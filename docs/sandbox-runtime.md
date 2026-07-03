@@ -75,18 +75,19 @@ page cache 的密度收益。
 **除挂载点与 `/opt/sandbox-runtime/` 外无其他文件**——无 /etc、/usr、/var、
 /lib、共享库等,所有额外功能由 sandbox-init 通过 Go syscall 实现。
 
-`/opt/sandbox-runtime/` 是预留的 **Guest 侧发布件根**:随本镜像出厂的平台运行时
-组件(如 `/opt/sandbox-runtime/bin/envd`)放此处,经 virtio-pmem + DAX 跨 sandbox
-共享一份、与 sandbox-init 原子同版;phase1a 把它 bind 进新 root 同名路径(§3.1),
-应用在自身 rootfs 内以**只读**看到它,且该路径遮蔽 app 镜像在此的任何内容(§5.2)。
-当前为空占位。
+`/opt/sandbox-runtime/` 是 **Guest 侧发布件根**:随 runtime 镜像出厂的平台运行时
+组件放此处,经 virtio-pmem + DAX 跨 sandbox 共享一份、与 sandbox-init 原子同版;
+phase1a 把它 bind 进新 root 同名路径(§3.1),应用在自身 rootfs 内以**只读**看到它,
+且该路径遮蔽 app 镜像在此的任何内容(§5.2)。实际镜像由 `guest-runtime` 打包,
+首版内置 `/opt/sandbox-runtime/bin/{envd,flatten-ctl,mkfs.erofs}`。
 
 镜像小(~15 MiB)+ DAX 直接映射 host page cache,N 个 sandbox 共享同一份内存
 工作集(实际 ~10 MiB 驻留)。EROFS 文件格式 endian-neutral,任意 host arch 上
 的 mkfs.erofs 都可生成镜像;镜像内的 `/sbin/init` 是 target arch 二进制。
 
-构建经本仓 `make sandbox-runtime`(需 guest-runtime/native-deps 的 mkfs.erofs;详见
-`guest-runtime/native-deps/docs/build.md` §2.1)。
+`sandbox-init` 由本仓 `make sandbox-init` 构建;`sandbox-runtime.erofs` 由
+`guest-runtime` 消费该二进制并通过 `make sandbox-runtime` 打包。mkfs.erofs 构建详见
+`guest-runtime/native-deps/docs/build.md` §2.1。
 
 ## 3. sandbox-init 三阶段
 
@@ -1078,6 +1079,6 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
   文件系统 / virtio-console / 网络功能为何如此
 - `guest-runtime/native-deps/docs/cloud-hypervisor.md` §5.2 —— vsock hybrid 代理:host
   侧映射到 UDS 的 CONNECT 行格式;`--console` / `--serial` 的用法
-- `guest-runtime/native-deps/docs/build.md` §2.1 —— mkfs.erofs 构建(本仓 `make sandbox-runtime` 的前置工具)
+- `guest-runtime/native-deps/docs/build.md` §2.1 —— mkfs.erofs 构建(`guest-runtime make sandbox-runtime` 的前置工具)
 - `kuasar-sandbox/docs/kuasar-sandbox.md` §4.6 —— quiesce prep 必做项的目标依据
   (确定性 guest 配置)
