@@ -12,7 +12,7 @@ import (
 )
 
 // Payload-parse unit tests live with the canonical parser in
-// sandbox-vswitch/pkg/tapfd (payload_test.go); this package delegates to it
+// connector/pkg/tapfd (payload_test.go); this package delegates to it
 // and is covered by the RecvFd / Acquire tests below.
 
 // socketPair returns two connected *net.UnixConn (a sender, b receiver).

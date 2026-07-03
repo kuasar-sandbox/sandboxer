@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 // StreamSnapshotSource implements SnapshotReader against a snapshot bundle's

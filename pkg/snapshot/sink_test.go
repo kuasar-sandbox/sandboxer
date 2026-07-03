@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
 // FileSink must pack content-addressed tarstream artifacts: the envelope

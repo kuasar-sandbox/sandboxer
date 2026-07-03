@@ -1,6 +1,6 @@
 // Package util holds tiny, dependency-free helpers shared across packages —
 // size parsing and binary location. It is exported (rather than internal) so
-// pkg/config stays importable cross-module: sandbox-orchestrator imports pkg/config
+// pkg/config stays importable cross-module: orchestrator imports pkg/config
 // to build sandbox.yaml from a single source of truth, and Go forbids importing
 // another module's internal/. Keep this package narrow — only universal,
 // dependency-free helpers belong here.

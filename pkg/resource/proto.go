@@ -92,7 +92,7 @@ type Message struct {
 	GrantedInitialAlloc uint64 `json:"granted_initial_alloc,omitempty"`
 	// QueuedETAMs is deprecated (server no longer surfaces Queued status);
 	// retained to preserve wire-format BC with older clients.
-	QueuedETAMs         int64 `json:"queued_eta_ms,omitempty"`
+	QueuedETAMs int64 `json:"queued_eta_ms,omitempty"`
 	// QueuedForMs / QueuePosAtIn are informational metadata returned on
 	// Admitted: how long the request spent in the server-side FIFO queue
 	// before being granted (0 means immediate admit), and the queue depth
@@ -126,11 +126,11 @@ type Message struct {
 	Drain bool `json:"drain,omitempty"`
 
 	// AdminStatus response.
-	Zone           string `json:"zone,omitempty"`
-	NodeAllocated  uint64 `json:"node_allocated_memory,omitempty"`
-	AllocatablePool uint64 `json:"allocatable_pool_memory,omitempty"`
-	ReservationCount int   `json:"reservation_count,omitempty"`
-	Drained        bool   `json:"drained,omitempty"`
+	Zone             string `json:"zone,omitempty"`
+	NodeAllocated    uint64 `json:"node_allocated_memory,omitempty"`
+	AllocatablePool  uint64 `json:"allocatable_pool_memory,omitempty"`
+	ReservationCount int    `json:"reservation_count,omitempty"`
+	Drained          bool   `json:"drained,omitempty"`
 
 	// Generic.
 	Reason string `json:"reason,omitempty"`

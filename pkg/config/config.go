@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/util"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/proto"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
@@ -315,7 +315,7 @@ type NetworkConfig struct {
 // sandbox-ctl execs Exec with TAPFD_SOCKET pointing at an inherited
 // socketpair end, then receives one tap queue fd + metadata over it.
 type TapFDConfig struct {
-	Exec    []string `yaml:"exec"`              // helper argv, e.g. ["vswitch-ctl","open-port","sw0","--port=3"]
+	Exec    []string `yaml:"exec"`              // helper argv, e.g. ["connector-ctl","vswitch","open-port","sw0","--port=3"]
 	Timeout string   `yaml:"timeout,omitempty"` // handoff timeout (Go duration); empty → default
 }
 

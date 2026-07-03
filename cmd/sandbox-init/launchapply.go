@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/moby/sys/user"
 	"golang.org/x/sys/unix"
 )

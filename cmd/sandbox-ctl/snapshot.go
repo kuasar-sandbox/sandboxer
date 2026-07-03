@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 // snapshotCmd implements `sandbox-ctl snapshot`. --output and --upload

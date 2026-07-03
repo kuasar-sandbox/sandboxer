@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 // fakeCHProxy stands in for cloud-hypervisor's hybrid vsock proxy on the

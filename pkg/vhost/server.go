@@ -36,11 +36,11 @@ type ReadOnlyBackend struct{ R BlockReader }
 func (b *ReadOnlyBackend) ReadAt(buf []byte, offset int64) (int, error) {
 	return b.R.ReadAt(buf, offset)
 }
-func (b *ReadOnlyBackend) WriteAt([]byte, int64) (int, error)    { return 0, ErrReadOnly }
-func (b *ReadOnlyBackend) Flush() error                           { return nil }
-func (b *ReadOnlyBackend) Discard(offset, length int64) error     { return nil }
-func (b *ReadOnlyBackend) Size() int64                            { return b.R.Size() }
-func (b *ReadOnlyBackend) ReadOnly() bool                         { return true }
+func (b *ReadOnlyBackend) WriteAt([]byte, int64) (int, error) { return 0, ErrReadOnly }
+func (b *ReadOnlyBackend) Flush() error                       { return nil }
+func (b *ReadOnlyBackend) Discard(offset, length int64) error { return nil }
+func (b *ReadOnlyBackend) Size() int64                        { return b.R.Size() }
+func (b *ReadOnlyBackend) ReadOnly() bool                     { return true }
 
 // CowBackend wraps a BlockCOW.
 type CowBackend struct{ C *BlockCOW }
@@ -76,14 +76,14 @@ type Server struct {
 	inflight sync.WaitGroup
 
 	// negotiated state (modified by master)
-	mu                     sync.Mutex
-	features               uint64
-	protocolFeatures       uint64
-	memTable               MemTable
-	queues                 []*virtq
-	stopOnce               sync.Once
-	stop                   chan struct{}
-	listener               *net.UnixListener
+	mu               sync.Mutex
+	features         uint64
+	protocolFeatures uint64
+	memTable         MemTable
+	queues           []*virtq
+	stopOnce         sync.Once
+	stop             chan struct{}
+	listener         *net.UnixListener
 	// activeConn is the currently-connected master conn. Stop closes it
 	// to unblock any in-flight ReadMessage. We do NOT set a read deadline
 	// on the connection: vhost-user has no keepalive and the control
@@ -97,14 +97,14 @@ type Server struct {
 
 // virtq holds per-virtq state set up by SET_VRING_*.
 type virtq struct {
-	num         uint32
-	descAddr    uint64 // GPA
-	availAddr   uint64 // GPA
-	usedAddr    uint64 // GPA
-	baseIdx     uint16
-	kickFd      int
-	callFd      int
-	enabled     bool
+	num       uint32
+	descAddr  uint64 // GPA
+	availAddr uint64 // GPA
+	usedAddr  uint64 // GPA
+	baseIdx   uint16
+	kickFd    int
+	callFd    int
+	enabled   bool
 
 	stop chan struct{}
 	done chan struct{}

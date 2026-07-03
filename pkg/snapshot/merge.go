@@ -5,8 +5,8 @@ import (
 	"io"
 	"os"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
 // tarLayer is a parent local artifact (tarstream envelope) opened as a

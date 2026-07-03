@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 func TestMessageRoundTrip(t *testing.T) {

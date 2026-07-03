@@ -14,8 +14,8 @@ package uffd
 // Implementations:
 //   - ZeroSource:           cold-start. Always zero, full buf.
 //   - StreamSnapshotSource: restore. Wraps a fetch.Stream (local file,
-//                           manifest, or layered overlay); merged holes →
-//                           zero, data runs fetched from the serving layer.
+//     manifest, or layered overlay); merged holes →
+//     zero, data runs fetched from the serving layer.
 //
 // Implementations must be safe for concurrent calls.
 type SnapshotReader interface {

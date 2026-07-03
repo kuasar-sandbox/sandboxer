@@ -2,10 +2,10 @@ package sandbox
 
 import (
 	"fmt"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"strings"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 // CHCommand assembles the cloud-hypervisor argv for a cold-start sandbox.

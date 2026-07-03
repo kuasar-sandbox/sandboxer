@@ -7,9 +7,9 @@ import (
 )
 
 func TestStats_Record_BasicCounters(t *testing.T) {
-	s := NewStats("blk0", "/tmp/blk0", 1<<20) // 1 MiB
-	s.Record(BlkTypeIn, 4096, 100_000, true)  // 100µs ok
-	s.Record(BlkTypeIn, 8192, 250_000, true)  // 250µs ok
+	s := NewStats("blk0", "/tmp/blk0", 1<<20)   // 1 MiB
+	s.Record(BlkTypeIn, 4096, 100_000, true)    // 100µs ok
+	s.Record(BlkTypeIn, 8192, 250_000, true)    // 250µs ok
 	s.Record(BlkTypeIn, 4096, 9_000_000, false) // 9ms err
 
 	snap := s.Snapshot()
@@ -34,13 +34,13 @@ func TestStats_BucketBoundaries(t *testing.T) {
 	s := NewStats("x", "", 1<<20)
 	// Boundary ladder: each sample lands in its named bucket.
 	cases := []struct {
-		ns       uint64
-		wantBkt  int // index in latencyBucketsNs (or numLatencyBuckets for overflow)
+		ns      uint64
+		wantBkt int // index in latencyBucketsNs (or numLatencyBuckets for overflow)
 	}{
-		{500, 0},                  // < 1µs → bucket[0] (1µs)
-		{1_000, 0},                // == 1µs → bucket[0]
-		{1_001, 1},                // > 1µs → bucket[1] (2µs)
-		{2_000, 1},                // == 2µs → bucket[1]
+		{500, 0},                               // < 1µs → bucket[0] (1µs)
+		{1_000, 0},                             // == 1µs → bucket[0]
+		{1_001, 1},                             // > 1µs → bucket[1] (2µs)
+		{2_000, 1},                             // == 2µs → bucket[1]
 		{1_000_000_000, numLatencyBuckets - 1}, // == 1s → last named
 		{2_000_000_000, numLatencyBuckets},     // > 1s → overflow
 	}

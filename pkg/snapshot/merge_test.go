@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 // oracle is the reference layering semantics (must match mergeSparse): top byte

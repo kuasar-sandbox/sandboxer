@@ -3,9 +3,9 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/config"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/guestlink"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/resctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"log"
 	"net"
 	"os"
@@ -17,13 +17,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/ctl"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/memory"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/mux"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/proto"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/stdio"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/uffd"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/vhost"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
+	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
+	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
 )
 

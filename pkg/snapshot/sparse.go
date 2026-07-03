@@ -7,7 +7,7 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"golang.org/x/sys/unix"
 )
 

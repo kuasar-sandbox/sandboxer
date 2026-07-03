@@ -1,4 +1,4 @@
-module github.com/kuasar-sandbox/sandbox-runtime
+module github.com/kuasar-sandbox/sandboxer
 
 go 1.24.0
 
@@ -18,12 +18,12 @@ require (
 
 require (
 	github.com/coreos/go-systemd/v22 v22.5.0
-	github.com/kuasar-sandbox/sandbox-accelerator v0.0.0
-	github.com/kuasar-sandbox/sandbox-vswitch v0.0.0
+	github.com/kuasar-sandbox/accelerator v0.0.0
+	github.com/kuasar-sandbox/connector v0.0.0
 	golang.org/x/sys v0.40.0
 )
 
 replace (
-	github.com/kuasar-sandbox/sandbox-accelerator => ../sandbox-accelerator
-	github.com/kuasar-sandbox/sandbox-vswitch => ../sandbox-vswitch
+	github.com/kuasar-sandbox/accelerator => ../accelerator
+	github.com/kuasar-sandbox/connector => ../connector
 )

@@ -4,10 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"os"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/restore"
+	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
 
 // uploadSnapshotCmd implements `sandbox-ctl upload-snapshot` — promote a LOCAL

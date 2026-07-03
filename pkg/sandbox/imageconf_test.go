@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/image"
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
 )
 
 // TestLoadImageConfig_RoundTrip writes a fake "erofs prefix + appended

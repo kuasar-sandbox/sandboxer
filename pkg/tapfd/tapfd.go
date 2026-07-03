@@ -4,7 +4,7 @@
 // SCM_RIGHTS, so CH can drive virtio-net off a fd the network provider owns.
 //
 // The wire receive + payload parse are delegated to the canonical
-// sandbox-vswitch/pkg/tapfd; this package adds only the exec-helper
+// connector/pkg/tapfd; this package adds only the exec-helper
 // orchestration and projects the port metadata onto the subset sandbox-ctl
 // needs.
 package tapfd
@@ -22,7 +22,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	vsw "github.com/kuasar-sandbox/sandbox-vswitch/pkg/tapfd"
+	vsw "github.com/kuasar-sandbox/connector/pkg/tapfd"
 )
 
 // DefaultTimeout bounds the whole handoff (exec helper → recv fd → helper exit).
@@ -114,7 +114,7 @@ func Acquire(ctx context.Context, argv []string, timeout time.Duration) (tap *os
 }
 
 // RecvFd performs the §2.4 receive by delegating to the canonical
-// sandbox-vswitch tapfd library (recvmsg, SCM_RIGHTS fd collection, payload
+// connector tapfd library (recvmsg, SCM_RIGHTS fd collection, payload
 // parse, fd-count cross-check, and the positional tap/netns split), then
 // projects the resulting PortMetadata onto the MAC/IP/MTU subset sandbox-ctl
 // acts on. netnsFile is nil when the provider attached none. Any error closes

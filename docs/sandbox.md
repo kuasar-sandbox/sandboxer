@@ -435,7 +435,7 @@ network:
   # 源(二选一):
   tap: tap0                    # 预创建的 host TAP 名;CH 按名打开(dev/e2e,无 provider)
   tapfd:                       # tapfd 交接(docs/tapfd.md §3):exec provider helper 取 tap 队列 fd
-    exec: ["vswitch-ctl", "open-port", "sw0", "--port=3"]
+    exec: ["connector-ctl", "vswitch", "open-port", "sw0", "--port=3"]
     # timeout: 5s            # 交接超时(Go duration);默认 5s
 
   # 属性:tap 模式按下值生效;tapfd 模式下被交接元数据覆盖——
@@ -619,7 +619,7 @@ CH API 是本地管理调用、快且不受远程/缓存慢影响,60s 是安全�
 
 清单配置(manifest/store/crypto/cache 节)单独存在,不放入 sandbox.yaml——它
 是节点级配置,所有 CLI 共享(sandbox-ctl 通过 `--manifest-config` 或
-`MANIFEST_CONFIG` 环境变量引用,详见 `sandbox-accelerator/docs/manifest.md`)。
+`MANIFEST_CONFIG` 环境变量引用,详见 `accelerator/docs/manifest.md`)。
 
 **绝对路径要求**:sandbox.yaml 中所有 `file://` URL 必须是绝对路径
 (`file:///abs/path/to/file`)。配置校验阶段拒绝 `file://relative/path`
@@ -1035,7 +1035,7 @@ cloud-hypervisor \
 - `--memory-zone fd=3,uffd_socket=...`:patched CH 跳过 memfd_create,直接用
   sandbox-ctl 传入的 fd 当 backing;在 create_ram_region 内自己创建 uffd,
   通过 uffd_socket 发 va_report + SCM_RIGHTS,等 sandbox-ctl ack 后才允许
-  vCPU 跑(详见 `sandbox-deps/docs/cloud-hypervisor.md`)
+  vCPU 跑(详见 `guest-runtime/native-deps/docs/cloud-hypervisor.md`)
 - `--pmem discard_writes=on` 让 guest 写 pmem 不影响 host 文件
 - blk0 readonly=on 在 vhost-user 协议层告知 guest 这是只读盘
 - `--vsock cid=3,socket=...`:CH 创建 virtio-vsock 设备,guest CID=3,通过 hybrid
@@ -1073,7 +1073,7 @@ snapshot 与 overlay 都**按内容摘要命名**(content-addressed),彼此不�
 `<sha256>.snapshot`,给人和工具一个按 sid 寻址的"最新"入口
 (`<sid>` = `sandbox-ctl run --sandbox-id` 设的或 yaml 里的)。
 
-**工件容器 = tarstream**(`sandbox-accelerator/pkg/tarstream`,GNU PAX sparse
+**工件容器 = tarstream**(`accelerator/pkg/tarstream`,GNU PAX sparse
 1.0 单条目 tar):逻辑视图的洞进信封洞图,线上只有数据字节。工件文件本身**致密**
 ——`cp`/`rsync`/非稀疏文件系统都不再能破坏语义,洞的权威从此是信封而非 OS。
 
@@ -1484,7 +1484,7 @@ guest balloon 驱动充气分配的页**从不被 guest 写入**(`balloon_page_a
 (实测冷启动 ~99%)在 memfd 上是从未触碰的空洞——无 inode 页、无 PTE、无可
 释放物。CH 的 release 用一次 `lseek(SEEK_DATA)` 探测该 run 是否整段空洞,
 空洞则**跳过 (1)(2)**(平台 patch,见
-`sandbox-deps/docs/cloud-hypervisor.md` §3.4):无 madvise → 无同步握手,
+`guest-runtime/native-deps/docs/cloud-hypervisor.md` §3.4):无 madvise → 无同步握手,
 balloon 线程以内存速度扫过这 ~99% 的页 → **收敛近乎瞬时**。
 
 剩下少量(实测 ~1%)是 guest 启动期经 vhost-blk 后端 / 内核拉进 page cache
@@ -1599,7 +1599,7 @@ CH 命令行(三种模式都用,跟 cgroup 解耦):
   空洞(memfd 稀疏未 prefault),CH 的 release 对空洞 run 跳过 PUNCH/madvise
   → 省去同步 `EVENT_REMOVE` 握手,充气收敛近乎瞬时;少量确驻留的
   瞬态 page cache 仍合法回收(机制见 §8.5 与
-  `sandbox-deps/docs/cloud-hypervisor.md` §3.4)
+  `guest-runtime/native-deps/docs/cloud-hypervisor.md` §3.4)
 - **不**启用 `free_page_reporting`。FPR 让 guest 在每轮 page reclaim 中把空闲
   页号高频推到 host,CH 的 `release_memory_range` 对自身 mmap 做
   `madvise(MADV_DONTNEED)` 广播 mmu_notifier 失效到 KVM EPT,持续的 IPI
@@ -1653,7 +1653,7 @@ deflate_on_oom 触发链路:
 
 ## 10. 与 node-ctl 的资源协议
 
-详细协议规范见 `sandbox-orchestrator/docs/node-resource.md` §5;本节描述 sandbox-ctl 侧的执行器
+详细协议规范见 `orchestrator/docs/node-resource.md` §5;本节描述 sandbox-ctl 侧的执行器
 行为。
 
 ### 10.1 沙箱状态机
@@ -2071,7 +2071,7 @@ vmlinux 通过 `boot.kernel: file://...` 提供:
 - **in-guest userfaultfd 系统调用**:`CONFIG_USERFAULTFD` 未启用
 - **NR_CPUS 上限 4**
 
-详见 `sandbox-deps/docs/sandbox-kernel.md` §3、§5。
+详见 `guest-runtime/native-deps/docs/sandbox-kernel.md` §3、§5。
 
 ### 14.3 扩展点(用例驱动)
 
@@ -2086,19 +2086,19 @@ vmlinux 通过 `boot.kernel: file://...` 提供:
 
 - [`sandbox-runtime.md`](sandbox-runtime.md) —— guest 内 sandbox-init 三阶段
   与 vsock 控制面协议
-- `sandbox-deps/docs/cloud-hypervisor.md` —— CH patches、命令行选项、
+- `guest-runtime/native-deps/docs/cloud-hypervisor.md` —— CH patches、命令行选项、
   外部托管内存契约
-- `sandbox-deps/docs/sandbox-kernel.md` —— guest kernel defconfig、平台
+- `guest-runtime/native-deps/docs/sandbox-kernel.md` —— guest kernel defconfig、平台
   ABI 边界
-- `sandbox-deps/docs/build.md` —— 原生依赖(mkfs.erofs / vmlinux /
+- `guest-runtime/native-deps/docs/build.md` —— 原生依赖(mkfs.erofs / vmlinux /
   cloud-hypervisor / envd)的构建流程
-- `sandbox-orchestrator/docs/node-resource.md` —— 资源控制协议规范、节点级仲裁、
+- `orchestrator/docs/node-resource.md` —— 资源控制协议规范、节点级仲裁、
   admission、reclaimer
-- `sandbox-accelerator/docs/manifest.md` —— manifest:// 资源拉取通道
+- `accelerator/docs/manifest.md` —— manifest:// 资源拉取通道
   (blk0 base、snapshot)
-- `sandbox-accelerator/docs/cache.md` —— sandbox-ctl 通过 cache-ctl 客户端做
+- `accelerator/docs/cache.md` —— sandbox-ctl 通过 cache-ctl 客户端做
   chunk-level 请求
-- `sandbox-accelerator/docs/flatten.md` —— 构建 boot.root.base 的 EROFS 镜像
+- `accelerator/docs/flatten.md` —— 构建 boot.root.base 的 EROFS 镜像
 - `kuasar-sandbox/docs/perf.md` —— 沙箱性能基线与密度调优
 - `kuasar-sandbox/docs/kuasar-sandbox.md` §2.4 / §3.3 / §4.6 —— 沙箱在系统中的
   位置与目标

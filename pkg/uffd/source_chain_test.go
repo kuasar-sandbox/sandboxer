@@ -3,14 +3,15 @@ package uffd
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"io"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // keyByteGetter maps a chunk's CiphertextHash[0] to a page filled with that
@@ -24,7 +25,9 @@ func (g keyByteGetter) Get(_ context.Context, _ store.Partition, k store.Content
 // passthroughDecryptor returns the ciphertext bytes verbatim.
 type passthroughDecryptor struct{}
 
-func (passthroughDecryptor) Encrypt(_ [32]byte, p []byte) ([]byte, [32]byte)     { return p, [32]byte{} }
+func (passthroughDecryptor) Encrypt(_ [32]byte, p []byte) ([]byte, [32]byte, [32]byte) {
+	return p, [32]byte{}, [32]byte{}
+}
 func (passthroughDecryptor) Decrypt(_ [32]byte, c []byte) ([]byte, error)        { return c, nil }
 func (passthroughDecryptor) DecryptInPlace(_ [32]byte, b []byte) ([]byte, error) { return b, nil }
 
@@ -35,17 +38,21 @@ func buildPageStream(t *testing.T, numPages int, fills []byte) fetch.Stream {
 	t.Helper()
 	ps := int(PageSize)
 	m := &codec.Manifest{Version: codec.Version1, ImageSize: uint64(numPages * ps)}
+	g := mapGetter{}
 	for i := 0; i < numPages; i++ {
 		off := uint64(i * ps)
 		if fills[i] == 0 {
 			m.Holes = append(m.Holes, sparse.Extent{Offset: off, Size: uint64(ps)})
 			continue
 		}
+		blob := bytes.Repeat([]byte{fills[i]}, ps)
+		key := store.ContentKey(sha256.Sum256(blob))
+		g[key] = blob
 		m.Entries = append(m.Entries, codec.ChunkEntry{
-			Offset: off, Size: uint32(ps), CiphertextHash: store.ContentKey{fills[i]},
+			Offset: off, Size: uint32(ps), CiphertextHash: key,
 		})
 	}
-	return fetch.NewStream(m, make([][32]byte, len(m.Entries)), keyByteGetter{pageSize: ps}, passthroughDecryptor{})
+	return fetch.NewStream(m, make([][32]byte, len(m.Entries)), g, passthroughDecryptor{})
 }
 
 // drainSource walks src page-by-page exactly as the uffd handler does:
@@ -98,7 +105,6 @@ func buildExtentStream(t *testing.T, numPages int, exts []extent) fetch.Stream {
 	ps := int(PageSize)
 	m := &codec.Manifest{Version: codec.Version1, ImageSize: uint64(numPages * ps)}
 	g := mapGetter{}
-	var keyN byte = 1
 	for _, e := range exts {
 		off := uint64(e.startPage * ps)
 		sz := e.numPages * ps
@@ -106,10 +112,9 @@ func buildExtentStream(t *testing.T, numPages int, exts []extent) fetch.Stream {
 			m.Holes = append(m.Holes, sparse.Extent{Offset: off, Size: uint64(sz)})
 			continue
 		}
-		var k store.ContentKey
-		k[0] = keyN
-		keyN++
-		g[k] = bytes.Repeat([]byte{e.fill}, sz)
+		blob := bytes.Repeat([]byte{e.fill}, sz)
+		k := store.ContentKey(sha256.Sum256(blob))
+		g[k] = blob
 		m.Entries = append(m.Entries, codec.ChunkEntry{Offset: off, Size: uint32(sz), CiphertextHash: k})
 	}
 	return fetch.NewStream(m, make([][32]byte, len(m.Entries)), g, passthroughDecryptor{})

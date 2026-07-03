@@ -1,7 +1,7 @@
 package sandbox
 
 import (
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"strings"
 	"testing"
 )

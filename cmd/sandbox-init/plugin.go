@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 // Plugin supervision: companion processes (launch.plugin[]) run alongside the

@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func TestMergeLaunch_OverrideTakesPrecedence(t *testing.T) {

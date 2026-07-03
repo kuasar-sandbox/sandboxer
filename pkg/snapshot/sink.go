@@ -10,10 +10,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/ingest"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"golang.org/x/sys/unix"
 )
 

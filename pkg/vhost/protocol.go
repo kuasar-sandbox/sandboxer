@@ -20,27 +20,27 @@ import (
 
 // vhost-user message request codes (subset relevant to our backend).
 const (
-	MsgGetFeatures           uint32 = 1
-	MsgSetFeatures           uint32 = 2
-	MsgSetOwner              uint32 = 3
-	MsgResetOwner            uint32 = 4
-	MsgSetMemTable           uint32 = 5
-	MsgSetVringNum           uint32 = 8
-	MsgSetVringAddr          uint32 = 9
-	MsgSetVringBase          uint32 = 10
-	MsgGetVringBase          uint32 = 11
-	MsgSetVringKick          uint32 = 12
-	MsgSetVringCall          uint32 = 13
-	MsgGetProtocolFeatures   uint32 = 15
-	MsgSetProtocolFeatures   uint32 = 16
-	MsgGetQueueNum           uint32 = 17
-	MsgSetVringEnable        uint32 = 18
-	MsgSetBackendReqFd       uint32 = 21
-	MsgGetConfig             uint32 = 24
-	MsgSetConfig             uint32 = 25
-	MsgGetMaxMemSlots        uint32 = 36
-	MsgAddMemReg             uint32 = 37
-	MsgRemMemReg             uint32 = 38
+	MsgGetFeatures         uint32 = 1
+	MsgSetFeatures         uint32 = 2
+	MsgSetOwner            uint32 = 3
+	MsgResetOwner          uint32 = 4
+	MsgSetMemTable         uint32 = 5
+	MsgSetVringNum         uint32 = 8
+	MsgSetVringAddr        uint32 = 9
+	MsgSetVringBase        uint32 = 10
+	MsgGetVringBase        uint32 = 11
+	MsgSetVringKick        uint32 = 12
+	MsgSetVringCall        uint32 = 13
+	MsgGetProtocolFeatures uint32 = 15
+	MsgSetProtocolFeatures uint32 = 16
+	MsgGetQueueNum         uint32 = 17
+	MsgSetVringEnable      uint32 = 18
+	MsgSetBackendReqFd     uint32 = 21
+	MsgGetConfig           uint32 = 24
+	MsgSetConfig           uint32 = 25
+	MsgGetMaxMemSlots      uint32 = 36
+	MsgAddMemReg           uint32 = 37
+	MsgRemMemReg           uint32 = 38
 )
 
 // MsgName returns a human-readable name for a message code; "?" for unknown.

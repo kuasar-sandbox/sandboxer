@@ -3,14 +3,14 @@ package resctl
 import (
 	"context"
 	"fmt"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/resource"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
 // ControllerHookOptions configures the dynamic-mode controller integration.

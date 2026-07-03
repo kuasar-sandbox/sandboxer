@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // TestBuildSnapshotCfg_SingleDisk verifies a single-disk snapshot.cfg records

@@ -12,14 +12,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/ingest"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/util"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/config"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/snapshot"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
+	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"gopkg.in/yaml.v3"
 )
 

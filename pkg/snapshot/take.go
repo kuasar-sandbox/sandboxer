@@ -19,7 +19,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/chapi"
+	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 )
 
 // Quiescer abstracts the vhost backend's pause/resume hooks. A typical
@@ -253,4 +253,3 @@ func absorbOverlay(ctx context.Context, sink SnapshotSink, d DiskDiff, merging b
 	}
 	return sink.AbsorbOverlay(ctx, src, holes)
 }
-

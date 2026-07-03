@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/fwd"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/fwd"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 func TestConnRegistry(t *testing.T) {

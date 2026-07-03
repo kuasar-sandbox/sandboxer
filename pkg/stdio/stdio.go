@@ -39,8 +39,8 @@ import (
 	"syscall"
 
 	"github.com/coreos/go-systemd/v22/journal"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/mux"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"golang.org/x/sys/unix"
 )
 

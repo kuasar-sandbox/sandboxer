@@ -3,12 +3,12 @@ package sandbox
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/guestlink"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"os"
 	"runtime"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/vhost"
+	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
 
 // statsReport is the JSON layout written by --stats-json. The bucket

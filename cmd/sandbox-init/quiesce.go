@@ -9,8 +9,8 @@ import (
 // runQuiesce executes the v1 pre-snapshot cleanup sequence
 // (docs/sandbox-runtime.md §3.4):
 //
-//   1. sync(2)                                — flush ext4 upperdir dirty
-//   2. echo 3 > /proc/sys/vm/drop_caches      — drop page + dentry/inode cache
+//  1. sync(2)                                — flush ext4 upperdir dirty
+//  2. echo 3 > /proc/sys/vm/drop_caches      — drop page + dentry/inode cache
 //
 // Errors are logged and **do not abort** the function; quiesce is a
 // best-effort step driving cross-instance dedup quality, not a snapshot

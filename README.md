@@ -1,4 +1,4 @@
-# sandbox-runtime
+# sandboxer
 
 microVM 沙箱生命周期引擎:冷启动、快照、恢复,以及块设备(vhost-user-blk)与
 按需内存(uffd 懒加载)的 host 侧编排;guest 侧由打进 `sandbox-runtime.erofs`
@@ -6,9 +6,9 @@ microVM 沙箱生命周期引擎:冷启动、快照、恢复,以及块设备(vho
 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的运行时
 核心,独立演进。
 
-对外导出 `pkg/resource`(节点资源控制协议:wire + `Client`;由 `sandbox-orchestrator`
+对外导出 `pkg/resource`(节点资源控制协议:wire + `Client`;由 `orchestrator`
 的 **node-ctl** 作控制器侧 import);协议规范见
-[`sandbox-orchestrator/docs/node-resource.md`](https://github.com/kuasar-sandbox/sandbox-orchestrator/blob/main/docs/node-resource.md) §5。
+[`orchestrator/docs/node-resource.md`](https://github.com/kuasar-sandbox/orchestrator/blob/main/docs/node-resource.md) §5。
 
 ## 组成
 
@@ -22,7 +22,7 @@ microVM 沙箱生命周期引擎:冷启动、快照、恢复,以及块设备(vho
 | `pkg/{guestlink,mux,proto,fwd,stdio,ctl}` | host↔guest vsock 控制面、stdio MUX、端口转发、ctl.sock |
 | `pkg/{config,resctl,chapi,tapfd}` | sandbox.yaml、cgroup+balloon 联动、CH API 客户端、tapfd 消费 |
 | `pkg/util` | 内联工具(`ParseSize` / `LocateBinary` 等,跨模块导出) |
-| `pkg/resource` | **导出面**:节点资源控制协议(`sandbox-orchestrator` 的 node-ctl import) |
+| `pkg/resource` | **导出面**:节点资源控制协议(`orchestrator` 的 node-ctl import) |
 
 ## 构建
 
@@ -34,15 +34,15 @@ make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
 make vet test
 ```
 
-构建需要 Go 1.24+;运行还需 **sandbox-deps** 产出的原生件:`vmlinux`(guest
+构建需要 Go 1.24+;运行还需 **guest-runtime/native-deps** 产出的原生件:`vmlinux`(guest
 内核)、`cloud-hypervisor`(VMM,平台 patch)、`mkfs.erofs`。
 
 ## 跨仓依赖(薄)
 
 | 依赖 | 用途 | 解析 |
 |---|---|---|
-| `sandbox-accelerator/pkg/manifest`(+ `pkg/image`、`cache`/`store` client) | 快照 ingest/fetch、vhost 块读、读展平镜像内嵌的 RuntimeConfig | `replace => ../sandbox-accelerator` |
-| `sandbox-vswitch/pkg/tapfd` | tapfd 交接消费侧(`RecvFdsWithNetns`) | `replace => ../sandbox-vswitch` |
+| `accelerator/pkg/manifest`(+ `pkg/image`、`cache`/`store` client) | 快照 ingest/fetch、vhost 块读、读展平镜像内嵌的 RuntimeConfig | `replace => ../accelerator` |
+| `connector/pkg/tapfd` | tapfd 交接消费侧(`RecvFdsWithNetns`) | `replace => ../connector` |
 
 均为纯 Go、无 CGO 的导入面——整仓 `CGO_ENABLED=0` 构建,不引入 rocksdb / eBPF
 等重依赖。`replace` 指向兄弟仓相对路径:clone 全组织为兄弟目录即可离线构建;

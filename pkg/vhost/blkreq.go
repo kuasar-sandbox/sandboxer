@@ -7,8 +7,8 @@ import (
 
 // virtio-blk request types.
 const (
-	BlkTypeIn        uint32 = 0  // read
-	BlkTypeOut       uint32 = 1  // write
+	BlkTypeIn        uint32 = 0 // read
+	BlkTypeOut       uint32 = 1 // write
 	BlkTypeFlush     uint32 = 4
 	BlkTypeGetID     uint32 = 8
 	BlkTypeDiscard   uint32 = 11

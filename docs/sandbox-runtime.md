@@ -85,8 +85,8 @@ page cache 的密度收益。
 工作集(实际 ~10 MiB 驻留)。EROFS 文件格式 endian-neutral,任意 host arch 上
 的 mkfs.erofs 都可生成镜像;镜像内的 `/sbin/init` 是 target arch 二进制。
 
-构建经本仓 `make sandbox-runtime`(需 sandbox-deps 的 mkfs.erofs;详见
-`sandbox-deps/docs/build.md` §2.1)。
+构建经本仓 `make sandbox-runtime`(需 guest-runtime/native-deps 的 mkfs.erofs;详见
+`guest-runtime/native-deps/docs/build.md` §2.1)。
 
 ## 3. sandbox-init 三阶段
 
@@ -1074,10 +1074,10 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
 
 - [`sandbox.md`](sandbox.md) §2.2(`run` 的 `--tty` / `--console` / stdio 标志)、
   §5.2(CH 冷启动命令行)、§6.2 / §6.3(snapshot 时序 / ctl.sock 协议)、§7(恢复)
-- `sandbox-deps/docs/sandbox-kernel.md` —— guest kernel 启用的 namespace /
+- `guest-runtime/native-deps/docs/sandbox-kernel.md` —— guest kernel 启用的 namespace /
   文件系统 / virtio-console / 网络功能为何如此
-- `sandbox-deps/docs/cloud-hypervisor.md` §5.2 —— vsock hybrid 代理:host
+- `guest-runtime/native-deps/docs/cloud-hypervisor.md` §5.2 —— vsock hybrid 代理:host
   侧映射到 UDS 的 CONNECT 行格式;`--console` / `--serial` 的用法
-- `sandbox-deps/docs/build.md` §2.1 —— mkfs.erofs 构建(本仓 `make sandbox-runtime` 的前置工具)
+- `guest-runtime/native-deps/docs/build.md` §2.1 —— mkfs.erofs 构建(本仓 `make sandbox-runtime` 的前置工具)
 - `kuasar-sandbox/docs/kuasar-sandbox.md` §4.6 —— quiesce prep 必做项的目标依据
   (确定性 guest 配置)

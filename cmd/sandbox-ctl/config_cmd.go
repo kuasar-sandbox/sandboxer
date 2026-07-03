@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/kuasar-sandbox/sandbox-runtime/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"os"
 	"strings"
 
@@ -204,7 +204,7 @@ resources:
 network:
   # Source: exactly one of tap (a pre-existing host TAP) or tapfd (handoff helper).
   tap: tap0
-  # tapfd: { exec: ["vswitch-ctl", "open-port", "sw0", "--port=1"] }
+  # tapfd: { exec: ["connector-ctl", "vswitch", "open-port", "sw0", "--port=1"] }
   ip: 169.254.1.1/31                       # guest CIDR; "" → no IP
   hostname: my-sandbox
 boot:

@@ -1,12 +1,12 @@
-# sandbox-runtime — microVM sandbox lifecycle engine.
+# sandboxer — microVM sandbox lifecycle engine.
 #
 #   sandbox-ctl     host control plane (run / snapshot / exec / config / info)
 #   sandbox-init    guest PID 1 (packed into sandbox-runtime.erofs)
 #   sandbox-runtime sandbox-init packed into a virtio-pmem-mountable EROFS
 #
-# `make build` produces all three. sandbox-runtime needs mkfs.erofs from
-# sandbox-deps; the finder below probes PATH, this repo's bin/, and the
-# sibling sandbox-deps/bin/ (the org-root layout).
+# `make build` produces all three. The runtime image target needs mkfs.erofs
+# from guest-runtime/native-deps; the finder below probes PATH, this repo's
+# bin/, and the sibling guest-runtime/native-deps/bin/ (the org-root layout).
 
 SHELL := /bin/bash
 
@@ -41,13 +41,13 @@ BUILD_DIR      := build/$(TARGET_ARCH)
 
 # mkfs.erofs lookup chain (in priority order):
 #   PATH → this repo's $(BINDIR)/ → this repo's bin/ symlink →
-#   sibling sandbox-deps/bin/$(TARGET_ARCH)/ → sibling sandbox-deps/bin/ symlink
+#   sibling guest-runtime/native-deps/bin/$(TARGET_ARCH)/ → sibling guest-runtime/native-deps/bin/ symlink
 MKFS_EROFS ?= $(shell \
     command -v mkfs.erofs 2>/dev/null \
     || ( [ -x $(BINDIR)/mkfs.erofs ] && echo $(BINDIR)/mkfs.erofs ) \
     || ( [ -x bin/mkfs.erofs ] && echo bin/mkfs.erofs ) \
-    || ( [ -x ../sandbox-deps/$(BINDIR)/mkfs.erofs ] && echo ../sandbox-deps/$(BINDIR)/mkfs.erofs ) \
-    || ( [ -x ../sandbox-deps/bin/mkfs.erofs ] && echo ../sandbox-deps/bin/mkfs.erofs ))
+    || ( [ -x ../guest-runtime/native-deps/$(BINDIR)/mkfs.erofs ] && echo ../guest-runtime/native-deps/$(BINDIR)/mkfs.erofs ) \
+    || ( [ -x ../guest-runtime/native-deps/bin/mkfs.erofs ] && echo ../guest-runtime/native-deps/bin/mkfs.erofs ))
 
 define link_bin
 @if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
@@ -75,13 +75,13 @@ sandbox-init:
 
 # Pack sandbox-init into the guest "/" image (virtio-pmem, DAX, read-only,
 # shared across sandboxes via host page cache). Needs mkfs.erofs; EROFS is
-# endian-neutral / cross-mountable. mkfs flags mirror sandbox-accelerator's
+# endian-neutral / cross-mountable. mkfs flags mirror accelerator's
 # flatten.go buildEROFS for deterministic, dedup-friendly output. stderr
 # discarded because mkfs.erofs 1.9 emits a false-positive
 # "<E> Compression is not enabled" on -Ededupe even when --chunksize already
 # triggers chunk-based dedup (matches flatten.go Stderr=io.Discard).
 sandbox-runtime: sandbox-init
-	@[ -n "$(MKFS_EROFS)" ] || { echo "mkfs.erofs not found — build it in sandbox-deps (\`make -C ../sandbox-deps erofs\`) or set MKFS_EROFS=<path>" >&2; exit 1; }
+	@[ -n "$(MKFS_EROFS)" ] || { echo "mkfs.erofs not found — build it in guest-runtime/native-deps (\`make -C ../guest-runtime/native-deps erofs\`) or set MKFS_EROFS=<path>" >&2; exit 1; }
 	rm -rf $(BUILD_DIR)/sandbox-runtime
 	mkdir -p $(BUILD_DIR)/sandbox-runtime/sbin $(BUILD_DIR)/sandbox-runtime/proc \
 	         $(BUILD_DIR)/sandbox-runtime/sys $(BUILD_DIR)/sandbox-runtime/dev \
@@ -123,13 +123,13 @@ clean:
 
 # Go micro-benchmarks. Sandbox-level e2e (cold/snapshot/restore/...) lives in
 # kuasar-sandbox/test/e2e — they need vmlinux + cloud-hypervisor + mkfs.erofs
-# (from sandbox-deps) plus accelerator binaries, so they're cross-repo and
+# (from guest-runtime/native-deps) plus accelerator binaries, so they're cross-repo and
 # their natural home is the umbrella.
 bench:
 	CGO_ENABLED=0 $(GO) test -bench=. -benchmem -run=^$$ ./...
 
 help:
-	@echo "sandbox-runtime. Targets:"
+	@echo "sandboxer. Targets:"
 	@echo "  build              sandbox-ctl + sandbox-init + sandbox-runtime.erofs"
 	@echo "  sandbox-ctl        host control plane"
 	@echo "  sandbox-init       guest PID 1 (stripped)"
