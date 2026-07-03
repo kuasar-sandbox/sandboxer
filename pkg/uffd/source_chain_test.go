@@ -14,14 +14,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
-// keyByteGetter maps a chunk's CiphertextHash[0] to a page filled with that
-// byte. Models the cache returning a chunk's (passthrough-"decrypted") bytes.
-type keyByteGetter struct{ pageSize int }
-
-func (g keyByteGetter) Get(_ context.Context, _ store.Partition, k store.ContentKey) (cache.CacheResult, cache.Blob, error) {
-	return cache.CacheHit, cache.NewMemBlob(bytes.Repeat([]byte{k[0]}, g.pageSize)), nil
-}
-
 // passthroughDecryptor returns the ciphertext bytes verbatim.
 type passthroughDecryptor struct{}
 
