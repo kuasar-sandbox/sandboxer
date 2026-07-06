@@ -2099,6 +2099,6 @@ vmlinux 通过 `boot.kernel: file://...` 提供:
 - `accelerator/docs/cache.md` —— sandbox-ctl 通过 cache-ctl 客户端做
   chunk-level 请求
 - `accelerator/docs/flatten.md` —— 构建 boot.root.base 的 EROFS 镜像
-- `kuasar-sandbox/docs/perf.md` —— 沙箱性能基线与密度调优
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §2.4 / §3.3 / §4.6 —— 沙箱在系统中的
+- `orchestrator/release-builder/docs/perf.md` —— 沙箱性能基线与密度调优
+- `orchestrator/release-builder/docs/kuasar-sandbox.md` §2.4 / §3.3 / §4.6 —— 沙箱在系统中的
   位置与目标

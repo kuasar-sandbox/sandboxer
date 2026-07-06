@@ -357,7 +357,7 @@ target 锚定在合理水位(详见 [`sandbox.md`](sandbox.md) §9.3);失败仅�
 quiesce 是 host `/vm.pause` 之前的最后一次清理机会,目标两件事:
 
 1. 把跨实例 snapshot 的内存与磁盘状态推向"确定性",让分块去重率从 50-70% 升至
-   >90%(`kuasar-sandbox/docs/kuasar-sandbox.md` §4.6)。
+   >90%(`orchestrator/release-builder/docs/kuasar-sandbox.md` §4.6)。
 2. **让 MUX 与端口转发连接在快照前彻底关闭**——快照绝不能捕获一条半开/握手中途的
    MUX 连接,或一条仍在飞的 `connect` 端口转发连接(restore 出来后无对端,成为
    悬挂状态;§4.6 / §3.7)。
@@ -1080,5 +1080,5 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
 - `guest-runtime/native-deps/docs/cloud-hypervisor.md` §5.2 —— vsock hybrid 代理:host
   侧映射到 UDS 的 CONNECT 行格式;`--console` / `--serial` 的用法
 - `guest-runtime/native-deps/docs/build.md` §2.1 —— mkfs.erofs 构建(`guest-runtime make sandbox-runtime` 的前置工具)
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §4.6 —— quiesce prep 必做项的目标依据
+- `orchestrator/release-builder/docs/kuasar-sandbox.md` §4.6 —— quiesce prep 必做项的目标依据
   (确定性 guest 配置)
