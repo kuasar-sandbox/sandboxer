@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
@@ -37,25 +38,42 @@ func ServeExecRequest(ctx context.Context, conn net.Conn, req ctl.Request, vsock
 	pipeConns(ctx, conn, guestConn)
 }
 
-// pipeConns copies bytes both ways between a and b until either side
-// closes (or ctx cancels), then closes both and waits for both copy
-// goroutines to unwind. Each io.Copy returns exactly once, so the
-// drain loop is bounded.
+// pipeConns copies bytes both ways between a and b. A read EOF in one
+// direction is propagated as a write-side half-close to the peer so the
+// reverse direction can still deliver trailing protocol frames such as
+// exec exit status. A full close is reserved for context cancellation
+// or after both directions have drained.
 func pipeConns(ctx context.Context, a, b net.Conn) {
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(a, b); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(b, a); done <- struct{}{} }()
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			_ = a.Close()
+			_ = b.Close()
+		})
+	}
+	closeWrite := func(c net.Conn) {
+		if cw, ok := c.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+			return
+		}
+		_ = c.Close()
+	}
 
-	got := 0
-	select {
-	case <-done:
-		got++
-	case <-ctx.Done():
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(a, b); closeWrite(a); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(b, a); closeWrite(b); done <- struct{}{} }()
+
+	for got := 0; got < 2; got++ {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			closeBoth()
+			for got < 2 {
+				<-done
+				got++
+			}
+			return
+		}
 	}
-	_ = a.Close()
-	_ = b.Close()
-	for got < 2 {
-		<-done
-		got++
-	}
+	closeBoth()
 }
