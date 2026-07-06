@@ -1,0 +1,284 @@
+From c12bb037cd309fb1786bc3836315737bb32aa9d5 Mon Sep 17 00:00:00 2001
+From: Chen Xiaohui <graych@gmail.com>
+Date: Sun, 3 May 2026 22:01:35 +0800
+Subject: [PATCH 1/4] vmm: memory: support externally-allocated memfd-backed
+ zones
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add `--memory-zone fd=<n>,uffd_socket=<path>` so a parent process can
+hand cloud-hypervisor a pre-allocated memfd to use as the backing
+store for one guest RAM zone, instead of CH calling memfd_create() in
+its own mm.
+
+Motivation
+==========
+Several deployments want to manage guest RAM lifetimes outside CH:
+
+  * snapshot pipelines that prefer to dump bytes through a held-open
+    memfd (sparse copy via SEEK_DATA/HOLE on a single shared inode)
+    rather than streaming /vm.snapshot's memory_ranges over the API;
+  * uffd-based lazy loaders that need the parent process to own the
+    memfd inode so it can mmap a backendVA next to CH's chVA and
+    install pages cooperatively;
+  * test harnesses that want to drop a pre-populated memfd into CH
+    without a memory-file path on disk.
+
+Today these all have to fork+exec CH and mediate via /vm.snapshot
+HTTP, which forces every byte through user space twice. Letting the
+parent inject the fd directly removes that copy.
+
+Behaviour
+=========
+Two new optional fields on MemoryZoneConfig:
+
+  fd: Option<i32>           Inherited file descriptor (typically passed
+                            via cmd.ExtraFiles in Go / fork+execve in
+                            other parents). When Some, CH uses this fd
+                            verbatim as `existing_memory_file` for
+                            create_ram_region — no memfd_create, no
+                            ftruncate, no path lookup.
+
+  uffd_socket: Option<PathBuf>
+                            UDS path the next commit uses for the va_
+                            report handshake. Plumbed through here but
+                            unused; the parser is added now so the
+                            CLI surface is one commit instead of two.
+
+Multi-region support
+--------------------
+A guest zone can be split into multiple GuestRegionMmap regions when
+it crosses the PCI MMIO hole (typical on x86-64 ≥ 4 GiB) or when
+virtio-mem hotplug carves it. Every region needs its own File handle
+to satisfy MmapRegion ownership, so CH `try_clone()`s the inherited fd
+on each region. The kernel-side mmap shares the underlying shmem
+inode across all clones — every region points at the same memory.
+A new MemfdClone error wraps any try_clone() failure (typically
+ENOMEM / EMFILE).
+
+Both `fill_saved_regions`-style restore and the cold-start path use
+the same per-region clone pattern.
+
+Backwards compat
+================
+No behaviour change unless the CLI uses fd= explicitly. Configs that
+don't set fd= take the existing memfd_create / file path. The new
+ApplyLandlock rule for uffd_socket is a no-op when uffd_socket is
+unset.
+
+Testing
+=======
+A small Go harness (sandbox-ctl) exercises both single-region (2 GiB)
+and multi-region (8 GiB crossing the PCI hole) configs:
+
+  - parent memfd_create + ftruncate + seal-shrink
+  - cmd.ExtraFiles[0] = memfd, --memory-zone size=N,fd=3,...
+  - guest boots; parent reads the same inode via its own mmap and
+    captures the resident pages with SEEK_DATA/HOLE.
+
+Signed-off-by: Chen Xiaohui <graych@gmail.com>
+---
+ vmm/src/config.rs         | 10 ++++++-
+ vmm/src/memory_manager.rs | 56 +++++++++++++++++++++++++++++++++++++--
+ vmm/src/vm_config.rs      | 19 +++++++++++++
+ 3 files changed, 82 insertions(+), 3 deletions(-)
+
+diff --git a/vmm/src/config.rs b/vmm/src/config.rs
+index a4339c2..a7a64ba 100644
+--- a/vmm/src/config.rs
++++ b/vmm/src/config.rs
+@@ -907,7 +907,9 @@ impl MemoryConfig {
+                     .add("host_numa_node")
+                     .add("hotplug_size")
+                     .add("hotplugged_size")
+-                    .add("prefault");
++                    .add("prefault")
++                    .add("fd")
++                    .add("uffd_socket");
+                 parser.parse(memory_zone).map_err(Error::ParseMemoryZone)?;
+ 
+                 let id = parser.get("id").ok_or(Error::ParseMemoryZoneIdMissing)?;
+@@ -948,6 +950,10 @@ impl MemoryConfig {
+                     .map_err(Error::ParseMemoryZone)?
+                     .unwrap_or(Toggle(false))
+                     .0;
++                let fd = parser
++                    .convert::<i32>("fd")
++                    .map_err(Error::ParseMemoryZone)?;
++                let uffd_socket = parser.get("uffd_socket").map(PathBuf::from);
+ 
+                 zones.push(MemoryZoneConfig {
+                     id,
+@@ -960,6 +966,8 @@ impl MemoryConfig {
+                     hotplug_size,
+                     hotplugged_size,
+                     prefault,
++                    fd,
++                    uffd_socket,
+                 });
+             }
+             Some(zones)
+diff --git a/vmm/src/memory_manager.rs b/vmm/src/memory_manager.rs
+index 03b7b8a..f6e551d 100644
+--- a/vmm/src/memory_manager.rs
++++ b/vmm/src/memory_manager.rs
+@@ -199,6 +199,10 @@ pub enum Error {
+     #[error("Failed to create shared file")]
+     SharedFileCreate(#[source] io::Error),
+ 
++    /// Failed to try_clone() the inherited memfd for a region.
++    #[error("Failed to clone memfd for fd-backed memory region")]
++    MemfdClone(#[source] io::Error),
++
+     /// Failed to set shared file length.
+     #[error("Failed to set shared file length")]
+     SharedFileSetLen(#[source] io::Error),
+@@ -545,6 +549,17 @@ impl MemoryManager {
+         let mut zone_align_size = memory_zone_get_align_size(zone)?;
+         let mut zone_offset = 0u64;
+         let mut memory_zones = HashMap::new();
++        // Adopt the inherited memfd for the current zone (if any). For
++        // multi-region zones (e.g. MMIO splits crossing the PCI hole on
++        // x86-64) we try_clone() the fd per region below; the kernel-
++        // side mmap shares the same shmem inode across all clones, so
++        // every region points at the same memory.
++        // SAFETY: fd was inherited via cmd.ExtraFiles by the parent;
++        // CH owns each clone for its MmapRegion lifetime. Mutated below
++        // when iterating to a new zone.
++        let mut zone_fd: Option<File> = zone
++            .fd
++            .map(|raw| unsafe { File::from_raw_fd(raw) });
+ 
+         if !is_aligned(zone.size, zone_align_size) {
+             return Err(Error::MisalignedMemorySize);
+@@ -595,6 +610,14 @@ impl MemoryManager {
+                     region_start.raw_value(),
+                     region_size
+                 );
++                // try_clone() per region so each MmapRegion owns its
++                // own File handle while sharing the same underlying
++                // inode (multi-region zones, e.g. MMIO splits, all see
++                // the same memory).
++                let existing_memory_file = match zone_fd.as_ref() {
++                    Some(f) => Some(f.try_clone().map_err(Error::MemfdClone)?),
++                    None => None,
++                };
+                 let region = MemoryManager::create_ram_region(
+                     &zone.file,
+                     file_offset,
+@@ -605,7 +628,7 @@ impl MemoryManager {
+                     zone.hugepages,
+                     zone.hugepage_size,
+                     zone.host_numa_node,
+-                    None,
++                    existing_memory_file,
+                     thp,
+                 )?;
+ 
+@@ -643,6 +666,11 @@ impl MemoryManager {
+                         return Err(Error::DuplicateZoneId);
+                     }
+                     memory_zones.insert(zone.id.clone(), MemoryZone::default());
++                    // Pick up the new zone's inherited fd (if any). Keep
++                    // the same SAFETY invariant as the initial setup.
++                    zone_fd = zone
++                        .fd
++                        .map(|raw| unsafe { File::from_raw_fd(raw) });
+                 }
+ 
+                 if ram_region_consumed {
+@@ -668,6 +696,18 @@ impl MemoryManager {
+     ) -> Result<(Vec<Arc<GuestRegionMmap>>, MemoryZones), Error> {
+         let mut memory_regions = Vec::new();
+         let mut memory_zones = HashMap::new();
++        // Adopt each fd-backed zone's inherited fd. Multi-region zones
++        // try_clone() per region below, same pattern as cold-start.
++        let mut zone_fds: HashMap<&str, File> = HashMap::new();
++        for zone_config in zones_config {
++            if let Some(raw) = zone_config.fd {
++                // SAFETY: fd was inherited via cmd.ExtraFiles by the
++                // parent (sandbox-ctl) — same invariant as cold-start.
++                zone_fds.insert(zone_config.id.as_str(), unsafe {
++                    File::from_raw_fd(raw)
++                });
++            }
++        }
+ 
+         for zone_config in zones_config {
+             memory_zones.insert(zone_config.id.clone(), MemoryZone::default());
+@@ -676,6 +716,16 @@ impl MemoryManager {
+         for guest_ram_mapping in guest_ram_mappings {
+             for zone_config in zones_config {
+                 if guest_ram_mapping.zone_id == zone_config.id {
++                    // CLI-provided zone.fd takes precedence over the
++                    // migration-receive HashMap. try_clone() per region
++                    // for the same shared-inode reason as cold-start.
++                    let existing_memory_file = match zone_fds
++                        .get(zone_config.id.as_str())
++                    {
++                        Some(f) => Some(f.try_clone().map_err(Error::MemfdClone)?),
++                        None => existing_memory_files
++                            .remove(&guest_ram_mapping.slot),
++                    };
+                     let region = MemoryManager::create_ram_region(
+                         if guest_ram_mapping.virtio_mem {
+                             &None
+@@ -690,7 +740,7 @@ impl MemoryManager {
+                         zone_config.hugepages,
+                         zone_config.hugepage_size,
+                         zone_config.host_numa_node,
+-                        existing_memory_files.remove(&guest_ram_mapping.slot),
++                        existing_memory_file,
+                         thp,
+                     )?;
+                     memory_regions.push(Arc::clone(&region));
+@@ -877,6 +927,8 @@ impl MemoryManager {
+                 hotplug_size: config.hotplug_size,
+                 hotplugged_size: config.hotplugged_size,
+                 prefault: config.prefault,
++                fd: None,
++                uffd_socket: None,
+             }];
+ 
+             Ok((config.size, zones, allow_mem_hotplug))
+diff --git a/vmm/src/vm_config.rs b/vmm/src/vm_config.rs
+index 5de8c31..22b0850 100644
+--- a/vmm/src/vm_config.rs
++++ b/vmm/src/vm_config.rs
+@@ -159,6 +159,22 @@ pub struct MemoryZoneConfig {
+     pub hotplugged_size: Option<u64>,
+     #[serde(default)]
+     pub prefault: bool,
++    /// Inherited fd for memory backing (e.g. via cmd.ExtraFiles in Go).
++    /// When set, CH skips memfd_create and uses this fd directly via the
++    /// existing_memory_files map for both cold-start and restore. Implies
++    /// the user owns snapshot save/restore externally — `memory_range_table`
++    /// skips this zone's regions, so /vm.snapshot writes no memory-ranges
++    /// for it.
++    #[serde(default)]
++    pub fd: Option<i32>,
++    /// UDS path for the va_report handshake to an external uffd handler.
++    /// When set, CH creates a userfaultfd in this process (mm-bound to
++    /// CH's mm so faults route correctly), registers MISSING on the
++    /// memory zone's mmap, then sends `{type:"va_report", va_start,
++    /// size, zone_id}` to this socket with the uffd_fd attached via
++    /// SCM_RIGHTS. Waits for `{type:"ack"}` before allowing vCPU run.
++    #[serde(default)]
++    pub uffd_socket: Option<PathBuf>,
+ }
+ 
+ impl ApplyLandlock for MemoryZoneConfig {
+@@ -166,6 +182,9 @@ impl ApplyLandlock for MemoryZoneConfig {
+         if let Some(file) = &self.file {
+             landlock.add_rule_with_access(file, "rw")?;
+         }
++        if let Some(socket) = &self.uffd_socket {
++            landlock.add_rule_with_access(socket, "rw")?;
++        }
+         Ok(())
+     }
+ }
+-- 
+2.30.2
+

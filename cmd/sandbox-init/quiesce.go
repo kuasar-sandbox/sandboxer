@@ -7,7 +7,7 @@ import (
 )
 
 // runQuiesce executes the v1 pre-snapshot cleanup sequence
-// (docs/sandbox-runtime.md §3.4):
+// (docs/sandbox-init.md §3.4):
 //
 //  1. sync(2)                                — flush ext4 upperdir dirty
 //  2. echo 3 > /proc/sys/vm/drop_caches      — drop page + dentry/inode cache
@@ -18,7 +18,7 @@ import (
 // not as a halted snapshot.
 //
 // The /tmp tmpfs reset and the application-level signal hook described
-// in docs/sandbox-runtime.md §3.4 (quiesce extension items) are not implemented here.
+// in docs/sandbox-init.md §3.4 (quiesce extension items) are not implemented here.
 func runQuiesce() {
 	t0 := time.Now()
 

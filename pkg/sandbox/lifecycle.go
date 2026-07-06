@@ -756,7 +756,7 @@ func handleSnapshotRequest(
 	reattachMUX func() error, // re-establishes the stdio MUX after --resume; may be nil
 	logf func(string, ...any),
 ) (resp ctl.Response, err error) {
-	// Quiesce sequence (docs/sandbox.md §6.2 T2a, sandbox-runtime.md §3.4):
+	// Quiesce sequence (docs/sandbox.md §6.2 T2a, sandbox-init.md §3.4):
 	// pause the ping ticker, then `quiesce` → the guest does sync +
 	// drop_caches, stops reading the app's stdout/stderr (pty), runs the
 	// graceful MUX_CLOSE handshake on the stdio MUX (the host's mux.Session

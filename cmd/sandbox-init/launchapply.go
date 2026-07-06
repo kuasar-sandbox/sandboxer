@@ -1,6 +1,6 @@
 // Launch-spec application: declarative mounts, file injection, one-shot
 // init commands, and run-as-user resolution. All via raw syscalls — no
-// external tools (docs/sandbox-runtime.md §3.1-§3.2).
+// external tools (docs/sandbox-init.md §3.1-§3.2).
 package main
 
 import (

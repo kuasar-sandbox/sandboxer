@@ -16,7 +16,7 @@ import (
 // LaunchServer accepts the guest's launch-channel connections on a UDS
 // that cloud-hypervisor's hybrid vsock proxies from CID=2 port=5000.
 //
-// The protocol (docs/sandbox-runtime.md §4) is bidirectional and
+// The protocol (docs/sandbox-init.md §4) is bidirectional and
 // short-lived. This server handles the **guest → host** direction:
 //
 //   - hello       → server replies with the LaunchSpec (one-shot)
@@ -77,7 +77,7 @@ type LaunchServer struct {
 	// connection AFTER the final ack is sent: instead of closing it, the
 	// server clears its deadline and hands it to OnMUXReady, which wraps
 	// it in a mux.Session and bridges the app's stdio (the launch conn
-	// becomes the stdio MUX — docs/sandbox-runtime.md §4.5). `established`
+	// becomes the stdio MUX — docs/sandbox-init.md §4.5). `established`
 	// is the channel set echoed by the guest in launch_ack. If nil, the
 	// connection is closed as before (used by tests).
 	OnMUXReady func(conn net.Conn, established proto.StdioSpec)

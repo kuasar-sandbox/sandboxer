@@ -14,7 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The guest side of the stdio MUX (docs/sandbox-runtime.md §3.5 / §4.5).
+// The guest side of the stdio MUX (docs/sandbox-init.md §3.5 / §4.5).
 //
 // consoleBridge owns the user app's stdio fds — a pty master (tty mode)
 // or the sandbox-init ends of stdin/stdout/stderr pipes (pipe mode) —
@@ -48,7 +48,7 @@ const (
 // app-side fds are swapped by rewireApp across an in-place app restart. The
 // pumps are persistent (per sandbox) and re-fetch BOTH the session (from
 // holder) and the app fd (from this bridge, guarded by appMu) so the MUX link
-// survives an app restart with no pump churn (docs/sandbox-runtime.md §3.2).
+// survives an app restart with no pump churn (docs/sandbox-init.md §3.2).
 type consoleBridge struct {
 	tty bool
 	// negotiated channel set (immutable; what start/protoSpec key off).

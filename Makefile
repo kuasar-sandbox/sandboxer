@@ -8,7 +8,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build sandbox-ctl sandbox-init test vet bench clean help
+.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -48,7 +48,7 @@ endef
 # ---------------------------------------------------------------------------
 all: build
 
-build: sandbox-ctl sandbox-init
+build: sandbox-ctl sandbox-init cloud-hypervisor
 
 sandbox-ctl:
 	@mkdir -p $(BINDIR)
@@ -61,6 +61,15 @@ sandbox-init:
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '-s -w' -o $(BINDIR)/sandbox-init ./cmd/sandbox-init
 	$(call link_bin,sandbox-init)
 
+native-deps:
+	$(MAKE) -C native-deps build TARGET_ARCH=$(TARGET_ARCH)
+
+cloud-hypervisor:
+	$(MAKE) -C native-deps cloud-hypervisor TARGET_ARCH=$(TARGET_ARCH)
+	@mkdir -p $(BINDIR)
+	cp -f native-deps/bin/$(TARGET_ARCH)/cloud-hypervisor $(BINDIR)/cloud-hypervisor
+	$(call link_bin,cloud-hypervisor)
+
 test:
 	CGO_ENABLED=0 $(GO) test ./...
 
@@ -69,6 +78,7 @@ vet:
 
 clean:
 	rm -rf bin build
+	$(MAKE) -C native-deps clean
 
 # Go micro-benchmarks. Sandbox-level e2e (cold/snapshot/restore/...) lives in
 # release-builder/test/e2e — they need vmlinux + cloud-hypervisor + mkfs.erofs
@@ -80,6 +90,7 @@ bench:
 help:
 	@echo "sandboxer. Targets:"
 	@echo "  build              sandbox-ctl + sandbox-init"
+	@echo "  cloud-hypervisor   patched VMM consumed by sandbox-ctl"
 	@echo "  sandbox-ctl        host control plane"
 	@echo "  sandbox-init       guest PID 1 binary consumed by guest-runtime"
 	@echo "  test / vet / clean"

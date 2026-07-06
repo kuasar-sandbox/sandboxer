@@ -122,7 +122,7 @@ func (s *Session) SetWinsize(cols, rows uint16) error {
 }
 
 // InitMuxClose performs the guest-initiated graceful close handshake
-// (docs/sandbox-runtime.md §4.6): send MUX_CLOSE, then block until the
+// (docs/sandbox-init.md §4.6): send MUX_CLOSE, then block until the
 // peer's MUX_CLOSE_ACK arrives (or the session ends). After this call
 // returns, data Writes are refused; the caller should then Close().
 // Frames arriving in the meantime are still processed normally.

@@ -1,6 +1,6 @@
 // sandbox-init is the guest PID 1 binary inside the sandbox VM.
 //
-// It runs three phases (docs/sandbox-runtime.md §3):
+// It runs three phases (docs/sandbox-init.md §3):
 //  1. Bring up loopback + bind AF_VSOCK :5000 (socket-only, before hello;
 //     the host→guest reverse channel must exist before the host's ping
 //     ticker fires). Then run the launch handshake (dial CID 2:5000 → hello
@@ -519,7 +519,7 @@ func phase2ForkApp(spec *proto.LaunchSpec, cs childStdio) (int, error) {
 	// never leaks its own (e.g. /proc) back. Cold-start mounts/files are
 	// already in place and become shared peers in the copy. Without this,
 	// a restore-time bind stays invisible to the already-running app
-	// (docs/sandbox-runtime.md §4.3).
+	// (docs/sandbox-init.md §4.3).
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_SHARED, ""); err != nil {
 		return 0, fmt.Errorf("make-rshared /: %w", err)
 	}

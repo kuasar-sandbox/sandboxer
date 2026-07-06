@@ -7,7 +7,7 @@ import (
 
 // Shared restart machinery for the user app (launch.restart) and companion
 // plugins (launch.plugin[]). Both use the same exponential backoff and the
-// same restart-policy decision (docs/sandbox-runtime.md §3.2).
+// same restart-policy decision (docs/sandbox-init.md §3.2).
 
 const (
 	backoffMin   = 10 * time.Millisecond

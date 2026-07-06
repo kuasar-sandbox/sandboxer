@@ -34,14 +34,16 @@ make vet test
 ```
 
 构建需要 Go 1.24+;运行还需 **guest-runtime** 产出的 `sandbox-runtime.erofs`
-以及 **guest-runtime/native-deps** 产出的原生件:`vmlinux`(guest 内核)、
-`cloud-hypervisor`(VMM,平台 patch)、`mkfs.erofs`。
+以及 **guest-runtime/native-deps** 产出的 `vmlinux`(guest 内核)、
+`mkfs.erofs`;patched `cloud-hypervisor` 由本仓 `sandboxer/native-deps` 构建并由
+`sandbox-ctl` 启动。
 
 ## 跨仓依赖(薄)
 
 | 依赖 | 用途 | 解析 |
 |---|---|---|
-| `accelerator/pkg/manifest`(+ `pkg/image`、`cache`/`store` client) | 快照 ingest/fetch、vhost 块读、读展平镜像内嵌的 RuntimeConfig | `replace => ../accelerator` |
+| `accelerator/pkg/manifest`(+ `cache`/`store` client) | 快照 ingest/fetch、vhost 块读 | `replace => ../accelerator` |
+| `accelerator/pkg/image` | 读取展平镜像内嵌的 RuntimeConfig | `replace => ../accelerator` |
 | `connector/pkg/tapfd` | tapfd 交接消费侧(`RecvFdsWithNetns`) | `replace => ../connector` |
 
 均为纯 Go、无 CGO 的导入面——整仓 `CGO_ENABLED=0` 构建,不引入 rocksdb / eBPF
@@ -52,5 +54,7 @@ make vet test
 
 - [docs/sandbox.md](docs/sandbox.md) — host 控制平面:`sandbox-ctl` 命令行、
   sandbox.yaml、冷启动/快照/恢复数据流、uffd handler、资源模型。
-- [docs/sandbox-runtime.md](docs/sandbox-runtime.md) — guest 运行时:
+- [docs/sandbox-init.md](docs/sandbox-init.md) — guest PID 1 ABI:
   `sandbox-init` 三阶段、vsock 控制面 + stdio MUX 协议、应用契约。
+- [docs/cloud-hypervisor.md](docs/cloud-hypervisor.md) — patched CH 与
+  `sandbox-ctl` 的外部 memfd/uffd/balloon 契约。

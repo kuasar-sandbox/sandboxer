@@ -167,7 +167,7 @@ sandbox-ctl run [flags]
                           = 冷启动模式。restore 模式下 sandbox.yaml 字段语义
                           见 §11.0
 
-  # 应用 stdio(冷启动 + 恢复模式都生效;详见 docs/sandbox-runtime.md §3.5 / §4.5)
+  # 应用 stdio(冷启动 + 恢复模式都生效;详见 docs/sandbox-init.md §3.5 / §4.5)
   #
   # 应用的 stdin/stdout/stderr(或一个伪终端)经 vsock MUX 与 sandbox-ctl 双向
   # 转发,不与内核 dmesg 混流。CH 进程自身的 stdio:stdin = /dev/null、stdout =
@@ -198,7 +198,7 @@ sandbox-ctl run [flags]
                           模式下做 \n→\r\n 转换);file=<path>:写 <path>;
                           journald=<tag>:逐行写 journald(SYSLOG_IDENTIFIER=<tag>)
 
-  # 端口转发(冷启动 + 恢复模式都生效;详见 docs/sandbox-runtime.md §3.7)
+  # 端口转发(冷启动 + 恢复模式都生效;详见 docs/sandbox-init.md §3.7)
   --connect <L:TARGET>    dial 模式:host 本地端点 L 转发到沙箱内 TARGET,可重复。
   --connect <L::TARGET>   accept 模式:guest 在 TARGET 上 Listen+Accept,与 L 的每条
                           本地连接配对。L = UDS 路径(@name 抽象)或 fd=N(继承的已
@@ -211,12 +211,12 @@ sandbox-ctl run [flags]
 **行为**:阻塞前台运行,直到 CH 退出或收到 SIGTERM/SIGINT。退出码:应用正常退出 →
 应用退出码;应用被信号杀 → 128+signal;guest panic / CH 异常退出 → CH 退出码映射。
 应用退出码来自 guest 经 vsock 发的 `app_exited{code, term_signal}`(见
-[`sandbox-runtime.md`](sandbox-runtime.md) §4.3);拿不到时回退 CH 退出码。
+[`sandbox-init.md`](sandbox-init.md) §4.3);拿不到时回退 CH 退出码。
 
 **进程组与信号**:sandbox-ctl spawn CH 时给它一个新进程组(`Setpgid`),CH 因此不在
 sandbox-ctl 控制终端的前台进程组——终端产生的 `^C` / `^\` / `^Z` 不会直达 CH。host
 信号(SIGTERM/SIGINT)由 sandbox-ctl 统一处理(只在此一处注册),收到即转发 SIGTERM
-给 CH、宽限后 SIGKILL(与 [`sandbox-runtime.md`](sandbox-runtime.md) §3.3 的退出
+给 CH、宽限后 SIGKILL(与 [`sandbox-init.md`](sandbox-init.md) §3.3 的退出
 序列衔接)。`--tty` raw 模式下终端是 raw 的、`^C` 不产生 SIGINT(见上);非 raw 模式
 下 `^C` 正常触发上述 SIGTERM 升级链。
 
@@ -235,7 +235,7 @@ sandbox-ctl 控制终端的前台进程组——终端产生的 `^C` / `^\` / `^
 - `--tty` 与 `--stdin` / `--stdout` / `--stderr` / `--stdin-from` / `--stdout-to`
   / `--stderr-to` 中任一显式赋值互斥(`--tty` 是伪终端模式,没有分流概念)
 - 显式 `--tty`(或 `--tty=true`)但 stdin 或 stdout 不是终端 → 报错(host 侧 pty
-  无意义,见 [`sandbox-runtime.md`](sandbox-runtime.md) §3.5)
+  无意义,见 [`sandbox-init.md`](sandbox-init.md) §3.5)
 - `--stdin=false` 与 `--stdin-from` 互斥;`--stdout=false` 与 `--stdout-to` 互斥;
   `--stderr=false` 与 `--stderr-to` 互斥
 
@@ -330,13 +330,13 @@ pty EOF 之后发出),exec 收到即结束并还原终端,不依赖底层连接�
 **传输路径**:`sandbox-ctl exec` → `<run-dir>/<sid>/ctl.sock`(§6.3,与 snapshot
 共用该 UDS 协议)→ sandbox-ctl run 进程 → 经反向 vsock 通道发 `exec` 操作给
 sandbox-init → guest 为这次 exec 起一条**独立的 stdio MUX**(详见
-[`sandbox-runtime.md`](sandbox-runtime.md) §3.6 / §4.3)。run 进程在握手后只做
+[`sandbox-init.md`](sandbox-init.md) §3.6 / §4.3)。run 进程在握手后只做
 ctl.sock ↔ guest vsock 的透明字节转发,MUX 端到端跑在 `sandbox-ctl exec` 与
 guest 之间。多个 exec 会话并发互不影响。
 
 **与 snapshot 的关系**:snapshot quiesce 期间拒绝新的 exec,并 SIGKILL 在飞的
 exec 子进程(快照不能带运行中的 exec 兄弟进程);沙箱 resume / restore 后恢复
-受理。详见 §6.2 与 [`sandbox-runtime.md`](sandbox-runtime.md) §3.6。
+受理。详见 §6.2 与 [`sandbox-init.md`](sandbox-init.md) §3.6。
 
 ### 2.5 `sandbox-ctl config`
 
@@ -467,7 +467,7 @@ boot:
                                               # 已存在的 diff 忽略此项
       diff_size: 1GiB                         # 可选,默认 1GiB。仅在"创建空白 diff"(无模板、
                                               # 无 base)时用于定尺寸;已有 diff 保持自身大小
-    # —— 单磁盘模式:省略上面的 overlay 即启用(详见 docs/sandbox-runtime.md §3.1)——
+    # —— 单磁盘模式:省略上面的 overlay 即启用(详见 docs/sandbox-init.md §3.1)——
     # 不写 boot.root.overlay 时,root 盘本身是可写 ext4,直接挂为 disk0(无 overlayfs、无 disk1)。
     # 下面三项是 overlay.{diff,diff_template,diff_size} 的 root 层等价物,给 root 盘写能力;
     # 与 overlay.* 互斥。base 可选(须是 ext4 镜像作 CoW 下层);无 erofs 镜像 ⇒ 无内嵌
@@ -480,7 +480,7 @@ boot:
   # 每块盘的配置规则与 boot.root 完全相同(单盘 diff / 双盘 overlay,含 base_from_refs);
   # 多一个 name(仅配置期用,运行期转序号)。每块盘必须被 mounts[].type=disk 挂载恰好一次
   # (定义却不挂载 = 配置错误)。设备序:root 在前(单盘 1 个 / overlay 2 个),再按本数组序,
-  # 决定 guest /dev/vd[a,b,c…];详见 docs/sandbox-runtime.md §3.1。
+  # 决定 guest /dev/vd[a,b,c…];详见 docs/sandbox-init.md §3.1。
   disks:
     - name: scratch                            # 单盘:可写 ext4(diff/diff_template/diff_size)
       diff_template: file:///opt/sandbox/disk-templates/scratch-50G.ext4
@@ -513,7 +513,7 @@ launch:
   stop_signal: SIGTERM        # 停机信号(覆盖镜像 StopSignal);信号名或编号;空 → SIGTERM
   stop_grace_period: 10s      # 发停机信号后等应用退出的宽限,超时则 SIGKILL;默认 10s
   start_timeout: ""           # host 等待 launch_ack(含 init 全程)的超时;空 / 0 = 无限期
-                              #   (见 sandbox-runtime.md §4.10)
+                              #   (见 sandbox-init.md §4.10)
   # 伴生进程(plugin):与 launch.exec 同 rootfs/cgroup/网络运行的常驻 sidecar,各自独立监督。
   # plugin 退出不影响沙箱生命周期(只有 launch.exec 退出才按 launch.restart 决定 reboot/重启)。
   plugin:
@@ -606,7 +606,7 @@ CH API 是本地管理调用、快且不受远程/缓存慢影响,60s 是安全�
 
 **`mounts` / `files` / `init` 的应用时机**:三者均在 guest 收到 LaunchSpec 后、
 应用进程拉起前生效(`init` 在 `launch_ack` 之前完成,故 host 的 "settled" 信号代表
-"环境与 init 全部就绪",详见 [`sandbox-runtime.md`](sandbox-runtime.md) §3.2)。
+"环境与 init 全部就绪",详见 [`sandbox-init.md`](sandbox-init.md) §3.2)。
 `mounts` 的 `empty` 卷落 vdb(磁盘、不耗内存),`files` 落内存盘(不进磁盘快照层)。
 
 **冷启动(golden) vs restore(per-instance)注入**:`mounts` / `init` / 静态
@@ -651,7 +651,7 @@ sandbox-init 以 flush-and-replace 重配网卡(克隆取新 L3 身份,见 §11.
 
 **`launch.*` / `mounts` / `files` / `init` 不进 cmdline**:容器启动配置
 (exec/args/env/workdir/restart/user/stop_signal/stop_grace_period)及挂载 / 文件 /
-初始化命令均通过 vsock 在运行时下发,见 [`sandbox-runtime.md`](sandbox-runtime.md)
+初始化命令均通过 vsock 在运行时下发,见 [`sandbox-init.md`](sandbox-init.md)
 §3.2。`start_timeout` 仅在 host 侧约束 launch 握手等待。
 
 ### 3.2 file:// vs manifest:// truth table
@@ -961,7 +961,7 @@ T18  va_report server 收到 sendmsg:
      T18c epoll_create1 → add uffd_C → 起 reader + N worker
      T18d 回 ack 给 CH
 T19  Guest 内 kernel 启动 → mount /dev/pmem0 → exec /sbin/init = sandbox-init
-     sandbox-init 三阶段(详见 sandbox-runtime.md §3):
+     sandbox-init 三阶段(详见 sandbox-init.md §3):
      T19a phase 1 mount + overlay + chroot;AF_VSOCK bind+listen :5000
      T19b phase 2 dial host:5000 → hello → host 回 launch{spec, stdio} → guest 备好
           app stdio(tty: openpty / pipe: socketpair)→ launch_ack{stdio} → host 回 ack
@@ -972,12 +972,12 @@ T19  Guest 内 kernel 启动 → mount /dev/pmem0 → exec /sbin/init = sandbox-
 T20  vCPU 跑过程中:
      · stdio MUX:STDIN / STDOUT / STDERR(或 PTY)+ WINDOW_UPDATE / SET_WINSIZE
        帧在 sandbox-ctl ↔ sandbox-init 间双向流动;MUX 因故断 → sandbox-ctl 拨新
-       连接发 attach 重建(详见 sandbox-runtime.md §4.5 / §4.6)
+       连接发 attach 重建(详见 sandbox-init.md §4.5 / §4.6)
      · vCPU 首次访问页 → uffd_C MISSING fault → handler 走 Absent → ZEROPAGE
      · backend 访问 backendVA → kernel 默认 shmem 缺页:folio 已存在(handler 装的)→
        直接装 sandbox-ctl mm PTE,无 uffd 事件
      · sandbox-init 周期(默认 5s)从 /proc/meminfo 读 MemAvailable/MemTotal,
-       走短连接发 mem_report(sandbox-runtime.md §4.3)给 host
+       走短连接发 mem_report(sandbox-init.md §4.3)给 host
      · host BalloonController 按策略推 desired_balloon target(详见 §9.3),通过
        CH HTTP API PUT /api/v1/vm.resize 落到 guest;guest balloon 驱动 inflate
        → CH 在 memfd 上 fallocate(PUNCH_HOLE) + 在 chVA 上 madvise(DONTNEED)
@@ -1035,14 +1035,14 @@ cloud-hypervisor \
 - `--memory-zone fd=3,uffd_socket=...`:patched CH 跳过 memfd_create,直接用
   sandbox-ctl 传入的 fd 当 backing;在 create_ram_region 内自己创建 uffd,
   通过 uffd_socket 发 va_report + SCM_RIGHTS,等 sandbox-ctl ack 后才允许
-  vCPU 跑(详见 `guest-runtime/native-deps/docs/cloud-hypervisor.md`)
+  vCPU 跑(详见 `sandboxer/docs/cloud-hypervisor.md`)
 - `--pmem discard_writes=on` 让 guest 写 pmem 不影响 host 文件
 - blk0 readonly=on 在 vhost-user 协议层告知 guest 这是只读盘
 - `--vsock cid=3,socket=...`:CH 创建 virtio-vsock 设备,guest CID=3,通过 hybrid
   代理把 guest port 5000 流量映射到 host UDS。承载控制面短连接(launch / ping /
   app_started / app_exited / mem_report / quiesce / restore / attach),以及
   launch / restore / attach 那条连接握手后升级而成的应用 stdio MUX(详见
-  [`sandbox-runtime.md`](sandbox-runtime.md) §4)
+  [`sandbox-init.md`](sandbox-init.md) §4)
 - `--console tty`:CH 把 guest 的 virtio-console(hvc0)接到 CH 进程自身的 stdout。
   sandbox-ctl 给 CH 的 stdout 是一根匿名管道,从读端拿到内核 dmesg 流,按
   `run --console` 决定去向(§2.2)。CH 进程的 **stdin = /dev/null** 是关键——CH 的
@@ -1051,7 +1051,7 @@ cloud-hypervisor \
   CH 的 stderr = sandbox-ctl 的 stderr(CH 自己的 WARN)
 - `--serial off`:没有 8250 UART;内核控制台的唯一出口是 hvc0。应用的
   stdin/stdout/stderr 不经此路,走 vsock MUX(详见
-  [`sandbox-runtime.md`](sandbox-runtime.md) §3.5 / §4.5)
+  [`sandbox-init.md`](sandbox-init.md) §3.5 / §4.5)
 - cmdline 中的 `console=hvc0` 由平台自动注入(§3.1),内核 dmesg 始终走 hvc0
 
 ## 6. snapshot 数据流
@@ -1149,10 +1149,10 @@ T2  目标进程串行:
         exec 兄弟进程;沙箱 resume/restore 后解除)→ **freeze 应用进程树**
         (cgroup.freeze=1,等 cgroup.events 至 frozen 1)→ sync + drop_caches →
         停读应用 stdout/stderr(pty master)→ 拆除所有 connect 端口转发中继(SO_LINGER
-        确认拆除,sandbox-runtime.md §3.7)→ 在 stdio
+        确认拆除,sandbox-init.md §3.7)→ 在 stdio
         MUX 上发起优雅关闭握手(sandbox-ctl 的 MUX 端响应 MUX_CLOSE_ACK 并读到 EOF
         确认 MUX 已彻底关闭)→ 回 quiesced。quiesced 一回来即表示"应用已冻结、MUX
-        与转发已关、guest 干净态",可继续 T2b;deadline(见 sandbox-runtime.md §4.10)内未
+        与转发已关、guest 干净态",可继续 T2b;deadline(见 sandbox-init.md §4.10)内未
         收到 quiesced(含 freeze 在有界等待内未确认 frozen)→ 视为协议失败,**放弃
         此次 snapshot**(绝不带半冻结/半开 MUX 快照),sandbox 继续运行
     T2b CH /vm.pause:vCPU 暂停,virtio 设备 quiesce
@@ -1199,7 +1199,7 @@ T8  resume_after=true:CH /vm.resume,沙箱原地续跑;quiesce 时 guest 冻结�
                   残留 + 应用 stdio)。attach 只管 MUX 传输、不等同"快照后 resume";
                   guest 因仍处 quiesce 冻结态(attach 是其首个 post-resume 接触)
                   据自身冻结状态补做 thaw——属 quiesce 生命周期而非 attach 语义,
-                  见 sandbox-runtime.md §4.3 / §4.6
+                  见 sandbox-init.md §4.3 / §4.6
     resume_after=false(默认):CH /vm.shutdown,等 CH 退出 → sandbox-ctl run
                   进程也退出
 T9  ctl.sock 回 snapshot_done
@@ -1255,11 +1255,11 @@ UDS,承载两类宿主侧控制请求:`snapshot`(一问一答)与 `exec`(握手�
 | `exec` | object | `{ argv:[...], env:{K:V}, cwd, user, stdio }`——要执行的命令与协商的 stdio(对应 §2.4 的 flag;user 在 app ns 内按镜像 /etc/passwd 解析) |
 
 run 进程收到后向 guest 反向通道发 `exec` 操作(见
-[`sandbox-runtime.md`](sandbox-runtime.md) §4.3),拿到 guest 实际建立的 stdio
+[`sandbox-init.md`](sandbox-init.md) §4.3),拿到 guest 实际建立的 stdio
 规格后回 `exec_ack`(`{ "type":"exec_ack", "stdio":{...} }`),**此后该 ctl.sock
 连接不再收发 JSON,而是被 run 进程透明转发为 `sandbox-ctl exec` ↔ guest 之间
 的端到端 stdio MUX**(含 EXIT_STATUS 帧与优雅 MUX_CLOSE,详见
-[`sandbox-runtime.md`](sandbox-runtime.md) §4.5 / §4.6)。
+[`sandbox-init.md`](sandbox-init.md) §4.5 / §4.6)。
 
 任一请求出错回 `{"type": "error", "msg": "<reason>"}`:snapshot 不可达状态
 (CH 已退出 / 配置不一致 / out_dir+upload 都给或都没给)、或 exec 被拒
@@ -1484,7 +1484,7 @@ guest balloon 驱动充气分配的页**从不被 guest 写入**(`balloon_page_a
 (实测冷启动 ~99%)在 memfd 上是从未触碰的空洞——无 inode 页、无 PTE、无可
 释放物。CH 的 release 用一次 `lseek(SEEK_DATA)` 探测该 run 是否整段空洞,
 空洞则**跳过 (1)(2)**(平台 patch,见
-`guest-runtime/native-deps/docs/cloud-hypervisor.md` §3.4):无 madvise → 无同步握手,
+`sandboxer/docs/cloud-hypervisor.md` §3.4):无 madvise → 无同步握手,
 balloon 线程以内存速度扫过这 ~99% 的页 → **收敛近乎瞬时**。
 
 剩下少量(实测 ~1%)是 guest 启动期经 vhost-blk 后端 / 内核拉进 page cache
@@ -1599,7 +1599,7 @@ CH 命令行(三种模式都用,跟 cgroup 解耦):
   空洞(memfd 稀疏未 prefault),CH 的 release 对空洞 run 跳过 PUNCH/madvise
   → 省去同步 `EVENT_REMOVE` 握手,充气收敛近乎瞬时;少量确驻留的
   瞬态 page cache 仍合法回收(机制见 §8.5 与
-  `guest-runtime/native-deps/docs/cloud-hypervisor.md` §3.4)
+  `sandboxer/docs/cloud-hypervisor.md` §3.4)
 - **不**启用 `free_page_reporting`。FPR 让 guest 在每轮 page reclaim 中把空闲
   页号高频推到 host,CH 的 `release_memory_range` 对自身 mmap 做
   `madvise(MADV_DONTNEED)` 广播 mmu_notifier 失效到 KVM EPT,持续的 IPI
@@ -1678,7 +1678,7 @@ startup → settled,不进入 burst / recover;restoring 仅在快照恢复路径
   拿到 launch spec 启动用户进程的时刻
 - **恢复 restoring → settled**:由 host 收到 sandbox-init 的 `restore_ack` 触发
   (host→guest `restore{epoch}` 短连接,sandbox-init 立即 reply `restore_ack`,
-  该连接随后升级为新的 stdio MUX,见 §7 / sandbox-runtime.md §4.3)
+  该连接随后升级为新的 stdio MUX,见 §7 / sandbox-init.md §4.3)
 
 ### 10.2 各阶段的 cgroup 与 balloon
 
@@ -2071,7 +2071,7 @@ vmlinux 通过 `boot.kernel: file://...` 提供:
 - **in-guest userfaultfd 系统调用**:`CONFIG_USERFAULTFD` 未启用
 - **NR_CPUS 上限 4**
 
-详见 `guest-runtime/native-deps/docs/sandbox-kernel.md` §3、§5。
+详见 `guest-runtime/docs/vmlinux.md` §3、§5。
 
 ### 14.3 扩展点(用例驱动)
 
@@ -2080,25 +2080,25 @@ vmlinux 通过 `boot.kernel: file://...` 提供:
 | **DISCARD with overlay.base layer** | 引入 manifest:// base + 本地 diff 部署形态 | 三态 stateMap(clean/dirty/discard,2 bits/block) |
 | **memory hotplug / virtio-mem** | 弹性扩缩用例 | uffd 动态 register、状态表扩容 |
 | **incremental snapshot** | 频繁 snapshot 同一 sandbox 的用例 | KVM_GET_DIRTY_LOG 接入 + log-mode CH 协调 |
-| **应用 quiesce hook** | 跨实例去重率超过 kuasar-sandbox.md §4.6 量化的"非确定性 50-70%"上限的用例 | sandbox-runtime.md §3.4 quiesce 扩展项表 |
+| **应用 quiesce hook** | 跨实例去重率超过 kuasar-sandbox.md §4.6 量化的"非确定性 50-70%"上限的用例 | sandbox-init.md §3.4 quiesce 扩展项表 |
 
 ## 15. See Also
 
-- [`sandbox-runtime.md`](sandbox-runtime.md) —— guest 内 sandbox-init 三阶段
+- [`sandbox-init.md`](sandbox-init.md) —— guest 内 sandbox-init 三阶段
   与 vsock 控制面协议
-- `guest-runtime/native-deps/docs/cloud-hypervisor.md` —— CH patches、命令行选项、
+- `sandboxer/docs/cloud-hypervisor.md` —— CH patches、命令行选项、
   外部托管内存契约
-- `guest-runtime/native-deps/docs/sandbox-kernel.md` —— guest kernel defconfig、平台
+- `guest-runtime/docs/vmlinux.md` —— guest kernel defconfig、平台
   ABI 边界
 - `guest-runtime/native-deps/docs/build.md` —— 原生依赖(mkfs.erofs / vmlinux /
-  cloud-hypervisor / envd)的构建流程
+  envd)的构建流程
 - `orchestrator/docs/node-resource.md` —— 资源控制协议规范、节点级仲裁、
   admission、reclaimer
 - `accelerator/docs/manifest.md` —— manifest:// 资源拉取通道
   (blk0 base、snapshot)
 - `accelerator/docs/cache.md` —— sandbox-ctl 通过 cache-ctl 客户端做
   chunk-level 请求
-- `accelerator/docs/flatten.md` —— 构建 boot.root.base 的 EROFS 镜像
+- `guest-runtime/docs/flatten.md` —— 构建 boot.root.base 的 EROFS 镜像
 - `orchestrator/release-builder/docs/perf.md` —— 沙箱性能基线与密度调优
 - `orchestrator/release-builder/docs/kuasar-sandbox.md` §2.4 / §3.3 / §4.6 —— 沙箱在系统中的
   位置与目标

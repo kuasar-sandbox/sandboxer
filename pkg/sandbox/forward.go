@@ -18,7 +18,7 @@ import (
 // ForwardSpec is one parsed `--connect` directive: accept connections on
 // a host-local endpoint (a UDS path or an inherited listening socket fd)
 // and splice each to a guest-side endpoint via a per-connection reverse
-// channel (proto.TypeConnect → fwd frame relay, docs/sandbox-runtime.md
+// channel (proto.TypeConnect → fwd frame relay, docs/sandbox-init.md
 // §3.7). The host side is identical for every mode (it listens on the
 // local endpoint); Accept selects what the guest does at the target —
 // dial it (false) or Listen+Accept on it (true).

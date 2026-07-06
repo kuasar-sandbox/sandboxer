@@ -2,7 +2,7 @@
 // snapshot freezer.
 //
 // The platform guest kernel enables CONFIG_CGROUPS=y plus the cpu/memory/io/
-// pids controllers (docs/sandbox-kernel.md §5.2). sandbox-init: (1) mounts the
+// pids controllers (guest-runtime/docs/vmlinux.md §5.2). sandbox-init: (1) mounts the
 // cgroup v2 hierarchy; (2) delegates the available controllers to children via
 // the root cgroup.subtree_control, so the per-process cgroups envd creates
 // inside the guest (ptys/socats/user) actually expose cpu.weight / memory.* /
@@ -11,7 +11,7 @@
 // freezes it before a snapshot quiesce / thaws it once the restore environment
 // is rebuilt — so the snapshot captures the app stopped and keeps it stopped
 // across /vm.resume until sandbox-init has re-fixed the environment,
-// eliminating the resume-vs-env-init race (docs/sandbox-runtime.md §3.4).
+// eliminating the resume-vs-env-init race (docs/sandbox-init.md §3.4).
 //
 // All work is plain syscalls + cgroupfs writes; no external tools.
 package main
@@ -115,7 +115,7 @@ func cgroupPlaceApp(pid int) error {
 // A confirmed freeze is a hard precondition for `quiesced`: a
 // half-frozen snapshot is exactly the resume-vs-env race we eliminate,
 // so on timeout this returns an error and the caller must NOT send
-// quiesced (host then abandons the snapshot; see docs/sandbox-runtime.md
+// quiesced (host then abandons the snapshot; see docs/sandbox-init.md
 // §3.4 错误处理).
 func cgroupFreeze() error {
 	if err := os.WriteFile(cgroupFreezeFile, []byte("1"), 0); err != nil {

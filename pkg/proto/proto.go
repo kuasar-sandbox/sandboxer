@@ -2,7 +2,7 @@
 // sandbox-init control channel that runs over virtio-vsock, plus the
 // constants shared with the stdio MUX sub-protocol (pkg/mux).
 //
-// Two kinds of connections (docs/sandbox-runtime.md §4):
+// Two kinds of connections (docs/sandbox-init.md §4):
 //
 //	(1) Management short connections — one request + one response per
 //	    connection, then close. Both directions reuse port 5000:
@@ -26,7 +26,7 @@
 //	    connection: a `connect{ConnectSpec}` → `connect_ack` handshake,
 //	    then the conn switches to the fwd frame sub-protocol
 //	    (pkg/fwd) which splices the bytes to a guest-side dial
-//	    target with TCP half-close preserved (docs/sandbox-runtime.md §3.7).
+//	    target with TCP half-close preserved (docs/sandbox-init.md §3.7).
 //
 // This package is dependency-light (stdlib only) so the guest
 // sandbox-init binary can import it without dragging in YAML or other
@@ -112,7 +112,7 @@ type LaunchSpec struct {
 	// Plugins are companion ("plugin") processes launched alongside the app,
 	// in the same guest rootfs + cgroup, each supervised by its own restart
 	// policy + the shared backoff. A plugin exit never affects the sandbox
-	// lifecycle (only the app's exit does). docs/sandbox-runtime.md §3.2.
+	// lifecycle (only the app's exit does). docs/sandbox-init.md §3.2.
 	Plugins []PluginSpec `json:"plugins,omitempty"`
 
 	// User is the run-as identity for the app process: "uid:gid" or
@@ -127,7 +127,7 @@ type LaunchSpec struct {
 	StopGraceSec int `json:"stop_grace_sec,omitempty"`
 
 	// Mounts / Files / Init drive guest environment setup before the app
-	// is forked (docs/sandbox-runtime.md §3.1-§3.2). Mounts: tmpfs + empty
+	// is forked (docs/sandbox-init.md §3.1-§3.2). Mounts: tmpfs + empty
 	// (volume) mounts. Files: content injected via tmpfs+bind (memory-only).
 	// Init: one-shot commands run sequentially (initContainers semantics).
 	Mounts []MountSpec `json:"mounts,omitempty"`
@@ -214,7 +214,7 @@ type NetworkSpec struct {
 // in LaunchSpec (what the host wants) and is echoed back — possibly
 // narrowed — in launch_ack / restore_ack / attach_ack (what the guest
 // actually set up). It maps directly onto the MUX stream set
-// (docs/sandbox-runtime.md §3.5 / §4.5):
+// (docs/sandbox-init.md §3.5 / §4.5):
 //
 //   - TTY == true  → pty mode: the app gets a real pty (isatty()=true);
 //     MUX streams = {control, pty}. stdin/stdout/stderr ignored
@@ -265,7 +265,7 @@ type ExecSpec struct {
 // guest-side stream connection at Address and splice it to the host-side
 // listener that accepted the local connection. It backs `sandbox-ctl run
 // --connect` port forwarding. How the guest obtains that connection is set
-// by Accept (docs/sandbox-runtime.md §3.7):
+// by Accept (docs/sandbox-init.md §3.7):
 //
 //   - Accept == false (dial mode, `LOCAL:TARGET`): guest `net.Dial`s
 //     Address — reaches a server already listening inside the sandbox.
@@ -377,7 +377,7 @@ type Message struct {
 	Msg string `json:"msg,omitempty"`
 }
 
-// Message type constants. See docs/sandbox-runtime.md §4.3 for the
+// Message type constants. See docs/sandbox-init.md §4.3 for the
 // directions, the request/response pairs, and which connections upgrade
 // to the MUX after their *_ack.
 const (
@@ -404,7 +404,7 @@ const (
 	TypeError        = "error"
 )
 
-// Default per-message deadlines (docs/sandbox-runtime.md §4.9). Callers
+// Default per-message deadlines (docs/sandbox-init.md §4.9). Callers
 // pass these to SetDeadline on the underlying conn covering dial+write+
 // read of the management exchange. For launch/attach the deadline covers
 // only the handshake — the connection then lives on as the MUX. (The restore

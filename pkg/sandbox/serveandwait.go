@@ -138,7 +138,7 @@ type VMParams struct {
 
 	// Forwards are the parsed `--connect` port-forward directives. Each
 	// gets a host-local listener whose accepted connections are spliced to
-	// a guest-side target via a reverse channel (docs/sandbox-runtime.md
+	// a guest-side target via a reverse channel (docs/sandbox-init.md
 	// §3.7). Empty → no port forwarding.
 	Forwards []ForwardSpec
 

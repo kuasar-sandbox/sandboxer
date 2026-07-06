@@ -16,7 +16,7 @@ import (
 // policy with the shared backoff (supervise.go). A plugin's exit never affects
 // the sandbox lifecycle — only the user app's exit does. Plugins are
 // sandbox-init's direct children, so the phase3Supervise Wait4(-1) reaper
-// collects them and routes their exits here (docs/sandbox-runtime.md §3.2).
+// collects them and routes their exits here (docs/sandbox-init.md §3.2).
 
 // pluginProc is one supervised plugin: its spec + backoff state. pending marks
 // a relaunch deferred by a snapshot quiesce, issued at endQuiesce.

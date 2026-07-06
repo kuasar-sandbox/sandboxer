@@ -1,12 +1,13 @@
-# sandbox-runtime — guest 运行时
+# sandbox-init — guest PID 1 ABI
 
-guest 内 PID 1 二进制 `sandbox-init` 与承载它的根文件系统镜像
-`sandbox-runtime.erofs`。负责沙箱启动期 rootfs 组装、应用拉起、生命周期监督、
-应用 stdio/console 转发、以及与 host sandbox-ctl 之间的控制面通信。
+`sandbox-init` 是每个 sandbox guest 内的 PID 1,由 `sandboxer/cmd/sandbox-init`
+构建,再由 `guest-runtime` 打包进 `sandbox-runtime.erofs`。本文档定义
+`sandbox-init` 与 host 侧 `sandbox-ctl` 之间的 ABI:启动期 rootfs 组装、launch
+握手、应用拉起、生命周期监督、stdio/console 转发、exec/attach/quiesce 控制面。
 
-`sandbox-runtime` 是节点级共享资产——所有 sandbox 通过 virtio-pmem + DAX
-直接映射 host 上同一份 erofs 文件,获得无运行时拷贝、跨 sandbox 共享 host
-page cache 的密度收益。
+`sandbox-runtime.erofs` 的镜像打包、内置 guest payload、版本发布与构建流程见
+`guest-runtime/docs/sandbox-runtime.md`。本文件只讨论镜像内 `/sbin/init` 的
+运行契约,以及 `sandbox-ctl` 启动 microVM 后如何与它对接。
 
 ## 1. 概述
 
@@ -1075,9 +1076,9 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
 
 - [`sandbox.md`](sandbox.md) §2.2(`run` 的 `--tty` / `--console` / stdio 标志)、
   §5.2(CH 冷启动命令行)、§6.2 / §6.3(snapshot 时序 / ctl.sock 协议)、§7(恢复)
-- `guest-runtime/native-deps/docs/sandbox-kernel.md` —— guest kernel 启用的 namespace /
+- `guest-runtime/docs/vmlinux.md` —— guest kernel 启用的 namespace /
   文件系统 / virtio-console / 网络功能为何如此
-- `guest-runtime/native-deps/docs/cloud-hypervisor.md` §5.2 —— vsock hybrid 代理:host
+- `sandboxer/docs/cloud-hypervisor.md` §5.2 —— vsock hybrid 代理:host
   侧映射到 UDS 的 CONNECT 行格式;`--console` / `--serial` 的用法
 - `guest-runtime/native-deps/docs/build.md` §2.1 —— mkfs.erofs 构建(`guest-runtime make sandbox-runtime` 的前置工具)
 - `orchestrator/release-builder/docs/kuasar-sandbox.md` §4.6 —— quiesce prep 必做项的目标依据
