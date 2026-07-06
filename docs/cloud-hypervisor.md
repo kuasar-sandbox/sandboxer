@@ -41,7 +41,7 @@
 
 - patch 文件位置:`deps/ch-patches/000{1,2,3,4}-*.patch`
 - 应用方式:`make ch-patches-apply`(在 `make cloud-hypervisor` 内自动调);
-  开发循环与幂等 sanity 语义见 native-deps `docs/build.md` §3
+  开发循环与幂等 sanity 语义见 `sandboxer/native-deps/README.md` §3
 - 跟 upstream rebase:每个 CH 大版本(~3 月)review 一次,几行 conflict
   人工 fix
 - **不**尝试上游化:patch 设计选择(SCM_RIGHTS in-process + create_ram_region
@@ -237,7 +237,7 @@ cache 又释放、folio 仍驻留 memfd 的页,`lseek` 见数据**不跳过**,�
 panic 消息与 DWARF 不泄漏构建机绝对路径。
 
 patch 开发循环(`ch-fetch` / `ch-patches-format`、`patches-apply` 的幂等
-sanity 检查)、交叉编译与 WSL2 注意统一见 native-deps `docs/build.md` §3-§5。
+sanity 检查)、产物同步和边界说明见 `sandboxer/native-deps/README.md`。
 
 ## 5. 启动协议(per-arch)
 
@@ -334,6 +334,6 @@ KVM EPT,IPI shootdown 饿死 guest vsock kthread(机理与替代反馈环见
   之后如何处理 fault 事件
 - `guest-runtime/docs/vmlinux.md` —— guest kernel 如何配合 CH 启动
   协议(PVH / EFI stub)
-- native-deps `docs/build.md` —— `make cloud-hypervisor` 工作流与 patch
+- `sandboxer/native-deps/README.md` —— `make cloud-hypervisor` 工作流与 patch
   开发循环
 - `orchestrator/release-builder/docs/kuasar-sandbox.md` §2.4 —— VMM 与 Guest 环境在系统中的位置

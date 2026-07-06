@@ -33,10 +33,11 @@ make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
 make vet test
 ```
 
-构建需要 Go 1.24+;运行还需 **guest-runtime** 产出的 `sandbox-runtime.erofs`
-以及 **guest-runtime/native-deps** 产出的 `vmlinux`(guest 内核)、
-`mkfs.erofs`;patched `cloud-hypervisor` 由本仓 `sandboxer/native-deps` 构建并由
-`sandbox-ctl` 启动。
+构建需要 Go 1.24+;运行还需 **guest-runtime** 发布的 `sandbox-runtime.erofs`
+和 `vmlinux`(guest 内核);patched `cloud-hypervisor` 由本仓
+`sandboxer/native-deps` 构建并由 `sandbox-ctl` 启动。`mkfs.erofs` 是
+guest-runtime 构建 runtime 镜像和 build sandbox 内展平镜像时使用的工具,
+不是 sandboxer host 侧运行依赖。
 
 ## 跨仓依赖(薄)
 
