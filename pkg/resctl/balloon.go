@@ -203,7 +203,7 @@ func (b *BalloonController) Hint(memAvailable, memTotal uint64) {
 	if committed > 0 && b.Capacity > committed {
 		visible := b.Capacity - committed
 		if memAvailable > visible+visibleSlack {
-			b.Logf("balloon: stale mem_report avail=%d MiB visible=%d MiB (skip)",
+			b.Logf("balloon: stale mem_report avail=%d MiB visible=%d MiB (ignored)",
 				memAvailable>>20, visible>>20)
 			return
 		}

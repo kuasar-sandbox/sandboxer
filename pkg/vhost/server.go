@@ -3,6 +3,7 @@ package vhost
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -281,6 +282,14 @@ func (s *Server) serveOneMaster(conn *net.UnixConn) {
 		}
 		msg, err := ReadMessage(conn)
 		if err != nil {
+			select {
+			case <-s.stop:
+				return
+			default:
+			}
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+				return
+			}
 			s.logf("vhost: read: %v (master disconnected)", err)
 			return
 		}

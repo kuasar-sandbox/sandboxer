@@ -179,15 +179,17 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 
 // Settled marks the cold-start launch hello arrival.
 //
-// Writes cgroup memory.high (in both static and dynamic modes — the
-// boot-time uffd page-fault burst is past, PSI throttling is now safe;
-// JoinCgroup deliberately deferred the write here, Issue 4).
+// Writes cgroup memory.high using the locally visible allocatable_now. In
+// static mode this is the floor. In dynamic mode it is the controller-granted
+// startup budget until the next Heartbeat returns the controller's authoritative
+// post-settled allocatable. This keeps the startup grant effective long enough
+// for the user program to exec while still releasing the controller-side
+// startup_pool as soon as launch_ack arrives.
 //
-// Does NOT touch the balloon: cold-start CH was launched with
-// `--balloon size=cap-floor` already, so the device is at the right
-// inflation from the moment the guest boots. The BalloonController's
-// in-memory target is initialised by lifecycle.go before CH starts so
-// it agrees with reality without needing a fresh /vm.resize here.
+// Does NOT touch the balloon directly. Cold-start CH was launched with a
+// balloon derived from the initial allocatable (static floor or dynamic startup
+// grant), and the first Heartbeat / reclaim / grant path applies later
+// controller decisions through OnAllocatableChanged.
 //
 // In dynamic mode, also notifies the controller RPC of the settled
 // transition.
@@ -199,13 +201,17 @@ func (h *ControllerHooks) Settled() error {
 	if err != nil {
 		return err
 	}
-	if err := h.setMemoryHigh(floor); err != nil {
+	current := h.AllocatableNowMem()
+	if current == 0 {
+		current = floor
+	}
+	if err := h.setMemoryHigh(current); err != nil {
 		h.opts.Logf("settled: setMemoryHigh: %v", err)
 	}
-	h.mu.Lock()
-	h.allocatableNowMem = floor
-	h.mu.Unlock()
 	if !h.Enabled() {
+		h.mu.Lock()
+		h.allocatableNowMem = floor
+		h.mu.Unlock()
 		return nil
 	}
 	rss := readMemoryCurrent(h.opts.CgroupPath)

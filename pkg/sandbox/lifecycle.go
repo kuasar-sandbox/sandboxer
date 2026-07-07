@@ -121,6 +121,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// passed to CH in ch.go, so the in-memory target agrees with CH from
 	// the start without an extra round-trip after launch.
 	var balloonCtl *resctl.BalloonController
+	initialAllocBytes := allocBytes
 	if allocBytes < capBytes {
 		balloonCtl = resctl.NewBalloonController(chSock, capBytes, logf)
 		balloonCtl.SetAllocatable(allocBytes)
@@ -144,6 +145,16 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		grantedInitial, err := hooks.Admit(opts.SandboxID, 0)
 		if err != nil {
 			return -1, err
+		}
+		if grantedInitial < allocBytes {
+			return -1, fmt.Errorf("controller admit granted initial allocatable %d below floor %d", grantedInitial, allocBytes)
+		}
+		if grantedInitial > capBytes {
+			return -1, fmt.Errorf("controller admit granted initial allocatable %d above capacity %d", grantedInitial, capBytes)
+		}
+		initialAllocBytes = grantedInitial
+		if balloonCtl != nil {
+			balloonCtl.SetAllocatable(initialAllocBytes)
 		}
 		logf("controller admit ok, initial allocatable=%d", grantedInitial)
 	}
@@ -416,7 +427,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 			if err != nil {
 				return nil, nil, fmt.Errorf("stdio: %w", err)
 			}
-			args, err := CHCommand(opts.Cfg, e.Disks, e.CHSock, e.VsockBase, kernelPath, runtimePath, e.UffdSock, consoleArg, e.TapFDNum, e.NetMAC)
+			args, err := CHCommandWithInitialAllocatable(opts.Cfg, initialAllocBytes, e.Disks, e.CHSock, e.VsockBase, kernelPath, runtimePath, e.UffdSock, consoleArg, e.TapFDNum, e.NetMAC)
 			if err != nil {
 				cleanup()
 				return nil, nil, fmt.Errorf("CH cmdline: %w", err)

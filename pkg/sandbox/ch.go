@@ -8,19 +8,29 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
-// CHCommand assembles the cloud-hypervisor argv for a cold-start sandbox.
+// CHCommand assembles the cloud-hypervisor argv for a cold-start sandbox using
+// the static allocatable value from sandbox.yaml.
+func CHCommand(cfg *config.SandboxConfig, disks []DiskArg, chSock, vsockSock, kernelPath, runtimePath, uffdSock, consoleArg string, tapFDNum int, netMAC string) ([]string, error) {
+	return CHCommandWithInitialAllocatable(cfg, 0, disks, chSock, vsockSock, kernelPath, runtimePath, uffdSock, consoleArg, tapFDNum, netMAC)
+}
+
+// CHCommandWithInitialAllocatable assembles the cloud-hypervisor argv for a
+// cold-start sandbox and lets the caller override the guest-visible initial
+// allocatable memory. This is used by dynamic resource control: Admit can grant
+// a startup budget larger than the steady-state floor, and CH must boot with a
+// balloon size derived from that grant rather than from the floor.
 //
 // vsockSock is the host-side base UDS path; CH proxies guest CID 2 vsock
 // traffic to "<vsockSock>_<port>" entries. sandbox-ctl listens on the
 // per-port suffix (proto.LaunchPort) for the launch handshake.
 //
-// Memory sizing: --memory size= is the capacity (what guest sees), with
-// shared=on so vhost-user backends in the same process can mmap the
-// memfd CH creates. Balloon size = capacity - allocatable, releasing the
-// difference back to host at boot. free_page_reporting stays OFF (its
-// mmu_notifier traffic starves the guest vsock kthread — see balloon.go);
-// runtime adjustments come from the host resctl.BalloonController via
-// /api/v1/vm.resize on mem_report feedback.
+// Memory sizing: --memory-zone size= is the capacity, with shared=on so
+// vhost-user backends in the same process can mmap the memfd CH creates.
+// Balloon size = capacity - initialAllocatable, releasing the difference back
+// to host at boot. free_page_reporting stays OFF (its mmu_notifier traffic
+// starves the guest vsock kthread — see balloon.go); runtime adjustments come
+// from the host resctl.BalloonController via /api/v1/vm.resize on mem_report
+// feedback.
 //
 // uffdSock is the path of the va_report UDS server (cloud-hypervisor.md
 // §3.3). Patched CH connects to it during create_ram_region.
@@ -36,7 +46,7 @@ import (
 // off` — no 8250 UART; cmdline pins `console=hvc0`. The application's
 // stdin/stdout/stderr do NOT travel via the console — they go over the
 // vsock stdio MUX (pkg/mux). See docs/sandbox.md §5.2.
-func CHCommand(cfg *config.SandboxConfig, disks []DiskArg, chSock, vsockSock, kernelPath, runtimePath, uffdSock, consoleArg string, tapFDNum int, netMAC string) ([]string, error) {
+func CHCommandWithInitialAllocatable(cfg *config.SandboxConfig, initialAllocBytes uint64, disks []DiskArg, chSock, vsockSock, kernelPath, runtimePath, uffdSock, consoleArg string, tapFDNum int, netMAC string) ([]string, error) {
 	capBytes, err := cfg.CapacityMemoryBytes()
 	if err != nil {
 		return nil, err
@@ -44,6 +54,15 @@ func CHCommand(cfg *config.SandboxConfig, disks []DiskArg, chSock, vsockSock, ke
 	allocBytes, err := cfg.AllocatableMemoryBytes()
 	if err != nil {
 		return nil, err
+	}
+	if initialAllocBytes == 0 {
+		initialAllocBytes = allocBytes
+	}
+	if initialAllocBytes < allocBytes {
+		initialAllocBytes = allocBytes
+	}
+	if initialAllocBytes > capBytes {
+		initialAllocBytes = capBytes
 	}
 
 	// --memory-zone replaces --memory under the unified-memfd model:
@@ -84,20 +103,16 @@ func CHCommand(cfg *config.SandboxConfig, disks []DiskArg, chSock, vsockSock, ke
 		}
 	}
 
-	if allocBytes < capBytes {
-		// size = capacity − allocatable at boot: balloon device starts
-		// pre-inflated to the static minimum, so the guest sees exactly
-		// `allocatable` MiB visible from the moment it boots. No
-		// post-Settled inflate transition; the host resctl.BalloonController
-		// (pkg/sandbox/balloon.go) seeds its in-memory target to the
-		// same value and reconciles a no-op on Start, then handles
-		// runtime adjustments via /api/v1/vm.resize on mem_report
-		// feedback or controller grant/reclaim events.
+	if initialAllocBytes < capBytes {
+		// size = capacity − initialAllocatable at boot: static mode uses
+		// the floor allocatable; dynamic mode may use the controller-granted
+		// startup budget. The host resctl.BalloonController seeds its
+		// in-memory target to the same value before CH starts.
 		//
 		// free_page_reporting is intentionally OFF — its mmu_notifier
 		// traffic starves the guest vsock kthread (see balloon.go
 		// rationale).
-		balloonOpts := fmt.Sprintf("size=%d", capBytes-allocBytes)
+		balloonOpts := fmt.Sprintf("size=%d", capBytes-initialAllocBytes)
 		if cfg.DeflateOnOOM() {
 			balloonOpts += ",deflate_on_oom=on"
 		}

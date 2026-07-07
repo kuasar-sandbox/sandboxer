@@ -166,8 +166,9 @@ type AllocatableConfig struct {
 	// clamp(round(CPU * 100), 1, 10000). Without cgroup_path, must equal
 	// capacity.cpu (no fractional CPU without cgroup).
 	CPU float64 `yaml:"cpu"`
-	// Memory drives balloon initial size = capacity.memory - this value.
-	// Independent of cgroup; balloon is a CH-side mechanism.
+	// Memory is the steady-state floor. Static mode also uses it for CH's
+	// initial balloon size. Dynamic mode may boot from a controller-granted
+	// startup budget and later converge back to this floor.
 	Memory string `yaml:"memory"`
 	// DeflateOnOOM toggles CH --balloon ,deflate_on_oom=on. Pointer so
 	// nil = use default (true). Only applies when balloon is configured

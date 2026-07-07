@@ -78,6 +78,20 @@ func TestCHCommand_HasExpectedFlags(t *testing.T) {
 	}
 }
 
+func TestCHCommand_InitialAllocatableOverridesBalloon(t *testing.T) {
+	cfg := makeMinimalCfg()
+	args, err := CHCommandWithInitialAllocatable(cfg, 3<<30,
+		[]DiskArg{{Sock: "/run/sb/blk0.sock", ReadOnly: true}, {Sock: "/run/sb/blk1.sock"}},
+		"/run/sb/ch.sock", "/run/sb/vsock.sock", "/vmlinux", "/sandbox-runtime.erofs", "/run/sb/uffd.sock", "tty", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--balloon size=1073741824") {
+		t.Fatalf("initial allocatable 3GiB under 4GiB capacity should boot with 1GiB balloon, got: %s", joined)
+	}
+}
+
 func TestCHCommand_SingleDisk(t *testing.T) {
 	cfg := makeMinimalCfg()
 	// Single-disk: drop the overlay; the root disk is a writable ext4 CoW.

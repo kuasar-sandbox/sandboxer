@@ -69,6 +69,13 @@ func (s *Server) runWorker(idx int, q *virtq) {
 		err = s.processQueue(q)
 		s.inflight.Done()
 		if err != nil {
+			if errors.Is(err, syscall.EBADF) {
+				select {
+				case <-q.stop:
+					return
+				default:
+				}
+			}
 			s.logf("vhost: queue %d process: %v", idx, err)
 		}
 	}
@@ -95,6 +102,11 @@ func (s *Server) processQueue(q *virtq) error {
 		q.baseIdx++
 	}
 
+	select {
+	case <-q.stop:
+		return nil
+	default:
+	}
 	return s.notifyCall(q)
 }
 
