@@ -20,6 +20,12 @@ import (
 // while a slow RESPONSE can still be waited out per RespDeadline.
 const dialTimeout = 5 * time.Second
 
+const (
+	waitReadyDialTimeout = 50 * time.Millisecond
+	waitReadyInitialPoll = 1 * time.Millisecond
+	waitReadyMaxPoll     = 20 * time.Millisecond
+)
+
 // Client issues management calls against one CH api-socket. The zero value is
 // usable except for Sock. RespDeadline bounds the response read; 0 = no forced
 // deadline (a wedged CH then unblocks only via teardown closing the socket).
@@ -88,18 +94,70 @@ func WaitReady(ctx context.Context, sock string, deadline time.Duration) error {
 	if deadline > 0 {
 		end = time.Now().Add(deadline)
 	}
+	poll := waitReadyInitialPoll
+	var lastErr error
 	for {
 		if ctx.Err() != nil {
 			return fmt.Errorf("ch api socket not ready: %w", ctx.Err())
 		}
 		if !end.IsZero() && !time.Now().Before(end) {
-			return fmt.Errorf("ch api socket not ready")
+			if lastErr != nil {
+				return fmt.Errorf("ch api socket not ready before deadline: %w", lastErr)
+			}
+			return fmt.Errorf("ch api socket not ready before deadline")
 		}
-		c, err := net.DialTimeout("unix", sock, 200*time.Millisecond)
+
+		dialCtx := ctx
+		cancel := func() {}
+		timeout := waitReadyDialTimeout
+		if !end.IsZero() {
+			remaining := time.Until(end)
+			if remaining <= 0 {
+				continue
+			}
+			if remaining < timeout {
+				timeout = remaining
+			}
+		}
+		if timeout > 0 {
+			dialCtx, cancel = context.WithTimeout(ctx, timeout)
+		}
+
+		c, err := (&net.Dialer{}).DialContext(dialCtx, "unix", sock)
+		cancel()
 		if err == nil {
 			_ = c.Close()
 			return nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		lastErr = err
+
+		sleep := poll
+		if !end.IsZero() {
+			remaining := time.Until(end)
+			if remaining <= 0 {
+				continue
+			}
+			if remaining < sleep {
+				sleep = remaining
+			}
+		}
+		timer := time.NewTimer(sleep)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return fmt.Errorf("ch api socket not ready: %w", ctx.Err())
+		case <-timer.C:
+		}
+		if poll < waitReadyMaxPoll {
+			poll *= 2
+			if poll > waitReadyMaxPoll {
+				poll = waitReadyMaxPoll
+			}
+		}
 	}
 }
