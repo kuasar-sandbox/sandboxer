@@ -14,7 +14,8 @@
 #   - patches-apply requires HEAD == ch-patches-base; otherwise refuses
 #     and tells the user to format-extract WIP first, then reset.
 #   - patches-format clears stale .patch files before regenerating.
-#   - build relies on cargo's incremental compile.
+#   - build skips if $BINDIR/cloud-hypervisor already exists; cargo is
+#     otherwise incremental.
 #
 # Inputs (env, all optional):
 #   CLOUD_HYPERVISOR_TARBALL         URL or local path; supports "url#filename" form.
@@ -174,6 +175,12 @@ do_patches_format() {
 }
 
 do_build() {
+    local out_bin="$BINDIR/cloud-hypervisor"
+    if [ -x "$out_bin" ]; then
+        log "already built: $out_bin (delete it to force rebuild)"
+        exit 0
+    fi
+
     require_cmd cargo rustc
     [ -f "$CH_SRC/Cargo.toml" ] || die "no source at $CH_SRC; run 'make ch-fetch' first"
     mkdir -p "$CH_BUILD_OUT"
@@ -226,14 +233,14 @@ do_build() {
         "${cargo_target_args[@]}" \
         --manifest-path "$CH_SRC/Cargo.toml" --bin cloud-hypervisor
     mkdir -p "$BINDIR"
-    cp "$CH_BUILD_OUT/$artifact_subdir/cloud-hypervisor" "$BINDIR/cloud-hypervisor"
-    chmod +x "$BINDIR/cloud-hypervisor"
-    log "built $BINDIR/cloud-hypervisor ($(du -h "$BINDIR/cloud-hypervisor" | cut -f1))"
+    cp "$CH_BUILD_OUT/$artifact_subdir/cloud-hypervisor" "$out_bin"
+    chmod +x "$out_bin"
+    log "built $out_bin ($(du -h "$out_bin" | cut -f1))"
     # --version only runs on host-native binaries; cross-builds show file info instead.
     if [ -z "${RUST_TARGET:-}" ] || [ "$RUST_TARGET" = "$(rustc -vV 2>/dev/null | awk '/^host:/{print $2}')" ]; then
-        "$BINDIR/cloud-hypervisor" --version 2>&1 | head -1 || true
+        "$out_bin" --version 2>&1 | head -1 || true
     else
-        file "$BINDIR/cloud-hypervisor" 2>&1 | head -1 || true
+        file "$out_bin" 2>&1 | head -1 || true
     fi
 }
 

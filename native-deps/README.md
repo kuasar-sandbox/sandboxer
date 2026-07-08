@@ -34,7 +34,7 @@ make cloud-hypervisor TARGET_ARCH=aarch64
 1. 下载并缓存 Cloud Hypervisor pin 版本 tarball。
 2. 解压到 `build/src/cloud-hypervisor`。
 3. 初始化 git 基线并应用 `deps/ch-patches/*.patch`。
-4. 用 cargo 构建 `cloud-hypervisor`。
+4. 若目标文件不存在,用 cargo 构建 `cloud-hypervisor`。
 5. 拷贝到 `bin/<arch>/cloud-hypervisor`。
 
 已有目标文件时构建会跳过。需要强制重建时删除
