@@ -205,6 +205,7 @@ network:
   # Source: exactly one of tap (a pre-existing host TAP) or tapfd (handoff helper).
   tap: tap0
   # tapfd: { exec: ["connector-ctl", "vswitch", "open-port", "sw0", "--port=1"] }
+  # tapfd: { socket: /run/kuasar/connector/sw0/tapfd.sock, request: "VSWITCH=sw0 PORT=1" }
   ip: 169.254.1.1/31                       # guest CIDR; "" → no IP
   hostname: my-sandbox
 boot:

@@ -463,21 +463,17 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	}
 
 	// Network: re-acquire the host side for this restore. tapfd mode re-runs
-	// the handoff (docs/tapfd.md §4, idempotent) for a fresh queue fd, passed
-	// to CH via --restore net_fds; tap-name mode lets CH reopen the named tap
-	// from the restored config. The merged metadata also yields the NetworkSpec
-	// the guest re-applies flush-and-replace (clone takes a fresh L3 identity;
-	// the MAC stays the snapshot's, so the provider must use a stable per-port
-	// MAC — see docs/tapfd.md §5).
+	// the configured handoff (docs/tapfd.md §4, idempotent) for a fresh queue
+	// fd, passed to CH via --restore net_fds; tap-name mode lets CH reopen the
+	// named tap from the restored config. The merged metadata also yields the
+	// NetworkSpec the guest re-applies flush-and-replace (clone takes a fresh
+	// L3 identity; the MAC stays the snapshot's, so the provider must use a
+	// stable per-port MAC — see docs/tapfd.md §5).
 	var tapFile, netnsFile *os.File
 	var metaMAC, metaIP string
 	var metaMTU int
 	if snapCfg.Network.TapFD != nil {
-		argv, err := snapCfg.Network.TapFD.ResolvedExec()
-		if err != nil {
-			return -1, err
-		}
-		f, nsf, meta, err := tapfd.Acquire(ctx, argv, snapCfg.Network.TapFD.TimeoutDuration())
+		f, nsf, meta, err := tapfd.AcquireConfig(ctx, snapCfg.Network.TapFD)
 		if err != nil {
 			return -1, fmt.Errorf("tapfd handoff: %w", err)
 		}

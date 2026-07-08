@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	vsw "github.com/kuasar-sandbox/connector/pkg/tapfd"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // DefaultTimeout bounds the whole handoff (exec helper → recv fd → helper exit).
@@ -35,6 +36,22 @@ type Metadata struct {
 	MAC string // provider-assigned MAC the VMM must mirror onto virtio-net
 	IP  string // interface L3 address (may be bare, no mask)
 	MTU int    // interface MTU (0 = absent)
+}
+
+// AcquireConfig selects the configured tapfd transport and returns the acquired
+// tap queue fd, optional tap netns fd, and provider metadata.
+func AcquireConfig(ctx context.Context, cfg *config.TapFDConfig) (tap *os.File, netns *os.File, meta Metadata, err error) {
+	if cfg == nil {
+		return nil, nil, Metadata{}, errors.New("tapfd: nil config")
+	}
+	if cfg.Socket != "" {
+		return AcquireSocket(ctx, cfg.Socket, cfg.Request, cfg.TimeoutDuration())
+	}
+	argv, err := cfg.ResolvedExec()
+	if err != nil {
+		return nil, nil, Metadata{}, err
+	}
+	return Acquire(ctx, argv, cfg.TimeoutDuration())
 }
 
 // Acquire runs the §3 exec-helper handoff: it creates a connected socketpair,
@@ -67,7 +84,12 @@ func Acquire(ctx context.Context, argv []string, timeout time.Duration) (tap *os
 		_ = helperFile.Close()
 		return nil, nil, Metadata{}, fmt.Errorf("tapfd: fileconn: %w", err)
 	}
-	uconn := conn.(*net.UnixConn)
+	uconn, ok := conn.(*net.UnixConn)
+	if !ok {
+		_ = conn.Close()
+		_ = helperFile.Close()
+		return nil, nil, Metadata{}, fmt.Errorf("tapfd: socketpair returned %T, want *net.UnixConn", conn)
+	}
 	defer uconn.Close()
 
 	cctx, cancel := context.WithTimeout(ctx, timeout)
@@ -106,6 +128,53 @@ func Acquire(ctx context.Context, argv []string, timeout time.Duration) (tap *os
 			argv[0], werr, strings.TrimSpace(stderr.String()))
 	}
 	if len(tapFiles) != 1 { // single-queue v1
+		closeAll(tapFiles)
+		closeFile(netnsFile)
+		return nil, nil, Metadata{}, fmt.Errorf("tapfd: expected 1 tap fd, received %d", len(tapFiles))
+	}
+	return tapFiles[0], netnsFile, meta, nil
+}
+
+// AcquireSocket runs the persistent-provider handoff: it dials socketPath,
+// sends a TAPFD/1 OPEN request built from requestFields, receives exactly one
+// tap fd + metadata + an optional netns fd, and returns without spawning a
+// helper process. The provider request always includes want_netns=1.
+func AcquireSocket(ctx context.Context, socketPath, requestFields string, timeout time.Duration) (tap *os.File, netns *os.File, meta Metadata, err error) {
+	if socketPath == "" {
+		return nil, nil, Metadata{}, errors.New("tapfd: empty socket path")
+	}
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	req, err := vsw.BuildOpenRequest(requestFields, true)
+	if err != nil {
+		return nil, nil, Metadata{}, fmt.Errorf("tapfd: build request: %w", err)
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(cctx, "unix", socketPath)
+	if err != nil {
+		return nil, nil, Metadata{}, fmt.Errorf("tapfd: dial %s: %w", socketPath, err)
+	}
+	uconn, ok := conn.(*net.UnixConn)
+	if !ok {
+		_ = conn.Close()
+		return nil, nil, Metadata{}, fmt.Errorf("tapfd: dial %s returned %T, want *net.UnixConn", socketPath, conn)
+	}
+	defer uconn.Close()
+
+	_ = uconn.SetDeadline(time.Now().Add(timeout))
+	if _, err := uconn.Write(req); err != nil {
+		return nil, nil, Metadata{}, fmt.Errorf("tapfd: write request to %s: %w", socketPath, err)
+	}
+	tapFiles, netnsFile, meta, rerr := RecvFd(uconn)
+	if rerr != nil {
+		closeAll(tapFiles)
+		closeFile(netnsFile)
+		return nil, nil, Metadata{}, fmt.Errorf("tapfd: recv from %s: %w", socketPath, rerr)
+	}
+	if len(tapFiles) != 1 {
 		closeAll(tapFiles)
 		closeFile(netnsFile)
 		return nil, nil, Metadata{}, fmt.Errorf("tapfd: expected 1 tap fd, received %d", len(tapFiles))

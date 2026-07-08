@@ -434,9 +434,11 @@ resources:
 network:
   # 源(二选一):
   tap: tap0                    # 预创建的 host TAP 名;CH 按名打开(dev/e2e,无 provider)
-  tapfd:                       # tapfd 交接(docs/tapfd.md §3):exec provider helper 取 tap 队列 fd
+  tapfd:                       # tapfd 交接(docs/tapfd.md §3/§4):exec helper 或持久 provider socket
     exec: ["connector-ctl", "vswitch", "open-port", "sw0", "--port=3"]
-    # timeout: 5s            # 交接超时(Go duration);默认 5s
+    # socket: /run/kuasar/connector/sw0/tapfd.sock
+    # request: "VSWITCH=sw0 PORT=3"
+    # timeout: 5s              # 交接超时(Go duration);默认 5s
 
   # 属性:tap 模式按下值生效;tapfd 模式下被交接元数据覆盖——
   #   meta.mac→mac、meta.ip→ip(仅替换地址,保留下方掩码)、meta.mtu→mtu
@@ -1014,9 +1016,9 @@ cloud-hypervisor \
 
 # --net: tapfd 模式用 fd=<N>(memfd 之后继承的 fd,通常 fd=4)+ mac=<交接元数据>,
 #        id=_net0 供 restore 经 net_fds 重新绑定该网卡;tap 名模式则 --net tap=<name>。
-# tapfd 交接(docs/tapfd.md §3):exec helper 时置 TAPFD_SOCKET + TAPFD_WANT_NETNS=1
-#        (请求 tap 的 netns fd,§3.4)。provider 的 tap 处于独立 netns 时回带该 fd,
-#        sandbox-ctl 据此在该 netns 内 fork/exec CH(T16);否则 CH 在 host netns 启动。
+# tapfd 交接(docs/tapfd.md §3/§4):exec helper 时置 TAPFD_SOCKET + TAPFD_WANT_NETNS=1;
+#        socket 模式发送 TAPFD/1 OPEN want_netns=1 ...。provider 的 tap 处于独立 netns
+#        时回带该 fd,sandbox-ctl 据此在该 netns 内 fork/exec CH(T16);否则 CH 在 host netns 启动。
 # CH 进程的 stdio(sandbox-ctl 设置):
 #   stdin  = /dev/null            ← 关键:CH 的 --console tty 只在 stdin 是终端时才会
 #                                     raw 化那个终端;接 /dev/null 故 CH 不碰任何终端

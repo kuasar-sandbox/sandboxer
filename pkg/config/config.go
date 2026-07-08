@@ -313,10 +313,13 @@ type NetworkConfig struct {
 }
 
 // TapFDConfig configures tapfd-handoff acquisition (docs/tapfd.md §3).
-// sandbox-ctl execs Exec with TAPFD_SOCKET pointing at an inherited
-// socketpair end, then receives one tap queue fd + metadata over it.
+// Exec mode spawns a provider helper with TAPFD_SOCKET pointing at an
+// inherited socketpair end. Socket mode dials a long-running provider and sends
+// Request as the OPEN request fields. Exactly one of Exec or Socket is set.
 type TapFDConfig struct {
-	Exec    []string `yaml:"exec"`              // helper argv, e.g. ["connector-ctl","vswitch","open-port","sw0","--port=3"]
+	Exec    []string `yaml:"exec,omitempty"`    // helper argv, e.g. ["connector-ctl","vswitch","open-port","sw0","--port=3"]
+	Socket  string   `yaml:"socket,omitempty"`  // persistent provider unix socket
+	Request string   `yaml:"request,omitempty"` // provider request fields, e.g. "VSWITCH=sw0 PORT=3"
 	Timeout string   `yaml:"timeout,omitempty"` // handoff timeout (Go duration); empty → default
 }
 
@@ -348,6 +351,30 @@ func (t *TapFDConfig) ResolvedExec() ([]string, error) {
 		return nil, fmt.Errorf("tapfd helper: %w", err)
 	}
 	return append([]string{bin}, t.Exec[1:]...), nil
+}
+
+// Validate checks the tapfd transport-specific invariants. field is used as
+// the error prefix so callers can report their config path.
+func (t *TapFDConfig) Validate(field string) error {
+	if t == nil {
+		return nil
+	}
+	hasExec := len(t.Exec) > 0
+	hasSocket := t.Socket != ""
+	if hasExec == hasSocket {
+		return fmt.Errorf("%s: exactly one of exec or socket is required", field)
+	}
+	if hasSocket {
+		if !filepath.IsAbs(t.Socket) {
+			return fmt.Errorf("%s.socket must be absolute", field)
+		}
+		if strings.TrimSpace(t.Request) == "" {
+			return fmt.Errorf("%s.request is required when socket is set", field)
+		}
+	} else if strings.TrimSpace(t.Request) != "" {
+		return fmt.Errorf("%s.request requires socket mode", field)
+	}
+	return nil
 }
 
 // Effective merges the static network attributes with optional handoff
@@ -1032,8 +1059,8 @@ func (c *SandboxConfig) ValidateCold() error {
 	if (c.Network.TAP == "") == (c.Network.TapFD == nil) {
 		return errors.New("network: exactly one of `tap` or `tapfd` is required")
 	}
-	if c.Network.TapFD != nil && len(c.Network.TapFD.Exec) == 0 {
-		return errors.New("network.tapfd.exec is required")
+	if err := c.Network.TapFD.Validate("network.tapfd"); err != nil {
+		return err
 	}
 
 	// mounts: target absolute; type ∈ {tmpfs, empty, disk}; nfs deferred. The
@@ -1132,8 +1159,8 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	if (c.Network.TAP == "") == (c.Network.TapFD == nil) {
 		return errors.New("network: exactly one of `tap` or `tapfd` is required")
 	}
-	if c.Network.TapFD != nil && len(c.Network.TapFD.Exec) == 0 {
-		return errors.New("network.tapfd.exec is required")
+	if err := c.Network.TapFD.Validate("network.tapfd"); err != nil {
+		return err
 	}
 	// Capacity is optional in the host yaml (matched against snapshot.cfg);
 	// if provided it must be well-formed.

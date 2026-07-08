@@ -1,14 +1,19 @@
 package tapfd
 
 import (
+	"bufio"
 	"context"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	ctapfd "github.com/kuasar-sandbox/connector/pkg/tapfd"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // Payload-parse unit tests live with the canonical parser in
@@ -144,4 +149,120 @@ func TestAcquire_Errors(t *testing.T) {
 	if _, _, _, err := Acquire(context.Background(), []string{"sh", "-c", "exit 3"}, 2*time.Second); err == nil {
 		t.Fatal("non-zero helper: want error")
 	}
+}
+
+func TestAcquireSocketOK(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "tapfd.sock")
+	reqCh, errCh := serveOneTapFDSocket(t, sock, func(conn *net.UnixConn, line string) error {
+		payload, err := (&ctapfd.PortMetadata{
+			Port:    1,
+			MAC:     "02:00:00:00:80:01",
+			MTU:     1450,
+			InnerIP: "169.254.4.1",
+			FDCount: 1,
+		}).Marshal()
+		if err != nil {
+			return err
+		}
+		payload, err = ctapfd.BuildOKResponse(payload)
+		if err != nil {
+			return err
+		}
+		dn, err := os.Open(os.DevNull)
+		if err != nil {
+			return err
+		}
+		defer dn.Close()
+		return ctapfd.SendFd(conn, payload, dn.Fd())
+	})
+
+	f, netnsFile, meta, err := AcquireSocket(context.Background(), sock, "VSWITCH=sw0 PORT=1", time.Second)
+	if err != nil {
+		t.Fatalf("AcquireSocket: %v", err)
+	}
+	defer f.Close()
+	if netnsFile != nil {
+		netnsFile.Close()
+		t.Fatalf("got netns fd without netns_fd= in payload")
+	}
+	if got, want := <-reqCh, "TAPFD/1 OPEN want_netns=1 VSWITCH=sw0 PORT=1\n"; got != want {
+		t.Fatalf("request = %q, want %q", got, want)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+	if meta.MAC != "02:00:00:00:80:01" || meta.IP != "169.254.4.1" || meta.MTU != 1450 {
+		t.Fatalf("meta = %+v", meta)
+	}
+}
+
+func TestAcquireSocketProviderError(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "tapfd.sock")
+	_, errCh := serveOneTapFDSocket(t, sock, func(conn *net.UnixConn, line string) error {
+		_, err := conn.Write(ctapfd.BuildErrorResponse(ctapfd.ErrorCodePortUnavailable, "port_not_attached"))
+		return err
+	})
+
+	_, _, _, err := AcquireSocket(context.Background(), sock, "VSWITCH=sw0 PORT=1", time.Second)
+	if err == nil || !strings.Contains(err.Error(), ctapfd.ErrorCodePortUnavailable) {
+		t.Fatalf("AcquireSocket error = %v, want provider error", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+}
+
+func TestAcquireConfigSocket(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "tapfd.sock")
+	_, errCh := serveOneTapFDSocket(t, sock, func(conn *net.UnixConn, line string) error {
+		_, err := conn.Write(ctapfd.BuildErrorResponse(ctapfd.ErrorCodePortUnavailable, "port_not_attached"))
+		return err
+	})
+
+	_, _, _, err := AcquireConfig(context.Background(), &config.TapFDConfig{
+		Socket:  sock,
+		Request: "VSWITCH=sw0 PORT=1",
+		Timeout: "1s",
+	})
+	if err == nil || !strings.Contains(err.Error(), ctapfd.ErrorCodePortUnavailable) {
+		t.Fatalf("AcquireConfig error = %v, want provider error", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+}
+
+func serveOneTapFDSocket(t *testing.T, sock string, respond func(conn *net.UnixConn, line string) error) (<-chan string, <-chan error) {
+	t.Helper()
+	addr, err := net.ResolveUnixAddr("unix", sock)
+	if err != nil {
+		t.Fatalf("resolve unix: %v", err)
+	}
+	ln, err := net.ListenUnix("unix", addr)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = ln.Close()
+		_ = os.Remove(sock)
+	})
+
+	reqCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.AcceptUnix()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			errCh <- err
+			return
+		}
+		reqCh <- line
+		errCh <- respond(conn, line)
+	}()
+	return reqCh, errCh
 }

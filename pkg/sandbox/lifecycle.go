@@ -243,20 +243,16 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		return -1, fmt.Errorf("launch spec: %w", err)
 	}
 
-	// Network acquisition. tapfd mode (docs/tapfd.md §3) execs the provider
-	// helper to receive a tap queue fd + metadata; tap-name mode was verified
-	// above and CH opens it. The handoff metadata overrides the static attrs
-	// (mac/ip/mtu). The resolved spec travels through the launch handshake;
-	// nil → "no IP configuration" to sandbox-init.
+	// Network acquisition. tapfd mode (docs/tapfd.md §3) receives a tap queue
+	// fd + metadata from either an exec helper or a persistent provider socket;
+	// tap-name mode was verified above and CH opens it. The handoff metadata
+	// overrides the static attrs (mac/ip/mtu). The resolved spec travels
+	// through the launch handshake; nil → "no IP configuration" to sandbox-init.
 	var tapFile, netnsFile *os.File
 	var metaMAC, metaIP string
 	var metaMTU int
 	if opts.Cfg.Network.TapFD != nil {
-		argv, err := opts.Cfg.Network.TapFD.ResolvedExec()
-		if err != nil {
-			return -1, err
-		}
-		f, nsf, meta, err := tapfd.Acquire(ctx, argv, opts.Cfg.Network.TapFD.TimeoutDuration())
+		f, nsf, meta, err := tapfd.AcquireConfig(ctx, opts.Cfg.Network.TapFD)
 		if err != nil {
 			return -1, fmt.Errorf("tapfd handoff: %w", err)
 		}

@@ -61,6 +61,28 @@ func TestLoad_ValidCold(t *testing.T) {
 	}
 }
 
+func TestValidateCold_TapFDSocket(t *testing.T) {
+	cfg, err := Load(writeYAML(t, strings.Replace(minimalCold, "  tap: tap0", `  tapfd:
+    socket: /run/kuasar/connector/sw0/tapfd.sock
+    request: "VSWITCH=sw0 PORT=1"
+    timeout: 500ms`, 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.ValidateCold(); err != nil {
+		t.Fatalf("ValidateCold: %v", err)
+	}
+	if got := cfg.Network.TapFD.Socket; got != "/run/kuasar/connector/sw0/tapfd.sock" {
+		t.Fatalf("tapfd.socket = %q", got)
+	}
+	if got := cfg.Network.TapFD.Request; got != "VSWITCH=sw0 PORT=1" {
+		t.Fatalf("tapfd.request = %q", got)
+	}
+	if got := cfg.Network.TapFD.TimeoutDuration(); got != 500*time.Millisecond {
+		t.Fatalf("tapfd timeout = %s", got)
+	}
+}
+
 func TestLoad_DefaultsAllocFromCapacity(t *testing.T) {
 	cfg, err := Load(writeYAML(t, `
 resources:
@@ -248,10 +270,26 @@ func TestValidateCold_MissingFields(t *testing.T) {
 		{"both tap and tapfd", func(c *SandboxConfig) {
 			c.Network.TapFD = &TapFDConfig{Exec: []string{"helper"}}
 		}, "exactly one of"},
-		{"tapfd without exec", func(c *SandboxConfig) {
+		{"tapfd without transport", func(c *SandboxConfig) {
 			c.Network.TAP = ""
 			c.Network.TapFD = &TapFDConfig{}
-		}, "tapfd.exec is required"},
+		}, "exactly one of exec or socket"},
+		{"tapfd socket without request", func(c *SandboxConfig) {
+			c.Network.TAP = ""
+			c.Network.TapFD = &TapFDConfig{Socket: "/run/kuasar/connector/sw0/tapfd.sock"}
+		}, "request is required"},
+		{"tapfd socket relative path", func(c *SandboxConfig) {
+			c.Network.TAP = ""
+			c.Network.TapFD = &TapFDConfig{Socket: "tapfd.sock", Request: "VSWITCH=sw0 PORT=1"}
+		}, "socket must be absolute"},
+		{"tapfd exec and socket", func(c *SandboxConfig) {
+			c.Network.TAP = ""
+			c.Network.TapFD = &TapFDConfig{Exec: []string{"helper"}, Socket: "/run/kuasar/connector/sw0/tapfd.sock", Request: "VSWITCH=sw0 PORT=1"}
+		}, "exactly one of exec or socket"},
+		{"tapfd exec with request", func(c *SandboxConfig) {
+			c.Network.TAP = ""
+			c.Network.TapFD = &TapFDConfig{Exec: []string{"helper"}, Request: "VSWITCH=sw0 PORT=1"}
+		}, "request requires socket"},
 		{"alloc mem > capacity", func(c *SandboxConfig) {
 			c.Resources.Allocatable.Memory = "16GiB"
 		}, "allocatable.memory must be ≤"},

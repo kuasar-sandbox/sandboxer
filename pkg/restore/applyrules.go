@@ -170,8 +170,8 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 	if (host.Network.TAP == "") == (host.Network.TapFD == nil) {
 		return nil, errors.New("network: exactly one of `tap` or `tapfd` is required in restore mode")
 	}
-	if host.Network.TapFD != nil && len(host.Network.TapFD.Exec) == 0 {
-		return nil, errors.New("network.tapfd.exec is required")
+	if err := host.Network.TapFD.Validate("network.tapfd"); err != nil {
+		return nil, err
 	}
 
 	// 3. boot.runtime: file:// only (cold + restore alike).
