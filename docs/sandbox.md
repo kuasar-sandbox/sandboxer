@@ -166,6 +166,10 @@ sandbox-ctl run [flags]
                           <ref> = 本地文件路径或 manifest://<hex>。不带此 flag
                           = 冷启动模式。restore 模式下 sandbox.yaml 字段语义
                           见 §11.0
+  --restore-file-refs verify|trust
+                          本地 file:// runtime/base ref 的校验策略。verify(默认)
+                          重算文件 SHA256 并比对 snapshot.cfg;trust 只校验协议、
+                          basename 和本地文件存在,用于受信本地性能模式
 
   # 应用 stdio(冷启动 + 恢复模式都生效;详见 docs/sandbox-init.md §3.5 / §4.5)
   #
@@ -670,6 +674,7 @@ sandbox-init 以 flush-and-replace 重配网卡(克隆取新 L3 身份,见 §11.
 | `boot.root.diff_template`(单盘) | ✓ (only) | ✗ | 单盘根盘的预格式化 ext4 模板;与 overlay.* 互斥 |
 | `boot.root.base_from_refs`(单盘) | ✓ | ✓ | 单盘快照链(snapshot.cfg 自动填,§3.5) |
 | `run --restore=<ref>` | ✓ | ✓ | `<sid>.snapshot` 文件路径 / manifest://<key> |
+| `run --restore-file-refs=verify\|trust` | ✓ | – | restore 时本地 `file://` runtime/base 引用的内容校验策略;默认 verify |
 
 ### 3.3 flattened image 内嵌 config.json
 
@@ -1298,7 +1303,9 @@ T3  archive/zip.NewReader(ReaderAt, totalSize) → 解出 config.json / state.js
     from_refs);from_refs 各项在该 .snapshot 同目录定位
 T4  restore.ApplyRules(host sandbox.yaml, snapshot.cfg, snapshotPath):
     - 验证 capacity 一致(host 提供时)
-    - 验证 boot.runtime / boot.root.base 协议 + basename + digest 匹配(host 提供时)
+    - 验证 boot.runtime / boot.root.base 协议 + basename 匹配(host 提供时)
+    - 默认 `--restore-file-refs=verify` 会重算本地 file:// 内容 SHA256;
+      `trust` 只确认本地文件存在,跳过内容 hash
     - 未提供时从 snapshot.cfg 复制(file 模式解析为 .snapshot 同目录文件)
     - 详见 §11.0 字段语义表 + §13 校验矩阵
 T5  从 snapshot.cfg 拿 capacity 推 ramSize;从 state.json 解出 balloon 状态推
@@ -1784,8 +1791,8 @@ allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
 | `network.{tap\|tapfd}` | 必须(源二选一);tapfd 模式重新交接(docs/tapfd.md §4,幂等)取新 fd,经 `--restore net_fds=[_net0@[4]]` 注入 CH;tap 名模式 CH 按名重开 | error: missing(restore 不能没网络源) |
 | `network.{ip,mtu,nexthop,hostname,interface}` | 经 restore 通知重新下发,guest flush-and-replace 重配(克隆取新 L3 身份);MAC 不变(沿用快照设备状态,故 provider 须用稳定 per-port MAC) | 保留快照网络不变 |
 | `boot.kernel` | 静默忽略(restore 不 boot) | 同 |
-| `boot.runtime`(仅 file://) | basename + sha256 digest 与 snapshot.cfg.runtime_ref 全部匹配才允许;否则拒绝 | 用 snapshot.cfg.runtime_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
-| `boot.root.base`(file://) | 协议 + basename + digest 与 snapshot.cfg.base_ref 一致才允许 | 用 snapshot.cfg.base_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
+| `boot.runtime`(仅 file://) | basename 与 snapshot.cfg.runtime_ref 匹配才允许;默认还要求 sha256 digest 匹配 | 用 snapshot.cfg.runtime_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
+| `boot.root.base`(file://) | 协议 + basename 与 snapshot.cfg.base_ref 一致才允许;默认还要求 digest 匹配 | 用 snapshot.cfg.base_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
 | `boot.root.base`(manifest://) | manifest key 与 snapshot.cfg.base_ref 一致才允许 | 用 snapshot.cfg.base_ref 原值 |
 | `boot.root.overlay.base` | **静默忽略** | 用 snapshot.cfg.overlay.base |
 | `from_refs` / `boot.root.overlay.base_from_refs` | 无此 yaml 字段(增量分层链纯由 snapshot.cfg 提供,§3.5) | 用 snapshot.cfg 原值 |
@@ -1805,6 +1812,11 @@ zone watermarks)。变了 capacity 等于换了一套硬件假设,行为未定�
 目标 host 上同名 sandbox-runtime.erofs / container-image.erofs 可能是不同
 版本。digest 不匹配的恢复不安全(guest 期望 inode 数据与文件实际数据不一致,
 EROFS 挂载或运行时读会读到诡异数据)。
+
+`--restore-file-refs=trust` 是受信本地性能模式:仍校验协议和 basename,并确认
+本地文件存在,但不顺序读取 runtime/base 文件重算 SHA256。它适合单机性能比拼、
+同节点 snapshot fork、或平台已用带外机制保证 runtime/base 不被替换的场景;跨
+节点迁移、导入外部 snapshot、或多租户生产默认应继续使用 `verify`。
 
 **boot.root.overlay.base 为什么忽略 yaml**:overlay 数据是 sandbox 自己的写
 状态,与镜像 base 等价物,只能从 snapshot 内部走。让 yaml 强制提供没意义,
@@ -2033,14 +2045,14 @@ snapshot 路径要求 `/vm.pause` 之后内存内容稳定,但 backend worker �
 
 `run --restore=<ref>` 触发。host yaml 先经 `ValidateRestoreHostConfig` 自校验
 (网络源、引用格式等),与 snapshot.cfg 的交叉校验(capacity 相等、runtime/base
-digest)随后在 `restore.ApplyRules` 拿到 bundle 时进行。额外:
+ref 匹配;默认含 digest)随后在 `restore.ApplyRules` 拿到 bundle 时进行。额外:
 
 | 规则 | 错误消息 |
 |------|---------|
 | sandbox.yaml 提供 `boot.runtime` 时,协议必须与 snapshot.cfg.runtime_ref 一致 | "boot.runtime scheme mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 `boot.root.base` 时,协议必须与 snapshot.cfg.base_ref 一致 | "boot.root.base scheme mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 file:// runtime / base 时,basename(filepath.Base)必须与 snapshot.cfg ref 中 basename 一致 | "<field> basename mismatch with snapshot.cfg" |
-| sandbox.yaml 提供 file:// runtime / base 时,文件 SHA256 digest 必须与 snapshot.cfg ref 中 @sha256:<digest> 一致 | "<field> digest mismatch with snapshot.cfg" |
+| sandbox.yaml 提供 file:// runtime / base 且 `--restore-file-refs=verify` 时,文件 SHA256 digest 必须与 snapshot.cfg ref 中 @sha256:<digest> 一致 | "<field> digest mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 manifest:// runtime / base 时,manifest key 必须与 snapshot.cfg ref 一致 | "<field> manifest key mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 `resources.capacity.{cpu,memory}` 时,与 snapshot.cfg 严格相等 | "capacity mismatch with snapshot.cfg" |
 | `boot.root.overlay.diff` 可选;空→落盘 base 目录新建(随沙箱销毁) | — |

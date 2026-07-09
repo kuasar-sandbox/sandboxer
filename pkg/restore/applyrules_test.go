@@ -32,6 +32,10 @@ func baseSnap(runtimeRef, baseRef, overlayBase string) *SnapshotCfg {
 	return cfg
 }
 
+func applyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string) (*config.SandboxConfig, error) {
+	return ApplyRules(host, snap, snapshotPath, ApplyOptions{})
+}
+
 func TestParseRef(t *testing.T) {
 	for _, tc := range []struct {
 		in     string
@@ -66,6 +70,30 @@ func TestParseRef(t *testing.T) {
 	}
 }
 
+func TestParseFileRefPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want FileRefPolicy
+		err  bool
+	}{
+		{"", FileRefPolicyVerify, false},
+		{"verify", FileRefPolicyVerify, false},
+		{"trust", FileRefPolicyTrust, false},
+		{"bad", "", true},
+	} {
+		got, err := ParseFileRefPolicy(tc.in)
+		if tc.err {
+			if err == nil {
+				t.Errorf("ParseFileRefPolicy(%q) expected error", tc.in)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("ParseFileRefPolicy(%q) = %q, %v; want %q, nil", tc.in, got, err, tc.want)
+		}
+	}
+}
+
 func TestApplyRules_CapacityMustMatchWhenProvided(t *testing.T) {
 	dir := t.TempDir()
 	rtPath := filepath.Join(dir, "runtime.erofs")
@@ -80,13 +108,13 @@ func TestApplyRules_CapacityMustMatchWhenProvided(t *testing.T) {
 	host.Network.TAP = "tap0"
 	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
 
-	if _, err := ApplyRules(host, snap, filepath.Join(dir, "ignored.snapshot")); err == nil || !strings.Contains(err.Error(), "capacity mismatch") {
+	if _, err := applyRules(host, snap, filepath.Join(dir, "ignored.snapshot")); err == nil || !strings.Contains(err.Error(), "capacity mismatch") {
 		t.Fatalf("expected capacity mismatch error, got %v", err)
 	}
 
 	host.Resources.Capacity.CPU = 2
 	host.Resources.Capacity.Memory = "4GiB"
-	if _, err := ApplyRules(host, snap, filepath.Join(dir, "ignored.snapshot")); err != nil {
+	if _, err := applyRules(host, snap, filepath.Join(dir, "ignored.snapshot")); err != nil {
 		t.Fatalf("matching capacity should be accepted: %v", err)
 	}
 }
@@ -103,7 +131,7 @@ func TestApplyRules_CapacityAutoFilledWhenAbsent(t *testing.T) {
 	host.Network.TAP = "tap0"
 	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
 
-	out, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot"))
+	out, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +151,7 @@ func TestApplyRules_NetworkTAPRequired(t *testing.T) {
 	host := &config.SandboxConfig{}
 	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
 
-	if _, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "exactly one of") {
+	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "exactly one of") {
 		t.Fatalf("expected network source required error, got %v", err)
 	}
 }
@@ -141,7 +169,7 @@ func TestApplyRules_OverlayDiffOptional(t *testing.T) {
 
 	// An empty overlay.diff is now allowed: restore auto-defaults a fresh diff
 	// under the on-disk base dir (sized to the snapshot's overlay base).
-	merged, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot"))
+	merged, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot"))
 	if err != nil {
 		t.Fatalf("empty overlay.diff should be accepted, got %v", err)
 	}
@@ -169,7 +197,7 @@ func TestApplyRules_SingleDisk(t *testing.T) {
 
 	host := &config.SandboxConfig{}
 	host.Network.TAP = "tap0"
-	out, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot"))
+	out, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot"))
 	if err != nil {
 		t.Fatalf("ApplyRules single-disk: %v", err)
 	}
@@ -197,7 +225,7 @@ func TestApplyRules_RuntimeFileAutoResolveAndDigest(t *testing.T) {
 	host.Network.TAP = "tap0"
 	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
 
-	out, err := ApplyRules(host, snap, snapPath)
+	out, err := applyRules(host, snap, snapPath)
 	if err != nil {
 		t.Fatalf("auto-resolve failed: %v", err)
 	}
@@ -225,7 +253,7 @@ func TestApplyRules_RuntimeProvidedDigestMustMatch(t *testing.T) {
 	host.Boot.Runtime = "file://" + rtPath
 	host.Boot.Root.Base = "file://" + bsPath
 
-	if _, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot")); err != nil {
+	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err != nil {
 		t.Fatalf("matching host file should pass: %v", err)
 	}
 
@@ -233,8 +261,33 @@ func TestApplyRules_RuntimeProvidedDigestMustMatch(t *testing.T) {
 	if err := os.WriteFile(rtPath, []byte("tampered"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
 		t.Fatalf("expected sha256 mismatch, got %v", err)
+	}
+}
+
+func TestApplyRules_TrustFileRefsSkipsDigestContentCheck(t *testing.T) {
+	dir := t.TempDir()
+	rtPath := filepath.Join(dir, "runtime.erofs")
+	rtDigest := writeFile(t, rtPath, []byte("runtime body"))
+	bsPath := filepath.Join(dir, "base.erofs")
+	bsDigest := writeFile(t, bsPath, []byte("base body"))
+	snap := baseSnap("file://runtime.erofs@sha256:"+rtDigest, "file://base.erofs@sha256:"+bsDigest, "file://abc.overlay")
+
+	host := &config.SandboxConfig{}
+	host.Network.TAP = "tap0"
+	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
+	host.Boot.Runtime = "file://" + rtPath
+	host.Boot.Root.Base = "file://" + bsPath
+
+	if err := os.WriteFile(rtPath, []byte("tampered runtime"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bsPath, []byte("tampered base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot"), ApplyOptions{FileRefs: FileRefPolicyTrust}); err != nil {
+		t.Fatalf("trust mode should skip content digest mismatch: %v", err)
 	}
 }
 
@@ -258,7 +311,7 @@ func TestApplyRules_BasenameMismatchRejected(t *testing.T) {
 	host.Boot.Runtime = "file://" + otherPath
 	host.Boot.Root.Base = "file://" + bsPath
 
-	if _, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "basename mismatch") {
+	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "basename mismatch") {
 		t.Fatalf("expected basename mismatch, got %v", err)
 	}
 }
@@ -278,7 +331,7 @@ func TestApplyRules_SchemeMismatchRejected(t *testing.T) {
 	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
 	host.Boot.Root.Base = "manifest://abcdef" // host says manifest, snap says file
 
-	if _, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "scheme mismatch") {
+	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "scheme mismatch") {
 		t.Fatalf("expected scheme mismatch, got %v", err)
 	}
 }
@@ -294,7 +347,7 @@ func TestApplyRules_ManifestBaseMatchesKey(t *testing.T) {
 	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
 
 	// host empty: should auto-fill manifest://abcdef
-	out, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot"))
+	out, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,13 +360,13 @@ func TestApplyRules_ManifestBaseMatchesKey(t *testing.T) {
 
 	// host provides matching manifest:// key
 	host.Boot.Root.Base = "manifest://abcdef"
-	if _, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot")); err != nil {
+	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err != nil {
 		t.Fatalf("matching manifest key should pass: %v", err)
 	}
 
 	// host provides different manifest:// key → mismatch
 	host.Boot.Root.Base = "manifest://different"
-	if _, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "manifest key mismatch") {
+	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "manifest key mismatch") {
 		t.Fatalf("expected manifest key mismatch, got %v", err)
 	}
 }
@@ -331,7 +384,7 @@ func TestApplyRules_OverlayBaseFromSnapshotIgnoresHost(t *testing.T) {
 	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
 	host.Boot.Root.Overlay.Base = "manifest://something-else" // should be silently ignored
 
-	out, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot"))
+	out, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +400,7 @@ func TestApplyRules_RuntimeManifestRejected(t *testing.T) {
 	host.Network.TAP = "tap0"
 	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
 
-	if _, err := ApplyRules(host, snap, ""); err == nil || !strings.Contains(err.Error(), "runtime_ref") {
+	if _, err := applyRules(host, snap, ""); err == nil || !strings.Contains(err.Error(), "runtime_ref") {
 		t.Fatalf("expected runtime_ref scheme error, got %v", err)
 	}
 }
@@ -363,7 +416,7 @@ func TestApplyRules_ManifestBundleEmptyPathRejectsFileRefs(t *testing.T) {
 	host.Network.TAP = "tap0"
 	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
 
-	if _, err := ApplyRules(host, snap, ""); err == nil || !strings.Contains(err.Error(), "boot.runtime") {
+	if _, err := applyRules(host, snap, ""); err == nil || !strings.Contains(err.Error(), "boot.runtime") {
 		t.Fatalf("expected boot.runtime explicit-required error, got %v", err)
 	}
 }

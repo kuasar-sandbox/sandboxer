@@ -71,6 +71,7 @@ Usage:
                         [--sandbox-id <sid>] [--ch-binary <path>]
                         [--run-root <dir>] [--base-root <dir>]
                         [--restore <file_path|manifest://hex>]
+                        [--restore-file-refs verify|trust]
                         [--stdin] [--stdout=false] [--stderr=false]
                         [--stdin-from F] [--stdout-to F] [--stderr-to F]
                         [--tty] [--console off|default|file=PATH]

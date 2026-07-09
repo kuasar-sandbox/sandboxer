@@ -46,6 +46,7 @@ type Options struct {
 	HostCfg             *config.SandboxConfig  // host yaml: TAP, blk1.diff, etc.
 	ManifestCfg         *config.ManifestConfig // for snapshot --upload from a restored sandbox
 	Fetcher             fetch.Fetcher          // required when any URI is manifest://; caller owns lifecycle
+	FileRefs            FileRefPolicy          // verify (default) or trust local file:// refs in snapshot.cfg
 	SandboxID           string
 	CHBinary            string
 	RuntimeRoot         string        // tmpfs run root; "/run/sandbox" by default
@@ -204,7 +205,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	merged, err := ApplyRules(opts.HostCfg, parsedSnap, opts.SnapshotPath)
+	merged, err := ApplyRules(opts.HostCfg, parsedSnap, opts.SnapshotPath, ApplyOptions{
+		FileRefs: opts.FileRefs,
+	})
 	if err != nil {
 		return -1, err
 	}

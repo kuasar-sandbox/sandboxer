@@ -87,6 +87,37 @@ type Ref struct {
 	Key      string // manifest mode: hex content key; file mode: empty
 }
 
+// FileRefPolicy controls how restore treats local file:// refs recorded in
+// snapshot.cfg.
+type FileRefPolicy string
+
+const (
+	FileRefPolicyVerify FileRefPolicy = "verify"
+	FileRefPolicyTrust  FileRefPolicy = "trust"
+)
+
+// ApplyOptions tunes restore snapshot.cfg/host-yaml merge rules.
+type ApplyOptions struct {
+	FileRefs FileRefPolicy
+}
+
+// ParseFileRefPolicy parses the public verify|trust spelling. Empty means the
+// default strict mode.
+func ParseFileRefPolicy(s string) (FileRefPolicy, error) {
+	switch FileRefPolicy(strings.TrimSpace(s)) {
+	case "", FileRefPolicyVerify:
+		return FileRefPolicyVerify, nil
+	case FileRefPolicyTrust:
+		return FileRefPolicyTrust, nil
+	default:
+		return "", fmt.Errorf("restore file refs %q (want verify|trust)", s)
+	}
+}
+
+func (p FileRefPolicy) normalized() (FileRefPolicy, error) {
+	return ParseFileRefPolicy(string(p))
+}
+
 // String reconstructs the canonical form. Inverse of ParseRef.
 func (r Ref) String() string {
 	switch r.Scheme {
@@ -128,10 +159,12 @@ func ParseRef(s string) (Ref, error) {
 
 // ApplyRules merges host sandbox.yaml fields against the snapshot.cfg
 // per docs/sandbox.md §11.0. Host-provided file:// URLs in
-// boot.runtime / boot.root.base must (a) match the snapshot.cfg ref's
-// scheme + basename + digest verbatim; (b) resolve to a host file with
-// matching SHA256. Host-empty fields are auto-filled from snapshot.cfg
-// (basename interpreted relative to the snapshot bundle's directory).
+// boot.runtime / boot.root.base must match the snapshot.cfg ref's
+// scheme + basename. In verify mode, the local file content must also
+// match the ref's SHA256. In trust mode, restore skips that content hash
+// and only checks that the local file exists. Host-empty fields are
+// auto-filled from snapshot.cfg (basename interpreted relative to the
+// snapshot bundle's directory).
 //
 // Capacity must match exactly when host provides it. Network must be
 // provided. boot.root.overlay.base in host yaml is silently ignored
@@ -144,12 +177,16 @@ func ParseRef(s string) (Ref, error) {
 // runtime/base ref fields explicitly.
 //
 // Returns the merged config.SandboxConfig the lifecycle should run with.
-func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string) (*config.SandboxConfig, error) {
+func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string, opts ApplyOptions) (*config.SandboxConfig, error) {
 	if host == nil {
 		return nil, errors.New("ApplyRules: host config is nil")
 	}
 	if snap == nil {
 		return nil, errors.New("ApplyRules: snapshot.cfg is nil")
+	}
+	fileRefs, err := opts.FileRefs.normalized()
+	if err != nil {
+		return nil, err
 	}
 	out := *host // shallow copy
 
@@ -182,7 +219,7 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 	if snapRuntimeRef.Scheme != "file" {
 		return nil, fmt.Errorf("snapshot.cfg.runtime_ref: scheme %q unexpected (boot.runtime is file:// only)", snapRuntimeRef.Scheme)
 	}
-	resolvedRuntime, err := resolveBootFileRef(host.Boot.Runtime, snapRuntimeRef, snapshotPath, "boot.runtime")
+	resolvedRuntime, err := resolveBootFileRef(host.Boot.Runtime, snapRuntimeRef, snapshotPath, "boot.runtime", fileRefs)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +242,7 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 		if err != nil {
 			return nil, fmt.Errorf("snapshot.cfg.base_ref: %w", err)
 		}
-		resolvedBase, err := resolveAnyRef(host.Boot.Root.Base, snapBaseRef, snapshotPath, "boot.root.base")
+		resolvedBase, err := resolveAnyRef(host.Boot.Root.Base, snapBaseRef, snapshotPath, "boot.root.base", fileRefs)
 		if err != nil {
 			return nil, err
 		}
@@ -242,7 +279,7 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 				if err != nil {
 					return nil, fmt.Errorf("snapshot.cfg.%s.base_ref: %w", field, err)
 				}
-				resolvedBase, err := resolveAnyRef(hd.Base, snapBaseRef, snapshotPath, field+".base")
+				resolvedBase, err := resolveAnyRef(hd.Base, snapBaseRef, snapshotPath, field+".base", fileRefs)
 				if err != nil {
 					return nil, err
 				}
@@ -268,19 +305,19 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 // resolveBootFileRef enforces the file:// rules for boot.runtime /
 // boot.root.base when the snapshot.cfg ref is file:// type.
 //
-//   - host empty: build absolute path = filepath.Join(<bundle dir>, basename),
-//     verify file SHA256 matches digest, return file:// + abs path.
-//   - host non-empty: parse host URL → file path, verify
-//     basename(path) == ref.Basename, sha256(file) == ref.Digest,
-//     return host URL as-is.
-func resolveBootFileRef(hostURL string, snapRef Ref, snapshotPath, fieldName string) (string, error) {
+//   - host empty: build absolute path = filepath.Join(<bundle dir>, basename).
+//   - host non-empty: parse host URL → file path and verify
+//     basename(path) == ref.Basename.
+//   - verify mode hashes the local file and matches ref.Digest; trust mode
+//     only checks that the local file exists.
+func resolveBootFileRef(hostURL string, snapRef Ref, snapshotPath, fieldName string, fileRefs FileRefPolicy) (string, error) {
 	if hostURL == "" {
 		if snapshotPath == "" {
 			return "", fmt.Errorf("%s: snapshot.cfg ref is file:// but bundle is manifest-loaded; provide %s explicitly", fieldName, fieldName)
 		}
 		bundleDir := filepath.Dir(snapshotPath)
 		abs := filepath.Join(bundleDir, snapRef.Basename)
-		if err := verifyFileDigest(abs, snapRef.Digest); err != nil {
+		if err := validateFileRef(abs, snapRef.Digest, fileRefs); err != nil {
 			return "", fmt.Errorf("%s: auto-resolved %s: %w", fieldName, abs, err)
 		}
 		return "file://" + abs, nil
@@ -296,7 +333,10 @@ func resolveBootFileRef(hostURL string, snapRef Ref, snapshotPath, fieldName str
 	if filepath.Base(hostPath) != snapRef.Basename {
 		return "", fmt.Errorf("%s: basename mismatch with snapshot.cfg (host=%q, snap=%q)", fieldName, filepath.Base(hostPath), snapRef.Basename)
 	}
-	if err := verifyFileDigest(hostPath, snapRef.Digest); err != nil {
+	if err := validateFileRef(hostPath, snapRef.Digest, fileRefs); err != nil {
+		if fileRefs != FileRefPolicyVerify {
+			return "", fmt.Errorf("%s: file ref: %w", fieldName, err)
+		}
 		return "", fmt.Errorf("%s: digest mismatch: %w", fieldName, err)
 	}
 	return hostURL, nil
@@ -304,10 +344,10 @@ func resolveBootFileRef(hostURL string, snapRef Ref, snapshotPath, fieldName str
 
 // resolveAnyRef handles either file:// or manifest:// refs (used by
 // boot.root.base which accepts both).
-func resolveAnyRef(hostURL string, snapRef Ref, snapshotPath, fieldName string) (string, error) {
+func resolveAnyRef(hostURL string, snapRef Ref, snapshotPath, fieldName string, fileRefs FileRefPolicy) (string, error) {
 	switch snapRef.Scheme {
 	case "file":
-		return resolveBootFileRef(hostURL, snapRef, snapshotPath, fieldName)
+		return resolveBootFileRef(hostURL, snapRef, snapshotPath, fieldName, fileRefs)
 	case "manifest":
 		if hostURL == "" {
 			return snapRef.String(), nil
@@ -323,6 +363,20 @@ func resolveAnyRef(hostURL string, snapRef Ref, snapshotPath, fieldName string) 
 	default:
 		return "", fmt.Errorf("%s: unsupported scheme %q in snapshot.cfg", fieldName, snapRef.Scheme)
 	}
+}
+
+func validateFileRef(path, want string, policy FileRefPolicy) error {
+	if policy == FileRefPolicyVerify {
+		return verifyFileDigest(path, want)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if st.IsDir() {
+		return fmt.Errorf("%s is a directory", path)
+	}
+	return nil
 }
 
 // verifyFileDigest streams the file at path, computes SHA256 (sparse
