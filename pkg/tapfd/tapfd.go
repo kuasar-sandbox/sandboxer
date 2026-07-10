@@ -35,7 +35,6 @@ const DefaultTimeout = 5 * time.Second
 type Metadata struct {
 	MAC string // provider-assigned MAC the VMM must mirror onto virtio-net
 	IP  string // interface L3 address (may be bare, no mask)
-	MTU int    // interface MTU (0 = absent)
 }
 
 // AcquireConfig selects the configured tapfd transport and returns the acquired
@@ -185,15 +184,15 @@ func AcquireSocket(ctx context.Context, socketPath, requestFields string, timeou
 // RecvFd performs the §2.4 receive by delegating to the canonical
 // connector tapfd library (recvmsg, SCM_RIGHTS fd collection, payload
 // parse, fd-count cross-check, and the positional tap/netns split), then
-// projects the resulting PortMetadata onto the MAC/IP/MTU subset sandbox-ctl
-// acts on. netnsFile is nil when the provider attached none. Any error closes
-// all received fds.
+// projects the resulting PortMetadata onto the MAC/IP subset sandbox-ctl acts
+// on. netnsFile is nil when the provider attached none. Any error closes all
+// received fds.
 func RecvFd(conn *net.UnixConn) (tapFiles []*os.File, netnsFile *os.File, meta Metadata, err error) {
 	taps, netnsF, pm, rerr := vsw.RecvFdsWithNetns(conn)
 	if rerr != nil {
 		return nil, nil, Metadata{}, rerr
 	}
-	return taps, netnsF, Metadata{MAC: pm.MAC, IP: pm.InnerIP, MTU: int(pm.MTU)}, nil
+	return taps, netnsF, Metadata{MAC: pm.MAC, IP: pm.InnerIP}, nil
 }
 
 func closeAll(files []*os.File) {

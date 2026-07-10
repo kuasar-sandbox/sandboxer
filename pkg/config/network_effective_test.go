@@ -9,7 +9,6 @@ func TestEffectiveNetwork(t *testing.T) {
 		name        string
 		cfg         NetworkConfig
 		mMAC, mIP   string
-		mMTU        int
 		wantMAC     string
 		wantIPCIDR  string // "" → expect nil spec
 		wantMTU     int
@@ -18,8 +17,8 @@ func TestEffectiveNetwork(t *testing.T) {
 		{
 			name: "meta overrides, config mask preserved",
 			cfg:  NetworkConfig{MAC: "aa:aa:aa:aa:aa:aa", IP: "169.254.1.1/31", MTU: 1500, Nexthop: "169.254.1.0"},
-			mMAC: "02:00:00:00:80:01", mIP: "169.254.4.1", mMTU: 1450,
-			wantMAC: "02:00:00:00:80:01", wantIPCIDR: "169.254.4.1/31", wantMTU: 1450, wantNexthop: "169.254.1.0",
+			mMAC: "02:00:00:00:80:01", mIP: "169.254.4.1",
+			wantMAC: "02:00:00:00:80:01", wantIPCIDR: "169.254.4.1/31", wantMTU: 1500, wantNexthop: "169.254.1.0",
 		},
 		{
 			name:    "no meta uses config as-is",
@@ -46,7 +45,7 @@ func TestEffectiveNetwork(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mac, spec := tc.cfg.Effective(tc.mMAC, tc.mIP, tc.mMTU)
+			mac, spec := tc.cfg.Effective(tc.mMAC, tc.mIP)
 			if mac != tc.wantMAC {
 				t.Errorf("mac = %q, want %q", mac, tc.wantMAC)
 			}
