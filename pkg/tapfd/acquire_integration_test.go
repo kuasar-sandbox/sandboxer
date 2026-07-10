@@ -113,7 +113,7 @@ func TestHelperProcess(t *testing.T) {
 	if err != nil {
 		fail("helper: open tap: %v", err)
 	}
-	payload := []byte("port=1 mac=02:00:00:00:80:01 mtu=1450 ip=169.254.4.1 fd=1\x00")
+	payload := []byte("port=1 mac=02:00:00:00:80:01 ip=169.254.4.1 fd=1\x00")
 	if _, _, err := uconn.WriteMsgUnix(payload, unix.UnixRights(int(tap.Fd())), nil); err != nil {
 		fail("helper: send fd: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestAcquireHandoffIT(t *testing.T) {
 	}
 	defer f.Close()
 
-	if meta.MAC != "02:00:00:00:80:01" || meta.IP != "169.254.4.1" || meta.MTU != 1450 {
+	if meta.MAC != "02:00:00:00:80:01" || meta.IP != "169.254.4.1" {
 		t.Errorf("meta = %+v", meta)
 	}
 	if fl := queueFlags(t, f); fl&unix.IFF_VNET_HDR == 0 {

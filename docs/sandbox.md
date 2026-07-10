@@ -444,8 +444,8 @@ network:
     # request: "VSWITCH=sw0 PORT=3"
     # timeout: 5s              # 交接超时(Go duration);默认 5s
 
-  # 属性:tap 模式按下值生效;tapfd 模式下被交接元数据覆盖——
-  #   meta.mac→mac、meta.ip→ip(仅替换地址,保留下方掩码)、meta.mtu→mtu
+  # 属性:tap 模式按下值生效;tapfd 模式下 mac/ip 被交接元数据覆盖——
+  #   meta.mac→mac、meta.ip→ip(仅替换地址,保留下方掩码)
   mac: ""                      # virtio-net MAC(CH --net mac=);空 + tap 模式 → CH 自动分配
   ip: 169.254.1.1/31           # guest CIDR(IPv4 或 IPv6);空则不配 IP
   mtu: 1500                    # guest 网卡 MTU;0 用内核默认
@@ -782,7 +782,7 @@ boot:
 | 字段 | 为什么不存 |
 |---|---|
 | `sandbox.id` | 由 host 传入(`run --sandbox-id` 或 yaml) |
-| `network.{tap\|tapfd,mac,ip,mtu,nexthop,hostname,interface}` | host-localized,restore 时由 sandbox.yaml 提供;源二选一,tapfd 元数据覆盖 mac/ip/mtu |
+| `network.{tap\|tapfd,mac,ip,mtu,nexthop,hostname,interface}` | host-localized,restore 时由 sandbox.yaml 提供;源二选一,tapfd 元数据覆盖 mac/ip |
 | `launch.{exec,args,env,workdir,restart}` | 应用启动配置在 guest 内存里已经反映为运行中进程,restore 后不再走 launch 协议 |
 | `control.{cgroup_path,controller}` | host-localized 资源策略 |
 | `overhead` / `watermark_high` / `startup` / `allocatable` | 同上,host 资源策略 |

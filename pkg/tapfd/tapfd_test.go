@@ -77,7 +77,7 @@ func TestRecvFd_OK(t *testing.T) {
 		netnsFile.Close()
 		t.Fatalf("got netns fd without netns_fd= in payload")
 	}
-	if meta.MAC != "02:00:00:00:80:01" || meta.IP != "169.254.4.1" || meta.MTU != 1450 {
+	if meta.MAC != "02:00:00:00:80:01" || meta.IP != "169.254.4.1" {
 		t.Fatalf("meta = %+v", meta)
 	}
 }
@@ -157,7 +157,6 @@ func TestAcquireSocketOK(t *testing.T) {
 		payload, err := (&ctapfd.PortMetadata{
 			Port:    1,
 			MAC:     "02:00:00:00:80:01",
-			MTU:     1450,
 			InnerIP: "169.254.4.1",
 			FDCount: 1,
 		}).Marshal()
@@ -191,7 +190,7 @@ func TestAcquireSocketOK(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatalf("provider: %v", err)
 	}
-	if meta.MAC != "02:00:00:00:80:01" || meta.IP != "169.254.4.1" || meta.MTU != 1450 {
+	if meta.MAC != "02:00:00:00:80:01" || meta.IP != "169.254.4.1" {
 		t.Fatalf("meta = %+v", meta)
 	}
 }

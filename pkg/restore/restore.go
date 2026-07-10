@@ -474,7 +474,6 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// stable per-port MAC — see docs/tapfd.md §5).
 	var tapFile, netnsFile *os.File
 	var metaMAC, metaIP string
-	var metaMTU int
 	if snapCfg.Network.TapFD != nil {
 		f, nsf, meta, err := tapfd.AcquireConfig(ctx, snapCfg.Network.TapFD)
 		if err != nil {
@@ -486,10 +485,10 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		if netnsFile != nil {
 			defer netnsFile.Close()
 		}
-		metaMAC, metaIP, metaMTU = meta.MAC, meta.IP, meta.MTU
-		logf("tapfd: received tap fd for restore (mac=%s ip=%s mtu=%d netns=%t)", meta.MAC, meta.IP, meta.MTU, netnsFile != nil)
+		metaMAC, metaIP = meta.MAC, meta.IP
+		logf("tapfd: received tap fd for restore (mac=%s ip=%s netns=%t)", meta.MAC, meta.IP, netnsFile != nil)
 	}
-	netMAC, netSpec := snapCfg.Network.Effective(metaMAC, metaIP, metaMTU)
+	netMAC, netSpec := snapCfg.Network.Effective(metaMAC, metaIP)
 
 	// The shared back-half (memfd, uffd va_report handler, vhost-blk
 	// backends, the launch server — incl. the guest→host mem_report /

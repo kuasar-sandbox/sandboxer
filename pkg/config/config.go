@@ -297,9 +297,9 @@ func (c *SandboxConfig) SensorRuntime() (mode string, stallUs, windowUs uint64, 
 //   - TapFD: tapfd handoff (docs/tapfd.md §3) — sandbox-ctl execs a helper that
 //     hands over a tap queue fd (with virtio-net header) + metadata.
 //
-// In TapFD mode the handoff metadata OVERRIDES the static attributes:
-// meta.mac→MAC, meta.ip→IP (address replaces, configured mask preserved),
-// meta.mtu→MTU. See NetworkConfig.Effective.
+// In TapFD mode the handoff metadata OVERRIDES the static identity attributes:
+// meta.mac→MAC, meta.ip→IP (address replaces, configured mask preserved).
+// MTU stays a sandbox/node configuration value.
 type NetworkConfig struct {
 	TAP   string       `yaml:"tap,omitempty"`   // host tap name; CH opens it (attach, don't create)
 	TapFD *TapFDConfig `yaml:"tapfd,omitempty"` // tapfd handoff helper (docs/tapfd.md §3)
@@ -378,12 +378,12 @@ func (t *TapFDConfig) Validate(field string) error {
 }
 
 // Effective merges the static network attributes with optional handoff
-// metadata (metaMAC/metaIP/metaMTU; empty/zero = no override) and returns the
+// metadata (metaMAC/metaIP; empty = no override) and returns the
 // MAC for CH (--net mac=) plus the guest NetworkSpec to push. The IP override
 // replaces the address while preserving the configured mask when the override
 // carries none. spec is nil when there is no IP to configure (matches the
 // "no IP → skip guest network" cold-start behavior).
-func (n NetworkConfig) Effective(metaMAC, metaIP string, metaMTU int) (mac string, spec *proto.NetworkSpec) {
+func (n NetworkConfig) Effective(metaMAC, metaIP string) (mac string, spec *proto.NetworkSpec) {
 	mac = n.MAC
 	if metaMAC != "" {
 		mac = metaMAC
@@ -393,9 +393,6 @@ func (n NetworkConfig) Effective(metaMAC, metaIP string, metaMTU int) (mac strin
 		ip = mergeIPMask(metaIP, n.IP)
 	}
 	mtu := n.MTU
-	if metaMTU > 0 {
-		mtu = metaMTU
-	}
 	if ip == "" {
 		return mac, nil
 	}

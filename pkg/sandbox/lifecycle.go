@@ -246,11 +246,10 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// Network acquisition. tapfd mode (docs/tapfd.md §3) receives a tap queue
 	// fd + metadata from either an exec helper or a persistent provider socket;
 	// tap-name mode was verified above and CH opens it. The handoff metadata
-	// overrides the static attrs (mac/ip/mtu). The resolved spec travels
+	// overrides the static mac/ip attrs. The resolved spec travels
 	// through the launch handshake; nil → "no IP configuration" to sandbox-init.
 	var tapFile, netnsFile *os.File
 	var metaMAC, metaIP string
-	var metaMTU int
 	if opts.Cfg.Network.TapFD != nil {
 		f, nsf, meta, err := tapfd.AcquireConfig(ctx, opts.Cfg.Network.TapFD)
 		if err != nil {
@@ -262,10 +261,10 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		if netnsFile != nil {
 			defer netnsFile.Close()
 		}
-		metaMAC, metaIP, metaMTU = meta.MAC, meta.IP, meta.MTU
-		logf("tapfd: received tap fd (mac=%s ip=%s mtu=%d netns=%t)", meta.MAC, meta.IP, meta.MTU, netnsFile != nil)
+		metaMAC, metaIP = meta.MAC, meta.IP
+		logf("tapfd: received tap fd (mac=%s ip=%s netns=%t)", meta.MAC, meta.IP, netnsFile != nil)
 	}
-	netMAC, netSpec := opts.Cfg.Network.Effective(metaMAC, metaIP, metaMTU)
+	netMAC, netSpec := opts.Cfg.Network.Effective(metaMAC, metaIP)
 	launchSpec.Network = netSpec
 
 	// Environment setup carried in the launch spec (applied guest-side
