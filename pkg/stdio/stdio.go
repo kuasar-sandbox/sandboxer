@@ -245,12 +245,19 @@ const journaldMaxLine = 60 << 10
 // stderr with a "[tag] " line prefix so output is never silently lost.
 type journaldWriter struct {
 	tag      string
+	fields   map[string]string
 	fallback io.Writer // non-nil ⇒ journald unavailable
 	buf      []byte
 }
 
 func newJournaldWriter(tag string) *journaldWriter {
-	w := &journaldWriter{tag: tag}
+	fields := map[string]string{"SYSLOG_IDENTIFIER": tag}
+	for _, key := range []string{"KUASAR_RUN_ID", "KUASAR_SANDBOX_ID", "KUASAR_BUILD_ID"} {
+		if v := os.Getenv(key); v != "" {
+			fields[key] = v
+		}
+	}
+	w := &journaldWriter{tag: tag, fields: fields}
 	if !journal.Enabled() {
 		w.fallback = os.Stderr
 	}
@@ -283,7 +290,7 @@ func (w *journaldWriter) emit(line []byte) {
 		fmt.Fprintf(w.fallback, "[%s] %s\n", w.tag, line)
 		return
 	}
-	_ = journal.Send(string(line), journal.PriInfo, map[string]string{"SYSLOG_IDENTIFIER": w.tag})
+	_ = journal.Send(string(line), journal.PriInfo, w.fields)
 }
 
 // Close flushes any buffered partial line. Callers invoke it only after the
