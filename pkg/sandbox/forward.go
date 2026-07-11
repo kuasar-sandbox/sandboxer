@@ -113,6 +113,10 @@ func OpenForward(client *guestlink.HostClient, spec *proto.ConnectSpec, deadline
 	if err != nil {
 		return nil, err
 	}
+	return finishOpenForward(conn, spec)
+}
+
+func finishOpenForward(conn net.Conn, spec *proto.ConnectSpec) (net.Conn, error) {
 	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeConnect, Connect: spec}); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("write connect: %w", err)
@@ -136,7 +140,7 @@ func OpenForward(client *guestlink.HostClient, spec *proto.ConnectSpec, deadline
 // Forwarder runs the host side of `sandbox-ctl run --connect`: one
 // listener per ForwardSpec, each accepted connection spliced to the guest
 // via a per-connection reverse channel (OpenForward/openAccept → fwd.Relay).
-// It tracks live relays so a snapshot can gate new ones (Pause) and collapse
+// It tracks live relays so a snapshot can gate new ones (PauseAndDrain) and collapse
 // active ones (CloseActive), mirroring the guest's quiesce teardown; the
 // guest closes its ends authoritatively (lingered), this just promptly
 // drops the host halves. Accept-mode forwards also park a reverse conn while
@@ -150,7 +154,8 @@ type Forwarder struct {
 
 	mu        sync.Mutex
 	relays    map[*fwd.Relay]struct{}
-	pending   map[net.Conn]struct{} // accept-mode reverse conns awaiting connect_ack
+	pending   map[net.Conn]struct{} // dial/accept reverse conns awaiting connect_ack
+	inflight  sync.WaitGroup        // serve goroutines admitted before the quiesce gate
 	quiescing bool
 	closed    bool
 }
@@ -229,15 +234,13 @@ func (f *Forwarder) acceptLoop(ctx context.Context, ln net.Listener, spec Forwar
 }
 
 func (f *Forwarder) serve(local net.Conn, spec ForwardSpec) {
-	// Gate: refuse new forwards while a snapshot is quiescing or after
-	// shutdown (the guest would reject the connect anyway; fail fast).
-	f.mu.Lock()
-	gated := f.quiescing || f.closed
-	f.mu.Unlock()
-	if gated {
+	// Admission and inflight.Add are serialized with PauseAndDrain setting the
+	// gate. Once the gate is set, Wait therefore cannot race a new Add.
+	if !f.beginServe() {
 		_ = local.Close()
 		return
 	}
+	defer f.inflight.Done()
 	client := &guestlink.HostClient{BasePath: f.vsockBase, Logf: f.logf}
 	cs := &proto.ConnectSpec{Network: spec.Network, Address: spec.Address, Accept: spec.Accept}
 	var vconn net.Conn
@@ -245,7 +248,7 @@ func (f *Forwarder) serve(local net.Conn, spec ForwardSpec) {
 	if spec.Accept {
 		vconn, err = f.openAccept(client, cs)
 	} else {
-		vconn, err = OpenForward(client, cs, proto.DeadlineConnect)
+		vconn, err = f.openForward(client, cs)
 	}
 	if err != nil {
 		f.logf("port-forward %s → %s: %v", spec.Raw, spec.Address, err)
@@ -259,6 +262,16 @@ func (f *Forwarder) serve(local net.Conn, spec ForwardSpec) {
 	}
 	defer f.untrack(relay)
 	relay.Run()
+}
+
+func (f *Forwarder) beginServe() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.quiescing || f.closed {
+		return false
+	}
+	f.inflight.Add(1)
+	return true
 }
 
 func (f *Forwarder) track(r *fwd.Relay) bool {
@@ -288,19 +301,21 @@ func (f *Forwarder) openAccept(client *guestlink.HostClient, spec *proto.Connect
 	if err != nil {
 		return nil, err
 	}
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeConnect, Connect: spec}); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("write connect: %w", err)
-	}
-	// Drop the handshake deadline and park; register first so a concurrent
-	// Close/CloseActive can collapse the wait (closing conn unblocks the read).
-	_ = conn.SetDeadline(time.Time{})
+	// Track from the first live raw connection, before any request bytes are
+	// sent, so PauseAndDrain can close every admitted handshake.
 	if !f.trackPending(conn) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("connect: forwarder gated (quiescing/closed)")
 	}
+	defer f.untrackPending(conn)
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeConnect, Connect: spec}); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("write connect: %w", err)
+	}
+	// Drop the handshake deadline and park; pending tracking lets a concurrent
+	// PauseAndDrain collapse the wait (closing conn unblocks the read).
+	_ = conn.SetDeadline(time.Time{})
 	resp, err := proto.ReadMessage(conn)
-	f.untrackPending(conn)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("read connect_ack: %w", err)
@@ -315,7 +330,23 @@ func (f *Forwarder) openAccept(client *guestlink.HostClient, spec *proto.Connect
 	return conn, nil
 }
 
-// trackPending registers an accept-mode reverse conn parked for connect_ack,
+// openForward is the tracked dial-mode handshake. OpenForward remains the
+// standalone helper, while Forwarder must register the raw connection before
+// writing connect{} so a snapshot can close and join an in-flight handshake.
+func (f *Forwarder) openForward(client *guestlink.HostClient, spec *proto.ConnectSpec) (net.Conn, error) {
+	conn, err := client.DialRaw(proto.DeadlineConnect)
+	if err != nil {
+		return nil, err
+	}
+	if !f.trackPending(conn) {
+		_ = conn.Close()
+		return nil, fmt.Errorf("connect: forwarder gated (quiescing/closed)")
+	}
+	defer f.untrackPending(conn)
+	return finishOpenForward(conn, spec)
+}
+
+// trackPending registers a dial/accept reverse conn waiting for connect_ack,
 // returning false (gated) if a snapshot/shutdown is in progress — same gate
 // as track, so a forward racing quiesce is dropped rather than parked.
 func (f *Forwarder) trackPending(c net.Conn) bool {
@@ -334,12 +365,22 @@ func (f *Forwarder) untrackPending(c net.Conn) {
 	f.mu.Unlock()
 }
 
-// Pause gates new forwards (a snapshot is quiescing); Resume re-enables.
-// Symmetric with guestlink.Pinger.Pause/Resume around snapshot.Take.
-func (f *Forwarder) Pause()  { f.mu.Lock(); f.quiescing = true; f.mu.Unlock() }
+// PauseAndDrain gates new forwards, closes every pending handshake and live
+// relay admitted before the gate, then waits for their serve goroutines to
+// return. When it completes, no host-side forward can emit teardown after the
+// guest's subsequent quiesced response.
+func (f *Forwarder) PauseAndDrain() {
+	f.mu.Lock()
+	f.quiescing = true
+	f.mu.Unlock()
+	f.CloseActive()
+	f.inflight.Wait()
+}
+
+// Resume re-enables forwarding after an aborted snapshot or resume-after flow.
 func (f *Forwarder) Resume() { f.mu.Lock(); f.quiescing = false; f.mu.Unlock() }
 
-// CloseActive tears down every live relay AND every parked accept-mode conn
+// CloseActive tears down every live relay AND every in-flight handshake conn
 // (host side) — called around a snapshot so neither survives into the paused
 // window. The guest closes its ends authoritatively (lingered) so the
 // snapshot is clean; this just collapses the host-side halves promptly.

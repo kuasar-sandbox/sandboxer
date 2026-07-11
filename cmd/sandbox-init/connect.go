@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net"
 	"os"
@@ -47,6 +48,7 @@ var errAcceptQuiescing = errors.New("sandbox quiescing (snapshot in progress)")
 type connSession struct {
 	relay     *fwd.Relay
 	c         *vsockConn
+	cancel    context.CancelFunc
 	closeOnce sync.Once
 }
 
@@ -58,6 +60,9 @@ type connSession struct {
 // it. relay is read after the registry mutex has serialized any promote, so
 // the nil check is stable here.
 func (s *connSession) teardown() {
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.relay != nil {
 		s.relay.Shutdown(func() { _ = s.c.SetLinger(connectLingerSec) })
 		return
@@ -232,12 +237,19 @@ func closeConnectSessions(reg *connRegistry, lns *acceptListeners) {
 	wg.Wait()
 }
 
+type connectDialFunc func(context.Context, string, string) (net.Conn, error)
+
 // runConnectSession services one proto.TypeConnect reverse-channel conn:
 // obtain the guest-side connection (dial the target, or — in accept mode —
 // Accept one on a lazily-created listener), ack, then splice the conn to it
 // via the fwd frame relay (TCP half-close preserved). It owns c (the relay
 // closes it). Blocks until the session ends.
 func runConnectSession(c *vsockConn, req *proto.Message, sup *supervisorState) {
+	dialer := &net.Dialer{Timeout: connectDialTimeout}
+	runConnectSessionWithDial(c, req, sup, dialer.DialContext)
+}
+
+func runConnectSessionWithDial(c *vsockConn, req *proto.Message, sup *supervisorState, dial connectDialFunc) {
 	reg := sup.connReg
 	fail := func(msg string) {
 		_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: msg})
@@ -249,13 +261,6 @@ func runConnectSession(c *vsockConn, req *proto.Message, sup *supervisorState) {
 		fail("connect: empty address")
 		return
 	}
-	// Reject new forwards while quiescing: a snapshot wants zero in-flight
-	// forward connections, and the target (the app) is frozen, so a dial /
-	// accept would hang.
-	if reg.isQuiescing() {
-		fail("connect: sandbox quiescing (snapshot in progress)")
-		return
-	}
 	network := spec.Network
 	if network == "" {
 		network = "tcp"
@@ -264,27 +269,43 @@ func runConnectSession(c *vsockConn, req *proto.Message, sup *supervisorState) {
 		runAcceptSession(c, network, spec.Address, sup)
 		return
 	}
-	target, err := net.DialTimeout(network, spec.Address, connectDialTimeout)
-	if err != nil {
-		fail("connect: dial " + spec.Address + ": " + err.Error())
+
+	// Register before the potentially blocking target dial. Quiesce can now
+	// cancel the dial and perform the lingered reverse-connection close before
+	// replying `quiesced`; a late dial completion cannot emit teardown afterward.
+	dialCtx, cancel := context.WithCancel(context.Background())
+	s := &connSession{c: c, cancel: cancel}
+	if !reg.add(s) {
+		s.teardown()
 		return
 	}
+	defer func() {
+		cancel()
+		reg.remove(s)
+	}()
+
+	target, err := dial(dialCtx, network, spec.Address)
+	if err != nil {
+		if !reg.isQuiescing() {
+			_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: "connect: dial " + spec.Address + ": " + err.Error()})
+		}
+		s.teardown()
+		return
+	}
+	cancel()
 
 	relay := fwd.NewRelay(c, target)
-	s := &connSession{relay: relay, c: c}
-	// Register before acking so a snapshot starting now either observes
-	// this session (and tears it down) or is observed here (add fails).
-	if !reg.add(s) {
-		// Raced with quiesce: don't ack — the host's OpenForward sees the
-		// conn close and fails the local connection. Lingered teardown.
-		relay.Shutdown(func() { _ = c.SetLinger(connectLingerSec) })
+	if !reg.promote(s, relay) {
+		// Quiesce snapshotted this registered pre-dial session. Its teardown
+		// owns the reverse conn; only dispose of the newly opened target here.
+		_ = target.Close()
+		s.teardown()
 		return
 	}
-	defer reg.remove(s)
 
 	if err := proto.WriteMessage(c, &proto.Message{Type: proto.TypeConnectAck}); err != nil {
 		logf("connect: write connect_ack (%s): %v", spec.Address, err)
-		relay.Shutdown(nil)
+		s.teardown()
 		return
 	}
 	_ = c.SetDeadline(time.Time{}) // hand off to the relay; no per-frame deadline

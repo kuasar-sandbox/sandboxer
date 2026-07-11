@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"os"
@@ -131,6 +132,45 @@ func TestRunConnectSessionDialFail(t *testing.T) {
 	}
 	if resp.Type != proto.TypeError {
 		t.Fatalf("got %q want error", resp.Type)
+	}
+}
+
+func TestRunConnectSessionDialQuiesce(t *testing.T) {
+	hostFD, guestFD := socketpairFDs(t)
+	hostC := &vsockConn{fd: hostFD}
+	guestC := &vsockConn{fd: guestFD}
+	defer hostC.Close()
+
+	sup := &supervisorState{connReg: newConnRegistry(), acceptLn: newAcceptListeners()}
+	dialStarted := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		runConnectSessionWithDial(guestC, &proto.Message{
+			Type:    proto.TypeConnect,
+			Connect: &proto.ConnectSpec{Address: "198.51.100.1:80"},
+		}, sup, func(ctx context.Context, _, _ string) (net.Conn, error) {
+			close(dialStarted)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		close(done)
+	}()
+
+	select {
+	case <-dialStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("target dial did not start")
+	}
+	closeConnectSessions(sup.connReg, sup.acceptLn)
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("quiesce did not cancel the registered target dial")
+	}
+	_ = hostC.SetDeadline(time.Now().Add(time.Second))
+	if n, _ := hostC.Read(make([]byte, 1)); n != 0 {
+		t.Errorf("expected reverse conn at EOF after quiesce, read %d bytes", n)
 	}
 }
 

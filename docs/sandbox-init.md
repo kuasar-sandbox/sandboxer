@@ -382,7 +382,8 @@ quiesce 是 host `/vm.pause` 之前的最后一次清理机会,目标两件事:
    关闭 target 连接 + 反向通道 vsock 连接,后者带 SO_LINGER **阻塞至 socket 移除**
    ——与 MUX 同理,不留半开 vsock 残留。多会话**并发**关闭,有界于 quiesce 预算。
    accept 模式额外关闭缓存的 guest listener(唤醒 park 中的 Accept,清空缓存,resume
-   后懒重建)。host 侧 Forwarder 同步暂停新建并收拢活跃中继 + pending accept 反向连接的 host 半边
+   后懒重建)。host 侧 Forwarder 在发送 quiesce 前暂停新建、关闭并等待所有在途 dial/accept
+   握手与活跃中继退出，确保之后不再产生 host 侧 teardown
 5. 在 MUX 连接上发起优雅关闭握手(§4.6):MUX_CLOSE → 收 MUX_CLOSE_ACK → close(MUX)。
    close 带 SO_LINGER,**阻塞至该 vsock socket 真正从内核移除**(host 响应方回 ACK
    后立即关闭其连接,RST 回到 guest → 这端 socket 移除),而非"发起关闭即返回"——
@@ -566,7 +567,8 @@ socket,host 用 `net.FileListener` 包装后关掉原 fd,避免泄漏进 CH)或 
 guest 标记 quiescing 拒绝新 connect,逐条关 target + vsock(后者 SO_LINGER 确认拆除);
 **accept 模式额外**关闭所有缓存的 accept listener(唤醒 park 中的 `Accept`,其会话已在
 connReg 中一并拆除)并清空缓存——listener 不随快照留存,resume 后**懒重建**。host 侧
-Forwarder 暂停新建,并收拢活跃中继**与 pending 的 accept 反向连接**;`resume`/`restore`/
+Forwarder 在发送 quiesce 前暂停新建,并收拢、等待活跃中继**与 pending 的 dial/accept
+反向连接**;`resume`/`restore`/
 `attach`(§4.3)后解除拒绝、重新受理(并 reopen accept listener 缓存)。host 的转发
 listener 本身**不**随 quiesce 关闭——跨快照存活,restore 进程以同样 `--connect` 重新接管。
 

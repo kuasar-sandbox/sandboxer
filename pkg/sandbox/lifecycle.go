@@ -783,12 +783,13 @@ func handleSnapshotRequest(
 			go destroyAfterSnapshot(chSock, opts.Cfg.CHApiDeadline(), logf)
 		}
 	}()
-	// Gate new port-forward connects for the whole quiesce→snapshot window;
-	// active relays are collapsed after the guest acks `quiesced` (it has
-	// already torn down its ends, lingered). Resume mirrors the pinger:
-	// stay paused only on the success + destroy path.
+	// Gate new port-forward connects and join every admitted handshake/relay
+	// before asking the guest to quiesce. The later `quiesced` response is then
+	// a barrier after both host and guest teardown, so no forward shutdown can
+	// race /vm.pause. Resume mirrors the pinger: stay paused only on the success
+	// + destroy path.
 	if forwarder != nil {
-		forwarder.Pause()
+		forwarder.PauseAndDrain()
 		defer func() {
 			if err == nil && !req.ResumeAfter {
 				return
@@ -813,13 +814,6 @@ func handleSnapshotRequest(
 		client := pinger.Client
 		if client == nil {
 			client = &guestlink.HostClient{BasePath: filepath.Join(runDir, "vsock.sock"), Logf: logf}
-		}
-		// Close host forward halves before quiesce. Their vsock SHUTDOWNs must
-		// reach the guest before the quiesced response becomes the transport
-		// barrier; closing them after that response can race /vm.pause and leave
-		// teardown packets in the snapshotted virtqueue.
-		if forwarder != nil {
-			forwarder.CloseActive()
 		}
 		if err := guestlink.SendQuiesce(client); err != nil {
 			logf("quiesce: %v (aborting snapshot)", err)
