@@ -814,15 +814,16 @@ func handleSnapshotRequest(
 		if client == nil {
 			client = &guestlink.HostClient{BasePath: filepath.Join(runDir, "vsock.sock"), Logf: logf}
 		}
+		// Close host forward halves before quiesce. Their vsock SHUTDOWNs must
+		// reach the guest before the quiesced response becomes the transport
+		// barrier; closing them after that response can race /vm.pause and leave
+		// teardown packets in the snapshotted virtqueue.
+		if forwarder != nil {
+			forwarder.CloseActive()
+		}
 		if err := guestlink.SendQuiesce(client); err != nil {
 			logf("quiesce: %v (aborting snapshot)", err)
 			return ctl.Response{}, fmt.Errorf("quiesce: %w", err)
-		}
-		// Guest acked: it has closed the stdio MUX and torn down its
-		// port-forward ends (lingered). Collapse the host-side relay halves
-		// promptly so none linger into the paused snapshot window.
-		if forwarder != nil {
-			forwarder.CloseActive()
 		}
 		logf("quiesce: guest acked (MUX + forwards closed), proceeding to /vm.pause")
 	}
