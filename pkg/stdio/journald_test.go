@@ -60,4 +60,24 @@ func TestJournaldWriterLineFraming(t *testing.T) {
 	}
 }
 
+func TestJournaldWriterKuasarIdentityFields(t *testing.T) {
+	t.Setenv("KUASAR_RUN_ID", "sr-test")
+	t.Setenv("KUASAR_SANDBOX_ID", "sandbox-test")
+	t.Setenv("KUASAR_BUILD_ID", "")
+
+	w := newJournaldWriter("sandbox")
+	if got := w.fields["SYSLOG_IDENTIFIER"]; got != "sandbox" {
+		t.Fatalf("SYSLOG_IDENTIFIER = %q", got)
+	}
+	if got := w.fields["KUASAR_RUN_ID"]; got != "sr-test" {
+		t.Fatalf("KUASAR_RUN_ID = %q", got)
+	}
+	if got := w.fields["KUASAR_SANDBOX_ID"]; got != "sandbox-test" {
+		t.Fatalf("KUASAR_SANDBOX_ID = %q", got)
+	}
+	if _, ok := w.fields["KUASAR_BUILD_ID"]; ok {
+		t.Fatal("empty KUASAR_BUILD_ID should be omitted")
+	}
+}
+
 func boolp(b bool) *bool { return &b }
