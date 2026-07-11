@@ -2,10 +2,14 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 func TestParseForwardSpec(t *testing.T) {
@@ -104,5 +108,82 @@ func TestForwarderAcceptAndClose(t *testing.T) {
 	f.Close()
 	if _, err := net.DialTimeout("unix", udsPath, 500*time.Millisecond); err == nil {
 		t.Error("expected dial to fail after Close (listener removed)")
+	}
+}
+
+func TestForwarderPauseAndDrainClosesDialHandshake(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+	ln, err := net.Listen("unix", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	handshake := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		line := make([]byte, len(proto.HostConnectLine))
+		if _, err := io.ReadFull(c, line); err != nil {
+			serverDone <- err
+			return
+		}
+		if string(line) != string(proto.HostConnectLine) {
+			serverDone <- fmt.Errorf("CONNECT line = %q", line)
+			return
+		}
+		if _, err := c.Write([]byte("OK 1\n")); err != nil {
+			serverDone <- err
+			return
+		}
+		req, err := proto.ReadMessage(c)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if req.Type != proto.TypeConnect {
+			serverDone <- fmt.Errorf("request type = %q", req.Type)
+			return
+		}
+		close(handshake)
+		if _, err := c.Read(make([]byte, 1)); err == nil {
+			serverDone <- fmt.Errorf("handshake connection remained open")
+			return
+		}
+		serverDone <- nil
+	}()
+
+	f := NewForwarder(base, func(string, ...any) {})
+	local, peer := net.Pipe()
+	defer peer.Close()
+	go f.serve(local, ForwardSpec{Raw: "test", Network: "tcp", Address: "127.0.0.1:1"})
+
+	select {
+	case <-handshake:
+	case err := <-serverDone:
+		t.Fatalf("handshake setup: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("dial handshake did not start")
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		f.PauseAndDrain()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(3 * time.Second):
+		t.Fatal("PauseAndDrain did not join the admitted handshake")
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
 	}
 }

@@ -783,12 +783,13 @@ func handleSnapshotRequest(
 			go destroyAfterSnapshot(chSock, opts.Cfg.CHApiDeadline(), logf)
 		}
 	}()
-	// Gate new port-forward connects for the whole quiesce→snapshot window;
-	// active relays are collapsed after the guest acks `quiesced` (it has
-	// already torn down its ends, lingered). Resume mirrors the pinger:
-	// stay paused only on the success + destroy path.
+	// Gate new port-forward connects and join every admitted handshake/relay
+	// before asking the guest to quiesce. The later `quiesced` response is then
+	// a barrier after both host and guest teardown, so no forward shutdown can
+	// race /vm.pause. Resume mirrors the pinger: stay paused only on the success
+	// + destroy path.
 	if forwarder != nil {
-		forwarder.Pause()
+		forwarder.PauseAndDrain()
 		defer func() {
 			if err == nil && !req.ResumeAfter {
 				return
@@ -817,12 +818,6 @@ func handleSnapshotRequest(
 		if err := guestlink.SendQuiesce(client); err != nil {
 			logf("quiesce: %v (aborting snapshot)", err)
 			return ctl.Response{}, fmt.Errorf("quiesce: %w", err)
-		}
-		// Guest acked: it has closed the stdio MUX and torn down its
-		// port-forward ends (lingered). Collapse the host-side relay halves
-		// promptly so none linger into the paused snapshot window.
-		if forwarder != nil {
-			forwarder.CloseActive()
 		}
 		logf("quiesce: guest acked (MUX + forwards closed), proceeding to /vm.pause")
 	}
