@@ -40,7 +40,7 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 source "$script_dir/common.sh"
 
 : "${STAGE:=build}"
-: "${CLOUD_HYPERVISOR_TARBALL:=https://github.com/cloud-hypervisor/cloud-hypervisor/archive/refs/tags/v51.1.tar.gz#cloud-hypervisor-51.1.tar.gz}"
+: "${CLOUD_HYPERVISOR_TARBALL:=https://codeload.github.com/cloud-hypervisor/cloud-hypervisor/tar.gz/refs/tags/v51.1#cloud-hypervisor-51.1.tar.gz}"
 : "${CLOUD_HYPERVISOR_TARBALL_SHA256:=}"
 : "${BUILD_DIR:=$(pwd)/build}"
 : "${BINDIR:=$(pwd)/bin}"
