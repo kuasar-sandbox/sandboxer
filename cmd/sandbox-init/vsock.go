@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,12 +26,17 @@ const (
 // implementing the deadline-aware net.Conn surface that
 // proto.{Read,Write}Message needs.
 type vsockConn struct {
-	fd int
+	fd        int
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (c *vsockConn) Read(b []byte) (int, error)  { return syscall.Read(c.fd, b) }
 func (c *vsockConn) Write(b []byte) (int, error) { return syscall.Write(c.fd, b) }
-func (c *vsockConn) Close() error                { return syscall.Close(c.fd) }
+func (c *vsockConn) Close() error {
+	c.closeOnce.Do(func() { c.closeErr = syscall.Close(c.fd) })
+	return c.closeErr
+}
 
 // SetDeadline applies SO_RCVTIMEO + SO_SNDTIMEO. AF_VSOCK supports both
 // (kernel >= 5.16). Coarse-grained but adequate for our ms-level
