@@ -32,7 +32,7 @@ BINDIR      := bin/$(TARGET_ARCH)
 BUILD_DIR   := build/$(TARGET_ARCH)
 TARBALL_DIR := build/tarball
 
-CLOUD_HYPERVISOR_TARBALL        ?= https://github.com/cloud-hypervisor/cloud-hypervisor/archive/refs/tags/v51.1.tar.gz\#cloud-hypervisor-51.1.tar.gz
+CLOUD_HYPERVISOR_TARBALL        ?= https://codeload.github.com/cloud-hypervisor/cloud-hypervisor/tar.gz/refs/tags/v51.1\#cloud-hypervisor-51.1.tar.gz
 CLOUD_HYPERVISOR_TARBALL_SHA256 ?=
 CLOUD_HYPERVISOR_SRC            ?= $(abspath build/src/cloud-hypervisor)
 CLOUD_HYPERVISOR_BUILD_OUT      ?= $(abspath $(BUILD_DIR)/cloud-hypervisor)
