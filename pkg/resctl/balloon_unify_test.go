@@ -99,6 +99,41 @@ func TestBalloon_SetAllocatableComputesTarget(t *testing.T) {
 	}
 }
 
+func TestBalloon_SeedAppliedAllocatableSkipsInitialResize(t *testing.T) {
+	srv := newFakeCHResize(t)
+	b := NewBalloonController(srv.sock, 8<<30, nil)
+	b.Interval = 100 * time.Millisecond
+	b.SeedAppliedAllocatable(256 << 20)
+	wantInitial := uint64((8 << 30) - (256 << 20))
+	if got := b.CurrentTarget(); got != wantInitial {
+		t.Fatalf("target = %d, want %d", got, wantInitial)
+	}
+	if got := b.CurrentActual(); got != wantInitial {
+		t.Fatalf("actual = %d, want %d", got, wantInitial)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := b.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Stop()
+	if calls := srv.seen(); len(calls) != 0 {
+		t.Fatalf("seeded Start issued resize calls: %v", calls)
+	}
+
+	time.Sleep(b.Interval + 20*time.Millisecond)
+	b.SetAllocatable(512 << 20)
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) && len(srv.seen()) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	calls := srv.seen()
+	if len(calls) != 1 || calls[0] != (8<<30)-(512<<20) {
+		t.Fatalf("later resize calls = %v", calls)
+	}
+}
+
 // TestBalloon_KickFiresImmediatelyWhenElapsed: when the previous
 // reconcile is older than Interval, a SetAllocatable should trigger an
 // immediate /vm.resize call (not wait for the ticker).
