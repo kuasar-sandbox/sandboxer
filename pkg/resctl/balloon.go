@@ -153,11 +153,24 @@ func (b *BalloonController) SetTarget(sizeBytes uint64) {
 // and by lifecycle / restore at construction so the in-memory target
 // matches the value baked into CH's --balloon arg or the snapshot.
 func (b *BalloonController) SetAllocatable(allocBytes uint64) {
-	var target uint64
+	b.SetTarget(b.targetForAllocatable(allocBytes))
+}
+
+// SeedAppliedAllocatable initializes the desired and applied balloon target
+// before Start when CH is launched with the same target on its command line.
+// It deliberately does not queue a resize; later SetAllocatable calls retain
+// their normal reconcile behavior.
+func (b *BalloonController) SeedAppliedAllocatable(allocBytes uint64) {
+	target := b.targetForAllocatable(allocBytes)
+	b.target.Store(target)
+	b.actual.Store(target)
+}
+
+func (b *BalloonController) targetForAllocatable(allocBytes uint64) uint64 {
 	if b.Capacity > allocBytes {
-		target = b.Capacity - allocBytes
+		return b.Capacity - allocBytes
 	}
-	b.SetTarget(target)
+	return 0
 }
 
 // Hint adjusts the balloon target based on a guest /proc/meminfo

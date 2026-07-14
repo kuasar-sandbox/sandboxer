@@ -117,14 +117,12 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 
 	// resctl.BalloonController is the sole writer of /api/v1/vm.resize. Created
 	// only when alloc < cap (no balloon device when alloc == cap).
-	// SetAllocatable(allocBytes) here matches the --balloon size= value
-	// passed to CH in ch.go, so the in-memory target agrees with CH from
-	// the start without an extra round-trip after launch.
+	// The final initial allocatable is seeded below after controller admission,
+	// so desired/applied state matches the --balloon size= value passed to CH.
 	var balloonCtl *resctl.BalloonController
 	initialAllocBytes := allocBytes
 	if allocBytes < capBytes {
 		balloonCtl = resctl.NewBalloonController(chSock, capBytes, logf)
-		balloonCtl.SetAllocatable(allocBytes)
 	}
 
 	// Controller handshake (dynamic mode) — must happen before cgroup write
@@ -153,10 +151,10 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 			return -1, fmt.Errorf("controller admit granted initial allocatable %d above capacity %d", grantedInitial, capBytes)
 		}
 		initialAllocBytes = grantedInitial
-		if balloonCtl != nil {
-			balloonCtl.SetAllocatable(initialAllocBytes)
-		}
 		logf("controller admit ok, initial allocatable=%d", grantedInitial)
+	}
+	if balloonCtl != nil {
+		balloonCtl.SeedAppliedAllocatable(initialAllocBytes)
 	}
 	defer hooks.Release("normal")
 
