@@ -775,12 +775,18 @@ host 对 MUX 关闭的全部职责:收到 `MUX_CLOSE` → 把要发的发完 →
 → **立即 close 其连接**。不需要知道为什么关、什么时候关。
 
 **为什么 host 必须主动 close、guest 必须 SO_LINGER**:virtio-vsock 对 guest 单方
-关闭的连接不立即回收——内核挂起延迟移除(默认 8s),等对端 RST 或超时。若快照在此
-窗口内拍下,会捕获到一个半关闭的残留连接。后续 restore(尤其 snapshot-of-restored
-链)时,host 侧 vsock 代理对首个 host 发起连接(restore-notify)确定性复用同一
-local port,与残留连接的四元组相撞 → guest 静默丢弃 restore-notify → 卡在握手超时。
-故 host 回 ACK 后立即 close(RST 令 guest 端连接进入移除),guest 的 close 用
-SO_LINGER 阻塞至移除完成——`quiesced`(§3.4)时连接确已彻底拆除,无残留。
+关闭的连接不立即回收——内核挂起延迟移除(默认 8s),等对端 RST 或超时。故 host 回
+ACK 后立即 close(RST 令 guest 端连接进入移除),guest 的 close 用 SO_LINGER 阻塞至
+移除完成。这样 `quiesced`(§3.4)可保证已纳入 quiesce 的 MUX、forward 和在途握手
+全部拆除,没有关连接产生的 transport packet 再与 `/vm.pause` 竞争。
+
+这个 barrier **不能单独保证 guest 内核里没有任何旧连接状态**:刚在 gate 前正常结束
+的短连接已经离开 registry,最终承载 `quiesced` 的控制连接也只能在 ACK 写出后关闭。
+Cloud Hypervisor restore 会重建 Unix vsock backend;若 host local-port 分配器同时重置
+到 `0x40000000`,首个 restore-notify 可能复用旧四元组并被 guest RST,表现为读取
+`OK <port>` 前 EOF。平台 CH 补丁因此把 `local_port_last` 纳入 `VsockState`,恢复时
+从快照游标的下一个端口继续分配。协议层负责排空活跃流量,VMM 状态层负责不复用任何
+快照前已分配端口;restore 握手无需靠重试或延长超时兜底。
 
 **三个触发点**(同一握手):
 
@@ -886,7 +892,8 @@ guest 对 vsock 连接 arm SO_LINGER 再关,阻塞至 host RST 确认拆除,不�
   ══ MUX: MUX_CLOSE_ACK ════════════════════════════════►  recv ACK → close(MUX);  host: read → EOF → close(MUX)
                        ◄── quiesced ─────────────────────  reply on the quiesce conn; close it
   ✓ MUX closed + quiesced received  →  /vm.pause  /vm.snapshot
-  snapshot state:  listener up · app session alive (app frozen) · no MUX · no active mgmt conn
+  snapshot state:  listener up · app session alive (app frozen) · no MUX · no open mgmt conn
+                   · CH vsock local_port_last persisted
 ```
 
 **restore**:
@@ -905,7 +912,8 @@ guest 对 vsock 连接 arm SO_LINGER 再关,阻塞至 host RST 确认拆除,不�
 **listener 跨快照不关闭**——若 quiesce 把 listener 关掉,host 之后下发的 `restore`
 / `attach` 就无人 accept,guest agent 不可达。listener fd 在 snapshot/restore 间保持
 bind+listen idle 状态(idle vsock socket 没有连接表也没有缓冲数据,跟随快照过去再
-restore 语义干净)。
+restore 语义干净)。CH 重建 backend 时从快照保存的 `local_port_last + 1` 继续分配
+host local port,不与 guest 快照中的旧连接四元组冲突。
 
 ### 4.9 ping 健康探测
 

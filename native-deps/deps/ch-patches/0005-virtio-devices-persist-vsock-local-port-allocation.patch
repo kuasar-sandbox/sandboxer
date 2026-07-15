@@ -1,0 +1,188 @@
+From fc7f6d5af20dc61fd7bb64619bea59b7207933ad Mon Sep 17 00:00:00 2001
+From: Kuasar Sandbox <noreply@kuasar.dev>
+Date: Wed, 15 Jul 2026 14:18:01 +0800
+Subject: [PATCH] virtio-devices: persist vsock local port allocation
+
+The Unix vsock muxer is reconstructed during restore and currently restarts host-side port allocation at 0x40000000. Guest memory still contains socket tuples from before the snapshot, so reusing one of those ports can make the guest reject the first restore connection with RST.
+
+Store local_port_last in VsockState and restore it into the new backend so allocation continues at the next unused port.
+---
+ virtio-devices/src/vsock/device.rs     | 35 ++++++++++++++++++++++++--
+ virtio-devices/src/vsock/mod.rs        | 20 +++++++++++++--
+ virtio-devices/src/vsock/unix/muxer.rs | 20 ++++++++++++++-
+ 3 files changed, 70 insertions(+), 5 deletions(-)
+
+diff --git a/virtio-devices/src/vsock/device.rs b/virtio-devices/src/vsock/device.rs
+index 27a0af1..f488fdb 100644
+--- a/virtio-devices/src/vsock/device.rs
++++ b/virtio-devices/src/vsock/device.rs
+@@ -323,6 +323,8 @@ pub struct Vsock<B: VsockBackend> {
+ pub struct VsockState {
+     pub avail_features: u64,
+     pub acked_features: u64,
++    /// The last host-side port allocated by the vsock backend.
++    pub local_port_last: u32,
+ }
+ 
+ impl<B> Vsock<B>
+@@ -336,7 +338,7 @@ where
+         id: String,
+         cid: u32,
+         path: PathBuf,
+-        backend: B,
++        mut backend: B,
+         iommu: bool,
+         seccomp_action: SeccompAction,
+         exit_evt: EventFd,
+@@ -344,6 +346,7 @@ where
+     ) -> io::Result<Vsock<B>> {
+         let (avail_features, acked_features, paused) = if let Some(state) = state {
+             info!("Restoring virtio-vsock {id}");
++            backend.set_local_port_last(state.local_port_last);
+             (state.avail_features, state.acked_features, true)
+         } else {
+             let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_F_IN_ORDER);
+@@ -378,6 +381,7 @@ where
+         VsockState {
+             avail_features: self.common.avail_features,
+             acked_features: self.common.acked_features,
++            local_port_last: self.backend.read().unwrap().local_port_last(),
+         }
+     }
+ 
+@@ -528,7 +532,7 @@ impl<B> Migratable for Vsock<B> where B: VsockBackend + Sync + 'static {}
+ mod unit_tests {
+     use libc::EFD_NONBLOCK;
+ 
+-    use super::super::unit_tests::{NoopVirtioInterrupt, TestContext};
++    use super::super::unit_tests::{NoopVirtioInterrupt, TestBackend, TestContext};
+     use super::super::*;
+     use super::*;
+     use crate::ActivateError;
+@@ -627,6 +631,33 @@ mod unit_tests {
+             .unwrap();
+     }
+ 
++    #[test]
++    fn test_vsock_state_preserves_local_port_last() {
++        let ctx = TestContext::new();
++        let expected = (1u32 << 30) + 100;
++        ctx.device
++            .backend
++            .write()
++            .unwrap()
++            .set_local_port_last(expected);
++
++        let state = ctx.device.state();
++        assert_eq!(state.local_port_last, expected);
++
++        let restored = Vsock::new(
++            String::from("restored-vsock"),
++            ctx.cid as u32,
++            PathBuf::from("/test/restored-vsock"),
++            TestBackend::new(),
++            false,
++            seccompiler::SeccompAction::Trap,
++            EventFd::new(EFD_NONBLOCK).unwrap(),
++            Some(state),
++        )
++        .unwrap();
++        assert_eq!(restored.backend.read().unwrap().local_port_last(), expected);
++    }
++
+     #[test]
+     fn test_irq() {
+         // Test case: successful IRQ signaling.
+diff --git a/virtio-devices/src/vsock/mod.rs b/virtio-devices/src/vsock/mod.rs
+index 7895587..2e9b0c5 100644
+--- a/virtio-devices/src/vsock/mod.rs
++++ b/virtio-devices/src/vsock/mod.rs
+@@ -158,7 +158,13 @@ pub trait VsockChannel {
+ /// It that needs to be sendable through a mpsc channel (the latter due to how `vmm::EpollContext` works).
+ /// Currently, the only implementation we have is `crate::virtio::unix::muxer::VsockMuxer`, which
+ /// translates guest-side vsock connections to host-side Unix domain socket connections.
+-pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {}
++pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {
++    /// Return the last host-side port allocated by the backend.
++    fn local_port_last(&self) -> u32;
++
++    /// Resume host-side port allocation after the supplied port.
++    fn set_local_port_last(&mut self, port: u32);
++}
+ 
+ #[cfg(any(test, fuzzing))]
+ pub mod unit_tests {
+@@ -198,6 +204,7 @@ pub mod unit_tests {
+         pub rx_ok_cnt: usize,
+         pub tx_ok_cnt: usize,
+         pub evset: Option<epoll::Events>,
++        pub local_port_last: u32,
+     }
+     impl TestBackend {
+         #[allow(clippy::new_without_default)]
+@@ -210,6 +217,7 @@ pub mod unit_tests {
+                 rx_ok_cnt: 0,
+                 tx_ok_cnt: 0,
+                 evset: None,
++                local_port_last: (1u32 << 30) - 1,
+             }
+         }
+         pub fn set_rx_err(&mut self, err: Option<VsockError>) {
+@@ -256,7 +264,15 @@ pub mod unit_tests {
+             self.evset = Some(evset);
+         }
+     }
+-    impl VsockBackend for TestBackend {}
++    impl VsockBackend for TestBackend {
++        fn local_port_last(&self) -> u32 {
++            self.local_port_last
++        }
++
++        fn set_local_port_last(&mut self, port: u32) {
++            self.local_port_last = port;
++        }
++    }
+ 
+     pub struct TestContext {
+         pub cid: u64,
+diff --git a/virtio-devices/src/vsock/unix/muxer.rs b/virtio-devices/src/vsock/unix/muxer.rs
+index edce5b1..0bd47fc 100644
+--- a/virtio-devices/src/vsock/unix/muxer.rs
++++ b/virtio-devices/src/vsock/unix/muxer.rs
+@@ -345,7 +345,15 @@ impl VsockEpollListener for VsockMuxer {
+     }
+ }
+ 
+-impl VsockBackend for VsockMuxer {}
++impl VsockBackend for VsockMuxer {
++    fn local_port_last(&self) -> u32 {
++        self.local_port_last
++    }
++
++    fn set_local_port_last(&mut self, port: u32) {
++        self.local_port_last = port;
++    }
++}
+ 
+ impl VsockMuxer {
+     /// Muxer constructor.
+@@ -1223,6 +1231,16 @@ mod unit_tests {
+         assert_eq!(ctx.pkt.buf().unwrap()[..data.len()], data);
+     }
+ 
++    #[test]
++    fn test_local_port_allocation_continues_after_restore() {
++        let mut ctx = MuxerTestContext::new("local_port_restore");
++        ctx.muxer.set_local_port_last((1u32 << 30) + 100);
++
++        let (_stream, local_port) = ctx.local_connect(1025);
++
++        assert_eq!(local_port, (1u32 << 30) + 101);
++    }
++
+     #[test]
+     fn test_local_close() {
+         let peer_port = 1025;
+-- 
+2.43.0
+
