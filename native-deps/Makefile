@@ -34,7 +34,7 @@ TARBALL_DIR := build/tarball
 CLOUD_HYPERVISOR_BIN := $(abspath $(BINDIR)/cloud-hypervisor)
 
 CLOUD_HYPERVISOR_TARBALL        ?= https://codeload.github.com/cloud-hypervisor/cloud-hypervisor/tar.gz/refs/tags/v51.1\#cloud-hypervisor-51.1.tar.gz
-CLOUD_HYPERVISOR_TARBALL_SHA256 ?=
+CLOUD_HYPERVISOR_TARBALL_SHA256 ?= a2393046c0230f6360792ed2ef1b60968aa4e04d12b6be419c86306774e2e4ef
 CLOUD_HYPERVISOR_SRC            ?= $(abspath build/src/cloud-hypervisor)
 CLOUD_HYPERVISOR_BUILD_OUT      ?= $(abspath $(BUILD_DIR)/cloud-hypervisor)
 CH_PATCHES_DIR                  := $(abspath deps/ch-patches)
