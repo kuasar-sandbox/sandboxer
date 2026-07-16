@@ -387,14 +387,13 @@ func (b *consoleBridge) closeLiveMUX() {
 	b.holder.invalidate(sess)
 }
 
-// appExited marks the bridge shut at sandbox shutdown (reboot): it closes the
-// current app fd ends and wakes the app→host pumps parked for a next generation
-// so they EOF their streams and exit, then waits (bounded) for them to drain.
-// (An in-place restart uses rewireApp instead, which does NOT close the
-// session.) Called before reboot.
+// appExited marks the bridge shut at sandbox shutdown (reboot), then waits
+// (bounded) for the app→host pumps to consume the natural EOF from the exited
+// app and flush their streams. The read ends must remain open while they drain;
+// closing them first can discard bytes still buffered in stdout/stderr or the
+// PTY. An in-place restart uses rewireApp instead and keeps the session open.
 func (b *consoleBridge) appExited() {
 	b.appMu.Lock()
-	b.closeEndsLocked()
 	b.appClosed = true
 	b.appCond.Broadcast() // wake pumps in waitNextFd → CloseWrite + return
 	b.appMu.Unlock()
@@ -406,6 +405,9 @@ func (b *consoleBridge) appExited() {
 	case <-time.After(2 * time.Second):
 		// host wedged / no session — give up; we reboot anyway.
 	}
+	b.appMu.Lock()
+	b.closeEndsLocked()
+	b.appMu.Unlock()
 	b.holder.shutdown()
 }
 
