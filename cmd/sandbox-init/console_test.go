@@ -77,6 +77,71 @@ func TestPumpAppToHost(t *testing.T) {
 	}
 }
 
+func TestAppExitedDrainsTrailingOutput(t *testing.T) {
+	ss := mux.PipeStreams(false, true, false)
+	guest, host := muxPair(t, ss)
+	holder := newSessionHolder()
+	holder.set(guest)
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := newTestBridge()
+	b.holder = holder
+	b.stdoutR = pr
+
+	startPump := make(chan struct{})
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		<-startPump
+		pumpAppToHost(b, roleStdout, holder, mux.StreamStdout)
+	}()
+
+	want := []byte("trailing output before app exit\n")
+	if _, err := pw.Write(want); err != nil {
+		t.Fatalf("write app stdout: %v", err)
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close app stdout: %v", err)
+	}
+
+	exited := make(chan struct{})
+	go func() {
+		b.appExited()
+		close(exited)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		b.appMu.Lock()
+		closed := b.appClosed
+		b.appMu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("appExited did not mark the bridge closed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(startPump)
+
+	got, err := io.ReadAll(host.Stream(mux.StreamStdout))
+	if err != nil {
+		t.Fatalf("read host StreamStdout: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("host got %q, want %q", got, want)
+	}
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("appExited did not finish after draining output")
+	}
+}
+
 // TestPumpAppToHostRestart verifies the app→host pump survives an in-place
 // restart: on the first app instance's EOF it parks (no stream EOF), and after
 // a rewire (new generation fd) it resumes streaming the new instance's output.
