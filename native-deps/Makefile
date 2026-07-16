@@ -31,6 +31,7 @@ endif
 BINDIR      := bin/$(TARGET_ARCH)
 BUILD_DIR   := build/$(TARGET_ARCH)
 TARBALL_DIR := build/tarball
+CLOUD_HYPERVISOR_BIN := $(abspath $(BINDIR)/cloud-hypervisor)
 
 CLOUD_HYPERVISOR_TARBALL        ?= https://codeload.github.com/cloud-hypervisor/cloud-hypervisor/tar.gz/refs/tags/v51.1\#cloud-hypervisor-51.1.tar.gz
 CLOUD_HYPERVISOR_TARBALL_SHA256 ?=
@@ -73,8 +74,12 @@ ch-patches-format:
 	STAGE=patches-format $(CH_INVOKE) bash deps/build-cloud-hypervisor.sh
 ch-build:
 	STAGE=build $(CH_INVOKE) bash deps/build-cloud-hypervisor.sh
-cloud-hypervisor: ch-patches-apply ch-build
+cloud-hypervisor: $(CLOUD_HYPERVISOR_BIN)
 	$(call link_bin,cloud-hypervisor)
+$(CLOUD_HYPERVISOR_BIN):
+	STAGE=fetch $(CH_INVOKE) bash deps/build-cloud-hypervisor.sh
+	STAGE=patches-apply $(CH_INVOKE) bash deps/build-cloud-hypervisor.sh
+	STAGE=build $(CH_INVOKE) bash deps/build-cloud-hypervisor.sh
 
 test:
 	bash -n deps/*.sh
