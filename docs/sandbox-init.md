@@ -782,11 +782,12 @@ ACK 后立即 close(RST 令 guest 端连接进入移除),guest 的 close 用 SO_
 
 这个 barrier **不能单独保证 guest 内核里没有任何旧连接状态**:刚在 gate 前正常结束
 的短连接已经离开 registry,最终承载 `quiesced` 的控制连接也只能在 ACK 写出后关闭。
-Cloud Hypervisor restore 会重建 Unix vsock backend;若 host local-port 分配器同时重置
-到 `0x40000000`,首个 restore-notify 可能复用旧四元组并被 guest RST,表现为读取
-`OK <port>` 前 EOF。平台 CH 补丁因此把 `local_port_last` 纳入 `VsockState`,恢复时
-从快照游标的下一个端口继续分配。协议层负责排空活跃流量,VMM 状态层负责不复用任何
-快照前已分配端口;restore 握手无需靠重试或延长超时兜底。
+Cloud Hypervisor restore 又会重建空的 Unix vsock backend,不会序列化 connection map。
+平台 CH 补丁用两条独立不变量收口:保存 `local_port_last`,避免新连接复用旧四元组;
+恢复设备激活时向 guest 发布 `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET`,让 Linux 清理全部
+connected sockets,同时在 guest event-queue kick 确认前 gate backend RX。listener
+不受 reset 影响。首个 restore REQUEST 只能在清理确认后进入 guest,无需 retry、sleep
+或延长 timeout。
 
 **三个触发点**(同一握手):
 
@@ -892,7 +893,7 @@ guest 对 vsock 连接 arm SO_LINGER 再关,阻塞至 host RST 确认拆除,不�
   ══ MUX: MUX_CLOSE_ACK ════════════════════════════════►  recv ACK → close(MUX);  host: read → EOF → close(MUX)
                        ◄── quiesced ─────────────────────  reply on the quiesce conn; close it
   ✓ MUX closed + quiesced received  →  /vm.pause  /vm.snapshot
-  snapshot state:  listener up · app session alive (app frozen) · no MUX · no open mgmt conn
+  snapshot state:  listener up · app session alive (app frozen) · no MUX
                    · CH vsock local_port_last persisted
 ```
 
@@ -901,8 +902,11 @@ guest 对 vsock 连接 arm SO_LINGER 再关,阻塞至 host RST 确认拆除,不�
 ```
   sandbox-ctl                                              sandbox-init
   ───────────                                              ────────────
-  /vm.resume OK   (app still frozen — freeze state rode the snapshot)
-  dial CID=2:5000 ── restore{epoch,wallclock} ──────────►  clock_settime(CLOCK_REALTIME, wallclock_ns)
+  CH restore activation: publish TRANSPORT_RESET
+  /vm.resume OK   (RX gated)                          ───►  reset connected sockets; listener stays up
+  dial CID=2:5000 (REQUEST buffered behind RX gate)
+                       ◄── event queue kick (ack) ─────────  reset complete; CH ungates pending REQUEST
+                   ── restore{epoch,wallclock} ──────────►  clock_settime(CLOCK_REALTIME, wallclock_ns)
                        ◄── restore_ack{stdio, app_state} ─  reply on this conn
   send SET_WINSIZE  ════════════════════════════════════►  (this conn ⇒ MUX);  resume reading app pipes; replay residual
                                                            thaw app: cgroup.freeze=0  ← last, env ready
@@ -910,10 +914,9 @@ guest 对 vsock 连接 arm SO_LINGER 再关,阻塞至 host RST 确认拆除,不�
 ```
 
 **listener 跨快照不关闭**——若 quiesce 把 listener 关掉,host 之后下发的 `restore`
-/ `attach` 就无人 accept,guest agent 不可达。listener fd 在 snapshot/restore 间保持
-bind+listen idle 状态(idle vsock socket 没有连接表也没有缓冲数据,跟随快照过去再
-restore 语义干净)。CH 重建 backend 时从快照保存的 `local_port_last + 1` 继续分配
-host local port,不与 guest 快照中的旧连接四元组冲突。
+/ `attach` 就无人 accept,guest agent 不可达。transport reset 只遍历 connected sockets,
+不会关闭 bind/listen socket。CH 同时从快照保存的 `local_port_last + 1` 继续分配 host
+local port;前者重置 transport epoch,后者维持分配连续性,两者职责不同。
 
 ### 4.9 ping 健康探测
 

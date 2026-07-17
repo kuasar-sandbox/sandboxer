@@ -1,0 +1,274 @@
+From 3c5f122685de6d7792766e02de2d152034452974 Mon Sep 17 00:00:00 2001
+From: Kuasar Sandbox <noreply@kuasar.dev>
+Date: Fri, 17 Jul 2026 09:31:49 +0800
+Subject: [PATCH] virtio-devices: reset vsock transport on restore
+
+The Unix backend connection map is rebuilt empty on restore while the guest retains connected sockets. Publish VIRTIO_VSOCK_EVENT_TRANSPORT_RESET from the restored event queue before the vCPU resumes, and gate backend RX until the guest replenishes the event queue after handling the reset. This preserves the listener while reconciling the two transport endpoints before the first restore connection is delivered.
+---
+ virtio-devices/src/vsock/device.rs | 130 +++++++++++++++++++++++++++--
+ virtio-devices/src/vsock/mod.rs    |  11 ++-
+ 2 files changed, 134 insertions(+), 7 deletions(-)
+
+diff --git a/virtio-devices/src/vsock/device.rs b/virtio-devices/src/vsock/device.rs
+index f488fdb..16eb298 100644
+--- a/virtio-devices/src/vsock/device.rs
++++ b/virtio-devices/src/vsock/device.rs
+@@ -8,6 +8,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the THIRD-PARTY file.
+ 
++use std::mem::size_of;
+ use std::os::unix::io::AsRawFd;
+ use std::path::PathBuf;
+ use std::sync::atomic::AtomicBool;
+@@ -21,9 +22,9 @@ use log::{debug, error, info, warn};
+ use seccompiler::SeccompAction;
+ use serde::{Deserialize, Serialize};
+ use virtio_queue::{Queue, QueueOwnedT, QueueT};
+-use vm_memory::{GuestAddressSpace, GuestMemoryAtomic};
++use vm_memory::{Bytes, GuestAddressSpace, GuestMemoryAtomic};
+ use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
+-use vm_virtio::AccessPlatform;
++use vm_virtio::{AccessPlatform, Translatable};
+ use vmm_sys_util::eventfd::EventFd;
+ 
+ /// This is the `VirtioDevice` implementation for our vsock device. It handles the virtio-level
+@@ -49,15 +50,17 @@ use super::{VsockBackend, VsockPacket};
+ use crate::seccomp_filters::Thread;
+ use crate::thread_helper::spawn_virtio_thread;
+ use crate::{
+-    ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
+-    Error as DeviceError, GuestMemoryMmap, VIRTIO_F_IN_ORDER, VIRTIO_F_IOMMU_PLATFORM,
+-    VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterrupt,
+-    VirtioInterruptType,
++    ActivateError, ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError,
++    EpollHelperHandler, Error as DeviceError, GuestMemoryMmap, VIRTIO_F_IN_ORDER,
++    VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice, VirtioDeviceType,
++    VirtioInterrupt, VirtioInterruptType,
+ };
+ 
+ const QUEUE_SIZE: u16 = 256;
+ const NUM_QUEUES: usize = 3;
+ const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES];
++const EVT_QUEUE_INDEX: usize = 2;
++const VIRTIO_VSOCK_EVENT_TRANSPORT_RESET: u32 = 0;
+ 
+ // New descriptors are pending on the rx queue.
+ pub const RX_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
+@@ -95,6 +98,7 @@ pub struct VsockEpollHandler<B: VsockBackend> {
+     pub interrupt_cb: Arc<dyn VirtioInterrupt>,
+     pub backend: Arc<RwLock<B>>,
+     pub access_platform: Option<Arc<dyn AccessPlatform>>,
++    pub pending_event_ack: bool,
+ }
+ 
+ impl<B> VsockEpollHandler<B>
+@@ -115,12 +119,58 @@ where
+             })
+     }
+ 
++    /// Reset guest-side connections after restore. The backend connection map is not
++    /// snapshotted, so retaining the guest driver's connected sockets would leave the
++    /// two transport endpoints with different state.
++    fn send_transport_reset_event(&mut self) -> result::Result<(), anyhow::Error> {
++        let queue = &mut self.queues[EVT_QUEUE_INDEX];
++        let mut desc_chain = queue
++            .pop_descriptor_chain(self.mem.memory())
++            .ok_or_else(|| anyhow!("vsock event queue has no available descriptor"))?;
++        let desc = desc_chain
++            .next()
++            .ok_or_else(|| anyhow!("vsock event descriptor chain is empty"))?;
++
++        if !desc.is_write_only() || desc.len() < size_of::<u32>() as u32 {
++            return Err(anyhow!(
++                "invalid vsock event descriptor: write_only={}, len={}",
++                desc.is_write_only(),
++                desc.len()
++            ));
++        }
++
++        let addr = desc
++            .addr()
++            .translate_gva(self.access_platform.as_deref(), size_of::<u32>());
++        desc_chain
++            .memory()
++            .write_obj(VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.to_le(), addr)
++            .map_err(|e| anyhow!("failed to write vsock transport reset event: {e:?}"))?;
++        queue
++            .add_used(
++                desc_chain.memory(),
++                desc_chain.head_index(),
++                size_of::<u32>() as u32,
++            )
++            .map_err(|e| anyhow!("failed to publish vsock transport reset event: {e:?}"))?;
++
++        self.pending_event_ack = true;
++        self.signal_used_queue(EVT_QUEUE_INDEX as u16)
++            .map_err(|e| anyhow!("failed to signal vsock transport reset event: {e:?}"))?;
++        info!("vsock: transport reset published; waiting for guest acknowledgement");
++        Ok(())
++    }
++
+     /// Walk the driver-provided RX queue buffers and attempt to fill them up with any data that we
+     /// have pending.
+     ///
+     fn process_rx(&mut self) -> result::Result<(), DeviceError> {
+         debug!("vsock: epoll_handler::process_rx()");
+ 
++        if self.pending_event_ack {
++            return Ok(());
++        }
++
+         let mut used_descs = false;
+ 
+         while let Some(mut desc_chain) = self.queues[0].pop_descriptor_chain(self.mem.memory()) {
+@@ -279,6 +329,17 @@ where
+                 self.queue_evts[2].read().map_err(|e| {
+                     EpollHelperError::HandleEvent(anyhow!("Failed to get EVT queue event: {e:?}"))
+                 })?;
++                if self.pending_event_ack {
++                    self.pending_event_ack = false;
++                    info!("vsock: guest acknowledged restored transport reset");
++                    if self.backend.read().unwrap().has_pending_rx() {
++                        self.process_rx().map_err(|e| {
++                            EpollHelperError::HandleEvent(anyhow!(
++                                "Failed to process RX queue after transport reset: {e:?}"
++                            ))
++                        })?;
++                    }
++                }
+             }
+             BACKEND_EVENT => {
+                 debug!("vsock: backend event");
+@@ -317,6 +378,7 @@ pub struct Vsock<B: VsockBackend> {
+     path: PathBuf,
+     seccomp_action: SeccompAction,
+     exit_evt: EventFd,
++    reset_transport_on_activate: bool,
+ }
+ 
+ #[derive(Serialize, Deserialize)]
+@@ -344,6 +406,7 @@ where
+         exit_evt: EventFd,
+         state: Option<VsockState>,
+     ) -> io::Result<Vsock<B>> {
++        let reset_transport_on_activate = state.is_some();
+         let (avail_features, acked_features, paused) = if let Some(state) = state {
+             info!("Restoring virtio-vsock {id}");
+             backend.set_local_port_last(state.local_port_last);
+@@ -374,6 +437,7 @@ where
+             path,
+             seccomp_action,
+             exit_evt,
++            reset_transport_on_activate,
+         })
+     }
+ 
+@@ -464,8 +528,17 @@ where
+             interrupt_cb,
+             backend: self.backend.clone(),
+             access_platform: self.common.access_platform.clone(),
++            pending_event_ack: false,
+         };
+ 
++        if self.reset_transport_on_activate {
++            handler.send_transport_reset_event().map_err(|e| {
++                error!("Failed to reset restored virtio-vsock transport: {e:#}");
++                ActivateError::BadActivate
++            })?;
++            self.reset_transport_on_activate = false;
++        }
++
+         let paused = self.common.paused.clone();
+         let paused_sync = self.common.paused_sync.clone();
+         let mut epoll_threads = Vec::new();
+@@ -656,6 +729,51 @@ mod unit_tests {
+         )
+         .unwrap();
+         assert_eq!(restored.backend.read().unwrap().local_port_last(), expected);
++        assert!(restored.reset_transport_on_activate);
++    }
++
++    #[test]
++    fn test_restore_transport_reset_gates_rx_until_guest_ack() {
++        const EVENT_ADDR: u64 = 0x0060_0000;
++
++        let test_ctx = TestContext::new();
++        let mut ctx = test_ctx.create_epoll_handler_context();
++        ctx.guest_evvq.dtable[0].set(
++            EVENT_ADDR,
++            size_of::<u32>() as u32,
++            virtio_bindings::virtio_ring::VRING_DESC_F_WRITE
++                .try_into()
++                .unwrap(),
++            0,
++        );
++        ctx.guest_evvq.avail.ring[0].set(0);
++        ctx.guest_evvq.avail.idx.set(1);
++        test_ctx
++            .mem
++            .write_obj(u32::MAX, vm_memory::GuestAddress(EVENT_ADDR))
++            .unwrap();
++
++        ctx.handler.send_transport_reset_event().unwrap();
++
++        assert!(ctx.handler.pending_event_ack);
++        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
++        assert_eq!(
++            test_ctx
++                .mem
++                .read_obj::<u32>(vm_memory::GuestAddress(EVENT_ADDR))
++                .unwrap(),
++            VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
++        );
++
++        ctx.handler.backend.write().unwrap().set_pending_rx(true);
++        ctx.handler.process_rx().unwrap();
++        assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
++        assert_eq!(ctx.handler.backend.read().unwrap().rx_ok_cnt, 0);
++
++        ctx.signal_evtq_event();
++        assert!(!ctx.handler.pending_event_ack);
++        assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
++        assert_eq!(ctx.handler.backend.read().unwrap().rx_ok_cnt, 1);
+     }
+ 
+     #[test]
+diff --git a/virtio-devices/src/vsock/mod.rs b/virtio-devices/src/vsock/mod.rs
+index 2e9b0c5..d11bb44 100644
+--- a/virtio-devices/src/vsock/mod.rs
++++ b/virtio-devices/src/vsock/mod.rs
+@@ -178,7 +178,7 @@ pub mod unit_tests {
+     use vm_virtio::queue::testing::VirtQueue as GuestQ;
+     use vmm_sys_util::eventfd::EventFd;
+ 
+-    use super::device::{RX_QUEUE_EVENT, TX_QUEUE_EVENT, VsockEpollHandler};
++    use super::device::{EVT_QUEUE_EVENT, RX_QUEUE_EVENT, TX_QUEUE_EVENT, VsockEpollHandler};
+     use super::packet::VSOCK_PKT_HDR_SIZE;
+     use super::*;
+     use crate::device::{VirtioInterrupt, VirtioInterruptType};
+@@ -355,6 +355,7 @@ pub mod unit_tests {
+                     interrupt_cb,
+                     backend: Arc::new(RwLock::new(TestBackend::new())),
+                     access_platform: None,
++                    pending_event_ack: false,
+                 },
+             }
+         }
+@@ -384,5 +385,13 @@ pub mod unit_tests {
+                 EpollHelper::new(&self.handler.kill_evt, &self.handler.pause_evt).unwrap();
+             self.handler.handle_event(&mut epoll_helper, &event).ok();
+         }
++        pub fn signal_evtq_event(&mut self) {
++            self.handler.queue_evts[2].write(1).unwrap();
++            let events = epoll::Events::EPOLLIN;
++            let event = epoll::Event::new(events, EVT_QUEUE_EVENT as u64);
++            let mut epoll_helper =
++                EpollHelper::new(&self.handler.kill_evt, &self.handler.pause_evt).unwrap();
++            self.handler.handle_event(&mut epoll_helper, &event).ok();
++        }
+     }
+ }
+-- 
+2.43.0
+

@@ -75,8 +75,8 @@ sandbox-ctl 是 CH 的父进程。CH 退出 → sandbox-ctl 收 SIGCHLD → 优�
    fd 传给 sandbox-ctl 的 handler;sandbox-ctl 自己 mmap 的 backendVA 不注册
    uffd,kernel 走默认 shmem 缺页路径。这从根本上避免跨 mm folio-creation
    race
-3. **patch 影响面最小**:CH 改动 ~429 行(4 个 commit,基于 v51.1);仅 `--memory-zone fd=`
-   出现时激活;不写 fd= 的所有调用者行为完全等同 upstream
+3. **patch 影响面最小**:CH 改动约 630 行(6 个 commit,基于 v51.1);内存补丁仅在
+   `--memory-zone fd=` 时激活,vsock 补丁仅改变 snapshot/restore 的 transport 状态
 4. **资源可寻址**:任何运行所需文件(vmlinux 除外)都能选 `file://` 或
    `manifest://`,运行时无差别看待;snapshot 同样可上传至 manifest 存储
 5. **三态资源控制**:是否启用 cgroup 限制、是否启用动态控制由 sandbox.yaml
