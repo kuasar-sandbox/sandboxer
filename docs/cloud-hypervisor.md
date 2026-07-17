@@ -18,8 +18,9 @@
    或零页填充。CH 自己创建 uffd(必须绑到 CH mm),通过 SCM_RIGHTS 把 fd 传
    给 sandbox-ctl 的 handler
 3. **restore-safe vsock**:CH restore 会重建空的 Unix backend,guest 却保留
-   已连接 socket。恢复时必须向 guest 发布 virtio-vsock transport reset,并在
-   guest 确认清理旧连接前阻止新 backend RX 包进入
+   已连接 socket。快照时必须向 guest event queue 预发布 virtio-vsock transport
+   reset,恢复时重发该事件的 IRQ,并在 guest 确认清理旧连接前阻止新 backend RX
+   包进入
 
 这些能力 upstream CH 都不直接支持。第二条尤其本质——upstream uffd handler 模型
 是 CH 调外部 socket,handler 提供数据,但平台需要 handler 接管 fault 投递
@@ -37,9 +38,9 @@
 | `virtio-devices/src/balloon.rs` | ~38 | balloon release 对 user-managed zone 的空洞 run 跳过 `PUNCH_HOLE`/`MADV_DONTNEED`(`SEEK_DATA` 探测)|
 | `virtio-devices/src/seccomp_filters.rs` | ~8 | balloon 线程 seccomp 放行 `SYS_lseek`(skip-hole 探测所需)|
 | `virtio-devices/src/vsock/unix/muxer.rs` | ~20 | 持久化 host local-port 分配游标 |
-| `virtio-devices/src/vsock/device.rs` / `mod.rs` | ~170 | restore 时发布 transport reset,guest 确认前 gate RX |
+| `virtio-devices/src/vsock/device.rs` / `mod.rs` | ~330 | snapshot 时发布 transport reset,restore 重发 IRQ,guest 确认前 gate RX |
 
-总计约 630 行 Rust、6 个 commit,基于 cloud-hypervisor `v51.1`。
+总计约 790 行 Rust、6 个 commit,基于 cloud-hypervisor `v51.1`。
 
 ### 1.3 维护策略
 
@@ -239,23 +240,33 @@ CH 的 Unix vsock backend 在 restore 时重新创建。若 host local-port 分�
 patch 把 `local_port_last` 纳入 `VsockState`,恢复 backend 后从下一端口继续分配。
 该状态在嵌套快照中逐层保存,不是只覆盖一次 restore 的进程内游标。
 
-### 3.6 0006 — restore 时重置 vsock transport
+### 3.6 0006 — snapshot 时预发布 vsock transport reset
 
 仅避免端口复用仍不完整:CH 不序列化 backend connection map,而 guest 内核会把
 连接 socket、credit 与关闭状态一并带入快照。restore 后两端因此处于不同 transport
-epoch。patch 在恢复设备 `activate` 时、vCPU 恢复前执行以下协议:
+epoch。restore 的 guest RAM 又由外部 userfaultfd 惰性恢复,设备 `activate` 阶段读取
+event virtqueue 页可能只看到尚未 fault-in 的空 avail ring,不能在这里要求新 descriptor。
+patch 执行以下协议:
 
-1. 从已恢复的 event virtqueue 取一个 guest 提供的 writable descriptor,写入
-   `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET`,推进 used ring 并触发 event queue IRQ。
-2. 置 `pending_event_ack`,此时 backend 可接收 host UDS,但所有 RX packet 都留在
-   backend,不能进入 guest RX queue。
-3. Linux guest 处理 reset:关闭 connected sockets、重新读取 CID,listener 保持
-   bind/listen;随后补回 event descriptor 并 kick event queue。
-4. CH 把该 kick 作为 reset acknowledgement,解除 RX gate 并立即排空 pending RX。
+1. VM 已暂停后,`Vsock::snapshot` 从**源 VM 的 live event virtqueue**取一个 guest
+   提供的 writable descriptor,写入 `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET`,推进 used
+   ring 并置 `transport_reset_pending`。普通 `/vm.pause` 不发布 reset。
+2. pending 状态随 `VsockState` 持久化。源 VM resume 与目标设备 restore activation
+   都只重发该 used-ring event 的 IRQ;restore 不再读取或消费 event descriptor。
+3. pending 期间 backend 可接收 host UDS,但所有 RX packet 都留在 backend,不能进入
+   guest RX queue。
+4. Linux guest 处理 reset:关闭 connected sockets、重新读取 CID,listener 保持
+   bind/listen;随后补回 event descriptor 并 kick event queue。CH 把该 kick 作为
+   acknowledgement,解除 RX gate 并立即排空 pending RX。
+
+snapshot staging 会先排空 reset 之前已经到达的 eventfd kick。设备线程 resume 后若
+同一批 epoll 仍带着该旧通知,非阻塞 read 返回 `EAGAIN` 并保持 gate,不会把旧 kick
+误当成新 reset 的 acknowledgement。
 
 因此首个 `restore` 控制连接可以在 VM resume 后立即发起,但其 REQUEST 必定在 guest
-完成旧连接清理后才可见。这里没有 retry、sleep 或放宽 deadline。event descriptor
-缺失或非法会直接令 restore activation 失败,而不是带着半重置 transport 继续运行。
+完成旧连接清理后才可见。这里没有 retry、sleep 或放宽 deadline。源 VM snapshot
+阶段若 descriptor 缺失或非法会明确失败;目标 restore activation 即使没有任何新
+available descriptor 也必须成功,因为 reset 已经存在于快照的 used ring 中。
 
 ## 4. 构建工作流
 

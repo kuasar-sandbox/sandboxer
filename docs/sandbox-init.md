@@ -791,10 +791,10 @@ ACK 后立即 close(RST 令 guest 端连接进入移除),guest 的 close 用 SO_
 的短连接已经离开 registry,最终承载 `quiesced` 的控制连接也只能在 ACK 写出后关闭。
 Cloud Hypervisor restore 又会重建空的 Unix vsock backend,不会序列化 connection map。
 平台 CH 补丁用两条独立不变量收口:保存 `local_port_last`,避免新连接复用旧四元组;
-恢复设备激活时向 guest 发布 `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET`,让 Linux 清理全部
-connected sockets,同时在 guest event-queue kick 确认前 gate backend RX。listener
-不受 reset 影响。首个 restore REQUEST 只能在清理确认后进入 guest,无需 retry、sleep
-或延长 timeout。
+snapshot 时向 guest used event ring 预发布 `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET`,
+restore activation 只重发 IRQ,让 Linux 清理全部 connected sockets,同时在 guest
+event-queue kick 确认前 gate backend RX。listener 不受 reset 影响。首个 restore
+REQUEST 只能在清理确认后进入 guest,无需 retry、sleep 或延长 timeout。
 
 **三个触发点**(同一握手):
 
@@ -902,6 +902,7 @@ guest 对 vsock 连接 arm SO_LINGER 再关,阻塞至 host RST 确认拆除,不�
   ✓ MUX closed + quiesced received  →  /vm.pause  /vm.snapshot
   snapshot state:  listener up · app session alive (app frozen) · no MUX
                    · CH vsock local_port_last persisted
+                   · TRANSPORT_RESET in used ring · reset pending persisted
 ```
 
 **restore**:
@@ -909,7 +910,7 @@ guest 对 vsock 连接 arm SO_LINGER 再关,阻塞至 host RST 确认拆除,不�
 ```
   sandbox-ctl                                              sandbox-init
   ───────────                                              ────────────
-  CH restore activation: publish TRANSPORT_RESET
+  CH restore activation: re-signal snapshotted TRANSPORT_RESET (consume no descriptor)
   /vm.resume OK   (RX gated)                          ───►  reset connected sockets; listener stays up
   dial CID=2:5000 (REQUEST buffered behind RX gate)
                        ◄── event queue kick (ack) ─────────  reset complete; CH ungates pending REQUEST
