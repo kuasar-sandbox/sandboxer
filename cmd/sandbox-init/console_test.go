@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 // muxPair wires a guest-side and host-side mux.Session over a net.Pipe so
@@ -26,8 +27,12 @@ func muxPair(t *testing.T, ss mux.StreamSet) (guest, host *mux.Session) {
 // newTestBridge builds a bare bridge (generation 1, no session) whose app fds
 // the test sets directly. The pumps read those fds and re-fetch them across
 // generations (app restart).
-func newTestBridge() *consoleBridge {
-	b := &consoleBridge{appGen: 1}
+func newTestBridge(outputRoles ...appRole) *consoleBridge {
+	var mask appDrainMask
+	for _, role := range outputRoles {
+		mask |= drainMaskForRole(role)
+	}
+	b := &consoleBridge{appGen: 1, appDrain: newAppGenerationDrain(mask), appDone: make(chan struct{})}
 	b.appCond = sync.NewCond(&b.appMu)
 	return b
 }
@@ -36,8 +41,7 @@ func newTestBridge() *consoleBridge {
 // generation EOFs its stream and exits (the reboot path, minus the wg wait).
 func shutdownBridge(b *consoleBridge) {
 	b.appMu.Lock()
-	b.appClosed = true
-	b.appCond.Broadcast()
+	b.closeAppLocked()
 	b.appMu.Unlock()
 }
 
@@ -51,7 +55,7 @@ func TestPumpAppToHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := newTestBridge()
+	b := newTestBridge(roleStdout)
 	b.stdoutR = pr
 	pumped := make(chan struct{})
 	go func() { pumpAppToHost(b, roleStdout, holder, mux.StreamStdout); close(pumped) }()
@@ -87,7 +91,7 @@ func TestAppExitedDrainsTrailingOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := newTestBridge()
+	b := newTestBridge(roleStdout)
 	b.holder = holder
 	b.stdoutR = pr
 
@@ -152,7 +156,7 @@ func TestPumpAppToHostRestart(t *testing.T) {
 	holder.set(guest)
 
 	pr1, pw1, _ := os.Pipe()
-	b := newTestBridge()
+	b := newTestBridge(roleStdout)
 	b.stdoutR = pr1
 	pumped := make(chan struct{})
 	go func() { pumpAppToHost(b, roleStdout, holder, mux.StreamStdout); close(pumped) }()
@@ -173,15 +177,18 @@ func TestPumpAppToHostRestart(t *testing.T) {
 		t.Fatalf("instance 1: got %q", got)
 	}
 	_ = pw1.Close()
+	select {
+	case <-b.appDrain.done:
+	case <-time.After(time.Second):
+		t.Fatal("instance 1 output did not drain")
+	}
 
 	// Re-wire to a fresh fd (simulating restartApp's bridge.rewireApp) — bump
 	// the generation so the parked pump resumes on the new fd.
 	pr2, pw2, _ := os.Pipe()
 	b.appMu.Lock()
-	_ = pr1.Close()
-	b.stdoutR = pr2
-	b.appGen++
-	b.appCond.Broadcast()
+	closeAppEnds(b.endsLocked())
+	b.setEndsLocked(appEnds{stdoutR: pr2}, newAppGenerationDrain(drainStdout))
 	b.appMu.Unlock()
 
 	// Instance 2's output must flow on the SAME stream (no EOF in between).
@@ -238,7 +245,7 @@ func TestSessionHolderReattach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := newTestBridge()
+	b := newTestBridge(roleStdout)
 	b.stdoutR = pr
 	pumped := make(chan struct{})
 	go func() { pumpAppToHost(b, roleStdout, holder, mux.StreamStdout); close(pumped) }()
@@ -284,4 +291,224 @@ func TestSessionHolderShutdownWakesWaiters(t *testing.T) {
 	if holder.peek() != nil {
 		t.Fatal("peek after shutdown should be nil")
 	}
+}
+
+type rewireResult struct {
+	stdio childStdio
+	err   error
+}
+
+type readResult struct {
+	data []byte
+	err  error
+}
+
+func readAllAsync(r io.Reader) <-chan readResult {
+	done := make(chan readResult, 1)
+	go func() {
+		data, err := io.ReadAll(r)
+		done <- readResult{data: data, err: err}
+	}()
+	return done
+}
+
+func awaitRead(t *testing.T, done <-chan readResult) []byte {
+	t.Helper()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("read stream: %v", res.err)
+		}
+		return res.data
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out reading stream")
+		return nil
+	}
+}
+
+func awaitRewire(t *testing.T, done <-chan rewireResult) childStdio {
+	t.Helper()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("rewireApp: %v", res.err)
+		}
+		return res.stdio
+	case <-time.After(2 * time.Second):
+		t.Fatal("rewireApp did not finish")
+		return childStdio{}
+	}
+}
+
+func assertRewireBlocked(t *testing.T, done <-chan rewireResult) {
+	t.Helper()
+	select {
+	case res := <-done:
+		closeChildStdio(res.stdio)
+		t.Fatalf("rewireApp returned before the previous generation drained: %v", res.err)
+	case <-time.After(25 * time.Millisecond):
+	}
+}
+
+func waitOutputPumps(t *testing.T, b *consoleBridge) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("app-to-host pumps did not exit")
+	}
+}
+
+func TestRewireAppDrainsPipeGeneration(t *testing.T) {
+	spec := proto.StdioSpec{Stdout: true, Stderr: true}
+	cs1, b, err := setupAppStdio(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, host := muxPair(t, streamSetFor(spec))
+	b.attach(guest)
+	outRead := readAllAsync(host.Stream(mux.StreamStdout))
+	errRead := readAllAsync(host.Stream(mux.StreamStderr))
+
+	if _, err := cs1.stdout.Write([]byte("old-stdout")); err != nil {
+		t.Fatalf("write old stdout: %v", err)
+	}
+	if _, err := cs1.stderr.Write([]byte("old-stderr")); err != nil {
+		t.Fatalf("write old stderr: %v", err)
+	}
+	closeChildStdio(cs1)
+
+	rewired := make(chan rewireResult, 1)
+	go func() {
+		cs, err := b.rewireAppWithTimeout(spec, time.Second)
+		rewired <- rewireResult{stdio: cs, err: err}
+	}()
+	assertRewireBlocked(t, rewired)
+
+	b.start()
+	cs2 := awaitRewire(t, rewired)
+	if _, err := cs2.stdout.Write([]byte("new-stdout")); err != nil {
+		t.Fatalf("write new stdout: %v", err)
+	}
+	if _, err := cs2.stderr.Write([]byte("new-stderr")); err != nil {
+		t.Fatalf("write new stderr: %v", err)
+	}
+	closeChildStdio(cs2)
+	shutdownBridge(b)
+
+	if got, want := string(awaitRead(t, outRead)), "old-stdoutnew-stdout"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if got, want := string(awaitRead(t, errRead)), "old-stderrnew-stderr"; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	waitOutputPumps(t, b)
+}
+
+func TestRewireAppDrainsPTYGeneration(t *testing.T) {
+	spec := proto.StdioSpec{TTY: true}
+	cs1, b, err := setupAppStdio(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, host := muxPair(t, streamSetFor(spec))
+	b.attach(guest)
+	ptyRead := readAllAsync(host.Stream(mux.StreamPTY))
+
+	if _, err := cs1.stdout.Write([]byte("old-pty")); err != nil {
+		t.Fatalf("write old PTY: %v", err)
+	}
+	closeChildStdio(cs1)
+
+	rewired := make(chan rewireResult, 1)
+	go func() {
+		cs, err := b.rewireAppWithTimeout(spec, time.Second)
+		rewired <- rewireResult{stdio: cs, err: err}
+	}()
+	assertRewireBlocked(t, rewired)
+
+	b.start()
+	cs2 := awaitRewire(t, rewired)
+	if _, err := cs2.stdout.Write([]byte("new-pty")); err != nil {
+		t.Fatalf("write new PTY: %v", err)
+	}
+	closeChildStdio(cs2)
+	shutdownBridge(b)
+
+	if got, want := string(awaitRead(t, ptyRead)), "old-ptynew-pty"; got != want {
+		t.Fatalf("PTY = %q, want %q", got, want)
+	}
+	waitOutputPumps(t, b)
+}
+
+func TestRewireAppForcesStuckGenerationAfterTimeout(t *testing.T) {
+	spec := proto.StdioSpec{Stdout: true}
+	cs1, b, err := setupAppStdio(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, host := muxPair(t, streamSetFor(spec))
+	b.attach(guest)
+	b.start()
+	outRead := readAllAsync(host.Stream(mux.StreamStdout))
+
+	const drainTimeout = 50 * time.Millisecond
+	started := time.Now()
+	rewired := make(chan rewireResult, 1)
+	go func() {
+		cs, err := b.rewireAppWithTimeout(spec, drainTimeout)
+		rewired <- rewireResult{stdio: cs, err: err}
+	}()
+	cs2 := awaitRewire(t, rewired)
+	if elapsed := time.Since(started); elapsed < drainTimeout {
+		t.Fatalf("rewireApp returned in %s, before drain timeout %s", elapsed, drainTimeout)
+	}
+	closeChildStdio(cs1)
+
+	if _, err := cs2.stdout.Write([]byte("new-after-timeout")); err != nil {
+		t.Fatalf("write new stdout: %v", err)
+	}
+	closeChildStdio(cs2)
+	shutdownBridge(b)
+
+	if got, want := string(awaitRead(t, outRead)), "new-after-timeout"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	waitOutputPumps(t, b)
+}
+
+func TestRewireAppStopsOnBridgeShutdown(t *testing.T) {
+	spec := proto.StdioSpec{Stdout: true}
+	cs1, b, err := setupAppStdio(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rewired := make(chan rewireResult, 1)
+	go func() {
+		cs, err := b.rewireAppWithTimeout(spec, time.Second)
+		rewired <- rewireResult{stdio: cs, err: err}
+	}()
+	assertRewireBlocked(t, rewired)
+
+	started := time.Now()
+	shutdownBridge(b)
+	select {
+	case res := <-rewired:
+		closeChildStdio(res.stdio)
+		if res.err == nil {
+			t.Fatal("rewireApp succeeded after bridge shutdown")
+		}
+		if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+			t.Fatalf("rewireApp took %s to observe bridge shutdown", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rewireApp did not stop on bridge shutdown")
+	}
+	closeChildStdio(cs1)
 }

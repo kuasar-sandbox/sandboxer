@@ -59,14 +59,17 @@ type consoleBridge struct {
 	// app-side fds for the CURRENT app generation, guarded by appMu. ptyMaster
 	// in tty mode; stdinW/stdoutR/stderrR in pipe mode (any nil = channel off).
 	// appGen bumps on each rewireApp; appClosed = sandbox shutdown.
-	appMu     sync.Mutex
-	appCond   *sync.Cond
-	appGen    uint64
-	appClosed bool
-	ptyMaster *os.File
-	stdinW    *os.File
-	stdoutR   *os.File
-	stderrR   *os.File
+	appRewireMu sync.Mutex
+	appMu       sync.Mutex
+	appCond     *sync.Cond
+	appGen      uint64
+	appDrain    *appGenerationDrain
+	appDone     chan struct{}
+	appClosed   bool
+	ptyMaster   *os.File
+	stdinW      *os.File
+	stdoutR     *os.File
+	stderrR     *os.File
 
 	started bool
 	wg      sync.WaitGroup // guest→host pumps (the ones that CloseWrite on shutdown)
@@ -75,6 +78,78 @@ type consoleBridge struct {
 // appEnds is the sandbox-init side of one app generation's stdio fds.
 type appEnds struct {
 	ptyMaster, stdinW, stdoutR, stderrR *os.File
+}
+
+var errAppBridgeClosed = errors.New("app stdio bridge is closed")
+
+type appDrainMask uint8
+
+const (
+	drainPTY appDrainMask = 1 << iota
+	drainStdout
+	drainStderr
+)
+
+// appGenerationDrain closes done after every enabled app-to-host pump has
+// consumed its generation's EOF. A pump marks its role only after forwarding
+// the final bytes, so done is also the generation handoff barrier.
+type appGenerationDrain struct {
+	mu      sync.Mutex
+	pending appDrainMask
+	done    chan struct{}
+}
+
+func newAppGenerationDrain(pending appDrainMask) *appGenerationDrain {
+	d := &appGenerationDrain{pending: pending, done: make(chan struct{})}
+	if pending == 0 {
+		close(d.done)
+	}
+	return d
+}
+
+func (d *appGenerationDrain) mark(role appRole) {
+	if d == nil {
+		return
+	}
+	bit := drainMaskForRole(role)
+	if bit == 0 {
+		return
+	}
+	d.mu.Lock()
+	if d.pending&bit != 0 {
+		d.pending &^= bit
+		if d.pending == 0 {
+			close(d.done)
+		}
+	}
+	d.mu.Unlock()
+}
+
+func drainMaskForRole(role appRole) appDrainMask {
+	switch role {
+	case rolePTY:
+		return drainPTY
+	case roleStdout:
+		return drainStdout
+	case roleStderr:
+		return drainStderr
+	default:
+		return 0
+	}
+}
+
+func drainMaskForSpec(spec proto.StdioSpec) appDrainMask {
+	if spec.TTY {
+		return drainPTY
+	}
+	var mask appDrainMask
+	if spec.Stdout {
+		mask |= drainStdout
+	}
+	if spec.Stderr {
+		mask |= drainStderr
+	}
+	return mask
 }
 
 // fdForLocked returns the current fd for role (caller holds appMu).
@@ -92,11 +167,11 @@ func (b *consoleBridge) fdForLocked(role appRole) *os.File {
 	return nil
 }
 
-// currentFd returns (fd, gen) for role at the current generation.
-func (b *consoleBridge) currentFd(role appRole) (*os.File, uint64) {
+// currentFd returns the fd, id, and drain barrier for the current generation.
+func (b *consoleBridge) currentFd(role appRole) (*os.File, uint64, *appGenerationDrain) {
 	b.appMu.Lock()
 	defer b.appMu.Unlock()
-	return b.fdForLocked(role), b.appGen
+	return b.fdForLocked(role), b.appGen, b.appDrain
 }
 
 // writeFd returns the current fd for role (host→app pumps re-fetch the dst per
@@ -108,49 +183,130 @@ func (b *consoleBridge) writeFd(role appRole) *os.File {
 	return b.fdForLocked(role)
 }
 
+func (b *consoleBridge) closeAppLocked() {
+	if !b.appClosed {
+		b.appClosed = true
+		if b.appDone != nil {
+			close(b.appDone)
+		}
+	}
+	b.appCond.Broadcast()
+}
+
 // waitNextFd blocks until a generation newer than gen is wired (an app
-// restart) or the bridge is shut down. Returns (fd, newGen, true) on a new
-// generation, (nil, 0, false) on shutdown.
-func (b *consoleBridge) waitNextFd(role appRole, gen uint64) (*os.File, uint64, bool) {
+// restart) or the bridge is shut down. It returns the new fd, generation,
+// drain barrier, and true, or false when there is no installed generation left.
+func (b *consoleBridge) waitNextFd(role appRole, gen uint64) (*os.File, uint64, *appGenerationDrain, bool) {
 	b.appMu.Lock()
 	defer b.appMu.Unlock()
 	for b.appGen <= gen && !b.appClosed {
 		b.appCond.Wait()
 	}
-	if b.appClosed {
-		return nil, 0, false
+	// Shutdown forbids a future generation, but a generation already installed
+	// by rewireApp must still be consumed before the pump exits.
+	if b.appGen <= gen {
+		return nil, 0, nil, false
 	}
-	return b.fdForLocked(role), b.appGen, true
+	return b.fdForLocked(role), b.appGen, b.appDrain, true
 }
 
 // setEndsLocked installs a generation's fds and bumps appGen (caller holds appMu).
-func (b *consoleBridge) setEndsLocked(e appEnds) {
+func (b *consoleBridge) setEndsLocked(e appEnds, drain *appGenerationDrain) {
 	b.ptyMaster, b.stdinW, b.stdoutR, b.stderrR = e.ptyMaster, e.stdinW, e.stdoutR, e.stderrR
+	b.appDrain = drain
 	b.appGen++
 	b.appCond.Broadcast()
 }
 
-// closeEndsLocked closes the current generation's sandbox-init fd ends (caller
-// holds appMu).
-func (b *consoleBridge) closeEndsLocked() {
-	for _, f := range []*os.File{b.ptyMaster, b.stdinW, b.stdoutR, b.stderrR} {
+func (b *consoleBridge) endsLocked() appEnds {
+	return appEnds{
+		ptyMaster: b.ptyMaster,
+		stdinW:    b.stdinW,
+		stdoutR:   b.stdoutR,
+		stderrR:   b.stderrR,
+	}
+}
+
+func closeAppEnds(e appEnds) {
+	for _, f := range []*os.File{e.ptyMaster, e.stdinW, e.stdoutR, e.stderrR} {
 		if f != nil {
 			_ = f.Close()
 		}
 	}
 }
 
+// closeEndsLocked closes the current generation's sandbox-init fd ends (caller
+// holds appMu).
+func (b *consoleBridge) closeEndsLocked() {
+	closeAppEnds(b.endsLocked())
+}
+
 // rewireApp creates a fresh app stdio generation (for an in-place restart),
-// closing the old ends and waking the pumps onto the new ones; the MUX session
-// is untouched. Returns the new childStdio for the re-fork.
+// waiting for the old output pumps to drain before waking them onto the new
+// ends; the MUX session is untouched. Returns the new childStdio for the re-fork.
 func (b *consoleBridge) rewireApp(spec proto.StdioSpec) (childStdio, error) {
+	return b.rewireAppWithTimeout(spec, appGenerationDrainTimeout)
+}
+
+const appGenerationDrainTimeout = 2 * time.Second
+
+func (b *consoleBridge) rewireAppWithTimeout(spec proto.StdioSpec, timeout time.Duration) (childStdio, error) {
 	cs, ends, err := makeAppFds(spec)
 	if err != nil {
 		return childStdio{}, err
 	}
+	b.appRewireMu.Lock()
+	defer b.appRewireMu.Unlock()
+
 	b.appMu.Lock()
-	b.closeEndsLocked()
-	b.setEndsLocked(ends)
+	if b.appClosed {
+		b.appMu.Unlock()
+		closeChildStdio(cs)
+		closeAppEnds(ends)
+		return childStdio{}, errAppBridgeClosed
+	}
+	oldEnds, oldDrain, oldGen := b.endsLocked(), b.appDrain, b.appGen
+	b.appMu.Unlock()
+
+	if oldDrain != nil {
+		timer := time.NewTimer(timeout)
+		select {
+		case <-oldDrain.done:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+			logf("restart: app stdio generation %d did not drain within %s; forcing old fds closed", oldGen, timeout)
+		case <-b.appDone:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+	}
+	// Natural EOF means these reads are already drained. On timeout, closing the
+	// old ends unblocks a pump held open by an inherited writer.
+	closeAppEnds(oldEnds)
+
+	b.appMu.Lock()
+	if b.appClosed {
+		b.appMu.Unlock()
+		closeChildStdio(cs)
+		closeAppEnds(ends)
+		return childStdio{}, errAppBridgeClosed
+	}
+	if b.appGen != oldGen {
+		b.appMu.Unlock()
+		closeChildStdio(cs)
+		closeAppEnds(ends)
+		return childStdio{}, errors.New("rewire app stdio: generation changed while draining")
+	}
+	b.setEndsLocked(ends, newAppGenerationDrain(drainMaskForSpec(spec)))
 	b.appMu.Unlock()
 	return cs, nil
 }
@@ -173,6 +329,8 @@ func setupAppStdio(spec proto.StdioSpec) (childStdio, *consoleBridge, error) {
 		hasStderr: spec.Stderr,
 		holder:    newSessionHolder(),
 		appGen:    1,
+		appDrain:  newAppGenerationDrain(drainMaskForSpec(spec)),
+		appDone:   make(chan struct{}),
 		ptyMaster: ends.ptyMaster,
 		stdinW:    ends.stdinW,
 		stdoutR:   ends.stdoutR,
@@ -180,6 +338,18 @@ func setupAppStdio(spec proto.StdioSpec) (childStdio, *consoleBridge, error) {
 	}
 	b.appCond = sync.NewCond(&b.appMu)
 	return cs, b, nil
+}
+
+func closeChildStdio(cs childStdio) {
+	if cs.stdin != nil {
+		_ = cs.stdin.Close()
+	}
+	if cs.stdout != nil && cs.stdout != cs.stdin {
+		_ = cs.stdout.Close()
+	}
+	if cs.stderr != nil && cs.stderr != cs.stdin && cs.stderr != cs.stdout {
+		_ = cs.stderr.Close()
+	}
 }
 
 // makeAppFds creates one generation of app stdio fds per spec: the child's
@@ -276,8 +446,10 @@ func streamSetFor(s proto.StdioSpec) mux.StreamSet {
 // it pushes the host's terminal size onto the guest pty master (the
 // kernel then SIGWINCHes the app's pgrp).
 func (b *consoleBridge) onSetWinsize(cols, rows uint16) {
-	if b.tty && b.ptyMaster != nil {
-		_ = setWinsize(int(b.ptyMaster.Fd()), cols, rows)
+	if b.tty {
+		if master := b.writeFd(rolePTY); master != nil {
+			_ = setWinsize(int(master.Fd()), cols, rows)
+		}
 	}
 }
 
@@ -394,8 +566,7 @@ func (b *consoleBridge) closeLiveMUX() {
 // PTY. An in-place restart uses rewireApp instead and keeps the session open.
 func (b *consoleBridge) appExited() {
 	b.appMu.Lock()
-	b.appClosed = true
-	b.appCond.Broadcast() // wake pumps in waitNextFd → CloseWrite + return
+	b.closeAppLocked() // wake pumps in waitNextFd → CloseWrite + return
 	b.appMu.Unlock()
 
 	done := make(chan struct{})
@@ -421,14 +592,14 @@ func (b *consoleBridge) appExited() {
 // bridge shutdown (reboot) does it EOF the stream and return.
 func pumpAppToHost(b *consoleBridge, role appRole, holder *sessionHolder, id uint8) {
 	buf := make([]byte, mux.DataChunk)
-	src, gen := b.currentFd(role)
+	src, gen, drain := b.currentFd(role)
 	for {
 		if src == nil {
-			nsrc, ngen, ok := b.waitNextFd(role, gen)
+			nsrc, ngen, ndrain, ok := b.waitNextFd(role, gen)
 			if !ok {
 				return
 			}
-			src, gen = nsrc, ngen
+			src, gen, drain = nsrc, ngen, ndrain
 			continue
 		}
 		n, rerr := src.Read(buf)
@@ -445,9 +616,10 @@ func pumpAppToHost(b *consoleBridge, role appRole, holder *sessionHolder, id uin
 			}
 		}
 		if rerr != nil {
+			drain.mark(role)
 			// This app instance's fd is done. Park for the next instance
 			// (restart); on shutdown, EOF the stream and return.
-			nsrc, ngen, ok := b.waitNextFd(role, gen)
+			nsrc, ngen, ndrain, ok := b.waitNextFd(role, gen)
 			if !ok {
 				for {
 					sess := holder.wait()
@@ -460,7 +632,7 @@ func pumpAppToHost(b *consoleBridge, role appRole, holder *sessionHolder, id uin
 					holder.invalidate(sess)
 				}
 			}
-			src, gen = nsrc, ngen
+			src, gen, drain = nsrc, ngen, ndrain
 		}
 	}
 }

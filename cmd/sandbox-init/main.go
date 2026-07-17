@@ -788,9 +788,16 @@ func restartApp(s *supervisorState, b *consoleBridge, delay time.Duration) {
 	}
 	cs, err := b.rewireApp(s.spec.Stdio)
 	if err != nil {
+		if s.shutdown.Load() || errors.Is(err, errAppBridgeClosed) {
+			return
+		}
 		logf("restart: re-wire stdio: %v (rebooting)", err)
 		notifyAppExited(1, 0)
 		doReboot()
+		return
+	}
+	if s.shutdown.Load() {
+		closeChildStdio(cs)
 		return
 	}
 	s.appBackoff.onStart(time.Now())
