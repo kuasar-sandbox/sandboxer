@@ -37,6 +37,14 @@ func TestWriteAllRejectsNoProgress(t *testing.T) {
 	}
 }
 
+func TestWriteAllPreservesWriterError(t *testing.T) {
+	wantErr := errors.New("writer failed")
+	err := WriteAll(writerFunc(func([]byte) (int, error) { return -1, wantErr }), []byte("payload"))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("WriteAll error = %v, want %v", err, wantErr)
+	}
+}
+
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
