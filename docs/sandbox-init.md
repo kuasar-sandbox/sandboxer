@@ -263,7 +263,8 @@ switch-root 之后单线程执行。
      - 把子进程 pid 写入 /sys/fs/cgroup/app/cgroup.procs(其派生的整棵进程树
        随之归入该 cgroup;sandbox-init 自身留在 root cgroup,冻结时不被停)
      - 启动 stdio 桥接 goroutine:app 端 fd ↔ MUX 流(§3.5)。桥的 app 侧 fd 按"代"
-       可换(in-place 重启时 rewireApp 换新 fd),MUX 会话不变 → 重启不断 host 链路
+       可换;in-place 重启先等旧代 stdout/stderr 或 PTY pump 读到 EOF 并把尾部写入
+       MUX,再安装新 fd。MUX 会话和 stream 不变 → 重启不断 host 链路
      - 短连接 dial host:5000 发 app_started{pid} → 等 ack → close
      - 拉起 launch.plugin[] 伴生进程(见下),再进入阶段 3 supervisor
 ```
@@ -323,7 +324,10 @@ loop:
 restartApp(backoff):                                  // app 原地重启,launch.restart=always/on-failure
   sleep(backoff)                                      // 退避;期间 reaper 继续收 plugin/exec
   待 shutting_down=false 且 非 quiescing(快照窗口)
-  rewireApp:换一代 app stdio fd 接到**不变的 MUX 会话** → phase2ForkApp →
+  rewireApp:
+    等旧代全部 app→host pump:读到 EOF 且最后字节已写入 MUX
+    超过 2s 仍未 EOF(例如后代继承 writer)→ 强制关闭旧代 fd,有界继续
+    安装新代 fd,唤醒 pump 接到**不变的 MUX stream** → phase2ForkApp →
     app_pid.store(newpid) → 入 app cgroup → app_started{newpid}
   // host 的 run 链路不断,持续收到新实例输出
 
@@ -338,6 +342,9 @@ app_exit_then_reboot(status):
 按其路由,故新实例的退出不会被误判为 plugin/exec。**快照门**:quiesce 置 quiescing(plugin
 随 app cgroup 冻结、supervisor 不再 fork 新进程),restore/attach 解除——restartApp 会等过这个
 窗口再 fork,避免冻结遗漏新进程。`launch.restart=always` 下 app 退出**不 reboot**,沙箱长活。
+generation drain 只确认 app→host 输出,不对 stdin 建 barrier;新旧输出在每条 MUX stream 上
+保持顺序,代际切换不会发送 stream EOF。停机若追上刚安装的新代,pump 仍先消费该已存在代,
+但不会再等待未来代。
 
 `reboot(POWER_OFF)`(而非 `RESTART`):一次性沙箱模型下应用退出即沙箱结束,
 CH 应随之干净退出。`RESTART` 会触发 CH 的"原地重启"流程,试图重连 vhost-user-blk
