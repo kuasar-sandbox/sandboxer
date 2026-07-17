@@ -6,6 +6,37 @@ import (
 	"testing"
 )
 
+type shortWriter struct {
+	bytes.Buffer
+	max int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.max {
+		p = p[:w.max]
+	}
+	return w.Buffer.Write(p)
+}
+
+func TestRoundTripWithShortWrites(t *testing.T) {
+	want := &Message{
+		Type:  TypeError,
+		Msg:   string(bytes.Repeat([]byte("short-write-"), 1024)),
+		Epoch: 17,
+	}
+	w := &shortWriter{max: 3}
+	if err := WriteMessage(w, want); err != nil {
+		t.Fatalf("WriteMessage: %v", err)
+	}
+	got, err := ReadMessage(bytes.NewReader(w.Bytes()))
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round-trip mismatch: got=%+v want=%+v", got, want)
+	}
+}
+
 func TestRoundTrip_Launch(t *testing.T) {
 	m := &Message{
 		Type: TypeLaunch,

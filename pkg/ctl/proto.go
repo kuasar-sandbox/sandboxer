@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/kuasar-sandbox/sandboxer/internal/wireio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
@@ -90,11 +91,10 @@ func WriteMessage(w io.Writer, v any) error {
 	}
 	var lenBuf [4]byte
 	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(body)))
-	if _, err := w.Write(lenBuf[:]); err != nil {
+	if err := wireio.WriteAll(w, lenBuf[:]); err != nil {
 		return err
 	}
-	_, err = w.Write(body)
-	return err
+	return wireio.WriteAll(w, body)
 }
 
 // ReadMessage reads length-prefixed JSON into v (a pointer).
