@@ -40,6 +40,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/internal/wireio"
 )
 
 // VsockHostCID is the well-known guest-side address of the host (always 2).
@@ -439,10 +441,10 @@ func WriteMessage(w io.Writer, m *Message) error {
 	}
 	var hdr [4]byte
 	binary.LittleEndian.PutUint32(hdr[:], uint32(len(payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
+	if err := wireio.WriteAll(w, hdr[:]); err != nil {
 		return fmt.Errorf("proto: write header: %w", err)
 	}
-	if _, err := w.Write(payload); err != nil {
+	if err := wireio.WriteAll(w, payload); err != nil {
 		return fmt.Errorf("proto: write payload: %w", err)
 	}
 	return nil

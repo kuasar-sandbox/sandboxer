@@ -2,10 +2,41 @@ package ctl
 
 import (
 	"bytes"
+	"reflect"
 	"testing"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
+
+type shortWriter struct {
+	bytes.Buffer
+	max int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.max {
+		p = p[:w.max]
+	}
+	return w.Buffer.Write(p)
+}
+
+func TestMessageRoundTripWithShortWrites(t *testing.T) {
+	want := Response{
+		Type: TypeSnapshotDone,
+		Msg:  string(bytes.Repeat([]byte("short-write-"), 1024)),
+	}
+	w := &shortWriter{max: 3}
+	if err := WriteMessage(w, &want); err != nil {
+		t.Fatalf("WriteMessage: %v", err)
+	}
+	var got Response
+	if err := ReadMessage(bytes.NewReader(w.Bytes()), &got); err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round-trip mismatch: got=%+v want=%+v", got, want)
+	}
+}
 
 func TestMessageRoundTrip(t *testing.T) {
 	req := Request{

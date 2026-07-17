@@ -15,6 +15,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/kuasar-sandbox/sandboxer/internal/wireio"
 )
 
 // Wire format of one frame:
@@ -77,11 +79,11 @@ func WriteFrame(w io.Writer, f Frame) error {
 	hdr[0] = f.Stream
 	hdr[1] = f.Type
 	binary.BigEndian.PutUint16(hdr[2:4], uint16(len(f.Payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
+	if err := wireio.WriteAll(w, hdr[:]); err != nil {
 		return fmt.Errorf("mux: write header: %w", err)
 	}
 	if len(f.Payload) > 0 {
-		if _, err := w.Write(f.Payload); err != nil {
+		if err := wireio.WriteAll(w, f.Payload); err != nil {
 			return fmt.Errorf("mux: write payload: %w", err)
 		}
 	}

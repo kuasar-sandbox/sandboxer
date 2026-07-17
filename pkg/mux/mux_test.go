@@ -10,6 +10,18 @@ import (
 	"time"
 )
 
+type shortWriter struct {
+	bytes.Buffer
+	max int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.max {
+		p = p[:w.max]
+	}
+	return w.Buffer.Write(p)
+}
+
 func TestFrameRoundTrip(t *testing.T) {
 	cases := []Frame{
 		{Stream: StreamStdout, Type: FrameData, Payload: []byte("hello world")},
@@ -37,6 +49,25 @@ func TestFrameRoundTrip(t *testing.T) {
 	// too-large payload rejected
 	if err := WriteFrame(&buf, Frame{Stream: StreamStdout, Type: FrameData, Payload: make([]byte, MaxFramePayload+1)}); !errors.Is(err, ErrFrameTooLarge) {
 		t.Fatalf("expected ErrFrameTooLarge, got %v", err)
+	}
+}
+
+func TestFrameRoundTripWithShortWrites(t *testing.T) {
+	w := &shortWriter{max: 3}
+	want := Frame{
+		Stream:  StreamStdout,
+		Type:    FrameData,
+		Payload: bytes.Repeat([]byte("frame-payload-"), 4096),
+	}
+	if err := WriteFrame(w, want); err != nil {
+		t.Fatalf("WriteFrame: %v", err)
+	}
+	got, err := ReadFrame(bytes.NewReader(w.Bytes()))
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	if got.Stream != want.Stream || got.Type != want.Type || !bytes.Equal(got.Payload, want.Payload) {
+		t.Fatalf("round-trip mismatch: got payload=%d bytes, want=%d", len(got.Payload), len(want.Payload))
 	}
 }
 
