@@ -36,6 +36,22 @@ import (
 // sockets + snap staging). --base-root defaults to SANDBOX_BASE_ROOT env or
 // "/var/lib/sandbox" (on-disk: the overlay diff).
 func runCmd(args []string) int {
+	resourceReservationToken := os.Getenv("KUASAR_RESOURCE_RESERVATION_TOKEN")
+	resourceControllerSocket := os.Getenv("KUASAR_RESOURCE_CONTROLLER_SOCKET")
+	_ = os.Unsetenv("KUASAR_RESOURCE_RESERVATION_TOKEN")
+	_ = os.Unsetenv("KUASAR_RESOURCE_CONTROLLER_SOCKET")
+	reservationHandoffComplete := false
+	defer func() {
+		if resourceReservationToken == "" || reservationHandoffComplete {
+			return
+		}
+		if err := resctl.ReleasePreparedReservation(
+			resourceControllerSocket, resourceReservationToken, "run_setup_failed",
+		); err != nil {
+			fmt.Fprintf(os.Stderr, "[sandbox-ctl] release prepared reservation: %v\n", err)
+		}
+	}()
+
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 
 	configPath := fs.String("config", "", "sandbox.yaml path(s), ':'-separated, merged front-to-back (or SANDBOX_CONFIG env)")
@@ -221,8 +237,18 @@ func runCmd(args []string) int {
 		cfg.Resources.Control.CgroupPath = p
 		cfg.Resources.Control.Adopt = true
 	}
+	if resourceReservationToken != "" {
+		configuredSocket := cfg.Resources.Control.Controller
+		if resourceControllerSocket == "" {
+			resourceControllerSocket = configuredSocket
+		} else if configuredSocket != resourceControllerSocket {
+			fmt.Fprintf(os.Stderr,
+				"[sandbox-ctl] prepared reservation controller %q does not match sandbox config %q\n",
+				resourceControllerSocket, configuredSocket)
+			return 1
+		}
+	}
 
-	resourceReservationToken := os.Getenv("KUASAR_RESOURCE_RESERVATION_TOKEN")
 	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
 		SocketPath:       cfg.Resources.Control.Controller,
 		CgroupPath:       cfg.Resources.Control.CgroupPath,
@@ -235,7 +261,7 @@ func runCmd(args []string) int {
 		fmt.Fprintf(os.Stderr, "[sandbox-ctl] resource controller: %v\n", err)
 		return 1
 	}
-	_ = os.Unsetenv("KUASAR_RESOURCE_RESERVATION_TOKEN")
+	reservationHandoffComplete = true
 	defer hooks.Release("run_exit")
 
 	manifestCfg, err := config.LoadManifestConfig(*manifestPath)

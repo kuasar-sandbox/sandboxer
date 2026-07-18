@@ -59,6 +59,47 @@ type ControllerHooks struct {
 	bgWG              sync.WaitGroup
 }
 
+var preparedReleaseRetryDelays = [...]time.Duration{
+	0,
+	100 * time.Millisecond,
+	500 * time.Millisecond,
+	1 * time.Second,
+}
+
+// ReleasePreparedReservation returns a prepared token when sandbox-ctl exits
+// before ControllerHooks can take over. Release is idempotent at the controller,
+// so reconnecting after a lost request or acknowledgement is safe.
+func ReleasePreparedReservation(socketPath, token, reason string) error {
+	if token == "" {
+		return nil
+	}
+	if socketPath == "" {
+		socketPath = resource.DefaultSocket
+	}
+	client := &resource.Client{SocketPath: socketPath}
+	if err := client.OwnPreparedReservation(token); err != nil {
+		return err
+	}
+	var lastErr error
+	for _, delay := range preparedReleaseRetryDelays {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		if err := client.Connect(); err != nil {
+			lastErr = err
+			continue
+		}
+		if err := client.Release(reason); err == nil {
+			_ = client.Close()
+			return nil
+		} else {
+			lastErr = err
+		}
+		_ = client.Close()
+	}
+	return fmt.Errorf("release prepared reservation: %w", lastErr)
+}
+
 // NewControllerHooks dials the controller and returns hooks ready for
 // Admit. Returns hooks with no client (static-mode no-op for RPC calls)
 // when SocketPath is empty.

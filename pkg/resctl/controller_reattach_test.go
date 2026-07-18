@@ -4,10 +4,50 @@ import (
 	"net"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
+
+func TestReleasePreparedReservationRetriesControllerDial(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resource.sock")
+	received := make(chan *resource.Message, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		ln, err := net.Listen("unix", path)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		req, err := resource.ReadMessage(conn)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		received <- req
+		serverErr <- resource.WriteMessage(conn, &resource.Message{Type: resource.TypeAck})
+	}()
+
+	if err := ReleasePreparedReservation(path, "reservation-token", "setup_failed"); err != nil {
+		t.Fatal(err)
+	}
+	req := <-received
+	if req.Type != resource.TypeRelease || req.Token != "reservation-token" || req.Reason != "setup_failed" {
+		t.Fatalf("request = %+v, want retried prepared-token release", req)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestPreparedReservationRequiresController(t *testing.T) {
 	_, err := NewControllerHooks(ControllerHookOptions{ReservationToken: "reservation-token"}, &config.SandboxConfig{})
