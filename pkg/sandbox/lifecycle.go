@@ -43,9 +43,9 @@ type RunOptions struct {
 	StatsJSONPath string                 // if set, write vhost stats as JSON to this path on shutdown
 	StatsInterval time.Duration          // if > 0, periodically log lazy-load stats; 0 = off
 	StdioMode     stdio.Mode             // CH process stdio wiring; see pkg/stdio
-	// ResourceReservationToken is a host-only resource-controller handle
-	// prepared by node-ctl. It is never sent to the guest.
-	ResourceReservationToken string
+	// ControllerHooks may be supplied by sandbox-ctl so one owner covers all
+	// setup failures before and after prepared-reservation reattachment.
+	ControllerHooks *resctl.ControllerHooks
 
 	// PingFatalThreshold: after this many consecutive ping failures
 	// the host SIGTERMs CH so cmd.Wait() returns. 0 = disabled
@@ -79,6 +79,21 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if opts.CHBinary == "" {
 		opts.CHBinary = "cloud-hypervisor"
 	}
+	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl] "+format, a...) }
+
+	hooks := opts.ControllerHooks
+	if hooks == nil {
+		var err error
+		hooks, err = resctl.NewControllerHooks(resctl.ControllerHookOptions{
+			SocketPath: opts.Cfg.Resources.Control.Controller,
+			CgroupPath: opts.Cfg.Resources.Control.CgroupPath,
+			Logf:       logf,
+		}, opts.Cfg)
+		if err != nil {
+			return -1, fmt.Errorf("controller dial: %w", err)
+		}
+		defer hooks.Release("normal")
+	}
 
 	if err := opts.Cfg.ValidateCold(); err != nil {
 		return -1, fmt.Errorf("config: %w", err)
@@ -106,8 +121,6 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// owned by ServeAndWait, which derives them identically from runDir.
 	chSock := filepath.Join(runDir, "ch.sock")
 
-	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl] "+format, a...) }
-
 	// Resolve capacity / floor up front so we can build the resctl.BalloonController
 	// before hooks (hooks owns "alloc change → balloon target" routing,
 	// which needs balloonCtl in hand). Both are cheap yaml lookups; the
@@ -127,22 +140,13 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if allocBytes < capBytes {
 		balloonCtl = resctl.NewBalloonController(chSock, capBytes, logf)
 	}
+	hooks.SetBalloon(balloonCtl)
 
 	// Controller handshake (dynamic mode) — must happen before cgroup write
 	// so that the controller-granted initial allocatable can override
 	// the static startup-burst value when degraded. Balloon is injected
 	// here so any later OnAllocatableChanged / SettledRestore call routes
 	// through balloonCtl rather than opening its own HTTP path.
-	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
-		SocketPath:       opts.Cfg.Resources.Control.Controller,
-		CgroupPath:       opts.Cfg.Resources.Control.CgroupPath,
-		ReservationToken: opts.ResourceReservationToken,
-		Logf:             logf,
-		Balloon:          balloonCtl,
-	}, opts.Cfg)
-	if err != nil {
-		return -1, fmt.Errorf("controller dial: %w", err)
-	}
 	if hooks.Enabled() {
 		grantedInitial, err := hooks.Admit(opts.SandboxID, 0)
 		if err != nil {
@@ -160,8 +164,6 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if balloonCtl != nil {
 		balloonCtl.SeedAppliedAllocatable(initialAllocBytes)
 	}
-	defer hooks.Release("normal")
-
 	// cgroup join. CgroupPath empty → no-cgroup mode, no cgroup operations.
 	// CgroupPath set → join existing cgroup (must already exist; not
 	// created by sandbox-ctl). See docs/sandbox.md §4.1.

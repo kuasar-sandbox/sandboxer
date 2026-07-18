@@ -54,9 +54,9 @@ type Options struct {
 	StatsJSONPath       string        // if non-empty, dump uffd + per-backend stats here on exit
 	StatsInterval       time.Duration // if > 0, periodically log lazy-load stats; 0 = off
 	StdioMode           stdio.Mode    // CH process stdio wiring; see pkg/stdio
-	// ResourceReservationToken is a host-only resource-controller handle
-	// prepared by node-ctl. It is never restored into guest state.
-	ResourceReservationToken string
+	// ControllerHooks may be supplied by sandbox-ctl so one owner covers all
+	// setup failures before and after prepared-reservation reattachment.
+	ControllerHooks *resctl.ControllerHooks
 
 	// PingFatalThreshold: same semantics as sandbox.RunOptions —
 	// SIGTERM CH after N consecutive ping failures. 0 disables.
@@ -97,6 +97,19 @@ func Run(ctx context.Context, opts Options) (int, error) {
 
 	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl run --restore] "+format, a...) }
 	startUnixNs := time.Now().UnixNano()
+	hooks := opts.ControllerHooks
+	if hooks == nil {
+		var err error
+		hooks, err = resctl.NewControllerHooks(resctl.ControllerHookOptions{
+			SocketPath: opts.HostCfg.Resources.Control.Controller,
+			CgroupPath: opts.HostCfg.Resources.Control.CgroupPath,
+			Logf:       logf,
+		}, opts.HostCfg)
+		if err != nil {
+			return -1, fmt.Errorf("controller dial: %w", err)
+		}
+		defer hooks.Release("normal")
+	}
 
 	// cgroup join (same semantics as cold-start lifecycle.go). No-cgroup
 	// mode (no cgroup_path) is a no-op. See docs/sandbox.md §4.1.
@@ -132,17 +145,6 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// then late-injected via hooks.SetBalloon. Until then, hooks balloon-
 	// related entry points (SettledRestore, OnAllocatableChanged) treat
 	// Balloon-nil as no-op on the balloon side.
-	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
-		SocketPath:       opts.HostCfg.Resources.Control.Controller,
-		CgroupPath:       opts.HostCfg.Resources.Control.CgroupPath,
-		ReservationToken: opts.ResourceReservationToken,
-		Logf:             logf,
-	}, opts.HostCfg)
-	if err != nil {
-		return -1, fmt.Errorf("controller dial: %w", err)
-	}
-	defer hooks.Release("normal")
-
 	// Open the snapshot bundle as a single fetch.Stream — file:// is a local
 	// tarstream artifact (hole map from the envelope), manifest:// is
 	// chunk-granular via cache-ctl.

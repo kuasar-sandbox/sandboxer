@@ -58,6 +58,23 @@ func (c *Client) Token() string {
 	return c.token
 }
 
+// OwnPreparedReservation makes this client responsible for releasing a token
+// that was durably prepared before sandbox-ctl started. Reattach later confirms
+// the same reservation; failures before then still retain enough information
+// for Release to return the capacity.
+func (c *Client) OwnPreparedReservation(token string) error {
+	if token == "" {
+		return errors.New("client: prepared reservation token is empty")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.token != "" && c.token != token {
+		return errors.New("client: already owns a different reservation token")
+	}
+	c.token = token
+	return nil
+}
+
 // roundTrip writes req and reads exactly one reply. Holds the mutex
 // for the duration. Caller must avoid concurrent calls.
 func (c *Client) roundTrip(req *Message, deadline time.Duration) (*Message, error) {
@@ -162,12 +179,24 @@ func (c *Client) Admit(p AdmitParams) (*AdmitResult, error) {
 // path after node-ctl has already performed durable Admission; they must not
 // submit a second Admit request from sandbox-ctl.
 func (c *Client) Reattach(token string) (uint64, error) {
+	if token == "" {
+		return 0, errors.New("client: reattach token is empty")
+	}
+	c.mu.Lock()
+	owned := c.token
+	c.mu.Unlock()
+	if owned != "" && owned != token {
+		return 0, errors.New("client: reattach token does not match the owned reservation")
+	}
 	resp, err := c.roundTrip(&Message{Type: TypeReattach, Token: token}, DeadlineAdmit)
 	if err != nil {
 		return 0, err
 	}
 	if resp.Type != TypeAck {
 		return 0, fmt.Errorf("client: reattach reply %q msg=%q", resp.Type, resp.Msg)
+	}
+	if resp.NewAllocatable == 0 {
+		return 0, errors.New("client: reattach acknowledgement omitted a positive allocatable grant")
 	}
 	c.mu.Lock()
 	c.token = token

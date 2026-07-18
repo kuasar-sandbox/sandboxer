@@ -206,16 +206,9 @@ func runCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	manifestCfg, err := config.LoadManifestConfig(*manifestPath)
-	if err != nil {
-		if !errors.Is(err, manifest.ErrConfigNotProvided) {
-			fmt.Fprintf(os.Stderr, "[sandbox-ctl] manifest config: %v\n", err)
-			return 1
-		}
-		manifestCfg = nil
-	}
 
-	// cgroup overrides.
+	// Apply cgroup overrides before constructing the single resource-controller
+	// owner shared by all remaining cold/restore setup paths.
 	if *cgroupPath != "" {
 		cfg.Resources.Control.CgroupPath = *cgroupPath
 	}
@@ -229,6 +222,31 @@ func runCmd(args []string) int {
 		cfg.Resources.Control.Adopt = true
 	}
 
+	resourceReservationToken := os.Getenv("KUASAR_RESOURCE_RESERVATION_TOKEN")
+	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
+		SocketPath:       cfg.Resources.Control.Controller,
+		CgroupPath:       cfg.Resources.Control.CgroupPath,
+		ReservationToken: resourceReservationToken,
+		Logf: func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "[sandbox-ctl] resource: "+format+"\n", args...)
+		},
+	}, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[sandbox-ctl] resource controller: %v\n", err)
+		return 1
+	}
+	_ = os.Unsetenv("KUASAR_RESOURCE_RESERVATION_TOKEN")
+	defer hooks.Release("run_exit")
+
+	manifestCfg, err := config.LoadManifestConfig(*manifestPath)
+	if err != nil {
+		if !errors.Is(err, manifest.ErrConfigNotProvided) {
+			fmt.Fprintf(os.Stderr, "[sandbox-ctl] manifest config: %v\n", err)
+			return 1
+		}
+		manifestCfg = nil
+	}
+
 	restoreR := *restoreRef
 
 	// Signal handling lives in pkg/sandbox (lifecycle.go /
@@ -236,29 +254,27 @@ func runCmd(args []string) int {
 	// to it with SIGKILL escalation. So this layer just passes a plain
 	// context.
 	ctx := context.Background()
-	resourceReservationToken := os.Getenv("KUASAR_RESOURCE_RESERVATION_TOKEN")
-	_ = os.Unsetenv("KUASAR_RESOURCE_RESERVATION_TOKEN")
 
 	// Restore mode dispatch.
 	if restoreR != "" {
 		return runRestore(ctx, cfg, manifestCfg, restoreR,
 			fileRefs, *sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards,
-			resourceReservationToken)
+			hooks)
 	}
 
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
-		Cfg:                      cfg,
-		ManifestCfg:              manifestCfg,
-		SandboxID:                *sandboxID,
-		CHBinary:                 chBin,
-		RuntimeRoot:              rd,
-		BaseRoot:                 br,
-		StatsJSONPath:            *statsJSON,
-		StatsInterval:            *statsInterval,
-		StdioMode:                stdioMode,
-		PingFatalThreshold:       *pingFatal,
-		Forwards:                 forwards,
-		ResourceReservationToken: resourceReservationToken,
+		Cfg:                cfg,
+		ManifestCfg:        manifestCfg,
+		SandboxID:          *sandboxID,
+		CHBinary:           chBin,
+		RuntimeRoot:        rd,
+		BaseRoot:           br,
+		StatsJSONPath:      *statsJSON,
+		StatsInterval:      *statsInterval,
+		StdioMode:          stdioMode,
+		PingFatalThreshold: *pingFatal,
+		Forwards:           forwards,
+		ControllerHooks:    hooks,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -270,7 +286,7 @@ func runCmd(args []string) int {
 // runRestore parses the snapshot reference and dispatches to restore.Run.
 func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *config.ManifestConfig,
 	ref string, fileRefs restore.FileRefPolicy, sandboxID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
-	statsInterval time.Duration, forwards []sandbox.ForwardSpec, resourceReservationToken string,
+	statsInterval time.Duration, forwards []sandbox.ForwardSpec, hooks *resctl.ControllerHooks,
 ) int {
 	const manifestPrefix = "manifest://"
 	var (
@@ -301,22 +317,22 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 	}
 
 	exit, err := restore.Run(ctx, restore.Options{
-		SnapshotPath:             snapshotPath,
-		SnapshotManifestKey:      snapshotKey,
-		HostCfg:                  cfg,
-		ManifestCfg:              manifestCfg,
-		Fetcher:                  fetcher,
-		FileRefs:                 fileRefs,
-		SandboxID:                sandboxID,
-		CHBinary:                 chBin,
-		RuntimeRoot:              runDir,
-		BaseRoot:                 baseRoot,
-		StatsJSONPath:            statsJSON,
-		StatsInterval:            statsInterval,
-		StdioMode:                stdioMode,
-		PingFatalThreshold:       pingFatal,
-		Forwards:                 forwards,
-		ResourceReservationToken: resourceReservationToken,
+		SnapshotPath:        snapshotPath,
+		SnapshotManifestKey: snapshotKey,
+		HostCfg:             cfg,
+		ManifestCfg:         manifestCfg,
+		Fetcher:             fetcher,
+		FileRefs:            fileRefs,
+		SandboxID:           sandboxID,
+		CHBinary:            chBin,
+		RuntimeRoot:         runDir,
+		BaseRoot:            baseRoot,
+		StatsJSONPath:       statsJSON,
+		StatsInterval:       statsInterval,
+		StdioMode:           stdioMode,
+		PingFatalThreshold:  pingFatal,
+		Forwards:            forwards,
+		ControllerHooks:     hooks,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

@@ -2,14 +2,15 @@ package resctl
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
@@ -67,11 +68,20 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		h.opts.Logf = func(string, ...any) {}
 	}
 	if opts.SocketPath == "" {
+		if opts.ReservationToken != "" {
+			return nil, errors.New("resource controller is required for a prepared reservation")
+		}
 		return h, nil
 	}
 	h.client = &resource.Client{SocketPath: opts.SocketPath}
 	if err := h.client.Connect(); err != nil {
 		return nil, err
+	}
+	if opts.ReservationToken != "" {
+		if err := h.client.OwnPreparedReservation(opts.ReservationToken); err != nil {
+			_ = h.client.Close()
+			return nil, err
+		}
 	}
 	return h, nil
 }
