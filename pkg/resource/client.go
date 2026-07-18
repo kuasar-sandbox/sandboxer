@@ -157,20 +157,22 @@ func (c *Client) Admit(p AdmitParams) (*AdmitResult, error) {
 	}, nil
 }
 
-// Reattach binds a fresh connection to an existing reservation
-// (controller restart or transient network drop).
-func (c *Client) Reattach(token string) error {
+// Reattach binds a fresh connection to an existing reservation and returns the
+// reservation's current allocatable-memory grant. Cluster launches use this
+// path after node-ctl has already performed durable Admission; they must not
+// submit a second Admit request from sandbox-ctl.
+func (c *Client) Reattach(token string) (uint64, error) {
 	resp, err := c.roundTrip(&Message{Type: TypeReattach, Token: token}, DeadlineAdmit)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if resp.Type != TypeAck {
-		return fmt.Errorf("client: reattach reply %q msg=%q", resp.Type, resp.Msg)
+		return 0, fmt.Errorf("client: reattach reply %q msg=%q", resp.Type, resp.Msg)
 	}
 	c.mu.Lock()
 	c.token = token
 	c.mu.Unlock()
-	return nil
+	return resp.NewAllocatable, nil
 }
 
 // Settled marks the per-sandbox state machine's startup → settled

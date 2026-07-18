@@ -43,6 +43,9 @@ type RunOptions struct {
 	StatsJSONPath string                 // if set, write vhost stats as JSON to this path on shutdown
 	StatsInterval time.Duration          // if > 0, periodically log lazy-load stats; 0 = off
 	StdioMode     stdio.Mode             // CH process stdio wiring; see pkg/stdio
+	// ResourceReservationToken is a host-only resource-controller handle
+	// prepared by node-ctl. It is never sent to the guest.
+	ResourceReservationToken string
 
 	// PingFatalThreshold: after this many consecutive ping failures
 	// the host SIGTERMs CH so cmd.Wait() returns. 0 = disabled
@@ -131,10 +134,11 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// here so any later OnAllocatableChanged / SettledRestore call routes
 	// through balloonCtl rather than opening its own HTTP path.
 	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
-		SocketPath: opts.Cfg.Resources.Control.Controller,
-		CgroupPath: opts.Cfg.Resources.Control.CgroupPath,
-		Logf:       logf,
-		Balloon:    balloonCtl,
+		SocketPath:       opts.Cfg.Resources.Control.Controller,
+		CgroupPath:       opts.Cfg.Resources.Control.CgroupPath,
+		ReservationToken: opts.ResourceReservationToken,
+		Logf:             logf,
+		Balloon:          balloonCtl,
 	}, opts.Cfg)
 	if err != nil {
 		return -1, fmt.Errorf("controller dial: %w", err)

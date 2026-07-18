@@ -29,10 +29,11 @@ import (
 // sole writer of /vm.resize. May be nil when allocatable.memory ==
 // capacity.memory (no balloon device on this VM).
 type ControllerHookOptions struct {
-	SocketPath string
-	CgroupPath string
-	Logf       func(string, ...any)
-	Balloon    *BalloonController
+	SocketPath       string
+	CgroupPath       string
+	ReservationToken string
+	Logf             func(string, ...any)
+	Balloon          *BalloonController
 }
 
 // ControllerHooks bundles the per-sandbox state for resource control:
@@ -124,6 +125,17 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 			return 0, err
 		}
 		return burst, nil
+	}
+	if h.opts.ReservationToken != "" {
+		granted, err := h.client.Reattach(h.opts.ReservationToken)
+		if err != nil {
+			return 0, fmt.Errorf("reattach preassigned reservation: %w", err)
+		}
+		h.mu.Lock()
+		h.allocatableNowMem = granted
+		h.mu.Unlock()
+		h.opts.Logf("controller reattach: initial_alloc=%d", granted)
+		return granted, nil
 	}
 	cap, err := h.cfg.CapacityMemoryBytes()
 	if err != nil {
