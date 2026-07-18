@@ -186,8 +186,65 @@ func TestAdmitReattachesPreassignedReservation(t *testing.T) {
 	if req.Type != resource.TypeReattach || req.Token != "reservation-token" {
 		t.Fatalf("request = %+v, want reattach with preassigned token", req)
 	}
-	if req.SandboxID != "" {
-		t.Fatalf("reattach unexpectedly submitted sandbox admission: %+v", req)
+	if req.SandboxID != "sandbox-1" {
+		t.Fatalf("reattach sandbox identity = %q, want sandbox-1", req.SandboxID)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReleaseReconnectsAfterReattachConnectionFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resource.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	released := make(chan *resource.Message, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		first, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if _, err := resource.ReadMessage(first); err != nil {
+			_ = first.Close()
+			serverErr <- err
+			return
+		}
+		_ = first.Close()
+
+		second, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer second.Close()
+		req, err := resource.ReadMessage(second)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		released <- req
+		serverErr <- resource.WriteMessage(second, &resource.Message{Type: resource.TypeAck})
+	}()
+
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: path, ReservationToken: "reservation-token",
+	}, &config.SandboxConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hooks.Admit("sandbox-1", 0); err == nil {
+		t.Fatal("reattach unexpectedly survived a broken controller connection")
+	}
+	hooks.Release("reattach_failed")
+	req := <-released
+	if req.Type != resource.TypeRelease || req.Token != "reservation-token" || req.Reason != "reattach_failed" {
+		t.Fatalf("fallback release = %+v", req)
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatal(err)

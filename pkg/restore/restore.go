@@ -357,6 +357,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		if err != nil {
 			return -1, fmt.Errorf("controller admit: %w", err)
 		}
+		if err := validateRestoredGrant(granted, yamlAlloc, snapCap); err != nil {
+			return -1, err
+		}
 		initialAlloc = granted
 		logf("controller admit ok, restored allocatable=%d (snapshot allocatable=%d, balloon target/current=%d/%d)",
 			granted, allocAtSnap, balTarget, balCurrent)
@@ -619,6 +622,16 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			return nil
 		},
 	})
+}
+
+func validateRestoredGrant(granted, floor, capacity uint64) error {
+	if granted < floor {
+		return fmt.Errorf("controller reattach granted allocatable %d below floor %d", granted, floor)
+	}
+	if granted > capacity {
+		return fmt.Errorf("controller reattach granted allocatable %d above restored VM capacity %d", granted, capacity)
+	}
+	return nil
 }
 
 // reconstructDisk rebuilds one logical disk for restore: the read-only base is

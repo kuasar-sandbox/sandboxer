@@ -178,9 +178,12 @@ func (c *Client) Admit(p AdmitParams) (*AdmitResult, error) {
 // reservation's current allocatable-memory grant. Cluster launches use this
 // path after node-ctl has already performed durable Admission; they must not
 // submit a second Admit request from sandbox-ctl.
-func (c *Client) Reattach(token string) (uint64, error) {
+func (c *Client) Reattach(token, sandboxID string) (uint64, error) {
 	if token == "" {
 		return 0, errors.New("client: reattach token is empty")
+	}
+	if sandboxID == "" {
+		return 0, errors.New("client: reattach sandbox ID is empty")
 	}
 	c.mu.Lock()
 	owned := c.token
@@ -188,7 +191,7 @@ func (c *Client) Reattach(token string) (uint64, error) {
 	if owned != "" && owned != token {
 		return 0, errors.New("client: reattach token does not match the owned reservation")
 	}
-	resp, err := c.roundTrip(&Message{Type: TypeReattach, Token: token}, DeadlineAdmit)
+	resp, err := c.roundTrip(&Message{Type: TypeReattach, Token: token, SandboxID: sandboxID}, DeadlineAdmit)
 	if err != nil {
 		return 0, err
 	}

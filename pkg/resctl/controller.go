@@ -178,7 +178,7 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 		return burst, nil
 	}
 	if h.opts.ReservationToken != "" {
-		granted, err := h.client.Reattach(h.opts.ReservationToken)
+		granted, err := h.client.Reattach(h.opts.ReservationToken, sid)
 		if err != nil {
 			return 0, fmt.Errorf("reattach preassigned reservation: %w", err)
 		}
@@ -468,8 +468,16 @@ func (h *ControllerHooks) Release(reason string) {
 		h.cancelBg()
 	}
 	h.bgWG.Wait()
+	token := h.client.Token()
 	if err := h.client.Release(reason); err != nil {
-		h.opts.Logf("controller.Release: %v", err)
+		h.opts.Logf("controller.Release: %v; retrying prepared-token release", err)
+		_ = h.client.Close()
+		if token != "" {
+			if retryErr := ReleasePreparedReservation(h.opts.SocketPath, token, reason); retryErr != nil {
+				h.opts.Logf("controller.Release retry: %v", retryErr)
+			}
+		}
+		return
 	}
 	_ = h.client.Close()
 }
