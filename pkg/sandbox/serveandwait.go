@@ -191,6 +191,12 @@ type SnapDiskRef struct {
 // parts — config resolution, the CH cmdline, the post-spawn settle
 // protocol — stay in the callers via VMParams.BuildCmd / PostSpawn.
 func ServeAndWait(p VMParams) (int, error) {
+	if err := p.Ctx.Err(); err != nil {
+		return -1, err
+	}
+	sigCh := make(chan os.Signal, 4)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
 	logf := p.Logf
 	runDir := p.RunDir
 	chSock := filepath.Join(runDir, "ch.sock")
@@ -510,10 +516,11 @@ func ServeAndWait(p VMParams) (int, error) {
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	sigCh := make(chan os.Signal, 4)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(sigCh)
-
+	if err := p.Ctx.Err(); err != nil {
+		cancelBackends()
+		backendWG.Wait()
+		return -1, err
+	}
 	if err := startCH(cmd, p.NetnsFile); err != nil {
 		cancelBackends()
 		backendWG.Wait()

@@ -5,14 +5,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
@@ -36,6 +38,12 @@ import (
 // sockets + snap staging). --base-root defaults to SANDBOX_BASE_ROOT env or
 // "/var/lib/sandbox" (on-disk: the overlay diff).
 func runCmd(args []string) int {
+	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
+	return runCmdContext(ctx, args)
+}
+
+func runCmdContext(ctx context.Context, args []string) int {
 	resourceReservationToken := os.Getenv("KUASAR_RESOURCE_RESERVATION_TOKEN")
 	resourceControllerSocket := os.Getenv("KUASAR_RESOURCE_CONTROLLER_SOCKET")
 	_ = os.Unsetenv("KUASAR_RESOURCE_RESERVATION_TOKEN")
@@ -105,6 +113,10 @@ func runCmd(args []string) int {
 
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if err := ctx.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "sandbox-ctl run: setup canceled: %v\n", err)
+		return 1
 	}
 	fileRefs, err := restore.ParseFileRefPolicy(*restoreFileRefs)
 	if err != nil {
@@ -274,12 +286,6 @@ func runCmd(args []string) int {
 	}
 
 	restoreR := *restoreRef
-
-	// Signal handling lives in pkg/sandbox (lifecycle.go /
-	// restore.go) — they own the CH process and forward SIGTERM/SIGINT
-	// to it with SIGKILL escalation. So this layer just passes a plain
-	// context.
-	ctx := context.Background()
 
 	// Restore mode dispatch.
 	if restoreR != "" {

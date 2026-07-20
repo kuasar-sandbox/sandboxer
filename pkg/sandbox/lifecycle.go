@@ -63,6 +63,9 @@ type RunOptions struct {
 // spawn CH, wait for exit, cleanup. Returns CH's exit code or an error
 // if setup failed.
 func Run(ctx context.Context, opts RunOptions) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
 	startUnixNs := time.Now().UnixNano()
 	if opts.Cfg == nil {
 		return -1, fmt.Errorf("RunOptions.Cfg is nil")
@@ -381,6 +384,9 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// faults, the merged launch spec whose conn becomes the stdio MUX
 	// (WireLaunchMUX), and a settle protocol gated on the guest's
 	// hello / launch_ack handshake.
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
 	return ServeAndWait(VMParams{
 		Ctx:                ctx,
 		SandboxID:          opts.SandboxID,

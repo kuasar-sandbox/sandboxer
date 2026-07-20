@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"os"
 	"path/filepath"
@@ -48,5 +49,46 @@ func TestRunReleasesPreparedReservationOnFlagParseFailure(t *testing.T) {
 	}
 	if os.Getenv("KUASAR_RESOURCE_RESERVATION_TOKEN") != "" || os.Getenv("KUASAR_RESOURCE_CONTROLLER_SOCKET") != "" {
 		t.Fatal("prepared reservation handoff leaked into child environment")
+	}
+}
+
+func TestRunReleasesPreparedReservationWhenSetupContextIsCanceled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resource.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	received := make(chan *resource.Message, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		req, err := resource.ReadMessage(conn)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		received <- req
+		serverErr <- resource.WriteMessage(conn, &resource.Message{Type: resource.TypeAck})
+	}()
+	t.Setenv("KUASAR_RESOURCE_RESERVATION_TOKEN", "reservation-token")
+	t.Setenv("KUASAR_RESOURCE_CONTROLLER_SOCKET", path)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if code := runCmdContext(ctx, nil); code != 1 {
+		t.Fatalf("runCmdContext code = %d, want 1", code)
+	}
+	req := <-received
+	if req.Type != resource.TypeRelease || req.Token != "reservation-token" || req.Reason != "run_setup_failed" {
+		t.Fatalf("request = %+v, want canceled setup release", req)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
 	}
 }

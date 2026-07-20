@@ -70,6 +70,9 @@ type Options struct {
 
 // Run executes restore. Returns the CH exit code.
 func Run(ctx context.Context, opts Options) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
 	if opts.SnapshotPath == "" && opts.SnapshotManifestKey == "" {
 		return -1, errors.New("restore: SnapshotPath or SnapshotManifestKey required")
 	}
@@ -508,6 +511,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// restore, so WireLaunchMUX=false — the stdio MUX is re-established
 	// by PostSpawn over the reverse channel), and a settle protocol of
 	// waitAPI → /vm.resume → restore{epoch} → SettledRestore.
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
 	return sandbox.ServeAndWait(sandbox.VMParams{
 		Ctx:                ctx,
 		SandboxID:          opts.SandboxID,
