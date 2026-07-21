@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"os"
@@ -9,6 +10,33 @@ import (
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
+
+func TestRunRequiresControllerSocketWithPreparedReservation(t *testing.T) {
+	t.Setenv("KUASAR_RESOURCE_RESERVATION_TOKEN", "reservation-token")
+	t.Setenv("KUASAR_RESOURCE_CONTROLLER_SOCKET", "")
+	var stderr bytes.Buffer
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = oldStderr })
+
+	code := runCmdContext(context.Background(), nil)
+	_ = w.Close()
+	_, _ = stderr.ReadFrom(r)
+	_ = r.Close()
+	if code != 1 {
+		t.Fatalf("runCmdContext code = %d, want 1", code)
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("KUASAR_RESOURCE_CONTROLLER_SOCKET is required")) {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if os.Getenv("KUASAR_RESOURCE_RESERVATION_TOKEN") != "" {
+		t.Fatal("prepared reservation token leaked into child environment")
+	}
+}
 
 func TestRunReleasesPreparedReservationOnFlagParseFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "resource.sock")

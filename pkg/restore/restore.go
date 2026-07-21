@@ -551,7 +551,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			// --kernel/--vsock; --console/--serial are restored from the
 			// snapshot bundle (taken with `--console tty --serial off`),
 			// so we don't repeat them. consoleArg is unused here.
-			cmd := exec.CommandContext(ctx, opts.CHBinary)
+			cmd := exec.Command(opts.CHBinary)
 			_, cleanup, err := opts.StdioMode.SetupCHStdio(cmd)
 			if err != nil {
 				return nil, nil, fmt.Errorf("stdio: %w", err)
@@ -578,7 +578,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		// non-nil return aborts the run (ServeAndWait kills CH); we
 		// don't hand back a sandbox whose guest agent is unreachable.
 		PostSpawn: func(pc sandbox.PostSpawnCtx) error {
-			if err := chapi.WaitReady(ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
+			if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
 			}
 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).Resume(); err != nil {
@@ -588,8 +588,8 @@ func Run(ctx context.Context, opts Options) (int, error) {
 
 			tRestore := time.Now()
 			// 0 = no forced timeout: DialRaw needs a finite value, so fall back
-			// to noForcedTimeout (effective-infinity; cancellation still flows
-			// via ctx → CH teardown closing the vsock conn).
+			// to noForcedTimeout (effective-infinity; CH teardown closes the
+			// vsock connection).
 			restoreDeadline := opts.HostCfg.RestoreDeadline()
 			if restoreDeadline <= 0 {
 				restoreDeadline = config.NoForcedTimeout

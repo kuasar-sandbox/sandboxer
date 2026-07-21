@@ -164,9 +164,10 @@ func (h *ControllerHooks) AllocatableNowMem() uint64 {
 // non-zero only on the restore path.
 //
 // On success, the returned grantedInitialAlloc is what to use for
-// initial cgroup memory.high and balloon target. The controller
-// computes max(yaml.startup, yaml.allocatable, allocatable_at_snapshot)
-// so the grant may exceed yaml.startup, but never falls below it.
+// initial cgroup memory.high and balloon target. Cold starts require at
+// least max(yaml.startup, yaml.allocatable). Restores may fall back to the
+// yaml allocatable floor when the controller cannot grant the preferred
+// allocatable_at_snapshot value.
 func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint64, error) {
 	if !h.Enabled() {
 		// Mode A/B: no admission, return startup (or floor if startup
@@ -189,7 +190,10 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 	if err != nil {
 		return 0, err
 	}
-	minimum := max(floor, burst, allocatableAtSnapshot)
+	minimum := max(floor, burst)
+	if allocatableAtSnapshot > 0 {
+		minimum = floor
+	}
 	validateGrant := func(granted uint64) error {
 		if granted < minimum {
 			return fmt.Errorf("initial allocation %d below required minimum %d", granted, minimum)

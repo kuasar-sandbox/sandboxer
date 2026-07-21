@@ -235,6 +235,48 @@ func TestReattachRejectsGrantBelowStartupBudget(t *testing.T) {
 	}
 }
 
+func TestReattachAcceptsRestoreFallbackBelowSnapshotAllocation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resource.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		req, err := resource.ReadMessage(conn)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- resource.WriteMessage(conn, &resource.Message{
+			Type: resource.TypeAck, Token: req.Token, NewAllocatable: 2 << 30,
+		})
+	}()
+
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: path, ReservationToken: "reservation-token",
+	}, preparedReservationTestConfig(path, "3GiB"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hooks.client.Close()
+	granted, err := hooks.Admit("sandbox-1", 4<<30)
+	if err != nil || granted != 2<<30 {
+		t.Fatalf("restore fallback grant = %d, %v", granted, err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReleaseReconnectsAfterReattachConnectionFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "resource.sock")
 	ln, err := net.Listen("unix", path)

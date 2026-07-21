@@ -48,6 +48,11 @@ func runCmdContext(ctx context.Context, args []string) int {
 	resourceControllerSocket := os.Getenv("KUASAR_RESOURCE_CONTROLLER_SOCKET")
 	_ = os.Unsetenv("KUASAR_RESOURCE_RESERVATION_TOKEN")
 	_ = os.Unsetenv("KUASAR_RESOURCE_CONTROLLER_SOCKET")
+	if resourceReservationToken != "" && resourceControllerSocket == "" {
+		fmt.Fprintln(os.Stderr,
+			"[sandbox-ctl] KUASAR_RESOURCE_CONTROLLER_SOCKET is required with KUASAR_RESOURCE_RESERVATION_TOKEN")
+		return 1
+	}
 	reservationHandoffComplete := false
 	defer func() {
 		if resourceReservationToken == "" || reservationHandoffComplete {
@@ -251,9 +256,7 @@ func runCmdContext(ctx context.Context, args []string) int {
 	}
 	if resourceReservationToken != "" {
 		configuredSocket := cfg.Resources.Control.Controller
-		if resourceControllerSocket == "" {
-			resourceControllerSocket = configuredSocket
-		} else if configuredSocket != resourceControllerSocket {
+		if configuredSocket != resourceControllerSocket {
 			fmt.Fprintf(os.Stderr,
 				"[sandbox-ctl] prepared reservation controller %q does not match sandbox config %q\n",
 				resourceControllerSocket, configuredSocket)
