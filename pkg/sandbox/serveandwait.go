@@ -205,11 +205,10 @@ func ServeAndWait(p VMParams) (int, error) {
 	uffdSockPath := filepath.Join(runDir, "uffd.sock")
 	ctlSockPath := filepath.Join(runDir, "ctl.sock")
 
-	// backendCtx is the context the vhost / launch / va_report / ctl.sock
-	// servers run under (and the stdio MUX bridge). Cancelled when CH
-	// exits (or earlier via signal escalation); the deferred cancel is a
-	// backstop for the early-error returns below.
-	backendCtx, cancelBackends := context.WithCancel(p.Ctx)
+	// p.Ctx gates setup. Once ServeAndWait has installed its signal handler,
+	// runtime shutdown is ordered through CH; canceling the backends first can
+	// drop active disk I/O while vmm.shutdown is still draining the VM.
+	backendCtx, cancelBackends := context.WithCancel(context.WithoutCancel(p.Ctx))
 	defer cancelBackends()
 
 	// Exactly one stdio MUX at a time; which conn backs it changes across

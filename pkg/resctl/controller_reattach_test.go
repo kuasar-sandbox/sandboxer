@@ -84,7 +84,7 @@ func TestPreparedReservationIsReleasedBeforeReattach(t *testing.T) {
 
 	hooks, err := NewControllerHooks(ControllerHookOptions{
 		SocketPath: path, ReservationToken: "reservation-token",
-	}, &config.SandboxConfig{})
+	}, preparedReservationTestConfig(path, "3GiB"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestReattachRejectsMissingAllocatableGrant(t *testing.T) {
 
 	hooks, err := NewControllerHooks(ControllerHookOptions{
 		SocketPath: path, ReservationToken: "reservation-token",
-	}, &config.SandboxConfig{})
+	}, preparedReservationTestConfig(path, "3GiB"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,14 +162,14 @@ func TestAdmitReattachesPreassignedReservation(t *testing.T) {
 		serverErr <- resource.WriteMessage(conn, &resource.Message{
 			Type:           resource.TypeAck,
 			Token:          req.Token,
-			NewAllocatable: 512 << 20,
+			NewAllocatable: 3 << 30,
 		})
 	}()
 
 	hooks, err := NewControllerHooks(ControllerHookOptions{
 		SocketPath:       path,
 		ReservationToken: "reservation-token",
-	}, &config.SandboxConfig{})
+	}, preparedReservationTestConfig(path, "3GiB"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,8 +179,8 @@ func TestAdmitReattachesPreassignedReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if granted != 512<<20 {
-		t.Fatalf("granted = %d, want %d", granted, uint64(512<<20))
+	if granted != 3<<30 {
+		t.Fatalf("granted = %d, want %d", granted, uint64(3<<30))
 	}
 	req := <-received
 	if req.Type != resource.TypeReattach || req.Token != "reservation-token" {
@@ -188,6 +188,47 @@ func TestAdmitReattachesPreassignedReservation(t *testing.T) {
 	}
 	if req.SandboxID != "sandbox-1" {
 		t.Fatalf("reattach sandbox identity = %q, want sandbox-1", req.SandboxID)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReattachRejectsGrantBelowStartupBudget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resource.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		req, err := resource.ReadMessage(conn)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- resource.WriteMessage(conn, &resource.Message{
+			Type: resource.TypeAck, Token: req.Token, NewAllocatable: 2 << 30,
+		})
+	}()
+
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: path, ReservationToken: "reservation-token",
+	}, preparedReservationTestConfig(path, "3GiB"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hooks.client.Close()
+	if _, err := hooks.Admit("sandbox-1", 0); err == nil {
+		t.Fatal("reattach accepted a grant below the startup budget")
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatal(err)
@@ -234,7 +275,7 @@ func TestReleaseReconnectsAfterReattachConnectionFailure(t *testing.T) {
 
 	hooks, err := NewControllerHooks(ControllerHookOptions{
 		SocketPath: path, ReservationToken: "reservation-token",
-	}, &config.SandboxConfig{})
+	}, preparedReservationTestConfig(path, "3GiB"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,4 +290,11 @@ func TestReleaseReconnectsAfterReattachConnectionFailure(t *testing.T) {
 	if err := <-serverErr; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func preparedReservationTestConfig(path, startup string) *config.SandboxConfig {
+	cfg := makeMinimalCfg()
+	cfg.Resources.Control.Controller = path
+	cfg.Resources.Startup = &config.StartupConfig{Memory: startup}
+	return cfg
 }

@@ -177,17 +177,6 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 		}
 		return burst, nil
 	}
-	if h.opts.ReservationToken != "" {
-		granted, err := h.client.Reattach(h.opts.ReservationToken, sid)
-		if err != nil {
-			return 0, fmt.Errorf("reattach preassigned reservation: %w", err)
-		}
-		h.mu.Lock()
-		h.allocatableNowMem = granted
-		h.mu.Unlock()
-		h.opts.Logf("controller reattach: initial_alloc=%d", granted)
-		return granted, nil
-	}
 	cap, err := h.cfg.CapacityMemoryBytes()
 	if err != nil {
 		return 0, err
@@ -199,6 +188,30 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 	burst, err := h.cfg.StartupBytes()
 	if err != nil {
 		return 0, err
+	}
+	minimum := max(floor, burst, allocatableAtSnapshot)
+	validateGrant := func(granted uint64) error {
+		if granted < minimum {
+			return fmt.Errorf("initial allocation %d below required minimum %d", granted, minimum)
+		}
+		if granted > cap {
+			return fmt.Errorf("initial allocation %d above capacity %d", granted, cap)
+		}
+		return nil
+	}
+	if h.opts.ReservationToken != "" {
+		granted, err := h.client.Reattach(h.opts.ReservationToken, sid)
+		if err != nil {
+			return 0, fmt.Errorf("reattach preassigned reservation: %w", err)
+		}
+		if err := validateGrant(granted); err != nil {
+			return 0, fmt.Errorf("reattach preassigned reservation: %w", err)
+		}
+		h.mu.Lock()
+		h.allocatableNowMem = granted
+		h.mu.Unlock()
+		h.opts.Logf("controller reattach: initial_alloc=%d", granted)
+		return granted, nil
 	}
 	floorCPU := h.cfg.Resources.Allocatable.CPU
 	res, err := h.client.Admit(resource.AdmitParams{
@@ -226,6 +239,9 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 		// rather than returning Queued). Any other status is a server
 		// protocol violation.
 		return 0, fmt.Errorf("admit returned unexpected status %q", res.Status)
+	}
+	if err := validateGrant(res.GrantedInitialAlloc); err != nil {
+		return 0, fmt.Errorf("admit returned invalid grant: %w", err)
 	}
 	h.mu.Lock()
 	h.allocatableNowMem = res.GrantedInitialAlloc
