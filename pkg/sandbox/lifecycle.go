@@ -451,7 +451,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 			go func() {
 				select {
 				case <-pc.Launch.HelloDone():
-					pc.Pinger.Start(pc.Ctx)
+					pc.Pinger.Start(pc.RuntimeCtx)
 				case <-pc.Ctx.Done():
 					return
 				}
@@ -461,13 +461,13 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 						pc.Logf("settled: %v", err)
 					}
 					if pc.Balloon != nil {
-						if err := pc.Balloon.Start(pc.Ctx); err != nil {
+						if err := pc.Balloon.Start(pc.RuntimeCtx); err != nil {
 							pc.Logf("balloon: start: %v", err)
 						}
 					}
 					if pc.Hooks.Enabled() {
-						pc.Hooks.StartHeartbeat(pc.Ctx, 5*time.Second)
-						pc.Hooks.StartSensor(pc.Ctx, 64<<20)
+						pc.Hooks.StartHeartbeat(pc.RuntimeCtx, 5*time.Second)
+						pc.Hooks.StartSensor(pc.RuntimeCtx, 64<<20)
 					}
 				case <-pc.Ctx.Done():
 				}
@@ -515,6 +515,7 @@ func waitForCHWithSignalEscalation(
 	chRespDeadline time.Duration,
 	grace time.Duration,
 	logf func(format string, args ...any),
+	onShutdown func(),
 ) error {
 	var killTimer *time.Timer
 	var killCh <-chan time.Time
@@ -523,6 +524,9 @@ func waitForCHWithSignalEscalation(
 		select {
 		case sig := <-sigCh:
 			if !shutdownInitiated {
+				if onShutdown != nil {
+					onShutdown()
+				}
 				usedAPI := false
 				if chSock != "" {
 					if err := (chapi.Client{Sock: chSock, RespDeadline: chRespDeadline}).ShutdownVMM(); err == nil {

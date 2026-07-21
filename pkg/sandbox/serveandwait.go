@@ -62,7 +62,8 @@ type CmdEnv struct {
 //     EstablishMUX → guestlink.Pinger.Start → Balloon.Start → Hooks.SettledRestore;
 //     a non-nil return aborts the run (ServeAndWait kills CH).
 type PostSpawnCtx struct {
-	Ctx          context.Context
+	Ctx          context.Context // settle handshake; canceled on runtime shutdown
+	RuntimeCtx   context.Context // remains live until CH exits and backends stop
 	Cmd          *exec.Cmd
 	Pinger       *guestlink.Pinger
 	Launch       *guestlink.LaunchServer
@@ -548,8 +549,29 @@ func ServeAndWait(p VMParams) (int, error) {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 	})
 
-	if err := p.PostSpawn(PostSpawnCtx{
-		Ctx:          backendCtx,
+	settleCtx, cancelSettle := context.WithCancel(backendCtx)
+	defer cancelSettle()
+	doneCh := make(chan error, 1)
+	go func() { doneCh <- cmd.Wait() }()
+	shutdownStarted := make(chan struct{})
+	var shutdownOnce sync.Once
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- waitForCHWithSignalEscalation(
+			doneCh, sigCh, cmd.Process, chPid, chSock, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf,
+			func() {
+				shutdownOnce.Do(func() {
+					close(shutdownStarted)
+					cancelSettle()
+				})
+			},
+		)
+		cancelSettle()
+	}()
+
+	postSpawnErr := p.PostSpawn(PostSpawnCtx{
+		Ctx:          settleCtx,
+		RuntimeCtx:   backendCtx,
 		Cmd:          cmd,
 		Pinger:       pinger,
 		Launch:       launch,
@@ -558,17 +580,27 @@ func ServeAndWait(p VMParams) (int, error) {
 		Balloon:      p.Balloon,
 		CHSock:       chSock,
 		Logf:         logf,
-	}); err != nil {
-		_ = cmd.Process.Kill()
-		cancelBackends()
-		backendWG.Wait()
-		return -1, err
+	})
+	if postSpawnErr != nil {
+		select {
+		case <-shutdownStarted:
+			// The signal path owns CH shutdown. Keep every backend alive until
+			// the ordered vmm.shutdown/SIGKILL sequence has completed.
+		default:
+			select {
+			case <-waitDone:
+				// CH exited while settling; it is already reaped.
+			default:
+				_ = cmd.Process.Kill()
+				<-waitDone
+			}
+			cancelBackends()
+			backendWG.Wait()
+			return -1, postSpawnErr
+		}
 	}
 
-	doneCh := make(chan error, 1)
-	go func() { doneCh <- cmd.Wait() }()
-
-	waitErr := waitForCHWithSignalEscalation(doneCh, sigCh, cmd.Process, chPid, chSock, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf)
+	waitErr := <-waitDone
 	cancelBackends()
 	backendWG.Wait()
 	exit := 0

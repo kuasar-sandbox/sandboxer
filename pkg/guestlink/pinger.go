@@ -279,12 +279,18 @@ func SendQuiesce(client *HostClient) error {
 // instance-specific secrets / config that were never baked into the golden
 // snapshot. nil → no per-instance file injection.
 func OpenMUXViaRestore(client *HostClient, epoch uint32, network *proto.NetworkSpec, files []proto.FileSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+	return OpenMUXViaRestoreContext(context.Background(), client, epoch, network, files, deadline)
+}
+
+// OpenMUXViaRestoreContext makes the restore handshake interruptible without
+// binding the returned long-lived MUX connection to the setup context.
+func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, files []proto.FileSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
 	// WallclockNs lets the guest jump CLOCK_REALTIME forward by the
 	// dormant interval (CH reloads the snapshot's stale clock verbatim).
 	// Captured here, as close to the send as possible; the residual
 	// host→guest propagation skew is sub-ms (kernel-microsecond dial,
 	// the guest's reverse-channel listener survived the snapshot).
-	return openMUX(client, &proto.Message{
+	return openMUXContext(ctx, client, &proto.Message{
 		Type:        proto.TypeRestore,
 		Epoch:       epoch,
 		WallclockNs: time.Now().UnixNano(),
@@ -313,17 +319,29 @@ func OpenMUXViaExec(client *HostClient, spec *proto.ExecSpec, deadline time.Dura
 }
 
 func openMUX(client *HostClient, req *proto.Message, wantAck string, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
-	conn, err := client.DialRaw(deadline)
+	return openMUXContext(context.Background(), client, req, wantAck, deadline)
+}
+
+func openMUXContext(ctx context.Context, client *HostClient, req *proto.Message, wantAck string, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+	conn, err := client.DialRawContext(ctx, deadline)
 	if err != nil {
 		return nil, proto.StdioSpec{}, err
 	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 	if err := proto.WriteMessage(conn, req); err != nil {
 		_ = conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, proto.StdioSpec{}, ctxErr
+		}
 		return nil, proto.StdioSpec{}, fmt.Errorf("write %s: %w", req.Type, err)
 	}
 	resp, err := proto.ReadMessage(conn)
 	if err != nil {
 		_ = conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, proto.StdioSpec{}, ctxErr
+		}
 		return nil, proto.StdioSpec{}, fmt.Errorf("read %s: %w", wantAck, err)
 	}
 	if resp.Type != wantAck {
@@ -332,6 +350,14 @@ func openMUX(client *HostClient, req *proto.Message, wantAck string, deadline ti
 	}
 	// Hand-off: the MUX session manages its own per-frame timing.
 	_ = conn.SetDeadline(time.Time{})
+	if !stopCancel() {
+		_ = conn.Close()
+		return nil, proto.StdioSpec{}, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, proto.StdioSpec{}, err
+	}
 	var spec proto.StdioSpec
 	if resp.Stdio != nil {
 		spec = *resp.Stdio

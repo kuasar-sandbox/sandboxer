@@ -1,6 +1,7 @@
 package guestlink
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -87,15 +88,24 @@ func (c *HostClient) RoundTrip(req *proto.Message, deadline time.Duration) (*pro
 // and may keep the conn open (e.g. wrap it in a mux.Session). On any
 // error the conn is closed.
 func (c *HostClient) DialRaw(deadline time.Duration) (net.Conn, error) {
+	return c.DialRawContext(context.Background(), deadline)
+}
+
+// DialRawContext is DialRaw with cancellation covering the Unix dial and
+// Cloud Hypervisor CONNECT preface. Cancellation stops only this handshake;
+// a successfully returned connection is owned by the caller.
+func (c *HostClient) DialRawContext(ctx context.Context, deadline time.Duration) (net.Conn, error) {
 	end := time.Now().Add(deadline)
 	remaining := time.Until(end)
 	if remaining <= 0 {
 		return nil, fmt.Errorf("launchclient: deadline already exceeded")
 	}
-	conn, err := net.DialTimeout("unix", c.BasePath, remaining)
+	conn, err := (&net.Dialer{Timeout: remaining}).DialContext(ctx, "unix", c.BasePath)
 	if err != nil {
 		return nil, fmt.Errorf("launchclient: dial %s: %w", c.BasePath, err)
 	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 	if err := conn.SetDeadline(end); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("launchclient: set deadline: %w", err)
@@ -106,7 +116,21 @@ func (c *HostClient) DialRaw(deadline time.Duration) (net.Conn, error) {
 	}
 	if err := drainLine(conn); err != nil {
 		_ = conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("launchclient: drain OK line: %w", err)
+	}
+	// Removing the callback is the hand-off point. If cancellation already
+	// won, wait for its close by closing again and report the context error
+	// instead of returning a connection that may be closing concurrently.
+	if !stopCancel() {
+		_ = conn.Close()
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 	return conn, nil
 }

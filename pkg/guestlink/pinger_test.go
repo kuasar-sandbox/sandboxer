@@ -2,6 +2,7 @@ package guestlink
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"path/filepath"
@@ -231,6 +232,35 @@ func TestOpenMUXViaRestore(t *testing.T) {
 	defer conn.Close()
 	if spec.TTY || !spec.Stdout || !spec.Stderr {
 		t.Errorf("restore_ack stdio mismatch: %+v", spec)
+	}
+}
+
+func TestOpenMUXViaRestoreContextCancellationClosesHandshake(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+	requestRead := make(chan struct{})
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		_, _ = proto.ReadMessage(c)
+		close(requestRead)
+		_, _ = io.Copy(io.Discard, c)
+	})
+	defer proxy.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := OpenMUXViaRestoreContext(ctx, &HostClient{BasePath: base}, 3, nil, nil, time.Hour)
+		done <- err
+	}()
+	<-requestRead
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("restore handshake cancellation = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("restore handshake ignored context cancellation")
 	}
 }
 

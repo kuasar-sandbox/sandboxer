@@ -594,7 +594,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			if restoreDeadline <= 0 {
 				restoreDeadline = config.NoForcedTimeout
 			}
-			muxConn, muxSpec, err := guestlink.OpenMUXViaRestore(pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline)
+			muxConn, muxSpec, err := guestlink.OpenMUXViaRestoreContext(
+				pc.Ctx, pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline,
+			)
 			if err != nil {
 				return fmt.Errorf("notify restore: %w (guest agent unreachable)", err)
 			}
@@ -603,11 +605,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			}
 			pc.Logf("restore notify acked in %dµs (stdio MUX re-established: tty=%v); starting ping ticker",
 				time.Since(tRestore).Microseconds(), muxSpec.TTY)
-			pc.Pinger.Start(pc.Ctx)
+			pc.Pinger.Start(pc.RuntimeCtx)
 			// Balloon reconcile: idempotent — if initialAlloc ==
 			// allocAtSnap, target matches what CH loaded from state.json.
 			if pc.Balloon != nil {
-				if err := pc.Balloon.Start(pc.Ctx); err != nil {
+				if err := pc.Balloon.Start(pc.RuntimeCtx); err != nil {
 					pc.Logf("balloon: start: %v", err)
 				}
 			}
@@ -621,8 +623,8 @@ func Run(ctx context.Context, opts Options) (int, error) {
 					pc.Logf("settled-restore: %v (continuing)", err)
 				}
 				if pc.Hooks.Enabled() {
-					pc.Hooks.StartHeartbeat(pc.Ctx, 5*time.Second)
-					pc.Hooks.StartSensor(pc.Ctx, 64<<20)
+					pc.Hooks.StartHeartbeat(pc.RuntimeCtx, 5*time.Second)
+					pc.Hooks.StartSensor(pc.RuntimeCtx, 64<<20)
 				}
 			}
 			return nil
