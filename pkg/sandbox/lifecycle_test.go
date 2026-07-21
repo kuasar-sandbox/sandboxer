@@ -3,7 +3,9 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -184,6 +186,65 @@ func TestWaitForCH_DoubleSIGTERM_EscalatesImmediately(t *testing.T) {
 	}
 	if elapsed > 1*time.Second {
 		t.Fatalf("immediate escalation took too long: %v", elapsed)
+	}
+}
+
+func TestWaitForCH_HungShutdownAPIDoesNotExtendGrace(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "ch.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	requestSeen := make(chan struct{})
+	releaseServer := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4096)
+		if _, err := conn.Read(buf); err != nil {
+			serverDone <- err
+			return
+		}
+		close(requestSeen)
+		<-releaseServer
+		serverDone <- nil
+	}()
+
+	doneCh := make(chan error, 1)
+	sigCh := make(chan os.Signal, 1)
+	proc := &fakeSignaler{}
+	grace := 100 * time.Millisecond
+	go func() {
+		for proc.sentCount(syscall.SIGKILL) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		doneCh <- &exitErrStub{code: -1}
+	}()
+
+	t0 := time.Now()
+	sigCh <- syscall.SIGTERM
+	_ = waitForCHWithSignalEscalation(doneCh, sigCh, proc, 1234, sock, 0, grace, discardLogf, nil)
+	elapsed := time.Since(t0)
+	select {
+	case <-requestSeen:
+	default:
+		t.Fatal("vmm.shutdown request was not sent")
+	}
+	if proc.sentCount(syscall.SIGKILL) != 1 {
+		t.Fatalf("hung shutdown API did not trigger one SIGKILL: %v", proc.sent)
+	}
+	if elapsed < grace || elapsed > grace+500*time.Millisecond {
+		t.Fatalf("hung shutdown API escalation took %v, want %v..%v", elapsed, grace, grace+500*time.Millisecond)
+	}
+	close(releaseServer)
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
 	}
 }
 

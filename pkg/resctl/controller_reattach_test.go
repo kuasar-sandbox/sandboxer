@@ -1,6 +1,8 @@
 package resctl
 
 import (
+	"context"
+	"errors"
 	"net"
 	"path/filepath"
 	"testing"
@@ -128,7 +130,7 @@ func TestReattachRejectsMissingAllocatableGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer hooks.client.Close()
-	if _, err := hooks.Admit("sandbox-1", 0); err == nil {
+	if _, err := hooks.Admit(context.Background(), "sandbox-1", 0); err == nil {
 		t.Fatalf("missing grant error = %v", err)
 	}
 	if err := <-serverErr; err != nil {
@@ -175,7 +177,7 @@ func TestAdmitReattachesPreassignedReservation(t *testing.T) {
 	}
 	defer hooks.client.Close()
 
-	granted, err := hooks.Admit("sandbox-1", 0)
+	granted, err := hooks.Admit(context.Background(), "sandbox-1", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +229,7 @@ func TestReattachRejectsGrantBelowStartupBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer hooks.client.Close()
-	if _, err := hooks.Admit("sandbox-1", 0); err == nil {
+	if _, err := hooks.Admit(context.Background(), "sandbox-1", 0); err == nil {
 		t.Fatal("reattach accepted a grant below the startup budget")
 	}
 	if err := <-serverErr; err != nil {
@@ -268,7 +270,7 @@ func TestReattachAcceptsRestoreFallbackBelowSnapshotAllocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer hooks.client.Close()
-	granted, err := hooks.Admit("sandbox-1", 4<<30)
+	granted, err := hooks.Admit(context.Background(), "sandbox-1", 4<<30)
 	if err != nil || granted != 2<<30 {
 		t.Fatalf("restore fallback grant = %d, %v", granted, err)
 	}
@@ -321,12 +323,91 @@ func TestReleaseReconnectsAfterReattachConnectionFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := hooks.Admit("sandbox-1", 0); err == nil {
+	if _, err := hooks.Admit(context.Background(), "sandbox-1", 0); err == nil {
 		t.Fatal("reattach unexpectedly survived a broken controller connection")
 	}
 	hooks.Release("reattach_failed")
 	req := <-released
 	if req.Type != resource.TypeRelease || req.Token != "reservation-token" || req.Reason != "reattach_failed" {
+		t.Fatalf("fallback release = %+v", req)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPreparedReattachCancellationReleasesReservation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resource.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	reattachSeen := make(chan *resource.Message, 1)
+	released := make(chan *resource.Message, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		first, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		req, err := resource.ReadMessage(first)
+		if err != nil {
+			_ = first.Close()
+			serverErr <- err
+			return
+		}
+		reattachSeen <- req
+		one := make([]byte, 1)
+		_, _ = first.Read(one)
+		_ = first.Close()
+
+		second, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer second.Close()
+		req, err = resource.ReadMessage(second)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		released <- req
+		serverErr <- resource.WriteMessage(second, &resource.Message{Type: resource.TypeAck})
+	}()
+
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: path, ReservationToken: "reservation-token",
+	}, preparedReservationTestConfig(path, "3GiB"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	admitErr := make(chan error, 1)
+	go func() {
+		_, err := hooks.Admit(ctx, "sandbox-1", 0)
+		admitErr <- err
+	}()
+	req := <-reattachSeen
+	if req.Type != resource.TypeReattach || req.Token != "reservation-token" {
+		t.Fatalf("request = %+v, want prepared reattach", req)
+	}
+	cancel()
+	select {
+	case err := <-admitErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled reattach = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("canceled reattach did not return promptly")
+	}
+
+	hooks.Release("reattach_canceled")
+	req = <-released
+	if req.Type != resource.TypeRelease || req.Token != "reservation-token" || req.Reason != "reattach_canceled" {
 		t.Fatalf("fallback release = %+v", req)
 	}
 	if err := <-serverErr; err != nil {

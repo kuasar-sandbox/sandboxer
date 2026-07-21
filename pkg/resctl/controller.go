@@ -168,7 +168,13 @@ func (h *ControllerHooks) AllocatableNowMem() uint64 {
 // least max(yaml.startup, yaml.allocatable). Restores may fall back to the
 // yaml allocatable floor when the controller cannot grant the preferred
 // allocatable_at_snapshot value.
-func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint64, error) {
+func (h *ControllerHooks) Admit(ctx context.Context, sid string, allocatableAtSnapshot uint64) (uint64, error) {
+	if ctx == nil {
+		return 0, errors.New("controller admit context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if !h.Enabled() {
 		// Mode A/B: no admission, return startup (or floor if startup
 		// not configured) so the cold-start cgroup setup works the same.
@@ -204,7 +210,7 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 		return nil
 	}
 	if h.opts.ReservationToken != "" {
-		granted, err := h.client.Reattach(h.opts.ReservationToken, sid)
+		granted, err := h.client.Reattach(ctx, h.opts.ReservationToken, sid)
 		if err != nil {
 			return 0, fmt.Errorf("reattach preassigned reservation: %w", err)
 		}
@@ -218,7 +224,7 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 		return granted, nil
 	}
 	floorCPU := h.cfg.Resources.Allocatable.CPU
-	res, err := h.client.Admit(resource.AdmitParams{
+	res, err := h.client.Admit(ctx, resource.AdmitParams{
 		SandboxID:             sid,
 		CapacityMemoryBytes:   cap,
 		CapacityCPU:           h.cfg.Resources.Capacity.CPU,

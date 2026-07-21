@@ -356,7 +356,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		// Dynamic mode: controller decides. Floor sent = yaml.allocatable
 		// (controller's 2-tier fallback uses it if headroom can't fit
 		// allocAtSnap).
-		granted, err := hooks.Admit(opts.SandboxID, allocAtSnap)
+		granted, err := hooks.Admit(ctx, opts.SandboxID, allocAtSnap)
 		if err != nil {
 			return -1, fmt.Errorf("controller admit: %w", err)
 		}

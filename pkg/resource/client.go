@@ -1,6 +1,7 @@
 package resource
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -78,22 +79,64 @@ func (c *Client) OwnPreparedReservation(token string) error {
 // roundTrip writes req and reads exactly one reply. Holds the mutex
 // for the duration. Caller must avoid concurrent calls.
 func (c *Client) roundTrip(req *Message, deadline time.Duration) (*Message, error) {
+	return c.roundTripContext(context.Background(), req, deadline)
+}
+
+// roundTripContext interrupts an in-flight request when ctx is canceled. The
+// connection cannot be reused after that interruption because a delayed reply
+// could otherwise be mistaken for the next request's response.
+func (c *Client) roundTripContext(ctx context.Context, req *Message, deadline time.Duration) (*Message, error) {
+	if ctx == nil {
+		return nil, errors.New("client: nil request context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn == nil {
 		return nil, errors.New("client: not connected")
 	}
+	conn := c.conn
 	if deadline > 0 {
-		_ = c.conn.SetDeadline(time.Now().Add(deadline))
+		_ = conn.SetDeadline(time.Now().Add(deadline))
 	}
-	if err := WriteMessage(c.conn, req); err != nil {
+	watchDone := make(chan struct{})
+	stopWatch := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(watchDone)
+	})
+	watchStopped := false
+	stopContextWatch := func() {
+		if watchStopped {
+			return
+		}
+		watchStopped = true
+		if !stopWatch() {
+			<-watchDone
+		}
+	}
+	defer stopContextWatch()
+	if err := WriteMessage(conn, req); err != nil {
+		stopContextWatch()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = conn.Close()
+			c.conn = nil
+			return nil, ctxErr
+		}
 		return nil, err
 	}
-	resp, err := ReadMessage(c.conn)
+	resp, err := ReadMessage(conn)
+	stopContextWatch()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		_ = conn.Close()
+		c.conn = nil
+		return nil, ctxErr
+	}
 	if err != nil {
 		return nil, err
 	}
-	_ = c.conn.SetDeadline(time.Time{})
+	_ = conn.SetDeadline(time.Time{})
 	if resp.Type == TypeError {
 		return resp, fmt.Errorf("controller: %s", resp.Msg)
 	}
@@ -141,8 +184,8 @@ type AdmitResult struct {
 // no longer a Queued path — the controller blocks the connection while
 // the admission worker holds it in the server-side FIFO queue, so the
 // Admit call simply takes as long as queuing takes.
-func (c *Client) Admit(p AdmitParams) (*AdmitResult, error) {
-	resp, err := c.roundTrip(&Message{
+func (c *Client) Admit(ctx context.Context, p AdmitParams) (*AdmitResult, error) {
+	resp, err := c.roundTripContext(ctx, &Message{
 		Type:                  TypeAdmit,
 		SandboxID:             p.SandboxID,
 		CapacityMemoryBytes:   p.CapacityMemoryBytes,
@@ -178,7 +221,7 @@ func (c *Client) Admit(p AdmitParams) (*AdmitResult, error) {
 // reservation's current allocatable-memory grant. Cluster launches use this
 // path after node-ctl has already performed durable Admission; they must not
 // submit a second Admit request from sandbox-ctl.
-func (c *Client) Reattach(token, sandboxID string) (uint64, error) {
+func (c *Client) Reattach(ctx context.Context, token, sandboxID string) (uint64, error) {
 	if token == "" {
 		return 0, errors.New("client: reattach token is empty")
 	}
@@ -191,7 +234,7 @@ func (c *Client) Reattach(token, sandboxID string) (uint64, error) {
 	if owned != "" && owned != token {
 		return 0, errors.New("client: reattach token does not match the owned reservation")
 	}
-	resp, err := c.roundTrip(&Message{Type: TypeReattach, Token: token, SandboxID: sandboxID}, DeadlineAdmit)
+	resp, err := c.roundTripContext(ctx, &Message{Type: TypeReattach, Token: token, SandboxID: sandboxID}, DeadlineAdmit)
 	if err != nil {
 		return 0, err
 	}
