@@ -61,6 +61,10 @@ type SandboxConfig struct {
 	// in production.
 	Timeouts TimeoutsConfig `yaml:"timeouts,omitempty"`
 
+	// Restore carries policy for this host restore invocation. It is not part
+	// of snapshot.cfg and is never inherited from the snapshot being restored.
+	Restore RestoreConfig `yaml:"restore,omitempty"`
+
 	// Mounts / Files / Init drive guest environment setup (applied before
 	// the app is forked). See docs/sandbox.md §3.1.
 	Mounts []MountConfig `yaml:"mounts,omitempty"`
@@ -85,6 +89,40 @@ type SandboxConfig struct {
 	// (from_refs / overlay.base_from_refs; see docs/sandbox.md §3.5). Zero
 	// value on cold start ⇒ empty chains. Not part of the YAML schema.
 	SnapshotProvenance SnapshotProvenance `yaml:"-"`
+}
+
+// PrefetchMode selects whether restore requests a best-effort remote snapshot
+// cache warm-up. The empty configuration value has the same semantics as off.
+type PrefetchMode string
+
+const (
+	PrefetchOff    PrefetchMode = "off"
+	PrefetchMemory PrefetchMode = "memory"
+)
+
+// RestoreConfig contains host-only policy for one restore invocation.
+// Prefetch is a string at the YAML boundary so invalid input survives parsing
+// and can be rejected with a field-specific validation error.
+type RestoreConfig struct {
+	Prefetch string `yaml:"prefetch,omitempty"`
+}
+
+// ParsePrefetchMode validates the public restore.prefetch spelling and returns
+// its normalized mode. Empty means the default, off.
+func ParsePrefetchMode(s string) (PrefetchMode, error) {
+	switch PrefetchMode(s) {
+	case "", PrefetchOff:
+		return PrefetchOff, nil
+	case PrefetchMemory:
+		return PrefetchMemory, nil
+	default:
+		return "", fmt.Errorf("restore.prefetch %q invalid (want off|memory)", s)
+	}
+}
+
+func (c RestoreConfig) validate() error {
+	_, err := ParsePrefetchMode(c.Prefetch)
+	return err
 }
 
 // SnapshotRefs holds the precomputed `file://<basename>@sha256:<digest>`
@@ -929,6 +967,9 @@ func (c *SandboxConfig) DiffSizeBytes() (int64, error) {
 //   - Startup.memory ∈ [allocatable.memory, capacity.memory]
 //   - WatermarkHigh.memory ∈ (0, allocatable.memory]
 func (c *SandboxConfig) ValidateCold() error {
+	if err := c.Restore.validate(); err != nil {
+		return err
+	}
 	if c.Resources.Capacity.CPU <= 0 {
 		return errors.New("resources.capacity.cpu must be > 0")
 	}
@@ -1153,6 +1194,9 @@ func (c *SandboxConfig) ValidateCold() error {
 // --mode restore`: cold-only fields (kernel, launch, mounts, ...) are not
 // required here.
 func (c *SandboxConfig) ValidateRestoreHostConfig() error {
+	if err := c.Restore.validate(); err != nil {
+		return err
+	}
 	if (c.Network.TAP == "") == (c.Network.TapFD == nil) {
 		return errors.New("network: exactly one of `tap` or `tapfd` is required")
 	}

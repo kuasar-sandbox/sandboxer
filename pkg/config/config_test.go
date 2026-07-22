@@ -253,6 +253,81 @@ func TestTimeouts_Validate(t *testing.T) {
 	}
 }
 
+func TestParsePrefetchMode(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  PrefetchMode
+	}{
+		{"", PrefetchOff},
+		{"off", PrefetchOff},
+		{"memory", PrefetchMemory},
+	} {
+		got, err := ParsePrefetchMode(tc.input)
+		if err != nil {
+			t.Errorf("ParsePrefetchMode(%q): %v", tc.input, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("ParsePrefetchMode(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+
+	if _, err := ParsePrefetchMode("disk"); err == nil || !strings.Contains(err.Error(), "restore.prefetch") {
+		t.Fatalf("ParsePrefetchMode(disk) error = %v, want restore.prefetch validation error", err)
+	}
+	if _, err := ParsePrefetchMode(" memory "); err == nil {
+		t.Fatal("ParsePrefetchMode must accept only the literal memory value")
+	}
+}
+
+func TestRestorePrefetchValidation(t *testing.T) {
+	cfg, err := Load(writeYAML(t, minimalCold+"\nrestore:\n  prefetch: memory\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Restore.Prefetch != "memory" {
+		t.Fatalf("restore.prefetch = %q, want memory", cfg.Restore.Prefetch)
+	}
+	if err := cfg.ValidateCold(); err != nil {
+		t.Fatalf("ValidateCold(memory): %v", err)
+	}
+	if err := cfg.ValidateRestoreHostConfig(); err != nil {
+		t.Fatalf("ValidateRestoreHostConfig(memory): %v", err)
+	}
+
+	cfg.Restore.Prefetch = "disk"
+	for name, validate := range map[string]func() error{
+		"cold":    cfg.ValidateCold,
+		"restore": cfg.ValidateRestoreHostConfig,
+	} {
+		if err := validate(); err == nil || !strings.Contains(err.Error(), "restore.prefetch") {
+			t.Errorf("%s validation error = %v, want restore.prefetch error", name, err)
+		}
+	}
+}
+
+func TestRestorePrefetchMergedOverride(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.yaml")
+	over := filepath.Join(dir, "over.yaml")
+	if err := os.WriteFile(base, []byte(minimalCold+"\nrestore:\n  prefetch: memory\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(over, []byte("restore:\n  prefetch: off\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadMerged([]string{base, over})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Restore.Prefetch != "off" {
+		t.Fatalf("restore.prefetch = %q, want later file to override with off", cfg.Restore.Prefetch)
+	}
+	if err := cfg.ValidateRestoreHostConfig(); err != nil {
+		t.Fatalf("ValidateRestoreHostConfig(off): %v", err)
+	}
+}
+
 func TestValidateCold_MissingFields(t *testing.T) {
 	cases := []struct {
 		name      string

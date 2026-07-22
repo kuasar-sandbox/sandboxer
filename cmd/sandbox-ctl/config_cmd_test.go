@@ -25,6 +25,8 @@ files:
   - { path: /etc/x }
 init:
   - { exec: /bin/true }
+restore:
+  prefetch: memory
 `
 	out, err := restoreFilter([]byte(in))
 	if err != nil {
@@ -36,9 +38,18 @@ init:
 			t.Errorf("restore filter should have dropped %q; output:\n%s", dropped, got)
 		}
 	}
-	for _, kept := range []string{"runtime:", "tap0", "diff_template", "capacity"} {
+	for _, kept := range []string{"runtime:", "tap0", "diff_template", "capacity", "prefetch: memory"} {
 		if !strings.Contains(got, kept) {
 			t.Errorf("restore filter should have kept %q; output:\n%s", kept, got)
 		}
+	}
+}
+
+func TestRestoreSkeletonKeepsPrefetchDisabled(t *testing.T) {
+	if rc := strictCheckBytes([]byte(skeletonRestore), "restore"); rc != 0 {
+		t.Fatalf("restore skeleton strict check returned %d", rc)
+	}
+	if !strings.Contains(skeletonRestore, "prefetch: off") {
+		t.Fatalf("restore skeleton must expose disabled-by-default prefetch policy")
 	}
 }
