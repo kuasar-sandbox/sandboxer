@@ -245,6 +245,8 @@ launch:
 // skeletonRestore is the restore host-yaml template (sandbox-ctl run --restore).
 const skeletonRestore = `# restore host yaml — sandbox-ctl run --restore <ref> --config <this>
 # Cold-only fields (kernel, launch, mounts, ...) are intentionally absent.
+restore:
+  prefetch: off                            # off (default) | memory (remote memory snapshot only)
 resources:
   capacity: { cpu: 2, memory: 8GiB }       # must equal the snapshot.cfg capacity
 network:

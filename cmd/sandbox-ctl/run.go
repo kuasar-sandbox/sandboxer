@@ -268,6 +268,14 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 	ref string, fileRefs restore.FileRefPolicy, sandboxID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec,
 ) int {
+	// Validate host-only restore policy before inspecting the remote reference or
+	// constructing a Fetcher. restore.Run repeats this at its public boundary,
+	// but the CLI owns NewFetcher and must not dial for an invalid config.
+	if _, err := config.ParsePrefetchMode(cfg.Restore.Prefetch); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+
 	const manifestPrefix = "manifest://"
 	var (
 		snapshotPath string

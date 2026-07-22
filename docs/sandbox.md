@@ -165,7 +165,8 @@ sandbox-ctl run [flags]
                           manifest://<hex>)读 snapshot.cfg + 内存内容启动。
                           <ref> = 本地文件路径或 manifest://<hex>。不带此 flag
                           = 冷启动模式。restore 模式下 sandbox.yaml 字段语义
-                          见 §11.0
+                          见 §11.0.远程内存预取由 sandbox.yaml 的
+                          restore.prefetch 显式控制,不增加 CLI flag(§7.1)
   --restore-file-refs verify|trust
                           本地 file:// runtime/base ref 的校验策略。verify(默认)
                           重算文件 SHA256 并比对 snapshot.cfg;trust 只校验协议、
@@ -530,6 +531,11 @@ launch:
       user: "0:0"               # 可选
       restart: always           # never|on-failure|always;省略 → always(伴生进程默认常驻)
 
+# 本次 host restore 的机会式优化策略,不写入 snapshot.cfg.默认关闭;
+# 仅为经过工作集评估的特定 sandbox 显式改为 memory(§7.1).冷启动忽略此策略.
+restore:
+  prefetch: off                 # off(默认) | memory(仅远程内存 snapshot)
+
 # host 侧恢复/生命周期超时;guest/远程耦合项默认 0 = 不强制(host 等待 guest/懒加载所需的
 # 任意时长,dial/connect 探测仍有界),便于慢速/降级环境:慢的远程仓库/缓存、或调试器暂停都不会
 # 误中止一个仍在健康推进的 restore。生产环境按 examples/timeouts-production.yaml 设正值快速失败。
@@ -674,6 +680,7 @@ sandbox-init 以 flush-and-replace 重配网卡(克隆取新 L3 身份,见 §11.
 | `boot.root.diff_template`(单盘) | ✓ (only) | ✗ | 单盘根盘的预格式化 ext4 模板;与 overlay.* 互斥 |
 | `boot.root.base_from_refs`(单盘) | ✓ | ✓ | 单盘快照链(snapshot.cfg 自动填,§3.5) |
 | `run --restore=<ref>` | ✓ | ✓ | `<sid>.snapshot` 文件路径 / manifest://<key> |
+| `restore.prefetch: memory` | skipped | ✓ | 默认 `off`;仅当前远程内存顶层且 direct ref 为单 key 时执行,§7.1 |
 | `run --restore-file-refs=verify\|trust` | ✓ | – | restore 时本地 `file://` runtime/base 引用的内容校验策略;默认 verify |
 
 ### 3.3 flattened image 内嵌 config.json
@@ -825,6 +832,20 @@ CoW diff,只有写过的块是数据。
 报错而非部分恢复。**远程链**不做通用折叠(compaction):`manifest://` 链能长到多深
 就多深,深链恢复时每次缺页逐层查空洞(纯内存,无 RPC)直到命中层发一次取数;浅链
 (典型 s1→s3)无感,长链自行承担读放大。平台若在意代次深度,自行控制再保存的次数。
+
+#### 活动工作集提示与远程顶层 Prefetch
+
+增量内存顶层还提供一个机会式的工作集提示:从父快照恢复时使用全新的稀疏 memfd,
+本次运行中被 UFFD 换入或被 guest 写入,并在再次 snapshot 时仍驻留的页才出现在新
+顶层;未触碰的页继续是 Hole 并穿透到 `from_refs`.因此 "S1 基线 → 恢复 S1 → 运行
+代表性业务窗口 → 保存 S2" 得到的 S2 顶层,通常比完整逻辑内存小,并近似表达该窗口
+激活的内存集合.它不记录访问频率或先后顺序,也不保证代表未来请求.
+
+`restore.prefetch: memory` 可在恢复远程 S2 时机会式温热**当前内存顶层**的 cache.
+多层快照的顶层经过上述筛选,是主要价值场景;`from_refs` 为空的远程单层快照在用户
+显式启用后也允许 Prefetch,但其候选是全部已保存 resident memory,不宣称为活动
+工作集.父内存层,root/data disk 和本地快照始终不在选择范围内.完整资格,执行
+边界和验证方法见 §7.1.
 
 #### 本地层不变量(至多一层、且在顶层)
 
@@ -1288,10 +1309,13 @@ va_report → uffd_C 就绪);区别:
 4. config.json 内捕获了原 run 的 paths(uffd_socket / blk0.sock / blk1.sock /
    vsock.sock),restore 前必须**重写为本次 run 的 paths**(基于 host
    `<run-dir>`)
+5. `restore.prefetch: memory` 可为远程内存顶层启动机会式后台 Prefetch(§7.1);
+   它不改变 snapshotReader,UFFD demand 或恢复正确性
 
 ```
-T0  sandbox-ctl run --restore <ref> --config sandbox.yaml [--run-root <dir>] ...
-T1  解析 host sandbox.yaml(本地化字段:network、overlay.diff、cgroup/控制器等)
+T0  sandbox-ctl run --restore <ref> --config sandbox.yaml [--run-root <dir>] ...;
+    解析 restore.prefetch,非法值在 cgroup/目录/远程读取等副作用前失败
+T1  解析其余 host sandbox.yaml(本地化字段:network,overlay.diff,cgroup/控制器等)
 T2  打开 <ref>:
     file path: os.Open + Stat → ReaderAt
     manifest://: 通过 store + cache 客户端取 manifest → 解封 → fetch.Fetcher 包成 ReaderAt
@@ -1317,6 +1341,8 @@ T8  state.json 直接写到 <run-dir>/<sid>/snap-state/
     本次 <run-dir>/<sid>/ 下的对应名)
 T9  memory 准备:同冷启动 §5.1 T6,**唯一差别** snapshotReader =
     StreamSnapshotSource(包裹 [本快照内存段] ++ from_refs 叠成的分层流)。
+    最终 memory source 构造成功后,若满足 §7.1 资格则异步 Prefetch 当前
+    selfStream;不等待其完成,继续后续磁盘与 VM 恢复准备.
     blk0 / blk1 base 同理:overlay.base 与 base_from_refs 叠成分层只读基座,
     其上新建本次 blk1.diff(CoW)。provenance(父 ref + 两条链)前向传给本运行
     进程,供其将来再保存时算链(T5)
@@ -1356,6 +1382,86 @@ T15 vsock 连接发 restore{epoch=N, wallclock_ns} 给 sandbox-init(guest:5000 l
 T16 vCPU 跑,fault 流转见 §8 uffd handler;balloon EVENT_REMOVE 同冷启动
 T17 user app 退出 / 接收外部信号 → 退出流程同冷启动
 ```
+
+### 7.1 远程内存顶层 Prefetch
+
+Prefetch 是默认关闭的 cache warm-up 策略,不是恢复前置条件.只有字面值
+`restore.prefetch: memory` 才提出请求;空值和 `off` 都关闭.其他值是配置错误,
+必须在 `restore.Run` 产生 cgroup,目录或远程读取等副作用前拒绝.该字段属于本次
+host restore policy,不写入或继承自 `snapshot.cfg`;冷启动不执行 Prefetch.默认
+示例保持 `off`,需要启用时可把
+[`examples/restore-prefetch-memory.yaml`](../examples/restore-prefetch-memory.yaml)
+仅合并到目标 sandbox 的恢复配置中.
+
+启动资格为:
+
+```text
+restore.prefetch == "memory"
+AND restore input is manifest://
+AND direct snapshot ref resolves to exactly one manifest key
+AND final layered memory source was built successfully
+AND current selfStream implements fetch.Prefetcher
+```
+
+`from_refs` 非空不是门槛.远程单层,单 key 快照显式启用后同样执行;但其候选是
+全部已保存 resident memory.多层快照只预取当前顶层,该层更接近一次代表性业务
+窗口的活动工作集,通常是收益更明确的场景.`manifest://k1:k2` 形式的复合直接引用
+仍可按既有语义恢复,但无法无歧义表达当前快照边界,V1 跳过 Prefetch.
+
+选择直接作用于当前 `selfStream` 和它的单一 manifest key,不对最终 layered Stream
+做无参数 Prefetch.因此 `from_refs` 中的父内存层保持零 Prefetch;root/data disk,
+EROFS,CoW 和本地 `file://` snapshot 也不参与.accelerator 的接口没有 range 参数,
+而 snapshot bundle 的布局是:
+
+```text
+[ RAM-sized sparse memory prefix ][ ZIP trailer: config/state/snapshot.cfg ]
+```
+
+所以 `memory` 实际遍历当前顶层 bundle 的所有可见 Data chunks,包含很小的 ZIP tail,
+并非严格的 `[0, ramSize)`.ZIP entries 在 Prefetch 启动前已按需读取,通常已命中 cache.
+若未来要求严格 RAM 范围,应先扩展 accelerator 的 range Prefetch 契约.
+
+任务在最终内存 source 成功构造后启动 goroutine,立即让恢复主流程继续.它不阻塞
+`/vm.resume` 或 `restore_ack`,可以与磁盘重建,网络准备,CH restore 以及恢复后的
+首批 UFFD demand 重叠.Prefetch 失败采用 fail-open:只结束后台任务并记录日志,
+不取消 restore,不得让 `restore.Run` 返回错误;后续缺页仍通过原有 demand ReadAt
+完成校验,解密和 `UFFDIO_COPY`.不重试,不 pin,不在 sandboxer 增加 chunk 去重,
+singleflight 或独立调度器.
+
+生命周期必须满足:
+
+```text
+restore 退出或失败
+    ↓
+cancel Prefetch context
+    ↓
+wait Prefetch 返回
+    ↓
+Close from_refs / selfStream
+    ↓
+restore.Run 返回;caller 才能 Close shared Fetcher
+```
+
+不能用 "等待超时后遗留 goroutine" 的方式绕过取消.accelerator Stream/Fetcher 与
+Prefetch 不能并发 Close;任务句柄的 `Stop` 必须幂等并完成 cancel + wait.
+
+默认关闭时日志保持安静.显式启用时日志至少表达以下状态;不伪造 accelerator
+接口没有返回的 chunk 数或字节数:
+
+| 状态 | 日志语义 |
+|---|---|
+| 不满足资格 | `skipped reason=local_top\|composite_top_ref\|no_capability` |
+| 开始 | `started mode=memory parent_layers=N` |
+| 正常结束 | `completed duration=...` |
+| 失败降级 | `failed duration=... error=... restore_continues=on_demand` |
+| 生命周期取消 | `canceled duration=...` |
+
+收益只能通过请求级 A/B 验证.两组应固定同一 S1/S2 工件,代表性业务脚本,cache
+初始状态和容量,网络/store 条件及 VM 配置,随机化顺序并重复采样.至少比较首个
+代表性请求 p50/p95/p99,UFFD demand cache hit/miss 与 fetch latency,origin fetch
+次数和传输量,Prefetch 在首个 demand 前完成的比例,并观察 cache 污染及已经开始的
+一个 Prefetch Get 是否放大 demand 尾延迟.`/vm.resume` 和 `restore_ack` 不以
+Prefetch 完成为屏障;单次 benchmark 或 Prefetch 完成日志都不能作为默认开启依据.
 
 CH patched 在 create_ram_region 严格按以下顺序确保 va_report ordering:
 
@@ -1788,6 +1894,7 @@ allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
 |---|---|---|
 | `resources.capacity.{cpu,memory}` | 与 snapshot.cfg 严格相等才允许;不一致拒绝启动(error: "capacity mismatch") | 直接用 snapshot.cfg.resources.capacity |
 | `resources.allocatable.*` | 与冷启动语义相同(host 资源策略) | 沿用冷启动默认(等于 capacity) |
+| `restore.prefetch` | `memory` 在满足 §7.1 资格时异步预取当前远程内存顶层;`off` 显式关闭 | 默认关闭;不从 snapshot.cfg 继承 |
 | `network.{tap\|tapfd}` | 必须(源二选一);tapfd 模式重新交接(docs/tapfd.md §4,幂等)取新 fd,经 `--restore net_fds=[_net0@[4]]` 注入 CH;tap 名模式 CH 按名重开 | error: missing(restore 不能没网络源) |
 | `network.{ip,mtu,nexthop,hostname,interface}` | 经 restore 通知重新下发,guest flush-and-replace 重配(克隆取新 L3 身份);MAC 不变(沿用快照设备状态,故 provider 须用稳定 per-port MAC) | 保留快照网络不变 |
 | `boot.kernel` | 静默忽略(restore 不 boot) | 同 |
@@ -2045,10 +2152,14 @@ snapshot 路径要求 `/vm.pause` 之后内存内容稳定,但 backend worker �
 
 `run --restore=<ref>` 触发。host yaml 先经 `ValidateRestoreHostConfig` 自校验
 (网络源、引用格式等),与 snapshot.cfg 的交叉校验(capacity 相等、runtime/base
-ref 匹配;默认含 digest)随后在 `restore.ApplyRules` 拿到 bundle 时进行。额外:
+ref 匹配;默认含 digest)随后在 `restore.ApplyRules` 拿到 bundle 时进行.
+`restore.prefetch` 还会在 `restore.Run` 入口复用同一个 parser,保证普通
+`run --restore` 即使未预先调用 validator,也会在副作用前拒绝非法值.额外:
 
 | 规则 | 错误消息 |
 |------|---------|
+| `restore.prefetch` 只允许空值,`off`,`memory` | "restore.prefetch <value> invalid (want off\|memory)" |
+| `memory` + 本地 snapshot,复合 direct manifest ref 或无 Prefetcher 能力 | 不作为配置错误;按 §7.1 记录 skipped 并继续正常 restore |
 | sandbox.yaml 提供 `boot.runtime` 时,协议必须与 snapshot.cfg.runtime_ref 一致 | "boot.runtime scheme mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 `boot.root.base` 时,协议必须与 snapshot.cfg.base_ref 一致 | "boot.root.base scheme mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 file:// runtime / base 时,basename(filepath.Base)必须与 snapshot.cfg ref 中 basename 一致 | "<field> basename mismatch with snapshot.cfg" |

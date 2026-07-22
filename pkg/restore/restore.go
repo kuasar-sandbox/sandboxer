@@ -79,6 +79,10 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if opts.HostCfg == nil {
 		return -1, errors.New("restore: HostCfg required")
 	}
+	prefetchMode, err := config.ParsePrefetchMode(opts.HostCfg.Restore.Prefetch)
+	if err != nil {
+		return -1, err
+	}
 	if opts.SandboxID == "" {
 		opts.SandboxID = "rs-default"
 	}
@@ -417,6 +421,10 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, fmt.Errorf("snapshot source: %w", err)
 	}
 	logf("snapshot source: %d memory layer(s)", len(memLayers))
+	prefetch := startMemoryPrefetch(ctx, prefetchMode, opts.SnapshotManifestKey, selfStream, len(memLayers)-1, logf)
+	// Close is a lifetime boundary for fetch.Stream. Register this after every
+	// memory-layer Close defer so cancellation and join always run first.
+	defer prefetch.Stop()
 
 	// Reconstruct each logical disk (root + data disks, in order): layer the
 	// captured base ([top] ++ base_from_refs) into a ro base, build a fresh
