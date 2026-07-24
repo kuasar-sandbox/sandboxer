@@ -16,20 +16,25 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// PageSize must match the granularity uffd was set up with.
-const PageSize = 4096
+const (
+	// PageSize must match the granularity uffd was set up with.
+	PageSize = 4096
 
-// MaxBatchPages caps the number of contiguous pages a single fault
-// event resolves in one UFFDIO_COPY / UFFDIO_ZEROPAGE call. 256 pages
-// = 1 MiB. Hits two goals:
-//  1. Amortize ioctl + per-fault wake overhead across many pages
-//     (typical first-touch workloads page in adjacent VA ranges)
-//  2. Keep the per-worker source buffer at 1 MiB (sync.Pool friendly,
-//     no surprise multi-MiB allocations under fault burst)
-const MaxBatchPages = 256
+	// MaxBatchPages caps the number of contiguous pages a single fault
+	// event resolves in one UFFDIO_COPY / UFFDIO_ZEROPAGE call. 256 pages
+	// = 1 MiB. Hits two goals:
+	//  1. Amortize ioctl + per-fault wake overhead across many pages
+	//     (typical first-touch workloads page in adjacent VA ranges)
+	//  2. Keep the per-worker source buffer at 1 MiB (sync.Pool friendly,
+	//     no surprise multi-MiB allocations under fault burst)
+	MaxBatchPages = 256
 
-// MaxBatchBytes is MaxBatchPages × PageSize.
-const MaxBatchBytes = MaxBatchPages * PageSize
+	// MaxBatchBytes is MaxBatchPages × PageSize.
+	MaxBatchBytes = MaxBatchPages * PageSize
+
+	// MinWorkers is the minimum number of worker goroutines for processing UFFD faults.
+	MinWorkers = 2
+)
 
 // Config gathers everything the handler needs from the caller. Memfd /
 // BackendVA / Size come from pkg/memory.Memfd.
@@ -51,7 +56,11 @@ type Config struct {
 	// start; StreamSnapshotSource for restore.
 	Source SnapshotReader
 
-	// Number of worker goroutines. 0 → runtime.NumCPU(); minimum 2.
+	// Number of worker goroutines for servicing UFFD page faults.
+	// The vCPU count forms an upper bound on fault concurrency, serving as a
+	// reasonable baseline that avoids worker over-provisioning.
+	//
+	// Defaults to runtime.NumCPU() when unset, with a minimum of MinWorkers.
 	NumWorkers int
 
 	// Optional logger; nil → discarded.
@@ -200,12 +209,8 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 	if addrMap == nil {
 		return nil, fmt.Errorf("uffd: AddressMap is nil")
 	}
-	if cfg.NumWorkers <= 0 {
-		cfg.NumWorkers = runtime.NumCPU()
-	}
-	if cfg.NumWorkers < 2 {
-		cfg.NumWorkers = 2
-	}
+
+	cfg.NumWorkers = workerCount(cfg.NumWorkers)
 	logf := cfg.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
@@ -242,6 +247,16 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		readerDone: make(chan struct{}),
 		queue:      queues,
 	}, nil
+}
+
+func workerCount(numWorkers int) int {
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
+	}
+	if numWorkers < MinWorkers {
+		return MinWorkers
+	}
+	return numWorkers
 }
 
 // AddUffd attaches an additional CH-side uffd fd to an already-running
