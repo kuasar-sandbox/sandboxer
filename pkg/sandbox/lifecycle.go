@@ -399,7 +399,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		Balloon:           balloonCtl,
 		Hooks:             hooks,
 
-		TapFile:   tapFile, // nil in tap-name mode; CH inherits it at fd 4
+		TapFile:   tapFile, // nil in tap-name/no-network modes; non-nil tapfd is inherited at fd 4
 		NetMAC:    netMAC,
 		NetnsFile: netnsFile, // non-nil → launch CH inside the tap's netns
 

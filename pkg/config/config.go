@@ -324,13 +324,14 @@ func (c *SandboxConfig) SensorRuntime() (mode string, stallUs, windowUs uint64, 
 	return
 }
 
-// NetworkConfig declares the host-side network source (one of TAP / TapFD)
+// NetworkConfig declares the optional host-side network source (TAP / TapFD)
 // plus the guest-side IP layer config. The IP/Nexthop/MTU/Hostname/Interface
 // fields are propagated to sandbox-init via the launch protocol (and re-applied
 // on restore); sandbox-init applies them via netlink. Replaces the kernel's
 // `ip=...` cmdline + CONFIG_IP_PNP path.
 //
-// Source modes (exactly one, see ValidateCold):
+// Source modes (at most one, see ValidateCold):
+//   - None: no virtio-net device; all guest-side network fields must be empty.
 //   - TAP: a pre-existing host tap; CH opens it by name (dev/e2e, no provider).
 //   - TapFD: tapfd handoff (docs/tapfd.md §3) — sandbox-ctl execs a helper that
 //     hands over a tap queue fd (with virtio-net header) + metadata.
@@ -347,7 +348,7 @@ type NetworkConfig struct {
 	MTU       int    `yaml:"mtu,omitempty"`       // guest iface MTU; 0 → leave kernel default
 	Nexthop   string `yaml:"nexthop,omitempty"`   // default route next-hop; empty → no default route
 	Hostname  string `yaml:"hostname,omitempty"`  // guest hostname (sethostname)
-	Interface string `yaml:"interface,omitempty"` // guest iface name; defaults to "eth0"
+	Interface string `yaml:"interface,omitempty"` // guest iface name; source set + empty → "eth0"
 }
 
 // TapFDConfig configures tapfd-handoff acquisition (docs/tapfd.md §3).
@@ -413,6 +414,41 @@ func (t *TapFDConfig) Validate(field string) error {
 		return fmt.Errorf("%s.request requires socket mode", field)
 	}
 	return nil
+}
+
+func (n NetworkConfig) hasSource() bool {
+	return n.TAP != "" || n.TapFD != nil
+}
+
+func (n NetworkConfig) validate() error {
+	if n.TAP != "" && n.TapFD != nil {
+		return errors.New("network: `tap` and `tapfd` are mutually exclusive")
+	}
+	if err := n.TapFD.Validate("network.tapfd"); err != nil {
+		return err
+	}
+	if n.hasSource() {
+		return nil
+	}
+
+	var field string
+	switch {
+	case n.MAC != "":
+		field = "mac"
+	case n.IP != "":
+		field = "ip"
+	case n.MTU != 0:
+		field = "mtu"
+	case n.Nexthop != "":
+		field = "nexthop"
+	case n.Hostname != "":
+		field = "hostname"
+	case n.Interface != "":
+		field = "interface"
+	default:
+		return nil
+	}
+	return fmt.Errorf("network.%s requires network.tap or network.tapfd", field)
 }
 
 // Effective merges the static network attributes with optional handoff
@@ -715,7 +751,7 @@ func (c *SandboxConfig) ApplyDefaults() {
 	if c.Launch.Workdir == "" {
 		c.Launch.Workdir = "/"
 	}
-	if c.Network.Interface == "" {
+	if c.Network.hasSource() && c.Network.Interface == "" {
 		c.Network.Interface = "eth0"
 	}
 	for i := range c.Mounts {
@@ -1094,10 +1130,7 @@ func (c *SandboxConfig) ValidateCold() error {
 		return err
 	}
 
-	if (c.Network.TAP == "") == (c.Network.TapFD == nil) {
-		return errors.New("network: exactly one of `tap` or `tapfd` is required")
-	}
-	if err := c.Network.TapFD.Validate("network.tapfd"); err != nil {
+	if err := c.Network.validate(); err != nil {
 		return err
 	}
 
@@ -1197,10 +1230,7 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	if err := c.Restore.validate(); err != nil {
 		return err
 	}
-	if (c.Network.TAP == "") == (c.Network.TapFD == nil) {
-		return errors.New("network: exactly one of `tap` or `tapfd` is required")
-	}
-	if err := c.Network.TapFD.Validate("network.tapfd"); err != nil {
+	if err := c.Network.validate(); err != nil {
 		return err
 	}
 	// Capacity is optional in the host yaml (matched against snapshot.cfg);

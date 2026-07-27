@@ -166,10 +166,11 @@ func ParseRef(s string) (Ref, error) {
 // auto-filled from snapshot.cfg (basename interpreted relative to the
 // snapshot bundle's directory).
 //
-// Capacity must match exactly when host provides it. Network must be
-// provided. boot.root.overlay.base in host yaml is silently ignored
-// (always taken from snapshot.cfg). boot.kernel / boot.cmdline /
-// launch.* are silently ignored.
+// Capacity must match exactly when host provides it. Network may be omitted;
+// Run separately verifies that its presence matches the device topology in
+// config.json. boot.root.overlay.base in host yaml is silently ignored (always
+// taken from snapshot.cfg). boot.kernel / boot.cmdline / launch.* are silently
+// ignored.
 //
 // snapshotPath is the local file path of the <sid>.snapshot bundle
 // (used to resolve runtime/base file basenames). Pass empty when the
@@ -203,9 +204,10 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 		out.Resources.Capacity.Memory = snap.Resources.Capacity.Memory
 	}
 
-	// 2. network: exactly one source required (same rule as cold start).
-	if (host.Network.TAP == "") == (host.Network.TapFD == nil) {
-		return nil, errors.New("network: exactly one of `tap` or `tapfd` is required in restore mode")
+	// 2. network: zero or one host source. Run later matches zero/one against
+	// the virtio-net topology captured in config.json.
+	if host.Network.TAP != "" && host.Network.TapFD != nil {
+		return nil, errors.New("network: `tap` and `tapfd` are mutually exclusive in restore mode")
 	}
 	if err := host.Network.TapFD.Validate("network.tapfd"); err != nil {
 		return nil, err

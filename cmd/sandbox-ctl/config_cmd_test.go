@@ -53,3 +53,31 @@ func TestRestoreSkeletonKeepsPrefetchDisabled(t *testing.T) {
 		t.Fatalf("restore skeleton must expose disabled-by-default prefetch policy")
 	}
 }
+
+func TestStrictCheckAcceptsNoNetwork(t *testing.T) {
+	cold := []byte(`resources:
+  capacity: { cpu: 1, memory: 1GiB }
+  allocatable: { cpu: 1, memory: 1GiB }
+boot:
+  kernel: file:///opt/sandbox/vmlinux
+  runtime: file:///opt/sandbox/sandbox-runtime.erofs
+  root:
+    diff_template: file:///opt/sandbox/root.ext4
+launch: { exec: /bin/true }
+`)
+	restore := []byte(`resources:
+  capacity: { cpu: 1, memory: 1GiB }
+boot:
+  runtime: file:///opt/sandbox/sandbox-runtime.erofs
+  root:
+    base: file:///opt/sandbox/app.erofs
+    overlay: {}
+`)
+	for mode, doc := range map[string][]byte{"cold": cold, "restore": restore} {
+		t.Run(mode, func(t *testing.T) {
+			if rc := strictCheckBytes(doc, mode); rc != 0 {
+				t.Fatalf("%s strict check returned %d for no-network config", mode, rc)
+			}
+		})
+	}
+}
