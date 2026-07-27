@@ -469,7 +469,7 @@ network:
 boot:
   kernel: file:///opt/sandbox/vmlinux              # 仅冷启动需要
   runtime: file:///opt/sandbox/sandbox-runtime.erofs  # 仅 file://
-  cmdline: ""                                      # 追加项(quiet/loglevel= 等);init=/root=/console=hvc0 平台已自动注入
+  cmdline: ""                                      # 追加项(quiet/loglevel= 等);init=/root=/rootflags=/console=hvc0 平台已自动注入
   root:
     base: file:///container-snapshot.erofs    # 自动挂为 disk0(vhost-user-blk ro)
                                               # flattened image,尾部附加的 zip 内含
@@ -653,7 +653,7 @@ CH API 是本地管理调用、快且不受远程/缓存慢影响,60s 是安全�
 **自动注入的 kernel cmdline**(用户不写、不可改):
 
 ```
-init=/sbin/init root=/dev/pmem0 ro rootfstype=erofs dax=always console=hvc0
+init=/sbin/init root=/dev/pmem0 ro rootfstype=erofs rootflags=dax=always console=hvc0
 ```
 
 锁定 `sandbox-runtime.erofs` 通过 virtio-pmem DAX 挂为 `/`、由 `/sbin/init`
@@ -1050,7 +1050,7 @@ cloud-hypervisor \
   --net         fd=4,mac=<from tapfd>,id=_net0,iommu=off \
   --console     tty \
   --serial      off \
-  --cmdline     "init=/sbin/init root=/dev/pmem0 ro rootfstype=erofs dax=always
+  --cmdline     "init=/sbin/init root=/dev/pmem0 ro rootfstype=erofs rootflags=dax=always
                  console=hvc0"
 
 # --net: 无网络源时整项省略;tapfd 模式用 fd=<N>(memfd 之后继承的 fd,通常 fd=4)+

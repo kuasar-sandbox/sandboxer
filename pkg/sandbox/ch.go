@@ -152,11 +152,12 @@ func chNetArg(tapName string, tapFDNum int, mac string) string {
 // buildCmdline returns the kernel cmdline for guest boot.
 //
 // Layout:
-//  1. Auto-injected fixed boot params (init, root, rootfstype, console)
+//  1. Auto-injected fixed boot params (init, root, rootfstype, rootflags,
+//     console)
 //     — lock down how sandbox-runtime.erofs is mounted as / via
 //     virtio-pmem and that kernel dmesg goes to hvc0 (virtio-console).
-//  2. User-supplied boot.cmdline extras (quiet, loglevel=, …; init= /
-//     root= / console= are platform-owned and should not be repeated).
+//  2. User-supplied boot.cmdline extras (quiet, loglevel=, …; init= / root= /
+//     rootflags= / console= are platform-owned and should not be repeated).
 //
 // The launch spec (exec/args/env/workdir/restart/stdio) is **not** in
 // the cmdline — it travels over vsock at runtime via the launch protocol
@@ -167,7 +168,7 @@ func buildCmdline(cfg *config.SandboxConfig) string {
 		"root=/dev/pmem0",
 		"ro",
 		"rootfstype=erofs",
-		"dax=always",
+		"rootflags=dax=always",
 		"console=hvc0",
 		// panic=-1 → kernel immediately emergency_restart()s on panic
 		// (e.g., "Attempted to kill init!"); on our minimal x86 kernel

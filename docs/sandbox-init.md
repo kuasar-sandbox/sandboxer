@@ -144,7 +144,7 @@ F. switch-root 之后的基础挂载:
 `/dev/vda`(blk0 base)是用户应用的镜像 erofs(只读);`/dev/vdb`(blk1 overlay
 ext4)是写层。overlay 合并后 `/sysroot` 是 guest rootfs 的最终视图,switch-root
 之后这套视图变成新的 `/`。承载 sandbox-init 自身的 `sandbox-runtime.erofs` 由内核经
-virtio-pmem 挂在 `/`(`root=/dev/pmem0 ... dax=always`),阶段 1 把它让位给 overlay
+virtio-pmem 挂在 `/`(`root=/dev/pmem0 ... rootflags=dax=always`),阶段 1 把它让位给 overlay
 (其中 `/opt/sandbox-runtime` 经 bind 在让位时随子树保留进新 root)。
 
 **为何能并发**:`bind+listen` 必须在 `launch` 写出前完成(host 在 `launch` 写完即起

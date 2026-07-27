@@ -6,6 +6,15 @@ import (
 	"testing"
 )
 
+func hasCmdlineToken(cmdline, want string) bool {
+	for _, token := range strings.Fields(cmdline) {
+		if token == want {
+			return true
+		}
+	}
+	return false
+}
+
 func makeMinimalCfg() *config.SandboxConfig {
 	cfg := &config.SandboxConfig{
 		Resources: config.ResourcesConfig{
@@ -64,7 +73,7 @@ func TestCHCommand_HasExpectedFlags(t *testing.T) {
 		"init=/sbin/init",
 		"root=/dev/pmem0",
 		"rootfstype=erofs",
-		"dax=always",
+		"rootflags=dax=always",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("CH cmdline missing %q\n  got: %s", want, joined)
@@ -228,13 +237,19 @@ func TestBuildCmdline_ContainsAutoInjectedAndUserExtras(t *testing.T) {
 		"init=/sbin/init",
 		"root=/dev/pmem0",
 		"rootfstype=erofs",
-		"dax=always",
+		"rootflags=dax=always",
 		"console=hvc0",
 		"ip=169.254.1.1",
 	} {
 		if !strings.Contains(cl, want) {
 			t.Errorf("cmdline missing %q\n  got: %s", want, cl)
 		}
+	}
+	if !hasCmdlineToken(cl, "rootflags=dax=always") {
+		t.Errorf("cmdline must pass EROFS DAX through rootflags: %s", cl)
+	}
+	if hasCmdlineToken(cl, "dax=always") {
+		t.Errorf("cmdline must not contain bare EROFS mount option: %s", cl)
 	}
 	for _, banned := range []string{"sandbox.app", "sandbox.args"} {
 		if strings.Contains(cl, banned) {
