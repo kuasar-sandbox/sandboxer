@@ -6,9 +6,12 @@ microVM 沙箱生命周期引擎:冷启动、快照、恢复,以及块设备(vho
 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的运行时
 核心,独立演进。
 
-对外导出 `pkg/resource`(节点资源控制协议:wire + `Client`;由 `orchestrator`
-的 **node-ctl** 作控制器侧 import);协议规范见
-[`orchestrator/docs/node-resource.md`](https://github.com/kuasar-sandbox/orchestrator/blob/main/docs/node-resource.md) §5。
+控制相关的跨仓薄导出面包括:`pkg/resource` 提供节点资源控制协议
+(wire + `Client`,由 `orchestrator` 的 **node-ctl** 作控制器侧 import),
+`pkg/ctl` 提供 host-local `ctl.sock` 协议与 `ProxyExec` 入口,供可信
+node proxy 在完成远程 exec 鉴权后接入现有 exec/MUX 链路。资源协议
+规范见 [`orchestrator/docs/node-resource.md`](https://github.com/kuasar-sandbox/orchestrator/blob/main/docs/node-resource.md)
+§5;`ctl.sock` 与 `ProxyExec` 合同见 [`docs/sandbox.md`](docs/sandbox.md) §6.3。
 
 ## 组成
 
@@ -19,7 +22,8 @@ microVM 沙箱生命周期引擎:冷启动、快照、恢复,以及块设备(vho
 | `pkg/sandbox` `pkg/restore` `pkg/snapshot` | 生命周期编排:冷启动 / 恢复 / 快照(含增量分层链) |
 | `pkg/uffd` `pkg/memory` | uffd handler 与 memfd 统一内存所有权(懒加载) |
 | `pkg/vhost` | vhost-user-blk 后端(file / manifest 块源 + CoW diff) |
-| `pkg/{guestlink,mux,proto,fwd,stdio,ctl}` | host↔guest vsock 控制面、stdio MUX、端口转发、ctl.sock |
+| `pkg/{guestlink,mux,proto,fwd,stdio}` | host↔guest vsock 控制面、stdio MUX 与端口转发 |
+| `pkg/ctl` | **导出面**:host-local `ctl.sock` 协议 + 经鉴权 exec 隧道的 `ProxyExec` gate/relay |
 | `pkg/{config,resctl,chapi,tapfd}` | sandbox.yaml、cgroup+balloon 联动、CH API 客户端、tapfd 消费 |
 | `pkg/util` | 内联工具(`ParseSize` / `LocateBinary` 等,跨模块导出) |
 | `pkg/resource` | **导出面**:节点资源控制协议(`orchestrator` 的 node-ctl import) |
