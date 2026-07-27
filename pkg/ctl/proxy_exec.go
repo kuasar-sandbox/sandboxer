@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 
 	"github.com/kuasar-sandbox/sandboxer/internal/wireio"
@@ -160,22 +161,39 @@ func proxyExecRelay(downstream, ctlConn io.ReadWriteCloser, closeBoth func()) er
 	go pump(proxyExecCtlToDownstream, downstream, ctlConn)
 
 	var directionErrors [proxyExecRelayDirections]error
-	closing := false
+	primaryDirection := -1
 	for range proxyExecRelayDirections {
 		result := <-results
 		directionErrors[result.direction] = result.err
-		if result.err != nil && !closing {
-			closing = true
+		if result.err != nil && primaryDirection < 0 {
+			primaryDirection = result.direction
 			closeBoth()
 		}
 	}
 	pumps.Wait()
-	// Select only after both pumps have stopped so simultaneous errors do not
-	// acquire a nondeterministic priority from channel scheduling.
-	for _, err := range directionErrors {
+	// Select only after both pumps have stopped so independent simultaneous
+	// errors do not acquire a nondeterministic priority from channel scheduling.
+	// Once one error has triggered full close, however, a peer pump commonly
+	// reports net.ErrClosed (or an equivalent closed-stream error). That teardown
+	// artifact must not replace the original error merely because its direction
+	// has a higher fixed priority.
+	for direction, err := range directionErrors {
 		if err != nil {
+			if direction != primaryDirection && proxyExecTeardownError(err) {
+				continue
+			}
 			return err
 		}
 	}
+	if primaryDirection >= 0 {
+		return directionErrors[primaryDirection]
+	}
 	return nil
+}
+
+func proxyExecTeardownError(err error) bool {
+	return errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
 }

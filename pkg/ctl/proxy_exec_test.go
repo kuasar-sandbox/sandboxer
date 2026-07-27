@@ -483,6 +483,25 @@ func TestProxyExecRelayErrorStopsOtherDirection(t *testing.T) {
 	assertClosedOnce(t, ctlConn)
 }
 
+func TestProxyExecReverseRelayErrorIsNotMaskedByTeardown(t *testing.T) {
+	wantErr := errors.New("injected ctl-to-downstream failure")
+	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+	downstream := newPrefixedBlockingReadRWC(frame)
+	ctlConn := &memoryRWC{reader: &terminalErrorReader{err: wantErr}}
+
+	done := make(chan error, 1)
+	go func() { done <- ProxyExec(context.Background(), downstream, ctlConn) }()
+	err := ctlTestWaitError(done)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("ProxyExec error = %v, want original reverse relay error", err)
+	}
+	if !bytes.Equal(ctlConn.written.Bytes(), frame) {
+		t.Fatal("valid first frame was not forwarded before reverse relay error")
+	}
+	assertClosedOnce(t, downstream)
+	assertClosedOnce(t, ctlConn)
+}
+
 func TestProxyExecCloseWriteErrorStopsOtherDirection(t *testing.T) {
 	wantErr := errors.New("injected CloseWrite failure")
 	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
@@ -503,6 +522,31 @@ func TestProxyExecCloseWriteErrorStopsOtherDirection(t *testing.T) {
 	}
 	if !bytes.Equal(ctlConn.written.Bytes(), frame) {
 		t.Fatal("valid first frame was not forwarded before CloseWrite failure")
+	}
+	assertClosedOnce(t, downstream)
+	assertClosedOnce(t, ctlConn)
+}
+
+func TestProxyExecReverseCloseWriteErrorIsNotMaskedByTeardown(t *testing.T) {
+	wantErr := errors.New("injected downstream CloseWrite failure")
+	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+	downstream := &failingCloseWriteRWC{
+		blockingReadRWC: newPrefixedBlockingReadRWC(frame),
+		err:             wantErr,
+	}
+	ctlConn := &memoryRWC{reader: bytes.NewReader(nil)}
+
+	done := make(chan error, 1)
+	go func() { done <- ProxyExec(context.Background(), downstream, ctlConn) }()
+	err := ctlTestWaitError(done)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("ProxyExec error = %v, want original reverse CloseWrite error", err)
+	}
+	if got := downstream.closeWrites.Load(); got != 1 {
+		t.Fatalf("CloseWrite calls = %d, want 1", got)
+	}
+	if !bytes.Equal(ctlConn.written.Bytes(), frame) {
+		t.Fatal("valid first frame was not forwarded before reverse CloseWrite failure")
 	}
 	assertClosedOnce(t, downstream)
 	assertClosedOnce(t, ctlConn)
@@ -775,6 +819,7 @@ func (r *terminalErrorReader) Read(p []byte) (int, error) {
 }
 
 type blockingReadRWC struct {
+	prefix  *bytes.Reader
 	written bytes.Buffer
 	closed  chan struct{}
 	once    sync.Once
@@ -785,7 +830,17 @@ func newBlockingReadRWC() *blockingReadRWC {
 	return &blockingReadRWC{closed: make(chan struct{})}
 }
 
-func (s *blockingReadRWC) Read([]byte) (int, error) {
+func newPrefixedBlockingReadRWC(prefix []byte) *blockingReadRWC {
+	return &blockingReadRWC{
+		prefix: bytes.NewReader(append([]byte(nil), prefix...)),
+		closed: make(chan struct{}),
+	}
+}
+
+func (s *blockingReadRWC) Read(p []byte) (int, error) {
+	if s.prefix != nil && s.prefix.Len() > 0 {
+		return s.prefix.Read(p)
+	}
 	<-s.closed
 	return 0, net.ErrClosed
 }
