@@ -48,6 +48,11 @@ handler、cgroup/balloon 联动(含 host 端 BalloonController)、与 node-ctl
        /run/sandbox/<sid>/   ch.sock  blk0.sock  blk1.sock  uffd.sock  ctl.sock  vsock.sock (+ _5000)
                              snap-stage/ (snapshot) | snap-state/ (restore)   tmpfs run dir
        /var/lib/sandbox/<sid>/<sid>.overlay.diff    overlay writable upper layer (ext4 sparse, on disk)
+
+   authorized remote exec
+
+       client ── exec tunnel ──► node proxy ── pkg/ctl.ProxyExec ──► ctl.sock
+                                      authenticate + select exact sandbox
 ```
 
 Two host-side roots, kept distinct (overridable via --run-root / SANDBOX_RUN_ROOT
@@ -337,7 +342,10 @@ pty EOF 之后发出),exec 收到即结束并还原终端,不依赖底层连接�
 sandbox-init → guest 为这次 exec 起一条**独立的 stdio MUX**(详见
 [`sandbox-init.md`](sandbox-init.md) §3.6 / §4.3)。run 进程在握手后只做
 ctl.sock ↔ guest vsock 的透明字节转发,MUX 端到端跑在 `sandbox-ctl exec` 与
-guest 之间。多个 exec 会话并发互不影响。
+guest 之间。多个 exec 会话并发互不影响。远程授权 exec 由可信 node proxy
+在完成鉴权并选定目标 sandbox 后,调用 `pkg/ctl.ProxyExec` 对下游首帧做
+`exec_request` gate,再接入同一条 `ctl.sock` 与 MUX 路径;不定义另一套 guest
+wire。
 
 **与 snapshot 的关系**:snapshot quiesce 期间拒绝新的 exec,并 SIGKILL 在飞的
 exec 子进程(快照不能带运行中的 exec 兄弟进程);沙箱 resume / restore 后恢复
@@ -1257,6 +1265,37 @@ T10 sandbox-ctl snapshot(发起方进程)收到 done:
 UDS,承载两类宿主侧控制请求:`snapshot`(一问一答)与 `exec`(握手后该连接升级
 为端到端 stdio MUX)。请求 / 响应都是 JSON,长度前缀(4 字节 LE uint32)+ payload。
 同一 UDS 上多个请求各自独立的连接、可并发(每连接一 goroutine)。
+
+**远程授权 exec 入口**:`pkg/ctl.ProxyExec(ctx, downstream, ctlConn)` 是
+HTTP 无关的 server-side gate/relay。调用方负责在调用前完成用户鉴权、
+目标 sandbox 选择与生命周期准备,并将 `ctlConn` 连到该 sandbox 的
+`<run-dir>/<sid>/ctl.sock`;`ProxyExec` 本身不解析身份或签发凭据。
+
+```text
+authorized downstream                       existing sandbox path
+        │                                             │
+        ▼                                             ▼
+node proxy ──► ProxyExec ──► ctl.sock ──► sandbox-ctl run ──► guest exec
+                │
+                ├─ first frame: exec_request only
+                └─ accepted: transparent ctl/MUX relay
+```
+
+gate 按现有 `ctl.sock` framing 先完整读取 4-byte LE 长度和 payload:
+
+- payload 上限与其他 ctl 消息一致,为 64 KiB;长度前缀或 payload 截断、
+  超限或非法 JSON 都拒绝。
+- 只接受首帧对象的 `type == "exec_request"`;`snapshot_request` 及其他类型
+  不得向 `ctlConn` 写入任何字节。
+- 验证通过后,原长度前缀和原 JSON payload 逐字节写入 `ctlConn`,不做
+  decode/re-encode;已跟在首帧后的 buffered ctl/MUX 字节也不丢失。
+
+首帧通过后,两个方向使用有界 buffer 透明复制。一侧正常 EOF 时,如目标
+支持 `CloseWrite`,只传播写侧半关闭,继续排空反向数据;若流不支持
+`CloseWrite`,则不以全关闭代替半关闭。任一方向 I/O 失败或 `ctx` 取消时
+关闭两条流,等待两个复制方向退出后返回。`ProxyExec` 从调用开始即取得
+`downstream` 和 `ctlConn` 的所有权;包括参数错误、gate 拒绝、转发失败和
+取消在内,所有返回路径都关闭两个非 nil 流。
 
 **snapshot_request**(snapshot 子命令 → sandbox-ctl run):
 
