@@ -31,8 +31,29 @@ type vsockConn struct {
 	closeErr  error
 }
 
-func (c *vsockConn) Read(b []byte) (int, error)  { return syscall.Read(c.fd, b) }
-func (c *vsockConn) Write(b []byte) (int, error) { return syscall.Write(c.fd, b) }
+type fdIOFunc func(int, []byte) (int, error)
+
+// retryInterruptedIO hides signal delivery from the stream abstraction. PID 1
+// receives SIGCHLD while management connections are active, so raw AF_VSOCK
+// syscalls can return (-1, EINTR) even though the connection is still healthy.
+// Retry EINTR unless the operation reports a positive partial result, which
+// must be returned to the caller unchanged.
+func retryInterruptedIO(op fdIOFunc, fd int, b []byte) (int, error) {
+	for {
+		n, err := op(fd, b)
+		if n > 0 || !errors.Is(err, syscall.EINTR) {
+			return n, err
+		}
+	}
+}
+
+func (c *vsockConn) Read(b []byte) (int, error) {
+	return retryInterruptedIO(syscall.Read, c.fd, b)
+}
+
+func (c *vsockConn) Write(b []byte) (int, error) {
+	return retryInterruptedIO(syscall.Write, c.fd, b)
+}
 func (c *vsockConn) Close() error {
 	c.closeOnce.Do(func() { c.closeErr = syscall.Close(c.fd) })
 	return c.closeErr
