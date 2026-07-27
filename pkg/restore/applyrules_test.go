@@ -140,7 +140,7 @@ func TestApplyRules_CapacityAutoFilledWhenAbsent(t *testing.T) {
 	}
 }
 
-func TestApplyRules_NetworkTAPRequired(t *testing.T) {
+func TestApplyRules_NoNetworkAllowed(t *testing.T) {
 	dir := t.TempDir()
 	rtPath := filepath.Join(dir, "runtime.erofs")
 	rtDigest := writeFile(t, rtPath, []byte("runtime body"))
@@ -151,8 +151,30 @@ func TestApplyRules_NetworkTAPRequired(t *testing.T) {
 	host := &config.SandboxConfig{}
 	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
 
-	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "exactly one of") {
-		t.Fatalf("expected network source required error, got %v", err)
+	out, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot"))
+	if err != nil {
+		t.Fatalf("no network source should be accepted: %v", err)
+	}
+	if out.Network.TAP != "" || out.Network.TapFD != nil {
+		t.Fatalf("network source unexpectedly added: %+v", out.Network)
+	}
+}
+
+func TestApplyRules_NetworkSourcesMutuallyExclusive(t *testing.T) {
+	dir := t.TempDir()
+	rtPath := filepath.Join(dir, "runtime.erofs")
+	rtDigest := writeFile(t, rtPath, []byte("runtime body"))
+	bsPath := filepath.Join(dir, "base.erofs")
+	bsDigest := writeFile(t, bsPath, []byte("base body"))
+	snap := baseSnap("file://runtime.erofs@sha256:"+rtDigest, "file://base.erofs@sha256:"+bsDigest, "file://abc.overlay")
+
+	host := &config.SandboxConfig{}
+	host.Network.TAP = "tap0"
+	host.Network.TapFD = &config.TapFDConfig{Exec: []string{"helper"}}
+	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
+
+	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected mutually-exclusive network source error, got %v", err)
 	}
 }
 

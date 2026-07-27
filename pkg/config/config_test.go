@@ -83,6 +83,86 @@ func TestValidateCold_TapFDSocket(t *testing.T) {
 	}
 }
 
+func TestValidate_NoNetwork(t *testing.T) {
+	withoutNetwork := strings.Replace(minimalCold, "network:\n  tap: tap0\n", "", 1)
+	cases := map[string]string{
+		"omitted": withoutNetwork,
+		"empty":   strings.Replace(minimalCold, "network:\n  tap: tap0", "network: {}", 1),
+	}
+	for name, doc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := Load(writeYAML(t, doc))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Network.Interface != "" {
+				t.Fatalf("network.interface = %q, want empty without a network source", cfg.Network.Interface)
+			}
+			if err := cfg.ValidateCold(); err != nil {
+				t.Fatalf("ValidateCold: %v", err)
+			}
+			if err := cfg.ValidateRestoreHostConfig(); err != nil {
+				t.Fatalf("ValidateRestoreHostConfig: %v", err)
+			}
+		})
+	}
+}
+
+func TestApplyDefaults_NetworkInterface(t *testing.T) {
+	cases := []struct {
+		name string
+		net  NetworkConfig
+		want string
+	}{
+		{name: "no source"},
+		{name: "tap", net: NetworkConfig{TAP: "tap0"}, want: "eth0"},
+		{name: "tapfd", net: NetworkConfig{TapFD: &TapFDConfig{Exec: []string{"helper"}}}, want: "eth0"},
+		{name: "explicit", net: NetworkConfig{TAP: "tap0", Interface: "ens3"}, want: "ens3"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &SandboxConfig{Network: tc.net}
+			cfg.ApplyDefaults()
+			if cfg.Network.Interface != tc.want {
+				t.Fatalf("network.interface = %q, want %q", cfg.Network.Interface, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidate_NetworkFieldsRequireSource(t *testing.T) {
+	cases := []struct {
+		name string
+		net  NetworkConfig
+	}{
+		{name: "mac", net: NetworkConfig{MAC: "02:00:00:00:00:01"}},
+		{name: "ip", net: NetworkConfig{IP: "169.254.1.1/31"}},
+		{name: "mtu", net: NetworkConfig{MTU: 1500}},
+		{name: "nexthop", net: NetworkConfig{Nexthop: "169.254.1.0"}},
+		{name: "hostname", net: NetworkConfig{Hostname: "sandbox"}},
+		{name: "interface", net: NetworkConfig{Interface: "eth0"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeYAML(t, minimalCold))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Network = tc.net
+			for mode, validate := range map[string]func() error{
+				"cold":    cfg.ValidateCold,
+				"restore": cfg.ValidateRestoreHostConfig,
+			} {
+				err := validate()
+				want := "network." + tc.name + " requires network.tap or network.tapfd"
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Errorf("%s validation error = %v, want %q", mode, err, want)
+				}
+			}
+		})
+	}
+}
+
 func TestLoad_DefaultsAllocFromCapacity(t *testing.T) {
 	cfg, err := Load(writeYAML(t, `
 resources:
@@ -341,10 +421,9 @@ func TestValidateCold_MissingFields(t *testing.T) {
 		{"no root.base", func(c *SandboxConfig) { c.Boot.Root.Base = "" }, "boot.root.base"},
 		{"no overlay.diff", func(c *SandboxConfig) { c.Boot.Root.Overlay.Diff = "" }, "boot.root.overlay.diff"},
 		{"manifest overlay.diff", func(c *SandboxConfig) { c.Boot.Root.Overlay.Diff = "manifest://abc" }, "must be file"},
-		{"no network source", func(c *SandboxConfig) { c.Network.TAP = "" }, "exactly one of"},
 		{"both tap and tapfd", func(c *SandboxConfig) {
 			c.Network.TapFD = &TapFDConfig{Exec: []string{"helper"}}
-		}, "exactly one of"},
+		}, "mutually exclusive"},
 		{"tapfd without transport", func(c *SandboxConfig) {
 			c.Network.TAP = ""
 			c.Network.TapFD = &TapFDConfig{}

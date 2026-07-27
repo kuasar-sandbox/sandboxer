@@ -435,9 +435,10 @@ resources:
   startup:               # 仅 controller 已设时允许;默认 = allocatable.memory
     memory: 256MiB             # 启动期 allocatable_now;约束 floor ≤ 此 ≤ capacity
 
-# 网络:源二选一(tap 名 / tapfd 交接);属性在 tapfd 模式下被交接元数据覆盖
+# 网络:整个 network 块可省略或写成 {},表示不挂 virtio-net 设备.
+# 启用网络时源最多选一个(tap 名 / tapfd 交接);属性在 tapfd 模式下被交接元数据覆盖.
 network:
-  # 源(二选一):
+  # 源(最多一个):
   tap: tap0                    # 预创建的 host TAP 名;CH 按名打开(dev/e2e,无 provider)
   tapfd:                       # tapfd 交接(docs/tapfd.md §3/§4):exec helper 或持久 provider socket
     exec: ["connector-ctl", "vswitch", "open-port", "sw0", "--port=3"]
@@ -453,6 +454,8 @@ network:
   nexthop: ""                  # 默认路由下一跳;空则不配默认路由
   hostname: my-sandbox         # guest hostname(sethostname)
   interface: eth0              # guest 内网卡名,默认 eth0
+
+# 无网络源时不得保留 mac/ip/mtu/nexthop/hostname/interface 等属性.
 
 # Guest 启动 + rootfs
 boot:
@@ -789,7 +792,7 @@ boot:
 | 字段 | 为什么不存 |
 |---|---|
 | `sandbox.id` | 由 host 传入(`run --sandbox-id` 或 yaml) |
-| `network.{tap\|tapfd,mac,ip,mtu,nexthop,hostname,interface}` | host-localized,restore 时由 sandbox.yaml 提供;源二选一,tapfd 元数据覆盖 mac/ip |
+| `network.{tap\|tapfd,mac,ip,mtu,nexthop,hostname,interface}` | host-localized,restore 时由 sandbox.yaml 提供;无源表示无 NIC,有源时最多一个且须与 config.json 中的快照 NIC 拓扑一致;tapfd 元数据覆盖 mac/ip |
 | `launch.{exec,args,env,workdir,restart}` | 应用启动配置在 guest 内存里已经反映为运行中进程,restore 后不再走 launch 协议 |
 | `control.{cgroup_path,controller}` | host-localized 资源策略 |
 | `overhead` / `watermark_high` / `startup` / `allocatable` | 同上,host 资源策略 |
@@ -932,7 +935,8 @@ CPU 维度本质比内存简单——没有不可逆失败、调整即时、释�
 ```
 T0   sandbox-ctl run --config sandbox.yaml 启动
 T1   解析 yaml(可选 --sandbox-id 覆盖)→ 构造完整 SandboxConfig
-T2   验证 TAP 存在,准备 /run/sandbox/<sid>/ 目录
+T2   tap 源验证已存在 TAP;tapfd 与无网络源跳过 TAP 名验证;
+     随后准备 /run/sandbox/<sid>/ 目录
 T3   准备 overlay diff:已存在→原样用(绝不 truncate);不存在→从 diff_template 稀疏复制 /
      按 base 大小新建 / 否则按 diff_size 新建空白稀疏文件(详见 §3.1)
 T4   动态控制模式:dial controller, send Admit, 收 grant 后继续(详见 §10)
@@ -962,7 +966,8 @@ T14  起 ctl.sock UDS server: listen /run/sandbox/<sid>/ctl.sock(snapshot / exec
 T15  构造 CH 命令行(详见 §5.2):
      `--memory-zone size=<ramSize>,shared=on,fd=3,uffd_socket=/run/sandbox/<sid>/uffd.sock`
      `--console tty --serial off`,cmdline `... console=hvc0`(内核 dmesg 走 hvc0)
-     cmd.ExtraFiles = [memfd] 让 fd=3 在 CH 进程中可见
+     cmd.ExtraFiles = [memfd] 让 fd=3 在 CH 进程中可见;tapfd 模式再追加 tap fd,
+     无网络源时不追加
      CH 进程 stdio:stdin = /dev/null(CH 因此不 raw 化任何宿主终端)、
      stdout = 一根匿名管道(承载 hvc0 dmesg,sandbox-ctl 按 `--console` 决定去向)、
      stderr = sandbox-ctl 的 stderr;cmd.SysProcAttr.Setpgid = true(CH 不在
@@ -978,7 +983,7 @@ T17  CH (patched) 启动:
      T17c connect uffd_socket → sendmsg(va_report; SCM_RIGHTS=uffd_C) → 等 ack
      T17d memory_range_table 检测 user_managed → snapshot_memory_ranges 不含此 zone
      T17e 配 virtio-pmem(sandbox-runtime.erofs DAX)、virtio-vsock(cid=3)、
-          virtio-net、virtio-balloon
+          可选 virtio-net(仅有网络源时)、virtio-balloon
      T17f vhost-user-blk 握手:SET_OWNER → SET_FEATURES → SET_MEM_TABLE [memfd fd]
           backend fstat 比对 inode = sandbox-ctl 启动时记下的 memfd inode
           → 复用 backendVA → 不再 mmap
@@ -1040,8 +1045,9 @@ cloud-hypervisor \
   --cmdline     "init=/sbin/init root=/dev/pmem0 ro rootfstype=erofs dax=always
                  console=hvc0"
 
-# --net: tapfd 模式用 fd=<N>(memfd 之后继承的 fd,通常 fd=4)+ mac=<交接元数据>,
-#        id=_net0 供 restore 经 net_fds 重新绑定该网卡;tap 名模式则 --net tap=<name>。
+# --net: 无网络源时整项省略;tapfd 模式用 fd=<N>(memfd 之后继承的 fd,通常 fd=4)+
+#        mac=<交接元数据>,id=_net0 供 restore 经 net_fds 重新绑定该网卡;
+#        tap 名模式则 --net tap=<name>.
 # tapfd 交接(docs/tapfd.md §3/§4):exec helper 时置 TAPFD_SOCKET + TAPFD_WANT_NETNS=1;
 #        socket 模式发送 TAPFD/1 OPEN want_netns=1 ...。provider 的 tap 处于独立 netns
 #        时回带该 fd,sandbox-ctl 据此在该 netns 内 fork/exec CH(T16);否则 CH 在 host netns 启动。
@@ -1315,7 +1321,7 @@ va_report → uffd_C 就绪);区别:
 ```
 T0  sandbox-ctl run --restore <ref> --config sandbox.yaml [--run-root <dir>] ...;
     解析 restore.prefetch,非法值在 cgroup/目录/远程读取等副作用前失败
-T1  解析其余 host sandbox.yaml(本地化字段:network,overlay.diff,cgroup/控制器等)
+T1  解析其余 host sandbox.yaml(本地化字段:可选 network、overlay.diff、cgroup/控制器等)
 T2  打开 <ref>:
     file path: os.Open + Stat → ReaderAt
     manifest://: 通过 store + cache 客户端取 manifest → 解封 → fetch.Fetcher 包成 ReaderAt
@@ -1332,10 +1338,12 @@ T4  restore.ApplyRules(host sandbox.yaml, snapshot.cfg, snapshotPath):
       `trust` 只确认本地文件存在,跳过内容 hash
     - 未提供时从 snapshot.cfg 复制(file 模式解析为 .snapshot 同目录文件)
     - 详见 §11.0 字段语义表 + §13 校验矩阵
+    restore.Run 随后读取 config.json.net,要求快照 NIC 拓扑与 host network source
+    是否存在一致;restore 不允许新增或删除 NIC
 T5  从 snapshot.cfg 拿 capacity 推 ramSize;从 state.json 解出 balloon 状态推
     allocatable_at_snapshot(详见 §11.1)
 T6  动态控制模式:Admit{floor, allocatable_at_snapshot} → grant
-T7  cgroup setup + TAP 验证 + blk1.diff(全新)准备
+T7  cgroup setup + blk1.diff(全新)准备
 T8  state.json 直接写到 <run-dir>/<sid>/snap-state/
     config.json 经路径重写后写入(uffd_socket / blk0/1.sock / vsock.sock 都改为
     本次 <run-dir>/<sid>/ 下的对应名)
@@ -1346,6 +1354,8 @@ T9  memory 准备:同冷启动 §5.1 T6,**唯一差别** snapshotReader =
     blk0 / blk1 base 同理:overlay.base 与 base_from_refs 叠成分层只读基座,
     其上新建本次 blk1.diff(CoW)。provenance(父 ref + 两条链)前向传给本运行
     进程,供其将来再保存时算链(T5)
+    联网快照的 tapfd 模式在此重新交接并取得新 fd;tap 名模式由 CH 按快照配置
+    重开;无 NIC 时两者均跳过
 T10 blk0 + blk1 backend 起;launch server UDS(<vsock-base>_5000)同样起——restore
     与冷启动共用同一后半段(memfd/uffd/blk/launch/pinger/ctl/信号/stats),仅 uffd
     source、CH 命令行、settle 协议不同。**差别**仅在于 restore 不走 hello/launch 握手
@@ -1357,6 +1367,8 @@ T11 spawn cloud-hypervisor (patched):
       --memory-zone size=<ramSize>,shared=on,fd=3,uffd_socket=<run-dir>/<sid>/uffd.sock
       --restore source_url=<run-dir>/<sid>/snap-state/
       --console tty --serial off
+    有 tapfd 的联网快照在 restore 参数追加 net_fds=[_net0@[4]];
+    无 NIC 快照不追加 net_fds
     CH 进程 stdio 同冷启动(§5.2):stdin=/dev/null、stdout=匿名管道(dmesg)、
     stderr=sandbox-ctl stderr;Setpgid(CH 不在前台进程组)
 T12 CH (patched) 启动:同冷启动 T17a-T17c(创建 uffd_C,sendmsg va_report);
@@ -1895,8 +1907,8 @@ allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
 | `resources.capacity.{cpu,memory}` | 与 snapshot.cfg 严格相等才允许;不一致拒绝启动(error: "capacity mismatch") | 直接用 snapshot.cfg.resources.capacity |
 | `resources.allocatable.*` | 与冷启动语义相同(host 资源策略) | 沿用冷启动默认(等于 capacity) |
 | `restore.prefetch` | `memory` 在满足 §7.1 资格时异步预取当前远程内存顶层;`off` 显式关闭 | 默认关闭;不从 snapshot.cfg 继承 |
-| `network.{tap\|tapfd}` | 必须(源二选一);tapfd 模式重新交接(docs/tapfd.md §4,幂等)取新 fd,经 `--restore net_fds=[_net0@[4]]` 注入 CH;tap 名模式 CH 按名重开 | error: missing(restore 不能没网络源) |
-| `network.{ip,mtu,nexthop,hostname,interface}` | 经 restore 通知重新下发,guest flush-and-replace 重配(克隆取新 L3 身份);MAC 不变(沿用快照设备状态,故 provider 须用稳定 per-port MAC) | 保留快照网络不变 |
+| `network.{tap\|tapfd}` | 最多一个且存在性必须与 config.json 中的快照 NIC 拓扑一致;tapfd 模式重新交接(docs/tapfd.md §4,幂等)取新 fd,经 `--restore net_fds=[_net0@[4]]` 注入 CH;tap 名模式 CH 按名重开 | 仅无 NIC 快照允许;联网快照报拓扑不匹配 |
+| `network.{ip,mtu,nexthop,hostname,interface}` | 仅存在网络源时允许;经 restore 通知重新下发,guest flush-and-replace 重配(克隆取新 L3 身份);MAC 不变(沿用快照设备状态,故 provider 须用稳定 per-port MAC) | 无 NIC 快照保持无 NIC;联网快照保留快照网络不变 |
 | `boot.kernel` | 静默忽略(restore 不 boot) | 同 |
 | `boot.runtime`(仅 file://) | basename 与 snapshot.cfg.runtime_ref 匹配才允许;默认还要求 sha256 digest 匹配 | 用 snapshot.cfg.runtime_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
 | `boot.root.base`(file://) | 协议 + basename 与 snapshot.cfg.base_ref 一致才允许;默认还要求 digest 匹配 | 用 snapshot.cfg.base_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
@@ -2116,6 +2128,8 @@ snapshot 路径要求 `/vm.pause` 之后内存内容稳定,但 backend worker �
 | `overhead.memory ≥ 0` | "overhead.memory must be non-negative" |
 | `watermark_high.memory > 0` 且 `≤ allocatable.memory`(静态 cgroup / 动态控制模式启动初值) | "watermark_high.memory out of (0, allocatable.memory]" |
 | `mounts[].target` / `files[].path` 必须绝对路径 | "<field> must be absolute" |
+| `network.tap` 与 `network.tapfd` 最多设置一个;两者均未设置表示无 NIC | "network: `tap` and `tapfd` are mutually exclusive" |
+| 无网络源时不得设置 `mac/ip/mtu/nexthop/hostname/interface` | "network.<field> requires network.tap or network.tapfd" |
 | `mounts[].type` ∈ {tmpfs, empty}(省略 = empty);`nfs` 暂未实现 | "mount type <t> not yet implemented" / "unknown mount type <t>" |
 | `files[].mode` 若设须为合法八进制 | "files[].mode invalid octal" |
 | `init[].exec` 非空 | "init[].exec is required" |
@@ -2151,8 +2165,9 @@ snapshot 路径要求 `/vm.pause` 之后内存内容稳定,但 backend worker �
 ### 13.4 restore 模式校验(`SandboxConfig.ValidateRestoreHostConfig` + `restore.ApplyRules`)
 
 `run --restore=<ref>` 触发。host yaml 先经 `ValidateRestoreHostConfig` 自校验
-(网络源、引用格式等),与 snapshot.cfg 的交叉校验(capacity 相等、runtime/base
-ref 匹配;默认含 digest)随后在 `restore.ApplyRules` 拿到 bundle 时进行.
+(可选网络源、引用格式等),与 snapshot.cfg 的交叉校验(capacity 相等、runtime/base
+ref 匹配;默认含 digest)随后在 `restore.ApplyRules` 拿到 bundle 时进行;
+config.json.net 提供快照 NIC 拓扑,restore.Run 在任何 tapfd 交接或 CH 启动前校验.
 `restore.prefetch` 还会在 `restore.Run` 入口复用同一个 parser,保证普通
 `run --restore` 即使未预先调用 validator,也会在副作用前拒绝非法值.额外:
 
@@ -2167,7 +2182,8 @@ ref 匹配;默认含 digest)随后在 `restore.ApplyRules` 拿到 bundle 时进�
 | sandbox.yaml 提供 manifest:// runtime / base 时,manifest key 必须与 snapshot.cfg ref 一致 | "<field> manifest key mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 `resources.capacity.{cpu,memory}` 时,与 snapshot.cfg 严格相等 | "capacity mismatch with snapshot.cfg" |
 | `boot.root.overlay.diff` 可选;空→落盘 base 目录新建(随沙箱销毁) | — |
-| sandbox.yaml 必须提供 `network.tap` 或 `network.tapfd`(二选一,tapfd 同样有效;与 §11.0 一致) | "network: exactly one of `tap` or `tapfd` is required in restore mode" |
+| `network.tap` 与 `network.tapfd` 最多设置一个;无源时不得设置其他 network 属性 | "network: `tap` and `tapfd` are mutually exclusive" / "network.<field> requires network.tap or network.tapfd" |
+| config.json 有 NIC 当且仅当 sandbox.yaml 提供一个网络源;restore 不得增删 NIC | "network topology mismatch: ..." |
 
 ## 14. 已知限制与扩展点
 

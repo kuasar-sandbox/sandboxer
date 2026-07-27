@@ -140,6 +140,25 @@ func TestCHCommand_TapFDMode(t *testing.T) {
 	}
 }
 
+func TestCHCommand_NoNetwork(t *testing.T) {
+	cfg := makeMinimalCfg()
+	cfg.Network = config.NetworkConfig{}
+	args, err := CHCommand(cfg,
+		[]DiskArg{{Sock: "/run/sb/blk0.sock", ReadOnly: true}, {Sock: "/run/sb/blk1.sock"}},
+		"/run/sb/ch.sock", "/run/sb/vsock.sock", "/vmlinux", "/sandbox-runtime.erofs",
+		"/run/sb/uffd.sock", "tty", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--net") {
+		t.Fatalf("no-network mode must omit --net, got: %s", joined)
+	}
+	if !strings.Contains(joined, "--vsock cid=3,socket=/run/sb/vsock.sock") {
+		t.Fatalf("no-network mode must retain the vsock control plane, got: %s", joined)
+	}
+}
+
 func TestCHCommand_TapNameModeMirrorsMAC(t *testing.T) {
 	cfg := makeMinimalCfg() // Network.TAP = "tap0"
 	args, err := CHCommand(cfg, []DiskArg{{Sock: "/0", ReadOnly: true}, {Sock: "/1"}}, "/c", "/v", "/k", "/r", "/u", "tty",

@@ -79,6 +79,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if opts.HostCfg == nil {
 		return -1, errors.New("restore: HostCfg required")
 	}
+	if err := opts.HostCfg.ValidateRestoreHostConfig(); err != nil {
+		return -1, err
+	}
 	prefetchMode, err := config.ParsePrefetchMode(opts.HostCfg.Restore.Prefetch)
 	if err != nil {
 		return -1, err
@@ -204,7 +207,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// runtime_ref, base_ref, overlay.base. ApplyRules merges it with the
 	// host sandbox.yaml per docs/sandbox.md §11.0 — capacity must match
 	// exactly when host provides it, runtime/base are validated against
-	// digest, network.tap is required, overlay.diff is required.
+	// digest, network source validity is checked, overlay.diff is required.
 	parsedSnap, err := ParseSnapshotCfg(entries["snapshot.cfg"])
 	if err != nil {
 		return -1, err
@@ -216,6 +219,14 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, err
 	}
 	snapCfg := *merged
+	snapshotHasNetwork, err := snapshotConfigHasNetwork(entries["config.json"])
+	if err != nil {
+		return -1, err
+	}
+	hostHasNetwork := snapCfg.Network.TAP != "" || snapCfg.Network.TapFD != nil
+	if err := validateRestoreNetworkTopology(snapshotHasNetwork, hostHasNetwork); err != nil {
+		return -1, err
+	}
 	// Metadata passthrough: inherit the parent snapshot's metadata so a
 	// snapshot taken by this restored run carries it forward; an explicit
 	// host-yaml metadata map overrides wholesale.
@@ -473,7 +484,8 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		disks = append(disks, db)
 	}
 
-	// Network: re-acquire the host side for this restore. tapfd mode re-runs
+	// Network: when the snapshot has a virtio-net device, re-acquire its host
+	// side for this restore. tapfd mode re-runs
 	// the configured handoff (docs/tapfd.md §4, idempotent) for a fresh queue
 	// fd, passed to CH via --restore net_fds; tap-name mode lets CH reopen the
 	// named tap from the restored config. The merged metadata also yields the
@@ -530,7 +542,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		Balloon:       balloonCtl,
 		Hooks:         hooks,
 
-		TapFile:   tapFile, // nil in tap-name mode; CH inherits it at fd 4
+		TapFile:   tapFile, // nil in tap-name/no-network modes; non-nil tapfd is inherited at fd 4
 		NetMAC:    netMAC,
 		NetnsFile: netnsFile, // non-nil → launch CH inside the tap's netns
 

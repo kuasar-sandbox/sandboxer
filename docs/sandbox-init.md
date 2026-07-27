@@ -219,7 +219,8 @@ guest 从内存快照续跑、盘已挂好(不重挂),host 只需按同序重建
 switch-root 之后单线程执行。
 
 ```
-1. applyNetwork(spec.network)            ← 冷启动:全新网卡,additive
+1. spec.network 非空时 applyNetwork(spec.network);为空时跳过
+                                           ← 冷启动:可选全新网卡,additive
      - Sethostname(network.hostname)
      - raw netlink RTM_NEWLINK(interface UP[+IFLA_MTU]) / RTM_NEWADDR(IP/CIDR) /
        可选 RTM_NEWROUTE(nexthop)
@@ -292,8 +293,9 @@ PID ns(共享 rootfs/网络/cgroup,但不在 app 的 PID ns 内)。
 **唯独 restore 注入靠它**。网络 restore 重配无此问题:app 只 `CLONE_NEWNS`、不
 `CLONE_NEWNET`,与 PID1 共享网络 ns,netlink 改动天然可见。
 
-**applyNetwork 不是 listener 的前置依赖**——applyNetwork 只对应用层网络服务
-有意义;vsock 控制面与网络配置正交。
+**applyNetwork 不是 listener 的前置依赖**——LaunchSpec 不带 network 时直接跳过,
+guest 仍有 `lo`;applyNetwork 只对应用层外部网络服务有意义,vsock 控制面与网络
+配置正交.
 
 **fast-fail**:一次性沙箱模型下,网络 / 挂载 / 文件 / init 任一失败都让应用悄悄跑
 是反模式——上层调度器期望"沙箱起不来 = 重新调度",而不是"起来了但环境不对"。
@@ -1041,7 +1043,8 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
   sandbox-init 的 PID ns(private 应用看不到它们)。
 - **mount namespace**:私有挂载 ns,起始视图与 sandbox-init 相同(overlayfs 合并的
   / + isolated 时自挂的 /proc)
-- **网络**:eth0(virtio-net,host TAP 后端),IP 已由 sandbox-init 配好
+- **网络**:配置网络源时为 eth0(virtio-net,host TAP 后端),IP 由 sandbox-init 配好;
+  无网络源时不挂 virtio-net,仅保留 `lo`,vsock 控制面仍可用
 - **/dev**:`devtmpfs`(/dev/null、/dev/random、/dev/urandom 等);`/dev/pts`(devpts)
 - **/run**、**/run/shm**:runtime 自动挂载的 tmpfs(无需声明)
 - **/opt/sandbox-runtime**(平台保留):随 runtime 镜像出厂的 Guest 侧发布件根,经 bind 以

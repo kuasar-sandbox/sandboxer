@@ -37,6 +37,9 @@ func TestEffectiveNetwork(t *testing.T) {
 			wantIPCIDR: "169.254.7.7/32",
 		},
 		{
+			name: "no network yields no mac or spec",
+		},
+		{
 			name:    "no ip yields nil spec (mac still resolved)",
 			cfg:     NetworkConfig{MAC: "aa:aa:aa:aa:aa:aa"},
 			mMAC:    "02:00:00:00:80:01",

@@ -295,7 +295,7 @@ CH 暴露给 guest 的设备清单(冷启动):
 ```
 virtio-pmem    → sandbox-runtime.erofs (DAX, MAP_SHARED 共享 host page cache)
 virtio-blk × 2 → blk0 (base, ro) + blk1 (overlay COW, rw),vhost-user backend
-virtio-net     → eth0,host TAP 后端
+virtio-net     → 可选;配置网络源时为 eth0,host TAP 后端;无源时不创建设备
 virtio-console → hvc0,内核 dmesg;--console tty(写到 CH 进程的 stdout = sandbox-ctl
                  给的匿名管道),--serial off(无 8250 UART)。CH 进程的 stdin=/dev/null
                  故 CH 不 raw 化任何宿主终端。应用 stdio 不走此设备(走 vsock MUX)
@@ -307,6 +307,9 @@ virtio-balloon → size=0 [+ deflate_on_oom=on];host BalloonController 通过
                  不启用(广播 mmu_notifier 会饿死 guest vsock kthread)
 virtio-mem     → host-driven 主动 unplug(扩展点)
 ```
+
+restore 沿用 `config.json` 中的设备拓扑,不能新增或删除 virtio-net.sandboxer 在
+启动 CH 前要求 host restore 配置是否提供网络源与快照中的 NIC 是否存在一致.
 
 恢复路径设备拓扑通过 `--restore source_url=<state.json dir>` 从 snapshot
 state 还原,不需要重新指定 `--kernel` / `--vsock`。

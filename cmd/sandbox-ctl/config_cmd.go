@@ -202,7 +202,8 @@ resources:
   capacity:    { cpu: 2, memory: 8GiB }   # vCPU / memory the guest sees
   allocatable: { cpu: 2, memory: 8GiB }   # <= capacity (no cgroup ⇒ cpu == capacity.cpu)
 network:
-  # Source: exactly one of tap (a pre-existing host TAP) or tapfd (handoff helper).
+  # Optional: omit this block or use "network: {}" to start without a NIC.
+  # Otherwise set at most one source: tap (pre-existing host TAP) or tapfd (handoff helper).
   tap: tap0
   # tapfd: { exec: ["connector-ctl", "vswitch", "open-port", "sw0", "--port=1"] }
   # tapfd: { socket: /run/kuasar/connector/sw0/tapfd.sock, request: "VSWITCH=sw0 PORT=1" }
@@ -250,7 +251,9 @@ restore:
 resources:
   capacity: { cpu: 2, memory: 8GiB }       # must equal the snapshot.cfg capacity
 network:
-  tap: tap0                                # source re-acquired on restore
+  # Source presence must match the snapshot's NIC topology. Omit this block
+  # (or use "network: {}") when restoring a snapshot that has no NIC.
+  tap: tap0                                # source re-acquired for a snapshot with a NIC
   ip: 169.254.4.1/31                       # clone takes a fresh identity
   hostname: clone-1
 boot:
