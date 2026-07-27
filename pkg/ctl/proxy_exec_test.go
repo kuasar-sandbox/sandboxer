@@ -418,6 +418,52 @@ func TestProxyExecContextCancellationStopsGateAndRelay(t *testing.T) {
 	})
 }
 
+func TestProxyExecCancellationWinsConcurrentCompletionAndError(t *testing.T) {
+	tests := []struct {
+		name     string
+		terminal error
+	}{
+		{name: "completion", terminal: io.EOF},
+		{name: "relay error", terminal: errors.New("concurrent relay error")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+			downstream := &memoryRWC{
+				reader: &cancelingTerminalReader{
+					data:     frame,
+					terminal: tt.terminal,
+					cancel:   cancel,
+				},
+			}
+			ctlConn := &memoryRWC{reader: bytes.NewReader(nil)}
+			err := ProxyExec(ctx, downstream, ctlConn)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("ProxyExec error = %v, want context.Canceled", err)
+			}
+			assertClosedOnce(t, downstream)
+			assertClosedOnce(t, ctlConn)
+		})
+	}
+
+	t.Run("gate error", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		downstream := &memoryRWC{reader: &cancelingTerminalReader{
+			data:     []byte{1, 2, 3},
+			terminal: io.EOF,
+			cancel:   cancel,
+		}}
+		ctlConn := &memoryRWC{reader: bytes.NewReader(nil)}
+		err := ProxyExec(ctx, downstream, ctlConn)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ProxyExec error = %v, want context.Canceled", err)
+		}
+		assertClosedOnce(t, downstream)
+		assertClosedOnce(t, ctlConn)
+	})
+}
+
 func TestProxyExecRelayErrorStopsOtherDirection(t *testing.T) {
 	wantErr := errors.New("injected downstream read failure")
 	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
@@ -435,6 +481,69 @@ func TestProxyExecRelayErrorStopsOtherDirection(t *testing.T) {
 	}
 	assertClosedOnce(t, downstream)
 	assertClosedOnce(t, ctlConn)
+}
+
+func TestProxyExecCloseWriteErrorStopsOtherDirection(t *testing.T) {
+	wantErr := errors.New("injected CloseWrite failure")
+	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+	downstream := &memoryRWC{reader: bytes.NewReader(frame)}
+	ctlConn := &failingCloseWriteRWC{
+		blockingReadRWC: newBlockingReadRWC(),
+		err:             wantErr,
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- ProxyExec(context.Background(), downstream, ctlConn) }()
+	err := ctlTestWaitError(done)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("ProxyExec error = %v, want CloseWrite failure", err)
+	}
+	if got := ctlConn.closeWrites.Load(); got != 1 {
+		t.Fatalf("CloseWrite calls = %d, want 1", got)
+	}
+	if !bytes.Equal(ctlConn.written.Bytes(), frame) {
+		t.Fatal("valid first frame was not forwarded before CloseWrite failure")
+	}
+	assertClosedOnce(t, downstream)
+	assertClosedOnce(t, ctlConn)
+}
+
+func TestProxyExecSimultaneousRelayErrorsUseDirectionPriority(t *testing.T) {
+	for iteration := 0; iteration < 100; iteration++ {
+		downstreamErr := errors.New("downstream-to-ctl failure")
+		ctlErr := errors.New("ctl-to-downstream failure")
+		ready := make(chan struct{}, 2)
+		release := make(chan struct{})
+		frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+		downstream := &memoryRWC{reader: &barrierErrorReader{
+			data:    frame,
+			err:     downstreamErr,
+			ready:   ready,
+			release: release,
+		}}
+		ctlConn := &memoryRWC{reader: &barrierErrorReader{
+			err:     ctlErr,
+			ready:   ready,
+			release: release,
+		}}
+
+		done := make(chan error, 1)
+		go func() { done <- ProxyExec(context.Background(), downstream, ctlConn) }()
+		for range 2 {
+			select {
+			case <-ready:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("iteration %d: relay direction did not reach error barrier", iteration)
+			}
+		}
+		close(release)
+		err := ctlTestWaitError(done)
+		if !errors.Is(err, downstreamErr) {
+			t.Fatalf("iteration %d: ProxyExec error = %v, want downstream-to-ctl priority", iteration, err)
+		}
+		assertClosedOnce(t, downstream)
+		assertClosedOnce(t, ctlConn)
+	}
 }
 
 func TestProxyExecWithCtlServer(t *testing.T) {
@@ -620,6 +729,42 @@ type terminalErrorReader struct {
 	err  error
 }
 
+type cancelingTerminalReader struct {
+	data     []byte
+	terminal error
+	cancel   context.CancelFunc
+	once     sync.Once
+}
+
+func (r *cancelingTerminalReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	r.once.Do(r.cancel)
+	return 0, r.terminal
+}
+
+type barrierErrorReader struct {
+	data    []byte
+	err     error
+	ready   chan<- struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (r *barrierErrorReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	r.once.Do(func() { r.ready <- struct{}{} })
+	<-r.release
+	return 0, r.err
+}
+
 func (r *terminalErrorReader) Read(p []byte) (int, error) {
 	if len(r.data) == 0 {
 		return 0, r.err
@@ -654,6 +799,17 @@ func (s *blockingReadRWC) Close() error {
 }
 
 func (s *blockingReadRWC) closeCount() int32 { return s.closes.Load() }
+
+type failingCloseWriteRWC struct {
+	*blockingReadRWC
+	err         error
+	closeWrites atomic.Int32
+}
+
+func (s *failingCloseWriteRWC) CloseWrite() error {
+	s.closeWrites.Add(1)
+	return s.err
+}
 
 type closeCounter interface {
 	closeCount() int32

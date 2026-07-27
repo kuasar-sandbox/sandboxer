@@ -14,6 +14,14 @@ import (
 
 const proxyExecCopyBufferBytes = 32 * 1024
 
+// Relay errors use a fixed direction priority after both pumps exit. The
+// request direction is primary because it contains the gated ctl/MUX input.
+const (
+	proxyExecDownstreamToCtl = iota
+	proxyExecCtlToDownstream
+	proxyExecRelayDirections
+)
+
 type closeWriter interface {
 	CloseWrite() error
 }
@@ -57,15 +65,25 @@ func ProxyExec(ctx context.Context, downstream io.ReadWriteCloser, ctlConn io.Re
 	// Closing both streams is the only portable way to interrupt a blocked
 	// Read or Write through the deliberately small io.ReadWriteCloser API.
 	stopWatch := make(chan struct{})
+	watchResult := make(chan error, 1)
 	watchDone := make(chan struct{})
-	cancelErr := make(chan error, 1)
 	go func() {
 		defer close(watchDone)
 		select {
 		case <-ctx.Done():
-			cancelErr <- ctx.Err()
+			err := ctx.Err()
 			closeBoth()
+			watchResult <- err
 		case <-stopWatch:
+			// If completion and cancellation become ready together, prefer
+			// cancellation. This removes select's otherwise random choice
+			// while preserving completion that wins before ctx is canceled.
+			if err := ctx.Err(); err != nil {
+				closeBoth()
+				watchResult <- err
+				return
+			}
+			watchResult <- nil
 		}
 	}()
 
@@ -77,13 +95,12 @@ func ProxyExec(ctx context.Context, downstream io.ReadWriteCloser, ctlConn io.Re
 	}
 
 	close(stopWatch)
+	watchErr := <-watchResult
 	<-watchDone
-	select {
-	case err := <-cancelErr:
-		return err
-	default:
-		return result
+	if watchErr != nil {
+		return watchErr
 	}
+	return result
 }
 
 func proxyExecFirstFrame(downstream io.Reader, ctlConn io.Writer) error {
@@ -121,27 +138,44 @@ func proxyExecFirstFrame(downstream io.Reader, ctlConn io.Writer) error {
 }
 
 func proxyExecRelay(downstream, ctlConn io.ReadWriteCloser, closeBoth func()) error {
-	results := make(chan error, 2)
-	pump := func(dst io.Writer, src io.Reader) {
+	type relayResult struct {
+		direction int
+		err       error
+	}
+	results := make(chan relayResult, proxyExecRelayDirections)
+	var pumps sync.WaitGroup
+	pumps.Add(proxyExecRelayDirections)
+	pump := func(direction int, dst io.Writer, src io.Reader) {
+		defer pumps.Done()
 		_, err := io.CopyBuffer(dst, src, make([]byte, proxyExecCopyBufferBytes))
 		if err == nil {
 			if dst, ok := dst.(closeWriter); ok {
-				_ = dst.CloseWrite()
+				err = dst.CloseWrite()
 			}
 		}
-		results <- err
+		results <- relayResult{direction: direction, err: err}
 	}
 
-	go pump(ctlConn, downstream)
-	go pump(downstream, ctlConn)
+	go pump(proxyExecDownstreamToCtl, ctlConn, downstream)
+	go pump(proxyExecCtlToDownstream, downstream, ctlConn)
 
-	var firstErr error
-	for range 2 {
-		err := <-results
-		if err != nil && firstErr == nil {
-			firstErr = err
+	var directionErrors [proxyExecRelayDirections]error
+	closing := false
+	for range proxyExecRelayDirections {
+		result := <-results
+		directionErrors[result.direction] = result.err
+		if result.err != nil && !closing {
+			closing = true
 			closeBoth()
 		}
 	}
-	return firstErr
+	pumps.Wait()
+	// Select only after both pumps have stopped so simultaneous errors do not
+	// acquire a nondeterministic priority from channel scheduling.
+	for _, err := range directionErrors {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
