@@ -43,8 +43,12 @@ func (e *envFlag) Set(v string) error {
 // Stdio model: docs/sandbox.md §2.2.
 func execCmd(args []string) int {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
-	sandboxID := fs.String("sandbox-id", "", "target sandbox id (required)")
+	sandboxID := fs.String("sandbox-id", "", "target sandbox id (required without --proxy)")
 	runRoot := fs.String("run-root", "", "tmpfs run root (overrides SANDBOX_RUN_ROOT env; default /run/sandbox)")
+	proxyURL := fs.String("proxy", "", "HTTP/HTTPS CONNECT endpoint (remote mode)")
+	var proxyHeaders proxyHeaderFlag
+	proxyHeaderArgs := redactedProxyHeaderValue{headers: &proxyHeaders}
+	fs.Var(&proxyHeaderArgs, "proxy-header", "CONNECT header 'Name: value' (repeatable; remote mode)")
 	cwd := fs.String("cwd", "", "working directory inside the sandbox (default: guest root)")
 	user := fs.String("user", "", "run-as identity: \"uid[:gid]\" or a user name from the sandbox's /etc/passwd (default: root)")
 	var env envFlag
@@ -63,13 +67,26 @@ func execCmd(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *sandboxID == "" {
+	if err := proxyHeaderArgs.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "exec: %v\n", err)
+		return 2
+	}
+	connectHeaders := proxyHeaders.Header()
+	if *proxyURL == "" && *sandboxID == "" {
 		fmt.Fprintln(os.Stderr, "exec: --sandbox-id required")
+		return 2
+	}
+	if *proxyURL == "" && len(connectHeaders) != 0 {
+		fmt.Fprintln(os.Stderr, "exec: --proxy-header requires --proxy")
 		return 2
 	}
 	command := fs.Args()
 	if len(command) == 0 {
-		fmt.Fprintln(os.Stderr, "exec: missing command (use: sandbox-ctl exec --sandbox-id <sid> [flags] -- CMD [ARGS...])")
+		if *proxyURL == "" {
+			fmt.Fprintln(os.Stderr, "exec: missing command (use: sandbox-ctl exec --sandbox-id <sid> [flags] -- CMD [ARGS...])")
+		} else {
+			fmt.Fprintln(os.Stderr, "exec: missing command (use: sandbox-ctl exec --proxy <url> [flags] -- CMD [ARGS...])")
+		}
 		return 2
 	}
 
@@ -126,14 +143,93 @@ func execCmd(args []string) int {
 		spec.Stdio.Winsize = &proto.Winsize{Cols: cols, Rows: rows}
 	}
 
-	ctlSock := filepath.Join(rd, *sandboxID, "ctl.sock")
-	c, err := net.DialTimeout("unix", ctlSock, 5*time.Second)
+	ctlSock := ""
+	var dial func(context.Context) (net.Conn, error)
+	if *proxyURL != "" {
+		dial = func(ctx context.Context) (net.Conn, error) {
+			return dialProxyExec(ctx, *proxyURL, connectHeaders)
+		}
+	} else {
+		ctlSock = filepath.Join(rd, *sandboxID, "ctl.sock")
+		dial = func(ctx context.Context) (net.Conn, error) {
+			return dialLocalExec(ctx, ctlSock)
+		}
+	}
+	dialSignals := make(chan os.Signal, 1)
+	signal.Notify(dialSignals, syscall.SIGINT, syscall.SIGTERM)
+	c, err := dialExecInterruptible(dial, dialSignals, func() { signal.Stop(dialSignals) })
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "exec: dial %s: %v\n", ctlSock, err)
+		if ctlSock != "" {
+			fmt.Fprintf(os.Stderr, "exec: dial %s: %v\n", ctlSock, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "exec: proxy: %v\n", err)
+		}
 		return 1
 	}
 	defer c.Close()
+	return runExecOverConnWithRemoteRedaction(
+		c, spec, stdioMode, *proxyURL != "" && hasExecProxyHeaderValue(connectHeaders),
+	)
+}
 
+// dialExecInterruptible cancels an in-flight dial on SIGINT/SIGTERM and also
+// observes a signal delivered in the narrow interval after dial returns but
+// before signal delivery is stopped. stopSignals must synchronously prevent
+// further sends to signals before it returns, as signal.Stop does.
+func dialExecInterruptible(
+	dial func(context.Context) (net.Conn, error),
+	signals <-chan os.Signal,
+	stopSignals func(),
+) (net.Conn, error) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	dialFinished := make(chan struct{})
+	signalHandled := make(chan struct{})
+	go func() {
+		defer close(signalHandled)
+		select {
+		case sig := <-signals:
+			if sig != nil {
+				cancel(fmt.Errorf("%s signal received", sig))
+			}
+		case <-dialFinished:
+		}
+	}()
+
+	conn, err := dial(ctx)
+	close(dialFinished)
+	if stopSignals != nil {
+		stopSignals()
+	}
+	<-signalHandled
+	cause := context.Cause(ctx)
+	if cause == nil {
+		select {
+		case sig := <-signals:
+			if sig != nil {
+				cause = fmt.Errorf("%s signal received", sig)
+			}
+		default:
+		}
+	}
+	if cause != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, cause
+	}
+	return conn, err
+}
+
+func dialLocalExec(ctx context.Context, ctlSock string) (net.Conn, error) {
+	return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", ctlSock)
+}
+
+func runExecOverConn(c net.Conn, spec proto.ExecSpec, stdioMode stdio.Mode) int {
+	return runExecOverConnWithRemoteRedaction(c, spec, stdioMode, false)
+}
+
+func runExecOverConnWithRemoteRedaction(c net.Conn, spec proto.ExecSpec, stdioMode stdio.Mode, redactHandshake bool) int {
 	if err := ctl.WriteMessage(c, &ctl.Request{Type: ctl.TypeExecRequest, Exec: &spec}); err != nil {
 		fmt.Fprintf(os.Stderr, "exec: send request: %v\n", err)
 		return 1
@@ -144,11 +240,19 @@ func execCmd(args []string) int {
 		return 1
 	}
 	if resp.Type == ctl.TypeError {
-		fmt.Fprintf(os.Stderr, "exec: %s\n", resp.Msg)
+		if redactHandshake {
+			fmt.Fprintln(os.Stderr, "exec: remote exec rejected")
+		} else {
+			fmt.Fprintf(os.Stderr, "exec: %s\n", resp.Msg)
+		}
 		return 1
 	}
 	if resp.Type != ctl.TypeExecAck || resp.Stdio == nil {
-		fmt.Fprintf(os.Stderr, "exec: unexpected response %q\n", resp.Type)
+		if redactHandshake {
+			fmt.Fprintln(os.Stderr, "exec: unexpected remote response")
+		} else {
+			fmt.Fprintf(os.Stderr, "exec: unexpected response %q\n", resp.Type)
+		}
 		return 1
 	}
 

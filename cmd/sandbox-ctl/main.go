@@ -78,7 +78,9 @@ Usage:
                         [--ping-fatal-threshold N] [--stats-interval <dur>]
   sandbox-ctl snapshot  --sandbox-id <sid> (--output <out_dir> | --upload)
                         [--resume] [--run-root <dir>] [--timeout <sec>]
-  sandbox-ctl exec      --sandbox-id <sid> [--run-root <dir>] [--cwd <dir>]
+  sandbox-ctl exec      [--sandbox-id <sid>] [--run-root <dir>]
+                        [--proxy <http[s]://host[:port]>] [--proxy-header 'Name: value' ...]
+                        [--cwd <dir>]
                         [--env KEY=VAL ...]
                         [--stdin] [--stdout=false] [--stderr=false]
                         [--stdin-from F] [--stdout-to F] [--stderr-to F]
@@ -111,7 +113,10 @@ exec runs an ad-hoc command inside a running sandbox as a sibling of
 the user app (it does not replace it). The command + args follow '--'.
 Stdio works exactly like run (--tty / --stdin / --stdout / --stderr
 and their -from/-to variants). exec exits with the guest command's
-exit code. Rejected while a snapshot is quiescing the sandbox.
+exit code. Rejected while a snapshot is quiescing the sandbox. Without
+--proxy it dials the local sandbox ctl.sock and requires --sandbox-id.
+With --proxy it sends HTTP CONNECT directly to that endpoint and adds
+each repeatable --proxy-header without interpreting route/auth values.
 
 See docs/sandbox.md for the full design.
 `)
