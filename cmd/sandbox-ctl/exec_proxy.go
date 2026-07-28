@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -190,7 +191,8 @@ func dialProxyExecWithTLS(ctx context.Context, rawURL string, headers http.Heade
 			_ = conn.Close()
 		}
 	}()
-	stopCancelClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	transportConn := conn
+	stopCancelClose := context.AfterFunc(ctx, func() { _ = transportConn.Close() })
 	defer stopCancelClose()
 
 	deadline := time.Now().Add(execProxyHandshakeTimeout)
@@ -234,42 +236,47 @@ func dialProxyExecWithTLS(ctx context.Context, rawURL string, headers http.Heade
 
 	handshakeReader := &execProxyHandshakeReader{r: conn, remaining: execProxyResponseHeaderSize, limited: true}
 	buffered := bufio.NewReader(handshakeReader)
-	var resp *http.Response
+	var (
+		resp       *http.Response
+		statusCode int
+	)
 	for {
-		resp, err = http.ReadResponse(buffered, req)
+		var head *execProxyResponseHead
+		head, err = readExecProxyResponseHead(buffered)
 		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			if errors.Is(err, errExecProxyResponseHeaderTooLarge) || handshakeReader.remaining <= 0 {
-				return nil, fmt.Errorf("read CONNECT response: %w", errExecProxyResponseHeaderTooLarge)
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				return nil, errors.New("read CONNECT response: timeout")
-			}
-			return nil, errors.New("read CONNECT response: malformed or incomplete response")
+			return nil, classifyExecProxyResponseError(ctx, handshakeReader, err)
 		}
-		if resp.StatusCode < 100 || resp.StatusCode >= 200 || resp.StatusCode == http.StatusSwitchingProtocols {
+		statusCode = head.statusCode
+		if statusCode >= 100 && statusCode < 200 && statusCode != http.StatusSwitchingProtocols {
+			continue
+		}
+		if statusCode < 200 || statusCode >= 300 {
+			resp, err = head.readResponse(buffered, req)
+			if err != nil {
+				return nil, classifyExecProxyResponseError(ctx, handshakeReader, err)
+			}
+			statusCode = resp.StatusCode
+		}
+		if statusCode < 100 || statusCode >= 200 || statusCode == http.StatusSwitchingProtocols {
 			break
 		}
-		_ = resp.Body.Close()
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if hasExecProxyHeaderValue(headers) || resp.StatusCode < 200 {
-			return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d", resp.StatusCode)
+	if statusCode < 200 || statusCode >= 300 {
+		if hasExecProxyHeaderValue(headers) || statusCode < 200 {
+			return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d", statusCode)
 		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, execProxyErrorBodySize+1))
 		if readErr != nil {
 			if errors.Is(readErr, errExecProxyResponseHeaderTooLarge) || handshakeReader.remaining <= 0 {
 				return nil, fmt.Errorf("read CONNECT response: %w", errExecProxyResponseHeaderTooLarge)
 			}
-			return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d", resp.StatusCode)
+			return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d", statusCode)
 		}
 		message := sanitizeExecProxyErrorBody(body, headers)
 		if message == "" {
-			return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d", resp.StatusCode)
+			return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d", statusCode)
 		}
-		return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d: %s", resp.StatusCode, message)
+		return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d: %s", statusCode, message)
 	}
 	handshakeReader.limited = false
 	stopCancelClose()
@@ -282,6 +289,74 @@ func dialProxyExecWithTLS(ctx context.Context, rawURL string, headers http.Heade
 
 	succeeded = true
 	return &execProxyConn{Conn: conn, reader: buffered}, nil
+}
+
+type execProxyResponseHead struct {
+	proto      string
+	status     string
+	statusCode int
+	header     http.Header
+}
+
+// readExecProxyResponseHead stops at the empty line so that a successful
+// CONNECT response cannot interpret tunnel bytes through HTTP body framing.
+func readExecProxyResponseHead(r *bufio.Reader) (*execProxyResponseHead, error) {
+	tp := textproto.NewReader(r)
+	line, err := tp.ReadLine()
+	if err != nil {
+		return nil, err
+	}
+	proto, status, ok := strings.Cut(line, " ")
+	if !ok {
+		return nil, errors.New("malformed HTTP response")
+	}
+	status = strings.TrimLeft(status, " ")
+	statusText, _, _ := strings.Cut(status, " ")
+	if len(statusText) != 3 {
+		return nil, errors.New("malformed HTTP status code")
+	}
+	statusCode, err := strconv.Atoi(statusText)
+	if err != nil || statusCode < 0 {
+		return nil, errors.New("malformed HTTP status code")
+	}
+	if _, _, ok := http.ParseHTTPVersion(proto); !ok {
+		return nil, errors.New("malformed HTTP version")
+	}
+	header, err := tp.ReadMIMEHeader()
+	if err != nil {
+		return nil, err
+	}
+	return &execProxyResponseHead{
+		proto:      proto,
+		status:     status,
+		statusCode: statusCode,
+		header:     http.Header(header),
+	}, nil
+}
+
+// readResponse reparses a rejected response with net/http's strict transfer
+// framing so its bounded diagnostic body can be consumed safely.
+func (h *execProxyResponseHead) readResponse(r *bufio.Reader, req *http.Request) (*http.Response, error) {
+	var raw strings.Builder
+	fmt.Fprintf(&raw, "%s %s\r\n", h.proto, h.status)
+	if err := h.header.Write(&raw); err != nil {
+		return nil, err
+	}
+	raw.WriteString("\r\n")
+	return http.ReadResponse(bufio.NewReader(io.MultiReader(strings.NewReader(raw.String()), r)), req)
+}
+
+func classifyExecProxyResponseError(ctx context.Context, r *execProxyHandshakeReader, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(err, errExecProxyResponseHeaderTooLarge) || r.remaining <= 0 {
+		return fmt.Errorf("read CONNECT response: %w", errExecProxyResponseHeaderTooLarge)
+	}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return errors.New("read CONNECT response: timeout")
+	}
+	return errors.New("read CONNECT response: malformed or incomplete response")
 }
 
 // writeExecProxyConnect serializes only the validated, caller-provided Header

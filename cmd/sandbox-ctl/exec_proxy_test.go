@@ -291,6 +291,63 @@ func TestDialProxyExecReadsFinalResponseAfterInformationalResponses(t *testing.T
 	}
 }
 
+func TestDialProxyExecIgnoresSuccessfulResponseFramingHeaders(t *testing.T) {
+	const magic = "tunnel-after-invalid-framing"
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = http.ReadRequest(bufio.NewReader(conn))
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n"+
+			"Content-Length: invalid\r\nTransfer-Encoding: unsupported\r\n\r\n"+magic)
+	}()
+
+	conn, err := dialProxyExec(context.Background(), "http://"+listener.Addr().String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	got := make([]byte, len(magic))
+	if _, err := io.ReadFull(conn, got); err != nil || string(got) != magic {
+		t.Fatalf("tunnel bytes = %q, err=%v", got, err)
+	}
+	<-done
+}
+
+func TestDialProxyExecKeepsRejectedResponseFramingStrict(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = http.ReadRequest(bufio.NewReader(conn))
+		_, _ = io.WriteString(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: invalid\r\n\r\n")
+	}()
+
+	_, err = dialProxyExec(context.Background(), "http://"+listener.Addr().String(), nil)
+	if err == nil || !strings.Contains(err.Error(), "malformed or incomplete response") {
+		t.Fatalf("rejected response framing error = %v", err)
+	}
+	<-done
+}
+
 func TestDialProxyExecBoundsRejectedResponseTrailers(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

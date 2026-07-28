@@ -361,8 +361,9 @@ sandbox-ctl exec --proxy
 
 `--proxy`直接指向最终data-plane endpoint,不表示企业HTTP proxy再嵌套第二层CONNECT.
 HTTP与HTTPS都使用标准HTTP/1.1 CONNECT;HTTPS使用系统CA和hostname verification,不提供
-跳过证书校验选项.任意2xx表示tunnel建立;CONNECT响应通过有界解析,并保留`bufio.Reader`
-已经预读的tunnel bytes.非2xx响应正文有界读取,错误不会输出`--proxy-header`值.
+跳过证书校验选项.任意2xx表示tunnel建立;成功响应忽略HTTP消息体分帧字段,CONNECT响应头
+通过有界解析,并保留`bufio.Reader`已经预读的tunnel bytes.非2xx响应按HTTP分帧严格解析,
+正文有界读取,错误不会输出`--proxy-header`值.
 
 `--proxy-header`拒绝`Host`,`Connection`,`Proxy-Connection`,`Content-Length`,
 `Transfer-Encoding`和`Trailer`等transport-owned字段.这些参数可能包含bearer credential,不会写入
