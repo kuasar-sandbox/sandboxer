@@ -364,8 +364,8 @@ HTTP与HTTPS都使用标准HTTP/1.1 CONNECT;HTTPS使用系统CA和hostname verif
 跳过证书校验选项.任意2xx表示tunnel建立;CONNECT响应通过有界解析,并保留`bufio.Reader`
 已经预读的tunnel bytes.非2xx响应正文有界读取,错误不会输出`--proxy-header`值.
 
-`--proxy-header`拒绝`Host`,`Connection`,`Proxy-Connection`,`Content-Length`和
-`Transfer-Encoding`等transport-owned字段.这些参数可能包含bearer credential,不会写入
+`--proxy-header`拒绝`Host`,`Connection`,`Proxy-Connection`,`Content-Length`,
+`Transfer-Encoding`和`Trailer`等transport-owned字段.这些参数可能包含bearer credential,不会写入
 普通日志,但命令行参数可能被本机进程列表观察;生产SDK后续可用进程内API避免该暴露.
 
 **与 snapshot 的关系**:snapshot quiesce 期间拒绝新的 exec,并 SIGKILL 在飞的

@@ -34,6 +34,7 @@ var forbiddenProxyHeaders = map[string]struct{}{
 	"proxy-connection":  {},
 	"content-length":    {},
 	"transfer-encoding": {},
+	"trailer":           {},
 }
 
 // proxyHeaderFlag collects repeatable CONNECT headers without ever rendering
@@ -227,30 +228,41 @@ func dialProxyExecWithTLS(ctx context.Context, rawURL string, headers http.Heade
 		Host:   execProxyAuthority,
 		Header: headers.Clone(),
 	}
-	if err := req.Write(conn); err != nil {
+	if err := writeExecProxyConnect(conn, req.Header); err != nil {
 		return nil, fmt.Errorf("write CONNECT request: %w", err)
 	}
 
 	handshakeReader := &execProxyHandshakeReader{r: conn, remaining: execProxyResponseHeaderSize, limited: true}
 	buffered := bufio.NewReader(handshakeReader)
-	resp, err := http.ReadResponse(buffered, req)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+	var resp *http.Response
+	for {
+		resp, err = http.ReadResponse(buffered, req)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if errors.Is(err, errExecProxyResponseHeaderTooLarge) || handshakeReader.remaining <= 0 {
+				return nil, fmt.Errorf("read CONNECT response: %w", errExecProxyResponseHeaderTooLarge)
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return nil, errors.New("read CONNECT response: timeout")
+			}
+			return nil, errors.New("read CONNECT response: malformed or incomplete response")
 		}
-		if errors.Is(err, errExecProxyResponseHeaderTooLarge) {
-			return nil, fmt.Errorf("read CONNECT response: %w", err)
+		if resp.StatusCode < 100 || resp.StatusCode >= 200 || resp.StatusCode == http.StatusSwitchingProtocols {
+			break
 		}
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return nil, errors.New("read CONNECT response: timeout")
-		}
-		return nil, errors.New("read CONNECT response: malformed or incomplete response")
+		_ = resp.Body.Close()
 	}
-	handshakeReader.limited = false
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		defer resp.Body.Close()
+		if hasExecProxyHeaderValue(headers) || resp.StatusCode < 200 {
+			return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d", resp.StatusCode)
+		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, execProxyErrorBodySize+1))
 		if readErr != nil {
+			if errors.Is(readErr, errExecProxyResponseHeaderTooLarge) || handshakeReader.remaining <= 0 {
+				return nil, fmt.Errorf("read CONNECT response: %w", errExecProxyResponseHeaderTooLarge)
+			}
 			return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d", resp.StatusCode)
 		}
 		message := sanitizeExecProxyErrorBody(body, headers)
@@ -259,6 +271,7 @@ func dialProxyExecWithTLS(ctx context.Context, rawURL string, headers http.Heade
 		}
 		return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d: %s", resp.StatusCode, message)
 	}
+	handshakeReader.limited = false
 	stopCancelClose()
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -269,6 +282,20 @@ func dialProxyExecWithTLS(ctx context.Context, rawURL string, headers http.Heade
 
 	succeeded = true
 	return &execProxyConn{Conn: conn, reader: buffered}, nil
+}
+
+// writeExecProxyConnect serializes only the validated, caller-provided Header
+// values. http.Request.Write special-cases User-Agent and would otherwise
+// collapse repeated opaque values.
+func writeExecProxyConnect(w io.Writer, headers http.Header) error {
+	var request strings.Builder
+	fmt.Fprintf(&request, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", execProxyAuthority, execProxyAuthority)
+	if err := headers.Write(&request); err != nil {
+		return err
+	}
+	request.WriteString("\r\n")
+	_, err := io.WriteString(w, request.String())
+	return err
 }
 
 type execProxyHandshakeReader struct {
@@ -316,18 +343,14 @@ func (c *execProxyConn) CloseWrite() error {
 }
 
 func sanitizeExecProxyErrorBody(body []byte, headers http.Header) string {
+	if hasExecProxyHeaderValue(headers) {
+		return ""
+	}
 	truncated := len(body) > execProxyErrorBodySize
 	if truncated {
 		body = body[:execProxyErrorBodySize]
 	}
 	message := strings.ToValidUTF8(string(body), "?")
-	for _, values := range headers {
-		for _, value := range values {
-			if value != "" {
-				message = strings.ReplaceAll(message, value, "<redacted>")
-			}
-		}
-	}
 	message = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) && r != '\t' && r != '\n' && r != '\r' {
 			return '?'
@@ -339,4 +362,15 @@ func sanitizeExecProxyErrorBody(body []byte, headers http.Header) string {
 		message += " ..."
 	}
 	return message
+}
+
+func hasExecProxyHeaderValue(headers http.Header) bool {
+	for _, values := range headers {
+		for _, value := range values {
+			if value != "" {
+				return true
+			}
+		}
+	}
+	return false
 }

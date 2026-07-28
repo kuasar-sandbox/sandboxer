@@ -44,6 +44,7 @@ func TestProxyHeaderFlagPreservesRepeatedValuesAndRejectsOwnedFields(t *testing.
 		"Proxy-Connection: keep-alive",
 		"content-length: 1",
 		"Transfer-Encoding: chunked",
+		"Trailer: X-Later",
 	} {
 		var rejected proxyHeaderFlag
 		if err := rejected.Set(value); err == nil {
@@ -121,6 +122,7 @@ func TestDialProxyExecPreservesAuthorityHeadersAndBufferedTunnelBytes(t *testing
 	headers := http.Header{
 		"X-Test":              {"first", "second"},
 		"Proxy-Authorization": {"Bearer secret-value"},
+		"User-Agent":          {"first-agent", "second-agent"},
 	}
 	conn, err := dialProxyExec(context.Background(), server.URL, headers)
 	if err != nil {
@@ -148,6 +150,9 @@ func TestDialProxyExecPreservesAuthorityHeadersAndBufferedTunnelBytes(t *testing
 		}
 		if got := req.Header.Get("Proxy-Authorization"); got != "Bearer secret-value" {
 			t.Fatalf("Proxy-Authorization = %q", got)
+		}
+		if got := req.Header.Values("User-Agent"); len(got) != 2 || got[0] != "first-agent" || got[1] != "second-agent" {
+			t.Fatalf("User-Agent = %v", got)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("proxy did not observe CONNECT request")
@@ -226,7 +231,7 @@ func TestDialProxyExecForwardsExistingCtlProtocolWithoutTransportFrame(t *testin
 	}
 }
 
-func TestDialProxyExecBoundsAndRedactsRejectedResponse(t *testing.T) {
+func TestDialProxyExecOmitsRejectedResponseBodyWhenHeadersArePresent(t *testing.T) {
 	const secret = "kat1.secret-value"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
@@ -239,9 +244,115 @@ func TestDialProxyExecBoundsAndRedactsRejectedResponse(t *testing.T) {
 		t.Fatal("rejected CONNECT succeeded")
 	}
 	message := err.Error()
-	if !strings.Contains(message, "403") || !strings.Contains(message, "<redacted>") ||
-		!strings.Contains(message, "...") || strings.Contains(message, secret) || len(message) > execProxyErrorBodySize+256 {
+	if !strings.Contains(message, "403") || strings.Contains(message, "token=") ||
+		strings.Contains(message, "<redacted>") || strings.Contains(message, "...") ||
+		strings.Contains(message, secret) || len(message) > 128 {
 		t.Fatalf("rejected CONNECT error = %q", message)
+	}
+}
+
+func TestDialProxyExecBoundsRejectedResponseBodyWithoutHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, "diagnostic "+strings.Repeat("x", execProxyErrorBodySize+1024))
+	}))
+	defer server.Close()
+
+	_, err := dialProxyExec(context.Background(), server.URL, nil)
+	if err == nil {
+		t.Fatal("rejected CONNECT succeeded")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "403: diagnostic") || !strings.Contains(message, "...") ||
+		len(message) > execProxyErrorBodySize+256 {
+		t.Fatalf("bounded rejected CONNECT error = %q", message)
+	}
+}
+
+func TestDialProxyExecReadsFinalResponseAfterInformationalResponses(t *testing.T) {
+	const magic = "tunnel-after-103"
+	server := newExecConnectServer(t, false, func(conn net.Conn, rw *bufio.ReadWriter, req *http.Request) {
+		_, _ = rw.WriteString("HTTP/1.1 103 Early Hints\r\nLink: </ready>\r\n\r\n")
+		_, _ = rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n" + magic)
+		_ = rw.Flush()
+	})
+	defer server.Close()
+
+	conn, err := dialProxyExec(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	got := make([]byte, len(magic))
+	if _, err := io.ReadFull(conn, got); err != nil || string(got) != magic {
+		t.Fatalf("tunnel bytes = %q, err=%v", got, err)
+	}
+}
+
+func TestDialProxyExecBoundsRejectedResponseTrailers(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = http.ReadRequest(bufio.NewReader(conn))
+		_, _ = io.WriteString(conn, "HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n")
+		_, _ = io.WriteString(conn, "0\r\nX-Fill: "+strings.Repeat("x", execProxyResponseHeaderSize)+"\r\n\r\n")
+	}()
+
+	_, err = dialProxyExec(context.Background(), "http://"+listener.Addr().String(), nil)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("oversized rejected response trailer error = %v", err)
+	}
+	<-done
+}
+
+func TestDialProxyExecDoesNotDrainRejectedResponseBody(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		_, _ = http.ReadRequest(bufio.NewReader(conn))
+		_, _ = io.WriteString(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 1048576\r\n\r\n")
+		_, _ = io.WriteString(conn, strings.Repeat("x", execProxyErrorBodySize+1))
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		one := make([]byte, 1)
+		_, err = conn.Read(one)
+		if errors.Is(err, io.EOF) {
+			err = nil
+		}
+		done <- err
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err = dialProxyExec(ctx, "http://"+listener.Addr().String(), nil)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("rejected CONNECT error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("rejected CONNECT drained unread body for %s", elapsed)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("server did not observe prompt connection close: %v", err)
 	}
 }
 
