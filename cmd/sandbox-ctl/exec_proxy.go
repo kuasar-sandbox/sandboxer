@@ -1,0 +1,342 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"golang.org/x/net/http/httpguts"
+)
+
+const (
+	execProxyAuthority          = "sandbox:443"
+	execProxyDialTimeout        = 5 * time.Second
+	execProxyHandshakeTimeout   = 10 * time.Second
+	execProxyResponseHeaderSize = 64 << 10
+	execProxyErrorBodySize      = 4 << 10
+)
+
+var errExecProxyResponseHeaderTooLarge = errors.New("CONNECT response header too large")
+
+var forbiddenProxyHeaders = map[string]struct{}{
+	"host":              {},
+	"connection":        {},
+	"proxy-connection":  {},
+	"content-length":    {},
+	"transfer-encoding": {},
+}
+
+// proxyHeaderFlag collects repeatable CONNECT headers without ever rendering
+// their values back through flag diagnostics.
+type proxyHeaderFlag struct {
+	header http.Header
+}
+
+// redactedProxyHeaderValue prevents flag.FlagSet from quoting a rejected raw
+// argument (which may contain a bearer credential) in its parse error. The
+// underlying parser keeps its normal error contract for direct callers.
+type redactedProxyHeaderValue struct {
+	headers *proxyHeaderFlag
+	err     error
+}
+
+func (v *redactedProxyHeaderValue) String() string {
+	if v == nil || v.headers == nil {
+		return ""
+	}
+	return v.headers.String()
+}
+
+func (v *redactedProxyHeaderValue) Set(raw string) error {
+	if v.err == nil {
+		v.err = v.headers.Set(raw)
+	}
+	return nil
+}
+
+func (v *redactedProxyHeaderValue) Err() error {
+	if v == nil {
+		return nil
+	}
+	return v.err
+}
+
+func (h *proxyHeaderFlag) String() string {
+	if h == nil || len(h.header) == 0 {
+		return ""
+	}
+	return "<redacted>"
+}
+
+func (h *proxyHeaderFlag) Set(raw string) error {
+	name, value, ok := strings.Cut(raw, ":")
+	if !ok {
+		return errors.New("--proxy-header must be Name: value")
+	}
+	name = strings.TrimSpace(name)
+	value = strings.TrimSpace(value)
+	if !httpguts.ValidHeaderFieldName(name) {
+		return errors.New("--proxy-header has an invalid name")
+	}
+	if _, forbidden := forbiddenProxyHeaders[strings.ToLower(name)]; forbidden {
+		return fmt.Errorf("--proxy-header %s is transport-owned", name)
+	}
+	if !httpguts.ValidHeaderFieldValue(value) {
+		return fmt.Errorf("--proxy-header %s has an invalid value", name)
+	}
+	if h.header == nil {
+		h.header = make(http.Header)
+	}
+	h.header.Add(name, value)
+	return nil
+}
+
+func (h *proxyHeaderFlag) Header() http.Header {
+	if h == nil {
+		return nil
+	}
+	return h.header.Clone()
+}
+
+type execProxyEndpoint struct {
+	scheme     string
+	address    string
+	serverName string
+}
+
+func parseExecProxyEndpoint(raw string) (*execProxyEndpoint, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u == nil || u.Opaque != "" || u.User != nil || u.Host == "" ||
+		(u.Path != "" && u.Path != "/") || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, errors.New("invalid proxy URL")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return nil, errors.New("proxy URL scheme must be http or https")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return nil, errors.New("proxy URL host is required")
+	}
+	port := u.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	} else {
+		p, err := strconv.Atoi(port)
+		if err != nil || p <= 0 || p > 65535 {
+			return nil, errors.New("proxy URL port is invalid")
+		}
+	}
+	return &execProxyEndpoint{
+		scheme:     scheme,
+		address:    net.JoinHostPort(host, port),
+		serverName: host,
+	}, nil
+}
+
+func validateExecProxyHeaders(headers http.Header) error {
+	for name, values := range headers {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return errors.New("proxy header has an invalid name")
+		}
+		if _, forbidden := forbiddenProxyHeaders[strings.ToLower(name)]; forbidden {
+			return fmt.Errorf("proxy header %s is transport-owned", name)
+		}
+		for _, value := range values {
+			if !httpguts.ValidHeaderFieldValue(value) {
+				return fmt.Errorf("proxy header %s has an invalid value", name)
+			}
+		}
+	}
+	return nil
+}
+
+func dialProxyExec(ctx context.Context, rawURL string, headers http.Header) (net.Conn, error) {
+	return dialProxyExecWithTLS(ctx, rawURL, headers, nil)
+}
+
+func dialProxyExecWithTLS(ctx context.Context, rawURL string, headers http.Header, tlsConfig *tls.Config) (net.Conn, error) {
+	endpoint, err := parseExecProxyEndpoint(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateExecProxyHeaders(headers); err != nil {
+		return nil, err
+	}
+
+	dialer := &net.Dialer{Timeout: execProxyDialTimeout, KeepAlive: 30 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", endpoint.address)
+	if err != nil {
+		return nil, fmt.Errorf("connect proxy endpoint: %w", err)
+	}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			_ = conn.Close()
+		}
+	}()
+	stopCancelClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancelClose()
+
+	deadline := time.Now().Add(execProxyHandshakeTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("set proxy handshake deadline: %w", err)
+	}
+
+	if endpoint.scheme == "https" {
+		config := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: endpoint.serverName}
+		if tlsConfig != nil {
+			config = tlsConfig.Clone()
+			if config.ServerName == "" {
+				config.ServerName = endpoint.serverName
+			}
+			if config.MinVersion < tls.VersionTLS12 {
+				config.MinVersion = tls.VersionTLS12
+			}
+		}
+		tlsConn := tls.Client(conn, config)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, fmt.Errorf("proxy TLS handshake: %w", err)
+		}
+		conn = tlsConn
+	}
+
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: execProxyAuthority},
+		Host:   execProxyAuthority,
+		Header: headers.Clone(),
+	}
+	if err := req.Write(conn); err != nil {
+		return nil, fmt.Errorf("write CONNECT request: %w", err)
+	}
+
+	handshakeReader := &execProxyHandshakeReader{r: conn, remaining: execProxyResponseHeaderSize, limited: true}
+	buffered := bufio.NewReader(handshakeReader)
+	resp, err := http.ReadResponse(buffered, req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if errors.Is(err, errExecProxyResponseHeaderTooLarge) {
+			return nil, fmt.Errorf("read CONNECT response: %w", err)
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return nil, errors.New("read CONNECT response: timeout")
+		}
+		return nil, errors.New("read CONNECT response: malformed or incomplete response")
+	}
+	handshakeReader.limited = false
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, execProxyErrorBodySize+1))
+		if readErr != nil {
+			return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d", resp.StatusCode)
+		}
+		message := sanitizeExecProxyErrorBody(body, headers)
+		if message == "" {
+			return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d", resp.StatusCode)
+		}
+		return nil, fmt.Errorf("proxy CONNECT rejected: HTTP %d: %s", resp.StatusCode, message)
+	}
+	stopCancelClose()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("clear proxy handshake deadline: %w", err)
+	}
+
+	succeeded = true
+	return &execProxyConn{Conn: conn, reader: buffered}, nil
+}
+
+type execProxyHandshakeReader struct {
+	r         io.Reader
+	remaining int64
+	limited   bool
+}
+
+func (r *execProxyHandshakeReader) Read(p []byte) (int, error) {
+	if !r.limited {
+		return r.r.Read(p)
+	}
+	if r.remaining <= 0 {
+		return 0, errExecProxyResponseHeaderTooLarge
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.r.Read(p)
+	r.remaining -= int64(n)
+	return n, err
+}
+
+type execProxyConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *execProxyConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func (c *execProxyConn) CloseRead() error {
+	if closer, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return closer.CloseRead()
+	}
+	return nil
+}
+
+func (c *execProxyConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return nil
+}
+
+func sanitizeExecProxyErrorBody(body []byte, headers http.Header) string {
+	truncated := len(body) > execProxyErrorBodySize
+	if truncated {
+		body = body[:execProxyErrorBodySize]
+	}
+	message := strings.ToValidUTF8(string(body), "?")
+	for _, values := range headers {
+		for _, value := range values {
+			if value != "" {
+				message = strings.ReplaceAll(message, value, "<redacted>")
+			}
+		}
+	}
+	message = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\t' && r != '\n' && r != '\r' {
+			return '?'
+		}
+		return r
+	}, message)
+	message = strings.Join(strings.Fields(message), " ")
+	if truncated {
+		message += " ..."
+	}
+	return message
+}
