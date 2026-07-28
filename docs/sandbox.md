@@ -19,7 +19,7 @@ handler、cgroup/balloon 联动(含 host 端 BalloonController)、与 node-ctl
 
    node-shared  (one set per host)
        /opt/sandbox/vmlinux                  kernel image — each sandbox loads its own
-       /opt/sandbox/sandbox-runtime.erofs    guest PID 1 image — DAX-shared host page cache
+       /opt/sandbox/sandbox-runtime.bundle    guest PID 1 image — DAX-shared host page cache
        /opt/sandbox/overlay-templates/*.ext4 pre-formatted COW upper templates (multiple sizes)
        cache-ctl  (tiered)                   chunk cache shared across sandboxes
        store-ctl                             content-addressed store backend (OBS proxy)
@@ -41,7 +41,7 @@ handler、cgroup/balloon 联动(含 host 端 BalloonController)、与 node-ctl
               ▼            ▼            ▼
        ┌─ cloud-hypervisor (patched) ────────────┐
        │   KVM + virtio devices                  │
-       │   pmem  → sandbox-runtime.erofs         │
+       │   pmem  → sandbox-runtime.bundle         │
        │   blk0 / blk1 → sandbox-ctl backend     │
        └─────────────────────────────────────────┘
 
@@ -172,10 +172,6 @@ sandbox-ctl run [flags]
                           = 冷启动模式。restore 模式下 sandbox.yaml 字段语义
                           见 §11.0.远程内存预取由 sandbox.yaml 的
                           restore.prefetch 显式控制,不增加 CLI flag(§7.1)
-  --restore-file-refs verify|trust
-                          本地 file:// runtime/base ref 的校验策略。verify(默认)
-                          重算文件 SHA256 并比对 snapshot.cfg;trust 只校验协议、
-                          basename 和本地文件存在,用于受信本地性能模式
 
   # 应用 stdio(冷启动 + 恢复模式都生效;详见 docs/sandbox-init.md §3.5 / §4.5)
   #
@@ -415,7 +411,7 @@ sandbox-ctl info <manifest://hex | snapshot-path> [flags]
 把一个**本地** snapshot(`<sid>.snapshot` bundle 及其 `snapshot.cfg` 引用的全部本地
 工件)**离线提升**为远程 `manifest://` snapshot——**不启动沙箱、不需 /dev/kvm**。
 **自动上传** cfg 里每个 `file://` 工件槽位并改写为 `manifest://`:根/数据盘的
-base 镜像(`base_ref`,按 `@sha256` 摘要先校验文件)、各盘捕获的顶层
+base 镜像(`base_ref`,按 `@sha256` 先校验 tarstream marker)、各盘捕获的顶层
 overlay;远程下层链按引用带过;`runtime_ref` 刻意不动(节点级启动工件,按摘要
 钉住、随平台分发,不属于租户工件域)。内容寻址 ⇒ 共享 base 重复上传自动去重、
 失败重试安全。产出 0 本地层的全远程快照,stdout 打印其 `manifest://<key>`
@@ -491,7 +487,7 @@ network:
 # Guest 启动 + rootfs
 boot:
   kernel: file:///opt/sandbox/vmlinux              # 仅冷启动需要
-  runtime: file:///opt/sandbox/sandbox-runtime.erofs  # 仅 file://
+  runtime: file:///opt/sandbox/sandbox-runtime.bundle  # 仅 file://
   cmdline: ""                                      # 追加项(quiet/loglevel= 等);init=/root=/rootflags=/console=hvc0 平台已自动注入
   root:
     base: file:///container-snapshot.erofs    # 自动挂为 disk0(vhost-user-blk ro)
@@ -679,7 +675,7 @@ CH API 是本地管理调用、快且不受远程/缓存慢影响,60s 是安全�
 init=/sbin/init root=/dev/pmem0 ro rootfstype=erofs rootflags=dax=always console=hvc0
 ```
 
-锁定 `sandbox-runtime.erofs` 通过 virtio-pmem DAX 挂为 `/`、由 `/sbin/init`
+锁定 `sandbox-runtime.bundle` 通过 virtio-pmem DAX 挂为 `/`、由 `/sbin/init`
 (sandbox-init 二进制)接管;`console=hvc0` 让内核 dmesg 走 virtio-console(CH
 `--serial off`,没有 8250 UART)。`boot.cmdline` 的内容追加在后,用户控制 `quiet`
 / `loglevel=` 等(`console=` 与 `init=` / `root=` 已被平台占用,用户不应再写)。
@@ -705,7 +701,7 @@ sandbox-init 以 flush-and-replace 重配网卡(克隆取新 L3 身份,见 §11.
 | 字段 | `file://` | `manifest://` | 备注 |
 |------|-----------|---------------|------|
 | `boot.kernel` | ✓ | ✗ | vmlinux 体积小且节点级共享,manifest 化没有收益 |
-| `boot.runtime` | ✓ | ✗ | sandbox-runtime.erofs 节点级共享,DAX 直接用 host 文件 |
+| `boot.runtime` | ✓ | ✗ | sandbox-runtime.bundle 节点级共享,DAX 直接用 host 文件 |
 | `boot.root.base` | ✓ | ✓ | overlay 模式:erofs 镜像;单盘模式:可选 ext4 CoW 下层。跨 sandbox 复用率高,manifest 化收益最大 |
 | `boot.root.overlay.base` | ✓ | ✓ | 快照恢复时常用 manifest:// |
 | `boot.root.overlay.diff` | ✓ (only) | ✗ | 运行时 dirty 数据,本地 sparse 文件;可选,空→落盘 base 目录 |
@@ -715,7 +711,24 @@ sandbox-init 以 flush-and-replace 重配网卡(克隆取新 L3 身份,见 §11.
 | `boot.root.base_from_refs`(单盘) | ✓ | ✓ | 单盘快照链(snapshot.cfg 自动填,§3.5) |
 | `run --restore=<ref>` | ✓ | ✓ | `<sid>.snapshot` 文件路径 / manifest://<key> |
 | `restore.prefetch: memory` | skipped | ✓ | 默认 `off`;仅当前远程内存顶层且 direct ref 为单 key 时执行,§7.1 |
-| `run --restore-file-refs=verify\|trust` | ✓ | – | restore 时本地 `file://` runtime/base 引用的内容校验策略;默认 verify |
+
+### 3.2.1 file artifact identity
+
+本地磁盘、overlay 和 snapshot 使用 tarstream 工件:第一个 entry 是稀疏 payload,
+第二个 entry 是 size=0 的 `.kuasar.sha256.<hex>` marker。摘要覆盖 marker header
+之前的物理 tar 字节,由 writer 在写 payload 时同步生成。随机访问打开时只读取
+tar header、sparse map 和 marker,通过可选 `tarstream.Digester` 暴露
+`sha256:<hex>`,不读取 payload。
+
+`boot.runtime` 使用专用 bundle:
+
+```text
+raw EROFS | zero padding | ZIP(.kuasar.sha256.<hex>)
+```
+
+EROFS 保持从 offset 0 开始,bundle 总大小保持 2 MiB 对齐。runtime digest 覆盖
+ZIP 前的 EROFS + padding,启动和恢复只从 EOF 读取 ZIP marker,Cloud Hypervisor
+仍把整个 bundle 直接作为 virtio-pmem backing。
 
 ### 3.3 flattened image 内嵌 config.json
 
@@ -773,7 +786,7 @@ from_refs: []
 
 # Guest 启动 + rootfs
 boot:
-  runtime_ref: file://sandbox-runtime.erofs@sha256:<digest>
+  runtime_ref: file://sandbox-runtime.bundle@sha256:<digest>
                  # boot.runtime 仅支持 file://(见 §3.2 truth table),
                  # snapshot.cfg 保存的 runtime_ref 也只会是 file:// 形式
   root:
@@ -805,8 +818,8 @@ boot:
   sandbox.yaml 若提供必须严格相等,不一致拒绝启动(详见 §11.0、§13)
 - `runtime_ref`:始终 `file://<basename>@sha256:<digest>` 形式
   (`boot.runtime` 本身只支持 file://)。restore 时 basename 用于在
-  `<sid>.snapshot` 同目录定位文件,digest 用于内容校验(防止换了一个不同
-  版本的 erofs)
+  `<sid>.snapshot` 同目录定位文件,digest 与 runtime bundle 内 marker 比较,
+  防止选择不同版本
 - `base_ref`(file:// 类):同 runtime_ref,`file://<basename>@sha256:<digest>`
 - `base_ref`(manifest:// 类):原样保留 manifest key(`manifest://<key>`),
   无需 digest(manifest key 已是 content-addressable)
@@ -1013,7 +1026,7 @@ T17  CH (patched) 启动:
           UFFDIO_REGISTER(uffd_C, [chVA, +ramSize], MISSING)
      T17c connect uffd_socket → sendmsg(va_report; SCM_RIGHTS=uffd_C) → 等 ack
      T17d memory_range_table 检测 user_managed → snapshot_memory_ranges 不含此 zone
-     T17e 配 virtio-pmem(sandbox-runtime.erofs DAX)、virtio-vsock(cid=3)、
+     T17e 配 virtio-pmem(sandbox-runtime.bundle DAX)、virtio-vsock(cid=3)、
           可选 virtio-net(仅有网络源时)、virtio-balloon
      T17f vhost-user-blk 握手:SET_OWNER → SET_FEATURES → SET_MEM_TABLE [memfd fd]
           backend fstat 比对 inode = sandbox-ctl 启动时记下的 memfd inode
@@ -1064,7 +1077,7 @@ T24  sandbox-ctl 退出,exit code = guest 上报的 app_exited{code,term_signal}
 cloud-hypervisor \
   --api-socket  /run/sandbox/<sid>/ch.sock \
   --kernel      /opt/sandbox/vmlinux \
-  --pmem        file=/opt/sandbox/sandbox-runtime.erofs,discard_writes=on,iommu=off \
+  --pmem        file=/opt/sandbox/sandbox-runtime.bundle,discard_writes=on,iommu=off \
   --memory-zone size=8G,shared=on,fd=3,uffd_socket=/run/sandbox/<sid>/uffd.sock \
   --balloon     size=0[,deflate_on_oom=on] \
   --disk        vhost_user=on,socket=/run/sandbox/<sid>/blk0.sock,readonly=on \
@@ -1138,13 +1151,13 @@ snapshot 与 overlay 都**按内容摘要命名**(content-addressed),彼此不�
 `<sha256>.snapshot`,给人和工具一个按 sid 寻址的"最新"入口
 (`<sid>` = `sandbox-ctl run --sandbox-id` 设的或 yaml 里的)。
 
-**工件容器 = tarstream**(`accelerator/pkg/tarstream`,GNU PAX sparse
-1.0 单条目 tar):逻辑视图的洞进信封洞图,线上只有数据字节。工件文件本身**致密**
+**工件容器 = tarstream**(`accelerator/pkg/tarstream`,GNU PAX sparse payload +
+空 digest marker):逻辑视图的洞进信封洞图,线上只有数据字节。工件文件本身**致密**
 ——`cp`/`rsync`/非稀疏文件系统都不再能破坏语义,洞的权威从此是信封而非 OS。
 
-**内容摘要 `<sha256>`** = 工件字节(整个 tar 文件)的 SHA256,打包时同步计算
-(信封确定性编码 ⇒ 同内容同摘要)。只读驻留数据 + ZIP 段,8 GiB 镜像里的零页
-不读不写。
+**内容摘要 `<sha256>`** = digest marker header 之前物理 tar 字节的 SHA256,
+打包时同步计算(信封确定性编码 ⇒ 同内容同摘要)。marker 自身和 tar 结束块不参与,
+避免自引用。只读驻留数据 + ZIP 段,8 GiB 镜像里的零页不读不写。
 
 **`snapshot` 条目逻辑布局**(信封内的逻辑视图;洞在信封图里):
 
@@ -1182,8 +1195,8 @@ file 模式下 overlay 与 snapshot bundle 走同一条落盘路径:
    洞图经 SEEK_DATA/HOLE 取自**活体**源文件(这是文件系统作为洞权威的唯一一处,
    工件落定后权威归信封)
 2. `tarstream.WriteTo` 把源打包到同目录 `<sid>.<ext>.partial`,**边写边算**
-   工件字节的 SHA256(一遍);只有数据 extent 上线,洞进信封图;snapshot 的
-   ZIP 段拼接在 `ramSize` 逻辑偏移后
+   payload tar prefix 的 SHA256(一遍),再追加空 digest marker;只有数据 extent
+   上线,洞进信封图;snapshot 的 ZIP 段拼接在 `ramSize` 逻辑偏移后
 3. `rename` `.partial` → `<out_dir>/<digest>.<ext>`(原子落定);snapshot 另建/更新
    `<sid>.snapshot` 符号链接指向它
 
@@ -1228,19 +1241,16 @@ T3  CH /vm.snapshot { destination_url=file://<run-dir>/<sid>/snap-stage/ }
       state.json    - vCPU 寄存器、virtio queue 状态、IRQ 等
     sandbox-ctl 把这两个文件读进内存作为 ZIP 内容暂存,不再落盘
 T4  overlay → sink(在 memory 前处理,snapshot.cfg 才能拿到终态 overlay.base):
-    若 --output 且 diff 是自动创建(沙箱独占)且本次不 resume(沙箱将销毁):
-        **零拷贝**——就地跳空洞算摘要(§6.1)后直接 rename diff → <out_dir>/<digest>.overlay
-        (同文件系统;跨文件系统则回退到下面的复制);overlay_ref = file://<digest>.overlay
-    否则若 --output:blk1.diff 数据 extent 打包 tarstream → <sid>.overlay.partial →
-        跳空洞算摘要(§6.1)→ rename <out_dir>/<digest>.overlay;
+    若 --output:blk1.diff 数据 extent 打包 tarstream → <sid>.overlay.partial →
+        writer 返回 marker digest(§6.1)→ rename <out_dir>/<digest>.overlay;
         overlay_ref = file://<digest>.overlay
     若 --upload:blk1.diff 数据 extent 流式喂 manifest.Ingester(空洞编码进
         manifest,不落盘)→ overlay_manifest_key;
         overlay_ref = manifest://<overlay_manifest_key>
 T5  生成最终 snapshot.cfg(在内存中,§3.4 schema):
     resources.capacity:        从 sandbox 当前 SandboxConfig
-    boot.runtime_ref:           file://<basename>@sha256:<digest>(file 模式 host
-                                启动时已扫过)或 manifest://<key>(原引用)
+    boot.runtime_ref:           file://<basename>@sha256:<digest>(从 bundle marker
+                                读取)或 manifest://<key>(原引用)
     boot.root.base_ref:         同上规则
     boot.root.overlay.base:     T4 的 overlay_ref(本次 diff = 磁盘链顶)
     from_refs / overlay.base_from_refs:  增量分层链(§3.5)。冷启动 = [];否则按
@@ -1254,7 +1264,7 @@ T6  生成 snapshot 内容:
                   snapshot.cfg(三个 entries)
     若 --upload:走流式构造,直接 io.Reader 喂 ingest,不落盘;
                   stdout 输出 snapshot_manifest_key(= 链中本快照的内容寻址名)
-    若 --output:先写到 <sid>.snapshot.partial → 跳空洞算摘要(§6.1)→ rename
+    若 --output:先写到 <sid>.snapshot.partial → writer 返回 marker digest(§6.1)→ rename
                   <out_dir>/<sha256>.snapshot,再建/更新符号链接
                   <out_dir>/<sid>.snapshot → <sha256>.snapshot
 T7  srv0.Resume() + srv1.Resume()
@@ -1396,8 +1406,8 @@ T3  archive/zip.NewReader(ReaderAt, totalSize) → 解出 config.json / state.js
 T4  restore.ApplyRules(host sandbox.yaml, snapshot.cfg, snapshotPath):
     - 验证 capacity 一致(host 提供时)
     - 验证 boot.runtime / boot.root.base 协议 + basename 匹配(host 提供时)
-    - 默认 `--restore-file-refs=verify` 会重算本地 file:// 内容 SHA256;
-      `trust` 只确认本地文件存在,跳过内容 hash
+    - runtime 从 bundle 尾部 ZIP、base 从 tarstream marker 读取声明摘要并与 ref 比较;
+      全程不读取 payload
     - 未提供时从 snapshot.cfg 复制(file 模式解析为 .snapshot 同目录文件)
     - 详见 §11.0 字段语义表 + §13 校验矩阵
     restore.Run 随后读取 config.json.net,要求快照 NIC 拓扑与 host network source
@@ -1972,8 +1982,8 @@ allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
 | `network.{tap\|tapfd}` | 最多一个且存在性必须与 config.json 中的快照 NIC 拓扑一致;tapfd 模式重新交接(docs/tapfd.md §4,幂等)取新 fd,经 `--restore net_fds=[_net0@[4]]` 注入 CH;tap 名模式 CH 按名重开 | 仅无 NIC 快照允许;联网快照报拓扑不匹配 |
 | `network.{ip,mtu,nexthop,hostname,interface}` | 仅存在网络源时允许;经 restore 通知重新下发,guest flush-and-replace 重配(克隆取新 L3 身份);MAC 不变(沿用快照设备状态,故 provider 须用稳定 per-port MAC) | 无 NIC 快照保持无 NIC;联网快照保留快照网络不变 |
 | `boot.kernel` | 静默忽略(restore 不 boot) | 同 |
-| `boot.runtime`(仅 file://) | basename 与 snapshot.cfg.runtime_ref 匹配才允许;默认还要求 sha256 digest 匹配 | 用 snapshot.cfg.runtime_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
-| `boot.root.base`(file://) | 协议 + basename 与 snapshot.cfg.base_ref 一致才允许;默认还要求 digest 匹配 | 用 snapshot.cfg.base_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
+| `boot.runtime`(仅 file://) | basename 与 snapshot.cfg.runtime_ref 匹配,且 bundle marker 必须与 digest 一致 | 用 snapshot.cfg.runtime_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
+| `boot.root.base`(file://) | 协议 + basename 与 snapshot.cfg.base_ref 一致,且 tarstream marker 必须与 digest 一致 | 用 snapshot.cfg.base_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
 | `boot.root.base`(manifest://) | manifest key 与 snapshot.cfg.base_ref 一致才允许 | 用 snapshot.cfg.base_ref 原值 |
 | `boot.root.overlay.base` | **静默忽略** | 用 snapshot.cfg.overlay.base |
 | `from_refs` / `boot.root.overlay.base_from_refs` | 无此 yaml 字段(增量分层链纯由 snapshot.cfg 提供,§3.5) | 用 snapshot.cfg 原值 |
@@ -1989,15 +1999,11 @@ allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
 capacity 决定了页面布局、kernel 内部数据结构(NR_CPUS / per-cpu data /
 zone watermarks)。变了 capacity 等于换了一套硬件假设,行为未定义。
 
-**为什么 file:// runtime / base 要 digest 校验**:跨主机移动 snapshot 时,
-目标 host 上同名 sandbox-runtime.erofs / container-image.erofs 可能是不同
-版本。digest 不匹配的恢复不安全(guest 期望 inode 数据与文件实际数据不一致,
-EROFS 挂载或运行时读会读到诡异数据)。
-
-`--restore-file-refs=trust` 是受信本地性能模式:仍校验协议和 basename,并确认
-本地文件存在,但不顺序读取 runtime/base 文件重算 SHA256。它适合单机性能比拼、
-同节点 snapshot fork、或平台已用带外机制保证 runtime/base 不被替换的场景;跨
-节点迁移、导入外部 snapshot、或多租户生产默认应继续使用 `verify`。
+**为什么 file:// runtime / base 要 marker 校验**:跨主机移动 snapshot 时,
+目标 host 上同名 sandbox-runtime.bundle / container-image.erofs 可能是不同
+版本。恢复必须比较 snapshot ref 与构建阶段写入的 marker。该比较只有 metadata
+I/O,没有再保留跳过校验的性能模式。marker 是制品 identity 声明;发布流程通过
+写入时计算、fsync、原子 rename 和发布后不可变保证 payload 与声明一致。
 
 **boot.root.overlay.base 为什么忽略 yaml**:overlay 数据是 sandbox 自己的写
 状态,与镜像 base 等价物,只能从 snapshot 内部走。让 yaml 强制提供没意义,
@@ -2228,7 +2234,7 @@ snapshot 路径要求 `/vm.pause` 之后内存内容稳定,但 backend worker �
 
 `run --restore=<ref>` 触发。host yaml 先经 `ValidateRestoreHostConfig` 自校验
 (可选网络源、引用格式等),与 snapshot.cfg 的交叉校验(capacity 相等、runtime/base
-ref 匹配;默认含 digest)随后在 `restore.ApplyRules` 拿到 bundle 时进行;
+ref 与 marker 匹配)随后在 `restore.ApplyRules` 拿到 bundle 时进行;
 config.json.net 提供快照 NIC 拓扑,restore.Run 在任何 tapfd 交接或 CH 启动前校验.
 `restore.prefetch` 还会在 `restore.Run` 入口复用同一个 parser,保证普通
 `run --restore` 即使未预先调用 validator,也会在副作用前拒绝非法值.额外:
@@ -2240,7 +2246,7 @@ config.json.net 提供快照 NIC 拓扑,restore.Run 在任何 tapfd 交接或 CH
 | sandbox.yaml 提供 `boot.runtime` 时,协议必须与 snapshot.cfg.runtime_ref 一致 | "boot.runtime scheme mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 `boot.root.base` 时,协议必须与 snapshot.cfg.base_ref 一致 | "boot.root.base scheme mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 file:// runtime / base 时,basename(filepath.Base)必须与 snapshot.cfg ref 中 basename 一致 | "<field> basename mismatch with snapshot.cfg" |
-| sandbox.yaml 提供 file:// runtime / base 且 `--restore-file-refs=verify` 时,文件 SHA256 digest 必须与 snapshot.cfg ref 中 @sha256:<digest> 一致 | "<field> digest mismatch with snapshot.cfg" |
+| sandbox.yaml 提供 file:// runtime / base 时,制品 marker 必须与 snapshot.cfg ref 中 @sha256:<digest> 一致 | "<field> digest mismatch: sha256 marker mismatch ..." |
 | sandbox.yaml 提供 manifest:// runtime / base 时,manifest key 必须与 snapshot.cfg ref 一致 | "<field> manifest key mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 `resources.capacity.{cpu,memory}` 时,与 snapshot.cfg 严格相等 | "capacity mismatch with snapshot.cfg" |
 | `boot.root.overlay.diff` 可选;空→落盘 base 目录新建(随沙箱销毁) | — |

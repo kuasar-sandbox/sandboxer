@@ -4,7 +4,7 @@
 #   sandbox-init    guest PID 1 source/binary (packed by guest-runtime)
 #
 # `make build` produces the two sandboxer binaries. The guest-runtime repo
-# consumes sandbox-init to produce sandbox-runtime.erofs.
+# consumes sandbox-init to produce sandbox-runtime.bundle.
 
 SHELL := /bin/bash
 
@@ -82,7 +82,7 @@ clean:
 
 # Go micro-benchmarks. Sandbox-level e2e (cold/snapshot/restore/...) lives in
 # release-builder/test/e2e — they need vmlinux + cloud-hypervisor + mkfs.erofs
-# (from guest-runtime/native-deps), sandbox-runtime.erofs (from guest-runtime),
+# (from guest-runtime/native-deps), sandbox-runtime.bundle (from guest-runtime),
 # and accelerator binaries, so they are cross-repo.
 bench:
 	CGO_ENABLED=0 $(GO) test -bench=. -benchmem -run=^$$ ./...

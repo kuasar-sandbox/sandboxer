@@ -50,7 +50,6 @@ func runCmd(args []string) int {
 	statsJSON := fs.String("stats-json", "", "if set, write per-backend + uffd stats as JSON to this path on shutdown")
 
 	restoreRef := fs.String("restore", "", "snapshot reference (file path or manifest://<hex>) — switches to restore mode")
-	restoreFileRefs := fs.String("restore-file-refs", string(restore.FileRefPolicyVerify), "restore local file:// refs: verify content digest or trust snapshot.cfg (verify|trust)")
 
 	// stdio flags. The bool flags (--stdin/--stdout/--stderr/--tty) are
 	// tri-state — "not set" must be distinguishable from "set to false"
@@ -90,12 +89,6 @@ func runCmd(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	fileRefs, err := restore.ParseFileRefPolicy(*restoreFileRefs)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "sandbox-ctl run: %v\n", err)
-		return 2
-	}
-
 	// --ping-fatal-threshold precedence: flag > env > 0 (disabled).
 	pingFatalSet := false
 	fs.Visit(func(f *flag.Flag) {
@@ -240,7 +233,7 @@ func runCmd(args []string) int {
 	// Restore mode dispatch.
 	if restoreR != "" {
 		return runRestore(ctx, cfg, manifestCfg, restoreR,
-			fileRefs, *sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards)
+			*sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards)
 	}
 
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
@@ -265,7 +258,7 @@ func runCmd(args []string) int {
 
 // runRestore parses the snapshot reference and dispatches to restore.Run.
 func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *config.ManifestConfig,
-	ref string, fileRefs restore.FileRefPolicy, sandboxID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
+	ref string, sandboxID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec,
 ) int {
 	// Validate host-only restore policy before inspecting the remote reference or
@@ -310,7 +303,6 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 		HostCfg:             cfg,
 		ManifestCfg:         manifestCfg,
 		Fetcher:             fetcher,
-		FileRefs:            fileRefs,
 		SandboxID:           sandboxID,
 		CHBinary:            chBin,
 		RuntimeRoot:         runDir,

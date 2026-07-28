@@ -1,16 +1,12 @@
 package restore
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"io"
-	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -87,37 +83,6 @@ type Ref struct {
 	Key      string // manifest mode: hex content key; file mode: empty
 }
 
-// FileRefPolicy controls how restore treats local file:// refs recorded in
-// snapshot.cfg.
-type FileRefPolicy string
-
-const (
-	FileRefPolicyVerify FileRefPolicy = "verify"
-	FileRefPolicyTrust  FileRefPolicy = "trust"
-)
-
-// ApplyOptions tunes restore snapshot.cfg/host-yaml merge rules.
-type ApplyOptions struct {
-	FileRefs FileRefPolicy
-}
-
-// ParseFileRefPolicy parses the public verify|trust spelling. Empty means the
-// default strict mode.
-func ParseFileRefPolicy(s string) (FileRefPolicy, error) {
-	switch FileRefPolicy(strings.TrimSpace(s)) {
-	case "", FileRefPolicyVerify:
-		return FileRefPolicyVerify, nil
-	case FileRefPolicyTrust:
-		return FileRefPolicyTrust, nil
-	default:
-		return "", fmt.Errorf("restore file refs %q (want verify|trust)", s)
-	}
-}
-
-func (p FileRefPolicy) normalized() (FileRefPolicy, error) {
-	return ParseFileRefPolicy(string(p))
-}
-
 // String reconstructs the canonical form. Inverse of ParseRef.
 func (r Ref) String() string {
 	switch r.Scheme {
@@ -160,11 +125,9 @@ func ParseRef(s string) (Ref, error) {
 // ApplyRules merges host sandbox.yaml fields against the snapshot.cfg
 // per docs/sandbox.md §11.0. Host-provided file:// URLs in
 // boot.runtime / boot.root.base must match the snapshot.cfg ref's
-// scheme + basename. In verify mode, the local file content must also
-// match the ref's SHA256. In trust mode, restore skips that content hash
-// and only checks that the local file exists. Host-empty fields are
-// auto-filled from snapshot.cfg (basename interpreted relative to the
-// snapshot bundle's directory).
+// scheme + basename, and the artifact's embedded digest marker must match the
+// ref. Host-empty fields are auto-filled from snapshot.cfg (basename
+// interpreted relative to the snapshot bundle's directory).
 //
 // Capacity must match exactly when host provides it. Network may be omitted;
 // Run separately verifies that its presence matches the device topology in
@@ -178,16 +141,12 @@ func ParseRef(s string) (Ref, error) {
 // runtime/base ref fields explicitly.
 //
 // Returns the merged config.SandboxConfig the lifecycle should run with.
-func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string, opts ApplyOptions) (*config.SandboxConfig, error) {
+func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string) (*config.SandboxConfig, error) {
 	if host == nil {
 		return nil, errors.New("ApplyRules: host config is nil")
 	}
 	if snap == nil {
 		return nil, errors.New("ApplyRules: snapshot.cfg is nil")
-	}
-	fileRefs, err := opts.FileRefs.normalized()
-	if err != nil {
-		return nil, err
 	}
 	out := *host // shallow copy
 
@@ -221,7 +180,7 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 	if snapRuntimeRef.Scheme != "file" {
 		return nil, fmt.Errorf("snapshot.cfg.runtime_ref: scheme %q unexpected (boot.runtime is file:// only)", snapRuntimeRef.Scheme)
 	}
-	resolvedRuntime, err := resolveBootFileRef(host.Boot.Runtime, snapRuntimeRef, snapshotPath, "boot.runtime", fileRefs)
+	resolvedRuntime, err := resolveBootFileRef(host.Boot.Runtime, snapRuntimeRef, snapshotPath, "boot.runtime", readRuntimeBundleDigest)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +203,7 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 		if err != nil {
 			return nil, fmt.Errorf("snapshot.cfg.base_ref: %w", err)
 		}
-		resolvedBase, err := resolveAnyRef(host.Boot.Root.Base, snapBaseRef, snapshotPath, "boot.root.base", fileRefs)
+		resolvedBase, err := resolveAnyRef(host.Boot.Root.Base, snapBaseRef, snapshotPath, "boot.root.base")
 		if err != nil {
 			return nil, err
 		}
@@ -281,7 +240,7 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 				if err != nil {
 					return nil, fmt.Errorf("snapshot.cfg.%s.base_ref: %w", field, err)
 				}
-				resolvedBase, err := resolveAnyRef(hd.Base, snapBaseRef, snapshotPath, field+".base", fileRefs)
+				resolvedBase, err := resolveAnyRef(hd.Base, snapBaseRef, snapshotPath, field+".base")
 				if err != nil {
 					return nil, err
 				}
@@ -310,16 +269,15 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 //   - host empty: build absolute path = filepath.Join(<bundle dir>, basename).
 //   - host non-empty: parse host URL → file path and verify
 //     basename(path) == ref.Basename.
-//   - verify mode hashes the local file and matches ref.Digest; trust mode
-//     only checks that the local file exists.
-func resolveBootFileRef(hostURL string, snapRef Ref, snapshotPath, fieldName string, fileRefs FileRefPolicy) (string, error) {
+//   - the embedded marker must match ref.Digest.
+func resolveBootFileRef(hostURL string, snapRef Ref, snapshotPath, fieldName string, readDigest func(string) (string, error)) (string, error) {
 	if hostURL == "" {
 		if snapshotPath == "" {
 			return "", fmt.Errorf("%s: snapshot.cfg ref is file:// but bundle is manifest-loaded; provide %s explicitly", fieldName, fieldName)
 		}
 		bundleDir := filepath.Dir(snapshotPath)
 		abs := filepath.Join(bundleDir, snapRef.Basename)
-		if err := validateFileRef(abs, snapRef.Digest, fileRefs); err != nil {
+		if err := validateFileRef(abs, snapRef.Digest, readDigest); err != nil {
 			return "", fmt.Errorf("%s: auto-resolved %s: %w", fieldName, abs, err)
 		}
 		return "file://" + abs, nil
@@ -335,10 +293,7 @@ func resolveBootFileRef(hostURL string, snapRef Ref, snapshotPath, fieldName str
 	if filepath.Base(hostPath) != snapRef.Basename {
 		return "", fmt.Errorf("%s: basename mismatch with snapshot.cfg (host=%q, snap=%q)", fieldName, filepath.Base(hostPath), snapRef.Basename)
 	}
-	if err := validateFileRef(hostPath, snapRef.Digest, fileRefs); err != nil {
-		if fileRefs != FileRefPolicyVerify {
-			return "", fmt.Errorf("%s: file ref: %w", fieldName, err)
-		}
+	if err := validateFileRef(hostPath, snapRef.Digest, readDigest); err != nil {
 		return "", fmt.Errorf("%s: digest mismatch: %w", fieldName, err)
 	}
 	return hostURL, nil
@@ -346,10 +301,10 @@ func resolveBootFileRef(hostURL string, snapRef Ref, snapshotPath, fieldName str
 
 // resolveAnyRef handles either file:// or manifest:// refs (used by
 // boot.root.base which accepts both).
-func resolveAnyRef(hostURL string, snapRef Ref, snapshotPath, fieldName string, fileRefs FileRefPolicy) (string, error) {
+func resolveAnyRef(hostURL string, snapRef Ref, snapshotPath, fieldName string) (string, error) {
 	switch snapRef.Scheme {
 	case "file":
-		return resolveBootFileRef(hostURL, snapRef, snapshotPath, fieldName, fileRefs)
+		return resolveBootFileRef(hostURL, snapRef, snapshotPath, fieldName, readTarArtifactDigest)
 	case "manifest":
 		if hostURL == "" {
 			return snapRef.String(), nil
@@ -367,35 +322,10 @@ func resolveAnyRef(hostURL string, snapRef Ref, snapshotPath, fieldName string, 
 	}
 }
 
-func validateFileRef(path, want string, policy FileRefPolicy) error {
-	if policy == FileRefPolicyVerify {
-		return verifyFileDigest(path, want)
-	}
-	st, err := os.Stat(path)
+func validateFileRef(path, want string, readDigest func(string) (string, error)) error {
+	got, err := readDigest(path)
 	if err != nil {
 		return err
 	}
-	if st.IsDir() {
-		return fmt.Errorf("%s is a directory", path)
-	}
-	return nil
-}
-
-// verifyFileDigest streams the file at path, computes SHA256 (sparse
-// holes read as 0), and returns nil iff hex(hash) == want.
-func verifyFileDigest(path, want string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return err
-	}
-	got := hex.EncodeToString(h.Sum(nil))
-	if got != want {
-		return fmt.Errorf("sha256 mismatch (got %s, want %s)", got, want)
-	}
-	return nil
+	return matchDigest(got, want)
 }

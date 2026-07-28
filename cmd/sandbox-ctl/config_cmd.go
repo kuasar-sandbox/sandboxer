@@ -211,7 +211,7 @@ network:
   hostname: my-sandbox
 boot:
   kernel:  file:///opt/sandbox/vmlinux
-  runtime: file:///opt/sandbox/sandbox-runtime.erofs
+  runtime: file:///opt/sandbox/sandbox-runtime.bundle
   root:
     base: file:///opt/sandbox/app.erofs    # flattened image (erofs, ro lower)
     overlay:
@@ -257,7 +257,7 @@ network:
   ip: 169.254.4.1/31                       # clone takes a fresh identity
   hostname: clone-1
 boot:
-  runtime: file:///opt/sandbox/sandbox-runtime.erofs   # must match snapshot.cfg digest
+  runtime: file:///opt/sandbox/sandbox-runtime.bundle   # must match snapshot.cfg digest
   root:
     base: file:///opt/sandbox/app.erofs
     overlay: {}                            # diff omitted → fresh diff on disk;

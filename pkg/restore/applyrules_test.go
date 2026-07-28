@@ -1,23 +1,81 @@
 package restore
 
 import (
+	"archive/zip"
+	"bytes"
+	"context"
 	"crypto/sha256"
-	"encoding/hex"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
-// helper: creates a file at path with body, returns hex(sha256).
+// writeFile creates the new platform artifact shape used by ApplyRules tests:
+// runtime paths get an aligned EROFS-prefix bundle, bases get tarstream.
 func writeFile(t *testing.T, path string, body []byte) string {
 	t.Helper()
-	if err := os.WriteFile(path, body, 0o644); err != nil {
+	if strings.Contains(filepath.Base(path), "runtime") {
+		return writeRuntimeBundle(t, path, body)
+	}
+	f, err := os.Create(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	h := sha256.Sum256(body)
-	return hex.EncodeToString(h[:])
+	digest, err := tarstream.WriteTo(context.Background(), f, "image", sparse.Dense(bytes.NewReader(body), uint64(len(body))))
+	if err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimPrefix(digest, "sha256:")
+}
+
+func writeRuntimeBundle(t *testing.T, path string, body []byte) string {
+	t.Helper()
+	markerZIP := func(hexDigest string) []byte {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		h := &zip.FileHeader{
+			Name:     tarstream.SHA256MarkerPrefix + hexDigest,
+			Method:   zip.Store,
+			Modified: time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC),
+		}
+		h.SetMode(0o444)
+		if _, err := zw.CreateHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+	placeholder := markerZIP(strings.Repeat("0", 64))
+	bundle := make([]byte, 2<<20)
+	prefixSize := len(bundle) - len(placeholder)
+	if len(body) > prefixSize {
+		t.Fatalf("runtime test body too large: %d", len(body))
+	}
+	copy(bundle, body)
+	sum := sha256.Sum256(bundle[:prefixSize])
+	hexDigest := fmt.Sprintf("%x", sum[:])
+	footer := markerZIP(hexDigest)
+	if len(footer) != len(placeholder) {
+		t.Fatal("runtime marker ZIP size changed")
+	}
+	copy(bundle[prefixSize:], footer)
+	if err := os.WriteFile(path, bundle, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return hexDigest
 }
 
 // baseSnap returns a SnapshotCfg with capacity 2vCPU/4GiB and the given
@@ -33,7 +91,7 @@ func baseSnap(runtimeRef, baseRef, overlayBase string) *SnapshotCfg {
 }
 
 func applyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string) (*config.SandboxConfig, error) {
-	return ApplyRules(host, snap, snapshotPath, ApplyOptions{})
+	return ApplyRules(host, snap, snapshotPath)
 }
 
 func TestParseRef(t *testing.T) {
@@ -66,30 +124,6 @@ func TestParseRef(t *testing.T) {
 		}
 		if got.Scheme != tc.scheme || got.Basename != tc.base || got.Digest != tc.dig || got.Key != tc.key {
 			t.Errorf("ParseRef(%q) = %+v, want {%s %s %s %s}", tc.in, got, tc.scheme, tc.base, tc.dig, tc.key)
-		}
-	}
-}
-
-func TestParseFileRefPolicy(t *testing.T) {
-	for _, tc := range []struct {
-		in   string
-		want FileRefPolicy
-		err  bool
-	}{
-		{"", FileRefPolicyVerify, false},
-		{"verify", FileRefPolicyVerify, false},
-		{"trust", FileRefPolicyTrust, false},
-		{"bad", "", true},
-	} {
-		got, err := ParseFileRefPolicy(tc.in)
-		if tc.err {
-			if err == nil {
-				t.Errorf("ParseFileRefPolicy(%q) expected error", tc.in)
-			}
-			continue
-		}
-		if err != nil || got != tc.want {
-			t.Errorf("ParseFileRefPolicy(%q) = %q, %v; want %q, nil", tc.in, got, err, tc.want)
 		}
 	}
 }
@@ -283,33 +317,8 @@ func TestApplyRules_RuntimeProvidedDigestMustMatch(t *testing.T) {
 	if err := os.WriteFile(rtPath, []byte("tampered"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
-		t.Fatalf("expected sha256 mismatch, got %v", err)
-	}
-}
-
-func TestApplyRules_TrustFileRefsSkipsDigestContentCheck(t *testing.T) {
-	dir := t.TempDir()
-	rtPath := filepath.Join(dir, "runtime.erofs")
-	rtDigest := writeFile(t, rtPath, []byte("runtime body"))
-	bsPath := filepath.Join(dir, "base.erofs")
-	bsDigest := writeFile(t, bsPath, []byte("base body"))
-	snap := baseSnap("file://runtime.erofs@sha256:"+rtDigest, "file://base.erofs@sha256:"+bsDigest, "file://abc.overlay")
-
-	host := &config.SandboxConfig{}
-	host.Network.TAP = "tap0"
-	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
-	host.Boot.Runtime = "file://" + rtPath
-	host.Boot.Root.Base = "file://" + bsPath
-
-	if err := os.WriteFile(rtPath, []byte("tampered runtime"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(bsPath, []byte("tampered base"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ApplyRules(host, snap, filepath.Join(dir, "x.snapshot"), ApplyOptions{FileRefs: FileRefPolicyTrust}); err != nil {
-		t.Fatalf("trust mode should skip content digest mismatch: %v", err)
+	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("expected digest marker failure, got %v", err)
 	}
 }
 
