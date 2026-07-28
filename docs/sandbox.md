@@ -314,11 +314,14 @@ snapshot.cfg 的 overlay.base 引用与实际数据位置脱节。
 / `kubectl exec`)。
 
 ```
-sandbox-ctl exec --sandbox-id <sid> [flags] -- CMD [ARGS...]
+sandbox-ctl exec [--sandbox-id <sid>] [--proxy <http[s]://host[:port]>] [flags] -- CMD [ARGS...]
 
-  --sandbox-id <sid>    必填,目标 sandbox
+  --sandbox-id <sid>    本地模式必填,目标 sandbox;远程模式不把它转换为任何 Header
   --run-root <dir>      与 run 一致;SANDBOX_RUN_ROOT env;默认 /run/sandbox。exec 通过
                         <run-root>/<sid>/ctl.sock 联系运行中的 sandbox-ctl run 进程
+  --proxy <url>         远程模式:直连最终接收业务 Header 的 HTTP/HTTPS CONNECT endpoint
+  --proxy-header <h>    远程 CONNECT Header,格式为 "Name: value",可重复;同名值按 Add
+                        语义保留.客户端不解析或生成 SID/service/token/group/route-key
   --cwd <dir>           命令在 guest 内的工作目录(默认 guest 根)
   --user <u>            run-as 身份:"uid[:gid]" 或沙箱 /etc/passwd 用户名(默认 root)
   --env KEY=VAL         追加/覆盖一个环境变量,可重复。在一个默认 PATH 基线上叠加
@@ -346,6 +349,24 @@ guest 之间。多个 exec 会话并发互不影响。远程授权 exec 由可�
 在完成鉴权并选定目标 sandbox 后,调用 `pkg/ctl.ProxyExec` 对下游首帧做
 `exec_request` gate,再接入同一条 `ctl.sock` 与 MUX 路径;不定义另一套 guest
 wire。
+
+远程模式只替换上述第一跳拨号:
+
+```text
+sandbox-ctl exec --proxy
+  → HTTP/HTTPS CONNECT sandbox:443
+  → 已鉴权的数据面 tunnel
+  → 原有 exec_request → exec_ack → MUX
+```
+
+`--proxy`直接指向最终data-plane endpoint,不表示企业HTTP proxy再嵌套第二层CONNECT.
+HTTP与HTTPS都使用标准HTTP/1.1 CONNECT;HTTPS使用系统CA和hostname verification,不提供
+跳过证书校验选项.任意2xx表示tunnel建立;CONNECT响应通过有界解析,并保留`bufio.Reader`
+已经预读的tunnel bytes.非2xx响应正文有界读取,错误不会输出`--proxy-header`值.
+
+`--proxy-header`拒绝`Host`,`Connection`,`Proxy-Connection`,`Content-Length`和
+`Transfer-Encoding`等transport-owned字段.这些参数可能包含bearer credential,不会写入
+普通日志,但命令行参数可能被本机进程列表观察;生产SDK后续可用进程内API避免该暴露.
 
 **与 snapshot 的关系**:snapshot quiesce 期间拒绝新的 exec,并 SIGKILL 在飞的
 exec 子进程(快照不能带运行中的 exec 兄弟进程);沙箱 resume / restore 后恢复
