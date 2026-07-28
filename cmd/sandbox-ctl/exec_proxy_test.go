@@ -11,7 +11,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -450,6 +452,31 @@ func TestDialProxyExecContextCancellationInterruptsHandshake(t *testing.T) {
 	<-done
 }
 
+func TestDialExecInterruptibleClosesConnectionWhenSignalRacesWithDialCompletion(t *testing.T) {
+	client, peer := net.Pipe()
+	defer peer.Close()
+	signals := make(chan os.Signal, 1)
+	stopped := false
+	conn, err := dialExecInterruptible(
+		func(context.Context) (net.Conn, error) { return client, nil },
+		signals,
+		func() {
+			// Model a signal already accepted by os/signal immediately before
+			// signal.Stop establishes that no later delivery is possible.
+			signals <- syscall.SIGTERM
+			stopped = true
+		},
+	)
+	if conn != nil || err == nil || !strings.Contains(err.Error(), "terminated") || !stopped {
+		t.Fatalf("racing signal conn=%v err=%v stopped=%v", conn, err, stopped)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	one := make([]byte, 1)
+	if _, readErr := peer.Read(one); !errors.Is(readErr, io.EOF) {
+		t.Fatalf("successful dial connection remained open after signal: %v", readErr)
+	}
+}
+
 func TestExecCmdProxyDoesNotRequireSandboxIDOrEchoHeaders(t *testing.T) {
 	const secret = "secret-proxy-header"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -481,6 +508,57 @@ func TestExecCmdProxyDoesNotRequireSandboxIDOrEchoHeaders(t *testing.T) {
 	})
 	if code != 2 || !strings.Contains(stderr, "invalid name") || strings.Contains(stderr, secret) {
 		t.Fatalf("invalid proxy-header validation code=%d stderr=%q", code, stderr)
+	}
+}
+
+func TestExecCmdProxyHidesRemoteCtlHandshakeDiagnostics(t *testing.T) {
+	const secret = "remote-reflected-secret"
+	for _, test := range []struct {
+		name     string
+		response ctl.Response
+		want     string
+	}{
+		{name: "error message", response: ctl.Response{Type: ctl.TypeError, Msg: secret}, want: "remote exec rejected"},
+		{name: "unexpected type", response: ctl.Response{Type: secret}, want: "unexpected remote response"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			serverDone := make(chan error, 1)
+			server := newExecConnectServer(t, false, func(conn net.Conn, rw *bufio.ReadWriter, req *http.Request) {
+				if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+					serverDone <- err
+					return
+				}
+				if err := rw.Flush(); err != nil {
+					serverDone <- err
+					return
+				}
+				var request ctl.Request
+				if err := ctl.ReadMessage(rw, &request); err != nil {
+					serverDone <- err
+					return
+				}
+				if err := ctl.WriteMessage(rw, &test.response); err != nil {
+					serverDone <- err
+					return
+				}
+				serverDone <- rw.Flush()
+			})
+			defer server.Close()
+
+			code, stderr := captureStderr(t, func() int {
+				return execCmd([]string{
+					"--proxy", server.URL,
+					"--proxy-header", "X-Access-Token: " + secret,
+					"--", "/bin/true",
+				})
+			})
+			if code != 1 || !strings.Contains(stderr, test.want) || strings.Contains(stderr, secret) {
+				t.Fatalf("exec code=%d stderr=%q", code, stderr)
+			}
+			if err := <-serverDone; err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

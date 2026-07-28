@@ -366,7 +366,8 @@ HTTP与HTTPS都使用标准HTTP/1.1 CONNECT;HTTPS使用系统CA和hostname verif
 
 `--proxy-header`拒绝`Host`,`Connection`,`Proxy-Connection`,`Content-Length`,
 `Transfer-Encoding`和`Trailer`等transport-owned字段.这些参数可能包含bearer credential,不会写入
-普通日志,但命令行参数可能被本机进程列表观察;生产SDK后续可用进程内API避免该暴露.
+普通日志;携带任意该Header时,HTTP拒绝正文和CONNECT 200后的ctl握手详情均不输出.
+命令行参数仍可能被本机进程列表观察;生产SDK后续可用进程内API避免该暴露.
 
 **与 snapshot 的关系**:snapshot quiesce 期间拒绝新的 exec,并 SIGKILL 在飞的
 exec 子进程(快照不能带运行中的 exec 兄弟进程);沙箱 resume / restore 后恢复
