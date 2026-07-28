@@ -1,11 +1,11 @@
 # sandbox-init — guest PID 1 ABI
 
 `sandbox-init` 是每个 sandbox guest 内的 PID 1,由 `sandboxer/cmd/sandbox-init`
-构建,再由 `guest-runtime` 打包进 `sandbox-runtime.erofs`。本文档定义
+构建,再由 `guest-runtime` 打包进 `sandbox-runtime.bundle`。本文档定义
 `sandbox-init` 与 host 侧 `sandbox-ctl` 之间的 ABI:启动期 rootfs 组装、launch
 握手、应用拉起、生命周期监督、stdio/console 转发、exec/attach/quiesce 控制面。
 
-`sandbox-runtime.erofs` 的镜像打包、内置 guest payload、版本发布与构建流程见
+`sandbox-runtime.bundle` 的镜像打包、内置 guest payload、版本发布与构建流程见
 `guest-runtime/docs/sandbox-runtime.md`。本文件只讨论镜像内 `/sbin/init` 的
 运行契约,以及 `sandbox-ctl` 启动 microVM 后如何与它对接。
 
@@ -31,7 +31,7 @@
    sandbox-ctl ── spawn CH ──►  cloud-hypervisor             kernel boot
                                        │                          │
                                        │ virtio-pmem / DAX        │  mount root, exec /sbin/init
-   sandbox-runtime.erofs  ◄────────────┤  (host shared file)      │  = sandbox-init
+   sandbox-runtime.bundle  ◄────────────┤  (host shared file)      │  = sandbox-init
                                        │                          │    phase 1: mount + overlayfs + chroot
         kernel dmesg  ◄── --console ───┤ ◄── hvc0 (virtio-con) ── │    phase 2: vsock launch handshake
         (host captures to stderr/file) │                          │              + app stdio wiring
@@ -60,7 +60,7 @@
   那条 MUX 任一时刻至多一条(launch 生,restore/attach 续);exec 每次会话另起一条
   独立、短生命的 MUX,可并发多条(§3.6)
 
-## 2. sandbox-runtime.erofs 镜像结构
+## 2. sandbox-runtime.bundle 镜像结构
 
 ```
 /sbin/init                sandbox-init 静态 Go 二进制,~10-15 MiB
@@ -86,7 +86,7 @@ phase1a 把它 bind 进新 root 同名路径(§3.1),应用在自身 rootfs 内�
 工作集(实际 ~10 MiB 驻留)。EROFS 文件格式 endian-neutral,任意 host arch 上
 的 mkfs.erofs 都可生成镜像;镜像内的 `/sbin/init` 是 target arch 二进制。
 
-`sandbox-init` 由本仓 `make sandbox-init` 构建;`sandbox-runtime.erofs` 由
+`sandbox-init` 由本仓 `make sandbox-init` 构建;`sandbox-runtime.bundle` 由
 `guest-runtime` 消费该二进制并通过 `make sandbox-runtime` 打包。mkfs.erofs 构建详见
 `guest-runtime/native-deps/docs/build.md` §2.1。
 
@@ -143,7 +143,7 @@ F. switch-root 之后的基础挂载:
 
 `/dev/vda`(blk0 base)是用户应用的镜像 erofs(只读);`/dev/vdb`(blk1 overlay
 ext4)是写层。overlay 合并后 `/sysroot` 是 guest rootfs 的最终视图,switch-root
-之后这套视图变成新的 `/`。承载 sandbox-init 自身的 `sandbox-runtime.erofs` 由内核经
+之后这套视图变成新的 `/`。承载 sandbox-init 自身的 `sandbox-runtime.bundle` 由内核经
 virtio-pmem 挂在 `/`(`root=/dev/pmem0 ... rootflags=dax=always`),阶段 1 把它让位给 overlay
 (其中 `/opt/sandbox-runtime` 经 bind 在让位时随子树保留进新 root)。
 
@@ -164,7 +164,7 @@ target;switch-root 的 `MS_MOVE /sysroot → /` 会把该 bind 随整棵子树�
 发布件根 bind 进 `/sysroot/opt/sandbox-runtime`,由 E 的 `MS_MOVE /sysroot → /` 随子树带进
 新 `/`,bind 持有 pmem inode 引用使其在原挂载被遮蔽后仍存活;phase2 fork 前的 `MS_REC|MS_SHARED`
 令其作为对等挂载传播进应用私有 mount ns(应用以只读看到)。因 payload 驻留 pmem,改它即改
-`sandbox-runtime.erofs` 的 digest——而 restore 本就要求该 digest 与快照一致(同一份 pmem 必被
+`sandbox-runtime.bundle` 的 digest——而 restore 本就要求该 digest 与快照一致(同一份 pmem 必被
 重挂),故恢复出来的 sandbox 看到同一份 payload、无版本偏斜。代价是 payload 与 runtime 镜像同
 生命周期、无法独立热补丁(需独立版本时改用独立只读 EROFS 设备,见 §6)。
 

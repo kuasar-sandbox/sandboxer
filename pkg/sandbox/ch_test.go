@@ -24,7 +24,7 @@ func makeMinimalCfg() *config.SandboxConfig {
 		Network: config.NetworkConfig{TAP: "tap0"},
 		Boot: config.BootConfig{
 			Kernel:  "file:///vmlinux",
-			Runtime: "file:///sandbox-runtime.erofs",
+			Runtime: "file:///sandbox-runtime.bundle",
 			Cmdline: "console=hvc0",
 			Root: config.RootConfig{
 				Base: "file:///c.erofs",
@@ -49,7 +49,7 @@ func TestCHCommand_HasExpectedFlags(t *testing.T) {
 	cfg := makeMinimalCfg()
 	args, err := CHCommand(cfg,
 		[]DiskArg{{Sock: "/run/sb/blk0.sock", ReadOnly: true}, {Sock: "/run/sb/blk1.sock"}}, "/run/sb/ch.sock", "/run/sb/vsock.sock",
-		"/vmlinux", "/sandbox-runtime.erofs", "/run/sb/uffd.sock", "tty", 0, "")
+		"/vmlinux", "/sandbox-runtime.bundle", "/run/sb/uffd.sock", "tty", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestCHCommand_HasExpectedFlags(t *testing.T) {
 	for _, want := range []string{
 		"--api-socket /run/sb/ch.sock",
 		"--kernel /vmlinux",
-		"file=/sandbox-runtime.erofs,discard_writes=on",
+		"file=/sandbox-runtime.bundle,discard_writes=on",
 		"size=4096M,shared=on,fd=3,uffd_socket=/run/sb/uffd.sock",
 		// cap = 4 GiB, alloc = 2 GiB → balloon pre-inflated to 2 GiB
 		// (= 2147483648 bytes) so guest sees exactly `alloc` from boot.
@@ -91,7 +91,7 @@ func TestCHCommand_InitialAllocatableOverridesBalloon(t *testing.T) {
 	cfg := makeMinimalCfg()
 	args, err := CHCommandWithInitialAllocatable(cfg, 3<<30,
 		[]DiskArg{{Sock: "/run/sb/blk0.sock", ReadOnly: true}, {Sock: "/run/sb/blk1.sock"}},
-		"/run/sb/ch.sock", "/run/sb/vsock.sock", "/vmlinux", "/sandbox-runtime.erofs", "/run/sb/uffd.sock", "tty", 0, "")
+		"/run/sb/ch.sock", "/run/sb/vsock.sock", "/vmlinux", "/sandbox-runtime.bundle", "/run/sb/uffd.sock", "tty", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestCHCommand_SingleDisk(t *testing.T) {
 	}
 	args, err := CHCommand(cfg,
 		[]DiskArg{{Sock: "/run/sb/blk0.sock"}}, "/run/sb/ch.sock", "/run/sb/vsock.sock",
-		"/vmlinux", "/sandbox-runtime.erofs", "/run/sb/uffd.sock", "tty", 0, "")
+		"/vmlinux", "/sandbox-runtime.bundle", "/run/sb/uffd.sock", "tty", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestCHCommand_TapFDMode(t *testing.T) {
 	cfg.Network = config.NetworkConfig{TapFD: &config.TapFDConfig{Exec: []string{"helper"}}}
 	args, err := CHCommand(cfg,
 		[]DiskArg{{Sock: "/run/sb/blk0.sock", ReadOnly: true}, {Sock: "/run/sb/blk1.sock"}}, "/run/sb/ch.sock", "/run/sb/vsock.sock",
-		"/vmlinux", "/sandbox-runtime.erofs", "/run/sb/uffd.sock", "tty",
+		"/vmlinux", "/sandbox-runtime.bundle", "/run/sb/uffd.sock", "tty",
 		4, "02:00:00:00:80:01") // CH fd 4 (memfd=3 + tap), effective mac from handoff
 	if err != nil {
 		t.Fatal(err)
@@ -154,7 +154,7 @@ func TestCHCommand_NoNetwork(t *testing.T) {
 	cfg.Network = config.NetworkConfig{}
 	args, err := CHCommand(cfg,
 		[]DiskArg{{Sock: "/run/sb/blk0.sock", ReadOnly: true}, {Sock: "/run/sb/blk1.sock"}},
-		"/run/sb/ch.sock", "/run/sb/vsock.sock", "/vmlinux", "/sandbox-runtime.erofs",
+		"/run/sb/ch.sock", "/run/sb/vsock.sock", "/vmlinux", "/sandbox-runtime.bundle",
 		"/run/sb/uffd.sock", "tty", 0, "")
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +217,7 @@ func TestCHCommand_NoBalloonWhenAllocEqualsCapacity(t *testing.T) {
 	cfg.Resources.Allocatable.Memory = cfg.Resources.Capacity.Memory
 	args, err := CHCommand(cfg,
 		[]DiskArg{{Sock: "/run/sb/blk0.sock", ReadOnly: true}, {Sock: "/run/sb/blk1.sock"}}, "/run/sb/ch.sock", "/run/sb/vsock.sock",
-		"/vmlinux", "/sandbox-runtime.erofs", "/run/sb/uffd.sock", "tty", 0, "")
+		"/vmlinux", "/sandbox-runtime.bundle", "/run/sb/uffd.sock", "tty", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,8 +4,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,8 +14,8 @@ import (
 )
 
 // FileSink must pack content-addressed tarstream artifacts: the envelope
-// carries the hole map (no OS sparseness needed), the name is the SHA256 of
-// the artifact bytes, and the bundle keeps its [memory][ZIP] entry layout.
+// carries the hole map (no OS sparseness needed), the name comes from the
+// embedded digest marker, and the bundle keeps its [memory][ZIP] entry layout.
 func TestFileSinkArtifacts(t *testing.T) {
 	const size = 1 << 20
 	mem := make([]byte, size)
@@ -34,13 +32,20 @@ func TestFileSinkArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Content address = sha256 of the artifact bytes.
+	// Content address comes from the digest marker written with the payload.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sum := sha256.Sum256(raw)
-	wantRef := "file://" + hex.EncodeToString(sum[:]) + ".overlay"
+	src, _, err := tarstream.SourceAt(bytes.NewReader(raw), int64(len(raw)), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, ok := src.(tarstream.Digester)
+	if !ok {
+		t.Fatal("overlay source has no digest marker")
+	}
+	wantRef := "file://" + d.Digest()[len("sha256:"):] + ".overlay"
 	if ref != wantRef {
 		t.Fatalf("overlay ref = %s, want %s", ref, wantRef)
 	}
@@ -70,8 +75,15 @@ func TestFileSinkArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bsum := sha256.Sum256(braw)
-	if want := "file://" + hex.EncodeToString(bsum[:]) + ".snapshot"; bref != want {
+	bsrc, _, err := tarstream.SourceAt(bytes.NewReader(braw), int64(len(braw)), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bd, ok := bsrc.(tarstream.Digester)
+	if !ok {
+		t.Fatal("snapshot source has no digest marker")
+	}
+	if want := "file://" + bd.Digest()[len("sha256:"):] + ".snapshot"; bref != want {
 		t.Fatalf("bundle ref = %s, want %s", bref, want)
 	}
 	bv, err := tarstream.ReadSeekFrom(bytes.NewReader(braw), "snapshot")

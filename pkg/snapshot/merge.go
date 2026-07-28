@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -29,6 +31,31 @@ func openMergeBase(path string, size int64) (*tarLayer, []sparse.Extent, error) 
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	src, _, err := tarstream.SourceAt(f, st.Size(), "")
+	if err != nil {
+		f.Close()
+		return nil, nil, fmt.Errorf("merge base %s: not a tarstream artifact: %w", path, err)
+	}
+	d, ok := src.(tarstream.Digester)
+	if !ok {
+		f.Close()
+		return nil, nil, fmt.Errorf("merge base %s: tarstream artifact missing digest marker", path)
+	}
+	hexDigest := strings.TrimPrefix(d.Digest(), "sha256:")
+	real := path
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		real = resolved
+	}
+	stem, _, hasExt := strings.Cut(filepath.Base(real), ".")
+	if len(hexDigest) != 64 || !hasExt || stem != hexDigest {
+		f.Close()
+		return nil, nil, fmt.Errorf("merge base %s: basename does not match digest marker", path)
 	}
 	v, err := tarstream.ReadSeekFrom(f, "")
 	if err != nil {

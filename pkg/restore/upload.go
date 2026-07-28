@@ -3,11 +3,9 @@ package restore
 import (
 	"archive/zip"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -42,8 +40,8 @@ import (
 //     returns the uploaded snapshot's identity = manifest://<memKey>.
 //
 // Local artifacts resolve as siblings of the bundle (file:// refs carry
-// basenames); a base image's @sha256 digest is verified against the file
-// before upload. Ingest is content-addressed, so re-uploading shared
+// basenames); a base image's @sha256 digest is compared with its marker before
+// upload. Ingest is content-addressed, so re-uploading shared
 // artifacts (the same base image across templates) dedups to the same key.
 //
 // The result is restorable via `sandbox-ctl run --restore=manifest://<memKey>`.
@@ -51,8 +49,12 @@ func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	bundle, err := fetch.OpenTarStream(snapshotPath)
+	bundle, bundleDigest, err := openTarArtifact(snapshotPath)
 	if err != nil {
+		return "", fmt.Errorf("open snapshot: %w", err)
+	}
+	if err := validateContentAddressedName(snapshotPath, bundleDigest); err != nil {
+		bundle.Close()
 		return "", fmt.Errorf("open snapshot: %w", err)
 	}
 	defer bundle.Close()
@@ -204,8 +206,8 @@ type artifactUploader struct {
 
 // uploadRef resolves ref: manifest:// (or empty) passes through; file://
 // uploads the local artifact and returns its manifest:// ref. digested
-// selects the base_ref form (file://<name>@sha256:<hex>, digest verified
-// against the file) vs the plain captured-layer form (file://<basename>).
+// selects the base_ref form (file://<name>@sha256:<hex>, marker compared before
+// ingest) vs the plain captured-layer form (file://<basename>).
 func (u *artifactUploader) uploadRef(label, ref string, digested bool) (string, error) {
 	if ref == "" {
 		return ref, nil
@@ -231,21 +233,18 @@ func (u *artifactUploader) uploadRef(label, ref string, digested bool) (string, 
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(u.dir, name)
 	}
-	if wantDigest != "" {
-		got, err := fileSHA256(path)
-		if err != nil {
-			return "", fmt.Errorf("upload-snapshot: %s: hash %s: %w", label, path, err)
-		}
-		if got != wantDigest {
-			return "", fmt.Errorf("upload-snapshot: %s: %s digest %s does not match ref %s", label, path, got, wantDigest)
-		}
-	}
-
-	st, err := fetch.OpenTarStream(path)
+	st, gotDigest, err := openTarArtifact(path)
 	if err != nil {
 		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
 	}
 	defer st.Close()
+	if wantDigest != "" {
+		if err := matchDigest(gotDigest, wantDigest); err != nil {
+			return "", fmt.Errorf("upload-snapshot: %s: %s does not match ref: %w", label, path, err)
+		}
+	} else if err := validateContentAddressedName(path, gotDigest); err != nil {
+		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
+	}
 	res, err := u.ing.Ingest(u.ctx, st, ingest.IngestOption{OnProgress: u.progress(label)})
 	if err != nil {
 		return "", fmt.Errorf("upload-snapshot: ingest %s: %w", label, err)
@@ -327,20 +326,6 @@ func (s *memZipSource) ReadAt(ctx context.Context, buf []byte, off uint64) (int,
 		done = n
 	}
 	return n, eof
-}
-
-// fileSHA256 hashes a file's bytes (the artifact content address).
-func fileSHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // parseManifestKey decodes a 64-hex manifest key into a store.ContentKey.

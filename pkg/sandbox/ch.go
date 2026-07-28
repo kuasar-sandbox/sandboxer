@@ -154,7 +154,7 @@ func chNetArg(tapName string, tapFDNum int, mac string) string {
 // Layout:
 //  1. Auto-injected fixed boot params (init, root, rootfstype, rootflags,
 //     console)
-//     — lock down how sandbox-runtime.erofs is mounted as / via
+//     — lock down how sandbox-runtime.bundle is mounted as / via
 //     virtio-pmem and that kernel dmesg goes to hvc0 (virtio-console).
 //  2. User-supplied boot.cmdline extras (quiet, loglevel=, …; init= / root= /
 //     rootflags= / console= are platform-owned and should not be repeated).

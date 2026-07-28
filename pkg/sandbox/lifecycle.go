@@ -2,12 +2,7 @@ package sandbox
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
-	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"io"
 	"log"
 	"os"
@@ -21,10 +16,15 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/runtimebundle"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/tapfd"
@@ -1114,13 +1114,11 @@ type overlayCfgYAML struct {
 	BaseFromRefs []string `yaml:"base_from_refs,omitempty"`
 }
 
-// populateSnapshotRefs hashes boot.runtime + boot.root.base (when file://)
-// and stores the canonical refs on cfg.SnapshotRefs so buildSnapshotCfg
-// can render snapshot.cfg without re-hashing on each request. Called once
-// during Run() startup; cost is one streamed read per artifact (typical
-// runtime ≈ 5 MiB, base ≈ 100 MiB).
+// populateSnapshotRefs reads the identities embedded in boot.runtime and local
+// tarstream bases, then stores canonical refs on cfg.SnapshotRefs. It performs
+// metadata-only reads; manifest refs already carry their content identity.
 func populateSnapshotRefs(cfg *config.SandboxConfig) error {
-	rRef, err := buildBootRef(cfg.Boot.Runtime, false /* fileOnly=false; runtime is file:// only but caller fields enforce */)
+	rRef, err := buildRuntimeRef(cfg.Boot.Runtime)
 	if err != nil {
 		return fmt.Errorf("boot.runtime: %w", err)
 	}
@@ -1135,7 +1133,7 @@ func populateSnapshotRefs(cfg *config.SandboxConfig) error {
 			if d.Single() || d.Base == "" {
 				continue
 			}
-			ref, err := buildBootRef(d.Base, true /* allowManifest */)
+			ref, err := buildDiskRef(d.Base)
 			if err != nil {
 				return fmt.Errorf("boot.disks[%d].base: %w", i, err)
 			}
@@ -1146,7 +1144,7 @@ func populateSnapshotRefs(cfg *config.SandboxConfig) error {
 	if cfg.Boot.Root.Base == "" {
 		return nil
 	}
-	bRef, err := buildBootRef(cfg.Boot.Root.Base, true /* allowManifest */)
+	bRef, err := buildDiskRef(cfg.Boot.Root.Base)
 	if err != nil {
 		return fmt.Errorf("boot.root.base: %w", err)
 	}
@@ -1154,40 +1152,40 @@ func populateSnapshotRefs(cfg *config.SandboxConfig) error {
 	return nil
 }
 
-// buildBootRef produces the canonical snapshot.cfg ref for a host URL.
-//   - file:///abs/path → "file://<basename>@sha256:<hex>"
-//   - manifest://<key> → "manifest://<key>" (passthrough; only when
-//     allowManifest is true)
-func buildBootRef(uri string, allowManifest bool) (string, error) {
+// buildRuntimeRef produces the canonical snapshot ref for the PMEM runtime
+// bundle. boot.runtime is file-only by configuration contract.
+func buildRuntimeRef(uri string) (string, error) {
+	if !strings.HasPrefix(uri, "file://") {
+		return "", fmt.Errorf("expected file://, got %q", uri)
+	}
+	path := strings.TrimPrefix(uri, "file://")
+	info, err := runtimebundle.Inspect(path)
+	if err != nil {
+		return "", err
+	}
+	return "file://" + filepath.Base(path) + "@" + info.Digest, nil
+}
+
+// buildDiskRef passes manifest identities through and reads a local tarstream
+// artifact's declared identity without scanning its payload.
+func buildDiskRef(uri string) (string, error) {
 	if strings.HasPrefix(uri, "manifest://") {
-		if !allowManifest {
-			return "", fmt.Errorf("manifest:// not permitted here")
-		}
 		return uri, nil
 	}
 	if !strings.HasPrefix(uri, "file://") {
 		return "", fmt.Errorf("expected file:// or manifest://, got %q", uri)
 	}
 	path := strings.TrimPrefix(uri, "file://")
-	digest, err := streamFileSha256(path)
+	stream, err := fetch.OpenTarStream(path)
 	if err != nil {
 		return "", err
 	}
-	return "file://" + filepath.Base(path) + "@sha256:" + digest, nil
-}
-
-// streamFileSha256 returns hex(SHA256(file)). Sparse holes read as 0.
-func streamFileSha256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
+	defer stream.Close()
+	d, ok := stream.(tarstream.Digester)
+	if !ok {
+		return "", fmt.Errorf("file artifact %s has no declared digest", path)
 	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return "file://" + filepath.Base(path) + "@" + d.Digest(), nil
 }
 
 func generateSandboxID() string {

@@ -31,7 +31,7 @@ network:
   tap: tap0
 boot:
   kernel: file:///opt/sandbox/vmlinux
-  runtime: file:///opt/sandbox/sandbox-runtime.erofs
+  runtime: file:///opt/sandbox/sandbox-runtime.bundle
   cmdline: "console=hvc0 ip=169.254.1.1::169.254.1.0:255.255.255.254:test:eth0:off"
   root:
     base: file:///container.erofs

@@ -75,7 +75,7 @@ func assembleDataDisk(m proto.MountSpec) error {
 	}
 	for _, d := range needed {
 		if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
-			return fmt.Errorf("disk %d: mountpoint %s missing in runtime erofs (rebuild sandbox-runtime.erofs or reduce boot.disks[])", m.DiskIndex, d)
+			return fmt.Errorf("disk %d: mountpoint %s missing in runtime erofs (rebuild sandbox-runtime.bundle or reduce boot.disks[])", m.DiskIndex, d)
 		}
 	}
 	for _, dev := range m.DiskDevs {

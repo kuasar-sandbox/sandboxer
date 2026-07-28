@@ -22,7 +22,7 @@
 //     app_exited{code,term_signal}, then reboot.
 //
 // All work is done via syscalls; no busybox or external tools are
-// included in sandbox-runtime.erofs.
+// included in sandbox-runtime.bundle.
 package main
 
 import (

@@ -2,12 +2,12 @@ package snapshot
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
@@ -28,8 +28,8 @@ func HexKey(k store.ContentKey) string {
 //
 //   - FileSink packs content-addressed local tarstream artifacts
 //     (<sha>.overlay / <sha>.snapshot, entry "overlay"/"snapshot") under an
-//     output dir (--output); the content address is the SHA256 of the
-//     artifact bytes (deterministic envelope), computed while writing.
+//     output dir (--output); the content address is the SHA256 declared by the
+//     envelope's empty marker, computed while writing the deterministic prefix.
 //   - IngestSink streams to a manifest store via ingest.Ingester (--upload).
 //
 // Each method takes the source as an io.ReadSeeker plus its hole map (the
@@ -44,7 +44,7 @@ type SnapshotSink interface {
 }
 
 // ---------------------------------------------------------------------------
-// FileSink — sparse local files, content-addressed via hashSparseFile.
+// FileSink — sparse local files, content-addressed while tarstream writes.
 // ---------------------------------------------------------------------------
 
 type FileSink struct {
@@ -100,8 +100,8 @@ func (s *FileSink) AbsorbBundle(ctx context.Context, mem io.ReadSeeker, holes []
 	return "file://" + digest + ".snapshot", final, nil
 }
 
-// writeArtifact packs src as a tarstream artifact (single entry named kind)
-// at <sid>.<kind>.partial, hashing the artifact bytes while writing, then
+// writeArtifact packs src as a tarstream artifact (payload named kind plus a
+// digest marker) at <sid>.<kind>.partial, hashing the prefix while writing, then
 // renames to <sha>.<kind>. Only data extents flow (holes ride the envelope
 // map); the artifact file itself is dense and survives non-sparse-aware
 // copies and filesystems.
@@ -111,8 +111,8 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 	if err != nil {
 		return "", "", err
 	}
-	h := sha256.New()
-	if err := tarstream.WriteTo(ctx, io.MultiWriter(f, h), kind, src); err != nil {
+	digest, err := tarstream.WriteTo(ctx, f, kind, src)
+	if err != nil {
 		f.Close()
 		_ = os.Remove(tmp)
 		return "", "", fmt.Errorf("pack %s: %w", kind, err)
@@ -124,12 +124,16 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 	if err := f.Close(); err != nil {
 		return "", "", err
 	}
-	digest := hex.EncodeToString(h.Sum(nil))
-	final := filepath.Join(s.outDir, digest+"."+kind)
+	hexDigest := strings.TrimPrefix(digest, "sha256:")
+	if len(hexDigest) != 64 || hexDigest == digest {
+		_ = os.Remove(tmp)
+		return "", "", fmt.Errorf("pack %s: invalid tarstream digest %q", kind, digest)
+	}
+	final := filepath.Join(s.outDir, hexDigest+"."+kind)
 	if err := os.Rename(tmp, final); err != nil {
 		return "", "", fmt.Errorf("rename %s: %w", kind, err)
 	}
-	return digest, final, nil
+	return hexDigest, final, nil
 }
 
 // ---------------------------------------------------------------------------

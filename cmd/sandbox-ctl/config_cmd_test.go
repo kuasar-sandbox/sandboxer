@@ -60,7 +60,7 @@ func TestStrictCheckAcceptsNoNetwork(t *testing.T) {
   allocatable: { cpu: 1, memory: 1GiB }
 boot:
   kernel: file:///opt/sandbox/vmlinux
-  runtime: file:///opt/sandbox/sandbox-runtime.erofs
+  runtime: file:///opt/sandbox/sandbox-runtime.bundle
   root:
     diff_template: file:///opt/sandbox/root.ext4
 launch: { exec: /bin/true }
@@ -68,7 +68,7 @@ launch: { exec: /bin/true }
 	restore := []byte(`resources:
   capacity: { cpu: 1, memory: 1GiB }
 boot:
-  runtime: file:///opt/sandbox/sandbox-runtime.erofs
+  runtime: file:///opt/sandbox/sandbox-runtime.bundle
   root:
     base: file:///opt/sandbox/app.erofs
     overlay: {}

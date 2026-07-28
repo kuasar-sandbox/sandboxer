@@ -293,7 +293,7 @@ CH 自适应启动协议,sandbox-ctl 命令行不区分 arch:
 CH 暴露给 guest 的设备清单(冷启动):
 
 ```
-virtio-pmem    → sandbox-runtime.erofs (DAX, MAP_SHARED 共享 host page cache)
+virtio-pmem    → sandbox-runtime.bundle (DAX, MAP_SHARED 共享 host page cache)
 virtio-blk × 2 → blk0 (base, ro) + blk1 (overlay COW, rw),vhost-user backend
 virtio-net     → 可选;配置网络源时为 eth0,host TAP 后端;无源时不创建设备
 virtio-console → hvc0,内核 dmesg;--console tty(写到 CH 进程的 stdout = sandbox-ctl

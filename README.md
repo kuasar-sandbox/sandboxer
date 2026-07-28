@@ -2,7 +2,7 @@
 
 microVM 沙箱生命周期引擎:冷启动、快照、恢复,以及块设备(vhost-user-blk)与
 按需内存(uffd 懒加载)的 host 侧编排;guest 侧由 PID 1
-(`sandbox-init`)承接,并由 `guest-runtime` 打包进 `sandbox-runtime.erofs`。是
+(`sandbox-init`)承接,并由 `guest-runtime` 打包进 `sandbox-runtime.bundle`。是
 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的运行时
 核心,独立演进。
 
@@ -18,7 +18,7 @@ node proxy 在完成远程 exec 鉴权后接入现有 exec/MUX 链路。资源�
 | 路径 | 角色 |
 |---|---|
 | `cmd/sandbox-ctl` | host 控制平面:`run`(恢复 = `run --restore`)/ `snapshot` / `exec` / `config` / `info` / `upload-snapshot` |
-| `cmd/sandbox-init` | guest PID 1:三阶段 init + vsock 控制面 + 应用监督;由 `guest-runtime` 打包进 `sandbox-runtime.erofs` |
+| `cmd/sandbox-init` | guest PID 1:三阶段 init + vsock 控制面 + 应用监督;由 `guest-runtime` 打包进 `sandbox-runtime.bundle` |
 | `pkg/sandbox` `pkg/restore` `pkg/snapshot` | 生命周期编排:冷启动 / 恢复 / 快照(含增量分层链) |
 | `pkg/uffd` `pkg/memory` | uffd handler 与 memfd 统一内存所有权(懒加载) |
 | `pkg/vhost` | vhost-user-blk 后端(file / manifest 块源 + CoW diff) |
@@ -37,7 +37,7 @@ make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
 make vet test
 ```
 
-构建需要 Go 1.24+;运行还需 **guest-runtime** 发布的 `sandbox-runtime.erofs`
+构建需要 Go 1.24+;运行还需 **guest-runtime** 发布的 `sandbox-runtime.bundle`
 和 `vmlinux`(guest 内核);patched `cloud-hypervisor` 由本仓
 `sandboxer/native-deps` 构建并由 `sandbox-ctl` 启动。`mkfs.erofs` 是
 guest-runtime 构建 runtime 镜像和 build sandbox 内展平镜像时使用的工具,

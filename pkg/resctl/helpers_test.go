@@ -25,7 +25,7 @@ resources:
 network: { tap: tap0 }
 boot:
   kernel: file:///opt/sandbox/vmlinux
-  runtime: file:///opt/sandbox/sandbox-runtime.erofs
+  runtime: file:///opt/sandbox/sandbox-runtime.bundle
   cmdline: "console=hvc0"
   root:
     base: file:///container.erofs
@@ -44,7 +44,7 @@ func makeMinimalCfg() *config.SandboxConfig {
 		Network: config.NetworkConfig{TAP: "tap0"},
 		Boot: config.BootConfig{
 			Kernel:  "file:///vmlinux",
-			Runtime: "file:///sandbox-runtime.erofs",
+			Runtime: "file:///sandbox-runtime.bundle",
 			Cmdline: "console=hvc0",
 			Root: config.RootConfig{
 				Base:    "file:///c.erofs",

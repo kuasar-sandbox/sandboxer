@@ -10,9 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
-	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"io"
 	"log"
 	"os"
@@ -22,7 +19,10 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/tapfd"
@@ -46,7 +46,6 @@ type Options struct {
 	HostCfg             *config.SandboxConfig  // host yaml: TAP, blk1.diff, etc.
 	ManifestCfg         *config.ManifestConfig // for snapshot --upload from a restored sandbox
 	Fetcher             fetch.Fetcher          // required when any URI is manifest://; caller owns lifecycle
-	FileRefs            FileRefPolicy          // verify (default) or trust local file:// refs in snapshot.cfg
 	SandboxID           string
 	CHBinary            string
 	RuntimeRoot         string        // tmpfs run root; "/run/sandbox" by default
@@ -159,8 +158,12 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		selfRef      string
 	)
 	if opts.SnapshotPath != "" {
-		fs, err := fetch.OpenTarStream(opts.SnapshotPath)
+		fs, digest, err := openTarArtifact(opts.SnapshotPath)
 		if err != nil {
+			return -1, fmt.Errorf("open snapshot: %w", err)
+		}
+		if err := validateContentAddressedName(opts.SnapshotPath, digest); err != nil {
+			fs.Close()
 			return -1, fmt.Errorf("open snapshot: %w", err)
 		}
 		defer fs.Close()
@@ -212,9 +215,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	merged, err := ApplyRules(opts.HostCfg, parsedSnap, opts.SnapshotPath, ApplyOptions{
-		FileRefs: opts.FileRefs,
-	})
+	merged, err := ApplyRules(opts.HostCfg, parsedSnap, opts.SnapshotPath)
 	if err != nil {
 		return -1, err
 	}
@@ -235,9 +236,10 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	}
 
 	// Carry the runtime/base refs forward so a snapshot taken by this restored
-	// run records them (the cold path hashes them via populateSnapshotRefs;
-	// here they're already known + verified from the parent snapshot.cfg, so a
-	// re-hash is unnecessary). Without this, snapshots from a restored sandbox
+	// run records them (the cold path reads their markers via
+	// populateSnapshotRefs; here they are already matched against the parent
+	// snapshot.cfg, so another marker read is unnecessary). Without this,
+	// snapshots from a restored sandbox
 	// would have empty runtime_ref/base_ref and could not themselves be restored.
 	snapCfg.SnapshotRefs = config.SnapshotRefs{
 		RuntimeRef: parsedSnap.Boot.RuntimeRef,
@@ -731,6 +733,17 @@ func openRefStream(ctx context.Context, ref string, opts Options) (fetch.Stream,
 	}
 	if scheme == "file" && !filepath.IsAbs(value) && opts.SnapshotPath != "" {
 		value = filepath.Join(filepath.Dir(opts.SnapshotPath), value)
+	}
+	if scheme == "file" {
+		s, digest, err := openTarArtifact(value)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateContentAddressedName(value, digest); err != nil {
+			s.Close()
+			return nil, err
+		}
+		return s, nil
 	}
 	s, _, err := sandbox.OpenDiskStream(ctx, scheme+"://"+value, opts.Fetcher)
 	return s, err

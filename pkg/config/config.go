@@ -510,7 +510,7 @@ func mergeIPMask(metaIP, cfgIP string) string {
 type BootConfig struct {
 	Kernel  string     `yaml:"kernel"`  // file:// only (cold-start)
 	Cmdline string     `yaml:"cmdline"` // user extras; merged with auto-injected base
-	Runtime string     `yaml:"runtime"` // file:// sandbox-runtime.erofs path
+	Runtime string     `yaml:"runtime"` // file:// sandbox-runtime.bundle path
 	Root    RootConfig `yaml:"root"`
 
 	// Disks are additional data disks (beyond the root). Each follows the same
@@ -524,7 +524,7 @@ type BootConfig struct {
 }
 
 // MaxDataDisks bounds boot.disks[]. It must equal the number of
-// /sysdisks/disk-<N> mountpoint sets baked into sandbox-runtime.erofs (see
+// /sysdisks/disk-<N> mountpoint sets baked into sandbox-runtime.bundle (see
 // the repo Makefile). The guest also rejects a disk whose dir is absent, so a
 // mismatched (older) erofs fails closed rather than silently.
 const MaxDataDisks = 8

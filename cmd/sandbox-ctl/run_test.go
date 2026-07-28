@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 )
 
@@ -42,7 +41,7 @@ func callRunRestoreForValidation(t *testing.T, cfg *config.SandboxConfig, manife
 	return captureStderr(t, func() int {
 		return runRestore(
 			context.Background(), cfg, manifestCfg, "manifest://deadbeef",
-			restore.FileRefPolicyVerify, "test-sandbox", "/nonexistent/cloud-hypervisor",
+			"test-sandbox", "/nonexistent/cloud-hypervisor",
 			runRoot, filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil,
 		)
 	})
