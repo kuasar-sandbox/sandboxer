@@ -42,7 +42,7 @@ func callRunRestoreForValidation(t *testing.T, cfg *config.SandboxConfig, manife
 		return runRestore(
 			context.Background(), cfg, manifestCfg, "manifest://deadbeef",
 			"test-sandbox", "/nonexistent/cloud-hypervisor",
-			runRoot, filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil,
+			runRoot, filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil,
 		)
 	})
 }

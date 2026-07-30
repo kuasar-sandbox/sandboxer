@@ -111,7 +111,7 @@ sandbox-ctl 是 CH 的父进程。CH 退出 → sandbox-ctl 收 SIGCHLD → 优�
 | `exec` | 在运行中的 sandbox 内执行一条命令——应用的兄弟进程(不替换应用),加入应用的 mount + pid 命名空间,与 `run` 共用 stdio 模型 |
 | `config` | 产出 / 合并 / 校验 sandbox.yaml(`--config a.yaml[:b...]` 或 `--template`;`--mode default\|restore`、`--check skip\|strict`、`-o`) |
 | `info` | 打印 snapshot 内嵌的 `snapshot.cfg`(`manifest://<key>` 或本地 snapshot 路径;`--json`;`--manifest-config`) |
-| `upload-snapshot` | 把**本地**快照离线提升为远程 `manifest://` 快照(不启动沙箱;§3.5 本地层不变量) |
+| `upload-snapshot` | 把本地快照图发布为 canonical portable ref:manifest 或 named ref location(不启动沙箱) |
 
 ### 2.2 `sandbox-ctl run`
 
@@ -123,6 +123,8 @@ sandbox-ctl run [flags]
                           (语义同 config 子命令,§2.5;SANDBOX_CONFIG env;flag 优先)
   --manifest-config <path>  manifest 配置 YAML(MANIFEST_CONFIG env);仅 manifest://
                           资源(blk0 base、--restore manifest://、--upload)需要
+  --ref-location <name>=<file-URI>
+                          可重复;把 located file ref 的逻辑名称映射到可信宿主目录
   --sandbox-id <sid>      覆盖 yaml 里的 sandbox.id
 
   # 执行环境
@@ -250,10 +252,12 @@ sandbox-ctl 控制终端的前台进程组——终端产生的 `^C` / `^\` / `^
 透传的内核 dmesg 同样在写 raw 终端前做 `\n`→`\r\n`;应用的 PTY 流原样透传(guest 那侧
 伪终端的 ONLCR 已把 `\r\n` 加好)。
 
-**恢复模式**:`--restore=<file_path|manifest://hex>` 让 sandbox-ctl 走恢复路径
+**恢复模式**:`--restore=<snapshot-path|manifest://hex|file://basename@location:name>`
+让 sandbox-ctl 走恢复路径
 (详见 §7)。`<ref>` 形式:
 
-- 本地 file path / `manifest://<hex>` — 统一经 `StreamSnapshotSource`:file 解析为
+- 本地 file path / `manifest://<hex>` / located file ref — 统一经
+  `StreamSnapshotSource`:file 解析为
   稀疏文件流,manifest 经 cache-ctl + store-ctl 按 chunk 粒度 lazy fetch,再按
   snapshot.cfg 的 `from_refs` 叠成分层流(§3.5)写入 memfd。snapshot.cfg 内
   base_ref / overlay.base(+ base_from_refs)同理
@@ -398,38 +402,37 @@ sandbox-ctl config [flags]
 对齐 `flatten-ctl info`。
 
 ```
-sandbox-ctl info <manifest://hex | snapshot-path> [flags]
+sandbox-ctl info <snapshot-ref | snapshot-path> [flags]
 
-  <manifest://hex | snapshot-path>  本地 snapshot 路径,或 manifest://<hex>
+  <snapshot-ref | snapshot-path>  本地路径、manifest://<hex> 或 located file ref
   --json                  默认输出 snapshot.cfg 原始 YAML;--json 改为重新输出解析后的结构
   --manifest-config <p>   manifest 配置 YAML(MANIFEST_CONFIG env);仅 manifest://
                           输入需要,file/本地路径可省
+  --ref-location <name>=<file-URI>  可重复;located file ref 的可信宿主目录映射
 ```
 
 ### 2.7 `sandbox-ctl upload-snapshot`
 
-把一个**本地** snapshot(`<sid>.snapshot` bundle 及其 `snapshot.cfg` 引用的全部本地
-工件)**离线提升**为远程 `manifest://` snapshot——**不启动沙箱、不需 /dev/kvm**。
-**自动上传** cfg 里每个 `file://` 工件槽位并改写为 `manifest://`:根/数据盘的
-base 镜像(`base_ref`,按 `@sha256` 先校验 tarstream marker)、各盘捕获的顶层
-overlay;远程下层链按引用带过;`runtime_ref` 刻意不动(节点级启动工件,按摘要
-钉住、随平台分发,不属于租户工件域)。内容寻址 ⇒ 共享 base 重复上传自动去重、
-失败重试安全。产出 0 本地层的全远程快照,stdout 打印其 `manifest://<key>`
-(可直接 `run --restore=manifest://<key>`)。
+把一个本地 snapshot graph 离线发布为 canonical portable ref,不启动沙箱、不需
+`/dev/kvm`。发布到 manifest 时 local file refs 改写为 `manifest://`;发布到 named
+location 时改写为 `file://<content-addressed-basename>@location:<name>`。已有
+manifest/located refs 原样保留,因此三者可以混合。root snapshot 总会重建并发布,
+stdout 只打印新的 canonical root ref。`runtime_ref` 是节点级启动工件,仍按摘要
+钉住并随平台分发,不进入租户工件发布域。
 
 ```
 sandbox-ctl upload-snapshot [flags] <snapshot-path>
 
   <snapshot-path>         本地 <sid>.snapshot(或其指向的 <sha>.snapshot)
   --manifest-config <p>   manifest 配置 YAML(MANIFEST_CONFIG env);$MANIFEST_KEY 提供客户密钥
+  --to-ref-location <name>=<file-URI>
+                          与 --manifest-config 二选一;目标目录只写内容寻址文件
   --quiet                 抑制 stderr 进度日志
 ```
 
-本地工件按 bundle **同目录**解析(cfg 的 file:// 引用是 basename);base 镜像须与
-bundle 同目录放置。校验(§3.5):每个**下层** `manifest://` 层必须存在且在当前
-`MANIFEST_KEY` 下可解封(**仅取 manifest blob、不下载 chunk**);若**下层**含
-`file://` 本地层(违反本地层不变量),拒绝并提示先 `snapshot --output` 本地导出把
-它折叠进顶层(顶层与 base 镜像不受此限——它们正是被自动上传的对象)。
+local file refs 按 bundle 同目录解析并递归升级;已有 portable ref 是本次发布边界。
+named location 目录不创建 alias、symlink 或临时 rename;有效的同名内容寻址文件直接
+复用,不完整或校验失败的目标直接覆盖并在 close 后重新验证 marker、size 与 digest。
 
 ## 3. 配置
 
@@ -698,6 +701,12 @@ sandbox-init 以 flush-and-replace 重配网卡(克隆取新 L3 身份,见 §11.
 
 ### 3.2 file:// vs manifest:// truth table
 
+`file://` 有两种语义:不带 qualifier 的路径是 node-local ref;带
+`@location:<name>` 的 ref 只允许 basename,实际目录必须由可信的可重复
+`--ref-location name=file:///absolute/path` 提供。`@sha256:<digest>` 如存在必须位于
+`@location` 之前。located file ref 与 `manifest://<key>` 都是 portable ref;
+`manifest://` 只允许单个 key,分层通过 `base_from_refs` 等显式数组表达。
+
 | 字段 | `file://` | `manifest://` | 备注 |
 |------|-----------|---------------|------|
 | `boot.kernel` | ✓ | ✗ | vmlinux 体积小且节点级共享,manifest 化没有收益 |
@@ -709,7 +718,7 @@ sandbox-init 以 flush-and-replace 重配网卡(克隆取新 L3 身份,见 §11.
 | `boot.root.diff`(单盘) | ✓ (only) | ✗ | 单盘可写根盘,overlay.diff 的 root 层等价;省略 overlay 时启用 |
 | `boot.root.diff_template`(单盘) | ✓ (only) | ✗ | 单盘根盘的预格式化 ext4 模板;与 overlay.* 互斥 |
 | `boot.root.base_from_refs`(单盘) | ✓ | ✓ | 单盘快照链(snapshot.cfg 自动填,§3.5) |
-| `run --restore=<ref>` | ✓ | ✓ | `<sid>.snapshot` 文件路径 / manifest://<key> |
+| `run --restore=<ref>` | ✓ | ✓ | 本地路径、located file ref 或 manifest://<key> |
 | `restore.prefetch: memory` | skipped | ✓ | 默认 `off`;仅当前远程内存顶层且 direct ref 为单 key 时执行,§7.1 |
 
 ### 3.2.1 file artifact identity
@@ -896,9 +905,11 @@ CoW diff,只有写过的块是数据。
 
 #### 本地层不变量(至多一层、且在顶层)
 
-`file://` 本地层与 `manifest://` 远程层可在一条链内混用,但**任一快照链中本地层至多
-一个,且一定是顶层(self/最新)**;`from_refs`/`base_from_refs`(下层)只许远程。这保证
-一个快照要么「全远程」、要么「本地顶 + 远程下层链」,绝不出现埋在远程层下的本地层
+`file://` 本地层与 portable 层(manifest/located file)可在一条链内混用,但运行时
+生成的增量链中**本地层至多
+一个,且一定是顶层(self/最新)**;`from_refs`/`base_from_refs`(下层)只许 portable ref。
+这保证一个快照要么「全 portable」、要么「本地顶 + portable 下层链」,绝不出现埋在
+portable 层下的本地层
 (那样的快照换主机恢复时必因本地文件缺失而失效)。两条机制维持它:
 
 - **本地导出 = 替换次新层(合并,非新增)**:若沙箱本身从**本地** `file://` 快照懒加载,
@@ -909,10 +920,8 @@ CoW diff,只有写过的块是数据。
   导出,仍是「新顶层压在父 ref 之上」的增量分层——远程父不触发合并。)`--upload` 路径
   同样合并:从本地父恢复后 `snapshot --upload`,把父本地层一并 ingest 进上传的顶层,
   产出 0 本地层的远程快照。
-- **离线提升 `sandbox-ctl upload-snapshot <本地快照>`**(§2.7):不启动沙箱,把本地顶层
-  overlay+内存 ingest 为远程 `manifest://`、远程下层链按引用带过,产出全远程快照(打印
-  其 `manifest://` 键)。要求下层全部已是远程且在当前 `MANIFEST_KEY` 下可解封(**仅校验
-  manifest、不下载 chunk**);埋藏的本地下层会被拒绝(提示先做本地导出折叠)。
+- **离线提升 `sandbox-ctl upload-snapshot <本地快照>`**(§2.7):递归升级可见 local
+  refs,已有 manifest/located refs 原样带过,最终打印 canonical portable root ref。
 
 ## 4. 资源模型
 
@@ -1482,15 +1491,15 @@ host restore policy,不写入或继承自 `snapshot.cfg`;冷启动不执行 Pref
 ```text
 restore.prefetch == "memory"
 AND restore input is manifest://
-AND direct snapshot ref resolves to exactly one manifest key
+AND direct snapshot ref resolves to one manifest key
 AND final layered memory source was built successfully
 AND current selfStream implements fetch.Prefetcher
 ```
 
 `from_refs` 非空不是门槛.远程单层,单 key 快照显式启用后同样执行;但其候选是
 全部已保存 resident memory.多层快照只预取当前顶层,该层更接近一次代表性业务
-窗口的活动工作集,通常是收益更明确的场景.`manifest://k1:k2` 形式的复合直接引用
-仍可按既有语义恢复,但无法无歧义表达当前快照边界,V1 跳过 Prefetch.
+窗口的活动工作集,通常是收益更明确的场景.不存在复合 `manifest://k1:k2` ref;
+父层始终由 `from_refs` 显式表达。
 
 选择直接作用于当前 `selfStream` 和它的单一 manifest key,不对最终 layered Stream
 做无参数 Prefetch.因此 `from_refs` 中的父内存层保持零 Prefetch;root/data disk,

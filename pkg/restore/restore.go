@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -43,9 +44,11 @@ import (
 type Options struct {
 	SnapshotPath        string                 // file path; mutually exclusive with SnapshotManifestKey
 	SnapshotManifestKey string                 // hex content key; mutually exclusive with SnapshotPath
+	SnapshotRef         string                 // canonical portable root ref; empty for a node-local file
 	HostCfg             *config.SandboxConfig  // host yaml: TAP, blk1.diff, etc.
 	ManifestCfg         *config.ManifestConfig // for snapshot --upload from a restored sandbox
 	Fetcher             fetch.Fetcher          // required when any URI is manifest://; caller owns lifecycle
+	RefLocations        config.RefLocations    // trusted named file locations
 	SandboxID           string
 	CHBinary            string
 	RuntimeRoot         string        // tmpfs run root; "/run/sandbox" by default
@@ -96,6 +99,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	}
 	if opts.CHBinary == "" {
 		opts.CHBinary = "cloud-hypervisor"
+	}
+	if err := preflightLocatedRefs(ctx, opts); err != nil {
+		return -1, fmt.Errorf("restore preflight: %w", err)
 	}
 
 	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl run --restore] "+format, a...) }
@@ -166,10 +172,27 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			fs.Close()
 			return -1, fmt.Errorf("open snapshot: %w", err)
 		}
+		if opts.SnapshotRef != "" {
+			ref, err := manifest.ParseRef(opts.SnapshotRef)
+			if err != nil {
+				fs.Close()
+				return -1, fmt.Errorf("open snapshot: %w", err)
+			}
+			if ref.Digest != "" {
+				if err := matchDigest(digest, ref.Digest); err != nil {
+					fs.Close()
+					return -1, fmt.Errorf("open snapshot: %w", err)
+				}
+			}
+		}
 		defer fs.Close()
 		selfStream = fs
 		totalSize = int64(fs.Size())
-		selfRef = fileSnapshotRef(opts.SnapshotPath) // §3.5: follows symlink → file://<sha256>.snapshot
+		if opts.SnapshotRef != "" {
+			selfRef = opts.SnapshotRef
+		} else {
+			selfRef = fileSnapshotRef(opts.SnapshotPath) // §3.5: follows symlink → file://<sha256>.snapshot
+		}
 	} else {
 		fc, sz, err := sandbox.OpenManifestStream(ctx, opts.SnapshotManifestKey, opts.Fetcher)
 		if err != nil {
@@ -178,10 +201,13 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		defer fc.Close()
 		selfStream = fc
 		totalSize = sz
-		selfRef = "manifest://" + opts.SnapshotManifestKey
+		selfRef = opts.SnapshotRef
+		if selfRef == "" {
+			selfRef = "manifest://" + opts.SnapshotManifestKey
+		}
 		logf("manifest snapshot: key=%s bundle_size=%d", opts.SnapshotManifestKey, sz)
 	}
-	snapReaderAt = fetch.NewReaderAt(ctx, selfStream, totalSize)
+	snapReaderAt = fetch.NewReaderAt(ctx, selfStream)
 
 	zipReader, err := zip.NewReader(snapReaderAt, totalSize)
 	if err != nil {
@@ -215,7 +241,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	merged, err := ApplyRules(opts.HostCfg, parsedSnap, opts.SnapshotPath)
+	merged, err := ApplyRules(opts.HostCfg, parsedSnap, opts.localSnapshotPath(), opts.RefLocations)
 	if err != nil {
 		return -1, err
 	}
@@ -245,6 +271,12 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		RuntimeRef: parsedSnap.Boot.RuntimeRef,
 		BaseRef:    parsedSnap.Boot.Root.BaseRef,
 	}
+	if len(parsedSnap.Boot.Disks) > 0 {
+		snapCfg.SnapshotRefs.DiskBaseRefs = make([]string, len(parsedSnap.Boot.Disks))
+		for i := range parsedSnap.Boot.Disks {
+			snapCfg.SnapshotRefs.DiskBaseRefs[i] = parsedSnap.Boot.Disks[i].BaseRef
+		}
+	}
 
 	// Record provenance so a snapshot taken by this restored run prepends this
 	// bundle and extends the chain (§3.5): child.from_refs = [selfRef] ++
@@ -267,13 +299,13 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// so a re-export merges this run's resident delta onto them (replace the
 	// next-newest local layer, not stack a second one) — docs §3.5. Paths
 	// resolve like openRefStream: the disk layer is a basename in the bundle dir.
-	if opts.SnapshotPath != "" {
-		if abs, err := filepath.Abs(opts.SnapshotPath); err == nil {
+	if localSnapshotPath := opts.localSnapshotPath(); localSnapshotPath != "" {
+		if abs, err := filepath.Abs(localSnapshotPath); err == nil {
 			snapCfg.SnapshotProvenance.ParentSnapshotPath = abs
 		}
 		if sc, val, ok := config.SchemeAndPath(parentDiskBase); ok && sc == "file" {
 			if !filepath.IsAbs(val) {
-				val = filepath.Join(filepath.Dir(opts.SnapshotPath), val)
+				val = filepath.Join(filepath.Dir(localSnapshotPath), val)
 			}
 			snapCfg.SnapshotProvenance.ParentOverlayPath = val
 		}
@@ -290,10 +322,10 @@ func Run(ctx context.Context, opts Options) (int, error) {
 				top, chain = n.Overlay.Base, n.Overlay.BaseFromRefs
 			}
 			pd[i] = config.DiskProvenance{OverlayBase: top, BaseFromRefs: chain}
-			if opts.SnapshotPath != "" {
+			if localSnapshotPath := opts.localSnapshotPath(); localSnapshotPath != "" {
 				if sc, val, ok := config.SchemeAndPath(top); ok && sc == "file" {
 					if !filepath.IsAbs(val) {
-						val = filepath.Join(filepath.Dir(opts.SnapshotPath), val)
+						val = filepath.Join(filepath.Dir(localSnapshotPath), val)
 					}
 					pd[i].OverlayPath = val
 				}
@@ -434,7 +466,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, fmt.Errorf("snapshot source: %w", err)
 	}
 	logf("snapshot source: %d memory layer(s)", len(memLayers))
-	prefetch := startMemoryPrefetch(ctx, prefetchMode, opts.SnapshotManifestKey, selfStream, len(memLayers)-1, logf)
+	prefetch := startMemoryPrefetch(ctx, prefetchMode, selfStream, len(memLayers)-1, logf)
 	// Close is a lifetime boundary for fetch.Stream. Register this after every
 	// memory-layer Close defer so cancellation and join always run first.
 	defer prefetch.Stop()
@@ -656,18 +688,8 @@ func reconstructDisk(ctx context.Context, opts Options, single bool, capturedTop
 	db.Overlay = !single
 
 	// Layered ro base: [captured top] ++ chain.
-	scheme, val, ok := config.SchemeAndPath(capturedTop)
-	if !ok {
-		return fail(fmt.Errorf("%s: invalid captured base ref: %s", diskKey, capturedTop))
-	}
-	if scheme == "file" && !filepath.IsAbs(val) && opts.SnapshotPath != "" {
-		val = filepath.Join(filepath.Dir(opts.SnapshotPath), val)
-	}
-	if scheme == "manifest" && opts.Fetcher == nil {
-		return fail(fmt.Errorf("%s: manifest:// base requires Fetcher", diskKey))
-	}
-	logf("disk %s image: %s://%s", diskKey, scheme, val)
-	top, _, err := sandbox.OpenDiskStream(ctx, scheme+"://"+val, opts.Fetcher)
+	logf("disk %s image: %s", diskKey, capturedTop)
+	top, err := openRefStream(ctx, capturedTop, opts)
 	if err != nil {
 		return fail(fmt.Errorf("%s: open base: %w", diskKey, err))
 	}
@@ -712,7 +734,7 @@ func reconstructDisk(ctx context.Context, opts Options, single bool, capturedTop
 
 	// Overlay mode: the ro erofs base device.
 	if !single {
-		r, _, rerr := sandbox.OpenBlockReader(ctx, erofsBaseURI, opts.Fetcher)
+		r, _, rerr := sandbox.OpenBlockReader(ctx, erofsBaseURI, opts.Fetcher, opts.RefLocations)
 		if rerr != nil {
 			return fail(fmt.Errorf("%s: open erofs base: %w", diskKey, rerr))
 		}
@@ -726,27 +748,149 @@ func reconstructDisk(ctx context.Context, opts Options, single bool, capturedTop
 // fetch.Stream. file:// refs are content-addressed basenames located relative
 // to the snapshot bundle dir (local mode); manifest:// refs go through the
 // fetcher. Shared by the memory and disk layered chains.
-func openRefStream(ctx context.Context, ref string, opts Options) (fetch.Stream, error) {
-	scheme, value, ok := config.SchemeAndPath(ref)
-	if !ok {
-		return nil, fmt.Errorf("invalid ref %q", ref)
+func openRefStream(ctx context.Context, raw string, opts Options) (fetch.Stream, error) {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return nil, err
 	}
-	if scheme == "file" && !filepath.IsAbs(value) && opts.SnapshotPath != "" {
-		value = filepath.Join(filepath.Dir(opts.SnapshotPath), value)
-	}
-	if scheme == "file" {
-		s, digest, err := openTarArtifact(value)
+	if ref.Scheme == manifest.RefSchemeFile {
+		relativeDir := ""
+		if localSnapshotPath := opts.localSnapshotPath(); localSnapshotPath != "" {
+			relativeDir = filepath.Dir(localSnapshotPath)
+		}
+		path, err := opts.RefLocations.ResolveFile(ref, relativeDir)
 		if err != nil {
 			return nil, err
 		}
-		if err := validateContentAddressedName(value, digest); err != nil {
+		s, digest, err := openTarArtifact(path)
+		if err != nil {
+			return nil, err
+		}
+		if ref.Digest != "" {
+			if err := matchDigest(digest, ref.Digest); err != nil {
+				s.Close()
+				return nil, err
+			}
+			if ref.Location != "" {
+				if err := validateContentAddressedName(path, digest); err != nil {
+					s.Close()
+					return nil, err
+				}
+			}
+		} else if err := validateContentAddressedName(path, digest); err != nil {
 			s.Close()
 			return nil, err
 		}
 		return s, nil
 	}
-	s, _, err := sandbox.OpenDiskStream(ctx, scheme+"://"+value, opts.Fetcher)
+	s, _, err := sandbox.OpenDiskStream(ctx, ref.String(), opts.Fetcher, opts.RefLocations)
 	return s, err
+}
+
+func (o Options) localSnapshotPath() string {
+	if o.SnapshotRef == "" {
+		return o.SnapshotPath
+	}
+	return ""
+}
+
+// preflightLocatedRefs walks snapshot.cfg plus its memory parents and verifies
+// every named location before cgroup, run-directory, TAP, or VMM side effects.
+func preflightLocatedRefs(ctx context.Context, opts Options) error {
+	var stream fetch.Stream
+	if opts.SnapshotPath != "" {
+		opened, _, err := openTarArtifact(opts.SnapshotPath)
+		if err != nil {
+			return err
+		}
+		stream = opened
+	} else {
+		opened, _, err := sandbox.OpenManifestStream(ctx, opts.SnapshotManifestKey, opts.Fetcher)
+		if err != nil {
+			return err
+		}
+		stream = opened
+	}
+	defer stream.Close()
+	_, root, err := readSnapshotEntries(ctx, stream, int64(stream.Size()))
+	if err != nil {
+		return err
+	}
+	pending := []*SnapshotCfg{root}
+	seenParents := map[string]bool{}
+	for len(pending) > 0 {
+		snap := pending[0]
+		pending = pending[1:]
+		refs := snapshotArtifactRefs(snap)
+		for _, raw := range refs {
+			if err := preflightLocatedRef(raw, opts); err != nil {
+				return err
+			}
+		}
+		for _, raw := range snap.FromRefs {
+			if seenParents[raw] {
+				continue
+			}
+			seenParents[raw] = true
+			if len(seenParents) > 1024 {
+				return fmt.Errorf("snapshot parent graph exceeds 1024 entries")
+			}
+			parent, err := openRefStream(ctx, raw, opts)
+			if err != nil {
+				return fmt.Errorf("snapshot parent %s: %w", raw, err)
+			}
+			_, parentCfg, readErr := readSnapshotEntries(ctx, parent, int64(parent.Size()))
+			closeErr := parent.Close()
+			if readErr != nil {
+				return fmt.Errorf("snapshot parent %s: %w", raw, readErr)
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			pending = append(pending, parentCfg)
+		}
+	}
+	return nil
+}
+
+func snapshotArtifactRefs(snap *SnapshotCfg) []string {
+	refs := []string{snap.Boot.RuntimeRef, snap.Boot.Root.BaseRef, snap.Boot.Root.Base}
+	refs = append(refs, snap.Boot.Root.BaseFromRefs...)
+	if snap.Boot.Root.Overlay != nil {
+		refs = append(refs, snap.Boot.Root.Overlay.Base)
+		refs = append(refs, snap.Boot.Root.Overlay.BaseFromRefs...)
+	}
+	for i := range snap.Boot.Disks {
+		n := &snap.Boot.Disks[i]
+		refs = append(refs, n.BaseRef, n.Base)
+		refs = append(refs, n.BaseFromRefs...)
+		if n.Overlay != nil {
+			refs = append(refs, n.Overlay.Base)
+			refs = append(refs, n.Overlay.BaseFromRefs...)
+		}
+	}
+	return refs
+}
+
+func preflightLocatedRef(raw string, opts Options) error {
+	if raw == "" {
+		return nil
+	}
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return err
+	}
+	if ref.Scheme != manifest.RefSchemeFile || ref.Location == "" {
+		return nil
+	}
+	path, err := opts.RefLocations.ResolveFile(ref, "")
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("located ref %s: %w", ref.String(), err)
+	}
+	return nil
 }
 
 // fileSnapshotRef returns the content-addressed ref for a file-mode snapshot

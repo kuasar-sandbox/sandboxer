@@ -36,6 +36,7 @@ import (
 type RunOptions struct {
 	Cfg           *config.SandboxConfig
 	ManifestCfg   *config.ManifestConfig // for manifest:// resolution; may be nil if all file://
+	RefLocations  config.RefLocations    // trusted logical location -> host directory mappings
 	SandboxID     string                 // generated if empty
 	CHBinary      string                 // path to bin/cloud-hypervisor
 	RuntimeRoot   string                 // tmpfs run root (sockets / snap staging); "/run/sandbox" by default
@@ -88,7 +89,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 			return -1, err
 		}
 	}
-	if err := populateSnapshotRefs(opts.Cfg); err != nil {
+	if err := populateSnapshotRefs(opts.Cfg, opts.RefLocations); err != nil {
 		return -1, fmt.Errorf("snapshot refs: %w", err)
 	}
 
@@ -197,7 +198,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		if opts.ManifestCfg == nil {
 			return -1, fmt.Errorf("manifest:// disk requires --manifest-config or MANIFEST_CONFIG")
 		}
-		fetcher, err = opts.ManifestCfg.NewFetcher(opts.ManifestCfg.FetchKeyFunc())
+		fetcher, err = opts.ManifestCfg.NewFetcher()
 		if err != nil {
 			return -1, fmt.Errorf("manifest fetcher: %w", err)
 		}
@@ -219,7 +220,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if opts.Cfg.SingleDisk() {
 		imageCfg = &ImageConfig{}
 	} else {
-		r, _, err := OpenBlockReader(ctx, opts.Cfg.Boot.Root.Base, fetcher)
+		r, _, err := OpenBlockReader(ctx, opts.Cfg.Boot.Root.Base, fetcher, opts.RefLocations)
 		if err != nil {
 			return -1, fmt.Errorf("blk0 base: %w", err)
 		}
@@ -291,7 +292,8 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if opts.Cfg.SingleDisk() {
 		diffURI, diffTemplate = opts.Cfg.Boot.Root.Diff, opts.Cfg.Boot.Root.DiffTemplate
 		if opts.Cfg.Boot.Root.Base != "" {
-			r, _, err := OpenBlockReader(ctx, opts.Cfg.Boot.Root.Base, fetcher)
+			refs := append([]string{opts.Cfg.Boot.Root.Base}, opts.Cfg.Boot.Root.BaseFromRefs...)
+			r, _, err := OpenLayeredBlockReader(ctx, refs, fetcher, opts.RefLocations)
 			if err != nil {
 				return -1, fmt.Errorf("single-disk root base: %w", err)
 			}
@@ -301,7 +303,8 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	} else {
 		diffURI, diffTemplate = opts.Cfg.Boot.Root.Overlay.Diff, opts.Cfg.Boot.Root.Overlay.DiffTemplate
 		if opts.Cfg.Boot.Root.Overlay.Base != "" {
-			r, _, err := OpenBlockReader(ctx, opts.Cfg.Boot.Root.Overlay.Base, fetcher)
+			refs := append([]string{opts.Cfg.Boot.Root.Overlay.Base}, opts.Cfg.Boot.Root.Overlay.BaseFromRefs...)
+			r, _, err := OpenLayeredBlockReader(ctx, refs, fetcher, opts.RefLocations)
 			if err != nil {
 				return -1, fmt.Errorf("blk1 overlay base: %w", err)
 			}
@@ -358,7 +361,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		OwnedDiff: ownedDiff,
 	}}
 	for i := range opts.Cfg.Boot.Disks {
-		db, dcleanup, derr := prepColdDataDisk(ctx, &opts.Cfg.Boot.Disks[i], i, opts.BaseRoot, opts.SandboxID, fetcher)
+		db, dcleanup, derr := prepColdDataDisk(ctx, &opts.Cfg.Boot.Disks[i], i, opts.BaseRoot, opts.SandboxID, fetcher, opts.RefLocations)
 		if derr != nil {
 			return -1, derr
 		}
@@ -628,7 +631,7 @@ func resolveDiskMounts(mounts []proto.MountSpec, disks []config.DiskConfig, root
 // optional ro base(s) and builds its writable CoW diff (same machinery as the
 // root). ordinal is its boot.disks[] index (used for the auto-default diff name).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, baseRoot, sandboxID string, fetcher fetch.Fetcher) (DiskBackend, func(), error) {
+func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, baseRoot, sandboxID string, fetcher fetch.Fetcher, locations config.RefLocations) (DiskBackend, func(), error) {
 	var db DiskBackend
 	var closers []func()
 	cleanup := func() {
@@ -646,7 +649,7 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 	if single {
 		cowBaseURI, diffURI, diffTemplate = d.Base, d.Diff, d.DiffTemplate
 	} else {
-		r, _, err := OpenBlockReader(ctx, d.Base, fetcher)
+		r, _, err := OpenBlockReader(ctx, d.Base, fetcher, locations)
 		if err != nil {
 			return fail(fmt.Errorf("%s erofs base: %w", field, err))
 		}
@@ -657,7 +660,14 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 
 	var cowBase vhost.BlockReader
 	if cowBaseURI != "" {
-		r, _, err := OpenBlockReader(ctx, cowBaseURI, fetcher)
+		var fromRefs []string
+		if single {
+			fromRefs = d.BaseFromRefs
+		} else {
+			fromRefs = d.Overlay.BaseFromRefs
+		}
+		refs := append([]string{cowBaseURI}, fromRefs...)
+		r, _, err := OpenLayeredBlockReader(ctx, refs, fetcher, locations)
 		if err != nil {
 			return fail(fmt.Errorf("%s cow base: %w", field, err))
 		}
@@ -873,7 +883,14 @@ func handleSnapshotRequest(
 	// (replace the next-newest layer, not stack) for BOTH --output and --upload;
 	// buildSnapshotCfg drops the parent ref to match. Cold/manifest parents stack.
 	prov := cfg.SnapshotProvenance
-	localParent := strings.HasPrefix(prov.ParentSnapshotRef, "file://")
+	localParent := false
+	if prov.ParentSnapshotRef != "" {
+		parentRef, err := manifest.ParseRef(prov.ParentSnapshotRef)
+		if err != nil {
+			return ctl.Response{}, fmt.Errorf("parent snapshot ref: %w", err)
+		}
+		localParent = !parentRef.Portable()
+	}
 	diffs := make([]snapshot.DiskDiff, len(disks))
 	for i, d := range disks {
 		dd := snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff}
@@ -992,7 +1009,14 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 	//     ref (local-layer depth stays 1).
 	//   - REMOTE (manifest://) / cold start: prepend the parent ref to stack.
 	prov := cfg.SnapshotProvenance
-	localParent := strings.HasPrefix(prov.ParentSnapshotRef, "file://")
+	localParent := false
+	if prov.ParentSnapshotRef != "" {
+		parentRef, err := manifest.ParseRef(prov.ParentSnapshotRef)
+		if err != nil {
+			return nil, fmt.Errorf("parent snapshot ref: %w", err)
+		}
+		localParent = !parentRef.Portable()
+	}
 	coldStart := prov.ParentSnapshotRef == ""
 	if localParent {
 		doc.FromRefs = prov.ParentFromRefs
@@ -1004,11 +1028,13 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 	// single-disk CoW base, or the overlay's lower (overlay.base) in two-disk
 	// mode — both must be chained on cold start (see renderDiskNode).
 	rootColdLower := cfg.Boot.Root.Base
+	rootColdChain := cfg.Boot.Root.BaseFromRefs
 	if cfg.Boot.Root.Overlay != nil {
 		rootColdLower = cfg.Boot.Root.Overlay.Base
+		rootColdChain = cfg.Boot.Root.Overlay.BaseFromRefs
 	}
 	doc.Boot.Root = renderDiskNode(overlayRefs[0], cfg.SnapshotRefs.BaseRef,
-		rootColdLower, cfg.SingleDisk(), localParent, coldStart,
+		rootColdLower, rootColdChain, cfg.SingleDisk(), localParent, coldStart,
 		prov.ParentOverlayBase, prov.ParentBaseFromRefs)
 
 	// Data-disk nodes (boot.disks[] order), each with its own parent chain.
@@ -1024,11 +1050,13 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 			baseRef = cfg.SnapshotRefs.DiskBaseRefs[i]
 		}
 		diskColdLower := d.Base
+		diskColdChain := d.BaseFromRefs
 		if d.Overlay != nil {
 			diskColdLower = d.Overlay.Base
+			diskColdChain = d.Overlay.BaseFromRefs
 		}
 		doc.Boot.Disks = append(doc.Boot.Disks, renderDiskNode(overlayRefs[1+i],
-			baseRef, diskColdLower, d.RootConfig.Single(), localParent, coldStart, pTop, pChain))
+			baseRef, diskColdLower, diskColdChain, d.RootConfig.Single(), localParent, coldStart, pTop, pChain))
 	}
 	return yaml.Marshal(&doc)
 }
@@ -1040,7 +1068,7 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 // lower (overlay.base) in two-disk mode — to chain. parentTop/parentChain are
 // this disk's parent overlay ref + chain — dropped (localParent: merged) or
 // prepended (stacked).
-func renderDiskNode(overlayRef, baseRef, coldLower string, single, localParent, coldStart bool, parentTop string, parentChain []string) diskNodeYAML {
+func renderDiskNode(overlayRef, baseRef, coldLower string, coldChain []string, single, localParent, coldStart bool, parentTop string, parentChain []string) diskNodeYAML {
 	var chain []string
 	if localParent {
 		chain = parentChain
@@ -1054,7 +1082,7 @@ func renderDiskNode(overlayRef, baseRef, coldLower string, single, localParent, 
 	// (overlay.base), e.g. a fromTemplate build's inherited template overlay. A
 	// self-contained diff (diff_template, no lower) has coldLower == "".
 	if coldStart && coldLower != "" {
-		chain = prependRef(coldLower, chain)
+		chain = append([]string{coldLower}, append([]string{}, coldChain...)...)
 	}
 	node := diskNodeYAML{}
 	if single {
@@ -1117,7 +1145,7 @@ type overlayCfgYAML struct {
 // populateSnapshotRefs reads the identities embedded in boot.runtime and local
 // tarstream bases, then stores canonical refs on cfg.SnapshotRefs. It performs
 // metadata-only reads; manifest refs already carry their content identity.
-func populateSnapshotRefs(cfg *config.SandboxConfig) error {
+func populateSnapshotRefs(cfg *config.SandboxConfig, locations config.RefLocations) error {
 	rRef, err := buildRuntimeRef(cfg.Boot.Runtime)
 	if err != nil {
 		return fmt.Errorf("boot.runtime: %w", err)
@@ -1133,7 +1161,7 @@ func populateSnapshotRefs(cfg *config.SandboxConfig) error {
 			if d.Single() || d.Base == "" {
 				continue
 			}
-			ref, err := buildDiskRef(d.Base)
+			ref, err := buildDiskRef(d.Base, locations)
 			if err != nil {
 				return fmt.Errorf("boot.disks[%d].base: %w", i, err)
 			}
@@ -1144,7 +1172,7 @@ func populateSnapshotRefs(cfg *config.SandboxConfig) error {
 	if cfg.Boot.Root.Base == "" {
 		return nil
 	}
-	bRef, err := buildDiskRef(cfg.Boot.Root.Base)
+	bRef, err := buildDiskRef(cfg.Boot.Root.Base, locations)
 	if err != nil {
 		return fmt.Errorf("boot.root.base: %w", err)
 	}
@@ -1168,14 +1196,18 @@ func buildRuntimeRef(uri string) (string, error) {
 
 // buildDiskRef passes manifest identities through and reads a local tarstream
 // artifact's declared identity without scanning its payload.
-func buildDiskRef(uri string) (string, error) {
-	if strings.HasPrefix(uri, "manifest://") {
-		return uri, nil
+func buildDiskRef(uri string, locations config.RefLocations) (string, error) {
+	ref, err := manifest.ParseRef(uri)
+	if err != nil {
+		return "", err
 	}
-	if !strings.HasPrefix(uri, "file://") {
-		return "", fmt.Errorf("expected file:// or manifest://, got %q", uri)
+	if ref.Scheme == manifest.RefSchemeManifest {
+		return ref.String(), nil
 	}
-	path := strings.TrimPrefix(uri, "file://")
+	path, err := locations.ResolveFile(ref, "")
+	if err != nil {
+		return "", err
+	}
 	stream, err := fetch.OpenTarStream(path)
 	if err != nil {
 		return "", err
@@ -1185,7 +1217,13 @@ func buildDiskRef(uri string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("file artifact %s has no declared digest", path)
 	}
-	return "file://" + filepath.Base(path) + "@" + d.Digest(), nil
+	digest := strings.TrimPrefix(d.Digest(), "sha256:")
+	if ref.Digest != "" && ref.Digest != digest {
+		return "", fmt.Errorf("file artifact %s digest mismatch: got %s, want %s", path, digest, ref.Digest)
+	}
+	ref.Path = filepath.Base(path)
+	ref.Digest = digest
+	return ref.String(), nil
 }
 
 func generateSandboxID() string {

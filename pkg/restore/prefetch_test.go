@@ -12,34 +12,26 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func TestMemoryPrefetchEligibility(t *testing.T) {
-	key := prefetchKey(0x21)
-	keyRef := manifest.HexKey(key)
-
 	tests := []struct {
 		name       string
 		mode       config.PrefetchMode
-		keyRef     string
 		stream     fetch.Stream
 		wantReason string
 	}{
-		{name: "default off", mode: config.PrefetchOff, keyRef: keyRef, stream: newPrefetchTestStream()},
-		{name: "local snapshot", mode: config.PrefetchMemory, stream: newPrefetchTestStream(), wantReason: "reason=local_top"},
-		{name: "composite top", mode: config.PrefetchMemory, keyRef: keyRef + ":" + manifest.HexKey(prefetchKey(0x22)), stream: newPrefetchTestStream(), wantReason: "reason=composite_top_ref"},
-		{name: "stream without capability", mode: config.PrefetchMemory, keyRef: keyRef, stream: plainPrefetchTestStream{}, wantReason: "reason=no_capability"},
+		{name: "default off", mode: config.PrefetchOff, stream: newPrefetchTestStream()},
+		{name: "stream without capability", mode: config.PrefetchMemory, stream: plainPrefetchTestStream{}, wantReason: "reason=no_capability"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := newPrefetchTestLogs()
-			task := startMemoryPrefetch(context.Background(), tt.mode, tt.keyRef, tt.stream, 2, logs.logf)
+			task := startMemoryPrefetch(context.Background(), tt.mode, tt.stream, 2, logs.logf)
 			task.Stop()
 			if task != nil {
 				t.Fatal("ineligible prefetch started a task")
@@ -53,8 +45,8 @@ func TestMemoryPrefetchEligibility(t *testing.T) {
 			}
 			if stream, ok := tt.stream.(*prefetchTestStream); ok {
 				select {
-				case call := <-stream.started:
-					t.Fatalf("ineligible prefetch called stream with keys %x", call)
+				case <-stream.started:
+					t.Fatal("ineligible prefetch called stream")
 				default:
 				}
 			}
@@ -79,24 +71,19 @@ func TestRunRejectsInvalidPrefetchBeforeSideEffects(t *testing.T) {
 	}
 }
 
-func TestMemoryPrefetchPassesTopKey(t *testing.T) {
-	topKey := prefetchKey(0x31)
+func TestMemoryPrefetchStartsTopStream(t *testing.T) {
 	top := newPrefetchTestStream()
 
-	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, manifest.HexKey(topKey), top, 3, nil)
-	got := <-top.started
-	if len(got) != 1 || got[0] != topKey {
-		t.Fatalf("Prefetch keys = %x, want top key %x", got, topKey)
-	}
+	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, top, 3, nil)
+	<-top.started
 	task.Stop()
 }
 
 func TestMemoryPrefetchStopCancelsAndJoinsBeforeClose(t *testing.T) {
-	key := prefetchKey(0x41)
 	stream := newPrefetchTestStream()
 	stream.holdAfterCancel = make(chan struct{})
 
-	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, manifest.HexKey(key), stream, 0, nil)
+	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, stream, 0, nil)
 	<-stream.started
 
 	stopReturned := make(chan struct{})
@@ -124,7 +111,7 @@ func TestMemoryPrefetchFailureIsFailOpen(t *testing.T) {
 	stream.result = wantErr
 	logs := newPrefetchTestLogs()
 
-	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, manifest.HexKey(prefetchKey(0x51)), stream, 1, logs.logf)
+	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, stream, 1, logs.logf)
 	<-stream.started
 	close(stream.complete)
 	<-stream.done
@@ -139,7 +126,7 @@ func TestMemoryPrefetchFailureIsFailOpen(t *testing.T) {
 func TestMemoryPrefetchNaturalCompletionThenStop(t *testing.T) {
 	stream := newPrefetchTestStream()
 	logs := newPrefetchTestLogs()
-	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, manifest.HexKey(prefetchKey(0x61)), stream, 4, logs.logf)
+	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, stream, 4, logs.logf)
 	<-stream.started
 	close(stream.complete)
 	<-stream.done
@@ -157,7 +144,7 @@ func TestMemoryPrefetchNaturalCompletionThenStop(t *testing.T) {
 func TestMemoryPrefetchCancellationLog(t *testing.T) {
 	stream := newPrefetchTestStream()
 	logs := newPrefetchTestLogs()
-	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, manifest.HexKey(prefetchKey(0x71)), stream, 2, logs.logf)
+	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, stream, 2, logs.logf)
 	<-stream.started
 	task.Stop()
 
@@ -207,7 +194,7 @@ func (plainPrefetchTestStream) ReadAt(context.Context, []byte, uint64) (int, err
 func (plainPrefetchTestStream) Close() error { return nil }
 
 type prefetchTestStream struct {
-	started         chan []store.ContentKey
+	started         chan struct{}
 	canceled        chan struct{}
 	done            chan struct{}
 	complete        chan struct{}
@@ -219,7 +206,7 @@ type prefetchTestStream struct {
 
 func newPrefetchTestStream() *prefetchTestStream {
 	return &prefetchTestStream{
-		started:  make(chan []store.ContentKey, 1),
+		started:  make(chan struct{}, 1),
 		canceled: make(chan struct{}),
 		done:     make(chan struct{}),
 		complete: make(chan struct{}),
@@ -241,8 +228,8 @@ func (s *prefetchTestStream) Close() error {
 		return errors.New("stream closed before prefetch exited")
 	}
 }
-func (s *prefetchTestStream) Prefetch(ctx context.Context, keys ...store.ContentKey) error {
-	s.started <- append([]store.ContentKey(nil), keys...)
+func (s *prefetchTestStream) Prefetch(ctx context.Context) error {
+	s.started <- struct{}{}
 	defer s.doneOnce.Do(func() { close(s.done) })
 	select {
 	case <-s.complete:
@@ -273,12 +260,6 @@ func (l *prefetchTestLogs) joined() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return strings.Join(l.lines, "\n")
-}
-
-func prefetchKey(value byte) store.ContentKey {
-	var key store.ContentKey
-	key[0] = value
-	return key
 }
 
 var _ fetch.Prefetcher = (*prefetchTestStream)(nil)

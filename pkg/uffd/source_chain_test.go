@@ -3,25 +3,16 @@ package uffd
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"io"
 	"testing"
 
-	"github.com/kuasar-sandbox/accelerator/pkg/cache"
-	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
-// passthroughDecryptor returns the ciphertext bytes verbatim.
-type passthroughDecryptor struct{}
+type testStream struct{ sparse.Source }
 
-func (passthroughDecryptor) Encrypt(_ [32]byte, p []byte) ([]byte, [32]byte, [32]byte) {
-	return p, [32]byte{}, [32]byte{}
-}
-func (passthroughDecryptor) Decrypt(_ [32]byte, c []byte) ([]byte, error)        { return c, nil }
-func (passthroughDecryptor) DecryptInPlace(_ [32]byte, b []byte) ([]byte, error) { return b, nil }
+func (testStream) Close() error { return nil }
 
 // buildPageStream makes a one-page-per-chunk manifest Stream over numPages
 // pages. fills[i] != 0 → page i is a data chunk filled with fills[i]; fills[i]
@@ -29,22 +20,21 @@ func (passthroughDecryptor) DecryptInPlace(_ [32]byte, b []byte) ([]byte, error)
 func buildPageStream(t *testing.T, numPages int, fills []byte) fetch.Stream {
 	t.Helper()
 	ps := int(PageSize)
-	m := &codec.Manifest{Version: codec.Version1, ImageSize: uint64(numPages * ps)}
-	g := mapGetter{}
+	data := make([]byte, numPages*ps)
+	var holes []sparse.Extent
 	for i := 0; i < numPages; i++ {
 		off := uint64(i * ps)
 		if fills[i] == 0 {
-			m.Holes = append(m.Holes, sparse.Extent{Offset: off, Size: uint64(ps)})
+			holes = append(holes, sparse.Extent{Offset: off, Size: uint64(ps)})
 			continue
 		}
-		blob := bytes.Repeat([]byte{fills[i]}, ps)
-		key := store.ContentKey(sha256.Sum256(blob))
-		g[key] = blob
-		m.Entries = append(m.Entries, codec.ChunkEntry{
-			Offset: off, Size: uint32(ps), CiphertextHash: key,
-		})
+		copy(data[i*ps:(i+1)*ps], bytes.Repeat([]byte{fills[i]}, ps))
 	}
-	return fetch.NewStream(m, make([][32]byte, len(m.Entries)), g, passthroughDecryptor{})
+	src, err := sparse.NewSource(bytes.NewReader(data), uint64(len(data)), holes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testStream{Source: src}
 }
 
 // drainSource walks src page-by-page exactly as the uffd handler does:
@@ -74,16 +64,6 @@ func drainSource(t *testing.T, src SnapshotReader, size int) []byte {
 	return out
 }
 
-// mapGetter returns a chunk's full bytes by content key.
-type mapGetter map[store.ContentKey][]byte
-
-func (g mapGetter) Get(_ context.Context, _ store.Partition, k store.ContentKey) (cache.CacheResult, cache.Blob, error) {
-	if d, ok := g[k]; ok {
-		return cache.CacheHit, cache.NewMemBlob(d), nil
-	}
-	return cache.CacheMiss, nil, nil
-}
-
 // extent is one [startPage, startPage+numPages) region; fill==0 → declared hole.
 type extent struct {
 	startPage, numPages int
@@ -95,21 +75,22 @@ type extent struct {
 func buildExtentStream(t *testing.T, numPages int, exts []extent) fetch.Stream {
 	t.Helper()
 	ps := int(PageSize)
-	m := &codec.Manifest{Version: codec.Version1, ImageSize: uint64(numPages * ps)}
-	g := mapGetter{}
+	data := make([]byte, numPages*ps)
+	var holes []sparse.Extent
 	for _, e := range exts {
 		off := uint64(e.startPage * ps)
 		sz := e.numPages * ps
 		if e.fill == 0 {
-			m.Holes = append(m.Holes, sparse.Extent{Offset: off, Size: uint64(sz)})
+			holes = append(holes, sparse.Extent{Offset: off, Size: uint64(sz)})
 			continue
 		}
-		blob := bytes.Repeat([]byte{e.fill}, sz)
-		k := store.ContentKey(sha256.Sum256(blob))
-		g[k] = blob
-		m.Entries = append(m.Entries, codec.ChunkEntry{Offset: off, Size: uint32(sz), CiphertextHash: k})
+		copy(data[e.startPage*ps:(e.startPage+e.numPages)*ps], bytes.Repeat([]byte{e.fill}, sz))
 	}
-	return fetch.NewStream(m, make([][32]byte, len(m.Entries)), g, passthroughDecryptor{})
+	src, err := sparse.NewSource(bytes.NewReader(data), uint64(len(data)), holes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testStream{Source: src}
 }
 
 // TestStreamSnapshotSource_LayeredMultiPageChunks exercises the realistic case:

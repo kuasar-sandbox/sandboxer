@@ -91,41 +91,7 @@ func baseSnap(runtimeRef, baseRef, overlayBase string) *SnapshotCfg {
 }
 
 func applyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string) (*config.SandboxConfig, error) {
-	return ApplyRules(host, snap, snapshotPath)
-}
-
-func TestParseRef(t *testing.T) {
-	for _, tc := range []struct {
-		in     string
-		scheme string
-		base   string
-		dig    string
-		key    string
-		err    bool
-	}{
-		{"file://runtime.erofs@sha256:abcd", "file", "runtime.erofs", "abcd", "", false},
-		{"manifest://deadbeef", "manifest", "", "", "deadbeef", false},
-		{"file://runtime.erofs", "", "", "", "", true}, // missing @sha256:
-		{"manifest://", "", "", "", "", true},          // empty key
-		{"http://example.com", "", "", "", "", true},   // unsupported
-		{"file://@sha256:abcd", "", "", "", "", true},  // empty basename
-		{"file://name@sha256:", "", "", "", "", true},  // empty digest
-	} {
-		got, err := ParseRef(tc.in)
-		if tc.err {
-			if err == nil {
-				t.Errorf("ParseRef(%q) expected error, got %+v", tc.in, got)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("ParseRef(%q) unexpected error: %v", tc.in, err)
-			continue
-		}
-		if got.Scheme != tc.scheme || got.Basename != tc.base || got.Digest != tc.dig || got.Key != tc.key {
-			t.Errorf("ParseRef(%q) = %+v, want {%s %s %s %s}", tc.in, got, tc.scheme, tc.base, tc.dig, tc.key)
-		}
-	}
+	return ApplyRules(host, snap, snapshotPath, nil)
 }
 
 func TestApplyRules_CapacityMustMatchWhenProvided(t *testing.T) {
@@ -371,32 +337,34 @@ func TestApplyRules_ManifestBaseMatchesKey(t *testing.T) {
 	dir := t.TempDir()
 	rtPath := filepath.Join(dir, "runtime.erofs")
 	rtDigest := writeFile(t, rtPath, []byte("runtime body"))
-	snap := baseSnap("file://runtime.erofs@sha256:"+rtDigest, "manifest://abcdef", "manifest://9999")
+	baseKey := strings.Repeat("a", 64)
+	overlayKey := strings.Repeat("b", 64)
+	snap := baseSnap("file://runtime.erofs@sha256:"+rtDigest, "manifest://"+baseKey, "manifest://"+overlayKey)
 
 	host := &config.SandboxConfig{}
 	host.Network.TAP = "tap0"
 	host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
 
-	// host empty: should auto-fill manifest://abcdef
+	// host empty: should auto-fill the snapshot manifest ref.
 	out, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Boot.Root.Base != "manifest://abcdef" {
-		t.Errorf("manifest auto-fill = %s, want manifest://abcdef", out.Boot.Root.Base)
+	if out.Boot.Root.Base != "manifest://"+baseKey {
+		t.Errorf("manifest auto-fill = %s, want manifest://%s", out.Boot.Root.Base, baseKey)
 	}
-	if out.Boot.Root.Overlay.Base != "manifest://9999" {
-		t.Errorf("overlay.base from snapshot = %s, want manifest://9999", out.Boot.Root.Overlay.Base)
+	if out.Boot.Root.Overlay.Base != "manifest://"+overlayKey {
+		t.Errorf("overlay.base from snapshot = %s, want manifest://%s", out.Boot.Root.Overlay.Base, overlayKey)
 	}
 
 	// host provides matching manifest:// key
-	host.Boot.Root.Base = "manifest://abcdef"
+	host.Boot.Root.Base = "manifest://" + baseKey
 	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err != nil {
 		t.Fatalf("matching manifest key should pass: %v", err)
 	}
 
 	// host provides different manifest:// key → mismatch
-	host.Boot.Root.Base = "manifest://different"
+	host.Boot.Root.Base = "manifest://" + strings.Repeat("c", 64)
 	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "manifest key mismatch") {
 		t.Fatalf("expected manifest key mismatch, got %v", err)
 	}
