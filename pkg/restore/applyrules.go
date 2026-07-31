@@ -105,6 +105,10 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 		return nil, errors.New("ApplyRules: snapshot.cfg is nil")
 	}
 	out := *host // shallow copy
+	out.SnapshotRefs = config.SnapshotRefs{RuntimeRef: snap.Boot.RuntimeRef}
+	if len(snap.Boot.Disks) > 0 {
+		out.SnapshotRefs.DiskBaseRefs = make([]string, len(snap.Boot.Disks))
+	}
 
 	// 1. capacity: exact match if host provides; otherwise copy.
 	if host.Resources.Capacity.CPU != 0 || host.Resources.Capacity.Memory != "" {
@@ -170,6 +174,10 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 			return nil, err
 		}
 		out.Boot.Root.Base = resolvedBase
+		out.SnapshotRefs.BaseRef, err = effectiveSnapshotBaseRef(resolvedBase, snapBaseRef)
+		if err != nil {
+			return nil, fmt.Errorf("boot.root.base: %w", err)
+		}
 		// Fresh Overlay pointer so we never mutate host's (out is a shallow copy);
 		// inherit the host's optional diff override, force overlay.base from the
 		// snapshot (host yaml's overlay.base is ignored).
@@ -208,6 +216,10 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 					return nil, err
 				}
 				hd.Base = resolvedBase
+				out.SnapshotRefs.DiskBaseRefs[i], err = effectiveSnapshotBaseRef(resolvedBase, snapBaseRef)
+				if err != nil {
+					return nil, fmt.Errorf("%s.base: %w", field, err)
+				}
 				ov := config.OverlayConfig{}
 				if hd.Overlay != nil {
 					ov = *hd.Overlay
@@ -345,4 +357,23 @@ func parseSnapshotRuntimeRef(raw string) (manifest.Ref, error) {
 		return manifest.Ref{}, fmt.Errorf("named ref locations are not supported")
 	}
 	return ref, nil
+}
+
+func effectiveSnapshotBaseRef(raw string, snapRef manifest.Ref) (string, error) {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return "", err
+	}
+	if ref.Scheme != snapRef.Scheme {
+		return "", fmt.Errorf("effective scheme %q does not match snapshot scheme %q", ref.Scheme, snapRef.Scheme)
+	}
+	if ref.Scheme == manifest.RefSchemeManifest {
+		return snapRef.String(), nil
+	}
+	ref.Path = filepath.Base(ref.Path)
+	ref.Digest = snapRef.Digest
+	if err := ref.Validate(); err != nil {
+		return "", err
+	}
+	return ref.String(), nil
 }

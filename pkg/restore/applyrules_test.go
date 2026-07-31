@@ -347,6 +347,51 @@ func TestApplyRules_RejectsLocatedRuntimeRef(t *testing.T) {
 	}
 }
 
+func TestApplyRules_CarriesEffectiveLocatedBaseRefs(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "runtime.bundle")
+	runtimeDigest := writeFile(t, runtimePath, []byte("runtime body"))
+	rootDir := t.TempDir()
+	rootPath, rootDigest := writePublishArtifact(t, rootDir, ".erofs", bytes.Repeat([]byte{0x51}, 4096))
+	diskDir := t.TempDir()
+	diskPath, diskDigest := writePublishArtifact(t, diskDir, ".erofs", bytes.Repeat([]byte{0x52}, 4096))
+	rootName := filepath.Base(rootPath)
+	diskName := filepath.Base(diskPath)
+
+	snap := baseSnap(
+		"file://runtime.bundle@sha256:"+runtimeDigest,
+		"file://"+rootName+"@sha256:"+strings.TrimPrefix(rootDigest, "sha256:")+"@location:old-root",
+		"manifest://"+strings.Repeat("a", 64),
+	)
+	snap.Boot.Disks = []SnapDiskNode{{
+		BaseRef: "file://" + diskName + "@sha256:" + strings.TrimPrefix(diskDigest, "sha256:") + "@location:old-disk",
+		Overlay: &SnapOverlayCfg{Base: "manifest://" + strings.Repeat("b", 64)},
+	}}
+	host := &config.SandboxConfig{}
+	host.Boot.Root.Base = "file://" + rootName + "@location:new-root"
+	host.Boot.Root.Overlay = &config.OverlayConfig{}
+	host.Boot.Disks = []config.DiskConfig{{RootConfig: config.RootConfig{
+		Base:    "file://" + diskName + "@location:new-disk",
+		Overlay: &config.OverlayConfig{},
+	}}}
+
+	out, err := ApplyRules(host, snap, filepath.Join(dir, "root.snapshot"), config.RefLocations{
+		"new-root": rootDir,
+		"new-disk": diskDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRoot := "file://" + rootName + "@sha256:" + strings.TrimPrefix(rootDigest, "sha256:") + "@location:new-root"
+	wantDisk := "file://" + diskName + "@sha256:" + strings.TrimPrefix(diskDigest, "sha256:") + "@location:new-disk"
+	if out.SnapshotRefs.BaseRef != wantRoot {
+		t.Fatalf("effective root base_ref = %q, want %q", out.SnapshotRefs.BaseRef, wantRoot)
+	}
+	if len(out.SnapshotRefs.DiskBaseRefs) != 1 || out.SnapshotRefs.DiskBaseRefs[0] != wantDisk {
+		t.Fatalf("effective disk base_refs = %v, want [%s]", out.SnapshotRefs.DiskBaseRefs, wantDisk)
+	}
+}
+
 func TestApplyRules_ManifestBaseMatchesKey(t *testing.T) {
 	dir := t.TempDir()
 	rtPath := filepath.Join(dir, "runtime.erofs")

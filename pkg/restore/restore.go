@@ -245,23 +245,6 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		snapCfg.Metadata = parsedSnap.Metadata
 	}
 
-	// Carry the runtime/base refs forward so a snapshot taken by this restored
-	// run records them (the cold path reads their markers via
-	// populateSnapshotRefs; here they are already matched against the parent
-	// snapshot.cfg, so another marker read is unnecessary). Without this,
-	// snapshots from a restored sandbox
-	// would have empty runtime_ref/base_ref and could not themselves be restored.
-	snapCfg.SnapshotRefs = config.SnapshotRefs{
-		RuntimeRef: parsedSnap.Boot.RuntimeRef,
-		BaseRef:    parsedSnap.Boot.Root.BaseRef,
-	}
-	if len(parsedSnap.Boot.Disks) > 0 {
-		snapCfg.SnapshotRefs.DiskBaseRefs = make([]string, len(parsedSnap.Boot.Disks))
-		for i := range parsedSnap.Boot.Disks {
-			snapCfg.SnapshotRefs.DiskBaseRefs[i] = parsedSnap.Boot.Disks[i].BaseRef
-		}
-	}
-
 	// Record provenance so a snapshot taken by this restored run prepends this
 	// bundle and extends the chain (§3.5): child.from_refs = [selfRef] ++
 	// this.from_refs; child.base_from_refs = [this.overlay.base] ++ this.base_from_refs.
