@@ -821,9 +821,12 @@ func preflightLocatedRefs(ctx context.Context, opts Options) error {
 	for len(pending) > 0 {
 		snap := pending[0]
 		pending = pending[1:]
+		if err := preflightLocatedRef(snap.Boot.RuntimeRef, opts, readRuntimeBundleDigest); err != nil {
+			return err
+		}
 		refs := snapshotArtifactRefs(snap)
 		for _, raw := range refs {
-			if err := preflightLocatedRef(raw, opts); err != nil {
+			if err := preflightLocatedRef(raw, opts, readTarArtifactDigest); err != nil {
 				return err
 			}
 		}
@@ -854,7 +857,7 @@ func preflightLocatedRefs(ctx context.Context, opts Options) error {
 }
 
 func snapshotArtifactRefs(snap *SnapshotCfg) []string {
-	refs := []string{snap.Boot.RuntimeRef, snap.Boot.Root.BaseRef, snap.Boot.Root.Base}
+	refs := []string{snap.Boot.Root.BaseRef, snap.Boot.Root.Base}
 	refs = append(refs, snap.Boot.Root.BaseFromRefs...)
 	if snap.Boot.Root.Overlay != nil {
 		refs = append(refs, snap.Boot.Root.Overlay.Base)
@@ -872,7 +875,7 @@ func snapshotArtifactRefs(snap *SnapshotCfg) []string {
 	return refs
 }
 
-func preflightLocatedRef(raw string, opts Options) error {
+func preflightLocatedRef(raw string, opts Options, readDigest func(string) (string, error)) error {
 	if raw == "" {
 		return nil
 	}
@@ -887,7 +890,16 @@ func preflightLocatedRef(raw string, opts Options) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(path); err != nil {
+	digest, err := readDigest(path)
+	if err != nil {
+		return fmt.Errorf("located ref %s: %w", ref.String(), err)
+	}
+	if ref.Digest != "" {
+		if err := matchDigest(digest, ref.Digest); err != nil {
+			return fmt.Errorf("located ref %s: %w", ref.String(), err)
+		}
+	}
+	if err := validateContentAddressedName(path, digest); err != nil {
 		return fmt.Errorf("located ref %s: %w", ref.String(), err)
 	}
 	return nil

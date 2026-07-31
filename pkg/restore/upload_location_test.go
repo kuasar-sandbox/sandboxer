@@ -187,6 +187,49 @@ func TestPreflightLocatedRefsWalksMemoryParents(t *testing.T) {
 	}
 }
 
+func TestPreflightLocatedRefsValidatesDiskArtifactIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		makeRef func(t *testing.T, locationDir, artifactPath, digest string) string
+		want    string
+	}{
+		{
+			name: "digest qualifier",
+			makeRef: func(_ *testing.T, _, artifactPath, _ string) string {
+				return "file://" + filepath.Base(artifactPath) + "@sha256:" + strings.Repeat("f", 64) + "@location:shared"
+			},
+			want: "sha256 marker mismatch",
+		},
+		{
+			name: "content addressed name",
+			makeRef: func(t *testing.T, locationDir, artifactPath, _ string) string {
+				wrongPath := filepath.Join(locationDir, "wrong.overlay")
+				if err := os.Rename(artifactPath, wrongPath); err != nil {
+					t.Fatal(err)
+				}
+				return "file://wrong.overlay@location:shared"
+			},
+			want: "does not match marker",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			locationDir := t.TempDir()
+			artifactPath, digest := writePublishArtifact(t, locationDir, ".overlay", bytes.Repeat([]byte{0x4B}, 4096))
+			rootCfg := &SnapshotCfg{}
+			rootCfg.Resources.Capacity.Memory = "4KiB"
+			rootCfg.Boot.Root.Overlay = &SnapOverlayCfg{Base: tc.makeRef(t, locationDir, artifactPath, digest)}
+			rootPath := writePublishSnapshot(t, t.TempDir(), rootCfg)
+			err := preflightLocatedRefs(context.Background(), Options{
+				SnapshotPath: rootPath,
+				RefLocations: config.RefLocations{"shared": locationDir},
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("preflight error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func writePublishArtifact(t *testing.T, dir, ext string, payload []byte) (string, string) {
 	t.Helper()
 	tmp, err := os.CreateTemp(dir, "artifact-*.tmp")

@@ -297,7 +297,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 				fmt.Fprintln(os.Stderr, err)
 				return 2
 			}
-			if parsed.Location != "" {
+			if parsed.Location != "" || parsed.Digest != "" {
 				snapshotRef = parsed.String()
 			}
 		}

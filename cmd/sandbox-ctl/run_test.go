@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -8,8 +9,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
+	"gopkg.in/yaml.v3"
 )
 
 func captureStderr(t *testing.T, fn func() int) (int, string) {
@@ -87,4 +93,57 @@ func TestRunRestoreRejectsInvalidPrefetchBeforeRemoteDial(t *testing.T) {
 	if _, err := os.Stat(runRoot); !os.IsNotExist(err) {
 		t.Fatalf("runtime root was touched for invalid prefetch: stat error = %v", err)
 	}
+}
+
+func TestRunRestoreChecksDigestOnUnlocatedFileRef(t *testing.T) {
+	snapshotPath := writeRunRestoreSnapshot(t)
+	runRoot := filepath.Join(t.TempDir(), "run")
+	ref := "file://" + snapshotPath + "@sha256:" + strings.Repeat("f", 64)
+	rc, stderr := captureStderr(t, func() int {
+		return runRestore(
+			context.Background(), &config.SandboxConfig{}, nil, ref,
+			"test-sandbox", "/nonexistent/cloud-hypervisor", runRoot,
+			filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil,
+		)
+	})
+	if rc != 1 || !strings.Contains(stderr, "sha256 marker mismatch") {
+		t.Fatalf("runRestore = %d, stderr %q; want digest mismatch", rc, stderr)
+	}
+}
+
+func writeRunRestoreSnapshot(t *testing.T) string {
+	t.Helper()
+	cfg := &restore.SnapshotCfg{}
+	cfg.Resources.Capacity.Memory = "4KiB"
+	configBody, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zipBody, err := snapshot.BuildZIP(map[string][]byte{
+		"config.json":  []byte("{}"),
+		"state.json":   []byte("{}"),
+		"snapshot.cfg": configBody,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := append(make([]byte, 4096), zipBody...)
+	dir := t.TempDir()
+	tmp, err := os.CreateTemp(dir, "snapshot-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := tarstream.WriteTo(context.Background(), tmp, "snapshot", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
+	if err != nil {
+		tmp.Close()
+		t.Fatal(err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, strings.TrimPrefix(digest, "sha256:")+".snapshot")
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
