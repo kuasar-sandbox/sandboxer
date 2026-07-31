@@ -35,6 +35,10 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRepairsPartialFile(t *testing
 		BaseFromRefs: []string{oldLocated},
 	}
 	rootPath := writePublishSnapshot(t, sourceDir, snapCfg)
+	if err := os.Chmod(sourceDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sourceDir, 0o755) })
 
 	rootRef, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil)
 	if err != nil {
@@ -92,6 +96,57 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRepairsPartialFile(t *testing
 	}
 	if err := verifyArtifactFile(publishedOverlay, overlayDigest, 4096); err != nil {
 		t.Fatalf("partial file was not repaired: %v", err)
+	}
+}
+
+func TestPublishLocalToLocationRejectsSnapshotParentDigestMismatch(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	parentCfg := &SnapshotCfg{}
+	parentCfg.Resources.Capacity.Memory = "4KiB"
+	parentPath := writePublishSnapshot(t, sourceDir, parentCfg)
+
+	rootCfg := &SnapshotCfg{FromRefs: []string{
+		"file://" + filepath.Base(parentPath) + "@sha256:" + strings.Repeat("f", 64),
+	}}
+	rootCfg.Resources.Capacity.Memory = "4KiB"
+	rootPath := writePublishSnapshot(t, sourceDir, rootCfg)
+
+	_, err := PublishLocalToLocation(ctx, rootPath, "shared", t.TempDir(), nil)
+	if err == nil || !strings.Contains(err.Error(), "sha256 marker mismatch") {
+		t.Fatalf("publish error = %v, want snapshot parent digest mismatch", err)
+	}
+}
+
+func TestPublishLocalToLocationRefusesSymlinkDestination(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	targetDir := t.TempDir()
+	overlayPath, overlayDigest := writePublishArtifact(t, sourceDir, ".overlay", bytes.Repeat([]byte{0xA5}, 4096))
+	snapCfg := &SnapshotCfg{}
+	snapCfg.Resources.Capacity.Memory = "4KiB"
+	snapCfg.Boot.Root.Overlay = &SnapOverlayCfg{Base: "file://" + filepath.Base(overlayPath)}
+	rootPath := writePublishSnapshot(t, sourceDir, snapCfg)
+
+	victim := filepath.Join(t.TempDir(), "victim")
+	const original = "do not overwrite"
+	if err := os.WriteFile(victim, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(targetDir, strings.TrimPrefix(overlayDigest, "sha256:")+".overlay")
+	if err := os.Symlink(victim, destination); err != nil {
+		t.Fatal(err)
+	}
+	_, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil)
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("publish error = %v, want symlink rejection", err)
+	}
+	body, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != original {
+		t.Fatalf("victim content = %q", body)
 	}
 }
 

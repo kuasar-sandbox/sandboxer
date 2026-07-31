@@ -18,6 +18,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
+	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
@@ -36,7 +37,7 @@ func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config
 	p := newSnapshotPublisher(ctx, logf)
 	p.ing = ing
 	p.manifestConfig = mcfg
-	return p.publishSnapshot(snapshotPath)
+	return p.publishSnapshot(snapshotPath, "")
 }
 
 // PublishLocalToLocation publishes a local snapshot graph into one trusted
@@ -56,7 +57,7 @@ func PublishLocalToLocation(ctx context.Context, snapshotPath, location, directo
 	p := newSnapshotPublisher(ctx, logf)
 	p.location = location
 	p.directory = filepath.Clean(directory)
-	return p.publishSnapshot(snapshotPath)
+	return p.publishSnapshot(snapshotPath, "")
 }
 
 type snapshotPublisher struct {
@@ -82,7 +83,7 @@ func newSnapshotPublisher(ctx context.Context, logf func(string, ...any)) *snaps
 	}
 }
 
-func (p *snapshotPublisher) publishSnapshot(snapshotPath string) (result string, retErr error) {
+func (p *snapshotPublisher) publishSnapshot(snapshotPath, wantDigest string) (result string, retErr error) {
 	realPath, err := filepath.EvalSymlinks(snapshotPath)
 	if err != nil {
 		return "", fmt.Errorf("open snapshot: %w", err)
@@ -90,9 +91,6 @@ func (p *snapshotPublisher) publishSnapshot(snapshotPath string) (result string,
 	realPath, err = filepath.Abs(realPath)
 	if err != nil {
 		return "", err
-	}
-	if ref, ok := p.done[realPath]; ok {
-		return ref, nil
 	}
 	if p.visiting[realPath] {
 		return "", fmt.Errorf("upload-snapshot: cycle at %s", realPath)
@@ -105,11 +103,18 @@ func (p *snapshotPublisher) publishSnapshot(snapshotPath string) (result string,
 		return "", fmt.Errorf("open snapshot: %w", err)
 	}
 	defer bundle.Close()
-	if err := validateContentAddressedName(realPath, bundleDigest); err != nil {
+	if wantDigest != "" {
+		if err := matchDigest(bundleDigest, wantDigest); err != nil {
+			return "", fmt.Errorf("open snapshot: %w", err)
+		}
+	} else if err := validateContentAddressedName(realPath, bundleDigest); err != nil {
 		return "", fmt.Errorf("open snapshot: %w", err)
 	}
 	if err := verifyArtifactFile(realPath, bundleDigest, int64(bundle.Size())); err != nil {
 		return "", fmt.Errorf("open snapshot: %w", err)
+	}
+	if ref, ok := p.done[realPath]; ok {
+		return ref, nil
 	}
 	bundleSize := int64(bundle.Size())
 	entries, parsed, err := readSnapshotEntries(p.ctx, bundle, bundleSize)
@@ -162,7 +167,7 @@ func (p *snapshotPublisher) publishSnapshot(snapshotPath string) (result string,
 		result = "manifest://" + manifest.HexKey(res.ManifestKey)
 		p.logf("upload-snapshot: memory stored=%d dedup=%d zero=%d", res.StoredChunks, res.DedupChunks, res.ZeroChunks)
 	} else {
-		tmp, err := os.CreateTemp(bundleDir, ".publish-snapshot-*.tmp")
+		tmp, err := os.CreateTemp(p.directory, ".publish-snapshot-*.tmp")
 		if err != nil {
 			return "", err
 		}
@@ -272,7 +277,7 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 		path = filepath.Join(relativeDir, path)
 	}
 	if snapshotRef {
-		return p.publishSnapshot(path)
+		return p.publishSnapshot(path, ref.Digest)
 	}
 	return p.publishLeaf(label, path, ref.Digest)
 }
@@ -315,7 +320,10 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, 
 	if err != nil {
 		return "", err
 	}
-	if destInfo, statErr := os.Stat(destination); statErr == nil {
+	if destInfo, statErr := os.Lstat(destination); statErr == nil {
+		if !destInfo.Mode().IsRegular() {
+			return "", fmt.Errorf("ref location destination is not a regular file: %s", destination)
+		}
 		if destInfo.Size() == sourceInfo.Size() && verifyArtifactFile(destination, digest, 0) == nil {
 			return p.locatedRef(basename, hexDigest, keepDigest), nil
 		}
@@ -328,7 +336,7 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, 
 		return "", err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(destination, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	out, err := openLocationDestination(destination)
 	if err != nil {
 		return "", err
 	}
@@ -348,6 +356,31 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, 
 	}
 	p.logf("upload-snapshot: published %s", destination)
 	return p.locatedRef(basename, hexDigest, keepDigest), nil
+}
+
+func openLocationDestination(path string) (*os.File, error) {
+	fd, err := unix.Open(path, unix.O_CREAT|unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	closeFD := true
+	defer func() {
+		if closeFD {
+			_ = unix.Close(fd)
+		}
+	}()
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return nil, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, fmt.Errorf("ref location destination is not a regular file: %s", path)
+	}
+	if err := unix.Ftruncate(fd, 0); err != nil {
+		return nil, err
+	}
+	closeFD = false
+	return os.NewFile(uintptr(fd), path), nil
 }
 
 func (p *snapshotPublisher) locatedRef(basename, digest string, keepDigest bool) string {
