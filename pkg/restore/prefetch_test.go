@@ -12,45 +12,83 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
-func TestMemoryPrefetchEligibility(t *testing.T) {
-	tests := []struct {
-		name       string
-		mode       config.PrefetchMode
-		stream     fetch.Stream
-		wantReason string
-	}{
-		{name: "default off", mode: config.PrefetchOff, stream: newPrefetchTestStream()},
-		{name: "stream without capability", mode: config.PrefetchMemory, stream: plainPrefetchTestStream{}, wantReason: "reason=no_capability"},
+func TestMemoryPrefetchDisabledIsSilent(t *testing.T) {
+	manifestKey := strings.Repeat("a", 64)
+	for _, rawMode := range []string{"", "off"} {
+		mode, err := config.ParsePrefetchMode(rawMode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, backend := range []struct {
+			name string
+			key  string
+		}{
+			{name: "file"},
+			{name: "manifest", key: manifestKey},
+		} {
+			t.Run(rawMode+"/"+backend.name, func(t *testing.T) {
+				stream := newPrefetchTestStream()
+				logs := newPrefetchTestLogs()
+				task := startMemoryPrefetch(context.Background(), mode, backend.key, stream, 2, logs.logf)
+				task.Stop()
+				if task != nil {
+					t.Fatal("disabled prefetch started a task")
+				}
+				if got := stream.calls.Load(); got != 0 {
+					t.Fatalf("disabled prefetch calls = %d; want 0", got)
+				}
+				if joined := logs.joined(); joined != "" {
+					t.Fatalf("disabled prefetch logs = %q; want none", joined)
+				}
+			})
+		}
 	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+func TestMemoryPrefetchNoCapabilityIsFailOpen(t *testing.T) {
+	manifestKey := strings.Repeat("b", 64)
+	for _, backend := range []struct {
+		name string
+		key  string
+	}{
+		{name: "file"},
+		{name: "manifest", key: manifestKey},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
 			logs := newPrefetchTestLogs()
-			task := startMemoryPrefetch(context.Background(), tt.mode, tt.stream, 2, logs.logf)
+			task := startMemoryPrefetch(
+				context.Background(),
+				config.PrefetchMemory,
+				backend.key,
+				plainPrefetchTestStream{},
+				2,
+				logs.logf,
+			)
 			task.Stop()
 			if task != nil {
-				t.Fatal("ineligible prefetch started a task")
+				t.Fatal("stream without Prefetcher capability started a task")
 			}
 			joined := logs.joined()
-			if tt.wantReason == "" && joined != "" {
-				t.Fatalf("disabled prefetch logs = %q, want none", joined)
+			if !strings.Contains(joined, "memory prefetch skipped reason=no_capability backend="+backend.name+" parent_layers=2") {
+				t.Fatalf("skip logs = %q; want backend and parent layer count", joined)
 			}
-			if tt.wantReason != "" && (!strings.Contains(joined, "memory prefetch skipped "+tt.wantReason) || !strings.Contains(joined, "parent_layers=2")) {
-				t.Fatalf("skip logs = %q, want %q and parent layer count", joined, tt.wantReason)
-			}
-			if stream, ok := tt.stream.(*prefetchTestStream); ok {
-				select {
-				case <-stream.started:
-					t.Fatal("ineligible prefetch called stream")
-				default:
-				}
+			if backend.key != "" && !strings.Contains(joined, "key="+backend.key) {
+				t.Fatalf("manifest skip logs = %q; want key", joined)
 			}
 		})
+	}
+}
+
+func TestCompositeManifestRefRejectedBeforePrefetch(t *testing.T) {
+	key := strings.Repeat("c", 64)
+	if _, err := manifest.ParseRef("manifest://" + key + ":" + key); err == nil {
+		t.Fatal("canonical parser accepted a composite manifest ref")
 	}
 }
 
@@ -71,19 +109,62 @@ func TestRunRejectsInvalidPrefetchBeforeSideEffects(t *testing.T) {
 	}
 }
 
-func TestMemoryPrefetchStartsTopStream(t *testing.T) {
-	top := newPrefetchTestStream()
+func TestMemoryPrefetchUsesCurrentSelfWithoutSelector(t *testing.T) {
+	manifestKey := strings.Repeat("d", 64)
+	for _, backend := range []struct {
+		name       string
+		key        string
+		completion string
+	}{
+		{name: "file", completion: "advised"},
+		{name: "manifest", key: manifestKey, completion: "completed"},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			self := newPrefetchTestStream()
+			parents := []*prefetchTestStream{newPrefetchTestStream(), newPrefetchTestStream()}
+			disks := []*prefetchTestStream{newPrefetchTestStream(), newPrefetchTestStream(), newPrefetchTestStream()}
+			logs := newPrefetchTestLogs()
 
-	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, top, 3, nil)
-	<-top.started
-	task.Stop()
+			task := startMemoryPrefetch(
+				context.Background(),
+				config.PrefetchMemory,
+				backend.key,
+				self,
+				len(parents),
+				logs.logf,
+			)
+			<-self.started
+			close(self.complete)
+			<-self.done
+			task.Stop()
+
+			if got := self.calls.Load(); got != 1 {
+				t.Fatalf("current self Prefetch calls = %d; want 1", got)
+			}
+			for i, stream := range append(parents, disks...) {
+				if got := stream.calls.Load(); got != 0 {
+					t.Fatalf("non-self stream %d Prefetch calls = %d; want 0", i, got)
+				}
+			}
+
+			identity := "backend=" + backend.name + " parent_layers=2"
+			if backend.key != "" {
+				identity += " key=" + backend.key
+			}
+			joined := logs.joined()
+			if !strings.Contains(joined, "memory prefetch started "+identity) ||
+				!strings.Contains(joined, "memory prefetch "+backend.completion+" "+identity+" duration=") {
+				t.Fatalf("logs = %q; want started/%s for current %s self", joined, backend.completion, backend.name)
+			}
+		})
+	}
 }
 
 func TestMemoryPrefetchStopCancelsAndJoinsBeforeClose(t *testing.T) {
 	stream := newPrefetchTestStream()
 	stream.holdAfterCancel = make(chan struct{})
 
-	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, stream, 0, nil)
+	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, "", stream, 0, nil)
 	<-stream.started
 
 	stopReturned := make(chan struct{})
@@ -107,34 +188,60 @@ func TestMemoryPrefetchStopCancelsAndJoinsBeforeClose(t *testing.T) {
 
 func TestMemoryPrefetchFailureIsFailOpen(t *testing.T) {
 	wantErr := errors.New("cache unavailable")
-	stream := newPrefetchTestStream()
-	stream.result = wantErr
-	logs := newPrefetchTestLogs()
+	manifestKey := strings.Repeat("e", 64)
+	for _, backend := range []struct {
+		name string
+		key  string
+	}{
+		{name: "file"},
+		{name: "manifest", key: manifestKey},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			stream := newPrefetchTestStream()
+			stream.result = wantErr
+			logs := newPrefetchTestLogs()
 
-	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, stream, 1, logs.logf)
-	<-stream.started
-	close(stream.complete)
-	<-stream.done
-	task.Stop()
+			task := startMemoryPrefetch(
+				context.Background(),
+				config.PrefetchMemory,
+				backend.key,
+				stream,
+				1,
+				logs.logf,
+			)
+			<-stream.started
+			close(stream.complete)
+			<-stream.done
+			task.Stop()
 
-	joined := logs.joined()
-	if !strings.Contains(joined, wantErr.Error()) || !strings.Contains(joined, "duration=") || !strings.Contains(joined, "restore_continues=on_demand") {
-		t.Fatalf("logs = %q, want fail-open diagnostic", joined)
+			joined := logs.joined()
+			if !strings.Contains(joined, "memory prefetch failed backend="+backend.name+" parent_layers=1") ||
+				!strings.Contains(joined, wantErr.Error()) ||
+				!strings.Contains(joined, "duration=") ||
+				!strings.Contains(joined, "restore_continues=on_demand") {
+				t.Fatalf("logs = %q; want fail-open %s diagnostic", joined, backend.name)
+			}
+			if backend.key != "" && !strings.Contains(joined, "key="+backend.key) {
+				t.Fatalf("manifest failure logs = %q; want key", joined)
+			}
+		})
 	}
 }
 
 func TestMemoryPrefetchNaturalCompletionThenStop(t *testing.T) {
 	stream := newPrefetchTestStream()
 	logs := newPrefetchTestLogs()
-	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, stream, 4, logs.logf)
+	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, "", stream, 4, logs.logf)
 	<-stream.started
 	close(stream.complete)
 	<-stream.done
 	task.Stop()
 
 	joined := logs.joined()
-	if !strings.Contains(joined, "started mode=memory parent_layers=4") || !strings.Contains(joined, "completed mode=memory parent_layers=4") || !strings.Contains(joined, "duration=") {
-		t.Fatalf("logs = %q, want started/completed observability", joined)
+	if !strings.Contains(joined, "started backend=file parent_layers=4") ||
+		!strings.Contains(joined, "advised backend=file parent_layers=4") ||
+		!strings.Contains(joined, "duration=") {
+		t.Fatalf("logs = %q, want started/advised observability", joined)
 	}
 	if strings.Contains(joined, "canceled") {
 		t.Fatalf("natural completion was misreported as canceled: %q", joined)
@@ -144,12 +251,12 @@ func TestMemoryPrefetchNaturalCompletionThenStop(t *testing.T) {
 func TestMemoryPrefetchCancellationLog(t *testing.T) {
 	stream := newPrefetchTestStream()
 	logs := newPrefetchTestLogs()
-	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, stream, 2, logs.logf)
+	task := startMemoryPrefetch(context.Background(), config.PrefetchMemory, "", stream, 2, logs.logf)
 	<-stream.started
 	task.Stop()
 
 	joined := logs.joined()
-	if !strings.Contains(joined, "canceled mode=memory parent_layers=2") || !strings.Contains(joined, "duration=") {
+	if !strings.Contains(joined, "canceled backend=file parent_layers=2") || !strings.Contains(joined, "duration=") {
 		t.Fatalf("logs = %q, want canceled observability", joined)
 	}
 }
@@ -202,6 +309,7 @@ type prefetchTestStream struct {
 	result          error
 	cancelOnce      sync.Once
 	doneOnce        sync.Once
+	calls           atomic.Int32
 }
 
 func newPrefetchTestStream() *prefetchTestStream {
@@ -229,6 +337,7 @@ func (s *prefetchTestStream) Close() error {
 	}
 }
 func (s *prefetchTestStream) Prefetch(ctx context.Context) error {
+	s.calls.Add(1)
 	s.started <- struct{}{}
 	defer s.doneOnce.Do(func() { close(s.done) })
 	select {
