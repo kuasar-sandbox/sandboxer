@@ -16,8 +16,8 @@ import (
 
 // OpenBlockReader resolves a file:// or manifest:// disk URI into a
 // vhost.BlockReader plus the total disk size, via a fetch.Stream. file://
-// opens a local tarstream artifact; manifest:// (one key, or ':'-joined keys
-// that overlay as layers) resolves through the fetcher. Both wrap in a
+// opens a local tarstream artifact; manifest:// resolves one manifest through
+// the fetcher. Both wrap in a
 // StreamReader whose Close releases the stream (the file's fd; a manifest
 // stream's cache/store client is owned by the Fetcher and closed separately).
 //

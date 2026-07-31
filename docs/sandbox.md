@@ -1543,7 +1543,7 @@ Prefetch 不能并发 Close;任务句柄的 `Stop` 必须幂等并完成 cancel 
 
 | 状态 | 日志语义 |
 |---|---|
-| 不满足资格 | `skipped reason=local_top\|composite_top_ref\|no_capability` |
+| 不满足资格 | `skipped reason=no_capability` |
 | 开始 | `started mode=memory parent_layers=N` |
 | 正常结束 | `completed duration=...` |
 | 失败降级 | `failed duration=... error=... restore_continues=on_demand` |
