@@ -278,6 +278,11 @@ func TestApplyRules_RuntimeProvidedDigestMustMatch(t *testing.T) {
 	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err != nil {
 		t.Fatalf("matching host file should pass: %v", err)
 	}
+	host.Boot.Runtime = "file://" + rtPath + "@sha256:" + strings.Repeat("f", 64)
+	if _, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot")); err == nil || !strings.Contains(err.Error(), "host ref digest mismatch") {
+		t.Fatalf("expected host ref digest failure, got %v", err)
+	}
+	host.Boot.Runtime = "file://" + rtPath
 
 	// Tamper: overwrite runtime with different bytes; digest should mismatch.
 	if err := os.WriteFile(rtPath, []byte("tampered"), 0o644); err != nil {

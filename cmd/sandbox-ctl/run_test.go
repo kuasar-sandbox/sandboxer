@@ -109,6 +109,9 @@ func TestRunRestoreChecksDigestOnUnlocatedFileRef(t *testing.T) {
 	if rc != 1 || !strings.Contains(stderr, "sha256 marker mismatch") {
 		t.Fatalf("runRestore = %d, stderr %q; want digest mismatch", rc, stderr)
 	}
+	if _, err := os.Stat(runRoot); !os.IsNotExist(err) {
+		t.Fatalf("runtime root was touched before digest validation: %v", err)
+	}
 }
 
 func writeRunRestoreSnapshot(t *testing.T) string {

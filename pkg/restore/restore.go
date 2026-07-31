@@ -803,9 +803,37 @@ func (o Options) localSnapshotPath() string {
 func preflightLocatedRefs(ctx context.Context, opts Options) error {
 	var stream fetch.Stream
 	if opts.SnapshotPath != "" {
-		opened, _, err := openTarArtifact(opts.SnapshotPath)
+		opened, digest, err := openTarArtifact(opts.SnapshotPath)
 		if err != nil {
 			return err
+		}
+		if err := validateContentAddressedName(opts.SnapshotPath, digest); err != nil {
+			opened.Close()
+			return err
+		}
+		if opts.SnapshotRef != "" {
+			ref, err := manifest.ParseRef(opts.SnapshotRef)
+			if err != nil {
+				opened.Close()
+				return err
+			}
+			if ref.Location != "" {
+				info, err := os.Lstat(opts.SnapshotPath)
+				if err != nil {
+					opened.Close()
+					return err
+				}
+				if !info.Mode().IsRegular() {
+					opened.Close()
+					return fmt.Errorf("located root %s: location target is not a regular file", ref.String())
+				}
+			}
+			if ref.Digest != "" {
+				if err := matchDigest(digest, ref.Digest); err != nil {
+					opened.Close()
+					return err
+				}
+			}
 		}
 		stream = opened
 	} else {

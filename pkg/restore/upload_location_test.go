@@ -258,6 +258,59 @@ func TestPreflightLocatedRefsValidatesDiskArtifactIdentity(t *testing.T) {
 	}
 }
 
+func TestPreflightLocatedRefsValidatesRootIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		makeRef func(t *testing.T, rootPath string) (string, string)
+	}{
+		{
+			name: "digest qualifier",
+			makeRef: func(_ *testing.T, rootPath string) (string, string) {
+				return "file://" + filepath.Base(rootPath) + "@sha256:" + strings.Repeat("f", 64) + "@location:shared", "sha256 marker mismatch"
+			},
+		},
+		{
+			name: "content addressed name",
+			makeRef: func(t *testing.T, rootPath string) (string, string) {
+				wrongPath := filepath.Join(filepath.Dir(rootPath), "wrong.snapshot")
+				if err := os.Rename(rootPath, wrongPath); err != nil {
+					t.Fatal(err)
+				}
+				return "file://wrong.snapshot@location:shared", "does not match marker"
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			locationDir := t.TempDir()
+			rootCfg := &SnapshotCfg{}
+			rootCfg.Resources.Capacity.Memory = "4KiB"
+			rootPath := writePublishSnapshot(t, locationDir, rootCfg)
+			rootRef, want := tc.makeRef(t, rootPath)
+			resolved, err := (config.RefLocations{"shared": locationDir}).ResolveFile(mustParseRef(t, rootRef), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = preflightLocatedRefs(context.Background(), Options{
+				SnapshotPath: resolved,
+				SnapshotRef:  rootRef,
+				RefLocations: config.RefLocations{"shared": locationDir},
+			})
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("preflight root error = %v, want %q", err, want)
+			}
+		})
+	}
+}
+
+func mustParseRef(t *testing.T, raw string) manifest.Ref {
+	t.Helper()
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref
+}
+
 func TestLocalSnapshotPathKeepsUnlocatedDigestRef(t *testing.T) {
 	path := "/snapshots/" + strings.Repeat("a", 64) + ".snapshot"
 	localRef := "file://" + path + "@sha256:" + strings.Repeat("a", 64)

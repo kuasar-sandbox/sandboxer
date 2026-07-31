@@ -261,6 +261,11 @@ func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fiel
 	if err := validateFileRef(hostPath, snapRef.Digest, readDigest); err != nil {
 		return "", fmt.Errorf("%s: digest mismatch: %w", fieldName, err)
 	}
+	if hostRef.Digest != "" {
+		if err := validateFileRef(hostPath, hostRef.Digest, readDigest); err != nil {
+			return "", fmt.Errorf("%s: host ref digest mismatch: %w", fieldName, err)
+		}
+	}
 	return "file://" + hostPath, nil
 }
 
