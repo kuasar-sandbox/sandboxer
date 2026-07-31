@@ -1,14 +1,16 @@
 # Explicit per-sandbox restore policy fragment.
 #
 # Prefetch is disabled by default. Merge this fragment only into a sandbox
-# whose remote snapshot was produced from a representative working-set window,
-# for example:
+# whose snapshot was produced from a representative working-set window, for
+# example:
 #
 #   sandbox-ctl config --config sandbox.yaml:examples/restore-prefetch-memory.yaml \
 #     --mode restore --check strict -o restore.yaml
 #
-# A remote single-layer snapshot is also eligible when explicitly enabled, but
-# its candidate set is all saved resident memory rather than a filtered
-# incremental top layer. Local snapshots and disks are never prefetched.
+# A single-layer snapshot is also eligible when explicitly enabled, but its
+# candidate set is all saved resident memory rather than a filtered incremental
+# top layer. Only the current memory self is warmed: manifest snapshots fill the
+# chunk cache, while file snapshots submit FADV_WILLNEED for the open artifact.
+# Parent memory layers and disks are never prefetched.
 restore:
   prefetch: memory

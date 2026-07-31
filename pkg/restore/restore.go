@@ -431,7 +431,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, fmt.Errorf("snapshot source: %w", err)
 	}
 	logf("snapshot source: %d memory layer(s)", len(memLayers))
-	prefetch := startMemoryPrefetch(ctx, prefetchMode, selfStream, len(memLayers)-1, logf)
+	prefetch := startMemoryPrefetch(ctx, prefetchMode, opts.SnapshotManifestKey, selfStream, len(memLayers)-1, logf)
 	// Close is a lifetime boundary for fetch.Stream. Register this after every
 	// memory-layer Close defer so cancellation and join always run first.
 	defer prefetch.Stop()

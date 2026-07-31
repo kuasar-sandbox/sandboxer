@@ -91,8 +91,8 @@ type SandboxConfig struct {
 	SnapshotProvenance SnapshotProvenance `yaml:"-"`
 }
 
-// PrefetchMode selects whether restore requests a best-effort remote snapshot
-// cache warm-up. The empty configuration value has the same semantics as off.
+// PrefetchMode selects whether restore requests a best-effort warm-up of the
+// current memory self Stream. The empty value has the same semantics as off.
 type PrefetchMode string
 
 const (
