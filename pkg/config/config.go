@@ -1249,7 +1249,7 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	}
 	// Reference formats (when provided).
 	if c.Boot.Runtime != "" {
-		if err := requireFileAbs("boot.runtime", c.Boot.Runtime); err != nil {
+		if err := requireFileAbsOrLocated("boot.runtime", c.Boot.Runtime); err != nil {
 			return err
 		}
 	}
@@ -1452,6 +1452,17 @@ func requireFileAbs(field, uri string) error {
 	p := strings.TrimPrefix(uri, "file://")
 	if !filepath.IsAbs(p) {
 		return fmt.Errorf("%s file:// must be absolute (got %q)", field, uri)
+	}
+	return nil
+}
+
+func requireFileAbsOrLocated(field, uri string) error {
+	ref, err := manifest.ParseRef(uri)
+	if err != nil || ref.Scheme != manifest.RefSchemeFile {
+		return fmt.Errorf("%s must be file://", field)
+	}
+	if ref.Location == "" && !filepath.IsAbs(ref.Path) {
+		return fmt.Errorf("%s file:// must be absolute or located (got %q)", field, uri)
 	}
 	return nil
 }

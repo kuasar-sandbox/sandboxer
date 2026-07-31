@@ -269,6 +269,11 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 			return "", fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
 		}
 	}
+	if ref.Location != "" && ref.Location == p.location {
+		if err := p.validateLocatedRef(label, ref); err != nil {
+			return "", err
+		}
+	}
 	if ref.Portable() {
 		return ref.String(), nil
 	}
@@ -280,6 +285,35 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 		return p.publishSnapshot(path, ref.Digest)
 	}
 	return p.publishLeaf(label, path, ref.Digest)
+}
+
+func (p *snapshotPublisher) validateLocatedRef(label string, ref manifest.Ref) error {
+	path := filepath.Join(p.directory, ref.Path)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("upload-snapshot: %s %q: location target is not a regular file", label, ref.String())
+	}
+	stream, digest, err := openTarArtifact(path)
+	if err != nil {
+		return fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
+	}
+	logicalSize := int64(stream.Size())
+	stream.Close()
+	if ref.Digest != "" {
+		if err := matchDigest(digest, ref.Digest); err != nil {
+			return fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
+		}
+	}
+	if err := validateContentAddressedName(path, digest); err != nil {
+		return fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
+	}
+	if err := verifyArtifactFile(path, digest, logicalSize); err != nil {
+		return fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
+	}
+	return nil
 }
 
 func (p *snapshotPublisher) publishLeaf(label, path, wantDigest string) (string, error) {

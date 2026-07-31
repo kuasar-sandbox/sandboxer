@@ -408,6 +408,14 @@ func TestRestorePrefetchMergedOverride(t *testing.T) {
 	}
 }
 
+func TestValidateRestoreHostAcceptsLocatedRuntime(t *testing.T) {
+	cfg := &SandboxConfig{}
+	cfg.Boot.Runtime = "file://" + strings.Repeat("a", 64) + ".bundle@location:platform"
+	if err := cfg.ValidateRestoreHostConfig(); err != nil {
+		t.Fatalf("ValidateRestoreHostConfig located runtime: %v", err)
+	}
+}
+
 func TestValidateCold_MissingFields(t *testing.T) {
 	cases := []struct {
 		name      string

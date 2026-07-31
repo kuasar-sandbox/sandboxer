@@ -150,6 +150,34 @@ func TestPublishLocalToLocationRefusesSymlinkDestination(t *testing.T) {
 	}
 }
 
+func TestPublishLocalToLocationValidatesSameLocationBoundary(t *testing.T) {
+	ctx := context.Background()
+	targetDir := t.TempDir()
+	artifactPath, _ := writePublishArtifact(t, targetDir, ".overlay", bytes.Repeat([]byte{0x3C}, 4096))
+	boundaryRef := "file://" + filepath.Base(artifactPath) + "@location:shared"
+	rootCfg := &SnapshotCfg{}
+	rootCfg.Resources.Capacity.Memory = "4KiB"
+	rootCfg.Boot.Root.Overlay = &SnapOverlayCfg{Base: boundaryRef}
+	rootPath := writePublishSnapshot(t, t.TempDir(), rootCfg)
+
+	if _, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil); err != nil {
+		t.Fatalf("valid same-location boundary: %v", err)
+	}
+	outsidePath := filepath.Join(t.TempDir(), filepath.Base(artifactPath))
+	if err := os.Rename(artifactPath, outsidePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil); err == nil || !strings.Contains(err.Error(), boundaryRef) {
+		t.Fatalf("missing same-location boundary error = %v", err)
+	}
+	if err := os.Symlink(outsidePath, artifactPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("symlink same-location boundary error = %v", err)
+	}
+}
+
 func TestSnapshotPublisherChecksPreservedManifestRefs(t *testing.T) {
 	p := newSnapshotPublisher(context.Background(), nil)
 	p.manifestConfig = &manifest.Config{}
@@ -227,6 +255,18 @@ func TestPreflightLocatedRefsValidatesDiskArtifactIdentity(t *testing.T) {
 				t.Fatalf("preflight error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestLocalSnapshotPathKeepsUnlocatedDigestRef(t *testing.T) {
+	path := "/snapshots/" + strings.Repeat("a", 64) + ".snapshot"
+	localRef := "file://" + path + "@sha256:" + strings.Repeat("a", 64)
+	if got := (Options{SnapshotPath: path, SnapshotRef: localRef}).localSnapshotPath(); got != path {
+		t.Fatalf("localSnapshotPath = %q, want %q", got, path)
+	}
+	locatedRef := "file://" + filepath.Base(path) + "@location:shared"
+	if got := (Options{SnapshotPath: path, SnapshotRef: locatedRef}).localSnapshotPath(); got != "" {
+		t.Fatalf("located localSnapshotPath = %q, want empty", got)
 	}
 }
 

@@ -791,6 +791,10 @@ func (o Options) localSnapshotPath() string {
 	if o.SnapshotRef == "" {
 		return o.SnapshotPath
 	}
+	ref, err := manifest.ParseRef(o.SnapshotRef)
+	if err != nil || !ref.Portable() {
+		return o.SnapshotPath
+	}
 	return ""
 }
 
@@ -889,6 +893,13 @@ func preflightLocatedRef(raw string, opts Options, readDigest func(string) (stri
 	path, err := opts.RefLocations.ResolveFile(ref, "")
 	if err != nil {
 		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("located ref %s: %w", ref.String(), err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("located ref %s: location target is not a regular file", ref.String())
 	}
 	digest, err := readDigest(path)
 	if err != nil {
