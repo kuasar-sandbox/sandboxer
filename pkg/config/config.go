@@ -154,10 +154,6 @@ type SnapshotProvenance struct {
 	// for manifest:// / cold-start restores (which stack via ParentSnapshotRef).
 	ParentSnapshotPath string
 	ParentOverlayPath  string
-	// ParentOverlayNoFollow is set when ParentOverlayPath came from a named
-	// location, whose final path component must be opened without following a
-	// symlink.
-	ParentOverlayNoFollow bool
 
 	// ParentDisks is the per-data-disk parent state (boot.disks[] order), the
 	// data-disk analogue of ParentOverlayBase/ParentBaseFromRefs/ParentOverlayPath.
@@ -172,9 +168,6 @@ type DiskProvenance struct {
 	OverlayBase  string   // parent's boot.disks[i] overlay.base (or single base); "" cold
 	BaseFromRefs []string // parent's boot.disks[i] chain below it
 	OverlayPath  string   // local overlay file path (file:// parent only) for flatten-merge
-	// OverlayNoFollow has the same named-location semantics as
-	// SnapshotProvenance.ParentOverlayNoFollow.
-	OverlayNoFollow bool
 }
 
 // ResourcesConfig follows Kubernetes-style capacity / allocatable split:

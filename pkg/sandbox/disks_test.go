@@ -51,7 +51,7 @@ func TestOpenDiskStreamValidatesLocatedContentName(t *testing.T) {
 	}
 }
 
-func TestOpenDiskStreamRejectsLocatedSymlink(t *testing.T) {
+func TestOpenDiskStreamFollowsLocatedSymlink(t *testing.T) {
 	locationDir := t.TempDir()
 	outsideDir := t.TempDir()
 	tmp, err := os.CreateTemp(outsideDir, "disk-*.tmp")
@@ -74,8 +74,11 @@ func TestOpenDiskStreamRejectsLocatedSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, _, err = OpenDiskStream(context.Background(), "file://"+name+"@location:shared", nil, config.RefLocations{"shared": locationDir})
-	if err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("located symlink error = %v", err)
+	stream, _, err := OpenDiskStream(context.Background(), "file://"+name+"@location:shared", nil, config.RefLocations{"shared": locationDir})
+	if err != nil {
+		t.Fatalf("open located symlink: %v", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

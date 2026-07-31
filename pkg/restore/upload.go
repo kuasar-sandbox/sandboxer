@@ -18,7 +18,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
-	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
@@ -269,11 +268,6 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 			return "", fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
 		}
 	}
-	if ref.Location != "" && ref.Location == p.location {
-		if err := p.validateLocatedRef(label, ref); err != nil {
-			return "", err
-		}
-	}
 	if ref.Portable() {
 		return ref.String(), nil
 	}
@@ -285,35 +279,6 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 		return p.publishSnapshot(path, ref.Digest)
 	}
 	return p.publishLeaf(label, path, ref.Digest)
-}
-
-func (p *snapshotPublisher) validateLocatedRef(label string, ref manifest.Ref) error {
-	path := filepath.Join(p.directory, ref.Path)
-	info, err := os.Lstat(path)
-	if err != nil {
-		return fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("upload-snapshot: %s %q: location target is not a regular file", label, ref.String())
-	}
-	stream, digest, err := openTarArtifact(path)
-	if err != nil {
-		return fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
-	}
-	logicalSize := int64(stream.Size())
-	stream.Close()
-	if ref.Digest != "" {
-		if err := matchDigest(digest, ref.Digest); err != nil {
-			return fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
-		}
-	}
-	if err := validateContentAddressedName(path, digest); err != nil {
-		return fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
-	}
-	if err := verifyArtifactFile(path, digest, logicalSize); err != nil {
-		return fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
-	}
-	return nil
 }
 
 func (p *snapshotPublisher) publishLeaf(label, path, wantDigest string) (string, error) {
@@ -354,10 +319,7 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, 
 	if err != nil {
 		return "", err
 	}
-	if destInfo, statErr := os.Lstat(destination); statErr == nil {
-		if !destInfo.Mode().IsRegular() {
-			return "", fmt.Errorf("ref location destination is not a regular file: %s", destination)
-		}
+	if destInfo, statErr := os.Stat(destination); statErr == nil {
 		if destInfo.Size() == sourceInfo.Size() && verifyArtifactFile(destination, digest, 0) == nil {
 			return p.locatedRef(basename, hexDigest, keepDigest), nil
 		}
@@ -373,7 +335,7 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, 
 	// Named locations deliberately do not require temporary-file rename support.
 	// Valid content-addressed files are reused; an invalid final name is repaired
 	// in place by one sequential write.
-	out, err := openLocationDestination(destination)
+	out, err := os.OpenFile(destination, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return "", err
 	}
@@ -393,31 +355,6 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, 
 	}
 	p.logf("upload-snapshot: published %s", destination)
 	return p.locatedRef(basename, hexDigest, keepDigest), nil
-}
-
-func openLocationDestination(path string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_CREAT|unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	closeFD := true
-	defer func() {
-		if closeFD {
-			_ = unix.Close(fd)
-		}
-	}()
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		return nil, err
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
-		return nil, fmt.Errorf("ref location destination is not a regular file: %s", path)
-	}
-	if err := unix.Ftruncate(fd, 0); err != nil {
-		return nil, err
-	}
-	closeFD = false
-	return os.NewFile(uintptr(fd), path), nil
 }
 
 func (p *snapshotPublisher) locatedRef(basename, digest string, keepDigest bool) string {

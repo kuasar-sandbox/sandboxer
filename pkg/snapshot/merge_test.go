@@ -13,7 +13,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
-func TestOpenMergeBaseNoFollow(t *testing.T) {
+func TestOpenMergeBaseFollowsSymlink(t *testing.T) {
 	payload := bytes.Repeat([]byte{0x5A}, 4096)
 	targetDir := t.TempDir()
 	tmp, err := os.CreateTemp(targetDir, "merge-*.tmp")
@@ -32,9 +32,9 @@ func TestOpenMergeBaseNoFollow(t *testing.T) {
 	if err := os.Rename(tmp.Name(), target); err != nil {
 		t.Fatal(err)
 	}
-	layer, _, err := openMergeBase(target, int64(len(payload)), true)
+	layer, _, err := openMergeBase(target, int64(len(payload)))
 	if err != nil {
-		t.Fatalf("open regular no-follow merge base: %v", err)
+		t.Fatalf("open merge base: %v", err)
 	}
 	if err := layer.Close(); err != nil {
 		t.Fatal(err)
@@ -44,8 +44,12 @@ func TestOpenMergeBaseNoFollow(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := openMergeBase(link, int64(len(payload)), true); err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("no-follow merge base error = %v", err)
+	linkedLayer, _, err := openMergeBase(link, int64(len(payload)))
+	if err != nil {
+		t.Fatalf("open merge base symlink: %v", err)
+	}
+	if err := linkedLayer.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

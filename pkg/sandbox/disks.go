@@ -4,15 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
@@ -57,12 +53,7 @@ func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher, loca
 		if err != nil {
 			return nil, 0, err
 		}
-		var s fetch.Stream
-		if ref.Location != "" {
-			s, err = openLocatedTarStream(path)
-		} else {
-			s, err = fetch.OpenTarStream(path)
-		}
+		s, err := fetch.OpenTarStream(path)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -77,55 +68,6 @@ func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher, loca
 		return nil, 0, fmt.Errorf("unknown disk URI scheme: %s", ref.Scheme)
 	}
 }
-
-type locatedTarStream struct {
-	sparse.Source
-	file   *os.File
-	digest string
-}
-
-func openLocatedTarStream(path string) (fetch.Stream, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
-	if err != nil {
-		if errors.Is(err, unix.ELOOP) {
-			return nil, fmt.Errorf("artifact %s is a symlink", path)
-		}
-		return nil, fmt.Errorf("open artifact %s: %w", path, err)
-	}
-	file := os.NewFile(uintptr(fd), path)
-	if file == nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("open artifact %s: invalid file descriptor", path)
-	}
-	closeFile := true
-	defer func() {
-		if closeFile {
-			_ = file.Close()
-		}
-	}()
-
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		return nil, fmt.Errorf("stat artifact %s: %w", path, err)
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
-		return nil, fmt.Errorf("artifact %s is not a regular file", path)
-	}
-	source, _, err := tarstream.SourceAt(file, stat.Size, "")
-	if err != nil {
-		return nil, fmt.Errorf("artifact %s is not a tarstream artifact: %w", path, err)
-	}
-	digester, ok := source.(tarstream.Digester)
-	if !ok {
-		return nil, fmt.Errorf("artifact %s is missing a digest marker", path)
-	}
-
-	closeFile = false
-	return &locatedTarStream{Source: source, file: file, digest: digester.Digest()}, nil
-}
-
-func (s *locatedTarStream) Digest() string { return s.digest }
-func (s *locatedTarStream) Close() error   { return s.file.Close() }
 
 // OpenLayeredBlockReader opens refs in top-to-bottom order and composes them as
 // one read-only block source. A single ref is returned without an extra layer.

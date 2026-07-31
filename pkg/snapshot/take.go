@@ -73,10 +73,9 @@ type Sources struct {
 // MergeBase, when set (local-parent re-export), is the parent's local overlay
 // file path this disk's delta is flattened onto (replace, not stack).
 type DiskDiff struct {
-	Path              string
-	Owned             bool
-	MergeBase         string
-	MergeBaseNoFollow bool // named-location base: reject a symlink final component
+	Path      string
+	Owned     bool
+	MergeBase string
 }
 
 // Outputs describes what was produced. Refs are scheme-tagged
@@ -197,7 +196,7 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	var memSrc io.ReadSeeker = memfdReader(s.MemfdFD, s.MemfdSize)
 	memSrcHoles := memHoles
 	if localMerge {
-		base, baseHoles, berr := openMergeBase(s.MergeBaseSnapshot, s.MemfdSize, false)
+		base, baseHoles, berr := openMergeBase(s.MergeBaseSnapshot, s.MemfdSize)
 		if berr != nil {
 			return nil, fmt.Errorf("merge memory base: %w", berr)
 		}
@@ -245,7 +244,7 @@ func absorbOverlay(ctx context.Context, sink SnapshotSink, d DiskDiff, merging b
 	var src io.ReadSeeker = diff
 	holes := overlayHoles
 	if merging {
-		base, baseHoles, berr := openMergeBase(d.MergeBase, dstat.Size(), d.MergeBaseNoFollow)
+		base, baseHoles, berr := openMergeBase(d.MergeBase, dstat.Size())
 		if berr != nil {
 			return "", "", fmt.Errorf("merge overlay base: %w", berr)
 		}

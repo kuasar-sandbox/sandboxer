@@ -118,7 +118,7 @@ func TestPublishLocalToLocationRejectsSnapshotParentDigestMismatch(t *testing.T)
 	}
 }
 
-func TestPublishLocalToLocationRefusesSymlinkDestination(t *testing.T) {
+func TestPublishLocalToLocationFollowsExistingSymlinkDestination(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()
 	targetDir := t.TempDir()
@@ -129,52 +129,53 @@ func TestPublishLocalToLocationRefusesSymlinkDestination(t *testing.T) {
 	rootPath := writePublishSnapshot(t, sourceDir, snapCfg)
 
 	victim := filepath.Join(t.TempDir(), "victim")
-	const original = "do not overwrite"
-	if err := os.WriteFile(victim, []byte(original), 0o644); err != nil {
+	if err := os.WriteFile(victim, []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	destination := filepath.Join(targetDir, strings.TrimPrefix(overlayDigest, "sha256:")+".overlay")
 	if err := os.Symlink(victim, destination); err != nil {
 		t.Fatal(err)
 	}
-	_, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil)
-	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
-		t.Fatalf("publish error = %v, want symlink rejection", err)
-	}
-	body, err := os.ReadFile(victim)
-	if err != nil {
+	if _, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil); err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != original {
-		t.Fatalf("victim content = %q", body)
+	if err := verifyArtifactFile(victim, overlayDigest, 4096); err != nil {
+		t.Fatalf("symlink target was not published: %v", err)
+	}
+	info, err := os.Lstat(destination)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("destination symlink changed: info=%v err=%v", info, err)
 	}
 }
 
-func TestPublishLocalToLocationValidatesSameLocationBoundary(t *testing.T) {
+func TestPublishLocalToLocationPreservesSameLocationBoundary(t *testing.T) {
 	ctx := context.Background()
 	targetDir := t.TempDir()
-	artifactPath, _ := writePublishArtifact(t, targetDir, ".overlay", bytes.Repeat([]byte{0x3C}, 4096))
-	boundaryRef := "file://" + filepath.Base(artifactPath) + "@location:shared"
+	boundaryRef := "file://" + strings.Repeat("a", 64) + ".overlay@location:shared"
 	rootCfg := &SnapshotCfg{}
 	rootCfg.Resources.Capacity.Memory = "4KiB"
 	rootCfg.Boot.Root.Overlay = &SnapOverlayCfg{Base: boundaryRef}
 	rootPath := writePublishSnapshot(t, t.TempDir(), rootCfg)
 
-	if _, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil); err != nil {
-		t.Fatalf("valid same-location boundary: %v", err)
-	}
-	outsidePath := filepath.Join(t.TempDir(), filepath.Base(artifactPath))
-	if err := os.Rename(artifactPath, outsidePath); err != nil {
+	rootRef, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil); err == nil || !strings.Contains(err.Error(), boundaryRef) {
-		t.Fatalf("missing same-location boundary error = %v", err)
-	}
-	if err := os.Symlink(outsidePath, artifactPath); err != nil {
+	parsed, err := manifest.ParseRef(rootRef)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil); err == nil || !strings.Contains(err.Error(), "not a regular file") {
-		t.Fatalf("symlink same-location boundary error = %v", err)
+	stream, _, err := openTarArtifact(filepath.Join(targetDir, parsed.Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, publishedCfg, err := readSnapshotEntries(ctx, stream, int64(stream.Size()))
+	stream.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publishedCfg.Boot.Root.Overlay.Base != boundaryRef {
+		t.Fatalf("same-location boundary = %q, want %q", publishedCfg.Boot.Root.Overlay.Base, boundaryRef)
 	}
 }
 
@@ -304,26 +305,6 @@ func TestPreflightLocatedRefsValidatesRootIdentity(t *testing.T) {
 				return "file://wrong.snapshot@location:shared", "content name does not match"
 			},
 		},
-		{
-			name: "symlink",
-			makeRef: func(t *testing.T, rootPath string) (string, string) {
-				outside := filepath.Join(t.TempDir(), filepath.Base(rootPath))
-				body, err := os.ReadFile(rootPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(outside, body, 0o644); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Remove(rootPath); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(outside, rootPath); err != nil {
-					t.Fatal(err)
-				}
-				return "file://" + filepath.Base(rootPath) + "@location:shared", "symlink"
-			},
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			locationDir := t.TempDir()
@@ -344,6 +325,25 @@ func TestPreflightLocatedRefsValidatesRootIdentity(t *testing.T) {
 				t.Fatalf("preflight root error = %v, want %q", err, want)
 			}
 		})
+	}
+}
+
+func TestPreflightLocatedRefsFollowsRootSymlink(t *testing.T) {
+	targetCfg := &SnapshotCfg{}
+	targetCfg.Resources.Capacity.Memory = "4KiB"
+	targetPath := writePublishSnapshot(t, t.TempDir(), targetCfg)
+	locationDir := t.TempDir()
+	linkPath := filepath.Join(locationDir, filepath.Base(targetPath))
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	rootRef := "file://" + filepath.Base(linkPath) + "@location:shared"
+	if err := preflightLocatedRefs(context.Background(), Options{
+		SnapshotPath: linkPath,
+		SnapshotRef:  rootRef,
+		RefLocations: config.RefLocations{"shared": locationDir},
+	}); err != nil {
+		t.Fatalf("preflight located root symlink: %v", err)
 	}
 }
 
@@ -417,23 +417,19 @@ func TestResolveLocalMergePathUsesRefLocations(t *testing.T) {
 	snapshotPath := "/snapshots/root.snapshot"
 	locations := config.RefLocations{"shared": "/shared/location"}
 	for _, tc := range []struct {
-		ref          string
-		want         string
-		wantNoFollow bool
+		ref  string
+		want string
 	}{
-		{"file://layer.overlay", "/snapshots/layer.overlay", false},
-		{"file://layer.overlay@location:shared", "/shared/location/layer.overlay", true},
-		{"manifest://" + strings.Repeat("a", 64), "", false},
+		{"file://layer.overlay", "/snapshots/layer.overlay"},
+		{"file://layer.overlay@location:shared", "/shared/location/layer.overlay"},
+		{"manifest://" + strings.Repeat("a", 64), ""},
 	} {
-		got, noFollow, err := resolveLocalMergePath(tc.ref, snapshotPath, locations)
+		got, err := resolveLocalMergePath(tc.ref, snapshotPath, locations)
 		if err != nil {
 			t.Fatalf("resolveLocalMergePath(%q): %v", tc.ref, err)
 		}
 		if got != tc.want {
 			t.Fatalf("resolveLocalMergePath(%q) = %q, want %q", tc.ref, got, tc.want)
-		}
-		if noFollow != tc.wantNoFollow {
-			t.Fatalf("resolveLocalMergePath(%q) noFollow = %v, want %v", tc.ref, noFollow, tc.wantNoFollow)
 		}
 	}
 }
