@@ -992,7 +992,7 @@ func destroyAfterSnapshot(chSock string, respDeadline time.Duration, logf func(s
 
 // buildSnapshotCfg renders the snapshot.cfg YAML body per docs §3.4.
 // runtime_ref / base_ref are pre-computed by sandbox-ctl at boot
-// (file SHA256 is hashed once at startup; see config.SnapshotRefs in
+// from each artifact's declared identity (see config.SnapshotRefs in
 // config.SandboxConfig). overlayRef is filled in by Take() after overlay
 // digest is known, or by Upload() after overlay manifest key is known.
 func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, error) {
