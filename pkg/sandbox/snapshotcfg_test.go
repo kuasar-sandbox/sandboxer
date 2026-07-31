@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"gopkg.in/yaml.v3"
 )
 
 // TestBuildSnapshotCfg_SingleDisk verifies a single-disk snapshot.cfg records
@@ -138,5 +139,50 @@ func TestBuildSnapshotCfg_DataDisks(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Errorf("data-disk snapshot.cfg missing %q\n%s", want, s)
 		}
+	}
+}
+
+func TestBuildSnapshotCfg_MixedLocalMemoryManifestDiskKeepsDiskParent(t *testing.T) {
+	cfg := &config.SandboxConfig{}
+	cfg.Resources.Capacity.CPU = 2
+	cfg.Resources.Capacity.Memory = "2GiB"
+	cfg.SnapshotRefs.RuntimeRef = "file://rt@sha256:aa"
+	cfg.SnapshotRefs.BaseRef = "file://root@sha256:bb"
+	cfg.SnapshotRefs.DiskBaseRefs = []string{"file://data@sha256:cc"}
+	cfg.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///root.diff"}
+	cfg.Boot.Disks = []config.DiskConfig{{
+		Name: "data",
+		RootConfig: config.RootConfig{
+			Base:    "file:///data.erofs",
+			Overlay: &config.OverlayConfig{Diff: "file:///data.diff"},
+		},
+	}}
+	cfg.SnapshotProvenance = config.SnapshotProvenance{
+		ParentSnapshotRef:  "file://parent.snapshot",
+		ParentSnapshotPath: "/snapshots/parent.snapshot",
+		ParentOverlayBase:  "file://parent-root.overlay",
+		ParentOverlayPath:  "/snapshots/parent-root.overlay",
+		ParentBaseFromRefs: []string{"manifest://root-lower"},
+		ParentDisks: []config.DiskProvenance{{
+			OverlayBase:  "manifest://data-parent",
+			BaseFromRefs: []string{"manifest://data-lower"},
+		}},
+	}
+
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://new-root", "manifest://new-data"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc snapshotCfgYAML
+	if err := yaml.Unmarshal(body, &doc); err != nil {
+		t.Fatal(err)
+	}
+	rootChain := doc.Boot.Root.Overlay.BaseFromRefs
+	if len(rootChain) != 1 || rootChain[0] != "manifest://root-lower" {
+		t.Fatalf("root chain = %v, want merged parent lower only", rootChain)
+	}
+	dataChain := doc.Boot.Disks[0].Overlay.BaseFromRefs
+	if len(dataChain) != 2 || dataChain[0] != "manifest://data-parent" || dataChain[1] != "manifest://data-lower" {
+		t.Fatalf("data chain = %v, want portable parent retained", dataChain)
 	}
 }

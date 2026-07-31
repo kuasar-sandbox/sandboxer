@@ -878,10 +878,9 @@ func handleSnapshotRequest(
 		sink = snapshot.NewFileSink(req.OutDir, sandboxID, logf)
 	}
 
-	// Per-disk diff list (root, then data disks) for Take. Restored from a LOCAL
-	// snapshot ⇒ MERGE this run's resident delta onto the parent local layer
-	// (replace the next-newest layer, not stack) for BOTH --output and --upload;
-	// buildSnapshotCfg drops the parent ref to match. Cold/manifest parents stack.
+	// Per-disk diff list (root, then data disks) for Take. A disk is merged only
+	// when restore recorded a physical parent layer path for that disk; mixed
+	// graphs may have local memory with manifest-backed disk parents, which stack.
 	prov := cfg.SnapshotProvenance
 	localParent := false
 	if prov.ParentSnapshotRef != "" {
@@ -895,11 +894,13 @@ func handleSnapshotRequest(
 	for i, d := range disks {
 		dd := snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff}
 		if localParent {
+			mergeBase := ""
 			if i == 0 {
-				dd.MergeBase = prov.ParentOverlayPath // root
+				mergeBase = prov.ParentOverlayPath // root
 			} else if j := i - 1; j < len(prov.ParentDisks) {
-				dd.MergeBase = prov.ParentDisks[j].OverlayPath
+				mergeBase = prov.ParentDisks[j].OverlayPath
 			}
+			dd.MergeBase = mergeBase
 		}
 		diffs[i] = dd
 	}
@@ -916,8 +917,8 @@ func handleSnapshotRequest(
 		Logf:          logf,
 	}
 	if localParent {
-		if prov.ParentSnapshotPath == "" || prov.ParentOverlayPath == "" {
-			return ctl.Response{}, fmt.Errorf("snapshot: local parent %q lacks merge paths", prov.ParentSnapshotRef)
+		if prov.ParentSnapshotPath == "" {
+			return ctl.Response{}, fmt.Errorf("snapshot: local parent %q lacks memory merge path", prov.ParentSnapshotRef)
 		}
 		src.MergeBaseSnapshot = prov.ParentSnapshotPath
 	}
@@ -1001,13 +1002,11 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 	doc.Metadata = cfg.Metadata
 	doc.Boot.RuntimeRef = cfg.SnapshotRefs.RuntimeRef
 
-	// Incremental layered chain (docs/sandbox.md §3.5), keyed on the parent's
-	// scheme (same rule for memory, root, and each data disk):
-	//   - LOCAL parent (file://): this run's resident delta was MERGED onto the
-	//     parent local layer (snapshot.Take's mergeSparse), so the new top
-	//     REPLACES the parent — inherit the parent's lower chain, drop the parent
-	//     ref (local-layer depth stays 1).
-	//   - REMOTE (manifest://) / cold start: prepend the parent ref to stack.
+	// Incremental memory follows the root snapshot ref. Each disk decides
+	// independently: a recorded physical merge path means Take merged the parent
+	// local layer and the new top replaces it; without one, the parent disk ref is
+	// prepended and remains in the chain. This preserves mixed graphs with local
+	// memory and manifest-backed disks.
 	prov := cfg.SnapshotProvenance
 	localParent := false
 	if prov.ParentSnapshotRef != "" {
@@ -1033,8 +1032,9 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 		rootColdLower = cfg.Boot.Root.Overlay.Base
 		rootColdChain = cfg.Boot.Root.Overlay.BaseFromRefs
 	}
+	rootMerged := localParent && prov.ParentOverlayPath != ""
 	doc.Boot.Root = renderDiskNode(overlayRefs[0], cfg.SnapshotRefs.BaseRef,
-		rootColdLower, rootColdChain, cfg.SingleDisk(), localParent, coldStart,
+		rootColdLower, rootColdChain, cfg.SingleDisk(), rootMerged, coldStart,
 		prov.ParentOverlayBase, prov.ParentBaseFromRefs)
 
 	// Data-disk nodes (boot.disks[] order), each with its own parent chain.
@@ -1045,6 +1045,7 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 		if i < len(prov.ParentDisks) {
 			pTop, pChain = prov.ParentDisks[i].OverlayBase, prov.ParentDisks[i].BaseFromRefs
 		}
+		diskMerged := localParent && i < len(prov.ParentDisks) && prov.ParentDisks[i].OverlayPath != ""
 		baseRef := ""
 		if i < len(cfg.SnapshotRefs.DiskBaseRefs) {
 			baseRef = cfg.SnapshotRefs.DiskBaseRefs[i]
@@ -1056,7 +1057,7 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 			diskColdChain = d.Overlay.BaseFromRefs
 		}
 		doc.Boot.Disks = append(doc.Boot.Disks, renderDiskNode(overlayRefs[1+i],
-			baseRef, diskColdLower, diskColdChain, d.RootConfig.Single(), localParent, coldStart, pTop, pChain))
+			baseRef, diskColdLower, diskColdChain, d.RootConfig.Single(), diskMerged, coldStart, pTop, pChain))
 	}
 	return yaml.Marshal(&doc)
 }
@@ -1066,11 +1067,11 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 // baseRef the erofs image ref (overlay mode); coldLower the cold-start read-only
 // lower the writable diff sits on — the single-disk CoW base, or the overlay's
 // lower (overlay.base) in two-disk mode — to chain. parentTop/parentChain are
-// this disk's parent overlay ref + chain — dropped (localParent: merged) or
+// this disk's parent overlay ref + chain — dropped (parentMerged) or
 // prepended (stacked).
-func renderDiskNode(overlayRef, baseRef, coldLower string, coldChain []string, single, localParent, coldStart bool, parentTop string, parentChain []string) diskNodeYAML {
+func renderDiskNode(overlayRef, baseRef, coldLower string, coldChain []string, single, parentMerged, coldStart bool, parentTop string, parentChain []string) diskNodeYAML {
 	var chain []string
-	if localParent {
+	if parentMerged {
 		chain = parentChain
 	} else {
 		chain = prependRef(parentTop, parentChain)

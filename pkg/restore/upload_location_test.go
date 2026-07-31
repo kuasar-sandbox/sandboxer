@@ -302,6 +302,22 @@ func TestPreflightLocatedRefsValidatesRootIdentity(t *testing.T) {
 	}
 }
 
+func TestPreflightLocatedRefsIncludesHostOverrides(t *testing.T) {
+	rootCfg := &SnapshotCfg{}
+	rootCfg.Resources.Capacity.Memory = "4KiB"
+	rootCfg.Boot.RuntimeRef = "file://runtime.bundle@sha256:" + strings.Repeat("a", 64)
+	rootPath := writePublishSnapshot(t, t.TempDir(), rootCfg)
+	hostCfg := &config.SandboxConfig{}
+	hostCfg.Boot.Runtime = "file://runtime.bundle@location:platform"
+	err := preflightLocatedRefs(context.Background(), Options{
+		SnapshotPath: rootPath,
+		HostCfg:      hostCfg,
+	})
+	if err == nil || !strings.Contains(err.Error(), `location "platform" is not configured`) {
+		t.Fatalf("host override preflight error = %v", err)
+	}
+}
+
 func mustParseRef(t *testing.T, raw string) manifest.Ref {
 	t.Helper()
 	ref, err := manifest.ParseRef(raw)

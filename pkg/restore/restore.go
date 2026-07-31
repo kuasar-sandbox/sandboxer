@@ -864,6 +864,9 @@ func preflightLocatedRefs(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
+	if err := preflightHostLocatedOverrides(root, opts); err != nil {
+		return err
+	}
 	pending := []*SnapshotCfg{root}
 	seenParents := map[string]bool{}
 	for len(pending) > 0 {
@@ -899,6 +902,66 @@ func preflightLocatedRefs(ctx context.Context, opts Options) error {
 				return closeErr
 			}
 			pending = append(pending, parentCfg)
+		}
+	}
+	return nil
+}
+
+func preflightHostLocatedOverrides(snap *SnapshotCfg, opts Options) error {
+	if opts.HostCfg == nil {
+		return nil
+	}
+	located := func(raw string) (bool, error) {
+		if raw == "" {
+			return false, nil
+		}
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return false, err
+		}
+		return ref.Scheme == manifest.RefSchemeFile && ref.Location != "", nil
+	}
+	if ok, err := located(opts.HostCfg.Boot.Runtime); err != nil {
+		return fmt.Errorf("boot.runtime: %w", err)
+	} else if ok {
+		snapRef, err := manifest.ParseRef(snap.Boot.RuntimeRef)
+		if err != nil {
+			return fmt.Errorf("snapshot.cfg.runtime_ref: %w", err)
+		}
+		if _, err := resolveBootFileRef(opts.HostCfg.Boot.Runtime, snapRef, opts.localSnapshotPath(), "boot.runtime", readRuntimeBundleDigest, opts.RefLocations); err != nil {
+			return err
+		}
+	}
+	if ok, err := located(opts.HostCfg.Boot.Root.Base); err != nil {
+		return fmt.Errorf("boot.root.base: %w", err)
+	} else if ok && !snap.SingleDisk() {
+		snapRef, err := manifest.ParseRef(snap.Boot.Root.BaseRef)
+		if err != nil {
+			return fmt.Errorf("snapshot.cfg.base_ref: %w", err)
+		}
+		if _, err := resolveAnyRef(opts.HostCfg.Boot.Root.Base, snapRef, opts.localSnapshotPath(), "boot.root.base", opts.RefLocations); err != nil {
+			return err
+		}
+	}
+	limit := len(opts.HostCfg.Boot.Disks)
+	if len(snap.Boot.Disks) < limit {
+		limit = len(snap.Boot.Disks)
+	}
+	for i := 0; i < limit; i++ {
+		hostRef := opts.HostCfg.Boot.Disks[i].Base
+		ok, err := located(hostRef)
+		if err != nil {
+			return fmt.Errorf("boot.disks[%d].base: %w", i, err)
+		}
+		if !ok || snap.Boot.Disks[i].single() {
+			continue
+		}
+		snapRef, err := manifest.ParseRef(snap.Boot.Disks[i].BaseRef)
+		if err != nil {
+			return fmt.Errorf("snapshot.cfg.boot.disks[%d].base_ref: %w", i, err)
+		}
+		if _, err := resolveAnyRef(hostRef, snapRef, opts.localSnapshotPath(), fmt.Sprintf("boot.disks[%d].base", i), opts.RefLocations); err != nil {
+			return err
 		}
 	}
 	return nil
