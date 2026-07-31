@@ -303,12 +303,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		if abs, err := filepath.Abs(localSnapshotPath); err == nil {
 			snapCfg.SnapshotProvenance.ParentSnapshotPath = abs
 		}
-		if sc, val, ok := config.SchemeAndPath(parentDiskBase); ok && sc == "file" {
-			if !filepath.IsAbs(val) {
-				val = filepath.Join(filepath.Dir(localSnapshotPath), val)
-			}
-			snapCfg.SnapshotProvenance.ParentOverlayPath = val
+		path, err := resolveLocalMergePath(parentDiskBase, localSnapshotPath, opts.RefLocations)
+		if err != nil {
+			return -1, fmt.Errorf("resolve parent root layer: %w", err)
 		}
+		snapCfg.SnapshotProvenance.ParentOverlayPath = path
 	}
 	// Per-data-disk provenance (boot.disks[] order): the data-disk analogue of
 	// the root fields above, so a snapshot by this restored run extends each
@@ -323,12 +322,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			}
 			pd[i] = config.DiskProvenance{OverlayBase: top, BaseFromRefs: chain}
 			if localSnapshotPath := opts.localSnapshotPath(); localSnapshotPath != "" {
-				if sc, val, ok := config.SchemeAndPath(top); ok && sc == "file" {
-					if !filepath.IsAbs(val) {
-						val = filepath.Join(filepath.Dir(localSnapshotPath), val)
-					}
-					pd[i].OverlayPath = val
+				path, err := resolveLocalMergePath(top, localSnapshotPath, opts.RefLocations)
+				if err != nil {
+					return -1, fmt.Errorf("resolve parent disk %d layer: %w", i, err)
 				}
+				pd[i].OverlayPath = path
 			}
 		}
 		snapCfg.SnapshotProvenance.ParentDisks = pd
@@ -796,6 +794,20 @@ func (o Options) localSnapshotPath() string {
 		return o.SnapshotPath
 	}
 	return ""
+}
+
+func resolveLocalMergePath(raw, snapshotPath string, locations config.RefLocations) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return "", err
+	}
+	if ref.Scheme != manifest.RefSchemeFile {
+		return "", nil
+	}
+	return locations.ResolveFile(ref, filepath.Dir(snapshotPath))
 }
 
 // preflightLocatedRefs walks snapshot.cfg plus its memory parents and verifies

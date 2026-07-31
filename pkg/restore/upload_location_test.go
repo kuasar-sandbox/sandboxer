@@ -323,6 +323,27 @@ func TestLocalSnapshotPathKeepsUnlocatedDigestRef(t *testing.T) {
 	}
 }
 
+func TestResolveLocalMergePathUsesRefLocations(t *testing.T) {
+	snapshotPath := "/snapshots/root.snapshot"
+	locations := config.RefLocations{"shared": "/shared/location"}
+	for _, tc := range []struct {
+		ref  string
+		want string
+	}{
+		{"file://layer.overlay", "/snapshots/layer.overlay"},
+		{"file://layer.overlay@location:shared", "/shared/location/layer.overlay"},
+		{"manifest://" + strings.Repeat("a", 64), ""},
+	} {
+		got, err := resolveLocalMergePath(tc.ref, snapshotPath, locations)
+		if err != nil {
+			t.Fatalf("resolveLocalMergePath(%q): %v", tc.ref, err)
+		}
+		if got != tc.want {
+			t.Fatalf("resolveLocalMergePath(%q) = %q, want %q", tc.ref, got, tc.want)
+		}
+	}
+}
+
 func writePublishArtifact(t *testing.T, dir, ext string, payload []byte) (string, string) {
 	t.Helper()
 	tmp, err := os.CreateTemp(dir, "artifact-*.tmp")
