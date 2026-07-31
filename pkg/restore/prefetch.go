@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
@@ -28,22 +27,11 @@ type prefetchTask struct {
 func startMemoryPrefetch(
 	ctx context.Context,
 	mode config.PrefetchMode,
-	snapshotManifestKey string,
 	selfStream fetch.Stream,
 	parentLayers int,
 	logf func(string, ...any),
 ) *prefetchTask {
 	if mode != config.PrefetchMemory {
-		return nil
-	}
-	if snapshotManifestKey == "" {
-		logPrefetch(logf, "memory prefetch skipped reason=local_top mode=memory parent_layers=%d", parentLayers)
-		return nil
-	}
-
-	keys, err := manifest.ParseKeyRefs(snapshotManifestKey)
-	if err != nil || len(keys) != 1 {
-		logPrefetch(logf, "memory prefetch skipped reason=composite_top_ref mode=memory parent_layers=%d", parentLayers)
 		return nil
 	}
 	prefetcher, ok := selfStream.(fetch.Prefetcher)
@@ -54,22 +42,20 @@ func startMemoryPrefetch(
 
 	prefetchCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	key := keys[0]
-	keyText := manifest.HexKey(key)
 	startedAt := time.Now()
-	logPrefetch(logf, "memory prefetch started mode=memory parent_layers=%d key=%s", parentLayers, keyText)
+	logPrefetch(logf, "memory prefetch started mode=memory parent_layers=%d", parentLayers)
 	go func() {
 		defer close(done)
-		if err := prefetcher.Prefetch(prefetchCtx, key); err != nil {
+		if err := prefetcher.Prefetch(prefetchCtx); err != nil {
 			duration := time.Since(startedAt)
 			if errors.Is(err, context.Canceled) {
-				logPrefetch(logf, "memory prefetch canceled mode=memory parent_layers=%d key=%s duration=%s", parentLayers, keyText, duration)
+				logPrefetch(logf, "memory prefetch canceled mode=memory parent_layers=%d duration=%s", parentLayers, duration)
 			} else {
-				logPrefetch(logf, "memory prefetch failed mode=memory parent_layers=%d key=%s duration=%s error=%v restore_continues=on_demand", parentLayers, keyText, duration, err)
+				logPrefetch(logf, "memory prefetch failed mode=memory parent_layers=%d duration=%s error=%v restore_continues=on_demand", parentLayers, duration, err)
 			}
 			return
 		}
-		logPrefetch(logf, "memory prefetch completed mode=memory parent_layers=%d key=%s duration=%s", parentLayers, keyText, time.Since(startedAt))
+		logPrefetch(logf, "memory prefetch completed mode=memory parent_layers=%d duration=%s", parentLayers, time.Since(startedAt))
 	}()
 	return &prefetchTask{cancel: cancel, done: done}
 }

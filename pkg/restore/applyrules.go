@@ -1,12 +1,16 @@
 package restore
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"gopkg.in/yaml.v3"
 )
 
@@ -74,54 +78,6 @@ func ParseSnapshotCfg(body []byte) (*SnapshotCfg, error) {
 	return &cfg, nil
 }
 
-// Ref is a parsed `file://<basename>@sha256:<digest>` or
-// `manifest://<key>` reference.
-type Ref struct {
-	Scheme   string // "file" or "manifest"
-	Basename string // file mode: filename only; manifest mode: empty
-	Digest   string // file mode: sha256 hex (lowercase); manifest mode: empty
-	Key      string // manifest mode: hex content key; file mode: empty
-}
-
-// String reconstructs the canonical form. Inverse of ParseRef.
-func (r Ref) String() string {
-	switch r.Scheme {
-	case "file":
-		return "file://" + r.Basename + "@sha256:" + r.Digest
-	case "manifest":
-		return "manifest://" + r.Key
-	default:
-		return ""
-	}
-}
-
-// ParseRef parses runtime_ref / base_ref strings.
-func ParseRef(s string) (Ref, error) {
-	switch {
-	case strings.HasPrefix(s, "manifest://"):
-		key := strings.TrimPrefix(s, "manifest://")
-		if key == "" {
-			return Ref{}, errors.New("manifest:// ref: empty key")
-		}
-		return Ref{Scheme: "manifest", Key: key}, nil
-	case strings.HasPrefix(s, "file://"):
-		body := strings.TrimPrefix(s, "file://")
-		// Expect <basename>@sha256:<hex>
-		idx := strings.LastIndex(body, "@sha256:")
-		if idx < 0 {
-			return Ref{}, fmt.Errorf("file:// ref %q: missing @sha256:<digest>", s)
-		}
-		base := body[:idx]
-		dig := body[idx+len("@sha256:"):]
-		if base == "" || dig == "" {
-			return Ref{}, fmt.Errorf("file:// ref %q: empty basename or digest", s)
-		}
-		return Ref{Scheme: "file", Basename: base, Digest: dig}, nil
-	default:
-		return Ref{}, fmt.Errorf("ref %q: missing file:// or manifest:// scheme", s)
-	}
-}
-
 // ApplyRules merges host sandbox.yaml fields against the snapshot.cfg
 // per docs/sandbox.md §11.0. Host-provided file:// URLs in
 // boot.runtime / boot.root.base must match the snapshot.cfg ref's
@@ -141,7 +97,7 @@ func ParseRef(s string) (Ref, error) {
 // runtime/base ref fields explicitly.
 //
 // Returns the merged config.SandboxConfig the lifecycle should run with.
-func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string) (*config.SandboxConfig, error) {
+func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string, locations config.RefLocations) (*config.SandboxConfig, error) {
 	if host == nil {
 		return nil, errors.New("ApplyRules: host config is nil")
 	}
@@ -149,6 +105,10 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 		return nil, errors.New("ApplyRules: snapshot.cfg is nil")
 	}
 	out := *host // shallow copy
+	out.SnapshotRefs = config.SnapshotRefs{RuntimeRef: snap.Boot.RuntimeRef}
+	if len(snap.Boot.Disks) > 0 {
+		out.SnapshotRefs.DiskBaseRefs = make([]string, len(snap.Boot.Disks))
+	}
 
 	// 1. capacity: exact match if host provides; otherwise copy.
 	if host.Resources.Capacity.CPU != 0 || host.Resources.Capacity.Memory != "" {
@@ -173,14 +133,20 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 	}
 
 	// 3. boot.runtime: file:// only (cold + restore alike).
-	snapRuntimeRef, err := ParseRef(snap.Boot.RuntimeRef)
+	snapRuntimeRef, err := parseSnapshotRuntimeRef(snap.Boot.RuntimeRef)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot.cfg.runtime_ref: %w", err)
 	}
-	if snapRuntimeRef.Scheme != "file" {
-		return nil, fmt.Errorf("snapshot.cfg.runtime_ref: scheme %q unexpected (boot.runtime is file:// only)", snapRuntimeRef.Scheme)
+	if host.Boot.Runtime != "" {
+		hostRuntimeRef, err := manifest.ParseRef(host.Boot.Runtime)
+		if err != nil || hostRuntimeRef.Scheme != manifest.RefSchemeFile {
+			return nil, fmt.Errorf("boot.runtime: must be file://")
+		}
+		if hostRuntimeRef.Location != "" {
+			return nil, fmt.Errorf("boot.runtime: named ref locations are not supported")
+		}
 	}
-	resolvedRuntime, err := resolveBootFileRef(host.Boot.Runtime, snapRuntimeRef, snapshotPath, "boot.runtime", readRuntimeBundleDigest)
+	resolvedRuntime, err := resolveBootFileRef(host.Boot.Runtime, snapRuntimeRef, snapshotPath, "boot.runtime", readRuntimeBundleDigest, locations)
 	if err != nil {
 		return nil, err
 	}
@@ -199,15 +165,19 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 	} else {
 		// Overlay: base_ref is the erofs image (file:// or manifest://); the
 		// captured upper diff (overlay.base) is used raw via OpenDiskStream.
-		snapBaseRef, err := ParseRef(snap.Boot.Root.BaseRef)
+		snapBaseRef, err := manifest.ParseRef(snap.Boot.Root.BaseRef)
 		if err != nil {
 			return nil, fmt.Errorf("snapshot.cfg.base_ref: %w", err)
 		}
-		resolvedBase, err := resolveAnyRef(host.Boot.Root.Base, snapBaseRef, snapshotPath, "boot.root.base")
+		resolvedBase, err := resolveAnyRef(host.Boot.Root.Base, snapBaseRef, snapshotPath, "boot.root.base", locations)
 		if err != nil {
 			return nil, err
 		}
 		out.Boot.Root.Base = resolvedBase
+		out.SnapshotRefs.BaseRef, err = effectiveSnapshotBaseRef(resolvedBase, snapBaseRef)
+		if err != nil {
+			return nil, fmt.Errorf("boot.root.base: %w", err)
+		}
 		// Fresh Overlay pointer so we never mutate host's (out is a shallow copy);
 		// inherit the host's optional diff override, force overlay.base from the
 		// snapshot (host yaml's overlay.base is ignored).
@@ -216,6 +186,7 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 			ov = *host.Boot.Root.Overlay
 		}
 		ov.Base = snap.Boot.Root.Overlay.Base
+		ov.BaseFromRefs = append([]string(nil), snap.Boot.Root.Overlay.BaseFromRefs...)
 		out.Boot.Root.Overlay = &ov
 	}
 
@@ -236,20 +207,25 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 				hd.Base = sd.Base
 				hd.BaseFromRefs = sd.BaseFromRefs
 			} else {
-				snapBaseRef, err := ParseRef(sd.BaseRef)
+				snapBaseRef, err := manifest.ParseRef(sd.BaseRef)
 				if err != nil {
 					return nil, fmt.Errorf("snapshot.cfg.%s.base_ref: %w", field, err)
 				}
-				resolvedBase, err := resolveAnyRef(hd.Base, snapBaseRef, snapshotPath, field+".base")
+				resolvedBase, err := resolveAnyRef(hd.Base, snapBaseRef, snapshotPath, field+".base", locations)
 				if err != nil {
 					return nil, err
 				}
 				hd.Base = resolvedBase
+				out.SnapshotRefs.DiskBaseRefs[i], err = effectiveSnapshotBaseRef(resolvedBase, snapBaseRef)
+				if err != nil {
+					return nil, fmt.Errorf("%s.base: %w", field, err)
+				}
 				ov := config.OverlayConfig{}
 				if hd.Overlay != nil {
 					ov = *hd.Overlay
 				}
 				ov.Base = sd.Overlay.Base
+				ov.BaseFromRefs = append([]string(nil), sd.Overlay.BaseFromRefs...)
 				hd.Overlay = &ov
 			}
 			out.Boot.Disks[i] = hd
@@ -270,41 +246,62 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 //   - host non-empty: parse host URL → file path and verify
 //     basename(path) == ref.Basename.
 //   - the embedded marker must match ref.Digest.
-func resolveBootFileRef(hostURL string, snapRef Ref, snapshotPath, fieldName string, readDigest func(string) (string, error)) (string, error) {
+func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fieldName string, readDigest func(string) (string, error), locations config.RefLocations) (string, error) {
 	if hostURL == "" {
-		if snapshotPath == "" {
+		if snapshotPath == "" && snapRef.Location == "" && !filepath.IsAbs(snapRef.Path) {
 			return "", fmt.Errorf("%s: snapshot.cfg ref is file:// but bundle is manifest-loaded; provide %s explicitly", fieldName, fieldName)
 		}
-		bundleDir := filepath.Dir(snapshotPath)
-		abs := filepath.Join(bundleDir, snapRef.Basename)
-		if err := validateFileRef(abs, snapRef.Digest, readDigest); err != nil {
+		bundleDir := ""
+		if snapshotPath != "" {
+			bundleDir = filepath.Dir(snapshotPath)
+		}
+		abs, err := locations.ResolveFile(snapRef, bundleDir)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", fieldName, err)
+		}
+		if err := validateResolvedFileRef(abs, snapRef, snapRef.Digest, readDigest, locations); err != nil {
 			return "", fmt.Errorf("%s: auto-resolved %s: %w", fieldName, abs, err)
+		}
+		if snapRef.Location != "" {
+			return snapRef.String(), nil
 		}
 		return "file://" + abs, nil
 	}
 
-	if !strings.HasPrefix(hostURL, "file://") {
+	hostRef, err := manifest.ParseRef(hostURL)
+	if err != nil || hostRef.Scheme != manifest.RefSchemeFile {
 		return "", fmt.Errorf("%s: scheme mismatch with snapshot.cfg (host=%q, snap=file://)", fieldName, hostURL)
 	}
-	hostPath := strings.TrimPrefix(hostURL, "file://")
+	hostPath, err := locations.ResolveFile(hostRef, "")
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", fieldName, err)
+	}
 	if !filepath.IsAbs(hostPath) {
-		return "", fmt.Errorf("%s: file:// must be absolute (got %q)", fieldName, hostURL)
+		return "", fmt.Errorf("%s: file:// must be absolute or located (got %q)", fieldName, hostURL)
 	}
-	if filepath.Base(hostPath) != snapRef.Basename {
-		return "", fmt.Errorf("%s: basename mismatch with snapshot.cfg (host=%q, snap=%q)", fieldName, filepath.Base(hostPath), snapRef.Basename)
+	if filepath.Base(hostPath) != snapRef.Path {
+		return "", fmt.Errorf("%s: basename mismatch with snapshot.cfg (host=%q, snap=%q)", fieldName, filepath.Base(hostPath), snapRef.Path)
 	}
-	if err := validateFileRef(hostPath, snapRef.Digest, readDigest); err != nil {
+	if err := validateResolvedFileRef(hostPath, hostRef, snapRef.Digest, readDigest, locations); err != nil {
 		return "", fmt.Errorf("%s: digest mismatch: %w", fieldName, err)
 	}
-	return hostURL, nil
+	if hostRef.Digest != "" {
+		if err := validateResolvedFileRef(hostPath, hostRef, hostRef.Digest, readDigest, locations); err != nil {
+			return "", fmt.Errorf("%s: host ref digest mismatch: %w", fieldName, err)
+		}
+	}
+	if hostRef.Location != "" {
+		return hostRef.String(), nil
+	}
+	return "file://" + hostPath, nil
 }
 
 // resolveAnyRef handles either file:// or manifest:// refs (used by
 // boot.root.base which accepts both).
-func resolveAnyRef(hostURL string, snapRef Ref, snapshotPath, fieldName string) (string, error) {
+func resolveAnyRef(hostURL string, snapRef manifest.Ref, snapshotPath, fieldName string, locations config.RefLocations) (string, error) {
 	switch snapRef.Scheme {
 	case "file":
-		return resolveBootFileRef(hostURL, snapRef, snapshotPath, fieldName, readTarArtifactDigest)
+		return resolveBootFileRef(hostURL, snapRef, snapshotPath, fieldName, readTarArtifactDigest, locations)
 	case "manifest":
 		if hostURL == "" {
 			return snapRef.String(), nil
@@ -313,8 +310,8 @@ func resolveAnyRef(hostURL string, snapRef Ref, snapshotPath, fieldName string) 
 			return "", fmt.Errorf("%s: scheme mismatch with snapshot.cfg (host=%q, snap=manifest://)", fieldName, hostURL)
 		}
 		hostKey := strings.TrimPrefix(hostURL, "manifest://")
-		if hostKey != snapRef.Key {
-			return "", fmt.Errorf("%s: manifest key mismatch with snapshot.cfg (host=%q, snap=%q)", fieldName, hostKey, snapRef.Key)
+		if hostKey != snapRef.Path {
+			return "", fmt.Errorf("%s: manifest key mismatch with snapshot.cfg (host=%q, snap=%q)", fieldName, hostKey, snapRef.Path)
 		}
 		return hostURL, nil
 	default:
@@ -322,10 +319,61 @@ func resolveAnyRef(hostURL string, snapRef Ref, snapshotPath, fieldName string) 
 	}
 }
 
-func validateFileRef(path, want string, readDigest func(string) (string, error)) error {
-	got, err := readDigest(path)
+func validateResolvedFileRef(path string, ref manifest.Ref, want string, readDigest func(string) (string, error), locations config.RefLocations) error {
+	var (
+		got string
+		err error
+	)
+	if ref.Location == "" {
+		got, err = readDigest(path)
+	} else {
+		stream, _, openErr := sandbox.OpenDiskStream(context.Background(), ref.String(), nil, locations)
+		if openErr != nil {
+			return openErr
+		}
+		digester, ok := stream.(tarstream.Digester)
+		if !ok {
+			_ = stream.Close()
+			return fmt.Errorf("file artifact %s has no declared digest", path)
+		}
+		got = digester.Digest()
+		err = stream.Close()
+	}
 	if err != nil {
 		return err
 	}
 	return matchDigest(got, want)
+}
+
+func parseSnapshotRuntimeRef(raw string) (manifest.Ref, error) {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return manifest.Ref{}, err
+	}
+	if ref.Scheme != manifest.RefSchemeFile {
+		return manifest.Ref{}, fmt.Errorf("scheme %q unexpected (boot.runtime is file:// only)", ref.Scheme)
+	}
+	if ref.Location != "" {
+		return manifest.Ref{}, fmt.Errorf("named ref locations are not supported")
+	}
+	return ref, nil
+}
+
+func effectiveSnapshotBaseRef(raw string, snapRef manifest.Ref) (string, error) {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return "", err
+	}
+	if ref.Scheme != snapRef.Scheme {
+		return "", fmt.Errorf("effective scheme %q does not match snapshot scheme %q", ref.Scheme, snapRef.Scheme)
+	}
+	if ref.Scheme == manifest.RefSchemeManifest {
+		return snapRef.String(), nil
+	}
+	ref.Path = filepath.Base(ref.Path)
+	ref.Digest = snapRef.Digest
+	if err := ref.Validate(); err != nil {
+		return "", err
+	}
+	return ref.String(), nil
 }

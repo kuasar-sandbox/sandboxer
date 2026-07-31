@@ -2,11 +2,56 @@ package snapshot
 
 import (
 	"bytes"
+	"context"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
+
+func TestOpenMergeBaseFollowsSymlink(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x5A}, 4096)
+	targetDir := t.TempDir()
+	tmp, err := os.CreateTemp(targetDir, "merge-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := tarstream.WriteTo(context.Background(), tmp, "overlay", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	name := strings.TrimPrefix(digest, "sha256:") + ".overlay"
+	target := filepath.Join(targetDir, name)
+	if err := os.Rename(tmp.Name(), target); err != nil {
+		t.Fatal(err)
+	}
+	layer, _, err := openMergeBase(target, int64(len(payload)))
+	if err != nil {
+		t.Fatalf("open merge base: %v", err)
+	}
+	if err := layer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	link := filepath.Join(t.TempDir(), name)
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	linkedLayer, _, err := openMergeBase(link, int64(len(payload)))
+	if err != nil {
+		t.Fatalf("open merge base symlink: %v", err)
+	}
+	if err := linkedLayer.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // oracle is the reference layering semantics (must match mergeSparse): top byte
 // where top is resident, else base byte where base is resident, else 0 (merged

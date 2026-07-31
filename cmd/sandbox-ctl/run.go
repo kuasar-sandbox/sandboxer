@@ -44,6 +44,8 @@ func runCmd(args []string) int {
 	chBinary := fs.String("ch-binary", "", "path to cloud-hypervisor binary (default: SANDBOX_CH_PATH env, exe-dir, or PATH)")
 	runRoot := fs.String("run-root", "", "tmpfs run root: sockets + snap staging (overrides SANDBOX_RUN_ROOT env; default /run/sandbox)")
 	baseRoot := fs.String("base-root", "", "on-disk base root: overlay diff (overrides SANDBOX_BASE_ROOT env; default /var/lib/sandbox)")
+	refLocations := config.RefLocations{}
+	fs.Var(refLocations, "ref-location", "trusted ref location name=file:///absolute/path (repeatable)")
 
 	cgroupPath := fs.String("cgroup-path", "", "absolute cgroup v2 directory to join (must already exist); empty = no cgroup")
 	cgroupAdopt := fs.Bool("cgroup-adopt", false, "adopt the cgroup sandbox-ctl is already in (its systemd unit's cgroup): write limits there, do NOT move CH; resolves the cgroup path from /proc/self/cgroup")
@@ -233,12 +235,13 @@ func runCmd(args []string) int {
 	// Restore mode dispatch.
 	if restoreR != "" {
 		return runRestore(ctx, cfg, manifestCfg, restoreR,
-			*sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards)
+			*sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations)
 	}
 
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
 		Cfg:                cfg,
 		ManifestCfg:        manifestCfg,
+		RefLocations:       refLocations,
 		SandboxID:          *sandboxID,
 		CHBinary:           chBin,
 		RuntimeRoot:        rd,
@@ -259,7 +262,7 @@ func runCmd(args []string) int {
 // runRestore parses the snapshot reference and dispatches to restore.Run.
 func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *config.ManifestConfig,
 	ref string, sandboxID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
-	statsInterval time.Duration, forwards []sandbox.ForwardSpec,
+	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
 ) int {
 	// Validate host-only restore policy before inspecting the remote reference or
 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
@@ -269,16 +272,34 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 		return 1
 	}
 
-	const manifestPrefix = "manifest://"
 	var (
 		snapshotPath string
 		snapshotKey  string
+		snapshotRef  string
 	)
-	if strings.HasPrefix(ref, manifestPrefix) {
-		snapshotKey = strings.TrimPrefix(ref, manifestPrefix)
-		if manifestCfg == nil {
-			fmt.Fprintln(os.Stderr, "sandbox-ctl run --restore=manifest://: requires --manifest-config or MANIFEST_CONFIG")
+	if strings.HasPrefix(ref, "manifest://") || strings.HasPrefix(ref, "file://") {
+		parsed, err := manifest.ParseRef(ref)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
 			return 2
+		}
+		switch parsed.Scheme {
+		case manifest.RefSchemeManifest:
+			snapshotRef = parsed.String()
+			snapshotKey = parsed.Path
+			if manifestCfg == nil {
+				fmt.Fprintln(os.Stderr, "sandbox-ctl run --restore=manifest://: requires --manifest-config or MANIFEST_CONFIG")
+				return 2
+			}
+		case manifest.RefSchemeFile:
+			snapshotPath, err = refLocations.ResolveFile(parsed, "")
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 2
+			}
+			if parsed.Location != "" || parsed.Digest != "" {
+				snapshotRef = parsed.String()
+			}
 		}
 	} else {
 		snapshotPath = ref
@@ -289,7 +310,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 		err     error
 	)
 	if manifestCfg != nil {
-		fetcher, err = manifestCfg.NewFetcher(manifestCfg.FetchKeyFunc())
+		fetcher, err = manifestCfg.NewFetcher()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
@@ -300,9 +321,11 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 	exit, err := restore.Run(ctx, restore.Options{
 		SnapshotPath:        snapshotPath,
 		SnapshotManifestKey: snapshotKey,
+		SnapshotRef:         snapshotRef,
 		HostCfg:             cfg,
 		ManifestCfg:         manifestCfg,
 		Fetcher:             fetcher,
+		RefLocations:        refLocations,
 		SandboxID:           sandboxID,
 		CHBinary:            chBin,
 		RuntimeRoot:         runDir,

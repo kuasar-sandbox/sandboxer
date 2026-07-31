@@ -590,6 +590,10 @@ type OverlayConfig struct {
 	// Base is an optional read-only ext4 layer (e.g. a snapshot's prior dirty
 	// state). May be file:// or manifest://. Empty for fresh sandboxes.
 	Base string `yaml:"base"`
+	// BaseFromRefs is the explicit top-to-bottom chain below Base. It is used
+	// by both cold template starts and snapshot restore; layer composition is
+	// never encoded into a manifest URI.
+	BaseFromRefs []string `yaml:"base_from_refs,omitempty"`
 	// Diff is the local sparse ext4 file collecting writes since boot.
 	// file:// only. Optional: empty → auto-default to
 	// file://<base-dir>/<sid>.overlay.diff (on disk, see docs/sandbox.md §3.1).
@@ -1119,7 +1123,7 @@ func (c *SandboxConfig) ValidateCold() error {
 	if c.Boot.Runtime == "" {
 		return errors.New("boot.runtime is required")
 	}
-	if err := requireFileAbs("boot.runtime", c.Boot.Runtime); err != nil {
+	if err := requireRuntimeFileAbs("boot.runtime", c.Boot.Runtime); err != nil {
 		return err
 	}
 
@@ -1245,7 +1249,7 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	}
 	// Reference formats (when provided).
 	if c.Boot.Runtime != "" {
-		if err := requireFileAbs("boot.runtime", c.Boot.Runtime); err != nil {
+		if err := requireRuntimeFileAbs("boot.runtime", c.Boot.Runtime); err != nil {
 			return err
 		}
 	}
@@ -1296,6 +1300,14 @@ func validateDiskSource(r *RootConfig, prefix string, cold bool) error {
 				return err
 			}
 		}
+		if len(ov.BaseFromRefs) > 0 && ov.Base == "" {
+			return fmt.Errorf("%s.overlay.base is required when base_from_refs is set", prefix)
+		}
+		for i, ref := range ov.BaseFromRefs {
+			if err := requireAbsIfFile(fmt.Sprintf("%s.overlay.base_from_refs[%d]", prefix, i), ref); err != nil {
+				return err
+			}
+		}
 		if ov.Diff != "" {
 			if err := requireFileAbs(prefix+".overlay.diff", ov.Diff); err != nil {
 				return err
@@ -1330,6 +1342,14 @@ func validateDiskSource(r *RootConfig, prefix string, cold bool) error {
 	}
 	if r.Base != "" {
 		if err := requireAbsIfFile(prefix+".base", r.Base); err != nil {
+			return err
+		}
+	}
+	if len(r.BaseFromRefs) > 0 && r.Base == "" {
+		return fmt.Errorf("%s.base is required when base_from_refs is set", prefix)
+	}
+	for i, ref := range r.BaseFromRefs {
+		if err := requireAbsIfFile(fmt.Sprintf("%s.base_from_refs[%d]", prefix, i), ref); err != nil {
 			return err
 		}
 	}
@@ -1436,14 +1456,38 @@ func requireFileAbs(field, uri string) error {
 	return nil
 }
 
+func requireRuntimeFileAbs(field, uri string) error {
+	ref, err := manifest.ParseRef(uri)
+	if err != nil || ref.Scheme != manifest.RefSchemeFile {
+		return fmt.Errorf("%s must be file://", field)
+	}
+	if ref.Location != "" {
+		return fmt.Errorf("%s does not support named ref locations", field)
+	}
+	if !filepath.IsAbs(ref.Path) {
+		return fmt.Errorf("%s file:// must be absolute (got %q)", field, uri)
+	}
+	return nil
+}
+
 // requireAbsIfFile permits manifest:// and otherwise enforces an
 // absolute file:// path. Used for fields that accept both schemes
 // (root.base, overlay.base).
 func requireAbsIfFile(field, uri string) error {
-	if strings.HasPrefix(uri, "manifest://") {
+	ref, err := manifest.ParseRef(uri)
+	if err != nil {
+		return fmt.Errorf("%s must be file:// or manifest:// (got %q)", field, uri)
+	}
+	if ref.Scheme == manifest.RefSchemeManifest {
 		return nil
 	}
-	return requireFileAbs(field, uri)
+	if ref.Location != "" {
+		return nil
+	}
+	if !filepath.IsAbs(ref.Path) {
+		return fmt.Errorf("%s file:// must be absolute or located (got %q)", field, uri)
+	}
+	return nil
 }
 
 // SchemeAndPath splits a URI like "file:///path" or "manifest://hexkey"

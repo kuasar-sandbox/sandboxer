@@ -10,41 +10,54 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
 
-// uploadSnapshotCmd implements `sandbox-ctl upload-snapshot` — promote a LOCAL
-// file snapshot to a REMOTE manifest:// snapshot WITHOUT booting a sandbox
-// (docs/sandbox.md §3.5). It ingests this snapshot's OWN overlay + memory bundle
-// and carries the (already-remote) lower chain by reference, after verifying
-// each lower layer is present and sealed under the current MANIFEST_KEY (manifest
-// blob only — no chunk download). Prints the uploaded snapshot's manifest:// key.
+// uploadSnapshotCmd implements the offline local-ref upgrader. It publishes a
+// local snapshot graph to manifest storage or one named file location, preserves
+// existing portable refs, and prints the canonical portable root ref.
 //
-//	sandbox-ctl upload-snapshot [--manifest-config <file>] [--quiet] <snapshot-path>
-//
-// Needs --manifest-config (or MANIFEST_CONFIG) + $MANIFEST_KEY; no /dev/kvm, no
-// running sandbox. A lower local file:// layer is rejected — re-export it
-// locally first to flatten it into the top layer.
+//	sandbox-ctl upload-snapshot [--manifest-config <file> | --to-ref-location name=file:///path] [--quiet] <snapshot-path>
 func uploadSnapshotCmd(args []string) int {
 	fs := flag.NewFlagSet("upload-snapshot", flag.ContinueOnError)
 	manifestPath := fs.String("manifest-config", "", "manifest config YAML (overrides MANIFEST_CONFIG env); $MANIFEST_KEY supplies the customer key")
+	toRefLocation := fs.String("to-ref-location", "", "publish local refs to name=file:///absolute/path")
 	quiet := fs.Bool("quiet", false, "suppress progress logs on stderr")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if *toRefLocation != "" && *manifestPath != "" {
+		fmt.Fprintln(os.Stderr, "upload-snapshot: --manifest-config and --to-ref-location are mutually exclusive")
+		return 2
+	}
 	path := fs.Arg(0)
-	if path == "" {
-		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl upload-snapshot [--manifest-config <file>] [--quiet] <snapshot-path>")
+	if path == "" || fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl upload-snapshot [--manifest-config <file> | --to-ref-location name=file:///path] [--quiet] <snapshot-path>")
 		return 2
 	}
 
-	mcfg, err := config.LoadManifestConfig(*manifestPath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
 	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
 	if *quiet {
 		logf = func(string, ...any) {}
 	}
-	ref, err := restore.UploadLocal(context.Background(), path, mcfg, logf)
+	var (
+		ref string
+		err error
+	)
+	if *toRefLocation != "" {
+		locations := config.RefLocations{}
+		if err := locations.Set(*toRefLocation); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		for name, directory := range locations {
+			ref, err = restore.PublishLocalToLocation(context.Background(), path, name, directory, logf)
+		}
+	} else {
+		mcfg, loadErr := config.LoadManifestConfig(*manifestPath)
+		if loadErr != nil {
+			fmt.Fprintln(os.Stderr, loadErr)
+			return 1
+		}
+		ref, err = restore.UploadLocal(context.Background(), path, mcfg, logf)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1

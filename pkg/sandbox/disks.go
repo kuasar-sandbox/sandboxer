@@ -4,18 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"path/filepath"
+	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
 
 // OpenBlockReader resolves a file:// or manifest:// disk URI into a
 // vhost.BlockReader plus the total disk size, via a fetch.Stream. file://
-// opens a local tarstream artifact; manifest:// (one key, or ':'-joined keys
-// that overlay as layers) resolves through the fetcher. Both wrap in a
+// opens a local tarstream artifact; manifest:// resolves one manifest through
+// the fetcher. Both wrap in a
 // StreamReader whose Close releases the stream (the file's fd; a manifest
 // stream's cache/store client is owned by the Fetcher and closed separately).
 //
@@ -26,8 +28,8 @@ import (
 //
 // ctx scopes asynchronous chunk fetches kicked off by later ReadAt calls;
 // cancelling it makes pending vhost-user-blk reads fail promptly at shutdown.
-func OpenBlockReader(ctx context.Context, uri string, fetcher fetch.Fetcher) (vhost.BlockReader, int64, error) {
-	stream, size, err := OpenDiskStream(ctx, uri, fetcher)
+func OpenBlockReader(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations) (vhost.BlockReader, int64, error) {
+	stream, size, err := OpenDiskStream(ctx, uri, fetcher, locations)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -38,29 +40,61 @@ func OpenBlockReader(ctx context.Context, uri string, fetcher fetch.Fetcher) (vh
 // and its size. Exported so callers outside this package (notably
 // pkg/restore) can share the same code path. The caller owns the
 // returned stream and must Close it (directly or via a StreamReader).
-func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher) (fetch.Stream, int64, error) {
-	scheme, value, ok := config.SchemeAndPath(uri)
-	if !ok {
-		return nil, 0, fmt.Errorf("invalid disk URI: %s", uri)
+func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations) (fetch.Stream, int64, error) {
+	ref, err := manifest.ParseRef(uri)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid disk URI %q: %w", uri, err)
 	}
-	switch scheme {
-	case "file":
+	switch ref.Scheme {
+	case manifest.RefSchemeFile:
 		// Local disk artifacts are tarstream envelopes (image/overlay);
 		// the hole map comes from the envelope, never the filesystem.
-		s, err := fetch.OpenTarStream(value)
+		path, err := locations.ResolveFile(ref, "")
 		if err != nil {
 			return nil, 0, err
 		}
+		s, err := fetch.OpenTarStream(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		if err := validateFileRefIdentity(ref, s); err != nil {
+			s.Close()
+			return nil, 0, err
+		}
 		return s, int64(s.Size()), nil
-	case "manifest":
-		return OpenManifestStream(ctx, value, fetcher)
+	case manifest.RefSchemeManifest:
+		return OpenManifestStream(ctx, ref.Path, fetcher)
 	default:
-		return nil, 0, fmt.Errorf("unknown disk URI scheme: %s", scheme)
+		return nil, 0, fmt.Errorf("unknown disk URI scheme: %s", ref.Scheme)
 	}
 }
 
-// OpenManifestStream resolves a manifest:// key reference (one key, or
-// several ':'-joined keys that overlay as layers) into a fetch.Stream and its
+// OpenLayeredBlockReader opens refs in top-to-bottom order and composes them as
+// one read-only block source. A single ref is returned without an extra layer.
+func OpenLayeredBlockReader(ctx context.Context, refs []string, fetcher fetch.Fetcher, locations config.RefLocations) (vhost.BlockReader, int64, error) {
+	if len(refs) == 0 {
+		return nil, 0, errors.New("disk layer list is empty")
+	}
+	streams := make([]fetch.Stream, 0, len(refs))
+	for i, ref := range refs {
+		stream, _, err := OpenDiskStream(ctx, ref, fetcher, locations)
+		if err != nil {
+			for _, opened := range streams {
+				_ = opened.Close()
+			}
+			return nil, 0, fmt.Errorf("layer[%d] %q: %w", i, ref, err)
+		}
+		streams = append(streams, stream)
+	}
+	stream := streams[0]
+	if len(streams) > 1 {
+		stream = fetch.NewLayered(streams...)
+	}
+	size := int64(stream.Size())
+	return vhost.NewStreamReader(ctx, stream, size), size, nil
+}
+
+// OpenManifestStream resolves one manifest:// key into a fetch.Stream and its
 // image size. Exported so callers (notably pkg/restore for snapshot
 // memory bundles) can share the code path.
 //
@@ -70,15 +104,33 @@ func OpenManifestStream(ctx context.Context, keyRef string, fetcher fetch.Fetche
 	if fetcher == nil {
 		return nil, 0, errors.New("manifest:// requires a fetch.Fetcher")
 	}
-	keys, err := manifest.ParseKeyRefs(keyRef)
+	key, err := manifest.ParseKeyRef(keyRef)
 	if err != nil {
 		return nil, 0, err
 	}
-	stream, err := fetcher.Fetch(ctx, keys...)
+	stream, err := fetcher.OpenManifest(ctx, key)
 	if err != nil {
 		return nil, 0, err
 	}
 	return stream, int64(stream.Size()), nil
+}
+
+func validateFileRefIdentity(ref manifest.Ref, stream fetch.Stream) error {
+	digester, ok := stream.(tarstream.Digester)
+	if !ok {
+		return fmt.Errorf("file ref %q has no digest marker", ref.String())
+	}
+	digest := strings.TrimPrefix(digester.Digest(), "sha256:")
+	if ref.Digest != "" && ref.Digest != digest {
+		return fmt.Errorf("file ref %q digest mismatch: got %s", ref.String(), digest)
+	}
+	if ref.Location != "" {
+		contentName := strings.TrimSuffix(ref.Path, filepath.Ext(ref.Path))
+		if contentName != digest {
+			return fmt.Errorf("located file ref %q content name does not match digest %s", ref.String(), digest)
+		}
+	}
+	return nil
 }
 
 // needsManifestFetcher returns true if any disk URI in cfg uses the
@@ -91,9 +143,10 @@ func needsManifestFetcher(cfg *config.SandboxConfig) bool {
 		nodes = append(nodes, d.RootConfig)
 	}
 	for _, n := range nodes {
-		candidates := []string{n.Base}
+		candidates := append([]string{n.Base}, n.BaseFromRefs...)
 		if n.Overlay != nil {
 			candidates = append(candidates, n.Overlay.Base)
+			candidates = append(candidates, n.Overlay.BaseFromRefs...)
 		}
 		for _, uri := range candidates {
 			if uri == "" {
@@ -106,7 +159,3 @@ func needsManifestFetcher(cfg *config.SandboxConfig) bool {
 	}
 	return false
 }
-
-// Compile-time guard: store.ContentKey is used indirectly by
-// ParseHexKey above. Keep the import alive without an unused symbol.
-var _ = store.PartitionChunk

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
@@ -27,6 +28,8 @@ func infoCmd(args []string) int {
 	fs := flag.NewFlagSet("info", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "machine-readable JSON output")
 	manifestPath := fs.String("manifest-config", "", "manifest config YAML (overrides MANIFEST_CONFIG env); required for manifest:// inputs")
+	refLocations := config.RefLocations{}
+	fs.Var(refLocations, "ref-location", "trusted ref location name=file:///absolute/path (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -41,20 +44,22 @@ func infoCmd(args []string) int {
 		stream    fetch.Stream
 		totalSize int64
 	)
-	if strings.HasPrefix(input, "manifest://") {
-		key := strings.TrimPrefix(input, "manifest://")
-		mcfg, err := config.LoadManifestConfig(*manifestPath)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
+	if strings.HasPrefix(input, "manifest://") || strings.HasPrefix(input, "file://") {
+		var fetcher manifest.FetcherCloser
+		if strings.HasPrefix(input, "manifest://") {
+			mcfg, err := config.LoadManifestConfig(*manifestPath)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			fetcher, err = mcfg.NewFetcher()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			defer fetcher.Close()
 		}
-		fetcher, err := mcfg.NewFetcher(mcfg.FetchKeyFunc())
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		defer fetcher.Close()
-		fc, sz, err := sandbox.OpenManifestStream(ctx, key, fetcher)
+		fc, sz, err := sandbox.OpenDiskStream(ctx, input, fetcher, refLocations)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
@@ -71,7 +76,7 @@ func infoCmd(args []string) int {
 		stream, totalSize = fsr, int64(fsr.Size())
 	}
 
-	body, err := readSnapshotCfg(fetch.NewReaderAt(ctx, stream, totalSize), totalSize)
+	body, err := readSnapshotCfg(fetch.NewReaderAt(ctx, stream), totalSize)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1

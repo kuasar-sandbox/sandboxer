@@ -3,9 +3,10 @@ package restore
 import (
 	"archive/zip"
 	"context"
-	"encoding/hex"
+	"crypto/sha256"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,249 +15,402 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/store"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"gopkg.in/yaml.v3"
 )
 
-// UploadLocal promotes a LOCAL snapshot (the <sid>.snapshot tarstream bundle
-// plus every local artifact its snapshot.cfg references) to a fully-REMOTE
-// manifest:// snapshot WITHOUT booting a sandbox. It:
-//
-//  1. parses the bundle's snapshot.cfg + its lower chain;
-//  2. validates every LOWER layer (from_refs / base_from_refs) is remote,
-//     present, and sealed under the current MANIFEST_KEY — manifest blob
-//     only, NO chunk download (Config.CheckManifest). A lower file:// layer
-//     is rejected: the only local layers permitted are the TOP artifacts
-//     (the local-layer invariant, docs §3.5);
-//  3. AUTO-UPLOADS every local file:// ARTIFACT the cfg references — the
-//     root/disk base images (base_ref, digest-verified) and the captured
-//     top overlays — re-rendering their refs to manifest://. runtime_ref is
-//     deliberately left alone: it is a node boot artifact pinned by digest
-//     and distributed with the platform, not a tenant artifact;
-//  4. ingests the memory bundle with the re-rendered snapshot.cfg and
-//     returns the uploaded snapshot's identity = manifest://<memKey>.
-//
-// Local artifacts resolve as siblings of the bundle (file:// refs carry
-// basenames); a base image's @sha256 digest is compared with its marker before
-// upload. Ingest is content-addressed, so re-uploading shared
-// artifacts (the same base image across templates) dedups to the same key.
-//
-// The result is restorable via `sandbox-ctl run --restore=manifest://<memKey>`.
+// UploadLocal publishes a local snapshot graph to manifest storage. Local file
+// refs are upgraded to manifest refs; existing manifest and located file refs
+// remain unchanged.
 func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config, logf func(string, ...any)) (string, error) {
-	if logf == nil {
-		logf = func(string, ...any) {}
+	if mcfg == nil {
+		return "", fmt.Errorf("manifest config is required")
 	}
-	bundle, bundleDigest, err := openTarArtifact(snapshotPath)
-	if err != nil {
-		return "", fmt.Errorf("open snapshot: %w", err)
-	}
-	if err := validateContentAddressedName(snapshotPath, bundleDigest); err != nil {
-		bundle.Close()
-		return "", fmt.Errorf("open snapshot: %w", err)
-	}
-	defer bundle.Close()
-	bundleSize := int64(bundle.Size())
-	bundleDir := filepath.Dir(snapshotPath)
-
-	// 1. Trailing-ZIP members (config.json / state.json / snapshot.cfg).
-	zr, err := zip.NewReader(fetch.NewReaderAt(ctx, bundle, bundleSize), bundleSize)
-	if err != nil {
-		return "", fmt.Errorf("read snapshot ZIP trailer: %w", err)
-	}
-	ent := map[string][]byte{}
-	for _, zf := range zr.File {
-		rc, err := zf.Open()
-		if err != nil {
-			return "", fmt.Errorf("zip open %s: %w", zf.Name, err)
-		}
-		b, rerr := io.ReadAll(rc)
-		rc.Close()
-		if rerr != nil {
-			return "", fmt.Errorf("zip read %s: %w", zf.Name, rerr)
-		}
-		ent[zf.Name] = b
-	}
-	for _, w := range []string{"config.json", "state.json", "snapshot.cfg"} {
-		if _, ok := ent[w]; !ok {
-			return "", fmt.Errorf("snapshot bundle missing %s (produced by old sandbox-ctl?)", w)
-		}
-	}
-	parsed, err := ParseSnapshotCfg(ent["snapshot.cfg"])
-	if err != nil {
-		return "", err
-	}
-
-	// 2. Validate every LOWER layer (memory + disk chains): remote, present,
-	//    key-consistent. Reject buried local layers (invariant).
-	lower := append([]string{}, parsed.FromRefs...)
-	lower = append(lower, parsed.Boot.Root.BaseFromRefs...)
-	if parsed.Boot.Root.Overlay != nil {
-		lower = append(lower, parsed.Boot.Root.Overlay.BaseFromRefs...)
-	}
-	for i := range parsed.Boot.Disks {
-		n := &parsed.Boot.Disks[i]
-		lower = append(lower, n.BaseFromRefs...)
-		if n.Overlay != nil {
-			lower = append(lower, n.Overlay.BaseFromRefs...)
-		}
-	}
-	for _, ref := range lower {
-		sc, val, ok := config.SchemeAndPath(ref)
-		if !ok {
-			return "", fmt.Errorf("upload-snapshot: malformed lower ref %q", ref)
-		}
-		switch sc {
-		case "file":
-			return "", fmt.Errorf("upload-snapshot: lower layer %q is a local file:// — re-export locally to flatten it first (local-layer invariant, docs §3.5)", ref)
-		case "manifest":
-			for _, part := range strings.Split(val, ":") { // manifest://k1:k2 → per-key check
-				key, perr := parseManifestKey(part)
-				if perr != nil {
-					return "", fmt.Errorf("upload-snapshot: lower ref %q: %w", ref, perr)
-				}
-				if cerr := mcfg.CheckManifest(ctx, key); cerr != nil {
-					return "", fmt.Errorf("upload-snapshot: lower layer %q: %w", ref, cerr)
-				}
-			}
-		default:
-			return "", fmt.Errorf("upload-snapshot: lower ref %q: unknown scheme %q", ref, sc)
-		}
-	}
-	logf("upload-snapshot: %d lower layer(s) verified present + key-consistent", len(lower))
-
-	// 3. Auto-upload the local artifacts the cfg references, rewriting refs.
 	ing, err := mcfg.NewIngester(mcfg.IngestKeyFunc(), nil)
 	if err != nil {
 		return "", fmt.Errorf("ingester: %w", err)
 	}
 	defer ing.Close()
-	up := &artifactUploader{ctx: ctx, ing: ing, dir: bundleDir, logf: logf}
+	p := newSnapshotPublisher(ctx, logf)
+	p.ing = ing
+	p.manifestConfig = mcfg
+	return p.publishSnapshot(snapshotPath, "")
+}
 
-	if parsed.Boot.Root.BaseRef, err = up.uploadRef("root base", parsed.Boot.Root.BaseRef, true); err != nil {
+// PublishLocalToLocation publishes a local snapshot graph into one trusted
+// named file location. It writes only content-addressed files and returns the
+// canonical located root ref.
+func PublishLocalToLocation(ctx context.Context, snapshotPath, location, directory string, logf func(string, ...any)) (string, error) {
+	probe := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: "probe.snapshot", Location: location}
+	if err := probe.Validate(); err != nil {
 		return "", err
 	}
-	if parsed.Boot.Root.Base, err = up.uploadRef("root top layer", parsed.Boot.Root.Base, false); err != nil {
+	if !filepath.IsAbs(directory) {
+		return "", fmt.Errorf("ref location directory must be absolute: %q", directory)
+	}
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return "", fmt.Errorf("create ref location: %w", err)
+	}
+	p := newSnapshotPublisher(ctx, logf)
+	p.location = location
+	p.directory = filepath.Clean(directory)
+	return p.publishSnapshot(snapshotPath, "")
+}
+
+type snapshotPublisher struct {
+	ctx            context.Context
+	ing            ingest.Ingester
+	manifestConfig *manifest.Config
+	location       string
+	directory      string
+	logf           func(string, ...any)
+	done           map[string]string
+	visiting       map[string]bool
+}
+
+func newSnapshotPublisher(ctx context.Context, logf func(string, ...any)) *snapshotPublisher {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	return &snapshotPublisher{
+		ctx:      ctx,
+		logf:     logf,
+		done:     make(map[string]string),
+		visiting: make(map[string]bool),
+	}
+}
+
+func (p *snapshotPublisher) publishSnapshot(snapshotPath, wantDigest string) (result string, retErr error) {
+	realPath, err := filepath.EvalSymlinks(snapshotPath)
+	if err != nil {
+		return "", fmt.Errorf("open snapshot: %w", err)
+	}
+	realPath, err = filepath.Abs(realPath)
+	if err != nil {
 		return "", err
 	}
-	if parsed.Boot.Root.Overlay != nil {
-		if parsed.Boot.Root.Overlay.Base, err = up.uploadRef("root overlay", parsed.Boot.Root.Overlay.Base, false); err != nil {
+	if p.visiting[realPath] {
+		return "", fmt.Errorf("upload-snapshot: cycle at %s", realPath)
+	}
+	p.visiting[realPath] = true
+	defer func() { delete(p.visiting, realPath) }()
+
+	bundle, bundleDigest, err := openTarArtifact(realPath)
+	if err != nil {
+		return "", fmt.Errorf("open snapshot: %w", err)
+	}
+	defer bundle.Close()
+	if wantDigest != "" {
+		if err := matchDigest(bundleDigest, wantDigest); err != nil {
+			return "", fmt.Errorf("open snapshot: %w", err)
+		}
+	} else if err := validateContentAddressedName(realPath, bundleDigest); err != nil {
+		return "", fmt.Errorf("open snapshot: %w", err)
+	}
+	if err := verifyArtifactFile(realPath, bundleDigest, int64(bundle.Size())); err != nil {
+		return "", fmt.Errorf("open snapshot: %w", err)
+	}
+	if ref, ok := p.done[realPath]; ok {
+		return ref, nil
+	}
+	bundleSize := int64(bundle.Size())
+	entries, parsed, err := readSnapshotEntries(p.ctx, bundle, bundleSize)
+	if err != nil {
+		return "", err
+	}
+	bundleDir := filepath.Dir(realPath)
+
+	for i, ref := range parsed.FromRefs {
+		parsed.FromRefs[i], err = p.publishRef(fmt.Sprintf("memory parent %d", i), ref, bundleDir, true)
+		if err != nil {
 			return "", err
 		}
+	}
+	if err := p.publishDiskNode("root", &parsed.Boot.Root.BaseRef, &parsed.Boot.Root.Base, &parsed.Boot.Root.BaseFromRefs, parsed.Boot.Root.Overlay, bundleDir); err != nil {
+		return "", err
 	}
 	for i := range parsed.Boot.Disks {
 		n := &parsed.Boot.Disks[i]
-		lbl := fmt.Sprintf("disk %d", i)
-		if n.BaseRef, err = up.uploadRef(lbl+" base", n.BaseRef, true); err != nil {
+		if err := p.publishDiskNode(fmt.Sprintf("disk %d", i), &n.BaseRef, &n.Base, &n.BaseFromRefs, n.Overlay, bundleDir); err != nil {
 			return "", err
-		}
-		if n.Base, err = up.uploadRef(lbl+" top layer", n.Base, false); err != nil {
-			return "", err
-		}
-		if n.Overlay != nil {
-			if n.Overlay.Base, err = up.uploadRef(lbl+" overlay", n.Overlay.Base, false); err != nil {
-				return "", err
-			}
 		}
 	}
 
-	// 4. Re-render snapshot.cfg, rebuild the ZIP, ingest [memory][new ZIP].
-	newCfg, err := yaml.Marshal(&parsed)
+	newCfg, err := yaml.Marshal(parsed)
 	if err != nil {
 		return "", fmt.Errorf("render snapshot.cfg: %w", err)
 	}
 	zipBytes, err := snapshot.BuildZIP(map[string][]byte{
-		"config.json":  ent["config.json"],
-		"state.json":   ent["state.json"],
+		"config.json":  entries["config.json"],
+		"state.json":   entries["state.json"],
 		"snapshot.cfg": newCfg,
 	})
 	if err != nil {
 		return "", fmt.Errorf("build zip: %w", err)
 	}
-
-	capBytes, err := util.ParseSize(parsed.Resources.Capacity.Memory)
+	memSize, err := util.ParseSize(parsed.Resources.Capacity.Memory)
 	if err != nil {
 		return "", fmt.Errorf("capacity.memory: %w", err)
 	}
-	if int64(capBytes) > bundleSize {
-		return "", fmt.Errorf("snapshot %s too small (%d) for its memory section (%d)", snapshotPath, bundleSize, capBytes)
+	if int64(memSize) > bundleSize {
+		return "", fmt.Errorf("snapshot %s too small (%d) for its memory section (%d)", realPath, bundleSize, memSize)
 	}
-	src := &memZipSource{bundle: bundle, memSize: capBytes, zip: zipBytes}
-	res, err := ing.Ingest(ctx, src, ingest.IngestOption{OnProgress: up.progress("memory section")})
+	src := &memZipSource{bundle: bundle, memSize: memSize, zip: zipBytes}
+	if p.ing != nil {
+		res, err := p.ing.Ingest(p.ctx, src, ingest.IngestOption{OnProgress: p.progress("memory section")})
+		if err != nil {
+			return "", fmt.Errorf("ingest bundle: %w", err)
+		}
+		result = "manifest://" + manifest.HexKey(res.ManifestKey)
+		p.logf("upload-snapshot: memory stored=%d dedup=%d zero=%d", res.StoredChunks, res.DedupChunks, res.ZeroChunks)
+	} else {
+		tmp, err := os.CreateTemp(p.directory, ".publish-snapshot-*.tmp")
+		if err != nil {
+			return "", err
+		}
+		tmpPath := tmp.Name()
+		defer os.Remove(tmpPath)
+		digest, writeErr := tarstream.WriteTo(p.ctx, tmp, "snapshot", src)
+		closeErr := tmp.Close()
+		if writeErr != nil {
+			return "", fmt.Errorf("rebuild snapshot: %w", writeErr)
+		}
+		if closeErr != nil {
+			return "", closeErr
+		}
+		result, err = p.publishLocationFile(tmpPath, ".snapshot", digest, false)
+		if err != nil {
+			return "", err
+		}
+	}
+	p.done[realPath] = result
+	return result, nil
+}
+
+func readSnapshotEntries(ctx context.Context, bundle fetch.Stream, bundleSize int64) (map[string][]byte, *SnapshotCfg, error) {
+	zr, err := zip.NewReader(fetch.NewReaderAt(ctx, bundle), bundleSize)
 	if err != nil {
-		return "", fmt.Errorf("ingest bundle: %w", err)
+		return nil, nil, fmt.Errorf("read snapshot ZIP trailer: %w", err)
 	}
-	logf("upload-snapshot: memory stored=%d dedup=%d zero=%d", res.StoredChunks, res.DedupChunks, res.ZeroChunks)
-	// The documented identity is the full ref — callers (orchestrator
-	// promote, scripts) branch on the manifest:// scheme to tell remote
-	// from local, so a bare key here reads as a local path downstream.
-	return "manifest://" + snapshot.HexKey(res.ManifestKey), nil
+	entries := make(map[string][]byte)
+	for _, zf := range zr.File {
+		rc, err := zf.Open()
+		if err != nil {
+			return nil, nil, fmt.Errorf("zip open %s: %w", zf.Name, err)
+		}
+		body, readErr := io.ReadAll(rc)
+		closeErr := rc.Close()
+		if readErr != nil {
+			return nil, nil, fmt.Errorf("zip read %s: %w", zf.Name, readErr)
+		}
+		if closeErr != nil {
+			return nil, nil, closeErr
+		}
+		entries[zf.Name] = body
+	}
+	for _, name := range []string{"config.json", "state.json", "snapshot.cfg"} {
+		if _, ok := entries[name]; !ok {
+			return nil, nil, fmt.Errorf("snapshot bundle missing %s", name)
+		}
+	}
+	parsed, err := ParseSnapshotCfg(entries["snapshot.cfg"])
+	if err != nil {
+		return nil, nil, err
+	}
+	return entries, parsed, nil
 }
 
-// artifactUploader ingests local file:// artifacts referenced by a
-// snapshot.cfg and rewrites their refs to manifest://.
-type artifactUploader struct {
-	ctx  context.Context
-	ing  ingest.Ingester
-	dir  string // bundle dir: file:// refs resolve as siblings
-	logf func(string, ...any)
+func (p *snapshotPublisher) publishDiskNode(label string, baseRef, base *string, baseFromRefs *[]string, overlay *SnapOverlayCfg, bundleDir string) error {
+	var err error
+	if *baseRef, err = p.publishRef(label+" base", *baseRef, bundleDir, false); err != nil {
+		return err
+	}
+	if *base, err = p.publishRef(label+" top", *base, bundleDir, false); err != nil {
+		return err
+	}
+	for i, ref := range *baseFromRefs {
+		(*baseFromRefs)[i], err = p.publishRef(fmt.Sprintf("%s parent %d", label, i), ref, bundleDir, false)
+		if err != nil {
+			return err
+		}
+	}
+	if overlay == nil {
+		return nil
+	}
+	if overlay.Base, err = p.publishRef(label+" overlay", overlay.Base, bundleDir, false); err != nil {
+		return err
+	}
+	for i, ref := range overlay.BaseFromRefs {
+		overlay.BaseFromRefs[i], err = p.publishRef(fmt.Sprintf("%s overlay parent %d", label, i), ref, bundleDir, false)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// uploadRef resolves ref: manifest:// (or empty) passes through; file://
-// uploads the local artifact and returns its manifest:// ref. digested
-// selects the base_ref form (file://<name>@sha256:<hex>, marker compared before
-// ingest) vs the plain captured-layer form (file://<basename>).
-func (u *artifactUploader) uploadRef(label, ref string, digested bool) (string, error) {
-	if ref == "" {
-		return ref, nil
+func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotRef bool) (string, error) {
+	if raw == "" {
+		return "", nil
 	}
-	sc, _, ok := config.SchemeAndPath(ref)
-	if !ok {
-		return "", fmt.Errorf("upload-snapshot: %s: malformed ref %q", label, ref)
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
 	}
-	if sc != "file" {
-		return ref, nil // already remote
-	}
-
-	name := strings.TrimPrefix(ref, "file://")
-	wantDigest := ""
-	if digested {
-		r, err := ParseRef(ref)
+	if ref.Scheme == manifest.RefSchemeManifest && p.manifestConfig != nil {
+		key, err := manifest.ParseHexKey(ref.Path)
 		if err != nil {
 			return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
 		}
-		name, wantDigest = r.Basename, r.Digest
-	}
-	path := name
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(u.dir, name)
-	}
-	st, gotDigest, err := openTarArtifact(path)
-	if err != nil {
-		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
-	}
-	defer st.Close()
-	if wantDigest != "" {
-		if err := matchDigest(gotDigest, wantDigest); err != nil {
-			return "", fmt.Errorf("upload-snapshot: %s: %s does not match ref: %w", label, path, err)
+		if err := p.manifestConfig.CheckManifest(p.ctx, key); err != nil {
+			return "", fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
 		}
-	} else if err := validateContentAddressedName(path, gotDigest); err != nil {
-		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
 	}
-	res, err := u.ing.Ingest(u.ctx, st, ingest.IngestOption{OnProgress: u.progress(label)})
-	if err != nil {
-		return "", fmt.Errorf("upload-snapshot: ingest %s: %w", label, err)
+	if ref.Portable() {
+		return ref.String(), nil
 	}
-	key := snapshot.HexKey(res.ManifestKey)
-	u.logf("upload-snapshot: %s %s → manifest://%s (stored=%d dedup=%d)",
-		label, name, key, res.StoredChunks, res.DedupChunks)
-	return "manifest://" + key, nil
+	path := ref.Path
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(relativeDir, path)
+	}
+	if snapshotRef {
+		return p.publishSnapshot(path, ref.Digest)
+	}
+	return p.publishLeaf(label, path, ref.Digest)
 }
 
-// progress returns a throttled OnProgress logger.
-func (u *artifactUploader) progress(label string) func(processed, total uint64) {
+func (p *snapshotPublisher) publishLeaf(label, path, wantDigest string) (string, error) {
+	stream, digest, err := openTarArtifact(path)
+	if err != nil {
+		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
+	}
+	defer stream.Close()
+	if err := verifyArtifactFile(path, digest, int64(stream.Size())); err != nil {
+		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
+	}
+	if wantDigest != "" {
+		if err := matchDigest(digest, wantDigest); err != nil {
+			return "", err
+		}
+	} else if err := validateContentAddressedName(path, digest); err != nil {
+		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
+	}
+
+	if p.ing != nil {
+		res, err := p.ing.Ingest(p.ctx, stream, ingest.IngestOption{OnProgress: p.progress(label)})
+		if err != nil {
+			return "", fmt.Errorf("upload-snapshot: ingest %s: %w", label, err)
+		}
+		key := manifest.HexKey(res.ManifestKey)
+		p.logf("upload-snapshot: %s %s → manifest://%s (stored=%d dedup=%d)", label, path, key, res.StoredChunks, res.DedupChunks)
+		return "manifest://" + key, nil
+	}
+	ext := filepath.Ext(path)
+	return p.publishLocationFile(path, ext, digest, wantDigest != "")
+}
+
+func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, keepDigest bool) (string, error) {
+	hexDigest := strings.TrimPrefix(digest, "sha256:")
+	basename := hexDigest + ext
+	destination := filepath.Join(p.directory, basename)
+	sourceInfo, err := os.Stat(sourcePath)
+	if err != nil {
+		return "", err
+	}
+	if destInfo, statErr := os.Stat(destination); statErr == nil {
+		if destInfo.Size() == sourceInfo.Size() && verifyArtifactFile(destination, digest, 0) == nil {
+			return p.locatedRef(basename, hexDigest, keepDigest), nil
+		}
+	} else if !os.IsNotExist(statErr) {
+		return "", statErr
+	}
+
+	in, err := os.Open(sourcePath)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	// Named locations deliberately do not require temporary-file rename support.
+	// Valid content-addressed files are reused; an invalid final name is repaired
+	// in place by one sequential write.
+	out, err := os.OpenFile(destination, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return "", err
+	}
+	copyErr := copyAndVerifyArtifact(out, in, sourceInfo.Size(), digest)
+	if copyErr == nil {
+		copyErr = out.Sync()
+	}
+	closeErr := out.Close()
+	if copyErr != nil {
+		return "", copyErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if err := verifyArtifactFile(destination, digest, 0); err != nil {
+		return "", fmt.Errorf("verify published %s: %w", destination, err)
+	}
+	p.logf("upload-snapshot: published %s", destination)
+	return p.locatedRef(basename, hexDigest, keepDigest), nil
+}
+
+func (p *snapshotPublisher) locatedRef(basename, digest string, keepDigest bool) string {
+	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: basename, Location: p.location}
+	if keepDigest {
+		ref.Digest = digest
+	}
+	return ref.String()
+}
+
+const tarstreamTrailerSize = int64(3 * 512) // marker header + two zero blocks
+
+func copyAndVerifyArtifact(dst io.Writer, src io.Reader, size int64, wantDigest string) error {
+	if size < tarstreamTrailerSize {
+		return fmt.Errorf("tarstream artifact is too small: %d", size)
+	}
+	h := sha256.New()
+	if _, err := io.CopyN(io.MultiWriter(dst, h), src, size-tarstreamTrailerSize); err != nil {
+		return err
+	}
+	if _, err := io.CopyN(dst, src, tarstreamTrailerSize); err != nil {
+		return err
+	}
+	got := fmt.Sprintf("sha256:%x", h.Sum(nil))
+	if got != wantDigest {
+		return fmt.Errorf("tarstream digest mismatch: got %s, want %s", got, wantDigest)
+	}
+	return nil
+}
+
+func verifyArtifactFile(path, wantDigest string, wantLogicalSize int64) error {
+	stream, digest, err := openTarArtifact(path)
+	if err != nil {
+		return err
+	}
+	logicalSize := int64(stream.Size())
+	stream.Close()
+	if digest != wantDigest {
+		return fmt.Errorf("digest marker mismatch: got %s, want %s", digest, wantDigest)
+	}
+	if wantLogicalSize > 0 && logicalSize != wantLogicalSize {
+		return fmt.Errorf("logical size mismatch: got %d, want %d", logicalSize, wantLogicalSize)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return copyAndVerifyArtifact(io.Discard, f, info.Size(), wantDigest)
+}
+
+func (p *snapshotPublisher) progress(label string) func(processed, total uint64) {
 	const mib = 1 << 20
 	last := time.Now()
 	return func(processed, total uint64) {
@@ -264,13 +418,12 @@ func (u *artifactUploader) progress(label string) func(processed, total uint64) 
 			return
 		}
 		last = time.Now()
-		u.logf("upload: %s %d/%d MiB", label, processed/mib, total/mib)
+		p.logf("upload: %s %d/%d MiB", label, processed/mib, total/mib)
 	}
 }
 
 // memZipSource composes [0,memSize) of the bundle entry followed by the
-// re-rendered ZIP trailer as one sparse.Source — the same [memory][ZIP]
-// shape the live snapshot path ingests.
+// re-rendered ZIP trailer as one sparse.Source.
 type memZipSource struct {
 	bundle  sparse.Source
 	memSize uint64
@@ -323,21 +476,6 @@ func (s *memZipSource) ReadAt(ctx context.Context, buf []byte, off uint64) (int,
 	}
 	if done < n {
 		copy(p[done:], s.zip[off-s.memSize:])
-		done = n
 	}
 	return n, eof
-}
-
-// parseManifestKey decodes a 64-hex manifest key into a store.ContentKey.
-func parseManifestKey(hexKey string) (store.ContentKey, error) {
-	var k store.ContentKey
-	b, err := hex.DecodeString(hexKey)
-	if err != nil {
-		return k, fmt.Errorf("manifest key %q: %w", hexKey, err)
-	}
-	if len(b) != len(k) {
-		return k, fmt.Errorf("manifest key %q: want %d bytes, got %d", hexKey, len(k), len(b))
-	}
-	copy(k[:], b)
-	return k, nil
 }

@@ -70,7 +70,8 @@ Usage:
   sandbox-ctl run       --config sandbox.yaml [--manifest-config <path>]
                         [--sandbox-id <sid>] [--ch-binary <path>]
                         [--run-root <dir>] [--base-root <dir>]
-                        [--restore <file_path|manifest://hex>]
+			[--restore <snapshot-path|manifest://hex|file://basename@location:name>]
+			[--ref-location name=file:///absolute/path ...]
                         [--stdin] [--stdout=false] [--stderr=false]
                         [--stdin-from F] [--stdout-to F] [--stderr-to F]
                         [--tty] [--console off|default|file=PATH]
@@ -87,10 +88,12 @@ Usage:
   sandbox-ctl config    [--config a.yaml[:b.yaml...] | --template]
                         [--mode default|restore] [--check skip|strict] [-o <file>]
                         produce/merge/validate a sandbox.yaml on stdout
-  sandbox-ctl info      [--json] [--manifest-config <p>] <manifest://hex|snapshot-path>
-                        print a snapshot's embedded snapshot.cfg
-  sandbox-ctl upload-snapshot [--manifest-config <p>] [--quiet] <snapshot-path>
-                        promote a LOCAL snapshot to a remote manifest:// snapshot (no boot)
+	sandbox-ctl info      [--json] [--manifest-config <p>]
+			[--ref-location name=file:///absolute/path ...] <snapshot-ref|snapshot-path>
+			print a snapshot's embedded snapshot.cfg
+	sandbox-ctl upload-snapshot [--manifest-config <p> | --to-ref-location name=file:///path]
+			[--quiet] <snapshot-path>
+			publish local refs and print the canonical portable root ref (no boot)
 
 --manifest-config (or MANIFEST_CONFIG env) is required for any
 manifest:// resource (boot.root.base, --restore manifest://, --upload).
