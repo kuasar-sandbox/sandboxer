@@ -190,11 +190,13 @@ func TestSnapshotPublisherChecksPreservedManifestRefs(t *testing.T) {
 
 func TestPreflightLocatedRefsWalksMemoryParents(t *testing.T) {
 	parentDir := t.TempDir()
-	parentCfg := &SnapshotCfg{}
+	parentCfg := &SnapshotCfg{FromRefs: []string{
+		"file://" + strings.Repeat("d", 64) + ".snapshot@location:missing-parent",
+	}}
 	parentCfg.Resources.Capacity.Memory = "4KiB"
 	parentCfg.Boot.Root.BaseRef = "manifest://" + strings.Repeat("a", 64)
 	parentCfg.Boot.Root.Overlay = &SnapOverlayCfg{
-		Base: "file://" + strings.Repeat("b", 64) + ".overlay@location:missing",
+		Base: "file://" + strings.Repeat("b", 64) + ".overlay@location:ignored-parent-disk",
 	}
 	parentPath := writePublishSnapshot(t, parentDir, parentCfg)
 
@@ -210,8 +212,31 @@ func TestPreflightLocatedRefsWalksMemoryParents(t *testing.T) {
 		SnapshotPath: rootPath,
 		RefLocations: config.RefLocations{"parent": parentDir},
 	})
-	if err == nil || !strings.Contains(err.Error(), `location "missing" is not configured`) {
+	if err == nil || !strings.Contains(err.Error(), `location "missing-parent" is not configured`) {
 		t.Fatalf("preflight error = %v", err)
+	}
+}
+
+func TestPreflightLocatedRefsIgnoresParentDiskArtifacts(t *testing.T) {
+	parentDir := t.TempDir()
+	parentCfg := &SnapshotCfg{}
+	parentCfg.Resources.Capacity.Memory = "4KiB"
+	parentCfg.Boot.Root.Overlay = &SnapOverlayCfg{
+		Base: "file://" + strings.Repeat("b", 64) + ".overlay@location:obsolete-parent-disk",
+	}
+	parentPath := writePublishSnapshot(t, parentDir, parentCfg)
+
+	rootCfg := &SnapshotCfg{FromRefs: []string{
+		"file://" + filepath.Base(parentPath) + "@location:parent",
+	}}
+	rootCfg.Resources.Capacity.Memory = "4KiB"
+	rootPath := writePublishSnapshot(t, t.TempDir(), rootCfg)
+
+	if err := preflightLocatedRefs(context.Background(), Options{
+		SnapshotPath: rootPath,
+		RefLocations: config.RefLocations{"parent": parentDir},
+	}); err != nil {
+		t.Fatalf("parent disk artifact affected memory preflight: %v", err)
 	}
 }
 

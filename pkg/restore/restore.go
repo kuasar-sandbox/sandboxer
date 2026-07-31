@@ -871,10 +871,12 @@ func preflightLocatedRefs(ctx context.Context, opts Options) error {
 		item := pending[0]
 		pending = pending[1:]
 		snap := item.cfg
-		refs := snapshotArtifactRefs(snap, item.overrides)
-		for _, raw := range refs {
-			if err := preflightLocatedRef(ctx, raw, opts); err != nil {
-				return err
+		if item.overrides != nil {
+			refs := snapshotArtifactRefs(snap, item.overrides)
+			for _, raw := range refs {
+				if err := preflightLocatedRef(ctx, raw, opts); err != nil {
+					return err
+				}
 			}
 		}
 		for _, raw := range snap.FromRefs {

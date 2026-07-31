@@ -370,6 +370,9 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, 
 		return "", err
 	}
 	defer in.Close()
+	// Named locations deliberately do not require temporary-file rename support.
+	// Valid content-addressed files are reused; an invalid final name is repaired
+	// in place by one sequential write.
 	out, err := openLocationDestination(destination)
 	if err != nil {
 		return "", err
