@@ -226,7 +226,7 @@ func TestPreflightLocatedRefsValidatesDiskArtifactIdentity(t *testing.T) {
 			makeRef: func(_ *testing.T, _, artifactPath, _ string) string {
 				return "file://" + filepath.Base(artifactPath) + "@sha256:" + strings.Repeat("f", 64) + "@location:shared"
 			},
-			want: "sha256 marker mismatch",
+			want: "digest mismatch",
 		},
 		{
 			name: "content addressed name",
@@ -237,7 +237,7 @@ func TestPreflightLocatedRefsValidatesDiskArtifactIdentity(t *testing.T) {
 				}
 				return "file://wrong.overlay@location:shared"
 			},
-			want: "does not match marker",
+			want: "content name does not match",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -266,7 +266,7 @@ func TestPreflightLocatedRefsValidatesRootIdentity(t *testing.T) {
 		{
 			name: "digest qualifier",
 			makeRef: func(_ *testing.T, rootPath string) (string, string) {
-				return "file://" + filepath.Base(rootPath) + "@sha256:" + strings.Repeat("f", 64) + "@location:shared", "sha256 marker mismatch"
+				return "file://" + filepath.Base(rootPath) + "@sha256:" + strings.Repeat("f", 64) + "@location:shared", "digest mismatch"
 			},
 		},
 		{
@@ -276,7 +276,27 @@ func TestPreflightLocatedRefsValidatesRootIdentity(t *testing.T) {
 				if err := os.Rename(rootPath, wrongPath); err != nil {
 					t.Fatal(err)
 				}
-				return "file://wrong.snapshot@location:shared", "does not match marker"
+				return "file://wrong.snapshot@location:shared", "content name does not match"
+			},
+		},
+		{
+			name: "symlink",
+			makeRef: func(t *testing.T, rootPath string) (string, string) {
+				outside := filepath.Join(t.TempDir(), filepath.Base(rootPath))
+				body, err := os.ReadFile(rootPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(outside, body, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(rootPath); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, rootPath); err != nil {
+					t.Fatal(err)
+				}
+				return "file://" + filepath.Base(rootPath) + "@location:shared", "symlink"
 			},
 		},
 	} {
@@ -303,18 +323,47 @@ func TestPreflightLocatedRefsValidatesRootIdentity(t *testing.T) {
 }
 
 func TestPreflightLocatedRefsIncludesHostOverrides(t *testing.T) {
+	artifactPath, digest := writePublishArtifact(t, t.TempDir(), ".erofs", bytes.Repeat([]byte{0x6A}, 4096))
 	rootCfg := &SnapshotCfg{}
 	rootCfg.Resources.Capacity.Memory = "4KiB"
-	rootCfg.Boot.RuntimeRef = "file://runtime.bundle@sha256:" + strings.Repeat("a", 64)
+	rootCfg.Boot.Root.BaseRef = "file://" + filepath.Base(artifactPath) + "@sha256:" + strings.TrimPrefix(digest, "sha256:")
+	rootCfg.Boot.Root.Overlay = &SnapOverlayCfg{}
 	rootPath := writePublishSnapshot(t, t.TempDir(), rootCfg)
 	hostCfg := &config.SandboxConfig{}
-	hostCfg.Boot.Runtime = "file://runtime.bundle@location:platform"
+	hostCfg.Boot.Root.Base = "file://" + filepath.Base(artifactPath) + "@location:platform"
 	err := preflightLocatedRefs(context.Background(), Options{
 		SnapshotPath: rootPath,
 		HostCfg:      hostCfg,
 	})
 	if err == nil || !strings.Contains(err.Error(), `location "platform" is not configured`) {
 		t.Fatalf("host override preflight error = %v", err)
+	}
+}
+
+func TestPreflightSkipsBaseRefsReplacedByHostOverrides(t *testing.T) {
+	rootBase, rootDigest := writePublishArtifact(t, t.TempDir(), ".erofs", bytes.Repeat([]byte{0x71}, 4096))
+	diskBase, diskDigest := writePublishArtifact(t, t.TempDir(), ".erofs", bytes.Repeat([]byte{0x72}, 4096))
+	rootCfg := &SnapshotCfg{}
+	rootCfg.Resources.Capacity.Memory = "4KiB"
+	rootCfg.Boot.Root.BaseRef = "file://" + filepath.Base(rootBase) + "@sha256:" + strings.TrimPrefix(rootDigest, "sha256:") + "@location:missing-root"
+	rootCfg.Boot.Root.Overlay = &SnapOverlayCfg{}
+	rootCfg.Boot.Disks = []SnapDiskNode{{
+		BaseRef: "file://" + filepath.Base(diskBase) + "@sha256:" + strings.TrimPrefix(diskDigest, "sha256:") + "@location:missing-disk",
+		Overlay: &SnapOverlayCfg{},
+	}}
+	rootPath := writePublishSnapshot(t, t.TempDir(), rootCfg)
+	hostCfg := &config.SandboxConfig{}
+	hostCfg.Boot.Root.Base = "file://" + rootBase
+	hostCfg.Boot.Disks = []config.DiskConfig{{RootConfig: config.RootConfig{
+		Base:    "file://" + diskBase,
+		Overlay: &config.OverlayConfig{},
+	}}}
+
+	if err := preflightLocatedRefs(context.Background(), Options{
+		SnapshotPath: rootPath,
+		HostCfg:      hostCfg,
+	}); err != nil {
+		t.Fatalf("preflight with host base overrides: %v", err)
 	}
 }
 
@@ -357,6 +406,19 @@ func TestResolveLocalMergePathUsesRefLocations(t *testing.T) {
 		if got != tc.want {
 			t.Fatalf("resolveLocalMergePath(%q) = %q, want %q", tc.ref, got, tc.want)
 		}
+	}
+}
+
+func TestResolveAnyRefPreservesLocatedBase(t *testing.T) {
+	locationDir := t.TempDir()
+	path, digest := writePublishArtifact(t, locationDir, ".erofs", bytes.Repeat([]byte{0x73}, 4096))
+	ref := mustParseRef(t, "file://"+filepath.Base(path)+"@sha256:"+strings.TrimPrefix(digest, "sha256:")+"@location:shared")
+	got, err := resolveAnyRef("", ref, "/snapshots/root.snapshot", "boot.root.base", config.RefLocations{"shared": locationDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != ref.String() {
+		t.Fatalf("resolved located base = %q, want %q", got, ref.String())
 	}
 }
 

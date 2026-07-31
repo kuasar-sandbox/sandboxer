@@ -1123,7 +1123,7 @@ func (c *SandboxConfig) ValidateCold() error {
 	if c.Boot.Runtime == "" {
 		return errors.New("boot.runtime is required")
 	}
-	if err := requireFileAbs("boot.runtime", c.Boot.Runtime); err != nil {
+	if err := requireRuntimeFileAbs("boot.runtime", c.Boot.Runtime); err != nil {
 		return err
 	}
 
@@ -1249,7 +1249,7 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	}
 	// Reference formats (when provided).
 	if c.Boot.Runtime != "" {
-		if err := requireFileAbsOrLocated("boot.runtime", c.Boot.Runtime); err != nil {
+		if err := requireRuntimeFileAbs("boot.runtime", c.Boot.Runtime); err != nil {
 			return err
 		}
 	}
@@ -1456,13 +1456,16 @@ func requireFileAbs(field, uri string) error {
 	return nil
 }
 
-func requireFileAbsOrLocated(field, uri string) error {
+func requireRuntimeFileAbs(field, uri string) error {
 	ref, err := manifest.ParseRef(uri)
 	if err != nil || ref.Scheme != manifest.RefSchemeFile {
 		return fmt.Errorf("%s must be file://", field)
 	}
-	if ref.Location == "" && !filepath.IsAbs(ref.Path) {
-		return fmt.Errorf("%s file:// must be absolute or located (got %q)", field, uri)
+	if ref.Location != "" {
+		return fmt.Errorf("%s does not support named ref locations", field)
+	}
+	if !filepath.IsAbs(ref.Path) {
+		return fmt.Errorf("%s file:// must be absolute (got %q)", field, uri)
 	}
 	return nil
 }

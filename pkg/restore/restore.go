@@ -19,6 +19,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
@@ -164,26 +165,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		selfRef      string
 	)
 	if opts.SnapshotPath != "" {
-		fs, digest, err := openTarArtifact(opts.SnapshotPath)
+		fs, _, err := openSnapshotArtifact(ctx, opts)
 		if err != nil {
 			return -1, fmt.Errorf("open snapshot: %w", err)
-		}
-		if err := validateContentAddressedName(opts.SnapshotPath, digest); err != nil {
-			fs.Close()
-			return -1, fmt.Errorf("open snapshot: %w", err)
-		}
-		if opts.SnapshotRef != "" {
-			ref, err := manifest.ParseRef(opts.SnapshotRef)
-			if err != nil {
-				fs.Close()
-				return -1, fmt.Errorf("open snapshot: %w", err)
-			}
-			if ref.Digest != "" {
-				if err := matchDigest(digest, ref.Digest); err != nil {
-					fs.Close()
-					return -1, fmt.Errorf("open snapshot: %w", err)
-				}
-			}
 		}
 		defer fs.Close()
 		selfStream = fs
@@ -752,6 +736,10 @@ func openRefStream(ctx context.Context, raw string, opts Options) (fetch.Stream,
 		return nil, err
 	}
 	if ref.Scheme == manifest.RefSchemeFile {
+		if ref.Location != "" {
+			stream, _, err := sandbox.OpenDiskStream(ctx, ref.String(), opts.Fetcher, opts.RefLocations)
+			return stream, err
+		}
 		relativeDir := ""
 		if localSnapshotPath := opts.localSnapshotPath(); localSnapshotPath != "" {
 			relativeDir = filepath.Dir(localSnapshotPath)
@@ -785,6 +773,55 @@ func openRefStream(ctx context.Context, raw string, opts Options) (fetch.Stream,
 	return s, err
 }
 
+func openSnapshotArtifact(ctx context.Context, opts Options) (fetch.Stream, string, error) {
+	var ref manifest.Ref
+	if opts.SnapshotRef != "" {
+		parsed, err := manifest.ParseRef(opts.SnapshotRef)
+		if err != nil {
+			return nil, "", err
+		}
+		if parsed.Scheme != manifest.RefSchemeFile {
+			return nil, "", fmt.Errorf("snapshot path cannot use %s ref", parsed.Scheme)
+		}
+		ref = parsed
+	}
+	if ref.Location != "" {
+		resolved, err := opts.RefLocations.ResolveFile(ref, "")
+		if err != nil {
+			return nil, "", err
+		}
+		if filepath.Clean(resolved) != filepath.Clean(opts.SnapshotPath) {
+			return nil, "", fmt.Errorf("located root %s does not resolve to %s", ref.String(), opts.SnapshotPath)
+		}
+		stream, _, err := sandbox.OpenDiskStream(ctx, ref.String(), opts.Fetcher, opts.RefLocations)
+		if err != nil {
+			return nil, "", err
+		}
+		digester, ok := stream.(tarstream.Digester)
+		if !ok {
+			_ = stream.Close()
+			return nil, "", fmt.Errorf("snapshot %s has no declared digest", ref.String())
+		}
+		return stream, digester.Digest(), nil
+	}
+
+	stream, digest, err := openTarArtifact(opts.SnapshotPath)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := validateContentAddressedName(opts.SnapshotPath, digest); err != nil {
+		_ = stream.Close()
+		return nil, "", err
+	}
+	if ref.Digest != "" {
+		if err := matchDigest(digest, ref.Digest); err != nil {
+			_ = stream.Close()
+			return nil, "", err
+		}
+	}
+	return stream, digest, nil
+}
+
 func (o Options) localSnapshotPath() string {
 	if o.SnapshotRef == "" {
 		return o.SnapshotPath
@@ -815,41 +852,9 @@ func resolveLocalMergePath(raw, snapshotPath string, locations config.RefLocatio
 func preflightLocatedRefs(ctx context.Context, opts Options) error {
 	var stream fetch.Stream
 	if opts.SnapshotPath != "" {
-		opened, digest, err := openTarArtifact(opts.SnapshotPath)
+		opened, _, err := openSnapshotArtifact(ctx, opts)
 		if err != nil {
 			return err
-		}
-		if err := validateContentAddressedName(opts.SnapshotPath, digest); err != nil {
-			opened.Close()
-			return err
-		}
-		if opts.SnapshotRef != "" {
-			ref, err := manifest.ParseRef(opts.SnapshotRef)
-			if err != nil {
-				opened.Close()
-				return err
-			}
-			if ref.Location != "" {
-				if filepath.Base(opts.SnapshotPath) != ref.Path {
-					opened.Close()
-					return fmt.Errorf("located root %s does not resolve to %s", ref.String(), opts.SnapshotPath)
-				}
-				info, err := os.Lstat(opts.SnapshotPath)
-				if err != nil {
-					opened.Close()
-					return err
-				}
-				if !info.Mode().IsRegular() {
-					opened.Close()
-					return fmt.Errorf("located root %s: location target is not a regular file", ref.String())
-				}
-			}
-			if ref.Digest != "" {
-				if err := matchDigest(digest, ref.Digest); err != nil {
-					opened.Close()
-					return err
-				}
-			}
 		}
 		stream = opened
 	} else {
@@ -864,20 +869,28 @@ func preflightLocatedRefs(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
-	if err := preflightHostLocatedOverrides(root, opts); err != nil {
+	if root.Boot.RuntimeRef != "" {
+		if _, err := parseSnapshotRuntimeRef(root.Boot.RuntimeRef); err != nil {
+			return fmt.Errorf("snapshot.cfg.runtime_ref: %w", err)
+		}
+	}
+	overrides, err := preflightHostBaseOverrides(root, opts)
+	if err != nil {
 		return err
 	}
-	pending := []*SnapshotCfg{root}
+	type pendingSnapshot struct {
+		cfg       *SnapshotCfg
+		overrides *preflightBaseOverrides
+	}
+	pending := []pendingSnapshot{{cfg: root, overrides: &overrides}}
 	seenParents := map[string]bool{}
 	for len(pending) > 0 {
-		snap := pending[0]
+		item := pending[0]
 		pending = pending[1:]
-		if err := preflightLocatedRef(snap.Boot.RuntimeRef, opts, readRuntimeBundleDigest); err != nil {
-			return err
-		}
-		refs := snapshotArtifactRefs(snap)
+		snap := item.cfg
+		refs := snapshotArtifactRefs(snap, item.overrides)
 		for _, raw := range refs {
-			if err := preflightLocatedRef(raw, opts, readTarArtifactDigest); err != nil {
+			if err := preflightLocatedRef(ctx, raw, opts); err != nil {
 				return err
 			}
 		}
@@ -901,47 +914,31 @@ func preflightLocatedRefs(ctx context.Context, opts Options) error {
 			if closeErr != nil {
 				return closeErr
 			}
-			pending = append(pending, parentCfg)
+			pending = append(pending, pendingSnapshot{cfg: parentCfg})
 		}
 	}
 	return nil
 }
 
-func preflightHostLocatedOverrides(snap *SnapshotCfg, opts Options) error {
+type preflightBaseOverrides struct {
+	root  bool
+	disks map[int]bool
+}
+
+func preflightHostBaseOverrides(snap *SnapshotCfg, opts Options) (preflightBaseOverrides, error) {
+	var overrides preflightBaseOverrides
 	if opts.HostCfg == nil {
-		return nil
+		return overrides, nil
 	}
-	located := func(raw string) (bool, error) {
-		if raw == "" {
-			return false, nil
-		}
-		ref, err := manifest.ParseRef(raw)
-		if err != nil {
-			return false, err
-		}
-		return ref.Scheme == manifest.RefSchemeFile && ref.Location != "", nil
-	}
-	if ok, err := located(opts.HostCfg.Boot.Runtime); err != nil {
-		return fmt.Errorf("boot.runtime: %w", err)
-	} else if ok {
-		snapRef, err := manifest.ParseRef(snap.Boot.RuntimeRef)
-		if err != nil {
-			return fmt.Errorf("snapshot.cfg.runtime_ref: %w", err)
-		}
-		if _, err := resolveBootFileRef(opts.HostCfg.Boot.Runtime, snapRef, opts.localSnapshotPath(), "boot.runtime", readRuntimeBundleDigest, opts.RefLocations); err != nil {
-			return err
-		}
-	}
-	if ok, err := located(opts.HostCfg.Boot.Root.Base); err != nil {
-		return fmt.Errorf("boot.root.base: %w", err)
-	} else if ok && !snap.SingleDisk() {
+	if opts.HostCfg.Boot.Root.Base != "" && !snap.SingleDisk() {
 		snapRef, err := manifest.ParseRef(snap.Boot.Root.BaseRef)
 		if err != nil {
-			return fmt.Errorf("snapshot.cfg.base_ref: %w", err)
+			return overrides, fmt.Errorf("snapshot.cfg.base_ref: %w", err)
 		}
 		if _, err := resolveAnyRef(opts.HostCfg.Boot.Root.Base, snapRef, opts.localSnapshotPath(), "boot.root.base", opts.RefLocations); err != nil {
-			return err
+			return overrides, err
 		}
+		overrides.root = true
 	}
 	limit := len(opts.HostCfg.Boot.Disks)
 	if len(snap.Boot.Disks) < limit {
@@ -949,26 +946,29 @@ func preflightHostLocatedOverrides(snap *SnapshotCfg, opts Options) error {
 	}
 	for i := 0; i < limit; i++ {
 		hostRef := opts.HostCfg.Boot.Disks[i].Base
-		ok, err := located(hostRef)
-		if err != nil {
-			return fmt.Errorf("boot.disks[%d].base: %w", i, err)
-		}
-		if !ok || snap.Boot.Disks[i].single() {
+		if hostRef == "" || snap.Boot.Disks[i].single() {
 			continue
 		}
 		snapRef, err := manifest.ParseRef(snap.Boot.Disks[i].BaseRef)
 		if err != nil {
-			return fmt.Errorf("snapshot.cfg.boot.disks[%d].base_ref: %w", i, err)
+			return overrides, fmt.Errorf("snapshot.cfg.boot.disks[%d].base_ref: %w", i, err)
 		}
 		if _, err := resolveAnyRef(hostRef, snapRef, opts.localSnapshotPath(), fmt.Sprintf("boot.disks[%d].base", i), opts.RefLocations); err != nil {
-			return err
+			return overrides, err
 		}
+		if overrides.disks == nil {
+			overrides.disks = make(map[int]bool)
+		}
+		overrides.disks[i] = true
 	}
-	return nil
+	return overrides, nil
 }
 
-func snapshotArtifactRefs(snap *SnapshotCfg) []string {
-	refs := []string{snap.Boot.Root.BaseRef, snap.Boot.Root.Base}
+func snapshotArtifactRefs(snap *SnapshotCfg, overrides *preflightBaseOverrides) []string {
+	refs := []string{snap.Boot.Root.Base}
+	if overrides == nil || !overrides.root {
+		refs = append(refs, snap.Boot.Root.BaseRef)
+	}
 	refs = append(refs, snap.Boot.Root.BaseFromRefs...)
 	if snap.Boot.Root.Overlay != nil {
 		refs = append(refs, snap.Boot.Root.Overlay.Base)
@@ -976,7 +976,10 @@ func snapshotArtifactRefs(snap *SnapshotCfg) []string {
 	}
 	for i := range snap.Boot.Disks {
 		n := &snap.Boot.Disks[i]
-		refs = append(refs, n.BaseRef, n.Base)
+		refs = append(refs, n.Base)
+		if overrides == nil || !overrides.disks[i] {
+			refs = append(refs, n.BaseRef)
+		}
 		refs = append(refs, n.BaseFromRefs...)
 		if n.Overlay != nil {
 			refs = append(refs, n.Overlay.Base)
@@ -986,7 +989,7 @@ func snapshotArtifactRefs(snap *SnapshotCfg) []string {
 	return refs
 }
 
-func preflightLocatedRef(raw string, opts Options, readDigest func(string) (string, error)) error {
+func preflightLocatedRef(ctx context.Context, raw string, opts Options) error {
 	if raw == "" {
 		return nil
 	}
@@ -997,30 +1000,11 @@ func preflightLocatedRef(raw string, opts Options, readDigest func(string) (stri
 	if ref.Scheme != manifest.RefSchemeFile || ref.Location == "" {
 		return nil
 	}
-	path, err := opts.RefLocations.ResolveFile(ref, "")
-	if err != nil {
-		return err
-	}
-	info, err := os.Lstat(path)
+	stream, _, err := sandbox.OpenDiskStream(ctx, ref.String(), opts.Fetcher, opts.RefLocations)
 	if err != nil {
 		return fmt.Errorf("located ref %s: %w", ref.String(), err)
 	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("located ref %s: location target is not a regular file", ref.String())
-	}
-	digest, err := readDigest(path)
-	if err != nil {
-		return fmt.Errorf("located ref %s: %w", ref.String(), err)
-	}
-	if ref.Digest != "" {
-		if err := matchDigest(digest, ref.Digest); err != nil {
-			return fmt.Errorf("located ref %s: %w", ref.String(), err)
-		}
-	}
-	if err := validateContentAddressedName(path, digest); err != nil {
-		return fmt.Errorf("located ref %s: %w", ref.String(), err)
-	}
-	return nil
+	return stream.Close()
 }
 
 // fileSnapshotRef returns the content-addressed ref for a file-mode snapshot

@@ -1,13 +1,16 @@
 package restore
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"gopkg.in/yaml.v3"
 )
 
@@ -126,12 +129,18 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 	}
 
 	// 3. boot.runtime: file:// only (cold + restore alike).
-	snapRuntimeRef, err := manifest.ParseRef(snap.Boot.RuntimeRef)
+	snapRuntimeRef, err := parseSnapshotRuntimeRef(snap.Boot.RuntimeRef)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot.cfg.runtime_ref: %w", err)
 	}
-	if snapRuntimeRef.Scheme != "file" {
-		return nil, fmt.Errorf("snapshot.cfg.runtime_ref: scheme %q unexpected (boot.runtime is file:// only)", snapRuntimeRef.Scheme)
+	if host.Boot.Runtime != "" {
+		hostRuntimeRef, err := manifest.ParseRef(host.Boot.Runtime)
+		if err != nil || hostRuntimeRef.Scheme != manifest.RefSchemeFile {
+			return nil, fmt.Errorf("boot.runtime: must be file://")
+		}
+		if hostRuntimeRef.Location != "" {
+			return nil, fmt.Errorf("boot.runtime: named ref locations are not supported")
+		}
 	}
 	resolvedRuntime, err := resolveBootFileRef(host.Boot.Runtime, snapRuntimeRef, snapshotPath, "boot.runtime", readRuntimeBundleDigest, locations)
 	if err != nil {
@@ -238,8 +247,11 @@ func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fiel
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", fieldName, err)
 		}
-		if err := validateFileRef(abs, snapRef.Digest, readDigest); err != nil {
+		if err := validateResolvedFileRef(abs, snapRef, snapRef.Digest, readDigest, locations); err != nil {
 			return "", fmt.Errorf("%s: auto-resolved %s: %w", fieldName, abs, err)
+		}
+		if snapRef.Location != "" {
+			return snapRef.String(), nil
 		}
 		return "file://" + abs, nil
 	}
@@ -258,13 +270,16 @@ func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fiel
 	if filepath.Base(hostPath) != snapRef.Path {
 		return "", fmt.Errorf("%s: basename mismatch with snapshot.cfg (host=%q, snap=%q)", fieldName, filepath.Base(hostPath), snapRef.Path)
 	}
-	if err := validateFileRef(hostPath, snapRef.Digest, readDigest); err != nil {
+	if err := validateResolvedFileRef(hostPath, hostRef, snapRef.Digest, readDigest, locations); err != nil {
 		return "", fmt.Errorf("%s: digest mismatch: %w", fieldName, err)
 	}
 	if hostRef.Digest != "" {
-		if err := validateFileRef(hostPath, hostRef.Digest, readDigest); err != nil {
+		if err := validateResolvedFileRef(hostPath, hostRef, hostRef.Digest, readDigest, locations); err != nil {
 			return "", fmt.Errorf("%s: host ref digest mismatch: %w", fieldName, err)
 		}
+	}
+	if hostRef.Location != "" {
+		return hostRef.String(), nil
 	}
 	return "file://" + hostPath, nil
 }
@@ -292,10 +307,42 @@ func resolveAnyRef(hostURL string, snapRef manifest.Ref, snapshotPath, fieldName
 	}
 }
 
-func validateFileRef(path, want string, readDigest func(string) (string, error)) error {
-	got, err := readDigest(path)
+func validateResolvedFileRef(path string, ref manifest.Ref, want string, readDigest func(string) (string, error), locations config.RefLocations) error {
+	var (
+		got string
+		err error
+	)
+	if ref.Location == "" {
+		got, err = readDigest(path)
+	} else {
+		stream, _, openErr := sandbox.OpenDiskStream(context.Background(), ref.String(), nil, locations)
+		if openErr != nil {
+			return openErr
+		}
+		digester, ok := stream.(tarstream.Digester)
+		if !ok {
+			_ = stream.Close()
+			return fmt.Errorf("file artifact %s has no declared digest", path)
+		}
+		got = digester.Digest()
+		err = stream.Close()
+	}
 	if err != nil {
 		return err
 	}
 	return matchDigest(got, want)
+}
+
+func parseSnapshotRuntimeRef(raw string) (manifest.Ref, error) {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return manifest.Ref{}, err
+	}
+	if ref.Scheme != manifest.RefSchemeFile {
+		return manifest.Ref{}, fmt.Errorf("scheme %q unexpected (boot.runtime is file:// only)", ref.Scheme)
+	}
+	if ref.Location != "" {
+		return manifest.Ref{}, fmt.Errorf("named ref locations are not supported")
+	}
+	return ref, nil
 }

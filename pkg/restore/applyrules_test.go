@@ -338,6 +338,15 @@ func TestApplyRules_SchemeMismatchRejected(t *testing.T) {
 	}
 }
 
+func TestApplyRules_RejectsLocatedRuntimeRef(t *testing.T) {
+	snap := &SnapshotCfg{}
+	snap.Boot.RuntimeRef = "file://runtime.bundle@sha256:" + strings.Repeat("a", 64) + "@location:platform"
+	host := &config.SandboxConfig{}
+	if _, err := applyRules(host, snap, "/snapshots/root.snapshot"); err == nil || !strings.Contains(err.Error(), "named ref locations are not supported") {
+		t.Fatalf("located runtime_ref error = %v", err)
+	}
+}
+
 func TestApplyRules_ManifestBaseMatchesKey(t *testing.T) {
 	dir := t.TempDir()
 	rtPath := filepath.Join(dir, "runtime.erofs")

@@ -1205,24 +1205,20 @@ func buildDiskRef(uri string, locations config.RefLocations) (string, error) {
 	if ref.Scheme == manifest.RefSchemeManifest {
 		return ref.String(), nil
 	}
-	path, err := locations.ResolveFile(ref, "")
-	if err != nil {
-		return "", err
-	}
-	stream, err := fetch.OpenTarStream(path)
+	stream, _, err := OpenDiskStream(context.Background(), uri, nil, locations)
 	if err != nil {
 		return "", err
 	}
 	defer stream.Close()
 	d, ok := stream.(tarstream.Digester)
 	if !ok {
-		return "", fmt.Errorf("file artifact %s has no declared digest", path)
+		return "", fmt.Errorf("file artifact %s has no declared digest", ref.Path)
 	}
 	digest := strings.TrimPrefix(d.Digest(), "sha256:")
 	if ref.Digest != "" && ref.Digest != digest {
-		return "", fmt.Errorf("file artifact %s digest mismatch: got %s, want %s", path, digest, ref.Digest)
+		return "", fmt.Errorf("file artifact %s digest mismatch: got %s, want %s", ref.Path, digest, ref.Digest)
 	}
-	ref.Path = filepath.Base(path)
+	ref.Path = filepath.Base(ref.Path)
 	ref.Digest = digest
 	return ref.String(), nil
 }
