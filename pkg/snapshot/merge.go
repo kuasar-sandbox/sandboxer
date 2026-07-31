@@ -1,11 +1,14 @@
 package snapshot
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -27,8 +30,8 @@ func (l *tarLayer) Close() error { return l.f.Close() }
 // plus the holes over [0,size) — from the tar envelope's map, clipped to the
 // layer size (a snapshot's memory section = MemfdSize; an overlay's = the
 // diff size). size must not exceed the entry's logical size.
-func openMergeBase(path string, size int64) (*tarLayer, []sparse.Extent, error) {
-	f, err := os.Open(path)
+func openMergeBase(path string, size int64, noFollow bool) (*tarLayer, []sparse.Extent, error) {
+	f, err := openMergeBaseFile(path, noFollow)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -48,11 +51,13 @@ func openMergeBase(path string, size int64) (*tarLayer, []sparse.Extent, error) 
 		return nil, nil, fmt.Errorf("merge base %s: tarstream artifact missing digest marker", path)
 	}
 	hexDigest := strings.TrimPrefix(d.Digest(), "sha256:")
-	real := path
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		real = resolved
+	contentPath := path
+	if !noFollow {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			contentPath = resolved
+		}
 	}
-	stem, _, hasExt := strings.Cut(filepath.Base(real), ".")
+	stem, _, hasExt := strings.Cut(filepath.Base(contentPath), ".")
 	if len(hexDigest) != 64 || !hasExt || stem != hexDigest {
 		f.Close()
 		return nil, nil, fmt.Errorf("merge base %s: basename does not match digest marker", path)
@@ -67,6 +72,34 @@ func openMergeBase(path string, size int64) (*tarLayer, []sparse.Extent, error) 
 		return nil, nil, fmt.Errorf("merge base %s: entry size %d < expected layer size %d", path, v.Size(), size)
 	}
 	return &tarLayer{f: f, ReadSeeker: v}, clipExtents(v.Holes(), uint64(size)), nil
+}
+
+func openMergeBaseFile(path string, noFollow bool) (*os.File, error) {
+	if !noFollow {
+		return os.Open(path)
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, unix.ELOOP) {
+			return nil, fmt.Errorf("merge base %s is a symlink", path)
+		}
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("merge base %s: invalid file descriptor", path)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		_ = file.Close()
+		return nil, fmt.Errorf("merge base %s is not a regular file", path)
+	}
+	return file, nil
 }
 
 // clipExtents intersects sorted, disjoint extents with [0, size).

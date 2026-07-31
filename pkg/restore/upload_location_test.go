@@ -417,19 +417,23 @@ func TestResolveLocalMergePathUsesRefLocations(t *testing.T) {
 	snapshotPath := "/snapshots/root.snapshot"
 	locations := config.RefLocations{"shared": "/shared/location"}
 	for _, tc := range []struct {
-		ref  string
-		want string
+		ref          string
+		want         string
+		wantNoFollow bool
 	}{
-		{"file://layer.overlay", "/snapshots/layer.overlay"},
-		{"file://layer.overlay@location:shared", "/shared/location/layer.overlay"},
-		{"manifest://" + strings.Repeat("a", 64), ""},
+		{"file://layer.overlay", "/snapshots/layer.overlay", false},
+		{"file://layer.overlay@location:shared", "/shared/location/layer.overlay", true},
+		{"manifest://" + strings.Repeat("a", 64), "", false},
 	} {
-		got, err := resolveLocalMergePath(tc.ref, snapshotPath, locations)
+		got, noFollow, err := resolveLocalMergePath(tc.ref, snapshotPath, locations)
 		if err != nil {
 			t.Fatalf("resolveLocalMergePath(%q): %v", tc.ref, err)
 		}
 		if got != tc.want {
 			t.Fatalf("resolveLocalMergePath(%q) = %q, want %q", tc.ref, got, tc.want)
+		}
+		if noFollow != tc.wantNoFollow {
+			t.Fatalf("resolveLocalMergePath(%q) noFollow = %v, want %v", tc.ref, noFollow, tc.wantNoFollow)
 		}
 	}
 }

@@ -270,11 +270,12 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		if abs, err := filepath.Abs(localSnapshotPath); err == nil {
 			snapCfg.SnapshotProvenance.ParentSnapshotPath = abs
 		}
-		path, err := resolveLocalMergePath(parentDiskBase, localSnapshotPath, opts.RefLocations)
+		path, noFollow, err := resolveLocalMergePath(parentDiskBase, localSnapshotPath, opts.RefLocations)
 		if err != nil {
 			return -1, fmt.Errorf("resolve parent root layer: %w", err)
 		}
 		snapCfg.SnapshotProvenance.ParentOverlayPath = path
+		snapCfg.SnapshotProvenance.ParentOverlayNoFollow = noFollow
 	}
 	// Per-data-disk provenance (boot.disks[] order): the data-disk analogue of
 	// the root fields above, so a snapshot by this restored run extends each
@@ -289,11 +290,12 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			}
 			pd[i] = config.DiskProvenance{OverlayBase: top, BaseFromRefs: chain}
 			if localSnapshotPath := opts.localSnapshotPath(); localSnapshotPath != "" {
-				path, err := resolveLocalMergePath(top, localSnapshotPath, opts.RefLocations)
+				path, noFollow, err := resolveLocalMergePath(top, localSnapshotPath, opts.RefLocations)
 				if err != nil {
 					return -1, fmt.Errorf("resolve parent disk %d layer: %w", i, err)
 				}
 				pd[i].OverlayPath = path
+				pd[i].OverlayNoFollow = noFollow
 			}
 		}
 		snapCfg.SnapshotProvenance.ParentDisks = pd
@@ -816,18 +818,19 @@ func (o Options) localSnapshotPath() string {
 	return ""
 }
 
-func resolveLocalMergePath(raw, snapshotPath string, locations config.RefLocations) (string, error) {
+func resolveLocalMergePath(raw, snapshotPath string, locations config.RefLocations) (string, bool, error) {
 	if raw == "" {
-		return "", nil
+		return "", false, nil
 	}
 	ref, err := manifest.ParseRef(raw)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if ref.Scheme != manifest.RefSchemeFile {
-		return "", nil
+		return "", false, nil
 	}
-	return locations.ResolveFile(ref, filepath.Dir(snapshotPath))
+	path, err := locations.ResolveFile(ref, filepath.Dir(snapshotPath))
+	return path, ref.Location != "", err
 }
 
 // preflightLocatedRefs walks snapshot.cfg plus its memory parents and verifies

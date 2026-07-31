@@ -895,12 +895,16 @@ func handleSnapshotRequest(
 		dd := snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff}
 		if localParent {
 			mergeBase := ""
+			mergeBaseNoFollow := false
 			if i == 0 {
 				mergeBase = prov.ParentOverlayPath // root
+				mergeBaseNoFollow = prov.ParentOverlayNoFollow
 			} else if j := i - 1; j < len(prov.ParentDisks) {
 				mergeBase = prov.ParentDisks[j].OverlayPath
+				mergeBaseNoFollow = prov.ParentDisks[j].OverlayNoFollow
 			}
 			dd.MergeBase = mergeBase
+			dd.MergeBaseNoFollow = mergeBaseNoFollow
 		}
 		diffs[i] = dd
 	}
