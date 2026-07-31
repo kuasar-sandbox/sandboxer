@@ -28,7 +28,8 @@ func (l RefLocations) Set(spec string) error {
 	if err != nil {
 		return fmt.Errorf("ref location %q: %w", spec, err)
 	}
-	if u.Scheme != "file" || u.Host != "" || u.Path == "" || !filepath.IsAbs(u.Path) || u.RawQuery != "" || u.Fragment != "" {
+	if u.Scheme != "file" || u.Host != "" || u.Path == "" || !filepath.IsAbs(u.Path) ||
+		u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("ref location %q: URI must be file:///absolute/path without host, query, or fragment", spec)
 	}
 	if _, exists := l[name]; exists {

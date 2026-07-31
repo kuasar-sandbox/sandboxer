@@ -818,6 +818,10 @@ func preflightLocatedRefs(ctx context.Context, opts Options) error {
 				return err
 			}
 			if ref.Location != "" {
+				if filepath.Base(opts.SnapshotPath) != ref.Path {
+					opened.Close()
+					return fmt.Errorf("located root %s does not resolve to %s", ref.String(), opts.SnapshotPath)
+				}
 				info, err := os.Lstat(opts.SnapshotPath)
 				if err != nil {
 					opened.Close()

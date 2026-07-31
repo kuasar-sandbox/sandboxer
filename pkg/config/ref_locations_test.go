@@ -44,6 +44,7 @@ func TestRefLocationsRejectInvalid(t *testing.T) {
 		".bad=file:///tmp/x",
 		"x=/tmp/x",
 		"x=file://host/tmp/x",
+		"x=file://user@/tmp/x",
 		"x=file://relative",
 		"x=file:///tmp/x?q=1",
 	} {
