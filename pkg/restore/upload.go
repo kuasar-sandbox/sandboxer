@@ -35,6 +35,7 @@ func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config
 	defer ing.Close()
 	p := newSnapshotPublisher(ctx, logf)
 	p.ing = ing
+	p.manifestConfig = mcfg
 	return p.publishSnapshot(snapshotPath)
 }
 
@@ -59,13 +60,14 @@ func PublishLocalToLocation(ctx context.Context, snapshotPath, location, directo
 }
 
 type snapshotPublisher struct {
-	ctx       context.Context
-	ing       ingest.Ingester
-	location  string
-	directory string
-	logf      func(string, ...any)
-	done      map[string]string
-	visiting  map[string]bool
+	ctx            context.Context
+	ing            ingest.Ingester
+	manifestConfig *manifest.Config
+	location       string
+	directory      string
+	logf           func(string, ...any)
+	done           map[string]string
+	visiting       map[string]bool
 }
 
 func newSnapshotPublisher(ctx context.Context, logf func(string, ...any)) *snapshotPublisher {
@@ -253,6 +255,15 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 	if err != nil {
 		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
 	}
+	if ref.Scheme == manifest.RefSchemeManifest && p.manifestConfig != nil {
+		key, err := manifest.ParseHexKey(ref.Path)
+		if err != nil {
+			return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
+		}
+		if err := p.manifestConfig.CheckManifest(p.ctx, key); err != nil {
+			return "", fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
+		}
+	}
 	if ref.Portable() {
 		return ref.String(), nil
 	}
@@ -293,9 +304,6 @@ func (p *snapshotPublisher) publishLeaf(label, path, wantDigest string) (string,
 		return "manifest://" + key, nil
 	}
 	ext := filepath.Ext(path)
-	if ext != ".snapshot" && ext != ".overlay" && ext != ".image" {
-		return "", fmt.Errorf("upload-snapshot: %s: unsupported file suffix %q", label, ext)
-	}
 	return p.publishLocationFile(path, ext, digest, wantDigest != "")
 }
 

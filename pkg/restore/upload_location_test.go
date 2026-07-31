@@ -22,13 +22,14 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRepairsPartialFile(t *testing
 	targetDir := t.TempDir()
 
 	overlayPath, overlayDigest := writePublishArtifact(t, sourceDir, ".overlay", bytes.Repeat([]byte{0xA5}, 4096))
+	basePath, baseDigest := writePublishArtifact(t, sourceDir, ".erofs", bytes.Repeat([]byte{0x5A}, 4096))
 	manifestKey := strings.Repeat("b", 64)
 	oldLocated := "file://old.overlay@location:old"
 	snapCfg := &SnapshotCfg{FromRefs: []string{"manifest://" + manifestKey}}
 	snapCfg.Resources.Capacity.CPU = 1
 	snapCfg.Resources.Capacity.Memory = "4KiB"
 	snapCfg.Boot.RuntimeRef = "file://runtime.bundle@sha256:" + strings.Repeat("c", 64)
-	snapCfg.Boot.Root.BaseRef = "manifest://" + strings.Repeat("d", 64)
+	snapCfg.Boot.Root.BaseRef = "file://" + filepath.Base(basePath) + "@sha256:" + strings.TrimPrefix(baseDigest, "sha256:")
 	snapCfg.Boot.Root.Overlay = &SnapOverlayCfg{
 		Base:         "file://" + filepath.Base(overlayPath),
 		BaseFromRefs: []string{oldLocated},
@@ -50,6 +51,10 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRepairsPartialFile(t *testing
 	if _, err := os.Stat(publishedOverlay); err != nil {
 		t.Fatalf("published overlay: %v", err)
 	}
+	publishedBase := filepath.Join(targetDir, strings.TrimPrefix(baseDigest, "sha256:")+".erofs")
+	if _, err := os.Stat(publishedBase); err != nil {
+		t.Fatalf("published EROFS base: %v", err)
+	}
 
 	rootStream, _, err := openTarArtifact(filepath.Join(targetDir, parsedRoot.Path))
 	if err != nil {
@@ -63,6 +68,10 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRepairsPartialFile(t *testing
 	wantOverlayRef := "file://" + filepath.Base(publishedOverlay) + "@location:shared"
 	if publishedCfg.Boot.Root.Overlay.Base != wantOverlayRef {
 		t.Fatalf("overlay ref = %q, want %q", publishedCfg.Boot.Root.Overlay.Base, wantOverlayRef)
+	}
+	wantBaseRef := "file://" + filepath.Base(publishedBase) + "@sha256:" + strings.TrimPrefix(baseDigest, "sha256:") + "@location:shared"
+	if publishedCfg.Boot.Root.BaseRef != wantBaseRef {
+		t.Fatalf("base ref = %q, want %q", publishedCfg.Boot.Root.BaseRef, wantBaseRef)
 	}
 	if publishedCfg.Boot.Root.Overlay.BaseFromRefs[0] != oldLocated {
 		t.Fatalf("existing located ref changed: %v", publishedCfg.Boot.Root.Overlay.BaseFromRefs)
@@ -83,6 +92,16 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRepairsPartialFile(t *testing
 	}
 	if err := verifyArtifactFile(publishedOverlay, overlayDigest, 4096); err != nil {
 		t.Fatalf("partial file was not repaired: %v", err)
+	}
+}
+
+func TestSnapshotPublisherChecksPreservedManifestRefs(t *testing.T) {
+	p := newSnapshotPublisher(context.Background(), nil)
+	p.manifestConfig = &manifest.Config{}
+	ref := "manifest://" + strings.Repeat("a", 64)
+	_, err := p.publishRef("parent", ref, "", false)
+	if err == nil || !strings.Contains(err.Error(), "cache.endpoint or store.endpoint required") {
+		t.Fatalf("publishRef error = %v, want manifest backend check", err)
 	}
 }
 
