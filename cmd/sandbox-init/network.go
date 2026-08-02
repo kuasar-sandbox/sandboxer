@@ -23,7 +23,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"unsafe"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
@@ -109,24 +108,20 @@ func applyNetworkMode(spec *proto.NetworkSpec, replace bool) error {
 		return fmt.Errorf("netlink bind: %w", err)
 	}
 
-	seq := uint32(1)
+	if replace {
+		return applyNetworkRestore(fd, iface, ifindex, family, ip, prefixLen, spec)
+	}
 
+	// cold start: sequential, additive
+	seq := uint32(1)
 	if err := nlSendLinkUp(fd, seq, ifindex, spec.MTU); err != nil {
 		return fmt.Errorf("link up %s: %w", iface, err)
 	}
 	seq++
-
-	if replace {
-		if err := flushAddrs(fd, &seq, ifindex, family); err != nil {
-			return fmt.Errorf("flush addrs on %s: %w", iface, err)
-		}
-	}
-
-	if err := nlSendAddrAdd(fd, seq, ifindex, family, ip, prefixLen, replace); err != nil {
+	if err := nlSendAddrAdd(fd, seq, ifindex, family, ip, prefixLen, false); err != nil {
 		return fmt.Errorf("addr add %s on %s: %w", spec.IPCIDR, iface, err)
 	}
 	seq++
-
 	if spec.Nexthop != "" {
 		gw := net.ParseIP(spec.Nexthop)
 		if gw == nil {
@@ -136,11 +131,103 @@ func applyNetworkMode(spec *proto.NetworkSpec, replace bool) error {
 		if gw.To4() == nil {
 			gwFamily = unix.AF_INET6
 		}
-		if err := nlSendDefaultRoute(fd, seq, ifindex, gwFamily, gw, replace); err != nil {
+		if err := nlSendDefaultRoute(fd, seq, ifindex, gwFamily, gw, false); err != nil {
 			return fmt.Errorf("default route via %s: %w", spec.Nexthop, err)
 		}
 	}
 	return nil
+}
+
+// applyNetworkRestore is the optimized restore path. On restore the interface
+// is already up (from snapshot) and may already carry the snapshot's old IP.
+// Optimizations vs the naive sequential flush+replace:
+//   - Skip RTM_NEWLINK when the link is already up AND the MTU matches.
+//   - Dump existing addresses once; if the target IP/prefix is already
+//     present, skip RTM_NEWADDR entirely (no change needed).
+//   - Batch all remaining messages (DELADDR for stale addresses + NEWADDR +
+//     NEWROUTE) into a single sendto + one ACK-drain loop, instead of one
+//     send/recv round-trip per message.
+func applyNetworkRestore(fd int, iface string, ifindex int32, family int, ip net.IP, prefix int, spec *proto.NetworkSpec) error {
+	// 1. Skip link-up if already up (and MTU matches when specified).
+	if !isLinkUp(iface) || (spec.MTU > 0 && readMTU(iface) != spec.MTU) {
+		if err := nlSendLinkUp(fd, 1, ifindex, spec.MTU); err != nil {
+			return fmt.Errorf("link up %s: %w", iface, err)
+		}
+	}
+
+	// 2. Dump existing global-scope addresses to decide what to flush/skip.
+	seq := uint32(2) // seq=1 used by linkup (if sent); dump starts at 2
+	existing, err := nlDumpAddrs(fd, seq, ifindex, family)
+	seq++
+	if err != nil {
+		return fmt.Errorf("dump addrs on %s: %w", iface, err)
+	}
+	// 3. Build one wire-level change batch: stale address deletions first,
+	// followed by the target address and default route. Netlink can still
+	// partially apply a batch, so every ACK is drained and any failure aborts
+	// restore rather than allowing a clone to retain its old identity.
+	var changeBatch []byte
+	nChanges := 0
+	targetExists := false
+	for _, a := range existing {
+		if a.ip.Equal(ip) && a.prefix == prefix {
+			targetExists = true
+			continue // keep — already the target
+		}
+		changeBatch = nlAppendMsg(changeBatch, unix.RTM_DELADDR, 0, seq, buildAddrBody(ifindex, family, a.prefix, a.ip))
+		seq++
+		nChanges++
+	}
+
+	// 4. Append NEWADDR + NEWROUTE to the same sendto batch.
+	if !targetExists {
+		changeBatch = nlAppendMsg(changeBatch, unix.RTM_NEWADDR, addFlags(true), seq, buildAddrBody(ifindex, family, prefix, ip))
+		seq++
+		nChanges++
+	}
+	if spec.Nexthop != "" {
+		gw := net.ParseIP(spec.Nexthop)
+		if gw == nil {
+			return fmt.Errorf("parse nexthop %q: invalid IP", spec.Nexthop)
+		}
+		gwFamily := unix.AF_INET
+		if gw.To4() == nil {
+			gwFamily = unix.AF_INET6
+		}
+		changeBatch = nlAppendMsg(changeBatch, unix.RTM_NEWROUTE, addFlags(true), seq, buildRouteBody(ifindex, gwFamily, gw))
+		seq++
+		nChanges++
+	}
+	if err := nlSendBatch(fd, changeBatch, nChanges); err != nil {
+		return fmt.Errorf("network change batch on %s: %w", iface, err)
+	}
+	return nil
+}
+
+// isLinkUp reads /sys/class/net/<iface>/flags and returns true iff IFF_UP set.
+func isLinkUp(iface string) bool {
+	data, err := os.ReadFile("/sys/class/net/" + iface + "/flags")
+	if err != nil {
+		return false
+	}
+	flags, err := strconv.ParseInt(strings.TrimSpace(string(data)), 0, 64)
+	if err != nil {
+		return false
+	}
+	return flags&unix.IFF_UP != 0
+}
+
+// readMTU reads /sys/class/net/<iface>/mtu.
+func readMTU(iface string) int {
+	data, err := os.ReadFile("/sys/class/net/" + iface + "/mtu")
+	if err != nil {
+		return 0
+	}
+	mtu, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0
+	}
+	return mtu
 }
 
 // readIfindex returns the kernel-assigned interface index for name via
@@ -176,48 +263,106 @@ func nlAttr(buf []byte, attrType uint16, value []byte) []byte {
 	return append(buf, a...)
 }
 
-// nlSend sends a single message with NLM_F_REQUEST|NLM_F_ACK and waits
-// for the kernel ack (NLMSG_ERROR with err==0).
+// nlSend sends a single message with NLM_F_REQUEST|NLM_F_ACK and waits for
+// the kernel ack (NLMSG_ERROR with err==0). It delegates to nlSendBatch with
+// a one-message buffer, so the single- and batched-send paths share the same
+// ACK-draining logic.
 func nlSend(fd int, msgType uint16, flags uint16, seq uint32, body []byte) error {
+	buf := nlAppendMsg(nil, msgType, flags, seq, body)
+	return nlSendBatch(fd, buf, 1)
+}
+
+// nlAppendMsg builds one netlink message (NlMsghdr + body, NLM_F_REQUEST|
+// NLM_F_ACK|flags) and appends it to buf. Returns the new buf. Used by both
+// nlSend (single) and the batched restore path (multiple messages in one
+// sendto).
+func nlAppendMsg(buf []byte, msgType uint16, flags uint16, seq uint32, body []byte) []byte {
 	const hdrSize = unix.SizeofNlMsghdr
 	totalLen := hdrSize + len(body)
-	buf := make([]byte, totalLen)
-	hdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
+	old := len(buf)
+	buf = append(buf, make([]byte, totalLen)...)
+	hdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[old]))
 	hdr.Len = uint32(totalLen)
 	hdr.Type = msgType
 	hdr.Flags = unix.NLM_F_REQUEST | unix.NLM_F_ACK | flags
 	hdr.Seq = seq
 	hdr.Pid = 0
-	copy(buf[hdrSize:], body)
+	copy(buf[old+hdrSize:], body)
+	return buf
+}
 
+// nlSendBatch sends a buffer of one or more concatenated netlink messages in
+// a single sendto and drains exactly expectAcks ACKs (NLMSG_ERROR). Each
+// message in the buffer must carry NLM_F_ACK. The kernel processes messages
+// in order, so ACKs arrive in the same order as requests.
+//
+// ALL expectAcks ACKs are drained even when one fails — this prevents a
+// pending ACK from poisoning the socket for the next operation. The first
+// non-zero error is returned, but the caller knows every message was
+// processed by the kernel.
+func nlSendBatch(fd int, buf []byte, expectAcks int) error {
+	if len(buf) == 0 || expectAcks == 0 {
+		return nil
+	}
 	if err := unix.Sendto(fd, buf, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
 		return fmt.Errorf("sendto: %w", err)
 	}
-
-	rbuf := make([]byte, 4096)
-	for {
+	rbuf := make([]byte, 8192)
+	got := 0
+	var firstErr error
+	for got < expectAcks {
 		n, _, err := unix.Recvfrom(fd, rbuf, 0)
 		if err != nil {
-			return fmt.Errorf("recvfrom: %w", err)
+			return fmt.Errorf("recvfrom: %w (drained %d/%d acks)", err, got, expectAcks)
 		}
-		if n < hdrSize {
-			return fmt.Errorf("short recv %d", n)
+		if n < unix.SizeofNlMsghdr {
+			return fmt.Errorf("short recv %d (drained %d/%d acks)", n, got, expectAcks)
 		}
-		rhdr := (*unix.NlMsghdr)(unsafe.Pointer(&rbuf[0]))
-		if rhdr.Type == unix.NLMSG_ERROR {
-			// payload is int32 errno, then echoed request hdr
-			errno := int32(binary.LittleEndian.Uint32(rbuf[hdrSize : hdrSize+4]))
-			if errno == 0 {
-				return nil
-			}
-			return fmt.Errorf("netlink error %d (%s)", -errno, unix.Errno(-errno))
+		// One recv may contain multiple ACKs (batched kernel reply).
+		nACK, ackErr, parseErr := parseBatchACKs(rbuf[:n], expectAcks-got)
+		if parseErr != nil {
+			return fmt.Errorf("parse batch acks: %w (drained %d/%d acks)", parseErr, got, expectAcks)
 		}
-		if rhdr.Flags&unix.NLM_F_MULTI != 0 && rhdr.Type != unix.NLMSG_DONE {
-			continue
+		got += nACK
+		if firstErr == nil && ackErr != nil {
+			firstErr = ackErr
 		}
-		// unexpected reply (multipart on a non-multipart op)
-		return fmt.Errorf("unexpected netlink reply type %d", rhdr.Type)
 	}
+	return firstErr
+}
+
+// parseBatchACKs parses up to limit NLMSG_ERROR acknowledgements from one
+// recv buffer. It returns the first kernel error while still consuming every
+// ACK in the buffer. Malformed messages are rejected instead of being treated
+// as a partial success.
+func parseBatchACKs(data []byte, limit int) (got int, firstErr, parseErr error) {
+	const hdrSize = unix.SizeofNlMsghdr
+	for len(data) >= hdrSize && got < limit {
+		mh := (*unix.NlMsghdr)(unsafe.Pointer(&data[0]))
+		l := int(mh.Len)
+		if l < hdrSize || l > len(data) {
+			return got, firstErr, fmt.Errorf("invalid netlink message length %d (buffer %d)", l, len(data))
+		}
+		if mh.Type == unix.NLMSG_ERROR {
+			if l < hdrSize+4 {
+				return got, firstErr, fmt.Errorf("short NLMSG_ERROR length %d", l)
+			}
+			errno := int32(binary.LittleEndian.Uint32(data[hdrSize : hdrSize+4]))
+			if errno != 0 && firstErr == nil {
+				firstErr = fmt.Errorf("netlink error %d (%s)", -errno, unix.Errno(-errno))
+			}
+			got++
+		}
+		aligned := nlAlign(l)
+		if aligned > len(data) {
+			return got, firstErr, fmt.Errorf("aligned netlink message length %d exceeds buffer %d", aligned, len(data))
+		}
+		data = data[aligned:]
+	}
+	if len(data) != 0 {
+		return got, firstErr, fmt.Errorf("trailing %d-byte netlink data after %d acks", len(data), got)
+	}
+	return got, firstErr, nil
 }
 
 // nlSendLinkUp issues RTM_NEWLINK setting IFF_UP on ifindex, and — when
@@ -246,24 +391,29 @@ func addFlags(replace bool) uint16 {
 	return unix.NLM_F_CREATE | unix.NLM_F_EXCL
 }
 
-// nlSendAddrAdd issues RTM_NEWADDR with IFA_LOCAL + IFA_ADDRESS.
-func nlSendAddrAdd(fd int, seq uint32, ifindex int32, family int, ip net.IP, prefix int, replace bool) error {
+// buildAddrBody constructs the RTM_NEWADDR/RTM_DELADDR payload (IfAddrmsg +
+// IFA_LOCAL + IFA_ADDRESS attributes).
+func buildAddrBody(ifindex int32, family int, prefix int, ip net.IP) []byte {
 	body := make([]byte, unix.SizeofIfAddrmsg)
 	ifa := (*unix.IfAddrmsg)(unsafe.Pointer(&body[0]))
 	ifa.Family = uint8(family)
 	ifa.Prefixlen = uint8(prefix)
 	ifa.Index = uint32(ifindex)
 	ifa.Scope = unix.RT_SCOPE_UNIVERSE
-
 	raw := addrBytes(family, ip)
 	body = nlAttr(body, unix.IFA_LOCAL, raw)
 	body = nlAttr(body, unix.IFA_ADDRESS, raw)
-
-	return nlSend(fd, unix.RTM_NEWADDR, addFlags(replace), seq, body)
+	return body
 }
 
-// nlSendDefaultRoute issues RTM_NEWROUTE for 0.0.0.0/0 (or ::/0) via gw on ifindex.
-func nlSendDefaultRoute(fd int, seq uint32, ifindex int32, family int, gw net.IP, replace bool) error {
+// nlSendAddrAdd issues RTM_NEWADDR with IFA_LOCAL + IFA_ADDRESS.
+func nlSendAddrAdd(fd int, seq uint32, ifindex int32, family int, ip net.IP, prefix int, replace bool) error {
+	return nlSend(fd, unix.RTM_NEWADDR, addFlags(replace), seq, buildAddrBody(ifindex, family, prefix, ip))
+}
+
+// buildRouteBody constructs the RTM_NEWROUTE payload for 0.0.0.0/0 via gw on
+// ifindex (RtMsg + RTA_GATEWAY + RTA_OIF attributes).
+func buildRouteBody(ifindex int32, family int, gw net.IP) []byte {
 	body := make([]byte, unix.SizeofRtMsg)
 	rt := (*unix.RtMsg)(unsafe.Pointer(&body[0]))
 	rt.Family = uint8(family)
@@ -282,8 +432,12 @@ func nlSendDefaultRoute(fd int, seq uint32, ifindex int32, family int, gw net.IP
 	oifBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(oifBytes, uint32(ifindex))
 	body = nlAttr(body, unix.RTA_OIF, oifBytes)
+	return body
+}
 
-	return nlSend(fd, unix.RTM_NEWROUTE, addFlags(replace), seq, body)
+// nlSendDefaultRoute issues RTM_NEWROUTE for 0.0.0.0/0 (or ::/0) via gw on ifindex.
+func nlSendDefaultRoute(fd int, seq uint32, ifindex int32, family int, gw net.IP, replace bool) error {
+	return nlSend(fd, unix.RTM_NEWROUTE, addFlags(replace), seq, buildRouteBody(ifindex, family, gw))
 }
 
 // addrBytes returns the 4- or 16-byte wire form of ip for the family.
@@ -292,25 +446,6 @@ func addrBytes(family int, ip net.IP) []byte {
 		return ip.To4()
 	}
 	return ip.To16()
-}
-
-// flushAddrs removes every global-scope address of `family` on ifindex
-// (RTM_GETADDR dump → RTM_DELADDR each). Used on restore so a re-identified
-// clone does not keep the golden snapshot's IP. Link/host-scope addresses
-// (e.g. IPv6 link-local) are left untouched. *seq is advanced per message.
-func flushAddrs(fd int, seq *uint32, ifindex int32, family int) error {
-	addrs, err := nlDumpAddrs(fd, *seq, ifindex, family)
-	*seq++
-	if err != nil {
-		return err
-	}
-	for _, a := range addrs {
-		if err := nlSendAddrDel(fd, *seq, ifindex, family, a.ip, a.prefix); err != nil {
-			return fmt.Errorf("del %s/%d: %w", a.ip, a.prefix, err)
-		}
-		*seq++
-	}
-	return nil
 }
 
 type addrEntry struct {
@@ -349,7 +484,7 @@ func nlDumpAddrs(fd int, seq uint32, ifindex int32, family int) ([]addrEntry, er
 			mh := (*unix.NlMsghdr)(unsafe.Pointer(&data[0]))
 			l := int(mh.Len)
 			if l < hdrSize || l > len(data) {
-				return out, nil // truncated/malformed — stop with what we have
+				return nil, fmt.Errorf("getaddr dump: invalid netlink message length %d (buffer %d)", l, len(data))
 			}
 			switch mh.Type {
 			case unix.NLMSG_DONE:
@@ -365,7 +500,14 @@ func nlDumpAddrs(fd int, seq uint32, ifindex int32, family int) ([]addrEntry, er
 					out = append(out, e)
 				}
 			}
-			data = data[nlAlign(l):]
+			aligned := nlAlign(l)
+			if aligned > len(data) {
+				return nil, fmt.Errorf("getaddr dump: aligned message length %d exceeds buffer %d", aligned, len(data))
+			}
+			data = data[aligned:]
+		}
+		if len(data) != 0 {
+			return nil, fmt.Errorf("getaddr dump: trailing %d-byte netlink fragment", len(data))
 		}
 	}
 }
@@ -399,21 +541,3 @@ func parseAddrEntry(p []byte, ifindex int32, family int) (addrEntry, bool) {
 	}
 	return addrEntry{ip: ip, prefix: int(ifa.Prefixlen)}, true
 }
-
-// nlSendAddrDel issues RTM_DELADDR for ip/prefix on ifindex.
-func nlSendAddrDel(fd int, seq uint32, ifindex int32, family int, ip net.IP, prefix int) error {
-	body := make([]byte, unix.SizeofIfAddrmsg)
-	ifa := (*unix.IfAddrmsg)(unsafe.Pointer(&body[0]))
-	ifa.Family = uint8(family)
-	ifa.Prefixlen = uint8(prefix)
-	ifa.Index = uint32(ifindex)
-
-	raw := addrBytes(family, ip)
-	body = nlAttr(body, unix.IFA_LOCAL, raw)
-	body = nlAttr(body, unix.IFA_ADDRESS, raw)
-
-	return nlSend(fd, unix.RTM_DELADDR, 0, seq, body)
-}
-
-// _ keeps the syscall import live in case future revisions need raw fcntls.
-var _ = syscall.SOCK_STREAM
