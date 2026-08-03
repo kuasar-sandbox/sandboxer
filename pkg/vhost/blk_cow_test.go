@@ -2,10 +2,13 @@ package vhost
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 // fakeReader is a BlockReader returning a fixed pattern.
@@ -382,6 +385,78 @@ func TestBlockCOW_FailedMaterializationDoesNotMarkDirty(t *testing.T) {
 	}
 	if cow.blockDirty(0) {
 		t.Fatal("failed materialization marked block dirty")
+	}
+}
+
+func TestBlockCOW_SnapshotViewIsUpperOnly(t *testing.T) {
+	const size = 4 * cowBlockSize
+	baseData := patternedBytes(size)
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: baseData}, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cow.Close()
+
+	partial := bytes.Repeat([]byte{0x91}, 512)
+	if _, err := cow.WriteAt(partial, cowBlockSize+512); err != nil {
+		t.Fatal(err)
+	}
+	full := bytes.Repeat([]byte{0xe7}, cowBlockSize)
+	if _, err := cow.WriteAt(full, 3*cowBlockSize); err != nil {
+		t.Fatal(err)
+	}
+
+	view, holes, err := cow.SnapshotView()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHoles := []sparse.Extent{
+		{Offset: 0, Size: cowBlockSize},
+		{Offset: 2 * cowBlockSize, Size: cowBlockSize},
+	}
+	if len(holes) != len(wantHoles) {
+		t.Fatalf("holes=%v want %v", holes, wantHoles)
+	}
+	for i := range holes {
+		if holes[i] != wantHoles[i] {
+			t.Fatalf("holes=%v want %v", holes, wantHoles)
+		}
+	}
+
+	// SnapshotView captures the bitmap. A later write to a formerly clean
+	// block must not make that block appear in this upper-only view.
+	if _, err := cow.WriteAt(bytes.Repeat([]byte{0x44}, cowBlockSize), 0); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, size)
+	if _, err := io.ReadFull(view, got); err != nil {
+		t.Fatal(err)
+	}
+	want := make([]byte, size)
+	copy(want[cowBlockSize:2*cowBlockSize], baseData[cowBlockSize:2*cowBlockSize])
+	copy(want[cowBlockSize+512:], partial)
+	copy(want[3*cowBlockSize:], full)
+	if !bytes.Equal(got, want) {
+		t.Fatal("snapshot view exposed base data, missed dirty data, or changed with the live bitmap")
+	}
+}
+
+func TestSnapshotHoles(t *testing.T) {
+	bitmap := []uint64{0}
+	bitmap[0] = 1<<1 | 1<<2 | 1<<5
+	got := snapshotHoles(bitmap, 8*cowBlockSize)
+	want := []sparse.Extent{
+		{Offset: 0, Size: cowBlockSize},
+		{Offset: 3 * cowBlockSize, Size: 2 * cowBlockSize},
+		{Offset: 6 * cowBlockSize, Size: 2 * cowBlockSize},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("snapshotHoles=%v want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("snapshotHoles=%v want %v", got, want)
+		}
 	}
 }
 
