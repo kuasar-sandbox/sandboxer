@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -166,4 +167,188 @@ func TestBlockCOW_ReadAcrossBlocks(t *testing.T) {
 	if !bytes.Equal(buf, expected) {
 		t.Fatalf("multi-block read mismatch")
 	}
+}
+
+func TestBlockCOW_FirstPartialWriteMaterializesBase(t *testing.T) {
+	tests := []struct {
+		name   string
+		offset int64
+		length int
+	}{
+		{name: "sector", offset: 512, length: 512},
+		{name: "partial-sector", offset: 123, length: 257},
+		{name: "cross-sector", offset: 400, length: 300},
+		{name: "cross-block", offset: cowBlockSize - 100, length: 300},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const size = 3 * cowBlockSize
+			baseData := patternedBytes(size)
+			base := &fakeReader{data: baseData}
+			cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), base, size)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cow.Close()
+
+			payload := bytes.Repeat([]byte{0xa5}, tt.length)
+			if n, err := cow.WriteAt(payload, tt.offset); err != nil || n != len(payload) {
+				t.Fatalf("WriteAt: n=%d err=%v", n, err)
+			}
+
+			got := make([]byte, size)
+			if n, err := cow.ReadAt(got, 0); err != nil || n != len(got) {
+				t.Fatalf("ReadAt: n=%d err=%v", n, err)
+			}
+			want := append([]byte(nil), baseData...)
+			copy(want[tt.offset:], payload)
+			if !bytes.Equal(got, want) {
+				t.Fatal("partial write did not preserve untouched base bytes")
+			}
+			wantDirty := 1
+			if tt.offset < cowBlockSize && tt.offset+int64(tt.length) > cowBlockSize {
+				wantDirty = 2
+			}
+			if got := cow.DirtyCount(); got != wantDirty {
+				t.Fatalf("DirtyCount=%d want %d", got, wantDirty)
+			}
+		})
+	}
+}
+
+func TestBlockCOW_FirstPartialWriteMaterializesZerosWithoutBase(t *testing.T) {
+	const size = 2 * cowBlockSize
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), nil, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cow.Close()
+
+	payload := bytes.Repeat([]byte{0x5a}, 513)
+	if n, err := cow.WriteAt(payload, 255); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: n=%d err=%v", n, err)
+	}
+	got := make([]byte, cowBlockSize)
+	if _, err := cow.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	want := make([]byte, cowBlockSize)
+	copy(want[255:], payload)
+	if !bytes.Equal(got, want) {
+		t.Fatal("partial write did not preserve zero-filled clean bytes")
+	}
+}
+
+func TestBlockCOW_DescriptorSplitPreservesMaterializedBlock(t *testing.T) {
+	const size = 2 * cowBlockSize
+	baseData := patternedBytes(size)
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: baseData}, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cow.Close()
+
+	segments := []struct {
+		offset int64
+		data   []byte
+	}{
+		{offset: 700, data: bytes.Repeat([]byte{'a'}, 113)},
+		{offset: 813, data: bytes.Repeat([]byte{'b'}, 271)},
+		{offset: 1084, data: bytes.Repeat([]byte{'c'}, 509)},
+	}
+	want := append([]byte(nil), baseData...)
+	for _, seg := range segments {
+		if n, err := cow.WriteAt(seg.data, seg.offset); err != nil || n != len(seg.data) {
+			t.Fatalf("WriteAt(%d): n=%d err=%v", seg.offset, n, err)
+		}
+		copy(want[seg.offset:], seg.data)
+	}
+	got := make([]byte, cowBlockSize)
+	if _, err := cow.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want[:cowBlockSize]) {
+		t.Fatal("descriptor-split writes lost base or prior segment bytes")
+	}
+}
+
+func TestBlockCOW_ConcurrentOverlappingFirstWrites(t *testing.T) {
+	const blocks = 64
+	const size = blocks * cowBlockSize
+	baseData := patternedBytes(size)
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: baseData}, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cow.Close()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for blk := 0; blk < blocks; blk++ {
+		blockOffset := int64(blk * cowBlockSize)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := cow.WriteAt(bytes.Repeat([]byte{'x'}, 1024), blockOffset); err != nil {
+				t.Errorf("first overlapping write: %v", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := cow.WriteAt(bytes.Repeat([]byte{'y'}, 1024), blockOffset+512); err != nil {
+				t.Errorf("second overlapping write: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for blk := 0; blk < blocks; blk++ {
+		blockOffset := blk * cowBlockSize
+		got := make([]byte, cowBlockSize)
+		if _, err := cow.ReadAt(got, int64(blockOffset)); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got[:512], bytes.Repeat([]byte{'x'}, 512)) {
+			t.Fatalf("block %d lost first writer's non-overlap", blk)
+		}
+		overlap := got[512:1024]
+		if !bytes.Equal(overlap, bytes.Repeat([]byte{'x'}, 512)) &&
+			!bytes.Equal(overlap, bytes.Repeat([]byte{'y'}, 512)) {
+			t.Fatalf("block %d has torn overlap", blk)
+		}
+		if !bytes.Equal(got[1024:1536], bytes.Repeat([]byte{'y'}, 512)) {
+			t.Fatalf("block %d lost second writer's non-overlap", blk)
+		}
+		if !bytes.Equal(got[1536:], baseData[blockOffset+1536:blockOffset+cowBlockSize]) {
+			t.Fatalf("block %d lost untouched base tail", blk)
+		}
+	}
+}
+
+func TestBlockCOW_FailedMaterializationDoesNotMarkDirty(t *testing.T) {
+	const size = cowBlockSize
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: patternedBytes(size)}, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cow.diff.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cow.WriteAt([]byte("partial"), 17); err == nil {
+		t.Fatal("WriteAt succeeded with closed diff")
+	}
+	if cow.blockDirty(0) {
+		t.Fatal("failed materialization marked block dirty")
+	}
+}
+
+func patternedBytes(size int) []byte {
+	b := make([]byte, size)
+	for i := range b {
+		b[i] = byte((i*31 + 7) % 251)
+	}
+	return b
 }
