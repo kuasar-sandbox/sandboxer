@@ -822,14 +822,18 @@ func handleSnapshotRequest(
 	diffs := make([]snapshot.DiskDiff, len(disks))
 	diskMerged := make([]bool, len(disks))
 	for i, d := range disks {
-		dd := snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff}
-		st, statErr := os.Stat(dd.Path)
-		if statErr != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q: %w", i, dd.Path, statErr)
+		dd := snapshot.DiskDiff{
+			Path:         d.DiffPath,
+			Owned:        d.OwnedDiff,
+			SnapshotView: d.SnapshotView,
 		}
-		if !st.Mode().IsRegular() {
-			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q is not a regular file", i, dd.Path)
+		if dd.SnapshotView == nil {
+			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q has no snapshot view", i, dd.Path)
 		}
+		if d.Size <= 0 {
+			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q has invalid logical size %d", i, dd.Path, d.Size)
+		}
+		diffSize := d.Size
 		var parentDiskRef string
 		if i == 0 {
 			parentDiskRef = prov.ParentOverlayBase
@@ -850,7 +854,7 @@ func handleSnapshotRequest(
 			if dd.MergeBase == "" {
 				return ctl.Response{}, fmt.Errorf("snapshot: local parent disk %d lacks a merge base path", i)
 			}
-			if err := snapshot.ValidateMergeBase(dd.MergeBase, st.Size()); err != nil {
+			if err := snapshot.ValidateMergeBase(dd.MergeBase, diffSize); err != nil {
 				return ctl.Response{}, fmt.Errorf("snapshot: disk %d merge base: %w", i, err)
 			}
 			diskMerged[i] = true

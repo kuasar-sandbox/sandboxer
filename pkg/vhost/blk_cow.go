@@ -8,6 +8,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"golang.org/x/sys/unix"
 )
 
@@ -371,6 +372,152 @@ func (c *BlockCOW) Discard(offset, length int64) error {
 	c.bitmapMu.Unlock()
 
 	return nil
+}
+
+// SnapshotView returns a read-only, upper-only view of the diff at the current
+// dirty-bitmap state. Dirty blocks expose their complete plaintext diff bytes;
+// clean blocks are holes and defensively read as zeros rather than falling
+// through to base. The caller must keep the BlockCOW open while using the view.
+// Snapshot orchestration calls this after quiescing every vhost backend, so the
+// dirty block contents stay stable for the view's lifetime.
+func (c *BlockCOW) SnapshotView() (io.ReadSeeker, []sparse.Extent, error) {
+	c.bitmapMu.RLock()
+	bitmap := append([]uint64(nil), c.bitmap...)
+	c.bitmapMu.RUnlock()
+
+	view := &cowSnapshotReaderAt{cow: c, bitmap: bitmap}
+	return io.NewSectionReader(view, 0, c.size), snapshotHoles(bitmap, c.size), nil
+}
+
+type cowSnapshotReaderAt struct {
+	cow    *BlockCOW
+	bitmap []uint64
+}
+
+func (r *cowSnapshotReaderAt) ReadAt(buf []byte, offset int64) (int, error) {
+	if offset < 0 || offset >= r.cow.size {
+		return 0, io.EOF
+	}
+	n := len(buf)
+	var eof error
+	if int64(n) > r.cow.size-offset {
+		n = int(r.cow.size - offset)
+		eof = io.EOF
+	}
+
+	written := 0
+	for written < n {
+		pos := offset + int64(written)
+		blk := pos / r.cow.blockSize
+		dirty := bitmapBlockDirty(r.bitmap, blk)
+		runEnd := min((blk+1)*r.cow.blockSize, offset+int64(n))
+		for runEnd < offset+int64(n) {
+			nextBlk := runEnd / r.cow.blockSize
+			if bitmapBlockDirty(r.bitmap, nextBlk) != dirty {
+				break
+			}
+			runEnd = min((nextBlk+1)*r.cow.blockSize, offset+int64(n))
+		}
+		chunkLen := int(runEnd - pos)
+		chunk := buf[written : written+chunkLen]
+
+		if dirty {
+			lastBlk := (runEnd - 1) / r.cow.blockSize
+			r.cow.rlockBlockRange(blk, lastBlk)
+			read, err := r.cow.diff.ReadAt(chunk, pos)
+			r.cow.runlockBlockRange(blk, lastBlk)
+			written += read
+			if err != nil && !(errors.Is(err, io.EOF) && read == len(chunk)) {
+				return written, err
+			}
+			if read != len(chunk) {
+				return written, io.ErrUnexpectedEOF
+			}
+			continue
+		}
+
+		clear(chunk)
+		written += len(chunk)
+	}
+	return written, eof
+}
+
+// rlockBlockRange locks each stripe touched by the inclusive block range once,
+// in numeric stripe order. Snapshot reads can then issue one pread for a
+// contiguous dirty run without weakening same-block exclusion or recursively
+// taking an RWMutex when a range spans more than one full stripe cycle.
+func (c *BlockCOW) rlockBlockRange(first, last int64) {
+	stripeCount := int64(len(c.blockMu))
+	blockCount := last - first + 1
+	firstStripe := first % stripeCount
+	if blockCount >= stripeCount {
+		for stripe := int64(0); stripe < stripeCount; stripe++ {
+			c.blockMu[stripe].RLock()
+		}
+		return
+	}
+	end := firstStripe + blockCount
+	if end <= stripeCount {
+		for stripe := firstStripe; stripe < end; stripe++ {
+			c.blockMu[stripe].RLock()
+		}
+		return
+	}
+	for stripe := int64(0); stripe < end-stripeCount; stripe++ {
+		c.blockMu[stripe].RLock()
+	}
+	for stripe := firstStripe; stripe < stripeCount; stripe++ {
+		c.blockMu[stripe].RLock()
+	}
+}
+
+func (c *BlockCOW) runlockBlockRange(first, last int64) {
+	stripeCount := int64(len(c.blockMu))
+	blockCount := last - first + 1
+	firstStripe := first % stripeCount
+	if blockCount >= stripeCount {
+		for stripe := stripeCount - 1; stripe >= 0; stripe-- {
+			c.blockMu[stripe].RUnlock()
+		}
+		return
+	}
+	end := firstStripe + blockCount
+	if end <= stripeCount {
+		for stripe := end - 1; stripe >= firstStripe; stripe-- {
+			c.blockMu[stripe].RUnlock()
+		}
+		return
+	}
+	for stripe := stripeCount - 1; stripe >= firstStripe; stripe-- {
+		c.blockMu[stripe].RUnlock()
+	}
+	for stripe := end - stripeCount - 1; stripe >= 0; stripe-- {
+		c.blockMu[stripe].RUnlock()
+	}
+}
+
+func bitmapBlockDirty(bitmap []uint64, blk int64) bool {
+	return bitmap[blk/64]&(1<<(uint64(blk)%64)) != 0
+}
+
+func snapshotHoles(bitmap []uint64, size int64) []sparse.Extent {
+	numBlocks := size / cowBlockSize
+	var holes []sparse.Extent
+	for blk := int64(0); blk < numBlocks; {
+		if bitmapBlockDirty(bitmap, blk) {
+			blk++
+			continue
+		}
+		start := blk
+		for blk < numBlocks && !bitmapBlockDirty(bitmap, blk) {
+			blk++
+		}
+		holes = append(holes, sparse.Extent{
+			Offset: uint64(start * cowBlockSize),
+			Size:   uint64((blk - start) * cowBlockSize),
+		})
+	}
+	return holes
 }
 
 // Size returns the visible block-device size in bytes.

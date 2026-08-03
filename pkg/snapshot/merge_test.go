@@ -93,6 +93,57 @@ func readAll(t *testing.T, rs io.ReadSeeker, size int64, holes []sparse.Extent) 
 	return out
 }
 
+func TestHoleRunAlternatingBlocks(t *testing.T) {
+	const (
+		blockSize = int64(4096)
+		blocks    = 1 << 16
+		size      = blocks * blockSize
+	)
+	holes := make([]sparse.Extent, 0, blocks/2)
+	for block := int64(1); block < blocks; block += 2 {
+		holes = append(holes, sparse.Extent{
+			Offset: uint64(block * blockSize),
+			Size:   uint64(blockSize),
+		})
+	}
+	for block := int64(0); block < blocks; block++ {
+		isHole, end := holeRun(block*blockSize, holes, size)
+		if want := block%2 == 1; isHole != want {
+			t.Fatalf("block %d hole=%v want %v", block, isHole, want)
+		}
+		if want := (block + 1) * blockSize; end != want {
+			t.Fatalf("block %d end=%d want %d", block, end, want)
+		}
+	}
+	if isHole, end := holeRun(-1, holes, size); isHole || end != 0 {
+		t.Fatalf("negative position = (%v, %d), want (false, 0)", isHole, end)
+	}
+	if isHole, end := holeRun(size, holes, size); isHole || end != size {
+		t.Fatalf("end position = (%v, %d), want (false, %d)", isHole, end, size)
+	}
+}
+
+func BenchmarkSeekerSourceAlternatingBlocks(b *testing.B) {
+	const (
+		blockSize = uint64(4096)
+		blocks    = 1 << 20
+		size      = blocks * blockSize
+	)
+	holes := make([]sparse.Extent, 0, blocks/2)
+	for block := uint64(1); block < blocks; block += 2 {
+		holes = append(holes, sparse.Extent{Offset: block * blockSize, Size: blockSize})
+	}
+	src := &seekerSource{size: size, holes: holes}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		offset := uint64(i&(blocks-1)) * blockSize
+		if _, _, err := src.RunAt(offset, blockSize); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestMergeSparse_Equivalence(t *testing.T) {
 	const size = 16
 	cases := []struct {

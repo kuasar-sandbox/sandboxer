@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 )
 
@@ -68,14 +69,17 @@ type Sources struct {
 	Logf     func(string, ...any)
 }
 
-// DiskDiff is one logical disk's writable diff to capture. Owned marks an
-// auto-created diff eligible for the zero-copy move on destroy-snapshot.
-// MergeBase, when set (local-parent re-export), is the parent's local overlay
-// file path this disk's delta is flattened onto (replace, not stack).
+// DiskDiff is one logical disk's writable diff to capture. SnapshotView is the
+// live COW's upper-only logical source; Path is retained for diagnostics and
+// lifecycle bookkeeping, never reopened as snapshot data. Owned marks an
+// auto-created diff eligible for cleanup. MergeBase, when set (local-parent
+// re-export), is the parent's local overlay file path this disk's delta is
+// flattened onto (replace, not stack).
 type DiskDiff struct {
-	Path      string
-	Owned     bool
-	MergeBase string
+	Path         string
+	Owned        bool
+	MergeBase    string
+	SnapshotView func() (io.ReadSeeker, []sparse.Extent, error)
 }
 
 // Outputs describes what was produced. Refs are scheme-tagged
@@ -226,28 +230,26 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 // absorbOverlay streams one disk's diff to the sink, optionally flattening it
 // onto the parent's local overlay (merge, replacing the parent layer).
 func absorbOverlay(ctx context.Context, sink SnapshotSink, d DiskDiff, merging bool) (string, string, error) {
-	diff, err := os.Open(d.Path)
-	if err != nil {
-		return "", "", fmt.Errorf("open diff %s: %w", d.Path, err)
+	if d.SnapshotView == nil {
+		return "", "", fmt.Errorf("snapshot diff %s has no snapshot view", d.Path)
 	}
-	defer diff.Close()
-	dstat, err := diff.Stat()
+	diff, overlayHoles, err := d.SnapshotView()
 	if err != nil {
-		return "", "", fmt.Errorf("stat diff %s: %w", d.Path, err)
+		return "", "", fmt.Errorf("snapshot view %s: %w", d.Path, err)
 	}
-	overlayHoles, err := WalkHoles(int(diff.Fd()), dstat.Size())
+	size, err := seekerSize(diff)
 	if err != nil {
-		return "", "", fmt.Errorf("overlay holes: %w", err)
+		return "", "", fmt.Errorf("snapshot view size %s: %w", d.Path, err)
 	}
 	var src io.ReadSeeker = diff
 	holes := overlayHoles
 	if merging {
-		base, baseHoles, berr := openMergeBase(d.MergeBase, dstat.Size())
+		base, baseHoles, berr := openMergeBase(d.MergeBase, size)
 		if berr != nil {
 			return "", "", fmt.Errorf("merge overlay base: %w", berr)
 		}
 		defer base.Close()
-		src, holes = mergeSparse(diff, overlayHoles, base, baseHoles, dstat.Size())
+		src, holes = mergeSparse(diff, overlayHoles, base, baseHoles, size)
 	}
 	return sink.AbsorbOverlay(ctx, src, holes)
 }

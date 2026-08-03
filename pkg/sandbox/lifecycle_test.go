@@ -1,8 +1,10 @@
 package sandbox
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
@@ -141,10 +144,7 @@ func TestHandleSnapshotRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T
 
 func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) {
 	dir := t.TempDir()
-	diff := filepath.Join(dir, "root.diff")
-	if err := os.WriteFile(diff, make([]byte, 4096), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	diff := filepath.Join(dir, "must-not-be-opened.diff")
 	cfg := &config.SandboxConfig{}
 	cfg.SnapshotProvenance = config.SnapshotProvenance{
 		ParentSnapshotRef: "file://base.snapshot",
@@ -156,13 +156,24 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 	}
 	mergeRef := false
 	req := ctl.Request{OutDir: filepath.Join(dir, "out"), MergeRef: &mergeRef}
+	viewCalled := false
 
 	_, err := handleSnapshotRequest(req, RunOptions{Cfg: cfg, SandboxID: "test"}, nil,
-		[]SnapDiskRef{{DiffPath: diff}}, nil, "", filepath.Join(dir, "run"),
+		[]SnapDiskRef{{
+			DiffPath: diff,
+			Size:     4096,
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				viewCalled = true
+				return bytes.NewReader(make([]byte, 4096)), nil, nil
+			},
+		}}, nil, "", filepath.Join(dir, "run"),
 		pinger, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") ||
 		!strings.Contains(err.Error(), "missing.overlay") {
 		t.Fatalf("disk merge preflight error = %v", err)
+	}
+	if viewCalled {
+		t.Fatal("snapshot view provider called during size preflight")
 	}
 }
 

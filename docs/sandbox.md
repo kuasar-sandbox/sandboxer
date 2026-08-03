@@ -1212,9 +1212,11 @@ manifest key 与容器无关(= f(逻辑内容, 洞图))。
 
 file 模式下 overlay 与 snapshot bundle 走同一条落盘路径:
 
-1. quiesce 完成后源内容稳定(overlay 源 = blk1.diff,snapshot 源 = memfd);
-   洞图经 SEEK_DATA/HOLE 取自**活体**源文件(这是文件系统作为洞权威的唯一一处,
-   工件落定后权威归信封)
+1. quiesce 完成后源内容稳定。snapshot memory 源是 memfd,洞图经
+   SEEK_DATA/HOLE 取得;overlay 源由 live `BlockCOW.SnapshotView()` 提供,
+   dirty bitmap 生成 upper-only 洞图,dirty block 读取 plaintext diff,clean block
+   防御性读零。active diff path 只用于日志、统计和清理,不会作为 snapshot 数据重开;
+   工件落定后洞的权威归 tarstream 信封
 2. `tarstream.WriteTo` 把源打包到同目录 `<sid>.<ext>.partial`,**边写边算**
    payload tar prefix 的 SHA256(一遍),再追加空 digest marker;只有数据 extent
    上线,洞进信封图;snapshot 的 ZIP 段拼接在 `ramSize` 逻辑偏移后
@@ -1263,10 +1265,11 @@ T3  CH /vm.snapshot { destination_url=file://<run-dir>/<sid>/snap-stage/ }
       state.json    - vCPU 寄存器、virtio queue 状态、IRQ 等
     sandbox-ctl 把这两个文件读进内存作为 ZIP 内容暂存,不再落盘
 T4  overlay → sink(在 memory 前处理,snapshot.cfg 才能拿到终态 overlay.base):
-    若 --output:blk1.diff 数据 extent 打包 tarstream → <sid>.overlay.partial →
+    若 --output:BlockCOW upper-only SnapshotView 的 dirty extent 打包 tarstream →
+        <sid>.overlay.partial →
         writer 返回 marker digest(§6.1)→ rename <out_dir>/<digest>.overlay;
         overlay_ref = file://<digest>.overlay
-    若 --upload:blk1.diff 数据 extent 流式喂 manifest.Ingester(空洞编码进
+    若 --upload:同一 SnapshotView 数据 extent 流式喂 manifest.Ingester(空洞编码进
         manifest,不落盘)→ overlay_manifest_key;
         overlay_ref = manifest://<overlay_manifest_key>
 T5  生成最终 snapshot.cfg(在内存中,§3.4 schema):
@@ -2197,6 +2200,14 @@ blk1 是可写盘,基础语义为"上层 ext4 sparse 文件 + 可选 base 层":
 固定数量的 stripe lock 让同一 4K block 的 read/materialize/write 串行化,
 不同 block 仍可并发。启动时通过 SEEK_DATA/HOLE 扫 blk1.diff 重建 dirtyBitmap;
 因此 dirty bit 始终表示对应 4K diff block 已完整初始化。
+
+snapshot 在全部 vhost backend quiesce 后调用 `BlockCOW.SnapshotView()`:view 复制
+当前 dirty bitmap,只暴露 upper,不包含 base。dirty block 从 live BlockCOW 读取完整
+plaintext 4K 内容;clean block 作为 hole,即使调用方防御性读取也返回零。snapshot
+plumbing 携带该 view provider,不再通过 raw diff path 重开文件;path 只保留给日志、
+统计和清理。preflight 直接携带 BlockCOW logical size,不提前构造 hole map;
+capture 读取时把相邻 dirty block 合并为连续 range,每个涉及的 stripe 只取一次读锁,
+并以一次底层 `ReadAt` 读取该 range。
 
 DISCARD 路径(无 base layer 时正确):`fallocate(PUNCH_HOLE)` + bitmap 清掉;
 读 ReadAt 看到 bitmap 干净 → memset(0)。**带 base layer 时**需要扩展为三态

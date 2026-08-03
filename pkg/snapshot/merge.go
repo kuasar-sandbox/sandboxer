@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -209,18 +210,30 @@ func (m *mergedReadSeeker) Seek(off int64, whence int) (int64, error) {
 
 // holeRun reports whether pos lies in a hole and the end of the current run
 // (hole-end if in a hole, else the start of the next hole, or size). holes must
-// be sorted, non-overlapping, within [0,size) (WalkHoles guarantees this).
+// be sorted, non-overlapping, within [0,size). Use binary search because a
+// BlockCOW snapshot can legitimately contain millions of alternating 4 KiB
+// hole/data runs; rescanning from the first extent for every RunAt call would
+// make artifact creation quadratic while the VM is paused.
 func holeRun(pos int64, holes []sparse.Extent, size int64) (bool, int64) {
-	for _, h := range holes {
-		hs, he := int64(h.Offset), int64(h.Offset+h.Size)
-		if pos < hs {
-			return false, hs
-		}
-		if pos < he {
-			return true, he
-		}
+	if pos < 0 {
+		return false, 0
 	}
-	return false, size
+	if pos >= size {
+		return false, size
+	}
+	position := uint64(pos)
+	i := sort.Search(len(holes), func(i int) bool {
+		h := holes[i]
+		return h.Offset > position || h.Size > position-h.Offset
+	})
+	if i == len(holes) {
+		return false, size
+	}
+	h := holes[i]
+	if pos < int64(h.Offset) {
+		return false, int64(h.Offset)
+	}
+	return true, int64(h.Offset + h.Size)
 }
 
 // holeIntersection returns the ranges that are holes in BOTH inputs over
