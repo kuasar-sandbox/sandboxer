@@ -21,7 +21,7 @@ import (
 //
 //   - hello       → server replies with the LaunchSpec (one-shot)
 //   - launch_ack  → server acks; OnLaunchAck callback fires (Settled trigger)
-//   - app_started → server acks; OnAppStarted callback fires
+//   - app_started → server acks; then OnAppStarted callback fires
 //   - app_exited  → server acks; OnAppExited callback fires
 //
 // Each connection carries exactly one request + one response, then both
@@ -59,8 +59,9 @@ type LaunchServer struct {
 	// safe to engage memory.high / controller RPCs.
 	OnLaunchAck func()
 
-	// OnAppStarted fires when the guest reports its user app has been
-	// fork/execed. Optional; nil → just ack.
+	// OnAppStarted fires only after the app_started ACK has been written
+	// successfully. The notification does not prove the target execve
+	// succeeded. Optional; nil → just ack.
 	OnAppStarted func(pid int)
 
 	// OnAppExited fires when the guest reports its user app has
@@ -166,7 +167,7 @@ func (s *LaunchServer) LaunchAckDone() <-chan struct{} { return s.launchAckDone 
 
 // handleConn services one connection. It returns true iff it handed the
 // connection off (to OnMUXReady) and the caller must NOT close it.
-func (s *LaunchServer) handleConn(conn *net.UnixConn) (handedOff bool) {
+func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 	// Deadline for the first read (hello / app notification). AppNotifyDeadline
 	// = 0 → no forced timeout (don't drop a guest that's briefly blocked on a
 	// slow page-in before it sends); a positive value catches a guest that
@@ -261,10 +262,13 @@ func (s *LaunchServer) handleConn(conn *net.UnixConn) (handedOff bool) {
 
 	case proto.TypeAppStarted:
 		s.Logf("launch: app_started pid=%d", msg.PID)
+		if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck}); err != nil {
+			s.Logf("launch: write app_started ack: %v", err)
+			return false
+		}
 		if s.OnAppStarted != nil {
 			s.OnAppStarted(msg.PID)
 		}
-		_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck})
 		return false
 
 	case proto.TypeAppExited:

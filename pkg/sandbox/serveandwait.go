@@ -73,6 +73,7 @@ type PostSpawnCtx struct {
 	Balloon      *resctl.BalloonController
 	CHSock       string
 	Logf         func(string, ...any)
+	NotifyReady  func()
 }
 
 // VMParams is the input to ServeAndWait — everything the shared
@@ -146,6 +147,12 @@ type VMParams struct {
 
 	BuildCmd  func(CmdEnv) (cmd *exec.Cmd, cleanup func(), err error)
 	PostSpawn func(PostSpawnCtx) error
+
+	// NotifyReadiness is optional. ReadyOnAppStarted selects the cold-start
+	// barrier; restore instead calls PostSpawnCtx.NotifyReady explicitly after
+	// its restore ACK and host-side MUX establishment.
+	NotifyReadiness   ReadinessNotify
+	ReadyOnAppStarted bool
 }
 
 // DiskBackend is one logical disk served to the guest (root or a boot.disks[]
@@ -198,6 +205,7 @@ type SnapDiskRef struct {
 // protocol — stay in the callers via VMParams.BuildCmd / PostSpawn.
 func ServeAndWait(p VMParams) (int, error) {
 	logf := p.Logf
+	readiness := newReadinessEmitter(p.NotifyReadiness)
 	runDir := p.RunDir
 	chSock := filepath.Join(runDir, "ch.sock")
 	vsockBase := filepath.Join(runDir, "vsock.sock")
@@ -370,8 +378,13 @@ func ServeAndWait(p VMParams) (int, error) {
 		StartTimeout:      p.StartTimeout,
 		AppNotifyDeadline: p.AppNotifyDeadline,
 		Logf:              logf,
-		OnAppStarted:      func(pid int) { logf("guest reports user app pid=%d", pid) },
-		OnAppExited:       func(code int) { logf("guest reports user app exited code=%d", code) },
+		OnAppStarted: func(pid int) {
+			logf("guest reports user app pid=%d", pid)
+			if p.ReadyOnAppStarted {
+				readiness.notifyReady()
+			}
+		},
+		OnAppExited: func(code int) { logf("guest reports user app exited code=%d", code) },
 		OnMemReport: func(memAvail, memTotal uint64) {
 			if p.Balloon != nil && os.Getenv("SANDBOX_BALLOON_NO_HINT") == "" {
 				p.Balloon.Hint(memAvail, memTotal)
@@ -442,6 +455,9 @@ func ServeAndWait(p VMParams) (int, error) {
 		return -1, fmt.Errorf("ctl.sock listen: %w", err)
 	}
 	defer ctlSrv.Stop()
+	// Listen has completed and cleanup is registered. A connection made now
+	// can wait in the kernel accept queue until ctlSrv.Serve starts below.
+	readiness.notifyControlReady()
 	// By function return the servers are already stopped (explicit
 	// cancelBackends()+backendWG.Wait() below), so this just closes the
 	// MUX conn and runs the bridge cleanup (restores the terminal in tty
@@ -568,6 +584,7 @@ func ServeAndWait(p VMParams) (int, error) {
 		Balloon:      p.Balloon,
 		CHSock:       chSock,
 		Logf:         logf,
+		NotifyReady:  readiness.notifyReady,
 	}); err != nil {
 		_ = cmd.Process.Kill()
 		cancelBackends()

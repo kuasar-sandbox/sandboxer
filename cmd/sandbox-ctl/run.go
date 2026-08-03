@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -50,6 +51,7 @@ func runCmd(args []string) int {
 	cgroupPath := fs.String("cgroup-path", "", "absolute cgroup v2 directory to join (must already exist); empty = no cgroup")
 	cgroupAdopt := fs.Bool("cgroup-adopt", false, "adopt the cgroup sandbox-ctl is already in (its systemd unit's cgroup): write limits there, do NOT move CH; resolves the cgroup path from /proc/self/cgroup")
 	statsJSON := fs.String("stats-json", "", "if set, write per-backend + uffd stats as JSON to this path on shutdown")
+	readyFD := fs.Int("ready-fd", -1, "write control_ready and ready events to an inherited fd")
 
 	restoreRef := fs.String("restore", "", "snapshot reference (file path or manifest://<hex>) — switches to restore mode")
 
@@ -90,6 +92,30 @@ func runCmd(args []string) int {
 
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	readyFDSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "ready-fd" {
+			readyFDSet = true
+		}
+	})
+	var readiness *readinessFDWriter
+	if readyFDSet {
+		var err error
+		readiness, err = newReadinessFDWriter(*readyFD, func(format string, args ...any) {
+			log.Printf("[sandbox-ctl] "+format, args...)
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sandbox-ctl run: %v\n", err)
+			return 2
+		}
+		// Every subsequent return closes the descriptor, so startup failure is
+		// represented by EOF (possibly after control_ready).
+		defer readiness.Close()
+	}
+	var notifyReadiness sandbox.ReadinessNotify
+	if readiness != nil {
+		notifyReadiness = readiness.Notify
 	}
 	// --ping-fatal-threshold precedence: flag > env > 0 (disabled).
 	pingFatalSet := false
@@ -235,7 +261,7 @@ func runCmd(args []string) int {
 	// Restore mode dispatch.
 	if restoreR != "" {
 		return runRestore(ctx, cfg, manifestCfg, restoreR,
-			*sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations)
+			*sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations, notifyReadiness)
 	}
 
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
@@ -251,6 +277,7 @@ func runCmd(args []string) int {
 		StdioMode:          stdioMode,
 		PingFatalThreshold: *pingFatal,
 		Forwards:           forwards,
+		NotifyReadiness:    notifyReadiness,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -263,6 +290,7 @@ func runCmd(args []string) int {
 func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *config.ManifestConfig,
 	ref string, sandboxID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
+	notifyReadiness sandbox.ReadinessNotify,
 ) int {
 	// Validate host-only restore policy before inspecting the remote reference or
 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
@@ -335,6 +363,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 		StdioMode:           stdioMode,
 		PingFatalThreshold:  pingFatal,
 		Forwards:            forwards,
+		NotifyReadiness:     notifyReadiness,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
