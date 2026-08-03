@@ -123,7 +123,10 @@ func validateFileRefIdentity(ref manifest.Ref, stream fetch.Stream) error {
 	if !ok {
 		return fmt.Errorf("file ref %q has no digest marker", ref.String())
 	}
-	digest := strings.TrimPrefix(tagged, "sha256:")
+	digest, err := tartransition.SHA256Digest(tagged)
+	if err != nil {
+		return fmt.Errorf("file ref %q uses an unsupported digest scheme: %w", ref.String(), err)
+	}
 	if ref.Digest != "" && ref.Digest != digest {
 		return fmt.Errorf("file ref %q digest mismatch: got %s", ref.String(), digest)
 	}

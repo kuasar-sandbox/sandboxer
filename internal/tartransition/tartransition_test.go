@@ -54,6 +54,19 @@ func TestDigestSignatures(t *testing.T) {
 	}
 }
 
+func TestSHA256DigestRejectsHMAC(t *testing.T) {
+	got, err := SHA256Digest("sha256:" + testDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != testDigest {
+		t.Fatalf("SHA256Digest() = %q, want %q", got, testDigest)
+	}
+	if _, err := SHA256Digest("hmac:" + testDigest); err == nil {
+		t.Fatal("HMAC digest accepted by legacy SHA-256 caller")
+	}
+}
+
 func TestCallWriteToSignatures(t *testing.T) {
 	ctx := context.Background()
 	src := sparse.Dense(bytes.NewReader(nil), 0)

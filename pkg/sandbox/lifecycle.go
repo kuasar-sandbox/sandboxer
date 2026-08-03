@@ -1380,7 +1380,10 @@ func buildDiskRef(uri string, locations config.RefLocations) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("file artifact %s has no declared digest", ref.Path)
 	}
-	digest := strings.TrimPrefix(tagged, "sha256:")
+	digest, err := tartransition.SHA256Digest(tagged)
+	if err != nil {
+		return "", fmt.Errorf("file artifact %s uses an unsupported digest scheme: %w", ref.Path, err)
+	}
 	if ref.Digest != "" && ref.Digest != digest {
 		return "", fmt.Errorf("file artifact %s digest mismatch: got %s, want %s", ref.Path, digest, ref.Digest)
 	}

@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -312,7 +311,10 @@ func (p *snapshotPublisher) publishLeaf(label, path, wantDigest string) (string,
 }
 
 func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, keepDigest bool) (string, error) {
-	hexDigest := strings.TrimPrefix(digest, "sha256:")
+	hexDigest, err := tartransition.SHA256Digest(digest)
+	if err != nil {
+		return "", fmt.Errorf("publish location: unsupported digest scheme: %w", err)
+	}
 	basename := hexDigest + ext
 	destination := filepath.Join(p.directory, basename)
 	sourceInfo, err := os.Stat(sourcePath)

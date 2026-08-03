@@ -131,9 +131,27 @@ func joinDigest(scheme, digest string) (string, error) {
 	return validateTagged(scheme + ":" + digest)
 }
 
+// SHA256Digest returns the untagged digest only when tagged uses the legacy
+// SHA-256 scheme that current sandboxer refs and content-addressed names can
+// represent. Final-API HMAC identities must fail closed until issue #24 makes
+// those callers scheme-aware and deletes this bridge.
+func SHA256Digest(tagged string) (string, error) {
+	tagged, err := validateTagged(tagged)
+	if err != nil {
+		return "", err
+	}
+	scheme, digest, _ := strings.Cut(tagged, ":")
+	if scheme != digestSchemeSHA256 {
+		return "", fmt.Errorf("tartransition: digest scheme is not supported before sandboxer issue #24")
+	}
+	return digest, nil
+}
+
+const digestSchemeSHA256 = "sha256"
+
 func validateTagged(tagged string) (string, error) {
 	scheme, digest, found := strings.Cut(tagged, ":")
-	if !found || scheme != "sha256" && scheme != "hmac" {
+	if !found || scheme != digestSchemeSHA256 && scheme != "hmac" {
 		return "", fmt.Errorf("tartransition: invalid digest scheme")
 	}
 	if len(digest) != 64 || strings.ToLower(digest) != digest {
