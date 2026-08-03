@@ -375,9 +375,5 @@ func effectiveSnapshotBaseRef(raw string, snapRef manifest.Ref) (string, error) 
 		return snapRef.String(), nil
 	}
 	ref.Path = filepath.Base(ref.Path)
-	ref.Digest = snapRef.Digest
-	if err := ref.Validate(); err != nil {
-		return "", err
-	}
-	return ref.String(), nil
+	return tartransition.SHA256RefString(ref, snapRef.Digest)
 }
