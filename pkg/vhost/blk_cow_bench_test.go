@@ -136,6 +136,37 @@ func BenchmarkBlockCOWSnapshotView(b *testing.B) {
 	}
 	b.Run("read-dirty-4k", func(b *testing.B) { benchmarkRead(b, 0) })
 	b.Run("read-clean-4k", func(b *testing.B) { benchmarkRead(b, cowBlockSize) })
+
+	b.Run("read-dense-1m", func(b *testing.B) {
+		dense, err := OpenBlockCOW(
+			filepath.Join(b.TempDir(), "dense.ext4"),
+			zeroBlockReader{size: size},
+			size,
+		)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { _ = dense.Close() })
+		if _, err := dense.WriteAt(make([]byte, size), 0); err != nil {
+			b.Fatal(err)
+		}
+		view, _, err := dense.SnapshotView()
+		if err != nil {
+			b.Fatal(err)
+		}
+		buf := make([]byte, size)
+		b.SetBytes(size)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := view.Seek(0, io.SeekStart); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := io.ReadFull(view, buf); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func resetBenchmarkCOW(b *testing.B, cow *BlockCOW) {

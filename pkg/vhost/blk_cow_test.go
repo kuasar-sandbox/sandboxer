@@ -441,6 +441,38 @@ func TestBlockCOW_SnapshotViewIsUpperOnly(t *testing.T) {
 	}
 }
 
+func TestBlockCOW_SnapshotViewReadsDenseRanges(t *testing.T) {
+	const size = (cowLockStripes + 4) * cowBlockSize
+	payload := patternedBytes(size)
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), nil, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cow.Close()
+	if _, err := cow.WriteAt(payload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	view, holes, err := cow.SnapshotView()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holes) != 0 {
+		t.Fatalf("dense view holes=%v, want none", holes)
+	}
+	const offset = (cowLockStripes-2)*cowBlockSize + 123
+	got := make([]byte, 5*cowBlockSize-380)
+	if _, err := view.Seek(offset, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(view, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload[offset:offset+len(got)]) {
+		t.Fatal("dense snapshot range differs from diff plaintext")
+	}
+}
+
 func TestSnapshotHoles(t *testing.T) {
 	bitmap := []uint64{0}
 	bitmap[0] = 1<<1 | 1<<2 | 1<<5

@@ -409,18 +409,23 @@ func (r *cowSnapshotReaderAt) ReadAt(buf []byte, offset int64) (int, error) {
 	for written < n {
 		pos := offset + int64(written)
 		blk := pos / r.cow.blockSize
-		blkEnd := (blk + 1) * r.cow.blockSize
-		chunkLen := n - written
-		if remaining := blkEnd - pos; int64(chunkLen) > remaining {
-			chunkLen = int(remaining)
+		dirty := bitmapBlockDirty(r.bitmap, blk)
+		runEnd := min((blk+1)*r.cow.blockSize, offset+int64(n))
+		for runEnd < offset+int64(n) {
+			nextBlk := runEnd / r.cow.blockSize
+			if bitmapBlockDirty(r.bitmap, nextBlk) != dirty {
+				break
+			}
+			runEnd = min((nextBlk+1)*r.cow.blockSize, offset+int64(n))
 		}
+		chunkLen := int(runEnd - pos)
 		chunk := buf[written : written+chunkLen]
 
-		if bitmapBlockDirty(r.bitmap, blk) {
-			lock := r.cow.blockLock(blk)
-			lock.RLock()
+		if dirty {
+			lastBlk := (runEnd - 1) / r.cow.blockSize
+			r.cow.rlockBlockRange(blk, lastBlk)
 			read, err := r.cow.diff.ReadAt(chunk, pos)
-			lock.RUnlock()
+			r.cow.runlockBlockRange(blk, lastBlk)
 			written += read
 			if err != nil && !(errors.Is(err, io.EOF) && read == len(chunk)) {
 				return written, err
@@ -435,6 +440,60 @@ func (r *cowSnapshotReaderAt) ReadAt(buf []byte, offset int64) (int, error) {
 		written += len(chunk)
 	}
 	return written, eof
+}
+
+// rlockBlockRange locks each stripe touched by the inclusive block range once,
+// in numeric stripe order. Snapshot reads can then issue one pread for a
+// contiguous dirty run without weakening same-block exclusion or recursively
+// taking an RWMutex when a range spans more than one full stripe cycle.
+func (c *BlockCOW) rlockBlockRange(first, last int64) {
+	stripeCount := int64(len(c.blockMu))
+	blockCount := last - first + 1
+	firstStripe := first % stripeCount
+	if blockCount >= stripeCount {
+		for stripe := int64(0); stripe < stripeCount; stripe++ {
+			c.blockMu[stripe].RLock()
+		}
+		return
+	}
+	end := firstStripe + blockCount
+	if end <= stripeCount {
+		for stripe := firstStripe; stripe < end; stripe++ {
+			c.blockMu[stripe].RLock()
+		}
+		return
+	}
+	for stripe := int64(0); stripe < end-stripeCount; stripe++ {
+		c.blockMu[stripe].RLock()
+	}
+	for stripe := firstStripe; stripe < stripeCount; stripe++ {
+		c.blockMu[stripe].RLock()
+	}
+}
+
+func (c *BlockCOW) runlockBlockRange(first, last int64) {
+	stripeCount := int64(len(c.blockMu))
+	blockCount := last - first + 1
+	firstStripe := first % stripeCount
+	if blockCount >= stripeCount {
+		for stripe := stripeCount - 1; stripe >= 0; stripe-- {
+			c.blockMu[stripe].RUnlock()
+		}
+		return
+	}
+	end := firstStripe + blockCount
+	if end <= stripeCount {
+		for stripe := end - 1; stripe >= firstStripe; stripe-- {
+			c.blockMu[stripe].RUnlock()
+		}
+		return
+	}
+	for stripe := stripeCount - 1; stripe >= firstStripe; stripe-- {
+		c.blockMu[stripe].RUnlock()
+	}
+	for stripe := end - stripeCount - 1; stripe >= 0; stripe-- {
+		c.blockMu[stripe].RUnlock()
+	}
 }
 
 func bitmapBlockDirty(bitmap []uint64, blk int64) bool {
