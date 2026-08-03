@@ -16,8 +16,9 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/internal/runtimebundle"
-	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
@@ -36,6 +37,7 @@ import (
 type RunOptions struct {
 	Cfg           *config.SandboxConfig
 	ManifestCfg   *config.ManifestConfig // for manifest:// resolution; may be nil if all file://
+	Fetcher       fetch.Fetcher          // lazily network-backed; caller owns its lifetime
 	RefLocations  config.RefLocations    // trusted logical location -> host directory mappings
 	SandboxID     string                 // generated if empty
 	CHBinary      string                 // path to bin/cloud-hypervisor
@@ -44,6 +46,9 @@ type RunOptions struct {
 	StatsJSONPath string                 // if set, write vhost stats as JSON to this path on shutdown
 	StatsInterval time.Duration          // if > 0, periodically log lazy-load stats; 0 = off
 	StdioMode     stdio.Mode             // CH process stdio wiring; see pkg/stdio
+	CustomerKeyFn ingest.CustomerKeyFunc // process-fixed customer key resolver
+	LocalCodec    tarstream.Codec        // nil when crypto.local=off
+	LocalRequired bool                   // reject plaintext local tarstreams
 
 	// PingFatalThreshold: after this many consecutive ping failures
 	// the host SIGTERMs CH so cmd.Wait() returns. 0 = disabled
@@ -69,6 +74,9 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if opts.Cfg == nil {
 		return -1, fmt.Errorf("RunOptions.Cfg is nil")
 	}
+	if opts.LocalRequired && opts.LocalCodec == nil {
+		return -1, fmt.Errorf("RunOptions.LocalRequired requires LocalCodec")
+	}
 	if opts.SandboxID == "" {
 		opts.SandboxID = generateSandboxID()
 	}
@@ -93,7 +101,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 			return -1, err
 		}
 	}
-	if err := populateSnapshotRefs(opts.Cfg, opts.RefLocations); err != nil {
+	if err := populateSnapshotRefs(opts.Cfg, opts.RefLocations, opts.LocalCodec, opts.LocalRequired); err != nil {
 		return -1, fmt.Errorf("snapshot refs: %w", err)
 	}
 
@@ -197,19 +205,16 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// configs without a manifest config skip the dial. snapshot --upload
 	// builds its own (write-side) Ingester at request time; the two
 	// paths never share a connection pool.
-	var fetcher manifest.FetcherCloser
+	fetcher := opts.Fetcher
 	if needsManifestFetcher(opts.Cfg) {
-		if opts.ManifestCfg == nil {
+		if fetcher == nil {
 			return -1, fmt.Errorf("manifest:// disk requires --manifest-config or MANIFEST_CONFIG")
 		}
-		fetcher, err = opts.ManifestCfg.NewFetcher()
-		if err != nil {
-			return -1, fmt.Errorf("manifest fetcher: %w", err)
+		if opts.ManifestCfg != nil {
+			logf("manifest fetcher: store=%s cache=%s crypto=%s/%s",
+				opts.ManifestCfg.Store.Endpoint, opts.ManifestCfg.Cache.Endpoint,
+				opts.ManifestCfg.Crypto.Chunk, opts.ManifestCfg.Crypto.Manifest)
 		}
-		defer fetcher.Close()
-		logf("manifest fetcher: store=%s cache=%s crypto=%s/%s",
-			opts.ManifestCfg.Store.Endpoint, opts.ManifestCfg.Cache.Endpoint,
-			opts.ManifestCfg.Crypto.Chunk, opts.ManifestCfg.Crypto.Manifest)
 	}
 
 	// Resolve the root disk(s) and image config by mode (docs/sandbox-runtime
@@ -224,7 +229,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if opts.Cfg.SingleDisk() {
 		imageCfg = &ImageConfig{}
 	} else {
-		r, _, err := OpenBlockReader(ctx, opts.Cfg.Boot.Root.Base, fetcher, opts.RefLocations)
+		r, _, err := OpenBlockReader(ctx, opts.Cfg.Boot.Root.Base, fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
 		if err != nil {
 			return -1, fmt.Errorf("blk0 base: %w", err)
 		}
@@ -297,7 +302,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		diffURI, diffTemplate = opts.Cfg.Boot.Root.Diff, opts.Cfg.Boot.Root.DiffTemplate
 		if opts.Cfg.Boot.Root.Base != "" {
 			refs := append([]string{opts.Cfg.Boot.Root.Base}, opts.Cfg.Boot.Root.BaseFromRefs...)
-			r, _, err := OpenLayeredBlockReader(ctx, refs, fetcher, opts.RefLocations)
+			r, _, err := OpenLayeredBlockReader(ctx, refs, fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
 			if err != nil {
 				return -1, fmt.Errorf("single-disk root base: %w", err)
 			}
@@ -308,7 +313,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		diffURI, diffTemplate = opts.Cfg.Boot.Root.Overlay.Diff, opts.Cfg.Boot.Root.Overlay.DiffTemplate
 		if opts.Cfg.Boot.Root.Overlay.Base != "" {
 			refs := append([]string{opts.Cfg.Boot.Root.Overlay.Base}, opts.Cfg.Boot.Root.Overlay.BaseFromRefs...)
-			r, _, err := OpenLayeredBlockReader(ctx, refs, fetcher, opts.RefLocations)
+			r, _, err := OpenLayeredBlockReader(ctx, refs, fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
 			if err != nil {
 				return -1, fmt.Errorf("blk1 overlay base: %w", err)
 			}
@@ -365,7 +370,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		OwnedDiff: ownedDiff,
 	}}
 	for i := range opts.Cfg.Boot.Disks {
-		db, dcleanup, derr := prepColdDataDisk(ctx, &opts.Cfg.Boot.Disks[i], i, opts.BaseRoot, opts.SandboxID, fetcher, opts.RefLocations)
+		db, dcleanup, derr := prepColdDataDisk(ctx, &opts.Cfg.Boot.Disks[i], i, opts.BaseRoot, opts.SandboxID, fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
 		if derr != nil {
 			return -1, derr
 		}
@@ -412,6 +417,9 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 
 		SnapCfg:           opts.Cfg,
 		ManifestCfg:       opts.ManifestCfg,
+		CustomerKeyFn:     opts.CustomerKeyFn,
+		LocalCodec:        opts.LocalCodec,
+		LocalRequired:     opts.LocalRequired,
 		Forwards:          opts.Forwards,
 		Cgroup:            cg,
 		NotifyReadiness:   opts.NotifyReadiness,
@@ -637,7 +645,7 @@ func resolveDiskMounts(mounts []proto.MountSpec, disks []config.DiskConfig, root
 // optional ro base(s) and builds its writable CoW diff (same machinery as the
 // root). ordinal is its boot.disks[] index (used for the auto-default diff name).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, baseRoot, sandboxID string, fetcher fetch.Fetcher, locations config.RefLocations) (DiskBackend, func(), error) {
+func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, baseRoot, sandboxID string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (DiskBackend, func(), error) {
 	var db DiskBackend
 	var closers []func()
 	cleanup := func() {
@@ -655,7 +663,7 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 	if single {
 		cowBaseURI, diffURI, diffTemplate = d.Base, d.Diff, d.DiffTemplate
 	} else {
-		r, _, err := OpenBlockReader(ctx, d.Base, fetcher, locations)
+		r, _, err := OpenBlockReader(ctx, d.Base, fetcher, locations, codec, required)
 		if err != nil {
 			return fail(fmt.Errorf("%s erofs base: %w", field, err))
 		}
@@ -673,7 +681,7 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 			fromRefs = d.Overlay.BaseFromRefs
 		}
 		refs := append([]string{cowBaseURI}, fromRefs...)
-		r, _, err := OpenLayeredBlockReader(ctx, refs, fetcher, locations)
+		r, _, err := OpenLayeredBlockReader(ctx, refs, fetcher, locations, codec, required)
 		if err != nil {
 			return fail(fmt.Errorf("%s cow base: %w", field, err))
 		}
@@ -739,23 +747,29 @@ func (q *allQuiescer) Resume() {
 // that owns the bundle holds references; the snapshot path consumes
 // them when a request arrives.
 type SnapshotHandler struct {
-	Cfg         *config.SandboxConfig
-	ManifestCfg *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
-	SandboxID   string                 // required: snapshot.Take rejects empty
-	Memfd       *memory.Memfd
-	Disks       []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
-	Servers     []*vhost.Server // all vhost servers (quiesced together around the dump)
-	CHSock      string
-	RunDir      string
-	Pinger      *guestlink.Pinger // optional; if non-nil, paused around quiesce/Take
-	Forwarder   *Forwarder        // optional; if non-nil, paused + active relays collapsed around quiesce
-	Reattach    func() error      // optional; re-establishes the stdio MUX after --resume
-	Logf        func(string, ...any)
+	Cfg           *config.SandboxConfig
+	ManifestCfg   *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
+	CustomerKeyFn ingest.CustomerKeyFunc
+	LocalCodec    tarstream.Codec
+	LocalRequired bool
+	SandboxID     string // required: snapshot.Take rejects empty
+	Memfd         *memory.Memfd
+	Disks         []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
+	Servers       []*vhost.Server // all vhost servers (quiesced together around the dump)
+	CHSock        string
+	RunDir        string
+	Pinger        *guestlink.Pinger // optional; if non-nil, paused around quiesce/Take
+	Forwarder     *Forwarder        // optional; if non-nil, paused + active relays collapsed around quiesce
+	Reattach      func() error      // optional; re-establishes the stdio MUX after --resume
+	Logf          func(string, ...any)
 }
 
 // Handle dispatches one ctl snapshot_request. Public for restore.Run.
 func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
-	opts := RunOptions{Cfg: h.Cfg, ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID}
+	opts := RunOptions{
+		Cfg: h.Cfg, ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
+		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
+	}
 	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, h.Pinger, h.Forwarder, h.Reattach, h.Logf)
 }
 
@@ -840,13 +854,13 @@ func handleSnapshotRequest(
 			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q has invalid logical size %d", i, dd.Path, d.Size)
 		}
 		diffSize := d.Size
-		var parentDiskRef string
+		var parentDiskRef, parentDiskPath string
 		if i == 0 {
 			parentDiskRef = prov.ParentOverlayBase
-			dd.MergeBase = prov.ParentOverlayPath
+			parentDiskPath = prov.ParentOverlayPath
 		} else if i-1 < len(prov.ParentDisks) {
 			parentDiskRef = prov.ParentDisks[i-1].OverlayBase
-			dd.MergeBase = prov.ParentDisks[i-1].OverlayPath
+			parentDiskPath = prov.ParentDisks[i-1].OverlayPath
 		}
 		mergeDisk := false
 		if parentDiskRef != "" {
@@ -857,10 +871,14 @@ func handleSnapshotRequest(
 			mergeDisk = !ref.Portable()
 		}
 		if mergeDisk {
-			if dd.MergeBase == "" {
+			if parentDiskPath == "" {
 				return ctl.Response{}, fmt.Errorf("snapshot: local parent disk %d lacks a merge base path", i)
 			}
-			if err := snapshot.ValidateMergeBase(dd.MergeBase, diffSize); err != nil {
+			dd.MergeBase, err = resolvedLocalMergeRef(parentDiskPath, parentDiskRef)
+			if err != nil {
+				return ctl.Response{}, fmt.Errorf("snapshot: disk %d merge base identity: %w", i, err)
+			}
+			if err := snapshot.ValidateMergeBase(dd.MergeBase, diffSize, opts.LocalCodec, opts.LocalRequired); err != nil {
 				return ctl.Response{}, fmt.Errorf("snapshot: disk %d merge base: %w", i, err)
 			}
 			diskMerged[i] = true
@@ -871,11 +889,16 @@ func handleSnapshotRequest(
 	}
 
 	mergeMemory := localParent && mergeRef
+	memoryMergeBase := ""
 	if mergeMemory {
 		if prov.ParentSnapshotPath == "" {
-			return ctl.Response{}, fmt.Errorf("snapshot: local parent %q lacks a memory merge path", prov.ParentSnapshotRef)
+			return ctl.Response{}, fmt.Errorf("snapshot: local parent lacks a memory merge path")
 		}
-		if err := snapshot.ValidateMergeBase(prov.ParentSnapshotPath, int64(mfd.Size())); err != nil {
+		memoryMergeBase, err = resolvedLocalMergeRef(prov.ParentSnapshotPath, prov.ParentSnapshotRef)
+		if err != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot: memory merge base identity: %w", err)
+		}
+		if err := snapshot.ValidateMergeBase(memoryMergeBase, int64(mfd.Size()), opts.LocalCodec, opts.LocalRequired); err != nil {
 			return ctl.Response{}, fmt.Errorf("snapshot: memory merge base: %w", err)
 		}
 	}
@@ -888,7 +911,7 @@ func handleSnapshotRequest(
 		return ctl.Response{}, err
 	}
 	if !req.Upload {
-		if err := validateLocalMemoryRefs(req.OutDir, resultMemoryRefs); err != nil {
+		if err := validateLocalMemoryRefs(req.OutDir, resultMemoryRefs, opts.LocalCodec); err != nil {
 			return ctl.Response{}, err
 		}
 	}
@@ -903,7 +926,10 @@ func handleSnapshotRequest(
 	var sink snapshot.SnapshotSink
 	var ingestSink *snapshot.IngestSink
 	if req.Upload {
-		ing, ierr := opts.ManifestCfg.NewIngester(opts.ManifestCfg.IngestKeyFunc(), nil)
+		if opts.CustomerKeyFn == nil {
+			return ctl.Response{}, fmt.Errorf("snapshot ingester: customer key resolver is unavailable")
+		}
+		ing, ierr := opts.ManifestCfg.NewIngester(opts.CustomerKeyFn, nil)
 		if ierr != nil {
 			return ctl.Response{}, fmt.Errorf("snapshot ingester: %w", ierr)
 		}
@@ -911,7 +937,7 @@ func handleSnapshotRequest(
 		ingestSink = snapshot.NewIngestSink(ing, logf)
 		sink = ingestSink
 	} else {
-		sink = snapshot.NewFileSink(req.OutDir, opts.SandboxID, logf)
+		sink = snapshot.NewFileSink(req.OutDir, opts.SandboxID, opts.LocalCodec, opts.LocalRequired, logf)
 	}
 
 	dropCachesResult := proto.DropCachesUnknown
@@ -979,7 +1005,7 @@ func handleSnapshotRequest(
 	}
 
 	// Build snapshot.cfg builder closure. Take() invokes it with the final
-	// overlay_ref the sink produced (file://<sha256>.overlay in --output mode,
+	// overlay_ref the sink produced (scheme-qualified file ref in --output mode,
 	// manifest://<key> in --upload mode) so snapshot.cfg's overlay.base is
 	// final on first write — no post-hoc ZIP rewrite.
 	cfg := opts.Cfg
@@ -1011,9 +1037,11 @@ func handleSnapshotRequest(
 		SnapshotCfg:   snapCfgBuilder,
 		Quiescer:      &allQuiescer{servers: servers},
 		Logf:          logf,
+		LocalCodec:    opts.LocalCodec,
+		LocalRequired: opts.LocalRequired,
 	}
 	if mergeMemory {
-		src.MergeBaseSnapshot = prov.ParentSnapshotPath
+		src.MergeBaseSnapshot = memoryMergeBase
 	}
 	out, err := snapshot.Take(src, sink, req.ResumeAfter)
 	if err != nil {
@@ -1103,11 +1131,11 @@ func ensureSnapshotDir(dir string) error {
 	return os.Remove(name)
 }
 
-func validateLocalMemoryRefs(outputDir string, refs []string) error {
+func validateLocalMemoryRefs(outputDir string, refs []string, codec tarstream.Codec) error {
 	for i, raw := range refs {
 		ref, err := manifest.ParseRef(raw)
 		if err != nil {
-			return fmt.Errorf("snapshot: memory ref[%d] %q: %w", i, raw, err)
+			return fmt.Errorf("snapshot: memory ref[%d] is invalid", i)
 		}
 		if ref.Portable() {
 			continue
@@ -1118,17 +1146,23 @@ func validateLocalMemoryRefs(outputDir string, refs []string) error {
 		path := filepath.Join(outputDir, filepath.Base(ref.Path))
 		info, err := os.Stat(path)
 		if err != nil {
-			return fmt.Errorf("snapshot: local memory ref[%d] %q is not accessible at %q: %w", i, raw, path, err)
+			if codec != nil {
+				return fmt.Errorf("snapshot: local memory ref[%d] is not accessible", i)
+			}
+			return fmt.Errorf("snapshot: local memory ref[%d] is not accessible: %w", i, err)
 		}
 		if !info.Mode().IsRegular() {
-			return fmt.Errorf("snapshot: local memory ref[%d] %q at %q is not a regular file", i, raw, path)
+			return fmt.Errorf("snapshot: local memory ref[%d] is not a regular file", i)
 		}
 		f, err := os.Open(path)
 		if err != nil {
-			return fmt.Errorf("snapshot: local memory ref[%d] %q is not readable at %q: %w", i, raw, path, err)
+			if codec != nil {
+				return fmt.Errorf("snapshot: local memory ref[%d] is not readable", i)
+			}
+			return fmt.Errorf("snapshot: local memory ref[%d] is not readable: %w", i, err)
 		}
 		if err := f.Close(); err != nil {
-			return fmt.Errorf("snapshot: local memory ref[%d] %q close: %w", i, raw, err)
+			return fmt.Errorf("snapshot: local memory ref[%d] close: %w", i, err)
 		}
 	}
 	return nil
@@ -1138,10 +1172,10 @@ func validatePortableMemoryRefs(refs []string) error {
 	for i, raw := range refs {
 		ref, err := manifest.ParseRef(raw)
 		if err != nil {
-			return fmt.Errorf("snapshot: memory ref[%d] %q: %w", i, raw, err)
+			return fmt.Errorf("snapshot: memory ref[%d] is invalid", i)
 		}
 		if !ref.Portable() {
-			return fmt.Errorf("snapshot: direct upload would retain local memory lower ref %q; use --output then upload-snapshot", raw)
+			return fmt.Errorf("snapshot: direct upload would retain a local memory lower; use --output then upload-snapshot")
 		}
 	}
 	return nil
@@ -1155,12 +1189,12 @@ func normalizeLocalMemoryRefs(refs []string) ([]string, error) {
 	for i, raw := range refs {
 		ref, err := manifest.ParseRef(raw)
 		if err != nil {
-			return nil, fmt.Errorf("snapshot: memory ref[%d] %q: %w", i, raw, err)
+			return nil, fmt.Errorf("snapshot: memory ref[%d] is invalid", i)
 		}
 		if !ref.Portable() {
 			base := filepath.Base(ref.Path)
 			if ref.Path == "" || base == "." || base == ".." || base == string(filepath.Separator) {
-				return nil, fmt.Errorf("snapshot: memory ref[%d] %q has no artifact basename", i, raw)
+				return nil, fmt.Errorf("snapshot: memory ref[%d] has no artifact basename", i)
 			}
 			ref.Path = base
 		}
@@ -1315,7 +1349,10 @@ type overlayCfgYAML struct {
 // populateSnapshotRefs reads the identities embedded in boot.runtime and local
 // tarstream bases, then stores canonical refs on cfg.SnapshotRefs. It performs
 // metadata-only reads; manifest refs already carry their content identity.
-func populateSnapshotRefs(cfg *config.SandboxConfig, locations config.RefLocations) error {
+func populateSnapshotRefs(cfg *config.SandboxConfig, locations config.RefLocations, codec tarstream.Codec, required bool) error {
+	if err := canonicalizeConfiguredTarRefs(cfg, locations, codec, required); err != nil {
+		return err
+	}
 	rRef, err := buildRuntimeRef(cfg.Boot.Runtime)
 	if err != nil {
 		return fmt.Errorf("boot.runtime: %w", err)
@@ -1331,7 +1368,7 @@ func populateSnapshotRefs(cfg *config.SandboxConfig, locations config.RefLocatio
 			if d.Single() || d.Base == "" {
 				continue
 			}
-			ref, err := buildDiskRef(d.Base, locations)
+			ref, err := buildDiskRef(d.Base, locations, codec, required)
 			if err != nil {
 				return fmt.Errorf("boot.disks[%d].base: %w", i, err)
 			}
@@ -1342,12 +1379,94 @@ func populateSnapshotRefs(cfg *config.SandboxConfig, locations config.RefLocatio
 	if cfg.Boot.Root.Base == "" {
 		return nil
 	}
-	bRef, err := buildDiskRef(cfg.Boot.Root.Base, locations)
+	bRef, err := buildDiskRef(cfg.Boot.Root.Base, locations, codec, required)
 	if err != nil {
 		return fmt.Errorf("boot.root.base: %w", err)
 	}
 	cfg.SnapshotRefs.BaseRef = bRef
 	return nil
+}
+
+// canonicalizeConfiguredTarRefs replaces every local immutable disk ref in the
+// live config with the actual policy-normalized identity returned by its
+// artifact. Paths and named locations are preserved for later opens. This
+// keeps cold-start lower chains from copying legacy sha256 qualifiers into a
+// newly generated key-bound snapshot.cfg.
+func canonicalizeConfiguredTarRefs(cfg *config.SandboxConfig, locations config.RefLocations, codec tarstream.Codec, required bool) error {
+	if cfg == nil {
+		return fmt.Errorf("sandbox config is nil")
+	}
+	normalize := func(field string, target *string) error {
+		if target == nil || *target == "" {
+			return nil
+		}
+		ref, err := canonicalConfiguredTarRef(*target, locations, codec, required)
+		if err != nil {
+			return fmt.Errorf("%s: %w", field, err)
+		}
+		*target = ref
+		return nil
+	}
+	normalizeList := func(field string, refs []string) error {
+		for i := range refs {
+			if err := normalize(fmt.Sprintf("%s[%d]", field, i), &refs[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	normalizeRoot := func(field string, root *config.RootConfig) error {
+		if err := normalize(field+".base", &root.Base); err != nil {
+			return err
+		}
+		if err := normalizeList(field+".base_from_refs", root.BaseFromRefs); err != nil {
+			return err
+		}
+		if root.Overlay == nil {
+			return nil
+		}
+		if err := normalize(field+".overlay.base", &root.Overlay.Base); err != nil {
+			return err
+		}
+		return normalizeList(field+".overlay.base_from_refs", root.Overlay.BaseFromRefs)
+	}
+	if err := normalizeRoot("boot.root", &cfg.Boot.Root); err != nil {
+		return err
+	}
+	for i := range cfg.Boot.Disks {
+		if err := normalizeRoot(fmt.Sprintf("boot.disks[%d]", i), &cfg.Boot.Disks[i].RootConfig); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func canonicalConfiguredTarRef(raw string, locations config.RefLocations, codec tarstream.Codec, required bool) (string, error) {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return "", protectLocalArtifactError(codec, "parse local artifact ref", err)
+	}
+	if ref.Scheme == manifest.RefSchemeManifest {
+		return ref.String(), nil
+	}
+	stream, _, err := OpenDiskStream(context.Background(), raw, nil, locations, codec, required)
+	if err != nil {
+		return "", err
+	}
+	digester, ok := stream.(tarstream.Digester)
+	if !ok {
+		_ = stream.Close()
+		return "", fmt.Errorf("local artifact has no declared digest")
+	}
+	scheme, digest := digester.Digest()
+	if err := stream.Close(); err != nil {
+		return "", err
+	}
+	ref.DigestScheme, ref.Digest = scheme, digest
+	if err := ref.Validate(); err != nil {
+		return "", fmt.Errorf("invalid canonical local artifact ref")
+	}
+	return ref.String(), nil
 }
 
 // buildRuntimeRef produces the canonical snapshot ref for the PMEM runtime
@@ -1366,7 +1485,7 @@ func buildRuntimeRef(uri string) (string, error) {
 
 // buildDiskRef passes manifest identities through and reads a local tarstream
 // artifact's declared identity without scanning its payload.
-func buildDiskRef(uri string, locations config.RefLocations) (string, error) {
+func buildDiskRef(uri string, locations config.RefLocations, codec tarstream.Codec, required bool) (string, error) {
 	ref, err := manifest.ParseRef(uri)
 	if err != nil {
 		return "", err
@@ -1374,31 +1493,44 @@ func buildDiskRef(uri string, locations config.RefLocations) (string, error) {
 	if ref.Scheme == manifest.RefSchemeManifest {
 		return ref.String(), nil
 	}
-	stream, _, err := OpenDiskStream(context.Background(), uri, nil, locations)
+	stream, _, err := OpenDiskStream(context.Background(), uri, nil, locations, codec, required)
 	if err != nil {
 		return "", err
 	}
 	defer stream.Close()
-	tagged, ok, err := tartransition.Digest(stream)
-	if err != nil {
-		return "", fmt.Errorf("file artifact %s has invalid declared digest: %w", ref.Path, err)
-	}
+	digester, ok := stream.(tarstream.Digester)
 	if !ok {
-		return "", fmt.Errorf("file artifact %s has no declared digest", ref.Path)
+		return "", fmt.Errorf("file artifact has no declared digest")
 	}
-	digest, err := tartransition.SHA256Digest(tagged)
-	if err != nil {
-		return "", fmt.Errorf("file artifact %s uses an unsupported digest scheme: %w", ref.Path, err)
-	}
-	expected, err := tartransition.SHA256RefDigest(ref)
-	if err != nil {
-		return "", fmt.Errorf("file artifact %s uses an unsupported ref digest scheme: %w", ref.Path, err)
-	}
-	if expected != "" && expected != digest {
-		return "", fmt.Errorf("file artifact %s digest mismatch: got %s, want %s", ref.Path, digest, expected)
-	}
+	scheme, digest := digester.Digest()
 	ref.Path = filepath.Base(ref.Path)
-	return tartransition.SHA256RefString(ref, digest)
+	ref.DigestScheme = scheme
+	ref.Digest = digest
+	if err := ref.Validate(); err != nil {
+		return "", fmt.Errorf("file artifact ref: %w", err)
+	}
+	return ref.String(), nil
+}
+
+// resolvedLocalMergeRef binds an already-resolved local path to the canonical
+// identity carried in snapshot provenance. Merge preflight and Take both open
+// this exact ref, avoiding basename inference and TOCTOU loss of the expected
+// digest between the two stages.
+func resolvedLocalMergeRef(path, raw string) (string, error) {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Portable() || ref.Digest == "" {
+		return "", fmt.Errorf("scheme-qualified local file identity required")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve local merge path: %w", err)
+	}
+	ref.Path = abs
+	ref.Location = ""
+	if err := ref.Validate(); err != nil {
+		return "", fmt.Errorf("invalid local merge identity")
+	}
+	return ref.String(), nil
 }
 
 func generateSandboxID() string {

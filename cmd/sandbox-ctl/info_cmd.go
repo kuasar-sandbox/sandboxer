@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -27,7 +28,7 @@ import (
 func infoCmd(args []string) int {
 	fs := flag.NewFlagSet("info", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "machine-readable JSON output")
-	manifestPath := fs.String("manifest-config", "", "manifest config YAML (overrides MANIFEST_CONFIG env); required for manifest:// inputs")
+	manifestPath := fs.String("manifest-config", "", "storage config YAML (overrides MANIFEST_CONFIG env); required for manifest:// or crypto.local=auto|required")
 	refLocations := config.RefLocations{}
 	fs.Var(refLocations, "ref-location", "trusted ref location name=file:///absolute/path (repeatable)")
 	if err := fs.Parse(args); err != nil {
@@ -40,41 +41,44 @@ func infoCmd(args []string) int {
 	}
 
 	ctx := context.Background()
+	manifestCfg, err := config.LoadManifestConfig(*manifestPath)
+	if err != nil {
+		if !errors.Is(err, manifest.ErrConfigNotProvided) {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		manifestCfg = nil
+	}
+	keyFn, localCodec, localRequired, err := storageOptions(manifestCfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	var manifestFetcher fetch.Fetcher
+	if manifestCfg != nil {
+		lazy := &onDemandManifestFetcher{cfg: manifestCfg, keyFn: keyFn}
+		manifestFetcher = lazy
+		defer lazy.Close()
+	}
 	var (
 		stream    fetch.Stream
 		totalSize int64
 	)
-	if strings.HasPrefix(input, "manifest://") || strings.HasPrefix(input, "file://") {
-		var fetcher manifest.FetcherCloser
-		if strings.HasPrefix(input, "manifest://") {
-			mcfg, err := config.LoadManifestConfig(*manifestPath)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				return 1
-			}
-			fetcher, err = mcfg.NewFetcher()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				return 1
-			}
-			defer fetcher.Close()
-		}
-		fc, sz, err := sandbox.OpenDiskStream(ctx, input, fetcher, refLocations)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		defer fc.Close()
-		stream, totalSize = fc, sz
-	} else {
-		fsr, err := fetch.OpenTarStream(input)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		defer fsr.Close()
-		stream, totalSize = fsr, int64(fsr.Size())
+	uri := input
+	if !strings.HasPrefix(uri, "manifest://") && !strings.HasPrefix(uri, "file://") {
+		uri = "file://" + uri
 	}
+	if strings.HasPrefix(uri, "manifest://") && manifestCfg == nil {
+		fmt.Fprintln(os.Stderr, "manifest:// input requires --manifest-config or MANIFEST_CONFIG")
+		return 1
+	}
+	opened, size, err := sandbox.OpenDiskStream(ctx, uri, manifestFetcher, refLocations, localCodec, localRequired)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer opened.Close()
+	stream, totalSize = opened, size
 
 	body, err := readSnapshotCfg(fetch.NewReaderAt(ctx, stream), totalSize)
 	if err != nil {

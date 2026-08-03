@@ -2,7 +2,7 @@
 // Subcommands:
 //
 //	run       — start a sandbox (cold-start; or with --restore=<ref> from a snapshot)
-//	snapshot  — pause + dump to <sid>.snapshot + <sha256>.overlay (or upload)
+//	snapshot  — pause + dump to <sid>.snapshot + <digest>.overlay (or upload)
 //	exec      — run an ad-hoc command inside a running sandbox
 //	config    — produce / merge / validate a sandbox.yaml
 //	info      — print a snapshot's embedded snapshot.cfg
@@ -96,11 +96,12 @@ Usage:
 			[--quiet] <snapshot-path>
 			publish local refs and print the canonical portable root ref (no boot)
 
---manifest-config (or MANIFEST_CONFIG env) is required for any
-manifest:// resource (boot.root.base, --restore manifest://, --upload).
-file://-only configurations may omit it. The sensitive manifest.key may
-be supplied via the MANIFEST_KEY env var instead of the config file
-(MANIFEST_KEY overrides a manifest.key set in the file).
+--manifest-config (or MANIFEST_CONFIG env) supplies the shared storage
+configuration. It is required for any manifest:// resource and for local
+file artifacts when crypto.local is auto or required. file://-only off-mode
+configurations may omit it. The sensitive manifest.key may be supplied via
+the MANIFEST_KEY env var instead of the config file (MANIFEST_KEY overrides
+a manifest.key set in the file).
 
 run starts one sandbox VM and blocks until the guest exits. With
 --restore, the sandbox is resumed from a snapshot bundle instead of

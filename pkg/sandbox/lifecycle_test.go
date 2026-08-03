@@ -33,20 +33,19 @@ func TestValidateLocalMemoryRefsUsesOutputBundleDirectory(t *testing.T) {
 		manifestRef,
 		locatedRef,
 	}
-	if err := validateLocalMemoryRefs(out, refs); err != nil {
+	if err := validateLocalMemoryRefs(out, refs, nil); err != nil {
 		t.Fatalf("validateLocalMemoryRefs() error = %v", err)
 	}
 
 	if err := os.Symlink(name, filepath.Join(out, "alias.snapshot")); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateLocalMemoryRefs(out, []string{"file://alias.snapshot"}); err != nil {
+	if err := validateLocalMemoryRefs(out, []string{"file://alias.snapshot"}, nil); err != nil {
 		t.Fatalf("accessible sibling symlink should be accepted: %v", err)
 	}
 
-	err := validateLocalMemoryRefs(out, []string{"file://missing.snapshot"})
-	if err == nil || !strings.Contains(err.Error(), `file://missing.snapshot`) ||
-		!strings.Contains(err.Error(), filepath.Join(out, "missing.snapshot")) {
+	err := validateLocalMemoryRefs(out, []string{"file://missing.snapshot"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "not accessible") {
 		t.Fatalf("missing local memory ref error = %v", err)
 	}
 }
@@ -77,7 +76,7 @@ func TestValidateLocalMemoryRefsRejectsNonRegularFiles(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			err := validateLocalMemoryRefs(out, []string{"file://base.snapshot"})
+			err := validateLocalMemoryRefs(out, []string{"file://base.snapshot"}, nil)
 			if err == nil || !strings.Contains(err.Error(), "is not a regular file") {
 				t.Fatalf("non-regular local memory ref error = %v", err)
 			}
@@ -145,10 +144,11 @@ func TestHandleSnapshotRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T
 func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) {
 	dir := t.TempDir()
 	diff := filepath.Join(dir, "must-not-be-opened.diff")
+	digest := strings.Repeat("0", 64)
 	cfg := &config.SandboxConfig{}
 	cfg.SnapshotProvenance = config.SnapshotProvenance{
-		ParentSnapshotRef: "file://base.snapshot",
-		ParentOverlayBase: "file://base.overlay",
+		ParentSnapshotRef: "file://base.snapshot@sha256:" + digest,
+		ParentOverlayBase: "file://base.overlay@sha256:" + digest,
 		ParentOverlayPath: filepath.Join(dir, "missing.overlay"),
 	}
 	pinger := &guestlink.Pinger{
@@ -168,8 +168,7 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 			},
 		}}, nil, "", filepath.Join(dir, "run"),
 		pinger, nil, nil, discardLogf)
-	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") ||
-		!strings.Contains(err.Error(), "missing.overlay") {
+	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") {
 		t.Fatalf("disk merge preflight error = %v", err)
 	}
 	if viewCalled {

@@ -28,8 +28,8 @@ func TestAbsorbOverlayUsesSnapshotView(t *testing.T) {
 			return bytes.NewReader(logical), holes, nil
 		},
 	}
-	sink := NewFileSink(t.TempDir(), "sid", nil)
-	ref, path, err := absorbOverlay(context.Background(), sink, diff, false)
+	sink := NewFileSink(t.TempDir(), "sid", nil, false, nil)
+	ref, path, err := absorbOverlay(context.Background(), sink, diff, false, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,8 +61,8 @@ func TestAbsorbOverlayUsesSnapshotView(t *testing.T) {
 }
 
 func TestAbsorbOverlayRequiresSnapshotView(t *testing.T) {
-	sink := NewFileSink(t.TempDir(), "sid", nil)
-	if _, _, err := absorbOverlay(context.Background(), sink, DiskDiff{Path: "raw.diff"}, false); err == nil {
+	sink := NewFileSink(t.TempDir(), "sid", nil, false, nil)
+	if _, _, err := absorbOverlay(context.Background(), sink, DiskDiff{Path: "raw.diff"}, false, nil, false); err == nil {
 		t.Fatal("absorbOverlay accepted a raw-path-only diff")
 	}
 }

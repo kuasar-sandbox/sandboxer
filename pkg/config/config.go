@@ -125,12 +125,12 @@ func (c RestoreConfig) validate() error {
 	return err
 }
 
-// SnapshotRefs holds the precomputed `file://<basename>@sha256:<digest>`
+// SnapshotRefs holds precomputed scheme-qualified file refs or manifest refs.
 // (or `manifest://<key>`) refs for boot.runtime and boot.root.base, used
 // when synthesising snapshot.cfg.
 type SnapshotRefs struct {
 	RuntimeRef string // file://<basename>@sha256:<digest>
-	BaseRef    string // file://<basename>@sha256:<digest> or manifest://<key>
+	BaseRef    string // file://<basename>@<sha256|hmac>:<digest> or manifest://<key>
 	// DiskBaseRefs are the per-data-disk erofs base refs (boot.disks[] order),
 	// the data-disk analogue of BaseRef. Empty entry for a single-disk data disk
 	// (no erofs base) or one with no base.
@@ -141,7 +141,7 @@ type SnapshotRefs struct {
 // and chains so the next snapshot taken by this run can prepend the parent
 // and record the full incremental layered chain. Empty on cold start.
 type SnapshotProvenance struct {
-	ParentSnapshotRef  string   // manifest://<key> or file://<sha256>.snapshot; "" on cold start
+	ParentSnapshotRef  string   // manifest://<key> or scheme-qualified file snapshot ref; "" on cold start
 	ParentFromRefs     []string // parent's from_refs (memory chain below the parent)
 	ParentOverlayBase  string   // parent's overlay.base (top disk diff); "" on cold start
 	ParentBaseFromRefs []string // parent's overlay.base_from_refs (disk chain below it)

@@ -12,9 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
-	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -29,7 +30,7 @@ func writeFile(t *testing.T, path string, body []byte) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tartransition.WriteTo(context.Background(), f, "image", sparse.Dense(bytes.NewReader(body), uint64(len(body))))
+	_, digest, err := tarstream.WriteTo(context.Background(), f, "image", sparse.Dense(bytes.NewReader(body), uint64(len(body))))
 	if err != nil {
 		f.Close()
 		t.Fatal(err)
@@ -37,7 +38,7 @@ func writeFile(t *testing.T, path string, body []byte) string {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	return strings.TrimPrefix(digest, "sha256:")
+	return digest
 }
 
 func writeRuntimeBundle(t *testing.T, path string, body []byte) string {
@@ -92,7 +93,81 @@ func baseSnap(runtimeRef, baseRef, overlayBase string) *SnapshotCfg {
 }
 
 func applyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string) (*config.SandboxConfig, error) {
-	return ApplyRules(host, snap, snapshotPath, nil)
+	return ApplyRules(host, snap, snapshotPath, nil, nil, false)
+}
+
+func TestApplyRulesCanonicalizesLegacyBaseToHMAC(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "runtime.erofs")
+	runtimeDigest := writeFile(t, runtimePath, []byte("runtime body"))
+	basePath := filepath.Join(dir, "base.erofs")
+	plainDigest := writeFile(t, basePath, []byte("base body"))
+	snap := baseSnap(
+		"file://runtime.erofs@sha256:"+runtimeDigest,
+		"file://base.erofs@sha256:"+plainDigest,
+		"file://overlay",
+	)
+	host := &config.SandboxConfig{}
+	host.Network.TAP = "tap0"
+	host.Boot.Root.Overlay = &config.OverlayConfig{}
+	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x71})
+	out, err := ApplyRules(host, snap, filepath.Join(dir, "root.snapshot"), nil, codec, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := manifest.ParseRef(out.SnapshotRefs.BaseRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.DigestScheme != tarstream.DigestSchemeHMAC || ref.Digest == plainDigest {
+		t.Fatalf("effective base ref=%#v", ref)
+	}
+	if _, err := ApplyRules(host, snap, filepath.Join(dir, "root.snapshot"), nil, codec, true); err == nil {
+		t.Fatal("required ApplyRules accepted a legacy sha256 base ref")
+	}
+}
+
+func TestCanonicalizeSnapshotTarRefsConvertsLegacyIdentities(t *testing.T) {
+	dir := t.TempDir()
+	path, tagged := writePublishArtifact(t, dir, ".snapshot", bytes.Repeat([]byte{0x37}, 4096))
+	plainDigest := strings.TrimPrefix(tagged, "sha256:")
+	legacy := "file://" + filepath.Base(path) + "@sha256:" + plainDigest
+	manifestRef := "manifest://" + strings.Repeat("a", 64)
+	cfg := &SnapshotCfg{FromRefs: []string{legacy, manifestRef}}
+	cfg.Boot.Root.BaseRef = legacy
+	cfg.Boot.Root.Overlay = &SnapOverlayCfg{Base: legacy, BaseFromRefs: []string{legacy}}
+	cfg.Boot.Disks = []SnapDiskNode{
+		{Base: legacy, BaseFromRefs: []string{legacy}},
+		{BaseRef: legacy, Overlay: &SnapOverlayCfg{Base: legacy, BaseFromRefs: []string{legacy}}},
+	}
+	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x73})
+	opts := Options{SnapshotPath: filepath.Join(dir, "root.snapshot"), LocalCodec: codec}
+	if err := canonicalizeSnapshotTarRefs(context.Background(), cfg, opts); err != nil {
+		t.Fatal(err)
+	}
+	refs := []string{
+		cfg.FromRefs[0], cfg.Boot.Root.BaseRef, cfg.Boot.Root.Overlay.Base,
+		cfg.Boot.Root.Overlay.BaseFromRefs[0], cfg.Boot.Disks[0].Base,
+		cfg.Boot.Disks[0].BaseFromRefs[0], cfg.Boot.Disks[1].BaseRef,
+		cfg.Boot.Disks[1].Overlay.Base, cfg.Boot.Disks[1].Overlay.BaseFromRefs[0],
+	}
+	for i, raw := range refs {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			t.Fatalf("ref[%d]: %v", i, err)
+		}
+		if ref.DigestScheme != tarstream.DigestSchemeHMAC || ref.Digest == plainDigest {
+			t.Fatalf("ref[%d] was not canonicalized: %#v", i, ref)
+		}
+	}
+	if cfg.FromRefs[1] != manifestRef {
+		t.Fatalf("manifest ref changed: %q", cfg.FromRefs[1])
+	}
+	requiredCfg := &SnapshotCfg{FromRefs: []string{legacy}}
+	opts.LocalRequired = true
+	if err := canonicalizeSnapshotTarRefs(context.Background(), requiredCfg, opts); err == nil {
+		t.Fatal("required policy accepted a legacy snapshot graph ref")
+	}
 }
 
 func TestApplyRules_CapacityMustMatchWhenProvided(t *testing.T) {
@@ -256,7 +331,7 @@ func TestApplyRules_RuntimeFileAutoResolveAndDigest(t *testing.T) {
 	if out.Boot.Runtime != wantRt {
 		t.Errorf("runtime auto-resolve = %s, want %s", out.Boot.Runtime, wantRt)
 	}
-	wantBase := "file://" + bsPath
+	wantBase := "file://" + bsPath + "@sha256:" + bsDigest
 	if out.Boot.Root.Base != wantBase {
 		t.Errorf("base auto-resolve = %s, want %s", out.Boot.Root.Base, wantBase)
 	}
@@ -379,7 +454,7 @@ func TestApplyRules_CarriesEffectiveLocatedBaseRefs(t *testing.T) {
 	out, err := ApplyRules(host, snap, filepath.Join(dir, "root.snapshot"), config.RefLocations{
 		"new-root": rootDir,
 		"new-disk": diskDir,
-	})
+	}, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}

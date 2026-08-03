@@ -15,7 +15,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
@@ -136,8 +138,11 @@ type VMParams struct {
 	// this fd (it's not an ExtraFile); the caller closes it after the run.
 	NetnsFile *os.File
 
-	SnapCfg     *config.SandboxConfig // ctl.sock SnapshotHandler.Cfg
-	ManifestCfg *config.ManifestConfig
+	SnapCfg       *config.SandboxConfig // ctl.sock SnapshotHandler.Cfg
+	ManifestCfg   *config.ManifestConfig
+	CustomerKeyFn ingest.CustomerKeyFunc
+	LocalCodec    tarstream.Codec
+	LocalRequired bool
 
 	// Forwards are the parsed `--connect` port-forward directives. Each
 	// gets a host-local listener whose accepted connections are spliced to
@@ -429,18 +434,21 @@ func ServeAndWait(p VMParams) (int, error) {
 	// ctl.sock server for snapshot requests. SnapshotHandler is the
 	// shared bundle both Run and restore.Run use.
 	snapHandler := &SnapshotHandler{
-		Cfg:         p.SnapCfg,
-		ManifestCfg: p.ManifestCfg,
-		SandboxID:   p.SandboxID,
-		Memfd:       memfd,
-		Disks:       snapDisks,
-		Servers:     servers,
-		CHSock:      chSock,
-		RunDir:      runDir,
-		Pinger:      pinger,
-		Forwarder:   forwarder,
-		Reattach:    reattach,
-		Logf:        logf,
+		Cfg:           p.SnapCfg,
+		ManifestCfg:   p.ManifestCfg,
+		CustomerKeyFn: p.CustomerKeyFn,
+		LocalCodec:    p.LocalCodec,
+		LocalRequired: p.LocalRequired,
+		SandboxID:     p.SandboxID,
+		Memfd:         memfd,
+		Disks:         snapDisks,
+		Servers:       servers,
+		CHSock:        chSock,
+		RunDir:        runDir,
+		Pinger:        pinger,
+		Forwarder:     forwarder,
+		Reattach:      reattach,
+		Logf:          logf,
 	}
 	ctlSrv := &ctl.Server{
 		Path:            ctlSockPath,
