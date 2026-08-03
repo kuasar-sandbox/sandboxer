@@ -18,8 +18,9 @@ import (
 // If dirty (i.e. ever written since this backend started), pread from
 // diff. Otherwise, pread from base; if base is nil, return zeros.
 //
-// Write path: pwrite to diff file at the same offset, then mark each
-// 4K block dirty in the bitmap.
+// Write path: a first partial write materializes the complete 4K block from
+// base (or zeros), merges the update, writes the complete block, then marks it
+// dirty. Reads and writes to the same block share a striped RWMutex.
 //
 // At backend startup, we rebuild the bitmap from diff file by walking
 // SEEK_DATA / SEEK_HOLE — any byte range marked as data in the diff is
@@ -32,10 +33,14 @@ type BlockCOW struct {
 	size      int64
 	bitmapMu  sync.RWMutex
 	bitmap    []uint64 // each bit = one 4K block
+	blockMu   []sync.RWMutex
 	blockSize int64
 }
 
-const cowBlockSize = 4096
+const (
+	cowBlockSize   = 4096
+	cowLockStripes = 256
+)
 
 // OpenBlockCOW opens diff for read+write (creating it sparse if absent),
 // builds the dirty bitmap, and pairs it with the optional base reader.
@@ -93,6 +98,7 @@ func OpenBlockCOW(diffPath string, base BlockReader, createSize int64) (*BlockCO
 		diff:      f,
 		size:      size,
 		bitmap:    bitmap,
+		blockMu:   make([]sync.RWMutex, cowLockStripes),
 		blockSize: cowBlockSize,
 	}
 	if err := cow.rebuildBitmap(); err != nil {
@@ -183,6 +189,10 @@ func (c *BlockCOW) markDirty(blk int64) {
 	c.bitmap[blk/64] |= 1 << (uint64(blk) % 64)
 }
 
+func (c *BlockCOW) blockLock(blk int64) *sync.RWMutex {
+	return &c.blockMu[uint64(blk)%uint64(len(c.blockMu))]
+}
+
 // ReadAt reads len(buf) bytes starting at offset, routing per-block
 // reads to either the diff file or the base reader.
 func (c *BlockCOW) ReadAt(buf []byte, offset int64) (int, error) {
@@ -204,8 +214,11 @@ func (c *BlockCOW) ReadAt(buf []byte, offset int64) (int, error) {
 			blkEnd = end
 		}
 		chunk := buf[pos : pos+(blkEnd-(offset+pos))]
+		lock := c.blockLock(blk)
+		lock.RLock()
 		if c.blockDirty(blk) {
 			if _, err := c.diff.ReadAt(chunk, offset+pos); err != nil && !errors.Is(err, io.EOF) {
+				lock.RUnlock()
 				return int(pos), err
 			}
 		} else if c.base != nil && offset+pos < c.base.Size() {
@@ -213,32 +226,100 @@ func (c *BlockCOW) ReadAt(buf []byte, offset int64) (int, error) {
 			if err != nil && !errors.Is(err, io.EOF) {
 				// Zero the rest of the chunk if base reader returned partial.
 				zeroSlice(chunk[n:])
+				lock.RUnlock()
 				return int(pos) + n, err
 			}
 			zeroSlice(chunk[n:])
 		} else {
 			zeroSlice(chunk)
 		}
+		lock.RUnlock()
 		pos += int64(len(chunk))
 	}
 	return int(pos), nil
 }
 
-// WriteAt writes buf at offset to the diff file and marks affected blocks dirty.
+// WriteAt writes buf at offset to the diff file. The first partial write to a
+// clean block materializes the complete block from base (or zeros), merges the
+// caller's bytes, writes the complete block, and only then marks it dirty.
 func (c *BlockCOW) WriteAt(buf []byte, offset int64) (int, error) {
-	if offset < 0 || offset+int64(len(buf)) > c.size {
+	if offset < 0 || offset > c.size || int64(len(buf)) > c.size-offset {
 		return 0, fmt.Errorf("vhost: write out of bounds: offset=%d len=%d size=%d", offset, len(buf), c.size)
 	}
-	n, err := c.diff.WriteAt(buf, offset)
-	if err != nil {
-		return n, err
+	written := 0
+	for written < len(buf) {
+		pos := offset + int64(written)
+		blk := pos / c.blockSize
+		blkEnd := (blk + 1) * c.blockSize
+		chunkLen := len(buf) - written
+		if remaining := blkEnd - pos; int64(chunkLen) > remaining {
+			chunkLen = int(remaining)
+		}
+
+		lock := c.blockLock(blk)
+		lock.Lock()
+		n, err := c.writeBlockLocked(buf[written:written+chunkLen], pos, blk)
+		lock.Unlock()
+		written += n
+		if err != nil {
+			return written, err
+		}
 	}
-	startBlk := offset / c.blockSize
-	endBlk := (offset + int64(n) + c.blockSize - 1) / c.blockSize
-	for blk := startBlk; blk < endBlk; blk++ {
+	return written, nil
+}
+
+// writeBlockLocked writes a range wholly contained in blk. The caller holds
+// that block's stripe lock exclusively.
+func (c *BlockCOW) writeBlockLocked(buf []byte, offset, blk int64) (int, error) {
+	if c.blockDirty(blk) {
+		return c.diff.WriteAt(buf, offset)
+	}
+
+	blockStart := blk * c.blockSize
+	if offset == blockStart && int64(len(buf)) == c.blockSize {
+		if err := c.writeFreshBlock(buf, blockStart); err != nil {
+			return 0, err
+		}
 		c.markDirty(blk)
+		return len(buf), nil
 	}
-	return n, nil
+
+	block := make([]byte, c.blockSize)
+	if c.base != nil && blockStart < c.base.Size() {
+		readLen := c.blockSize
+		if remaining := c.base.Size() - blockStart; remaining < readLen {
+			readLen = remaining
+		}
+		n, err := c.base.ReadAt(block[:readLen], blockStart)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, fmt.Errorf("vhost: materialize block %d from base: %w", blk, err)
+		}
+		if int64(n) != readLen {
+			return 0, fmt.Errorf("vhost: materialize block %d from base: %w", blk, io.ErrUnexpectedEOF)
+		}
+	}
+	copy(block[offset-blockStart:], buf)
+	if err := c.writeFreshBlock(block, blockStart); err != nil {
+		return 0, err
+	}
+	c.markDirty(blk)
+	return len(buf), nil
+}
+
+func (c *BlockCOW) writeFreshBlock(block []byte, offset int64) error {
+	n, err := c.diff.WriteAt(block, offset)
+	if err == nil && n != len(block) {
+		err = io.ErrShortWrite
+	}
+	if err == nil {
+		return nil
+	}
+	// A clean block must remain a hole after a failed materialization so a
+	// future reopen cannot mistake a partial write for a complete dirty block.
+	_ = unix.Fallocate(int(c.diff.Fd()),
+		unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
+		offset, c.blockSize)
+	return fmt.Errorf("vhost: materialize diff block at %d: %w", offset, err)
 }
 
 // Flush is called on virtio-blk FLUSH; sync diff file to disk.
