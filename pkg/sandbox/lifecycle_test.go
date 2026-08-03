@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
@@ -173,6 +174,38 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 	}
 	if viewCalled {
 		t.Fatal("snapshot view provider called during size preflight")
+	}
+}
+
+func TestHandleSnapshotRequestResolvesUploadKeyBeforeSnapshotView(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.SandboxConfig{}
+	viewCalled := false
+	keyCalls := 0
+	_, err := handleSnapshotRequest(ctl.Request{Upload: true}, RunOptions{
+		Cfg:         cfg,
+		SandboxID:   "test",
+		ManifestCfg: &config.ManifestConfig{Store: manifest.StoreConfig{Endpoint: "unused"}},
+		CustomerKeyFn: func() ([32]byte, error) {
+			keyCalls++
+			return [32]byte{}, errors.New("invalid customer key")
+		},
+	}, nil, []SnapDiskRef{{
+		DiffPath: filepath.Join(dir, "diff"),
+		Size:     4096,
+		SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			viewCalled = true
+			return bytes.NewReader(make([]byte, 4096)), nil, nil
+		},
+	}}, nil, "", filepath.Join(dir, "run"), nil, nil, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "customer key") {
+		t.Fatalf("upload key error = %v", err)
+	}
+	if keyCalls != 1 {
+		t.Fatalf("customer key calls=%d, want 1", keyCalls)
+	}
+	if viewCalled {
+		t.Fatal("snapshot view was opened before customer-key validation")
 	}
 }
 

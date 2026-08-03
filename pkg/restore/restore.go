@@ -974,7 +974,7 @@ func preflightLocatedRefs(ctx context.Context, opts Options) error {
 			return fmt.Errorf("snapshot.cfg.runtime_ref: %w", err)
 		}
 	}
-	overrides, err := preflightHostBaseOverrides(root, opts)
+	overrides, err := preflightHostBaseOverrides(ctx, root, opts)
 	if err != nil {
 		return err
 	}
@@ -1027,7 +1027,7 @@ type preflightBaseOverrides struct {
 	disks map[int]bool
 }
 
-func preflightHostBaseOverrides(snap *SnapshotCfg, opts Options) (preflightBaseOverrides, error) {
+func preflightHostBaseOverrides(ctx context.Context, snap *SnapshotCfg, opts Options) (preflightBaseOverrides, error) {
 	var overrides preflightBaseOverrides
 	if opts.HostCfg == nil {
 		return overrides, nil
@@ -1037,7 +1037,11 @@ func preflightHostBaseOverrides(snap *SnapshotCfg, opts Options) (preflightBaseO
 		if err != nil {
 			return overrides, protectArtifactReadError(opts.LocalCodec, "snapshot.cfg.base_ref", err)
 		}
-		if _, err := resolveAnyRef(opts.HostCfg.Boot.Root.Base, snapRef, opts.localSnapshotPath(), "boot.root.base", opts.RefLocations, opts.LocalCodec, opts.LocalRequired); err != nil {
+		resolved, err := resolveAnyRef(opts.HostCfg.Boot.Root.Base, snapRef, opts.localSnapshotPath(), "boot.root.base", opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+		if err != nil {
+			return overrides, err
+		}
+		if err := preflightResolvedManifestBase(ctx, resolved, opts); err != nil {
 			return overrides, err
 		}
 		overrides.root = true
@@ -1055,7 +1059,11 @@ func preflightHostBaseOverrides(snap *SnapshotCfg, opts Options) (preflightBaseO
 		if err != nil {
 			return overrides, protectArtifactReadError(opts.LocalCodec, fmt.Sprintf("snapshot.cfg.boot.disks[%d].base_ref", i), err)
 		}
-		if _, err := resolveAnyRef(hostRef, snapRef, opts.localSnapshotPath(), fmt.Sprintf("boot.disks[%d].base", i), opts.RefLocations, opts.LocalCodec, opts.LocalRequired); err != nil {
+		resolved, err := resolveAnyRef(hostRef, snapRef, opts.localSnapshotPath(), fmt.Sprintf("boot.disks[%d].base", i), opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+		if err != nil {
+			return overrides, err
+		}
+		if err := preflightResolvedManifestBase(ctx, resolved, opts); err != nil {
 			return overrides, err
 		}
 		if overrides.disks == nil {
@@ -1064,6 +1072,21 @@ func preflightHostBaseOverrides(snap *SnapshotCfg, opts Options) (preflightBaseO
 		overrides.disks[i] = true
 	}
 	return overrides, nil
+}
+
+func preflightResolvedManifestBase(ctx context.Context, raw string, opts Options) error {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return err
+	}
+	if ref.Scheme != manifest.RefSchemeManifest {
+		return nil
+	}
+	stream, _, err := sandbox.OpenDiskStream(ctx, ref.String(), opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+	if err != nil {
+		return fmt.Errorf("manifest base preflight: %w", err)
+	}
+	return stream.Close()
 }
 
 func snapshotArtifactRefs(snap *SnapshotCfg, overrides *preflightBaseOverrides) []string {
@@ -1098,6 +1121,13 @@ func preflightLocatedRef(ctx context.Context, raw string, opts Options) error {
 	ref, err := manifest.ParseRef(raw)
 	if err != nil {
 		return protectArtifactReadError(opts.LocalCodec, "parse local artifact ref", err)
+	}
+	if ref.Scheme == manifest.RefSchemeManifest {
+		stream, _, err := sandbox.OpenDiskStream(ctx, ref.String(), opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+		if err != nil {
+			return fmt.Errorf("manifest artifact: %w", err)
+		}
+		return stream.Close()
 	}
 	if ref.Scheme != manifest.RefSchemeFile || ref.Location == "" {
 		return nil

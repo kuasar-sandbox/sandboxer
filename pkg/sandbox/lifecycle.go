@@ -104,6 +104,20 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if err := populateSnapshotRefs(opts.Cfg, opts.RefLocations, opts.LocalCodec, opts.LocalRequired); err != nil {
 		return -1, fmt.Errorf("snapshot refs: %w", err)
 	}
+	needsManifest := needsManifestFetcher(opts.Cfg)
+	if needsManifest {
+		if opts.Fetcher == nil {
+			return -1, fmt.Errorf("manifest:// disk requires --manifest-config or MANIFEST_CONFIG")
+		}
+		// The CLI's resolver is memoized. Resolve the key before controller,
+		// cgroup, or run-directory side effects while leaving network clients
+		// lazy until the first actual manifest open.
+		if opts.CustomerKeyFn != nil {
+			if _, err := opts.CustomerKeyFn(); err != nil {
+				return -1, fmt.Errorf("manifest customer key: %w", err)
+			}
+		}
+	}
 
 	runDir := filepath.Join(opts.RuntimeRoot, opts.SandboxID)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
@@ -200,16 +214,13 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	}
 	defer func() { _ = cg.Cleanup() }()
 
-	// Open the read-side fetcher (cache + store clients + decryptor)
-	// once per sandbox when any disk URI uses manifest://. file://-only
-	// configs without a manifest config skip the dial. snapshot --upload
-	// builds its own (write-side) Ingester at request time; the two
-	// paths never share a connection pool.
+	// Use the caller-owned read-side fetcher when a disk uses manifest://.
+	// The CLI wrapper creates cache/store clients only on its first actual
+	// OpenManifest; file-only configs never dial. snapshot --upload builds its
+	// own write-side Ingester at request time, so the two paths do not share a
+	// connection pool.
 	fetcher := opts.Fetcher
-	if needsManifestFetcher(opts.Cfg) {
-		if fetcher == nil {
-			return -1, fmt.Errorf("manifest:// disk requires --manifest-config or MANIFEST_CONFIG")
-		}
+	if needsManifest {
 		if opts.ManifestCfg != nil {
 			logf("manifest fetcher: store=%s cache=%s crypto=%s/%s",
 				opts.ManifestCfg.Store.Endpoint, opts.ManifestCfg.Cache.Endpoint,
@@ -928,6 +939,9 @@ func handleSnapshotRequest(
 	if req.Upload {
 		if opts.CustomerKeyFn == nil {
 			return ctl.Response{}, fmt.Errorf("snapshot ingester: customer key resolver is unavailable")
+		}
+		if _, keyErr := opts.CustomerKeyFn(); keyErr != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot ingester: customer key: %w", keyErr)
 		}
 		ing, ierr := opts.ManifestCfg.NewIngester(opts.CustomerKeyFn, nil)
 		if ierr != nil {

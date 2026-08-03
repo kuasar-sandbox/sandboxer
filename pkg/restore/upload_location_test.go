@@ -201,13 +201,26 @@ func (failingManifestFetcher) OpenManifest(context.Context, store.ContentKey) (f
 	return nil, errors.New("backend unavailable")
 }
 
+func TestPreflightChecksManifestArtifacts(t *testing.T) {
+	cfg := &SnapshotCfg{}
+	cfg.Resources.Capacity.Memory = "4KiB"
+	cfg.Boot.Root.Overlay = &SnapOverlayCfg{Base: "manifest://" + strings.Repeat("a", 64)}
+	path := writePublishSnapshot(t, t.TempDir(), cfg)
+	err := preflightLocatedRefs(context.Background(), Options{
+		SnapshotPath: path,
+		Fetcher:      failingManifestFetcher{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "backend unavailable") {
+		t.Fatalf("manifest preflight error = %v", err)
+	}
+}
+
 func TestPreflightLocatedRefsWalksMemoryParents(t *testing.T) {
 	parentDir := t.TempDir()
 	parentCfg := &SnapshotCfg{FromRefs: []string{
 		"file://" + strings.Repeat("d", 64) + ".snapshot@location:missing-parent",
 	}}
 	parentCfg.Resources.Capacity.Memory = "4KiB"
-	parentCfg.Boot.Root.BaseRef = "manifest://" + strings.Repeat("a", 64)
 	parentCfg.Boot.Root.Overlay = &SnapOverlayCfg{
 		Base: "file://" + strings.Repeat("b", 64) + ".overlay@location:ignored-parent-disk",
 	}
@@ -218,7 +231,6 @@ func TestPreflightLocatedRefsWalksMemoryParents(t *testing.T) {
 		"file://" + filepath.Base(parentPath) + "@location:parent",
 	}}
 	rootCfg.Resources.Capacity.Memory = "4KiB"
-	rootCfg.Boot.Root.BaseRef = "manifest://" + strings.Repeat("c", 64)
 	rootPath := writePublishSnapshot(t, rootDir, rootCfg)
 
 	err := preflightLocatedRefs(context.Background(), Options{
