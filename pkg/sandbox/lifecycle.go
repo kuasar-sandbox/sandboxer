@@ -1388,8 +1388,7 @@ func buildDiskRef(uri string, locations config.RefLocations) (string, error) {
 		return "", fmt.Errorf("file artifact %s digest mismatch: got %s, want %s", ref.Path, digest, ref.Digest)
 	}
 	ref.Path = filepath.Base(ref.Path)
-	ref.Digest = digest
-	return ref.String(), nil
+	return tartransition.SHA256RefString(ref, digest)
 }
 
 func generateSandboxID() string {

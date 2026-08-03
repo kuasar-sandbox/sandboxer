@@ -323,7 +323,7 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, 
 	}
 	if destInfo, statErr := os.Stat(destination); statErr == nil {
 		if destInfo.Size() == sourceInfo.Size() && verifyArtifactFile(destination, digest, 0) == nil {
-			return p.locatedRef(basename, hexDigest, keepDigest), nil
+			return p.locatedRef(basename, hexDigest, keepDigest)
 		}
 	} else if !os.IsNotExist(statErr) {
 		return "", statErr
@@ -356,15 +356,15 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, 
 		return "", fmt.Errorf("verify published %s: %w", destination, err)
 	}
 	p.logf("upload-snapshot: published %s", destination)
-	return p.locatedRef(basename, hexDigest, keepDigest), nil
+	return p.locatedRef(basename, hexDigest, keepDigest)
 }
 
-func (p *snapshotPublisher) locatedRef(basename, digest string, keepDigest bool) string {
+func (p *snapshotPublisher) locatedRef(basename, digest string, keepDigest bool) (string, error) {
 	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: basename, Location: p.location}
 	if keepDigest {
-		ref.Digest = digest
+		return tartransition.SHA256RefString(ref, digest)
 	}
-	return ref.String()
+	return ref.String(), nil
 }
 
 const tarstreamTrailerSize = int64(3 * 512) // marker header + two zero blocks

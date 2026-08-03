@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
@@ -64,6 +65,18 @@ func TestSHA256DigestRejectsHMAC(t *testing.T) {
 	}
 	if _, err := SHA256Digest("hmac:" + testDigest); err == nil {
 		t.Fatal("HMAC digest accepted by legacy SHA-256 caller")
+	}
+}
+
+func TestSHA256RefStringUsesCurrentManifestRef(t *testing.T) {
+	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: "image.erofs", Location: "shared"}
+	got, err := SHA256RefString(ref, testDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "file://image.erofs@sha256:" + testDigest + "@location:shared"
+	if got != want {
+		t.Fatalf("SHA256RefString() = %q, want %q", got, want)
 	}
 }
 

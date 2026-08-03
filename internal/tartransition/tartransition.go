@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
@@ -145,6 +146,28 @@ func SHA256Digest(tagged string) (string, error) {
 		return "", fmt.Errorf("tartransition: digest scheme is not supported before sandboxer issue #24")
 	}
 	return digest, nil
+}
+
+// SHA256RefString formats a legacy SHA-256 file ref across manifest.Ref's
+// issue #27 transition. Current Ref derives @sha256 from Digest alone; the
+// final Ref also requires DigestScheme. Reflection keeps this temporary bridge
+// source-compatible with both definitions.
+func SHA256RefString(ref manifest.Ref, digest string) (string, error) {
+	if _, err := SHA256Digest(digestSchemeSHA256 + ":" + digest); err != nil {
+		return "", err
+	}
+	ref.Digest = digest
+	field := reflect.ValueOf(&ref).Elem().FieldByName("DigestScheme")
+	if field.IsValid() {
+		if field.Kind() != reflect.String || !field.CanSet() {
+			return "", fmt.Errorf("tartransition: unsupported manifest.Ref DigestScheme field")
+		}
+		field.SetString(digestSchemeSHA256)
+	}
+	if err := ref.Validate(); err != nil {
+		return "", fmt.Errorf("tartransition: validate SHA-256 ref: %w", err)
+	}
+	return ref.String(), nil
 }
 
 const digestSchemeSHA256 = "sha256"
