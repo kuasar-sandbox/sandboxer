@@ -40,6 +40,9 @@ type Request struct {
 	Upload      bool   `json:"upload,omitempty"`
 	ResumeAfter bool   `json:"resume_after,omitempty"`
 	StagingDir  string `json:"staging_dir,omitempty"`
+	// nil preserves the behavior of clients predating these fields.
+	DropCaches *bool `json:"drop_caches,omitempty"`
+	MergeRef   *bool `json:"merge_ref,omitempty"`
 
 	// exec_request: the command + stdio the caller wants run inside the
 	// already-running sandbox.
@@ -51,15 +54,16 @@ type Response struct {
 	Type string `json:"type"`
 
 	// snapshot_done fields.
-	MemorySize          uint64 `json:"memory_size,omitempty"`
-	MemoryResident      uint64 `json:"memory_resident,omitempty"`
-	WallclockPauseMs    int64  `json:"wallclock_pause_ms,omitempty"`
-	WallclockDumpMs     int64  `json:"wallclock_dump_ms,omitempty"`
-	SnapshotManifestKey string `json:"snapshot_manifest_key,omitempty"`
-	OverlayManifestKey  string `json:"overlay_manifest_key,omitempty"`
-	SnapshotPath        string `json:"snapshot_path,omitempty"`
-	OverlayPath         string `json:"overlay_path,omitempty"`
-	OverlayRef          string `json:"overlay_ref,omitempty"`
+	MemorySize          uint64                 `json:"memory_size,omitempty"`
+	MemoryResident      uint64                 `json:"memory_resident,omitempty"`
+	WallclockPauseMs    int64                  `json:"wallclock_pause_ms,omitempty"`
+	WallclockDumpMs     int64                  `json:"wallclock_dump_ms,omitempty"`
+	SnapshotManifestKey string                 `json:"snapshot_manifest_key,omitempty"`
+	OverlayManifestKey  string                 `json:"overlay_manifest_key,omitempty"`
+	SnapshotPath        string                 `json:"snapshot_path,omitempty"`
+	OverlayPath         string                 `json:"overlay_path,omitempty"`
+	OverlayRef          string                 `json:"overlay_ref,omitempty"`
+	DropCachesResult    proto.DropCachesResult `json:"drop_caches_result,omitempty"`
 
 	// exec_ack: the stdio channel set the guest actually established
 	// (the caller bridges exactly these MUX streams).
@@ -67,6 +71,18 @@ type Response struct {
 
 	// type=error: human-readable reason.
 	Msg string `json:"msg,omitempty"`
+}
+
+// DropCachesEnabled reports the per-snapshot cache policy. A missing field
+// means true so old clients retain the historical behavior.
+func (r Request) DropCachesEnabled() bool {
+	return r.DropCaches == nil || *r.DropCaches
+}
+
+// MergeRefEnabled reports whether a local parent memory ref is flattened into
+// the new self artifact. A missing field means true for wire compatibility.
+func (r Request) MergeRefEnabled() bool {
+	return r.MergeRef == nil || *r.MergeRef
 }
 
 const (

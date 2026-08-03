@@ -248,18 +248,27 @@ func indexOf(s, sub string) int {
 }
 
 // SendQuiesce performs a host→guest quiesce request/response on a
-// short-lived connection. Caller is expected to have paused the ping
-// ticker first to avoid concurrent host→guest traffic during the
-// snapshot pre-pause window.
-func SendQuiesce(client *HostClient) error {
-	resp, err := client.RoundTrip(&proto.Message{Type: proto.TypeQuiesce}, proto.DeadlineQuiesce)
+// short-lived connection and returns the guest's cache-drop outcome.
+// Unknown means the guest predates outcome reporting. Caller is expected to
+// have paused the ping ticker first to avoid concurrent host→guest traffic
+// during the snapshot pre-pause window.
+func SendQuiesce(client *HostClient, skipDropCaches bool) (proto.DropCachesResult, error) {
+	resp, err := client.RoundTrip(&proto.Message{
+		Type:           proto.TypeQuiesce,
+		SkipDropCaches: skipDropCaches,
+	}, proto.DeadlineQuiesce)
 	if err != nil {
-		return err
+		return proto.DropCachesUnknown, err
 	}
 	if resp.Type != proto.TypeQuiesced {
-		return &protoMismatchErr{want: proto.TypeQuiesced, got: resp.Type, msg: resp.Msg}
+		return proto.DropCachesUnknown, &protoMismatchErr{want: proto.TypeQuiesced, got: resp.Type, msg: resp.Msg}
 	}
-	return nil
+	switch resp.DropCachesResult {
+	case proto.DropCachesSkipped, proto.DropCachesSucceeded, proto.DropCachesFailed:
+		return resp.DropCachesResult, nil
+	default:
+		return proto.DropCachesUnknown, nil
+	}
 }
 
 // OpenMUXViaRestore notifies the guest that a restore has completed and

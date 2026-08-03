@@ -20,7 +20,7 @@ func TestBuildSnapshotCfg_SingleDisk(t *testing.T) {
 	cfg.Boot.Root.DiffTemplate = "file:///root.ext4"  // Overlay nil ⇒ single-disk
 	cfg.Boot.Root.Base = "manifest://coldbase"        // CoW lower → chained on cold start
 
-	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"})
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestBuildSnapshotCfg_Overlay(t *testing.T) {
 	cfg.SnapshotRefs.BaseRef = "file://img@sha256:bb"
 	cfg.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///d.ext4"} // overlay mode
 
-	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"})
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestBuildSnapshotCfg_OmitsRestorePolicy(t *testing.T) {
 	cfg.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///d.ext4"}
 	cfg.Restore.Prefetch = "memory"
 
-	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"})
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestBuildSnapshotCfg_OverlayColdBase(t *testing.T) {
 		Diff: "file:///d.ext4",
 	}
 
-	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"})
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,8 @@ func TestBuildSnapshotCfg_DataDisks(t *testing.T) {
 	}
 	cfg.SnapshotRefs.DiskBaseRefs = []string{"", "file://ds@sha256:cc"}
 
-	body, err := buildSnapshotCfg(cfg, []string{"manifest://root", "manifest://scratch", "manifest://dataset"})
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://root", "manifest://scratch", "manifest://dataset"},
+		nil, []bool{false, false, false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +170,9 @@ func TestBuildSnapshotCfg_MixedLocalMemoryManifestDiskKeepsDiskParent(t *testing
 		}},
 	}
 
-	body, err := buildSnapshotCfg(cfg, []string{"manifest://new-root", "manifest://new-data"})
+	body, err := buildSnapshotCfg(cfg,
+		[]string{"manifest://new-root", "manifest://new-data"},
+		[]string{"file://parent.snapshot"}, []bool{true, false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,5 +187,73 @@ func TestBuildSnapshotCfg_MixedLocalMemoryManifestDiskKeepsDiskParent(t *testing
 	dataChain := doc.Boot.Disks[0].Overlay.BaseFromRefs
 	if len(dataChain) != 2 || dataChain[0] != "manifest://data-parent" || dataChain[1] != "manifest://data-lower" {
 		t.Fatalf("data chain = %v, want portable parent retained", dataChain)
+	}
+}
+
+func TestBuildSnapshotCfg_LocalWorkingSetKeepsMemoryParentButMergesDisks(t *testing.T) {
+	cfg := &config.SandboxConfig{}
+	cfg.Resources.Capacity.Memory = "2GiB"
+	cfg.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///root.diff"}
+	cfg.Boot.Disks = []config.DiskConfig{
+		{Name: "data", RootConfig: config.RootConfig{DiffTemplate: "file:///data.diff"}},
+	}
+	cfg.SnapshotProvenance = config.SnapshotProvenance{
+		ParentSnapshotRef:  "file://base.snapshot",
+		ParentFromRefs:     []string{"manifest://memory-lower"},
+		ParentOverlayBase:  "file://base-root.overlay",
+		ParentBaseFromRefs: []string{"manifest://root-lower"},
+		ParentDisks: []config.DiskProvenance{{
+			OverlayBase:  "file://base-data.overlay",
+			BaseFromRefs: []string{"manifest://data-lower"},
+		}},
+	}
+
+	body, err := buildSnapshotCfg(cfg,
+		[]string{"file://working-root.overlay", "file://working-data.overlay"},
+		[]string{"file://base.snapshot", "manifest://memory-lower"}, []bool{true, true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(body)
+	var doc snapshotCfgYAML
+	if err := yaml.Unmarshal(body, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(doc.FromRefs, ","); got != "file://base.snapshot,manifest://memory-lower" {
+		t.Errorf("memory from_refs = %v", doc.FromRefs)
+	}
+	if got := strings.Join(doc.Boot.Root.Overlay.BaseFromRefs, ","); got != "manifest://root-lower" {
+		t.Errorf("root base_from_refs = %v", doc.Boot.Root.Overlay.BaseFromRefs)
+	}
+	if got := strings.Join(doc.Boot.Disks[0].BaseFromRefs, ","); got != "manifest://data-lower" {
+		t.Errorf("data base_from_refs = %v", doc.Boot.Disks[0].BaseFromRefs)
+	}
+	for _, banned := range []string{"file://base-root.overlay", "file://base-data.overlay"} {
+		if strings.Contains(s, banned) {
+			t.Errorf("merged disk parent %q must not remain in snapshot.cfg\n%s", banned, s)
+		}
+	}
+}
+
+func TestBuildSnapshotCfg_DefaultLocalMergeDropsMemoryParent(t *testing.T) {
+	cfg := &config.SandboxConfig{}
+	cfg.Resources.Capacity.Memory = "2GiB"
+	cfg.Boot.Root.DiffTemplate = "file:///root.diff"
+	cfg.SnapshotProvenance = config.SnapshotProvenance{
+		ParentSnapshotRef: "file://base.snapshot",
+		ParentFromRefs:    []string{"manifest://memory-lower"},
+	}
+
+	body, err := buildSnapshotCfg(cfg, []string{"file://root.overlay"},
+		[]string{"manifest://memory-lower"}, []bool{true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(body)
+	if strings.Contains(s, "file://base.snapshot") {
+		t.Fatalf("merged local memory parent must be dropped:\n%s", s)
+	}
+	if !strings.Contains(s, "manifest://memory-lower") {
+		t.Fatalf("merged local memory must inherit lower chain:\n%s", s)
 	}
 }

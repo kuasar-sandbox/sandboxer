@@ -433,6 +433,9 @@ sandbox-ctl upload-snapshot [flags] <snapshot-path>
 local file refs 按 bundle 同目录解析并递归升级;已有 portable ref 是本次发布边界。
 named location 目录不创建 alias、symlink 或临时 rename;有效的同名内容寻址文件直接
 复用,不完整或校验失败的目标直接覆盖并在 close 后重新验证 marker、size 与 digest。
+working-set snapshot 的本地 memory `from_refs` 是 memory-only lowers;当前通用
+publisher 的递归遍历尚未与该语义完成校准,不承诺能发布只保留必要 memory lowers
+的最小 artifact set。该发布闭环继续由 #41 follow-up 定义和验证。
 
 ## 3. 配置
 
@@ -904,23 +907,31 @@ self 温热 chunk cache,file self 对已打开的 artifact FD 提交 `FADV_WILLN
 工作集.父内存层和 root/data disk 始终不在选择范围内.完整资格,执行边界和验证
 方法见 §7.1.
 
-#### 本地层不变量(至多一层、且在顶层)
+#### 本地层不变量(memory 有限放宽,disk 保持单层)
 
-`file://` 本地层与 portable 层(manifest/located file)可在一条链内混用,但运行时
-生成的增量链中**本地层至多
-一个,且一定是顶层(self/最新)**;`from_refs`/`base_from_refs`(下层)只许 portable ref。
-这保证一个快照要么「全 portable」、要么「本地顶 + portable 下层链」,绝不出现埋在
-portable 层下的本地层
-(那样的快照换主机恢复时必因本地文件缺失而失效)。两条机制维持它:
+`file://` 本地层与 portable 层(manifest/located file)可混用。disk chain 仍要求本地层至多一个且
+必须是顶层;本地 disk top 每次保存都 flatten-merge,`base_from_refs` 不新增本地 ref。
+memory chain 则允许 self 以下出现多个本地 `file://*.snapshot` ref,仅用于本地
+working-set 生成与验证。这组 artifact 必须一起保留;缺任一层即整条快照失效。离线上传
+后本地 refs 会递归改写成目标 portable refs。
 
-- **本地导出 = 替换次新层(合并,非新增)**:若沙箱本身从**本地** `file://` 快照懒加载,
+- **默认本地导出 = 替换直接父 self(合并,非递归 compaction)**:若沙箱本身从**本地**
+  `file://` 快照懒加载,
   再次 `snapshot --output` 时把本次稀疏增量**叠加合并**进父本地层(顶层逐页优先、父层
-  穿透、两层皆空洞才穿透祖父),产出**一个**新本地顶层**替换**父层(`from_refs` 继承父层
-  的下层链、丢掉父 ref),而非在其上再压一层。如此反复「本地恢复→本地保存」本地层深
-  恒为 1,顶层自足于(远程)祖父链,仍是稀疏文件。(从**远程** `manifest://` 父恢复后
-  导出,仍是「新顶层压在父 ref 之上」的增量分层——远程父不触发合并。)`--upload` 路径
-  同样合并:从本地父恢复后 `snapshot --upload`,把父本地层一并 ingest 进上传的顶层,
-  产出 0 本地层的远程快照。
+  穿透、两层皆空洞才穿透祖父),新 self **替换直接父 self**并原样继承父
+  `from_refs`。已有 local lowers 不递归压平,因此默认 merge 只保证不增加既有本地深度,
+  不保证整条 memory chain 的 local depth=1。依赖 artifact 生命周期仍由这组本地 bundle
+  的使用者维护。(从**远程** `manifest://` 父恢复后导出,仍是「新顶层压在父 ref 之上」
+  的增量分层——远程父不触发合并。)
+- **工作集 opt-in**:从本地父恢复后使用
+  `snapshot --output ... --drop-caches=false --merge-ref=false`,本次 memory self
+  不合并父 memory,而是保留 `from_refs=[父]++父.from_refs`;root 与所有 data disk
+  仍按上条规则 merge。第一版不复制依赖:创建前要求输出目录已包含每个本地 memory
+  ref basename。`--merge-ref=false` 配合本地父不支持直接 `--upload`,应先本地输出
+  再运行 `upload-snapshot`。
+- **live upload 检查最终 memory chain**:无论 `merge-ref` 取值,只要计算后的
+  `resultMemoryRefs` 仍包含本地 ref,就在 quiesce 前拒绝 `snapshot --upload`。可先
+  `--output` 做本地验证,再用 `upload-snapshot` 递归发布整个 snapshot graph。
 - **离线提升 `sandbox-ctl upload-snapshot <本地快照>`**(§2.7):递归升级可见 local
   refs,已有 manifest/located refs 原样带过,最终打印 canonical portable root ref。
 
@@ -1230,12 +1241,13 @@ snapshot 内容不变时摘要相同 → rename 到**同名文件**(覆盖,等�
 
 ```
 T0  sandbox-ctl snapshot --sandbox-id <sid> [--output <out_dir>] [--upload]
+        [--drop-caches=true|false] [--merge-ref=true|false]
 T1  通过 <run-dir>/<sid>/ctl.sock 联系目标 sandbox-ctl run 进程
 T2  目标进程串行:
     T2a 通过 vsock 短连接发 quiesce 给 sandbox-init,等 quiesced 响应。sandbox-init
         收到后:拒绝新的 exec 并 SIGKILL 在飞的 exec 子进程(快照不能带运行中的
         exec 兄弟进程;沙箱 resume/restore 后解除)→ **freeze 应用进程树**
-        (cgroup.freeze=1,等 cgroup.events 至 frozen 1)→ sync + drop_caches →
+        (cgroup.freeze=1,等 cgroup.events 至 frozen 1)→ sync + optional drop_caches →
         停读应用 stdout/stderr(pty master)→ 拆除所有 connect 端口转发中继(SO_LINGER
         确认拆除,sandbox-init.md §3.7)→ 在 stdio
         MUX 上发起优雅关闭握手(sandbox-ctl 的 MUX 端响应 MUX_CLOSE_ACK 并读到 EOF
@@ -1265,8 +1277,15 @@ T5  生成最终 snapshot.cfg(在内存中,§3.4 schema):
     boot.root.overlay.base:     T4 的 overlay_ref(本次 diff = 磁盘链顶)
     from_refs / overlay.base_from_refs:  增量分层链(§3.5)。冷启动 = [];否则按
                                 运行进程持有的 provenance(恢复时记下的"从何而来")
-                                计算:from_refs = [父快照 ref] ++ 父.from_refs;
-                                base_from_refs = [父.overlay.base] ++ 父.base_from_refs。
+                                计算:默认本地 memory merge 只替换直接父 self,
+                                from_refs=父.from_refs(已有 local lowers 原样保留);
+                                `--merge-ref=false` 时
+                                from_refs=[父快照 ref]++父.from_refs。
+                                每块 root/data disk 分别计算 base_from_refs:若本地
+                                parent disk top 已实际 merge(diskMerged[i]=true),则
+                                base_from_refs=父.base_from_refs,删除已吸收的父 top;
+                                若 parent disk 为 portable 或未 merge,则
+                                base_from_refs=[父 top]++父.base_from_refs。
                                 子快照只引用父(其 ref 在恢复时已知),无鸡生蛋
 T6  生成 snapshot 内容:
     [memory 段]  ramSize 字节,SEEK_DATA/HOLE 驱动的稀疏数据

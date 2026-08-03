@@ -88,3 +88,64 @@ func TestReadMessageOversized(t *testing.T) {
 		t.Fatal("expected oversized-message error, got nil")
 	}
 }
+
+func TestSnapshotBoolDefaultsAndRoundTrip(t *testing.T) {
+	if !(Request{}).DropCachesEnabled() || !(Request{}).MergeRefEnabled() {
+		t.Fatal("missing bool fields must preserve true defaults")
+	}
+
+	f := false
+	want := Request{Type: TypeSnapshotRequest, DropCaches: &f, MergeRef: &f}
+	var buf bytes.Buffer
+	if err := WriteMessage(&buf, &want); err != nil {
+		t.Fatal(err)
+	}
+	var got Request
+	if err := ReadMessage(&buf, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.DropCaches == nil || *got.DropCaches || got.DropCachesEnabled() {
+		t.Fatalf("drop_caches false was not preserved: %+v", got.DropCaches)
+	}
+	if got.MergeRef == nil || *got.MergeRef || got.MergeRefEnabled() {
+		t.Fatalf("merge_ref false was not preserved: %+v", got.MergeRef)
+	}
+}
+
+func TestOldSnapshotRequestOmitsNewBoolFields(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteMessage(&buf, &Request{Type: TypeSnapshotRequest}); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(buf.Bytes(), []byte("drop_caches")) || bytes.Contains(buf.Bytes(), []byte("merge_ref")) {
+		t.Fatalf("nil compatibility fields must be omitted: %q", buf.Bytes())
+	}
+}
+
+func TestSnapshotProtocolKeepsStagingAndTypedDropCachesResult(t *testing.T) {
+	wantReq := Request{Type: TypeSnapshotRequest, StagingDir: "/run/sandbox/snap-stage"}
+	var buf bytes.Buffer
+	if err := WriteMessage(&buf, &wantReq); err != nil {
+		t.Fatal(err)
+	}
+	var gotReq Request
+	if err := ReadMessage(&buf, &gotReq); err != nil {
+		t.Fatal(err)
+	}
+	if gotReq.StagingDir != wantReq.StagingDir {
+		t.Fatalf("staging_dir = %q, want %q", gotReq.StagingDir, wantReq.StagingDir)
+	}
+
+	wantResp := Response{Type: TypeSnapshotDone, DropCachesResult: proto.DropCachesSkipped}
+	buf.Reset()
+	if err := WriteMessage(&buf, &wantResp); err != nil {
+		t.Fatal(err)
+	}
+	var gotResp Response
+	if err := ReadMessage(&buf, &gotResp); err != nil {
+		t.Fatal(err)
+	}
+	if gotResp.DropCachesResult != proto.DropCachesSkipped {
+		t.Fatalf("drop_caches_result = %q, want %q", gotResp.DropCachesResult, proto.DropCachesSkipped)
+	}
+}

@@ -344,7 +344,7 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 			logf("reverse-channel: quiesce freeze failed, NOT sending quiesced: %v", err)
 			return false
 		}
-		runQuiesce() // sync + drop_caches
+		dropCachesResult := runQuiesce(req.SkipDropCaches)
 		// Tear down port-forward relays the same way as the stdio MUX: a
 		// live forward left open would be captured as a half-open vsock
 		// remnant. Each vsock conn closes with SO_LINGER so the teardown is
@@ -352,7 +352,10 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		// closes the cached accept-mode listeners (unblocking parked accepts).
 		closeConnectSessions(sup.connReg, sup.acceptLn)
 		bridge.closeLiveMUX() // stop forwarding app output, then the MUX_CLOSE handshake
-		if err := proto.WriteMessage(c, &proto.Message{Type: proto.TypeQuiesced}); err != nil {
+		if err := proto.WriteMessage(c, &proto.Message{
+			Type:             proto.TypeQuiesced,
+			DropCachesResult: dropCachesResult,
+		}); err != nil {
 			logf("reverse-channel: write quiesced: %v", err)
 		}
 		return false

@@ -69,6 +69,18 @@ func openMergeBase(path string, size int64) (*tarLayer, []sparse.Extent, error) 
 	return &tarLayer{f: f, ReadSeeker: v}, clipExtents(v.Holes(), uint64(size)), nil
 }
 
+// ValidateMergeBase performs the same structural, digest-name, and logical
+// size checks Take will apply to a local memory or disk merge base, without
+// retaining the artifact. Callers use it before guest quiesce so predictable
+// local-artifact failures cannot leave a guest frozen.
+func ValidateMergeBase(path string, size int64) error {
+	base, _, err := openMergeBase(path, size)
+	if err != nil {
+		return err
+	}
+	return base.Close()
+}
+
 // clipExtents intersects sorted, disjoint extents with [0, size).
 func clipExtents(hs []sparse.Extent, size uint64) []sparse.Extent {
 	var out []sparse.Extent

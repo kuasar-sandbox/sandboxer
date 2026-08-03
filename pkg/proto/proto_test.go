@@ -226,6 +226,46 @@ func TestRoundTrip_PingPong(t *testing.T) {
 	}
 }
 
+func TestQuiesceCachePolicyRoundTripAndOldPeerCompatibility(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteMessage(&buf, &Message{Type: TypeQuiesce, SkipDropCaches: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadMessage(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != TypeQuiesce || !got.SkipDropCaches {
+		t.Fatalf("quiesce round-trip mismatch: %+v", got)
+	}
+
+	buf.Reset()
+	if err := WriteMessage(&buf, &Message{
+		Type:             TypeQuiesced,
+		DropCachesResult: DropCachesSkipped,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = ReadMessage(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DropCachesResult != DropCachesSkipped {
+		t.Fatalf("quiesced result mismatch: %+v", got)
+	}
+
+	buf.Reset()
+	buf.Write([]byte{19, 0, 0, 0})
+	buf.WriteString(`{"type":"quiesced"}`)
+	got, err = ReadMessage(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SkipDropCaches || got.DropCachesResult != "" {
+		t.Fatalf("old peer fields changed meaning: %+v", got)
+	}
+}
+
 func TestRoundTrip_RestoreEpoch(t *testing.T) {
 	m := &Message{Type: TypeRestore, Epoch: 7}
 	var buf bytes.Buffer

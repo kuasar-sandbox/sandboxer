@@ -4,12 +4,167 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 )
+
+func TestValidateLocalMemoryRefsUsesOutputBundleDirectory(t *testing.T) {
+	out := t.TempDir()
+	name := "base.snapshot"
+	manifestRef := "manifest://" + strings.Repeat("a", 64)
+	locatedRef := "file://located.snapshot@location:parent"
+	if err := os.WriteFile(filepath.Join(out, name), []byte("artifact"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refs := []string{
+		"file:///different/source/" + name,
+		manifestRef,
+		locatedRef,
+	}
+	if err := validateLocalMemoryRefs(out, refs); err != nil {
+		t.Fatalf("validateLocalMemoryRefs() error = %v", err)
+	}
+
+	if err := os.Symlink(name, filepath.Join(out, "alias.snapshot")); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLocalMemoryRefs(out, []string{"file://alias.snapshot"}); err != nil {
+		t.Fatalf("accessible sibling symlink should be accepted: %v", err)
+	}
+
+	err := validateLocalMemoryRefs(out, []string{"file://missing.snapshot"})
+	if err == nil || !strings.Contains(err.Error(), `file://missing.snapshot`) ||
+		!strings.Contains(err.Error(), filepath.Join(out, "missing.snapshot")) {
+		t.Fatalf("missing local memory ref error = %v", err)
+	}
+}
+
+func TestValidateLocalMemoryRefsRejectsNonRegularFiles(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(string) error
+	}{
+		{
+			name: "directory",
+			setup: func(path string) error {
+				return os.Mkdir(path, 0o755)
+			},
+		},
+		{
+			name: "fifo",
+			setup: func(path string) error {
+				return syscall.Mkfifo(path, 0o600)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := t.TempDir()
+			path := filepath.Join(out, "base.snapshot")
+			if err := tt.setup(path); err != nil {
+				t.Fatal(err)
+			}
+
+			err := validateLocalMemoryRefs(out, []string{"file://base.snapshot"})
+			if err == nil || !strings.Contains(err.Error(), "is not a regular file") {
+				t.Fatalf("non-regular local memory ref error = %v", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeLocalMemoryRefsEmitsSiblingBasenames(t *testing.T) {
+	digest := strings.Repeat("b", 64)
+	locatedRef := "file://located.snapshot@sha256:" + digest + "@location:parent"
+	manifestRef := "manifest://" + strings.Repeat("a", 64)
+	got, err := normalizeLocalMemoryRefs([]string{
+		"file:///legacy/path/base.snapshot",
+		"file://nested/parent.snapshot",
+		locatedRef,
+		manifestRef,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"file://base.snapshot", "file://parent.snapshot", locatedRef, manifestRef}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("normalized refs = %v, want %v", got, want)
+	}
+
+	if _, err := normalizeLocalMemoryRefs([]string{"file://.."}); err == nil {
+		t.Fatal("normalizeLocalMemoryRefs(file://..) succeeded")
+	}
+}
+
+func TestValidatePortableMemoryRefsAcceptsLocatedFileRefs(t *testing.T) {
+	refs := []string{
+		"manifest://" + strings.Repeat("a", 64),
+		"file://base.snapshot@location:parent",
+	}
+	if err := validatePortableMemoryRefs(refs); err != nil {
+		t.Fatalf("portable refs rejected: %v", err)
+	}
+	if err := validatePortableMemoryRefs([]string{"file://base.snapshot"}); err == nil {
+		t.Fatal("unlocated local ref accepted for direct upload")
+	}
+}
+
+func TestHandleSnapshotRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T) {
+	pinger := &guestlink.Pinger{
+		Client: &guestlink.HostClient{BasePath: filepath.Join(t.TempDir(), "must-not-dial.sock")},
+	}
+	baseCfg := &config.SandboxConfig{}
+	baseOpts := RunOptions{Cfg: baseCfg, SandboxID: "test"}
+	disks := []SnapDiskRef{{DiffPath: filepath.Join(t.TempDir(), "not-needed.diff")}}
+
+	_, err := handleSnapshotRequest(ctl.Request{}, baseOpts, nil, disks, nil,
+		"", t.TempDir(), pinger, nil, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "--output and --upload") {
+		t.Fatalf("missing output error = %v", err)
+	}
+
+	_, err = handleSnapshotRequest(ctl.Request{Upload: true}, baseOpts, nil, disks, nil,
+		"", t.TempDir(), pinger, nil, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "manifest") {
+		t.Fatalf("missing manifest config error = %v", err)
+	}
+}
+
+func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) {
+	dir := t.TempDir()
+	diff := filepath.Join(dir, "root.diff")
+	if err := os.WriteFile(diff, make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.SandboxConfig{}
+	cfg.SnapshotProvenance = config.SnapshotProvenance{
+		ParentSnapshotRef: "file://base.snapshot",
+		ParentOverlayBase: "file://base.overlay",
+		ParentOverlayPath: filepath.Join(dir, "missing.overlay"),
+	}
+	pinger := &guestlink.Pinger{
+		Client: &guestlink.HostClient{BasePath: filepath.Join(dir, "must-not-dial.sock")},
+	}
+	mergeRef := false
+	req := ctl.Request{OutDir: filepath.Join(dir, "out"), MergeRef: &mergeRef}
+
+	_, err := handleSnapshotRequest(req, RunOptions{Cfg: cfg, SandboxID: "test"}, nil,
+		[]SnapDiskRef{{DiffPath: diff}}, nil, "", filepath.Join(dir, "run"),
+		pinger, nil, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") ||
+		!strings.Contains(err.Error(), "missing.overlay") {
+		t.Fatalf("disk merge preflight error = %v", err)
+	}
+}
 
 // fakeSignaler records signals sent to it; never blocks. Goroutine-safe:
 // waitForCHWithSignalEscalation calls Signal from the test goroutine while

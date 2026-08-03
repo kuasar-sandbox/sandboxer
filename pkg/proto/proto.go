@@ -337,6 +337,14 @@ type Message struct {
 	ID      uint64 `json:"id,omitempty"`
 	TSendNs int64  `json:"t_send_ns,omitempty"`
 
+	// quiesce: SkipDropCaches asks a new guest to preserve its page,
+	// dentry, and inode caches after freeze+sync. Old guests ignore this
+	// additive field and retain their historical drop behavior.
+	SkipDropCaches bool `json:"skip_drop_caches,omitempty"`
+	// quiesced: DropCachesResult reports what the guest did. Its absence
+	// means the peer predates result reporting.
+	DropCachesResult DropCachesResult `json:"drop_caches_result,omitempty"`
+
 	// restore / attach: incremented on each restore/attach. Lets guest
 	// distinguish "fresh wake" from a duplicate message in flight.
 	Epoch uint32 `json:"epoch,omitempty"`
@@ -378,6 +386,16 @@ type Message struct {
 	// error: human-readable reason on rejection paths.
 	Msg string `json:"msg,omitempty"`
 }
+
+// DropCachesResult is the guest's best-effort quiesce cache-drop outcome.
+type DropCachesResult string
+
+const (
+	DropCachesUnknown   DropCachesResult = "unknown"
+	DropCachesSkipped   DropCachesResult = "skipped"
+	DropCachesSucceeded DropCachesResult = "succeeded"
+	DropCachesFailed    DropCachesResult = "failed"
+)
 
 // Message type constants. See docs/sandbox-init.md §4.3 for the
 // directions, the request/response pairs, and which connections upgrade
