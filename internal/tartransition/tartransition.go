@@ -148,6 +148,33 @@ func SHA256Digest(tagged string) (string, error) {
 	return digest, nil
 }
 
+// SHA256RefDigest returns ref's untagged digest only when the ref represents
+// the legacy SHA-256 identity. Current manifest.Ref has no DigestScheme field,
+// so a non-empty Digest is implicitly SHA-256; the final issue #27 Ref carries
+// the scheme explicitly and must fail closed for HMAC until issue #24 removes
+// this bridge and makes the caller fully scheme-aware.
+func SHA256RefDigest(ref manifest.Ref) (string, error) {
+	field := reflect.ValueOf(ref).FieldByName("DigestScheme")
+	if field.IsValid() {
+		if field.Kind() != reflect.String {
+			return "", fmt.Errorf("tartransition: unsupported manifest.Ref DigestScheme field")
+		}
+		scheme := field.String()
+		if ref.Digest == "" {
+			if scheme != "" {
+				return "", fmt.Errorf("tartransition: digest scheme is set without a digest")
+			}
+			return "", nil
+		}
+		if scheme != digestSchemeSHA256 {
+			return "", fmt.Errorf("tartransition: ref digest scheme is not supported before sandboxer issue #24")
+		}
+	} else if ref.Digest == "" {
+		return "", nil
+	}
+	return SHA256Digest(digestSchemeSHA256 + ":" + ref.Digest)
+}
+
 // SHA256RefString formats a legacy SHA-256 file ref across manifest.Ref's
 // issue #27 transition. Current Ref derives @sha256 from Digest alone; the
 // final Ref also requires DigestScheme. Reflection keeps this temporary bridge

@@ -127,7 +127,11 @@ func validateFileRefIdentity(ref manifest.Ref, stream fetch.Stream) error {
 	if err != nil {
 		return fmt.Errorf("file ref %q uses an unsupported digest scheme: %w", ref.String(), err)
 	}
-	if ref.Digest != "" && ref.Digest != digest {
+	expected, err := tartransition.SHA256RefDigest(ref)
+	if err != nil {
+		return fmt.Errorf("file ref %q uses an unsupported digest scheme: %w", ref.String(), err)
+	}
+	if expected != "" && expected != digest {
 		return fmt.Errorf("file ref %q digest mismatch: got %s", ref.String(), digest)
 	}
 	if ref.Location != "" {

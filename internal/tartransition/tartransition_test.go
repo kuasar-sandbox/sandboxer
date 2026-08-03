@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -65,6 +66,24 @@ func TestSHA256DigestRejectsHMAC(t *testing.T) {
 	}
 	if _, err := SHA256Digest("hmac:" + testDigest); err == nil {
 		t.Fatal("HMAC digest accepted by legacy SHA-256 caller")
+	}
+}
+
+func TestSHA256RefDigestRejectsFinalHMACScheme(t *testing.T) {
+	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: "image.erofs", Digest: testDigest}
+	field := reflect.ValueOf(&ref).Elem().FieldByName("DigestScheme")
+	if field.IsValid() {
+		field.SetString("sha256")
+	}
+	if got, err := SHA256RefDigest(ref); err != nil || got != testDigest {
+		t.Fatalf("SHA256RefDigest(sha256) = %q, %v", got, err)
+	}
+	if !field.IsValid() {
+		return
+	}
+	field.SetString("hmac")
+	if _, err := SHA256RefDigest(ref); err == nil {
+		t.Fatal("final manifest.Ref HMAC scheme accepted by legacy SHA-256 caller")
 	}
 }
 

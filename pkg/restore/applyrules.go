@@ -374,6 +374,10 @@ func effectiveSnapshotBaseRef(raw string, snapRef manifest.Ref) (string, error) 
 	if ref.Scheme == manifest.RefSchemeManifest {
 		return snapRef.String(), nil
 	}
+	digest, err := tartransition.SHA256RefDigest(snapRef)
+	if err != nil {
+		return "", err
+	}
 	ref.Path = filepath.Base(ref.Path)
-	return tartransition.SHA256RefString(ref, snapRef.Digest)
+	return tartransition.SHA256RefString(ref, digest)
 }
