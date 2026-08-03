@@ -2205,7 +2205,9 @@ snapshot 在全部 vhost backend quiesce 后调用 `BlockCOW.SnapshotView()`:vie
 当前 dirty bitmap,只暴露 upper,不包含 base。dirty block 从 live BlockCOW 读取完整
 plaintext 4K 内容;clean block 作为 hole,即使调用方防御性读取也返回零。snapshot
 plumbing 携带该 view provider,不再通过 raw diff path 重开文件;path 只保留给日志、
-统计和清理。
+统计和清理。preflight 直接携带 BlockCOW logical size,不提前构造 hole map;
+capture 读取时把相邻 dirty block 合并为连续 range,每个涉及的 stripe 只取一次读锁,
+并以一次底层 `ReadAt` 读取该 range。
 
 DISCARD 路径(无 base layer 时正确):`fallocate(PUNCH_HOLE)` + bitmap 清掉;
 读 ReadAt 看到 bitmap 干净 → memset(0)。**带 base layer 时**需要扩展为三态
