@@ -55,6 +55,10 @@ type RunOptions struct {
 	// Each opens a host-local listener whose connections are spliced to a
 	// guest-side target. Empty → no port forwarding.
 	Forwards []ForwardSpec
+
+	// NotifyReadiness receives the one-shot startup milestones for this run.
+	// nil preserves the historical behavior exactly.
+	NotifyReadiness ReadinessNotify
 }
 
 // Run executes one sandbox lifecycle: prepare backends + launch server,
@@ -406,10 +410,12 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		NetMAC:    netMAC,
 		NetnsFile: netnsFile, // non-nil → launch CH inside the tap's netns
 
-		SnapCfg:     opts.Cfg,
-		ManifestCfg: opts.ManifestCfg,
-		Forwards:    opts.Forwards,
-		Cgroup:      cg,
+		SnapCfg:           opts.Cfg,
+		ManifestCfg:       opts.ManifestCfg,
+		Forwards:          opts.Forwards,
+		Cgroup:            cg,
+		NotifyReadiness:   opts.NotifyReadiness,
+		ReadyOnAppStarted: true,
 
 		BuildCmd: func(e CmdEnv) (*exec.Cmd, func(), error) {
 			_, kernelPath, _ := config.SchemeAndPath(opts.Cfg.Boot.Kernel)

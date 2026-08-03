@@ -1,12 +1,14 @@
 package guestlink
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"net"
 	"path/filepath"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -181,6 +183,105 @@ func TestLaunchServer_AppLifecycleNotifications(t *testing.T) {
 		t.Errorf("Serve returned: %v", err)
 	}
 }
+
+func TestLaunchServer_AppStartedCallbackRunsAfterACK(t *testing.T) {
+	request := encodeLaunchMessage(t, &proto.Message{Type: proto.TypeAppStarted, PID: 4711})
+	wantACK := encodeLaunchMessage(t, &proto.Message{Type: proto.TypeAck})
+	conn := &scriptedLaunchConn{read: bytes.NewReader(request)}
+	var ackComplete atomic.Bool
+	conn.write = func(p []byte) (int, error) {
+		n, err := conn.written.Write(p)
+		if bytes.Equal(conn.written.Bytes(), wantACK) {
+			ackComplete.Store(true)
+		}
+		return n, err
+	}
+	called := false
+	srv := &LaunchServer{
+		Logf: func(string, ...any) {},
+		OnAppStarted: func(pid int) {
+			called = true
+			if pid != 4711 {
+				t.Errorf("pid = %d, want 4711", pid)
+			}
+			if !ackComplete.Load() {
+				t.Error("OnAppStarted ran before the ACK was fully written")
+			}
+		},
+	}
+	if keep := srv.handleConn(conn); keep {
+		t.Fatal("app_started connection unexpectedly handed off")
+	}
+	if !called {
+		t.Fatal("OnAppStarted was not called")
+	}
+	if !bytes.Equal(conn.written.Bytes(), wantACK) {
+		t.Fatalf("ACK wire = %x, want %x", conn.written.Bytes(), wantACK)
+	}
+}
+
+func TestLaunchServer_AppStartedACKFailureSkipsCallback(t *testing.T) {
+	request := encodeLaunchMessage(t, &proto.Message{Type: proto.TypeAppStarted, PID: 4711})
+	conn := &scriptedLaunchConn{read: bytes.NewReader(request), failAfter: 4}
+	conn.write = conn.writeUntilFailure
+	called := false
+	srv := &LaunchServer{
+		Logf:         func(string, ...any) {},
+		OnAppStarted: func(int) { called = true },
+	}
+	if keep := srv.handleConn(conn); keep {
+		t.Fatal("app_started connection unexpectedly handed off")
+	}
+	if called {
+		t.Fatal("OnAppStarted ran after a failed ACK write")
+	}
+}
+
+func encodeLaunchMessage(t *testing.T, msg *proto.Message) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := proto.WriteMessage(&buf, msg); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+type scriptedLaunchConn struct {
+	read      *bytes.Reader
+	written   bytes.Buffer
+	write     func([]byte) (int, error)
+	failAfter int
+}
+
+func (c *scriptedLaunchConn) Read(p []byte) (int, error) { return c.read.Read(p) }
+func (c *scriptedLaunchConn) Write(p []byte) (int, error) {
+	if c.write != nil {
+		return c.write(p)
+	}
+	return c.written.Write(p)
+}
+func (c *scriptedLaunchConn) writeUntilFailure(p []byte) (int, error) {
+	remaining := c.failAfter - c.written.Len()
+	if remaining <= 0 {
+		return 0, io.ErrClosedPipe
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	n, _ := c.written.Write(p)
+	return n, nil
+}
+func (*scriptedLaunchConn) Close() error                     { return nil }
+func (*scriptedLaunchConn) LocalAddr() net.Addr              { return testLaunchAddr("local") }
+func (*scriptedLaunchConn) RemoteAddr() net.Addr             { return testLaunchAddr("remote") }
+func (*scriptedLaunchConn) SetDeadline(time.Time) error      { return nil }
+func (*scriptedLaunchConn) SetReadDeadline(time.Time) error  { return nil }
+func (*scriptedLaunchConn) SetWriteDeadline(time.Time) error { return nil }
+
+type testLaunchAddr string
+
+func (a testLaunchAddr) Network() string { return "test" }
+func (a testLaunchAddr) String() string  { return string(a) }
 
 func TestLaunchServer_NilSpecRejected(t *testing.T) {
 	srv := &LaunchServer{Path: "/tmp/never.sock"}

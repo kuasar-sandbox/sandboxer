@@ -160,6 +160,11 @@ sandbox-ctl run [flags]
                           tick 跳过(warm 后自动安静)。0 = 关闭。flag >
                           SANDBOX_STATS_INTERVAL env > 默认 30s
 
+  # 一次性启动通知(可选)
+  --ready-fd <fd>         向继承 fd 写 control_ready\n、ready\n,成功后关闭该 fd。
+                          fd 必须 >= 3;未提供时完全关闭。事件不写普通 stdout/stderr,
+                          且 ready 后 run 仍继续拥有 VM、阻塞到 sandbox 退出
+
   # 可靠性兜底
   --ping-fatal-threshold N  连续 N 次 host→guest ping 失败后,sandbox-ctl 主动给 CH
                           发 SIGTERM(随后宽限升级 SIGKILL),让 cmd.Wait 返回而不是
@@ -227,6 +232,70 @@ sandbox-ctl 控制终端的前台进程组——终端产生的 `^C` / `^\` / `^
 给 CH、宽限后 SIGKILL(与 [`sandbox-init.md`](sandbox-init.md) §3.3 的退出
 序列衔接)。`--tty` raw 模式下终端是 raw 的、`^C` 不产生 SIGINT(见上);非 raw 模式
 下 `^C` 正常触发上述 SIGTERM 升级链。
+
+**启动 readiness wire**:`--ready-fd=N` 是调用方提供的一次性观察通道。成功 wire
+严格为 `control_ready\nready\nEOF`;每个事件最多一次且不能反序。语义如下:
+
+- `control_ready`:仅在本次 `<run-root>/<sid>/ctl.sock` 已成功 `Listen` 后写出。
+  此时 host-local socket 可连接(连接可先进入 accept queue),但不承诺 guest、exec、
+  network、envd 或应用已就绪。
+- cold `ready`:host 收到本次 run 的首个现有 `app_started`,并且成功把
+  `TypeAck` 完整写回 guest 后写出。应用原地 restart 的后续 `app_started` 不重复
+  `ready`;该边界不证明最终目标程序 `execve` 成功,也不表示业务服务健康。
+- restore `ready`:依次完成 CH API `WaitReady`、`/vm.resume`、
+  `OpenMUXViaRestore` 收到 `restore_ack`、host `EstablishMUX` 后写出。pinger、balloon、
+  `SettledRestore`、heartbeat 与 sensor 不在该 barrier 内;不推断 guest thaw-complete。
+
+失败不增加额外事件或 ping fallback:`control_ready` 前失败只得到 EOF;
+`control_ready` 后失败得到该行后再 EOF。具体错误仍看 `run` 退出码与 stderr/journald。
+若 reader 提前关闭,后续写的 `EPIPE` 只记录一次并禁用 notifier,不会终止 sandbox。
+`sandbox-ctl` 在解析 flag 后立即校验 fd、设置 `FD_CLOEXEC`,自行拥有并在所有返回路径
+关闭它;写完 `ready` 也立即关闭。未提供 flag 时没有新增日志、goroutine 或行为变化。
+
+Bash 应把 readiness pipe 与应用 stdio 分开;重定向顺序必须先令 fd 3 指向 coprocess
+stdout,再重定向普通 stdout/stderr:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+sid=demo
+tmp=$(mktemp -d)
+
+coproc SB {
+    exec sandbox-ctl run \
+        --sandbox-id "$sid" \
+        --config sandbox.yaml \
+        --ready-fd=3 \
+        3>&1 \
+        >"$tmp/run.stdout" \
+        2>"$tmp/run.stderr"
+}
+
+pid=$SB_PID
+ready_fd=${SB[0]}
+
+if ! IFS= read -r -t 10 -u "$ready_fd" event ||
+   [[ "$event" != control_ready ]]; then
+    echo "sandbox did not reach control_ready" >&2
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" || true
+    exit 1
+fi
+
+if ! IFS= read -r -t 60 -u "$ready_fd" event ||
+   [[ "$event" != ready ]]; then
+    echo "sandbox did not become ready" >&2
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" || true
+    exit 1
+fi
+
+sandbox-ctl exec --sandbox-id "$sid" -- /bin/true
+```
+
+不要把 readiness marker 写入普通 stdout/stderr:两者分别承载应用输出、运行日志与
+guest console,无法提供无歧义的启动协议边界。
 
 **stdio 决策表**:
 
@@ -1027,7 +1096,8 @@ T11  读 boot.root.base 末尾 ZIP 拿 ImageConfig(缺 ZIP 软失败返回空)
 T12  起 launch server goroutine:listen /run/sandbox/<sid>/vsock.sock_5000
 T13  起 va_report UDS server: listen /run/sandbox/<sid>/uffd.sock
      OnReady callback 内将 adopt uffd_C(从 SCM_RIGHTS)+ 起 epoll/worker
-T14  起 ctl.sock UDS server: listen /run/sandbox/<sid>/ctl.sock(snapshot / exec 请求入口)
+T14  起 ctl.sock UDS server: listen /run/sandbox/<sid>/ctl.sock(snapshot / exec 请求入口);
+     Listen 成功且 cleanup 已注册后,若启用 --ready-fd 则写 control_ready
 T15  构造 CH 命令行(详见 §5.2):
      `--memory-zone size=<ramSize>,shared=on,fd=3,uffd_socket=/run/sandbox/<sid>/uffd.sock`
      `--console tty --serial off`,cmdline `... console=hvc0`(内核 dmesg 走 hvc0)
@@ -1065,7 +1135,8 @@ T19  Guest 内 kernel 启动 → mount /dev/pmem0 → exec /sbin/init = sandbox-
           app stdio(tty: openpty / pipe: socketpair)→ launch_ack{stdio} → host 回 ack
           → **这条连接升级为 stdio MUX**;host 发一次初始 SET_WINSIZE,起 app stdio
           桥接,ping ticker start;guest fork/exec user app(app fd 0/1/2 = 伪终端从端
-          或 pipe 子端)→ 短连接发 app_started{pid}
+          或 pipe 子端)→ 短连接发 app_started{pid}→ host 成功写回 ACK→ 本次 cold run
+          首次通知写 ready 并关闭 ready fd(后续原地 restart 不重复)
      T19c phase 3 supervisor + 反向 listener(ping/restore/quiesce/attach/exec)+ mem_report
 T20  vCPU 跑过程中:
      · stdio MUX:STDIN / STDOUT / STDERR(或 PTY)+ WINDOW_UPDATE / SET_WINSIZE
@@ -1493,7 +1564,9 @@ T15 vsock 连接发 restore{epoch=N, wallclock_ns} 给 sandbox-init(guest:5000 l
      ticker 照常)。restore_ack 是 attach_ack 的超集(含 channel 集合 + 应用状态)
      外加"恢复完成"信号。**这条连接随后升级为新的 stdio MUX**:host 发一次初始
      SET_WINSIZE,重建应用 stdio 桥接,per-stream window 重新协商,残留字节回放,
-     应用解除阻塞;然后(re)start ping ticker。deadline 到点未收到 restore_ack →
+     host 成功建立 MUX 后,本次 restore run 写 ready 并关闭 ready fd,随后 host
+     (re)start ping ticker。guest 在写 ACK 后自行 reattach/thaw;本 ready 不确认其
+     thaw 完成。deadline 到点未收到 restore_ack →
      restore 失败回退:CH /vm.shutdown 并向调用方报错
 T16 vCPU 跑,fault 流转见 §8 uffd handler;balloon EVENT_REMOVE 同冷启动
 T17 user app 退出 / 接收外部信号 → 退出流程同冷启动

@@ -368,8 +368,9 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 }
 
 // notifyAppStarted dials the host launch UDS and sends a short-conn
-// app_started notification. Best-effort: errors are logged but not
-// fatal — the host has fallback signals (ping, ctl.sock).
+// app_started notification. Best-effort: errors are logged but not fatal to
+// the guest. The host emits no readiness fallback; an observer waiting for
+// ready instead fails closed through its own timeout and teardown policy.
 func notifyAppStarted(pid int) error {
 	conn, err := dialVsock(proto.VsockHostCID, proto.LaunchPort)
 	if err != nil {

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,6 +67,10 @@ type Options struct {
 	// sandbox re-opens the same host-local listeners (forward.go). Empty →
 	// no port forwarding.
 	Forwards []sandbox.ForwardSpec
+
+	// NotifyReadiness receives the one-shot startup milestones for this run.
+	// nil preserves the historical behavior exactly.
+	NotifyReadiness sandbox.ReadinessNotify
 }
 
 // Run executes restore. Returns the CH exit code.
@@ -545,10 +550,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		NetMAC:    netMAC,
 		NetnsFile: netnsFile, // non-nil → launch CH inside the tap's netns
 
-		SnapCfg:     &snapCfg,
-		ManifestCfg: opts.ManifestCfg,
-		Forwards:    opts.Forwards,
-		Cgroup:      cg,
+		SnapCfg:         &snapCfg,
+		ManifestCfg:     opts.ManifestCfg,
+		Forwards:        opts.Forwards,
+		Cgroup:          cg,
+		NotifyReadiness: opts.NotifyReadiness,
 
 		BuildCmd: func(e sandbox.CmdEnv) (*exec.Cmd, func(), error) {
 			// CH 51 `--restore source_url=file://<dir>` replaces
@@ -598,12 +604,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			if restoreDeadline <= 0 {
 				restoreDeadline = config.NoForcedTimeout
 			}
-			muxConn, muxSpec, err := guestlink.OpenMUXViaRestore(pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline)
+			muxSpec, err := openAndEstablishRestoreMUX(func() (net.Conn, proto.StdioSpec, error) {
+				return guestlink.OpenMUXViaRestore(pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline)
+			}, pc.EstablishMUX, pc.NotifyReady)
 			if err != nil {
-				return fmt.Errorf("notify restore: %w (guest agent unreachable)", err)
-			}
-			if err := pc.EstablishMUX(muxConn, muxSpec); err != nil {
-				return fmt.Errorf("stdio MUX bridge: %w", err)
+				return err
 			}
 			pc.Logf("restore notify acked in %dµs (stdio MUX re-established: tty=%v); starting ping ticker",
 				time.Since(tRestore).Microseconds(), muxSpec.TTY)
@@ -632,6 +637,30 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			return nil
 		},
 	})
+}
+
+// openAndEstablishRestoreMUX is the restore readiness barrier after CH API
+// readiness and /vm.resume: OpenMUXViaRestore returns only after restore_ack,
+// then the host MUX must be established before ready is emitted. The pinger,
+// balloon, settled hook, heartbeat, and sensor deliberately remain outside.
+func openAndEstablishRestoreMUX(
+	open func() (net.Conn, proto.StdioSpec, error),
+	establish func(net.Conn, proto.StdioSpec) error,
+	notifyReady func(),
+) (proto.StdioSpec, error) {
+	conn, spec, err := open()
+	if err != nil {
+		return proto.StdioSpec{}, fmt.Errorf("notify restore: %w (guest agent unreachable)", err)
+	}
+	if err := establish(conn, spec); err != nil {
+		// EstablishMUX did not take ownership on failure.
+		_ = conn.Close()
+		return proto.StdioSpec{}, fmt.Errorf("stdio MUX bridge: %w", err)
+	}
+	if notifyReady != nil {
+		notifyReady()
+	}
+	return spec, nil
 }
 
 // reconstructDisk rebuilds one logical disk for restore: the read-only base is

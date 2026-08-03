@@ -76,6 +76,7 @@ Usage:
                         [--stdin-from F] [--stdout-to F] [--stderr-to F]
                         [--tty] [--console off|default|file=PATH]
                         [--ping-fatal-threshold N] [--stats-interval <dur>]
+			[--ready-fd N]
   sandbox-ctl snapshot  --sandbox-id <sid> (--output <out_dir> | --upload)
                         [--resume] [--run-root <dir>] [--timeout <sec>]
   sandbox-ctl exec      [--sandbox-id <sid>] [--run-root <dir>]
@@ -104,7 +105,9 @@ be supplied via the MANIFEST_KEY env var instead of the config file
 run starts one sandbox VM and blocks until the guest exits. With
 --restore, the sandbox is resumed from a snapshot bundle instead of
 cold-starting (sandbox.yaml field semantics in restore mode are listed
-in docs/sandbox.md §11.0).
+in docs/sandbox.md §11.0). --ready-fd writes the one-shot startup wire
+"control_ready\nready\n" to an inherited fd and closes that fd after
+ready; run itself continues to own the VM and remains blocked.
 
 snapshot pauses a running sandbox and writes a snapshot bundle either
 to a local directory (--output) or to the manifest store (--upload).
