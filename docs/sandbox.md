@@ -2177,16 +2177,26 @@ blk1 是可写盘,基础语义为"上层 ext4 sparse 文件 + 可选 base 层":
 ```
 读路径:
   for each 4K block in [off, off+len(buf)):
+    acquire shared stripe lock
     if dirtyBitmap[blk]:    pread(diffFile, slice, blk*4K)
     elif baseReader != nil: baseReader.ReadAt(slice, blk*4K)
     else:                   memset(slice, 0)
 
 写路径:
-  pwrite(diffFile, buf, off);
-  for each 4K block: dirtyBitmap[blk] |= 1
+  for each 4K block in [off, off+len(buf)):
+    acquire exclusive stripe lock
+    if clean 且本次未完整覆盖该 block:
+      从 baseReader 或零完整初始化 4K scratch block
+      合并本次 slice
+      pwrite(diffFile, scratch, blk*4K, 4K)
+    else:
+      pwrite(diffFile, slice, 对应 offset)
+    完整写成功后 dirtyBitmap[blk] |= 1
 ```
 
-启动时通过 SEEK_DATA/HOLE 扫 blk1.diff 重建 dirtyBitmap。
+固定数量的 stripe lock 让同一 4K block 的 read/materialize/write 串行化,
+不同 block 仍可并发。启动时通过 SEEK_DATA/HOLE 扫 blk1.diff 重建 dirtyBitmap;
+因此 dirty bit 始终表示对应 4K diff block 已完整初始化。
 
 DISCARD 路径(无 base layer 时正确):`fallocate(PUNCH_HOLE)` + bitmap 清掉;
 读 ReadAt 看到 bitmap 干净 → memset(0)。**带 base layer 时**需要扩展为三态
