@@ -121,8 +121,8 @@ sandbox-ctl run [flags]
   # 配置 + 身份
   --config <path[:path2...]>  sandbox.yaml 路径,':' 分隔多份时 front-to-back 深合并
                           (语义同 config 子命令,§2.5;SANDBOX_CONFIG env;flag 优先)
-  --manifest-config <path>  manifest 配置 YAML(MANIFEST_CONFIG env);仅 manifest://
-                          资源(blk0 base、--restore manifest://、--upload)需要
+  --manifest-config <path>  存储配置 YAML(MANIFEST_CONFIG env);manifest 资源以及
+                          crypto.local=auto|required 的本地工件需要
   --ref-location <name>=<file-URI>
                           可重复;把 located file ref 的逻辑名称映射到可信宿主目录
   --sandbox-id <sid>      覆盖 yaml 里的 sandbox.id
@@ -345,8 +345,8 @@ env 传入(由 `pkg/manifest` 解析)。编排侧的 `node-ctl run-sandbox` 启�
 sandbox-ctl snapshot [flags]
 
   --sandbox-id <sid>    必填,目标 sandbox
-  --output <out_dir>    本地输出目录,产出 <sha256>.snapshot(+ <sid>.snapshot 符号链接)
-                        + <sha256>.overlay
+  --output <out_dir>    本地输出目录。crypto.local=off 产出 <sha256>.*,
+                        auto|required 产出 <hmac>.*;另建 <sid>.snapshot 符号链接
   --upload              上传至 manifest 存储:overlay 流式 ingest 拿 manifest key,
                         <sid>.snapshot 内嵌 snapshot.cfg 的 overlay.base 写为
                         manifest://<key>;stdout 输出 snapshot manifest key
@@ -475,8 +475,8 @@ sandbox-ctl info <snapshot-ref | snapshot-path> [flags]
 
   <snapshot-ref | snapshot-path>  本地路径、manifest://<hex> 或 located file ref
   --json                  默认输出 snapshot.cfg 原始 YAML;--json 改为重新输出解析后的结构
-  --manifest-config <p>   manifest 配置 YAML(MANIFEST_CONFIG env);仅 manifest://
-                          输入需要,file/本地路径可省
+  --manifest-config <p>   存储配置 YAML(MANIFEST_CONFIG env);manifest 输入以及
+                          crypto.local=auto|required 的本地工件需要
   --ref-location <name>=<file-URI>  可重复;located file ref 的可信宿主目录映射
 ```
 
@@ -484,7 +484,8 @@ sandbox-ctl info <snapshot-ref | snapshot-path> [flags]
 
 把一个本地 snapshot graph 离线发布为 canonical portable ref,不启动沙箱、不需
 `/dev/kvm`。发布到 manifest 时 local file refs 改写为 `manifest://`;发布到 named
-location 时改写为 `file://<content-addressed-basename>@location:<name>`。已有
+location 时改写为
+`file://<content-addressed-basename>@<scheme>:<digest>@location:<name>`。已有
 manifest/located refs 原样保留,因此三者可以混合。root snapshot 总会重建并发布,
 stdout 只打印新的 canonical root ref。`runtime_ref` 是节点级启动工件,仍按摘要
 钉住并随平台分发,不进入租户工件发布域。
@@ -492,16 +493,22 @@ stdout 只打印新的 canonical root ref。`runtime_ref` 是节点级启动工�
 ```
 sandbox-ctl upload-snapshot [flags] <snapshot-path>
 
-  <snapshot-path>         本地 <sid>.snapshot(或其指向的 <sha>.snapshot)
-  --manifest-config <p>   manifest 配置 YAML(MANIFEST_CONFIG env);$MANIFEST_KEY 提供客户密钥
+  <snapshot-path>         本地 <sid>.snapshot(或其指向的 <digest>.snapshot)
+  --manifest-config <p>   存储配置 YAML(MANIFEST_CONFIG env);$MANIFEST_KEY 提供客户密钥
   --to-ref-location <name>=<file-URI>
                           与 --manifest-config 二选一;目标目录只写内容寻址文件
   --quiet                 抑制 stderr 进度日志
 ```
 
+显式 `--manifest-config` 与 `--to-ref-location` 互斥,因为前者选择 manifest 发布
+目标。使用 named location 时仍可由 `MANIFEST_CONFIG` 环境变量提供
+`crypto.local` policy;若未提供则按默认 `off`。
+
 local file refs 按 bundle 同目录解析并递归升级;已有 portable ref 是本次发布边界。
-named location 目录不创建 alias、symlink 或临时 rename;有效的同名内容寻址文件直接
-复用,不完整或校验失败的目标直接覆盖并在 close 后重新验证 marker、size 与 digest。
+发布前对每个本地 tarstream 执行 sequential full validation,再从逻辑 plaintext
+稀疏视图重新编码;不会 raw-copy 工件。named location 使用目标目录内临时文件,
+`Sync` + `Close` 后以 no-replace 原子提交并同步父目录。终态已存在时完整验证,
+内容与 identity 一致才复用;不完整、校验失败或 identity 不一致时拒绝,绝不覆盖。
 working-set snapshot 的本地 memory `from_refs` 是 memory-only lowers;当前通用
 publisher 的递归遍历尚未与该语义完成校准,不承诺能发布只保留必要 memory lowers
 的最小 artifact set。该发布闭环继续由 #41 follow-up 定义和验证。
@@ -734,9 +741,26 @@ CH API 是本地管理调用、快且不受远程/缓存慢影响,60s 是安全�
 路由由 sandbox-ctl 编排决定(冷启动 → LaunchSpec,restore → restore 通知),与网络
 字段一致,schema 无需 per-instance 标记。
 
-清单配置(manifest/store/crypto/cache 节)单独存在,不放入 sandbox.yaml——它
+存储配置(manifest/store/crypto/cache 节)单独存在,不放入 sandbox.yaml——它
 是节点级配置,所有 CLI 共享(sandbox-ctl 通过 `--manifest-config` 或
 `MANIFEST_CONFIG` 环境变量引用,详见 `accelerator/docs/manifest.md`)。
+
+本地 immutable tarstream 复用同一 `crypto` 节:
+
+```yaml
+crypto:
+  chunk: aes
+  manifest: aes
+  local: off             # off | auto | required;默认 off
+```
+
+`crypto.local` 是兼容/强制 policy,不是算法选择。`off` 不解析本地 customerKey,
+也不构造 codec;`auto` 用固定 AES-SIV codec 写 encrypted v1,读取时兼容历史
+plaintext;`required` 同样加密写入,并拒绝 plaintext 与 legacy `@sha256` ref。
+`auto|required` 必须在进程启动配置阶段取得有效 `$MANIFEST_KEY`,否则 fail closed。
+同一 sandbox-ctl 进程只解析一次 key,并把同一固定值交给 manifest key table、
+tarstream codec 和 HMAC identity。构造本地 codec 不连接 store/cache;manifest
+客户端在第一次实际 fetch/ingest 时才建立。
 
 **绝对路径要求**:sandbox.yaml 中所有 `file://` URL 必须是绝对路径
 (`file:///abs/path/to/file`)。配置校验阶段拒绝 `file://relative/path`
@@ -775,8 +799,9 @@ sandbox-init 以 flush-and-replace 重配网卡(克隆取新 L3 身份,见 §11.
 
 `file://` 有两种语义:不带 qualifier 的路径是 node-local ref;带
 `@location:<name>` 的 ref 只允许 basename,实际目录必须由可信的可重复
-`--ref-location name=file:///absolute/path` 提供。`@sha256:<digest>` 如存在必须位于
-`@location` 之前。located file ref 与 `manifest://<key>` 都是 portable ref;
+`--ref-location name=file:///absolute/path` 提供。digest qualifier 是
+`@sha256:<digest>` 或 `@hmac:<digest>`,如存在必须位于 `@location` 之前。located
+file ref 与 `manifest://<key>` 都是 portable ref;
 `manifest://` 只允许单个 key,分层通过 `base_from_refs` 等显式数组表达。
 
 | 字段 | `file://` | `manifest://` | 备注 |
@@ -796,10 +821,33 @@ sandbox-init 以 flush-and-replace 重配网卡(克隆取新 L3 身份,见 §11.
 ### 3.2.1 file artifact identity
 
 本地磁盘、overlay 和 snapshot 使用 tarstream 工件:第一个 entry 是稀疏 payload,
-第二个 entry 是 size=0 的 `.kuasar.sha256.<hex>` marker。摘要覆盖 marker header
-之前的物理 tar 字节,由 writer 在写 payload 时同步生成。随机访问打开时只读取
-tar header、sparse map 和 marker,通过可选 `tarstream.Digester` 暴露
-`sha256:<hex>`,不读取 payload。
+第二个 entry 是 size=0 的 `.kuasar.sha256.<plainDigest>` marker。`plainDigest` 是
+marker header 之前 canonical plaintext tar bytes 的 SHA256;marker 和两个 trailer
+blocks 也属于 canonical tarstream。marker 在加密工件中位于密文内部。
+
+本地 identity 通过 `tarstream.Digester.Digest()` 返回 `(scheme,digest)`:
+
+- `crypto.local=off`:不传 codec,输出保持历史 plaintext byte-identical,scheme 是
+  `sha256`,digest 是 `plainDigest`
+- `crypto.local=auto|required`:传固定 AES-SIV codec,writer 把完整 canonical
+  tarstream 包入 encrypted v1 envelope,固定 record size 4096。scheme 是 `hmac`,
+  digest 是 `HMAC-SHA256(customerKey,plainDigestRaw32Bytes)`
+
+`hmac` 只是 key-bound identity scheme,不是物理 encoding flag。`auto` 读取历史
+plaintext 时也只向上层返回 `hmac`,不暴露内部 `plainDigest`;是否拒绝 plaintext
+只由 `required` 决定。新生成的 file ref 一律携带显式 digest qualifier。兼容矩阵:
+
+| `crypto.local` | plaintext / legacy `@sha256` | encrypted / `@hmac` | 新写入 |
+|----------------|--------------------------------|----------------------|--------|
+| `off` | 接受 | 拒绝(无 codec) | plaintext + `@sha256` |
+| `auto` | 接受,内部转换为 expected `hmac` | 接受 | encrypted v1 + `@hmac` |
+| `required` | 拒绝 | 接受 | encrypted v1 + `@hmac` |
+
+随机访问经 `fetch.OpenTarStream` + `SourceAt` 保持 lazy 和 O(1) record 定位,读取过的
+record 分别认证,适合 restore、merge 和 info。upload、named-location publish 与
+conversion 使用 `SourceFrom` 顺序消费到 outer EOF,重算 inner digest,验证 marker、
+trailer、expected identity 和额外尾字节。encrypted magic 一旦命中,认证或格式失败
+都不会回退 plaintext。
 
 `boot.runtime` 使用专用 bundle:
 
@@ -863,7 +911,7 @@ metadata:
 # [s1.snapshot];从 s2 恢复再存的 s3 = [s2.snapshot, s1.snapshot]。
 from_refs: []
   # - manifest://<key-of-parent.snapshot>
-  # - file://<sha256>.snapshot          # 内容寻址名,basename 即摘要(无 @sha256: 后缀)
+  # - file://<digest>.snapshot@<scheme>:<digest>  # scheme = sha256 | hmac
 
 # Guest 启动 + rootfs
 boot:
@@ -871,10 +919,10 @@ boot:
                  # boot.runtime 仅支持 file://(见 §3.2 truth table),
                  # snapshot.cfg 保存的 runtime_ref 也只会是 file:// 形式
   root:
-    base_ref:    file://container-image.erofs@sha256:<digest>
+    base_ref:    file://container-image.erofs@<scheme>:<digest>
                  # 或 manifest://<key>(原引用是 manifest:// 时原样保留)
     overlay:
-      base:      file://<sha256>.overlay
+      base:      file://<digest>.overlay@<scheme>:<digest>
                  # 或 manifest://<key>(--upload 模式)。本快照捕获的 diff = 链顶
       base_from_refs: []
                  # 磁盘 diff 链(base 之下,自顶向下,不含 base)。与 from_refs 对称:
@@ -882,15 +930,15 @@ boot:
 
   # 单磁盘模式(快照取自单盘 sandbox):无 base_ref、无 overlay 节,改用 root 层:
   # root:
-  #   base:           file://<sha256>.overlay   # 本快照捕获的 root diff = 链顶(或 manifest://)
+  #   base:           file://<digest>.overlay@<scheme>:<digest>  # root diff 链顶(或 manifest://)
   #   base_from_refs: []                         # 单盘磁盘链;冷启动会把 root.base(CoW 下层)入链
   # 数据盘 boot.disks[]:有序数组(不含 name,按序号 = cold boot.disks[] 序),每项与 root 同结构
   # (single → base+base_from_refs;overlay → base_ref+overlay{base,base_from_refs})。每块可写
   # diff 单独捕获为一个 .overlay 工件(本地)/ manifest key(上传)。恢复时与 restore host yaml 的
   # boot.disks[] 按序号合并(数同序同)。
   # disks:
-  #   - { base: file://<sha256>.overlay }                                   # 单盘数据盘
-  #   - { base_ref: file://ds.erofs@sha256:<d>, overlay: { base: file://<sha256>.overlay } }  # overlay 数据盘
+  #   - { base: file://<digest>.overlay@<scheme>:<digest> }                  # 单盘数据盘
+  #   - { base_ref: file://ds.erofs@<scheme>:<d>, overlay: { base: file://<digest>.overlay@<scheme>:<digest> } }  # overlay 数据盘
 ```
 
 **字段说明**:
@@ -901,16 +949,17 @@ boot:
   (`boot.runtime` 本身只支持 file://)。restore 时 basename 用于在
   `<sid>.snapshot` 同目录定位文件,digest 与 runtime bundle 内 marker 比较,
   防止选择不同版本
-- `base_ref`(file:// 类):同 runtime_ref,`file://<basename>@sha256:<digest>`
+- `base_ref`(file:// 类):`file://<basename>@<scheme>:<digest>`,其中 tarstream
+  工件的 scheme 由 §3.2.1 的本地 policy 决定
 - `base_ref`(manifest:// 类):原样保留 manifest key(`manifest://<key>`),
   无需 digest(manifest key 已是 content-addressable)
-- `overlay.base`(file:// 类):指向 snapshot 输出目录中那个 `<sha256>.overlay`
-  文件,basename 自带 sha256 摘要,无需额外 `@sha256:` 后缀
+- `overlay.base`(file:// 类):指向 snapshot 输出目录中那个 `<digest>.overlay`
+  文件,并显式携带 `@sha256:<digest>` 或 `@hmac:<digest>`
 - `overlay.base`(manifest:// 类):上传后的 overlay manifest key
 - `from_refs` / `overlay.base_from_refs`:增量分层链(见 §3.5)。每项是
-  `manifest://<key>` 或内容寻址的 `file://<sha256>.snapshot` /
-  `file://<sha256>.overlay`(basename 即摘要,无 `@sha256:` 后缀,与 overlay.base
-  同约定),可在一条链内混用(如 s1 本地文件、s2 已上传)。顺序严格自顶向下(新→旧)
+  `manifest://<key>` 或内容寻址的
+  `file://<digest>.<ext>@<scheme>:<digest>`,可在一条链内混用(如 s1 本地文件、
+  s2 已上传)。顺序严格自顶向下(新→旧)
 
 **故意不存的字段**:
 
@@ -1232,24 +1281,25 @@ cloud-hypervisor \
 
 ```
 <out_dir>/
-├── <sha256>.snapshot                     # tarstream 工件(条目 "snapshot" = [内存][ZIP])
-├── <sid>.snapshot → <sha256>.snapshot    # 符号链接:按 sid 寻址的"最新"指针
-└── <sha256>.overlay                      # tarstream 工件(条目 "overlay" = ext4 diff)
+├── <digest>.snapshot                     # tarstream 工件(条目 "snapshot" = [内存][ZIP])
+├── <sid>.snapshot → <digest>.snapshot    # 符号链接:按 sid 寻址的"最新"指针
+└── <digest>.overlay                      # tarstream 工件(条目 "overlay" = ext4 diff)
 ```
 
 snapshot 与 overlay 都**按内容摘要命名**(content-addressed),彼此不覆盖,故可作为
 `from_refs` / `overlay.base_from_refs` 链里**稳定、可校验**的父引用(file 模式)——
 同一 sid 的 s1/s2/s3 名字各异,链才能成立。`<sid>.snapshot` 符号链接指向本次产出的
-`<sha256>.snapshot`,给人和工具一个按 sid 寻址的"最新"入口
+`<digest>.snapshot`,给人和工具一个按 sid 寻址的"最新"入口
 (`<sid>` = `sandbox-ctl run --sandbox-id` 设的或 yaml 里的)。
 
 **工件容器 = tarstream**(`accelerator/pkg/tarstream`,GNU PAX sparse payload +
 空 digest marker):逻辑视图的洞进信封洞图,线上只有数据字节。工件文件本身**致密**
 ——`cp`/`rsync`/非稀疏文件系统都不再能破坏语义,洞的权威从此是信封而非 OS。
 
-**内容摘要 `<sha256>`** = digest marker header 之前物理 tar 字节的 SHA256,
-打包时同步计算(信封确定性编码 ⇒ 同内容同摘要)。marker 自身和 tar 结束块不参与,
-避免自引用。只读驻留数据 + ZIP 段,8 GiB 镜像里的零页不读不写。
+**内容 identity `<scheme>:<digest>`** 由 §3.2.1 定义。`off` 使用 plaintext
+`sha256`;`auto|required` 使用 customerKey-bound `hmac`,并把完整 canonical
+tarstream 写入固定 4 KiB record 的 AES-SIV envelope。两种路径都只读驻留数据 +
+ZIP 段,8 GiB 镜像里的零页不读不写;加密路径不生成 plaintext staging。
 
 **`snapshot` 条目逻辑布局**(信封内的逻辑视图;洞在信封图里):
 
@@ -1279,7 +1329,7 @@ manifest key 与容器无关(= f(逻辑内容, 洞图))。
 
 **单 zone 假设**:限定单 memory zone(固定 spec,见 §14.1)。
 
-**`<sha256>.overlay` / `<sha256>.snapshot` 写入路径**(pack-while-hash):
+**`<digest>.overlay` / `<digest>.snapshot` 写入路径**(pack-while-hash):
 
 file 模式下 overlay 与 snapshot bundle 走同一条落盘路径:
 
@@ -1288,14 +1338,17 @@ file 模式下 overlay 与 snapshot bundle 走同一条落盘路径:
    dirty bitmap 生成 upper-only 洞图,dirty block 读取 plaintext diff,clean block
    防御性读零。active diff path 只用于日志、统计和清理,不会作为 snapshot 数据重开;
    工件落定后洞的权威归 tarstream 信封
-2. `tarstream.WriteTo` 把源打包到同目录 `<sid>.<ext>.partial`,**边写边算**
-   payload tar prefix 的 SHA256(一遍),再追加空 digest marker;只有数据 extent
-   上线,洞进信封图;snapshot 的 ZIP 段拼接在 `ramSize` 逻辑偏移后
-3. `rename` `.partial` → `<out_dir>/<digest>.<ext>`(原子落定);snapshot 另建/更新
-   `<sid>.snapshot` 符号链接指向它
+2. `tarstream.WriteTo` 把源直接写到同目录 `<sid>.<ext>.partial`,单遍计算 inner
+   plaintext digest;只有 data extent 上线,洞进信封图;snapshot 的 ZIP 段拼接在
+   `ramSize` 逻辑偏移后。启用 codec 时 writer 在同一遍直接输出 encrypted v1,
+   不落 plaintext 中间件
+3. `.partial` 经 `Sync` + `Close` 后以 no-replace 原子提交为
+   `<out_dir>/<digest>.<ext>`,再同步父目录;snapshot 另建/更新
+   `<sid>.snapshot` 符号链接指向它。终态已存在时顺序完整验证 scheme、digest、
+   marker、trailer、outer EOF 和 logical size,一致才复用
 
 `.partial` 是同目录瞬态名,落定后输出目录只见内容寻址的终态文件。同一沙箱多次
-snapshot 内容不变时摘要相同 → rename 到**同名文件**(覆盖,等价无 op,天然内容寻址)。
+snapshot 内容不变时 identity 相同 → 验证后复用**同名文件**,绝不覆盖不一致终态。
 整条路径只读源的数据 extent + ZIP 段,8 GiB / 200 MiB 驻留的沙箱只触约 200 MiB。
 
 ### 6.2 snapshot 时序
@@ -1307,7 +1360,7 @@ snapshot 内容不变时摘要相同 → rename 到**同名文件**(覆盖,等�
   一次性 append
 - staging 目录(`<run-dir>/<sid>/snap-stage`,tmpfs)只容纳 CH 产出的
   config.json/state.json(KB 级);GiB 级 memory 段与 overlay 不经此目录——
-  --output 直接落 `<out_dir>`(写 `.partial` 再 rename),--upload 流式喂 ingest
+  --output 直接落 `<out_dir>`(写 `.partial` 再 no-replace commit),--upload 流式喂 ingest
 - pause 窗口 = quiesce + CH dump + overlay export + memory dump + zip append。
   overlay + memory 写都是 SEEK_DATA/HOLE 驱动的数据 extent 打包,稀疏 sandbox
   8 GiB → 驻留 200 MiB → ~100 ms
@@ -1338,8 +1391,9 @@ T3  CH /vm.snapshot { destination_url=file://<run-dir>/<sid>/snap-stage/ }
 T4  overlay → sink(在 memory 前处理,snapshot.cfg 才能拿到终态 overlay.base):
     若 --output:BlockCOW upper-only SnapshotView 的 dirty extent 打包 tarstream →
         <sid>.overlay.partial →
-        writer 返回 marker digest(§6.1)→ rename <out_dir>/<digest>.overlay;
-        overlay_ref = file://<digest>.overlay
+        writer 返回 scheme + digest(§6.1)→ no-replace commit
+        <out_dir>/<digest>.overlay;
+        overlay_ref = file://<digest>.overlay@<scheme>:<digest>
     若 --upload:同一 SnapshotView 数据 extent 流式喂 manifest.Ingester(空洞编码进
         manifest,不落盘)→ overlay_manifest_key;
         overlay_ref = manifest://<overlay_manifest_key>
@@ -1367,9 +1421,9 @@ T6  生成 snapshot 内容:
                   snapshot.cfg(三个 entries)
     若 --upload:走流式构造,直接 io.Reader 喂 ingest,不落盘;
                   stdout 输出 snapshot_manifest_key(= 链中本快照的内容寻址名)
-    若 --output:先写到 <sid>.snapshot.partial → writer 返回 marker digest(§6.1)→ rename
-                  <out_dir>/<sha256>.snapshot,再建/更新符号链接
-                  <out_dir>/<sid>.snapshot → <sha256>.snapshot
+    若 --output:先写到 <sid>.snapshot.partial → writer 返回 scheme + digest(§6.1)→ no-replace commit
+                  <out_dir>/<digest>.snapshot,再建/更新符号链接
+                  <out_dir>/<sid>.snapshot → <digest>.snapshot
 T7  srv0.Resume() + srv1.Resume()
 T8  resume_after=true:CH /vm.resume,沙箱原地续跑;quiesce 时 guest 冻结了
                   应用并关了 stdio MUX,这里 sandbox-ctl 拨新连接发 attach 重建
@@ -1383,7 +1437,7 @@ T8  resume_after=true:CH /vm.resume,沙箱原地续跑;quiesce 时 guest 冻结�
 T9  ctl.sock 回 snapshot_done
 T10 sandbox-ctl snapshot(发起方进程)收到 done:
     若 --upload:stdout 输出 snapshot_manifest_key
-    否则:本地产物在 <out_dir>/(<sha256>.snapshot + <sid>.snapshot 符号链接 + <sha256>.overlay)
+    否则:本地产物在 <out_dir>/(<digest>.snapshot + <sid>.snapshot 符号链接 + <digest>.overlay)
 ```
 
 **关键差异 vs 一般 VMM 快照**:
@@ -1392,7 +1446,7 @@ T10 sandbox-ctl snapshot(发起方进程)收到 done:
 - ZIP 内 snapshot.cfg 在 T5 一次写入即终态,**没有"事后回填重写 ZIP"步骤**
 - 8 GiB sandbox / 200 MiB 驻留:物理 I/O ~200 MiB(CH 通用快照路径 ~24 GiB),
   延迟 ~1 s 量级
-- overlay 文件名内嵌 SHA256(content-addressable),同沙箱多次 snapshot 内容
+- overlay 文件名内嵌 policy 选择的 digest(content-addressable),同沙箱多次 snapshot 内容
   不变时自动同名
 
 ### 6.3 ctl.sock 协议
@@ -1438,7 +1492,7 @@ gate 按现有 `ctl.sock` framing 先完整读取 4-byte LE 长度和 payload:
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `type` | string | `"snapshot_request"` |
-| `out_dir` | string | `--output` 目录;snapshot 在该目录写 `<sha256>.snapshot`(+ `<sid>.snapshot` 符号链接)+ `<sha256>.overlay`;与 `upload` 互斥 |
+| `out_dir` | string | `--output` 目录;snapshot 在该目录写 `<digest>.snapshot`(+ `<sid>.snapshot` 符号链接)+ `<digest>.overlay`;与 `upload` 互斥 |
 | `upload` | bool | true 时走流式 ingest 到 manifest store;与 `out_dir` 互斥 |
 | `resume_after` | bool | 默认 false(零值即销毁);CLI 默认与之一致。`--resume` 触发 true |
 
@@ -1451,7 +1505,7 @@ gate 按现有 `ctl.sock` framing 先完整读取 4-byte LE 长度和 payload:
   "memory_resident":     209715200,
   "wallclock_pause_ms":  12,
   "wallclock_dump_ms":   840,
-  "overlay_ref":         "file://<sha256>.overlay" 或 "manifest://<key>",
+  "overlay_ref":         "file://<digest>.overlay@<scheme>:<digest>" 或 "manifest://<key>",
   "snapshot_key":        "<hex>"   // 仅 upload 模式
 }
 ```
@@ -1504,12 +1558,13 @@ T3  archive/zip.NewReader(ReaderAt, totalSize) → 解出 config.json / state.js
     snapshot.cfg。解析 from_refs / overlay.base_from_refs(§3.5),逐项解析为
     Stream(file:// 校验摘要、manifest:// 内容自校验),校验全链 capacity 一致。
     file 模式:若 <ref> 是 <sid>.snapshot 符号链接,follow 解析出真实
-    <sha256>.snapshot 名,作为本次的内容寻址名(供将来再保存时写入子快照
+    <digest>.snapshot 名,读取工件取得实际 scheme + digest,作为本次的内容寻址
+    self ref(供将来再保存时写入子快照
     from_refs);from_refs 各项在该 .snapshot 同目录定位
 T4  restore.ApplyRules(host sandbox.yaml, snapshot.cfg, snapshotPath):
     - 验证 capacity 一致(host 提供时)
     - 验证 boot.runtime / boot.root.base 协议 + basename 匹配(host 提供时)
-    - runtime 从 bundle 尾部 ZIP、base 从 tarstream marker 读取声明摘要并与 ref 比较;
+    - runtime 从 bundle 尾部 ZIP、base 从 tarstream identity 读取 scheme + digest 并与 ref 比较;
       全程不读取 payload
     - 未提供时从 snapshot.cfg 复制(file 模式解析为 .snapshot 同目录文件)
     - 详见 §11.0 字段语义表 + §13 校验矩阵
@@ -2088,7 +2143,7 @@ allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
 | `network.{ip,mtu,nexthop,hostname,interface}` | 仅存在网络源时允许;经 restore 通知重新下发,guest flush-and-replace 重配(克隆取新 L3 身份);MAC 不变(沿用快照设备状态,故 provider 须用稳定 per-port MAC) | 无 NIC 快照保持无 NIC;联网快照保留快照网络不变 |
 | `boot.kernel` | 静默忽略(restore 不 boot) | 同 |
 | `boot.runtime`(仅 file://) | basename 与 snapshot.cfg.runtime_ref 匹配,且 bundle marker 必须与 digest 一致 | 用 snapshot.cfg.runtime_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
-| `boot.root.base`(file://) | 协议 + basename 与 snapshot.cfg.base_ref 一致,且 tarstream marker 必须与 digest 一致 | 用 snapshot.cfg.base_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
+| `boot.root.base`(file://) | 协议 + basename 与 snapshot.cfg.base_ref 一致,且 tarstream scheme + digest 必须一致 | 用 snapshot.cfg.base_ref:basename 解析为 `<sid>.snapshot` 同目录文件 |
 | `boot.root.base`(manifest://) | manifest key 与 snapshot.cfg.base_ref 一致才允许 | 用 snapshot.cfg.base_ref 原值 |
 | `boot.root.overlay.base` | **静默忽略** | 用 snapshot.cfg.overlay.base |
 | `from_refs` / `boot.root.overlay.base_from_refs` | 无此 yaml 字段(增量分层链纯由 snapshot.cfg 提供,§3.5) | 用 snapshot.cfg 原值 |
@@ -2104,11 +2159,12 @@ allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
 capacity 决定了页面布局、kernel 内部数据结构(NR_CPUS / per-cpu data /
 zone watermarks)。变了 capacity 等于换了一套硬件假设,行为未定义。
 
-**为什么 file:// runtime / base 要 marker 校验**:跨主机移动 snapshot 时,
+**为什么 file:// runtime / base 要 identity 校验**:跨主机移动 snapshot 时,
 目标 host 上同名 sandbox-runtime.bundle / container-image.erofs 可能是不同
-版本。恢复必须比较 snapshot ref 与构建阶段写入的 marker。该比较只有 metadata
-I/O,没有再保留跳过校验的性能模式。marker 是制品 identity 声明;发布流程通过
-写入时计算、fsync、原子 rename 和发布后不可变保证 payload 与声明一致。
+版本。runtime 仍比较 bundle SHA marker;base 与其他 tarstream 工件按 §3.2.1
+比较 scheme + digest。随机路径只读取所需 metadata/record,没有跳过校验的性能
+模式;发布路径再执行 sequential full validation。发布流程通过写入时计算、fsync、
+no-replace 原子提交和终态不可变保证 payload 与声明一致。
 
 **boot.root.overlay.base 为什么忽略 yaml**:overlay 数据是 sandbox 自己的写
 状态,与镜像 base 等价物,只能从 snapshot 内部走。让 yaml 强制提供没意义,
@@ -2370,7 +2426,8 @@ config.json.net 提供快照 NIC 拓扑,restore.Run 在任何 tapfd 交接或 CH
 | sandbox.yaml 提供 `boot.runtime` 时,协议必须与 snapshot.cfg.runtime_ref 一致 | "boot.runtime scheme mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 `boot.root.base` 时,协议必须与 snapshot.cfg.base_ref 一致 | "boot.root.base scheme mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 file:// runtime / base 时,basename(filepath.Base)必须与 snapshot.cfg ref 中 basename 一致 | "<field> basename mismatch with snapshot.cfg" |
-| sandbox.yaml 提供 file:// runtime / base 时,制品 marker 必须与 snapshot.cfg ref 中 @sha256:<digest> 一致 | "<field> digest mismatch: sha256 marker mismatch ..." |
+| sandbox.yaml 提供 file:// runtime 时,bundle marker 必须与 snapshot.cfg ref 中 `@sha256:<digest>` 一致 | "boot.runtime digest mismatch: sha256 marker mismatch ..." |
+| sandbox.yaml 提供 file:// base 时,tarstream 的 scheme + digest 必须与 snapshot.cfg ref 中 `@sha256:<digest>` 或 `@hmac:<digest>` 一致 | "boot.root.base digest mismatch: ..." |
 | sandbox.yaml 提供 manifest:// runtime / base 时,manifest key 必须与 snapshot.cfg ref 一致 | "<field> manifest key mismatch with snapshot.cfg" |
 | sandbox.yaml 提供 `resources.capacity.{cpu,memory}` 时,与 snapshot.cfg 严格相等 | "capacity mismatch with snapshot.cfg" |
 | `boot.root.overlay.diff` 可选;空→落盘 base 目录新建(随沙箱销毁) | — |
