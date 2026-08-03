@@ -156,11 +156,14 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 	}
 	mergeRef := false
 	req := ctl.Request{OutDir: filepath.Join(dir, "out"), MergeRef: &mergeRef}
+	viewCalled := false
 
 	_, err := handleSnapshotRequest(req, RunOptions{Cfg: cfg, SandboxID: "test"}, nil,
 		[]SnapDiskRef{{
 			DiffPath: diff,
+			Size:     4096,
 			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				viewCalled = true
 				return bytes.NewReader(make([]byte, 4096)), nil, nil
 			},
 		}}, nil, "", filepath.Join(dir, "run"),
@@ -168,6 +171,9 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") ||
 		!strings.Contains(err.Error(), "missing.overlay") {
 		t.Fatalf("disk merge preflight error = %v", err)
+	}
+	if viewCalled {
+		t.Fatal("snapshot view provider called during size preflight")
 	}
 }
 

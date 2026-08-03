@@ -179,10 +179,12 @@ type DiskArg struct {
 
 // SnapDiskRef is one logical disk's writable diff for the snapshot path, in
 // logical order (root, then data disks). SnapshotView supplies the live COW's
-// upper-only logical view; DiffPath remains for diagnostics and cleanup.
+// upper-only logical view; Size supports predictable preflight checks without
+// constructing that view, and DiffPath remains for diagnostics and cleanup.
 type SnapDiskRef struct {
 	DiffPath     string
 	OwnedDiff    bool
+	Size         int64
 	SnapshotView func() (io.ReadSeeker, []sparse.Extent, error)
 }
 
@@ -349,6 +351,7 @@ func ServeAndWait(p VMParams) (int, error) {
 		snapDisks = append(snapDisks, SnapDiskRef{
 			DiffPath:     d.DiffPath,
 			OwnedDiff:    d.OwnedDiff,
+			Size:         d.Cow.Size(),
 			SnapshotView: d.Cow.SnapshotView,
 		})
 	}

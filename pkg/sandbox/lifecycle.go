@@ -830,14 +830,10 @@ func handleSnapshotRequest(
 		if dd.SnapshotView == nil {
 			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q has no snapshot view", i, dd.Path)
 		}
-		preflightView, _, viewErr := dd.SnapshotView()
-		if viewErr != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q view: %w", i, dd.Path, viewErr)
+		if d.Size <= 0 {
+			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q has invalid logical size %d", i, dd.Path, d.Size)
 		}
-		diffSize, sizeErr := preflightView.Seek(0, io.SeekEnd)
-		if sizeErr != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q size: %w", i, dd.Path, sizeErr)
-		}
+		diffSize := d.Size
 		var parentDiskRef string
 		if i == 0 {
 			parentDiskRef = prov.ParentOverlayBase
