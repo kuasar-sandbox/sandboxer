@@ -239,6 +239,46 @@ func TestBlockCOW_FirstPartialWriteMaterializesZerosWithoutBase(t *testing.T) {
 	}
 }
 
+func TestBlockCOW_PartialWriteSurvivesReopen(t *testing.T) {
+	const size = 4 * cowBlockSize
+	baseData := patternedBytes(size)
+	base := &fakeReader{data: baseData}
+	diff := filepath.Join(t.TempDir(), "diff.ext4")
+	cow, err := OpenBlockCOW(diff, base, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{0xd3}, 512)
+	const offset = cowBlockSize + 512
+	if _, err := cow.WriteAt(payload, offset); err != nil {
+		t.Fatal(err)
+	}
+	if err := cow.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cow.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenBlockCOW(diff, base, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.DirtyCount(); got != 1 {
+		t.Fatalf("DirtyCount after reopen=%d want 1", got)
+	}
+	got := make([]byte, size)
+	if _, err := reopened.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	want := append([]byte(nil), baseData...)
+	copy(want[offset:], payload)
+	if !bytes.Equal(got, want) {
+		t.Fatal("reopened diff did not preserve materialized base bytes")
+	}
+}
+
 func TestBlockCOW_DescriptorSplitPreservesMaterializedBlock(t *testing.T) {
 	const size = 2 * cowBlockSize
 	baseData := patternedBytes(size)
