@@ -8,6 +8,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"golang.org/x/sys/unix"
 )
 
@@ -371,6 +372,93 @@ func (c *BlockCOW) Discard(offset, length int64) error {
 	c.bitmapMu.Unlock()
 
 	return nil
+}
+
+// SnapshotView returns a read-only, upper-only view of the diff at the current
+// dirty-bitmap state. Dirty blocks expose their complete plaintext diff bytes;
+// clean blocks are holes and defensively read as zeros rather than falling
+// through to base. The caller must keep the BlockCOW open while using the view.
+// Snapshot orchestration calls this after quiescing every vhost backend, so the
+// dirty block contents stay stable for the view's lifetime.
+func (c *BlockCOW) SnapshotView() (io.ReadSeeker, []sparse.Extent, error) {
+	c.bitmapMu.RLock()
+	bitmap := append([]uint64(nil), c.bitmap...)
+	c.bitmapMu.RUnlock()
+
+	view := &cowSnapshotReaderAt{cow: c, bitmap: bitmap}
+	return io.NewSectionReader(view, 0, c.size), snapshotHoles(bitmap, c.size), nil
+}
+
+type cowSnapshotReaderAt struct {
+	cow    *BlockCOW
+	bitmap []uint64
+}
+
+func (r *cowSnapshotReaderAt) ReadAt(buf []byte, offset int64) (int, error) {
+	if offset < 0 || offset >= r.cow.size {
+		return 0, io.EOF
+	}
+	n := len(buf)
+	var eof error
+	if int64(n) > r.cow.size-offset {
+		n = int(r.cow.size - offset)
+		eof = io.EOF
+	}
+
+	written := 0
+	for written < n {
+		pos := offset + int64(written)
+		blk := pos / r.cow.blockSize
+		blkEnd := (blk + 1) * r.cow.blockSize
+		chunkLen := n - written
+		if remaining := blkEnd - pos; int64(chunkLen) > remaining {
+			chunkLen = int(remaining)
+		}
+		chunk := buf[written : written+chunkLen]
+
+		if bitmapBlockDirty(r.bitmap, blk) {
+			lock := r.cow.blockLock(blk)
+			lock.RLock()
+			read, err := r.cow.diff.ReadAt(chunk, pos)
+			lock.RUnlock()
+			written += read
+			if err != nil && !(errors.Is(err, io.EOF) && read == len(chunk)) {
+				return written, err
+			}
+			if read != len(chunk) {
+				return written, io.ErrUnexpectedEOF
+			}
+			continue
+		}
+
+		clear(chunk)
+		written += len(chunk)
+	}
+	return written, eof
+}
+
+func bitmapBlockDirty(bitmap []uint64, blk int64) bool {
+	return bitmap[blk/64]&(1<<(uint64(blk)%64)) != 0
+}
+
+func snapshotHoles(bitmap []uint64, size int64) []sparse.Extent {
+	numBlocks := size / cowBlockSize
+	var holes []sparse.Extent
+	for blk := int64(0); blk < numBlocks; {
+		if bitmapBlockDirty(bitmap, blk) {
+			blk++
+			continue
+		}
+		start := blk
+		for blk < numBlocks && !bitmapBlockDirty(bitmap, blk) {
+			blk++
+		}
+		holes = append(holes, sparse.Extent{
+			Offset: uint64(start * cowBlockSize),
+			Size:   uint64((blk - start) * cowBlockSize),
+		})
+	}
+	return holes
 }
 
 // Size returns the visible block-device size in bytes.

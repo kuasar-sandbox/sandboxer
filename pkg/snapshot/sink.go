@@ -32,12 +32,12 @@ func HexKey(k store.ContentKey) string {
 //     envelope's empty marker, computed while writing the deterministic prefix.
 //   - IngestSink streams to a manifest store via ingest.Ingester (--upload).
 //
-// Each method takes the source as an io.ReadSeeker plus its hole map (the
-// caller computes holes via SEEK_HOLE on the LIVE source fd — the one place
-// filesystem metadata is the hole authority; from the artifact on, the tar
-// envelope is). The sink reads only resident extents. They return the
-// artifact's ref (file://<sha>.ext | manifest://<key>) and, for file mode,
-// its local path ("" for ingest).
+// Each method takes the source as an io.ReadSeeker plus its authoritative hole
+// map. Memory holes come from SEEK_HOLE on the live memfd; overlay holes come
+// from BlockCOW's dirty bitmap. From the artifact on, the tar envelope is the
+// hole authority. The sink reads only resident extents. They return the
+// artifact's ref (file://<sha>.ext | manifest://<key>) and, for file mode, its
+// local path ("" for ingest).
 type SnapshotSink interface {
 	AbsorbOverlay(ctx context.Context, diff io.ReadSeeker, holes []sparse.Extent) (ref, path string, err error)
 	AbsorbBundle(ctx context.Context, mem io.ReadSeeker, holes []sparse.Extent, zip io.Reader) (ref, path string, err error)

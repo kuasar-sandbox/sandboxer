@@ -3,9 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
-	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -17,10 +15,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
@@ -150,13 +152,14 @@ type VMParams struct {
 // data disk). Single-disk: Cow only (one writable ext4 device). Overlay:
 // Reader (ro erofs base) THEN Cow (rw ext4 upper) — two devices. ServeAndWait
 // expands each into its vhost device(s) in CH --disk order. DiffPath/OwnedDiff
-// describe the Cow's writable diff for the snapshot path.
+// describe the Cow's writable diff for diagnostics and lifecycle cleanup;
+// snapshot data comes from Cow.SnapshotView.
 type DiskBackend struct {
 	Overlay   bool
 	Reader    vhost.BlockReader // overlay only (ro base); nil in single-disk
 	Cow       *vhost.BlockCOW   // the writable ext4 (always present)
 	BasePath  string            // overlay: ro base stats path
-	DiffPath  string            // the Cow's diff file (stats path + snapshot capture source)
+	DiffPath  string            // the Cow's diff file (stats/diagnostics/cleanup path)
 	OwnedDiff bool              // diff is auto-created (ours) → eligible for zero-copy move on destroy-snapshot
 }
 
@@ -175,11 +178,12 @@ type DiskArg struct {
 }
 
 // SnapDiskRef is one logical disk's writable diff for the snapshot path, in
-// logical order (root, then data disks). The snapshot captures each diff and
-// records its base chain in snapshot.cfg.
+// logical order (root, then data disks). SnapshotView supplies the live COW's
+// upper-only logical view; DiffPath remains for diagnostics and cleanup.
 type SnapDiskRef struct {
-	DiffPath  string
-	OwnedDiff bool
+	DiffPath     string
+	OwnedDiff    bool
+	SnapshotView func() (io.ReadSeeker, []sparse.Extent, error)
 }
 
 // ServeAndWait owns the half of the sandbox lifecycle that is identical
@@ -307,7 +311,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	// rw ext4 upper (blkN+1); single → one rw ext4 (blkN). The device sockets
 	// blk0.sock, blk1.sock, … are numbered in this order, fixing the guest's
 	// /dev/vd[a,b,c…]. diskServers groups, per logical disk, the writable Cow's
-	// snapshot diff (DiffPath/OwnedDiff) for the snapshot path.
+	// snapshot view plus DiffPath/OwnedDiff lifecycle metadata.
 	var servers []*vhost.Server // all vhost servers, in device order
 	var devs []servedDevice     // CH --disk args, in device order
 	var snapDisks []SnapDiskRef // per logical disk: writable diff for snapshot
@@ -342,7 +346,11 @@ func ServeAndWait(p VMParams) (int, error) {
 			stopServers()
 			return -1, err
 		}
-		snapDisks = append(snapDisks, SnapDiskRef{DiffPath: d.DiffPath, OwnedDiff: d.OwnedDiff})
+		snapDisks = append(snapDisks, SnapDiskRef{
+			DiffPath:     d.DiffPath,
+			OwnedDiff:    d.OwnedDiff,
+			SnapshotView: d.Cow.SnapshotView,
+		})
 	}
 
 	// guestlink.LaunchServer: guest→host management short-conns on
