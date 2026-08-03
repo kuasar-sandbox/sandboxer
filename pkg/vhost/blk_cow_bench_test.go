@@ -1,6 +1,7 @@
 package vhost
 
 import (
+	"io"
 	"path/filepath"
 	"testing"
 
@@ -85,6 +86,56 @@ func BenchmarkBlockCOWWriteAt(b *testing.B) {
 			}
 		}
 	})
+}
+
+func BenchmarkBlockCOWSnapshotView(b *testing.B) {
+	const size = benchmarkCOWBlocks * cowBlockSize
+	cow, err := OpenBlockCOW(
+		filepath.Join(b.TempDir(), "diff.ext4"),
+		zeroBlockReader{size: size},
+		size,
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = cow.Close() })
+	block := make([]byte, cowBlockSize)
+	for i := int64(0); i < benchmarkCOWBlocks; i += 2 {
+		if _, err := cow.WriteAt(block, i*cowBlockSize); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.Run("create", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			view, holes, err := cow.SnapshotView()
+			if err != nil || view == nil || len(holes) == 0 {
+				b.Fatalf("SnapshotView: view=%v holes=%d err=%v", view, len(holes), err)
+			}
+		}
+	})
+
+	benchmarkRead := func(b *testing.B, offset int64) {
+		view, _, err := cow.SnapshotView()
+		if err != nil {
+			b.Fatal(err)
+		}
+		buf := make([]byte, cowBlockSize)
+		b.SetBytes(cowBlockSize)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := view.Seek(offset, io.SeekStart); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := io.ReadFull(view, buf); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.Run("read-dirty-4k", func(b *testing.B) { benchmarkRead(b, 0) })
+	b.Run("read-clean-4k", func(b *testing.B) { benchmarkRead(b, cowBlockSize) })
 }
 
 func resetBenchmarkCOW(b *testing.B, cow *BlockCOW) {
