@@ -247,6 +247,10 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 //     basename(path) == ref.Basename.
 //   - the embedded marker must match ref.Digest.
 func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fieldName string, readDigest func(string) (string, error), locations config.RefLocations) (string, error) {
+	snapDigest, err := tartransition.SHA256RefDigest(snapRef)
+	if err != nil {
+		return "", fmt.Errorf("%s: snapshot ref uses an unsupported digest scheme: %w", fieldName, err)
+	}
 	if hostURL == "" {
 		if snapshotPath == "" && snapRef.Location == "" && !filepath.IsAbs(snapRef.Path) {
 			return "", fmt.Errorf("%s: snapshot.cfg ref is file:// but bundle is manifest-loaded; provide %s explicitly", fieldName, fieldName)
@@ -259,7 +263,7 @@ func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fiel
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", fieldName, err)
 		}
-		if err := validateResolvedFileRef(abs, snapRef, snapRef.Digest, readDigest, locations); err != nil {
+		if err := validateResolvedFileRef(abs, snapRef, snapDigest, readDigest, locations); err != nil {
 			return "", fmt.Errorf("%s: auto-resolved %s: %w", fieldName, abs, err)
 		}
 		if snapRef.Location != "" {
@@ -272,6 +276,10 @@ func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fiel
 	if err != nil || hostRef.Scheme != manifest.RefSchemeFile {
 		return "", fmt.Errorf("%s: scheme mismatch with snapshot.cfg (host=%q, snap=file://)", fieldName, hostURL)
 	}
+	hostDigest, err := tartransition.SHA256RefDigest(hostRef)
+	if err != nil {
+		return "", fmt.Errorf("%s: host ref uses an unsupported digest scheme: %w", fieldName, err)
+	}
 	hostPath, err := locations.ResolveFile(hostRef, "")
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", fieldName, err)
@@ -282,11 +290,11 @@ func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fiel
 	if filepath.Base(hostPath) != snapRef.Path {
 		return "", fmt.Errorf("%s: basename mismatch with snapshot.cfg (host=%q, snap=%q)", fieldName, filepath.Base(hostPath), snapRef.Path)
 	}
-	if err := validateResolvedFileRef(hostPath, hostRef, snapRef.Digest, readDigest, locations); err != nil {
+	if err := validateResolvedFileRef(hostPath, hostRef, snapDigest, readDigest, locations); err != nil {
 		return "", fmt.Errorf("%s: digest mismatch: %w", fieldName, err)
 	}
-	if hostRef.Digest != "" {
-		if err := validateResolvedFileRef(hostPath, hostRef, hostRef.Digest, readDigest, locations); err != nil {
+	if hostDigest != "" {
+		if err := validateResolvedFileRef(hostPath, hostRef, hostDigest, readDigest, locations); err != nil {
 			return "", fmt.Errorf("%s: host ref digest mismatch: %w", fieldName, err)
 		}
 	}

@@ -1384,8 +1384,12 @@ func buildDiskRef(uri string, locations config.RefLocations) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("file artifact %s uses an unsupported digest scheme: %w", ref.Path, err)
 	}
-	if ref.Digest != "" && ref.Digest != digest {
-		return "", fmt.Errorf("file artifact %s digest mismatch: got %s, want %s", ref.Path, digest, ref.Digest)
+	expected, err := tartransition.SHA256RefDigest(ref)
+	if err != nil {
+		return "", fmt.Errorf("file artifact %s uses an unsupported ref digest scheme: %w", ref.Path, err)
+	}
+	if expected != "" && expected != digest {
+		return "", fmt.Errorf("file artifact %s digest mismatch: got %s, want %s", ref.Path, digest, expected)
 	}
 	ref.Path = filepath.Base(ref.Path)
 	return tartransition.SHA256RefString(ref, digest)

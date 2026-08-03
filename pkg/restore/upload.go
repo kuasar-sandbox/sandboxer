@@ -258,6 +258,10 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 	if err != nil {
 		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
 	}
+	wantDigest, err := tartransition.SHA256RefDigest(ref)
+	if err != nil {
+		return "", fmt.Errorf("upload-snapshot: %s: unsupported digest scheme: %w", label, err)
+	}
 	if ref.Scheme == manifest.RefSchemeManifest && p.manifestConfig != nil {
 		key, err := manifest.ParseHexKey(ref.Path)
 		if err != nil {
@@ -275,9 +279,9 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 		path = filepath.Join(relativeDir, path)
 	}
 	if snapshotRef {
-		return p.publishSnapshot(path, ref.Digest)
+		return p.publishSnapshot(path, wantDigest)
 	}
-	return p.publishLeaf(label, path, ref.Digest)
+	return p.publishLeaf(label, path, wantDigest)
 }
 
 func (p *snapshotPublisher) publishLeaf(label, path, wantDigest string) (string, error) {
