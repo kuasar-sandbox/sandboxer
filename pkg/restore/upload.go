@@ -8,14 +8,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"gopkg.in/yaml.v3"
@@ -172,7 +171,7 @@ func (p *snapshotPublisher) publishSnapshot(snapshotPath, wantDigest string) (re
 		}
 		tmpPath := tmp.Name()
 		defer os.Remove(tmpPath)
-		digest, writeErr := tarstream.WriteTo(p.ctx, tmp, "snapshot", src)
+		digest, writeErr := tartransition.WriteTo(p.ctx, tmp, "snapshot", src)
 		closeErr := tmp.Close()
 		if writeErr != nil {
 			return "", fmt.Errorf("rebuild snapshot: %w", writeErr)
@@ -259,6 +258,10 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 	if err != nil {
 		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
 	}
+	wantDigest, err := tartransition.SHA256RefDigest(ref)
+	if err != nil {
+		return "", fmt.Errorf("upload-snapshot: %s: unsupported digest scheme: %w", label, err)
+	}
 	if ref.Scheme == manifest.RefSchemeManifest && p.manifestConfig != nil {
 		key, err := manifest.ParseHexKey(ref.Path)
 		if err != nil {
@@ -276,9 +279,9 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 		path = filepath.Join(relativeDir, path)
 	}
 	if snapshotRef {
-		return p.publishSnapshot(path, ref.Digest)
+		return p.publishSnapshot(path, wantDigest)
 	}
-	return p.publishLeaf(label, path, ref.Digest)
+	return p.publishLeaf(label, path, wantDigest)
 }
 
 func (p *snapshotPublisher) publishLeaf(label, path, wantDigest string) (string, error) {
@@ -312,7 +315,10 @@ func (p *snapshotPublisher) publishLeaf(label, path, wantDigest string) (string,
 }
 
 func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, keepDigest bool) (string, error) {
-	hexDigest := strings.TrimPrefix(digest, "sha256:")
+	hexDigest, err := tartransition.SHA256Digest(digest)
+	if err != nil {
+		return "", fmt.Errorf("publish location: unsupported digest scheme: %w", err)
+	}
 	basename := hexDigest + ext
 	destination := filepath.Join(p.directory, basename)
 	sourceInfo, err := os.Stat(sourcePath)
@@ -321,7 +327,7 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, 
 	}
 	if destInfo, statErr := os.Stat(destination); statErr == nil {
 		if destInfo.Size() == sourceInfo.Size() && verifyArtifactFile(destination, digest, 0) == nil {
-			return p.locatedRef(basename, hexDigest, keepDigest), nil
+			return p.locatedRef(basename, hexDigest, keepDigest)
 		}
 	} else if !os.IsNotExist(statErr) {
 		return "", statErr
@@ -354,15 +360,15 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, 
 		return "", fmt.Errorf("verify published %s: %w", destination, err)
 	}
 	p.logf("upload-snapshot: published %s", destination)
-	return p.locatedRef(basename, hexDigest, keepDigest), nil
+	return p.locatedRef(basename, hexDigest, keepDigest)
 }
 
-func (p *snapshotPublisher) locatedRef(basename, digest string, keepDigest bool) string {
+func (p *snapshotPublisher) locatedRef(basename, digest string, keepDigest bool) (string, error) {
 	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: basename, Location: p.location}
 	if keepDigest {
-		ref.Digest = digest
+		return tartransition.SHA256RefString(ref, digest)
 	}
-	return ref.String()
+	return ref.String(), nil
 }
 
 const tarstreamTrailerSize = int64(3 * 512) // marker header + two zero blocks

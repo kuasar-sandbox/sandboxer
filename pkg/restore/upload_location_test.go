@@ -10,7 +10,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"gopkg.in/yaml.v3"
@@ -453,7 +453,7 @@ func writePublishArtifact(t *testing.T, dir, ext string, payload []byte) (string
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tarstream.WriteTo(context.Background(), tmp, "payload", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
+	digest, err := tartransition.WriteTo(context.Background(), tmp, "payload", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
 	if err != nil {
 		tmp.Close()
 		t.Fatal(err)

@@ -9,7 +9,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
@@ -116,12 +116,22 @@ func OpenManifestStream(ctx context.Context, keyRef string, fetcher fetch.Fetche
 }
 
 func validateFileRefIdentity(ref manifest.Ref, stream fetch.Stream) error {
-	digester, ok := stream.(tarstream.Digester)
+	tagged, ok, err := tartransition.Digest(stream)
+	if err != nil {
+		return fmt.Errorf("file ref %q has invalid digest marker: %w", ref.String(), err)
+	}
 	if !ok {
 		return fmt.Errorf("file ref %q has no digest marker", ref.String())
 	}
-	digest := strings.TrimPrefix(digester.Digest(), "sha256:")
-	if ref.Digest != "" && ref.Digest != digest {
+	digest, err := tartransition.SHA256Digest(tagged)
+	if err != nil {
+		return fmt.Errorf("file ref %q uses an unsupported digest scheme: %w", ref.String(), err)
+	}
+	expected, err := tartransition.SHA256RefDigest(ref)
+	if err != nil {
+		return fmt.Errorf("file ref %q uses an unsupported digest scheme: %w", ref.String(), err)
+	}
+	if expected != "" && expected != digest {
 		return fmt.Errorf("file ref %q digest mismatch: got %s", ref.String(), digest)
 	}
 	if ref.Location != "" {

@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/internal/runtimebundle"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 )
 
 func openTarArtifact(path string) (fetch.Stream, string, error) {
@@ -16,12 +16,16 @@ func openTarArtifact(path string) (fetch.Stream, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	d, ok := stream.(tarstream.Digester)
+	digest, ok, digestErr := tartransition.Digest(stream)
+	if digestErr != nil {
+		stream.Close()
+		return nil, "", fmt.Errorf("file artifact %s has invalid declared digest: %w", path, digestErr)
+	}
 	if !ok {
 		stream.Close()
 		return nil, "", fmt.Errorf("file artifact %s has no declared digest", path)
 	}
-	return stream, d.Digest(), nil
+	return stream, digest, nil
 }
 
 func readRuntimeBundleDigest(path string) (string, error) {

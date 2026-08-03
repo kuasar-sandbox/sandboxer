@@ -7,13 +7,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"golang.org/x/sys/unix"
 )
 
@@ -111,7 +110,7 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 	if err != nil {
 		return "", "", err
 	}
-	digest, err := tarstream.WriteTo(ctx, f, kind, src)
+	digest, err := tartransition.WriteTo(ctx, f, kind, src)
 	if err != nil {
 		f.Close()
 		_ = os.Remove(tmp)
@@ -124,10 +123,10 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 	if err := f.Close(); err != nil {
 		return "", "", err
 	}
-	hexDigest := strings.TrimPrefix(digest, "sha256:")
-	if len(hexDigest) != 64 || hexDigest == digest {
+	hexDigest, err := tartransition.SHA256Digest(digest)
+	if err != nil {
 		_ = os.Remove(tmp)
-		return "", "", fmt.Errorf("pack %s: invalid tarstream digest %q", kind, digest)
+		return "", "", fmt.Errorf("pack %s: invalid tarstream digest: %w", kind, err)
 	}
 	final := filepath.Join(s.outDir, hexDigest+"."+kind)
 	if err := os.Rename(tmp, final); err != nil {

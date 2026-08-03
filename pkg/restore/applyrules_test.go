@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -28,7 +29,7 @@ func writeFile(t *testing.T, path string, body []byte) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tarstream.WriteTo(context.Background(), f, "image", sparse.Dense(bytes.NewReader(body), uint64(len(body))))
+	digest, err := tartransition.WriteTo(context.Background(), f, "image", sparse.Dense(bytes.NewReader(body), uint64(len(body))))
 	if err != nil {
 		f.Close()
 		t.Fatal(err)

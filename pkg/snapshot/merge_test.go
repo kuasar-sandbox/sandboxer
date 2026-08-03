@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 )
 
 func TestOpenMergeBaseFollowsSymlink(t *testing.T) {
@@ -20,7 +20,7 @@ func TestOpenMergeBaseFollowsSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tarstream.WriteTo(context.Background(), tmp, "overlay", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
+	digest, err := tartransition.WriteTo(context.Background(), tmp, "overlay", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
 	if err != nil {
 		t.Fatal(err)
 	}

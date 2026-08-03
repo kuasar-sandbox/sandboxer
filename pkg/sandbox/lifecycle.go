@@ -16,8 +16,8 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/internal/runtimebundle"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
@@ -1373,17 +1373,26 @@ func buildDiskRef(uri string, locations config.RefLocations) (string, error) {
 		return "", err
 	}
 	defer stream.Close()
-	d, ok := stream.(tarstream.Digester)
+	tagged, ok, err := tartransition.Digest(stream)
+	if err != nil {
+		return "", fmt.Errorf("file artifact %s has invalid declared digest: %w", ref.Path, err)
+	}
 	if !ok {
 		return "", fmt.Errorf("file artifact %s has no declared digest", ref.Path)
 	}
-	digest := strings.TrimPrefix(d.Digest(), "sha256:")
-	if ref.Digest != "" && ref.Digest != digest {
-		return "", fmt.Errorf("file artifact %s digest mismatch: got %s, want %s", ref.Path, digest, ref.Digest)
+	digest, err := tartransition.SHA256Digest(tagged)
+	if err != nil {
+		return "", fmt.Errorf("file artifact %s uses an unsupported digest scheme: %w", ref.Path, err)
+	}
+	expected, err := tartransition.SHA256RefDigest(ref)
+	if err != nil {
+		return "", fmt.Errorf("file artifact %s uses an unsupported ref digest scheme: %w", ref.Path, err)
+	}
+	if expected != "" && expected != digest {
+		return "", fmt.Errorf("file artifact %s digest mismatch: got %s, want %s", ref.Path, digest, expected)
 	}
 	ref.Path = filepath.Base(ref.Path)
-	ref.Digest = digest
-	return ref.String(), nil
+	return tartransition.SHA256RefString(ref, digest)
 }
 
 func generateSandboxID() string {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 )
 
 // tarLayer is a parent local artifact (tarstream envelope) opened as a
@@ -43,12 +44,20 @@ func openMergeBase(path string, size int64) (*tarLayer, []sparse.Extent, error) 
 		f.Close()
 		return nil, nil, fmt.Errorf("merge base %s: not a tarstream artifact: %w", path, err)
 	}
-	d, ok := src.(tarstream.Digester)
+	tagged, ok, err := tartransition.Digest(src)
+	if err != nil {
+		f.Close()
+		return nil, nil, fmt.Errorf("merge base %s: invalid digest marker: %w", path, err)
+	}
 	if !ok {
 		f.Close()
 		return nil, nil, fmt.Errorf("merge base %s: tarstream artifact missing digest marker", path)
 	}
-	hexDigest := strings.TrimPrefix(d.Digest(), "sha256:")
+	hexDigest, err := tartransition.SHA256Digest(tagged)
+	if err != nil {
+		f.Close()
+		return nil, nil, fmt.Errorf("merge base %s: unsupported digest scheme: %w", path, err)
+	}
 	real := path
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		real = resolved

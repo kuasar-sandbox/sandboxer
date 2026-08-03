@@ -19,7 +19,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
@@ -719,6 +719,10 @@ func openRefStream(ctx context.Context, raw string, opts Options) (fetch.Stream,
 		return nil, err
 	}
 	if ref.Scheme == manifest.RefSchemeFile {
+		expectedDigest, err := tartransition.SHA256RefDigest(ref)
+		if err != nil {
+			return nil, err
+		}
 		if ref.Location != "" {
 			stream, _, err := sandbox.OpenDiskStream(ctx, ref.String(), opts.Fetcher, opts.RefLocations)
 			return stream, err
@@ -735,8 +739,8 @@ func openRefStream(ctx context.Context, raw string, opts Options) (fetch.Stream,
 		if err != nil {
 			return nil, err
 		}
-		if ref.Digest != "" {
-			if err := matchDigest(digest, ref.Digest); err != nil {
+		if expectedDigest != "" {
+			if err := matchDigest(digest, expectedDigest); err != nil {
 				s.Close()
 				return nil, err
 			}
@@ -758,6 +762,7 @@ func openRefStream(ctx context.Context, raw string, opts Options) (fetch.Stream,
 
 func openSnapshotArtifact(ctx context.Context, opts Options) (fetch.Stream, string, error) {
 	var ref manifest.Ref
+	var expectedDigest string
 	if opts.SnapshotRef != "" {
 		parsed, err := manifest.ParseRef(opts.SnapshotRef)
 		if err != nil {
@@ -765,6 +770,10 @@ func openSnapshotArtifact(ctx context.Context, opts Options) (fetch.Stream, stri
 		}
 		if parsed.Scheme != manifest.RefSchemeFile {
 			return nil, "", fmt.Errorf("snapshot path cannot use %s ref", parsed.Scheme)
+		}
+		expectedDigest, err = tartransition.SHA256RefDigest(parsed)
+		if err != nil {
+			return nil, "", err
 		}
 		ref = parsed
 	}
@@ -780,12 +789,16 @@ func openSnapshotArtifact(ctx context.Context, opts Options) (fetch.Stream, stri
 		if err != nil {
 			return nil, "", err
 		}
-		digester, ok := stream.(tarstream.Digester)
+		digest, ok, digestErr := tartransition.Digest(stream)
+		if digestErr != nil {
+			_ = stream.Close()
+			return nil, "", fmt.Errorf("snapshot %s has invalid declared digest: %w", ref.String(), digestErr)
+		}
 		if !ok {
 			_ = stream.Close()
 			return nil, "", fmt.Errorf("snapshot %s has no declared digest", ref.String())
 		}
-		return stream, digester.Digest(), nil
+		return stream, digest, nil
 	}
 
 	stream, digest, err := openTarArtifact(opts.SnapshotPath)
@@ -796,8 +809,8 @@ func openSnapshotArtifact(ctx context.Context, opts Options) (fetch.Stream, stri
 		_ = stream.Close()
 		return nil, "", err
 	}
-	if ref.Digest != "" {
-		if err := matchDigest(digest, ref.Digest); err != nil {
+	if expectedDigest != "" {
+		if err := matchDigest(digest, expectedDigest); err != nil {
 			_ = stream.Close()
 			return nil, "", err
 		}
