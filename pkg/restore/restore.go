@@ -19,7 +19,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
@@ -780,12 +780,16 @@ func openSnapshotArtifact(ctx context.Context, opts Options) (fetch.Stream, stri
 		if err != nil {
 			return nil, "", err
 		}
-		digester, ok := stream.(tarstream.Digester)
+		digest, ok, digestErr := tartransition.Digest(stream)
+		if digestErr != nil {
+			_ = stream.Close()
+			return nil, "", fmt.Errorf("snapshot %s has invalid declared digest: %w", ref.String(), digestErr)
+		}
 		if !ok {
 			_ = stream.Close()
 			return nil, "", fmt.Errorf("snapshot %s has no declared digest", ref.String())
 		}
-		return stream, digester.Digest(), nil
+		return stream, digest, nil
 	}
 
 	stream, digest, err := openTarArtifact(opts.SnapshotPath)

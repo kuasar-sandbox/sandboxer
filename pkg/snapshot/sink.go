@@ -13,7 +13,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"golang.org/x/sys/unix"
 )
 
@@ -111,7 +111,7 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 	if err != nil {
 		return "", "", err
 	}
-	digest, err := tarstream.WriteTo(ctx, f, kind, src)
+	digest, err := tartransition.WriteTo(ctx, f, kind, src)
 	if err != nil {
 		f.Close()
 		_ = os.Remove(tmp)

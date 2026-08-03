@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"gopkg.in/yaml.v3"
@@ -331,12 +331,16 @@ func validateResolvedFileRef(path string, ref manifest.Ref, want string, readDig
 		if openErr != nil {
 			return openErr
 		}
-		digester, ok := stream.(tarstream.Digester)
+		var ok bool
+		got, ok, err = tartransition.Digest(stream)
+		if err != nil {
+			_ = stream.Close()
+			return fmt.Errorf("file artifact %s has invalid declared digest: %w", path, err)
+		}
 		if !ok {
 			_ = stream.Close()
 			return fmt.Errorf("file artifact %s has no declared digest", path)
 		}
-		got = digester.Digest()
 		err = stream.Close()
 	}
 	if err != nil {

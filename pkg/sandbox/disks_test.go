@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -19,7 +19,7 @@ func TestOpenDiskStreamValidatesLocatedContentName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tarstream.WriteTo(context.Background(), tmp, "image", sparse.Dense(bytes.NewReader([]byte("image")), 5))
+	digest, err := tartransition.WriteTo(context.Background(), tmp, "image", sparse.Dense(bytes.NewReader([]byte("image")), 5))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestOpenDiskStreamFollowsLocatedSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tarstream.WriteTo(context.Background(), tmp, "image", sparse.Dense(bytes.NewReader([]byte("image")), 5))
+	digest, err := tartransition.WriteTo(context.Background(), tmp, "image", sparse.Dense(bytes.NewReader([]byte("image")), 5))
 	if err != nil {
 		t.Fatal(err)
 	}

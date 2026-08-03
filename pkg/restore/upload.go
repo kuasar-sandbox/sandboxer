@@ -15,7 +15,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"gopkg.in/yaml.v3"
@@ -172,7 +172,7 @@ func (p *snapshotPublisher) publishSnapshot(snapshotPath, wantDigest string) (re
 		}
 		tmpPath := tmp.Name()
 		defer os.Remove(tmpPath)
-		digest, writeErr := tarstream.WriteTo(p.ctx, tmp, "snapshot", src)
+		digest, writeErr := tartransition.WriteTo(p.ctx, tmp, "snapshot", src)
 		closeErr := tmp.Close()
 		if writeErr != nil {
 			return "", fmt.Errorf("rebuild snapshot: %w", writeErr)

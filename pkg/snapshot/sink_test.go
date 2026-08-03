@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 )
 
 // FileSink must pack content-addressed tarstream artifacts: the envelope
@@ -41,11 +42,14 @@ func TestFileSinkArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, ok := src.(tarstream.Digester)
+	tagged, ok, err := tartransition.Digest(src)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("overlay source has no digest marker")
 	}
-	wantRef := "file://" + d.Digest()[len("sha256:"):] + ".overlay"
+	wantRef := "file://" + tagged[len("sha256:"):] + ".overlay"
 	if ref != wantRef {
 		t.Fatalf("overlay ref = %s, want %s", ref, wantRef)
 	}
@@ -79,11 +83,14 @@ func TestFileSinkArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bd, ok := bsrc.(tarstream.Digester)
+	btagged, ok, err := tartransition.Digest(bsrc)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("snapshot source has no digest marker")
 	}
-	if want := "file://" + bd.Digest()[len("sha256:"):] + ".snapshot"; bref != want {
+	if want := "file://" + btagged[len("sha256:"):] + ".snapshot"; bref != want {
 		t.Fatalf("bundle ref = %s, want %s", bref, want)
 	}
 	bv, err := tarstream.ReadSeekFrom(bytes.NewReader(braw), "snapshot")

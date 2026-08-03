@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
@@ -136,7 +136,7 @@ func writeRunRestoreSnapshot(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tarstream.WriteTo(context.Background(), tmp, "snapshot", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
+	digest, err := tartransition.WriteTo(context.Background(), tmp, "snapshot", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
 	if err != nil {
 		tmp.Close()
 		t.Fatal(err)

@@ -16,8 +16,8 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/internal/runtimebundle"
+	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
@@ -1373,11 +1373,14 @@ func buildDiskRef(uri string, locations config.RefLocations) (string, error) {
 		return "", err
 	}
 	defer stream.Close()
-	d, ok := stream.(tarstream.Digester)
+	tagged, ok, err := tartransition.Digest(stream)
+	if err != nil {
+		return "", fmt.Errorf("file artifact %s has invalid declared digest: %w", ref.Path, err)
+	}
 	if !ok {
 		return "", fmt.Errorf("file artifact %s has no declared digest", ref.Path)
 	}
-	digest := strings.TrimPrefix(d.Digest(), "sha256:")
+	digest := strings.TrimPrefix(tagged, "sha256:")
 	if ref.Digest != "" && ref.Digest != digest {
 		return "", fmt.Errorf("file artifact %s digest mismatch: got %s, want %s", ref.Path, digest, ref.Digest)
 	}
