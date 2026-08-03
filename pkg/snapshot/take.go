@@ -157,16 +157,14 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 
 	// T4: overlays → sink, one per logical disk (root + data disks), in order.
 	// Done first so snapshot.cfg below carries the final overlay.base refs.
-	// localMerge: the sandbox was restored from a LOCAL snapshot; per disk with
-	// a MergeBase, flatten this run's resident delta onto the parent local layer
-	// (replace, not stack — §3.5). The diff is always repacked into a tar
-	// artifact (the live raw diff and the at-rest artifact are different
-	// containers, so there is no rename fast path).
-	localMerge := s.MergeBaseSnapshot != ""
+	// Per-disk flattening is independent from memory flattening. A working-set
+	// snapshot deliberately leaves MergeBaseSnapshot empty so its memory self
+	// layer stays separate, while every local disk still carries MergeBase and
+	// is flattened as before.
 	out.OverlayRefs = make([]string, len(s.Diffs))
 	out.OverlayPaths = make([]string, len(s.Diffs))
 	for i, d := range s.Diffs {
-		ref, path, err := absorbOverlay(ctx, sink, d, localMerge && d.MergeBase != "")
+		ref, path, err := absorbOverlay(ctx, sink, d, d.MergeBase != "")
 		if err != nil {
 			return nil, fmt.Errorf("disk %d: %w", i, err)
 		}
@@ -195,7 +193,7 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	}
 	var memSrc io.ReadSeeker = memfdReader(s.MemfdFD, s.MemfdSize)
 	memSrcHoles := memHoles
-	if localMerge {
+	if s.MergeBaseSnapshot != "" {
 		base, baseHoles, berr := openMergeBase(s.MergeBaseSnapshot, s.MemfdSize)
 		if berr != nil {
 			return nil, fmt.Errorf("merge memory base: %w", berr)

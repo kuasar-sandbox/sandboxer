@@ -383,7 +383,8 @@ quiesce 是 host `/vm.pause` 之前的最后一次清理机会,目标两件事:
    (有界等待)。在 sync 前冻结 ⇒ sync 之后应用不再产生新脏页,镜像更确定;
    freezer 原子覆盖整棵子树,含冻结期 fork 出的子进程
 1. [prep] sync(2)                                  // ~ms,把 ext4 upperdir 全部 dirty 落地
-2. [prep] open("/proc/sys/vm/drop_caches", O_WRONLY) → write("3\n")
+2. [prep] 若 quiesce.skip_drop_caches=false:
+   open("/proc/sys/vm/drop_caches", O_WRONLY) → write("3\n")
                                                     // 同时丢 page cache + dentry/inode cache
 3. 停止读应用的 stdout/stderr pipe(或 pty master) // 应用已冻结,残留有界
    (停读是 MUX 关闭的前置动作)
@@ -406,10 +407,16 @@ quiesce 是 host `/vm.pause` 之前的最后一次清理机会,目标两件事:
 
 - **sync 在前**:`drop_caches` 只丢 clean,先 sync 把 dirty 转 clean,disk dump
   与 memory dump 看到的是一致状态
-- **drop_caches=3**:page cache 是确定性 snapshot 的核心污染源;同一应用不同启动
+- **drop_caches=3(默认)**:page cache 是确定性 snapshot 的核心污染源;同一应用不同启动
   序的 page cache 内容按访问顺序、prefetch 时序差异化堆积,跨实例 ~90% 不同;drop
   后每实例 restore 后 page cache 初值统一为空,直接对应 kuasar-sandbox.md §4.6 量化的"确定性
-  50→90% dedup"差距来源。sandbox-init 是 PID 1 root,write 无权限障碍
+  50→90% dedup"差距来源。单次 snapshot 可用 `--drop-caches=false` 请求跳过此写入,
+  但 freeze 与 sync 仍照常执行,用于保留 warm-up 形成的 guest cache 状态。
+
+`quiesced.drop_caches_result` 回报 `skipped | succeeded | failed`;空值表示旧 guest
+未实现回报(`unknown`)。显式请求 skip 而收到 unknown 时 host 继续快照并告警,因为旧
+guest 可能已经按旧协议执行了 drop。该结果只描述动作,不承诺 cache 未被内存压力或
+balloon 回收。
 
 **扩展项(未实现;协议预留扩展位)**:
 

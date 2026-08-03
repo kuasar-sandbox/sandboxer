@@ -191,15 +191,41 @@ func TestSendQuiesce_Quiesced(t *testing.T) {
 
 	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
 		req, _ := proto.ReadMessage(c)
-		if req.Type != proto.TypeQuiesce {
-			t.Errorf("got %s", req.Type)
+		if req.Type != proto.TypeQuiesce || !req.SkipDropCaches {
+			t.Errorf("got %+v", req)
 		}
+		_ = proto.WriteMessage(c, &proto.Message{
+			Type:             proto.TypeQuiesced,
+			DropCachesResult: proto.DropCachesSkipped,
+		})
+	})
+	defer proxy.close()
+
+	result, err := SendQuiesce(&HostClient{BasePath: base}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != proto.DropCachesSkipped {
+		t.Fatalf("result=%q", result)
+	}
+}
+
+func TestSendQuiesce_OldGuestResultUnknown(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		_, _ = proto.ReadMessage(c)
 		_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeQuiesced})
 	})
 	defer proxy.close()
 
-	if err := SendQuiesce(&HostClient{BasePath: base}); err != nil {
+	result, err := SendQuiesce(&HostClient{BasePath: base}, true)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result != proto.DropCachesUnknown {
+		t.Fatalf("result=%q, want unknown", result)
 	}
 }
 
@@ -244,7 +270,7 @@ func TestSendQuiesce_WrongResponse(t *testing.T) {
 	})
 	defer proxy.close()
 
-	err := SendQuiesce(&HostClient{BasePath: base})
+	_, err := SendQuiesce(&HostClient{BasePath: base}, false)
 	if err == nil {
 		t.Error("expected error on wrong response")
 	}

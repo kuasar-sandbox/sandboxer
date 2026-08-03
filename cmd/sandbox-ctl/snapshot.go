@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 // snapshotCmd implements `sandbox-ctl snapshot`. --output and --upload
@@ -22,6 +23,8 @@ func snapshotCmd(args []string) int {
 	outDir := fs.String("output", "", "local output dir; produces <sid>.snapshot + <sha256>.overlay")
 	upload := fs.Bool("upload", false, "ingest snapshot bundle + overlay into manifest store; stdout = snapshot manifest key")
 	resume := fs.Bool("resume", false, "keep sandbox running after snapshot (default: destroy via /vm.shutdown)")
+	dropCaches := fs.Bool("drop-caches", true, "drop guest page, inode, and dentry caches before snapshot")
+	mergeRef := fs.Bool("merge-ref", true, "merge a local parent memory ref into the new memory self layer")
 	runRoot := fs.String("run-root", "", "tmpfs run root (overrides SANDBOX_RUN_ROOT env; default /run/sandbox)")
 	timeoutS := fs.Int("timeout", 0, "seconds to wait for snapshot_done (0 = wait indefinitely; upload can take minutes)")
 
@@ -85,6 +88,8 @@ func snapshotCmd(args []string) int {
 		OutDir:      *outDir,
 		Upload:      *upload,
 		ResumeAfter: *resume,
+		DropCaches:  dropCaches,
+		MergeRef:    mergeRef,
 	}
 	if err := ctl.WriteMessage(c, &req); err != nil {
 		fmt.Fprintf(os.Stderr, "snapshot: send request: %v\n", err)
@@ -98,6 +103,9 @@ func snapshotCmd(args []string) int {
 	if resp.Type == ctl.TypeError {
 		fmt.Fprintf(os.Stderr, "snapshot: error from sandbox: %s\n", resp.Msg)
 		return 1
+	}
+	if warning := snapshotDropCachesWarning(*dropCaches, resp.DropCachesResult); warning != "" {
+		fmt.Fprintf(os.Stderr, "snapshot: warning: %s\n", warning)
 	}
 	if *upload {
 		// Match `manifest-ctl store --put-manifest`: stdout = manifest key,
@@ -124,4 +132,19 @@ func snapshotCmd(args []string) int {
 		fmt.Printf("  overlay file:    %s\n", resp.OverlayPath)
 	}
 	return 0
+}
+
+func snapshotDropCachesWarning(dropCaches bool, result proto.DropCachesResult) string {
+	switch {
+	case !dropCaches && result == proto.DropCachesUnknown:
+		return "guest did not report drop_caches capability; it may have dropped caches despite --drop-caches=false"
+	case !dropCaches && result != proto.DropCachesSkipped:
+		return fmt.Sprintf("guest reported drop_caches=%s despite --drop-caches=false", result)
+	case dropCaches && result == proto.DropCachesFailed:
+		return "guest failed to write drop_caches; snapshot continued because cache dropping is best-effort"
+	case dropCaches && result == proto.DropCachesSkipped:
+		return "guest unexpectedly skipped drop_caches although the snapshot requested it"
+	default:
+		return ""
+	}
 }

@@ -770,6 +770,142 @@ func handleSnapshotRequest(
 	reattachMUX func() error, // re-establishes the stdio MUX after --resume; may be nil
 	logf func(string, ...any),
 ) (resp ctl.Response, err error) {
+	dropCaches := req.DropCachesEnabled()
+	mergeRef := req.MergeRefEnabled()
+	prov := opts.Cfg.SnapshotProvenance
+	localParent := false
+	if prov.ParentSnapshotRef != "" {
+		parentRef, parseErr := manifest.ParseRef(prov.ParentSnapshotRef)
+		if parseErr != nil {
+			return ctl.Response{}, fmt.Errorf("parent snapshot ref: %w", parseErr)
+		}
+		localParent = !parentRef.Portable()
+	}
+
+	// Finish every predictable request/artifact/directory check before pausing
+	// forwards or the pinger and, critically, before asking the guest to freeze.
+	if opts.SandboxID == "" {
+		return ctl.Response{}, fmt.Errorf("snapshot: empty sandbox id")
+	}
+	if len(disks) != 1+len(opts.Cfg.Boot.Disks) {
+		return ctl.Response{}, fmt.Errorf("snapshot: runtime disk count %d does not match configured disk count %d",
+			len(disks), 1+len(opts.Cfg.Boot.Disks))
+	}
+	if req.Upload && (opts.ManifestCfg == nil || opts.ManifestCfg.Store.Endpoint == "") {
+		return ctl.Response{}, fmt.Errorf("upload mode requires --manifest-config or MANIFEST_CONFIG (manifest store endpoints)")
+	}
+	if req.Upload && req.OutDir != "" {
+		return ctl.Response{}, fmt.Errorf("--output and --upload are mutually exclusive")
+	}
+	if !req.Upload && req.OutDir == "" {
+		return ctl.Response{}, fmt.Errorf("--output and --upload are mutually exclusive; one is required")
+	}
+	if localParent && !mergeRef && req.Upload {
+		return ctl.Response{}, fmt.Errorf("--merge-ref=false with a local memory parent requires --output; direct upload is not supported")
+	}
+
+	stagingDir := filepath.Join(runDir, "snap-stage")
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		return ctl.Response{}, fmt.Errorf("snapshot staging directory: %w", err)
+	}
+	defer os.RemoveAll(stagingDir)
+	if !req.Upload {
+		if err := ensureSnapshotDir(req.OutDir); err != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot output directory: %w", err)
+		}
+	}
+
+	if prov.ParentSnapshotRef != "" && len(prov.ParentDisks) != max(0, len(disks)-1) {
+		return ctl.Response{}, fmt.Errorf("snapshot: parent disk provenance count %d does not match runtime data disk count %d",
+			len(prov.ParentDisks), max(0, len(disks)-1))
+	}
+	diffs := make([]snapshot.DiskDiff, len(disks))
+	diskMerged := make([]bool, len(disks))
+	for i, d := range disks {
+		dd := snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff}
+		st, statErr := os.Stat(dd.Path)
+		if statErr != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q: %w", i, dd.Path, statErr)
+		}
+		if !st.Mode().IsRegular() {
+			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q is not a regular file", i, dd.Path)
+		}
+		var parentDiskRef string
+		if i == 0 {
+			parentDiskRef = prov.ParentOverlayBase
+			dd.MergeBase = prov.ParentOverlayPath
+		} else if i-1 < len(prov.ParentDisks) {
+			parentDiskRef = prov.ParentDisks[i-1].OverlayBase
+			dd.MergeBase = prov.ParentDisks[i-1].OverlayPath
+		}
+		mergeDisk := false
+		if parentDiskRef != "" {
+			ref, parseErr := manifest.ParseRef(parentDiskRef)
+			if parseErr != nil {
+				return ctl.Response{}, fmt.Errorf("snapshot: disk %d parent ref: %w", i, parseErr)
+			}
+			mergeDisk = !ref.Portable()
+		}
+		if mergeDisk {
+			if dd.MergeBase == "" {
+				return ctl.Response{}, fmt.Errorf("snapshot: local parent disk %d lacks a merge base path", i)
+			}
+			if err := snapshot.ValidateMergeBase(dd.MergeBase, st.Size()); err != nil {
+				return ctl.Response{}, fmt.Errorf("snapshot: disk %d merge base: %w", i, err)
+			}
+			diskMerged[i] = true
+		} else {
+			dd.MergeBase = ""
+		}
+		diffs[i] = dd
+	}
+
+	mergeMemory := localParent && mergeRef
+	if mergeMemory {
+		if prov.ParentSnapshotPath == "" {
+			return ctl.Response{}, fmt.Errorf("snapshot: local parent %q lacks a memory merge path", prov.ParentSnapshotRef)
+		}
+		if err := snapshot.ValidateMergeBase(prov.ParentSnapshotPath, int64(mfd.Size())); err != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot: memory merge base: %w", err)
+		}
+	}
+	resultMemoryRefs := prependRef(prov.ParentSnapshotRef, prov.ParentFromRefs)
+	if mergeMemory {
+		resultMemoryRefs = prov.ParentFromRefs
+	}
+	resultMemoryRefs, err = normalizeLocalMemoryRefs(resultMemoryRefs)
+	if err != nil {
+		return ctl.Response{}, err
+	}
+	if !req.Upload {
+		if err := validateLocalMemoryRefs(req.OutDir, resultMemoryRefs); err != nil {
+			return ctl.Response{}, err
+		}
+	}
+	if req.Upload {
+		if err := validatePortableMemoryRefs(resultMemoryRefs); err != nil {
+			return ctl.Response{}, err
+		}
+	}
+
+	// Construct the sink before quiesce as well: malformed manifest/store
+	// configuration must not be discovered only after the guest is frozen.
+	var sink snapshot.SnapshotSink
+	var ingestSink *snapshot.IngestSink
+	if req.Upload {
+		ing, ierr := opts.ManifestCfg.NewIngester(opts.ManifestCfg.IngestKeyFunc(), nil)
+		if ierr != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot ingester: %w", ierr)
+		}
+		defer ing.Close()
+		ingestSink = snapshot.NewIngestSink(ing, logf)
+		sink = ingestSink
+	} else {
+		sink = snapshot.NewFileSink(req.OutDir, opts.SandboxID, logf)
+	}
+
+	dropCachesResult := proto.DropCachesUnknown
+
 	// Quiesce sequence (docs/sandbox.md §6.2 T2a, sandbox-init.md §3.4):
 	// pause the ping ticker, then `quiesce` → the guest does sync +
 	// drop_caches, stops reading the app's stdout/stderr (pty), runs the
@@ -822,29 +958,15 @@ func handleSnapshotRequest(
 		if client == nil {
 			client = &guestlink.HostClient{BasePath: filepath.Join(runDir, "vsock.sock"), Logf: logf}
 		}
-		if err := guestlink.SendQuiesce(client); err != nil {
+		result, qerr := guestlink.SendQuiesce(client, !dropCaches)
+		if qerr != nil {
+			err = qerr
 			logf("quiesce: %v (aborting snapshot)", err)
 			return ctl.Response{}, fmt.Errorf("quiesce: %w", err)
 		}
-		logf("quiesce: guest acked (MUX + forwards closed), proceeding to /vm.pause")
+		dropCachesResult = result
+		logf("quiesce: guest acked (drop_caches=%s, MUX + forwards closed), proceeding to /vm.pause", result)
 	}
-
-	if req.Upload && (opts.ManifestCfg == nil || opts.ManifestCfg.Store.Endpoint == "") {
-		return ctl.Response{}, fmt.Errorf("upload mode requires --manifest-config or MANIFEST_CONFIG (manifest store endpoints)")
-	}
-	// --output 与 --upload 互斥(docs/sandbox.md §13.3)。CLI 已经做过这道
-	// 校验,但 ctl.sock 协议是开放的,run 进程也守在最后一关。
-	if req.Upload && req.OutDir != "" {
-		return ctl.Response{}, fmt.Errorf("--output and --upload are mutually exclusive")
-	}
-	if !req.Upload && req.OutDir == "" {
-		return ctl.Response{}, fmt.Errorf("--output and --upload are mutually exclusive; one is required")
-	}
-	stagingDir := filepath.Join(runDir, "snap-stage")
-	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
-		return ctl.Response{}, err
-	}
-	defer os.RemoveAll(stagingDir)
 
 	// Build snapshot.cfg builder closure. Take() invokes it with the final
 	// overlay_ref the sink produced (file://<sha256>.overlay in --output mode,
@@ -852,7 +974,7 @@ func handleSnapshotRequest(
 	// final on first write — no post-hoc ZIP rewrite.
 	cfg := opts.Cfg
 	snapCfgBuilder := func(overlayRefs []string) ([]byte, error) {
-		return buildSnapshotCfg(cfg, overlayRefs)
+		return buildSnapshotCfg(cfg, overlayRefs, resultMemoryRefs, diskMerged)
 	}
 
 	// opts.SandboxID is always populated by the run path (generated when the
@@ -864,44 +986,10 @@ func handleSnapshotRequest(
 	// with the long-lived read-side fetcher). Either way Take streams the
 	// multi-GiB memory + overlay straight to the sink — only CH's tiny
 	// config.json/state.json transit the /run tmpfs staging dir.
-	var sink snapshot.SnapshotSink
-	var ingestSink *snapshot.IngestSink
-	if req.Upload {
-		ing, ierr := opts.ManifestCfg.NewIngester(opts.ManifestCfg.IngestKeyFunc(), nil)
-		if ierr != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot ingester: %w", ierr)
-		}
-		defer ing.Close()
-		ingestSink = snapshot.NewIngestSink(ing, logf)
-		sink = ingestSink
-	} else {
-		sink = snapshot.NewFileSink(req.OutDir, sandboxID, logf)
-	}
-
-	// Per-disk diff list (root, then data disks) for Take. A disk is merged only
-	// when restore recorded a physical parent layer path for that disk; mixed
-	// graphs may have local memory with manifest-backed disk parents, which stack.
-	prov := cfg.SnapshotProvenance
-	localParent := false
-	if prov.ParentSnapshotRef != "" {
-		parentRef, err := manifest.ParseRef(prov.ParentSnapshotRef)
-		if err != nil {
-			return ctl.Response{}, fmt.Errorf("parent snapshot ref: %w", err)
-		}
-		localParent = !parentRef.Portable()
-	}
-	diffs := make([]snapshot.DiskDiff, len(disks))
-	for i, d := range disks {
-		dd := snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff}
-		if localParent {
-			if i == 0 {
-				dd.MergeBase = prov.ParentOverlayPath // root
-			} else if j := i - 1; j < len(prov.ParentDisks) {
-				dd.MergeBase = prov.ParentDisks[j].OverlayPath
-			}
-		}
-		diffs[i] = dd
-	}
+	// Per-disk diff list (root, then data disks) for Take. Restored from a LOCAL
+	// snapshot ⇒ MERGE this run's resident delta onto the parent local layer
+	// (replace the next-newest layer, not stack) for BOTH --output and --upload;
+	// buildSnapshotCfg drops the parent ref to match. Cold/manifest parents stack.
 	src := snapshot.Sources{
 		SandboxID:     sandboxID,
 		APISock:       chSock,
@@ -914,10 +1002,7 @@ func handleSnapshotRequest(
 		Quiescer:      &allQuiescer{servers: servers},
 		Logf:          logf,
 	}
-	if localParent {
-		if prov.ParentSnapshotPath == "" {
-			return ctl.Response{}, fmt.Errorf("snapshot: local parent %q lacks memory merge path", prov.ParentSnapshotRef)
-		}
+	if mergeMemory {
 		src.MergeBaseSnapshot = prov.ParentSnapshotPath
 	}
 	out, err := snapshot.Take(src, sink, req.ResumeAfter)
@@ -943,6 +1028,7 @@ func handleSnapshotRequest(
 		MemoryResident:   out.MemoryResident,
 		WallclockPauseMs: out.WallclockPauseMs,
 		WallclockDumpMs:  out.WallclockDumpMs,
+		DropCachesResult: dropCachesResult,
 	}
 	// The response reports the ROOT overlay (out.*[0]); data-disk overlays live
 	// in the bundle's snapshot.cfg (boot.disks[]) and, in --output mode, as
@@ -988,38 +1074,115 @@ func destroyAfterSnapshot(chSock string, respDeadline time.Duration, logf func(s
 	logf("snapshot: destroy mode — VMM shutdown requested")
 }
 
+func ensureSnapshotDir(dir string) error {
+	if dir == "" {
+		return fmt.Errorf("empty path")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".snapshot-write-check-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	return os.Remove(name)
+}
+
+func validateLocalMemoryRefs(outputDir string, refs []string) error {
+	for i, raw := range refs {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return fmt.Errorf("snapshot: memory ref[%d] %q: %w", i, raw, err)
+		}
+		if ref.Portable() {
+			continue
+		}
+		// Local memory dependencies are intentionally portable only as a
+		// sibling artifact set. Never retain an absolute/source-directory path
+		// in snapshot.cfg; resolve the ref basename against W's output bundle.
+		path := filepath.Join(outputDir, filepath.Base(ref.Path))
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("snapshot: local memory ref[%d] %q is not accessible at %q: %w", i, raw, path, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("snapshot: local memory ref[%d] %q at %q is not a regular file", i, raw, path)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("snapshot: local memory ref[%d] %q is not readable at %q: %w", i, raw, path, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("snapshot: local memory ref[%d] %q close: %w", i, raw, err)
+		}
+	}
+	return nil
+}
+
+func validatePortableMemoryRefs(refs []string) error {
+	for i, raw := range refs {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return fmt.Errorf("snapshot: memory ref[%d] %q: %w", i, raw, err)
+		}
+		if !ref.Portable() {
+			return fmt.Errorf("snapshot: direct upload would retain local memory lower ref %q; use --output then upload-snapshot", raw)
+		}
+	}
+	return nil
+}
+
+func normalizeLocalMemoryRefs(refs []string) ([]string, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	out := make([]string, len(refs))
+	for i, raw := range refs {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot: memory ref[%d] %q: %w", i, raw, err)
+		}
+		if !ref.Portable() {
+			base := filepath.Base(ref.Path)
+			if ref.Path == "" || base == "." || base == ".." || base == string(filepath.Separator) {
+				return nil, fmt.Errorf("snapshot: memory ref[%d] %q has no artifact basename", i, raw)
+			}
+			ref.Path = base
+		}
+		out[i] = ref.String()
+	}
+	return out, nil
+}
+
 // buildSnapshotCfg renders the snapshot.cfg YAML body per docs §3.4.
 // runtime_ref / base_ref are pre-computed by sandbox-ctl at boot
 // from each artifact's declared identity (see config.SnapshotRefs in
 // config.SandboxConfig). overlayRef is filled in by Take() after overlay
 // digest is known, or by Upload() after overlay manifest key is known.
-func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, error) {
+func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs, memoryFromRefs []string, diskMerged []bool) ([]byte, error) {
+	if len(overlayRefs) != 1+len(cfg.Boot.Disks) {
+		return nil, fmt.Errorf("snapshot.cfg: got %d disk refs, want %d", len(overlayRefs), 1+len(cfg.Boot.Disks))
+	}
+	if len(diskMerged) != len(overlayRefs) {
+		return nil, fmt.Errorf("snapshot.cfg: got %d disk merge decisions, want %d", len(diskMerged), len(overlayRefs))
+	}
 	doc := snapshotCfgYAML{}
 	doc.Resources.Capacity.CPU = cfg.Resources.Capacity.CPU
 	doc.Resources.Capacity.Memory = cfg.Resources.Capacity.Memory
 	doc.Metadata = cfg.Metadata
 	doc.Boot.RuntimeRef = cfg.SnapshotRefs.RuntimeRef
 
-	// Incremental memory follows the root snapshot ref. Each disk decides
-	// independently: a recorded physical merge path means Take merged the parent
-	// local layer and the new top replaces it; without one, the parent disk ref is
-	// prepended and remains in the chain. This preserves mixed graphs with local
-	// memory and manifest-backed disks.
+	// Incremental layered chain (docs/sandbox.md §3.5). The lifecycle passes
+	// the already-decided and canonicalized memory chain because working-set
+	// snapshots may stack local memory while still merging every local disk.
 	prov := cfg.SnapshotProvenance
-	localParent := false
-	if prov.ParentSnapshotRef != "" {
-		parentRef, err := manifest.ParseRef(prov.ParentSnapshotRef)
-		if err != nil {
-			return nil, fmt.Errorf("parent snapshot ref: %w", err)
-		}
-		localParent = !parentRef.Portable()
-	}
 	coldStart := prov.ParentSnapshotRef == ""
-	if localParent {
-		doc.FromRefs = prov.ParentFromRefs
-	} else {
-		doc.FromRefs = prependRef(prov.ParentSnapshotRef, prov.ParentFromRefs)
-	}
+	doc.FromRefs = memoryFromRefs
 
 	// Root node. coldLower is the read-only lower the writable diff sits on: the
 	// single-disk CoW base, or the overlay's lower (overlay.base) in two-disk
@@ -1030,9 +1193,8 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 		rootColdLower = cfg.Boot.Root.Overlay.Base
 		rootColdChain = cfg.Boot.Root.Overlay.BaseFromRefs
 	}
-	rootMerged := localParent && prov.ParentOverlayPath != ""
 	doc.Boot.Root = renderDiskNode(overlayRefs[0], cfg.SnapshotRefs.BaseRef,
-		rootColdLower, rootColdChain, cfg.SingleDisk(), rootMerged, coldStart,
+		rootColdLower, rootColdChain, cfg.SingleDisk(), diskMerged[0], coldStart,
 		prov.ParentOverlayBase, prov.ParentBaseFromRefs)
 
 	// Data-disk nodes (boot.disks[] order), each with its own parent chain.
@@ -1043,7 +1205,6 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 		if i < len(prov.ParentDisks) {
 			pTop, pChain = prov.ParentDisks[i].OverlayBase, prov.ParentDisks[i].BaseFromRefs
 		}
-		diskMerged := localParent && i < len(prov.ParentDisks) && prov.ParentDisks[i].OverlayPath != ""
 		baseRef := ""
 		if i < len(cfg.SnapshotRefs.DiskBaseRefs) {
 			baseRef = cfg.SnapshotRefs.DiskBaseRefs[i]
@@ -1055,7 +1216,7 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs []string) ([]byte, 
 			diskColdChain = d.Overlay.BaseFromRefs
 		}
 		doc.Boot.Disks = append(doc.Boot.Disks, renderDiskNode(overlayRefs[1+i],
-			baseRef, diskColdLower, diskColdChain, d.RootConfig.Single(), diskMerged, coldStart, pTop, pChain))
+			baseRef, diskColdLower, diskColdChain, d.RootConfig.Single(), diskMerged[1+i], coldStart, pTop, pChain))
 	}
 	return yaml.Marshal(&doc)
 }
