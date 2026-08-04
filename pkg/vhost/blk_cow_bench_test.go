@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"golang.org/x/sys/unix"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 )
 
 const benchmarkCOWBlocks = 256
@@ -15,6 +15,97 @@ type zeroBlockReader struct{ size int64 }
 func (r zeroBlockReader) ReadAt(buf []byte, offset int64) (int, error) {
 	clear(buf)
 	return len(buf), nil
+}
+
+func BenchmarkEncryptedBlockCOW(b *testing.B) {
+	const size = benchmarkCOWBlocks * cowBlockSize
+	codec, err := manifestcrypto.NewTarStreamCodec([32]byte{0x92})
+	if err != nil {
+		b.Fatal(err)
+	}
+	open := func(b *testing.B) *BlockCOW {
+		b.Helper()
+		cow, err := OpenBlockCOW(
+			filepath.Join(b.TempDir(), "diff.ext4"),
+			zeroBlockReader{size: size},
+			DiffInit{CreateSize: size},
+			WithCodec(codec, false),
+		)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { _ = cow.Close() })
+		return cow
+	}
+
+	b.Run("clean-partial-512", func(b *testing.B) {
+		cow := open(b)
+		payload := make([]byte, 512)
+		b.SetBytes(int64(len(payload)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if i > 0 && i%benchmarkCOWBlocks == 0 {
+				b.StopTimer()
+				resetBenchmarkCOW(b, cow)
+				b.StartTimer()
+			}
+			offset := int64(i%benchmarkCOWBlocks)*cowBlockSize + 123
+			if _, err := cow.WriteAt(payload, offset); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		offset int64
+		size   int
+	}{
+		{name: "dirty-sector-512", offset: 512, size: 512},
+		{name: "dirty-partial-257", offset: 123, size: 257},
+		{name: "dirty-full-4k", offset: 0, size: cowBlockSize},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			cow := open(b)
+			if _, err := cow.WriteAt(make([]byte, cowBlockSize), 0); err != nil {
+				b.Fatal(err)
+			}
+			payload := make([]byte, test.size)
+			b.SetBytes(int64(len(payload)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := cow.WriteAt(payload, test.offset); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name string
+		size int
+	}{
+		{name: "read-dirty-512", size: 512},
+		{name: "read-dirty-4k", size: cowBlockSize},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			cow := open(b)
+			if _, err := cow.WriteAt(make([]byte, cowBlockSize), 0); err != nil {
+				b.Fatal(err)
+			}
+			buffer := make([]byte, test.size)
+			b.SetBytes(int64(len(buffer)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := cow.ReadAt(buffer, 0); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func (r zeroBlockReader) Size() int64 { return r.size }
@@ -27,7 +118,7 @@ func BenchmarkBlockCOWWriteAt(b *testing.B) {
 		cow, err := OpenBlockCOW(
 			filepath.Join(b.TempDir(), "diff.ext4"),
 			zeroBlockReader{size: size},
-			size,
+			DiffInit{CreateSize: size},
 		)
 		if err != nil {
 			b.Fatal(err)
@@ -93,7 +184,7 @@ func BenchmarkBlockCOWSnapshotView(b *testing.B) {
 	cow, err := OpenBlockCOW(
 		filepath.Join(b.TempDir(), "diff.ext4"),
 		zeroBlockReader{size: size},
-		size,
+		DiffInit{CreateSize: size},
 	)
 	if err != nil {
 		b.Fatal(err)
@@ -141,7 +232,7 @@ func BenchmarkBlockCOWSnapshotView(b *testing.B) {
 		dense, err := OpenBlockCOW(
 			filepath.Join(b.TempDir(), "dense.ext4"),
 			zeroBlockReader{size: size},
-			size,
+			DiffInit{CreateSize: size},
 		)
 		if err != nil {
 			b.Fatal(err)
@@ -171,12 +262,7 @@ func BenchmarkBlockCOWSnapshotView(b *testing.B) {
 
 func resetBenchmarkCOW(b *testing.B, cow *BlockCOW) {
 	b.Helper()
-	if err := unix.Fallocate(
-		int(cow.diff.Fd()),
-		unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
-		0,
-		cow.size,
-	); err != nil {
+	if err := cow.diff.punchHole(0, cow.size); err != nil {
 		b.Fatal(err)
 	}
 	cow.bitmapMu.Lock()

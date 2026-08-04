@@ -53,7 +53,7 @@ type Options struct {
 	Fetcher             fetch.Fetcher          // required when any URI is manifest://; caller owns lifecycle
 	CustomerKeyFn       ingest.CustomerKeyFunc // process-fixed key used by later snapshot upload
 	LocalCodec          tarstream.Codec        // nil when crypto.local=off
-	LocalRequired       bool                   // reject plaintext local tarstreams
+	LocalRequired       bool                   // reject plaintext local artifacts and active diffs
 	RefLocations        config.RefLocations    // trusted named file locations
 	SandboxID           string
 	CHBinary            string
@@ -727,11 +727,15 @@ func reconstructDisk(ctx context.Context, opts Options, single bool, capturedTop
 	if !ok {
 		return fail(fmt.Errorf("%s: bad diff uri: %s", diskKey, diffURI))
 	}
-	createSize, err := sandbox.PrepareDiff(diffPath, diffTemplate, baseReader.Size(), diffSize)
+	diffInit, err := sandbox.PrepareDiff(diffPath, diffTemplate, baseReader.Size(), diffSize)
 	if err != nil {
 		return fail(fmt.Errorf("%s: prepare diff: %w", diskKey, err))
 	}
-	cow, err := vhost.OpenBlockCOW(diffPath, baseReader, createSize)
+	var cowOptions []vhost.BlockCOWOption
+	if opts.LocalCodec != nil {
+		cowOptions = append(cowOptions, vhost.WithCodec(opts.LocalCodec, opts.LocalRequired))
+	}
+	cow, err := vhost.OpenBlockCOW(diffPath, baseReader, diffInit, cowOptions...)
 	if err != nil {
 		return fail(fmt.Errorf("%s: open BlockCOW: %w", diskKey, err))
 	}

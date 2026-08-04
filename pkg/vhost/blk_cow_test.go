@@ -2,6 +2,7 @@ package vhost
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -33,7 +34,7 @@ func (r *fakeReader) Close() error { return nil }
 func TestBlockCOW_BareDiff_NoBaseRead(t *testing.T) {
 	dir := t.TempDir()
 	diff := filepath.Join(dir, "diff.ext4")
-	cow, err := OpenBlockCOW(diff, nil, 4*4096)
+	cow, err := OpenBlockCOW(diff, nil, DiffInit{CreateSize: 4 * 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +61,7 @@ func TestBlockCOW_WriteThenRead(t *testing.T) {
 	dir := t.TempDir()
 	diff := filepath.Join(dir, "diff.ext4")
 	base := &fakeReader{data: bytes.Repeat([]byte("BASE"), 4096)} // 16 KiB
-	cow, err := OpenBlockCOW(diff, base, 4*4096)
+	cow, err := OpenBlockCOW(diff, base, DiffInit{CreateSize: 4 * 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +117,7 @@ func TestBlockCOW_BitmapRebuildFromExistingDiff(t *testing.T) {
 	}
 	f.Close()
 
-	cow, err := OpenBlockCOW(diff, nil, size)
+	cow, err := OpenBlockCOW(diff, nil, DiffInit{Existing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,9 +142,36 @@ func TestBlockCOW_BitmapRebuildFromExistingDiff(t *testing.T) {
 func TestBlockCOW_DeclaredSizeAlignment(t *testing.T) {
 	dir := t.TempDir()
 	diff := filepath.Join(dir, "diff.ext4")
-	_, err := OpenBlockCOW(diff, nil, 4097) // not 4K aligned
+	_, err := OpenBlockCOW(diff, nil, DiffInit{CreateSize: 4097}) // not 4K aligned
 	if err == nil {
 		t.Fatal("expected alignment error")
+	}
+}
+
+func TestBlockCOW_IOBoundsDoNotOverflow(t *testing.T) {
+	const size = 4096
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), nil, DiffInit{CreateSize: size})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cow.Close()
+
+	if n, err := cow.ReadAt(nil, size); err != nil || n != 0 {
+		t.Fatalf("zero-length ReadAt at EOF = %d, %v", n, err)
+	}
+	maxOffset := int64(^uint64(0) >> 1)
+	if _, err := cow.ReadAt(make([]byte, 1), maxOffset); !errors.Is(err, io.EOF) {
+		t.Fatalf("overflowing ReadAt error = %v", err)
+	}
+	if _, err := cow.WriteAt(make([]byte, 1), maxOffset); err == nil {
+		t.Fatal("overflowing WriteAt was accepted")
+	}
+	if err := cow.Discard(maxOffset, 1); err == nil {
+		t.Fatal("overflowing Discard was accepted")
+	}
+	reader := &cowSnapshotReaderAt{cow: cow, bitmap: append([]uint64(nil), cow.bitmap...)}
+	if n, err := reader.ReadAt(nil, size); err != nil || n != 0 {
+		t.Fatalf("zero-length snapshot ReadAt at EOF = %d, %v", n, err)
 	}
 }
 
@@ -151,7 +179,7 @@ func TestBlockCOW_ReadAcrossBlocks(t *testing.T) {
 	dir := t.TempDir()
 	diff := filepath.Join(dir, "diff.ext4")
 	const size = 4 * 4096
-	cow, err := OpenBlockCOW(diff, nil, size)
+	cow, err := OpenBlockCOW(diff, nil, DiffInit{CreateSize: size})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +216,7 @@ func TestBlockCOW_FirstPartialWriteMaterializesBase(t *testing.T) {
 			const size = 3 * cowBlockSize
 			baseData := patternedBytes(size)
 			base := &fakeReader{data: baseData}
-			cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), base, size)
+			cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), base, DiffInit{CreateSize: size})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -221,7 +249,7 @@ func TestBlockCOW_FirstPartialWriteMaterializesBase(t *testing.T) {
 
 func TestBlockCOW_FirstPartialWriteMaterializesZerosWithoutBase(t *testing.T) {
 	const size = 2 * cowBlockSize
-	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), nil, size)
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), nil, DiffInit{CreateSize: size})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +275,7 @@ func TestBlockCOW_PartialWriteSurvivesReopen(t *testing.T) {
 	baseData := patternedBytes(size)
 	base := &fakeReader{data: baseData}
 	diff := filepath.Join(t.TempDir(), "diff.ext4")
-	cow, err := OpenBlockCOW(diff, base, size)
+	cow, err := OpenBlockCOW(diff, base, DiffInit{CreateSize: size})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +291,7 @@ func TestBlockCOW_PartialWriteSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := OpenBlockCOW(diff, base, size)
+	reopened, err := OpenBlockCOW(diff, base, DiffInit{Existing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +313,7 @@ func TestBlockCOW_PartialWriteSurvivesReopen(t *testing.T) {
 func TestBlockCOW_DescriptorSplitPreservesMaterializedBlock(t *testing.T) {
 	const size = 2 * cowBlockSize
 	baseData := patternedBytes(size)
-	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: baseData}, size)
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: baseData}, DiffInit{CreateSize: size})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +347,7 @@ func TestBlockCOW_ConcurrentOverlappingFirstWrites(t *testing.T) {
 	const blocks = 64
 	const size = blocks * cowBlockSize
 	baseData := patternedBytes(size)
-	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: baseData}, size)
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: baseData}, DiffInit{CreateSize: size})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +401,7 @@ func TestBlockCOW_ConcurrentOverlappingFirstWrites(t *testing.T) {
 
 func TestBlockCOW_FailedMaterializationDoesNotMarkDirty(t *testing.T) {
 	const size = cowBlockSize
-	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: patternedBytes(size)}, size)
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: patternedBytes(size)}, DiffInit{CreateSize: size})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +419,7 @@ func TestBlockCOW_FailedMaterializationDoesNotMarkDirty(t *testing.T) {
 func TestBlockCOW_SnapshotViewIsUpperOnly(t *testing.T) {
 	const size = 4 * cowBlockSize
 	baseData := patternedBytes(size)
-	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: baseData}, size)
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: baseData}, DiffInit{CreateSize: size})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +472,7 @@ func TestBlockCOW_SnapshotViewIsUpperOnly(t *testing.T) {
 func TestBlockCOW_SnapshotViewReadsDenseRanges(t *testing.T) {
 	const size = (cowLockStripes + 4) * cowBlockSize
 	payload := patternedBytes(size)
-	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), nil, size)
+	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), nil, DiffInit{CreateSize: size})
 	if err != nil {
 		t.Fatal(err)
 	}

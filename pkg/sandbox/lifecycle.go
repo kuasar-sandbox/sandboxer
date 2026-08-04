@@ -48,7 +48,7 @@ type RunOptions struct {
 	StdioMode     stdio.Mode             // CH process stdio wiring; see pkg/stdio
 	CustomerKeyFn ingest.CustomerKeyFunc // process-fixed customer key resolver
 	LocalCodec    tarstream.Codec        // nil when crypto.local=off
-	LocalRequired bool                   // reject plaintext local tarstreams
+	LocalRequired bool                   // reject plaintext local artifacts and active diffs
 
 	// PingFatalThreshold: after this many consecutive ping failures
 	// the host SIGTERMs CH so cmd.Wait() returns. 0 = disabled
@@ -359,11 +359,15 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	createSize, err := PrepareDiff(diffPath, diffTemplate, baseSize, diffSize)
+	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize, diffSize)
 	if err != nil {
 		return -1, fmt.Errorf("prepare diff: %w", err)
 	}
-	cow, err := vhost.OpenBlockCOW(diffPath, cowBase, createSize)
+	var cowOptions []vhost.BlockCOWOption
+	if opts.LocalCodec != nil {
+		cowOptions = append(cowOptions, vhost.WithCodec(opts.LocalCodec, opts.LocalRequired))
+	}
+	cow, err := vhost.OpenBlockCOW(diffPath, cowBase, diffInit, cowOptions...)
 	if err != nil {
 		return -1, fmt.Errorf("root COW: %w", err)
 	}
@@ -722,11 +726,15 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 	if err != nil {
 		return fail(err)
 	}
-	createSize, err := PrepareDiff(diffPath, diffTemplate, baseSize, diffSize)
+	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize, diffSize)
 	if err != nil {
 		return fail(fmt.Errorf("%s prepare diff: %w", field, err))
 	}
-	cow, err := vhost.OpenBlockCOW(diffPath, cowBase, createSize)
+	var cowOptions []vhost.BlockCOWOption
+	if codec != nil {
+		cowOptions = append(cowOptions, vhost.WithCodec(codec, required))
+	}
+	cow, err := vhost.OpenBlockCOW(diffPath, cowBase, diffInit, cowOptions...)
 	if err != nil {
 		return fail(fmt.Errorf("%s COW: %w", field, err))
 	}
