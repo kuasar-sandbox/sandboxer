@@ -16,6 +16,7 @@ import (
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"golang.org/x/sys/unix"
 )
 
 func TestBlockCOWCodecOptions(t *testing.T) {
@@ -245,6 +246,24 @@ func TestEncryptedDiffHeaderValidation(t *testing.T) {
 		if err := open(path, true); !errors.Is(err, tarstream.ErrPlaintextForbidden) {
 			t.Fatalf("required damaged magic error=%v", err)
 		}
+	})
+
+	t.Run("near-magic-plaintext-auto", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "legacy.diff")
+		body := make([]byte, cowBlockSize)
+		copy(body, diffMagic[:])
+		body[len(diffMagic)-1] ^= 1
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cow, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithCodec(codec, false))
+		if err != nil {
+			t.Fatalf("auto rejected non-magic legacy plaintext: %v", err)
+		}
+		if cow.diff.encrypted {
+			t.Fatal("near-magic plaintext was classified as encrypted")
+		}
+		_ = cow.Close()
 	})
 }
 
@@ -492,6 +511,26 @@ func TestEncryptedBitmapRebuildSkipsHeaderAndPreservesSparseBlocks(t *testing.T)
 	}
 }
 
+func TestFreshEncryptedDiffRejectsPreallocatedBody(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "active.diff")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff, err := createEncryptedDiffFile(f, 2*cowBlockSize, testDiffCodec(t, 0x55), strings.NewReader(strings.Repeat("k", diffXTSKeySize)))
+	if err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	defer diff.Close()
+	if _, err := f.WriteAt([]byte{1}, diffHeaderRegionSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := diff.validateFreshEncryptedBodySparse(); err == nil {
+		t.Fatal("filesystem body allocation before seed was accepted")
+	}
+}
+
 func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 	const size = 4 * cowBlockSize
 	dir := t.TempDir()
@@ -539,12 +578,18 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 	if err := plain.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if info, err := os.Stat(plainPath); err != nil || info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("fresh plaintext diff permissions=%v err=%v", info, err)
+	}
 	encrypted, encryptedPath := openSeeded(t, "auto.diff", false)
 	if !encrypted.diff.encrypted {
 		t.Fatal("auto produced plaintext target")
 	}
 	if err := encrypted.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if info, err := os.Stat(encryptedPath); err != nil || info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("fresh encrypted diff permissions=%v err=%v", info, err)
 	}
 	required, _ := openSeeded(t, "required.diff", true)
 	if err := required.Close(); err != nil {
@@ -638,6 +683,68 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 	}
 	if partials, _ := filepath.Glob(filepath.Join(dir, ".seed-failure.diff.*.partial")); len(partials) != 0 {
 		t.Fatalf("seed failure left temporary files: %v", partials)
+	}
+}
+
+func TestEmptyPlaceholderConcurrentInitializationDoesNotReplaceWinner(t *testing.T) {
+	const size = 2 * cowBlockSize
+	dir := t.TempDir()
+	path := filepath.Join(dir, "active.diff")
+	template := filepath.Join(dir, "template.ext4")
+	want := patternedBytes(size)
+	writeSparseTemplate(t, template, want, []sparse.Extent{{Offset: 0, Size: size}})
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	codec := testDiffCodec(t, 0x62)
+
+	const creators = 16
+	start := make(chan struct{})
+	results := make(chan error, creators)
+	var wait sync.WaitGroup
+	for range creators {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			cow, err := OpenBlockCOW(path, nil, DiffInit{TemplatePath: template}, WithCodec(codec, true))
+			if cow != nil {
+				err = errors.Join(err, cow.Close())
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	winners := 0
+	for err := range results {
+		if err == nil {
+			winners++
+			continue
+		}
+		if !errors.Is(err, unix.EEXIST) {
+			t.Fatalf("competing creator error=%v, want EEXIST", err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("successful creators=%d want=1", winners)
+	}
+
+	reopened, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithCodec(codec, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got := make([]byte, size)
+	if _, err := reopened.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("winning atomic initialization was replaced or corrupted")
+	}
+	if partials, _ := filepath.Glob(filepath.Join(dir, ".active.diff.*.partial")); len(partials) != 0 {
+		t.Fatalf("competing creators left temporary files: %v", partials)
 	}
 }
 

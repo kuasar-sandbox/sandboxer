@@ -901,7 +901,9 @@ target 都生成独立随机 XTS key;不使用 HKDF、per-file salt 或额外 he
 任何 template data extent 涉及的 4 KiB block 都完整初始化 8 个 XTS data units;
 template hole 保持 target hole。seed 先写同目录临时文件并执行 Sync + Close,再以
 no-replace 原子提交并同步父目录;失败不修改 final target。禁止 raw-copy encrypted
-template 或复用其 XTS key。
+template 或复用其 XTS key。encrypted header 写入并 Sync 后、template seed 之前必须
+确认 body 仍全为 hole;若目标文件系统的 allocation / SEEK_DATA 粒度让 4 KiB header
+extent 跨入 body,创建直接失败,不引入 persistent bitmap 或零扫描兜底。
 
 ### 3.3 flattened image 内嵌 config.json
 

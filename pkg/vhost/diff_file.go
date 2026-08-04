@@ -286,9 +286,6 @@ func initializeFreshDiffFile(path string, logicalSize int64, codec tarstream.Cod
 			_ = os.Remove(tmpPath)
 		}
 	}()
-	if err := tmp.Chmod(0o644); err != nil {
-		return nil, fmt.Errorf("vhost: set diff temporary permissions: %w", err)
-	}
 
 	var target *diffFile
 	if codec == nil {
@@ -299,6 +296,9 @@ func initializeFreshDiffFile(path string, logicalSize int64, codec tarstream.Cod
 	} else {
 		target, err = createEncryptedDiffFile(tmp, logicalSize, codec, cryptorand.Reader)
 		if err != nil {
+			return nil, err
+		}
+		if err := target.validateFreshEncryptedBodySparse(); err != nil {
 			return nil, err
 		}
 	}
@@ -524,6 +524,29 @@ func (d *diffFile) scanDirtyBlocks() ([]uint64, error) {
 	return bitmap, nil
 }
 
+// validateFreshEncryptedBodySparse verifies the filesystem contract before a
+// template can allocate legitimate body blocks. A filesystem whose allocation
+// granularity lets the header's data extent cross bodyOffset cannot safely
+// reconstruct the dirty bitmap after reopen, so creation fails closed.
+func (d *diffFile) validateFreshEncryptedBodySparse() error {
+	if !d.encrypted {
+		return nil
+	}
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("vhost: sync encrypted diff header: %w", err)
+	}
+	bitmap, err := d.scanDirtyBlocks()
+	if err != nil {
+		return fmt.Errorf("vhost: validate encrypted diff sparse body: %w", err)
+	}
+	for _, word := range bitmap {
+		if word != 0 {
+			return fmt.Errorf("vhost: filesystem does not preserve the encrypted diff's 4 KiB header/body sparse boundary")
+		}
+	}
+	return nil
+}
+
 func (d *diffFile) punchHole(offset, length int64) error {
 	return unix.Fallocate(int(d.f.Fd()),
 		unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
@@ -676,43 +699,44 @@ func commitFreshDiff(source, destination string) error {
 		return nil
 	}
 
-	// The historical contract treated an existing empty placeholder as a
-	// fresh target. Preserve it under a unique same-directory name while the
-	// already-seeded temporary file makes its no-replace commit. If that commit
-	// loses a race, restore the original placeholder instead of deleting it.
-	info, statErr := os.Lstat(destination)
-	if statErr != nil || !info.Mode().IsRegular() || info.Size() != 0 {
+	// The historical contract treats an existing empty regular file as a
+	// provisioned placeholder. Serialize cooperating creators on its inode,
+	// revalidate the path while holding that lock, then atomically exchange the
+	// seeded temporary file with the placeholder. The post-exchange inode and
+	// size checks catch a non-cooperating path replacement or writer before the
+	// old empty inode is removed.
+	placeholder, openErr := os.OpenFile(destination, os.O_RDWR|unix.O_NOFOLLOW, 0)
+	if openErr != nil {
 		return fmt.Errorf("vhost: commit fresh diff without replacement: %w", err)
 	}
-	directory := filepath.Dir(destination)
-	placeholder, createErr := os.CreateTemp(directory, "."+filepath.Base(destination)+".empty.*.partial")
-	if createErr != nil {
-		return fmt.Errorf("vhost: reserve empty diff placeholder backup: %w", createErr)
+	defer placeholder.Close()
+	if lockErr := unix.Flock(int(placeholder.Fd()), unix.LOCK_EX); lockErr != nil {
+		return fmt.Errorf("vhost: lock empty diff placeholder: %w", lockErr)
 	}
-	backup := placeholder.Name()
-	if closeErr := placeholder.Close(); closeErr != nil {
-		_ = os.Remove(backup)
-		return fmt.Errorf("vhost: close empty diff placeholder backup: %w", closeErr)
+	defer unix.Flock(int(placeholder.Fd()), unix.LOCK_UN)
+	placeholderInfo, statErr := placeholder.Stat()
+	pathInfo, pathErr := os.Lstat(destination)
+	if statErr != nil || pathErr != nil || !placeholderInfo.Mode().IsRegular() ||
+		placeholderInfo.Size() != 0 || !os.SameFile(placeholderInfo, pathInfo) {
+		return fmt.Errorf("vhost: commit fresh diff without replacement: %w", err)
 	}
-	if removeErr := os.Remove(backup); removeErr != nil {
-		return fmt.Errorf("vhost: prepare empty diff placeholder backup: %w", removeErr)
+	if exchangeErr := unix.Renameat2(unix.AT_FDCWD, source, unix.AT_FDCWD, destination, unix.RENAME_EXCHANGE); exchangeErr != nil {
+		return fmt.Errorf("vhost: exchange empty diff placeholder: %w", exchangeErr)
 	}
-	if moveErr := unix.Renameat2(unix.AT_FDCWD, destination, unix.AT_FDCWD, backup, unix.RENAME_NOREPLACE); moveErr != nil {
-		return fmt.Errorf("vhost: preserve empty diff placeholder: %w", moveErr)
-	}
-	err = unix.Renameat2(unix.AT_FDCWD, source, unix.AT_FDCWD, destination, unix.RENAME_NOREPLACE)
-	if err != nil {
-		restoreErr := unix.Renameat2(unix.AT_FDCWD, backup, unix.AT_FDCWD, destination, unix.RENAME_NOREPLACE)
-		if restoreErr != nil {
-			return errors.Join(
-				fmt.Errorf("vhost: commit fresh diff without replacement: %w", err),
-				fmt.Errorf("vhost: restore empty diff placeholder from %s: %w", backup, restoreErr),
-			)
+	rollback := func(cause error) error {
+		rollbackErr := unix.Renameat2(unix.AT_FDCWD, source, unix.AT_FDCWD, destination, unix.RENAME_EXCHANGE)
+		if rollbackErr != nil {
+			return errors.Join(cause, fmt.Errorf("vhost: roll back empty diff placeholder exchange: %w", rollbackErr))
 		}
-		return fmt.Errorf("vhost: commit fresh diff without replacement: %w", err)
+		return cause
 	}
-	if removeErr := os.Remove(backup); removeErr != nil {
-		return fmt.Errorf("vhost: remove committed diff placeholder backup: %w", removeErr)
+	swappedInfo, swappedErr := os.Lstat(source)
+	placeholderInfo, statErr = placeholder.Stat()
+	if swappedErr != nil || statErr != nil || !os.SameFile(placeholderInfo, swappedInfo) || placeholderInfo.Size() != 0 {
+		return rollback(fmt.Errorf("vhost: empty diff placeholder changed during atomic exchange"))
+	}
+	if removeErr := os.Remove(source); removeErr != nil {
+		return rollback(fmt.Errorf("vhost: remove exchanged empty diff placeholder: %w", removeErr))
 	}
 	return nil
 }
