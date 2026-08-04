@@ -199,7 +199,7 @@ func TestSnapshotPublisherChecksPreservedManifestRefs(t *testing.T) {
 	p := newSnapshotPublisher(context.Background(), nil, false, nil)
 	p.fetcher = failingManifestFetcher{}
 	ref := "manifest://" + strings.Repeat("a", 64)
-	_, err := p.publishRef("parent", ref, "", false)
+	_, err := p.publishRef("parent", ref, "", publishLeafArtifact)
 	if err == nil || !strings.Contains(err.Error(), "backend unavailable") {
 		t.Fatalf("publishRef error = %v, want manifest backend check", err)
 	}

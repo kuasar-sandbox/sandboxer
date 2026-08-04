@@ -913,11 +913,7 @@ func handleSnapshotRequest(
 			return ctl.Response{}, fmt.Errorf("snapshot: memory merge base: %w", err)
 		}
 	}
-	resultMemoryRefs := prependRef(prov.ParentSnapshotRef, prov.ParentFromRefs)
-	if mergeMemory {
-		resultMemoryRefs = prov.ParentFromRefs
-	}
-	resultMemoryRefs, err = normalizeLocalMemoryRefs(resultMemoryRefs)
+	resultMemoryRefs, err := snapshotMemoryRefs(prov, mergeMemory)
 	if err != nil {
 		return ctl.Response{}, err
 	}
@@ -1204,6 +1200,17 @@ func validatePortableMemoryRefs(refs []string) error {
 		}
 	}
 	return nil
+}
+
+// snapshotMemoryRefs returns the memory lowers retained by the next snapshot.
+// A local merge replaces only the direct parent self; the parent's existing
+// lowers remain in order and are not recursively compacted.
+func snapshotMemoryRefs(prov config.SnapshotProvenance, mergeLocalParent bool) ([]string, error) {
+	refs := prependRef(prov.ParentSnapshotRef, prov.ParentFromRefs)
+	if mergeLocalParent {
+		refs = append([]string(nil), prov.ParentFromRefs...)
+	}
+	return normalizeLocalMemoryRefs(refs)
 }
 
 func normalizeLocalMemoryRefs(refs []string) ([]string, error) {

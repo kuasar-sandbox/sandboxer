@@ -169,7 +169,7 @@ func TestPublishEncryptedLeafIsByteDeterministic(t *testing.T) {
 	expected := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: sourcePath, DigestScheme: scheme, Digest: digest}
 	p := newSnapshotPublisher(ctx, codec, false, nil)
 	p.location, p.directory = "encrypted", targetDir
-	ref, err := p.publishLeaf("leaf", sourcePath, expected)
+	ref, err := p.publishLeaf("leaf", sourcePath, expected, publishLeafArtifact)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestManifestPublisherFullyAuthenticatesInput(t *testing.T) {
 	}
 	p := newSnapshotPublisher(ctx, codec, false, nil)
 	p.ing = consumingIngester{}
-	if _, err := p.publishSnapshot(rootPath, manifest.Ref{}); !errors.Is(err, tarstream.ErrAuthentication) {
+	if _, err := p.publishRootSnapshot(rootPath, manifest.Ref{}); !errors.Is(err, tarstream.ErrAuthentication) {
 		t.Fatalf("tampered manifest publication error=%v", err)
 	}
 }
