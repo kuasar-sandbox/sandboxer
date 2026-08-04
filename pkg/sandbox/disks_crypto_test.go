@@ -209,6 +209,46 @@ func TestCanonicalizeConfiguredTarRefsConvertsColdChains(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeConfiguredTarRefsAcceptsNamedNodeLocalArtifact(t *testing.T) {
+	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x46})
+	dir := t.TempDir()
+	plainPath, _, plainDigest := writeDiskArtifact(t, dir, "image", bytes.Repeat([]byte{0x31}, 4096), nil)
+	namedPlainPath := filepath.Join(dir, "legacy.erofs")
+	if err := os.Rename(plainPath, namedPlainPath); err != nil {
+		t.Fatal(err)
+	}
+	plainCfg := &config.SandboxConfig{}
+	plainCfg.Boot.Root.Base = "file://" + namedPlainPath
+	if err := canonicalizeConfiguredTarRefs(plainCfg, nil, codec, false); err != nil {
+		t.Fatal(err)
+	}
+	plainRef, err := manifest.ParseRef(plainCfg.Boot.Root.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plainRef.Path != namedPlainPath || plainRef.DigestScheme != tarstream.DigestSchemeHMAC || plainRef.Digest == plainDigest {
+		t.Fatalf("canonical named plaintext ref=%#v", plainRef)
+	}
+
+	contentPath, _, _ := writeDiskArtifact(t, dir, "image", bytes.Repeat([]byte{0x32}, 4096), codec)
+	namedPath := filepath.Join(dir, "app.erofs")
+	if err := os.Rename(contentPath, namedPath); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.SandboxConfig{}
+	cfg.Boot.Root.Base = "file://" + namedPath
+	if err := canonicalizeConfiguredTarRefs(cfg, nil, codec, true); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := manifest.ParseRef(cfg.Boot.Root.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Path != namedPath || ref.DigestScheme != tarstream.DigestSchemeHMAC || ref.Digest == "" {
+		t.Fatalf("canonical named local ref=%#v", ref)
+	}
+}
+
 func TestOpenDiskStreamRejectsEncryptedEnvelopeDamage(t *testing.T) {
 	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x44})
 	dir := t.TempDir()

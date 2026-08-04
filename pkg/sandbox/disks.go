@@ -192,6 +192,12 @@ func validateFileRefIdentity(ref manifest.Ref, path string, stream fetch.Stream,
 		// the tarstream parser, which compares it in constant time.
 		return nil
 	}
+	if ref.Location == "" {
+		// An unqualified node-local path is an explicit provisioning input,
+		// not a content-addressed lookup. Its caller may canonicalize the
+		// identity returned by the stream after this open.
+		return nil
+	}
 
 	realPath := path
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
