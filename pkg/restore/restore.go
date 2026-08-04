@@ -780,11 +780,13 @@ func openRefStream(ctx context.Context, raw string, opts Options) (fetch.Stream,
 	return s, err
 }
 
-// canonicalizeSnapshotTarRefs replaces every local tarstream qualifier with
-// the policy-normalized identity returned by the actual artifact. In auto mode
-// this converts legacy sha256 qualifiers to hmac before provenance or a newly
-// rendered child snapshot can observe them. Paths and locations keep their
-// existing resolution semantics; manifest refs are unchanged.
+// canonicalizeSnapshotTarRefs replaces each selected local tarstream qualifier
+// with the policy-normalized identity returned by the actual artifact. A base
+// ref replaced by a host override is deferred to ApplyRules, which validates
+// the host artifact against that snapshot identity. In auto mode this converts
+// legacy sha256 qualifiers to hmac before provenance or a newly rendered child
+// snapshot can observe them. Paths and locations keep their existing resolution
+// semantics; manifest refs are unchanged.
 func canonicalizeSnapshotTarRefs(ctx context.Context, cfg *SnapshotCfg, opts Options) error {
 	if cfg == nil {
 		return fmt.Errorf("nil snapshot config")
@@ -808,9 +810,11 @@ func canonicalizeSnapshotTarRefs(ctx context.Context, cfg *SnapshotCfg, opts Opt
 		}
 		return nil
 	}
-	normalizeNode := func(label string, baseRef, base *string, chain []string, overlay *SnapOverlayCfg) error {
-		if err := normalize(label+".base_ref", baseRef); err != nil {
-			return err
+	normalizeNode := func(label string, baseRef, base *string, chain []string, overlay *SnapOverlayCfg, baseOverridden bool) error {
+		if !baseOverridden {
+			if err := normalize(label+".base_ref", baseRef); err != nil {
+				return err
+			}
 		}
 		if err := normalize(label+".base", base); err != nil {
 			return err
@@ -829,14 +833,17 @@ func canonicalizeSnapshotTarRefs(ctx context.Context, cfg *SnapshotCfg, opts Opt
 	if err := normalizeList("from_refs", cfg.FromRefs); err != nil {
 		return err
 	}
+	rootBaseOverridden := opts.HostCfg != nil && opts.HostCfg.Boot.Root.Base != "" && !cfg.SingleDisk()
 	if err := normalizeNode("boot.root", &cfg.Boot.Root.BaseRef, &cfg.Boot.Root.Base,
-		cfg.Boot.Root.BaseFromRefs, cfg.Boot.Root.Overlay); err != nil {
+		cfg.Boot.Root.BaseFromRefs, cfg.Boot.Root.Overlay, rootBaseOverridden); err != nil {
 		return err
 	}
 	for i := range cfg.Boot.Disks {
 		node := &cfg.Boot.Disks[i]
+		baseOverridden := opts.HostCfg != nil && i < len(opts.HostCfg.Boot.Disks) &&
+			opts.HostCfg.Boot.Disks[i].Base != "" && !node.single()
 		if err := normalizeNode(fmt.Sprintf("boot.disks[%d]", i), &node.BaseRef, &node.Base,
-			node.BaseFromRefs, node.Overlay); err != nil {
+			node.BaseFromRefs, node.Overlay, baseOverridden); err != nil {
 			return err
 		}
 	}

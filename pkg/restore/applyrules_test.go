@@ -170,6 +170,57 @@ func TestCanonicalizeSnapshotTarRefsConvertsLegacyIdentities(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeSnapshotTarRefsDefersHostBaseOverrides(t *testing.T) {
+	hostDir := t.TempDir()
+	runtimePath := filepath.Join(hostDir, "runtime.erofs")
+	runtimeDigest := writeFile(t, runtimePath, []byte("runtime"))
+	rootPath := filepath.Join(hostDir, "root.img")
+	rootDigest := writeFile(t, rootPath, []byte("root base"))
+	diskPath := filepath.Join(hostDir, "data.img")
+	diskDigest := writeFile(t, diskPath, []byte("data base"))
+
+	rootRef := "file://root.img@sha256:" + rootDigest
+	diskRef := "file://data.img@sha256:" + diskDigest
+	snap := &SnapshotCfg{}
+	snap.Boot.RuntimeRef = "file://runtime.erofs@sha256:" + runtimeDigest
+	snap.Boot.Root.BaseRef = rootRef
+	snap.Boot.Root.Overlay = &SnapOverlayCfg{}
+	snap.Boot.Disks = []SnapDiskNode{{BaseRef: diskRef, Overlay: &SnapOverlayCfg{}}}
+	host := &config.SandboxConfig{}
+	host.Boot.Runtime = "file://" + runtimePath
+	host.Boot.Root.Base = "file://" + rootPath
+	host.Boot.Root.Overlay = &config.OverlayConfig{}
+	host.Boot.Disks = []config.DiskConfig{{RootConfig: config.RootConfig{
+		Base:    "file://" + diskPath,
+		Overlay: &config.OverlayConfig{},
+	}}}
+
+	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x74})
+	bundlePath := filepath.Join(t.TempDir(), "root.snapshot")
+	opts := Options{SnapshotPath: bundlePath, HostCfg: host, LocalCodec: codec}
+	if err := canonicalizeSnapshotTarRefs(context.Background(), snap, opts); err != nil {
+		t.Fatal(err)
+	}
+	if snap.Boot.Root.BaseRef != rootRef || snap.Boot.Disks[0].BaseRef != diskRef {
+		t.Fatalf("deferred base refs changed: root=%q disk=%q", snap.Boot.Root.BaseRef, snap.Boot.Disks[0].BaseRef)
+	}
+
+	merged, err := ApplyRules(host, snap, bundlePath, nil, codec, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := []string{merged.SnapshotRefs.BaseRef, merged.SnapshotRefs.DiskBaseRefs[0]}
+	for i, raw := range refs {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			t.Fatalf("effective ref[%d]: %v", i, err)
+		}
+		if ref.DigestScheme != tarstream.DigestSchemeHMAC {
+			t.Fatalf("effective ref[%d] scheme = %q, want hmac", i, ref.DigestScheme)
+		}
+	}
+}
+
 func TestApplyRules_CapacityMustMatchWhenProvided(t *testing.T) {
 	dir := t.TempDir()
 	rtPath := filepath.Join(dir, "runtime.erofs")
