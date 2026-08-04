@@ -225,7 +225,7 @@ func consumeSource(ctx context.Context, source sparse.Source, start uint64) erro
 					return readErr
 				}
 				if n != int(length) {
-					return fmt.Errorf("short source read")
+					return io.ErrUnexpectedEOF
 				}
 				position += length
 			}

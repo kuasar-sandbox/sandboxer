@@ -3,6 +3,7 @@ package restore
 import (
 	"archive/zip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -420,39 +421,195 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest 
 	basename := digest + ext
 	destination := filepath.Join(p.directory, basename)
 	outputRequired := p.codec != nil
-	if err := os.Chmod(sourcePath, 0o644); err != nil {
-		return "", fmt.Errorf("publish location: set temporary permissions: %w", err)
-	}
 	if err := validatePublishedFinal(p.ctx, sourcePath, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
 		return "", fmt.Errorf("publish location: validate converted output: %w", err)
 	}
-	err := unix.Renameat2(unix.AT_FDCWD, sourcePath, unix.AT_FDCWD, destination, unix.RENAME_NOREPLACE)
-	if err == unix.EEXIST {
-		if validateErr := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); validateErr != nil {
-			return "", fmt.Errorf("publish location: existing final is invalid: %w", validateErr)
+	for {
+		if err := p.ctx.Err(); err != nil {
+			return "", fmt.Errorf("publish location: %w", err)
 		}
+		created, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			if !os.IsExist(err) {
+				return "", fmt.Errorf("publish location: create final exclusively: %w", err)
+			}
+			validateErr := validateAndSyncPublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest)
+			if validateErr == nil {
+				if err := syncLocationDirectory(p.directory); err != nil {
+					return "", fmt.Errorf("publish location: sync parent directory: %w", err)
+				}
+				return p.locatedRef(basename, scheme, digest)
+			}
+			if ctxErr := p.ctx.Err(); ctxErr != nil {
+				return "", fmt.Errorf("publish location: validate existing final: %w", ctxErr)
+			}
+			if errors.Is(validateErr, context.Canceled) || errors.Is(validateErr, context.DeadlineExceeded) {
+				return "", fmt.Errorf("publish location: validate existing final: %w", validateErr)
+			}
+			if os.IsNotExist(validateErr) {
+				continue
+			}
+			if !isConfirmedLocationFinalMismatch(validateErr) {
+				return "", fmt.Errorf("publish location: validate existing final: %w", validateErr)
+			}
+			if err := removeInvalidLocationFile(destination); err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return "", fmt.Errorf("publish location: existing final is invalid (%v) and cannot be replaced: %w", validateErr, err)
+			}
+			continue
+		}
+		ownedInfo, err := created.Stat()
+		if err != nil {
+			_ = created.Close()
+			if removeErr := os.Remove(destination); removeErr != nil && !os.IsNotExist(removeErr) {
+				return "", fmt.Errorf("publish location: stat created final: %v; remove incomplete final: %w", err, removeErr)
+			}
+			return "", fmt.Errorf("publish location: stat created final: %w", err)
+		}
+		owned := true
+		defer func() {
+			if owned {
+				_ = removeOwnedLocationFile(destination, ownedInfo)
+			}
+		}()
+		if err := created.Chmod(0o644); err != nil {
+			_ = created.Close()
+			return "", fmt.Errorf("publish location: set final permissions: %w", err)
+		}
+		if err := copySyncAndCloseLocationFile(p.ctx, created, sourcePath); err != nil {
+			return "", fmt.Errorf("publish location: write final: %w", err)
+		}
+		if err := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
+			return "", fmt.Errorf("publish location: validate final: %w", err)
+		}
+		if err := syncLocationDirectory(p.directory); err != nil {
+			return "", fmt.Errorf("publish location: sync parent directory: %w", err)
+		}
+		owned = false
+		p.logf("upload-snapshot: published %s", destination)
 		return p.locatedRef(basename, scheme, digest)
 	}
+}
+
+var errLocationFinalMismatch = errors.New("location final mismatch")
+
+func isConfirmedLocationFinalMismatch(err error) bool {
+	for _, mismatch := range []error{
+		errLocationFinalMismatch,
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		tarstream.ErrCodecRequired,
+		tarstream.ErrPlaintextForbidden,
+		tarstream.ErrUnsupportedVersion,
+		tarstream.ErrMalformedEnvelope,
+		tarstream.ErrAuthentication,
+		tarstream.ErrDigestMismatch,
+		tarstream.ErrInvalidCanonicalTarstream,
+		tarstream.ErrUnsupportedEncoding,
+		tarstream.ErrNotFound,
+	} {
+		if errors.Is(err, mismatch) {
+			return true
+		}
+	}
+	return false
+}
+
+func removeInvalidLocationFile(path string) error {
+	info, err := os.Lstat(path)
 	if err != nil {
-		return "", fmt.Errorf("publish location: commit without replacement: %w", err)
+		return err
 	}
-	dir, err := os.Open(p.directory)
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("existing final is not a regular file")
+	}
+	return os.Remove(path)
+}
+
+func removeOwnedLocationFile(path string, owned os.FileInfo) error {
+	if owned != nil {
+		current, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(owned, current) {
+			return fmt.Errorf("final path is now owned by another publisher")
+		}
+	}
+	return os.Remove(path)
+}
+
+// publishLocationCopy is a test seam for failures after the publisher owns the
+// exclusively-created final. Production copies are sequential and cancellable.
+var publishLocationCopy = copyLocationContents
+
+func copySyncAndCloseLocationFile(ctx context.Context, destination *os.File, sourcePath string) error {
+	source, err := os.Open(sourcePath)
 	if err != nil {
-		return "", fmt.Errorf("publish location: open parent directory: %w", err)
+		_ = destination.Close()
+		return err
 	}
-	syncErr := dir.Sync()
-	closeErr := dir.Close()
-	if syncErr != nil {
-		return "", fmt.Errorf("publish location: sync parent directory: %w", syncErr)
+	info, statErr := source.Stat()
+	var copied int64
+	if statErr == nil {
+		copied, err = publishLocationCopy(ctx, destination, source)
 	}
-	if closeErr != nil {
-		return "", fmt.Errorf("publish location: close parent directory: %w", closeErr)
+	sourceCloseErr := source.Close()
+	if statErr != nil {
+		err = statErr
+	} else if err == nil && copied != info.Size() {
+		err = fmt.Errorf("short copy: wrote %d of %d bytes", copied, info.Size())
+	} else if err == nil && sourceCloseErr != nil {
+		err = sourceCloseErr
 	}
-	p.logf("upload-snapshot: published %s", destination)
-	return p.locatedRef(basename, scheme, digest)
+	if err == nil {
+		err = destination.Sync()
+	}
+	closeErr := destination.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
+func copyLocationContents(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {
+	buf := make([]byte, 128*1024)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		n, readErr := source.Read(buf)
+		if n > 0 {
+			written, writeErr := destination.Write(buf[:n])
+			total += int64(written)
+			if writeErr != nil {
+				return total, writeErr
+			}
+			if written != n {
+				return total, io.ErrShortWrite
+			}
+		}
+		if readErr == io.EOF {
+			return total, nil
+		}
+		if readErr != nil {
+			return total, readErr
+		}
+	}
 }
 
 func validatePublishedFinal(ctx context.Context, path string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string) error {
+	return validatePublishedFinalFile(ctx, path, logicalSize, codec, required, scheme, digest, false)
+}
+
+func validateAndSyncPublishedFinal(ctx context.Context, path string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string) error {
+	return validatePublishedFinalFile(ctx, path, logicalSize, codec, required, scheme, digest, true)
+}
+
+func validatePublishedFinalFile(ctx context.Context, path string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string, syncFile bool) error {
 	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return protectArtifactReadError(codec, "open existing final", err)
@@ -463,7 +620,7 @@ func validatePublishedFinal(ctx context.Context, path string, logicalSize uint64
 		return err
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("existing final is not a regular file")
+		return fmt.Errorf("%w: existing final is not a regular file", errLocationFinalMismatch)
 	}
 	var options []tarstream.ReadOption
 	if codec != nil {
@@ -475,9 +632,30 @@ func validatePublishedFinal(ctx context.Context, path string, logicalSize uint64
 		return err
 	}
 	if source.Size() != logicalSize {
-		return fmt.Errorf("existing final logical size mismatch")
+		return fmt.Errorf("%w: existing final logical size", errLocationFinalMismatch)
 	}
-	return consumeSource(ctx, source, 0)
+	if err := consumeSource(ctx, source, 0); err != nil {
+		return err
+	}
+	if syncFile {
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("sync existing final: %w", err)
+		}
+	}
+	return nil
+}
+
+func syncLocationDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 func (p *snapshotPublisher) locatedRef(basename, scheme, digest string) (string, error) {
