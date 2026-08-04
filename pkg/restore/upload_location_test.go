@@ -62,8 +62,18 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRejectsInconsistentFinal(t *t
 	if _, err := os.Stat(publishedBase); err != nil {
 		t.Fatalf("published EROFS base: %v", err)
 	}
+	publishedRoot := filepath.Join(targetDir, parsedRoot.Path)
+	for _, path := range []string{publishedRoot, publishedOverlay, publishedBase} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o644 {
+			t.Fatalf("published mode for %s = %o, want 644", filepath.Base(path), got)
+		}
+	}
 
-	rootStream, _, _, err := openTarArtifact(filepath.Join(targetDir, parsedRoot.Path), manifest.Ref{}, nil, false)
+	rootStream, _, _, err := openTarArtifact(publishedRoot, manifest.Ref{}, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}

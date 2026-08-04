@@ -362,6 +362,9 @@ func (p *snapshotPublisher) publishLeaf(label, path string, expected manifest.Re
 func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest string, logicalSize uint64) (string, error) {
 	basename := digest + ext
 	destination := filepath.Join(p.directory, basename)
+	if err := os.Chmod(sourcePath, 0o644); err != nil {
+		return "", fmt.Errorf("publish location: set temporary permissions: %w", err)
+	}
 	if err := validatePublishedFinal(p.ctx, sourcePath, logicalSize, p.codec, p.required, scheme, digest); err != nil {
 		return "", fmt.Errorf("publish location: validate converted output: %w", err)
 	}
@@ -375,9 +378,17 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest 
 	if err != nil {
 		return "", fmt.Errorf("publish location: commit without replacement: %w", err)
 	}
-	if dir, openErr := os.Open(p.directory); openErr == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
+	dir, err := os.Open(p.directory)
+	if err != nil {
+		return "", fmt.Errorf("publish location: open parent directory: %w", err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return "", fmt.Errorf("publish location: sync parent directory: %w", syncErr)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("publish location: close parent directory: %w", closeErr)
 	}
 	p.logf("upload-snapshot: published %s", destination)
 	return p.locatedRef(basename, scheme, digest)

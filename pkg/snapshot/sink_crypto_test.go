@@ -117,6 +117,30 @@ func TestEncryptedFileSinkRejectsInconsistentExistingFinal(t *testing.T) {
 	}
 }
 
+func TestFileSinkUsesUniqueTemporaryFiles(t *testing.T) {
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "same.overlay.partial")
+	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, final, err := NewFileSink(dir, "same", nil, false, nil).AbsorbOverlay(
+		context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x71}, 4096)), nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body, err := os.ReadFile(stale); err != nil || string(body) != "stale" {
+		t.Fatalf("stale partial changed: %q err=%v", body, err)
+	}
+	info, err := os.Stat(final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("final mode = %o, want 644", got)
+	}
+}
+
 func TestFileSinkPolicyAndKeyIdentity(t *testing.T) {
 	payload := bytes.Repeat([]byte{0x7b}, 4096)
 	ctx := context.Background()

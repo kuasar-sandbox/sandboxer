@@ -102,25 +102,29 @@ func (s *FileSink) AbsorbBundle(ctx context.Context, mem io.ReadSeeker, holes []
 }
 
 // writeArtifact packs src as a tarstream artifact (payload named kind plus a
-// digest marker) at <sid>.<kind>.partial, hashing the prefix while writing, then
-// commits without replacement to <digest>.<kind>. Only data extents flow (holes ride the envelope
-// map); the artifact file itself is dense and survives non-sparse-aware
-// copies and filesystems.
+// digest marker) at a unique same-directory temporary path, hashing the prefix
+// while writing, then commits without replacement to <digest>.<kind>. Only data
+// extents flow (holes ride the envelope map); the artifact file itself is dense
+// and survives non-sparse-aware copies and filesystems.
 func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.Source) (string, string, string, error) {
 	if s.required && s.codec == nil {
 		return "", "", "", fmt.Errorf("pack %s: required policy has no codec", kind)
 	}
-	tmp := filepath.Join(s.outDir, s.sandboxID+"."+kind+".partial")
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	f, err := os.CreateTemp(s.outDir, s.sandboxID+"."+kind+".*.partial")
 	if err != nil {
 		return "", "", "", err
 	}
+	tmp := f.Name()
 	keepTmp := false
 	defer func() {
 		if !keepTmp {
 			_ = os.Remove(tmp)
 		}
 	}()
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		return "", "", "", fmt.Errorf("set %s temporary permissions: %w", kind, err)
+	}
 	var options []tarstream.WriteOption
 	if s.codec != nil {
 		options = append(options, tarstream.WithCodec(s.codec, s.required))
@@ -149,9 +153,17 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 		return "", "", "", fmt.Errorf("commit %s without replacement: %w", kind, err)
 	}
 	keepTmp = true // rename consumed the path; deferred cleanup has nothing to remove
-	if dir, openErr := os.Open(s.outDir); openErr == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
+	dir, err := os.Open(s.outDir)
+	if err != nil {
+		return "", "", "", fmt.Errorf("open snapshot output directory: %w", err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return "", "", "", fmt.Errorf("sync snapshot output directory: %w", syncErr)
+	}
+	if closeErr != nil {
+		return "", "", "", fmt.Errorf("close snapshot output directory: %w", closeErr)
 	}
 	return scheme, digest, final, nil
 }
