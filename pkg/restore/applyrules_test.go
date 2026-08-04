@@ -170,6 +170,27 @@ func TestCanonicalizeSnapshotTarRefsConvertsLegacyIdentities(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeSnapshotTarRefsPreservesAbsolutePath(t *testing.T) {
+	dir := t.TempDir()
+	path, tagged := writePublishArtifact(t, dir, ".snapshot", bytes.Repeat([]byte{0x38}, 4096))
+	plainDigest := strings.TrimPrefix(tagged, "sha256:")
+	cfg := &SnapshotCfg{FromRefs: []string{"file://" + path + "@sha256:" + plainDigest}}
+	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x75})
+	if err := canonicalizeSnapshotTarRefs(context.Background(), cfg, Options{LocalCodec: codec}); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := manifest.ParseRef(cfg.FromRefs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Path != path {
+		t.Fatalf("canonical path = %q, want %q", ref.Path, path)
+	}
+	if ref.DigestScheme != tarstream.DigestSchemeHMAC || ref.Digest == plainDigest {
+		t.Fatalf("canonical identity = %#v", ref)
+	}
+}
+
 func TestCanonicalizeSnapshotTarRefsDefersHostBaseOverrides(t *testing.T) {
 	hostDir := t.TempDir()
 	runtimePath := filepath.Join(hostDir, "runtime.erofs")

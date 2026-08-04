@@ -874,9 +874,6 @@ func canonicalizeSnapshotTarRef(ctx context.Context, raw string, opts Options) (
 		return "", closeErr
 	}
 	ref.DigestScheme, ref.Digest = scheme, digest
-	if ref.Location == "" {
-		ref.Path = filepath.Base(ref.Path)
-	}
 	if err := ref.Validate(); err != nil {
 		return "", fmt.Errorf("invalid canonical artifact ref")
 	}
