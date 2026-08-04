@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
-	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"gopkg.in/yaml.v3"
@@ -97,7 +97,7 @@ func ParseSnapshotCfg(body []byte) (*SnapshotCfg, error) {
 // runtime/base ref fields explicitly.
 //
 // Returns the merged config.SandboxConfig the lifecycle should run with.
-func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string, locations config.RefLocations) (*config.SandboxConfig, error) {
+func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string, locations config.RefLocations, codec tarstream.Codec, required bool) (*config.SandboxConfig, error) {
 	if host == nil {
 		return nil, errors.New("ApplyRules: host config is nil")
 	}
@@ -167,9 +167,9 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 		// captured upper diff (overlay.base) is used raw via OpenDiskStream.
 		snapBaseRef, err := manifest.ParseRef(snap.Boot.Root.BaseRef)
 		if err != nil {
-			return nil, fmt.Errorf("snapshot.cfg.base_ref: %w", err)
+			return nil, protectArtifactReadError(codec, "snapshot.cfg.base_ref", err)
 		}
-		resolvedBase, err := resolveAnyRef(host.Boot.Root.Base, snapBaseRef, snapshotPath, "boot.root.base", locations)
+		resolvedBase, err := resolveAnyRef(host.Boot.Root.Base, snapBaseRef, snapshotPath, "boot.root.base", locations, codec, required)
 		if err != nil {
 			return nil, err
 		}
@@ -209,9 +209,9 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 			} else {
 				snapBaseRef, err := manifest.ParseRef(sd.BaseRef)
 				if err != nil {
-					return nil, fmt.Errorf("snapshot.cfg.%s.base_ref: %w", field, err)
+					return nil, protectArtifactReadError(codec, "snapshot.cfg "+field+".base_ref", err)
 				}
-				resolvedBase, err := resolveAnyRef(hd.Base, snapBaseRef, snapshotPath, field+".base", locations)
+				resolvedBase, err := resolveAnyRef(hd.Base, snapBaseRef, snapshotPath, field+".base", locations, codec, required)
 				if err != nil {
 					return nil, err
 				}
@@ -246,8 +246,8 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 //   - host non-empty: parse host URL → file path and verify
 //     basename(path) == ref.Basename.
 //   - the embedded marker must match ref.Digest.
-func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fieldName string, readDigest func(string) (string, error), locations config.RefLocations) (string, error) {
-	snapDigest, err := tartransition.SHA256RefDigest(snapRef)
+func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fieldName string, readDigest func(string) (string, string, error), locations config.RefLocations) (string, error) {
+	snapScheme, snapDigest, err := normalizedRefIdentity(snapRef, nil, false)
 	if err != nil {
 		return "", fmt.Errorf("%s: snapshot ref uses an unsupported digest scheme: %w", fieldName, err)
 	}
@@ -263,7 +263,7 @@ func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fiel
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", fieldName, err)
 		}
-		if err := validateResolvedFileRef(abs, snapRef, snapDigest, readDigest, locations); err != nil {
+		if err := validateResolvedFileRef(abs, snapScheme, snapDigest, readDigest); err != nil {
 			return "", fmt.Errorf("%s: auto-resolved %s: %w", fieldName, abs, err)
 		}
 		if snapRef.Location != "" {
@@ -274,9 +274,9 @@ func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fiel
 
 	hostRef, err := manifest.ParseRef(hostURL)
 	if err != nil || hostRef.Scheme != manifest.RefSchemeFile {
-		return "", fmt.Errorf("%s: scheme mismatch with snapshot.cfg (host=%q, snap=file://)", fieldName, hostURL)
+		return "", fmt.Errorf("%s: scheme mismatch with snapshot.cfg (want file://)", fieldName)
 	}
-	hostDigest, err := tartransition.SHA256RefDigest(hostRef)
+	hostScheme, hostDigest, err := normalizedRefIdentity(hostRef, nil, false)
 	if err != nil {
 		return "", fmt.Errorf("%s: host ref uses an unsupported digest scheme: %w", fieldName, err)
 	}
@@ -290,11 +290,11 @@ func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fiel
 	if filepath.Base(hostPath) != snapRef.Path {
 		return "", fmt.Errorf("%s: basename mismatch with snapshot.cfg (host=%q, snap=%q)", fieldName, filepath.Base(hostPath), snapRef.Path)
 	}
-	if err := validateResolvedFileRef(hostPath, hostRef, snapDigest, readDigest, locations); err != nil {
+	if err := validateResolvedFileRef(hostPath, snapScheme, snapDigest, readDigest); err != nil {
 		return "", fmt.Errorf("%s: digest mismatch: %w", fieldName, err)
 	}
 	if hostDigest != "" {
-		if err := validateResolvedFileRef(hostPath, hostRef, hostDigest, readDigest, locations); err != nil {
+		if err := validateResolvedFileRef(hostPath, hostScheme, hostDigest, readDigest); err != nil {
 			return "", fmt.Errorf("%s: host ref digest mismatch: %w", fieldName, err)
 		}
 	}
@@ -306,10 +306,10 @@ func resolveBootFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fiel
 
 // resolveAnyRef handles either file:// or manifest:// refs (used by
 // boot.root.base which accepts both).
-func resolveAnyRef(hostURL string, snapRef manifest.Ref, snapshotPath, fieldName string, locations config.RefLocations) (string, error) {
+func resolveAnyRef(hostURL string, snapRef manifest.Ref, snapshotPath, fieldName string, locations config.RefLocations, codec tarstream.Codec, required bool) (string, error) {
 	switch snapRef.Scheme {
 	case "file":
-		return resolveBootFileRef(hostURL, snapRef, snapshotPath, fieldName, readTarArtifactDigest, locations)
+		return resolveTarFileRef(hostURL, snapRef, snapshotPath, fieldName, locations, codec, required)
 	case "manifest":
 		if hostURL == "" {
 			return snapRef.String(), nil
@@ -327,34 +327,94 @@ func resolveAnyRef(hostURL string, snapRef manifest.Ref, snapshotPath, fieldName
 	}
 }
 
-func validateResolvedFileRef(path string, ref manifest.Ref, want string, readDigest func(string) (string, error), locations config.RefLocations) error {
-	var (
-		got string
-		err error
-	)
-	if ref.Location == "" {
-		got, err = readDigest(path)
-	} else {
-		stream, _, openErr := sandbox.OpenDiskStream(context.Background(), ref.String(), nil, locations)
-		if openErr != nil {
-			return openErr
-		}
-		var ok bool
-		got, ok, err = tartransition.Digest(stream)
-		if err != nil {
-			_ = stream.Close()
-			return fmt.Errorf("file artifact %s has invalid declared digest: %w", path, err)
-		}
-		if !ok {
-			_ = stream.Close()
-			return fmt.Errorf("file artifact %s has no declared digest", path)
-		}
-		err = stream.Close()
+func resolveTarFileRef(hostURL string, snapRef manifest.Ref, snapshotPath, fieldName string, locations config.RefLocations, codec tarstream.Codec, required bool) (string, error) {
+	bundleDir := ""
+	if snapshotPath != "" {
+		bundleDir = filepath.Dir(snapshotPath)
 	}
+	if hostURL == "" {
+		if snapshotPath == "" && snapRef.Location == "" && !filepath.IsAbs(snapRef.Path) {
+			return "", fmt.Errorf("%s: snapshot.cfg ref is file:// but bundle is manifest-loaded; provide %s explicitly", fieldName, fieldName)
+		}
+		path, err := locations.ResolveFile(snapRef, bundleDir)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", fieldName, err)
+		}
+		scheme, digest, err := validateTarFileRef(path, snapRef, locations, codec, required)
+		if err != nil {
+			return "", fmt.Errorf("%s: auto-resolved file artifact: %w", fieldName, err)
+		}
+		resolved := snapRef
+		resolved.DigestScheme, resolved.Digest = scheme, digest
+		if resolved.Location == "" {
+			resolved.Path = path
+		}
+		return resolved.String(), nil
+	}
+
+	hostRef, err := manifest.ParseRef(hostURL)
+	if err != nil || hostRef.Scheme != manifest.RefSchemeFile {
+		return "", fmt.Errorf("%s: scheme mismatch with snapshot.cfg (want file://)", fieldName)
+	}
+	hostPath, err := locations.ResolveFile(hostRef, "")
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", fieldName, err)
+	}
+	if !filepath.IsAbs(hostPath) {
+		return "", fmt.Errorf("%s: file:// must be absolute or located", fieldName)
+	}
+	if filepath.Base(hostPath) != filepath.Base(snapRef.Path) {
+		return "", fmt.Errorf("%s: basename mismatch with snapshot.cfg", fieldName)
+	}
+	if hostRef.Digest != "" {
+		if _, _, err := validateTarFileRef(hostPath, hostRef, locations, codec, required); err != nil {
+			return "", fmt.Errorf("%s: host ref: %w", fieldName, err)
+		}
+	}
+	snapshotIdentity := snapRef
+	snapshotIdentity.Location = ""
+	snapshotIdentity.Path = hostPath
+	scheme, digest, err := validateTarFileRef(hostPath, snapshotIdentity, nil, codec, required)
+	if err != nil {
+		return "", fmt.Errorf("%s: snapshot ref: %w", fieldName, err)
+	}
+	resolved := hostRef
+	resolved.DigestScheme, resolved.Digest = scheme, digest
+	if resolved.Location == "" {
+		resolved.Path = hostPath
+	}
+	return resolved.String(), nil
+}
+
+func validateTarFileRef(path string, ref manifest.Ref, locations config.RefLocations, codec tarstream.Codec, required bool) (string, string, error) {
+	openRef := ref
+	if openRef.Location == "" {
+		openRef.Path = path
+	}
+	stream, _, err := sandbox.OpenDiskStream(context.Background(), openRef.String(), nil, locations, codec, required)
+	if err != nil {
+		return "", "", err
+	}
+	scheme, digest, err := sourceDigest(stream)
+	closeErr := stream.Close()
+	if err != nil {
+		return "", "", err
+	}
+	if closeErr != nil {
+		return "", "", closeErr
+	}
+	return scheme, digest, nil
+}
+
+func validateResolvedFileRef(path, wantScheme, wantDigest string, readDigest func(string) (string, string, error)) error {
+	gotScheme, gotDigest, err := readDigest(path)
 	if err != nil {
 		return err
 	}
-	return matchDigest(got, want)
+	if wantDigest == "" {
+		return nil
+	}
+	return matchDigest(gotScheme, gotDigest, wantScheme, wantDigest)
 }
 
 func parseSnapshotRuntimeRef(raw string) (manifest.Ref, error) {
@@ -367,6 +427,9 @@ func parseSnapshotRuntimeRef(raw string) (manifest.Ref, error) {
 	}
 	if ref.Location != "" {
 		return manifest.Ref{}, fmt.Errorf("named ref locations are not supported")
+	}
+	if ref.DigestScheme != tarstream.DigestSchemeSHA256 || ref.Digest == "" {
+		return manifest.Ref{}, fmt.Errorf("sha256 digest qualifier is required")
 	}
 	return ref, nil
 }
@@ -382,10 +445,12 @@ func effectiveSnapshotBaseRef(raw string, snapRef manifest.Ref) (string, error) 
 	if ref.Scheme == manifest.RefSchemeManifest {
 		return snapRef.String(), nil
 	}
-	digest, err := tartransition.SHA256RefDigest(snapRef)
-	if err != nil {
+	ref.Path = filepath.Base(ref.Path)
+	if ref.Digest == "" {
+		return "", fmt.Errorf("effective file ref has no digest identity")
+	}
+	if err := ref.Validate(); err != nil {
 		return "", err
 	}
-	ref.Path = filepath.Base(ref.Path)
-	return tartransition.SHA256RefString(ref, digest)
+	return ref.String(), nil
 }

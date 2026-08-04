@@ -20,7 +20,7 @@ import (
 func snapshotCmd(args []string) int {
 	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
 	sandboxID := fs.String("sandbox-id", "", "target sandbox id (required)")
-	outDir := fs.String("output", "", "local output dir; produces <sid>.snapshot + <sha256>.overlay")
+	outDir := fs.String("output", "", "local output dir; produces <sid>.snapshot + scheme-qualified content-addressed artifacts")
 	upload := fs.Bool("upload", false, "ingest snapshot bundle + overlay into manifest store; stdout = snapshot manifest key")
 	resume := fs.Bool("resume", false, "keep sandbox running after snapshot (default: destroy via /vm.shutdown)")
 	dropCaches := fs.Bool("drop-caches", true, "drop guest page, inode, and dentry caches before snapshot")

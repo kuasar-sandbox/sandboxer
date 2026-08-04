@@ -14,6 +14,9 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
@@ -40,7 +43,7 @@ func runCmd(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 
 	configPath := fs.String("config", "", "sandbox.yaml path(s), ':'-separated, merged front-to-back (or SANDBOX_CONFIG env)")
-	manifestPath := fs.String("manifest-config", "", "path to manifest config YAML (overrides MANIFEST_CONFIG env; required for manifest:// resources)")
+	manifestPath := fs.String("manifest-config", "", "path to storage config YAML (overrides MANIFEST_CONFIG env; required for manifest:// or crypto.local=auto|required)")
 	sandboxID := fs.String("sandbox-id", "", "sandbox id (overrides sandbox.yaml)")
 	chBinary := fs.String("ch-binary", "", "path to cloud-hypervisor binary (default: SANDBOX_CH_PATH env, exe-dir, or PATH)")
 	runRoot := fs.String("run-root", "", "tmpfs run root: sockets + snap staging (overrides SANDBOX_RUN_ROOT env; default /run/sandbox)")
@@ -235,6 +238,17 @@ func runCmd(args []string) int {
 		}
 		manifestCfg = nil
 	}
+	keyFn, localCodec, localRequired, err := storageOptions(manifestCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[sandbox-ctl] local crypto: %v\n", err)
+		return 1
+	}
+	var manifestFetcher fetch.Fetcher
+	if manifestCfg != nil {
+		lazy := &onDemandManifestFetcher{cfg: manifestCfg, keyFn: keyFn}
+		manifestFetcher = lazy
+		defer lazy.Close()
+	}
 
 	// cgroup overrides.
 	if *cgroupPath != "" {
@@ -261,12 +275,17 @@ func runCmd(args []string) int {
 	// Restore mode dispatch.
 	if restoreR != "" {
 		return runRestore(ctx, cfg, manifestCfg, restoreR,
-			*sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations, notifyReadiness)
+			*sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
+			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness)
 	}
 
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
 		Cfg:                cfg,
 		ManifestCfg:        manifestCfg,
+		Fetcher:            manifestFetcher,
+		CustomerKeyFn:      keyFn,
+		LocalCodec:         localCodec,
+		LocalRequired:      localRequired,
 		RefLocations:       refLocations,
 		SandboxID:          *sandboxID,
 		CHBinary:           chBin,
@@ -290,6 +309,7 @@ func runCmd(args []string) int {
 func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *config.ManifestConfig,
 	ref string, sandboxID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
+	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
 	notifyReadiness sandbox.ReadinessNotify,
 ) int {
 	// Validate host-only restore policy before inspecting the remote reference or
@@ -333,19 +353,6 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 		snapshotPath = ref
 	}
 
-	var (
-		fetcher manifest.FetcherCloser
-		err     error
-	)
-	if manifestCfg != nil {
-		fetcher, err = manifestCfg.NewFetcher()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		defer fetcher.Close()
-	}
-
 	exit, err := restore.Run(ctx, restore.Options{
 		SnapshotPath:        snapshotPath,
 		SnapshotManifestKey: snapshotKey,
@@ -353,6 +360,9 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 		HostCfg:             cfg,
 		ManifestCfg:         manifestCfg,
 		Fetcher:             fetcher,
+		CustomerKeyFn:       keyFn,
+		LocalCodec:          localCodec,
+		LocalRequired:       localRequired,
 		RefLocations:        refLocations,
 		SandboxID:           sandboxID,
 		CHBinary:            chBin,

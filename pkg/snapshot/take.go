@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 )
 
@@ -34,7 +35,7 @@ type Quiescer interface {
 // Sources gathers the inputs Take needs.
 //
 // SnapshotCfg is rendered late (Take calls it with the final overlay.base
-// ref — file://<sha>.overlay or manifest://<key>) because that ref depends
+// ref — a scheme-qualified file ref or manifest://<key>) because that ref depends
 // on how the overlay was absorbed by the sink.
 type Sources struct {
 	SandboxID  string // <sid> for output filename / symlink
@@ -53,8 +54,8 @@ type Sources struct {
 	// forced. From config.SandboxConfig.CHApiDeadline() (timeouts.ch_api).
 	CHApiDeadline time.Duration
 
-	// MergeBaseSnapshot is the parent LOCAL <sha>.snapshot abs path this run was
-	// restored from (memory section = [0,MemfdSize)). When set, Take flattens
+	// MergeBaseSnapshot is the parent local snapshot's already-resolved,
+	// scheme-qualified file ref (memory section = [0,MemfdSize)). When set, Take flattens
 	// this run's resident memory delta ONTO it and absorbs the merged result as
 	// the new top — replacing the next-newest local layer instead of stacking
 	// (docs §3.5). Per-disk overlay flattening is driven by DiskDiff.MergeBase.
@@ -65,16 +66,18 @@ type Sources struct {
 	// logical disk, in Diffs order).
 	SnapshotCfg func(overlayRefs []string) ([]byte, error)
 
-	Quiescer Quiescer
-	Logf     func(string, ...any)
+	Quiescer      Quiescer
+	Logf          func(string, ...any)
+	LocalCodec    tarstream.Codec
+	LocalRequired bool
 }
 
 // DiskDiff is one logical disk's writable diff to capture. SnapshotView is the
 // live COW's upper-only logical source; Path is retained for diagnostics and
 // lifecycle bookkeeping, never reopened as snapshot data. Owned marks an
 // auto-created diff eligible for cleanup. MergeBase, when set (local-parent
-// re-export), is the parent's local overlay file path this disk's delta is
-// flattened onto (replace, not stack).
+// re-export), is the parent's already-resolved, scheme-qualified local overlay
+// ref this disk's delta is flattened onto (replace, not stack).
 type DiskDiff struct {
 	Path         string
 	Owned        bool
@@ -83,7 +86,7 @@ type DiskDiff struct {
 }
 
 // Outputs describes what was produced. Refs are scheme-tagged
-// (file://<sha>.ext | manifest://<key>); Path is the local file (file mode
+// (scheme-qualified file ref | manifest://<key>); Path is the local file (file mode
 // only, "" for upload). The handler maps these into the ctl.Response.
 type Outputs struct {
 	OverlayRefs  []string // one per logical disk, in Diffs order
@@ -130,11 +133,12 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	}
 	pausedAt := time.Now()
 	resumed := false
+	succeeded := false
 	defer func() {
-		// resume_after=false (destroy mode) is handled by the caller via
-		// /vm.shutdown after Take returns; here we only resume on the
-		// resume_after=true path.
-		if !resumed && resumeAfter {
+		// A failed snapshot always leaves the sandbox running, so undo the CH
+		// pause even on the destroy-on-success path. Successful destroy mode is
+		// handled by the caller via /vmm.shutdown and deliberately stays paused.
+		if !resumed && (!succeeded || resumeAfter) {
 			_ = ch.Resume()
 		}
 	}()
@@ -168,7 +172,7 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	out.OverlayRefs = make([]string, len(s.Diffs))
 	out.OverlayPaths = make([]string, len(s.Diffs))
 	for i, d := range s.Diffs {
-		ref, path, err := absorbOverlay(ctx, sink, d, d.MergeBase != "")
+		ref, path, err := absorbOverlay(ctx, sink, d, d.MergeBase != "", s.LocalCodec, s.LocalRequired)
 		if err != nil {
 			return nil, fmt.Errorf("disk %d: %w", i, err)
 		}
@@ -198,7 +202,7 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	var memSrc io.ReadSeeker = memfdReader(s.MemfdFD, s.MemfdSize)
 	memSrcHoles := memHoles
 	if s.MergeBaseSnapshot != "" {
-		base, baseHoles, berr := openMergeBase(s.MergeBaseSnapshot, s.MemfdSize)
+		base, baseHoles, berr := openMergeBase(s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired)
 		if berr != nil {
 			return nil, fmt.Errorf("merge memory base: %w", berr)
 		}
@@ -224,12 +228,13 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	out.WallclockPauseMs = pausedAt.Sub(pauseStart).Milliseconds()
 	out.WallclockDumpMs = dumpEnd.Sub(dumpStart).Milliseconds()
 	logf("snapshot: overlays=%v snapshot=%s memory_resident=%d", out.OverlayRefs, out.SnapshotRef, out.MemoryResident)
+	succeeded = true
 	return out, nil
 }
 
 // absorbOverlay streams one disk's diff to the sink, optionally flattening it
 // onto the parent's local overlay (merge, replacing the parent layer).
-func absorbOverlay(ctx context.Context, sink SnapshotSink, d DiskDiff, merging bool) (string, string, error) {
+func absorbOverlay(ctx context.Context, sink SnapshotSink, d DiskDiff, merging bool, codec tarstream.Codec, required bool) (string, string, error) {
 	if d.SnapshotView == nil {
 		return "", "", fmt.Errorf("snapshot diff %s has no snapshot view", d.Path)
 	}
@@ -244,7 +249,7 @@ func absorbOverlay(ctx context.Context, sink SnapshotSink, d DiskDiff, merging b
 	var src io.ReadSeeker = diff
 	holes := overlayHoles
 	if merging {
-		base, baseHoles, berr := openMergeBase(d.MergeBase, size)
+		base, baseHoles, berr := openMergeBase(d.MergeBase, size, codec, required)
 		if berr != nil {
 			return "", "", fmt.Errorf("merge overlay base: %w", berr)
 		}

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,39 +16,40 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 func TestValidateLocalMemoryRefsUsesOutputBundleDirectory(t *testing.T) {
 	out := t.TempDir()
-	name := "base.snapshot"
+	path, scheme, digest := writeDiskArtifact(t, out, "snapshot", []byte("artifact"), nil)
+	name := filepath.Base(path)
 	manifestRef := "manifest://" + strings.Repeat("a", 64)
 	locatedRef := "file://located.snapshot@location:parent"
-	if err := os.WriteFile(filepath.Join(out, name), []byte("artifact"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	refs := []string{
-		"file:///different/source/" + name,
+		fileRef(filepath.Join("/different/source", name), scheme, digest),
 		manifestRef,
 		locatedRef,
 	}
-	if err := validateLocalMemoryRefs(out, refs); err != nil {
+	if err := validateLocalMemoryRefs(out, refs, nil, false); err != nil {
 		t.Fatalf("validateLocalMemoryRefs() error = %v", err)
 	}
 
 	if err := os.Symlink(name, filepath.Join(out, "alias.snapshot")); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateLocalMemoryRefs(out, []string{"file://alias.snapshot"}); err != nil {
+	if err := validateLocalMemoryRefs(out, []string{"file://alias.snapshot"}, nil, false); err != nil {
 		t.Fatalf("accessible sibling symlink should be accepted: %v", err)
 	}
 
-	err := validateLocalMemoryRefs(out, []string{"file://missing.snapshot"})
-	if err == nil || !strings.Contains(err.Error(), `file://missing.snapshot`) ||
-		!strings.Contains(err.Error(), filepath.Join(out, "missing.snapshot")) {
+	err := validateLocalMemoryRefs(out, []string{"file://missing.snapshot"}, nil, false)
+	if err == nil || !strings.Contains(err.Error(), "not accessible") {
 		t.Fatalf("missing local memory ref error = %v", err)
 	}
 }
@@ -77,11 +80,38 @@ func TestValidateLocalMemoryRefsRejectsNonRegularFiles(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			err := validateLocalMemoryRefs(out, []string{"file://base.snapshot"})
+			err := validateLocalMemoryRefs(out, []string{"file://base.snapshot"}, nil, false)
 			if err == nil || !strings.Contains(err.Error(), "is not a regular file") {
 				t.Fatalf("non-regular local memory ref error = %v", err)
 			}
 		})
+	}
+}
+
+func TestValidateLocalMemoryRefsEnforcesCryptoPolicy(t *testing.T) {
+	out := t.TempDir()
+	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x51})
+	wrongCodec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x52})
+	plainPath, plainScheme, plainDigest := writeDiskArtifact(t, out, "snapshot", []byte("plain memory"), nil)
+	otherPath, _, _ := writeDiskArtifact(t, out, "snapshot", []byte("other memory"), nil)
+	encryptedPath, encryptedScheme, encryptedDigest := writeDiskArtifact(t, out, "snapshot", []byte("encrypted memory"), codec)
+	plainRef := fileRef(plainPath, plainScheme, plainDigest)
+	encryptedRef := fileRef(encryptedPath, encryptedScheme, encryptedDigest)
+
+	if err := validateLocalMemoryRefs(out, []string{plainRef}, codec, false); err != nil {
+		t.Fatalf("auto rejected plaintext memory dependency: %v", err)
+	}
+	if err := validateLocalMemoryRefs(out, []string{plainRef}, codec, true); err == nil {
+		t.Fatal("required accepted plaintext memory dependency")
+	}
+	if err := validateLocalMemoryRefs(out, []string{encryptedRef}, codec, true); err != nil {
+		t.Fatalf("required rejected encrypted memory dependency: %v", err)
+	}
+	if err := validateLocalMemoryRefs(out, []string{encryptedRef}, wrongCodec, true); err == nil {
+		t.Fatal("wrong key accepted encrypted memory dependency")
+	}
+	if err := validateLocalMemoryRefs(out, []string{fileRef(otherPath, plainScheme, plainDigest)}, nil, false); err == nil {
+		t.Fatal("mismatched identity accepted memory dependency")
 	}
 }
 
@@ -145,10 +175,11 @@ func TestHandleSnapshotRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T
 func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) {
 	dir := t.TempDir()
 	diff := filepath.Join(dir, "must-not-be-opened.diff")
+	digest := strings.Repeat("0", 64)
 	cfg := &config.SandboxConfig{}
 	cfg.SnapshotProvenance = config.SnapshotProvenance{
-		ParentSnapshotRef: "file://base.snapshot",
-		ParentOverlayBase: "file://base.overlay",
+		ParentSnapshotRef: "file://base.snapshot@sha256:" + digest,
+		ParentOverlayBase: "file://base.overlay@sha256:" + digest,
 		ParentOverlayPath: filepath.Join(dir, "missing.overlay"),
 	}
 	pinger := &guestlink.Pinger{
@@ -168,12 +199,162 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 			},
 		}}, nil, "", filepath.Join(dir, "run"),
 		pinger, nil, nil, discardLogf)
-	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") ||
-		!strings.Contains(err.Error(), "missing.overlay") {
+	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") {
 		t.Fatalf("disk merge preflight error = %v", err)
 	}
 	if viewCalled {
 		t.Fatal("snapshot view provider called during size preflight")
+	}
+}
+
+func TestHandleSnapshotRequestResolvesUploadKeyBeforeSnapshotView(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.SandboxConfig{}
+	viewCalled := false
+	keyCalls := 0
+	_, err := handleSnapshotRequest(ctl.Request{Upload: true}, RunOptions{
+		Cfg:         cfg,
+		SandboxID:   "test",
+		ManifestCfg: &config.ManifestConfig{Store: manifest.StoreConfig{Endpoint: "unused"}},
+		CustomerKeyFn: func() ([32]byte, error) {
+			keyCalls++
+			return [32]byte{}, errors.New("invalid customer key")
+		},
+	}, nil, []SnapDiskRef{{
+		DiffPath: filepath.Join(dir, "diff"),
+		Size:     4096,
+		SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			viewCalled = true
+			return bytes.NewReader(make([]byte, 4096)), nil, nil
+		},
+	}}, nil, "", filepath.Join(dir, "run"), nil, nil, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "customer key") {
+		t.Fatalf("upload key error = %v", err)
+	}
+	if keyCalls != 1 {
+		t.Fatalf("customer key calls=%d, want 1", keyCalls)
+	}
+	if viewCalled {
+		t.Fatal("snapshot view was opened before customer-key validation")
+	}
+}
+
+func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+	listener, err := net.Listen("unix", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guestDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			guestDone <- acceptErr
+			return
+		}
+		defer conn.Close()
+		line := make([]byte, len(proto.HostConnectLine))
+		if _, readErr := io.ReadFull(conn, line); readErr != nil {
+			guestDone <- readErr
+			return
+		}
+		if string(line) != string(proto.HostConnectLine) {
+			guestDone <- fmt.Errorf("CONNECT line = %q", line)
+			return
+		}
+		if _, writeErr := conn.Write([]byte("OK 1\n")); writeErr != nil {
+			guestDone <- writeErr
+			return
+		}
+		request, readErr := proto.ReadMessage(conn)
+		if readErr != nil {
+			guestDone <- readErr
+			return
+		}
+		if request.Type != proto.TypeQuiesce {
+			guestDone <- fmt.Errorf("request type = %q", request.Type)
+			return
+		}
+		guestDone <- proto.WriteMessage(conn, &proto.Message{
+			Type:             proto.TypeQuiesced,
+			DropCachesResult: proto.DropCachesSkipped,
+		})
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+	chSock := filepath.Join(dir, "ch.sock")
+	chListener, err := net.Listen("unix", chSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resumed atomic.Bool
+	chServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/vm.snapshot" {
+			http.Error(w, "injected snapshot failure", http.StatusInternalServerError)
+			return
+		}
+		if r.URL.Path == "/api/v1/vm.resume" {
+			resumed.Store(true)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	chDone := make(chan struct{})
+	go func() {
+		_ = chServer.Serve(chListener)
+		close(chDone)
+	}()
+	t.Cleanup(func() {
+		_ = chServer.Close()
+		<-chDone
+	})
+
+	mfd, err := memory.Create("snapshot-failure-reattach", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	reattachCalls := 0
+	reattachedAfterResume := false
+	_, err = handleSnapshotRequest(
+		ctl.Request{OutDir: filepath.Join(dir, "out")},
+		RunOptions{Cfg: &config.SandboxConfig{}, SandboxID: "test"},
+		mfd,
+		[]SnapDiskRef{{
+			DiffPath: filepath.Join(dir, "diff"),
+			Size:     4096,
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				return bytes.NewReader(make([]byte, 4096)), nil, nil
+			},
+		}},
+		nil,
+		chSock,
+		filepath.Join(dir, "run"),
+		&guestlink.Pinger{Client: &guestlink.HostClient{BasePath: base}},
+		nil,
+		func() error {
+			reattachCalls++
+			if !resumed.Load() {
+				return errors.New("reattach ran before VM resume")
+			}
+			reattachedAfterResume = true
+			return nil
+		},
+		discardLogf,
+	)
+	if err == nil || !strings.Contains(err.Error(), "CH snapshot") {
+		t.Fatalf("snapshot error = %v, want CH snapshot failure", err)
+	}
+	if guestErr := <-guestDone; guestErr != nil {
+		t.Fatal(guestErr)
+	}
+	if reattachCalls != 1 {
+		t.Fatalf("reattach calls = %d, want 1", reattachCalls)
+	}
+	if !resumed.Load() {
+		t.Fatal("VM was not resumed before failed snapshot returned")
+	}
+	if !reattachedAfterResume {
+		t.Fatal("guest was not reattached after VM resume")
 	}
 }
 

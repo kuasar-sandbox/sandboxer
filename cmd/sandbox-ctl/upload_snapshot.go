@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"os"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
 
@@ -17,7 +20,7 @@ import (
 //	sandbox-ctl upload-snapshot [--manifest-config <file> | --to-ref-location name=file:///path] [--quiet] <snapshot-path>
 func uploadSnapshotCmd(args []string) int {
 	fs := flag.NewFlagSet("upload-snapshot", flag.ContinueOnError)
-	manifestPath := fs.String("manifest-config", "", "manifest config YAML (overrides MANIFEST_CONFIG env); $MANIFEST_KEY supplies the customer key")
+	manifestPath := fs.String("manifest-config", "", "storage config YAML (overrides MANIFEST_CONFIG env); $MANIFEST_KEY supplies the customer key")
 	toRefLocation := fs.String("to-ref-location", "", "publish local refs to name=file:///absolute/path")
 	quiet := fs.Bool("quiet", false, "suppress progress logs on stderr")
 	if err := fs.Parse(args); err != nil {
@@ -37,10 +40,26 @@ func uploadSnapshotCmd(args []string) int {
 	if *quiet {
 		logf = func(string, ...any) {}
 	}
-	var (
-		ref string
-		err error
-	)
+	manifestCfg, loadErr := config.LoadManifestConfig(*manifestPath)
+	if loadErr != nil {
+		if *toRefLocation == "" || !errors.Is(loadErr, manifest.ErrConfigNotProvided) {
+			fmt.Fprintln(os.Stderr, loadErr)
+			return 1
+		}
+		manifestCfg = nil
+	}
+	keyFn, localCodec, localRequired, err := storageOptions(manifestCfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	var manifestFetcher fetch.Fetcher
+	if manifestCfg != nil {
+		lazy := &onDemandManifestFetcher{cfg: manifestCfg, keyFn: keyFn}
+		manifestFetcher = lazy
+		defer lazy.Close()
+	}
+	var ref string
 	if *toRefLocation != "" {
 		locations := config.RefLocations{}
 		if err := locations.Set(*toRefLocation); err != nil {
@@ -48,15 +67,10 @@ func uploadSnapshotCmd(args []string) int {
 			return 2
 		}
 		for name, directory := range locations {
-			ref, err = restore.PublishLocalToLocation(context.Background(), path, name, directory, logf)
+			ref, err = restore.PublishLocalToLocation(context.Background(), path, name, directory, localCodec, localRequired, logf)
 		}
 	} else {
-		mcfg, loadErr := config.LoadManifestConfig(*manifestPath)
-		if loadErr != nil {
-			fmt.Fprintln(os.Stderr, loadErr)
-			return 1
-		}
-		ref, err = restore.UploadLocal(context.Background(), path, mcfg, logf)
+		ref, err = restore.UploadLocal(context.Background(), path, manifestCfg, keyFn, manifestFetcher, localCodec, localRequired, logf)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

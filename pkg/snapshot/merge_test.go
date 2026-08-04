@@ -6,11 +6,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
 func TestOpenMergeBaseFollowsSymlink(t *testing.T) {
@@ -20,19 +21,19 @@ func TestOpenMergeBaseFollowsSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tartransition.WriteTo(context.Background(), tmp, "overlay", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
+	scheme, digest, err := tarstream.WriteTo(context.Background(), tmp, "overlay", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := tmp.Close(); err != nil {
 		t.Fatal(err)
 	}
-	name := strings.TrimPrefix(digest, "sha256:") + ".overlay"
+	name := digest + ".overlay"
 	target := filepath.Join(targetDir, name)
 	if err := os.Rename(tmp.Name(), target); err != nil {
 		t.Fatal(err)
 	}
-	layer, _, err := openMergeBase(target, int64(len(payload)))
+	layer, _, err := openMergeBase(mergeTestRef(t, target, scheme, digest), int64(len(payload)), nil, false)
 	if err != nil {
 		t.Fatalf("open merge base: %v", err)
 	}
@@ -44,13 +45,93 @@ func TestOpenMergeBaseFollowsSymlink(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	linkedLayer, _, err := openMergeBase(link, int64(len(payload)))
+	linkedLayer, _, err := openMergeBase(mergeTestRef(t, link, scheme, digest), int64(len(payload)), nil, false)
 	if err != nil {
 		t.Fatalf("open merge base symlink: %v", err)
 	}
 	if err := linkedLayer.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestOpenMergeBaseCryptoPolicy(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x6c}, 3*4096)
+	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x51})
+	wrong, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x52})
+	dir := t.TempDir()
+	type artifact struct {
+		path, scheme, digest string
+	}
+	write := func(encrypted bool) artifact {
+		tmp, err := os.CreateTemp(dir, "merge-*.tmp")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var options []tarstream.WriteOption
+		if encrypted {
+			options = append(options, tarstream.WithCodec(codec, true))
+		}
+		scheme, digest, err := tarstream.WriteTo(context.Background(), tmp, "overlay", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), options...)
+		if err != nil {
+			_ = tmp.Close()
+			t.Fatal(err)
+		}
+		if err := tmp.Close(); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, digest+".overlay")
+		if err := os.Rename(tmp.Name(), path); err != nil {
+			t.Fatal(err)
+		}
+		return artifact{path: path, scheme: scheme, digest: digest}
+	}
+	plainPath := write(false)
+	encryptedPath := write(true)
+
+	layer, holes, err := openMergeBase(mergeTestRef(t, encryptedPath.path, encryptedPath.scheme, encryptedPath.digest), int64(len(payload)), codec, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holes) != 0 {
+		t.Fatalf("encrypted merge holes=%v", holes)
+	}
+	got, err := io.ReadAll(layer)
+	if closeErr := layer.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("encrypted merge read err=%v equal=%v", err, bytes.Equal(got, payload))
+	}
+	if _, _, err := openMergeBase(mergeTestRef(t, encryptedPath.path, encryptedPath.scheme, encryptedPath.digest), int64(len(payload)), wrong, true); err == nil {
+		t.Fatal("merge accepted the wrong customer key")
+	}
+	legacy, _, err := openMergeBase(mergeTestRef(t, plainPath.path, plainPath.scheme, plainPath.digest), int64(len(payload)), codec, false)
+	if err != nil {
+		t.Fatalf("auto legacy merge: %v", err)
+	}
+	_ = legacy.Close()
+	if _, _, err := openMergeBase(mergeTestRef(t, plainPath.path, plainPath.scheme, plainPath.digest), int64(len(payload)), codec, true); err == nil {
+		t.Fatal("required merge accepted plaintext")
+	}
+
+	logical := filepath.Join(dir, "logical-parent.overlay")
+	if err := os.Rename(encryptedPath.path, logical); err != nil {
+		t.Fatal(err)
+	}
+	logicalLayer, _, err := openMergeBase(mergeTestRef(t, logical, encryptedPath.scheme, encryptedPath.digest), int64(len(payload)), codec, true)
+	if err != nil {
+		t.Fatalf("scheme-qualified logical merge basename: %v", err)
+	}
+	_ = logicalLayer.Close()
+}
+
+func mergeTestRef(t *testing.T, path, scheme, digest string) string {
+	t.Helper()
+	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path, DigestScheme: scheme, Digest: digest}
+	if err := ref.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return ref.String()
 }
 
 // oracle is the reference layering semantics (must match mergeSparse): top byte

@@ -1,16 +1,17 @@
 package snapshot
 
 import (
+	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
-	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
 )
 
 // tarLayer is a parent local artifact (tarstream envelope) opened as a
@@ -19,91 +20,118 @@ import (
 // past the layer size (e.g. into a .snapshot's ZIP trailer) never happen —
 // mergedReadSeeker bounds every read by its size.
 type tarLayer struct {
-	f *os.File
-	tarstream.ReadSeeker
+	stream fetch.Stream
+	io.ReadSeeker
 }
 
-func (l *tarLayer) Close() error { return l.f.Close() }
+func (l *tarLayer) Close() error { return l.stream.Close() }
 
-// openMergeBase opens a parent local artifact and returns its logical view
+// openMergeBase opens a parent local artifact ref and returns its logical view
 // plus the holes over [0,size) — from the tar envelope's map, clipped to the
 // layer size (a snapshot's memory section = MemfdSize; an overlay's = the
-// diff size). size must not exceed the entry's logical size.
-func openMergeBase(path string, size int64) (*tarLayer, []sparse.Extent, error) {
-	f, err := os.Open(path)
+// diff size). The ref is an already-resolved file ref with an explicit expected
+// identity, so logical basenames remain valid without a basename guess. size
+// must not exceed the entry's logical size.
+func openMergeBase(raw string, size int64, codec tarstream.Codec, required bool) (*tarLayer, []sparse.Extent, error) {
+	if size < 0 {
+		return nil, nil, fmt.Errorf("merge base: negative logical size")
+	}
+	if required && codec == nil {
+		return nil, nil, fmt.Errorf("merge base: required policy has no codec")
+	}
+	ref, err := manifest.ParseRef(raw)
+	if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Location != "" || ref.Digest == "" {
+		return nil, nil, fmt.Errorf("merge base: resolved scheme-qualified file ref required")
+	}
+	var options []tarstream.ReadOption
+	if codec != nil {
+		options = append(options, tarstream.WithCodec(codec, required))
+	}
+	wantScheme, wantDigest, err := mergeExpectedIdentity(ref, codec, required)
 	if err != nil {
 		return nil, nil, err
 	}
-	st, err := f.Stat()
+	options = append(options, tarstream.WithExpectedDigest(wantScheme, wantDigest))
+	stream, err := fetch.OpenTarStream(ref.Path, options...)
 	if err != nil {
-		f.Close()
+		return nil, nil, &mergeArtifactError{err: err}
+	}
+	fail := func(err error) (*tarLayer, []sparse.Extent, error) {
+		_ = stream.Close()
 		return nil, nil, err
 	}
-	src, _, err := tarstream.SourceAt(f, st.Size(), "")
+	if stream.Size() < uint64(size) {
+		return fail(fmt.Errorf("merge base: entry size %d < expected layer size %d", stream.Size(), size))
+	}
+	holes, err := mergeStreamHoles(stream, uint64(size))
 	if err != nil {
-		f.Close()
-		return nil, nil, fmt.Errorf("merge base %s: not a tarstream artifact: %w", path, err)
+		return fail(fmt.Errorf("merge base: hole map: %w", err))
 	}
-	tagged, ok, err := tartransition.Digest(src)
-	if err != nil {
-		f.Close()
-		return nil, nil, fmt.Errorf("merge base %s: invalid digest marker: %w", path, err)
-	}
-	if !ok {
-		f.Close()
-		return nil, nil, fmt.Errorf("merge base %s: tarstream artifact missing digest marker", path)
-	}
-	hexDigest, err := tartransition.SHA256Digest(tagged)
-	if err != nil {
-		f.Close()
-		return nil, nil, fmt.Errorf("merge base %s: unsupported digest scheme: %w", path, err)
-	}
-	real := path
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		real = resolved
-	}
-	stem, _, hasExt := strings.Cut(filepath.Base(real), ".")
-	if len(hexDigest) != 64 || !hasExt || stem != hexDigest {
-		f.Close()
-		return nil, nil, fmt.Errorf("merge base %s: basename does not match digest marker", path)
-	}
-	v, err := tarstream.ReadSeekFrom(f, "")
-	if err != nil {
-		f.Close()
-		return nil, nil, fmt.Errorf("merge base %s: not a tarstream artifact: %w", path, err)
-	}
-	if v.Size() < size {
-		f.Close()
-		return nil, nil, fmt.Errorf("merge base %s: entry size %d < expected layer size %d", path, v.Size(), size)
-	}
-	return &tarLayer{f: f, ReadSeeker: v}, clipExtents(v.Holes(), uint64(size)), nil
+	reader := fetch.NewReaderAt(context.Background(), stream)
+	return &tarLayer{stream: stream, ReadSeeker: io.NewSectionReader(reader, 0, size)}, holes, nil
 }
 
-// ValidateMergeBase performs the same structural, digest-name, and logical
+type mergeArtifactError struct{ err error }
+
+func (e *mergeArtifactError) Error() string { return "merge base: local artifact validation failed" }
+func (e *mergeArtifactError) Unwrap() error { return e.err }
+
+func mergeExpectedIdentity(ref manifest.Ref, codec tarstream.Codec, required bool) (string, string, error) {
+	if codec == nil {
+		if ref.DigestScheme != tarstream.DigestSchemeSHA256 {
+			return "", "", fmt.Errorf("merge base: hmac identity requires local codec")
+		}
+		return ref.DigestScheme, ref.Digest, nil
+	}
+	switch ref.DigestScheme {
+	case tarstream.DigestSchemeHMAC:
+		return ref.DigestScheme, ref.Digest, nil
+	case tarstream.DigestSchemeSHA256:
+		if required {
+			return "", "", fmt.Errorf("merge base: legacy sha256 identity is forbidden by required policy")
+		}
+		var plain [32]byte
+		if len(ref.Digest) != hex.EncodedLen(len(plain)) || strings.ToLower(ref.Digest) != ref.Digest {
+			return "", "", fmt.Errorf("merge base: invalid legacy sha256 identity")
+		}
+		if _, err := hex.Decode(plain[:], []byte(ref.Digest)); err != nil {
+			return "", "", fmt.Errorf("merge base: invalid legacy sha256 identity")
+		}
+		keyed := codec.KeyedDigest(plain)
+		return tarstream.DigestSchemeHMAC, hex.EncodeToString(keyed[:]), nil
+	default:
+		return "", "", fmt.Errorf("merge base: unsupported digest scheme")
+	}
+}
+
+// ValidateMergeBase performs the same structural, expected-identity, and logical
 // size checks Take will apply to a local memory or disk merge base, without
 // retaining the artifact. Callers use it before guest quiesce so predictable
 // local-artifact failures cannot leave a guest frozen.
-func ValidateMergeBase(path string, size int64) error {
-	base, _, err := openMergeBase(path, size)
+func ValidateMergeBase(path string, size int64, codec tarstream.Codec, required bool) error {
+	base, _, err := openMergeBase(path, size, codec, required)
 	if err != nil {
 		return err
 	}
 	return base.Close()
 }
 
-// clipExtents intersects sorted, disjoint extents with [0, size).
-func clipExtents(hs []sparse.Extent, size uint64) []sparse.Extent {
-	var out []sparse.Extent
-	for _, h := range hs {
-		if h.Offset >= size {
-			break
+func mergeStreamHoles(stream fetch.Stream, size uint64) ([]sparse.Extent, error) {
+	var holes []sparse.Extent
+	for offset := uint64(0); offset < size; {
+		kind, end, err := stream.RunAt(offset, size-offset)
+		if err != nil {
+			return nil, err
 		}
-		if h.Offset+h.Size > size {
-			h.Size = size - h.Offset
+		if end <= offset || end > size {
+			return nil, fmt.Errorf("invalid run [%d,%d)", offset, end)
 		}
-		out = append(out, h)
+		if kind == sparse.Hole {
+			holes = append(holes, sparse.Extent{Offset: offset, Size: end - offset})
+		}
+		offset = end
 	}
-	return out
+	return holes, nil
 }
 
 // mergeSparse flattens two adjacent sparse layers — top (this run's resident

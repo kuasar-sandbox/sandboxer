@@ -2,6 +2,8 @@ package sandbox
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -9,7 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
@@ -23,13 +25,13 @@ import (
 //
 // For manifest:// the fetcher must be non-nil — it carries the cache-ctl /
 // store-ctl client and the per-process decryptor. Cold-start lifecycle and
-// restore both construct the fetcher up front (only when manifest:// resources
-// are referenced) and share it across every disk URI.
+// restore share one process-owned fetcher across every disk URI; its network
+// clients are created only when a manifest is actually opened.
 //
 // ctx scopes asynchronous chunk fetches kicked off by later ReadAt calls;
 // cancelling it makes pending vhost-user-blk reads fail promptly at shutdown.
-func OpenBlockReader(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations) (vhost.BlockReader, int64, error) {
-	stream, size, err := OpenDiskStream(ctx, uri, fetcher, locations)
+func OpenBlockReader(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (vhost.BlockReader, int64, error) {
+	stream, size, err := OpenDiskStream(ctx, uri, fetcher, locations, codec, required)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -40,10 +42,10 @@ func OpenBlockReader(ctx context.Context, uri string, fetcher fetch.Fetcher, loc
 // and its size. Exported so callers outside this package (notably
 // pkg/restore) can share the same code path. The caller owns the
 // returned stream and must Close it (directly or via a StreamReader).
-func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations) (fetch.Stream, int64, error) {
+func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (fetch.Stream, int64, error) {
 	ref, err := manifest.ParseRef(uri)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid disk URI %q: %w", uri, err)
+		return nil, 0, protectLocalArtifactError(codec, "parse local artifact ref", err)
 	}
 	switch ref.Scheme {
 	case manifest.RefSchemeFile:
@@ -51,17 +53,9 @@ func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher, loca
 		// the hole map comes from the envelope, never the filesystem.
 		path, err := locations.ResolveFile(ref, "")
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, protectLocalArtifactError(codec, "resolve local artifact ref", err)
 		}
-		s, err := fetch.OpenTarStream(path)
-		if err != nil {
-			return nil, 0, err
-		}
-		if err := validateFileRefIdentity(ref, s); err != nil {
-			s.Close()
-			return nil, 0, err
-		}
-		return s, int64(s.Size()), nil
+		return openLocalDiskStream(path, ref, codec, required)
 	case manifest.RefSchemeManifest:
 		return OpenManifestStream(ctx, ref.Path, fetcher)
 	default:
@@ -69,20 +63,36 @@ func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher, loca
 	}
 }
 
+func openLocalDiskStream(path string, ref manifest.Ref, codec tarstream.Codec, required bool) (fetch.Stream, int64, error) {
+	options, err := fileReadOptions(ref, codec, required)
+	if err != nil {
+		return nil, 0, err
+	}
+	s, err := fetch.OpenTarStream(path, options...)
+	if err != nil {
+		return nil, 0, protectLocalArtifactError(codec, "open local artifact", err)
+	}
+	if err := validateFileRefIdentity(ref, path, s, codec, required); err != nil {
+		_ = s.Close()
+		return nil, 0, err
+	}
+	return s, int64(s.Size()), nil
+}
+
 // OpenLayeredBlockReader opens refs in top-to-bottom order and composes them as
 // one read-only block source. A single ref is returned without an extra layer.
-func OpenLayeredBlockReader(ctx context.Context, refs []string, fetcher fetch.Fetcher, locations config.RefLocations) (vhost.BlockReader, int64, error) {
+func OpenLayeredBlockReader(ctx context.Context, refs []string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (vhost.BlockReader, int64, error) {
 	if len(refs) == 0 {
 		return nil, 0, errors.New("disk layer list is empty")
 	}
 	streams := make([]fetch.Stream, 0, len(refs))
 	for i, ref := range refs {
-		stream, _, err := OpenDiskStream(ctx, ref, fetcher, locations)
+		stream, _, err := OpenDiskStream(ctx, ref, fetcher, locations, codec, required)
 		if err != nil {
 			for _, opened := range streams {
 				_ = opened.Close()
 			}
-			return nil, 0, fmt.Errorf("layer[%d] %q: %w", i, ref, err)
+			return nil, 0, fmt.Errorf("layer[%d]: %w", i, err)
 		}
 		streams = append(streams, stream)
 	}
@@ -92,6 +102,21 @@ func OpenLayeredBlockReader(ctx context.Context, refs []string, fetcher fetch.Fe
 	}
 	size := int64(stream.Size())
 	return vhost.NewStreamReader(ctx, stream, size), size, nil
+}
+
+type localArtifactError struct {
+	op  string
+	err error
+}
+
+func (e *localArtifactError) Error() string { return e.op + " failed" }
+func (e *localArtifactError) Unwrap() error { return e.err }
+
+func protectLocalArtifactError(codec tarstream.Codec, op string, err error) error {
+	if codec == nil || err == nil {
+		return err
+	}
+	return &localArtifactError{op: op, err: err}
 }
 
 // OpenManifestStream resolves one manifest:// key into a fetch.Stream and its
@@ -115,32 +140,101 @@ func OpenManifestStream(ctx context.Context, keyRef string, fetcher fetch.Fetche
 	return stream, int64(stream.Size()), nil
 }
 
-func validateFileRefIdentity(ref manifest.Ref, stream fetch.Stream) error {
-	tagged, ok, err := tartransition.Digest(stream)
-	if err != nil {
-		return fmt.Errorf("file ref %q has invalid digest marker: %w", ref.String(), err)
-	}
-	if !ok {
-		return fmt.Errorf("file ref %q has no digest marker", ref.String())
-	}
-	digest, err := tartransition.SHA256Digest(tagged)
-	if err != nil {
-		return fmt.Errorf("file ref %q uses an unsupported digest scheme: %w", ref.String(), err)
-	}
-	expected, err := tartransition.SHA256RefDigest(ref)
-	if err != nil {
-		return fmt.Errorf("file ref %q uses an unsupported digest scheme: %w", ref.String(), err)
-	}
-	if expected != "" && expected != digest {
-		return fmt.Errorf("file ref %q digest mismatch: got %s", ref.String(), digest)
-	}
-	if ref.Location != "" {
-		contentName := strings.TrimSuffix(ref.Path, filepath.Ext(ref.Path))
-		if contentName != digest {
-			return fmt.Errorf("located file ref %q content name does not match digest %s", ref.String(), digest)
+func fileReadOptions(ref manifest.Ref, codec tarstream.Codec, required bool) ([]tarstream.ReadOption, error) {
+	if codec == nil {
+		if required {
+			return nil, fmt.Errorf("local tarstream: required policy has no codec")
 		}
+		if ref.DigestScheme == tarstream.DigestSchemeHMAC {
+			return nil, fmt.Errorf("local tarstream: hmac ref requires crypto.local=auto or required")
+		}
+		if ref.DigestScheme == tarstream.DigestSchemeSHA256 {
+			return []tarstream.ReadOption{tarstream.WithExpectedDigest(ref.DigestScheme, ref.Digest)}, nil
+		}
+		return nil, nil
+	}
+
+	options := []tarstream.ReadOption{tarstream.WithCodec(codec, required)}
+	switch ref.DigestScheme {
+	case "":
+		return options, nil
+	case tarstream.DigestSchemeHMAC:
+		return append(options, tarstream.WithExpectedDigest(tarstream.DigestSchemeHMAC, ref.Digest)), nil
+	case tarstream.DigestSchemeSHA256:
+		if required {
+			return nil, fmt.Errorf("local tarstream: legacy sha256 ref is forbidden by required policy")
+		}
+		keyed, err := keyedDigestHex(codec, ref.Digest)
+		if err != nil {
+			return nil, fmt.Errorf("local tarstream: invalid legacy sha256 ref")
+		}
+		return append(options, tarstream.WithExpectedDigest(tarstream.DigestSchemeHMAC, keyed)), nil
+	default:
+		return nil, fmt.Errorf("local tarstream: unsupported digest scheme")
+	}
+}
+
+func validateFileRefIdentity(ref manifest.Ref, path string, stream fetch.Stream, codec tarstream.Codec, required bool) error {
+	digester, ok := stream.(tarstream.Digester)
+	if !ok {
+		return fmt.Errorf("local tarstream: artifact has no declared digest")
+	}
+	scheme, digest := digester.Digest()
+	wantScheme := tarstream.DigestSchemeSHA256
+	if codec != nil {
+		wantScheme = tarstream.DigestSchemeHMAC
+	}
+	if scheme != wantScheme {
+		return fmt.Errorf("local tarstream: artifact digest scheme is incompatible with policy")
+	}
+	if ref.Digest != "" {
+		// fileReadOptions supplied the policy-normalized expected identity to
+		// the tarstream parser, which compares it in constant time.
+		return nil
+	}
+	if ref.Location == "" {
+		// An unqualified node-local path is an explicit provisioning input,
+		// not a content-addressed lookup. Its caller may canonicalize the
+		// identity returned by the stream after this open.
+		return nil
+	}
+
+	realPath := path
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		realPath = resolved
+	}
+	base := filepath.Base(realPath)
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	if codec == nil || required {
+		if !digestEqual(stem, digest) {
+			return fmt.Errorf("local tarstream: content name does not match artifact identity")
+		}
+		return nil
+	}
+	if digestEqual(stem, digest) {
+		return nil
+	}
+	legacy, err := keyedDigestHex(codec, stem)
+	if err != nil || !digestEqual(legacy, digest) {
+		return fmt.Errorf("local tarstream: content name does not match artifact identity")
 	}
 	return nil
+}
+
+func keyedDigestHex(codec tarstream.Codec, plainHex string) (string, error) {
+	var plain [32]byte
+	if len(plainHex) != hex.EncodedLen(len(plain)) || strings.ToLower(plainHex) != plainHex {
+		return "", fmt.Errorf("invalid digest")
+	}
+	if _, err := hex.Decode(plain[:], []byte(plainHex)); err != nil {
+		return "", fmt.Errorf("invalid digest")
+	}
+	keyed := codec.KeyedDigest(plain)
+	return hex.EncodeToString(keyed[:]), nil
+}
+
+func digestEqual(left, right string) bool {
+	return len(left) == len(right) && subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
 }
 
 // needsManifestFetcher returns true if any disk URI in cfg uses the

@@ -3,20 +3,23 @@ package restore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"gopkg.in/yaml.v3"
 )
 
-func TestPublishLocalToLocationRewritesLocalRefsAndRepairsPartialFile(t *testing.T) {
+func TestPublishLocalToLocationRewritesLocalRefsAndRejectsInconsistentFinal(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()
 	targetDir := t.TempDir()
@@ -40,7 +43,7 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRepairsPartialFile(t *testing
 	}
 	t.Cleanup(func() { _ = os.Chmod(sourceDir, 0o755) })
 
-	rootRef, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil)
+	rootRef, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,8 +62,18 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRepairsPartialFile(t *testing
 	if _, err := os.Stat(publishedBase); err != nil {
 		t.Fatalf("published EROFS base: %v", err)
 	}
+	publishedRoot := filepath.Join(targetDir, parsedRoot.Path)
+	for _, path := range []string{publishedRoot, publishedOverlay, publishedBase} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o644 {
+			t.Fatalf("published mode for %s = %o, want 644", filepath.Base(path), got)
+		}
+	}
 
-	rootStream, _, err := openTarArtifact(filepath.Join(targetDir, parsedRoot.Path))
+	rootStream, _, _, err := openTarArtifact(publishedRoot, manifest.Ref{}, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +82,7 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRepairsPartialFile(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantOverlayRef := "file://" + filepath.Base(publishedOverlay) + "@location:shared"
+	wantOverlayRef := "file://" + filepath.Base(publishedOverlay) + "@sha256:" + strings.TrimPrefix(overlayDigest, "sha256:") + "@location:shared"
 	if publishedCfg.Boot.Root.Overlay.Base != wantOverlayRef {
 		t.Fatalf("overlay ref = %q, want %q", publishedCfg.Boot.Root.Overlay.Base, wantOverlayRef)
 	}
@@ -83,19 +96,22 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRepairsPartialFile(t *testing
 	if publishedCfg.FromRefs[0] != "manifest://"+manifestKey {
 		t.Fatalf("manifest ref changed: %v", publishedCfg.FromRefs)
 	}
+	reusedRef, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil, false, nil)
+	if err != nil {
+		t.Fatalf("reuse consistent finals: %v", err)
+	}
+	if reusedRef != rootRef {
+		t.Fatalf("reused root ref=%q want=%q", reusedRef, rootRef)
+	}
 
 	if err := os.WriteFile(publishedOverlay, []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	secondRef, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil, false, nil); err == nil {
+		t.Fatal("inconsistent existing final was silently replaced")
 	}
-	if secondRef != rootRef {
-		t.Fatalf("repeat root ref = %q, want %q", secondRef, rootRef)
-	}
-	if err := verifyArtifactFile(publishedOverlay, overlayDigest, 4096); err != nil {
-		t.Fatalf("partial file was not repaired: %v", err)
+	if got, err := os.ReadFile(publishedOverlay); err != nil || string(got) != "partial" {
+		t.Fatalf("inconsistent final changed: %q err=%v", got, err)
 	}
 }
 
@@ -112,13 +128,13 @@ func TestPublishLocalToLocationRejectsSnapshotParentDigestMismatch(t *testing.T)
 	rootCfg.Resources.Capacity.Memory = "4KiB"
 	rootPath := writePublishSnapshot(t, sourceDir, rootCfg)
 
-	_, err := PublishLocalToLocation(ctx, rootPath, "shared", t.TempDir(), nil)
-	if err == nil || !strings.Contains(err.Error(), "sha256 marker mismatch") {
+	_, err := PublishLocalToLocation(ctx, rootPath, "shared", t.TempDir(), nil, false, nil)
+	if err == nil || !strings.Contains(err.Error(), "digest mismatch") {
 		t.Fatalf("publish error = %v, want snapshot parent digest mismatch", err)
 	}
 }
 
-func TestPublishLocalToLocationFollowsExistingSymlinkDestination(t *testing.T) {
+func TestPublishLocalToLocationRejectsExistingSymlinkDestination(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()
 	targetDir := t.TempDir()
@@ -136,11 +152,11 @@ func TestPublishLocalToLocationFollowsExistingSymlinkDestination(t *testing.T) {
 	if err := os.Symlink(victim, destination); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil); err != nil {
-		t.Fatal(err)
+	if _, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil, false, nil); err == nil {
+		t.Fatal("existing symlink destination was followed")
 	}
-	if err := verifyArtifactFile(victim, overlayDigest, 4096); err != nil {
-		t.Fatalf("symlink target was not published: %v", err)
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "partial" {
+		t.Fatalf("symlink target changed: %q err=%v", got, err)
 	}
 	info, err := os.Lstat(destination)
 	if err != nil || info.Mode()&os.ModeSymlink == 0 {
@@ -157,7 +173,7 @@ func TestPublishLocalToLocationPreservesSameLocationBoundary(t *testing.T) {
 	rootCfg.Boot.Root.Overlay = &SnapOverlayCfg{Base: boundaryRef}
 	rootPath := writePublishSnapshot(t, t.TempDir(), rootCfg)
 
-	rootRef, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil)
+	rootRef, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +181,7 @@ func TestPublishLocalToLocationPreservesSameLocationBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stream, _, err := openTarArtifact(filepath.Join(targetDir, parsed.Path))
+	stream, _, _, err := openTarArtifact(filepath.Join(targetDir, parsed.Path), manifest.Ref{}, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,12 +196,32 @@ func TestPublishLocalToLocationPreservesSameLocationBoundary(t *testing.T) {
 }
 
 func TestSnapshotPublisherChecksPreservedManifestRefs(t *testing.T) {
-	p := newSnapshotPublisher(context.Background(), nil)
-	p.manifestConfig = &manifest.Config{}
+	p := newSnapshotPublisher(context.Background(), nil, false, nil)
+	p.fetcher = failingManifestFetcher{}
 	ref := "manifest://" + strings.Repeat("a", 64)
 	_, err := p.publishRef("parent", ref, "", false)
-	if err == nil || !strings.Contains(err.Error(), "cache.endpoint or store.endpoint required") {
+	if err == nil || !strings.Contains(err.Error(), "backend unavailable") {
 		t.Fatalf("publishRef error = %v, want manifest backend check", err)
+	}
+}
+
+type failingManifestFetcher struct{}
+
+func (failingManifestFetcher) OpenManifest(context.Context, store.ContentKey) (fetch.Stream, error) {
+	return nil, errors.New("backend unavailable")
+}
+
+func TestPreflightChecksManifestArtifacts(t *testing.T) {
+	cfg := &SnapshotCfg{}
+	cfg.Resources.Capacity.Memory = "4KiB"
+	cfg.Boot.Root.Overlay = &SnapOverlayCfg{Base: "manifest://" + strings.Repeat("a", 64)}
+	path := writePublishSnapshot(t, t.TempDir(), cfg)
+	err := preflightLocatedRefs(context.Background(), Options{
+		SnapshotPath: path,
+		Fetcher:      failingManifestFetcher{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "backend unavailable") {
+		t.Fatalf("manifest preflight error = %v", err)
 	}
 }
 
@@ -195,7 +231,6 @@ func TestPreflightLocatedRefsWalksMemoryParents(t *testing.T) {
 		"file://" + strings.Repeat("d", 64) + ".snapshot@location:missing-parent",
 	}}
 	parentCfg.Resources.Capacity.Memory = "4KiB"
-	parentCfg.Boot.Root.BaseRef = "manifest://" + strings.Repeat("a", 64)
 	parentCfg.Boot.Root.Overlay = &SnapOverlayCfg{
 		Base: "file://" + strings.Repeat("b", 64) + ".overlay@location:ignored-parent-disk",
 	}
@@ -206,7 +241,6 @@ func TestPreflightLocatedRefsWalksMemoryParents(t *testing.T) {
 		"file://" + filepath.Base(parentPath) + "@location:parent",
 	}}
 	rootCfg.Resources.Capacity.Memory = "4KiB"
-	rootCfg.Boot.Root.BaseRef = "manifest://" + strings.Repeat("c", 64)
 	rootPath := writePublishSnapshot(t, rootDir, rootCfg)
 
 	err := preflightLocatedRefs(context.Background(), Options{
@@ -413,6 +447,59 @@ func TestLocalSnapshotPathKeepsUnlocatedDigestRef(t *testing.T) {
 	}
 }
 
+func TestOpenSnapshotArtifactTreatsPlainPathLiterally(t *testing.T) {
+	cfg := &SnapshotCfg{}
+	cfg.Resources.Capacity.Memory = "4KiB"
+	path := writePublishSnapshot(t, t.TempDir(), cfg)
+	dir := filepath.Join(t.TempDir(), "literal@location:not-a-ref")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	literal := filepath.Join(dir, filepath.Base(path))
+	if err := os.Rename(path, literal); err != nil {
+		t.Fatal(err)
+	}
+	stream, scheme, digest, err := openSnapshotArtifact(context.Background(), Options{SnapshotPath: literal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr := stream.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if scheme != tarstream.DigestSchemeSHA256 || digest == "" {
+		t.Fatalf("literal snapshot identity = %s:%s", scheme, digest)
+	}
+}
+
+func TestFileSnapshotRefUsesActualSchemeAndPreservesLocation(t *testing.T) {
+	target := filepath.Join(t.TempDir(), strings.Repeat("a", 64)+".snapshot")
+	if err := os.WriteFile(target, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "sid.snapshot")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	hmacDigest := strings.Repeat("b", 64)
+	got, err := fileSnapshotRef(link, "", tarstream.DigestSchemeHMAC, hmacDigest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := mustParseRef(t, got)
+	if ref.Path != filepath.Base(target) || ref.DigestScheme != tarstream.DigestSchemeHMAC || ref.Digest != hmacDigest {
+		t.Fatalf("local self ref=%#v", ref)
+	}
+	locatedRaw := "file://logical.snapshot@sha256:" + strings.Repeat("c", 64) + "@location:shared"
+	got, err = fileSnapshotRef(link, locatedRaw, tarstream.DigestSchemeHMAC, hmacDigest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref = mustParseRef(t, got)
+	if ref.Path != "logical.snapshot" || ref.Location != "shared" || ref.DigestScheme != tarstream.DigestSchemeHMAC || ref.Digest != hmacDigest {
+		t.Fatalf("located self ref=%#v", ref)
+	}
+}
+
 func TestResolveLocalMergePathUsesRefLocations(t *testing.T) {
 	snapshotPath := "/snapshots/root.snapshot"
 	locations := config.RefLocations{"shared": "/shared/location"}
@@ -438,7 +525,7 @@ func TestResolveAnyRefPreservesLocatedBase(t *testing.T) {
 	locationDir := t.TempDir()
 	path, digest := writePublishArtifact(t, locationDir, ".erofs", bytes.Repeat([]byte{0x73}, 4096))
 	ref := mustParseRef(t, "file://"+filepath.Base(path)+"@sha256:"+strings.TrimPrefix(digest, "sha256:")+"@location:shared")
-	got, err := resolveAnyRef("", ref, "/snapshots/root.snapshot", "boot.root.base", config.RefLocations{"shared": locationDir})
+	got, err := resolveAnyRef("", ref, "/snapshots/root.snapshot", "boot.root.base", config.RefLocations{"shared": locationDir}, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,12 +535,16 @@ func TestResolveAnyRefPreservesLocatedBase(t *testing.T) {
 }
 
 func writePublishArtifact(t *testing.T, dir, ext string, payload []byte) (string, string) {
+	return writePublishNamedArtifact(t, dir, ext, "payload", payload)
+}
+
+func writePublishNamedArtifact(t *testing.T, dir, ext, name string, payload []byte) (string, string) {
 	t.Helper()
 	tmp, err := os.CreateTemp(dir, "artifact-*.tmp")
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tartransition.WriteTo(context.Background(), tmp, "payload", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
+	scheme, digest, err := tarstream.WriteTo(context.Background(), tmp, name, sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
 	if err != nil {
 		tmp.Close()
 		t.Fatal(err)
@@ -461,11 +552,11 @@ func writePublishArtifact(t *testing.T, dir, ext string, payload []byte) (string
 	if err := tmp.Close(); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, strings.TrimPrefix(digest, "sha256:")+ext)
+	path := filepath.Join(dir, digest+ext)
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		t.Fatal(err)
 	}
-	return path, digest
+	return path, scheme + ":" + digest
 }
 
 func writePublishSnapshot(t *testing.T, dir string, cfg *SnapshotCfg) string {
@@ -483,6 +574,6 @@ func writePublishSnapshot(t *testing.T, dir string, cfg *SnapshotCfg) string {
 		t.Fatal(err)
 	}
 	payload := append(make([]byte, 4096), zipBody...)
-	path, _ := writePublishArtifact(t, dir, ".snapshot", payload)
+	path, _ := writePublishNamedArtifact(t, dir, ".snapshot", "snapshot", payload)
 	return path
 }

@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
@@ -48,7 +48,8 @@ func callRunRestoreForValidation(t *testing.T, cfg *config.SandboxConfig, manife
 		return runRestore(
 			context.Background(), cfg, manifestCfg, "manifest://deadbeef",
 			"test-sandbox", "/nonexistent/cloud-hypervisor",
-			runRoot, filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil, nil,
+			runRoot, filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil,
+			nil, nil, nil, false, nil,
 		)
 	})
 }
@@ -103,10 +104,11 @@ func TestRunRestoreChecksDigestOnUnlocatedFileRef(t *testing.T) {
 		return runRestore(
 			context.Background(), &config.SandboxConfig{}, nil, ref,
 			"test-sandbox", "/nonexistent/cloud-hypervisor", runRoot,
-			filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil, nil,
+			filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil,
+			nil, nil, nil, false, nil,
 		)
 	})
-	if rc != 1 || !strings.Contains(stderr, "sha256 marker mismatch") {
+	if rc != 1 || !strings.Contains(stderr, "digest mismatch") {
 		t.Fatalf("runRestore = %d, stderr %q; want digest mismatch", rc, stderr)
 	}
 	if _, err := os.Stat(runRoot); !os.IsNotExist(err) {
@@ -136,7 +138,7 @@ func writeRunRestoreSnapshot(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tartransition.WriteTo(context.Background(), tmp, "snapshot", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
+	_, digest, err := tarstream.WriteTo(context.Background(), tmp, "snapshot", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))))
 	if err != nil {
 		tmp.Close()
 		t.Fatal(err)
@@ -144,7 +146,7 @@ func writeRunRestoreSnapshot(t *testing.T) string {
 	if err := tmp.Close(); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, strings.TrimPrefix(digest, "sha256:")+".snapshot")
+	path := filepath.Join(dir, digest+".snapshot")
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		t.Fatal(err)
 	}

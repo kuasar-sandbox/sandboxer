@@ -3,7 +3,6 @@ package restore
 import (
 	"archive/zip"
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -14,34 +13,38 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
+	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
 // UploadLocal publishes a local snapshot graph to manifest storage. Local file
 // refs are upgraded to manifest refs; existing manifest and located file refs
 // remain unchanged.
-func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config, logf func(string, ...any)) (string, error) {
+func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config, keyFn ingest.CustomerKeyFunc, manifestFetcher fetch.Fetcher, codec tarstream.Codec, required bool, logf func(string, ...any)) (string, error) {
 	if mcfg == nil {
 		return "", fmt.Errorf("manifest config is required")
 	}
-	ing, err := mcfg.NewIngester(mcfg.IngestKeyFunc(), nil)
+	if keyFn == nil {
+		return "", fmt.Errorf("customer key resolver is required")
+	}
+	ing, err := mcfg.NewIngester(keyFn, nil)
 	if err != nil {
 		return "", fmt.Errorf("ingester: %w", err)
 	}
 	defer ing.Close()
-	p := newSnapshotPublisher(ctx, logf)
+	p := newSnapshotPublisher(ctx, codec, required, logf)
 	p.ing = ing
-	p.manifestConfig = mcfg
-	return p.publishSnapshot(snapshotPath, "")
+	p.fetcher = manifestFetcher
+	return p.publishSnapshot(snapshotPath, manifest.Ref{})
 }
 
 // PublishLocalToLocation publishes a local snapshot graph into one trusted
 // named file location. It writes only content-addressed files and returns the
 // canonical located root ref.
-func PublishLocalToLocation(ctx context.Context, snapshotPath, location, directory string, logf func(string, ...any)) (string, error) {
+func PublishLocalToLocation(ctx context.Context, snapshotPath, location, directory string, codec tarstream.Codec, required bool, logf func(string, ...any)) (string, error) {
 	probe := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: "probe.snapshot", Location: location}
 	if err := probe.Validate(); err != nil {
 		return "", err
@@ -52,72 +55,73 @@ func PublishLocalToLocation(ctx context.Context, snapshotPath, location, directo
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		return "", fmt.Errorf("create ref location: %w", err)
 	}
-	p := newSnapshotPublisher(ctx, logf)
+	p := newSnapshotPublisher(ctx, codec, required, logf)
 	p.location = location
 	p.directory = filepath.Clean(directory)
-	return p.publishSnapshot(snapshotPath, "")
+	return p.publishSnapshot(snapshotPath, manifest.Ref{})
 }
 
 type snapshotPublisher struct {
-	ctx            context.Context
-	ing            ingest.Ingester
-	manifestConfig *manifest.Config
-	location       string
-	directory      string
-	logf           func(string, ...any)
-	done           map[string]string
-	visiting       map[string]bool
+	ctx       context.Context
+	ing       ingest.Ingester
+	fetcher   fetch.Fetcher
+	codec     tarstream.Codec
+	required  bool
+	location  string
+	directory string
+	logf      func(string, ...any)
+	done      map[string]string
+	visiting  map[string]bool
 }
 
-func newSnapshotPublisher(ctx context.Context, logf func(string, ...any)) *snapshotPublisher {
+func newSnapshotPublisher(ctx context.Context, codec tarstream.Codec, required bool, logf func(string, ...any)) *snapshotPublisher {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
 	return &snapshotPublisher{
-		ctx:      ctx,
-		logf:     logf,
-		done:     make(map[string]string),
-		visiting: make(map[string]bool),
+		ctx: ctx, codec: codec, required: required, logf: logf,
+		done: make(map[string]string), visiting: make(map[string]bool),
 	}
 }
 
-func (p *snapshotPublisher) publishSnapshot(snapshotPath, wantDigest string) (result string, retErr error) {
+func (p *snapshotPublisher) publishSnapshot(snapshotPath string, expected manifest.Ref) (result string, retErr error) {
 	realPath, err := filepath.EvalSymlinks(snapshotPath)
 	if err != nil {
-		return "", fmt.Errorf("open snapshot: %w", err)
+		return "", protectArtifactReadError(p.codec, "resolve local snapshot", err)
 	}
 	realPath, err = filepath.Abs(realPath)
 	if err != nil {
 		return "", err
 	}
 	if p.visiting[realPath] {
-		return "", fmt.Errorf("upload-snapshot: cycle at %s", realPath)
+		return "", fmt.Errorf("upload-snapshot: snapshot cycle detected")
 	}
 	p.visiting[realPath] = true
 	defer func() { delete(p.visiting, realPath) }()
 
-	bundle, bundleDigest, err := openTarArtifact(realPath)
+	bundle, bundleScheme, bundleDigest, err := openTarArtifact(realPath, expected, p.codec, p.required)
 	if err != nil {
 		return "", fmt.Errorf("open snapshot: %w", err)
 	}
-	defer bundle.Close()
-	if wantDigest != "" {
-		if err := matchDigest(bundleDigest, wantDigest); err != nil {
-			return "", fmt.Errorf("open snapshot: %w", err)
-		}
-	} else if err := validateContentAddressedName(realPath, bundleDigest); err != nil {
-		return "", fmt.Errorf("open snapshot: %w", err)
-	}
-	if err := verifyArtifactFile(realPath, bundleDigest, int64(bundle.Size())); err != nil {
-		return "", fmt.Errorf("open snapshot: %w", err)
-	}
 	if ref, ok := p.done[realPath]; ok {
+		_ = bundle.Close()
 		return ref, nil
 	}
 	bundleSize := int64(bundle.Size())
 	entries, parsed, err := readSnapshotEntries(p.ctx, bundle, bundleSize)
 	if err != nil {
+		_ = bundle.Close()
 		return "", err
+	}
+	if err := bundle.Close(); err != nil {
+		return "", err
+	}
+	identity := manifest.Ref{
+		Scheme: manifest.RefSchemeFile, Path: realPath,
+		DigestScheme: bundleScheme, Digest: bundleDigest,
+	}
+	if err := validateSequentialInput(p.ctx, realPath, "snapshot", identity, bundleSize, p.codec, p.required); err != nil {
+		return "", fmt.Errorf("fully validate snapshot: %w", err)
 	}
 	bundleDir := filepath.Dir(realPath)
 
@@ -154,9 +158,20 @@ func (p *snapshotPublisher) publishSnapshot(snapshotPath, wantDigest string) (re
 		return "", fmt.Errorf("capacity.memory: %w", err)
 	}
 	if int64(memSize) > bundleSize {
-		return "", fmt.Errorf("snapshot %s too small (%d) for its memory section (%d)", realPath, bundleSize, memSize)
+		return "", fmt.Errorf("snapshot is too small for its memory section")
 	}
-	src := &memZipSource{bundle: bundle, memSize: memSize, zip: zipBytes}
+	sequential, closer, _, sequentialScheme, sequentialDigest, err := openSequentialTarArtifact(realPath, "snapshot", identity, p.codec, p.required)
+	if err != nil {
+		return "", fmt.Errorf("fully open snapshot: %w", err)
+	}
+	defer closer.Close()
+	if int64(sequential.Size()) != bundleSize {
+		return "", fmt.Errorf("snapshot logical size changed during publication")
+	}
+	if err := matchDigest(sequentialScheme, sequentialDigest, bundleScheme, bundleDigest); err != nil {
+		return "", fmt.Errorf("snapshot identity changed during publication")
+	}
+	src := &memZipSource{bundle: sequential, originalSize: sequential.Size(), memSize: memSize, zip: zipBytes}
 	if p.ing != nil {
 		res, err := p.ing.Ingest(p.ctx, src, ingest.IngestOption{OnProgress: p.progress("memory section")})
 		if err != nil {
@@ -171,7 +186,10 @@ func (p *snapshotPublisher) publishSnapshot(snapshotPath, wantDigest string) (re
 		}
 		tmpPath := tmp.Name()
 		defer os.Remove(tmpPath)
-		digest, writeErr := tartransition.WriteTo(p.ctx, tmp, "snapshot", src)
+		scheme, digest, writeErr := tarstream.WriteTo(p.ctx, tmp, "snapshot", src, p.writeOptions()...)
+		if writeErr == nil {
+			writeErr = tmp.Sync()
+		}
 		closeErr := tmp.Close()
 		if writeErr != nil {
 			return "", fmt.Errorf("rebuild snapshot: %w", writeErr)
@@ -179,13 +197,30 @@ func (p *snapshotPublisher) publishSnapshot(snapshotPath, wantDigest string) (re
 		if closeErr != nil {
 			return "", closeErr
 		}
-		result, err = p.publishLocationFile(tmpPath, ".snapshot", digest, false)
+		result, err = p.publishLocationFile(tmpPath, ".snapshot", scheme, digest, src.Size())
 		if err != nil {
 			return "", err
 		}
 	}
 	p.done[realPath] = result
 	return result, nil
+}
+
+func validateSequentialInput(ctx context.Context, path, name string, identity manifest.Ref, logicalSize int64, codec tarstream.Codec, required bool) error {
+	source, closer, _, _, _, err := openSequentialTarArtifact(path, name, identity, codec, required)
+	if err != nil {
+		return err
+	}
+	if int64(source.Size()) != logicalSize {
+		_ = closer.Close()
+		return fmt.Errorf("logical size changed during validation")
+	}
+	consumeErr := consumeSource(ctx, source, 0)
+	closeErr := closer.Close()
+	if consumeErr != nil {
+		return consumeErr
+	}
+	return closeErr
 }
 
 func readSnapshotEntries(ctx context.Context, bundle fetch.Stream, bundleSize int64) (map[string][]byte, *SnapshotCfg, error) {
@@ -256,19 +291,19 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 	}
 	ref, err := manifest.ParseRef(raw)
 	if err != nil {
-		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
+		return "", protectArtifactReadError(p.codec, "upload-snapshot: parse "+label, err)
 	}
-	wantDigest, err := tartransition.SHA256RefDigest(ref)
-	if err != nil {
-		return "", fmt.Errorf("upload-snapshot: %s: unsupported digest scheme: %w", label, err)
-	}
-	if ref.Scheme == manifest.RefSchemeManifest && p.manifestConfig != nil {
+	if ref.Scheme == manifest.RefSchemeManifest && p.fetcher != nil {
 		key, err := manifest.ParseHexKey(ref.Path)
 		if err != nil {
 			return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
 		}
-		if err := p.manifestConfig.CheckManifest(p.ctx, key); err != nil {
+		stream, err := p.fetcher.OpenManifest(p.ctx, key)
+		if err != nil {
 			return "", fmt.Errorf("upload-snapshot: %s %q: %w", label, ref.String(), err)
+		}
+		if err := stream.Close(); err != nil {
+			return "", err
 		}
 	}
 	if ref.Portable() {
@@ -279,27 +314,17 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 		path = filepath.Join(relativeDir, path)
 	}
 	if snapshotRef {
-		return p.publishSnapshot(path, wantDigest)
+		return p.publishSnapshot(path, ref)
 	}
-	return p.publishLeaf(label, path, wantDigest)
+	return p.publishLeaf(label, path, ref)
 }
 
-func (p *snapshotPublisher) publishLeaf(label, path, wantDigest string) (string, error) {
-	stream, digest, err := openTarArtifact(path)
+func (p *snapshotPublisher) publishLeaf(label, path string, expected manifest.Ref) (string, error) {
+	stream, closer, payloadName, scheme, digest, err := openSequentialTarArtifact(path, "", expected, p.codec, p.required)
 	if err != nil {
 		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
 	}
-	defer stream.Close()
-	if err := verifyArtifactFile(path, digest, int64(stream.Size())); err != nil {
-		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
-	}
-	if wantDigest != "" {
-		if err := matchDigest(digest, wantDigest); err != nil {
-			return "", err
-		}
-	} else if err := validateContentAddressedName(path, digest); err != nil {
-		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
-	}
+	defer closer.Close()
 
 	if p.ing != nil {
 		res, err := p.ing.Ingest(p.ctx, stream, ingest.IngestOption{OnProgress: p.progress(label)})
@@ -307,113 +332,113 @@ func (p *snapshotPublisher) publishLeaf(label, path, wantDigest string) (string,
 			return "", fmt.Errorf("upload-snapshot: ingest %s: %w", label, err)
 		}
 		key := manifest.HexKey(res.ManifestKey)
-		p.logf("upload-snapshot: %s %s → manifest://%s (stored=%d dedup=%d)", label, path, key, res.StoredChunks, res.DedupChunks)
+		p.logf("upload-snapshot: %s → manifest://%s (stored=%d dedup=%d)", label, key, res.StoredChunks, res.DedupChunks)
 		return "manifest://" + key, nil
 	}
-	ext := filepath.Ext(path)
-	return p.publishLocationFile(path, ext, digest, wantDigest != "")
-}
-
-func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, digest string, keepDigest bool) (string, error) {
-	hexDigest, err := tartransition.SHA256Digest(digest)
-	if err != nil {
-		return "", fmt.Errorf("publish location: unsupported digest scheme: %w", err)
-	}
-	basename := hexDigest + ext
-	destination := filepath.Join(p.directory, basename)
-	sourceInfo, err := os.Stat(sourcePath)
+	tmp, err := os.CreateTemp(p.directory, ".publish-leaf-*.tmp")
 	if err != nil {
 		return "", err
 	}
-	if destInfo, statErr := os.Stat(destination); statErr == nil {
-		if destInfo.Size() == sourceInfo.Size() && verifyArtifactFile(destination, digest, 0) == nil {
-			return p.locatedRef(basename, hexDigest, keepDigest)
-		}
-	} else if !os.IsNotExist(statErr) {
-		return "", statErr
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	outScheme, outDigest, writeErr := tarstream.WriteTo(p.ctx, tmp, payloadName, stream, p.writeOptions()...)
+	if writeErr == nil {
+		writeErr = tmp.Sync()
 	}
-
-	in, err := os.Open(sourcePath)
-	if err != nil {
-		return "", err
-	}
-	defer in.Close()
-	// Named locations deliberately do not require temporary-file rename support.
-	// Valid content-addressed files are reused; an invalid final name is repaired
-	// in place by one sequential write.
-	out, err := os.OpenFile(destination, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return "", err
-	}
-	copyErr := copyAndVerifyArtifact(out, in, sourceInfo.Size(), digest)
-	if copyErr == nil {
-		copyErr = out.Sync()
-	}
-	closeErr := out.Close()
-	if copyErr != nil {
-		return "", copyErr
+	closeErr := tmp.Close()
+	if writeErr != nil {
+		return "", fmt.Errorf("upload-snapshot: encode %s: %w", label, writeErr)
 	}
 	if closeErr != nil {
 		return "", closeErr
 	}
-	if err := verifyArtifactFile(destination, digest, 0); err != nil {
-		return "", fmt.Errorf("verify published %s: %w", destination, err)
+	if err := matchDigest(outScheme, outDigest, scheme, digest); err != nil {
+		return "", fmt.Errorf("upload-snapshot: converted identity changed")
+	}
+	ext := filepath.Ext(path)
+	return p.publishLocationFile(tmpPath, ext, outScheme, outDigest, stream.Size())
+}
+
+func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest string, logicalSize uint64) (string, error) {
+	basename := digest + ext
+	destination := filepath.Join(p.directory, basename)
+	outputRequired := p.codec != nil
+	if err := os.Chmod(sourcePath, 0o644); err != nil {
+		return "", fmt.Errorf("publish location: set temporary permissions: %w", err)
+	}
+	if err := validatePublishedFinal(p.ctx, sourcePath, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
+		return "", fmt.Errorf("publish location: validate converted output: %w", err)
+	}
+	err := unix.Renameat2(unix.AT_FDCWD, sourcePath, unix.AT_FDCWD, destination, unix.RENAME_NOREPLACE)
+	if err == unix.EEXIST {
+		if validateErr := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); validateErr != nil {
+			return "", fmt.Errorf("publish location: existing final is invalid: %w", validateErr)
+		}
+		return p.locatedRef(basename, scheme, digest)
+	}
+	if err != nil {
+		return "", fmt.Errorf("publish location: commit without replacement: %w", err)
+	}
+	dir, err := os.Open(p.directory)
+	if err != nil {
+		return "", fmt.Errorf("publish location: open parent directory: %w", err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return "", fmt.Errorf("publish location: sync parent directory: %w", syncErr)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("publish location: close parent directory: %w", closeErr)
 	}
 	p.logf("upload-snapshot: published %s", destination)
-	return p.locatedRef(basename, hexDigest, keepDigest)
+	return p.locatedRef(basename, scheme, digest)
 }
 
-func (p *snapshotPublisher) locatedRef(basename, digest string, keepDigest bool) (string, error) {
-	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: basename, Location: p.location}
-	if keepDigest {
-		return tartransition.SHA256RefString(ref, digest)
-	}
-	return ref.String(), nil
-}
-
-const tarstreamTrailerSize = int64(3 * 512) // marker header + two zero blocks
-
-func copyAndVerifyArtifact(dst io.Writer, src io.Reader, size int64, wantDigest string) error {
-	if size < tarstreamTrailerSize {
-		return fmt.Errorf("tarstream artifact is too small: %d", size)
-	}
-	h := sha256.New()
-	if _, err := io.CopyN(io.MultiWriter(dst, h), src, size-tarstreamTrailerSize); err != nil {
-		return err
-	}
-	if _, err := io.CopyN(dst, src, tarstreamTrailerSize); err != nil {
-		return err
-	}
-	got := fmt.Sprintf("sha256:%x", h.Sum(nil))
-	if got != wantDigest {
-		return fmt.Errorf("tarstream digest mismatch: got %s, want %s", got, wantDigest)
-	}
-	return nil
-}
-
-func verifyArtifactFile(path, wantDigest string, wantLogicalSize int64) error {
-	stream, digest, err := openTarArtifact(path)
+func validatePublishedFinal(ctx context.Context, path string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string) error {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
-		return err
-	}
-	logicalSize := int64(stream.Size())
-	stream.Close()
-	if digest != wantDigest {
-		return fmt.Errorf("digest marker mismatch: got %s, want %s", digest, wantDigest)
-	}
-	if wantLogicalSize > 0 && logicalSize != wantLogicalSize {
-		return fmt.Errorf("logical size mismatch: got %d, want %d", logicalSize, wantLogicalSize)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return err
+		return protectArtifactReadError(codec, "open existing final", err)
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
 		return err
 	}
-	return copyAndVerifyArtifact(io.Discard, f, info.Size(), wantDigest)
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("existing final is not a regular file")
+	}
+	var options []tarstream.ReadOption
+	if codec != nil {
+		options = append(options, tarstream.WithCodec(codec, required))
+	}
+	options = append(options, tarstream.WithExpectedDigest(scheme, digest))
+	source, _, err := tarstream.SourceFrom(f, "", options...)
+	if err != nil {
+		return err
+	}
+	if source.Size() != logicalSize {
+		return fmt.Errorf("existing final logical size mismatch")
+	}
+	return consumeSource(ctx, source, 0)
+}
+
+func (p *snapshotPublisher) locatedRef(basename, scheme, digest string) (string, error) {
+	ref := manifest.Ref{
+		Scheme: manifest.RefSchemeFile, Path: basename, Location: p.location,
+		DigestScheme: scheme, Digest: digest,
+	}
+	if err := ref.Validate(); err != nil {
+		return "", err
+	}
+	return ref.String(), nil
+}
+
+func (p *snapshotPublisher) writeOptions() []tarstream.WriteOption {
+	if p.codec == nil {
+		return nil
+	}
+	return []tarstream.WriteOption{tarstream.WithCodec(p.codec, p.required)}
 }
 
 func (p *snapshotPublisher) progress(label string) func(processed, total uint64) {
@@ -431,9 +456,12 @@ func (p *snapshotPublisher) progress(label string) func(processed, total uint64)
 // memZipSource composes [0,memSize) of the bundle entry followed by the
 // re-rendered ZIP trailer as one sparse.Source.
 type memZipSource struct {
-	bundle  sparse.Source
-	memSize uint64
-	zip     []byte
+	bundle       sparse.Source
+	originalSize uint64
+	memSize      uint64
+	zip          []byte
+	validated    bool
+	validateErr  error
 }
 
 func (s *memZipSource) Size() uint64 { return s.memSize + uint64(len(s.zip)) }
@@ -474,14 +502,33 @@ func (s *memZipSource) ReadAt(ctx context.Context, buf []byte, off uint64) (int,
 		if rest := s.memSize - off; uint64(part) > rest {
 			part = int(rest)
 		}
-		if _, err := s.bundle.ReadAt(ctx, p[:part], off); err != nil && err != io.EOF {
-			return 0, err
+		read, err := s.bundle.ReadAt(ctx, p[:part], off)
+		if err != nil && err != io.EOF {
+			return read, err
+		}
+		if read != part {
+			return read, fmt.Errorf("short snapshot source read")
 		}
 		done += part
 		off += uint64(part)
 	}
 	if done < n {
+		if err := s.validateOriginal(ctx); err != nil {
+			return done, err
+		}
 		copy(p[done:], s.zip[off-s.memSize:])
 	}
 	return n, eof
+}
+
+func (s *memZipSource) validateOriginal(ctx context.Context) error {
+	if !s.validated {
+		s.validated = true
+		if s.originalSize != s.bundle.Size() || s.memSize > s.originalSize {
+			s.validateErr = fmt.Errorf("snapshot source geometry changed")
+		} else {
+			s.validateErr = consumeSource(ctx, s.bundle, s.memSize)
+		}
+	}
+	return s.validateErr
 }

@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandboxer/internal/tartransition"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -19,20 +19,19 @@ func TestOpenDiskStreamValidatesLocatedContentName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tartransition.WriteTo(context.Background(), tmp, "image", sparse.Dense(bytes.NewReader([]byte("image")), 5))
+	_, digest, err := tarstream.WriteTo(context.Background(), tmp, "image", sparse.Dense(bytes.NewReader([]byte("image")), 5))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := tmp.Close(); err != nil {
 		t.Fatal(err)
 	}
-	hexDigest := strings.TrimPrefix(digest, "sha256:")
-	goodName := hexDigest + ".image"
+	goodName := digest + ".image"
 	if err := os.Rename(tmp.Name(), filepath.Join(dir, goodName)); err != nil {
 		t.Fatal(err)
 	}
 	locations := config.RefLocations{"shared": dir}
-	stream, _, err := OpenDiskStream(context.Background(), "file://"+goodName+"@location:shared", nil, locations)
+	stream, _, err := OpenDiskStream(context.Background(), "file://"+goodName+"@location:shared", nil, locations, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +45,7 @@ func TestOpenDiskStreamValidatesLocatedContentName(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, badName), body, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := OpenDiskStream(context.Background(), "file://"+badName+"@location:shared", nil, locations); err == nil {
+	if _, _, err := OpenDiskStream(context.Background(), "file://"+badName+"@location:shared", nil, locations, nil, false); err == nil {
 		t.Fatal("located ref with a mismatched content name succeeded")
 	}
 }
@@ -58,14 +57,14 @@ func TestOpenDiskStreamFollowsLocatedSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := tartransition.WriteTo(context.Background(), tmp, "image", sparse.Dense(bytes.NewReader([]byte("image")), 5))
+	_, digest, err := tarstream.WriteTo(context.Background(), tmp, "image", sparse.Dense(bytes.NewReader([]byte("image")), 5))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := tmp.Close(); err != nil {
 		t.Fatal(err)
 	}
-	name := strings.TrimPrefix(digest, "sha256:") + ".image"
+	name := digest + ".image"
 	target := filepath.Join(outsideDir, name)
 	if err := os.Rename(tmp.Name(), target); err != nil {
 		t.Fatal(err)
@@ -74,7 +73,7 @@ func TestOpenDiskStreamFollowsLocatedSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stream, _, err := OpenDiskStream(context.Background(), "file://"+name+"@location:shared", nil, config.RefLocations{"shared": locationDir})
+	stream, _, err := OpenDiskStream(context.Background(), "file://"+name+"@location:shared", nil, config.RefLocations{"shared": locationDir}, nil, false)
 	if err != nil {
 		t.Fatalf("open located symlink: %v", err)
 	}
