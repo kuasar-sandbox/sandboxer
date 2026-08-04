@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 )
@@ -64,21 +65,37 @@ func infoCmd(args []string) int {
 		stream    fetch.Stream
 		totalSize int64
 	)
-	uri := input
-	if !strings.HasPrefix(uri, "manifest://") && !strings.HasPrefix(uri, "file://") {
-		uri = "file://" + uri
+	if strings.HasPrefix(input, "manifest://") || strings.HasPrefix(input, "file://") {
+		if strings.HasPrefix(input, "manifest://") && manifestCfg == nil {
+			fmt.Fprintln(os.Stderr, "manifest:// input requires --manifest-config or MANIFEST_CONFIG")
+			return 1
+		}
+		opened, size, err := sandbox.OpenDiskStream(ctx, input, manifestFetcher, refLocations, localCodec, localRequired)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		stream, totalSize = opened, size
+	} else {
+		var options []tarstream.ReadOption
+		if localCodec != nil {
+			options = append(options, tarstream.WithCodec(localCodec, localRequired))
+		} else if localRequired {
+			fmt.Fprintln(os.Stderr, "local tarstream: required policy has no codec")
+			return 1
+		}
+		opened, err := fetch.OpenTarStream(input, options...)
+		if err != nil {
+			if localCodec != nil {
+				fmt.Fprintln(os.Stderr, "open local artifact failed")
+			} else {
+				fmt.Fprintln(os.Stderr, err)
+			}
+			return 1
+		}
+		stream, totalSize = opened, int64(opened.Size())
 	}
-	if strings.HasPrefix(uri, "manifest://") && manifestCfg == nil {
-		fmt.Fprintln(os.Stderr, "manifest:// input requires --manifest-config or MANIFEST_CONFIG")
-		return 1
-	}
-	opened, size, err := sandbox.OpenDiskStream(ctx, uri, manifestFetcher, refLocations, localCodec, localRequired)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer opened.Close()
-	stream, totalSize = opened, size
+	defer stream.Close()
 
 	body, err := readSnapshotCfg(fetch.NewReaderAt(ctx, stream), totalSize)
 	if err != nil {

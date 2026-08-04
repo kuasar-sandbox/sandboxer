@@ -67,6 +67,19 @@ func TestInfoLocalCryptoPolicy(t *testing.T) {
 	if rc != 0 || !strings.Contains(stdout, "memory: 4KiB") || stderr != "" {
 		t.Fatalf("auto plaintext rc=%d stdout=%q stderr=%q", rc, stdout, stderr)
 	}
+
+	literalDir := filepath.Join(t.TempDir(), "literal@location:not-a-ref")
+	if err := os.Mkdir(literalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	literalPath := filepath.Join(literalDir, filepath.Base(plainPath))
+	if err := os.Rename(plainPath, literalPath); err != nil {
+		t.Fatal(err)
+	}
+	rc, stdout, stderr = captureInfoOutput(t, func() int { return infoCmd([]string{literalPath}) })
+	if rc != 0 || !strings.Contains(stdout, "memory: 4KiB") || stderr != "" {
+		t.Fatalf("literal path rc=%d stdout=%q stderr=%q", rc, stdout, stderr)
+	}
 }
 
 func captureInfoOutput(t *testing.T, fn func() int) (int, string, string) {

@@ -884,18 +884,28 @@ func canonicalizeSnapshotTarRef(ctx context.Context, raw string, opts Options) (
 }
 
 func openSnapshotArtifact(ctx context.Context, opts Options) (fetch.Stream, string, string, error) {
-	var ref manifest.Ref
-	if opts.SnapshotRef != "" {
-		parsed, err := manifest.ParseRef(opts.SnapshotRef)
+	if opts.SnapshotRef == "" {
+		options, err := tarReadOptions(manifest.Ref{}, opts.LocalCodec, opts.LocalRequired)
 		if err != nil {
-			return nil, "", "", protectArtifactReadError(opts.LocalCodec, "parse snapshot ref", err)
+			return nil, "", "", err
 		}
-		if parsed.Scheme != manifest.RefSchemeFile {
-			return nil, "", "", fmt.Errorf("snapshot path cannot use %s ref", parsed.Scheme)
+		stream, err := fetch.OpenTarStream(opts.SnapshotPath, options...)
+		if err != nil {
+			return nil, "", "", protectArtifactReadError(opts.LocalCodec, "open local snapshot", err)
 		}
-		ref = parsed
-	} else {
-		ref = manifest.Ref{Scheme: manifest.RefSchemeFile, Path: opts.SnapshotPath}
+		scheme, digest, digestErr := sourceDigest(stream)
+		if digestErr != nil {
+			_ = stream.Close()
+			return nil, "", "", digestErr
+		}
+		return stream, scheme, digest, nil
+	}
+	ref, err := manifest.ParseRef(opts.SnapshotRef)
+	if err != nil {
+		return nil, "", "", protectArtifactReadError(opts.LocalCodec, "parse snapshot ref", err)
+	}
+	if ref.Scheme != manifest.RefSchemeFile {
+		return nil, "", "", fmt.Errorf("snapshot path cannot use %s ref", ref.Scheme)
 	}
 	if ref.Location != "" {
 		resolved, err := opts.RefLocations.ResolveFile(ref, "")
@@ -905,28 +915,8 @@ func openSnapshotArtifact(ctx context.Context, opts Options) (fetch.Stream, stri
 		if filepath.Clean(resolved) != filepath.Clean(opts.SnapshotPath) {
 			return nil, "", "", fmt.Errorf("located root ref does not resolve to snapshot path")
 		}
-		stream, _, err := sandbox.OpenDiskStream(ctx, ref.String(), opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
-		if err != nil {
-			return nil, "", "", err
-		}
-		scheme, digest, digestErr := sourceDigest(stream)
-		if digestErr != nil {
-			_ = stream.Close()
-			return nil, "", "", digestErr
-		}
-		return stream, scheme, digest, nil
 	}
-	ref.Path = opts.SnapshotPath
-	stream, _, err := sandbox.OpenDiskStream(ctx, ref.String(), opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
-	if err != nil {
-		return nil, "", "", err
-	}
-	scheme, digest, err := sourceDigest(stream)
-	if err != nil {
-		_ = stream.Close()
-		return nil, "", "", err
-	}
-	return stream, scheme, digest, nil
+	return openTarArtifact(opts.SnapshotPath, ref, opts.LocalCodec, opts.LocalRequired)
 }
 
 func (o Options) localSnapshotPath() string {

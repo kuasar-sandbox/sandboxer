@@ -447,6 +447,30 @@ func TestLocalSnapshotPathKeepsUnlocatedDigestRef(t *testing.T) {
 	}
 }
 
+func TestOpenSnapshotArtifactTreatsPlainPathLiterally(t *testing.T) {
+	cfg := &SnapshotCfg{}
+	cfg.Resources.Capacity.Memory = "4KiB"
+	path := writePublishSnapshot(t, t.TempDir(), cfg)
+	dir := filepath.Join(t.TempDir(), "literal@location:not-a-ref")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	literal := filepath.Join(dir, filepath.Base(path))
+	if err := os.Rename(path, literal); err != nil {
+		t.Fatal(err)
+	}
+	stream, scheme, digest, err := openSnapshotArtifact(context.Background(), Options{SnapshotPath: literal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr := stream.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if scheme != tarstream.DigestSchemeSHA256 || digest == "" {
+		t.Fatalf("literal snapshot identity = %s:%s", scheme, digest)
+	}
+}
+
 func TestFileSnapshotRefUsesActualSchemeAndPreservesLocation(t *testing.T) {
 	target := filepath.Join(t.TempDir(), strings.Repeat("a", 64)+".snapshot")
 	if err := os.WriteFile(target, nil, 0o644); err != nil {
