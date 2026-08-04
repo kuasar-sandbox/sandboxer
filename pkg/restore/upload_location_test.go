@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -266,6 +267,21 @@ func TestPreflightLocatedRefsValidatesOpaqueRootMemoryLayers(t *testing.T) {
 	err := preflightLocatedRefs(context.Background(), Options{SnapshotPath: rootPath})
 	if err == nil || !strings.Contains(err.Error(), `location "missing-parent" is not configured`) {
 		t.Fatalf("missing opaque root memory layer error = %v", err)
+	}
+}
+
+func TestPreflightLocatedRefsBoundsFlattenedMemoryLayers(t *testing.T) {
+	refs := make([]string, maxSnapshotParentEntries+1)
+	for i := range refs {
+		refs[i] = "file://" + fmt.Sprintf("%064x", i+1) + ".snapshot"
+	}
+	rootCfg := &SnapshotCfg{FromRefs: refs}
+	rootCfg.Resources.Capacity.Memory = "4KiB"
+	rootPath := writePublishSnapshot(t, t.TempDir(), rootCfg)
+
+	err := preflightLocatedRefs(context.Background(), Options{SnapshotPath: rootPath})
+	if err == nil || !strings.Contains(err.Error(), "snapshot parent graph exceeds 1024 entries") {
+		t.Fatalf("oversized flattened memory list error = %v", err)
 	}
 }
 

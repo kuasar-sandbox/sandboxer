@@ -941,6 +941,8 @@ func resolveLocalMergePath(raw, snapshotPath string, locations config.RefLocatio
 	return locations.ResolveFile(ref, filepath.Dir(snapshotPath))
 }
 
+const maxSnapshotParentEntries = 1024
+
 // preflightLocatedRefs validates every artifact referenced by the root
 // snapshot.cfg before cgroup, run-directory, TAP, or VMM side effects. The
 // root from_refs list is already the flattened memory chain; each entry is an
@@ -977,6 +979,13 @@ func preflightLocatedRefs(ctx context.Context, opts Options) error {
 	for _, raw := range snapshotArtifactRefs(root, &overrides) {
 		if err := preflightLocatedRef(ctx, raw, opts); err != nil {
 			return err
+		}
+	}
+	seenParents := make(map[string]struct{}, maxSnapshotParentEntries+1)
+	for _, raw := range root.FromRefs {
+		seenParents[raw] = struct{}{}
+		if len(seenParents) > maxSnapshotParentEntries {
+			return fmt.Errorf("snapshot parent graph exceeds %d entries", maxSnapshotParentEntries)
 		}
 	}
 	for i, raw := range root.FromRefs {
