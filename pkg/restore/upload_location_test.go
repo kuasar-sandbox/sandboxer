@@ -21,7 +21,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestPublishLocalToLocationRewritesLocalRefsAndRejectsInconsistentFinal(t *testing.T) {
+func TestPublishLocalToLocationRewritesLocalRefsAndRepairsInconsistentFinal(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()
 	targetDir := t.TempDir()
@@ -109,11 +109,15 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRejectsInconsistentFinal(t *t
 	if err := os.WriteFile(publishedOverlay, []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil, false, nil); err == nil {
-		t.Fatal("inconsistent existing final was silently replaced")
+	repairedRef, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil, false, nil)
+	if err != nil {
+		t.Fatalf("repair inconsistent existing final: %v", err)
 	}
-	if got, err := os.ReadFile(publishedOverlay); err != nil || string(got) != "partial" {
-		t.Fatalf("inconsistent final changed: %q err=%v", got, err)
+	if repairedRef != rootRef {
+		t.Fatalf("repaired root ref=%q want=%q", repairedRef, rootRef)
+	}
+	if err := validatePublishedFinal(ctx, publishedOverlay, 4096, nil, false, "sha256", strings.TrimPrefix(overlayDigest, "sha256:")); err != nil {
+		t.Fatalf("repaired overlay is invalid: %v", err)
 	}
 }
 

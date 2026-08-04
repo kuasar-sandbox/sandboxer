@@ -423,31 +423,69 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest 
 	if err := validatePublishedFinal(p.ctx, sourcePath, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
 		return "", fmt.Errorf("publish location: validate converted output: %w", err)
 	}
-	created, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		if os.IsExist(err) {
-			if validateErr := validateExistingLocationFile(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); validateErr != nil {
-				return "", fmt.Errorf("publish location: existing final is invalid: %w", validateErr)
+	const takeoverAttempts = 3
+	for attempt := 0; attempt < takeoverAttempts; attempt++ {
+		created, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			if !os.IsExist(err) {
+				return "", fmt.Errorf("publish location: create final exclusively: %w", err)
 			}
-			return p.locatedRef(basename, scheme, digest)
+			validateErr := validateExistingLocationFile(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest)
+			if validateErr == nil {
+				return p.locatedRef(basename, scheme, digest)
+			}
+			if err := removeInvalidLocationFile(destination); err != nil {
+				return "", fmt.Errorf("publish location: existing final is invalid (%v) and cannot be replaced: %w", validateErr, err)
+			}
+			continue
 		}
-		return "", fmt.Errorf("publish location: create final exclusively: %w", err)
-	}
-	owned := true
-	defer func() {
-		if owned {
-			_ = os.Remove(destination)
+		ownedInfo, err := created.Stat()
+		if err != nil {
+			_ = created.Close()
+			_ = removeOwnedLocationFile(destination, nil)
+			return "", fmt.Errorf("publish location: stat created final: %w", err)
 		}
-	}()
-	if err := copySyncAndCloseLocationFile(p.ctx, created, sourcePath); err != nil {
-		return "", fmt.Errorf("publish location: write final: %w", err)
+		owned := true
+		defer func() {
+			if owned {
+				_ = removeOwnedLocationFile(destination, ownedInfo)
+			}
+		}()
+		if err := copySyncAndCloseLocationFile(p.ctx, created, sourcePath); err != nil {
+			return "", fmt.Errorf("publish location: write final: %w", err)
+		}
+		if err := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
+			return "", fmt.Errorf("publish location: validate final: %w", err)
+		}
+		owned = false
+		p.logf("upload-snapshot: published %s", destination)
+		return p.locatedRef(basename, scheme, digest)
 	}
-	if err := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
-		return "", fmt.Errorf("publish location: validate final: %w", err)
+	return "", fmt.Errorf("publish location: could not acquire final after %d attempts", takeoverAttempts)
+}
+
+func removeInvalidLocationFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
 	}
-	owned = false
-	p.logf("upload-snapshot: published %s", destination)
-	return p.locatedRef(basename, scheme, digest)
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("existing final is not a regular file")
+	}
+	return os.Remove(path)
+}
+
+func removeOwnedLocationFile(path string, owned os.FileInfo) error {
+	if owned != nil {
+		current, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(owned, current) {
+			return fmt.Errorf("final path is now owned by another publisher")
+		}
+	}
+	return os.Remove(path)
 }
 
 // publishLocationCopy is a test seam for failures after the publisher owns the
