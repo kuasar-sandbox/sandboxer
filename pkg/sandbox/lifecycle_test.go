@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
@@ -23,29 +24,27 @@ import (
 
 func TestValidateLocalMemoryRefsUsesOutputBundleDirectory(t *testing.T) {
 	out := t.TempDir()
-	name := "base.snapshot"
+	path, scheme, digest := writeDiskArtifact(t, out, "snapshot", []byte("artifact"), nil)
+	name := filepath.Base(path)
 	manifestRef := "manifest://" + strings.Repeat("a", 64)
 	locatedRef := "file://located.snapshot@location:parent"
-	if err := os.WriteFile(filepath.Join(out, name), []byte("artifact"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	refs := []string{
-		"file:///different/source/" + name,
+		fileRef(filepath.Join("/different/source", name), scheme, digest),
 		manifestRef,
 		locatedRef,
 	}
-	if err := validateLocalMemoryRefs(out, refs, nil); err != nil {
+	if err := validateLocalMemoryRefs(out, refs, nil, false); err != nil {
 		t.Fatalf("validateLocalMemoryRefs() error = %v", err)
 	}
 
 	if err := os.Symlink(name, filepath.Join(out, "alias.snapshot")); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateLocalMemoryRefs(out, []string{"file://alias.snapshot"}, nil); err != nil {
+	if err := validateLocalMemoryRefs(out, []string{"file://alias.snapshot"}, nil, false); err != nil {
 		t.Fatalf("accessible sibling symlink should be accepted: %v", err)
 	}
 
-	err := validateLocalMemoryRefs(out, []string{"file://missing.snapshot"}, nil)
+	err := validateLocalMemoryRefs(out, []string{"file://missing.snapshot"}, nil, false)
 	if err == nil || !strings.Contains(err.Error(), "not accessible") {
 		t.Fatalf("missing local memory ref error = %v", err)
 	}
@@ -77,11 +76,38 @@ func TestValidateLocalMemoryRefsRejectsNonRegularFiles(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			err := validateLocalMemoryRefs(out, []string{"file://base.snapshot"}, nil)
+			err := validateLocalMemoryRefs(out, []string{"file://base.snapshot"}, nil, false)
 			if err == nil || !strings.Contains(err.Error(), "is not a regular file") {
 				t.Fatalf("non-regular local memory ref error = %v", err)
 			}
 		})
+	}
+}
+
+func TestValidateLocalMemoryRefsEnforcesCryptoPolicy(t *testing.T) {
+	out := t.TempDir()
+	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x51})
+	wrongCodec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x52})
+	plainPath, plainScheme, plainDigest := writeDiskArtifact(t, out, "snapshot", []byte("plain memory"), nil)
+	otherPath, _, _ := writeDiskArtifact(t, out, "snapshot", []byte("other memory"), nil)
+	encryptedPath, encryptedScheme, encryptedDigest := writeDiskArtifact(t, out, "snapshot", []byte("encrypted memory"), codec)
+	plainRef := fileRef(plainPath, plainScheme, plainDigest)
+	encryptedRef := fileRef(encryptedPath, encryptedScheme, encryptedDigest)
+
+	if err := validateLocalMemoryRefs(out, []string{plainRef}, codec, false); err != nil {
+		t.Fatalf("auto rejected plaintext memory dependency: %v", err)
+	}
+	if err := validateLocalMemoryRefs(out, []string{plainRef}, codec, true); err == nil {
+		t.Fatal("required accepted plaintext memory dependency")
+	}
+	if err := validateLocalMemoryRefs(out, []string{encryptedRef}, codec, true); err != nil {
+		t.Fatalf("required rejected encrypted memory dependency: %v", err)
+	}
+	if err := validateLocalMemoryRefs(out, []string{encryptedRef}, wrongCodec, true); err == nil {
+		t.Fatal("wrong key accepted encrypted memory dependency")
+	}
+	if err := validateLocalMemoryRefs(out, []string{fileRef(otherPath, plainScheme, plainDigest)}, nil, false); err == nil {
+		t.Fatal("mismatched identity accepted memory dependency")
 	}
 }
 

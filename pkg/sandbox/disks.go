@@ -55,24 +55,28 @@ func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher, loca
 		if err != nil {
 			return nil, 0, protectLocalArtifactError(codec, "resolve local artifact ref", err)
 		}
-		options, err := fileReadOptions(ref, codec, required)
-		if err != nil {
-			return nil, 0, err
-		}
-		s, err := fetch.OpenTarStream(path, options...)
-		if err != nil {
-			return nil, 0, protectLocalArtifactError(codec, "open local artifact", err)
-		}
-		if err := validateFileRefIdentity(ref, path, s, codec, required); err != nil {
-			s.Close()
-			return nil, 0, err
-		}
-		return s, int64(s.Size()), nil
+		return openLocalDiskStream(path, ref, codec, required)
 	case manifest.RefSchemeManifest:
 		return OpenManifestStream(ctx, ref.Path, fetcher)
 	default:
 		return nil, 0, fmt.Errorf("unknown disk URI scheme: %s", ref.Scheme)
 	}
+}
+
+func openLocalDiskStream(path string, ref manifest.Ref, codec tarstream.Codec, required bool) (fetch.Stream, int64, error) {
+	options, err := fileReadOptions(ref, codec, required)
+	if err != nil {
+		return nil, 0, err
+	}
+	s, err := fetch.OpenTarStream(path, options...)
+	if err != nil {
+		return nil, 0, protectLocalArtifactError(codec, "open local artifact", err)
+	}
+	if err := validateFileRefIdentity(ref, path, s, codec, required); err != nil {
+		_ = s.Close()
+		return nil, 0, err
+	}
+	return s, int64(s.Size()), nil
 }
 
 // OpenLayeredBlockReader opens refs in top-to-bottom order and composes them as

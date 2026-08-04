@@ -922,7 +922,7 @@ func handleSnapshotRequest(
 		return ctl.Response{}, err
 	}
 	if !req.Upload {
-		if err := validateLocalMemoryRefs(req.OutDir, resultMemoryRefs, opts.LocalCodec); err != nil {
+		if err := validateLocalMemoryRefs(req.OutDir, resultMemoryRefs, opts.LocalCodec, opts.LocalRequired); err != nil {
 			return ctl.Response{}, err
 		}
 	}
@@ -1145,7 +1145,7 @@ func ensureSnapshotDir(dir string) error {
 	return os.Remove(name)
 }
 
-func validateLocalMemoryRefs(outputDir string, refs []string, codec tarstream.Codec) error {
+func validateLocalMemoryRefs(outputDir string, refs []string, codec tarstream.Codec, required bool) error {
 	for i, raw := range refs {
 		ref, err := manifest.ParseRef(raw)
 		if err != nil {
@@ -1168,14 +1168,11 @@ func validateLocalMemoryRefs(outputDir string, refs []string, codec tarstream.Co
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("snapshot: local memory ref[%d] is not a regular file", i)
 		}
-		f, err := os.Open(path)
+		stream, _, err := openLocalDiskStream(path, ref, codec, required)
 		if err != nil {
-			if codec != nil {
-				return fmt.Errorf("snapshot: local memory ref[%d] is not readable", i)
-			}
-			return fmt.Errorf("snapshot: local memory ref[%d] is not readable: %w", i, err)
+			return fmt.Errorf("snapshot: local memory ref[%d] validation: %w", i, err)
 		}
-		if err := f.Close(); err != nil {
+		if err := stream.Close(); err != nil {
 			return fmt.Errorf("snapshot: local memory ref[%d] close: %w", i, err)
 		}
 	}
