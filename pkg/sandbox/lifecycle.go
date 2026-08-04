@@ -771,7 +771,7 @@ type SnapshotHandler struct {
 	RunDir        string
 	Pinger        *guestlink.Pinger // optional; if non-nil, paused around quiesce/Take
 	Forwarder     *Forwarder        // optional; if non-nil, paused + active relays collapsed around quiesce
-	Reattach      func() error      // optional; re-establishes the stdio MUX after --resume
+	Reattach      func() error      // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
 	Logf          func(string, ...any)
 }
 
@@ -798,7 +798,7 @@ func handleSnapshotRequest(
 	chSock, runDir string,
 	pinger *guestlink.Pinger,
 	forwarder *Forwarder, // gates new forwards + collapses active relays around quiesce; may be nil
-	reattachMUX func() error, // re-establishes the stdio MUX after --resume; may be nil
+	reattachMUX func() error, // re-establishes the stdio MUX after a resumed snapshot attempt; may be nil
 	logf func(string, ...any),
 ) (resp ctl.Response, err error) {
 	dropCaches := req.DropCachesEnabled()
@@ -955,6 +955,7 @@ func handleSnapshotRequest(
 	}
 
 	dropCachesResult := proto.DropCachesUnknown
+	guestQuiesced := false
 
 	// Quiesce sequence (docs/sandbox.md §6.2 T2a, sandbox-init.md §3.4):
 	// pause the ping ticker, then `quiesce` → the guest does sync +
@@ -1015,6 +1016,7 @@ func handleSnapshotRequest(
 			return ctl.Response{}, fmt.Errorf("quiesce: %w", err)
 		}
 		dropCachesResult = result
+		guestQuiesced = true
 		logf("quiesce: guest acked (drop_caches=%s, MUX + forwards closed), proceeding to /vm.pause", result)
 	}
 
@@ -1057,8 +1059,24 @@ func handleSnapshotRequest(
 	if mergeMemory {
 		src.MergeBaseSnapshot = memoryMergeBase
 	}
+	reattachRunningGuest := func(reason string) {
+		if reattachMUX == nil {
+			return
+		}
+		if reattachErr := reattachMUX(); reattachErr != nil {
+			logf("stdio MUX re-attach after %s failed: %v (sandbox running, stdio detached)", reason, reattachErr)
+		} else {
+			logf("stdio MUX re-attached after %s", reason)
+		}
+	}
 	out, err := snapshot.Take(src, sink, req.ResumeAfter)
 	if err != nil {
+		// SendQuiesce closes the old MUX and freezes the application. Take
+		// restores the VM/backend state on failure; reattach completes the
+		// guest-side recovery and thaws the application before we return.
+		if guestQuiesced {
+			reattachRunningGuest("failed snapshot")
+		}
 		return ctl.Response{}, err
 	}
 
@@ -1067,12 +1085,8 @@ func handleSnapshotRequest(
 	// succeeded; a reattach failure just leaves the resumed sandbox with
 	// detached stdio). Do this before any upload work so the app, which is
 	// already running again, isn't blocked on a full stdout pipe for long.
-	if req.ResumeAfter && reattachMUX != nil {
-		if err := reattachMUX(); err != nil {
-			logf("stdio MUX re-attach after snapshot failed: %v (sandbox running, stdio detached)", err)
-		} else {
-			logf("stdio MUX re-attached after snapshot")
-		}
+	if req.ResumeAfter {
+		reattachRunningGuest("snapshot")
 	}
 
 	resp = ctl.Response{

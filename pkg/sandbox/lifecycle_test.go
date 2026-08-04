@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +22,8 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 func TestValidateLocalMemoryRefsUsesOutputBundleDirectory(t *testing.T) {
@@ -232,6 +236,125 @@ func TestHandleSnapshotRequestResolvesUploadKeyBeforeSnapshotView(t *testing.T) 
 	}
 	if viewCalled {
 		t.Fatal("snapshot view was opened before customer-key validation")
+	}
+}
+
+func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+	listener, err := net.Listen("unix", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guestDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			guestDone <- acceptErr
+			return
+		}
+		defer conn.Close()
+		line := make([]byte, len(proto.HostConnectLine))
+		if _, readErr := io.ReadFull(conn, line); readErr != nil {
+			guestDone <- readErr
+			return
+		}
+		if string(line) != string(proto.HostConnectLine) {
+			guestDone <- fmt.Errorf("CONNECT line = %q", line)
+			return
+		}
+		if _, writeErr := conn.Write([]byte("OK 1\n")); writeErr != nil {
+			guestDone <- writeErr
+			return
+		}
+		request, readErr := proto.ReadMessage(conn)
+		if readErr != nil {
+			guestDone <- readErr
+			return
+		}
+		if request.Type != proto.TypeQuiesce {
+			guestDone <- fmt.Errorf("request type = %q", request.Type)
+			return
+		}
+		guestDone <- proto.WriteMessage(conn, &proto.Message{
+			Type:             proto.TypeQuiesced,
+			DropCachesResult: proto.DropCachesSkipped,
+		})
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+	chSock := filepath.Join(dir, "ch.sock")
+	chListener, err := net.Listen("unix", chSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resumed atomic.Bool
+	chServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/vm.snapshot" {
+			http.Error(w, "injected snapshot failure", http.StatusInternalServerError)
+			return
+		}
+		if r.URL.Path == "/api/v1/vm.resume" {
+			resumed.Store(true)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	chDone := make(chan struct{})
+	go func() {
+		_ = chServer.Serve(chListener)
+		close(chDone)
+	}()
+	t.Cleanup(func() {
+		_ = chServer.Close()
+		<-chDone
+	})
+
+	mfd, err := memory.Create("snapshot-failure-reattach", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	reattachCalls := 0
+	reattachedAfterResume := false
+	_, err = handleSnapshotRequest(
+		ctl.Request{OutDir: filepath.Join(dir, "out")},
+		RunOptions{Cfg: &config.SandboxConfig{}, SandboxID: "test"},
+		mfd,
+		[]SnapDiskRef{{
+			DiffPath: filepath.Join(dir, "diff"),
+			Size:     4096,
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				return bytes.NewReader(make([]byte, 4096)), nil, nil
+			},
+		}},
+		nil,
+		chSock,
+		filepath.Join(dir, "run"),
+		&guestlink.Pinger{Client: &guestlink.HostClient{BasePath: base}},
+		nil,
+		func() error {
+			reattachCalls++
+			if !resumed.Load() {
+				return errors.New("reattach ran before VM resume")
+			}
+			reattachedAfterResume = true
+			return nil
+		},
+		discardLogf,
+	)
+	if err == nil || !strings.Contains(err.Error(), "CH snapshot") {
+		t.Fatalf("snapshot error = %v, want CH snapshot failure", err)
+	}
+	if guestErr := <-guestDone; guestErr != nil {
+		t.Fatal(guestErr)
+	}
+	if reattachCalls != 1 {
+		t.Fatalf("reattach calls = %d, want 1", reattachCalls)
+	}
+	if !resumed.Load() {
+		t.Fatal("VM was not resumed before failed snapshot returned")
+	}
+	if !reattachedAfterResume {
+		t.Fatal("guest was not reattached after VM resume")
 	}
 }
 
