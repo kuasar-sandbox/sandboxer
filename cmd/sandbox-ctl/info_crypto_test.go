@@ -72,7 +72,7 @@ func TestInfoLocalCryptoPolicy(t *testing.T) {
 	if err := os.Mkdir(literalDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	literalPath := filepath.Join(literalDir, filepath.Base(plainPath))
+	literalPath := filepath.Join(literalDir, "backup.snapshot")
 	if err := os.Rename(plainPath, literalPath); err != nil {
 		t.Fatal(err)
 	}
