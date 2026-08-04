@@ -133,11 +133,12 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	}
 	pausedAt := time.Now()
 	resumed := false
+	succeeded := false
 	defer func() {
-		// resume_after=false (destroy mode) is handled by the caller via
-		// /vm.shutdown after Take returns; here we only resume on the
-		// resume_after=true path.
-		if !resumed && resumeAfter {
+		// A failed snapshot always leaves the sandbox running, so undo the CH
+		// pause even on the destroy-on-success path. Successful destroy mode is
+		// handled by the caller via /vmm.shutdown and deliberately stays paused.
+		if !resumed && (!succeeded || resumeAfter) {
 			_ = ch.Resume()
 		}
 	}()
@@ -227,6 +228,7 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	out.WallclockPauseMs = pausedAt.Sub(pauseStart).Milliseconds()
 	out.WallclockDumpMs = dumpEnd.Sub(dumpStart).Milliseconds()
 	logf("snapshot: overlays=%v snapshot=%s memory_resident=%d", out.OverlayRefs, out.SnapshotRef, out.MemoryResident)
+	succeeded = true
 	return out, nil
 }
 

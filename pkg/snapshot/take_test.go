@@ -4,9 +4,14 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -66,3 +71,62 @@ func TestAbsorbOverlayRequiresSnapshotView(t *testing.T) {
 		t.Fatal("absorbOverlay accepted a raw-path-only diff")
 	}
 }
+
+func TestTakeResumesAfterDestroyModeFailure(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "ch.sock")
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var requests []string
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path == "/api/v1/vm.snapshot" {
+			http.Error(w, "injected snapshot failure", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	serveDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(serveDone)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-serveDone
+	})
+
+	quiescer := &recordingQuiescer{}
+	_, err = Take(Sources{
+		SandboxID:     "resume-on-error",
+		APISock:       sock,
+		StagingDir:    t.TempDir(),
+		CHApiDeadline: time.Second,
+		SnapshotCfg:   func([]string) ([]byte, error) { return nil, nil },
+		Quiescer:      quiescer,
+	}, NewFileSink(t.TempDir(), "resume-on-error", nil, false, nil), false)
+	if err == nil || !strings.Contains(err.Error(), "CH snapshot") {
+		t.Fatalf("Take error = %v, want injected CH snapshot failure", err)
+	}
+	mu.Lock()
+	got := strings.Join(requests, ",")
+	mu.Unlock()
+	if want := "/api/v1/vm.pause,/api/v1/vm.snapshot,/api/v1/vm.resume"; got != want {
+		t.Fatalf("CH requests = %q, want %q", got, want)
+	}
+	if quiescer.quiesce != 1 || quiescer.resume != 1 {
+		t.Fatalf("quiescer calls = quiesce:%d resume:%d", quiescer.quiesce, quiescer.resume)
+	}
+}
+
+type recordingQuiescer struct {
+	quiesce int
+	resume  int
+}
+
+func (q *recordingQuiescer) Quiesce() { q.quiesce++ }
+func (q *recordingQuiescer) Resume()  { q.resume++ }
