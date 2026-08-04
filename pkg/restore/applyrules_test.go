@@ -474,6 +474,15 @@ func TestApplyRules_RejectsLocatedRuntimeRef(t *testing.T) {
 	}
 }
 
+func TestApplyRules_RejectsUnqualifiedRuntimeRef(t *testing.T) {
+	snap := &SnapshotCfg{}
+	snap.Boot.RuntimeRef = "file://runtime.bundle"
+	host := &config.SandboxConfig{}
+	if _, err := applyRules(host, snap, "/snapshots/root.snapshot"); err == nil || !strings.Contains(err.Error(), "digest qualifier is required") {
+		t.Fatalf("unqualified runtime_ref error = %v", err)
+	}
+}
+
 func TestApplyRules_CarriesEffectiveLocatedBaseRefs(t *testing.T) {
 	dir := t.TempDir()
 	runtimePath := filepath.Join(dir, "runtime.bundle")

@@ -428,6 +428,9 @@ func parseSnapshotRuntimeRef(raw string) (manifest.Ref, error) {
 	if ref.Location != "" {
 		return manifest.Ref{}, fmt.Errorf("named ref locations are not supported")
 	}
+	if ref.DigestScheme != tarstream.DigestSchemeSHA256 || ref.Digest == "" {
+		return manifest.Ref{}, fmt.Errorf("sha256 digest qualifier is required")
+	}
 	return ref, nil
 }
 
