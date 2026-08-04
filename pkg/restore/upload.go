@@ -3,6 +3,7 @@ package restore
 import (
 	"archive/zip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -423,18 +424,29 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest 
 	if err := validatePublishedFinal(p.ctx, sourcePath, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
 		return "", fmt.Errorf("publish location: validate converted output: %w", err)
 	}
-	const takeoverAttempts = 3
-	for attempt := 0; attempt < takeoverAttempts; attempt++ {
+	for {
+		if err := p.ctx.Err(); err != nil {
+			return "", fmt.Errorf("publish location: %w", err)
+		}
 		created, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err != nil {
 			if !os.IsExist(err) {
 				return "", fmt.Errorf("publish location: create final exclusively: %w", err)
 			}
-			validateErr := validateExistingLocationFile(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest)
+			validateErr := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest)
 			if validateErr == nil {
 				return p.locatedRef(basename, scheme, digest)
 			}
+			if ctxErr := p.ctx.Err(); ctxErr != nil {
+				return "", fmt.Errorf("publish location: validate existing final: %w", ctxErr)
+			}
+			if errors.Is(validateErr, context.Canceled) || errors.Is(validateErr, context.DeadlineExceeded) {
+				return "", fmt.Errorf("publish location: validate existing final: %w", validateErr)
+			}
 			if err := removeInvalidLocationFile(destination); err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
 				return "", fmt.Errorf("publish location: existing final is invalid (%v) and cannot be replaced: %w", validateErr, err)
 			}
 			continue
@@ -442,7 +454,6 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest 
 		ownedInfo, err := created.Stat()
 		if err != nil {
 			_ = created.Close()
-			_ = removeOwnedLocationFile(destination, nil)
 			return "", fmt.Errorf("publish location: stat created final: %w", err)
 		}
 		owned := true
@@ -451,17 +462,32 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest 
 				_ = removeOwnedLocationFile(destination, ownedInfo)
 			}
 		}()
+		if err := created.Chmod(0o644); err != nil {
+			_ = created.Close()
+			return "", fmt.Errorf("publish location: set final permissions: %w", err)
+		}
 		if err := copySyncAndCloseLocationFile(p.ctx, created, sourcePath); err != nil {
 			return "", fmt.Errorf("publish location: write final: %w", err)
 		}
 		if err := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
 			return "", fmt.Errorf("publish location: validate final: %w", err)
 		}
+		dir, err := os.Open(p.directory)
+		if err != nil {
+			return "", fmt.Errorf("publish location: open parent directory: %w", err)
+		}
+		syncErr := dir.Sync()
+		closeErr := dir.Close()
+		if syncErr != nil {
+			return "", fmt.Errorf("publish location: sync parent directory: %w", syncErr)
+		}
+		if closeErr != nil {
+			return "", fmt.Errorf("publish location: close parent directory: %w", closeErr)
+		}
 		owned = false
 		p.logf("upload-snapshot: published %s", destination)
 		return p.locatedRef(basename, scheme, digest)
 	}
-	return "", fmt.Errorf("publish location: could not acquire final after %d attempts", takeoverAttempts)
 }
 
 func removeInvalidLocationFile(path string) error {
@@ -546,28 +572,6 @@ func copyLocationContents(ctx context.Context, destination io.Writer, source io.
 			return total, readErr
 		}
 	}
-}
-
-func validateExistingLocationFile(ctx context.Context, path string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string) error {
-	const attempts = 20
-	var err error
-	for attempt := 0; attempt < attempts; attempt++ {
-		err = validatePublishedFinal(ctx, path, logicalSize, codec, required, scheme, digest)
-		if err == nil {
-			return nil
-		}
-		if attempt+1 == attempts {
-			break
-		}
-		timer := time.NewTimer(10 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-	return err
 }
 
 func validatePublishedFinal(ctx context.Context, path string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string) error {

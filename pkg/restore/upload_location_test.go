@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
@@ -18,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
+	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
@@ -45,7 +48,10 @@ func TestPublishLocalToLocationRewritesLocalRefsAndRepairsInconsistentFinal(t *t
 	}
 	t.Cleanup(func() { _ = os.Chmod(sourceDir, 0o755) })
 
+	oldUmask := unix.Umask(0o077)
+	t.Cleanup(func() { unix.Umask(oldUmask) })
 	rootRef, err := PublishLocalToLocation(ctx, rootPath, "shared", targetDir, nil, false, nil)
+	unix.Umask(oldUmask)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,27 +202,78 @@ func TestPublishLocationFileCleansUpOwnedPartialFinal(t *testing.T) {
 
 func TestPublishLocationFileConcurrentPublishers(t *testing.T) {
 	dir := t.TempDir()
-	source, identity := writePublishArtifact(t, t.TempDir(), ".overlay", bytes.Repeat([]byte{0x37}, 4096))
+	source, identity := writePublishArtifact(t, t.TempDir(), ".overlay", bytes.Repeat([]byte{0x37}, 16<<20))
 	scheme, digest, _ := strings.Cut(identity, ":")
-	start := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var copyCalls atomic.Int32
+	originalCopy := publishLocationCopy
+	publishLocationCopy = func(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {
+		if copyCalls.Add(1) == 1 {
+			close(firstStarted)
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		}
+		return copyLocationContents(ctx, destination, source)
+	}
+	t.Cleanup(func() { publishLocationCopy = originalCopy })
+
 	results := make(chan error, 2)
-	for range 2 {
+	publish := func() {
 		go func() {
-			p := newSnapshotPublisher(context.Background(), nil, false, nil)
+			p := newSnapshotPublisher(ctx, nil, false, nil)
 			p.location, p.directory = "shared", dir
-			<-start
-			_, err := p.publishLocationFile(source, ".overlay", scheme, digest, 4096)
+			_, err := p.publishLocationFile(source, ".overlay", scheme, digest, 16<<20)
 			results <- err
 		}()
 	}
-	close(start)
-	for range 2 {
-		if err := <-results; err != nil {
-			t.Fatalf("concurrent publish: %v", err)
-		}
+	publish()
+	select {
+	case <-firstStarted:
+	case err := <-results:
+		t.Fatalf("first publisher stopped before copying: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
-	if err := validatePublishedFinal(context.Background(), filepath.Join(dir, digest+".overlay"), 4096, nil, false, scheme, digest); err != nil {
+	publish()
+	var secondErr error
+	select {
+	case secondErr = <-results:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	close(releaseFirst)
+	firstErr := <-results
+	if secondErr != nil || firstErr != nil {
+		t.Fatalf("concurrent publish errors: first=%v second=%v", firstErr, secondErr)
+	}
+	if err := validatePublishedFinal(context.Background(), filepath.Join(dir, digest+".overlay"), 16<<20, nil, false, scheme, digest); err != nil {
 		t.Fatalf("final validation: %v", err)
+	}
+}
+
+func TestPublishLocationFileDoesNotRemoveFinalWhenContextCanceled(t *testing.T) {
+	dir := t.TempDir()
+	source, identity := writePublishArtifact(t, t.TempDir(), ".overlay", bytes.Repeat([]byte{0x29}, 4096))
+	scheme, digest, _ := strings.Cut(identity, ":")
+	destination := filepath.Join(dir, digest+".overlay")
+	if err := os.WriteFile(destination, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p := newSnapshotPublisher(ctx, nil, false, nil)
+	p.location, p.directory = "shared", dir
+	if _, err := p.publishLocationFile(source, ".overlay", scheme, digest, 4096); !errors.Is(err, context.Canceled) {
+		t.Fatalf("publish error = %v, want context cancellation", err)
+	}
+	if got, err := os.ReadFile(destination); err != nil || string(got) != "existing" {
+		t.Fatalf("existing final changed after cancellation: %q err=%v", got, err)
 	}
 }
 

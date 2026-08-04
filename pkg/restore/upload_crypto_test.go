@@ -182,7 +182,7 @@ func TestPublishEncryptedLeafIsByteDeterministic(t *testing.T) {
 	}
 }
 
-func TestPublishLocationRejectsPlaintextExistingFinalInAuto(t *testing.T) {
+func TestPublishLocationRepairsPlaintextExistingFinalInAuto(t *testing.T) {
 	ctx := context.Background()
 	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x66})
 	sourceDir := t.TempDir()
@@ -223,15 +223,18 @@ func TestPublishLocationRejectsPlaintextExistingFinalInAuto(t *testing.T) {
 	}
 	p := newSnapshotPublisher(ctx, codec, false, nil)
 	p.location, p.directory = "encrypted", targetDir
-	if _, err := p.publishLocationFile(sourcePath, ".overlay", scheme, digest, uint64(len(payload))); !errors.Is(err, tarstream.ErrPlaintextForbidden) {
-		t.Fatalf("auto plaintext collision error=%v", err)
+	if _, err := p.publishLocationFile(sourcePath, ".overlay", scheme, digest, uint64(len(payload))); err != nil {
+		t.Fatalf("repair auto plaintext collision: %v", err)
 	}
 	after, err := os.ReadFile(destination)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(after, before) {
-		t.Fatal("plaintext published final was modified")
+	if bytes.Equal(after, before) {
+		t.Fatal("plaintext published final was not replaced")
+	}
+	if err := validatePublishedFinal(ctx, destination, uint64(len(payload)), codec, true, scheme, digest); err != nil {
+		t.Fatalf("repaired encrypted final is invalid: %v", err)
 	}
 }
 

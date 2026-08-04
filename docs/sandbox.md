@@ -517,12 +517,16 @@ root/data disk 字段中的本地项同样作为 opaque leaf 发布。相同 rea
 直接取得最终内容寻址文件,顺序复制后执行 `Sync`、`Close` 并重新打开做完整验证;
 失败时只清理本次 publisher 成功 exclusive create 的不完整文件。终态已存在时先
 验证 tarstream 格式、logical size、digest scheme/digest、marker、codec 和本地加密
-策略:全部一致则复用;有限等待后仍损坏的普通文件视为失败上传的遗留文件,删除后以
-exclusive create 重试。symlink 和非普通文件始终拒绝且不会删除。
+策略:全部一致则复用;不一致的普通文件直接删除后以 exclusive create 重试,直到上传
+成功或调用 context 取消。context 取消或超时不作为内容不一致的证据,不会触发删除。
+并发修复不引入 advisory lock 或锁文件:竞争期间 publisher 可以删除彼此尚未完成的
+普通 final,竞争停止后最后仍在执行的上传完成发布。symlink 和非普通文件始终拒绝且
+不会删除。
 
 因此 named ref-location 的共享文件系统只需支持 `mkdir`、create、exclusive create、
-write、read、stat、pread/seek,以及删除不完整普通文件;不要求 rename、
-renameat2、symlink、hardlink、reflink 或 sparse file。节点本地 checkpoint 的
+write、read、stat、pread/seek、chmod、file/directory sync,以及删除不一致或不完整的
+普通文件;不要求 rename、renameat2、symlink、hardlink、reflink、advisory lock 或
+sparse file。节点本地 checkpoint 的
 `SnapshotSink`/`FileSink` 和运行期 active writable vhost diff 仍依赖现有原子提交及
 本地文件系统语义,不属于 named ref-location 的共享文件系统兼容范围。
 
