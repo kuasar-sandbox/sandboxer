@@ -41,6 +41,9 @@ make vet test
 `sandboxer-vX.Y.Z-linux-<arch>.tar.gz` 包含 `sandbox-ctl`、`sandbox-init`、
 `cloud-hypervisor` 和对应文档。本地可用 `make release VERSION=vX.Y.Z`
 生成并校验相同布局的 release bundle。
+正式版之前,workflow 每天按上海日期发布
+`v0.1.0-preview.YYYYMMDD` prerelease;preview 不更新 GitHub Latest,正式
+`v0.1.0` 由独立构建发布。
 
 构建需要 Go 1.24+;运行还需 **guest-runtime** 发布的 `sandbox-runtime.bundle`
 和 `vmlinux`(guest 内核);patched `cloud-hypervisor` 由本仓
