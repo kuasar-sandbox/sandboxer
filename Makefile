@@ -8,7 +8,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench clean help
+.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -87,11 +87,29 @@ clean:
 bench:
 	CGO_ENABLED=0 $(GO) test -bench=. -benchmem -run=^$$ ./...
 
+VERSION ?= v0.1.0
+
+release: build
+	@mkdir -p $(BUILD_DIR)
+	@printf 'repository\trequested_ref\tresolved_sha\trole\n' > $(BUILD_DIR)/revisions.tsv
+	@printf 'kuasar-sandbox/accelerator\tHEAD\t%s\tdependency\n' "$$(git -C ../accelerator rev-parse HEAD)" >> $(BUILD_DIR)/revisions.tsv
+	@printf 'kuasar-sandbox/connector\tHEAD\t%s\tdependency\n' "$$(git -C ../connector rev-parse HEAD)" >> $(BUILD_DIR)/revisions.tsv
+	@printf 'kuasar-sandbox/sandboxer\tHEAD\t%s\tprimary\n' "$$(git rev-parse HEAD)" >> $(BUILD_DIR)/revisions.tsv
+	rm -rf $(BUILD_DIR)/release-bundle
+	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
+		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" \
+		$(BUILD_DIR)/revisions.tsv $(BUILD_DIR)/release-bundle
+
+test-release:
+	bash scripts/test-release.sh
+
 help:
 	@echo "sandboxer. Targets:"
 	@echo "  build              sandbox-ctl + sandbox-init"
 	@echo "  cloud-hypervisor   patched VMM consumed by sandbox-ctl"
 	@echo "  sandbox-ctl        host control plane"
 	@echo "  sandbox-init       guest PID 1 binary consumed by guest-runtime"
+	@echo "  release            build a validated component release bundle"
+	@echo "  test-release       test component release packaging"
 	@echo "  test / vet / clean"
 	@echo "  TARGET_ARCH        x86_64 (default) | aarch64"

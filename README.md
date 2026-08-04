@@ -37,6 +37,11 @@ make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
 make vet test
 ```
 
+独立版本通过仓库的 `Release` workflow 发布为 `vX.Y.Z`;发布件
+`sandboxer-vX.Y.Z-linux-<arch>.tar.gz` 包含 `sandbox-ctl`、`sandbox-init`、
+`cloud-hypervisor` 和对应文档。本地可用 `make release VERSION=vX.Y.Z`
+生成并校验相同布局的 release bundle。
+
 构建需要 Go 1.24+;运行还需 **guest-runtime** 发布的 `sandbox-runtime.bundle`
 和 `vmlinux`(guest 内核);patched `cloud-hypervisor` 由本仓
 `sandboxer/native-deps` 构建并由 `sandbox-ctl` 启动。`mkfs.erofs` 是
