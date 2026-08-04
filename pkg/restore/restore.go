@@ -941,8 +941,10 @@ func resolveLocalMergePath(raw, snapshotPath string, locations config.RefLocatio
 	return locations.ResolveFile(ref, filepath.Dir(snapshotPath))
 }
 
-// preflightLocatedRefs walks snapshot.cfg plus its memory parents and verifies
-// every named location before cgroup, run-directory, TAP, or VMM side effects.
+// preflightLocatedRefs validates every artifact referenced by the root
+// snapshot.cfg before cgroup, run-directory, TAP, or VMM side effects. The
+// root from_refs list is already the flattened memory chain; each entry is an
+// opaque memory layer and its embedded historical snapshot.cfg is not walked.
 func preflightLocatedRefs(ctx context.Context, opts Options) error {
 	var stream fetch.Stream
 	if opts.SnapshotPath != "" {
@@ -972,45 +974,18 @@ func preflightLocatedRefs(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
-	type pendingSnapshot struct {
-		cfg       *SnapshotCfg
-		overrides *preflightBaseOverrides
-	}
-	pending := []pendingSnapshot{{cfg: root, overrides: &overrides}}
-	seenParents := map[string]bool{}
-	for len(pending) > 0 {
-		item := pending[0]
-		pending = pending[1:]
-		snap := item.cfg
-		if item.overrides != nil {
-			refs := snapshotArtifactRefs(snap, item.overrides)
-			for _, raw := range refs {
-				if err := preflightLocatedRef(ctx, raw, opts); err != nil {
-					return err
-				}
-			}
+	for _, raw := range snapshotArtifactRefs(root, &overrides) {
+		if err := preflightLocatedRef(ctx, raw, opts); err != nil {
+			return err
 		}
-		for _, raw := range snap.FromRefs {
-			if seenParents[raw] {
-				continue
-			}
-			seenParents[raw] = true
-			if len(seenParents) > 1024 {
-				return fmt.Errorf("snapshot parent graph exceeds 1024 entries")
-			}
-			parent, err := openRefStream(ctx, raw, opts)
-			if err != nil {
-				return fmt.Errorf("snapshot parent: %w", err)
-			}
-			_, parentCfg, readErr := readSnapshotEntries(ctx, parent, int64(parent.Size()))
-			closeErr := parent.Close()
-			if readErr != nil {
-				return fmt.Errorf("snapshot parent: %w", readErr)
-			}
-			if closeErr != nil {
-				return closeErr
-			}
-			pending = append(pending, pendingSnapshot{cfg: parentCfg})
+	}
+	for i, raw := range root.FromRefs {
+		parent, err := openRefStream(ctx, raw, opts)
+		if err != nil {
+			return fmt.Errorf("snapshot memory layer %d: %w", i, err)
+		}
+		if err := parent.Close(); err != nil {
+			return fmt.Errorf("snapshot memory layer %d: %w", i, err)
 		}
 	}
 	return nil

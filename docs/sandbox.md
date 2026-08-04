@@ -1035,7 +1035,7 @@ self 温热 chunk cache,file self 对已打开的 artifact FD 提交 `FADV_WILLN
 必须是顶层;本地 disk top 每次保存都 flatten-merge,`base_from_refs` 不新增本地 ref。
 memory chain 则允许 self 以下出现多个本地 `file://*.snapshot` ref,仅用于本地
 working-set 生成与验证。这组 artifact 必须一起保留;缺任一层即整条快照失效。离线上传
-后本地 refs 会递归改写成目标 portable refs。
+后 root 展平列表中的本地 refs 会逐项改写成目标 portable refs。
 
 - **默认本地导出 = 替换直接父 self(合并,非递归 compaction)**:若沙箱本身从**本地**
   `file://` 快照懒加载,
@@ -1563,6 +1563,8 @@ T2  打开 <ref>:
 T3  archive/zip.NewReader(ReaderAt, totalSize) → 解出 config.json / state.json /
     snapshot.cfg。解析 from_refs / overlay.base_from_refs(§3.5),逐项解析为
     Stream(file:// 校验摘要、manifest:// 内容自校验),校验全链 capacity 一致。
+    root snapshot.cfg 的展平 from_refs 列表是 memory chain 的唯一权威;preflight
+    把每项作为 opaque memory layer 打开验证,不解析 lower 内历史 snapshot.cfg。
     file 模式:若 <ref> 是 <sid>.snapshot 符号链接,follow 解析出真实
     <digest>.snapshot 名,读取工件取得实际 scheme + digest,作为本次的内容寻址
     self ref(供将来再保存时写入子快照
