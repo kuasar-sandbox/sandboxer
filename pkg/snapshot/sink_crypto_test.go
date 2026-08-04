@@ -3,6 +3,7 @@ package snapshot
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -114,6 +115,48 @@ func TestEncryptedFileSinkRejectsInconsistentExistingFinal(t *testing.T) {
 	partials, _ := filepath.Glob(filepath.Join(dir, "*.partial"))
 	if len(partials) != 0 {
 		t.Fatalf("failed reuse left partial files: %v", partials)
+	}
+}
+
+func TestEncryptedFileSinkRejectsPlaintextExistingFinalInAuto(t *testing.T) {
+	ctx := context.Background()
+	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x34})
+	dir := t.TempDir()
+	payload := bytes.Repeat([]byte{0x6b}, 32*1024)
+
+	plainRef, plainPath, err := NewFileSink(dir, "plain", nil, false, nil).AbsorbOverlay(ctx, bytes.NewReader(payload), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := manifest.ParseRef(plainRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := hex.DecodeString(parsed.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw [32]byte
+	copy(raw[:], decoded)
+	keyed := codec.KeyedDigest(raw)
+	final := filepath.Join(dir, hex.EncodeToString(keyed[:])+".overlay")
+	if err := os.Rename(plainPath, final); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := NewFileSink(dir, "encrypted", codec, false, nil).AbsorbOverlay(ctx, bytes.NewReader(payload), nil); !errors.Is(err, tarstream.ErrPlaintextForbidden) {
+		t.Fatalf("auto plaintext collision error=%v", err)
+	}
+	after, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("plaintext existing final was modified")
 	}
 }
 

@@ -362,15 +362,16 @@ func (p *snapshotPublisher) publishLeaf(label, path string, expected manifest.Re
 func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest string, logicalSize uint64) (string, error) {
 	basename := digest + ext
 	destination := filepath.Join(p.directory, basename)
+	outputRequired := p.codec != nil
 	if err := os.Chmod(sourcePath, 0o644); err != nil {
 		return "", fmt.Errorf("publish location: set temporary permissions: %w", err)
 	}
-	if err := validatePublishedFinal(p.ctx, sourcePath, logicalSize, p.codec, p.required, scheme, digest); err != nil {
+	if err := validatePublishedFinal(p.ctx, sourcePath, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
 		return "", fmt.Errorf("publish location: validate converted output: %w", err)
 	}
 	err := unix.Renameat2(unix.AT_FDCWD, sourcePath, unix.AT_FDCWD, destination, unix.RENAME_NOREPLACE)
 	if err == unix.EEXIST {
-		if validateErr := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, p.required, scheme, digest); validateErr != nil {
+		if validateErr := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); validateErr != nil {
 			return "", fmt.Errorf("publish location: existing final is invalid: %w", validateErr)
 		}
 		return p.locatedRef(basename, scheme, digest)

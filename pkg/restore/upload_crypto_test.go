@@ -182,6 +182,59 @@ func TestPublishEncryptedLeafIsByteDeterministic(t *testing.T) {
 	}
 }
 
+func TestPublishLocationRejectsPlaintextExistingFinalInAuto(t *testing.T) {
+	ctx := context.Background()
+	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x66})
+	sourceDir := t.TempDir()
+	targetDir := t.TempDir()
+	payload := bytes.Repeat([]byte{0x38}, 32*1024)
+
+	write := func(path string, encrypted bool) (string, string) {
+		t.Helper()
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var options []tarstream.WriteOption
+		if encrypted {
+			options = append(options, tarstream.WithCodec(codec, false))
+		}
+		scheme, digest, err := tarstream.WriteTo(ctx, f, "payload", sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), options...)
+		if err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return scheme, digest
+	}
+
+	sourcePath := filepath.Join(sourceDir, "converted.tmp")
+	scheme, digest := write(sourcePath, true)
+	destination := filepath.Join(targetDir, digest+".overlay")
+	plainScheme, _ := write(destination, false)
+	if plainScheme != tarstream.DigestSchemeSHA256 {
+		t.Fatalf("plaintext scheme=%q", plainScheme)
+	}
+	before, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newSnapshotPublisher(ctx, codec, false, nil)
+	p.location, p.directory = "encrypted", targetDir
+	if _, err := p.publishLocationFile(sourcePath, ".overlay", scheme, digest, uint64(len(payload))); !errors.Is(err, tarstream.ErrPlaintextForbidden) {
+		t.Fatalf("auto plaintext collision error=%v", err)
+	}
+	after, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("plaintext published final was modified")
+	}
+}
+
 func TestManifestPublisherFullyAuthenticatesInput(t *testing.T) {
 	ctx := context.Background()
 	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x65})

@@ -144,7 +144,10 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 	final := filepath.Join(s.outDir, digest+"."+kind)
 	err = unix.Renameat2(unix.AT_FDCWD, tmp, unix.AT_FDCWD, final, unix.RENAME_NOREPLACE)
 	if err == unix.EEXIST {
-		if validateErr := validateArtifactFile(ctx, final, kind, src.Size(), s.codec, s.required, scheme, digest); validateErr != nil {
+		// A codec-backed write always emits ciphertext, including in auto
+		// mode. Reuse must therefore prove that an existing final has the
+		// same encoding as the output we attempted to commit.
+		if validateErr := validateArtifactFile(ctx, final, kind, src.Size(), s.codec, s.codec != nil, scheme, digest); validateErr != nil {
 			return "", "", "", fmt.Errorf("reuse existing %s: %w", kind, validateErr)
 		}
 		return scheme, digest, final, nil
