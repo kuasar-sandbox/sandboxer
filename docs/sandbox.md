@@ -585,9 +585,9 @@ boot:
                                               # file:///var/lib/sandbox/<sid>/<sid>.overlay.diff
                                               # (自动创建的随沙箱销毁;显式给定的不删)
       diff_template: file:///opt/sandbox/overlay-templates/basic-1G.ext4
-                                              # 可选,file:// only。diff 不存在时从该预格式化
-                                              # ext4 稀疏复制(冷启动得到可挂载上层,免 mkfs);
-                                              # 已存在的 diff 忽略此项
+                                              # 可选,file:// only。diff 不存在时把该预格式化
+                                              # ext4 的逻辑稀疏视图写入新 diff;目标编码由
+                                              # crypto.local 决定。已存在的 diff 忽略此项
       diff_size: 1GiB                         # 可选,默认 1GiB。仅在"创建空白 diff"(无模板、
                                               # 无 base)时用于定尺寸;已有 diff 保持自身大小
     # —— 单磁盘模式:省略上面的 overlay 即启用(详见 docs/sandbox-init.md §3.1)——
@@ -763,8 +763,8 @@ crypto:
 plaintext;`required` 同样加密写入,并拒绝 plaintext 与 legacy `@sha256` ref。
 `auto|required` 必须在进程启动配置阶段取得有效 `$MANIFEST_KEY`,否则 fail closed。
 同一 sandbox-ctl 进程只解析一次 key,并把同一固定值交给 manifest key table、
-tarstream codec 和 HMAC identity。构造本地 codec 不连接 store/cache;manifest
-客户端在第一次实际 fetch/ingest 时才建立。
+tarstream codec、HMAC identity 和 active diff header key wrapping。构造本地 codec
+不连接 store/cache;manifest 客户端在第一次实际 fetch/ingest 时才建立。
 
 **绝对路径要求**:sandbox.yaml 中所有 `file://` URL 必须是绝对路径
 (`file:///abs/path/to/file`)。配置校验阶段拒绝 `file://relative/path`
@@ -815,9 +815,9 @@ file ref 与 `manifest://<key>` 都是 portable ref;
 | `boot.root.base` | ✓ | ✓ | overlay 模式:erofs 镜像;单盘模式:可选 ext4 CoW 下层。跨 sandbox 复用率高,manifest 化收益最大 |
 | `boot.root.overlay.base` | ✓ | ✓ | 快照恢复时常用 manifest:// |
 | `boot.root.overlay.diff` | ✓ (only) | ✗ | 运行时 dirty 数据,本地 sparse 文件;可选,空→落盘 base 目录 |
-| `boot.root.overlay.diff_template` | ✓ (only) | ✗ | 预格式化 ext4 模板,seed 新建 diff |
+| `boot.root.overlay.diff_template` | ✓ (only) | ✗ | 预格式化 ext4 逻辑初始化源,seed 新建 diff |
 | `boot.root.diff`(单盘) | ✓ (only) | ✗ | 单盘可写根盘,overlay.diff 的 root 层等价;省略 overlay 时启用 |
-| `boot.root.diff_template`(单盘) | ✓ (only) | ✗ | 单盘根盘的预格式化 ext4 模板;与 overlay.* 互斥 |
+| `boot.root.diff_template`(单盘) | ✓ (only) | ✗ | 单盘根盘的预格式化 ext4 逻辑初始化源;与 overlay.* 互斥 |
 | `boot.root.base_from_refs`(单盘) | ✓ | ✓ | 单盘快照链(snapshot.cfg 自动填,§3.5) |
 | `run --restore=<ref>` | ✓ | ✓ | 本地路径、located file ref 或 manifest://<key> |
 | `restore.prefetch: memory` | ✓ | ✓ | 默认 `off`;仅预热当前 memory self:file 提交 `FADV_WILLNEED`,manifest 预热 chunk cache,§7.1 |
@@ -862,6 +862,46 @@ raw EROFS | zero padding | ZIP(.kuasar.sha256.<hex>)
 EROFS 保持从 offset 0 开始,bundle 总大小保持 2 MiB 对齐。runtime digest 覆盖
 ZIP 前的 EROFS + padding,启动和恢复只从 EOF 读取 ZIP marker,Cloud Hypervisor
 仍把整个 bundle 直接作为 virtio-pmem backing。
+
+### 3.2.2 active diff encryption
+
+active diff 是 mutable sparse block device backing,不使用 tarstream record envelope,
+也没有 Digester、`hmac` ref 或内容寻址文件名。`crypto.local=off` 新建历史 plaintext
+sparse 文件;`auto|required` 新建 encrypted v1 文件。`auto` 可打开历史 plaintext,
+`required` 拒绝历史 plaintext。两种加密 policy 都要求当前进程启动时取得的同一
+customerKey。
+
+encrypted v1 的物理布局固定为:
+
+```text
+[4096-byte wrapped header region][length-preserving sparse XTS body]
+```
+
+前 16 bytes 是 authenticated prefix:magic `89 4b 44 58 54 53 31 0a`、big-endian
+version `1`、prefix size `16`、flags `0`。其后的 wrapped plaintext 固定 128 bytes,
+包含 logical size、block size `4096`、XTS data-unit size `512`、body offset `4096`、
+key size `64`、每文件随机 64-byte XTS key 和 40 bytes 零保留区。该 plaintext 使用
+accelerator #27 AES-SIV codec 和 AAD `"kuasar/diff/header/v1\0" || prefix` 加密认证,header region
+剩余 bytes 必须为零。body 使用 AES-256-XTS,每个 512-byte logical sector 的 sector
+number 作为 tweak;body 物理长度与 logical disk 相等,guest offset 0 对应物理
+offset 4096。
+
+AES-XTS 只提供磁盘扇区保密性,不认证 mutable body,也不承诺检测 sector replay、
+relocation 或回滚。header 认证只保护格式、logical size 和 wrapped XTS key。每个新
+target 都生成独立随机 XTS key;不使用 HKDF、per-file salt 或额外 header HMAC。
+
+`diff_template` 是逻辑初始化源而非目标物理编码。existing non-empty diff 优先并
+完全忽略 template。新目标按下面矩阵创建:
+
+| `crypto.local` | plaintext template | encrypted template |
+|----------------|--------------------|--------------------|
+| `off` | 按逻辑 sparse view 创建 plaintext target | 拒绝(没有 codec) |
+| `auto|required` | 按逻辑 plaintext 读取,以新随机 XTS key 创建 encrypted target | 用当前 customerKey 解 header,按逻辑 plaintext 读取,以新随机 XTS key 重新加密 |
+
+任何 template data extent 涉及的 4 KiB block 都完整初始化 8 个 XTS data units;
+template hole 保持 target hole。seed 先写同目录临时文件并执行 Sync + Close,再以
+no-replace 原子提交并同步父目录;失败不修改 final target。禁止 raw-copy encrypted
+template 或复用其 XTS key。
 
 ### 3.3 flattened image 内嵌 config.json
 
@@ -1126,8 +1166,9 @@ T0   sandbox-ctl run --config sandbox.yaml 启动
 T1   解析 yaml(可选 --sandbox-id 覆盖)→ 构造完整 SandboxConfig
 T2   tap 源验证已存在 TAP;tapfd 与无网络源跳过 TAP 名验证;
      随后准备 /run/sandbox/<sid>/ 目录
-T3   准备 overlay diff:已存在→原样用(绝不 truncate);不存在→从 diff_template 稀疏复制 /
-     按 base 大小新建 / 否则按 diff_size 新建空白稀疏文件(详见 §3.1)
+T3   准备 overlay diff:已存在→按 crypto.local policy 打开(绝不 truncate,忽略 template);
+     不存在→从 diff_template 的逻辑 sparse view 初始化 / 按 base 大小新建 blank upper;
+     新文件编码由 crypto.local 决定(详见 §3.2.2)
 T4   动态控制模式:dial controller, send Admit, 收 grant 后继续(详见 §10)
 T5   cgroup setup:写 cgroup limits + 把自身 PID 加入 cgroup.procs
      (后续 fork 的 CH 自然在同 cgroup)
@@ -2318,7 +2359,7 @@ blk1 是可写盘,基础语义为"上层 ext4 sparse 文件 + 可选 base 层":
 读路径:
   for each 4K block in [off, off+len(buf)):
     acquire shared stripe lock
-    if dirtyBitmap[blk]:    pread(diffFile, slice, blk*4K)
+    if dirtyBitmap[blk]:    read logical diff view at blk*4K
     elif baseReader != nil: baseReader.ReadAt(slice, blk*4K)
     else:                   memset(slice, 0)
 
@@ -2328,15 +2369,22 @@ blk1 是可写盘,基础语义为"上层 ext4 sparse 文件 + 可选 base 层":
     if clean 且本次未完整覆盖该 block:
       从 baseReader 或零完整初始化 4K scratch block
       合并本次 slice
-      pwrite(diffFile, scratch, blk*4K, 4K)
+      write logical diff view at blk*4K, 4K
     else:
-      pwrite(diffFile, slice, 对应 offset)
+      write logical diff view at 对应 offset
     完整写成功后 dirtyBitmap[blk] |= 1
 ```
 
 固定数量的 stripe lock 让同一 4K block 的 read/materialize/write 串行化,
-不同 block 仍可并发。启动时通过 SEEK_DATA/HOLE 扫 blk1.diff 重建 dirtyBitmap;
-因此 dirty bit 始终表示对应 4K diff block 已完整初始化。
+不同 block 仍可并发。plaintext diff 的 logical offset 等于 physical offset;
+encrypted diff 的 private diff-file helper 把 logical offset 映射到 4096-byte header
+之后,再按 512-byte XTS data unit 解密/加密。guest、BlockCOW 和 snapshot 均看不到
+header offset 或 ciphertext。
+
+启动时通过 SEEK_DATA/HOLE 扫 active diff body 重建 dirtyBitmap;encrypted 文件从
+physical offset 4096 开始扫描,header allocation 绝不标记 logical block dirty。因此
+dirty bit 始终表示对应 4K body block 已完整初始化。clean block 第一次 partial write
+先从 base 或零读取完整 4 KiB、合并修改、写完 8 个 512-byte units,成功后才标 dirty。
 
 snapshot 在全部 vhost backend quiesce 后调用 `BlockCOW.SnapshotView()`:view 复制
 当前 dirty bitmap,只暴露 upper,不包含 base。dirty block 从 live BlockCOW 读取完整
@@ -2346,9 +2394,9 @@ plumbing 携带该 view provider,不再通过 raw diff path 重开文件;path �
 capture 读取时把相邻 dirty block 合并为连续 range,每个涉及的 stripe 只取一次读锁,
 并以一次底层 `ReadAt` 读取该 range。
 
-DISCARD 路径(无 base layer 时正确):`fallocate(PUNCH_HOLE)` + bitmap 清掉;
-读 ReadAt 看到 bitmap 干净 → memset(0)。**带 base layer 时**需要扩展为三态
-`{ clean, dirty, discard }`(详见扩展点)。
+当前 virtio-blk DISCARD / WRITE_ZEROES 保持 v1 的有效 no-op:worker 接受请求并返回
+成功,但不把 guest range 传给 BlockCOW,不改变 body 或 bitmap。本期不引入三态
+`{ clean, dirty, discard }` 和新的 hole-punch 语义。
 
 ### 12.5 Quiesce / Resume
 

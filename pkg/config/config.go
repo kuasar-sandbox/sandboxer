@@ -564,9 +564,10 @@ type RootConfig struct {
 	// file://<base-dir>/<sid>.overlay.diff; an auto-defaulted diff is removed
 	// when the sandbox ends, an explicitly set one is never removed.
 	Diff string `yaml:"diff"`
-	// DiffTemplate (file:// only) seeds a freshly-created Diff by sparse-copying
-	// this pre-formatted ext4 image, so a single-disk cold boot gets a mountable
-	// rw root without mkfs. Ignored if Diff already exists.
+	// DiffTemplate (file:// only) is the logical initialization source for a
+	// freshly-created Diff. Its sparse plaintext view is encoded according to
+	// crypto.local, so a single-disk cold boot gets a mountable rw root without
+	// mkfs. Ignored if Diff already exists.
 	DiffTemplate string `yaml:"diff_template"`
 	// DiffSize sizes a freshly-created Diff over Base (no template). Applied
 	// only at creation; an existing diff keeps its own size. Empty → 1 GiB.
@@ -600,9 +601,10 @@ type OverlayConfig struct {
 	// An auto-defaulted diff is removed when the sandbox ends; an explicitly
 	// set diff is never removed.
 	Diff string `yaml:"diff"`
-	// DiffTemplate, when set (file:// only), seeds a freshly-created diff by
-	// sparse-copying this pre-formatted ext4 image (so cold boot gets a
-	// mountable upper layer without mkfs). Ignored if the diff already exists.
+	// DiffTemplate, when set (file:// only), is the logical initialization
+	// source for a freshly-created diff. Its sparse plaintext view is encoded
+	// according to crypto.local, so cold boot gets a mountable upper layer
+	// without mkfs. Ignored if the diff already exists.
 	DiffTemplate string `yaml:"diff_template"`
 	// DiffSize is the size of a freshly-created blank diff (no template, no
 	// base). Applied ONLY at creation; an existing diff keeps its own size.
