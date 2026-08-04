@@ -4,12 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sync"
-	"syscall"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"golang.org/x/sys/unix"
 )
 
 // BlockCOW provides a COW (copy-on-write) read-write block view on top
@@ -30,7 +27,7 @@ import (
 // DISCARD requests are accepted but currently no-op (v1 limitation).
 type BlockCOW struct {
 	base      BlockReader // optional; may be nil for no base layer
-	diff      *os.File
+	diff      *diffFile
 	size      int64
 	bitmapMu  sync.RWMutex
 	bitmap    []uint64 // each bit = one 4K block
@@ -43,101 +40,39 @@ const (
 	cowLockStripes = 256
 )
 
-// OpenBlockCOW opens diff for read+write (creating it sparse if absent),
-// builds the dirty bitmap, and pairs it with the optional base reader.
+// OpenBlockCOW opens or atomically creates the active diff described by init,
+// builds the dirty bitmap from its body, and pairs it with the optional base.
 //
 // If base is nil, reads to clean blocks return zeros.
-//
-// createSize sizes the diff ONLY when it is freshly created (absent/empty):
-// the device size then equals createSize. An existing non-empty diff is used
-// at its current size and is NEVER truncated — shrinking would corrupt the
-// filesystem inside it, and growing the block device would not grow that
-// filesystem anyway, so the diff is provisioned at its final size up front
-// (see docs/sandbox.md §3.1). The caller provisions a pre-formatted /
-// template- / base-backed diff for cold boot.
-func OpenBlockCOW(diffPath string, base BlockReader, createSize int64) (*BlockCOW, error) {
-	if createSize <= 0 {
-		return nil, errors.New("vhost: createSize must be > 0")
-	}
-	if createSize%cowBlockSize != 0 {
-		return nil, fmt.Errorf("vhost: createSize %d not aligned to %d", createSize, cowBlockSize)
-	}
-
-	f, err := os.OpenFile(diffPath, os.O_RDWR|os.O_CREATE, 0o644)
+func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions ...BlockCOWOption) (*BlockCOW, error) {
+	options, err := parseBlockCOWOptions(rawOptions)
 	if err != nil {
-		return nil, fmt.Errorf("vhost: open diff %s: %w", diffPath, err)
+		return nil, err
 	}
-	st, err := f.Stat()
+	diff, err := openBlockCOWDiff(diffPath, init, options)
 	if err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("vhost: stat diff %s: %w", diffPath, err)
+		return nil, err
 	}
-	size := st.Size()
-	if size == 0 {
-		// Freshly created (or empty): size it once, here. This truncate is
-		// creation-only — it never runs against a diff that already has data.
-		size = createSize
-		if err := f.Truncate(size); err != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("vhost: size fresh diff to %d: %w", size, err)
-		}
-	}
-	if size%cowBlockSize != 0 {
-		_ = f.Close()
-		return nil, fmt.Errorf("vhost: existing diff size %d not aligned to %d", size, cowBlockSize)
-	}
+	size := diff.logicalSize
 	if base != nil && base.Size() > size {
-		_ = f.Close()
+		_ = diff.Close()
 		return nil, fmt.Errorf("vhost: base size %d > diff size %d", base.Size(), size)
 	}
-
-	numBlocks := size / cowBlockSize
-	bitmap := make([]uint64, (numBlocks+63)/64)
+	bitmap, err := diff.scanDirtyBlocks()
+	if err != nil {
+		_ = diff.Close()
+		return nil, fmt.Errorf("vhost: rebuild bitmap: %w", err)
+	}
 
 	cow := &BlockCOW{
 		base:      base,
-		diff:      f,
+		diff:      diff,
 		size:      size,
 		bitmap:    bitmap,
 		blockMu:   make([]sync.RWMutex, cowLockStripes),
 		blockSize: cowBlockSize,
 	}
-	if err := cow.rebuildBitmap(); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("vhost: rebuild bitmap: %w", err)
-	}
 	return cow, nil
-}
-
-// rebuildBitmap walks the diff file with SEEK_DATA/SEEK_HOLE and marks
-// each 4K block that contains any data as dirty.
-func (c *BlockCOW) rebuildBitmap() error {
-	fd := int(c.diff.Fd())
-	var off int64 = 0
-	for off < c.size {
-		dataOff, err := syscall.Seek(fd, off, 3 /* SEEK_DATA */)
-		if err != nil {
-			if errors.Is(err, syscall.ENXIO) {
-				return nil // no more data; rest of file is hole
-			}
-			return fmt.Errorf("SEEK_DATA at %d: %w", off, err)
-		}
-		holeOff, err := syscall.Seek(fd, dataOff, 4 /* SEEK_HOLE */)
-		if err != nil {
-			return fmt.Errorf("SEEK_HOLE at %d: %w", dataOff, err)
-		}
-		if holeOff > c.size {
-			holeOff = c.size
-		}
-		// Mark every block in [dataOff, holeOff) as dirty.
-		startBlk := dataOff / c.blockSize
-		endBlk := (holeOff + c.blockSize - 1) / c.blockSize
-		for blk := startBlk; blk < endBlk; blk++ {
-			c.bitmap[blk/64] |= 1 << (uint64(blk) % 64)
-		}
-		off = holeOff
-	}
-	return nil
 }
 
 // dirtyCount returns the number of blocks marked dirty (test helper).
@@ -197,14 +132,20 @@ func (c *BlockCOW) blockLock(blk int64) *sync.RWMutex {
 // ReadAt reads len(buf) bytes starting at offset, routing per-block
 // reads to either the diff file or the base reader.
 func (c *BlockCOW) ReadAt(buf []byte, offset int64) (int, error) {
+	if len(buf) == 0 {
+		if offset < 0 || offset > c.size {
+			return 0, io.EOF
+		}
+		return 0, nil
+	}
 	if offset < 0 || offset >= c.size {
 		return 0, io.EOF
 	}
-	end := offset + int64(len(buf))
-	if end > c.size {
+	available := c.size - offset
+	if int64(len(buf)) > available {
 		buf = buf[:c.size-offset]
-		end = c.size
 	}
+	end := offset + int64(len(buf))
 
 	pos := int64(0)
 	for offset+pos < end {
@@ -317,9 +258,7 @@ func (c *BlockCOW) writeFreshBlock(block []byte, offset int64) error {
 	}
 	// A clean block must remain a hole after a failed materialization so a
 	// future reopen cannot mistake a partial write for a complete dirty block.
-	_ = unix.Fallocate(int(c.diff.Fd()),
-		unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
-		offset, c.blockSize)
+	_ = c.diff.punchHole(offset, c.blockSize)
 	return fmt.Errorf("vhost: materialize diff block at %d: %w", offset, err)
 }
 
@@ -338,7 +277,7 @@ func (c *BlockCOW) Flush() error {
 // content the guest considered freed. The P3-era extension switches to
 // a 3-state stateMap (clean/dirty/discard); see sandbox.md §12.4.
 func (c *BlockCOW) Discard(offset, length int64) error {
-	if offset < 0 || length < 0 || offset+length > c.size {
+	if offset < 0 || offset > c.size || length < 0 || length > c.size-offset {
 		return fmt.Errorf("vhost: discard out of bounds: off=%d len=%d size=%d",
 			offset, length, c.size)
 	}
@@ -358,9 +297,7 @@ func (c *BlockCOW) Discard(offset, length int64) error {
 
 	punchOff := startBlk * blockSize
 	punchLen := (endBlk - startBlk) * blockSize
-	if err := unix.Fallocate(int(c.diff.Fd()),
-		unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
-		punchOff, punchLen); err != nil {
+	if err := c.diff.punchHole(punchOff, punchLen); err != nil {
 		return fmt.Errorf("vhost: punch_hole [%d,%d): %w",
 			punchOff, punchOff+punchLen, err)
 	}
@@ -395,6 +332,12 @@ type cowSnapshotReaderAt struct {
 }
 
 func (r *cowSnapshotReaderAt) ReadAt(buf []byte, offset int64) (int, error) {
+	if len(buf) == 0 {
+		if offset < 0 || offset > r.cow.size {
+			return 0, io.EOF
+		}
+		return 0, nil
+	}
 	if offset < 0 || offset >= r.cow.size {
 		return 0, io.EOF
 	}
