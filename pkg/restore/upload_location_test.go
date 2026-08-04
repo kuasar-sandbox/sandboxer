@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -162,6 +163,74 @@ func TestPublishLocalToLocationRejectsExistingSymlinkDestination(t *testing.T) {
 	info, err := os.Lstat(destination)
 	if err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("destination symlink changed: info=%v err=%v", info, err)
+	}
+}
+
+func TestPublishLocationFileCleansUpOwnedPartialFinal(t *testing.T) {
+	dir := t.TempDir()
+	source, identity := writePublishArtifact(t, t.TempDir(), ".overlay", bytes.Repeat([]byte{0x42}, 4096))
+	scheme, digest, _ := strings.Cut(identity, ":")
+	p := newSnapshotPublisher(context.Background(), nil, false, nil)
+	p.location, p.directory = "shared", dir
+
+	originalCopy := publishLocationCopy
+	publishLocationCopy = func(_ context.Context, destination io.Writer, source io.Reader) (int64, error) {
+		buf := make([]byte, 32)
+		n, _ := source.Read(buf)
+		written, _ := destination.Write(buf[:n])
+		return int64(written), errors.New("injected copy failure")
+	}
+	t.Cleanup(func() { publishLocationCopy = originalCopy })
+
+	if _, err := p.publishLocationFile(source, ".overlay", scheme, digest, 4096); err == nil || !strings.Contains(err.Error(), "injected copy failure") {
+		t.Fatalf("publish error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, digest+".overlay")); !os.IsNotExist(err) {
+		t.Fatalf("partial final was not removed: %v", err)
+	}
+}
+
+func TestPublishLocationFileConcurrentPublishers(t *testing.T) {
+	dir := t.TempDir()
+	source, identity := writePublishArtifact(t, t.TempDir(), ".overlay", bytes.Repeat([]byte{0x37}, 4096))
+	scheme, digest, _ := strings.Cut(identity, ":")
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			p := newSnapshotPublisher(context.Background(), nil, false, nil)
+			p.location, p.directory = "shared", dir
+			<-start
+			_, err := p.publishLocationFile(source, ".overlay", scheme, digest, 4096)
+			results <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent publish: %v", err)
+		}
+	}
+	if err := validatePublishedFinal(context.Background(), filepath.Join(dir, digest+".overlay"), 4096, nil, false, scheme, digest); err != nil {
+		t.Fatalf("final validation: %v", err)
+	}
+}
+
+func TestPublishLocationFileDoesNotReplaceNonRegularFinal(t *testing.T) {
+	dir := t.TempDir()
+	source, identity := writePublishArtifact(t, t.TempDir(), ".overlay", bytes.Repeat([]byte{0x19}, 4096))
+	scheme, digest, _ := strings.Cut(identity, ":")
+	destination := filepath.Join(dir, digest+".overlay")
+	if err := os.Mkdir(destination, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := newSnapshotPublisher(context.Background(), nil, false, nil)
+	p.location, p.directory = "shared", dir
+	if _, err := p.publishLocationFile(source, ".overlay", scheme, digest, 4096); err == nil {
+		t.Fatal("existing directory was accepted or replaced")
+	}
+	if info, err := os.Stat(destination); err != nil || !info.IsDir() {
+		t.Fatalf("existing directory changed: info=%v err=%v", info, err)
 	}
 }
 

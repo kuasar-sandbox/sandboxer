@@ -513,9 +513,17 @@ root/data disk 字段中的本地项同样作为 opaque leaf 发布。相同 rea
 所有本地依赖均被改写为目标 portable ref,原有顺序与重复项保持不变。
 
 发布前对每个本地 tarstream 执行 sequential full validation,再从逻辑 plaintext
-稀疏视图重新编码;不会 raw-copy 工件。named location 使用目标目录内临时文件,
-`Sync` + `Close` 后以 no-replace 原子提交并同步父目录。终态已存在时完整验证,
-内容与 identity 一致才复用;不完整、校验失败或 identity 不一致时拒绝,绝不覆盖。
+稀疏视图重新编码;不会 raw-copy 工件。named location publisher 以 exclusive create
+直接取得最终内容寻址文件,顺序复制后执行 `Sync`、`Close` 并重新打开做完整验证;
+失败时只清理本次 publisher 成功 exclusive create 的不完整文件。终态已存在时不会
+覆盖,只有 tarstream 格式、logical size、digest scheme/digest、marker、codec 和本地
+加密策略全部验证一致才复用;并发写入只做受 context 控制的有限重试。
+
+因此 named ref-location 的共享文件系统只需支持 `mkdir`、create、exclusive create、
+write、read、stat、pread/seek,以及删除本 publisher 创建的不完整文件;不要求 rename、
+renameat2、symlink、hardlink、reflink 或 sparse file。节点本地 checkpoint 的
+`SnapshotSink`/`FileSink` 和运行期 active writable vhost diff 仍依赖现有原子提交及
+本地文件系统语义,不属于 named ref-location 的共享文件系统兼容范围。
 
 ## 3. 配置
 

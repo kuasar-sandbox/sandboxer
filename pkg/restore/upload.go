@@ -420,36 +420,116 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest 
 	basename := digest + ext
 	destination := filepath.Join(p.directory, basename)
 	outputRequired := p.codec != nil
-	if err := os.Chmod(sourcePath, 0o644); err != nil {
-		return "", fmt.Errorf("publish location: set temporary permissions: %w", err)
-	}
 	if err := validatePublishedFinal(p.ctx, sourcePath, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
 		return "", fmt.Errorf("publish location: validate converted output: %w", err)
 	}
-	err := unix.Renameat2(unix.AT_FDCWD, sourcePath, unix.AT_FDCWD, destination, unix.RENAME_NOREPLACE)
-	if err == unix.EEXIST {
-		if validateErr := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); validateErr != nil {
-			return "", fmt.Errorf("publish location: existing final is invalid: %w", validateErr)
+	created, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			if validateErr := validateExistingLocationFile(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); validateErr != nil {
+				return "", fmt.Errorf("publish location: existing final is invalid: %w", validateErr)
+			}
+			return p.locatedRef(basename, scheme, digest)
 		}
-		return p.locatedRef(basename, scheme, digest)
+		return "", fmt.Errorf("publish location: create final exclusively: %w", err)
 	}
-	if err != nil {
-		return "", fmt.Errorf("publish location: commit without replacement: %w", err)
+	owned := true
+	defer func() {
+		if owned {
+			_ = os.Remove(destination)
+		}
+	}()
+	if err := copySyncAndCloseLocationFile(p.ctx, created, sourcePath); err != nil {
+		return "", fmt.Errorf("publish location: write final: %w", err)
 	}
-	dir, err := os.Open(p.directory)
-	if err != nil {
-		return "", fmt.Errorf("publish location: open parent directory: %w", err)
+	if err := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
+		return "", fmt.Errorf("publish location: validate final: %w", err)
 	}
-	syncErr := dir.Sync()
-	closeErr := dir.Close()
-	if syncErr != nil {
-		return "", fmt.Errorf("publish location: sync parent directory: %w", syncErr)
-	}
-	if closeErr != nil {
-		return "", fmt.Errorf("publish location: close parent directory: %w", closeErr)
-	}
+	owned = false
 	p.logf("upload-snapshot: published %s", destination)
 	return p.locatedRef(basename, scheme, digest)
+}
+
+// publishLocationCopy is a test seam for failures after the publisher owns the
+// exclusively-created final. Production copies are sequential and cancellable.
+var publishLocationCopy = copyLocationContents
+
+func copySyncAndCloseLocationFile(ctx context.Context, destination *os.File, sourcePath string) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		_ = destination.Close()
+		return err
+	}
+	info, statErr := source.Stat()
+	var copied int64
+	if statErr == nil {
+		copied, err = publishLocationCopy(ctx, destination, source)
+	}
+	sourceCloseErr := source.Close()
+	if statErr != nil {
+		err = statErr
+	} else if err == nil && copied != info.Size() {
+		err = fmt.Errorf("short copy: wrote %d of %d bytes", copied, info.Size())
+	} else if err == nil && sourceCloseErr != nil {
+		err = sourceCloseErr
+	}
+	if err == nil {
+		err = destination.Sync()
+	}
+	closeErr := destination.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
+func copyLocationContents(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {
+	buf := make([]byte, 128*1024)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		n, readErr := source.Read(buf)
+		if n > 0 {
+			written, writeErr := destination.Write(buf[:n])
+			total += int64(written)
+			if writeErr != nil {
+				return total, writeErr
+			}
+			if written != n {
+				return total, io.ErrShortWrite
+			}
+		}
+		if readErr == io.EOF {
+			return total, nil
+		}
+		if readErr != nil {
+			return total, readErr
+		}
+	}
+}
+
+func validateExistingLocationFile(ctx context.Context, path string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string) error {
+	const attempts = 20
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		err = validatePublishedFinal(ctx, path, logicalSize, codec, required, scheme, digest)
+		if err == nil {
+			return nil
+		}
+		if attempt+1 == attempts {
+			break
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
 }
 
 func validatePublishedFinal(ctx context.Context, path string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string) error {
