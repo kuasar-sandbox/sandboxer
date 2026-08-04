@@ -277,6 +277,58 @@ func TestPublishLocationFileDoesNotRemoveFinalWhenContextCanceled(t *testing.T) 
 	}
 }
 
+func TestLocationFinalMismatchClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "logical mismatch", err: errLocationFinalMismatch, want: true},
+		{name: "truncation", err: io.ErrUnexpectedEOF, want: true},
+		{name: "authentication", err: fmt.Errorf("wrapped: %w", tarstream.ErrAuthentication), want: true},
+		{name: "digest", err: tarstream.ErrDigestMismatch, want: true},
+		{name: "plaintext policy", err: tarstream.ErrPlaintextForbidden, want: true},
+		{name: "cancellation", err: context.Canceled, want: false},
+		{name: "io failure", err: &os.PathError{Op: "read", Path: "final", Err: unix.EIO}, want: false},
+		{name: "stale handle", err: &os.PathError{Op: "read", Path: "final", Err: unix.ESTALE}, want: false},
+		{name: "permission", err: os.ErrPermission, want: false},
+		{name: "unknown", err: errors.New("backend unavailable"), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isConfirmedLocationFinalMismatch(test.err); got != test.want {
+				t.Fatalf("isConfirmedLocationFinalMismatch(%v) = %v, want %v", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func TestPublishLocationFilePreservesFinalOnValidationAccessError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file mode access checks")
+	}
+	dir := t.TempDir()
+	source, identity := writePublishArtifact(t, t.TempDir(), ".overlay", bytes.Repeat([]byte{0x49}, 4096))
+	scheme, digest, _ := strings.Cut(identity, ":")
+	destination := filepath.Join(dir, digest+".overlay")
+	if err := os.WriteFile(destination, []byte("preserve"), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(destination, 0o600) })
+	p := newSnapshotPublisher(context.Background(), nil, false, nil)
+	p.location, p.directory = "shared", dir
+	if _, err := p.publishLocationFile(source, ".overlay", scheme, digest, 4096); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("publish error = %v, want permission error", err)
+	}
+	info, err := os.Lstat(destination)
+	if err != nil {
+		t.Fatalf("existing final was removed: %v", err)
+	}
+	if info.Mode().Perm() != 0 {
+		t.Fatalf("existing final mode = %04o, want 0000", info.Mode().Perm())
+	}
+}
+
 func TestPublishLocationFileDoesNotReplaceNonRegularFinal(t *testing.T) {
 	dir := t.TempDir()
 	source, identity := writePublishArtifact(t, t.TempDir(), ".overlay", bytes.Repeat([]byte{0x19}, 4096))

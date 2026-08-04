@@ -519,6 +519,8 @@ root/data disk 字段中的本地项同样作为 opaque leaf 发布。相同 rea
 验证 tarstream 格式、logical size、digest scheme/digest、marker、codec 和本地加密
 策略:全部一致则复用;不一致的普通文件直接删除后以 exclusive create 重试,直到上传
 成功或调用 context 取消。context 取消或超时不作为内容不一致的证据,不会触发删除。
+打开、读取、stat 或 sync 的系统错误同样不证明内容不一致:publisher 返回错误并保留
+现有终态,由后续上传重试。复用成功前会同步已验证的文件和父目录。
 并发修复不引入 advisory lock 或锁文件:竞争期间 publisher 可以删除彼此尚未完成的
 普通 final,竞争停止后最后仍在执行的上传完成发布。symlink 和非普通文件始终拒绝且
 不会删除。

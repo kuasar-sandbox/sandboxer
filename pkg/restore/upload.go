@@ -433,14 +433,23 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest 
 			if !os.IsExist(err) {
 				return "", fmt.Errorf("publish location: create final exclusively: %w", err)
 			}
-			validateErr := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest)
+			validateErr := validateAndSyncPublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest)
 			if validateErr == nil {
+				if err := syncLocationDirectory(p.directory); err != nil {
+					return "", fmt.Errorf("publish location: sync parent directory: %w", err)
+				}
 				return p.locatedRef(basename, scheme, digest)
 			}
 			if ctxErr := p.ctx.Err(); ctxErr != nil {
 				return "", fmt.Errorf("publish location: validate existing final: %w", ctxErr)
 			}
 			if errors.Is(validateErr, context.Canceled) || errors.Is(validateErr, context.DeadlineExceeded) {
+				return "", fmt.Errorf("publish location: validate existing final: %w", validateErr)
+			}
+			if os.IsNotExist(validateErr) {
+				continue
+			}
+			if !isConfirmedLocationFinalMismatch(validateErr) {
 				return "", fmt.Errorf("publish location: validate existing final: %w", validateErr)
 			}
 			if err := removeInvalidLocationFile(destination); err != nil {
@@ -454,6 +463,9 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest 
 		ownedInfo, err := created.Stat()
 		if err != nil {
 			_ = created.Close()
+			if removeErr := os.Remove(destination); removeErr != nil && !os.IsNotExist(removeErr) {
+				return "", fmt.Errorf("publish location: stat created final: %v; remove incomplete final: %w", err, removeErr)
+			}
 			return "", fmt.Errorf("publish location: stat created final: %w", err)
 		}
 		owned := true
@@ -472,22 +484,37 @@ func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest 
 		if err := validatePublishedFinal(p.ctx, destination, logicalSize, p.codec, outputRequired, scheme, digest); err != nil {
 			return "", fmt.Errorf("publish location: validate final: %w", err)
 		}
-		dir, err := os.Open(p.directory)
-		if err != nil {
-			return "", fmt.Errorf("publish location: open parent directory: %w", err)
-		}
-		syncErr := dir.Sync()
-		closeErr := dir.Close()
-		if syncErr != nil {
-			return "", fmt.Errorf("publish location: sync parent directory: %w", syncErr)
-		}
-		if closeErr != nil {
-			return "", fmt.Errorf("publish location: close parent directory: %w", closeErr)
+		if err := syncLocationDirectory(p.directory); err != nil {
+			return "", fmt.Errorf("publish location: sync parent directory: %w", err)
 		}
 		owned = false
 		p.logf("upload-snapshot: published %s", destination)
 		return p.locatedRef(basename, scheme, digest)
 	}
+}
+
+var errLocationFinalMismatch = errors.New("location final mismatch")
+
+func isConfirmedLocationFinalMismatch(err error) bool {
+	for _, mismatch := range []error{
+		errLocationFinalMismatch,
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		tarstream.ErrCodecRequired,
+		tarstream.ErrPlaintextForbidden,
+		tarstream.ErrUnsupportedVersion,
+		tarstream.ErrMalformedEnvelope,
+		tarstream.ErrAuthentication,
+		tarstream.ErrDigestMismatch,
+		tarstream.ErrInvalidCanonicalTarstream,
+		tarstream.ErrUnsupportedEncoding,
+		tarstream.ErrNotFound,
+	} {
+		if errors.Is(err, mismatch) {
+			return true
+		}
+	}
+	return false
 }
 
 func removeInvalidLocationFile(path string) error {
@@ -575,6 +602,14 @@ func copyLocationContents(ctx context.Context, destination io.Writer, source io.
 }
 
 func validatePublishedFinal(ctx context.Context, path string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string) error {
+	return validatePublishedFinalFile(ctx, path, logicalSize, codec, required, scheme, digest, false)
+}
+
+func validateAndSyncPublishedFinal(ctx context.Context, path string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string) error {
+	return validatePublishedFinalFile(ctx, path, logicalSize, codec, required, scheme, digest, true)
+}
+
+func validatePublishedFinalFile(ctx context.Context, path string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string, syncFile bool) error {
 	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return protectArtifactReadError(codec, "open existing final", err)
@@ -585,7 +620,7 @@ func validatePublishedFinal(ctx context.Context, path string, logicalSize uint64
 		return err
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("existing final is not a regular file")
+		return fmt.Errorf("%w: existing final is not a regular file", errLocationFinalMismatch)
 	}
 	var options []tarstream.ReadOption
 	if codec != nil {
@@ -597,9 +632,30 @@ func validatePublishedFinal(ctx context.Context, path string, logicalSize uint64
 		return err
 	}
 	if source.Size() != logicalSize {
-		return fmt.Errorf("existing final logical size mismatch")
+		return fmt.Errorf("%w: existing final logical size", errLocationFinalMismatch)
 	}
-	return consumeSource(ctx, source, 0)
+	if err := consumeSource(ctx, source, 0); err != nil {
+		return err
+	}
+	if syncFile {
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("sync existing final: %w", err)
+		}
+	}
+	return nil
+}
+
+func syncLocationDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 func (p *snapshotPublisher) locatedRef(basename, scheme, digest string) (string, error) {
