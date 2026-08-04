@@ -38,7 +38,7 @@ func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config
 	p := newSnapshotPublisher(ctx, codec, required, logf)
 	p.ing = ing
 	p.fetcher = manifestFetcher
-	return p.publishSnapshot(snapshotPath, manifest.Ref{})
+	return p.publishRootSnapshot(snapshotPath, manifest.Ref{})
 }
 
 // PublishLocalToLocation publishes a local snapshot graph into one trusted
@@ -58,7 +58,23 @@ func PublishLocalToLocation(ctx context.Context, snapshotPath, location, directo
 	p := newSnapshotPublisher(ctx, codec, required, logf)
 	p.location = location
 	p.directory = filepath.Clean(directory)
-	return p.publishSnapshot(snapshotPath, manifest.Ref{})
+	return p.publishRootSnapshot(snapshotPath, manifest.Ref{})
+}
+
+// publishRole is derived from the snapshot.cfg field being traversed. A root
+// graph is parsed and rewritten, while memory layers and ordinary artifacts are
+// published as opaque logical tarstreams.
+type publishRole uint8
+
+const (
+	publishRootGraph publishRole = iota
+	publishMemoryLayer
+	publishLeafArtifact
+)
+
+type publishCacheKey struct {
+	RealPath string
+	Role     publishRole
 }
 
 type snapshotPublisher struct {
@@ -70,8 +86,8 @@ type snapshotPublisher struct {
 	location  string
 	directory string
 	logf      func(string, ...any)
-	done      map[string]string
-	visiting  map[string]bool
+	done      map[publishCacheKey]string
+	visiting  map[publishCacheKey]bool
 }
 
 func newSnapshotPublisher(ctx context.Context, codec tarstream.Codec, required bool, logf func(string, ...any)) *snapshotPublisher {
@@ -80,30 +96,39 @@ func newSnapshotPublisher(ctx context.Context, codec tarstream.Codec, required b
 	}
 	return &snapshotPublisher{
 		ctx: ctx, codec: codec, required: required, logf: logf,
-		done: make(map[string]string), visiting: make(map[string]bool),
+		done: make(map[publishCacheKey]string), visiting: make(map[publishCacheKey]bool),
 	}
 }
 
-func (p *snapshotPublisher) publishSnapshot(snapshotPath string, expected manifest.Ref) (result string, retErr error) {
-	realPath, err := filepath.EvalSymlinks(snapshotPath)
+func resolvePublishPath(path string, codec tarstream.Codec, operation string) (string, error) {
+	realPath, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return "", protectArtifactReadError(p.codec, "resolve local snapshot", err)
+		return "", protectArtifactReadError(codec, operation, err)
 	}
 	realPath, err = filepath.Abs(realPath)
 	if err != nil {
 		return "", err
 	}
-	if p.visiting[realPath] {
+	return realPath, nil
+}
+
+func (p *snapshotPublisher) publishRootSnapshot(snapshotPath string, expected manifest.Ref) (result string, retErr error) {
+	realPath, err := resolvePublishPath(snapshotPath, p.codec, "resolve local snapshot")
+	if err != nil {
+		return "", err
+	}
+	key := publishCacheKey{RealPath: realPath, Role: publishRootGraph}
+	if p.visiting[key] {
 		return "", fmt.Errorf("upload-snapshot: snapshot cycle detected")
 	}
-	p.visiting[realPath] = true
-	defer func() { delete(p.visiting, realPath) }()
+	p.visiting[key] = true
+	defer func() { delete(p.visiting, key) }()
 
 	bundle, bundleScheme, bundleDigest, err := openTarArtifact(realPath, expected, p.codec, p.required)
 	if err != nil {
 		return "", fmt.Errorf("open snapshot: %w", err)
 	}
-	if ref, ok := p.done[realPath]; ok {
+	if ref, ok := p.done[key]; ok {
 		_ = bundle.Close()
 		return ref, nil
 	}
@@ -126,7 +151,7 @@ func (p *snapshotPublisher) publishSnapshot(snapshotPath string, expected manife
 	bundleDir := filepath.Dir(realPath)
 
 	for i, ref := range parsed.FromRefs {
-		parsed.FromRefs[i], err = p.publishRef(fmt.Sprintf("memory parent %d", i), ref, bundleDir, true)
+		parsed.FromRefs[i], err = p.publishRef(fmt.Sprintf("memory parent %d", i), ref, bundleDir, publishMemoryLayer)
 		if err != nil {
 			return "", err
 		}
@@ -202,7 +227,7 @@ func (p *snapshotPublisher) publishSnapshot(snapshotPath string, expected manife
 			return "", err
 		}
 	}
-	p.done[realPath] = result
+	p.done[key] = result
 	return result, nil
 }
 
@@ -258,14 +283,14 @@ func readSnapshotEntries(ctx context.Context, bundle fetch.Stream, bundleSize in
 
 func (p *snapshotPublisher) publishDiskNode(label string, baseRef, base *string, baseFromRefs *[]string, overlay *SnapOverlayCfg, bundleDir string) error {
 	var err error
-	if *baseRef, err = p.publishRef(label+" base", *baseRef, bundleDir, false); err != nil {
+	if *baseRef, err = p.publishRef(label+" base", *baseRef, bundleDir, publishLeafArtifact); err != nil {
 		return err
 	}
-	if *base, err = p.publishRef(label+" top", *base, bundleDir, false); err != nil {
+	if *base, err = p.publishRef(label+" top", *base, bundleDir, publishLeafArtifact); err != nil {
 		return err
 	}
 	for i, ref := range *baseFromRefs {
-		(*baseFromRefs)[i], err = p.publishRef(fmt.Sprintf("%s parent %d", label, i), ref, bundleDir, false)
+		(*baseFromRefs)[i], err = p.publishRef(fmt.Sprintf("%s parent %d", label, i), ref, bundleDir, publishLeafArtifact)
 		if err != nil {
 			return err
 		}
@@ -273,11 +298,11 @@ func (p *snapshotPublisher) publishDiskNode(label string, baseRef, base *string,
 	if overlay == nil {
 		return nil
 	}
-	if overlay.Base, err = p.publishRef(label+" overlay", overlay.Base, bundleDir, false); err != nil {
+	if overlay.Base, err = p.publishRef(label+" overlay", overlay.Base, bundleDir, publishLeafArtifact); err != nil {
 		return err
 	}
 	for i, ref := range overlay.BaseFromRefs {
-		overlay.BaseFromRefs[i], err = p.publishRef(fmt.Sprintf("%s overlay parent %d", label, i), ref, bundleDir, false)
+		overlay.BaseFromRefs[i], err = p.publishRef(fmt.Sprintf("%s overlay parent %d", label, i), ref, bundleDir, publishLeafArtifact)
 		if err != nil {
 			return err
 		}
@@ -285,7 +310,7 @@ func (p *snapshotPublisher) publishDiskNode(label string, baseRef, base *string,
 	return nil
 }
 
-func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotRef bool) (string, error) {
+func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, role publishRole) (string, error) {
 	if raw == "" {
 		return "", nil
 	}
@@ -313,16 +338,41 @@ func (p *snapshotPublisher) publishRef(label, raw, relativeDir string, snapshotR
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(relativeDir, path)
 	}
-	if snapshotRef {
-		return p.publishSnapshot(path, ref)
+	switch role {
+	case publishRootGraph:
+		return p.publishRootSnapshot(path, ref)
+	case publishMemoryLayer:
+		return p.publishMemorySnapshotLayer(label, path, ref)
+	case publishLeafArtifact:
+		return p.publishLeaf(label, path, ref, publishLeafArtifact)
+	default:
+		return "", fmt.Errorf("upload-snapshot: %s: unknown publish role %d", label, role)
 	}
-	return p.publishLeaf(label, path, ref)
 }
 
-func (p *snapshotPublisher) publishLeaf(label, path string, expected manifest.Ref) (string, error) {
-	stream, closer, payloadName, scheme, digest, err := openSequentialTarArtifact(path, "", expected, p.codec, p.required)
+// publishMemorySnapshotLayer deliberately does not read snapshot.cfg. A
+// from_refs entry is already a flattened memory-only lower in the current root
+// graph, so its historical disk graph is not a dependency of this publication.
+func (p *snapshotPublisher) publishMemorySnapshotLayer(label, path string, expected manifest.Ref) (string, error) {
+	return p.publishLeaf(label, path, expected, publishMemoryLayer)
+}
+
+func (p *snapshotPublisher) publishLeaf(label, path string, expected manifest.Ref, role publishRole) (string, error) {
+	if role != publishMemoryLayer && role != publishLeafArtifact {
+		return "", fmt.Errorf("upload-snapshot: %s: role %d is not an opaque artifact role", label, role)
+	}
+	realPath, err := resolvePublishPath(path, p.codec, "resolve local "+label)
+	if err != nil {
+		return "", err
+	}
+	stream, closer, payloadName, scheme, digest, err := openSequentialTarArtifact(realPath, "", expected, p.codec, p.required)
 	if err != nil {
 		return "", fmt.Errorf("upload-snapshot: %s: %w", label, err)
+	}
+	key := publishCacheKey{RealPath: realPath, Role: role}
+	if ref, ok := p.done[key]; ok {
+		_ = closer.Close()
+		return ref, nil
 	}
 	defer closer.Close()
 
@@ -331,9 +381,11 @@ func (p *snapshotPublisher) publishLeaf(label, path string, expected manifest.Re
 		if err != nil {
 			return "", fmt.Errorf("upload-snapshot: ingest %s: %w", label, err)
 		}
-		key := manifest.HexKey(res.ManifestKey)
-		p.logf("upload-snapshot: %s → manifest://%s (stored=%d dedup=%d)", label, key, res.StoredChunks, res.DedupChunks)
-		return "manifest://" + key, nil
+		manifestKey := manifest.HexKey(res.ManifestKey)
+		p.logf("upload-snapshot: %s → manifest://%s (stored=%d dedup=%d)", label, manifestKey, res.StoredChunks, res.DedupChunks)
+		result := "manifest://" + manifestKey
+		p.done[key] = result
+		return result, nil
 	}
 	tmp, err := os.CreateTemp(p.directory, ".publish-leaf-*.tmp")
 	if err != nil {
@@ -355,8 +407,13 @@ func (p *snapshotPublisher) publishLeaf(label, path string, expected manifest.Re
 	if err := matchDigest(outScheme, outDigest, scheme, digest); err != nil {
 		return "", fmt.Errorf("upload-snapshot: converted identity changed")
 	}
-	ext := filepath.Ext(path)
-	return p.publishLocationFile(tmpPath, ext, outScheme, outDigest, stream.Size())
+	ext := filepath.Ext(realPath)
+	result, err := p.publishLocationFile(tmpPath, ext, outScheme, outDigest, stream.Size())
+	if err != nil {
+		return "", err
+	}
+	p.done[key] = result
+	return result, nil
 }
 
 func (p *snapshotPublisher) publishLocationFile(sourcePath, ext, scheme, digest string, logicalSize uint64) (string, error) {

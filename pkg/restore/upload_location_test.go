@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -199,7 +200,7 @@ func TestSnapshotPublisherChecksPreservedManifestRefs(t *testing.T) {
 	p := newSnapshotPublisher(context.Background(), nil, false, nil)
 	p.fetcher = failingManifestFetcher{}
 	ref := "manifest://" + strings.Repeat("a", 64)
-	_, err := p.publishRef("parent", ref, "", false)
+	_, err := p.publishRef("parent", ref, "", publishLeafArtifact)
 	if err == nil || !strings.Contains(err.Error(), "backend unavailable") {
 		t.Fatalf("publishRef error = %v, want manifest backend check", err)
 	}
@@ -225,10 +226,14 @@ func TestPreflightChecksManifestArtifacts(t *testing.T) {
 	}
 }
 
-func TestPreflightLocatedRefsWalksMemoryParents(t *testing.T) {
+func TestPreflightLocatedRefsTreatsRootMemoryListAsAuthoritative(t *testing.T) {
 	parentDir := t.TempDir()
+	ancestorCfg := &SnapshotCfg{}
+	ancestorCfg.Resources.Capacity.Memory = "4KiB"
+	ancestorPath := writePublishSnapshot(t, parentDir, ancestorCfg)
 	parentCfg := &SnapshotCfg{FromRefs: []string{
-		"file://" + strings.Repeat("d", 64) + ".snapshot@location:missing-parent",
+		"file://" + filepath.Base(ancestorPath),
+		"file://" + strings.Repeat("d", 64) + ".snapshot@location:stale-parent",
 	}}
 	parentCfg.Resources.Capacity.Memory = "4KiB"
 	parentCfg.Boot.Root.Overlay = &SnapOverlayCfg{
@@ -239,16 +244,44 @@ func TestPreflightLocatedRefsWalksMemoryParents(t *testing.T) {
 	rootDir := t.TempDir()
 	rootCfg := &SnapshotCfg{FromRefs: []string{
 		"file://" + filepath.Base(parentPath) + "@location:parent",
+		"file://" + filepath.Base(ancestorPath) + "@location:parent",
 	}}
 	rootCfg.Resources.Capacity.Memory = "4KiB"
 	rootPath := writePublishSnapshot(t, rootDir, rootCfg)
 
-	err := preflightLocatedRefs(context.Background(), Options{
+	if err := preflightLocatedRefs(context.Background(), Options{
 		SnapshotPath: rootPath,
 		RefLocations: config.RefLocations{"parent": parentDir},
-	})
+	}); err != nil {
+		t.Fatalf("flattened root memory list was not authoritative: %v", err)
+	}
+}
+
+func TestPreflightLocatedRefsValidatesOpaqueRootMemoryLayers(t *testing.T) {
+	rootCfg := &SnapshotCfg{FromRefs: []string{
+		"file://" + strings.Repeat("d", 64) + ".snapshot@location:missing-parent",
+	}}
+	rootCfg.Resources.Capacity.Memory = "4KiB"
+	rootPath := writePublishSnapshot(t, t.TempDir(), rootCfg)
+
+	err := preflightLocatedRefs(context.Background(), Options{SnapshotPath: rootPath})
 	if err == nil || !strings.Contains(err.Error(), `location "missing-parent" is not configured`) {
-		t.Fatalf("preflight error = %v", err)
+		t.Fatalf("missing opaque root memory layer error = %v", err)
+	}
+}
+
+func TestPreflightLocatedRefsBoundsFlattenedMemoryLayers(t *testing.T) {
+	refs := make([]string, maxSnapshotParentEntries+1)
+	for i := range refs {
+		refs[i] = "file://" + fmt.Sprintf("%064x", i+1) + ".snapshot"
+	}
+	rootCfg := &SnapshotCfg{FromRefs: refs}
+	rootCfg.Resources.Capacity.Memory = "4KiB"
+	rootPath := writePublishSnapshot(t, t.TempDir(), rootCfg)
+
+	err := preflightLocatedRefs(context.Background(), Options{SnapshotPath: rootPath})
+	if err == nil || !strings.Contains(err.Error(), "snapshot parent graph exceeds 1024 entries") {
+		t.Fatalf("oversized flattened memory list error = %v", err)
 	}
 }
 

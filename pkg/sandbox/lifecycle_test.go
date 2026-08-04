@@ -151,6 +151,78 @@ func TestValidatePortableMemoryRefsAcceptsLocatedFileRefs(t *testing.T) {
 	}
 }
 
+func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
+	portable := "manifest://" + strings.Repeat("a", 64)
+	prov := config.SnapshotProvenance{
+		ParentSnapshotRef: "file:///bundle/w.snapshot",
+		ParentFromRefs: []string{
+			"file:///bundle/b.snapshot",
+			portable,
+		},
+	}
+
+	merged, err := snapshotMemoryRefs(prov, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMerged := []string{"file://b.snapshot", portable}
+	if strings.Join(merged, ",") != strings.Join(wantMerged, ",") {
+		t.Fatalf("merged memory refs = %v, want %v", merged, wantMerged)
+	}
+
+	workingSet, err := snapshotMemoryRefs(prov, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantWorkingSet := []string{"file://w.snapshot", "file://b.snapshot", portable}
+	if strings.Join(workingSet, ",") != strings.Join(wantWorkingSet, ",") {
+		t.Fatalf("working-set memory refs = %v, want %v", workingSet, wantWorkingSet)
+	}
+
+	if prov.ParentFromRefs[0] != "file:///bundle/b.snapshot" {
+		t.Fatalf("snapshotMemoryRefs mutated provenance: %v", prov.ParentFromRefs)
+	}
+}
+
+func TestHandleSnapshotRequestRejectsMergedLocalLowerBeforeQuiesce(t *testing.T) {
+	dir := t.TempDir()
+	parentPath, parentScheme, parentDigest := writeDiskArtifact(t, dir, "snapshot", make([]byte, 4096), nil)
+	cfg := &config.SandboxConfig{}
+	cfg.SnapshotProvenance = config.SnapshotProvenance{
+		ParentSnapshotRef:  fileRef(parentPath, parentScheme, parentDigest),
+		ParentSnapshotPath: parentPath,
+		ParentFromRefs:     []string{"file://base.snapshot"},
+	}
+	mfd, err := memory.Create("portable-chain-preflight", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	viewCalled := false
+	pinger := &guestlink.Pinger{
+		Client: &guestlink.HostClient{BasePath: filepath.Join(dir, "must-not-dial.sock")},
+	}
+
+	_, err = handleSnapshotRequest(ctl.Request{Upload: true}, RunOptions{
+		Cfg:         cfg,
+		SandboxID:   "test",
+		ManifestCfg: &config.ManifestConfig{Store: manifest.StoreConfig{Endpoint: "unused"}},
+	}, mfd, []SnapDiskRef{{
+		DiffPath: filepath.Join(dir, "diff"),
+		Size:     4096,
+		SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			viewCalled = true
+			return bytes.NewReader(make([]byte, 4096)), nil, nil
+		},
+	}}, nil, "", filepath.Join(dir, "run"), pinger, nil, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "direct upload would retain a local memory lower") {
+		t.Fatalf("local lower preflight error = %v", err)
+	}
+	if viewCalled {
+		t.Fatal("snapshot view opened before final memory-chain validation")
+	}
+}
+
 func TestHandleSnapshotRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T) {
 	pinger := &guestlink.Pinger{
 		Client: &guestlink.HostClient{BasePath: filepath.Join(t.TempDir(), "must-not-dial.sock")},

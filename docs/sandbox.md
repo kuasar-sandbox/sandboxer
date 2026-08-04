@@ -504,14 +504,18 @@ sandbox-ctl upload-snapshot [flags] <snapshot-path>
 目标。使用 named location 时仍可由 `MANIFEST_CONFIG` 环境变量提供
 `crypto.local` policy;若未提供则按默认 `off`。
 
-local file refs 按 bundle 同目录解析并递归升级;已有 portable ref 是本次发布边界。
+local file refs 按 bundle 同目录解析;已有 portable ref 是本次发布边界。发布器按
+`snapshot.cfg` 字段区分三种角色:只解析并重建命令行指定的 root snapshot graph;
+`from_refs` 中的本地项是已经 flatten 的 memory-only lower,作为 opaque snapshot
+tarstream 独立发布,不再读取其中历史 `snapshot.cfg` 或追踪它的旧 disk refs;当前
+root/data disk 字段中的本地项同样作为 opaque leaf 发布。相同 realpath 的缓存键还包含
+角色,避免同一工件在 root graph 与 memory layer 两种语义间错误复用。输出 root 的
+所有本地依赖均被改写为目标 portable ref,原有顺序与重复项保持不变。
+
 发布前对每个本地 tarstream 执行 sequential full validation,再从逻辑 plaintext
 稀疏视图重新编码;不会 raw-copy 工件。named location 使用目标目录内临时文件,
 `Sync` + `Close` 后以 no-replace 原子提交并同步父目录。终态已存在时完整验证,
 内容与 identity 一致才复用;不完整、校验失败或 identity 不一致时拒绝,绝不覆盖。
-working-set snapshot 的本地 memory `from_refs` 是 memory-only lowers;当前通用
-publisher 的递归遍历尚未与该语义完成校准,不承诺能发布只保留必要 memory lowers
-的最小 artifact set。该发布闭环继续由 #41 follow-up 定义和验证。
 
 ## 3. 配置
 
@@ -1031,7 +1035,7 @@ self 温热 chunk cache,file self 对已打开的 artifact FD 提交 `FADV_WILLN
 必须是顶层;本地 disk top 每次保存都 flatten-merge,`base_from_refs` 不新增本地 ref。
 memory chain 则允许 self 以下出现多个本地 `file://*.snapshot` ref,仅用于本地
 working-set 生成与验证。这组 artifact 必须一起保留;缺任一层即整条快照失效。离线上传
-后本地 refs 会递归改写成目标 portable refs。
+后 root 展平列表中的本地 refs 会逐项改写成目标 portable refs。
 
 - **默认本地导出 = 替换直接父 self(合并,非递归 compaction)**:若沙箱本身从**本地**
   `file://` 快照懒加载,
@@ -1050,8 +1054,10 @@ working-set 生成与验证。这组 artifact 必须一起保留;缺任一层即
 - **live upload 检查最终 memory chain**:无论 `merge-ref` 取值,只要计算后的
   `resultMemoryRefs` 仍包含本地 ref,就在 quiesce 前拒绝 `snapshot --upload`。可先
   `--output` 做本地验证,再用 `upload-snapshot` 递归发布整个 snapshot graph。
-- **离线提升 `sandbox-ctl upload-snapshot <本地快照>`**(§2.7):递归升级可见 local
-  refs,已有 manifest/located refs 原样带过,最终打印 canonical portable root ref。
+- **离线提升 `sandbox-ctl upload-snapshot <本地快照>`**(§2.7):重建 root graph,
+  把 `from_refs` 的 local memory lowers 作为 opaque 工件发布,并升级当前 root/data
+  disk 的 local leaves;已有 manifest/located refs 原样带过,最终打印 canonical
+  portable root ref。历史 memory lower 内已被 flatten 掉的旧 disk graph 不再是依赖。
 
 ## 4. 资源模型
 
@@ -1557,6 +1563,8 @@ T2  打开 <ref>:
 T3  archive/zip.NewReader(ReaderAt, totalSize) → 解出 config.json / state.json /
     snapshot.cfg。解析 from_refs / overlay.base_from_refs(§3.5),逐项解析为
     Stream(file:// 校验摘要、manifest:// 内容自校验),校验全链 capacity 一致。
+    root snapshot.cfg 的展平 from_refs 列表是 memory chain 的唯一权威;preflight
+    把每项作为 opaque memory layer 打开验证,不解析 lower 内历史 snapshot.cfg。
     file 模式:若 <ref> 是 <sid>.snapshot 符号链接,follow 解析出真实
     <digest>.snapshot 名,读取工件取得实际 scheme + digest,作为本次的内容寻址
     self ref(供将来再保存时写入子快照
