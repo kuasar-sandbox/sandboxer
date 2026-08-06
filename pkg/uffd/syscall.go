@@ -187,12 +187,10 @@ func ioctlUffdCopy(fd int, dst, src, length uint64) (int64, error) {
 		Src: src,
 		Len: length,
 	}
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL,
 		uintptr(fd), uffdioCopy,
-		uintptr(unsafe.Pointer(&req))); errno != 0 {
-		return req.Copied, errno
-	}
-	return req.Copied, nil
+		uintptr(unsafe.Pointer(&req)))
+	return normalizeUffdCompletion(req.Copied, errno)
 }
 
 // ioctlUffdZeropage invokes UFFDIO_ZEROPAGE and returns the kernel-reported
@@ -202,12 +200,27 @@ func ioctlUffdZeropage(fd int, dst, length uint64) (int64, error) {
 		RangeStart: dst,
 		RangeLen:   length,
 	}
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL,
 		uintptr(fd), uffdioZeropage,
-		uintptr(unsafe.Pointer(&req))); errno != 0 {
-		return req.Zeropage, errno
+		uintptr(unsafe.Pointer(&req)))
+	return normalizeUffdCompletion(req.Zeropage, errno)
+}
+
+// The kernel writes the result of mcopy_atomic/mfill_zeropage into the signed
+// output field before returning from ioctl. On a conflict that means both an
+// ioctl errno and a negative output value (for example -EEXIST). A negative
+// value is an error code, not a byte count; never expose it as completed work.
+func normalizeUffdCompletion(completed int64, errno unix.Errno) (int64, error) {
+	if completed < 0 {
+		if errno != 0 {
+			return 0, errno
+		}
+		return 0, unix.Errno(-completed)
 	}
-	return req.Zeropage, nil
+	if errno != 0 {
+		return completed, errno
+	}
+	return completed, nil
 }
 
 // ioctlUffdWake wakes any threads sleeping on faults in [start, start+len).
