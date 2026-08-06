@@ -793,20 +793,36 @@ type shortDiffBodyIO struct {
 type failingDiffTemplate struct{ size uint64 }
 
 func (s failingDiffTemplate) Size() uint64 { return s.size }
-func (s failingDiffTemplate) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
+func (s failingDiffTemplate) RunAt(offset, limit uint64) (sparse.Run, error) {
 	if offset >= s.size {
-		return 0, 0, io.EOF
+		return nil, io.EOF
 	}
 	end := offset + limit
 	if end < offset || end > s.size {
 		end = s.size
 	}
-	return sparse.Data, end, nil
+	return failingDiffRun{source: s, offset: offset, end: end}, nil
 }
 func (failingDiffTemplate) ReadAt(context.Context, []byte, uint64) (int, error) {
 	return 0, errors.New("injected template read failure")
 }
 func (failingDiffTemplate) Close() error { return nil }
+
+type failingDiffRun struct {
+	source failingDiffTemplate
+	offset uint64
+	end    uint64
+}
+
+func (r failingDiffRun) Offset() uint64     { return r.offset }
+func (r failingDiffRun) End() uint64        { return r.end }
+func (failingDiffRun) Kind() sparse.RunKind { return sparse.Data }
+func (r failingDiffRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	if innerOffset > r.end-r.offset || uint64(len(buf)) > r.end-r.offset-innerOffset {
+		return 0, errors.New("run read out of bounds")
+	}
+	return r.source.ReadAt(ctx, buf, r.offset+innerOffset)
+}
 
 func (s shortDiffBodyIO) ReadAt(buf []byte, offset int64) (int, error) {
 	if !s.shortRead || len(buf) == 0 {

@@ -37,27 +37,27 @@ func buildPageStream(t *testing.T, numPages int, fills []byte) fetch.Stream {
 	return testStream{Source: src}
 }
 
-// drainSource walks src page-by-page exactly as the uffd handler does:
-// PageSize-aligned ReadAt, zero runs leave the destination zero, data runs are
-// copied. Returns the reconstructed image.
+// drainSource walks the executable Runs exposed by SnapshotReader.
 func drainSource(t *testing.T, src SnapshotReader, size int) []byte {
 	t.Helper()
 	out := make([]byte, size)
 	off := 0
 	for off < size {
-		buf := make([]byte, size-off)
-		n, zero, err := src.ReadAt(buf, uint64(off))
+		run, err := src.RunAt(uint64(off), uint64(size-off))
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			t.Fatalf("ReadAt @ %d: %v", off, err)
+			t.Fatalf("RunAt @ %d: %v", off, err)
 		}
+		n := int(run.End() - run.Offset())
 		if n == 0 {
-			t.Fatalf("ReadAt @ %d made no progress", off)
+			t.Fatalf("RunAt @ %d made no progress", off)
 		}
-		if !zero {
-			copy(out[off:off+n], buf[:n])
+		if run.Kind() == sparse.Data {
+			if got, readErr := run.ReadAt(context.Background(), out[off:off+n], 0); readErr != nil || got != n {
+				t.Fatalf("Run.ReadAt @ %d = (%d, %v), want (%d, nil)", off, got, readErr, n)
+			}
 		}
 		off += n
 	}
@@ -119,7 +119,7 @@ func TestStreamSnapshotSource_LayeredMultiPageChunks(t *testing.T) {
 		}
 	}
 
-	src, err := NewStreamSnapshotSource(context.Background(), fetch.NewLayered(top, base), uint64(n)*PageSize)
+	src, err := NewStreamSnapshotSource(fetch.NewLayered(top, base), uint64(n)*PageSize)
 	if err != nil {
 		t.Fatalf("NewStreamSnapshotSource: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestStreamSnapshotSource_LayeredManifest(t *testing.T) {
 	// top: data on 0,2,4; holes elsewhere (fall through to base).
 	top := buildPageStream(t, n, []byte{0xA0, 0x00, 0xA2, 0x00, 0xA4, 0x00, 0x00, 0x00})
 
-	src, err := NewStreamSnapshotSource(context.Background(), fetch.NewLayered(top, base), uint64(n)*PageSize)
+	src, err := NewStreamSnapshotSource(fetch.NewLayered(top, base), uint64(n)*PageSize)
 	if err != nil {
 		t.Fatalf("NewStreamSnapshotSource: %v", err)
 	}

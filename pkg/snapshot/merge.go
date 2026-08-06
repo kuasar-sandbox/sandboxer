@@ -119,10 +119,11 @@ func ValidateMergeBase(path string, size int64, codec tarstream.Codec, required 
 func mergeStreamHoles(stream fetch.Stream, size uint64) ([]sparse.Extent, error) {
 	var holes []sparse.Extent
 	for offset := uint64(0); offset < size; {
-		kind, end, err := stream.RunAt(offset, size-offset)
+		run, err := stream.RunAt(offset, size-offset)
 		if err != nil {
 			return nil, err
 		}
+		kind, end := run.Kind(), run.End()
 		if end <= offset || end > size {
 			return nil, fmt.Errorf("invalid run [%d,%d)", offset, end)
 		}

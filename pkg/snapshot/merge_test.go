@@ -219,7 +219,7 @@ func BenchmarkSeekerSourceAlternatingBlocks(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		offset := uint64(i&(blocks-1)) * blockSize
-		if _, _, err := src.RunAt(offset, blockSize); err != nil {
+		if _, err := src.RunAt(offset, blockSize); err != nil {
 			b.Fatal(err)
 		}
 	}

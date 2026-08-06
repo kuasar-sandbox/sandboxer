@@ -292,11 +292,15 @@ func TestPrefetchTaskStopIsIdempotent(t *testing.T) {
 type plainPrefetchTestStream struct{}
 
 func (plainPrefetchTestStream) Size() uint64 { return 1 }
-func (plainPrefetchTestStream) RunAt(uint64, uint64) (sparse.RunKind, uint64, error) {
-	return sparse.Data, 1, nil
+func (s plainPrefetchTestStream) RunAt(offset, limit uint64) (sparse.Run, error) {
+	return newPrefetchTestRun(s, offset, limit)
 }
-func (plainPrefetchTestStream) ReadAt(context.Context, []byte, uint64) (int, error) {
-	return 0, io.EOF
+func (plainPrefetchTestStream) ReadAt(_ context.Context, buf []byte, offset uint64) (int, error) {
+	if offset >= 1 {
+		return 0, io.EOF
+	}
+	clear(buf)
+	return len(buf), nil
 }
 func (plainPrefetchTestStream) Close() error { return nil }
 
@@ -322,11 +326,15 @@ func newPrefetchTestStream() *prefetchTestStream {
 }
 
 func (s *prefetchTestStream) Size() uint64 { return 1 }
-func (s *prefetchTestStream) RunAt(uint64, uint64) (sparse.RunKind, uint64, error) {
-	return sparse.Data, 1, nil
+func (s *prefetchTestStream) RunAt(offset, limit uint64) (sparse.Run, error) {
+	return newPrefetchTestRun(s, offset, limit)
 }
-func (s *prefetchTestStream) ReadAt(context.Context, []byte, uint64) (int, error) {
-	return 0, io.EOF
+func (s *prefetchTestStream) ReadAt(_ context.Context, buf []byte, offset uint64) (int, error) {
+	if offset >= 1 {
+		return 0, io.EOF
+	}
+	clear(buf)
+	return len(buf), nil
 }
 func (s *prefetchTestStream) Close() error {
 	select {
@@ -350,6 +358,41 @@ func (s *prefetchTestStream) Prefetch(ctx context.Context) error {
 		}
 		return ctx.Err()
 	}
+}
+
+type prefetchRunSource interface {
+	ReadAt(context.Context, []byte, uint64) (int, error)
+}
+
+type prefetchTestRun struct {
+	source prefetchRunSource
+	offset uint64
+	end    uint64
+}
+
+func newPrefetchTestRun(source prefetchRunSource, offset, limit uint64) (sparse.Run, error) {
+	if offset >= 1 {
+		return nil, io.EOF
+	}
+	if limit == 0 {
+		return nil, errors.New("zero RunAt limit")
+	}
+	end := offset + limit
+	if end < offset || end > 1 {
+		end = 1
+	}
+	return prefetchTestRun{source: source, offset: offset, end: end}, nil
+}
+
+func (r prefetchTestRun) Offset() uint64     { return r.offset }
+func (r prefetchTestRun) End() uint64        { return r.end }
+func (prefetchTestRun) Kind() sparse.RunKind { return sparse.Data }
+func (r prefetchTestRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	length := r.end - r.offset
+	if innerOffset > length || uint64(len(buf)) > length-innerOffset {
+		return 0, errors.New("prefetch test Run read out of bounds")
+	}
+	return r.source.ReadAt(ctx, buf, r.offset+innerOffset)
 }
 
 type prefetchTestLogs struct {

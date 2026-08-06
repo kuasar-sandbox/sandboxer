@@ -178,10 +178,10 @@ func ioctlUffdRegister(fd int, start, length uint64) error {
 	return nil
 }
 
-// ioctlUffdCopy invokes UFFDIO_COPY. Returns nil on success, the errno
-// otherwise (notably EEXIST when the dst page already got resolved by
-// another fault — caller should fall back to UFFDIO_WAKE).
-func ioctlUffdCopy(fd int, dst, src, length uint64) error {
+// ioctlUffdCopy invokes UFFDIO_COPY and returns the kernel-reported completed
+// byte count even when ioctl returns an errno. Callers validate its range and
+// page alignment before updating statistics or PageState.
+func ioctlUffdCopy(fd int, dst, src, length uint64) (int64, error) {
 	req := uffdioCopyStruct{
 		Dst: dst,
 		Src: src,
@@ -190,13 +190,14 @@ func ioctlUffdCopy(fd int, dst, src, length uint64) error {
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
 		uintptr(fd), uffdioCopy,
 		uintptr(unsafe.Pointer(&req))); errno != 0 {
-		return errno
+		return req.Copied, errno
 	}
-	return nil
+	return req.Copied, nil
 }
 
-// ioctlUffdZeropage invokes UFFDIO_ZEROPAGE — installs a zero page at dst.
-func ioctlUffdZeropage(fd int, dst, length uint64) error {
+// ioctlUffdZeropage invokes UFFDIO_ZEROPAGE and returns the kernel-reported
+// completed byte count even when ioctl returns an errno.
+func ioctlUffdZeropage(fd int, dst, length uint64) (int64, error) {
 	req := uffdioZeropageStruct{
 		RangeStart: dst,
 		RangeLen:   length,
@@ -204,9 +205,9 @@ func ioctlUffdZeropage(fd int, dst, length uint64) error {
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
 		uintptr(fd), uffdioZeropage,
 		uintptr(unsafe.Pointer(&req))); errno != 0 {
-		return errno
+		return req.Zeropage, errno
 	}
-	return nil
+	return req.Zeropage, nil
 }
 
 // ioctlUffdWake wakes any threads sleeping on faults in [start, start+len).
