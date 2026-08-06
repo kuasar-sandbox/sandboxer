@@ -10,7 +10,9 @@ package chapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"time"
 )
@@ -19,12 +21,6 @@ import (
 // the response deadline is "no forced"), so a missing/dead socket fails fast
 // while a slow RESPONSE can still be waited out per RespDeadline.
 const dialTimeout = 5 * time.Second
-
-const (
-	waitReadyDialTimeout = 50 * time.Millisecond
-	waitReadyInitialPoll = 1 * time.Millisecond
-	waitReadyMaxPoll     = 20 * time.Millisecond
-)
 
 // Client issues management calls against one CH api-socket. The zero value is
 // usable except for Sock. RespDeadline bounds the response read; 0 = no forced
@@ -85,79 +81,56 @@ func (c Client) do(method, path, body string) error {
 	return nil
 }
 
-// WaitReady polls the CH api-socket until it accepts a connection (CH creates
-// it during startup). deadline <= 0 polls until ctx is cancelled (e.g. CH exit
-// / SIGINT); a positive deadline bounds the wait. Used by restore before the
-// post-spawn /vm.resume.
-func WaitReady(ctx context.Context, sock string, deadline time.Duration) error {
-	var end time.Time
+// WaitRestored reads CH's --event-monitor event stream until it sees the
+// vm/restored event that Vm::restore emits once device setup and restored
+// vCPU start are complete. CH's monitor thread writes each event as a JSON
+// object (whitespace-separated); this decodes them structurally rather than
+// scanning the serialization, so it is immune to pretty- vs compact-print
+// changes. Only Vm::restore emits an event named "restored" (source "vm").
+//
+// r is the read-end of the fd passed to CH as --event-monitor fd=<n>. The
+// decode goroutine blocks on r; on timeout or ctx cancellation WaitRestored
+// closes r (the EOF unblocks the goroutine) and drains it, so no blocked
+// reader is ever leaked. EOF before the event is an error. This is the
+// restore+resume completion barrier for the resume=true path: the old external
+// /vm.resume gave it implicitly (it serialized behind VmRestore in CH's api
+// loop), but resume=true drops that call.
+func WaitRestored(ctx context.Context, r io.ReadCloser, deadline time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		dec := json.NewDecoder(r)
+		for {
+			var ev struct {
+				Source string `json:"source"`
+				Event  string `json:"event"`
+			}
+			if err := dec.Decode(&ev); err != nil {
+				done <- fmt.Errorf("vm/restored not seen before stream end: %w", err)
+				return
+			}
+			if ev.Source == "vm" && ev.Event == "restored" {
+				done <- nil
+				return
+			}
+		}
+	}()
+	var tc <-chan time.Time
 	if deadline > 0 {
-		end = time.Now().Add(deadline)
+		t := time.NewTimer(deadline)
+		defer t.Stop()
+		tc = t.C
 	}
-	poll := waitReadyInitialPoll
-	var lastErr error
-	for {
-		if ctx.Err() != nil {
-			return fmt.Errorf("ch api socket not ready: %w", ctx.Err())
-		}
-		if !end.IsZero() && !time.Now().Before(end) {
-			if lastErr != nil {
-				return fmt.Errorf("ch api socket not ready before deadline: %w", lastErr)
-			}
-			return fmt.Errorf("ch api socket not ready before deadline")
-		}
-
-		dialCtx := ctx
-		cancel := func() {}
-		timeout := waitReadyDialTimeout
-		if !end.IsZero() {
-			remaining := time.Until(end)
-			if remaining <= 0 {
-				continue
-			}
-			if remaining < timeout {
-				timeout = remaining
-			}
-		}
-		if timeout > 0 {
-			dialCtx, cancel = context.WithTimeout(ctx, timeout)
-		}
-
-		c, err := (&net.Dialer{}).DialContext(dialCtx, "unix", sock)
-		cancel()
-		if err == nil {
-			_ = c.Close()
-			return nil
-		}
-		lastErr = err
-
-		sleep := poll
-		if !end.IsZero() {
-			remaining := time.Until(end)
-			if remaining <= 0 {
-				continue
-			}
-			if remaining < sleep {
-				sleep = remaining
-			}
-		}
-		timer := time.NewTimer(sleep)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			return fmt.Errorf("ch api socket not ready: %w", ctx.Err())
-		case <-timer.C:
-		}
-		if poll < waitReadyMaxPoll {
-			poll *= 2
-			if poll > waitReadyMaxPoll {
-				poll = waitReadyMaxPoll
-			}
-		}
+	shutdown := func(err error) error {
+		_ = r.Close() // EOF unblocks the decode goroutine…
+		<-done        // …then reap it before returning
+		return err
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return shutdown(fmt.Errorf("vm/restored: %w", ctx.Err()))
+	case <-tc:
+		return shutdown(fmt.Errorf("vm/restored not seen before deadline"))
 	}
 }

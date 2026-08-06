@@ -2,99 +2,61 @@ package chapi
 
 import (
 	"context"
-	"errors"
-	"net"
-	"path/filepath"
-	"runtime"
+	"io"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestWaitReadyReadySocket(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("unix sockets are not available")
-	}
-	sock := filepath.Join(t.TempDir(), "ch.sock")
-	done, ready := listenUnixOnce(t, sock, 0)
-	if err := <-ready; err != nil {
-		t.Fatalf("listen unix %s: %v", sock, err)
-	}
-
-	if err := WaitReady(context.Background(), sock, time.Second); err != nil {
-		t.Fatalf("WaitReady: %v", err)
-	}
-	waitDone(t, done)
-}
-
-func TestWaitReadySocketAppearsWithinShortDeadline(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("unix sockets are not available")
-	}
-	sock := filepath.Join(t.TempDir(), "ch.sock")
-	done, ready := listenUnixOnce(t, sock, 5*time.Millisecond)
-
-	if err := WaitReady(context.Background(), sock, 45*time.Millisecond); err != nil {
-		t.Fatalf("WaitReady: %v", err)
-	}
-	if err := <-ready; err != nil {
-		t.Fatalf("listen unix %s: %v", sock, err)
-	}
-	waitDone(t, done)
-}
-
-func TestWaitReadyContextCancel(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("unix sockets are not available")
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 1)
-	sock := filepath.Join(t.TempDir(), "missing.sock")
-	go func() {
-		errCh <- WaitReady(ctx, sock, 0)
-	}()
-
-	time.Sleep(5 * time.Millisecond)
-	cancel()
-
-	select {
-	case err := <-errCh:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("WaitReady error = %v, want context.Canceled", err)
+// TestWaitRestored drives chapi.WaitRestored with fake CH event-monitor
+// streams (whitespace-separated JSON objects, as CH's monitor thread writes).
+func TestWaitRestored(t *testing.T) {
+	restored := `{"timestamp":{"secs":0,"nanos":2},"source":"vm","event":"restored","properties":null}`
+	restoring := `{"timestamp":{"secs":0,"nanos":1},"source":"vm","event":"restoring","properties":null}`
+	join := func(events ...string) string {
+		var b strings.Builder
+		for _, e := range events {
+			b.WriteString(e)
+			b.WriteString("\n\n")
 		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("WaitReady did not return after context cancellation")
+		return b.String()
 	}
-}
 
-func listenUnixOnce(t *testing.T, sock string, delay time.Duration) (<-chan struct{}, <-chan error) {
-	t.Helper()
-	done := make(chan struct{})
-	ready := make(chan error, 1)
-	go func() {
-		defer close(done)
-		time.Sleep(delay)
-		ln, err := net.Listen("unix", sock)
-		ready <- err
-		if err != nil {
-			return
-		}
-		defer ln.Close()
-		if unixLn, ok := ln.(*net.UnixListener); ok {
-			_ = unixLn.SetDeadline(time.Now().Add(time.Second))
-		}
-		conn, err := ln.Accept()
-		if err == nil {
-			_ = conn.Close()
-		}
-	}()
-	return done, ready
-}
+	cases := []struct {
+		name     string
+		stream   string
+		keepOpen bool // leave the write-end open so Decode blocks (exercises the timeout path)
+		deadline time.Duration
+		wantErr  bool
+	}{
+		{name: "restoring-then-restored", stream: join(restoring, restored), deadline: time.Second},
+		{name: "restored-only", stream: join(restored), deadline: time.Second},
+		{name: "restoring-then-EOF", stream: join(restoring), deadline: time.Second, wantErr: true},
+		{name: "deadline-blocked-no-stream", stream: "", keepOpen: true, deadline: 50 * time.Millisecond, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-func waitDone(t *testing.T, done <-chan struct{}) {
-	t.Helper()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("listener did not accept WaitReady connection")
+			r, w := io.Pipe()
+			go func() {
+				_, _ = io.WriteString(w, tc.stream)
+				if !tc.keepOpen {
+					_ = w.Close()
+				}
+			}()
+
+			err := WaitRestored(ctx, r, tc.deadline)
+			if tc.wantErr && err == nil {
+				t.Fatal("WaitRestored returned nil, want error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("WaitRestored returned %v, want nil", err)
+			}
+			if tc.keepOpen {
+				_ = w.Close() // release the still-open write-end
+			}
+		})
 	}
 }

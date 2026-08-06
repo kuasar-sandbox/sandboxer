@@ -53,6 +53,11 @@ type CmdEnv struct {
 	// in CH's --net mac= (tapfd metadata override or config). See docs/sandbox.md.
 	TapFDNum int
 	NetMAC   string
+
+	// EventMonitorFDNum is the CH-visible fd of the inherited event-monitor
+	// write-end (cmd.ExtraFiles after memfd [and tap]). The restore BuildCmd
+	// emits --event-monitor fd=<this>; cold start inherits the fd unused.
+	EventMonitorFDNum int
 }
 
 // PostSpawnCtx is handed to a caller's PostSpawn closure right after CH
@@ -62,9 +67,10 @@ type CmdEnv struct {
 //   - cold start: spawn a goroutine that gates pinger.Start on
 //     Launch.HelloDone and Hooks.Settled + Balloon.Start on
 //     Launch.LaunchAckDone, then return nil (fire-and-forget).
-//   - restore: synchronously waitAPI → /vm.resume → guestlink.OpenMUXViaRestore →
-//     EstablishMUX → guestlink.Pinger.Start → Balloon.Start → Hooks.SettledRestore;
-//     a non-nil return aborts the run (ServeAndWait kills CH).
+//   - restore: synchronously waitAPI → vm/restored (event-monitor) →
+//     guestlink.OpenMUXViaRestore → EstablishMUX → guestlink.Pinger.Start →
+//     Balloon.Start → Hooks.SettledRestore; a non-nil return aborts the run
+//     (ServeAndWait kills CH).
 type PostSpawnCtx struct {
 	Ctx          context.Context
 	Cmd          *exec.Cmd
@@ -76,6 +82,11 @@ type PostSpawnCtx struct {
 	CHSock       string
 	Logf         func(string, ...any)
 	NotifyReady  func()
+	// EventMonitor is the read-end of the --event-monitor pipe ServeAndWait
+	// always creates. Restore reads it until CH emits vm/restored before the
+	// MUX handshake; cold start does not read it. WaitRestored closes it on
+	// timeout/cancel to unblock its decode goroutine.
+	EventMonitor io.ReadCloser
 }
 
 // VMParams is the input to ServeAndWait — everything the shared
@@ -512,11 +523,15 @@ func ServeAndWait(p VMParams) (int, error) {
 		}
 	}()
 
-	// memfd is cmd.ExtraFiles[0] → CH fd 3; an optional tapfd-handoff queue
-	// fd is appended next → CH fd 4 (referenced by --net fd= / restore net_fds).
+	// CH fd layout: 0/1/2 are stdio, then cmd.ExtraFiles in append order from
+	// fd 3 — memfd (always [0]→3), an optional tapfd-handoff queue fd (→4),
+	// then the event-monitor write-end (→4 with no tap, →5 with tap). Both
+	// numbers are set here in lockstep with the ExtraFiles append block below.
 	tapFDNum := 0
+	emFDNum := 4 // after memfd(3)
 	if p.TapFile != nil {
 		tapFDNum = 4
+		emFDNum = 5
 	}
 	// CH --disk args in device order (root first, then data disks); BuildCmd
 	// (CHCommand / restore config rewrite) emits one --disk per entry.
@@ -525,14 +540,15 @@ func ServeAndWait(p VMParams) (int, error) {
 		diskArgs[i] = DiskArg{Sock: d.sock, ReadOnly: d.readonly}
 	}
 	cmd, chStdioCleanup, err := p.BuildCmd(CmdEnv{
-		Memfd:     memfd,
-		CHSock:    chSock,
-		Disks:     diskArgs,
-		VsockBase: vsockBase,
-		UffdSock:  uffdSockPath,
-		RunDir:    runDir,
-		TapFDNum:  tapFDNum,
-		NetMAC:    p.NetMAC,
+		Memfd:             memfd,
+		CHSock:            chSock,
+		Disks:             diskArgs,
+		VsockBase:         vsockBase,
+		UffdSock:          uffdSockPath,
+		RunDir:            runDir,
+		TapFDNum:          tapFDNum,
+		NetMAC:            p.NetMAC,
+		EventMonitorFDNum: emFDNum,
 	})
 	if err != nil {
 		cancelBackends()
@@ -540,14 +556,27 @@ func ServeAndWait(p VMParams) (int, error) {
 		return -1, fmt.Errorf("build CH cmd: %w", err)
 	}
 	defer chStdioCleanup()
-	// fd=3 ← memfd in CH (after stdin/out/err). New process group keeps
-	// CH out of sandbox-ctl's controlling-terminal foreground group, so
-	// terminal-generated ^C/^\/^Z don't hit CH directly — sandbox-ctl
-	// owns signal handling (below).
+	// Create the --event-monitor pipe now (after BuildCmd succeeded). CH
+	// inherits the write-end at fd emFDNum; the read-end goes to PostSpawn to
+	// await vm/restored. sandbox-ctl closes its write-end copy after spawn so
+	// the read-end EOFs when CH exits.
+	emRead, emWrite, err := os.Pipe()
+	if err != nil {
+		cancelBackends()
+		backendWG.Wait()
+		return -1, fmt.Errorf("event-monitor pipe: %w", err)
+	}
+	defer emRead.Close()
+	defer emWrite.Close() // safety net for the spawn-fail path; a no-op double-close on success
+	// fd=3 ← memfd in CH (after stdin/out/err).
 	cmd.ExtraFiles = []*os.File{memfd.File()}
 	if p.TapFile != nil {
 		cmd.ExtraFiles = append(cmd.ExtraFiles, p.TapFile) // CH fd 4
 	}
+	cmd.ExtraFiles = append(cmd.ExtraFiles, emWrite) // CH fd emFDNum (4 or 5)
+	// New process group keeps CH out of sandbox-ctl's controlling-terminal
+	// foreground group, so terminal-generated ^C/^\/^Z don't hit CH directly
+	// — sandbox-ctl owns signal handling (below).
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	sigCh := make(chan os.Signal, 4)
@@ -561,6 +590,9 @@ func ServeAndWait(p VMParams) (int, error) {
 	}
 	chPid := cmd.Process.Pid
 	logf("CH started pid=%d", chPid)
+	// CH has inherited its own dup of the event-monitor write-end; close
+	// sandbox-ctl's copy so the read-end sees EOF when CH exits.
+	_ = emWrite.Close()
 
 	// Move CH (and only CH) into the per-sandbox cgroup. sandbox-ctl
 	// stays in its parent cgroup — see pkg/sandbox/cgroup.go header.
@@ -593,6 +625,7 @@ func ServeAndWait(p VMParams) (int, error) {
 		CHSock:       chSock,
 		Logf:         logf,
 		NotifyReady:  readiness.notifyReady,
+		EventMonitor: emRead,
 	}); err != nil {
 		_ = cmd.Process.Kill()
 		cancelBackends()

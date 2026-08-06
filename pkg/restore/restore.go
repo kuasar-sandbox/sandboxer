@@ -391,7 +391,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// PSI throttling during uffd-driven replay), and balloon already
 	// reflects allocAtSnap from the snapshot (any correction needed
 	// when initialAlloc != allocAtSnap also happens in SettledRestore,
-	// after vm.resume).
+	// after the vm/restored barrier).
 	if hooks != nil {
 		hooks.SetAllocatableNow(initialAlloc)
 	}
@@ -531,7 +531,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// placeholder launch spec (the guest does NOT re-hello after a
 	// restore, so WireLaunchMUX=false — the stdio MUX is re-established
 	// by PostSpawn over the reverse channel), and a settle protocol of
-	// waitAPI → /vm.resume → restore{epoch} → SettledRestore.
+	// vm/restored (event-monitor) → restore{epoch} → SettledRestore.
 	return sandbox.ServeAndWait(sandbox.VMParams{
 		Ctx:                ctx,
 		SandboxID:          opts.SandboxID,
@@ -588,27 +588,32 @@ func Run(ctx context.Context, opts Options) (int, error) {
 				// net _net0 with one fd → [_net0@[N]].
 				restoreArg += fmt.Sprintf(",net_fds=[_net0@[%d]]", e.TapFDNum)
 			}
+			// resume=true: CH restores and resumes the vCPUs atomically
+			// (vmm vm_restore: Vm::restore → vm_resume). It replaces the old
+			// post-spawn /vm.resume, which raced — the api-socket accepts the
+			// moment the VMM thread binds it, before the CLI even sends
+			// VmRestore, so "socket connectable" was never a restore-done
+			// signal. The restore-done barrier is now the vm/restored event
+			// (see PostSpawn → chapi.WaitRestored over --event-monitor).
+			restoreArg += ",resume=true"
 			cmd.Args = append(cmd.Args, "--api-socket", e.CHSock, "--restore", restoreArg)
+			cmd.Args = append(cmd.Args, "--event-monitor", fmt.Sprintf("fd=%d", e.EventMonitorFDNum))
 			logf("spawning %s --api-socket %s --restore %s", opts.CHBinary, e.CHSock, restoreArg)
 			return cmd, cleanup, nil
 		},
 
-		// Restore settle (docs/sandbox.md §7 T14-T15): wait for CH's
-		// API, /vm.resume to release the vCPUs from the snapshot point,
-		// then notify the guest (restore{epoch=1}) and turn that
-		// reverse-channel conn into the stdio MUX. Synchronous — a
-		// non-nil return aborts the run (ServeAndWait kills CH); we
-		// don't hand back a sandbox whose guest agent is unreachable.
+		// Restore settle (docs/sandbox.md §7 T14-T15). With resume=true, CH
+		// restores and resumes the vCPUs atomically; there is no post-spawn
+		// /vm.resume (see BuildCmd). The restore-done barrier is the
+		// vm/restored event over --event-monitor — it fires once device setup
+		// + restored vCPU start are done, so vsock.sock exists by the time
+		// the MUX handshake dials it. It doubles as the CH-liveness gate:
+		// vm/restored can only come from a running CH (api-socket bound early
+		// in startup), and CH exit EOFs the pipe promptly — so it needs no
+		// separate socket-liveness poll. Synchronous — a non-nil return
+		// aborts the run (ServeAndWait kills CH); we don't hand back a sandbox
+		// whose guest agent is unreachable.
 		PostSpawn: func(pc sandbox.PostSpawnCtx) error {
-			if err := chapi.WaitReady(ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
-				return fmt.Errorf("ch api not ready: %w", err)
-			}
-			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).Resume(); err != nil {
-				return fmt.Errorf("vm.resume: %w", err)
-			}
-			pc.Logf("VM resumed, vCPU running")
-
-			tRestore := time.Now()
 			// 0 = no forced timeout: DialRaw needs a finite value, so fall back
 			// to noForcedTimeout (effective-infinity; cancellation still flows
 			// via ctx → CH teardown closing the vsock conn).
@@ -616,14 +621,22 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			if restoreDeadline <= 0 {
 				restoreDeadline = config.NoForcedTimeout
 			}
+			tRestore := time.Now()
+			if err := chapi.WaitRestored(ctx, pc.EventMonitor, restoreDeadline); err != nil {
+				return fmt.Errorf("vm/restored event: %w", err)
+			}
+			pc.Logf("vm/restored seen in %dms (resume=true); vsock.sock ready",
+				time.Since(tRestore).Milliseconds())
+
+			tNotify := time.Now()
 			muxSpec, err := openAndEstablishRestoreMUX(func() (net.Conn, proto.StdioSpec, error) {
 				return guestlink.OpenMUXViaRestore(pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline)
 			}, pc.EstablishMUX, pc.NotifyReady)
 			if err != nil {
 				return err
 			}
-			pc.Logf("restore notify acked in %dµs (stdio MUX re-established: tty=%v); starting ping ticker",
-				time.Since(tRestore).Microseconds(), muxSpec.TTY)
+			pc.Logf("restore notify acked in %dms (stdio MUX re-established: tty=%v); starting ping ticker",
+				time.Since(tNotify).Milliseconds(), muxSpec.TTY)
 			pc.Pinger.Start(pc.Ctx)
 			// Balloon reconcile: idempotent — if initialAlloc ==
 			// allocAtSnap, target matches what CH loaded from state.json.
@@ -651,8 +664,8 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	})
 }
 
-// openAndEstablishRestoreMUX is the restore readiness barrier after CH API
-// readiness and /vm.resume: OpenMUXViaRestore returns only after restore_ack,
+// openAndEstablishRestoreMUX is the restore readiness barrier after the
+// vm/restored event: OpenMUXViaRestore returns only after restore_ack,
 // then the host MUX must be established before ready is emitted. The pinger,
 // balloon, settled hook, heartbeat, and sensor deliberately remain outside.
 func openAndEstablishRestoreMUX(
