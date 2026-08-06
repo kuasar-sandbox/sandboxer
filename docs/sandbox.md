@@ -1812,72 +1812,218 @@ kernel 缺页处理:
 
 backendVA 上**完全不注册 uffd**就根除了 cross-mm folio-creation race。
 
-### 8.2 SnapshotReader 接口
+### 8.2 SnapshotReader 与 executable Run
 
-两模式只在 source 实现上不同。单次 ReadAt 同时返回分类(zero / data)和
-source-aligned run length:
+冷启动和恢复共用一个只解析 metadata 的接口:
 
-```
+```go
 type SnapshotReader interface {
-    // ReadAt 填 buf 中 memfdOffset 起的若干字节并返回 run 分类。
-    //   n     页对齐的字节数(PageSize ≤ n ≤ len(buf),EOF 时 0)
-    //   zero  true → 该段全零;handler 装零页,不读 buf
-    //         false → buf[:n] 是真实数据;handler COPY
-    //   err   io.EOF 表示已超出 source 范围
-    //
-    // source 根据自身布局自由选 n:
-    //   - file-backed sparse source 在 IsZero 翻转处截断
-    //   - manifest-backed source 在 chunk 边界截断
-    ReadAt(buf []byte, memfdOffset uint64) (n int, zero bool, err error)
+    RunAt(
+        memfdOffset uint64,
+        limit uint64,
+    ) (sparse.Run, error)
 }
-
-冷启动:    ZeroSource{}
-              ReadAt → 永远 (len(buf), true, nil)
-
-恢复:      StreamSnapshotSource{stream}
-              stream = 分层读取层(§3.5):[本快照内存段] ++ from_refs。
-              file 层为稀疏文件流(SEEK_DATA/HOLE),manifest 层为 chunk 流
-              (一次 ReadAt 至多一次 chunk fetch + 解密);data run 命中某层取数,
-              合并空洞(每层皆空洞)跨 hole / IsZero 合并 → UFFDIO_ZEROPAGE 不读 store
 ```
 
-handler 主逻辑一份代码,模式差异隐藏在 source 实现里。
+`sparse.Run` 描述最终逻辑可见的 `[Offset(), End())` 区段,`Kind()` 为
+`Hole`、`Zero` 或 `Data`。payload 读取通过
+`Run.ReadAt(ctx, buf, innerOffset)` 完成,`innerOffset` 相对
+`Run.Offset()`;读取不得越过 `Run.End()`。Run 不可变,生命周期不超过
+所属 snapshot Stream。
+
+`RunAt` 仅做 metadata 解析,不会触发 cache/store Get、hash 校验、解密或
+Prefetch。Handler 因此可以先确定所有硬边界和 Run 能力,再决定 urgent 与 tail
+的读取方式。两种 source 的行为如下:
+
+- `ZeroSource` 返回受 caller limit 限制的 `sparse.Zero` Run。它不自行选择
+  tail window。
+- `StreamSnapshotSource` 对 Data 直接返回 `fetch.Stream.RunAt` 的最终
+  serving Run。manifest Data 保留 `fetch.ChunkRun` 能力;file、NFS 或 tar
+  Data 是普通 Run。
+- 最终可见的 Hole 和 manifest Zero 在 UFFD 边界合并为一个 no-read
+  `sparse.Zero` Run。
+- Run 不越过 memory section 的 `ramSize`。若 no-read/data 边界位于 faulting
+  page 内,返回仅覆盖该页的普通 Data Run,由 `Stream.ReadAt` 组合该页,避免把
+  真实 Data 错误地交给 `UFFDIO_ZEROPAGE`。
+- 普通 Data 不再跨多个 Data Run 隐式扩展。layered stream 透传最终 leaf 的
+  Run,上层 Hole 只收紧 visibility bound。
+
+Handler 持有生命周期 context,所有 urgent 和 deferred
+`Run.ReadAt` 都使用该 context。Handler 关闭并 join tail worker 后,restore
+调用方才关闭底层 Stream,因此 tail task 持有 Run 期间 Stream 始终有效。
 
 ### 8.3 PageState 状态机
 
-```
+```go
 type PageState uint8
 const (
-    StateAbsent   = 0   // folio 还没 handler 装过
-    StateLoaded   = 1   // folio 已在 memfd inode + chVA PTE 已装
-    StateReleased = 2   // balloon EVENT_REMOVE 后,fault 时直接 ZEROPAGE
+    StateAbsent   = 0   // folio 尚未由 handler 安装
+    StateLoaded   = 1   // folio 已安装,或 EEXIST 后已收敛
+    StateReleased = 2   // balloon EVENT_REMOVE 后,再次 fault 时装零页
 )
 ```
 
-PageState 用 `[]uint8`,size = ramSize / pageSize。每 4 GiB RAM = 1 MiB 状态表。
+PageState 使用 `[]uint8`,size = ramSize / PageSize。每 4 GiB RAM 对应
+1 MiB 状态表。
 
-转移:
+| 当前 | 事件 | urgent 处理 | tail | 新态 |
+|------|------|-------------|------|------|
+| Absent | PAGEFAULT,Data Run | `Run.ReadAt(ctx,pageBuf,0)` 或 ChunkRun 完整读取后 `UFFDIO_COPY` 首页 | buffered/deferred Data | 条件提交 Loaded |
+| Absent | PAGEFAULT,Hole/Zero | 单页 `UFFDIO_ZEROPAGE` | Zero | 条件提交 Loaded |
+| Released | PAGEFAULT | 单页 `UFFDIO_ZEROPAGE` | Released Zero | 条件提交 Loaded |
+| Loaded | PAGEFAULT | 单页 `UFFDIO_ZEROPAGE`,不扩展 | 无 | Loaded |
+| 任意 | EVENT_REMOVE/UNMAP | 同步标记范围为 Released,提交 removeQ | 陈旧 tail 不得覆盖 | Released |
 
-| 当前 | 事件 | 处理 | 新态 |
-|------|------|------|------|
-| Absent | uffd_C PAGEFAULT | OverrideMap 命中 → buf 装入 → UFFDIO_COPY;否则 source.ReadAt → ZERO 段 ZEROPAGE / 数据段 COPY | Loaded |
-| Released | uffd_C PAGEFAULT | UFFDIO_ZEROPAGE | Loaded |
-| Loaded | uffd_C PAGEFAULT | folio 已被 balloon PUNCH 回收、`EVENT_REMOVE` 尚未落到状态表:单页 `UFFDIO_ZEROPAGE` 重填(`EEXIST`/`EAGAIN` → WAKE 重试)。**不可 WAKE-only**,否则 fault↔WAKE 活锁 | Loaded |
-| 任意 | EVENT_REMOVE on uffd_C | pageStates[range] = Released(同步,fault 路径要看);push 到 removeQ;flusher 异步 batch+merge → madvise(DONTNEED, backendVA);OverrideMap.Drop(pageIdx) | Released |
+范围操作为:
 
-### 8.4 worker pool
+```go
+RunLength(start, max uint64, want PageState) uint64
+SetRangeIf(start, end uint64, old, new PageState) uint64
+```
 
-- N worker goroutines,N = `runtime.NumCPU()`,最少 2
-- 每个 goroutine LockOSThread(避免 Go runtime 把 worker 移动到别的 OS 线程)
-- 一个 reader goroutine **epoll uffd_C**;事件按 `memfd_offset` 哈希分发到
-  worker queue
-- 哈希用 **memfd offset**(同 page 的事件路由到同 worker 避免状态表争抢)
-- worker 收到事件,先检查 OverrideMap,命中走 per-page COPY 路径;未命中走
-  source 批量路径
+`RunLength` 在一次读锁内扫描连续 expected-state 范围;`SetRangeIf` 在一次
+写锁内只提交仍等于 old 的页。urgent 和 tail 均按 ioctl 明确完成的页数调用
+`SetRangeIf`,因此 EVENT_REMOVE 后的 Released 页不会被陈旧 tail
+无条件改回 Loaded。
+
+### 8.4 fault-first worker 与 serial tail
+
+```text
+                            ┌──────── fault worker 0 ── 4 KiB urgent buffer
+UFFD PAGEFAULT ── hash ─────┤
+                            └──────── fault worker N ── 4 KiB urgent buffer
+                                          │
+                                          │ urgent COPY/ZEROPAGE
+                                          ▼
+                                  non-blocking reserve
+                                          │
+                                          ▼
+                                  one serial tail worker
+                                  one 1 MiB shared buffer
+```
+
+每个 Handler 只有以下 speculative 资源:
+
+```go
+tailBusy atomic.Bool
+tailQ    chan tailTask // capacity = 1
+tailBuf  []byte        // MaxTailBytes = 1 MiB
+```
+
+`InitialTailBytes = 64 KiB`。全 Handler 最多一个 tail task 处于 reserved、
+queued 或 running。reservation 失败时 fault worker 直接放弃 tail,不等待、不
+新增队列。remove flusher 使用独立的 mandatory reclaim 队列和 goroutine,不被
+tail 占用或反压。
+
+Run 类型决定数据准备方式:
+
+| Run/状态 | fault worker | serial tail worker |
+|----------|--------------|--------------------|
+| manifest `fetch.ChunkRun` | slot 可用时读取完整当前可见 Run 到共享 buffer,先 COPY 首页;slot 忙时只读 4 KiB | `tailBufferedData`,复用 `tailBuf[PageSize:]` |
+| file/tar/NFS 普通 Data | 只读 4 KiB 并 COPY 首页 | `tailDeferredData`,按 data window 调用同一 Run 的相对子范围 ReadAt |
+| Hole/Zero/ZeroSource | ZEROPAGE 首页,不读 source | `tailZero(expected=StateAbsent)` |
+| StateReleased | ZEROPAGE 首页,不读 source | `tailZero(expected=StateReleased)` |
+| StateLoaded | ZEROPAGE 首页 | 无 |
+
+所有 Run 和 tail hard end 同时受以下边界限制:
+
+```text
+MaxTailBytes
+当前 CH UFFD region end
+RAM end
+连续 expected-state range
+Run.End()
+layered visibility bound
+```
+
+ChunkRun 不使用 adaptive window。它的完整可见 Run 已经限制在 1 MiB 内;
+若物理 chunk end 不是页边界,完整 Run 仍只读取一次,tail 只提交其中页对齐的
+完整页面。普通 Data 和 Zero/Released 分别维护独立窗口:
+
+```text
+64 KiB → 128 KiB → 256 KiB → 512 KiB → 1 MiB
+```
+
+上一 tail 成功完成到 `completedEnd`,且下一次真实 fault 恰好位于该地址时,
+对应窗口翻倍。地址不连续、task drop、无完成量、ioctl 冲突、mode 或 expected
+state 变化都会重置为 64 KiB。ChunkRun 不增长或消费这两个窗口。
+
+urgent ioctl 只提交 faulting page,承担恢复正确性:
+
+- 完整成功后按实际完成量条件提交当前页。
+- `EEXIST` 执行 `UFFDIO_WAKE`,沿用 folio 已由 backend/其他 fault 安装的
+  收敛语义。
+- `EAGAIN` 和 `ENOENT` 执行 WAKE,不把未完成页标为 Loaded,允许后续 fault
+  重试。
+- 其他错误进入 handler 原有错误路径。
+
+`ioctlUffdCopy` 和 `ioctlUffdZeropage` 返回 kernel result struct 中的实际
+完成字节数。调用方严格要求 `0 <= completed <= requested`,且 completed
+按 PageSize 对齐。`pages_copied` 和 `pages_zeroed` 只累计该明确完成量。
+
+tail worker 严格串行且 best-effort。执行前和 source read 后都重新检查
+PageState,只处理仍为 expected 的连续前缀。普通 COPY/ZEROPAGE 会自动唤醒已
+等待的其他 fault;`EEXIST/EAGAIN/ENOENT` 记录 conflict 并停止当前 task,
+不逐页重试,也不升级为 sandbox 恢复失败。每条完成、冲突、取消、drop 和关闭
+路径都清除 `tailBusy`。
+
+关闭顺序为:
+
+1. 设置 closing,拒绝新 reservation。
+2. 取消 Handler context,丢弃 queued tail,等待 reserved/running task 释放并
+   join tail worker。
+3. 停止并 join UFFD reader 和 fault workers。
+4. remove flusher drain reader 已提交的 mandatory reclaim 后退出。
+5. Handler 返回后,restore 关闭 snapshot Stream。
+
+可观测指标分为:
+
+```text
+fault_queue_wait_ns
+fault_queue_wait_p50 / p95 / p99
+fault_queue_depth / fault_queue_depth_hwm
+fault_inflight / fault_inflight_hwm
+
+source_read_calls / source_read_bytes / source_read_ns
+urgent_copy_calls / urgent_copy_ns
+urgent_zero_calls / urgent_zero_ns
+
+tail_submitted / tail_dropped_busy / tail_canceled
+tail_buffered_data / tail_deferred_data / tail_zero
+tail_pages_planned / tail_pages_completed
+tail_copy_ns / tail_zero_ns
+tail_conflicts / tail_partial
+tail_window_current / tail_window_grows / tail_window_resets
+```
+
+stderr 的 `[uffd-stats]` 和 `--stats-json` 使用相同字段。旧的同步
+`batch_*` 指标不再存在。标准化 in-process A/B/C benchmark 命令为:
+
+```bash
+go test ./pkg/uffd -run '^$' \
+  -bench '^BenchmarkUFFDFaultStrategies$' \
+  -benchmem -benchtime=300ms -count=5
+```
+
+其子项统一比较:
+
+```text
+A_SyncFullBatch
+B_FaultFirstNoTail
+C_FaultFirstSerialTail
+```
+
+fixture 覆盖 ordinary Data、manifest hit、合成 cold-copy、local plaintext /
+encrypted tar、Zero/Released、顺序/随机和双 vCPU。设置
+`KUASAR_UFFD_BENCH_NFS_ARTIFACT` 可加入位于 NFS 上的 canonical tarstream
+artifact。该微基准报告 `source-B/op` 和 `uffd-B/op`;真实 cache miss、
+cold page cache、UFFD wake、host CPU/RSS、guest resident pages、restore
+readiness 和首请求延迟仍由需要 KVM 的跨仓 e2e/perf matrix 测量,不能用微基准
+替代。
 
 **5.10 内核兼容**:仅依赖 4.11+ 引入的 `UFFD_FEATURE_MISSING_SHMEM` /
-`EVENT_REMOVE` / `EVENT_UNMAP` / `THREAD_ID`。**不**用 `MINOR_SHMEM`(5.13+)
-/ `UFFDIO_CONTINUE`(5.13+)。
+`EVENT_REMOVE` / `EVENT_UNMAP` / `THREAD_ID`。不使用
+`MINOR_SHMEM`(5.13+)或 `UFFDIO_CONTINUE`(5.13+)。
 
 ### 8.5 EVENT_REMOVE 处理
 

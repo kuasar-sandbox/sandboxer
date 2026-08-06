@@ -44,10 +44,36 @@ type uffdStatsJSON struct {
 	MadviseBytes        uint64 `json:"madvise_bytes"`
 	BackendLookupMiss   uint64 `json:"backend_lookup_miss"`
 	Errors              uint64 `json:"errors"`
-	BatchCalls          uint64 `json:"batch_calls"`
-	BatchPagesTotal     uint64 `json:"batch_pages_total"`
-	BatchAvgPages       uint64 `json:"batch_avg_pages"`
-	BatchMaxPages       uint64 `json:"batch_max_pages"`
+	FaultQueueWaitNs    uint64 `json:"fault_queue_wait_ns"`
+	FaultQueueWaitP50   uint64 `json:"fault_queue_wait_p50"`
+	FaultQueueWaitP95   uint64 `json:"fault_queue_wait_p95"`
+	FaultQueueWaitP99   uint64 `json:"fault_queue_wait_p99"`
+	FaultQueueDepth     uint64 `json:"fault_queue_depth"`
+	FaultQueueDepthHWM  uint64 `json:"fault_queue_depth_hwm"`
+	FaultInflight       uint64 `json:"fault_inflight"`
+	FaultInflightHWM    uint64 `json:"fault_inflight_hwm"`
+	SourceReadCalls     uint64 `json:"source_read_calls"`
+	SourceReadBytes     uint64 `json:"source_read_bytes"`
+	SourceReadNs        uint64 `json:"source_read_ns"`
+	UrgentCopyCalls     uint64 `json:"urgent_copy_calls"`
+	UrgentCopyNs        uint64 `json:"urgent_copy_ns"`
+	UrgentZeroCalls     uint64 `json:"urgent_zero_calls"`
+	UrgentZeroNs        uint64 `json:"urgent_zero_ns"`
+	TailSubmitted       uint64 `json:"tail_submitted"`
+	TailDroppedBusy     uint64 `json:"tail_dropped_busy"`
+	TailCanceled        uint64 `json:"tail_canceled"`
+	TailBufferedData    uint64 `json:"tail_buffered_data"`
+	TailDeferredData    uint64 `json:"tail_deferred_data"`
+	TailZero            uint64 `json:"tail_zero"`
+	TailPagesPlanned    uint64 `json:"tail_pages_planned"`
+	TailPagesCompleted  uint64 `json:"tail_pages_completed"`
+	TailCopyNs          uint64 `json:"tail_copy_ns"`
+	TailZeroNs          uint64 `json:"tail_zero_ns"`
+	TailConflicts       uint64 `json:"tail_conflicts"`
+	TailPartial         uint64 `json:"tail_partial"`
+	TailWindowCurrent   uint64 `json:"tail_window_current"`
+	TailWindowGrows     uint64 `json:"tail_window_grows"`
+	TailWindowResets    uint64 `json:"tail_window_resets"`
 	// LazyLoadRatio = (pages_zeroed + pages_copied) / total_pages.
 	// total_pages comes from RAMSize/PageSize. Cold-start tracks how
 	// little of declared RAM the guest actually touches; restore tracks
@@ -208,10 +234,36 @@ func buildUffdJSON(counters map[string]uint64, ramBytes int64) *uffdStatsJSON {
 		MadviseBytes:        counters["madvise_bytes"],
 		BackendLookupMiss:   counters["backend_lookup_miss"],
 		Errors:              counters["errors"],
-		BatchCalls:          counters["batch_calls"],
-		BatchPagesTotal:     counters["batch_pages_total"],
-		BatchAvgPages:       counters["batch_avg_pages"],
-		BatchMaxPages:       counters["batch_max_pages"],
+		FaultQueueWaitNs:    counters["fault_queue_wait_ns"],
+		FaultQueueWaitP50:   counters["fault_queue_wait_p50"],
+		FaultQueueWaitP95:   counters["fault_queue_wait_p95"],
+		FaultQueueWaitP99:   counters["fault_queue_wait_p99"],
+		FaultQueueDepth:     counters["fault_queue_depth"],
+		FaultQueueDepthHWM:  counters["fault_queue_depth_hwm"],
+		FaultInflight:       counters["fault_inflight"],
+		FaultInflightHWM:    counters["fault_inflight_hwm"],
+		SourceReadCalls:     counters["source_read_calls"],
+		SourceReadBytes:     counters["source_read_bytes"],
+		SourceReadNs:        counters["source_read_ns"],
+		UrgentCopyCalls:     counters["urgent_copy_calls"],
+		UrgentCopyNs:        counters["urgent_copy_ns"],
+		UrgentZeroCalls:     counters["urgent_zero_calls"],
+		UrgentZeroNs:        counters["urgent_zero_ns"],
+		TailSubmitted:       counters["tail_submitted"],
+		TailDroppedBusy:     counters["tail_dropped_busy"],
+		TailCanceled:        counters["tail_canceled"],
+		TailBufferedData:    counters["tail_buffered_data"],
+		TailDeferredData:    counters["tail_deferred_data"],
+		TailZero:            counters["tail_zero"],
+		TailPagesPlanned:    counters["tail_pages_planned"],
+		TailPagesCompleted:  counters["tail_pages_completed"],
+		TailCopyNs:          counters["tail_copy_ns"],
+		TailZeroNs:          counters["tail_zero_ns"],
+		TailConflicts:       counters["tail_conflicts"],
+		TailPartial:         counters["tail_partial"],
+		TailWindowCurrent:   counters["tail_window_current"],
+		TailWindowGrows:     counters["tail_window_grows"],
+		TailWindowResets:    counters["tail_window_resets"],
 		TotalPages:          totalPages,
 		ResidentPages:       resident,
 		LazyLoadRatio:       ratio,

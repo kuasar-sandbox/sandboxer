@@ -156,4 +156,5 @@ func (s LatSnapshot) Percentile(p float64) uint64 {
 }
 
 func (s LatSnapshot) P50() uint64 { return s.Percentile(0.50) }
+func (s LatSnapshot) P95() uint64 { return s.Percentile(0.95) }
 func (s LatSnapshot) P99() uint64 { return s.Percentile(0.99) }

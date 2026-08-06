@@ -581,12 +581,12 @@ func openDiffTemplate(path string, codec tarstream.Codec) (diffTemplateSource, e
 
 func (s *fileDiffTemplate) Size() uint64 { return uint64(s.diff.logicalSize) }
 
-func (s *fileDiffTemplate) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
+func (s *fileDiffTemplate) RunAt(offset, limit uint64) (sparse.Run, error) {
 	if offset >= s.Size() {
-		return 0, 0, io.EOF
+		return nil, io.EOF
 	}
 	if limit == 0 {
-		return 0, 0, fmt.Errorf("vhost: diff template RunAt limit is zero")
+		return nil, fmt.Errorf("vhost: diff template RunAt limit is zero")
 	}
 	end := offset + limit
 	if end < offset || end > s.Size() {
@@ -602,10 +602,47 @@ func (s *fileDiffTemplate) RunAt(offset, limit uint64) (sparse.RunKind, uint64, 
 		}
 		runEnd = min(uint64((nextBlock+1)*cowBlockSize), end)
 	}
+	kind := sparse.Hole
 	if dirty {
-		return sparse.Data, runEnd, nil
+		kind = sparse.Data
 	}
-	return sparse.Hole, runEnd, nil
+	return fileDiffTemplateRun{source: s, offset: offset, end: runEnd, kind: kind}, nil
+}
+
+type fileDiffTemplateRun struct {
+	source *fileDiffTemplate
+	offset uint64
+	end    uint64
+	kind   sparse.RunKind
+}
+
+func (r fileDiffTemplateRun) Offset() uint64       { return r.offset }
+func (r fileDiffTemplateRun) End() uint64          { return r.end }
+func (r fileDiffTemplateRun) Kind() sparse.RunKind { return r.kind }
+
+func (r fileDiffTemplateRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	length := r.end - r.offset
+	if innerOffset > length || uint64(len(buf)) > length-innerOffset {
+		return 0, fmt.Errorf("vhost: diff template Run read outside [0,%d)", length)
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if r.kind == sparse.Hole || r.kind == sparse.Zero {
+		clear(buf)
+		return len(buf), nil
+	}
+	n, err := r.source.ReadAt(ctx, buf, r.offset+innerOffset)
+	if n == len(buf) && (err == nil || errors.Is(err, io.EOF)) {
+		return n, nil
+	}
+	if err != nil {
+		return n, err
+	}
+	return n, io.ErrUnexpectedEOF
 }
 
 func (s *fileDiffTemplate) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
@@ -651,10 +688,11 @@ func seedDiffTemplate(ctx context.Context, target *diffFile, source diffTemplate
 	defer clear(block)
 	var nextSeed uint64
 	for offset := uint64(0); offset < source.Size(); {
-		kind, end, err := source.RunAt(offset, source.Size()-offset)
+		run, err := source.RunAt(offset, source.Size()-offset)
 		if err != nil {
 			return err
 		}
+		kind, end := run.Kind(), run.End()
 		if end <= offset || end > source.Size() {
 			return fmt.Errorf("invalid diff template sparse run")
 		}

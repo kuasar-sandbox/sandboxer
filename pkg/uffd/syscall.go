@@ -178,35 +178,49 @@ func ioctlUffdRegister(fd int, start, length uint64) error {
 	return nil
 }
 
-// ioctlUffdCopy invokes UFFDIO_COPY. Returns nil on success, the errno
-// otherwise (notably EEXIST when the dst page already got resolved by
-// another fault — caller should fall back to UFFDIO_WAKE).
-func ioctlUffdCopy(fd int, dst, src, length uint64) error {
+// ioctlUffdCopy invokes UFFDIO_COPY and returns the kernel-reported completed
+// byte count even when ioctl returns an errno. Callers validate its range and
+// page alignment before updating statistics or PageState.
+func ioctlUffdCopy(fd int, dst, src, length uint64) (int64, error) {
 	req := uffdioCopyStruct{
 		Dst: dst,
 		Src: src,
 		Len: length,
 	}
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL,
 		uintptr(fd), uffdioCopy,
-		uintptr(unsafe.Pointer(&req))); errno != 0 {
-		return errno
-	}
-	return nil
+		uintptr(unsafe.Pointer(&req)))
+	return normalizeUffdCompletion(req.Copied, errno)
 }
 
-// ioctlUffdZeropage invokes UFFDIO_ZEROPAGE — installs a zero page at dst.
-func ioctlUffdZeropage(fd int, dst, length uint64) error {
+// ioctlUffdZeropage invokes UFFDIO_ZEROPAGE and returns the kernel-reported
+// completed byte count even when ioctl returns an errno.
+func ioctlUffdZeropage(fd int, dst, length uint64) (int64, error) {
 	req := uffdioZeropageStruct{
 		RangeStart: dst,
 		RangeLen:   length,
 	}
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL,
 		uintptr(fd), uffdioZeropage,
-		uintptr(unsafe.Pointer(&req))); errno != 0 {
-		return errno
+		uintptr(unsafe.Pointer(&req)))
+	return normalizeUffdCompletion(req.Zeropage, errno)
+}
+
+// The kernel writes the result of mcopy_atomic/mfill_zeropage into the signed
+// output field before returning from ioctl. On a conflict that means both an
+// ioctl errno and a negative output value (for example -EEXIST). A negative
+// value is an error code, not a byte count; never expose it as completed work.
+func normalizeUffdCompletion(completed int64, errno unix.Errno) (int64, error) {
+	if completed < 0 {
+		if errno != 0 {
+			return 0, errno
+		}
+		return 0, unix.Errno(-completed)
 	}
-	return nil
+	if errno != 0 {
+		return completed, errno
+	}
+	return completed, nil
 }
 
 // ioctlUffdWake wakes any threads sleeping on faults in [start, start+len).

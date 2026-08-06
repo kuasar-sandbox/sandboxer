@@ -210,10 +210,11 @@ func consumeSource(ctx context.Context, source sparse.Source, start uint64) erro
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		kind, end, err := source.RunAt(offset, source.Size()-offset)
+		run, err := source.RunAt(offset, source.Size()-offset)
 		if err != nil {
 			return err
 		}
+		kind, end := run.Kind(), run.End()
 		if end <= offset || end > source.Size() {
 			return fmt.Errorf("invalid sparse run")
 		}

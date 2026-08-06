@@ -440,7 +440,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		defer s.Close()
 		memLayers = append(memLayers, s)
 	}
-	source, err := uffd.NewStreamSnapshotSource(ctx, fetch.NewLayered(memLayers...), capBytes)
+	source, err := uffd.NewStreamSnapshotSource(fetch.NewLayered(memLayers...), capBytes)
 	if err != nil {
 		return -1, fmt.Errorf("snapshot source: %w", err)
 	}

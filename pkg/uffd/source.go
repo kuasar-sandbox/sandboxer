@@ -1,47 +1,65 @@
 package uffd
 
-// SnapshotReader supplies the page contents the handler installs at a
-// given memfd offset on an Absent fault.
-//
-// Single-call protocol: ReadAt returns both the run classification
-// (zero vs data) AND the run length the source can serve in one
-// call, page-aligned and bounded by len(buf). The source picks the
-// length to align with its own internal boundaries — chunk edges for
-// manifest-backed streams, hole/data boundaries for file-backed
-// streams. Handler must accept any returned n; pages beyond will be
-// served by separate calls when faulted.
-//
-// Implementations:
-//   - ZeroSource:           cold-start. Always zero, full buf.
-//   - StreamSnapshotSource: restore. Wraps a fetch.Stream (local file,
-//     manifest, or layered overlay); merged holes →
-//     zero, data runs fetched from the serving layer.
-//
-// Implementations must be safe for concurrent calls.
+import (
+	"context"
+	"fmt"
+	"math"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+)
+
+// SnapshotReader resolves the snapshot contents covering memfdOffset. RunAt is
+// metadata-only; payload bytes are read later through the returned sparse.Run
+// with offsets relative to Run.Offset(). Implementations must be safe for
+// concurrent RunAt calls, and returned Runs remain valid for the lifetime of
+// the reader that produced them.
 type SnapshotReader interface {
-	// ReadAt fills buf with up to len(buf) bytes starting at memfdOffset
-	// and returns the run's classification.
-	//
-	// Return contract:
-	//
-	//	n:    page-aligned bytes covered (PageSize ≤ n ≤ len(buf), or 0 at EOF)
-	//	zero: true  → source did NOT write to buf; handler installs zero pages
-	//	      false → buf[:n] holds plaintext; handler copies them
-	//	err:  io.EOF when memfdOffset ≥ source size (n=0); transport otherwise.
-	//
-	// memfdOffset and len(buf) are guaranteed PageSize-aligned by the
-	// handler. Implementations must round n down to a PageSize multiple
-	// (zero-padding the partial last page internally on file/network
-	// short reads).
-	//
-	// Safe for concurrent use.
-	ReadAt(buf []byte, memfdOffset uint64) (n int, zero bool, err error)
+	RunAt(memfdOffset, limit uint64) (sparse.Run, error)
 }
 
-// ZeroSource implements SnapshotReader for cold-start. Every page is
-// zero; the source never writes to buf.
+// ZeroSource implements SnapshotReader for cold-start. It does not choose a
+// speculative window: every returned Zero Run is bounded exactly by limit.
 type ZeroSource struct{}
 
-func (ZeroSource) ReadAt(buf []byte, _ uint64) (int, bool, error) {
-	return len(buf), true, nil
+func (ZeroSource) RunAt(memfdOffset, limit uint64) (sparse.Run, error) {
+	if limit == 0 {
+		return nil, fmt.Errorf("uffd: zero source: limit must be non-zero")
+	}
+	if limit > math.MaxUint64-memfdOffset {
+		return nil, fmt.Errorf("uffd: zero source: range overflows uint64")
+	}
+	return snapshotZeroRun{offset: memfdOffset, end: memfdOffset + limit}, nil
+}
+
+type snapshotZeroRun struct {
+	offset uint64
+	end    uint64
+}
+
+func (r snapshotZeroRun) Offset() uint64     { return r.offset }
+func (r snapshotZeroRun) End() uint64        { return r.end }
+func (snapshotZeroRun) Kind() sparse.RunKind { return sparse.Zero }
+func (r snapshotZeroRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	if err := validateSnapshotRunRead(r.offset, r.end, innerOffset, len(buf)); err != nil {
+		return 0, err
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	clear(buf)
+	return len(buf), nil
+}
+
+func validateSnapshotRunRead(offset, end, innerOffset uint64, length int) error {
+	if end <= offset {
+		return fmt.Errorf("uffd: invalid snapshot run [%d,%d)", offset, end)
+	}
+	runLength := end - offset
+	if innerOffset > runLength || uint64(length) > runLength-innerOffset {
+		return fmt.Errorf("uffd: snapshot run read offset %d length %d outside [0,%d)", innerOffset, length, runLength)
+	}
+	return nil
 }

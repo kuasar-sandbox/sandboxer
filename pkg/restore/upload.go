@@ -701,10 +701,13 @@ type memZipSource struct {
 
 func (s *memZipSource) Size() uint64 { return s.memSize + uint64(len(s.zip)) }
 
-func (s *memZipSource) RunAt(off, limit uint64) (sparse.RunKind, uint64, error) {
+func (s *memZipSource) RunAt(off, limit uint64) (sparse.Run, error) {
 	total := s.Size()
 	if off >= total {
-		return 0, 0, io.EOF
+		return nil, io.EOF
+	}
+	if limit == 0 {
+		return nil, fmt.Errorf("restore: mem+zip RunAt limit is zero")
 	}
 	if off < s.memSize {
 		if limit > s.memSize-off {
@@ -713,10 +716,41 @@ func (s *memZipSource) RunAt(off, limit uint64) (sparse.RunKind, uint64, error) 
 		return s.bundle.RunAt(off, limit)
 	}
 	end := off + limit
-	if end > total {
+	if end < off || end > total {
 		end = total
 	}
-	return sparse.Data, end, nil
+	return memZipRun{source: s, offset: off, end: end}, nil
+}
+
+type memZipRun struct {
+	source *memZipSource
+	offset uint64
+	end    uint64
+}
+
+func (r memZipRun) Offset() uint64     { return r.offset }
+func (r memZipRun) End() uint64        { return r.end }
+func (memZipRun) Kind() sparse.RunKind { return sparse.Data }
+
+func (r memZipRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	length := r.end - r.offset
+	if innerOffset > length || uint64(len(buf)) > length-innerOffset {
+		return 0, fmt.Errorf("restore: mem+zip Run read outside [0,%d)", length)
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.source.ReadAt(ctx, buf, r.offset+innerOffset)
+	if n == len(buf) && (err == nil || errors.Is(err, io.EOF)) {
+		return n, nil
+	}
+	if err != nil {
+		return n, err
+	}
+	return n, io.ErrUnexpectedEOF
 }
 
 func (s *memZipSource) ReadAt(ctx context.Context, buf []byte, off uint64) (int, error) {

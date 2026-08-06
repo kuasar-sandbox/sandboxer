@@ -64,6 +64,9 @@ func (m *PageStateMap) CompareAndSwap(pageIdx uint64, old, new PageState) bool {
 
 // SetRange writes state to every page in [startIdx, endIdx).
 func (m *PageStateMap) SetRange(startIdx, endIdx uint64, s PageState) {
+	if startIdx >= uint64(len(m.pages)) || startIdx >= endIdx {
+		return
+	}
 	if endIdx > uint64(len(m.pages)) {
 		endIdx = uint64(len(m.pages))
 	}
@@ -73,6 +76,51 @@ func (m *PageStateMap) SetRange(startIdx, endIdx uint64, s PageState) {
 		m.pages[i] = v
 	}
 	m.mu.Unlock()
+}
+
+// RunLength returns the number of consecutive pages equal to want beginning at
+// startIdx, capped at max. The whole scan holds one read lock.
+func (m *PageStateMap) RunLength(startIdx, max uint64, want PageState) uint64 {
+	if max == 0 || startIdx >= uint64(len(m.pages)) {
+		return 0
+	}
+	endIdx := uint64(len(m.pages))
+	if max < endIdx-startIdx {
+		endIdx = startIdx + max
+	}
+	wantByte := uint8(want)
+	m.mu.RLock()
+	i := startIdx
+	for i < endIdx && m.pages[i] == wantByte {
+		i++
+	}
+	m.mu.RUnlock()
+	return i - startIdx
+}
+
+// SetRangeIf changes each page in [startIdx,endIdx) that still equals old to
+// new and returns the number of pages changed. The conditional commit holds one
+// write lock, preventing a stale tail completion from overwriting a concurrent
+// EVENT_REMOVE transition to StateReleased.
+func (m *PageStateMap) SetRangeIf(startIdx, endIdx uint64, old, new PageState) uint64 {
+	if startIdx >= uint64(len(m.pages)) || startIdx >= endIdx {
+		return 0
+	}
+	if endIdx > uint64(len(m.pages)) {
+		endIdx = uint64(len(m.pages))
+	}
+	oldByte := uint8(old)
+	newByte := uint8(new)
+	var changed uint64
+	m.mu.Lock()
+	for i := startIdx; i < endIdx; i++ {
+		if m.pages[i] == oldByte {
+			m.pages[i] = newByte
+			changed++
+		}
+	}
+	m.mu.Unlock()
+	return changed
 }
 
 // Len returns the number of tracked pages.

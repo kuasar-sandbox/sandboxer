@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -210,10 +211,11 @@ func consumeSource(ctx context.Context, source sparse.Source) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		kind, end, err := source.RunAt(offset, source.Size()-offset)
+		run, err := source.RunAt(offset, source.Size()-offset)
 		if err != nil {
 			return err
 		}
+		kind, end := run.Kind(), run.End()
 		if end <= offset || end > source.Size() {
 			return fmt.Errorf("invalid sparse run")
 		}
@@ -452,9 +454,12 @@ type seekerSource struct {
 
 func (s *seekerSource) Size() uint64 { return s.size }
 
-func (s *seekerSource) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
+func (s *seekerSource) RunAt(offset, limit uint64) (sparse.Run, error) {
 	if offset >= s.size {
-		return 0, 0, io.EOF
+		return nil, io.EOF
+	}
+	if limit == 0 {
+		return nil, fmt.Errorf("snapshot: seeker RunAt limit is zero")
 	}
 	limEnd := offset + limit
 	if limEnd < offset || limEnd > s.size {
@@ -465,10 +470,47 @@ func (s *seekerSource) RunAt(offset, limit uint64) (sparse.RunKind, uint64, erro
 	if e > limEnd {
 		e = limEnd
 	}
+	kind := sparse.Data
 	if isHole {
-		return sparse.Hole, e, nil
+		kind = sparse.Hole
 	}
-	return sparse.Data, e, nil
+	return seekerRun{source: s, offset: offset, end: e, kind: kind}, nil
+}
+
+type seekerRun struct {
+	source *seekerSource
+	offset uint64
+	end    uint64
+	kind   sparse.RunKind
+}
+
+func (r seekerRun) Offset() uint64       { return r.offset }
+func (r seekerRun) End() uint64          { return r.end }
+func (r seekerRun) Kind() sparse.RunKind { return r.kind }
+
+func (r seekerRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	length := r.end - r.offset
+	if innerOffset > length || uint64(len(buf)) > length-innerOffset {
+		return 0, fmt.Errorf("snapshot: seeker Run read outside [0,%d)", length)
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if r.kind == sparse.Hole || r.kind == sparse.Zero {
+		clear(buf)
+		return len(buf), nil
+	}
+	n, err := r.source.ReadAt(ctx, buf, r.offset+innerOffset)
+	if n == len(buf) && (err == nil || errors.Is(err, io.EOF)) {
+		return n, nil
+	}
+	if err != nil {
+		return n, err
+	}
+	return n, io.ErrUnexpectedEOF
 }
 
 func (s *seekerSource) ReadAt(_ context.Context, buf []byte, offset uint64) (int, error) {
