@@ -132,6 +132,16 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, pageBuf []byte) {
 	hardEnd := h.stateHardEnd(pageOffset, pageIdx, StateAbsent)
 	if hardEnd-pageOffset < PageSize {
+		// The fault was classified as Absent before entering this method,
+		// but a concurrent urgent or tail completion may have populated it
+		// before the run scan acquired the state lock. Converge that stale
+		// event exactly like an ioctl conflict: wake it without treating an
+		// already-resolved page as a handler error. A Released page will fault
+		// again and take the StateReleased zero path.
+		if h.state.Get(pageIdx) != StateAbsent {
+			h.wake(uffdFD, pageVA, PageSize)
+			return
+		}
 		h.failUrgent(uffdFD, pageVA, "no full Absent page at offset 0x%x", pageOffset)
 		return
 	}

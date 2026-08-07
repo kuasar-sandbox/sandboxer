@@ -294,6 +294,32 @@ func TestUrgentConflictConvergence(t *testing.T) {
 	}
 }
 
+func TestStaleAbsentFaultConvergesWithoutError(t *testing.T) {
+	source := newRecordingSnapshot(2*PageSize, sparse.Data, 0x28)
+	h := newUnitHandler(t, 2*PageSize, source)
+	ioctls := newFakeIoctls()
+	h.ops = ioctls.ops()
+
+	// handleAbsentFault is entered only after handleFault observed Absent.
+	// Model a tail completion changing the page before stateHardEnd scans it.
+	h.state.Set(0, StateLoaded)
+	h.handleAbsentFault(7, unitCHVA, 0, 0, make([]byte, PageSize))
+
+	stats := h.Stats()
+	if stats["errors"] != 0 || stats["wakes"] != 1 {
+		t.Fatalf("stale fault metrics = %#v, want one wake and no error", stats)
+	}
+	if got := source.runLimits(); len(got) != 0 {
+		t.Fatalf("stale fault queried source with limits %v", got)
+	}
+	if calls := ioctls.snapshot(); len(calls) != 0 {
+		t.Fatalf("stale fault issued data ioctl calls: %+v", calls)
+	}
+	if got := h.state.Get(0); got != StateLoaded {
+		t.Fatalf("stale fault changed state to %v", got)
+	}
+}
+
 func TestTailPartialCompletionUsesActualPages(t *testing.T) {
 	source := newRecordingSnapshot(4*PageSize, sparse.Data, 0x59)
 	h := newUnitHandler(t, 4*PageSize, source)
