@@ -58,7 +58,7 @@ make cloud-hypervisor
   `PUNCH_HOLE/MADV_DONTNEED`。
 - patch 文件按 commit 顺序落在 `deps/ch-patches/`。
 - 升级 CH 版本时先更新 pin,再重新执行 `ch-fetch`、应用 patch、构建、跑
-  sandboxer 和 release-builder e2e。
+  sandboxer 和 platform e2e。
 - `build/src/cloud-hypervisor` 是 patch 工作区;不要在未 format patch 前
   清理该目录。
 
@@ -89,8 +89,8 @@ make cloud-hypervisor
 
 ```bash
 make test
-make -C ../orchestrator/release-builder test-e2e-sandbox-cold
+make -C ../platform test-e2e-sandbox-cold
 ```
 
 真实 e2e 需要 `/dev/kvm`、guest runtime、vmlinux 和 tap/network 前置条件。
-缺失时脚本会 skip;发布前应在具备 KVM 的环境跑完整 release-builder e2e。
+缺失时脚本会 skip;发布前应在具备 KVM 的环境跑完整 platform e2e。
