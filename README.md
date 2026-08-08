@@ -38,10 +38,11 @@ make vet test
 ```
 
 独立版本通过仓库的 `Release` workflow 发布为 `vX.Y.Z`;发布件
-`sandboxer-vX.Y.Z-linux-<arch>.tar.gz` 包含 `sandbox-ctl`、`sandbox-init`、
+`sandboxer-vX.Y.Z-linux-x86_64.tar.gz` 包含 `sandbox-ctl`、`sandbox-init`、
 `cloud-hypervisor` 和对应文档。本地可用 `make release VERSION=vX.Y.Z`
 生成并校验相同布局的 release bundle。
-正式版之前,workflow 每天按上海日期发布
+当前 Release 只发布已完成全量构建与 BMS 验证的 Linux x86_64 目标。正式版之前,
+`platform` 仓的每日协调器按上海日期触发
 `v0.1.0-preview.YYYYMMDD` prerelease;preview 不更新 GitHub Latest,正式
 `v0.1.0` 由独立构建发布。
 
