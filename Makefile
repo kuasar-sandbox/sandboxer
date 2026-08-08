@@ -81,7 +81,7 @@ clean:
 	$(MAKE) -C native-deps clean
 
 # Go micro-benchmarks. Sandbox-level e2e (cold/snapshot/restore/...) lives in
-# release-builder/test/e2e — they need vmlinux + cloud-hypervisor + mkfs.erofs
+# platform/test/e2e — they need vmlinux + cloud-hypervisor + mkfs.erofs
 # (from guest-runtime/native-deps), sandbox-runtime.bundle (from guest-runtime),
 # and accelerator binaries, so they are cross-repo.
 bench:
@@ -91,14 +91,10 @@ VERSION ?= v0.1.0
 
 release: build
 	@mkdir -p $(BUILD_DIR)
-	@printf 'repository\trequested_ref\tresolved_sha\trole\n' > $(BUILD_DIR)/revisions.tsv
-	@printf 'kuasar-sandbox/accelerator\tHEAD\t%s\tdependency\n' "$$(git -C ../accelerator rev-parse HEAD)" >> $(BUILD_DIR)/revisions.tsv
-	@printf 'kuasar-sandbox/connector\tHEAD\t%s\tdependency\n' "$$(git -C ../connector rev-parse HEAD)" >> $(BUILD_DIR)/revisions.tsv
-	@printf 'kuasar-sandbox/sandboxer\tHEAD\t%s\tprimary\n' "$$(git rev-parse HEAD)" >> $(BUILD_DIR)/revisions.tsv
 	rm -rf $(BUILD_DIR)/release-bundle
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
 		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" \
-		$(BUILD_DIR)/revisions.tsv $(BUILD_DIR)/release-bundle
+		$(BUILD_DIR)/release-bundle
 
 test-release:
 	bash scripts/test-release.sh
