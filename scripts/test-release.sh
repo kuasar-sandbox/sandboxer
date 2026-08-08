@@ -11,60 +11,55 @@ fail() {
   exit 1
 }
 
-mkdir -p "$TMP/bin"
-for binary in sandbox-ctl sandbox-init cloud-hypervisor; do
-  printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/$binary"
-  chmod +x "$TMP/bin/$binary"
+mkdir -p "$TMP/bin" "$TMP/src"
+printf 'package main\nfunc main() {}\n' > "$TMP/src/main.go"
+GO111MODULE=off go build -o "$TMP/go-fixture" "$TMP/src/main.go"
+for binary in sandbox-ctl sandbox-init; do
+  install -m 0755 "$TMP/go-fixture" "$TMP/bin/$binary"
 done
-cat > "$TMP/revisions.tsv" <<'EOF'
-repository	requested_ref	resolved_sha	role
-kuasar-sandbox/sandboxer	main	1111111111111111111111111111111111111111	primary
-EOF
+printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/cloud-hypervisor"
+chmod +x "$TMP/bin/cloud-hypervisor"
 
-env \
-  RELEASE_BIN_DIR="$TMP/bin" \
-  SOURCE_DATE_EPOCH=1700000000 \
-  RELEASE_WORKFLOW_REPOSITORY=kuasar-sandbox/sandboxer \
-  RELEASE_WORKFLOW_RUN_ID=123 \
-  RELEASE_WORKFLOW_RUN_ATTEMPT=1 \
-  RELEASE_WORKFLOW_RUN_URL=https://github.com/kuasar-sandbox/sandboxer/actions/runs/123 \
-  "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/revisions.tsv" "$TMP/bundle"
-"$ROOT/scripts/release.sh" validate "$TMP/bundle"
-bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
-  "$TMP/bundle" kuasar-sandbox/sandboxer v1.2.3
+SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+  "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
+"$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
+"$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
+  "$TMP/bundle" kuasar-sandbox/sandboxer v1.2.3 \
+  1111111111111111111111111111111111111111
 
 archive="$TMP/bundle/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz"
-for path in \
-  ./bin/sandbox-ctl \
-  ./bin/sandbox-init \
-  ./bin/cloud-hypervisor \
-  ./docs/sandboxer.md \
-  ./release/sandboxer.json; do
+for path in ./bin/sandbox-ctl ./bin/sandbox-init ./bin/cloud-hypervisor \
+  ./docs/sandboxer.md; do
   tar -tzf "$archive" | grep -Fx "$path" >/dev/null || fail "archive is missing $path"
 done
+if tar -tzf "$archive" | grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' >/dev/null; then
+  fail "archive contains release metadata JSON"
+fi
+
+SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+  "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
+cmp -s "$archive" "$TMP/reproducible/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz" \
+  || fail "identical inputs did not produce an identical archive"
 
 cp -a "$TMP/bundle" "$TMP/tampered"
 printf 'tampered\n' >> "$TMP/tampered/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz"
-if "$ROOT/scripts/release.sh" validate "$TMP/tampered" >/dev/null 2>&1; then
+if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/tampered" >/dev/null 2>&1; then
   fail "validator accepted a tampered archive"
 fi
 
-env \
-  RELEASE_BIN_DIR="$TMP/bin" \
-  SOURCE_DATE_EPOCH=1700000000 \
-  RELEASE_WORKFLOW_REPOSITORY=kuasar-sandbox/sandboxer \
-  RELEASE_WORKFLOW_RUN_ID=124 \
-  RELEASE_WORKFLOW_RUN_ATTEMPT=1 \
-  RELEASE_WORKFLOW_RUN_URL=https://github.com/kuasar-sandbox/sandboxer/actions/runs/124 \
-  "$ROOT/scripts/release.sh" package v1.2.3-preview.20260804 x86_64 \
-    "$TMP/revisions.tsv" "$TMP/preview-bundle"
-"$ROOT/scripts/release.sh" validate "$TMP/preview-bundle"
-bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
-  "$TMP/preview-bundle" kuasar-sandbox/sandboxer v1.2.3-preview.20260804
+cp -a "$TMP/bundle" "$TMP/extra"
+touch "$TMP/extra/assets/release.json"
+if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra" >/dev/null 2>&1; then
+  fail "validator accepted an extra asset"
+fi
 
 if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package 01.2.3 x86_64 \
-  "$TMP/revisions.tsv" "$TMP/invalid" >/dev/null 2>&1; then
+  "$TMP/invalid-version" >/dev/null 2>&1; then
   fail "packager accepted an invalid version"
+fi
+if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package v1.2.3 aarch64 \
+  "$TMP/invalid-arch" >/dev/null 2>&1; then
+  fail "packager accepted an unvalidated release architecture"
 fi
 
 echo "test-release: PASS"
