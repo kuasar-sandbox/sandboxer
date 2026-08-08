@@ -17,7 +17,7 @@ import (
 // local snapshot graph to manifest storage or one named file location, preserves
 // existing portable refs, and prints the canonical portable root ref.
 //
-//	sandbox-ctl upload-snapshot [--manifest-config <file> | --to-ref-location name=file:///path] [--quiet] <snapshot-path>
+//	sandbox-ctl upload-snapshot [--manifest-config <file>] [--to-ref-location name=file:///path] [--quiet] <snapshot-path>
 func uploadSnapshotCmd(args []string) int {
 	fs := flag.NewFlagSet("upload-snapshot", flag.ContinueOnError)
 	manifestPath := fs.String("manifest-config", "", "storage config YAML (overrides MANIFEST_CONFIG env); $MANIFEST_KEY supplies the customer key")
@@ -26,13 +26,9 @@ func uploadSnapshotCmd(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *toRefLocation != "" && *manifestPath != "" {
-		fmt.Fprintln(os.Stderr, "upload-snapshot: --manifest-config and --to-ref-location are mutually exclusive")
-		return 2
-	}
 	path := fs.Arg(0)
 	if path == "" || fs.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl upload-snapshot [--manifest-config <file> | --to-ref-location name=file:///path] [--quiet] <snapshot-path>")
+		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl upload-snapshot [--manifest-config <file>] [--to-ref-location name=file:///path] [--quiet] <snapshot-path>")
 		return 2
 	}
 
