@@ -35,11 +35,13 @@ make build                      # sandbox-ctl + sandbox-init
 make sandbox-ctl sandbox-init   # 两个纯 Go 二进制(CGO_ENABLED=0)
 make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
 make vet test
+make test-e2e                   # 运行 test/e2e/run_all.sh;需要 platform 组装的完整 BIN
 ```
 
 独立版本通过仓库的 `Release` workflow 发布为 `vX.Y.Z`;发布件
 `sandboxer-vX.Y.Z-linux-x86_64.tar.gz` 包含 `sandbox-ctl`、`sandbox-init`、
-`cloud-hypervisor` 和对应文档。本地可用 `make release VERSION=vX.Y.Z`
+`cloud-hypervisor`。本仓文档与 `test/e2e/` 仅由 platform 从所选 tag 聚合进
+platform 包。本地可用 `make release VERSION=vX.Y.Z`
 生成并校验相同布局的 release bundle。
 当前 Release 只发布已完成全量构建与 BMS 验证的 Linux x86_64 目标。正式版之前,
 `platform` 仓的每日协调器按上海日期触发
