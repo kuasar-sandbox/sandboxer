@@ -94,8 +94,20 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if opts.LocalRequired && opts.LocalCodec == nil {
 		return -1, errors.New("restore: LocalRequired requires LocalCodec")
 	}
+	if opts.LocalCodec != nil && opts.CustomerKeyFn == nil {
+		return -1, errors.New("restore: LocalCodec requires CustomerKeyFn")
+	}
 	if err := opts.HostCfg.ValidateRestoreHostConfig(); err != nil {
 		return -1, err
+	}
+	var diffCustomerKey [32]byte
+	if opts.LocalCodec != nil {
+		var err error
+		diffCustomerKey, err = opts.CustomerKeyFn()
+		if err != nil {
+			return -1, fmt.Errorf("restore: diff customer key: %w", err)
+		}
+		defer clear(diffCustomerKey[:])
 	}
 	prefetchMode, err := config.ParsePrefetchMode(opts.HostCfg.Restore.Prefetch)
 	if err != nil {
@@ -467,7 +479,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	rootDB, rootCleanup, err := reconstructDisk(ctx, opts, snapCfg.SingleDisk(), rootTop, parentDiskChain,
+	rootDB, rootCleanup, err := reconstructDisk(ctx, opts, diffCustomerKey, snapCfg.SingleDisk(), rootTop, parentDiskChain,
 		snapCfg.Boot.Root.Base, rootDiffURI, rootDiffTmpl, rootDiffSize, "overlay", logf)
 	if err != nil {
 		return -1, err
@@ -489,7 +501,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		if err != nil {
 			return -1, err
 		}
-		db, dcleanup, derr := reconstructDisk(ctx, opts, single, top, chain, d.Base, diffURI, diffTmpl, dsz, fmt.Sprintf("disk%d", i), logf)
+		db, dcleanup, derr := reconstructDisk(ctx, opts, diffCustomerKey, single, top, chain, d.Base, diffURI, diffTmpl, dsz, fmt.Sprintf("disk%d", i), logf)
 		if derr != nil {
 			return -1, derr
 		}
@@ -682,7 +694,7 @@ func openAndEstablishRestoreMUX(
 // capturedTop/chain come from the snapshot.cfg node; diffURI/diffTemplate from
 // the merged config (host override, else auto-default <sid>.<diskKey>.diff).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func reconstructDisk(ctx context.Context, opts Options, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate string, diffSize int64, diskKey string, logf func(string, ...any)) (sandbox.DiskBackend, func(), error) {
+func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate string, diffSize int64, diskKey string, logf func(string, ...any)) (sandbox.DiskBackend, func(), error) {
 	var db sandbox.DiskBackend
 	var closers []func()
 	cleanup := func() {
@@ -733,7 +745,7 @@ func reconstructDisk(ctx context.Context, opts Options, single bool, capturedTop
 	}
 	var cowOptions []vhost.BlockCOWOption
 	if opts.LocalCodec != nil {
-		cowOptions = append(cowOptions, vhost.WithCodec(opts.LocalCodec, opts.LocalRequired))
+		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
 	}
 	cow, err := vhost.OpenBlockCOW(diffPath, baseReader, diffInit, cowOptions...)
 	if err != nil {

@@ -774,12 +774,13 @@ crypto:
 ```
 
 `crypto.local` 是兼容/强制 policy,不是算法选择。`off` 不解析本地 customerKey,
-也不构造 codec;`auto` 用固定 AES-SIV codec 写 encrypted v1,读取时兼容历史
-plaintext;`required` 同样加密写入,并拒绝 plaintext 与 legacy `@sha256` ref。
+也不构造 codec;`auto` 写 encrypted v1,读取时兼容历史 plaintext;`required` 同样
+加密写入,并拒绝 plaintext 与 legacy `@sha256` ref。
 `auto|required` 必须在进程启动配置阶段取得有效 `$MANIFEST_KEY`,否则 fail closed。
 同一 sandbox-ctl 进程只解析一次 key,并把同一固定值交给 manifest key table、
-tarstream codec、HMAC identity 和 active diff header key wrapping。构造本地 codec
-不连接 store/cache;manifest 客户端在第一次实际 fetch/ingest 时才建立。
+tarstream codec、HMAC identity 和 active diff header key derivation。tarstream 与
+active diff 只共享 policy 和 customerKey 来源,不共享算法或 codec API。构造本地
+codec 不连接 store/cache;manifest 客户端在第一次实际 fetch/ingest 时才建立。
 
 **绝对路径要求**:sandbox.yaml 中所有 `file://` URL 必须是绝对路径
 (`file:///abs/path/to/file`)。配置校验阶段拒绝 `file://relative/path`
@@ -848,9 +849,11 @@ blocks 也属于 canonical tarstream。marker 在加密工件中位于密文内�
 
 - `crypto.local=off`:不传 codec,输出保持历史 plaintext byte-identical,scheme 是
   `sha256`,digest 是 `plainDigest`
-- `crypto.local=auto|required`:传固定 AES-SIV codec,writer 把完整 canonical
-  tarstream 包入 encrypted v1 envelope,固定 record size 4096。scheme 是 `hmac`,
-  digest 是 `HMAC-SHA256(customerKey,plainDigestRaw32Bytes)`
+- `crypto.local=auto|required`:传 customer-key-backed codec,writer 为每个工件生成
+  32-byte salt,派生独立 AES-256-GCM key,把完整 canonical tarstream 包入
+  encrypted v1 envelope;data record size 固定为 4096,record sequence 生成 GCM
+  nonce。scheme 是 `hmac`,digest 是
+  `HMAC-SHA256(customerKey,plainDigestRaw32Bytes)`
 
 `hmac` 只是 key-bound identity scheme,不是物理 encoding flag。`auto` 读取历史
 plaintext 时也只向上层返回 `hmac`,不暴露内部 `plainDigest`;是否拒绝 plaintext
@@ -895,22 +898,27 @@ encrypted v1 的物理布局固定为:
 前 16 bytes 是 authenticated prefix:magic `89 4b 44 58 54 53 31 0a`、big-endian
 version `1`、prefix size `16`、flags `0`。其后的 wrapped plaintext 固定 128 bytes,
 包含 logical size、block size `4096`、XTS data-unit size `512`、body offset `4096`、
-key size `64`、每文件随机 64-byte XTS key 和 40 bytes 零保留区。该 plaintext 使用
-accelerator #27 AES-SIV codec 和 AAD `"kuasar/diff/header/v1\0" || prefix` 加密认证,header region
-剩余 bytes 必须为零。body 使用 AES-256-XTS,每个 512-byte logical sector 的 sector
-number 作为 tweak;body 物理长度与 logical disk 相等,guest offset 0 对应物理
-offset 4096。
+key size `64`、每文件随机 64-byte XTS key 和 40 bytes 零保留区。DIFF 不调用
+tarstream codec:sandboxer 从 customerKey 以
+`HMAC-SHA256(key,"kuasar/diff/header-key/aes-gcm/v1\0")` 派生固定的 AES-256-GCM
+header key。prefix 后依次存放随机 12-byte nonce、128-byte header ciphertext 和
+16-byte tag;AAD 是 `"kuasar/diff/header/v1\0" || prefix`,header region 剩余 bytes
+必须为零。body 使用 AES-256-XTS,每个 512-byte logical sector 的 sector number
+作为 tweak;body 物理长度与 logical disk 相等,guest offset 0 对应物理 offset
+4096。
 
 AES-XTS 只提供磁盘扇区保密性,不认证 mutable body,也不承诺检测 sector replay、
 relocation 或回滚。header 认证只保护格式、logical size 和 wrapped XTS key。每个新
-target 都生成独立随机 XTS key;不使用 HKDF、per-file salt 或额外 header HMAC。
+target 都生成独立随机 XTS key 和 GCM nonce;不使用 per-file KDF salt 或额外 header
+HMAC。旧 AES-SIV encrypted DIFF 不在兼容范围内;magic 命中后按当前 v1 认证失败,
+不会回退为 plaintext。
 
 `diff_template` 是逻辑初始化源而非目标物理编码。existing non-empty diff 优先并
 完全忽略 template。新目标按下面矩阵创建:
 
 | `crypto.local` | plaintext template | encrypted template |
 |----------------|--------------------|--------------------|
-| `off` | 按逻辑 sparse view 创建 plaintext target | 拒绝(没有 codec) |
+| `off` | 按逻辑 sparse view 创建 plaintext target | 拒绝(没有 DIFF encryption key) |
 | `auto|required` | 按逻辑 plaintext 读取,以新随机 XTS key 创建 encrypted target | 用当前 customerKey 解 header,按逻辑 plaintext 读取,以新随机 XTS key 重新加密 |
 
 任何 template data extent 涉及的 4 KiB block 都完整初始化 8 个 XTS data units;
@@ -1362,8 +1370,9 @@ snapshot 与 overlay 都**按内容摘要命名**(content-addressed),彼此不�
 
 **内容 identity `<scheme>:<digest>`** 由 §3.2.1 定义。`off` 使用 plaintext
 `sha256`;`auto|required` 使用 customerKey-bound `hmac`,并把完整 canonical
-tarstream 写入固定 4 KiB record 的 AES-SIV envelope。两种路径都只读驻留数据 +
-ZIP 段,8 GiB 镜像里的零页不读不写;加密路径不生成 plaintext staging。
+tarstream 写入固定 4 KiB data record 的 per-artifact AES-256-GCM envelope。两种
+路径都只读驻留数据 + ZIP 段,8 GiB 镜像里的零页不读不写;加密路径不生成
+plaintext staging。
 
 **`snapshot` 条目逻辑布局**(信封内的逻辑视图;洞在信封图里):
 

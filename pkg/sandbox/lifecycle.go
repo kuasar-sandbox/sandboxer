@@ -77,6 +77,9 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if opts.LocalRequired && opts.LocalCodec == nil {
 		return -1, fmt.Errorf("RunOptions.LocalRequired requires LocalCodec")
 	}
+	if opts.LocalCodec != nil && opts.CustomerKeyFn == nil {
+		return -1, fmt.Errorf("RunOptions.LocalCodec requires CustomerKeyFn")
+	}
 	if opts.SandboxID == "" {
 		opts.SandboxID = generateSandboxID()
 	}
@@ -92,6 +95,15 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 
 	if err := opts.Cfg.ValidateCold(); err != nil {
 		return -1, fmt.Errorf("config: %w", err)
+	}
+	var diffCustomerKey [32]byte
+	if opts.LocalCodec != nil {
+		var err error
+		diffCustomerKey, err = opts.CustomerKeyFn()
+		if err != nil {
+			return -1, fmt.Errorf("diff customer key: %w", err)
+		}
+		defer clear(diffCustomerKey[:])
 	}
 	// tap-name mode: CH opens the host tap, so verify it exists now.
 	// tapfd mode: the fd comes from the provider handoff below (no host tap
@@ -365,7 +377,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	}
 	var cowOptions []vhost.BlockCOWOption
 	if opts.LocalCodec != nil {
-		cowOptions = append(cowOptions, vhost.WithCodec(opts.LocalCodec, opts.LocalRequired))
+		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
 	}
 	cow, err := vhost.OpenBlockCOW(diffPath, cowBase, diffInit, cowOptions...)
 	if err != nil {
@@ -385,7 +397,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		OwnedDiff: ownedDiff,
 	}}
 	for i := range opts.Cfg.Boot.Disks {
-		db, dcleanup, derr := prepColdDataDisk(ctx, &opts.Cfg.Boot.Disks[i], i, opts.BaseRoot, opts.SandboxID, fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+		db, dcleanup, derr := prepColdDataDisk(ctx, &opts.Cfg.Boot.Disks[i], i, opts.BaseRoot, opts.SandboxID, fetcher, opts.RefLocations, opts.LocalCodec, diffCustomerKey, opts.LocalRequired)
 		if derr != nil {
 			return -1, derr
 		}
@@ -686,7 +698,7 @@ func resolveDiskMounts(mounts []proto.MountSpec, disks []config.DiskConfig, root
 // optional ro base(s) and builds its writable CoW diff (same machinery as the
 // root). ordinal is its boot.disks[] index (used for the auto-default diff name).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, baseRoot, sandboxID string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (DiskBackend, func(), error) {
+func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, baseRoot, sandboxID string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, diffCustomerKey [32]byte, required bool) (DiskBackend, func(), error) {
 	var db DiskBackend
 	var closers []func()
 	cleanup := func() {
@@ -758,7 +770,7 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 	}
 	var cowOptions []vhost.BlockCOWOption
 	if codec != nil {
-		cowOptions = append(cowOptions, vhost.WithCodec(codec, required))
+		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, required))
 	}
 	cow, err := vhost.OpenBlockCOW(diffPath, cowBase, diffInit, cowOptions...)
 	if err != nil {

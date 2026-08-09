@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,7 +17,6 @@ import (
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"golang.org/x/crypto/xts"
 	"golang.org/x/sys/unix"
 )
@@ -25,14 +27,22 @@ const (
 	diffHeaderRegionSize = int64(4096)
 	diffDataUnitSize     = int64(512)
 	diffXTSKeySize       = 64
+	diffHeaderNonceSize  = 12
+	diffHeaderTagSize    = 16
+	diffHeaderSealedSize = diffHeaderNonceSize + diffHeaderPlainSize + diffHeaderTagSize
 	diffVersion          = uint16(1)
 	maxDiffScratchSize   = 1 << 20
 )
 
 var (
 	diffMagic           = [8]byte{0x89, 'K', 'D', 'X', 'T', 'S', '1', '\n'}
+	diffHeaderKeyDomain = []byte("kuasar/diff/header-key/aes-gcm/v1\x00")
 	diffHeaderAADDomain = []byte("kuasar/diff/header/v1\x00")
 	diffScratchPool     sync.Pool
+
+	ErrDiffEncryptionRequired = errors.New("vhost: diff encryption required")
+	ErrDiffPlaintextForbidden = errors.New("vhost: plaintext diff forbidden")
+	ErrDiffAuthentication     = errors.New("vhost: diff authentication failed")
 )
 
 type diffScratch struct {
@@ -56,32 +66,35 @@ type BlockCOWOption interface {
 }
 
 type blockCOWOptions struct {
-	codec    tarstream.Codec
-	required bool
-	codecSet bool
+	encryption    *diffEncryption
+	required      bool
+	encryptionSet bool
 }
 
-type codecBlockCOWOption struct {
-	codec    tarstream.Codec
-	required bool
+type diffEncryptionBlockCOWOption struct {
+	customerKey [32]byte
+	required    bool
 }
 
-func (o codecBlockCOWOption) applyBlockCOW(options *blockCOWOptions) error {
-	if o.codec == nil {
-		return fmt.Errorf("vhost: WithCodec requires a non-nil codec")
+func (o diffEncryptionBlockCOWOption) applyBlockCOW(options *blockCOWOptions) error {
+	if options.encryptionSet {
+		return fmt.Errorf("vhost: duplicate WithDiffEncryption option")
 	}
-	if options.codecSet {
-		return fmt.Errorf("vhost: duplicate WithCodec option")
+	encryption, err := newDiffEncryption(o.customerKey)
+	clear(o.customerKey[:])
+	if err != nil {
+		return err
 	}
-	options.codec, options.required, options.codecSet = o.codec, o.required, true
+	options.encryption, options.required, options.encryptionSet = encryption, o.required, true
 	return nil
 }
 
-// WithCodec makes active-diff reads policy-aware and makes every fresh diff an
-// encrypted v1 file. required rejects existing plaintext active diffs; it does
-// not reject a plaintext template used only as a provisioning input.
-func WithCodec(codec tarstream.Codec, required bool) BlockCOWOption {
-	return codecBlockCOWOption{codec: codec, required: required}
+// WithDiffEncryption makes active-diff reads policy-aware and makes every fresh
+// diff an encrypted v1 file using customerKey. required rejects existing
+// plaintext active diffs; it does not reject a plaintext template used only as
+// a provisioning input.
+func WithDiffEncryption(customerKey [32]byte, required bool) BlockCOWOption {
+	return diffEncryptionBlockCOWOption{customerKey: customerKey, required: required}
 }
 
 func parseBlockCOWOptions(raw []BlockCOWOption) (blockCOWOptions, error) {
@@ -119,12 +132,12 @@ func openBlockCOWDiff(path string, init DiffInit, options blockCOWOptions) (*dif
 		return nil, fmt.Errorf("vhost: empty diff path")
 	}
 	if init.Existing {
-		return openExistingDiffFile(path, options.codec, options.required, false)
+		return openExistingDiffFile(path, options.encryption, options.required, false)
 	}
-	return createFreshDiffFile(path, init, options.codec)
+	return createFreshDiffFile(path, init, options.encryption)
 }
 
-func openExistingDiffFile(path string, codec tarstream.Codec, required, readOnly bool) (*diffFile, error) {
+func openExistingDiffFile(path string, encryption *diffEncryption, required, readOnly bool) (*diffFile, error) {
 	flags := os.O_RDWR
 	if readOnly {
 		flags = os.O_RDONLY
@@ -155,17 +168,17 @@ func openExistingDiffFile(path string, codec tarstream.Codec, required, readOnly
 		}
 	}
 	if magic == diffMagic {
-		if codec == nil {
-			return fail(tarstream.ErrCodecRequired)
+		if encryption == nil {
+			return fail(ErrDiffEncryptionRequired)
 		}
-		diff, err := openEncryptedDiffFile(f, info.Size(), codec)
+		diff, err := openEncryptedDiffFile(f, info.Size(), encryption)
 		if err != nil {
 			return fail(err)
 		}
 		return diff, nil
 	}
 	if required {
-		return fail(tarstream.ErrPlaintextForbidden)
+		return fail(ErrDiffPlaintextForbidden)
 	}
 	if err := validateDiffLogicalSize(info.Size()); err != nil {
 		return fail(fmt.Errorf("vhost: plaintext diff: %w", err))
@@ -173,7 +186,7 @@ func openExistingDiffFile(path string, codec tarstream.Codec, required, readOnly
 	return &diffFile{f: f, bodyIO: f, logicalSize: info.Size()}, nil
 }
 
-func openEncryptedDiffFile(f *os.File, physicalSize int64, codec tarstream.Codec) (*diffFile, error) {
+func openEncryptedDiffFile(f *os.File, physicalSize int64, encryption *diffEncryption) (*diffFile, error) {
 	if physicalSize < diffHeaderRegionSize {
 		return nil, fmt.Errorf("vhost: encrypted diff header is truncated")
 	}
@@ -195,17 +208,19 @@ func openEncryptedDiffFile(f *os.File, physicalSize int64, codec tarstream.Codec
 	if flags := binary.BigEndian.Uint32(prefix[12:16]); flags != 0 {
 		return nil, fmt.Errorf("vhost: encrypted diff flags 0x%x are unsupported", flags)
 	}
-	wrappedSize := codec.CiphertextSize(diffHeaderPlainSize)
-	if wrappedSize <= diffHeaderPlainSize || wrappedSize > int(diffHeaderRegionSize)-diffPrefixSize {
-		return nil, fmt.Errorf("vhost: encrypted diff codec returned an invalid header size")
-	}
-	wrappedEnd := diffPrefixSize + wrappedSize
+	wrappedEnd := diffPrefixSize + diffHeaderSealedSize
 	if !allZero(region[wrappedEnd:]) {
 		return nil, fmt.Errorf("vhost: encrypted diff header padding is not zero")
 	}
-	plaintext, err := codec.DecryptInPlace(region[diffPrefixSize:wrappedEnd], diffHeaderAAD(prefix))
+	nonceEnd := diffPrefixSize + diffHeaderNonceSize
+	plaintext, err := encryption.header.Open(
+		region[nonceEnd:nonceEnd],
+		region[diffPrefixSize:nonceEnd],
+		region[nonceEnd:wrappedEnd],
+		diffHeaderAAD(prefix),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("vhost: encrypted diff header: %w", err)
+		return nil, ErrDiffAuthentication
 	}
 	if len(plaintext) != diffHeaderPlainSize {
 		return nil, fmt.Errorf("vhost: encrypted diff header plaintext size is invalid")
@@ -251,12 +266,12 @@ func openEncryptedDiffFile(f *os.File, physicalSize int64, codec tarstream.Codec
 	}, nil
 }
 
-func createFreshDiffFile(path string, init DiffInit, codec tarstream.Codec) (*diffFile, error) {
+func createFreshDiffFile(path string, init DiffInit, encryption *diffEncryption) (*diffFile, error) {
 	var template diffTemplateSource
 	logicalSize := init.CreateSize
 	if init.TemplatePath != "" {
 		var err error
-		template, err = openDiffTemplate(init.TemplatePath, codec)
+		template, err = openDiffTemplate(init.TemplatePath, encryption)
 		if err != nil {
 			return nil, fmt.Errorf("vhost: open diff template: %w", err)
 		}
@@ -269,10 +284,10 @@ func createFreshDiffFile(path string, init DiffInit, codec tarstream.Codec) (*di
 	if err := validateDiffLogicalSize(logicalSize); err != nil {
 		return nil, fmt.Errorf("vhost: fresh diff: %w", err)
 	}
-	return initializeFreshDiffFile(path, logicalSize, codec, template)
+	return initializeFreshDiffFile(path, logicalSize, encryption, template)
 }
 
-func initializeFreshDiffFile(path string, logicalSize int64, codec tarstream.Codec, template diffTemplateSource) (*diffFile, error) {
+func initializeFreshDiffFile(path string, logicalSize int64, encryption *diffEncryption, template diffTemplateSource) (*diffFile, error) {
 	directory := filepath.Dir(path)
 	tmp, err := os.CreateTemp(directory, "."+filepath.Base(path)+".*.partial")
 	if err != nil {
@@ -288,13 +303,13 @@ func initializeFreshDiffFile(path string, logicalSize int64, codec tarstream.Cod
 	}()
 
 	var target *diffFile
-	if codec == nil {
+	if encryption == nil {
 		if err := tmp.Truncate(logicalSize); err != nil {
 			return nil, fmt.Errorf("vhost: size plaintext diff: %w", err)
 		}
 		target = &diffFile{f: tmp, bodyIO: tmp, logicalSize: logicalSize}
 	} else {
-		target, err = createEncryptedDiffFile(tmp, logicalSize, codec, cryptorand.Reader)
+		target, err = createEncryptedDiffFile(tmp, logicalSize, encryption, cryptorand.Reader)
 		if err != nil {
 			return nil, err
 		}
@@ -320,11 +335,11 @@ func initializeFreshDiffFile(path string, logicalSize int64, codec tarstream.Cod
 	if err := syncDirectory(directory); err != nil {
 		return nil, err
 	}
-	// A codec-backed writer always produced encrypted v1, even in auto mode.
-	return openExistingDiffFile(path, codec, codec != nil, false)
+	// An encryption-backed writer always produced encrypted v1, even in auto mode.
+	return openExistingDiffFile(path, encryption, encryption != nil, false)
 }
 
-func createEncryptedDiffFile(f *os.File, logicalSize int64, codec tarstream.Codec, random io.Reader) (*diffFile, error) {
+func createEncryptedDiffFile(f *os.File, logicalSize int64, encryption *diffEncryption, random io.Reader) (*diffFile, error) {
 	var rawKey [diffXTSKeySize]byte
 	var header [diffHeaderPlainSize]byte
 	defer clear(rawKey[:])
@@ -344,18 +359,22 @@ func createEncryptedDiffFile(f *os.File, logicalSize int64, codec tarstream.Code
 	binary.BigEndian.PutUint32(header[16:20], uint32(diffHeaderRegionSize))
 	binary.BigEndian.PutUint32(header[20:24], diffXTSKeySize)
 	copy(header[24:88], rawKey[:])
-	sealed, err := codec.Encrypt(nil, header[:], diffHeaderAAD(prefix[:]))
-	if err != nil {
-		return nil, fmt.Errorf("vhost: wrap encrypted diff header: %w", err)
-	}
-	if len(sealed) != codec.CiphertextSize(len(header)) || diffPrefixSize+len(sealed) > int(diffHeaderRegionSize) {
-		clear(sealed)
-		return nil, fmt.Errorf("vhost: encrypted diff codec returned an invalid wrapped header")
-	}
 	region := make([]byte, diffHeaderRegionSize)
 	copy(region, prefix[:])
-	copy(region[diffPrefixSize:], sealed)
-	clear(sealed)
+	nonceEnd := diffPrefixSize + diffHeaderNonceSize
+	if _, err := io.ReadFull(random, region[diffPrefixSize:nonceEnd]); err != nil {
+		clear(region)
+		return nil, fmt.Errorf("vhost: generate diff header nonce: %w", err)
+	}
+	sealed := encryption.header.Seal(
+		region[nonceEnd:nonceEnd],
+		region[diffPrefixSize:nonceEnd],
+		header[:],
+		diffHeaderAAD(prefix[:]),
+	)
+	if len(sealed) != diffHeaderPlainSize+diffHeaderTagSize {
+		panic("vhost: AES-GCM returned an unexpected diff header size")
+	}
 	if err := writeFullAt(f, region, 0); err != nil {
 		clear(region)
 		return nil, fmt.Errorf("vhost: write encrypted diff header: %w", err)
@@ -386,6 +405,27 @@ func diffHeaderAAD(prefix []byte) []byte {
 	aad = append(aad, diffHeaderAADDomain...)
 	aad = append(aad, prefix...)
 	return aad
+}
+
+type diffEncryption struct {
+	header cipher.AEAD
+}
+
+func newDiffEncryption(customerKey [32]byte) (*diffEncryption, error) {
+	mac := hmac.New(sha256.New, customerKey[:])
+	_, _ = mac.Write(diffHeaderKeyDomain)
+	var headerKey [sha256.Size]byte
+	mac.Sum(headerKey[:0])
+	defer clear(headerKey[:])
+	block, err := aes.NewCipher(headerKey[:])
+	if err != nil {
+		return nil, fmt.Errorf("vhost: create diff header cipher: %w", err)
+	}
+	header, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("vhost: create diff header GCM: %w", err)
+	}
+	return &diffEncryption{header: header}, nil
 }
 
 func validateDiffLogicalSize(size int64) error {
@@ -566,8 +606,8 @@ type fileDiffTemplate struct {
 	bitmap []uint64
 }
 
-func openDiffTemplate(path string, codec tarstream.Codec) (diffTemplateSource, error) {
-	diff, err := openExistingDiffFile(path, codec, false, true)
+func openDiffTemplate(path string, encryption *diffEncryption) (diffTemplateSource, error) {
+	diff, err := openExistingDiffFile(path, encryption, false, true)
 	if err != nil {
 		return nil, err
 	}
