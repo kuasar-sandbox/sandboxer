@@ -3,6 +3,7 @@ package vhost
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,20 +14,17 @@ import (
 	"sync"
 	"testing"
 
-	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"golang.org/x/sys/unix"
 )
 
-func TestBlockCOWCodecOptions(t *testing.T) {
-	codec := testDiffCodec(t, 0x11)
+func TestBlockCOWDiffEncryptionOptions(t *testing.T) {
+	key := testDiffKey(0x11)
 	for _, test := range []struct {
 		name    string
 		options []BlockCOWOption
 	}{
-		{name: "nil codec", options: []BlockCOWOption{WithCodec(nil, false)}},
-		{name: "duplicate codec", options: []BlockCOWOption{WithCodec(codec, false), WithCodec(codec, true)}},
+		{name: "duplicate encryption", options: []BlockCOWOption{WithDiffEncryption(key, false), WithDiffEncryption(key, true)}},
 		{name: "nil option", options: []BlockCOWOption{nil}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -47,9 +45,9 @@ func TestEncryptedBlockCOWPolicyAndReopen(t *testing.T) {
 	path := filepath.Join(dir, "active.diff")
 	baseData := patternedBytes(size)
 	base := &fakeReader{data: baseData}
-	codec := testDiffCodec(t, 0x21)
+	key := testDiffKey(0x21)
 
-	cow, err := OpenBlockCOW(path, base, DiffInit{CreateSize: size}, WithCodec(codec, false))
+	cow, err := OpenBlockCOW(path, base, DiffInit{CreateSize: size}, WithDiffEncryption(key, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,14 +95,14 @@ func TestEncryptedBlockCOWPolicyAndReopen(t *testing.T) {
 		t.Fatal("encrypted body stored plaintext")
 	}
 
-	if _, err := OpenBlockCOW(path, base, DiffInit{Existing: true}); !errors.Is(err, tarstream.ErrCodecRequired) {
+	if _, err := OpenBlockCOW(path, base, DiffInit{Existing: true}); !errors.Is(err, ErrDiffEncryptionRequired) {
 		t.Fatalf("off encrypted open error=%v", err)
 	}
-	wrong := testDiffCodec(t, 0x22)
-	if _, err := OpenBlockCOW(path, base, DiffInit{Existing: true}, WithCodec(wrong, true)); !errors.Is(err, tarstream.ErrAuthentication) {
+	wrong := testDiffKey(0x22)
+	if _, err := OpenBlockCOW(path, base, DiffInit{Existing: true}, WithDiffEncryption(wrong, true)); !errors.Is(err, ErrDiffAuthentication) {
 		t.Fatalf("wrong key error=%v", err)
 	}
-	reopened, err := OpenBlockCOW(path, base, DiffInit{Existing: true}, WithCodec(codec, true))
+	reopened, err := OpenBlockCOW(path, base, DiffInit{Existing: true}, WithDiffEncryption(key, true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +130,7 @@ func TestEncryptedBlockCOWPolicyAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	before, _ := os.ReadFile(plainPath)
-	auto, err := OpenBlockCOW(plainPath, nil, DiffInit{Existing: true}, WithCodec(codec, false))
+	auto, err := OpenBlockCOW(plainPath, nil, DiffInit{Existing: true}, WithDiffEncryption(key, false))
 	if err != nil {
 		t.Fatalf("auto plaintext: %v", err)
 	}
@@ -146,17 +144,17 @@ func TestEncryptedBlockCOWPolicyAndReopen(t *testing.T) {
 	if !bytes.Equal(after, before) {
 		t.Fatal("auto modified an existing plaintext diff")
 	}
-	if _, err := OpenBlockCOW(plainPath, nil, DiffInit{Existing: true}, WithCodec(codec, true)); !errors.Is(err, tarstream.ErrPlaintextForbidden) {
+	if _, err := OpenBlockCOW(plainPath, nil, DiffInit{Existing: true}, WithDiffEncryption(key, true)); !errors.Is(err, ErrDiffPlaintextForbidden) {
 		t.Fatalf("required plaintext error=%v", err)
 	}
 }
 
 func TestEncryptedDiffHeaderValidation(t *testing.T) {
-	codec := testDiffCodec(t, 0x31)
+	key := testDiffKey(0x31)
 	create := func(t *testing.T) string {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), "active.diff")
-		cow, err := OpenBlockCOW(path, nil, DiffInit{CreateSize: cowBlockSize}, WithCodec(codec, false))
+		cow, err := OpenBlockCOW(path, nil, DiffInit{CreateSize: cowBlockSize}, WithDiffEncryption(key, false))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -166,7 +164,7 @@ func TestEncryptedDiffHeaderValidation(t *testing.T) {
 		return path
 	}
 	open := func(path string, required bool) error {
-		cow, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithCodec(codec, required))
+		cow, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithDiffEncryption(key, required))
 		if cow != nil {
 			_ = cow.Close()
 		}
@@ -233,7 +231,7 @@ func TestEncryptedDiffHeaderValidation(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := create(t)
-			rewrapDiffHeader(t, path, codec, test.mutate)
+			rewrapDiffHeader(t, path, key, test.mutate)
 			if err := open(path, false); err == nil {
 				t.Fatal("invalid authenticated metadata was accepted")
 			}
@@ -243,7 +241,7 @@ func TestEncryptedDiffHeaderValidation(t *testing.T) {
 	t.Run("magic-required", func(t *testing.T) {
 		path := create(t)
 		mutateDiffBytes(t, path, func(body []byte) { body[0] ^= 1 })
-		if err := open(path, true); !errors.Is(err, tarstream.ErrPlaintextForbidden) {
+		if err := open(path, true); !errors.Is(err, ErrDiffPlaintextForbidden) {
 			t.Fatalf("required damaged magic error=%v", err)
 		}
 	})
@@ -256,7 +254,7 @@ func TestEncryptedDiffHeaderValidation(t *testing.T) {
 		if err := os.WriteFile(path, body, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		cow, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithCodec(codec, false))
+		cow, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithDiffEncryption(key, false))
 		if err != nil {
 			t.Fatalf("auto rejected non-magic legacy plaintext: %v", err)
 		}
@@ -265,11 +263,27 @@ func TestEncryptedDiffHeaderValidation(t *testing.T) {
 		}
 		_ = cow.Close()
 	})
+
+	t.Run("old-aes-siv-v1", func(t *testing.T) {
+		const oldHeader = "894b44585453310a00010010000000000170cd897df89cc598b26de657afb7b70b74d8d642451e27f413a9db206efb46a51c2090af40fd8401a2e25f681a19320b5bc87531fb226083b31876d4c89902deb97766b2a600065e3f92ba3323a39a72dce34d4ef9f5e1f59201522f607b0e43cb11d0f1fc948e49f35f8d7dd1f09d2f8f93d97561147dfce80130e919d719c496e7703c11bb326cc2c9479f61c7f42c"
+		const oldLogicalSize = 256 * diffDataUnitSize
+		path := filepath.Join(t.TempDir(), "old-siv.diff")
+		body := make([]byte, diffHeaderRegionSize+oldLogicalSize)
+		copy(body, mustDecodeHex(t, oldHeader))
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithDiffEncryption(testDiffKey(0x41), false)); !errors.Is(err, ErrDiffAuthentication) {
+			t.Fatalf("old AES-SIV diff error=%v", err)
+		}
+	})
 }
 
 func TestEncryptedDiffGoldenAndRandomKeys(t *testing.T) {
-	codec := testDiffCodec(t, 0x41)
+	key := testDiffKey(0x41)
 	rawKey := mustDecodeHex(t, "27182818284590452353602874713526624977572470936999595749669676273141592653589793238462643383279502884197169399375105820974944592")
+	nonce := mustDecodeHex(t, "000102030405060708090a0b")
+	randomMaterial := append(append([]byte(nil), rawKey...), nonce...)
 	path := filepath.Join(t.TempDir(), "golden.diff")
 	f, err := os.Create(path)
 	if err != nil {
@@ -277,7 +291,7 @@ func TestEncryptedDiffGoldenAndRandomKeys(t *testing.T) {
 	}
 	const vectorSector = int64(0xff)
 	const goldenSize = (vectorSector + 1) * diffDataUnitSize
-	diff, err := createEncryptedDiffFile(f, goldenSize, codec, bytes.NewReader(rawKey))
+	diff, err := createEncryptedDiffFile(f, goldenSize, mustDiffEncryption(t, key), bytes.NewReader(randomMaterial))
 	if err != nil {
 		_ = f.Close()
 		t.Fatal(err)
@@ -308,8 +322,8 @@ func TestEncryptedDiffGoldenAndRandomKeys(t *testing.T) {
 	if !bytes.Equal(gotPlaintext, plaintext) {
 		t.Fatal("AES-256-XTS round trip failed")
 	}
-	const wantHeader = "894b44585453310a00010010000000000170cd897df89cc598b26de657afb7b70b74d8d642451e27f413a9db206efb46a51c2090af40fd8401a2e25f681a19320b5bc87531fb226083b31876d4c89902deb97766b2a600065e3f92ba3323a39a72dce34d4ef9f5e1f59201522f607b0e43cb11d0f1fc948e49f35f8d7dd1f09d2f8f93d97561147dfce80130e919d719c496e7703c11bb326cc2c9479f61c7f42c"
-	gotHeader := hex.EncodeToString(physical[:diffPrefixSize+codec.CiphertextSize(diffHeaderPlainSize)])
+	const wantHeader = "894b44585453310a0001001000000000000102030405060708090a0bb2ce352abb439fafdbbf9e7c711227cc2036bd773685b370447336476c95bb845f52cee4acacc2d1646d48dfd014d36e7dc33a90e76d34e75d0184af8385189bf92ece9956134546003eb26ed378aaa619a77ea3a2d77937494a2a7676f8b809edac3e7a68311a760dd05f4907647a2490ee18f0b4e69dde13e4121c1f0f80d6d5c82996b62be812fb2960d05b3cffc6"
+	gotHeader := hex.EncodeToString(physical[:diffPrefixSize+diffHeaderSealedSize])
 	if gotHeader != wantHeader {
 		t.Fatalf("encrypted diff header=%s want=%s", gotHeader, wantHeader)
 	}
@@ -320,7 +334,7 @@ func TestEncryptedDiffGoldenAndRandomKeys(t *testing.T) {
 	paths := []string{filepath.Join(t.TempDir(), "a.diff"), filepath.Join(t.TempDir(), "b.diff")}
 	files := make([][]byte, len(paths))
 	for i, candidate := range paths {
-		cow, err := OpenBlockCOW(candidate, nil, DiffInit{CreateSize: cowBlockSize}, WithCodec(codec, false))
+		cow, err := OpenBlockCOW(candidate, nil, DiffInit{CreateSize: cowBlockSize}, WithDiffEncryption(key, false))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -350,7 +364,7 @@ func TestEncryptedBlockCOWArbitraryIOAndShortIO(t *testing.T) {
 		filepath.Join(t.TempDir(), "active.diff"),
 		&fakeReader{data: baseData},
 		DiffInit{CreateSize: size},
-		WithCodec(testDiffCodec(t, 0x51), false),
+		WithDiffEncryption(testDiffKey(0x51), false),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -390,7 +404,7 @@ func TestEncryptedBlockCOWArbitraryIOAndShortIO(t *testing.T) {
 		filepath.Join(t.TempDir(), "short.diff"),
 		&fakeReader{data: baseData[:cowBlockSize]},
 		DiffInit{CreateSize: cowBlockSize},
-		WithCodec(testDiffCodec(t, 0x52), false),
+		WithDiffEncryption(testDiffKey(0x52), false),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -421,7 +435,7 @@ func TestEncryptedBlockCOWConcurrentOverlappingWrites(t *testing.T) {
 		filepath.Join(t.TempDir(), "active.diff"),
 		&fakeReader{data: baseData},
 		DiffInit{CreateSize: size},
-		WithCodec(testDiffCodec(t, 0x53), false),
+		WithDiffEncryption(testDiffKey(0x53), false),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -477,8 +491,8 @@ func TestEncryptedBlockCOWConcurrentOverlappingWrites(t *testing.T) {
 func TestEncryptedBitmapRebuildSkipsHeaderAndPreservesSparseBlocks(t *testing.T) {
 	const size = 6 * cowBlockSize
 	path := filepath.Join(t.TempDir(), "active.diff")
-	codec := testDiffCodec(t, 0x54)
-	cow, err := OpenBlockCOW(path, nil, DiffInit{CreateSize: size}, WithCodec(codec, false))
+	key := testDiffKey(0x54)
+	cow, err := OpenBlockCOW(path, nil, DiffInit{CreateSize: size}, WithDiffEncryption(key, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -496,7 +510,7 @@ func TestEncryptedBitmapRebuildSkipsHeaderAndPreservesSparseBlocks(t *testing.T)
 	if err := cow.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithCodec(codec, true))
+	reopened, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithDiffEncryption(key, true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +531,8 @@ func TestFreshEncryptedDiffRejectsPreallocatedBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	diff, err := createEncryptedDiffFile(f, 2*cowBlockSize, testDiffCodec(t, 0x55), strings.NewReader(strings.Repeat("k", diffXTSKeySize)))
+	key := testDiffKey(0x55)
+	diff, err := createEncryptedDiffFile(f, 2*cowBlockSize, mustDiffEncryption(t, key), strings.NewReader(strings.Repeat("k", diffXTSKeySize+diffHeaderNonceSize)))
 	if err != nil {
 		_ = f.Close()
 		t.Fatal(err)
@@ -542,14 +557,15 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 		{Offset: cowBlockSize + 123, Size: 257},
 		{Offset: 3 * cowBlockSize, Size: cowBlockSize},
 	})
-	codec := testDiffCodec(t, 0x61)
+	key := testDiffKey(0x61)
+	encryption := mustDiffEncryption(t, key)
 
 	openSeeded := func(t *testing.T, name string, required bool) (*BlockCOW, string) {
 		t.Helper()
 		path := filepath.Join(dir, name)
 		var options []BlockCOWOption
 		if name != "plain.diff" {
-			options = append(options, WithCodec(codec, required))
+			options = append(options, WithDiffEncryption(key, required))
 		}
 		cow, err := OpenBlockCOW(path, nil, DiffInit{TemplatePath: templatePath}, options...)
 		if err != nil {
@@ -598,7 +614,7 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 
 	baseData := patternedBytes(size)
 	layered, err := OpenBlockCOW(filepath.Join(dir, "layered.diff"), &fakeReader{data: baseData},
-		DiffInit{TemplatePath: templatePath}, WithCodec(codec, true))
+		DiffInit{TemplatePath: templatePath}, WithDiffEncryption(key, true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -619,12 +635,12 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 	}
 
 	if _, err := OpenBlockCOW(filepath.Join(dir, "off-from-encrypted.diff"), nil,
-		DiffInit{TemplatePath: encryptedPath}); !errors.Is(err, tarstream.ErrCodecRequired) {
+		DiffInit{TemplatePath: encryptedPath}); !errors.Is(err, ErrDiffEncryptionRequired) {
 		t.Fatalf("off encrypted template error=%v", err)
 	}
 	reencryptedPath := filepath.Join(dir, "reencrypted.diff")
 	reencrypted, err := OpenBlockCOW(reencryptedPath, nil,
-		DiffInit{TemplatePath: encryptedPath}, WithCodec(codec, true))
+		DiffInit{TemplatePath: encryptedPath}, WithDiffEncryption(key, true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,7 +667,7 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 	if err := os.WriteFile(collision, []byte("sentinel"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenBlockCOW(collision, nil, DiffInit{TemplatePath: templatePath}, WithCodec(codec, false)); err == nil {
+	if _, err := OpenBlockCOW(collision, nil, DiffInit{TemplatePath: templatePath}, WithDiffEncryption(key, false)); err == nil {
 		t.Fatal("fresh initialization replaced an existing final")
 	}
 	if body, err := os.ReadFile(collision); err != nil || string(body) != "sentinel" {
@@ -665,7 +681,7 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 	if err := os.WriteFile(empty, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	fromEmpty, err := OpenBlockCOW(empty, nil, DiffInit{TemplatePath: templatePath}, WithCodec(codec, false))
+	fromEmpty, err := OpenBlockCOW(empty, nil, DiffInit{TemplatePath: templatePath}, WithDiffEncryption(key, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -675,7 +691,7 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 	}
 
 	seedFailure := filepath.Join(dir, "seed-failure.diff")
-	if _, err := initializeFreshDiffFile(seedFailure, size, codec, failingDiffTemplate{size: size}); err == nil {
+	if _, err := initializeFreshDiffFile(seedFailure, size, encryption, failingDiffTemplate{size: size}); err == nil {
 		t.Fatal("injected template read failure was accepted")
 	}
 	if _, err := os.Stat(seedFailure); !os.IsNotExist(err) {
@@ -696,7 +712,7 @@ func TestEmptyPlaceholderConcurrentInitializationDoesNotReplaceWinner(t *testing
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	codec := testDiffCodec(t, 0x62)
+	key := testDiffKey(0x62)
 
 	const creators = 16
 	start := make(chan struct{})
@@ -707,7 +723,7 @@ func TestEmptyPlaceholderConcurrentInitializationDoesNotReplaceWinner(t *testing
 		go func() {
 			defer wait.Done()
 			<-start
-			cow, err := OpenBlockCOW(path, nil, DiffInit{TemplatePath: template}, WithCodec(codec, true))
+			cow, err := OpenBlockCOW(path, nil, DiffInit{TemplatePath: template}, WithDiffEncryption(key, true))
 			if cow != nil {
 				err = errors.Join(err, cow.Close())
 			}
@@ -731,7 +747,7 @@ func TestEmptyPlaceholderConcurrentInitializationDoesNotReplaceWinner(t *testing
 		t.Fatalf("successful creators=%d want=1", winners)
 	}
 
-	reopened, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithCodec(codec, true))
+	reopened, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithDiffEncryption(key, true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -755,7 +771,7 @@ func TestEncryptedSnapshotViewIsDecryptedUpperOnly(t *testing.T) {
 		filepath.Join(t.TempDir(), "active.diff"),
 		&fakeReader{data: baseData},
 		DiffInit{CreateSize: size},
-		WithCodec(testDiffCodec(t, 0x71), true),
+		WithDiffEncryption(testDiffKey(0x71), true),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -846,15 +862,19 @@ func (s shortDiffBodyIO) WriteAt(buf []byte, offset int64) (int, error) {
 	return n, nil
 }
 
-func testDiffCodec(t *testing.T, first byte) tarstream.Codec {
-	t.Helper()
+func testDiffKey(first byte) [32]byte {
 	var key [32]byte
 	key[0] = first
-	codec, err := manifestcrypto.NewTarStreamCodec(key)
+	return key
+}
+
+func mustDiffEncryption(t *testing.T, key [32]byte) *diffEncryption {
+	t.Helper()
+	encryption, err := newDiffEncryption(key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return codec
+	return encryption
 }
 
 func mutateDiffBytes(t *testing.T, path string, mutate func([]byte)) {
@@ -869,8 +889,9 @@ func mutateDiffBytes(t *testing.T, path string, mutate func([]byte)) {
 	}
 }
 
-func rewrapDiffHeader(t *testing.T, path string, codec tarstream.Codec, mutate func([]byte)) {
+func rewrapDiffHeader(t *testing.T, path string, key [32]byte, mutate func([]byte)) {
 	t.Helper()
+	encryption := mustDiffEncryption(t, key)
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -881,19 +902,30 @@ func rewrapDiffHeader(t *testing.T, path string, codec tarstream.Codec, mutate f
 		t.Fatal(err)
 	}
 	prefix := append([]byte(nil), region[:diffPrefixSize]...)
-	wrappedSize := codec.CiphertextSize(diffHeaderPlainSize)
-	header, err := codec.DecryptInPlace(region[diffPrefixSize:diffPrefixSize+wrappedSize], diffHeaderAAD(prefix))
+	nonceEnd := diffPrefixSize + diffHeaderNonceSize
+	wrapperEnd := diffPrefixSize + diffHeaderSealedSize
+	header, err := encryption.header.Open(
+		nil,
+		region[diffPrefixSize:nonceEnd],
+		region[nonceEnd:wrapperEnd],
+		diffHeaderAAD(prefix),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer clear(header)
 	mutate(header)
-	sealed, err := codec.Encrypt(nil, header, diffHeaderAAD(prefix))
-	if err != nil {
-		t.Fatal(err)
-	}
 	clear(region)
 	copy(region, prefix)
-	copy(region[diffPrefixSize:], sealed)
+	if _, err := io.ReadFull(cryptorand.Reader, region[diffPrefixSize:nonceEnd]); err != nil {
+		t.Fatal(err)
+	}
+	encryption.header.Seal(
+		region[nonceEnd:nonceEnd],
+		region[diffPrefixSize:nonceEnd],
+		header,
+		diffHeaderAAD(prefix),
+	)
 	if err := writeFullAt(f, region, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -936,9 +968,9 @@ func binaryPutUint16(target []byte, value uint16) {
 }
 
 func TestDiffReadErrorsDoNotExposeKeyMaterial(t *testing.T) {
-	codec := testDiffCodec(t, 0x81)
+	key := testDiffKey(0x81)
 	path := filepath.Join(t.TempDir(), "active.diff")
-	cow, err := OpenBlockCOW(path, nil, DiffInit{CreateSize: cowBlockSize}, WithCodec(codec, false))
+	cow, err := OpenBlockCOW(path, nil, DiffInit{CreateSize: cowBlockSize}, WithDiffEncryption(key, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -948,7 +980,7 @@ func TestDiffReadErrorsDoNotExposeKeyMaterial(t *testing.T) {
 	if err := os.WriteFile(path, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err = OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithCodec(codec, false))
+	_, err = OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithDiffEncryption(key, false))
 	if err == nil {
 		t.Fatal("tampered header was accepted")
 	}
@@ -959,14 +991,9 @@ func TestDiffReadErrorsDoNotExposeKeyMaterial(t *testing.T) {
 }
 
 func FuzzEncryptedDiffHeader(f *testing.F) {
-	var key [32]byte
-	key[0] = 0x91
-	codec, err := manifestcrypto.NewTarStreamCodec(key)
-	if err != nil {
-		f.Fatal(err)
-	}
+	key := testDiffKey(0x91)
 	seedPath := filepath.Join(f.TempDir(), "seed.diff")
-	seed, err := OpenBlockCOW(seedPath, nil, DiffInit{CreateSize: cowBlockSize}, WithCodec(codec, false))
+	seed, err := OpenBlockCOW(seedPath, nil, DiffInit{CreateSize: cowBlockSize}, WithDiffEncryption(key, false))
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -994,7 +1021,7 @@ func FuzzEncryptedDiffHeader(f *testing.F) {
 		if err := os.WriteFile(path, body, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		cow, _ := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithCodec(codec, false))
+		cow, _ := OpenBlockCOW(path, nil, DiffInit{Existing: true}, WithDiffEncryption(key, false))
 		if cow != nil {
 			_ = cow.Close()
 		}

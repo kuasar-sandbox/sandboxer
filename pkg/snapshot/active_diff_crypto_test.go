@@ -28,7 +28,7 @@ func TestEncryptedActiveDiffSnapshotToEncryptedFileSink(t *testing.T) {
 		activePath,
 		nil,
 		vhost.DiffInit{CreateSize: size},
-		vhost.WithCodec(codec, true),
+		vhost.WithDiffEncryption(key, true),
 	)
 	if err != nil {
 		t.Fatal(err)

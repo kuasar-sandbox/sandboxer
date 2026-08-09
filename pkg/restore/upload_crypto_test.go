@@ -145,7 +145,7 @@ func TestPublishLocalToLocationFullyAuthenticatesInput(t *testing.T) {
 	}
 }
 
-func TestPublishEncryptedLeafIsByteDeterministic(t *testing.T) {
+func TestPublishEncryptedLeafPreservesLogicalIdentity(t *testing.T) {
 	ctx := context.Background()
 	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x64})
 	sourceDir := t.TempDir()
@@ -174,11 +174,25 @@ func TestPublishEncryptedLeafIsByteDeterministic(t *testing.T) {
 		t.Fatal(err)
 	}
 	parsed := mustParseRef(t, ref)
+	if parsed.DigestScheme != scheme || parsed.Digest != digest {
+		t.Fatalf("published identity=%s:%s want=%s:%s", parsed.DigestScheme, parsed.Digest, scheme, digest)
+	}
 	targetPath := filepath.Join(targetDir, parsed.Path)
-	sourceBytes, _ := os.ReadFile(sourcePath)
-	targetBytes, _ := os.ReadFile(targetPath)
-	if !bytes.Equal(sourceBytes, targetBytes) {
-		t.Fatal("same logical artifact and key did not produce byte-identical ciphertext")
+	stream, err := fetch.OpenTarStream(
+		targetPath,
+		tarstream.WithCodec(codec, true),
+		tarstream.WithExpectedDigest(parsed.DigestScheme, parsed.Digest),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	got := make([]byte, len(payload))
+	if n, err := stream.ReadAt(ctx, got, 0); err != nil || n != len(got) {
+		t.Fatalf("published ReadAt=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("published artifact logical content changed")
 	}
 }
 

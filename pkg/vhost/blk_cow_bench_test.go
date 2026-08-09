@@ -4,8 +4,6 @@ import (
 	"io"
 	"path/filepath"
 	"testing"
-
-	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 )
 
 const benchmarkCOWBlocks = 256
@@ -19,17 +17,14 @@ func (r zeroBlockReader) ReadAt(buf []byte, offset int64) (int, error) {
 
 func BenchmarkEncryptedBlockCOW(b *testing.B) {
 	const size = benchmarkCOWBlocks * cowBlockSize
-	codec, err := manifestcrypto.NewTarStreamCodec([32]byte{0x92})
-	if err != nil {
-		b.Fatal(err)
-	}
+	key := [32]byte{0x92}
 	open := func(b *testing.B) *BlockCOW {
 		b.Helper()
 		cow, err := OpenBlockCOW(
 			filepath.Join(b.TempDir(), "diff.ext4"),
 			zeroBlockReader{size: size},
 			DiffInit{CreateSize: size},
-			WithCodec(codec, false),
+			WithDiffEncryption(key, false),
 		)
 		if err != nil {
 			b.Fatal(err)
