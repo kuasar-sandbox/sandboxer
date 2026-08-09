@@ -68,10 +68,18 @@ validate_archive_paths() {
   if grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' "$listing" >/dev/null; then
     fail "$archive contains release metadata JSON"
   fi
+  local expected_files="$WORK/expected-archive-files"
+  local actual_files="$WORK/actual-archive-files"
+  printf '%s\n' \
+    bin/cloud-hypervisor \
+    bin/sandbox-ctl \
+    bin/sandbox-init > "$expected_files"
   awk '
     { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ && path !~ /^bin\// { exit 1 }
-  ' "$listing" || fail "$archive contains a file outside bin/"
+    path != "" && path !~ /\/$/ { print path }
+  ' "$listing" | LC_ALL=C sort > "$actual_files"
+  cmp -s "$expected_files" "$actual_files" \
+    || { diff -u "$expected_files" "$actual_files" >&2 || true; fail "$archive contains an unexpected file set"; }
 }
 
 validate_bundle() {

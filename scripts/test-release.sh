@@ -28,7 +28,7 @@ chmod +x "$TMP/bin/cloud-hypervisor"
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
-"$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
+bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/sandboxer v1.2.3 \
   1111111111111111111111111111111111111111
 
@@ -58,6 +58,17 @@ cp -a "$TMP/bundle" "$TMP/extra"
 touch "$TMP/extra/assets/release.json"
 if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra" >/dev/null 2>&1; then
   fail "validator accepted an extra asset"
+fi
+
+cp -a "$TMP/bundle" "$TMP/extra-archive-file"
+extra_archive="$TMP/extra-archive-file/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz"
+mkdir -p "$TMP/extra-archive-root"
+tar -xzf "$extra_archive" -C "$TMP/extra-archive-root"
+printf 'unexpected\n' > "$TMP/extra-archive-root/bin/unexpected"
+tar -czf "$extra_archive" -C "$TMP/extra-archive-root" .
+(cd "$(dirname "$extra_archive")" && sha256sum "$(basename "$extra_archive")" > SHA256SUMS)
+if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra-archive-file" >/dev/null 2>&1; then
+  fail "validator accepted an unexpected file inside the archive"
 fi
 
 if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package 01.2.3 x86_64 \
