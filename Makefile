@@ -8,7 +8,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench release test-release clean help
+.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench test-e2e release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -36,6 +36,7 @@ GO             := go
 GO_BUILD_FLAGS := -trimpath
 BINDIR         := bin/$(TARGET_ARCH)
 BUILD_DIR      := build/$(TARGET_ARCH)
+E2E_BIN        ?= $(abspath ../platform/bin/$(TARGET_ARCH))
 
 define link_bin
 @if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
@@ -80,12 +81,14 @@ clean:
 	rm -rf bin build
 	$(MAKE) -C native-deps clean
 
-# Go micro-benchmarks. Sandbox-level e2e (cold/snapshot/restore/...) lives in
-# platform/test/e2e — they need vmlinux + cloud-hypervisor + mkfs.erofs
-# (from guest-runtime/native-deps), sandbox-runtime.bundle (from guest-runtime),
-# and accelerator binaries, so they are cross-repo.
+# Sandbox lifecycle E2E is maintained here, next to the implementation. It uses
+# an assembled platform BIN because boot/restore cases need artifacts built by
+# accelerator and guest-runtime as well as sandboxer.
 bench:
 	CGO_ENABLED=0 $(GO) test -bench=. -benchmem -run=^$$ ./...
+
+test-e2e:
+	BIN="$(E2E_BIN)" bash test/e2e/run_all.sh
 
 VERSION ?= v0.1.0
 
@@ -105,6 +108,7 @@ help:
 	@echo "  cloud-hypervisor   patched VMM consumed by sandbox-ctl"
 	@echo "  sandbox-ctl        host control plane"
 	@echo "  sandbox-init       guest PID 1 binary consumed by guest-runtime"
+	@echo "  test-e2e           run the sandboxer-owned E2E suite with E2E_BIN"
 	@echo "  release            build a validated component release bundle"
 	@echo "  test-release       test component release packaging"
 	@echo "  test / vet / clean"

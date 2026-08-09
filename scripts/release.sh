@@ -70,8 +70,8 @@ validate_archive_paths() {
   fi
   awk '
     { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ && path !~ /^(bin|docs|test)\// { exit 1 }
-  ' "$listing" || fail "$archive contains a file outside bin/, docs/, or test/"
+    path != "" && path !~ /\/$/ && path !~ /^bin\// { exit 1 }
+  ' "$listing" || fail "$archive contains a file outside bin/"
 }
 
 validate_bundle() {
@@ -111,10 +111,6 @@ validate_bundle() {
   done
   [ -x "$extract/bin/cloud-hypervisor" ] \
     || fail "$archive is missing executable bin/cloud-hypervisor"
-  for file in docs/sandboxer.md docs/sandbox.md docs/sandbox-init.md \
-    docs/cloud-hypervisor.md; do
-    [ -f "$extract/$file" ] || fail "$archive is missing $file"
-  done
 }
 
 package_release() {
@@ -138,10 +134,6 @@ package_release() {
   copy_executable "$bin_dir/cloud-hypervisor" bin/cloud-hypervisor
   check_go_binary "$STAGE/bin/sandbox-ctl"
   check_go_binary "$STAGE/bin/sandbox-init"
-  copy_file README.md docs/sandboxer.md
-  copy_file docs/sandbox.md docs/sandbox.md
-  copy_file docs/sandbox-init.md docs/sandbox-init.md
-  copy_file docs/cloud-hypervisor.md docs/cloud-hypervisor.md
 
   mkdir -p "$output/assets"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
@@ -150,7 +142,7 @@ package_release() {
   cat > "$output/release-notes.md" <<EOF
 $NAME $version for Linux $arch.
 
-Extract the archive into a Kuasar Sandbox deployment root and verify it with \`SHA256SUMS\`. GitHub provides the source archives for this tag automatically.
+Extract the archive into a Kuasar Sandbox deployment root and verify it with \`SHA256SUMS\`. Documentation and E2E suites from this exact tag are collected by the aggregate platform release.
 EOF
   validate_bundle "$version" "$arch" "$output"
   echo "==> prepared $output for $version"
