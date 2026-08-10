@@ -21,6 +21,14 @@ repack_bundle() {
   (cd "$bundle/assets" && sha256sum "$ARCHIVE_NAME" > SHA256SUMS)
 }
 
+repack_bundle_with_conflicting_owner_names() {
+  local bundle="$1" root="$2" archive
+  archive="$bundle/assets/$ARCHIVE_NAME"
+  tar --sort=name --owner='nobody:0' --group='nogroup:0' --mtime="@1700000000" \
+    --pax-option=delete=atime,delete=ctime -czf "$archive" -C "$root" .
+  (cd "$bundle/assets" && sha256sum "$ARCHIVE_NAME" > SHA256SUMS)
+}
+
 expect_invalid_archive() {
   local bundle="$1" description="$2"
   if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$bundle" >/dev/null 2>&1; then
@@ -107,6 +115,11 @@ chmod 0777 "$TMP/mode-root/bin"
 cp -a "$TMP/bundle" "$TMP/mode-bundle"
 repack_bundle "$TMP/mode-bundle" "$TMP/mode-root"
 expect_invalid_archive "$TMP/mode-bundle" "unexpected archive permissions"
+
+cp -a "$TMP/bundle" "$TMP/conflicting-owner-bundle"
+repack_bundle_with_conflicting_owner_names "$TMP/conflicting-owner-bundle" "$TMP/archive-root"
+expect_invalid_archive "$TMP/conflicting-owner-bundle" \
+  "root numeric IDs paired with non-root owner names"
 
 if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package 01.2.3 x86_64 \
   "$TMP/invalid-version" >/dev/null 2>&1; then

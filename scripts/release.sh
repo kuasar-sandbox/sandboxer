@@ -60,11 +60,15 @@ check_go_binary() {
 
 validate_archive_paths() {
   local archive="$1" listing="$WORK/listing" metadata="$WORK/archive-metadata"
+  local numeric_listing="$WORK/archive-numeric-listing" named_listing="$WORK/archive-named-listing"
   local expected_entries="$WORK/expected-archive-entries"
   local actual_entries="$WORK/actual-archive-entries"
   LC_ALL=C tar --quoting-style=escape -tzf "$archive" > "$listing"
-  LC_ALL=C tar --numeric-owner --quoting-style=escape -tvzf "$archive" \
-    | awk '{ print $1 " " $2 }' > "$metadata"
+  LC_ALL=C tar --numeric-owner --quoting-style=escape -tvzf "$archive" > "$numeric_listing"
+  LC_ALL=C tar --quoting-style=escape -tvzf "$archive" > "$named_listing"
+  cmp -s "$numeric_listing" "$named_listing" \
+    || fail "$archive contains owner names inconsistent with numeric IDs"
+  awk '{ print $1 " " $2 }' "$numeric_listing" > "$metadata"
   awk '
     /^\// { exit 1 }
     { path=$0; sub(/^\.\//, "", path); if (path ~ /(^|\/)\.\.($|\/)/) exit 1 }
