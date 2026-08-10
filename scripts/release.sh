@@ -58,20 +58,10 @@ check_go_binary() {
     || fail "Go build info is missing from $file"
 }
 
-validate_archive_paths() {
-  local archive="$1" listing="$WORK/listing"
-  tar -tzf "$archive" > "$listing"
-  awk '
-    /^\// { exit 1 }
-    { path=$0; sub(/^\.\//, "", path); if (path ~ /(^|\/)\.\.($|\/)/) exit 1 }
-  ' "$listing" || fail "$archive contains an unsafe path"
-  if grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' "$listing" >/dev/null; then
-    fail "$archive contains release metadata JSON"
-  fi
-  awk '
-    { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ && path !~ /^bin\// { exit 1 }
-  ' "$listing" || fail "$archive contains a file outside bin/"
+validate_archive_contract() {
+  local archive="$1"
+  go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
+    || fail "$archive violates the exact entry contract"
 }
 
 validate_bundle() {
@@ -99,7 +89,7 @@ validate_bundle() {
   (cd "$bundle/assets" && sha256sum --quiet -c SHA256SUMS) \
     || fail "SHA256SUMS validation failed"
 
-  validate_archive_paths "$bundle/assets/$archive"
+  validate_archive_contract "$bundle/assets/$archive"
   local extract="$WORK/extract"
   rm -rf "$extract"
   mkdir -p "$extract"
@@ -127,7 +117,7 @@ package_release() {
 
   STAGE="$WORK/stage"
   rm -rf "$STAGE"
-  mkdir -p "$STAGE"
+  install -d -m 0755 "$STAGE" "$STAGE/bin"
   bin_dir="${RELEASE_BIN_DIR:-$ROOT/bin/$arch}"
   copy_executable "$bin_dir/sandbox-ctl" bin/sandbox-ctl
   copy_executable "$bin_dir/sandbox-init" bin/sandbox-init
