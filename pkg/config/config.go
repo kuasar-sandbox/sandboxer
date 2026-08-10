@@ -218,22 +218,16 @@ type AllocatableConfig struct {
 // Both fields are optional; their presence selects deployment mode.
 type ControlConfig struct {
 	// CgroupPath is the absolute path of an existing cgroup directory.
-	// sandbox-ctl joins this cgroup (writes limits + adds self PID); it
-	// never creates the directory and never rmdir on exit. Empty disables
-	// all cgroup operations (no-cgroup mode).
+	// sandbox-ctl writes limits there and creates only the VMM process in it;
+	// it never creates the directory or removes it on exit. Empty disables all
+	// cgroup operations (no-cgroup mode).
 	CgroupPath string `yaml:"cgroup_path,omitempty"`
+	// CgroupFD is an inherited runtime capability backing CgroupPath. It is
+	// never serialized; zero means sandbox-ctl should open CgroupPath itself.
+	CgroupFD int `yaml:"-"`
 	// Controller is the UDS path of a sandbox-resource-control protocol
 	// endpoint. Non-empty enables dynamic mode (M2+). Requires CgroupPath.
 	Controller string `yaml:"controller,omitempty"`
-	// Adopt makes sandbox-ctl ADOPT the cgroup it is already a member of
-	// (e.g. its systemd unit's cgroup): it writes limits to that cgroup but
-	// does NOT move any process into it — CH is forked as a child and
-	// inherits membership. Set by --cgroup-adopt, which also resolves
-	// CgroupPath from /proc/self/cgroup. NOTE: in adopt mode sandbox-ctl
-	// shares the limited cgroup with CH, re-exposing the memory.high
-	// throttle-deadlock the non-adopt path avoids (see cgroup.go header);
-	// omit --cgroup-adopt to fall back to the decoupled path.
-	Adopt bool `yaml:"adopt,omitempty"`
 	// Sensor tunes the per-sandbox memory pressure sensor (data source +
 	// reaction). Optional; nil = use PSI mode with default thresholds.
 	Sensor *SensorConfig `yaml:"sensor,omitempty"`
@@ -1005,7 +999,8 @@ func (c *SandboxConfig) DiffSizeBytes() (int64, error) {
 //   - Startup requires Controller
 //   - allocatable.cpu == capacity.cpu when CgroupPath is empty (no
 //     fractional CPU without cgroup)
-//   - CgroupPath must exist on the host filesystem
+//   - CgroupPath must exist on the host filesystem unless a validated inherited
+//     CgroupFD is authoritative
 //   - Startup.memory ∈ [allocatable.memory, capacity.memory]
 //   - WatermarkHigh.memory ∈ (0, allocatable.memory]
 func (c *SandboxConfig) ValidateCold() error {
@@ -1054,14 +1049,38 @@ func (c *SandboxConfig) ValidateCold() error {
 			c.Resources.Capacity.CPU, c.Resources.Allocatable.CPU)
 	}
 
-	// CgroupPath existence
+	// Cgroup target. An inherited descriptor is the placement authority; its
+	// resolved path is retained only as the cross-process controller identity.
 	if cgroupSet {
-		st, err := os.Stat(c.Resources.Control.CgroupPath)
-		if err != nil {
-			return fmt.Errorf("resources.control.cgroup_path %q does not exist: %w", c.Resources.Control.CgroupPath, err)
+		if !filepath.IsAbs(c.Resources.Control.CgroupPath) {
+			return fmt.Errorf("resources.control.cgroup_path must be absolute: %q", c.Resources.Control.CgroupPath)
 		}
-		if !st.IsDir() {
-			return fmt.Errorf("resources.control.cgroup_path %q is not a directory", c.Resources.Control.CgroupPath)
+		if fd := c.Resources.Control.CgroupFD; fd != 0 {
+			if fd < 3 {
+				return fmt.Errorf("resources.control.cgroup fd must be >= 3, got %d", fd)
+			}
+			var st unix.Stat_t
+			if err := unix.Fstat(fd, &st); err != nil {
+				return fmt.Errorf("resources.control.cgroup fd %d: %w", fd, err)
+			}
+			if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+				return fmt.Errorf("resources.control.cgroup fd %d is not a directory", fd)
+			}
+			var fs unix.Statfs_t
+			if err := unix.Fstatfs(fd, &fs); err != nil {
+				return fmt.Errorf("resources.control.cgroup fd %d statfs: %w", fd, err)
+			}
+			if fs.Type != unix.CGROUP2_SUPER_MAGIC {
+				return fmt.Errorf("resources.control.cgroup fd %d is not on cgroup v2", fd)
+			}
+		} else {
+			st, err := os.Stat(c.Resources.Control.CgroupPath)
+			if err != nil {
+				return fmt.Errorf("resources.control.cgroup_path %q does not exist: %w", c.Resources.Control.CgroupPath, err)
+			}
+			if !st.IsDir() {
+				return fmt.Errorf("resources.control.cgroup_path %q is not a directory", c.Resources.Control.CgroupPath)
+			}
 		}
 	}
 

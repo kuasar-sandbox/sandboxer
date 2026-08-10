@@ -137,12 +137,12 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// Initial memory.high uses the configured allocatable; the value gets
 	// bumped after we derive allocatable_at_snapshot from the bundle's
 	// state.json balloon (below).
-	cg, err := resctl.JoinCgroupForConfig(opts.HostCfg)
+	cg, err := resctl.SetupCgroupForConfig(opts.HostCfg)
 	if err != nil {
 		return -1, fmt.Errorf("cgroup: %w", err)
 	}
 	if cg.Active() {
-		logf("cgroup limits set: %s (CH joins on start; sandbox-ctl stays out)", cg.Path)
+		logf("cgroup limits set: %s (CH starts in cgroup; sandbox-ctl stays out)", cg.Path)
 	}
 	defer func() { _ = cg.Cleanup() }()
 
@@ -168,7 +168,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// Balloon-nil as no-op on the balloon side.
 	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
 		SocketPath: opts.HostCfg.Resources.Control.Controller,
-		CgroupPath: opts.HostCfg.Resources.Control.CgroupPath,
+		CgroupPath: cg.LocalPath(),
 		Logf:       logf,
 	}, opts.HostCfg)
 	if err != nil {
@@ -646,7 +646,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			}
 			// Restore-path settled trigger (docs/sandbox.md §10.1):
 			// restore_ack is the controller's equivalent of cold-start
-			// hello. Writes memory.high (deferred from JoinCgroup —
+			// hello. Writes memory.high (deferred from SetupCgroup —
 			// Issue 4) using allocatable_now; corrects balloon only when
 			// initialAlloc != allocAtSnap.
 			if pc.Hooks != nil {

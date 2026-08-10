@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"log"
 	"os"
 	"strconv"
@@ -51,8 +50,7 @@ func runCmd(args []string) int {
 	refLocations := config.RefLocations{}
 	fs.Var(refLocations, "ref-location", "trusted ref location name=file:///absolute/path (repeatable)")
 
-	cgroupPath := fs.String("cgroup-path", "", "absolute cgroup v2 directory to join (must already exist); empty = no cgroup")
-	cgroupAdopt := fs.Bool("cgroup-adopt", false, "adopt the cgroup sandbox-ctl is already in (its systemd unit's cgroup): write limits there, do NOT move CH; resolves the cgroup path from /proc/self/cgroup")
+	cgroupPath := fs.String("cgroup-path", "", "existing cgroup v2 target: absolute path or inherited fd=N; empty = no cgroup")
 	statsJSON := fs.String("stats-json", "", "if set, write per-backend + uffd stats as JSON to this path on shutdown")
 	readyFD := fs.Int("ready-fd", -1, "write control_ready and ready events to an inherited fd")
 
@@ -252,16 +250,16 @@ func runCmd(args []string) int {
 
 	// cgroup overrides.
 	if *cgroupPath != "" {
-		cfg.Resources.Control.CgroupPath = *cgroupPath
-	}
-	if *cgroupAdopt {
-		p, perr := resctl.SelfCgroupV2Path()
-		if perr != nil {
-			fmt.Fprintf(os.Stderr, "[sandbox-ctl] --cgroup-adopt: %v\n", perr)
+		resolved, inherited, rerr := resolveCgroupPathArg(*cgroupPath)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "[sandbox-ctl] --cgroup-path: %v\n", rerr)
 			return 1
 		}
-		cfg.Resources.Control.CgroupPath = p
-		cfg.Resources.Control.Adopt = true
+		if inherited != nil {
+			defer inherited.Close()
+			cfg.Resources.Control.CgroupFD = int(inherited.Fd())
+		}
+		cfg.Resources.Control.CgroupPath = resolved
 	}
 
 	restoreR := *restoreRef

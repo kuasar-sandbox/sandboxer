@@ -164,14 +164,12 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		balloonCtl = resctl.NewBalloonController(chSock, capBytes, logf)
 	}
 
-	// Controller handshake (dynamic mode) — must happen before cgroup write
-	// so that the controller-granted initial allocatable can override
-	// the static startup-burst value when degraded. Balloon is injected
-	// here so any later OnAllocatableChanged / SettledRestore call routes
-	// through balloonCtl rather than opening its own HTTP path.
+	// Controller handshake (dynamic mode) happens before cgroup writes so a
+	// rejected admission leaves no local resource side effects. Admit carries
+	// the resolved host cgroup path from cfg; local I/O is pinned to the stable
+	// cgroup descriptor after SetupCgroup below.
 	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
 		SocketPath: opts.Cfg.Resources.Control.Controller,
-		CgroupPath: opts.Cfg.Resources.Control.CgroupPath,
 		Logf:       logf,
 		Balloon:    balloonCtl,
 	}, opts.Cfg)
@@ -195,11 +193,17 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if balloonCtl != nil {
 		balloonCtl.SeedAppliedAllocatable(initialAllocBytes)
 	}
-	defer hooks.Release("normal")
 
-	// cgroup join. CgroupPath empty → no-cgroup mode, no cgroup operations.
+	// CgroupPath empty → no-cgroup mode, no cgroup operations.
 	// CgroupPath set → join existing cgroup (must already exist; not
 	// created by sandbox-ctl). See docs/sandbox.md §4.1.
+	var cg *resctl.CgroupController
+	defer func() {
+		hooks.Release("normal")
+		if cg != nil {
+			_ = cg.Cleanup()
+		}
+	}()
 	cgCfg, err := resctl.BuildCgroupConfig(opts.Cfg)
 	if err != nil {
 		return -1, err
@@ -213,18 +217,18 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// memory.max remains the hard ceiling during boot; memory.high gets
 	// written by Settled() once the boot transient is past.
 	cgCfg.MemoryHighBytes = 0
-	cg, err := resctl.JoinCgroup(cgCfg)
+	cg, err = resctl.SetupCgroup(cgCfg)
 	if err != nil {
 		return -1, fmt.Errorf("cgroup: %w", err)
 	}
+	hooks.SetLocalCgroupPath(cg.LocalPath())
 	if cg.Active() {
-		logf("cgroup limits set: %s memory.max=%d memory.high=%d cpu.max=%dus/100000us cpu.weight=%d (CH joins on start; sandbox-ctl stays out)",
+		logf("cgroup limits set: %s memory.max=%d memory.high=%d cpu.max=%dus/100000us cpu.weight=%d (CH starts in cgroup; sandbox-ctl stays out)",
 			cg.Path, cgCfg.MemoryMaxBytes, cgCfg.MemoryHighBytes,
 			cgCfg.CPUMaxQuotaUs, cgCfg.CPUWeight)
 	} else {
 		logf("cgroup: no path configured, running without cgroup limits (no-cgroup mode)")
 	}
-	defer func() { _ = cg.Cleanup() }()
 
 	// Use the caller-owned read-side fetcher when a disk uses manifest://.
 	// The CLI wrapper creates cache/store clients only on its first actual
