@@ -284,14 +284,16 @@ func runExecOverConnWithRemoteRedaction(c net.Conn, spec proto.ExecSpec, stdioMo
 		}
 	}()
 
-	// Terminate as soon as the guest reports the command's exit status
-	// (it is sent after every stdout/stderr/pty EOF, so output is fully
-	// delivered by then). Waiting on sess.Done() instead would hang
-	// until the vsock conn close propagates through CH's hybrid-vsock
-	// proxy, which only happens on further I/O. sess.Done() remains the
-	// fallback for a genuinely lost connection.
+	// The guest sends EXIT_STATUS after every stdout/stderr/pty EOF, then
+	// immediately performs the guest-initiated MUX_CLOSE handshake. Do not
+	// return in between those two control frames: closing here would prevent
+	// this host-side Session from ACKing MUX_CLOSE and would let a following
+	// short exec overlap the previous vsock teardown. The MUX_CLOSE handler
+	// writes the ACK and closes our conn itself, so Done is a local protocol
+	// barrier; it does not wait for CH to propagate a remote orderly close.
 	select {
 	case <-sess.ExitReceived():
+		<-sess.Done()
 	case <-sess.Done():
 	}
 	signal.Stop(sigCh)
