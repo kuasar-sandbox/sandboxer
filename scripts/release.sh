@@ -58,33 +58,10 @@ check_go_binary() {
     || fail "Go build info is missing from $file"
 }
 
-validate_archive_paths() {
-  local archive="$1" listing="$WORK/listing" metadata="$WORK/archive-metadata"
-  local numeric_listing="$WORK/archive-numeric-listing" named_listing="$WORK/archive-named-listing"
-  local expected_entries="$WORK/expected-archive-entries"
-  local actual_entries="$WORK/actual-archive-entries"
-  LC_ALL=C tar --quoting-style=escape -tzf "$archive" > "$listing"
-  LC_ALL=C tar --numeric-owner --quoting-style=escape -tvzf "$archive" > "$numeric_listing"
-  LC_ALL=C tar --quoting-style=escape -tvzf "$archive" > "$named_listing"
-  cmp -s "$numeric_listing" "$named_listing" \
-    || fail "$archive contains owner names inconsistent with numeric IDs"
-  awk '{ print $1 " " $2 }' "$numeric_listing" > "$metadata"
-  awk '
-    /^\// { exit 1 }
-    { path=$0; sub(/^\.\//, "", path); if (path ~ /(^|\/)\.\.($|\/)/) exit 1 }
-  ' "$listing" || fail "$archive contains an unsafe path"
-  if grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' "$listing" >/dev/null; then
-    fail "$archive contains release metadata JSON"
-  fi
-  printf '%s\t%s\n' \
-    'drwxr-xr-x 0/0' './' \
-    'drwxr-xr-x 0/0' './bin/' \
-    '-rwxr-xr-x 0/0' './bin/cloud-hypervisor' \
-    '-rwxr-xr-x 0/0' './bin/sandbox-ctl' \
-    '-rwxr-xr-x 0/0' './bin/sandbox-init' | LC_ALL=C sort > "$expected_entries"
-  paste "$metadata" "$listing" | LC_ALL=C sort > "$actual_entries"
-  cmp -s "$expected_entries" "$actual_entries" \
-    || { diff -u "$expected_entries" "$actual_entries" >&2 || true; fail "$archive violates the exact entry contract"; }
+validate_archive_contract() {
+  local archive="$1"
+  go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
+    || fail "$archive violates the exact entry contract"
 }
 
 validate_bundle() {
@@ -112,7 +89,7 @@ validate_bundle() {
   (cd "$bundle/assets" && sha256sum --quiet -c SHA256SUMS) \
     || fail "SHA256SUMS validation failed"
 
-  validate_archive_paths "$bundle/assets/$archive"
+  validate_archive_contract "$bundle/assets/$archive"
   local extract="$WORK/extract"
   rm -rf "$extract"
   mkdir -p "$extract"

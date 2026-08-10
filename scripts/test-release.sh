@@ -21,10 +21,10 @@ repack_bundle() {
   (cd "$bundle/assets" && sha256sum "$ARCHIVE_NAME" > SHA256SUMS)
 }
 
-repack_bundle_with_conflicting_owner_names() {
-  local bundle="$1" root="$2" archive
+repack_bundle_with_owner_names() {
+  local bundle="$1" root="$2" owner="$3" group="$4" archive
   archive="$bundle/assets/$ARCHIVE_NAME"
-  tar --sort=name --owner='nobody:0' --group='nogroup:0' --mtime="@1700000000" \
+  tar --sort=name --owner="$owner" --group="$group" --mtime="@1700000000" \
     --pax-option=delete=atime,delete=ctime -czf "$archive" -C "$root" .
   (cd "$bundle/assets" && sha256sum "$ARCHIVE_NAME" > SHA256SUMS)
 }
@@ -117,9 +117,16 @@ repack_bundle "$TMP/mode-bundle" "$TMP/mode-root"
 expect_invalid_archive "$TMP/mode-bundle" "unexpected archive permissions"
 
 cp -a "$TMP/bundle" "$TMP/conflicting-owner-bundle"
-repack_bundle_with_conflicting_owner_names "$TMP/conflicting-owner-bundle" "$TMP/archive-root"
+repack_bundle_with_owner_names \
+  "$TMP/conflicting-owner-bundle" "$TMP/archive-root" 'nobody:0' 'nogroup:0'
 expect_invalid_archive "$TMP/conflicting-owner-bundle" \
   "root numeric IDs paired with non-root owner names"
+
+cp -a "$TMP/bundle" "$TMP/numeric-owner-name-bundle"
+repack_bundle_with_owner_names \
+  "$TMP/numeric-owner-name-bundle" "$TMP/archive-root" '0:0' '0:0'
+expect_invalid_archive "$TMP/numeric-owner-name-bundle" \
+  "literal numeric owner names paired with root numeric IDs"
 
 if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package 01.2.3 x86_64 \
   "$TMP/invalid-version" >/dev/null 2>&1; then
