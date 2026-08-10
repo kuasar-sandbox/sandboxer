@@ -61,6 +61,34 @@ func TestLoad_ValidCold(t *testing.T) {
 	}
 }
 
+func TestValidateCold_InheritedCgroupFDIsAuthoritative(t *testing.T) {
+	target, err := os.Open("/sys/fs/cgroup")
+	if err != nil {
+		t.Skipf("open cgroup v2 root: %v", err)
+	}
+	defer target.Close()
+
+	cfg, err := Load(writeYAML(t, minimalCold))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Resources.Control.CgroupPath = "/resolved/cgroup/path/no-longer-visible"
+	cfg.Resources.Control.CgroupFD = int(target.Fd())
+	if err := cfg.ValidateCold(); err != nil {
+		t.Fatalf("ValidateCold rejected valid inherited cgroup: %v", err)
+	}
+
+	nonCgroup, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nonCgroup.Close()
+	cfg.Resources.Control.CgroupFD = int(nonCgroup.Fd())
+	if err := cfg.ValidateCold(); err == nil || !strings.Contains(err.Error(), "not on cgroup v2") {
+		t.Fatalf("ValidateCold non-cgroup fd error = %v", err)
+	}
+}
+
 func TestValidateCold_TapFDSocket(t *testing.T) {
 	cfg, err := Load(writeYAML(t, strings.Replace(minimalCold, "  tap: tap0", `  tapfd:
     socket: /run/kuasar/connector/sw0/tapfd.sock

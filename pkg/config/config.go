@@ -999,7 +999,8 @@ func (c *SandboxConfig) DiffSizeBytes() (int64, error) {
 //   - Startup requires Controller
 //   - allocatable.cpu == capacity.cpu when CgroupPath is empty (no
 //     fractional CPU without cgroup)
-//   - CgroupPath must exist on the host filesystem
+//   - CgroupPath must exist on the host filesystem unless a validated inherited
+//     CgroupFD is authoritative
 //   - Startup.memory ∈ [allocatable.memory, capacity.memory]
 //   - WatermarkHigh.memory ∈ (0, allocatable.memory]
 func (c *SandboxConfig) ValidateCold() error {
@@ -1048,17 +1049,38 @@ func (c *SandboxConfig) ValidateCold() error {
 			c.Resources.Capacity.CPU, c.Resources.Allocatable.CPU)
 	}
 
-	// CgroupPath existence
+	// Cgroup target. An inherited descriptor is the placement authority; its
+	// resolved path is retained only as the cross-process controller identity.
 	if cgroupSet {
 		if !filepath.IsAbs(c.Resources.Control.CgroupPath) {
 			return fmt.Errorf("resources.control.cgroup_path must be absolute: %q", c.Resources.Control.CgroupPath)
 		}
-		st, err := os.Stat(c.Resources.Control.CgroupPath)
-		if err != nil {
-			return fmt.Errorf("resources.control.cgroup_path %q does not exist: %w", c.Resources.Control.CgroupPath, err)
-		}
-		if !st.IsDir() {
-			return fmt.Errorf("resources.control.cgroup_path %q is not a directory", c.Resources.Control.CgroupPath)
+		if fd := c.Resources.Control.CgroupFD; fd != 0 {
+			if fd < 3 {
+				return fmt.Errorf("resources.control.cgroup fd must be >= 3, got %d", fd)
+			}
+			var st unix.Stat_t
+			if err := unix.Fstat(fd, &st); err != nil {
+				return fmt.Errorf("resources.control.cgroup fd %d: %w", fd, err)
+			}
+			if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+				return fmt.Errorf("resources.control.cgroup fd %d is not a directory", fd)
+			}
+			var fs unix.Statfs_t
+			if err := unix.Fstatfs(fd, &fs); err != nil {
+				return fmt.Errorf("resources.control.cgroup fd %d statfs: %w", fd, err)
+			}
+			if fs.Type != unix.CGROUP2_SUPER_MAGIC {
+				return fmt.Errorf("resources.control.cgroup fd %d is not on cgroup v2", fd)
+			}
+		} else {
+			st, err := os.Stat(c.Resources.Control.CgroupPath)
+			if err != nil {
+				return fmt.Errorf("resources.control.cgroup_path %q does not exist: %w", c.Resources.Control.CgroupPath, err)
+			}
+			if !st.IsDir() {
+				return fmt.Errorf("resources.control.cgroup_path %q is not a directory", c.Resources.Control.CgroupPath)
+			}
 		}
 	}
 
