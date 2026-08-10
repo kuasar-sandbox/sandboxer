@@ -59,8 +59,9 @@ check_go_binary() {
 }
 
 validate_archive_paths() {
-  local archive="$1" listing="$WORK/listing"
+  local archive="$1" listing="$WORK/listing" verbose_listing="$WORK/verbose-listing"
   tar -tzf "$archive" > "$listing"
+  tar -tvzf "$archive" > "$verbose_listing"
   awk '
     /^\// { exit 1 }
     { path=$0; sub(/^\.\//, "", path); if (path ~ /(^|\/)\.\.($|\/)/) exit 1 }
@@ -68,18 +69,26 @@ validate_archive_paths() {
   if grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' "$listing" >/dev/null; then
     fail "$archive contains release metadata JSON"
   fi
-  local expected_files="$WORK/expected-archive-files"
-  local actual_files="$WORK/actual-archive-files"
+  local expected_entries="$WORK/expected-archive-entries"
+  local actual_entries="$WORK/actual-archive-entries"
   printf '%s\n' \
-    bin/cloud-hypervisor \
-    bin/sandbox-ctl \
-    bin/sandbox-init > "$expected_files"
+    'd bin/' \
+    'f bin/cloud-hypervisor' \
+    'f bin/sandbox-ctl' \
+    'f bin/sandbox-init' > "$expected_entries"
   awk '
-    { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ { print path }
-  ' "$listing" | LC_ALL=C sort > "$actual_files"
-  cmp -s "$expected_files" "$actual_files" \
-    || { diff -u "$expected_files" "$actual_files" >&2 || true; fail "$archive contains an unexpected file set"; }
+    {
+      type=substr($1, 1, 1)
+      path=$NF
+      sub(/^\.\//, "", path)
+      if (path == "") next
+      if (type == "d") print "d " path
+      else if (type == "-") print "f " path
+      else print type " " path
+    }
+  ' "$verbose_listing" | LC_ALL=C sort > "$actual_entries"
+  cmp -s "$expected_entries" "$actual_entries" \
+    || { diff -u "$expected_entries" "$actual_entries" >&2 || true; fail "$archive contains unexpected entries or entry types"; }
 }
 
 validate_bundle() {

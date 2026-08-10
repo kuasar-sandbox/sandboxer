@@ -71,6 +71,17 @@ if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra-archive-file" >
   fail "validator accepted an unexpected file inside the archive"
 fi
 
+cp -a "$TMP/extra-archive-root" "$TMP/symlink-archive-root"
+rm "$TMP/symlink-archive-root/bin/unexpected" "$TMP/symlink-archive-root/bin/sandbox-init"
+ln -s sandbox-ctl "$TMP/symlink-archive-root/bin/sandbox-init"
+cp -a "$TMP/bundle" "$TMP/symlink-archive-file"
+symlink_archive="$TMP/symlink-archive-file/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz"
+tar -czf "$symlink_archive" -C "$TMP/symlink-archive-root" .
+(cd "$(dirname "$symlink_archive")" && sha256sum "$(basename "$symlink_archive")" > SHA256SUMS)
+if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/symlink-archive-file" >/dev/null 2>&1; then
+  fail "validator accepted a symlink in place of a release binary"
+fi
+
 if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package 01.2.3 x86_64 \
   "$TMP/invalid-version" >/dev/null 2>&1; then
   fail "packager accepted an invalid version"
