@@ -206,6 +206,48 @@ func TestSessionMuxCloseHandshake(t *testing.T) {
 	}
 }
 
+func TestSessionMuxCloseAckStopsInitiatorReadLoop(t *testing.T) {
+	initiatorConn, peerConn := net.Pipe()
+	defer initiatorConn.Close()
+	defer peerConn.Close()
+
+	initiator := NewSession(initiatorConn, PipeStreams(true, true, true), Options{})
+	defer initiator.Close()
+
+	peerDone := make(chan error, 1)
+	go func() {
+		frame, err := ReadFrame(peerConn)
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		if frame.Stream != StreamControl || frame.Type != FrameMuxClose {
+			peerDone <- errors.New("peer received a non-MUX_CLOSE frame")
+			return
+		}
+		peerDone <- WriteFrame(peerConn, Frame{Stream: StreamControl, Type: FrameMuxCloseAck})
+	}()
+
+	if err := initiator.InitMuxClose(); err != nil {
+		t.Fatalf("InitMuxClose: %v", err)
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("peer handshake: %v", err)
+	}
+
+	// The peer deliberately keeps its connection open. MUX_CLOSE_ACK is
+	// nevertheless terminal: the initiator must not begin another frame read
+	// that could race its Close and consume bytes from a reused raw fd.
+	select {
+	case <-initiator.Done():
+		if err := initiator.Err(); err != nil {
+			t.Fatalf("initiator Err after MUX_CLOSE_ACK: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initiator read loop continued after MUX_CLOSE_ACK")
+	}
+}
+
 func TestSessionExitStatus(t *testing.T) {
 	for _, code := range []int{0, 42, 137} {
 		// net.Pipe is synchronous: SendExitStatus blocks until the host

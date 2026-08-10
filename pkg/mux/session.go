@@ -123,9 +123,10 @@ func (s *Session) SetWinsize(cols, rows uint16) error {
 
 // InitMuxClose performs the guest-initiated graceful close handshake
 // (docs/sandbox-init.md §4.6): send MUX_CLOSE, then block until the
-// peer's MUX_CLOSE_ACK arrives (or the session ends). After this call
-// returns, data Writes are refused; the caller should then Close().
-// Frames arriving in the meantime are still processed normally.
+// peer's MUX_CLOSE_ACK arrives (or the session ends). MUX_CLOSE_ACK is
+// terminal for the read loop, so after this call returns no further Read can
+// race the caller's Close. Data Writes are refused from initiation onward;
+// frames arriving before the ACK are still processed normally.
 func (s *Session) InitMuxClose() error {
 	s.mu.Lock()
 	if s.closeInitiated {
@@ -267,6 +268,20 @@ func (s *Session) readLoop() {
 			s.setErr(err)
 			_ = s.conn.Close()
 			return
+		}
+		// MUX_CLOSE_ACK is the final frame for the initiator. The caller
+		// closes the connection after InitMuxClose returns, so the read loop
+		// must stop here rather than issue one more Read against a concurrently
+		// closing connection. In particular, raw-fd transports must never let
+		// a stale session read from a newly accepted connection that reused the
+		// same fd number.
+		if f.Type == FrameMuxCloseAck {
+			s.mu.Lock()
+			initiated := s.closeInitiated
+			s.mu.Unlock()
+			if initiated {
+				return
+			}
 		}
 	}
 }
