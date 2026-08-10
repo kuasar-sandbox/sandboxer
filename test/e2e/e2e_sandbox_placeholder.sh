@@ -15,9 +15,10 @@
 #   1. launch.placeholder boot without a virtio-net device
 #   2. the guest handshake + phase-2 fork accept a no-exec spec (no "kill init")
 #   3. no CH --net, guest has only lo, and vsock-backed exec still works
-#   4. PID 1 in the app ns is the placeholder (exec-child-placeholder argv)
-#   5. SIGTERM the anchor from an exec session → in-place restart, NOT reboot
-#   6. graceful stop (SIGTERM the run process) exits 0
+#   4. consecutive stdin exec sessions cross the complete MUX close barrier
+#   5. PID 1 in the app ns is the placeholder (exec-child-placeholder argv)
+#   6. SIGTERM the anchor from an exec session → in-place restart, NOT reboot
+#   7. graceful stop (SIGTERM the run process) exits 0
 #
 # Prerequisites (checked; missing → skip with a message, exit 0):
 #   /dev/kvm rw · bin/{cloud-hypervisor,sandbox-ctl,sandbox-init,
@@ -202,6 +203,39 @@ exec1 -- /bin/sh -c 'echo EXEC-OK-1; id; uname -sr' >"$WORK/x1.out" 2>&1 || true
 sed 's/^/    /' "$WORK/x1.out"
 grep -q EXEC-OK-1 "$WORK/x1.out" || { echo "==> FAIL: exec produced no marker"; tail -60 "$RUNLOG"; exit 1; }
 echo "==> PASS: exec ran inside the placeholder sandbox"
+
+# A command exit is followed by the guest-initiated MUX_CLOSE handshake. Drive
+# enough data to exceed the per-stream window, then immediately start the next
+# session: every sandbox-ctl exec must wait for the previous close barrier.
+echo "==> [1a] verify consecutive stdin exec sessions close cleanly"
+dd if=/dev/zero of="$WORK/exec.stdin" bs=1024 count=256 status=none
+EXEC_STDIN_HASH="$(sha256sum "$WORK/exec.stdin" | cut -d' ' -f1)"
+for i in {1..32}; do
+    if ! exec1 --stdin-from "$WORK/exec.stdin" -- /bin/sh -c \
+        'cat > /tmp/exec.stdin && sha256sum /tmp/exec.stdin' \
+        >"$WORK/exec.hash" 2>"$WORK/exec.err"; then
+        echo "==> FAIL: consecutive stdin exec $i failed"
+        sed 's/^/    /' "$WORK/exec.err"
+        tail -60 "$RUNLOG"
+        exit 1
+    fi
+    GUEST_HASH="$(cut -d' ' -f1 < "$WORK/exec.hash")"
+    [ "$GUEST_HASH" = "$EXEC_STDIN_HASH" ] || {
+        echo "==> FAIL: consecutive stdin exec $i produced hash $GUEST_HASH (want $EXEC_STDIN_HASH)"
+        if exec1 -- cat /tmp/exec.stdin >"$WORK/exec.received" 2>"$WORK/exec.received.err"; then
+            echo "==> source/received byte counts:"
+            wc -c "$WORK/exec.stdin" "$WORK/exec.received" | sed 's/^/    /'
+            echo "==> first differing byte positions (position source received):"
+            cmp -l "$WORK/exec.stdin" "$WORK/exec.received" | sed -n '1,16p' | sed 's/^/    /' || true
+        else
+            echo "==> failed to retrieve the guest input for comparison:"
+            sed 's/^/    /' "$WORK/exec.received.err"
+        fi
+        tail -60 "$RUNLOG"
+        exit 1
+    }
+done
+echo "==> PASS: 32 consecutive stdin exec sessions crossed their MUX close barriers"
 
 # ---- 2. PID 1 in the app ns is the placeholder ----------------------------
 echo "==> [2] verify PID 1 is the placeholder"

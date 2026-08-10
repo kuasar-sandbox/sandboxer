@@ -811,9 +811,10 @@ REQUEST 只能在清理确认后进入 guest,无需 retry、sleep 或延长 time
 2. **exec 会话结束**(§3.6)——exec 命令退出后,guest 在该会话 MUX 上**先把
    stdout/stderr/pty 全部 EOF**,**再发 `EXIT_STATUS`**(payload = 退出码,被信号杀
    为 128+signo),**然后**走同一套 guest 发起的 `MUX_CLOSE` 握手。host(`sandbox-ctl
-   exec`)收到 `EXIT_STATUS` 即得知命令退出码并据此结束、还原终端——**不依赖底层
-   连接关闭的传播**(经 CH hybrid-vsock 代理时,对端关闭往往要等下一次 I/O 才被
-   察觉,故用显式 `EXIT_STATUS` 帧而非"连接关掉"作为完成信号)。
+   exec`)收到 `EXIT_STATUS` 即得知命令退出码;继续处理紧随其后的 `MUX_CLOSE`,
+   回应 ACK 并关闭本端连接后再结束、还原终端。这个本地协议屏障**不依赖底层
+   对端连接关闭的传播**(经 CH hybrid-vsock 代理时,对端关闭往往要等下一次 I/O 才被
+   察觉,故用显式 `EXIT_STATUS` 帧而非"连接关掉"作为命令完成信号)。
 3. **ATTACH 流程**——host 拨新连接发 `attach`,guest 在回 `attach_ack` 之前先把
    **旧 MUX 连接**优雅关闭。兜底:旧 MUX 大概率正因 vsock 断了才触发重连,这时对它
    发 `MUX_CLOSE` 直接报错 → guest **降级为硬丢弃**旧连接,不阻塞 attach。统一逻辑:
