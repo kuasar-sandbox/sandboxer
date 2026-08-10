@@ -149,6 +149,16 @@ func (c *CgroupController) Active() bool {
 	return c != nil && c.active
 }
 
+// LocalPath returns a process-local stable path for cgroup file I/O. The path
+// remains pinned to the opened cgroup even if its host pathname is renamed or
+// replaced, and is valid until Cleanup.
+func (c *CgroupController) LocalPath() string {
+	if c == nil || !c.active || c.target == nil {
+		return ""
+	}
+	return fmt.Sprintf("/proc/self/fd/%d", c.target.Fd())
+}
+
 // ConfigureSysProcAttr makes the child start in the target cgroup via
 // clone3(CLONE_INTO_CGROUP). No-op in no-cgroup mode.
 func (c *CgroupController) ConfigureSysProcAttr(attr *syscall.SysProcAttr) error {

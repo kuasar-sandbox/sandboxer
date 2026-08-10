@@ -168,7 +168,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// Balloon-nil as no-op on the balloon side.
 	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
 		SocketPath: opts.HostCfg.Resources.Control.Controller,
-		CgroupPath: opts.HostCfg.Resources.Control.CgroupPath,
+		CgroupPath: cg.LocalPath(),
 		Logf:       logf,
 	}, opts.HostCfg)
 	if err != nil {

@@ -2147,6 +2147,10 @@ cpu.weight  ← clamp(round(allocatable.cpu × 100), 1, 10000)
 `clone3(CLONE_INTO_CGROUP)` 把 CH(且仅 CH)原子创建到该 cgroup。这样不存在
 `cmd.Start` 后迁移 PID 的竞态或早期内存记账偏差。
 
+该模式要求 Linux 5.7+ 提供 `CLONE_INTO_CGROUP`,且宿主 seccomp 策略允许
+`clone3`。任一条件不满足时 CH 启动直接失败;不会回退到启动后迁移 PID 或让
+sandbox-ctl 与 CH 共享资源 cgroup。
+
 guest 内存逼近 `memory.high` 时,内核节流只作用于 CH;sandbox-ctl 仍可正常调度、
 收发信号和回收 CH。否则 `mem_cgroup_handle_over_high` 可能将 sandbox-ctl 卡在
 TASK_KILLABLE D-state,使其既无法终止 CH,也无法 reap `cmd.Wait`。

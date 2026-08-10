@@ -91,6 +91,9 @@ func TestCgroupControllerConfiguresAtomicPlacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if local := cg.LocalPath(); !strings.HasPrefix(local, "/proc/self/fd/") {
+		t.Fatalf("LocalPath = %q, want stable descriptor path", local)
+	}
 	attr := &syscall.SysProcAttr{Setpgid: true}
 	if err := cg.ConfigureSysProcAttr(attr); err != nil {
 		t.Fatal(err)
@@ -101,8 +104,75 @@ func TestCgroupControllerConfiguresAtomicPlacement(t *testing.T) {
 	if err := cg.Cleanup(); err != nil {
 		t.Fatal(err)
 	}
+	if local := cg.LocalPath(); local != "" {
+		t.Fatalf("LocalPath after Cleanup = %q, want empty", local)
+	}
 	if err := cg.ConfigureSysProcAttr(&syscall.SysProcAttr{}); err == nil {
 		t.Fatal("closed controller accepted process configuration")
+	}
+}
+
+func TestCgroupLocalIOStaysPinnedAfterPathReplacement(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "vmm")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"memory.max":      "",
+		"memory.high":     "old",
+		"memory.current":  "123",
+		"memory.swap.max": "",
+		"cpu.max":         "",
+	} {
+		if err := os.WriteFile(filepath.Join(target, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cg, err := SetupCgroup(CgroupConfig{Path: target, MemoryMaxBytes: 1, CPUMaxQuotaUs: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cg.Cleanup()
+
+	moved := filepath.Join(root, "moved")
+	if err := os.Rename(target, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "memory.high"), []byte("replacement"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "memory.current"), []byte("456"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := makeMinimalCfg()
+	hooks := &ControllerHooks{
+		opts: ControllerHookOptions{CgroupPath: cg.LocalPath()},
+		cfg:  cfg,
+	}
+	if err := hooks.setMemoryHigh(256 << 20); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(moved, "memory.high"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "234881024" {
+		t.Fatalf("pinned memory.high = %q, want 234881024", got)
+	}
+	replacement, err := os.ReadFile(filepath.Join(target, "memory.high"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(replacement) != "replacement" {
+		t.Fatalf("replacement memory.high changed to %q", replacement)
+	}
+	if current := readMemoryCurrent(cg.LocalPath()); current != 123 {
+		t.Fatalf("pinned memory.current = %d, want 123", current)
 	}
 }
 

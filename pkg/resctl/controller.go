@@ -20,8 +20,10 @@ import (
 // cgroup memory.high, updates in-memory allocatable_now), but no
 // controller RPCs are issued and no Heartbeat/Sensor goroutines start.
 //
-// CgroupPath: directory used for memory.high writes and memory.current /
-// memory.events.local reads. Empty = no-cgroup mode.
+// CgroupPath: process-local stable directory used for memory.high writes and
+// memory.current / memory.events.local reads. Callers with an inherited cgroup
+// capability pass CgroupController.LocalPath so local I/O stays pinned to the
+// opened cgroup. Empty = no-cgroup mode.
 //
 // Balloon: the per-sandbox BalloonController owning /api/v1/vm.resize.
 // Hooks never speaks CH HTTP directly — every balloon change goes
@@ -73,6 +75,16 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		return nil, err
 	}
 	return h, nil
+}
+
+// SetLocalCgroupPath installs the stable process-local path used by cgroup
+// reads and writes. It must be called before Settled or background hooks start.
+// The host path carried to the resource controller remains cfg's CgroupPath.
+func (h *ControllerHooks) SetLocalCgroupPath(path string) {
+	if h == nil {
+		return
+	}
+	h.opts.CgroupPath = path
 }
 
 // Enabled reports whether dynamic-mode controller integration is in
