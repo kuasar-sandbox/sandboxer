@@ -141,16 +141,10 @@ sandbox-ctl run [flags]
                           (可写层必须落盘,不能用 tmpfs run 根)
 
   # 资源覆盖(运维临时调整)
-  --cgroup-path <path>    覆盖 control.cgroup_path:写到该已存在的 cgroup 绝对路径,
-                          并把 CH(仅 CH)move 进去
-  --cgroup-adopt          采纳 sandbox-ctl 自己所在的 cgroup(其 systemd 单元的
-                          cgroup):把资源上限写到该 cgroup,但**不**把 CH move 进去
-                          (CH 作为 fork 出的子进程已是成员,AddPID 成为 no-op)。
-                          cgroup 路径从 /proc/self/cgroup 解析(SelfCgroupV2Path),
-                          置 control.adopt(YAML `adopt: true`)。注意:adopt 模式
-                          让 sandbox-ctl 与 CH 同处一个 cgroup,重新暴露了常规解耦
-                          路径所规避的 memory.high 节流死锁(见 pkg/resctl/cgroup.go
-                          头注)——面向 run-sandbox 启动器路径
+  --cgroup-path <target>  覆盖 control.cgroup_path。target 是已存在的 cgroup v2
+                          绝对路径,或仅供启动器使用的继承描述符 `fd=N`。sandbox-ctl
+                          写入资源上限,并通过 CLONE_INTO_CGROUP 只把 CH 原子创建到
+                          目标 cgroup;自身始终留在外部控制 cgroup
 
   # 诊断
   --stats-json <path>     退出时把各 backend + uffd 统计以 JSON 写到该路径
@@ -1149,9 +1143,9 @@ working-set 生成与验证。这组 artifact 必须一起保留;缺任一层即
 | 超分密度提升 | ✗ | 有限(allocatable 必须保守) | ✓ allocatable 可贴近真实工作集 |
 
 切换模式通过加 / 减 sandbox.yaml 字段。`control.controller`(动态控制模式开关)
-只能在 sandbox.yaml 里设;命令行只在 cgroup 维度给运维一个临时覆盖入口
-(`--cgroup-path` 覆盖 cgroup_path;`--cgroup-adopt` 采纳 sandbox-ctl 自身所在的
-cgroup,见 §2.2 / §9.2)。
+只能在 sandbox.yaml 里设;命令行只在 cgroup 维度提供临时覆盖入口:
+`--cgroup-path` 接受绝对路径或启动器继承的 `fd=N`。`fd=N` 是进程运行时句柄,
+不能写入 YAML(见 §2.2 / §9.2)。
 
 ### 4.2 资源量
 
@@ -1195,7 +1189,7 @@ T3   准备 overlay diff:已存在→按 crypto.local policy 打开(绝不 trunc
      不存在→从 diff_template 的逻辑 sparse view 初始化 / 按 base 大小新建 blank upper;
      新文件编码由 crypto.local 决定(详见 §3.2.2)
 T4   动态控制模式:dial controller, send Admit, 收 grant 后继续(详见 §10)
-T5   cgroup setup:写 cgroup limits + 把自身 PID 加入 cgroup.procs
+T5   cgroup setup:打开目标 cgroup FD + 写 cgroup limits
      (后续 fork 的 CH 自然在同 cgroup)
 T6   memory 准备(统一模型,冷启动 + 恢复同):
      T6a memfd_create("sandbox-<sid>-ram", MFD_CLOEXEC | MFD_ALLOW_SEALING)
@@ -2148,19 +2142,14 @@ cpu.weight  ← clamp(round(allocatable.cpu × 100), 1, 10000)
 这套静态模型实现了"无竞争时给 capacity / 有竞争时给 floor",**完全不需要
 运行时调整 cpu.max,也不需要 CPU 维度的 burst/recover 状态机或 RPC**。
 
-**cgroup 归属:解耦(默认)vs 采纳(`--cgroup-adopt`)**。两种写法都把上面的
-memory/cpu 上限写到目标 cgroup,区别在于谁进这个 cgroup:
+**cgroup 归属固定解耦**。sandbox-ctl **从不**把自己加入沙箱资源 cgroup。
+它打开外部创建的 cgroup 目录,写入 memory/cpu 上限,并通过
+`clone3(CLONE_INTO_CGROUP)` 把 CH(且仅 CH)原子创建到该 cgroup。这样不存在
+`cmd.Start` 后迁移 PID 的竞态或早期内存记账偏差。
 
-- **解耦(默认,含 `--cgroup-path`)**:sandbox-ctl **从不**把自己加入沙箱
-  cgroup,只在 CH `exec.Start` 后用 `AddPID` 把 CH(且仅 CH)move 进去。
-  这样 guest 内存逼近 `memory.high` 触发的内核节流只压到 CH,sandbox-ctl 仍可
-  正常被调度、收发信号(否则 `mem_cgroup_handle_over_high` 会把 sandbox-ctl 卡在
-  TASK_KILLABLE D-state,既杀不了 CH 也 reap 不了 `cmd.Wait`,全盘死锁)。
-- **采纳(`--cgroup-adopt`)**:目标 cgroup 就是 sandbox-ctl 自身所在的(其
-  systemd 单元的)cgroup——上限写到该 cgroup,CH 作为 fork 出的子进程已是成员,
-  故 `AddPID` 成为 no-op。代价是 sandbox-ctl 与 CH 同处一个 cgroup,**重新暴露了
-  上面解耦路径所规避的 `memory.high` 节流死锁**(见 pkg/resctl/cgroup.go 头注)。
-  面向 run-sandbox 启动器路径(单元自身即沙箱 cgroup,无需预建)。
+guest 内存逼近 `memory.high` 时,内核节流只作用于 CH;sandbox-ctl 仍可正常调度、
+收发信号和回收 CH。否则 `mem_cgroup_handle_over_high` 可能将 sandbox-ctl 卡在
+TASK_KILLABLE D-state,使其既无法终止 CH,也无法 reap `cmd.Wait`。
 
 ### 9.3 balloon 配置与 BalloonController
 

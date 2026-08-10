@@ -218,22 +218,16 @@ type AllocatableConfig struct {
 // Both fields are optional; their presence selects deployment mode.
 type ControlConfig struct {
 	// CgroupPath is the absolute path of an existing cgroup directory.
-	// sandbox-ctl joins this cgroup (writes limits + adds self PID); it
-	// never creates the directory and never rmdir on exit. Empty disables
-	// all cgroup operations (no-cgroup mode).
+	// sandbox-ctl writes limits there and creates only the VMM process in it;
+	// it never creates the directory or removes it on exit. Empty disables all
+	// cgroup operations (no-cgroup mode).
 	CgroupPath string `yaml:"cgroup_path,omitempty"`
+	// CgroupFD is an inherited runtime capability backing CgroupPath. It is
+	// never serialized; zero means sandbox-ctl should open CgroupPath itself.
+	CgroupFD int `yaml:"-"`
 	// Controller is the UDS path of a sandbox-resource-control protocol
 	// endpoint. Non-empty enables dynamic mode (M2+). Requires CgroupPath.
 	Controller string `yaml:"controller,omitempty"`
-	// Adopt makes sandbox-ctl ADOPT the cgroup it is already a member of
-	// (e.g. its systemd unit's cgroup): it writes limits to that cgroup but
-	// does NOT move any process into it — CH is forked as a child and
-	// inherits membership. Set by --cgroup-adopt, which also resolves
-	// CgroupPath from /proc/self/cgroup. NOTE: in adopt mode sandbox-ctl
-	// shares the limited cgroup with CH, re-exposing the memory.high
-	// throttle-deadlock the non-adopt path avoids (see cgroup.go header);
-	// omit --cgroup-adopt to fall back to the decoupled path.
-	Adopt bool `yaml:"adopt,omitempty"`
 	// Sensor tunes the per-sandbox memory pressure sensor (data source +
 	// reaction). Optional; nil = use PSI mode with default thresholds.
 	Sensor *SensorConfig `yaml:"sensor,omitempty"`
@@ -1056,6 +1050,9 @@ func (c *SandboxConfig) ValidateCold() error {
 
 	// CgroupPath existence
 	if cgroupSet {
+		if !filepath.IsAbs(c.Resources.Control.CgroupPath) {
+			return fmt.Errorf("resources.control.cgroup_path must be absolute: %q", c.Resources.Control.CgroupPath)
+		}
 		st, err := os.Stat(c.Resources.Control.CgroupPath)
 		if err != nil {
 			return fmt.Errorf("resources.control.cgroup_path %q does not exist: %w", c.Resources.Control.CgroupPath, err)

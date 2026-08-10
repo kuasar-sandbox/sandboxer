@@ -213,12 +213,12 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// memory.max remains the hard ceiling during boot; memory.high gets
 	// written by Settled() once the boot transient is past.
 	cgCfg.MemoryHighBytes = 0
-	cg, err := resctl.JoinCgroup(cgCfg)
+	cg, err := resctl.SetupCgroup(cgCfg)
 	if err != nil {
 		return -1, fmt.Errorf("cgroup: %w", err)
 	}
 	if cg.Active() {
-		logf("cgroup limits set: %s memory.max=%d memory.high=%d cpu.max=%dus/100000us cpu.weight=%d (CH joins on start; sandbox-ctl stays out)",
+		logf("cgroup limits set: %s memory.max=%d memory.high=%d cpu.max=%dus/100000us cpu.weight=%d (CH starts in cgroup; sandbox-ctl stays out)",
 			cg.Path, cgCfg.MemoryMaxBytes, cgCfg.MemoryHighBytes,
 			cgCfg.CPUMaxQuotaUs, cgCfg.CPUWeight)
 	} else {
