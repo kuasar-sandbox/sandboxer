@@ -145,14 +145,22 @@ for i in $(seq 1 400); do
     kill -0 "$SBPID2" 2>/dev/null || break
     sleep 0.05
 done
-kill -TERM "$SBPID2" 2>/dev/null || true
-wait "$SBPID2" 2>/dev/null || true
+RESTORE_WAS_RUNNING=0
+if kill -0 "$SBPID2" 2>/dev/null; then
+    RESTORE_WAS_RUNNING=1
+    kill -TERM "$SBPID2" 2>/dev/null || true
+fi
+RESTORE_RC=0
+wait "$SBPID2" 2>/dev/null || RESTORE_RC=$?
 
-echo "==> restored app tick samples:"; grep -oE "^TICK [0-9]+ ID=[^ ]+" "$LOG2" | tail -5 | sed 's/^/    /'
+echo "==> restored app tick samples:"
+grep -oE "^TICK [0-9]+ ID=[^ ]+" "$LOG2" | tail -5 | sed 's/^/    /' || true
 if [ "$SEEN" = "1" ]; then
     echo "==> PASS: restored app saw injected per-instance file (ID=clone-42)"
     echo "==> e2e_sandbox_restore_files: OK"
 else
-    echo "==> FAIL: restored app never saw ID=clone-42 (injection did not reach the app)"
+    echo "==> FAIL: restored app never saw ID=clone-42 (running_before_stop=$RESTORE_WAS_RUNNING exit=$RESTORE_RC)"
+    echo "==> restore log tail:"
+    tail -100 "$LOG2" | sed 's/^/    /' || true
     exit 1
 fi
