@@ -59,9 +59,12 @@ check_go_binary() {
 }
 
 validate_archive_paths() {
-  local archive="$1" listing="$WORK/listing" verbose_listing="$WORK/verbose-listing"
-  tar -tzf "$archive" > "$listing"
-  tar -tvzf "$archive" > "$verbose_listing"
+  local archive="$1" listing="$WORK/listing" metadata="$WORK/archive-metadata"
+  local expected_entries="$WORK/expected-archive-entries"
+  local actual_entries="$WORK/actual-archive-entries"
+  LC_ALL=C tar --quoting-style=escape -tzf "$archive" > "$listing"
+  LC_ALL=C tar --numeric-owner --quoting-style=escape -tvzf "$archive" \
+    | awk '{ print $1 " " $2 }' > "$metadata"
   awk '
     /^\// { exit 1 }
     { path=$0; sub(/^\.\//, "", path); if (path ~ /(^|\/)\.\.($|\/)/) exit 1 }
@@ -69,26 +72,15 @@ validate_archive_paths() {
   if grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' "$listing" >/dev/null; then
     fail "$archive contains release metadata JSON"
   fi
-  local expected_entries="$WORK/expected-archive-entries"
-  local actual_entries="$WORK/actual-archive-entries"
-  printf '%s\n' \
-    'd bin/' \
-    'f bin/cloud-hypervisor' \
-    'f bin/sandbox-ctl' \
-    'f bin/sandbox-init' > "$expected_entries"
-  awk '
-    {
-      type=substr($1, 1, 1)
-      path=$NF
-      sub(/^\.\//, "", path)
-      if (path == "") next
-      if (type == "d") print "d " path
-      else if (type == "-") print "f " path
-      else print type " " path
-    }
-  ' "$verbose_listing" | LC_ALL=C sort > "$actual_entries"
+  printf '%s\t%s\n' \
+    'drwxr-xr-x 0/0' './' \
+    'drwxr-xr-x 0/0' './bin/' \
+    '-rwxr-xr-x 0/0' './bin/cloud-hypervisor' \
+    '-rwxr-xr-x 0/0' './bin/sandbox-ctl' \
+    '-rwxr-xr-x 0/0' './bin/sandbox-init' | LC_ALL=C sort > "$expected_entries"
+  paste "$metadata" "$listing" | LC_ALL=C sort > "$actual_entries"
   cmp -s "$expected_entries" "$actual_entries" \
-    || { diff -u "$expected_entries" "$actual_entries" >&2 || true; fail "$archive contains unexpected entries or entry types"; }
+    || { diff -u "$expected_entries" "$actual_entries" >&2 || true; fail "$archive violates the exact entry contract"; }
 }
 
 validate_bundle() {
@@ -144,7 +136,7 @@ package_release() {
 
   STAGE="$WORK/stage"
   rm -rf "$STAGE"
-  mkdir -p "$STAGE"
+  install -d -m 0755 "$STAGE" "$STAGE/bin"
   bin_dir="${RELEASE_BIN_DIR:-$ROOT/bin/$arch}"
   copy_executable "$bin_dir/sandbox-ctl" bin/sandbox-ctl
   copy_executable "$bin_dir/sandbox-init" bin/sandbox-init

@@ -11,6 +11,23 @@ fail() {
   exit 1
 }
 
+ARCHIVE_NAME=sandboxer-v1.2.3-linux-x86_64.tar.gz
+
+repack_bundle() {
+  local bundle="$1" root="$2" archive
+  archive="$bundle/assets/$ARCHIVE_NAME"
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@1700000000" \
+    --pax-option=delete=atime,delete=ctime -czf "$archive" -C "$root" .
+  (cd "$bundle/assets" && sha256sum "$ARCHIVE_NAME" > SHA256SUMS)
+}
+
+expect_invalid_archive() {
+  local bundle="$1" description="$2"
+  if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$bundle" >/dev/null 2>&1; then
+    fail "validator accepted $description"
+  fi
+}
+
 for entrypoint in test/e2e/e2e_sandbox_*.sh test/e2e/run_all.sh; do
   [ "$(git -C "$ROOT" ls-files -s -- "$entrypoint" | awk '{print $1}')" = 100755 ] \
     || fail "$entrypoint is not executable in the Git index"
@@ -32,16 +49,13 @@ bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/sandboxer v1.2.3 \
   1111111111111111111111111111111111111111
 
-archive="$TMP/bundle/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz"
-for path in ./bin/sandbox-ctl ./bin/sandbox-init ./bin/cloud-hypervisor; do
-  tar -tzf "$archive" | grep -Fx "$path" >/dev/null || fail "archive is missing $path"
-done
-if tar -tzf "$archive" | grep -E '^\./(docs|test/e2e)(/|$)' >/dev/null; then
-  fail "component archive contains documentation or E2E sources"
-fi
-if tar -tzf "$archive" | grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' >/dev/null; then
-  fail "archive contains release metadata JSON"
-fi
+archive="$TMP/bundle/assets/$ARCHIVE_NAME"
+printf '%s\n' ./ ./bin/ ./bin/cloud-hypervisor ./bin/sandbox-ctl ./bin/sandbox-init \
+  > "$TMP/expected-archive-entries"
+LC_ALL=C tar --quoting-style=escape -tzf "$archive" | LC_ALL=C sort \
+  > "$TMP/actual-archive-entries"
+cmp -s "$TMP/expected-archive-entries" "$TMP/actual-archive-entries" \
+  || fail "packager did not emit the exact archive entry set"
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
@@ -60,27 +74,39 @@ if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra" >/dev/null 2>&
   fail "validator accepted an extra asset"
 fi
 
-cp -a "$TMP/bundle" "$TMP/extra-archive-file"
-extra_archive="$TMP/extra-archive-file/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz"
-mkdir -p "$TMP/extra-archive-root"
-tar -xzf "$extra_archive" -C "$TMP/extra-archive-root"
-printf 'unexpected\n' > "$TMP/extra-archive-root/bin/unexpected"
-tar -czf "$extra_archive" -C "$TMP/extra-archive-root" .
-(cd "$(dirname "$extra_archive")" && sha256sum "$(basename "$extra_archive")" > SHA256SUMS)
-if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra-archive-file" >/dev/null 2>&1; then
-  fail "validator accepted an unexpected file inside the archive"
-fi
+mkdir -p "$TMP/archive-root"
+tar -xzf "$archive" -C "$TMP/archive-root"
 
-cp -a "$TMP/extra-archive-root" "$TMP/symlink-archive-root"
-rm "$TMP/symlink-archive-root/bin/unexpected" "$TMP/symlink-archive-root/bin/sandbox-init"
-ln -s sandbox-ctl "$TMP/symlink-archive-root/bin/sandbox-init"
-cp -a "$TMP/bundle" "$TMP/symlink-archive-file"
-symlink_archive="$TMP/symlink-archive-file/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz"
-tar -czf "$symlink_archive" -C "$TMP/symlink-archive-root" .
-(cd "$(dirname "$symlink_archive")" && sha256sum "$(basename "$symlink_archive")" > SHA256SUMS)
-if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/symlink-archive-file" >/dev/null 2>&1; then
-  fail "validator accepted a symlink in place of a release binary"
-fi
+cp -a "$TMP/archive-root" "$TMP/extra-file-root"
+printf 'unexpected\n' > "$TMP/extra-file-root/bin/unexpected"
+cp -a "$TMP/bundle" "$TMP/extra-file-bundle"
+repack_bundle "$TMP/extra-file-bundle" "$TMP/extra-file-root"
+expect_invalid_archive "$TMP/extra-file-bundle" "an unexpected regular file"
+
+cp -a "$TMP/archive-root" "$TMP/linked-binary-root"
+rm "$TMP/linked-binary-root/bin/sandbox-init"
+ln -s sandbox-ctl "$TMP/linked-binary-root/bin/sandbox-init"
+cp -a "$TMP/bundle" "$TMP/linked-binary-bundle"
+repack_bundle "$TMP/linked-binary-bundle" "$TMP/linked-binary-root"
+expect_invalid_archive "$TMP/linked-binary-bundle" "a symlink in place of a binary"
+
+cp -a "$TMP/archive-root" "$TMP/unexpected-link-root"
+ln -s ./ "$TMP/unexpected-link-root/unexpected-link"
+cp -a "$TMP/bundle" "$TMP/unexpected-link-bundle"
+repack_bundle "$TMP/unexpected-link-bundle" "$TMP/unexpected-link-root"
+expect_invalid_archive "$TMP/unexpected-link-bundle" "an unexpected symlink whose target masks its name"
+
+cp -a "$TMP/archive-root" "$TMP/extra-directory-root"
+mkdir "$TMP/extra-directory-root/etc"
+cp -a "$TMP/bundle" "$TMP/extra-directory-bundle"
+repack_bundle "$TMP/extra-directory-bundle" "$TMP/extra-directory-root"
+expect_invalid_archive "$TMP/extra-directory-bundle" "an unexpected directory"
+
+cp -a "$TMP/archive-root" "$TMP/mode-root"
+chmod 0777 "$TMP/mode-root/bin"
+cp -a "$TMP/bundle" "$TMP/mode-bundle"
+repack_bundle "$TMP/mode-bundle" "$TMP/mode-root"
+expect_invalid_archive "$TMP/mode-bundle" "unexpected archive permissions"
 
 if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package 01.2.3 x86_64 \
   "$TMP/invalid-version" >/dev/null 2>&1; then
