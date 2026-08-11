@@ -16,17 +16,25 @@ import (
 // the conn to a guest handler that does proto.ReadMessage / WriteMessage.
 type fakeCHProxy struct {
 	listener net.Listener
+	beforeOK func(net.Conn) bool
 	guestFn  func(net.Conn)
 	wg       sync.WaitGroup
 }
 
 func newFakeCHProxy(t *testing.T, basePath string, guestFn func(net.Conn)) *fakeCHProxy {
+	return newFakeCHProxyWithBeforeOK(t, basePath, nil, guestFn)
+}
+
+// newFakeCHProxyWithBeforeOK lets a test close selected connections after
+// receiving CONNECT but before CH's OK line. Returning true from beforeOK
+// makes the proxy drop that connection without handing it to the guest.
+func newFakeCHProxyWithBeforeOK(t *testing.T, basePath string, beforeOK func(net.Conn) bool, guestFn func(net.Conn)) *fakeCHProxy {
 	t.Helper()
 	l, err := net.Listen("unix", basePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &fakeCHProxy{listener: l, guestFn: guestFn}
+	p := &fakeCHProxy{listener: l, beforeOK: beforeOK, guestFn: guestFn}
 	p.wg.Add(1)
 	go p.accept()
 	return p
@@ -63,6 +71,9 @@ func (p *fakeCHProxy) handleConn(c net.Conn) {
 		}
 	}
 	if string(line) != "CONNECT 5000\n" {
+		return
+	}
+	if p.beforeOK != nil && p.beforeOK(c) {
 		return
 	}
 	// Mirror real CH hybrid vsock: reply "OK <localPort>\n" before
