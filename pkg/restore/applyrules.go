@@ -29,7 +29,12 @@ type SnapshotCfg struct {
 	// through snapshot/upload re-rendering, surfaced by info --json.
 	Metadata map[string]string `yaml:"metadata,omitempty"`
 	FromRefs []string          `yaml:"from_refs"` // memory chain below this bundle (§3.5)
-	Boot     struct {
+	Launch   struct {
+		// CgroupControl is guest topology, not host restore policy. It must
+		// survive restore so subsequent snapshots retain the same contract.
+		CgroupControl bool `yaml:"cgroup_control"`
+	} `yaml:"launch"`
+	Boot struct {
 		RuntimeRef string `yaml:"runtime_ref"`
 		Root       struct {
 			// overlay mode: BaseRef is the erofs image; Overlay carries the
@@ -88,8 +93,8 @@ func ParseSnapshotCfg(body []byte) (*SnapshotCfg, error) {
 // Capacity must match exactly when host provides it. Network may be omitted;
 // Run separately verifies that its presence matches the device topology in
 // config.json. boot.root.overlay.base in host yaml is silently ignored (always
-// taken from snapshot.cfg). boot.kernel / boot.cmdline / launch.* are silently
-// ignored.
+// taken from snapshot.cfg). boot.kernel / boot.cmdline and launch fields other
+// than snapshot-owned launch.cgroup_control are silently ignored.
 //
 // snapshotPath is the local file path of the <sid>.snapshot bundle
 // (used to resolve runtime/base file basenames). Pass empty when the
@@ -105,6 +110,7 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 		return nil, errors.New("ApplyRules: snapshot.cfg is nil")
 	}
 	out := *host // shallow copy
+	out.Launch.CgroupControl = snap.Launch.CgroupControl
 	out.SnapshotRefs = config.SnapshotRefs{RuntimeRef: snap.Boot.RuntimeRef}
 	if len(snap.Boot.Disks) > 0 {
 		out.SnapshotRefs.DiskBaseRefs = make([]string, len(snap.Boot.Disks))
@@ -232,9 +238,10 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 		}
 	}
 
-	// boot.kernel / boot.cmdline / launch.* silently ignored — fields
-	// stay as host yaml provided, but lifecycle.go won't use them on
-	// the restore path.
+	// boot.kernel / boot.cmdline and launch fields other than cgroup_control are
+	// ignored — they stay as host yaml provided, but lifecycle.go won't use them
+	// on the restore path. launch.cgroup_control is snapshot-owned guest topology
+	// and was copied above so a later snapshot preserves it.
 
 	return &out, nil
 }

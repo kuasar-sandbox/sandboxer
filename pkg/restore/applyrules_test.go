@@ -92,6 +92,39 @@ func baseSnap(runtimeRef, baseRef, overlayBase string) *SnapshotCfg {
 	return cfg
 }
 
+func TestSnapshotCfgCgroupControlRoundTripAndApply(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "runtime.erofs")
+	runtimeDigest := writeFile(t, runtimePath, []byte("runtime body"))
+	basePath := filepath.Join(dir, "base.erofs")
+	baseDigest := writeFile(t, basePath, []byte("base body"))
+	body := []byte("launch:\n  cgroup_control: true\n")
+	parsed, err := ParseSnapshotCfg(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.Launch.CgroupControl {
+		t.Fatal("snapshot.cfg parse lost launch.cgroup_control")
+	}
+	snap := baseSnap(
+		"file://runtime.erofs@sha256:"+runtimeDigest,
+		"file://base.erofs@sha256:"+baseDigest,
+		"file://overlay",
+	)
+	snap.Launch.CgroupControl = parsed.Launch.CgroupControl
+	host := &config.SandboxConfig{}
+	host.Network.TAP = "tap0"
+	host.Boot.Root.Overlay = &config.OverlayConfig{}
+	host.Launch.CgroupControl = false
+	out, err := applyRules(host, snap, filepath.Join(dir, "root.snapshot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Launch.CgroupControl {
+		t.Fatal("ApplyRules did not restore snapshot launch.cgroup_control")
+	}
+}
+
 func applyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string) (*config.SandboxConfig, error) {
 	return ApplyRules(host, snap, snapshotPath, nil, nil, false)
 }

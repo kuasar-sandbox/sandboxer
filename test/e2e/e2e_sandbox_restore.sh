@@ -110,6 +110,7 @@ boot:
 launch:
   args: ["-c", "import sys,time\nprint('PYBOOT-OK', flush=True)\ni=0\nwhile True:\n    print('TICK', i, flush=True)\n    i+=1\n    time.sleep(0.25)"]
   restart: never
+  cgroup_control: true
 EOF
 
 LOG1="$WORK/run1.log"
@@ -137,8 +138,10 @@ readiness_connect_ctl "$RUNTIME_ROOT/$SID1/ctl.sock" \
 readiness_wait_event "$WORK/cold.ready" 2 ready "$SBPID1" \
     || { tail -60 "$LOG1"; exit 1; }
 COLD_READY_MS=$(( ($(date +%s%N) - COLD_T0_NS) / 1000000 ))
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$RUNTIME_ROOT" -- /bin/true \
+CG_COLD=$("$BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$RUNTIME_ROOT" -- cat /proc/self/cgroup) \
     || { echo "==> FAIL: cold immediate exec after ready failed"; exit 1; }
+grep -qE '^0::/init[[:space:]]*$' <<<"$CG_COLD" \
+    || { echo "==> FAIL: cold exec cgroup = $CG_COLD, want 0::/init"; exit 1; }
 readiness_assert_wire "$WORK/cold.ready" "$COLD_READER_PID" $'control_ready\nready\n' \
     || { echo "==> FAIL: cold readiness wire was not exact"; exit 1; }
 echo "==> PASS: cold exact readiness wire; ctl.sock and immediate exec succeeded"
@@ -201,6 +204,9 @@ boot:
     overlay:
       diff: file://$DIFF_RESTORE
       size: 1GiB
+launch:
+  # Deliberately opposite: snapshot.cfg owns the already-running guest topology.
+  cgroup_control: false
 EOF
 
 LOG2="$WORK/run2.log"
@@ -228,8 +234,10 @@ readiness_connect_ctl "$RUNTIME_ROOT/$SID2/ctl.sock" \
 readiness_wait_event "$WORK/restore.ready" 2 ready "$SBPID2" \
     || { tail -60 "$LOG2"; exit 1; }
 RESTORE_READY_MS=$(( ($(date +%s%N) - RESTORE_T0_NS) / 1000000 ))
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RUNTIME_ROOT" -- /bin/true \
+CG_RESTORE=$("$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RUNTIME_ROOT" -- cat /proc/self/cgroup) \
     || { echo "==> FAIL: restore immediate exec after ready failed"; exit 1; }
+grep -qE '^0::/init[[:space:]]*$' <<<"$CG_RESTORE" \
+    || { echo "==> FAIL: restored exec cgroup = $CG_RESTORE, want pinned 0::/init"; exit 1; }
 readiness_assert_wire "$WORK/restore.ready" "$RESTORE_READER_PID" $'control_ready\nready\n' \
     || { echo "==> FAIL: restore readiness wire was not exact"; exit 1; }
 echo "==> PASS: restore exact readiness wire; ctl.sock and immediate exec succeeded"

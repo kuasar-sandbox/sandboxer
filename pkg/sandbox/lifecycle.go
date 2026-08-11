@@ -1301,6 +1301,7 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs, memoryFromRefs []s
 	doc.Resources.Capacity.CPU = cfg.Resources.Capacity.CPU
 	doc.Resources.Capacity.Memory = cfg.Resources.Capacity.Memory
 	doc.Metadata = cfg.Metadata
+	doc.Launch.CgroupControl = cfg.Launch.CgroupControl
 	doc.Boot.RuntimeRef = cfg.SnapshotRefs.RuntimeRef
 
 	// Incremental layered chain (docs/sandbox.md §3.5). The lifecycle passes
@@ -1415,7 +1416,10 @@ type snapshotCfgYAML struct {
 	} `yaml:"resources"`
 	Metadata map[string]string `yaml:"metadata,omitempty"` // opaque platform passthrough
 	FromRefs []string          `yaml:"from_refs,omitempty"`
-	Boot     struct {
+	Launch   struct {
+		CgroupControl bool `yaml:"cgroup_control"`
+	} `yaml:"launch"`
+	Boot struct {
 		RuntimeRef string         `yaml:"runtime_ref"`
 		Root       diskNodeYAML   `yaml:"root"`
 		Disks      []diskNodeYAML `yaml:"disks,omitempty"`

@@ -639,6 +639,9 @@ launch:
   restart: never              # never|on-failure|always。never=应用退出即沙箱 reboot(一次性);
                               #   always=原地重启;on-failure=非0/信号退出重启、干净退出 reboot。
                               #   重启用退避 10ms→60s、存活满 60s 重置;stdio MUX 跨重启存活
+  cgroup_control: false       # false(默认):primary/plugin/native exec 在真实 /app,应用见 0::/;
+                              # true:真实 /app 保持无直属进程并下放 controllers,上述进程在
+                              #   /app/init,应用见 0::/init。/app 始终是 namespace/freezer 根
   pid_namespace: private      # private(默认)=应用是自身 PID ns 的 PID 1;
                               #   shared=应用在 sandbox-init 的 PID ns,复用 PID1 reaper 收割孤儿
   user: "0:0"                 # uid:gid 或 name:group(覆盖镜像 User);命名用户由 guest 侧读 /etc/passwd 解析
@@ -950,8 +953,9 @@ honor 的 OCI config 子集:`Entrypoint` / `Cmd` / `Env` / `WorkingDir` /
 
 `snapshot.cfg` 是 `<sid>.snapshot` 末尾 ZIP 内的一个 entry,记录 snapshot 时
 **guest 那一侧不可重生的契约**——capacity、runtime / image base 内容指针、
-overlay 数据指针。**host 侧可重选的字段一概不存**(network、launch、cgroup、
-controller、cmdline 等都由 restore 调用者通过 sandbox.yaml 重新提供)。
+overlay 数据指针,以及已在 guest 内存中建立的 `launch.cgroup_control` 拓扑。
+**host 侧可重选的字段一概不存**(network、其他 launch 字段、host cgroup/
+controller、cmdline 等都由 restore 调用者通过 sandbox.yaml 重新提供或在恢复时忽略)。
 
 **字段 schema**(YAML):
 
@@ -975,6 +979,10 @@ metadata:
 from_refs: []
   # - manifest://<key-of-parent.snapshot>
   # - file://<digest>.snapshot@<scheme>:<digest>  # scheme = sha256 | hmac
+
+# Guest 内已建立、恢复后不可改选的应用 cgroup 拓扑
+launch:
+  cgroup_control: false
 
 # Guest 启动 + rootfs
 boot:
@@ -1008,6 +1016,10 @@ boot:
 
 - `resources.capacity.{cpu,memory}`:guest 看到的物理规格。restore 时
   sandbox.yaml 若提供必须严格相等,不一致拒绝启动(详见 §11.0、§13)
+- `launch.cgroup_control`:冷启动时建立并保存在 guest 内存中的 cgroup namespace/
+  delegation 拓扑。restore 必须沿用 snapshot.cfg 的值;host yaml 同名字段不覆盖它,
+  后续再次 snapshot 时原样写回。`false`/`true` 布局见
+  [`sandbox-init.md`](sandbox-init.md) §3.2.1
 - `runtime_ref`:始终 `file://<basename>@sha256:<digest>` 形式
   (`boot.runtime` 本身只支持 file://)。restore 时 basename 用于在
   `<sid>.snapshot` 同目录定位文件,digest 与 runtime bundle 内 marker 比较,
@@ -1249,8 +1261,10 @@ T19  Guest 内 kernel 启动 → mount /dev/pmem0 → exec /sbin/init = sandbox-
      T19b phase 2 dial host:5000 → hello → host 回 launch{spec, stdio} → guest 备好
           app stdio(tty: openpty / pipe: socketpair)→ launch_ack{stdio} → host 回 ack
           → **这条连接升级为 stdio MUX**;host 发一次初始 SET_WINSIZE,起 app stdio
-          桥接,ping ticker start;guest fork/exec user app(app fd 0/1/2 = 伪终端从端
-          或 pipe 子端)→ 短连接发 app_started{pid}→ host 成功写回 ACK→ 本次 cold run
+          桥接,ping ticker start;guest 用 CLONE_INTO_CGROUP(/app) fork primary helper,
+          child unshare cgroup ns + 私有 mount 内重挂 scoped cgroup2;true 时自迁移 /init;
+          parent 固定 namespace、验证空根并启用/回读 controllers后才放行 final exec
+          (app fd 0/1/2 = 伪终端从端或 pipe 子端)→ 短连接发 app_started{pid}→ host 成功写回 ACK→ 本次 cold run
           首次通知写 ready 并关闭 ready fd(后续原地 restart 不重复)
      T19c phase 3 supervisor + 反向 listener(ping/restore/quiesce/attach/exec)+ mem_report
 T20  vCPU 跑过程中:
@@ -1439,8 +1453,9 @@ T1  通过 <run-dir>/<sid>/ctl.sock 联系目标 sandbox-ctl run 进程
 T2  目标进程串行:
     T2a 通过 vsock 短连接发 quiesce 给 sandbox-init,等 quiesced 响应。sandbox-init
         收到后:拒绝新的 exec 并 SIGKILL 在飞的 exec 子进程(快照不能带运行中的
-        exec 兄弟进程;沙箱 resume/restore 后解除)→ **freeze 应用进程树**
-        (cgroup.freeze=1,等 cgroup.events 至 frozen 1)→ sync + optional drop_caches →
+        exec 兄弟进程;沙箱 resume/restore 后解除)→ **freeze 真实
+        /sys/fs/cgroup/app 整棵应用树**(它始终是 namespace/freezer 根;不调用 envd
+        /freeze;cgroup.freeze=1,等 cgroup.events 至 frozen 1)→ sync + optional drop_caches →
         停读应用 stdout/stderr(pty master)→ 拆除所有 connect 端口转发中继(SO_LINGER
         确认拆除,sandbox-init.md §3.7)→ 在 stdio
         MUX 上发起优雅关闭握手(sandbox-ctl 的 MUX 端响应 MUX_CLOSE_ACK 并读到 EOF
@@ -1466,6 +1481,7 @@ T4  overlay → sink(在 memory 前处理,snapshot.cfg 才能拿到终态 overla
         overlay_ref = manifest://<overlay_manifest_key>
 T5  生成最终 snapshot.cfg(在内存中,§3.4 schema):
     resources.capacity:        从 sandbox 当前 SandboxConfig
+    launch.cgroup_control:      当前 guest cgroup 拓扑(false/true),供 restore 后再次 snapshot 继承
     boot.runtime_ref:           file://<basename>@sha256:<digest>(从 bundle marker
                                 读取)或 manifest://<key>(原引用)
     boot.root.base_ref:         同上规则
@@ -2364,7 +2380,8 @@ allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
 | `boot.root.overlay.diff` | 可选 file:// 绝对路径;空→落盘 base 目录(随沙箱销毁) | 默认落盘 base 目录 |
 | `boot.root.overlay.diff_size` | restore 新 diff 取 base 大小,此项不参与 | 取 base 大小 |
 | `boot.cmdline` | 静默忽略(restore 不 boot) | 同 |
-| `launch.*` | 静默忽略(应用在 guest 内存里) | 同 |
+| `launch.cgroup_control` | host 值静默忽略;沿用 snapshot.cfg 的值(guest 内 namespace/delegation 拓扑已建立),并供后续 snapshot 回写 | 用 snapshot.cfg 的值 |
+| `launch.*`(除 `cgroup_control`) | 静默忽略(应用在 guest 内存里) | 同 |
 | `control.cgroup_path` / `control.controller` | 用作本次恢复的资源策略 | 同冷启动默认 |
 | `overhead` / `watermark_high` / `startup` | 同 control 规则 | 同冷启动默认 |
 | 其他 | 静默忽略 | — |

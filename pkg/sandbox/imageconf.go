@@ -105,8 +105,9 @@ func LoadImageConfigFrom(r io.ReaderAt, size int64) (*ImageConfig, error) {
 // Workdir / Restart: override else image else default.
 func MergeLaunch(image *ImageConfig, override config.LaunchConfig) (*proto.LaunchSpec, error) {
 	spec := &proto.LaunchSpec{
-		Workdir: "/",
-		Restart: "never",
+		Workdir:       "/",
+		Restart:       "never",
+		CgroupControl: override.CgroupControl,
 	}
 
 	// Placeholder: no external program. Skip exec resolution (and any image

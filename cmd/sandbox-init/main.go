@@ -55,26 +55,24 @@ const (
 )
 
 func main() {
-	// Re-entry as the user-app exec helper (after fork+clone in phase 2).
-	// argv: [self, "exec-child", isolated("1"/"0"), cred, workdir, appPath, args...]
-	// isolated reports whether the app got its own PID ns (→ remount /proc);
-	// cred ("uid:gid:sg,..." or "-") is dropped just before execve.
-	if len(os.Args) >= 6 && os.Args[1] == "exec-child" {
-		runExecChild(os.Args[2] == "1", os.Args[3], os.Args[4], os.Args[5], os.Args[6:], false, false)
+	// Primary app helper. argv: [self, "exec-child", bootstrap|restart,
+	// isolated, cgroupControl, placeholder, cred, workdir, appPath, args...].
+	if len(os.Args) >= 9 && os.Args[1] == "exec-child" {
+		runPrimaryExecChild(os.Args[2], os.Args[3] == "1", os.Args[4] == "1",
+			os.Args[5] == "1", os.Args[6], os.Args[7], os.Args[8], os.Args[9:])
 		return
 	}
-	// Placeholder app (launch.placeholder): same ns/cred setup as exec-child
-	// but no program — it waits for SIGTERM/SIGINT instead of execve.
-	// argv: [self, "exec-child-placeholder", isolated("1"/"0"), cred, workdir]
-	if len(os.Args) >= 5 && os.Args[1] == "exec-child-placeholder" {
-		runExecChild(os.Args[2] == "1", os.Args[3], os.Args[4], "", nil, false, true)
+	// Plugin helper: direct final-cgroup placement followed by cgroup namespace
+	// join + scoped cgroupfs in a private mount namespace.
+	if len(os.Args) >= 5 && os.Args[1] == "plugin-child" {
+		runPluginExecChild(os.Args[2], os.Args[3], os.Args[4], os.Args[5:])
 		return
 	}
-	// Joined exec command (sandbox-ctl exec): forked by the exec-join
-	// helper after it has entered the app's mount + pid namespaces. cred
-	// was resolved by the helper inside the app ns ("-" = keep root).
+	// Joined exec command (sandbox-ctl exec): forked into the app PID namespace
+	// by exec-join, then joins the app mount namespace itself before resolving
+	// its credential and final executable.
 	if len(os.Args) >= 5 && os.Args[1] == "exec-child-joined" {
-		runExecChild(false, os.Args[2], os.Args[3], os.Args[4], os.Args[5:], true, false)
+		runJoinedExecChild(os.Args[2], os.Args[3], os.Args[4], os.Args[5:])
 		return
 	}
 	// nsenter helper for sandbox-ctl exec.
@@ -83,7 +81,6 @@ func main() {
 		runExecJoin(os.Args[2], os.Args[3], os.Args[4], os.Args[5], os.Args[6], os.Args[7:])
 		return
 	}
-
 	logf("sandbox-init starting (pid=%d)", os.Getpid())
 	if os.Getpid() != 1 {
 		die("must run as PID 1, got %d", os.Getpid())
@@ -129,7 +126,7 @@ func main() {
 	}
 
 	// switch-root into the assembled overlay + post-switch base mounts.
-	if err := phase1bSwitchRoot(); err != nil {
+	if err := phase1bSwitchRoot(spec.CgroupControl); err != nil {
 		die("phase 1b switch-root: %v", err)
 	}
 
@@ -149,18 +146,18 @@ func main() {
 	}
 	logf("phase2: network + stdio done")
 
-	appPid, err := phase2ForkApp(spec, cs)
+	// Register SIGCHLD before the first primary/plugin can exit. The buffered
+	// channel retains an edge until phase3 starts consuming it, so a plugin
+	// helper that fails setup during the initial synchronous launch pass is
+	// still reaped and retried according to plugin launch-failure semantics.
+	sigCh := make(chan os.Signal, 16)
+	signal.Notify(sigCh, syscall.SIGCHLD)
+
+	appPid, err := phase2ForkApp(spec, cs, true, nil)
 	if err != nil {
 		die("phase 2 fork: %v", err)
 	}
 	logf("phase2: app forked pid=%d", appPid)
-
-	// Move the app tree into the `app` cgroup so quiesce can freeze it.
-	// Fatal on failure: a pid left in the root cgroup would not freeze,
-	// silently defeating the snapshot freeze (§3.4).
-	if err := cgroupPlaceApp(appPid); err != nil {
-		die("cgroup place app pid=%d: %v", appPid, err)
-	}
 
 	// Notify host before entering supervisor — best-effort short conn.
 	if err := notifyAppStarted(appPid); err != nil {
@@ -195,7 +192,7 @@ func main() {
 	// starves this very vsock listener after ~16 s).
 	go runMemReporter(memReportInterval)
 
-	phase3Supervise(supervisor, bridge)
+	phase3Supervise(supervisor, bridge, sigCh)
 	// phase3Supervise does not return.
 }
 
@@ -320,7 +317,7 @@ func phase1aAssembleRoot() error {
 // mounts the post-switch base filesystems (devpts, cgroup v2,
 // /run, /run/shm). Runs after the join, single-threaded — the chroot is a
 // process-global path switch so nothing else may touch a path concurrently.
-func phase1bSwitchRoot() error {
+func phase1bSwitchRoot(cgroupControl bool) error {
 	for _, src := range []struct{ from, to string }{
 		{"/proc", "/sysroot/proc"},
 		{"/sys", "/sysroot/sys"},
@@ -361,7 +358,7 @@ func phase1bSwitchRoot() error {
 	// (snapshot freeze/thaw, §3.4) + resource-controller delegation so
 	// envd's in-guest cgroups get cpu/memory/io/pids (cgroup.go).
 	// Mounted post-chroot so the path is stable.
-	if err := cgroupMount(); err != nil {
+	if err := cgroupMount(cgroupControl); err != nil {
 		return fmt.Errorf("cgroup setup: %w", err)
 	}
 
@@ -503,24 +500,25 @@ func phase2Apply(spec *proto.LaunchSpec, conn *vsockConn) (childStdio, *consoleB
 	return cs, bridge, nil
 }
 
-// phase2ForkApp re-execs ourselves with the "exec-child" sentinel argv in
-// a new PID + mount namespace, wiring the app's 0/1/2 to the fds prepared
-// by setupAppStdio. In tty mode the child also gets a fresh session with
-// the pty slave (its fd 0) as controlling terminal, so the line discipline
-// can deliver SIGINT / SIGWINCH to the app's process group. The re-exec'd
-// child (runExecChild) remounts /proc and execs the user app.
-func phase2ForkApp(spec *proto.LaunchSpec, cs childStdio) (int, error) {
+// phase2ForkApp re-execs sandbox-init as the primary helper in a private mount
+// namespace (and optional private PID namespace). firstPrimary is the sole
+// bootstrap: clone3 places it in real /app and child-side unshare creates the
+// application cgroup namespace. Restarts clone directly into the final target
+// and receive the pinned namespace FD. In both cases the helper handshake
+// confirms namespace/mount setup and final exec before this function returns.
+func phase2ForkApp(spec *proto.LaunchSpec, cs childStdio, firstPrimary bool, onSpawn func(int) error) (int, error) {
 	self := "/proc/self/exe"
 
 	// Make the mount tree rshared BEFORE forking the app, so restore-time
 	// file injection (binds created later in PID 1's namespace) propagates
 	// into the app's private CLONE_NEWNS namespace. The app child marks its
-	// own copy rslave (runExecChild) so it receives PID 1's mount events but
+	// own copy rslave (runPrimaryExecChild) so it receives PID 1's mount events but
 	// never leaks its own (e.g. /proc) back. Cold-start mounts/files are
 	// already in place and become shared peers in the copy. Without this,
 	// a restore-time bind stays invisible to the already-running app
 	// (docs/sandbox-init.md §4.3).
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_SHARED, ""); err != nil {
+		closeChildStdio(cs)
 		return 0, fmt.Errorf("make-rshared /: %w", err)
 	}
 
@@ -532,6 +530,7 @@ func phase2ForkApp(spec *proto.LaunchSpec, cs childStdio) (int, error) {
 	if spec.User != "" {
 		c, err := resolveCred(spec.User)
 		if err != nil {
+			closeChildStdio(cs)
 			return 0, fmt.Errorf("resolve user %q: %w", spec.User, err)
 		}
 		credStr = c.encode()
@@ -545,25 +544,42 @@ func phase2ForkApp(spec *proto.LaunchSpec, cs childStdio) (int, error) {
 	if isolated {
 		isoArg = "1"
 	}
-	// Placeholder: no program — the child sets up its ns/cred then waits.
-	// Otherwise pass the resolved exec + args for execve.
-	var args []string
-	if spec.Placeholder {
-		args = []string{self, "exec-child-placeholder", isoArg, credStr, spec.Workdir}
-	} else {
-		args = append([]string{self, "exec-child", isoArg, credStr, spec.Workdir, spec.Exec}, spec.Args...)
+	mode := "restart"
+	if firstPrimary {
+		mode = "bootstrap"
 	}
+	controlArg := "0"
+	if spec.CgroupControl {
+		controlArg = "1"
+	}
+	placeholderArg := "0"
+	appPath := spec.Exec
+	if spec.Placeholder {
+		placeholderArg = "1"
+		appPath = "-"
+	}
+	args := append([]string{self, "exec-child", mode, isoArg, controlArg, placeholderArg,
+		credStr, spec.Workdir, appPath}, spec.Args...)
 
 	cloneflags := uintptr(syscall.CLONE_NEWNS)
 	if isolated {
 		cloneflags |= syscall.CLONE_NEWPID
 	}
 	sysAttr := &syscall.SysProcAttr{Cloneflags: cloneflags}
+	if err := cgroupConfigureClone(sysAttr, firstPrimary); err != nil {
+		closeChildStdio(cs)
+		return 0, err
+	}
 	if cs.tty {
 		sysAttr.Setsid = true
 		sysAttr.Setctty = true // Ctty defaults to 0 = Stdin = the pty slave
 	}
 
+	parentSync, childSync, err := newChildSyncPair()
+	if err != nil {
+		closeChildStdio(cs)
+		return 0, fmt.Errorf("child handshake socketpair: %w", err)
+	}
 	cmd := exec.Cmd{
 		Path:        self,
 		Args:        args,
@@ -574,104 +590,31 @@ func phase2ForkApp(spec *proto.LaunchSpec, cs childStdio) (int, error) {
 		Stderr:      cs.stderr,
 		SysProcAttr: sysAttr,
 	}
-	if err := cmd.Start(); err != nil {
-		return 0, err
-	}
-	// Drop our copies of the child ends so EOF propagates once the app
-	// closes its fds (the consoleBridge keeps the opposite ends).
-	_ = cs.stdin.Close()
-	if cs.stdout != cs.stdin {
-		_ = cs.stdout.Close()
-	}
-	if cs.stderr != cs.stdin && cs.stderr != cs.stdout {
-		_ = cs.stderr.Close()
-	}
-	return cmd.Process.Pid, nil
-}
-
-// runExecChild runs in the forked child after CLONE_NEWNS (+ CLONE_NEWPID
-// when isolated). For an isolated app it is pid 1 in the new pid ns and
-// remounts /proc so it reflects that ns; a shared-PID app stays in
-// sandbox-init's pid ns, where /proc is already correct, so no remount.
-// Then chdir to workdir and exec the real app.
-//
-// If appPath has no '/', resolve via PATH lookup (image config Cmd
-// often holds bare names like "python3" or "node", expecting standard
-// PATH search semantics like sh/cmd would do).
-func runExecChild(isolated bool, cred, workdir, appPath string, args []string, joined, placeholder bool) {
-	// Independent children (the user app) get a private mount namespace. A
-	// joined exec command already runs in the app's mount + pid namespace, so
-	// it touches neither the rslave nor /proc (would disrupt the shared view).
-	if !joined {
-		// Make this app's private mount namespace an rslave of PID 1's
-		// rshared tree: restore-time injections (binds in PID 1) propagate
-		// IN, while the app's own mounts (the /proc below) stay local and
-		// never leak back to PID 1. Done before the /proc mount so /proc is
-		// a local, non-propagating mount.
-		if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_SLAVE, ""); err != nil {
-			die("exec-child: make-rslave /: %v", err)
-		}
-		// Only an isolated app (its own pid ns) needs a fresh /proc; a
-		// shared-PID app's /proc (sandbox-init's) already reflects its ns.
-		if isolated {
-			if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-				if errRemount := unix.Mount("none", "/proc", "", unix.MS_REMOUNT, ""); errRemount != nil {
-					die("exec-child: remount /proc: %v / %v", err, errRemount)
-				}
-			}
-		}
-	}
-
-	if workdir != "" && workdir != "/" {
-		if err := unix.Chdir(workdir); err != nil {
-			die("exec-child: chdir %s: %v", workdir, err)
-		}
-	}
-
-	resolved := appPath
-	if !placeholder && !strings.Contains(appPath, "/") {
-		// PATH lookup uses os.Environ() (set by parent from spec.Env).
-		p, err := exec.LookPath(appPath)
+	if firstPrimary {
+		cmd.ExtraFiles = []*os.File{childSync} // fd 3
+	} else {
+		ns, err := cgroupNamespaceFile()
 		if err != nil {
-			die("exec-child: %s not found in PATH: %v", appPath, err)
+			_ = parentSync.Close()
+			_ = childSync.Close()
+			closeChildStdio(cs)
+			return 0, err
 		}
-		resolved = p
+		cmd.ExtraFiles = []*os.File{ns, childSync} // fd 3 namespace, fd 4 sync
 	}
-
-	// Tie the command's lifetime to the exec-join helper (our parent).
-	// Done here, from inside the app's pid namespace, rather than via
-	// syscall.SysProcAttr.Pdeathsig in runExecJoin — Go's ForkExec
-	// child self-check (getppid vs pre-clone parent pid) misfires across
-	// setns(CLONE_NEWPID) and would SIGKILL us at startup. The kernel
-	// tracks the real parent task regardless of pid-ns visibility, and
-	// PR_SET_PDEATHSIG survives a normal (non-setuid) execve, so it
-	// still fires for the real command when the helper dies.
-	if joined {
-		if err := unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(syscall.SIGKILL), 0, 0, 0); err != nil {
-			die("exec-child: set pdeathsig: %v", err)
-		}
+	var onReady func(int) error
+	if firstPrimary {
+		onReady = cgroupFinalizeBootstrap
 	}
-
-	// Drop to the run-as identity LAST — after mount /proc, chdir and PATH
-	// lookup, all of which need root — and right before execve.
-	if err := applyCred(cred); err != nil {
-		die("exec-child: drop privileges: %v", err)
+	pid, err := coordinateChild(&cmd, parentSync, childSync, onSpawn, onReady, nil, childSyncExecEOF)
+	closeChildStdio(cs)
+	if err != nil && firstPrimary && pid > 0 {
+		// No process-wide reaper exists yet. Ensure a failed bootstrap helper
+		// cannot linger and consume its child PID/namespace resources.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 	}
-
-	// Placeholder: run no program. Wait for a stop signal and exit cleanly.
-	// (Cannot block on `select{}` — Go's deadlock detector would panic with
-	// no live goroutines; a signal-fed channel keeps the runtime alive.)
-	if placeholder {
-		logf("exec-child: placeholder app (no exec) — waiting for stop signal")
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-		<-sigCh
-		os.Exit(0)
-	}
-
-	if err := syscall.Exec(resolved, append([]string{appPath}, args...), os.Environ()); err != nil {
-		die("exec-child: exec %s: %v", resolved, err)
-	}
+	return pid, err
 }
 
 // supervisorState is shared between the signal loop and the reverse
@@ -694,8 +637,7 @@ type supervisorState struct {
 // (restart in place with backoff, or reboot); plugin exits route to the plugin
 // supervisor; exec-session children route to their session; orphans (shared-PID
 // apps' descendants) are reaped silently.
-func phase3Supervise(s *supervisorState, b *consoleBridge) {
-	sigCh := make(chan os.Signal, 16)
+func phase3Supervise(s *supervisorState, b *consoleBridge, sigCh chan os.Signal) {
 	signal.Notify(sigCh, syscall.SIGCHLD, syscall.SIGTERM, syscall.SIGINT)
 
 	for {
@@ -801,16 +743,22 @@ func restartApp(s *supervisorState, b *consoleBridge, delay time.Duration) {
 		return
 	}
 	s.appBackoff.onStart(time.Now())
-	pid, err := phase2ForkApp(s.spec, cs)
+	pid, err := phase2ForkApp(s.spec, cs, false, func(pid int) error {
+		// Register the new primary before the helper leaves its initial start
+		// gate, so even a namespace/setup failure is classified by the sole
+		// SIGCHLD reaper as this app attempt.
+		s.appPid.Store(int64(pid))
+		return nil
+	})
 	if err != nil {
+		if pid > 0 {
+			logf("restart: app setup failed pid=%d: %v (reaper will apply restart policy)", pid, err)
+			return
+		}
 		logf("restart: fork app: %v (rebooting)", err)
 		notifyAppExited(1, 0)
 		doReboot()
 		return
-	}
-	s.appPid.Store(int64(pid))
-	if err := cgroupPlaceApp(pid); err != nil {
-		logf("restart: cgroup place pid=%d: %v", pid, err)
 	}
 	logf("app restarted pid=%d", pid)
 	if err := notifyAppStarted(pid); err != nil {

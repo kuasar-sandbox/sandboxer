@@ -41,11 +41,12 @@ func TestRoundTrip_Launch(t *testing.T) {
 	m := &Message{
 		Type: TypeLaunch,
 		Launch: &LaunchSpec{
-			Exec:    "/usr/bin/foo",
-			Args:    []string{"--flag", "value with spaces", "comma,inside,arg"},
-			Env:     map[string]string{"PATH": "/bin:/usr/bin", "HOME": "/root"},
-			Workdir: "/var/data",
-			Restart: "on-failure",
+			Exec:          "/usr/bin/foo",
+			Args:          []string{"--flag", "value with spaces", "comma,inside,arg"},
+			Env:           map[string]string{"PATH": "/bin:/usr/bin", "HOME": "/root"},
+			Workdir:       "/var/data",
+			Restart:       "on-failure",
+			CgroupControl: true,
 		},
 	}
 	var buf bytes.Buffer

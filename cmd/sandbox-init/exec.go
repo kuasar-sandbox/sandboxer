@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -67,18 +68,18 @@ func newExecRegistry() *execRegistry {
 // register records a freshly-started exec child and returns the channel
 // the reaper will deliver its WaitStatus on. If the child was already
 // reaped (lost the Start→register race) the status is delivered at once.
-func (r *execRegistry) register(pid int) <-chan syscall.WaitStatus {
+func (r *execRegistry) register(pid int) (<-chan syscall.WaitStatus, bool) {
 	ch := make(chan syscall.WaitStatus, 1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if st, ok := r.pending[pid]; ok {
 		delete(r.pending, pid)
 		ch <- st
-		return ch
+		return ch, !r.quiescing
 	}
 	r.waiters[pid] = ch
 	r.live[pid] = struct{}{}
-	return ch
+	return ch, !r.quiescing
 }
 
 // deliver routes a reaped non-app pid's status to its session. Returns
@@ -249,13 +250,18 @@ func runExecSession(c *vsockConn, req *proto.Message, sup *supervisorState) {
 		stderrR:   cb.stderrR,
 	}
 
-	pid, err := forkExecChild(spec, cs, int(sup.appPid.Load()))
+	pid, waitCh, err := forkExecChild(spec, cs, int(sup.appPid.Load()), reg)
 	if err != nil {
+		if pid > 0 {
+			// The helper was registered before leaving its start gate. Wait for
+			// the sole SIGCHLD reaper to consume the failed setup attempt.
+			<-waitCh
+			reg.done(pid)
+		}
 		eb.drain()
 		fail("exec: fork: " + err.Error())
 		return
 	}
-	waitCh := reg.register(pid)
 	defer reg.done(pid)
 
 	established := spec.Stdio
@@ -303,8 +309,8 @@ func runExecSession(c *vsockConn, req *proto.Message, sup *supervisorState) {
 // the command. The returned pid is the HELPER's — it is what the
 // SIGCHLD reaper tracks and what quiesce/lost-session kills; the
 // command dies with the helper via PR_SET_PDEATHSIG armed by the
-// joined child itself (see runExecJoin / runExecChild).
-func forkExecChild(spec *proto.ExecSpec, cs childStdio, appPid int) (int, error) {
+// joined child itself (see runExecJoin / runJoinedExecChild).
+func forkExecChild(spec *proto.ExecSpec, cs childStdio, appPid int, reg *execRegistry) (int, <-chan syscall.WaitStatus, error) {
 	self := "/proc/self/exe"
 	ttyArg := "0"
 	if cs.tty {
@@ -316,6 +322,23 @@ func forkExecChild(spec *proto.ExecSpec, cs childStdio, appPid int) (int, error)
 	}
 	args := append([]string{self, "exec-join", strconv.Itoa(appPid), ttyArg, userArg, spec.Cwd, spec.Argv[0]}, spec.Argv[1:]...)
 
+	ns, err := cgroupNamespaceFile()
+	if err != nil {
+		closeChildStdio(cs)
+		return 0, nil, err
+	}
+	parentSync, childSync, err := newChildSyncPair()
+	if err != nil {
+		closeChildStdio(cs)
+		return 0, nil, fmt.Errorf("child handshake socketpair: %w", err)
+	}
+	sysAttr := &syscall.SysProcAttr{}
+	if err := cgroupConfigureClone(sysAttr, false); err != nil {
+		_ = parentSync.Close()
+		_ = childSync.Close()
+		closeChildStdio(cs)
+		return 0, nil, err
+	}
 	cmd := exec.Cmd{
 		Path:   self,
 		Args:   args,
@@ -327,44 +350,47 @@ func forkExecChild(spec *proto.ExecSpec, cs childStdio, appPid int) (int, error)
 		// No Cloneflags / Setsid here: the helper joins the app's
 		// namespaces and the COMMAND (forked by the helper) gets the
 		// new session + controlling tty (see runExecJoin).
-		SysProcAttr: &syscall.SysProcAttr{},
+		ExtraFiles:  []*os.File{ns, childSync}, // fd 3 cgroup ns, fd 4 sync
+		SysProcAttr: sysAttr,
 	}
-	if err := cmd.Start(); err != nil {
-		return 0, err
+	var waitCh <-chan syscall.WaitStatus
+	pid, err := coordinateChild(&cmd, parentSync, childSync, func(pid int) error {
+		var allowed bool
+		waitCh, allowed = reg.register(pid)
+		if !allowed {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			return errors.New("exec: sandbox quiescing (snapshot in progress)")
+		}
+		return nil
+	}, nil, nil, childSyncStarted)
+	closeChildStdio(cs)
+	if err != nil {
+		return pid, waitCh, err
 	}
-	// Drop our copies of the child ends so EOF propagates once the
-	// command closes its fds (the execBridge keeps the opposite ends).
-	_ = cs.stdin.Close()
-	if cs.stdout != cs.stdin {
-		_ = cs.stdout.Close()
-	}
-	if cs.stderr != cs.stdin && cs.stderr != cs.stdout {
-		_ = cs.stderr.Close()
-	}
-	return cmd.Process.Pid, nil
+	return pid, waitCh, nil
 }
 
-// runExecJoin is the re-exec entrypoint "exec-join": the nsenter
-// helper. It enters the app's mount + pid namespaces, then ForkExecs
-// the command ("exec-child-joined") so the command runs as a sibling
-// of the user app inside its namespaces, and proxies the command's
-// exit status as its own (so the reaper relays a faithful code).
+// runExecJoin is the native-exec namespace helper. It is born atomically in
+// the final application cgroup, joins the pinned cgroup namespace, selects the
+// primary PID namespace for its child, and opens the primary mount namespace.
 //
-// The command's lifetime is tied to this helper via PR_SET_PDEATHSIG=
-// SIGKILL — but armed by the joined child itself (runExecChild), NOT
-// via syscall.SysProcAttr.Pdeathsig here. Go's ForkExec runs a child-
-// side "is my parent already dead?" self-check that compares getppid()
-// against the parent pid captured before clone; because the child is
-// placed in the app's PID namespace (setns CLONE_NEWPID below), its
-// getppid() resolves in that ns where the helper is invisible (→ 0),
-// never equals the helper's init-ns pid, so the check would SIGKILL
-// the command at startup every time. Arming pdeathsig from the child
-// after it is in the new ns avoids that bogus check; the kernel tracks
-// the real parent task regardless of pid-ns visibility, and
-// PR_SET_PDEATHSIG survives a normal (non-setuid) execve.
+// The mount join is completed by exec-child-joined after the fork. With a
+// private primary PID namespace, its procfs cannot represent this outer helper,
+// so joining that mount before ForkExec would make /proc/self/exe disappear.
+// The child is already inside the primary PID namespace and can safely join the
+// mount namespace before final exec. Once the inner child reports that join is
+// ready, this helper joins the same mount namespace on its locked thread and
+// only then releases the child's final exec; it remains the status proxy.
 func runExecJoin(appPidStr, ttyStr, userSpec, cwd, argv0 string, args []string) {
-	// setns(CLONE_NEWNS) is per-thread; pin this goroutine so the join
-	// and the subsequent fork happen on the same (joined) thread.
+	sync, err := childSyncFromFD(childJoinedSyncFD)
+	if err != nil {
+		die("exec-join: sync: %v", err)
+	}
+	if err := sync.waitFor(childMsgStart); err != nil {
+		sync.fail(fmt.Errorf("wait for setup release: %w", err))
+	}
+	// Namespace selection is per-thread; pin this goroutine so setns and the
+	// subsequent child clone use the same nsproxy and fs_struct.
 	runtime.LockOSThread()
 	// The kernel's mntns_install() rejects setns(CLONE_NEWNS) unless the
 	// calling thread's fs_struct is unshared (fs->users == 1). Go's
@@ -374,80 +400,111 @@ func runExecJoin(appPidStr, ttyStr, userSpec, cwd, argv0 string, args []string) 
 	// thread first; the fs values are preserved (private copy), only the
 	// sharing is broken. Must precede the setns below.
 	if err := unix.Unshare(unix.CLONE_FS); err != nil {
-		die("exec-join: unshare fs: %v", err)
+		sync.fail(fmt.Errorf("unshare fs: %w", err))
 	}
 
 	appPid, err := strconv.Atoi(appPidStr)
 	if err != nil {
-		die("exec-join: bad app pid %q: %v", appPidStr, err)
+		sync.fail(fmt.Errorf("bad app pid %q: %w", appPidStr, err))
 	}
-	// Open the ns handles while still in the initial mount ns (where
-	// /proc/<appPid> resolves) — before joining the app's mount ns.
+	// Open both handles while the guest-global /proc can resolve appPid.
 	mntFD, err := unix.Open(fmt.Sprintf("/proc/%d/ns/mnt", appPid), unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		die("exec-join: open app mnt ns: %v", err)
+		sync.fail(fmt.Errorf("open app mnt ns: %w", err))
 	}
 	pidFD, err := unix.Open(fmt.Sprintf("/proc/%d/ns/pid", appPid), unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		die("exec-join: open app pid ns: %v", err)
+		_ = unix.Close(mntFD)
+		sync.fail(fmt.Errorf("open app pid ns: %w", err))
 	}
-	if err := unix.Setns(mntFD, unix.CLONE_NEWNS); err != nil {
-		die("exec-join: setns mnt: %v", err)
+	unix.CloseOnExec(childCgroupNamespaceFD)
+	if err := cgroupJoinNamespace(childCgroupNamespaceFD); err != nil {
+		_ = unix.Close(mntFD)
+		_ = unix.Close(pidFD)
+		sync.fail(err)
+	}
+	if err := unix.Close(childCgroupNamespaceFD); err != nil {
+		_ = unix.Close(mntFD)
+		_ = unix.Close(pidFD)
+		sync.fail(fmt.Errorf("close cgroup namespace fd: %w", err))
 	}
 	// setns(CLONE_NEWPID) does not move us; it places our future
-	// children (the ForkExec below) into the app's pid namespace.
+	// child into the app's PID namespace.
 	if err := unix.Setns(pidFD, unix.CLONE_NEWPID); err != nil {
-		die("exec-join: setns pid: %v", err)
+		_ = unix.Close(mntFD)
+		_ = unix.Close(pidFD)
+		sync.fail(fmt.Errorf("setns pid: %w", err))
 	}
-	_ = unix.Close(mntFD)
 	_ = unix.Close(pidFD)
+	if err := sync.readyAndWait(); err != nil {
+		_ = unix.Close(mntFD)
+		sync.fail(err)
+	}
 
-	// No Pdeathsig here: Go's ForkExec child self-check (getppid vs
-	// pre-clone parent pid) misfires across setns(CLONE_NEWPID) and
-	// SIGKILLs the command at startup. The joined child arms
-	// PR_SET_PDEATHSIG itself instead (runExecChild).
+	// No SysProcAttr.Pdeathsig here: Go's child-side parent check compares
+	// PIDs across namespaces and would kill the child spuriously. The joined
+	// child arms PR_SET_PDEATHSIG itself immediately before final exec.
 	sys := &syscall.SysProcAttr{}
 	if ttyStr == "1" {
 		sys.Setsid = true
-		sys.Setctty = true // Ctty defaults to 0 = the pty slave
+		sys.Setctty = true
 	}
-	// Resolve the run-as identity AFTER the namespace joins, against the
-	// APP rootfs's /etc/passwd (names like "user" mean the image's user).
-	credStr := "-"
-	if userSpec != "" && userSpec != "-" {
-		c, err := resolveCred(userSpec)
-		if err != nil {
-			die("exec-join: resolve user %q: %v", userSpec, err)
-		}
-		credStr = c.encode()
+	innerParent, innerChild, err := newChildSyncPair()
+	if err != nil {
+		_ = unix.Close(mntFD)
+		sync.fail(fmt.Errorf("command handshake socketpair: %w", err))
+	}
+	mntFile := os.NewFile(uintptr(mntFD), "primary-mount-namespace")
+	if mntFile == nil {
+		_ = unix.Close(mntFD)
+		_ = innerParent.Close()
+		_ = innerChild.Close()
+		sync.fail(errors.New("wrap primary mount namespace fd"))
 	}
 	self := "/proc/self/exe"
-	gargv := append([]string{self, "exec-child-joined", credStr, cwd, argv0}, args...)
-	pid, err := syscall.ForkExec(self, gargv, &syscall.ProcAttr{
-		Dir:   "/",
-		Env:   os.Environ(), // = execEnv(spec.Env), inherited via our exec
-		Files: []uintptr{0, 1, 2},
-		Sys:   sys,
-	})
+	gargv := append([]string{self, "exec-child-joined", userSpec, cwd, argv0}, args...)
+	cmd := exec.Cmd{
+		Path:        self,
+		Args:        gargv,
+		Env:         os.Environ(), // = execEnv(spec.Env), inherited via our exec
+		Dir:         "/",
+		Stdin:       os.Stdin,
+		Stdout:      os.Stdout,
+		Stderr:      os.Stderr,
+		ExtraFiles:  []*os.File{mntFile, innerChild}, // fd 3 mount ns, fd 4 sync
+		SysProcAttr: sys,
+	}
+	pid, err := coordinateChild(&cmd, innerParent, innerChild, nil, func(int) error {
+		// The inner child has joined this mount namespace but has not executed
+		// user code yet. Join the outer status proxy now, so failure aborts the
+		// child at its ready gate and the native exec fails closed.
+		if err := unix.Setns(int(mntFile.Fd()), unix.CLONE_NEWNS); err != nil {
+			return fmt.Errorf("setns mnt: %w", err)
+		}
+		return nil
+	}, nil, childSyncExecEOF)
 	if err != nil {
-		die("exec-join: fork command: %v", err)
-	}
-
-	var ws syscall.WaitStatus
-	for {
-		_, werr := syscall.Wait4(pid, &ws, 0, nil)
-		if werr == syscall.EINTR {
-			continue
+		if pid > 0 {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
 		}
-		if werr != nil {
-			die("exec-join: wait command: %v", werr)
+		_ = mntFile.Close()
+		sync.fail(fmt.Errorf("fork joined command: %w", err))
+	}
+	_ = mntFile.Close()
+	if err := sync.write(childMsgExec); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		sync.fail(fmt.Errorf("report command start: %w", err))
+	}
+	sync.close()
+	waitErr := cmd.Wait()
+	if cmd.ProcessState != nil {
+		if status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
+			os.Exit(exitCodeFromStatus(status))
 		}
-		break
 	}
-	if ws.Signaled() {
-		os.Exit(128 + int(ws.Signal()))
-	}
-	os.Exit(ws.ExitStatus())
+	die("exec-join: wait command: %v", waitErr)
 }
 
 // execEnv builds the child environment: a default PATH baseline that

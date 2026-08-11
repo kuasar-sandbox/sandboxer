@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeYAML(t *testing.T, content string) string {
@@ -58,6 +60,55 @@ func TestLoad_ValidCold(t *testing.T) {
 	}
 	if err := cfg.ValidateCold(); err != nil {
 		t.Errorf("ValidateCold: %v", err)
+	}
+}
+
+func TestLaunchCgroupControlYAMLRoundTripAndDefault(t *testing.T) {
+	defaultCfg, err := Load(writeYAML(t, minimalCold))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultCfg.Launch.CgroupControl {
+		t.Fatal("launch.cgroup_control default = true, want false")
+	}
+	defaultBody, err := yaml.Marshal(defaultCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var defaultDecoded SandboxConfig
+	if err := yaml.Unmarshal(defaultBody, &defaultDecoded); err != nil {
+		t.Fatal(err)
+	}
+	if defaultDecoded.Launch.CgroupControl {
+		t.Fatalf("default YAML round-trip changed launch.cgroup_control:\n%s", defaultBody)
+	}
+
+	enabledDoc := strings.Replace(minimalCold, "launch:\n", "launch:\n  cgroup_control: true\n", 1)
+	enabled, err := Load(writeYAML(t, enabledDoc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !enabled.Launch.CgroupControl {
+		t.Fatal("launch.cgroup_control did not parse as true")
+	}
+	if err := enabled.ValidateCold(); err != nil {
+		t.Fatalf("ValidateCold rejected launch.cgroup_control=true: %v", err)
+	}
+	body, err := yaml.Marshal(enabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded SandboxConfig
+	if err := yaml.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Launch.CgroupControl {
+		t.Fatalf("YAML round-trip lost launch.cgroup_control:\n%s", body)
+	}
+
+	invalidDoc := strings.Replace(minimalCold, "launch:\n", "launch:\n  cgroup_control: not-a-bool\n", 1)
+	if _, err := Load(writeYAML(t, invalidDoc)); err == nil {
+		t.Fatal("launch.cgroup_control accepted a non-boolean value")
 	}
 }
 

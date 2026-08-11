@@ -21,9 +21,10 @@ import (
 // pluginProc is one supervised plugin: its spec + backoff state. pending marks
 // a relaunch deferred by a snapshot quiesce, issued at endQuiesce.
 type pluginProc struct {
-	spec    proto.PluginSpec
-	bo      backoff
-	pending bool
+	spec         proto.PluginSpec
+	bo           backoff
+	pending      bool
+	launchFailed bool
 }
 
 // policy returns the effective restart policy (plugins default to always).
@@ -50,8 +51,8 @@ func newPluginRegistry() *pluginRegistry {
 	return &pluginRegistry{byPID: make(map[int]*pluginProc)}
 }
 
-// start launches the initial plugin set. Called once after the app is forked
-// and placed in the app cgroup (app comes up first; plugins are companions).
+// start launches the initial plugin set. Called once after the app completes
+// its cgroup bootstrap (app comes up first; plugins are companions).
 func (r *pluginRegistry) start(specs []proto.PluginSpec) {
 	for _, s := range specs {
 		p := &pluginProc{spec: s}
@@ -78,19 +79,38 @@ func (r *pluginRegistry) launch(p *pluginProc) {
 	}
 	r.mu.Unlock()
 
-	pid, err := startPluginProcess(p.spec)
+	pid, err := startPluginProcess(p.spec, func(pid int) error {
+		// Register before the helper leaves its start gate. The global reaper
+		// can therefore classify even a namespace/mount/final-exec failure.
+		r.mu.Lock()
+		p.bo.onStart(time.Now())
+		p.pending = false
+		p.launchFailed = false
+		r.byPID[pid] = p
+		r.mu.Unlock()
+		return nil
+	}, func(pid int) {
+		// coordinateChild invokes this before acknowledging the helper's
+		// error, so onExit observes launchFailed deterministically.
+		r.mu.Lock()
+		if r.byPID[pid] == p {
+			p.launchFailed = true
+		}
+		r.mu.Unlock()
+	})
 	if err != nil {
-		// A launch failure is treated like an exit: back off and retry.
 		logf("plugin %s: launch failed: %v", p.spec.Exec, err)
+		if pid > 0 {
+			// The registered helper will exit after the error acknowledgement;
+			// onExit owns its backoff/relaunch so there is exactly one retry.
+			return
+		}
+		// clone3/exec of the helper itself failed, so no child exists for the
+		// reaper to drive. Back off and retry here.
 		delay := p.bo.next(time.Now())
 		go func() { time.Sleep(delay); r.launch(p) }()
 		return
 	}
-	r.mu.Lock()
-	p.bo.onStart(time.Now())
-	p.pending = false
-	r.byPID[pid] = p
-	r.mu.Unlock()
 	logf("plugin %s: started pid=%d (restart=%s)", p.spec.Exec, pid, p.policy())
 }
 
@@ -100,19 +120,26 @@ func (r *pluginRegistry) launch(p *pluginProc) {
 func (r *pluginRegistry) onExit(pid int, status syscall.WaitStatus) bool {
 	r.mu.Lock()
 	p := r.byPID[pid]
+	launchFailed := false
 	if p != nil {
 		delete(r.byPID, pid)
+		launchFailed = p.launchFailed
+		p.launchFailed = false
 	}
 	r.mu.Unlock()
 	if p == nil {
 		return false
 	}
-	if !wantRestart(p.policy(), status) {
+	if !launchFailed && !wantRestart(p.policy(), status) {
 		logf("plugin %s: exited code=%d (restart=%s) — done", p.spec.Exec, status.ExitStatus(), p.policy())
 		return true
 	}
 	delay := p.bo.next(time.Now())
-	logf("plugin %s: exited code=%d — restarting in %s", p.spec.Exec, status.ExitStatus(), delay)
+	if launchFailed {
+		logf("plugin %s: launch helper exited after setup failure — retrying in %s", p.spec.Exec, delay)
+	} else {
+		logf("plugin %s: exited code=%d — restarting in %s", p.spec.Exec, status.ExitStatus(), delay)
+	}
 	go func() { time.Sleep(delay); r.launch(p) }()
 	return true
 }
@@ -143,37 +170,52 @@ func (r *pluginRegistry) endQuiesce() {
 	}
 }
 
-// startPluginProcess forks one plugin into the app cgroup with console stdio
-// and returns its pid. Mirrors runInit's child setup (env over the default
-// PATH, optional workdir + run-as user) but does NOT wait — the reaper does.
-func startPluginProcess(s proto.PluginSpec) (int, error) {
-	cmd := exec.Command(s.Exec, s.Args...)
-	cmd.Stdin = nil
-	cmd.Stdout = os.Stderr // guest console
-	cmd.Stderr = os.Stderr
-	cmd.Env = envSliceFromMap(s.Env)
-	if s.Workdir != "" && s.Workdir != "/" {
-		cmd.Dir = s.Workdir
-	}
+// startPluginProcess starts a lightweight sandbox-init re-exec atomically in
+// the final application cgroup. The helper joins the pinned cgroup namespace,
+// installs a scoped cgroupfs in a private mount namespace, drops credentials,
+// and execs the plugin. Namespace, mount, placement, and final-exec failures
+// are returned as launch failures; there is no post-Start cgroup migration or
+// fail-open "continuing unfrozen" path.
+func startPluginProcess(s proto.PluginSpec, onSpawn func(int) error, onFailure func(int)) (int, error) {
+	credStr := "-"
 	if s.User != "" {
 		c, err := resolveCred(s.User)
 		if err != nil {
 			return 0, fmt.Errorf("user %q: %w", s.User, err)
 		}
 		if c != nil {
-			cmd.SysProcAttr = &syscall.SysProcAttr{
-				Credential: &syscall.Credential{Uid: c.uid, Gid: c.gid, Groups: c.sgids},
-			}
+			credStr = c.encode()
 		}
 	}
-	if err := cmd.Start(); err != nil {
+	ns, err := cgroupNamespaceFile()
+	if err != nil {
 		return 0, err
 	}
-	pid := cmd.Process.Pid
-	// Place in the app cgroup so a snapshot quiesce freezes the plugin with the
-	// app (else it would run with stale clock/network across resume, §3.4).
-	if err := cgroupPlaceApp(pid); err != nil {
-		logf("plugin %s: cgroup place pid=%d: %v (continuing unfrozen)", s.Exec, pid, err)
+	parentSync, childSync, err := newChildSyncPair()
+	if err != nil {
+		return 0, fmt.Errorf("child handshake socketpair: %w", err)
 	}
-	return pid, nil
+	self := "/proc/self/exe"
+	args := append([]string{self, "plugin-child", credStr, s.Workdir, s.Exec}, s.Args...)
+	sysAttr := &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
+	if err := cgroupConfigureClone(sysAttr, false); err != nil {
+		_ = parentSync.Close()
+		_ = childSync.Close()
+		return 0, err
+	}
+	// Preserve the documented/default PATH for bare plugin executables;
+	// explicit plugin PATH still wins.
+	pluginEnv := execEnv(s.Env)
+	cmd := exec.Cmd{
+		Path:        self,
+		Args:        args,
+		Env:         pluginEnv,
+		Dir:         "/",
+		Stdin:       nil,
+		Stdout:      os.Stderr,
+		Stderr:      os.Stderr,
+		ExtraFiles:  []*os.File{ns, childSync}, // fd 3 cgroup ns, fd 4 sync
+		SysProcAttr: sysAttr,
+	}
+	return coordinateChild(&cmd, parentSync, childSync, onSpawn, nil, onFailure, childSyncExecEOF)
 }
