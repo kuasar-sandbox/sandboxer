@@ -77,6 +77,31 @@ func TestBuildSnapshotCfg_OmitsRestorePolicy(t *testing.T) {
 	}
 }
 
+func TestBuildSnapshotCfg_PersistsCgroupControl(t *testing.T) {
+	cfg := &config.SandboxConfig{}
+	cfg.Resources.Capacity.CPU = 2
+	cfg.Resources.Capacity.Memory = "2GiB"
+	cfg.Launch.CgroupControl = true
+	cfg.SnapshotRefs.RuntimeRef = "file://rt@sha256:aa"
+	cfg.Boot.Root.DiffTemplate = "file:///root.ext4"
+
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Launch struct {
+			CgroupControl bool `yaml:"cgroup_control"`
+		} `yaml:"launch"`
+	}
+	if err := yaml.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Launch.CgroupControl {
+		t.Fatalf("snapshot.cfg lost launch.cgroup_control:\n%s", body)
+	}
+}
+
 // TestBuildSnapshotCfg_OverlayColdBase verifies that an overlay-mode COLD start
 // with an inherited overlay.base (e.g. a fromTemplate build) chains that
 // read-only lower into the snapshot's overlay.base_from_refs — else a restore of

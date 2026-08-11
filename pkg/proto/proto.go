@@ -89,6 +89,11 @@ type LaunchSpec struct {
 	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
 	Workdir string            `json:"workdir,omitempty"`
+	// CgroupControl selects the application cgroup topology. false runs the
+	// application in the cgroup-namespace root (/); true keeps that real root
+	// empty, delegates its controllers, and runs sandbox-init-managed processes
+	// in /init. The namespace/freezer root is real /app in both modes.
+	CgroupControl bool `json:"cgroup_control,omitempty"`
 	// Placeholder, when true, runs no external program: the app child does
 	// all its namespace/cgroup/stdio setup but, instead of execve, waits for
 	// SIGTERM/SIGINT and exits — an empty "anchor" app for a sandbox driven

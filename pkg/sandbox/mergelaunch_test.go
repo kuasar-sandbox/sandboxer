@@ -15,11 +15,12 @@ func TestMergeLaunch_OverrideTakesPrecedence(t *testing.T) {
 		WorkingDir: "/image-dir",
 	}
 	override := config.LaunchConfig{
-		Exec:    "/override/exec",
-		Args:    []string{"override-arg"},
-		Env:     map[string]string{"BOTH": "override", "FROM_OVERRIDE": "1"},
-		Workdir: "/override-dir",
-		Restart: "always",
+		Exec:          "/override/exec",
+		Args:          []string{"override-arg"},
+		Env:           map[string]string{"BOTH": "override", "FROM_OVERRIDE": "1"},
+		Workdir:       "/override-dir",
+		Restart:       "always",
+		CgroupControl: true,
 	}
 	got, err := MergeLaunch(image, override)
 	if err != nil {
@@ -36,6 +37,9 @@ func TestMergeLaunch_OverrideTakesPrecedence(t *testing.T) {
 	}
 	if got.Restart != "always" {
 		t.Errorf("Restart = %q", got.Restart)
+	}
+	if !got.CgroupControl {
+		t.Error("CgroupControl = false, want true")
 	}
 	if got.Env["BOTH"] != "override" {
 		t.Errorf("Env BOTH = %q (override should win)", got.Env["BOTH"])

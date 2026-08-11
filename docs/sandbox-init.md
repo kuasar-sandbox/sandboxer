@@ -132,7 +132,8 @@ E. switch-root:
                                                     B6 的 /opt 与 D 的 volume binds 一并进入新 /
 
 F. switch-root 之后的基础挂载:
-   mount -t cgroup2 cgroup2 /sys/fs/cgroup;mkdir /sys/fs/cgroup/app   ← freezer 冻结域 + 下放 cpu/memory/io/pids 控制器(§3.4)
+   mount -t cgroup2 cgroup2 /sys/fs/cgroup;mkdir /sys/fs/cgroup/app   ← 应用 cgroup namespace/freezer 根
+   launch.cgroup_control=true 时另 mkdir /sys/fs/cgroup/app/init,并严格下放 advertised controllers(§3.2.1)
    mount -t devpts devpts /dev/pts (newinstance,ptmxmode=0666)        ← tty 模式 openpty 需要
    mount -t tmpfs  tmpfs  /run     (nosuid,nodev)                     ← 自动挂载(类 /proc)
    mount -t tmpfs  tmpfs  /run/shm (nosuid,nodev,mode=1777)           ← 自动挂载
@@ -239,20 +240,38 @@ switch-root 之后单线程执行。
 6. write  launch_ack{stdio: 实际启用的 channel 集合}  ← 此后连接进入 MUX 帧收发态,不再关闭
 7. read   ack                            ← host 确认进入 MUX 态
 
-8. 通过 exec.Cmd 拉起子进程:
+8. 通过 exec.Cmd 拉起首次 primary helper:
      SysProcAttr.Cloneflags = CLONE_NEWNS [ | CLONE_NEWPID 当 pid_namespace=private(默认) ]
        private:app 是自身 PID ns 的 PID 1。shared(launch.pid_namespace=shared):app 留在
        sandbox-init 的 PID ns,由 PID1 reaper 收割 app 的孤儿后代(复用 init reaper)。
+     SysProcAttr.UseCgroupFD=true,CgroupFD=/sys/fs/cgroup/app 的 O_CLOEXEC 目录 fd
+       → clone3(CLONE_INTO_CGROUP)保证 helper 从出生起就在真实 /app;
+     SysProcAttr.Unshareflags 含 CLONE_NEWCGROUP
+       → Go 的 fork child 在 clone3 返回后、re-exec 前执行 unshare(CLONE_NEWCGROUP),
+          故新 cgroup namespace 以真实 /app 为根,不需要 anchor 进程。
      tty 模式: Setctty + setsid + slave 作为 fd 0/1/2;关闭 master 副本于子进程
      pipe 模式: 各 pipe/socketpair 的 child 端作为 fd 0/1/2
-     argv: [/proc/self/exe, "exec-child", isolated("1"/"0"), cred, workdir, exec, args...]
+     argv: [/proc/self/exe, "exec-child", "bootstrap", isolated, cgroupControl,
+            placeholder, cred, workdir, exec, args...]
        cred = "uid:gid:sg1,sg2"(由 spec.user 在 guest 侧 /etc/passwd 解析)或 "-"(不降权)
-       placeholder(launch.placeholder)时 argv = [..., "exec-child-placeholder", isolated, cred, workdir]
-       (无 exec/args:占位锚点,不跑任何外部程序)
+       placeholder 时同一 helper 末步等待信号,不 exec 外部程序
      env:  spec.Env(默认补 PATH)
 
-9. 子进程在新 ns 内:isolated 时 mount -t proc proc /proc(新 PID ns 必需;shared 沿用
-     sandbox-init 的 /proc)→ chdir(workdir) → 若 cred≠"-":setgroups → setgid → setuid
+9. helper 先阻塞在内部 SOCK_STREAM 握手的 start gate;父进程完成 pid 登记后才放行。
+   helper 在已有 private mount ns 内先把 / 标为 rslave(禁止反向传播),再卸载继承的
+   guest-global cgroup2 mount并重新 mount cgroup2 /sys/fs/cgroup。新 mount 受刚创建的
+   cgroup namespace 限定,真实 /app 在 helper 视图中成为 /。仅 cgroup_control=true 时,
+   bootstrap helper 向虚拟 /init/cgroup.procs 写一次 0,自迁移到真实 /app/init;这是
+   sandbox-init 实现中唯一一次 cgroup.procs 写入。
+   随后 isolated 时 mount -t proc proc /proc(新 PID ns 必需;shared 沿用
+     sandbox-init 的 /proc),再在 ready gate 阻塞。
+
+10. 父进程在 helper 的 ready gate 上:
+     - 固定打开 /proc/<pid>/ns/cgroup(O_CLOEXEC),由 sandbox-init 长期持有;
+     - cgroup_control=true 时确认真实 /app/cgroup.procs 为空,把真实 /app/
+       cgroup.controllers 中每个 advertised controller 写入 cgroup.subtree_control,
+       再回读逐项校验;任何一步失败都 abort helper,绝不启动最终应用;
+     - 发 go。helper 才执行 chdir(workdir) → 若 cred≠"-":setgroups → setgid → setuid
      (降权放在挂载 /proc 之后、execve 之前)→ syscall.Exec(exec, args...)
      placeholder 时:同样的 ns/cred 准备,但末步不 execve,改
        signal.Notify(SIGTERM,SIGINT) → <-sig → exit(0)(不可用 select{}:无活 goroutine
@@ -260,9 +279,7 @@ switch-root 之后单线程执行。
        stop 时收信号退出。host 侧强制 restart=always ⇒ 从 exec 会话 kill 占位会原地
        重拉(非 reboot);仅 host 停机(置 shutdown 后再杀)走 reboot。
 
-10. 父进程(sandbox-init pid=1):
-     - 把子进程 pid 写入 /sys/fs/cgroup/app/cgroup.procs(其派生的整棵进程树
-       随之归入该 cgroup;sandbox-init 自身留在 root cgroup,冻结时不被停)
+11. 父进程(sandbox-init pid=1)等内部 CLOEXEC socket 以 EOF 确认最终 execve 成功,然后:
      - 启动 stdio 桥接 goroutine:app 端 fd ↔ MUX 流(§3.5)。桥的 app 侧 fd 按"代"
        可换;in-place 重启先等旧代 stdout/stderr 或 PTY pump 读到 EOF 并把尾部写入
        MUX,再安装新 fd。MUX 会话和 stream 不变 → 重启不断 host 链路
@@ -270,13 +287,72 @@ switch-root 之后单线程执行。
      - 拉起 launch.plugin[] 伴生进程(见下),再进入阶段 3 supervisor
 ```
 
-**伴生进程(launch.plugin[])**。app 起来并入 cgroup 后,sandbox-init 顺序拉起每个 plugin
+#### 3.2.1 应用 cgroup namespace 与 controller 拓扑
+
+真实 `/sys/fs/cgroup/app` 在两种模式下始终同时是**应用 cgroup namespace 根**和
+snapshot 的**递归 freezer 根**;snapshot 始终只 freeze/thaw 这个路径,不调用应用或
+`envd` 的 `/freeze`。`sandbox-init` 自身与顶层 `init: []` 一次性准备命令留在 guest-global
+cgroup 根,不属于 `/app`。
+
+`launch.cgroup_control` 默认 `false`。真实布局与应用内 scoped cgroup2 视图如下:
+
+```text
+cgroup_control=false
+
+真实 guest-global                         primary/plugin/native exec 所见
+/sys/fs/cgroup/                           /sys/fs/cgroup/        (真实 /app 的 scoped mount)
+├── cgroup.procs: sandbox-init, init[]     ├── cgroup.procs: primary/plugin/exec
+└── app/                                  └── /proc/self/cgroup: 0::/
+    └── cgroup.procs: primary、restart、plugin、native exec 及其后代
+         ↑ namespace root + snapshot freeze root
+
+cgroup_control=true
+
+真实 guest-global                         primary/plugin/native exec 所见
+/sys/fs/cgroup/                           /sys/fs/cgroup/        (真实 /app 的 scoped mount)
+├── cgroup.procs: sandbox-init, init[]     ├── cgroup.procs: 空
+└── app/                                  ├── cgroup.subtree_control: 全部 advertised controllers
+    ├── cgroup.procs: 空                   ├── init/
+    ├── cgroup.subtree_control: 全部       │   └── cgroup.procs: primary/plugin/exec
+    └── init/                             └── /proc/self/cgroup: 0::/init
+        └── cgroup.procs: primary、restart、plugin、native exec 及其后代
+         ↑ /app 是 namespace/freezer 根;/init 是 sandbox-init 直接管理的长期进程组
+```
+
+`true` 模式在创建应用子组前先严格启用并回读 guest-global 根 advertised controllers,
+bootstrap 自迁移后再对真实 `/app` 做同样校验;任一 controller 缺失即启动失败。
+`false` 模式不承诺应用侧 delegation,只保留 guest-global 根的历史 best-effort 下放。
+
+图中的 cgroup `/init` **不是** sandbox.yaml 顶层 `init: []`:前者是长期应用进程组,
+后者仍由 sandbox-init 在 primary 启动前顺序执行一次。`cgroup_control=true` 给应用侧
+manager 留出空的 namespace 根及 controller delegation;例如 envd 默认创建的
+`/user`、`/ptys`、`/socats` 对应真实 `/app/{user,ptys,socats}`,与 `/init` 同级。
+不创建额外 `/exec`,native exec 仍与 primary 同组。
+
+首次 primary 的 bootstrap 是唯一特殊路径;之后 primary restart、plugin start/restart、
+native exec 的 `exec-join` 都用 pinned cgroup namespace fd,并通过
+`clone3(CLONE_INTO_CGROUP)`**直接出生在最终 target**(`/app` 或 `/app/init`)。没有
+`Start → 写 cgroup.procs` 的迁移窗口,setup/namespace/mount/握手失败均使该次启动失败。
+所有传递给 helper 的 namespace/socket fd 都立即恢复 CLOEXEC 并在使用后关闭,最终应用
+不会继承它们。应用正常访问的 `/sys/fs/cgroup` 只有上述 scoped 视图,其中不存在
+guest-global 路径 `/sys/fs/cgroup/app`;shared PID 下通过 `/proc/1/root` 检查 PID 1 的
+mount namespace 属于下述非安全边界例外。
+
+cgroup namespace 只限定 cgroupfs 的**视图与管理根**,不是额外安全边界。特别是
+`pid_namespace=shared` 时应用仍与 sandbox-init 共用 PID namespace,所以能看到
+sandbox-init 为 PID 1;其 `/proc/1/cgroup` 相对应用 namespace 甚至可能显示 `/..`。
+这与应用自身看到 cgroup 路径 `/` 或 `/init` 并不矛盾。
+
+**伴生进程(launch.plugin[])**。app 完成 bootstrap 后,sandbox-init 顺序拉起每个 plugin
 作为**自身的子进程**(故 reaper 直接收割),跑在同一 guest rootfs + app cgroup(随快照一起
 冻结)+ 网络;stdout/stderr 走 console;支持 env/workdir/user。每个 plugin 按自身
 `restart`(never|on-failure|always,默认 always)+ 共享退避(下文)独立监督。**plugin
 退出绝不影响沙箱生命周期**——只有 app(launch.exec)的退出按 launch.restart 决定 reboot
 或原地重启。plugin 与 app 是"对等体":app 隔离(private)时 plugin 仍在 sandbox-init 的
-PID ns(共享 rootfs/网络/cgroup,但不在 app 的 PID ns 内)。
+PID ns(共享 rootfs/网络/cgroup,但不在 app 的 PID ns 内)。每次 plugin 启动先以
+`CLONE_INTO_CGROUP` 进入最终 target,再由轻量 re-exec helper 在 private mount ns 中加入
+pinned cgroup namespace并挂 scoped cgroup2;placement/setup/exec 失败按 plugin 启动失败
+处理,不存在“继续运行但未冻结”的降级。
 
 **降权时机**:`spec.user` 解析后的 uid/gid 不在外层 clone 用 `SysProcAttr.Credential`
 ——否则子进程会以非 root 身份执行 `mount /proc`(新 PID ns 必需)而 EPERM 失败。
@@ -329,8 +405,9 @@ restartApp(backoff):                                  // app 原地重启,launch
   rewireApp:
     等旧代全部 app→host pump:读到 EOF 且最后字节已写入 MUX
     超过 2s 仍未 EOF(例如后代继承 writer)→ 强制关闭旧代 fd,有界继续
-    安装新代 fd,唤醒 pump 接到**不变的 MUX stream** → phase2ForkApp →
-    app_pid.store(newpid) → 入 app cgroup → app_started{newpid}
+    安装新代 fd,唤醒 pump 接到**不变的 MUX stream** → phase2ForkApp:
+    先 app_pid.store(newpid),再放行 helper;helper 以 CLONE_INTO_CGROUP 直接出生在最终
+    target、加入 pinned cgroup namespace并挂 scoped cgroup2 → app_started{newpid}
   // host 的 run 链路不断,持续收到新实例输出
 
 app_exit_then_reboot(status):
@@ -381,7 +458,8 @@ quiesce 是 host `/vm.pause` 之前的最后一次清理机会,目标两件事:
 0. (先按 §3.6 拒绝新 exec 并 SIGKILL 在飞 exec 辅助进程)freeze 应用:
    write /sys/fs/cgroup/app/cgroup.freeze = 1,轮询 cgroup.events 至 frozen 1
    (有界等待)。在 sync 前冻结 ⇒ sync 之后应用不再产生新脏页,镜像更确定;
-   freezer 原子覆盖整棵子树,含冻结期 fork 出的子进程
+   freezer 原子覆盖整棵子树,含 /init、envd 创建的 user/ptys/socats 等子树和
+   冻结期 fork 出的子进程;不调用 envd /freeze
 1. [prep] sync(2)                                  // ~ms,把 ext4 upperdir 全部 dirty 落地
 2. [prep] 若 quiesce.skip_drop_caches=false:
    open("/proc/sys/vm/drop_caches", O_WRONLY) → write("3\n")
@@ -484,14 +562,24 @@ host 侧由 CH 把它写到 sandbox-ctl 给 CH 的 stdout(一根匿名管道),sa
 为这次会话准备 stdio、起进程、回 `exec_ack`,该连接随即成为这条会话**独立**的
 stdio MUX(§4.5)。每条反向 `exec` 连接由各自的 goroutine 服务,多会话并发独立。
 
-**加入应用的命名空间**。命令必须运行在**应用自己的 mount + pid 命名空间**内,
+**加入应用的命名空间与 cgroup**。命令必须运行在**应用自己的 mount + pid + cgroup
+命名空间**内,
 这样 `ps` / `/proc/<pid>` / 按 pid 发信号都能看见并作用于应用进程树与其文件系统
 视图(语义同 `docker exec`)。但 `setns(CLONE_NEWPID)` 只对调用进程**之后 fork
 的子进程**生效、`setns(CLONE_NEWNS)` 是**线程级**——在长寿、多线程的 sandbox-init
-进程里直接 setns 既不安全也会污染自身。因此用一个**短命的 nsenter 式辅助进程**:
-它先打开应用的 `mnt` / `pid` 命名空间句柄并 setns 加入,再 fork 出真正的命令;
-命令沿用应用命名空间里**已挂载的** `/proc`(不重挂,以免扰动共享视图)。辅助进程
-全程只做"join + 拉起 + 等待回收 + 转述退出码",对 sandbox-init 主进程零副作用。
+进程里直接 setns 既不安全也会污染自身。因此 sandbox-init 先用 pinned target cgroup fd
+对 `exec-join` 做 `clone3(CLONE_INTO_CGROUP)`,注册 pid 后才通过内部握手放行;helper
+加入 pinned cgroup namespace并为其未来 child 选择应用 PID namespace。真正命令由一个
+内层 re-exec child 拉起:它先进入应用 mount namespace,沿用其中**已挂载的** `/proc` 与
+scoped cgroup2(不重挂),再解析 image 内用户并 final exec。private PID 模式下必须保留这
+两段 helper:外层若先进入应用 mount namespace,其 `/proc` 看不见外层 pid,
+`/proc/self/exe` 将无法用于 fork 内层 child。内层完成 mount join 后先停在 ready gate;
+外层此时加入同一 mount namespace,成功后才放行内层 final exec,然后只负责等待回收与
+转述退出码;任一 join 失败都不会执行用户命令,对 sandbox-init 主进程零副作用。
+
+`exec-join` 与最终命令从出生起都继承最终应用 cgroup(`/app` 或 `/app/init`),应用内分别
+看到 `0::/` 或 `0::/init`。没有独立 `/exec` cgroup,也没有任何事后
+`cgroup.procs` placement。
 
 **退出与回收**。命令退出后,guest 在该会话 MUX 上**先 EOF 全部 stdout/stderr/
 pty**,**再发 `EXIT_STATUS`**(退出码;被信号杀为 128+signo),**再**走 §4.6 的
@@ -1023,6 +1111,7 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
   "env":     {"PATH": "...", "HOME": "/root"},
   "workdir": "/",
   "restart": "never",                    // never|on-failure|always(in-place 重启 + 退避)
+  "cgroup_control": false,                // 默认 false:进程见 /;true:空根下放 controller,进程见 /init
   "placeholder": false,                  // true → 不 exec 外部程序,占位锚点等待停机;exec 互斥;host 强制 restart=always
   "share_pid": false,                    // true → 应用进 sandbox-init 的 PID ns(pid_namespace=shared)
   "user":    "0:0",                      // uid:gid 或 name:group(guest 侧 /etc/passwd 解析);空 → root
@@ -1052,8 +1141,14 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
 
 - **PID 1**:`pid_namespace=private`(默认)时用户应用是自身 PID ns 的 PID 1
   (CLONE_NEWPID);`shared` 时应用在 sandbox-init 的 PID ns(非 PID 1),由 sandbox-init
-  做 reaper 收割其孤儿后代。伴生 plugin 与应用同 rootfs/cgroup/网络,但始终在
+  做 reaper 收割其孤儿后代,并仍能看到 sandbox-init PID 1。伴生 plugin 与应用同 rootfs/cgroup/网络,但始终在
   sandbox-init 的 PID ns(private 应用看不到它们)。
+- **cgroup namespace**:真实 `/sys/fs/cgroup/app` 始终是 namespace/freezer 根。
+  `cgroup_control=false` 时 primary/restart/plugin/native exec 在真实 `/app`,scoped
+  cgroup2 与 `/proc/self/cgroup` 显示 `0::/`;`true` 时真实 `/app` 无直属进程且
+  subtree controllers 已校验启用,上述进程在真实 `/app/init`,显示 `0::/init`。
+  这里的 `/init` 是 cgroup 长期进程组,不是顶层 `init: []`;cgroup namespace 是视图与
+  管理根,不是额外安全边界。
 - **mount namespace**:私有挂载 ns,起始视图与 sandbox-init 相同(overlayfs 合并的
   / + isolated 时自挂的 /proc)
 - **网络**:配置网络源时为 eth0(virtio-net,host TAP 后端),IP 由 sandbox-init 配好;

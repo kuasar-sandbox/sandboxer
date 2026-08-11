@@ -16,7 +16,7 @@
 #   2. the guest handshake + phase-2 fork accept a no-exec spec (no "kill init")
 #   3. no CH --net, guest has only lo, and vsock-backed exec still works
 #   4. consecutive stdin exec sessions cross the complete MUX close barrier
-#   5. PID 1 in the app ns is the placeholder (exec-child-placeholder argv)
+#   5. PID 1 in the app ns is the placeholder (exec-child placeholder flag)
 #   6. SIGTERM the anchor from an exec session → in-place restart, NOT reboot
 #   7. graceful stop (SIGTERM the run process) exits 0
 #
@@ -249,7 +249,8 @@ echo "==> PASS: $EXEC_STRESS_ITERATIONS consecutive stdin exec sessions crossed 
 # ---- 2. PID 1 in the app ns is the placeholder ----------------------------
 echo "==> [2] verify PID 1 is the placeholder"
 exec1 -- cat /proc/1/cmdline >"$WORK/pid1" 2>/dev/null || true
-if grep -aq "exec-child-placeholder" "$WORK/pid1"; then
+mapfile -d '' -t PID1_ARGV < "$WORK/pid1"
+if [ "${#PID1_ARGV[@]}" -ge 6 ] && [ "${PID1_ARGV[1]}" = exec-child ] && [ "${PID1_ARGV[5]}" = 1 ]; then
     echo "==> PASS: PID 1 cmdline = $(tr '\0' ' ' < "$WORK/pid1")"
 else
     echo "==> FAIL: PID 1 is not the placeholder: $(tr '\0' ' ' < "$WORK/pid1")"; exit 1

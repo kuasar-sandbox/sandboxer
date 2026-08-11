@@ -192,7 +192,18 @@ boot:
 launch:
   args: ["-c", "import os,time\nprint('PYBOOT-OK', flush=True)\nfd=os.open('/ticks.dat', os.O_RDWR|os.O_CREAT, 0o644)\ni=0\nwhile True:\n    os.pwrite(fd, ('TICK%08d' % i).encode().ljust(4096, b'.'), i*4096)\n    os.fsync(fd)\n    blk0=os.pread(fd, 12, 0).decode()\n    print('TICK %d DISK blk0=%s' % (i, blk0), flush=True)\n    i+=1\n    time.sleep(0.25)"]
   restart: never
+  cgroup_control: true
 EOF
+
+assert_cgroup_init() {
+    local sid=$1 label=$2 got
+    got=$("$BIN/sandbox-ctl" exec --sandbox-id "$sid" --run-root "$WORK/runtime" -- cat /proc/self/cgroup)
+    grep -qE '^0::/init[[:space:]]*$' <<<"$got" || {
+        echo "FAIL: $label native exec cgroup=$got, want 0::/init"
+        exit 1
+    }
+    echo "==> $label native exec joined pinned cgroup namespace at /init"
+}
 
 # ---- run sandbox + first snapshot --upload --------------------------------
 
@@ -223,6 +234,7 @@ for _ in $(seq 1 600); do
     sleep 0.05
 done
 PRE_SNAP_TICK=$(grep -oE "^TICK [0-9]+" "$LOG1" | tail -1 | awk '{print $2}')
+assert_cgroup_init "$SID1" "cold"
 echo "==> guest at TICK $PRE_SNAP_TICK; taking snapshot --upload"
 
 SNAP1_LOG="$WORK/snap1.log"
@@ -272,6 +284,9 @@ boot:
     overlay:
       diff: file://$DIFF_RESTORE
       size: 1GiB
+launch:
+  # Snapshot topology is authoritative; every restore host deliberately says false.
+  cgroup_control: false
 EOF
 
 LOG2="$WORK/run2.log"
@@ -309,6 +324,7 @@ if [ -z "$T_FIRST_TICK_NS" ]; then
     exit 1
 fi
 RESTORE_MS=$(( (T_FIRST_TICK_NS - T_RES_BEG) / 1000000 ))
+assert_cgroup_init "$SID2" "restore #1"
 echo "==> restore + TICK $WANT_TICK (disk blk0 OK) seen in ${RESTORE_MS} ms"
 
 # ---- second snapshot --upload (dedup pass) ------------------------------
@@ -366,6 +382,8 @@ boot:
     overlay:
       diff: file://$DIFF_RESTORE2
       size: 1GiB
+launch:
+  cgroup_control: false
 EOF
 
 LOG3="$WORK/run3.log"
@@ -406,6 +424,7 @@ fi
 grep -qE "snapshot source: 2 memory layer\(s\)" "$LOG3" || {
     echo "FAIL: phase-4 restore was not 2-layer"; grep -E 'memory layer' "$LOG3" | grep -ivE faulty; kill -TERM "$SBPID3" 2>/dev/null; exit 1; }
 RESTORE2_MS=$(( (T2_NS - T_RES2_BEG) / 1000000 ))
+assert_cgroup_init "$SID3" "restore #2"
 echo "==> PASS: chained restore reached TICK $WANT_TICK2 in ${RESTORE2_MS} ms (2-layer chain; disk blk0 fall-through OK)"
 # Leave SID3 running — phase 5 snapshots it into a 3-layer chain.
 
@@ -448,6 +467,8 @@ boot:
     overlay:
       diff: file://$DIFF_RESTORE3
       size: 1GiB
+launch:
+  cgroup_control: false
 EOF
 LOG4="$WORK/run4.log"
 SID4="up4-$$"
@@ -480,6 +501,7 @@ fi
 grep -qE "snapshot source: 3 memory layer\(s\)" "$LOG4" || {
     echo "FAIL: snap#3 restore was not 3-layer (chain flattened/lost?)"; grep -E 'memory layer' "$LOG4" | grep -ivE faulty; kill -TERM "$SBPID4" 2>/dev/null; exit 1; }
 RESTORE3_MS=$(( (T3_NS - T_RES3_BEG) / 1000000 ))
+assert_cgroup_init "$SID4" "restore #3"
 echo "==> PASS: 3-layer chained restore reached TICK $WANT_TICK3 in ${RESTORE3_MS} ms (snap3→snap2→snap1; disk blk0 fall-through through 3 layers)"
 kill -TERM "$SBPID4" 2>/dev/null
 wait "$SBPID4" 2>/dev/null || true

@@ -616,6 +616,13 @@ type LaunchConfig struct {
 	Workdir string            `yaml:"workdir"`
 	Restart string            `yaml:"restart"` // never|on-failure|always
 
+	// CgroupControl delegates the application cgroup namespace root to the
+	// application. false (default) runs application processes directly in the
+	// /app namespace root. true keeps /app empty, enables its subtree
+	// controllers, and runs sandbox-init-managed application processes in
+	// /app/init so in-guest managers can create controlled child cgroups.
+	CgroupControl bool `yaml:"cgroup_control,omitempty"`
+
 	// Placeholder, when true, starts an empty "anchor" app that runs no
 	// external program (no exec): the app child sets up its namespaces/cgroup/
 	// stdio then waits for stop. exec must be empty (mutually exclusive). The
