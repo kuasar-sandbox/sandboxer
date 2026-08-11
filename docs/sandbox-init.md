@@ -1071,8 +1071,11 @@ local port;前者重置 transport epoch,后者维持分配连续性,两者职责
 
 - 任意 host→guest 短连接失败计入对应 `*_error_total`,不立刻 kill VM;由更上层
   health checker(本文档不覆盖)按指标决策
-- `restore` 在 deadline 内未收到 `restore_ack` → restore 失败回退:sandbox-ctl 调
-  CH `/vm.shutdown` 终结此次恢复并向调用方返回错误
+- `restore` 在请求发送前若 CH hybrid-vsock 已接收 `CONNECT`、却在返回
+  `OK <port>` 前以 EOF/reset 断开,host 在总 deadline 内以 25 ms 起步退避、最多
+  2 s 重拨;此阶段尚未写 `restore`,不会重放请求。首次写 `restore` 后的任何失败均
+  fail closed,不重试。最终未收到 `restore_ack` → sandbox-ctl 调 CH
+  `/vm.shutdown` 终结此次恢复并向调用方返回错误
 - MUX 连接读/写出错 → host 拨新连接发 `attach` 重建;`attach` 也失败 → 计入指标,
   应用 stdio 转发中断(应用因反压阻塞),由上层决策
 - `quiesce` 在 deadline 内未收到 `quiesced` → host 视为协议失败,**放弃此次 snapshot**
@@ -1090,7 +1093,7 @@ host 侧凡由 sandbox.yaml `timeouts.*` 接管的项以配置为准,默认不�
 | `app_exited` | 同 `app_started` | ack 拿不到也照常 reboot |
 | `ping` | `timeouts.ping`(默认不强制;生产档 200 ms) | 到点计入 `ping_timeout_total`;启用 `--ping-fatal-threshold` 须设有界值 |
 | `quiesce` | 8 s | guest 要 drop caches + 停读 app pipe + MUX_CLOSE 一来回;留足头部 |
-| `restore` | `timeouts.restore`(默认不强制) | kernel vsock 层在此期间 hold 住连接请求等 vCPU 跑起来 accept;恢复期大量缺页换入会拉长;此连接随后转 MUX |
+| `restore` | `timeouts.restore`(默认不强制) | kernel vsock 层在此期间 hold 住连接请求等 vCPU 跑起来 accept;请求前 EOF/reset 在同一总 deadline 内短时重拨(最多 2 s),`restore` 一经写出绝不重放;恢复期大量缺页换入会拉长;此连接随后转 MUX |
 | `attach` | 5 s | 同 `restore` 的 hold 语义;此连接随后转 MUX |
 | `exec` | 10 s | 比 attach 宽:guest 要 fork+exec 子进程并 PATH 解析后才回 `exec_ack`;仅覆盖握手段,连接转 MUX 后 deadline 清除 |
 | `connect` | 10 s | 仅覆盖握手段(内含 guest 侧 dial 目标 ≤ 5 s);连接转 fwd 通道后 deadline 清除 |

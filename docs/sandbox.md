@@ -1706,7 +1706,10 @@ T15 vsock 连接发 restore{epoch=N, wallclock_ns} 给 sandbox-init(guest:5000 l
      SET_WINSIZE,重建应用 stdio 桥接,per-stream window 重新协商,残留字节回放,
      host 成功建立 MUX 后,本次 restore run 写 ready 并关闭 ready fd,随后 host
      (re)start ping ticker。guest 在写 ACK 后自行 reattach/thaw;本 ready 不确认其
-     thaw 完成。deadline 到点未收到 restore_ack →
+     thaw 完成。`restore` 写入前,若 CH hybrid-vsock 在 `CONNECT 5000` 后、
+     `OK <port>` 前短暂 EOF/reset,host 在同一总 deadline 内退避重拨(最多 2 s);
+     请求尚未发送,因此不会重放。`restore` 一经写入,后续写/读/协议错误均不重试。
+     deadline 到点未收到 restore_ack →
      restore 失败回退:CH /vm.shutdown 并向调用方报错
 T16 vCPU 跑,fault 流转见 §8 uffd handler;balloon EVENT_REMOVE 同冷启动
 T17 user app 退出 / 接收外部信号 → 退出流程同冷启动

@@ -2,10 +2,13 @@ package guestlink
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
@@ -288,18 +291,107 @@ func SendQuiesce(client *HostClient, skipDropCaches bool) (proto.DropCachesResul
 // instance-specific secrets / config that were never baked into the golden
 // snapshot. nil → no per-instance file injection.
 func OpenMUXViaRestore(client *HostClient, epoch uint32, network *proto.NetworkSpec, files []proto.FileSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+	conn, err := dialRawForRestore(client, deadline, restoreDialRetryWindow)
+	if err != nil {
+		return nil, proto.StdioSpec{}, err
+	}
+
 	// WallclockNs lets the guest jump CLOCK_REALTIME forward by the
 	// dormant interval (CH reloads the snapshot's stale clock verbatim).
-	// Captured here, as close to the send as possible; the residual
+	// Captured after the connection is ready, as close to the send as
+	// possible; the residual
 	// host→guest propagation skew is sub-ms (kernel-microsecond dial,
 	// the guest's reverse-channel listener survived the snapshot).
-	return openMUX(client, &proto.Message{
+	return finishOpenMUX(conn, &proto.Message{
 		Type:        proto.TypeRestore,
 		Epoch:       epoch,
 		WallclockNs: time.Now().UnixNano(),
 		Network:     network,
 		Files:       files,
-	}, proto.TypeRestoreAck, deadline)
+	}, proto.TypeRestoreAck)
+}
+
+const (
+	restoreDialRetryWindow  = 2 * time.Second
+	restoreDialRetryInitial = 25 * time.Millisecond
+	restoreDialRetryMax     = 200 * time.Millisecond
+)
+
+// dialRawForRestore retries only the pre-request hybrid-vsock handshake. After
+// /vm.resume, CH can transiently reset a host-initiated connection before it
+// emits its "OK <port>" line while the restored guest listener is becoming
+// runnable. DialRaw has not written a proto request at that point, so redialing
+// cannot replay restore. finishOpenMUX deliberately remains outside this loop:
+// once restore is written, every error fails closed. Each retry attempt uses
+// the smaller of the overall deadline and retry-window remainder; a successful
+// CONNECT/OK restores the overall deadline before the request is written.
+func dialRawForRestore(client *HostClient, deadline, retryWindow time.Duration) (net.Conn, error) {
+	deadlineAt := time.Now().Add(deadline)
+
+	backoff := restoreDialRetryInitial
+	var lastErr error
+	var retryUntil time.Time
+	for attempt := 1; ; attempt++ {
+		attemptDeadline := deadlineAt
+		if !retryUntil.IsZero() && retryUntil.Before(attemptDeadline) {
+			attemptDeadline = retryUntil
+		}
+		remaining := time.Until(attemptDeadline)
+		if remaining <= 0 {
+			if lastErr != nil {
+				return nil, fmt.Errorf("restore pre-request connect failed after %d attempts: %w", attempt-1, lastErr)
+			}
+			return nil, fmt.Errorf("restore pre-request connect: deadline exceeded after %d attempts", attempt-1)
+		}
+
+		conn, err := client.DialRaw(remaining)
+		if err == nil {
+			// A retry's CONNECT/OK exchange is capped by retryUntil. Restore
+			// write+ACK still owns the original overall restore deadline.
+			if err := conn.SetDeadline(deadlineAt); err != nil {
+				_ = conn.Close()
+				return nil, fmt.Errorf("restore pre-request connect: restore overall deadline: %w", err)
+			}
+			if attempt > 1 && client.Logf != nil {
+				client.Logf("restore pre-request connect recovered on attempt %d", attempt)
+			}
+			return conn, nil
+		}
+		if !retryUntil.IsZero() && time.Until(retryUntil) <= 0 {
+			return nil, fmt.Errorf("restore pre-request connect failed after %d attempts: %w", attempt, err)
+		}
+		if !retryableRestoreDialError(err) {
+			return nil, err
+		}
+		lastErr = err
+		if retryUntil.IsZero() {
+			retryUntil = time.Now().Add(retryWindow)
+			if deadlineAt.Before(retryUntil) {
+				retryUntil = deadlineAt
+			}
+		}
+
+		retryRemaining := time.Until(retryUntil)
+		if retryRemaining <= backoff {
+			return nil, fmt.Errorf("restore pre-request connect failed after %d attempts: %w", attempt, err)
+		}
+		if client.Logf != nil {
+			client.Logf("restore pre-request connect attempt %d failed: %v; retrying in %s", attempt, err, backoff)
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > restoreDialRetryMax {
+			backoff = restoreDialRetryMax
+		}
+	}
+}
+
+func retryableRestoreDialError(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EPIPE)
 }
 
 // OpenMUXViaAttach re-establishes the stdio MUX after the previous one
@@ -326,6 +418,10 @@ func openMUX(client *HostClient, req *proto.Message, wantAck string, deadline ti
 	if err != nil {
 		return nil, proto.StdioSpec{}, err
 	}
+	return finishOpenMUX(conn, req, wantAck)
+}
+
+func finishOpenMUX(conn net.Conn, req *proto.Message, wantAck string) (net.Conn, proto.StdioSpec, error) {
 	if err := proto.WriteMessage(conn, req); err != nil {
 		_ = conn.Close()
 		return nil, proto.StdioSpec{}, fmt.Errorf("write %s: %w", req.Type, err)

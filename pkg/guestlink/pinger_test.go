@@ -2,9 +2,11 @@ package guestlink
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -257,6 +259,181 @@ func TestOpenMUXViaRestore(t *testing.T) {
 	defer conn.Close()
 	if spec.TTY || !spec.Stdout || !spec.Stderr {
 		t.Errorf("restore_ack stdio mismatch: %+v", spec)
+	}
+}
+
+func TestOpenMUXViaRestore_RetriesTransientEOFBeforeRequest(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+
+	var connects atomic.Uint32
+	var requests atomic.Uint32
+	proxy := newFakeCHProxyWithBeforeOK(t, base, func(net.Conn) bool {
+		// Model CH accepting CONNECT immediately after /vm.resume, then
+		// dropping that first connection before the guest listener is ready.
+		return connects.Add(1) == 1
+	}, func(c net.Conn) {
+		req, err := proto.ReadMessage(c)
+		if err != nil {
+			t.Errorf("guest read: %v", err)
+			return
+		}
+		requests.Add(1)
+		_ = proto.WriteMessage(c, &proto.Message{
+			Type:     proto.TypeRestoreAck,
+			Epoch:    req.Epoch,
+			AppState: proto.AppStateRunning,
+		})
+	})
+	defer proxy.close()
+
+	conn, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 4, nil, nil, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if got := connects.Load(); got != 2 {
+		t.Fatalf("CONNECT attempts = %d, want 2", got)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("restore requests = %d, want exactly 1", got)
+	}
+}
+
+func TestOpenMUXViaRestore_DoesNotRetryAfterRequest(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+
+	var connects atomic.Uint32
+	var requests atomic.Uint32
+	proxy := newFakeCHProxyWithBeforeOK(t, base, func(net.Conn) bool {
+		connects.Add(1)
+		return false
+	}, func(c net.Conn) {
+		if _, err := proto.ReadMessage(c); err == nil {
+			requests.Add(1)
+		}
+		// Close without restore_ack. The request may already have taken
+		// effect, so this failure must not enter the pre-request retry loop.
+	})
+	defer proxy.close()
+
+	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 5, nil, nil, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "read restore_ack") {
+		t.Fatalf("error = %v, want restore_ack read failure", err)
+	}
+	if got := connects.Load(); got != 1 {
+		t.Fatalf("CONNECT attempts = %d, want 1", got)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("restore requests = %d, want exactly 1", got)
+	}
+}
+
+func TestOpenMUXViaRestore_TransientRetryIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+
+	var connects atomic.Uint32
+	proxy := newFakeCHProxyWithBeforeOK(t, base, func(net.Conn) bool {
+		connects.Add(1)
+		return true
+	}, func(net.Conn) {
+		t.Error("guest received a connection without CH acknowledging it")
+	})
+	defer proxy.close()
+
+	started := time.Now()
+	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 6, nil, nil, 250*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected bounded pre-request connect failure")
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("error = %v, want wrapped EOF", err)
+	}
+	if !strings.Contains(err.Error(), "restore pre-request connect failed") {
+		t.Fatalf("error = %v, want retry context", err)
+	}
+	if got := connects.Load(); got < 2 {
+		t.Fatalf("CONNECT attempts = %d, want at least 2", got)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("retry took %v, want bounded failure", elapsed)
+	}
+}
+
+func TestDialRawForRestore_BoundsStalledRetryAttempt(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+
+	var connects atomic.Uint32
+	releaseStall := make(chan struct{})
+	proxy := newFakeCHProxyWithBeforeOK(t, base, func(net.Conn) bool {
+		if connects.Add(1) == 1 {
+			return true // first attempt: transient EOF before OK
+		}
+		<-releaseStall // retry: CONNECT accepted, but CH never emits OK
+		return true
+	}, func(net.Conn) {
+		t.Error("guest received a connection before CH acknowledgement")
+	})
+	defer proxy.close()
+	defer close(releaseStall)
+
+	done := make(chan error, 1)
+	go func() {
+		conn, err := dialRawForRestore(&HostClient{BasePath: base, Logf: t.Logf}, 2*time.Second, 100*time.Millisecond)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "restore pre-request connect failed") {
+			t.Fatalf("error = %v, want bounded retry failure", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("stalled retry exceeded its retry window")
+	}
+	if got := connects.Load(); got != 2 {
+		t.Fatalf("CONNECT attempts = %d, want 2", got)
+	}
+}
+
+func TestOpenMUXViaRestore_DoesNotRetryNonTransientHandshakeError(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+
+	var connects atomic.Uint32
+	proxy := newFakeCHProxyWithBeforeOK(t, base, func(c net.Conn) bool {
+		connects.Add(1)
+		// A syntactically invalid CH acknowledgement is a protocol error,
+		// not the transient EOF/reset boundary. Fill drainLine's cap without
+		// a newline so the client fails deterministically.
+		_, _ = c.Write(make([]byte, 64))
+		return true
+	}, func(net.Conn) {
+		t.Error("guest received a connection after invalid CH acknowledgement")
+	})
+	defer proxy.close()
+
+	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 7, nil, nil, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "OK line not terminated") {
+		t.Fatalf("error = %v, want non-transient handshake failure", err)
+	}
+	if got := connects.Load(); got != 1 {
+		t.Fatalf("CONNECT attempts = %d, want 1", got)
+	}
+}
+
+func TestRetryableRestoreDialError(t *testing.T) {
+	if !retryableRestoreDialError(io.EOF) {
+		t.Error("EOF should be retryable before the restore request")
+	}
+	if retryableRestoreDialError(errors.New("bad CONNECT protocol")) {
+		t.Error("arbitrary protocol error should fail without retry")
 	}
 }
 
