@@ -289,3 +289,20 @@ func TestPluginHelperEnvironmentKeepsDefaultPATH(t *testing.T) {
 		t.Fatalf("explicit plugin PATH did not override default: %v", overridden)
 	}
 }
+
+func TestVerifyChildParentAliveAcrossCredentialTransition(t *testing.T) {
+	parent, child, err := newChildSyncPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	if err := verifyChildParentAlive(int(child.Fd())); err != nil {
+		t.Fatalf("live handshake peer reported dead: %v", err)
+	}
+	if err := parent.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyChildParentAlive(int(child.Fd())); err == nil || !strings.Contains(err.Error(), "credential transition") {
+		t.Fatalf("closed handshake peer check = %v, want fail-closed error", err)
+	}
+}

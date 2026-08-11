@@ -588,7 +588,9 @@ pty**,**再发 `EXIT_STATUS`**(退出码;被信号杀为 128+signo),**再**走 �
 (§3.3);supervisor 的子进程回收器把"非应用子进程"的退出态路由给对应 exec 会话,
 不误判为应用退出。
 
-**与 snapshot 的关系**。辅助进程持有父死信号:它被杀即一并带走那条命令。会话
+**与 snapshot 的关系**。内层 helper 在 setup 前设置父死信号;降权可能清除此信号时,
+它在降权后重设,并通过私有握手 socket 的无阻塞 EOF 检查确认原 `exec-join` 仍存活,
+之后才 final exec。因而外层辅助进程被杀会一并带走那条命令。会话
 MUX 中途断(host 侧 `sandbox-ctl exec` 退出 / 失联)→ guest SIGKILL 该命令,命令
 不会比其会话存活更久。snapshot quiesce(§3.4)开始时**拒绝新的 exec 并 SIGKILL
 所有在飞的 exec 辅助进程**(快照不能带运行中的 exec 兄弟进程);沙箱在 resume /

@@ -332,8 +332,13 @@ func execFinalApplication(sync *childSync, cred, workdir, appPath string, args [
 	}
 	if joined {
 		// A credential transition can clear PDEATHSIG. Re-arm it after
-		// applyCred so the final command cannot outlive exec-join.
+		// applyCred, then prove the original exec-join still owns the peer
+		// handshake socket. If it died during the credential transition,
+		// re-arming alone could bind the signal to a new reaper parent.
 		if err := armParentDeathSignal(); err != nil {
+			return err
+		}
+		if err := verifyChildParentAlive(int(sync.file.Fd())); err != nil {
 			return err
 		}
 	}
@@ -406,4 +411,23 @@ func armParentDeathSignal() error {
 		return fmt.Errorf("set pdeathsig: %w", err)
 	}
 	return nil
+}
+
+// verifyChildParentAlive checks the private handshake socket without
+// consuming data. After the child has received "go", an alive exec-join owns
+// the peer and the empty stream returns EAGAIN. EOF proves that original peer
+// exited during a credential transition that may have cleared PDEATHSIG.
+func verifyChildParentAlive(fd int) error {
+	var probe [1]byte
+	n, _, err := unix.Recvfrom(fd, probe[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
+	if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check exec-join handshake peer: %w", err)
+	}
+	if n == 0 {
+		return errors.New("exec-join exited during credential transition")
+	}
+	return errors.New("unexpected exec-join handshake data before final exec")
 }
