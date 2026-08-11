@@ -821,23 +821,41 @@ func envSliceFromMap(m map[string]string) []string {
 // runMemReporter samples /proc/meminfo every interval and pushes a
 // mem_report to the host. Best-effort: errors logged, ticker continues.
 // First report fires immediately so the host's BalloonController gets
-// a baseline before its first reconcile tick.
+// a baseline before its first reconcile tick. After an error streak, the
+// first acknowledged report emits one recovery marker so callers can
+// distinguish a transient timeout from a stalled channel.
 func runMemReporter(interval time.Duration) {
-	push := func() {
-		avail, total, err := readMemInfo()
-		if err != nil {
-			logf("mem_report: read /proc/meminfo: %v", err)
-			return
-		}
-		if err := notifyMemReport(avail, total); err != nil {
-			logf("mem_report: %v", err)
-		}
-	}
+	push := newMemReportAttempt(readMemInfo, notifyMemReport, logf)
 	push()
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for range t.C {
 		push()
+	}
+}
+
+func newMemReportAttempt(
+	read func() (memAvailable, memTotal uint64, err error),
+	notify func(memAvailable, memTotal uint64) error,
+	logf func(string, ...any),
+) func() {
+	consecutiveFailures := 0
+	return func() {
+		avail, total, err := read()
+		if err != nil {
+			logf("mem_report: read /proc/meminfo: %v", err)
+			consecutiveFailures++
+			return
+		}
+		if err := notify(avail, total); err != nil {
+			logf("mem_report: %v", err)
+			consecutiveFailures++
+			return
+		}
+		if consecutiveFailures > 0 {
+			logf("mem_report: recovered after %d consecutive failures", consecutiveFailures)
+			consecutiveFailures = 0
+		}
 	}
 }
 
