@@ -14,6 +14,24 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// transferReadinessFD models the inherited --ready-fd ownership contract. The
+// production writer adopts and closes the numeric descriptor, so the original
+// *os.File must be closed (and its finalizer disarmed) before that descriptor can
+// be reused by another test.
+func transferReadinessFD(t *testing.T, f *os.File) int {
+	t.Helper()
+	fd, err := unix.Dup(int(f.Fd()))
+	if err != nil {
+		_ = f.Close()
+		t.Fatalf("duplicate readiness fd: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = unix.Close(fd)
+		t.Fatalf("close readiness fd source: %v", err)
+	}
+	return fd
+}
+
 func TestRunCmdRejectsReadyFDBelowThree(t *testing.T) {
 	rc, stderr := captureStderr(t, func() int {
 		return runCmd([]string{"--ready-fd=2"})
@@ -44,10 +62,11 @@ func TestRunCmdEarlyFailureClosesReadyFD(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
+	readyFD := transferReadinessFD(t, w)
 
 	rc, _ := captureStderr(t, func() int {
 		return runCmd([]string{
-			"--ready-fd=" + strconv.Itoa(int(w.Fd())),
+			"--ready-fd=" + strconv.Itoa(readyFD),
 			"--ch-binary=/nonexistent/cloud-hypervisor",
 			"--config=/nonexistent/sandbox.yaml",
 		})
@@ -70,12 +89,14 @@ func TestReadinessFDWriterSetsCLOEXEC(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	n, err := newReadinessFDWriter(int(w.Fd()), nil)
+	readyFD := transferReadinessFD(t, w)
+	n, err := newReadinessFDWriter(readyFD, nil)
 	if err != nil {
+		_ = unix.Close(readyFD)
 		t.Fatal(err)
 	}
 	defer n.Close()
-	flags, err := unix.FcntlInt(w.Fd(), unix.F_GETFD, 0)
+	flags, err := unix.FcntlInt(uintptr(readyFD), unix.F_GETFD, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,8 +111,10 @@ func TestReadinessFDWriterExactSequenceAndDuplicates(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	n, err := newReadinessFDWriter(int(w.Fd()), nil)
+	readyFD := transferReadinessFD(t, w)
+	n, err := newReadinessFDWriter(readyFD, nil)
 	if err != nil {
+		_ = unix.Close(readyFD)
 		t.Fatal(err)
 	}
 	n.Notify(sandbox.ReadinessControlReady)
@@ -117,10 +140,12 @@ func TestReadinessFDWriterReadyBeforeControlFailsClosed(t *testing.T) {
 	}
 	defer r.Close()
 	var logs bytes.Buffer
-	n, err := newReadinessFDWriter(int(w.Fd()), func(format string, args ...any) {
+	readyFD := transferReadinessFD(t, w)
+	n, err := newReadinessFDWriter(readyFD, func(format string, args ...any) {
 		fmt.Fprintf(&logs, format+"\n", args...)
 	})
 	if err != nil {
+		_ = unix.Close(readyFD)
 		t.Fatal(err)
 	}
 	n.Notify(sandbox.ReadinessReady)
@@ -146,10 +171,12 @@ func TestReadinessFDWriterEPIPEDisablesWithoutFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	var logs bytes.Buffer
-	n, err := newReadinessFDWriter(int(w.Fd()), func(format string, args ...any) {
+	readyFD := transferReadinessFD(t, w)
+	n, err := newReadinessFDWriter(readyFD, func(format string, args ...any) {
 		fmt.Fprintf(&logs, format+"\n", args...)
 	})
 	if err != nil {
+		_ = unix.Close(readyFD)
 		t.Fatal(err)
 	}
 	n.Notify(sandbox.ReadinessControlReady)
@@ -167,8 +194,10 @@ func TestReadinessFDWriterConcurrentNotifyAndClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := newReadinessFDWriter(int(w.Fd()), nil)
+	readyFD := transferReadinessFD(t, w)
+	n, err := newReadinessFDWriter(readyFD, nil)
 	if err != nil {
+		_ = unix.Close(readyFD)
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
