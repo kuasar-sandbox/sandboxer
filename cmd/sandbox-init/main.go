@@ -146,6 +146,13 @@ func main() {
 	}
 	logf("phase2: network + stdio done")
 
+	// Register SIGCHLD before the first primary/plugin can exit. The buffered
+	// channel retains an edge until phase3 starts consuming it, so a plugin
+	// helper that fails setup during the initial synchronous launch pass is
+	// still reaped and retried according to plugin launch-failure semantics.
+	sigCh := make(chan os.Signal, 16)
+	signal.Notify(sigCh, syscall.SIGCHLD)
+
 	appPid, err := phase2ForkApp(spec, cs, true, nil)
 	if err != nil {
 		die("phase 2 fork: %v", err)
@@ -185,7 +192,7 @@ func main() {
 	// starves this very vsock listener after ~16 s).
 	go runMemReporter(memReportInterval)
 
-	phase3Supervise(supervisor, bridge)
+	phase3Supervise(supervisor, bridge, sigCh)
 	// phase3Supervise does not return.
 }
 
@@ -630,8 +637,7 @@ type supervisorState struct {
 // (restart in place with backoff, or reboot); plugin exits route to the plugin
 // supervisor; exec-session children route to their session; orphans (shared-PID
 // apps' descendants) are reaped silently.
-func phase3Supervise(s *supervisorState, b *consoleBridge) {
-	sigCh := make(chan os.Signal, 16)
+func phase3Supervise(s *supervisorState, b *consoleBridge, sigCh chan os.Signal) {
 	signal.Notify(sigCh, syscall.SIGCHLD, syscall.SIGTERM, syscall.SIGINT)
 
 	for {

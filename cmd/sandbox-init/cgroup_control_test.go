@@ -265,3 +265,27 @@ func TestChildHandshakeParentFailureAbortsFinalExecGate(t *testing.T) {
 		t.Fatalf("helper did not stop cleanly at the final-exec gate: %v", waitErr)
 	}
 }
+
+func TestPluginHelperEnvironmentKeepsDefaultPATH(t *testing.T) {
+	value := func(env []string, key string) string {
+		prefix := key + "="
+		for _, entry := range env {
+			if strings.HasPrefix(entry, prefix) {
+				return strings.TrimPrefix(entry, prefix)
+			}
+		}
+		return ""
+	}
+
+	got := execEnv(map[string]string{"LOG": "info"})
+	if value(got, "PATH") == "" {
+		t.Fatalf("plugin helper environment lost default PATH: %v", got)
+	}
+	if value(got, "LOG") != "info" {
+		t.Fatalf("plugin helper environment lost explicit variable: %v", got)
+	}
+	overridden := execEnv(map[string]string{"PATH": "/plugin/bin"})
+	if value(overridden, "PATH") != "/plugin/bin" {
+		t.Fatalf("explicit plugin PATH did not override default: %v", overridden)
+	}
+}

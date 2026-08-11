@@ -203,10 +203,13 @@ func startPluginProcess(s proto.PluginSpec, onSpawn func(int) error, onFailure f
 		_ = childSync.Close()
 		return 0, err
 	}
+	// Preserve the documented/default PATH for bare plugin executables;
+	// explicit plugin PATH still wins.
+	pluginEnv := execEnv(s.Env)
 	cmd := exec.Cmd{
 		Path:        self,
 		Args:        args,
-		Env:         envSliceFromMap(s.Env),
+		Env:         pluginEnv,
 		Dir:         "/",
 		Stdin:       nil,
 		Stdout:      os.Stderr,
