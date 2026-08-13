@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -151,21 +153,61 @@ func (h *LeaseHandle) Close() error {
 // ReadLease reads one immutable record. Lock ownership must be checked
 // separately; file existence/content alone does not establish liveness.
 func ReadLease(path string) (Lease, error) {
-	var lease Lease
-	f, err := os.Open(path)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
-		return lease, err
+		return Lease{}, err
+	}
+	f := os.NewFile(uintptr(fd), "sandbox-resource-lease-read")
+	if f == nil {
+		_ = unix.Close(fd)
+		return Lease{}, fmt.Errorf("lease adopt read fd")
 	}
 	defer f.Close()
+	return decodeLease(f)
+}
+
+func decodeLease(f *os.File) (Lease, error) {
+	var lease Lease
 	dec := json.NewDecoder(f)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&lease); err != nil {
 		return lease, err
 	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return lease, fmt.Errorf("lease has trailing JSON value")
+		}
+		return lease, fmt.Errorf("lease trailing content: %w", err)
+	}
 	if err := lease.Validate(); err != nil {
 		return lease, err
 	}
 	return lease, nil
+}
+
+// InspectLease obtains lock ownership and immutable content from one open file
+// description, so a pathname replacement cannot splice one process's lock
+// identity onto another inode's JSON. A locked corrupt lease returns
+// locked=true and its owner together with the decode error, allowing callers
+// to install a full-pool unknown charge.
+func InspectLease(path string) (lease Lease, ownerPID int, locked bool, err error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return Lease{}, 0, false, err
+	}
+	f := os.NewFile(uintptr(fd), "sandbox-resource-lease-inspect")
+	if f == nil {
+		_ = unix.Close(fd)
+		return Lease{}, 0, false, fmt.Errorf("lease adopt inspect fd")
+	}
+	defer f.Close()
+	ownerPID, locked, err = LockOwnerFD(f.Fd())
+	if err != nil || !locked {
+		return Lease{}, ownerPID, locked, err
+	}
+	lease, err = decodeLease(f)
+	return lease, ownerPID, true, err
 }
 
 // LeaseLockOwner queries the conflicting POSIX write lock with F_GETLK.
@@ -189,4 +231,38 @@ func LockOwnerFD(fd uintptr) (ownerPID int, locked bool, err error) {
 		return 0, false, nil
 	}
 	return int(query.Pid), true, nil
+}
+
+// RemoveUnlockedLease removes a stale record only while holding the same POSIX
+// write lock used by its owner. This closes the F_GETLK -> unlink race with a
+// new sandbox process opening and locking the stale inode between inventory
+// inspection and cleanup. removed=false means another process owns the lease.
+func RemoveUnlockedLease(path string) (removed bool, err error) {
+	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return false, nil
+		}
+		return false, err
+	}
+	f := os.NewFile(uintptr(fd), "stale-sandbox-resource-lease")
+	if f == nil {
+		_ = unix.Close(fd)
+		return false, fmt.Errorf("lease adopt stale fd")
+	}
+	defer f.Close()
+	lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 0}
+	if err := unix.FcntlFlock(f.Fd(), unix.F_SETLK, &lock); err != nil {
+		if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EAGAIN) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
