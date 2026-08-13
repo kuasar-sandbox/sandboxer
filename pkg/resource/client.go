@@ -53,6 +53,7 @@ func (c *Client) Connect() error {
 	defer c.mu.Unlock()
 	if c.conn != nil {
 		_ = c.conn.Close()
+		c.conn = nil
 	}
 	conn, err := net.DialTimeout("unix", c.SocketPath, 5*time.Second)
 	if err != nil {

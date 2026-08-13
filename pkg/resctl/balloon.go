@@ -67,8 +67,8 @@ type BalloonController struct {
 	chSock string
 	client *http.Client
 
-	target atomic.Uint64 // desired balloon size in bytes
-	actual atomic.Uint64 // last successfully applied size
+	target      atomic.Uint64 // desired balloon size in bytes
+	actual      atomic.Uint64 // last successfully applied size
 	reconcileMu sync.Mutex
 
 	// kick is a non-blocking signal channel: SetTarget (and therefore
@@ -162,8 +162,19 @@ func (b *BalloonController) SetAllocatable(allocBytes uint64) {
 // and advances appliedAllocatable only after this returns successfully.
 func (b *BalloonController) ApplyAllocatable(ctx context.Context, allocBytes uint64) error {
 	b.defaults()
-	b.target.Store(b.targetForAllocatable(allocBytes))
-	return b.Reconcile(ctx)
+	previous := b.target.Load()
+	target := b.targetForAllocatable(allocBytes)
+	b.target.Store(target)
+	if err := b.Reconcile(ctx); err != nil {
+		// Do not leave a failed controller budget queued for the background
+		// reconcile loop. ControllerHooks deliberately keeps reporting the
+		// previous applied allocation on error; a later untracked resize would
+		// otherwise make StateSync undercount the live consumer. Preserve a
+		// concurrent Hint/SetTarget update instead of overwriting it.
+		b.target.CompareAndSwap(target, previous)
+		return err
+	}
+	return nil
 }
 
 // SeedAppliedAllocatable initializes the desired and applied balloon target

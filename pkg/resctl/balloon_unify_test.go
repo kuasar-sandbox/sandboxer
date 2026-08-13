@@ -320,14 +320,24 @@ func TestHooks_SettledRestoreFailedCorrectionKeepsObservedAllocation(t *testing.
 	cfg.ApplyDefaults()
 	b := NewBalloonController(filepath.Join(t.TempDir(), "missing-ch.sock"), 8<<30, nil)
 	b.SeedAppliedAllocatable(2 << 30)
+	originalTarget := b.CurrentTarget()
 	h := &ControllerHooks{opts: ControllerHookOptions{Balloon: b, Logf: func(string, ...any) {}}, cfg: cfg}
 	h.SetRestoreAppliedAllocatable(2 << 30)
 
 	if err := h.SettledRestore(2<<30, 3<<30); err == nil {
 		t.Fatal("SettledRestore succeeded despite failed balloon correction")
 	}
+	if !h.localState().settled {
+		t.Fatal("failed post-restore correction lost the crossed settle barrier")
+	}
 	if got := h.AllocatableNowMem(); got != 2<<30 {
 		t.Fatalf("applied allocation advanced after failed correction: got %d want %d", got, uint64(2<<30))
+	}
+	if got := b.CurrentTarget(); got != originalTarget {
+		t.Fatalf("failed correction remained queued: target=%d want=%d", got, originalTarget)
+	}
+	if err := b.Reconcile(context.Background()); err != nil {
+		t.Fatalf("rolled-back reconcile retried failed resize: %v", err)
 	}
 }
 

@@ -271,6 +271,12 @@ func (h *ControllerHooks) Settled() error {
 	h.sessionMu.Lock()
 	defer h.sessionMu.Unlock()
 	state := h.localState()
+	// The guest crossed the settle barrier independently of controller or
+	// local enforcement health. Commit that fact first so a reconnect can
+	// replay it even when memory.high/balloon or the Settled RPC fails.
+	h.mu.Lock()
+	h.settled = true
+	h.mu.Unlock()
 	target := state.desired
 	if target == 0 {
 		target = state.applied
@@ -282,7 +288,6 @@ func (h *ControllerHooks) Settled() error {
 		return fmt.Errorf("settled apply allocatable: %w", err)
 	}
 	h.mu.Lock()
-	h.settled = true
 	connected := h.connected
 	h.mu.Unlock()
 	if !h.Enabled() {
@@ -310,6 +315,11 @@ func (h *ControllerHooks) SettledRestore(allocAtSnap, desiredAlloc uint64) error
 	h.sessionMu.Lock()
 	defer h.sessionMu.Unlock()
 	state := h.localState()
+	// restore_ack is the local settle barrier. Record it before any fallible
+	// post-resume resource correction or controller notification.
+	h.mu.Lock()
+	h.settled = true
+	h.mu.Unlock()
 	if desiredAlloc == 0 {
 		desiredAlloc = state.desired
 	}
@@ -323,7 +333,6 @@ func (h *ControllerHooks) SettledRestore(allocAtSnap, desiredAlloc uint64) error
 		h.opts.Logf("settled-restore: applied correction alloc %d → %d", allocAtSnap, desiredAlloc)
 	}
 	h.mu.Lock()
-	h.settled = true
 	connected := h.connected
 	h.mu.Unlock()
 	if !h.Enabled() {
