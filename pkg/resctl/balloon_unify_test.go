@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -312,6 +313,61 @@ func TestHooks_OnAllocatableChangedTouchesBalloon(t *testing.T) {
 	}
 	if got := h.AllocatableNowMem(); got != 2<<30 {
 		t.Errorf("allocatableNowMem = %d, want %d", got, 2<<30)
+	}
+}
+
+func TestHooks_OnAllocatableChangedRollsBackMemoryHighWhenBalloonFails(t *testing.T) {
+	const (
+		capacity      = uint64(8 << 30)
+		previousAlloc = uint64(2 << 30)
+		newAlloc      = uint64(3 << 30)
+	)
+	cgroup := t.TempDir()
+	memoryHigh := filepath.Join(cgroup, "memory.high")
+	previousHigh := []byte("1879048192\n")
+	if err := os.WriteFile(memoryHigh, previousHigh, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b := NewBalloonController(filepath.Join(t.TempDir(), "missing-ch.sock"), capacity, nil)
+	b.SeedAppliedAllocatable(previousAlloc)
+	cfg := &config.SandboxConfig{
+		Resources: config.ResourcesConfig{
+			Capacity:    config.CapacityConfig{Memory: "8GiB"},
+			Allocatable: config.AllocatableConfig{Memory: "1GiB"},
+		},
+	}
+	cfg.ApplyDefaults()
+	h := &ControllerHooks{
+		opts: ControllerHookOptions{
+			SocketPath: "/run/node-resource-controller.sock",
+			CgroupPath: cgroup,
+			Balloon:    b,
+			Logf:       func(string, ...any) {},
+		},
+		cfg:               cfg,
+		allocatableNowMem: previousAlloc,
+		desiredAllocMem:   previousAlloc,
+	}
+
+	if err := h.OnAllocatableChanged(newAlloc); err == nil {
+		t.Fatal("OnAllocatableChanged succeeded despite failed balloon enforcement")
+	}
+	gotHigh, err := os.ReadFile(memoryHigh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotHigh) != string(previousHigh) {
+		t.Fatalf("memory.high = %q after failed balloon, want rollback to %q", gotHigh, previousHigh)
+	}
+	if got := h.AllocatableNowMem(); got != previousAlloc {
+		t.Fatalf("applied allocation advanced to %d, want %d", got, previousAlloc)
+	}
+	wantBalloon := capacity - previousAlloc
+	if got := b.CurrentTarget(); got != wantBalloon {
+		t.Fatalf("balloon target = %d after failed apply, want rollback to %d", got, wantBalloon)
+	}
+	if got := b.CurrentActual(); got != wantBalloon {
+		t.Fatalf("balloon actual = %d after failed apply, want %d", got, wantBalloon)
 	}
 }
 

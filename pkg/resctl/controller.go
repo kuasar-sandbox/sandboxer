@@ -361,8 +361,8 @@ func (h *ControllerHooks) notifySettledLocked(operation string) error {
 	}
 	rss := readMemoryCurrent(h.opts.CgroupPath)
 	if err := h.client.Settled(rss, 0); err != nil {
+		h.markDisconnectedLocked(err)
 		if resource.IsTransportError(err) {
-			h.markDisconnectedLocked(err)
 			return nil
 		}
 		return fmt.Errorf("%s: %w", operation, err)
@@ -398,18 +398,25 @@ func (h *ControllerHooks) applyContext() context.Context {
 }
 
 func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes uint64) error {
+	previousHigh, err := h.readMemoryHigh()
+	if err != nil {
+		return err
+	}
 	if err := h.setMemoryHigh(allocBytes); err != nil {
 		return err
 	}
 	if h.opts.Balloon != nil {
-		var err error
+		var balloonErr error
 		if h.Enabled() {
-			err = h.opts.Balloon.ApplyAllocatable(ctx, allocBytes)
+			balloonErr = h.opts.Balloon.ApplyAllocatable(ctx, allocBytes)
 		} else {
-			err = h.opts.Balloon.ApplyAllocatableEventually(ctx, allocBytes)
+			balloonErr = h.opts.Balloon.ApplyAllocatableEventually(ctx, allocBytes)
 		}
-		if err != nil {
-			return err
+		if balloonErr != nil {
+			if rollbackErr := h.restoreMemoryHigh(previousHigh); rollbackErr != nil {
+				return errors.Join(balloonErr, fmt.Errorf("rollback memory.high: %w", rollbackErr))
+			}
+			return balloonErr
 		}
 	}
 	h.mu.Lock()
@@ -419,8 +426,36 @@ func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes
 	return nil
 }
 
-func (h *ControllerHooks) setMemoryHigh(allocBytes uint64) error {
+func (h *ControllerHooks) memoryHighPath() string {
 	if h == nil || h.opts.CgroupPath == "" {
+		return ""
+	}
+	return filepath.Join(h.opts.CgroupPath, "memory.high")
+}
+
+func (h *ControllerHooks) readMemoryHigh() ([]byte, error) {
+	path := h.memoryHighPath()
+	if path == "" {
+		return nil, nil
+	}
+	value, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read memory.high: %w", err)
+	}
+	return value, nil
+}
+
+func (h *ControllerHooks) restoreMemoryHigh(value []byte) error {
+	path := h.memoryHighPath()
+	if path == "" {
+		return nil
+	}
+	return os.WriteFile(path, value, 0o644)
+}
+
+func (h *ControllerHooks) setMemoryHigh(allocBytes uint64) error {
+	path := h.memoryHighPath()
+	if path == "" {
 		return nil
 	}
 	ratio := 0.875
@@ -432,7 +467,6 @@ func (h *ControllerHooks) setMemoryHigh(allocBytes uint64) error {
 		}
 	}
 	newHigh := uint64(float64(allocBytes) * ratio)
-	path := filepath.Join(h.opts.CgroupPath, "memory.high")
 	if err := os.WriteFile(path, []byte(strconv.FormatUint(newHigh, 10)), 0o644); err != nil {
 		return fmt.Errorf("write memory.high: %w", err)
 	}

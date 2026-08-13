@@ -30,17 +30,25 @@ type settledController struct {
 	socket   string
 	listener *net.UnixListener
 	settled  chan resource.Message
+	synced   chan resource.Message
+	reject   bool
 	done     chan struct{}
 }
 
-func startSettledController(t *testing.T) *settledController {
+func startSettledController(t *testing.T, reject ...bool) *settledController {
 	t.Helper()
 	socket := filepath.Join(t.TempDir(), "controller.sock")
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &settledController{t: t, socket: socket, listener: listener, settled: make(chan resource.Message, 1), done: make(chan struct{})}
+	c := &settledController{
+		t: t, socket: socket, listener: listener,
+		settled: make(chan resource.Message, 1), synced: make(chan resource.Message, 1), done: make(chan struct{}),
+	}
+	if len(reject) > 0 {
+		c.reject = reject[0]
+	}
 	go func() {
 		defer close(c.done)
 		conn, err := listener.AcceptUnix()
@@ -63,10 +71,34 @@ func startSettledController(t *testing.T) *settledController {
 			return
 		}
 		c.settled <- *settled
-		_ = resource.WriteMessage(conn, &resource.Message{Type: resource.TypeAck})
-		release, err := resource.ReadMessage(conn)
-		if err == nil && release.Type == resource.TypeRelease {
+		if !c.reject {
 			_ = resource.WriteMessage(conn, &resource.Message{Type: resource.TypeAck})
+			release, err := resource.ReadMessage(conn)
+			if err == nil && release.Type == resource.TypeRelease {
+				_ = resource.WriteMessage(conn, &resource.Message{Type: resource.TypeAck})
+			}
+			return
+		}
+		_ = resource.WriteMessage(conn, &resource.Message{Type: resource.TypeError, Msg: "invalid session token"})
+		_ = conn.Close()
+
+		reconnected, err := listener.AcceptUnix()
+		if err != nil {
+			return
+		}
+		defer reconnected.Close()
+		syncReq, err := resource.ReadMessage(reconnected)
+		if err != nil || syncReq.Type != resource.TypeStateSync {
+			t.Errorf("state sync request = %+v err=%v", syncReq, err)
+			return
+		}
+		_ = resource.WriteMessage(reconnected, &resource.Message{
+			Type: resource.TypeAck, Token: "settled-sync-token", NewAllocatable: syncReq.AppliedAllocatableMemory,
+		})
+		c.synced <- *syncReq
+		release, err := resource.ReadMessage(reconnected)
+		if err == nil && release.Type == resource.TypeRelease {
+			_ = resource.WriteMessage(reconnected, &resource.Message{Type: resource.TypeAck})
 		}
 	}()
 	t.Cleanup(func() {
@@ -366,6 +398,46 @@ func TestSettledNotificationSurvivesLocalEnforcementFailure(t *testing.T) {
 	}
 	if !hooks.localState().settled {
 		t.Fatal("local settle barrier was not retained")
+	}
+}
+
+func TestSettledExplicitErrorReconnectsWithSettledState(t *testing.T) {
+	controller := startSettledController(t, true)
+	cgroup := filepath.Join(t.TempDir(), "cgroup")
+	if err := os.MkdirAll(cgroup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{"memory.high": "max", "memory.current": "1"} {
+		if err := os.WriteFile(filepath.Join(cgroup, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: controller.socket, CgroupPath: cgroup, SandboxID: "settled-reconnect",
+		Context: context.Background(), Logf: t.Logf,
+	}, reconnectConfig(t, controller.socket, cgroup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hooks.Release("test")
+	if _, err := hooks.Admit("settled-reconnect", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := hooks.Settled(); err == nil {
+		t.Fatal("Settled hid the controller rejection")
+	}
+	select {
+	case syncReq := <-controller.synced:
+		if syncReq.SandboxID != "settled-reconnect" || !syncReq.Settled ||
+			syncReq.AppliedAllocatableMemory != 768<<20 || syncReq.PreviousToken != "settle-token" {
+			t.Fatalf("StateSync after Settled rejection = %+v", syncReq)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StateSync after Settled rejection timed out")
+	}
+	waitHooksConnected(t, hooks)
+	if got := hooks.localState(); !got.connected || !got.settled || got.token != "settled-sync-token" {
+		t.Fatalf("recovered state = %+v", got)
 	}
 }
 
