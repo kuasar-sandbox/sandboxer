@@ -360,17 +360,15 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	}
 	allocAtSnap := deriveAllocatableAtSnapshot(snapCap, balTarget, balCurrent, balOk)
 
-	// BalloonController, sole writer of /vm.resize. Created once we know
-	// snapCap and allocAtSnap: target is seeded to `cap - allocAtSnap` so
-	// the in-memory state matches what CH will load from state.json when
-	// it starts with --restore. Subsequent SettledRestore decides whether
-	// a runtime correction is needed (initialAlloc != allocAtSnap).
+	// BalloonController, sole writer of /vm.resize. CH restores num_pages
+	// (balTarget), while the effective allocation uses min(target,current).
+	// Seed those separately so an in-flight balloon operation is reconciled
+	// immediately after resume. Subsequent SettledRestore decides whether a
+	// controller/static correction is also needed (initialAlloc != allocAtSnap).
 	var balloonCtl *resctl.BalloonController
-	if allocAtSnap < snapCap {
+	if balOk {
 		balloonCtl = resctl.NewBalloonController(chSock, snapCap, logf)
-		// CH restores this target from its device state; seed it as already
-		// applied so an unchanged budget needs no post-resume resize RPC.
-		balloonCtl.SeedAppliedAllocatable(allocAtSnap)
+		balloonCtl.SeedRestoredState(allocAtSnap, balTarget)
 		hooks.SetBalloon(balloonCtl)
 	}
 
@@ -635,8 +633,8 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			pc.Logf("restore notify acked in %dµs (stdio MUX re-established: tty=%v); starting ping ticker",
 				time.Since(tRestore).Microseconds(), muxSpec.TTY)
 			pc.Pinger.Start(pc.Ctx)
-			// Balloon reconcile: idempotent — if initialAlloc ==
-			// allocAtSnap, target matches what CH loaded from state.json.
+			// Balloon reconcile is a no-op only when CH's restored target already
+			// matches the effective allocation; an in-flight snapshot is corrected.
 			if pc.Balloon != nil {
 				if err := pc.Balloon.Start(pc.Ctx); err != nil {
 					pc.Logf("balloon: start: %v", err)

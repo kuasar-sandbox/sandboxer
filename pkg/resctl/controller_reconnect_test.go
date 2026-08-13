@@ -176,6 +176,33 @@ func reconnectConfig(t *testing.T, socket, cgroup string) *config.SandboxConfig 
 	return cfg
 }
 
+func TestControllerHooksCanonicalizesLeaseAndAdmitCgroupPath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "intermediate"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cgroup := filepath.Join(dir, "target")
+	if err := os.MkdirAll(cgroup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	unclean := filepath.Join(dir, "intermediate", "..", "target") + string(filepath.Separator)
+	socket := filepath.Join(dir, "controller.sock")
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: socket, SandboxID: "canonical-path", Context: context.Background(), Logf: t.Logf,
+	}, reconnectConfig(t, socket, unclean))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hooks.Release("test")
+	lease, err := resource.ReadLease(hooks.lease.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.CgroupPath != cgroup || hooks.controllerCgroupPath != cgroup {
+		t.Fatalf("canonical paths: lease=%q Admit=%q want=%q", lease.CgroupPath, hooks.controllerCgroupPath, cgroup)
+	}
+}
+
 func TestControllerHooksReconnectStateSync(t *testing.T) {
 	controller := startReconnectController(t, false)
 	cgroup := filepath.Join(t.TempDir(), "cgroup")

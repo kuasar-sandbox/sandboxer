@@ -35,6 +35,10 @@ type ControllerHooks struct {
 	mu        sync.Mutex
 	client    *resource.Client
 	lease     *resource.LeaseHandle
+	// controllerCgroupPath is the canonical host pathname used in the immutable
+	// lease and every controller request. opts.CgroupPath is separately replaced
+	// with the process-local pinned FD path used for cgroup file I/O.
+	controllerCgroupPath string
 
 	admitted          bool
 	settled           bool
@@ -75,6 +79,8 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		cancel()
 		return nil, fmt.Errorf("dynamic resource mode requires sandbox id")
 	}
+	controllerCgroupPath := filepath.Clean(cfg.Resources.Control.CgroupPath)
+	h.controllerCgroupPath = controllerCgroupPath
 	capMem, err := cfg.CapacityMemoryBytes()
 	if err != nil {
 		cancel()
@@ -92,7 +98,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 	}
 	lease, err := resource.CreateLease(resource.Lease{
 		Version: resource.LeaseVersion, SandboxID: opts.SandboxID, PID: os.Getpid(),
-		ControllerSocket: opts.SocketPath, CgroupPath: cfg.Resources.Control.CgroupPath,
+		ControllerSocket: opts.SocketPath, CgroupPath: controllerCgroupPath,
 		CapacityMemory: capMem, CapacityCPUMilli: uint64(cfg.Resources.Capacity.CPU) * 1000,
 		FloorMemory: floorMem, FloorCPUMilli: uint64(cfg.Resources.Allocatable.CPU * 1000),
 		StartupMemory: startupMem, ClientFeatures: []string{resource.FeatureStateSyncV1},
@@ -209,7 +215,7 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 			CapacityCPU:      h.cfg.Resources.Capacity.CPU,
 			FloorMemoryBytes: floorMem, FloorCPU: h.cfg.Resources.Allocatable.CPU,
 			StartupBudgetMemory: startupMem, AllocatableAtSnapshot: allocatableAtSnapshot,
-			CgroupPath:     h.cfg.Resources.Control.CgroupPath,
+			CgroupPath:     h.controllerCgroupPath,
 			ClientFeatures: []string{resource.FeatureStateSyncV1},
 		})
 		if resource.IsTransportError(err) {

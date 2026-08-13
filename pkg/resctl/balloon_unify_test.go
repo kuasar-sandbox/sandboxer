@@ -135,6 +135,29 @@ func TestBalloon_SeedAppliedAllocatableSkipsInitialResize(t *testing.T) {
 	}
 }
 
+func TestBalloon_SeedRestoredStateReconcilesInFlightInflation(t *testing.T) {
+	srv := newFakeCHResize(t)
+	b := NewBalloonController(srv.sock, 1<<30, nil)
+	// Snapshot effective allocation used current=100 MiB, but CH restores the
+	// still-in-flight num_pages target of 200 MiB.
+	b.SeedRestoredState((1<<30)-(100<<20), 200<<20)
+	if got := b.CurrentTarget(); got != 100<<20 {
+		t.Fatalf("desired restored target = %d, want %d", got, uint64(100<<20))
+	}
+	if got := b.CurrentActual(); got != 200<<20 {
+		t.Fatalf("CH restored target = %d, want %d", got, uint64(200<<20))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := b.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Stop()
+	if calls := srv.seen(); len(calls) != 1 || calls[0] != 100<<20 {
+		t.Fatalf("in-flight restore resize calls = %v, want [%d]", calls, uint64(100<<20))
+	}
+}
+
 // TestBalloon_KickFiresImmediatelyWhenElapsed: when the previous
 // reconcile is older than Interval, a SetAllocatable should trigger an
 // immediate /vm.resize call (not wait for the ticker).

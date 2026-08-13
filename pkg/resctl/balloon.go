@@ -200,6 +200,18 @@ func (b *BalloonController) SeedAppliedAllocatable(allocBytes uint64) {
 	b.actual.Store(target)
 }
 
+// SeedRestoredState initializes the desired effective allocation separately
+// from the target Cloud Hypervisor restored in its balloon device state. They
+// differ when a snapshot captured an in-flight inflate/deflate operation; the
+// first Reconcile must then correct CH to the effective snapshot allocation.
+func (b *BalloonController) SeedRestoredState(allocBytes, restoredTargetBytes uint64) {
+	if restoredTargetBytes > b.Capacity {
+		restoredTargetBytes = b.Capacity
+	}
+	b.target.Store(b.targetForAllocatable(allocBytes))
+	b.actual.Store(restoredTargetBytes)
+}
+
 func (b *BalloonController) targetForAllocatable(allocBytes uint64) uint64 {
 	if b.Capacity > allocBytes {
 		return b.Capacity - allocBytes
