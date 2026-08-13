@@ -31,6 +31,38 @@ func TestLeaseHelperProcess(t *testing.T) {
 	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
 }
 
+func TestLeaseLockProbeHelperProcess(t *testing.T) {
+	if os.Getenv("RESOURCE_LEASE_PROBE_HELPER") != "1" {
+		return
+	}
+	owner, locked, err := LeaseLockOwner(os.Getenv("RESOURCE_LEASE_PROBE_PATH"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !locked {
+		t.Fatal("lease is not locked")
+	}
+	_, _ = fmt.Fprintln(os.Stdout, owner)
+}
+
+func assertExternalLeaseOwner(t *testing.T, path string, want int) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLeaseLockProbeHelperProcess$")
+	cmd.Env = append(os.Environ(),
+		"RESOURCE_LEASE_PROBE_HELPER=1", "RESOURCE_LEASE_PROBE_PATH="+path)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("external lock probe: %v: %s", err, out)
+	}
+	var got int
+	if _, err := fmt.Fscan(strings.NewReader(string(out)), &got); err != nil {
+		t.Fatalf("parse external lock owner from %q: %v", out, err)
+	}
+	if got != want {
+		t.Fatalf("external lock owner = %d, want %d", got, want)
+	}
+}
+
 func TestLeaseLifecycleAndHashedPath(t *testing.T) {
 	dir := t.TempDir()
 	socket := filepath.Join(dir, "controller.sock")
@@ -83,6 +115,83 @@ func TestLeaseLifecycleAndHashedPath(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("normal exit retained lease: %v", err)
+	}
+}
+
+func TestOwnerSideLeaseInspectionPreservesPOSIXLock(t *testing.T) {
+	dir := t.TempDir()
+	lease := Lease{
+		Version: LeaseVersion, SandboxID: "owner-inspection", PID: os.Getpid(),
+		ControllerSocket: filepath.Join(dir, "controller.sock"), CgroupPath: filepath.Join(dir, "cgroup"),
+		CapacityMemory: 1024, CapacityCPUMilli: 1000,
+		FloorMemory: 256, FloorCPUMilli: 500, StartupMemory: 512,
+	}
+	handle, err := CreateLease(lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	path := handle.Path()
+	assertExternalLeaseOwner(t, path, os.Getpid())
+
+	owner, locked, err := LeaseLockOwner(path)
+	if err != nil || !locked || owner != os.Getpid() {
+		t.Fatalf("owner-side LockOwner = %d locked=%v err=%v", owner, locked, err)
+	}
+	assertExternalLeaseOwner(t, path, os.Getpid())
+
+	read, err := ReadLease(path)
+	if err != nil || read.SandboxID != lease.SandboxID {
+		t.Fatalf("owner-side ReadLease = %+v, %v", read, err)
+	}
+	assertExternalLeaseOwner(t, path, os.Getpid())
+
+	inspected, owner, locked, err := InspectLease(path)
+	if err != nil || !locked || owner != os.Getpid() || inspected.SandboxID != lease.SandboxID {
+		t.Fatalf("owner-side InspectLease = %+v owner=%d locked=%v err=%v", inspected, owner, locked, err)
+	}
+	assertExternalLeaseOwner(t, path, os.Getpid())
+
+	if removed, err := RemoveUnlockedLease(path); err != nil || removed {
+		t.Fatalf("owner-side stale cleanup = removed %v, err %v", removed, err)
+	}
+	assertExternalLeaseOwner(t, path, os.Getpid())
+
+	if duplicate, err := CreateLease(lease); err == nil {
+		_ = duplicate.Close()
+		t.Fatal("same process created a second live lease for one SID")
+	}
+	assertExternalLeaseOwner(t, path, os.Getpid())
+}
+
+func TestLeaseHandleCloseDoesNotUnlinkReplacementPath(t *testing.T) {
+	dir := t.TempDir()
+	lease := Lease{
+		Version: LeaseVersion, SandboxID: "close-replacement", PID: os.Getpid(),
+		ControllerSocket: filepath.Join(dir, "controller.sock"), CgroupPath: filepath.Join(dir, "cgroup"),
+		CapacityMemory: 1024, CapacityCPUMilli: 1000,
+		FloorMemory: 256, FloorCPUMilli: 500, StartupMemory: 512,
+	}
+	handle, err := CreateLease(lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := handle.Path()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "replacement\n" {
+		t.Fatalf("replacement content = %q", content)
 	}
 }
 

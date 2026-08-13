@@ -2385,6 +2385,9 @@ path、capacity、floor、startup、client features。SID 只参与 SHA-256,不�
 持 POSIX `fcntl` write lock直至沙箱生命周期结束;
 Heartbeat/Grant/StateSync 不更新文件。正常退出在仍持 lock 时 unlink 后 close;
 SIGKILL 则由内核自动释放 lock,controller 扫描时清理 stale 文件。
+由于 POSIX record lock 是进程级并会在同一进程关闭该 inode 的任意 FD 时释放,
+sandbox-ctl 对自己持有的 lease 做读取或存活检查时复用长期持有的 FD;退出时也只
+unlink 仍指向该 FD inode 的路径,避免误删并发替换的新 lease。
 
 controller socket 必须是文件系统 UDS;Linux `@name`/NUL abstract 地址无法承载
 同路径派生的 `.owner` 和 `.leases/` inventory,配置校验会直接拒绝。运行时会把
