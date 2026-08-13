@@ -225,7 +225,10 @@ sandbox-ctl 控制终端的前台进程组——终端产生的 `^C` / `^\` / `^
 信号(SIGTERM/SIGINT)由 sandbox-ctl 统一处理(只在此一处注册),收到即转发 SIGTERM
 给 CH、宽限后 SIGKILL(与 [`sandbox-init.md`](sandbox-init.md) §3.3 的退出
 序列衔接)。`--tty` raw 模式下终端是 raw 的、`^C` 不产生 SIGINT(见上);非 raw 模式
-下 `^C` 正常触发上述 SIGTERM 升级链。
+下 `^C` 正常触发上述 SIGTERM 升级链。signal source 在 Admit 前注册:CH 尚未 spawn
+则取消 image/manifest/controller 等 pre-spawn 工作并 fail closed;CH 已 spawn 则中断
+`WaitReady`、`/vm.resume`、`restore_ack` 等同步 barrier,但 vhost/vsock backend 保持到
+queued signal 完成上述 CH 优雅关闭/升级,不会由 `exec.CommandContext` 直接 SIGKILL。
 
 **启动 readiness wire**:`--ready-fd=N` 是调用方提供的一次性观察通道。成功 wire
 严格为 `control_ready\nready\nEOF`;每个事件最多一次且不能反序。语义如下:
@@ -1711,7 +1714,9 @@ T15 vsock 连接发 restore{epoch=N, wallclock_ns} 给 sandbox-init(guest:5000 l
      `OK <port>` 前短暂 EOF/reset,host 在同一总 deadline 内退避重拨(最多 2 s);
      请求尚未发送,因此不会重放。`restore` 一经写入,后续写/读/协议错误均不重试。
      deadline 到点未收到 restore_ack →
-     restore 失败回退:CH /vm.shutdown 并向调用方报错
+     restore 失败回退:CH /vm.shutdown 并向调用方报错。若此 barrier 收到 host
+     SIGTERM/SIGINT,context 会立即打断 CH API/vsock I/O,随后由已缓存 signal 进入
+     正常 CH shutdown → grace → SIGKILL 升级链;backend 不会先于 CH 被撤掉
 T16 vCPU 跑,fault 流转见 §8 uffd handler;balloon EVENT_REMOVE 同冷启动
 T17 user app 退出 / 接收外部信号 → 退出流程同冷启动
 ```

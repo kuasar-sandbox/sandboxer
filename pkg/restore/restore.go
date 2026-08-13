@@ -607,7 +607,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
 			}
-			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).Resume(); err != nil {
+			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).ResumeContext(pc.Ctx); err != nil {
 				return fmt.Errorf("vm.resume: %w", err)
 			}
 			pc.Logf("VM resumed, vCPU running")
@@ -621,7 +621,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 				restoreDeadline = config.NoForcedTimeout
 			}
 			muxSpec, err := openAndEstablishRestoreMUX(func() (net.Conn, proto.StdioSpec, error) {
-				return guestlink.OpenMUXViaRestore(pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline)
+				return guestlink.OpenMUXViaRestoreContext(pc.Ctx, pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline)
 			}, pc.EstablishMUX, pc.NotifyReady)
 			if err != nil {
 				return err

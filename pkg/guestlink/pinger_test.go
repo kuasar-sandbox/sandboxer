@@ -262,6 +262,40 @@ func TestOpenMUXViaRestore(t *testing.T) {
 	}
 }
 
+func TestOpenMUXViaRestoreContextCancelsStalledAck(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+	requestRead := make(chan struct{})
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		if _, err := proto.ReadMessage(c); err == nil {
+			close(requestRead)
+		}
+		_, _ = io.Copy(io.Discard, c)
+	})
+	defer proxy.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, err := OpenMUXViaRestoreContext(ctx, &HostClient{BasePath: base}, 3, nil, nil, 24*time.Hour)
+		errCh <- err
+	}()
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("restore request was not received")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("OpenMUXViaRestoreContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stalled restore_ack was not cancelled")
+	}
+}
+
 func TestOpenMUXViaRestore_RetriesTransientEOFBeforeRequest(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "vsock.sock")

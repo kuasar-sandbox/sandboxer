@@ -3,6 +3,7 @@ package chapi
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"path/filepath"
 	"runtime"
@@ -24,6 +25,52 @@ func TestWaitReadyReadySocket(t *testing.T) {
 		t.Fatalf("WaitReady: %v", err)
 	}
 	waitDone(t, done)
+}
+
+func TestResumeContextCancelsStalledResponse(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix sockets are not available")
+	}
+	sock := filepath.Join(t.TempDir(), "ch.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	requestRead := make(chan struct{})
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4096)
+		if _, err := conn.Read(buf); err == nil {
+			close(requestRead)
+		}
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- (Client{Sock: sock}).ResumeContext(ctx) }()
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("resume request was not received")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ResumeContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ResumeContext did not cancel stalled response")
+	}
+	<-serverDone
 }
 
 func TestWaitReadySocketAppearsWithinShortDeadline(t *testing.T) {

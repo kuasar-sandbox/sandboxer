@@ -64,7 +64,10 @@ type CmdEnv struct {
 //     Launch.LaunchAckDone, then return nil (fire-and-forget).
 //   - restore: synchronously waitAPI → /vm.resume → guestlink.OpenMUXViaRestore →
 //     EstablishMUX → guestlink.Pinger.Start → Balloon.Start → Hooks.SettledRestore;
-//     a non-nil return aborts the run (ServeAndWait kills CH).
+//     Ctx is cancelled by a retained shutdown signal so every synchronous
+//     barrier unwinds. A non-signal error aborts and kills CH; a retained signal
+//     continues into the normal graceful CH shutdown/escalation path while
+//     backend services remain on their separate VM lifecycle context.
 type PostSpawnCtx struct {
 	Ctx          context.Context
 	Cmd          *exec.Cmd
@@ -597,7 +600,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	})
 
 	if err := p.PostSpawn(PostSpawnCtx{
-		Ctx:          backendCtx,
+		Ctx:          p.Ctx,
 		Cmd:          cmd,
 		Pinger:       pinger,
 		Launch:       launch,
@@ -608,10 +611,16 @@ func ServeAndWait(p VMParams) (int, error) {
 		Logf:         logf,
 		NotifyReady:  readiness.notifyReady,
 	}); err != nil {
-		_ = cmd.Process.Kill()
-		cancelBackends()
-		backendWG.Wait()
-		return -1, err
+		if !runShutdownRequested(p.Ctx) {
+			_ = cmd.Process.Kill()
+			cancelBackends()
+			backendWG.Wait()
+			return -1, err
+		}
+		// A retained signal interrupted the synchronous restore barrier. Keep
+		// backend services alive and fall through so the queued signal drives
+		// the normal CH shutdown/escalation protocol.
+		logf("post-spawn interrupted by shutdown: %v", err)
 	}
 
 	doneCh := make(chan error, 1)

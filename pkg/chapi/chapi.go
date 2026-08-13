@@ -42,6 +42,12 @@ func (c Client) Pause() error { return c.do("PUT", "/api/v1/vm.pause", "") }
 // Resume issues PUT /api/v1/vm.resume.
 func (c Client) Resume() error { return c.do("PUT", "/api/v1/vm.resume", "") }
 
+// ResumeContext is Resume with cancellation for the restore post-spawn
+// barrier. Cancelling interrupts both dialing and a stalled CH response.
+func (c Client) ResumeContext(ctx context.Context) error {
+	return c.doContext(ctx, "PUT", "/api/v1/vm.resume", "")
+}
+
 // Snapshot issues PUT /api/v1/vm.snapshot with destination_url=destURL. CH
 // writes config.json + state.json there; with our patches memory-ranges is
 // skipped for fd-backed user-managed zones.
@@ -56,11 +62,25 @@ func (c Client) Snapshot(destURL string) error {
 func (c Client) ShutdownVMM() error { return c.do("PUT", "/api/v1/vmm.shutdown", "") }
 
 func (c Client) do(method, path, body string) error {
-	conn, err := net.DialTimeout("unix", c.Sock, dialTimeout)
+	return c.doContext(context.Background(), method, path, body)
+}
+
+func (c Client) doContext(ctx context.Context, method, path, body string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dialCtx, cancelDial := context.WithTimeout(ctx, dialTimeout)
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", c.Sock)
+	cancelDial()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("ch api dial %s: %w", c.Sock, ctxErr)
+		}
 		return fmt.Errorf("ch api dial %s: %w", c.Sock, err)
 	}
 	defer conn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stopCancel()
 	if c.RespDeadline > 0 {
 		_ = conn.SetDeadline(time.Now().Add(c.RespDeadline))
 	}
@@ -71,10 +91,19 @@ func (c Client) do(method, path, body string) error {
 	}
 	req += "Connection: close\r\n\r\n" + body
 	if _, err := conn.Write([]byte(req)); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("ch api %s %s write: %w", method, path, ctxErr)
+		}
 		return fmt.Errorf("ch api %s %s write: %w", method, path, err)
 	}
 	buf := make([]byte, 4096)
-	n, _ := conn.Read(buf)
+	n, readErr := conn.Read(buf)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("ch api %s %s read: %w", method, path, ctxErr)
+	}
+	if readErr != nil && n == 0 {
+		return fmt.Errorf("ch api %s %s read: %w", method, path, readErr)
+	}
 	resp := string(buf[:n])
 	if len(resp) < 12 {
 		return fmt.Errorf("ch api %s %s short response: %q", method, path, resp)

@@ -12,6 +12,7 @@ type runSignalContextKey struct{}
 
 type runSignalStream struct {
 	signals           <-chan os.Signal
+	shutdown          <-chan struct{}
 	controllerContext context.Context
 	vmContext         context.Context
 }
@@ -32,9 +33,11 @@ func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSo
 	preSpawnCtx, cancelPreSpawn := context.WithCancel(parent)
 	controllerCtx, cancelController := context.WithCancel(parent)
 	forwarded := make(chan os.Signal, 4)
+	shutdown := make(chan struct{})
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	var once sync.Once
+	var shutdownOnce sync.Once
 	go func() {
 		defer close(done)
 		for {
@@ -43,19 +46,20 @@ func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSo
 				if !ok {
 					return
 				}
-				cancelPreSpawn()
-				cancelController()
 				select {
 				case forwarded <- sig:
 				default:
 				}
+				shutdownOnce.Do(func() { close(shutdown) })
+				cancelPreSpawn()
+				cancelController()
 			case <-stop:
 				return
 			}
 		}
 	}()
 	ctx := context.WithValue(preSpawnCtx, runSignalContextKey{}, runSignalStream{
-		signals: forwarded, controllerContext: controllerCtx, vmContext: parent,
+		signals: forwarded, shutdown: shutdown, controllerContext: controllerCtx, vmContext: parent,
 	})
 	return ctx, func() {
 		once.Do(func() {
@@ -105,4 +109,20 @@ func runSignalsFromContext(ctx context.Context) <-chan os.Signal {
 	}
 	stream, _ := ctx.Value(runSignalContextKey{}).(runSignalStream)
 	return stream.signals
+}
+
+func runShutdownRequested(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	stream, _ := ctx.Value(runSignalContextKey{}).(runSignalStream)
+	if stream.shutdown == nil {
+		return false
+	}
+	select {
+	case <-stream.shutdown:
+		return true
+	default:
+		return false
+	}
 }

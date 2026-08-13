@@ -35,6 +35,9 @@ func TestRunSignalContextRetainsSignalBeforeServeAndWait(t *testing.T) {
 	if err := vmCtx.Err(); err != nil {
 		t.Fatalf("VM backend context cancelled before graceful CH shutdown: %v", err)
 	}
+	if !runShutdownRequested(ctx) {
+		t.Fatal("retained shutdown was not marked before context cancellation")
+	}
 	signals := runSignalsFromContext(ctx)
 	select {
 	case sig := <-signals:
@@ -59,6 +62,21 @@ func TestRunSignalContextRetainsSignalBeforeServeAndWait(t *testing.T) {
 	stop()
 	if !stopped.Load() {
 		t.Fatal("signal source was not stopped")
+	}
+}
+
+func TestRunSignalContextDistinguishesParentCancellation(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	ctx, stop := newRunSignalContext(parent, make(chan os.Signal), nil)
+	t.Cleanup(stop)
+	cancelParent()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("parent cancellation did not reach run context")
+	}
+	if runShutdownRequested(ctx) {
+		t.Fatal("parent cancellation was misclassified as a retained signal")
 	}
 }
 
