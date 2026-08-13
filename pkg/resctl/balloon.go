@@ -69,6 +69,7 @@ type BalloonController struct {
 
 	target atomic.Uint64 // desired balloon size in bytes
 	actual atomic.Uint64 // last successfully applied size
+	reconcileMu sync.Mutex
 
 	// kick is a non-blocking signal channel: SetTarget (and therefore
 	// SetAllocatable, which wraps SetTarget) pokes it on every write.
@@ -154,6 +155,15 @@ func (b *BalloonController) SetTarget(sizeBytes uint64) {
 // matches the value baked into CH's --balloon arg or the snapshot.
 func (b *BalloonController) SetAllocatable(allocBytes uint64) {
 	b.SetTarget(b.targetForAllocatable(allocBytes))
+}
+
+// ApplyAllocatable synchronously commits an allocatable change to Cloud
+// Hypervisor. ControllerHooks uses it inside the serialized resource session
+// and advances appliedAllocatable only after this returns successfully.
+func (b *BalloonController) ApplyAllocatable(ctx context.Context, allocBytes uint64) error {
+	b.defaults()
+	b.target.Store(b.targetForAllocatable(allocBytes))
+	return b.Reconcile(ctx)
 }
 
 // SeedAppliedAllocatable initializes the desired and applied balloon target
@@ -319,6 +329,8 @@ func (b *BalloonController) loop(ctx context.Context) {
 // last applied value. Idempotent; safe to call concurrently with
 // SetTarget/Hint.
 func (b *BalloonController) Reconcile(ctx context.Context) error {
+	b.reconcileMu.Lock()
+	defer b.reconcileMu.Unlock()
 	target := b.target.Load()
 	// Record the attempt time regardless of whether a resize is actually
 	// needed: the kick-rate-limit only cares "did we recently look", not

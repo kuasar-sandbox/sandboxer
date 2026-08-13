@@ -169,6 +169,8 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
 		SocketPath: opts.HostCfg.Resources.Control.Controller,
 		CgroupPath: cg.LocalPath(),
+		SandboxID:  opts.SandboxID,
+		Context:    ctx,
 		Logf:       logf,
 	}, opts.HostCfg)
 	if err != nil {

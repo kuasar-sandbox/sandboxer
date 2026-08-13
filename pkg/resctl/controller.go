@@ -2,114 +2,142 @@ package resctl
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
-// ControllerHookOptions configures the dynamic-mode controller integration.
-//
-// SocketPath: UDS path of the controller endpoint. Empty disables the
-// node-ctl RPC integration; hooks still run in a degraded form (writes
-// cgroup memory.high, updates in-memory allocatable_now), but no
-// controller RPCs are issued and no Heartbeat/Sensor goroutines start.
-//
-// CgroupPath: process-local stable directory used for memory.high writes and
-// memory.current / memory.events.local reads. Callers with an inherited cgroup
-// capability pass CgroupController.LocalPath so local I/O stays pinned to the
-// opened cgroup. Empty = no-cgroup mode.
-//
-// Balloon: the per-sandbox BalloonController owning /api/v1/vm.resize.
-// Hooks never speaks CH HTTP directly — every balloon change goes
-// through Balloon.SetAllocatable, so the BalloonController stays the
-// sole writer of /vm.resize. May be nil when allocatable.memory ==
-// capacity.memory (no balloon device on this VM).
 type ControllerHookOptions struct {
 	SocketPath string
 	CgroupPath string
+	SandboxID  string
+	Context    context.Context
 	Logf       func(string, ...any)
 	Balloon    *BalloonController
 }
 
-// ControllerHooks bundles the per-sandbox state for resource control:
-// the node-ctl client (dynamic mode only), the current allocatable_now,
-// and the background goroutines for Heartbeat and pressure-driven
-// RequestBudget.
-//
-// A nil receiver — or a receiver whose SocketPath was empty at
-// construction — is a safe no-op for every method that requires an
-// active client; the cgroup-side writes (memory.high) and the balloon
-// hand-off still happen in static mode. This lets lifecycle.go always
-// call into hooks without branching on mode.
+// ControllerHooks owns one recoverable controller session. sessionMu covers a
+// complete RPC response application (network -> cgroup/balloon -> local state)
+// and connection replacement, so a stale response cannot race StateSync.
 type ControllerHooks struct {
 	opts ControllerHookOptions
 	cfg  *config.SandboxConfig
 
-	mu                sync.Mutex
-	client            *resource.Client
+	sessionMu sync.Mutex
+	mu        sync.Mutex
+	client    *resource.Client
+	lease     *resource.LeaseHandle
+
+	admitted          bool
+	settled           bool
+	connected         bool
 	allocatableNowMem uint64
+	previousToken     string
 	released          bool
-	cancelBg          context.CancelFunc
-	bgWG              sync.WaitGroup
+
+	lifetimeCtx    context.Context
+	cancelLifetime context.CancelFunc
+	reconnectWake  chan struct{}
+	reconnectWG    sync.WaitGroup
+
+	cancelBg context.CancelFunc
+	bgWG     sync.WaitGroup
 }
 
-// NewControllerHooks dials the controller and returns hooks ready for
-// Admit. Returns hooks with no client (static-mode no-op for RPC calls)
-// when SocketPath is empty.
 func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (*ControllerHooks, error) {
-	h := &ControllerHooks{opts: opts, cfg: cfg}
-	if h.opts.Logf == nil {
-		h.opts.Logf = func(string, ...any) {}
+	if cfg == nil {
+		return nil, fmt.Errorf("controller hooks require config")
+	}
+	if opts.Logf == nil {
+		opts.Logf = func(string, ...any) {}
+	}
+	if opts.Context == nil {
+		opts.Context = context.Background()
+	}
+	lifetimeCtx, cancel := context.WithCancel(context.Background())
+	h := &ControllerHooks{
+		opts: opts, cfg: cfg, lifetimeCtx: lifetimeCtx, cancelLifetime: cancel,
+		reconnectWake: make(chan struct{}, 1),
 	}
 	if opts.SocketPath == "" {
 		return h, nil
 	}
-	h.client = &resource.Client{SocketPath: opts.SocketPath}
-	if err := h.client.Connect(); err != nil {
+	if opts.SandboxID == "" {
+		cancel()
+		return nil, fmt.Errorf("dynamic resource mode requires sandbox id")
+	}
+	capMem, err := cfg.CapacityMemoryBytes()
+	if err != nil {
+		cancel()
 		return nil, err
 	}
+	floorMem, err := cfg.AllocatableMemoryBytes()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	startupMem, err := cfg.StartupBytes()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	lease, err := resource.CreateLease(resource.Lease{
+		Version: resource.LeaseVersion, SandboxID: opts.SandboxID, PID: os.Getpid(),
+		ControllerSocket: opts.SocketPath, CgroupPath: cfg.Resources.Control.CgroupPath,
+		CapacityMemory: capMem, CapacityCPUMilli: uint64(cfg.Resources.Capacity.CPU) * 1000,
+		FloorMemory: floorMem, FloorCPUMilli: uint64(cfg.Resources.Allocatable.CPU * 1000),
+		StartupMemory: startupMem, ClientFeatures: []string{resource.FeatureStateSyncV1},
+	})
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("controller lease: %w", err)
+	}
+	h.lease = lease
+	h.client = &resource.Client{SocketPath: opts.SocketPath}
+	h.reconnectWG.Add(1)
+	go h.reconnectLoop()
 	return h, nil
 }
 
-// SetLocalCgroupPath installs the stable process-local path used by cgroup
-// reads and writes. It must be called before Settled or background hooks start.
-// The host path carried to the resource controller remains cfg's CgroupPath.
 func (h *ControllerHooks) SetLocalCgroupPath(path string) {
 	if h == nil {
 		return
 	}
+	h.sessionMu.Lock()
 	h.opts.CgroupPath = path
+	h.sessionMu.Unlock()
 }
 
-// Enabled reports whether dynamic-mode controller integration is in
-// effect (i.e. a controller client is connected).
 func (h *ControllerHooks) Enabled() bool {
-	return h != nil && h.client != nil
+	return h != nil && h.opts.SocketPath != ""
 }
 
-// SetBalloon late-injects the BalloonController owning /vm.resize.
-// Used by the restore path, where snapCap (and hence the BalloonController
-// constructor argument) is only known after the snapshot bundle has
-// been parsed — well after NewControllerHooks. lifecycle (cold-start)
-// passes Balloon via ControllerHookOptions at construction and does not
-// need this. Caller must ensure no concurrent Heartbeat/Sensor goroutine
-// has been started yet (they read opts.Balloon).
+func (h *ControllerHooks) Connected() bool {
+	if h == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.connected
+}
+
 func (h *ControllerHooks) SetBalloon(b *BalloonController) {
 	if h == nil {
 		return
 	}
+	h.sessionMu.Lock()
 	h.opts.Balloon = b
+	h.sessionMu.Unlock()
 }
 
-// AllocatableNowMem returns the current allocatable_now in bytes. Set
-// by SetAllocatableNow / OnAllocatableChanged / Settled. Returns 0 when
-// the receiver is nil or no Settled-equivalent has run yet.
 func (h *ControllerHooks) AllocatableNowMem() uint64 {
 	if h == nil {
 		return 0
@@ -119,92 +147,110 @@ func (h *ControllerHooks) AllocatableNowMem() uint64 {
 	return h.allocatableNowMem
 }
 
-// Admit performs the controller handshake. Caller passes capacity /
-// floor / startup values from sandbox.yaml; allocatableAtSnapshot is
-// non-zero only on the restore path.
-//
-// On success, the returned grantedInitialAlloc is what to use for
-// initial cgroup memory.high and balloon target. The controller
-// computes max(yaml.startup, yaml.allocatable, allocatable_at_snapshot)
-// so the grant may exceed yaml.startup, but never falls below it.
-func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint64, error) {
-	if !h.Enabled() {
-		// Mode A/B: no admission, return startup (or floor if startup
-		// not configured) so the cold-start cgroup setup works the same.
-		burst, err := h.cfg.StartupBytes()
-		if err != nil {
-			return 0, err
-		}
-		return burst, nil
-	}
-	cap, err := h.cfg.CapacityMemoryBytes()
-	if err != nil {
-		return 0, err
-	}
-	floor, err := h.cfg.AllocatableMemoryBytes()
-	if err != nil {
-		return 0, err
-	}
-	burst, err := h.cfg.StartupBytes()
-	if err != nil {
-		return 0, err
-	}
-	floorCPU := h.cfg.Resources.Allocatable.CPU
-	res, err := h.client.Admit(resource.AdmitParams{
-		SandboxID:             sid,
-		CapacityMemoryBytes:   cap,
-		CapacityCPU:           h.cfg.Resources.Capacity.CPU,
-		FloorMemoryBytes:      floor,
-		FloorCPU:              floorCPU,
-		StartupBudgetMemory:   burst,
-		AllocatableAtSnapshot: allocatableAtSnapshot,
-		CgroupPath:            h.cfg.Resources.Control.CgroupPath,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("admit: %w", err)
-	}
-	if res.Status == resource.StatusRejected {
-		if res.Reason != "" {
-			return 0, fmt.Errorf("admit rejected (%s): %s", res.Reason, res.Msg)
-		}
-		return 0, fmt.Errorf("admit rejected: %s", res.Msg)
-	}
-	if res.Status != resource.StatusAdmitted {
-		// StatusQueued was deprecated when the controller moved to a
-		// server-side hold-connection queue (the server blocks the conn
-		// rather than returning Queued). Any other status is a server
-		// protocol violation.
-		return 0, fmt.Errorf("admit returned unexpected status %q", res.Status)
-	}
-	h.mu.Lock()
-	h.allocatableNowMem = res.GrantedInitialAlloc
-	h.mu.Unlock()
-	if res.QueuedForMs > 0 {
-		h.opts.Logf("controller admit: token=%s initial_alloc=%d (queued %dms, pos %d at entry)",
-			res.Token[:8], res.GrantedInitialAlloc, res.QueuedForMs, res.QueuePosAtIn)
-	} else {
-		h.opts.Logf("controller admit: token=%s initial_alloc=%d",
-			res.Token[:8], res.GrantedInitialAlloc)
-	}
-	return res.GrantedInitialAlloc, nil
+type localControllerState struct {
+	admitted, settled, connected, released bool
+	applied                                uint64
+	token                                  string
 }
 
-// Settled marks the cold-start launch hello arrival.
-//
-// Writes cgroup memory.high using the locally visible allocatable_now. In
-// static mode this is the floor. In dynamic mode it is the controller-granted
-// startup budget until the next Heartbeat returns the controller's authoritative
-// post-settled allocatable. This keeps the startup grant effective long enough
-// for the user program to exec while still releasing the controller-side
-// startup_pool as soon as launch_ack arrives.
-//
-// Does NOT touch the balloon directly. Cold-start CH was launched with a
-// balloon derived from the initial allocatable (static floor or dynamic startup
-// grant), and the first Heartbeat / reclaim / grant path applies later
-// controller decisions through OnAllocatableChanged.
-//
-// In dynamic mode, also notifies the controller RPC of the settled
-// transition.
+func (h *ControllerHooks) localState() localControllerState {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return localControllerState{
+		admitted: h.admitted, settled: h.settled, connected: h.connected,
+		released: h.released, applied: h.allocatableNowMem, token: h.previousToken,
+	}
+}
+
+func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint64, error) {
+	if !h.Enabled() {
+		return h.cfg.StartupBytes()
+	}
+	if sid != h.opts.SandboxID {
+		return 0, fmt.Errorf("admit sandbox id %q does not match lease %q", sid, h.opts.SandboxID)
+	}
+	capMem, err := h.cfg.CapacityMemoryBytes()
+	if err != nil {
+		return 0, err
+	}
+	floorMem, err := h.cfg.AllocatableMemoryBytes()
+	if err != nil {
+		return 0, err
+	}
+	startupMem, err := h.cfg.StartupBytes()
+	if err != nil {
+		return 0, err
+	}
+
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	backoff := 100 * time.Millisecond
+	for {
+		select {
+		case <-h.opts.Context.Done():
+			return 0, h.opts.Context.Err()
+		case <-h.lifetimeCtx.Done():
+			return 0, errors.New("controller hooks released")
+		default:
+		}
+		if !h.client.Connected() {
+			if err := h.client.Connect(); err != nil {
+				if err := h.waitRetry(backoff); err != nil {
+					return 0, err
+				}
+				backoff = nextBackoff(backoff)
+				continue
+			}
+		}
+		res, err := h.client.Admit(resource.AdmitParams{
+			SandboxID: sid, CapacityMemoryBytes: capMem,
+			CapacityCPU:      h.cfg.Resources.Capacity.CPU,
+			FloorMemoryBytes: floorMem, FloorCPU: h.cfg.Resources.Allocatable.CPU,
+			StartupBudgetMemory: startupMem, AllocatableAtSnapshot: allocatableAtSnapshot,
+			CgroupPath:     h.cfg.Resources.Control.CgroupPath,
+			ClientFeatures: []string{resource.FeatureStateSyncV1},
+		})
+		if resource.IsTransportError(err) {
+			h.setConnected(false)
+			if err := h.waitRetry(backoff); err != nil {
+				return 0, err
+			}
+			backoff = nextBackoff(backoff)
+			continue
+		}
+		if err != nil {
+			return 0, fmt.Errorf("admit: %w", err)
+		}
+		if res.Status == resource.StatusRejected {
+			if res.Reason != "" {
+				return 0, fmt.Errorf("admit rejected (%s): %s", res.Reason, res.Msg)
+			}
+			return 0, fmt.Errorf("admit rejected: %s", res.Msg)
+		}
+		if res.Status != resource.StatusAdmitted {
+			return 0, fmt.Errorf("admit returned unexpected status %q", res.Status)
+		}
+		h.mu.Lock()
+		h.admitted, h.connected = true, true
+		h.allocatableNowMem, h.previousToken = res.GrantedInitialAlloc, res.Token
+		h.mu.Unlock()
+		if res.QueuedForMs > 0 {
+			h.opts.Logf("controller admit: token=%s initial_alloc=%d (queued %dms, pos %d at entry)",
+				shortToken(res.Token), res.GrantedInitialAlloc, res.QueuedForMs, res.QueuePosAtIn)
+		} else {
+			h.opts.Logf("controller admit: token=%s initial_alloc=%d", shortToken(res.Token), res.GrantedInitialAlloc)
+		}
+		return res.GrantedInitialAlloc, nil
+	}
+}
+
+func shortToken(token string) string {
+	if len(token) > 8 {
+		return token[:8]
+	}
+	return token
+}
+
 func (h *ControllerHooks) Settled() error {
 	if h == nil {
 		return nil
@@ -213,46 +259,47 @@ func (h *ControllerHooks) Settled() error {
 	if err != nil {
 		return err
 	}
-	current := h.AllocatableNowMem()
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	current := h.localState().applied
 	if current == 0 {
 		current = floor
 	}
 	if err := h.setMemoryHigh(current); err != nil {
 		h.opts.Logf("settled: setMemoryHigh: %v", err)
 	}
+	h.mu.Lock()
+	h.settled = true
 	if !h.Enabled() {
-		h.mu.Lock()
 		h.allocatableNowMem = floor
-		h.mu.Unlock()
+	}
+	connected := h.connected
+	h.mu.Unlock()
+	if !h.Enabled() {
+		return nil
+	}
+	if !connected {
+		h.notifyReconnect()
 		return nil
 	}
 	rss := readMemoryCurrent(h.opts.CgroupPath)
 	if err := h.client.Settled(rss, 0); err != nil {
+		if resource.IsTransportError(err) {
+			h.markDisconnectedLocked(err)
+			return nil
+		}
 		return fmt.Errorf("controller.Settled: %w", err)
 	}
 	return nil
 }
 
-// SettledRestore is the restore-path equivalent of Settled, fired on
-// the guest's restore_ack. Writes cgroup memory.high using the current
-// allocatable_now (set pre-resume by restore.go via SetAllocatableNow;
-// fallback = yaml.floor when in-memory state is zero — usually a bug
-// elsewhere, but we don't want to crash).
-//
-// allocAtSnap is the allocatable_at_snapshot derived from the bundle's
-// state.json balloon section. The CH balloon was reloaded to that value
-// when CH started with --restore, so a balloon /vm.resize is only issued
-// when the local allocatable_now decision (yaml.max-with-snap in static,
-// controller granted in dynamic) differs from it. When they agree —
-// the common case — no balloon write happens, avoiding mmu_notifier
-// traffic on top of the ongoing uffd-driven page replay.
-//
-// In dynamic mode, also notifies the controller RPC.
 func (h *ControllerHooks) SettledRestore(allocAtSnap uint64) error {
 	if h == nil {
 		return nil
 	}
-	cur := h.AllocatableNowMem()
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	cur := h.localState().applied
 	if cur == 0 {
 		if floor, err := h.cfg.AllocatableMemoryBytes(); err == nil {
 			cur = floor
@@ -261,33 +308,34 @@ func (h *ControllerHooks) SettledRestore(allocAtSnap uint64) error {
 	if err := h.setMemoryHigh(cur); err != nil {
 		h.opts.Logf("settled-restore: setMemoryHigh: %v", err)
 	}
-	// Balloon was already at `cap - allocAtSnap` from the snapshot
-	// restore. Only correct it when the decision diverges.
 	if cur != allocAtSnap && h.opts.Balloon != nil {
-		h.opts.Balloon.SetAllocatable(cur)
+		if err := h.opts.Balloon.ApplyAllocatable(h.applyContext(), cur); err != nil {
+			return fmt.Errorf("settled-restore balloon correction: %w", err)
+		}
 		h.opts.Logf("settled-restore: balloon correction alloc %d → %d", allocAtSnap, cur)
 	}
+	h.mu.Lock()
+	h.settled = true
+	connected := h.connected
+	h.mu.Unlock()
 	if !h.Enabled() {
+		return nil
+	}
+	if !connected {
+		h.notifyReconnect()
 		return nil
 	}
 	rss := readMemoryCurrent(h.opts.CgroupPath)
 	if err := h.client.Settled(rss, 0); err != nil {
+		if resource.IsTransportError(err) {
+			h.markDisconnectedLocked(err)
+			return nil
+		}
 		return fmt.Errorf("controller.SettledRestore: %w", err)
 	}
 	return nil
 }
 
-// SetAllocatableNow updates the in-memory allocatable_now state without
-// any external side effect (no cgroup write, no balloon write).
-//
-// Used by restore.go before vm.resume to record the controller-granted
-// (or static-mode-decided) allocatable, so that the subsequent
-// SettledRestore can compute memory.high and decide whether a balloon
-// correction is needed. Doing the in-memory update before CH is even up
-// is safe; doing any external write here is not (CH socket doesn't
-// exist yet pre-cmd.Start; even after, pre-resume balloon writes step
-// on the snapshot-loaded balloon state, and pre-replay memory.high
-// throttles the uffd page-fault burst).
 func (h *ControllerHooks) SetAllocatableNow(allocBytes uint64) {
 	if h == nil {
 		return
@@ -297,26 +345,30 @@ func (h *ControllerHooks) SetAllocatableNow(allocBytes uint64) {
 	h.mu.Unlock()
 }
 
-// OnAllocatableChanged is the runtime-adjustment entry point used by
-// the dynamic-mode Heartbeat and Sensor loops when the controller's
-// authoritative allocatable_now has changed (admin grant, admin
-// reclaim, or sensor-triggered RequestBudget). Writes cgroup memory.high
-// and the balloon target together, then updates allocatable_now state.
-//
-// memory.high and balloon move in lock-step per docs/sandbox.md §10.2:
-// PSI threshold and host-side reclaim target must agree, or the guest
-// hits PSI throttling at a watermark inconsistent with what the balloon
-// is letting it use. No-op on the balloon side when Balloon is nil
-// (allocatable.memory == capacity.memory — no balloon device).
 func (h *ControllerHooks) OnAllocatableChanged(allocBytes uint64) error {
 	if h == nil {
 		return nil
 	}
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	return h.applyAllocatableLocked(h.applyContext(), allocBytes)
+}
+
+func (h *ControllerHooks) applyContext() context.Context {
+	if h != nil && h.lifetimeCtx != nil {
+		return h.lifetimeCtx
+	}
+	return context.Background()
+}
+
+func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes uint64) error {
 	if err := h.setMemoryHigh(allocBytes); err != nil {
 		return err
 	}
 	if h.opts.Balloon != nil {
-		h.opts.Balloon.SetAllocatable(allocBytes)
+		if err := h.opts.Balloon.ApplyAllocatable(ctx, allocBytes); err != nil {
+			return err
+		}
 	}
 	h.mu.Lock()
 	h.allocatableNowMem = allocBytes
@@ -324,10 +376,6 @@ func (h *ControllerHooks) OnAllocatableChanged(allocBytes uint64) error {
 	return nil
 }
 
-// setMemoryHigh writes memory.high = allocBytes * watermark_ratio. The
-// ratio is taken from the user-configured WatermarkHigh.memory if set,
-// otherwise defaults to 0.875 (matching WatermarkHighBytes default).
-// No-op when CgroupPath unset.
 func (h *ControllerHooks) setMemoryHigh(allocBytes uint64) error {
 	if h == nil || h.opts.CgroupPath == "" {
 		return nil
@@ -335,8 +383,8 @@ func (h *ControllerHooks) setMemoryHigh(allocBytes uint64) error {
 	ratio := 0.875
 	if h.cfg.Resources.WatermarkHigh != nil && h.cfg.Resources.WatermarkHigh.Memory != "" {
 		alloc, _ := h.cfg.AllocatableMemoryBytes()
-		cur, perr := h.cfg.WatermarkHighBytes()
-		if perr == nil && alloc > 0 {
+		cur, parseErr := h.cfg.WatermarkHighBytes()
+		if parseErr == nil && alloc > 0 {
 			ratio = float64(cur) / float64(alloc)
 		}
 	}
@@ -348,62 +396,211 @@ func (h *ControllerHooks) setMemoryHigh(allocBytes uint64) error {
 	return nil
 }
 
-// StartHeartbeat spawns the periodic Heartbeat goroutine. Stops on ctx
-// cancel or Release. No-op in static mode (no controller to talk to).
-//
-// Each heartbeat returns the controller's authoritative allocatable_now.
-// If it differs from the local value, the active reclaimer (or an
-// admin reclaim/grant command) changed our budget; we apply it via
-// OnAllocatableChanged so cgroup memory.high and CH balloon target
-// move together.
 func (h *ControllerHooks) StartHeartbeat(ctx context.Context, period time.Duration) {
 	if !h.Enabled() {
 		return
 	}
 	bgCtx, cancel := context.WithCancel(ctx)
-	h.mu.Lock()
-	if h.cancelBg == nil {
-		h.cancelBg = cancel
-	} else {
-		old := h.cancelBg
-		h.cancelBg = func() { old(); cancel() }
-	}
-	h.mu.Unlock()
+	h.addBackground(cancel)
 	h.bgWG.Add(1)
 	go func() {
 		defer h.bgWG.Done()
-		t := time.NewTicker(period)
-		defer t.Stop()
+		ticker := time.NewTicker(period)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-bgCtx.Done():
 				return
-			case <-t.C:
-				rss := readMemoryCurrent(h.opts.CgroupPath)
-				res, err := h.client.Heartbeat(rss, 0, 0, 0)
-				if err != nil {
-					h.opts.Logf("heartbeat: %v (will retry next tick)", err)
-					continue
-				}
-				if res != nil && res.NewAllocatable > 0 {
-					local := h.AllocatableNowMem()
-					if res.NewAllocatable != local {
-						h.opts.Logf("heartbeat: controller adjusted alloc %d → %d, applying",
-							local, res.NewAllocatable)
-						if err := h.OnAllocatableChanged(res.NewAllocatable); err != nil {
-							h.opts.Logf("apply allocatable: %v", err)
-						}
-					}
-				}
+			case <-ticker.C:
+				h.heartbeatOnce(bgCtx)
 			}
 		}
 	}()
 }
 
-// Release sends a final Release message and tears down the connection.
-// Idempotent.
-func (h *ControllerHooks) Release(reason string) {
+func (h *ControllerHooks) heartbeatOnce(ctx context.Context) {
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	state := h.localState()
+	if state.released || !state.admitted {
+		return
+	}
+	if !state.connected {
+		h.notifyReconnect()
+		return
+	}
+	rss := readMemoryCurrent(h.opts.CgroupPath)
+	res, err := h.client.Heartbeat(rss, 0, 0, 0)
+	if err != nil {
+		if resource.IsTransportError(err) {
+			h.markDisconnectedLocked(err)
+		} else {
+			h.opts.Logf("heartbeat: %v", err)
+		}
+		return
+	}
+	if res != nil && res.NewAllocatable > 0 && res.NewAllocatable != state.applied {
+		h.opts.Logf("heartbeat: controller adjusted alloc %d → %d, applying", state.applied, res.NewAllocatable)
+		if err := h.applyAllocatableLocked(ctx, res.NewAllocatable); err != nil {
+			h.opts.Logf("apply allocatable: %v", err)
+		}
+	}
+}
+
+// RequestBudget serializes the grant response with local application. It is the
+// only positive-budget entry point used by the pressure sensor.
+func (h *ControllerHooks) RequestBudget(step uint64, urgency, reason string) (uint64, uint64, time.Duration, error) {
 	if !h.Enabled() {
+		return 0, h.AllocatableNowMem(), 0, nil
+	}
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	state := h.localState()
+	if !state.connected {
+		h.notifyReconnect()
+		return 0, state.applied, 0, &resource.TransportError{Err: errors.New("controller session disconnected")}
+	}
+	granted, newAlloc, cooldownMs, err := h.client.RequestBudget(state.applied, step, urgency, reason)
+	if err != nil {
+		if resource.IsTransportError(err) {
+			h.markDisconnectedLocked(err)
+		}
+		return 0, state.applied, 0, err
+	}
+	if granted > 0 {
+		if err := h.applyAllocatableLocked(h.applyContext(), newAlloc); err != nil {
+			return 0, state.applied, time.Duration(cooldownMs) * time.Millisecond, err
+		}
+	}
+	return granted, newAlloc, time.Duration(cooldownMs) * time.Millisecond, nil
+}
+
+func (h *ControllerHooks) addBackground(cancel context.CancelFunc) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cancelBg == nil {
+		h.cancelBg = cancel
+		return
+	}
+	old := h.cancelBg
+	h.cancelBg = func() { old(); cancel() }
+}
+
+func (h *ControllerHooks) markDisconnectedLocked(err error) {
+	h.setConnected(false)
+	_ = h.client.Close()
+	h.opts.Logf("controller disconnected: %v; retaining applied allocatable and reconnecting", err)
+	h.notifyReconnect()
+}
+
+func (h *ControllerHooks) setConnected(connected bool) {
+	h.mu.Lock()
+	h.connected = connected
+	h.mu.Unlock()
+}
+
+func (h *ControllerHooks) notifyReconnect() {
+	select {
+	case h.reconnectWake <- struct{}{}:
+	default:
+	}
+}
+
+func (h *ControllerHooks) reconnectLoop() {
+	defer h.reconnectWG.Done()
+	for {
+		select {
+		case <-h.lifetimeCtx.Done():
+			return
+		case <-h.reconnectWake:
+		}
+		backoff := 100 * time.Millisecond
+		for {
+			state := h.localState()
+			if state.released {
+				return
+			}
+			if !state.admitted || state.connected {
+				break
+			}
+			h.sessionMu.Lock()
+			state = h.localState()
+			if state.connected || state.released || !state.admitted {
+				h.sessionMu.Unlock()
+				break
+			}
+			err := h.client.Connect()
+			if err == nil {
+				rss := readMemoryCurrent(h.opts.CgroupPath)
+				result, syncErr := h.client.StateSync(resource.StateSyncParams{
+					SandboxID: h.opts.SandboxID, AppliedAllocatableMemory: state.applied,
+					Settled: state.settled, CurrentRSS: rss, PreviousToken: state.token,
+				})
+				if syncErr == nil {
+					h.mu.Lock()
+					h.connected, h.previousToken = true, result.Token
+					h.mu.Unlock()
+					h.sessionMu.Unlock()
+					h.opts.Logf("controller state sync restored token=%s allocatable=%d settled=%v",
+						shortToken(result.Token), state.applied, state.settled)
+					break
+				}
+				if resource.IsStateSyncUnsupported(syncErr) && state.token != "" {
+					legacyAlloc, reattachErr := h.client.ReattachState(state.token)
+					if reattachErr == nil {
+						if legacyAlloc > 0 && legacyAlloc != state.applied {
+							reattachErr = h.applyAllocatableLocked(h.applyContext(), legacyAlloc)
+						}
+						if reattachErr == nil {
+							h.setConnected(true)
+							h.sessionMu.Unlock()
+							h.opts.Logf("controller reattached through legacy protocol token=%s", shortToken(state.token))
+							break
+						}
+					}
+					err = reattachErr
+				} else {
+					err = syncErr
+				}
+			}
+			_ = h.client.Close()
+			h.setConnected(false)
+			h.sessionMu.Unlock()
+			if err != nil {
+				h.opts.Logf("controller reconnect: %v", err)
+			}
+			if err := h.waitRetry(backoff); err != nil {
+				return
+			}
+			backoff = nextBackoff(backoff)
+		}
+	}
+}
+
+func nextBackoff(current time.Duration) time.Duration {
+	current *= 2
+	if current > 5*time.Second {
+		return 5 * time.Second
+	}
+	return current
+}
+
+func (h *ControllerHooks) waitRetry(base time.Duration) error {
+	jitter := time.Duration(rand.Int64N(int64(base/2 + 1)))
+	timer := time.NewTimer(base + jitter)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-h.opts.Context.Done():
+		return h.opts.Context.Err()
+	case <-h.lifetimeCtx.Done():
+		return errors.New("controller hooks released")
+	}
+}
+
+func (h *ControllerHooks) Release(reason string) {
+	if h == nil {
 		return
 	}
 	h.mu.Lock()
@@ -412,19 +609,31 @@ func (h *ControllerHooks) Release(reason string) {
 		return
 	}
 	h.released = true
+	cancelBg := h.cancelBg
 	h.mu.Unlock()
-	if h.cancelBg != nil {
-		h.cancelBg()
+	if cancelBg != nil {
+		cancelBg()
 	}
 	h.bgWG.Wait()
-	if err := h.client.Release(reason); err != nil {
-		h.opts.Logf("controller.Release: %v", err)
+	h.cancelLifetime()
+	h.reconnectWG.Wait()
+	if h.Enabled() {
+		h.sessionMu.Lock()
+		if h.client.Connected() {
+			if err := h.client.Release(reason); err != nil && !resource.IsTransportError(err) {
+				h.opts.Logf("controller.Release: %v", err)
+			}
+		}
+		_ = h.client.Close()
+		h.sessionMu.Unlock()
 	}
-	_ = h.client.Close()
+	if h.lease != nil {
+		if err := h.lease.Close(); err != nil {
+			h.opts.Logf("controller lease cleanup: %v", err)
+		}
+	}
 }
 
-// readMemoryCurrent reads memory.current from a cgroup directory. Returns
-// 0 when the file is absent or the cgroup_path is empty.
 func readMemoryCurrent(cgroupPath string) uint64 {
 	if cgroupPath == "" {
 		return 0

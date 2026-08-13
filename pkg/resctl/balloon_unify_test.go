@@ -227,7 +227,8 @@ func TestBalloon_KickRateLimited(t *testing.T) {
 // adjustment must call balloonCtl.SetAllocatable (and not open its own
 // HTTP path).
 func TestHooks_OnAllocatableChangedTouchesBalloon(t *testing.T) {
-	b := NewBalloonController("/dev/null", 8<<30, nil)
+	srv := newFakeCHResize(t)
+	b := NewBalloonController(srv.sock, 8<<30, nil)
 	cfg := &config.SandboxConfig{
 		Resources: config.ResourcesConfig{
 			Capacity:    config.CapacityConfig{Memory: "8GiB"},
@@ -294,7 +295,8 @@ func TestHooks_SettledRestoreBalloonCorrectionOnlyOnMismatch(t *testing.T) {
 	}
 
 	// Case 2: mismatch → correction applied to balloon.
-	b2 := NewBalloonController("/dev/null", 8<<30, nil)
+	srv := newFakeCHResize(t)
+	b2 := NewBalloonController(srv.sock, 8<<30, nil)
 	b2.SetAllocatable(2 << 30) // snapshot value
 	h2 := &ControllerHooks{opts: ControllerHookOptions{Balloon: b2, Logf: func(string, ...any) {}}, cfg: cfg}
 	h2.SetAllocatableNow(3 << 30) // controller granted different value

@@ -170,12 +170,15 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// cgroup descriptor after SetupCgroup below.
 	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
 		SocketPath: opts.Cfg.Resources.Control.Controller,
+		SandboxID:  opts.SandboxID,
+		Context:    ctx,
 		Logf:       logf,
 		Balloon:    balloonCtl,
 	}, opts.Cfg)
 	if err != nil {
 		return -1, fmt.Errorf("controller dial: %w", err)
 	}
+	defer hooks.Release("normal")
 	if hooks.Enabled() {
 		grantedInitial, err := hooks.Admit(opts.SandboxID, 0)
 		if err != nil {
@@ -199,7 +202,6 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// created by sandbox-ctl). See docs/sandbox.md §4.1.
 	var cg *resctl.CgroupController
 	defer func() {
-		hooks.Release("normal")
 		if cg != nil {
 			_ = cg.Cleanup()
 		}

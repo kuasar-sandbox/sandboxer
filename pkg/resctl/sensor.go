@@ -297,8 +297,7 @@ func (s *PressureSensor) runEventsPoll(ctx context.Context) {
 // dispatch is the shared RequestBudget → OnAllocatableChanged path.
 // Errors are logged-only; sensor keeps running on next signal.
 func (s *PressureSensor) dispatch(urgency, reason string) {
-	currentAlloc := s.hooks.AllocatableNowMem()
-	g, newAlloc, _, err := s.hooks.client.RequestBudget(currentAlloc, s.step, urgency, reason)
+	g, newAlloc, _, err := s.hooks.RequestBudget(s.step, urgency, reason)
 	if err != nil {
 		if !isExpectedRPCErr(err) {
 			s.logf("sensor: request_budget urgency=%s reason=%s: %v", urgency, reason, err)
@@ -306,10 +305,6 @@ func (s *PressureSensor) dispatch(urgency, reason string) {
 		return
 	}
 	if g == 0 {
-		return
-	}
-	if err := s.hooks.OnAllocatableChanged(newAlloc); err != nil {
-		s.logf("sensor: apply allocatable %d: %v", newAlloc, err)
 		return
 	}
 	s.logf("sensor: granted +%d (urgency=%s reason=%s) → allocatable=%d",
@@ -376,6 +371,9 @@ func isExpectedRPCErr(err error) bool {
 	if err == nil {
 		return true
 	}
+	if resource.IsTransportError(err) {
+		return true
+	}
 	msg := err.Error()
 	return strings.Contains(msg, "EOF") ||
 		strings.Contains(msg, "broken pipe") ||
@@ -391,15 +389,7 @@ func (h *ControllerHooks) StartSensor(ctx context.Context, step uint64) {
 	}
 	sensor := NewPressureSensor(h, h.opts.CgroupPath, step, h.opts.Logf)
 	bgCtx, cancel := context.WithCancel(ctx)
-	h.mu.Lock()
-	if h.cancelBg == nil {
-		h.cancelBg = cancel
-	} else {
-		// Heartbeat already owns cancelBg; chain so Release cancels both.
-		old := h.cancelBg
-		h.cancelBg = func() { old(); cancel() }
-	}
-	h.mu.Unlock()
+	h.addBackground(cancel)
 	h.bgWG.Add(1)
 	go func() {
 		defer h.bgWG.Done()
