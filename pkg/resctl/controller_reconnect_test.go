@@ -415,3 +415,50 @@ func waitHooksConnected(t *testing.T, hooks *ControllerHooks) {
 		t.Fatal("hooks did not become connected")
 	}
 }
+
+func TestControllerHooksReleaseCancelsLifetimeBeforeWaiting(t *testing.T) {
+	lifetimeCtx, cancelLifetime := context.WithCancel(context.Background())
+	hooks := &ControllerHooks{
+		opts:           ControllerHookOptions{Logf: t.Logf},
+		lifetimeCtx:    lifetimeCtx,
+		cancelLifetime: cancelLifetime,
+	}
+	hooks.bgWG.Add(1)
+	go func() {
+		defer hooks.bgWG.Done()
+		<-lifetimeCtx.Done()
+	}()
+	done := make(chan struct{})
+	go func() {
+		hooks.Release("test")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Release waited for background work before cancelling its lifetime context")
+	}
+}
+
+func TestControllerHooksLifetimeFollowsRunContext(t *testing.T) {
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	dir := t.TempDir()
+	cgroup := filepath.Join(dir, "cgroup")
+	if err := os.MkdirAll(cgroup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "controller.sock")
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: socket, SandboxID: "run-context", Context: runCtx, Logf: t.Logf,
+	}, reconnectConfig(t, socket, cgroup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelRun()
+	select {
+	case <-hooks.lifetimeCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("run context cancellation did not cancel controller lifetime")
+	}
+	hooks.Release("test")
+}

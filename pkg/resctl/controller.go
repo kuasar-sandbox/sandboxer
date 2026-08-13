@@ -68,7 +68,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 	if opts.Context == nil {
 		opts.Context = context.Background()
 	}
-	lifetimeCtx, cancel := context.WithCancel(context.Background())
+	lifetimeCtx, cancel := context.WithCancel(opts.Context)
 	h := &ControllerHooks{
 		opts: opts, cfg: cfg, lifetimeCtx: lifetimeCtx, cancelLifetime: cancel,
 		reconnectWake: make(chan struct{}, 1),
@@ -664,8 +664,8 @@ func (h *ControllerHooks) Release(reason string) {
 	if cancelBg != nil {
 		cancelBg()
 	}
-	h.bgWG.Wait()
 	h.cancelLifetime()
+	h.bgWG.Wait()
 	h.reconnectWG.Wait()
 	if h.Enabled() {
 		h.sessionMu.Lock()
