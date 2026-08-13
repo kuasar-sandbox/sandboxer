@@ -31,11 +31,13 @@ type vma struct {
 	memfdOffset uint64
 }
 
-// AddressMap translates a fault VA (from any registered VMA) into the
-// memfd-relative offset. Both backendVA and chVA cover the same memfd
-// inode; backend is one VMA, CH may be multiple. Stable in steady state
-// (RLock per fault); only mutated when registering a VMA at sandbox
-// startup or when handling a va_report from CH.
+// AddressMap translates a CH userfaultfd event VA into the memfd-relative
+// offset and a memfd-relative offset into the sandbox-ctl backend VMA. Both
+// backendVA and chVA cover the same memfd inode, but they belong to different
+// process address spaces and their numeric VA ranges may overlap. Backend is
+// one VMA, CH may be multiple. Stable in steady state (RLock per fault); only
+// mutated when registering a VMA at sandbox startup or when handling a
+// va_report from CH.
 type AddressMap struct {
 	mu       sync.RWMutex
 	memfdLen uint64
@@ -87,13 +89,20 @@ func (m *AddressMap) RegisterVMA(p ProcessKind, vaStart, size, memfdOffset uint6
 	return nil
 }
 
-// Locate returns (memfdOffset, true) if faultVA falls within any
-// registered VMA (any process), else (_, false).
+// Locate returns (memfdOffset, true) if faultVA falls within a CH VMA, else
+// (_, false). Every caller handles an event read from a CH-owned userfaultfd;
+// the backend mapping is never userfaultfd-registered and is resolved only by
+// BackendVAFor. Filtering by process is required because backend and CH live in
+// different address spaces, so their numeric VA ranges may legitimately
+// overlap.
 func (m *AddressMap) Locate(faultVA uint64) (uint64, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for i := range m.vmas {
 		v := &m.vmas[i]
+		if v.process != ProcessCH {
+			continue
+		}
 		if faultVA >= v.start && faultVA < v.end {
 			return v.memfdOffset + (faultVA - v.start), true
 		}
