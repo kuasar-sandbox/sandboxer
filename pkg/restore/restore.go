@@ -368,7 +368,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	var balloonCtl *resctl.BalloonController
 	if allocAtSnap < snapCap {
 		balloonCtl = resctl.NewBalloonController(chSock, snapCap, logf)
-		balloonCtl.SetAllocatable(allocAtSnap)
+		// CH restores this target from its device state; seed it as already
+		// applied so an unchanged budget needs no post-resume resize RPC.
+		balloonCtl.SeedAppliedAllocatable(allocAtSnap)
 		hooks.SetBalloon(balloonCtl)
 	}
 
@@ -386,6 +388,10 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		initialAlloc = allocAtSnap
 	}
 	if hooks.Enabled() {
+		// The restored balloon already enforces allocAtSnap. Seed that actual
+		// state before Admit so a concurrent reconnect never reports the new
+		// controller's grant until the post-resume correction has succeeded.
+		hooks.SetRestoreAppliedAllocatable(allocAtSnap)
 		// Dynamic mode: controller decides. Floor sent = yaml.allocatable
 		// (controller's 2-tier fallback uses it if headroom can't fit
 		// allocAtSnap).
@@ -400,16 +406,6 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		logf("static mode: bumping initial allocatable from yaml=%d to snapshot allocatable=%d (balloon target/current=%d/%d)",
 			yamlAlloc, allocAtSnap, balTarget, balCurrent)
 	}
-	// Record initialAlloc in hooks' in-memory state. No external write
-	// here: cgroup memory.high is deferred to SettledRestore (Issue 4 —
-	// PSI throttling during uffd-driven replay), and balloon already
-	// reflects allocAtSnap from the snapshot (any correction needed
-	// when initialAlloc != allocAtSnap also happens in SettledRestore,
-	// after vm.resume).
-	if hooks != nil {
-		hooks.SetAllocatableNow(initialAlloc)
-	}
-
 	// state.json restored verbatim (vCPU regs, virtio queue indices —
 	// nothing path-dependent).
 	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), entries["state.json"], 0o644); err != nil {
@@ -652,7 +648,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			// Issue 4) using allocatable_now; corrects balloon only when
 			// initialAlloc != allocAtSnap.
 			if pc.Hooks != nil {
-				if err := pc.Hooks.SettledRestore(allocAtSnap); err != nil {
+				if err := pc.Hooks.SettledRestore(allocAtSnap, initialAlloc); err != nil {
 					pc.Logf("settled-restore: %v (continuing)", err)
 				}
 				if pc.Hooks.Enabled() {

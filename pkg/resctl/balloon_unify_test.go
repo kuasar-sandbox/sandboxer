@@ -3,7 +3,6 @@ package resctl
 import (
 	"context"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -11,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // fakeCHResize spins a tiny HTTP/1.1-over-UDS server that records every
@@ -252,15 +253,15 @@ func TestHooks_OnAllocatableChangedTouchesBalloon(t *testing.T) {
 	}
 }
 
-// TestHooks_SetAllocatableNowDoesNotTouchBalloon: restore.go pre-resume
-// path — record state without any external side effect.
-func TestHooks_SetAllocatableNowDoesNotTouchBalloon(t *testing.T) {
+// TestHooks_SetRestoreAppliedAllocatableDoesNotTouchBalloon covers the
+// restore pre-resume path: record observed state without external side effects.
+func TestHooks_SetRestoreAppliedAllocatableDoesNotTouchBalloon(t *testing.T) {
 	b := NewBalloonController("/dev/null", 8<<30, nil)
 	h := &ControllerHooks{opts: ControllerHookOptions{Balloon: b, Logf: func(string, ...any) {}}}
 	// Seed balloon target to a known value so we can detect spurious writes.
 	b.SetAllocatable(4 << 30)
 	wantTarget := b.CurrentTarget()
-	h.SetAllocatableNow(1 << 30)
+	h.SetRestoreAppliedAllocatable(1 << 30)
 	if got := h.AllocatableNowMem(); got != 1<<30 {
 		t.Errorf("allocatableNowMem = %d, want %d", got, 1<<30)
 	}
@@ -283,11 +284,11 @@ func TestHooks_SettledRestoreBalloonCorrectionOnlyOnMismatch(t *testing.T) {
 
 	// Case 1: match → no correction.
 	b1 := NewBalloonController("/dev/null", 8<<30, nil)
-	b1.SetAllocatable(2 << 30)
+	b1.SeedAppliedAllocatable(2 << 30)
 	initial := b1.CurrentTarget()
 	h1 := &ControllerHooks{opts: ControllerHookOptions{Balloon: b1, Logf: func(string, ...any) {}}, cfg: cfg}
-	h1.SetAllocatableNow(2 << 30) // == allocAtSnap
-	if err := h1.SettledRestore(2 << 30); err != nil {
+	h1.SetRestoreAppliedAllocatable(2 << 30) // == allocAtSnap
+	if err := h1.SettledRestore(2<<30, 2<<30); err != nil {
 		t.Fatalf("SettledRestore: %v", err)
 	}
 	if got := b1.CurrentTarget(); got != initial {
@@ -299,13 +300,34 @@ func TestHooks_SettledRestoreBalloonCorrectionOnlyOnMismatch(t *testing.T) {
 	b2 := NewBalloonController(srv.sock, 8<<30, nil)
 	b2.SetAllocatable(2 << 30) // snapshot value
 	h2 := &ControllerHooks{opts: ControllerHookOptions{Balloon: b2, Logf: func(string, ...any) {}}, cfg: cfg}
-	h2.SetAllocatableNow(3 << 30) // controller granted different value
-	if err := h2.SettledRestore(2 << 30); err != nil {
+	h2.SetRestoreAppliedAllocatable(2 << 30)
+	if err := h2.SettledRestore(2<<30, 3<<30); err != nil {
 		t.Fatalf("SettledRestore: %v", err)
 	}
 	want := uint64(8<<30) - uint64(3<<30)
 	if got := b2.CurrentTarget(); got != want {
 		t.Errorf("mismatch case: balloon target = %d, want %d", got, want)
+	}
+}
+
+func TestHooks_SettledRestoreFailedCorrectionKeepsObservedAllocation(t *testing.T) {
+	cfg := &config.SandboxConfig{
+		Resources: config.ResourcesConfig{
+			Capacity:    config.CapacityConfig{Memory: "8GiB"},
+			Allocatable: config.AllocatableConfig{Memory: "1GiB"},
+		},
+	}
+	cfg.ApplyDefaults()
+	b := NewBalloonController(filepath.Join(t.TempDir(), "missing-ch.sock"), 8<<30, nil)
+	b.SeedAppliedAllocatable(2 << 30)
+	h := &ControllerHooks{opts: ControllerHookOptions{Balloon: b, Logf: func(string, ...any) {}}, cfg: cfg}
+	h.SetRestoreAppliedAllocatable(2 << 30)
+
+	if err := h.SettledRestore(2<<30, 3<<30); err == nil {
+		t.Fatal("SettledRestore succeeded despite failed balloon correction")
+	}
+	if got := h.AllocatableNowMem(); got != 2<<30 {
+		t.Fatalf("applied allocation advanced after failed correction: got %d want %d", got, uint64(2<<30))
 	}
 }
 

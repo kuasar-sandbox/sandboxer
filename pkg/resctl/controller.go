@@ -40,6 +40,7 @@ type ControllerHooks struct {
 	settled           bool
 	connected         bool
 	allocatableNowMem uint64
+	desiredAllocMem   uint64
 	previousToken     string
 	released          bool
 
@@ -149,7 +150,7 @@ func (h *ControllerHooks) AllocatableNowMem() uint64 {
 
 type localControllerState struct {
 	admitted, settled, connected, released bool
-	applied                                uint64
+	applied, desired                       uint64
 	token                                  string
 }
 
@@ -158,7 +159,8 @@ func (h *ControllerHooks) localState() localControllerState {
 	defer h.mu.Unlock()
 	return localControllerState{
 		admitted: h.admitted, settled: h.settled, connected: h.connected,
-		released: h.released, applied: h.allocatableNowMem, token: h.previousToken,
+		released: h.released, applied: h.allocatableNowMem,
+		desired: h.desiredAllocMem, token: h.previousToken,
 	}
 }
 
@@ -232,7 +234,14 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 		}
 		h.mu.Lock()
 		h.admitted, h.connected = true, true
-		h.allocatableNowMem, h.previousToken = res.GrantedInitialAlloc, res.Token
+		h.desiredAllocMem = res.GrantedInitialAlloc
+		// Cold start has no pre-existing applied state, so the CH boot
+		// balloon is constructed from this grant. Restore seeds the actual
+		// snapshot value before Admit and must not be overwritten by intent.
+		if h.allocatableNowMem == 0 {
+			h.allocatableNowMem = res.GrantedInitialAlloc
+		}
+		h.previousToken = res.Token
 		h.mu.Unlock()
 		if res.QueuedForMs > 0 {
 			h.opts.Logf("controller admit: token=%s initial_alloc=%d (queued %dms, pos %d at entry)",
@@ -261,18 +270,19 @@ func (h *ControllerHooks) Settled() error {
 	}
 	h.sessionMu.Lock()
 	defer h.sessionMu.Unlock()
-	current := h.localState().applied
-	if current == 0 {
-		current = floor
+	state := h.localState()
+	target := state.desired
+	if target == 0 {
+		target = state.applied
 	}
-	if err := h.setMemoryHigh(current); err != nil {
-		h.opts.Logf("settled: setMemoryHigh: %v", err)
+	if target == 0 {
+		target = floor
+	}
+	if err := h.applyAllocatableLocked(h.applyContext(), target); err != nil {
+		return fmt.Errorf("settled apply allocatable: %w", err)
 	}
 	h.mu.Lock()
 	h.settled = true
-	if !h.Enabled() {
-		h.allocatableNowMem = floor
-	}
 	connected := h.connected
 	h.mu.Unlock()
 	if !h.Enabled() {
@@ -293,26 +303,24 @@ func (h *ControllerHooks) Settled() error {
 	return nil
 }
 
-func (h *ControllerHooks) SettledRestore(allocAtSnap uint64) error {
+func (h *ControllerHooks) SettledRestore(allocAtSnap, desiredAlloc uint64) error {
 	if h == nil {
 		return nil
 	}
 	h.sessionMu.Lock()
 	defer h.sessionMu.Unlock()
-	cur := h.localState().applied
-	if cur == 0 {
-		if floor, err := h.cfg.AllocatableMemoryBytes(); err == nil {
-			cur = floor
-		}
+	state := h.localState()
+	if desiredAlloc == 0 {
+		desiredAlloc = state.desired
 	}
-	if err := h.setMemoryHigh(cur); err != nil {
-		h.opts.Logf("settled-restore: setMemoryHigh: %v", err)
+	if desiredAlloc == 0 {
+		desiredAlloc = allocAtSnap
 	}
-	if cur != allocAtSnap && h.opts.Balloon != nil {
-		if err := h.opts.Balloon.ApplyAllocatable(h.applyContext(), cur); err != nil {
-			return fmt.Errorf("settled-restore balloon correction: %w", err)
-		}
-		h.opts.Logf("settled-restore: balloon correction alloc %d → %d", allocAtSnap, cur)
+	if err := h.applyAllocatableLocked(h.applyContext(), desiredAlloc); err != nil {
+		return fmt.Errorf("settled-restore apply allocatable: %w", err)
+	}
+	if desiredAlloc != allocAtSnap {
+		h.opts.Logf("settled-restore: applied correction alloc %d → %d", allocAtSnap, desiredAlloc)
 	}
 	h.mu.Lock()
 	h.settled = true
@@ -336,7 +344,9 @@ func (h *ControllerHooks) SettledRestore(allocAtSnap uint64) error {
 	return nil
 }
 
-func (h *ControllerHooks) SetAllocatableNow(allocBytes uint64) {
+// SetRestoreAppliedAllocatable records the allocation encoded in the restored
+// balloon device before Admit. It is an observed value, not controller intent.
+func (h *ControllerHooks) SetRestoreAppliedAllocatable(allocBytes uint64) {
 	if h == nil {
 		return
 	}
@@ -372,6 +382,7 @@ func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes
 	}
 	h.mu.Lock()
 	h.allocatableNowMem = allocBytes
+	h.desiredAllocMem = allocBytes
 	h.mu.Unlock()
 	return nil
 }
