@@ -41,13 +41,14 @@ type ControllerHooks struct {
 	// with the process-local pinned FD path used for cgroup file I/O.
 	controllerCgroupPath string
 
-	admitted          bool
-	settled           bool
-	connected         bool
-	allocatableNowMem uint64
-	desiredAllocMem   uint64
-	previousToken     string
-	released          bool
+	admitted           bool
+	settled            bool
+	connected          bool
+	allocatableNowMem  uint64
+	desiredAllocMem    uint64
+	enforcementPending bool
+	previousToken      string
+	released           bool
 
 	lifetimeCtx    context.Context
 	cancelLifetime context.CancelFunc
@@ -172,9 +173,9 @@ func (h *ControllerHooks) AllocatableNowMem() uint64 {
 }
 
 type localControllerState struct {
-	admitted, settled, connected, released bool
-	applied, desired                       uint64
-	token                                  string
+	admitted, settled, connected, released, enforcementPending bool
+	applied, desired                                           uint64
+	token                                                      string
 }
 
 func (h *ControllerHooks) localState() localControllerState {
@@ -183,7 +184,8 @@ func (h *ControllerHooks) localState() localControllerState {
 	return localControllerState{
 		admitted: h.admitted, settled: h.settled, connected: h.connected,
 		released: h.released, applied: h.allocatableNowMem,
-		desired: h.desiredAllocMem, token: h.previousToken,
+		desired: h.desiredAllocMem, enforcementPending: h.enforcementPending,
+		token: h.previousToken,
 	}
 }
 
@@ -258,6 +260,11 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 		h.mu.Lock()
 		h.admitted, h.connected = true, true
 		h.desiredAllocMem = res.GrantedInitialAlloc
+		// Both cold start and restore deliberately defer memory.high until
+		// their guest settle barrier. Keep the boot/restored balloon budget as
+		// the safe applied value, but force enforcement even when the next
+		// controller response repeats that same allocation.
+		h.enforcementPending = true
 		// Cold start has no pre-existing applied state, so the CH boot
 		// balloon is constructed from this grant. Restore seeds the actual
 		// snapshot value before Admit and must not be overwritten by intent.
@@ -327,7 +334,10 @@ func (h *ControllerHooks) SettledRestore(allocAtSnap, desiredAlloc uint64) error
 	h.mu.Lock()
 	h.settled = true
 	h.mu.Unlock()
-	if desiredAlloc == 0 {
+	// Admit's caller retains its original grant, but a reconnect before
+	// restore_ack may have replaced that intent through StateSync. The
+	// session-local desired value is canonical once present.
+	if state.desired > 0 {
 		desiredAlloc = state.desired
 	}
 	if desiredAlloc == 0 {
@@ -378,6 +388,7 @@ func (h *ControllerHooks) SetRestoreAppliedAllocatable(allocBytes uint64) {
 	}
 	h.mu.Lock()
 	h.allocatableNowMem = allocBytes
+	h.enforcementPending = true
 	h.mu.Unlock()
 }
 
@@ -429,6 +440,7 @@ func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes
 	h.mu.Lock()
 	h.allocatableNowMem = allocBytes
 	h.desiredAllocMem = allocBytes
+	h.enforcementPending = false
 	h.mu.Unlock()
 	return nil
 }
@@ -516,14 +528,14 @@ func (h *ControllerHooks) heartbeatOnce(ctx context.Context) {
 	rss := readMemoryCurrent(h.opts.CgroupPath)
 	res, err := h.client.Heartbeat(rss, 0, 0, 0)
 	if err != nil {
-		if resource.IsTransportError(err) {
-			h.markDisconnectedLocked(err)
-		} else {
-			h.opts.Logf("heartbeat: %v", err)
-		}
+		// A TypeError such as "no reservation" rejects the session just as
+		// definitively as EOF. Keeping that stream connected would prevent
+		// StateSync forever.
+		h.markDisconnectedLocked(err)
 		return
 	}
-	if res != nil && res.NewAllocatable > 0 && res.NewAllocatable != state.applied {
+	if res != nil && res.NewAllocatable > 0 &&
+		(res.NewAllocatable != state.applied || state.enforcementPending) {
 		h.opts.Logf("heartbeat: controller adjusted alloc %d → %d, applying", state.applied, res.NewAllocatable)
 		if err := h.applyAllocatableLocked(ctx, res.NewAllocatable); err != nil {
 			h.opts.Logf("apply allocatable: %v", err)
@@ -546,9 +558,7 @@ func (h *ControllerHooks) RequestBudget(step uint64, urgency, reason string) (ui
 	}
 	granted, newAlloc, cooldownMs, err := h.client.RequestBudget(state.applied, step, urgency, reason)
 	if err != nil {
-		if resource.IsTransportError(err) {
-			h.markDisconnectedLocked(err)
-		}
+		h.markDisconnectedLocked(err)
 		return 0, state.applied, 0, err
 	}
 	if granted > 0 {
@@ -621,10 +631,22 @@ func (h *ControllerHooks) reconnectLoop() {
 					Settled: state.settled, CurrentRSS: rss, PreviousToken: state.token,
 				})
 				restoredAlloc := state.applied
-				if syncErr == nil && result.NewAllocatable > 0 && result.NewAllocatable != state.applied {
-					syncErr = h.applyAllocatableLocked(h.applyContext(), result.NewAllocatable)
+				desiredAlloc := state.desired
+				if syncErr == nil && result.NewAllocatable > 0 {
+					desiredAlloc = result.NewAllocatable
+				}
+				if syncErr == nil && !state.settled {
+					// Cold start and restore intentionally defer memory.high and
+					// balloon corrections until hello/restore_ack. Remember the
+					// recovered controller decision without crossing that barrier.
+					h.mu.Lock()
+					h.desiredAllocMem = desiredAlloc
+					h.mu.Unlock()
+				} else if syncErr == nil && desiredAlloc > 0 &&
+					(desiredAlloc != state.applied || state.enforcementPending) {
+					syncErr = h.applyAllocatableLocked(h.applyContext(), desiredAlloc)
 					if syncErr == nil {
-						restoredAlloc = result.NewAllocatable
+						restoredAlloc = desiredAlloc
 					}
 				}
 				if syncErr == nil {
@@ -639,8 +661,17 @@ func (h *ControllerHooks) reconnectLoop() {
 				if resource.IsStateSyncUnsupported(syncErr) && state.token != "" {
 					legacyAlloc, reattachErr := h.client.ReattachState(state.token)
 					if reattachErr == nil {
-						if legacyAlloc > 0 && legacyAlloc != state.applied {
-							reattachErr = h.applyAllocatableLocked(h.applyContext(), legacyAlloc)
+						desiredAlloc := state.desired
+						if legacyAlloc > 0 {
+							desiredAlloc = legacyAlloc
+						}
+						if !state.settled {
+							h.mu.Lock()
+							h.desiredAllocMem = desiredAlloc
+							h.mu.Unlock()
+						} else if desiredAlloc > 0 &&
+							(desiredAlloc != state.applied || state.enforcementPending) {
+							reattachErr = h.applyAllocatableLocked(h.applyContext(), desiredAlloc)
 						}
 						if reattachErr == nil {
 							h.setConnected(true)

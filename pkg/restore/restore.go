@@ -159,25 +159,6 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, err
 	}
 
-	// Restore-side controller hooks. Admit happens once we've derived
-	// allocatable_at_snapshot from the bundle's state.json balloon section
-	// (see deriveAllocatableAtSnapshot below).
-	// Balloon is created later (snapCap unknown until snapCfg is parsed),
-	// then late-injected via hooks.SetBalloon. Until then, hooks balloon-
-	// related entry points (SettledRestore, OnAllocatableChanged) treat
-	// Balloon-nil as no-op on the balloon side.
-	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
-		SocketPath: opts.HostCfg.Resources.Control.Controller,
-		CgroupPath: cg.LocalPath(),
-		SandboxID:  opts.SandboxID,
-		Context:    ctx,
-		Logf:       logf,
-	}, opts.HostCfg)
-	if err != nil {
-		return -1, fmt.Errorf("controller dial: %w", err)
-	}
-	defer hooks.Release("normal")
-
 	// Open the snapshot bundle as a single fetch.Stream — file:// is a local
 	// tarstream artifact (hole map from the envelope), manifest:// is
 	// chunk-granular via cache-ctl.
@@ -369,7 +350,6 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if balOk {
 		balloonCtl = resctl.NewBalloonController(chSock, snapCap, logf)
 		balloonCtl.SeedRestoredState(allocAtSnap, balTarget)
-		hooks.SetBalloon(balloonCtl)
 	}
 
 	yamlAlloc, err := opts.HostCfg.AllocatableMemoryBytes()
@@ -385,6 +365,22 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if allocAtSnap > initialAlloc {
 		initialAlloc = allocAtSnap
 	}
+	// Publish the immutable lifecycle lease only when every snapshot field
+	// needed by Admit is available. A stalled manifest fetch must not appear
+	// to restart inventory as a live, full-capacity sandbox that cannot yet
+	// StateSync because it has never been admitted.
+	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
+		SocketPath: opts.HostCfg.Resources.Control.Controller,
+		CgroupPath: cg.LocalPath(),
+		SandboxID:  opts.SandboxID,
+		Context:    ctx,
+		Logf:       logf,
+		Balloon:    balloonCtl,
+	}, opts.HostCfg)
+	if err != nil {
+		return -1, fmt.Errorf("controller dial: %w", err)
+	}
+	defer hooks.Release("normal")
 	if hooks.Enabled() {
 		// The restored balloon already enforces allocAtSnap. Seed that actual
 		// state before Admit so a concurrent reconnect never reports the new

@@ -73,11 +73,23 @@ func startSettledController(t *testing.T, reject ...bool) *settledController {
 		c.settled <- *settled
 		if !c.reject {
 			_ = resource.WriteMessage(conn, &resource.Message{Type: resource.TypeAck})
-			release, err := resource.ReadMessage(conn)
-			if err == nil && release.Type == resource.TypeRelease {
-				_ = resource.WriteMessage(conn, &resource.Message{Type: resource.TypeAck})
+			for {
+				req, err := resource.ReadMessage(conn)
+				if err != nil {
+					return
+				}
+				switch req.Type {
+				case resource.TypeHeartbeat:
+					_ = resource.WriteMessage(conn, &resource.Message{
+						Type: resource.TypeAck, NewAllocatable: admit.StartupBudgetMemory,
+					})
+				case resource.TypeRelease:
+					_ = resource.WriteMessage(conn, &resource.Message{Type: resource.TypeAck})
+					return
+				default:
+					_ = resource.WriteMessage(conn, &resource.Message{Type: resource.TypeAck})
+				}
 			}
-			return
 		}
 		_ = resource.WriteMessage(conn, &resource.Message{Type: resource.TypeError, Msg: "invalid session token"})
 		_ = conn.Close()
@@ -107,6 +119,89 @@ func startSettledController(t *testing.T, reject ...bool) *settledController {
 		case <-c.done:
 		case <-time.After(5 * time.Second):
 			t.Error("settled controller did not stop")
+		}
+	})
+	return c
+}
+
+type sessionErrorController struct {
+	t          *testing.T
+	socket     string
+	rejectType string
+	listener   *net.UnixListener
+	synced     chan resource.Message
+	done       chan struct{}
+}
+
+func startSessionErrorController(t *testing.T, rejectType string) *sessionErrorController {
+	t.Helper()
+	socket := filepath.Join(t.TempDir(), "controller.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &sessionErrorController{
+		t: t, socket: socket, rejectType: rejectType, listener: listener,
+		synced: make(chan resource.Message, 1), done: make(chan struct{}),
+	}
+	go func() {
+		defer close(c.done)
+		first, err := listener.AcceptUnix()
+		if err != nil {
+			return
+		}
+		admit, err := resource.ReadMessage(first)
+		if err != nil || admit.Type != resource.TypeAdmit {
+			t.Errorf("admit request = %+v err=%v", admit, err)
+			_ = first.Close()
+			return
+		}
+		_ = resource.WriteMessage(first, &resource.Message{
+			Type: resource.TypeAdmitResponse, Status: resource.StatusAdmitted,
+			Token: "rejected-session-token", GrantedInitialAlloc: admit.StartupBudgetMemory,
+		})
+		rejected, err := resource.ReadMessage(first)
+		if err != nil || rejected.Type != rejectType {
+			t.Errorf("rejected request = %+v err=%v, want %s", rejected, err, rejectType)
+			_ = first.Close()
+			return
+		}
+		_ = resource.WriteMessage(first, &resource.Message{Type: resource.TypeError, Msg: "no reservation"})
+		_ = first.Close()
+
+		second, err := listener.AcceptUnix()
+		if err != nil {
+			return
+		}
+		defer second.Close()
+		syncReq, err := resource.ReadMessage(second)
+		if err != nil || syncReq.Type != resource.TypeStateSync {
+			t.Errorf("state sync request = %+v err=%v", syncReq, err)
+			return
+		}
+		_ = resource.WriteMessage(second, &resource.Message{
+			Type: resource.TypeAck, Token: "recovered-session-token",
+			NewAllocatable: syncReq.AppliedAllocatableMemory,
+		})
+		c.synced <- *syncReq
+		for {
+			req, err := resource.ReadMessage(second)
+			if err != nil {
+				return
+			}
+			if req.Type == resource.TypeRelease {
+				_ = resource.WriteMessage(second, &resource.Message{Type: resource.TypeAck})
+				return
+			}
+			_ = resource.WriteMessage(second, &resource.Message{Type: resource.TypeAck})
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		select {
+		case <-c.done:
+		case <-time.After(5 * time.Second):
+			t.Error("session error controller did not stop")
 		}
 	})
 	return c
@@ -371,6 +466,146 @@ func TestControllerHooksAppliesStateSyncAllocation(t *testing.T) {
 	}
 }
 
+func TestControllerHooksDefersPreSettledStateSyncAllocation(t *testing.T) {
+	const (
+		startupAlloc = uint64(768 << 20)
+		syncAlloc    = uint64(640 << 20)
+	)
+	controller := startReconnectController(t, false, syncAlloc)
+	cgroup := filepath.Join(t.TempDir(), "cgroup")
+	if err := os.MkdirAll(cgroup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{"memory.high": "max", "memory.current": "123"} {
+		if err := os.WriteFile(filepath.Join(cgroup, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: controller.socket, CgroupPath: cgroup, SandboxID: "pre-settle-sync",
+		Context: context.Background(), Logf: t.Logf,
+	}, reconnectConfig(t, controller.socket, cgroup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hooks.Release("test")
+	if _, err := hooks.Admit("pre-settle-sync", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Detect the server-side close before crossing hello/restore_ack.
+	hooks.heartbeatOnce(context.Background())
+	select {
+	case syncReq := <-controller.synced:
+		if syncReq.Settled || syncReq.AppliedAllocatableMemory != startupAlloc {
+			t.Fatalf("pre-settle StateSync = %+v", syncReq)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pre-settle StateSync timeout")
+	}
+	waitHooksConnected(t, hooks)
+	state := hooks.localState()
+	if state.applied != startupAlloc || state.desired != syncAlloc || !state.enforcementPending {
+		t.Fatalf("deferred state = %+v", state)
+	}
+	data, err := os.ReadFile(filepath.Join(cgroup, "memory.high"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "max" {
+		t.Fatalf("pre-settle StateSync wrote memory.high=%q", data)
+	}
+
+	if err := hooks.Settled(); err != nil {
+		t.Fatal(err)
+	}
+	state = hooks.localState()
+	if state.applied != syncAlloc || state.desired != syncAlloc || state.enforcementPending {
+		t.Fatalf("settled state = %+v", state)
+	}
+	wantHigh := fmt.Sprint(uint64(float64(syncAlloc) * 0.875))
+	data, err = os.ReadFile(filepath.Join(cgroup, "memory.high"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != wantHigh {
+		t.Fatalf("settled memory.high = %q, want %q", data, wantHigh)
+	}
+}
+
+func TestControllerHooksDefersPreRestoreAckStateSyncAllocation(t *testing.T) {
+	const (
+		allocAtSnapshot = uint64(704 << 20)
+		admitAlloc      = uint64(768 << 20)
+		syncAlloc       = uint64(640 << 20)
+	)
+	controller := startReconnectController(t, false, syncAlloc)
+	cgroup := filepath.Join(t.TempDir(), "cgroup")
+	if err := os.MkdirAll(cgroup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{"memory.high": "max", "memory.current": "123"} {
+		if err := os.WriteFile(filepath.Join(cgroup, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: controller.socket, CgroupPath: cgroup, SandboxID: "pre-restore-ack-sync",
+		Context: context.Background(), Logf: t.Logf,
+	}, reconnectConfig(t, controller.socket, cgroup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hooks.Release("test")
+	hooks.SetRestoreAppliedAllocatable(allocAtSnapshot)
+	grant, err := hooks.Admit("pre-restore-ack-sync", allocAtSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grant != admitAlloc {
+		t.Fatalf("admit grant = %d, want %d", grant, admitAlloc)
+	}
+
+	// Detect the server-side close before restore_ack, then ensure the
+	// recovered target remains deferred and replaces the stale Admit grant.
+	hooks.heartbeatOnce(context.Background())
+	select {
+	case syncReq := <-controller.synced:
+		if syncReq.Settled || syncReq.AppliedAllocatableMemory != allocAtSnapshot {
+			t.Fatalf("pre-restore_ack StateSync = %+v", syncReq)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pre-restore_ack StateSync timeout")
+	}
+	waitHooksConnected(t, hooks)
+	if state := hooks.localState(); state.applied != allocAtSnapshot || state.desired != syncAlloc || !state.enforcementPending {
+		t.Fatalf("deferred restore state = %+v", state)
+	}
+	data, err := os.ReadFile(filepath.Join(cgroup, "memory.high"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "max" {
+		t.Fatalf("pre-restore_ack StateSync wrote memory.high=%q", data)
+	}
+
+	if err := hooks.SettledRestore(allocAtSnapshot, grant); err != nil {
+		t.Fatal(err)
+	}
+	state := hooks.localState()
+	if state.applied != syncAlloc || state.desired != syncAlloc || state.enforcementPending {
+		t.Fatalf("settled restore state = %+v", state)
+	}
+	wantHigh := fmt.Sprint(uint64(float64(syncAlloc) * 0.875))
+	data, err = os.ReadFile(filepath.Join(cgroup, "memory.high"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != wantHigh {
+		t.Fatalf("settled restore memory.high = %q, want %q", data, wantHigh)
+	}
+}
+
 func TestSettledNotificationSurvivesLocalEnforcementFailure(t *testing.T) {
 	controller := startSettledController(t)
 	missingCgroup := filepath.Join(t.TempDir(), "missing-cgroup")
@@ -398,6 +633,50 @@ func TestSettledNotificationSurvivesLocalEnforcementFailure(t *testing.T) {
 	}
 	if !hooks.localState().settled {
 		t.Fatal("local settle barrier was not retained")
+	}
+}
+
+func TestHeartbeatRetriesPendingInitialEnforcement(t *testing.T) {
+	controller := startSettledController(t)
+	cgroup := filepath.Join(t.TempDir(), "cgroup")
+	if err := os.MkdirAll(cgroup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroup, "memory.current"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: controller.socket, CgroupPath: cgroup, SandboxID: "retry-initial-enforcement",
+		Context: context.Background(), Logf: t.Logf,
+	}, reconnectConfig(t, controller.socket, cgroup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hooks.Release("test")
+	if _, err := hooks.Admit("retry-initial-enforcement", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := hooks.Settled(); err == nil {
+		t.Fatal("Settled hid missing memory.high")
+	}
+	if state := hooks.localState(); !state.settled || !state.enforcementPending {
+		t.Fatalf("failed settle state = %+v", state)
+	}
+	if err := os.WriteFile(filepath.Join(cgroup, "memory.high"), []byte("max"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hooks.heartbeatOnce(context.Background())
+	state := hooks.localState()
+	if state.enforcementPending || state.applied != 768<<20 {
+		t.Fatalf("heartbeat retry state = %+v", state)
+	}
+	wantHigh := fmt.Sprint(uint64(float64(uint64(768<<20)) * 0.875))
+	data, err := os.ReadFile(filepath.Join(cgroup, "memory.high"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != wantHigh {
+		t.Fatalf("retried memory.high = %q, want %q", data, wantHigh)
 	}
 }
 
@@ -438,6 +717,54 @@ func TestSettledExplicitErrorReconnectsWithSettledState(t *testing.T) {
 	waitHooksConnected(t, hooks)
 	if got := hooks.localState(); !got.connected || !got.settled || got.token != "settled-sync-token" {
 		t.Fatalf("recovered state = %+v", got)
+	}
+}
+
+func TestSessionErrorsReconnectThroughStateSync(t *testing.T) {
+	for _, rpcType := range []string{resource.TypeHeartbeat, resource.TypeRequestBudget} {
+		t.Run(rpcType, func(t *testing.T) {
+			controller := startSessionErrorController(t, rpcType)
+			cgroup := filepath.Join(t.TempDir(), "cgroup")
+			if err := os.MkdirAll(cgroup, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for name, value := range map[string]string{"memory.high": "max", "memory.current": "1"} {
+				if err := os.WriteFile(filepath.Join(cgroup, name), []byte(value), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hooks, err := NewControllerHooks(ControllerHookOptions{
+				SocketPath: controller.socket, CgroupPath: cgroup, SandboxID: "session-error-" + rpcType,
+				Context: context.Background(), Logf: t.Logf,
+			}, reconnectConfig(t, controller.socket, cgroup))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer hooks.Release("test")
+			if _, err := hooks.Admit("session-error-"+rpcType, 0); err != nil {
+				t.Fatal(err)
+			}
+			switch rpcType {
+			case resource.TypeHeartbeat:
+				hooks.heartbeatOnce(context.Background())
+			case resource.TypeRequestBudget:
+				if _, _, _, err := hooks.RequestBudget(64<<20, resource.UrgencyNormal, "test"); err == nil {
+					t.Fatal("RequestBudget hid the rejected session")
+				}
+			}
+			select {
+			case syncReq := <-controller.synced:
+				if syncReq.SandboxID != "session-error-"+rpcType || syncReq.PreviousToken != "rejected-session-token" {
+					t.Fatalf("StateSync after %s rejection = %+v", rpcType, syncReq)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("StateSync after %s rejection timed out", rpcType)
+			}
+			waitHooksConnected(t, hooks)
+			if state := hooks.localState(); !state.connected || state.token != "recovered-session-token" {
+				t.Fatalf("recovered %s state = %+v", rpcType, state)
+			}
+		})
 	}
 }
 
