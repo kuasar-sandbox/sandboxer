@@ -512,14 +512,43 @@ func (c *Client) AdminStatus() (*AdminStatusResult, error) {
 }
 
 func (c *Client) AdminList() ([]ReservationView, error) {
-	resp, err := c.roundTrip(&Message{Type: TypeAdminList}, DeadlineHeartbeat)
-	if err != nil {
-		return nil, err
+	var reservations []ReservationView
+	after := ""
+	for {
+		resp, err := c.roundTrip(&Message{
+			Type: TypeAdminList, ListAfter: after, ListLimit: DefaultAdminListPageSize,
+		}, DeadlineHeartbeat)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Type != TypeAck {
+			return nil, fmt.Errorf("client: admin_list reply %q msg=%q", resp.Type, resp.Msg)
+		}
+		if after == "" && resp.ListNext == "" {
+			// Controllers predating pagination return one cursorless response and
+			// did not promise SID ordering. Accept that legacy response as-is.
+			return append(reservations, resp.Reservations...), nil
+		}
+		previous := after
+		for _, reservation := range resp.Reservations {
+			if reservation.SandboxID <= previous {
+				return nil, errors.New("client: admin_list page is not strictly ordered by sandbox ID")
+			}
+			previous = reservation.SandboxID
+		}
+		reservations = append(reservations, resp.Reservations...)
+		if resp.ListNext == "" {
+			return reservations, nil
+		}
+		if len(resp.Reservations) == 0 {
+			return nil, errors.New("client: admin_list returned an empty page with a continuation cursor")
+		}
+		last := resp.Reservations[len(resp.Reservations)-1].SandboxID
+		if resp.ListNext != last || resp.ListNext <= after {
+			return nil, fmt.Errorf("client: admin_list continuation %q does not advance after %q", resp.ListNext, after)
+		}
+		after = resp.ListNext
 	}
-	if resp.Type != TypeAck {
-		return nil, fmt.Errorf("client: admin_list reply %q msg=%q", resp.Type, resp.Msg)
-	}
-	return append([]ReservationView(nil), resp.Reservations...), nil
 }
 
 // OOMReport notifies the controller of a guest-side OOM event.

@@ -16,6 +16,9 @@ func TestMessageRoundTrip(t *testing.T) {
 		FloorCPU:            0.1,
 		StartupBudgetMemory: 1 << 30,
 		CgroupPath:          "/sys/fs/cgroup/sandboxes/sb-001",
+		ListAfter:           "sb-000",
+		ListLimit:           DefaultAdminListPageSize,
+		ListNext:            "sb-001",
 	}
 	var buf bytes.Buffer
 	if err := WriteMessage(&buf, in); err != nil {
@@ -31,7 +34,10 @@ func TestMessageRoundTrip(t *testing.T) {
 		out.CapacityCPU != in.CapacityCPU ||
 		out.FloorCPU != in.FloorCPU ||
 		out.StartupBudgetMemory != in.StartupBudgetMemory ||
-		out.CgroupPath != in.CgroupPath {
+		out.CgroupPath != in.CgroupPath ||
+		out.ListAfter != in.ListAfter ||
+		out.ListLimit != in.ListLimit ||
+		out.ListNext != in.ListNext {
 		t.Errorf("round trip mismatch:\n in=%+v\nout=%+v", in, out)
 	}
 }

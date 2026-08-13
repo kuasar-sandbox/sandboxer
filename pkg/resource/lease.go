@@ -87,6 +87,23 @@ type LeaseHandle struct {
 	err  error
 }
 
+// POSIX process-associated record locks are released when the owning process
+// closes any descriptor for the locked inode. Keep track of leases owned by
+// this process so owner-side inspection can reuse the pinned descriptor rather
+// than open and close the pathname behind LeaseHandle's back.
+var localLeaseHandles = struct {
+	sync.Mutex
+	byPath map[string]*LeaseHandle
+}{byPath: make(map[string]*LeaseHandle)}
+
+func localLeasePath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(abs)
+}
+
 func CreateLease(l Lease) (*LeaseHandle, error) {
 	return createLease(l, nil)
 }
@@ -132,12 +149,27 @@ func createLease(l Lease, beforePublish func(string, *os.File)) (*LeaseHandle, e
 	if beforePublish != nil {
 		beforePublish(path, f)
 	}
+	localPath := localLeasePath(path)
 	for {
-		if err := unix.Renameat2(unix.AT_FDCWD, tempPath, unix.AT_FDCWD, path, unix.RENAME_NOREPLACE); err == nil {
+		// Serialize publication with every owner-side helper in this process.
+		// Without this boundary another goroutine could open and close the newly
+		// published inode before it is registered, silently releasing our lock.
+		localLeaseHandles.Lock()
+		if localLeaseHandles.byPath[localPath] != nil {
+			localLeaseHandles.Unlock()
+			return fail(fmt.Errorf("lease %s is locked by sandbox process %d", path, os.Getpid()))
+		}
+		renameErr := unix.Renameat2(unix.AT_FDCWD, tempPath, unix.AT_FDCWD, path, unix.RENAME_NOREPLACE)
+		if renameErr == nil {
 			published = true
-			return &LeaseHandle{path: path, file: f}, nil
-		} else if !errors.Is(err, unix.EEXIST) {
-			return fail(fmt.Errorf("lease publish %s: %w", path, err))
+			handle := &LeaseHandle{path: path, file: f}
+			localLeaseHandles.byPath[localPath] = handle
+			localLeaseHandles.Unlock()
+			return handle, nil
+		}
+		localLeaseHandles.Unlock()
+		if !errors.Is(renameErr, unix.EEXIST) {
+			return fail(fmt.Errorf("lease publish %s: %w", path, renameErr))
 		}
 		removed, err := RemoveUnlockedLease(path)
 		if err != nil {
@@ -174,9 +206,24 @@ func (h *LeaseHandle) Close() error {
 	if h == nil {
 		return nil
 	}
+	localLeaseHandles.Lock()
+	defer localLeaseHandles.Unlock()
 	h.once.Do(func() {
-		if err := os.Remove(h.path); err != nil && !os.IsNotExist(err) {
-			h.err = err
+		localPath := localLeasePath(h.path)
+		if localLeaseHandles.byPath[localPath] == h {
+			opened, statErr := h.file.Stat()
+			named, pathErr := os.Lstat(h.path)
+			switch {
+			case statErr != nil:
+				h.err = statErr
+			case pathErr != nil && !os.IsNotExist(pathErr):
+				h.err = pathErr
+			case pathErr == nil && os.SameFile(opened, named):
+				if err := os.Remove(h.path); err != nil && !os.IsNotExist(err) {
+					h.err = err
+				}
+			}
+			delete(localLeaseHandles.byPath, localPath)
 		}
 		if err := h.file.Close(); h.err == nil && err != nil {
 			h.err = err
@@ -188,6 +235,11 @@ func (h *LeaseHandle) Close() error {
 // ReadLease reads one immutable record. Lock ownership must be checked
 // separately; file existence/content alone does not establish liveness.
 func ReadLease(path string) (Lease, error) {
+	localLeaseHandles.Lock()
+	defer localLeaseHandles.Unlock()
+	if handle := localLeaseHandles.byPath[localLeasePath(path)]; handle != nil {
+		return decodeOwnedLease(handle)
+	}
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return Lease{}, err
@@ -201,9 +253,17 @@ func ReadLease(path string) (Lease, error) {
 	return decodeLease(f)
 }
 
-func decodeLease(f *os.File) (Lease, error) {
+func decodeOwnedLease(handle *LeaseHandle) (Lease, error) {
+	info, err := handle.file.Stat()
+	if err != nil {
+		return Lease{}, err
+	}
+	return decodeLease(io.NewSectionReader(handle.file, 0, info.Size()))
+}
+
+func decodeLease(r io.Reader) (Lease, error) {
 	var lease Lease
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(r)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&lease); err != nil {
 		return lease, err
@@ -227,6 +287,12 @@ func decodeLease(f *os.File) (Lease, error) {
 // locked=true and its owner together with the decode error, allowing callers
 // to install a full-pool unknown charge.
 func InspectLease(path string) (lease Lease, ownerPID int, locked bool, err error) {
+	localLeaseHandles.Lock()
+	defer localLeaseHandles.Unlock()
+	if handle := localLeaseHandles.byPath[localLeasePath(path)]; handle != nil {
+		lease, err := decodeOwnedLease(handle)
+		return lease, os.Getpid(), true, err
+	}
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return Lease{}, 0, false, err
@@ -249,6 +315,11 @@ func InspectLease(path string) (lease Lease, ownerPID int, locked bool, err erro
 // locked=false means the file is stale. The caller should not infer liveness
 // from the PID stored in JSON.
 func LeaseLockOwner(path string) (ownerPID int, locked bool, err error) {
+	localLeaseHandles.Lock()
+	defer localLeaseHandles.Unlock()
+	if localLeaseHandles.byPath[localLeasePath(path)] != nil {
+		return os.Getpid(), true, nil
+	}
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return 0, false, err
@@ -279,6 +350,11 @@ func RemoveUnlockedLease(path string) (removed bool, err error) {
 // removeUnlockedLease's hook is test-only fault injection for pathname
 // replacement after open. Production always calls RemoveUnlockedLease.
 func removeUnlockedLease(path string, afterOpen func(string, *os.File)) (removed bool, err error) {
+	localLeaseHandles.Lock()
+	defer localLeaseHandles.Unlock()
+	if localLeaseHandles.byPath[localLeasePath(path)] != nil {
+		return false, nil
+	}
 	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {

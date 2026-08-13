@@ -23,6 +23,11 @@ const DefaultSocket = "/run/sandbox-resource.sock"
 // MaxMessageBytes bounds the JSON payload size for one message.
 const MaxMessageBytes = 64 * 1024
 
+// DefaultAdminListPageSize is the number of reservations a current client asks
+// for per admin_list response. The controller may return fewer entries to keep
+// the encoded frame below MaxMessageBytes.
+const DefaultAdminListPageSize = 128
+
 // Message types. See docs/node.md §5.2.
 const (
 	TypeAdmit          = "admit"
@@ -153,6 +158,13 @@ type Message struct {
 	Pool              ResourcesView     `json:"pool,omitempty"`
 	StartupInFlight   uint64            `json:"startup_in_flight,omitempty"`
 	Reservations      []ReservationView `json:"reservations,omitempty"`
+
+	// AdminList pagination. ListLimit=0 is a legacy unpaginated request;
+	// current clients always send a positive limit. ListAfter and ListNext are
+	// exclusive lexicographic sandbox-ID cursors. Old peers ignore these fields.
+	ListAfter string `json:"list_after,omitempty"`
+	ListLimit int    `json:"list_limit,omitempty"`
+	ListNext  string `json:"list_next,omitempty"`
 
 	// Generic.
 	Reason string `json:"reason,omitempty"`
