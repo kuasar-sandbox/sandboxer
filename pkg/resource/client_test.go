@@ -3,11 +3,60 @@ package resource
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func startResourceProtocolServer(t *testing.T, handler func(*Message) (*Message, error)) *Client {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "controller.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.AcceptUnix()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		for {
+			req, err := ReadMessage(conn)
+			if err != nil {
+				done <- nil
+				return
+			}
+			resp, err := handler(req)
+			if err != nil {
+				done <- err
+				return
+			}
+			if err := WriteMessage(conn, resp); err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
+	client := &Client{SocketPath: path}
+	if err := client.Connect(); err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = listener.Close()
+		if err := <-done; err != nil {
+			t.Errorf("resource protocol server: %v", err)
+		}
+	})
+	return client
+}
 
 func TestConnectFailureClearsClosedConnection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.sock")
@@ -88,5 +137,76 @@ func TestAdmitContextCancelsInFlightRoundTrip(t *testing.T) {
 	case <-serverDone:
 	case <-time.After(time.Second):
 		t.Fatal("cancelled Admit did not close the server stream")
+	}
+}
+
+func TestAdminListAggregatesPaginatedResponses(t *testing.T) {
+	var requests atomic.Int32
+	client := startResourceProtocolServer(t, func(req *Message) (*Message, error) {
+		requests.Add(1)
+		if req.Type != TypeAdminList || req.ListLimit != DefaultAdminListPageSize {
+			return nil, fmt.Errorf("admin_list request = %+v", req)
+		}
+		switch req.ListAfter {
+		case "":
+			return &Message{Type: TypeAck, Reservations: []ReservationView{
+				{SandboxID: "a"}, {SandboxID: "b"},
+			}, ListNext: "b"}, nil
+		case "b":
+			return &Message{Type: TypeAck, Reservations: []ReservationView{
+				{SandboxID: "c"}, {SandboxID: "d"},
+			}, ListNext: "d"}, nil
+		case "d":
+			return &Message{Type: TypeAck, Reservations: []ReservationView{{SandboxID: "e"}}}, nil
+		default:
+			return nil, fmt.Errorf("unexpected cursor %q", req.ListAfter)
+		}
+	})
+	got, err := client.AdminList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 3 || len(got) != 5 {
+		t.Fatalf("AdminList requests=%d reservations=%+v", requests.Load(), got)
+	}
+	for n, want := range []string{"a", "b", "c", "d", "e"} {
+		if got[n].SandboxID != want {
+			t.Fatalf("reservation %d SID = %q, want %q", n, got[n].SandboxID, want)
+		}
+	}
+}
+
+func TestAdminListAcceptsLegacyUnpaginatedResponse(t *testing.T) {
+	var requests atomic.Int32
+	client := startResourceProtocolServer(t, func(req *Message) (*Message, error) {
+		requests.Add(1)
+		return &Message{Type: TypeAck, Reservations: []ReservationView{
+			{SandboxID: "b"}, {SandboxID: "a"},
+		}}, nil
+	})
+	got, err := client.AdminList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 || len(got) != 2 {
+		t.Fatalf("legacy AdminList requests=%d reservations=%+v", requests.Load(), got)
+	}
+	if got[0].SandboxID != "b" || got[1].SandboxID != "a" {
+		t.Fatalf("legacy AdminList reordered reservations: %+v", got)
+	}
+}
+
+func TestAdminListRejectsNonAdvancingPagination(t *testing.T) {
+	client := startResourceProtocolServer(t, func(req *Message) (*Message, error) {
+		if req.ListAfter == "" {
+			return &Message{
+				Type: TypeAck, Reservations: []ReservationView{{SandboxID: "a"}}, ListNext: "a",
+			}, nil
+		}
+		return &Message{Type: TypeAck, ListNext: "a"}, nil
+	})
+	if _, err := client.AdminList(); err == nil ||
+		err.Error() != "client: admin_list returned an empty page with a continuation cursor" {
+		t.Fatalf("AdminList error = %v", err)
 	}
 }
