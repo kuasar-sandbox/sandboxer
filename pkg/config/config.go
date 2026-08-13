@@ -1267,6 +1267,9 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	if err := c.Restore.validate(); err != nil {
 		return err
 	}
+	if c.Resources.Control.Controller != "" && c.Resources.Control.CgroupPath == "" {
+		return errors.New("resources.control.controller requires resources.control.cgroup_path")
+	}
 	if err := validateControllerSocket(c.Resources.Control.Controller); err != nil {
 		return err
 	}

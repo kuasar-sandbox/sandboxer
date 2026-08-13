@@ -890,9 +890,18 @@ func TestValidateCold_ResourceControl(t *testing.T) {
 
 func TestValidateRestoreHostConfigRejectsAbstractControllerSocket(t *testing.T) {
 	cfg := &SandboxConfig{}
+	cfg.Resources.Control.CgroupPath = "/sys/fs/cgroup/test"
 	cfg.Resources.Control.Controller = "@node-ctl"
 	if err := cfg.ValidateRestoreHostConfig(); err == nil || !strings.Contains(err.Error(), "filesystem Unix socket path") {
 		t.Fatalf("ValidateRestoreHostConfig abstract controller error = %v", err)
+	}
+}
+
+func TestValidateRestoreHostConfigRejectsControllerWithoutCgroup(t *testing.T) {
+	cfg := &SandboxConfig{}
+	cfg.Resources.Control.Controller = "/run/node-ctl.sock"
+	if err := cfg.ValidateRestoreHostConfig(); err == nil || !strings.Contains(err.Error(), "requires resources.control.cgroup_path") {
+		t.Fatalf("ValidateRestoreHostConfig controller-only error = %v", err)
 	}
 }
 
