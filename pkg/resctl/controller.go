@@ -284,28 +284,12 @@ func (h *ControllerHooks) Settled() error {
 	if target == 0 {
 		target = floor
 	}
-	if err := h.applyAllocatableLocked(h.applyContext(), target); err != nil {
-		return fmt.Errorf("settled apply allocatable: %w", err)
+	applyErr := h.applyAllocatableLocked(h.applyContext(), target)
+	notifyErr := h.notifySettledLocked("controller.Settled")
+	if applyErr != nil {
+		return errors.Join(fmt.Errorf("settled apply allocatable: %w", applyErr), notifyErr)
 	}
-	h.mu.Lock()
-	connected := h.connected
-	h.mu.Unlock()
-	if !h.Enabled() {
-		return nil
-	}
-	if !connected {
-		h.notifyReconnect()
-		return nil
-	}
-	rss := readMemoryCurrent(h.opts.CgroupPath)
-	if err := h.client.Settled(rss, 0); err != nil {
-		if resource.IsTransportError(err) {
-			h.markDisconnectedLocked(err)
-			return nil
-		}
-		return fmt.Errorf("controller.Settled: %w", err)
-	}
-	return nil
+	return notifyErr
 }
 
 func (h *ControllerHooks) SettledRestore(allocAtSnap, desiredAlloc uint64) error {
@@ -326,12 +310,22 @@ func (h *ControllerHooks) SettledRestore(allocAtSnap, desiredAlloc uint64) error
 	if desiredAlloc == 0 {
 		desiredAlloc = allocAtSnap
 	}
-	if err := h.applyAllocatableLocked(h.applyContext(), desiredAlloc); err != nil {
-		return fmt.Errorf("settled-restore apply allocatable: %w", err)
-	}
-	if desiredAlloc != allocAtSnap {
+	applyErr := h.applyAllocatableLocked(h.applyContext(), desiredAlloc)
+	if applyErr == nil && desiredAlloc != allocAtSnap {
 		h.opts.Logf("settled-restore: applied correction alloc %d → %d", allocAtSnap, desiredAlloc)
 	}
+	notifyErr := h.notifySettledLocked("controller.SettledRestore")
+	if applyErr != nil {
+		return errors.Join(fmt.Errorf("settled-restore apply allocatable: %w", applyErr), notifyErr)
+	}
+	return notifyErr
+}
+
+// notifySettledLocked publishes the irreversible guest settle barrier even if
+// local enforcement just failed. The controller therefore releases startup
+// accounting; the locally retained applied value remains the StateSync truth.
+// Caller holds sessionMu.
+func (h *ControllerHooks) notifySettledLocked(operation string) error {
 	h.mu.Lock()
 	connected := h.connected
 	h.mu.Unlock()
@@ -348,7 +342,7 @@ func (h *ControllerHooks) SettledRestore(allocAtSnap, desiredAlloc uint64) error
 			h.markDisconnectedLocked(err)
 			return nil
 		}
-		return fmt.Errorf("controller.SettledRestore: %w", err)
+		return fmt.Errorf("%s: %w", operation, err)
 	}
 	return nil
 }

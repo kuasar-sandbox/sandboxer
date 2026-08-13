@@ -88,6 +88,12 @@ type LeaseHandle struct {
 }
 
 func CreateLease(l Lease) (*LeaseHandle, error) {
+	return createLease(l, nil)
+}
+
+// createLease's hook is test-only fault injection for the open -> lock race.
+// Production always calls CreateLease, which passes nil.
+func createLease(l Lease, afterFirstOpen func(string, *os.File)) (*LeaseHandle, error) {
 	if err := l.Validate(); err != nil {
 		return nil, err
 	}
@@ -96,34 +102,64 @@ func CreateLease(l Lease) (*LeaseHandle, error) {
 		return nil, fmt.Errorf("lease mkdir %s: %w", dir, err)
 	}
 	path := LeasePath(l.ControllerSocket, l.SandboxID)
-	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("lease open %s: %w", path, err)
-	}
-	f := os.NewFile(uintptr(fd), "sandbox-resource-lease")
-	if f == nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("lease adopt fd")
-	}
-	fail := func(cause error) (*LeaseHandle, error) {
-		_ = f.Close()
-		return nil, cause
-	}
-	lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 0}
-	if err := unix.FcntlFlock(f.Fd(), unix.F_SETLK, &lock); err != nil {
-		return fail(fmt.Errorf("lease %s is locked by another sandbox: %w", path, err))
-	}
 	payload, err := json.Marshal(l)
 	if err != nil {
-		return fail(fmt.Errorf("lease encode: %w", err))
+		return nil, fmt.Errorf("lease encode: %w", err)
 	}
-	if err := f.Truncate(0); err != nil {
-		return fail(fmt.Errorf("lease truncate: %w", err))
+	for {
+		fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("lease open %s: %w", path, err)
+		}
+		f := os.NewFile(uintptr(fd), "sandbox-resource-lease")
+		if f == nil {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("lease adopt fd")
+		}
+		fail := func(cause error) (*LeaseHandle, error) {
+			_ = f.Close()
+			return nil, cause
+		}
+		if afterFirstOpen != nil {
+			hook := afterFirstOpen
+			afterFirstOpen = nil
+			hook(path, f)
+		}
+		lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 0}
+		if err := unix.FcntlFlock(f.Fd(), unix.F_SETLK, &lock); err != nil {
+			return fail(fmt.Errorf("lease %s is locked by another sandbox: %w", path, err))
+		}
+		matches, err := pathNamesFile(path, f)
+		if err != nil {
+			return fail(fmt.Errorf("lease verify %s: %w", path, err))
+		}
+		if !matches {
+			_ = f.Close()
+			continue
+		}
+		if err := f.Truncate(0); err != nil {
+			return fail(fmt.Errorf("lease truncate: %w", err))
+		}
+		if _, err := f.WriteAt(append(payload, '\n'), 0); err != nil {
+			return fail(fmt.Errorf("lease write: %w", err))
+		}
+		return &LeaseHandle{path: path, file: f}, nil
 	}
-	if _, err := f.WriteAt(append(payload, '\n'), 0); err != nil {
-		return fail(fmt.Errorf("lease write: %w", err))
+}
+
+func pathNamesFile(path string, f *os.File) (bool, error) {
+	opened, err := f.Stat()
+	if err != nil {
+		return false, err
 	}
-	return &LeaseHandle{path: path, file: f}, nil
+	named, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return os.SameFile(opened, named), nil
 }
 
 func (h *LeaseHandle) Path() string {

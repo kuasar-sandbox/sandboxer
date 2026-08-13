@@ -118,3 +118,60 @@ func TestRemoveUnlockedLeaseRechecksAndRemovesStaleRecord(t *testing.T) {
 		t.Fatalf("stale lease remains: %v", err)
 	}
 }
+
+func TestCreateLeaseRetriesWhenLockedInodeWasUnlinked(t *testing.T) {
+	dir := t.TempDir()
+	lease := Lease{
+		Version: LeaseVersion, SandboxID: "open-lock-race", PID: os.Getpid(),
+		ControllerSocket: filepath.Join(dir, "controller.sock"), CgroupPath: filepath.Join(dir, "cgroup"),
+		CapacityMemory: 1024, CapacityCPUMilli: 1000,
+		FloorMemory: 256, FloorCPUMilli: 500, StartupMemory: 512,
+	}
+	path := LeasePath(lease.ControllerSocket, lease.SandboxID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var openedStale os.FileInfo
+	var hookErr error
+	handle, err := createLease(lease, func(path string, opened *os.File) {
+		openedStale, hookErr = opened.Stat()
+		if hookErr != nil {
+			return
+		}
+		if hookErr = os.Remove(path); hookErr != nil {
+			return
+		}
+		hookErr = os.WriteFile(path, []byte("replacement\n"), 0o600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(openedStale, current) {
+		t.Fatal("CreateLease retained the unlinked stale inode")
+	}
+	handleInfo, err := handle.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(handleInfo, current) {
+		t.Fatal("lease handle does not own the inode reachable by pathname")
+	}
+	got, err := ReadLease(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SandboxID != lease.SandboxID || got.PID != lease.PID {
+		t.Fatalf("lease = %+v", got)
+	}
+}

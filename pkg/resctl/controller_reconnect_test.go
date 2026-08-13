@@ -23,6 +23,61 @@ type reconnectController struct {
 	closeOnce sync.Once
 }
 
+type settledController struct {
+	t        *testing.T
+	socket   string
+	listener *net.UnixListener
+	settled  chan resource.Message
+	done     chan struct{}
+}
+
+func startSettledController(t *testing.T) *settledController {
+	t.Helper()
+	socket := filepath.Join(t.TempDir(), "controller.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &settledController{t: t, socket: socket, listener: listener, settled: make(chan resource.Message, 1), done: make(chan struct{})}
+	go func() {
+		defer close(c.done)
+		conn, err := listener.AcceptUnix()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		admit, err := resource.ReadMessage(conn)
+		if err != nil || admit.Type != resource.TypeAdmit {
+			t.Errorf("admit request = %+v err=%v", admit, err)
+			return
+		}
+		_ = resource.WriteMessage(conn, &resource.Message{
+			Type: resource.TypeAdmitResponse, Status: resource.StatusAdmitted,
+			Token: "settle-token", GrantedInitialAlloc: admit.StartupBudgetMemory,
+		})
+		settled, err := resource.ReadMessage(conn)
+		if err != nil || settled.Type != resource.TypeSettled {
+			t.Errorf("settled request = %+v err=%v", settled, err)
+			return
+		}
+		c.settled <- *settled
+		_ = resource.WriteMessage(conn, &resource.Message{Type: resource.TypeAck})
+		release, err := resource.ReadMessage(conn)
+		if err == nil && release.Type == resource.TypeRelease {
+			_ = resource.WriteMessage(conn, &resource.Message{Type: resource.TypeAck})
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		select {
+		case <-c.done:
+		case <-time.After(5 * time.Second):
+			t.Error("settled controller did not stop")
+		}
+	})
+	return c
+}
+
 func startReconnectController(t *testing.T, legacy bool) *reconnectController {
 	t.Helper()
 	socket := filepath.Join(t.TempDir(), "controller.sock")
@@ -169,6 +224,36 @@ func TestControllerHooksReconnectStateSync(t *testing.T) {
 	}
 	if got := hooks.AllocatableNowMem(); got != 768<<20 {
 		t.Fatalf("failed apply advanced allocatable to %d", got)
+	}
+}
+
+func TestSettledNotificationSurvivesLocalEnforcementFailure(t *testing.T) {
+	controller := startSettledController(t)
+	missingCgroup := filepath.Join(t.TempDir(), "missing-cgroup")
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: controller.socket, CgroupPath: missingCgroup, SandboxID: "settle-on-failure",
+		Context: context.Background(), Logf: t.Logf,
+	}, reconnectConfig(t, controller.socket, missingCgroup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hooks.Release("test")
+	if _, err := hooks.Admit("settle-on-failure", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := hooks.Settled(); err == nil {
+		t.Fatal("Settled hid the local enforcement failure")
+	}
+	select {
+	case req := <-controller.settled:
+		if req.Type != resource.TypeSettled {
+			t.Fatalf("settled request = %+v", req)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("local enforcement failure suppressed Settled RPC")
+	}
+	if !hooks.localState().settled {
+		t.Fatal("local settle barrier was not retained")
 	}
 }
 
