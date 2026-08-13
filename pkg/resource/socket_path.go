@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // CanonicalSocketPath returns the stable filesystem identity used for a
@@ -26,19 +27,26 @@ func CanonicalSocketPath(path string) (string, error) {
 		return "", err
 	}
 	abs = filepath.Clean(abs)
-	if info, err := os.Lstat(abs); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			return "", fmt.Errorf("controller socket %s is a symlink", abs)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("inspect controller socket %s: %w", abs, err)
-	}
-
 	parent, err := canonicalExistingParent(filepath.Dir(abs))
 	if err != nil {
 		return "", fmt.Errorf("resolve controller socket parent: %w", err)
 	}
-	return filepath.Join(parent, filepath.Base(abs)), nil
+	canonical := filepath.Join(parent, filepath.Base(abs))
+	if info, err := os.Lstat(canonical); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("controller socket %s is a symlink", canonical)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return "", fmt.Errorf("inspect controller socket %s link count", canonical)
+		}
+		if stat.Nlink != 1 {
+			return "", fmt.Errorf("controller socket %s has %d hard links", canonical, stat.Nlink)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect controller socket %s: %w", canonical, err)
+	}
+	return canonical, nil
 }
 
 func canonicalExistingParent(path string) (string, error) {
@@ -54,6 +62,14 @@ func canonicalExistingParent(path string) (string, error) {
 		}
 		if !errors.Is(err, os.ErrNotExist) {
 			return "", err
+		}
+		if info, lstatErr := os.Lstat(current); lstatErr == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("parent component %s is a dangling symlink", current)
+			}
+			return "", err
+		} else if !errors.Is(lstatErr, os.ErrNotExist) {
+			return "", lstatErr
 		}
 		parent := filepath.Dir(current)
 		if parent == current {

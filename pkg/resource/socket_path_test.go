@@ -1,6 +1,7 @@
 package resource
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,35 @@ func TestCanonicalSocketPathRejectsFinalSymlink(t *testing.T) {
 	}
 	if _, err := CanonicalSocketPath(alias); err == nil || !strings.Contains(err.Error(), "is a symlink") {
 		t.Fatalf("final symlink error = %v", err)
+	}
+}
+
+func TestCanonicalSocketPathRejectsDanglingParentSymlink(t *testing.T) {
+	root := t.TempDir()
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(filepath.Join(root, "missing"), alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CanonicalSocketPath(filepath.Join(alias, "controller.sock")); err == nil ||
+		!strings.Contains(err.Error(), "dangling symlink") {
+		t.Fatalf("dangling parent error = %v", err)
+	}
+}
+
+func TestCanonicalSocketPathRejectsHardLinkedEntry(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "controller.sock")
+	listener, err := net.Listen("unix", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	alias := filepath.Join(root, "controller-alias.sock")
+	if err := os.Link(target, alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CanonicalSocketPath(alias); err == nil || !strings.Contains(err.Error(), "hard links") {
+		t.Fatalf("hard-linked socket error = %v", err)
 	}
 }
 
