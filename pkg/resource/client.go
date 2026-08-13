@@ -4,9 +4,33 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
+
+// TransportError marks a failed stream operation. Callers use it to enter the
+// reconnect path without treating a controller restart as a sandbox failure.
+type TransportError struct{ Err error }
+
+func (e *TransportError) Error() string { return e.Err.Error() }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// ControllerError is an explicit TypeError response. It is distinct from a
+// broken stream, which matters for StateSync -> legacy Reattach negotiation.
+type ControllerError struct{ Message string }
+
+func (e *ControllerError) Error() string { return "controller: " + e.Message }
+
+func IsTransportError(err error) bool {
+	var target *TransportError
+	return errors.As(err, &target)
+}
+
+func IsStateSyncUnsupported(err error) bool {
+	var target *ControllerError
+	return errors.As(err, &target) && strings.Contains(target.Message, "unknown type: "+TypeStateSync)
+}
 
 // Client is sandbox-ctl's RPC interface to the controller. Designed for
 // a single long-lived connection per sandbox. Concurrent calls are
@@ -36,6 +60,12 @@ func (c *Client) Connect() error {
 	}
 	c.conn = conn
 	return nil
+}
+
+func (c *Client) Connected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn != nil
 }
 
 // Close terminates the connection.
@@ -70,15 +100,19 @@ func (c *Client) roundTrip(req *Message, deadline time.Duration) (*Message, erro
 		_ = c.conn.SetDeadline(time.Now().Add(deadline))
 	}
 	if err := WriteMessage(c.conn, req); err != nil {
-		return nil, err
+		_ = c.conn.Close()
+		c.conn = nil
+		return nil, &TransportError{Err: err}
 	}
 	resp, err := ReadMessage(c.conn)
 	if err != nil {
-		return nil, err
+		_ = c.conn.Close()
+		c.conn = nil
+		return nil, &TransportError{Err: err}
 	}
 	_ = c.conn.SetDeadline(time.Time{})
 	if resp.Type == TypeError {
-		return resp, fmt.Errorf("controller: %s", resp.Msg)
+		return resp, &ControllerError{Message: resp.Msg}
 	}
 	return resp, nil
 }
@@ -94,6 +128,7 @@ type AdmitParams struct {
 	StartupBudgetMemory   uint64
 	AllocatableAtSnapshot uint64 // 0 for cold start
 	CgroupPath            string
+	ClientFeatures        []string
 }
 
 // AdmitResult captures the response from an Admit call.
@@ -135,6 +170,7 @@ func (c *Client) Admit(p AdmitParams) (*AdmitResult, error) {
 		StartupBudgetMemory:   p.StartupBudgetMemory,
 		AllocatableAtSnapshot: p.AllocatableAtSnapshot,
 		CgroupPath:            p.CgroupPath,
+		ClientFeatures:        append([]string(nil), p.ClientFeatures...),
 	}, DeadlineAdmit)
 	if err != nil {
 		return nil, err
@@ -160,17 +196,59 @@ func (c *Client) Admit(p AdmitParams) (*AdmitResult, error) {
 // Reattach binds a fresh connection to an existing reservation
 // (controller restart or transient network drop).
 func (c *Client) Reattach(token string) error {
+	_, err := c.ReattachState(token)
+	return err
+}
+
+// ReattachState is the compatibility path for controllers that predate
+// StateSync. It also returns the old controller's current allocation so the
+// caller can apply it before resuming requests.
+func (c *Client) ReattachState(token string) (uint64, error) {
 	resp, err := c.roundTrip(&Message{Type: TypeReattach, Token: token}, DeadlineAdmit)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if resp.Type != TypeAck {
-		return fmt.Errorf("client: reattach reply %q msg=%q", resp.Type, resp.Msg)
+		return 0, fmt.Errorf("client: reattach reply %q msg=%q", resp.Type, resp.Msg)
 	}
 	c.mu.Lock()
 	c.token = token
 	c.mu.Unlock()
-	return nil
+	return resp.NewAllocatable, nil
+}
+
+type StateSyncParams struct {
+	SandboxID                string
+	AppliedAllocatableMemory uint64
+	Settled                  bool
+	CurrentRSS               uint64
+	PreviousToken            string
+}
+
+type StateSyncResult struct {
+	Token          string
+	NewAllocatable uint64
+}
+
+func (c *Client) StateSync(p StateSyncParams) (*StateSyncResult, error) {
+	resp, err := c.roundTrip(&Message{
+		Type:                     TypeStateSync,
+		SandboxID:                p.SandboxID,
+		AppliedAllocatableMemory: p.AppliedAllocatableMemory,
+		Settled:                  p.Settled,
+		CurrentRSS:               p.CurrentRSS,
+		PreviousToken:            p.PreviousToken,
+	}, DeadlineAdmit)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Type != TypeAck || resp.Token == "" {
+		return nil, fmt.Errorf("client: state_sync reply %q msg=%q", resp.Type, resp.Msg)
+	}
+	c.mu.Lock()
+	c.token = resp.Token
+	c.mu.Unlock()
+	return &StateSyncResult{Token: resp.Token, NewAllocatable: resp.NewAllocatable}, nil
 }
 
 // Settled marks the per-sandbox state machine's startup → settled
@@ -311,11 +389,19 @@ func (c *Client) AdminReclaim(sid string, target uint64) (uint64, error) {
 
 // AdminStatusResult is the response to AdminStatus.
 type AdminStatusResult struct {
-	Zone             string
-	NodeAllocated    uint64
-	AllocatablePool  uint64
-	ReservationCount int
-	Drained          bool
+	Zone              string
+	NodeAllocated     uint64
+	AllocatablePool   uint64
+	ReservationCount  int
+	ProvisionalCount  int
+	UnknownCount      int
+	Drained           bool
+	NodeBudget        ResourcesView
+	HostReserved      ResourcesView
+	OperationalMargin ResourcesView
+	Allocated         ResourcesView
+	Pool              ResourcesView
+	StartupInFlight   uint64
 }
 
 // AdminStatus queries the controller's live state via RPC. Useful when
@@ -329,12 +415,31 @@ func (c *Client) AdminStatus() (*AdminStatusResult, error) {
 		return nil, fmt.Errorf("client: admin_status reply %q msg=%q", resp.Type, resp.Msg)
 	}
 	return &AdminStatusResult{
-		Zone:             resp.Zone,
-		NodeAllocated:    resp.NodeAllocated,
-		AllocatablePool:  resp.AllocatablePool,
-		ReservationCount: resp.ReservationCount,
-		Drained:          resp.Drained,
+		Zone:              resp.Zone,
+		NodeAllocated:     resp.NodeAllocated,
+		AllocatablePool:   resp.AllocatablePool,
+		ReservationCount:  resp.ReservationCount,
+		ProvisionalCount:  resp.ProvisionalCount,
+		UnknownCount:      resp.UnknownCount,
+		Drained:           resp.Drained,
+		NodeBudget:        resp.NodeBudget,
+		HostReserved:      resp.HostReserved,
+		OperationalMargin: resp.OperationalMargin,
+		Allocated:         resp.Allocated,
+		Pool:              resp.Pool,
+		StartupInFlight:   resp.StartupInFlight,
 	}, nil
+}
+
+func (c *Client) AdminList() ([]ReservationView, error) {
+	resp, err := c.roundTrip(&Message{Type: TypeAdminList}, DeadlineHeartbeat)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Type != TypeAck {
+		return nil, fmt.Errorf("client: admin_list reply %q msg=%q", resp.Type, resp.Msg)
+	}
+	return append([]ReservationView(nil), resp.Reservations...), nil
 }
 
 // OOMReport notifies the controller of a guest-side OOM event.
