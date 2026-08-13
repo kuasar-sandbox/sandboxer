@@ -35,6 +35,7 @@ const (
 	TypeRelease        = "release"
 	TypeAck            = "ack"
 	TypeReattach       = "reattach"
+	TypeStateSync      = "state_sync"
 	TypeError          = "error"
 
 	// Admin verbs (no per-sandbox token needed; identifies target sandbox
@@ -43,7 +44,12 @@ const (
 	TypeAdminGrant   = "admin_grant"
 	TypeAdminReclaim = "admin_reclaim"
 	TypeAdminStatus  = "admin_status"
+	TypeAdminList    = "admin_list"
 )
+
+// Client feature names are carried by Admit and the immutable lifecycle lease.
+// Unknown features are ignored so old controllers remain wire-compatible.
+const FeatureStateSyncV1 = "state_sync_v1"
 
 // Admission status values.
 const (
@@ -76,14 +82,15 @@ type Message struct {
 	Token string `json:"token,omitempty"`
 
 	// Admit (sandbox-ctl → controller).
-	SandboxID             string  `json:"sandbox_id,omitempty"`
-	CapacityMemoryBytes   uint64  `json:"capacity_memory_bytes,omitempty"`
-	CapacityCPU           int     `json:"capacity_cpu,omitempty"`
-	FloorMemoryBytes      uint64  `json:"floor_memory_bytes,omitempty"`
-	FloorCPU              float64 `json:"floor_cpu,omitempty"`
-	StartupBudgetMemory   uint64  `json:"startup_budget_memory,omitempty"`
-	AllocatableAtSnapshot uint64  `json:"allocatable_at_snapshot,omitempty"`
-	CgroupPath            string  `json:"cgroup_path,omitempty"`
+	SandboxID             string   `json:"sandbox_id,omitempty"`
+	CapacityMemoryBytes   uint64   `json:"capacity_memory_bytes,omitempty"`
+	CapacityCPU           int      `json:"capacity_cpu,omitempty"`
+	FloorMemoryBytes      uint64   `json:"floor_memory_bytes,omitempty"`
+	FloorCPU              float64  `json:"floor_cpu,omitempty"`
+	StartupBudgetMemory   uint64   `json:"startup_budget_memory,omitempty"`
+	AllocatableAtSnapshot uint64   `json:"allocatable_at_snapshot,omitempty"`
+	CgroupPath            string   `json:"cgroup_path,omitempty"`
+	ClientFeatures        []string `json:"client_features,omitempty"`
 
 	// AdmitResponse (controller → sandbox-ctl).
 	// Status ∈ {admitted, rejected}. StatusQueued is reserved (server
@@ -106,6 +113,12 @@ type Message struct {
 	RecentHighCount     uint64 `json:"recent_high_count,omitempty"`
 	CPUThrottledPeriods uint64 `json:"cpu_throttled_periods,omitempty"`
 
+	// StateSync. PreviousToken is compatibility/diagnostic context only; the
+	// server authenticates the request from the lease lock and SO_PEERCRED.
+	AppliedAllocatableMemory uint64 `json:"applied_allocatable_memory,omitempty"`
+	Settled                  bool   `json:"settled,omitempty"`
+	PreviousToken            string `json:"previous_token,omitempty"`
+
 	// RequestBudget / BudgetResponse.
 	CurrentAlloc   uint64 `json:"current_alloc,omitempty"`
 	RequestedDelta uint64 `json:"requested_delta,omitempty"`
@@ -126,15 +139,50 @@ type Message struct {
 	Drain bool `json:"drain,omitempty"`
 
 	// AdminStatus response.
-	Zone             string `json:"zone,omitempty"`
-	NodeAllocated    uint64 `json:"node_allocated_memory,omitempty"`
-	AllocatablePool  uint64 `json:"allocatable_pool_memory,omitempty"`
-	ReservationCount int    `json:"reservation_count,omitempty"`
-	Drained          bool   `json:"drained,omitempty"`
+	Zone              string            `json:"zone,omitempty"`
+	NodeAllocated     uint64            `json:"node_allocated_memory,omitempty"`
+	AllocatablePool   uint64            `json:"allocatable_pool_memory,omitempty"`
+	ReservationCount  int               `json:"reservation_count,omitempty"`
+	ProvisionalCount  int               `json:"provisional_count,omitempty"`
+	UnknownCount      int               `json:"unknown_count,omitempty"`
+	Drained           bool              `json:"drained,omitempty"`
+	NodeBudget        ResourcesView     `json:"node_budget,omitempty"`
+	HostReserved      ResourcesView     `json:"host_reserved,omitempty"`
+	OperationalMargin ResourcesView     `json:"operational_margin,omitempty"`
+	Allocated         ResourcesView     `json:"allocated,omitempty"`
+	Pool              ResourcesView     `json:"pool,omitempty"`
+	StartupInFlight   uint64            `json:"startup_in_flight,omitempty"`
+	Reservations      []ReservationView `json:"reservations,omitempty"`
 
 	// Generic.
 	Reason string `json:"reason,omitempty"`
 	Msg    string `json:"msg,omitempty"`
+}
+
+// ResourcesView is the protocol-neutral resource pair used by live admin
+// status/list replies. CPU is expressed in milli-CPU throughout this protocol.
+type ResourcesView struct {
+	MemoryBytes uint64 `json:"memory_bytes"`
+	CPUMilli    uint64 `json:"cpu_milli"`
+}
+
+// ReservationView is a token-free copy of one live controller reservation.
+// It is diagnostic output only and is never accepted back as controller state.
+type ReservationView struct {
+	SandboxID             string        `json:"sandbox_id"`
+	PeerPID               int           `json:"peer_pid,omitempty"`
+	CgroupPath            string        `json:"cgroup_path,omitempty"`
+	Capacity              ResourcesView `json:"capacity"`
+	Floor                 ResourcesView `json:"floor"`
+	AllocatableMemory     uint64        `json:"allocatable_memory"`
+	EffectiveStartupBytes uint64        `json:"effective_startup_bytes,omitempty"`
+	Stage                 string        `json:"stage"`
+	CurrentRSS            uint64        `json:"current_rss,omitempty"`
+	LastReportUnix        int64         `json:"last_report_unix,omitempty"`
+	Connected             bool          `json:"connected"`
+	Provisional           bool          `json:"provisional"`
+	RecoverySource        string        `json:"recovery_source"`
+	StartupExpired        bool          `json:"startup_expired,omitempty"`
 }
 
 // WriteMessage writes one message in length-prefix-JSON wire format:
