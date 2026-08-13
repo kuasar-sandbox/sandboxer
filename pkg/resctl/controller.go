@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -79,6 +80,12 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		cancel()
 		return nil, fmt.Errorf("dynamic resource mode requires sandbox id")
 	}
+	controllerSocketPath, err := filepath.Abs(opts.SocketPath)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("resolve controller socket: %w", err)
+	}
+	h.opts.SocketPath = controllerSocketPath
 	controllerCgroupPath := filepath.Clean(cfg.Resources.Control.CgroupPath)
 	h.controllerCgroupPath = controllerCgroupPath
 	capMem, err := cfg.CapacityMemoryBytes()
@@ -98,9 +105,9 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 	}
 	lease, err := resource.CreateLease(resource.Lease{
 		Version: resource.LeaseVersion, SandboxID: opts.SandboxID, PID: os.Getpid(),
-		ControllerSocket: opts.SocketPath, CgroupPath: controllerCgroupPath,
+		ControllerSocket: controllerSocketPath, CgroupPath: controllerCgroupPath,
 		CapacityMemory: capMem, CapacityCPUMilli: uint64(cfg.Resources.Capacity.CPU) * 1000,
-		FloorMemory: floorMem, FloorCPUMilli: uint64(cfg.Resources.Allocatable.CPU * 1000),
+		FloorMemory: floorMem, FloorCPUMilli: cpuMilliCeil(cfg.Resources.Allocatable.CPU),
 		StartupMemory: startupMem, ClientFeatures: []string{resource.FeatureStateSyncV1},
 	})
 	if err != nil {
@@ -108,10 +115,20 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		return nil, fmt.Errorf("controller lease: %w", err)
 	}
 	h.lease = lease
-	h.client = &resource.Client{SocketPath: opts.SocketPath}
+	h.client = &resource.Client{SocketPath: controllerSocketPath}
 	h.reconnectWG.Add(1)
 	go h.reconnectLoop()
 	return h, nil
+}
+
+// cpuMilliCeil preserves every positive CPU floor as a non-zero conservative
+// accounting value. cgroup cpu.weight already maps sub-millicore values to its
+// minimum non-zero weight, so the lifecycle lease must not truncate them away.
+func cpuMilliCeil(cpu float64) uint64 {
+	if cpu <= 0 {
+		return 0
+	}
+	return uint64(math.Ceil(cpu * 1000))
 }
 
 func (h *ControllerHooks) SetLocalCgroupPath(path string) {
@@ -562,13 +579,20 @@ func (h *ControllerHooks) reconnectLoop() {
 					SandboxID: h.opts.SandboxID, AppliedAllocatableMemory: state.applied,
 					Settled: state.settled, CurrentRSS: rss, PreviousToken: state.token,
 				})
+				restoredAlloc := state.applied
+				if syncErr == nil && result.NewAllocatable > 0 && result.NewAllocatable != state.applied {
+					syncErr = h.applyAllocatableLocked(h.applyContext(), result.NewAllocatable)
+					if syncErr == nil {
+						restoredAlloc = result.NewAllocatable
+					}
+				}
 				if syncErr == nil {
 					h.mu.Lock()
 					h.connected, h.previousToken = true, result.Token
 					h.mu.Unlock()
 					h.sessionMu.Unlock()
 					h.opts.Logf("controller state sync restored token=%s allocatable=%d settled=%v",
-						shortToken(result.Token), state.applied, state.settled)
+						shortToken(result.Token), restoredAlloc, state.settled)
 					break
 				}
 				if resource.IsStateSyncUnsupported(syncErr) && state.token != "" {

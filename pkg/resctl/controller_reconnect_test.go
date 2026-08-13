@@ -2,6 +2,7 @@ package resctl
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ type reconnectController struct {
 	t         *testing.T
 	socket    string
 	legacy    bool
+	syncAlloc uint64
 	listener  *net.UnixListener
 	done      chan struct{}
 	synced    chan resource.Message
@@ -78,7 +80,7 @@ func startSettledController(t *testing.T) *settledController {
 	return c
 }
 
-func startReconnectController(t *testing.T, legacy bool) *reconnectController {
+func startReconnectController(t *testing.T, legacy bool, syncAlloc ...uint64) *reconnectController {
 	t.Helper()
 	socket := filepath.Join(t.TempDir(), "controller.sock")
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
@@ -86,6 +88,9 @@ func startReconnectController(t *testing.T, legacy bool) *reconnectController {
 		t.Fatal(err)
 	}
 	c := &reconnectController{t: t, socket: socket, legacy: legacy, listener: listener, done: make(chan struct{}), synced: make(chan resource.Message, 1)}
+	if len(syncAlloc) > 0 {
+		c.syncAlloc = syncAlloc[0]
+	}
 	go c.run()
 	t.Cleanup(c.close)
 	return c
@@ -139,7 +144,11 @@ func (c *reconnectController) run() {
 		}
 		_ = resource.WriteMessage(second, &resource.Message{Type: resource.TypeAck, Token: reattach.Token, NewAllocatable: syncReq.AppliedAllocatableMemory})
 	} else {
-		_ = resource.WriteMessage(second, &resource.Message{Type: resource.TypeAck, Token: "synced-token", NewAllocatable: syncReq.AppliedAllocatableMemory})
+		newAlloc := syncReq.AppliedAllocatableMemory
+		if c.syncAlloc > 0 {
+			newAlloc = c.syncAlloc
+		}
+		_ = resource.WriteMessage(second, &resource.Message{Type: resource.TypeAck, Token: "synced-token", NewAllocatable: newAlloc})
 	}
 	c.synced <- *syncReq
 	for {
@@ -178,6 +187,7 @@ func reconnectConfig(t *testing.T, socket, cgroup string) *config.SandboxConfig 
 
 func TestControllerHooksCanonicalizesLeaseAndAdmitCgroupPath(t *testing.T) {
 	dir := t.TempDir()
+	t.Chdir(dir)
 	if err := os.MkdirAll(filepath.Join(dir, "intermediate"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +196,8 @@ func TestControllerHooksCanonicalizesLeaseAndAdmitCgroupPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	unclean := filepath.Join(dir, "intermediate", "..", "target") + string(filepath.Separator)
-	socket := filepath.Join(dir, "controller.sock")
+	socket := filepath.Join("intermediate", "..", "controller.sock")
+	wantSocket := filepath.Join(dir, "controller.sock")
 	hooks, err := NewControllerHooks(ControllerHookOptions{
 		SocketPath: socket, SandboxID: "canonical-path", Context: context.Background(), Logf: t.Logf,
 	}, reconnectConfig(t, socket, unclean))
@@ -200,6 +211,35 @@ func TestControllerHooksCanonicalizesLeaseAndAdmitCgroupPath(t *testing.T) {
 	}
 	if lease.CgroupPath != cgroup || hooks.controllerCgroupPath != cgroup {
 		t.Fatalf("canonical paths: lease=%q Admit=%q want=%q", lease.CgroupPath, hooks.controllerCgroupPath, cgroup)
+	}
+	if lease.ControllerSocket != wantSocket || hooks.opts.SocketPath != wantSocket || hooks.client.SocketPath != wantSocket {
+		t.Fatalf("canonical controller sockets: lease=%q hooks=%q client=%q want=%q",
+			lease.ControllerSocket, hooks.opts.SocketPath, hooks.client.SocketPath, wantSocket)
+	}
+}
+
+func TestControllerHooksRoundsPositiveCPUFloorUp(t *testing.T) {
+	dir := t.TempDir()
+	cgroup := filepath.Join(dir, "cgroup")
+	if err := os.MkdirAll(cgroup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "controller.sock")
+	cfg := reconnectConfig(t, socket, cgroup)
+	cfg.Resources.Allocatable.CPU = 0.0005
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: socket, SandboxID: "sub-millicore", Context: context.Background(), Logf: t.Logf,
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hooks.Release("test")
+	lease, err := resource.ReadLease(hooks.lease.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.FloorCPUMilli != 1 {
+		t.Fatalf("floor CPU = %d millicores, want 1", lease.FloorCPUMilli)
 	}
 }
 
@@ -251,6 +291,51 @@ func TestControllerHooksReconnectStateSync(t *testing.T) {
 	}
 	if got := hooks.AllocatableNowMem(); got != 768<<20 {
 		t.Fatalf("failed apply advanced allocatable to %d", got)
+	}
+}
+
+func TestControllerHooksAppliesStateSyncAllocation(t *testing.T) {
+	const syncAlloc = uint64(640 << 20)
+	controller := startReconnectController(t, false, syncAlloc)
+	cgroup := filepath.Join(t.TempDir(), "cgroup")
+	if err := os.MkdirAll(cgroup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{"memory.high": "max", "memory.current": "123"} {
+		if err := os.WriteFile(filepath.Join(cgroup, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: controller.socket, CgroupPath: cgroup, SandboxID: "state-sync-allocation",
+		Context: context.Background(), Logf: t.Logf,
+	}, reconnectConfig(t, controller.socket, cgroup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hooks.Release("test")
+	if _, err := hooks.Admit("state-sync-allocation", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := hooks.Settled(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-controller.synced:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StateSync timeout")
+	}
+	waitHooksConnected(t, hooks)
+	if got := hooks.AllocatableNowMem(); got != syncAlloc {
+		t.Fatalf("applied allocation = %d, want %d", got, syncAlloc)
+	}
+	wantHigh := uint64(float64(syncAlloc) * 0.875)
+	data, err := os.ReadFile(filepath.Join(cgroup, "memory.high"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != fmt.Sprint(wantHigh) {
+		t.Fatalf("memory.high = %q, want %d", data, wantHigh)
 	}
 }
 

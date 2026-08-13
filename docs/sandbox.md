@@ -2355,7 +2355,9 @@ guest 内进程级压力(跨 host/guest 边界,接口复杂)。
 - 唯一 reconnect loop 按 100ms 起、上限 5s 的带 jitter 指数退避持续 Connect,
   不设“超时后切换模式”;controller 长期不可用时 VM 仍按最后 applied 正常运行
 - 新 controller 支持 `state_sync_v1` 时上报 SID、actual applied、settled、RSS 和
-  可选旧 token;验证成功取得新 session token后恢复 Heartbeat/budget
+  可选旧 token;验证成功取得新 session token后恢复 Heartbeat/budget。若响应携带
+  不同的非零 `new_allocatable`,也必须先成功应用到 cgroup 与 balloon,否则保持
+  disconnected 并重试同步
 - 旧 controller 不认识 StateSync 时回退 `Reattach(old_token)`。其返回额度只有在
   cgroup 与 balloon 同步应用成功后才替换本地 applied
 
@@ -2374,7 +2376,8 @@ StateSync 仍报告快照 actual,不能把旧 controller 意图或新 grant 冒�
 
 文件只包含不可变字段:SID、sandbox-ctl PID、controller socket、真实 cgroup
 path、capacity、floor、startup、client features。SID 只参与 SHA-256,不直接成为
-路径。sandbox-ctl 对 FD 持 POSIX `fcntl` write lock直至沙箱生命周期结束;
+路径;socket 与 cgroup path 均以规范化绝对路径作为跨进程身份。sandbox-ctl 对 FD
+持 POSIX `fcntl` write lock直至沙箱生命周期结束;
 Heartbeat/Grant/StateSync 不更新文件。正常退出在仍持 lock 时 unlink 后 close;
 SIGKILL 则由内核自动释放 lock,controller 扫描时清理 stale 文件。
 
