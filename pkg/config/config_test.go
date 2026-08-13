@@ -905,6 +905,15 @@ func TestValidateRestoreHostConfigRejectsControllerWithoutCgroup(t *testing.T) {
 	}
 }
 
+func TestValidateRestoreHostConfigRejectsRelativeCgroupPath(t *testing.T) {
+	cfg := &SandboxConfig{}
+	cfg.Resources.Control.CgroupPath = "slice/task"
+	cfg.Resources.Control.Controller = "/run/node-ctl.sock"
+	if err := cfg.ValidateRestoreHostConfig(); err == nil || !strings.Contains(err.Error(), "cgroup_path must be absolute") {
+		t.Fatalf("ValidateRestoreHostConfig relative cgroup error = %v", err)
+	}
+}
+
 func TestResourceControlDefaults(t *testing.T) {
 	dir := t.TempDir()
 	cfg, err := Load(writeYAML(t, `

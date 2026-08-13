@@ -1270,6 +1270,9 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	if err := c.Restore.validate(); err != nil {
 		return err
 	}
+	if path := c.Resources.Control.CgroupPath; path != "" && !filepath.IsAbs(path) {
+		return fmt.Errorf("resources.control.cgroup_path must be absolute: %q", path)
+	}
 	if c.Resources.Control.Controller != "" && c.Resources.Control.CgroupPath == "" {
 		return errors.New("resources.control.controller requires resources.control.cgroup_path")
 	}
