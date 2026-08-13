@@ -2,7 +2,9 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -15,6 +17,7 @@ func TestRunSignalContextRetainsSignalBeforeServeAndWait(t *testing.T) {
 	ctx, stop := newRunSignalContext(context.Background(), source, func() { stopped.Store(true) })
 	t.Cleanup(stop)
 	controllerCtx := ControllerWorkContext(ctx)
+	vmCtx := vmLifecycleContext(ctx)
 
 	// Model SIGTERM after Admit but before ServeAndWait obtains its shutdown
 	// channel. Cancellation and later CH delivery must both survive that gap.
@@ -24,8 +27,13 @@ func TestRunSignalContextRetainsSignalBeforeServeAndWait(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("controller work context was not cancelled")
 	}
-	if err := ctx.Err(); err != nil {
-		t.Fatalf("VM lifecycle context cancelled before graceful CH shutdown: %v", err)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("pre-spawn context was not cancelled")
+	}
+	if err := vmCtx.Err(); err != nil {
+		t.Fatalf("VM backend context cancelled before graceful CH shutdown: %v", err)
 	}
 	signals := runSignalsFromContext(ctx)
 	select {
@@ -51,5 +59,24 @@ func TestRunSignalContextRetainsSignalBeforeServeAndWait(t *testing.T) {
 	stop()
 	if !stopped.Load() {
 		t.Fatal("signal source was not stopped")
+	}
+}
+
+func TestServeAndWaitRejectsCancelledPreSpawnContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	buildCalled := false
+	_, err := ServeAndWait(VMParams{
+		Ctx: ctx,
+		BuildCmd: func(CmdEnv) (*exec.Cmd, func(), error) {
+			buildCalled = true
+			return nil, func() {}, nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ServeAndWait error = %v, want context.Canceled", err)
+	}
+	if buildCalled {
+		t.Fatal("BuildCmd called after pre-spawn cancellation")
 	}
 }

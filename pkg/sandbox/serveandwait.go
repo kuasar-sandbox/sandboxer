@@ -209,6 +209,9 @@ type SnapDiskRef struct {
 // parts — config resolution, the CH cmdline, the post-spawn settle
 // protocol — stay in the callers via VMParams.BuildCmd / PostSpawn.
 func ServeAndWait(p VMParams) (int, error) {
+	if err := p.Ctx.Err(); err != nil {
+		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
+	}
 	logf := p.Logf
 	readiness := newReadinessEmitter(p.NotifyReadiness)
 	runDir := p.RunDir
@@ -222,7 +225,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	// servers run under (and the stdio MUX bridge). Cancelled when CH
 	// exits (or earlier via signal escalation); the deferred cancel is a
 	// backstop for the early-error returns below.
-	backendCtx, cancelBackends := context.WithCancel(p.Ctx)
+	backendCtx, cancelBackends := context.WithCancel(vmLifecycleContext(p.Ctx))
 	defer cancelBackends()
 
 	// Exactly one stdio MUX at a time; which conn backs it changes across
@@ -568,6 +571,14 @@ func ServeAndWait(p VMParams) (int, error) {
 		sigCh = localSignals
 	}
 
+	// A shutdown received while BuildCmd or any preceding setup was in flight
+	// must not create a new VM. The retained signal is consumed below only when
+	// CH crossed this final pre-spawn boundary.
+	if err := p.Ctx.Err(); err != nil {
+		cancelBackends()
+		backendWG.Wait()
+		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
+	}
 	if err := startCH(cmd, p.NetnsFile); err != nil {
 		cancelBackends()
 		backendWG.Wait()

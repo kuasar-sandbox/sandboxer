@@ -13,13 +13,15 @@ type runSignalContextKey struct{}
 type runSignalStream struct {
 	signals           <-chan os.Signal
 	controllerContext context.Context
+	vmContext         context.Context
 }
 
 // NotifyRunContext registers the sandbox lifecycle's signal source before
-// admission. The first SIGTERM/SIGINT cancels ControllerWorkContext(ctx) so
-// controller retries stop; ctx itself remains live until ServeAndWait performs
-// its existing graceful CH shutdown. Every signal is retained for that shutdown
-// and the second-signal escalation protocol.
+// admission. The first SIGTERM/SIGINT cancels ctx and
+// ControllerWorkContext(ctx), aborting work which has not spawned CH yet. Once
+// CH exists, ServeAndWait keeps its backend services on vmLifecycleContext(ctx)
+// and consumes every retained signal through the existing graceful shutdown and
+// second-signal escalation protocol.
 func NotifyRunContext(parent context.Context) (context.Context, context.CancelFunc) {
 	source := make(chan os.Signal, 4)
 	signal.Notify(source, syscall.SIGTERM, syscall.SIGINT)
@@ -27,6 +29,7 @@ func NotifyRunContext(parent context.Context) (context.Context, context.CancelFu
 }
 
 func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSource func()) (context.Context, context.CancelFunc) {
+	preSpawnCtx, cancelPreSpawn := context.WithCancel(parent)
 	controllerCtx, cancelController := context.WithCancel(parent)
 	forwarded := make(chan os.Signal, 4)
 	stop := make(chan struct{})
@@ -40,6 +43,7 @@ func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSo
 				if !ok {
 					return
 				}
+				cancelPreSpawn()
 				cancelController()
 				select {
 				case forwarded <- sig:
@@ -50,8 +54,8 @@ func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSo
 			}
 		}
 	}()
-	ctx := context.WithValue(parent, runSignalContextKey{}, runSignalStream{
-		signals: forwarded, controllerContext: controllerCtx,
+	ctx := context.WithValue(preSpawnCtx, runSignalContextKey{}, runSignalStream{
+		signals: forwarded, controllerContext: controllerCtx, vmContext: parent,
 	})
 	return ctx, func() {
 		once.Do(func() {
@@ -60,14 +64,30 @@ func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSo
 			}
 			close(stop)
 			<-done
+			cancelPreSpawn()
 			cancelController()
 		})
 	}
 }
 
+// vmLifecycleContext returns the context used by services which must remain
+// alive while an already-spawned CH handles a retained shutdown signal. For
+// callers without NotifyRunContext it is the original context.
+func vmLifecycleContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	stream, _ := ctx.Value(runSignalContextKey{}).(runSignalStream)
+	if stream.vmContext != nil {
+		return stream.vmContext
+	}
+	return ctx
+}
+
 // ControllerWorkContext returns the signal-cancelled context used only for
-// resource-controller connection and enforcement work. Other VM services must
-// keep using ctx so CH can drain while its vhost/vsock backends remain alive.
+// resource-controller connection and enforcement work. ServeAndWait derives
+// already-spawned VM services from vmLifecycleContext so CH can drain while its
+// vhost/vsock backends remain alive.
 func ControllerWorkContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.Background()
