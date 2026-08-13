@@ -3,6 +3,7 @@ package resource
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -119,7 +120,37 @@ func TestRemoveUnlockedLeaseRechecksAndRemovesStaleRecord(t *testing.T) {
 	}
 }
 
-func TestCreateLeaseRetriesWhenLockedInodeWasUnlinked(t *testing.T) {
+func TestRemoveUnlockedLeaseDoesNotUnlinkReplacementPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stale.json")
+	if err := os.WriteFile(path, []byte("stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var hookErr error
+	removed, err := removeUnlockedLease(path, func(path string, _ *os.File) {
+		if hookErr = os.Remove(path); hookErr != nil {
+			return
+		}
+		hookErr = os.WriteFile(path, []byte("replacement\n"), 0o600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if removed {
+		t.Fatal("cleanup reported removing an inode it did not open")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "replacement\n" {
+		t.Fatalf("replacement pathname content = %q", got)
+	}
+}
+
+func TestCreateLeaseAtomicallyPublishesLockedCompleteInodeAfterStaleRace(t *testing.T) {
 	dir := t.TempDir()
 	lease := Lease{
 		Version: LeaseVersion, SandboxID: "open-lock-race", PID: os.Getpid(),
@@ -134,11 +165,20 @@ func TestCreateLeaseRetriesWhenLockedInodeWasUnlinked(t *testing.T) {
 	if err := os.WriteFile(path, []byte("stale\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var openedStale os.FileInfo
+	var temporary os.FileInfo
 	var hookErr error
-	handle, err := createLease(lease, func(path string, opened *os.File) {
-		openedStale, hookErr = opened.Stat()
+	handle, err := createLease(lease, func(path string, temporaryFile *os.File) {
+		temporary, hookErr = temporaryFile.Stat()
 		if hookErr != nil {
+			return
+		}
+		visible, readErr := os.ReadFile(path)
+		if readErr != nil {
+			hookErr = readErr
+			return
+		}
+		if string(visible) != "stale\n" {
+			hookErr = fmt.Errorf("stable pathname exposed unpublished content %q", visible)
 			return
 		}
 		if hookErr = os.Remove(path); hookErr != nil {
@@ -157,15 +197,15 @@ func TestCreateLeaseRetriesWhenLockedInodeWasUnlinked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if os.SameFile(openedStale, current) {
-		t.Fatal("CreateLease retained the unlinked stale inode")
-	}
 	handleInfo, err := handle.file.Stat()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !os.SameFile(handleInfo, current) {
 		t.Fatal("lease handle does not own the inode reachable by pathname")
+	}
+	if !os.SameFile(temporary, current) {
+		t.Fatal("published lease is not the completely written temporary inode")
 	}
 	got, err := ReadLease(path)
 	if err != nil {

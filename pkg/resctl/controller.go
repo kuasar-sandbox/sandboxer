@@ -379,7 +379,13 @@ func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes
 		return err
 	}
 	if h.opts.Balloon != nil {
-		if err := h.opts.Balloon.ApplyAllocatable(ctx, allocBytes); err != nil {
+		var err error
+		if h.Enabled() {
+			err = h.opts.Balloon.ApplyAllocatable(ctx, allocBytes)
+		} else {
+			err = h.opts.Balloon.ApplyAllocatableEventually(ctx, allocBytes)
+		}
+		if err != nil {
 			return err
 		}
 	}

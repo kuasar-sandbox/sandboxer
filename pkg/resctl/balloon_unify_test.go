@@ -320,7 +320,7 @@ func TestHooks_SettledRestoreFailedCorrectionKeepsObservedAllocation(t *testing.
 	cfg.ApplyDefaults()
 	b := NewBalloonController(filepath.Join(t.TempDir(), "missing-ch.sock"), 8<<30, nil)
 	b.SeedAppliedAllocatable(2 << 30)
-	originalTarget := b.CurrentTarget()
+	desiredTarget := uint64(8<<30) - uint64(3<<30)
 	h := &ControllerHooks{opts: ControllerHookOptions{Balloon: b, Logf: func(string, ...any) {}}, cfg: cfg}
 	h.SetRestoreAppliedAllocatable(2 << 30)
 
@@ -333,11 +333,40 @@ func TestHooks_SettledRestoreFailedCorrectionKeepsObservedAllocation(t *testing.
 	if got := h.AllocatableNowMem(); got != 2<<30 {
 		t.Fatalf("applied allocation advanced after failed correction: got %d want %d", got, uint64(2<<30))
 	}
-	if got := b.CurrentTarget(); got != originalTarget {
-		t.Fatalf("failed correction remained queued: target=%d want=%d", got, originalTarget)
+	if got := b.CurrentTarget(); got != desiredTarget {
+		t.Fatalf("static failed correction was not queued: target=%d want=%d", got, desiredTarget)
 	}
-	if err := b.Reconcile(context.Background()); err != nil {
-		t.Fatalf("rolled-back reconcile retried failed resize: %v", err)
+	if err := b.Reconcile(context.Background()); err == nil {
+		t.Fatal("queued static correction did not retry failed resize")
+	}
+}
+
+func TestReconcileReadsTargetAfterSerialization(t *testing.T) {
+	srv := newFakeCHResize(t)
+	b := NewBalloonController(srv.sock, 8<<30, nil)
+	b.defaults()
+	b.SeedAppliedAllocatable(1 << 30)
+	b.SetAllocatable(2 << 30)
+
+	b.reconcileMu.Lock()
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- b.Reconcile(context.Background())
+	}()
+	<-started
+	// Let Reconcile reach the held serialization boundary. The target update
+	// must still be observed after the lock is acquired.
+	time.Sleep(20 * time.Millisecond)
+	b.SetAllocatable(3 << 30)
+	b.reconcileMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	want := uint64(5 << 30)
+	if got := b.CurrentActual(); got != want {
+		t.Fatalf("reconciled stale target = %d, want latest %d", got, want)
 	}
 }
 

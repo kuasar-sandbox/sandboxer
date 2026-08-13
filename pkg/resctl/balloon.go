@@ -161,17 +161,30 @@ func (b *BalloonController) SetAllocatable(allocBytes uint64) {
 // Hypervisor. ControllerHooks uses it inside the serialized resource session
 // and advances appliedAllocatable only after this returns successfully.
 func (b *BalloonController) ApplyAllocatable(ctx context.Context, allocBytes uint64) error {
+	return b.applyAllocatable(ctx, allocBytes, false)
+}
+
+// ApplyAllocatableEventually keeps a failed target queued for the background
+// reconciler. Static resource mode uses this after restore because there is no
+// controller allocation to report until the local correction succeeds.
+func (b *BalloonController) ApplyAllocatableEventually(ctx context.Context, allocBytes uint64) error {
+	return b.applyAllocatable(ctx, allocBytes, true)
+}
+
+func (b *BalloonController) applyAllocatable(ctx context.Context, allocBytes uint64, retainOnFailure bool) error {
 	b.defaults()
 	previous := b.target.Load()
 	target := b.targetForAllocatable(allocBytes)
 	b.target.Store(target)
 	if err := b.applyExactTarget(ctx, target); err != nil {
-		// Do not leave a failed controller budget queued for the background
-		// reconcile loop. ControllerHooks deliberately keeps reporting the
-		// previous applied allocation on error; a later untracked resize would
-		// otherwise make StateSync undercount the live consumer. Preserve a
-		// concurrent Hint/SetTarget update instead of overwriting it.
-		b.target.CompareAndSwap(target, previous)
+		// Dynamic controller budgets must not remain queued: ControllerHooks
+		// keeps reporting the previous applied allocation, so a later untracked
+		// resize would make StateSync undercount the consumer. Static restore
+		// correction deliberately retains the target for retry. In rollback mode,
+		// preserve a concurrent Hint/SetTarget instead of overwriting it.
+		if !retainOnFailure {
+			b.target.CompareAndSwap(target, previous)
+		}
 		return err
 	}
 	return nil
@@ -340,7 +353,9 @@ func (b *BalloonController) loop(ctx context.Context) {
 // last applied value. Idempotent; safe to call concurrently with
 // SetTarget/Hint.
 func (b *BalloonController) Reconcile(ctx context.Context) error {
-	return b.applyExactTarget(ctx, b.target.Load())
+	b.reconcileMu.Lock()
+	defer b.reconcileMu.Unlock()
+	return b.applyTargetLocked(ctx, b.target.Load())
 }
 
 // applyExactTarget serializes one explicit resize target. Reconcile snapshots
@@ -350,6 +365,11 @@ func (b *BalloonController) Reconcile(ctx context.Context) error {
 func (b *BalloonController) applyExactTarget(ctx context.Context, target uint64) error {
 	b.reconcileMu.Lock()
 	defer b.reconcileMu.Unlock()
+	return b.applyTargetLocked(ctx, target)
+}
+
+// applyTargetLocked applies exactly target. Caller holds reconcileMu.
+func (b *BalloonController) applyTargetLocked(ctx context.Context, target uint64) error {
 	// Record the attempt time regardless of whether a resize is actually
 	// needed: the kick-rate-limit only cares "did we recently look", not
 	// "did we recently change CH state".
