@@ -8,8 +8,10 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -264,11 +266,12 @@ func runCmd(args []string) int {
 
 	restoreR := *restoreRef
 
-	// Signal handling lives in pkg/sandbox (lifecycle.go /
-	// restore.go) — they own the CH process and forward SIGTERM/SIGINT
-	// to it with SIGKILL escalation. So this layer just passes a plain
-	// context.
-	ctx := context.Background()
+	// pkg/sandbox still owns forwarding signals to CH and SIGKILL escalation.
+	// This second subscription only turns the run lifetime into cancellation so
+	// pre-spawn admission and synchronous restore settlement cannot keep retrying
+	// after shutdown has begun. os/signal broadcasts to both subscribers.
+	ctx, stopRunSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stopRunSignals()
 
 	// Restore mode dispatch.
 	if restoreR != "" {
