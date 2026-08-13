@@ -17,7 +17,7 @@ func TestRunSignalContextRetainsSignalBeforeServeAndWait(t *testing.T) {
 	ctx, stop := newRunSignalContext(context.Background(), source, func() { stopped.Store(true) })
 	t.Cleanup(stop)
 	controllerCtx := ControllerWorkContext(ctx)
-	vmCtx := vmLifecycleContext(ctx)
+	vmCtx := VMLifecycleContext(ctx)
 
 	// Model SIGTERM after Admit but before ServeAndWait obtains its shutdown
 	// channel. Cancellation and later CH delivery must both survive that gap.

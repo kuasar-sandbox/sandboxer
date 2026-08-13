@@ -225,7 +225,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	// servers run under (and the stdio MUX bridge). Cancelled when CH
 	// exits (or earlier via signal escalation); the deferred cancel is a
 	// backstop for the early-error returns below.
-	backendCtx, cancelBackends := context.WithCancel(vmLifecycleContext(p.Ctx))
+	backendCtx, cancelBackends := context.WithCancel(VMLifecycleContext(p.Ctx))
 	defer cancelBackends()
 
 	// Exactly one stdio MUX at a time; which conn backs it changes across

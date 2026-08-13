@@ -19,7 +19,7 @@ type runSignalStream struct {
 // NotifyRunContext registers the sandbox lifecycle's signal source before
 // admission. The first SIGTERM/SIGINT cancels ctx and
 // ControllerWorkContext(ctx), aborting work which has not spawned CH yet. Once
-// CH exists, ServeAndWait keeps its backend services on vmLifecycleContext(ctx)
+// CH exists, ServeAndWait keeps its backend services on VMLifecycleContext(ctx)
 // and consumes every retained signal through the existing graceful shutdown and
 // second-signal escalation protocol.
 func NotifyRunContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -70,10 +70,10 @@ func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSo
 	}
 }
 
-// vmLifecycleContext returns the context used by services which must remain
+// VMLifecycleContext returns the context used by services which must remain
 // alive while an already-spawned CH handles a retained shutdown signal. For
 // callers without NotifyRunContext it is the original context.
-func vmLifecycleContext(ctx context.Context) context.Context {
+func VMLifecycleContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.Background()
 	}
@@ -86,7 +86,7 @@ func vmLifecycleContext(ctx context.Context) context.Context {
 
 // ControllerWorkContext returns the signal-cancelled context used only for
 // resource-controller connection and enforcement work. ServeAndWait derives
-// already-spawned VM services from vmLifecycleContext so CH can drain while its
+// already-spawned VM services from VMLifecycleContext so CH can drain while its
 // vhost/vsock backends remain alive.
 func ControllerWorkContext(ctx context.Context) context.Context {
 	if ctx == nil {
