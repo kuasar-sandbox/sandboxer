@@ -555,9 +555,18 @@ func ServeAndWait(p VMParams) (int, error) {
 		return -1, fmt.Errorf("cgroup: configure CH process: %w", err)
 	}
 
-	sigCh := make(chan os.Signal, 4)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(sigCh)
+	// sandbox-ctl registers this stream before Admit so an early shutdown cannot
+	// fall between admission and CH signal registration. Library callers without
+	// that context retain the original local registration behavior.
+	var sigCh <-chan os.Signal
+	if inherited := runSignalsFromContext(p.Ctx); inherited != nil {
+		sigCh = inherited
+	} else {
+		localSignals := make(chan os.Signal, 4)
+		signal.Notify(localSignals, syscall.SIGTERM, syscall.SIGINT)
+		defer signal.Stop(localSignals)
+		sigCh = localSignals
+	}
 
 	if err := startCH(cmd, p.NetnsFile); err != nil {
 		cancelBackends()

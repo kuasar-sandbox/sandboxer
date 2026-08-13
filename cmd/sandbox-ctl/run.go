@@ -8,10 +8,8 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"log"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -266,11 +264,10 @@ func runCmd(args []string) int {
 
 	restoreR := *restoreRef
 
-	// pkg/sandbox still owns forwarding signals to CH and SIGKILL escalation.
-	// This second subscription only turns the run lifetime into cancellation so
-	// pre-spawn admission and synchronous restore settlement cannot keep retrying
-	// after shutdown has begun. os/signal broadcasts to both subscribers.
-	ctx, stopRunSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	// Register once before Admit. The resulting context cancels controller work,
+	// while the same buffered signal stream is consumed later by ServeAndWait for
+	// CH forwarding/escalation. This closes the Admit -> CH-start registration gap.
+	ctx, stopRunSignals := sandbox.NotifyRunContext(context.Background())
 	defer stopRunSignals()
 
 	// Restore mode dispatch.
