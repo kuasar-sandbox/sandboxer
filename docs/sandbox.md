@@ -2380,7 +2380,9 @@ SIGKILL 则由内核自动释放 lock,controller 扫描时清理 stale 文件。
 
 该创建逻辑同时覆盖 conductor-managed 和直接执行的 `sandbox-ctl run`。managed
 模式中 controller 还会把 lease owner 与 `<run-root>/<sid>/<sid>.pid` 的 owner/PID
-及 `<sid>.yaml` 合同交叉核对;direct 模式没有这些 managed 文件,仍以
+及 `<sid>.yaml` 合同交叉核对。managed YAML 不保存最终 cgroup path;runner 在
+`exec` 时通过 node-owned FD 注入,controller 因而从 `/proc/<owner>/cgroup` 推导
+sibling `vmm` 与 lease 比较。direct 模式没有这些 managed 文件,仍以
 `SO_PEERCRED == lease lock owner` 和允许的 cgroup root认证。
 
 controller 异常重启时先按 live lease capacity 建 provisional 安全上界,再对
