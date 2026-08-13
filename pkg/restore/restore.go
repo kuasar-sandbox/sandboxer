@@ -373,7 +373,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		SocketPath: opts.HostCfg.Resources.Control.Controller,
 		CgroupPath: cg.LocalPath(),
 		SandboxID:  opts.SandboxID,
-		Context:    ctx,
+		Context:    sandbox.ControllerWorkContext(ctx),
 		Logf:       logf,
 		Balloon:    balloonCtl,
 	}, opts.HostCfg)

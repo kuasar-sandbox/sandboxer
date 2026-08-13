@@ -221,7 +221,7 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 		default:
 		}
 		if !h.client.Connected() {
-			if err := h.client.Connect(); err != nil {
+			if err := h.client.ConnectContext(h.lifetimeCtx); err != nil {
 				if err := h.waitRetry(backoff); err != nil {
 					return 0, err
 				}
@@ -229,7 +229,7 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 				continue
 			}
 		}
-		res, err := h.client.Admit(resource.AdmitParams{
+		res, err := h.client.AdmitContext(h.lifetimeCtx, resource.AdmitParams{
 			SandboxID: sid, CapacityMemoryBytes: capMem,
 			CapacityCPU:      h.cfg.Resources.Capacity.CPU,
 			FloorMemoryBytes: floorMem, FloorCPU: h.cfg.Resources.Allocatable.CPU,
@@ -370,7 +370,7 @@ func (h *ControllerHooks) notifySettledLocked(operation string) error {
 		return nil
 	}
 	rss := readMemoryCurrent(h.opts.CgroupPath)
-	if err := h.client.Settled(rss, 0); err != nil {
+	if err := h.client.SettledContext(h.lifetimeCtx, rss, 0); err != nil {
 		h.markDisconnectedLocked(err)
 		if resource.IsTransportError(err) {
 			return nil
@@ -526,7 +526,7 @@ func (h *ControllerHooks) heartbeatOnce(ctx context.Context) {
 		return
 	}
 	rss := readMemoryCurrent(h.opts.CgroupPath)
-	res, err := h.client.Heartbeat(rss, 0, 0, 0)
+	res, err := h.client.HeartbeatContext(h.lifetimeCtx, rss, 0, 0, 0)
 	if err != nil {
 		// A TypeError such as "no reservation" rejects the session just as
 		// definitively as EOF. Keeping that stream connected would prevent
@@ -556,7 +556,7 @@ func (h *ControllerHooks) RequestBudget(step uint64, urgency, reason string) (ui
 		h.notifyReconnect()
 		return 0, state.applied, 0, &resource.TransportError{Err: errors.New("controller session disconnected")}
 	}
-	granted, newAlloc, cooldownMs, err := h.client.RequestBudget(state.applied, step, urgency, reason)
+	granted, newAlloc, cooldownMs, err := h.client.RequestBudgetContext(h.lifetimeCtx, state.applied, step, urgency, reason)
 	if err != nil {
 		h.markDisconnectedLocked(err)
 		return 0, state.applied, 0, err
@@ -623,10 +623,10 @@ func (h *ControllerHooks) reconnectLoop() {
 				h.sessionMu.Unlock()
 				break
 			}
-			err := h.client.Connect()
+			err := h.client.ConnectContext(h.lifetimeCtx)
 			if err == nil {
 				rss := readMemoryCurrent(h.opts.CgroupPath)
-				result, syncErr := h.client.StateSync(resource.StateSyncParams{
+				result, syncErr := h.client.StateSyncContext(h.lifetimeCtx, resource.StateSyncParams{
 					SandboxID: h.opts.SandboxID, AppliedAllocatableMemory: state.applied,
 					Settled: state.settled, CurrentRSS: rss, PreviousToken: state.token,
 				})
@@ -659,7 +659,7 @@ func (h *ControllerHooks) reconnectLoop() {
 					break
 				}
 				if resource.IsStateSyncUnsupported(syncErr) && state.token != "" {
-					legacyAlloc, reattachErr := h.client.ReattachState(state.token)
+					legacyAlloc, reattachErr := h.client.ReattachStateContext(h.lifetimeCtx, state.token)
 					if reattachErr == nil {
 						desiredAlloc := state.desired
 						if legacyAlloc > 0 {

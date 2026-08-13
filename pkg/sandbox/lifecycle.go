@@ -179,7 +179,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
 		SocketPath: opts.Cfg.Resources.Control.Controller,
 		SandboxID:  opts.SandboxID,
-		Context:    ctx,
+		Context:    ControllerWorkContext(ctx),
 		Logf:       logf,
 		Balloon:    balloonCtl,
 	}, opts.Cfg)

@@ -11,13 +11,15 @@ import (
 type runSignalContextKey struct{}
 
 type runSignalStream struct {
-	signals <-chan os.Signal
+	signals           <-chan os.Signal
+	controllerContext context.Context
 }
 
 // NotifyRunContext registers the sandbox lifecycle's signal source before
-// admission. The first SIGTERM/SIGINT cancels ctx so controller retries stop;
-// every signal is also retained for ServeAndWait's existing CH shutdown and
-// second-signal escalation protocol.
+// admission. The first SIGTERM/SIGINT cancels ControllerWorkContext(ctx) so
+// controller retries stop; ctx itself remains live until ServeAndWait performs
+// its existing graceful CH shutdown. Every signal is retained for that shutdown
+// and the second-signal escalation protocol.
 func NotifyRunContext(parent context.Context) (context.Context, context.CancelFunc) {
 	source := make(chan os.Signal, 4)
 	signal.Notify(source, syscall.SIGTERM, syscall.SIGINT)
@@ -25,7 +27,7 @@ func NotifyRunContext(parent context.Context) (context.Context, context.CancelFu
 }
 
 func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSource func()) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(parent)
+	controllerCtx, cancelController := context.WithCancel(parent)
 	forwarded := make(chan os.Signal, 4)
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -38,7 +40,7 @@ func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSo
 				if !ok {
 					return
 				}
-				cancel()
+				cancelController()
 				select {
 				case forwarded <- sig:
 				default:
@@ -48,7 +50,9 @@ func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSo
 			}
 		}
 	}()
-	ctx = context.WithValue(ctx, runSignalContextKey{}, runSignalStream{signals: forwarded})
+	ctx := context.WithValue(parent, runSignalContextKey{}, runSignalStream{
+		signals: forwarded, controllerContext: controllerCtx,
+	})
 	return ctx, func() {
 		once.Do(func() {
 			if stopSource != nil {
@@ -56,9 +60,23 @@ func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSo
 			}
 			close(stop)
 			<-done
-			cancel()
+			cancelController()
 		})
 	}
+}
+
+// ControllerWorkContext returns the signal-cancelled context used only for
+// resource-controller connection and enforcement work. Other VM services must
+// keep using ctx so CH can drain while its vhost/vsock backends remain alive.
+func ControllerWorkContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	stream, _ := ctx.Value(runSignalContextKey{}).(runSignalStream)
+	if stream.controllerContext != nil {
+		return stream.controllerContext
+	}
+	return ctx
 }
 
 func runSignalsFromContext(ctx context.Context) <-chan os.Signal {

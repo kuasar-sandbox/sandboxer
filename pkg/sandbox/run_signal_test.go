@@ -14,14 +14,18 @@ func TestRunSignalContextRetainsSignalBeforeServeAndWait(t *testing.T) {
 	var stopped atomic.Bool
 	ctx, stop := newRunSignalContext(context.Background(), source, func() { stopped.Store(true) })
 	t.Cleanup(stop)
+	controllerCtx := ControllerWorkContext(ctx)
 
 	// Model SIGTERM after Admit but before ServeAndWait obtains its shutdown
 	// channel. Cancellation and later CH delivery must both survive that gap.
 	source <- syscall.SIGTERM
 	select {
-	case <-ctx.Done():
+	case <-controllerCtx.Done():
 	case <-time.After(time.Second):
-		t.Fatal("run context was not cancelled")
+		t.Fatal("controller work context was not cancelled")
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("VM lifecycle context cancelled before graceful CH shutdown: %v", err)
 	}
 	signals := runSignalsFromContext(ctx)
 	select {
