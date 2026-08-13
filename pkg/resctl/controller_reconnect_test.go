@@ -345,6 +345,55 @@ func TestControllerHooksCanonicalizesLeaseAndAdmitCgroupPath(t *testing.T) {
 	}
 }
 
+func TestControllerHooksPublishesLeaseUnderCanonicalSocketIdentity(t *testing.T) {
+	root := t.TempDir()
+	realDir := root
+	for len(filepath.Join(realDir, "controller.sock")) <= 120 {
+		realDir = filepath.Join(realDir, "deep-component")
+	}
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(realDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	cgroup := filepath.Join(root, "cgroup")
+	if err := os.Mkdir(cgroup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configured := filepath.Join(alias, "controller.sock")
+	canonical := filepath.Join(realDir, "controller.sock")
+	if len(configured) > 107 || len(canonical) <= 107 {
+		t.Fatalf("test paths do not straddle AF_UNIX limit: dial=%d identity=%d", len(configured), len(canonical))
+	}
+	const sid = "canonical-socket-inventory"
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		SocketPath: configured, SandboxID: sid, Context: context.Background(), Logf: t.Logf,
+	}, reconnectConfig(t, configured, cgroup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hooks.Release("test")
+
+	wantLeasePath := resource.LeasePath(canonical, sid)
+	if hooks.lease.Path() != wantLeasePath || hooks.controllerSocketIdentity != canonical {
+		t.Fatalf("canonical inventory identity: lease=%q identity=%q, want lease=%q identity=%q",
+			hooks.lease.Path(), hooks.controllerSocketIdentity, wantLeasePath, canonical)
+	}
+	if hooks.opts.SocketPath != configured || hooks.client.SocketPath != configured {
+		t.Fatalf("dial paths expanded through alias: hooks=%q client=%q, want %q",
+			hooks.opts.SocketPath, hooks.client.SocketPath, configured)
+	}
+	lease, err := resource.ReadLease(wantLeasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.ControllerSocket != canonical {
+		t.Fatalf("lease controller socket = %q, want %q", lease.ControllerSocket, canonical)
+	}
+}
+
 func TestControllerHooksRoundsPositiveCPUFloorUp(t *testing.T) {
 	dir := t.TempDir()
 	cgroup := filepath.Join(dir, "cgroup")

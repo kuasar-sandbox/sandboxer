@@ -227,7 +227,10 @@ type ControlConfig struct {
 	CgroupFD int `yaml:"-"`
 	// Controller is the filesystem UDS path of a sandbox-resource-control
 	// protocol endpoint. Linux abstract addresses are unsupported because the
-	// recovery owner lock and lease inventory are derived from this path.
+	// recovery owner lock and lease inventory are derived from this path. At
+	// runtime the bind/dial spelling is retained, while parent symlinks are
+	// canonicalized for inventory; ambiguous final, dangling, or hard-link
+	// aliases fail closed.
 	// Non-empty enables dynamic mode (M2+). Requires CgroupPath.
 	Controller string `yaml:"controller,omitempty"`
 	// Sensor tunes the per-sandbox memory pressure sensor (data source +

@@ -2382,7 +2382,10 @@ Heartbeat/Grant/StateSync 不更新文件。正常退出在仍持 lock 时 unlin
 SIGKILL 则由内核自动释放 lock,controller 扫描时清理 stale 文件。
 
 controller socket 必须是文件系统 UDS;Linux `@name`/NUL abstract 地址无法承载
-同路径派生的 `.owner` 和 `.leases/` inventory,配置校验会直接拒绝。
+同路径派生的 `.owner` 和 `.leases/` inventory,配置校验会直接拒绝。运行时会把
+父目录 symlink 解析为统一 inventory 身份,但 bind/dial 保留原绝对路径(允许用短
+alias 避免 AF_UNIX 路径长度上限);dangling parent、最终组件 symlink 或多
+hard-link socket 因无法唯一确定 owner/inventory 路径而 fail closed。
 
 该创建逻辑同时覆盖 conductor-managed 和直接执行的 `sandbox-ctl run`。managed
 模式中 controller 还会把 lease owner 与 `<run-root>/<sid>/<sid>.pid` 的 owner/PID

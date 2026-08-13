@@ -40,6 +40,9 @@ type ControllerHooks struct {
 	// lease and every controller request. opts.CgroupPath is separately replaced
 	// with the process-local pinned FD path used for cgroup file I/O.
 	controllerCgroupPath string
+	// controllerSocketIdentity is the canonical owner/lease inventory identity.
+	// opts.SocketPath remains the possibly shorter absolute dial path.
+	controllerSocketIdentity string
 
 	admitted           bool
 	settled            bool
@@ -81,12 +84,18 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		cancel()
 		return nil, fmt.Errorf("dynamic resource mode requires sandbox id")
 	}
-	controllerSocketPath, err := filepath.Abs(opts.SocketPath)
+	controllerSocketIdentity, err := resource.CanonicalSocketPath(opts.SocketPath)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("resolve controller socket: %w", err)
 	}
+	controllerSocketPath, err := filepath.Abs(opts.SocketPath)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("resolve controller dial path: %w", err)
+	}
 	h.opts.SocketPath = controllerSocketPath
+	h.controllerSocketIdentity = controllerSocketIdentity
 	controllerCgroupPath := filepath.Clean(cfg.Resources.Control.CgroupPath)
 	h.controllerCgroupPath = controllerCgroupPath
 	capMem, err := cfg.CapacityMemoryBytes()
@@ -106,7 +115,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 	}
 	lease, err := resource.CreateLease(resource.Lease{
 		Version: resource.LeaseVersion, SandboxID: opts.SandboxID, PID: os.Getpid(),
-		ControllerSocket: controllerSocketPath, CgroupPath: controllerCgroupPath,
+		ControllerSocket: controllerSocketIdentity, CgroupPath: controllerCgroupPath,
 		CapacityMemory: capMem, CapacityCPUMilli: uint64(cfg.Resources.Capacity.CPU) * 1000,
 		FloorMemory: floorMem, FloorCPUMilli: cpuMilliCeil(cfg.Resources.Allocatable.CPU),
 		StartupMemory: startupMem, ClientFeatures: []string{resource.FeatureStateSyncV1},
