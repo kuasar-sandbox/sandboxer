@@ -371,6 +371,50 @@ func TestHooks_OnAllocatableChangedRollsBackMemoryHighWhenBalloonFails(t *testin
 	}
 }
 
+func TestHooks_StaticFailedBalloonKeepsMemoryHighForQueuedRetry(t *testing.T) {
+	const (
+		capacity      = uint64(8 << 30)
+		previousAlloc = uint64(2 << 30)
+		newAlloc      = uint64(3 << 30)
+	)
+	cgroup := t.TempDir()
+	memoryHigh := filepath.Join(cgroup, "memory.high")
+	if err := os.WriteFile(memoryHigh, []byte("max\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b := NewBalloonController(filepath.Join(t.TempDir(), "missing-ch.sock"), capacity, nil)
+	b.SeedAppliedAllocatable(previousAlloc)
+	cfg := &config.SandboxConfig{
+		Resources: config.ResourcesConfig{
+			Capacity:    config.CapacityConfig{Memory: "8GiB"},
+			Allocatable: config.AllocatableConfig{Memory: "1GiB"},
+		},
+	}
+	cfg.ApplyDefaults()
+	h := &ControllerHooks{
+		opts: ControllerHookOptions{CgroupPath: cgroup, Balloon: b, Logf: func(string, ...any) {}},
+		cfg:  cfg,
+	}
+
+	if err := h.OnAllocatableChanged(newAlloc); err == nil {
+		t.Fatal("OnAllocatableChanged succeeded despite failed balloon enforcement")
+	}
+	gotHigh, err := os.ReadFile(memoryHigh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHigh := fmt.Sprint(uint64(float64(newAlloc) * 0.875))
+	if string(gotHigh) != wantHigh {
+		t.Fatalf("memory.high = %q after queued static apply, want %q", gotHigh, wantHigh)
+	}
+	if got := b.CurrentTarget(); got != capacity-newAlloc {
+		t.Fatalf("queued balloon target = %d, want %d", got, capacity-newAlloc)
+	}
+	if got := b.CurrentActual(); got != capacity-previousAlloc {
+		t.Fatalf("failed balloon actual = %d, want %d", got, capacity-previousAlloc)
+	}
+}
+
 // TestHooks_SetRestoreAppliedAllocatableDoesNotTouchBalloon covers the
 // restore pre-resume path: record observed state without external side effects.
 func TestHooks_SetRestoreAppliedAllocatableDoesNotTouchBalloon(t *testing.T) {

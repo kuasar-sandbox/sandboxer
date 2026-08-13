@@ -407,14 +407,21 @@ func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes
 	}
 	if h.opts.Balloon != nil {
 		var balloonErr error
-		if h.Enabled() {
+		dynamic := h.Enabled()
+		if dynamic {
 			balloonErr = h.opts.Balloon.ApplyAllocatable(ctx, allocBytes)
 		} else {
 			balloonErr = h.opts.Balloon.ApplyAllocatableEventually(ctx, allocBytes)
 		}
 		if balloonErr != nil {
-			if rollbackErr := h.restoreMemoryHigh(previousHigh); rollbackErr != nil {
-				return errors.Join(balloonErr, fmt.Errorf("rollback memory.high: %w", rollbackErr))
+			// Dynamic allocations are published to StateSync only after both
+			// enforcement steps commit, so their cgroup half must roll back.
+			// Static restore deliberately keeps the failed balloon target queued
+			// for retry; memory.high must remain at that eventual target too.
+			if dynamic {
+				if rollbackErr := h.restoreMemoryHigh(previousHigh); rollbackErr != nil {
+					return errors.Join(balloonErr, fmt.Errorf("rollback memory.high: %w", rollbackErr))
+				}
 			}
 			return balloonErr
 		}
