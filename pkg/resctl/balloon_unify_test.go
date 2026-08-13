@@ -341,5 +341,30 @@ func TestHooks_SettledRestoreFailedCorrectionKeepsObservedAllocation(t *testing.
 	}
 }
 
+func TestApplyAllocatableOverridesCompetingHintTarget(t *testing.T) {
+	srv := newFakeCHResize(t)
+	b := NewBalloonController(srv.sock, 8<<30, nil)
+	b.SeedAppliedAllocatable(1 << 30)
+	b.TargetFreeBuffer = 64 << 20
+	b.Slack = 1
+	b.MaxStep = 256 << 20
+
+	// Publish a competing hint target before the explicit apply. The explicit
+	// controller allocation must still be the resize committed by this call.
+	b.Hint(256<<20, 7<<30)
+	if err := b.ApplyAllocatable(context.Background(), 2<<30); err != nil {
+		t.Fatal(err)
+	}
+	want := uint64(6 << 30)
+	if got := b.CurrentActual(); got != want {
+		t.Fatalf("explicit apply actual target = %d, want %d", got, want)
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.calls) == 0 || srv.calls[len(srv.calls)-1] != want {
+		t.Fatalf("resize calls = %v, want final %d", srv.calls, want)
+	}
+}
+
 // silence unused-import linter when build tags strip http use elsewhere.
 var _ = fmt.Sprintf

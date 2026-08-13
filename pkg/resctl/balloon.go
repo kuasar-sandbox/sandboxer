@@ -165,7 +165,7 @@ func (b *BalloonController) ApplyAllocatable(ctx context.Context, allocBytes uin
 	previous := b.target.Load()
 	target := b.targetForAllocatable(allocBytes)
 	b.target.Store(target)
-	if err := b.Reconcile(ctx); err != nil {
+	if err := b.applyExactTarget(ctx, target); err != nil {
 		// Do not leave a failed controller budget queued for the background
 		// reconcile loop. ControllerHooks deliberately keeps reporting the
 		// previous applied allocation on error; a later untracked resize would
@@ -340,9 +340,16 @@ func (b *BalloonController) loop(ctx context.Context) {
 // last applied value. Idempotent; safe to call concurrently with
 // SetTarget/Hint.
 func (b *BalloonController) Reconcile(ctx context.Context) error {
+	return b.applyExactTarget(ctx, b.target.Load())
+}
+
+// applyExactTarget serializes one explicit resize target. Reconcile snapshots
+// the latest general policy target; controller budget application passes its
+// own target so a concurrent mem-report Hint cannot make a successful call
+// commit a different resize than the allocation ControllerHooks records.
+func (b *BalloonController) applyExactTarget(ctx context.Context, target uint64) error {
 	b.reconcileMu.Lock()
 	defer b.reconcileMu.Unlock()
-	target := b.target.Load()
 	// Record the attempt time regardless of whether a resize is actually
 	// needed: the kick-rate-limit only cares "did we recently look", not
 	// "did we recently change CH state".
