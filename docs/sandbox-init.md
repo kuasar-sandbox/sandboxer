@@ -1097,7 +1097,7 @@ host 侧凡由 sandbox.yaml `timeouts.*` 接管的项以配置为准,默认不�
 | `attach` | 5 s | 同 `restore` 的 hold 语义;此连接随后转 MUX |
 | `exec` | 10 s | 比 attach 宽:guest 要 fork+exec 子进程并 PATH 解析后才回 `exec_ack`;仅覆盖握手段,连接转 MUX 后 deadline 清除 |
 | `connect` | 10 s | 仅覆盖握手段(内含 guest 侧 dial 目标 ≤ 5 s);连接转 fwd 通道后 deadline 清除 |
-| `mem_report` | 同 `app_started` | guest 每 5 s 一次,host 失败仅记日志、controller 在下一 tick 用旧 hint |
+| `mem_report` | guest 侧连接后 4 s(write+读 ack);dial 另有 5 s 重试预算;host 读死线 `timeouts.app_notify`(默认不强制) | guest 每 5 s 一次;该消息用于 VMM 受 `memory.high` 压力时的反馈控制,故不能复用 200 ms 快速失败预算;连接后的 4 s 仍小于上报周期,失败后由 ticker 继续重试 |
 
 ## 5. 应用契约
 
