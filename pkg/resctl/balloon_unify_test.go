@@ -18,12 +18,13 @@ import (
 // /api/v1/vm.resize PUT and replies 204. Mirrors enough of CH to exercise
 // BalloonController.callResize end-to-end.
 type fakeCHResize struct {
-	sock    string
-	listen  net.Listener
-	wg      sync.WaitGroup
-	mu      sync.Mutex
-	calls   []uint64 // desired_balloon values seen, in order
-	stopped atomic.Bool
+	sock     string
+	listen   net.Listener
+	wg       sync.WaitGroup
+	mu       sync.Mutex
+	calls    []uint64 // desired_balloon values seen, in order
+	failures int
+	stopped  atomic.Bool
 }
 
 func newFakeCHResize(t *testing.T) *fakeCHResize {
@@ -57,7 +58,15 @@ func newFakeCHResize(t *testing.T) *fakeCHResize {
 		}
 		s.mu.Lock()
 		s.calls = append(s.calls, v)
+		fail := s.failures > 0
+		if fail {
+			s.failures--
+		}
 		s.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	srv := &http.Server{Handler: mux}
@@ -72,6 +81,12 @@ func newFakeCHResize(t *testing.T) *fakeCHResize {
 		s.wg.Wait()
 	})
 	return s
+}
+
+func (s *fakeCHResize) failNext(count int) {
+	s.mu.Lock()
+	s.failures = count
+	s.mu.Unlock()
 }
 
 func (s *fakeCHResize) seen() []uint64 {
@@ -155,6 +170,30 @@ func TestBalloon_SeedRestoredStateReconcilesInFlightInflation(t *testing.T) {
 	defer b.Stop()
 	if calls := srv.seen(); len(calls) != 1 || calls[0] != 100<<20 {
 		t.Fatalf("in-flight restore resize calls = %v, want [%d]", calls, uint64(100<<20))
+	}
+}
+
+func TestBalloon_StartRetriesAfterInitialReconcileFailure(t *testing.T) {
+	srv := newFakeCHResize(t)
+	srv.failNext(1)
+	b := NewBalloonController(srv.sock, 1<<30, nil)
+	b.Interval = 10 * time.Millisecond
+	b.SeedRestoredState((1<<30)-(100<<20), 200<<20)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := b.Start(ctx); err == nil {
+		t.Fatal("Start hid the injected initial reconcile failure")
+	}
+	defer b.Stop()
+	deadline := time.Now().Add(time.Second)
+	for b.CurrentActual() != 100<<20 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := b.CurrentActual(); got != 100<<20 {
+		t.Fatalf("background retry left actual target at %d, want %d; calls=%v", got, uint64(100<<20), srv.seen())
+	}
+	if calls := srv.seen(); len(calls) < 2 || calls[0] != 100<<20 || calls[1] != 100<<20 {
+		t.Fatalf("initial failure/retry calls = %v, want repeated %d", calls, uint64(100<<20))
 	}
 }
 

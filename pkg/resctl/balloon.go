@@ -290,20 +290,19 @@ func (b *BalloonController) Hint(memAvailable, memTotal uint64) {
 	b.SetTarget(next)
 }
 
-// Start runs an immediate reconcile (so the post-Settled inflate
-// happens as soon as the controller is engaged), then a ticker.
-// Returns the initial reconcile error so the caller can fast-fail
-// if CH's HTTP API is unreachable.
+// Start runs an immediate reconcile (so the post-Settled inflate happens as
+// soon as the controller is engaged), then always starts the retry loop. The
+// initial error is still returned for observability, but a transient CH API
+// failure must not consume startOnce without leaving any retry mechanism.
 func (b *BalloonController) Start(ctx context.Context) error {
 	b.defaults()
 	var err error
 	b.startOnce.Do(func() {
-		if rerr := b.Reconcile(ctx); rerr != nil {
-			err = fmt.Errorf("balloon: initial resize: %w", rerr)
-			return
-		}
 		b.stopCh = make(chan struct{})
 		b.doneCh = make(chan struct{})
+		if rerr := b.Reconcile(ctx); rerr != nil {
+			err = fmt.Errorf("balloon: initial resize: %w", rerr)
+		}
 		go b.loop(ctx)
 	})
 	return err
