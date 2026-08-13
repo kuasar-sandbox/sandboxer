@@ -2,6 +2,7 @@ package resctl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,7 +25,10 @@ type fakeCHResize struct {
 	wg       sync.WaitGroup
 	mu       sync.Mutex
 	calls    []uint64 // desired_balloon values seen, in order
+	current  uint64
 	failures int
+	dropAcks int
+	infoFail int
 	stopped  atomic.Bool
 }
 
@@ -37,6 +41,21 @@ func newFakeCHResize(t *testing.T) *fakeCHResize {
 	}
 	s := &fakeCHResize{sock: sock, listen: l}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/vm.info", func(w http.ResponseWriter, _ *http.Request) {
+		s.mu.Lock()
+		fail := s.infoFail > 0
+		if fail {
+			s.infoFail--
+		}
+		current := s.current
+		s.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"config":{"balloon":{"size":%d}}}`, current)
+	})
 	mux.HandleFunc("/api/v1/vm.resize", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			DesiredBalloon uint64 `json:"desired_balloon"`
@@ -63,9 +82,30 @@ func newFakeCHResize(t *testing.T) *fakeCHResize {
 		if fail {
 			s.failures--
 		}
+		dropAck := s.dropAcks > 0
+		if dropAck {
+			s.dropAcks--
+		}
+		if !fail {
+			s.current = v
+		}
 		s.mu.Unlock()
 		if fail {
 			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if dropAck {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("response writer cannot drop resize acknowledgement")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Errorf("hijack resize response: %v", err)
+				return
+			}
+			_ = conn.Close()
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -88,6 +128,30 @@ func (s *fakeCHResize) failNext(count int) {
 	s.mu.Lock()
 	s.failures = count
 	s.mu.Unlock()
+}
+
+func (s *fakeCHResize) setCurrent(size uint64) {
+	s.mu.Lock()
+	s.current = size
+	s.mu.Unlock()
+}
+
+func (s *fakeCHResize) dropAckNext(count int) {
+	s.mu.Lock()
+	s.dropAcks = count
+	s.mu.Unlock()
+}
+
+func (s *fakeCHResize) failInfoNext(count int) {
+	s.mu.Lock()
+	s.infoFail = count
+	s.mu.Unlock()
+}
+
+func (s *fakeCHResize) currentSize() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.current
 }
 
 func (s *fakeCHResize) seen() []uint64 {
@@ -328,7 +392,10 @@ func TestHooks_OnAllocatableChangedRollsBackMemoryHighWhenBalloonFails(t *testin
 	if err := os.WriteFile(memoryHigh, previousHigh, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	b := NewBalloonController(filepath.Join(t.TempDir(), "missing-ch.sock"), capacity, nil)
+	srv := newFakeCHResize(t)
+	srv.setCurrent(capacity - previousAlloc)
+	srv.failNext(1)
+	b := NewBalloonController(srv.sock, capacity, nil)
 	b.SeedAppliedAllocatable(previousAlloc)
 	cfg := &config.SandboxConfig{
 		Resources: config.ResourcesConfig{
@@ -368,6 +435,192 @@ func TestHooks_OnAllocatableChangedRollsBackMemoryHighWhenBalloonFails(t *testin
 	}
 	if got := b.CurrentActual(); got != wantBalloon {
 		t.Fatalf("balloon actual = %d after failed apply, want %d", got, wantBalloon)
+	}
+}
+
+func TestHooks_OnAllocatableChangedConfirmsLostBalloonAcknowledgement(t *testing.T) {
+	const (
+		capacity      = uint64(8 << 30)
+		previousAlloc = uint64(2 << 30)
+		newAlloc      = uint64(3 << 30)
+	)
+	cgroup := t.TempDir()
+	memoryHigh := filepath.Join(cgroup, "memory.high")
+	if err := os.WriteFile(memoryHigh, []byte("max\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := newFakeCHResize(t)
+	srv.setCurrent(capacity - previousAlloc)
+	srv.dropAckNext(1)
+	b := NewBalloonController(srv.sock, capacity, nil)
+	b.SeedAppliedAllocatable(previousAlloc)
+	cfg := &config.SandboxConfig{
+		Resources: config.ResourcesConfig{
+			Capacity:    config.CapacityConfig{Memory: "8GiB"},
+			Allocatable: config.AllocatableConfig{Memory: "1GiB"},
+		},
+	}
+	cfg.ApplyDefaults()
+	h := &ControllerHooks{
+		opts: ControllerHookOptions{
+			SocketPath: "/run/node-resource-controller.sock",
+			CgroupPath: cgroup,
+			Balloon:    b,
+			Logf:       func(string, ...any) {},
+		},
+		cfg:               cfg,
+		allocatableNowMem: previousAlloc,
+		desiredAllocMem:   previousAlloc,
+	}
+
+	if err := h.OnAllocatableChanged(newAlloc); err != nil {
+		t.Fatalf("confirmed lost acknowledgement was not committed: %v", err)
+	}
+	wantHigh := fmt.Sprint(uint64(float64(newAlloc) * 0.875))
+	gotHigh, err := os.ReadFile(memoryHigh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotHigh) != wantHigh {
+		t.Fatalf("memory.high = %q, want %q", gotHigh, wantHigh)
+	}
+	if got := h.AllocatableNowMem(); got != newAlloc {
+		t.Fatalf("applied allocation = %d, want %d", got, newAlloc)
+	}
+	wantBalloon := capacity - newAlloc
+	if got := b.CurrentTarget(); got != wantBalloon {
+		t.Fatalf("balloon target = %d, want %d", got, wantBalloon)
+	}
+	if got := b.CurrentActual(); got != wantBalloon {
+		t.Fatalf("balloon actual = %d, want confirmed %d", got, wantBalloon)
+	}
+}
+
+func TestHooks_OnAllocatableChangedCompensatesWhenLostAckCannotBeConfirmed(t *testing.T) {
+	const (
+		capacity      = uint64(8 << 30)
+		previousAlloc = uint64(2 << 30)
+		newAlloc      = uint64(3 << 30)
+	)
+	cgroup := t.TempDir()
+	memoryHigh := filepath.Join(cgroup, "memory.high")
+	previousHigh := []byte("1879048192\n")
+	if err := os.WriteFile(memoryHigh, previousHigh, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := newFakeCHResize(t)
+	previousBalloon := capacity - previousAlloc
+	srv.setCurrent(previousBalloon)
+	srv.dropAckNext(1)
+	srv.failInfoNext(1)
+	b := NewBalloonController(srv.sock, capacity, nil)
+	b.SeedAppliedAllocatable(previousAlloc)
+	cfg := &config.SandboxConfig{
+		Resources: config.ResourcesConfig{
+			Capacity:    config.CapacityConfig{Memory: "8GiB"},
+			Allocatable: config.AllocatableConfig{Memory: "1GiB"},
+		},
+	}
+	cfg.ApplyDefaults()
+	h := &ControllerHooks{
+		opts: ControllerHookOptions{
+			SocketPath: "/run/node-resource-controller.sock",
+			CgroupPath: cgroup,
+			Balloon:    b,
+			Logf:       func(string, ...any) {},
+		},
+		cfg:               cfg,
+		allocatableNowMem: previousAlloc,
+		desiredAllocMem:   previousAlloc,
+	}
+
+	if err := h.OnAllocatableChanged(newAlloc); err == nil {
+		t.Fatal("compensated ambiguous resize did not return the original failure")
+	}
+	gotHigh, err := os.ReadFile(memoryHigh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotHigh) != string(previousHigh) {
+		t.Fatalf("memory.high = %q after compensation, want %q", gotHigh, previousHigh)
+	}
+	if got := h.AllocatableNowMem(); got != previousAlloc {
+		t.Fatalf("applied allocation = %d after compensation, want %d", got, previousAlloc)
+	}
+	if got := b.CurrentTarget(); got != previousBalloon {
+		t.Fatalf("balloon target = %d after compensation, want %d", got, previousBalloon)
+	}
+	if got := b.CurrentActual(); got != previousBalloon {
+		t.Fatalf("balloon actual = %d after compensation, want %d", got, previousBalloon)
+	}
+	if got := srv.currentSize(); got != previousBalloon {
+		t.Fatalf("Cloud Hypervisor target = %d after compensation, want %d", got, previousBalloon)
+	}
+	if calls := srv.seen(); len(calls) != 2 || calls[0] != capacity-newAlloc || calls[1] != previousBalloon {
+		t.Fatalf("resize calls = %v, want attempted %d then compensation %d", calls, capacity-newAlloc, previousBalloon)
+	}
+}
+
+func TestHooks_AmbiguousBalloonDoesNotReturnBeforeResolution(t *testing.T) {
+	const (
+		capacity      = uint64(8 << 30)
+		previousAlloc = uint64(2 << 30)
+		newAlloc      = uint64(3 << 30)
+	)
+	cgroup := t.TempDir()
+	memoryHigh := filepath.Join(cgroup, "memory.high")
+	previousHigh := []byte("1879048192\n")
+	if err := os.WriteFile(memoryHigh, previousHigh, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := newFakeCHResize(t)
+	srv.setCurrent(capacity - previousAlloc)
+	srv.dropAckNext(100)
+	srv.failInfoNext(100)
+	b := NewBalloonController(srv.sock, capacity, nil)
+	b.SeedAppliedAllocatable(previousAlloc)
+	cfg := &config.SandboxConfig{
+		Resources: config.ResourcesConfig{
+			Capacity:    config.CapacityConfig{Memory: "8GiB"},
+			Allocatable: config.AllocatableConfig{Memory: "1GiB"},
+		},
+	}
+	cfg.ApplyDefaults()
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	h := &ControllerHooks{
+		opts: ControllerHookOptions{
+			SocketPath: "/run/node-resource-controller.sock",
+			CgroupPath: cgroup,
+			Balloon:    b,
+			Logf:       func(string, ...any) {},
+		},
+		cfg:               cfg,
+		lifetimeCtx:       ctx,
+		allocatableNowMem: previousAlloc,
+		desiredAllocMem:   previousAlloc,
+	}
+
+	started := time.Now()
+	err := h.OnAllocatableChanged(newAlloc)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ambiguous resize error = %v, want context deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed < 100*time.Millisecond {
+		t.Fatalf("ambiguous resize returned before fail-closed resolution window: %v", elapsed)
+	}
+	if calls := srv.seen(); len(calls) < 2 {
+		t.Fatalf("ambiguous resize did not attempt explicit compensation: %v", calls)
+	}
+	gotHigh, readErr := os.ReadFile(memoryHigh)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(gotHigh) != string(previousHigh) {
+		t.Fatalf("memory.high = %q after cancelled resolution, want %q", gotHigh, previousHigh)
+	}
+	if got := h.AllocatableNowMem(); got != previousAlloc {
+		t.Fatalf("ambiguous allocation was published as %d, want retained %d", got, previousAlloc)
 	}
 }
 

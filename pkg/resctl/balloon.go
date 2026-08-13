@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -173,21 +174,82 @@ func (b *BalloonController) ApplyAllocatableEventually(ctx context.Context, allo
 
 func (b *BalloonController) applyAllocatable(ctx context.Context, allocBytes uint64, retainOnFailure bool) error {
 	b.defaults()
+	b.reconcileMu.Lock()
+	defer b.reconcileMu.Unlock()
+
 	previous := b.target.Load()
+	previousActual := b.actual.Load()
 	target := b.targetForAllocatable(allocBytes)
 	b.target.Store(target)
-	if err := b.applyExactTarget(ctx, target); err != nil {
+	if err := b.applyTargetLocked(ctx, target); err != nil {
 		// Dynamic controller budgets must not remain queued: ControllerHooks
 		// keeps reporting the previous applied allocation, so a later untracked
 		// resize would make StateSync undercount the consumer. Static restore
 		// correction deliberately retains the target for retry. In rollback mode,
 		// preserve a concurrent Hint/SetTarget instead of overwriting it.
 		if !retainOnFailure {
+			committed, resolutionErr := b.resolveAmbiguousResizeLocked(ctx, target, previousActual)
+			if committed {
+				return nil
+			}
 			b.target.CompareAndSwap(target, previous)
+			if resolutionErr != nil {
+				return errors.Join(err, fmt.Errorf("resolve ambiguous balloon resize: %w", resolutionErr))
+			}
 		}
 		return err
 	}
 	return nil
+}
+
+// resolveAmbiguousResizeLocked establishes a known Cloud Hypervisor target
+// after vm.resize returned without a definitive acknowledgement. A successful
+// vm.info observation of target commits the original operation. Otherwise an
+// explicit resize restores the last acknowledged target. It retries while the
+// sandbox lifetime is live: returning an unknown result would let StateSync
+// undercount a grant that CH may already have applied. Caller holds reconcileMu.
+func (b *BalloonController) resolveAmbiguousResizeLocked(ctx context.Context, target, previous uint64) (bool, error) {
+	observed, infoErr := b.readDesiredBalloon(ctx)
+	if infoErr == nil && observed == target {
+		b.actual.Store(target)
+		b.Logf("balloon: confirmed ambiguous resize at %d MiB", target>>20)
+		return true, nil
+	}
+
+	// A non-target vm.info value is not enough to prove rollback: CH's
+	// balloon resize mutates the device target before signalling its config
+	// interrupt, so an HTTP error can leave device state changed while the
+	// published VmConfig still contains the old value. Require an explicitly
+	// acknowledged idempotent resize to the last known target.
+	backoff := 25 * time.Millisecond
+	observationErr := infoErr
+	if infoErr == nil {
+		observationErr = fmt.Errorf("vm.info balloon target=%d, want %d", observed, target)
+	}
+	lastErr := observationErr
+	for {
+		if err := b.callResize(ctx, previous); err == nil {
+			b.actual.Store(previous)
+			b.Logf("balloon: compensated ambiguous resize to %d MiB", previous>>20)
+			return false, nil
+		} else {
+			// Keep diagnostics bounded even if CH is unavailable for hours.
+			lastErr = errors.Join(observationErr, fmt.Errorf("compensating vm.resize: %w", err))
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, errors.Join(lastErr, ctx.Err())
+		case <-timer.C:
+		}
+		if backoff < time.Second {
+			backoff *= 2
+			if backoff > time.Second {
+				backoff = time.Second
+			}
+		}
+	}
 }
 
 // SeedAppliedAllocatable initializes the desired and applied balloon target
@@ -369,16 +431,6 @@ func (b *BalloonController) Reconcile(ctx context.Context) error {
 	return b.applyTargetLocked(ctx, b.target.Load())
 }
 
-// applyExactTarget serializes one explicit resize target. Reconcile snapshots
-// the latest general policy target; controller budget application passes its
-// own target so a concurrent mem-report Hint cannot make a successful call
-// commit a different resize than the allocation ControllerHooks records.
-func (b *BalloonController) applyExactTarget(ctx context.Context, target uint64) error {
-	b.reconcileMu.Lock()
-	defer b.reconcileMu.Unlock()
-	return b.applyTargetLocked(ctx, target)
-}
-
 // applyTargetLocked applies exactly target. Caller holds reconcileMu.
 func (b *BalloonController) applyTargetLocked(ctx context.Context, target uint64) error {
 	// Record the attempt time regardless of whether a resize is actually
@@ -418,6 +470,35 @@ func (b *BalloonController) callResize(ctx context.Context, sizeBytes uint64) er
 		return fmt.Errorf("vm.resize: HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (b *BalloonController) readDesiredBalloon(ctx context.Context) (uint64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://ch/api/v1/vm.info", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("vm.info: HTTP %d", resp.StatusCode)
+	}
+	var info struct {
+		Config struct {
+			Balloon *struct {
+				Size uint64 `json:"size"`
+			} `json:"balloon"`
+		} `json:"config"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return 0, fmt.Errorf("vm.info: decode: %w", err)
+	}
+	if info.Config.Balloon == nil {
+		return 0, errors.New("vm.info: balloon missing")
+	}
+	return info.Config.Balloon.Size, nil
 }
 
 func abs64(x int64) int64 {
