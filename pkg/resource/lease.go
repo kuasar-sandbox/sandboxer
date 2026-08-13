@@ -88,6 +88,12 @@ type LeaseHandle struct {
 }
 
 func CreateLease(l Lease) (*LeaseHandle, error) {
+	return createLease(l, nil)
+}
+
+// createLease's hook is test-only fault injection immediately before atomic
+// publication. Production always calls CreateLease, which passes nil.
+func createLease(l Lease, beforePublish func(string, *os.File)) (*LeaseHandle, error) {
 	if err := l.Validate(); err != nil {
 		return nil, err
 	}
@@ -96,34 +102,63 @@ func CreateLease(l Lease) (*LeaseHandle, error) {
 		return nil, fmt.Errorf("lease mkdir %s: %w", dir, err)
 	}
 	path := LeasePath(l.ControllerSocket, l.SandboxID)
-	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	payload, err := json.Marshal(l)
 	if err != nil {
-		return nil, fmt.Errorf("lease open %s: %w", path, err)
+		return nil, fmt.Errorf("lease encode: %w", err)
 	}
-	f := os.NewFile(uintptr(fd), "sandbox-resource-lease")
-	if f == nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("lease adopt fd")
+	f, err := os.CreateTemp(dir, "."+LeaseFilename(l.SandboxID)+".tmp-*")
+	if err != nil {
+		return nil, fmt.Errorf("lease create temporary file: %w", err)
 	}
+	tempPath := f.Name()
+	published := false
 	fail := func(cause error) (*LeaseHandle, error) {
 		_ = f.Close()
+		if !published {
+			_ = os.Remove(tempPath)
+		}
 		return nil, cause
+	}
+	if err := f.Chmod(0o600); err != nil {
+		return fail(fmt.Errorf("lease chmod temporary file: %w", err))
 	}
 	lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 0}
 	if err := unix.FcntlFlock(f.Fd(), unix.F_SETLK, &lock); err != nil {
-		return fail(fmt.Errorf("lease %s is locked by another sandbox: %w", path, err))
+		return fail(fmt.Errorf("lease lock temporary file: %w", err))
 	}
-	payload, err := json.Marshal(l)
-	if err != nil {
-		return fail(fmt.Errorf("lease encode: %w", err))
-	}
-	if err := f.Truncate(0); err != nil {
-		return fail(fmt.Errorf("lease truncate: %w", err))
-	}
-	if _, err := f.WriteAt(append(payload, '\n'), 0); err != nil {
+	if _, err := f.Write(append(payload, '\n')); err != nil {
 		return fail(fmt.Errorf("lease write: %w", err))
 	}
-	return &LeaseHandle{path: path, file: f}, nil
+	if beforePublish != nil {
+		beforePublish(path, f)
+	}
+	for {
+		if err := unix.Renameat2(unix.AT_FDCWD, tempPath, unix.AT_FDCWD, path, unix.RENAME_NOREPLACE); err == nil {
+			published = true
+			return &LeaseHandle{path: path, file: f}, nil
+		} else if !errors.Is(err, unix.EEXIST) {
+			return fail(fmt.Errorf("lease publish %s: %w", path, err))
+		}
+		removed, err := RemoveUnlockedLease(path)
+		if err != nil {
+			return fail(fmt.Errorf("lease inspect existing %s: %w", path, err))
+		}
+		if removed {
+			continue
+		}
+		owner, locked, err := LeaseLockOwner(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fail(fmt.Errorf("lease inspect existing %s: %w", path, err))
+		}
+		if locked {
+			return fail(fmt.Errorf("lease %s is locked by sandbox process %d", path, owner))
+		}
+		// The pathname appeared or changed after stale cleanup. Retry until
+		// that inode is either removed or shown to have a live owner.
+	}
 }
 
 func (h *LeaseHandle) Path() string {
@@ -238,6 +273,12 @@ func LockOwnerFD(fd uintptr) (ownerPID int, locked bool, err error) {
 // new sandbox process opening and locking the stale inode between inventory
 // inspection and cleanup. removed=false means another process owns the lease.
 func RemoveUnlockedLease(path string) (removed bool, err error) {
+	return removeUnlockedLease(path, nil)
+}
+
+// removeUnlockedLease's hook is test-only fault injection for pathname
+// replacement after open. Production always calls RemoveUnlockedLease.
+func removeUnlockedLease(path string, afterOpen func(string, *os.File)) (removed bool, err error) {
 	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
@@ -251,12 +292,29 @@ func RemoveUnlockedLease(path string) (removed bool, err error) {
 		return false, fmt.Errorf("lease adopt stale fd")
 	}
 	defer f.Close()
+	if afterOpen != nil {
+		afterOpen(path, f)
+	}
 	lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 0}
 	if err := unix.FcntlFlock(f.Fd(), unix.F_SETLK, &lock); err != nil {
 		if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EAGAIN) {
 			return false, nil
 		}
 		return false, err
+	}
+	opened, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	named, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !os.SameFile(opened, named) {
+		return false, nil
 	}
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {

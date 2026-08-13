@@ -159,23 +159,6 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, err
 	}
 
-	// Restore-side controller hooks. Admit happens once we've derived
-	// allocatable_at_snapshot from the bundle's state.json balloon section
-	// (see deriveAllocatableAtSnapshot below).
-	// Balloon is created later (snapCap unknown until snapCfg is parsed),
-	// then late-injected via hooks.SetBalloon. Until then, hooks balloon-
-	// related entry points (SettledRestore, OnAllocatableChanged) treat
-	// Balloon-nil as no-op on the balloon side.
-	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
-		SocketPath: opts.HostCfg.Resources.Control.Controller,
-		CgroupPath: cg.LocalPath(),
-		Logf:       logf,
-	}, opts.HostCfg)
-	if err != nil {
-		return -1, fmt.Errorf("controller dial: %w", err)
-	}
-	defer hooks.Release("normal")
-
 	// Open the snapshot bundle as a single fetch.Stream — file:// is a local
 	// tarstream artifact (hole map from the envelope), manifest:// is
 	// chunk-granular via cache-ctl.
@@ -358,16 +341,15 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	}
 	allocAtSnap := deriveAllocatableAtSnapshot(snapCap, balTarget, balCurrent, balOk)
 
-	// BalloonController, sole writer of /vm.resize. Created once we know
-	// snapCap and allocAtSnap: target is seeded to `cap - allocAtSnap` so
-	// the in-memory state matches what CH will load from state.json when
-	// it starts with --restore. Subsequent SettledRestore decides whether
-	// a runtime correction is needed (initialAlloc != allocAtSnap).
+	// BalloonController, sole writer of /vm.resize. CH restores num_pages
+	// (balTarget), while the effective allocation uses min(target,current).
+	// Seed those separately so an in-flight balloon operation is reconciled
+	// immediately after resume. Subsequent SettledRestore decides whether a
+	// controller/static correction is also needed (initialAlloc != allocAtSnap).
 	var balloonCtl *resctl.BalloonController
-	if allocAtSnap < snapCap {
+	if balOk {
 		balloonCtl = resctl.NewBalloonController(chSock, snapCap, logf)
-		balloonCtl.SetAllocatable(allocAtSnap)
-		hooks.SetBalloon(balloonCtl)
+		balloonCtl.SeedRestoredState(allocAtSnap, balTarget)
 	}
 
 	yamlAlloc, err := opts.HostCfg.AllocatableMemoryBytes()
@@ -383,7 +365,27 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if allocAtSnap > initialAlloc {
 		initialAlloc = allocAtSnap
 	}
+	// Publish the immutable lifecycle lease only when every snapshot field
+	// needed by Admit is available. A stalled manifest fetch must not appear
+	// to restart inventory as a live, full-capacity sandbox that cannot yet
+	// StateSync because it has never been admitted.
+	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
+		SocketPath: opts.HostCfg.Resources.Control.Controller,
+		CgroupPath: cg.LocalPath(),
+		SandboxID:  opts.SandboxID,
+		Context:    sandbox.ControllerWorkContext(ctx),
+		Logf:       logf,
+		Balloon:    balloonCtl,
+	}, opts.HostCfg)
+	if err != nil {
+		return -1, fmt.Errorf("controller dial: %w", err)
+	}
+	defer hooks.Release("normal")
 	if hooks.Enabled() {
+		// The restored balloon already enforces allocAtSnap. Seed that actual
+		// state before Admit so a concurrent reconnect never reports the new
+		// controller's grant until the post-resume correction has succeeded.
+		hooks.SetRestoreAppliedAllocatable(allocAtSnap)
 		// Dynamic mode: controller decides. Floor sent = yaml.allocatable
 		// (controller's 2-tier fallback uses it if headroom can't fit
 		// allocAtSnap).
@@ -398,16 +400,6 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		logf("static mode: bumping initial allocatable from yaml=%d to snapshot allocatable=%d (balloon target/current=%d/%d)",
 			yamlAlloc, allocAtSnap, balTarget, balCurrent)
 	}
-	// Record initialAlloc in hooks' in-memory state. No external write
-	// here: cgroup memory.high is deferred to SettledRestore (Issue 4 —
-	// PSI throttling during uffd-driven replay), and balloon already
-	// reflects allocAtSnap from the snapshot (any correction needed
-	// when initialAlloc != allocAtSnap also happens in SettledRestore,
-	// after vm.resume).
-	if hooks != nil {
-		hooks.SetAllocatableNow(initialAlloc)
-	}
-
 	// state.json restored verbatim (vCPU regs, virtio queue indices —
 	// nothing path-dependent).
 	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), entries["state.json"], 0o644); err != nil {
@@ -585,7 +577,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			// --kernel/--vsock; --console/--serial are restored from the
 			// snapshot bundle (taken with `--console tty --serial off`),
 			// so we don't repeat them. consoleArg is unused here.
-			cmd := exec.CommandContext(ctx, opts.CHBinary)
+			cmd := exec.CommandContext(sandbox.VMLifecycleContext(ctx), opts.CHBinary)
 			_, cleanup, err := opts.StdioMode.SetupCHStdio(cmd)
 			if err != nil {
 				return nil, nil, fmt.Errorf("stdio: %w", err)
@@ -612,10 +604,10 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		// non-nil return aborts the run (ServeAndWait kills CH); we
 		// don't hand back a sandbox whose guest agent is unreachable.
 		PostSpawn: func(pc sandbox.PostSpawnCtx) error {
-			if err := chapi.WaitReady(ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
+			if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
 			}
-			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).Resume(); err != nil {
+			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).ResumeContext(pc.Ctx); err != nil {
 				return fmt.Errorf("vm.resume: %w", err)
 			}
 			pc.Logf("VM resumed, vCPU running")
@@ -623,13 +615,13 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			tRestore := time.Now()
 			// 0 = no forced timeout: DialRaw needs a finite value, so fall back
 			// to noForcedTimeout (effective-infinity; cancellation still flows
-			// via ctx → CH teardown closing the vsock conn).
+			// via pc.Ctx → CH teardown closing the vsock conn).
 			restoreDeadline := opts.HostCfg.RestoreDeadline()
 			if restoreDeadline <= 0 {
 				restoreDeadline = config.NoForcedTimeout
 			}
 			muxSpec, err := openAndEstablishRestoreMUX(func() (net.Conn, proto.StdioSpec, error) {
-				return guestlink.OpenMUXViaRestore(pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline)
+				return guestlink.OpenMUXViaRestoreContext(pc.Ctx, pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline)
 			}, pc.EstablishMUX, pc.NotifyReady)
 			if err != nil {
 				return err
@@ -637,8 +629,8 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			pc.Logf("restore notify acked in %dµs (stdio MUX re-established: tty=%v); starting ping ticker",
 				time.Since(tRestore).Microseconds(), muxSpec.TTY)
 			pc.Pinger.Start(pc.Ctx)
-			// Balloon reconcile: idempotent — if initialAlloc ==
-			// allocAtSnap, target matches what CH loaded from state.json.
+			// Balloon reconcile is a no-op only when CH's restored target already
+			// matches the effective allocation; an in-flight snapshot is corrected.
 			if pc.Balloon != nil {
 				if err := pc.Balloon.Start(pc.Ctx); err != nil {
 					pc.Logf("balloon: start: %v", err)
@@ -650,7 +642,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			// Issue 4) using allocatable_now; corrects balloon only when
 			// initialAlloc != allocAtSnap.
 			if pc.Hooks != nil {
-				if err := pc.Hooks.SettledRestore(allocAtSnap); err != nil {
+				if err := pc.Hooks.SettledRestore(allocAtSnap, initialAlloc); err != nil {
 					pc.Logf("settled-restore: %v (continuing)", err)
 				}
 				if pc.Hooks.Enabled() {

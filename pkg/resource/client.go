@@ -1,6 +1,7 @@
 package resource
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -49,12 +50,20 @@ type Client struct {
 // Connect dials the controller socket. Idempotent: re-dialing closes
 // the previous connection.
 func (c *Client) Connect() error {
+	return c.ConnectContext(context.Background())
+}
+
+func (c *Client) ConnectContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn != nil {
 		_ = c.conn.Close()
+		c.conn = nil
 	}
-	conn, err := net.DialTimeout("unix", c.SocketPath, 5*time.Second)
+	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", c.SocketPath)
 	if err != nil {
 		return fmt.Errorf("client: dial %s: %w", c.SocketPath, err)
 	}
@@ -91,26 +100,73 @@ func (c *Client) Token() string {
 // roundTrip writes req and reads exactly one reply. Holds the mutex
 // for the duration. Caller must avoid concurrent calls.
 func (c *Client) roundTrip(req *Message, deadline time.Duration) (*Message, error) {
+	return c.roundTripContext(context.Background(), req, deadline)
+}
+
+func (c *Client) roundTripContext(ctx context.Context, req *Message, deadline time.Duration) (*Message, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn == nil {
 		return nil, errors.New("client: not connected")
 	}
+	conn := c.conn
+	deadlineAt := time.Time{}
 	if deadline > 0 {
-		_ = c.conn.SetDeadline(time.Now().Add(deadline))
+		deadlineAt = time.Now().Add(deadline)
 	}
-	if err := WriteMessage(c.conn, req); err != nil {
-		_ = c.conn.Close()
+	if ctxDeadline, ok := ctx.Deadline(); ok && (deadlineAt.IsZero() || ctxDeadline.Before(deadlineAt)) {
+		deadlineAt = ctxDeadline
+	}
+	if !deadlineAt.IsZero() {
+		_ = conn.SetDeadline(deadlineAt)
+	}
+	// net.Conn permits concurrent deadline updates. Interrupt an in-flight
+	// read/write on cancellation without waiting for Client.mu, which this RPC
+	// deliberately holds for the one-outstanding-request contract.
+	stopContextWatch := func() {}
+	if ctxDone := ctx.Done(); ctxDone != nil {
+		stopWatch := make(chan struct{})
+		watchDone := make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			select {
+			case <-ctxDone:
+				_ = conn.SetDeadline(time.Now())
+			case <-stopWatch:
+			}
+		}()
+		var stopOnce sync.Once
+		stopContextWatch = func() {
+			stopOnce.Do(func() {
+				close(stopWatch)
+				<-watchDone
+			})
+		}
+	}
+	defer stopContextWatch()
+
+	if err := WriteMessage(conn, req); err != nil {
+		_ = conn.Close()
 		c.conn = nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, &TransportError{Err: err}
 	}
-	resp, err := ReadMessage(c.conn)
+	resp, err := ReadMessage(conn)
 	if err != nil {
-		_ = c.conn.Close()
+		_ = conn.Close()
 		c.conn = nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, &TransportError{Err: err}
 	}
-	_ = c.conn.SetDeadline(time.Time{})
+	stopContextWatch()
+	_ = conn.SetDeadline(time.Time{})
 	if resp.Type == TypeError {
 		return resp, &ControllerError{Message: resp.Msg}
 	}
@@ -160,7 +216,11 @@ type AdmitResult struct {
 // the admission worker holds it in the server-side FIFO queue, so the
 // Admit call simply takes as long as queuing takes.
 func (c *Client) Admit(p AdmitParams) (*AdmitResult, error) {
-	resp, err := c.roundTrip(&Message{
+	return c.AdmitContext(context.Background(), p)
+}
+
+func (c *Client) AdmitContext(ctx context.Context, p AdmitParams) (*AdmitResult, error) {
+	resp, err := c.roundTripContext(ctx, &Message{
 		Type:                  TypeAdmit,
 		SandboxID:             p.SandboxID,
 		CapacityMemoryBytes:   p.CapacityMemoryBytes,
@@ -204,7 +264,11 @@ func (c *Client) Reattach(token string) error {
 // StateSync. It also returns the old controller's current allocation so the
 // caller can apply it before resuming requests.
 func (c *Client) ReattachState(token string) (uint64, error) {
-	resp, err := c.roundTrip(&Message{Type: TypeReattach, Token: token}, DeadlineAdmit)
+	return c.ReattachStateContext(context.Background(), token)
+}
+
+func (c *Client) ReattachStateContext(ctx context.Context, token string) (uint64, error) {
+	resp, err := c.roundTripContext(ctx, &Message{Type: TypeReattach, Token: token}, DeadlineAdmit)
 	if err != nil {
 		return 0, err
 	}
@@ -231,7 +295,11 @@ type StateSyncResult struct {
 }
 
 func (c *Client) StateSync(p StateSyncParams) (*StateSyncResult, error) {
-	resp, err := c.roundTrip(&Message{
+	return c.StateSyncContext(context.Background(), p)
+}
+
+func (c *Client) StateSyncContext(ctx context.Context, p StateSyncParams) (*StateSyncResult, error) {
+	resp, err := c.roundTripContext(ctx, &Message{
 		Type:                     TypeStateSync,
 		SandboxID:                p.SandboxID,
 		AppliedAllocatableMemory: p.AppliedAllocatableMemory,
@@ -255,13 +323,17 @@ func (c *Client) StateSync(p StateSyncParams) (*StateSyncResult, error) {
 // transition. Called by the launch hello handler / SendRestore success
 // path.
 func (c *Client) Settled(rss, cpuUsec uint64) error {
+	return c.SettledContext(context.Background(), rss, cpuUsec)
+}
+
+func (c *Client) SettledContext(ctx context.Context, rss, cpuUsec uint64) error {
 	c.mu.Lock()
 	tok := c.token
 	c.mu.Unlock()
 	if tok == "" {
 		return errors.New("client: no token")
 	}
-	resp, err := c.roundTrip(&Message{
+	resp, err := c.roundTripContext(ctx, &Message{
 		Type:           TypeSettled,
 		Token:          tok,
 		CurrentRSS:     rss,
@@ -279,6 +351,10 @@ func (c *Client) Settled(rss, cpuUsec uint64) error {
 // RequestBudget asks for a memory budget delta. Returns granted_delta
 // (may be 0) and the cooldown the caller should respect before retrying.
 func (c *Client) RequestBudget(currentAlloc, requestedDelta uint64, urgency, reason string) (granted uint64, newAlloc uint64, cooldownMs int64, err error) {
+	return c.RequestBudgetContext(context.Background(), currentAlloc, requestedDelta, urgency, reason)
+}
+
+func (c *Client) RequestBudgetContext(ctx context.Context, currentAlloc, requestedDelta uint64, urgency, reason string) (granted uint64, newAlloc uint64, cooldownMs int64, err error) {
 	c.mu.Lock()
 	tok := c.token
 	c.mu.Unlock()
@@ -286,7 +362,7 @@ func (c *Client) RequestBudget(currentAlloc, requestedDelta uint64, urgency, rea
 		err = errors.New("client: no token")
 		return
 	}
-	resp, e := c.roundTrip(&Message{
+	resp, e := c.roundTripContext(ctx, &Message{
 		Type:           TypeRequestBudget,
 		Token:          tok,
 		CurrentAlloc:   currentAlloc,
@@ -318,13 +394,17 @@ type HeartbeatResult struct {
 // returns the controller's authoritative allocatable_now for delta-
 // tracking.
 func (c *Client) Heartbeat(rss, cpuUsec, recentHigh, cpuThrottled uint64) (*HeartbeatResult, error) {
+	return c.HeartbeatContext(context.Background(), rss, cpuUsec, recentHigh, cpuThrottled)
+}
+
+func (c *Client) HeartbeatContext(ctx context.Context, rss, cpuUsec, recentHigh, cpuThrottled uint64) (*HeartbeatResult, error) {
 	c.mu.Lock()
 	tok := c.token
 	c.mu.Unlock()
 	if tok == "" {
 		return nil, errors.New("client: no token")
 	}
-	resp, err := c.roundTrip(&Message{
+	resp, err := c.roundTripContext(ctx, &Message{
 		Type:                TypeHeartbeat,
 		Token:               tok,
 		CurrentRSS:          rss,

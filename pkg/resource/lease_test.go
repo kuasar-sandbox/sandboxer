@@ -3,6 +3,7 @@ package resource
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -116,5 +117,101 @@ func TestRemoveUnlockedLeaseRechecksAndRemovesStaleRecord(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("stale lease remains: %v", err)
+	}
+}
+
+func TestRemoveUnlockedLeaseDoesNotUnlinkReplacementPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stale.json")
+	if err := os.WriteFile(path, []byte("stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var hookErr error
+	removed, err := removeUnlockedLease(path, func(path string, _ *os.File) {
+		if hookErr = os.Remove(path); hookErr != nil {
+			return
+		}
+		hookErr = os.WriteFile(path, []byte("replacement\n"), 0o600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if removed {
+		t.Fatal("cleanup reported removing an inode it did not open")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "replacement\n" {
+		t.Fatalf("replacement pathname content = %q", got)
+	}
+}
+
+func TestCreateLeaseAtomicallyPublishesLockedCompleteInodeAfterStaleRace(t *testing.T) {
+	dir := t.TempDir()
+	lease := Lease{
+		Version: LeaseVersion, SandboxID: "open-lock-race", PID: os.Getpid(),
+		ControllerSocket: filepath.Join(dir, "controller.sock"), CgroupPath: filepath.Join(dir, "cgroup"),
+		CapacityMemory: 1024, CapacityCPUMilli: 1000,
+		FloorMemory: 256, FloorCPUMilli: 500, StartupMemory: 512,
+	}
+	path := LeasePath(lease.ControllerSocket, lease.SandboxID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var temporary os.FileInfo
+	var hookErr error
+	handle, err := createLease(lease, func(path string, temporaryFile *os.File) {
+		temporary, hookErr = temporaryFile.Stat()
+		if hookErr != nil {
+			return
+		}
+		visible, readErr := os.ReadFile(path)
+		if readErr != nil {
+			hookErr = readErr
+			return
+		}
+		if string(visible) != "stale\n" {
+			hookErr = fmt.Errorf("stable pathname exposed unpublished content %q", visible)
+			return
+		}
+		if hookErr = os.Remove(path); hookErr != nil {
+			return
+		}
+		hookErr = os.WriteFile(path, []byte("replacement\n"), 0o600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handleInfo, err := handle.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(handleInfo, current) {
+		t.Fatal("lease handle does not own the inode reachable by pathname")
+	}
+	if !os.SameFile(temporary, current) {
+		t.Fatal("published lease is not the completely written temporary inode")
+	}
+	got, err := ReadLease(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SandboxID != lease.SandboxID || got.PID != lease.PID {
+		t.Fatalf("lease = %+v", got)
 	}
 }

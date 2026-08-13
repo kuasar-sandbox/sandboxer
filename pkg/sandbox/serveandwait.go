@@ -64,7 +64,10 @@ type CmdEnv struct {
 //     Launch.LaunchAckDone, then return nil (fire-and-forget).
 //   - restore: synchronously waitAPI → /vm.resume → guestlink.OpenMUXViaRestore →
 //     EstablishMUX → guestlink.Pinger.Start → Balloon.Start → Hooks.SettledRestore;
-//     a non-nil return aborts the run (ServeAndWait kills CH).
+//     Ctx is cancelled by a retained shutdown signal so every synchronous
+//     barrier unwinds. A non-signal error aborts and kills CH; a retained signal
+//     continues into the normal graceful CH shutdown/escalation path while
+//     backend services remain on their separate VM lifecycle context.
 type PostSpawnCtx struct {
 	Ctx          context.Context
 	Cmd          *exec.Cmd
@@ -209,6 +212,9 @@ type SnapDiskRef struct {
 // parts — config resolution, the CH cmdline, the post-spawn settle
 // protocol — stay in the callers via VMParams.BuildCmd / PostSpawn.
 func ServeAndWait(p VMParams) (int, error) {
+	if err := p.Ctx.Err(); err != nil {
+		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
+	}
 	logf := p.Logf
 	readiness := newReadinessEmitter(p.NotifyReadiness)
 	runDir := p.RunDir
@@ -222,7 +228,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	// servers run under (and the stdio MUX bridge). Cancelled when CH
 	// exits (or earlier via signal escalation); the deferred cancel is a
 	// backstop for the early-error returns below.
-	backendCtx, cancelBackends := context.WithCancel(p.Ctx)
+	backendCtx, cancelBackends := context.WithCancel(VMLifecycleContext(p.Ctx))
 	defer cancelBackends()
 
 	// Exactly one stdio MUX at a time; which conn backs it changes across
@@ -555,10 +561,27 @@ func ServeAndWait(p VMParams) (int, error) {
 		return -1, fmt.Errorf("cgroup: configure CH process: %w", err)
 	}
 
-	sigCh := make(chan os.Signal, 4)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(sigCh)
+	// sandbox-ctl registers this stream before Admit so an early shutdown cannot
+	// fall between admission and CH signal registration. Library callers without
+	// that context retain the original local registration behavior.
+	var sigCh <-chan os.Signal
+	if inherited := runSignalsFromContext(p.Ctx); inherited != nil {
+		sigCh = inherited
+	} else {
+		localSignals := make(chan os.Signal, 4)
+		signal.Notify(localSignals, syscall.SIGTERM, syscall.SIGINT)
+		defer signal.Stop(localSignals)
+		sigCh = localSignals
+	}
 
+	// A shutdown received while BuildCmd or any preceding setup was in flight
+	// must not create a new VM. The retained signal is consumed below only when
+	// CH crossed this final pre-spawn boundary.
+	if err := p.Ctx.Err(); err != nil {
+		cancelBackends()
+		backendWG.Wait()
+		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
+	}
 	if err := startCH(cmd, p.NetnsFile); err != nil {
 		cancelBackends()
 		backendWG.Wait()
@@ -577,7 +600,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	})
 
 	if err := p.PostSpawn(PostSpawnCtx{
-		Ctx:          backendCtx,
+		Ctx:          p.Ctx,
 		Cmd:          cmd,
 		Pinger:       pinger,
 		Launch:       launch,
@@ -588,10 +611,16 @@ func ServeAndWait(p VMParams) (int, error) {
 		Logf:         logf,
 		NotifyReady:  readiness.notifyReady,
 	}); err != nil {
-		_ = cmd.Process.Kill()
-		cancelBackends()
-		backendWG.Wait()
-		return -1, err
+		if !runShutdownRequested(p.Ctx) {
+			_ = cmd.Process.Kill()
+			cancelBackends()
+			backendWG.Wait()
+			return -1, err
+		}
+		// A retained signal interrupted the synchronous restore barrier. Keep
+		// backend services alive and fall through so the queued signal drives
+		// the normal CH shutdown/escalation protocol.
+		logf("post-spawn interrupted by shutdown: %v", err)
 	}
 
 	doneCh := make(chan error, 1)

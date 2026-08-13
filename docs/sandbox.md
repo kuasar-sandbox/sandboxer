@@ -96,7 +96,7 @@ sandbox-ctl 是 CH 的父进程。CH 退出 → sandbox-ctl 收 SIGCHLD → 优�
 | CH 崩溃 | sandbox-ctl 收 SIGCHLD | 整 sandbox 销毁 |
 | sandbox-ctl 崩溃 | CH 失去父进程 + uffd handler 没了 | vCPU 卡 fault → 上层 supervisor SIGKILL CH |
 | stdio MUX 连接断(vsock 异常) | 应用 stdio 转发中断(应用因反压在 write 上阻塞) | sandbox-ctl 拨新连接 `attach` 重建并续传;`attach` 也失败 → 计入指标,由上层决策 |
-| node-ctl 不可达(动态控制模式) | 长连断 | 退避重连 5×;持续 60s 失败切到无控制器降级模式 |
+| node-ctl 不可达(动态控制模式) | 长连断、budget 暂停 | 保持最后实际应用额度;单一 jitter 指数退避 loop 持续重连,StateSync 恢复;不回退 floor、不销毁 VM |
 | 单沙箱 OOM | guest 内进程被 kill;deflate_on_oom 释放 balloon | 非平台级故障 |
 | 资源开销 | sandbox-ctl Go runtime ~10-15 MiB;CH 自身 ~13 MiB | blk1.diff 是 sparse 文件,实际 = 已写 sectors |
 
@@ -225,7 +225,10 @@ sandbox-ctl 控制终端的前台进程组——终端产生的 `^C` / `^\` / `^
 信号(SIGTERM/SIGINT)由 sandbox-ctl 统一处理(只在此一处注册),收到即转发 SIGTERM
 给 CH、宽限后 SIGKILL(与 [`sandbox-init.md`](sandbox-init.md) §3.3 的退出
 序列衔接)。`--tty` raw 模式下终端是 raw 的、`^C` 不产生 SIGINT(见上);非 raw 模式
-下 `^C` 正常触发上述 SIGTERM 升级链。
+下 `^C` 正常触发上述 SIGTERM 升级链。signal source 在 Admit 前注册:CH 尚未 spawn
+则取消 image/manifest/controller 等 pre-spawn 工作并 fail closed;CH 已 spawn 则中断
+`WaitReady`、`/vm.resume`、`restore_ack` 等同步 barrier,但 vhost/vsock backend 保持到
+queued signal 完成上述 CH 优雅关闭/升级,不会由 `exec.CommandContext` 直接 SIGKILL。
 
 **启动 readiness wire**:`--ready-fd=N` 是调用方提供的一次性观察通道。成功 wire
 严格为 `control_ready\nready\nEOF`;每个事件最多一次且不能反序。语义如下:
@@ -543,7 +546,7 @@ resources:
 
   control:                     # 部署模式驱动
     cgroup_path: ""            # 空 = 无 cgroup 模式;非空 = 必须已存在的 cgroup 绝对路径
-    controller: ""             # 空 = 无 cgroup / 静态 cgroup 模式;非空 = 动态控制模式(UDS 路径)
+    controller: ""             # 空 = 无 cgroup / 静态 cgroup 模式;非空 = 动态控制模式(文件型 UDS 路径,不支持 @abstract)
     sensor:                    # 压力感知器(动态控制模式;§10.3),可选,缺省 psi 默认值
       mode: psi                # psi | events_poll | none;psi 失败自动回落 events_poll
       psi_some_stall_us: 10000 # PSI trigger:1s 窗口累计 10ms stall 触发(密集 workload 实测甜点)
@@ -1200,7 +1203,8 @@ T2   tap 源验证已存在 TAP;tapfd 与无网络源跳过 TAP 名验证;
 T3   准备 overlay diff:已存在→按 crypto.local policy 打开(绝不 truncate,忽略 template);
      不存在→从 diff_template 的逻辑 sparse view 初始化 / 按 base 大小新建 blank upper;
      新文件编码由 crypto.local 决定(详见 §3.2.2)
-T4   动态控制模式:dial controller, send Admit, 收 grant 后继续(详见 §10)
+T4   动态控制模式:先创建并锁定 immutable lifecycle lease(每生命周期只写一次),
+     再 dial controller/send Admit,收 grant 后继续(详见 §10)
 T5   cgroup setup:打开目标 cgroup FD + 写 cgroup limits
      (后续 fork 的 CH 自然在同 cgroup)
 T6   memory 准备(统一模型,冷启动 + 恢复同):
@@ -1710,7 +1714,9 @@ T15 vsock 连接发 restore{epoch=N, wallclock_ns} 给 sandbox-init(guest:5000 l
      `OK <port>` 前短暂 EOF/reset,host 在同一总 deadline 内退避重拨(最多 2 s);
      请求尚未发送,因此不会重放。`restore` 一经写入,后续写/读/协议错误均不重试。
      deadline 到点未收到 restore_ack →
-     restore 失败回退:CH /vm.shutdown 并向调用方报错
+     restore 失败回退:CH /vm.shutdown 并向调用方报错。若此 barrier 收到 host
+     SIGTERM/SIGINT,context 会立即打断 CH API/vsock I/O,随后由已缓存 signal 进入
+     正常 CH shutdown → grace → SIGKILL 升级链;backend 不会先于 CH 被撤掉
 T16 vCPU 跑,fault 流转见 §8 uffd handler;balloon EVENT_REMOVE 同冷启动
 T17 user app 退出 / 接收外部信号 → 退出流程同冷启动
 ```
@@ -2336,7 +2342,7 @@ host 上更早调高 `memory.high` → 缩短 / 消除 `mem_cgroup_handle_over_h
 不采纳:guest balloon STATS_VQ(5 s 周期太粗);uffd fault rate(信号扭曲);
 guest 内进程级压力(跨 host/guest 边界,接口复杂)。
 
-### 10.4 长连维持与降级
+### 10.4 长连维持与自动恢复
 
 **长连维持**:
 
@@ -2344,13 +2350,60 @@ guest 内进程级压力(跨 host/guest 边界,接口复杂)。
   Heartbeat ack 的 `new_allocatable` 接收 reclaim/admin 的 allocatable 调整
 - 30s 周期 Heartbeat;控制器 90s(3 个周期)未收到 → 视为掉线
 
-**断连降级**:
+**断连恢复**:
 
-- 连接断开,sandbox-ctl 退避重试(1s, 2s, 5s, 10s, 10s, ...)
-- 持续 60s 重连失败 → 切到无控制器模式继续:保持当前 allocatable 不变,接管
-  cgroup memory.high 设置,不再申请 burst
-- 此时即使有新压力,只能靠 cgroup PSI 反压 + deflate_on_oom 兜底
-- 重连成功后自动恢复联动
+- 所有 controller RPC、连接替换和 StateSync 共用同一个 session 串行化边界,
+  每个 sandbox 最多一个 outstanding request;旧连接的迟到 response 不能越过
+  reconnect 更新状态
+- 任意 EOF/reset/broken pipe 后关闭旧连接,保留最后已经同时成功落地到
+  `memory.high` 与 balloon 的 `appliedAllocatable`,暂停新的正向 budget 请求
+- 唯一 reconnect loop 按 100ms 起、上限 5s 的带 jitter 指数退避持续 Connect,
+  不设“超时后切换模式”;controller 长期不可用时 VM 仍按最后 applied 正常运行
+- 新 controller 支持 `state_sync_v1` 时上报 SID、actual applied、settled、RSS 和
+  可选旧 token;验证成功取得新 session token后恢复 Heartbeat/budget。若响应携带
+  不同的非零 `new_allocatable`,也必须先成功应用到 cgroup 与 balloon,否则保持
+  disconnected 并重试同步
+- 旧 controller 不认识 StateSync 时回退 `Reattach(old_token)`。其返回额度只有在
+  cgroup 与 balloon 同步应用成功后才替换本地 applied
+
+任何资源调整均遵守“先落地、后推进状态”:先写 `memory.high`,再同步等待 CH
+`/vm.resize` 成功,最后才更新 `appliedAllocatable`。restore 时先从快照 balloon
+设备记录实际值;新 controller 的 grant 是 desired,post-resume correction 成功前
+StateSync 仍报告快照 actual,不能把旧 controller 意图或新 grant 冒充已应用结果。
+
+### 10.5 lifecycle lease 与 controller 重启
+
+动态模式在第一次 Admit 前创建:
+
+```text
+<controller-socket>.leases/<sha256(sandbox-id)>.json
+```
+
+文件只包含不可变字段:SID、sandbox-ctl PID、controller socket、真实 cgroup
+path、capacity、floor、startup、client features。SID 只参与 SHA-256,不直接成为
+路径;socket 与 cgroup path 均以规范化绝对路径作为跨进程身份。sandbox-ctl 对 FD
+持 POSIX `fcntl` write lock直至沙箱生命周期结束;
+Heartbeat/Grant/StateSync 不更新文件。正常退出在仍持 lock 时 unlink 后 close;
+SIGKILL 则由内核自动释放 lock,controller 扫描时清理 stale 文件。
+
+controller socket 必须是文件系统 UDS;Linux `@name`/NUL abstract 地址无法承载
+同路径派生的 `.owner` 和 `.leases/` inventory,配置校验会直接拒绝。运行时会把
+父目录 symlink 解析为统一 inventory 身份,但 bind/dial 保留原绝对路径(允许用短
+alias 避免 AF_UNIX 路径长度上限);dangling parent、最终组件 symlink 或多
+hard-link socket 因无法唯一确定 owner/inventory 路径而 fail closed。
+
+该创建逻辑同时覆盖 conductor-managed 和直接执行的 `sandbox-ctl run`。managed
+模式中 controller 还会把 lease owner 与 `<run-root>/<sid>/<sid>.pid` 的 owner/PID
+及 `<sid>.yaml` 合同交叉核对。managed YAML 不保存最终 cgroup path;runner 在
+`exec` 时通过 node-owned FD 注入,controller 因而从 `/proc/<owner>/cgroup` 推导
+sibling `vmm` 与 lease 比较。direct 模式没有这些 managed 文件,仍以
+`SO_PEERCRED == lease lock owner` 和允许的 cgroup root认证。
+
+controller 异常重启时先按 live lease capacity 建 provisional 安全上界,再对
+populated cgroup 兜底;listen 后本进程自动 StateSync,以 actual applied 原子替换
+provisional。连接断开、heartbeat timeout、startup TTL 都不能让 controller
+删除仍有 live lease 或 populated cgroup 的消费者。恢复只覆盖同一 host 上
+controller 进程重启;不使用共享 checkpoint/WAL,也不跨 host reboot。
 
 ## 11. 恢复时的资源衔接
 

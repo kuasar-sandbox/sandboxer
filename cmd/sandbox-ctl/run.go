@@ -264,11 +264,11 @@ func runCmd(args []string) int {
 
 	restoreR := *restoreRef
 
-	// Signal handling lives in pkg/sandbox (lifecycle.go /
-	// restore.go) — they own the CH process and forward SIGTERM/SIGINT
-	// to it with SIGKILL escalation. So this layer just passes a plain
-	// context.
-	ctx := context.Background()
+	// Register once before Admit. The resulting context cancels controller work,
+	// while the same buffered signal stream is consumed later by ServeAndWait for
+	// CH forwarding/escalation. This closes the Admit -> CH-start registration gap.
+	ctx, stopRunSignals := sandbox.NotifyRunContext(context.Background())
+	defer stopRunSignals()
 
 	// Restore mode dispatch.
 	if restoreR != "" {

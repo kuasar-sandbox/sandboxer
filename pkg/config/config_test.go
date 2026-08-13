@@ -789,6 +789,14 @@ func TestValidateCold_ResourceControl(t *testing.T) {
 		}, "controller requires resources.control.cgroup_path")
 	})
 
+	t.Run("abstract controller socket", func(t *testing.T) {
+		dir := t.TempDir()
+		run(t, func(c *SandboxConfig) {
+			c.Resources.Control.CgroupPath = dir
+			c.Resources.Control.Controller = "@node-ctl"
+		}, "filesystem Unix socket path")
+	})
+
 	t.Run("overhead without cgroup", func(t *testing.T) {
 		run(t, func(c *SandboxConfig) {
 			c.Resources.Overhead = &OverheadConfig{Memory: "32MiB"}
@@ -878,6 +886,32 @@ func TestValidateCold_ResourceControl(t *testing.T) {
 			c.Resources.Startup = &StartupConfig{Memory: "1500MiB"}
 		}, "")
 	})
+}
+
+func TestValidateRestoreHostConfigRejectsAbstractControllerSocket(t *testing.T) {
+	cfg := &SandboxConfig{}
+	cfg.Resources.Control.CgroupPath = "/sys/fs/cgroup/test"
+	cfg.Resources.Control.Controller = "@node-ctl"
+	if err := cfg.ValidateRestoreHostConfig(); err == nil || !strings.Contains(err.Error(), "filesystem Unix socket path") {
+		t.Fatalf("ValidateRestoreHostConfig abstract controller error = %v", err)
+	}
+}
+
+func TestValidateRestoreHostConfigRejectsControllerWithoutCgroup(t *testing.T) {
+	cfg := &SandboxConfig{}
+	cfg.Resources.Control.Controller = "/run/node-ctl.sock"
+	if err := cfg.ValidateRestoreHostConfig(); err == nil || !strings.Contains(err.Error(), "requires resources.control.cgroup_path") {
+		t.Fatalf("ValidateRestoreHostConfig controller-only error = %v", err)
+	}
+}
+
+func TestValidateRestoreHostConfigRejectsRelativeCgroupPath(t *testing.T) {
+	cfg := &SandboxConfig{}
+	cfg.Resources.Control.CgroupPath = "slice/task"
+	cfg.Resources.Control.Controller = "/run/node-ctl.sock"
+	if err := cfg.ValidateRestoreHostConfig(); err == nil || !strings.Contains(err.Error(), "cgroup_path must be absolute") {
+		t.Fatalf("ValidateRestoreHostConfig relative cgroup error = %v", err)
+	}
 }
 
 func TestResourceControlDefaults(t *testing.T) {

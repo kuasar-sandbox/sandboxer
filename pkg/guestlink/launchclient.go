@@ -1,6 +1,7 @@
 package guestlink
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -87,26 +88,59 @@ func (c *HostClient) RoundTrip(req *proto.Message, deadline time.Duration) (*pro
 // and may keep the conn open (e.g. wrap it in a mux.Session). On any
 // error the conn is closed.
 func (c *HostClient) DialRaw(deadline time.Duration) (net.Conn, error) {
+	return c.DialRawContext(context.Background(), deadline)
+}
+
+// DialRawContext is DialRaw with cancellation for lifecycle barriers. The
+// returned connection still carries the original deadline; cancellation is
+// observed only until the CONNECT/OK handshake has completed.
+func (c *HostClient) DialRawContext(ctx context.Context, deadline time.Duration) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	end := time.Now().Add(deadline)
 	remaining := time.Until(end)
 	if remaining <= 0 {
 		return nil, fmt.Errorf("launchclient: deadline already exceeded")
 	}
-	conn, err := net.DialTimeout("unix", c.BasePath, remaining)
+	dialCtx, cancelDial := context.WithTimeout(ctx, remaining)
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", c.BasePath)
+	cancelDial()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("launchclient: dial %s: %w", c.BasePath, ctxErr)
+		}
 		return nil, fmt.Errorf("launchclient: dial %s: %w", c.BasePath, err)
 	}
 	if err := conn.SetDeadline(end); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("launchclient: set deadline: %w", err)
 	}
-	if _, err := conn.Write(proto.HostConnectLine); err != nil {
+	if ctxErr := ctx.Err(); ctxErr != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("launchclient: write CONNECT: %w", err)
+		return nil, ctxErr
+	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	fail := func(err error) (net.Conn, error) {
+		_ = stopCancel()
+		_ = conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
+	}
+	if _, err := conn.Write(proto.HostConnectLine); err != nil {
+		return fail(fmt.Errorf("launchclient: write CONNECT: %w", err))
 	}
 	if err := drainLine(conn); err != nil {
+		return fail(fmt.Errorf("launchclient: drain OK line: %w", err))
+	}
+	if !stopCancel() {
 		_ = conn.Close()
-		return nil, fmt.Errorf("launchclient: drain OK line: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, context.Canceled
 	}
 	return conn, nil
 }

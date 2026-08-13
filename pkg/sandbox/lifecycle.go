@@ -163,6 +163,14 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if allocBytes < capBytes {
 		balloonCtl = resctl.NewBalloonController(chSock, capBytes, logf)
 	}
+	// Register cgroup cleanup before ControllerHooks.Release so LIFO shutdown
+	// stops every controller goroutine while its pinned cgroup FD is still live.
+	var cg *resctl.CgroupController
+	defer func() {
+		if cg != nil {
+			_ = cg.Cleanup()
+		}
+	}()
 
 	// Controller handshake (dynamic mode) happens before cgroup writes so a
 	// rejected admission leaves no local resource side effects. Admit carries
@@ -170,12 +178,15 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// cgroup descriptor after SetupCgroup below.
 	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
 		SocketPath: opts.Cfg.Resources.Control.Controller,
+		SandboxID:  opts.SandboxID,
+		Context:    ControllerWorkContext(ctx),
 		Logf:       logf,
 		Balloon:    balloonCtl,
 	}, opts.Cfg)
 	if err != nil {
 		return -1, fmt.Errorf("controller dial: %w", err)
 	}
+	defer hooks.Release("normal")
 	if hooks.Enabled() {
 		grantedInitial, err := hooks.Admit(opts.SandboxID, 0)
 		if err != nil {
@@ -197,13 +208,6 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// CgroupPath empty → no-cgroup mode, no cgroup operations.
 	// CgroupPath set → join existing cgroup (must already exist; not
 	// created by sandbox-ctl). See docs/sandbox.md §4.1.
-	var cg *resctl.CgroupController
-	defer func() {
-		hooks.Release("normal")
-		if cg != nil {
-			_ = cg.Cleanup()
-		}
-	}()
 	cgCfg, err := resctl.BuildCgroupConfig(opts.Cfg)
 	if err != nil {
 		return -1, err

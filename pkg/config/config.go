@@ -225,8 +225,13 @@ type ControlConfig struct {
 	// CgroupFD is an inherited runtime capability backing CgroupPath. It is
 	// never serialized; zero means sandbox-ctl should open CgroupPath itself.
 	CgroupFD int `yaml:"-"`
-	// Controller is the UDS path of a sandbox-resource-control protocol
-	// endpoint. Non-empty enables dynamic mode (M2+). Requires CgroupPath.
+	// Controller is the filesystem UDS path of a sandbox-resource-control
+	// protocol endpoint. Linux abstract addresses are unsupported because the
+	// recovery owner lock and lease inventory are derived from this path. At
+	// runtime the bind/dial spelling is retained, while parent symlinks are
+	// canonicalized for inventory; ambiguous final, dangling, or hard-link
+	// aliases fail closed.
+	// Non-empty enables dynamic mode (M2+). Requires CgroupPath.
 	Controller string `yaml:"controller,omitempty"`
 	// Sensor tunes the per-sandbox memory pressure sensor (data source +
 	// reaction). Optional; nil = use PSI mode with default thresholds.
@@ -1042,6 +1047,9 @@ func (c *SandboxConfig) ValidateCold() error {
 	if controllerSet && !cgroupSet {
 		return errors.New("resources.control.controller requires resources.control.cgroup_path")
 	}
+	if err := validateControllerSocket(c.Resources.Control.Controller); err != nil {
+		return err
+	}
 	if !cgroupSet && c.Resources.Overhead != nil {
 		return errors.New("resources.overhead requires resources.control.cgroup_path")
 	}
@@ -1262,6 +1270,15 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	if err := c.Restore.validate(); err != nil {
 		return err
 	}
+	if path := c.Resources.Control.CgroupPath; path != "" && !filepath.IsAbs(path) {
+		return fmt.Errorf("resources.control.cgroup_path must be absolute: %q", path)
+	}
+	if c.Resources.Control.Controller != "" && c.Resources.Control.CgroupPath == "" {
+		return errors.New("resources.control.controller requires resources.control.cgroup_path")
+	}
+	if err := validateControllerSocket(c.Resources.Control.Controller); err != nil {
+		return err
+	}
 	if err := c.Network.validate(); err != nil {
 		return err
 	}
@@ -1289,6 +1306,16 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	}
 	if err := c.Timeouts.validate(); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateControllerSocket(path string) error {
+	if path == "" {
+		return nil
+	}
+	if strings.HasPrefix(path, "@") || strings.IndexByte(path, 0) >= 0 {
+		return errors.New("resources.control.controller must be a filesystem Unix socket path; abstract addresses cannot back lifecycle inventory")
 	}
 	return nil
 }

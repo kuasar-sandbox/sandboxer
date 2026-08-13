@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -67,8 +68,9 @@ type BalloonController struct {
 	chSock string
 	client *http.Client
 
-	target atomic.Uint64 // desired balloon size in bytes
-	actual atomic.Uint64 // last successfully applied size
+	target      atomic.Uint64 // desired balloon size in bytes
+	actual      atomic.Uint64 // last successfully applied size
+	reconcileMu sync.Mutex
 
 	// kick is a non-blocking signal channel: SetTarget (and therefore
 	// SetAllocatable, which wraps SetTarget) pokes it on every write.
@@ -156,6 +158,100 @@ func (b *BalloonController) SetAllocatable(allocBytes uint64) {
 	b.SetTarget(b.targetForAllocatable(allocBytes))
 }
 
+// ApplyAllocatable synchronously commits an allocatable change to Cloud
+// Hypervisor. ControllerHooks uses it inside the serialized resource session
+// and advances appliedAllocatable only after this returns successfully.
+func (b *BalloonController) ApplyAllocatable(ctx context.Context, allocBytes uint64) error {
+	return b.applyAllocatable(ctx, allocBytes, false)
+}
+
+// ApplyAllocatableEventually keeps a failed target queued for the background
+// reconciler. Static resource mode uses this after restore because there is no
+// controller allocation to report until the local correction succeeds.
+func (b *BalloonController) ApplyAllocatableEventually(ctx context.Context, allocBytes uint64) error {
+	return b.applyAllocatable(ctx, allocBytes, true)
+}
+
+func (b *BalloonController) applyAllocatable(ctx context.Context, allocBytes uint64, retainOnFailure bool) error {
+	b.defaults()
+	b.reconcileMu.Lock()
+	defer b.reconcileMu.Unlock()
+
+	previous := b.target.Load()
+	previousActual := b.actual.Load()
+	target := b.targetForAllocatable(allocBytes)
+	b.target.Store(target)
+	if err := b.applyTargetLocked(ctx, target); err != nil {
+		// Dynamic controller budgets must not remain queued: ControllerHooks
+		// keeps reporting the previous applied allocation, so a later untracked
+		// resize would make StateSync undercount the consumer. Static restore
+		// correction deliberately retains the target for retry. In rollback mode,
+		// preserve a concurrent Hint/SetTarget instead of overwriting it.
+		if !retainOnFailure {
+			committed, resolutionErr := b.resolveAmbiguousResizeLocked(ctx, target, previousActual)
+			if committed {
+				return nil
+			}
+			b.target.CompareAndSwap(target, previous)
+			if resolutionErr != nil {
+				return errors.Join(err, fmt.Errorf("resolve ambiguous balloon resize: %w", resolutionErr))
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+// resolveAmbiguousResizeLocked establishes a known Cloud Hypervisor target
+// after vm.resize returned without a definitive acknowledgement. A successful
+// vm.info observation of target commits the original operation. Otherwise an
+// explicit resize restores the last acknowledged target. It retries while the
+// sandbox lifetime is live: returning an unknown result would let StateSync
+// undercount a grant that CH may already have applied. Caller holds reconcileMu.
+func (b *BalloonController) resolveAmbiguousResizeLocked(ctx context.Context, target, previous uint64) (bool, error) {
+	observed, infoErr := b.readDesiredBalloon(ctx)
+	if infoErr == nil && observed == target {
+		b.actual.Store(target)
+		b.Logf("balloon: confirmed ambiguous resize at %d MiB", target>>20)
+		return true, nil
+	}
+
+	// A non-target vm.info value is not enough to prove rollback: CH's
+	// balloon resize mutates the device target before signalling its config
+	// interrupt, so an HTTP error can leave device state changed while the
+	// published VmConfig still contains the old value. Require an explicitly
+	// acknowledged idempotent resize to the last known target.
+	backoff := 25 * time.Millisecond
+	observationErr := infoErr
+	if infoErr == nil {
+		observationErr = fmt.Errorf("vm.info balloon target=%d, want %d", observed, target)
+	}
+	lastErr := observationErr
+	for {
+		if err := b.callResize(ctx, previous); err == nil {
+			b.actual.Store(previous)
+			b.Logf("balloon: compensated ambiguous resize to %d MiB", previous>>20)
+			return false, nil
+		} else {
+			// Keep diagnostics bounded even if CH is unavailable for hours.
+			lastErr = errors.Join(observationErr, fmt.Errorf("compensating vm.resize: %w", err))
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, errors.Join(lastErr, ctx.Err())
+		case <-timer.C:
+		}
+		if backoff < time.Second {
+			backoff *= 2
+			if backoff > time.Second {
+				backoff = time.Second
+			}
+		}
+	}
+}
+
 // SeedAppliedAllocatable initializes the desired and applied balloon target
 // before Start when CH is launched with the same target on its command line.
 // It deliberately does not queue a resize; later SetAllocatable calls retain
@@ -164,6 +260,18 @@ func (b *BalloonController) SeedAppliedAllocatable(allocBytes uint64) {
 	target := b.targetForAllocatable(allocBytes)
 	b.target.Store(target)
 	b.actual.Store(target)
+}
+
+// SeedRestoredState initializes the desired effective allocation separately
+// from the target Cloud Hypervisor restored in its balloon device state. They
+// differ when a snapshot captured an in-flight inflate/deflate operation; the
+// first Reconcile must then correct CH to the effective snapshot allocation.
+func (b *BalloonController) SeedRestoredState(allocBytes, restoredTargetBytes uint64) {
+	if restoredTargetBytes > b.Capacity {
+		restoredTargetBytes = b.Capacity
+	}
+	b.target.Store(b.targetForAllocatable(allocBytes))
+	b.actual.Store(restoredTargetBytes)
 }
 
 func (b *BalloonController) targetForAllocatable(allocBytes uint64) uint64 {
@@ -244,20 +352,19 @@ func (b *BalloonController) Hint(memAvailable, memTotal uint64) {
 	b.SetTarget(next)
 }
 
-// Start runs an immediate reconcile (so the post-Settled inflate
-// happens as soon as the controller is engaged), then a ticker.
-// Returns the initial reconcile error so the caller can fast-fail
-// if CH's HTTP API is unreachable.
+// Start runs an immediate reconcile (so the post-Settled inflate happens as
+// soon as the controller is engaged), then always starts the retry loop. The
+// initial error is still returned for observability, but a transient CH API
+// failure must not consume startOnce without leaving any retry mechanism.
 func (b *BalloonController) Start(ctx context.Context) error {
 	b.defaults()
 	var err error
 	b.startOnce.Do(func() {
-		if rerr := b.Reconcile(ctx); rerr != nil {
-			err = fmt.Errorf("balloon: initial resize: %w", rerr)
-			return
-		}
 		b.stopCh = make(chan struct{})
 		b.doneCh = make(chan struct{})
+		if rerr := b.Reconcile(ctx); rerr != nil {
+			err = fmt.Errorf("balloon: initial resize: %w", rerr)
+		}
 		go b.loop(ctx)
 	})
 	return err
@@ -319,7 +426,13 @@ func (b *BalloonController) loop(ctx context.Context) {
 // last applied value. Idempotent; safe to call concurrently with
 // SetTarget/Hint.
 func (b *BalloonController) Reconcile(ctx context.Context) error {
-	target := b.target.Load()
+	b.reconcileMu.Lock()
+	defer b.reconcileMu.Unlock()
+	return b.applyTargetLocked(ctx, b.target.Load())
+}
+
+// applyTargetLocked applies exactly target. Caller holds reconcileMu.
+func (b *BalloonController) applyTargetLocked(ctx context.Context, target uint64) error {
 	// Record the attempt time regardless of whether a resize is actually
 	// needed: the kick-rate-limit only cares "did we recently look", not
 	// "did we recently change CH state".
@@ -357,6 +470,35 @@ func (b *BalloonController) callResize(ctx context.Context, sizeBytes uint64) er
 		return fmt.Errorf("vm.resize: HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (b *BalloonController) readDesiredBalloon(ctx context.Context) (uint64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://ch/api/v1/vm.info", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("vm.info: HTTP %d", resp.StatusCode)
+	}
+	var info struct {
+		Config struct {
+			Balloon *struct {
+				Size uint64 `json:"size"`
+			} `json:"balloon"`
+		} `json:"config"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return 0, fmt.Errorf("vm.info: decode: %w", err)
+	}
+	if info.Config.Balloon == nil {
+		return 0, errors.New("vm.info: balloon missing")
+	}
+	return info.Config.Balloon.Size, nil
 }
 
 func abs64(x int64) int64 {

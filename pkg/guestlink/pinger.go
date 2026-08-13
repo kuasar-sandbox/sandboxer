@@ -291,10 +291,20 @@ func SendQuiesce(client *HostClient, skipDropCaches bool) (proto.DropCachesResul
 // instance-specific secrets / config that were never baked into the golden
 // snapshot. nil → no per-instance file injection.
 func OpenMUXViaRestore(client *HostClient, epoch uint32, network *proto.NetworkSpec, files []proto.FileSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
-	conn, err := dialRawForRestore(client, deadline, restoreDialRetryWindow)
+	return OpenMUXViaRestoreContext(context.Background(), client, epoch, network, files, deadline)
+}
+
+// OpenMUXViaRestoreContext is OpenMUXViaRestore with cancellation covering
+// both the pre-request CONNECT/OK retry window and the one-shot restore_ack.
+func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, files []proto.FileSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, err := dialRawForRestoreContext(ctx, client, deadline, restoreDialRetryWindow)
 	if err != nil {
 		return nil, proto.StdioSpec{}, err
 	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 
 	// WallclockNs lets the guest jump CLOCK_REALTIME forward by the
 	// dormant interval (CH reloads the snapshot's stale clock verbatim).
@@ -302,13 +312,32 @@ func OpenMUXViaRestore(client *HostClient, epoch uint32, network *proto.NetworkS
 	// possible; the residual
 	// host→guest propagation skew is sub-ms (kernel-microsecond dial,
 	// the guest's reverse-channel listener survived the snapshot).
-	return finishOpenMUX(conn, &proto.Message{
+	rawConn := conn
+	resultConn, spec, err := finishOpenMUX(rawConn, &proto.Message{
 		Type:        proto.TypeRestore,
 		Epoch:       epoch,
 		WallclockNs: time.Now().UnixNano(),
 		Network:     network,
 		Files:       files,
 	}, proto.TypeRestoreAck)
+	if !stopCancel() {
+		_ = rawConn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, proto.StdioSpec{}, ctxErr
+		}
+		return nil, proto.StdioSpec{}, context.Canceled
+	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, proto.StdioSpec{}, ctxErr
+		}
+		return nil, proto.StdioSpec{}, err
+	}
+	// finishOpenMUX clears the handshake deadline before returning. Clear it
+	// once more after stopping the cancellation callback to make the ownership
+	// handoff explicit.
+	_ = resultConn.SetDeadline(time.Time{})
+	return resultConn, spec, nil
 }
 
 const (
@@ -326,12 +355,19 @@ const (
 // the smaller of the overall deadline and retry-window remainder; a successful
 // CONNECT/OK restores the overall deadline before the request is written.
 func dialRawForRestore(client *HostClient, deadline, retryWindow time.Duration) (net.Conn, error) {
+	return dialRawForRestoreContext(context.Background(), client, deadline, retryWindow)
+}
+
+func dialRawForRestoreContext(ctx context.Context, client *HostClient, deadline, retryWindow time.Duration) (net.Conn, error) {
 	deadlineAt := time.Now().Add(deadline)
 
 	backoff := restoreDialRetryInitial
 	var lastErr error
 	var retryUntil time.Time
 	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		attemptDeadline := deadlineAt
 		if !retryUntil.IsZero() && retryUntil.Before(attemptDeadline) {
 			attemptDeadline = retryUntil
@@ -344,7 +380,7 @@ func dialRawForRestore(client *HostClient, deadline, retryWindow time.Duration) 
 			return nil, fmt.Errorf("restore pre-request connect: deadline exceeded after %d attempts", attempt-1)
 		}
 
-		conn, err := client.DialRaw(remaining)
+		conn, err := client.DialRawContext(ctx, remaining)
 		if err == nil {
 			// A retry's CONNECT/OK exchange is capped by retryUntil. Restore
 			// write+ACK still owns the original overall restore deadline.
@@ -378,7 +414,18 @@ func dialRawForRestore(client *HostClient, deadline, retryWindow time.Duration) 
 		if client.Logf != nil {
 			client.Logf("restore pre-request connect attempt %d failed: %v; retrying in %s", attempt, err, backoff)
 		}
-		time.Sleep(backoff)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		}
 		backoff *= 2
 		if backoff > restoreDialRetryMax {
 			backoff = restoreDialRetryMax
