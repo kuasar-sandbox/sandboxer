@@ -543,7 +543,7 @@ resources:
 
   control:                     # 部署模式驱动
     cgroup_path: ""            # 空 = 无 cgroup 模式;非空 = 必须已存在的 cgroup 绝对路径
-    controller: ""             # 空 = 无 cgroup / 静态 cgroup 模式;非空 = 动态控制模式(UDS 路径)
+    controller: ""             # 空 = 无 cgroup / 静态 cgroup 模式;非空 = 动态控制模式(文件型 UDS 路径,不支持 @abstract)
     sensor:                    # 压力感知器(动态控制模式;§10.3),可选,缺省 psi 默认值
       mode: psi                # psi | events_poll | none;psi 失败自动回落 events_poll
       psi_some_stall_us: 10000 # PSI trigger:1s 窗口累计 10ms stall 触发(密集 workload 实测甜点)
@@ -2380,6 +2380,9 @@ path、capacity、floor、startup、client features。SID 只参与 SHA-256,不�
 持 POSIX `fcntl` write lock直至沙箱生命周期结束;
 Heartbeat/Grant/StateSync 不更新文件。正常退出在仍持 lock 时 unlink 后 close;
 SIGKILL 则由内核自动释放 lock,controller 扫描时清理 stale 文件。
+
+controller socket 必须是文件系统 UDS;Linux `@name`/NUL abstract 地址无法承载
+同路径派生的 `.owner` 和 `.leases/` inventory,配置校验会直接拒绝。
 
 该创建逻辑同时覆盖 conductor-managed 和直接执行的 `sandbox-ctl run`。managed
 模式中 controller 还会把 lease owner 与 `<run-root>/<sid>/<sid>.pid` 的 owner/PID
