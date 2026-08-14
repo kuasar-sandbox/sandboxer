@@ -52,6 +52,15 @@ const (
 	// host-side reconcile cadence; at this rate the worst-case
 	// reclaim latency is ~2 × interval.
 	memReportInterval = 5 * time.Second
+
+	// memReportNotifyDeadline is deliberately longer than the generic
+	// app-lifecycle notification deadline. A memory report traverses the CH
+	// vsock worker precisely while the VMM may be throttled by memory.high;
+	// 200 ms repeatedly expires in that state even though the guest and host
+	// remain healthy. Once connected, keep the exchange bound below the
+	// reporting interval so a lost ACK does not consume the next periodic
+	// attempt (the connect retry has its own existing budget).
+	memReportNotifyDeadline = 4 * time.Second
 )
 
 func main() {

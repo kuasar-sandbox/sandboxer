@@ -401,7 +401,39 @@ func notifyMemReport(memAvailable, memTotal uint64) error {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(proto.DeadlineAppNotify))
+	return exchangeMemReport(conn, memAvailable, memTotal, memReportNotifyDeadline)
+}
+
+// exchangeMemReport covers the connected write/ACK exchange. Keeping it
+// separate from AF_VSOCK dial makes the pressure-delayed ACK boundary
+// deterministic in unit tests. AF_VSOCK implements SetDeadline with socket
+// timeouts that restart for each blocking syscall, so the close timer is the
+// authoritative wall-clock bound across partial header/payload reads.
+func exchangeMemReport(conn interface {
+	Read([]byte) (int, error)
+	Write([]byte) (int, error)
+	SetDeadline(time.Time) error
+	Close() error
+}, memAvailable, memTotal uint64, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	timerDone := make(chan struct{})
+	timer := time.AfterFunc(time.Until(deadline), func() {
+		defer close(timerDone)
+		// Closing a file descriptor in another goroutine does not reliably
+		// interrupt a blocked Linux socket syscall. Shut down the concrete
+		// AF_VSOCK connection first; Close remains the portable fallback for
+		// tests and prevents any later operation after the budget expires.
+		if c, ok := conn.(*vsockConn); ok {
+			_ = unix.Shutdown(c.fd, unix.SHUT_RDWR)
+		}
+		_ = conn.Close()
+	})
+	defer func() {
+		if !timer.Stop() {
+			<-timerDone
+		}
+	}()
+	_ = conn.SetDeadline(deadline)
 	if err := proto.WriteMessage(conn, &proto.Message{
 		Type:              proto.TypeMemReport,
 		MemAvailableBytes: memAvailable,

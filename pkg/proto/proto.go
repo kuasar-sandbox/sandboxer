@@ -435,7 +435,7 @@ const (
 // only the handshake — the connection then lives on as the MUX. (The restore
 // handshake deadline is host-configurable, supplied by the caller.)
 const (
-	DeadlineAppNotify = 200 * time.Millisecond // app_started / app_exited / launch_ack / mem_report
+	DeadlineAppNotify = 200 * time.Millisecond // app_started / app_exited / launch_ack
 	DeadlinePing      = 200 * time.Millisecond
 	DeadlineQuiesce   = 8 * time.Second // prep + stop-reading-app-pipes + MUX_CLOSE round-trip
 	DeadlineAttach    = 5 * time.Second

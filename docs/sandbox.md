@@ -744,7 +744,10 @@ CH API 是本地管理调用、快且不受远程/缓存慢影响,60s 是安全�
 > **`ping` 与 `--ping-fatal-threshold` 的配合**:`ping` 默认不强制时,卡死但仍连通的
 > guest 不会触发 fatal 兜底(ping 一直等而非失败)。若启用 `--ping-fatal-threshold`,
 > 须同时把 `timeouts.ping` 设为有界值(生产档为 200ms)。`app_notify` 只约束 host 读;
-> guest 侧(sandbox-init)写通知仍保留短的有界写死线作为"host 已死"的快速失败。
+> guest 侧(sandbox-init)的 `app_started` / `app_exited` 仍保留 200 ms 写死线
+> 作为"host 已死"的快速失败;`mem_report` 因为正是 VMM 受 `memory.high`
+> 压力时的反馈信号,使用小于 5 s 上报周期的 4 s 已连接交换死线
+> (写请求并等待 ack)。
 > `snapshot` 子命令另有 `--timeout` 自管上界(§2.3)。
 
 **`mounts` / `files` / `init` 的应用时机**:三者均在 guest 收到 LaunchSpec 后、
