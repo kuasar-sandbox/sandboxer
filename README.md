@@ -80,3 +80,5 @@ guest-runtime 构建 runtime 镜像和 build sandbox 内展平镜像时使用的
 本仓库的项目原创内容采用 [Apache License 2.0](LICENSE).Cloud Hypervisor patch
 中保留的上游许可证边界见 [LICENSE_SCOPE.md](LICENSE_SCOPE.md).
 贡献授权说明见 [CONTRIBUTING.md](CONTRIBUTING.md).
+
+<!-- Validation-only change for the post-rename BMS gate in project issue #44; this PR will not be merged. -->
