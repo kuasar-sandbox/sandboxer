@@ -36,7 +36,7 @@ GO             := go
 GO_BUILD_FLAGS := -trimpath
 BINDIR         := bin/$(TARGET_ARCH)
 BUILD_DIR      := build/$(TARGET_ARCH)
-E2E_BIN        ?= $(abspath ../platform/bin/$(TARGET_ARCH))
+E2E_BIN        ?= $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
 
 define link_bin
 @if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
