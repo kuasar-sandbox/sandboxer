@@ -89,7 +89,7 @@ make cloud-hypervisor
 
 ```bash
 make test
-make -C ../platform test-e2e-sandbox-cold
+make -C ../kuasar-sandbox test-e2e-sandbox-cold
 ```
 
 真实 e2e 需要 `/dev/kvm`、guest runtime、vmlinux 和 tap/network 前置条件。

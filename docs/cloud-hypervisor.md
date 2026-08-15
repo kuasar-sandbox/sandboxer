@@ -382,4 +382,4 @@ KVM EPT,IPI shootdown 饿死 guest vsock kthread(机理与替代反馈环见
   协议(PVH / EFI stub)
 - `sandboxer/native-deps/README.md` —— `make cloud-hypervisor` 工作流与 patch
   开发循环
-- `platform/docs/kuasar-sandbox.md` §2.4 —— VMM 与 Guest 环境在系统中的位置
+- `kuasar-sandbox/docs/kuasar-sandbox.md` §2.4 —— VMM 与 Guest 环境在系统中的位置
