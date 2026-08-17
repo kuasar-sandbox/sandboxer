@@ -1,0 +1,970 @@
+From e15a6554365c9f1eadcae8ab9e0a6f856ebc92bf Mon Sep 17 00:00:00 2001
+From: Chen Xiaohui <graych@gmail.com>
+Date: Mon, 17 Aug 2026 15:56:30 +0800
+Subject: [PATCH 7/7] vmm: make VM pause and resume reliable
+
+Keep the vCPU kick signal pending outside KVM_RUN and consume it after an interrupted run, reset acknowledgements before each request, and bound vCPU state waits with monotonic deadlines. Complete each virtio resume handshake before allowing the next pause, including custom net and vhost-user worker threads and restored workers with concurrent ready events.
+---
+ hypervisor/src/cpu.rs                |  16 +++
+ hypervisor/src/kvm/mod.rs            | 131 +++++++++++++++++-
+ virtio-devices/src/device.rs         | 107 +++++++++++++-
+ virtio-devices/src/epoll_helper.rs   |  69 +++++++--
+ virtio-devices/src/net.rs            |  12 +-
+ virtio-devices/src/vhost_user/blk.rs |  11 +-
+ virtio-devices/src/vhost_user/fs.rs  |  11 +-
+ virtio-devices/src/vhost_user/net.rs |  16 +--
+ vmm/src/cpu.rs                       | 200 ++++++++++++++++++++++-----
+ vmm/src/seccomp_filters.rs           |   2 +
+ 10 files changed, 496 insertions(+), 79 deletions(-)
+
+diff --git a/hypervisor/src/cpu.rs b/hypervisor/src/cpu.rs
+index 4bc348a..8581da3 100644
+--- a/hypervisor/src/cpu.rs
++++ b/hypervisor/src/cpu.rs
+@@ -37,6 +37,16 @@ pub enum CpuVendor {
+ ///
+ /// Enum for CPU error
+ pub enum HypervisorCpuError {
++    ///
++    /// Configuring the vCPU kick signal error
++    ///
++    #[error("Failed to configure vCPU kick signal")]
++    ConfigureVcpuKickSignal(#[source] std::io::Error),
++    ///
++    /// Consuming the pending vCPU kick signal error
++    ///
++    #[error("Failed to consume pending vCPU kick signal")]
++    ConsumeVcpuKickSignal(#[source] std::io::Error),
+     ///
+     /// Setting standard registers error
+     ///
+@@ -524,6 +534,12 @@ pub trait Vcpu: Send + Sync {
+     /// Triggers the running of the current virtual CPU returning an exit reason.
+     ///
+     fn run(&mut self) -> std::result::Result<VmExit, HypervisorCpuError>;
++    ///
++    /// Configures the signal used to interrupt a running vCPU.
++    ///
++    fn configure_kick_signal(&self, _signal: libc::c_int) -> Result<()> {
++        Ok(())
++    }
+     #[cfg(target_arch = "x86_64")]
+     ///
+     /// Translate guest virtual address to guest physical address
+diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
+index 2590091..267853a 100644
+--- a/hypervisor/src/kvm/mod.rs
++++ b/hypervisor/src/kvm/mod.rs
+@@ -22,7 +22,8 @@ use std::result;
+ #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+ use std::sync::Mutex;
+ #[cfg(target_arch = "x86_64")]
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::{AtomicI32, Ordering};
+ use std::sync::{Arc, RwLock};
+ 
+ use anyhow::anyhow;
+@@ -30,6 +31,7 @@ use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
+ #[cfg(target_arch = "x86_64")]
+ use log::warn;
+ use vmm_sys_util::eventfd::EventFd;
++use vmm_sys_util::{ioctl::ioctl_with_ptr, ioctl_iow_nr};
+ 
+ #[cfg(target_arch = "aarch64")]
+ use crate::aarch64::gic::KvmGicV3Its;
+@@ -128,6 +130,114 @@ use crate::kvm::x86_64::XsaveStateError;
+ #[cfg(target_arch = "x86_64")]
+ ioctl_io_nr!(KVM_NMI, kvm_bindings::KVMIO, 0x9a);
+ 
++ioctl_iow_nr!(
++    KVM_SET_SIGNAL_MASK,
++    kvm_bindings::KVMIO,
++    0x8b,
++    std::os::raw::c_uint
++);
++
++const KVM_SIGNAL_MASK_SIZE: usize = std::mem::size_of::<u64>();
++
++#[repr(C)]
++struct KvmSignalMask {
++    len: u32,
++    sigset: [u8; KVM_SIGNAL_MASK_SIZE],
++}
++
++fn configure_kvm_kick_signal(fd: &VcpuFd, signal: libc::c_int) -> std::io::Result<()> {
++    // Keep the kick signal pending while the vCPU thread is in userspace. KVM_RUN
++    // temporarily installs the mask below, where the kick signal is unblocked, so
++    // a kick cannot be consumed in the gap immediately before KVM_RUN.
++    let mut kick_set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
++    let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
++
++    // SAFETY: both pointers refer to initialized sigset_t values.
++    if unsafe { libc::sigemptyset(&mut kick_set) } != 0
++        || unsafe { libc::sigaddset(&mut kick_set, signal) } != 0
++    {
++        return Err(std::io::Error::last_os_error());
++    }
++
++    // pthread_sigmask returns the error number directly instead of setting errno.
++    // SAFETY: the signal sets are valid for the duration of the call.
++    let ret = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &kick_set, &mut old_mask) };
++    if ret != 0 {
++        return Err(std::io::Error::from_raw_os_error(ret));
++    }
++
++    let mut run_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
++    // SAFETY: sigset_t is plain data and the source and destination do not overlap.
++    unsafe {
++        std::ptr::copy_nonoverlapping(&old_mask, &mut run_mask, 1);
++    }
++
++    // SAFETY: run_mask is an initialized sigset_t.
++    if unsafe { libc::sigdelset(&mut run_mask, signal) } != 0 {
++        let error = std::io::Error::last_os_error();
++        // SAFETY: old_mask was returned by pthread_sigmask above.
++        unsafe {
++            libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut());
++        }
++        return Err(error);
++    }
++
++    let mut kvm_mask = KvmSignalMask {
++        len: KVM_SIGNAL_MASK_SIZE as u32,
++        sigset: [0; KVM_SIGNAL_MASK_SIZE],
++    };
++    // Linux exposes a 64-bit kernel signal mask through KVM_SET_SIGNAL_MASK.
++    // SAFETY: both buffers are valid for KVM_SIGNAL_MASK_SIZE bytes and do not overlap.
++    unsafe {
++        std::ptr::copy_nonoverlapping(
++            &run_mask as *const libc::sigset_t as *const u8,
++            kvm_mask.sigset.as_mut_ptr(),
++            KVM_SIGNAL_MASK_SIZE,
++        );
++    }
++
++    // SAFETY: fd is a vCPU fd and kvm_mask matches struct kvm_signal_mask.
++    let ret = unsafe { ioctl_with_ptr(fd, KVM_SET_SIGNAL_MASK(), &kvm_mask) };
++    if ret < 0 {
++        let error = std::io::Error::last_os_error();
++        // SAFETY: old_mask was returned by pthread_sigmask above.
++        unsafe {
++            libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut());
++        }
++        return Err(error);
++    }
++
++    Ok(())
++}
++
++fn consume_kvm_kick_signal(signal: libc::c_int) -> std::io::Result<()> {
++    let mut kick_set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
++
++    // SAFETY: kick_set points to an initialized sigset_t value.
++    if unsafe { libc::sigemptyset(&mut kick_set) } != 0
++        || unsafe { libc::sigaddset(&mut kick_set, signal) } != 0
++    {
++        return Err(std::io::Error::last_os_error());
++    }
++
++    // The empty kick handler consumes the pending signal while it is briefly
++    // unblocked. Block it again before the next KVM_RUN so another kick cannot
++    // be consumed in the userspace gap.
++    // SAFETY: kick_set remains valid for both pthread_sigmask calls.
++    let ret = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &kick_set, std::ptr::null_mut()) };
++    if ret != 0 {
++        return Err(std::io::Error::from_raw_os_error(ret));
++    }
++
++    // SAFETY: kick_set remains valid for this pthread_sigmask call.
++    let ret = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &kick_set, std::ptr::null_mut()) };
++    if ret != 0 {
++        return Err(std::io::Error::from_raw_os_error(ret));
++    }
++
++    Ok(())
++}
++
+ #[cfg(feature = "tdx")]
+ const KVM_EXIT_TDX: u32 = 50;
+ #[cfg(feature = "tdx")]
+@@ -582,6 +692,7 @@ impl vm::Vm for KvmVm {
+         let xsave_size = self.fd.check_extension_int(Cap::Xsave2);
+         let vcpu = KvmVcpu {
+             fd,
++            kick_signal: AtomicI32::new(0),
+             #[cfg(target_arch = "x86_64")]
+             msrs: self.msrs.clone(),
+             vm_ops,
+@@ -1345,6 +1456,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
+ /// Vcpu struct for KVM
+ pub struct KvmVcpu {
+     fd: VcpuFd,
++    kick_signal: AtomicI32,
+     #[cfg(target_arch = "x86_64")]
+     msrs: Vec<MsrEntry>,
+     vm_ops: Option<Arc<dyn vm::VmOps>>,
+@@ -2018,7 +2130,15 @@ impl cpu::Vcpu for KvmVcpu {
+             },
+ 
+             Err(ref e) => match e.errno() {
+-                libc::EAGAIN | libc::EINTR => Ok(cpu::VmExit::Ignore),
++                libc::EAGAIN => Ok(cpu::VmExit::Ignore),
++                libc::EINTR => {
++                    let signal = self.kick_signal.load(Ordering::Relaxed);
++                    if signal != 0 {
++                        consume_kvm_kick_signal(signal)
++                            .map_err(cpu::HypervisorCpuError::ConsumeVcpuKickSignal)?;
++                    }
++                    Ok(cpu::VmExit::Ignore)
++                }
+                 _ => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                     "VCPU error {e:?}"
+                 ))),
+@@ -2700,6 +2820,13 @@ impl cpu::Vcpu for KvmVcpu {
+             .map_err(cpu::HypervisorCpuError::InitializeTdx)
+     }
+ 
++    fn configure_kick_signal(&self, signal: libc::c_int) -> cpu::Result<()> {
++        configure_kvm_kick_signal(&self.fd, signal)
++            .map_err(cpu::HypervisorCpuError::ConfigureVcpuKickSignal)?;
++        self.kick_signal.store(signal, Ordering::Relaxed);
++        Ok(())
++    }
++
+     ///
+     /// Set the "immediate_exit" state
+     ///
+diff --git a/virtio-devices/src/device.rs b/virtio-devices/src/device.rs
+index f0ed28f..8074bb3 100644
+--- a/virtio-devices/src/device.rs
++++ b/virtio-devices/src/device.rs
+@@ -7,7 +7,7 @@
+ // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+ 
+ use std::collections::HashMap;
+-use std::io::Write;
++use std::io::{ErrorKind, Write};
+ use std::num::Wrapping;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Barrier};
+@@ -298,6 +298,45 @@ impl VirtioCommon {
+         // requires the addresses held by the descriptors to be translated.
+         self.avail_features &= !(1 << VIRTIO_F_RING_INDIRECT_DESC);
+     }
++
++    pub fn resume_with_threads(
++        &mut self,
++        extra_threads: &[&thread::Thread],
++    ) -> std::result::Result<(), MigratableError> {
++        // A runtime pause leaves the pause event pending until resume. Drain it
++        // before waking the workers so they cannot enter the next pause while
++        // they are still completing the previous one. A restored device starts
++        // paused without a pending event and therefore needs no resume ACK.
++        let wait_for_resume_ack = if self.paused.load(Ordering::SeqCst) {
++            if let Some(pause_evt) = &self.pause_evt {
++                match pause_evt.read() {
++                    Ok(_) => true,
++                    Err(e) if e.kind() == ErrorKind::WouldBlock => false,
++                    Err(e) => return Err(MigratableError::Resume(e.into())),
++                }
++            } else {
++                false
++            }
++        } else {
++            false
++        };
++
++        self.paused.store(false, Ordering::SeqCst);
++        if let Some(epoll_threads) = &self.epoll_threads {
++            for t in epoll_threads.iter() {
++                t.thread().unpark();
++            }
++        }
++        for thread in extra_threads {
++            thread.unpark();
++        }
++
++        if wait_for_resume_ack {
++            self.paused_sync.as_ref().unwrap().wait();
++        }
++
++        Ok(())
++    }
+ }
+ 
+ impl Pausable for VirtioCommon {
+@@ -328,13 +367,69 @@ impl Pausable for VirtioCommon {
+             "Resuming virtio-{}",
+             VirtioDeviceType::from(self.device_type)
+         );
+-        self.paused.store(false, Ordering::SeqCst);
+-        if let Some(epoll_threads) = &self.epoll_threads {
+-            for t in epoll_threads.iter() {
+-                t.thread().unpark();
++        self.resume_with_threads(&[])
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn repeated_pause_resume_waits_for_worker_ack() {
++        const ITERATIONS: usize = 100;
++
++        let paused = Arc::new(AtomicBool::new(false));
++        let paused_sync = Arc::new(Barrier::new(2));
++        let worker_paused = paused.clone();
++        let worker_sync = paused_sync.clone();
++        let worker = thread::spawn(move || {
++            for _ in 0..ITERATIONS {
++                while !worker_paused.load(Ordering::SeqCst) {
++                    thread::yield_now();
++                }
++                worker_sync.wait();
++                while worker_paused.load(Ordering::SeqCst) {
++                    thread::park();
++                }
++                worker_sync.wait();
+             }
++        });
++
++        let mut common = VirtioCommon {
++            pause_evt: Some(EventFd::new(EFD_NONBLOCK).unwrap()),
++            paused,
++            paused_sync: Some(paused_sync),
++            epoll_threads: Some(vec![worker]),
++            device_type: 1,
++            ..Default::default()
++        };
++
++        for _ in 0..ITERATIONS {
++            common.pause().unwrap();
++            common.resume().unwrap();
+         }
+ 
+-        Ok(())
++        common
++            .epoll_threads
++            .take()
++            .unwrap()
++            .pop()
++            .unwrap()
++            .join()
++            .unwrap();
++    }
++
++    #[test]
++    fn restored_resume_does_not_wait_for_runtime_ack() {
++        let mut common = VirtioCommon {
++            pause_evt: Some(EventFd::new(EFD_NONBLOCK).unwrap()),
++            paused: Arc::new(AtomicBool::new(true)),
++            paused_sync: Some(Arc::new(Barrier::new(2))),
++            ..Default::default()
++        };
++
++        common.resume_with_threads(&[]).unwrap();
++        assert!(!common.paused.load(Ordering::SeqCst));
+     }
+ }
+diff --git a/virtio-devices/src/epoll_helper.rs b/virtio-devices/src/epoll_helper.rs
+index dc062c8..4a0f53c 100644
+--- a/virtio-devices/src/epoll_helper.rs
++++ b/virtio-devices/src/epoll_helper.rs
+@@ -44,6 +44,7 @@ pub enum EpollHelperError {
+ pub const EPOLL_HELPER_EVENT_PAUSE: u16 = 0;
+ pub const EPOLL_HELPER_EVENT_KILL: u16 = 1;
+ pub const EPOLL_HELPER_EVENT_LAST: u16 = 15;
++const EPOLL_EVENTS_LEN: usize = 100;
+ 
+ pub trait EpollHelperHandler {
+     // Handle one event at a time. The EpollHelper iterates over a list of
+@@ -151,6 +152,22 @@ impl EpollHelper {
+         .map_err(EpollHelperError::Ctl)
+     }
+ 
++    fn pause_event_pending(&self) -> std::result::Result<bool, EpollHelperError> {
++        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
++
++        loop {
++            match epoll::wait(self.epoll_file.as_raw_fd(), 0, &mut events) {
++                Ok(count) => {
++                    return Ok(events[..count]
++                        .iter()
++                        .any(|event| event.data as u16 == EPOLL_HELPER_EVENT_PAUSE));
++                }
++                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
++                Err(e) => return Err(EpollHelperError::Wait(e)),
++            }
++        }
++    }
++
+     pub fn run(
+         &mut self,
+         paused: &AtomicBool,
+@@ -169,16 +186,27 @@ impl EpollHelper {
+         timeout: i32,
+         enable_event_list: bool,
+     ) -> std::result::Result<(), EpollHelperError> {
+-        const EPOLL_EVENTS_LEN: usize = 100;
+         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
+ 
+         // Before jumping into the epoll loop, check if the device is expected
+         // to be in a paused state. This is helpful for the restore code path
+         // as the device thread should not start processing anything before the
+         // device has been resumed.
++        let mut pause_request_pending = false;
+         while paused.load(Ordering::SeqCst) {
++            if self.pause_event_pending()? {
++                pause_request_pending = true;
++                break;
++            }
+             thread::park();
+         }
++        if pause_request_pending {
++            paused_sync.wait();
++            while paused.load(Ordering::SeqCst) {
++                thread::park();
++            }
++            paused_sync.wait();
++        }
+ 
+         loop {
+             let num_events =
+@@ -232,10 +260,11 @@ impl EpollHelper {
+                             thread::park();
+                         }
+ 
+-                        // Drain pause event after the device has been resumed.
+-                        // This ensures the pause event has been seen by each
+-                        // thread related to this virtio device.
+-                        let _ = self.pause_evt.read();
++                        // Acknowledge that the worker has completed the resume
++                        // before the device can begin another pause cycle. The
++                        // control thread drains the shared pause event before
++                        // waking all workers.
++                        paused_sync.wait();
+                     }
+                     _ => {
+                         handler.handle_event(self, event)?;
+@@ -256,7 +285,6 @@ impl EpollHelper {
+         _timeout: i32,
+         _enable_event_list: bool,
+     ) -> std::result::Result<(), EpollHelperError> {
+-        const EPOLL_EVENTS_LEN: usize = 100;
+         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
+ 
+         loop {
+@@ -304,10 +332,8 @@ impl EpollHelper {
+                             thread::park();
+                         }
+ 
+-                        // Drain pause event after the device has been resumed.
+-                        // This ensures the pause event has been seen by each
+-                        // thread related to this virtio device.
+-                        let _ = self.pause_evt.read();
++                        // Acknowledge completion of the resume phase.
++                        paused_sync.wait();
+                     }
+                     _ => {
+                         handler.handle_event(self, event)?;
+@@ -323,3 +349,26 @@ impl AsRawFd for EpollHelper {
+         self.epoll_file.as_raw_fd()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn pause_event_pending_checks_all_ready_events() {
++        let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
++        let pause_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
++        let queue_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
++        let mut helper = EpollHelper::new(&kill_evt, &pause_evt).unwrap();
++        helper
++            .add_event(queue_evt.as_raw_fd(), EPOLL_HELPER_EVENT_LAST + 1)
++            .unwrap();
++
++        // Make a queue event ready first so a one-entry epoll buffer would
++        // miss the later pause event and incorrectly park the worker.
++        queue_evt.write(1).unwrap();
++        pause_evt.write(1).unwrap();
++
++        assert!(helper.pause_event_pending().unwrap());
++    }
++}
+diff --git a/virtio-devices/src/net.rs b/virtio-devices/src/net.rs
+index 8eee661..775b922 100644
+--- a/virtio-devices/src/net.rs
++++ b/virtio-devices/src/net.rs
+@@ -864,12 +864,12 @@ impl Pausable for Net {
+     }
+ 
+     fn resume(&mut self) -> result::Result<(), MigratableError> {
+-        self.common.resume()?;
+-
+-        if let Some(ctrl_queue_epoll_thread) = &self.ctrl_queue_epoll_thread {
+-            ctrl_queue_epoll_thread.thread().unpark();
+-        }
+-        Ok(())
++        let extra_threads: Vec<_> = self
++            .ctrl_queue_epoll_thread
++            .iter()
++            .map(|thread| thread.thread())
++            .collect();
++        self.common.resume_with_threads(&extra_threads)
+     }
+ }
+ 
+diff --git a/virtio-devices/src/vhost_user/blk.rs b/virtio-devices/src/vhost_user/blk.rs
+index d26350c..993da96 100644
+--- a/virtio-devices/src/vhost_user/blk.rs
++++ b/virtio-devices/src/vhost_user/blk.rs
+@@ -365,11 +365,12 @@ impl Pausable for Blk {
+     }
+ 
+     fn resume(&mut self) -> result::Result<(), MigratableError> {
+-        self.common.resume()?;
+-
+-        if let Some(epoll_thread) = &self.epoll_thread {
+-            epoll_thread.thread().unpark();
+-        }
++        let extra_threads: Vec<_> = self
++            .epoll_thread
++            .iter()
++            .map(|thread| thread.thread())
++            .collect();
++        self.common.resume_with_threads(&extra_threads)?;
+ 
+         self.vu_common.resume()
+     }
+diff --git a/virtio-devices/src/vhost_user/fs.rs b/virtio-devices/src/vhost_user/fs.rs
+index d0005af..295d14b 100644
+--- a/virtio-devices/src/vhost_user/fs.rs
++++ b/virtio-devices/src/vhost_user/fs.rs
+@@ -376,11 +376,12 @@ impl Pausable for Fs {
+     }
+ 
+     fn resume(&mut self) -> result::Result<(), MigratableError> {
+-        self.common.resume()?;
+-
+-        if let Some(epoll_thread) = &self.epoll_thread {
+-            epoll_thread.thread().unpark();
+-        }
++        let extra_threads: Vec<_> = self
++            .epoll_thread
++            .iter()
++            .map(|thread| thread.thread())
++            .collect();
++        self.common.resume_with_threads(&extra_threads)?;
+ 
+         self.vu_common.resume()
+     }
+diff --git a/virtio-devices/src/vhost_user/net.rs b/virtio-devices/src/vhost_user/net.rs
+index e0a71c7..5ecdd63 100644
+--- a/virtio-devices/src/vhost_user/net.rs
++++ b/virtio-devices/src/vhost_user/net.rs
+@@ -418,15 +418,13 @@ impl Pausable for Net {
+     }
+ 
+     fn resume(&mut self) -> result::Result<(), MigratableError> {
+-        self.common.resume()?;
+-
+-        if let Some(epoll_thread) = &self.epoll_thread {
+-            epoll_thread.thread().unpark();
+-        }
+-
+-        if let Some(ctrl_queue_epoll_thread) = &self.ctrl_queue_epoll_thread {
+-            ctrl_queue_epoll_thread.thread().unpark();
+-        }
++        let extra_threads: Vec<_> = self
++            .epoll_thread
++            .iter()
++            .chain(self.ctrl_queue_epoll_thread.iter())
++            .map(|thread| thread.thread())
++            .collect();
++        self.common.resume_with_threads(&extra_threads)?;
+ 
+         self.vu_common.resume()
+     }
+diff --git a/vmm/src/cpu.rs b/vmm/src/cpu.rs
+index bba78e6..89ba920 100644
+--- a/vmm/src/cpu.rs
++++ b/vmm/src/cpu.rs
+@@ -19,6 +19,7 @@ use std::mem::size_of;
+ use std::os::unix::thread::JoinHandleExt;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Barrier, Mutex};
++use std::time::{Duration, Instant};
+ use std::{cmp, io, result, thread};
+ 
+ use acpi_tables::sdt::Sdt;
+@@ -116,6 +117,10 @@ macro_rules! extract_bits_64_without_offset {
+ 
+ pub const CPU_MANAGER_ACPI_SIZE: usize = 0xc;
+ 
++const VCPU_STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(1);
++const VCPU_STATE_POLL_INTERVAL: Duration = Duration::from_millis(1);
++const VCPU_SIGNAL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
++
+ #[derive(Debug, Error)]
+ pub enum Error {
+     #[error("Error creating vCPU")]
+@@ -162,6 +167,9 @@ pub enum Error {
+     #[error("Timeout when waiting for signal to be acknowledged")]
+     SignalAcknowledgeTimeout,
+ 
++    #[error("Timeout when waiting for vCPU state transition: {0}")]
++    VcpuStateTransitionTimeout(&'static str),
++
+     #[error("Error adding CpuManager to MMIO bus")]
+     BusError(#[source] vm_device::BusError),
+ 
+@@ -709,6 +717,10 @@ impl VcpuState {
+         self.handle.is_some()
+     }
+ 
++    fn reset_signal_acknowledgement(&self) {
++        self.vcpu_run_interrupted.store(false, Ordering::SeqCst);
++    }
++
+     /// Sends a signal to the underlying thread.
+     ///
+     /// Please call [`Self::wait_until_signal_acknowledged`] afterward to block
+@@ -723,28 +735,69 @@ impl VcpuState {
+     }
+ 
+     /// Blocks until the vCPU thread has acknowledged the signal. It retries to send
+-    /// the signal every 10ms. Times out after 1000ms.
++    /// the signal every 10ms until the supplied deadline.
+     ///
+     /// This is the counterpart of [`Self::signal_thread`].
+-    fn wait_until_signal_acknowledged(&self) -> Result<()> {
++    fn wait_until_signal_acknowledged(&self, deadline: Instant) -> Result<()> {
+         if let Some(_handle) = self.handle.as_ref() {
+-            let mut count = 0;
++            let start = Instant::now();
++            let mut next_retry = start + VCPU_SIGNAL_RETRY_INTERVAL;
+             loop {
+                 if self.vcpu_run_interrupted.load(Ordering::SeqCst) {
+                     return Ok(());
+                 }
+-                // This is more effective than thread::yield_now() at
+-                // avoiding a priority inversion with the vCPU thread
+-                thread::sleep(std::time::Duration::from_millis(1));
+-                count += 1;
+-                if count >= 1000 {
++
++                let now = Instant::now();
++                if now >= deadline {
+                     return Err(Error::SignalAcknowledgeTimeout);
+-                } else if count % 10 == 0 {
+-                    warn!("vCPU thread did not respond in {count}ms to signal - retrying");
++                }
++
++                if now >= next_retry {
++                    let elapsed_ms = now.duration_since(start).as_millis();
++                    warn!("vCPU thread did not respond in {elapsed_ms}ms to signal - retrying");
+                     self.signal_thread();
++                    next_retry = now + VCPU_SIGNAL_RETRY_INTERVAL;
++                }
++
++                // This is more effective than thread::yield_now() at
++                // avoiding a priority inversion with the vCPU thread
++                thread::sleep(VCPU_STATE_POLL_INTERVAL.min(deadline - now));
++            }
++        }
++        Ok(())
++    }
++
++    fn wait_until_paused(&self, expected: bool, deadline: Instant) -> Result<()> {
++        if self.active() {
++            while self.paused.load(Ordering::SeqCst) != expected {
++                let now = Instant::now();
++                if now >= deadline {
++                    return Err(Error::VcpuStateTransitionTimeout(if expected {
++                        "pause"
++                    } else {
++                        "resume"
++                    }));
++                }
++                thread::sleep(VCPU_STATE_POLL_INTERVAL.min(deadline - now));
++            }
++        }
++
++        Ok(())
++    }
++
++    fn wait_until_resumed(&self, deadline: Instant) -> Result<()> {
++        if self.active() {
++            while self.paused.load(Ordering::SeqCst)
++                || self.vcpu_run_interrupted.load(Ordering::SeqCst)
++            {
++                let now = Instant::now();
++                if now >= deadline {
++                    return Err(Error::VcpuStateTransitionTimeout("resume"));
+                 }
++                thread::sleep(VCPU_STATE_POLL_INTERVAL.min(deadline - now));
+             }
+         }
++
+         Ok(())
+     }
+ 
+@@ -763,6 +816,61 @@ impl VcpuState {
+     }
+ }
+ 
++#[cfg(test)]
++mod vcpu_state_tests {
++    use super::*;
++
++    fn active_state() -> VcpuState {
++        VcpuState {
++            handle: Some(thread::spawn(|| {})),
++            ..Default::default()
++        }
++    }
++
++    #[test]
++    fn signal_acknowledgement_obeys_deadline() {
++        let mut state = active_state();
++
++        assert!(matches!(
++            state.wait_until_signal_acknowledged(Instant::now()),
++            Err(Error::SignalAcknowledgeTimeout)
++        ));
++
++        state.vcpu_run_interrupted.store(true, Ordering::SeqCst);
++        assert!(state.wait_until_signal_acknowledged(Instant::now()).is_ok());
++        state.join_thread().unwrap();
++    }
++
++    #[test]
++    fn paused_state_obeys_deadline() {
++        let mut state = active_state();
++
++        assert!(matches!(
++            state.wait_until_paused(true, Instant::now()),
++            Err(Error::VcpuStateTransitionTimeout("pause"))
++        ));
++
++        state.paused.store(true, Ordering::SeqCst);
++        assert!(state.wait_until_paused(true, Instant::now()).is_ok());
++        state.join_thread().unwrap();
++    }
++
++    #[test]
++    fn resume_waits_for_signal_acknowledgement_to_clear() {
++        let mut state = active_state();
++        state.vcpu_run_interrupted.store(true, Ordering::SeqCst);
++
++        assert!(matches!(
++            state.wait_until_resumed(Instant::now()),
++            Err(Error::VcpuStateTransitionTimeout("resume"))
++        ));
++
++        state.reset_signal_acknowledgement();
++        assert!(state.wait_until_resumed(Instant::now()).is_ok());
++        state.join_thread().unwrap();
++    }
++}
++
+ impl CpuManager {
+     #[allow(unused_variables)]
+     #[allow(clippy::too_many_arguments)]
+@@ -1117,18 +1225,28 @@ impl CpuManager {
+                         }
+                     }
+ 
+-                    // Apply seccomp filter for vcpu thread.
++                    extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {}
++                    // This uses an async signal safe handler to kill the vcpu handles.
++                    register_signal_handler(SIGRTMIN(), handle_signal)
++                        .expect("Failed to register vcpu signal handler");
++                    if let Err(e) = vcpu
++                        .lock()
++                        .unwrap()
++                        .vcpu
++                        .configure_kick_signal(SIGRTMIN())
++                    {
++                        error!("Failed to configure vCPU kick signal: {e}");
++                        return;
++                    }
++
++                    // Apply the seccomp filter only after the one-time vCPU signal
++                    // setup. KVM_SET_SIGNAL_MASK is not needed by the run loop.
+                     if !vcpu_seccomp_filter.is_empty() &&  let Err(e) =
+                             apply_filter(&vcpu_seccomp_filter).map_err(Error::ApplySeccompFilter)
+                         {
+                             error!("Error applying seccomp filter: {e:?}");
+                             return;
+                         }
+-
+-                    extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {}
+-                    // This uses an async signal safe handler to kill the vcpu handles.
+-                    register_signal_handler(SIGRTMIN(), handle_signal)
+-                        .expect("Failed to register vcpu signal handler");
+                     // Block until all CPUs are ready.
+                     vcpu_thread_barrier.wait();
+ 
+@@ -1178,8 +1296,8 @@ impl CpuManager {
+                                 while vcpus_pause_signalled.load(Ordering::SeqCst) {
+                                     thread::park();
+                                 }
+-                                vcpu_paused.store(false, Ordering::SeqCst);
+                                 vcpu_run_interrupted.store(false, Ordering::SeqCst);
++                                vcpu_paused.store(false, Ordering::SeqCst);
+                             }
+ 
+                             if vcpus_kick_signalled.load(Ordering::SeqCst) {
+@@ -1351,9 +1469,10 @@ impl CpuManager {
+     fn remove_vcpu(&mut self, cpu_id: u32) -> Result<()> {
+         info!("Removing vCPU: cpu_id = {cpu_id}");
+         let state = &mut self.vcpu_states[usize::try_from(cpu_id).unwrap()];
++        state.reset_signal_acknowledgement();
+         state.kill.store(true, Ordering::SeqCst);
+         state.signal_thread();
+-        state.wait_until_signal_acknowledged()?;
++        state.wait_until_signal_acknowledged(Instant::now() + VCPU_STATE_CHANGE_TIMEOUT)?;
+         state.join_thread()?;
+         state.handle = None;
+ 
+@@ -1445,20 +1564,28 @@ impl CpuManager {
+     ///
+     /// For the vCPU threads this will interrupt the KVM_RUN ioctl() allowing
+     /// the loop to check the shared state booleans.
+-    fn signal_vcpus(&mut self) -> Result<()> {
++    fn reset_vcpu_signal_acknowledgements(&self) {
++        for state in self.vcpu_states.iter() {
++            state.reset_signal_acknowledgement();
++        }
++    }
++
++    fn signal_vcpus(&mut self, deadline: Instant) -> Result<()> {
+         // Splitting this into two loops reduced the time to pause many vCPUs
+         // massively. Example: 254 vCPUs. >254ms -> ~4ms.
+         for state in self.vcpu_states.iter() {
+             state.signal_thread();
+         }
+         for state in self.vcpu_states.iter() {
+-            state.wait_until_signal_acknowledged()?;
++            state.wait_until_signal_acknowledged(deadline)?;
+         }
+ 
+         Ok(())
+     }
+ 
+     pub fn shutdown(&mut self) -> Result<()> {
++        self.reset_vcpu_signal_acknowledgements();
++
+         // Tell the vCPUs to stop themselves next time they go through the loop
+         self.vcpus_kill_signalled.store(true, Ordering::SeqCst);
+ 
+@@ -1470,7 +1597,7 @@ impl CpuManager {
+             state.unpark_thread();
+         }
+ 
+-        self.signal_vcpus()?;
++        self.signal_vcpus(Instant::now() + VCPU_STATE_CHANGE_TIMEOUT)?;
+ 
+         // Wait for all the threads to finish. This removes the state from the vector.
+         for mut state in self.vcpu_states.drain(..) {
+@@ -2086,8 +2213,9 @@ impl CpuManager {
+     }
+ 
+     pub(crate) fn nmi(&mut self) -> Result<()> {
++        self.reset_vcpu_signal_acknowledgements();
+         self.vcpus_kick_signalled.store(true, Ordering::SeqCst);
+-        self.signal_vcpus()?;
++        self.signal_vcpus(Instant::now() + VCPU_STATE_CHANGE_TIMEOUT)?;
+         self.vcpus_kick_signalled.store(false, Ordering::SeqCst);
+ 
+         Ok(())
+@@ -2446,10 +2574,14 @@ impl Aml for CpuManager {
+ 
+ impl Pausable for CpuManager {
+     fn pause(&mut self) -> std::result::Result<(), MigratableError> {
++        let deadline = Instant::now() + VCPU_STATE_CHANGE_TIMEOUT;
++
++        self.reset_vcpu_signal_acknowledgements();
++
+         // Tell the vCPUs to pause themselves next time they exit
+         self.vcpus_pause_signalled.store(true, Ordering::SeqCst);
+ 
+-        self.signal_vcpus()
++        self.signal_vcpus(deadline)
+             .map_err(|e| MigratableError::Pause(anyhow!("Error signalling vCPUs: {e}")))?;
+ 
+         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+@@ -2467,19 +2599,17 @@ impl Pausable for CpuManager {
+         // The vCPU thread will change its paused state before parking, wait here for each
+         // activated vCPU change their state to ensure they have parked.
+         for state in self.vcpu_states.iter() {
+-            if state.active() {
+-                // wait for vCPU to update state
+-                while !state.paused.load(Ordering::SeqCst) {
+-                    // To avoid a priority inversion with the vCPU thread
+-                    thread::sleep(std::time::Duration::from_millis(1));
+-                }
+-            }
++            state.wait_until_paused(true, deadline).map_err(|e| {
++                MigratableError::Pause(anyhow!("Error waiting for vCPU to pause: {e}"))
++            })?;
+         }
+ 
+         Ok(())
+     }
+ 
+     fn resume(&mut self) -> std::result::Result<(), MigratableError> {
++        let deadline = Instant::now() + VCPU_STATE_CHANGE_TIMEOUT;
++
+         // Ensure that vCPUs keep running after being unpark() in
+         // their run vCPU loop.
+         self.vcpus_pause_signalled.store(false, Ordering::SeqCst);
+@@ -2491,14 +2621,12 @@ impl Pausable for CpuManager {
+                 state.unpark_thread();
+             }
+         }
+-        // Step 2/2: wait for state ACK
++        // Step 2/2: wait for both the parked state and the signal ACK to clear.
+         {
+             for state in self.vcpu_states.iter() {
+-                // wait for vCPU to update state
+-                while state.paused.load(Ordering::SeqCst) {
+-                    // To avoid a priority inversion with the vCPU thread
+-                    thread::sleep(std::time::Duration::from_millis(1));
+-                }
++                state.wait_until_resumed(deadline).map_err(|e| {
++                    MigratableError::Resume(anyhow!("Error waiting for vCPU to resume: {e}"))
++                })?;
+             }
+         }
+         Ok(())
+diff --git a/vmm/src/seccomp_filters.rs b/vmm/src/seccomp_filters.rs
+index 84b947f..1b99dc9 100644
+--- a/vmm/src/seccomp_filters.rs
++++ b/vmm/src/seccomp_filters.rs
+@@ -82,6 +82,7 @@ mod kvm {
+     pub const KVM_CREATE_VCPU: u64 = 0xae41;
+     pub const KVM_CREATE_IRQCHIP: u64 = 0xae60;
+     pub const KVM_RUN: u64 = 0xae80;
++    pub const KVM_SET_SIGNAL_MASK: u64 = 0x4004_ae8b;
+     pub const KVM_SET_MP_STATE: u64 = 0x4004_ae99;
+     pub const KVM_SET_GSI_ROUTING: u64 = 0x4008_ae6a;
+     pub const KVM_SET_DEVICE_ATTR: u64 = 0x4018_aee1;
+@@ -237,6 +238,7 @@ fn create_vmm_ioctl_seccomp_rule_common_kvm() -> Result<Vec<SeccompRule>, Backen
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IOEVENTFD)?],
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQFD)?],
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_RUN)?],
++        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_SIGNAL_MASK)?],
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_MEMORY_ENCRYPT_OP)?],
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_DEVICE_ATTR,)?],
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_HAS_DEVICE_ATTR,)?],
+-- 
+2.30.2
+

@@ -1,14 +1,15 @@
 # cloud-hypervisor — VMM 与平台 patches
 
 平台用 cloud-hypervisor(CH)作为 microVM 监视器。绝大多数路径跑 upstream
-行为,外部托管内存和 restore-safe vsock 通过本仓维护的 6 个 patch 实现。
+行为,外部托管内存、restore-safe vsock 和可靠 VM lifecycle 通过本仓维护的
+7 个 patch 实现。
 本文档定义 patch 范围、构建方式及对应行为契约。
 
 ## 1. 概述
 
 ### 1.1 为什么需要 patch
 
-平台对 VMM 有三条非 upstream 的诉求:
+平台对 VMM 有四条非 upstream 的诉求:
 
 1. **外部托管 sandbox RAM**:host 进程(sandbox-ctl)持有 memfd inode,CH 通过
    继承 fd 把同一 inode mmap 到自己地址空间——而不是 CH 自己 `memfd_create`。
@@ -21,6 +22,9 @@
    已连接 socket。快照时必须向 guest event queue 预发布 virtio-vsock transport
    reset,恢复时重发该事件的 IRQ,并在 guest 确认清理旧连接前阻止新 backend RX
    包进入
+4. **可靠 VM lifecycle**:pause、snapshot、resume 和 ordered shutdown 在数值
+   `cpu.max` 与 host contention 下不能丢失 vCPU kick,也不能因 CPU 或 virtio
+   worker 的旧 acknowledgement 提前返回或永久阻塞
 
 这些能力 upstream CH 都不直接支持。第二条尤其本质——upstream uffd handler 模型
 是 CH 调外部 socket,handler 提供数据,但平台需要 handler 接管 fault 投递
@@ -39,18 +43,23 @@
 | `virtio-devices/src/seccomp_filters.rs` | ~8 | balloon 线程 seccomp 放行 `SYS_lseek`(skip-hole 探测所需)|
 | `virtio-devices/src/vsock/unix/muxer.rs` | ~20 | 持久化 host local-port 分配游标 |
 | `virtio-devices/src/vsock/device.rs` / `mod.rs` | ~330 | snapshot 时发布 transport reset,restore 重发 IRQ,guest 确认前 gate RX |
+| `hypervisor/src/cpu.rs` / `kvm/mod.rs` | ~150 | `KVM_SET_SIGNAL_MASK` no-miss vCPU kick + pending signal 消费 |
+| `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~200 | vCPU ACK 重置、单调时钟 deadline、KVM ioctl allowlist |
+| `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~200 | pause event drain + resume 双向 barrier,覆盖自定义 worker |
 
-总计约 790 行 Rust、6 个 commit,基于 cloud-hypervisor `v51.1`。
+总计约 1,260 行 Rust、7 个 commit,基于 cloud-hypervisor `v51.1`。
 
 ### 1.3 维护策略
 
-- patch 文件位置:`deps/ch-patches/000{1,2,3,4,5,6}-*.patch`
+- patch 文件位置:`deps/ch-patches/000{1,2,3,4,5,6,7}-*.patch`
 - 应用方式:`make ch-patches-apply`(在 `make cloud-hypervisor` 内自动调);
   开发循环与幂等 sanity 语义见 `sandboxer/native-deps/README.md` §3
 - 跟 upstream rebase:每个 CH 大版本(~3 月)review 一次,几行 conflict
   人工 fix
-- **不**尝试上游化:patch 设计选择(SCM_RIGHTS in-process + create_ram_region
-  里跑 ioctl)与 upstream 风格偏差明显,本项目维持自有 fork
+- 外部 RAM/UFFD patch 的设计选择(SCM_RIGHTS in-process +
+  `create_ram_region` 里跑 ioctl)与 upstream 风格偏差明显,本项目维持自有
+  patch;vCPU kick 与 worker barrier 若有 upstream 等价修复,升级时应优先替换
+  `0007`,不长期维护重复实现
 
 ## 2. 启用条件与命令行
 
@@ -267,6 +276,33 @@ snapshot staging 会先排空 reset 之前已经到达的 eventfd kick。设备�
 完成旧连接清理后才可见。这里没有 retry、sleep 或放宽 deadline。源 VM snapshot
 阶段若 descriptor 缺失或非法会明确失败;目标 restore activation 即使没有任何新
 available descriptor 也必须成功,因为 reset 已经存在于快照的 used ring 中。
+
+### 3.7 0007 — VM pause/resume 与 ordered shutdown 可靠性
+
+CH v51.1 用 no-op `SIGRTMIN` handler 中断 `KVM_RUN`:控制线程先发布 pause/kill
+状态,再 `pthread_kill` 每个 vCPU,等待 vCPU loop 写入 acknowledgement。若 signal
+在 vCPU 检查状态之后、进入下一次 `KVM_RUN` 之前到达 userspace,handler 返回后该
+vCPU 仍可阻塞在 `KVM_RUN`;每 10 ms 重发只能降低概率,不能关闭竞态窗口。
+
+patch 通过三组相互独立但同属 lifecycle barrier 的修复关闭该问题:
+
+1. vCPU thread 在 userspace 阻塞 kick signal,并通过 `KVM_SET_SIGNAL_MASK` 只在
+   `KVM_RUN` 内解除阻塞。这样 signal 要么中断当前 `KVM_RUN`,要么保持 pending 并
+   中断下一次调用,不存在 userspace 丢失窗口。`KVM_RUN` 返回 `EINTR` 后必须短暂
+   unblock 再 block,让空 handler 消费 pending signal;否则它会令后续每次
+   `KVM_RUN` 都立即返回,表现成 API 成功但 guest 不再执行。VMM seccomp 的公共 KVM
+   ioctl 集显式放行 `KVM_SET_SIGNAL_MASK`。
+2. 每次 pause、shutdown、NMI 和 vCPU removal 请求都在发布状态前清除旧 ACK;
+   resume 在发布 `paused=false` 前清除 ACK,并等待 vCPU 确认恢复。所有等待统一使用
+   `CLOCK_MONOTONIC` 语义的 1 s deadline,10 ms 重发只保留为调度延迟补偿与诊断,
+   不再承担 no-miss 正确性。
+3. virtio control thread 在 pause 前 drain 共享 pause event;worker 从 park 恢复后
+   参加第二次 barrier,control thread 收齐 resume ACK 才允许下一次 pause。net 与
+   vhost-user 的自定义 worker handle 也加入同一 resume barrier。恢复态设备若尚未
+   收到 runtime pause event,不会等待一个不存在的 ACK。
+
+该 patch 不改变 sandbox 配置、CH HTTP API、snapshot 格式或资源协议,也不在
+lifecycle 前后修改 `cpu.max`。超时仍是最终有界失败保护,不是竞态修复方法。
 
 ## 4. 构建工作流
 
