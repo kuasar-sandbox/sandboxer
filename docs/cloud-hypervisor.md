@@ -45,9 +45,9 @@
 | `virtio-devices/src/vsock/device.rs` / `mod.rs` | ~330 | snapshot 时发布 transport reset,restore 重发 IRQ,guest 确认前 gate RX |
 | `hypervisor/src/cpu.rs` / `kvm/mod.rs` | ~150 | `KVM_SET_SIGNAL_MASK` no-miss vCPU kick + pending signal 消费 |
 | `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~200 | vCPU ACK 重置、单调时钟 deadline、KVM ioctl allowlist |
-| `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~200 | pause event drain + resume 双向 barrier,覆盖自定义 worker |
+| `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~250 | pause event publish/wake + resume 双向 barrier,覆盖自定义 worker |
 
-总计约 1,260 行 Rust、7 个 commit,基于 cloud-hypervisor `v51.1`。
+总计约 1,310 行 Rust、7 个 commit,基于 cloud-hypervisor `v51.1`。
 
 ### 1.3 维护策略
 
@@ -296,10 +296,12 @@ patch 通过三组相互独立但同属 lifecycle barrier 的修复关闭该问�
    resume 在发布 `paused=false` 前清除 ACK,并等待 vCPU 确认恢复。所有等待统一使用
    `CLOCK_MONOTONIC` 语义的 1 s deadline,10 ms 重发只保留为调度延迟补偿与诊断,
    不再承担 no-miss 正确性。
-3. virtio control thread 在 pause 前 drain 共享 pause event;worker 从 park 恢复后
-   参加第二次 barrier,control thread 收齐 resume ACK 才允许下一次 pause。net 与
-   vhost-user 的自定义 worker handle 也加入同一 resume barrier。恢复态设备若尚未
-   收到 runtime pause event,不会等待一个不存在的 ACK。
+3. runtime pause 先发布共享 pause event,再显式 unpark 所有普通与自定义 worker,
+   关闭 worker 的 zero-time epoll poll 到 `thread::park` 之间的启动竞态。resume 先
+   drain 该 event 再唤醒 worker;worker 从 park 恢复后参加第二次 barrier,control
+   thread 收齐 resume ACK 才允许下一次 pause。net 与 vhost-user 的自定义 worker
+   handle 同时加入 pause wake 和 resume barrier。恢复态设备若尚未收到 runtime
+   pause event,不会等待一个不存在的 ACK。
 
 该 patch 不改变 sandbox 配置、CH HTTP API、snapshot 格式或资源协议,也不在
 lifecycle 前后修改 `cpu.max`。超时仍是最终有界失败保护,不是竞态修复方法。

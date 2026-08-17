@@ -1,21 +1,23 @@
-From e15a6554365c9f1eadcae8ab9e0a6f856ebc92bf Mon Sep 17 00:00:00 2001
+From a9688f90895a231e0f09e805d1e609a5180b843e Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Mon, 17 Aug 2026 15:56:30 +0800
-Subject: [PATCH 7/7] vmm: make VM pause and resume reliable
+Subject: [PATCH] vmm: make VM pause and resume reliable
 
-Keep the vCPU kick signal pending outside KVM_RUN and consume it after an interrupted run, reset acknowledgements before each request, and bound vCPU state waits with monotonic deadlines. Complete each virtio resume handshake before allowing the next pause, including custom net and vhost-user worker threads and restored workers with concurrent ready events.
+Keep the vCPU kick signal pending outside KVM_RUN and consume it after an interrupted run, reset acknowledgements before each request, and bound vCPU state waits with monotonic deadlines.
+
+Publish each virtio pause event before explicitly waking every worker so a just-started worker cannot park across the eventfd notification. Complete each resume handshake before allowing the next pause, including custom net and vhost-user worker threads and restored workers with concurrent ready events.
 ---
  hypervisor/src/cpu.rs                |  16 +++
  hypervisor/src/kvm/mod.rs            | 131 +++++++++++++++++-
- virtio-devices/src/device.rs         | 107 +++++++++++++-
+ virtio-devices/src/device.rs         | 134 ++++++++++++++++--
  virtio-devices/src/epoll_helper.rs   |  69 +++++++--
- virtio-devices/src/net.rs            |  12 +-
- virtio-devices/src/vhost_user/blk.rs |  11 +-
- virtio-devices/src/vhost_user/fs.rs  |  11 +-
- virtio-devices/src/vhost_user/net.rs |  16 +--
+ virtio-devices/src/net.rs            |  19 ++-
+ virtio-devices/src/vhost_user/blk.rs |  18 ++-
+ virtio-devices/src/vhost_user/fs.rs  |  18 ++-
+ virtio-devices/src/vhost_user/net.rs |  24 ++--
  vmm/src/cpu.rs                       | 200 ++++++++++++++++++++++-----
  vmm/src/seccomp_filters.rs           |   2 +
- 10 files changed, 496 insertions(+), 79 deletions(-)
+ 10 files changed, 545 insertions(+), 86 deletions(-)
 
 diff --git a/hypervisor/src/cpu.rs b/hypervisor/src/cpu.rs
 index 4bc348a..8581da3 100644
@@ -236,7 +238,7 @@ index 2590091..267853a 100644
      /// Set the "immediate_exit" state
      ///
 diff --git a/virtio-devices/src/device.rs b/virtio-devices/src/device.rs
-index f0ed28f..8074bb3 100644
+index f0ed28f..438ecc3 100644
 --- a/virtio-devices/src/device.rs
 +++ b/virtio-devices/src/device.rs
 @@ -7,7 +7,7 @@
@@ -248,15 +250,62 @@ index f0ed28f..8074bb3 100644
  use std::num::Wrapping;
  use std::sync::atomic::{AtomicBool, Ordering};
  use std::sync::{Arc, Barrier};
-@@ -298,6 +298,45 @@ impl VirtioCommon {
+@@ -298,10 +298,22 @@ impl VirtioCommon {
          // requires the addresses held by the descriptors to be translated.
          self.avail_features &= !(1 << VIRTIO_F_RING_INDIRECT_DESC);
      }
+-}
+ 
+-impl Pausable for VirtioCommon {
+-    fn pause(&mut self) -> std::result::Result<(), MigratableError> {
++    fn unpark_threads(&self, extra_threads: &[&thread::Thread]) {
++        if let Some(epoll_threads) = &self.epoll_threads {
++            for t in epoll_threads.iter() {
++                t.thread().unpark();
++            }
++        }
++        for thread in extra_threads {
++            thread.unpark();
++        }
++    }
 +
++    pub fn pause_with_threads(
++        &mut self,
++        extra_threads: &[&thread::Thread],
++    ) -> std::result::Result<(), MigratableError> {
+         info!(
+             "Pausing virtio-{}",
+             VirtioDeviceType::from(self.device_type)
+@@ -312,6 +324,12 @@ impl Pausable for VirtioCommon {
+                 .write(1)
+                 .map_err(|e| MigratableError::Pause(e.into()))?;
+ 
++            // A worker starting while paused can observe the state before the
++            // eventfd write and park after a zero-time epoll poll. Preserve an
++            // unpark token after publishing the event so that race cannot strand
++            // the worker while the control thread waits on the pause barrier.
++            self.unpark_threads(extra_threads);
++
+             // Wait for all threads to acknowledge the pause before going
+             // any further. This is exclusively performed when pause_evt
+             // eventfd is Some(), as this means the virtio device has been
+@@ -323,18 +341,116 @@ impl Pausable for VirtioCommon {
+         Ok(())
+     }
+ 
+-    fn resume(&mut self) -> std::result::Result<(), MigratableError> {
 +    pub fn resume_with_threads(
 +        &mut self,
 +        extra_threads: &[&thread::Thread],
 +    ) -> std::result::Result<(), MigratableError> {
+         info!(
+             "Resuming virtio-{}",
+             VirtioDeviceType::from(self.device_type)
+         );
+-        self.paused.store(false, Ordering::SeqCst);
+-        if let Some(epoll_threads) = &self.epoll_threads {
+-            for t in epoll_threads.iter() {
+-                t.thread().unpark();
 +        // A runtime pause leaves the pause event pending until resume. Drain it
 +        // before waking the workers so they cannot enter the next pause while
 +        // they are still completing the previous one. A restored device starts
@@ -270,38 +319,28 @@ index f0ed28f..8074bb3 100644
 +                }
 +            } else {
 +                false
-+            }
+             }
 +        } else {
 +            false
 +        };
 +
 +        self.paused.store(false, Ordering::SeqCst);
-+        if let Some(epoll_threads) = &self.epoll_threads {
-+            for t in epoll_threads.iter() {
-+                t.thread().unpark();
-+            }
-+        }
-+        for thread in extra_threads {
-+            thread.unpark();
-+        }
++        self.unpark_threads(extra_threads);
 +
 +        if wait_for_resume_ack {
 +            self.paused_sync.as_ref().unwrap().wait();
-+        }
-+
-+        Ok(())
-+    }
- }
+         }
  
- impl Pausable for VirtioCommon {
-@@ -328,13 +367,69 @@ impl Pausable for VirtioCommon {
-             "Resuming virtio-{}",
-             VirtioDeviceType::from(self.device_type)
-         );
--        self.paused.store(false, Ordering::SeqCst);
--        if let Some(epoll_threads) = &self.epoll_threads {
--            for t in epoll_threads.iter() {
--                t.thread().unpark();
+         Ok(())
+     }
+ }
++
++impl Pausable for VirtioCommon {
++    fn pause(&mut self) -> std::result::Result<(), MigratableError> {
++        self.pause_with_threads(&[])
++    }
++
++    fn resume(&mut self) -> std::result::Result<(), MigratableError> {
 +        self.resume_with_threads(&[])
 +    }
 +}
@@ -323,12 +362,16 @@ index f0ed28f..8074bb3 100644
 +                while !worker_paused.load(Ordering::SeqCst) {
 +                    thread::yield_now();
 +                }
++                // Model a just-started epoll worker that observed paused before
++                // the pause event became visible, then parked after its poll.
++                // pause_with_threads() must leave an unpark token for it.
++                thread::park();
 +                worker_sync.wait();
 +                while worker_paused.load(Ordering::SeqCst) {
 +                    thread::park();
 +                }
 +                worker_sync.wait();
-             }
++            }
 +        });
 +
 +        let mut common = VirtioCommon {
@@ -343,9 +386,8 @@ index f0ed28f..8074bb3 100644
 +        for _ in 0..ITERATIONS {
 +            common.pause().unwrap();
 +            common.resume().unwrap();
-         }
- 
--        Ok(())
++        }
++
 +        common
 +            .epoll_threads
 +            .take()
@@ -367,8 +409,8 @@ index f0ed28f..8074bb3 100644
 +
 +        common.resume_with_threads(&[]).unwrap();
 +        assert!(!common.paused.load(Ordering::SeqCst));
-     }
- }
++    }
++}
 diff --git a/virtio-devices/src/epoll_helper.rs b/virtio-devices/src/epoll_helper.rs
 index dc062c8..4a0f53c 100644
 --- a/virtio-devices/src/epoll_helper.rs
@@ -498,10 +540,20 @@ index dc062c8..4a0f53c 100644
 +    }
 +}
 diff --git a/virtio-devices/src/net.rs b/virtio-devices/src/net.rs
-index 8eee661..775b922 100644
+index 8eee661..c55a927 100644
 --- a/virtio-devices/src/net.rs
 +++ b/virtio-devices/src/net.rs
-@@ -864,12 +864,12 @@ impl Pausable for Net {
+@@ -860,16 +860,21 @@ impl VirtioDevice for Net {
+ 
+ impl Pausable for Net {
+     fn pause(&mut self) -> result::Result<(), MigratableError> {
+-        self.common.pause()
++        let extra_threads: Vec<_> = self
++            .ctrl_queue_epoll_thread
++            .iter()
++            .map(|thread| thread.thread())
++            .collect();
++        self.common.pause_with_threads(&extra_threads)
      }
  
      fn resume(&mut self) -> result::Result<(), MigratableError> {
@@ -521,10 +573,20 @@ index 8eee661..775b922 100644
  }
  
 diff --git a/virtio-devices/src/vhost_user/blk.rs b/virtio-devices/src/vhost_user/blk.rs
-index d26350c..993da96 100644
+index d26350c..1be1807 100644
 --- a/virtio-devices/src/vhost_user/blk.rs
 +++ b/virtio-devices/src/vhost_user/blk.rs
-@@ -365,11 +365,12 @@ impl Pausable for Blk {
+@@ -361,15 +361,21 @@ impl VirtioDevice for Blk {
+ impl Pausable for Blk {
+     fn pause(&mut self) -> result::Result<(), MigratableError> {
+         self.vu_common.pause()?;
+-        self.common.pause()
++        let extra_threads: Vec<_> = self
++            .epoll_thread
++            .iter()
++            .map(|thread| thread.thread())
++            .collect();
++        self.common.pause_with_threads(&extra_threads)
      }
  
      fn resume(&mut self) -> result::Result<(), MigratableError> {
@@ -543,10 +605,20 @@ index d26350c..993da96 100644
          self.vu_common.resume()
      }
 diff --git a/virtio-devices/src/vhost_user/fs.rs b/virtio-devices/src/vhost_user/fs.rs
-index d0005af..295d14b 100644
+index d0005af..19ba141 100644
 --- a/virtio-devices/src/vhost_user/fs.rs
 +++ b/virtio-devices/src/vhost_user/fs.rs
-@@ -376,11 +376,12 @@ impl Pausable for Fs {
+@@ -372,15 +372,21 @@ impl VirtioDevice for Fs {
+ impl Pausable for Fs {
+     fn pause(&mut self) -> result::Result<(), MigratableError> {
+         self.vu_common.pause()?;
+-        self.common.pause()
++        let extra_threads: Vec<_> = self
++            .epoll_thread
++            .iter()
++            .map(|thread| thread.thread())
++            .collect();
++        self.common.pause_with_threads(&extra_threads)
      }
  
      fn resume(&mut self) -> result::Result<(), MigratableError> {
@@ -565,10 +637,21 @@ index d0005af..295d14b 100644
          self.vu_common.resume()
      }
 diff --git a/virtio-devices/src/vhost_user/net.rs b/virtio-devices/src/vhost_user/net.rs
-index e0a71c7..5ecdd63 100644
+index e0a71c7..082c9ea 100644
 --- a/virtio-devices/src/vhost_user/net.rs
 +++ b/virtio-devices/src/vhost_user/net.rs
-@@ -418,15 +418,13 @@ impl Pausable for Net {
+@@ -414,19 +414,23 @@ impl VirtioDevice for Net {
+ impl Pausable for Net {
+     fn pause(&mut self) -> result::Result<(), MigratableError> {
+         self.vu_common.pause()?;
+-        self.common.pause()
++        let extra_threads: Vec<_> = self
++            .epoll_thread
++            .iter()
++            .chain(self.ctrl_queue_epoll_thread.iter())
++            .map(|thread| thread.thread())
++            .collect();
++        self.common.pause_with_threads(&extra_threads)
      }
  
      fn resume(&mut self) -> result::Result<(), MigratableError> {
