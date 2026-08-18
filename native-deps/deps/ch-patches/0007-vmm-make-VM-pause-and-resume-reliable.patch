@@ -1,4 +1,4 @@
-From ade825e93946e0ed6d54add6dabc6b65a58c3cf7 Mon Sep 17 00:00:00 2001
+From 3edbdbc092abe1db6610140dbaa5e95525969b3e Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Mon, 17 Aug 2026 15:56:30 +0800
 Subject: [PATCH] vmm: make VM pause and resume reliable
@@ -8,16 +8,16 @@ Keep the vCPU kick signal pending outside KVM_RUN and consume it after an interr
 Publish each virtio pause event before explicitly waking every worker so a just-started worker cannot park across the eventfd notification. Complete each resume handshake before allowing the next pause, including custom net and vhost-user worker threads and restored workers with concurrent ready events.
 ---
  hypervisor/src/cpu.rs                |  16 ++
- hypervisor/src/kvm/mod.rs            | 143 +++++++++++-
- virtio-devices/src/device.rs         | 134 +++++++++++-
+ hypervisor/src/kvm/mod.rs            | 143 ++++++++++-
+ virtio-devices/src/device.rs         | 134 +++++++++-
  virtio-devices/src/epoll_helper.rs   |  69 +++++-
  virtio-devices/src/net.rs            |  19 +-
  virtio-devices/src/vhost_user/blk.rs |  18 +-
  virtio-devices/src/vhost_user/fs.rs  |  18 +-
  virtio-devices/src/vhost_user/net.rs |  24 +-
- vmm/src/cpu.rs                       | 315 +++++++++++++++++++++++----
+ vmm/src/cpu.rs                       | 352 +++++++++++++++++++++++----
  vmm/src/seccomp_filters.rs           |   2 +
- 10 files changed, 666 insertions(+), 92 deletions(-)
+ 10 files changed, 702 insertions(+), 93 deletions(-)
 
 diff --git a/hypervisor/src/cpu.rs b/hypervisor/src/cpu.rs
 index 4bc348a..8581da3 100644
@@ -687,7 +687,7 @@ index e0a71c7..082c9ea 100644
          self.vu_common.resume()
      }
 diff --git a/vmm/src/cpu.rs b/vmm/src/cpu.rs
-index bba78e6..c286ccd 100644
+index bba78e6..bb14d28 100644
 --- a/vmm/src/cpu.rs
 +++ b/vmm/src/cpu.rs
 @@ -19,6 +19,7 @@ use std::mem::size_of;
@@ -719,7 +719,7 @@ index bba78e6..c286ccd 100644
      #[error("Error adding CpuManager to MMIO bus")]
      BusError(#[source] vm_device::BusError),
 
-@@ -709,6 +717,10 @@ impl VcpuState {
+@@ -709,12 +717,23 @@ impl VcpuState {
          self.handle.is_some()
      }
 
@@ -730,7 +730,20 @@ index bba78e6..c286ccd 100644
      /// Sends a signal to the underlying thread.
      ///
      /// Please call [`Self::wait_until_signal_acknowledged`] afterward to block
-@@ -722,29 +734,84 @@ impl VcpuState {
+     /// until the vCPU thread has acknowledged the signal.
+     fn signal_thread(&self) {
+         if let Some(handle) = self.handle.as_ref() {
++            // A completed vCPU no longer participates in lifecycle barriers.
++            // Its JoinHandle remains present until shutdown drains it, but it
++            // cannot observe or acknowledge another request.
++            if handle.is_finished() {
++                return;
++            }
++
+             // SAFETY: FFI call with correct arguments
+             unsafe {
+                 libc::pthread_kill(handle.as_pthread_t() as _, SIGRTMIN());
+@@ -722,29 +741,91 @@ impl VcpuState {
          }
      }
 
@@ -741,15 +754,23 @@ index bba78e6..c286ccd 100644
      ///
      /// This is the counterpart of [`Self::signal_thread`].
 -    fn wait_until_signal_acknowledged(&self) -> Result<()> {
-+    fn wait_until_signal_acknowledged(&self, deadline: Instant, retry_signal: bool) -> Result<()> {
-         if let Some(_handle) = self.handle.as_ref() {
+-        if let Some(_handle) = self.handle.as_ref() {
 -            let mut count = 0;
++    fn wait_until_signal_acknowledged(&self, deadline: Instant, retry_signal: bool) -> Result<()> {
++        if let Some(handle) = self.handle.as_ref() {
 +            let start = Instant::now();
 +            let mut next_retry = start + VCPU_SIGNAL_RETRY_INTERVAL;
              loop {
                  if self.vcpu_run_interrupted.load(Ordering::SeqCst) {
                      return Ok(());
                  }
++
++                // Natural reset, shutdown, run errors, and panics are not ACKs
++                // for this request. Once the thread has completed, however, it
++                // is no longer a participant that this barrier can wait for.
++                if handle.is_finished() {
++                    return Ok(());
++                }
 +
 +                let now = Instant::now();
 +                if now >= deadline {
@@ -825,7 +846,7 @@ index bba78e6..c286ccd 100644
          Ok(())
      }
 
-@@ -763,6 +830,84 @@ impl VcpuState {
+@@ -763,6 +844,105 @@ impl VcpuState {
      }
  }
 
@@ -855,6 +876,27 @@ index bba78e6..c286ccd 100644
 +                .wait_until_signal_acknowledged(Instant::now(), false)
 +                .is_ok()
 +        );
++        state.join_thread().unwrap();
++    }
++
++    #[test]
++    fn finished_vcpu_does_not_require_signal_acknowledgement() {
++        let handle = thread::spawn(|| {});
++        while !handle.is_finished() {
++            thread::yield_now();
++        }
++        let mut state = VcpuState {
++            handle: Some(handle),
++            ..Default::default()
++        };
++
++        state.signal_thread();
++        assert!(
++            state
++                .wait_until_signal_acknowledged(Instant::now(), false)
++                .is_ok()
++        );
++        assert!(!state.vcpu_run_interrupted.load(Ordering::SeqCst));
 +        state.join_thread().unwrap();
 +    }
 +
@@ -910,7 +952,7 @@ index bba78e6..c286ccd 100644
  impl CpuManager {
      #[allow(unused_variables)]
      #[allow(clippy::too_many_arguments)]
-@@ -1061,7 +1206,6 @@ impl CpuManager {
+@@ -1061,7 +1241,6 @@ impl CpuManager {
          let vcpu_run_interrupted = self.vcpu_states[usize::try_from(vcpu_id).unwrap()]
              .vcpu_run_interrupted
              .clone();
@@ -918,7 +960,7 @@ index bba78e6..c286ccd 100644
          let vcpu_paused = self.vcpu_states[usize::try_from(vcpu_id).unwrap()]
              .paused
              .clone();
-@@ -1092,6 +1236,15 @@ impl CpuManager {
+@@ -1092,6 +1271,15 @@ impl CpuManager {
 
          info!("Starting vCPU: cpu_id = {vcpu_id}");
 
@@ -934,7 +976,7 @@ index bba78e6..c286ccd 100644
          let handle = Some(
              thread::Builder::new()
                  .name(format!("vcpu{vcpu_id}"))
-@@ -1117,18 +1270,19 @@ impl CpuManager {
+@@ -1117,18 +1305,19 @@ impl CpuManager {
                          }
                      }
 
@@ -960,7 +1002,7 @@ index bba78e6..c286ccd 100644
                      // Block until all CPUs are ready.
                      vcpu_thread_barrier.wait();
 
-@@ -1178,12 +1332,29 @@ impl CpuManager {
+@@ -1178,12 +1367,29 @@ impl CpuManager {
                                  while vcpus_pause_signalled.load(Ordering::SeqCst) {
                                      thread::park();
                                  }
@@ -992,7 +1034,7 @@ index bba78e6..c286ccd 100644
                                  #[cfg(target_arch = "x86_64")]
                                  match vcpu.lock().as_ref().unwrap().vcpu.nmi() {
                                      Ok(()) => {},
-@@ -1192,6 +1363,33 @@ impl CpuManager {
+@@ -1192,6 +1398,33 @@ impl CpuManager {
                                          break;
                                      }
                                  }
@@ -1026,7 +1068,7 @@ index bba78e6..c286ccd 100644
                              }
 
                              // We've been told to terminate
-@@ -1231,13 +1429,11 @@ impl CpuManager {
+@@ -1231,13 +1464,11 @@ impl CpuManager {
                                      VmExit::Hyperv => {}
                                      VmExit::Reset => {
                                          info!("VmExit::Reset");
@@ -1040,7 +1082,7 @@ index bba78e6..c286ccd 100644
                                          exit_evt.write(1).unwrap();
                                          break;
                                      }
-@@ -1258,7 +1454,6 @@ impl CpuManager {
+@@ -1258,7 +1489,6 @@ impl CpuManager {
 
                                  Err(e) => {
                                      error!("VCPU generated error: {:?}", Error::VcpuRun(e.into()));
@@ -1048,7 +1090,7 @@ index bba78e6..c286ccd 100644
                                      exit_evt.write(1).unwrap();
                                      break;
                                  }
-@@ -1274,7 +1469,6 @@ impl CpuManager {
+@@ -1274,7 +1504,6 @@ impl CpuManager {
                          }
                      })
                      .or_else(|_| {
@@ -1056,7 +1098,7 @@ index bba78e6..c286ccd 100644
                          error!("vCPU thread panicked");
                          panic_exit_evt.write(1)
                      })
-@@ -1350,10 +1544,19 @@ impl CpuManager {
+@@ -1350,10 +1579,19 @@ impl CpuManager {
 
      fn remove_vcpu(&mut self, cpu_id: u32) -> Result<()> {
          info!("Removing vCPU: cpu_id = {cpu_id}");
@@ -1077,7 +1119,7 @@ index bba78e6..c286ccd 100644
          state.join_thread()?;
          state.handle = None;
 
-@@ -1445,20 +1648,33 @@ impl CpuManager {
+@@ -1445,20 +1683,33 @@ impl CpuManager {
      ///
      /// For the vCPU threads this will interrupt the KVM_RUN ioctl() allowing
      /// the loop to check the shared state booleans.
@@ -1113,7 +1155,7 @@ index bba78e6..c286ccd 100644
          // Tell the vCPUs to stop themselves next time they go through the loop
          self.vcpus_kill_signalled.store(true, Ordering::SeqCst);
 
-@@ -1470,7 +1686,7 @@ impl CpuManager {
+@@ -1470,7 +1721,7 @@ impl CpuManager {
              state.unpark_thread();
          }
 
@@ -1122,7 +1164,7 @@ index bba78e6..c286ccd 100644
 
          // Wait for all the threads to finish. This removes the state from the vector.
          for mut state in self.vcpu_states.drain(..) {
-@@ -2086,10 +2302,25 @@ impl CpuManager {
+@@ -2086,10 +2337,25 @@ impl CpuManager {
      }
 
      pub(crate) fn nmi(&mut self) -> Result<()> {
@@ -1149,7 +1191,7 @@ index bba78e6..c286ccd 100644
          Ok(())
      }
  }
-@@ -2446,10 +2677,14 @@ impl Aml for CpuManager {
+@@ -2446,10 +2712,14 @@ impl Aml for CpuManager {
 
  impl Pausable for CpuManager {
      fn pause(&mut self) -> std::result::Result<(), MigratableError> {
@@ -1165,7 +1207,7 @@ index bba78e6..c286ccd 100644
              .map_err(|e| MigratableError::Pause(anyhow!("Error signalling vCPUs: {e}")))?;
 
          #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-@@ -2467,19 +2702,17 @@ impl Pausable for CpuManager {
+@@ -2467,19 +2737,17 @@ impl Pausable for CpuManager {
          // The vCPU thread will change its paused state before parking, wait here for each
          // activated vCPU change their state to ensure they have parked.
          for state in self.vcpu_states.iter() {
@@ -1190,7 +1232,7 @@ index bba78e6..c286ccd 100644
          // Ensure that vCPUs keep running after being unpark() in
          // their run vCPU loop.
          self.vcpus_pause_signalled.store(false, Ordering::SeqCst);
-@@ -2491,14 +2724,12 @@ impl Pausable for CpuManager {
+@@ -2491,14 +2759,12 @@ impl Pausable for CpuManager {
                  state.unpark_thread();
              }
          }
