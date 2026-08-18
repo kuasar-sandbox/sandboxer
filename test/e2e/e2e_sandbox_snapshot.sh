@@ -19,12 +19,43 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
+VCPU_COUNT="${VCPU_COUNT:-1}"
+VCPU_LIFECYCLE_CYCLES="${VCPU_LIFECYCLE_CYCLES:-100}"
+SNAPSHOT_CYCLES="${SNAPSHOT_CYCLES:-1}"
+VMM_CGROUP_PATH="${VMM_CGROUP_PATH:-}"
+VMM_CPU_MAX=""
+VMM_CONTROL_YAML=""
+
+case "$VCPU_COUNT" in
+    ''|*[!0-9]*|0) echo "$0: VCPU_COUNT must be a positive integer" >&2; exit 1 ;;
+esac
+case "$VCPU_LIFECYCLE_CYCLES" in
+    ''|*[!0-9]*) echo "$0: VCPU_LIFECYCLE_CYCLES must be a non-negative integer" >&2; exit 1 ;;
+esac
+case "$SNAPSHOT_CYCLES" in
+    ''|*[!0-9]*|0) echo "$0: SNAPSHOT_CYCLES must be a positive integer" >&2; exit 1 ;;
+esac
+if [ -n "$VMM_CGROUP_PATH" ]; then
+    case "$VMM_CGROUP_PATH" in
+        /*) ;;
+        *) echo "$0: VMM_CGROUP_PATH must be absolute" >&2; exit 1 ;;
+    esac
+    [ -d "$VMM_CGROUP_PATH" ] || { echo "$0: missing VMM_CGROUP_PATH: $VMM_CGROUP_PATH" >&2; exit 1; }
+    [ -r "$VMM_CGROUP_PATH/cpu.max" ] || { echo "$0: missing $VMM_CGROUP_PATH/cpu.max" >&2; exit 1; }
+    VMM_CONTROL_YAML="  control: { cgroup_path: \"$VMM_CGROUP_PATH\" }"
+fi
 
 skip() {
     echo
     echo "==> e2e_sandbox_snapshot: skipping ($*)"
     if [ "${REQUIRE_KVM:-0}" = "1" ]; then exit 1; fi
     exit 0
+}
+
+assert_vmm_cpu_max_unchanged() {
+    [ -z "$VMM_CGROUP_PATH" ] || [ -z "$VMM_CPU_MAX" ] \
+        || [ "$(cat "$VMM_CGROUP_PATH/cpu.max")" = "$VMM_CPU_MAX" ] \
+        || { echo "==> VMM cpu.max changed from '$VMM_CPU_MAX'" >&2; return 1; }
 }
 
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
@@ -80,8 +111,9 @@ mkfs.ext4 -q -F "$DIFF_FILE"
 # "PYBOOT-OK" within ~1s confirms app is up.
 cat > "$WORK/sandbox.yaml" <<EOF
 resources:
-  capacity:    { cpu: 1, memory: 512MiB }
-  allocatable: { cpu: 1, memory: 512MiB }
+  capacity:    { cpu: $VCPU_COUNT, memory: 512MiB }
+  allocatable: { cpu: $VCPU_COUNT, memory: 512MiB }
+$VMM_CONTROL_YAML
 network:
   tap: $TAP_NAME
   interface: eth0
@@ -125,19 +157,88 @@ done
 if ! grep -q "TICK 5" "$LOG"; then
     echo "==> timeout waiting for guest app"; tail -40 "$LOG"; kill -TERM "$SBPID" 2>/dev/null; exit 1
 fi
-echo "==> guest app running, taking snapshot"
+echo "==> guest app running"
+if [ -n "$VMM_CGROUP_PATH" ]; then
+    VMM_CPU_MAX="$(cat "$VMM_CGROUP_PATH/cpu.max")"
+    case "$VMM_CPU_MAX" in
+        max|"max "*) echo "==> VMM cpu.max is not numeric: $VMM_CPU_MAX" >&2; exit 1 ;;
+    esac
+    echo "==> VMM cpu.max baseline: $VMM_CPU_MAX"
+fi
 
-OUT="$WORK/snap-out"
-mkdir -p "$OUT"
-"$BIN/sandbox-ctl" snapshot \
-    --sandbox-id "$SID" \
-    --output "$OUT" \
-    --run-root "$RUNTIME_ROOT" \
-    --resume 2>&1 | tee "$WORK/snap.log"
+# Exercise the same CH pause/resume barrier used by snapshot without paying the
+# memory-dump cost on every iteration. A persistent Unix HTTP connection keeps
+# the 10k-cycle issue #112 stress practical; the real snapshot below still
+# validates the complete sandbox-ctl path and ordered shutdown follows cleanup.
+if [ "$VCPU_LIFECYCLE_CYCLES" -gt 0 ]; then
+    CH_SOCKET="$RUNTIME_ROOT/$SID/ch.sock"
+    [ -S "$CH_SOCKET" ] || { echo "==> missing Cloud Hypervisor API socket: $CH_SOCKET"; exit 1; }
+    echo "==> exercising $VCPU_LIFECYCLE_CYCLES pause/resume cycles ($VCPU_COUNT vCPU)"
+    python3 - "$CH_SOCKET" "$VCPU_LIFECYCLE_CYCLES" <<'PY'
+import http.client
+import socket
+import sys
+
+socket_path, cycles_text = sys.argv[1:]
+cycles = int(cycles_text)
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path):
+        super().__init__("localhost", timeout=2)
+        self.path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.path)
+
+
+connection = UnixHTTPConnection(socket_path)
+for iteration in range(1, cycles + 1):
+    for endpoint in ("/api/v1/vm.pause", "/api/v1/vm.resume"):
+        connection.request("PUT", endpoint, body=b"")
+        response = connection.getresponse()
+        body = response.read()
+        if response.status not in (200, 204):
+            raise SystemExit(
+                f"iteration {iteration} {endpoint}: HTTP {response.status}: "
+                f"{body.decode(errors='replace')}"
+            )
+    if iteration % 1000 == 0:
+        print(f"    completed={iteration}", flush=True)
+connection.close()
+PY
+fi
+assert_vmm_cpu_max_unchanged
+
+echo "==> taking snapshot"
+
+for snapshot_cycle in $(seq 1 "$SNAPSHOT_CYCLES"); do
+    OUT="$WORK/snap-out-$snapshot_cycle"
+    mkdir -p "$OUT"
+    if [ "$SNAPSHOT_CYCLES" -gt 1 ]; then
+        echo "==> snapshot cycle $snapshot_cycle/$SNAPSHOT_CYCLES"
+    fi
+    "$BIN/sandbox-ctl" snapshot \
+        --sandbox-id "$SID" \
+        --output "$OUT" \
+        --run-root "$RUNTIME_ROOT" \
+        --resume 2>&1 | tee "$WORK/snap-$snapshot_cycle.log"
+    assert_vmm_cpu_max_unchanged
+    if [ "$snapshot_cycle" -lt "$SNAPSHOT_CYCLES" ]; then
+        rm -rf "$OUT"
+    fi
+done
 
 # Tear down sandbox
 kill -TERM "$SBPID" 2>/dev/null || true
 wait "$SBPID" 2>/dev/null || true
+assert_vmm_cpu_max_unchanged
+if [ -n "$VMM_CGROUP_PATH" ]; then
+    grep -qx 'populated 0' "$VMM_CGROUP_PATH/cgroup.events" \
+        || { echo "==> VMM cgroup remains populated after shutdown" >&2; cat "$VMM_CGROUP_PATH/cgroup.events" >&2; exit 1; }
+fi
 
 # Validate outputs
 echo "==> validating snapshot bundle"

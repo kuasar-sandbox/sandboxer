@@ -43,11 +43,11 @@
 | `virtio-devices/src/seccomp_filters.rs` | ~8 | balloon 线程 seccomp 放行 `SYS_lseek`(skip-hole 探测所需)|
 | `virtio-devices/src/vsock/unix/muxer.rs` | ~20 | 持久化 host local-port 分配游标 |
 | `virtio-devices/src/vsock/device.rs` / `mod.rs` | ~330 | snapshot 时发布 transport reset,restore 重发 IRQ,guest 确认前 gate RX |
-| `hypervisor/src/cpu.rs` / `kvm/mod.rs` | ~150 | `KVM_SET_SIGNAL_MASK` no-miss vCPU kick + pending signal 消费 |
-| `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~420 | 请求级 vCPU ACK、单调时钟 deadline、pending kick drain、KVM ioctl allowlist |
+| `hypervisor/src/cpu.rs` / `kvm/mod.rs` | ~170 | `KVM_SET_SIGNAL_MASK` no-miss vCPU kick + `KVM_RUN` 返回后的 userspace signal unblock |
+| `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~460 | lifecycle 检查前 signal block、请求级 vCPU ACK、单调时钟 deadline、pending kick drain、KVM ioctl allowlist |
 | `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~280 | pause event publish/wake + resume 双向 barrier,覆盖自定义 worker |
 
-7 个 commit 合计 1,582 insertions / 137 deletions,基于 cloud-hypervisor `v51.1`。
+7 个 commit 合计 1,623 insertions / 138 deletions,基于 cloud-hypervisor `v51.1`。
 
 ### 1.3 维护策略
 
@@ -287,12 +287,14 @@ vCPU 仍可阻塞在 `KVM_RUN`;每 10 ms 重发只能降低概率,不能关闭�
 patch 通过三组相互独立但同属 lifecycle barrier 的修复关闭该问题:
 
 1. 创建线程在 spawn vCPU 前配置 `KVM_SET_SIGNAL_MASK` 并阻塞 kick signal,使子线程
-   从第一条指令起继承 userspace blocked mask;配置失败直接返回,不会让一个提前退出
-   的 vCPU 留在启动 barrier 之外。KVM 只在 `KVM_RUN` 内解除该 signal,所以一次 kick
-   要么中断当前调用,要么保持 pending 并中断下一次调用。`KVM_RUN` 返回 `EINTR` 后
-   短暂 unblock 再 block,让空 handler 消费 pending signal;否则后续每次 `KVM_RUN`
-   都会立即返回,表现成 API 成功但 guest 不再执行。VMM seccomp 的公共 KVM ioctl 集
-   显式放行 `KVM_SET_SIGNAL_MASK`。
+   从第一条指令起继承 blocked mask;配置失败直接返回,不会让一个提前退出的 vCPU
+   留在启动 barrier 之外。vCPU loop 每轮只在读取 lifecycle 状态之前 block signal;
+   `KVM_RUN` 通过已配置的 mask 原子 unblock,返回后则在处理 PIO/MMIO 等 userspace
+   工作之前立即 unblock。控制线程先写共享请求再发送 kick,因此 signal 在 userspace
+   到达时可以打断阻塞调用,下一轮状态检查会看到请求;signal 在 block、状态检查与
+   `KVM_RUN` 之间到达时保持 pending,并中断同一次 `KVM_RUN`。KVM 恢复 blocked mask
+   后留下的 pending signal 由返回后的空 handler 消费,不会让后续 `KVM_RUN` 持续
+   立即返回。VMM seccomp 的公共 KVM ioctl 集显式放行 `KVM_SET_SIGNAL_MASK`。
 2. pause、shutdown、NMI 和 vCPU removal 在发布请求前清除旧 ACK;vCPU 只有进入当前
    请求的 pause/NMI/kill 分支后才写 ACK,自然 reset、shutdown、run error 或 panic
    不能冒充请求确认。KVM no-miss 路径每个请求只发一次 kick;若 vCPU 在 kick 发出前
@@ -413,7 +415,11 @@ KVM EPT,IPI shootdown 饿死 guest vsock kthread(机理与替代反馈环见
   重构,patch 0001/0002 通常需要小幅 rebase。0003(uffd ioctl)改动较大,需要
   多花时间 review。0004 仅触 `virtio-devices/src/balloon.rs` 单函数
   (`release_memory_range`),rebase 面最小。0005/0006 需要随 upstream vsock device
-  queue/restore 生命周期变化一起复核
+  queue/restore 生命周期变化一起复核。0007 应随 upstream sound
+  `immediate_exit` 支持一起复核
+- **vCPU kick 掩码开销**:KVM vCPU 每次 userspace exit 需要一次 block/unblock
+  signal mask。CPU-bound guest 不增加 VM exit;PIO/MMIO 密集负载会承担额外 syscall
+  成本。该路径用于在 sound `immediate_exit` 接口可用前保持无漏唤醒语义
 - **多 fd-backed zone**:当前限定单 zone(整段 sandbox RAM 一个 memfd)。多
   zone(NUMA / virtio-mem 横向扩展)需要在 patch 0003 处对每 zone 各自 sendmsg
   一次,sandbox-ctl 端各自维护 addrMap
