@@ -1,14 +1,14 @@
-From eee7e3e426a96a72c97491e7cee03970a5933e75 Mon Sep 17 00:00:00 2001
+From f01992aab1c38aebd9602adfda7696c5d9e3ecb3 Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Tue, 18 Aug 2026 17:57:26 +0800
 Subject: [PATCH 7/7] vmm: make VM pause and resume reliable
 
-Make vCPU lifecycle kicks no-miss without leaving vCPU userspace exit
-handling uninterruptible. Block the kick before checking lifecycle state,
-use KVM_SET_SIGNAL_MASK to atomically unblock it inside KVM_RUN, and
-unblock immediately after every run before processing exits. A kick can
-therefore interrupt userspace work or remain pending across the
-state-check-to-run window.
+Make vCPU lifecycle kicks no-miss while keeping the kick signal blocked
+throughout vCPU userspace exit handling. Use KVM_SET_SIGNAL_MASK to
+atomically unblock it inside KVM_RUN, preserve a pending kick until the
+outer loop observes its lifecycle request, then consume and re-block it
+after completing pending KVM I/O. Repeat the safe-point consume after
+park/unpark to cover a late one-shot kick.
 
 Reset acknowledgements before each request, scope them to the lifecycle
 branch each vCPU observed, recover failed barriers, and bound state waits
@@ -18,23 +18,23 @@ Publish each virtio pause event before explicitly waking every worker and
 complete each resume handshake before allowing the next pause, including
 custom and restored workers.
 ---
- hypervisor/src/cpu.rs                |  16 +
- hypervisor/src/kvm/mod.rs            | 146 ++++++++-
- virtio-devices/src/device.rs         | 134 +++++++-
+ hypervisor/src/cpu.rs                |  11 +
+ hypervisor/src/kvm/mod.rs            |  97 ++++-
+ virtio-devices/src/device.rs         | 134 ++++++-
  virtio-devices/src/epoll_helper.rs   |  69 +++-
  virtio-devices/src/net.rs            |  19 +-
  virtio-devices/src/vhost_user/blk.rs |  18 +-
  virtio-devices/src/vhost_user/fs.rs  |  18 +-
  virtio-devices/src/vhost_user/net.rs |  24 +-
- vmm/src/cpu.rs                       | 454 +++++++++++++++++++++++----
+ vmm/src/cpu.rs                       | 548 ++++++++++++++++++++++++---
  vmm/src/seccomp_filters.rs           |   2 +
- 10 files changed, 793 insertions(+), 107 deletions(-)
+ 10 files changed, 835 insertions(+), 105 deletions(-)
 
 diff --git a/hypervisor/src/cpu.rs b/hypervisor/src/cpu.rs
-index 4bc348a..b01f888 100644
+index 4bc348a..ec2b92b 100644
 --- a/hypervisor/src/cpu.rs
 +++ b/hypervisor/src/cpu.rs
-@@ -37,6 +37,16 @@ pub enum CpuVendor {
+@@ -37,6 +37,11 @@ pub enum CpuVendor {
  ///
  /// Enum for CPU error
  pub enum HypervisorCpuError {
@@ -43,15 +43,10 @@ index 4bc348a..b01f888 100644
 +    ///
 +    #[error("Failed to configure vCPU kick signal")]
 +    ConfigureVcpuKickSignal(#[source] std::io::Error),
-+    ///
-+    /// Unblocking the pending vCPU kick signal error
-+    ///
-+    #[error("Failed to unblock pending vCPU kick signal")]
-+    ConsumeVcpuKickSignal(#[source] std::io::Error),
      ///
      /// Setting standard registers error
      ///
-@@ -524,6 +534,12 @@ pub trait Vcpu: Send + Sync {
+@@ -524,6 +529,12 @@ pub trait Vcpu: Send + Sync {
      /// Triggers the running of the current virtual CPU returning an exit reason.
      ///
      fn run(&mut self) -> std::result::Result<VmExit, HypervisorCpuError>;
@@ -65,20 +60,10 @@ index 4bc348a..b01f888 100644
      ///
      /// Translate guest virtual address to guest physical address
 diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
-index 2590091..9b5a4d1 100644
+index 2590091..fd23796 100644
 --- a/hypervisor/src/kvm/mod.rs
 +++ b/hypervisor/src/kvm/mod.rs
-@@ -22,7 +22,8 @@ use std::result;
- #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
- use std::sync::Mutex;
- #[cfg(target_arch = "x86_64")]
--use std::sync::atomic::{AtomicBool, Ordering};
-+use std::sync::atomic::AtomicBool;
-+use std::sync::atomic::{AtomicI32, Ordering};
- use std::sync::{Arc, RwLock};
- 
- use anyhow::anyhow;
-@@ -30,6 +31,7 @@ use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
+@@ -30,6 +30,7 @@ use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
  #[cfg(target_arch = "x86_64")]
  use log::warn;
  use vmm_sys_util::eventfd::EventFd;
@@ -86,7 +71,7 @@ index 2590091..9b5a4d1 100644
  
  #[cfg(target_arch = "aarch64")]
  use crate::aarch64::gic::KvmGicV3Its;
-@@ -128,6 +130,122 @@ use crate::kvm::x86_64::XsaveStateError;
+@@ -128,6 +129,94 @@ use crate::kvm::x86_64::XsaveStateError;
  #[cfg(target_arch = "x86_64")]
  ioctl_io_nr!(KVM_NMI, kvm_bindings::KVMIO, 0x9a);
  
@@ -178,75 +163,10 @@ index 2590091..9b5a4d1 100644
 +    Ok(())
 +}
 +
-+fn unblock_kvm_kick_signal(signal: libc::c_int) -> std::io::Result<()> {
-+    // SAFETY: libc::sigset_t has no invalid bit pattern; sigemptyset initializes it
-+    // before it is read.
-+    let mut kick_set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-+
-+    // SAFETY: kick_set points to valid sigset_t storage.
-+    if unsafe { libc::sigemptyset(&mut kick_set) } != 0 {
-+        return Err(std::io::Error::last_os_error());
-+    }
-+    // SAFETY: kick_set was initialized by sigemptyset above.
-+    if unsafe { libc::sigaddset(&mut kick_set, signal) } != 0 {
-+        return Err(std::io::Error::last_os_error());
-+    }
-+
-+    // pthread_sigmask returns the error number directly instead of setting errno.
-+    // Unblocking also consumes a pending kick through the registered empty handler
-+    // before returning to vCPU userspace work.
-+    // SAFETY: kick_set remains valid for this pthread_sigmask call.
-+    let ret = unsafe {
-+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &kick_set, std::ptr::null_mut())
-+    };
-+    if ret != 0 {
-+        return Err(std::io::Error::from_raw_os_error(ret));
-+    }
-+
-+    Ok(())
-+}
-+
  #[cfg(feature = "tdx")]
  const KVM_EXIT_TDX: u32 = 50;
  #[cfg(feature = "tdx")]
-@@ -582,6 +700,7 @@ impl vm::Vm for KvmVm {
-         let xsave_size = self.fd.check_extension_int(Cap::Xsave2);
-         let vcpu = KvmVcpu {
-             fd,
-+            kick_signal: AtomicI32::new(0),
-             #[cfg(target_arch = "x86_64")]
-             msrs: self.msrs.clone(),
-             vm_ops,
-@@ -1345,6 +1464,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
- /// Vcpu struct for KVM
- pub struct KvmVcpu {
-     fd: VcpuFd,
-+    kick_signal: AtomicI32,
-     #[cfg(target_arch = "x86_64")]
-     msrs: Vec<MsrEntry>,
-     vm_ops: Option<Arc<dyn vm::VmOps>>,
-@@ -1942,7 +2062,19 @@ impl cpu::Vcpu for KvmVcpu {
-     /// Triggers the running of the current virtual CPU returning an exit reason.
-     ///
-     fn run(&mut self) -> std::result::Result<cpu::VmExit, cpu::HypervisorCpuError> {
--        match self.fd.run() {
-+        let signal = self.kick_signal.load(Ordering::Relaxed);
-+        let run_result = self.fd.run();
-+
-+        // KVM_RUN restores the thread's blocked mask before returning. Unblock
-+        // the kick immediately so device emulation and other vCPU userspace work
-+        // remain interruptible. The run loop blocks it again before checking
-+        // lifecycle state, closing the check-to-KVM_RUN race.
-+        if signal != 0 {
-+            unblock_kvm_kick_signal(signal)
-+                .map_err(cpu::HypervisorCpuError::ConsumeVcpuKickSignal)?;
-+        }
-+
-+        match run_result {
-             Ok(run) => match run {
-                 #[cfg(target_arch = "x86_64")]
-                 VcpuExit::IoIn(addr, data) => {
-@@ -2018,7 +2150,8 @@ impl cpu::Vcpu for KvmVcpu {
+@@ -2018,7 +2107,8 @@ impl cpu::Vcpu for KvmVcpu {
              },
  
              Err(ref e) => match e.errno() {
@@ -256,15 +176,13 @@ index 2590091..9b5a4d1 100644
                  _ => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
                      "VCPU error {e:?}"
                  ))),
-@@ -2700,6 +2833,13 @@ impl cpu::Vcpu for KvmVcpu {
+@@ -2700,6 +2790,11 @@ impl cpu::Vcpu for KvmVcpu {
              .map_err(cpu::HypervisorCpuError::InitializeTdx)
      }
  
 +    fn configure_kick_signal(&self, signal: libc::c_int) -> cpu::Result<()> {
 +        configure_kvm_kick_signal(&self.fd, signal)
-+            .map_err(cpu::HypervisorCpuError::ConfigureVcpuKickSignal)?;
-+        self.kick_signal.store(signal, Ordering::Relaxed);
-+        Ok(())
++            .map_err(cpu::HypervisorCpuError::ConfigureVcpuKickSignal)
 +    }
 +
      ///
@@ -708,7 +626,7 @@ index e0a71c7..082c9ea 100644
          self.vu_common.resume()
      }
 diff --git a/vmm/src/cpu.rs b/vmm/src/cpu.rs
-index bba78e6..5a84384 100644
+index bba78e6..a0d8b14 100644
 --- a/vmm/src/cpu.rs
 +++ b/vmm/src/cpu.rs
 @@ -19,6 +19,7 @@ use std::mem::size_of;
@@ -719,7 +637,7 @@ index bba78e6..5a84384 100644
  use std::{cmp, io, result, thread};
  
  use acpi_tables::sdt::Sdt;
-@@ -116,6 +117,37 @@ macro_rules! extract_bits_64_without_offset {
+@@ -116,6 +117,68 @@ macro_rules! extract_bits_64_without_offset {
  
  pub const CPU_MANAGER_ACPI_SIZE: usize = 0xc;
  
@@ -728,7 +646,7 @@ index bba78e6..5a84384 100644
 +const VCPU_SIGNAL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 +
 +#[cfg(feature = "kvm")]
-+fn block_vcpu_kick_signal(signal: libc::c_int) -> io::Result<()> {
++fn vcpu_kick_signal_set(signal: libc::c_int) -> io::Result<libc::sigset_t> {
 +    // SAFETY: libc::sigset_t has no invalid bit pattern; sigemptyset initializes it
 +    // before it is read.
 +    let mut kick_set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
@@ -742,6 +660,13 @@ index bba78e6..5a84384 100644
 +        return Err(io::Error::last_os_error());
 +    }
 +
++    Ok(kick_set)
++}
++
++#[cfg(feature = "kvm")]
++fn block_vcpu_kick_signal(signal: libc::c_int) -> io::Result<()> {
++    let kick_set = vcpu_kick_signal_set(signal)?;
++
 +    // Block before reading lifecycle state. KVM_SET_SIGNAL_MASK temporarily
 +    // unblocks this signal inside KVM_RUN, so a kick sent after the state check
 +    // stays pending and interrupts that same KVM_RUN invocation.
@@ -754,10 +679,34 @@ index bba78e6..5a84384 100644
 +    Ok(())
 +}
 +
++#[cfg(feature = "kvm")]
++fn consume_vcpu_kick_signal(signal: libc::c_int) -> io::Result<()> {
++    let kick_set = vcpu_kick_signal_set(signal)?;
++
++    // The kick stays blocked throughout ordinary vCPU userspace work. Once the
++    // run loop has observed the lifecycle request, briefly unblocking it invokes
++    // the empty handler for a pending kick before pthread_sigmask() returns.
++    // Re-block immediately so the next request remains pending until its state is
++    // observed as well.
++    // SAFETY: kick_set remains valid for both pthread_sigmask calls.
++    let ret = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &kick_set, std::ptr::null_mut()) };
++    if ret != 0 {
++        return Err(io::Error::from_raw_os_error(ret));
++    }
++
++    // SAFETY: kick_set remains valid for this pthread_sigmask call.
++    let ret = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &kick_set, std::ptr::null_mut()) };
++    if ret != 0 {
++        return Err(io::Error::from_raw_os_error(ret));
++    }
++
++    Ok(())
++}
++
  #[derive(Debug, Error)]
  pub enum Error {
      #[error("Error creating vCPU")]
-@@ -162,6 +194,9 @@ pub enum Error {
+@@ -162,6 +225,9 @@ pub enum Error {
      #[error("Timeout when waiting for signal to be acknowledged")]
      SignalAcknowledgeTimeout,
  
@@ -767,7 +716,7 @@ index bba78e6..5a84384 100644
      #[error("Error adding CpuManager to MMIO bus")]
      BusError(#[source] vm_device::BusError),
  
-@@ -709,12 +744,23 @@ impl VcpuState {
+@@ -709,12 +775,23 @@ impl VcpuState {
          self.handle.is_some()
      }
  
@@ -791,7 +740,7 @@ index bba78e6..5a84384 100644
              // SAFETY: FFI call with correct arguments
              unsafe {
                  libc::pthread_kill(handle.as_pthread_t() as _, SIGRTMIN());
-@@ -722,29 +768,91 @@ impl VcpuState {
+@@ -722,29 +799,91 @@ impl VcpuState {
          }
      }
  
@@ -894,13 +843,47 @@ index bba78e6..5a84384 100644
          Ok(())
      }
  
-@@ -763,6 +871,112 @@ impl VcpuState {
+@@ -763,6 +902,168 @@ impl VcpuState {
      }
  }
  
 +#[cfg(test)]
 +mod vcpu_state_tests {
 +    use super::*;
++
++    #[cfg(feature = "kvm")]
++    fn signal_set_contains(set: &libc::sigset_t, signal: libc::c_int) -> bool {
++        // SAFETY: set points to an initialized sigset_t.
++        match unsafe { libc::sigismember(set, signal) } {
++            0 => false,
++            1 => true,
++            result => panic!("sigismember failed with {result}"),
++        }
++    }
++
++    #[cfg(feature = "kvm")]
++    fn pending_signal_set() -> libc::sigset_t {
++        // SAFETY: libc::sigset_t has no invalid bit pattern; sigpending fills it
++        // before it is read.
++        let mut pending = unsafe { std::mem::zeroed::<libc::sigset_t>() };
++        // SAFETY: pending points to valid sigset_t storage.
++        assert_eq!(unsafe { libc::sigpending(&mut pending) }, 0);
++        pending
++    }
++
++    #[cfg(feature = "kvm")]
++    fn blocked_signal_set() -> libc::sigset_t {
++        // SAFETY: libc::sigset_t has no invalid bit pattern; pthread_sigmask
++        // fills it before it is read.
++        let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
++        // When set is null, pthread_sigmask only returns the current mask and
++        // ignores how.
++        // SAFETY: blocked points to valid sigset_t storage.
++        let result =
++            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut blocked) };
++        assert_eq!(result, 0);
++        blocked
++    }
 +
 +    fn active_state() -> VcpuState {
 +        VcpuState {
@@ -926,11 +909,9 @@ index bba78e6..5a84384 100644
 +        ));
 +
 +        state.vcpu_run_interrupted.store(true, Ordering::SeqCst);
-+        assert!(
-+            state
-+                .wait_until_signal_acknowledged(Instant::now(), false)
-+                .is_ok()
-+        );
++        state
++            .wait_until_signal_acknowledged(Instant::now(), false)
++            .unwrap();
 +        join_active_state(&mut state);
 +    }
 +
@@ -946,11 +927,9 @@ index bba78e6..5a84384 100644
 +        };
 +
 +        state.signal_thread();
-+        assert!(
-+            state
-+                .wait_until_signal_acknowledged(Instant::now(), false)
-+                .is_ok()
-+        );
++        state
++            .wait_until_signal_acknowledged(Instant::now(), false)
++            .unwrap();
 +        assert!(!state.vcpu_run_interrupted.load(Ordering::SeqCst));
 +        join_active_state(&mut state);
 +    }
@@ -965,7 +944,7 @@ index bba78e6..5a84384 100644
 +        ));
 +
 +        state.paused.store(true, Ordering::SeqCst);
-+        assert!(state.wait_until_paused(true, Instant::now()).is_ok());
++        state.wait_until_paused(true, Instant::now()).unwrap();
 +        join_active_state(&mut state);
 +    }
 +
@@ -980,7 +959,7 @@ index bba78e6..5a84384 100644
 +        ));
 +
 +        state.reset_signal_acknowledgement();
-+        assert!(state.wait_until_resumed(Instant::now()).is_ok());
++        state.wait_until_resumed(Instant::now()).unwrap();
 +        join_active_state(&mut state);
 +    }
 +
@@ -995,19 +974,45 @@ index bba78e6..5a84384 100644
 +        ));
 +
 +        state.reset_signal_acknowledgement();
-+        assert!(
-+            state
-+                .wait_until_signal_acknowledgement_cleared(Instant::now())
-+                .is_ok()
-+        );
++        state
++            .wait_until_signal_acknowledgement_cleared(Instant::now())
++            .unwrap();
 +        join_active_state(&mut state);
++    }
++
++    #[cfg(feature = "kvm")]
++    #[test]
++    fn pending_vcpu_kick_survives_userspace_until_lifecycle_safe_point() {
++        thread::spawn(|| {
++            let signal = SIGRTMIN() + 1;
++
++            extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {}
++            register_signal_handler(signal, handle_signal).unwrap();
++
++            block_vcpu_kick_signal(signal).unwrap();
++
++            // SAFETY: pthread_self returns the current valid pthread identifier.
++            let result = unsafe { libc::pthread_kill(libc::pthread_self(), signal) };
++            assert_eq!(result, 0);
++            assert!(signal_set_contains(&pending_signal_set(), signal));
++
++            // Ordinary userspace work must not consume the lifecycle kick.
++            thread::yield_now();
++            assert!(signal_set_contains(&pending_signal_set(), signal));
++
++            consume_vcpu_kick_signal(signal).unwrap();
++            assert!(!signal_set_contains(&pending_signal_set(), signal));
++            assert!(signal_set_contains(&blocked_signal_set(), signal));
++        })
++        .join()
++        .unwrap();
 +    }
 +}
 +
  impl CpuManager {
      #[allow(unused_variables)]
      #[allow(clippy::too_many_arguments)]
-@@ -1061,7 +1275,6 @@ impl CpuManager {
+@@ -1061,7 +1362,6 @@ impl CpuManager {
          let vcpu_run_interrupted = self.vcpu_states[usize::try_from(vcpu_id).unwrap()]
              .vcpu_run_interrupted
              .clone();
@@ -1015,7 +1020,7 @@ index bba78e6..5a84384 100644
          let vcpu_paused = self.vcpu_states[usize::try_from(vcpu_id).unwrap()]
              .paused
              .clone();
-@@ -1092,6 +1305,15 @@ impl CpuManager {
+@@ -1092,6 +1392,15 @@ impl CpuManager {
  
          info!("Starting vCPU: cpu_id = {vcpu_id}");
  
@@ -1031,7 +1036,7 @@ index bba78e6..5a84384 100644
          let handle = Some(
              thread::Builder::new()
                  .name(format!("vcpu{vcpu_id}"))
-@@ -1117,23 +1339,36 @@ impl CpuManager {
+@@ -1117,23 +1426,36 @@ impl CpuManager {
                          }
                      }
  
@@ -1059,10 +1064,10 @@ index bba78e6..5a84384 100644
  
                      std::panic::catch_unwind(move || {
                          loop {
-+                            // KVMVcpu::run() leaves the kick unblocked while this
-+                            // thread handles userspace exits. Block it before the
-+                            // lifecycle checks below; KVM_RUN atomically unblocks
-+                            // it again through KVM_SET_SIGNAL_MASK.
++                            // Keep the kick blocked throughout vCPU userspace.
++                            // KVM_RUN atomically unblocks it through
++                            // KVM_SET_SIGNAL_MASK, and lifecycle branches consume
++                            // it only after observing the corresponding request.
 +                            #[cfg(feature = "kvm")]
 +                            if matches!(hypervisor_type, HypervisorType::Kvm)
 +                                && let Err(e) = block_vcpu_kick_signal(SIGRTMIN())
@@ -1074,7 +1079,24 @@ index bba78e6..5a84384 100644
                              // If we are being told to pause, we park the thread
                              // until the pause boolean is toggled.
                              // The resume operation is responsible for toggling
-@@ -1178,12 +1413,29 @@ impl CpuManager {
+@@ -1172,18 +1494,40 @@ impl CpuManager {
+                                     vcpu.lock().unwrap().vcpu.set_immediate_exit(false);
+                                 }
+ 
++                                // The lifecycle request has been observed and any
++                                // pending KVM I/O has been completed. It is now safe
++                                // to consume this request's pending kick.
++                                #[cfg(feature = "kvm")]
++                                if matches!(hypervisor_type, HypervisorType::Kvm)
++                                    && let Err(e) = consume_vcpu_kick_signal(SIGRTMIN())
++                                {
++                                    error!("Failed to consume the vCPU pause kick: {e}");
++                                    break;
++                                }
++
+                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
+ 
+                                 vcpu_paused.store(true, Ordering::SeqCst);
                                  while vcpus_pause_signalled.load(Ordering::SeqCst) {
                                      thread::park();
                                  }
@@ -1085,17 +1107,11 @@ index bba78e6..5a84384 100644
 +                                // that late pending signal before acknowledging
 +                                // resume and entering the next guest KVM_RUN.
 +                                #[cfg(feature = "kvm")]
-+                                if matches!(hypervisor_type, HypervisorType::Kvm) {
-+                                    let mut vcpu = vcpu.lock().unwrap();
-+                                    vcpu.vcpu.set_immediate_exit(true);
-+                                    let run_result = vcpu.run();
-+                                    vcpu.vcpu.set_immediate_exit(false);
-+                                    if !matches!(run_result, Ok(VmExit::Ignore)) {
-+                                        error!(
-+                                            "Unexpected VM exit while draining the vCPU kick signal"
-+                                        );
-+                                        break;
-+                                    }
++                                if matches!(hypervisor_type, HypervisorType::Kvm)
++                                    && let Err(e) = consume_vcpu_kick_signal(SIGRTMIN())
++                                {
++                                    error!("Failed to consume the late vCPU pause kick: {e}");
++                                    break;
 +                                }
                                  vcpu_run_interrupted.store(false, Ordering::SeqCst);
 +                                vcpu_paused.store(false, Ordering::SeqCst);
@@ -1106,7 +1122,7 @@ index bba78e6..5a84384 100644
                                  #[cfg(target_arch = "x86_64")]
                                  match vcpu.lock().as_ref().unwrap().vcpu.nmi() {
                                      Ok(()) => {},
-@@ -1192,6 +1444,33 @@ impl CpuManager {
+@@ -1192,6 +1536,35 @@ impl CpuManager {
                                          break;
                                      }
                                  }
@@ -1115,6 +1131,14 @@ index bba78e6..5a84384 100644
 +                                // current request and completed NMI injection. Wait
 +                                // for the manager to retire that request so it cannot
 +                                // be injected again on the next loop iteration.
++                                #[cfg(feature = "kvm")]
++                                if matches!(hypervisor_type, HypervisorType::Kvm)
++                                    && let Err(e) = consume_vcpu_kick_signal(SIGRTMIN())
++                                {
++                                    error!("Failed to consume the vCPU NMI kick: {e}");
++                                    break;
++                                }
++
 +                                vcpu_run_interrupted.store(true, Ordering::SeqCst);
 +                                while vcpus_kick_signalled.load(Ordering::SeqCst) {
 +                                    thread::park();
@@ -1124,23 +1148,17 @@ index bba78e6..5a84384 100644
 +                                // was sent, the signal is now pending. Drain it before
 +                                // returning to normal guest execution.
 +                                #[cfg(feature = "kvm")]
-+                                if matches!(hypervisor_type, HypervisorType::Kvm) {
-+                                    let mut vcpu = vcpu.lock().unwrap();
-+                                    vcpu.vcpu.set_immediate_exit(true);
-+                                    let run_result = vcpu.run();
-+                                    vcpu.vcpu.set_immediate_exit(false);
-+                                    if !matches!(run_result, Ok(VmExit::Ignore)) {
-+                                        error!(
-+                                            "Unexpected VM exit while draining the vCPU kick signal"
-+                                        );
-+                                        break;
-+                                    }
++                                if matches!(hypervisor_type, HypervisorType::Kvm)
++                                    && let Err(e) = consume_vcpu_kick_signal(SIGRTMIN())
++                                {
++                                    error!("Failed to consume the late vCPU NMI kick: {e}");
++                                    break;
 +                                }
 +                                vcpu_run_interrupted.store(false, Ordering::SeqCst);
                              }
  
                              // We've been told to terminate
-@@ -1231,13 +1510,11 @@ impl CpuManager {
+@@ -1231,13 +1604,11 @@ impl CpuManager {
                                      VmExit::Hyperv => {}
                                      VmExit::Reset => {
                                          info!("VmExit::Reset");
@@ -1154,7 +1172,7 @@ index bba78e6..5a84384 100644
                                          exit_evt.write(1).unwrap();
                                          break;
                                      }
-@@ -1258,7 +1535,6 @@ impl CpuManager {
+@@ -1258,7 +1629,6 @@ impl CpuManager {
  
                                  Err(e) => {
                                      error!("VCPU generated error: {:?}", Error::VcpuRun(e.into()));
@@ -1162,7 +1180,7 @@ index bba78e6..5a84384 100644
                                      exit_evt.write(1).unwrap();
                                      break;
                                  }
-@@ -1274,7 +1550,6 @@ impl CpuManager {
+@@ -1274,7 +1644,6 @@ impl CpuManager {
                          }
                      })
                      .or_else(|_| {
@@ -1170,7 +1188,7 @@ index bba78e6..5a84384 100644
                          error!("vCPU thread panicked");
                          panic_exit_evt.write(1)
                      })
-@@ -1350,10 +1625,19 @@ impl CpuManager {
+@@ -1350,10 +1719,19 @@ impl CpuManager {
  
      fn remove_vcpu(&mut self, cpu_id: u32) -> Result<()> {
          info!("Removing vCPU: cpu_id = {cpu_id}");
@@ -1191,7 +1209,7 @@ index bba78e6..5a84384 100644
          state.join_thread()?;
          state.handle = None;
  
-@@ -1445,20 +1729,33 @@ impl CpuManager {
+@@ -1445,20 +1823,33 @@ impl CpuManager {
      ///
      /// For the vCPU threads this will interrupt the KVM_RUN ioctl() allowing
      /// the loop to check the shared state booleans.
@@ -1227,7 +1245,7 @@ index bba78e6..5a84384 100644
          // Tell the vCPUs to stop themselves next time they go through the loop
          self.vcpus_kill_signalled.store(true, Ordering::SeqCst);
  
-@@ -1470,7 +1767,7 @@ impl CpuManager {
+@@ -1470,7 +1861,7 @@ impl CpuManager {
              state.unpark_thread();
          }
  
@@ -1236,7 +1254,7 @@ index bba78e6..5a84384 100644
  
          // Wait for all the threads to finish. This removes the state from the vector.
          for mut state in self.vcpu_states.drain(..) {
-@@ -2086,11 +2383,32 @@ impl CpuManager {
+@@ -2086,11 +2477,32 @@ impl CpuManager {
      }
  
      pub(crate) fn nmi(&mut self) -> Result<()> {
@@ -1271,7 +1289,7 @@ index bba78e6..5a84384 100644
      }
  }
  
-@@ -2446,40 +2764,66 @@ impl Aml for CpuManager {
+@@ -2446,40 +2858,66 @@ impl Aml for CpuManager {
  
  impl Pausable for CpuManager {
      fn pause(&mut self) -> std::result::Result<(), MigratableError> {
@@ -1358,7 +1376,7 @@ index bba78e6..5a84384 100644
          // Ensure that vCPUs keep running after being unpark() in
          // their run vCPU loop.
          self.vcpus_pause_signalled.store(false, Ordering::SeqCst);
-@@ -2491,14 +2835,12 @@ impl Pausable for CpuManager {
+@@ -2491,14 +2929,12 @@ impl Pausable for CpuManager {
                  state.unpark_thread();
              }
          }
