@@ -44,10 +44,10 @@
 | `virtio-devices/src/vsock/unix/muxer.rs` | ~20 | 持久化 host local-port 分配游标 |
 | `virtio-devices/src/vsock/device.rs` / `mod.rs` | ~330 | snapshot 时发布 transport reset,restore 重发 IRQ,guest 确认前 gate RX |
 | `hypervisor/src/cpu.rs` / `kvm/mod.rs` | ~150 | `KVM_SET_SIGNAL_MASK` no-miss vCPU kick + pending signal 消费 |
-| `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~350 | 请求级 vCPU ACK、单调时钟 deadline、pending kick drain、KVM ioctl allowlist |
+| `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~420 | 请求级 vCPU ACK、单调时钟 deadline、pending kick drain、KVM ioctl allowlist |
 | `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~280 | pause event publish/wake + resume 双向 barrier,覆盖自定义 worker |
 
-7 个 commit 合计 1,532 insertions / 124 deletions,基于 cloud-hypervisor `v51.1`。
+7 个 commit 合计 1,582 insertions / 137 deletions,基于 cloud-hypervisor `v51.1`。
 
 ### 1.3 维护策略
 
@@ -300,8 +300,10 @@ patch 通过三组相互独立但同属 lifecycle barrier 的修复关闭该问�
    NMI 使用 ACK set/clear 双向 barrier,控制线程在所有 vCPU 清除本次 ACK 后才返回,
    因此前一请求的 drain 不会吞掉下一次 pause 的 kick。已经自然结束但尚未 join 的
    vCPU thread 由 `JoinHandle::is_finished()` 从 signal barrier 排除,其 ACK 仍保持
-   false,避免正常 shutdown 清理等待一个不可能到达的 ACK。非 KVM backend 保留
-   10 ms retry。所有等待统一使用 `CLOCK_MONOTONIC` 语义的 1 s deadline。
+   false,避免正常 shutdown 清理等待一个不可能到达的 ACK。pause 失败会撤销请求、
+   unpark 并等待已参与 vCPU 恢复;NMI 即使 signal 超时也会完成 ACK-clear cleanup,
+   两条错误路径都使用独立的新 deadline。非 KVM backend 保留 10 ms retry。所有等待
+   统一使用 `CLOCK_MONOTONIC` 语义的 1 s deadline。
 3. runtime pause 先发布共享 pause event,再显式 unpark 所有普通与自定义 worker,
    关闭 worker 的 zero-time epoll poll 到 `thread::park` 之间的启动竞态。resume 先
    drain 该 event 再唤醒 worker;worker 从 park 恢复后参加第二次 barrier,control
