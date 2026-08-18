@@ -44,10 +44,10 @@
 | `virtio-devices/src/vsock/unix/muxer.rs` | ~20 | 持久化 host local-port 分配游标 |
 | `virtio-devices/src/vsock/device.rs` / `mod.rs` | ~330 | snapshot 时发布 transport reset,restore 重发 IRQ,guest 确认前 gate RX |
 | `hypervisor/src/cpu.rs` / `kvm/mod.rs` | ~150 | `KVM_SET_SIGNAL_MASK` no-miss vCPU kick + pending signal 消费 |
-| `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~200 | vCPU ACK 重置、单调时钟 deadline、KVM ioctl allowlist |
-| `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~250 | pause event publish/wake + resume 双向 barrier,覆盖自定义 worker |
+| `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~320 | 请求级 vCPU ACK、单调时钟 deadline、pending kick drain、KVM ioctl allowlist |
+| `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~280 | pause event publish/wake + resume 双向 barrier,覆盖自定义 worker |
 
-总计约 1,310 行 Rust、7 个 commit,基于 cloud-hypervisor `v51.1`。
+7 个 commit 合计 1,496 insertions / 123 deletions,基于 cloud-hypervisor `v51.1`。
 
 ### 1.3 维护策略
 
@@ -286,16 +286,20 @@ vCPU 仍可阻塞在 `KVM_RUN`;每 10 ms 重发只能降低概率,不能关闭�
 
 patch 通过三组相互独立但同属 lifecycle barrier 的修复关闭该问题:
 
-1. vCPU thread 在 userspace 阻塞 kick signal,并通过 `KVM_SET_SIGNAL_MASK` 只在
-   `KVM_RUN` 内解除阻塞。这样 signal 要么中断当前 `KVM_RUN`,要么保持 pending 并
-   中断下一次调用,不存在 userspace 丢失窗口。`KVM_RUN` 返回 `EINTR` 后必须短暂
-   unblock 再 block,让空 handler 消费 pending signal;否则它会令后续每次
-   `KVM_RUN` 都立即返回,表现成 API 成功但 guest 不再执行。VMM seccomp 的公共 KVM
-   ioctl 集显式放行 `KVM_SET_SIGNAL_MASK`。
-2. 每次 pause、shutdown、NMI 和 vCPU removal 请求都在发布状态前清除旧 ACK;
-   resume 在发布 `paused=false` 前清除 ACK,并等待 vCPU 确认恢复。所有等待统一使用
-   `CLOCK_MONOTONIC` 语义的 1 s deadline,10 ms 重发只保留为调度延迟补偿与诊断,
-   不再承担 no-miss 正确性。
+1. 创建线程在 spawn vCPU 前配置 `KVM_SET_SIGNAL_MASK` 并阻塞 kick signal,使子线程
+   从第一条指令起继承 userspace blocked mask;配置失败直接返回,不会让一个提前退出
+   的 vCPU 留在启动 barrier 之外。KVM 只在 `KVM_RUN` 内解除该 signal,所以一次 kick
+   要么中断当前调用,要么保持 pending 并中断下一次调用。`KVM_RUN` 返回 `EINTR` 后
+   短暂 unblock 再 block,让空 handler 消费 pending signal;否则后续每次 `KVM_RUN`
+   都会立即返回,表现成 API 成功但 guest 不再执行。VMM seccomp 的公共 KVM ioctl 集
+   显式放行 `KVM_SET_SIGNAL_MASK`。
+2. pause、shutdown、NMI 和 vCPU removal 在发布请求前清除旧 ACK;vCPU 只有进入当前
+   请求的 pause/NMI/kill 分支后才写 ACK,自然 reset、shutdown、run error 或 panic
+   不能冒充请求确认。KVM no-miss 路径每个请求只发一次 kick;若 vCPU 在 kick 发出前
+   已看到共享状态,pause resume 和 NMI 完成前会显式 drain 该 late pending signal。
+   NMI 使用 ACK set/clear 双向 barrier,控制线程在所有 vCPU 清除本次 ACK 后才返回,
+   因此前一请求的 drain 不会吞掉下一次 pause 的 kick。非 KVM backend 保留 10 ms
+   retry。所有等待统一使用 `CLOCK_MONOTONIC` 语义的 1 s deadline。
 3. runtime pause 先发布共享 pause event,再显式 unpark 所有普通与自定义 worker,
    关闭 worker 的 zero-time epoll poll 到 `thread::park` 之间的启动竞态。resume 先
    drain 该 event 再唤醒 worker;worker 从 park 恢复后参加第二次 barrier,control
