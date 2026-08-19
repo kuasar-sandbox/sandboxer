@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
+	"golang.org/x/sys/unix"
 )
 
 type ControllerHookOptions struct {
@@ -418,6 +419,13 @@ func (h *ControllerHooks) applyContext() context.Context {
 }
 
 func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes uint64) error {
+	memoryHighLock, err := h.lockMemoryHigh()
+	if err != nil {
+		return err
+	}
+	if memoryHighLock != nil {
+		defer memoryHighLock.Close()
+	}
 	previousHigh, err := h.readMemoryHigh()
 	if err != nil {
 		return err
@@ -452,6 +460,25 @@ func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes
 	h.enforcementPending = false
 	h.mu.Unlock()
 	return nil
+}
+
+// lockMemoryHigh serializes controller enforcement with VMM lifecycle
+// operations. The lifecycle code holds the same advisory lock while it lifts
+// memory.high, so an allocation cannot reinstate throttling before every CH
+// thread has crossed the quiesce/pause/resume or shutdown barrier.
+func (h *ControllerHooks) lockMemoryHigh() (*os.File, error) {
+	if h == nil || h.opts.CgroupPath == "" {
+		return nil, nil
+	}
+	lock, err := os.Open(h.opts.CgroupPath)
+	if err != nil {
+		return nil, fmt.Errorf("open memory.high lifecycle lock: %w", err)
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("lock memory.high lifecycle: %w", err)
+	}
+	return lock, nil
 }
 
 func (h *ControllerHooks) memoryHighPath() string {

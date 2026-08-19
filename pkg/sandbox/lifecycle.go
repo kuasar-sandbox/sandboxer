@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/tapfd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
+	"golang.org/x/sys/unix"
 )
 
 // RunOptions controls a single sandbox-ctl run invocation.
@@ -528,28 +530,50 @@ const chShutdownGrace = 5 * time.Second
 // cgroup. Lifecycle API calls need every CH thread to return to userspace; a
 // thread sleeping in mem_cgroup_handle_over_high cannot acknowledge pause or
 // ordered shutdown even though sandbox-ctl itself remains responsive outside
-// the cgroup. memory.max remains in force while memory.high is lifted.
-func liftVMMMemoryHigh(cgroupPath string) ([]byte, error) {
+// the cgroup. memory.max remains in force while memory.high is lifted. The
+// advisory lock is also taken by ControllerHooks, so a dynamic allocation
+// update cannot reinstate throttling inside the lifecycle critical section.
+func liftVMMMemoryHigh(cgroupPath string) ([]byte, *os.File, error) {
+	return liftVMMMemoryHighWithLock(cgroupPath, unix.LOCK_EX)
+}
+
+func tryLiftVMMMemoryHigh(cgroupPath string) ([]byte, *os.File, error) {
+	return liftVMMMemoryHighWithLock(cgroupPath, unix.LOCK_EX|unix.LOCK_NB)
+}
+
+func liftVMMMemoryHighWithLock(cgroupPath string, lockOperation int) ([]byte, *os.File, error) {
 	if cgroupPath == "" {
-		return nil, nil
+		return nil, nil, nil
+	}
+	lock, err := os.Open(cgroupPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open memory.high lifecycle lock: %w", err)
+	}
+	fail := func(err error) ([]byte, *os.File, error) {
+		_ = lock.Close()
+		return nil, nil, err
+	}
+	if err := unix.Flock(int(lock.Fd()), lockOperation); err != nil {
+		return fail(fmt.Errorf("lock memory.high lifecycle: %w", err))
 	}
 	path := filepath.Join(cgroupPath, "memory.high")
 	previous, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		return fail(fmt.Errorf("read %s: %w", path, err))
 	}
 	if strings.TrimSpace(string(previous)) == "max" {
-		return previous, nil
+		return previous, lock, nil
 	}
 	if err := os.WriteFile(path, []byte("max"), 0o644); err != nil {
-		return nil, fmt.Errorf("write %s: %w", path, err)
+		return fail(fmt.Errorf("write %s: %w", path, err))
 	}
-	return previous, nil
+	return previous, lock, nil
 }
 
 // restoreVMMMemoryHigh restores a value saved by liftVMMMemoryHigh only while
-// the file still contains "max". A concurrent resource-controller update is
-// therefore authoritative and is never overwritten with a stale watermark.
+// the file still contains "max". ControllerHooks updates are serialized by the
+// lifecycle lock; the conditional write also avoids overwriting a change made
+// by an external writer that does not participate in that lock.
 func restoreVMMMemoryHigh(cgroupPath string, previous []byte) (bool, error) {
 	if cgroupPath == "" || previous == nil || strings.TrimSpace(string(previous)) == "max" {
 		return false, nil
@@ -566,6 +590,36 @@ func restoreVMMMemoryHigh(cgroupPath string, previous []byte) (bool, error) {
 		return false, fmt.Errorf("write %s: %w", path, err)
 	}
 	return true, nil
+}
+
+// memoryHighThrottleDrain covers Linux's maximum per-batch memory.high delay
+// (2 seconds) plus a small scheduling margin. Raising memory.high stops new
+// throttling, but it does not wake a task already sleeping in
+// mem_cgroup_handle_over_high. CH deliberately keeps its vCPU kick signal
+// blocked outside KVM_RUN, so ordered shutdown must let that existing sleep
+// expire before starting CH's one-second acknowledgement window.
+const memoryHighThrottleDrain = 2100 * time.Millisecond
+
+func vmmMemoryHighThrottleDrainDelay(cgroupPath string, previous []byte) time.Duration {
+	if cgroupPath == "" || previous == nil {
+		return 0
+	}
+	high, err := strconv.ParseUint(strings.TrimSpace(string(previous)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	currentRaw, err := os.ReadFile(filepath.Join(cgroupPath, "memory.current"))
+	if err != nil {
+		return memoryHighThrottleDrain
+	}
+	current, err := strconv.ParseUint(strings.TrimSpace(string(currentRaw)), 10, 64)
+	if err != nil {
+		return memoryHighThrottleDrain
+	}
+	if current > high {
+		return memoryHighThrottleDrain
+	}
+	return 0
 }
 
 // processSignaler is the subset of *os.Process needed by
@@ -604,6 +658,7 @@ func waitForCHWithSignalEscalation(
 ) error {
 	var killTimer *time.Timer
 	var killCh <-chan time.Time
+	var memoryHighLock *os.File
 	shutdownInitiated := false
 	for {
 		select {
@@ -611,12 +666,21 @@ func waitForCHWithSignalEscalation(
 			if !shutdownInitiated {
 				usedAPI := false
 				if chSock != "" {
-					previousHigh, liftErr := liftVMMMemoryHigh(cgroupPath)
+					previousHigh, lock, liftErr := tryLiftVMMMemoryHigh(cgroupPath)
 					if liftErr != nil {
-						logf("received %v, could not lift VMM memory.high before shutdown: %v", sig, liftErr)
+						if errors.Is(liftErr, unix.EWOULDBLOCK) {
+							logf("received %v, VMM lifecycle already holds memory.high; falling back to SIGTERM", sig)
+						} else {
+							logf("received %v, could not lift VMM memory.high before shutdown: %v", sig, liftErr)
+						}
 					} else {
+						memoryHighLock = lock
 						if previousHigh != nil && strings.TrimSpace(string(previousHigh)) != "max" {
 							logf("received %v, lifted VMM memory.high for ordered shutdown", sig)
+						}
+						if drainDelay := vmmMemoryHighThrottleDrainDelay(cgroupPath, previousHigh); drainDelay > 0 {
+							logf("received %v, waiting %s for existing VMM memory.high throttles to drain", sig, drainDelay)
+							time.Sleep(drainDelay)
 						}
 						if err := (chapi.Client{Sock: chSock, RespDeadline: chRespDeadline}).ShutdownVMM(); err == nil {
 							logf("received %v, requested vmm.shutdown via API (will SIGKILL after %s if CH still alive)", sig, grace)
@@ -648,6 +712,11 @@ func waitForCHWithSignalEscalation(
 		case waitErr := <-doneCh:
 			if killTimer != nil {
 				killTimer.Stop()
+			}
+			if memoryHighLock != nil {
+				if err := memoryHighLock.Close(); err != nil {
+					logf("release VMM memory.high lifecycle lock: %v", err)
+				}
 			}
 			return waitErr
 		}
@@ -885,15 +954,15 @@ type SnapshotHandler struct {
 
 // Handle dispatches one ctl snapshot_request. Public for restore.Run.
 func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
-	return h.handle(req, "")
+	return h.handle(req, "", nil)
 }
 
-func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string) (ctl.Response, error) {
+func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (ctl.Response, error) {
 	opts := RunOptions{
 		Cfg: h.Cfg, ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
 	}
-	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, h.Pinger, h.Forwarder, h.Reattach, h.Logf)
+	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, h.Pinger, h.Forwarder, h.Reattach, h.Logf)
 }
 
 // handleSnapshotRequest executes one snapshot_request received via
@@ -909,6 +978,7 @@ func handleSnapshotRequest(
 	servers []*vhost.Server, // all vhost servers (quiesced together)
 	chSock, runDir string,
 	cgroupPath string,
+	chExited <-chan struct{},
 	pinger *guestlink.Pinger,
 	forwarder *Forwarder, // gates new forwards + collapses active relays around quiesce; may be nil
 	reattachMUX func() error, // re-establishes the stdio MUX after a resumed snapshot attempt; may be nil
@@ -1072,7 +1142,7 @@ func handleSnapshotRequest(
 			logf("stdio MUX re-attached after %s", reason)
 		}
 	}
-	previousMemoryHigh, liftErr := liftVMMMemoryHigh(cgroupPath)
+	previousMemoryHigh, memoryHighLock, liftErr := liftVMMMemoryHigh(cgroupPath)
 	if liftErr != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: lift VMM memory.high: %w", liftErr)
 	}
@@ -1091,6 +1161,11 @@ func handleSnapshotRequest(
 			err = errors.Join(err, fmt.Errorf("snapshot: restore VMM memory.high: %w", restoreErr))
 		} else if restored {
 			logf("snapshot: restored VMM memory.high after lifecycle operation")
+		}
+		if memoryHighLock != nil {
+			if closeErr := memoryHighLock.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("snapshot: release VMM memory.high lifecycle lock: %w", closeErr))
+			}
 		}
 	}()
 
@@ -1114,7 +1189,7 @@ func handleSnapshotRequest(
 	// that is what makes `sandbox-ctl run` return (docs/sandbox.md §6.2 T8).
 	defer func() {
 		if err == nil && !req.ResumeAfter {
-			go destroyAfterSnapshot(chSock, cgroupPath, previousMemoryHigh, opts.Cfg.CHApiDeadline(), logf)
+			go destroyAfterSnapshot(chSock, cgroupPath, previousMemoryHigh, memoryHighLock, chExited, opts.Cfg.CHApiDeadline(), logf)
 		}
 	}()
 	// Gate new port-forward connects and join every admitted handshake/relay
@@ -1259,9 +1334,25 @@ const destroyAfterSnapshotDelay = 300 * time.Millisecond
 // destroyAfterSnapshot tears the VMM down (PUT /api/v1/vmm.shutdown) so
 // the `sandbox-ctl run` process owning this ctl.sock returns. Run on a
 // goroutine on the resume_after=false ("destroy") path: by the time the
-// delay elapses the snapshot_done response has been queued + sent. Errors
-// are only logged — the sandbox is being torn down regardless.
-func destroyAfterSnapshot(chSock, cgroupPath string, previousMemoryHigh []byte, respDeadline time.Duration, logf func(string, ...any)) {
+// delay elapses the snapshot_done response has been queued + sent. The
+// memory.high lifecycle lock remains held until CH exits so controller updates
+// cannot reinstate throttling during ordered shutdown. Errors are only logged
+// — the sandbox is being torn down regardless.
+func destroyAfterSnapshot(
+	chSock, cgroupPath string,
+	previousMemoryHigh []byte,
+	memoryHighLock *os.File,
+	chExited <-chan struct{},
+	respDeadline time.Duration,
+	logf func(string, ...any),
+) {
+	if memoryHighLock != nil {
+		defer func() {
+			if err := memoryHighLock.Close(); err != nil {
+				logf("snapshot: destroy mode — release VMM memory.high lifecycle lock: %v", err)
+			}
+		}()
+	}
 	time.Sleep(destroyAfterSnapshotDelay)
 	if err := (chapi.Client{Sock: chSock, RespDeadline: respDeadline}).ShutdownVMM(); err != nil {
 		logf("snapshot: destroy mode — vmm.shutdown: %v", err)
@@ -1273,6 +1364,9 @@ func destroyAfterSnapshot(chSock, cgroupPath string, previousMemoryHigh []byte, 
 		return
 	}
 	logf("snapshot: destroy mode — VMM shutdown requested")
+	if chExited != nil {
+		<-chExited
+	}
 }
 
 func ensureSnapshotDir(dir string) error {
