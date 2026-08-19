@@ -436,6 +436,10 @@ func ServeAndWait(p VMParams) (int, error) {
 	// + collapse active relays around quiesce (symmetric with the pinger);
 	// started below alongside the other backend servers.
 	forwarder := NewForwarder(vsockBase, logf)
+	cgroupPath := ""
+	if p.Cgroup != nil {
+		cgroupPath = p.Cgroup.LocalPath()
+	}
 
 	// ctl.sock server for snapshot requests. SnapshotHandler is the
 	// shared bundle both Run and restore.Run use.
@@ -457,9 +461,11 @@ func ServeAndWait(p VMParams) (int, error) {
 		Logf:          logf,
 	}
 	ctlSrv := &ctl.Server{
-		Path:            ctlSockPath,
-		Logf:            logf,
-		SnapshotHandler: snapHandler.Handle,
+		Path: ctlSockPath,
+		Logf: logf,
+		SnapshotHandler: func(req ctl.Request) (ctl.Response, error) {
+			return snapHandler.handle(req, cgroupPath)
+		},
 		ExecHandler: func(conn net.Conn, req ctl.Request) {
 			guestlink.ServeExecRequest(backendCtx, conn, req, vsockBase, logf)
 		},
@@ -626,7 +632,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	doneCh := make(chan error, 1)
 	go func() { doneCh <- cmd.Wait() }()
 
-	waitErr := waitForCHWithSignalEscalation(doneCh, sigCh, cmd.Process, chPid, chSock, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf)
+	waitErr := waitForCHWithSignalEscalation(doneCh, sigCh, cmd.Process, chPid, chSock, cgroupPath, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf)
 	cancelBackends()
 	backendWG.Wait()
 	exit := 0
