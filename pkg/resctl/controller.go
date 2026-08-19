@@ -419,18 +419,15 @@ func (h *ControllerHooks) applyContext() context.Context {
 }
 
 func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes uint64) error {
-	memoryHighLock, err := h.lockMemoryHigh()
-	if err != nil {
-		return err
-	}
-	if memoryHighLock != nil {
-		defer memoryHighLock.Close()
-	}
-	previousHigh, err := h.readMemoryHigh()
-	if err != nil {
-		return err
-	}
-	if err := h.setMemoryHigh(allocBytes); err != nil {
+	var previousHigh []byte
+	if err := h.withMemoryHighLock(func() error {
+		var err error
+		previousHigh, err = h.readMemoryHigh()
+		if err != nil {
+			return err
+		}
+		return h.setMemoryHigh(allocBytes)
+	}); err != nil {
 		return err
 	}
 	if h.opts.Balloon != nil {
@@ -447,7 +444,10 @@ func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes
 			// Static restore deliberately keeps the failed balloon target queued
 			// for retry; memory.high must remain at that eventual target too.
 			if dynamic {
-				if rollbackErr := h.restoreMemoryHigh(previousHigh); rollbackErr != nil {
+				rollbackErr := h.withMemoryHighLock(func() error {
+					return h.restoreMemoryHigh(previousHigh)
+				})
+				if rollbackErr != nil {
 					return errors.Join(balloonErr, fmt.Errorf("rollback memory.high: %w", rollbackErr))
 				}
 			}
@@ -462,10 +462,23 @@ func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes
 	return nil
 }
 
-// lockMemoryHigh serializes controller enforcement with VMM lifecycle
-// operations. The lifecycle code holds the same advisory lock while it lifts
-// memory.high, so an allocation cannot reinstate throttling before every CH
-// thread has crossed the quiesce/pause/resume or shutdown barrier.
+// withMemoryHighLock serializes each watermark commit or rollback with VMM
+// lifecycle operations. Balloon RPC and ambiguous-result recovery deliberately
+// run outside the lock: they can last until the sandbox lifetime is canceled,
+// and must not prevent lifecycle code from lifting memory.high. A later dynamic
+// rollback reacquires the lock, so it waits until any active lifecycle barrier
+// has restored and released the watermark.
+func (h *ControllerHooks) withMemoryHighLock(fn func() error) error {
+	memoryHighLock, err := h.lockMemoryHigh()
+	if err != nil {
+		return err
+	}
+	if memoryHighLock != nil {
+		defer memoryHighLock.Close()
+	}
+	return fn()
+}
+
 func (h *ControllerHooks) lockMemoryHigh() (*os.File, error) {
 	if h == nil || h.opts.CgroupPath == "" {
 		return nil, nil

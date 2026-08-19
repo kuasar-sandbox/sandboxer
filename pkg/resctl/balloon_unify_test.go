@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"golang.org/x/sys/unix"
 )
 
 // fakeCHResize spins a tiny HTTP/1.1-over-UDS server that records every
@@ -621,6 +622,108 @@ func TestHooks_AmbiguousBalloonDoesNotReturnBeforeResolution(t *testing.T) {
 	}
 	if got := h.AllocatableNowMem(); got != previousAlloc {
 		t.Fatalf("ambiguous allocation was published as %d, want retained %d", got, previousAlloc)
+	}
+}
+
+func TestHooks_AmbiguousBalloonReleasesLifecycleLockAndSerializesRollback(t *testing.T) {
+	const (
+		capacity      = uint64(8 << 30)
+		previousAlloc = uint64(2 << 30)
+		newAlloc      = uint64(3 << 30)
+	)
+	cgroup := t.TempDir()
+	memoryHigh := filepath.Join(cgroup, "memory.high")
+	previousHigh := []byte("1879048192\n")
+	if err := os.WriteFile(memoryHigh, previousHigh, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := newFakeCHResize(t)
+	srv.setCurrent(capacity - previousAlloc)
+	srv.dropAckNext(100)
+	srv.failInfoNext(100)
+	b := NewBalloonController(srv.sock, capacity, nil)
+	b.SeedAppliedAllocatable(previousAlloc)
+	cfg := &config.SandboxConfig{
+		Resources: config.ResourcesConfig{
+			Capacity:    config.CapacityConfig{Memory: "8GiB"},
+			Allocatable: config.AllocatableConfig{Memory: "1GiB"},
+		},
+	}
+	cfg.ApplyDefaults()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := &ControllerHooks{
+		opts: ControllerHookOptions{
+			SocketPath: "/run/node-resource-controller.sock",
+			CgroupPath: cgroup,
+			Balloon:    b,
+			Logf:       func(string, ...any) {},
+		},
+		cfg:               cfg,
+		lifetimeCtx:       ctx,
+		allocatableNowMem: previousAlloc,
+		desiredAllocMem:   previousAlloc,
+	}
+
+	applyDone := make(chan error, 1)
+	go func() { applyDone <- h.OnAllocatableChanged(newAlloc) }()
+	deadline := time.Now().Add(time.Second)
+	for len(srv.seen()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if calls := srv.seen(); len(calls) < 2 {
+		cancel()
+		t.Fatalf("ambiguous resize did not enter compensation loop: %v", calls)
+	}
+
+	var lifecycleLock *os.File
+	for time.Now().Before(deadline) {
+		candidate, err := os.Open(cgroup)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		err = unix.Flock(int(candidate.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			lifecycleLock = candidate
+			break
+		}
+		_ = candidate.Close()
+		if !errors.Is(err, unix.EWOULDBLOCK) {
+			cancel()
+			t.Fatalf("acquire lifecycle lock: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if lifecycleLock == nil {
+		cancel()
+		t.Fatal("ambiguous balloon recovery retained the lifecycle lock")
+	}
+
+	cancel()
+	select {
+	case err := <-applyDone:
+		_ = lifecycleLock.Close()
+		t.Fatalf("allocation returned before rollback acquired lifecycle lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := lifecycleLock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-applyDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ambiguous resize error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("allocation did not complete after lifecycle lock release")
+	}
+	gotHigh, err := os.ReadFile(memoryHigh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotHigh) != string(previousHigh) {
+		t.Fatalf("memory.high = %q after serialized rollback, want %q", gotHigh, previousHigh)
 	}
 }
 
