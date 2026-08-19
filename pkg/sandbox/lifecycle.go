@@ -596,8 +596,11 @@ func restoreVMMMemoryHigh(cgroupPath string, previous []byte) (bool, error) {
 // (2 seconds) plus a small scheduling margin. Raising memory.high stops new
 // throttling, but it does not wake a task already sleeping in
 // mem_cgroup_handle_over_high. CH deliberately keeps its vCPU kick signal
-// blocked outside KVM_RUN, so ordered shutdown must let that existing sleep
-// expire before starting CH's one-second acknowledgement window.
+// blocked outside KVM_RUN, so snapshot and ordered shutdown must let that
+// existing sleep expire before starting CH's one-second acknowledgement
+// window. A zero memory.events.local high counter proves that this cgroup has
+// never entered the throttle; otherwise a below-watermark point sample alone
+// is insufficient and the path drains conservatively.
 const memoryHighThrottleDrain = 2100 * time.Millisecond
 
 func vmmMemoryHighThrottleDrainDelay(cgroupPath string, previous []byte) time.Duration {
@@ -619,7 +622,42 @@ func vmmMemoryHighThrottleDrainDelay(cgroupPath string, previous []byte) time.Du
 	if current > high {
 		return memoryHighThrottleDrain
 	}
-	return 0
+	eventsRaw, err := os.ReadFile(filepath.Join(cgroupPath, "memory.events.local"))
+	if err != nil {
+		return memoryHighThrottleDrain
+	}
+	fields := strings.Fields(string(eventsRaw))
+	for i := 0; i+1 < len(fields); i += 2 {
+		if fields[i] != "high" {
+			continue
+		}
+		highEvents, err := strconv.ParseUint(fields[i+1], 10, 64)
+		if err != nil || highEvents > 0 {
+			return memoryHighThrottleDrain
+		}
+		return 0
+	}
+	// Without an authoritative zero high-event count, a below-watermark
+	// sample cannot exclude a task that is still serving an earlier delay.
+	return memoryHighThrottleDrain
+}
+
+func waitVMMMemoryHighThrottleDrain(delay time.Duration, chExited <-chan struct{}) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	if chExited == nil {
+		<-timer.C
+		return nil
+	}
+	select {
+	case <-timer.C:
+		return nil
+	case <-chExited:
+		return fmt.Errorf("Cloud Hypervisor exited while draining memory.high throttles")
+	}
 }
 
 // processSignaler is the subset of *os.Process needed by
@@ -658,13 +696,34 @@ func waitForCHWithSignalEscalation(
 ) error {
 	var killTimer *time.Timer
 	var killCh <-chan time.Time
+	var drainTimer *time.Timer
+	var drainCh <-chan time.Time
 	var memoryHighLock *os.File
+	var pendingShutdownSignal os.Signal
 	shutdownInitiated := false
+	finishShutdownRequest := func(sig os.Signal, useAPI bool) {
+		usedAPI := false
+		if useAPI {
+			if err := (chapi.Client{Sock: chSock, RespDeadline: chRespDeadline}).ShutdownVMM(); err == nil {
+				logf("received %v, requested vmm.shutdown via API (will SIGKILL after %s if CH still alive)", sig, grace)
+				usedAPI = true
+			} else {
+				logf("received %v, vmm.shutdown API failed (%v) — falling back to SIGTERM", sig, err)
+			}
+		}
+		if !usedAPI {
+			logf("received %v, forwarding SIGTERM to CH (will SIGKILL after %s)", sig, grace)
+			_ = proc.Signal(syscall.SIGTERM)
+		}
+		killTimer = time.NewTimer(grace)
+		killCh = killTimer.C
+	}
 	for {
 		select {
 		case sig := <-sigCh:
 			if !shutdownInitiated {
-				usedAPI := false
+				shutdownInitiated = true
+				useAPI := false
 				if chSock != "" {
 					previousHigh, lock, liftErr := tryLiftVMMMemoryHigh(cgroupPath)
 					if liftErr != nil {
@@ -680,36 +739,40 @@ func waitForCHWithSignalEscalation(
 						}
 						if drainDelay := vmmMemoryHighThrottleDrainDelay(cgroupPath, previousHigh); drainDelay > 0 {
 							logf("received %v, waiting %s for existing VMM memory.high throttles to drain", sig, drainDelay)
-							time.Sleep(drainDelay)
+							pendingShutdownSignal = sig
+							drainTimer = time.NewTimer(drainDelay)
+							drainCh = drainTimer.C
+							continue
 						}
-						if err := (chapi.Client{Sock: chSock, RespDeadline: chRespDeadline}).ShutdownVMM(); err == nil {
-							logf("received %v, requested vmm.shutdown via API (will SIGKILL after %s if CH still alive)", sig, grace)
-							usedAPI = true
-						} else {
-							logf("received %v, vmm.shutdown API failed (%v) — falling back to SIGTERM", sig, err)
-						}
+						useAPI = true
 					}
 				}
-				if !usedAPI {
-					logf("received %v, forwarding SIGTERM to CH (will SIGKILL after %s)", sig, grace)
-					_ = proc.Signal(syscall.SIGTERM)
-				}
-				shutdownInitiated = true
-				killTimer = time.NewTimer(grace)
-				killCh = killTimer.C
+				finishShutdownRequest(sig, useAPI)
 			} else {
 				logf("received %v while shutdown in progress, sending SIGKILL now", sig)
 				_ = proc.Signal(syscall.SIGKILL)
+				if drainTimer != nil {
+					drainTimer.Stop()
+					drainTimer = nil
+				}
+				drainCh = nil
 				if killTimer != nil {
 					killTimer.Stop()
 				}
 				killCh = nil
 			}
+		case <-drainCh:
+			drainCh = nil
+			drainTimer = nil
+			finishShutdownRequest(pendingShutdownSignal, true)
 		case <-killCh:
 			logf("CH didn't exit within %s of shutdown request, sending SIGKILL pid=%d", grace, chPid)
 			_ = proc.Signal(syscall.SIGKILL)
 			killCh = nil
 		case waitErr := <-doneCh:
+			if drainTimer != nil {
+				drainTimer.Stop()
+			}
 			if killTimer != nil {
 				killTimer.Stop()
 			}
@@ -1168,6 +1231,12 @@ func handleSnapshotRequest(
 			}
 		}
 	}()
+	if drainDelay := vmmMemoryHighThrottleDrainDelay(cgroupPath, previousMemoryHigh); drainDelay > 0 {
+		logf("snapshot: waiting %s for existing VMM memory.high throttles to drain", drainDelay)
+		if drainErr := waitVMMMemoryHighThrottleDrain(drainDelay, chExited); drainErr != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot: drain VMM memory.high throttles: %w", drainErr)
+		}
+	}
 
 	dropCachesResult := proto.DropCachesUnknown
 	guestQuiesced := false

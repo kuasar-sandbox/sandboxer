@@ -323,6 +323,12 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 	if err := os.WriteFile(memoryHighPath, []byte("234881024\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "memory.current"), []byte("123456789\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "memory.events.local"), []byte("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	var quiesceSawLiftedMemoryHigh atomic.Bool
 	guestDone := make(chan error, 1)
 	go func() {
@@ -650,6 +656,9 @@ func TestWaitForCH_OrderedShutdownLiftsMemoryHigh(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "memory.current"), []byte("123456789"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "memory.events.local"), []byte("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	sock := filepath.Join(dir, "ch.sock")
 	listener, err := net.Listen("unix", sock)
 	if err != nil {
@@ -704,6 +713,10 @@ func TestWaitForCH_OrderedShutdownLiftsMemoryHigh(t *testing.T) {
 func TestVMMMemoryHighThrottleDrainDelay(t *testing.T) {
 	dir := t.TempDir()
 	currentPath := filepath.Join(dir, "memory.current")
+	eventsPath := filepath.Join(dir, "memory.events.local")
+	if err := os.WriteFile(eventsPath, []byte("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(currentPath, []byte("280408064\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -713,8 +726,17 @@ func TestVMMMemoryHighThrottleDrainDelay(t *testing.T) {
 	if err := os.WriteFile(currentPath, []byte("200000000\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(eventsPath, []byte("low 0\nhigh 1\nmax 0\noom 0\noom_kill 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := vmmMemoryHighThrottleDrainDelay(dir, []byte("234881024\n")); got != memoryHighThrottleDrain {
+		t.Fatalf("prior-high-event drain delay = %s, want %s", got, memoryHighThrottleDrain)
+	}
+	if err := os.WriteFile(eventsPath, []byte("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if got := vmmMemoryHighThrottleDrainDelay(dir, []byte("234881024\n")); got != 0 {
-		t.Fatalf("below-high drain delay = %s, want 0", got)
+		t.Fatalf("never-throttled drain delay = %s, want 0", got)
 	}
 	if got := vmmMemoryHighThrottleDrainDelay(dir, []byte("max\n")); got != 0 {
 		t.Fatalf("unlimited-high drain delay = %s, want 0", got)
@@ -777,6 +799,72 @@ func TestWaitForCH_LifecycleLockBusyFallsBackToSIGTERM(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("wait helper did not return after VMM exit")
+	}
+}
+
+func TestWaitForCH_ThrottleDrainRemainsSignalResponsive(t *testing.T) {
+	dir := t.TempDir()
+	for name, value := range map[string]string{
+		"memory.high":         "234881024",
+		"memory.current":      "280408064",
+		"memory.events.local": "low 0\nhigh 1\nmax 0\noom 0\noom_kill 0\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	doneCh := make(chan error, 1)
+	sigCh := make(chan os.Signal, 2)
+	proc := &fakeSignaler{}
+	drainStarted := make(chan struct{}, 1)
+	logf := func(format string, _ ...any) {
+		if strings.Contains(format, "waiting %s for existing VMM memory.high throttles") {
+			select {
+			case drainStarted <- struct{}{}:
+			default:
+			}
+		}
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- waitForCHWithSignalEscalation(
+			doneCh,
+			sigCh,
+			proc,
+			1234,
+			filepath.Join(dir, "unused.sock"),
+			dir,
+			time.Second,
+			10*time.Second,
+			logf,
+		)
+	}()
+
+	sigCh <- syscall.SIGTERM
+	select {
+	case <-drainStarted:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not enter memory.high drain")
+	}
+	start := time.Now()
+	sigCh <- syscall.SIGINT
+	for proc.sentCount(syscall.SIGKILL) == 0 && time.Since(start) <= 500*time.Millisecond {
+		time.Sleep(time.Millisecond)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("second signal was blocked by throttle drain for %s", elapsed)
+	}
+	if proc.sentCount(syscall.SIGKILL) != 1 {
+		t.Fatalf("expected immediate SIGKILL during throttle drain, got %v", proc.sent)
+	}
+	doneCh <- nil
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait helper did not reap VMM after drain escalation")
 	}
 }
 
