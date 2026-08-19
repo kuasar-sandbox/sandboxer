@@ -25,6 +25,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+	"golang.org/x/sys/unix"
 )
 
 func TestValidateLocalMemoryRefsUsesOutputBundleDirectory(t *testing.T) {
@@ -743,7 +744,118 @@ func TestVMMMemoryHighThrottleDrainDelay(t *testing.T) {
 	}
 }
 
-func TestWaitForCH_LifecycleLockBusyFallsBackToSIGTERM(t *testing.T) {
+func TestWaitForCH_BriefControllerLockContentionRetriesOrderedShutdown(t *testing.T) {
+	dir := t.TempDir()
+	memoryHighPath := filepath.Join(dir, "memory.high")
+	for name, value := range map[string]string{
+		"memory.high":         "234881024",
+		"memory.current":      "123456789",
+		"memory.events.local": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	controllerLock, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controllerLock.Close()
+	if err := unix.Flock(int(controllerLock.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			_ = unix.Flock(int(controllerLock.Fd()), unix.LOCK_UN)
+		}
+	}()
+
+	sock := filepath.Join(dir, "ch.sock")
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestSeen := make(chan bool, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		value, readErr := os.ReadFile(memoryHighPath)
+		requestSeen <- r.Method == http.MethodPut && r.URL.Path == "/api/v1/vmm.shutdown" &&
+			readErr == nil && strings.TrimSpace(string(value)) == "max"
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	serverDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(serverDone)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-serverDone
+	})
+
+	doneCh := make(chan error, 1)
+	sigCh := make(chan os.Signal, 1)
+	proc := &fakeSignaler{}
+	retryStarted := make(chan struct{}, 1)
+	logf := func(format string, _ ...any) {
+		if strings.Contains(format, "retrying for up to %s before SIGTERM fallback") {
+			select {
+			case retryStarted <- struct{}{}:
+			default:
+			}
+		}
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- waitForCHWithSignalEscalation(
+			doneCh,
+			sigCh,
+			proc,
+			1234,
+			sock,
+			dir,
+			time.Second,
+			time.Second,
+			logf,
+		)
+	}()
+
+	sigCh <- syscall.SIGTERM
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not retry the controller lock")
+	}
+	if proc.sentCount(syscall.SIGTERM) != 0 {
+		t.Fatalf("brief controller contention caused fallback signal: %v", proc.sent)
+	}
+	if err := unix.Flock(int(controllerLock.Fd()), unix.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	lockHeld = false
+	select {
+	case lifted := <-requestSeen:
+		if !lifted {
+			t.Fatal("retried ordered shutdown did not observe memory.high=max")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ordered shutdown was not attempted after controller lock release")
+	}
+	doneCh <- nil
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait helper did not return after VMM exit")
+	}
+	if len(proc.sent) != 0 {
+		t.Fatalf("retried ordered shutdown unexpectedly used process signals: %v", proc.sent)
+	}
+}
+
+func TestWaitForCH_PersistentLifecycleLockBusyFallsBackToSIGTERM(t *testing.T) {
 	dir := t.TempDir()
 	memoryHighPath := filepath.Join(dir, "memory.high")
 	if err := os.WriteFile(memoryHighPath, []byte("234881024"), 0o644); err != nil {
@@ -787,6 +899,8 @@ func TestWaitForCH_LifecycleLockBusyFallsBackToSIGTERM(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("shutdown signal blocked on lifecycle lock for %s", elapsed)
+	} else if elapsed < memoryHighLockRetryWindow {
+		t.Fatalf("shutdown fell back before the controller retry window elapsed: %s", elapsed)
 	}
 	if proc.sentCount(syscall.SIGTERM) != 1 {
 		t.Fatalf("expected 1 fallback SIGTERM, got %v", proc.sent)
@@ -799,6 +913,82 @@ func TestWaitForCH_LifecycleLockBusyFallsBackToSIGTERM(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("wait helper did not return after VMM exit")
+	}
+}
+
+func TestWaitForCH_LockRetryRemainsSignalResponsive(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "memory.high"), []byte("234881024"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	previous, memoryHighLock, err := liftVMMMemoryHigh(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doneCh := make(chan error, 1)
+	defer func() {
+		select {
+		case doneCh <- nil:
+		default:
+		}
+		_, _ = restoreVMMMemoryHigh(dir, previous)
+		_ = memoryHighLock.Close()
+	}()
+
+	sigCh := make(chan os.Signal, 2)
+	proc := &fakeSignaler{}
+	retryStarted := make(chan struct{}, 1)
+	logf := func(format string, _ ...any) {
+		if strings.Contains(format, "retrying for up to %s before SIGTERM fallback") {
+			select {
+			case retryStarted <- struct{}{}:
+			default:
+			}
+		}
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- waitForCHWithSignalEscalation(
+			doneCh,
+			sigCh,
+			proc,
+			1234,
+			filepath.Join(dir, "unused.sock"),
+			dir,
+			time.Second,
+			time.Second,
+			logf,
+		)
+	}()
+
+	sigCh <- syscall.SIGTERM
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not enter the controller lock retry window")
+	}
+	start := time.Now()
+	sigCh <- syscall.SIGINT
+	for proc.sentCount(syscall.SIGKILL) == 0 && time.Since(start) <= 500*time.Millisecond {
+		time.Sleep(time.Millisecond)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("second signal was blocked by controller lock retry for %s", elapsed)
+	}
+	if proc.sentCount(syscall.SIGKILL) != 1 {
+		t.Fatalf("expected immediate SIGKILL during controller lock retry, got %v", proc.sent)
+	}
+	if proc.sentCount(syscall.SIGTERM) != 0 {
+		t.Fatalf("controller lock retry unexpectedly fell back before escalation: %v", proc.sent)
+	}
+	doneCh <- nil
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait helper did not reap VMM after retry escalation")
 	}
 }
 

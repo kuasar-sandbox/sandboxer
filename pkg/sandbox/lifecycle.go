@@ -526,6 +526,16 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 // without this escalation, sandbox-ctl waits indefinitely on cmd.Wait.
 const chShutdownGrace = 5 * time.Second
 
+// ControllerHooks holds the memory.high lifecycle lock only around cgroupfs
+// reads and writes. A brief retry window lets ordered shutdown wait out that
+// commit without blocking the signal loop. Persistent contention is treated as
+// an active lifecycle operation, where waiting for the lock could deadlock with
+// snapshot destroy waiting for this same CH process to exit.
+const (
+	memoryHighLockRetryInterval = 10 * time.Millisecond
+	memoryHighLockRetryWindow   = 100 * time.Millisecond
+)
+
 // liftVMMMemoryHigh temporarily removes memory.high throttling from the VMM
 // cgroup. Lifecycle API calls need every CH thread to return to userspace; a
 // thread sleeping in mem_cgroup_handle_over_high cannot acknowledge pause or
@@ -698,6 +708,9 @@ func waitForCHWithSignalEscalation(
 	var killCh <-chan time.Time
 	var drainTimer *time.Timer
 	var drainCh <-chan time.Time
+	var memoryHighLockRetryTimer *time.Timer
+	var memoryHighLockRetryCh <-chan time.Time
+	var memoryHighLockRetryDeadline time.Time
 	var memoryHighLock *os.File
 	var pendingShutdownSignal os.Signal
 	shutdownInitiated := false
@@ -718,39 +731,66 @@ func waitForCHWithSignalEscalation(
 		killTimer = time.NewTimer(grace)
 		killCh = killTimer.C
 	}
+	attemptShutdownRequest := func(sig os.Signal) {
+		useAPI := false
+		if chSock != "" {
+			previousHigh, lock, liftErr := tryLiftVMMMemoryHigh(cgroupPath)
+			if liftErr != nil {
+				if errors.Is(liftErr, unix.EWOULDBLOCK) {
+					now := time.Now()
+					if memoryHighLockRetryDeadline.IsZero() {
+						memoryHighLockRetryDeadline = now.Add(memoryHighLockRetryWindow)
+						logf("received %v, memory.high lifecycle lock busy; retrying for up to %s before SIGTERM fallback", sig, memoryHighLockRetryWindow)
+					}
+					remaining := time.Until(memoryHighLockRetryDeadline)
+					if remaining > 0 {
+						retryDelay := memoryHighLockRetryInterval
+						if remaining < retryDelay {
+							retryDelay = remaining
+						}
+						pendingShutdownSignal = sig
+						memoryHighLockRetryTimer = time.NewTimer(retryDelay)
+						memoryHighLockRetryCh = memoryHighLockRetryTimer.C
+						return
+					}
+					memoryHighLockRetryDeadline = time.Time{}
+					logf("received %v, memory.high lifecycle lock remained busy for %s; falling back to SIGTERM", sig, memoryHighLockRetryWindow)
+				} else {
+					memoryHighLockRetryDeadline = time.Time{}
+					logf("received %v, could not lift VMM memory.high before shutdown: %v", sig, liftErr)
+				}
+			} else {
+				memoryHighLockRetryDeadline = time.Time{}
+				memoryHighLock = lock
+				if previousHigh != nil && strings.TrimSpace(string(previousHigh)) != "max" {
+					logf("received %v, lifted VMM memory.high for ordered shutdown", sig)
+				}
+				if drainDelay := vmmMemoryHighThrottleDrainDelay(cgroupPath, previousHigh); drainDelay > 0 {
+					logf("received %v, waiting %s for existing VMM memory.high throttles to drain", sig, drainDelay)
+					pendingShutdownSignal = sig
+					drainTimer = time.NewTimer(drainDelay)
+					drainCh = drainTimer.C
+					return
+				}
+				useAPI = true
+			}
+		}
+		finishShutdownRequest(sig, useAPI)
+	}
 	for {
 		select {
 		case sig := <-sigCh:
 			if !shutdownInitiated {
 				shutdownInitiated = true
-				useAPI := false
-				if chSock != "" {
-					previousHigh, lock, liftErr := tryLiftVMMMemoryHigh(cgroupPath)
-					if liftErr != nil {
-						if errors.Is(liftErr, unix.EWOULDBLOCK) {
-							logf("received %v, VMM lifecycle already holds memory.high; falling back to SIGTERM", sig)
-						} else {
-							logf("received %v, could not lift VMM memory.high before shutdown: %v", sig, liftErr)
-						}
-					} else {
-						memoryHighLock = lock
-						if previousHigh != nil && strings.TrimSpace(string(previousHigh)) != "max" {
-							logf("received %v, lifted VMM memory.high for ordered shutdown", sig)
-						}
-						if drainDelay := vmmMemoryHighThrottleDrainDelay(cgroupPath, previousHigh); drainDelay > 0 {
-							logf("received %v, waiting %s for existing VMM memory.high throttles to drain", sig, drainDelay)
-							pendingShutdownSignal = sig
-							drainTimer = time.NewTimer(drainDelay)
-							drainCh = drainTimer.C
-							continue
-						}
-						useAPI = true
-					}
-				}
-				finishShutdownRequest(sig, useAPI)
+				attemptShutdownRequest(sig)
 			} else {
 				logf("received %v while shutdown in progress, sending SIGKILL now", sig)
 				_ = proc.Signal(syscall.SIGKILL)
+				if memoryHighLockRetryTimer != nil {
+					memoryHighLockRetryTimer.Stop()
+					memoryHighLockRetryTimer = nil
+				}
+				memoryHighLockRetryCh = nil
 				if drainTimer != nil {
 					drainTimer.Stop()
 					drainTimer = nil
@@ -761,6 +801,10 @@ func waitForCHWithSignalEscalation(
 				}
 				killCh = nil
 			}
+		case <-memoryHighLockRetryCh:
+			memoryHighLockRetryCh = nil
+			memoryHighLockRetryTimer = nil
+			attemptShutdownRequest(pendingShutdownSignal)
 		case <-drainCh:
 			drainCh = nil
 			drainTimer = nil
@@ -770,6 +814,9 @@ func waitForCHWithSignalEscalation(
 			_ = proc.Signal(syscall.SIGKILL)
 			killCh = nil
 		case waitErr := <-doneCh:
+			if memoryHighLockRetryTimer != nil {
+				memoryHighLockRetryTimer.Stop()
+			}
 			if drainTimer != nil {
 				drainTimer.Stop()
 			}
