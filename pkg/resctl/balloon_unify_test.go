@@ -439,6 +439,78 @@ func TestHooks_OnAllocatableChangedRollsBackMemoryHighWhenBalloonFails(t *testin
 	}
 }
 
+func TestHooks_LifetimeCancellationInterruptsMemoryHighLock(t *testing.T) {
+	cgroup := t.TempDir()
+	memoryHigh := filepath.Join(cgroup, "memory.high")
+	previousHigh := []byte("1879048192\n")
+	if err := os.WriteFile(memoryHigh, previousHigh, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lifecycleLock, err := os.Open(cgroup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lifecycleLock.Close()
+	if err := unix.Flock(int(lifecycleLock.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.SandboxConfig{
+		Resources: config.ResourcesConfig{
+			Capacity:    config.CapacityConfig{Memory: "8GiB"},
+			Allocatable: config.AllocatableConfig{Memory: "1GiB"},
+		},
+	}
+	cfg.ApplyDefaults()
+	hooks, err := NewControllerHooks(ControllerHookOptions{
+		CgroupPath: cgroup,
+		Logf:       func(string, ...any) {},
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyStarted := make(chan struct{})
+	applyDone := make(chan error, 1)
+	hooks.bgWG.Add(1)
+	go func() {
+		defer hooks.bgWG.Done()
+		close(applyStarted)
+		applyDone <- hooks.OnAllocatableChanged(2 << 30)
+	}()
+	<-applyStarted
+	select {
+	case err := <-applyDone:
+		t.Fatalf("allocation did not wait for the lifecycle lock: %v", err)
+	case <-time.After(3 * controllerMemoryHighLockRetryInterval):
+	}
+
+	releaseDone := make(chan struct{})
+	go func() {
+		hooks.Release("test")
+		close(releaseDone)
+	}()
+	select {
+	case <-releaseDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("controller release blocked on lifecycle lock")
+	}
+	select {
+	case err := <-applyDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("allocation error = %v, want lifetime cancellation", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("lifetime cancellation did not interrupt memory.high lock acquisition")
+	}
+	gotHigh, err := os.ReadFile(memoryHigh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotHigh) != string(previousHigh) {
+		t.Fatalf("memory.high = %q after canceled lock acquisition, want %q", gotHigh, previousHigh)
+	}
+}
+
 func TestHooks_OnAllocatableChangedConfirmsLostBalloonAcknowledgement(t *testing.T) {
 	const (
 		capacity      = uint64(8 << 30)
@@ -650,8 +722,10 @@ func TestHooks_AmbiguousBalloonReleasesLifecycleLockAndSerializesRollback(t *tes
 		},
 	}
 	cfg.ApplyDefaults()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	operationCtx, cancelOperation := context.WithCancel(context.Background())
+	defer cancelOperation()
+	lifetimeCtx, cancelLifetime := context.WithCancel(context.Background())
+	defer cancelLifetime()
 	h := &ControllerHooks{
 		opts: ControllerHookOptions{
 			SocketPath: "/run/node-resource-controller.sock",
@@ -660,19 +734,19 @@ func TestHooks_AmbiguousBalloonReleasesLifecycleLockAndSerializesRollback(t *tes
 			Logf:       func(string, ...any) {},
 		},
 		cfg:               cfg,
-		lifetimeCtx:       ctx,
+		lifetimeCtx:       lifetimeCtx,
 		allocatableNowMem: previousAlloc,
 		desiredAllocMem:   previousAlloc,
 	}
 
 	applyDone := make(chan error, 1)
-	go func() { applyDone <- h.OnAllocatableChanged(newAlloc) }()
+	go func() { applyDone <- h.applyAllocatableLocked(operationCtx, newAlloc) }()
 	deadline := time.Now().Add(time.Second)
 	for len(srv.seen()) < 2 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	if calls := srv.seen(); len(calls) < 2 {
-		cancel()
+		cancelOperation()
 		t.Fatalf("ambiguous resize did not enter compensation loop: %v", calls)
 	}
 
@@ -680,7 +754,7 @@ func TestHooks_AmbiguousBalloonReleasesLifecycleLockAndSerializesRollback(t *tes
 	for time.Now().Before(deadline) {
 		candidate, err := os.Open(cgroup)
 		if err != nil {
-			cancel()
+			cancelOperation()
 			t.Fatal(err)
 		}
 		err = unix.Flock(int(candidate.Fd()), unix.LOCK_EX|unix.LOCK_NB)
@@ -690,17 +764,17 @@ func TestHooks_AmbiguousBalloonReleasesLifecycleLockAndSerializesRollback(t *tes
 		}
 		_ = candidate.Close()
 		if !errors.Is(err, unix.EWOULDBLOCK) {
-			cancel()
+			cancelOperation()
 			t.Fatalf("acquire lifecycle lock: %v", err)
 		}
 		time.Sleep(time.Millisecond)
 	}
 	if lifecycleLock == nil {
-		cancel()
+		cancelOperation()
 		t.Fatal("ambiguous balloon recovery retained the lifecycle lock")
 	}
 
-	cancel()
+	cancelOperation()
 	select {
 	case err := <-applyDone:
 		_ = lifecycleLock.Close()

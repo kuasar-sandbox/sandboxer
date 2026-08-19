@@ -17,6 +17,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const controllerMemoryHighLockRetryInterval = 10 * time.Millisecond
+
 type ControllerHookOptions struct {
 	SocketPath string
 	CgroupPath string
@@ -419,8 +421,14 @@ func (h *ControllerHooks) applyContext() context.Context {
 }
 
 func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes uint64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var previousHigh []byte
-	if err := h.withMemoryHighLock(func() error {
+	if err := h.withMemoryHighLock(ctx, func() error {
 		var err error
 		previousHigh, err = h.readMemoryHigh()
 		if err != nil {
@@ -444,7 +452,7 @@ func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes
 			// Static restore deliberately keeps the failed balloon target queued
 			// for retry; memory.high must remain at that eventual target too.
 			if dynamic {
-				rollbackErr := h.withMemoryHighLock(func() error {
+				rollbackErr := h.withMemoryHighLock(h.applyContext(), func() error {
 					return h.restoreMemoryHigh(previousHigh)
 				})
 				if rollbackErr != nil {
@@ -467,9 +475,10 @@ func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes
 // run outside the lock: they can last until the sandbox lifetime is canceled,
 // and must not prevent lifecycle code from lifting memory.high. A later dynamic
 // rollback reacquires the lock, so it waits until any active lifecycle barrier
-// has restored and released the watermark.
-func (h *ControllerHooks) withMemoryHighLock(fn func() error) error {
-	memoryHighLock, err := h.lockMemoryHigh()
+// has restored and released the watermark. Contended acquisition uses
+// nonblocking retries so controller/background cancellation can interrupt it.
+func (h *ControllerHooks) withMemoryHighLock(ctx context.Context, fn func() error) error {
+	memoryHighLock, err := h.lockMemoryHigh(ctx)
 	if err != nil {
 		return err
 	}
@@ -479,19 +488,42 @@ func (h *ControllerHooks) withMemoryHighLock(fn func() error) error {
 	return fn()
 }
 
-func (h *ControllerHooks) lockMemoryHigh() (*os.File, error) {
+func (h *ControllerHooks) lockMemoryHigh(ctx context.Context) (*os.File, error) {
 	if h == nil || h.opts.CgroupPath == "" {
 		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	lock, err := os.Open(h.opts.CgroupPath)
 	if err != nil {
 		return nil, fmt.Errorf("open memory.high lifecycle lock: %w", err)
 	}
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+	fail := func(err error) (*os.File, error) {
 		_ = lock.Close()
-		return nil, fmt.Errorf("lock memory.high lifecycle: %w", err)
+		return nil, err
 	}
-	return lock, nil
+	retry := time.NewTicker(controllerMemoryHighLockRetryInterval)
+	defer retry.Stop()
+	for {
+		// Always make one immediate attempt. That lets an already-canceled
+		// balloon operation perform a nonblocking rollback when no lifecycle
+		// operation owns the lock, while any actual contention remains fully
+		// cancellable below.
+		if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err == nil {
+			return lock, nil
+		} else if !errors.Is(err, unix.EWOULDBLOCK) {
+			return fail(fmt.Errorf("lock memory.high lifecycle: %w", err))
+		}
+		select {
+		case <-ctx.Done():
+			return fail(fmt.Errorf("lock memory.high lifecycle: %w", ctx.Err()))
+		case <-retry.C:
+			if err := ctx.Err(); err != nil {
+				return fail(fmt.Errorf("lock memory.high lifecycle: %w", err))
+			}
+		}
+	}
 }
 
 func (h *ControllerHooks) memoryHighPath() string {
