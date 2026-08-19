@@ -24,6 +24,8 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+	"golang.org/x/sys/unix"
 )
 
 func TestValidateLocalMemoryRefsUsesOutputBundleDirectory(t *testing.T) {
@@ -214,7 +216,7 @@ func TestHandleSnapshotRequestRejectsMergedLocalLowerBeforeQuiesce(t *testing.T)
 			viewCalled = true
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		},
-	}}, nil, "", filepath.Join(dir, "run"), pinger, nil, nil, discardLogf)
+	}}, nil, "", filepath.Join(dir, "run"), "", nil, pinger, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "direct upload would retain a local memory lower") {
 		t.Fatalf("local lower preflight error = %v", err)
 	}
@@ -232,13 +234,13 @@ func TestHandleSnapshotRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T
 	disks := []SnapDiskRef{{DiffPath: filepath.Join(t.TempDir(), "not-needed.diff")}}
 
 	_, err := handleSnapshotRequest(ctl.Request{}, baseOpts, nil, disks, nil,
-		"", t.TempDir(), pinger, nil, nil, discardLogf)
+		"", t.TempDir(), "", nil, pinger, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "--output and --upload") {
 		t.Fatalf("missing output error = %v", err)
 	}
 
 	_, err = handleSnapshotRequest(ctl.Request{Upload: true}, baseOpts, nil, disks, nil,
-		"", t.TempDir(), pinger, nil, nil, discardLogf)
+		"", t.TempDir(), "", nil, pinger, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "manifest") {
 		t.Fatalf("missing manifest config error = %v", err)
 	}
@@ -270,7 +272,7 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 				return bytes.NewReader(make([]byte, 4096)), nil, nil
 			},
 		}}, nil, "", filepath.Join(dir, "run"),
-		pinger, nil, nil, discardLogf)
+		"", nil, pinger, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") {
 		t.Fatalf("disk merge preflight error = %v", err)
 	}
@@ -299,7 +301,7 @@ func TestHandleSnapshotRequestResolvesUploadKeyBeforeSnapshotView(t *testing.T) 
 			viewCalled = true
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		},
-	}}, nil, "", filepath.Join(dir, "run"), nil, nil, nil, discardLogf)
+	}}, nil, "", filepath.Join(dir, "run"), "", nil, nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "customer key") {
 		t.Fatalf("upload key error = %v", err)
 	}
@@ -318,6 +320,17 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	memoryHighPath := filepath.Join(dir, "memory.high")
+	if err := os.WriteFile(memoryHighPath, []byte("234881024\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "memory.current"), []byte("123456789\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "memory.events.local"), []byte("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var quiesceSawLiftedMemoryHigh atomic.Bool
 	guestDone := make(chan error, 1)
 	go func() {
 		conn, acceptErr := listener.Accept()
@@ -348,6 +361,8 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 			guestDone <- fmt.Errorf("request type = %q", request.Type)
 			return
 		}
+		value, readErr := os.ReadFile(memoryHighPath)
+		quiesceSawLiftedMemoryHigh.Store(readErr == nil && strings.TrimSpace(string(value)) == "max")
 		guestDone <- proto.WriteMessage(conn, &proto.Message{
 			Type:             proto.TypeQuiesced,
 			DropCachesResult: proto.DropCachesSkipped,
@@ -360,7 +375,12 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	var resumed atomic.Bool
+	var pauseSawLiftedMemoryHigh atomic.Bool
 	chServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/vm.pause" {
+			value, readErr := os.ReadFile(memoryHighPath)
+			pauseSawLiftedMemoryHigh.Store(readErr == nil && strings.TrimSpace(string(value)) == "max")
+		}
 		if r.URL.Path == "/api/v1/vm.snapshot" {
 			http.Error(w, "injected snapshot failure", http.StatusInternalServerError)
 			return
@@ -401,6 +421,8 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 		nil,
 		chSock,
 		filepath.Join(dir, "run"),
+		dir,
+		nil,
 		&guestlink.Pinger{Client: &guestlink.HostClient{BasePath: base}},
 		nil,
 		func() error {
@@ -427,6 +449,17 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 	}
 	if !reattachedAfterResume {
 		t.Fatal("guest was not reattached after VM resume")
+	}
+	if !quiesceSawLiftedMemoryHigh.Load() {
+		t.Fatal("guest quiesce did not run with memory.high lifted")
+	}
+	if !pauseSawLiftedMemoryHigh.Load() {
+		t.Fatal("VM pause did not run with memory.high lifted")
+	}
+	if value, readErr := os.ReadFile(memoryHighPath); readErr != nil {
+		t.Fatal(readErr)
+	} else if string(value) != "234881024\n" {
+		t.Fatalf("memory.high = %q after failed snapshot, want original value", value)
 	}
 }
 
@@ -459,6 +492,120 @@ func (f *fakeSignaler) sentCount(sig os.Signal) int {
 
 func discardLogf(string, ...any) {}
 
+func TestVMMMemoryHighLifecycleGuard(t *testing.T) {
+	t.Run("restore original value", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "memory.high")
+		if err := os.WriteFile(path, []byte("234881024\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		previous, memoryHighLock, err := liftVMMMemoryHigh(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if memoryHighLock != nil {
+				_ = memoryHighLock.Close()
+			}
+		}()
+		if value, err := os.ReadFile(path); err != nil {
+			t.Fatal(err)
+		} else if string(value) != "max" {
+			t.Fatalf("lifted memory.high = %q, want max", value)
+		}
+		restored, err := restoreVMMMemoryHigh(dir, previous)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !restored {
+			t.Fatal("original memory.high was not restored")
+		}
+		if err := memoryHighLock.Close(); err != nil {
+			t.Fatal(err)
+		}
+		memoryHighLock = nil
+		if value, err := os.ReadFile(path); err != nil {
+			t.Fatal(err)
+		} else if string(value) != "234881024\n" {
+			t.Fatalf("restored memory.high = %q, want original value", value)
+		}
+	})
+
+	t.Run("serialize controller update", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "memory.high")
+		if err := os.WriteFile(path, []byte("234881024"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		previous, memoryHighLock, err := liftVMMMemoryHigh(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if memoryHighLock != nil {
+				_ = memoryHighLock.Close()
+			}
+		}()
+		cfg := &config.SandboxConfig{Resources: config.ResourcesConfig{
+			Capacity:    config.CapacityConfig{Memory: "8GiB"},
+			Allocatable: config.AllocatableConfig{Memory: "512MiB"},
+		}}
+		cfg.ApplyDefaults()
+		hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
+			CgroupPath: dir,
+			Logf:       discardLogf,
+		}, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer hooks.Release("test")
+
+		const newAllocatable = uint64(400 << 20)
+		applyStarted := make(chan struct{})
+		applyDone := make(chan error, 1)
+		go func() {
+			close(applyStarted)
+			applyDone <- hooks.OnAllocatableChanged(newAllocatable)
+		}()
+		<-applyStarted
+		select {
+		case err := <-applyDone:
+			t.Fatalf("controller update did not wait for lifecycle lock: %v", err)
+		case <-time.After(25 * time.Millisecond):
+		}
+		if value, err := os.ReadFile(path); err != nil {
+			t.Fatal(err)
+		} else if string(value) != "max" {
+			t.Fatalf("memory.high changed during lifecycle operation: %q", value)
+		}
+
+		restored, err := restoreVMMMemoryHigh(dir, previous)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !restored {
+			t.Fatal("original memory.high was not restored before releasing lifecycle lock")
+		}
+		if err := memoryHighLock.Close(); err != nil {
+			t.Fatal(err)
+		}
+		memoryHighLock = nil
+		select {
+		case err := <-applyDone:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("controller update remained blocked after lifecycle lock release")
+		}
+		if value, err := os.ReadFile(path); err != nil {
+			t.Fatal(err)
+		} else if want := fmt.Sprint(uint64(float64(newAllocatable) * 0.875)); string(value) != want {
+			t.Fatalf("memory.high = %q, want controller value %q", value, want)
+		}
+	})
+}
+
 // TestWaitForCH_NoSignals: clean-exit path — doneCh fires before any
 // signal, helper returns immediately with the wait error.
 func TestWaitForCH_NoSignals(t *testing.T) {
@@ -467,7 +614,7 @@ func TestWaitForCH_NoSignals(t *testing.T) {
 	proc := &fakeSignaler{}
 
 	doneCh <- nil
-	err := waitForCHWithSignalEscalation(doneCh, sigCh, proc, 1234, "", 0, time.Second, discardLogf)
+	err := waitForCHWithSignalEscalation(doneCh, sigCh, proc, 1234, "", "", 0, time.Second, discardLogf)
 	if err != nil {
 		t.Fatalf("expected nil error, got %v", err)
 	}
@@ -489,7 +636,7 @@ func TestWaitForCH_SIGTERM_GracefulExit(t *testing.T) {
 		doneCh <- &exitErrStub{code: 0}
 	}()
 
-	err := waitForCHWithSignalEscalation(doneCh, sigCh, proc, 1234, "", 0, 5*time.Second, discardLogf)
+	err := waitForCHWithSignalEscalation(doneCh, sigCh, proc, 1234, "", "", 0, 5*time.Second, discardLogf)
 	if err == nil {
 		t.Fatal("expected non-nil exit err stub")
 	}
@@ -498,6 +645,416 @@ func TestWaitForCH_SIGTERM_GracefulExit(t *testing.T) {
 	}
 	if proc.sentCount(syscall.SIGKILL) != 0 {
 		t.Fatalf("expected no SIGKILL, got %v", proc.sent)
+	}
+}
+
+func TestWaitForCH_OrderedShutdownLiftsMemoryHigh(t *testing.T) {
+	dir := t.TempDir()
+	memoryHighPath := filepath.Join(dir, "memory.high")
+	if err := os.WriteFile(memoryHighPath, []byte("234881024"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "memory.current"), []byte("123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "memory.events.local"), []byte("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(dir, "ch.sock")
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestSeen := make(chan bool, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		value, readErr := os.ReadFile(memoryHighPath)
+		requestSeen <- r.Method == http.MethodPut && r.URL.Path == "/api/v1/vmm.shutdown" &&
+			readErr == nil && strings.TrimSpace(string(value)) == "max"
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	serverDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(serverDone)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-serverDone
+	})
+
+	doneCh := make(chan error, 1)
+	sigCh := make(chan os.Signal, 1)
+	proc := &fakeSignaler{}
+	var liftedAtRequest atomic.Bool
+	go func() {
+		select {
+		case liftedAtRequestValue := <-requestSeen:
+			liftedAtRequest.Store(liftedAtRequestValue)
+		case <-time.After(time.Second):
+		}
+		doneCh <- nil
+	}()
+	sigCh <- syscall.SIGTERM
+	if err := waitForCHWithSignalEscalation(doneCh, sigCh, proc, 1234, sock, dir, time.Second, time.Second, discardLogf); err != nil {
+		t.Fatal(err)
+	}
+	if !liftedAtRequest.Load() {
+		t.Fatal("ordered shutdown request did not observe memory.high=max")
+	}
+	if len(proc.sent) != 0 {
+		t.Fatalf("ordered shutdown unexpectedly used process signals: %v", proc.sent)
+	}
+	if value, err := os.ReadFile(memoryHighPath); err != nil {
+		t.Fatal(err)
+	} else if string(value) != "max" {
+		t.Fatalf("memory.high = %q after ordered shutdown request, want max until VMM exit", value)
+	}
+}
+
+func TestVMMMemoryHighThrottleDrainDelay(t *testing.T) {
+	dir := t.TempDir()
+	currentPath := filepath.Join(dir, "memory.current")
+	eventsPath := filepath.Join(dir, "memory.events.local")
+	if err := os.WriteFile(eventsPath, []byte("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(currentPath, []byte("280408064\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := vmmMemoryHighThrottleDrainDelay(dir, []byte("234881024\n")); got != memoryHighThrottleDrain {
+		t.Fatalf("over-high drain delay = %s, want %s", got, memoryHighThrottleDrain)
+	}
+	if err := os.WriteFile(currentPath, []byte("200000000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(eventsPath, []byte("low 0\nhigh 1\nmax 0\noom 0\noom_kill 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := vmmMemoryHighThrottleDrainDelay(dir, []byte("234881024\n")); got != memoryHighThrottleDrain {
+		t.Fatalf("prior-high-event drain delay = %s, want %s", got, memoryHighThrottleDrain)
+	}
+	if err := os.WriteFile(eventsPath, []byte("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := vmmMemoryHighThrottleDrainDelay(dir, []byte("234881024\n")); got != 0 {
+		t.Fatalf("never-throttled drain delay = %s, want 0", got)
+	}
+	if got := vmmMemoryHighThrottleDrainDelay(dir, []byte("max\n")); got != 0 {
+		t.Fatalf("unlimited-high drain delay = %s, want 0", got)
+	}
+}
+
+func TestWaitForCH_BriefControllerLockContentionRetriesOrderedShutdown(t *testing.T) {
+	dir := t.TempDir()
+	memoryHighPath := filepath.Join(dir, "memory.high")
+	for name, value := range map[string]string{
+		"memory.high":         "234881024",
+		"memory.current":      "123456789",
+		"memory.events.local": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	controllerLock, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controllerLock.Close()
+	if err := unix.Flock(int(controllerLock.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			_ = unix.Flock(int(controllerLock.Fd()), unix.LOCK_UN)
+		}
+	}()
+
+	sock := filepath.Join(dir, "ch.sock")
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestSeen := make(chan bool, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		value, readErr := os.ReadFile(memoryHighPath)
+		requestSeen <- r.Method == http.MethodPut && r.URL.Path == "/api/v1/vmm.shutdown" &&
+			readErr == nil && strings.TrimSpace(string(value)) == "max"
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	serverDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(serverDone)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-serverDone
+	})
+
+	doneCh := make(chan error, 1)
+	sigCh := make(chan os.Signal, 1)
+	proc := &fakeSignaler{}
+	retryStarted := make(chan struct{}, 1)
+	logf := func(format string, _ ...any) {
+		if strings.Contains(format, "retrying for up to %s before SIGTERM fallback") {
+			select {
+			case retryStarted <- struct{}{}:
+			default:
+			}
+		}
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- waitForCHWithSignalEscalation(
+			doneCh,
+			sigCh,
+			proc,
+			1234,
+			sock,
+			dir,
+			time.Second,
+			time.Second,
+			logf,
+		)
+	}()
+
+	sigCh <- syscall.SIGTERM
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not retry the controller lock")
+	}
+	if proc.sentCount(syscall.SIGTERM) != 0 {
+		t.Fatalf("brief controller contention caused fallback signal: %v", proc.sent)
+	}
+	if err := unix.Flock(int(controllerLock.Fd()), unix.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	lockHeld = false
+	select {
+	case lifted := <-requestSeen:
+		if !lifted {
+			t.Fatal("retried ordered shutdown did not observe memory.high=max")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ordered shutdown was not attempted after controller lock release")
+	}
+	doneCh <- nil
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait helper did not return after VMM exit")
+	}
+	if len(proc.sent) != 0 {
+		t.Fatalf("retried ordered shutdown unexpectedly used process signals: %v", proc.sent)
+	}
+}
+
+func TestWaitForCH_PersistentLifecycleLockBusyFallsBackToSIGTERM(t *testing.T) {
+	dir := t.TempDir()
+	memoryHighPath := filepath.Join(dir, "memory.high")
+	if err := os.WriteFile(memoryHighPath, []byte("234881024"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	previous, memoryHighLock, err := liftVMMMemoryHigh(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doneCh := make(chan error, 1)
+	defer func() {
+		select {
+		case doneCh <- nil:
+		default:
+		}
+		_, _ = restoreVMMMemoryHigh(dir, previous)
+		_ = memoryHighLock.Close()
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	proc := &fakeSignaler{}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- waitForCHWithSignalEscalation(
+			doneCh,
+			sigCh,
+			proc,
+			1234,
+			filepath.Join(dir, "unused.sock"),
+			dir,
+			time.Second,
+			time.Second,
+			discardLogf,
+		)
+	}()
+
+	start := time.Now()
+	sigCh <- syscall.SIGTERM
+	for proc.sentCount(syscall.SIGTERM) == 0 && time.Since(start) <= 500*time.Millisecond {
+		time.Sleep(time.Millisecond)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("shutdown signal blocked on lifecycle lock for %s", elapsed)
+	} else if elapsed < memoryHighLockRetryWindow {
+		t.Fatalf("shutdown fell back before the controller retry window elapsed: %s", elapsed)
+	}
+	if proc.sentCount(syscall.SIGTERM) != 1 {
+		t.Fatalf("expected 1 fallback SIGTERM, got %v", proc.sent)
+	}
+	doneCh <- nil
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait helper did not return after VMM exit")
+	}
+}
+
+func TestWaitForCH_LockRetryRemainsSignalResponsive(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "memory.high"), []byte("234881024"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	previous, memoryHighLock, err := liftVMMMemoryHigh(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doneCh := make(chan error, 1)
+	defer func() {
+		select {
+		case doneCh <- nil:
+		default:
+		}
+		_, _ = restoreVMMMemoryHigh(dir, previous)
+		_ = memoryHighLock.Close()
+	}()
+
+	sigCh := make(chan os.Signal, 2)
+	proc := &fakeSignaler{}
+	retryStarted := make(chan struct{}, 1)
+	logf := func(format string, _ ...any) {
+		if strings.Contains(format, "retrying for up to %s before SIGTERM fallback") {
+			select {
+			case retryStarted <- struct{}{}:
+			default:
+			}
+		}
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- waitForCHWithSignalEscalation(
+			doneCh,
+			sigCh,
+			proc,
+			1234,
+			filepath.Join(dir, "unused.sock"),
+			dir,
+			time.Second,
+			time.Second,
+			logf,
+		)
+	}()
+
+	sigCh <- syscall.SIGTERM
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not enter the controller lock retry window")
+	}
+	start := time.Now()
+	sigCh <- syscall.SIGINT
+	for proc.sentCount(syscall.SIGKILL) == 0 && time.Since(start) <= 500*time.Millisecond {
+		time.Sleep(time.Millisecond)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("second signal was blocked by controller lock retry for %s", elapsed)
+	}
+	if proc.sentCount(syscall.SIGKILL) != 1 {
+		t.Fatalf("expected immediate SIGKILL during controller lock retry, got %v", proc.sent)
+	}
+	if proc.sentCount(syscall.SIGTERM) != 0 {
+		t.Fatalf("controller lock retry unexpectedly fell back before escalation: %v", proc.sent)
+	}
+	doneCh <- nil
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait helper did not reap VMM after retry escalation")
+	}
+}
+
+func TestWaitForCH_ThrottleDrainRemainsSignalResponsive(t *testing.T) {
+	dir := t.TempDir()
+	for name, value := range map[string]string{
+		"memory.high":         "234881024",
+		"memory.current":      "280408064",
+		"memory.events.local": "low 0\nhigh 1\nmax 0\noom 0\noom_kill 0\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	doneCh := make(chan error, 1)
+	sigCh := make(chan os.Signal, 2)
+	proc := &fakeSignaler{}
+	drainStarted := make(chan struct{}, 1)
+	logf := func(format string, _ ...any) {
+		if strings.Contains(format, "waiting %s for existing VMM memory.high throttles") {
+			select {
+			case drainStarted <- struct{}{}:
+			default:
+			}
+		}
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- waitForCHWithSignalEscalation(
+			doneCh,
+			sigCh,
+			proc,
+			1234,
+			filepath.Join(dir, "unused.sock"),
+			dir,
+			time.Second,
+			10*time.Second,
+			logf,
+		)
+	}()
+
+	sigCh <- syscall.SIGTERM
+	select {
+	case <-drainStarted:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not enter memory.high drain")
+	}
+	start := time.Now()
+	sigCh <- syscall.SIGINT
+	for proc.sentCount(syscall.SIGKILL) == 0 && time.Since(start) <= 500*time.Millisecond {
+		time.Sleep(time.Millisecond)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("second signal was blocked by throttle drain for %s", elapsed)
+	}
+	if proc.sentCount(syscall.SIGKILL) != 1 {
+		t.Fatalf("expected immediate SIGKILL during throttle drain, got %v", proc.sent)
+	}
+	doneCh <- nil
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait helper did not reap VMM after drain escalation")
 	}
 }
 
@@ -536,7 +1093,7 @@ func TestWaitForCH_SIGTERM_EscalatesToSIGKILL(t *testing.T) {
 
 	t0 := time.Now()
 	sigCh <- syscall.SIGTERM
-	err := waitForCHWithSignalEscalation(doneCh, sigCh, proc, 1234, "", 0, grace, discardLogf)
+	err := waitForCHWithSignalEscalation(doneCh, sigCh, proc, 1234, "", "", 0, grace, discardLogf)
 	elapsed := time.Since(t0)
 	if err == nil {
 		t.Fatal("expected exit err stub")
@@ -587,7 +1144,7 @@ func TestWaitForCH_DoubleSIGTERM_EscalatesImmediately(t *testing.T) {
 	sigCh <- syscall.SIGTERM
 	time.Sleep(50 * time.Millisecond) // first SIGTERM arms timer
 	sigCh <- syscall.SIGINT           // second signal escalates
-	_ = waitForCHWithSignalEscalation(doneCh, sigCh, proc, 1234, "", 0, grace, discardLogf)
+	_ = waitForCHWithSignalEscalation(doneCh, sigCh, proc, 1234, "", "", 0, grace, discardLogf)
 	elapsed := time.Since(t0)
 
 	if proc.sentCount(syscall.SIGKILL) != 1 {
