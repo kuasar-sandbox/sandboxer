@@ -11,6 +11,16 @@ fail() {
   exit 1
 }
 
+WORKFLOW="$ROOT/.github/workflows/release.yml"
+for input in accelerator_version connector_version; do
+  grep -Fq "      $input:" "$WORKFLOW" \
+    || fail "release workflow is missing required $input input"
+  [ "$(grep -Fc "ref: \${{ needs.preflight.outputs.$input }}" "$WORKFLOW")" -eq 2 ] \
+    || fail "release workflow does not pin both $input checkouts"
+done
+grep -Fq "repos/kuasar-sandbox/\$repository/releases/tags/\$version" "$WORKFLOW" \
+  || fail "release workflow does not verify dependency releases"
+
 ARCHIVE_NAME=sandboxer-v1.2.3-linux-x86_64.tar.gz
 
 repack_bundle() {
