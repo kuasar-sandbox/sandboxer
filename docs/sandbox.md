@@ -1899,9 +1899,9 @@ PageState 使用 `[]uint8`,size = ramSize / PageSize。每 4 GiB RAM 对应
 
 | 当前 | 事件 | urgent 处理 | tail | 新态 |
 |------|------|-------------|------|------|
-| Absent | PAGEFAULT,Data Run | `Run.ReadAt(ctx,pageBuf,0)` 或 ChunkRun 完整读取后 `UFFDIO_COPY` 首页 | buffered/deferred Data | 条件提交 Loaded |
-| Absent | PAGEFAULT,Hole/Zero | 单页 `UFFDIO_ZEROPAGE` | Zero | 条件提交 Loaded |
-| Released | PAGEFAULT | 单页 `UFFDIO_ZEROPAGE` | Released Zero | 条件提交 Loaded |
+| Absent | PAGEFAULT,Data Run | 普通 Run 读取 4 KiB;ChunkRun 有 tail slot 时一次读取最多 8 KiB;随后 `UFFDIO_COPY` 首页 | 最多一个 buffered/deferred Data 邻页 | 条件提交 Loaded |
+| Absent | PAGEFAULT,Hole/Zero | 单页 `UFFDIO_ZEROPAGE` | 最多 15 个 Zero 邻页 | 条件提交 Loaded |
+| Released | PAGEFAULT | 单页 `UFFDIO_ZEROPAGE` | 最多 15 个 Released Zero 邻页 | 条件提交 Loaded |
 | Loaded | PAGEFAULT | 单页 `UFFDIO_ZEROPAGE`,不扩展 | 无 | Loaded |
 | 任意 | EVENT_REMOVE/UNMAP | 同步标记范围为 Released,提交 removeQ | 陈旧 tail 不得覆盖 | Released |
 
@@ -1930,7 +1930,7 @@ UFFD PAGEFAULT ── hash ─────┤
                                           │
                                           ▼
                                   one serial tail worker
-                                  one 1 MiB shared buffer
+                                  one 8 KiB shared buffer
 ```
 
 每个 Handler 只有以下 speculative 资源:
@@ -1938,28 +1938,31 @@ UFFD PAGEFAULT ── hash ─────┤
 ```go
 tailBusy atomic.Bool
 tailQ    chan tailTask // capacity = 1
-tailBuf  []byte        // MaxTailBytes = 1 MiB
+tailBuf  []byte        // Data urgent 4 KiB + Data neighbor tail 4 KiB
 ```
 
-`InitialTailBytes = 64 KiB`。全 Handler 最多一个 tail task 处于 reserved、
-queued 或 running。reservation 失败时 fault worker 直接放弃 tail,不等待、不
-新增队列。remove flusher 使用独立的 mandatory reclaim 队列和 goroutine,不被
-tail 占用或反压。
+Data 邻页 tail 固定为一个 4 KiB 页,一次真实 Data fault 最多读取和安装 8 KiB。
+Hole/Zero/Released 不读取 source,固定最多安装 64 KiB,即 fault 页加 15 个邻页。
+两类上限均不自适应增长。全 Handler 最多一个 tail task 处于 reserved、queued
+或 running。reservation 失败时 fault worker 直接放弃 tail,不等待、不新增队列。
+remove flusher 使用独立的 mandatory reclaim 队列和 goroutine,不被 tail 占用
+或反压。
 
 Run 类型决定数据准备方式:
 
 | Run/状态 | fault worker | serial tail worker |
 |----------|--------------|--------------------|
-| manifest `fetch.ChunkRun` | slot 可用时读取完整当前可见 Run 到共享 buffer,先 COPY 首页;slot 忙时只读 4 KiB | `tailBufferedData`,复用 `tailBuf[PageSize:]` |
-| file/tar/NFS 普通 Data | 只读 4 KiB 并 COPY 首页 | `tailDeferredData`,按 data window 调用同一 Run 的相对子范围 ReadAt |
-| Hole/Zero/ZeroSource | ZEROPAGE 首页,不读 source | `tailZero(expected=StateAbsent)` |
-| StateReleased | ZEROPAGE 首页,不读 source | `tailZero(expected=StateReleased)` |
+| manifest `fetch.ChunkRun` | slot 可用时读取当前 Run 的前 8 KiB 到共享 buffer,先 COPY 首页;slot 忙时只读 4 KiB | `tailBufferedData`,复用 `tailBuf[PageSize:]` 填一个邻页 |
+| file/tar/NFS 普通 Data | 只读 4 KiB 并 COPY 首页 | `tailDeferredData`,从同一 Run 读取下一页 |
+| Hole/Zero/ZeroSource | ZEROPAGE 首页,不读 source | `tailZero(expected=StateAbsent)`,最多 15 个邻页 |
+| StateReleased | ZEROPAGE 首页,不读 source | `tailZero(expected=StateReleased)`,最多 15 个邻页 |
 | StateLoaded | ZEROPAGE 首页 | 无 |
 
 所有 Run 和 tail hard end 同时受以下边界限制:
 
 ```text
-MaxTailBytes
+Data: fault 页 + 一个邻页的 8 KiB 总上限
+Hole/Zero/Released: fault 页 + 15 个邻页的 64 KiB 总上限
 当前 CH UFFD region end
 RAM end
 连续 expected-state range
@@ -1967,17 +1970,13 @@ Run.End()
 layered visibility bound
 ```
 
-ChunkRun 不使用 adaptive window。它的完整可见 Run 已经限制在 1 MiB 内;
-若物理 chunk end 不是页边界,完整 Run 仍只读取一次,tail 只提交其中页对齐的
-完整页面。普通 Data 和 Zero/Released 分别维护独立窗口:
-
-```text
-64 KiB → 128 KiB → 256 KiB → 512 KiB → 1 MiB
-```
-
-上一 tail 成功完成到 `completedEnd`,且下一次真实 fault 恰好位于该地址时,
-对应窗口翻倍。地址不连续、task drop、无完成量、ioctl 冲突、mode 或 expected
-state 变化都会重置为 64 KiB。ChunkRun 不增长或消费这两个窗口。
+Data 与零页路径采用按成本分级的固定边界。Data 的 source 读取和 guest 页面安装
+均限于 8 KiB;不发生 source I/O 的 Hole/Zero/Released 允许 64 KiB 固定填充以
+保留冷启动性能。manifest ChunkRun 的物理 chunk 最多可达 1 MiB,但其获取粒度
+不再决定 guest 页面安装粒度。`accelerator` 的 manifest Stream 在内部以
+`32 entries`、`32 MiB` 和 `5s` idle TTL 的 LRU cache 保留近期已解密 chunk,
+后续真实 fault 可复用一次 Get、校验和解密的结果;该 cache 不改变 tail 或 guest
+页面安装上限。
 
 urgent ioctl 只提交 faulting page,承担恢复正确性:
 
@@ -2024,7 +2023,6 @@ tail_buffered_data / tail_deferred_data / tail_zero
 tail_pages_planned / tail_pages_completed
 tail_copy_ns / tail_zero_ns
 tail_conflicts / tail_partial
-tail_window_current / tail_window_grows / tail_window_resets
 ```
 
 stderr 的 `[uffd-stats]` 和 `--stats-json` 使用相同字段。旧的同步

@@ -71,9 +71,6 @@ type uffdStatsJSON struct {
 	TailZeroNs          uint64 `json:"tail_zero_ns"`
 	TailConflicts       uint64 `json:"tail_conflicts"`
 	TailPartial         uint64 `json:"tail_partial"`
-	TailWindowCurrent   uint64 `json:"tail_window_current"`
-	TailWindowGrows     uint64 `json:"tail_window_grows"`
-	TailWindowResets    uint64 `json:"tail_window_resets"`
 	// LazyLoadRatio = (pages_zeroed + pages_copied) / total_pages.
 	// total_pages comes from RAMSize/PageSize. Cold-start tracks how
 	// little of declared RAM the guest actually touches; restore tracks
@@ -261,9 +258,6 @@ func buildUffdJSON(counters map[string]uint64, ramBytes int64) *uffdStatsJSON {
 		TailZeroNs:          counters["tail_zero_ns"],
 		TailConflicts:       counters["tail_conflicts"],
 		TailPartial:         counters["tail_partial"],
-		TailWindowCurrent:   counters["tail_window_current"],
-		TailWindowGrows:     counters["tail_window_grows"],
-		TailWindowResets:    counters["tail_window_resets"],
 		TotalPages:          totalPages,
 		ResidentPages:       resident,
 		LazyLoadRatio:       ratio,

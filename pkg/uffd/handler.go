@@ -20,12 +20,18 @@ const (
 	// PageSize must match the granularity uffd was set up with.
 	PageSize = 4096
 
-	// InitialTailBytes is the first speculative window used for ordinary
-	// Data and Zero/Released Runs.
-	InitialTailBytes = 64 << 10
+	// dataNeighborTailBytes bounds speculative Data population to one page.
+	dataNeighborTailBytes = PageSize
 
-	// MaxTailBytes bounds the single Handler-wide speculative buffer.
-	MaxTailBytes = 1 << 20
+	// dataFaultFillBytes includes the urgent Data page and its one-page tail.
+	// Chunk runs use the combined buffer so one source read serves both copies.
+	dataFaultFillBytes = PageSize + dataNeighborTailBytes
+
+	// zeroFaultFillBytes is the fixed total bound for Hole, Zero, and Released
+	// runs. These paths issue no source read, so a 64 KiB cap preserves cold-boot
+	// performance without restoring the former adaptive growth to 1 MiB.
+	zeroFaultFillBytes    = 64 << 10
+	zeroNeighborTailBytes = zeroFaultFillBytes - PageSize
 
 	// MinWorkers is the minimum number of worker goroutines for processing UFFD faults.
 	MinWorkers = 2
@@ -146,7 +152,6 @@ type Handler struct {
 	tailIdle   chan struct{}
 	tailSubmit sync.Mutex
 	tailWG     sync.WaitGroup
-	windows    tailWindowManager
 
 	ops uffdOps
 
@@ -202,9 +207,6 @@ type handlerStats struct {
 	tailZeroNs      atomic.Uint64
 	tailConflicts   atomic.Uint64
 	tailPartial     atomic.Uint64
-	tailWindow      atomic.Uint64
-	tailWindowGrows atomic.Uint64
-	tailWindowReset atomic.Uint64
 }
 
 type faultEvent struct {
@@ -285,11 +287,10 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		ctx:        ctx,
 		cancel:     cancel,
 		tailQ:      make(chan tailTask, 1),
-		tailBuf:    make([]byte, MaxTailBytes),
+		tailBuf:    make([]byte, dataFaultFillBytes),
 		tailIdle:   make(chan struct{}, 1),
 		ops:        realUffdOps,
 	}
-	h.stats.tailWindow.Store(InitialTailBytes)
 	return h, nil
 }
 
@@ -764,9 +765,6 @@ func (h *Handler) Stats() map[string]uint64 {
 		"tail_zero_ns":          h.stats.tailZeroNs.Load(),
 		"tail_conflicts":        h.stats.tailConflicts.Load(),
 		"tail_partial":          h.stats.tailPartial.Load(),
-		"tail_window_current":   h.stats.tailWindow.Load(),
-		"tail_window_grows":     h.stats.tailWindowGrows.Load(),
-		"tail_window_resets":    h.stats.tailWindowReset.Load(),
 	}
 }
 

@@ -22,7 +22,7 @@ import (
 const unitCHVA = uint64(0x4000_0000)
 
 func TestChunkRunBufferedTail(t *testing.T) {
-	plain := bytes.Repeat([]byte{0x6c}, 3*PageSize)
+	plain := bytes.Repeat([]byte{0x6c}, zeroFaultFillBytes)
 	m := &codec.Manifest{
 		Version:   codec.Version1,
 		ImageSize: uint64(len(plain)),
@@ -49,22 +49,25 @@ func TestChunkRunBufferedTail(t *testing.T) {
 		t.Fatalf("chunk Get calls = %d, want 1", got)
 	}
 	calls := ioctls.snapshot()
-	if len(calls) != 2 || calls[0].kind != "copy" || calls[0].length != PageSize || calls[1].length != 2*PageSize {
-		t.Fatalf("ioctl calls = %+v, want urgent 4KiB then buffered 8KiB COPY", calls)
+	if len(calls) != 2 || calls[0].kind != "copy" || calls[0].length != PageSize || calls[1].length != dataNeighborTailBytes {
+		t.Fatalf("ioctl calls = %+v, want urgent 4KiB then buffered 4KiB COPY", calls)
 	}
-	if !bytes.Equal(calls[0].data, plain[:PageSize]) || !bytes.Equal(calls[1].data, plain[PageSize:]) {
+	if !bytes.Equal(calls[0].data, plain[:PageSize]) || !bytes.Equal(calls[1].data, plain[PageSize:2*PageSize]) {
 		t.Fatal("buffered ChunkRun data was not reused for the tail")
 	}
-	for page := uint64(0); page < 3; page++ {
+	for page := uint64(0); page < 2; page++ {
 		if got := h.state.Get(page); got != StateLoaded {
 			t.Fatalf("page %d state = %v, want Loaded", page, got)
 		}
 	}
+	if got := h.state.Get(2); got != StateAbsent {
+		t.Fatalf("page 2 state = %v, want Absent", got)
+	}
 	stats := h.Stats()
-	if stats["source_read_calls"] != 1 || stats["source_read_bytes"] != uint64(len(plain)) {
+	if stats["source_read_calls"] != 1 || stats["source_read_bytes"] != dataFaultFillBytes {
 		t.Fatalf("source metrics = %d calls/%d bytes", stats["source_read_calls"], stats["source_read_bytes"])
 	}
-	if stats["tail_buffered_data"] != 1 || stats["tail_pages_completed"] != 2 || stats["pages_copied"] != 3 {
+	if stats["tail_buffered_data"] != 1 || stats["tail_pages_completed"] != 1 || stats["pages_copied"] != 2 {
 		t.Fatalf("tail/copy metrics = %#v", stats)
 	}
 }
@@ -109,8 +112,9 @@ func TestChunkRunBusyReadsOnlyUrgentPage(t *testing.T) {
 }
 
 func TestOrdinaryDataFaultReadsFourKiBBeforeDeferredTail(t *testing.T) {
-	source := newRecordingSnapshot(4*PageSize, sparse.Data, 0x91)
-	h := newUnitHandler(t, 4*PageSize, source)
+	const pages = 20
+	source := newRecordingSnapshot(pages*PageSize, sparse.Data, 0x91)
+	h := newUnitHandler(t, pages*PageSize, source)
 	ioctls := newFakeIoctls()
 	h.ops = ioctls.ops()
 
@@ -118,17 +122,48 @@ func TestOrdinaryDataFaultReadsFourKiBBeforeDeferredTail(t *testing.T) {
 	if got := source.readLengths(); !equalUint64s(got, []uint64{PageSize}) {
 		t.Fatalf("foreground Run.ReadAt lengths = %v, want [4096]", got)
 	}
+	if got := source.runLimits(); !equalUint64s(got, []uint64{zeroFaultFillBytes}) {
+		t.Fatalf("metadata RunAt limits = %v, want [%d]", got, zeroFaultFillBytes)
+	}
 	if !h.tailBusy.Load() || len(h.tailQ) != 1 {
 		t.Fatalf("deferred tail reservation: busy=%v queued=%d", h.tailBusy.Load(), len(h.tailQ))
 	}
 
 	startUnitTail(t, h)
 	waitUnitTail(t, h)
-	if got := source.readLengths(); !equalUint64s(got, []uint64{PageSize, 3 * PageSize}) {
+	if got := source.readLengths(); !equalUint64s(got, []uint64{PageSize, dataNeighborTailBytes}) {
 		t.Fatalf("all Run.ReadAt lengths = %v", got)
 	}
-	if calls := ioctls.snapshot(); len(calls) != 2 || calls[0].length != PageSize || calls[1].length != 3*PageSize {
+	if calls := ioctls.snapshot(); len(calls) != 2 || calls[0].length != PageSize || calls[1].length != dataNeighborTailBytes {
 		t.Fatalf("ioctl calls = %+v", calls)
+	}
+	if h.state.Get(0) != StateLoaded || h.state.Get(1) != StateLoaded || h.state.Get(2) != StateAbsent {
+		t.Fatalf("states = %v/%v/%v, want Loaded/Loaded/Absent", h.state.Get(0), h.state.Get(1), h.state.Get(2))
+	}
+}
+
+func TestZeroTailStopsAtStateBoundary(t *testing.T) {
+	const pages = 20
+	h := newUnitHandler(t, pages*PageSize, ZeroSource{})
+	h.state.Set(8, StateLoaded)
+	ioctls := newFakeIoctls()
+	h.ops = ioctls.ops()
+
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 5}, make([]byte, PageSize))
+	startUnitTail(t, h)
+	waitUnitTail(t, h)
+
+	calls := ioctls.snapshot()
+	if len(calls) != 2 || calls[0].length != PageSize || calls[1].length != 7*PageSize {
+		t.Fatalf("zero calls = %+v, want urgent page then seven-page tail", calls)
+	}
+	for page := uint64(0); page <= 8; page++ {
+		if got := h.state.Get(page); got != StateLoaded {
+			t.Fatalf("page %d state = %v, want Loaded", page, got)
+		}
+	}
+	if got := h.state.Get(9); got != StateAbsent {
+		t.Fatalf("page 9 state = %v, want Absent", got)
 	}
 }
 
@@ -157,19 +192,19 @@ func TestZeroAndReleasedFaultsUseSerialZeroTail(t *testing.T) {
 			startUnitTail(t, h)
 			waitUnitTail(t, h)
 			calls = ioctls.snapshot()
-			if len(calls) != 2 || calls[1].kind != "zero" || calls[1].length != InitialTailBytes {
+			if len(calls) != 2 || calls[1].kind != "zero" || calls[1].length != zeroNeighborTailBytes {
 				t.Fatalf("zero calls = %+v", calls)
 			}
 			if h.Stats()["source_read_calls"] != 0 {
 				t.Fatal("zero path read source")
 			}
-			for page := uint64(0); page < 17; page++ {
+			for page := uint64(0); page < zeroFaultFillBytes/PageSize; page++ {
 				if h.state.Get(page) != StateLoaded {
 					t.Fatalf("page %d was not populated", page)
 				}
 			}
-			if h.state.Get(17) != tt.expected {
-				t.Fatalf("page 17 = %v, want %v", h.state.Get(17), tt.expected)
+			if page := uint64(zeroFaultFillBytes / PageSize); h.state.Get(page) != tt.expected {
+				t.Fatalf("page %d = %v, want %v", page, h.state.Get(page), tt.expected)
 			}
 		})
 	}
@@ -320,14 +355,14 @@ func TestStaleAbsentFaultConvergesWithoutError(t *testing.T) {
 	}
 }
 
-func TestTailPartialCompletionUsesActualPages(t *testing.T) {
+func TestTailNoCompletionLeavesNeighborAbsent(t *testing.T) {
 	source := newRecordingSnapshot(4*PageSize, sparse.Data, 0x59)
 	h := newUnitHandler(t, 4*PageSize, source)
 	ioctls := newFakeIoctls()
-	ioctls.copyHook = func(_ int, _ uint64, data []byte) (int64, error) {
+	ioctls.copyHook = func(_ int, dst uint64, data []byte) (int64, error) {
 		length := uint64(len(data))
-		if length > PageSize {
-			return PageSize, unix.EAGAIN
+		if dst == unitCHVA+PageSize {
+			return 0, unix.EAGAIN
 		}
 		return int64(length), nil
 	}
@@ -336,21 +371,21 @@ func TestTailPartialCompletionUsesActualPages(t *testing.T) {
 
 	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 6}, make([]byte, PageSize))
 	waitUnitTail(t, h)
-	if h.state.Get(0) != StateLoaded || h.state.Get(1) != StateLoaded || h.state.Get(2) != StateAbsent {
-		t.Fatalf("partial states = %v/%v/%v", h.state.Get(0), h.state.Get(1), h.state.Get(2))
+	if h.state.Get(0) != StateLoaded || h.state.Get(1) != StateAbsent || h.state.Get(2) != StateAbsent {
+		t.Fatalf("states = %v/%v/%v, want Loaded/Absent/Absent", h.state.Get(0), h.state.Get(1), h.state.Get(2))
 	}
 	stats := h.Stats()
-	if stats["pages_copied"] != 2 || stats["tail_pages_completed"] != 1 || stats["tail_partial"] != 1 || stats["tail_conflicts"] != 1 || stats["errors"] != 0 {
-		t.Fatalf("partial metrics = %#v", stats)
+	if stats["pages_copied"] != 1 || stats["tail_pages_completed"] != 0 || stats["tail_partial"] != 1 || stats["tail_conflicts"] != 1 || stats["errors"] != 0 {
+		t.Fatalf("tail completion metrics = %#v", stats)
 	}
 }
 
-func TestZeroTailPartialCompletionUsesActualPages(t *testing.T) {
+func TestZeroTailNoCompletionLeavesNeighborAbsent(t *testing.T) {
 	h := newUnitHandler(t, 4*PageSize, ZeroSource{})
 	ioctls := newFakeIoctls()
-	ioctls.zeroHook = func(_ int, _ uint64, length uint64) (int64, error) {
-		if length > PageSize {
-			return PageSize, unix.EAGAIN
+	ioctls.zeroHook = func(_ int, dst uint64, length uint64) (int64, error) {
+		if dst == unitCHVA+PageSize {
+			return 0, unix.EAGAIN
 		}
 		return int64(length), nil
 	}
@@ -359,12 +394,12 @@ func TestZeroTailPartialCompletionUsesActualPages(t *testing.T) {
 
 	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 6}, make([]byte, PageSize))
 	waitUnitTail(t, h)
-	if h.state.Get(0) != StateLoaded || h.state.Get(1) != StateLoaded || h.state.Get(2) != StateAbsent {
-		t.Fatalf("partial zero states = %v/%v/%v", h.state.Get(0), h.state.Get(1), h.state.Get(2))
+	if h.state.Get(0) != StateLoaded || h.state.Get(1) != StateAbsent || h.state.Get(2) != StateAbsent {
+		t.Fatalf("zero states = %v/%v/%v, want Loaded/Absent/Absent", h.state.Get(0), h.state.Get(1), h.state.Get(2))
 	}
 	stats := h.Stats()
-	if stats["pages_zeroed"] != 2 || stats["tail_pages_completed"] != 1 || stats["tail_partial"] != 1 || stats["tail_conflicts"] != 1 || stats["errors"] != 0 {
-		t.Fatalf("partial zero metrics = %#v", stats)
+	if stats["pages_zeroed"] != 1 || stats["tail_pages_completed"] != 0 || stats["tail_partial"] != 1 || stats["tail_conflicts"] != 1 || stats["errors"] != 0 {
+		t.Fatalf("zero tail completion metrics = %#v", stats)
 	}
 }
 
@@ -390,9 +425,9 @@ func TestEventRemoveWinsTailConditionalCommit(t *testing.T) {
 	source := newRecordingSnapshot(4*PageSize, sparse.Data, 0x77)
 	h := newUnitHandler(t, 4*PageSize, source)
 	ioctls := newFakeIoctls()
-	ioctls.copyHook = func(_ int, _ uint64, data []byte) (int64, error) {
+	ioctls.copyHook = func(_ int, dst uint64, data []byte) (int64, error) {
 		length := uint64(len(data))
-		if length > PageSize {
+		if dst == unitCHVA+PageSize {
 			h.state.SetRange(1, 4, StateReleased)
 		}
 		return int64(length), nil
@@ -418,10 +453,11 @@ func TestUrgentWinsRunningTail(t *testing.T) {
 	h := newUnitHandler(t, pages*PageSize, source)
 	tailEntered := make(chan struct{})
 	releaseTail := make(chan struct{})
+	var tailBlocked atomic.Bool
 	ioctls := newFakeIoctls()
-	ioctls.copyHook = func(_ int, _ uint64, data []byte) (int64, error) {
+	ioctls.copyHook = func(_ int, dst uint64, data []byte) (int64, error) {
 		length := uint64(len(data))
-		if length > PageSize {
+		if dst == unitCHVA+PageSize && tailBlocked.CompareAndSwap(false, true) {
 			close(tailEntered)
 			<-releaseTail
 			return 0, unix.EEXIST
@@ -446,24 +482,28 @@ func TestUrgentWinsRunningTail(t *testing.T) {
 }
 
 func TestFaultRunBoundStopsAtCHRegion(t *testing.T) {
-	const pages = 4
-	source := newRecordingSnapshot(pages*PageSize, sparse.Data, 0x63)
-	h := newUnitHandlerWithoutMap(t, pages*PageSize, source)
-	if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA, 2*PageSize, 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA+0x10_0000, 2*PageSize, 2*PageSize); err != nil {
-		t.Fatal(err)
-	}
-	ioctls := newFakeIoctls()
-	h.ops = ioctls.ops()
+	for _, kind := range []sparse.RunKind{sparse.Data, sparse.Zero} {
+		t.Run(fmt.Sprint(kind), func(t *testing.T) {
+			const pages = 4
+			source := newRecordingSnapshot(pages*PageSize, kind, 0x63)
+			h := newUnitHandlerWithoutMap(t, pages*PageSize, source)
+			if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA, 2*PageSize, 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA+0x10_0000, 2*PageSize, 2*PageSize); err != nil {
+				t.Fatal(err)
+			}
+			ioctls := newFakeIoctls()
+			h.ops = ioctls.ops()
 
-	h.handleFault(faultEvent{address: unitCHVA + PageSize, uffdFD: 11}, make([]byte, PageSize))
-	if got := source.runLimits(); !equalUint64s(got, []uint64{PageSize}) {
-		t.Fatalf("RunAt limits = %v, want one page at split", got)
-	}
-	if h.tailBusy.Load() || len(h.tailQ) != 0 {
-		t.Fatal("fault crossed CH region into a tail")
+			h.handleFault(faultEvent{address: unitCHVA + PageSize, uffdFD: 11}, make([]byte, PageSize))
+			if got := source.runLimits(); !equalUint64s(got, []uint64{PageSize}) {
+				t.Fatalf("RunAt limits = %v, want one page at split", got)
+			}
+			if h.tailBusy.Load() || len(h.tailQ) != 0 {
+				t.Fatal("fault crossed CH region into a tail")
+			}
+		})
 	}
 }
 
@@ -659,10 +699,9 @@ func newUnitHandlerWithoutMap(t *testing.T, size uint64, source SnapshotReader) 
 		ctx:      ctx,
 		cancel:   cancel,
 		tailQ:    make(chan tailTask, 1),
-		tailBuf:  make([]byte, MaxTailBytes),
+		tailBuf:  make([]byte, dataFaultFillBytes),
 		tailIdle: make(chan struct{}, 1),
 	}
-	h.stats.tailWindow.Store(InitialTailBytes)
 	return h
 }
 
