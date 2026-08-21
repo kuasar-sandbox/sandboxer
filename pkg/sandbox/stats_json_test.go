@@ -36,9 +36,6 @@ func TestUffdStatsExposeFaultFirstTailMetrics(t *testing.T) {
 		"tail_zero_ns":          33,
 		"tail_conflicts":        34,
 		"tail_partial":          35,
-		"tail_window_current":   36,
-		"tail_window_grows":     37,
-		"tail_window_resets":    38,
 	}
 	report := buildUffdJSON(counters, 16*4096)
 	data, err := json.Marshal(report)
@@ -56,6 +53,11 @@ func TestUffdStatsExposeFaultFirstTailMetrics(t *testing.T) {
 	}
 	if _, ok := got["batch_calls"]; ok {
 		t.Fatal("obsolete synchronous batch metric remains in JSON")
+	}
+	for _, key := range []string{"tail_window_current", "tail_window_grows", "tail_window_resets"} {
+		if _, ok := got[key]; ok {
+			t.Fatalf("obsolete adaptive-tail metric %q remains in JSON", key)
+		}
 	}
 	if report.ResidentPages != 8 || report.LazyLoadRatio != 0.5 {
 		t.Fatalf("resident ratio = %d/%v", report.ResidentPages, report.LazyLoadRatio)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -47,46 +46,6 @@ type tailTask struct {
 	start    uint64
 	end      uint64
 	expected PageState
-
-	// bufferedBytes starts at tailBuf[PageSize].
-	bufferedBytes uint64
-
-	faultOffset uint64
-	windowMode  tailWindowMode
-	windowEpoch uint64
-}
-
-type tailWindowMode uint8
-
-const (
-	tailWindowData tailWindowMode = iota
-	tailWindowZero
-)
-
-type tailWindowState struct {
-	valid      bool
-	nextOffset uint64
-	window     uint64
-	expected   PageState
-}
-
-type tailWindowManager struct {
-	mu sync.Mutex
-
-	data tailWindowState
-	zero tailWindowState
-
-	epoch        uint64
-	lastValid    bool
-	lastMode     tailWindowMode
-	lastExpected PageState
-}
-
-func (m *tailWindowManager) state(mode tailWindowMode) *tailWindowState {
-	if mode == tailWindowData {
-		return &m.data
-	}
-	return &m.zero
 }
 
 type urgentOutcome struct {
@@ -121,7 +80,6 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 		// A MISSING fault on StateLoaded means the balloon reclaimed the
 		// folio before its remove event was observed. Preserve the existing
 		// safety rule: refill only this page with zero and do not speculate.
-		h.invalidateWindow(tailWindowZero, StateLoaded)
 		if _, err := h.urgentZero(ev.uffdFD, pageVA, pageIdx, StateLoaded); err != nil {
 			h.logf("uffd: ZEROPAGE(loaded) va=0x%x: %v", pageVA, err)
 			h.stats.errors.Add(1)
@@ -130,7 +88,9 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 }
 
 func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, pageBuf []byte) {
-	hardEnd := h.stateHardEnd(pageOffset, pageIdx, StateAbsent)
+	// Scan far enough to retain the fixed 64 KiB zero-fill unit. Data reads and
+	// guest population are independently capped at dataFaultFillBytes below.
+	hardEnd := h.stateHardEnd(pageOffset, pageIdx, StateAbsent, zeroFaultFillBytes)
 	if hardEnd-pageOffset < PageSize {
 		// The fault was classified as Absent before entering this method,
 		// but a concurrent urgent or tail completion may have populated it
@@ -172,9 +132,8 @@ func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint
 }
 
 func (h *Handler) handleChunkFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, run sparse.Run, pageBuf []byte) {
-	// Chunk-backed work is its own natural unit and never consumes an
-	// adaptive ordinary-Data window.
-	h.invalidateAllWindows()
+	// Keep chunk fetch and guest population bounded to the urgent page plus
+	// one neighbor. Retaining decrypted chunk data is a separate cache design.
 	if !h.tryReserveTail() {
 		if err := h.readRun(run, pageBuf, 0); err != nil {
 			h.failUrgent(uffdFD, pageVA, "chunk urgent read off=0x%x: %v", pageOffset, err)
@@ -187,12 +146,7 @@ func (h *Handler) handleChunkFault(uffdFD int, pageVA, pageOffset, pageIdx uint6
 		return
 	}
 
-	runLength := run.End() - run.Offset()
-	if runLength > uint64(len(h.tailBuf)) {
-		h.releaseTail()
-		h.failUrgent(uffdFD, pageVA, "chunk Run length %d exceeds tail buffer", runLength)
-		return
-	}
+	runLength := min(run.End()-run.Offset(), uint64(len(h.tailBuf)))
 	if err := h.readRun(run, h.tailBuf[:runLength], 0); err != nil {
 		h.releaseTail()
 		h.failUrgent(uffdFD, pageVA, "chunk read off=0x%x len=%d: %v", pageOffset, runLength, err)
@@ -211,15 +165,13 @@ func (h *Handler) handleChunkFault(uffdFD int, pageVA, pageOffset, pageIdx uint6
 		return
 	}
 	task := tailTask{
-		kind:          tailBufferedData,
-		uffdFD:        uffdFD,
-		dstVA:         pageVA + PageSize,
-		pageIdx:       pageIdx + 1,
-		start:         pageOffset + PageSize,
-		end:           tailEnd,
-		expected:      StateAbsent,
-		bufferedBytes: tailEnd - pageOffset - PageSize,
-		faultOffset:   pageOffset,
+		kind:     tailBufferedData,
+		uffdFD:   uffdFD,
+		dstVA:    pageVA + PageSize,
+		pageIdx:  pageIdx + 1,
+		start:    pageOffset + PageSize,
+		end:      tailEnd,
+		expected: StateAbsent,
 	}
 	h.enqueueReservedTail(task)
 }
@@ -239,33 +191,27 @@ func (h *Handler) handleOrdinaryDataFault(uffdFD int, pageVA, pageOffset, pageId
 		return
 	}
 	tailEnd := alignedRunEnd(pageOffset, run.End())
-	epoch := h.beginWindowEvent(tailWindowData, StateAbsent)
 	if tailEnd <= pageOffset+PageSize {
-		h.dropWindowEvent(tailWindowData, StateAbsent, epoch)
 		return
 	}
 	if !h.tryReserveTail() {
-		h.dropWindowEvent(tailWindowData, StateAbsent, epoch)
 		return
 	}
 	task := tailTask{
-		kind:        tailDeferredData,
-		run:         run,
-		uffdFD:      uffdFD,
-		dstVA:       pageVA + PageSize,
-		pageIdx:     pageIdx + 1,
-		start:       pageOffset + PageSize,
-		end:         tailEnd,
-		expected:    StateAbsent,
-		faultOffset: pageOffset,
-		windowMode:  tailWindowData,
-		windowEpoch: epoch,
+		kind:     tailDeferredData,
+		run:      run,
+		uffdFD:   uffdFD,
+		dstVA:    pageVA + PageSize,
+		pageIdx:  pageIdx + 1,
+		start:    pageOffset + PageSize,
+		end:      tailEnd,
+		expected: StateAbsent,
 	}
 	h.enqueueReservedTail(task)
 }
 
 func (h *Handler) handleZeroFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, expected PageState) {
-	hardEnd := h.stateHardEnd(pageOffset, pageIdx, expected)
+	hardEnd := h.stateHardEnd(pageOffset, pageIdx, expected, zeroFaultFillBytes)
 	h.handleResolvedZeroFault(uffdFD, pageVA, pageOffset, pageIdx, expected, hardEnd)
 }
 
@@ -280,35 +226,29 @@ func (h *Handler) handleResolvedZeroFault(uffdFD int, pageVA, pageOffset, pageId
 		return
 	}
 	tailEnd := alignedRunEnd(pageOffset, runEnd)
-	epoch := h.beginWindowEvent(tailWindowZero, expected)
 	if tailEnd <= pageOffset+PageSize {
-		h.dropWindowEvent(tailWindowZero, expected, epoch)
 		return
 	}
 	if !h.tryReserveTail() {
-		h.dropWindowEvent(tailWindowZero, expected, epoch)
 		return
 	}
 	task := tailTask{
-		kind:        tailZero,
-		uffdFD:      uffdFD,
-		dstVA:       pageVA + PageSize,
-		pageIdx:     pageIdx + 1,
-		start:       pageOffset + PageSize,
-		end:         tailEnd,
-		expected:    expected,
-		faultOffset: pageOffset,
-		windowMode:  tailWindowZero,
-		windowEpoch: epoch,
+		kind:     tailZero,
+		uffdFD:   uffdFD,
+		dstVA:    pageVA + PageSize,
+		pageIdx:  pageIdx + 1,
+		start:    pageOffset + PageSize,
+		end:      tailEnd,
+		expected: expected,
 	}
 	h.enqueueReservedTail(task)
 }
 
-func (h *Handler) stateHardEnd(pageOffset, pageIdx uint64, expected PageState) uint64 {
+func (h *Handler) stateHardEnd(pageOffset, pageIdx uint64, expected PageState, maxFillBytes uint64) uint64 {
 	if pageOffset >= uint64(h.cfg.Size) {
 		return pageOffset
 	}
-	maxPages := uint64(MaxTailBytes / PageSize)
+	maxPages := maxFillBytes / PageSize
 	pages := h.state.RunLength(pageIdx, maxPages, expected)
 	length := pages * PageSize
 	if remaining := uint64(h.cfg.Size) - pageOffset; length > remaining {
@@ -487,7 +427,6 @@ func (h *Handler) enqueueReservedTail(task tailTask) bool {
 	defer h.tailSubmit.Unlock()
 	if h.closing.Load() || h.ctx.Err() != nil {
 		h.stats.tailCanceled.Add(1)
-		h.dropTaskWindow(task)
 		h.releaseTail()
 		return false
 	}
@@ -507,7 +446,6 @@ func (h *Handler) enqueueReservedTail(task tailTask) bool {
 		// tailBusy should make this unreachable, but preserve non-blocking
 		// fault progress if an invariant is violated.
 		h.stats.tailDroppedBusy.Add(1)
-		h.dropTaskWindow(task)
 		h.releaseTail()
 		return false
 	}
@@ -519,9 +457,8 @@ func (h *Handler) runTailWorker() {
 		select {
 		case <-h.ctx.Done():
 			select {
-			case task := <-h.tailQ:
+			case <-h.tailQ:
 				h.stats.tailCanceled.Add(1)
-				h.dropTaskWindow(task)
 				h.releaseTail()
 			default:
 			}
@@ -529,7 +466,6 @@ func (h *Handler) runTailWorker() {
 		case task := <-h.tailQ:
 			if h.ctx.Err() != nil {
 				h.stats.tailCanceled.Add(1)
-				h.dropTaskWindow(task)
 				h.releaseTail()
 				continue
 			}
@@ -540,27 +476,19 @@ func (h *Handler) runTailWorker() {
 }
 
 func (h *Handler) processTail(task tailTask) {
-	maxPages := (task.end - task.start) / PageSize
+	maxTailBytes := uint64(dataNeighborTailBytes)
+	if task.kind == tailZero {
+		maxTailBytes = zeroNeighborTailBytes
+	}
+	maxPages := min((task.end-task.start)/PageSize, maxTailBytes/PageSize)
 	statePages := h.state.RunLength(task.pageIdx, maxPages, task.expected)
 	if statePages == 0 {
 		h.stats.tailConflicts.Add(1)
-		h.dropTaskWindow(task)
 		return
 	}
 	length := statePages * PageSize
-	var selectedWindow uint64
-	var trackWindow bool
-	if task.kind != tailBufferedData {
-		selectedWindow, trackWindow = h.chooseWindow(task)
-		if length > selectedWindow {
-			length = selectedWindow
-		}
-	} else if length > task.bufferedBytes {
-		length = task.bufferedBytes
-	}
 	length -= length % PageSize
 	if length == 0 {
-		h.dropTaskWindow(task)
 		return
 	}
 
@@ -577,7 +505,6 @@ func (h *Handler) processTail(task tailTask) {
 			} else {
 				h.logf("uffd: deferred tail read [%d,%d): %v", task.start, task.start+length, err)
 			}
-			h.finishWindow(task, selectedWindow, 0, false, trackWindow)
 			return
 		}
 	case tailZero:
@@ -588,7 +515,6 @@ func (h *Handler) processTail(task tailTask) {
 	statePages = h.state.RunLength(task.pageIdx, length/PageSize, task.expected)
 	if statePages == 0 {
 		h.stats.tailConflicts.Add(1)
-		h.finishWindow(task, selectedWindow, 0, false, trackWindow)
 		return
 	}
 	if validLength := statePages * PageSize; validLength < length {
@@ -600,8 +526,7 @@ func (h *Handler) processTail(task tailTask) {
 	}
 
 	h.stats.tailPlanned.Add(length / PageSize)
-	completed, success := h.executeTailIO(task, data, length)
-	h.finishWindow(task, selectedWindow, completed, success, trackWindow)
+	h.executeTailIO(task, data, length)
 }
 
 func (h *Handler) executeTailIO(task tailTask, data []byte, length uint64) (uint64, bool) {
@@ -649,110 +574,6 @@ func (h *Handler) executeTailIO(task tailTask, data []byte, length uint64) (uint
 		return done, false
 	}
 	return done, done == length
-}
-
-func (h *Handler) beginWindowEvent(mode tailWindowMode, expected PageState) uint64 {
-	m := &h.windows
-	m.mu.Lock()
-	m.epoch++
-	if m.lastValid && (m.lastMode != mode || m.lastExpected != expected) {
-		h.resetWindowLocked(m.state(mode))
-	}
-	m.lastValid = true
-	m.lastMode = mode
-	m.lastExpected = expected
-	epoch := m.epoch
-	m.mu.Unlock()
-	return epoch
-}
-
-func (h *Handler) chooseWindow(task tailTask) (uint64, bool) {
-	m := &h.windows
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if task.windowEpoch != m.epoch {
-		h.stats.tailWindow.Store(InitialTailBytes)
-		return InitialTailBytes, false
-	}
-	state := m.state(task.windowMode)
-	window := uint64(InitialTailBytes)
-	if state.valid && state.expected == task.expected && state.nextOffset == task.faultOffset {
-		window = state.window * 2
-		if window > MaxTailBytes {
-			window = MaxTailBytes
-		}
-		if window > state.window {
-			h.stats.tailWindowGrows.Add(1)
-		}
-	} else if state.valid {
-		h.resetWindowLocked(state)
-	}
-	state.valid = false
-	state.window = window
-	state.expected = task.expected
-	h.stats.tailWindow.Store(window)
-	return window, true
-}
-
-func (h *Handler) finishWindow(task tailTask, selectedWindow, completed uint64, success, track bool) {
-	if task.kind == tailBufferedData {
-		return
-	}
-	m := &h.windows
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	state := m.state(task.windowMode)
-	if !track || task.windowEpoch != m.epoch || !success || completed == 0 {
-		if track && task.windowEpoch == m.epoch {
-			h.resetWindowLocked(state)
-		}
-		return
-	}
-	state.valid = true
-	state.nextOffset = task.start + completed
-	state.window = selectedWindow
-	state.expected = task.expected
-}
-
-func (h *Handler) dropWindowEvent(mode tailWindowMode, expected PageState, epoch uint64) {
-	m := &h.windows
-	m.mu.Lock()
-	if epoch == m.epoch {
-		h.resetWindowLocked(m.state(mode))
-	}
-	m.mu.Unlock()
-}
-
-func (h *Handler) dropTaskWindow(task tailTask) {
-	if task.kind == tailBufferedData {
-		return
-	}
-	h.dropWindowEvent(task.windowMode, task.expected, task.windowEpoch)
-}
-
-func (h *Handler) invalidateWindow(mode tailWindowMode, expected PageState) {
-	epoch := h.beginWindowEvent(mode, expected)
-	h.dropWindowEvent(mode, expected, epoch)
-}
-
-func (h *Handler) invalidateAllWindows() {
-	m := &h.windows
-	m.mu.Lock()
-	m.epoch++
-	if m.data.valid || m.zero.valid {
-		h.stats.tailWindowReset.Add(1)
-	}
-	m.data = tailWindowState{window: InitialTailBytes}
-	m.zero = tailWindowState{window: InitialTailBytes}
-	m.lastValid = false
-	h.stats.tailWindow.Store(InitialTailBytes)
-	m.mu.Unlock()
-}
-
-func (h *Handler) resetWindowLocked(state *tailWindowState) {
-	*state = tailWindowState{window: InitialTailBytes}
-	h.stats.tailWindowReset.Add(1)
-	h.stats.tailWindow.Store(InitialTailBytes)
 }
 
 func recordAtomicMax(dst *atomic.Uint64, value uint64) {

@@ -23,6 +23,8 @@ import (
 
 type benchmarkFaultStrategy uint8
 
+const benchmarkBatchBytes = 1 << 20
+
 const (
 	benchmarkSyncFullBatch benchmarkFaultStrategy = iota
 	benchmarkFaultFirstOnly
@@ -72,8 +74,8 @@ func BenchmarkUFFDFaultStrategies(b *testing.B) {
 		benchmarkManifestFixture(b, false),
 		benchmarkTarFixture(b, false),
 		benchmarkTarFixture(b, true),
-		{name: "Zero", source: ZeroSource{}, size: 4 * MaxTailBytes},
-		{name: "Released", source: ZeroSource{}, size: 4 * MaxTailBytes},
+		{name: "Zero", source: ZeroSource{}, size: 4 * benchmarkBatchBytes},
+		{name: "Released", source: ZeroSource{}, size: 4 * benchmarkBatchBytes},
 	}
 	if path := os.Getenv("KUASAR_UFFD_BENCH_NFS_ARTIFACT"); path != "" {
 		stream, err := fetch.OpenTarStream(path)
@@ -142,7 +144,7 @@ func benchmarkFaultStrategyRun(b *testing.B, fixture benchmarkSnapshotFixture, p
 		var workerSeed atomic.Uint64
 		b.ResetTimer()
 		b.RunParallel(func(pb *testing.PB) {
-			buf := make([]byte, MaxTailBytes)
+			buf := make([]byte, benchmarkBatchBytes)
 			seed := workerSeed.Add(0x9e37_79b9)
 			var iteration uint64
 			for pb.Next() {
@@ -152,7 +154,7 @@ func benchmarkFaultStrategyRun(b *testing.B, fixture benchmarkSnapshotFixture, p
 			}
 		})
 	} else {
-		buf := make([]byte, MaxTailBytes)
+		buf := make([]byte, benchmarkBatchBytes)
 		seed := uint64(0x1234_5678)
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -171,11 +173,11 @@ func benchmarkFaultStrategyRun(b *testing.B, fixture benchmarkSnapshotFixture, p
 }
 
 func benchmarkFaultOffset(size uint64, random bool, iteration uint64, seed *uint64) uint64 {
-	// Keep the MaxTailBytes query inside the fixture so ordinary/tar A and C
-	// compare a stable 1 MiB/68 KiB unit instead of mixing in image-tail clips.
+	// Keep the 1 MiB query inside the fixture so the former full-batch strategy
+	// remains comparable while the current serial-tail strategy is fixed at 8 KiB.
 	offsetSpan := size
-	if size > MaxTailBytes {
-		offsetSpan = size - MaxTailBytes + PageSize
+	if size > benchmarkBatchBytes {
+		offsetSpan = size - benchmarkBatchBytes + PageSize
 	}
 	pages := offsetSpan / PageSize
 	if !random {
@@ -190,7 +192,7 @@ func benchmarkFaultOffset(size uint64, random bool, iteration uint64, seed *uint
 }
 
 func benchmarkResolveFault(ctx context.Context, source SnapshotReader, offset uint64, strategy benchmarkFaultStrategy, buf []byte) (uint64, uint64, error) {
-	run, err := source.RunAt(offset, MaxTailBytes)
+	run, err := source.RunAt(offset, benchmarkBatchBytes)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -208,7 +210,7 @@ func benchmarkResolveFault(ctx context.Context, source SnapshotReader, offset ui
 			benchmarkPopulationSink.Add(PageSize)
 			return 0, PageSize, nil
 		case benchmarkFaultFirstTail:
-			tail := min(uint64(InitialTailBytes), aligned-PageSize)
+			tail := min(uint64(zeroNeighborTailBytes), aligned-PageSize)
 			benchmarkPopulationSink.Add(PageSize + tail)
 			return 0, PageSize + tail, nil
 		}
@@ -240,16 +242,17 @@ func benchmarkResolveFault(ctx context.Context, source SnapshotReader, offset ui
 		return PageSize, PageSize, nil
 	case benchmarkFaultFirstTail:
 		if _, ok := run.(fetch.ChunkRun); ok {
-			if err := read(buf[:visible], 0); err != nil {
+			fill := min(uint64(dataFaultFillBytes), aligned)
+			if err := read(buf[:fill], 0); err != nil {
 				return 0, 0, err
 			}
-			benchmarkPopulationSink.Add(aligned)
-			return visible, aligned, nil
+			benchmarkPopulationSink.Add(fill)
+			return fill, fill, nil
 		}
 		if err := read(buf[:PageSize], 0); err != nil {
 			return 0, 0, err
 		}
-		tail := min(uint64(InitialTailBytes), aligned-PageSize)
+		tail := min(uint64(dataNeighborTailBytes), aligned-PageSize)
 		if tail > 0 {
 			if err := read(buf[:tail], PageSize); err != nil {
 				return 0, 0, err
@@ -267,7 +270,7 @@ var benchmarkDataSink atomic.Uint32
 
 func benchmarkOrdinaryFixture(b *testing.B) benchmarkSnapshotFixture {
 	b.Helper()
-	data := bytes.Repeat([]byte{0x41}, 4*MaxTailBytes)
+	data := bytes.Repeat([]byte{0x41}, 4*benchmarkBatchBytes)
 	source, err := sparse.NewSource(bytes.NewReader(data), uint64(len(data)), nil)
 	if err != nil {
 		b.Fatal(err)
@@ -281,18 +284,18 @@ func benchmarkOrdinaryFixture(b *testing.B) benchmarkSnapshotFixture {
 
 func benchmarkManifestFixture(b *testing.B, reuse bool) benchmarkSnapshotFixture {
 	b.Helper()
-	chunk := bytes.Repeat([]byte{0x52}, MaxTailBytes)
+	chunk := bytes.Repeat([]byte{0x52}, benchmarkBatchBytes)
 	hash := sha256.Sum256(chunk)
 	const chunks = 4
 	entries := make([]codec.ChunkEntry, chunks)
 	for i := range entries {
 		entries[i] = codec.ChunkEntry{
-			Offset:         uint64(i * MaxTailBytes),
-			Size:           MaxTailBytes,
+			Offset:         uint64(i * benchmarkBatchBytes),
+			Size:           benchmarkBatchBytes,
 			CiphertextHash: hash,
 		}
 	}
-	m := &codec.Manifest{Version: codec.Version1, ImageSize: chunks * MaxTailBytes, Entries: entries}
+	m := &codec.Manifest{Version: codec.Version1, ImageSize: chunks * benchmarkBatchBytes, Entries: entries}
 	stream, getter := openSnapshotManifest(b, m, map[store.ContentKey][]byte{hash: chunk})
 	getter.reuseChunk = reuse
 	snapshot, err := NewStreamSnapshotSource(stream, m.ImageSize)
@@ -308,7 +311,7 @@ func benchmarkManifestFixture(b *testing.B, reuse bool) benchmarkSnapshotFixture
 
 func benchmarkTarFixture(b *testing.B, encrypted bool) benchmarkSnapshotFixture {
 	b.Helper()
-	data := bytes.Repeat([]byte{0x6d}, 4*MaxTailBytes)
+	data := bytes.Repeat([]byte{0x6d}, 4*benchmarkBatchBytes)
 	source, err := sparse.NewSource(bytes.NewReader(data), uint64(len(data)), nil)
 	if err != nil {
 		b.Fatal(err)

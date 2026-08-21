@@ -881,9 +881,6 @@ func writeUffdStats(w io.Writer, s map[string]uint64) {
 		"tail_zero_ns",
 		"tail_conflicts",
 		"tail_partial",
-		"tail_window_current",
-		"tail_window_grows",
-		"tail_window_resets",
 	}
 	for _, k := range keys {
 		fmt.Fprintf(w, "  %-20s %d\n", k, s[k])

@@ -77,8 +77,8 @@ func TestHandlerCloseJoinsReservedButNotEnqueuedTail(t *testing.T) {
 func TestDeferredRunReadCanceledReleasesTail(t *testing.T) {
 	source := newRecordingSnapshot(20*PageSize, sparse.Data, 0x23)
 	tailReadStarted := make(chan struct{})
-	source.readHook = func(ctx context.Context, _ uint64, buf []byte) error {
-		if len(buf) == PageSize {
+	source.readHook = func(ctx context.Context, offset uint64, _ []byte) error {
+		if offset == 0 {
 			return nil
 		}
 		close(tailReadStarted)
@@ -109,8 +109,8 @@ func TestDeferredRunReadCanceledReleasesTail(t *testing.T) {
 
 func TestDeferredRunReadFailureIsBestEffort(t *testing.T) {
 	source := newRecordingSnapshot(20*PageSize, sparse.Data, 0x42)
-	source.readHook = func(_ context.Context, _ uint64, buf []byte) error {
-		if len(buf) > PageSize {
+	source.readHook = func(_ context.Context, offset uint64, _ []byte) error {
+		if offset == PageSize {
 			return errors.New("injected deferred read failure")
 		}
 		return nil
