@@ -8,7 +8,7 @@ import (
 	"os"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
-	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
@@ -44,17 +44,16 @@ func uploadSnapshotCmd(args []string) int {
 		}
 		manifestCfg = nil
 	}
-	keyFn, localCodec, localRequired, err := storageOptions(manifestCfg)
+	processStorage, err := artifact.NewProcessStorage(manifestCfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	var manifestFetcher fetch.Fetcher
-	if manifestCfg != nil {
-		lazy := &onDemandManifestFetcher{cfg: manifestCfg, keyFn: keyFn}
-		manifestFetcher = lazy
-		defer lazy.Close()
-	}
+	defer processStorage.Close()
+	keyFn := processStorage.CustomerKeyFunc()
+	manifestFetcher := processStorage.Fetcher()
+	localCodec := processStorage.LocalCodec()
+	localRequired := processStorage.LocalRequired()
 	var ref string
 	if *toRefLocation != "" {
 		locations := config.RefLocations{}

@@ -74,6 +74,42 @@ type SnapOverlayCfg struct {
 // boot.root.overlay node).
 func (c *SnapshotCfg) SingleDisk() bool { return c.Boot.Root.Overlay == nil }
 
+// ArtifactRefs returns the non-empty disk artifact refs named by this root
+// snapshot.cfg. It covers the root disk and every data disk, including their
+// flattened base_from_refs chains. It deliberately excludes FromRefs (the
+// flattened memory-layer chain) and Boot.RuntimeRef (a node-provided platform
+// artifact). Callers own deduplication, ordering, and limits.
+func (c *SnapshotCfg) ArtifactRefs() []string {
+	if c == nil {
+		return nil
+	}
+	refs := make([]string, 0)
+	appendRef := func(raw string) {
+		if raw != "" {
+			refs = append(refs, raw)
+		}
+	}
+	appendNode := func(baseRef, base string, baseFromRefs []string, overlay *SnapOverlayCfg) {
+		appendRef(baseRef)
+		appendRef(base)
+		for _, raw := range baseFromRefs {
+			appendRef(raw)
+		}
+		if overlay != nil {
+			appendRef(overlay.Base)
+			for _, raw := range overlay.BaseFromRefs {
+				appendRef(raw)
+			}
+		}
+	}
+	appendNode(c.Boot.Root.BaseRef, c.Boot.Root.Base, c.Boot.Root.BaseFromRefs, c.Boot.Root.Overlay)
+	for i := range c.Boot.Disks {
+		node := &c.Boot.Disks[i]
+		appendNode(node.BaseRef, node.Base, node.BaseFromRefs, node.Overlay)
+	}
+	return refs
+}
+
 // ParseSnapshotCfg parses the YAML body of a snapshot.cfg ZIP entry.
 func ParseSnapshotCfg(body []byte) (*SnapshotCfg, error) {
 	var cfg SnapshotCfg

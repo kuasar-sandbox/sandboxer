@@ -43,6 +43,15 @@ func OpenBlockReader(ctx context.Context, uri string, fetcher fetch.Fetcher, loc
 // pkg/restore) can share the same code path. The caller owns the
 // returned stream and must Close it (directly or via a StreamReader).
 func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (fetch.Stream, int64, error) {
+	return OpenDiskStreamAt(ctx, uri, fetcher, locations, "", codec, required)
+}
+
+// OpenDiskStreamAt is OpenDiskStream with an explicit base directory for an
+// unlocated relative file ref. Located and absolute file refs ignore
+// relativeDir. Callers that prepare task-local refs should pass the directory
+// established by their bootstrap rather than relying on the process working
+// directory.
+func OpenDiskStreamAt(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, relativeDir string, codec tarstream.Codec, required bool) (fetch.Stream, int64, error) {
 	ref, err := manifest.ParseRef(uri)
 	if err != nil {
 		return nil, 0, protectLocalArtifactError(codec, "parse local artifact ref", err)
@@ -51,7 +60,7 @@ func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher, loca
 	case manifest.RefSchemeFile:
 		// Local disk artifacts are tarstream envelopes (image/overlay);
 		// the hole map comes from the envelope, never the filesystem.
-		path, err := locations.ResolveFile(ref, "")
+		path, err := locations.ResolveFile(ref, relativeDir)
 		if err != nil {
 			return nil, 0, protectLocalArtifactError(codec, "resolve local artifact ref", err)
 		}
