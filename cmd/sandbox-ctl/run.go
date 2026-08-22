@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
@@ -236,17 +237,16 @@ func runCmd(args []string) int {
 		}
 		manifestCfg = nil
 	}
-	keyFn, localCodec, localRequired, err := storageOptions(manifestCfg)
+	processStorage, err := artifact.NewProcessStorage(manifestCfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[sandbox-ctl] local crypto: %v\n", err)
 		return 1
 	}
-	var manifestFetcher fetch.Fetcher
-	if manifestCfg != nil {
-		lazy := &onDemandManifestFetcher{cfg: manifestCfg, keyFn: keyFn}
-		manifestFetcher = lazy
-		defer lazy.Close()
-	}
+	defer processStorage.Close()
+	keyFn := processStorage.CustomerKeyFunc()
+	manifestFetcher := processStorage.Fetcher()
+	localCodec := processStorage.LocalCodec()
+	localRequired := processStorage.LocalRequired()
 
 	// cgroup overrides.
 	if *cgroupPath != "" {
