@@ -78,6 +78,21 @@ func (r *SnapshotCfgReader) Close() error {
 // Read opens rootRef, extracts exactly one snapshot.cfg ZIP entry under the
 // configured size limit, and returns its canonical parsed representation.
 func (r *SnapshotCfgReader) Read(ctx context.Context, rootRef string, opts SnapshotCfgReadOptions) (*SnapshotCfgDocument, error) {
+	body, err := r.ReadRaw(ctx, rootRef, opts)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := ParseSnapshotCfg(body)
+	if err != nil {
+		return nil, err
+	}
+	return &SnapshotCfgDocument{Config: cfg, Raw: body}, nil
+}
+
+// ReadRaw performs the same bounded, exact-entry read as Read without parsing
+// the YAML. It exists for sandbox-ctl info's default diagnostic output; task
+// callers should use Read so malformed root configs fail preparation.
+func (r *SnapshotCfgReader) ReadRaw(ctx context.Context, rootRef string, opts SnapshotCfgReadOptions) ([]byte, error) {
 	if r == nil || r.storage == nil {
 		return nil, errors.New("snapshot.cfg reader is not initialized")
 	}
@@ -103,11 +118,7 @@ func (r *SnapshotCfgReader) Read(ctx context.Context, rootRef string, opts Snaps
 	if closeErr != nil {
 		return nil, fmt.Errorf("close snapshot stream: %w", closeErr)
 	}
-	cfg, err := ParseSnapshotCfg(body)
-	if err != nil {
-		return nil, err
-	}
-	return &SnapshotCfgDocument{Config: cfg, Raw: body}, nil
+	return body, nil
 }
 
 func (r *SnapshotCfgReader) openRoot(ctx context.Context, rootRef string, opts SnapshotCfgReadOptions) (fetch.Stream, int64, error) {

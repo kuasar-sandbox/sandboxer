@@ -82,6 +82,28 @@ func TestInfoLocalCryptoPolicy(t *testing.T) {
 	}
 }
 
+func TestInfoRawOutputDoesNotRequireSnapshotCfgParsing(t *testing.T) {
+	malformed := []byte("resources: [")
+	zipBody, err := snapshot.BuildZIP(map[string][]byte{"snapshot.cfg": malformed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, path, err := snapshot.NewFileSink(t.TempDir(), "malformed", nil, false, nil).AbsorbBundle(
+		context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x17}, 4096)), nil, bytes.NewReader(zipBody),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, stdout, stderr := captureInfoOutput(t, func() int { return infoCmd([]string{path}) })
+	if rc != 0 || stdout != string(malformed) || stderr != "" {
+		t.Fatalf("raw info rc=%d stdout=%q stderr=%q", rc, stdout, stderr)
+	}
+	rc, _, stderr = captureInfoOutput(t, func() int { return infoCmd([]string{"--json", path}) })
+	if rc == 0 || stderr == "" {
+		t.Fatalf("JSON info accepted malformed snapshot.cfg: rc=%d stderr=%q", rc, stderr)
+	}
+}
+
 func captureInfoOutput(t *testing.T, fn func() int) (int, string, string) {
 	t.Helper()
 	outR, outW, err := os.Pipe()

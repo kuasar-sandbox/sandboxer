@@ -50,13 +50,14 @@ func infoCmd(args []string) int {
 		return 1
 	}
 	defer reader.Close()
-	document, err := reader.Read(ctx, input, restore.SnapshotCfgReadOptions{RefLocations: refLocations})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
+	readOptions := restore.SnapshotCfgReadOptions{RefLocations: refLocations}
 
 	if *asJSON {
+		document, err := reader.Read(ctx, input, readOptions)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(document.Config); err != nil {
@@ -65,7 +66,12 @@ func infoCmd(args []string) int {
 		}
 		return 0
 	}
-	if _, err := os.Stdout.Write(document.Raw); err != nil {
+	body, err := reader.ReadRaw(ctx, input, readOptions)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if _, err := os.Stdout.Write(body); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
