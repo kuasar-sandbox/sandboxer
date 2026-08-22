@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"runtime"
 	"sort"
@@ -210,10 +209,31 @@ type handlerStats struct {
 }
 
 type faultEvent struct {
-	address uint64
-	flags   uint64
-	uffdFD  int // which uffd this came from — determines ioctl target fd
-	queued  time.Time
+	address uint64 // faulting VA as reported by the kernel (logs / fallback resolution)
+	uffdFD  int    // which uffd this came from — determines ioctl target fd
+
+	// Hot-path fields, resolved once by dispatch() so the worker skips the
+	// second AddressMap RLock (and stateHardEnd skips the third). Callers
+	// that hand events straight to handleFault (tests) leave resolved unset
+	// and the handler falls back to resolving from address.
+	resolved     bool
+	pageVA       uint64 // address rounded down to the faulting page
+	pageOffset   uint64 // page-aligned memfd offset
+	pageIdx      uint64 // pageOffset / PageSize
+	regionEndOff uint64 // exclusive memfd offset where the containing CH region ends
+
+	queued time.Time
+}
+
+// resolveFrom fills the pre-resolved hot-path fields. pageOffset must be the
+// LocatePage result for the event's address; regionEndOff the containing CH
+// region's exclusive end (0 when unknown → stateHardEnd skips the clamp).
+func (e *faultEvent) resolveFrom(pageOffset, regionEndOff uint64) {
+	e.resolved = true
+	e.pageVA = e.address &^ (PageSize - 1)
+	e.pageOffset = pageOffset
+	e.pageIdx = pageOffset / PageSize
+	e.regionEndOff = regionEndOff
 }
 
 // NewWithBackendUffd constructs the single-uffd handler. The CH-side
@@ -490,17 +510,23 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 	switch msg.Event {
 	case uffdEventPagefault:
 		pf := (*uffdMsgPagefault)(unsafe.Pointer(&msg.Arg[0]))
-		offset, ok := h.addrMap.Locate(pf.Address)
+		pageOffset, regionEnd, ok := h.addrMap.LocatePage(pf.Address)
 		if !ok {
 			h.logf("uffd: fault at unknown va 0x%x (fd=%d)", pf.Address, fromFD)
 			h.stats.errors.Add(1)
 			_ = ioctlUffdWake(fromFD, pf.Address&^(PageSize-1), PageSize)
 			return
 		}
-		idx := offset / PageSize
-		hashed := pageIdxHash(idx) % uint64(len(h.queue))
+		ev := faultEvent{address: pf.Address, uffdFD: fromFD, queued: time.Now()}
+		ev.resolveFrom(pageOffset, regionEnd)
+		hashed := pageIdxHash(ev.pageIdx) % uint64(len(h.queue))
 		select {
-		case h.queue[hashed] <- faultEvent{address: pf.Address, flags: pf.Flags, uffdFD: fromFD, queued: time.Now()}:
+		case h.queue[hashed] <- ev:
+			// Sum of channel lengths keeps the historical total-depth
+			// semantics of this gauge (same scale as fault_queue_depth).
+			// The len() reads are plain loads; a shared enqueue/dequeue
+			// counter was measured to bounce a cacheline between reader
+			// and worker on every fault.
 			recordAtomicMax(&h.stats.queueDepthHWM, uint64(h.QueueDepth()))
 		case <-h.stop:
 		}
@@ -709,14 +735,18 @@ func (h *Handler) runWorker(idx int) {
 	}
 }
 
+// pageIdxHash spreads page indices across worker queues. Same page idx
+// always maps to the same worker (same-page convergence). The splitmix64
+// finalizer is allocation-free and inlinable — unlike a per-fault FNV
+// hasher — and mixes well enough that stride workloads don't pile onto
+// one queue regardless of worker count.
 func pageIdxHash(idx uint64) uint64 {
-	h := fnv.New64a()
-	var b [8]byte
-	for i := 0; i < 8; i++ {
-		b[i] = byte(idx >> (i * 8))
-	}
-	_, _ = h.Write(b[:])
-	return h.Sum64()
+	idx ^= idx >> 30
+	idx *= 0xbf58476d1ce4e5b9
+	idx ^= idx >> 27
+	idx *= 0x94d049bb133111eb
+	idx ^= idx >> 31
+	return idx
 }
 
 // Stats returns a snapshot of counter values for diagnostics.

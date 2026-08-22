@@ -57,90 +57,93 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 	recordAtomicMax(&h.stats.inflightHWM, uint64(inflight))
 	defer h.stats.inflight.Add(-1)
 
-	memfdOffset, ok := h.addrMap.Locate(ev.address)
-	if !ok {
-		h.logf("uffd: handleFault unknown va 0x%x", ev.address)
-		h.stats.errors.Add(1)
-		h.wake(ev.uffdFD, ev.address&^(PageSize-1), PageSize)
-		return
+	if !ev.resolved {
+		// Event arrived without the reader's pre-resolution (tests, or any
+		// future direct-enqueue path). Resolve here; AddressMap is stable
+		// after startup registration, so this matches dispatch's result.
+		pageOffset, regionEnd, ok := h.addrMap.LocatePage(ev.address)
+		if !ok {
+			h.logf("uffd: handleFault unknown va 0x%x", ev.address)
+			h.stats.errors.Add(1)
+			h.wake(ev.uffdFD, ev.address&^(PageSize-1), PageSize)
+			return
+		}
+		ev.resolveFrom(pageOffset, regionEnd)
 	}
-	pageVA := ev.address &^ (PageSize - 1)
-	pageOffset := memfdOffset &^ (PageSize - 1)
-	pageIdx := pageOffset / PageSize
 
-	switch state := h.state.Get(pageIdx); state {
+	switch state := h.state.Get(ev.pageIdx); state {
 	case StateAbsent:
 		h.stats.faultsAbsent.Add(1)
-		h.handleAbsentFault(ev.uffdFD, pageVA, pageOffset, pageIdx, pageBuf)
+		h.handleAbsentFault(ev, pageBuf)
 	case StateReleased:
 		h.stats.faultsReleased.Add(1)
-		h.handleZeroFault(ev.uffdFD, pageVA, pageOffset, pageIdx, StateReleased)
+		h.handleZeroFault(ev, StateReleased)
 	case StateLoaded:
 		h.stats.faultsLoaded.Add(1)
 		// A MISSING fault on StateLoaded means the balloon reclaimed the
 		// folio before its remove event was observed. Preserve the existing
 		// safety rule: refill only this page with zero and do not speculate.
-		if _, err := h.urgentZero(ev.uffdFD, pageVA, pageIdx, StateLoaded); err != nil {
-			h.logf("uffd: ZEROPAGE(loaded) va=0x%x: %v", pageVA, err)
+		if _, err := h.urgentZero(ev.uffdFD, ev.pageVA, ev.pageIdx, StateLoaded); err != nil {
+			h.logf("uffd: ZEROPAGE(loaded) va=0x%x: %v", ev.pageVA, err)
 			h.stats.errors.Add(1)
 		}
 	}
 }
 
-func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, pageBuf []byte) {
+func (h *Handler) handleAbsentFault(ev faultEvent, pageBuf []byte) {
 	// Scan far enough to retain the fixed 64 KiB zero-fill unit. Data reads and
 	// guest population are independently capped at dataFaultFillBytes below.
-	hardEnd := h.stateHardEnd(pageOffset, pageIdx, StateAbsent, zeroFaultFillBytes)
-	if hardEnd-pageOffset < PageSize {
+	hardEnd := h.stateHardEnd(ev, StateAbsent, zeroFaultFillBytes)
+	if hardEnd-ev.pageOffset < PageSize {
 		// The fault was classified as Absent before entering this method,
 		// but a concurrent urgent or tail completion may have populated it
 		// before the run scan acquired the state lock. Converge that stale
 		// event exactly like an ioctl conflict: wake it without treating an
 		// already-resolved page as a handler error. A Released page will fault
 		// again and take the StateReleased zero path.
-		if h.state.Get(pageIdx) != StateAbsent {
-			h.wake(uffdFD, pageVA, PageSize)
+		if h.state.Get(ev.pageIdx) != StateAbsent {
+			h.wake(ev.uffdFD, ev.pageVA, PageSize)
 			return
 		}
-		h.failUrgent(uffdFD, pageVA, "no full Absent page at offset 0x%x", pageOffset)
+		h.failUrgent(ev.uffdFD, ev.pageVA, "no full Absent page at offset 0x%x", ev.pageOffset)
 		return
 	}
-	run, err := h.cfg.Source.RunAt(pageOffset, hardEnd-pageOffset)
+	run, err := h.cfg.Source.RunAt(ev.pageOffset, hardEnd-ev.pageOffset)
 	if err != nil {
-		h.failUrgent(uffdFD, pageVA, "source.RunAt off=0x%x limit=%d: %v", pageOffset, hardEnd-pageOffset, err)
+		h.failUrgent(ev.uffdFD, ev.pageVA, "source.RunAt off=0x%x limit=%d: %v", ev.pageOffset, hardEnd-ev.pageOffset, err)
 		return
 	}
-	if err := validateFaultRun(run, pageOffset, hardEnd); err != nil {
-		h.failUrgent(uffdFD, pageVA, "%v", err)
+	if err := validateFaultRun(run, ev.pageOffset, hardEnd); err != nil {
+		h.failUrgent(ev.uffdFD, ev.pageVA, "%v", err)
 		return
 	}
-	if run.End()-pageOffset < PageSize {
-		h.failUrgent(uffdFD, pageVA, "source Run [%d,%d) does not cover fault page", run.Offset(), run.End())
+	if run.End()-ev.pageOffset < PageSize {
+		h.failUrgent(ev.uffdFD, ev.pageVA, "source Run [%d,%d) does not cover fault page", run.Offset(), run.End())
 		return
 	}
 
 	switch run.Kind() {
 	case sparse.Data:
 		if _, ok := run.(fetch.ChunkRun); ok {
-			h.handleChunkFault(uffdFD, pageVA, pageOffset, pageIdx, run, pageBuf)
+			h.handleChunkFault(ev, run, pageBuf)
 			return
 		}
-		h.handleOrdinaryDataFault(uffdFD, pageVA, pageOffset, pageIdx, run, pageBuf)
+		h.handleOrdinaryDataFault(ev, run, pageBuf)
 	case sparse.Hole, sparse.Zero:
-		h.handleResolvedZeroFault(uffdFD, pageVA, pageOffset, pageIdx, StateAbsent, run.End())
+		h.handleResolvedZeroFault(ev, StateAbsent, run.End())
 	}
 }
 
-func (h *Handler) handleChunkFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, run sparse.Run, pageBuf []byte) {
+func (h *Handler) handleChunkFault(ev faultEvent, run sparse.Run, pageBuf []byte) {
 	// Keep chunk fetch and guest population bounded to the urgent page plus
 	// one neighbor. Retaining decrypted chunk data is a separate cache design.
 	if !h.tryReserveTail() {
 		if err := h.readRun(run, pageBuf, 0); err != nil {
-			h.failUrgent(uffdFD, pageVA, "chunk urgent read off=0x%x: %v", pageOffset, err)
+			h.failUrgent(ev.uffdFD, ev.pageVA, "chunk urgent read off=0x%x: %v", ev.pageOffset, err)
 			return
 		}
-		if _, err := h.urgentCopy(uffdFD, pageVA, pageIdx, StateAbsent, pageBuf); err != nil {
-			h.logf("uffd: COPY(chunk urgent) va=0x%x: %v", pageVA, err)
+		if _, err := h.urgentCopy(ev.uffdFD, ev.pageVA, ev.pageIdx, StateAbsent, pageBuf); err != nil {
+			h.logf("uffd: COPY(chunk urgent) va=0x%x: %v", ev.pageVA, err)
 			h.stats.errors.Add(1)
 		}
 		return
@@ -149,49 +152,49 @@ func (h *Handler) handleChunkFault(uffdFD int, pageVA, pageOffset, pageIdx uint6
 	runLength := min(run.End()-run.Offset(), uint64(len(h.tailBuf)))
 	if err := h.readRun(run, h.tailBuf[:runLength], 0); err != nil {
 		h.releaseTail()
-		h.failUrgent(uffdFD, pageVA, "chunk read off=0x%x len=%d: %v", pageOffset, runLength, err)
+		h.failUrgent(ev.uffdFD, ev.pageVA, "chunk read off=0x%x len=%d: %v", ev.pageOffset, runLength, err)
 		return
 	}
-	outcome, err := h.urgentCopy(uffdFD, pageVA, pageIdx, StateAbsent, h.tailBuf[:PageSize])
+	outcome, err := h.urgentCopy(ev.uffdFD, ev.pageVA, ev.pageIdx, StateAbsent, h.tailBuf[:PageSize])
 	if err != nil {
 		h.releaseTail()
-		h.logf("uffd: COPY(chunk urgent) va=0x%x: %v", pageVA, err)
+		h.logf("uffd: COPY(chunk urgent) va=0x%x: %v", ev.pageVA, err)
 		h.stats.errors.Add(1)
 		return
 	}
-	tailEnd := pageOffset + (runLength/PageSize)*PageSize
-	if !outcome.tailEligible || tailEnd <= pageOffset+PageSize {
+	tailEnd := ev.pageOffset + (runLength/PageSize)*PageSize
+	if !outcome.tailEligible || tailEnd <= ev.pageOffset+PageSize {
 		h.releaseTail()
 		return
 	}
 	task := tailTask{
 		kind:     tailBufferedData,
-		uffdFD:   uffdFD,
-		dstVA:    pageVA + PageSize,
-		pageIdx:  pageIdx + 1,
-		start:    pageOffset + PageSize,
+		uffdFD:   ev.uffdFD,
+		dstVA:    ev.pageVA + PageSize,
+		pageIdx:  ev.pageIdx + 1,
+		start:    ev.pageOffset + PageSize,
 		end:      tailEnd,
 		expected: StateAbsent,
 	}
 	h.enqueueReservedTail(task)
 }
 
-func (h *Handler) handleOrdinaryDataFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, run sparse.Run, pageBuf []byte) {
+func (h *Handler) handleOrdinaryDataFault(ev faultEvent, run sparse.Run, pageBuf []byte) {
 	if err := h.readRun(run, pageBuf, 0); err != nil {
-		h.failUrgent(uffdFD, pageVA, "data urgent read off=0x%x: %v", pageOffset, err)
+		h.failUrgent(ev.uffdFD, ev.pageVA, "data urgent read off=0x%x: %v", ev.pageOffset, err)
 		return
 	}
-	outcome, err := h.urgentCopy(uffdFD, pageVA, pageIdx, StateAbsent, pageBuf)
+	outcome, err := h.urgentCopy(ev.uffdFD, ev.pageVA, ev.pageIdx, StateAbsent, pageBuf)
 	if err != nil {
-		h.logf("uffd: COPY(data urgent) va=0x%x: %v", pageVA, err)
+		h.logf("uffd: COPY(data urgent) va=0x%x: %v", ev.pageVA, err)
 		h.stats.errors.Add(1)
 		return
 	}
 	if !outcome.tailEligible {
 		return
 	}
-	tailEnd := alignedRunEnd(pageOffset, run.End())
-	if tailEnd <= pageOffset+PageSize {
+	tailEnd := alignedRunEnd(ev.pageOffset, run.End())
+	if tailEnd <= ev.pageOffset+PageSize {
 		return
 	}
 	if !h.tryReserveTail() {
@@ -200,33 +203,33 @@ func (h *Handler) handleOrdinaryDataFault(uffdFD int, pageVA, pageOffset, pageId
 	task := tailTask{
 		kind:     tailDeferredData,
 		run:      run,
-		uffdFD:   uffdFD,
-		dstVA:    pageVA + PageSize,
-		pageIdx:  pageIdx + 1,
-		start:    pageOffset + PageSize,
+		uffdFD:   ev.uffdFD,
+		dstVA:    ev.pageVA + PageSize,
+		pageIdx:  ev.pageIdx + 1,
+		start:    ev.pageOffset + PageSize,
 		end:      tailEnd,
 		expected: StateAbsent,
 	}
 	h.enqueueReservedTail(task)
 }
 
-func (h *Handler) handleZeroFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, expected PageState) {
-	hardEnd := h.stateHardEnd(pageOffset, pageIdx, expected, zeroFaultFillBytes)
-	h.handleResolvedZeroFault(uffdFD, pageVA, pageOffset, pageIdx, expected, hardEnd)
+func (h *Handler) handleZeroFault(ev faultEvent, expected PageState) {
+	hardEnd := h.stateHardEnd(ev, expected, zeroFaultFillBytes)
+	h.handleResolvedZeroFault(ev, expected, hardEnd)
 }
 
-func (h *Handler) handleResolvedZeroFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, expected PageState, runEnd uint64) {
-	outcome, err := h.urgentZero(uffdFD, pageVA, pageIdx, expected)
+func (h *Handler) handleResolvedZeroFault(ev faultEvent, expected PageState, runEnd uint64) {
+	outcome, err := h.urgentZero(ev.uffdFD, ev.pageVA, ev.pageIdx, expected)
 	if err != nil {
-		h.logf("uffd: ZEROPAGE urgent va=0x%x expected=%d: %v", pageVA, expected, err)
+		h.logf("uffd: ZEROPAGE urgent va=0x%x expected=%d: %v", ev.pageVA, expected, err)
 		h.stats.errors.Add(1)
 		return
 	}
 	if !outcome.tailEligible {
 		return
 	}
-	tailEnd := alignedRunEnd(pageOffset, runEnd)
-	if tailEnd <= pageOffset+PageSize {
+	tailEnd := alignedRunEnd(ev.pageOffset, runEnd)
+	if tailEnd <= ev.pageOffset+PageSize {
 		return
 	}
 	if !h.tryReserveTail() {
@@ -234,28 +237,34 @@ func (h *Handler) handleResolvedZeroFault(uffdFD int, pageVA, pageOffset, pageId
 	}
 	task := tailTask{
 		kind:     tailZero,
-		uffdFD:   uffdFD,
-		dstVA:    pageVA + PageSize,
-		pageIdx:  pageIdx + 1,
-		start:    pageOffset + PageSize,
+		uffdFD:   ev.uffdFD,
+		dstVA:    ev.pageVA + PageSize,
+		pageIdx:  ev.pageIdx + 1,
+		start:    ev.pageOffset + PageSize,
 		end:      tailEnd,
 		expected: expected,
 	}
 	h.enqueueReservedTail(task)
 }
 
-func (h *Handler) stateHardEnd(pageOffset, pageIdx uint64, expected PageState, maxFillBytes uint64) uint64 {
+// stateHardEnd bounds one fault's state scan and fill to the smaller of the
+// fill unit, the memfd end, and — via the event's pre-resolved regionEndOff —
+// the containing CH uffd region, so a fill ioctl never crosses a region
+// boundary. regionEndOff 0 (unresolved event) skips the region clamp: no CH
+// region covers the offset, so the caller proceeds unclamped.
+func (h *Handler) stateHardEnd(ev faultEvent, expected PageState, maxFillBytes uint64) uint64 {
+	pageOffset := ev.pageOffset
 	if pageOffset >= uint64(h.cfg.Size) {
 		return pageOffset
 	}
 	maxPages := maxFillBytes / PageSize
-	pages := h.state.RunLength(pageIdx, maxPages, expected)
+	pages := h.state.RunLength(ev.pageIdx, maxPages, expected)
 	length := pages * PageSize
 	if remaining := uint64(h.cfg.Size) - pageOffset; length > remaining {
 		length = remaining
 	}
-	if remaining, ok := h.addrMap.CHRegionRemaining(pageOffset, length); ok && remaining < length {
-		length = remaining
+	if ev.regionEndOff > pageOffset && ev.regionEndOff-pageOffset < length {
+		length = ev.regionEndOff - pageOffset
 	}
 	length -= length % PageSize
 	return pageOffset + length

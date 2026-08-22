@@ -110,17 +110,15 @@ func (m *AddressMap) Locate(faultVA uint64) (uint64, bool) {
 	return 0, false
 }
 
-// CHRegionRemaining returns how many bytes, starting at memfdOffset,
-// stay within the single CH-side uffd region (VMA) that contains
-// memfdOffset, capped at reqLen. A uffd fill ioctl is issued on one
-// region's fd and must never run past that region's VA mapping: when
-// CH splits the zone across the x86 PCI hole the regions sit at
-// distinct, non-contiguous VAs, so a batch crossing the boundary
-// resolves to no compatible userfaultfd VMA and the ioctl returns
-// ENOENT for the out-of-region tail. Returns (reqLen, false) if no CH
-// region covers the offset (caller proceeds unclamped; Locate already
-// validated the faulting page itself).
-func (m *AddressMap) CHRegionRemaining(memfdOffset, reqLen uint64) (uint64, bool) {
+// LocatePage resolves a CH-side fault VA in a single RLock pass: the
+// page-aligned memfd offset of the faulting page plus the exclusive end
+// offset of the containing CH region. The region end lets the fault
+// worker clamp fill ioctls to one region without re-entering the map —
+// when CH splits a zone across the x86 PCI hole the regions sit at
+// distinct, non-contiguous VAs, and a batch crossing the boundary
+// resolves to no compatible userfaultfd VMA (ENOENT on the tail).
+// Returns ok=false when no CH VMA covers faultVA.
+func (m *AddressMap) LocatePage(faultVA uint64) (pageOffset, regionEndOff uint64, ok bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for i := range m.vmas {
@@ -128,15 +126,12 @@ func (m *AddressMap) CHRegionRemaining(memfdOffset, reqLen uint64) (uint64, bool
 		if v.process != ProcessCH {
 			continue
 		}
-		size := v.end - v.start
-		if memfdOffset >= v.memfdOffset && memfdOffset < v.memfdOffset+size {
-			if avail := v.memfdOffset + size - memfdOffset; avail < reqLen {
-				return avail, true
-			}
-			return reqLen, true
+		if faultVA >= v.start && faultVA < v.end {
+			off := v.memfdOffset + (faultVA - v.start)
+			return off &^ (PageSize - 1), v.memfdOffset + (v.end - v.start), true
 		}
 	}
-	return reqLen, false
+	return 0, 0, false
 }
 
 // BackendVAFor returns the backendVA address that corresponds to the

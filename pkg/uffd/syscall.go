@@ -69,13 +69,6 @@ type uffdMsgRemove struct {
 	End   uint64
 }
 
-// pagefault flag bits.
-const (
-	uffdPagefaultFlagWrite uint64 = 1 << 0
-	uffdPagefaultFlagWP    uint64 = 1 << 1
-	uffdPagefaultFlagMinor uint64 = 1 << 2
-)
-
 // uffdio_register struct.
 type uffdioRegisterStruct struct {
 	RangeStart uint64

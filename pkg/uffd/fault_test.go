@@ -253,6 +253,77 @@ func TestConcurrentFaultsKeepSingleTailReservation(t *testing.T) {
 	waitUnitTail(t, h)
 }
 
+func TestFaultQueueDepthHWMCountsTotalAcrossQueues(t *testing.T) {
+	h := newUnitHandler(t, 16*PageSize, newRecordingSnapshot(16*PageSize, sparse.Data, 0x31))
+	h.queue = []chan faultEvent{make(chan faultEvent, 4), make(chan faultEvent, 4)}
+	h.ops = newFakeIoctls().ops()
+	startUnitTail(t, h)
+
+	// Pick pages that hash to different worker queues, then dispatch 2+1
+	// events: no single queue ever holds more than 2, so a per-queue max
+	// would read 2 while the total-depth gauge must read 3.
+	var a, b uint64
+	for idx := uint64(0); a == 0 || b == 0; idx++ {
+		switch pageIdxHash(idx) % uint64(len(h.queue)) {
+		case 0:
+			if a == 0 {
+				a = idx
+			}
+		case 1:
+			if b == 0 {
+				b = idx
+			}
+		}
+		if idx > 64 {
+			t.Fatal("hash did not spread across two queues")
+		}
+	}
+
+	var msg uffdMsg
+	msg.Event = uffdEventPagefault
+	for _, page := range []uint64{a, a, b} {
+		binary.LittleEndian.PutUint64(msg.Arg[8:16], unitCHVA+page*PageSize)
+		h.dispatch(&msg, 21)
+	}
+	if got := h.Stats()["fault_queue_depth_hwm"]; got != 3 {
+		t.Fatalf("queue depth HWM = %d, want total of 3 across both queues", got)
+	}
+	if got := h.Stats()["fault_queue_depth"]; got != 3 {
+		t.Fatalf("queue depth = %d, want 3", got)
+	}
+
+	h.wg.Add(2)
+	for i := range h.queue {
+		go h.runWorker(i)
+	}
+	// Drain before shutdown: each event increments exactly one
+	// classification counter, so the sum reaching 3 proves every event
+	// entered handleFault. Queue depth alone is not enough — a worker can
+	// hold a received event before inflight is incremented, so depth and
+	// inflight would transiently read as drained with an event pending.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		classified := h.stats.faultsAbsent.Load() +
+			h.stats.faultsReleased.Load() +
+			h.stats.faultsLoaded.Load()
+		if classified >= 3 && h.stats.inflight.Load() == 0 && !h.tailBusy.Load() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pipeline did not drain: classified=%d/3 inflight=%d tailBusy=%v",
+				classified, h.stats.inflight.Load(), h.tailBusy.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(h.stop)
+	h.wg.Wait()
+
+	stats := h.Stats()
+	if stats["fault_queue_depth"] != 0 || stats["fault_queue_depth_hwm"] != 3 || stats["errors"] != 0 {
+		t.Fatalf("post-drain queue metrics = %#v", stats)
+	}
+}
+
 func TestFaultQueueWaitDepthAndInflightMetrics(t *testing.T) {
 	h := newUnitHandler(t, PageSize, newRecordingSnapshot(PageSize, sparse.Data, 0x17))
 	h.queue = []chan faultEvent{make(chan faultEvent, 4)}
@@ -338,7 +409,7 @@ func TestStaleAbsentFaultConvergesWithoutError(t *testing.T) {
 	// handleAbsentFault is entered only after handleFault observed Absent.
 	// Model a tail completion changing the page before stateHardEnd scans it.
 	h.state.Set(0, StateLoaded)
-	h.handleAbsentFault(7, unitCHVA, 0, 0, make([]byte, PageSize))
+	h.handleAbsentFault(faultEvent{address: unitCHVA, uffdFD: 7}, make([]byte, PageSize))
 
 	stats := h.Stats()
 	if stats["errors"] != 0 || stats["wakes"] != 1 {
