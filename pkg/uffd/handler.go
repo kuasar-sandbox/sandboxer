@@ -712,11 +712,16 @@ func (h *Handler) runRemoveFlusher() {
 
 func (h *Handler) runWorker(idx int) {
 	defer h.wg.Done()
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 
 	// Fault workers own only the urgent page. Speculative data uses the
 	// single Handler-wide tailBuf under tailBusy reservation.
+	//
+	// No LockOSThread: the work is source reads plus UFFD ioctls on fds
+	// shared process-wide — nothing here is thread-local (no setns, no
+	// signal-mask juggling, no per-thread fd). Pinning every fault worker
+	// to a dedicated OS thread only removes the scheduler's freedom to run
+	// a ready worker on an idle P, and at high sandbox density it holds
+	// NumThreads ≥ NumWorkers per sandbox for no measurable locality gain.
 	pageBuf := make([]byte, PageSize)
 	q := h.queue[idx]
 	for {
