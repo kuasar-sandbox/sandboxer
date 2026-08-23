@@ -13,8 +13,10 @@
 # artifact records freeze MemAvailable/Cached, CH target/current, Budget values,
 # snapshot resident bytes, rootfs vhost reads/bytes/latency, and UFFD counters.
 # No fixed latency threshold is introduced: the read-amplification gate is
-# relative to the two controls, while full pre-read residency is the direct
-# correctness assertion.
+# relative to the two controls. The controls require full pre-read residency;
+# the 256MiB-headroom case may lose at most one MemoryStep because the approved
+# memory.high PressureReserve deliberately starts host pressure one Step below
+# the full Budget.
 
 set -euo pipefail
 
@@ -66,6 +68,10 @@ esac
 case "$REPORT_SETTLE_SECONDS" in
     ''|*[!0-9]*|0) echo "$0: MEM_REPORT_SETTLE_SECONDS must be a positive integer" >&2; exit 1 ;;
 esac
+NEW_RESIDENT_FLOOR_BYTES=0
+if [ "$WARM_BYTES" -gt "$MEMORY_STEP_BYTES" ]; then
+    NEW_RESIDENT_FLOOR_BYTES=$((WARM_BYTES - MEMORY_STEP_BYTES))
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
@@ -358,19 +364,24 @@ guest_exec() { # $1=sid, remaining args are sandbox-ctl exec argv
     "$BIN/sandbox-ctl" exec --sandbox-id "$sid" --run-root "$RUN_ROOT" "$@"
 }
 
-assert_all_resident() { # $1=mincore output $2=context
-    local output="$1" context="$2"
-    python3 - "$output" "$context" <<'PY'
+assert_resident_at_least() { # $1=mincore output $2=floor bytes $3=context
+    local output="$1" floor_bytes="$2" context="$3"
+    python3 - "$output" "$floor_bytes" "$context" <<'PY'
 import re
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
-match = re.search(r"resident=(\d+) pages=(\d+)", text)
+floor_bytes = int(sys.argv[2])
+match = re.search(r"resident=(\d+) pages=(\d+) bytes=(\d+)", text)
 if not match:
-    raise SystemExit(f"{sys.argv[2]}: invalid mincore output: {text!r}")
-resident, pages = map(int, match.groups())
-if resident != pages:
-    raise SystemExit(f"{sys.argv[2]}: only {resident}/{pages} pages resident")
+    raise SystemExit(f"{sys.argv[3]}: invalid mincore output: {text!r}")
+resident, pages, file_bytes = map(int, match.groups())
+floor_pages = (floor_bytes * pages + file_bytes - 1) // file_bytes
+if resident < floor_pages:
+    raise SystemExit(
+        f"{sys.argv[3]}: only {resident}/{pages} pages resident, "
+        f"want at least {floor_pages} pages ({floor_bytes} bytes)"
+    )
 PY
 }
 
@@ -424,8 +435,9 @@ PY
     RECORDS["$key"]="$record"
 }
 
-record_case() { # $1=label $2=headroom-yaml $3=startup-yaml $4=also-b $5=headroom-bytes
+record_case() { # $1=label $2=headroom-yaml $3=startup-yaml $4=also-b $5=headroom-bytes $6=resident-floor
     local label="$1" headroom="$2" startup="$3" also_b="$4" headroom_bytes="$5"
+    local resident_floor_bytes="$6"
     local sid="mb-${label}-$$" log="$WORK/$label-run.log"
     local cgroup diff cfg pid checksum warm_path=/opt/kuasar-working-set-114.bin
     new_cgroup "$sid"
@@ -460,7 +472,8 @@ record_case() { # $1=label $2=headroom-yaml $3=startup-yaml $4=also-b $5=headroo
     sleep "$REPORT_SETTLE_SECONDS"
     guest_exec "$sid" -- python3 -c "$MINCORE_PROBE" "$warm_path" \
         >"$WORK/$label-prefreeze.mincore"
-    assert_all_resident "$WORK/$label-prefreeze.mincore" "$label before W freeze"
+    assert_resident_at_least "$WORK/$label-prefreeze.mincore" \
+        "$resident_floor_bytes" "$label before W freeze"
     guest_exec "$sid" -- cat /proc/meminfo >"$WORK/$label-prefreeze.meminfo"
 
     local w_key="$label-w" w_out="$WORK/$label-w" w_snapshot_output="$WORK/$label-w.snapshot.out"
@@ -554,8 +567,8 @@ with open(output, "w", encoding="utf-8") as destination:
 PY
 }
 
-restore_case() { # $1=key $2=require-full-residency
-    local key="$1" require_full="$2" snapshot="${SNAPSHOTS[$key]}"
+restore_case() { # $1=key $2=resident-floor-bytes
+    local key="$1" resident_floor_bytes="$2" snapshot="${SNAPSHOTS[$key]}"
     local sid="restore-${key}-$$" cgroup diff cfg log pid stats mincore checksum
     new_cgroup "$sid"
     cgroup="$NEW_CGROUP"
@@ -580,9 +593,8 @@ restore_case() { # $1=key $2=require-full-residency
     ready "$sid" "$pid" "$log"
     guest_exec "$sid" -- python3 -c "$MINCORE_PROBE" /opt/kuasar-working-set-114.bin \
         >"$mincore"
-    if [ "$require_full" = "1" ]; then
-        assert_all_resident "$mincore" "$key after restore before first content read"
-    fi
+    assert_resident_at_least "$mincore" "$resident_floor_bytes" \
+        "$key after restore before first content read"
     guest_exec "$sid" -- sha256sum /opt/kuasar-working-set-114.bin \
         >"$WORK/$key-restore.sha"
     grep -Fq "$checksum  /opt/kuasar-working-set-114.bin" "$WORK/$key-restore.sha" \
@@ -598,13 +610,13 @@ restore_case() { # $1=key $2=require-full-residency
 
 # The two controls are independent W captures. The new-model VM is resumed
 # after W so B is captured from the same guest and disk state.
-record_case no-balloon 8GiB 8GiB 0 "$CAPACITY_BYTES"
-record_case workaround 7680MiB 7680MiB 0 $((7680 * 1024 * 1024))
-record_case new 256MiB 2GiB 1 "$HEADROOM_BYTES"
+record_case no-balloon 8GiB 8GiB 0 "$CAPACITY_BYTES" "$WARM_BYTES"
+record_case workaround 7680MiB 7680MiB 0 $((7680 * 1024 * 1024)) "$WARM_BYTES"
+record_case new 256MiB 2GiB 1 "$HEADROOM_BYTES" "$NEW_RESIDENT_FLOOR_BYTES"
 
-restore_case no-balloon-w 1
-restore_case workaround-w 1
-restore_case new-w 1
+restore_case no-balloon-w "$WARM_BYTES"
+restore_case workaround-w "$WARM_BYTES"
+restore_case new-w "$NEW_RESIDENT_FLOOR_BYTES"
 restore_case new-b 0
 
 python3 - "$CAPACITY_BYTES" "$HEADROOM_BYTES" "$MEMORY_STEP_BYTES" "$ANON_BYTES" "$WARM_BYTES" \
@@ -643,13 +655,19 @@ for key in ("no-balloon-w", "workaround-w", "new-w"):
         raise SystemExit(f"{key}: W freeze used no trusted report: {freeze}")
     pre = doc["record"]["prefreeze_mincore"]
     restored = doc["restore_mincore"]
-    if pre["resident_pages"] != pre["pages"] or restored["resident_pages"] != restored["pages"]:
-        raise SystemExit(f"{key}: working-set file was not fully resident before first restore read")
-    expected_resident = anon_bytes + warm_bytes
+    resident_floor = warm_bytes if key != "new-w" else max(0, warm_bytes - step)
+    for phase, observation in (("prefreeze", pre), ("restore", restored)):
+        resident_bytes = observation["resident_pages"] * observation["bytes"] // observation["pages"]
+        if resident_bytes < resident_floor:
+            raise SystemExit(
+                f"{key}: {phase} resident bytes={resident_bytes}, "
+                f"want at least {resident_floor}"
+            )
+    expected_resident = anon_bytes + resident_floor
     if doc["record"]["memory_resident_bytes"] < expected_resident:
         raise SystemExit(
             f"{key}: W memory resident bytes={doc['record']['memory_resident_bytes']} "
-            f"smaller than anon+file working set={expected_resident}"
+            f"smaller than anon+required file working set={expected_resident}"
         )
 
 new_freeze = results["new-w"]["record"]["freeze"]
@@ -658,9 +676,11 @@ if new_freeze["MemAvailable"] < headroom - step:
         f"new-w: freeze MemAvailable={new_freeze['MemAvailable']} below one-step "
         f"headroom bound={headroom-step}"
     )
-if new_freeze["Cached"] < warm_bytes // 2:
+new_resident_floor = max(0, warm_bytes - step)
+if new_freeze["Cached"] < new_resident_floor:
     raise SystemExit(
-        f"new-w: freeze Cached={new_freeze['Cached']} does not retain the deterministic file"
+        f"new-w: freeze Cached={new_freeze['Cached']} below one-step "
+        f"working-set bound={new_resident_floor}"
     )
 
 # The old failure was thousands of extra rootfs reads while both controls were
@@ -695,6 +715,7 @@ with open(output, "w", encoding="utf-8") as destination:
         "memory_step_bytes": step,
         "anonymous_demand_bytes": anon_bytes,
         "working_set_bytes": warm_bytes,
+        "new_resident_floor_bytes": new_resident_floor,
         "rootfs_control_max_count": control_count,
         "rootfs_control_max_bytes": control_bytes,
         "results": results,
