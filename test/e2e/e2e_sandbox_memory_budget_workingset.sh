@@ -568,7 +568,8 @@ PY
 }
 
 restore_case() { # $1=key $2=resident-floor-bytes
-    local key="$1" resident_floor_bytes="$2" snapshot="${SNAPSHOTS[$key]}"
+    local key="$1" resident_floor_bytes="$2"
+    local snapshot="${SNAPSHOTS[$key]}"
     local sid="restore-${key}-$$" cgroup diff cfg log pid stats mincore checksum
     new_cgroup "$sid"
     cgroup="$NEW_CGROUP"
