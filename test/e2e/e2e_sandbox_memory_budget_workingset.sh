@@ -107,11 +107,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-grep -qw memory /sys/fs/cgroup/cgroup.controllers \
-    || skip "cgroup v2 memory controller is unavailable"
-echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+for controller in cpu memory; do
+    grep -qw "$controller" /sys/fs/cgroup/cgroup.controllers \
+        || skip "cgroup v2 $controller controller is unavailable"
+done
+echo '+cpu +memory' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
 mkdir "$CGROUP_ROOT" 2>/dev/null || skip "cannot create $CGROUP_ROOT"
-echo +memory > "$CGROUP_ROOT/cgroup.subtree_control" 2>/dev/null || true
+echo '+cpu +memory' > "$CGROUP_ROOT/cgroup.subtree_control" 2>/dev/null \
+    || skip "cannot enable cpu and memory below $CGROUP_ROOT"
+for controller in cpu memory; do
+    grep -qw "$controller" "$CGROUP_ROOT/cgroup.subtree_control" \
+        || skip "$controller is not enabled below $CGROUP_ROOT"
+done
 
 new_cgroup() { # $1 = stable leaf label
     local label="$1" leaf="$CGROUP_ROOT/$1"
