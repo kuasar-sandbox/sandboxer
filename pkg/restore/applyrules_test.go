@@ -236,6 +236,8 @@ func TestCanonicalizeSnapshotTarRefsDefersHostBaseOverrides(t *testing.T) {
 	rootRef := "file://root.img@sha256:" + rootDigest
 	diskRef := "file://data.img@sha256:" + diskDigest
 	snap := &SnapshotCfg{}
+	snap.Resources.Capacity.CPU = 1
+	snap.Resources.Capacity.Memory = "1GiB"
 	snap.Boot.RuntimeRef = "file://runtime.erofs@sha256:" + runtimeDigest
 	snap.Boot.Root.BaseRef = rootRef
 	snap.Boot.Root.Overlay = &SnapOverlayCfg{}
@@ -318,6 +320,48 @@ func TestApplyRules_CapacityAutoFilledWhenAbsent(t *testing.T) {
 	}
 	if out.Resources.Capacity.CPU != 2 || out.Resources.Capacity.Memory != "4GiB" {
 		t.Errorf("capacity not auto-filled: %+v", out.Resources.Capacity)
+	}
+}
+
+func TestApplyRulesValidatesResolvedRestoreMemoryPolicy(t *testing.T) {
+	dir := t.TempDir()
+	rtPath := filepath.Join(dir, "runtime.erofs")
+	rtDigest := writeFile(t, rtPath, []byte("runtime body"))
+	basePath := filepath.Join(dir, "base.erofs")
+	baseDigest := writeFile(t, basePath, []byte("base body"))
+	snap := baseSnap("file://runtime.erofs@sha256:"+rtDigest, "file://base.erofs@sha256:"+baseDigest, "file://abc.overlay")
+
+	tests := []struct {
+		name    string
+		mutate  func(*config.SandboxConfig)
+		wantErr string
+	}{
+		{
+			name: "allocatable above snapshot capacity",
+			mutate: func(c *config.SandboxConfig) {
+				c.Resources.Allocatable.Memory = "8GiB"
+			},
+			wantErr: "resources.allocatable.memory must be ≤ capacity.memory",
+		},
+		{
+			name: "startup above snapshot capacity",
+			mutate: func(c *config.SandboxConfig) {
+				c.Resources.Startup = &config.StartupConfig{Memory: "8GiB"}
+			},
+			wantErr: "resources.startup.memory",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			host := &config.SandboxConfig{}
+			host.Network.TAP = "tap0"
+			host.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///tmp/diff"}
+			tc.mutate(host)
+			_, err := applyRules(host, snap, filepath.Join(dir, "x.snapshot"))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ApplyRules() error=%v, want %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 

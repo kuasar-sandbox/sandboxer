@@ -1,9 +1,10 @@
 package sandbox
 
 import (
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func hasCmdlineToken(cmdline, want string) bool {
@@ -59,10 +60,10 @@ func TestCHCommand_HasExpectedFlags(t *testing.T) {
 		"--api-socket /run/sb/ch.sock",
 		"--kernel /vmlinux",
 		"file=/sandbox-runtime.bundle,discard_writes=on",
-		"size=4096M,shared=on,fd=3,uffd_socket=/run/sb/uffd.sock",
-		// cap = 4 GiB, alloc = 2 GiB → balloon pre-inflated to 2 GiB
-		// (= 2147483648 bytes) so guest sees exactly `alloc` from boot.
-		"--balloon size=2147483648",
+		"size=4294967296,shared=on,fd=3,uffd_socket=/run/sb/uffd.sock",
+		// startup defaults to Capacity, but the steady headroom enables runtime
+		// memory control, so the balloon device is still present at target zero.
+		"--balloon size=0",
 		"boot=2",
 		"--disk vhost_user=on,socket=/run/sb/blk0.sock,readonly=on vhost_user=on,socket=/run/sb/blk1.sock",
 		"tap=tap0",
@@ -87,9 +88,9 @@ func TestCHCommand_HasExpectedFlags(t *testing.T) {
 	}
 }
 
-func TestCHCommand_InitialAllocatableOverridesBalloon(t *testing.T) {
+func TestCHCommand_InitialBudgetOverridesBalloon(t *testing.T) {
 	cfg := makeMinimalCfg()
-	args, err := CHCommandWithInitialAllocatable(cfg, 3<<30,
+	args, err := CHCommandWithInitialBudget(cfg, 3<<30,
 		[]DiskArg{{Sock: "/run/sb/blk0.sock", ReadOnly: true}, {Sock: "/run/sb/blk1.sock"}},
 		"/run/sb/ch.sock", "/run/sb/vsock.sock", "/vmlinux", "/sandbox-runtime.bundle", "/run/sb/uffd.sock", "tty", 0, "")
 	if err != nil {
@@ -97,7 +98,19 @@ func TestCHCommand_InitialAllocatableOverridesBalloon(t *testing.T) {
 	}
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--balloon size=1073741824") {
-		t.Fatalf("initial allocatable 3GiB under 4GiB capacity should boot with 1GiB balloon, got: %s", joined)
+		t.Fatalf("initial Budget 3GiB under 4GiB capacity should boot with 1GiB balloon, got: %s", joined)
+	}
+}
+
+func TestCHCommand_StartupMayBeBelowSettledHeadroom(t *testing.T) {
+	cfg := makeMinimalCfg()
+	cfg.Resources.Startup = &config.StartupConfig{Memory: "1GiB"}
+	args, err := CHCommand(cfg, nil, "/c", "/v", "/k", "/r", "/u", "off", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if joined := strings.Join(args, " "); !strings.Contains(joined, "--balloon size=3221225472") {
+		t.Fatalf("startup 1GiB under 4GiB Capacity should use 3GiB target: %s", joined)
 	}
 }
 
@@ -260,20 +273,17 @@ func TestBuildCmdline_ContainsAutoInjectedAndUserExtras(t *testing.T) {
 
 func TestCHCommand_MemoryStringsHonored(t *testing.T) {
 	cfg := makeMinimalCfg()
-	cfg.Resources.Capacity.Memory = "512MiB"
+	cfg.Resources.Capacity.Memory = "536875008B" // 512MiB + one page
 	cfg.Resources.Allocatable.Memory = "256MiB"
 	args, err := CHCommand(cfg, []DiskArg{{Sock: "/0", ReadOnly: true}, {Sock: "/1"}}, "/c", "/v", "/k", "/r", "/u", "tty", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "size=512M,shared=on") {
-		t.Errorf("expected 512M memory, got: %s", joined)
+	if !strings.Contains(joined, "size=536875008,shared=on") {
+		t.Errorf("expected exact non-MiB memory zone, got: %s", joined)
 	}
-	// Balloon is pre-inflated to (cap-alloc) at boot so guest sees
-	// exactly `alloc` from kernel init — no post-Settled inflate
-	// transition. cap=512M alloc=256M → balloon=256M=268435456.
-	if !strings.Contains(joined, "--balloon size=268435456") {
-		t.Errorf("expected --balloon size=268435456 (cap-alloc pre-inflated), got: %s", joined)
+	if !strings.Contains(joined, "--balloon size=0") {
+		t.Errorf("default startup=Capacity must retain a target-zero balloon device, got: %s", joined)
 	}
 }

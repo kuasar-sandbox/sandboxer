@@ -57,8 +57,8 @@ func TestParseBalloonFromState(t *testing.T) {
 }
 
 func TestParseBalloonFromState_MissingTree(t *testing.T) {
-	// state.json without device-manager / __balloon — older bundles or
-	// balloon-disabled VMs.
+	// state.json without device-manager / __balloon: a VM whose cold and steady
+	// policy both use the full Capacity has no balloon device.
 	state := []byte(`{"snapshots":{}}`)
 	_, _, ok, err := parseBalloonFromState(state)
 	if err != nil {
@@ -79,45 +79,89 @@ func TestParseBalloonFromState_Malformed(t *testing.T) {
 	}
 }
 
-func TestDeriveAllocatableAtSnapshot_MinPicksConservative(t *testing.T) {
+func TestDeriveBudgetAtSnapshot_MinPicksConservative(t *testing.T) {
 	cap := uint64(1024 << 20)
 
 	// Inflating: target=200 MiB, current=100 MiB → min=100 MiB
 	// allocatable should be capacity - 100 MiB (the larger value).
-	got := deriveAllocatableAtSnapshot(cap, 200<<20, 100<<20, true)
+	got := deriveBudgetAtSnapshot(cap, 200<<20, 100<<20, true)
 	want := cap - 100<<20
 	if got != want {
 		t.Errorf("inflating: want=%d got=%d", want, got)
 	}
 
 	// Deflating: target=100 MiB, current=200 MiB → min=100 MiB
-	got = deriveAllocatableAtSnapshot(cap, 100<<20, 200<<20, true)
+	got = deriveBudgetAtSnapshot(cap, 100<<20, 200<<20, true)
 	want = cap - 100<<20
 	if got != want {
 		t.Errorf("deflating: want=%d got=%d", want, got)
 	}
 
 	// Balloon stable: target=current=128 MiB → min=128 MiB
-	got = deriveAllocatableAtSnapshot(cap, 128<<20, 128<<20, true)
+	got = deriveBudgetAtSnapshot(cap, 128<<20, 128<<20, true)
 	want = cap - 128<<20
 	if got != want {
 		t.Errorf("stable: want=%d got=%d", want, got)
 	}
 }
 
-func TestDeriveAllocatableAtSnapshot_NoBalloonInfo(t *testing.T) {
-	// ok=false (e.g., older bundle without balloon) → return capacity.
-	got := deriveAllocatableAtSnapshot(1<<30, 0, 0, false)
+func TestDeriveBudgetAtSnapshot_NoBalloonInfo(t *testing.T) {
+	// A deliberately balloon-disabled VM snapshots at full Capacity.
+	got := deriveBudgetAtSnapshot(1<<30, 0, 0, false)
 	if got != 1<<30 {
 		t.Errorf("no balloon info: want=%d got=%d", 1<<30, got)
 	}
 }
 
-func TestDeriveAllocatableAtSnapshot_BalloonExceedsCapacity(t *testing.T) {
+func TestDeriveBudgetAtSnapshot_BalloonExceedsCapacity(t *testing.T) {
 	// Defensive: if balloon target somehow exceeds capacity (corrupted
 	// state), don't underflow.
-	got := deriveAllocatableAtSnapshot(64<<20, 128<<20, 128<<20, true)
+	got := deriveBudgetAtSnapshot(64<<20, 128<<20, 128<<20, true)
 	if got != 0 {
 		t.Errorf("overrun: want=0 got=%d", got)
+	}
+}
+
+func TestValidateBudgetAtSnapshot(t *testing.T) {
+	const capacity = uint64(1 << 30)
+	for _, tc := range []struct {
+		capacity uint64
+		budget   uint64
+		wantErr  bool
+	}{
+		{capacity: capacity, budget: 1},
+		{capacity: capacity, budget: capacity},
+		{capacity: capacity, budget: 0, wantErr: true},
+		{capacity: capacity, budget: capacity + 1, wantErr: true},
+		{capacity: 0, budget: 0, wantErr: true},
+	} {
+		err := validateBudgetAtSnapshot(tc.capacity, tc.budget)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("validateBudgetAtSnapshot(%d, %d) error=%v, wantErr=%v",
+				tc.capacity, tc.budget, err, tc.wantErr)
+		}
+	}
+}
+
+func TestValidateRestoreBalloonControl(t *testing.T) {
+	const capacity = uint64(1 << 30)
+	for _, tc := range []struct {
+		name       string
+		headroom   uint64
+		hasBalloon bool
+		wantErr    bool
+	}{
+		{name: "no control needs no device", headroom: capacity},
+		{name: "control has device", headroom: 256 << 20, hasBalloon: true},
+		{name: "control without device", headroom: 256 << 20, wantErr: true},
+		{name: "zero headroom", hasBalloon: true, wantErr: true},
+		{name: "headroom above capacity", headroom: capacity + 1, hasBalloon: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateRestoreBalloonControl(capacity, tc.headroom, tc.hasBalloon)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateRestoreBalloonControl() error = %v, wantErr=%v", err, tc.wantErr)
+			}
+		})
 	}
 }

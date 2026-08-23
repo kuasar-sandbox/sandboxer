@@ -2,13 +2,31 @@ package resctl
 
 import (
 	"context"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
+
+func TestHostChargeAbove95PercentUsesExactIntegerComparison(t *testing.T) {
+	for _, tc := range []struct {
+		host, high uint64
+		want       bool
+	}{
+		{host: 95, high: 100, want: false},
+		{host: 96, high: 100, want: true},
+		{host: 1, high: 0, want: false},
+		{host: math.MaxUint64 - 1, high: math.MaxUint64, want: true},
+	} {
+		if got := hostChargeAbove95Percent(tc.host, tc.high); got != tc.want {
+			t.Fatalf("hostChargeAbove95Percent(%d, %d)=%v, want %v", tc.host, tc.high, got, tc.want)
+		}
+	}
+}
 
 func TestSensorRuntime_Defaults(t *testing.T) {
 	c := &config.SandboxConfig{}
@@ -125,10 +143,8 @@ func TestRunPSI_SetupWritesTrigger(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hooks := &ControllerHooks{
-		cfg: &config.SandboxConfig{},
-	}
-	s := NewPressureSensor(hooks, cgDir, 4<<20, nil)
+	cfg := &config.SandboxConfig{}
+	s := NewPressureSensor(&MemoryController{}, cfg, cgDir, nil)
 	s.runtime.StallUs = 25_000
 	s.runtime.WindowUs = 500_000
 
@@ -150,8 +166,8 @@ func TestRunPSI_SetupWritesTrigger(t *testing.T) {
 // TestRunPSI_MissingPressureFile returns error (caller falls back).
 func TestRunPSI_MissingPressureFile(t *testing.T) {
 	cgDir := t.TempDir() // no memory.pressure inside
-	hooks := &ControllerHooks{cfg: &config.SandboxConfig{}}
-	s := NewPressureSensor(hooks, cgDir, 4<<20, nil)
+	cfg := &config.SandboxConfig{}
+	s := NewPressureSensor(&MemoryController{}, cfg, cgDir, nil)
 	err := s.runPSI(t.Context())
 	if err == nil {
 		t.Fatal("expected error opening missing memory.pressure, got nil")
@@ -181,12 +197,52 @@ func TestRunEventsPoll_NoHigh_NoOOM_NoDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hooks := &ControllerHooks{cfg: &config.SandboxConfig{}}
-	s := NewPressureSensor(hooks, cgDir, 4<<20, nil)
+	cfg := &config.SandboxConfig{}
+	s := NewPressureSensor(&MemoryController{}, cfg, cgDir, nil)
 
 	ctx, cancel := contextWithTimeout(t, 250*time.Millisecond)
 	defer cancel()
 	s.runEventsPoll(ctx) // returns when ctx done; no panic = pass
+}
+
+func TestCgroupDiagnosticCountersRejectMalformedAndOverflow(t *testing.T) {
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, "memory.events.local")
+	currentPath := filepath.Join(dir, "memory.current")
+	highPath := filepath.Join(dir, "memory.high")
+
+	if err := os.WriteFile(eventsPath, []byte("high 18446744073709551616\noom 7x\noom_kill 3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if high, oom, ok := readMemoryEvents(dir); !ok || high != 0 || oom != 3 {
+		t.Fatalf("memory.events.local = (high=%d oom=%d ok=%v), want (0,3,true)", high, oom, ok)
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want uint64
+	}{
+		{name: "valid", body: "12345\n", want: 12345},
+		{name: "max", body: "max\n", want: 0},
+		{name: "suffix", body: "12x\n", want: 0},
+		{name: "overflow", body: "18446744073709551616\n", want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(currentPath, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(highPath, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if got := readHostMemoryChargeBestEffort(dir); got != tc.want {
+				t.Fatalf("best-effort memory.current = %d, want %d", got, tc.want)
+			}
+			if got := readUintFromCgFile(dir, "memory.high"); got != tc.want {
+				t.Fatalf("memory.high = %d, want %d", got, tc.want)
+			}
+		})
+	}
 }
 
 // minimalValidConfig returns a config.SandboxConfig that passes ValidateCold

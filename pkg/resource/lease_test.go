@@ -45,6 +45,22 @@ func TestLeaseLockProbeHelperProcess(t *testing.T) {
 	_, _ = fmt.Fprintln(os.Stdout, owner)
 }
 
+func TestLeaseStartupBudgetMayBeBelowSettledHeadroom(t *testing.T) {
+	lease := Lease{
+		Version: LeaseVersion, SandboxID: "startup-below-headroom", PID: os.Getpid(),
+		ControllerSocket: "/run/controller.sock", CgroupPath: "/sys/fs/cgroup/sandbox",
+		CapacityMemory: 1024, CapacityCPUMilli: 1000,
+		FloorMemory: 512, FloorCPUMilli: 500, StartupMemory: 256,
+	}
+	if err := lease.Validate(); err != nil {
+		t.Fatalf("independent startup headroom rejected: %v", err)
+	}
+	lease.StartupMemory = 0
+	if err := lease.Validate(); err == nil {
+		t.Fatal("zero startup headroom accepted")
+	}
+}
+
 func assertExternalLeaseOwner(t *testing.T, path string, want int) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestLeaseLockProbeHelperProcess$")

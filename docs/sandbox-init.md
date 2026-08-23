@@ -434,10 +434,18 @@ CH 应随之干净退出。`RESTART` 会触发 CH 的"原地重启"流程,试图
 listener 整个沙箱生命周期(冷启动 + snapshot/restore + MUX 重连 + 退出)持续存在,
 唯一退出点是进程 reboot。
 
-**mem_report 上报 goroutine**:与 supervisor 并行的第二个常驻 goroutine,默认
-每 5 s 读一次 `/proc/meminfo` 的 `MemAvailable:` 和 `MemTotal:`,短连接发
-`mem_report` 给 host(协议见 §4.4)。host 端 BalloonController 据此把 balloon
-target 锚定在合理水位(详见 [`sandbox.md`](sandbox.md) §9.3);失败仅记 stderr。
+**mem_report 上报 goroutine**:与 supervisor 并行的第二个常驻 goroutine。
+Launch barrier 后立即采样一次,随后默认每 5 s 读取 `/proc/meminfo`。每份报告
+携带 observation `epoch` 和严格递增 `seq`;restore 在写 `restore_ack` 前建立
+新 epoch并清除旧 pending 报告。
+
+报告包含 `MemAvailable` 以及 `MemTotal`、`MemFree`、`Cached`、`AnonPages`、
+`SReclaimable` 诊断字段,不读取或上报 balloon current。Host Capacity 也不能从
+MemTotal 推导;host 把报告与 CH `vm.info` 组合后在 sandbox 本地计算 Budget。
+
+发送失败时保留完全相同的 epoch/seq/payload,下一 ticker 重试;成功 ACK 后才清除
+pending 并允许下次采样。EAGAIN、timeout 或 ACK 丢失不会把 reporter 永久卡在
+in-progress 状态。详见 [`sandbox.md`](sandbox.md) §4.2 / §9.3。
 
 ### 3.4 quiesce 处理
 
@@ -749,9 +757,9 @@ vsock 端口固定 `5000`,**两个方向都复用同一端口号**,身份按方�
 | **应用启动通知** | guest→host | `app_started{pid}` → `ack` | 关 | guest 已 fork/exec 用户进程 |
 | **应用退出通知** | guest→host | `app_exited{code, term_signal}` → `ack` | 关 | 用户进程退出;guest 收 ack 后再 reboot;host 用作自身退出码 |
 | **健康探测** | host→guest | `ping{id, t_send_ns}` → `pong{id, t_send_ns}` | 关 | host 计 RTT / 超时 / 失败数(§4.9) |
-| **mem 报告** | guest→host | `mem_report{mem_avail, mem_total}` → `mem_report_ack` | 关 | guest 周期上报 `/proc/meminfo`,喂 host BalloonController |
+| **mem 报告** | guest→host | `mem_report{epoch,seq,mem_*}` → `mem_report_ack` | 关 | guest observation;host sandbox-local controller 验证 epoch/seq 后结合 CH `vm.info` |
 | **快照前** | host→guest | `quiesce` → `quiesced` | 关 | guest 冻结应用进程树 + 跑 prep + 关闭 MUX(§3.4),`quiesced` ⇒ 应用已冻结、可安全 `/vm.pause` |
-| **恢复后** | host→guest | `restore{epoch, wallclock_ns, network?, files?}` → `restore_ack{stdio, app_state}` | **升级 MUX** | 快照恢复 vCPU 起跑后 host 通知 guest;应用此时仍处 freezer 冻结态(冻结态随快照保存,`/vm.resume` 不解冻);`restore` 携带 host 发送前一刻的墙钟 `wallclock_ns`,guest 收到后先 `clock_settime` 把 `CLOCK_REALTIME` 跳到该值(CH 把快照里的旧钟原样载回,不纠正则落后整个静置区间;单调钟不受影响);若带 `network`,以 **flush-and-replace** 重配 L3(克隆取新 IP/MTU/nexthop/hostname;MAC 沿用快照设备状态不变);若带 `files`,把该实例专属文件(per-instance secret / resolv.conf)注入(同冷启动的内存盘 + bind 机制,仅落克隆内存、不入黄金快照)。两者均 best-effort + 记日志、thaw 前完成;回 `restore_ack`(ATTACH_ACK 的超集 + "恢复完成"信号,host 据此判定 restore 完成)、重连 MUX,**最后 thaw 应用**(write `cgroup.freeze=0`)——故应用绝不会观察到旧墙钟、错误网络、缺失的 per-instance 文件或未重连的 MUX。**RNG 重播种未实现**;该连接成为新 MUX |
+| **恢复后** | host→guest | `restore{epoch, wallclock_ns, network?, files?}` → `restore_ack{stdio, app_state}` | **升级 MUX** | 快照恢复 vCPU 起跑后 host 通知 guest;guest 先推进 mem-report epoch,再回 ACK、重连 MUX并最后 thaw。Host 在 ACK+MUX 前不启用 memory policy。其余 clock/network/files 语义见 §4.8。**RNG 重播种未实现** |
 | **MUX 重连** | host→guest | `attach{epoch}` → `attach_ack{stdio, app_state}` | **升级 MUX** | 纯 stdio-MUX 传输重连:MUX 因 vsock 异常断了,host 拨新连接重建;guest 优雅关旧 MUX(已断则硬丢)、回 ack,该连接成为新 MUX(§4.6)。**attach ≠ 快照后 resume**——活 VM 上从未 quiesce 的断线兜底也走它。thaw 不属 attach 语义,而属 quiesce 生命周期(freeze 的逆),**由 guest 自身冻结状态驱动**:仍冻结才补 thaw(仅 `resume_after=true` 同进程续跑路径——VM 原地 resume,attach 恰为首个 post-resume 接触),活 VM 重连本未冻结即跳过 |
 | **执行命令** | host→guest | `exec{spec}` → `exec_ack{stdio}` | **升级 MUX(独立会话)** | guest 为这条 `exec` 起一个兄弟进程并准备其 stdio,回 `exec_ack`,该连接成为这次 exec 会话**独立**的 MUX;并发多条互不影响;命令结束 guest 在 MUX 上发 EXIT_STATUS 再走 §4.6 关闭。详见 §3.6 |
 | **端口转发** | host→guest | `connect{spec}` → `connect_ack` | **升级转发数据通道** | guest 为这条 `connect` 取得 `ConnectSpec.address` 上的目标连接——dial(默认)或 `Accept`(`spec.accept`,accept 模式可无限期阻塞,host 无 deadline park)——回 `connect_ack`,该连接成为这条转发的 fwd 帧数据通道(§4.7),保留 TCP 半关闭;并发多条互不影响;quiesce 时主动拆除(§3.4)。详见 §3.7 |
@@ -781,8 +789,15 @@ JSON 可读、调试友好;消息量极少,无需 protobuf 工具链。
   "epoch":    3,                       // restore / attach: 第 N 次;每次 +1,用于去重 in-flight
   "wallclock_ns":1715000000000000000,  // restore: host 墙钟,guest 落 CLOCK_REALTIME(attach 不带)
   "network": { "ip": "169.254.4.1/31", "mtu": 1450, "nexthop": "", "hostname": "c1", "interface": "eth0" }, // restore 可选:重配 L3(flush-and-replace);省略则保留快照网络
-  "mem_avail_bytes": 4294967296,       // mem_report
-  "mem_total_bytes": 8589934592,       // mem_report
+  "mem_report": {                       // mem_report payload
+    "epoch": 2, "seq": 17,
+    "mem_total_bytes": 8589934592,
+    "mem_available_bytes": 4294967296,
+    "mem_free_bytes": 1073741824,
+    "cached_bytes": 2147483648,
+    "anon_pages_bytes": 536870912,
+    "s_reclaimable_bytes": 67108864
+  },
   "msg":      "<reason>"               // error
 }
 ```
@@ -1023,6 +1038,7 @@ guest 对 vsock 连接 arm SO_LINGER 再关,阻塞至 host RST 确认拆除,不�
                        ◄── restore_ack{stdio, app_state} ─  reply on this conn
   send SET_WINSIZE  ════════════════════════════════════►  (this conn ⇒ MUX);  resume reading app pipes; replay residual
                                                            thaw app: cgroup.freeze=0  ← last, env ready
+  SafeTarget normalization; open new mem-report epoch       next reporter sample uses new epoch/seq
   ping ticker (re)start                                    (listener unchanged across the snapshot)
 ```
 
@@ -1097,7 +1113,7 @@ host 侧凡由 sandbox.yaml `timeouts.*` 接管的项以配置为准,默认不�
 | `attach` | 5 s | 同 `restore` 的 hold 语义;此连接随后转 MUX |
 | `exec` | 10 s | 比 attach 宽:guest 要 fork+exec 子进程并 PATH 解析后才回 `exec_ack`;仅覆盖握手段,连接转 MUX 后 deadline 清除 |
 | `connect` | 10 s | 仅覆盖握手段(内含 guest 侧 dial 目标 ≤ 5 s);连接转 fwd 通道后 deadline 清除 |
-| `mem_report` | guest 侧连接后 4 s(write+读 ack);dial 另有 5 s 重试预算;host 读死线 `timeouts.app_notify`(默认不强制) | guest 每 5 s 一次;该消息用于 VMM 受 `memory.high` 压力时的反馈控制,故不能复用 200 ms 快速失败预算;连接后的 4 s 仍小于上报周期,失败后由 ticker 继续重试 |
+| `mem_report` | guest 侧连接后 4 s(write+读 ack);dial 另有 5 s 重试预算;host 读死线 `timeouts.app_notify`(默认不强制) | launch barrier 后立即一次,随后每 5 s;失败保留同一 payload,后续 ticker 恢复进展 |
 
 ## 5. 应用契约
 

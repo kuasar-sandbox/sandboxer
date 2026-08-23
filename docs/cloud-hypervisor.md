@@ -201,7 +201,7 @@ sandbox-ctl 都无 PTE。
 `fallocate(PUNCH_HOLE|KEEP_SIZE)` on memfd + `madvise(MADV_DONTNEED)` on chVA。
 后者落在 uffd 注册的 chVA 上,内核**无条件**(与该 run 是否驻留无关)合成
 一条 `EVENT_REMOVE`,且 `MADV_DONTNEED` **同步阻塞**到外部 handler 消费完
-该事件才返回。冷启动充气覆盖整个 `capacity − allocatable` 区间时,这是一场
+该事件才返回。冷启动充气覆盖整个 `Capacity − InitialBudget` 区间时,这是一场
 "对从未存在的页"的空 `EVENT_REMOVE` 风暴:压垮 handler 单 reader,并反压
 CH 的 balloon 线程。`EVENT_REMOVE` 的真正来源是 chVA 上的 `MADV_DONTNEED`
 (不是 memfd 的 fallocate)——所以**必须同时跳过两者**才能不发事件。
@@ -229,7 +229,7 @@ CH 的 balloon 线程。`EVENT_REMOVE` 的真正来源是 chVA 上的 `MADV_DONT
 process-level reclaim,而空洞 offset sandbox-ctl 也从未 fault → 那一步本就
 是 no-op。跳过前后 host 内存终态完全一致。
 
-**效果与取舍**:改动前 balloon 充满 `capacity − allocatable` 时,**每个 4K
+**效果与取舍**:改动前 balloon 充满 `Capacity − InitialBudget` 时,**每个 4K
 页**(`pbp` 在 x86-4K 被旁路)都对 uffd VMA 做 `MADV_DONTNEED`,而该调用
 **同步阻塞**到外部单 reader handler 消费完 `EVENT_REMOVE` 才返回——
 `≈ 充气字节 / 4K` 次串行跨进程往返,正是数十秒收敛(及偶发 boot 软死锁)
@@ -351,8 +351,9 @@ virtio-console → hvc0,内核 dmesg;--console tty(写到 CH 进程的 stdout = 
 virtio-vsock   → CID=3。控制面短连接(launch / ping / app_started / app_exited /
                  mem_report / quiesce / restore / attach)+ launch/restore/attach 那条
                  连接握手后升级而成的应用 stdio MUX(详见 sandbox-init.md §4)
-virtio-balloon → size=0 [+ deflate_on_oom=on];host BalloonController 通过
-                 /vm.resize 推 target(见 `sandboxer/docs/sandbox.md` §9.3);free_page_reporting
+virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on];sandbox-local
+                 BalloonController 通过 /vm.resize 推 target,并以 vm.info 的
+                 memory_actual_size 观察 current(见 `sandboxer/docs/sandbox.md` §9.3);free_page_reporting
                  不启用(广播 mmu_notifier 会饿死 guest vsock kthread)
 virtio-mem     → host-driven 主动 unplug(扩展点)
 ```
@@ -396,7 +397,7 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 | `/vm.restore` 对 user_managed zone | (不适用) | 跳过 fill;mmap 直接 fault 触发 uffd |
 | balloon release 对 user_managed zone 的空洞 run | (不适用) | 跳过 `PUNCH_HOLE`+`madvise`,不合成 `EVENT_REMOVE`;有数据的 run 同 upstream |
 | balloon `deflate_on_oom=on` | ✓(v51.1 已就绪) | ✓ |
-| `vm.resize` `desired_balloon` | ✓ | ✓(平台周期调用,host BalloonController)|
+| `vm.resize` `desired_balloon` | ✓ | ✓(sandbox-local BalloonController 调用)|
 | virtio-mem `vm.resize` | ✓ | ✓ |
 | vsock local-port cursor 跨 restore | ✗ | ✓(`VsockState.local_port_last`) |
 | vsock backend/guest transport epoch 对齐 | ✗ | ✓(reset event + RX acknowledgement gate) |
@@ -404,10 +405,11 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 平台**不**使用 `free_page_reporting`——upstream 支持完好,但在统一 memfd /
 外部 uffd 模型下其持续 `madvise(MADV_DONTNEED)` 会广播 mmu_notifier 失效到
 KVM EPT,IPI shootdown 饿死 guest vsock kthread(机理与替代反馈环见
-`guest-runtime/docs/vmlinux.md` §5.5)。改由 host 端 BalloonController
-经 `/vm.resize` 推 inflate target,事件量被反馈环 `MaxStep` 限速;冷启动充气
+`guest-runtime/docs/vmlinux.md` §5.5)。改由 sandbox-local BalloonController
+经 `/vm.resize` 推 inflate target;steady shrink 每份 fresh report 最多一个
+64MiB step。冷启动命令行 target
 覆盖的稀疏区间由 patch 0004(§3.4)跳过,不产生 `madvise` 广播与
-`EVENT_REMOVE`,`MaxStep` 仅对运行时回收**已驻留**工作集页仍有意义。
+`EVENT_REMOVE`;运行时回收已驻留页仍走完整 release 路径。
 `deflate_on_oom` 是 upstream v51.1 原生,无需新 patch。
 
 ## 7. 已知限制

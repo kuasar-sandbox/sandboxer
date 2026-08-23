@@ -55,8 +55,8 @@ type LaunchServer struct {
 
 	// OnLaunchAck fires when the guest reports it has applied the launch
 	// spec (network configured, ready to fork the app). Optional; nil →
-	// just ack. This is the Settled trigger: post-boot transient is over,
-	// safe to engage memory.high / controller RPCs.
+	// just ack. This opens the sandbox-local observation barrier before the
+	// ACK is written; the node Settled notification remains independent.
 	OnLaunchAck func()
 
 	// OnAppStarted fires only after the app_started ACK has been written
@@ -68,11 +68,14 @@ type LaunchServer struct {
 	// exited. Optional; nil → just ack.
 	OnAppExited func(code int)
 
-	// OnMemReport fires on every periodic mem_report from the guest
-	// (sandbox-init's /proc/meminfo sampler). Drives the host-side
-	// balloon controller (replaces virtio-balloon free-page-reporting).
-	// Optional; nil → just ack.
-	OnMemReport func(memAvailableBytes, memTotalBytes uint64)
+	// OnMemReport validates the local cold/restore observation barrier and
+	// consumes one periodic mem_report. It returns true when the report may be
+	// acknowledged. A false result returns an error response so sandbox-init
+	// retains the exact epoch/seq and retries it after the barrier opens.
+	// Duplicate or stale reports after an open barrier should return true while
+	// being ignored for policy, making a lost ACK idempotent. Optional; nil →
+	// just ack.
+	OnMemReport func(proto.MemReport) bool
 
 	// OnMUXReady, if non-nil, takes ownership of the hello/launch_ack
 	// connection AFTER the final ack is sent: instead of closing it, the
@@ -226,10 +229,12 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 			return false
 		}
 		s.Logf("launch: launch_ack received")
-		if s.OnLaunchAck != nil {
-			s.OnLaunchAck()
-		}
-		s.launchAckOnce.Do(func() { close(s.launchAckDone) })
+		s.launchAckOnce.Do(func() {
+			if s.OnLaunchAck != nil {
+				s.OnLaunchAck()
+			}
+			close(s.launchAckDone)
+		})
 		if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck}); err != nil {
 			s.Logf("launch: write ack: %v", err)
 			return false
@@ -253,10 +258,12 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 		// Legacy fresh-connection launch_ack (sandbox-init now always
 		// sends it on the hello conn). Kept as a defensive fallback.
 		s.Logf("launch: launch_ack received (standalone conn)")
-		if s.OnLaunchAck != nil {
-			s.OnLaunchAck()
-		}
-		s.launchAckOnce.Do(func() { close(s.launchAckDone) })
+		s.launchAckOnce.Do(func() {
+			if s.OnLaunchAck != nil {
+				s.OnLaunchAck()
+			}
+			close(s.launchAckDone)
+		})
 		_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck})
 		return false
 
@@ -280,10 +287,21 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 		return false
 
 	case proto.TypeMemReport:
-		if s.OnMemReport != nil {
-			s.OnMemReport(msg.MemAvailableBytes, msg.MemTotalBytes)
+		if msg.MemReport == nil {
+			s.Logf("launch: mem_report payload missing")
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "mem_report payload missing"})
+			return false
 		}
-		_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeMemReportAck})
+		if s.OnMemReport != nil && !s.OnMemReport(*msg.MemReport) {
+			s.Logf("launch: mem_report epoch=%d seq=%d held behind observation barrier",
+				msg.MemReport.Epoch, msg.MemReport.Seq)
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "mem_report observation barrier is not open"})
+			return false
+		}
+		if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeMemReportAck}); err != nil {
+			s.Logf("launch: write mem_report ack: %v", err)
+			return false
+		}
 		return false
 
 	default:

@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/bits"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 	"golang.org/x/sys/unix"
 )
@@ -20,9 +23,9 @@ const (
 	SensorModeNone       = "none"
 )
 
-// PressureSensor watches the per-sandbox cgroup for memory pressure
-// signals and turns them into RequestBudget calls against the
-// controller. See docs/sandbox.md §10.3.
+// PressureSensor watches the per-sandbox cgroup for memory pressure and asks
+// the sandbox-local MemoryController for one-step grow. Only that controller
+// decides whether a node reservation request and balloon deflate are needed.
 //
 // Two data sources are supported (selected by config.SensorConfig.Mode):
 //
@@ -38,13 +41,11 @@ const (
 //     when the kernel rejects the PSI trigger write (older kernels
 //     without PSI trigger support).
 //
-// Both modes funnel through the same dispatch() → RequestBudget RPC →
-// OnAllocatableChanged path.
+// Both modes funnel through the same dispatch() → local Budget transaction.
 type PressureSensor struct {
-	hooks      *ControllerHooks
+	controller *MemoryController
 	cgroupPath string
 	logf       func(string, ...any)
-	step       uint64
 	runtime    sensorRuntime
 }
 
@@ -55,20 +56,17 @@ type sensorRuntime struct {
 	MinInterval time.Duration
 }
 
-// NewPressureSensor builds a sensor pinned to a cgroup directory. Step
-// is the per-RequestBudget delta — small enough to keep cooldowns
-// useful, big enough to cover a typical pressure spike. Mode / PSI
-// trigger / debounce are resolved from hooks.cfg.SensorRuntime().
-func NewPressureSensor(hooks *ControllerHooks, cgroupPath string, step uint64, logf func(string, ...any)) *PressureSensor {
+// NewPressureSensor builds a sensor pinned to a cgroup directory. Mode / PSI
+// trigger / debounce are resolved from cfg; MemoryStep is the sole grow step.
+func NewPressureSensor(controller *MemoryController, cfg *config.SandboxConfig, cgroupPath string, logf func(string, ...any)) *PressureSensor {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	mode, stall, win, dbnc := hooks.cfg.SensorRuntime()
+	mode, stall, win, dbnc := cfg.SensorRuntime()
 	return &PressureSensor{
-		hooks:      hooks,
+		controller: controller,
 		cgroupPath: cgroupPath,
 		logf:       logf,
-		step:       step,
 		runtime: sensorRuntime{
 			Mode:        mode,
 			StallUs:     stall,
@@ -82,10 +80,11 @@ func NewPressureSensor(hooks *ControllerHooks, cgroupPath string, step uint64, l
 // configured mode; psi mode auto-falls-back to events_poll if PSI
 // trigger setup fails (older kernel without trigger support).
 //
-// Returns when ctx is cancelled. Designed to be called as
-// `go sensor.Run(ctx)` after Settled.
+// Returns when ctx is cancelled. It starts only after the cold launch ACK or
+// restore ACK+MUX barrier; the node's independent Settled notification is not
+// a prerequisite for sandbox-local pressure handling.
 func (s *PressureSensor) Run(ctx context.Context) {
-	if s == nil || s.hooks == nil || !s.hooks.Enabled() {
+	if s == nil || s.controller == nil {
 		return
 	}
 	switch s.runtime.Mode {
@@ -141,7 +140,7 @@ func (s *PressureSensor) runPSI(ctx context.Context) error {
 	}
 
 	s.logf("sensor: PSI mode active (trigger=%q debounce=%s step=%d)",
-		trig, s.runtime.MinInterval, s.step)
+		trig, s.runtime.MinInterval, resource.MemoryStep)
 
 	// OOM sidecar.
 	sideCtx, cancelSide := context.WithCancel(ctx)
@@ -238,10 +237,10 @@ func (s *PressureSensor) runOOMSidecar(ctx context.Context) {
 // runEventsPoll is the legacy 100ms poll path. Used as fallback when
 // PSI trigger setup fails OR when config.SensorConfig.Mode is "events_poll".
 func (s *PressureSensor) runEventsPoll(ctx context.Context) {
-	s.logf("sensor: events_poll mode active (100ms tick step=%d)", s.step)
+	s.logf("sensor: events_poll mode active (100ms tick step=%d)", resource.MemoryStep)
 	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
-	var lastHigh, lastOOM, prevRSS uint64
+	var lastHigh, lastOOM, previousHostCharge uint64
 	var prevAt time.Time
 	for {
 		select {
@@ -252,7 +251,7 @@ func (s *PressureSensor) runEventsPoll(ctx context.Context) {
 			if !ok {
 				continue
 			}
-			rss := readMemoryCurrent(s.cgroupPath)
+			hostCharge := readHostMemoryChargeBestEffort(s.cgroupPath)
 			memHigh := readUintFromCgFile(s.cgroupPath, "memory.high")
 
 			dHigh := uint64(0)
@@ -267,10 +266,10 @@ func (s *PressureSensor) runEventsPoll(ctx context.Context) {
 			lastOOM = oom
 
 			rising := false
-			if !prevAt.IsZero() && rss > prevRSS {
+			if !prevAt.IsZero() && hostCharge > previousHostCharge {
 				rising = true
 			}
-			prevRSS = rss
+			previousHostCharge = hostCharge
 			prevAt = now
 
 			urgency := ""
@@ -282,7 +281,7 @@ func (s *PressureSensor) runEventsPoll(ctx context.Context) {
 			case dHigh > 0:
 				urgency = resource.UrgencyNormal
 				reason = "high_event"
-			case memHigh > 0 && rss > 0 && rising && rssRatio(rss, memHigh) > 0.95:
+			case memHigh > 0 && hostCharge > 0 && rising && hostChargeAbove95Percent(hostCharge, memHigh):
 				urgency = resource.UrgencyLow
 				reason = "predicted"
 			}
@@ -294,28 +293,21 @@ func (s *PressureSensor) runEventsPoll(ctx context.Context) {
 	}
 }
 
-// dispatch is the shared RequestBudget → OnAllocatableChanged path.
-// Errors are logged-only; sensor keeps running on next signal.
+// dispatch never writes CH or cgroup state itself. Pressure signals are
+// coalesced by the local controller and remain safe if this producer outruns it.
 func (s *PressureSensor) dispatch(urgency, reason string) {
-	g, newAlloc, _, err := s.hooks.RequestBudget(s.step, urgency, reason)
-	if err != nil {
-		if !isExpectedRPCErr(err) {
-			s.logf("sensor: request_budget urgency=%s reason=%s: %v", urgency, reason, err)
-		}
-		return
-	}
-	if g == 0 {
-		return
-	}
-	s.logf("sensor: granted +%d (urgency=%s reason=%s) → allocatable=%d",
-		g, urgency, reason, newAlloc)
+	s.controller.RequestPressureGrow(urgency, reason)
 }
 
-func rssRatio(rss, high uint64) float64 {
+func hostChargeAbove95Percent(hostCharge, high uint64) bool {
 	if high == 0 {
-		return 0
+		return false
 	}
-	return float64(rss) / float64(high)
+	// Compare hostCharge/high > 95/100 without converting byte counts to
+	// float64 and without overflowing either product.
+	leftHigh, leftLow := bits.Mul64(hostCharge, 100)
+	rightHigh, rightLow := bits.Mul64(high, 95)
+	return leftHigh > rightHigh || leftHigh == rightHigh && leftLow > rightLow
 }
 
 // readMemoryEvents parses cgroup memory.events.local. Returns
@@ -330,13 +322,9 @@ func readMemoryEvents(cgroupPath string) (high, oom uint64, ok bool) {
 		if len(fields) != 2 {
 			continue
 		}
-		var v uint64
-		for _, b := range fields[1] {
-			if b < '0' || b > '9' {
-				v = 0
-				break
-			}
-			v = v*10 + uint64(b-'0')
+		v, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
 		}
 		switch fields[0] {
 		case "high":
@@ -357,42 +345,20 @@ func readUintFromCgFile(cgroupPath, name string) uint64 {
 	if err != nil {
 		return 0
 	}
-	var n uint64
-	for _, b := range data {
-		if b < '0' || b > '9' {
-			break
-		}
-		n = n*10 + uint64(b-'0')
+	n, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0
 	}
 	return n
 }
 
-func isExpectedRPCErr(err error) bool {
-	if err == nil {
-		return true
-	}
-	if resource.IsTransportError(err) {
-		return true
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "EOF") ||
-		strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "connection reset") ||
-		errors.Is(err, os.ErrClosed)
-}
-
-// StartSensor spawns the pressure sensor goroutine. Idempotent — safe
-// to call after Settled.
-func (h *ControllerHooks) StartSensor(ctx context.Context, step uint64) {
-	if !h.Enabled() {
+// StartSensor spawns the local pressure producer after the launch/restore
+// barrier. It applies in static and dynamic cgroup modes and is independent of
+// the node reservation session's Settled notification.
+func (m *MemoryController) StartSensor(ctx context.Context) {
+	if m == nil || m.cgroupPath == "" {
 		return
 	}
-	sensor := NewPressureSensor(h, h.opts.CgroupPath, step, h.opts.Logf)
-	bgCtx, cancel := context.WithCancel(ctx)
-	h.addBackground(cancel)
-	h.bgWG.Add(1)
-	go func() {
-		defer h.bgWG.Done()
-		sensor.Run(bgCtx)
-	}()
+	sensor := NewPressureSensor(m, m.cfg, m.cgroupPath, m.logf)
+	go sensor.Run(ctx)
 }

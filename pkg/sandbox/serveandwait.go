@@ -60,10 +60,10 @@ type CmdEnv struct {
 // protocols need:
 //
 //   - cold start: spawn a goroutine that gates pinger.Start on
-//     Launch.HelloDone and Hooks.Settled + Balloon.Start on
+//     Launch.HelloDone and local Memory.StartCold + Hooks.Settled on
 //     Launch.LaunchAckDone, then return nil (fire-and-forget).
 //   - restore: synchronously waitAPI → /vm.resume → guestlink.OpenMUXViaRestore →
-//     EstablishMUX → guestlink.Pinger.Start → Balloon.Start → Hooks.SettledRestore;
+//     EstablishMUX → guestlink.Pinger.Start → Hooks.Settled → Memory.StartRestore;
 //     Ctx is cancelled by a retained shutdown signal so every synchronous
 //     barrier unwinds. A non-signal error aborts and kills CH; a retained signal
 //     continues into the normal graceful CH shutdown/escalation path while
@@ -75,7 +75,7 @@ type PostSpawnCtx struct {
 	Launch       *guestlink.LaunchServer
 	EstablishMUX func(net.Conn, proto.StdioSpec) error
 	Hooks        *resctl.ControllerHooks
-	Balloon      *resctl.BalloonController
+	Memory       *resctl.MemoryController
 	CHSock       string
 	Logf         func(string, ...any)
 	NotifyReady  func()
@@ -119,8 +119,8 @@ type VMParams struct {
 	// message (hello / app_started / app_exited / mem_report); 0 = no forced
 	// timeout. From cfg.AppNotifyDeadline().
 	AppNotifyDeadline time.Duration
-	Balloon           *resctl.BalloonController
 	Hooks             *resctl.ControllerHooks
+	Memory            *resctl.MemoryController
 
 	// TapFile, when non-nil, is a tap queue fd acquired via the tapfd handoff
 	// (docs/tapfd.md). ServeAndWait inherits it into CH after the memfd (CH
@@ -377,7 +377,7 @@ func ServeAndWait(p VMParams) (int, error) {
 
 	// guestlink.LaunchServer: guest→host management short-conns on
 	// <vsock-base>_5000. Both cold and restore need this for the
-	// periodic mem_report (host-side resctl.BalloonController) and app_exited.
+	// periodic mem_report (sandbox-local resctl.MemoryController) and app_exited.
 	// Cold additionally upgrades the hello/launch_ack conn to the stdio
 	// MUX (OnMUXReady); restore's MUX comes from the reverse channel
 	// (PostSpawn → guestlink.OpenMUXViaRestore), so OnMUXReady stays nil there and
@@ -396,10 +396,20 @@ func ServeAndWait(p VMParams) (int, error) {
 			}
 		},
 		OnAppExited: func(code int) { logf("guest reports user app exited code=%d", code) },
-		OnMemReport: func(memAvail, memTotal uint64) {
-			if p.Balloon != nil && os.Getenv("SANDBOX_BALLOON_NO_HINT") == "" {
-				p.Balloon.Hint(memAvail, memTotal)
+		// Open the cold observation barrier synchronously before launch_ack is
+		// acknowledged to the guest. The reporter starts immediately after the
+		// guest's launch path; deferring this to a separate LaunchAckDone waiter
+		// could ACK and then discard its first report due to scheduler ordering.
+		OnLaunchAck: func() {
+			if p.Memory != nil {
+				p.Memory.StartCold(p.Ctx)
 			}
+		},
+		OnMemReport: func(report proto.MemReport) bool {
+			if p.Memory != nil {
+				return p.Memory.SubmitGuestReport(report)
+			}
+			return true
 		},
 	}
 	if p.WireLaunchMUX {
@@ -462,6 +472,7 @@ func ServeAndWait(p VMParams) (int, error) {
 		Pinger:        pinger,
 		Forwarder:     forwarder,
 		Reattach:      reattach,
+		Memory:        p.Memory,
 		Logf:          logf,
 	}
 	ctlSrv := &ctl.Server{
@@ -523,8 +534,8 @@ func ServeAndWait(p VMParams) (int, error) {
 
 	defer pinger.Stop()
 	defer func() {
-		if p.Balloon != nil {
-			p.Balloon.Stop()
+		if p.Memory != nil {
+			p.Memory.Stop()
 		}
 	}()
 
@@ -616,7 +627,7 @@ func ServeAndWait(p VMParams) (int, error) {
 		Launch:       launch,
 		EstablishMUX: establishMUX,
 		Hooks:        p.Hooks,
-		Balloon:      p.Balloon,
+		Memory:       p.Memory,
 		CHSock:       chSock,
 		Logf:         logf,
 		NotifyReady:  readiness.notifyReady,

@@ -393,3 +393,30 @@ func TestRoundTrip_AttachAndAck(t *testing.T) {
 		}
 	}
 }
+
+func TestRoundTrip_MemReport(t *testing.T) {
+	m := &Message{
+		Type: TypeMemReport,
+		MemReport: &MemReport{
+			Epoch:             4,
+			Seq:               17,
+			MemTotalBytes:     8 << 30,
+			MemAvailableBytes: 3 << 30,
+			MemFreeBytes:      128 << 20,
+			CachedBytes:       2 << 30,
+			AnonPagesBytes:    1 << 30,
+			SReclaimableBytes: 64 << 20,
+		},
+	}
+	var buf bytes.Buffer
+	if err := WriteMessage(&buf, m); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadMessage(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, m) {
+		t.Fatalf("round-trip mismatch:\n got=%+v\nwant=%+v", got, m)
+	}
+}

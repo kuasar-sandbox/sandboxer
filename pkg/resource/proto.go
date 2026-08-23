@@ -1,11 +1,6 @@
-// Package resource is the client side of the sandbox resource control
-// protocol: the wire format (Message, WriteMessage/ReadMessage) and the
-// Client that sandbox-ctl uses to talk to a node-level controller.
-//
-// The reference controller (server, admission, allocation, state) lives in
-// the sandbox-sentinel repo, which imports this package for the protocol
-// definitions. See sandbox-sentinel's docs/node.md for the protocol
-// contract and the per-sandbox state machine.
+// Package resource defines the reservation protocol used between sandboxer
+// and orchestrator. Sandbox-local balloon and cgroup policy is deliberately
+// outside this protocol.
 package resource
 
 import (
@@ -39,17 +34,12 @@ const (
 	TypeHeartbeat      = "heartbeat"
 	TypeRelease        = "release"
 	TypeAck            = "ack"
-	TypeReattach       = "reattach"
 	TypeStateSync      = "state_sync"
 	TypeError          = "error"
 
-	// Admin verbs (no per-sandbox token needed; identifies target sandbox
-	// by SandboxID field). Used by node-ctl drain/grant/reclaim CLI.
-	TypeAdminDrain   = "admin_drain"
-	TypeAdminGrant   = "admin_grant"
-	TypeAdminReclaim = "admin_reclaim"
-	TypeAdminStatus  = "admin_status"
-	TypeAdminList    = "admin_list"
+	TypeAdminDrain  = "admin_drain"
+	TypeAdminStatus = "admin_status"
+	TypeAdminList   = "admin_list"
 )
 
 // Client feature names are carried by Admit and the immutable lifecycle lease.
@@ -86,7 +76,10 @@ type Message struct {
 	Type  string `json:"type"`
 	Token string `json:"token,omitempty"`
 
-	// Admit (sandbox-ctl → controller).
+	// Admit (sandbox-ctl → controller). Wire names are retained at this
+	// reservation boundary: FloorMemoryBytes is settled headroom,
+	// StartupBudgetMemory is aligned cold InitialBudget, and
+	// AllocatableAtSnapshot is restore BudgetAtSnapshot.
 	SandboxID             string   `json:"sandbox_id,omitempty"`
 	CapacityMemoryBytes   uint64   `json:"capacity_memory_bytes,omitempty"`
 	CapacityCPU           int      `json:"capacity_cpu,omitempty"`
@@ -112,24 +105,27 @@ type Message struct {
 	QueuedForMs  int64 `json:"queued_for_ms,omitempty"`
 	QueuePosAtIn int64 `json:"queue_pos_at_in,omitempty"`
 
-	// Settled / Heartbeat.
+	// Settled / Heartbeat. CurrentRSS is host VMM cgroup memory.current
+	// diagnostics; it is never guest demand or a Budget input.
 	CurrentRSS          uint64 `json:"current_rss,omitempty"`
 	CurrentCPUUsec      uint64 `json:"current_cpu_usec,omitempty"`
 	RecentHighCount     uint64 `json:"recent_high_count,omitempty"`
 	CPUThrottledPeriods uint64 `json:"cpu_throttled_periods,omitempty"`
 
-	// StateSync. PreviousToken is compatibility/diagnostic context only; the
-	// server authenticates the request from the lease lock and SO_PEERCRED.
+	// StateSync. AppliedAllocatableMemory is the sandbox's safe reservation
+	// baseline. PreviousToken is diagnostic context only; the server
+	// authenticates the request from the lease lock and SO_PEERCRED.
 	AppliedAllocatableMemory uint64 `json:"applied_allocatable_memory,omitempty"`
 	Settled                  bool   `json:"settled,omitempty"`
 	PreviousToken            string `json:"previous_token,omitempty"`
 
-	// RequestBudget / BudgetResponse.
+	// RequestBudget / BudgetResponse. CurrentAlloc is the sandbox's safe
+	// absolute reservation baseline. RequestedDelta=0 commits a shrink.
 	CurrentAlloc   uint64 `json:"current_alloc,omitempty"`
 	RequestedDelta uint64 `json:"requested_delta,omitempty"`
 	Urgency        string `json:"urgency,omitempty"`
 	GrantedDelta   uint64 `json:"granted_delta,omitempty"`
-	NewAllocatable uint64 `json:"new_allocatable,omitempty"`
+	NewAllocatable uint64 `json:"new_allocatable,omitempty"` // resulting/echoed reservation
 	CooldownMs     int64  `json:"cooldown_ms,omitempty"`
 
 	// OOMReport.
@@ -137,13 +133,13 @@ type Message struct {
 	KilledPID int    `json:"killed_pid,omitempty"`
 	KilledRSS uint64 `json:"killed_rss,omitempty"`
 
-	// AdminReclaim target (node-ctl reclaim CLI → controller).
-	TargetAllocatable uint64 `json:"target_allocatable,omitempty"`
-
 	// AdminDrain.
 	Drain bool `json:"drain,omitempty"`
 
-	// AdminStatus response.
+	// AdminStatus response. NodeBudget is the existing name for the configured
+	// physical total; HostReserved and OperationalMargin are reported separately.
+	// NodeAllocated and Allocated.MemoryBytes are the aggregate live node
+	// reservation, not guest demand or host VMM charge.
 	Zone              string            `json:"zone,omitempty"`
 	NodeAllocated     uint64            `json:"node_allocated_memory,omitempty"`
 	AllocatablePool   uint64            `json:"allocatable_pool_memory,omitempty"`
@@ -180,6 +176,9 @@ type ResourcesView struct {
 
 // ReservationView is a token-free copy of one live controller reservation.
 // It is diagnostic output only and is never accepted back as controller state.
+// Floor.MemoryBytes is configured guest headroom, AllocatableMemory is the
+// current node reservation, EffectiveStartupBytes is the exact initial Budget,
+// and CurrentRSS is the host VMM cgroup memory.current diagnostic.
 type ReservationView struct {
 	SandboxID             string        `json:"sandbox_id"`
 	PeerPID               int           `json:"peer_pid,omitempty"`

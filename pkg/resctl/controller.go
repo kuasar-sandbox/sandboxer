@@ -5,56 +5,53 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
-	"golang.org/x/sys/unix"
 )
 
-const controllerMemoryHighLockRetryInterval = 10 * time.Millisecond
-
+// ControllerHookOptions identifies the existing sandbox/node reservation
+// session. CgroupPath is used only for host memory.current diagnostics; all
+// cgroup and balloon control remains sandbox-local outside ControllerHooks.
 type ControllerHookOptions struct {
 	SocketPath string
 	CgroupPath string
 	SandboxID  string
 	Context    context.Context
 	Logf       func(string, ...any)
-	Balloon    *BalloonController
 }
 
-// ControllerHooks owns one recoverable controller session. sessionMu covers a
-// complete RPC response application (network -> cgroup/balloon -> local state)
-// and connection replacement, so a stale response cannot race StateSync.
+// ControllerHooks is a reservation adapter. It deliberately knows nothing
+// about guest reports, CH balloon state, memory.high, or lifecycle phases other
+// than the existing Settled bit carried by StateSync.
 type ControllerHooks struct {
 	opts ControllerHookOptions
 	cfg  *config.SandboxConfig
 
+	// sessionMu covers one complete reservation RPC and connection
+	// replacement. It prevents an old response from racing StateSync.
 	sessionMu sync.Mutex
 	mu        sync.Mutex
 	client    *resource.Client
 	lease     *resource.LeaseHandle
-	// controllerCgroupPath is the canonical host pathname used in the immutable
-	// lease and every controller request. opts.CgroupPath is separately replaced
-	// with the process-local pinned FD path used for cgroup file I/O.
-	controllerCgroupPath string
-	// controllerSocketIdentity is the canonical owner/lease inventory identity.
-	// opts.SocketPath remains the possibly shorter absolute dial path.
+
+	controllerCgroupPath     string
 	controllerSocketIdentity string
 
-	admitted           bool
-	settled            bool
-	connected          bool
-	allocatableNowMem  uint64
-	desiredAllocMem    uint64
-	enforcementPending bool
-	previousToken      string
-	released           bool
+	admitted         bool
+	settled          bool
+	connected        bool
+	reservationBytes uint64
+	previousToken    string
+	released         bool
 
 	lifetimeCtx    context.Context
 	cancelLifetime context.CancelFunc
@@ -67,7 +64,7 @@ type ControllerHooks struct {
 
 func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (*ControllerHooks, error) {
 	if cfg == nil {
-		return nil, fmt.Errorf("controller hooks require config")
+		return nil, errors.New("controller hooks require config")
 	}
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
@@ -85,7 +82,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 	}
 	if opts.SandboxID == "" {
 		cancel()
-		return nil, fmt.Errorf("dynamic resource mode requires sandbox id")
+		return nil, errors.New("dynamic resource mode requires sandbox id")
 	}
 	controllerSocketIdentity, err := resource.CanonicalSocketPath(opts.SocketPath)
 	if err != nil {
@@ -99,29 +96,31 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 	}
 	h.opts.SocketPath = controllerSocketPath
 	h.controllerSocketIdentity = controllerSocketIdentity
-	controllerCgroupPath := filepath.Clean(cfg.Resources.Control.CgroupPath)
-	h.controllerCgroupPath = controllerCgroupPath
-	capMem, err := cfg.CapacityMemoryBytes()
+	h.controllerCgroupPath = filepath.Clean(cfg.Resources.Control.CgroupPath)
+
+	capacity, err := cfg.CapacityMemoryBytes()
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	floorMem, err := cfg.AllocatableMemoryBytes()
+	headroom, err := cfg.AllocatableMemoryBytes()
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	startupMem, err := cfg.StartupBytes()
+	startupHeadroom, err := cfg.StartupBytes()
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 	lease, err := resource.CreateLease(resource.Lease{
 		Version: resource.LeaseVersion, SandboxID: opts.SandboxID, PID: os.Getpid(),
-		ControllerSocket: controllerSocketIdentity, CgroupPath: controllerCgroupPath,
-		CapacityMemory: capMem, CapacityCPUMilli: uint64(cfg.Resources.Capacity.CPU) * 1000,
-		FloorMemory: floorMem, FloorCPUMilli: cpuMilliCeil(cfg.Resources.Allocatable.CPU),
-		StartupMemory: startupMem, ClientFeatures: []string{resource.FeatureStateSyncV1},
+		ControllerSocket: controllerSocketIdentity, CgroupPath: h.controllerCgroupPath,
+		CapacityMemory: capacity, CapacityCPUMilli: uint64(cfg.Resources.Capacity.CPU) * 1000,
+		FloorMemory: headroom, FloorCPUMilli: cpuMilliCeil(cfg.Resources.Allocatable.CPU),
+		// The immutable lease mirrors configured startup headroom. Only the
+		// existing Admit field carries its aligned InitialBudget representation.
+		StartupMemory: startupHeadroom, ClientFeatures: []string{resource.FeatureStateSyncV1},
 	})
 	if err != nil {
 		cancel()
@@ -134,9 +133,6 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 	return h, nil
 }
 
-// cpuMilliCeil preserves every positive CPU floor as a non-zero conservative
-// accounting value. cgroup cpu.weight already maps sub-millicore values to its
-// minimum non-zero weight, so the lifecycle lease must not truncate them away.
 func cpuMilliCeil(cpu float64) uint64 {
 	if cpu <= 0 {
 		return 0
@@ -166,28 +162,24 @@ func (h *ControllerHooks) Connected() bool {
 	return h.connected
 }
 
-func (h *ControllerHooks) SetBalloon(b *BalloonController) {
-	if h == nil {
-		return
-	}
-	h.sessionMu.Lock()
-	h.opts.Balloon = b
-	h.sessionMu.Unlock()
-}
-
-func (h *ControllerHooks) AllocatableNowMem() uint64 {
+// ReservationMemory returns the safe absolute reservation baseline used by
+// StateSync. A grow response advances it before local high/resize work. A
+// shrink request may lower it without a response because the local controller
+// sends that request only after actual convergence and high reduction; if the
+// node did not commit the request, StateSync completes the release.
+func (h *ControllerHooks) ReservationMemory() uint64 {
 	if h == nil {
 		return 0
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.allocatableNowMem
+	return h.reservationBytes
 }
 
 type localControllerState struct {
-	admitted, settled, connected, released, enforcementPending bool
-	applied, desired                                           uint64
-	token                                                      string
+	admitted, settled, connected, released bool
+	reservation                            uint64
+	token                                  string
 }
 
 func (h *ControllerHooks) localState() localControllerState {
@@ -195,30 +187,40 @@ func (h *ControllerHooks) localState() localControllerState {
 	defer h.mu.Unlock()
 	return localControllerState{
 		admitted: h.admitted, settled: h.settled, connected: h.connected,
-		released: h.released, applied: h.allocatableNowMem,
-		desired: h.desiredAllocMem, enforcementPending: h.enforcementPending,
+		released: h.released, reservation: h.reservationBytes,
 		token: h.previousToken,
 	}
 }
 
-func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint64, error) {
+// Admit obtains the exact initial reservation. budgetAtSnapshot is zero
+// for cold start and BudgetAtSnapshot for restore. Static mode returns the same
+// locally resolved value without contacting a node.
+func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, error) {
+	capacity, err := h.cfg.CapacityMemoryBytes()
+	if err != nil {
+		return 0, err
+	}
+	headroom, err := h.cfg.AllocatableMemoryBytes()
+	if err != nil {
+		return 0, err
+	}
+	startupHeadroom, err := h.cfg.StartupBytes()
+	if err != nil {
+		return 0, err
+	}
+	startupBudget := AlignedBudget(capacity, startupHeadroom)
+	initialBudget := startupBudget
+	if budgetAtSnapshot != 0 {
+		if budgetAtSnapshot > capacity {
+			return 0, fmt.Errorf("BudgetAtSnapshot %d exceeds Capacity %d", budgetAtSnapshot, capacity)
+		}
+		initialBudget = budgetAtSnapshot
+	}
 	if !h.Enabled() {
-		return h.cfg.StartupBytes()
+		return initialBudget, nil
 	}
 	if sid != h.opts.SandboxID {
 		return 0, fmt.Errorf("admit sandbox id %q does not match lease %q", sid, h.opts.SandboxID)
-	}
-	capMem, err := h.cfg.CapacityMemoryBytes()
-	if err != nil {
-		return 0, err
-	}
-	floorMem, err := h.cfg.AllocatableMemoryBytes()
-	if err != nil {
-		return 0, err
-	}
-	startupMem, err := h.cfg.StartupBytes()
-	if err != nil {
-		return 0, err
 	}
 
 	h.sessionMu.Lock()
@@ -242,12 +244,11 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 			}
 		}
 		res, err := h.client.AdmitContext(h.lifetimeCtx, resource.AdmitParams{
-			SandboxID: sid, CapacityMemoryBytes: capMem,
+			SandboxID: sid, CapacityMemoryBytes: capacity,
 			CapacityCPU:      h.cfg.Resources.Capacity.CPU,
-			FloorMemoryBytes: floorMem, FloorCPU: h.cfg.Resources.Allocatable.CPU,
-			StartupBudgetMemory: startupMem, AllocatableAtSnapshot: allocatableAtSnapshot,
-			CgroupPath:     h.controllerCgroupPath,
-			ClientFeatures: []string{resource.FeatureStateSyncV1},
+			FloorMemoryBytes: headroom, FloorCPU: h.cfg.Resources.Allocatable.CPU,
+			StartupBudgetMemory: startupBudget, AllocatableAtSnapshot: budgetAtSnapshot,
+			CgroupPath: h.controllerCgroupPath, ClientFeatures: []string{resource.FeatureStateSyncV1},
 		})
 		if resource.IsTransportError(err) {
 			h.setConnected(false)
@@ -269,29 +270,21 @@ func (h *ControllerHooks) Admit(sid string, allocatableAtSnapshot uint64) (uint6
 		if res.Status != resource.StatusAdmitted {
 			return 0, fmt.Errorf("admit returned unexpected status %q", res.Status)
 		}
+		if res.GrantedInitialAlloc != initialBudget {
+			return 0, fmt.Errorf("admit granted partial/incorrect initial reservation %d, require exactly %d", res.GrantedInitialAlloc, initialBudget)
+		}
 		h.mu.Lock()
 		h.admitted, h.connected = true, true
-		h.desiredAllocMem = res.GrantedInitialAlloc
-		// Both cold start and restore deliberately defer memory.high until
-		// their guest settle barrier. Keep the boot/restored balloon budget as
-		// the safe applied value, but force enforcement even when the next
-		// controller response repeats that same allocation.
-		h.enforcementPending = true
-		// Cold start has no pre-existing applied state, so the CH boot
-		// balloon is constructed from this grant. Restore seeds the actual
-		// snapshot value before Admit and must not be overwritten by intent.
-		if h.allocatableNowMem == 0 {
-			h.allocatableNowMem = res.GrantedInitialAlloc
-		}
+		h.reservationBytes = initialBudget
 		h.previousToken = res.Token
 		h.mu.Unlock()
 		if res.QueuedForMs > 0 {
-			h.opts.Logf("controller admit: token=%s initial_alloc=%d (queued %dms, pos %d at entry)",
-				shortToken(res.Token), res.GrantedInitialAlloc, res.QueuedForMs, res.QueuePosAtIn)
+			h.opts.Logf("controller admit: token=%s initial_reservation=%d (queued %dms, pos %d at entry)",
+				shortToken(res.Token), initialBudget, res.QueuedForMs, res.QueuePosAtIn)
 		} else {
-			h.opts.Logf("controller admit: token=%s initial_alloc=%d", shortToken(res.Token), res.GrantedInitialAlloc)
+			h.opts.Logf("controller admit: token=%s initial_reservation=%d", shortToken(res.Token), initialBudget)
 		}
-		return res.GrantedInitialAlloc, nil
+		return initialBudget, nil
 	}
 }
 
@@ -302,275 +295,95 @@ func shortToken(token string) string {
 	return token
 }
 
+// Settled publishes only the lifecycle fact. It never derives or changes a
+// reservation from host memory.current.
 func (h *ControllerHooks) Settled() error {
 	if h == nil {
 		return nil
 	}
-	floor, err := h.cfg.AllocatableMemoryBytes()
-	if err != nil {
-		return err
-	}
-	h.sessionMu.Lock()
-	defer h.sessionMu.Unlock()
-	state := h.localState()
-	// The guest crossed the settle barrier independently of controller or
-	// local enforcement health. Commit that fact first so a reconnect can
-	// replay it even when memory.high/balloon or the Settled RPC fails.
 	h.mu.Lock()
 	h.settled = true
-	h.mu.Unlock()
-	target := state.desired
-	if target == 0 {
-		target = state.applied
-	}
-	if target == 0 {
-		target = floor
-	}
-	applyErr := h.applyAllocatableLocked(h.applyContext(), target)
-	notifyErr := h.notifySettledLocked("controller.Settled")
-	if applyErr != nil {
-		return errors.Join(fmt.Errorf("settled apply allocatable: %w", applyErr), notifyErr)
-	}
-	return notifyErr
-}
-
-func (h *ControllerHooks) SettledRestore(allocAtSnap, desiredAlloc uint64) error {
-	if h == nil {
-		return nil
-	}
-	h.sessionMu.Lock()
-	defer h.sessionMu.Unlock()
-	state := h.localState()
-	// restore_ack is the local settle barrier. Record it before any fallible
-	// post-resume resource correction or controller notification.
-	h.mu.Lock()
-	h.settled = true
-	h.mu.Unlock()
-	// Admit's caller retains its original grant, but a reconnect before
-	// restore_ack may have replaced that intent through StateSync. The
-	// session-local desired value is canonical once present.
-	if state.desired > 0 {
-		desiredAlloc = state.desired
-	}
-	if desiredAlloc == 0 {
-		desiredAlloc = allocAtSnap
-	}
-	applyErr := h.applyAllocatableLocked(h.applyContext(), desiredAlloc)
-	if applyErr == nil && desiredAlloc != allocAtSnap {
-		h.opts.Logf("settled-restore: applied correction alloc %d → %d", allocAtSnap, desiredAlloc)
-	}
-	notifyErr := h.notifySettledLocked("controller.SettledRestore")
-	if applyErr != nil {
-		return errors.Join(fmt.Errorf("settled-restore apply allocatable: %w", applyErr), notifyErr)
-	}
-	return notifyErr
-}
-
-// notifySettledLocked publishes the irreversible guest settle barrier even if
-// local enforcement just failed. The controller therefore releases startup
-// accounting; the locally retained applied value remains the StateSync truth.
-// Caller holds sessionMu.
-func (h *ControllerHooks) notifySettledLocked(operation string) error {
-	h.mu.Lock()
-	connected := h.connected
 	h.mu.Unlock()
 	if !h.Enabled() {
 		return nil
 	}
-	if !connected {
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	state := h.localState()
+	if !state.connected {
 		h.notifyReconnect()
 		return nil
 	}
-	rss := readMemoryCurrent(h.opts.CgroupPath)
-	if err := h.client.SettledContext(h.lifetimeCtx, rss, 0); err != nil {
+	hostCharge := readHostMemoryChargeBestEffort(h.opts.CgroupPath)
+	if err := h.client.SettledContext(h.lifetimeCtx, hostCharge, 0); err != nil {
 		h.markDisconnectedLocked(err)
 		if resource.IsTransportError(err) {
 			return nil
 		}
-		return fmt.Errorf("%s: %w", operation, err)
+		return fmt.Errorf("controller.Settled: %w", err)
 	}
 	return nil
 }
 
-// SetRestoreAppliedAllocatable records the allocation encoded in the restored
-// balloon device before Admit. It is an observed value, not controller intent.
-func (h *ControllerHooks) SetRestoreAppliedAllocatable(allocBytes uint64) {
-	if h == nil {
-		return
-	}
-	h.mu.Lock()
-	h.allocatableNowMem = allocBytes
-	h.enforcementPending = true
-	h.mu.Unlock()
-}
-
-func (h *ControllerHooks) OnAllocatableChanged(allocBytes uint64) error {
-	if h == nil {
-		return nil
+// RequestBudget is the existing reservation transaction. currentAlloc is the
+// sandbox's safe absolute baseline; requestedDelta may be zero to commit a
+// shrink. The returned NewAllocatable is reservation state, never a balloon or
+// cgroup command.
+func (h *ControllerHooks) RequestBudget(currentAlloc, requestedDelta uint64, urgency, reason string) (uint64, uint64, time.Duration, error) {
+	if !h.Enabled() {
+		result, overflow := bits.Add64(currentAlloc, requestedDelta, 0)
+		if overflow != 0 {
+			return 0, currentAlloc, 0, ErrMemoryOverflow
+		}
+		return requestedDelta, result, 0, nil
 	}
 	h.sessionMu.Lock()
 	defer h.sessionMu.Unlock()
-	return h.applyAllocatableLocked(h.applyContext(), allocBytes)
-}
-
-func (h *ControllerHooks) applyContext() context.Context {
-	if h != nil && h.lifetimeCtx != nil {
-		return h.lifetimeCtx
+	state := h.localState()
+	if !state.connected {
+		h.notifyReconnect()
+		return 0, state.reservation, 0, &resource.TransportError{Err: errors.New("controller session disconnected")}
 	}
-	return context.Background()
-}
-
-func (h *ControllerHooks) applyAllocatableLocked(ctx context.Context, allocBytes uint64) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	var previousHigh []byte
-	if err := h.withMemoryHighLock(ctx, func() error {
-		var err error
-		previousHigh, err = h.readMemoryHigh()
-		if err != nil {
-			return err
+	granted, newReservation, cooldownMs, err := h.client.RequestBudgetContext(
+		h.lifetimeCtx, currentAlloc, requestedDelta, urgency, reason)
+	if err != nil {
+		baseline := state.reservation
+		// A shrink request is sent only after local balloon actual converged
+		// and memory.high was lowered. If its response is lost, CurrentAlloc
+		// is therefore the only reusable local baseline that is safe whether
+		// the node committed the request or not. A lost grow response keeps the
+		// old smaller baseline because no local grow has been applied yet.
+		if requestedDelta == 0 && currentAlloc < state.reservation {
+			h.mu.Lock()
+			h.reservationBytes = currentAlloc
+			h.mu.Unlock()
+			baseline = currentAlloc
 		}
-		return h.setMemoryHigh(allocBytes)
-	}); err != nil {
-		return err
+		h.markDisconnectedLocked(err)
+		return 0, baseline, 0, err
 	}
-	if h.opts.Balloon != nil {
-		var balloonErr error
-		dynamic := h.Enabled()
-		if dynamic {
-			balloonErr = h.opts.Balloon.ApplyAllocatable(ctx, allocBytes)
-		} else {
-			balloonErr = h.opts.Balloon.ApplyAllocatableEventually(ctx, allocBytes)
+	capacity, err := h.cfg.CapacityMemoryBytes()
+	if err != nil {
+		return 0, state.reservation, 0, err
+	}
+	want, overflow := bits.Add64(currentAlloc, granted, 0)
+	if overflow != 0 || granted > requestedDelta || newReservation != want || newReservation > capacity {
+		protocolErr := fmt.Errorf("invalid budget response: current=%d requested=%d granted=%d new=%d capacity=%d",
+			currentAlloc, requestedDelta, granted, newReservation, capacity)
+		baseline := state.reservation
+		if requestedDelta == 0 && currentAlloc < state.reservation {
+			h.mu.Lock()
+			h.reservationBytes = currentAlloc
+			h.mu.Unlock()
+			baseline = currentAlloc
 		}
-		if balloonErr != nil {
-			// Dynamic allocations are published to StateSync only after both
-			// enforcement steps commit, so their cgroup half must roll back.
-			// Static restore deliberately keeps the failed balloon target queued
-			// for retry; memory.high must remain at that eventual target too.
-			if dynamic {
-				rollbackErr := h.withMemoryHighLock(h.applyContext(), func() error {
-					return h.restoreMemoryHigh(previousHigh)
-				})
-				if rollbackErr != nil {
-					return errors.Join(balloonErr, fmt.Errorf("rollback memory.high: %w", rollbackErr))
-				}
-			}
-			return balloonErr
-		}
+		h.markDisconnectedLocked(protocolErr)
+		return 0, baseline, time.Duration(cooldownMs) * time.Millisecond, protocolErr
 	}
 	h.mu.Lock()
-	h.allocatableNowMem = allocBytes
-	h.desiredAllocMem = allocBytes
-	h.enforcementPending = false
+	h.reservationBytes = newReservation
 	h.mu.Unlock()
-	return nil
-}
-
-// withMemoryHighLock serializes each watermark commit or rollback with VMM
-// lifecycle operations. Balloon RPC and ambiguous-result recovery deliberately
-// run outside the lock: they can last until the sandbox lifetime is canceled,
-// and must not prevent lifecycle code from lifting memory.high. A later dynamic
-// rollback reacquires the lock, so it waits until any active lifecycle barrier
-// has restored and released the watermark. Contended acquisition uses
-// nonblocking retries so controller/background cancellation can interrupt it.
-func (h *ControllerHooks) withMemoryHighLock(ctx context.Context, fn func() error) error {
-	memoryHighLock, err := h.lockMemoryHigh(ctx)
-	if err != nil {
-		return err
-	}
-	if memoryHighLock != nil {
-		defer memoryHighLock.Close()
-	}
-	return fn()
-}
-
-func (h *ControllerHooks) lockMemoryHigh(ctx context.Context) (*os.File, error) {
-	if h == nil || h.opts.CgroupPath == "" {
-		return nil, nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	lock, err := os.Open(h.opts.CgroupPath)
-	if err != nil {
-		return nil, fmt.Errorf("open memory.high lifecycle lock: %w", err)
-	}
-	fail := func(err error) (*os.File, error) {
-		_ = lock.Close()
-		return nil, err
-	}
-	retry := time.NewTicker(controllerMemoryHighLockRetryInterval)
-	defer retry.Stop()
-	for {
-		// Always make one immediate attempt. That lets an already-canceled
-		// balloon operation perform a nonblocking rollback when no lifecycle
-		// operation owns the lock, while any actual contention remains fully
-		// cancellable below.
-		if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err == nil {
-			return lock, nil
-		} else if !errors.Is(err, unix.EWOULDBLOCK) {
-			return fail(fmt.Errorf("lock memory.high lifecycle: %w", err))
-		}
-		select {
-		case <-ctx.Done():
-			return fail(fmt.Errorf("lock memory.high lifecycle: %w", ctx.Err()))
-		case <-retry.C:
-			if err := ctx.Err(); err != nil {
-				return fail(fmt.Errorf("lock memory.high lifecycle: %w", err))
-			}
-		}
-	}
-}
-
-func (h *ControllerHooks) memoryHighPath() string {
-	if h == nil || h.opts.CgroupPath == "" {
-		return ""
-	}
-	return filepath.Join(h.opts.CgroupPath, "memory.high")
-}
-
-func (h *ControllerHooks) readMemoryHigh() ([]byte, error) {
-	path := h.memoryHighPath()
-	if path == "" {
-		return nil, nil
-	}
-	value, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read memory.high: %w", err)
-	}
-	return value, nil
-}
-
-func (h *ControllerHooks) restoreMemoryHigh(value []byte) error {
-	path := h.memoryHighPath()
-	if path == "" {
-		return nil
-	}
-	return os.WriteFile(path, value, 0o644)
-}
-
-func (h *ControllerHooks) setMemoryHigh(allocBytes uint64) error {
-	path := h.memoryHighPath()
-	if path == "" {
-		return nil
-	}
-	ratio := 0.875
-	if h.cfg.Resources.WatermarkHigh != nil && h.cfg.Resources.WatermarkHigh.Memory != "" {
-		alloc, _ := h.cfg.AllocatableMemoryBytes()
-		cur, parseErr := h.cfg.WatermarkHighBytes()
-		if parseErr == nil && alloc > 0 {
-			ratio = float64(cur) / float64(alloc)
-		}
-	}
-	newHigh := uint64(float64(allocBytes) * ratio)
-	if err := os.WriteFile(path, []byte(strconv.FormatUint(newHigh, 10)), 0o644); err != nil {
-		return fmt.Errorf("write memory.high: %w", err)
-	}
-	return nil
+	return granted, newReservation, time.Duration(cooldownMs) * time.Millisecond, nil
 }
 
 func (h *ControllerHooks) StartHeartbeat(ctx context.Context, period time.Duration) {
@@ -589,13 +402,13 @@ func (h *ControllerHooks) StartHeartbeat(ctx context.Context, period time.Durati
 			case <-bgCtx.Done():
 				return
 			case <-ticker.C:
-				h.heartbeatOnce(bgCtx)
+				h.heartbeatOnce()
 			}
 		}
 	}()
 }
 
-func (h *ControllerHooks) heartbeatOnce(ctx context.Context) {
+func (h *ControllerHooks) heartbeatOnce() {
 	h.sessionMu.Lock()
 	defer h.sessionMu.Unlock()
 	state := h.localState()
@@ -606,48 +419,19 @@ func (h *ControllerHooks) heartbeatOnce(ctx context.Context) {
 		h.notifyReconnect()
 		return
 	}
-	rss := readMemoryCurrent(h.opts.CgroupPath)
-	res, err := h.client.HeartbeatContext(h.lifetimeCtx, rss, 0, 0, 0)
+	hostCharge := readHostMemoryChargeBestEffort(h.opts.CgroupPath)
+	res, err := h.client.HeartbeatContext(h.lifetimeCtx, hostCharge, 0, 0, 0)
 	if err != nil {
-		// A TypeError such as "no reservation" rejects the session just as
-		// definitively as EOF. Keeping that stream connected would prevent
-		// StateSync forever.
 		h.markDisconnectedLocked(err)
 		return
 	}
-	if res != nil && res.NewAllocatable > 0 &&
-		(res.NewAllocatable != state.applied || state.enforcementPending) {
-		h.opts.Logf("heartbeat: controller adjusted alloc %d → %d, applying", state.applied, res.NewAllocatable)
-		if err := h.applyAllocatableLocked(ctx, res.NewAllocatable); err != nil {
-			h.opts.Logf("apply allocatable: %v", err)
+	if res == nil || res.NewAllocatable != state.reservation {
+		got := uint64(0)
+		if res != nil {
+			got = res.NewAllocatable
 		}
+		h.markDisconnectedLocked(fmt.Errorf("heartbeat reservation mismatch: node=%d local=%d", got, state.reservation))
 	}
-}
-
-// RequestBudget serializes the grant response with local application. It is the
-// only positive-budget entry point used by the pressure sensor.
-func (h *ControllerHooks) RequestBudget(step uint64, urgency, reason string) (uint64, uint64, time.Duration, error) {
-	if !h.Enabled() {
-		return 0, h.AllocatableNowMem(), 0, nil
-	}
-	h.sessionMu.Lock()
-	defer h.sessionMu.Unlock()
-	state := h.localState()
-	if !state.connected {
-		h.notifyReconnect()
-		return 0, state.applied, 0, &resource.TransportError{Err: errors.New("controller session disconnected")}
-	}
-	granted, newAlloc, cooldownMs, err := h.client.RequestBudgetContext(h.lifetimeCtx, state.applied, step, urgency, reason)
-	if err != nil {
-		h.markDisconnectedLocked(err)
-		return 0, state.applied, 0, err
-	}
-	if granted > 0 {
-		if err := h.applyAllocatableLocked(h.applyContext(), newAlloc); err != nil {
-			return 0, state.applied, time.Duration(cooldownMs) * time.Millisecond, err
-		}
-	}
-	return granted, newAlloc, time.Duration(cooldownMs) * time.Millisecond, nil
 }
 
 func (h *ControllerHooks) addBackground(cancel context.CancelFunc) {
@@ -664,7 +448,7 @@ func (h *ControllerHooks) addBackground(cancel context.CancelFunc) {
 func (h *ControllerHooks) markDisconnectedLocked(err error) {
 	h.setConnected(false)
 	_ = h.client.Close()
-	h.opts.Logf("controller disconnected: %v; retaining applied allocatable and reconnecting", err)
+	h.opts.Logf("controller disconnected: %v; retaining reservation baseline and reconnecting", err)
 	h.notifyReconnect()
 }
 
@@ -706,65 +490,25 @@ func (h *ControllerHooks) reconnectLoop() {
 			}
 			err := h.client.ConnectContext(h.lifetimeCtx)
 			if err == nil {
-				rss := readMemoryCurrent(h.opts.CgroupPath)
+				hostCharge := readHostMemoryChargeBestEffort(h.opts.CgroupPath)
 				result, syncErr := h.client.StateSyncContext(h.lifetimeCtx, resource.StateSyncParams{
-					SandboxID: h.opts.SandboxID, AppliedAllocatableMemory: state.applied,
-					Settled: state.settled, CurrentRSS: rss, PreviousToken: state.token,
+					SandboxID:                h.opts.SandboxID,
+					AppliedAllocatableMemory: state.reservation,
+					Settled:                  state.settled, CurrentRSS: hostCharge, PreviousToken: state.token,
 				})
-				restoredAlloc := state.applied
-				desiredAlloc := state.desired
-				if syncErr == nil && result.NewAllocatable > 0 {
-					desiredAlloc = result.NewAllocatable
-				}
-				if syncErr == nil && !state.settled {
-					// Cold start and restore intentionally defer memory.high and
-					// balloon corrections until hello/restore_ack. Remember the
-					// recovered controller decision without crossing that barrier.
-					h.mu.Lock()
-					h.desiredAllocMem = desiredAlloc
-					h.mu.Unlock()
-				} else if syncErr == nil && desiredAlloc > 0 &&
-					(desiredAlloc != state.applied || state.enforcementPending) {
-					syncErr = h.applyAllocatableLocked(h.applyContext(), desiredAlloc)
-					if syncErr == nil {
-						restoredAlloc = desiredAlloc
-					}
+				if syncErr == nil && result.NewAllocatable != state.reservation {
+					syncErr = fmt.Errorf("state_sync reservation mismatch: node=%d local=%d", result.NewAllocatable, state.reservation)
 				}
 				if syncErr == nil {
 					h.mu.Lock()
 					h.connected, h.previousToken = true, result.Token
 					h.mu.Unlock()
 					h.sessionMu.Unlock()
-					h.opts.Logf("controller state sync restored token=%s allocatable=%d settled=%v",
-						shortToken(result.Token), restoredAlloc, state.settled)
+					h.opts.Logf("controller state sync restored token=%s reservation=%d settled=%v",
+						shortToken(result.Token), state.reservation, state.settled)
 					break
 				}
-				if resource.IsStateSyncUnsupported(syncErr) && state.token != "" {
-					legacyAlloc, reattachErr := h.client.ReattachStateContext(h.lifetimeCtx, state.token)
-					if reattachErr == nil {
-						desiredAlloc := state.desired
-						if legacyAlloc > 0 {
-							desiredAlloc = legacyAlloc
-						}
-						if !state.settled {
-							h.mu.Lock()
-							h.desiredAllocMem = desiredAlloc
-							h.mu.Unlock()
-						} else if desiredAlloc > 0 &&
-							(desiredAlloc != state.applied || state.enforcementPending) {
-							reattachErr = h.applyAllocatableLocked(h.applyContext(), desiredAlloc)
-						}
-						if reattachErr == nil {
-							h.setConnected(true)
-							h.sessionMu.Unlock()
-							h.opts.Logf("controller reattached through legacy protocol token=%s", shortToken(state.token))
-							break
-						}
-					}
-					err = reattachErr
-				} else {
-					err = syncErr
-				}
+				err = syncErr
 			}
 			_ = h.client.Close()
 			h.setConnected(false)
@@ -837,7 +581,7 @@ func (h *ControllerHooks) Release(reason string) {
 	}
 }
 
-func readMemoryCurrent(cgroupPath string) uint64 {
+func readHostMemoryChargeBestEffort(cgroupPath string) uint64 {
 	if cgroupPath == "" {
 		return 0
 	}
@@ -845,12 +589,9 @@ func readMemoryCurrent(cgroupPath string) uint64 {
 	if err != nil {
 		return 0
 	}
-	var n uint64
-	for _, b := range data {
-		if b < '0' || b > '9' {
-			break
-		}
-		n = n*10 + uint64(b-'0')
+	charge, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0
 	}
-	return n
+	return charge
 }
