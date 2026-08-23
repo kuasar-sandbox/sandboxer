@@ -792,7 +792,7 @@ func TestVMMMemoryHighThrottleDrainDelay(t *testing.T) {
 	}
 }
 
-func TestWaitForCH_BriefControllerLockContentionRetriesOrderedShutdown(t *testing.T) {
+func TestWaitForCH_BriefMemoryHighLockContentionRetriesOrderedShutdown(t *testing.T) {
 	dir := t.TempDir()
 	memoryHighPath := filepath.Join(dir, "memory.high")
 	for name, value := range map[string]string{
@@ -804,18 +804,18 @@ func TestWaitForCH_BriefControllerLockContentionRetriesOrderedShutdown(t *testin
 			t.Fatal(err)
 		}
 	}
-	controllerLock, err := os.Open(dir)
+	memoryHighLock, err := os.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer controllerLock.Close()
-	if err := unix.Flock(int(controllerLock.Fd()), unix.LOCK_EX); err != nil {
+	defer memoryHighLock.Close()
+	if err := unix.Flock(int(memoryHighLock.Fd()), unix.LOCK_EX); err != nil {
 		t.Fatal(err)
 	}
 	lockHeld := true
 	defer func() {
 		if lockHeld {
-			_ = unix.Flock(int(controllerLock.Fd()), unix.LOCK_UN)
+			_ = unix.Flock(int(memoryHighLock.Fd()), unix.LOCK_UN)
 		}
 	}()
 
@@ -872,12 +872,12 @@ func TestWaitForCH_BriefControllerLockContentionRetriesOrderedShutdown(t *testin
 	select {
 	case <-retryStarted:
 	case <-time.After(time.Second):
-		t.Fatal("shutdown did not retry the controller lock")
+		t.Fatal("shutdown did not retry the memory.high lifecycle lock")
 	}
 	if proc.sentCount(syscall.SIGTERM) != 0 {
-		t.Fatalf("brief controller contention caused fallback signal: %v", proc.sent)
+		t.Fatalf("brief memory.high lifecycle contention caused fallback signal: %v", proc.sent)
 	}
-	if err := unix.Flock(int(controllerLock.Fd()), unix.LOCK_UN); err != nil {
+	if err := unix.Flock(int(memoryHighLock.Fd()), unix.LOCK_UN); err != nil {
 		t.Fatal(err)
 	}
 	lockHeld = false
@@ -887,7 +887,7 @@ func TestWaitForCH_BriefControllerLockContentionRetriesOrderedShutdown(t *testin
 			t.Fatal("retried ordered shutdown did not observe memory.high=max")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("ordered shutdown was not attempted after controller lock release")
+		t.Fatal("ordered shutdown was not attempted after memory.high lifecycle lock release")
 	}
 	doneCh <- nil
 	select {
@@ -1013,7 +1013,7 @@ func TestWaitForCH_LockRetryRemainsSignalResponsive(t *testing.T) {
 	select {
 	case <-retryStarted:
 	case <-time.After(time.Second):
-		t.Fatal("shutdown did not enter the controller lock retry window")
+		t.Fatal("shutdown did not enter the memory.high lifecycle lock retry window")
 	}
 	start := time.Now()
 	sigCh <- syscall.SIGINT
@@ -1021,13 +1021,13 @@ func TestWaitForCH_LockRetryRemainsSignalResponsive(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("second signal was blocked by controller lock retry for %s", elapsed)
+		t.Fatalf("second signal was blocked by memory.high lifecycle lock retry for %s", elapsed)
 	}
 	if proc.sentCount(syscall.SIGKILL) != 1 {
-		t.Fatalf("expected immediate SIGKILL during controller lock retry, got %v", proc.sent)
+		t.Fatalf("expected immediate SIGKILL during memory.high lifecycle lock retry, got %v", proc.sent)
 	}
 	if proc.sentCount(syscall.SIGTERM) != 0 {
-		t.Fatalf("controller lock retry unexpectedly fell back before escalation: %v", proc.sent)
+		t.Fatalf("memory.high lifecycle lock retry unexpectedly fell back before escalation: %v", proc.sent)
 	}
 	doneCh <- nil
 	select {

@@ -536,11 +536,11 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 // without this escalation, sandbox-ctl waits indefinitely on cmd.Wait.
 const chShutdownGrace = 5 * time.Second
 
-// ControllerHooks holds the memory.high lifecycle lock only around cgroupfs
-// reads and writes. A brief retry window lets ordered shutdown wait out that
-// commit without blocking the signal loop. Persistent contention is treated as
-// an active lifecycle operation, where waiting for the lock could deadlock with
-// snapshot destroy waiting for this same CH process to exit.
+// MemoryController holds the memory.high lifecycle lock only around sandbox-local
+// cgroupfs reads and writes. A brief retry window lets ordered shutdown wait out
+// that commit without blocking the signal loop. Persistent contention is treated
+// as an active lifecycle operation, where waiting for the lock could deadlock
+// with snapshot destroy waiting for this same CH process to exit.
 const (
 	memoryHighLockRetryInterval = 10 * time.Millisecond
 	memoryHighLockRetryWindow   = 100 * time.Millisecond
@@ -551,8 +551,8 @@ const (
 // thread sleeping in mem_cgroup_handle_over_high cannot acknowledge pause or
 // ordered shutdown even though sandbox-ctl itself remains responsive outside
 // the cgroup. memory.max remains in force while memory.high is lifted. The
-// advisory lock is also taken by ControllerHooks, so a dynamic allocation
-// update cannot reinstate throttling inside the lifecycle critical section.
+// advisory lock is also taken by MemoryController, so a local Budget update
+// cannot reinstate throttling inside the lifecycle critical section.
 func liftVMMMemoryHigh(cgroupPath string) ([]byte, *os.File, error) {
 	return liftVMMMemoryHighWithLock(cgroupPath, unix.LOCK_EX)
 }
@@ -591,9 +591,9 @@ func liftVMMMemoryHighWithLock(cgroupPath string, lockOperation int) ([]byte, *o
 }
 
 // restoreVMMMemoryHigh restores a value saved by liftVMMMemoryHigh only while
-// the file still contains "max". ControllerHooks updates are serialized by the
-// lifecycle lock; the conditional write also avoids overwriting a change made
-// by an external writer that does not participate in that lock.
+// the file still contains "max". MemoryController updates are serialized by the
+// lifecycle lock; the conditional write also avoids overwriting a change made by
+// an external writer that does not participate in that lock.
 func restoreVMMMemoryHigh(cgroupPath string, previous []byte) (bool, error) {
 	if cgroupPath == "" || previous == nil || strings.TrimSpace(string(previous)) == "max" {
 		return false, nil

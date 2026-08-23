@@ -2264,8 +2264,11 @@ deflate_on_oom 触发链路:
 的情况下减小 BalloonCurrent,所以 target/current 会暂时不一致。Sandbox 在该
 阶段跳过 shrink/high reduction;不会把自主 deflate 自动转换成 node admission
 或 reservation 请求。若 PSI/OOM sensor 另行发现压力,才走正常的 grow 请求。
-VMM 仍受现有 `memory.high`/`memory.max` 约束,因此该软保证不会把 host charge
-无界扩张到节点池之外。
+VMM 仍受该 sandbox 的现有 `memory.high` 和硬上界 `memory.max` 约束。但是自主
+deflate 不是 node grant:在 target/current 不稳定期间,不能声称 node aggregate
+严格满足 `reservation >= ObservedBudget`;admission 也不会把这部分暂时可用内存
+当作可调度 headroom。Sandbox 保留现有 reservation、禁止 shrink,等待同一控制
+循环以显式 grow 请求重新建立正式保证。
 
 ## 10. 与 node-ctl 的资源协议
 
@@ -2312,7 +2315,7 @@ PSI/OOM grow 可以按 reserve → high → deflate 前进。否则 guest emerge
 | restore normalization | 不变 | `max`/deferred | `SafeTarget=min(snapshot T,X)` |
 | steady grow | 先增加 | 再提高 | 最后 deflate,不等 current |
 | steady shrink | 保留旧值 | 保留旧值 | inflate 一步并等 current |
-| shrink commit | 最后降低 | 先降低 | 已收敛后释放 reservation |
+| shrink commit | 最后释放差额 | 先降低到新安全值 | current 已收敛,target 不变 |
 
 静态模式把 reservation 留在本地变量,顺序完全相同。CPU 设置全生命周期不变。
 
