@@ -148,8 +148,9 @@ func CalculateMemoryBudget(capacity, headroom, balloonTarget, currentBudget, gue
 }
 
 // NextShrinkTarget returns at most one aligned target step. Shrink is allowed
-// only from a stable CH observation and only when at least one full step of
-// deadband exists between the accepted and desired targets.
+// only from a stable CH observation and only when more than one full step
+// remains between the accepted and desired targets. The retained step is the
+// shrink deadband; it is Budget headroom, not part of RequestedBudget.
 func NextShrinkTarget(capacity, acceptedTarget, currentBudget, requestedBudget uint64) (uint64, bool) {
 	if acceptedTarget > capacity || currentBudget > capacity {
 		return acceptedTarget, false
@@ -162,7 +163,7 @@ func NextShrinkTarget(capacity, acceptedTarget, currentBudget, requestedBudget u
 		return acceptedTarget, false
 	}
 	gap, _ := saturatingSub(desiredTarget, acceptedTarget)
-	if gap < resource.MemoryStep {
+	if gap <= resource.MemoryStep {
 		return acceptedTarget, false
 	}
 	next, overflow := saturatingAdd(acceptedTarget, resource.MemoryStep)

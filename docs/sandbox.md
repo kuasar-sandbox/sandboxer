@@ -2233,7 +2233,8 @@ Budget shrink 必须满足:
 
 1. 使用 fresh epoch/seq report 和当次 CH observation
 2. target/current stable
-3. requested target 至少跨过一个 64MiB deadband
+3. requested target 与 accepted target 的差距必须严格大于 64MiB;
+   差距小于或等于一个 Step 时保留当前 Budget 作为 shrink deadband
 4. 每份 report 最多 inflate 一个 64MiB step
 5. 轮询 `memory_actual_size == TargetBudget` 后才降低 high 和释放 reservation
 6. 收敛前已排队的 report 不得驱动下一步 shrink

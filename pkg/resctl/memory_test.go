@@ -127,9 +127,10 @@ func TestNextShrinkTargetStableOneStep(t *testing.T) {
 		want                     uint64
 		ok                       bool
 	}{
-		{"one step", 256 << 20, 768 << 20, 512 << 20, 320 << 20, true},
+		{"more than deadband", 256 << 20, 768 << 20, 640 << 20, 320 << 20, true},
 		{"unstable", 256 << 20, 704 << 20, 512 << 20, 256 << 20, false},
-		{"deadband", 256 << 20, 768 << 20, 735 << 20, 256 << 20, false},
+		{"exactly one step deadband", 256 << 20, 768 << 20, 704 << 20, 256 << 20, false},
+		{"inside deadband", 256 << 20, 768 << 20, 735 << 20, 256 << 20, false},
 		{"grow direction", 256 << 20, 768 << 20, 896 << 20, 256 << 20, false},
 		{"unaligned restore target", 100 << 20, 924 << 20, 700 << 20, 128 << 20, true},
 	} {

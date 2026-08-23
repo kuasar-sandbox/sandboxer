@@ -13,10 +13,9 @@
 # artifact records freeze MemAvailable/Cached, CH target/current, Budget values,
 # snapshot resident bytes, rootfs vhost reads/bytes/latency, and UFFD counters.
 # No fixed latency threshold is introduced: the read-amplification gate is
-# relative to the two controls. The controls require full pre-read residency;
-# the 256MiB-headroom case may lose at most one MemoryStep because the approved
-# memory.high PressureReserve deliberately starts host pressure one Step below
-# the full Budget.
+# relative to the two controls. Every W case requires full pre-read residency;
+# the one-Step shrink deadband offsets memory.high's minimum PressureReserve so
+# the configured clean working set is not reclaimed before capture.
 
 set -euo pipefail
 
@@ -68,11 +67,6 @@ esac
 case "$REPORT_SETTLE_SECONDS" in
     ''|*[!0-9]*|0) echo "$0: MEM_REPORT_SETTLE_SECONDS must be a positive integer" >&2; exit 1 ;;
 esac
-NEW_RESIDENT_FLOOR_BYTES=0
-if [ "$WARM_BYTES" -gt "$MEMORY_STEP_BYTES" ]; then
-    NEW_RESIDENT_FLOOR_BYTES=$((WARM_BYTES - MEMORY_STEP_BYTES))
-fi
-
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
@@ -466,9 +460,8 @@ record_case() { # $1=label $2=headroom-yaml $3=startup-yaml $4=also-b $5=headroo
     [[ "$checksum" =~ ^[0-9a-f]{64}$ ]] \
         || { echo "FAIL: $label invalid working-set checksum" >&2; exit 1; }
 
-    # Wait across one production mem-report period. The local controller may
-    # take one legitimate shrink step, after which the warmed clean pages must
-    # still fit inside configured headroom.
+    # Wait across one production mem-report period. The retained shrink
+    # deadband must keep the complete warmed clean working set resident.
     sleep "$REPORT_SETTLE_SECONDS"
     guest_exec "$sid" -- python3 -c "$MINCORE_PROBE" "$warm_path" \
         >"$WORK/$label-prefreeze.mincore"
@@ -613,11 +606,11 @@ restore_case() { # $1=key $2=resident-floor-bytes
 # after W so B is captured from the same guest and disk state.
 record_case no-balloon 8GiB 8GiB 0 "$CAPACITY_BYTES" "$WARM_BYTES"
 record_case workaround 7680MiB 7680MiB 0 $((7680 * 1024 * 1024)) "$WARM_BYTES"
-record_case new 256MiB 2GiB 1 "$HEADROOM_BYTES" "$NEW_RESIDENT_FLOOR_BYTES"
+record_case new 256MiB 2GiB 1 "$HEADROOM_BYTES" "$WARM_BYTES"
 
 restore_case no-balloon-w "$WARM_BYTES"
 restore_case workaround-w "$WARM_BYTES"
-restore_case new-w "$NEW_RESIDENT_FLOOR_BYTES"
+restore_case new-w "$WARM_BYTES"
 restore_case new-b 0
 
 python3 - "$CAPACITY_BYTES" "$HEADROOM_BYTES" "$MEMORY_STEP_BYTES" "$ANON_BYTES" "$WARM_BYTES" \
@@ -656,7 +649,7 @@ for key in ("no-balloon-w", "workaround-w", "new-w"):
         raise SystemExit(f"{key}: W freeze used no trusted report: {freeze}")
     pre = doc["record"]["prefreeze_mincore"]
     restored = doc["restore_mincore"]
-    resident_floor = warm_bytes if key != "new-w" else max(0, warm_bytes - step)
+    resident_floor = warm_bytes
     for phase, observation in (("prefreeze", pre), ("restore", restored)):
         resident_bytes = observation["resident_pages"] * observation["bytes"] // observation["pages"]
         if resident_bytes < resident_floor:
@@ -672,16 +665,15 @@ for key in ("no-balloon-w", "workaround-w", "new-w"):
         )
 
 new_freeze = results["new-w"]["record"]["freeze"]
-if new_freeze["MemAvailable"] < headroom - step:
+if new_freeze["MemAvailable"] < headroom:
     raise SystemExit(
-        f"new-w: freeze MemAvailable={new_freeze['MemAvailable']} below one-step "
-        f"headroom bound={headroom-step}"
+        f"new-w: freeze MemAvailable={new_freeze['MemAvailable']} below "
+        f"configured headroom={headroom}"
     )
-new_resident_floor = max(0, warm_bytes - step)
-if new_freeze["Cached"] < new_resident_floor:
+if new_freeze["Cached"] < warm_bytes:
     raise SystemExit(
-        f"new-w: freeze Cached={new_freeze['Cached']} below one-step "
-        f"working-set bound={new_resident_floor}"
+        f"new-w: freeze Cached={new_freeze['Cached']} below "
+        f"working-set size={warm_bytes}"
     )
 
 # The old failure was thousands of extra rootfs reads while both controls were
@@ -716,7 +708,7 @@ with open(output, "w", encoding="utf-8") as destination:
         "memory_step_bytes": step,
         "anonymous_demand_bytes": anon_bytes,
         "working_set_bytes": warm_bytes,
-        "new_resident_floor_bytes": new_resident_floor,
+        "required_file_resident_bytes": warm_bytes,
         "rootfs_control_max_count": control_count,
         "rootfs_control_max_bytes": control_bytes,
         "results": results,
