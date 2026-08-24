@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -31,7 +32,12 @@ type fakeCHMemory struct {
 
 func newFakeCHMemory(t *testing.T, capacity uint64) *fakeCHMemory {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "ch.sock")
+	socketDir, err := os.MkdirTemp("", "sb-ch-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	sock := filepath.Join(socketDir, "ch.sock")
 	listener, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
