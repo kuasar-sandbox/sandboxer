@@ -261,7 +261,7 @@ PY
 
 wait_memory_stable() { # $1=sid $2=pid $3=log $4=headroom-bytes
     local sid="$1" pid="$2" log="$3" headroom="$4"
-    local target=-1 current=-1 available=-1 demand=0 requested=0 expected_target=-1
+    local target=-1 current=-1 available=-1 demand=0 requested=0 expected_target=-1 target_gap=-1
     local matching_observations=0 meminfo="$WORK/$sid.stability.meminfo"
     local deadline=$((SECONDS + 120))
     while [ "$SECONDS" -lt "$deadline" ]; do
@@ -281,10 +281,20 @@ wait_memory_stable() { # $1=sid $2=pid $3=log $4=headroom-bytes
                 fi
                 expected_target=$((CAPACITY_BYTES - requested))
                 expected_target=$((expected_target - expected_target % MEMORY_STEP_BYTES))
-                if [ "$target" -eq "$expected_target" ]; then
+                # The controller deliberately keeps up to one Step of extra
+                # Budget as its shrink deadband. A target above the formula
+                # result would under-provision headroom; a target more than one
+                # Step below it would indicate that steady reclaim stalled.
+                target_gap=-1
+                if [ "$target" -le "$expected_target" ]; then
+                    target_gap=$((expected_target - target))
+                fi
+                if [ "$target_gap" -ge 0 ] \
+                    && [ "$target_gap" -le "$MEMORY_STEP_BYTES" ] \
+                    && [ $((target % MEMORY_STEP_BYTES)) -eq 0 ]; then
                     matching_observations=$((matching_observations + 1))
                     if [ "$matching_observations" -ge 2 ]; then
-                        echo "    steady target=$target CurrentBudget=$current MemAvailable=$available headroom=$headroom"
+                        echo "    steady target=$target CurrentBudget=$current MemAvailable=$available headroom=$headroom desiredTarget=$expected_target deadband=$target_gap"
                         return 0
                     fi
                 else
@@ -297,7 +307,7 @@ wait_memory_stable() { # $1=sid $2=pid $3=log $4=headroom-bytes
         kill -0 "$pid" 2>/dev/null || { echo "FAIL: $sid exited before stable" >&2; return 1; }
         sleep 0.5
     done
-    echo "FAIL: $sid did not reach formula-derived steady Budget (target=$target current=$current MemAvailable=$available expected_target=$expected_target)" >&2
+    echo "FAIL: $sid did not reach formula-derived steady Budget within one-Step deadband (target=$target current=$current MemAvailable=$available expected_target=$expected_target target_gap=$target_gap)" >&2
     sed -n '1,280p' "$log" >&2
     return 1
 }
