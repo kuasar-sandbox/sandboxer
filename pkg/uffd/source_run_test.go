@@ -412,6 +412,18 @@ func (snapshotTestDecryptor) DecryptChunkInPlace(_ [32]byte, ciphertext []byte) 
 	return ciphertext, nil
 }
 
+// DecryptChunkTo keeps this cross-repository test fake source-compatible with
+// accelerator #72 while the accelerator and sandboxer changes merge in order.
+// The legacy methods above are removed by the follow-up dependency cleanup
+// after the accelerator canonical format lands.
+func (snapshotTestDecryptor) DecryptChunkTo(_ context.Context, _ [32]byte, ciphertext, dst []byte) error {
+	if len(ciphertext) != len(dst) {
+		return errors.New("snapshot test decryptor: ciphertext and destination sizes differ")
+	}
+	copy(dst, ciphertext)
+	return nil
+}
+
 func (d snapshotTestDecryptor) UnsealKeyTable(_ [32]byte, _, _ []byte) ([]byte, error) {
 	return make([]byte, d.keyBytes), nil
 }
@@ -426,14 +438,20 @@ type testTB interface {
 
 func openSnapshotManifest(t testTB, m *codec.Manifest, chunks map[store.ContentKey][]byte) (fetch.Stream, *snapshotManifestGetter) {
 	t.Helper()
-	data, err := codec.Marshal(m, []byte("sealed-test-keys"))
+	manifest := *m
+	manifest.Entries = append([]codec.ChunkEntry(nil), m.Entries...)
+	for _, entry := range manifest.Entries {
+		if entry.Size > manifest.MaxChunkSize {
+			manifest.MaxChunkSize = entry.Size
+		}
+	}
+	data, err := codec.Marshal(&manifest, []byte("sealed-test-keys"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var manifestKey store.ContentKey
-	manifestKey[0] = 0xa7
+	manifestKey := store.ContentKey(sha256.Sum256(data))
 	nonZero := 0
-	for _, entry := range m.Entries {
+	for _, entry := range manifest.Entries {
 		if !entry.IsZero {
 			nonZero++
 		}
