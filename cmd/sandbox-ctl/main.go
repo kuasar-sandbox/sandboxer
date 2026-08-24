@@ -78,7 +78,8 @@ Usage:
                         [--ping-fatal-threshold N] [--stats-interval <dur>]
 			[--ready-fd N]
   sandbox-ctl snapshot  --sandbox-id <sid> (--output <out_dir> | --upload)
-                        [--resume] [--run-root <dir>] [--timeout <sec>]
+                        [--mode local|bundle] [--resume]
+                        [--run-root <dir>] [--timeout <sec>]
   sandbox-ctl exec      [--sandbox-id <sid>] [--run-root <dir>]
                         [--proxy <http[s]://host[:port]>] [--proxy-header 'Name: value' ...]
                         [--cwd <dir>]
@@ -112,8 +113,10 @@ ready; run itself continues to own the VM and remains blocked.
 
 snapshot pauses a running sandbox and writes a snapshot bundle either
 to a local directory (--output) or to the manifest store (--upload).
-The two are mutually exclusive. By default the sandbox is destroyed
-after a successful snapshot; use --resume to keep it running.
+The two are mutually exclusive. Local output defaults to the tarstream
+format (mode=local); mode=bundle writes one multi-Manifest ZIP64 file.
+--upload cannot be combined with an explicit --mode. By default the sandbox
+is destroyed after a successful snapshot; use --resume to keep it running.
 
 exec runs an ad-hoc command inside a running sandbox as a sibling of
 the user app (it does not replace it). The command + args follow '--'.

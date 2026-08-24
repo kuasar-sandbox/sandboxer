@@ -46,6 +46,10 @@ type snapshotCfgStorage interface {
 	Close() error
 }
 
+type snapshotCfgFileOpener interface {
+	OpenFile(context.Context, string, manifest.Ref) (*artifact.OpenedFile, error)
+}
+
 // SnapshotCfgReader reads exactly one root snapshot bundle. It does not walk
 // FromRefs, apply conductor policy, or cache results across tasks.
 type SnapshotCfgReader struct {
@@ -125,16 +129,44 @@ func (r *SnapshotCfgReader) openRoot(ctx context.Context, rootRef string, opts S
 	codec := r.storage.LocalCodec()
 	required := r.storage.LocalRequired()
 	if strings.HasPrefix(rootRef, "manifest://") || strings.HasPrefix(rootRef, "file://") {
-		stream, size, err := sandbox.OpenDiskStreamAt(ctx, rootRef, r.storage.Fetcher(), opts.RefLocations, opts.RelativeDir, codec, required)
+		ref, err := manifest.ParseRef(rootRef)
 		if err != nil {
 			return nil, 0, err
 		}
-		return stream, size, nil
+		if ref.Scheme == manifest.RefSchemeFile {
+			path, err := opts.RefLocations.ResolveFile(ref, opts.RelativeDir)
+			if err != nil {
+				return nil, 0, err
+			}
+			if opener, ok := r.storage.(snapshotCfgFileOpener); ok {
+				opened, err := opener.OpenFile(ctx, path, ref)
+				if err != nil {
+					return nil, 0, protectArtifactReadError(codec, "open local snapshot", err)
+				}
+				if opened.Size() > math.MaxInt64 {
+					closeErr := opened.Close()
+					return nil, 0, errors.Join(fmt.Errorf("snapshot bundle is too large"), closeErr)
+				}
+				return opened, int64(opened.Size()), nil
+			}
+		}
+		return sandbox.OpenDiskStreamAt(ctx, rootRef, r.storage.Fetcher(), opts.RefLocations, opts.RelativeDir, codec, required)
 	}
 
 	path := rootRef
 	if !filepath.IsAbs(path) && opts.RelativeDir != "" {
 		path = filepath.Join(opts.RelativeDir, path)
+	}
+	if opener, ok := r.storage.(snapshotCfgFileOpener); ok {
+		opened, err := opener.OpenFile(ctx, path, manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path})
+		if err != nil {
+			return nil, 0, protectArtifactReadError(codec, "open local snapshot", err)
+		}
+		if opened.Size() > math.MaxInt64 {
+			_ = opened.Close()
+			return nil, 0, fmt.Errorf("snapshot bundle is too large")
+		}
+		return opened, int64(opened.Size()), nil
 	}
 	options, err := tarReadOptions(manifest.Ref{}, codec, required)
 	if err != nil {

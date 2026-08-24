@@ -112,6 +112,27 @@ func TestSnapshotBoolDefaultsAndRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSnapshotModeDefaultValidationAndRoundTrip(t *testing.T) {
+	if got, err := (Request{}).SnapshotMode(); err != nil || got != SnapshotModeLocal {
+		t.Fatalf("default mode = %q, err=%v", got, err)
+	}
+	want := Request{Type: TypeSnapshotRequest, Mode: SnapshotModeBundle}
+	var buf bytes.Buffer
+	if err := WriteMessage(&buf, &want); err != nil {
+		t.Fatal(err)
+	}
+	var got Request
+	if err := ReadMessage(&buf, &got); err != nil {
+		t.Fatal(err)
+	}
+	if mode, err := got.SnapshotMode(); err != nil || mode != SnapshotModeBundle {
+		t.Fatalf("round-trip mode = %q, err=%v", mode, err)
+	}
+	if _, err := (Request{Mode: "remote"}).SnapshotMode(); err == nil {
+		t.Fatal("legacy remote mode was accepted")
+	}
+}
+
 func TestOldSnapshotRequestOmitsNewBoolFields(t *testing.T) {
 	var buf bytes.Buffer
 	if err := WriteMessage(&buf, &Request{Type: TypeSnapshotRequest}); err != nil {

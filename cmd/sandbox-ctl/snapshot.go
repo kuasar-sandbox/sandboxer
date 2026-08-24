@@ -22,6 +22,7 @@ func snapshotCmd(args []string) int {
 	sandboxID := fs.String("sandbox-id", "", "target sandbox id (required)")
 	outDir := fs.String("output", "", "local output dir; produces <sid>.snapshot + scheme-qualified content-addressed artifacts")
 	upload := fs.Bool("upload", false, "ingest snapshot bundle + overlay into manifest store; stdout = snapshot manifest key")
+	mode := fs.String("mode", ctl.SnapshotModeLocal, "local snapshot format: local|bundle (default local)")
 	resume := fs.Bool("resume", false, "keep sandbox running after snapshot (default: destroy via /vm.shutdown)")
 	dropCaches := fs.Bool("drop-caches", true, "drop guest page, inode, and dentry caches before snapshot")
 	mergeRef := fs.Bool("merge-ref", true, "merge a local parent memory ref into the new memory self layer")
@@ -33,6 +34,20 @@ func snapshotCmd(args []string) int {
 	}
 	if *sandboxID == "" {
 		fmt.Fprintln(os.Stderr, "snapshot: --sandbox-id required")
+		return 2
+	}
+	modeSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "mode" {
+			modeSet = true
+		}
+	})
+	if *mode != ctl.SnapshotModeLocal && *mode != ctl.SnapshotModeBundle {
+		fmt.Fprintf(os.Stderr, "snapshot: --mode %q invalid (want local|bundle)\n", *mode)
+		return 2
+	}
+	if *upload && modeSet {
+		fmt.Fprintln(os.Stderr, "snapshot: --upload and explicit --mode are mutually exclusive")
 		return 2
 	}
 
@@ -90,6 +105,9 @@ func snapshotCmd(args []string) int {
 		ResumeAfter: *resume,
 		DropCaches:  dropCaches,
 		MergeRef:    mergeRef,
+	}
+	if modeSet {
+		req.Mode = *mode
 	}
 	if err := ctl.WriteMessage(c, &req); err != nil {
 		fmt.Fprintf(os.Stderr, "snapshot: send request: %v\n", err)

@@ -16,7 +16,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
-type blockingSecondSnapshotFetcher struct {
+type blockingSnapshotFetcher struct {
 	path    string
 	mu      sync.Mutex
 	opens   int
@@ -24,14 +24,10 @@ type blockingSecondSnapshotFetcher struct {
 	once    sync.Once
 }
 
-func (f *blockingSecondSnapshotFetcher) OpenManifest(ctx context.Context, _ store.ContentKey) (fetch.Stream, error) {
+func (f *blockingSnapshotFetcher) OpenManifest(ctx context.Context, _ store.ContentKey) (fetch.Stream, error) {
 	f.mu.Lock()
 	f.opens++
-	openNumber := f.opens
 	f.mu.Unlock()
-	if openNumber == 1 {
-		return fetch.OpenTarStream(f.path)
-	}
 	f.once.Do(func() { close(f.started) })
 	<-ctx.Done()
 	return nil, ctx.Err()
@@ -43,7 +39,7 @@ func TestRestoreDoesNotPublishLeaseWhileSnapshotOpenIsBlocked(t *testing.T) {
 	snap.Resources.Capacity.CPU = 1
 	snap.Resources.Capacity.Memory = "512MiB"
 	snapshotPath := writePublishSnapshot(t, dir, snap)
-	fetcher := &blockingSecondSnapshotFetcher{path: snapshotPath, started: make(chan struct{})}
+	fetcher := &blockingSnapshotFetcher{path: snapshotPath, started: make(chan struct{})}
 
 	cgroup := filepath.Join(dir, "cgroup")
 	if err := os.Mkdir(cgroup, 0o755); err != nil {
@@ -76,7 +72,7 @@ func TestRestoreDoesNotPublishLeaseWhileSnapshotOpenIsBlocked(t *testing.T) {
 	case <-fetcher.started:
 	case <-time.After(5 * time.Second):
 		cancel()
-		t.Fatal("restore did not reach its second snapshot open")
+		t.Fatal("restore did not reach its snapshot open")
 	}
 	if _, err := os.Stat(resource.LeasePath(socket, sid)); !errors.Is(err, os.ErrNotExist) {
 		cancel()

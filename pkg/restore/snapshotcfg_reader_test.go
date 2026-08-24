@@ -9,6 +9,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 )
@@ -111,6 +113,53 @@ func TestSnapshotCfgReaderManifestAndCloseLifecycle(t *testing.T) {
 	}
 	if storage.closes != 1 {
 		t.Fatalf("storage closes=%d, want 1", storage.closes)
+	}
+}
+
+func TestSnapshotCfgReaderManifestBundleBySymlinkAndSelector(t *testing.T) {
+	dir := t.TempDir()
+	key := [32]byte{0x61, 0x62, 0x63}
+	cfg := &config.ManifestConfig{
+		Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:  manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+	sink, err := snapshot.NewBundleSink(context.Background(), dir, "reader-bundle", cfg,
+		func() ([32]byte, error) { return key, nil }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootRef, path, err := sink.AbsorbBundle(context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x19}, 8192)), nil,
+		bytes.NewReader(testSnapshotZIP(t, testSnapshotCfg)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MANIFEST_KEY", hex.EncodeToString(key[:]))
+	reader := newTestProcessReader(t, cfg)
+
+	document, err := reader.Read(context.Background(), filepath.Join(dir, "reader-bundle.snapshot"), SnapshotCfgReadOptions{})
+	assertTestSnapshotDocument(t, document, err)
+	rootKey, err := manifest.ParseKeyRef(rootRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicit := "file://" + path + "@manifest:" + manifest.HexKey(rootKey)
+	document, err = reader.Read(context.Background(), explicit, SnapshotCfgReadOptions{})
+	assertTestSnapshotDocument(t, document, err)
+}
+
+func TestSnapshotCfgReaderRejectsOversizedExplicitFileBundle(t *testing.T) {
+	stream := &oversizedSnapshotStream{}
+	storage := &oversizedSnapshotStorage{stream: stream}
+	reader := newSnapshotCfgReader(storage)
+	root := "file://root.bundle@manifest:" + strings.Repeat("ab", 32)
+	if _, err := reader.Read(context.Background(), root, SnapshotCfgReadOptions{}); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("Read error = %v, want oversized Bundle rejection", err)
+	}
+	if stream.closes != 1 {
+		t.Fatalf("stream closes = %d, want 1", stream.closes)
 	}
 }
 
@@ -319,6 +368,29 @@ func (s *testSnapshotStorage) Fetcher() fetch.Fetcher      { return s.fetcher }
 func (s *testSnapshotStorage) LocalCodec() tarstream.Codec { return s.codec }
 func (s *testSnapshotStorage) LocalRequired() bool         { return s.require }
 func (s *testSnapshotStorage) Close() error                { s.closes++; return s.err }
+
+type oversizedSnapshotStorage struct {
+	testSnapshotStorage
+	stream *oversizedSnapshotStream
+}
+
+func (s *oversizedSnapshotStorage) OpenFile(context.Context, string, manifest.Ref) (*artifact.OpenedFile, error) {
+	return &artifact.OpenedFile{Stream: s.stream}, nil
+}
+
+type oversizedSnapshotStream struct{ closes int }
+
+func (*oversizedSnapshotStream) Size() uint64 { return uint64(math.MaxInt64) + 1 }
+
+func (*oversizedSnapshotStream) RunAt(uint64, uint64) (sparse.Run, error) {
+	return nil, errors.New("unexpected RunAt")
+}
+
+func (*oversizedSnapshotStream) ReadAt(context.Context, []byte, uint64) (int, error) {
+	return 0, errors.New("unexpected ReadAt")
+}
+
+func (s *oversizedSnapshotStream) Close() error { s.closes++; return nil }
 
 type testSnapshotFetcher struct {
 	path           string

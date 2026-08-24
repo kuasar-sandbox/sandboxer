@@ -24,6 +24,11 @@ type tarLayer struct {
 	io.ReadSeeker
 }
 
+// MergeBaseOpener returns one selected local layer as a fetch.Stream. The
+// caller owns the stream. It lets Take merge tarstream and Manifest Bundle
+// parents through the same sparse interface.
+type MergeBaseOpener func(ctx context.Context, raw string) (fetch.Stream, error)
+
 func (l *tarLayer) Close() error { return l.stream.Close() }
 
 // openMergeBase opens a parent local artifact ref and returns its logical view
@@ -33,15 +38,26 @@ func (l *tarLayer) Close() error { return l.stream.Close() }
 // identity, so logical basenames remain valid without a basename guess. size
 // must not exceed the entry's logical size.
 func openMergeBase(raw string, size int64, codec tarstream.Codec, required bool) (*tarLayer, []sparse.Extent, error) {
+	return openMergeBaseWithOpener(raw, size, codec, required, nil)
+}
+
+func openMergeBaseWithOpener(raw string, size int64, codec tarstream.Codec, required bool, opener MergeBaseOpener) (*tarLayer, []sparse.Extent, error) {
 	if size < 0 {
 		return nil, nil, fmt.Errorf("merge base: negative logical size")
 	}
 	if required && codec == nil {
 		return nil, nil, fmt.Errorf("merge base: required policy has no codec")
 	}
+	if opener != nil {
+		stream, err := opener(context.Background(), raw)
+		if err != nil {
+			return nil, nil, &mergeArtifactError{err: err}
+		}
+		return prepareMergeBase(stream, size)
+	}
 	ref, err := manifest.ParseRef(raw)
-	if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Location != "" || ref.Digest == "" {
-		return nil, nil, fmt.Errorf("merge base: resolved scheme-qualified file ref required")
+	if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Location != "" || ref.Digest == "" || ref.DigestScheme == "manifest" {
+		return nil, nil, fmt.Errorf("merge base: resolved tarstream file identity required")
 	}
 	var options []tarstream.ReadOption
 	if codec != nil {
@@ -56,6 +72,10 @@ func openMergeBase(raw string, size int64, codec tarstream.Codec, required bool)
 	if err != nil {
 		return nil, nil, &mergeArtifactError{err: err}
 	}
+	return prepareMergeBase(stream, size)
+}
+
+func prepareMergeBase(stream fetch.Stream, size int64) (*tarLayer, []sparse.Extent, error) {
 	fail := func(err error) (*tarLayer, []sparse.Extent, error) {
 		_ = stream.Close()
 		return nil, nil, err
@@ -109,7 +129,11 @@ func mergeExpectedIdentity(ref manifest.Ref, codec tarstream.Codec, required boo
 // retaining the artifact. Callers use it before guest quiesce so predictable
 // local-artifact failures cannot leave a guest frozen.
 func ValidateMergeBase(path string, size int64, codec tarstream.Codec, required bool) error {
-	base, _, err := openMergeBase(path, size, codec, required)
+	return ValidateMergeBaseWithOpener(path, size, codec, required, nil)
+}
+
+func ValidateMergeBaseWithOpener(path string, size int64, codec tarstream.Codec, required bool, opener MergeBaseOpener) error {
+	base, _, err := openMergeBaseWithOpener(path, size, codec, required, opener)
 	if err != nil {
 		return err
 	}

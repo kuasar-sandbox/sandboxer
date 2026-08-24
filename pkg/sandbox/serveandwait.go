@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"time"
 
+	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -143,6 +145,9 @@ type VMParams struct {
 
 	SnapCfg       *config.SandboxConfig // ctl.sock SnapshotHandler.Cfg
 	ManifestCfg   *config.ManifestConfig
+	Fetcher       fetch.Fetcher
+	BundleReader  *manifestbundle.Reader
+	RefLocations  config.RefLocations
 	CustomerKeyFn ingest.CustomerKeyFunc
 	LocalCodec    tarstream.Codec
 	LocalRequired bool
@@ -460,6 +465,9 @@ func ServeAndWait(p VMParams) (int, error) {
 	snapHandler := &SnapshotHandler{
 		Cfg:           p.SnapCfg,
 		ManifestCfg:   p.ManifestCfg,
+		Fetcher:       p.Fetcher,
+		BundleReader:  p.BundleReader,
+		RefLocations:  p.RefLocations,
 		CustomerKeyFn: p.CustomerKeyFn,
 		LocalCodec:    p.LocalCodec,
 		LocalRequired: p.LocalRequired,

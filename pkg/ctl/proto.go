@@ -36,8 +36,11 @@ type Request struct {
 	// snapshot_request: OutDir and Upload are mutually exclusive (the
 	// receiving run process enforces); ResumeAfter defaults to false
 	// (zero value = sandbox is destroyed after snapshot).
-	OutDir      string `json:"out_dir,omitempty"`
-	Upload      bool   `json:"upload,omitempty"`
+	OutDir string `json:"out_dir,omitempty"`
+	Upload bool   `json:"upload,omitempty"`
+	// Mode is optional for wire compatibility. Empty means local tarstream;
+	// bundle selects one multi-Manifest ZIP Bundle.
+	Mode        string `json:"mode,omitempty"`
 	ResumeAfter bool   `json:"resume_after,omitempty"`
 	StagingDir  string `json:"staging_dir,omitempty"`
 	// nil preserves the behavior of clients predating these fields.
@@ -83,6 +86,23 @@ func (r Request) DropCachesEnabled() bool {
 // the new self artifact. A missing field means true for wire compatibility.
 func (r Request) MergeRefEnabled() bool {
 	return r.MergeRef == nil || *r.MergeRef
+}
+
+const (
+	SnapshotModeLocal  = "local"
+	SnapshotModeBundle = "bundle"
+)
+
+// SnapshotMode returns the backward-compatible mode or rejects unknown input.
+func (r Request) SnapshotMode() (string, error) {
+	switch r.Mode {
+	case "", SnapshotModeLocal:
+		return SnapshotModeLocal, nil
+	case SnapshotModeBundle:
+		return SnapshotModeBundle, nil
+	default:
+		return "", fmt.Errorf("snapshot mode %q invalid (want local|bundle)", r.Mode)
+	}
 }
 
 const (

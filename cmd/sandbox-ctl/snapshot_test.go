@@ -16,6 +16,7 @@ func TestSnapshotCmdBoolFlagMapping(t *testing.T) {
 		extra         []string
 		wantDropCache bool
 		wantMergeRef  bool
+		wantMode      string
 	}{
 		{name: "defaults", wantDropCache: true, wantMergeRef: true},
 		{
@@ -24,6 +25,7 @@ func TestSnapshotCmdBoolFlagMapping(t *testing.T) {
 			wantDropCache: false,
 			wantMergeRef:  false,
 		},
+		{name: "explicit bundle", extra: []string{"--mode", "bundle"}, wantDropCache: true, wantMergeRef: true, wantMode: ctl.SnapshotModeBundle},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -69,7 +71,16 @@ func TestSnapshotCmdBoolFlagMapping(t *testing.T) {
 			if req.MergeRef == nil || *req.MergeRef != tt.wantMergeRef {
 				t.Fatalf("merge_ref=%v, want %v", req.MergeRef, tt.wantMergeRef)
 			}
+			if req.Mode != tt.wantMode {
+				t.Fatalf("mode=%q, want %q", req.Mode, tt.wantMode)
+			}
 		})
+	}
+}
+
+func TestSnapshotCmdRejectsUploadWithExplicitMode(t *testing.T) {
+	if code := snapshotCmd([]string{"--sandbox-id", "test", "--upload", "--mode", "local"}); code != 2 {
+		t.Fatalf("snapshotCmd exit=%d, want 2", code)
 	}
 }
 
