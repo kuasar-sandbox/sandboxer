@@ -1189,8 +1189,9 @@ allocatable 继续表示调度权重/保证,映射到 `cpu.weight`;本次变更�
 Guest `deflate_on_oom` 是应用 OOM 前的应急泄压,不是 Budget 调整。它可能让
 `CurrentBudget > TargetBudget`;此时控制器把 target/current 视为 unstable,
 禁止 shrink 和降低 `memory.high`。阶段内 node reservation 可以暂时小于
-guest current,但既有 `memory.high` 仍约束 VMM host charge;后续新 report/压力
-grow 再按正常 reservation 流程推进。
+guest current。steady 阶段已写入的有限 `memory.high` 仍约束 VMM host charge;
+cold/restore 的 deferred-high 阶段只有 `memory.max` 是硬上界。后续新 report/压力
+grow 再按正常 reservation 流程建立正式保证。
 
 ## 5. 冷启动数据流
 
@@ -1284,7 +1285,9 @@ T20  vCPU 跑过程中:
        直接装 sandbox-ctl mm PTE,无 uffd 事件
      · sandbox-init 从 /proc/meminfo 读 MemAvailable 及诊断字段,以 epoch/seq
        走短连接发 mem_report(sandbox-init.md §4.3)给 sandbox-local MemoryController
-     · MemoryController 查询同一时刻的 CH target/memory_actual_size,计算 Budget,
+     · MemoryController 在 report 到达后读取一份 CH target/memory_actual_size
+       observation,计算 Budget。guest report 与 CH observation 不宣称原子同刻,
+       shrink 前的稳定性复核负责 fail closed;
        必要时通过 PUT /api/v1/vm.resize 推进 target;guest balloon 驱动 inflate
        → CH 在 memfd 上 fallocate(PUNCH_HOLE) + 在 chVA 上 madvise(DONTNEED)
        → uffd_C 投 EVENT_REMOVE → handler push 到 removeQ → flusher batch+merge
@@ -2236,8 +2239,10 @@ Budget shrink 必须满足:
 3. requested target 与 accepted target 的差距必须严格大于 64MiB;
    差距小于或等于一个 Step 时保留当前 Budget 作为 shrink deadband
 4. 每份 report 最多 inflate 一个 64MiB step
-5. 轮询 `memory_actual_size == TargetBudget` 后才降低 high 和释放 reservation
-6. 收敛前已排队的 report 不得驱动下一步 shrink
+5. 发 resize 前立即重读 `vm.info`;读取失败或 target/current 已因 emergency
+   deflate 等原因变为 unstable 时保留 desired target,本轮不发 resize
+6. resize 后轮询 `memory_actual_size == TargetBudget` 才降低 high 和释放 reservation
+7. 收敛前已排队的 report 不得驱动下一步 shrink
 
 Snapshot capture 与所有 high/resize critical section 共用 lifecycle barrier。
 Resize 和 snapshot 不会并发;不要求 capture 前 target/current 完全相等,因为
@@ -2265,8 +2270,9 @@ deflate_on_oom 触发链路:
 的情况下减小 BalloonCurrent,所以 target/current 会暂时不一致。Sandbox 在该
 阶段跳过 shrink/high reduction;不会把自主 deflate 自动转换成 node admission
 或 reservation 请求。若 PSI/OOM sensor 另行发现压力,才走正常的 grow 请求。
-VMM 仍受该 sandbox 的现有 `memory.high` 和硬上界 `memory.max` 约束。但是自主
-deflate 不是 node grant:在 target/current 不稳定期间,不能声称 node aggregate
+steady 阶段 VMM 仍受该 sandbox 已写入的有限 `memory.high` 和硬上界
+`memory.max` 约束;cold/restore deferred-high 阶段只有 `memory.max` 是硬上界。
+但是自主 deflate 不是 node grant:在 target/current 不稳定期间,不能声称 node aggregate
 严格满足 `reservation >= ObservedBudget`;admission 也不会把这部分暂时可用内存
 当作可调度 headroom。Sandbox 保留现有 reservation、禁止 shrink,等待同一控制
 循环以显式 grow 请求重新建立正式保证。

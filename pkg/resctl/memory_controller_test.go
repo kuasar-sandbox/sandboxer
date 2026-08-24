@@ -1266,6 +1266,34 @@ func TestMemoryControllerReportBarrierRetriesClosedAndACKsIgnoredReports(t *test
 	}
 }
 
+func TestMemoryControllerFullReportQueueFailsClosedAndRecovers(t *testing.T) {
+	m := &MemoryController{
+		logf: func(string, ...any) {}, reportEvents: make(chan proto.MemReport, 1),
+	}
+	m.openReportBarrier()
+	first := proto.MemReport{Epoch: 7, Seq: 1, MemAvailableBytes: 1}
+	dropped := proto.MemReport{Epoch: 7, Seq: 2, MemAvailableBytes: 2}
+	next := proto.MemReport{Epoch: 7, Seq: 3, MemAvailableBytes: 3}
+	if !m.SubmitGuestReport(first) || !m.SubmitGuestReport(dropped) {
+		t.Fatal("open observation barrier did not ACK reports")
+	}
+	if got := <-m.reportEvents; got != first {
+		t.Fatalf("queued report = %+v, want first report %+v", got, first)
+	}
+	m.reportMu.Lock()
+	seq, last := m.reportSeq, m.lastReport
+	m.reportMu.Unlock()
+	if seq != dropped.Seq || last != dropped {
+		t.Fatalf("full queue did not retain conservative sequence fence: seq=%d last=%+v", seq, last)
+	}
+	if !m.SubmitGuestReport(next) {
+		t.Fatal("later periodic report did not recover progress")
+	}
+	if got := <-m.reportEvents; got != next {
+		t.Fatalf("recovery report = %+v, want %+v", got, next)
+	}
+}
+
 func TestMemoryControllerRestoreNormalizesAllSnapshotRelationsBeforeOpeningReports(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	for _, tc := range []struct {

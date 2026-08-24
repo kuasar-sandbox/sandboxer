@@ -8,29 +8,50 @@ import (
 
 func uint64ptr(value uint64) *uint64 { return &value }
 
-func TestTotalSizeMatchesCloudHypervisor(t *testing.T) {
-	config := Config{
-		Size: 4096, HotpluggedSize: uint64ptr(8192),
-		Zones: []Zone{
-			{Size: 16 << 20},
-			{Size: 32 << 20, HotpluggedSize: uint64ptr(64 << 20)},
+func TestTotalSizeMatchesCloudHypervisorMemorySelection(t *testing.T) {
+	zero := uint64(0)
+	tests := []struct {
+		name   string
+		config Config
+		want   uint64
+	}{
+		{
+			name:   "top-level memory",
+			config: Config{Size: 512<<20 + 4096, HotplugSize: &zero, HotpluggedSize: &zero},
+			want:   512<<20 + 4096,
+		},
+		{
+			name: "memory zones",
+			config: Config{Zones: []Zone{
+				{Size: 16 << 20},
+				{Size: 32<<20 + 4096, HotplugSize: &zero, HotpluggedSize: &zero},
+			}},
+			want: 48<<20 + 4096,
 		},
 	}
-	got, err := config.TotalSize()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := uint64(4096 + 8192 + 16<<20 + 32<<20 + 64<<20)
-	if got != want {
-		t.Fatalf("TotalSize()=%d, want %d", got, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.config.TotalSize()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("TotalSize()=%d, want %d", got, tt.want)
+			}
+		})
 	}
 }
 
 func TestTotalSizeRejectsInvalidTotals(t *testing.T) {
 	for _, config := range []Config{
 		{},
-		{Size: math.MaxUint64, Zones: []Zone{{Size: 1}}},
-		{Zones: []Zone{{Size: math.MaxUint64, HotpluggedSize: uint64ptr(1)}}},
+		{Zones: []Zone{}},
+		{Size: 1, Zones: []Zone{{Size: 1}}},
+		{Size: 1, HotplugSize: uint64ptr(1)},
+		{Size: 1, HotpluggedSize: uint64ptr(1)},
+		{Zones: []Zone{{Size: 1, HotplugSize: uint64ptr(1)}}},
+		{Zones: []Zone{{Size: 1, HotpluggedSize: uint64ptr(1)}}},
+		{Zones: []Zone{{Size: math.MaxUint64}, {Size: 1}}},
 	} {
 		if _, err := config.TotalSize(); err == nil {
 			t.Fatalf("TotalSize(%+v) accepted invalid total", config)

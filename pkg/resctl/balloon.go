@@ -189,6 +189,19 @@ func (b *BalloonController) ApplyTarget(ctx context.Context, target uint64) (Bal
 // applyDesiredHeld requires mutationGate to be held. MemoryController uses it
 // to keep memory.high -> resize ordering inside the same snapshot barrier.
 func (b *BalloonController) applyDesiredHeld(ctx context.Context) (BalloonState, error) {
+	return b.applyDesiredHeldMode(ctx, false)
+}
+
+// applyShrinkDesiredHeld performs the final target/current stability check in
+// the same host mutation critical section as an inflate resize. Guest
+// deflate_on_oom is autonomous and can make an earlier observation stale, so a
+// shrink must fail closed when this immediate vm.info is unavailable or
+// unstable. The retained desired target is retried by MemoryController.
+func (b *BalloonController) applyShrinkDesiredHeld(ctx context.Context) (BalloonState, error) {
+	return b.applyDesiredHeldMode(ctx, true)
+}
+
+func (b *BalloonController) applyDesiredHeldMode(ctx context.Context, requireStableBeforeResize bool) (BalloonState, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -209,6 +222,12 @@ func (b *BalloonController) applyDesiredHeld(ctx context.Context) (BalloonState,
 		if state.AcceptedTarget == desired {
 			return state, nil
 		}
+		if requireStableBeforeResize && !state.Stable(b.Capacity) {
+			return state, fmt.Errorf("balloon shrink deferred: accepted target/current=%d/%d are unstable",
+				state.AcceptedTarget, state.BalloonCurrent)
+		}
+	} else if requireStableBeforeResize {
+		return b.State(), fmt.Errorf("balloon shrink deferred: pre-resize vm.info: %w", preErr)
 	}
 
 	resizeErr := b.callResize(ctx, desired)

@@ -355,7 +355,7 @@ virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on];sandbox-local
                  BalloonController 通过 /vm.resize 推 target,并以 vm.info 的
                  memory_actual_size 观察 current(见 `sandboxer/docs/sandbox.md` §9.3);free_page_reporting
                  不启用(广播 mmu_notifier 会饿死 guest vsock kthread)
-virtio-mem     → host-driven 主动 unplug(扩展点)
+virtio-mem     → host-driven 主动 unplug(CH 能力;当前固定 Capacity Budget 模型不启用)
 ```
 
 restore 沿用 `config.json` 中的设备拓扑,不能新增或删除 virtio-net.sandboxer 在

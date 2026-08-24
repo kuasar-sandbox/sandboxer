@@ -177,6 +177,83 @@ func TestBalloonApplyGrowDoesNotWaitForCurrent(t *testing.T) {
 	}
 }
 
+func TestBalloonShrinkRechecksCurrentImmediatelyBeforeResize(t *testing.T) {
+	const capacity = uint64(8 << 30)
+	fake := newFakeCHMemory(t, capacity)
+	fake.configure(func(f *fakeCHMemory) {
+		f.acceptedTarget = 4 << 30
+		f.currentBudget = 5 << 30 // autonomous deflate: current balloon is 3 GiB
+		f.autoConverge = true
+	})
+	b := NewBalloonController(fake.sock, capacity, time.Second, nil)
+	if err := b.SetDesiredTarget(5 << 30); err != nil {
+		t.Fatal(err)
+	}
+	release, err := b.acquireMutation(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = b.applyShrinkDesiredHeld(context.Background())
+	release()
+	if err == nil {
+		t.Fatal("unstable target/current allowed a shrink resize")
+	}
+	if calls := fake.calls(); len(calls) != 0 {
+		t.Fatalf("unstable shrink issued resize calls: %v", calls)
+	}
+	if state := b.State(); state.DesiredTarget != 5<<30 {
+		t.Fatalf("deferred shrink lost its forward target: %+v", state)
+	}
+
+	// Once the old target/current pair converges, the retained target advances
+	// normally without needing another guest report to repeat the intent.
+	fake.configure(func(f *fakeCHMemory) { f.currentBudget = 4 << 30 })
+	release, err = b.acquireMutation(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := b.applyShrinkDesiredHeld(context.Background())
+	release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.AcceptedTarget != 5<<30 || state.CurrentBudget != 3<<30 {
+		t.Fatalf("converged shrink state = %+v", state)
+	}
+	if calls := fake.calls(); !reflect.DeepEqual(calls, []uint64{5 << 30}) {
+		t.Fatalf("converged shrink calls = %v", calls)
+	}
+}
+
+func TestBalloonShrinkRequiresPreResizeObservation(t *testing.T) {
+	const capacity = uint64(8 << 30)
+	fake := newFakeCHMemory(t, capacity)
+	fake.configure(func(f *fakeCHMemory) {
+		f.acceptedTarget = 4 << 30
+		f.currentBudget = 4 << 30
+		f.infoFailures = 1
+	})
+	b := NewBalloonController(fake.sock, capacity, time.Second, nil)
+	if err := b.SeedColdTarget(4 << 30); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SetDesiredTarget(5 << 30); err != nil {
+		t.Fatal(err)
+	}
+	release, err := b.acquireMutation(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = b.applyShrinkDesiredHeld(context.Background())
+	release()
+	if err == nil {
+		t.Fatal("shrink proceeded without a fresh pre-resize observation")
+	}
+	if calls := fake.calls(); len(calls) != 0 {
+		t.Fatalf("unobserved shrink issued resize calls: %v", calls)
+	}
+}
+
 func TestBalloonApplyRetainsDesiredAndRetriesForward(t *testing.T) {
 	const capacity = uint64(8 << 30)
 	fake := newFakeCHMemory(t, capacity)

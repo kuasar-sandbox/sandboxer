@@ -338,8 +338,10 @@ func (m *MemoryController) SubmitGuestReport(report proto.MemReport) bool {
 	select {
 	case m.reportEvents <- report:
 	default:
-		// Dropping a fresh report can only delay shrink. Its sequence remains
-		// consumed so it cannot be replayed later against newer CH state.
+		// A full queue may delay either policy direction until the next periodic
+		// observation or pressure event. Keep the sequence consumed: queued
+		// older reports then fail closed for shrink, and this observation cannot
+		// be replayed later against newer CH state.
 		m.logf("memory: report queue full; dropped epoch=%d seq=%d", report.Epoch, report.Seq)
 	}
 	return true
@@ -812,7 +814,7 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 				release()
 				return setErr
 			}
-			state, err = m.balloon.applyDesiredHeld(ctx)
+			state, err = m.balloon.applyShrinkDesiredHeld(ctx)
 		} else {
 			state = m.syntheticBalloonState()
 			if txn.target != 0 {
@@ -841,8 +843,8 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 	}
 	// Do not lower high or release reservation while a report already accepted
 	// by the observation barrier has not validated (or superseded) this
-	// transaction. A dropped or invalid newer report therefore fails closed
-	// until another valid report makes progress.
+	// transaction. A dropped valid newer report therefore fails closed until
+	// another valid report makes progress. Invalid reports never advance seq.
 	m.reportMu.Lock()
 	latestSeq := m.reportSeq
 	m.reportMu.Unlock()
