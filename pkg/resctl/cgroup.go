@@ -2,13 +2,14 @@ package resctl
 
 import (
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"log"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"strconv"
 	"syscall"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"golang.org/x/sys/unix"
 )
 
@@ -31,11 +32,14 @@ import (
 // external. Empty Path means "no cgroup operations" (no-cgroup mode in
 // docs/sandbox.md §4.1).
 //
-// MemoryMaxBytes / MemoryHighBytes are written verbatim to memory.max /
-// memory.high. The caller computes them from
+// MemoryMaxBytes is written verbatim to memory.max. A zero MemoryHighBytes is
+// the cold/restore deferred sentinel and writes "max" explicitly, so an
+// externally owned cgroup cannot carry a stale throttle into a new VM. A
+// positive value is written verbatim. The local Budget controller later
+// computes memory.high from Budget, guest demand, overhead, and
+// watermark_high.ratio. MemoryMax is
 //
-//	MemoryMaxBytes  = capacity.memory + overhead.memory
-//	MemoryHighBytes = watermark_high.memory   (default allocatable * 0.875)
+//	MemoryMaxBytes = capacity.memory + overhead.memory
 //
 // CPUMaxQuotaUs is the cpu.max quota; period is fixed 100000us. Set to
 //
@@ -117,10 +121,12 @@ func SetupCgroup(cfg CgroupConfig) (*CgroupController, error) {
 	if err := writeCgFile(stablePath, "memory.max", strconv.FormatUint(cfg.MemoryMaxBytes, 10)); err != nil {
 		return fail(fmt.Errorf("cgroup: memory.max: %w", err))
 	}
+	memoryHigh := "max"
 	if cfg.MemoryHighBytes > 0 {
-		if err := writeCgFile(stablePath, "memory.high", strconv.FormatUint(cfg.MemoryHighBytes, 10)); err != nil {
-			return fail(fmt.Errorf("cgroup: memory.high: %w", err))
-		}
+		memoryHigh = strconv.FormatUint(cfg.MemoryHighBytes, 10)
+	}
+	if err := writeCgFile(stablePath, "memory.high", memoryHigh); err != nil {
+		return fail(fmt.Errorf("cgroup: memory.high: %w", err))
 	}
 	// Disable swap so cgroup OOM signals are unambiguous. swap.max may
 	// be unavailable on hosts compiled without the swap controller; that
@@ -196,11 +202,10 @@ func (c *CgroupController) Cleanup() error {
 }
 
 // SetupCgroupForConfig is the convenience entry point used by restore.Run.
-// Derives a CgroupConfig from a config.SandboxConfig and joins, but with
-// MemoryHighBytes zeroed so the boot-transient page-fault burst is not
-// PSI-throttled — Settled/SettledRestore writes memory.high once the
-// transient is over (Issue 4). Returns a zero-value controller (Cleanup
-// no-op) when CgroupPath is unset (no-cgroup mode).
+// It derives the externally owned VMM cgroup limits without joining
+// sandbox-ctl. Deferred memory.high is reset to max until MemoryController has
+// a fresh guest report and CH observation. Returns a zero-value controller
+// (Cleanup no-op) when CgroupPath is unset (no-cgroup mode).
 func SetupCgroupForConfig(cfg *config.SandboxConfig) (*CgroupController, error) {
 	cgCfg, err := BuildCgroupConfig(cfg)
 	if err != nil {
@@ -214,10 +219,11 @@ func SetupCgroupForConfig(cfg *config.SandboxConfig) (*CgroupController, error) 
 // Returns a zero-Path config when CgroupPath is unset (no-cgroup mode); SetupCgroup
 // will then no-op.
 //
-// Memory.max derives from capacity + overhead so guest legitimate use
-// up to allocatable does not cgroup-OOM the CH process. Memory.high is
-// the watermark (default allocatable * 0.875). cpu.max = capacity *
-// 100000us per 100000us period; cpu.weight from allocatable.cpu.
+// Memory.max derives from capacity + overhead. A deferred memory.high is
+// represented by zero here and written as max by SetupCgroup until the local
+// Budget controller has a trusted guest/CH observation.
+// cpu.max = capacity * 100000us per 100000us period; cpu.weight derives from
+// allocatable.cpu.
 func BuildCgroupConfig(cfg *config.SandboxConfig) (CgroupConfig, error) {
 	if cfg.Resources.Control.CgroupPath == "" {
 		return CgroupConfig{}, nil
@@ -230,15 +236,18 @@ func BuildCgroupConfig(cfg *config.SandboxConfig) (CgroupConfig, error) {
 	if err != nil {
 		return CgroupConfig{}, fmt.Errorf("overhead.memory: %w", err)
 	}
-	wm, err := cfg.WatermarkHighBytes()
-	if err != nil {
-		return CgroupConfig{}, fmt.Errorf("watermark_high.memory: %w", err)
+	if _, err := cfg.WatermarkHighRatio(); err != nil {
+		return CgroupConfig{}, fmt.Errorf("watermark_high.ratio: %w", err)
+	}
+	memoryMax, carry := bits.Add64(capMem, overhead, 0)
+	if carry != 0 {
+		return CgroupConfig{}, fmt.Errorf("capacity.memory + overhead.memory overflows uint64")
 	}
 	return CgroupConfig{
 		Path:            cfg.Resources.Control.CgroupPath,
 		FD:              cfg.Resources.Control.CgroupFD,
-		MemoryMaxBytes:  capMem + overhead,
-		MemoryHighBytes: wm,
+		MemoryMaxBytes:  memoryMax,
+		MemoryHighBytes: 0,
 		CPUMaxQuotaUs:   cfg.Resources.Capacity.CPU * 100000,
 		CPUWeight:       cfg.CPUWeight(),
 	}, nil

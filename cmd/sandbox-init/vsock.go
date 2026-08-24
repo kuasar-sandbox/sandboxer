@@ -271,6 +271,16 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 				logf("reverse-channel: restore files injected (epoch=%d, n=%d)", req.Epoch, len(req.Files))
 			}
 		}
+		// Establish a new observation epoch and pause sampling before
+		// restore_ack. This serializes with an in-flight mem_report exchange, so
+		// neither an old-epoch delivery nor a pre-ACK sample can become the first
+		// trusted restore observation.
+		reportEpoch, err := guestMemReports.advanceEpochAndPause()
+		if err != nil {
+			logf("reverse-channel: restore mem_report epoch: %v", err)
+			return false
+		}
+		logf("reverse-channel: restore mem_report epoch=%d", reportEpoch)
 		spec := bridge.protoSpec()
 		resp := &proto.Message{Type: proto.TypeRestoreAck, Epoch: req.Epoch, Stdio: &spec, AppState: proto.AppStateRunning}
 		if err := proto.WriteMessage(c, resp); err != nil {
@@ -286,6 +296,11 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		if err := cgroupThaw(); err != nil {
 			logf("reverse-channel: restore thaw: %v", err)
 		}
+		guestMemReports.resumeEpoch()
+		// Restore, like cold boot, sends the first trustworthy observation
+		// immediately after its lifecycle barrier instead of waiting up to one
+		// periodic interval.
+		go guestMemReports.attempt(readMemInfo, notifyMemReport, logf)
 		return true
 
 	case proto.TypeAttach:
@@ -391,17 +406,15 @@ func notifyAppStarted(pid int) error {
 	return nil
 }
 
-// notifyMemReport dials the host launch UDS and pushes a /proc/meminfo
-// snapshot. Best-effort: errors logged, the next ticker iteration tries
-// again. Used by the host-side balloon controller (replaces
-// virtio-balloon free-page-reporting, see docs/sandbox.md §14).
-func notifyMemReport(memAvailable, memTotal uint64) error {
+// notifyMemReport pushes one sequenced /proc/meminfo observation. The caller
+// retains the same report across a failed exchange and retries it later.
+func notifyMemReport(report proto.MemReport) error {
 	conn, err := dialVsock(proto.VsockHostCID, proto.LaunchPort)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
-	return exchangeMemReport(conn, memAvailable, memTotal, memReportNotifyDeadline)
+	return exchangeMemReport(conn, report, memReportNotifyDeadline)
 }
 
 // exchangeMemReport covers the connected write/ACK exchange. Keeping it
@@ -414,7 +427,7 @@ func exchangeMemReport(conn interface {
 	Write([]byte) (int, error)
 	SetDeadline(time.Time) error
 	Close() error
-}, memAvailable, memTotal uint64, timeout time.Duration) error {
+}, report proto.MemReport, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	timerDone := make(chan struct{})
 	timer := time.AfterFunc(time.Until(deadline), func() {
@@ -435,9 +448,8 @@ func exchangeMemReport(conn interface {
 	}()
 	_ = conn.SetDeadline(deadline)
 	if err := proto.WriteMessage(conn, &proto.Message{
-		Type:              proto.TypeMemReport,
-		MemAvailableBytes: memAvailable,
-		MemTotalBytes:     memTotal,
+		Type:      proto.TypeMemReport,
+		MemReport: &report,
 	}); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}

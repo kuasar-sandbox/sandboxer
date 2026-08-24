@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
@@ -170,10 +171,8 @@ type DiskProvenance struct {
 	OverlayPath  string   // local overlay file path (file:// parent only) for flatten-merge
 }
 
-// ResourcesConfig follows Kubernetes-style capacity / allocatable split:
-// capacity is what the guest sees, allocatable is what the host actually
-// guarantees (≤ capacity). The difference is reclaimed via virtio-balloon
-// and cgroup limits.
+// ResourcesConfig separates immutable VM capacity from the settled guest
+// headroom maintained by the local memory-Budget controller.
 //
 // See docs/sandbox.md §4.1 for the three deployment modes driven by
 // Control.CgroupPath / Control.Controller presence.
@@ -187,8 +186,8 @@ type ResourcesConfig struct {
 	Control ControlConfig `yaml:"control,omitempty"`
 
 	// Overhead, WatermarkHigh, Startup use pointers so we can distinguish
-	// "not set" from "set to zero". They are only valid when the gating
-	// field is set (see ValidateCold).
+	// "not set" from "set to zero". Overhead and WatermarkHigh require a
+	// cgroup; Startup is an independent cold-start headroom in every mode.
 	Overhead      *OverheadConfig      `yaml:"overhead,omitempty"`
 	WatermarkHigh *WatermarkHighConfig `yaml:"watermark_high,omitempty"`
 	Startup       *StartupConfig       `yaml:"startup,omitempty"`
@@ -204,13 +203,12 @@ type AllocatableConfig struct {
 	// clamp(round(CPU * 100), 1, 10000). Without cgroup_path, must equal
 	// capacity.cpu (no fractional CPU without cgroup).
 	CPU float64 `yaml:"cpu"`
-	// Memory is the steady-state floor. Static mode also uses it for CH's
-	// initial balloon size. Dynamic mode may boot from a controller-granted
-	// startup budget and later converge back to this floor.
+	// Memory is settled guest headroom. It is neither a total Budget nor host
+	// VMM RSS. The local controller adds it to its DemandMemory estimate.
 	Memory string `yaml:"memory"`
 	// DeflateOnOOM toggles CH --balloon ,deflate_on_oom=on. Pointer so
-	// nil = use default (true). Only applies when balloon is configured
-	// (allocatable.memory < capacity.memory); otherwise ignored with warn.
+	// nil = use default (true). It applies whenever cold or steady policy
+	// requires a balloon device; otherwise it has no CH device to configure.
 	DeflateOnOOM *bool `yaml:"deflate_on_oom,omitempty"`
 }
 
@@ -238,9 +236,9 @@ type ControlConfig struct {
 	Sensor *SensorConfig `yaml:"sensor,omitempty"`
 }
 
-// SensorConfig configures the pressure sensor that turns cgroup memory
-// pressure into RequestBudget RPCs. Sensor lives in sandbox-ctl; only
-// meaningful in dynamic mode (Controller set).
+// SensorConfig configures the sandbox-local pressure sensor. Its signals feed
+// the same MemoryController grow path in static and dynamic cgroup modes;
+// dynamic mode adds a reservation RPC before the local high/balloon update.
 //
 // Mode selects the signal source:
 //
@@ -269,27 +267,41 @@ type SensorConfig struct {
 	MinIntervalMs int `yaml:"min_interval_ms,omitempty"`
 }
 
-// OverheadConfig adjusts cgroup memory.max above capacity.memory to give
-// CH process internal allocations + sandbox-ctl Go runtime headroom.
-// Without this overhead, memory.max = capacity.memory and CH may be
-// cgroup-OOM-killed under normal operation.
+// OverheadConfig adjusts the VMM cgroup memory.max above capacity.memory for
+// Cloud Hypervisor's host-side allocations. sandbox-ctl is deliberately kept
+// outside this cgroup and does not consume this allowance.
 type OverheadConfig struct {
 	Memory string `yaml:"memory"` // memory.max = capacity.memory + this
 }
 
-// WatermarkHighConfig sets cgroup memory.high — the PSI throttling
-// threshold below memory.max. Default is allocatable.memory * 0.875.
+// WatermarkHighConfig controls how much granted guest headroom remains above
+// cgroup memory.high. Ratio is node-owned policy resolved into sandbox.yaml.
 type WatermarkHighConfig struct {
-	Memory string `yaml:"memory"`
+	Ratio float64 `yaml:"ratio"`
 }
 
-// StartupConfig sets the requested initial allocatable_now during the
-// startup phase (before launch hello / restored). The controller's
-// admission gives max(startup, allocatable, allocatable_at_snapshot) so
-// the actual grant may exceed this when restoring a snapshot whose
-// allocatable_at_snapshot is larger, or when allocatable.memory is. Drops
-// to max(rss, allocatable.memory) after settled. Only meaningful in
-// dynamic mode (controller set).
+// UnmarshalYAML keeps this replaced schema strict even though the historical
+// top-level sandbox loader is permissive for unrelated fields.
+func (c *WatermarkHighConfig) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return errors.New("resources.watermark_high must be a mapping")
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		if node.Content[i].Value != "ratio" {
+			return fmt.Errorf("field %s not found in type config.WatermarkHighConfig", node.Content[i].Value)
+		}
+	}
+	type plain WatermarkHighConfig
+	var decoded plain
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*c = WatermarkHighConfig(decoded)
+	return nil
+}
+
+// StartupConfig sets cold-start headroom before the first trusted report.
+// Restore never uses it. It applies in both static and dynamic modes.
 type StartupConfig struct {
 	Memory string `yaml:"memory"`
 }
@@ -918,8 +930,8 @@ func (c *SandboxConfig) CgroupPath() string {
 }
 
 // OverheadMemoryBytes returns the cgroup memory.max overhead. Only
-// meaningful when CgroupPath is set; default is 32 MiB to give CH +
-// sandbox-ctl headroom and avoid cgroup OOM under normal operation.
+// meaningful when CgroupPath is set; default is 32 MiB for Cloud Hypervisor's
+// host-side allocations and avoids cgroup OOM under normal operation.
 // Returns 0 when CgroupPath is empty (caller should not use).
 func (c *SandboxConfig) OverheadMemoryBytes() (uint64, error) {
 	if c.Resources.Control.CgroupPath == "" {
@@ -931,34 +943,21 @@ func (c *SandboxConfig) OverheadMemoryBytes() (uint64, error) {
 	return util.ParseSize(c.Resources.Overhead.Memory)
 }
 
-// WatermarkHighBytes returns the cgroup memory.high initial value.
-// Only meaningful when CgroupPath is set; default = allocatable.memory * 0.875.
-// Returns 0 when CgroupPath is empty (caller should not use).
-func (c *SandboxConfig) WatermarkHighBytes() (uint64, error) {
-	if c.Resources.Control.CgroupPath == "" {
-		return 0, nil
-	}
+// WatermarkHighRatio returns the fixed-point memory.high ratio. Byte
+// arithmetic never passes through float64.
+func (c *SandboxConfig) WatermarkHighRatio() (uint64, error) {
 	if c.Resources.WatermarkHigh == nil {
-		alloc, err := c.AllocatableMemoryBytes()
-		if err != nil {
-			return 0, err
-		}
-		return uint64(float64(alloc) * 0.875), nil
+		return resource.DefaultWatermarkHighRatio, nil
 	}
-	return util.ParseSize(c.Resources.WatermarkHigh.Memory)
+	return resource.RatioFromFloat(c.Resources.WatermarkHigh.Ratio)
 }
 
-// StartupBytes returns the requested startup-phase allocatable_now.
-// Only meaningful when Controller is set; default = allocatable.memory.
-// Returns allocatable when Controller is empty (caller treats startup
-// as if no elevated request). Note: the admission controller may grant
-// more than this — actual grant = max(this, allocatable, allocatable_at_snapshot).
+// StartupBytes returns cold-start headroom. The default is full Capacity.
+// Restore admission ignores this value and reserves BudgetAtSnapshot instead;
+// callers may still read it to materialize the immutable reservation contract.
 func (c *SandboxConfig) StartupBytes() (uint64, error) {
-	if c.Resources.Control.Controller == "" {
-		return c.AllocatableMemoryBytes()
-	}
 	if c.Resources.Startup == nil {
-		return c.AllocatableMemoryBytes()
+		return c.CapacityMemoryBytes()
 	}
 	return util.ParseSize(c.Resources.Startup.Memory)
 }
@@ -1008,13 +1007,12 @@ func (c *SandboxConfig) DiffSizeBytes() (int64, error) {
 // Resource-control gating rules (see docs/sandbox.md §13):
 //   - Controller requires CgroupPath
 //   - Overhead / WatermarkHigh require CgroupPath
-//   - Startup requires Controller
 //   - allocatable.cpu == capacity.cpu when CgroupPath is empty (no
 //     fractional CPU without cgroup)
 //   - CgroupPath must exist on the host filesystem unless a validated inherited
 //     CgroupFD is authoritative
-//   - Startup.memory ∈ [allocatable.memory, capacity.memory]
-//   - WatermarkHigh.memory ∈ (0, allocatable.memory]
+//   - Allocatable.memory and Startup.memory are independently in (0, Capacity]
+//   - WatermarkHigh.ratio is in (0, 1)
 func (c *SandboxConfig) ValidateCold() error {
 	if err := c.Restore.validate(); err != nil {
 		return err
@@ -1032,6 +1030,9 @@ func (c *SandboxConfig) ValidateCold() error {
 	}
 	if allocMem > capMem {
 		return errors.New("resources.allocatable.memory must be ≤ capacity.memory")
+	}
+	if allocMem == 0 {
+		return errors.New("resources.allocatable.memory must be > 0")
 	}
 	if c.Resources.Allocatable.CPU > float64(c.Resources.Capacity.CPU) {
 		return errors.New("resources.allocatable.cpu must be ≤ capacity.cpu")
@@ -1055,9 +1056,6 @@ func (c *SandboxConfig) ValidateCold() error {
 	}
 	if !cgroupSet && c.Resources.WatermarkHigh != nil {
 		return errors.New("resources.watermark_high requires resources.control.cgroup_path")
-	}
-	if !controllerSet && c.Resources.Startup != nil {
-		return errors.New("resources.startup requires resources.control.controller")
 	}
 	if !cgroupSet && c.Resources.Allocatable.CPU != float64(c.Resources.Capacity.CPU) {
 		return fmt.Errorf("resources.allocatable.cpu must equal capacity.cpu (%d) when cgroup_path is not set; got %g (fractional cpu requires cgroup_path)",
@@ -1106,17 +1104,10 @@ func (c *SandboxConfig) ValidateCold() error {
 		}
 	}
 
-	// WatermarkHigh ∈ (0, allocatable.memory]
+	// WatermarkHigh ratio ∈ (0, 1).
 	if c.Resources.WatermarkHigh != nil {
-		wm, err := util.ParseSize(c.Resources.WatermarkHigh.Memory)
-		if err != nil {
-			return fmt.Errorf("resources.watermark_high.memory: %w", err)
-		}
-		if wm == 0 {
-			return errors.New("resources.watermark_high.memory must be > 0")
-		}
-		if wm > allocMem {
-			return fmt.Errorf("resources.watermark_high.memory (%d) must be ≤ allocatable.memory (%d)", wm, allocMem)
+		if _, err := c.WatermarkHighRatio(); err != nil {
+			return fmt.Errorf("resources.watermark_high.ratio: %w", err)
 		}
 	}
 
@@ -1136,14 +1127,14 @@ func (c *SandboxConfig) ValidateCold() error {
 		}
 	}
 
-	// Startup ∈ [allocatable.memory, capacity.memory]
+	// Startup headroom is independent of settled headroom.
 	if c.Resources.Startup != nil {
 		sb, err := util.ParseSize(c.Resources.Startup.Memory)
 		if err != nil {
 			return fmt.Errorf("resources.startup.memory: %w", err)
 		}
-		if sb < allocMem {
-			return fmt.Errorf("resources.startup.memory (%d) must be ≥ allocatable.memory (%d)", sb, allocMem)
+		if sb == 0 {
+			return errors.New("resources.startup.memory must be > 0")
 		}
 		if sb > capMem {
 			return fmt.Errorf("resources.startup.memory (%d) must be ≤ capacity.memory (%d)", sb, capMem)
@@ -1270,26 +1261,72 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	if err := c.Restore.validate(); err != nil {
 		return err
 	}
+	cgroupSet := c.Resources.Control.CgroupPath != ""
 	if path := c.Resources.Control.CgroupPath; path != "" && !filepath.IsAbs(path) {
 		return fmt.Errorf("resources.control.cgroup_path must be absolute: %q", path)
 	}
-	if c.Resources.Control.Controller != "" && c.Resources.Control.CgroupPath == "" {
+	if c.Resources.Control.Controller != "" && !cgroupSet {
 		return errors.New("resources.control.controller requires resources.control.cgroup_path")
 	}
 	if err := validateControllerSocket(c.Resources.Control.Controller); err != nil {
 		return err
+	}
+	if !cgroupSet && c.Resources.Overhead != nil {
+		return errors.New("resources.overhead requires resources.control.cgroup_path")
+	}
+	if !cgroupSet && c.Resources.WatermarkHigh != nil {
+		return errors.New("resources.watermark_high requires resources.control.cgroup_path")
+	}
+	if c.Resources.Overhead != nil {
+		if _, err := util.ParseSize(c.Resources.Overhead.Memory); err != nil {
+			return fmt.Errorf("resources.overhead.memory: %w", err)
+		}
+	}
+	if c.Resources.WatermarkHigh != nil {
+		if _, err := c.WatermarkHighRatio(); err != nil {
+			return fmt.Errorf("resources.watermark_high.ratio: %w", err)
+		}
 	}
 	if err := c.Network.validate(); err != nil {
 		return err
 	}
 	// Capacity is optional in the host yaml (matched against snapshot.cfg);
 	// if provided it must be well-formed.
+	var capMem uint64
 	if c.Resources.Capacity.CPU != 0 || c.Resources.Capacity.Memory != "" {
 		if c.Resources.Capacity.CPU <= 0 {
 			return errors.New("resources.capacity.cpu must be > 0")
 		}
-		if _, err := c.CapacityMemoryBytes(); err != nil {
+		var err error
+		capMem, err = c.CapacityMemoryBytes()
+		if err != nil {
 			return fmt.Errorf("resources.capacity.memory: %w", err)
+		}
+	}
+	// These fields are host policy, not snapshot state. Restore does not consume
+	// startup headroom, but it remains part of the same strict config schema.
+	if c.Resources.Allocatable.Memory != "" {
+		allocMem, err := util.ParseSize(c.Resources.Allocatable.Memory)
+		if err != nil {
+			return fmt.Errorf("resources.allocatable.memory: %w", err)
+		}
+		if allocMem == 0 {
+			return errors.New("resources.allocatable.memory must be > 0")
+		}
+		if capMem != 0 && allocMem > capMem {
+			return errors.New("resources.allocatable.memory must be ≤ capacity.memory")
+		}
+	}
+	if c.Resources.Startup != nil {
+		startup, err := util.ParseSize(c.Resources.Startup.Memory)
+		if err != nil {
+			return fmt.Errorf("resources.startup.memory: %w", err)
+		}
+		if startup == 0 {
+			return errors.New("resources.startup.memory must be > 0")
+		}
+		if capMem != 0 && startup > capMem {
+			return fmt.Errorf("resources.startup.memory (%d) must be ≤ capacity.memory (%d)", startup, capMem)
 		}
 	}
 	// Reference formats (when provided).

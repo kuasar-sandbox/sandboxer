@@ -9,443 +9,299 @@ import (
 	"net"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/internal/chmemory"
 )
 
-// BalloonController drives the cloud-hypervisor virtio-balloon size via
-// /api/v1/vm.resize, replacing virtio-balloon free-page-reporting.
-//
-// Why not FPR: the guest's FPR work item produces ~30 K UFFD_REMOVE
-// events per second; CH's release_memory_range path then issues
-// madvise(MADV_DONTNEED) on its own mmap, which broadcasts mmu_notifier
-// invalidations into the KVM EPT. The cumulative shootdown traffic
-// starves the guest's vsock kthread (timer interrupts get lost mid-IPI),
-// the OP_REQUEST → OP_RESPONSE handshake never completes, and every
-// host→guest ping deadlines out. The bug is reproducible in ≤ 30 s.
-//
-// The replacement loop:
-//
-//	guest sandbox-init  ──── mem_report (vsock) ───►  BalloonController.Hint
-//	                          MemAvailable                       │
-//	                                                             ▼
-//	                ◄──── PUT /api/v1/vm.resize  ──── reconcile (5 s ticker)
-//
-// Hint takes the latest /proc/meminfo snapshot and recomputes the
-// target balloon size to keep the guest's free buffer near
-// TargetFreeBuffer. SetTarget is also exposed for direct overrides
-// from the resource controller (node-ctl grant/reclaim).
-//
-// Trade-off vs FPR: reclaim latency rises from ~2 s (fixed) to
-// ~5–10 s (one or two reconcile ticks), but mmu_notifier traffic is
-// host-bounded by MaxStep per tick. In practice the guest no longer
-// deadlocks and the host still gets its physical memory back within
-// a sandbox heartbeat.
+// BalloonState keeps the local target intent, Cloud Hypervisor's accepted
+// target, and the guest driver's observed current balloon size separate.
+// A successful vm.resize advances only AcceptedTarget. CurrentBudget and
+// BalloonCurrent advance only from vm.info.memory_actual_size.
+type BalloonState struct {
+	DesiredTarget uint64
+
+	AcceptedTarget      uint64
+	AcceptedTargetKnown bool
+
+	CurrentBudget       uint64
+	BalloonCurrent      uint64
+	BalloonCurrentKnown bool
+}
+
+// Stable reports whether CH's accepted target and the guest driver's current
+// balloon represent the same Budget.
+func (s BalloonState) Stable(capacity uint64) bool {
+	return s.AcceptedTargetKnown && s.BalloonCurrentKnown &&
+		BudgetFromTarget(capacity, s.AcceptedTarget) == s.CurrentBudget
+}
+
+// ObservedBudget is the safe local upper bound across accepted target and
+// current balloon. The boolean is false until both sides have been observed.
+func (s BalloonState) ObservedBudget(capacity uint64) (uint64, bool) {
+	if !s.AcceptedTargetKnown || !s.BalloonCurrentKnown {
+		return 0, false
+	}
+	targetBudget := BudgetFromTarget(capacity, s.AcceptedTarget)
+	if s.CurrentBudget > targetBudget {
+		return s.CurrentBudget, true
+	}
+	return targetBudget, true
+}
+
+type balloonObservation struct {
+	AcceptedTarget uint64
+	CurrentBudget  uint64
+	BalloonCurrent uint64
+}
+
+// BalloonController is the sandbox-local, single writer for Cloud
+// Hypervisor's balloon target. It contains no guest-demand policy and no node
+// reservation logic; those belong to MemoryController.
 type BalloonController struct {
-	// Capacity is the VM's full RAM in bytes. Target is clamped to this.
 	Capacity uint64
+	Logf     func(string, ...any)
 
-	// Interval between reconcile ticks. Default 5 s.
-	Interval time.Duration
-
-	// TargetFreeBuffer is the guest-visible free-memory cushion the
-	// controller tries to maintain. Default max(64 MiB, Capacity/32).
-	// Smaller → more aggressive reclaim; larger → more burst headroom.
-	TargetFreeBuffer uint64
-
-	// MaxStep caps the absolute change applied per Hint, in bytes.
-	// Bounds the per-tick mmu_notifier burst from the inflate path.
-	// Default 256 MiB.
-	MaxStep uint64
-
-	// Slack: ignore Hint-driven changes smaller than this. Default 32 MiB.
-	Slack uint64
-
-	// Logf is the structured logger. Required.
-	Logf func(string, ...any)
-
-	// chSock is the path to CH's HTTP API UDS.
-	chSock string
 	client *http.Client
 
-	target      atomic.Uint64 // desired balloon size in bytes
-	actual      atomic.Uint64 // last successfully applied size
-	reconcileMu sync.Mutex
+	stateMu sync.Mutex
+	state   BalloonState
 
-	// kick is a non-blocking signal channel: SetTarget (and therefore
-	// SetAllocatable, which wraps SetTarget) pokes it on every write.
-	// The reconcile loop responds immediately when the previous reconcile
-	// was ≥ Interval ago, otherwise it drops the kick and lets the next
-	// ticker tick apply the pending target. Cap = 1, drop-on-full.
-	kick chan struct{}
-
-	// lastReconcileAt is the wall time of the most recent successful or
-	// no-op Reconcile, in unix nanos. Used by the loop to decide whether
-	// a kick can fire immediately.
-	lastReconcileAt atomic.Int64
-
-	startOnce sync.Once
-	stopOnce  sync.Once
-	stopCh    chan struct{}
-	doneCh    chan struct{}
+	// apiMu serializes vm.info and vm.resize exchanges. mutationGate extends
+	// serialization across the local high -> resize transaction and is also
+	// held by the snapshot lifecycle barrier.
+	apiMu        sync.Mutex
+	mutationGate chan struct{}
 }
 
-// NewBalloonController constructs a controller targeting the given
-// CH api-socket. capacity must equal the VM's --memory-zone size in
-// bytes. Defaults are filled in when not set by the caller.
-func NewBalloonController(chSock string, capacity uint64, logf func(string, ...any)) *BalloonController {
-	tr := &http.Transport{
-		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-			return net.Dial("unix", chSock)
+// NewBalloonController constructs a controller for one CH API socket.
+// capacity must be the exact byte total of CH's memory zones. A zero timeout
+// leaves request lifetime entirely to ctx.
+func NewBalloonController(chSock string, capacity uint64, timeout time.Duration, logf func(string, ...any)) *BalloonController {
+	dialer := net.Dialer{}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "unix", chSock)
 		},
 	}
-	return &BalloonController{
-		Capacity: capacity,
-		Logf:     logf,
-		chSock:   chSock,
-		client:   &http.Client{Transport: tr, Timeout: 3 * time.Second},
-		kick:     make(chan struct{}, 1),
+	if logf == nil {
+		logf = func(string, ...any) {}
 	}
+	b := &BalloonController{
+		Capacity:     capacity,
+		Logf:         logf,
+		client:       &http.Client{Transport: transport, Timeout: timeout},
+		mutationGate: make(chan struct{}, 1),
+	}
+	b.mutationGate <- struct{}{}
+	return b
 }
 
-func (b *BalloonController) defaults() {
-	if b.Interval <= 0 {
-		b.Interval = 5 * time.Second
+// SeedColdTarget records the exact target encoded on CH's command line. It
+// does not infer BalloonCurrent; the first post-launch vm.info supplies that
+// observation.
+func (b *BalloonController) SeedColdTarget(target uint64) error {
+	if err := ValidateBalloonSize(b.Capacity, target); err != nil {
+		return err
 	}
-	if b.TargetFreeBuffer == 0 {
-		b.TargetFreeBuffer = 64 << 20
-		if min := b.Capacity / 32; b.TargetFreeBuffer < min {
-			b.TargetFreeBuffer = min
+	b.stateMu.Lock()
+	b.state = BalloonState{
+		DesiredTarget: target, AcceptedTarget: target,
+		AcceptedTargetKnown: true,
+	}
+	b.stateMu.Unlock()
+	return nil
+}
+
+// SeedRestoredState records the two balloon values captured in CH snapshot
+// state. It performs no resize; restore normalization is an explicit operation
+// after restore ACK and MUX establishment.
+func (b *BalloonController) SeedRestoredState(snapshotTarget, snapshotCurrent uint64) error {
+	if err := ValidateBalloonSize(b.Capacity, snapshotTarget); err != nil {
+		return fmt.Errorf("snapshot balloon target: %w", err)
+	}
+	if err := ValidateBalloonSize(b.Capacity, snapshotCurrent); err != nil {
+		return fmt.Errorf("snapshot balloon current: %w", err)
+	}
+	currentBudget := BudgetFromTarget(b.Capacity, snapshotCurrent)
+	b.stateMu.Lock()
+	b.state = BalloonState{
+		DesiredTarget:  snapshotTarget,
+		AcceptedTarget: snapshotTarget, AcceptedTargetKnown: true,
+		CurrentBudget: currentBudget, BalloonCurrent: snapshotCurrent,
+		BalloonCurrentKnown: true,
+	}
+	b.stateMu.Unlock()
+	return nil
+}
+
+// State returns one consistent local snapshot.
+func (b *BalloonController) State() BalloonState {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	return b.state
+}
+
+// SetDesiredTarget updates local intent without issuing an HTTP request. A
+// failed apply never rolls this value back; later reconciliation continues
+// toward it.
+func (b *BalloonController) SetDesiredTarget(target uint64) error {
+	if err := ValidateBalloonSize(b.Capacity, target); err != nil {
+		return err
+	}
+	b.stateMu.Lock()
+	b.state.DesiredTarget = target
+	b.stateMu.Unlock()
+	return nil
+}
+
+// Observe refreshes accepted target and current balloon from one vm.info
+// response. Capacity is asserted against CH's exact memory total.
+func (b *BalloonController) Observe(ctx context.Context) (BalloonState, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.apiMu.Lock()
+	defer b.apiMu.Unlock()
+	observation, err := b.readMemoryObservation(ctx)
+	if err != nil {
+		return b.State(), err
+	}
+	return b.commitObservation(observation), nil
+}
+
+// ApplyTarget records target as desired and reconciles CH toward it. It
+// returns after vm.info confirms the accepted target; it deliberately does not
+// wait for memory_actual_size to converge. Failures retain target as desired
+// and never issue a compensating resize to an older value.
+func (b *BalloonController) ApplyTarget(ctx context.Context, target uint64) (BalloonState, error) {
+	if err := b.SetDesiredTarget(target); err != nil {
+		return b.State(), err
+	}
+	release, err := b.acquireMutation(ctx)
+	if err != nil {
+		return b.State(), err
+	}
+	defer release()
+	return b.applyDesiredHeld(ctx)
+}
+
+// applyDesiredHeld requires mutationGate to be held. MemoryController uses it
+// to keep memory.high -> resize ordering inside the same snapshot barrier.
+func (b *BalloonController) applyDesiredHeld(ctx context.Context) (BalloonState, error) {
+	return b.applyDesiredHeldMode(ctx, false)
+}
+
+// applyShrinkDesiredHeld performs the final target/current stability check in
+// the same host mutation critical section as an inflate resize. Guest
+// deflate_on_oom is autonomous and can make an earlier observation stale, so a
+// shrink must fail closed when this immediate vm.info is unavailable or
+// unstable. The retained desired target is retried by MemoryController.
+func (b *BalloonController) applyShrinkDesiredHeld(ctx context.Context) (BalloonState, error) {
+	return b.applyDesiredHeldMode(ctx, true)
+}
+
+func (b *BalloonController) applyDesiredHeldMode(ctx context.Context, requireStableBeforeResize bool) (BalloonState, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.apiMu.Lock()
+	defer b.apiMu.Unlock()
+
+	desired := b.State().DesiredTarget
+	if err := ValidateBalloonSize(b.Capacity, desired); err != nil {
+		return b.State(), err
+	}
+
+	// First observe: an earlier response may have been lost even though CH
+	// accepted the desired target. Confirmation completes that transaction
+	// without another resize.
+	pre, preErr := b.readMemoryObservation(ctx)
+	if preErr == nil {
+		state := b.commitObservation(pre)
+		if state.AcceptedTarget == desired {
+			return state, nil
 		}
+		if requireStableBeforeResize && !state.Stable(b.Capacity) {
+			return state, fmt.Errorf("balloon shrink deferred: accepted target/current=%d/%d are unstable",
+				state.AcceptedTarget, state.BalloonCurrent)
+		}
+	} else if requireStableBeforeResize {
+		return b.State(), fmt.Errorf("balloon shrink deferred: pre-resize vm.info: %w", preErr)
 	}
-	if b.MaxStep == 0 {
-		b.MaxStep = 256 << 20
+
+	resizeErr := b.callResize(ctx, desired)
+	if resizeErr == nil {
+		// HTTP success means CH accepted target, but not that the guest balloon
+		// current converged. Record only the accepted side before confirmation.
+		b.setAcceptedTarget(desired)
 	}
-	if b.Slack == 0 {
-		b.Slack = 32 << 20
+
+	post, postErr := b.readMemoryObservation(ctx)
+	if postErr == nil {
+		state := b.commitObservation(post)
+		if state.AcceptedTarget == desired {
+			if resizeErr != nil {
+				b.Logf("balloon: confirmed target=%d after lost/ambiguous resize response", desired)
+			} else {
+				b.Logf("balloon: CH accepted target=%d", desired)
+			}
+			return state, nil
+		}
+		mismatch := fmt.Errorf("vm.info balloon target=%d, want desired=%d", state.AcceptedTarget, desired)
+		if resizeErr != nil {
+			return state, errors.Join(resizeErr, mismatch)
+		}
+		return state, mismatch
 	}
-	if b.Logf == nil {
-		b.Logf = func(string, ...any) {}
+
+	state := b.State()
+	if resizeErr != nil {
+		if preErr != nil {
+			return state, errors.Join(resizeErr, fmt.Errorf("pre-resize vm.info: %w", preErr), fmt.Errorf("post-resize vm.info: %w", postErr))
+		}
+		return state, errors.Join(resizeErr, fmt.Errorf("post-resize vm.info: %w", postErr))
 	}
+	return state, fmt.Errorf("vm.resize accepted target=%d but vm.info confirmation failed: %w", desired, postErr)
 }
 
-// SetTarget overrides the desired balloon size in bytes. Clamped to
-// Capacity. Pokes the kick channel; the reconcile loop applies the new
-// target immediately if the last reconcile was ≥ Interval ago, otherwise
-// the pending change rides on the next ticker tick.
-//
-// Hint uses this for mem_report-driven feedback. External callers that
-// think in terms of "guest-visible allocatable memory" should prefer
-// SetAllocatable, which derives the balloon target from that.
-func (b *BalloonController) SetTarget(sizeBytes uint64) {
-	if sizeBytes > b.Capacity {
-		sizeBytes = b.Capacity
+// BeginSnapshot blocks new local balloon mutations and waits for an in-flight
+// high/resize critical section to finish. The returned release is idempotent;
+// destroy-snapshot callers may retain it until CH exits.
+func (b *BalloonController) BeginSnapshot(ctx context.Context) (func(), error) {
+	return b.acquireMutation(ctx)
+}
+
+func (b *BalloonController) acquireMutation(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	b.target.Store(sizeBytes)
 	select {
-	case b.kick <- struct{}{}:
-	default: // already pending; drop
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-b.mutationGate:
+		var once sync.Once
+		return func() { once.Do(func() { b.mutationGate <- struct{}{} }) }, nil
 	}
 }
 
-// SetAllocatable sets the balloon target from a guest-visible
-// allocatable-memory budget: target = Capacity − allocBytes, clamped
-// to [0, Capacity]. Used by ControllerHooks at every allocatable-now
-// change (Settled / Heartbeat-grant / Sensor-grant / restore correction)
-// and by lifecycle / restore at construction so the in-memory target
-// matches the value baked into CH's --balloon arg or the snapshot.
-func (b *BalloonController) SetAllocatable(allocBytes uint64) {
-	b.SetTarget(b.targetForAllocatable(allocBytes))
+func (b *BalloonController) setAcceptedTarget(target uint64) {
+	b.stateMu.Lock()
+	b.state.AcceptedTarget = target
+	b.state.AcceptedTargetKnown = true
+	b.stateMu.Unlock()
 }
 
-// ApplyAllocatable synchronously commits an allocatable change to Cloud
-// Hypervisor. ControllerHooks uses it inside the serialized resource session
-// and advances appliedAllocatable only after this returns successfully.
-func (b *BalloonController) ApplyAllocatable(ctx context.Context, allocBytes uint64) error {
-	return b.applyAllocatable(ctx, allocBytes, false)
-}
-
-// ApplyAllocatableEventually keeps a failed target queued for the background
-// reconciler. Static resource mode uses this after restore because there is no
-// controller allocation to report until the local correction succeeds.
-func (b *BalloonController) ApplyAllocatableEventually(ctx context.Context, allocBytes uint64) error {
-	return b.applyAllocatable(ctx, allocBytes, true)
-}
-
-func (b *BalloonController) applyAllocatable(ctx context.Context, allocBytes uint64, retainOnFailure bool) error {
-	b.defaults()
-	b.reconcileMu.Lock()
-	defer b.reconcileMu.Unlock()
-
-	previous := b.target.Load()
-	previousActual := b.actual.Load()
-	target := b.targetForAllocatable(allocBytes)
-	b.target.Store(target)
-	if err := b.applyTargetLocked(ctx, target); err != nil {
-		// Dynamic controller budgets must not remain queued: ControllerHooks
-		// keeps reporting the previous applied allocation, so a later untracked
-		// resize would make StateSync undercount the consumer. Static restore
-		// correction deliberately retains the target for retry. In rollback mode,
-		// preserve a concurrent Hint/SetTarget instead of overwriting it.
-		if !retainOnFailure {
-			committed, resolutionErr := b.resolveAmbiguousResizeLocked(ctx, target, previousActual)
-			if committed {
-				return nil
-			}
-			b.target.CompareAndSwap(target, previous)
-			if resolutionErr != nil {
-				return errors.Join(err, fmt.Errorf("resolve ambiguous balloon resize: %w", resolutionErr))
-			}
-		}
-		return err
-	}
-	return nil
-}
-
-// resolveAmbiguousResizeLocked establishes a known Cloud Hypervisor target
-// after vm.resize returned without a definitive acknowledgement. A successful
-// vm.info observation of target commits the original operation. Otherwise an
-// explicit resize restores the last acknowledged target. It retries while the
-// sandbox lifetime is live: returning an unknown result would let StateSync
-// undercount a grant that CH may already have applied. Caller holds reconcileMu.
-func (b *BalloonController) resolveAmbiguousResizeLocked(ctx context.Context, target, previous uint64) (bool, error) {
-	observed, infoErr := b.readDesiredBalloon(ctx)
-	if infoErr == nil && observed == target {
-		b.actual.Store(target)
-		b.Logf("balloon: confirmed ambiguous resize at %d MiB", target>>20)
-		return true, nil
-	}
-
-	// A non-target vm.info value is not enough to prove rollback: CH's
-	// balloon resize mutates the device target before signalling its config
-	// interrupt, so an HTTP error can leave device state changed while the
-	// published VmConfig still contains the old value. Require an explicitly
-	// acknowledged idempotent resize to the last known target.
-	backoff := 25 * time.Millisecond
-	observationErr := infoErr
-	if infoErr == nil {
-		observationErr = fmt.Errorf("vm.info balloon target=%d, want %d", observed, target)
-	}
-	lastErr := observationErr
-	for {
-		if err := b.callResize(ctx, previous); err == nil {
-			b.actual.Store(previous)
-			b.Logf("balloon: compensated ambiguous resize to %d MiB", previous>>20)
-			return false, nil
-		} else {
-			// Keep diagnostics bounded even if CH is unavailable for hours.
-			lastErr = errors.Join(observationErr, fmt.Errorf("compensating vm.resize: %w", err))
-		}
-		timer := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return false, errors.Join(lastErr, ctx.Err())
-		case <-timer.C:
-		}
-		if backoff < time.Second {
-			backoff *= 2
-			if backoff > time.Second {
-				backoff = time.Second
-			}
-		}
-	}
-}
-
-// SeedAppliedAllocatable initializes the desired and applied balloon target
-// before Start when CH is launched with the same target on its command line.
-// It deliberately does not queue a resize; later SetAllocatable calls retain
-// their normal reconcile behavior.
-func (b *BalloonController) SeedAppliedAllocatable(allocBytes uint64) {
-	target := b.targetForAllocatable(allocBytes)
-	b.target.Store(target)
-	b.actual.Store(target)
-}
-
-// SeedRestoredState initializes the desired effective allocation separately
-// from the target Cloud Hypervisor restored in its balloon device state. They
-// differ when a snapshot captured an in-flight inflate/deflate operation; the
-// first Reconcile must then correct CH to the effective snapshot allocation.
-func (b *BalloonController) SeedRestoredState(allocBytes, restoredTargetBytes uint64) {
-	if restoredTargetBytes > b.Capacity {
-		restoredTargetBytes = b.Capacity
-	}
-	b.target.Store(b.targetForAllocatable(allocBytes))
-	b.actual.Store(restoredTargetBytes)
-}
-
-func (b *BalloonController) targetForAllocatable(allocBytes uint64) uint64 {
-	if b.Capacity > allocBytes {
-		return b.Capacity - allocBytes
-	}
-	return 0
-}
-
-// Hint adjusts the balloon target based on a guest /proc/meminfo
-// sample. The policy keeps the guest's free buffer near TargetFreeBuffer,
-// stepped by at most MaxStep per call to bound mmu_notifier bursts.
-//
-// Math:
-//
-//	delta = memAvailable - TargetFreeBuffer
-//	new_target = clamp(target + delta, 0, Capacity)
-//	|delta| < Slack → no-op (anti-hunting)
-//	|delta| > MaxStep → clamp to ±MaxStep
-//
-// memTotal > Capacity is the only impossible case we reject; the
-// guest's MemTotal is normally a few % below Capacity (kernel +
-// reserved zones).
-//
-// Stale-report guard: the controller may have just inflated the
-// balloon by hundreds of MiB; the guest's MemAvailable lags by one
-// or two ticks because the balloon driver hasn't actually evicted
-// pages yet. If the report claims more free memory than the current
-// balloon target leaves visible, it is stale — skipping it avoids
-// driving the target to Capacity in a feedback runaway.
-func (b *BalloonController) Hint(memAvailable, memTotal uint64) {
-	b.defaults()
-	if memTotal > b.Capacity {
-		b.Logf("balloon: ignoring impossible mem_report total=%d MiB cap=%d MiB",
-			memTotal>>20, b.Capacity>>20)
-		return
-	}
-
-	// Visible memory after the current commitment = Capacity - max(target, actual).
-	// `target` (a SetTarget already published, even if reconcile hasn't
-	// applied it yet) is the authoritative "what guest is being asked to
-	// give up". If memAvailable is wildly larger than that, the guest's
-	// MemTotal hasn't yet reflected our pending inflate — skip the
-	// sample to avoid driving target up further in a feedback runaway.
-	const visibleSlack uint64 = 64 << 20
-	committed := b.actual.Load()
-	if pending := b.target.Load(); pending > committed {
-		committed = pending
-	}
-	if committed > 0 && b.Capacity > committed {
-		visible := b.Capacity - committed
-		if memAvailable > visible+visibleSlack {
-			b.Logf("balloon: stale mem_report avail=%d MiB visible=%d MiB (ignored)",
-				memAvailable>>20, visible>>20)
-			return
-		}
-	}
-
-	delta := int64(memAvailable) - int64(b.TargetFreeBuffer)
-	if abs64(delta) < int64(b.Slack) {
-		return
-	}
-	if delta > int64(b.MaxStep) {
-		delta = int64(b.MaxStep)
-	} else if delta < -int64(b.MaxStep) {
-		delta = -int64(b.MaxStep)
-	}
-
-	curr := b.target.Load()
-	var next uint64
-	if delta >= 0 {
-		next = curr + uint64(delta)
-	} else if uint64(-delta) > curr {
-		next = 0
-	} else {
-		next = curr - uint64(-delta)
-	}
-	b.SetTarget(next)
-}
-
-// Start runs an immediate reconcile (so the post-Settled inflate happens as
-// soon as the controller is engaged), then always starts the retry loop. The
-// initial error is still returned for observability, but a transient CH API
-// failure must not consume startOnce without leaving any retry mechanism.
-func (b *BalloonController) Start(ctx context.Context) error {
-	b.defaults()
-	var err error
-	b.startOnce.Do(func() {
-		b.stopCh = make(chan struct{})
-		b.doneCh = make(chan struct{})
-		if rerr := b.Reconcile(ctx); rerr != nil {
-			err = fmt.Errorf("balloon: initial resize: %w", rerr)
-		}
-		go b.loop(ctx)
-	})
-	return err
-}
-
-// Stop terminates the reconcile loop. Idempotent.
-func (b *BalloonController) Stop() {
-	b.stopOnce.Do(func() {
-		if b.stopCh != nil {
-			close(b.stopCh)
-			<-b.doneCh
-		}
-	})
-}
-
-// CurrentTarget returns the desired balloon size in bytes.
-func (b *BalloonController) CurrentTarget() uint64 { return b.target.Load() }
-
-// CurrentActual returns the last successfully applied size in bytes.
-func (b *BalloonController) CurrentActual() uint64 { return b.actual.Load() }
-
-func (b *BalloonController) loop(ctx context.Context) {
-	defer close(b.doneCh)
-	t := time.NewTicker(b.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-b.stopCh:
-			return
-		case <-t.C:
-			if err := b.Reconcile(ctx); err != nil {
-				b.Logf("balloon: reconcile: %v", err)
-			}
-		case <-b.kick:
-			// Immediate-response path: SetTarget/SetAllocatable poked us.
-			// Honour the Interval rate limit — if the last reconcile is
-			// fresher than Interval, drop this kick and let the next
-			// ticker tick (≤ Interval - elapsed away) catch the pending
-			// target. Reconcile is idempotent (no-op when target==actual),
-			// so a dropped kick can never leave the state divergent.
-			last := time.Unix(0, b.lastReconcileAt.Load())
-			if time.Since(last) < b.Interval {
-				continue
-			}
-			if err := b.Reconcile(ctx); err != nil {
-				b.Logf("balloon: reconcile (kick): %v", err)
-			}
-			// Re-anchor the ticker so the next periodic tick is one
-			// full Interval away from this kick-driven reconcile, not
-			// from the original Ticker start.
-			t.Reset(b.Interval)
-		}
-	}
-}
-
-// Reconcile applies the current target to CH if it differs from the
-// last applied value. Idempotent; safe to call concurrently with
-// SetTarget/Hint.
-func (b *BalloonController) Reconcile(ctx context.Context) error {
-	b.reconcileMu.Lock()
-	defer b.reconcileMu.Unlock()
-	return b.applyTargetLocked(ctx, b.target.Load())
-}
-
-// applyTargetLocked applies exactly target. Caller holds reconcileMu.
-func (b *BalloonController) applyTargetLocked(ctx context.Context, target uint64) error {
-	// Record the attempt time regardless of whether a resize is actually
-	// needed: the kick-rate-limit only cares "did we recently look", not
-	// "did we recently change CH state".
-	defer b.lastReconcileAt.Store(time.Now().UnixNano())
-	if target == b.actual.Load() {
-		return nil
-	}
-	if err := b.callResize(ctx, target); err != nil {
-		return err
-	}
-	b.actual.Store(target)
-	b.Logf("balloon: resized to %d MiB", target>>20)
-	return nil
+func (b *BalloonController) commitObservation(observation balloonObservation) BalloonState {
+	b.stateMu.Lock()
+	b.state.AcceptedTarget = observation.AcceptedTarget
+	b.state.AcceptedTargetKnown = true
+	b.state.CurrentBudget = observation.CurrentBudget
+	b.state.BalloonCurrent = observation.BalloonCurrent
+	b.state.BalloonCurrentKnown = true
+	state := b.state
+	b.stateMu.Unlock()
+	return state
 }
 
 func (b *BalloonController) callResize(ctx context.Context, sizeBytes uint64) error {
@@ -455,8 +311,7 @@ func (b *BalloonController) callResize(ctx context.Context, sizeBytes uint64) er
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
-		"http://ch/api/v1/vm.resize", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://ch/api/v1/vm.resize", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -472,38 +327,62 @@ func (b *BalloonController) callResize(ctx context.Context, sizeBytes uint64) er
 	return nil
 }
 
-func (b *BalloonController) readDesiredBalloon(ctx context.Context) (uint64, error) {
+func (b *BalloonController) readMemoryObservation(ctx context.Context) (balloonObservation, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://ch/api/v1/vm.info", nil)
 	if err != nil {
-		return 0, err
+		return balloonObservation{}, err
 	}
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return 0, err
+		return balloonObservation{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("vm.info: HTTP %d", resp.StatusCode)
+		return balloonObservation{}, fmt.Errorf("vm.info: HTTP %d", resp.StatusCode)
 	}
 	var info struct {
-		Config struct {
+		MemoryActualSize *uint64 `json:"memory_actual_size"`
+		Config           struct {
+			Memory  *chmemory.Config `json:"memory"`
 			Balloon *struct {
-				Size uint64 `json:"size"`
+				Size *uint64 `json:"size"`
 			} `json:"balloon"`
 		} `json:"config"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return 0, fmt.Errorf("vm.info: decode: %w", err)
+		return balloonObservation{}, fmt.Errorf("vm.info: decode: %w", err)
 	}
-	if info.Config.Balloon == nil {
-		return 0, errors.New("vm.info: balloon missing")
+	if info.Config.Memory == nil {
+		return balloonObservation{}, errors.New("vm.info: config.memory missing")
 	}
-	return info.Config.Balloon.Size, nil
-}
-
-func abs64(x int64) int64 {
-	if x < 0 {
-		return -x
+	if info.Config.Balloon == nil || info.Config.Balloon.Size == nil {
+		return balloonObservation{}, errors.New("vm.info: config.balloon.size missing")
 	}
-	return x
+	if info.MemoryActualSize == nil {
+		return balloonObservation{}, errors.New("vm.info: memory_actual_size missing")
+	}
+	capacity, err := info.Config.Memory.TotalSize()
+	if err != nil {
+		return balloonObservation{}, fmt.Errorf("vm.info: config.memory: %w", err)
+	}
+	if capacity != b.Capacity {
+		return balloonObservation{}, fmt.Errorf("vm.info: memory capacity=%d, resolved Capacity=%d", capacity, b.Capacity)
+	}
+	target := *info.Config.Balloon.Size
+	if err := ValidateBalloonSize(capacity, target); err != nil {
+		return balloonObservation{}, fmt.Errorf("vm.info target: %w", err)
+	}
+	currentBudget := *info.MemoryActualSize
+	if currentBudget > capacity {
+		return balloonObservation{}, fmt.Errorf("vm.info: memory_actual_size=%d exceeds Capacity=%d", currentBudget, capacity)
+	}
+	balloonCurrent, _ := saturatingSub(capacity, currentBudget)
+	if err := ValidateBalloonSize(capacity, balloonCurrent); err != nil {
+		return balloonObservation{}, fmt.Errorf("vm.info current: %w", err)
+	}
+	return balloonObservation{
+		AcceptedTarget: target,
+		CurrentBudget:  currentBudget,
+		BalloonCurrent: balloonCurrent,
+	}, nil
 }

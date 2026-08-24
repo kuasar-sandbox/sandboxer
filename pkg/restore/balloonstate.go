@@ -42,9 +42,8 @@ type balloonDeviceConfig struct {
 // targetBytes  = num_pages * 4096       # what sandbox-ctl told CH via /vm.resize
 // currentBytes = actual * 4096          # what guest balloon driver has reported
 //
-// Returns ok=false (with no error) if the bundle predates balloon use or
-// the path is missing. Caller treats this as "no info, fall back to
-// yaml.allocatable as cold-start equivalent". Returns an error only on
+// Returns ok=false (with no error) when no balloon device was captured; that
+// means the snapshot Budget is the full CH Capacity. Returns an error only on
 // malformed JSON.
 func parseBalloonFromState(stateJSON []byte) (targetBytes, currentBytes uint64, ok bool, err error) {
 	var tree chSnapshotTree
@@ -68,13 +67,13 @@ func parseBalloonFromState(stateJSON []byte) (targetBytes, currentBytes uint64, 
 	return targetBytes, currentBytes, true, nil
 }
 
-// deriveAllocatableAtSnapshot computes the runtime memory budget the
-// sandbox held at snapshot time, expressed as bytes.
+// deriveBudgetAtSnapshot computes the safe runtime Budget upper bound captured
+// by CH.
 //
-//	allocatable_at_snapshot = capacity − min(balloon.target, balloon.current)
+//	BudgetAtSnapshot = Capacity - min(BalloonTarget, BalloonCurrent)
 //
 // The min() picks whichever balloon interpretation gives the LARGER
-// allocatable, conservatively preserving guest's effective working set
+// Budget, conservatively preserving guest's effective working set
 // even when balloon target/current are still converging at snapshot time:
 //   - inflating (current < target): pick current → guest still has the
 //     larger memory until driver catches up
@@ -83,7 +82,7 @@ func parseBalloonFromState(stateJSON []byte) (targetBytes, currentBytes uint64, 
 //
 // Returns capacity itself when balloon info is unavailable (ok=false),
 // matching cold-start behaviour.
-func deriveAllocatableAtSnapshot(capacityBytes, target, current uint64, ok bool) uint64 {
+func deriveBudgetAtSnapshot(capacityBytes, target, current uint64, ok bool) uint64 {
 	if !ok {
 		return capacityBytes
 	}
@@ -95,4 +94,27 @@ func deriveAllocatableAtSnapshot(capacityBytes, target, current uint64, ok bool)
 		return 0
 	}
 	return capacityBytes - min
+}
+
+// validateBudgetAtSnapshot protects the existing Admit boundary, where zero
+// means a cold start rather than a restore. A zero restore Budget also cannot
+// satisfy the independently positive settled headroom contract.
+func validateBudgetAtSnapshot(capacity, budget uint64) error {
+	if capacity == 0 {
+		return fmt.Errorf("restore Capacity must be positive")
+	}
+	if budget == 0 || budget > capacity {
+		return fmt.Errorf("restore BudgetAtSnapshot %d is outside (0, %d]", budget, capacity)
+	}
+	return nil
+}
+
+func validateRestoreBalloonControl(capacity, headroom uint64, hasBalloon bool) error {
+	if capacity == 0 || headroom == 0 || headroom > capacity {
+		return fmt.Errorf("restore memory bounds headroom=%d Capacity=%d", headroom, capacity)
+	}
+	if !hasBalloon && headroom < capacity {
+		return fmt.Errorf("restore enables memory balloon control (headroom=%d Capacity=%d) but snapshot has no balloon device", headroom, capacity)
+	}
+	return nil
 }

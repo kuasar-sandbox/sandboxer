@@ -1,6 +1,7 @@
 package resctl
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,17 +54,19 @@ func TestSetupCgroup_PathIsFile(t *testing.T) {
 	}
 }
 
-// TestSetupCgroupForConfig_DefersMemoryHigh verifies the regression fix
-// for Issue 4: the convenience entry point used by restore.Run zeroes
-// MemoryHighBytes so the boot/replay transient page-fault burst is not
-// PSI-throttled. The actual memory.high write is deferred to
-// SettledRestore.
+// TestSetupCgroupForConfig_DefersMemoryHigh verifies that the convenience
+// entry point used by restore.Run explicitly removes any inherited throttle.
+// The first policy value remains deferred until a trusted guest/CH
+// observation.
 func TestSetupCgroupForConfig_DefersMemoryHigh(t *testing.T) {
 	dir := t.TempDir()
-	for _, f := range []string{"memory.max", "memory.swap.max", "cpu.max", "cpu.weight"} {
+	for _, f := range []string{"memory.max", "memory.high", "memory.swap.max", "cpu.max", "cpu.weight"} {
 		if err := os.WriteFile(filepath.Join(dir, f), []byte(""), 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "memory.high"), []byte("123"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	cfg := makeMinimalCfg()
 	cfg.Resources.Control.CgroupPath = dir
@@ -73,16 +76,16 @@ func TestSetupCgroupForConfig_DefersMemoryHigh(t *testing.T) {
 		t.Fatalf("SetupCgroupForConfig: %v", err)
 	}
 	defer cg.Cleanup()
-	// memory.high file must NOT have been created. (We didn't pre-create
-	// it, and SetupCgroup would error if it tried to write a missing file.)
-	if _, err := os.Stat(filepath.Join(dir, "memory.high")); err == nil {
-		t.Error("memory.high was written; SetupCgroupForConfig should defer it")
+	if got, err := os.ReadFile(filepath.Join(dir, "memory.high")); err != nil {
+		t.Fatal(err)
+	} else if string(got) != "max" {
+		t.Fatalf("memory.high = %q, want max while policy is deferred", got)
 	}
 }
 
 func TestCgroupControllerConfiguresAtomicPlacement(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"memory.max", "memory.swap.max", "cpu.max"} {
+	for _, name := range []string{"memory.max", "memory.high", "memory.swap.max", "cpu.max"} {
 		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -150,19 +153,21 @@ func TestCgroupLocalIOStaysPinnedAfterPathReplacement(t *testing.T) {
 	}
 
 	cfg := makeMinimalCfg()
-	hooks := &ControllerHooks{
-		opts: ControllerHookOptions{CgroupPath: cg.LocalPath()},
-		cfg:  cfg,
+	memoryCtl, err := NewMemoryController(MemoryControllerOptions{
+		Config: cfg, CgroupPath: cg.LocalPath(), InitialBudget: 4 << 30,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := hooks.setMemoryHigh(256 << 20); err != nil {
+	if err := memoryCtl.applyMemoryHigh(context.Background(), 256<<20, 0, false); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(moved, "memory.high"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "234881024" {
-		t.Fatalf("pinned memory.high = %q, want 234881024", got)
+	if string(got) != "201326592" {
+		t.Fatalf("pinned memory.high = %q, want 201326592", got)
 	}
 	replacement, err := os.ReadFile(filepath.Join(target, "memory.high"))
 	if err != nil {
@@ -171,7 +176,7 @@ func TestCgroupLocalIOStaysPinnedAfterPathReplacement(t *testing.T) {
 	if string(replacement) != "replacement" {
 		t.Fatalf("replacement memory.high changed to %q", replacement)
 	}
-	if current := readMemoryCurrent(cg.LocalPath()); current != 123 {
+	if current := readHostMemoryChargeBestEffort(cg.LocalPath()); current != 123 {
 		t.Fatalf("pinned memory.current = %d, want 123", current)
 	}
 }
@@ -209,10 +214,9 @@ func TestBuildCgroupConfig_ModeB(t *testing.T) {
 	if got.MemoryMaxBytes != wantMax {
 		t.Errorf("MemoryMaxBytes = %d, want %d", got.MemoryMaxBytes, wantMax)
 	}
-	// memory.high default = allocatable * 0.875
-	wantHigh := uint64(float64(2<<30) * 0.875)
-	if got.MemoryHighBytes != wantHigh {
-		t.Errorf("MemoryHighBytes = %d, want %d", got.MemoryHighBytes, wantHigh)
+	// memory.high stays deferred until a fresh guest/CH observation.
+	if got.MemoryHighBytes != 0 {
+		t.Errorf("MemoryHighBytes = %d, want deferred 0", got.MemoryHighBytes)
 	}
 	// cpu.max = capacity.cpu * 100000us
 	if got.CPUMaxQuotaUs != 2*100000 {

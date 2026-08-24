@@ -28,9 +28,9 @@ type Lease struct {
 	CgroupPath       string   `json:"cgroup_path"`
 	CapacityMemory   uint64   `json:"capacity_memory"`
 	CapacityCPUMilli uint64   `json:"capacity_cpu_milli"`
-	FloorMemory      uint64   `json:"floor_memory"`
+	FloorMemory      uint64   `json:"floor_memory"` // existing inventory name for settled headroom
 	FloorCPUMilli    uint64   `json:"floor_cpu_milli"`
-	StartupMemory    uint64   `json:"startup_memory"`
+	StartupMemory    uint64   `json:"startup_memory"` // configured cold startup headroom, before target alignment
 	ClientFeatures   []string `json:"client_features,omitempty"`
 }
 
@@ -53,8 +53,8 @@ func (l Lease) Validate() error {
 	if l.CapacityMemory == 0 || l.FloorMemory == 0 || l.FloorMemory > l.CapacityMemory {
 		return fmt.Errorf("lease memory bounds are invalid")
 	}
-	if l.StartupMemory < l.FloorMemory || l.StartupMemory > l.CapacityMemory {
-		return fmt.Errorf("lease startup memory is outside floor/capacity")
+	if l.StartupMemory == 0 || l.StartupMemory > l.CapacityMemory {
+		return fmt.Errorf("lease startup memory is outside (0, capacity]")
 	}
 	if l.CapacityCPUMilli == 0 || l.FloorCPUMilli == 0 || l.FloorCPUMilli > l.CapacityCPUMilli {
 		return fmt.Errorf("lease cpu bounds are invalid")

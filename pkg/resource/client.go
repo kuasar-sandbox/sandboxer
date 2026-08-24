@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"time"
 )
@@ -17,8 +16,8 @@ type TransportError struct{ Err error }
 func (e *TransportError) Error() string { return e.Err.Error() }
 func (e *TransportError) Unwrap() error { return e.Err }
 
-// ControllerError is an explicit TypeError response. It is distinct from a
-// broken stream, which matters for StateSync -> legacy Reattach negotiation.
+// ControllerError is an explicit TypeError response, distinct from a broken
+// stream that requires reconnect and StateSync.
 type ControllerError struct{ Message string }
 
 func (e *ControllerError) Error() string { return "controller: " + e.Message }
@@ -28,17 +27,10 @@ func IsTransportError(err error) bool {
 	return errors.As(err, &target)
 }
 
-func IsStateSyncUnsupported(err error) bool {
-	var target *ControllerError
-	return errors.As(err, &target) && strings.Contains(target.Message, "unknown type: "+TypeStateSync)
-}
-
-// Client is sandbox-ctl's RPC interface to the controller. Designed for
-// a single long-lived connection per sandbox. Concurrent calls are
-// serialized by an internal mutex — sandbox-ctl issues at most one
-// outstanding request at a time. Controller-driven allocatable changes
-// (active reclaim / admin grant / admin reclaim) are delivered on the
-// Heartbeat response (NewAllocatable), not via an unsolicited push.
+// Client is sandbox-ctl's RPC interface to the reservation controller.
+// Designed for a single long-lived connection per sandbox. Concurrent calls
+// are serialized by an internal mutex. Heartbeat.NewAllocatable is a
+// consistency echo; it is never a balloon or cgroup command.
 type Client struct {
 	SocketPath string
 
@@ -89,8 +81,7 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// Token returns the reservation token after a successful Admit /
-// Reattach.
+// Token returns the reservation token after Admit or StateSync.
 func (c *Client) Token() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -173,8 +164,10 @@ func (c *Client) roundTripContext(ctx context.Context, req *Message, deadline ti
 	return resp, nil
 }
 
-// AdmitParams collects the inputs to an Admit call. Built directly
-// from sandbox.SandboxConfig at the lifecycle layer.
+// AdmitParams collects the inputs to an Admit call. Built directly from
+// sandbox.SandboxConfig at the lifecycle layer. The existing reservation wire
+// names map FloorMemoryBytes to settled headroom, StartupBudgetMemory to the
+// aligned cold InitialBudget, and AllocatableAtSnapshot to BudgetAtSnapshot.
 type AdmitParams struct {
 	SandboxID             string
 	CapacityMemoryBytes   uint64
@@ -182,7 +175,7 @@ type AdmitParams struct {
 	FloorMemoryBytes      uint64
 	FloorCPU              float64
 	StartupBudgetMemory   uint64
-	AllocatableAtSnapshot uint64 // 0 for cold start
+	AllocatableAtSnapshot uint64 // wire name for BudgetAtSnapshot; 0 for cold
 	CgroupPath            string
 	ClientFeatures        []string
 }
@@ -199,7 +192,7 @@ type AdmitParams struct {
 type AdmitResult struct {
 	Status              string
 	Token               string
-	GrantedInitialAlloc uint64
+	GrantedInitialAlloc uint64 // exact cold InitialBudget or restore BudgetAtSnapshot reservation
 	Reason              string // machine-readable reject code
 	Msg                 string // human-readable detail
 	QueuedForMs         int64
@@ -253,34 +246,10 @@ func (c *Client) AdmitContext(ctx context.Context, p AdmitParams) (*AdmitResult,
 	}, nil
 }
 
-// Reattach binds a fresh connection to an existing reservation
-// (controller restart or transient network drop).
-func (c *Client) Reattach(token string) error {
-	_, err := c.ReattachState(token)
-	return err
-}
-
-// ReattachState is the compatibility path for controllers that predate
-// StateSync. It also returns the old controller's current allocation so the
-// caller can apply it before resuming requests.
-func (c *Client) ReattachState(token string) (uint64, error) {
-	return c.ReattachStateContext(context.Background(), token)
-}
-
-func (c *Client) ReattachStateContext(ctx context.Context, token string) (uint64, error) {
-	resp, err := c.roundTripContext(ctx, &Message{Type: TypeReattach, Token: token}, DeadlineAdmit)
-	if err != nil {
-		return 0, err
-	}
-	if resp.Type != TypeAck {
-		return 0, fmt.Errorf("client: reattach reply %q msg=%q", resp.Type, resp.Msg)
-	}
-	c.mu.Lock()
-	c.token = token
-	c.mu.Unlock()
-	return resp.NewAllocatable, nil
-}
-
+// StateSyncParams reconstructs only the existing node reservation session.
+// AppliedAllocatableMemory is the sandbox's safe absolute reservation baseline;
+// CurrentRSS is host VMM cgroup memory.current diagnostics. Neither field is a
+// guest demand observation or a balloon command.
 type StateSyncParams struct {
 	SandboxID                string
 	AppliedAllocatableMemory uint64
@@ -291,7 +260,7 @@ type StateSyncParams struct {
 
 type StateSyncResult struct {
 	Token          string
-	NewAllocatable uint64
+	NewAllocatable uint64 // echoed/reconciled node reservation
 }
 
 func (c *Client) StateSync(p StateSyncParams) (*StateSyncResult, error) {
@@ -381,18 +350,14 @@ func (c *Client) RequestBudgetContext(ctx context.Context, currentAlloc, request
 	return resp.GrantedDelta, resp.NewAllocatable, resp.CooldownMs, nil
 }
 
-// HeartbeatResult holds the controller's view of the sandbox state at
-// heartbeat time. NewAllocatable is the authoritative allocatable_now —
-// when it differs from the local value, the active reclaimer or an
-// admin command has changed it and the caller must apply (cgroup
-// memory.high + balloon resize).
+// HeartbeatResult holds the controller's reservation echo. A mismatch asks
+// the reservation adapter to StateSync; it never commands local enforcement.
 type HeartbeatResult struct {
 	NewAllocatable uint64
 }
 
-// Heartbeat sends a periodic alive notification with current usage and
-// returns the controller's authoritative allocatable_now for delta-
-// tracking.
+// Heartbeat sends host-charge diagnostics and returns the node's current
+// reservation for consistency checking.
 func (c *Client) Heartbeat(rss, cpuUsec, recentHigh, cpuThrottled uint64) (*HeartbeatResult, error) {
 	return c.HeartbeatContext(context.Background(), rss, cpuUsec, recentHigh, cpuThrottled)
 }
@@ -431,40 +396,6 @@ func (c *Client) AdminDrain(enable bool) error {
 		return fmt.Errorf("client: admin_drain reply %q msg=%q", resp.Type, resp.Msg)
 	}
 	return nil
-}
-
-// AdminGrant force-grants delta bytes of memory to a sandbox identified
-// by sid. Returns the controller's new allocatable_now value.
-func (c *Client) AdminGrant(sid string, delta uint64) (uint64, error) {
-	resp, err := c.roundTrip(&Message{
-		Type:           TypeAdminGrant,
-		SandboxID:      sid,
-		RequestedDelta: delta,
-	}, DeadlineRequestBudget)
-	if err != nil {
-		return 0, err
-	}
-	if resp.Type != TypeAck {
-		return 0, fmt.Errorf("client: admin_grant reply %q msg=%q", resp.Type, resp.Msg)
-	}
-	return resp.NewAllocatable, nil
-}
-
-// AdminReclaim forces a sandbox identified by sid to shrink to target
-// allocatable bytes. Returns the new allocatable.
-func (c *Client) AdminReclaim(sid string, target uint64) (uint64, error) {
-	resp, err := c.roundTrip(&Message{
-		Type:              TypeAdminReclaim,
-		SandboxID:         sid,
-		TargetAllocatable: target,
-	}, DeadlineRequestBudget)
-	if err != nil {
-		return 0, err
-	}
-	if resp.Type != TypeAck {
-		return 0, fmt.Errorf("client: admin_reclaim reply %q msg=%q", resp.Type, resp.Msg)
-	}
-	return resp.NewAllocatable, nil
 }
 
 // AdminStatusResult is the response to AdminStatus.

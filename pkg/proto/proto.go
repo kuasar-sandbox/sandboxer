@@ -383,13 +383,25 @@ type Message struct {
 	// baked into the golden snapshot. nil → no per-instance file injection.
 	Files []FileSpec `json:"files,omitempty"`
 
-	// mem_report: guest → host periodic /proc/meminfo snapshot used by
-	// the host-side balloon controller to drive vm.resize.
-	MemAvailableBytes uint64 `json:"mem_avail_bytes,omitempty"`
-	MemTotalBytes     uint64 `json:"mem_total_bytes,omitempty"`
+	// mem_report: guest → host periodic /proc/meminfo observation. Balloon
+	// current is deliberately absent; the host obtains it from CH vm.info.
+	MemReport *MemReport `json:"mem_report,omitempty"`
 
 	// error: human-readable reason on rejection paths.
 	Msg string `json:"msg,omitempty"`
+}
+
+// MemReport is one sequenced guest observation. MemTotal is diagnostic only;
+// VM Capacity is host-owned and must not be inferred from this report.
+type MemReport struct {
+	Epoch             uint64 `json:"epoch"`
+	Seq               uint64 `json:"seq"`
+	MemTotalBytes     uint64 `json:"mem_total_bytes"`
+	MemAvailableBytes uint64 `json:"mem_available_bytes"`
+	MemFreeBytes      uint64 `json:"mem_free_bytes,omitempty"`
+	CachedBytes       uint64 `json:"cached_bytes,omitempty"`
+	AnonPagesBytes    uint64 `json:"anon_pages_bytes,omitempty"`
+	SReclaimableBytes uint64 `json:"s_reclaimable_bytes,omitempty"`
 }
 
 // DropCachesResult is the guest's best-effort quiesce cache-drop outcome.

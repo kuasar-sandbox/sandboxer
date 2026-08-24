@@ -33,6 +33,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -47,10 +48,10 @@ const (
 	devicePollTimeout  = 10 * time.Second
 	gracefulShutdown   = 10 * time.Second
 
-	// memReportInterval is the period of the /proc/meminfo sampler
-	// that feeds the host-side balloon controller. Matches the
-	// host-side reconcile cadence; at this rate the worst-case
-	// reclaim latency is ~2 × interval.
+	// memReportInterval is the period of the /proc/meminfo sampler that feeds
+	// the sandbox-local Budget controller. Cold boot sends once immediately
+	// after launch; restore advances the epoch before restore_ack, and later
+	// attempts use this same periodic stream.
 	memReportInterval = 5 * time.Second
 
 	// memReportNotifyDeadline is deliberately longer than the generic
@@ -195,10 +196,8 @@ func main() {
 	// the supervisor so exec sessions can register their children.
 	go serveReverseChannel(revFD, supervisor, bridge)
 
-	// Memory reporter: feeds the host-side balloon controller with
-	// /proc/meminfo snapshots so it can drive vm.resize. Replaces
-	// virtio-balloon free-page-reporting (whose mmu_notifier traffic
-	// starves this very vsock listener after ~16 s).
+	// Memory reporter supplies guest demand observations to the host's local
+	// Budget controller. It never reports balloon current.
 	go runMemReporter(memReportInterval)
 
 	phase3Supervise(supervisor, bridge, sigCh)
@@ -827,14 +826,92 @@ func envSliceFromMap(m map[string]string) []string {
 	return out
 }
 
-// runMemReporter samples /proc/meminfo every interval and pushes a
-// mem_report to the host. Best-effort: errors logged, ticker continues.
-// First report fires immediately so the host's BalloonController gets
-// a baseline before its first reconcile tick. After an error streak, the
-// first acknowledged report emits one recovery marker so callers can
-// distinguish a transient timeout from a stalled channel.
+type memReportStream struct {
+	mu       sync.Mutex
+	epoch    uint64
+	seq      uint64
+	pending  *proto.MemReport
+	failures int
+	paused   bool
+}
+
+var guestMemReports = &memReportStream{epoch: 1}
+
+// advanceEpochAndPause serializes behind any in-flight exchange, discards the
+// old epoch's pending observation, and prevents sampling the restored guest
+// until restore_ack + MUX establishment have completed.
+func (s *memReportStream) advanceEpochAndPause() (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.epoch == ^uint64(0) {
+		return 0, errors.New("mem_report epoch exhausted")
+	}
+	s.epoch++
+	s.seq = 0
+	s.pending = nil
+	s.failures = 0
+	s.paused = true
+	return s.epoch, nil
+}
+
+func (s *memReportStream) resumeEpoch() {
+	s.mu.Lock()
+	s.paused = false
+	s.mu.Unlock()
+}
+
+func (s *memReportStream) currentEpoch() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.epoch
+}
+
+// attempt serializes sampling and delivery. A failed notification retains the
+// exact report so the next ticker retries the same epoch/seq instead of
+// permanently wedging an in-progress state (#106).
+func (s *memReportStream) attempt(
+	read func() (proto.MemReport, error),
+	notify func(proto.MemReport) error,
+	logf func(string, ...any),
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.paused {
+		return
+	}
+	if s.pending == nil {
+		report, err := read()
+		if err != nil {
+			logf("mem_report: read /proc/meminfo: %v", err)
+			s.failures++
+			return
+		}
+		if s.seq == ^uint64(0) {
+			logf("mem_report: sequence exhausted for epoch=%d", s.epoch)
+			s.failures++
+			return
+		}
+		s.seq++
+		report.Epoch = s.epoch
+		report.Seq = s.seq
+		s.pending = &report
+	}
+	if err := notify(*s.pending); err != nil {
+		logf("mem_report: %v", err)
+		s.failures++
+		return
+	}
+	s.pending = nil
+	if s.failures > 0 {
+		logf("mem_report: recovered after %d consecutive failures", s.failures)
+		s.failures = 0
+	}
+}
+
+// runMemReporter sends one report immediately after the launch barrier and
+// then on every interval.
 func runMemReporter(interval time.Duration) {
-	push := newMemReportAttempt(readMemInfo, notifyMemReport, logf)
+	push := func() { guestMemReports.attempt(readMemInfo, notifyMemReport, logf) }
 	push()
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -843,73 +920,69 @@ func runMemReporter(interval time.Duration) {
 	}
 }
 
-func newMemReportAttempt(
-	read func() (memAvailable, memTotal uint64, err error),
-	notify func(memAvailable, memTotal uint64) error,
-	logf func(string, ...any),
-) func() {
-	consecutiveFailures := 0
-	return func() {
-		avail, total, err := read()
+// readMemInfo parses the demand and diagnostic fields from /proc/meminfo.
+func readMemInfo() (proto.MemReport, error) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return proto.MemReport{}, err
+	}
+	return parseMemInfo(data)
+}
+
+func parseMemInfo(data []byte) (proto.MemReport, error) {
+	var report proto.MemReport
+	var totalFound, availableFound bool
+	for _, line := range strings.Split(string(data), "\n") {
+		key, _, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		var dst *uint64
+		switch key {
+		case "MemTotal":
+			dst, totalFound = &report.MemTotalBytes, true
+		case "MemAvailable":
+			dst, availableFound = &report.MemAvailableBytes, true
+		case "MemFree":
+			dst = &report.MemFreeBytes
+		case "Cached":
+			dst = &report.CachedBytes
+		case "AnonPages":
+			dst = &report.AnonPagesBytes
+		case "SReclaimable":
+			dst = &report.SReclaimableBytes
+		default:
+			continue
+		}
+		value, err := parseMemInfoBytes(line)
 		if err != nil {
-			logf("mem_report: read /proc/meminfo: %v", err)
-			consecutiveFailures++
-			return
+			return proto.MemReport{}, fmt.Errorf("%s: %w", key, err)
 		}
-		if err := notify(avail, total); err != nil {
-			logf("mem_report: %v", err)
-			consecutiveFailures++
-			return
-		}
-		if consecutiveFailures > 0 {
-			logf("mem_report: recovered after %d consecutive failures", consecutiveFailures)
-			consecutiveFailures = 0
-		}
+		*dst = value
 	}
+	if !totalFound || report.MemTotalBytes == 0 {
+		return proto.MemReport{}, errors.New("MemTotal not found or zero")
+	}
+	if !availableFound {
+		return proto.MemReport{}, errors.New("MemAvailable not found")
+	}
+	return report, nil
 }
 
-// readMemInfo parses /proc/meminfo's MemTotal and MemAvailable in
-// bytes. Linux reports kB; we shift to bytes for the wire protocol.
-func readMemInfo() (memAvailable, memTotal uint64, err error) {
-	f, err := os.Open("/proc/meminfo")
-	if err != nil {
-		return 0, 0, err
-	}
-	defer f.Close()
-	buf := make([]byte, 4096)
-	n, err := f.Read(buf)
-	if err != nil {
-		return 0, 0, err
-	}
-	for _, line := range strings.Split(string(buf[:n]), "\n") {
-		switch {
-		case strings.HasPrefix(line, "MemTotal:"):
-			memTotal = parseMemInfoKB(line) << 10
-		case strings.HasPrefix(line, "MemAvailable:"):
-			memAvailable = parseMemInfoKB(line) << 10
-		}
-		if memTotal != 0 && memAvailable != 0 {
-			break
-		}
-	}
-	if memTotal == 0 {
-		return 0, 0, errors.New("MemTotal not found")
-	}
-	return memAvailable, memTotal, nil
-}
-
-// parseMemInfoKB pulls the kB-scale integer out of a /proc/meminfo
-// line of shape "MemTotal:    8064212 kB". Returns 0 on malformed input.
-func parseMemInfoKB(line string) uint64 {
+// parseMemInfoBytes converts Linux's kB field without overflow.
+func parseMemInfoBytes(line string) (uint64, error) {
 	fields := strings.Fields(line)
-	if len(fields) < 2 {
-		return 0
+	if len(fields) < 3 || fields[2] != "kB" {
+		return 0, fmt.Errorf("malformed meminfo line %q", line)
 	}
 	v, err := strconv.ParseUint(fields[1], 10, 64)
 	if err != nil {
-		return 0
+		return 0, err
 	}
-	return v
+	if v > ^uint64(0)>>10 {
+		return 0, errors.New("meminfo byte conversion overflow")
+	}
+	return v << 10, nil
 }
 
 // initStart is the wall clock at sandbox-init main() entry. Used to

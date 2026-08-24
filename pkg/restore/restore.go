@@ -22,6 +22,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/chmemory"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
@@ -131,20 +132,6 @@ func Run(ctx context.Context, opts Options) (int, error) {
 
 	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl run --restore] "+format, a...) }
 	startUnixNs := time.Now().UnixNano()
-
-	// cgroup join (same semantics as cold-start lifecycle.go). No-cgroup
-	// mode (no cgroup_path) is a no-op. See docs/sandbox.md §4.1.
-	// Initial memory.high uses the configured allocatable; the value gets
-	// bumped after we derive allocatable_at_snapshot from the bundle's
-	// state.json balloon (below).
-	cg, err := resctl.SetupCgroupForConfig(opts.HostCfg)
-	if err != nil {
-		return -1, fmt.Errorf("cgroup: %w", err)
-	}
-	if cg.Active() {
-		logf("cgroup limits set: %s (CH starts in cgroup; sandbox-ctl stays out)", cg.Path)
-	}
-	defer func() { _ = cg.Cleanup() }()
 
 	runDir := filepath.Join(opts.RuntimeRoot, opts.SandboxID)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
@@ -326,45 +313,68 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		diskSocks[i] = filepath.Join(runDir, fmt.Sprintf("blk%d.sock", i))
 	}
 
-	// Derive allocatable_at_snapshot from CH state.json's balloon section
-	// (no separate resource-state.json file — see §13). When the bundle
-	// predates balloon use or balloon was disabled, parseBalloonFromState
-	// returns ok=false and we fall back to yaml.allocatable as if it were
-	// a cold start.
-	snapCap, err := snapCfg.CapacityMemoryBytes()
+	// CH snapshot config is the Capacity authority. sandbox.cfg must describe
+	// the same exact byte domain, but it is not used to infer CH total size.
+	snapCap, err := chmemory.CapacityFromVMConfig(entries["config.json"])
 	if err != nil {
-		return -1, fmt.Errorf("snap sandbox.cfg capacity: %w", err)
+		return -1, fmt.Errorf("snapshot CH capacity: %w", err)
+	}
+	declaredCap, err := snapCfg.CapacityMemoryBytes()
+	if err != nil {
+		return -1, fmt.Errorf("snapshot sandbox.cfg capacity: %w", err)
+	}
+	if declaredCap != snapCap {
+		return -1, fmt.Errorf("snapshot Capacity mismatch: CH memory zones=%d sandbox.cfg=%d", snapCap, declaredCap)
 	}
 	balTarget, balCurrent, balOk, err := parseBalloonFromState(entries["state.json"])
 	if err != nil {
 		return -1, fmt.Errorf("parse balloon from state.json: %w", err)
 	}
-	allocAtSnap := deriveAllocatableAtSnapshot(snapCap, balTarget, balCurrent, balOk)
-
-	// BalloonController, sole writer of /vm.resize. CH restores num_pages
-	// (balTarget), while the effective allocation uses min(target,current).
-	// Seed those separately so an in-flight balloon operation is reconciled
-	// immediately after resume. Subsequent SettledRestore decides whether a
-	// controller/static correction is also needed (initialAlloc != allocAtSnap).
-	var balloonCtl *resctl.BalloonController
 	if balOk {
-		balloonCtl = resctl.NewBalloonController(chSock, snapCap, logf)
-		balloonCtl.SeedRestoredState(allocAtSnap, balTarget)
+		if err := resctl.ValidateBalloonSize(snapCap, balTarget); err != nil {
+			return -1, fmt.Errorf("snapshot balloon target: %w", err)
+		}
+		if err := resctl.ValidateBalloonSize(snapCap, balCurrent); err != nil {
+			return -1, fmt.Errorf("snapshot balloon current: %w", err)
+		}
 	}
-
-	yamlAlloc, err := opts.HostCfg.AllocatableMemoryBytes()
+	settledHeadroom, err := snapCfg.AllocatableMemoryBytes()
 	if err != nil {
+		return -1, fmt.Errorf("restore settled headroom: %w", err)
+	}
+	if err := validateRestoreBalloonControl(snapCap, settledHeadroom, balOk); err != nil {
 		return -1, err
 	}
-
-	// Static mode: take max(yaml, snapshot allocatable). When the snapshot
-	// was captured under a controller (dynamic mode) at a burst-elevated
-	// allocatable, restoring under static mode (A/B) preserves that
-	// elevated working set rather than throttling the guest.
-	initialAlloc := yamlAlloc
-	if allocAtSnap > initialAlloc {
-		initialAlloc = allocAtSnap
+	budgetAtSnapshot := deriveBudgetAtSnapshot(snapCap, balTarget, balCurrent, balOk)
+	if err := validateBudgetAtSnapshot(snapCap, budgetAtSnapshot); err != nil {
+		return -1, err
 	}
+	safeTarget := uint64(0)
+	if balOk {
+		safeTarget = min(balTarget, balCurrent)
+	}
+
+	// Preserve both snapshot sides. SafeTarget normalization is deliberately
+	// deferred until restore ACK and MUX establishment.
+	var balloonCtl *resctl.BalloonController
+	if balOk {
+		balloonCtl = resctl.NewBalloonController(chSock, snapCap, snapCfg.CHApiDeadline(), logf)
+		if err := balloonCtl.SeedRestoredState(balTarget, balCurrent); err != nil {
+			return -1, err
+		}
+	}
+
+	// Cgroup setup must use the resolved snapshot Capacity, not a host-only
+	// preflight value. memory.high remains max until the first trusted report.
+	cg, err := resctl.SetupCgroupForConfig(&snapCfg)
+	if err != nil {
+		return -1, fmt.Errorf("cgroup: %w", err)
+	}
+	if cg.Active() {
+		logf("cgroup limits set: %s (CH starts in cgroup; sandbox-ctl stays out)", cg.Path)
+	}
+	defer func() { _ = cg.Cleanup() }()
+
 	// Publish the immutable lifecycle lease only when every snapshot field
 	// needed by Admit is available. A stalled manifest fetch must not appear
 	// to restart inventory as a live, full-capacity sandbox that cannot yet
@@ -375,30 +385,26 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		SandboxID:  opts.SandboxID,
 		Context:    sandbox.ControllerWorkContext(ctx),
 		Logf:       logf,
-		Balloon:    balloonCtl,
-	}, opts.HostCfg)
+	}, &snapCfg)
 	if err != nil {
 		return -1, fmt.Errorf("controller dial: %w", err)
 	}
 	defer hooks.Release("normal")
-	if hooks.Enabled() {
-		// The restored balloon already enforces allocAtSnap. Seed that actual
-		// state before Admit so a concurrent reconnect never reports the new
-		// controller's grant until the post-resume correction has succeeded.
-		hooks.SetRestoreAppliedAllocatable(allocAtSnap)
-		// Dynamic mode: controller decides. Floor sent = yaml.allocatable
-		// (controller's 2-tier fallback uses it if headroom can't fit
-		// allocAtSnap).
-		granted, err := hooks.Admit(opts.SandboxID, allocAtSnap)
-		if err != nil {
-			return -1, fmt.Errorf("controller admit: %w", err)
-		}
-		initialAlloc = granted
-		logf("controller admit ok, restored allocatable=%d (snapshot allocatable=%d, balloon target/current=%d/%d)",
-			granted, allocAtSnap, balTarget, balCurrent)
-	} else if allocAtSnap > yamlAlloc {
-		logf("static mode: bumping initial allocatable from yaml=%d to snapshot allocatable=%d (balloon target/current=%d/%d)",
-			yamlAlloc, allocAtSnap, balTarget, balCurrent)
+	initialBudget, err := hooks.Admit(opts.SandboxID, budgetAtSnapshot)
+	if err != nil {
+		return -1, fmt.Errorf("controller admit: %w", err)
+	}
+	if initialBudget != budgetAtSnapshot {
+		return -1, fmt.Errorf("restore initial Budget=%d, require BudgetAtSnapshot=%d", initialBudget, budgetAtSnapshot)
+	}
+	logf("restore BudgetAtSnapshot reserved=%d (balloon target/current=%d/%d)",
+		budgetAtSnapshot, balTarget, balCurrent)
+	memoryCtl, err := resctl.NewMemoryController(resctl.MemoryControllerOptions{
+		Config: &snapCfg, CgroupPath: cg.LocalPath(), Balloon: balloonCtl,
+		Reservation: hooks, InitialBudget: initialBudget, Logf: logf,
+	})
+	if err != nil {
+		return -1, fmt.Errorf("memory controller: %w", err)
 	}
 	// state.json restored verbatim (vCPU regs, virtio queue indices —
 	// nothing path-dependent).
@@ -421,13 +427,10 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, err
 	}
 
-	// Memory capacity → memfd size (the memfd itself is owned by
-	// sandbox.ServeAndWait). The uffd SnapshotSource is the only
-	// restore-specific input to the shared uffd handler: Sparse (file)
-	// or Manifest (chunk-granular via cache-ctl) instead of ZeroSource.
-	capBytes, err := snapCfg.CapacityMemoryBytes()
-	if err != nil {
-		return -1, err
+	// The CH-authoritative Capacity also sizes the memfd and UFFD source.
+	capBytes := snapCap
+	if capBytes > uint64(^uint(0)>>1) {
+		return -1, fmt.Errorf("restore Capacity %d exceeds host addressable memory size", capBytes)
 	}
 
 	// Build the layered memory source: [self bundle] ++ from_refs (§3.5). A
@@ -535,7 +538,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// placeholder launch spec (the guest does NOT re-hello after a
 	// restore, so WireLaunchMUX=false — the stdio MUX is re-established
 	// by PostSpawn over the reverse channel), and a settle protocol of
-	// waitAPI → /vm.resume → restore{epoch} → SettledRestore.
+	// waitAPI → /vm.resume → restore{epoch} → local restore normalization.
 	return sandbox.ServeAndWait(sandbox.VMParams{
 		Ctx:                ctx,
 		SandboxID:          opts.SandboxID,
@@ -556,8 +559,8 @@ func Run(ctx context.Context, opts Options) (int, error) {
 
 		LaunchSpec:    &proto.LaunchSpec{},
 		WireLaunchMUX: false,
-		Balloon:       balloonCtl,
 		Hooks:         hooks,
+		Memory:        memoryCtl,
 
 		TapFile:   tapFile, // nil in tap-name/no-network modes; non-nil tapfd is inherited at fd 4
 		NetMAC:    netMAC,
@@ -629,26 +632,25 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			pc.Logf("restore notify acked in %dµs (stdio MUX re-established: tty=%v); starting ping ticker",
 				time.Since(tRestore).Microseconds(), muxSpec.TTY)
 			pc.Pinger.Start(pc.Ctx)
-			// Balloon reconcile is a no-op only when CH's restored target already
-			// matches the effective allocation; an in-flight snapshot is corrected.
-			if pc.Balloon != nil {
-				if err := pc.Balloon.Start(pc.Ctx); err != nil {
-					pc.Logf("balloon: start: %v", err)
-				}
-			}
-			// Restore-path settled trigger (docs/sandbox.md §10.1):
-			// restore_ack is the controller's equivalent of cold-start
-			// hello. Writes memory.high (deferred from SetupCgroup —
-			// Issue 4) using allocatable_now; corrects balloon only when
-			// initialAlloc != allocAtSnap.
+			// Settled is only the node reservation lifecycle fact. Publish it as
+			// soon as ACK + MUX establishes the restored sandbox; it must not be
+			// delayed by, or made conditional on, sandbox-local CH normalization.
 			if pc.Hooks != nil {
-				if err := pc.Hooks.SettledRestore(allocAtSnap, initialAlloc); err != nil {
-					pc.Logf("settled-restore: %v (continuing)", err)
+				if err := pc.Hooks.Settled(); err != nil {
+					pc.Logf("settled: %v (continuing)", err)
 				}
 				if pc.Hooks.Enabled() {
 					pc.Hooks.StartHeartbeat(pc.Ctx, 5*time.Second)
-					pc.Hooks.StartSensor(pc.Ctx, 64<<20)
 				}
+			}
+			// ACK + MUX is the local safety boundary. SafeTarget normalization
+			// is separate from steady policy and reports remain closed until it
+			// is confirmed. Failure is retained for forward retry.
+			if pc.Memory != nil {
+				if err := pc.Memory.StartRestore(pc.Ctx, safeTarget); err != nil {
+					pc.Logf("restore memory normalization: %v (retrying)", err)
+				}
+				pc.Memory.StartSensor(pc.Ctx)
 			}
 			return nil
 		},

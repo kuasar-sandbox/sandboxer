@@ -2,23 +2,22 @@ package sandbox
 
 import (
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"strings"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 )
 
 // CHCommand assembles the cloud-hypervisor argv for a cold-start sandbox using
-// the static allocatable value from sandbox.yaml.
+// the configured startup headroom.
 func CHCommand(cfg *config.SandboxConfig, disks []DiskArg, chSock, vsockSock, kernelPath, runtimePath, uffdSock, consoleArg string, tapFDNum int, netMAC string) ([]string, error) {
-	return CHCommandWithInitialAllocatable(cfg, 0, disks, chSock, vsockSock, kernelPath, runtimePath, uffdSock, consoleArg, tapFDNum, netMAC)
+	return CHCommandWithInitialBudget(cfg, 0, disks, chSock, vsockSock, kernelPath, runtimePath, uffdSock, consoleArg, tapFDNum, netMAC)
 }
 
-// CHCommandWithInitialAllocatable assembles the cloud-hypervisor argv for a
-// cold-start sandbox and lets the caller override the guest-visible initial
-// allocatable memory. This is used by dynamic resource control: Admit can grant
-// a startup budget larger than the steady-state floor, and CH must boot with a
-// balloon size derived from that grant rather than from the floor.
+// CHCommandWithInitialBudget assembles the cloud-hypervisor argv for a cold
+// sandbox using the exact initial Budget already admitted by the reservation
+// adapter (or locally resolved in static mode).
 //
 // vsockSock is the host-side base UDS path; CH proxies guest CID 2 vsock
 // traffic to "<vsockSock>_<port>" entries. sandbox-ctl listens on the
@@ -26,11 +25,10 @@ func CHCommand(cfg *config.SandboxConfig, disks []DiskArg, chSock, vsockSock, ke
 //
 // Memory sizing: --memory-zone size= is the capacity, with shared=on so
 // vhost-user backends in the same process can mmap the memfd CH creates.
-// Balloon size = capacity - initialAllocatable, releasing the difference back
-// to host at boot. free_page_reporting stays OFF (its mmu_notifier traffic
-// starves the guest vsock kthread — see balloon.go); runtime adjustments come
-// from the host resctl.BalloonController via /api/v1/vm.resize on mem_report
-// feedback.
+// Balloon size is the aligned target represented by InitialBudget.
+// free_page_reporting stays OFF (its mmu_notifier traffic starves the guest
+// vsock kthread — see resctl/balloon.go); the sandbox-local MemoryController
+// combines guest reports with CH target/current observations before resize.
 //
 // uffdSock is the path of the va_report UDS server (cloud-hypervisor.md
 // §3.3). Patched CH connects to it during create_ram_region.
@@ -46,23 +44,31 @@ func CHCommand(cfg *config.SandboxConfig, disks []DiskArg, chSock, vsockSock, ke
 // off` — no 8250 UART; cmdline pins `console=hvc0`. The application's
 // stdin/stdout/stderr do NOT travel via the console — they go over the
 // vsock stdio MUX (pkg/mux). See docs/sandbox.md §5.2.
-func CHCommandWithInitialAllocatable(cfg *config.SandboxConfig, initialAllocBytes uint64, disks []DiskArg, chSock, vsockSock, kernelPath, runtimePath, uffdSock, consoleArg string, tapFDNum int, netMAC string) ([]string, error) {
+func CHCommandWithInitialBudget(cfg *config.SandboxConfig, initialBudget uint64, disks []DiskArg, chSock, vsockSock, kernelPath, runtimePath, uffdSock, consoleArg string, tapFDNum int, netMAC string) ([]string, error) {
 	capBytes, err := cfg.CapacityMemoryBytes()
 	if err != nil {
 		return nil, err
 	}
-	allocBytes, err := cfg.AllocatableMemoryBytes()
+	headroom, err := cfg.AllocatableMemoryBytes()
 	if err != nil {
 		return nil, err
 	}
-	if initialAllocBytes == 0 {
-		initialAllocBytes = allocBytes
+	if initialBudget == 0 {
+		startup, err := cfg.StartupBytes()
+		if err != nil {
+			return nil, err
+		}
+		initialBudget = resctl.AlignedBudget(capBytes, startup)
 	}
-	if initialAllocBytes < allocBytes {
-		initialAllocBytes = allocBytes
+	if initialBudget == 0 || initialBudget > capBytes {
+		return nil, fmt.Errorf("initial memory Budget %d is outside (0, %d]", initialBudget, capBytes)
 	}
-	if initialAllocBytes > capBytes {
-		initialAllocBytes = capBytes
+	initialTarget := resctl.TargetForBudget(capBytes, initialBudget)
+	if represented := resctl.BudgetFromTarget(capBytes, initialTarget); represented != initialBudget {
+		return nil, fmt.Errorf("initial memory Budget %d is not target-aligned; represented Budget is %d", initialBudget, represented)
+	}
+	if err := resctl.ValidateBalloonSize(capBytes, initialTarget); err != nil {
+		return nil, fmt.Errorf("initial balloon target: %w", err)
 	}
 
 	// --memory-zone replaces --memory under the unified-memfd model:
@@ -71,8 +77,8 @@ func CHCommandWithInitialAllocatable(cfg *config.SandboxConfig, initialAllocByte
 	// creates its own uffd in create_ram_region (mm-bound to CH so
 	// faults route correctly) and hands the fd back via SCM_RIGHTS.
 	memZone := fmt.Sprintf(
-		"id=ram0,size=%dM,shared=on,fd=3,uffd_socket=%s",
-		capBytes>>20, uffdSock)
+		"id=ram0,size=%d,shared=on,fd=3,uffd_socket=%s",
+		capBytes, uffdSock)
 
 	args := []string{
 		"--api-socket", chSock,
@@ -103,16 +109,18 @@ func CHCommandWithInitialAllocatable(cfg *config.SandboxConfig, initialAllocByte
 		}
 	}
 
-	if initialAllocBytes < capBytes {
-		// size = capacity − initialAllocatable at boot: static mode uses
-		// the floor allocatable; dynamic mode may use the controller-granted
-		// startup budget. The host resctl.BalloonController seeds its
-		// in-memory target to the same value before CH starts.
+	memoryControlEnabled := headroom < capBytes || initialTarget > 0
+	if memoryControlEnabled {
+		if err := resctl.ValidateBalloonSize(capBytes, resctl.TargetForBudget(capBytes, headroom)); err != nil {
+			return nil, fmt.Errorf("settled balloon target range: %w", err)
+		}
+		// Keep the device present even when the initial target is zero: the
+		// local steady controller will need it once a trusted report arrives.
 		//
 		// free_page_reporting is intentionally OFF — its mmu_notifier
 		// traffic starves the guest vsock kthread (see balloon.go
 		// rationale).
-		balloonOpts := fmt.Sprintf("size=%d", capBytes-initialAllocBytes)
+		balloonOpts := fmt.Sprintf("size=%d", initialTarget)
 		if cfg.DeflateOnOOM() {
 			balloonOpts += ",deflate_on_oom=on"
 		}

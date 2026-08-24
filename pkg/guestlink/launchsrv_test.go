@@ -31,11 +31,15 @@ func TestLaunchServer_HelloLaunchHandshake(t *testing.T) {
 		Restart: "never",
 	}
 	launchAckSeen := make(chan struct{})
+	allowLaunchACK := make(chan struct{})
 	srv := &LaunchServer{
-		Path:        sockPath,
-		Spec:        spec,
-		Logf:        func(string, ...any) {},
-		OnLaunchAck: func() { close(launchAckSeen) },
+		Path: sockPath,
+		Spec: spec,
+		Logf: func(string, ...any) {},
+		OnLaunchAck: func() {
+			close(launchAckSeen)
+			<-allowLaunchACK
+		},
 	}
 	if err := srv.Listen(); err != nil {
 		t.Fatal(err)
@@ -80,10 +84,31 @@ func TestLaunchServer_HelloLaunchHandshake(t *testing.T) {
 	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeLaunchAck}); err != nil {
 		t.Fatal(err)
 	}
-	ack, err := proto.ReadMessage(conn)
-	if err != nil {
-		t.Fatal(err)
+	type ackResult struct {
+		message *proto.Message
+		err     error
 	}
+	ackDone := make(chan ackResult, 1)
+	go func() {
+		message, err := proto.ReadMessage(conn)
+		ackDone <- ackResult{message: message, err: err}
+	}()
+	select {
+	case <-launchAckSeen:
+	case <-time.After(time.Second):
+		t.Fatal("OnLaunchAck not fired before ACK")
+	}
+	select {
+	case result := <-ackDone:
+		t.Fatalf("launch ACK completed before OnLaunchAck returned: %+v err=%v", result.message, result.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(allowLaunchACK)
+	result := <-ackDone
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	ack := result.message
 	if ack.Type != proto.TypeAck {
 		t.Errorf("expected ack, got %+v", ack)
 	}
@@ -95,11 +120,6 @@ func TestLaunchServer_HelloLaunchHandshake(t *testing.T) {
 	}
 	conn.Close()
 
-	select {
-	case <-launchAckSeen:
-	case <-time.After(time.Second):
-		t.Errorf("OnLaunchAck not fired")
-	}
 	select {
 	case <-srv.LaunchAckDone():
 	case <-time.After(time.Second):
@@ -234,6 +254,105 @@ func TestLaunchServer_AppStartedACKFailureSkipsCallback(t *testing.T) {
 	}
 	if called {
 		t.Fatal("OnAppStarted ran after a failed ACK write")
+	}
+}
+
+func TestLaunchServer_MemReportBarrierRunsBeforeACK(t *testing.T) {
+	report := proto.MemReport{Epoch: 2, Seq: 3, MemTotalBytes: 512 << 20, MemAvailableBytes: 128 << 20}
+	request := encodeLaunchMessage(t, &proto.Message{Type: proto.TypeMemReport, MemReport: &report})
+	wantACK := encodeLaunchMessage(t, &proto.Message{Type: proto.TypeMemReportAck})
+	conn := &scriptedLaunchConn{read: bytes.NewReader(request)}
+	var ackComplete atomic.Bool
+	conn.write = func(p []byte) (int, error) {
+		n, err := conn.written.Write(p)
+		if bytes.Equal(conn.written.Bytes(), wantACK) {
+			ackComplete.Store(true)
+		}
+		return n, err
+	}
+	called := false
+	srv := &LaunchServer{
+		Logf: func(string, ...any) {},
+		OnMemReport: func(got proto.MemReport) bool {
+			called = true
+			if !reflect.DeepEqual(got, report) {
+				t.Errorf("report = %+v, want %+v", got, report)
+			}
+			if ackComplete.Load() {
+				t.Error("OnMemReport barrier ran after the ACK was written")
+			}
+			return true
+		},
+	}
+	if keep := srv.handleConn(conn); keep {
+		t.Fatal("mem_report connection unexpectedly handed off")
+	}
+	if !called {
+		t.Fatal("OnMemReport was not called")
+	}
+	if !bytes.Equal(conn.written.Bytes(), wantACK) {
+		t.Fatalf("ACK wire = %x, want %x", conn.written.Bytes(), wantACK)
+	}
+}
+
+func TestLaunchServer_MemReportACKFailureMayRetryIdempotently(t *testing.T) {
+	report := proto.MemReport{Epoch: 1, Seq: 1, MemTotalBytes: 1}
+	request := encodeLaunchMessage(t, &proto.Message{Type: proto.TypeMemReport, MemReport: &report})
+	conn := &scriptedLaunchConn{read: bytes.NewReader(request), failAfter: 4}
+	conn.write = conn.writeUntilFailure
+	called := false
+	srv := &LaunchServer{
+		Logf:        func(string, ...any) {},
+		OnMemReport: func(proto.MemReport) bool { called = true; return true },
+	}
+	if keep := srv.handleConn(conn); keep {
+		t.Fatal("mem_report connection unexpectedly handed off")
+	}
+	if !called {
+		t.Fatal("OnMemReport barrier did not run before the failed ACK write")
+	}
+}
+
+func TestLaunchServer_MemReportClosedBarrierReturnsError(t *testing.T) {
+	report := proto.MemReport{Epoch: 2, Seq: 1, MemTotalBytes: 1}
+	request := encodeLaunchMessage(t, &proto.Message{Type: proto.TypeMemReport, MemReport: &report})
+	conn := &scriptedLaunchConn{read: bytes.NewReader(request)}
+	srv := &LaunchServer{
+		Logf:        func(string, ...any) {},
+		OnMemReport: func(proto.MemReport) bool { return false },
+	}
+	if keep := srv.handleConn(conn); keep {
+		t.Fatal("mem_report connection unexpectedly handed off")
+	}
+	got, err := proto.ReadMessage(bytes.NewReader(conn.written.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != proto.TypeError {
+		t.Fatalf("response type = %q, want %q", got.Type, proto.TypeError)
+	}
+}
+
+func TestLaunchServer_MemReportRequiresPayload(t *testing.T) {
+	request := encodeLaunchMessage(t, &proto.Message{Type: proto.TypeMemReport})
+	conn := &scriptedLaunchConn{read: bytes.NewReader(request)}
+	called := false
+	srv := &LaunchServer{
+		Logf:        func(string, ...any) {},
+		OnMemReport: func(proto.MemReport) bool { called = true; return true },
+	}
+	if keep := srv.handleConn(conn); keep {
+		t.Fatal("mem_report connection unexpectedly handed off")
+	}
+	if called {
+		t.Fatal("OnMemReport ran without a payload")
+	}
+	got, err := proto.ReadMessage(bytes.NewReader(conn.written.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != proto.TypeError {
+		t.Fatalf("response type = %q, want %q", got.Type, proto.TypeError)
 	}
 }
 

@@ -96,7 +96,7 @@ sandbox-ctl 是 CH 的父进程。CH 退出 → sandbox-ctl 收 SIGCHLD → 优�
 | CH 崩溃 | sandbox-ctl 收 SIGCHLD | 整 sandbox 销毁 |
 | sandbox-ctl 崩溃 | CH 失去父进程 + uffd handler 没了 | vCPU 卡 fault → 上层 supervisor SIGKILL CH |
 | stdio MUX 连接断(vsock 异常) | 应用 stdio 转发中断(应用因反压在 write 上阻塞) | sandbox-ctl 拨新连接 `attach` 重建并续传;`attach` 也失败 → 计入指标,由上层决策 |
-| node-ctl 不可达(动态控制模式) | 长连断、budget 暂停 | 保持最后实际应用额度;单一 jitter 指数退避 loop 持续重连,StateSync 恢复;不回退 floor、不销毁 VM |
+| node-ctl 不可达(动态控制模式) | 长连断、budget 暂停 | 保持当前安全 reservation baseline 与本地 target/high;单一 jitter 指数退避 loop 持续重连,StateSync 恢复;不回退到 configured headroom、不销毁 VM |
 | 单沙箱 OOM | guest 内进程被 kill;deflate_on_oom 释放 balloon | 非平台级故障 |
 | 资源开销 | sandbox-ctl Go runtime ~10-15 MiB;CH 自身 ~13 MiB | blk1.diff 是 sparse 文件,实际 = 已写 sectors |
 
@@ -536,29 +536,30 @@ sparse file。节点本地 checkpoint 的
 ```yaml
 # 资源规格
 resources:
-  capacity:                    # vCPU/内存数(guest 看到的"声明规格")
+  capacity:                    # CH memory zone 的固定上限 C
     cpu: 2
     memory: 8GiB
-  allocatable:                 # ≤ capacity,默认 = capacity
+  allocatable:                 # settled guest headroom H;standalone 默认 = capacity
     cpu: 0.1                   # ≤ capacity.cpu;无 cgroup 模式必须 == capacity.cpu
-    memory: 128MiB             # balloon 初始膨胀 = capacity.memory − 此值
+    memory: 256MiB             # 不是 total Budget,也不是 steady floor
     deflate_on_oom: true       # CH --balloon 是否带 deflate_on_oom
+
+  startup:                     # cold 首份可信 report 前的 headroom Hs;默认 = capacity
+    memory: 8GiB               # 与 allocatable.memory 独立;restore 完全忽略
 
   control:                     # 部署模式驱动
     cgroup_path: ""            # 空 = 无 cgroup 模式;非空 = 必须已存在的 cgroup 绝对路径
     controller: ""             # 空 = 无 cgroup / 静态 cgroup 模式;非空 = 动态控制模式(文件型 UDS 路径,不支持 @abstract)
-    sensor:                    # 压力感知器(动态控制模式;§10.3),可选,缺省 psi 默认值
+    sensor:                    # sandbox-local 压力感知器;动态模式的 grow 先申请 reservation
       mode: psi                # psi | events_poll | none;psi 失败自动回落 events_poll
       psi_some_stall_us: 10000 # PSI trigger:1s 窗口累计 10ms stall 触发(密集 workload 实测甜点)
       psi_some_window_us: 1000000
-      min_interval_ms: 100     # 两次 RequestBudget 最小间隔;PSI 抖动去抖
+      min_interval_ms: 100     # 两次压力 grow 最小间隔;PSI 抖动去抖
 
   overhead:                    # 仅 cgroup_path 已设时允许;默认 32 MiB
     memory: 32MiB              # memory.max = capacity.memory + 此值
-  watermark_high:              # 仅 cgroup_path 已设时允许;默认 allocatable.memory × 0.875
-    memory: 128MiB             # cgroup memory.high 初始值
-  startup:               # 仅 controller 已设时允许;默认 = allocatable.memory
-    memory: 256MiB             # 启动期 allocatable_now;约束 floor ≤ 此 ≤ capacity
+  watermark_high:              # node-owned policy;仅 cgroup_path 已设时允许
+    ratio: 0.875                # 0 < ratio < 1;request/template 不得覆盖
 
 # 网络:整个 network 块可省略或写成 {},表示不挂 virtio-net 设备.
 # 启用网络时源最多选一个(tap 名 / tapfd 交接);属性在 tapfd 模式下被交接元数据覆盖.
@@ -1140,59 +1141,57 @@ working-set 生成与验证。这组 artifact 必须一起保留;缺任一层即
 
 ### 4.1 三种部署模式
 
-是否启用 cgroup 限制、是否启用动态控制由 `control` 字段是否存在驱动:
+`sandbox-ctl` 始终拥有 guest observation、CH balloon 和 VMM cgroup 的本地闭环。
+`control.controller` 只决定该闭环是否在 grow 前调用既有 node reservation 协议:
 
-| 模式 | 字段配置 | 适用场景 |
-|---|---------|---------|
-| **无 cgroup** | `control.cgroup_path` 未设 | 开发环境、调试、单租户独占节点 |
-| **静态 cgroup** | `control.cgroup_path` 已设,`control.controller` 未设 | 生产但无超分需求;cgroup 隔离即可 |
-| **动态控制** | `control.cgroup_path` 已设,`control.controller` 已设 | 生产高密度、多租户共节点 |
+| 模式 | 配置 | Budget 决策与执行 | node 角色 |
+|---|---|---|---|
+| 无 cgroup | `cgroup_path` 空 | sandbox 本地公式 + balloon | 无 |
+| 静态 cgroup | 有 `cgroup_path`,无 `controller` | sandbox 本地公式 + balloon + `memory.high` | 无 |
+| 动态控制 | 两者都有 | 同一套本地公式与执行器 | admission、reservation、pool/zone 记账 |
 
-**能力对比**:
+Node 不读取 guest report,不查询 CH,不写 balloon target,也不写 `memory.high`。
+Heartbeat 只回显 reservation 一致性。静态与动态模式没有第二套 target 算法。
 
-| 能力 | 无 cgroup | 静态 cgroup | 动态控制 |
-|------|----------|------------|----------|
-| cgroup PSI 反压 | 无 | ✓ memory.high | ✓(随 allocatable 动态) |
-| balloon + deflate_on_oom | ✓ | ✓ | ✓ |
-| CPU 公平共享 | ✗(allocatable.cpu == capacity.cpu) | ✓ cpu.weight | ✓ |
-| 跨沙箱仲裁 | ✗ | ✗ | ✓ |
-| 防惊群 | ✗ | ✗ | ✓ 节点限速 + emergency_pool |
-| 创建期资源管控 | ✗ | ✗ | ✓ |
-| 超分密度提升 | ✗ | 有限(allocatable 必须保守) | ✓ allocatable 可贴近真实工作集 |
+### 4.2 内存术语与公式
 
-切换模式通过加 / 减 sandbox.yaml 字段。`control.controller`(动态控制模式开关)
-只能在 sandbox.yaml 里设;命令行只在 cgroup 维度提供临时覆盖入口:
-`--cgroup-path` 接受绝对路径或启动器继承的 `fd=N`。`fd=N` 是进程运行时句柄,
-不能写入 YAML(见 §2.2 / §9.2)。
+设 CH memory zone 的精确总量为 `Capacity = C`,CH 接受的 balloon target 为
+`T`,CH `vm.info.memory_actual_size` 为 `A`,guest `MemAvailable` 为 `M`。
+由 CH v51.1 的定义,`A = C - BalloonCurrent`,因此不从 guest 猜测 balloon current:
 
-### 4.2 资源量
+```text
+BalloonCurrent = C - A
+TargetBudget   = C - T
+CurrentBudget  = A
+ObservedBudget = max(TargetBudget, CurrentBudget)
+DemandMemory   = max(0, CurrentBudget - M)
 
-每沙箱在每个维度(memory / cpu)上有三个量:
+RawRequestedBudget = min(C, DemandMemory + Headroom)
+DesiredTarget       = alignDown(C - RawRequestedBudget, 64MiB)
+RequestedBudget     = C - DesiredTarget
+```
 
-| 量 | 内存 | CPU | 含义 |
-|----|------|-----|------|
-| `capacity` | resources.capacity.memory | resources.capacity.cpu(整数 vCPU) | guest 看到的"声明规格";cgroup 上界 |
-| `floor` | resources.allocatable.memory | resources.allocatable.cpu | 最小保留(K8s request 类比) |
-| `allocatable_now` | balloon 与 cgroup memory.high 实时反映 | (CPU 维度无 allocatable_now) | 内存独有的运行时 budget,在 [floor, capacity] 浮动;**仅动态控制模式存在** |
+Target 向下对齐等价于 Budget 向上保留,不会把实际 headroom 舍掉。加减法均为
+saturating 运算并 clamp 到 `[0,C]`。`ObservedBudget` 是 target/current 两侧的
+本地安全上界;动态模式的 node reservation 是独立的跨沙箱账本,两者不要混名。
 
-CPU 通过 cpu.max + cpu.weight 静态表达;无 cgroup / 静态 cgroup 模式内存也
-不浮动。详见 §6 / §7。
+`resources.allocatable.memory` 是 settled guest headroom `H`,不是 total Budget、
+steady floor 或 host RSS。`resources.startup.memory` 是 cold 首份可信 report 前的
+headroom `Hs`,缺省为 `C`,与 `H` 独立。restore 只使用 `BudgetAtSnapshot`,不使用
+`Hs`。`MemTotal` 仅诊断;Capacity 只取可信 CH memory config/snapshot。
 
 ### 4.3 内存与 CPU 的不对称性
 
-| 维度 | 内存 | CPU |
-|------|------|-----|
-| 物理强制机制 | balloon | cgroup cpu.max |
-| 反压机制 | cgroup memory.high(PSI) | cgroup cpu.max(throttle) |
-| 灾难性后果 | OOM kill | 仅减速,无 kill |
-| 调整生效延迟 | balloon 数 ms-数十 ms | cpu.max 立即(下一 period) |
-| 释放路径 | balloon inflate(host-driven via vm.resize)→ fallocate+madvise,异步 | 无需释放;period 边界自动 |
-| 安全网 | deflate_on_oom | 不需要 |
-| 是否有 burst 状态机 | 是 | 否 |
+Memory allocatable 是本地控制器加到 `DemandMemory` 上的动态 headroom。CPU
+allocatable 继续表示调度权重/保证,映射到 `cpu.weight`;本次变更不修改 CPU
+语义。二者同名但并不构成同一种资源模型。
 
-CPU 维度本质比内存简单——没有不可逆失败、调整即时、释放廉价。本设计利用
-内核 cgroup v2 的 cpu.weight 公平共享语义,**让 CPU 控制完全静态化**,只有
-内存有 burst/recover 状态机。
+Guest `deflate_on_oom` 是应用 OOM 前的应急泄压,不是 Budget 调整。它可能让
+`CurrentBudget > TargetBudget`;此时控制器把 target/current 视为 unstable,
+禁止 shrink 和降低 `memory.high`。阶段内 node reservation 可以暂时小于
+guest current。steady 阶段已写入的有限 `memory.high` 仍约束 VMM host charge;
+cold/restore 的 deferred-high 阶段只有 `memory.max` 是硬上界。后续新 report/压力
+grow 再按正常 reservation 流程建立正式保证。
 
 ## 5. 冷启动数据流
 
@@ -1206,10 +1205,11 @@ T2   tap 源验证已存在 TAP;tapfd 与无网络源跳过 TAP 名验证;
 T3   准备 overlay diff:已存在→按 crypto.local policy 打开(绝不 truncate,忽略 template);
      不存在→从 diff_template 的逻辑 sparse view 初始化 / 按 base 大小新建 blank upper;
      新文件编码由 crypto.local 决定(详见 §3.2.2)
-T4   动态控制模式:先创建并锁定 immutable lifecycle lease(每生命周期只写一次),
-     再 dial controller/send Admit,收 grant 后继续(详见 §10)
-T5   cgroup setup:打开目标 cgroup FD + 写 cgroup limits
-     (后续 fork 的 CH 自然在同 cgroup)
+T4   解析 cold InitialBudget = AlignedBudget(Capacity, startup headroom)。动态模式
+     先创建并锁定 immutable lifecycle lease,再向 controller 请求完整 InitialBudget;
+     queue/reject 均不得以较小 grant 启动。静态模式在本地采用同一 InitialBudget
+T5   cgroup setup:打开目标 cgroup FD,写 memory.max/cpu 设置,保持 memory.high=max;
+     首份可信 guest/CH observation 前不从 memory.current 推导 demand
 T6   memory 准备(统一模型,冷启动 + 恢复同):
      T6a memfd_create("sandbox-<sid>-ram", MFD_CLOEXEC | MFD_ALLOW_SEALING)
      T6b ftruncate(memfd, ramSize)
@@ -1232,7 +1232,8 @@ T13  起 va_report UDS server: listen /run/sandbox/<sid>/uffd.sock
      OnReady callback 内将 adopt uffd_C(从 SCM_RIGHTS)+ 起 epoll/worker
 T14  起 ctl.sock UDS server: listen /run/sandbox/<sid>/ctl.sock(snapshot / exec 请求入口);
      Listen 成功且 cleanup 已注册后,若启用 --ready-fd 则写 control_ready
-T15  构造 CH 命令行(详见 §5.2):
+T15  构造 CH 命令行(详见 §5.2),InitialTarget =
+     alignDown(Capacity - InitialBudget,64MiB):
      `--memory-zone size=<ramSize>,shared=on,fd=3,uffd_socket=/run/sandbox/<sid>/uffd.sock`
      `--console tty --serial off`,cmdline `... console=hvc0`(内核 dmesg 走 hvc0)
      cmd.ExtraFiles = [memfd] 让 fd=3 在 CH 进程中可见;tapfd 模式再追加 tap fd,
@@ -1273,7 +1274,8 @@ T19  Guest 内 kernel 启动 → mount /dev/pmem0 → exec /sbin/init = sandbox-
           parent 固定 namespace、验证空根并启用/回读 controllers后才放行 final exec
           (app fd 0/1/2 = 伪终端从端或 pipe 子端)→ 短连接发 app_started{pid}→ host 成功写回 ACK→ 本次 cold run
           首次通知写 ready 并关闭 ready fd(后续原地 restart 不重复)
-     T19c phase 3 supervisor + 反向 listener(ping/restore/quiesce/attach/exec)+ mem_report
+     T19c launch_ack 是 observation barrier;随后 phase 3 supervisor + 反向 listener
+          启动并立即发送首份 mem_report,之后默认每 5s 发送
 T20  vCPU 跑过程中:
      · stdio MUX:STDIN / STDOUT / STDERR(或 PTY)+ WINDOW_UPDATE / SET_WINSIZE
        帧在 sandbox-ctl ↔ sandbox-init 间双向流动;MUX 因故断 → sandbox-ctl 拨新
@@ -1281,10 +1283,12 @@ T20  vCPU 跑过程中:
      · vCPU 首次访问页 → uffd_C MISSING fault → handler 走 Absent → ZEROPAGE
      · backend 访问 backendVA → kernel 默认 shmem 缺页:folio 已存在(handler 装的)→
        直接装 sandbox-ctl mm PTE,无 uffd 事件
-     · sandbox-init 周期(默认 5s)从 /proc/meminfo 读 MemAvailable/MemTotal,
-       走短连接发 mem_report(sandbox-init.md §4.3)给 host
-     · host BalloonController 按策略推 desired_balloon target(详见 §9.3),通过
-       CH HTTP API PUT /api/v1/vm.resize 落到 guest;guest balloon 驱动 inflate
+     · sandbox-init 从 /proc/meminfo 读 MemAvailable 及诊断字段,以 epoch/seq
+       走短连接发 mem_report(sandbox-init.md §4.3)给 sandbox-local MemoryController
+     · MemoryController 在 report 到达后读取一份 CH target/memory_actual_size
+       observation,计算 Budget。guest report 与 CH observation 不宣称原子同刻,
+       shrink 前的稳定性复核负责 fail closed;
+       必要时通过 PUT /api/v1/vm.resize 推进 target;guest balloon 驱动 inflate
        → CH 在 memfd 上 fallocate(PUNCH_HOLE) + 在 chVA 上 madvise(DONTNEED)
        → uffd_C 投 EVENT_REMOVE → handler push 到 removeQ → flusher batch+merge
        后 madvise(DONTNEED, backendVA)
@@ -1307,7 +1311,7 @@ cloud-hypervisor \
   --kernel      /opt/sandbox/vmlinux \
   --pmem        file=/opt/sandbox/sandbox-runtime.bundle,discard_writes=on,iommu=off \
   --memory-zone size=8G,shared=on,fd=3,uffd_socket=/run/sandbox/<sid>/uffd.sock \
-  --balloon     size=0[,deflate_on_oom=on] \
+  --balloon     size=<InitialTarget>[,deflate_on_oom=on] \
   --disk        vhost_user=on,socket=/run/sandbox/<sid>/blk0.sock,readonly=on \
   --disk        vhost_user=on,socket=/run/sandbox/<sid>/blk1.sock \
   --vsock       cid=3,socket=/run/sandbox/<sid>/vsock.sock \
@@ -1333,11 +1337,10 @@ cloud-hypervisor \
 ```
 
 要点:
-- `--memory-zone size=8G` 是 capacity;balloon boot 时 `size=0`,sandbox-ctl
-  端的 BalloonController 在 settled 后通过 `/api/v1/vm.resize` 把 target 推到
-  `capacity − allocatable_now`,过程受 mem_report 驱动的反馈策略约束(§9.3)
-- balloon 行只在 `allocatable_now < capacity` 时出现;两者相等时省略
-  balloon 设备,无 host 端 RAM 回收路径
+- `--memory-zone size=8G` 是精确 Capacity。`--balloon size` 直接写入按 startup
+  headroom 算出的 InitialTarget;冷启动 settled 前没有 `/vm.resize`
+- 只要 cold 或 steady 策略需要 balloon control,即使 InitialTarget 为 0 也必须
+  生成 `--balloon size=0`。仅当 startup 与 settled 都不需要回收时省略设备
 - `--memory-zone fd=3,uffd_socket=...`:patched CH 跳过 memfd_create,直接用
   sandbox-ctl 传入的 fd 当 backing;在 create_ram_region 内自己创建 uffd,
   通过 uffd_socket 发 va_report + SCM_RIGHTS,等 sandbox-ctl ack 后才允许
@@ -1442,6 +1445,8 @@ snapshot 内容不变时 identity 相同 → 验证后复用**同名文件**,绝
 ### 6.2 snapshot 时序
 
 时序原则:
+- snapshot 请求通过形状校验后立即取得与 Budget resize 共用的 lifecycle barrier;
+  从 warm-up 到 freeze/capture 结束不得穿插新的 balloon resize
 - **overlay 在 memory 之前完整处理**(包括可能的 ingest)→ snapshot.cfg 拿到
   overlay.base 引用一次写入 ZIP,不需要事后回填重写
 - **config.json + state.json + snapshot.cfg 全程在内存暂存**,只在最末把 ZIP
@@ -1456,7 +1461,9 @@ snapshot 内容不变时 identity 相同 → 验证后复用**同名文件**,绝
 ```
 T0  sandbox-ctl snapshot --sandbox-id <sid> [--output <out_dir>] [--upload]
         [--drop-caches=true|false] [--merge-ref=true|false]
-T1  通过 <run-dir>/<sid>/ctl.sock 联系目标 sandbox-ctl run 进程
+T1  通过 <run-dir>/<sid>/ctl.sock 联系目标 sandbox-ctl run 进程。目标进程完成
+    request shape 校验后先取得 memory mutation barrier,等待在飞 resize 离开;
+    后续 artifact/merge/sink 准备、quiesce、pause、capture 全程持有
 T2  目标进程串行:
     T2a 通过 vsock 短连接发 quiesce 给 sandbox-init,等 quiesced 响应。sandbox-init
         收到后:拒绝新的 exec 并 SIGKILL 在飞的 exec 子进程(快照不能带运行中的
@@ -1662,10 +1669,12 @@ T4  restore.ApplyRules(host sandbox.yaml, snapshot.cfg, snapshotPath):
     - 详见 §11.0 字段语义表 + §13 校验矩阵
     restore.Run 随后读取 config.json.net,要求快照 NIC 拓扑与 host network source
     是否存在一致;restore 不允许新增或删除 NIC
-T5  从 snapshot.cfg 拿 capacity 推 ramSize;从 state.json 解出 balloon 状态推
-    allocatable_at_snapshot(详见 §11.1)
-T6  动态控制模式:Admit{floor, allocatable_at_snapshot} → grant
-T7  cgroup setup + blk1.diff(全新)准备
+T5  从 CH config.json 的 memory zone 精确计算 Capacity,并断言与 snapshot.cfg
+    相等;从 state.json 解出 snapshot balloon target/current,计算
+    BudgetAtSnapshot = Capacity - min(target,current)(详见 §11.1)
+T6  动态模式向 controller 请求完整 BudgetAtSnapshot;不能 partial grant。静态模式
+    本地采用同一数值。resources.startup.memory 不参与 restore
+T7  cgroup setup + blk1.diff(全新)准备;memory.high 保持 max/deferred
 T8  state.json 直接写到 <run-dir>/<sid>/snap-state/
     config.json 经路径重写后写入(uffd_socket / blk0/1.sock / vsock.sock 都改为
     本次 <run-dir>/<sid>/ 下的对应名)
@@ -1682,7 +1691,7 @@ T10 blk0 + blk1 backend 起;launch server UDS(<vsock-base>_5000)同样起——r
     与冷启动共用同一后半段(memfd/uffd/blk/launch/pinger/ctl/信号/stats),仅 uffd
     source、CH 命令行、settle 协议不同。**差别**仅在于 restore 不走 hello/launch 握手
     (应用已在跑,该连接不升级 MUX),但 launch server 仍承接 guest→host 的周期
-    mem_report 与 app_exited 短连接(host 端 BalloonController 据此调 balloon);
+    mem_report 与 app_exited 短连接(MemoryController 在 restore barrier 后接收新 epoch);
     va_report UDS server 起,OnReady 内 adopt CH 送来的 uffd_C
 T11 spawn cloud-hypervisor (patched):
       --api-socket <run-dir>/<sid>/ch.sock
@@ -1710,9 +1719,11 @@ T15 vsock 连接发 restore{epoch=N, wallclock_ns} 给 sandbox-init(guest:5000 l
      应用解除阻塞前墙钟已纠正。单调时钟不受影响(Go 定时器、ping RTT、mem_report
      ticker 照常)。restore_ack 是 attach_ack 的超集(含 channel 集合 + 应用状态)
      外加"恢复完成"信号。**这条连接随后升级为新的 stdio MUX**:host 发一次初始
-     SET_WINSIZE,重建应用 stdio 桥接,per-stream window 重新协商,残留字节回放,
-     host 成功建立 MUX 后,本次 restore run 写 ready 并关闭 ready fd,随后 host
-     (re)start ping ticker。guest 在写 ACK 后自行 reattach/thaw;本 ready 不确认其
+     SET_WINSIZE,重建应用 stdio 桥接,per-stream window 重新协商,残留字节回放。
+     ACK+MUX 完成前不启用任何 Budget/high/resize 调整。完成后 host 只执行一次
+     SafeTarget=min(snapshot target,snapshot current) normalization;该操作不运行
+     steady formula,不改变 reservation。normalization 被 CH 接受后才打开新 restore
+     epoch report barrier,随后启动 ping/sensor/heartbeat。guest 在写 ACK 后自行 reattach/thaw;ready 不确认其
      thaw 完成。`restore` 写入前,若 CH hybrid-vsock 在 `CONNECT 5000` 后、
      `OK <port>` 前短暂 EOF/reset,host 在同一总 deadline 内退避重拨(最多 2 s);
      请求尚未发送,因此不会重放。`restore` 一经写入,后续写/读/协议错误均不重试。
@@ -1720,7 +1731,8 @@ T15 vsock 连接发 restore{epoch=N, wallclock_ns} 给 sandbox-init(guest:5000 l
      restore 失败回退:CH /vm.shutdown 并向调用方报错。若此 barrier 收到 host
      SIGTERM/SIGINT,context 会立即打断 CH API/vsock I/O,随后由已缓存 signal 进入
      正常 CH shutdown → grace → SIGKILL 升级链;backend 不会先于 CH 被撤掉
-T16 vCPU 跑,fault 流转见 §8 uffd handler;balloon EVENT_REMOVE 同冷启动
+T16 首份新 epoch report 到达后才运行 settled headroom 公式;vCPU fault 流转见
+    §8 uffd handler,balloon EVENT_REMOVE 同冷启动
 T17 user app 退出 / 接收外部信号 → 退出流程同冷启动
 ```
 
@@ -2071,8 +2083,8 @@ handler 收到 `EVENT_REMOVE` 后做 **process-level reclaim**:对 sandbox-ctl
 自己的 backendVA mmap 做 `madvise(MADV_DONTNEED)`,把进程级 PTE/RSS 份额清掉。
 
 **空洞跳过为何决定冷启动收敛速度**。`release_memory_range` 在 x86-4K
-下**逐 4K 页**调用(`pbp` 合并被旁路)。若不跳过空洞,把 balloon 充到 `capacity −
-allocatable_now`(1.5 GiB 量级)时**每个 4K 页**都走 (1)(2),而 (2) 的
+下**逐 4K 页**调用(`pbp` 合并被旁路)。若不跳过空洞,把 balloon 充到一个
+1.5 GiB 量级 target 时**每个 4K 页**都走 (1)(2),而 (2) 的
 `MADV_DONTNEED` 在 uffd VMA 上**同步阻塞**到单 reader handler 消费完该
 `EVENT_REMOVE` 才返回——balloon 线程要做 `≈ 充气字节 / 4K`(1.5 GiB ≈ 40 万)
 次**串行的跨进程同步往返**,收敛达数十秒,且可在 boot 期形成软死锁。瓶颈是
@@ -2097,7 +2109,7 @@ patch 无关、也不属于充气阶段(勿与充气期事件混计)。
 
 | 端 | 动作 | 释放对象 | 触发时机 |
 |---|---|---|---|
-| CH(balloon inflate 处理) | run 段内有数据:`fallocate(PUNCH_HOLE)` on memfd + `madvise(MADV_DONTNEED)` on chVA;**整段空洞:跳过两者** | inode 页 + CH 自己的 PTE | host 通过 `/vm.resize` 推高 target → guest inflate 让出**已用过**的页(运行时回收 / node-ctl reclaim)|
+| CH(balloon inflate 处理) | run 段内有数据:`fallocate(PUNCH_HOLE)` on memfd + `madvise(MADV_DONTNEED)` on chVA;**整段空洞:跳过两者** | inode 页 + CH 自己的 PTE | sandbox 本地 Budget shrink 通过 `/vm.resize` 推高 target → guest inflate 让出**已用过**的页 |
 | sandbox-ctl handler | `madvise(MADV_DONTNEED)` on backendVA | sandbox-ctl 自己的 PTE/RSS | 收到 `EVENT_REMOVE`(仅 CH 未跳过、即段内有数据时)|
 
 **关键不变量**:
@@ -2128,20 +2140,30 @@ patch 无关、也不属于充气阶段(勿与充气期事件混计)。
 ### 9.1 cgroup 内存设置(静态 cgroup / 动态控制模式)
 
 ```
-memory.max       ← capacity_bytes + overhead.memory       # 不变
-memory.high      ← watermark_high.memory                  # 静态 cgroup 模式恒为该值;
-                                                              动态控制模式随 allocatable_now × ratio 变化
+memory.max       ← Capacity + resources.overhead.memory   # 固定上限
+memory.high      ← sandbox-local Budget policy            # 首份可信 report 前为 max
 memory.swap.max  ← 0                                      # 禁 swap
 ```
 
-**关键决策点**:
+对 fresh report 计算:
 
-- `memory.max = capacity + overhead`,**不等于 allocatable**。把 memory.max
-  设成 allocatable 时,guest 合法使用到 allocatable 上限会让 cgroup OOM kill
-  CH 进程,等同于平台主动终结沙箱
-- `memory.high < memory.max` 留出反压窗口:guest 内存接近 high 时内核给 CH
-  进程内存分配加 PSI 延迟,但不 kill
-- 禁用 swap:超分语义下 swap 会让 OOM 决策路径模糊
+```text
+GrantedHeadroom = max(0, Budget - DemandMemory)
+PressureReserve = min(
+    GrantedHeadroom,
+    max(ceil(GrantedHeadroom * (1-ratio)), min(64MiB, GrantedHeadroom)))
+HostMemoryHigh = min(
+    Capacity + VMMOverhead,
+    VMMOverhead + Budget - PressureReserve)
+```
+
+`ratio` 缺省为 0.875,用定点整数运算。实现还把当前 host
+`memory.current` 作为本次写入的安全下限,避免 settled 时立刻把 high 写到
+现有 VMM charge 以下而自触发 PSI;该 host charge 从不参与 Demand 或 Budget。
+
+Grow 顺序是 reserve → 提高 high → balloon deflate。Shrink 顺序是 balloon
+inflate → 等 `memory_actual_size` 收敛 → 降低 high → 释放 reservation。
+`memory.max` 始终是 Capacity 加 node-owned VMM overhead,不是 headroom。
 
 ### 9.2 cgroup CPU 设置
 
@@ -2165,7 +2187,7 @@ cpu.weight  ← clamp(round(allocatable.cpu × 100), 1, 10000)
 - 节点 CPU 紧张:内核 CFS 按 cpu.weight 比例分配,在 admission 保证
   `Σ allocatable.cpu ≤ physical_cpu` 的前提下,每沙箱至少等于 allocatable.cpu
 
-这套静态模型实现了"无竞争时给 capacity / 有竞争时给 floor",**完全不需要
+这套静态模型实现了"无竞争时给 capacity / 有竞争时按权重共享",**完全不需要
 运行时调整 cpu.max,也不需要 CPU 维度的 burst/recover 状态机或 RPC**。
 
 **cgroup 归属固定解耦**。sandbox-ctl **从不**把自己加入沙箱资源 cgroup。
@@ -2183,55 +2205,57 @@ TASK_KILLABLE D-state,使其既无法终止 CH,也无法 reap `cmd.Wait`。
 
 ### 9.3 balloon 配置与 BalloonController
 
-CH 命令行(三种模式都用,跟 cgroup 解耦):
+Balloon device 是否存在与 cgroup 是否存在解耦。只要 cold InitialTarget 非零或
+settled headroom 小于 Capacity,运行期就启用 balloon control,CH 命令行必须包含:
 
 ```
---balloon size=0[,deflate_on_oom=on]
+--balloon size=<InitialTarget>[,deflate_on_oom=on]
 ```
 
-仅当 `allocatable_now < capacity` 时附加 `--balloon`;两者相等时省略,无 host
-端 RAM 回收路径。
+在上述 balloon control 已启用的条件下,InitialTarget 为 0 也不能省略设备。Cold
+settled 前 target 唯一来源是这条命令,没有 `/vm.resize`。
+`free_page_reporting` 不启用;`deflate_on_oom` 缺省启用。
 
-- `size=0` boot 期 guest 看到 capacity 等额内存,balloon 尚未持有页。host 端
-  BalloonController 在 settled 之后(launch 握手完成)接管 target,把 balloon
-  推到 `capacity − allocatable_now`。这批让出的页 ~99%(实测)是从未写过的
-  空洞(memfd 稀疏未 prefault),CH 的 release 对空洞 run 跳过 PUNCH/madvise
-  → 省去同步 `EVENT_REMOVE` 握手,充气收敛近乎瞬时;少量确驻留的
-  瞬态 page cache 仍合法回收(机制见 §8.5 与
-  `sandboxer/docs/cloud-hypervisor.md` §3.4)
+BalloonController 是 CH target 的单写者,但不包含 demand policy 或 node 逻辑。
+每次 observation 从同一份 `vm.info` 读取:
+
+- `config.memory.total_size()` 并断言等于已解析的精确 Capacity
+- `config.balloon.size` 作为 CH accepted target
+- `memory_actual_size` 作为 CurrentBudget
+- `BalloonCurrent = Capacity - memory_actual_size`
+
+`PUT /vm.resize` 成功只表示 CH 接受 target。调用前后用 `vm.info` 处理响应丢失
+和 ambiguous result;失败保留 desired target,由后续 reconcile 继续向前,不发
+补偿 resize,不回滚 high 或 reservation。
+
+Budget grow 不等待 balloon current:node reservation(若配置 controller)成功后,
+先提高 `memory.high`,再减小 target。现役 reservation 协议允许 partial grant;
+sandbox 会先累积这些额度,只把“不超过已获 reservation 的最大可表示 Budget”转换
+为 target。这样 target 向下对齐不会把部分 grant 向上取整成未保留内存。
+Budget shrink 必须满足:
+
+1. 使用 fresh epoch/seq report 和当次 CH observation
+2. target/current stable
+3. requested target 与 accepted target 的差距必须严格大于 64MiB;
+   差距小于或等于一个 Step 时保留当前 Budget 作为 shrink deadband
+4. 每份 report 最多 inflate 一个 64MiB step
+5. 发 resize 前立即重读 `vm.info`;读取失败或 target/current 已因 emergency
+   deflate 等原因变为 unstable 时保留 desired target,本轮不发 resize
+6. resize 后轮询 `memory_actual_size == TargetBudget` 才降低 high 和释放 reservation
+7. 收敛前已排队的 report 不得驱动下一步 shrink
+
+Snapshot capture 与所有 high/resize critical section 共用 lifecycle barrier。
+Resize 和 snapshot 不会并发;不要求 capture 前 target/current 完全相等,因为
+`BudgetAtSnapshot` 对两侧取安全上界。
+
+下列原有决策继续保留:
+
 - **不**启用 `free_page_reporting`。FPR 让 guest 在每轮 page reclaim 中把空闲
   页号高频推到 host,CH 的 `release_memory_range` 对自身 mmap 做
   `madvise(MADV_DONTNEED)` 广播 mmu_notifier 失效到 KVM EPT,持续的 IPI
   shootdown 饿死 guest vsock kthread → host→guest ping 在十数秒内全部 timeout。
   改由 host 端按周期主动推 inflate target,事件量被速率限制,问题消除
-- `deflate_on_oom=on` 由 `allocatable.deflate_on_oom` 决定(默认 on)
-
-**BalloonController(host 侧反馈环)**:
-
-```
-guest sandbox-init  ─ mem_report (vsock, 5 s) ─►  Controller.Hint
-                       MemAvailable/MemTotal               │
-                                                           ▼
-       ◄─── PUT /api/v1/vm.resize {desired_balloon} ─── Reconcile (5 s tick)
-```
-
-策略要点:
-
-- **目标自由缓冲**`TargetFreeBuffer`:默认 `max(64 MiB, Capacity/32)`。Hint 根据
-  `delta = MemAvailable − TargetFreeBuffer` 调整 target,把 guest 的自由内存
-  锚定在该值附近
-- **anti-hunting**:`|delta| < Slack`(默认 32 MiB)的样本直接丢弃
-- **MaxStep 限速**:单次 Hint 调整 ≤ `MaxStep`(默认 256 MiB)。boot 充气
-  ~99% 走空洞跳过(无同步握手),故此限速实质作用于**运行时回收已驻留
-  工作集页**时的 mmu_notifier / `EVENT_REMOVE` 突发量
-- **stale 防护**:刚推过一次 inflate,guest MemTotal 还没收到本次让出量的反映,
-  此时 MemAvailable 偏大。若 `MemAvailable > (Capacity − max(target, actual)) +
-  64 MiB`(visible slack)判为 stale,跳过该样本,避免反馈环正反馈失控
-- **Reconcile**:5 s ticker;`target != actual` 时一次 `PUT /api/v1/vm.resize`,
-  成功后写回 `actual`。Start 立即跑一次以便 settled 后尽快进入 target
-
-**手动覆盖**:动态控制模式下 sandbox-ctl 也可以通过 `Controller.SetTarget`
-直接设值(node-ctl grant/reclaim 时使用),Hint 与 SetTarget 互不干扰。
+- `deflate_on_oom=on` 由 `allocatable.deflate_on_oom` 决定
 
 ### 9.4 deflate_on_oom 安全网
 
@@ -2242,13 +2266,16 @@ deflate_on_oom 触发链路:
 3. Balloon driver 从 balloon 池释放页给 guest 进程
 4. CH 在 host 上 RSS 增长,但 < memory.max(静态 cgroup / 动态控制模式)
 
-定位:**双重失败的最后防御**。动态控制模式正常路径下:
-- 第一道:cgroup memory.high PSI 给 CH 进程内存 alloc 加延迟
-- 第二道:sandbox-ctl 检测 high 事件 → 控制器 grant → balloon deflate
-
-只有当反馈环路追不上 guest 增长时,deflate_on_oom 才生效,代价是 guest 内
-进程被杀。无 cgroup / 静态 cgroup 模式没有反馈环路,deflate_on_oom 是唯一
-防线,所以默认开启。
+定位:guest 应用 OOM 前的应急泄压,不是 Budget grant。它可以在不修改 CH target
+的情况下减小 BalloonCurrent,所以 target/current 会暂时不一致。Sandbox 在该
+阶段跳过 shrink/high reduction;不会把自主 deflate 自动转换成 node admission
+或 reservation 请求。若 PSI/OOM sensor 另行发现压力,才走正常的 grow 请求。
+steady 阶段 VMM 仍受该 sandbox 已写入的有限 `memory.high` 和硬上界
+`memory.max` 约束;cold/restore deferred-high 阶段只有 `memory.max` 是硬上界。
+但是自主 deflate 不是 node grant:在 target/current 不稳定期间,不能声称 node aggregate
+严格满足 `reservation >= ObservedBudget`;admission 也不会把这部分暂时可用内存
+当作可调度 headroom。Sandbox 保留现有 reservation、禁止 shrink,等待同一控制
+循环以显式 grow 请求重新建立正式保证。
 
 ## 10. 与 node-ctl 的资源协议
 
@@ -2257,50 +2284,55 @@ deflate_on_oom 触发链路:
 
 ### 10.1 沙箱状态机
 
-动态控制模式下沙箱经过 7 个阶段;静态 cgroup 模式只走 admitted → creating →
-startup → settled,不进入 burst / recover;restoring 仅在快照恢复路径出现:
+沙箱 lifecycle 与 Budget loop 是两件事。Cold 的 launch_ack、restore 的
+restore_ack+MUX 只打开可信 observation barrier;`Settled` 不从 host
+`memory.current` 计算或改写 Budget。
 
-| 阶段 | 触发 | allocatable_now 内存策略(动态控制模式) | sandbox-ctl 行为 |
-|------|------|----------------------------------|-------------------|
-| **admitted** | 收到 Admit grant | reservation 占用预算,沙箱未启动 | 验证 cgroup_path,准备 socket |
-| **creating** | 开始创建 CH 等 | reservation 持有 | 拉起 CH、handshake |
-| **startup** | CH 已启动,等 launch hello | startup.memory | 等 launch protocol hello |
-| **restoring** | CH /vm.restore + /vm.resume 完成,等 restore_ack | allocatable_at_snapshot 或降级值 | 发 `restore{epoch}` 等 `restore_ack`(该连接随后升级为新 stdio MUX) |
-| **settled** | hello 收到 / restore_ack 收到 | 渐缩到 floor + 工作集余量 | 周期上报 RSS;发 Settled |
-| **burst** | 检测到压力 | 申请扩展,可达 capacity | resize-balloon、改 memory.high |
-| **recover** | 压力消退 + 冷却 | 不主动收回,等被动回缩 | 继续上报 |
+```text
+cold:
+  reserve exact InitialBudget(Hs aligned)
+  → CH --balloon InitialTarget
+  → launch_ack
+  → accept fresh report
+  → local steady formula
 
-**settled 触发是事件驱动,不依赖定时器**:
+restore:
+  reserve exact BudgetAtSnapshot
+  → CH spawn/resume
+  → restore_ack + MUX
+  → one SafeTarget normalization
+  → accept new restore epoch report
+  → local steady formula
+```
 
-- **冷启动 startup → settled**:由 sandbox-init phase 2 拨号 launch server
-  发 `hello` 消息触发——sandbox-init 在 mount/network 等平台初始化完成、即将
-  拿到 launch spec 启动用户进程的时刻
-- **恢复 restoring → settled**:由 host 收到 sandbox-init 的 `restore_ack` 触发
-  (host→guest `restore{epoch}` 短连接,sandbox-init 立即 reply `restore_ack`,
-  该连接随后升级为新的 stdio MUX,见 §7 / sandbox-init.md §4.3)
+不存在 `burst/recover` 隐式 target writer。每份 fresh report 都重新计算目标;
+PSI/OOM 只向同一个 MemoryController 提交 grow 事件。
+
+launch ACK 或 restore normalization 之后若 initial target/current 尚未 Stable,
+仍禁止 shrink 和首次降低 `memory.high`;但 report 明确要求的 safety grow 以及
+PSI/OOM grow 可以按 reserve → high → deflate 前进。否则 guest emergency deflate
+不自动 re-inflate 时会永久阻断 formal grow。
 
 ### 10.2 各阶段的 cgroup 与 balloon
 
-动态控制模式下(静态 cgroup 模式全程对应 settled 列):
+| 阶段 | reservation | `memory.high` | balloon |
+|---|---|---|---|
+| cold pre-report | exact InitialBudget | `max`/deferred | command-line InitialTarget |
+| restore pre-ACK | exact BudgetAtSnapshot | `max`/deferred | snapshot state,不调整 |
+| restore normalization | 不变 | `max`/deferred | `SafeTarget=min(snapshot T,X)` |
+| steady grow | 先增加 | 再提高 | 最后 deflate,不等 current |
+| steady shrink | 保留旧值 | 保留旧值 | inflate 一步并等 current |
+| shrink commit | 最后释放差额 | 先降低到新安全值 | current 已收敛,target 不变 |
 
-| 阶段 | memory.max | memory.high | balloon target | cpu.max / cpu.weight |
-|------|-----------|-------------|----------------|---------------------|
-| admitted | capacity+overhead | startup × ratio | (未启动 CH) | 静态(永不变) |
-| creating | 同上 | 同上 | (CH 启动中) | 同上 |
-| startup | 同上 | 同上 | capacity − startup | 同上 |
-| restoring | 同上 | allocatable_at_snapshot × ratio | capacity − allocatable_at_snapshot | 同上 |
-| settled | 同上(永不变) | allocatable_now × ratio | capacity − allocatable_now | 同上 |
-| burst | 同上 | allocatable_now × ratio(allocatable_now ↑) | capacity − allocatable_now ↓ | 同上 |
-| recover | 同上 | 同上 | 同上 | 同上 |
+静态模式把 reservation 留在本地变量,顺序完全相同。CPU 设置全生命周期不变。
 
-`ratio = watermark_high.memory / allocatable.memory`,默认 0.875。memory.max、
-cpu.max、cpu.weight 全程不变。memory.high 与 balloon target 随 allocatable_now
-同步变化。
+### 10.3 压力信号(静态与动态 cgroup 模式)
 
-### 10.3 压力信号(动态控制模式)
-
-sensor 是 sandbox-ctl 的 goroutine,Settled 之后启动,根据 cgroup 内存压力发
-`RequestBudget` 给 node-ctl。数据源由 `resources.control.sensor.mode` 选择:
+sensor 是 sandbox-ctl 的 goroutine,在 cold launch ACK 或 restore ACK+MUX barrier
+之后启动,根据 cgroup 内存压力向同一个 MemoryController 提交 grow 事件。它不等待
+node 的独立 `Settled` 通知。静态模式在 sandbox 内更新本地 reservation;动态模式才
+通过既有 `RequestBudget` 向 node-ctl 申请 reservation。两者的数据源都由
+`resources.control.sensor.mode` 选择:
 
 **`psi` 模式(默认)** —— 推荐。epoll on `memory.pressure`:
 
@@ -2328,7 +2360,7 @@ PSI trigger 写入格式 `some <stall_us> <window_us>`,缺省 `some 10000 100000
 |---|---|---|
 | `memory.events.local` | high 计数差 | 主信号:`urgency=normal` |
 | `memory.events.local` | oom 计数差 | 紧急信号:`urgency=high` |
-| `memory.current` + `memory.high` | RSS 上升斜率且 RSS/high > 0.95 | 预测信号:`urgency=low` |
+| `memory.current` + `memory.high` | host VMM charge 上升且 charge/high > 0.95 | 预测信号:`urgency=low` |
 
 **`none` 模式** —— 关闭 sensor(admission + balloon 仍工作)。
 
@@ -2345,32 +2377,26 @@ guest 内进程级压力(跨 host/guest 边界,接口复杂)。
 
 ### 10.4 长连维持与自动恢复
 
-**长连维持**:
+所有 reservation RPC、连接替换和 StateSync 共用一个 session 串行化边界,
+每个 sandbox 最多一个 outstanding request。断连时本地保留当前安全的绝对
+reservation baseline,指数退避重连并直接发送 StateSync;没有 Reattach fallback、
+版本协商或双路径。grow 只有在收到 grant 响应后才能增大该 baseline;shrink 在
+balloon current 收敛、`memory.high` 已降低且释放请求已经发出后,可以把该
+baseline 降到已完成的较小值。
 
-- 沙箱进入 startup 后,连接保持活跃;sandbox-ctl 在此连接上发后续 RPC,并经
-  Heartbeat ack 的 `new_allocatable` 接收 reclaim/admin 的 allocatable 调整
-- 30s 周期 Heartbeat;控制器 90s(3 个周期)未收到 → 视为掉线
+StateSync 只恢复 reservation baseline、Settled lifecycle fact 和 host
+`memory.current` 诊断值。它不携带也不恢复 CH target/current;这些是 sandbox
+进程从 `vm.info`/snapshot 重建的本地状态。Heartbeat 的 `new_allocatable` 只是
+一致性回显,不同值导致重新 StateSync,绝不作为 balloon/cgroup 指令。
 
-**断连恢复**:
+响应丢失时保持保守:
 
-- 所有 controller RPC、连接替换和 StateSync 共用同一个 session 串行化边界,
-  每个 sandbox 最多一个 outstanding request;旧连接的迟到 response 不能越过
-  reconnect 更新状态
-- 任意 EOF/reset/broken pipe 后关闭旧连接,保留最后已经同时成功落地到
-  `memory.high` 与 balloon 的 `appliedAllocatable`,暂停新的正向 budget 请求
-- 唯一 reconnect loop 按 100ms 起、上限 5s 的带 jitter 指数退避持续 Connect,
-  不设“超时后切换模式”;controller 长期不可用时 VM 仍按最后 applied 正常运行
-- 新 controller 支持 `state_sync_v1` 时上报 SID、actual applied、settled、RSS 和
-  可选旧 token;验证成功取得新 session token后恢复 Heartbeat/budget。若响应携带
-  不同的非零 `new_allocatable`,也必须先成功应用到 cgroup 与 balloon,否则保持
-  disconnected 并重试同步
-- 旧 controller 不认识 StateSync 时回退 `Reattach(old_token)`。其返回额度只有在
-  cgroup 与 balloon 同步应用成功后才替换本地 applied
-
-任何资源调整均遵守“先落地、后推进状态”:先写 `memory.high`,再同步等待 CH
-`/vm.resize` 成功,最后才更新 `appliedAllocatable`。restore 时先从快照 balloon
-设备记录实际值;新 controller 的 grant 是 desired,post-resume correction 成功前
-StateSync 仍报告快照 actual,不能把旧 controller 意图或新 grant 冒充已应用结果。
+- grow grant 的响应丢失:本地尚未提高 high/deflate;StateSync 以本地旧 baseline
+  重新建立 reservation,之后继续请求目标态
+- shrink commit 的响应丢失:balloon/high 已安全收缩,本地使用已完成的较小
+  `CurrentAlloc` 作为安全 baseline;node 已提交时双方相等,node 未提交时
+  StateSync 完成释放。不得继续使用旧的大 baseline,否则本地可能复用 node
+  已释放并重新分配的 headroom
 
 ### 10.5 lifecycle lease 与 controller 重启
 
@@ -2381,7 +2407,8 @@ StateSync 仍报告快照 actual,不能把旧 controller 意图或新 grant 冒�
 ```
 
 文件只包含不可变字段:SID、sandbox-ctl PID、controller socket、真实 cgroup
-path、capacity、floor、startup、client features。SID 只参与 SHA-256,不直接成为
+path、Capacity、settled headroom、cold startup headroom、client features。历史 wire
+字段名保持不变,但 lease 不保存 guest demand、balloon 或 cgroup 动态状态。SID 只参与 SHA-256,不直接成为
 路径;socket 与 cgroup path 均以规范化绝对路径作为跨进程身份。sandbox-ctl 对 FD
 持 POSIX `fcntl` write lock直至沙箱生命周期结束;
 Heartbeat/Grant/StateSync 不更新文件。正常退出在仍持 lock 时 unlink 后 close;
@@ -2403,8 +2430,8 @@ hard-link socket 因无法唯一确定 owner/inventory 路径而 fail closed。
 sibling `vmm` 与 lease 比较。direct 模式没有这些 managed 文件,仍以
 `SO_PEERCRED == lease lock owner` 和允许的 cgroup root认证。
 
-controller 异常重启时先按 live lease capacity 建 provisional 安全上界,再对
-populated cgroup 兜底;listen 后本进程自动 StateSync,以 actual applied 原子替换
+controller 异常重启时先按 live lease Capacity 建 provisional 安全上界,再对
+populated cgroup 兜底;listen 后本进程自动 StateSync,以 sandbox reservation baseline 原子替换
 provisional。连接断开、heartbeat timeout、startup TTL 都不能让 controller
 删除仍有 live lease 或 populated cgroup 的消费者。恢复只覆盖同一 host 上
 controller 进程重启;不使用共享 checkpoint/WAL,也不跨 host reboot。
@@ -2414,8 +2441,8 @@ controller 进程重启;不使用共享 checkpoint/WAL,也不跨 host reboot。
 恢复路径与冷启动有两层差别:**(a)** sandbox.yaml 里大量字段在 restore 模式下
 有特殊语义(与 snapshot.cfg 合并、覆盖、断言式校验);**(b)** guest 在快照里
 **已有 in-memory 状态**(driver 缓冲、应用堆、page cache),`/vm.resume` 之后
-cloud-hypervisor 按快照 page 索引把这些页 fault 回 guest 物理地址,host
-allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
+cloud-hypervisor 按快照 page 索引把这些页 fault 回 guest 物理地址,所以 restore
+必须先保留 snapshot target/current 两侧要求的安全 Budget。
 
 §11.0 解决 (a),§11.1-§11.3 解决 (b)。
 
@@ -2443,7 +2470,8 @@ allocatable 初值必须够大才能避免 PSI 节流 / sensor 反复 burst。
 | `launch.cgroup_control` | host 值静默忽略;沿用 snapshot.cfg 的值(guest 内 namespace/delegation 拓扑已建立),并供后续 snapshot 回写 | 用 snapshot.cfg 的值 |
 | `launch.*`(除 `cgroup_control`) | 静默忽略(应用在 guest 内存里) | 同 |
 | `control.cgroup_path` / `control.controller` | 用作本次恢复的资源策略 | 同冷启动默认 |
-| `overhead` / `watermark_high` / `startup` | 同 control 规则 | 同冷启动默认 |
+| `overhead` / `watermark_high` | 用作本次恢复的 host cgroup policy | 同冷启动默认 |
+| `startup` | 校验配置但 restore 不使用 | 不参与 restore |
 | 其他 | 静默忽略 | — |
 
 **为什么 capacity 必须严格相等(而不是 max)**:guest 内存中已经按当时
@@ -2466,72 +2494,59 @@ no-replace 原子提交和终态不可变保证 payload 与声明一致。
 
 ### 11.1 唯一来源:CH 自己的 balloon 状态
 
-`sandbox-ctl` 在运行期通过 BalloonController(§9.3)维护 `balloon.target =
-capacity − allocatable_now`(node-ctl grant/reclaim 走 SetTarget,稳态由
-mem_report Hint 驱动),因此 balloon target/current 已经把 allocatable_now
-的语义编码进去了。CH 在 `/vm.snapshot` 时把 balloon 设备状态(含 `num_pages`
-= host 想拿走的页数 / target、`actual` = guest 已交还的页数 / current)写入
-bundle 内的 `state.json`,**无须再额外保存**。
+CH 在 `/vm.snapshot` 时把 balloon 设备状态写入 `state.json`。Capacity 则从
+同一快照的 CH `config.json` memory config 精确计算,并与 `snapshot.cfg` 声明
+交叉校验;不能从 guest MemTotal 反推。
 
 恢复时 sandbox-ctl 从 bundle 解出:
 
 | 字段 | 来源 | 含义 |
 |---|---|---|
-| `capacity` | `snapshot.cfg` 的 `resources.capacity.memory` | 快照时的 memory-zone 容量 |
-| `balloon.target` | `state.json` `snapshots["device-manager"].snapshots["__balloon"]` 内的 `config.num_pages` × 4 KiB | host 当时想保留多少页(对应 capacity − allocatable_now) |
+| `Capacity` | CH `config.json` memory total | 快照时精确 memory-zone 容量 |
+| `balloon.target` | `state.json` `snapshots["device-manager"].snapshots["__balloon"]` 内的 `config.num_pages` × 4 KiB | CH accepted target `T` |
 | `balloon.current` | 同上 `config.actual` × 4 KiB | guest balloon 驱动当时已实际交还的页数 |
 
 派生:
 
 ```
-allocatable_at_snapshot = capacity − min(balloon.target, balloon.current)
+BudgetAtSnapshot = Capacity − min(balloon.target, balloon.current)
 ```
 
-取 `min` 是为了在 balloon 还没收敛时拿到更宽裕的 allocatable:
-- **inflating**(host 想拿更多,guest 还没让出,target > current):取 current
-  → guest 此刻仍持有较大有效内存,fault 重放时给它这个量,平滑过渡
-- **deflating**(host 想还给 guest,guest 还没扩张,target < current):取
-  target → host 已经计划放出,sensor/heartbeat 会让 guest 后续扩到该值
+它等价于 `max(snapshot TargetBudget,snapshot CurrentBudget)`,是不低估任一侧的
+安全上界,不是 configured headroom 或精确 working set。无 balloon device 时
+BudgetAtSnapshot 为 Capacity;若本次 settled 配置需要 balloon control,则拒绝
+恢复没有 balloon device 的快照。
 
-恢复后,BalloonController 通过 `SetTarget(capacity − allocatable)` 把 balloon
-target 重新设回该值,首次 Reconcile 通过 `/vm.resize` 落到 guest,使 host
-与 guest 视图一致;mem_report 反馈环在 guest 恢复 sandbox-init supervisor
-循环后自动续上。
+### 11.2 Restore admission 与 normalization
 
-### 11.2 无 cgroup / 静态 cgroup 模式(无控制器)的恢复决策
+所有模式的 InitialBudget 都严格等于 BudgetAtSnapshot。动态模式必须获得完整
+grant,否则 queue/reject;静态模式在本地保留完整值。startup headroom 不参与,
+也不存在降级到 settled headroom 后继续恢复的路径。
 
+`/vm.resume` 之后仍禁止策略调整,直到 guest `restore_ack` 且 host MUX 建立。
+随后只做一次:
+
+```text
+SafeTarget = min(snapshot Target, snapshot Current)
 ```
-initial_alloc = max(yaml.allocatable.memory, allocatable_at_snapshot)
-```
 
-`max` 的语义:从动态控制模式拍下的快照可能 allocatable_at_snapshot >
-yaml.allocatable(运行期 burst 过),恢复到静态部署时若直接用 yaml,guest
-的工作集会被压回 yaml,触发 PSI 节流。`max` 让恢复保留 burst 后的工作集
-大小;若运营策略要求严格遵守 yaml,可在 `sandbox.yaml` 里把 capacity 也调小
-到 yaml.allocatable,那时 allocatable_at_snapshot ≤ yaml(由 capacity 自然
-约束)。
+`current < target` 时它阻止恢复后继续 inflate 工作集;`target < current` 时它保留
+原先更大的 Budget 意图。Normalization 只确认 CH accepted target,不等待 current,
+不降低 `memory.high`,不释放 reservation,也不是 steady policy resize。
 
-### 11.3 动态控制模式(有控制器)的恢复决策
+### 11.3 新 observation epoch
 
-`sandbox-ctl` 在 `Admit` 中携带:
+Guest 在写 restore_ack 前原子推进 mem-report epoch并清除旧 pending report。Host
+在 normalization 成功前保持 report barrier 关闭;duplicate、旧 epoch、倒退 seq
+均不能驱动 shrink或释放 reservation。Barrier 打开后,首份新 epoch report 才能
+按 settled headroom 计算下一目标。
 
-| 字段 | 值 | 角色 |
-|---|---|---|
-| `floor_memory_bytes` | `yaml.allocatable.memory` | 控制器降级时的回退下限 |
-| `allocatable_at_snapshot` | 上一节派生值 | 控制器优先尝试授予的 QoS 目标 |
+若该首份 report 因 guest emergency deflate 观察到 unstable,它仍可触发
+reserve-first safety grow;只有 shrink/high reduction 继续等待 Stable。
 
-控制器复用 admit 逻辑——把 `allocatable_at_snapshot` 当 requestedInitial、
-`floor` 当 fallback——**恢复路径没有新分支**:
-
-| 余量情况 | granted_initial_alloc |
-|---|---|
-| 可分配余量 ≥ allocatable_at_snapshot | = allocatable_at_snapshot(完美还原) |
-| floor ≤ 可分配余量 < allocatable_at_snapshot | = floor(降级) |
-| 可分配余量 < floor | status=rejected,上层调度器换节点 |
-
-降级路径下,sensor 在 restoring 阶段已激活,若 fault 重放压满 cgroup memory.high
-就立即 RequestBudget(urgency=normal),逐步把 allocatable 拉回 burst 状态;
-预算不允许时,沙箱以 floor 长期运行,直到节点预算释放或被调度走。
+Normalization、controller reconnect、ambiguous resize response 与 report 并发时,
+desired target 仍只有 BalloonController 一个写者。失败保留目标并向前重试,不做
+补偿 resize或旧 session转换。
 
 ## 12. vhost-user-blk backend
 
@@ -2663,15 +2678,14 @@ snapshot 路径要求 `/vm.pause` 之后内存内容稳定,但 backend worker �
 |------|---------|
 | 所有 file:// URL 必须绝对路径(filepath.IsAbs) | "<field> file:// must be absolute" |
 | `cgroup_path` 为空时,`controller` 必须为空 | "controller requires cgroup_path" |
-| `cgroup_path` 为空时,`overhead` / `watermark_high` / `startup` 必须未设 | "<field> requires cgroup_path" |
+| `cgroup_path` 为空时,`overhead` / `watermark_high` 必须未设 | "<field> requires cgroup_path" |
 | `cgroup_path` 为空时,`allocatable.cpu == capacity.cpu` | "fractional cpu requires cgroup_path" |
 | `cgroup_path` 已设时,该路径必须存在(系统调用检查) | "cgroup_path <p> does not exist" |
-| `cgroup_path` 已设但 `controller` 为空时,`startup` 必须未设 | "startup requires controller" |
-| `controller` 已设时,`startup.memory` 满足 `floor ≤ ≤ capacity` | "startup.memory out of [floor, capacity]" |
+| `startup.memory` 在所有模式下独立满足 `0 < startup ≤ capacity` | "startup.memory must be > 0" / "must be ≤ capacity.memory" |
 | `allocatable.cpu ≤ capacity.cpu` 且均 > 0 | "allocatable.cpu must be in (0, capacity.cpu]" |
 | `allocatable.memory ≤ capacity.memory` | "allocatable.memory must be ≤ capacity.memory" |
 | `overhead.memory ≥ 0` | "overhead.memory must be non-negative" |
-| `watermark_high.memory > 0` 且 `≤ allocatable.memory`(静态 cgroup / 动态控制模式启动初值) | "watermark_high.memory out of (0, allocatable.memory]" |
+| `watermark_high.ratio` 满足 `0 < ratio < 1`;旧 `memory` key 被 strict parser 拒绝 | "memory.high ratio must be between 0 and 1" / unknown field |
 | `mounts[].target` / `files[].path` 必须绝对路径 | "<field> must be absolute" |
 | `network.tap` 与 `network.tapfd` 最多设置一个;两者均未设置表示无 NIC | "network: `tap` and `tapfd` are mutually exclusive" |
 | 无网络源时不得设置 `mac/ip/mtu/nexthop/hostname/interface` | "network.<field> requires network.tap or network.tapfd" |
@@ -2681,10 +2695,8 @@ snapshot 路径要求 `/vm.pause` 之后内存内容稳定,但 backend worker �
 | `launch.stop_signal` 若设须可解析为信号 | "unknown stop_signal <s>" |
 | `launch.stop_grace_period` / `launch.start_timeout` 若设须为合法 duration | "<field> invalid duration" |
 
-`allocatable.memory == capacity.memory` 时整个 balloon 设备不挂载
-(`--balloon` 不出现于 CH 命令行),BalloonController 不启动。若
-`deflate_on_oom` 显式写 true(默认值)不报错,记 warn 日志:
-"deflate_on_oom set but balloon not configured"。
+只有 cold InitialTarget 为 0 且 settled headroom 等于 Capacity 时才不挂 balloon。
+任一阶段需要 control 时即使 InitialTarget 为 0 也必须生成 `--balloon size=0`。
 
 ### 13.2 stdio flag 互斥(`run` 冷启动 / 恢复模式 / `exec` 同)
 
@@ -2780,8 +2792,8 @@ vmlinux 通过 `boot.kernel: file://...` 提供:
   ABI 边界
 - `guest-runtime/native-deps/docs/build.md` —— 原生依赖(mkfs.erofs / vmlinux /
   envd)的构建流程
-- `orchestrator/docs/node-resource.md` —— 资源控制协议规范、节点级仲裁、
-  admission、reclaimer
+- [`orchestrator/docs/node-resource.md`](https://github.com/kuasar-sandbox/orchestrator/blob/main/docs/node-resource.md)
+  —— 既有 reservation 协议、节点级 admission、pool/zone 记账与 recovery
 - `accelerator/docs/manifest.md` —— manifest:// 资源拉取通道
   (blk0 base、snapshot)
 - `accelerator/docs/cache.md` —— sandbox-ctl 通过 cache-ctl 客户端做

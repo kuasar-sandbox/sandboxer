@@ -147,24 +147,39 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 
 	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl] "+format, a...) }
 
-	// Resolve capacity / floor up front so we can build the resctl.BalloonController
-	// before hooks (hooks owns "alloc change → balloon target" routing,
-	// which needs balloonCtl in hand). Both are cheap yaml lookups; the
-	// memfd-creation block below reuses capBytes.
+	// Resolve the exact memory domain before admission. The local controller,
+	// CH command line, and node reservation all use these same byte values.
 	capBytes, err := opts.Cfg.CapacityMemoryBytes()
 	if err != nil {
 		return -1, err
 	}
-	allocBytes, _ := opts.Cfg.AllocatableMemoryBytes()
+	if capBytes > uint64(^uint(0)>>1) {
+		return -1, fmt.Errorf("memory Capacity %d exceeds host addressable memory size", capBytes)
+	}
+	allocBytes, err := opts.Cfg.AllocatableMemoryBytes()
+	if err != nil {
+		return -1, err
+	}
+	startupHeadroom, err := opts.Cfg.StartupBytes()
+	if err != nil {
+		return -1, err
+	}
+	initialBudget := resctl.AlignedBudget(capBytes, startupHeadroom)
+	// Reject a CH-inexpressible memory domain before creating a lease or
+	// acquiring any node reservation. Validate both the cold command-line
+	// target and the farthest target the settled policy can request.
+	if err := resctl.ValidateBalloonSize(capBytes, resctl.TargetForBudget(capBytes, initialBudget)); err != nil {
+		return -1, fmt.Errorf("initial memory domain: %w", err)
+	}
+	if err := resctl.ValidateBalloonSize(capBytes, resctl.TargetForBudget(capBytes, allocBytes)); err != nil {
+		return -1, fmt.Errorf("settled memory domain: %w", err)
+	}
 
-	// resctl.BalloonController is the sole writer of /api/v1/vm.resize. Created
-	// only when alloc < cap (no balloon device when alloc == cap).
-	// The final initial allocatable is seeded below after controller admission,
-	// so desired/applied state matches the --balloon size= value passed to CH.
+	// Create the CH executor whenever either cold or settled policy can use a
+	// balloon. InitialTarget=0 still emits --balloon size=0.
 	var balloonCtl *resctl.BalloonController
-	initialAllocBytes := allocBytes
-	if allocBytes < capBytes {
-		balloonCtl = resctl.NewBalloonController(chSock, capBytes, logf)
+	if allocBytes < capBytes || initialBudget < capBytes {
+		balloonCtl = resctl.NewBalloonController(chSock, capBytes, opts.Cfg.CHApiDeadline(), logf)
 	}
 	// Register cgroup cleanup before ControllerHooks.Release so LIFO shutdown
 	// stops every controller goroutine while its pinned cgroup FD is still live.
@@ -184,28 +199,21 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		SandboxID:  opts.SandboxID,
 		Context:    ControllerWorkContext(ctx),
 		Logf:       logf,
-		Balloon:    balloonCtl,
 	}, opts.Cfg)
 	if err != nil {
 		return -1, fmt.Errorf("controller dial: %w", err)
 	}
 	defer hooks.Release("normal")
-	if hooks.Enabled() {
-		grantedInitial, err := hooks.Admit(opts.SandboxID, 0)
-		if err != nil {
-			return -1, err
-		}
-		if grantedInitial < allocBytes {
-			return -1, fmt.Errorf("controller admit granted initial allocatable %d below floor %d", grantedInitial, allocBytes)
-		}
-		if grantedInitial > capBytes {
-			return -1, fmt.Errorf("controller admit granted initial allocatable %d above capacity %d", grantedInitial, capBytes)
-		}
-		initialAllocBytes = grantedInitial
-		logf("controller admit ok, initial allocatable=%d", grantedInitial)
+	grantedInitial, err := hooks.Admit(opts.SandboxID, 0)
+	if err != nil {
+		return -1, err
 	}
+	initialBudget = grantedInitial
+	logf("initial cold Budget reserved=%d", initialBudget)
 	if balloonCtl != nil {
-		balloonCtl.SeedAppliedAllocatable(initialAllocBytes)
+		if err := balloonCtl.SeedColdTarget(resctl.TargetForBudget(capBytes, initialBudget)); err != nil {
+			return -1, fmt.Errorf("seed cold balloon target: %w", err)
+		}
 	}
 
 	// CgroupPath empty → no-cgroup mode, no cgroup operations.
@@ -215,23 +223,30 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	// Defer memory.high write to Settled (launch hello). Cold boot's
-	// uffd-driven page-fault burst can push the cgroup well past
-	// allocatable*0.875; if memory.high is already in effect, every
+	// Defer memory.high write until a fresh post-launch guest/CH observation.
+	// Cold boot's uffd-driven page-fault burst can push the cgroup well past
+	// its eventual steady high; if memory.high is already in effect, every
 	// UFFDIO_ZEROPAGE/COPY syscall returns through
 	// mem_cgroup_handle_over_high reclaim, throttling the uffd handler
 	// against the very faults it's trying to resolve (Issue 4 root cause).
-	// memory.max remains the hard ceiling during boot; memory.high gets
-	// written by Settled() once the boot transient is past.
+	// memory.max remains the hard ceiling during boot. Settled is only the
+	// lifecycle barrier; MemoryController derives and writes the first high.
 	cgCfg.MemoryHighBytes = 0
 	cg, err = resctl.SetupCgroup(cgCfg)
 	if err != nil {
 		return -1, fmt.Errorf("cgroup: %w", err)
 	}
 	hooks.SetLocalCgroupPath(cg.LocalPath())
+	memoryCtl, err := resctl.NewMemoryController(resctl.MemoryControllerOptions{
+		Config: opts.Cfg, CgroupPath: cg.LocalPath(), Balloon: balloonCtl,
+		Reservation: hooks, InitialBudget: initialBudget, Logf: logf,
+	})
+	if err != nil {
+		return -1, fmt.Errorf("memory controller: %w", err)
+	}
 	if cg.Active() {
-		logf("cgroup limits set: %s memory.max=%d memory.high=%d cpu.max=%dus/100000us cpu.weight=%d (CH starts in cgroup; sandbox-ctl stays out)",
-			cg.Path, cgCfg.MemoryMaxBytes, cgCfg.MemoryHighBytes,
+		logf("cgroup limits set: %s memory.max=%d memory.high=max(deferred) cpu.max=%dus/100000us cpu.weight=%d (CH starts in cgroup; sandbox-ctl stays out)",
+			cg.Path, cgCfg.MemoryMaxBytes,
 			cgCfg.CPUMaxQuotaUs, cgCfg.CPUWeight)
 	} else {
 		logf("cgroup: no path configured, running without cgroup limits (no-cgroup mode)")
@@ -446,8 +461,8 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		VAReportDeadline:  opts.Cfg.VAReportDeadline(),
 		PingTimeout:       opts.Cfg.PingDeadline(),
 		AppNotifyDeadline: opts.Cfg.AppNotifyDeadline(),
-		Balloon:           balloonCtl,
 		Hooks:             hooks,
+		Memory:            memoryCtl,
 
 		TapFile:   tapFile, // nil in tap-name/no-network modes; non-nil tapfd is inherited at fd 4
 		NetMAC:    netMAC,
@@ -475,7 +490,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 			if err != nil {
 				return nil, nil, fmt.Errorf("stdio: %w", err)
 			}
-			args, err := CHCommandWithInitialAllocatable(opts.Cfg, initialAllocBytes, e.Disks, e.CHSock, e.VsockBase, kernelPath, runtimePath, e.UffdSock, consoleArg, e.TapFDNum, e.NetMAC)
+			args, err := CHCommandWithInitialBudget(opts.Cfg, initialBudget, e.Disks, e.CHSock, e.VsockBase, kernelPath, runtimePath, e.UffdSock, consoleArg, e.TapFDNum, e.NetMAC)
 			if err != nil {
 				cleanup()
 				return nil, nil, fmt.Errorf("CH cmdline: %w", err)
@@ -485,11 +500,9 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 			return cmd, cleanup, nil
 		},
 
-		// Cold-start settle: ping ticker starts as soon as the launch
-		// handshake completes (HelloDone = LaunchSpec sent); Settled +
-		// balloon reconcile + controller heartbeat/sensor gate on the
-		// guest's launch_ack (post-boot transient over). Fire-and-forget
-		// so ServeAndWait proceeds to cmd.Wait.
+		// Cold-start settle: the command-line balloon target remains the sole
+		// target until launch_ack. The ACK opens the local report barrier;
+		// node Settled remains an independent lifecycle notification.
 		PostSpawn: func(pc PostSpawnCtx) error {
 			go func() {
 				select {
@@ -500,17 +513,14 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 				}
 				select {
 				case <-pc.Launch.LaunchAckDone():
+					if pc.Memory != nil {
+						pc.Memory.StartSensor(pc.Ctx)
+					}
 					if err := pc.Hooks.Settled(); err != nil {
 						pc.Logf("settled: %v", err)
 					}
-					if pc.Balloon != nil {
-						if err := pc.Balloon.Start(pc.Ctx); err != nil {
-							pc.Logf("balloon: start: %v", err)
-						}
-					}
 					if pc.Hooks.Enabled() {
 						pc.Hooks.StartHeartbeat(pc.Ctx, 5*time.Second)
-						pc.Hooks.StartSensor(pc.Ctx, 64<<20)
 					}
 				case <-pc.Ctx.Done():
 				}
@@ -526,11 +536,11 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 // without this escalation, sandbox-ctl waits indefinitely on cmd.Wait.
 const chShutdownGrace = 5 * time.Second
 
-// ControllerHooks holds the memory.high lifecycle lock only around cgroupfs
-// reads and writes. A brief retry window lets ordered shutdown wait out that
-// commit without blocking the signal loop. Persistent contention is treated as
-// an active lifecycle operation, where waiting for the lock could deadlock with
-// snapshot destroy waiting for this same CH process to exit.
+// MemoryController holds the memory.high lifecycle lock only around sandbox-local
+// cgroupfs reads and writes. A brief retry window lets ordered shutdown wait out
+// that commit without blocking the signal loop. Persistent contention is treated
+// as an active lifecycle operation, where waiting for the lock could deadlock
+// with snapshot destroy waiting for this same CH process to exit.
 const (
 	memoryHighLockRetryInterval = 10 * time.Millisecond
 	memoryHighLockRetryWindow   = 100 * time.Millisecond
@@ -541,8 +551,8 @@ const (
 // thread sleeping in mem_cgroup_handle_over_high cannot acknowledge pause or
 // ordered shutdown even though sandbox-ctl itself remains responsive outside
 // the cgroup. memory.max remains in force while memory.high is lifted. The
-// advisory lock is also taken by ControllerHooks, so a dynamic allocation
-// update cannot reinstate throttling inside the lifecycle critical section.
+// advisory lock is also taken by MemoryController, so a local Budget update
+// cannot reinstate throttling inside the lifecycle critical section.
 func liftVMMMemoryHigh(cgroupPath string) ([]byte, *os.File, error) {
 	return liftVMMMemoryHighWithLock(cgroupPath, unix.LOCK_EX)
 }
@@ -581,9 +591,9 @@ func liftVMMMemoryHighWithLock(cgroupPath string, lockOperation int) ([]byte, *o
 }
 
 // restoreVMMMemoryHigh restores a value saved by liftVMMMemoryHigh only while
-// the file still contains "max". ControllerHooks updates are serialized by the
-// lifecycle lock; the conditional write also avoids overwriting a change made
-// by an external writer that does not participate in that lock.
+// the file still contains "max". MemoryController updates are serialized by the
+// lifecycle lock; the conditional write also avoids overwriting a change made by
+// an external writer that does not participate in that lock.
 func restoreVMMMemoryHigh(cgroupPath string, previous []byte) (bool, error) {
 	if cgroupPath == "" || previous == nil || strings.TrimSpace(string(previous)) == "max" {
 		return false, nil
@@ -1053,9 +1063,10 @@ type SnapshotHandler struct {
 	Servers       []*vhost.Server // all vhost servers (quiesced together around the dump)
 	CHSock        string
 	RunDir        string
-	Pinger        *guestlink.Pinger // optional; if non-nil, paused around quiesce/Take
-	Forwarder     *Forwarder        // optional; if non-nil, paused + active relays collapsed around quiesce
-	Reattach      func() error      // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
+	Pinger        *guestlink.Pinger        // optional; if non-nil, paused around quiesce/Take
+	Forwarder     *Forwarder               // optional; if non-nil, paused + active relays collapsed around quiesce
+	Reattach      func() error             // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
+	Memory        *resctl.MemoryController // optional; blocks local Budget mutation across capture
 	Logf          func(string, ...any)
 }
 
@@ -1069,7 +1080,7 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 		Cfg: h.Cfg, ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
 	}
-	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, h.Pinger, h.Forwarder, h.Reattach, h.Logf)
+	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
 }
 
 // handleSnapshotRequest executes one snapshot_request received via
@@ -1089,6 +1100,7 @@ func handleSnapshotRequest(
 	pinger *guestlink.Pinger,
 	forwarder *Forwarder, // gates new forwards + collapses active relays around quiesce; may be nil
 	reattachMUX func() error, // re-establishes the stdio MUX after a resumed snapshot attempt; may be nil
+	memoryController *resctl.MemoryController,
 	logf func(string, ...any),
 ) (resp ctl.Response, err error) {
 	dropCaches := req.DropCachesEnabled()
@@ -1124,6 +1136,27 @@ func handleSnapshotRequest(
 	if localParent && !mergeRef && req.Upload {
 		return ctl.Response{}, fmt.Errorf("--merge-ref=false with a local memory parent requires --output; direct upload is not supported")
 	}
+
+	// Enter the memory lifecycle barrier immediately after request-shape
+	// validation. Artifact/merge/sink preparation may perform I/O; allowing a
+	// Budget shrink during that interval recreates the warm-up→freeze cache loss
+	// from #114 even though the later quiesce itself is serialized.
+	releaseMemoryBarrier := func() {}
+	if memoryController != nil {
+		var barrierErr error
+		releaseMemoryBarrier, barrierErr = memoryController.BeginSnapshot(context.Background())
+		if barrierErr != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot: begin memory Budget barrier: %w", barrierErr)
+		}
+	}
+	defer func() {
+		// Successful destroy mode transfers the barrier to
+		// destroyAfterSnapshot, which retains it until CH exits.
+		if err == nil && !req.ResumeAfter {
+			return
+		}
+		releaseMemoryBarrier()
+	}()
 
 	stagingDir := filepath.Join(runDir, "snap-stage")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
@@ -1302,7 +1335,7 @@ func handleSnapshotRequest(
 	// that is what makes `sandbox-ctl run` return (docs/sandbox.md §6.2 T8).
 	defer func() {
 		if err == nil && !req.ResumeAfter {
-			go destroyAfterSnapshot(chSock, cgroupPath, previousMemoryHigh, memoryHighLock, chExited, opts.Cfg.CHApiDeadline(), logf)
+			go destroyAfterSnapshot(chSock, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
 		}
 	}()
 	// Gate new port-forward connects and join every admitted handshake/relay
@@ -1346,6 +1379,21 @@ func handleSnapshotRequest(
 		dropCachesResult = result
 		guestQuiesced = true
 		logf("quiesce: guest acked (drop_caches=%s, MUX + forwards closed), proceeding to /vm.pause", result)
+	}
+	// Record the last guest observation together with one exact CH target/current
+	// pair at the freeze boundary. BeginSnapshot still holds the balloon mutation
+	// gate, and a successful guest quiesce has already stopped the application;
+	// the following snapshot.Take is the first operation allowed to pause CH.
+	if memoryController != nil {
+		freeze, captureErr := memoryController.CaptureState(context.Background())
+		if captureErr != nil {
+			logf("snapshot: freeze memory observation unavailable: %v", captureErr)
+		} else {
+			logf("snapshot: freeze memory MemAvailable=%d Cached=%d BalloonTarget=%d BalloonCurrent=%d TargetBudget=%d CurrentBudget=%d ObservedBudget=%d Reservation=%d report=%d/%d",
+				freeze.GuestMemAvailable, freeze.GuestCached, freeze.BalloonTarget,
+				freeze.BalloonCurrent, freeze.TargetBudget, freeze.CurrentBudget,
+				freeze.ObservedBudget, freeze.Reservation, freeze.ReportEpoch, freeze.ReportSeq)
+		}
 	}
 
 	// Build snapshot.cfg builder closure. Take() invokes it with the final
@@ -1448,17 +1496,20 @@ const destroyAfterSnapshotDelay = 300 * time.Millisecond
 // the `sandbox-ctl run` process owning this ctl.sock returns. Run on a
 // goroutine on the resume_after=false ("destroy") path: by the time the
 // delay elapses the snapshot_done response has been queued + sent. The
-// memory.high lifecycle lock remains held until CH exits so controller updates
-// cannot reinstate throttling during ordered shutdown. Errors are only logged
-// — the sandbox is being torn down regardless.
+// memory.high lifecycle lock and balloon mutation barrier remain held until CH
+// exits, including when the shutdown request itself fails. Errors are only
+// logged — the sandbox is being torn down regardless.
 func destroyAfterSnapshot(
-	chSock, cgroupPath string,
-	previousMemoryHigh []byte,
+	chSock string,
 	memoryHighLock *os.File,
+	releaseMemoryBarrier func(),
 	chExited <-chan struct{},
 	respDeadline time.Duration,
 	logf func(string, ...any),
 ) {
+	if releaseMemoryBarrier != nil {
+		defer releaseMemoryBarrier()
+	}
 	if memoryHighLock != nil {
 		defer func() {
 			if err := memoryHighLock.Close(); err != nil {
@@ -1469,14 +1520,10 @@ func destroyAfterSnapshot(
 	time.Sleep(destroyAfterSnapshotDelay)
 	if err := (chapi.Client{Sock: chSock, RespDeadline: respDeadline}).ShutdownVMM(); err != nil {
 		logf("snapshot: destroy mode — vmm.shutdown: %v", err)
-		if restored, restoreErr := restoreVMMMemoryHigh(cgroupPath, previousMemoryHigh); restoreErr != nil {
-			logf("snapshot: destroy mode — restore VMM memory.high: %v", restoreErr)
-		} else if restored {
-			logf("snapshot: destroy mode — restored VMM memory.high after shutdown failure")
-		}
-		return
+		logf("snapshot: destroy mode — retaining memory barrier until VMM exit")
+	} else {
+		logf("snapshot: destroy mode — VMM shutdown requested")
 	}
-	logf("snapshot: destroy mode — VMM shutdown requested")
 	if chExited != nil {
 		<-chExited
 	}

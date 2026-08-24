@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -216,7 +217,7 @@ func TestHandleSnapshotRequestRejectsMergedLocalLowerBeforeQuiesce(t *testing.T)
 			viewCalled = true
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		},
-	}}, nil, "", filepath.Join(dir, "run"), "", nil, pinger, nil, nil, discardLogf)
+	}}, nil, "", filepath.Join(dir, "run"), "", nil, pinger, nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "direct upload would retain a local memory lower") {
 		t.Fatalf("local lower preflight error = %v", err)
 	}
@@ -234,13 +235,13 @@ func TestHandleSnapshotRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T
 	disks := []SnapDiskRef{{DiffPath: filepath.Join(t.TempDir(), "not-needed.diff")}}
 
 	_, err := handleSnapshotRequest(ctl.Request{}, baseOpts, nil, disks, nil,
-		"", t.TempDir(), "", nil, pinger, nil, nil, discardLogf)
+		"", t.TempDir(), "", nil, pinger, nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "--output and --upload") {
 		t.Fatalf("missing output error = %v", err)
 	}
 
 	_, err = handleSnapshotRequest(ctl.Request{Upload: true}, baseOpts, nil, disks, nil,
-		"", t.TempDir(), "", nil, pinger, nil, nil, discardLogf)
+		"", t.TempDir(), "", nil, pinger, nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "manifest") {
 		t.Fatalf("missing manifest config error = %v", err)
 	}
@@ -272,7 +273,7 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 				return bytes.NewReader(make([]byte, 4096)), nil, nil
 			},
 		}}, nil, "", filepath.Join(dir, "run"),
-		"", nil, pinger, nil, nil, discardLogf)
+		"", nil, pinger, nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") {
 		t.Fatalf("disk merge preflight error = %v", err)
 	}
@@ -301,7 +302,7 @@ func TestHandleSnapshotRequestResolvesUploadKeyBeforeSnapshotView(t *testing.T) 
 			viewCalled = true
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		},
-	}}, nil, "", filepath.Join(dir, "run"), "", nil, nil, nil, nil, discardLogf)
+	}}, nil, "", filepath.Join(dir, "run"), "", nil, nil, nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "customer key") {
 		t.Fatalf("upload key error = %v", err)
 	}
@@ -433,6 +434,7 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 			reattachedAfterResume = true
 			return nil
 		},
+		nil,
 		discardLogf,
 	)
 	if err == nil || !strings.Contains(err.Error(), "CH snapshot") {
@@ -531,10 +533,16 @@ func TestVMMMemoryHighLifecycleGuard(t *testing.T) {
 		}
 	})
 
-	t.Run("serialize controller update", func(t *testing.T) {
+	t.Run("serialize local Budget high update", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "memory.high")
 		if err := os.WriteFile(path, []byte("234881024"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// A local high update must read the host VMM charge as a safety lower
+		// bound. Model the cgroup input explicitly; an absent memory.current is
+		// intentionally fail-closed and would keep the controller retrying.
+		if err := os.WriteFile(filepath.Join(dir, "memory.current"), []byte("0"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		previous, memoryHighLock, err := liftVMMMemoryHigh(dir)
@@ -548,31 +556,23 @@ func TestVMMMemoryHighLifecycleGuard(t *testing.T) {
 		}()
 		cfg := &config.SandboxConfig{Resources: config.ResourcesConfig{
 			Capacity:    config.CapacityConfig{Memory: "8GiB"},
-			Allocatable: config.AllocatableConfig{Memory: "512MiB"},
+			Allocatable: config.AllocatableConfig{Memory: "8GiB"},
 		}}
 		cfg.ApplyDefaults()
-		hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
-			CgroupPath: dir,
-			Logf:       discardLogf,
-		}, cfg)
+		memoryCtl, err := resctl.NewMemoryController(resctl.MemoryControllerOptions{
+			Config: cfg, CgroupPath: dir, InitialBudget: 8 << 30, Logf: discardLogf,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer hooks.Release("test")
-
-		const newAllocatable = uint64(400 << 20)
-		applyStarted := make(chan struct{})
-		applyDone := make(chan error, 1)
-		go func() {
-			close(applyStarted)
-			applyDone <- hooks.OnAllocatableChanged(newAllocatable)
-		}()
-		<-applyStarted
-		select {
-		case err := <-applyDone:
-			t.Fatalf("controller update did not wait for lifecycle lock: %v", err)
-		case <-time.After(25 * time.Millisecond):
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		memoryCtl.StartCold(ctx)
+		defer memoryCtl.Stop()
+		if !memoryCtl.SubmitGuestReport(proto.MemReport{Epoch: 1, Seq: 1, MemTotalBytes: 8 << 30, MemAvailableBytes: 8 << 30}) {
+			t.Fatal("report rejected")
 		}
+		time.Sleep(25 * time.Millisecond)
 		if value, err := os.ReadFile(path); err != nil {
 			t.Fatal(err)
 		} else if string(value) != "max" {
@@ -590,20 +590,68 @@ func TestVMMMemoryHighLifecycleGuard(t *testing.T) {
 			t.Fatal(err)
 		}
 		memoryHighLock = nil
-		select {
-		case err := <-applyDone:
-			if err != nil {
-				t.Fatal(err)
+		deadline := time.Now().Add(time.Second)
+		for {
+			value, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
 			}
-		case <-time.After(time.Second):
-			t.Fatal("controller update remained blocked after lifecycle lock release")
-		}
-		if value, err := os.ReadFile(path); err != nil {
-			t.Fatal(err)
-		} else if want := fmt.Sprint(uint64(float64(newAllocatable) * 0.875)); string(value) != want {
-			t.Fatalf("memory.high = %q, want controller value %q", value, want)
+			if string(value) != "234881024" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("local Budget update remained blocked after lifecycle lock release")
+			}
+			time.Sleep(time.Millisecond)
 		}
 	})
+}
+
+func TestDestroyAfterSnapshotRetainsBarrierWhenShutdownFails(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "ch.sock")
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestSeen := make(chan struct{}, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/api/v1/vmm.shutdown" {
+			t.Errorf("shutdown request = %s %s", r.Method, r.URL.Path)
+		}
+		requestSeen <- struct{}{}
+		w.WriteHeader(http.StatusInternalServerError)
+	})}
+	serverDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(serverDone)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-serverDone
+	})
+
+	chExited := make(chan struct{})
+	barrierReleased := make(chan struct{})
+	go destroyAfterSnapshot(sock, nil, func() { close(barrierReleased) }, chExited, time.Second, discardLogf)
+
+	select {
+	case <-requestSeen:
+	case <-time.After(time.Second):
+		t.Fatal("destroy shutdown request was not sent")
+	}
+	select {
+	case <-barrierReleased:
+		t.Fatal("destroy barrier released after failed shutdown while VMM was still live")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(chExited)
+	select {
+	case <-barrierReleased:
+	case <-time.After(time.Second):
+		t.Fatal("destroy barrier was not released after VMM exit")
+	}
 }
 
 // TestWaitForCH_NoSignals: clean-exit path — doneCh fires before any
@@ -744,7 +792,7 @@ func TestVMMMemoryHighThrottleDrainDelay(t *testing.T) {
 	}
 }
 
-func TestWaitForCH_BriefControllerLockContentionRetriesOrderedShutdown(t *testing.T) {
+func TestWaitForCH_BriefMemoryHighLockContentionRetriesOrderedShutdown(t *testing.T) {
 	dir := t.TempDir()
 	memoryHighPath := filepath.Join(dir, "memory.high")
 	for name, value := range map[string]string{
@@ -756,18 +804,18 @@ func TestWaitForCH_BriefControllerLockContentionRetriesOrderedShutdown(t *testin
 			t.Fatal(err)
 		}
 	}
-	controllerLock, err := os.Open(dir)
+	memoryHighLock, err := os.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer controllerLock.Close()
-	if err := unix.Flock(int(controllerLock.Fd()), unix.LOCK_EX); err != nil {
+	defer memoryHighLock.Close()
+	if err := unix.Flock(int(memoryHighLock.Fd()), unix.LOCK_EX); err != nil {
 		t.Fatal(err)
 	}
 	lockHeld := true
 	defer func() {
 		if lockHeld {
-			_ = unix.Flock(int(controllerLock.Fd()), unix.LOCK_UN)
+			_ = unix.Flock(int(memoryHighLock.Fd()), unix.LOCK_UN)
 		}
 	}()
 
@@ -824,12 +872,12 @@ func TestWaitForCH_BriefControllerLockContentionRetriesOrderedShutdown(t *testin
 	select {
 	case <-retryStarted:
 	case <-time.After(time.Second):
-		t.Fatal("shutdown did not retry the controller lock")
+		t.Fatal("shutdown did not retry the memory.high lifecycle lock")
 	}
 	if proc.sentCount(syscall.SIGTERM) != 0 {
-		t.Fatalf("brief controller contention caused fallback signal: %v", proc.sent)
+		t.Fatalf("brief memory.high lifecycle contention caused fallback signal: %v", proc.sent)
 	}
-	if err := unix.Flock(int(controllerLock.Fd()), unix.LOCK_UN); err != nil {
+	if err := unix.Flock(int(memoryHighLock.Fd()), unix.LOCK_UN); err != nil {
 		t.Fatal(err)
 	}
 	lockHeld = false
@@ -839,7 +887,7 @@ func TestWaitForCH_BriefControllerLockContentionRetriesOrderedShutdown(t *testin
 			t.Fatal("retried ordered shutdown did not observe memory.high=max")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("ordered shutdown was not attempted after controller lock release")
+		t.Fatal("ordered shutdown was not attempted after memory.high lifecycle lock release")
 	}
 	doneCh <- nil
 	select {
@@ -965,7 +1013,7 @@ func TestWaitForCH_LockRetryRemainsSignalResponsive(t *testing.T) {
 	select {
 	case <-retryStarted:
 	case <-time.After(time.Second):
-		t.Fatal("shutdown did not enter the controller lock retry window")
+		t.Fatal("shutdown did not enter the memory.high lifecycle lock retry window")
 	}
 	start := time.Now()
 	sigCh <- syscall.SIGINT
@@ -973,13 +1021,13 @@ func TestWaitForCH_LockRetryRemainsSignalResponsive(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("second signal was blocked by controller lock retry for %s", elapsed)
+		t.Fatalf("second signal was blocked by memory.high lifecycle lock retry for %s", elapsed)
 	}
 	if proc.sentCount(syscall.SIGKILL) != 1 {
-		t.Fatalf("expected immediate SIGKILL during controller lock retry, got %v", proc.sent)
+		t.Fatalf("expected immediate SIGKILL during memory.high lifecycle lock retry, got %v", proc.sent)
 	}
 	if proc.sentCount(syscall.SIGTERM) != 0 {
-		t.Fatalf("controller lock retry unexpectedly fell back before escalation: %v", proc.sent)
+		t.Fatalf("memory.high lifecycle lock retry unexpectedly fell back before escalation: %v", proc.sent)
 	}
 	doneCh <- nil
 	select {

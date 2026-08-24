@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 	"gopkg.in/yaml.v3"
 )
 
@@ -286,6 +287,39 @@ func TestMemoryParsing(t *testing.T) {
 	}
 	if got != 1<<30 {
 		t.Errorf("AllocatableMemoryBytes = %d, want %d", got, 1<<30)
+	}
+}
+
+func TestLoadRejectsRemovedWatermarkMemory(t *testing.T) {
+	_, err := LoadConfigBytes([]byte(`
+resources:
+  capacity: {cpu: 1, memory: 1GiB}
+  allocatable: {cpu: 1, memory: 256MiB}
+  watermark_high:
+    memory: 224MiB
+`))
+	if err == nil || !strings.Contains(err.Error(), "field memory not found") {
+		t.Fatalf("LoadConfigBytes removed watermark_high.memory error=%v", err)
+	}
+}
+
+func TestLoadWatermarkRatio(t *testing.T) {
+	cfg, err := LoadConfigBytes([]byte(`
+resources:
+  capacity: {cpu: 1, memory: 1GiB}
+  allocatable: {cpu: 1, memory: 256MiB}
+  watermark_high:
+    ratio: 0.875
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := cfg.WatermarkHighRatio()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != resource.DefaultWatermarkHighRatio {
+		t.Fatalf("WatermarkHighRatio()=%d, want %d", got, resource.DefaultWatermarkHighRatio)
 	}
 }
 
@@ -805,17 +839,16 @@ func TestValidateCold_ResourceControl(t *testing.T) {
 
 	t.Run("watermark_high without cgroup", func(t *testing.T) {
 		run(t, func(c *SandboxConfig) {
-			c.Resources.WatermarkHigh = &WatermarkHighConfig{Memory: "256MiB"}
+			c.Resources.WatermarkHigh = &WatermarkHighConfig{Ratio: 0.875}
 		}, "resources.watermark_high requires")
 	})
 
-	t.Run("startup without controller", func(t *testing.T) {
-		// Even with cgroup_path set, startup still needs controller.
+	t.Run("startup is valid in static mode", func(t *testing.T) {
 		dir := t.TempDir()
 		run(t, func(c *SandboxConfig) {
 			c.Resources.Control.CgroupPath = dir
 			c.Resources.Startup = &StartupConfig{Memory: "256MiB"}
-		}, "resources.startup requires")
+		}, "")
 	})
 
 	t.Run("fractional cpu without cgroup", func(t *testing.T) {
@@ -841,23 +874,27 @@ func TestValidateCold_ResourceControl(t *testing.T) {
 		}, "is not a directory")
 	})
 
-	t.Run("watermark_high above allocatable", func(t *testing.T) {
+	t.Run("watermark_high ratio at one", func(t *testing.T) {
 		dir := t.TempDir()
 		run(t, func(c *SandboxConfig) {
 			c.Resources.Control.CgroupPath = dir
-			// allocatable.memory = 1GiB; set watermark_high above that
-			c.Resources.WatermarkHigh = &WatermarkHighConfig{Memory: "2GiB"}
-		}, "watermark_high.memory")
+			c.Resources.WatermarkHigh = &WatermarkHighConfig{Ratio: 1}
+		}, "watermark_high.ratio")
 	})
 
-	t.Run("startup below allocatable", func(t *testing.T) {
+	t.Run("startup below allocatable is valid", func(t *testing.T) {
 		dir := t.TempDir()
 		run(t, func(c *SandboxConfig) {
 			c.Resources.Control.CgroupPath = dir
 			c.Resources.Control.Controller = "/run/x.sock"
-			// allocatable=1GiB; startup below it
 			c.Resources.Startup = &StartupConfig{Memory: "256MiB"}
-		}, "startup.memory")
+		}, "")
+	})
+
+	t.Run("startup zero", func(t *testing.T) {
+		run(t, func(c *SandboxConfig) {
+			c.Resources.Startup = &StartupConfig{Memory: "0"}
+		}, "startup.memory must be > 0")
 	})
 
 	t.Run("startup above capacity", func(t *testing.T) {
@@ -914,6 +951,78 @@ func TestValidateRestoreHostConfigRejectsRelativeCgroupPath(t *testing.T) {
 	}
 }
 
+func TestValidateRestoreHostConfigMemoryPolicy(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*SandboxConfig)
+		wantErr string
+	}{
+		{
+			name: "overhead without cgroup",
+			mutate: func(c *SandboxConfig) {
+				c.Resources.Overhead = &OverheadConfig{Memory: "32MiB"}
+			},
+			wantErr: "resources.overhead requires",
+		},
+		{
+			name: "watermark without cgroup",
+			mutate: func(c *SandboxConfig) {
+				c.Resources.WatermarkHigh = &WatermarkHighConfig{Ratio: 0.875}
+			},
+			wantErr: "resources.watermark_high requires",
+		},
+		{
+			name: "invalid ratio",
+			mutate: func(c *SandboxConfig) {
+				c.Resources.Control.CgroupPath = "/sys/fs/cgroup/test"
+				c.Resources.WatermarkHigh = &WatermarkHighConfig{Ratio: 1}
+			},
+			wantErr: "resources.watermark_high.ratio",
+		},
+		{
+			name: "zero allocatable",
+			mutate: func(c *SandboxConfig) {
+				c.Resources.Allocatable.Memory = "0"
+			},
+			wantErr: "resources.allocatable.memory must be > 0",
+		},
+		{
+			name: "allocatable above capacity",
+			mutate: func(c *SandboxConfig) {
+				c.Resources.Allocatable.Memory = "2GiB"
+			},
+			wantErr: "resources.allocatable.memory must be ≤ capacity.memory",
+		},
+		{
+			name: "zero startup",
+			mutate: func(c *SandboxConfig) {
+				c.Resources.Startup = &StartupConfig{Memory: "0"}
+			},
+			wantErr: "resources.startup.memory must be > 0",
+		},
+		{
+			name: "startup above capacity",
+			mutate: func(c *SandboxConfig) {
+				c.Resources.Startup = &StartupConfig{Memory: "2GiB"}
+			},
+			wantErr: "resources.startup.memory",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &SandboxConfig{}
+			cfg.Resources.Capacity.CPU = 1
+			cfg.Resources.Capacity.Memory = "1GiB"
+			cfg.Resources.Allocatable.Memory = "256MiB"
+			tc.mutate(cfg)
+			err := cfg.ValidateRestoreHostConfig()
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidateRestoreHostConfig() error=%v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestResourceControlDefaults(t *testing.T) {
 	dir := t.TempDir()
 	cfg, err := Load(writeYAML(t, `
@@ -948,23 +1057,23 @@ launch: { exec: /bin/true }
 		t.Errorf("default overhead = %d, want 32 MiB (%d)", ovh, 32<<20)
 	}
 
-	// WatermarkHigh default = allocatable * 0.875
-	wm, err := cfg.WatermarkHighBytes()
+	// WatermarkHigh default = fixed-point 0.875.
+	wm, err := cfg.WatermarkHighRatio()
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := uint64(float64(256<<20) * 0.875)
+	want := uint64(875_000)
 	if wm != want {
 		t.Errorf("default watermark_high = %d, want %d", wm, want)
 	}
 
-	// Startup default = allocatable
+	// Startup default = Capacity.
 	sb, err := cfg.StartupBytes()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sb != 256<<20 {
-		t.Errorf("default startup = %d, want allocatable %d", sb, 256<<20)
+	if sb != 2<<30 {
+		t.Errorf("default startup = %d, want Capacity %d", sb, uint64(2<<30))
 	}
 
 	// DeflateOnOOM default = true

@@ -11,6 +11,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
+	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"gopkg.in/yaml.v3"
 )
 
@@ -164,7 +165,6 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 		out.Resources.Capacity.CPU = snap.Resources.Capacity.CPU
 		out.Resources.Capacity.Memory = snap.Resources.Capacity.Memory
 	}
-
 	// 2. network: zero or one host source. Run later matches zero/one against
 	// the virtio-net topology captured in config.json.
 	if host.Network.TAP != "" && host.Network.TapFD != nil {
@@ -279,7 +279,47 @@ func ApplyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath stri
 	// on the restore path. launch.cgroup_control is snapshot-owned guest topology
 	// and was copied above so a later snapshot preserves it.
 
+	if err := validateResolvedRestoreMemoryPolicy(&out); err != nil {
+		return nil, err
+	}
 	return &out, nil
+}
+
+// validateResolvedRestoreMemoryPolicy applies the Capacity-relative bounds only
+// after snapshot.cfg has supplied an omitted host Capacity. Startup is checked
+// as schema input but is never used to reserve or size a restored VM.
+func validateResolvedRestoreMemoryPolicy(c *config.SandboxConfig) error {
+	capacity, err := c.CapacityMemoryBytes()
+	if err != nil {
+		return fmt.Errorf("resources.capacity.memory: %w", err)
+	}
+	if capacity == 0 {
+		return errors.New("resources.capacity.memory must be > 0")
+	}
+	allocatable, err := c.AllocatableMemoryBytes()
+	if err != nil {
+		return fmt.Errorf("resources.allocatable.memory: %w", err)
+	}
+	if allocatable == 0 {
+		return errors.New("resources.allocatable.memory must be > 0")
+	}
+	if allocatable > capacity {
+		return errors.New("resources.allocatable.memory must be ≤ capacity.memory")
+	}
+	if c.Resources.Startup == nil {
+		return nil
+	}
+	startup, err := util.ParseSize(c.Resources.Startup.Memory)
+	if err != nil {
+		return fmt.Errorf("resources.startup.memory: %w", err)
+	}
+	if startup == 0 {
+		return errors.New("resources.startup.memory must be > 0")
+	}
+	if startup > capacity {
+		return fmt.Errorf("resources.startup.memory (%d) must be ≤ capacity.memory (%d)", startup, capacity)
+	}
+	return nil
 }
 
 // resolveBootFileRef enforces the file:// rules for boot.runtime /
