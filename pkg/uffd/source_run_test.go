@@ -404,18 +404,6 @@ func (g *snapshotManifestGetter) Get(_ context.Context, partition store.Partitio
 
 type snapshotTestDecryptor struct{ keyBytes int }
 
-func (snapshotTestDecryptor) DecryptChunk(_ [32]byte, ciphertext []byte) ([]byte, error) {
-	return append([]byte(nil), ciphertext...), nil
-}
-
-func (snapshotTestDecryptor) DecryptChunkInPlace(_ [32]byte, ciphertext []byte) ([]byte, error) {
-	return ciphertext, nil
-}
-
-// DecryptChunkTo keeps this cross-repository test fake source-compatible with
-// accelerator #72 while the accelerator and sandboxer changes merge in order.
-// The legacy methods above are removed by the follow-up dependency cleanup
-// after the accelerator canonical format lands.
 func (snapshotTestDecryptor) DecryptChunkTo(_ context.Context, _ [32]byte, ciphertext, dst []byte) error {
 	if len(ciphertext) != len(dst) {
 		return errors.New("snapshot test decryptor: ciphertext and destination sizes differ")
