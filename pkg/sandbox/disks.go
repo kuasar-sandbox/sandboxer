@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 
@@ -16,10 +17,15 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
 
+// FileStreamOpener opens one already-resolved file:// artifact. Callers that
+// have manifest configuration use it to share the tarstream/Bundle content
+// detector; nil preserves the legacy tarstream-only path.
+type FileStreamOpener func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error)
+
 // OpenBlockReader resolves a file:// or manifest:// disk URI into a
 // vhost.BlockReader plus the total disk size, via a fetch.Stream. file://
-// opens a local tarstream artifact; manifest:// resolves one manifest through
-// the fetcher. Both wrap in a
+// opens a local tarstream by default or uses the supplied unified opener;
+// manifest:// resolves one manifest through the fetcher. Both wrap in a
 // StreamReader whose Close releases the stream (the file's fd; a manifest
 // stream's cache/store client is owned by the Fetcher and closed separately).
 //
@@ -31,7 +37,13 @@ import (
 // ctx scopes asynchronous chunk fetches kicked off by later ReadAt calls;
 // cancelling it makes pending vhost-user-blk reads fail promptly at shutdown.
 func OpenBlockReader(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (vhost.BlockReader, int64, error) {
-	stream, size, err := OpenDiskStream(ctx, uri, fetcher, locations, codec, required)
+	return OpenBlockReaderWithOpener(ctx, uri, fetcher, locations, codec, required, nil)
+}
+
+// OpenBlockReaderWithOpener is OpenBlockReader with unified file:// format
+// detection supplied by the process artifact owner.
+func OpenBlockReaderWithOpener(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (vhost.BlockReader, int64, error) {
+	stream, size, err := OpenDiskStreamAtWithOpener(ctx, uri, fetcher, locations, "", codec, required, opener)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -52,17 +64,35 @@ func OpenDiskStream(ctx context.Context, uri string, fetcher fetch.Fetcher, loca
 // established by their bootstrap rather than relying on the process working
 // directory.
 func OpenDiskStreamAt(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, relativeDir string, codec tarstream.Codec, required bool) (fetch.Stream, int64, error) {
+	return OpenDiskStreamAtWithOpener(ctx, uri, fetcher, locations, relativeDir, codec, required, nil)
+}
+
+// OpenDiskStreamAtWithOpener is OpenDiskStreamAt with a caller-owned unified
+// file opener. Manifest selection and Chunk source isolation stay inside that
+// opener; this function only resolves the trusted file location.
+func OpenDiskStreamAtWithOpener(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, relativeDir string, codec tarstream.Codec, required bool, opener FileStreamOpener) (fetch.Stream, int64, error) {
 	ref, err := manifest.ParseRef(uri)
 	if err != nil {
 		return nil, 0, protectLocalArtifactError(codec, "parse local artifact ref", err)
 	}
 	switch ref.Scheme {
 	case manifest.RefSchemeFile:
-		// Local disk artifacts are tarstream envelopes (image/overlay);
-		// the hole map comes from the envelope, never the filesystem.
+		// Local tarstream hole maps and Bundle Manifest sparse maps both come
+		// from their logical envelopes, never from the outer filesystem.
 		path, err := locations.ResolveFile(ref, relativeDir)
 		if err != nil {
 			return nil, 0, protectLocalArtifactError(codec, "resolve local artifact ref", err)
+		}
+		if opener != nil {
+			stream, err := opener(ctx, path, ref)
+			if err != nil {
+				return nil, 0, protectLocalArtifactError(codec, "open local artifact", err)
+			}
+			if stream.Size() > math.MaxInt64 {
+				closeErr := stream.Close()
+				return nil, 0, errors.Join(fmt.Errorf("local artifact is too large"), closeErr)
+			}
+			return stream, int64(stream.Size()), nil
 		}
 		return openLocalDiskStream(path, ref, codec, required)
 	case manifest.RefSchemeManifest:
@@ -91,12 +121,18 @@ func openLocalDiskStream(path string, ref manifest.Ref, codec tarstream.Codec, r
 // OpenLayeredBlockReader opens refs in top-to-bottom order and composes them as
 // one read-only block source. A single ref is returned without an extra layer.
 func OpenLayeredBlockReader(ctx context.Context, refs []string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (vhost.BlockReader, int64, error) {
+	return OpenLayeredBlockReaderWithOpener(ctx, refs, fetcher, locations, codec, required, nil)
+}
+
+// OpenLayeredBlockReaderWithOpener is OpenLayeredBlockReader with unified
+// file:// format detection for every layer.
+func OpenLayeredBlockReaderWithOpener(ctx context.Context, refs []string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (vhost.BlockReader, int64, error) {
 	if len(refs) == 0 {
 		return nil, 0, errors.New("disk layer list is empty")
 	}
 	streams := make([]fetch.Stream, 0, len(refs))
 	for i, ref := range refs {
-		stream, _, err := OpenDiskStream(ctx, ref, fetcher, locations, codec, required)
+		stream, _, err := OpenDiskStreamAtWithOpener(ctx, ref, fetcher, locations, "", codec, required, opener)
 		if err != nil {
 			for _, opened := range streams {
 				_ = opened.Close()

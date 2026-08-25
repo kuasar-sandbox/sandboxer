@@ -70,6 +70,10 @@ type Sources struct {
 	Logf          func(string, ...any)
 	LocalCodec    tarstream.Codec
 	LocalRequired bool
+	// MergeBaseOpener opens a resolved file:// tarstream or Manifest Bundle
+	// selector. It is supplied by the lifecycle when Bundle-aware provenance is
+	// possible; nil preserves the legacy tarstream-only opener.
+	MergeBaseOpener MergeBaseOpener
 }
 
 // DiskDiff is one logical disk's writable diff to capture. SnapshotView is the
@@ -172,7 +176,7 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	out.OverlayRefs = make([]string, len(s.Diffs))
 	out.OverlayPaths = make([]string, len(s.Diffs))
 	for i, d := range s.Diffs {
-		ref, path, err := absorbOverlay(ctx, sink, d, d.MergeBase != "", s.LocalCodec, s.LocalRequired)
+		ref, path, err := absorbOverlayWithOpener(ctx, sink, d, d.MergeBase != "", s.LocalCodec, s.LocalRequired, s.MergeBaseOpener)
 		if err != nil {
 			return nil, fmt.Errorf("disk %d: %w", i, err)
 		}
@@ -202,7 +206,7 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	var memSrc io.ReadSeeker = memfdReader(s.MemfdFD, s.MemfdSize)
 	memSrcHoles := memHoles
 	if s.MergeBaseSnapshot != "" {
-		base, baseHoles, berr := openMergeBase(s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired)
+		base, baseHoles, berr := openMergeBaseWithOpener(s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MergeBaseOpener)
 		if berr != nil {
 			return nil, fmt.Errorf("merge memory base: %w", berr)
 		}
@@ -235,6 +239,10 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 // absorbOverlay streams one disk's diff to the sink, optionally flattening it
 // onto the parent's local overlay (merge, replacing the parent layer).
 func absorbOverlay(ctx context.Context, sink SnapshotSink, d DiskDiff, merging bool, codec tarstream.Codec, required bool) (string, string, error) {
+	return absorbOverlayWithOpener(ctx, sink, d, merging, codec, required, nil)
+}
+
+func absorbOverlayWithOpener(ctx context.Context, sink SnapshotSink, d DiskDiff, merging bool, codec tarstream.Codec, required bool, opener MergeBaseOpener) (string, string, error) {
 	if d.SnapshotView == nil {
 		return "", "", fmt.Errorf("snapshot diff %s has no snapshot view", d.Path)
 	}
@@ -249,7 +257,7 @@ func absorbOverlay(ctx context.Context, sink SnapshotSink, d DiskDiff, merging b
 	var src io.ReadSeeker = diff
 	holes := overlayHoles
 	if merging {
-		base, baseHoles, berr := openMergeBase(d.MergeBase, size, codec, required)
+		base, baseHoles, berr := openMergeBaseWithOpener(d.MergeBase, size, codec, required, opener)
 		if berr != nil {
 			return "", "", fmt.Errorf("merge overlay base: %w", berr)
 		}

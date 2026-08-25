@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 // artifact access. Manifest clients are allocated only when Fetcher is first
 // used, so file-only operations do not connect to cache or store.
 type ProcessStorage struct {
+	cfg           *config.ManifestConfig
 	keyFn         ingest.CustomerKeyFunc
 	localCodec    tarstream.Codec
 	localRequired bool
@@ -36,7 +38,7 @@ type ProcessStorage struct {
 // existing MANIFEST_KEY environment convention. It never accepts a key value
 // from the caller.
 func NewProcessStorage(cfg *config.ManifestConfig) (*ProcessStorage, error) {
-	s := &ProcessStorage{}
+	s := &ProcessStorage{cfg: cfg}
 	if cfg == nil {
 		return s, nil
 	}
@@ -67,7 +69,18 @@ func NewProcessStorage(cfg *config.ManifestConfig) (*ProcessStorage, error) {
 		s.localRequired = policy == crypto.LocalRequired
 	}
 	s.fetcher = &onDemandManifestFetcher{cfg: cfg, keyFn: s.keyFn}
+	if !verificationOptions(cfg).VerifyContent {
+		warnVerificationDisabled.Do(func() {
+			log.Printf("WARNING: manifest.verify_content=false; ordinary remote and Bundle Manifest/Chunk SHA-256 verification is disabled")
+		})
+	}
 	return s, nil
+}
+
+var warnVerificationDisabled sync.Once
+
+func verificationOptions(cfg *config.ManifestConfig) fetch.Options {
+	return fetch.Options{VerifyContent: cfg == nil || cfg.Manifest.VerifyContent == nil || *cfg.Manifest.VerifyContent}
 }
 
 // CustomerKeyFunc returns the process-fixed key resolver used by manifest
@@ -165,6 +178,7 @@ func newManifestFetcher(cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc
 	if err != nil {
 		return nil, nil, err
 	}
+	defer clear(customerKey[:])
 	_, decryptor, err := crypto.New(cfg.Crypto)
 	if err != nil {
 		return nil, nil, err
@@ -178,7 +192,7 @@ func newManifestFetcher(cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc
 		if err != nil {
 			return nil, nil, fmt.Errorf("manifest: dial cache: %w", err)
 		}
-		return fetch.NewFetcher(customerKey, client, decryptor), client, nil
+		return fetch.NewFetcherWithOptions(customerKey, client, decryptor, verificationOptions(cfg)), client, nil
 	}
 	if cfg.Store.Endpoint == "" {
 		return nil, nil, fmt.Errorf("manifest: cache.endpoint or store.endpoint required for fetch")
@@ -191,7 +205,7 @@ func newManifestFetcher(cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc
 	if err != nil {
 		return nil, nil, fmt.Errorf("manifest: dial store: %w", err)
 	}
-	return fetch.NewFetcher(customerKey, cache.NewStoreOrigin(client), decryptor), client, nil
+	return fetch.NewFetcherWithOptions(customerKey, cache.NewStoreOrigin(client), decryptor, verificationOptions(cfg)), client, nil
 }
 
 func optionalDuration(raw, field string) (time.Duration, error) {

@@ -318,13 +318,13 @@ guest console,无法提供无歧义的启动协议边界。
 透传的内核 dmesg 同样在写 raw 终端前做 `\n`→`\r\n`;应用的 PTY 流原样透传(guest 那侧
 伪终端的 ONLCR 已把 `\r\n` 加好)。
 
-**恢复模式**:`--restore=<snapshot-path|manifest://hex|file://basename@location:name>`
+**恢复模式**:`--restore=<snapshot-path|manifest://hex|file://bundle@manifest:key[@location:name]>`
 让 sandbox-ctl 走恢复路径
 (详见 §7)。`<ref>` 形式:
 
 - 本地 file path / `manifest://<hex>` / located file ref — 统一经
-  `StreamSnapshotSource`:file 解析为
-  稀疏文件流,manifest 经 cache-ctl + store-ctl 按 chunk 粒度 lazy fetch,再按
+  `StreamSnapshotSource`:file按内容解析为tarstream或Manifest Bundle的稀疏流,
+  manifest经cache-ctl + store-ctl按chunk粒度lazy fetch,再按
   snapshot.cfg 的 `from_refs` 叠成分层流(§3.5)写入 memfd。snapshot.cfg 内
   base_ref / overlay.base(+ base_from_refs)同理
 
@@ -342,8 +342,9 @@ env 传入(由 `pkg/manifest` 解析)。编排侧的 `node-ctl run-sandbox` 启�
 sandbox-ctl snapshot [flags]
 
   --sandbox-id <sid>    必填,目标 sandbox
-  --output <out_dir>    本地输出目录。crypto.local=off 产出 <sha256>.*,
-                        auto|required 产出 <hmac>.*;另建 <sid>.snapshot 符号链接
+  --output <out_dir>    本地输出目录;另建 <sid>.snapshot 符号链接
+  --mode local|bundle   本地格式,缺省 local。local 保持 tarstream 多文件;
+                        bundle 只产出一个 <root-manifest-key>.bundle
   --upload              上传至 manifest 存储:overlay 流式 ingest 拿 manifest key,
                         <sid>.snapshot 内嵌 snapshot.cfg 的 overlay.base 写为
                         manifest://<key>;stdout 输出 snapshot manifest key
@@ -365,7 +366,9 @@ sandbox-ctl snapshot [flags]
 
 **`--output` 与 `--upload` 严格互斥**——必须二选一,两者都给或都不给均报错
 退出。两者代表"持久化目的地"的两种形态(本地 vs manifest 存储),混用会让
-snapshot.cfg 的 overlay.base 引用与实际数据位置脱节。
+snapshot.cfg 的 overlay.base 引用与实际数据位置脱节。`--upload` 也不得与显式
+`--mode` 混用;直接上传继续使用既有 IngestSink。`--mode=bundle` 需要 manifest
+配置和客户密钥,但 Store endpoint 可省略。
 
 **销毁路径**(`--resume=false` 默认):snapshot 完成后,sandbox-ctl run 进程
 通过 CH `/vm.shutdown` 优雅关机(ACPI shutdown → guest sandbox-init 收到事件
@@ -480,17 +483,25 @@ sandbox-ctl info <snapshot-ref | snapshot-path> [flags]
 ### 2.7 `sandbox-ctl upload-snapshot`
 
 把一个本地 snapshot graph 离线发布为 canonical portable ref,不启动沙箱、不需
-`/dev/kvm`。发布到 manifest 时 local file refs 改写为 `manifest://`;发布到 named
-location 时改写为
-`file://<content-addressed-basename>@<scheme>:<digest>@location:<name>`。已有
-manifest/located refs 原样保留,因此三者可以混合。root snapshot 总会重建并发布,
-stdout 只打印新的 canonical root ref。`runtime_ref` 是节点级启动工件,仍按摘要
-钉住并随平台分发,不进入租户工件发布域。
+`/dev/kvm`。输入按内容自动识别:
+
+- tarstream root 保持既有路径:发布到 manifest 时递归升级 local file refs并重建
+  root;发布到 named location 时重编码为 located tarstream refs。
+- Manifest Bundle 发布到 Store 时读取文件内 admission,对目标执行
+  `AdmitWriteFor(recorded.Generation)` 并要求 generation/salt 完全一致;随后强制校验
+  全部 physical ContentKey、key table、Chunk plaintext 与 recorded salt domain,
+  原样上传唯一 Chunk、非 root Manifest,最后上传 root Manifest。不会重新 chunk、
+  压缩、加密、seal key table或改写 `snapshot.cfg`,输出 root key 与本地相同。
+- Manifest Bundle 发布到 named location 只复制一个 `<root-key>.bundle`,返回
+  `file://<root-key>.bundle@location:<name>`;不做 Store admission。
+
+已有 manifest/located refs 原样保留。`runtime_ref` 是节点级启动工件,仍按摘要钉住
+并随平台分发,不进入租户 snapshot-layer 发布域。
 
 ```
 sandbox-ctl upload-snapshot [flags] <snapshot-path>
 
-  <snapshot-path>         本地 <sid>.snapshot(或其指向的 <digest>.snapshot)
+  <snapshot-path>         本地 <sid>.snapshot(指向 tarstream 或 `.bundle`)
   --manifest-config <p>   存储配置 YAML(MANIFEST_CONFIG env);$MANIFEST_KEY 提供客户密钥
   --to-ref-location <name>=<file-URI>
                           与 --manifest-config 二选一;目标目录只写内容寻址文件
@@ -501,7 +512,8 @@ sandbox-ctl upload-snapshot [flags] <snapshot-path>
 目标。使用 named location 时仍可由 `MANIFEST_CONFIG` 环境变量提供
 `crypto.local` policy;若未提供则按默认 `off`。
 
-local file refs 按 bundle 同目录解析;已有 portable ref 是本次发布边界。发布器按
+下述递归重建规则只适用于 tarstream 输入。local file refs 按 root 同目录解析;已有
+portable ref 是本次发布边界。发布器按
 `snapshot.cfg` 字段区分三种角色:只解析并重建命令行指定的 root snapshot graph;
 `from_refs` 中的本地项是已经 flatten 的 memory-only lower,作为 opaque snapshot
 tarstream 独立发布,不再读取其中历史 `snapshot.cfg` 或追踪它的旧 disk refs;当前
@@ -520,7 +532,8 @@ root/data disk 字段中的本地项同样作为 opaque leaf 发布。相同 rea
 现有终态,由后续上传重试。复用成功前会同步已验证的文件和父目录。
 并发修复不引入 advisory lock 或锁文件:竞争期间 publisher 可以删除彼此尚未完成的
 普通 final,竞争停止后最后仍在执行的上传完成发布。symlink 和非普通文件始终拒绝且
-不会删除。
+不会删除。Manifest Bundle 的 exact-copy 路径不使用这些 tarstream 重编码/修复规则;
+目标存在时必须与源文件 byte-identical 才复用。
 
 因此 named ref-location 的共享文件系统只需支持 `mkdir`、create、exclusive create、
 write、read、stat、pread/seek、chmod、file/directory sync,以及删除不一致或不完整的
@@ -768,17 +781,38 @@ CH API 是本地管理调用、快且不受远程/缓存慢影响,60s 是安全�
 是节点级配置,所有 CLI 共享(sandbox-ctl 通过 `--manifest-config` 或
 `MANIFEST_CONFIG` 环境变量引用,详见 `accelerator/docs/manifest.md`)。
 
-本地 immutable tarstream 复用同一 `crypto` 节:
+与 Bundle 相关的节点级配置示例:
 
 ```yaml
+manifest:
+  # 普通 Bundle/远端读取的 physical SHA-256 复验;缺省 true。
+  verify_content: true
+  # 可选。在线时由 Store.AdmitWriteFor 确认;离线时按公共 salt 派生。
+  # 省略且离线时使用普通 generation 名 NONE。
+  write_generation: G2026-08
+
 crypto:
   chunk: aes
   manifest: aes
   local: off             # off | auto | required;默认 off
 ```
 
-`crypto.local` 是兼容/强制 policy,不是算法选择。`off` 不解析本地 customerKey,
-也不构造 codec;`auto` 写 encrypted v1,读取时兼容历史 plaintext;`required` 同样
+有 `store.endpoint` 且省略 `write_generation` 时调用 `Store.AdmitWrite()` 取得当前
+writable admission;显式配置时调用 `Store.AdmitWriteFor(generation)`。Store RPC失败
+不会退回本地派生。无 Store 时显式 generation或缺省 `NONE` 都通过公共
+`store.SaltForGeneration` 派生。一次 Bundle snapshot 在 guest pause 前只取得一次
+admission,其内全部 Manifest/Chunk共用该 generation和salt。
+
+`verify_content=false` 只跳过普通运行时 Bundle和远端 Fetcher的 physical SHA-256
+扫描,启动时只记录一次清晰告警;不会改变解密、解压和结构校验。`manifest-ctl verify`、
+Bundle full verify、Bundle upload和Store导入/导出始终强制校验,不受此开关影响。
+
+本地 immutable tarstream 复用同一 `crypto` 节。`crypto.local` 是兼容/强制 policy,
+不是算法选择。`off` 不解析本地 tarstream customerKey,也不构造 tarstream codec;
+Bundle始终使用 Manifest/Chunk 的 `crypto.chunk` / `crypto.manifest`,因此 Bundle模式仍
+需要 customerKey。
+
+`auto` 写 encrypted v1,读取时兼容历史 plaintext;`required` 同样
 加密写入,并拒绝 plaintext 与 legacy `@sha256` ref。
 `auto|required` 必须在进程启动配置阶段取得有效 `$MANIFEST_KEY`,否则 fail closed。
 同一 sandbox-ctl 进程只解析一次 key,并把同一固定值交给 manifest key table、
@@ -823,9 +857,10 @@ sandbox-init 以 flush-and-replace 重配网卡(克隆取新 L3 身份,见 §11.
 
 `file://` 有两种语义:不带 qualifier 的路径是 node-local ref;带
 `@location:<name>` 的 ref 只允许 basename,实际目录必须由可信的可重复
-`--ref-location name=file:///absolute/path` 提供。digest qualifier 是
-`@sha256:<digest>` 或 `@hmac:<digest>`,如存在必须位于 `@location` 之前。located
-file ref 与 `manifest://<key>` 都是 portable ref;
+`--ref-location name=file:///absolute/path` 提供。身份 qualifier 三选一:
+`@sha256:<digest> | @hmac:<digest> | @manifest:<key>`,如存在必须位于可选的
+`@location` 之前。tarstream只接受 sha256/hmac;Manifest Bundle只接受 manifest。
+located file ref 与 `manifest://<key>` 都是 portable ref;
 `manifest://` 只允许单个 key,分层通过 `base_from_refs` 等显式数组表达。
 
 | 字段 | `file://` | `manifest://` | 备注 |
@@ -885,7 +920,41 @@ EROFS 保持从 offset 0 开始,bundle 总大小保持 2 MiB 对齐。runtime di
 ZIP 前的 EROFS + padding,启动和恢复只从 EOF 读取 ZIP marker,Cloud Hypervisor
 仍把整个 bundle 直接作为 virtio-pmem backing。
 
-### 3.2.2 active diff encryption
+### 3.2.2 Manifest Bundle
+
+`--mode=bundle` 使用标准 ZIP64且全部 entry为 `zip.Store`,只允许:
+
+```text
+admission/<generation>/<64hex-salt>
+manifest/<64hex-content-key>
+chunk/<64hex-content-key>
+```
+
+对象 payload 是现有 physical Manifest/Chunk原始字节;不使用 ZIP Deflate、ZIP
+encryption、整文件摘要/加密或额外 metadata。一个文件记录一个完整
+`WriteAdmission`,并包含 root memory、root disk、每个data disk当前层以及需要本地
+保留的父层 Manifest。共享 Chunk按ContentKey只存一份。
+
+入口继续统一使用 `file://`:
+
+```text
+file://latest.bundle@manifest:<root-key>
+file://<root-key>.bundle@location:snapshots
+```
+
+未显式给 `@manifest` 时,先解析 symlink并从最终文件名 `<root-key>.bundle` 选择root;
+所选root必须存在于该Bundle。opener按内容识别 encrypted tarstream、ZIP Manifest
+Bundle、plaintext tarstream;ZIP local-header magic一旦命中就严格按Bundle profile
+解析,任何错误都fail closed,不得回退tarstream。
+
+读侧只在 Manifest 层选源:若 key在Bundle中,该Manifest及全部非零Chunk只从Bundle
+读取,打开Manifest时仅以Central Directory map检查完整Chunk闭包;缺失、损坏或I/O
+错误都直接失败。若Manifest不在Bundle中,该Manifest及其Chunk全部走远端Fetcher;
+即使Bundle恰好有同key Chunk也不得使用。不存在对象级Bundle→remote fallback
+Getter。root Bundle在整个sandbox生命周期保持打开,远端Fetcher只在首次Manifest
+miss时惰性连接。
+
+### 3.2.3 active diff encryption
 
 active diff 是 mutable sparse block device backing,不使用 tarstream record envelope,
 也没有 Digester、`hmac` ref 或内容寻址文件名。`crypto.local=off` 新建历史 plaintext
@@ -958,7 +1027,8 @@ honor 的 OCI config 子集:`Entrypoint` / `Cmd` / `Env` / `WorkingDir` /
 
 ### 3.4 snapshot.cfg(snapshot 内嵌)
 
-`snapshot.cfg` 是 `<sid>.snapshot` 末尾 ZIP 内的一个 entry,记录 snapshot 时
+`snapshot.cfg` 位于root memory逻辑流末尾的inner ZIP entry中:local tarstream直接
+包住该逻辑流,Manifest Bundle则由root Manifest指向它。该文件记录 snapshot 时
 **guest 那一侧不可重生的契约**——capacity、runtime / image base 内容指针、
 overlay 数据指针,以及已在 guest 内存中建立的 `launch.cgroup_control` 拓扑。
 **host 侧可重选的字段一概不存**(network、其他 launch 字段、host cgroup/
@@ -986,6 +1056,7 @@ metadata:
 from_refs: []
   # - manifest://<key-of-parent.snapshot>
   # - file://<digest>.snapshot@<scheme>:<digest>  # scheme = sha256 | hmac
+  # Bundle内部收编的父层始终写 manifest://;file://@manifest只用于外部Bundle入口/provenance
 
 # Guest 内已建立、恢复后不可改选的应用 cgroup 拓扑
 launch:
@@ -1001,7 +1072,7 @@ boot:
                  # 或 manifest://<key>(原引用是 manifest:// 时原样保留)
     overlay:
       base:      file://<digest>.overlay@<scheme>:<digest>
-                 # 或 manifest://<key>(--upload 模式)。本快照捕获的 diff = 链顶
+                 # 或 manifest://<key>(--upload / --mode=bundle)。本次 diff = 链顶
       base_from_refs: []
                  # 磁盘 diff 链(base 之下,自顶向下,不含 base)。与 from_refs 对称:
                  # s1 = [];s2 = [s1.ext4];s3 = [s2.ext4, s1.ext4]
@@ -1037,7 +1108,7 @@ boot:
   无需 digest(manifest key 已是 content-addressable)
 - `overlay.base`(file:// 类):指向 snapshot 输出目录中那个 `<digest>.overlay`
   文件,并显式携带 `@sha256:<digest>` 或 `@hmac:<digest>`
-- `overlay.base`(manifest:// 类):上传后的 overlay manifest key
+- `overlay.base`(manifest:// 类):直接上传或Bundle内当前overlay Manifest key
 - `from_refs` / `overlay.base_from_refs`:增量分层链(见 §3.5)。每项是
   `manifest://<key>` 或内容寻址的
   `file://<digest>.<ext>@<scheme>:<digest>`,可在一条链内混用(如 s1 本地文件、
@@ -1137,6 +1208,15 @@ working-set 生成与验证。这组 artifact 必须一起保留;缺任一层即
   disk 的 local leaves;已有 manifest/located refs 原样带过,最终打印 canonical
   portable root ref。历史 memory lower 内已被 flatten 掉的旧 disk graph 不再是依赖。
 
+以上“本地层深度”和递归重建描述针对 `mode=local` tarstream。`mode=bundle` 仍保持
+`merge_ref=true` 的plaintext merge语义;`merge_ref=false` 且父层仅本地时,在pause前
+把父 tarstream或不同admission Bundle解码后按当前admission重新Ingest。同admission
+父Bundle可原样复制选中Manifest及完整Chunk闭包。Bundle内的`snapshot.cfg`只写
+`manifest://<key>`;restore provenance在Bundle外表示同一文件中的层时使用
+`file://<bundle>@manifest:<key>`。远端`manifest://`父层可继续作为外部依赖,located
+file ref也保持外部。节点级`runtime_ref`仍沿用既有file identity/host override契约,
+不属于本次snapshot-layer收编域。
+
 ## 4. 资源模型
 
 ### 4.1 三种部署模式
@@ -1204,7 +1284,7 @@ T2   tap 源验证已存在 TAP;tapfd 与无网络源跳过 TAP 名验证;
      随后准备 /run/sandbox/<sid>/ 目录
 T3   准备 overlay diff:已存在→按 crypto.local policy 打开(绝不 truncate,忽略 template);
      不存在→从 diff_template 的逻辑 sparse view 初始化 / 按 base 大小新建 blank upper;
-     新文件编码由 crypto.local 决定(详见 §3.2.2)
+     新文件编码由 crypto.local 决定(详见 §3.2.3)
 T4   解析 cold InitialBudget = AlignedBudget(Capacity, startup headroom)。动态模式
      先创建并锁定 immutable lifecycle lease,再向 controller 请求完整 InitialBudget;
      queue/reject 均不得以较小 grant 启动。静态模式在本地采用同一 InitialBudget
@@ -1367,7 +1447,7 @@ cloud-hypervisor \
 
 ### 6.1 输出文件命名与字节布局
 
-**输出目录布局**(`--output <out_dir>` 模式):
+**`--mode=local` 输出目录布局**:
 
 ```
 <out_dir>/
@@ -1382,7 +1462,21 @@ snapshot 与 overlay 都**按内容摘要命名**(content-addressed),彼此不�
 `<digest>.snapshot`,给人和工具一个按 sid 寻址的"最新"入口
 (`<sid>` = `sandbox-ctl run --sandbox-id` 设的或 yaml 里的)。
 
-**工件容器 = tarstream**(`accelerator/pkg/tarstream`,GNU PAX sparse payload +
+**`--mode=bundle` 输出目录布局**:
+
+```text
+<out_dir>/
+├── <root-memory-manifest-key>.bundle
+└── <sid>.snapshot → <root-memory-manifest-key>.bundle
+```
+
+这是整次snapshot唯一的最终文件;root memory、root disk与全部data disk当前Manifest
+共用一个Writer和一个admission。各当前磁盘层先Ingest并返回`manifest://<key>`,写入
+最终`snapshot.cfg`后再Ingest root memory,以root key命名文件。临时ZIP在同目录
+Finalize、Sync、Close后用`RENAME_NOREPLACE`提交并Sync目录;同名终态只有在root、
+admission和完整Bundle验证一致时才复用。
+
+**local工件容器 = tarstream**(`accelerator/pkg/tarstream`,GNU PAX sparse payload +
 空 digest marker):逻辑视图的洞进信封洞图,线上只有数据字节。工件文件本身**致密**
 ——`cp`/`rsync`/非稀疏文件系统都不再能破坏语义,洞的权威从此是信封而非 OS。
 
@@ -1453,18 +1547,22 @@ snapshot 内容不变时 identity 相同 → 验证后复用**同名文件**,绝
   一次性 append
 - staging 目录(`<run-dir>/<sid>/snap-stage`,tmpfs)只容纳 CH 产出的
   config.json/state.json(KB 级);GiB 级 memory 段与 overlay 不经此目录——
-  --output 直接落 `<out_dir>`(写 `.partial` 再 no-replace commit),--upload 流式喂 ingest
+  --output直接落`<out_dir>`(local写tarstream partial;bundle写一个ZIP partial),
+  --upload流式喂ingest
 - pause 窗口 = quiesce + CH dump + overlay export + memory dump + zip append。
   overlay + memory 写都是 SEEK_DATA/HOLE 驱动的数据 extent 打包,稀疏 sandbox
   8 GiB → 驻留 200 MiB → ~100 ms
 
 ```
-T0  sandbox-ctl snapshot --sandbox-id <sid> [--output <out_dir>] [--upload]
+T0  sandbox-ctl snapshot --sandbox-id <sid> [--output <out_dir> --mode local|bundle] [--upload]
         [--drop-caches=true|false] [--merge-ref=true|false]
 T1  通过 <run-dir>/<sid>/ctl.sock 联系目标 sandbox-ctl run 进程。目标进程完成
     request shape 校验后先取得 memory mutation barrier,等待在飞 resize 离开;
     后续 artifact/merge/sink 准备、quiesce、pause、capture 全程持有
 T2  目标进程串行:
+    T2-pre 若mode=bundle:在pause前取得唯一WriteAdmission,创建一个临时ZIP/Bundle
+        Writer/Ingester;解析所有仅本地父层。同admission Bundle exact copy,不同admission
+        Bundle或tarstream解码后按当前admission重新Ingest。任何失败都发生在guest quiesce前
     T2a 通过 vsock 短连接发 quiesce 给 sandbox-init,等 quiesced 响应。sandbox-init
         收到后:拒绝新的 exec 并 SIGKILL 在飞的 exec 子进程(快照不能带运行中的
         exec 兄弟进程;沙箱 resume/restore 后解除)→ **freeze 真实
@@ -1485,19 +1583,22 @@ T3  CH /vm.snapshot { destination_url=file://<run-dir>/<sid>/snap-stage/ }
       state.json    - vCPU 寄存器、virtio queue 状态、IRQ 等
     sandbox-ctl 把这两个文件读进内存作为 ZIP 内容暂存,不再落盘
 T4  overlay → sink(在 memory 前处理,snapshot.cfg 才能拿到终态 overlay.base):
-    若 --output:BlockCOW upper-only SnapshotView 的 dirty extent 打包 tarstream →
+    若 --output --mode=local:BlockCOW upper-only SnapshotView 的 dirty extent 打包 tarstream →
         <sid>.overlay.partial →
         writer 返回 scheme + digest(§6.1)→ no-replace commit
         <out_dir>/<digest>.overlay;
         overlay_ref = file://<digest>.overlay@<scheme>:<digest>
+    若 --output --mode=bundle:全部root/data-disk SnapshotView依次使用同一Bundle
+        Ingester/admission,共享Chunk按ContentKey去重;
+        overlay_ref = manifest://<overlay_manifest_key>
     若 --upload:同一 SnapshotView 数据 extent 流式喂 manifest.Ingester(空洞编码进
         manifest,不落盘)→ overlay_manifest_key;
         overlay_ref = manifest://<overlay_manifest_key>
 T5  生成最终 snapshot.cfg(在内存中,§3.4 schema):
     resources.capacity:        从 sandbox 当前 SandboxConfig
     launch.cgroup_control:      当前 guest cgroup 拓扑(false/true),供 restore 后再次 snapshot 继承
-    boot.runtime_ref:           file://<basename>@sha256:<digest>(从 bundle marker
-                                读取)或 manifest://<key>(原引用)
+    boot.runtime_ref:           file://<basename>@sha256:<digest>(从runtime bundle marker读取;
+                                节点级平台工件,不作为snapshot Manifest层收编)
     boot.root.base_ref:         同上规则
     boot.root.overlay.base:     T4 的 overlay_ref(本次 diff = 磁盘链顶)
     from_refs / overlay.base_from_refs:  增量分层链(§3.5)。冷启动 = [];否则按
@@ -1518,9 +1619,13 @@ T6  生成 snapshot 内容:
                   snapshot.cfg(三个 entries)
     若 --upload:走流式构造,直接 io.Reader 喂 ingest,不落盘;
                   stdout 输出 snapshot_manifest_key(= 链中本快照的内容寻址名)
-    若 --output:先写到 <sid>.snapshot.partial → writer 返回 scheme + digest(§6.1)→ no-replace commit
+    若 --output --mode=local:先写到 <sid>.snapshot.partial → writer 返回 scheme + digest(§6.1)→ no-replace commit
                   <out_dir>/<digest>.snapshot,再建/更新符号链接
                   <out_dir>/<sid>.snapshot → <digest>.snapshot
+    若 --output --mode=bundle:root memory使用共享Ingester写入最后一个Manifest,
+                  Finalize ZIP、Sync、Close、no-replace commit为
+                  <out_dir>/<root-key>.bundle,再更新
+                  <out_dir>/<sid>.snapshot → <root-key>.bundle
 T7  srv0.Resume() + srv1.Resume()
 T8  resume_after=true:CH /vm.resume,沙箱原地续跑;quiesce 时 guest 冻结了
                   应用并关了 stdio MUX,这里 sandbox-ctl 拨新连接发 attach 重建
@@ -1534,7 +1639,8 @@ T8  resume_after=true:CH /vm.resume,沙箱原地续跑;quiesce 时 guest 冻结�
 T9  ctl.sock 回 snapshot_done
 T10 sandbox-ctl snapshot(发起方进程)收到 done:
     若 --upload:stdout 输出 snapshot_manifest_key
-    否则:本地产物在 <out_dir>/(<digest>.snapshot + <sid>.snapshot 符号链接 + <digest>.overlay)
+    若mode=local:本地产物为tarstream snapshot/overlay与sid symlink
+    若mode=bundle:本地产物仅为一个.bundle与sid symlink
 ```
 
 **关键差异 vs 一般 VMM 快照**:
@@ -1589,8 +1695,9 @@ gate 按现有 `ctl.sock` framing 先完整读取 4-byte LE 长度和 payload:
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `type` | string | `"snapshot_request"` |
-| `out_dir` | string | `--output` 目录;snapshot 在该目录写 `<digest>.snapshot`(+ `<sid>.snapshot` 符号链接)+ `<digest>.overlay`;与 `upload` 互斥 |
+| `out_dir` | string | `--output` 目录;local写tarstream图,bundle写一个`.bundle`;均维护`<sid>.snapshot` symlink;与`upload`互斥 |
 | `upload` | bool | true 时走流式 ingest 到 manifest store;与 `out_dir` 互斥 |
+| `mode` | string | 可选,空值向后兼容为`local`;只允许`local|bundle`;`upload=true`时必须省略 |
 | `resume_after` | bool | 默认 false(零值即销毁);CLI 默认与之一致。`--resume` 触发 true |
 
 响应 `snapshot_done`:
@@ -1631,8 +1738,9 @@ run 进程收到后向 guest 反向通道发 `exec` 操作(见
 flag。复用冷启动 §5.1 的 T6-T18 整段(memfd 准备 → backend 起 → CH 启动 →
 va_report → uffd_C 就绪);区别:
 
-1. 配置来源是 `<sid>.snapshot` 末尾 ZIP 内嵌的 config.json / state.json /
-   snapshot.cfg,与 host sandbox.yaml 按 §11.0 规则合并
+1. 配置来源是root逻辑流末尾inner ZIP内嵌的 config.json / state.json /
+   snapshot.cfg,与 host sandbox.yaml 按 §11.0 规则合并;外层可以是tarstream、
+   local Manifest Bundle或远端Manifest
 2. snapshotReader 是 `StreamSnapshotSource`(统一形态,不是 `ZeroSource`):它包裹一个
    读取层 `Stream`——file:// 与 manifest:// 都先解析为 `Stream`(分别是稀疏文件流、
    chunk 粒度的 manifest 流),再按 `from_refs` 叠成分层流(§3.5)。本快照内存段是
@@ -1649,17 +1757,21 @@ T0  sandbox-ctl run --restore <ref> --config sandbox.yaml [--run-root <dir>] ...
     解析 restore.prefetch,非法值在 cgroup/目录/远程读取等副作用前失败
 T1  解析其余 host sandbox.yaml(本地化字段:可选 network、overlay.diff、cgroup/控制器等)
 T2  打开 <ref>:
-    file path: os.Open + Stat → ReaderAt
+    file path/file://:按magic自动识别encrypted tarstream、Manifest Bundle、plaintext
+      tarstream。Bundle root由@manifest选择或从解析symlink后的<root-key>.bundle推导
     manifest://: 通过 store + cache 客户端取 manifest → 解封 → fetch.Fetcher 包成 ReaderAt
 T3  archive/zip.NewReader(ReaderAt, totalSize) → 解出 config.json / state.json /
     snapshot.cfg。解析 from_refs / overlay.base_from_refs(§3.5),逐项解析为
     Stream(file:// 校验摘要、manifest:// 内容自校验),校验全链 capacity 一致。
     root snapshot.cfg 的展平 from_refs 列表是 memory chain 的唯一权威;preflight
     把每项作为 opaque memory layer 打开验证,不解析 lower 内历史 snapshot.cfg。
-    file 模式:若 <ref> 是 <sid>.snapshot 符号链接,follow 解析出真实
-    <digest>.snapshot 名,读取工件取得实际 scheme + digest,作为本次的内容寻址
+    tarstream模式:若 <ref> 是 <sid>.snapshot 符号链接,follow解析真实
+    <digest>.snapshot并取得实际scheme+digest,作为本次内容寻址
     self ref(供将来再保存时写入子快照
-    from_refs);from_refs 各项在该 .snapshot 同目录定位
+    from_refs);from_refs各项在该.snapshot同目录定位。
+    Bundle模式:root文件及mmap保持到sandbox生命周期结束;其snapshot.cfg中的
+    manifest:// refs按Manifest membership选择Bundle-only或remote-only Fetcher。
+    provenance把Bundle内层保存为file://<bundle>@manifest:<key>,供child merge/收编
 T4  restore.ApplyRules(host sandbox.yaml, snapshot.cfg, snapshotPath):
     - 验证 capacity 一致(host 提供时)
     - 验证 boot.runtime / boot.root.base 协议 + basename 匹配(host 提供时)

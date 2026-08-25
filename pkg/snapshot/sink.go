@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
@@ -25,11 +28,13 @@ func HexKey(k store.ContentKey) string {
 
 // SnapshotSink absorbs the two large snapshot artifacts — the blk1 overlay and
 // the memory+ZIP bundle — straight from their sources to a destination,
-// WITHOUT staging them in /run tmpfs. Two impls share this interface:
+// WITHOUT staging them in /run tmpfs. Three impls share this interface:
 //
 //   - FileSink packs scheme-qualified content-addressed local tarstream
 //     artifacts (<digest>.overlay / <digest>.snapshot) under an output dir.
 //   - IngestSink streams to a manifest store via ingest.Ingester (--upload).
+//   - BundleSink writes every current Manifest/Chunk into one local ZIP64
+//     Bundle using one pre-resolved WriteAdmission (--mode=bundle).
 //
 // Each method takes the source as an io.ReadSeeker plus its authoritative hole
 // map. Memory holes come from SEEK_HOLE on the live memfd; overlay holes come
@@ -247,6 +252,278 @@ type IngestSink struct {
 	// Captured for the caller's Response (read via Results after Take).
 	overlayRes *ingest.Result
 	bundleRes  *ingest.Result
+}
+
+// ---------------------------------------------------------------------------
+// BundleSink — one standard ZIP64 file containing every current Manifest.
+// ---------------------------------------------------------------------------
+
+type BundleSink struct {
+	outDir    string
+	sandboxID string
+	cfg       *manifest.Config
+	keyFn     ingest.CustomerKeyFunc
+	logf      func(string, ...any)
+
+	file      *os.File
+	tmpPath   string
+	writer    *manifestbundle.Writer
+	ing       ingest.Ingester
+	admission store.WriteAdmission
+	manifests map[store.ContentKey]struct{}
+
+	overlayResults []*ingest.Result
+	bundleResult   *ingest.Result
+	finalized      bool
+	closed         bool
+}
+
+// NewBundleSink resolves the sole WriteAdmission and constructs the temporary
+// ZIP before the guest is paused. Every later Ingest reuses this writer.
+func NewBundleSink(ctx context.Context, outDir, sandboxID string, cfg *manifest.Config, keyFn ingest.CustomerKeyFunc, logf func(string, ...any)) (*BundleSink, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("snapshot Bundle requires manifest configuration")
+	}
+	if keyFn == nil {
+		return nil, fmt.Errorf("snapshot Bundle requires customer key resolver")
+	}
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	admission, err := cfg.WriteAdmission(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot Bundle admission: %w", err)
+	}
+	f, err := os.CreateTemp(outDir, sandboxID+".bundle.*.partial")
+	if err != nil {
+		return nil, fmt.Errorf("snapshot Bundle temporary file: %w", err)
+	}
+	fail := func(err error) (*BundleSink, error) {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return nil, err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		return fail(fmt.Errorf("snapshot Bundle temporary permissions: %w", err))
+	}
+	writer, err := manifestbundle.NewWriter(f, admission, manifestbundle.WriterOptions{})
+	if err != nil {
+		return fail(err)
+	}
+	ing, err := cfg.NewIngesterWithWriter(keyFn, nil, writer)
+	if err != nil {
+		return fail(err)
+	}
+	return &BundleSink{
+		outDir: outDir, sandboxID: sandboxID, cfg: cfg, keyFn: keyFn, logf: logf,
+		file: f, tmpPath: f.Name(), writer: writer, ing: ing, admission: admission,
+		manifests: make(map[store.ContentKey]struct{}),
+	}, nil
+}
+
+func (s *BundleSink) Admission() store.WriteAdmission { return s.admission }
+
+func (s *BundleSink) Writer() *manifestbundle.Writer { return s.writer }
+
+func (s *BundleSink) Results() (overlays []*ingest.Result, root *ingest.Result) {
+	return append([]*ingest.Result(nil), s.overlayResults...), s.bundleResult
+}
+
+func (s *BundleSink) AbsorbOverlay(ctx context.Context, diff io.ReadSeeker, holes []sparse.Extent) (string, string, error) {
+	size, err := seekerSize(diff)
+	if err != nil {
+		return "", "", err
+	}
+	result, err := s.ingestSource(ctx, &seekerSource{rs: diff, size: uint64(size), holes: holes}, holes, "overlay")
+	if err != nil {
+		return "", "", err
+	}
+	s.overlayResults = append(s.overlayResults, result)
+	return "manifest://" + HexKey(result.ManifestKey), "", nil
+}
+
+func (s *BundleSink) AbsorbBundle(ctx context.Context, mem io.ReadSeeker, holes []sparse.Extent, zip io.Reader) (string, string, error) {
+	memSize, err := seekerSize(mem)
+	if err != nil {
+		return "", "", err
+	}
+	tail, err := io.ReadAll(zip)
+	if err != nil {
+		return "", "", fmt.Errorf("read inner snapshot ZIP: %w", err)
+	}
+	source := &seekerSource{
+		rs:    &concatReadSeeker{mem: mem, memSize: memSize, tail: tail},
+		size:  uint64(memSize) + uint64(len(tail)),
+		holes: holes,
+	}
+	result, err := s.ingestSource(ctx, source, holes, "memory section")
+	if err != nil {
+		return "", "", err
+	}
+	s.bundleResult = result
+	if err := s.finalize(ctx, result.ManifestKey); err != nil {
+		return "", "", err
+	}
+	final := filepath.Join(s.outDir, HexKey(result.ManifestKey)+".bundle")
+	return "manifest://" + HexKey(result.ManifestKey), final, nil
+}
+
+// IngestStream collects one already-decoded local parent or immutable
+// artifact into this Bundle's admission. It is intended for pre-pause use.
+func (s *BundleSink) IngestStream(ctx context.Context, stream fetch.Stream, label string) (store.ContentKey, error) {
+	if stream == nil {
+		return store.ContentKey{}, fmt.Errorf("snapshot Bundle import %s: nil stream", label)
+	}
+	result, err := s.ingestSource(ctx, stream, nil, label)
+	if err != nil {
+		return store.ContentKey{}, err
+	}
+	return result.ManifestKey, nil
+}
+
+// CopyManifestFromBundle copies an exact complete parent layer when both
+// Bundles use the same admission.
+func (s *BundleSink) CopyManifestFromBundle(ctx context.Context, key store.ContentKey, source *manifestbundle.Reader) error {
+	if err := s.writer.CopyManifestFromBundle(ctx, key, source); err != nil {
+		return err
+	}
+	s.manifests[key] = struct{}{}
+	return nil
+}
+
+func (s *BundleSink) ingestSource(ctx context.Context, source sparse.Source, holes []sparse.Extent, label string) (*ingest.Result, error) {
+	if s.finalized || s.closed {
+		return nil, fmt.Errorf("snapshot Bundle is closed")
+	}
+	var holeBytes uint64
+	for _, hole := range holes {
+		holeBytes += hole.Size
+	}
+	effective := source.Size()
+	if holeBytes < effective {
+		effective -= holeBytes
+	}
+	const mib = 1 << 20
+	started := time.Now()
+	last := started
+	var previous uint64
+	result, err := s.ing.Ingest(ctx, source, ingest.IngestOption{OnProgress: func(processed, _ uint64) {
+		now := time.Now()
+		if now.Sub(last) < 2*time.Second {
+			return
+		}
+		percent := uint64(0)
+		if effective != 0 {
+			percent = min(processed*100/effective, 100)
+		}
+		rate := float64(processed-previous) / now.Sub(last).Seconds() / mib
+		s.logf("bundle: %s %d/%d MiB (%d%%) %.0f MiB/s", label, processed/mib, effective/mib, percent, rate)
+		last, previous = now, processed
+	}})
+	if err != nil {
+		return nil, fmt.Errorf("snapshot Bundle ingest %s: %w", label, err)
+	}
+	s.manifests[result.ManifestKey] = struct{}{}
+	s.logf("bundle: %s manifest=%s stored=%d dedup=%d in %.1fs", label,
+		HexKey(result.ManifestKey), result.StoredChunks, result.DedupChunks, time.Since(started).Seconds())
+	return result, nil
+}
+
+func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.writer.Finalize(root); err != nil {
+		return err
+	}
+	if err := s.file.Sync(); err != nil {
+		return fmt.Errorf("sync snapshot Bundle: %w", err)
+	}
+	if err := s.file.Close(); err != nil {
+		return fmt.Errorf("close snapshot Bundle: %w", err)
+	}
+	s.closed = true
+	final := filepath.Join(s.outDir, HexKey(root)+".bundle")
+	err := unix.Renameat2(unix.AT_FDCWD, s.tmpPath, unix.AT_FDCWD, final, unix.RENAME_NOREPLACE)
+	if err == unix.EEXIST {
+		if err := s.validateExisting(ctx, final, root); err != nil {
+			return fmt.Errorf("reuse existing snapshot Bundle: %w", err)
+		}
+		if err := os.Remove(s.tmpPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove duplicate snapshot Bundle temporary file: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("commit snapshot Bundle without replacement: %w", err)
+	}
+	s.tmpPath = ""
+	if err := syncDirectory(s.outDir); err != nil {
+		return fmt.Errorf("sync snapshot Bundle directory: %w", err)
+	}
+	link := filepath.Join(s.outDir, s.sandboxID+".snapshot")
+	_ = os.Remove(link)
+	if err := os.Symlink(filepath.Base(final), link); err != nil {
+		return fmt.Errorf("symlink %s.snapshot: %w", s.sandboxID, err)
+	}
+	if err := syncDirectory(s.outDir); err != nil {
+		return fmt.Errorf("sync snapshot Bundle symlink directory: %w", err)
+	}
+	s.finalized = true
+	s.logf("snapshot: %s.bundle written", HexKey(root)[:12])
+	return nil
+}
+
+func (s *BundleSink) validateExisting(ctx context.Context, path string, root store.ContentKey) error {
+	reader, err := manifestbundle.Open(path)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	if reader.Admission() != s.admission {
+		return fmt.Errorf("recorded admission differs")
+	}
+	customerKey, err := s.keyFn()
+	if err != nil {
+		return err
+	}
+	_, decryptor, err := manifestcrypto.New(s.cfg.Crypto)
+	if err != nil {
+		clear(customerKey[:])
+		return err
+	}
+	defer clear(customerKey[:])
+	expected := make([]store.ContentKey, 0, len(s.manifests))
+	for key := range s.manifests {
+		expected = append(expected, key)
+	}
+	return reader.FullVerify(ctx, root, customerKey, decryptor, manifestbundle.VerifyOptions{ExpectedManifests: expected})
+}
+
+func (s *BundleSink) Close() error {
+	if s == nil {
+		return nil
+	}
+	var result error
+	if !s.closed && s.file != nil {
+		result = s.file.Close()
+		s.closed = true
+	}
+	if s.tmpPath != "" {
+		if err := os.Remove(s.tmpPath); err != nil && !os.IsNotExist(err) {
+			result = errors.Join(result, err)
+		}
+		s.tmpPath = ""
+	}
+	return result
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	return errors.Join(syncErr, closeErr)
 }
 
 func NewIngestSink(ing ingest.Ingester, logf func(string, ...any)) *IngestSink {
