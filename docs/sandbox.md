@@ -356,7 +356,11 @@ sandbox-ctl snapshot [flags]
                         的多 GiB 内存 + overlay ingest 上传动辄数分钟,固定客户端
                         deadline 会误杀一个仍在健康推进的上传。需要兜底时显式
                         `--timeout N` 重新设上界
-```
+  --memory              默认 true(捕获 VM 内存)。`--memory=false` 产出**仅磁盘快照**:
+                        只捕获 overlay 链与 config ZIP,不读 memfd,产物为无内存段的
+                        bundle(snapshot.cfg 记 `memory: false`),恢复走冷启动路径
+                        (§7.2)。`--merge-ref` 对其无效;响应中 memory_size/resident=0
+ ```
 
 **进度输出**:`--upload` / `--output` 期间,sandbox-ctl run 进程按节流周期(≥2 s)
 向其 stderr 打 ingest 进度——`upload: <段名> <已处理> MiB (<百分比>) <速率> MiB/s`,
@@ -1085,6 +1089,11 @@ from_refs: []
   # - file://<digest>.snapshot@<scheme>:<digest>  # scheme = sha256 | hmac
   # Bundle模式的所有snapshot-layer ref固定为manifest://;物理Bundle地址只在bundle/refs
 
+# 仅磁盘快照标记(可选):`snapshot --memory=false` 产出的 bundle 无内存段,
+# 记 memory: false;其 from_refs 恒为 [](子快照内存从零开始,不继承磁盘-only
+# 父bundle 的"内存链")。恢复走冷启动路径(§7.2)。完整内存快照省略本字段。
+memory: false
+
 # Guest 内已建立、恢复后不可改选的应用 cgroup 拓扑
 launch:
   cgroup_control: false
@@ -1788,6 +1797,19 @@ va_report → uffd_C 就绪);区别:
    `<run-dir>`)
 5. `restore.prefetch: memory` 可为当前内存 self 启动后端相关的机会式后台 Prefetch(§7.1);
    它不改变 snapshotReader,UFFD demand 或恢复正确性
+
+### 7.2 仅磁盘快照的冷启动恢复(memory=false)
+
+`snapshot --memory=false` 产出的 bundle(snapshot.cfg 记 `memory: false`)没有
+内存段,不能走 `--restore`(无 VMM/vCPU 状态可恢复)。restore 检测到该标记后改走
+**冷启动**路径:重建 overlay 链为只读层(与 §7 相同的 reconstructDisk 流程,保留
+快照时的文件系统状态),其上新建可写 CoW;内存用 `ZeroSource`(全新 RAM);启动完整
+CH 命令行(等价 §5.2),guest 走 hello → launch_ack 握手。准入按冷启动语义(request 0,
+取 node grant);balloon/state.json 不消费。
+
+约束:host sandbox.yaml 必须提供 `boot.kernel` 与 `boot.runtime`(bundle 不携带,
+--restore 路径本不需要它们);kernel 版本与快照时的兼容性由操作方保证。版本偏斜防护:
+编排层(orchestrator)在节点运行时确认支持前不下发 `memory=false`。
 
 ```
 T0  sandbox-ctl run --restore <ref> --config sandbox.yaml [--run-root <dir>] ...;

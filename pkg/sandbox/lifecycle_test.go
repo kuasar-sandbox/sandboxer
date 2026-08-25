@@ -307,11 +307,11 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 		CustomerKeyFn: keyFn,
 	}
 	if err := validateNonBundleSnapshotSources(context.Background(), runOpts,
-		[]string{parentRef}, []bool{false}); err == nil || !strings.Contains(err.Error(), "without bundle/refs") {
+		[]string{parentRef}, []bool{false}, false); err == nil || !strings.Contains(err.Error(), "without bundle/refs") {
 		t.Fatalf("non-Bundle retained source error = %v", err)
 	}
 	if err := validateNonBundleSnapshotSources(context.Background(), runOpts,
-		nil, []bool{true}); err != nil {
+		nil, []bool{true}, false); err != nil {
 		t.Fatalf("fully merged non-Bundle source validation: %v", err)
 	}
 	rootSource, err := opened.ManifestFetcher().SelectRoot(parentKey)
@@ -325,7 +325,7 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 		t.Fatalf("remote source confirmation error = %v, calls=%d", err, remote.calls)
 	}
 	plan, err := prepareSnapshotBundlePlan(context.Background(), runOpts,
-		[]string{parentRef}, []bool{false}, childDir, admission)
+		[]string{parentRef}, []bool{false}, false, childDir, admission)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +370,7 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 	}
 
 	mergedPlan, err := prepareSnapshotBundlePlan(context.Background(), runOpts,
-		nil, []bool{true}, t.TempDir(), admission)
+		nil, []bool{true}, false, t.TempDir(), admission)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +471,7 @@ func TestPrepareSnapshotBundlePlanFlattensOnlyReachableSources(t *testing.T) {
 		Cfg: sandboxCfg, ManifestCfg: &childCfg, Fetcher: opened.ScopedFetcher(),
 		BundleReader: opened.BundleReader(), BundleFetcher: opened.ManifestFetcher(),
 		RefLocations: locations, CustomerKeyFn: keyFn,
-	}, []string{parentRoot}, []bool{false}, childDir, admission)
+	}, []string{parentRoot}, []bool{false}, false, childDir, admission)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +521,7 @@ func TestPrepareSnapshotBundlePlanIngestsTarstreamParentIntoCurrentAdmission(t *
 	outputDir := t.TempDir()
 	plan, err := prepareSnapshotBundlePlan(context.Background(), RunOptions{
 		Cfg: sandboxCfg, ManifestCfg: manifestCfg, CustomerKeyFn: keyFn,
-	}, []string{parentRef}, []bool{false}, outputDir, admission)
+	}, []string{parentRef}, []bool{false}, false, outputDir, admission)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,6 +660,42 @@ func TestHandleSnapshotRequestRejectsMergedLocalLowerBeforeQuiesce(t *testing.T)
 	}
 	if viewCalled {
 		t.Fatal("snapshot view opened before final memory-chain validation")
+	}
+}
+
+// A disk-only capture never touches the parent's memory section, so the
+// local-memory-parent upload restriction must not fire for it.
+func TestHandleSnapshotRequestDiskOnlySkipsLocalMemoryParentRestriction(t *testing.T) {
+	dir := t.TempDir()
+	parentPath, parentScheme, parentDigest := writeDiskArtifact(t, dir, "snapshot", make([]byte, 4096), nil)
+	cfg := &config.SandboxConfig{}
+	cfg.SnapshotProvenance = config.SnapshotProvenance{
+		ParentSnapshotRef:  fileRef(parentPath, parentScheme, parentDigest),
+		ParentSnapshotPath: parentPath,
+		ParentFromRefs:     []string{"file://base.snapshot"},
+	}
+	mfd, err := memory.Create("disk-only-upload", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	pinger := &guestlink.Pinger{
+		Client: &guestlink.HostClient{BasePath: filepath.Join(dir, "must-not-dial.sock")},
+	}
+	memoryOff := false
+	_, err = handleSnapshotRequest(ctl.Request{Upload: true, Memory: &memoryOff}, RunOptions{
+		Cfg:         cfg,
+		SandboxID:   "test",
+		ManifestCfg: &config.ManifestConfig{Store: manifest.StoreConfig{Endpoint: "unused"}},
+	}, mfd, []SnapDiskRef{{
+		DiffPath: filepath.Join(dir, "diff"),
+		Size:     4096,
+		SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			return bytes.NewReader(make([]byte, 4096)), nil, nil
+		},
+	}}, nil, "", filepath.Join(dir, "run"), "", nil, pinger, nil, nil, nil, discardLogf)
+	if err != nil && strings.Contains(err.Error(), "local memory parent") {
+		t.Fatalf("disk-only capture hit the local memory parent restriction: %v", err)
 	}
 }
 

@@ -125,6 +125,32 @@ func TestSnapshotCfgCgroupControlRoundTripAndApply(t *testing.T) {
 	}
 }
 
+func TestParseSnapshotCfgDiskOnly(t *testing.T) {
+	full, err := ParseSnapshotCfg([]byte("launch:\n  cgroup_control: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.DiskOnly() {
+		t.Fatal("full-memory snapshot.cfg parsed as disk-only")
+	}
+
+	diskOnly, err := ParseSnapshotCfg([]byte("memory: false\nfrom_refs: []\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !diskOnly.DiskOnly() {
+		t.Fatal("snapshot.cfg with memory=false did not parse as disk-only")
+	}
+	// memory=true is a no-op relative to the historical default.
+	explicitTrue, err := ParseSnapshotCfg([]byte("memory: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicitTrue.DiskOnly() {
+		t.Fatal("snapshot.cfg with memory=true parsed as disk-only")
+	}
+}
+
 func applyRules(host *config.SandboxConfig, snap *SnapshotCfg, snapshotPath string) (*config.SandboxConfig, error) {
 	return ApplyRules(host, snap, snapshotPath, nil, nil, false)
 }

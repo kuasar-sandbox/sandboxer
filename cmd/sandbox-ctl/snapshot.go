@@ -26,6 +26,7 @@ func snapshotCmd(args []string) int {
 	resume := fs.Bool("resume", false, "keep sandbox running after snapshot (default: destroy via /vm.shutdown)")
 	dropCaches := fs.Bool("drop-caches", true, "drop guest page, inode, and dentry caches before snapshot")
 	mergeRef := fs.Bool("merge-ref", true, "merge a local parent memory ref into the new memory self layer")
+	memory := fs.Bool("memory", true, "capture the VM memory (default); --memory=false takes a disk-only snapshot (overlays + config only) that restores via cold boot")
 	runRoot := fs.String("run-root", "", "tmpfs run root (overrides SANDBOX_RUN_ROOT env; default /run/sandbox)")
 	timeoutS := fs.Int("timeout", 0, "seconds to wait for snapshot_done (0 = wait indefinitely; upload can take minutes)")
 
@@ -105,6 +106,7 @@ func snapshotCmd(args []string) int {
 		ResumeAfter: *resume,
 		DropCaches:  dropCaches,
 		MergeRef:    mergeRef,
+		Memory:      memory,
 	}
 	if modeSet {
 		req.Mode = *mode

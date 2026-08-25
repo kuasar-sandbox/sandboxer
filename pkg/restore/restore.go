@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -218,6 +219,14 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, err
 	}
 	snapCfg := *merged
+	// A disk-only bundle carries no memory section: restoring it means a
+	// cold boot into the preserved filesystem state rather than a --restore
+	// of captured VMM/vCPU state. The host yaml therefore supplies the boot
+	// artifacts a cold start needs.
+	diskOnly := parsedSnap.DiskOnly()
+	if diskOnly && (opts.HostCfg.Boot.Kernel == "" || opts.HostCfg.Boot.Runtime == "") {
+		return -1, errors.New("restore: disk-only snapshot requires boot.kernel and boot.runtime in the host sandbox.yaml (cold-boot restore)")
+	}
 	snapshotHasNetwork, err := snapshotConfigHasNetwork(entries["config.json"])
 	if err != nil {
 		return -1, err
@@ -257,6 +266,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		ParentOverlayBase:  parentDiskBase,
 		ParentBaseFromRefs: parentDiskChain,
 		BundleSource:       bundleSource,
+		ParentDiskOnly:     diskOnly,
 	}
 	// Local restore: record the parent's on-disk bundle + top-disk-layer paths
 	// so a re-export merges this run's resident delta onto them (replace the
@@ -326,36 +336,48 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if declaredCap != snapCap {
 		return -1, fmt.Errorf("snapshot Capacity mismatch: CH memory zones=%d sandbox.cfg=%d", snapCap, declaredCap)
 	}
-	balTarget, balCurrent, balOk, err := parseBalloonFromState(entries["state.json"])
-	if err != nil {
-		return -1, fmt.Errorf("parse balloon from state.json: %w", err)
-	}
-	if balOk {
-		if err := resctl.ValidateBalloonSize(snapCap, balTarget); err != nil {
-			return -1, fmt.Errorf("snapshot balloon target: %w", err)
+	// A disk-only snapshot captures no balloon or vCPU state: its restore
+	// admits like a cold start (fresh RAM), so every balloon-derived value
+	// below stays at its zero value.
+	balTarget, balCurrent, balOk := uint64(0), uint64(0), false
+	if !diskOnly {
+		var err error
+		balTarget, balCurrent, balOk, err = parseBalloonFromState(entries["state.json"])
+		if err != nil {
+			return -1, fmt.Errorf("parse balloon from state.json: %w", err)
 		}
-		if err := resctl.ValidateBalloonSize(snapCap, balCurrent); err != nil {
-			return -1, fmt.Errorf("snapshot balloon current: %w", err)
+		if balOk {
+			if err := resctl.ValidateBalloonSize(snapCap, balTarget); err != nil {
+				return -1, fmt.Errorf("snapshot balloon target: %w", err)
+			}
+			if err := resctl.ValidateBalloonSize(snapCap, balCurrent); err != nil {
+				return -1, fmt.Errorf("snapshot balloon current: %w", err)
+			}
 		}
 	}
 	settledHeadroom, err := snapCfg.AllocatableMemoryBytes()
 	if err != nil {
 		return -1, fmt.Errorf("restore settled headroom: %w", err)
 	}
-	if err := validateRestoreBalloonControl(snapCap, settledHeadroom, balOk); err != nil {
-		return -1, err
+	if !diskOnly {
+		if err := validateRestoreBalloonControl(snapCap, settledHeadroom, balOk); err != nil {
+			return -1, err
+		}
 	}
-	budgetAtSnapshot := deriveBudgetAtSnapshot(snapCap, balTarget, balCurrent, balOk)
-	if err := validateBudgetAtSnapshot(snapCap, budgetAtSnapshot); err != nil {
-		return -1, err
-	}
-	safeTarget := uint64(0)
-	if balOk {
-		safeTarget = min(balTarget, balCurrent)
+	budgetAtSnapshot := uint64(0)
+	if !diskOnly {
+		budgetAtSnapshot = deriveBudgetAtSnapshot(snapCap, balTarget, balCurrent, balOk)
+		if err := validateBudgetAtSnapshot(snapCap, budgetAtSnapshot); err != nil {
+			return -1, err
+		}
 	}
 
 	// Preserve both snapshot sides. SafeTarget normalization is deliberately
 	// deferred until restore ACK and MUX establishment.
+	safeTarget := uint64(0)
+	if balOk {
+		safeTarget = min(balTarget, balCurrent)
+	}
 	var balloonCtl *resctl.BalloonController
 	if balOk {
 		balloonCtl = resctl.NewBalloonController(chSock, snapCap, snapCfg.CHApiDeadline(), logf)
@@ -390,15 +412,22 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, fmt.Errorf("controller dial: %w", err)
 	}
 	defer hooks.Release("normal")
-	initialBudget, err := hooks.Admit(opts.SandboxID, budgetAtSnapshot)
+	// Disk-only restore admits like a cold start: request zero, take the
+	// grant. A full-memory restore requires its exact BudgetAtSnapshot back.
+	grantedInitial, err := hooks.Admit(opts.SandboxID, budgetAtSnapshot)
 	if err != nil {
 		return -1, fmt.Errorf("controller admit: %w", err)
 	}
-	if initialBudget != budgetAtSnapshot {
-		return -1, fmt.Errorf("restore initial Budget=%d, require BudgetAtSnapshot=%d", initialBudget, budgetAtSnapshot)
+	if !diskOnly && grantedInitial != budgetAtSnapshot {
+		return -1, fmt.Errorf("restore initial Budget=%d, require BudgetAtSnapshot=%d", grantedInitial, budgetAtSnapshot)
 	}
-	logf("restore BudgetAtSnapshot reserved=%d (balloon target/current=%d/%d)",
-		budgetAtSnapshot, balTarget, balCurrent)
+	initialBudget := grantedInitial
+	if diskOnly {
+		logf("disk-only cold-boot admission granted initial Budget=%d", initialBudget)
+	} else {
+		logf("restore BudgetAtSnapshot reserved=%d (balloon target/current=%d/%d)",
+			budgetAtSnapshot, balTarget, balCurrent)
+	}
 	memoryCtl, err := resctl.NewMemoryController(resctl.MemoryControllerOptions{
 		Config: &snapCfg, CgroupPath: cg.LocalPath(), Balloon: balloonCtl,
 		Reservation: hooks, InitialBudget: initialBudget, Logf: logf,
@@ -406,25 +435,28 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if err != nil {
 		return -1, fmt.Errorf("memory controller: %w", err)
 	}
-	// state.json restored verbatim (vCPU regs, virtio queue indices —
-	// nothing path-dependent).
-	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), entries["state.json"], 0o644); err != nil {
-		return -1, err
-	}
-	// config.json captured paths (uffd_socket, per-disk vhost_socket, ch.sock
-	// api, vsock) → this run's sockets (disks in device order).
-	vsockSock := filepath.Join(runDir, "vsock.sock")
-	rewritten, err := rewriteConfigPaths(entries["config.json"], pathRewrite{
-		UffdSocket: uffdSock,
-		DiskSocks:  diskSocks,
-		APISock:    chSock,
-		VsockSock:  vsockSock,
-	})
-	if err != nil {
-		return -1, fmt.Errorf("rewrite config.json: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(stateDir, "config.json"), rewritten, 0o644); err != nil {
-		return -1, err
+	if !diskOnly {
+		// state.json restored verbatim (vCPU regs, virtio queue indices —
+		// nothing path-dependent). A disk-only bundle's state.json describes
+		// the paused VMM and is irrelevant to a cold boot.
+		if err := os.WriteFile(filepath.Join(stateDir, "state.json"), entries["state.json"], 0o644); err != nil {
+			return -1, err
+		}
+		// config.json captured paths (uffd_socket, per-disk vhost_socket, ch.sock
+		// api, vsock) → this run's sockets (disks in device order).
+		vsockSock := filepath.Join(runDir, "vsock.sock")
+		rewritten, err := rewriteConfigPaths(entries["config.json"], pathRewrite{
+			UffdSocket: uffdSock,
+			DiskSocks:  diskSocks,
+			APISock:    chSock,
+			VsockSock:  vsockSock,
+		})
+		if err != nil {
+			return -1, fmt.Errorf("rewrite config.json: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join(stateDir, "config.json"), rewritten, 0o644); err != nil {
+			return -1, err
+		}
 	}
 
 	// The CH-authoritative Capacity also sizes the memfd and UFFD source.
@@ -433,29 +465,37 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, fmt.Errorf("restore Capacity %d exceeds host addressable memory size", capBytes)
 	}
 
-	// Build the layered memory source: [self bundle] ++ from_refs (§3.5). A
-	// non-resident page (hole) in an upper layer falls through to a lower
-	// layer; a page hole in every layer (merged hole) → ZEROPAGE. Single layer
-	// (no from_refs) degenerates to today's behaviour. The from_refs streams
-	// live until the run exits (closed below); selfStream is closed at open.
-	memLayers := []fetch.Stream{selfStream}
-	for i, ref := range parsedSnap.FromRefs {
-		s, err := openRefStream(ctx, ref, opts)
-		if err != nil {
-			return -1, fmt.Errorf("from_refs[%d]: %w", i, err)
+	// Build the memory source. A full-memory restore layers [self bundle] ++
+	// from_refs (§3.5): a non-resident page (hole) in an upper layer falls
+	// through to a lower layer; a page hole in every layer (merged hole) →
+	// ZEROPAGE. Single layer (no from_refs) degenerates to today's behaviour.
+	// A disk-only bundle has no memory section at all: the guest boots fresh,
+	// so uffd serves zero pages exactly like a cold start.
+	var source uffd.SnapshotReader
+	if diskOnly {
+		source = uffd.ZeroSource{}
+		logf("disk-only bundle: cold-boot memory (zero-fill faults)")
+	} else {
+		memLayers := []fetch.Stream{selfStream}
+		for i, ref := range parsedSnap.FromRefs {
+			s, err := openRefStream(ctx, ref, opts)
+			if err != nil {
+				return -1, fmt.Errorf("from_refs[%d]: %w", i, err)
+			}
+			defer s.Close()
+			memLayers = append(memLayers, s)
 		}
-		defer s.Close()
-		memLayers = append(memLayers, s)
+		source, err = uffd.NewStreamSnapshotSource(fetch.NewLayered(memLayers...), capBytes)
+		if err != nil {
+			return -1, fmt.Errorf("snapshot source: %w", err)
+		}
+		logf("snapshot source: %d memory layer(s)", len(memLayers))
+		prefetch := startMemoryPrefetch(ctx, prefetchMode, opts.SnapshotManifestKey, selfStream, len(memLayers)-1, logf)
+		// Close is a lifetime boundary for fetch.Stream. Register this after
+		// every memory-layer Close defer so cancellation and join always run
+		// first.
+		defer prefetch.Stop()
 	}
-	source, err := uffd.NewStreamSnapshotSource(fetch.NewLayered(memLayers...), capBytes)
-	if err != nil {
-		return -1, fmt.Errorf("snapshot source: %w", err)
-	}
-	logf("snapshot source: %d memory layer(s)", len(memLayers))
-	prefetch := startMemoryPrefetch(ctx, prefetchMode, opts.SnapshotManifestKey, selfStream, len(memLayers)-1, logf)
-	// Close is a lifetime boundary for fetch.Stream. Register this after every
-	// memory-layer Close defer so cancellation and join always run first.
-	defer prefetch.Stop()
 
 	// Reconstruct each logical disk (root + data disks, in order): layer the
 	// captured base ([top] ++ base_from_refs) into a ro base, build a fresh
@@ -530,15 +570,48 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	}
 	netMAC, netSpec := snapCfg.Network.Effective(metaMAC, metaIP)
 
+	// Launch spec: a disk-only COLD boot performs the full guest launch
+	// handshake (hello → launch_ack), so it needs the resolved spec; a
+	// --restore boot never re-hellos and passes a placeholder.
+	var launchSpec *proto.LaunchSpec
+	startTimeout := time.Duration(0)
+	readyOnAppStarted := false
+	if diskOnly {
+		fileOpener := sandbox.FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
+			opened, err := artifact.OpenFile(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
+				opts.Fetcher, opts.LocalCodec, opts.LocalRequired)
+			if err != nil {
+				return nil, err
+			}
+			return opened, nil
+		})
+		spec, _, err := sandbox.LaunchSpecFromConfig(ctx, &snapCfg, opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired, fileOpener, logf)
+		if err != nil {
+			return -1, fmt.Errorf("disk-only launch spec: %w", err)
+		}
+		spec.Network = netSpec
+		spec.Stdio = opts.StdioMode.ProtoSpec()
+		if cols, rows, ok := opts.StdioMode.InitialWinsize(); ok {
+			spec.Stdio.Winsize = &proto.Winsize{Cols: cols, Rows: rows}
+		}
+		launchSpec = spec
+		startTimeout = snapCfg.StartTimeoutDuration()
+		readyOnAppStarted = true
+	} else {
+		launchSpec = &proto.LaunchSpec{}
+	}
+
 	// The shared back-half (memfd, uffd va_report handler, vhost-blk
 	// backends, the launch server — incl. the guest→host mem_report /
 	// app_exited channel that was missing on the restore path — pinger,
 	// ctl.sock, signal escalation, stats) lives in sandbox.ServeAndWait.
-	// Restore supplies: a snapshot uffd Source (not ZeroSource), a
+	// A --restore supplies: a snapshot uffd Source (not ZeroSource), a
 	// placeholder launch spec (the guest does NOT re-hello after a
 	// restore, so WireLaunchMUX=false — the stdio MUX is re-established
 	// by PostSpawn over the reverse channel), and a settle protocol of
 	// waitAPI → /vm.resume → restore{epoch} → local restore normalization.
+	// A disk-only supply instead mirrors cold start: ZeroSource faults, a
+	// wired launch MUX, and a hello-gated settle.
 	return sandbox.ServeAndWait(sandbox.VMParams{
 		Ctx:                ctx,
 		SandboxID:          opts.SandboxID,
@@ -557,10 +630,12 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		UffdSource: source,
 		Disks:      disks,
 
-		LaunchSpec:    &proto.LaunchSpec{},
-		WireLaunchMUX: false,
-		Hooks:         hooks,
-		Memory:        memoryCtl,
+		LaunchSpec:        launchSpec,
+		WireLaunchMUX:     diskOnly,
+		StartTimeout:      startTimeout,
+		Hooks:             hooks,
+		Memory:            memoryCtl,
+		ReadyOnAppStarted: readyOnAppStarted,
 
 		TapFile:   tapFile, // nil in tap-name/no-network modes; non-nil tapfd is inherited at fd 4
 		NetMAC:    netMAC,
@@ -580,15 +655,31 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		NotifyReadiness: opts.NotifyReadiness,
 
 		BuildCmd: func(e sandbox.CmdEnv) (*exec.Cmd, func(), error) {
+			cmd := exec.CommandContext(sandbox.VMLifecycleContext(ctx), opts.CHBinary)
+			consoleArg, cleanup, err := opts.StdioMode.SetupCHStdio(cmd)
+			if err != nil {
+				return nil, nil, fmt.Errorf("stdio: %w", err)
+			}
+			if diskOnly {
+				// Cold-boot cmdline from the merged config: the host yaml's
+				// kernel/runtime artifacts plus this run's sockets and the
+				// reconstructed disks (validated non-empty at admission).
+				_, kernelPath, _ := config.SchemeAndPath(snapCfg.Boot.Kernel)
+				_, runtimePath, _ := config.SchemeAndPath(snapCfg.Boot.Runtime)
+				args, argErr := sandbox.CHCommandWithInitialBudget(&snapCfg, initialBudget, e.Disks, e.CHSock, e.VsockBase, kernelPath, runtimePath, e.UffdSock, consoleArg, e.TapFDNum, e.NetMAC)
+				if argErr != nil {
+					cleanup()
+					return nil, nil, fmt.Errorf("CH cmdline: %w", argErr)
+				}
+				cmd.Args = append(cmd.Args, args...)
+				logf("CH args: %s", strings.Join(args, " "))
+				return cmd, cleanup, nil
+			}
 			// CH 51 `--restore source_url=file://<dir>` replaces
 			// --kernel/--vsock; --console/--serial are restored from the
 			// snapshot bundle (taken with `--console tty --serial off`),
 			// so we don't repeat them. consoleArg is unused here.
-			cmd := exec.CommandContext(sandbox.VMLifecycleContext(ctx), opts.CHBinary)
-			_, cleanup, err := opts.StdioMode.SetupCHStdio(cmd)
-			if err != nil {
-				return nil, nil, fmt.Errorf("stdio: %w", err)
-			}
+			_ = consoleArg
 			restoreArg := "source_url=file://" + stateDir
 			if e.TapFDNum > 0 {
 				// CH can't serialize fds, so the snapshot's net fd is dead;
@@ -604,13 +695,39 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			return cmd, cleanup, nil
 		},
 
-		// Restore settle (docs/sandbox.md §7 T14-T15): wait for CH's
-		// API, /vm.resume to release the vCPUs from the snapshot point,
-		// then notify the guest (restore{epoch=1}) and turn that
-		// reverse-channel conn into the stdio MUX. Synchronous — a
-		// non-nil return aborts the run (ServeAndWait kills CH); we
-		// don't hand back a sandbox whose guest agent is unreachable.
+		// Settle protocol. A --restore boot (docs/sandbox.md §7 T14-T15):
+		// wait for CH's API, /vm.resume to release the vCPUs from the
+		// snapshot point, then notify the guest (restore{epoch=1}) and turn
+		// that reverse-channel conn into the stdio MUX. Synchronous — a
+		// non-nil return aborts the run (ServeAndWait kills CH); we don't
+		// hand back a sandbox whose guest agent is unreachable. A disk-only
+		// cold boot mirrors cold start: the guest hellos over the wired
+		// launch MUX and settle gates on hello → launch_ack.
 		PostSpawn: func(pc sandbox.PostSpawnCtx) error {
+			if diskOnly {
+				go func() {
+					select {
+					case <-pc.Launch.HelloDone():
+						pc.Pinger.Start(pc.Ctx)
+					case <-pc.Ctx.Done():
+						return
+					}
+					select {
+					case <-pc.Launch.LaunchAckDone():
+						if pc.Memory != nil {
+							pc.Memory.StartSensor(pc.Ctx)
+						}
+						if err := pc.Hooks.Settled(); err != nil {
+							pc.Logf("settled: %v", err)
+						}
+						if pc.Hooks.Enabled() {
+							pc.Hooks.StartHeartbeat(pc.Ctx, 5*time.Second)
+						}
+					case <-pc.Ctx.Done():
+					}
+				}()
+				return nil
+			}
 			if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
 			}

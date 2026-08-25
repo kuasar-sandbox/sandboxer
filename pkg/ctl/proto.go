@@ -46,6 +46,10 @@ type Request struct {
 	// nil preserves the behavior of clients predating these fields.
 	DropCaches *bool `json:"drop_caches,omitempty"`
 	MergeRef   *bool `json:"merge_ref,omitempty"`
+	// Memory=false requests a disk-only snapshot: the overlays and the
+	// config ZIP are captured but the memfd is not dumped, producing a
+	// memoryless bundle that restores via cold boot (docs/sandbox.md §6.1).
+	Memory *bool `json:"memory,omitempty"`
 
 	// exec_request: the command + stdio the caller wants run inside the
 	// already-running sandbox.
@@ -86,6 +90,13 @@ func (r Request) DropCachesEnabled() bool {
 // the new self artifact. A missing field means true for wire compatibility.
 func (r Request) MergeRefEnabled() bool {
 	return r.MergeRef == nil || *r.MergeRef
+}
+
+// MemoryRequested reports whether the snapshot captures the VM memory. A
+// missing field means true so old clients retain the historical behavior;
+// false selects a disk-only capture.
+func (r Request) MemoryRequested() bool {
+	return r.Memory == nil || *r.Memory
 }
 
 const (

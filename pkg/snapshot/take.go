@@ -62,6 +62,12 @@ type Sources struct {
 	// Empty ⇒ no merge (stack via the parent refs).
 	MergeBaseSnapshot string
 
+	// SkipMemory captures a disk-only snapshot: overlays + config ZIP only,
+	// no memfd walk/merge, producing a memoryless bundle (snapshot.cfg
+	// carries memory=false) that restores via cold boot. The zero value
+	// preserves the historical full-memory behavior.
+	SkipMemory bool
+
 	// SnapshotCfg renders snapshot.cfg given the final overlay refs (one per
 	// logical disk, in Diffs order).
 	SnapshotCfg func(overlayRefs []string) ([]byte, error)
@@ -127,7 +133,7 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 		return nil, fmt.Errorf("snapshot: nil sink")
 	}
 	ctx := context.Background()
-	out := &Outputs{MemorySize: uint64(s.MemfdSize)}
+	out := &Outputs{}
 	ch := chapi.Client{Sock: s.APISock, RespDeadline: s.CHApiDeadline}
 
 	// T2a: pause CH.
@@ -199,21 +205,35 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 
 	// T6: [memory][ZIP] bundle → sink, streamed from the memfd (CH paused, so
 	// the mapping is stable); only resident pages are read/transferred.
-	memHoles, err := WalkHoles(s.MemfdFD, s.MemfdSize)
-	if err != nil {
-		return nil, fmt.Errorf("memory holes: %w", err)
-	}
-	var memSrc io.ReadSeeker = memfdReader(s.MemfdFD, s.MemfdSize)
-	memSrcHoles := memHoles
-	if s.MergeBaseSnapshot != "" {
-		base, baseHoles, berr := openMergeBaseWithOpener(s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MergeBaseOpener)
-		if berr != nil {
-			return nil, fmt.Errorf("merge memory base: %w", berr)
+	// T6: [memory][ZIP] bundle → sink, streamed from the memfd (CH paused, so
+	// the mapping is stable); only resident pages are read/transferred.
+	// Disk-only captures skip this stage entirely: the bundle is the bare ZIP
+	// trailer with a zero-size memory section, and MemorySize/Resident report 0.
+	var memSrc io.ReadSeeker
+	var memSrcHoles []sparse.Extent
+	if s.SkipMemory {
+		out.MemorySize = 0
+		out.MemoryResident = 0
+		memSrc = emptySection{}
+		memSrcHoles = nil
+	} else {
+		out.MemorySize = uint64(s.MemfdSize)
+		memHoles, err := WalkHoles(s.MemfdFD, s.MemfdSize)
+		if err != nil {
+			return nil, fmt.Errorf("memory holes: %w", err)
 		}
-		defer base.Close()
-		memSrc, memSrcHoles = mergeSparse(memSrc, memHoles, base, baseHoles, s.MemfdSize)
+		memSrc = memfdReader(s.MemfdFD, s.MemfdSize)
+		memSrcHoles = memHoles
+		if s.MergeBaseSnapshot != "" {
+			base, baseHoles, berr := openMergeBaseWithOpener(s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MergeBaseOpener)
+			if berr != nil {
+				return nil, fmt.Errorf("merge memory base: %w", berr)
+			}
+			defer base.Close()
+			memSrc, memSrcHoles = mergeSparse(memSrc, memHoles, base, baseHoles, s.MemfdSize)
+		}
+		out.MemoryResident = residentBytes(s.MemfdSize, memSrcHoles) // bytes actually written (merged)
 	}
-	out.MemoryResident = residentBytes(s.MemfdSize, memSrcHoles) // bytes actually written (merged)
 	out.SnapshotRef, out.SnapshotPath, err = sink.AbsorbBundle(
 		ctx, memSrc, memSrcHoles, bytes.NewReader(zipBytes))
 	if err != nil {
@@ -231,10 +251,30 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 
 	out.WallclockPauseMs = pausedAt.Sub(pauseStart).Milliseconds()
 	out.WallclockDumpMs = dumpEnd.Sub(dumpStart).Milliseconds()
-	logf("snapshot: overlays=%v snapshot=%s memory_resident=%d", out.OverlayRefs, out.SnapshotRef, out.MemoryResident)
+	if s.SkipMemory {
+		logf("snapshot: disk-only overlays=%v snapshot=%s", out.OverlayRefs, out.SnapshotRef)
+	} else {
+		logf("snapshot: overlays=%v snapshot=%s memory_resident=%d", out.OverlayRefs, out.SnapshotRef, out.MemoryResident)
+	}
 	succeeded = true
 	return out, nil
 }
+
+// emptySection is the zero-size memory section of a disk-only bundle.
+type emptySection struct{}
+
+func (emptySection) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart, io.SeekCurrent:
+		return offset, nil
+	case io.SeekEnd:
+		return offset, nil
+	default:
+		return 0, fmt.Errorf("emptySection: invalid whence %d", whence)
+	}
+}
+
+func (emptySection) Read([]byte) (int, error) { return 0, io.EOF }
 
 // absorbOverlay streams one disk's diff to the sink, optionally flattening it
 // onto the parent's local overlay (merge, replacing the parent layer).

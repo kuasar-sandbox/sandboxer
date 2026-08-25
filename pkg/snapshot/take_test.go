@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"io"
@@ -69,6 +70,110 @@ func TestAbsorbOverlayRequiresSnapshotView(t *testing.T) {
 	sink := NewFileSink(t.TempDir(), "sid", nil, false, nil)
 	if _, _, err := absorbOverlay(context.Background(), sink, DiskDiff{Path: "raw.diff"}, false, nil, false); err == nil {
 		t.Fatal("absorbOverlay accepted a raw-path-only diff")
+	}
+}
+
+// A disk-only Take must never touch the memfd (an invalid fd would fail the
+// hole walk if it did) and must produce a bundle whose payload is the bare
+// config ZIP.
+func TestTakeDiskOnlyProducesMemorylessBundle(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "ch.sock")
+	stagingDir := t.TempDir()
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/vm.snapshot" {
+			// Real CH drops config.json + state.json into the staging dir.
+			for _, name := range []string{"config.json", "state.json"} {
+				if err := os.WriteFile(filepath.Join(stagingDir, name), []byte("{}"), 0o644); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	serveDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(serveDone)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-serveDone
+	})
+
+	cfgCalls := 0
+	outDir := t.TempDir()
+	const diffSize = 2 * 4096
+	out, err := Take(Sources{
+		SandboxID:     "disk-only",
+		APISock:       sock,
+		StagingDir:    stagingDir,
+		CHApiDeadline: time.Second,
+		MemfdFD:       -1, // any memory access fails the whole Take
+		MemfdSize:     1 << 20,
+		Diffs: []DiskDiff{{
+			Path: "root.diff",
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				return bytes.NewReader(make([]byte, diffSize)), nil, nil
+			},
+		}},
+		SnapshotCfg: func([]string) ([]byte, error) {
+			cfgCalls++
+			return []byte("memory: false\n"), nil
+		},
+		Quiescer:   &recordingQuiescer{},
+		SkipMemory: true,
+	}, NewFileSink(outDir, "disk-only", nil, false, nil), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfgCalls != 1 {
+		t.Fatalf("snapshot.cfg builder calls = %d, want 1", cfgCalls)
+	}
+	if out.MemorySize != 0 || out.MemoryResident != 0 {
+		t.Fatalf("disk-only outputs report memory size=%d resident=%d, want 0/0", out.MemorySize, out.MemoryResident)
+	}
+
+	raw, err := os.ReadFile(out.SnapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := tarstream.ReadSeekFrom(bytes.NewReader(raw), "snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical := make([]byte, view.Size())
+	if _, err := io.ReadFull(view, logical); err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(logical), int64(len(logical)))
+	if err != nil {
+		t.Fatalf("disk-only bundle payload is not a bare ZIP: %v", err)
+	}
+	names := map[string]bool{}
+	for _, f := range zr.File {
+		names[f.Name] = true
+	}
+	for _, want := range []string{"config.json", "state.json", "snapshot.cfg"} {
+		if !names[want] {
+			t.Fatalf("disk-only bundle ZIP missing %s: %v", want, names)
+		}
+	}
+	cfgEntry, err := zr.Open("snapshot.cfg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cfgEntry.Close()
+	cfgBody, err := io.ReadAll(cfgEntry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(cfgBody), "memory: false") {
+		t.Fatalf("disk-only snapshot.cfg does not carry the memory=false marker:\n%s", cfgBody)
 	}
 }
 

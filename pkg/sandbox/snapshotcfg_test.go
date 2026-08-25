@@ -20,7 +20,7 @@ func TestBuildSnapshotCfg_SingleDisk(t *testing.T) {
 	cfg.Boot.Root.DiffTemplate = "file:///root.ext4"  // Overlay nil ⇒ single-disk
 	cfg.Boot.Root.Base = "manifest://coldbase"        // CoW lower → chained on cold start
 
-	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false})
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestBuildSnapshotCfg_Overlay(t *testing.T) {
 	cfg.SnapshotRefs.BaseRef = "file://img@sha256:bb"
 	cfg.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///d.ext4"} // overlay mode
 
-	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false})
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,6 +56,34 @@ func TestBuildSnapshotCfg_Overlay(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Errorf("overlay snapshot.cfg missing %q\n%s", want, s)
 		}
+	}
+}
+
+func TestBuildSnapshotCfg_DiskOnlyMarker(t *testing.T) {
+	cfg := &config.SandboxConfig{}
+
+	full, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fullDoc snapshotCfgYAML
+	if err := yaml.Unmarshal(full, &fullDoc); err != nil {
+		t.Fatal(err)
+	}
+	if fullDoc.Memory != nil {
+		t.Fatalf("full-memory snapshot.cfg must omit the memory field, got %v", *fullDoc.Memory)
+	}
+
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc snapshotCfgYAML
+	if err := yaml.Unmarshal(body, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Memory == nil || !*doc.Memory {
+		t.Fatalf("disk-only snapshot.cfg memory = %v, want false", doc.Memory)
 	}
 }
 
@@ -68,7 +96,7 @@ func TestBuildSnapshotCfg_OmitsRestorePolicy(t *testing.T) {
 	cfg.Boot.Root.Overlay = &config.OverlayConfig{Diff: "file:///d.ext4"}
 	cfg.Restore.Prefetch = "memory"
 
-	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false})
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +113,7 @@ func TestBuildSnapshotCfg_PersistsCgroupControl(t *testing.T) {
 	cfg.SnapshotRefs.RuntimeRef = "file://rt@sha256:aa"
 	cfg.Boot.Root.DiffTemplate = "file:///root.ext4"
 
-	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false})
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +145,7 @@ func TestBuildSnapshotCfg_OverlayColdBase(t *testing.T) {
 		Diff: "file:///d.ext4",
 	}
 
-	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false})
+	body, err := buildSnapshotCfg(cfg, []string{"manifest://captured"}, nil, []bool{false}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +179,7 @@ func TestBuildSnapshotCfg_DataDisks(t *testing.T) {
 	cfg.SnapshotRefs.DiskBaseRefs = []string{"", "file://ds@sha256:cc"}
 
 	body, err := buildSnapshotCfg(cfg, []string{"manifest://root", "manifest://scratch", "manifest://dataset"},
-		nil, []bool{false, false, false})
+		nil, []bool{false, false, false}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +225,7 @@ func TestBuildSnapshotCfg_MixedLocalMemoryManifestDiskKeepsDiskParent(t *testing
 
 	body, err := buildSnapshotCfg(cfg,
 		[]string{"manifest://new-root", "manifest://new-data"},
-		[]string{"file://parent.snapshot"}, []bool{true, false})
+		[]string{"file://parent.snapshot"}, []bool{true, false}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +263,7 @@ func TestBuildSnapshotCfg_LocalWorkingSetKeepsMemoryParentButMergesDisks(t *test
 
 	body, err := buildSnapshotCfg(cfg,
 		[]string{"file://working-root.overlay", "file://working-data.overlay"},
-		[]string{"file://base.snapshot", "manifest://memory-lower"}, []bool{true, true})
+		[]string{"file://base.snapshot", "manifest://memory-lower"}, []bool{true, true}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +298,7 @@ func TestBuildSnapshotCfg_DefaultLocalMergeDropsMemoryParent(t *testing.T) {
 	}
 
 	body, err := buildSnapshotCfg(cfg, []string{"file://root.overlay"},
-		[]string{"manifest://memory-lower"}, []bool{true})
+		[]string{"manifest://memory-lower"}, []bool{true}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

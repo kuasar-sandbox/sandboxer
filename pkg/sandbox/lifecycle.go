@@ -287,31 +287,12 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	//   - single-disk mode: blk0 is the writable ext4 CoW built below; there
 	//     is no erofs image and thus no image config, so launch.exec must be
 	//     set (enforced by config.validate). blk0Reader stays nil.
-	var blk0Reader vhost.BlockReader // overlay mode only (ro erofs base)
-	var imageCfg *ImageConfig
-	if opts.Cfg.SingleDisk() {
-		imageCfg = &ImageConfig{}
-	} else {
-		r, _, err := OpenBlockReaderWithOpener(ctx, opts.Cfg.Boot.Root.Base, fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired, fileOpener)
-		if err != nil {
-			return -1, fmt.Errorf("blk0 base: %w", err)
-		}
-		blk0Reader = r
-		defer blk0Reader.Close()
-		// Both file:// and manifest:// blk0 produce a vhost.BlockReader that is
-		// also a concurrent-safe io.ReaderAt; LoadImageConfigFrom does the
-		// ZIP-trailer scan over either source uniformly.
-		imageCfg, err = LoadImageConfigFrom(blk0Reader, blk0Reader.Size())
-		if err != nil {
-			return -1, fmt.Errorf("load rootfs image config: %w", err)
-		}
-		logf("image config: cmd=%v entrypoint=%v workdir=%q env-keys=%d",
-			imageCfg.Cmd, imageCfg.Entrypoint, imageCfg.WorkingDir, len(imageCfg.Env))
-	}
-	// Merge image config defaults with sandbox.yaml `launch:` overrides.
-	launchSpec, err := MergeLaunch(imageCfg, opts.Cfg.Launch)
+	launchSpec, blk0Reader, err := LaunchSpecFromConfig(ctx, opts.Cfg, fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired, fileOpener, logf)
 	if err != nil {
-		return -1, fmt.Errorf("launch spec: %w", err)
+		return -1, err
+	}
+	if blk0Reader != nil {
+		defer blk0Reader.Close()
 	}
 
 	// Network acquisition. tapfd mode (docs/tapfd.md §3) receives a tap queue
@@ -340,17 +321,8 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 
 	// Environment setup carried in the launch spec (applied guest-side
 	// before the app forks): mounts (incl. image Volumes → empty mounts),
-	// injected files, one-shot init, and the shutdown grace.
-	launchSpec.Mounts = effectiveMounts(opts.Cfg.Mounts, imageCfg.Volumes)
-	launchSpec.Files = opts.Cfg.ProtoFiles()
-	launchSpec.Init = toProtoInit(opts.Cfg.Init)
-	launchSpec.Plugins = toProtoPlugins(opts.Cfg.Launch.Plugin)
-	launchSpec.SharePID = opts.Cfg.Launch.PIDNamespace == "shared"
-	launchSpec.StopGraceSec = opts.Cfg.StopGraceSeconds()
-
-	// App stdio: tell sandbox-init what to wire (pty vs pipe channels);
-	// the launch-handshake connection becomes the stdio MUX after
-	// launch_ack (guestlink.LaunchServer.OnMUXReady below).
+	// injected files, one-shot init, and the shutdown grace — all resolved by
+	// LaunchSpecFromConfig; the caller only adds network and stdio.
 	launchSpec.Stdio = opts.StdioMode.ProtoSpec()
 	if cols, rows, ok := opts.StdioMode.InitialWinsize(); ok {
 		launchSpec.Stdio.Winsize = &proto.Winsize{Cols: cols, Rows: rows}
@@ -545,6 +517,66 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 			return nil
 		},
 	})
+}
+
+// LaunchSpecFromConfig resolves the guest launch spec for a config whose root
+// disk is backed by a readable EROFS image (docs/sandbox-runtime.md §3.1):
+//   - overlay mode: the image-config defaults (Cmd/Entrypoint/Env/Workdir/
+//     Volumes) are read from boot.root.base's appended ZIP trailer.
+//   - single-disk mode: there is no image config; launch.exec must be set
+//     (enforced by config.validate).
+//
+// It also resolves mounts (image Volumes → empty mounts), injected files,
+// one-shot init, plugins, PID sharing, and stop grace. The caller assigns
+// Network and Stdio afterwards. In overlay mode the opened blk0 reader is
+// returned for the caller to own (cold start keeps it for the ro erofs
+// device); single-disk mode returns nil.
+func LaunchSpecFromConfig(
+	ctx context.Context,
+	cfg *config.SandboxConfig,
+	fetcher fetch.Fetcher,
+	locations config.RefLocations,
+	codec tarstream.Codec,
+	required bool,
+	opener FileStreamOpener,
+	logf func(string, ...any),
+) (*proto.LaunchSpec, vhost.BlockReader, error) {
+	var rootReader vhost.BlockReader // overlay mode only (ro erofs base)
+	var imageCfg *ImageConfig
+	if cfg.SingleDisk() {
+		imageCfg = &ImageConfig{}
+	} else {
+		r, _, err := OpenBlockReaderWithOpener(ctx, cfg.Boot.Root.Base, fetcher, locations, codec, required, opener)
+		if err != nil {
+			return nil, nil, fmt.Errorf("blk0 base: %w", err)
+		}
+		rootReader = r
+		// Both file:// and manifest:// blk0 produce a vhost.BlockReader that is
+		// also a concurrent-safe io.ReaderAt; LoadImageConfigFrom does the
+		// ZIP-trailer scan over either source uniformly.
+		imageCfg, err = LoadImageConfigFrom(r, r.Size())
+		if err != nil {
+			r.Close()
+			return nil, nil, fmt.Errorf("load rootfs image config: %w", err)
+		}
+		logf("image config: cmd=%v entrypoint=%v workdir=%q env-keys=%d",
+			imageCfg.Cmd, imageCfg.Entrypoint, imageCfg.WorkingDir, len(imageCfg.Env))
+	}
+	// Merge image config defaults with sandbox.yaml `launch:` overrides.
+	spec, err := MergeLaunch(imageCfg, cfg.Launch)
+	if err != nil {
+		if rootReader != nil {
+			rootReader.Close()
+		}
+		return nil, nil, fmt.Errorf("launch spec: %w", err)
+	}
+	spec.Mounts = effectiveMounts(cfg.Mounts, imageCfg.Volumes)
+	spec.Files = cfg.ProtoFiles()
+	spec.Init = toProtoInit(cfg.Init)
+	spec.Plugins = toProtoPlugins(cfg.Launch.Plugin)
+	spec.SharePID = cfg.Launch.PIDNamespace == "shared"
+	spec.StopGraceSec = cfg.StopGraceSeconds()
+	return spec, rootReader, nil
 }
 
 // chShutdownGrace bounds how long we wait for CH to exit cleanly after
@@ -1131,6 +1163,8 @@ func handleSnapshotRequest(
 	if err != nil {
 		return ctl.Response{}, err
 	}
+	memoryRequested := req.MemoryRequested()
+	diskOnly := !memoryRequested
 	prov := opts.Cfg.SnapshotProvenance
 	localParent := false
 	if prov.ParentSnapshotRef != "" {
@@ -1165,8 +1199,16 @@ func handleSnapshotRequest(
 	if !req.Upload && req.OutDir == "" {
 		return ctl.Response{}, fmt.Errorf("--output and --upload are mutually exclusive; one is required")
 	}
-	if (localParent || prov.BundleSource != nil) && !mergeRef && req.Upload {
-		return ctl.Response{}, fmt.Errorf("--merge-ref=false with a local memory or Bundle parent requires --output; direct upload is not supported")
+	// The local-memory-parent restriction is about merging memory layers; a
+	// disk-only capture never touches the parent's memory section. The
+	// Bundle-parent restriction stays unconditional: the parent Bundle's
+	// manifests must reach the store via --output before a child upload can
+	// reference them.
+	if memoryRequested && localParent && !mergeRef && req.Upload {
+		return ctl.Response{}, fmt.Errorf("--merge-ref=false with a local memory parent requires --output; direct upload is not supported")
+	}
+	if prov.BundleSource != nil && !mergeRef && req.Upload {
+		return ctl.Response{}, fmt.Errorf("--merge-ref=false with a Bundle parent requires --output; direct upload is not supported")
 	}
 	mergeBaseOpener := snapshot.MergeBaseOpener(func(ctx context.Context, raw string) (fetch.Stream, error) {
 		ref, err := manifest.ParseRef(raw)
@@ -1283,9 +1325,12 @@ func handleSnapshotRequest(
 		diffs[i] = dd
 	}
 
+	// Disk-only captures never merge memory; a run restored from a disk-only
+	// parent owns fresh RAM with nothing to merge onto.
 	mergeMemory := false
 	memoryMergeBase := ""
-	if localParent && mergeRef {
+	if !memoryRequested || prov.ParentDiskOnly {
+	} else if localParent && mergeRef {
 		if prov.ParentSnapshotPath == "" {
 			return ctl.Response{}, fmt.Errorf("snapshot: local parent lacks a memory merge path")
 		}
@@ -1297,8 +1342,7 @@ func handleSnapshotRequest(
 			return ctl.Response{}, fmt.Errorf("snapshot: memory merge base: %w", err)
 		}
 		mergeMemory = true
-	} else if mergeRef && prov.BundleSource != nil && prov.ParentSnapshotRef != "" {
-		memoryMergeBase, mergeMemory, err = bundleManifestMergeRef(context.Background(), prov.ParentSnapshotRef, opts)
+	} else if mergeRef && prov.BundleSource != nil && prov.ParentSnapshotRef != "" {		memoryMergeBase, mergeMemory, err = bundleManifestMergeRef(context.Background(), prov.ParentSnapshotRef, opts)
 		if err != nil {
 			return ctl.Response{}, fmt.Errorf("snapshot: Bundle memory merge base identity: %w", err)
 		}
@@ -1308,19 +1352,27 @@ func handleSnapshotRequest(
 			}
 		}
 	}
-	resultMemoryRefs, err := snapshotMemoryRefs(prov, mergeMemory)
+	// Memory lineage: a disk-only capture has no memory section, and any
+	// capture taken by a run restored from a disk-only parent owns complete
+	// fresh RAM. Both must NOT stack the parent bundle into from_refs — it
+	// carries no memory layer a future restore could page in.
+	memoryLineage := prov
+	if !memoryRequested || prov.ParentDiskOnly {
+		memoryLineage = config.SnapshotProvenance{}
+	}
+	resultMemoryRefs, err := snapshotMemoryRefs(memoryLineage, mergeMemory)
 	if err != nil {
 		return ctl.Response{}, err
 	}
 	if snapshotMode != ctl.SnapshotModeBundle && prov.BundleSource != nil {
-		if err := validateNonBundleSnapshotSources(context.Background(), opts, resultMemoryRefs, diskMerged); err != nil {
+		if err := validateNonBundleSnapshotSources(context.Background(), opts, resultMemoryRefs, diskMerged, diskOnly); err != nil {
 			return ctl.Response{}, err
 		}
 	}
 	var bundleRefReplacements map[string]string
 	if snapshotMode == ctl.SnapshotModeBundle {
 		plan, planErr := prepareSnapshotBundlePlan(context.Background(), opts, resultMemoryRefs,
-			diskMerged, req.OutDir, bundleAdmission)
+			diskMerged, diskOnly, req.OutDir, bundleAdmission)
 		if planErr != nil {
 			return ctl.Response{}, planErr
 		}
@@ -1503,7 +1555,7 @@ func handleSnapshotRequest(
 	// final on first write — no post-hoc ZIP rewrite.
 	cfg := opts.Cfg
 	snapCfgBuilder := func(overlayRefs []string) ([]byte, error) {
-		body, err := buildSnapshotCfg(cfg, overlayRefs, resultMemoryRefs, diskMerged)
+		body, err := buildSnapshotCfg(cfg, overlayRefs, resultMemoryRefs, diskMerged, diskOnly)
 		if err != nil || bundleRefReplacements == nil {
 			return body, err
 		}
@@ -1549,6 +1601,7 @@ func handleSnapshotRequest(
 		LocalCodec:      opts.LocalCodec,
 		LocalRequired:   opts.LocalRequired,
 		MergeBaseOpener: mergeBaseOpener,
+		SkipMemory:      !memoryRequested,
 	}
 	if mergeMemory {
 		src.MergeBaseSnapshot = memoryMergeBase
@@ -1798,13 +1851,14 @@ func prepareSnapshotBundlePlan(
 	opts RunOptions,
 	memoryFromRefs []string,
 	diskMerged []bool,
+	diskOnly bool,
 	outputDir string,
 	admission store.WriteAdmission,
 ) (_ *snapshotBundlePlan, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	logicalRefs, err := snapshotLayerDependencyRefs(opts.Cfg, memoryFromRefs, diskMerged)
+	logicalRefs, err := snapshotLayerDependencyRefs(opts.Cfg, memoryFromRefs, diskMerged, diskOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -1923,9 +1977,9 @@ func prepareSnapshotBundlePlan(
 	return plan, nil
 }
 
-func snapshotLayerDependencyRefs(cfg *config.SandboxConfig, memoryFromRefs []string, diskMerged []bool) ([]string, error) {
+func snapshotLayerDependencyRefs(cfg *config.SandboxConfig, memoryFromRefs []string, diskMerged []bool, diskOnly bool) ([]string, error) {
 	placeholderRefs := make([]string, len(diskMerged))
-	probe, err := buildSnapshotCfg(cfg, placeholderRefs, memoryFromRefs, diskMerged)
+	probe, err := buildSnapshotCfg(cfg, placeholderRefs, memoryFromRefs, diskMerged, diskOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -1939,8 +1993,8 @@ func snapshotLayerDependencyRefs(cfg *config.SandboxConfig, memoryFromRefs []str
 	return refs, nil
 }
 
-func validateNonBundleSnapshotSources(ctx context.Context, opts RunOptions, memoryFromRefs []string, diskMerged []bool) error {
-	refs, err := snapshotLayerDependencyRefs(opts.Cfg, memoryFromRefs, diskMerged)
+func validateNonBundleSnapshotSources(ctx context.Context, opts RunOptions, memoryFromRefs []string, diskMerged []bool, diskOnly bool) error {
+	refs, err := snapshotLayerDependencyRefs(opts.Cfg, memoryFromRefs, diskMerged, diskOnly)
 	if err != nil {
 		return err
 	}
@@ -2389,7 +2443,9 @@ func normalizeLocalMemoryRefs(refs []string) ([]string, error) {
 // from each artifact's declared identity (see config.SnapshotRefs in
 // config.SandboxConfig). overlayRef is filled in by Take() after overlay
 // digest is known, or by Upload() after overlay manifest key is known.
-func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs, memoryFromRefs []string, diskMerged []bool) ([]byte, error) {
+// diskOnly records a memoryless capture (memory=false); normal snapshots
+// omit the field so older readers see the historical schema unchanged.
+func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs, memoryFromRefs []string, diskMerged []bool, diskOnly bool) ([]byte, error) {
 	if len(overlayRefs) != 1+len(cfg.Boot.Disks) {
 		return nil, fmt.Errorf("snapshot.cfg: got %d disk refs, want %d", len(overlayRefs), 1+len(cfg.Boot.Disks))
 	}
@@ -2397,6 +2453,9 @@ func buildSnapshotCfg(cfg *config.SandboxConfig, overlayRefs, memoryFromRefs []s
 		return nil, fmt.Errorf("snapshot.cfg: got %d disk merge decisions, want %d", len(diskMerged), len(overlayRefs))
 	}
 	doc := snapshotCfgYAML{}
+	if diskOnly {
+		doc.Memory = &diskOnly
+	}
 	doc.Resources.Capacity.CPU = cfg.Resources.Capacity.CPU
 	doc.Resources.Capacity.Memory = cfg.Resources.Capacity.Memory
 	doc.Metadata = cfg.Metadata
@@ -2507,6 +2566,9 @@ type diskNodeYAML struct {
 // snapshotCfgYAML mirrors the on-disk snapshot.cfg schema. Extracted
 // type so buildSnapshotCfg + applyrules.SnapshotCfg share a definition.
 type snapshotCfgYAML struct {
+	// Memory=false marks a disk-only (memoryless) bundle; omitted (nil) on
+	// full-memory snapshots so the historical schema is unchanged.
+	Memory    *bool `yaml:"memory,omitempty"`
 	Resources struct {
 		Capacity struct {
 			CPU    int    `yaml:"cpu"`

@@ -146,6 +146,11 @@ type SnapshotProvenance struct {
 	ParentFromRefs     []string // parent's from_refs (memory chain below the parent)
 	ParentOverlayBase  string   // parent's overlay.base (top disk diff); "" on cold start
 	ParentBaseFromRefs []string // parent's overlay.base_from_refs (disk chain below it)
+	// ParentDiskOnly records that the parent bundle is disk-only (memoryless,
+	// snapshot.cfg memory=false). A snapshot taken by this run then owns
+	// complete fresh RAM: it must not stack the parent into from_refs and
+	// must not attempt a local memory merge onto it.
+	ParentDiskOnly bool
 
 	// ParentSnapshot/OverlayPath are the absolute paths of the parent's local
 	// tarstream snapshot + overlay files, set ONLY when this run was restored

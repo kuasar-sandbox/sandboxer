@@ -19,6 +19,10 @@ import (
 // §3.4). Parsed from the trailing-ZIP entry "snapshot.cfg" inside a
 // <sid>.snapshot bundle.
 type SnapshotCfg struct {
+	// Memory=false marks a disk-only (memoryless) bundle produced by
+	// `sandbox-ctl snapshot --memory=false`. Omitted on full-memory
+	// snapshots; older readers ignore the unknown field.
+	Memory    *bool `yaml:"memory,omitempty"`
 	Resources struct {
 		Capacity struct {
 			CPU    int    `yaml:"cpu"`
@@ -74,6 +78,11 @@ type SnapOverlayCfg struct {
 // SingleDisk reports whether the snapshot was taken in single-disk mode (no
 // boot.root.overlay node).
 func (c *SnapshotCfg) SingleDisk() bool { return c.Boot.Root.Overlay == nil }
+
+// DiskOnly reports whether the bundle is memoryless (snapshot.cfg
+// memory=false): it restores via cold boot, not --restore, and must never
+// appear in another snapshot's from_refs memory chain.
+func (c *SnapshotCfg) DiskOnly() bool { return c.Memory != nil && !*c.Memory }
 
 // ArtifactRefs returns the non-empty disk artifact refs named by this root
 // snapshot.cfg. It covers the root disk and every data disk, including their
