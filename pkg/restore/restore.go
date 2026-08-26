@@ -1007,6 +1007,10 @@ func fileBundleSource(path, rawRef string) (string, string, error) {
 		}
 		ref = parsed
 	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
 	real, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", "", err
@@ -1015,13 +1019,26 @@ func fileBundleSource(path, rawRef string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	if ref.Location == "" {
-		ref.Path = filepath.Base(real)
+	if ref.Location != "" {
+		// A located alias is portable only when its final target is a
+		// canonical sibling in the same location directory. Otherwise the
+		// basename recorded in bundle/refs would resolve to a different file.
+		locationDir, err := filepath.EvalSymlinks(filepath.Dir(path))
+		if err != nil {
+			return "", "", err
+		}
+		if filepath.Clean(locationDir) != filepath.Clean(filepath.Dir(real)) {
+			return "", "", fmt.Errorf("located Bundle alias target must remain in the same location directory")
+		}
 	}
+	ref.Path = filepath.Base(real)
 	ref.DigestScheme = ""
 	ref.Digest = ""
 	if err := ref.Validate(); err != nil {
 		return "", "", err
+	}
+	if _, err := manifestbundle.EncodeRefs([]string{ref.String()}); err != nil {
+		return "", "", fmt.Errorf("canonical Bundle source: %w", err)
 	}
 	return ref.String(), real, nil
 }

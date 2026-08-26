@@ -1,9 +1,63 @@
 package restore
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
+
+func TestFileBundleSourceCanonicalizesLocatedAlias(t *testing.T) {
+	dir := t.TempDir()
+	key := strings.Repeat("a", 64)
+	bundleName := key + ".bundle"
+	bundlePath := filepath.Join(dir, bundleName)
+	if err := os.WriteFile(bundlePath, []byte("bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aliasPath := filepath.Join(dir, "root.snapshot")
+	if err := os.Symlink(bundleName, aliasPath); err != nil {
+		t.Fatal(err)
+	}
+
+	got, real, err := fileBundleSource(aliasPath,
+		"file://root.snapshot@manifest:"+key+"@location:A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "file://" + bundleName + "@location:A"; got != want {
+		t.Fatalf("source = %q, want %q", got, want)
+	}
+	if real != bundlePath {
+		t.Fatalf("real path = %q, want %q", real, bundlePath)
+	}
+
+	noncanonicalPath := filepath.Join(dir, "regular.snapshot")
+	if err := os.WriteFile(noncanonicalPath, []byte("bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fileBundleSource(noncanonicalPath,
+		"file://regular.snapshot@manifest:"+key+"@location:A"); err == nil ||
+		!strings.Contains(err.Error(), "canonical Bundle source") {
+		t.Fatalf("noncanonical located source error = %v", err)
+	}
+
+	otherDir := t.TempDir()
+	outsidePath := filepath.Join(otherDir, bundleName)
+	if err := os.WriteFile(outsidePath, []byte("bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outsideAlias := filepath.Join(dir, "outside.snapshot")
+	if err := os.Symlink(outsidePath, outsideAlias); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fileBundleSource(outsideAlias,
+		"file://outside.snapshot@manifest:"+key+"@location:A"); err == nil ||
+		!strings.Contains(err.Error(), "same location directory") {
+		t.Fatalf("outside located source error = %v", err)
+	}
+}
 
 func TestSnapshotCfgArtifactRefsSingleDisk(t *testing.T) {
 	cfg := &SnapshotCfg{}
