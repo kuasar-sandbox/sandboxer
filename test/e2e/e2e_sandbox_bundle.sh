@@ -269,6 +269,7 @@ network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: $hostn
 boot:
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
+    base: $BLK0_REF
     overlay: { diff: file://$root_diff, size: 512MiB }
   disks:
     - { name: scratch }
