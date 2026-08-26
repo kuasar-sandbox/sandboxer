@@ -362,30 +362,27 @@ func validateManifestBundleFile(path string, root *store.ContentKey) error {
 }
 
 func publishManifestBundleFile(ctx context.Context, sourcePath, destinationPath string, root *store.ContentKey) error {
-	if _, err := os.Lstat(destinationPath); err == nil {
-		return validateExistingBundleCopy(ctx, sourcePath, destinationPath, root)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	temporary, err := os.CreateTemp(filepath.Dir(destinationPath), ".bundle-publish-*.partial")
+	created, err := os.OpenFile(destinationPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o644); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := copySyncAndCloseLocationFile(ctx, temporary, sourcePath); err != nil {
-		return err
-	}
-	if err := unix.Renameat2(unix.AT_FDCWD, temporaryPath, unix.AT_FDCWD, destinationPath, unix.RENAME_NOREPLACE); err != nil {
-		if !errors.Is(err, unix.EEXIST) {
-			return err
+		if os.IsExist(err) {
+			return validateExistingBundleCopy(ctx, sourcePath, destinationPath, root)
 		}
+		return err
 	}
-	return validateExistingBundleCopy(ctx, sourcePath, destinationPath, root)
+	owned := true
+	defer func() {
+		if owned {
+			_ = os.Remove(destinationPath)
+		}
+	}()
+	if err := copySyncAndCloseLocationFile(ctx, created, sourcePath); err != nil {
+		return err
+	}
+	if err := validateExistingBundleCopy(ctx, sourcePath, destinationPath, root); err != nil {
+		return err
+	}
+	owned = false
+	return nil
 }
 
 func validateExistingBundleCopy(ctx context.Context, sourcePath, destinationPath string, root *store.ContentKey) error {

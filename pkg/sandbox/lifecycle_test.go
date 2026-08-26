@@ -99,6 +99,44 @@ func TestValidateLocalMemoryRefsRejectsNonRegularFiles(t *testing.T) {
 	}
 }
 
+func TestCanonicalBundleSourceNormalizesLocatedAlias(t *testing.T) {
+	dir := t.TempDir()
+	key := strings.Repeat("b", 64)
+	bundleName := key + ".bundle"
+	bundlePath := filepath.Join(dir, bundleName)
+	if err := os.WriteFile(bundlePath, []byte("bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aliasPath := filepath.Join(dir, "lower.snapshot")
+	if err := os.Symlink(bundleName, aliasPath); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := manifest.ParseRef("file://lower.snapshot@manifest:" + key + "@location:A")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, real, err := canonicalBundleSource(aliasPath, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "file://" + bundleName + "@location:A"; got != want {
+		t.Fatalf("source = %q, want %q", got, want)
+	}
+	if real != bundlePath {
+		t.Fatalf("real path = %q, want %q", real, bundlePath)
+	}
+
+	noncanonicalPath := filepath.Join(dir, "regular.snapshot")
+	if err := os.WriteFile(noncanonicalPath, []byte("bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ref.Path = filepath.Base(noncanonicalPath)
+	if _, _, err := canonicalBundleSource(noncanonicalPath, ref); err == nil {
+		t.Fatal("noncanonical located Bundle source was accepted")
+	}
+}
+
 func TestValidateLocalMemoryRefsEnforcesCryptoPolicy(t *testing.T) {
 	out := t.TempDir()
 	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x51})

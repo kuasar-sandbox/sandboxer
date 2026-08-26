@@ -2049,6 +2049,10 @@ func canonicalBundleSource(path string, ref manifest.Ref) (string, string, error
 	if ref.Scheme != manifest.RefSchemeFile {
 		return "", "", fmt.Errorf("Bundle source must use file://")
 	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
 	realPath, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", "", err
@@ -2059,9 +2063,16 @@ func canonicalBundleSource(path string, ref manifest.Ref) (string, string, error
 	}
 	ref.DigestScheme = ""
 	ref.Digest = ""
-	if ref.Location == "" {
-		ref.Path = filepath.Base(realPath)
+	if ref.Location != "" {
+		locationDir, err := filepath.EvalSymlinks(filepath.Dir(path))
+		if err != nil {
+			return "", "", err
+		}
+		if filepath.Clean(locationDir) != filepath.Clean(filepath.Dir(realPath)) {
+			return "", "", fmt.Errorf("located Bundle alias target must remain in the same location directory")
+		}
 	}
+	ref.Path = filepath.Base(realPath)
 	raw := ref.String()
 	if _, err := manifestbundle.EncodeRefs([]string{raw}); err != nil {
 		return "", "", err
