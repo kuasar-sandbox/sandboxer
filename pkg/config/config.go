@@ -1159,19 +1159,9 @@ func (c *SandboxConfig) ValidateCold() error {
 		}
 	}
 
-	if c.Boot.Kernel == "" {
-		return errors.New("boot.kernel is required for cold start")
-	}
-	if err := requireFileAbs("boot.kernel", c.Boot.Kernel); err != nil {
+	if err := c.ValidateColdBootArtifacts(); err != nil {
 		return err
 	}
-	if c.Boot.Runtime == "" {
-		return errors.New("boot.runtime is required")
-	}
-	if err := requireRuntimeFileAbs("boot.runtime", c.Boot.Runtime); err != nil {
-		return err
-	}
-
 	if err := c.validateRoot(true); err != nil {
 		return err
 	}
@@ -1275,6 +1265,23 @@ func (c *SandboxConfig) ValidateCold() error {
 // bundle in hand). It is the strict-mode check for `sandbox-ctl config
 // --mode restore`: cold-only fields (kernel, launch, mounts, ...) are not
 // required here.
+// ValidateColdBootArtifacts validates the boot artifacts a cold boot needs:
+// boot.kernel (file:// or absolute path) and boot.runtime (file:// only).
+// Shared by cold-start Validate and disk-only snapshot restore, which boots
+// cold from host-provided artifacts the bundle does not carry.
+func (c *SandboxConfig) ValidateColdBootArtifacts() error {
+	if c.Boot.Kernel == "" {
+		return errors.New("boot.kernel is required for cold start")
+	}
+	if err := requireFileAbs("boot.kernel", c.Boot.Kernel); err != nil {
+		return err
+	}
+	if c.Boot.Runtime == "" {
+		return errors.New("boot.runtime is required")
+	}
+	return requireRuntimeFileAbs("boot.runtime", c.Boot.Runtime)
+}
+
 func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	if err := c.Restore.validate(); err != nil {
 		return err

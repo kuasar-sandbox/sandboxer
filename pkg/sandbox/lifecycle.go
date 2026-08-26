@@ -1342,7 +1342,8 @@ func handleSnapshotRequest(
 			return ctl.Response{}, fmt.Errorf("snapshot: memory merge base: %w", err)
 		}
 		mergeMemory = true
-	} else if mergeRef && prov.BundleSource != nil && prov.ParentSnapshotRef != "" {		memoryMergeBase, mergeMemory, err = bundleManifestMergeRef(context.Background(), prov.ParentSnapshotRef, opts)
+	} else if mergeRef && prov.BundleSource != nil && prov.ParentSnapshotRef != "" {
+		memoryMergeBase, mergeMemory, err = bundleManifestMergeRef(context.Background(), prov.ParentSnapshotRef, opts)
 		if err != nil {
 			return ctl.Response{}, fmt.Errorf("snapshot: Bundle memory merge base identity: %w", err)
 		}

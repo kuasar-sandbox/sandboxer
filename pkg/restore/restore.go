@@ -222,10 +222,13 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// A disk-only bundle carries no memory section: restoring it means a
 	// cold boot into the preserved filesystem state rather than a --restore
 	// of captured VMM/vCPU state. The host yaml therefore supplies the boot
-	// artifacts a cold start needs.
+	// artifacts a cold start needs — validated with the same rules as cold
+	// start so a malformed ref fails here instead of mid-boot.
 	diskOnly := parsedSnap.DiskOnly()
-	if diskOnly && (opts.HostCfg.Boot.Kernel == "" || opts.HostCfg.Boot.Runtime == "") {
-		return -1, errors.New("restore: disk-only snapshot requires boot.kernel and boot.runtime in the host sandbox.yaml (cold-boot restore)")
+	if diskOnly {
+		if err := opts.HostCfg.ValidateColdBootArtifacts(); err != nil {
+			return -1, fmt.Errorf("restore: disk-only snapshot: %w", err)
+		}
 	}
 	snapshotHasNetwork, err := snapshotConfigHasNetwork(entries["config.json"])
 	if err != nil {
@@ -423,7 +426,25 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	}
 	initialBudget := grantedInitial
 	if diskOnly {
-		logf("disk-only cold-boot admission granted initial Budget=%d", initialBudget)
+		// Mirror sandbox.Run's cold-start memory domain: the granted Budget or
+		// the settled policy may sit below Capacity, which requires an
+		// operable balloon device on both the CH command line and in the
+		// controller. Without this, Admit's reduced startup grant either gets
+		// rejected by NewMemoryController (no balloon) or boots a balloon the
+		// host cannot drive.
+		if err := resctl.ValidateBalloonSize(snapCap, resctl.TargetForBudget(snapCap, initialBudget)); err != nil {
+			return -1, fmt.Errorf("initial memory domain: %w", err)
+		}
+		if err := resctl.ValidateBalloonSize(snapCap, resctl.TargetForBudget(snapCap, settledHeadroom)); err != nil {
+			return -1, fmt.Errorf("settled memory domain: %w", err)
+		}
+		if settledHeadroom < snapCap || initialBudget < snapCap {
+			balloonCtl = resctl.NewBalloonController(chSock, snapCap, snapCfg.CHApiDeadline(), logf)
+			if err := balloonCtl.SeedColdTarget(resctl.TargetForBudget(snapCap, initialBudget)); err != nil {
+				return -1, fmt.Errorf("seed cold balloon target: %w", err)
+			}
+		}
+		logf("disk-only cold-boot admission granted initial Budget=%d (balloon=%t)", initialBudget, balloonCtl != nil)
 	} else {
 		logf("restore BudgetAtSnapshot reserved=%d (balloon target/current=%d/%d)",
 			budgetAtSnapshot, balTarget, balCurrent)

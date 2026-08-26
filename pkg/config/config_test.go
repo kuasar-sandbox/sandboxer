@@ -951,6 +951,37 @@ func TestValidateRestoreHostConfigRejectsRelativeCgroupPath(t *testing.T) {
 	}
 }
 
+func TestValidateColdBootArtifacts(t *testing.T) {
+	tests := []struct {
+		name    string
+		kernel  string
+		runtime string
+		wantErr string
+	}{
+		{name: "valid file refs", kernel: "file:///boot/vmlinux", runtime: "file:///opt/sandbox-runtime.bundle"},
+		{name: "empty kernel", kernel: "", runtime: "file:///opt/runtime", wantErr: "boot.kernel is required"},
+		{name: "manifest kernel rejected", kernel: "manifest://" + strings.Repeat("a", 64), runtime: "file:///opt/runtime", wantErr: "boot.kernel must be file://"},
+		{name: "relative kernel rejected", kernel: "file://boot/vmlinux", runtime: "file:///opt/runtime", wantErr: "absolute"},
+		{name: "empty runtime", kernel: "file:///boot/vmlinux", runtime: "", wantErr: "boot.runtime is required"},
+		{name: "manifest runtime rejected", kernel: "file:///boot/vmlinux", runtime: "manifest://" + strings.Repeat("b", 64), wantErr: "boot.runtime"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &SandboxConfig{Boot: BootConfig{Kernel: tc.kernel, Runtime: tc.runtime}}
+			err := cfg.ValidateColdBootArtifacts()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateColdBootArtifacts = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidateColdBootArtifacts = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateRestoreHostConfigMemoryPolicy(t *testing.T) {
 	tests := []struct {
 		name    string
