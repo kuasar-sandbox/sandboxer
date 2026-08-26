@@ -282,3 +282,47 @@ func TestBuildSnapshotCfg_DefaultLocalMergeDropsMemoryParent(t *testing.T) {
 		t.Fatalf("merged local memory must inherit lower chain:\n%s", s)
 	}
 }
+
+func TestBundleSnapshotCfgRewritesOnlyLogicalSnapshotLayers(t *testing.T) {
+	fileRefs := []string{
+		"file://memory.bundle@manifest:" + strings.Repeat("1", 64),
+		"file://root.bundle@manifest:" + strings.Repeat("2", 64),
+		"file://root-parent.bundle@manifest:" + strings.Repeat("3", 64),
+		"file://data.bundle@manifest:" + strings.Repeat("4", 64),
+		"file://data-parent.bundle@manifest:" + strings.Repeat("5", 64),
+	}
+	body := []byte("from_refs:\n  - " + fileRefs[0] + "\n" +
+		"boot:\n  runtime_ref: file://runtime.erofs@sha256:" + strings.Repeat("a", 64) + "\n" +
+		"  root:\n    base_ref: file://root.erofs@sha256:" + strings.Repeat("b", 64) + "\n" +
+		"    overlay:\n      base: " + fileRefs[1] + "\n      base_from_refs:\n        - " + fileRefs[2] + "\n" +
+		"  disks:\n    - base: " + fileRefs[3] + "\n      base_from_refs:\n        - " + fileRefs[4] + "\n")
+	replacements := make(map[string]string, len(fileRefs))
+	for index, raw := range fileRefs {
+		replacements[raw] = "manifest://" + strings.Repeat(string(rune('a'+index)), 64)
+	}
+	rewritten, err := rewriteSnapshotLayerRefs(body, func(raw string) (string, error) {
+		return replacements[raw], nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBundleSnapshotCfg(rewritten); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range fileRefs {
+		if strings.Contains(string(rewritten), raw) {
+			t.Fatalf("physical Bundle selector leaked into snapshot.cfg:\n%s", rewritten)
+		}
+	}
+	for _, platformRef := range []string{
+		"file://runtime.erofs@sha256:" + strings.Repeat("a", 64),
+		"file://root.erofs@sha256:" + strings.Repeat("b", 64),
+	} {
+		if !strings.Contains(string(rewritten), platformRef) {
+			t.Fatalf("platform artifact ref %q changed:\n%s", platformRef, rewritten)
+		}
+	}
+	if err := validateBundleSnapshotCfg(body); err == nil {
+		t.Fatal("Bundle snapshot.cfg accepted a file:// snapshot-layer ref")
+	}
+}

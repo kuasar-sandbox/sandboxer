@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# e2e_sandbox_bundle.sh — Issue #74 multi-Manifest Bundle lifecycle:
-#   cold root + data disk -> one Bundle -> local restore -> child Bundle with
-#   merge_ref=false -> delete parent -> local restore -> exact Store upload ->
-#   remote restore. It also checks the one-file ref-location publish path.
+# e2e_sandbox_bundle.sh — Issue #79 ordered Bundle refs lifecycle:
+#   A cold Bundle -> located A -> B -> located B -> C, with manifest-only
+#   snapshot.cfg, flat ordered refs, exact multi-source Store upload, and
+#   remote restore. Root/data-disk coverage remains part of every generation.
 
 set -euo pipefail
 shopt -s nullglob
@@ -131,25 +131,26 @@ ready() {
 }
 
 validate_bundle() {
-    local directory="$1" sid="$2" minimum_manifests="$3" info_json="$4"
+    local directory="$1" sid="$2" minimum_manifests="$3" expected_refs="$4" expected_files="$5" info_json="$6"
     local bundles=("$directory"/*.bundle)
-    [ "${#bundles[@]}" = 1 ] || { echo "FAIL: $directory has ${#bundles[@]} Bundle files"; ls -la "$directory"; exit 1; }
+    [ "${#bundles[@]}" = "$expected_files" ] || { echo "FAIL: $directory has ${#bundles[@]} Bundle files, want $expected_files"; ls -la "$directory"; exit 1; }
     [ -L "$directory/$sid.snapshot" ] || { echo "FAIL: missing $sid.snapshot symlink"; exit 1; }
-    [ "$(readlink -f "$directory/$sid.snapshot")" = "$(readlink -f "${bundles[0]}")" ] \
-        || { echo "FAIL: sid symlink does not select the Bundle"; exit 1; }
+    local root_bundle
+    root_bundle="$(readlink -f "$directory/$sid.snapshot")"
+    [ -f "$root_bundle" ] || { echo "FAIL: sid symlink does not select a Bundle"; exit 1; }
     if find "$directory" -maxdepth 1 -type f \( -name '*.overlay' -o -name '*.snapshot' -o -name '*.partial' \) | grep -q .; then
         echo "FAIL: Bundle mode emitted a tarstream/partial sibling"
         find "$directory" -maxdepth 1 -printf '%f\n'
         exit 1
     fi
     "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" "$directory/$sid.snapshot" >"$info_json"
-    python3 - "${bundles[0]}" "$minimum_manifests" <<'PY'
+    python3 - "$root_bundle" "$minimum_manifests" "$expected_refs" <<'PY'
 import os
 import re
 import sys
 import zipfile
 
-path, minimum_text = sys.argv[1:]
+path, minimum_text, expected_refs_text = sys.argv[1:]
 root = os.path.basename(path).removesuffix(".bundle")
 if not re.fullmatch(r"[0-9a-f]{64}", root):
     raise SystemExit(f"invalid root Bundle filename: {path}")
@@ -157,14 +158,26 @@ with zipfile.ZipFile(path) as archive:
     names = [item.filename for item in archive.infolist()]
     if len(names) != len(set(names)):
         raise SystemExit("duplicate ZIP entry")
-    if sum(name.startswith("admission/") for name in names) != 1:
+    refs = [name for name in names if name == "bundle/refs"]
+    admissions = [name for name in names if name.startswith("bundle/admission/")]
+    if len(admissions) != 1:
         raise SystemExit("Bundle does not contain exactly one admission")
+    expected_refs = int(expected_refs_text)
+    if len(refs) != (1 if expected_refs else 0):
+        raise SystemExit(f"bundle/refs presence mismatch: {refs!r}")
+    expected_prefix = ["bundle/refs", admissions[0]] if expected_refs else [admissions[0]]
+    if names[:len(expected_prefix)] != expected_prefix:
+        raise SystemExit(f"metadata order={names[:len(expected_prefix)]!r}, want {expected_prefix!r}")
+    if expected_refs:
+        lines = archive.read("bundle/refs").decode("utf-8").splitlines()
+        if len(lines) != expected_refs or not archive.read("bundle/refs").endswith(b"\n"):
+            raise SystemExit(f"bundle/refs={lines!r}, want {expected_refs} LF-terminated lines")
     manifests = [name for name in names if name.startswith("manifest/")]
     if len(manifests) < int(minimum_text):
         raise SystemExit(f"Manifest count {len(manifests)} < {minimum_text}")
     if f"manifest/{root}" not in names:
         raise SystemExit("filename-selected root Manifest is absent")
-    allowed = re.compile(r"(?:admission/[A-Za-z0-9][A-Za-z0-9._-]{0,127}|manifest|chunk)/[0-9a-f]{64}$")
+    allowed = re.compile(r"(?:bundle/admission/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9a-f]{64}|bundle/refs|(?:manifest|chunk)/[0-9a-f]{64})$")
     for item in archive.infolist():
         if item.compress_type != zipfile.ZIP_STORED:
             raise SystemExit(f"non-Store ZIP entry: {item.filename}")
@@ -172,7 +185,22 @@ with zipfile.ZipFile(path) as archive:
             raise SystemExit(f"non-ZIP64 entry version: {item.filename}={item.extract_version}")
         if not allowed.fullmatch(item.filename):
             raise SystemExit(f"unknown Bundle entry: {item.filename}")
-print(f"    Bundle root={root} manifests={len(manifests)} chunks={sum(n.startswith('chunk/') for n in names)}")
+print(f"    Bundle root={root} refs={expected_refs} manifests={len(manifests)} chunks={sum(n.startswith('chunk/') for n in names)}")
+PY
+}
+
+assert_bundle_refs() {
+    local bundle="$1"
+    shift
+    python3 - "$bundle" "$@" <<'PY'
+import sys
+import zipfile
+
+path, *expected = sys.argv[1:]
+with zipfile.ZipFile(path) as archive:
+    got = archive.read("bundle/refs").decode("utf-8").splitlines() if expected else []
+if got != expected:
+    raise SystemExit(f"bundle/refs={got!r}, want {expected!r}")
 PY
 }
 
@@ -191,7 +219,7 @@ if len(parents) != int(sys.argv[2]):
 refs = list(parents)
 boot = doc["Boot"]
 for node in [boot["Root"], *(boot.get("Disks") or [])]:
-    refs.extend([node.get("BaseRef", ""), node.get("Base", "")])
+    refs.append(node.get("Base", ""))
     refs.extend(node.get("BaseFromRefs") or [])
     overlay = node.get("Overlay")
     if overlay:
@@ -220,8 +248,16 @@ start_ns="$(date +%s%N)"
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID1" --output "$OUT1" --mode bundle --run-root "$RR" >"$WORK/snapshot1.out" 2>"$WORK/snapshot1.log"
 echo "    create_ms=$((($(date +%s%N)-start_ns)/1000000))"
 wait "$P1" 2>/dev/null || true
-validate_bundle "$OUT1" "$SID1" 4 "$WORK/info1.json"
+validate_bundle "$OUT1" "$SID1" 3 0 1 "$WORK/info1.json"
 assert_manifest_snapshot_refs "$WORK/info1.json" 0
+
+ROOT1_PATH="$(readlink -f "$OUT1/$SID1.snapshot")"
+ROOT1="$(basename "$ROOT1_PATH" .bundle)"
+LOCATION_A="$WORK/location-a"
+LOCATED_A="$("$BIN/sandbox-ctl" upload-snapshot --to-ref-location A=file://$LOCATION_A --quiet "$OUT1/$SID1.snapshot")"
+[ "$LOCATED_A" = "file://$ROOT1.bundle@manifest:$ROOT1@location:A" ] || { echo "FAIL: located A ref=$LOCATED_A"; exit 1; }
+[ "$(find "$LOCATION_A" -maxdepth 1 -type f | wc -l)" = 1 ] || { echo "FAIL: location A file count"; exit 1; }
+cmp "$ROOT1_PATH" "$LOCATION_A/$ROOT1.bundle"
 
 write_restore_yaml() {
     local output="$1" hostname="$2" root_diff="$3"
@@ -239,13 +275,14 @@ boot:
 EOF
 }
 
-echo "==> phase 2: local Bundle restore -> self-contained child Bundle"
+echo "==> phase 2: located A restore -> B with manifest-only graph and refs=[A]"
 write_restore_yaml "$WORK/restore2.yaml" bundle-child "$WORK/root-r2.ext4"
 SID2="bundle-2-$$"
 OUT2="$WORK/out2"
 mkdir -p "$OUT2"
 start_ns="$(date +%s%N)"
-timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "$OUT1/$SID1.snapshot" --config "$WORK/restore2.yaml" \
+timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "$LOCATED_A" --ref-location A=file://$LOCATION_A \
+    --config "$WORK/restore2.yaml" \
     --manifest-config "$WORK/manifest.yaml" --sandbox-id "$SID2" --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$RR" >"$WORK/run2.log" 2>&1 &
 P2=$!
@@ -257,61 +294,87 @@ echo "    local_restore_ready_ms=$((($(date +%s%N)-start_ns)/1000000))"
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID2" --output "$OUT2" --mode bundle --merge-ref=false \
     --drop-caches=false --run-root "$RR" >"$WORK/snapshot2.out" 2>"$WORK/snapshot2.log"
 wait "$P2" 2>/dev/null || true
-validate_bundle "$OUT2" "$SID2" 5 "$WORK/info2.json"
+validate_bundle "$OUT2" "$SID2" 3 1 1 "$WORK/info2.json"
 assert_manifest_snapshot_refs "$WORK/info2.json" 1
 
-rm -rf "$OUT1"
-echo "==> phase 3: child restores after its parent Bundle is removed"
-write_restore_yaml "$WORK/restore3.yaml" bundle-self-contained "$WORK/root-r3.ext4"
+ROOT2_PATH="$(readlink -f "$OUT2/$SID2.snapshot")"
+ROOT2="$(basename "$ROOT2_PATH" .bundle)"
+assert_bundle_refs "$ROOT2_PATH" "file://$ROOT1.bundle@location:A"
+LOCATION_B="$WORK/location-b"
+LOCATED_B="$("$BIN/sandbox-ctl" upload-snapshot --to-ref-location B=file://$LOCATION_B --quiet "$OUT2/$SID2.snapshot")"
+[ "$LOCATED_B" = "file://$ROOT2.bundle@manifest:$ROOT2@location:B" ] || { echo "FAIL: located B ref=$LOCATED_B"; exit 1; }
+[ "$(find "$LOCATION_B" -maxdepth 1 -type f | wc -l)" = 1 ] || { echo "FAIL: located A was copied into B"; exit 1; }
+cmp "$ROOT2_PATH" "$LOCATION_B/$ROOT2.bundle"
+
+rm -rf "$OUT1" "$OUT2"
+echo "==> phase 3: located B restore -> C with flat refs=[B,A]"
+write_restore_yaml "$WORK/restore3.yaml" bundle-grandchild "$WORK/root-r3.ext4"
 SID3="bundle-3-$$"
-timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "$OUT2/$SID2.snapshot" --config "$WORK/restore3.yaml" \
+OUT3="$WORK/out3"
+mkdir -p "$OUT3"
+timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "$LOCATED_B" \
+    --ref-location A=file://$LOCATION_A --ref-location B=file://$LOCATION_B --config "$WORK/restore3.yaml" \
     --manifest-config "$WORK/manifest.yaml" --sandbox-id "$SID3" --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$RR" >"$WORK/run3.log" 2>&1 &
 P3=$!
 PIDS+=("$P3")
 ready "$SID3" "$P3" "$WORK/ready3" || { tail -80 "$WORK/run3.log"; exit 1; }
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID3" --run-root "$RR" -- /bin/sh -c \
-    'cat /bundle-root /bundle-root-child /scratch/bundle-data /scratch/bundle-data-child' >"$WORK/local-child-data"
-for marker in ROOT-BASE ROOT-CHILD DATA-BASE DATA-CHILD; do
-    grep -qx "$marker" "$WORK/local-child-data" || { cat "$WORK/local-child-data"; exit 1; }
-done
-kill "$P3" 2>/dev/null || true
+    'grep -qx ROOT-BASE /bundle-root; grep -qx ROOT-CHILD /bundle-root-child; grep -qx DATA-BASE /scratch/bundle-data; grep -qx DATA-CHILD /scratch/bundle-data-child; echo ROOT-C > /bundle-root-c; echo DATA-C > /scratch/bundle-data-c; sync'
+"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID3" --output "$OUT3" --mode bundle --merge-ref=false \
+    --drop-caches=false --run-root "$RR" >"$WORK/snapshot3.out" 2>"$WORK/snapshot3.log"
 wait "$P3" 2>/dev/null || true
+validate_bundle "$OUT3" "$SID3" 3 2 1 "$WORK/info3.json"
+assert_manifest_snapshot_refs "$WORK/info3.json" 2
+ROOT3_PATH="$(readlink -f "$OUT3/$SID3.snapshot")"
+ROOT3="$(basename "$ROOT3_PATH" .bundle)"
+assert_bundle_refs "$ROOT3_PATH" "file://$ROOT2.bundle@location:B" "file://$ROOT1.bundle@location:A"
 
-echo "==> phase 4: one-file ref-location copy + exact Store upload"
-ROOT2_PATH="$(readlink -f "$OUT2/$SID2.snapshot")"
-ROOT2="$(basename "$ROOT2_PATH" .bundle)"
-LOCATION="$WORK/location"
-LOCATED_REF="$("$BIN/sandbox-ctl" upload-snapshot --to-ref-location snapshots=file://$LOCATION --quiet "$OUT2/$SID2.snapshot")"
-[ "$LOCATED_REF" = "file://$ROOT2.bundle@location:snapshots" ] || { echo "FAIL: located ref=$LOCATED_REF"; exit 1; }
-[ "$(find "$LOCATION" -maxdepth 1 -type f | wc -l)" = 1 ] || { echo "FAIL: ref-location did not receive exactly one file"; exit 1; }
-cmp "$ROOT2_PATH" "$LOCATION/$ROOT2.bundle"
-
-start_ns="$(date +%s%N)"
-UPLOADED="$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/manifest.yaml" --quiet "$OUT2/$SID2.snapshot")"
-echo "    exact_upload_ms=$((($(date +%s%N)-start_ns)/1000000))"
-[ "$UPLOADED" = "manifest://$ROOT2" ] || { echo "FAIL: exact upload changed root: $UPLOADED"; exit 1; }
-"$BIN/manifest-ctl" verify --manifest-config "$WORK/manifest.yaml" "$ROOT2" >/dev/null
-
-rm -rf "$OUT2"
-echo "==> phase 5: remote restore of the exact same root Manifest"
-write_restore_yaml "$WORK/restore4.yaml" bundle-remote "$WORK/root-r4.ext4"
+echo "==> phase 4: local C restore lazily resolves located B and A"
+write_restore_yaml "$WORK/restore4.yaml" bundle-flat-refs "$WORK/root-r4.ext4"
 SID4="bundle-4-$$"
-start_ns="$(date +%s%N)"
-timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "manifest://$ROOT2" --config "$WORK/restore4.yaml" \
+timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "$OUT3/$SID3.snapshot" \
+    --ref-location A=file://$LOCATION_A --ref-location B=file://$LOCATION_B --config "$WORK/restore4.yaml" \
     --manifest-config "$WORK/manifest.yaml" --sandbox-id "$SID4" --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$RR" >"$WORK/run4.log" 2>&1 &
 P4=$!
 PIDS+=("$P4")
 ready "$SID4" "$P4" "$WORK/ready4" || { tail -80 "$WORK/run4.log"; exit 1; }
-echo "    remote_restore_ready_ms=$((($(date +%s%N)-start_ns)/1000000))"
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID4" --run-root "$RR" -- /bin/sh -c \
-    'cat /bundle-root /bundle-root-child /scratch/bundle-data /scratch/bundle-data-child' >"$WORK/remote-data"
-for marker in ROOT-BASE ROOT-CHILD DATA-BASE DATA-CHILD; do
-    grep -qx "$marker" "$WORK/remote-data" || { cat "$WORK/remote-data"; exit 1; }
+    'cat /bundle-root /bundle-root-child /bundle-root-c /scratch/bundle-data /scratch/bundle-data-child /scratch/bundle-data-c' >"$WORK/local-child-data"
+for marker in ROOT-BASE ROOT-CHILD ROOT-C DATA-BASE DATA-CHILD DATA-C; do
+    grep -qx "$marker" "$WORK/local-child-data" || { cat "$WORK/local-child-data"; exit 1; }
 done
 kill "$P4" 2>/dev/null || true
 wait "$P4" 2>/dev/null || true
 
+echo "==> phase 5: exact multi-source upload through current C -> B -> A"
+start_ns="$(date +%s%N)"
+UPLOADED="$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/manifest.yaml" \
+    --ref-location A=file://$LOCATION_A --ref-location B=file://$LOCATION_B --quiet "$OUT3/$SID3.snapshot")"
+echo "    exact_upload_ms=$((($(date +%s%N)-start_ns)/1000000))"
+[ "$UPLOADED" = "manifest://$ROOT3" ] || { echo "FAIL: exact upload changed root: $UPLOADED"; exit 1; }
+"$BIN/manifest-ctl" verify --manifest-config "$WORK/manifest.yaml" "$ROOT3" >/dev/null
+
+rm -rf "$OUT3" "$LOCATION_A" "$LOCATION_B"
+echo "==> phase 6: Store-only restore of the byte-identical C root"
+write_restore_yaml "$WORK/restore5.yaml" bundle-remote "$WORK/root-r5.ext4"
+SID5="bundle-5-$$"
+start_ns="$(date +%s%N)"
+timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "manifest://$ROOT3" --config "$WORK/restore5.yaml" \
+    --manifest-config "$WORK/manifest.yaml" --sandbox-id "$SID5" --ch-binary "$BIN/cloud-hypervisor" \
+    --run-root "$RR" >"$WORK/run5.log" 2>&1 &
+P5=$!
+PIDS+=("$P5")
+ready "$SID5" "$P5" "$WORK/ready5" || { tail -80 "$WORK/run5.log"; exit 1; }
+echo "    remote_restore_ready_ms=$((($(date +%s%N)-start_ns)/1000000))"
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID5" --run-root "$RR" -- /bin/sh -c \
+    'cat /bundle-root /bundle-root-child /bundle-root-c /scratch/bundle-data /scratch/bundle-data-child /scratch/bundle-data-c' >"$WORK/remote-data"
+for marker in ROOT-BASE ROOT-CHILD ROOT-C DATA-BASE DATA-CHILD DATA-C; do
+    grep -qx "$marker" "$WORK/remote-data" || { cat "$WORK/remote-data"; exit 1; }
+done
+kill "$P5" 2>/dev/null || true
+wait "$P5" 2>/dev/null || true
+
 echo
-echo "==> e2e_sandbox_bundle: OK (multi-disk, merge=false collection, parent deletion, exact upload, local/remote restore)"
+echo "==> e2e_sandbox_bundle: OK (A->B->C, manifest-only cfg, flat refs, located restore, exact Store upload, multi-disk)"

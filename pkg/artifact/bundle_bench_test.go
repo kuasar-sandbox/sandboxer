@@ -3,6 +3,8 @@ package artifact_test
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"path/filepath"
 	"sort"
 	"testing"
 	"time"
@@ -10,7 +12,10 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 )
 
@@ -189,6 +194,79 @@ func BenchmarkSnapshotArtifactReadLatencyQuantiles(b *testing.B) {
 			})
 		}
 	}
+}
+
+// BenchmarkBundleResolverTailFallback measures the sandboxer path resolver,
+// lazy Reader opens, ordered clean misses, and the final remote selection. The
+// cold cases include root open/close; warm cases reuse the per-root Reader
+// cache and perform no repeated file opens.
+func BenchmarkBundleResolverTailFallback(b *testing.B) {
+	b.StopTimer()
+	customerKey := [32]byte{0xd1, 0xd2, 0xd3}
+	keyFn := func() ([32]byte, error) { return customerKey, nil }
+	cfg := &manifest.Config{
+		Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:  manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+	sourceDir := b.TempDir()
+	_, sourcePath, _ := writeResolverBundle(b, sourceDir, "resolver-bench-source", cfg, keyFn, nil, false, 0x31)
+	target := store.ContentKey{0xff, 0xee, 0xdd}
+	remote := benchmarkTailRemote{}
+	for _, count := range []int{0, 1, 8, 32} {
+		refs := make([]string, count)
+		locations := make(config.RefLocations, count)
+		for index := range refs {
+			name := fmt.Sprintf("source-%02d", index)
+			refs[index] = "file://" + filepath.Base(sourcePath) + "@location:" + name
+			locations[name] = sourceDir
+		}
+		_, currentPath, _ := writeResolverBundle(b, b.TempDir(), fmt.Sprintf("resolver-current-%d", count), cfg, keyFn, refs, false, byte(0x51+count))
+
+		b.Run(fmt.Sprintf("Cold/%dRefs", count), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				opened, err := artifact.OpenFileWithLocations(context.Background(), currentPath,
+					manifest.Ref{Scheme: manifest.RefSchemeFile, Path: currentPath}, cfg, keyFn, remote, locations, nil, false)
+				if err != nil {
+					b.Fatal(err)
+				}
+				source, err := opened.ManifestFetcher().SelectManifest(context.Background(), target)
+				if err != nil || source.Reader != nil {
+					_ = opened.Close()
+					b.Fatalf("tail selection = %#v, %v", source, err)
+				}
+				if err := opened.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("Warm/%dRefs", count), func(b *testing.B) {
+			opened, err := artifact.OpenFileWithLocations(context.Background(), currentPath,
+				manifest.Ref{Scheme: manifest.RefSchemeFile, Path: currentPath}, cfg, keyFn, remote, locations, nil, false)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer opened.Close()
+			if _, err := opened.ManifestFetcher().SelectManifest(context.Background(), target); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if _, err := opened.ManifestFetcher().SelectManifest(context.Background(), target); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+type benchmarkTailRemote struct{}
+
+func (benchmarkTailRemote) OpenManifest(context.Context, store.ContentKey) (fetch.Stream, error) {
+	return nil, fmt.Errorf("benchmark remote should only be selected")
 }
 
 func bundleBenchmarkPercentile(sorted []int64, percentile float64) int64 {

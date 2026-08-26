@@ -113,6 +113,35 @@ func BenchmarkManifestBundleUpload(b *testing.B) {
 			}
 		})
 	}
+
+	b.StopTimer()
+	multi := writeMultiSourceUploadFixture(b)
+	multiSocket, _ := startBundleUploadStore(b, []store.Generation{"G1", "G2", "G3"})
+	multiCfg := *multi.currentCfg
+	multiCfg.Store = manifest.StoreConfig{Endpoint: multiSocket, Pool: 4, Timeout: "30s"}
+	var multiBytes int64
+	for _, path := range []string{multi.sourceAPath, multi.sourceBPath, multi.currentPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		multiBytes += info.Size()
+	}
+	b.Run("ThreeBundleSources", func(b *testing.B) {
+		b.SetBytes(multiBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			got, err := UploadLocalWithLocations(context.Background(), multi.currentPath, &multiCfg,
+				func() ([32]byte, error) { return multi.customerKey, nil }, nil, multi.locations, nil, false, nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if want := "manifest://" + manifest.HexKey(multi.currentRoot); got != want {
+				b.Fatalf("root = %q, want %q", got, want)
+			}
+		}
+	})
 }
 
 func bundleUploadBenchmarkBytes(size int, seed uint64) []byte {

@@ -17,6 +17,7 @@ import (
 	storefs "github.com/kuasar-sandbox/accelerator/pkg/store/fs"
 	"github.com/kuasar-sandbox/accelerator/pkg/store/pb"
 	storeserver "github.com/kuasar-sandbox/accelerator/pkg/store/server"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"google.golang.org/grpc"
 )
@@ -57,7 +58,7 @@ func TestPublishManifestBundleToLocationCopiesExactlyOneFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := manifest.HexKey(root) + ".bundle"
-	want := "file://" + base + "@location:snapshots"
+	want := "file://" + base + "@manifest:" + manifest.HexKey(root) + "@location:snapshots"
 	if got != want {
 		t.Fatalf("published ref = %q, want %q", got, want)
 	}
@@ -87,6 +88,123 @@ func TestPublishManifestBundleToLocationCopiesExactlyOneFile(t *testing.T) {
 	defer reader.Close()
 	if !reader.HasManifest(root) {
 		t.Fatal("published Bundle omitted root Manifest")
+	}
+}
+
+func TestPublishManifestBundleToLocationCopiesOnlySameDirectoryRefs(t *testing.T) {
+	sourceDir := t.TempDir()
+	destinationDir := t.TempDir()
+	key := [32]byte{0x81, 0x91, 0xa1}
+	cfg := &manifest.Config{
+		Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:  manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+	parentRef, parentPath, _ := writeUploadBundleFixture(t, sourceDir, "publish-parent", cfg, key)
+	parentRoot, err := manifest.ParseKeyRef(parentRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, err := cfg.WriteAdmission(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	localRef := "file://" + filepath.Base(parentPath)
+	locatedRef := "file://external.bundle@location:external"
+	child, err := snapshot.NewPlannedBundleSink(sourceDir, "publish-child", cfg,
+		func() ([32]byte, error) { return key, nil }, admission, []string{localRef, locatedRef}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := snapshot.BuildZIP(map[string][]byte{
+		"config.json": {}, "state.json": {},
+		"snapshot.cfg": []byte("from_refs:\n  - manifest://" + manifest.HexKey(parentRoot) + "\nboot: {}\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childRef, childPath, err := child.AbsorbBundle(context.Background(),
+		bytes.NewReader(bytes.Repeat([]byte{0x72}, 8192)), nil, bytes.NewReader(inner))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Close(); err != nil {
+		t.Fatal(err)
+	}
+	childRoot, err := manifest.ParseKeyRef(childRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := PublishLocalToLocation(context.Background(), childPath, "published", destinationDir, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "file://" + filepath.Base(childPath) + "@manifest:" + manifest.HexKey(childRoot) + "@location:published"
+	if got != want {
+		t.Fatalf("published ref = %q, want %q", got, want)
+	}
+	for _, path := range []string{parentPath, childPath} {
+		sourceBytes, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		destinationBytes, err := os.ReadFile(filepath.Join(destinationDir, filepath.Base(path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(sourceBytes, destinationBytes) {
+			t.Fatalf("published %s bytes changed", filepath.Base(path))
+		}
+	}
+	if _, err := os.Stat(filepath.Join(destinationDir, "external.bundle")); !os.IsNotExist(err) {
+		t.Fatalf("located external Bundle was copied: %v", err)
+	}
+	if reused, err := PublishLocalToLocation(context.Background(), childPath, "published", destinationDir, nil, false, nil); err != nil || reused != want {
+		t.Fatalf("byte-identical Bundle reuse = %q, %v", reused, err)
+	}
+}
+
+func TestPublishManifestBundleToLocationPreflightsSiblingCollision(t *testing.T) {
+	sourceDir := t.TempDir()
+	destinationDir := t.TempDir()
+	key := [32]byte{0x82, 0x92, 0xa2}
+	cfg := &manifest.Config{
+		Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:  manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+	_, parentPath, _ := writeUploadBundleFixture(t, sourceDir, "collision-parent", cfg, key)
+	admission, err := cfg.WriteAdmission(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := snapshot.NewPlannedBundleSink(sourceDir, "collision-child", cfg,
+		func() ([32]byte, error) { return key, nil }, admission,
+		[]string{"file://" + filepath.Base(parentPath)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := snapshot.BuildZIP(map[string][]byte{
+		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, childPath, err := child.AbsorbBundle(context.Background(),
+		bytes.NewReader(bytes.Repeat([]byte{0x73}, 8192)), nil, bytes.NewReader(inner))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destinationDir, filepath.Base(parentPath)), []byte("different"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishLocalToLocation(context.Background(), childPath, "published", destinationDir, nil, false, nil); err == nil {
+		t.Fatal("different sibling collision was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(destinationDir, filepath.Base(childPath))); !os.IsNotExist(err) {
+		t.Fatalf("root was published after sibling preflight failed: %v", err)
 	}
 }
 
@@ -293,6 +411,189 @@ func TestUploadManifestBundleRejectsObjectsOutsideRecordedSaltDomain(t *testing.
 	}
 	if found {
 		t.Fatal("root Manifest was published from a Bundle with forged admission provenance")
+	}
+}
+
+func TestUploadManifestBundleUsesOrderedSourcesAndEachAdmission(t *testing.T) {
+	fixture := writeMultiSourceUploadFixture(t)
+	socket, backend := startBundleUploadStore(t, []store.Generation{"G1", "G2", "G3"})
+	uploadCfg := *fixture.currentCfg
+	uploadCfg.Store = manifest.StoreConfig{Endpoint: socket, Pool: 3}
+
+	got, err := UploadLocalWithLocations(context.Background(), fixture.currentPath, &uploadCfg,
+		func() ([32]byte, error) { return fixture.customerKey, nil }, nil, fixture.locations, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "manifest://" + manifest.HexKey(fixture.currentRoot); got != want {
+		t.Fatalf("uploaded root = %q, want %q", got, want)
+	}
+	for _, source := range []struct {
+		path       string
+		generation store.Generation
+	}{
+		{fixture.sourceAPath, "G1"},
+		{fixture.sourceBPath, "G2"},
+		{fixture.currentPath, "G3"},
+	} {
+		reader, err := manifestbundle.Open(source.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range []struct {
+			partition store.Partition
+			keys      []store.ContentKey
+		}{
+			{store.PartitionChunk, reader.ChunkKeys()},
+			{store.PartitionManifest, reader.ManifestKeys()},
+		} {
+			for _, key := range item.keys {
+				result, blob, err := reader.Getter().Get(context.Background(), item.partition, key)
+				if err != nil || blob == nil {
+					_ = reader.Close()
+					t.Fatalf("read source %s %s: result=%v err=%v", item.partition, manifest.HexKey(key), result, err)
+				}
+				found, stored, err := backend.Get(context.Background(), source.generation, item.partition, key)
+				if err != nil || !found {
+					blob.Release()
+					_ = reader.Close()
+					t.Fatalf("target %s/%s %s: found=%v err=%v", source.generation, item.partition, manifest.HexKey(key), found, err)
+				}
+				if !bytes.Equal(stored, blob.Bytes()) {
+					blob.Release()
+					_ = reader.Close()
+					t.Fatalf("target rewrote %s/%s %s", source.generation, item.partition, manifest.HexKey(key))
+				}
+				blob.Release()
+			}
+		}
+		if err := reader.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUploadManifestBundlePreflightsAllSourceAdmissionsBeforePut(t *testing.T) {
+	fixture := writeMultiSourceUploadFixture(t)
+	socket, backend := startBundleUploadStore(t, []store.Generation{"G1", "G3"})
+	uploadCfg := *fixture.currentCfg
+	uploadCfg.Store = manifest.StoreConfig{Endpoint: socket}
+
+	_, err := UploadLocalWithLocations(context.Background(), fixture.currentPath, &uploadCfg,
+		func() ([32]byte, error) { return fixture.customerKey, nil }, nil, fixture.locations, nil, false, nil)
+	if err == nil || !strings.Contains(err.Error(), "G2") {
+		t.Fatalf("removed dependency generation error = %v", err)
+	}
+	for _, item := range []struct {
+		generation store.Generation
+		key        store.ContentKey
+	}{
+		{"G1", fixture.sourceARoot},
+		{"G3", fixture.currentRoot},
+	} {
+		found, _, getErr := backend.Get(context.Background(), item.generation, store.PartitionManifest, item.key)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if found {
+			t.Fatalf("Manifest %s was published before all admissions passed", manifest.HexKey(item.key))
+		}
+	}
+}
+
+func TestUploadManifestBundleReusesStrictStoreDependencyAfterBundleMiss(t *testing.T) {
+	fixture := writeMultiSourceUploadFixture(t)
+	socket, backend := startBundleUploadStore(t, []store.Generation{"G1", "G2", "G3"})
+	uploadCfg := *fixture.currentCfg
+	uploadCfg.Store = manifest.StoreConfig{Endpoint: socket, Pool: 2}
+
+	// Seed B through its own exact path, then make the listed Bundle unavailable.
+	if _, err := UploadLocal(context.Background(), fixture.sourceBPath, &uploadCfg,
+		func() ([32]byte, error) { return fixture.customerKey, nil }, nil, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(fixture.sourceBPath); err != nil {
+		t.Fatal(err)
+	}
+	got, err := UploadLocalWithLocations(context.Background(), fixture.currentPath, &uploadCfg,
+		func() ([32]byte, error) { return fixture.customerKey, nil }, nil, fixture.locations, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "manifest://" + manifest.HexKey(fixture.currentRoot); got != want {
+		t.Fatalf("uploaded root = %q, want %q", got, want)
+	}
+	found, _, err := backend.Get(context.Background(), "G3", store.PartitionManifest, fixture.currentRoot)
+	if err != nil || !found {
+		t.Fatalf("root after Store dependency reuse: found=%v err=%v", found, err)
+	}
+}
+
+type multiSourceUploadFixture struct {
+	customerKey                           [32]byte
+	currentCfg                            *manifest.Config
+	sourceAPath, sourceBPath, currentPath string
+	sourceARoot, sourceBRoot, currentRoot store.ContentKey
+	locations                             config.RefLocations
+}
+
+func writeMultiSourceUploadFixture(t testing.TB) multiSourceUploadFixture {
+	t.Helper()
+	customerKey := [32]byte{0xc1, 0xc2, 0xc3}
+	configFor := func(generation string) *manifest.Config {
+		return &manifest.Config{
+			Manifest: manifest.ManifestSubConfig{WriteGeneration: generation},
+			Chunker:  chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+			Crypto:   manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+		}
+	}
+	dirA, dirB := t.TempDir(), t.TempDir()
+	cfgA, cfgB, cfgC := configFor("G1"), configFor("G2"), configFor("G3")
+	refA, pathA, rootA := writeUploadBundleFixture(t, dirA, "source-a", cfgA, customerKey)
+	refB, pathB, rootB := writeUploadBundleFixture(t, dirB, "source-b", cfgB, customerKey)
+	if refA != "manifest://"+manifest.HexKey(rootA) || refB != "manifest://"+manifest.HexKey(rootB) {
+		t.Fatal("source fixture returned inconsistent root ref")
+	}
+	refs := []string{
+		"file://" + filepath.Base(pathA) + "@location:A",
+		"file://" + filepath.Base(pathB) + "@location:B",
+	}
+	admission, err := cfgC.WriteAdmission(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentDir := t.TempDir()
+	sink, err := snapshot.NewPlannedBundleSink(currentDir, "source-current", cfgC,
+		func() ([32]byte, error) { return customerKey, nil }, admission, refs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := snapshot.BuildZIP(map[string][]byte{
+		"config.json": {}, "state.json": {},
+		"snapshot.cfg": []byte("from_refs:\n  - manifest://" + manifest.HexKey(rootA) +
+			"\n  - manifest://" + manifest.HexKey(rootB) +
+			"\nboot:\n  root:\n    base: manifest://" + manifest.HexKey(rootB) + "\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentRef, currentPath, err := sink.AbsorbBundle(context.Background(),
+		bytes.NewReader(bytes.Repeat([]byte{0x7c}, 8192)), nil, bytes.NewReader(inner))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	currentRoot, err := manifest.ParseKeyRef(currentRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return multiSourceUploadFixture{
+		customerKey: customerKey, currentCfg: cfgC,
+		sourceAPath: pathA, sourceBPath: pathB, currentPath: currentPath,
+		sourceARoot: rootA, sourceBRoot: rootB, currentRoot: currentRoot,
+		locations: config.RefLocations{"A": dirA, "B": dirB},
 	}
 }
 

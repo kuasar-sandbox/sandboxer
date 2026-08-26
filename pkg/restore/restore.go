@@ -213,39 +213,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		parentDiskBase = parsedSnap.Boot.Root.Overlay.Base
 		parentDiskChain = append([]string(nil), parsedSnap.Boot.Root.Overlay.BaseFromRefs...)
 	}
-	if root.bundleReader != nil {
-		provenanceFromRefs, err = localizeBundleManifestRefs(provenanceFromRefs, selfRef, root.bundleReader)
-		if err != nil {
-			return -1, err
-		}
-		parentDiskBase, err = localizeBundleManifestRef(parentDiskBase, selfRef, root.bundleReader)
-		if err != nil {
-			return -1, err
-		}
-		parentDiskChain, err = localizeBundleManifestRefs(parentDiskChain, selfRef, root.bundleReader)
-		if err != nil {
-			return -1, err
-		}
-	}
 	merged, err := ApplyRules(opts.HostCfg, parsedSnap, opts.localSnapshotPath(), opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
 	if err != nil {
 		return -1, err
 	}
 	snapCfg := *merged
-	if root.bundleReader != nil {
-		snapCfg.SnapshotRefs.BaseRef, err = localizeBundleManifestRef(
-			snapCfg.SnapshotRefs.BaseRef, selfRef, root.bundleReader)
-		if err != nil {
-			return -1, err
-		}
-		for i := range snapCfg.SnapshotRefs.DiskBaseRefs {
-			snapCfg.SnapshotRefs.DiskBaseRefs[i], err = localizeBundleManifestRef(
-				snapCfg.SnapshotRefs.DiskBaseRefs[i], selfRef, root.bundleReader)
-			if err != nil {
-				return -1, err
-			}
-		}
-	}
 	snapshotHasNetwork, err := snapshotConfigHasNetwork(entries["config.json"])
 	if err != nil {
 		return -1, err
@@ -261,35 +233,44 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		snapCfg.Metadata = parsedSnap.Metadata
 	}
 
-	// Record provenance so a snapshot taken by this restored run prepends this
-	// bundle and extends the chain (§3.5): child.from_refs = [selfRef] ++
+	// Record logical provenance so a snapshot taken by this restored run
+	// prepends this Manifest and extends the chain (§3.5): child.from_refs = [self] ++
 	// this.from_refs; child.base_from_refs = [this.overlay.base] ++ this.base_from_refs.
 	// The parent's "top disk layer" + chain below it: overlay.base/overlay
 	// .base_from_refs in overlay mode, root.base/root.base_from_refs in
 	// single-disk mode (the captured diff is recorded at root level there).
+	parentSelfRef := selfRef
+	var bundleSource *config.BundleSourceProvenance
+	if root.bundleReader != nil {
+		parentSelfRef = "manifest://" + root.bundleRoot
+		physicalRef, physicalPath, sourceErr := fileBundleSource(opts.SnapshotPath, opts.SnapshotRef)
+		if sourceErr != nil {
+			return -1, fmt.Errorf("Bundle source provenance: %w", sourceErr)
+		}
+		bundleSource = &config.BundleSourceProvenance{
+			RootRef: physicalRef, RootPath: physicalPath, Refs: root.bundleReader.Refs(),
+		}
+	}
 	snapCfg.SnapshotProvenance = config.SnapshotProvenance{
-		ParentSnapshotRef:  selfRef,
+		ParentSnapshotRef:  parentSelfRef,
 		ParentFromRefs:     provenanceFromRefs,
 		ParentOverlayBase:  parentDiskBase,
 		ParentBaseFromRefs: parentDiskChain,
+		BundleSource:       bundleSource,
 	}
 	// Local restore: record the parent's on-disk bundle + top-disk-layer paths
 	// so a re-export merges this run's resident delta onto them (replace the
 	// next-newest local layer, not stack a second one) — docs §3.5. Paths
 	// resolve like openRefStream: the disk layer is a basename in the bundle dir.
-	if localSnapshotPath := opts.localSnapshotPath(); localSnapshotPath != "" {
+	if localSnapshotPath := opts.localSnapshotPath(); localSnapshotPath != "" && root.bundleReader == nil {
 		if abs, err := filepath.Abs(localSnapshotPath); err == nil {
 			snapCfg.SnapshotProvenance.ParentSnapshotPath = abs
 		}
-		if root.bundleReader != nil {
-			snapCfg.SnapshotProvenance.ParentOverlayPath = localSnapshotPath
-		} else {
-			path, err := resolveLocalMergePath(parentDiskBase, localSnapshotPath, opts.RefLocations)
-			if err != nil {
-				return -1, fmt.Errorf("resolve parent root layer: %w", err)
-			}
-			snapCfg.SnapshotProvenance.ParentOverlayPath = path
+		path, err := resolveLocalMergePath(parentDiskBase, localSnapshotPath, opts.RefLocations)
+		if err != nil {
+			return -1, fmt.Errorf("resolve parent root layer: %w", err)
 		}
+		snapCfg.SnapshotProvenance.ParentOverlayPath = path
 	}
 	// Per-data-disk provenance (boot.disks[] order): the data-disk analogue of
 	// the root fields above, so a snapshot by this restored run extends each
@@ -302,27 +283,13 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			if !n.single() {
 				top, chain = n.Overlay.Base, n.Overlay.BaseFromRefs
 			}
-			if root.bundleReader != nil {
-				top, err = localizeBundleManifestRef(top, selfRef, root.bundleReader)
-				if err != nil {
-					return -1, err
-				}
-				chain, err = localizeBundleManifestRefs(chain, selfRef, root.bundleReader)
-				if err != nil {
-					return -1, err
-				}
-			}
 			pd[i] = config.DiskProvenance{OverlayBase: top, BaseFromRefs: chain}
-			if localSnapshotPath := opts.localSnapshotPath(); localSnapshotPath != "" {
-				if root.bundleReader != nil {
-					pd[i].OverlayPath = localSnapshotPath
-				} else {
-					path, err := resolveLocalMergePath(top, localSnapshotPath, opts.RefLocations)
-					if err != nil {
-						return -1, fmt.Errorf("resolve parent disk %d layer: %w", i, err)
-					}
-					pd[i].OverlayPath = path
+			if localSnapshotPath := opts.localSnapshotPath(); localSnapshotPath != "" && root.bundleReader == nil {
+				path, err := resolveLocalMergePath(top, localSnapshotPath, opts.RefLocations)
+				if err != nil {
+					return -1, fmt.Errorf("resolve parent disk %d layer: %w", i, err)
 				}
+				pd[i].OverlayPath = path
 			}
 		}
 		snapCfg.SnapshotProvenance.ParentDisks = pd
@@ -603,6 +570,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		ManifestCfg:     opts.ManifestCfg,
 		Fetcher:         opts.Fetcher,
 		BundleReader:    root.bundleReader,
+		BundleFetcher:   root.bundleFetcher,
 		RefLocations:    opts.RefLocations,
 		CustomerKeyFn:   opts.CustomerKeyFn,
 		LocalCodec:      opts.LocalCodec,
@@ -823,8 +791,8 @@ func openRefStream(ctx context.Context, raw string, opts Options) (fetch.Stream,
 		if err != nil {
 			return nil, err
 		}
-		opened, err := artifact.OpenFile(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
-			opts.Fetcher, opts.LocalCodec, opts.LocalRequired)
+		opened, err := artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
+			opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
 		if err != nil {
 			return nil, err
 		}
@@ -938,12 +906,13 @@ func canonicalizeSnapshotTarRef(ctx context.Context, raw string, opts Options) (
 }
 
 type openedRootSnapshot struct {
-	stream       fetch.Stream
-	size         int64
-	selfRef      string
-	bundleRoot   string
-	bundleReader *manifestbundle.Reader
-	opts         Options
+	stream        fetch.Stream
+	size          int64
+	selfRef       string
+	bundleRoot    string
+	bundleReader  *manifestbundle.Reader
+	bundleFetcher *manifestbundle.ManifestFetcher
+	opts          Options
 }
 
 // openRootSnapshot opens a root once before restore side effects. A local
@@ -971,8 +940,8 @@ func openRootSnapshot(ctx context.Context, opts Options) (*openedRootSnapshot, e
 			}
 			ref = parsed
 		}
-		opened, err := artifact.OpenFile(ctx, opts.SnapshotPath, ref, opts.ManifestCfg,
-			opts.CustomerKeyFn, opts.Fetcher, opts.LocalCodec, opts.LocalRequired)
+		opened, err := artifact.OpenFileWithLocations(ctx, opts.SnapshotPath, ref, opts.ManifestCfg,
+			opts.CustomerKeyFn, opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
 		if err != nil {
 			return nil, protectArtifactReadError(opts.LocalCodec, "open local snapshot", err)
 		}
@@ -985,6 +954,7 @@ func openRootSnapshot(ctx context.Context, opts Options) (*openedRootSnapshot, e
 			root.bundleRoot = manifest.HexKey(key)
 			root.opts.Fetcher = opened.ScopedFetcher()
 			root.bundleReader = opened.BundleReader()
+			root.bundleFetcher = opened.ManifestFetcher()
 			root.selfRef, err = fileBundleRef(opts.SnapshotPath, opts.SnapshotRef, key)
 		} else {
 			scheme, digest := opened.Digest()
@@ -1009,20 +979,13 @@ func openRootSnapshot(ctx context.Context, opts Options) (*openedRootSnapshot, e
 }
 
 func fileBundleRef(path, rawRef string, key store.ContentKey) (string, error) {
-	ref := manifest.Ref{Scheme: manifest.RefSchemeFile}
-	if rawRef != "" {
-		parsed, err := manifest.ParseRef(rawRef)
-		if err != nil {
-			return "", err
-		}
-		ref = parsed
+	source, _, err := fileBundleSource(path, rawRef)
+	if err != nil {
+		return "", err
 	}
-	real := path
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		real = resolved
-	}
-	if ref.Location == "" {
-		ref.Path = filepath.Base(real)
+	ref, err := manifest.ParseRef(source)
+	if err != nil {
+		return "", err
 	}
 	ref.DigestScheme = "manifest"
 	ref.Digest = manifest.HexKey(key)
@@ -1032,52 +995,35 @@ func fileBundleRef(path, rawRef string, key store.ContentKey) (string, error) {
 	return ref.String(), nil
 }
 
-func localizeBundleManifestRefs(refs []string, rootRef string, reader *manifestbundle.Reader) ([]string, error) {
-	if len(refs) == 0 {
-		return nil, nil
-	}
-	out := make([]string, len(refs))
-	for i, raw := range refs {
-		localized, err := localizeBundleManifestRef(raw, rootRef, reader)
+func fileBundleSource(path, rawRef string) (string, string, error) {
+	ref := manifest.Ref{Scheme: manifest.RefSchemeFile}
+	if rawRef != "" {
+		parsed, err := manifest.ParseRef(rawRef)
 		if err != nil {
-			return nil, fmt.Errorf("localize Bundle ref[%d]: %w", i, err)
+			return "", "", err
 		}
-		out[i] = localized
+		if parsed.Scheme != manifest.RefSchemeFile {
+			return "", "", fmt.Errorf("Bundle source must use file://")
+		}
+		ref = parsed
 	}
-	return out, nil
-}
-
-// localizeBundleManifestRef preserves the source Bundle selector in
-// provenance. The live restore config keeps manifest:// refs and uses the
-// scoped Fetcher; provenance must remain resolvable after that root closes.
-func localizeBundleManifestRef(raw, rootRef string, reader *manifestbundle.Reader) (string, error) {
-	if raw == "" || reader == nil {
-		return raw, nil
-	}
-	ref, err := manifest.ParseRef(raw)
+	real, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	if ref.Scheme != manifest.RefSchemeManifest {
-		return ref.String(), nil
-	}
-	key, err := manifest.ParseHexKey(ref.Path)
+	real, err = filepath.Abs(real)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	if !reader.HasManifest(key) {
-		return ref.String(), nil
+	if ref.Location == "" {
+		ref.Path = filepath.Base(real)
 	}
-	root, err := manifest.ParseRef(rootRef)
-	if err != nil || root.Scheme != manifest.RefSchemeFile {
-		return "", fmt.Errorf("Bundle root provenance is not file://")
+	ref.DigestScheme = ""
+	ref.Digest = ""
+	if err := ref.Validate(); err != nil {
+		return "", "", err
 	}
-	root.DigestScheme = "manifest"
-	root.Digest = manifest.HexKey(key)
-	if err := root.Validate(); err != nil {
-		return "", err
-	}
-	return root.String(), nil
+	return ref.String(), real, nil
 }
 
 func openSnapshotArtifact(ctx context.Context, opts Options) (fetch.Stream, string, string, error) {

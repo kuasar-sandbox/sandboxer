@@ -278,8 +278,9 @@ type BundleSink struct {
 	closed         bool
 }
 
-// NewBundleSink resolves the sole WriteAdmission and constructs the temporary
-// ZIP before the guest is paused. Every later Ingest reuses this writer.
+// NewBundleSink retains the no-refs convenience path. Snapshot lifecycle code
+// that plans external sources must use NewPlannedBundleSink so admission and
+// refs are both immutable before the Writer emits its metadata prefix.
 func NewBundleSink(ctx context.Context, outDir, sandboxID string, cfg *manifest.Config, keyFn ingest.CustomerKeyFunc, logf func(string, ...any)) (*BundleSink, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("snapshot Bundle requires manifest configuration")
@@ -294,6 +295,21 @@ func NewBundleSink(ctx context.Context, outDir, sandboxID string, cfg *manifest.
 	if err != nil {
 		return nil, fmt.Errorf("snapshot Bundle admission: %w", err)
 	}
+	return NewPlannedBundleSink(outDir, sandboxID, cfg, keyFn, admission, nil, logf)
+}
+
+// NewPlannedBundleSink constructs one Bundle after the caller has resolved its
+// sole admission and complete ordered flat refs plan. It never admits again.
+func NewPlannedBundleSink(outDir, sandboxID string, cfg *manifest.Config, keyFn ingest.CustomerKeyFunc, admission store.WriteAdmission, refs []string, logf func(string, ...any)) (*BundleSink, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("snapshot Bundle requires manifest configuration")
+	}
+	if keyFn == nil {
+		return nil, fmt.Errorf("snapshot Bundle requires customer key resolver")
+	}
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	f, err := os.CreateTemp(outDir, sandboxID+".bundle.*.partial")
 	if err != nil {
 		return nil, fmt.Errorf("snapshot Bundle temporary file: %w", err)
@@ -306,7 +322,7 @@ func NewBundleSink(ctx context.Context, outDir, sandboxID string, cfg *manifest.
 	if err := f.Chmod(0o644); err != nil {
 		return fail(fmt.Errorf("snapshot Bundle temporary permissions: %w", err))
 	}
-	writer, err := manifestbundle.NewWriter(f, admission, manifestbundle.WriterOptions{})
+	writer, err := manifestbundle.NewWriter(f, admission, manifestbundle.WriterOptions{Refs: refs})
 	if err != nil {
 		return fail(err)
 	}

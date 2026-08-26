@@ -10,8 +10,10 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 )
@@ -122,6 +124,105 @@ func TestOpenFileZIPMagicFailsClosedAndTarRejectsManifestSelector(t *testing.T) 
 	}
 	if _, err := storage.OpenFile(context.Background(), tarPath, ref); err == nil || !strings.Contains(err.Error(), "tarstream rejects") {
 		t.Fatalf("tarstream @manifest error = %v", err)
+	}
+}
+
+func TestOpenFileBundleHonorsVerifyContentPolicy(t *testing.T) {
+	dir := t.TempDir()
+	customerKey := [32]byte{0x81, 0x82, 0x83}
+	keyFn := func() ([32]byte, error) { return customerKey, nil }
+	cfg := &manifest.Config{
+		Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:  manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+	sink, err := snapshot.NewBundleSink(context.Background(), dir, "verify-source", cfg, keyFn, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := snapshot.BuildZIP(map[string][]byte{
+		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootRef, sourcePath, err := sink.AbsorbBundle(context.Background(),
+		bytes.NewReader(bytes.Repeat([]byte{0x45}, 8192)), nil, bytes.NewReader(inner))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	root, err := manifest.ParseKeyRef(rootRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := manifestbundle.Open(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	wrongRoot := store.ContentKey{0xfe, 0xed, 0xfa, 0xce}
+	forgedPath := filepath.Join(dir, manifest.HexKey(wrongRoot)+".bundle")
+	file, err := os.OpenFile(forgedPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := manifestbundle.NewWriter(file, reader.Admission(), manifestbundle.WriterOptions{})
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	for _, chunkKey := range reader.ChunkKeys() {
+		_, blob, err := reader.Getter().Get(context.Background(), store.PartitionChunk, chunkKey)
+		if err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		_, putErr := writer.Put(context.Background(), reader.Admission(), store.PartitionChunk, chunkKey, blob.Bytes())
+		blob.Release()
+		if putErr != nil {
+			_ = file.Close()
+			t.Fatal(putErr)
+		}
+	}
+	_, manifestBlob, err := reader.Getter().Get(context.Background(), store.PartitionManifest, root)
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	_, putErr := writer.Put(context.Background(), reader.Admission(), store.PartitionManifest, wrongRoot, manifestBlob.Bytes())
+	manifestBlob.Release()
+	if putErr != nil {
+		_ = file.Close()
+		t.Fatal(putErr)
+	}
+	if err := writer.Finalize(wrongRoot); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	verify := true
+	strictCfg := *cfg
+	strictCfg.Manifest.VerifyContent = &verify
+	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: forgedPath}
+	if _, err := artifact.OpenFile(context.Background(), forgedPath, ref, &strictCfg, keyFn, nil, nil, false); err == nil || !strings.Contains(err.Error(), "content key mismatch") {
+		t.Fatalf("strict Bundle open error = %v", err)
+	}
+	verify = false
+	uncheckedCfg := *cfg
+	uncheckedCfg.Manifest.VerifyContent = &verify
+	opened, err := artifact.OpenFile(context.Background(), forgedPath, ref, &uncheckedCfg, keyFn, nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	buffer := make([]byte, 4096)
+	if n, err := opened.ReadAt(context.Background(), buffer, 0); err != nil || n != len(buffer) {
+		t.Fatalf("unchecked Bundle read = %d, %v", n, err)
 	}
 }
 
