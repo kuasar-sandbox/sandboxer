@@ -1312,6 +1312,11 @@ func handleSnapshotRequest(
 	if err != nil {
 		return ctl.Response{}, err
 	}
+	if snapshotMode != ctl.SnapshotModeBundle && prov.BundleSource != nil {
+		if err := validateNonBundleSnapshotSources(context.Background(), opts, resultMemoryRefs, diskMerged); err != nil {
+			return ctl.Response{}, err
+		}
+	}
 	var bundleRefReplacements map[string]string
 	if snapshotMode == ctl.SnapshotModeBundle {
 		plan, planErr := prepareSnapshotBundlePlan(context.Background(), opts, resultMemoryRefs,
@@ -1799,16 +1804,8 @@ func prepareSnapshotBundlePlan(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	placeholderRefs := make([]string, len(diskMerged))
-	probe, err := buildSnapshotCfg(opts.Cfg, placeholderRefs, memoryFromRefs, diskMerged)
+	logicalRefs, err := snapshotLayerDependencyRefs(opts.Cfg, memoryFromRefs, diskMerged)
 	if err != nil {
-		return nil, err
-	}
-	var logicalRefs []string
-	if _, err := rewriteSnapshotLayerRefs(probe, func(raw string) (string, error) {
-		logicalRefs = append(logicalRefs, raw)
-		return raw, nil
-	}); err != nil {
 		return nil, err
 	}
 
@@ -1926,6 +1923,55 @@ func prepareSnapshotBundlePlan(
 	return plan, nil
 }
 
+func snapshotLayerDependencyRefs(cfg *config.SandboxConfig, memoryFromRefs []string, diskMerged []bool) ([]string, error) {
+	placeholderRefs := make([]string, len(diskMerged))
+	probe, err := buildSnapshotCfg(cfg, placeholderRefs, memoryFromRefs, diskMerged)
+	if err != nil {
+		return nil, err
+	}
+	var refs []string
+	if _, err := rewriteSnapshotLayerRefs(probe, func(raw string) (string, error) {
+		refs = append(refs, raw)
+		return raw, nil
+	}); err != nil {
+		return nil, err
+	}
+	return refs, nil
+}
+
+func validateNonBundleSnapshotSources(ctx context.Context, opts RunOptions, memoryFromRefs []string, diskMerged []bool) error {
+	refs, err := snapshotLayerDependencyRefs(opts.Cfg, memoryFromRefs, diskMerged)
+	if err != nil {
+		return err
+	}
+	seen := make(map[store.ContentKey]struct{})
+	for _, raw := range refs {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return fmt.Errorf("snapshot dependency %q: %w", raw, err)
+		}
+		if ref.Scheme != manifest.RefSchemeManifest {
+			continue
+		}
+		key, err := manifest.ParseHexKey(ref.Path)
+		if err != nil {
+			return err
+		}
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		_, _, bundled, err := bundleSourceForManifest(ctx, key, opts)
+		if err != nil {
+			return fmt.Errorf("snapshot source for Manifest %s: %w", manifest.HexKey(key), err)
+		}
+		if bundled {
+			return fmt.Errorf("non-Bundle snapshot cannot retain Bundle-selected Manifest %s without bundle/refs; use --mode=bundle or merge the dependency", manifest.HexKey(key))
+		}
+	}
+	return nil
+}
+
 func bundleSourceForManifest(ctx context.Context, key store.ContentKey, opts RunOptions) (string, string, bool, error) {
 	if opts.BundleFetcher == nil {
 		return "", "", false, nil
@@ -1935,6 +1981,13 @@ func bundleSourceForManifest(ctx context.Context, key store.ContentKey, opts Run
 		return "", "", false, err
 	}
 	if source.Reader == nil {
+		stream, err := source.OpenManifest(ctx, key)
+		if err != nil {
+			return "", "", false, err
+		}
+		if err := stream.Close(); err != nil {
+			return "", "", false, err
+		}
 		return "", "", false, nil
 	}
 	bundleSource := opts.Cfg.SnapshotProvenance.BundleSource

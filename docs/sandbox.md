@@ -1245,6 +1245,11 @@ Bundle、父Bundle已有refs、其他首次使用source的顺序展平去重,不
 不可达历史。节点级`runtime_ref`和overlay只读`base_ref`继续沿用既有平台工件契约,
 不属于snapshot-layer强制转换域。
 
+tarstream和直接Store sink没有`bundle/refs`可记录物理来源。因此从Bundle恢复后,
+若最终逻辑图仍保留由current/refs Bundle选中的Manifest,非Bundle snapshot会在
+quiesce前拒绝;应使用`--mode=bundle`,或通过merge移除这些依赖。全部剩余Manifest
+都由默认Store提供时不受此限制。
+
 ## 4. 资源模型
 
 ### 4.1 三种部署模式

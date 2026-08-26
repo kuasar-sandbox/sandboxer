@@ -25,6 +25,7 @@ import (
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
@@ -259,14 +260,34 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 			RootRef: "file://" + filepath.Base(parentPath), RootPath: parentPath,
 		},
 	}
-	plan, err := prepareSnapshotBundlePlan(context.Background(), RunOptions{
+	runOpts := RunOptions{
 		Cfg:           sandboxCfg,
 		ManifestCfg:   childCfg,
 		Fetcher:       opened.ScopedFetcher(),
 		BundleReader:  opened.BundleReader(),
 		BundleFetcher: opened.ManifestFetcher(),
 		CustomerKeyFn: keyFn,
-	}, []string{parentRef}, []bool{false}, childDir, admission)
+	}
+	if err := validateNonBundleSnapshotSources(context.Background(), runOpts,
+		[]string{parentRef}, []bool{false}); err == nil || !strings.Contains(err.Error(), "without bundle/refs") {
+		t.Fatalf("non-Bundle retained source error = %v", err)
+	}
+	if err := validateNonBundleSnapshotSources(context.Background(), runOpts,
+		nil, []bool{true}); err != nil {
+		t.Fatalf("fully merged non-Bundle source validation: %v", err)
+	}
+	rootSource, err := opened.ManifestFetcher().SelectRoot(parentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &failingManifestFetcher{}
+	remoteOpts := runOpts
+	remoteOpts.BundleFetcher = manifestbundle.NewManifestFetcher(opened.BundleReader(), rootSource.Fetcher, remote)
+	if _, _, _, err := bundleSourceForManifest(context.Background(), store.ContentKey{0xff}, remoteOpts); err == nil || remote.calls != 1 {
+		t.Fatalf("remote source confirmation error = %v, calls=%d", err, remote.calls)
+	}
+	plan, err := prepareSnapshotBundlePlan(context.Background(), runOpts,
+		[]string{parentRef}, []bool{false}, childDir, admission)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,14 +331,8 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 		t.Fatal("child copied parent root instead of retaining an external Bundle source")
 	}
 
-	mergedPlan, err := prepareSnapshotBundlePlan(context.Background(), RunOptions{
-		Cfg:           sandboxCfg,
-		ManifestCfg:   childCfg,
-		Fetcher:       opened.ScopedFetcher(),
-		BundleReader:  opened.BundleReader(),
-		BundleFetcher: opened.ManifestFetcher(),
-		CustomerKeyFn: keyFn,
-	}, nil, []bool{true}, t.TempDir(), admission)
+	mergedPlan, err := prepareSnapshotBundlePlan(context.Background(), runOpts,
+		nil, []bool{true}, t.TempDir(), admission)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,6 +340,15 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 	if refs := mergedPlan.Refs(); len(refs) != 0 {
 		t.Fatalf("merged and unreachable parent source remained in refs: %v", refs)
 	}
+}
+
+type failingManifestFetcher struct {
+	calls int
+}
+
+func (f *failingManifestFetcher) OpenManifest(context.Context, store.ContentKey) (fetch.Stream, error) {
+	f.calls++
+	return nil, errors.New("remote Manifest missing")
 }
 
 func TestPrepareSnapshotBundlePlanFlattensOnlyReachableSources(t *testing.T) {
