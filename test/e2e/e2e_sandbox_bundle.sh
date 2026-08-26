@@ -261,6 +261,7 @@ cmp "$ROOT1_PATH" "$LOCATION_A/$ROOT1.bundle"
 
 write_restore_yaml() {
     local output="$1" hostname="$2" root_diff="$3"
+    rm -f "$root_diff"
     truncate -s 512M "$root_diff"
     mkfs.ext4 -q -F "$root_diff"
     cat > "$output" <<EOF
@@ -331,23 +332,42 @@ ROOT3_PATH="$(readlink -f "$OUT3/$SID3.snapshot")"
 ROOT3="$(basename "$ROOT3_PATH" .bundle)"
 assert_bundle_refs "$ROOT3_PATH" "file://$ROOT2.bundle@location:B" "file://$ROOT1.bundle@location:A"
 
-echo "==> phase 4: local C restore lazily resolves located B and A"
-write_restore_yaml "$WORK/restore4.yaml" bundle-flat-refs "$WORK/root-r4.ext4"
-SID4="bundle-4-$$"
-timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "$OUT3/$SID3.snapshot" \
-    --ref-location A=file://$LOCATION_A --ref-location B=file://$LOCATION_B --config "$WORK/restore4.yaml" \
-    --manifest-config "$WORK/manifest.yaml" --sandbox-id "$SID4" --ch-binary "$BIN/cloud-hypervisor" \
-    --run-root "$RR" >"$WORK/run4.log" 2>&1 &
-P4=$!
-PIDS+=("$P4")
-ready "$SID4" "$P4" "$WORK/ready4" || { tail -80 "$WORK/run4.log"; exit 1; }
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID4" --run-root "$RR" -- /bin/sh -c \
-    'cat /bundle-root /bundle-root-child /bundle-root-c /scratch/bundle-data /scratch/bundle-data-child /scratch/bundle-data-c' >"$WORK/local-child-data"
-for marker in ROOT-BASE ROOT-CHILD ROOT-C DATA-BASE DATA-CHILD DATA-C; do
-    grep -qx "$marker" "$WORK/local-child-data" || { cat "$WORK/local-child-data"; exit 1; }
+echo "==> phase 4: local C restore lazily resolves located B and A (20 samples)"
+RESTORE_SAMPLES="$WORK/a-b-c-restore-ms"
+: >"$RESTORE_SAMPLES"
+for sample in $(seq 1 20); do
+    write_restore_yaml "$WORK/restore4-$sample.yaml" "bundle-flat-refs-$sample" "$WORK/root-r4-$sample.ext4"
+    SID4="bundle-4-$sample-$$"
+    start_ns="$(date +%s%N)"
+    timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "$OUT3/$SID3.snapshot" \
+        --ref-location A=file://$LOCATION_A --ref-location B=file://$LOCATION_B --config "$WORK/restore4-$sample.yaml" \
+        --manifest-config "$WORK/manifest.yaml" --sandbox-id "$SID4" --ch-binary "$BIN/cloud-hypervisor" \
+        --run-root "$RR" >"$WORK/run4-$sample.log" 2>&1 &
+    P4=$!
+    PIDS+=("$P4")
+    ready "$SID4" "$P4" "$WORK/ready4-$sample" || { tail -80 "$WORK/run4-$sample.log"; exit 1; }
+    echo "$((($(date +%s%N)-start_ns)/1000000))" >>"$RESTORE_SAMPLES"
+    if [ "$sample" = 1 ]; then
+        "$BIN/sandbox-ctl" exec --sandbox-id "$SID4" --run-root "$RR" -- /bin/sh -c \
+            'cat /bundle-root /bundle-root-child /bundle-root-c /scratch/bundle-data /scratch/bundle-data-child /scratch/bundle-data-c' >"$WORK/local-child-data"
+        for marker in ROOT-BASE ROOT-CHILD ROOT-C DATA-BASE DATA-CHILD DATA-C; do
+            grep -qx "$marker" "$WORK/local-child-data" || { cat "$WORK/local-child-data"; exit 1; }
+        done
+    fi
+    kill "$P4" 2>/dev/null || true
+    wait "$P4" 2>/dev/null || true
+    unset "PIDS[$((${#PIDS[@]} - 1))]"
 done
-kill "$P4" 2>/dev/null || true
-wait "$P4" 2>/dev/null || true
+python3 - "$RESTORE_SAMPLES" <<'PY'
+import math
+import sys
+
+samples = sorted(int(line) for line in open(sys.argv[1], encoding="ascii") if line.strip())
+def percentile(value):
+    return samples[math.ceil(value * len(samples)) - 1]
+
+print(f"    A_to_B_to_C_restore_ready_ms n={len(samples)} p50={percentile(0.50)} p95={percentile(0.95)} p99={percentile(0.99)}")
+PY
 
 echo "==> phase 5: exact multi-source upload through current C -> B -> A"
 start_ns="$(date +%s%N)"
