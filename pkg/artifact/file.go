@@ -181,7 +181,15 @@ func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg 
 	if cfg == nil || keyFn == nil {
 		return nil, fmt.Errorf("manifest Bundle requires manifest configuration and customer key")
 	}
-	reader, err := bundle.Open(path)
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, fmt.Errorf("manifest Bundle resolve final path: %w", err)
+	}
+	resolvedPath, err = filepath.Abs(resolvedPath)
+	if err != nil {
+		return nil, fmt.Errorf("manifest Bundle resolve final path: %w", err)
+	}
+	reader, err := bundle.Open(resolvedPath)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +201,7 @@ func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg 
 		_ = reader.Close()
 		return nil, err
 	}
-	root, err := BundleRootKey(path, ref)
+	root, err := BundleRootKey(resolvedPath, ref)
 	if err != nil {
 		return fail(err)
 	}
@@ -210,7 +218,7 @@ func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg 
 		return fail(err)
 	}
 	if len(reader.Refs()) != 0 {
-		resolver = newBundleSourceResolver(filepath.Dir(path), locations, customerKey, decryptor, verificationOptions(cfg))
+		resolver = newBundleSourceResolver(filepath.Dir(resolvedPath), locations, customerKey, decryptor, verificationOptions(cfg))
 	}
 	local := fetch.NewFetcherWithOptions(customerKey, reader.Getter(), decryptor, verificationOptions(cfg))
 	clear(customerKey[:])

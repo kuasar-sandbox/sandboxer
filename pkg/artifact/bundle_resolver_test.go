@@ -137,6 +137,27 @@ func TestBundleResolverOrderedLazyFlatAndFailClosed(t *testing.T) {
 			t.Fatal("referenced Bundle's own refs participated recursively")
 		}
 	})
+
+	t.Run("same-directory ref follows final root symlink", func(t *testing.T) {
+		physicalDir := t.TempDir()
+		_, sourcePath, sourceKey := writeResolverBundle(t, physicalDir, "symlink-source", manifestCfg, keyFn, nil, true, 0x74)
+		localRef := "file://" + filepath.Base(sourcePath)
+		_, currentPath, _ := writeResolverBundle(t, physicalDir, "symlink-root", manifestCfg, keyFn, []string{localRef}, false, 0x75)
+		aliasDir := t.TempDir()
+		aliasPath := filepath.Join(aliasDir, "root.snapshot")
+		if err := os.Symlink(currentPath, aliasPath); err != nil {
+			t.Fatal(err)
+		}
+		opened := openResolverRoot(t, aliasPath, manifestCfg, keyFn, nil)
+		defer opened.Close()
+		source, err := opened.ManifestFetcher().SelectManifest(context.Background(), sourceKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if source.Ref != localRef {
+			t.Fatalf("selected source = %q, want %q", source.Ref, localRef)
+		}
+	})
 }
 
 func TestBundleResolverClosesEveryReferencedResource(t *testing.T) {
