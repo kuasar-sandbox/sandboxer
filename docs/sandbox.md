@@ -1680,6 +1680,8 @@ T10 sandbox-ctl snapshot(发起方进程)收到 done:
     若mode=bundle:本地产物仅为一个.bundle与sid symlink
 ```
 
+`--drop-caches` 默认为 `false`，即保留 guest cache 以降低恢复耗时；如需减小快照体积，显式传入 `--drop-caches=true`。
+
 **关键差异 vs 一般 VMM 快照**:
 - patched CH **不写** memory-ranges
 - sandbox-ctl 持有 memfd 自己 sparse 拷贝,**不经 CH→file→sandbox-ctl 的中转**

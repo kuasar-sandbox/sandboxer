@@ -90,8 +90,8 @@ func TestReadMessageOversized(t *testing.T) {
 }
 
 func TestSnapshotBoolDefaultsAndRoundTrip(t *testing.T) {
-	if !(Request{}).DropCachesEnabled() || !(Request{}).MergeRefEnabled() {
-		t.Fatal("missing bool fields must preserve true defaults")
+	if (Request{}).DropCachesEnabled() || !(Request{}).MergeRefEnabled() {
+		t.Fatal("drop_caches must default false and merge_ref must default true")
 	}
 
 	f := false
@@ -109,6 +109,11 @@ func TestSnapshotBoolDefaultsAndRoundTrip(t *testing.T) {
 	}
 	if got.MergeRef == nil || *got.MergeRef || got.MergeRefEnabled() {
 		t.Fatalf("merge_ref false was not preserved: %+v", got.MergeRef)
+	}
+
+	trueValue := true
+	if !(Request{DropCaches: &trueValue}).DropCachesEnabled() {
+		t.Fatal("drop_caches true was not enabled")
 	}
 }
 
@@ -133,13 +138,13 @@ func TestSnapshotModeDefaultValidationAndRoundTrip(t *testing.T) {
 	}
 }
 
-func TestOldSnapshotRequestOmitsNewBoolFields(t *testing.T) {
+func TestSnapshotRequestOmitsUnsetBoolFields(t *testing.T) {
 	var buf bytes.Buffer
 	if err := WriteMessage(&buf, &Request{Type: TypeSnapshotRequest}); err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(buf.Bytes(), []byte("drop_caches")) || bytes.Contains(buf.Bytes(), []byte("merge_ref")) {
-		t.Fatalf("nil compatibility fields must be omitted: %q", buf.Bytes())
+		t.Fatalf("unset bool fields must be omitted: %q", buf.Bytes())
 	}
 }
 

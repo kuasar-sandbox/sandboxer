@@ -24,7 +24,7 @@ func snapshotCmd(args []string) int {
 	upload := fs.Bool("upload", false, "ingest snapshot bundle + overlay into manifest store; stdout = snapshot manifest key")
 	mode := fs.String("mode", ctl.SnapshotModeLocal, "local snapshot format: local|bundle (default local)")
 	resume := fs.Bool("resume", false, "keep sandbox running after snapshot (default: destroy via /vm.shutdown)")
-	dropCaches := fs.Bool("drop-caches", true, "drop guest page, inode, and dentry caches before snapshot")
+	dropCaches := fs.Bool("drop-caches", false, "drop guest page, inode, and dentry caches before snapshot (default: preserve guest caches)")
 	mergeRef := fs.Bool("merge-ref", true, "merge a local parent memory ref into the new memory self layer")
 	runRoot := fs.String("run-root", "", "tmpfs run root (overrides SANDBOX_RUN_ROOT env; default /run/sandbox)")
 	timeoutS := fs.Int("timeout", 0, "seconds to wait for snapshot_done (0 = wait indefinitely; upload can take minutes)")

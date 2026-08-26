@@ -43,7 +43,8 @@ type Request struct {
 	Mode        string `json:"mode,omitempty"`
 	ResumeAfter bool   `json:"resume_after,omitempty"`
 	StagingDir  string `json:"staging_dir,omitempty"`
-	// nil preserves the behavior of clients predating these fields.
+	// nil means that guest caches are preserved; callers can explicitly opt in
+	// to cache dropping with a true value.
 	DropCaches *bool `json:"drop_caches,omitempty"`
 	MergeRef   *bool `json:"merge_ref,omitempty"`
 
@@ -77,9 +78,9 @@ type Response struct {
 }
 
 // DropCachesEnabled reports the per-snapshot cache policy. A missing field
-// means true so old clients retain the historical behavior.
+// means false so snapshots preserve guest caches by default.
 func (r Request) DropCachesEnabled() bool {
-	return r.DropCaches == nil || *r.DropCaches
+	return r.DropCaches != nil && *r.DropCaches
 }
 
 // MergeRefEnabled reports whether a local parent memory ref is flattened into
