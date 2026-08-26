@@ -50,6 +50,10 @@ type snapshotCfgFileOpener interface {
 	OpenFile(context.Context, string, manifest.Ref) (*artifact.OpenedFile, error)
 }
 
+type snapshotCfgLocationFileOpener interface {
+	OpenFileWithLocations(context.Context, string, manifest.Ref, config.RefLocations) (*artifact.OpenedFile, error)
+}
+
 // SnapshotCfgReader reads exactly one root snapshot bundle. It does not walk
 // FromRefs, apply conductor policy, or cache results across tasks.
 type SnapshotCfgReader struct {
@@ -138,8 +142,7 @@ func (r *SnapshotCfgReader) openRoot(ctx context.Context, rootRef string, opts S
 			if err != nil {
 				return nil, 0, err
 			}
-			if opener, ok := r.storage.(snapshotCfgFileOpener); ok {
-				opened, err := opener.OpenFile(ctx, path, ref)
+			if opened, handled, err := openSnapshotCfgFile(ctx, r.storage, path, ref, opts.RefLocations); handled {
 				if err != nil {
 					return nil, 0, protectArtifactReadError(codec, "open local snapshot", err)
 				}
@@ -157,8 +160,7 @@ func (r *SnapshotCfgReader) openRoot(ctx context.Context, rootRef string, opts S
 	if !filepath.IsAbs(path) && opts.RelativeDir != "" {
 		path = filepath.Join(opts.RelativeDir, path)
 	}
-	if opener, ok := r.storage.(snapshotCfgFileOpener); ok {
-		opened, err := opener.OpenFile(ctx, path, manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path})
+	if opened, handled, err := openSnapshotCfgFile(ctx, r.storage, path, manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path}, opts.RefLocations); handled {
 		if err != nil {
 			return nil, 0, protectArtifactReadError(codec, "open local snapshot", err)
 		}
@@ -181,6 +183,18 @@ func (r *SnapshotCfgReader) openRoot(ctx context.Context, rootRef string, opts S
 		return nil, 0, fmt.Errorf("snapshot bundle is too large")
 	}
 	return stream, int64(stream.Size()), nil
+}
+
+func openSnapshotCfgFile(ctx context.Context, storage snapshotCfgStorage, path string, ref manifest.Ref, locations config.RefLocations) (*artifact.OpenedFile, bool, error) {
+	if opener, ok := storage.(snapshotCfgLocationFileOpener); ok {
+		opened, err := opener.OpenFileWithLocations(ctx, path, ref, locations)
+		return opened, true, err
+	}
+	if opener, ok := storage.(snapshotCfgFileOpener); ok {
+		opened, err := opener.OpenFile(ctx, path, ref)
+		return opened, true, err
+	}
+	return nil, false, nil
 }
 
 func readSnapshotCfgEntry(reader io.ReaderAt, size int64) ([]byte, error) {

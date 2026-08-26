@@ -17,18 +17,20 @@ import (
 // local snapshot graph to manifest storage or one named file location, preserves
 // existing portable refs, and prints the canonical portable root ref.
 //
-//	sandbox-ctl upload-snapshot [--manifest-config <file>] [--to-ref-location name=file:///path] [--quiet] <snapshot-path>
+//	sandbox-ctl upload-snapshot [--manifest-config <file>] [--ref-location name=file:///path ...] [--to-ref-location name=file:///path] [--quiet] <snapshot-path>
 func uploadSnapshotCmd(args []string) int {
 	fs := flag.NewFlagSet("upload-snapshot", flag.ContinueOnError)
 	manifestPath := fs.String("manifest-config", "", "storage config YAML (overrides MANIFEST_CONFIG env); $MANIFEST_KEY supplies the customer key")
 	toRefLocation := fs.String("to-ref-location", "", "publish local refs to name=file:///absolute/path")
+	refLocations := config.RefLocations{}
+	fs.Var(refLocations, "ref-location", "trusted Bundle dependency location name=file:///absolute/path (repeatable)")
 	quiet := fs.Bool("quiet", false, "suppress progress logs on stderr")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	path := fs.Arg(0)
 	if path == "" || fs.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl upload-snapshot [--manifest-config <file>] [--to-ref-location name=file:///path] [--quiet] <snapshot-path>")
+		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl upload-snapshot [--manifest-config <file>] [--ref-location name=file:///path ...] [--to-ref-location name=file:///path] [--quiet] <snapshot-path>")
 		return 2
 	}
 
@@ -65,7 +67,7 @@ func uploadSnapshotCmd(args []string) int {
 			ref, err = restore.PublishLocalToLocation(context.Background(), path, name, directory, localCodec, localRequired, logf)
 		}
 	} else {
-		ref, err = restore.UploadLocal(context.Background(), path, manifestCfg, keyFn, manifestFetcher, localCodec, localRequired, logf)
+		ref, err = restore.UploadLocalWithLocations(context.Background(), path, manifestCfg, keyFn, manifestFetcher, refLocations, localCodec, localRequired, logf)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

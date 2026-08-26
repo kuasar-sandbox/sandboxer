@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -45,6 +46,7 @@ type RunOptions struct {
 	ManifestCfg   *config.ManifestConfig // for manifest:// resolution; may be nil if all file://
 	Fetcher       fetch.Fetcher          // lazily network-backed; caller owns its lifetime
 	BundleReader  *manifestbundle.Reader // non-nil while restoring a local root Bundle
+	BundleFetcher *manifestbundle.ManifestFetcher
 	RefLocations  config.RefLocations    // trusted logical location -> host directory mappings
 	SandboxID     string                 // generated if empty
 	CHBinary      string                 // path to bin/cloud-hypervisor
@@ -121,8 +123,8 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		}
 	}
 	fileOpener := FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
-		opened, err := artifact.OpenFile(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
-			opts.Fetcher, opts.LocalCodec, opts.LocalRequired)
+		opened, err := artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
+			opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
 		if err != nil {
 			return nil, err
 		}
@@ -1071,6 +1073,7 @@ type SnapshotHandler struct {
 	ManifestCfg   *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
 	Fetcher       fetch.Fetcher
 	BundleReader  *manifestbundle.Reader
+	BundleFetcher *manifestbundle.ManifestFetcher
 	RefLocations  config.RefLocations
 	CustomerKeyFn ingest.CustomerKeyFunc
 	LocalCodec    tarstream.Codec
@@ -1096,7 +1099,7 @@ func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
 func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (ctl.Response, error) {
 	opts := RunOptions{
 		Cfg: h.Cfg, ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
-		Fetcher: h.Fetcher, BundleReader: h.BundleReader, RefLocations: h.RefLocations,
+		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
 	}
 	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
@@ -1162,8 +1165,8 @@ func handleSnapshotRequest(
 	if !req.Upload && req.OutDir == "" {
 		return ctl.Response{}, fmt.Errorf("--output and --upload are mutually exclusive; one is required")
 	}
-	if localParent && !mergeRef && req.Upload {
-		return ctl.Response{}, fmt.Errorf("--merge-ref=false with a local memory parent requires --output; direct upload is not supported")
+	if (localParent || prov.BundleSource != nil) && !mergeRef && req.Upload {
+		return ctl.Response{}, fmt.Errorf("--merge-ref=false with a local memory or Bundle parent requires --output; direct upload is not supported")
 	}
 	mergeBaseOpener := snapshot.MergeBaseOpener(func(ctx context.Context, raw string) (fetch.Stream, error) {
 		ref, err := manifest.ParseRef(raw)
@@ -1174,14 +1177,15 @@ func handleSnapshotRequest(
 		if err != nil {
 			return nil, err
 		}
-		opened, err := artifact.OpenFile(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
-			opts.Fetcher, opts.LocalCodec, opts.LocalRequired)
+		opened, err := artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
+			opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
 		if err != nil {
 			return nil, err
 		}
 		return opened, nil
 	})
 	var bundleSink *snapshot.BundleSink
+	var bundleAdmission store.WriteAdmission
 
 	// Enter the memory lifecycle barrier immediately after request-shape
 	// validation. Artifact/merge/sink preparation may perform I/O; allowing a
@@ -1215,16 +1219,10 @@ func handleSnapshotRequest(
 		}
 	}
 	if snapshotMode == ctl.SnapshotModeBundle {
-		bundleSink, err = snapshot.NewBundleSink(context.Background(), req.OutDir, opts.SandboxID,
-			opts.ManifestCfg, opts.CustomerKeyFn, logf)
+		bundleAdmission, err = opts.ManifestCfg.WriteAdmission(context.Background())
 		if err != nil {
-			return ctl.Response{}, err
+			return ctl.Response{}, fmt.Errorf("snapshot Bundle admission: %w", err)
 		}
-		defer func() {
-			if closeErr := bundleSink.Close(); closeErr != nil {
-				err = errors.Join(err, fmt.Errorf("snapshot Bundle cleanup: %w", closeErr))
-			}
-		}()
 	}
 
 	if prov.ParentSnapshotRef != "" && len(prov.ParentDisks) != max(0, len(disks)-1) {
@@ -1260,16 +1258,21 @@ func handleSnapshotRequest(
 			if parseErr != nil {
 				return ctl.Response{}, fmt.Errorf("snapshot: disk %d parent ref: %w", i, parseErr)
 			}
-			mergeDisk = !ref.Portable()
-		}
-		if mergeDisk {
-			if parentDiskPath == "" {
-				return ctl.Response{}, fmt.Errorf("snapshot: local parent disk %d lacks a merge base path", i)
+			switch {
+			case ref.Scheme == manifest.RefSchemeFile && !ref.Portable():
+				if parentDiskPath == "" {
+					return ctl.Response{}, fmt.Errorf("snapshot: local parent disk %d lacks a merge base path", i)
+				}
+				dd.MergeBase, err = resolvedLocalMergeRef(parentDiskPath, parentDiskRef)
+				mergeDisk = err == nil
+			case mergeRef && ref.Scheme == manifest.RefSchemeManifest:
+				dd.MergeBase, mergeDisk, err = bundleManifestMergeRef(context.Background(), parentDiskRef, opts)
 			}
-			dd.MergeBase, err = resolvedLocalMergeRef(parentDiskPath, parentDiskRef)
 			if err != nil {
 				return ctl.Response{}, fmt.Errorf("snapshot: disk %d merge base identity: %w", i, err)
 			}
+		}
+		if mergeDisk {
 			if err := snapshot.ValidateMergeBaseWithOpener(dd.MergeBase, diffSize, opts.LocalCodec, opts.LocalRequired, mergeBaseOpener); err != nil {
 				return ctl.Response{}, fmt.Errorf("snapshot: disk %d merge base: %w", i, err)
 			}
@@ -1280,9 +1283,9 @@ func handleSnapshotRequest(
 		diffs[i] = dd
 	}
 
-	mergeMemory := localParent && mergeRef
+	mergeMemory := false
 	memoryMergeBase := ""
-	if mergeMemory {
+	if localParent && mergeRef {
 		if prov.ParentSnapshotPath == "" {
 			return ctl.Response{}, fmt.Errorf("snapshot: local parent lacks a memory merge path")
 		}
@@ -1293,15 +1296,46 @@ func handleSnapshotRequest(
 		if err := snapshot.ValidateMergeBaseWithOpener(memoryMergeBase, int64(mfd.Size()), opts.LocalCodec, opts.LocalRequired, mergeBaseOpener); err != nil {
 			return ctl.Response{}, fmt.Errorf("snapshot: memory merge base: %w", err)
 		}
+		mergeMemory = true
+	} else if mergeRef && prov.BundleSource != nil && prov.ParentSnapshotRef != "" {
+		memoryMergeBase, mergeMemory, err = bundleManifestMergeRef(context.Background(), prov.ParentSnapshotRef, opts)
+		if err != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot: Bundle memory merge base identity: %w", err)
+		}
+		if mergeMemory {
+			if err := snapshot.ValidateMergeBaseWithOpener(memoryMergeBase, int64(mfd.Size()), opts.LocalCodec, opts.LocalRequired, mergeBaseOpener); err != nil {
+				return ctl.Response{}, fmt.Errorf("snapshot: Bundle memory merge base: %w", err)
+			}
+		}
 	}
 	resultMemoryRefs, err := snapshotMemoryRefs(prov, mergeMemory)
 	if err != nil {
 		return ctl.Response{}, err
 	}
+	if snapshotMode != ctl.SnapshotModeBundle && prov.BundleSource != nil {
+		if err := validateNonBundleSnapshotSources(context.Background(), opts, resultMemoryRefs, diskMerged); err != nil {
+			return ctl.Response{}, err
+		}
+	}
 	var bundleRefReplacements map[string]string
 	if snapshotMode == ctl.SnapshotModeBundle {
-		bundleRefReplacements, err = prepareBundleRefReplacements(context.Background(), bundleSink,
-			opts, resultMemoryRefs, diskMerged, req.OutDir, logf)
+		plan, planErr := prepareSnapshotBundlePlan(context.Background(), opts, resultMemoryRefs,
+			diskMerged, req.OutDir, bundleAdmission)
+		if planErr != nil {
+			return ctl.Response{}, planErr
+		}
+		defer func() { err = errors.Join(err, plan.Close()) }()
+		bundleSink, err = snapshot.NewPlannedBundleSink(req.OutDir, opts.SandboxID,
+			opts.ManifestCfg, opts.CustomerKeyFn, bundleAdmission, plan.Refs(), logf)
+		if err != nil {
+			return ctl.Response{}, err
+		}
+		defer func() {
+			if closeErr := bundleSink.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("snapshot Bundle cleanup: %w", closeErr))
+			}
+		}()
+		bundleRefReplacements, err = plan.Ingest(context.Background(), bundleSink, logf)
 		if err != nil {
 			return ctl.Response{}, err
 		}
@@ -1473,12 +1507,19 @@ func handleSnapshotRequest(
 		if err != nil || bundleRefReplacements == nil {
 			return body, err
 		}
-		return rewriteSnapshotCfgRefs(body, func(raw string) (string, error) {
+		body, err = rewriteSnapshotLayerRefs(body, func(raw string) (string, error) {
 			if replacement, ok := bundleRefReplacements[raw]; ok {
 				return replacement, nil
 			}
 			return raw, nil
 		})
+		if err != nil {
+			return nil, err
+		}
+		if err := validateBundleSnapshotCfg(body); err != nil {
+			return nil, err
+		}
+		return body, nil
 	}
 
 	// opts.SandboxID is always populated by the run path (generated when the
@@ -1682,104 +1723,361 @@ func validatePortableMemoryRefs(refs []string) error {
 	return nil
 }
 
-func prepareBundleRefReplacements(
+type bundlePlanImport struct {
+	raw    string
+	label  string
+	opened *artifact.OpenedFile
+}
+
+type snapshotBundlePlan struct {
+	admission    store.WriteAdmission
+	refs         []string
+	replacements map[string]string
+	imports      []bundlePlanImport
+	closed       bool
+}
+
+func (p *snapshotBundlePlan) Refs() []string {
+	if p == nil {
+		return nil
+	}
+	return append([]string(nil), p.refs...)
+}
+
+func (p *snapshotBundlePlan) Ingest(ctx context.Context, sink *snapshot.BundleSink, logf func(string, ...any)) (map[string]string, error) {
+	if p == nil || sink == nil {
+		return nil, fmt.Errorf("snapshot Bundle plan or sink is unavailable")
+	}
+	if sink.Admission() != p.admission {
+		return nil, fmt.Errorf("snapshot Bundle plan admission changed before ingest")
+	}
+	for index := range p.imports {
+		item := &p.imports[index]
+		if item.opened == nil {
+			continue
+		}
+		key, ingestErr := sink.IngestStream(ctx, item.opened, item.label)
+		closeErr := item.opened.Close()
+		item.opened = nil
+		if ingestErr != nil || closeErr != nil {
+			return nil, errors.Join(ingestErr, closeErr)
+		}
+		p.replacements[item.raw] = "manifest://" + manifest.HexKey(key)
+		if logf != nil {
+			logf("bundle: collected %s as Manifest %s", item.label, manifest.HexKey(key))
+		}
+	}
+	return cloneStringMap(p.replacements), nil
+}
+
+func (p *snapshotBundlePlan) Close() error {
+	if p == nil || p.closed {
+		return nil
+	}
+	p.closed = true
+	var closeErr error
+	for index := range p.imports {
+		if p.imports[index].opened != nil {
+			closeErr = errors.Join(closeErr, p.imports[index].opened.Close())
+			p.imports[index].opened = nil
+		}
+	}
+	return closeErr
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func prepareSnapshotBundlePlan(
 	ctx context.Context,
-	sink *snapshot.BundleSink,
 	opts RunOptions,
 	memoryFromRefs []string,
 	diskMerged []bool,
 	outputDir string,
-	logf func(string, ...any),
-) (map[string]string, error) {
-	if sink == nil {
-		return nil, fmt.Errorf("snapshot Bundle sink is unavailable")
+	admission store.WriteAdmission,
+) (_ *snapshotBundlePlan, retErr error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	placeholderRefs := make([]string, len(diskMerged))
-	for i := range placeholderRefs {
-		var key store.ContentKey
-		key[len(key)-1] = byte(i + 1)
-		placeholderRefs[i] = "manifest://" + manifest.HexKey(key)
-	}
-	probe, err := buildSnapshotCfg(opts.Cfg, placeholderRefs, memoryFromRefs, diskMerged)
+	logicalRefs, err := snapshotLayerDependencyRefs(opts.Cfg, memoryFromRefs, diskMerged)
 	if err != nil {
 		return nil, err
 	}
-	var refs []string
-	if _, err := rewriteSnapshotCfgRefs(probe, func(raw string) (string, error) {
-		refs = append(refs, raw)
-		return raw, nil
-	}); err != nil {
-		return nil, err
-	}
 
+	plan := &snapshotBundlePlan{admission: admission, replacements: make(map[string]string)}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, plan.Close())
+		}
+	}()
 	knownPaths := bundleKnownRefPaths(opts)
-	replacements := make(map[string]string)
-	for _, raw := range refs {
-		if raw == "" || raw == opts.Cfg.SnapshotRefs.RuntimeRef {
-			// The PMEM runtime is a host platform artifact, not a sparse
-			// snapshot layer; its existing file identity/host override contract
-			// remains unchanged.
+	seenLogical := make(map[string]struct{}, len(logicalRefs))
+	usedSources := make(map[string]string)
+	var discoveryOrder []string
+	markSource := func(raw, path string) {
+		if _, seen := usedSources[raw]; !seen {
+			discoveryOrder = append(discoveryOrder, raw)
+		}
+		usedSources[raw] = path
+	}
+	for _, raw := range logicalRefs {
+		if _, seen := seenLogical[raw]; seen {
 			continue
 		}
+		seenLogical[raw] = struct{}{}
 		ref, err := manifest.ParseRef(raw)
 		if err != nil {
 			return nil, fmt.Errorf("snapshot Bundle ref %q: %w", raw, err)
-		}
-		if _, done := replacements[raw]; done {
-			continue
 		}
 		if ref.Scheme == manifest.RefSchemeManifest {
 			key, err := manifest.ParseHexKey(ref.Path)
 			if err != nil {
 				return nil, err
 			}
-			if opts.BundleReader == nil || !opts.BundleReader.HasManifest(key) {
-				continue
-			}
-			manifestRef, err := importBundleManifest(ctx, sink, key, opts, logf)
+			sourceRef, sourcePath, found, err := bundleSourceForManifest(ctx, key, opts)
 			if err != nil {
-				return nil, fmt.Errorf("snapshot Bundle collect local Manifest %q: %w", raw, err)
+				return nil, fmt.Errorf("snapshot Bundle source for %q: %w", raw, err)
 			}
-			replacements[raw] = manifestRef
+			if found {
+				markSource(sourceRef, sourcePath)
+			}
 			continue
 		}
-		if ref.Portable() {
-			continue
-		}
-		path, err := resolveBundleImportPath(ref, raw, knownPaths, opts.Cfg.SnapshotProvenance, outputDir)
+		path, err := resolveBundleArtifactPath(ref, raw, knownPaths, opts.Cfg.SnapshotProvenance, outputDir, opts.RefLocations)
 		if err != nil {
 			return nil, err
 		}
-		manifestRef, err := importBundleFileRef(ctx, sink, path, ref, opts, logf)
+		format, err := artifact.DetectFileFormat(path)
 		if err != nil {
-			return nil, fmt.Errorf("snapshot Bundle collect %q: %w", raw, err)
+			return nil, err
 		}
-		replacements[raw] = manifestRef
+		if format == artifact.FileFormatManifestBundle {
+			reader, err := manifestbundle.Open(path)
+			if err != nil {
+				return nil, err
+			}
+			key, keyErr := artifact.BundleRootKey(path, ref)
+			if keyErr == nil && !reader.HasManifest(key) {
+				keyErr = fmt.Errorf("root Manifest %s is absent from explicit Bundle", manifest.HexKey(key))
+			}
+			closeErr := reader.Close()
+			if keyErr != nil || closeErr != nil {
+				return nil, errors.Join(keyErr, closeErr)
+			}
+			sourceRef, sourcePath, err := canonicalBundleSource(path, ref)
+			if err != nil {
+				return nil, err
+			}
+			markSource(sourceRef, sourcePath)
+			plan.replacements[raw] = "manifest://" + manifest.HexKey(key)
+			continue
+		}
+		opened, err := artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
+			opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot Bundle open local layer %q: %w", raw, err)
+		}
+		plan.imports = append(plan.imports, bundlePlanImport{
+			raw: raw, label: "local layer " + filepath.Base(path), opened: opened,
+		})
 	}
 
-	// Prove the rendered root will not retain an unlocated local snapshot
-	// layer. This is metadata-only; all collection I/O above completed before
-	// guest quiesce.
-	_, err = rewriteSnapshotCfgRefs(probe, func(raw string) (string, error) {
-		if replacement, ok := replacements[raw]; ok {
-			raw = replacement
+	preferred := make([]string, 0, len(discoveryOrder))
+	if source := opts.Cfg.SnapshotProvenance.BundleSource; source != nil {
+		preferred = append(preferred, source.RootRef)
+		preferred = append(preferred, source.Refs...)
+	}
+	preferred = append(preferred, discoveryOrder...)
+	seenSources := make(map[string]struct{}, len(preferred))
+	ordered := make([]string, 0, len(usedSources))
+	for _, raw := range preferred {
+		if _, used := usedSources[raw]; !used {
+			continue
 		}
-		if raw == "" || raw == opts.Cfg.SnapshotRefs.RuntimeRef {
-			return raw, nil
+		if _, duplicate := seenSources[raw]; duplicate {
+			continue
 		}
+		seenSources[raw] = struct{}{}
+		ordered = append(ordered, raw)
+	}
+	if _, err := manifestbundle.EncodeRefs(ordered); err != nil {
+		return nil, err
+	}
+	for _, raw := range ordered {
 		ref, err := manifest.ParseRef(raw)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		if ref.Scheme == manifest.RefSchemeFile && !ref.Portable() {
-			return "", fmt.Errorf("Bundle snapshot.cfg retains unlocated local ref %q", raw)
+		if ref.Location == "" {
+			if err := ensureBundleSibling(ctx, usedSources[raw], outputDir, ref.Path); err != nil {
+				return nil, fmt.Errorf("snapshot Bundle prepare sibling %q: %w", raw, err)
+			}
 		}
-		return raw, nil
-	})
+	}
+	plan.refs = append([]string(nil), ordered...)
+	return plan, nil
+}
+
+func snapshotLayerDependencyRefs(cfg *config.SandboxConfig, memoryFromRefs []string, diskMerged []bool) ([]string, error) {
+	placeholderRefs := make([]string, len(diskMerged))
+	probe, err := buildSnapshotCfg(cfg, placeholderRefs, memoryFromRefs, diskMerged)
 	if err != nil {
 		return nil, err
 	}
-	return replacements, nil
+	var refs []string
+	if _, err := rewriteSnapshotLayerRefs(probe, func(raw string) (string, error) {
+		refs = append(refs, raw)
+		return raw, nil
+	}); err != nil {
+		return nil, err
+	}
+	return refs, nil
+}
+
+func validateNonBundleSnapshotSources(ctx context.Context, opts RunOptions, memoryFromRefs []string, diskMerged []bool) error {
+	refs, err := snapshotLayerDependencyRefs(opts.Cfg, memoryFromRefs, diskMerged)
+	if err != nil {
+		return err
+	}
+	seen := make(map[store.ContentKey]struct{})
+	for _, raw := range refs {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return fmt.Errorf("snapshot dependency %q: %w", raw, err)
+		}
+		if ref.Scheme != manifest.RefSchemeManifest {
+			continue
+		}
+		key, err := manifest.ParseHexKey(ref.Path)
+		if err != nil {
+			return err
+		}
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		_, _, bundled, err := bundleSourceForManifest(ctx, key, opts)
+		if err != nil {
+			return fmt.Errorf("snapshot source for Manifest %s: %w", manifest.HexKey(key), err)
+		}
+		if bundled {
+			return fmt.Errorf("non-Bundle snapshot cannot retain Bundle-selected Manifest %s without bundle/refs; use --mode=bundle or merge the dependency", manifest.HexKey(key))
+		}
+	}
+	return nil
+}
+
+func bundleSourceForManifest(ctx context.Context, key store.ContentKey, opts RunOptions) (string, string, bool, error) {
+	if opts.BundleFetcher == nil {
+		return "", "", false, nil
+	}
+	source, err := opts.BundleFetcher.SelectManifest(ctx, key)
+	if err != nil {
+		return "", "", false, err
+	}
+	if source.Reader == nil {
+		stream, err := source.OpenManifest(ctx, key)
+		if err != nil {
+			return "", "", false, err
+		}
+		if err := stream.Close(); err != nil {
+			return "", "", false, err
+		}
+		return "", "", false, nil
+	}
+	bundleSource := opts.Cfg.SnapshotProvenance.BundleSource
+	if bundleSource == nil {
+		return "", "", false, fmt.Errorf("selected Bundle source has no physical provenance")
+	}
+	if source.Reader == opts.BundleReader {
+		return bundleSource.RootRef, bundleSource.RootPath, true, nil
+	}
+	if source.Ref == "" {
+		return "", "", false, fmt.Errorf("selected referenced Bundle has no source ref")
+	}
+	ref, err := manifest.ParseRef(source.Ref)
+	if err != nil {
+		return "", "", false, err
+	}
+	path, err := opts.RefLocations.ResolveFile(ref, filepath.Dir(bundleSource.RootPath))
+	if err != nil {
+		return "", "", false, err
+	}
+	return source.Ref, path, true, nil
+}
+
+func bundleManifestMergeRef(ctx context.Context, raw string, opts RunOptions) (string, bool, error) {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return "", false, err
+	}
+	if ref.Scheme != manifest.RefSchemeManifest {
+		return "", false, nil
+	}
+	key, err := manifest.ParseHexKey(ref.Path)
+	if err != nil {
+		return "", false, err
+	}
+	sourceRef, sourcePath, found, err := bundleSourceForManifest(ctx, key, opts)
+	if err != nil || !found {
+		return "", false, err
+	}
+	physical, err := manifest.ParseRef(sourceRef)
+	if err != nil {
+		return "", false, err
+	}
+	if physical.Location == "" {
+		physical.Path, err = filepath.Abs(sourcePath)
+		if err != nil {
+			return "", false, err
+		}
+	}
+	physical.DigestScheme = "manifest"
+	physical.Digest = manifest.HexKey(key)
+	if err := physical.Validate(); err != nil {
+		return "", false, err
+	}
+	return physical.String(), true, nil
+}
+
+func canonicalBundleSource(path string, ref manifest.Ref) (string, string, error) {
+	if ref.Scheme != manifest.RefSchemeFile {
+		return "", "", fmt.Errorf("Bundle source must use file://")
+	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
+	realPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", "", err
+	}
+	realPath, err = filepath.Abs(realPath)
+	if err != nil {
+		return "", "", err
+	}
+	ref.DigestScheme = ""
+	ref.Digest = ""
+	if ref.Location != "" {
+		locationDir, err := filepath.EvalSymlinks(filepath.Dir(path))
+		if err != nil {
+			return "", "", err
+		}
+		if filepath.Clean(locationDir) != filepath.Clean(filepath.Dir(realPath)) {
+			return "", "", fmt.Errorf("located Bundle alias target must remain in the same location directory")
+		}
+	}
+	ref.Path = filepath.Base(realPath)
+	raw := ref.String()
+	if _, err := manifestbundle.EncodeRefs([]string{raw}); err != nil {
+		return "", "", err
+	}
+	return raw, realPath, nil
 }
 
 func bundleKnownRefPaths(opts RunOptions) map[string]string {
@@ -1824,8 +2122,15 @@ func bundleKnownRefPaths(opts RunOptions) map[string]string {
 	return paths
 }
 
-func resolveBundleImportPath(ref manifest.Ref, raw string, known map[string]string, provenance config.SnapshotProvenance, outputDir string) (string, error) {
+func resolveBundleArtifactPath(ref manifest.Ref, raw string, known map[string]string, provenance config.SnapshotProvenance, outputDir string, locations config.RefLocations) (string, error) {
 	if path := known[raw]; path != "" {
+		return path, nil
+	}
+	if ref.Location != "" {
+		path, err := locations.ResolveFile(ref, "")
+		if err != nil {
+			return "", err
+		}
 		return path, nil
 	}
 	if filepath.IsAbs(ref.Path) {
@@ -1848,58 +2153,138 @@ func resolveBundleImportPath(ref manifest.Ref, raw string, known map[string]stri
 	return "", fmt.Errorf("snapshot Bundle cannot resolve unlocated local ref %q before pause", raw)
 }
 
-func importBundleFileRef(ctx context.Context, sink *snapshot.BundleSink, path string, ref manifest.Ref, opts RunOptions, logf func(string, ...any)) (result string, retErr error) {
-	opened, err := artifact.OpenFile(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
-		opts.Fetcher, opts.LocalCodec, opts.LocalRequired)
+func ensureBundleSibling(ctx context.Context, sourcePath, outputDir, basename string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	realSource, err := filepath.EvalSymlinks(sourcePath)
 	if err != nil {
-		return "", err
+		return err
 	}
-	defer func() {
-		if closeErr := opened.Close(); closeErr != nil {
-			retErr = errors.Join(retErr, closeErr)
-		}
-	}()
-	if key, ok := opened.RootManifestKey(); ok && opened.BundleReader().Admission() == sink.Admission() {
-		if err := sink.CopyManifestFromBundle(ctx, key, opened.BundleReader()); err != nil {
-			return "", err
-		}
-		logf("bundle: copied local parent Manifest %s under matching admission", manifest.HexKey(key))
-		return "manifest://" + manifest.HexKey(key), nil
-	}
-	key, err := sink.IngestStream(ctx, opened, "local ref "+filepath.Base(path))
+	realSource, err = filepath.Abs(realSource)
 	if err != nil {
-		return "", err
+		return err
 	}
-	return "manifest://" + manifest.HexKey(key), nil
+	sourceInfo, err := os.Stat(realSource)
+	if err != nil {
+		return err
+	}
+	if !sourceInfo.Mode().IsRegular() {
+		return fmt.Errorf("source is not a regular file")
+	}
+	destination, err := filepath.Abs(filepath.Join(outputDir, basename))
+	if err != nil {
+		return err
+	}
+	if destinationInfo, statErr := os.Lstat(destination); statErr == nil {
+		if !destinationInfo.Mode().IsRegular() {
+			return fmt.Errorf("destination Bundle sibling is not a regular file")
+		}
+		if os.SameFile(sourceInfo, destinationInfo) {
+			return nil
+		}
+		return requireBundleFilesEqual(ctx, realSource, destination)
+	} else if !os.IsNotExist(statErr) {
+		return statErr
+	}
+
+	temporary, err := os.CreateTemp(outputDir, ".bundle-sibling-*.partial")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o644); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	source, err := os.Open(realSource)
+	if err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	copyErr := copyBundleFile(ctx, temporary, source)
+	copyErr = errors.Join(copyErr, source.Close())
+	if copyErr == nil {
+		copyErr = temporary.Sync()
+	}
+	copyErr = errors.Join(copyErr, temporary.Close())
+	if copyErr != nil {
+		return copyErr
+	}
+	if err := unix.Renameat2(unix.AT_FDCWD, temporaryPath, unix.AT_FDCWD, destination, unix.RENAME_NOREPLACE); err != nil {
+		if !errors.Is(err, unix.EEXIST) {
+			return err
+		}
+		return requireBundleFilesEqual(ctx, realSource, destination)
+	}
+	directory, err := os.Open(outputDir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
 }
 
-func importBundleManifest(ctx context.Context, sink *snapshot.BundleSink, key store.ContentKey, opts RunOptions, logf func(string, ...any)) (result string, retErr error) {
-	if opts.BundleReader == nil || !opts.BundleReader.HasManifest(key) {
-		return "", fmt.Errorf("Manifest %s is not in the restored root Bundle", manifest.HexKey(key))
-	}
-	if opts.BundleReader.Admission() == sink.Admission() {
-		if err := sink.CopyManifestFromBundle(ctx, key, opts.BundleReader); err != nil {
-			return "", err
+func copyBundleFile(ctx context.Context, destination io.Writer, source io.Reader) error {
+	buffer := make([]byte, 128*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		logf("bundle: copied restored local Manifest %s under matching admission", manifest.HexKey(key))
-		return "manifest://" + manifest.HexKey(key), nil
+		n, readErr := source.Read(buffer)
+		if n != 0 {
+			written, writeErr := destination.Write(buffer[:n])
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
 	}
-	if opts.Fetcher == nil {
-		return "", fmt.Errorf("Bundle-scoped Fetcher is unavailable")
-	}
-	stream, err := opts.Fetcher.OpenManifest(ctx, key)
-	if err != nil {
-		return "", err
-	}
-	defer func() { retErr = errors.Join(retErr, stream.Close()) }()
-	newKey, err := sink.IngestStream(ctx, stream, "restored local Manifest "+manifest.HexKey(key))
-	if err != nil {
-		return "", err
-	}
-	return "manifest://" + manifest.HexKey(newKey), nil
 }
 
-func rewriteSnapshotCfgRefs(body []byte, transform func(string) (string, error)) ([]byte, error) {
+func requireBundleFilesEqual(ctx context.Context, sourcePath, destinationPath string) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	destination, err := os.OpenFile(destinationPath, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer destination.Close()
+	left := make([]byte, 128*1024)
+	right := make([]byte, len(left))
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		leftN, leftErr := io.ReadFull(source, left)
+		rightN, rightErr := io.ReadFull(destination, right)
+		if leftN != rightN || !bytes.Equal(left[:leftN], right[:rightN]) {
+			return fmt.Errorf("destination Bundle bytes differ from source")
+		}
+		if leftErr == io.EOF || leftErr == io.ErrUnexpectedEOF {
+			if rightErr != leftErr {
+				return fmt.Errorf("destination Bundle size differs from source")
+			}
+			return nil
+		}
+		if leftErr != nil || rightErr != nil {
+			return errors.Join(leftErr, rightErr)
+		}
+	}
+}
+
+func rewriteSnapshotLayerRefs(body []byte, transform func(string) (string, error)) ([]byte, error) {
 	var doc snapshotCfgYAML
 	if err := yaml.Unmarshal(body, &doc); err != nil {
 		return nil, fmt.Errorf("snapshot.cfg ref rewrite: %w", err)
@@ -1924,9 +2309,6 @@ func rewriteSnapshotCfgRefs(body []byte, transform func(string) (string, error))
 		return nil
 	}
 	rewriteNode := func(node *diskNodeYAML) error {
-		if err := rewrite(&node.BaseRef); err != nil {
-			return err
-		}
 		if err := rewrite(&node.Base); err != nil {
 			return err
 		}
@@ -1941,9 +2323,6 @@ func rewriteSnapshotCfgRefs(body []byte, transform func(string) (string, error))
 		}
 		return rewriteList(node.Overlay.BaseFromRefs)
 	}
-	if err := rewrite(&doc.Boot.RuntimeRef); err != nil {
-		return nil, err
-	}
 	if err := rewriteList(doc.FromRefs); err != nil {
 		return nil, err
 	}
@@ -1956,6 +2335,20 @@ func rewriteSnapshotCfgRefs(body []byte, transform func(string) (string, error))
 		}
 	}
 	return yaml.Marshal(&doc)
+}
+
+func validateBundleSnapshotCfg(body []byte) error {
+	_, err := rewriteSnapshotLayerRefs(body, func(raw string) (string, error) {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return "", err
+		}
+		if ref.Scheme != manifest.RefSchemeManifest {
+			return "", fmt.Errorf("Bundle snapshot.cfg snapshot-layer ref %q is not manifest://", raw)
+		}
+		return raw, nil
+	})
+	return err
 }
 
 // snapshotMemoryRefs returns the memory lowers retained by the next snapshot.

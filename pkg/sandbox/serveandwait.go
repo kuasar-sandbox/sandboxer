@@ -147,6 +147,7 @@ type VMParams struct {
 	ManifestCfg   *config.ManifestConfig
 	Fetcher       fetch.Fetcher
 	BundleReader  *manifestbundle.Reader
+	BundleFetcher *manifestbundle.ManifestFetcher
 	RefLocations  config.RefLocations
 	CustomerKeyFn ingest.CustomerKeyFunc
 	LocalCodec    tarstream.Codec
@@ -467,6 +468,7 @@ func ServeAndWait(p VMParams) (int, error) {
 		ManifestCfg:   p.ManifestCfg,
 		Fetcher:       p.Fetcher,
 		BundleReader:  p.BundleReader,
+		BundleFetcher: p.BundleFetcher,
 		RefLocations:  p.RefLocations,
 		CustomerKeyFn: p.CustomerKeyFn,
 		LocalCodec:    p.LocalCodec,

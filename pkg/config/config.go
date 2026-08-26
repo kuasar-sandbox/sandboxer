@@ -148,8 +148,8 @@ type SnapshotProvenance struct {
 	ParentBaseFromRefs []string // parent's overlay.base_from_refs (disk chain below it)
 
 	// ParentSnapshot/OverlayPath are the absolute paths of the parent's local
-	// bundle + overlay files, set ONLY when this run was restored from a LOCAL
-	// file:// snapshot. They let a re-export MERGE this run's resident delta onto
+	// tarstream snapshot + overlay files, set ONLY when this run was restored
+	// from that LOCAL representation. They let a re-export MERGE the resident delta onto
 	// the parent local layer (replacing it) instead of stacking a second local
 	// layer — keeping the local-layer depth at 1 (docs/sandbox.md §3.5). Empty
 	// for manifest:// / cold-start restores (which stack via ParentSnapshotRef).
@@ -161,6 +161,19 @@ type SnapshotProvenance struct {
 	// Empty on cold start. Populated by restore from the parent snapshot.cfg's
 	// boot.disks[].
 	ParentDisks []DiskProvenance
+
+	// BundleSource is physical lookup state kept separately from the logical
+	// manifest:// provenance above. It is runtime-only and never serialized
+	// into snapshot.cfg.
+	BundleSource *BundleSourceProvenance
+}
+
+// BundleSourceProvenance identifies the restored current Bundle and its flat
+// ordered refs without adding a physical selector to the logical graph.
+type BundleSourceProvenance struct {
+	RootRef  string   // file://<basename>.bundle, optionally @location; no @manifest
+	RootPath string   // resolved host path used for sibling preparation and merge
+	Refs     []string // immutable copy of the current Bundle's flat ordered refs
 }
 
 // DiskProvenance is one data disk's parent (restored-from) chain — the

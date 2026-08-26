@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +25,7 @@ import (
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
@@ -93,6 +96,44 @@ func TestValidateLocalMemoryRefsRejectsNonRegularFiles(t *testing.T) {
 				t.Fatalf("non-regular local memory ref error = %v", err)
 			}
 		})
+	}
+}
+
+func TestCanonicalBundleSourceNormalizesLocatedAlias(t *testing.T) {
+	dir := t.TempDir()
+	key := strings.Repeat("b", 64)
+	bundleName := key + ".bundle"
+	bundlePath := filepath.Join(dir, bundleName)
+	if err := os.WriteFile(bundlePath, []byte("bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aliasPath := filepath.Join(dir, "lower.snapshot")
+	if err := os.Symlink(bundleName, aliasPath); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := manifest.ParseRef("file://lower.snapshot@manifest:" + key + "@location:A")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, real, err := canonicalBundleSource(aliasPath, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "file://" + bundleName + "@location:A"; got != want {
+		t.Fatalf("source = %q, want %q", got, want)
+	}
+	if real != bundlePath {
+		t.Fatalf("real path = %q, want %q", real, bundlePath)
+	}
+
+	noncanonicalPath := filepath.Join(dir, "regular.snapshot")
+	if err := os.WriteFile(noncanonicalPath, []byte("bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ref.Path = filepath.Base(noncanonicalPath)
+	if _, _, err := canonicalBundleSource(noncanonicalPath, ref); err == nil {
+		t.Fatal("noncanonical located Bundle source was accepted")
 	}
 }
 
@@ -192,7 +233,7 @@ func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
 	}
 }
 
-func TestImportBundleParentCopiesMatchingAdmissionAndReingestsDifferentAdmission(t *testing.T) {
+func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 	customerKey := [32]byte{0x71, 0x72, 0x73}
 	keyFn := func() ([32]byte, error) { return customerKey, nil }
 	configFor := func(generation string) *manifest.Config {
@@ -214,6 +255,10 @@ func TestImportBundleParentCopiesMatchingAdmissionAndReingestsDifferentAdmission
 	if err != nil {
 		t.Fatal(err)
 	}
+	baseRef, _, err := parent.AbsorbOverlay(context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x30}, 8192)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	parentRef, parentPath, err := parent.AbsorbBundle(context.Background(),
 		bytes.NewReader(bytes.Repeat([]byte{0x31}, 8192)), nil, bytes.NewReader(inner))
 	if err != nil {
@@ -230,135 +275,86 @@ func TestImportBundleParentCopiesMatchingAdmissionAndReingestsDifferentAdmission
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	for _, test := range []struct {
-		name       string
-		generation string
-		wantExact  bool
-	}{
-		{name: "matching admission copies exact objects", generation: "G1", wantExact: true},
-		{name: "different admission reingests plaintext", generation: "G2", wantExact: false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			childDir := t.TempDir()
-			childCfg := configFor(test.generation)
-			child, err := snapshot.NewBundleSink(context.Background(), childDir, "child", childCfg, keyFn, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = child.Close() })
-			importedRef, err := importBundleFileRef(context.Background(), child, parentPath, selector,
-				RunOptions{ManifestCfg: childCfg, CustomerKeyFn: keyFn}, discardLogf)
-			if err != nil {
-				t.Fatal(err)
-			}
-			importedKey, err := manifest.ParseKeyRef(importedRef)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if (importedKey == parentKey) != test.wantExact {
-				t.Fatalf("imported key = %s, parent = %s, wantExact=%v",
-					manifest.HexKey(importedKey), manifest.HexKey(parentKey), test.wantExact)
-			}
-			_, childPath, err := child.AbsorbBundle(context.Background(),
-				bytes.NewReader(bytes.Repeat([]byte{0x41}, 8192)), nil, bytes.NewReader(inner))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := child.Close(); err != nil {
-				t.Fatal(err)
-			}
-			reader, err := manifestbundle.Open(childPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer reader.Close()
-			if !reader.HasManifest(importedKey) {
-				t.Fatalf("child Bundle omitted imported Manifest %s", manifest.HexKey(importedKey))
-			}
-		})
-	}
-}
-
-func TestPrepareBundleRefReplacementsCollectsManifestOwnedByRestoredBundle(t *testing.T) {
-	customerKey := [32]byte{0x81, 0x82, 0x83}
-	keyFn := func() ([32]byte, error) { return customerKey, nil }
-	manifestCfg := &manifest.Config{
-		Manifest: manifest.ManifestSubConfig{WriteGeneration: "G1"},
-		Chunker:  chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
-		Crypto:   manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
-	}
-	inner, err := snapshot.BuildZIP(map[string][]byte{
-		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	parentDir := t.TempDir()
-	parent, err := snapshot.NewBundleSink(context.Background(), parentDir, "parent-base", manifestCfg, keyFn, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseRef, _, err := parent.AbsorbOverlay(context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x51}, 8192)), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rootRef, parentPath, err := parent.AbsorbBundle(context.Background(),
-		bytes.NewReader(bytes.Repeat([]byte{0x52}, 8192)), nil, bytes.NewReader(inner))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := parent.Close(); err != nil {
-		t.Fatal(err)
-	}
-	rootKey, err := manifest.ParseKeyRef(rootRef)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rootSelector, err := manifest.ParseRef("file://" + parentPath + "@manifest:" + manifest.HexKey(rootKey))
-	if err != nil {
-		t.Fatal(err)
-	}
-	opened, err := artifact.OpenFile(context.Background(), parentPath, rootSelector,
-		manifestCfg, keyFn, nil, nil, false)
+	opened, err := artifact.OpenFile(context.Background(), parentPath, selector,
+		parentCfg, keyFn, nil, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer opened.Close()
 
 	childDir := t.TempDir()
-	child, err := snapshot.NewBundleSink(context.Background(), childDir, "child-base", manifestCfg, keyFn, nil)
+	childCfg := configFor("G2")
+	admission, err := childCfg.WriteAdmission(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = child.Close() })
 	sandboxCfg := &config.SandboxConfig{}
 	sandboxCfg.Resources.Capacity.Memory = "8KiB"
 	sandboxCfg.Boot.Root.Overlay = &config.OverlayConfig{}
-	sandboxCfg.SnapshotRefs.BaseRef = baseRef
-	replacements, err := prepareBundleRefReplacements(context.Background(), child, RunOptions{
+	sandboxCfg.SnapshotProvenance = config.SnapshotProvenance{
+		ParentSnapshotRef: parentRef,
+		ParentOverlayBase: baseRef,
+		BundleSource: &config.BundleSourceProvenance{
+			RootRef: "file://" + filepath.Base(parentPath), RootPath: parentPath,
+		},
+	}
+	runOpts := RunOptions{
 		Cfg:           sandboxCfg,
-		ManifestCfg:   manifestCfg,
+		ManifestCfg:   childCfg,
 		Fetcher:       opened.ScopedFetcher(),
 		BundleReader:  opened.BundleReader(),
+		BundleFetcher: opened.ManifestFetcher(),
 		CustomerKeyFn: keyFn,
-	}, nil, []bool{false}, childDir, discardLogf)
+	}
+	if err := validateNonBundleSnapshotSources(context.Background(), runOpts,
+		[]string{parentRef}, []bool{false}); err == nil || !strings.Contains(err.Error(), "without bundle/refs") {
+		t.Fatalf("non-Bundle retained source error = %v", err)
+	}
+	if err := validateNonBundleSnapshotSources(context.Background(), runOpts,
+		nil, []bool{true}); err != nil {
+		t.Fatalf("fully merged non-Bundle source validation: %v", err)
+	}
+	rootSource, err := opened.ManifestFetcher().SelectRoot(parentKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replacements[baseRef] != baseRef {
-		t.Fatalf("local Bundle base replacement = %q, want exact %q", replacements[baseRef], baseRef)
+	remote := &failingManifestFetcher{}
+	remoteOpts := runOpts
+	remoteOpts.BundleFetcher = manifestbundle.NewManifestFetcher(opened.BundleReader(), rootSource.Fetcher, remote)
+	if _, _, _, err := bundleSourceForManifest(context.Background(), store.ContentKey{0xff}, remoteOpts); err == nil || remote.calls != 1 {
+		t.Fatalf("remote source confirmation error = %v, calls=%d", err, remote.calls)
+	}
+	plan, err := prepareSnapshotBundlePlan(context.Background(), runOpts,
+		[]string{parentRef}, []bool{false}, childDir, admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	wantSource := "file://" + filepath.Base(parentPath)
+	if got := plan.Refs(); !reflect.DeepEqual(got, []string{wantSource}) {
+		t.Fatalf("plan refs = %v, want [%s]", got, wantSource)
+	}
+	if err := requireBundleFilesEqual(context.Background(), parentPath, filepath.Join(childDir, filepath.Base(parentPath))); err != nil {
+		t.Fatalf("prepared sibling: %v", err)
+	}
+	child, err := snapshot.NewPlannedBundleSink(childDir, "child", childCfg, keyFn, admission, plan.Refs(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	replacements, err := plan.Ingest(context.Background(), child, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replacements) != 0 {
+		t.Fatalf("Bundle parent was unexpectedly reingested: %v", replacements)
 	}
 	_, childPath, err := child.AbsorbBundle(context.Background(),
-		bytes.NewReader(bytes.Repeat([]byte{0x53}, 8192)), nil, bytes.NewReader(inner))
+		bytes.NewReader(bytes.Repeat([]byte{0x41}, 8192)), nil, bytes.NewReader(inner))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := child.Close(); err != nil {
-		t.Fatal(err)
-	}
-	baseKey, err := manifest.ParseKeyRef(baseRef)
-	if err != nil {
 		t.Fatal(err)
 	}
 	reader, err := manifestbundle.Open(childPath)
@@ -366,8 +362,201 @@ func TestPrepareBundleRefReplacementsCollectsManifestOwnedByRestoredBundle(t *te
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	if !reader.HasManifest(baseKey) {
-		t.Fatalf("child Bundle left restored local base %s as a false remote dependency", manifest.HexKey(baseKey))
+	if got := reader.Refs(); !reflect.DeepEqual(got, []string{wantSource}) {
+		t.Fatalf("child refs = %v", got)
+	}
+	if reader.HasManifest(parentKey) {
+		t.Fatal("child copied parent root instead of retaining an external Bundle source")
+	}
+
+	mergedPlan, err := prepareSnapshotBundlePlan(context.Background(), runOpts,
+		nil, []bool{true}, t.TempDir(), admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mergedPlan.Close()
+	if refs := mergedPlan.Refs(); len(refs) != 0 {
+		t.Fatalf("merged and unreachable parent source remained in refs: %v", refs)
+	}
+}
+
+type failingManifestFetcher struct {
+	calls int
+}
+
+func (f *failingManifestFetcher) OpenManifest(context.Context, store.ContentKey) (fetch.Stream, error) {
+	f.calls++
+	return nil, errors.New("remote Manifest missing")
+}
+
+func TestPrepareSnapshotBundlePlanFlattensOnlyReachableSources(t *testing.T) {
+	customerKey := [32]byte{0x74, 0x75, 0x76}
+	keyFn := func() ([32]byte, error) { return customerKey, nil }
+	manifestCfg := &manifest.Config{
+		Manifest: manifest.ManifestSubConfig{WriteGeneration: "G1"},
+		Chunker:  chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:   manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+	makeBundle := func(directory, sid string, refs []string, fill byte, withOverlay bool) (string, string, string) {
+		t.Helper()
+		admission, err := manifestCfg.WriteAdmission(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		sink, err := snapshot.NewPlannedBundleSink(directory, sid, manifestCfg, keyFn, admission, refs, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var overlayRef string
+		if withOverlay {
+			overlayRef, _, err = sink.AbsorbOverlay(context.Background(), bytes.NewReader(bytes.Repeat([]byte{fill}, 8192)), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		inner, err := snapshot.BuildZIP(map[string][]byte{
+			"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rootRef, path, err := sink.AbsorbBundle(context.Background(),
+			bytes.NewReader(bytes.Repeat([]byte{fill + 1}, 8192)), nil, bytes.NewReader(inner))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sink.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return rootRef, path, overlayRef
+	}
+	dirA, dirB := t.TempDir(), t.TempDir()
+	_, pathA, _ := makeBundle(dirA, "unused-a", nil, 0x21, false)
+	_, pathB, layerB := makeBundle(dirB, "used-b", nil, 0x31, true)
+	refA := "file://" + filepath.Base(pathA) + "@location:A"
+	refB := "file://" + filepath.Base(pathB) + "@location:B"
+	parentDir := t.TempDir()
+	parentRoot, parentPath, _ := makeBundle(parentDir, "parent", []string{refA, refB}, 0x41, false)
+	parentPhysical := "file://" + filepath.Base(parentPath)
+	locations := config.RefLocations{"A": dirA, "B": dirB}
+	selector, err := manifest.ParseRef("file://" + parentPath + "@manifest:" + strings.TrimPrefix(parentRoot, "manifest://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := artifact.OpenFileWithLocations(context.Background(), parentPath, selector,
+		manifestCfg, keyFn, nil, locations, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+
+	sandboxCfg := &config.SandboxConfig{}
+	sandboxCfg.Resources.Capacity.Memory = "8KiB"
+	sandboxCfg.Boot.Root.Overlay = &config.OverlayConfig{}
+	sandboxCfg.SnapshotProvenance = config.SnapshotProvenance{
+		ParentSnapshotRef: parentRoot,
+		ParentOverlayBase: layerB,
+		BundleSource: &config.BundleSourceProvenance{
+			RootRef: parentPhysical, RootPath: parentPath, Refs: opened.BundleReader().Refs(),
+		},
+	}
+	childCfg := *manifestCfg
+	childCfg.Manifest.WriteGeneration = "G2"
+	admission, err := childCfg.WriteAdmission(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	childDir := t.TempDir()
+	plan, err := prepareSnapshotBundlePlan(context.Background(), RunOptions{
+		Cfg: sandboxCfg, ManifestCfg: &childCfg, Fetcher: opened.ScopedFetcher(),
+		BundleReader: opened.BundleReader(), BundleFetcher: opened.ManifestFetcher(),
+		RefLocations: locations, CustomerKeyFn: keyFn,
+	}, []string{parentRoot}, []bool{false}, childDir, admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	want := []string{parentPhysical, refB}
+	if got := plan.Refs(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("flattened refs = %v, want %v", got, want)
+	}
+	if _, err := os.Stat(filepath.Join(childDir, filepath.Base(parentPath))); err != nil {
+		t.Fatalf("direct local parent was not prepared as sibling: %v", err)
+	}
+	if slices.Contains(plan.Refs(), refA) {
+		t.Fatal("unreachable historical Bundle source remained in the new refs")
+	}
+}
+
+func TestPrepareSnapshotBundlePlanIngestsTarstreamParentIntoCurrentAdmission(t *testing.T) {
+	parentDir := t.TempDir()
+	inner, err := snapshot.BuildZIP(map[string][]byte{
+		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentRef, parentPath, err := snapshot.NewFileSink(parentDir, "tar-parent", nil, false, nil).AbsorbBundle(
+		context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x56}, 8192)), nil, bytes.NewReader(inner))
+	if err != nil {
+		t.Fatal(err)
+	}
+	customerKey := [32]byte{0x77, 0x78, 0x79}
+	keyFn := func() ([32]byte, error) { return customerKey, nil }
+	manifestCfg := &manifest.Config{
+		Manifest: manifest.ManifestSubConfig{WriteGeneration: "G2"},
+		Chunker:  chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:   manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+	admission, err := manifestCfg.WriteAdmission(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxCfg := &config.SandboxConfig{}
+	sandboxCfg.Resources.Capacity.Memory = "8KiB"
+	sandboxCfg.Boot.Root.Overlay = &config.OverlayConfig{}
+	sandboxCfg.SnapshotProvenance = config.SnapshotProvenance{
+		ParentSnapshotRef: parentRef, ParentSnapshotPath: parentPath,
+	}
+	outputDir := t.TempDir()
+	plan, err := prepareSnapshotBundlePlan(context.Background(), RunOptions{
+		Cfg: sandboxCfg, ManifestCfg: manifestCfg, CustomerKeyFn: keyFn,
+	}, []string{parentRef}, []bool{false}, outputDir, admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	if refs := plan.Refs(); len(refs) != 0 {
+		t.Fatalf("tarstream parent leaked into bundle/refs: %v", refs)
+	}
+	sink, err := snapshot.NewPlannedBundleSink(outputDir, "tar-child", manifestCfg, keyFn, admission, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacements, err := plan.Ingest(context.Background(), sink, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	importedRef := replacements[parentRef]
+	importedKey, err := manifest.ParseKeyRef(importedRef)
+	if err != nil {
+		t.Fatalf("tarstream replacement = %q: %v", importedRef, err)
+	}
+	_, childPath, err := sink.AbsorbBundle(context.Background(),
+		bytes.NewReader(bytes.Repeat([]byte{0x57}, 8192)), nil, bytes.NewReader(inner))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := manifestbundle.Open(childPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if reader.Admission() != admission || !reader.HasManifest(importedKey) {
+		t.Fatalf("tar parent was not ingested under current admission %v", admission)
 	}
 }
 

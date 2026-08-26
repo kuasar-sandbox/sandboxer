@@ -41,6 +41,8 @@ type OpenedFile struct {
 
 	format        FileFormat
 	scopedFetcher fetch.Fetcher
+	manifestSet   *bundle.ManifestFetcher
+	resolver      *bundleSourceResolver
 	bundleReader  *bundle.Reader
 	rootKey       store.ContentKey
 	digestScheme  string
@@ -53,6 +55,10 @@ type OpenedFile struct {
 func (f *OpenedFile) Format() FileFormat { return f.format }
 
 func (f *OpenedFile) ScopedFetcher() fetch.Fetcher { return f.scopedFetcher }
+
+// ManifestFetcher exposes Manifest-level source selection for callers that
+// must plan a new Bundle or exact Store upload. It is nil for tarstreams.
+func (f *OpenedFile) ManifestFetcher() *bundle.ManifestFetcher { return f.manifestSet }
 
 func (f *OpenedFile) BundleReader() *bundle.Reader { return f.bundleReader }
 
@@ -68,6 +74,9 @@ func (f *OpenedFile) Close() error {
 	f.closeOnce.Do(func() {
 		if f.Stream != nil {
 			f.closeErr = f.Stream.Close()
+		}
+		if f.resolver != nil {
+			f.closeErr = errors.Join(f.closeErr, f.resolver.Close())
 		}
 		if f.bundleReader != nil {
 			f.closeErr = errors.Join(f.closeErr, f.bundleReader.Close())
@@ -89,6 +98,22 @@ func OpenFile(
 	localCodec tarstream.Codec,
 	localRequired bool,
 ) (*OpenedFile, error) {
+	return OpenFileWithLocations(ctx, path, ref, manifestCfg, keyFn, remote, nil, localCodec, localRequired)
+}
+
+// OpenFileWithLocations is OpenFile with the trusted location map required by
+// ordered Bundle refs. Tarstream behavior is unchanged.
+func OpenFileWithLocations(
+	ctx context.Context,
+	path string,
+	ref manifest.Ref,
+	manifestCfg *config.ManifestConfig,
+	keyFn ingest.CustomerKeyFunc,
+	remote fetch.Fetcher,
+	locations config.RefLocations,
+	localCodec tarstream.Codec,
+	localRequired bool,
+) (*OpenedFile, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -107,7 +132,7 @@ func OpenFile(
 		return nil, err
 	}
 	if format == FileFormatManifestBundle {
-		return openManifestBundle(ctx, path, ref, manifestCfg, keyFn, remote)
+		return openManifestBundle(ctx, path, ref, manifestCfg, keyFn, remote, locations)
 	}
 	return openTarstream(path, ref, localCodec, localRequired)
 }
@@ -118,6 +143,15 @@ func (s *ProcessStorage) OpenFile(ctx context.Context, path string, ref manifest
 		return nil, fmt.Errorf("artifact: process storage is required")
 	}
 	return OpenFile(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), s.localCodec, s.localRequired)
+}
+
+// OpenFileWithLocations supplies ordered Bundle refs with trusted named
+// location resolution while retaining ProcessStorage ownership.
+func (s *ProcessStorage) OpenFileWithLocations(ctx context.Context, path string, ref manifest.Ref, locations config.RefLocations) (*OpenedFile, error) {
+	if s == nil {
+		return nil, fmt.Errorf("artifact: process storage is required")
+	}
+	return OpenFileWithLocations(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), locations, s.localCodec, s.localRequired)
 }
 
 // DetectFileFormat performs the non-consuming magic check used by snapshot,
@@ -140,22 +174,34 @@ func DetectFileFormat(path string) (FileFormat, error) {
 	return FileFormatTarstream, nil
 }
 
-func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc, remote fetch.Fetcher) (*OpenedFile, error) {
+func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc, remote fetch.Fetcher, locations config.RefLocations) (*OpenedFile, error) {
 	if ref.DigestScheme != "" && ref.DigestScheme != "manifest" {
 		return nil, fmt.Errorf("manifest Bundle rejects @%s identity", ref.DigestScheme)
 	}
 	if cfg == nil || keyFn == nil {
 		return nil, fmt.Errorf("manifest Bundle requires manifest configuration and customer key")
 	}
-	reader, err := bundle.Open(path)
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, fmt.Errorf("manifest Bundle resolve final path: %w", err)
+	}
+	resolvedPath, err = filepath.Abs(resolvedPath)
+	if err != nil {
+		return nil, fmt.Errorf("manifest Bundle resolve final path: %w", err)
+	}
+	reader, err := bundle.Open(resolvedPath)
 	if err != nil {
 		return nil, err
 	}
+	var resolver *bundleSourceResolver
 	fail := func(err error) (*OpenedFile, error) {
+		if resolver != nil {
+			_ = resolver.Close()
+		}
 		_ = reader.Close()
 		return nil, err
 	}
-	root, err := bundleRootKey(path, ref)
+	root, err := BundleRootKey(resolvedPath, ref)
 	if err != nil {
 		return fail(err)
 	}
@@ -171,20 +217,25 @@ func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg 
 		clear(customerKey[:])
 		return fail(err)
 	}
+	if len(reader.Refs()) != 0 {
+		resolver = newBundleSourceResolver(filepath.Dir(resolvedPath), locations, customerKey, decryptor, verificationOptions(cfg))
+	}
 	local := fetch.NewFetcherWithOptions(customerKey, reader.Getter(), decryptor, verificationOptions(cfg))
 	clear(customerKey[:])
-	scoped := bundle.NewManifestFetcher(reader, local, remote)
-	stream, err := local.OpenManifest(ctx, root)
+	scoped := bundle.NewManifestFetcherWithResolver(reader, local, resolver, remote)
+	stream, err := scoped.OpenRootManifest(ctx, root)
 	if err != nil {
 		return fail(fmt.Errorf("open manifest Bundle root %s: %w", manifest.HexKey(root), err))
 	}
 	return &OpenedFile{
-		Stream: stream, format: FileFormatManifestBundle, scopedFetcher: scoped,
-		bundleReader: reader, rootKey: root,
+		Stream: stream, format: FileFormatManifestBundle, scopedFetcher: scoped, manifestSet: scoped,
+		resolver: resolver, bundleReader: reader, rootKey: root,
 	}, nil
 }
 
-func bundleRootKey(path string, ref manifest.Ref) (store.ContentKey, error) {
+// BundleRootKey resolves an explicit @manifest selector or infers the root
+// from the symlink-resolved <64hex>.bundle filename.
+func BundleRootKey(path string, ref manifest.Ref) (store.ContentKey, error) {
 	if ref.DigestScheme == "manifest" {
 		key, err := manifest.ParseHexKey(ref.Digest)
 		if err != nil {

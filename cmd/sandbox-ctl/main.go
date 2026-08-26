@@ -94,7 +94,7 @@ Usage:
 			[--ref-location name=file:///absolute/path ...] <snapshot-ref|snapshot-path>
 			print a snapshot's embedded snapshot.cfg
 	sandbox-ctl upload-snapshot [--manifest-config <p> | --to-ref-location name=file:///path]
-			[--quiet] <snapshot-path>
+			[--ref-location name=file:///absolute/path ...] [--quiet] <snapshot-path>
 			publish local refs and print the canonical portable root ref (no boot)
 
 --manifest-config (or MANIFEST_CONFIG env) supplies the shared storage

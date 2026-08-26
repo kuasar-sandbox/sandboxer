@@ -23,6 +23,7 @@ import (
 	storeclient "github.com/kuasar-sandbox/accelerator/pkg/store/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"golang.org/x/sys/unix"
@@ -33,6 +34,12 @@ import (
 // refs are upgraded to manifest refs; existing manifest and located file refs
 // remain unchanged.
 func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config, keyFn ingest.CustomerKeyFunc, manifestFetcher fetch.Fetcher, codec tarstream.Codec, required bool, logf func(string, ...any)) (string, error) {
+	return UploadLocalWithLocations(ctx, snapshotPath, mcfg, keyFn, manifestFetcher, nil, codec, required, logf)
+}
+
+// UploadLocalWithLocations is UploadLocal with the trusted mappings needed to
+// resolve located Bundle refs during an exact multi-source upload.
+func UploadLocalWithLocations(ctx context.Context, snapshotPath string, mcfg *manifest.Config, keyFn ingest.CustomerKeyFunc, manifestFetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool, logf func(string, ...any)) (string, error) {
 	if mcfg == nil {
 		return "", fmt.Errorf("manifest config is required")
 	}
@@ -44,7 +51,7 @@ func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config
 		return "", err
 	}
 	if format == artifact.FileFormatManifestBundle {
-		return uploadLocalManifestBundle(ctx, snapshotPath, mcfg, keyFn, manifestFetcher, codec, required, logf)
+		return uploadLocalManifestBundle(ctx, snapshotPath, mcfg, keyFn, locations, codec, required, logf)
 	}
 	ing, err := mcfg.NewIngester(keyFn, nil)
 	if err != nil {
@@ -57,52 +64,10 @@ func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config
 	return p.publishRootSnapshot(snapshotPath, manifest.Ref{})
 }
 
-type admittedExactStore struct {
-	client    *storeclient.Client
-	admission store.WriteAdmission
-}
-
-func (s *admittedExactStore) AdmitWriteFor(ctx context.Context, generation store.Generation) (store.WriteAdmission, error) {
-	if err := ctx.Err(); err != nil {
-		return store.WriteAdmission{}, err
-	}
-	if generation != s.admission.Generation {
-		return store.WriteAdmission{}, fmt.Errorf("pre-admitted generation %q does not match %q", s.admission.Generation, generation)
-	}
-	return s.admission, nil
-}
-
-func (s *admittedExactStore) Put(ctx context.Context, admission store.WriteAdmission, partition store.Partition, key store.ContentKey, data []byte) (bool, error) {
-	if admission != s.admission {
-		return false, fmt.Errorf("upload-snapshot: object admission does not match the pre-admitted Bundle admission")
-	}
-	return s.client.Put(ctx, admission, partition, key, data)
-}
-
-func (s *admittedExactStore) PoolSize() int { return s.client.PoolSize() }
-
-func uploadLocalManifestBundle(ctx context.Context, snapshotPath string, cfg *manifest.Config, keyFn ingest.CustomerKeyFunc, _ fetch.Fetcher, codec tarstream.Codec, required bool, logf func(string, ...any)) (result string, retErr error) {
+func uploadLocalManifestBundle(ctx context.Context, snapshotPath string, cfg *manifest.Config, keyFn ingest.CustomerKeyFunc, locations config.RefLocations, codec tarstream.Codec, required bool, logf func(string, ...any)) (result string, retErr error) {
 	if cfg.Store.Endpoint == "" {
 		return "", fmt.Errorf("manifest store endpoint is required for Bundle upload")
 	}
-	// Upload is an explicit verification operation. Force verification for the
-	// initial root read as well as the complete Reader.Upload pass below, even
-	// when ordinary runtime reads have manifest.verify_content=false.
-	verify := true
-	verifyCfg := *cfg
-	verifyCfg.Manifest.VerifyContent = &verify
-	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: snapshotPath}
-	opened, err := artifact.OpenFile(ctx, snapshotPath, ref, &verifyCfg, keyFn, nil, codec, required)
-	if err != nil {
-		return "", err
-	}
-	defer func() { retErr = errors.Join(retErr, opened.Close()) }()
-	root, ok := opened.RootManifestKey()
-	if !ok {
-		return "", fmt.Errorf("upload-snapshot: input is not a Manifest Bundle")
-	}
-	reader := opened.BundleReader()
-
 	timeout, err := parseManifestStoreTimeout(cfg.Store.Timeout)
 	if err != nil {
 		return "", err
@@ -112,23 +77,6 @@ func uploadLocalManifestBundle(ctx context.Context, snapshotPath string, cfg *ma
 		return "", fmt.Errorf("upload-snapshot: dial target Store: %w", err)
 	}
 	defer func() { retErr = errors.Join(retErr, client.Close()) }()
-	accepted, err := client.AdmitWriteFor(ctx, reader.Admission().Generation)
-	if err != nil {
-		return "", fmt.Errorf("upload-snapshot: target admission for generation %q: %w", reader.Admission().Generation, err)
-	}
-	if accepted != reader.Admission() {
-		return "", fmt.Errorf("upload-snapshot: target admission does not exactly match Bundle admission")
-	}
-	target := &admittedExactStore{client: client, admission: accepted}
-
-	_, parsed, err := readSnapshotEntries(ctx, opened, int64(opened.Size()))
-	if err != nil {
-		return "", err
-	}
-	expected, external, err := bundleManifestReachability(parsed, reader, root)
-	if err != nil {
-		return "", err
-	}
 	customerKey, err := keyFn()
 	if err != nil {
 		return "", err
@@ -139,22 +87,62 @@ func uploadLocalManifestBundle(ctx context.Context, snapshotPath string, cfg *ma
 		return "", err
 	}
 	remote := fetch.NewFetcherWithOptions(customerKey, cache.NewStoreOrigin(client), decryptor, fetch.Options{VerifyContent: true})
-	for _, key := range external {
-		stream, err := remote.OpenManifest(ctx, key)
+
+	// Upload is an explicit verification operation. Force verification for the
+	// initial root read and every selected source, even
+	// when ordinary runtime reads have manifest.verify_content=false.
+	verify := true
+	verifyCfg := *cfg
+	verifyCfg.Manifest.VerifyContent = &verify
+	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: snapshotPath}
+	opened, err := artifact.OpenFileWithLocations(ctx, snapshotPath, ref, &verifyCfg, keyFn, remote, locations, codec, required)
+	if err != nil {
+		return "", err
+	}
+	defer func() { retErr = errors.Join(retErr, opened.Close()) }()
+	root, ok := opened.RootManifestKey()
+	if !ok {
+		return "", fmt.Errorf("upload-snapshot: input is not a Manifest Bundle")
+	}
+
+	_, parsed, err := readSnapshotEntries(ctx, opened, int64(opened.Size()))
+	if err != nil {
+		return "", err
+	}
+	dependencies, err := snapshotLayerManifestKeys(parsed, root)
+	if err != nil {
+		return "", err
+	}
+	rootSource, err := opened.ManifestFetcher().SelectRoot(root)
+	if err != nil {
+		return "", err
+	}
+	exactDependencies := make([]manifestbundle.ExactManifest, 0, len(dependencies))
+	for _, key := range dependencies {
+		source, err := opened.ManifestFetcher().SelectManifest(ctx, key)
 		if err != nil {
-			return "", fmt.Errorf("upload-snapshot: external Manifest %s is unavailable from target Store: %w", manifest.HexKey(key), err)
+			return "", fmt.Errorf("upload-snapshot: resolve Manifest %s: %w", manifest.HexKey(key), err)
 		}
-		if err := stream.Close(); err != nil {
-			return "", err
+		if source.Reader != nil {
+			exactDependencies = append(exactDependencies, manifestbundle.ExactManifest{Key: key, Reader: source.Reader})
+			continue
+		}
+		stream, err := source.OpenManifest(ctx, key)
+		if err != nil {
+			return "", fmt.Errorf("upload-snapshot: remote Manifest %s is unavailable from target Store: %w", manifest.HexKey(key), err)
+		}
+		if err := consumeManifestStream(ctx, stream); err != nil {
+			return "", fmt.Errorf("upload-snapshot: verify remote Manifest %s: %w", manifest.HexKey(key), err)
 		}
 	}
-	if err := reader.Upload(ctx, root, customerKey, decryptor, target,
-		manifestbundle.VerifyOptions{ExpectedManifests: expected}); err != nil {
+	if err := manifestbundle.UploadExactManifests(ctx,
+		manifestbundle.ExactManifest{Key: root, Reader: rootSource.Reader}, exactDependencies,
+		customerKey, decryptor, client, manifestbundle.VerifyOptions{}); err != nil {
 		return "", err
 	}
 	if logf != nil {
-		logf("upload-snapshot: exact Bundle upload root=%s manifests=%d chunks=%d generation=%s",
-			manifest.HexKey(root), len(reader.ManifestKeys()), len(reader.ChunkKeys()), reader.Admission().Generation)
+		logf("upload-snapshot: exact Bundle upload root=%s bundled-dependencies=%d remote-dependencies=%d",
+			manifest.HexKey(root), len(exactDependencies), len(dependencies)-len(exactDependencies))
 	}
 	return "manifest://" + manifest.HexKey(root), nil
 }
@@ -170,45 +158,64 @@ func parseManifestStoreTimeout(raw string) (time.Duration, error) {
 	return timeout, nil
 }
 
-func bundleManifestReachability(cfg *SnapshotCfg, reader *manifestbundle.Reader, root store.ContentKey) ([]store.ContentKey, []store.ContentKey, error) {
-	expected := map[store.ContentKey]struct{}{root: {}}
-	external := make(map[store.ContentKey]struct{})
+func snapshotLayerManifestKeys(cfg *SnapshotCfg, root store.ContentKey) ([]store.ContentKey, error) {
+	seen := map[store.ContentKey]struct{}{root: {}}
+	keys := make([]store.ContentKey, 0)
 	refs := append([]string(nil), cfg.FromRefs...)
-	refs = append(refs, snapshotArtifactRefs(cfg, nil)...)
+	appendNode := func(node *SnapDiskNode) {
+		refs = append(refs, node.Base)
+		refs = append(refs, node.BaseFromRefs...)
+		if node.Overlay != nil {
+			refs = append(refs, node.Overlay.Base)
+			refs = append(refs, node.Overlay.BaseFromRefs...)
+		}
+	}
+	rootNode := SnapDiskNode{Base: cfg.Boot.Root.Base, BaseFromRefs: cfg.Boot.Root.BaseFromRefs, Overlay: cfg.Boot.Root.Overlay}
+	appendNode(&rootNode)
+	for index := range cfg.Boot.Disks {
+		appendNode(&cfg.Boot.Disks[index])
+	}
 	for _, raw := range refs {
 		if raw == "" {
 			continue
 		}
 		ref, err := manifest.ParseRef(raw)
 		if err != nil {
-			return nil, nil, fmt.Errorf("upload-snapshot: invalid snapshot.cfg ref %q: %w", raw, err)
+			return nil, fmt.Errorf("upload-snapshot: invalid snapshot.cfg ref %q: %w", raw, err)
 		}
-		switch ref.Scheme {
-		case manifest.RefSchemeManifest:
-			key, err := manifest.ParseHexKey(ref.Path)
-			if err != nil {
-				return nil, nil, err
-			}
-			if reader.HasManifest(key) {
-				expected[key] = struct{}{}
-			} else {
-				external[key] = struct{}{}
-			}
-		case manifest.RefSchemeFile:
-			if !ref.Portable() {
-				return nil, nil, fmt.Errorf("upload-snapshot: Bundle snapshot.cfg retains unlocated local ref %q", raw)
-			}
+		if ref.Scheme != manifest.RefSchemeManifest {
+			return nil, fmt.Errorf("upload-snapshot: Bundle snapshot-layer ref must use manifest://, got %q", raw)
+		}
+		key, err := manifest.ParseHexKey(ref.Path)
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := seen[key]; !duplicate {
+			seen[key] = struct{}{}
+			keys = append(keys, key)
 		}
 	}
-	localKeys := make([]store.ContentKey, 0, len(expected))
-	for key := range expected {
-		localKeys = append(localKeys, key)
+	return keys, nil
+}
+
+func consumeManifestStream(ctx context.Context, stream fetch.Stream) (retErr error) {
+	if stream == nil {
+		return fmt.Errorf("nil Manifest stream")
 	}
-	externalKeys := make([]store.ContentKey, 0, len(external))
-	for key := range external {
-		externalKeys = append(externalKeys, key)
+	defer func() { retErr = errors.Join(retErr, stream.Close()) }()
+	buffer := make([]byte, 128*1024)
+	for offset := uint64(0); offset < stream.Size(); {
+		length := min(uint64(len(buffer)), stream.Size()-offset)
+		n, err := stream.ReadAt(ctx, buffer[:int(length)], offset)
+		if err != nil {
+			return err
+		}
+		if n != int(length) {
+			return io.ErrUnexpectedEOF
+		}
+		offset += length
 	}
-	return localKeys, externalKeys, nil
+	return nil
 }
 
 // PublishLocalToLocation publishes a local snapshot graph into one trusted
@@ -263,48 +270,122 @@ func publishManifestBundleToLocation(ctx context.Context, snapshotPath, location
 		_ = reader.Close()
 		return "", fmt.Errorf("publish Bundle: root Manifest %s is absent", manifest.HexKey(root))
 	}
+	refs := reader.Refs()
 	if err := reader.Close(); err != nil {
 		return "", err
 	}
 
-	destination := filepath.Join(directory, base)
-	created, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		if !os.IsExist(err) {
-			return "", fmt.Errorf("publish Bundle: create final: %w", err)
+	type publishFile struct {
+		source      string
+		destination string
+		root        *store.ContentKey
+	}
+	files := make([]publishFile, 0, len(refs)+1)
+	for _, raw := range refs {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return "", err
 		}
-		if err := validateExistingBundleCopy(ctx, realPath, destination, root); err != nil {
-			return "", fmt.Errorf("publish Bundle: existing final: %w", err)
+		if ref.Location != "" {
+			continue
 		}
-	} else {
-		owned := true
-		defer func() {
-			if owned {
-				_ = os.Remove(destination)
+		if ref.Path == base {
+			return "", fmt.Errorf("publish Bundle: refs must not contain the current Bundle %q", raw)
+		}
+		files = append(files, publishFile{
+			source:      filepath.Join(filepath.Dir(realPath), ref.Path),
+			destination: filepath.Join(directory, ref.Path),
+		})
+	}
+	// Dependencies are copied first and the root last. Preflight every source
+	// and collision before creating either, while deliberately not traversing
+	// any sibling Bundle's own refs.
+	files = append(files, publishFile{
+		source: realPath, destination: filepath.Join(directory, base), root: &root,
+	})
+	for _, file := range files {
+		if err := validateManifestBundleFile(file.source, file.root); err != nil {
+			return "", fmt.Errorf("publish Bundle: source %s: %w", filepath.Base(file.source), err)
+		}
+		if _, err := os.Lstat(file.destination); err == nil {
+			if err := validateExistingBundleCopy(ctx, file.source, file.destination, file.root); err != nil {
+				return "", fmt.Errorf("publish Bundle: existing %s: %w", filepath.Base(file.destination), err)
 			}
-		}()
-		if err := copySyncAndCloseLocationFile(ctx, created, realPath); err != nil {
-			return "", fmt.Errorf("publish Bundle: copy final: %w", err)
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("publish Bundle: inspect %s: %w", filepath.Base(file.destination), err)
 		}
-		if err := validateExistingBundleCopy(ctx, realPath, destination, root); err != nil {
-			return "", fmt.Errorf("publish Bundle: validate final: %w", err)
+	}
+	for _, file := range files {
+		if err := publishManifestBundleFile(ctx, file.source, file.destination, file.root); err != nil {
+			return "", fmt.Errorf("publish Bundle: copy %s: %w", filepath.Base(file.destination), err)
 		}
-		owned = false
 	}
 	if err := syncLocationDirectory(directory); err != nil {
 		return "", fmt.Errorf("publish Bundle: sync directory: %w", err)
 	}
 	if logf != nil {
-		logf("upload-snapshot: copied Manifest Bundle %s", destination)
+		logf("upload-snapshot: copied Manifest Bundle %s with %d same-directory dependencies",
+			filepath.Join(directory, base), len(files)-1)
 	}
-	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: base, Location: location}
+	ref := manifest.Ref{
+		Scheme: manifest.RefSchemeFile, Path: base, Location: location,
+		DigestScheme: "manifest", Digest: manifest.HexKey(root),
+	}
 	if err := ref.Validate(); err != nil {
 		return "", err
 	}
 	return ref.String(), nil
 }
 
-func validateExistingBundleCopy(ctx context.Context, sourcePath, destinationPath string, root store.ContentKey) error {
+func validateManifestBundleFile(path string, root *store.ContentKey) error {
+	file, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return fmt.Errorf("not a regular file")
+	}
+	reader, err := manifestbundle.NewReader(file, info.Size())
+	if err == nil && root != nil && !reader.HasManifest(*root) {
+		err = fmt.Errorf("root Manifest %s is absent", manifest.HexKey(*root))
+	}
+	if reader != nil {
+		err = errors.Join(err, reader.Close())
+	}
+	return errors.Join(err, file.Close())
+}
+
+func publishManifestBundleFile(ctx context.Context, sourcePath, destinationPath string, root *store.ContentKey) error {
+	created, err := os.OpenFile(destinationPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return validateExistingBundleCopy(ctx, sourcePath, destinationPath, root)
+		}
+		return err
+	}
+	owned := true
+	defer func() {
+		if owned {
+			_ = os.Remove(destinationPath)
+		}
+	}()
+	if err := copySyncAndCloseLocationFile(ctx, created, sourcePath); err != nil {
+		return err
+	}
+	if err := validateExistingBundleCopy(ctx, sourcePath, destinationPath, root); err != nil {
+		return err
+	}
+	owned = false
+	return nil
+}
+
+func validateExistingBundleCopy(ctx context.Context, sourcePath, destinationPath string, root *store.ContentKey) error {
 	destination, err := os.OpenFile(destinationPath, os.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
@@ -321,9 +402,9 @@ func validateExistingBundleCopy(ctx context.Context, sourcePath, destinationPath
 	if err != nil {
 		return err
 	}
-	if !reader.HasManifest(root) {
+	if root != nil && !reader.HasManifest(*root) {
 		_ = reader.Close()
-		return fmt.Errorf("root Manifest %s is absent", manifest.HexKey(root))
+		return fmt.Errorf("root Manifest %s is absent", manifest.HexKey(*root))
 	}
 	if err := reader.Close(); err != nil {
 		return err
