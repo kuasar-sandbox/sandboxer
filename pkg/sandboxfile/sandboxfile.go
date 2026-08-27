@@ -172,10 +172,11 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 // used for roots whose role is already known (run --from and *.sandbox file
 // refs); those inputs never fall back to an ordinary disk on a format error.
 //
-// Optional detection deliberately looks for the reserved runtime-config entry
-// near logical EOF before invoking the strict parser. This keeps existing
-// EROFS+ZIP(config.json) images and pure overlay layers unchanged, while a
-// malformed stream that claims the Sandbox entry fails closed.
+// Optional detection inspects only a ZIP central-directory entry name before
+// invoking the strict parser. This keeps existing EROFS+ZIP(config.json)
+// images and pure overlay layers unchanged even when their payload bytes
+// mention the reserved name, while malformed ZIP metadata at logical EOF and
+// a malformed stream that claims the Sandbox entry both fail closed.
 func PayloadIfSandbox(ctx context.Context, stream fetch.Stream, required bool) (fetch.Stream, bool, error) {
 	if stream == nil {
 		return nil, false, errors.New("sandbox payload: nil logical stream")
@@ -199,17 +200,64 @@ func PayloadIfSandbox(ctx context.Context, stream fetch.Stream, required bool) (
 }
 
 func claimsSandboxRuntimeConfig(ctx context.Context, stream fetch.Stream) (bool, error) {
-	const probeLimit = uint64(2*MaxImageConfigBytes + config.MaxPortableConfigBytes + 128<<10)
-	size := stream.Size()
-	start := uint64(0)
-	if size > probeLimit {
-		start = size - probeLimit
+	const (
+		maxProbeEntries     = 64
+		maxProbeCentralSize = 128 << 10
+	)
+	if stream.Size() < eocdSize {
+		return false, nil
 	}
-	probe, err := readStreamAt(ctx, stream, start, size-start)
+	eocd, err := readStreamAt(ctx, stream, stream.Size()-eocdSize, eocdSize)
 	if err != nil {
 		return false, fmt.Errorf("sandbox payload probe: %w", err)
 	}
-	return bytes.Contains(probe, []byte(config.SandboxRuntimeConfigName)), nil
+	if binary.LittleEndian.Uint32(eocd[0:4]) != eocdSignature {
+		return false, nil
+	}
+	_, centralStart, centralSize, count, err := parseEOCD(ctx, stream)
+	if err != nil {
+		return false, fmt.Errorf("sandbox payload ZIP metadata: %w", err)
+	}
+	if count > maxProbeEntries || centralSize > maxProbeCentralSize {
+		return false, fmt.Errorf("sandbox payload ZIP metadata exceeds detection limits (%d entries, %d bytes)", count, centralSize)
+	}
+	position := centralStart
+	centralEnd := centralStart + centralSize
+	claimed := false
+	for index := 0; index < count; index++ {
+		if position > centralEnd || centralHeaderSize > centralEnd-position {
+			return false, fmt.Errorf("sandbox payload ZIP metadata: central entry %d is truncated", index)
+		}
+		fixed, err := readStreamAt(ctx, stream, position, centralHeaderSize)
+		if err != nil {
+			return false, fmt.Errorf("sandbox payload ZIP metadata: central entry %d: %w", index, err)
+		}
+		if binary.LittleEndian.Uint32(fixed[0:4]) != centralHeaderSignature {
+			return false, fmt.Errorf("sandbox payload ZIP metadata: central entry %d has invalid signature", index)
+		}
+		nameLength := uint64(binary.LittleEndian.Uint16(fixed[28:30]))
+		extraLength := uint64(binary.LittleEndian.Uint16(fixed[30:32]))
+		commentLength := uint64(binary.LittleEndian.Uint16(fixed[32:34]))
+		variableLength := nameLength + extraLength + commentLength
+		if variableLength > centralEnd-position-centralHeaderSize {
+			return false, fmt.Errorf("sandbox payload ZIP metadata: central entry %d fields are truncated", index)
+		}
+		name, err := readStreamAt(ctx, stream, position+centralHeaderSize, nameLength)
+		if err != nil {
+			return false, fmt.Errorf("sandbox payload ZIP metadata: central entry %d name: %w", index, err)
+		}
+		if string(name) == config.SandboxRuntimeConfigName {
+			claimed = true
+		}
+		position += centralHeaderSize + variableLength
+	}
+	if position != centralEnd {
+		return false, errors.New("sandbox payload ZIP metadata: central directory size mismatch")
+	}
+	if claimed {
+		return true, nil
+	}
+	return false, nil
 }
 
 // OpenFlattenedEROFS validates the project's existing flattened image layout.

@@ -184,10 +184,12 @@ func TestNormalizeLocalMemoryRefsEmitsSiblingBasenames(t *testing.T) {
 
 func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
 	portable := "manifest://" + strings.Repeat("a", 64)
+	wDigest := strings.Repeat("b", 64)
+	bDigest := strings.Repeat("c", 64)
 	binding := &MemorySourceBinding{
-		SnapshotRef: "file:///bundle/w.snapshot",
+		SnapshotRef: "file:///bundle/w.snapshot@sha256:" + wDigest,
 		FromRefs: []string{
-			"file:///bundle/b.snapshot",
+			"file:///bundle/b.snapshot@sha256:" + bDigest,
 			portable,
 		},
 	}
@@ -196,7 +198,7 @@ func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantMerged := []string{"file://b.snapshot", portable}
+	wantMerged := []string{"file://b.snapshot@sha256:" + bDigest, portable}
 	if strings.Join(merged, ",") != strings.Join(wantMerged, ",") {
 		t.Fatalf("merged memory refs = %v, want %v", merged, wantMerged)
 	}
@@ -205,13 +207,34 @@ func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantWorkingSet := []string{"file://w.snapshot", "file://b.snapshot", portable}
+	wantWorkingSet := []string{
+		"file://w.snapshot@sha256:" + wDigest,
+		"file://b.snapshot@sha256:" + bDigest,
+		portable,
+	}
 	if strings.Join(workingSet, ",") != strings.Join(wantWorkingSet, ",") {
 		t.Fatalf("working-set memory refs = %v, want %v", workingSet, wantWorkingSet)
 	}
 
-	if binding.FromRefs[0] != "file:///bundle/b.snapshot" {
+	if binding.FromRefs[0] != "file:///bundle/b.snapshot@sha256:"+bDigest {
 		t.Fatalf("memoryRefsForSnapshot mutated binding: %v", binding.FromRefs)
+	}
+}
+
+func TestSnapshotMemoryRefsRejectsProspectiveChainOverLimit(t *testing.T) {
+	binding := &MemorySourceBinding{
+		SnapshotRef: "manifest://" + strings.Repeat("a", 64),
+		FromRefs:    make([]string, snapshot.MaxMemoryFromRefs),
+	}
+	for i := range binding.FromRefs {
+		binding.FromRefs[i] = fmt.Sprintf("file://%064x.snapshot@sha256:%064x", i+1, i+1)
+	}
+
+	if _, err := memoryRefsForSnapshot(binding, false); err == nil || !strings.Contains(err.Error(), "exceeds 64 entries") {
+		t.Fatalf("unmerged memory chain error = %v", err)
+	}
+	if refs, err := memoryRefsForSnapshot(binding, true); err != nil || len(refs) != snapshot.MaxMemoryFromRefs {
+		t.Fatalf("merged memory chain = %d refs, %v", len(refs), err)
 	}
 }
 
@@ -613,7 +636,7 @@ func TestHandleSnapshotRequestRejectsMissingLocalMemoryLowerBeforeQuiesce(t *tes
 		PortableConfig: snapshotTestLivePortable(t),
 		MemoryBinding: &MemorySourceBinding{
 			SnapshotRef: parentRef, RuntimeRef: parentRef, RelativeDir: filepath.Dir(parentPath),
-			FromRefs: []string{"file://base.snapshot"},
+			FromRefs: []string{"file://base.snapshot@sha256:" + strings.Repeat("a", 64)},
 		},
 		SandboxID:   "test",
 		ManifestCfg: &config.ManifestConfig{Store: manifest.StoreConfig{Endpoint: "unused"}},
@@ -625,7 +648,7 @@ func TestHandleSnapshotRequestRejectsMissingLocalMemoryLowerBeforeQuiesce(t *tes
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		},
 	}}, nil, filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"), "", nil, nil, pinger, nil, func() error { return nil }, nil, discardLogf)
-	if err == nil || !strings.Contains(err.Error(), "open memory Snapshot file://base.snapshot") {
+	if err == nil || !strings.Contains(err.Error(), "open memory Snapshot file://base.snapshot@sha256:") {
 		t.Fatalf("local lower preflight error = %v", err)
 	}
 	if viewCalled {

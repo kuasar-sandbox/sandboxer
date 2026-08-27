@@ -9,9 +9,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
@@ -114,6 +118,139 @@ func TestOpenMemoryParentLayersValidatesCapacityBeforeUse(t *testing.T) {
 	}
 	if _, err := openMemoryParentLayers(context.Background(), []string{ref}, opts, uint64(len(memory))+4096); err == nil || !strings.Contains(err.Error(), "does not match capacity") {
 		t.Fatalf("capacity mismatch error = %v", err)
+	}
+}
+
+func TestSeparateSandboxBundleRetainsSnapshotBundleMemoryScope(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	ctx := context.Background()
+	dir := t.TempDir()
+	customerKey := [32]byte{0x41, 0x42, 0x43}
+	keyFn := func() ([32]byte, error) { return customerKey, nil }
+	manifestCfg := &manifest.Config{
+		Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:  manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+
+	portable := &config.PortableSandboxConfig{
+		Version: config.PortableSandboxConfigVersion,
+		Resources: config.PortableResourcesConfig{
+			Capacity:    config.CapacityConfig{CPU: 1, Memory: "4KiB"},
+			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "4KiB"},
+		},
+		Boot: config.PortableBootConfig{
+			Kernel:  "file://vmlinux@sha256:" + sha,
+			Runtime: "file://sandbox-runtime.bundle@sha256:" + sha,
+			Root:    config.PortableRootConfig{Base: "self"},
+		},
+		Launch: config.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},
+	}
+	portableRaw, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eLogical, err := sandboxfile.BuildSource(
+		sparse.Dense(bytes.NewReader(bytes.Repeat([]byte{0x51}, 4096)), 4096), nil, portableRaw,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eSink, err := snapshot.NewBundleSink(ctx, dir, "separate-e", manifestCfg, keyFn, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eRef, _, err := eSink.AbsorbSandbox(ctx, eLogical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eSink.CommitSandbox(ctx, eRef, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := eSink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	eKey, err := manifest.ParseKeyRef(eRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eBundleRef := "file://" + manifest.HexKey(eKey) + ".bundle@manifest:" + manifest.HexKey(eKey)
+
+	sSink, err := snapshot.NewBundleSink(ctx, dir, "separate-s", manifestCfg, keyFn, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentConfig, err := snapshot.MarshalConfig(&snapshot.Config{
+		Version: snapshot.SnapshotConfigVersion, SandboxRef: eBundleRef,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentLogical, err := snapshotfile.BuildSource(
+		sparse.Dense(bytes.NewReader(bytes.Repeat([]byte{0x61}, 4096)), 4096),
+		[]byte("{}"), []byte("{}"), parentConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentRef, _, err := sSink.AbsorbSnapshot(ctx, parentLogical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootConfig, err := snapshot.MarshalConfig(&snapshot.Config{
+		Version: snapshot.SnapshotConfigVersion, SandboxRef: eBundleRef, FromRefs: []string{parentRef},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootLogical, err := snapshotfile.BuildSource(
+		sparse.Dense(bytes.NewReader(bytes.Repeat([]byte{0x71}, 4096)), 4096),
+		[]byte("{}"), []byte("{}"), rootConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sRef, _, err := sSink.AbsorbSnapshot(ctx, rootLogical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sSink.CommitSnapshot(ctx, sRef, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := sSink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sKey, err := manifest.ParseKeyRef(sRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sPath := filepath.Join(dir, manifest.HexKey(sKey)+".bundle")
+
+	root, err := openRootSnapshot(ctx, Options{
+		SnapshotPath: sPath, SnapshotRef: "file://" + filepath.Base(sPath) + "@manifest:" + manifest.HexKey(sKey),
+		ManifestCfg: manifestCfg, CustomerKeyFn: keyFn,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.stream.Close()
+	sandboxSource, err := openReferencedSandbox(ctx, eBundleRef, root.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sandboxSource.Root.Close()
+
+	// openReferencedSandbox deliberately nests its scoped fetcher over the
+	// Snapshot Bundle's fetcher. A miss in E therefore falls through to S,
+	// retaining parent memory Manifests that exist only in S.
+	layers, err := openMemoryParentLayers(ctx, []string{parentRef}, sandboxSource.opts, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layers) != 1 {
+		t.Fatalf("memory parent layers = %d, want 1", len(layers))
+	}
+	if err := layers[0].Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

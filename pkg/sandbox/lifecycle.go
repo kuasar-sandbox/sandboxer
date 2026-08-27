@@ -3214,7 +3214,23 @@ func memoryRefsForSnapshot(binding *MemorySourceBinding, mergeParent bool) ([]st
 	if mergeParent {
 		refs = append([]string(nil), binding.FromRefs...)
 	}
-	return normalizeLocalMemoryRefs(refs)
+	normalized, err := normalizeLocalMemoryRefs(refs)
+	if err != nil {
+		return nil, err
+	}
+	// The final E identity is not known until capture, but every sink emits a
+	// bounded content-addressed ref. Validate the complete prospective S config
+	// now with the longest local E ref shape so count, duplicates, ref syntax
+	// and the serialized-size limit all fail before quiesce.
+	probeDigest := strings.Repeat("f", 64)
+	if _, err := snapshot.MarshalConfig(&snapshot.Config{
+		Version:    snapshot.SnapshotConfigVersion,
+		SandboxRef: "file://" + probeDigest + ".sandbox@sha256:" + probeDigest,
+		FromRefs:   normalized,
+	}); err != nil {
+		return nil, fmt.Errorf("snapshot: prospective memory config: %w", err)
+	}
+	return normalized, nil
 }
 
 func currentDiskParentBinding(opts RunOptions, index int) (string, string, error) {

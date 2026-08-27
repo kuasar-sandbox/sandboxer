@@ -303,6 +303,33 @@ func TestOfflineFlattenedEROFSRebuildPreservesConfigAndRemovesOldZIP(t *testing.
 	}
 }
 
+func TestPayloadIfSandboxDetectsRuntimeEntryFromZIPMetadata(t *testing.T) {
+	payload := fakeEROFS()
+	imageConfig := []byte(`{"Architecture":"amd64","Os":"linux","Cmd":["cat","/etc/sandbox.runtime.cfg"]}`)
+	flattenedBytes := append(append([]byte(nil), payload...), legacyConfigZIP(t, imageConfig)...)
+	stream := &closeStream{Source: dataSource(t, flattenedBytes)}
+
+	opened, sandbox, err := PayloadIfSandbox(context.Background(), stream, false)
+	if err != nil {
+		t.Fatalf("ordinary flattened EROFS was claimed as Sandbox: %v", err)
+	}
+	if sandbox {
+		t.Fatal("config.json contents claimed the Sandbox logical role")
+	}
+	if opened != stream {
+		t.Fatal("ordinary flattened EROFS stream was replaced")
+	}
+	if stream.closes != 0 {
+		t.Fatalf("ordinary stream close count = %d before caller close", stream.closes)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if stream.closes != 1 {
+		t.Fatalf("ordinary stream close count = %d, want 1", stream.closes)
+	}
+}
+
 func TestOpenEROFSArtifactAcceptsBarePayloadAndStripsFlattenedZIP(t *testing.T) {
 	payload := fakeEROFS()
 	bare, err := OpenEROFSArtifact(context.Background(), &closeStream{Source: dataSource(t, payload)})
