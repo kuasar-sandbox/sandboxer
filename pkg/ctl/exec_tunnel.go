@@ -81,8 +81,12 @@ func ServeExecTunnel(ctx context.Context, options ExecTunnelOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := options.Authorize(ctx); err != nil {
+	authorizeErr := options.Authorize(ctx)
+	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if authorizeErr != nil {
+		return authorizeErr
 	}
 
 	streams := &execTunnelStreams{}
@@ -99,6 +103,9 @@ func ServeExecTunnel(ctx context.Context, options ExecTunnelOptions) error {
 	if downstream == nil {
 		return errors.New("ctl: serve exec tunnel: AcceptDownstream returned nil stream")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	return execTunnelRunWithContext(ctx, streams.Close, func() error {
 		frame, err := readExecRequestFrameWithTimeout(ctx, downstream, timeout, streams.Close)
@@ -109,7 +116,14 @@ func ServeExecTunnel(ctx context.Context, options ExecTunnelOptions) error {
 		// receive the parsed frame for authorization/backend selection, while the
 		// helper alone owns the exact bytes eventually written to the backend.
 		raw := append([]byte(nil), frame.Raw...)
-		if err := options.AuthorizeRequest(ctx, frame); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		requestErr := options.AuthorizeRequest(ctx, frame)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if requestErr != nil {
 			writeExecRequestRejected(downstream)
 			return ErrExecRequestRejected
 		}
@@ -118,6 +132,9 @@ func ServeExecTunnel(ctx context.Context, options ExecTunnelOptions) error {
 			if !streams.SetBackend(backend) {
 				return ctx.Err()
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if dialErr != nil || backend == nil {
 			writeExecRequestRejected(downstream)

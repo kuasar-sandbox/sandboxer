@@ -87,6 +87,86 @@ func TestServeExecTunnelAuthorizeFailureDoesNotAccept(t *testing.T) {
 	}
 }
 
+func TestServeExecTunnelCancellationAfterAuthorizeDoesNotAccept(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var accepts atomic.Int32
+	err := ServeExecTunnel(ctx, ExecTunnelOptions{
+		Authorize: func(context.Context) error {
+			cancel()
+			return nil
+		},
+		AcceptDownstream: func(context.Context) (io.ReadWriteCloser, error) {
+			accepts.Add(1)
+			return &memoryRWC{}, nil
+		},
+		AuthorizeRequest: func(context.Context, *ExecRequestFrame) error { return nil },
+		DialBackend: func(context.Context, *ExecRequestFrame) (io.ReadWriteCloser, error) {
+			return &memoryRWC{}, nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ServeExecTunnel error = %v, want context canceled", err)
+	}
+	if accepts.Load() != 0 {
+		t.Fatalf("AcceptDownstream calls = %d, want 0", accepts.Load())
+	}
+}
+
+func TestServeExecTunnelCancellationDuringRequestGateDoesNotDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	downstream := &memoryRWC{reader: bytes.NewReader(ctlTestValidExecFrame())}
+	var dials atomic.Int32
+	err := ServeExecTunnel(ctx, ExecTunnelOptions{
+		Authorize: func(context.Context) error { return nil },
+		AcceptDownstream: func(context.Context) (io.ReadWriteCloser, error) {
+			return downstream, nil
+		},
+		AuthorizeRequest: func(context.Context, *ExecRequestFrame) error {
+			cancel()
+			return nil
+		},
+		DialBackend: func(context.Context, *ExecRequestFrame) (io.ReadWriteCloser, error) {
+			dials.Add(1)
+			return &memoryRWC{}, nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ServeExecTunnel error = %v, want context canceled", err)
+	}
+	if dials.Load() != 0 {
+		t.Fatalf("DialBackend calls = %d, want 0", dials.Load())
+	}
+	if downstream.written.Len() != 0 {
+		t.Fatalf("canceled request gate wrote %d downstream bytes", downstream.written.Len())
+	}
+	assertClosedOnce(t, downstream)
+}
+
+func TestServeExecTunnelCancellationDuringDialDoesNotWriteRaw(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	downstream := &memoryRWC{reader: bytes.NewReader(ctlTestValidExecFrame())}
+	backend := &memoryRWC{reader: bytes.NewReader(nil)}
+	err := ServeExecTunnel(ctx, ExecTunnelOptions{
+		Authorize: func(context.Context) error { return nil },
+		AcceptDownstream: func(context.Context) (io.ReadWriteCloser, error) {
+			return downstream, nil
+		},
+		AuthorizeRequest: func(context.Context, *ExecRequestFrame) error { return nil },
+		DialBackend: func(context.Context, *ExecRequestFrame) (io.ReadWriteCloser, error) {
+			cancel()
+			return backend, nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ServeExecTunnel error = %v, want context canceled", err)
+	}
+	if backend.written.Len() != 0 {
+		t.Fatalf("canceled dial wrote %d backend bytes", backend.written.Len())
+	}
+	assertClosedOnce(t, downstream)
+	assertClosedOnce(t, backend)
+}
+
 func TestServeExecTunnelCallbackCannotChangeForwardedRaw(t *testing.T) {
 	frame := ctlTestValidExecFrame()
 	downstream := &memoryRWC{reader: bytes.NewReader(frame)}
