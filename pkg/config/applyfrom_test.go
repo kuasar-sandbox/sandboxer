@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -211,6 +212,61 @@ func TestApplyFromRulesRejectsDataDiskCountAndNameChanges(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("data topology error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestApplyFromRulesPreservesDataDiskMountTopology(t *testing.T) {
+	artifact := portableFromFixture()
+	artifact.Boot.Disks = []PortableDiskConfig{{
+		Name:               "data",
+		PortableRootConfig: PortableRootConfig{Base: "file://data.overlay@sha256:" + testSHA},
+	}}
+	artifact.Mounts = []MountConfig{
+		{Target: "/data", Type: "disk", Source: "data", Options: "ro"},
+		{Target: "/cache", Type: "tmpfs"},
+	}
+	if err := artifact.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	base := `
+network: {tap: tap0}
+boot:
+  kernel: file:///vmlinux
+  runtime: file:///runtime
+  root:
+    overlay: {diff_template: file:///upper.ext4}
+mounts:
+  %s
+  - {target: /scratch, type: tmpfs}
+`
+	for _, tc := range []struct {
+		name       string
+		diskMounts string
+		wantOK     bool
+	}{
+		{name: "same disk topology", diskMounts: "- {target: /data, type: disk, source: data, options: rw}", wantOK: true},
+		{name: "changed disk target", diskMounts: "- {target: /other, type: disk, source: data, options: rw}"},
+		{name: "duplicate disk source", diskMounts: "- {target: /other, type: disk, source: data}\n  - {target: /data, type: disk, source: data}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			host, presence, err := LoadConfigBytesWithPresence([]byte(fmt.Sprintf(base, tc.diskMounts)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, c0, err := ApplyFromRules(artifact, host, presence)
+			if !tc.wantOK {
+				if err == nil || !strings.Contains(err.Error(), "artifact-owned") {
+					t.Fatalf("ApplyFromRules error = %v, want mount topology rejection", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(c0.Mounts) != 2 || c0.Mounts[0].Target != "/data" || c0.Mounts[0].Options != "rw" || c0.Mounts[1].Target != "/scratch" {
+				t.Fatalf("persistent mount override = %#v", c0.Mounts)
 			}
 		})
 	}

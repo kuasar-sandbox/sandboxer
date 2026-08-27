@@ -53,6 +53,17 @@ func lifecycleSnapshotSource(t testing.TB, memory, snapshotConfig []byte) sparse
 	return logical
 }
 
+func TestEnsureSnapshotDirRejectsSymlinkBeforeCapture(t *testing.T) {
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "output")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSnapshotDir(link); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("ensureSnapshotDir error = %v, want symlink rejection", err)
+	}
+}
+
 func TestPrepareSnapshotDependencyRejectsLiveSandboxAsRootImage(t *testing.T) {
 	portable := snapshotTestPortable(t)
 	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
@@ -110,68 +121,6 @@ func lifecycleBundleSnapshot(t testing.TB, sink *snapshot.BundleSink, directory 
 	return ref, filepath.Join(directory, manifest.HexKey(key)+".bundle")
 }
 
-func TestValidateLocalMemoryRefsUsesOutputBundleDirectory(t *testing.T) {
-	out := t.TempDir()
-	path, scheme, digest := writeDiskArtifact(t, out, "snapshot", []byte("artifact"), nil)
-	name := filepath.Base(path)
-	manifestRef := "manifest://" + strings.Repeat("a", 64)
-	locatedRef := "file://located.snapshot@location:parent"
-	refs := []string{
-		fileRef(filepath.Join("/different/source", name), scheme, digest),
-		manifestRef,
-		locatedRef,
-	}
-	if err := validateLocalMemoryRefs(out, refs, nil, false); err != nil {
-		t.Fatalf("validateLocalMemoryRefs() error = %v", err)
-	}
-
-	if err := os.Symlink(name, filepath.Join(out, "alias.snapshot")); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateLocalMemoryRefs(out, []string{"file://alias.snapshot"}, nil, false); err != nil {
-		t.Fatalf("accessible sibling symlink should be accepted: %v", err)
-	}
-
-	err := validateLocalMemoryRefs(out, []string{"file://missing.snapshot"}, nil, false)
-	if err == nil || !strings.Contains(err.Error(), "not accessible") {
-		t.Fatalf("missing local memory ref error = %v", err)
-	}
-}
-
-func TestValidateLocalMemoryRefsRejectsNonRegularFiles(t *testing.T) {
-	tests := []struct {
-		name  string
-		setup func(string) error
-	}{
-		{
-			name: "directory",
-			setup: func(path string) error {
-				return os.Mkdir(path, 0o755)
-			},
-		},
-		{
-			name: "fifo",
-			setup: func(path string) error {
-				return syscall.Mkfifo(path, 0o600)
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			out := t.TempDir()
-			path := filepath.Join(out, "base.snapshot")
-			if err := tt.setup(path); err != nil {
-				t.Fatal(err)
-			}
-
-			err := validateLocalMemoryRefs(out, []string{"file://base.snapshot"}, nil, false)
-			if err == nil || !strings.Contains(err.Error(), "is not a regular file") {
-				t.Fatalf("non-regular local memory ref error = %v", err)
-			}
-		})
-	}
-}
-
 func TestCanonicalBundleSourceNormalizesLocatedAlias(t *testing.T) {
 	dir := t.TempDir()
 	key := strings.Repeat("b", 64)
@@ -210,33 +159,6 @@ func TestCanonicalBundleSourceNormalizesLocatedAlias(t *testing.T) {
 	}
 }
 
-func TestValidateLocalMemoryRefsEnforcesCryptoPolicy(t *testing.T) {
-	out := t.TempDir()
-	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x51})
-	wrongCodec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x52})
-	plainPath, plainScheme, plainDigest := writeDiskArtifact(t, out, "snapshot", []byte("plain memory"), nil)
-	otherPath, _, _ := writeDiskArtifact(t, out, "snapshot", []byte("other memory"), nil)
-	encryptedPath, encryptedScheme, encryptedDigest := writeDiskArtifact(t, out, "snapshot", []byte("encrypted memory"), codec)
-	plainRef := fileRef(plainPath, plainScheme, plainDigest)
-	encryptedRef := fileRef(encryptedPath, encryptedScheme, encryptedDigest)
-
-	if err := validateLocalMemoryRefs(out, []string{plainRef}, codec, false); err != nil {
-		t.Fatalf("auto rejected plaintext memory dependency: %v", err)
-	}
-	if err := validateLocalMemoryRefs(out, []string{plainRef}, codec, true); err == nil {
-		t.Fatal("required accepted plaintext memory dependency")
-	}
-	if err := validateLocalMemoryRefs(out, []string{encryptedRef}, codec, true); err != nil {
-		t.Fatalf("required rejected encrypted memory dependency: %v", err)
-	}
-	if err := validateLocalMemoryRefs(out, []string{encryptedRef}, wrongCodec, true); err == nil {
-		t.Fatal("wrong key accepted encrypted memory dependency")
-	}
-	if err := validateLocalMemoryRefs(out, []string{fileRef(otherPath, plainScheme, plainDigest)}, nil, false); err == nil {
-		t.Fatal("mismatched identity accepted memory dependency")
-	}
-}
-
 func TestNormalizeLocalMemoryRefsEmitsSiblingBasenames(t *testing.T) {
 	digest := strings.Repeat("b", 64)
 	locatedRef := "file://located.snapshot@sha256:" + digest + "@location:parent"
@@ -257,19 +179,6 @@ func TestNormalizeLocalMemoryRefsEmitsSiblingBasenames(t *testing.T) {
 
 	if _, err := normalizeLocalMemoryRefs([]string{"file://.."}); err == nil {
 		t.Fatal("normalizeLocalMemoryRefs(file://..) succeeded")
-	}
-}
-
-func TestValidatePortableMemoryRefsAcceptsLocatedFileRefs(t *testing.T) {
-	refs := []string{
-		"manifest://" + strings.Repeat("a", 64),
-		"file://base.snapshot@location:parent",
-	}
-	if err := validatePortableMemoryRefs(refs); err != nil {
-		t.Fatalf("portable refs rejected: %v", err)
-	}
-	if err := validatePortableMemoryRefs([]string{"file://base.snapshot"}); err == nil {
-		t.Fatal("unlocated local ref accepted for direct upload")
 	}
 }
 
@@ -372,14 +281,6 @@ func TestPrepareSnapshotBundlePlanCopiesReachableParentManifest(t *testing.T) {
 		BundleReader:  opened.BundleReader(),
 		BundleFetcher: opened.ManifestFetcher(),
 		CustomerKeyFn: keyFn,
-	}
-	if err := validateNonBundleSnapshotSources(context.Background(), runOpts,
-		[]string{parentRef}, []bool{false}); err == nil || !strings.Contains(err.Error(), "without bundle/refs") {
-		t.Fatalf("non-Bundle retained source error = %v", err)
-	}
-	if err := validateNonBundleSnapshotSources(context.Background(), runOpts,
-		nil, []bool{true}); err != nil {
-		t.Fatalf("fully merged non-Bundle source validation: %v", err)
 	}
 	rootSource, err := opened.ManifestFetcher().SelectRoot(parentKey)
 	if err != nil {
@@ -709,7 +610,7 @@ func TestHandleSnapshotRequestRejectsMissingLocalMemoryLowerBeforeQuiesce(t *tes
 
 	_, err = handleSnapshotRequest(context.Background(), ctl.Request{Upload: true}, RunOptions{
 		Cfg:            cfg,
-		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{Root: config.PortableRootConfig{Base: "self"}}},
+		PortableConfig: snapshotTestLivePortable(t),
 		MemoryBinding: &MemorySourceBinding{
 			SnapshotRef: parentRef, RuntimeRef: parentRef, RelativeDir: filepath.Dir(parentPath),
 			FromRefs: []string{"file://base.snapshot"},
@@ -723,7 +624,7 @@ func TestHandleSnapshotRequestRejectsMissingLocalMemoryLowerBeforeQuiesce(t *tes
 			viewCalled = true
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		},
-	}}, nil, "", filepath.Join(dir, "run"), "", nil, pinger, nil, nil, nil, discardLogf)
+	}}, nil, filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"), "", nil, nil, pinger, nil, func() error { return nil }, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "open memory Snapshot file://base.snapshot") {
 		t.Fatalf("local lower preflight error = %v", err)
 	}
@@ -739,20 +640,88 @@ func TestHandleSnapshotRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T
 	baseCfg := &config.SandboxConfig{}
 	baseOpts := RunOptions{
 		Cfg: baseCfg, SandboxID: "test",
-		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{Root: config.PortableRootConfig{Base: "self"}}},
+		PortableConfig: snapshotTestLivePortable(t),
 	}
 	disks := []SnapDiskRef{{DiffPath: filepath.Join(t.TempDir(), "not-needed.diff")}}
 
 	_, err := handleSnapshotRequest(context.Background(), ctl.Request{}, baseOpts, nil, disks, nil,
-		"", t.TempDir(), "", nil, pinger, nil, nil, nil, discardLogf)
+		"", t.TempDir(), "", nil, nil, pinger, nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "--output and --upload") {
 		t.Fatalf("missing output error = %v", err)
 	}
 
 	_, err = handleSnapshotRequest(context.Background(), ctl.Request{Upload: true}, baseOpts, nil, disks, nil,
-		"", t.TempDir(), "", nil, pinger, nil, nil, nil, discardLogf)
+		"", t.TempDir(), "", nil, nil, pinger, nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "manifest") {
 		t.Fatalf("missing manifest config error = %v", err)
+	}
+
+	validRequest := ctl.Request{OutDir: filepath.Join(t.TempDir(), "out")}
+	_, err = handleSnapshotRequest(context.Background(), validRequest, RunOptions{
+		PortableConfig: baseOpts.PortableConfig, SandboxID: "test",
+	}, nil, disks, nil, "unused.sock", t.TempDir(), "", nil, nil, pinger, nil, nil, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "host configuration") {
+		t.Fatalf("missing host config error = %v", err)
+	}
+
+	_, err = handleSnapshotRequest(context.Background(), validRequest, baseOpts, nil, disks, nil,
+		"unused.sock", t.TempDir(), "", nil, nil, pinger, nil, nil, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "memory backing") {
+		t.Fatalf("missing memory backing error = %v", err)
+	}
+}
+
+func TestCaptureGateSerializesAndMakesDestroyCaptureTerminal(t *testing.T) {
+	var gate captureGate
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		if err := gate.begin(); err != nil {
+			t.Errorf("first capture admission: %v", err)
+			close(done)
+			return
+		}
+		close(entered)
+		<-release
+		gate.finish(false)
+		close(done)
+	}()
+	<-entered
+	if err := gate.begin(); err == nil || !strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("concurrent capture admission error = %v", err)
+	}
+	close(release)
+	<-done
+	if err := gate.begin(); err != nil {
+		t.Fatalf("capture after failed/resumed operation: %v", err)
+	}
+	gate.finish(true)
+	if err := gate.begin(); err == nil || !strings.Contains(err.Error(), "shutdown is in progress") {
+		t.Fatalf("capture after terminal commit error = %v", err)
+	}
+}
+
+func TestSnapshotHandlerRejectsCaptureBeforeCloudHypervisorStarts(t *testing.T) {
+	handler := &SnapshotHandler{CHProcess: func() processSignaler { return nil }}
+	for _, capture := range []struct {
+		name string
+		call func() error
+	}{
+		{name: "export", call: func() error {
+			_, err := handler.HandleExport(ctl.Request{ResumeAfter: true})
+			return err
+		}},
+		{name: "snapshot", call: func() error {
+			_, err := handler.Handle(ctl.Request{ResumeAfter: true})
+			return err
+		}},
+	} {
+		t.Run(capture.name, func(t *testing.T) {
+			if err := capture.call(); err == nil || !strings.Contains(err.Error(), "process is not started") {
+				t.Fatalf("capture before CH start error = %v", err)
+			}
+		})
 	}
 }
 
@@ -807,6 +776,9 @@ func TestHandleExportRequestResumeUsesExportFreezeWindow(t *testing.T) {
 				if !gated {
 					return nil, nil, errors.New("SnapshotView opened before forward gate")
 				}
+				if forwarder.ExecAllowed() {
+					return nil, nil, errors.New("SnapshotView opened before exec gate")
+				}
 				events.add("view")
 				return bytes.NewReader(bytes.Repeat([]byte{0x51}, 4096)), nil, nil
 			},
@@ -815,6 +787,7 @@ func TestHandleExportRequestResumeUsesExportFreezeWindow(t *testing.T) {
 		chSock,
 		filepath.Join(dir, "run"),
 		"",
+		nil,
 		nil,
 		&guestlink.Pinger{Client: &guestlink.HostClient{BasePath: guestSock}},
 		forwarder,
@@ -854,6 +827,9 @@ func TestHandleExportRequestResumeUsesExportFreezeWindow(t *testing.T) {
 	if stillGated {
 		t.Fatal("forwarder remained gated after export --resume")
 	}
+	if !forwarder.ExecAllowed() {
+		t.Fatal("exec admission remained gated after export --resume")
+	}
 	c0After, err := config.MarshalPortableSandboxConfig(portable)
 	if err != nil {
 		t.Fatal(err)
@@ -873,11 +849,16 @@ func TestHandleExportRequestResumeUsesExportFreezeWindow(t *testing.T) {
 	}
 }
 
-func TestHandleExportRequestResumeReportsReattachFailure(t *testing.T) {
+func TestHandleExportRequestResumeReattachFailureTerminatesVM(t *testing.T) {
 	dir := t.TempDir()
 	guestSock := filepath.Join(dir, "guest.sock")
 	guestDone := serveOneQuiesce(t, guestSock, nil)
-	chSock, chRequests := serveLifecycleCH(t, dir, func(string) int { return http.StatusNoContent })
+	chSock, chRequests := serveLifecycleCH(t, dir, func(path string) int {
+		if path == "/api/v1/vmm.shutdown" {
+			return http.StatusInternalServerError
+		}
+		return http.StatusNoContent
+	})
 	portable := snapshotTestPortable(t)
 	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
 	if err := portable.Validate(); err != nil {
@@ -885,6 +866,13 @@ func TestHandleExportRequestResumeReportsReattachFailure(t *testing.T) {
 	}
 	forwarder := NewForwarder("", discardLogf)
 	outputDir := filepath.Join(dir, "output")
+	chExited := make(chan struct{})
+	process := &channelSignaler{sent: make(chan os.Signal, 1)}
+	signalSeen := make(chan os.Signal, 1)
+	go func() {
+		signalSeen <- <-process.sent
+		close(chExited)
+	}()
 	_, err := handleExportRequest(
 		context.Background(),
 		ctl.Request{OutDir: outputDir, ResumeAfter: true},
@@ -895,7 +883,7 @@ func TestHandleExportRequestResumeReportsReattachFailure(t *testing.T) {
 				return bytes.NewReader(bytes.Repeat([]byte{0x52}, 4096)), nil, nil
 			},
 		}},
-		nil, chSock, filepath.Join(dir, "run"), "", nil,
+		nil, chSock, filepath.Join(dir, "run"), "", chExited, process,
 		&guestlink.Pinger{Client: &guestlink.HostClient{BasePath: guestSock}},
 		forwarder,
 		func() error { return errors.New("injected resumed export reattach failure") },
@@ -907,14 +895,17 @@ func TestHandleExportRequestResumeReportsReattachFailure(t *testing.T) {
 	if guestErr := waitLifecycleResult(t, guestDone); guestErr != nil {
 		t.Fatal(guestErr)
 	}
-	if got, want := strings.Join(chRequests(), ","), "/api/v1/vm.pause,/api/v1/vm.resume"; got != want {
+	if got, want := strings.Join(chRequests(), ","), "/api/v1/vm.pause,/api/v1/vm.resume,/api/v1/vmm.shutdown"; got != want {
 		t.Fatalf("CH requests = %q, want %q", got, want)
+	}
+	if signal := <-signalSeen; signal != syscall.SIGTERM {
+		t.Fatalf("reattach failure fallback signal = %v, want SIGTERM", signal)
 	}
 	forwarder.mu.Lock()
 	stillGated := forwarder.quiescing
 	forwarder.mu.Unlock()
-	if stillGated {
-		t.Fatal("forwarder remained gated after reattach failure")
+	if !stillGated {
+		t.Fatal("forwarder reopened after terminal reattach failure")
 	}
 	if _, statErr := os.Lstat(filepath.Join(outputDir, "test.sandbox")); statErr != nil {
 		t.Fatalf("committed export artifact was lost after recovery failure: %v", statErr)
@@ -957,6 +948,7 @@ func TestHandleExportRequestFailureResumesBeforeReattachAndDoesNotCommitAlias(t 
 		chSock,
 		filepath.Join(dir, "run"),
 		"",
+		nil,
 		nil,
 		&guestlink.Pinger{Client: &guestlink.HostClient{BasePath: guestSock}},
 		forwarder,
@@ -1008,7 +1000,7 @@ func TestHandleExportRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T) 
 
 	_, err := handleExportRequest(context.Background(), ctl.Request{}, opts, disks, nil,
 		filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"), "", nil,
-		pinger, nil, nil, nil, discardLogf)
+		nil, pinger, nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "--output and --upload") {
 		t.Fatalf("missing output error = %v", err)
 	}
@@ -1020,7 +1012,7 @@ func TestHandleExportRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T) 
 	cancel()
 	_, err = handleExportRequest(ctx, ctl.Request{OutDir: filepath.Join(dir, "output")}, opts, disks, nil,
 		filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"), "", nil,
-		pinger, nil, nil, nil, discardLogf)
+		nil, pinger, nil, func() error { return nil }, nil, discardLogf)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled export error = %v, want context.Canceled", err)
 	}
@@ -1142,6 +1134,72 @@ func waitLifecycleResult(t *testing.T, result <-chan error) error {
 	}
 }
 
+func TestHandleSnapshotRequestQuiescesWithoutPinger(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	events := &lifecycleEvents{}
+	guestDone := serveOneQuiesce(t, filepath.Join(runDir, "vsock.sock"), func(*proto.Message) error {
+		events.add("guest-quiesce")
+		return nil
+	})
+	chSock, chRequests := serveLifecycleCH(t, dir, func(path string) int {
+		events.add("ch:" + path)
+		if path == "/api/v1/vm.pause" {
+			return http.StatusInternalServerError
+		}
+		return http.StatusNoContent
+	})
+	mfd, err := memory.Create("snapshot-no-pinger", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	if err := portable.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	viewCalled := false
+	reattachCalls := 0
+	_, err = handleSnapshotRequest(
+		context.Background(), ctl.Request{OutDir: filepath.Join(dir, "out"), ResumeAfter: true},
+		RunOptions{Cfg: &config.SandboxConfig{}, PortableConfig: portable, SandboxID: "test"},
+		mfd, []SnapDiskRef{{
+			DiffPath: filepath.Join(dir, "diff"), Size: 4096,
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				viewCalled = true
+				return bytes.NewReader(make([]byte, 4096)), nil, nil
+			},
+		}}, nil, chSock, runDir, "", nil, nil, nil, nil,
+		func() error {
+			reattachCalls++
+			events.add("reattach")
+			return nil
+		}, nil, discardLogf,
+	)
+	if err == nil || !strings.Contains(err.Error(), "CH pause") {
+		t.Fatalf("snapshot error = %v, want CH pause failure", err)
+	}
+	if guestErr := waitLifecycleResult(t, guestDone); guestErr != nil {
+		t.Fatal(guestErr)
+	}
+	if got, want := strings.Join(chRequests(), ","), "/api/v1/vm.pause"; got != want {
+		t.Fatalf("CH requests = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(events.snapshot(), ","), "guest-quiesce,ch:/api/v1/vm.pause,reattach"; got != want {
+		t.Fatalf("snapshot recovery order = %q, want %q", got, want)
+	}
+	if viewCalled {
+		t.Fatal("disk SnapshotView opened after failed CH pause")
+	}
+	if reattachCalls != 1 {
+		t.Fatalf("reattach calls = %d, want 1", reattachCalls)
+	}
+}
+
 func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) {
 	dir := t.TempDir()
 	diff := filepath.Join(dir, "must-not-be-opened.diff")
@@ -1154,14 +1212,19 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 	mergeRef := false
 	req := ctl.Request{OutDir: filepath.Join(dir, "out"), MergeRef: &mergeRef}
 	viewCalled := false
+	mfd, err := memory.Create("disk-merge-preflight", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
 
-	_, err := handleSnapshotRequest(context.Background(), req, RunOptions{
+	_, err = handleSnapshotRequest(context.Background(), req, RunOptions{
 		Cfg: cfg, SandboxID: "test",
-		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{Root: config.PortableRootConfig{Base: "self"}}},
+		PortableConfig: snapshotTestLivePortable(t),
 		SourceBinding: &RunSourceBinding{
 			SandboxRef: parentRef, RuntimeRef: parentRef, RelativeDir: dir,
 		},
-	}, nil,
+	}, mfd,
 		[]SnapDiskRef{{
 			DiffPath: diff,
 			Size:     4096,
@@ -1169,8 +1232,8 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 				viewCalled = true
 				return bytes.NewReader(make([]byte, 4096)), nil, nil
 			},
-		}}, nil, "", filepath.Join(dir, "run"),
-		"", nil, pinger, nil, nil, nil, discardLogf)
+		}}, nil, filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"),
+		"", nil, nil, pinger, nil, func() error { return nil }, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") {
 		t.Fatalf("disk merge preflight error = %v", err)
 	}
@@ -1184,23 +1247,28 @@ func TestHandleSnapshotRequestResolvesUploadKeyBeforeSnapshotView(t *testing.T) 
 	cfg := &config.SandboxConfig{}
 	viewCalled := false
 	keyCalls := 0
-	_, err := handleSnapshotRequest(context.Background(), ctl.Request{Upload: true}, RunOptions{
+	mfd, err := memory.Create("upload-key-preflight", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	_, err = handleSnapshotRequest(context.Background(), ctl.Request{Upload: true}, RunOptions{
 		Cfg:            cfg,
-		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{Root: config.PortableRootConfig{Base: "self"}}},
+		PortableConfig: snapshotTestLivePortable(t),
 		SandboxID:      "test",
 		ManifestCfg:    &config.ManifestConfig{Store: manifest.StoreConfig{Endpoint: "unused"}},
 		CustomerKeyFn: func() ([32]byte, error) {
 			keyCalls++
 			return [32]byte{}, errors.New("invalid customer key")
 		},
-	}, nil, []SnapDiskRef{{
+	}, mfd, []SnapDiskRef{{
 		DiffPath: filepath.Join(dir, "diff"),
 		Size:     4096,
 		SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
 			viewCalled = true
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		},
-	}}, nil, "", filepath.Join(dir, "run"), "", nil, nil, nil, nil, nil, discardLogf)
+	}}, nil, filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"), "", nil, nil, nil, nil, func() error { return nil }, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "customer key") {
 		t.Fatalf("upload key error = %v", err)
 	}
@@ -1212,7 +1280,7 @@ func TestHandleSnapshotRequestResolvesUploadKeyBeforeSnapshotView(t *testing.T) 
 	}
 }
 
-func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
+func TestHandleSnapshotRequestTerminatesAfterFailedRecoveryReattach(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "vsock.sock")
 	listener, err := net.Listen("unix", base)
@@ -1274,6 +1342,7 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	var resumed atomic.Bool
+	var recoveryShutdown atomic.Bool
 	var pauseSawLiftedMemoryHigh atomic.Bool
 	chServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/vm.pause" {
@@ -1286,6 +1355,11 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 		}
 		if r.URL.Path == "/api/v1/vm.resume" {
 			resumed.Store(true)
+		}
+		if r.URL.Path == "/api/v1/vmm.shutdown" {
+			recoveryShutdown.Store(true)
+			http.Error(w, "injected recovery shutdown failure", http.StatusInternalServerError)
+			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})}
@@ -1306,6 +1380,13 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 	defer mfd.Close()
 	reattachCalls := 0
 	reattachedAfterResume := false
+	chExited := make(chan struct{})
+	process := &channelSignaler{sent: make(chan os.Signal, 1)}
+	signalSeen := make(chan os.Signal, 1)
+	go func() {
+		signalSeen <- <-process.sent
+		close(chExited)
+	}()
 	portable := snapshotTestPortable(t)
 	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
 	if err := portable.Validate(); err != nil {
@@ -1327,7 +1408,8 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 		chSock,
 		filepath.Join(dir, "run"),
 		dir,
-		nil,
+		chExited,
+		process,
 		&guestlink.Pinger{Client: &guestlink.HostClient{BasePath: base}},
 		nil,
 		func() error {
@@ -1357,6 +1439,12 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 	if !reattachedAfterResume {
 		t.Fatal("guest was not reattached after VM resume")
 	}
+	if !recoveryShutdown.Load() {
+		t.Fatal("failed snapshot recovery did not request VMM shutdown")
+	}
+	if signal := <-signalSeen; signal != syscall.SIGTERM {
+		t.Fatalf("snapshot recovery fallback signal = %v, want SIGTERM", signal)
+	}
 	if !quiesceSawLiftedMemoryHigh.Load() {
 		t.Fatal("guest quiesce did not run with memory.high lifted")
 	}
@@ -1385,6 +1473,16 @@ func snapshotTestPortable(t *testing.T) *config.PortableSandboxConfig {
 		},
 		Launch: config.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},
 	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func snapshotTestLivePortable(t *testing.T) *config.PortableSandboxConfig {
+	t.Helper()
+	cfg := snapshotTestPortable(t)
+	cfg.Boot.Root = config.PortableRootConfig{Base: "self"}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -1461,6 +1559,13 @@ func TestMergeBaseOpenersExcludeSandboxAndSnapshotZIPTails(t *testing.T) {
 type fakeSignaler struct {
 	mu   sync.Mutex
 	sent []os.Signal
+}
+
+type channelSignaler struct{ sent chan os.Signal }
+
+func (s *channelSignaler) Signal(sig os.Signal) error {
+	s.sent <- sig
+	return nil
 }
 
 func (f *fakeSignaler) Signal(sig os.Signal) error {
@@ -1597,7 +1702,7 @@ func TestVMMMemoryHighLifecycleGuard(t *testing.T) {
 	})
 }
 
-func TestDestroyAfterSnapshotRetainsBarrierWhenShutdownFails(t *testing.T) {
+func TestDestroyAfterSnapshotFallsBackToSIGTERMAndRetainsBarrier(t *testing.T) {
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "ch.sock")
 	listener, err := net.Listen("unix", sock)
@@ -1624,12 +1729,21 @@ func TestDestroyAfterSnapshotRetainsBarrierWhenShutdownFails(t *testing.T) {
 
 	chExited := make(chan struct{})
 	barrierReleased := make(chan struct{})
-	go destroyAfterSnapshot(sock, nil, func() { close(barrierReleased) }, chExited, time.Second, discardLogf)
+	process := &channelSignaler{sent: make(chan os.Signal, 2)}
+	go destroyAfterSnapshot(sock, process, nil, func() { close(barrierReleased) }, chExited, time.Second, discardLogf)
 
 	select {
 	case <-requestSeen:
 	case <-time.After(time.Second):
 		t.Fatal("destroy shutdown request was not sent")
+	}
+	select {
+	case signal := <-process.sent:
+		if signal != syscall.SIGTERM {
+			t.Fatalf("shutdown fallback signal = %v, want SIGTERM", signal)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed vmm.shutdown did not signal the CH process")
 	}
 	select {
 	case <-barrierReleased:
@@ -1641,6 +1755,49 @@ func TestDestroyAfterSnapshotRetainsBarrierWhenShutdownFails(t *testing.T) {
 	case <-barrierReleased:
 	case <-time.After(time.Second):
 		t.Fatal("destroy barrier was not released after VMM exit")
+	}
+}
+
+func TestDestroyAfterSnapshotReleasesBarrierWhenExitNotificationNeverArrives(t *testing.T) {
+	chSock := filepath.Join(t.TempDir(), "missing-ch.sock")
+	chExited := make(chan struct{})
+	barrierReleased := make(chan struct{})
+	process := &channelSignaler{sent: make(chan os.Signal, 2)}
+	done := make(chan struct{})
+	go func() {
+		destroyAfterSnapshotWithBounds(
+			chSock,
+			process,
+			nil,
+			func() { close(barrierReleased) },
+			chExited,
+			time.Second,
+			0,
+			0,
+			discardLogf,
+		)
+		close(done)
+	}()
+
+	for _, want := range []os.Signal{syscall.SIGTERM, syscall.SIGKILL} {
+		select {
+		case got := <-process.sent:
+			if got != want {
+				t.Fatalf("destroy signal = %v, want %v", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("destroy did not send %v", want)
+		}
+	}
+	select {
+	case <-barrierReleased:
+	case <-time.After(time.Second):
+		t.Fatal("destroy did not release lifecycle barrier after bounded SIGKILL wait")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("destroy goroutine remained blocked without an exit notification")
 	}
 }
 
@@ -2190,6 +2347,17 @@ func TestWaitForCH_DoubleSIGTERM_EscalatesImmediately(t *testing.T) {
 	}
 	if elapsed > 1*time.Second {
 		t.Fatalf("immediate escalation took too long: %v", elapsed)
+	}
+}
+
+func TestValidateSandboxIDRejectsPathComponents(t *testing.T) {
+	for _, sandboxID := range []string{"", ".", "..", "../escape", "nested/id", `nested\id`} {
+		if err := validateSandboxID(sandboxID); err == nil {
+			t.Fatalf("validateSandboxID(%q) succeeded", sandboxID)
+		}
+	}
+	if err := validateSandboxID("sandbox-123"); err != nil {
+		t.Fatalf("validateSandboxID(valid): %v", err)
 	}
 }
 

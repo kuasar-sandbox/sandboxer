@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
+	"golang.org/x/sys/unix"
 )
 
 type LogicalRole string
@@ -229,7 +230,7 @@ func (p *Publisher) publishSandboxRoot(ctx context.Context, identity string, sco
 	if err != nil {
 		return "", err
 	}
-	source, err := sandboxfile.BuildSource(root.Payload, root.ImageConfig, runtimeConfig)
+	source, err := sandboxfile.BuildSourceContext(ctx, root.Payload, root.ImageConfig, runtimeConfig)
 	if err != nil {
 		return "", err
 	}
@@ -452,10 +453,18 @@ func ensurePublishDirectory(path string) error {
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return fmt.Errorf("create publish location: %w", err)
 	}
-	directory, err := os.Open(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return err
 	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("publish location must be a real directory, not a symlink or non-directory")
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	directory := os.NewFile(uintptr(fd), path)
 	syncErr := directory.Sync()
 	closeErr := directory.Close()
 	return errors.Join(syncErr, closeErr)

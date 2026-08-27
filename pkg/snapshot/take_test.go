@@ -137,6 +137,87 @@ func TestTakeResumesAfterDestroyModeFailure(t *testing.T) {
 	}
 }
 
+func TestTakeSinkCloseFailureResumesBackendsAndCH(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	if err := os.Mkdir(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mfd, err := memory.Create("take-close-failure", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+
+	sock := filepath.Join(dir, "ch.sock")
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var requests []string
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path == "/api/v1/vm.snapshot" {
+			if err := os.WriteFile(filepath.Join(staging, "config.json"), []byte(`{"vm":"config"}`), 0o600); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if err := os.WriteFile(filepath.Join(staging, "state.json"), []byte(`{"vm":"state"}`), 0o600); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	serveDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(serveDone)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-serveDone
+	})
+
+	portable := exportTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	portable.Boot.Disks = nil
+	portable.Mounts = nil
+	events := &takeEvents{}
+	quiescer := &freezeTrackingQuiescer{}
+	sink := &takeCaptureSink{
+		events: events, frozen: &quiescer.frozen,
+		closeErr: errors.New("injected close failure"),
+	}
+	_, err = Take(Sources{
+		Context: context.Background(), SandboxID: "close-failure", APISock: sock,
+		MemfdFD: mfd.FD(), MemfdSize: int64(mfd.Size()), StagingDir: staging,
+		PortableConfig: portable, CHApiDeadline: time.Second, Quiescer: quiescer,
+		Diffs: []DiskDiff{{SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			return bytes.NewReader(make([]byte, 4096)), nil, nil
+		}}},
+	}, sink, false)
+	if err == nil || !strings.Contains(err.Error(), "close artifact sink") || !strings.Contains(err.Error(), "injected close failure") {
+		t.Fatalf("Take error = %v, want sink close failure", err)
+	}
+	if sink.closes != 1 {
+		t.Fatalf("artifact sink closes = %d, want 1", sink.closes)
+	}
+	if quiescer.quiesce.Load() != 1 || quiescer.resume.Load() != 1 || quiescer.frozen.Load() {
+		t.Fatalf("backend lifecycle quiesce=%d resume=%d frozen=%v",
+			quiescer.quiesce.Load(), quiescer.resume.Load(), quiescer.frozen.Load())
+	}
+	mu.Lock()
+	got := strings.Join(requests, ",")
+	mu.Unlock()
+	if want := "/api/v1/vm.pause,/api/v1/vm.snapshot,/api/v1/vm.resume"; got != want {
+		t.Fatalf("CH requests = %q, want %q", got, want)
+	}
+}
+
 func TestTakeBuildsSandboxAndMemorySnapshotAtOneFreezePoint(t *testing.T) {
 	dir := t.TempDir()
 	staging := filepath.Join(dir, "staging")
@@ -223,13 +304,16 @@ func TestTakeBuildsSandboxAndMemorySnapshotAtOneFreezePoint(t *testing.T) {
 	wantOrder := []string{
 		"ch:/api/v1/vm.pause", "disk-view", "sink:sandbox",
 		"ch:/api/v1/vm.snapshot", "sink:snapshot", "sink:commit-snapshot",
-		"ch:/api/v1/vm.resume",
+		"sink:close", "ch:/api/v1/vm.resume",
 	}
 	if got := events.snapshot(); !reflect.DeepEqual(got, wantOrder) {
 		t.Fatalf("snapshot E/S order = %v, want %v", got, wantOrder)
 	}
 	if out.SandboxRef != sink.sandboxRef || out.SnapshotRef != sink.snapshotRef {
 		t.Fatalf("Take refs = E:%q S:%q", out.SandboxRef, out.SnapshotRef)
+	}
+	if sink.closes != 1 {
+		t.Fatalf("artifact sink closes = %d, want 1", sink.closes)
 	}
 
 	eSource, err := sparse.NewSource(bytes.NewReader(sink.sandboxBody), uint64(len(sink.sandboxBody)), nil)
@@ -319,6 +403,8 @@ type takeCaptureSink struct {
 	snapshotBody []byte
 	sandboxRef   string
 	snapshotRef  string
+	closeErr     error
+	closes       int
 }
 
 func (s *takeCaptureSink) AbsorbOverlay(context.Context, io.ReadSeeker, []sparse.Extent) (string, string, error) {
@@ -367,6 +453,15 @@ func (s *takeCaptureSink) CommitSnapshot(context.Context, string, string) error 
 	}
 	s.events.add("sink:commit-snapshot")
 	return nil
+}
+
+func (s *takeCaptureSink) Close() error {
+	if !s.frozen.Load() {
+		return errors.New("artifact sink closed outside backend freeze")
+	}
+	s.closes++
+	s.events.add("sink:close")
+	return s.closeErr
 }
 
 func readTakeSource(ctx context.Context, source sparse.Source) ([]byte, error) {

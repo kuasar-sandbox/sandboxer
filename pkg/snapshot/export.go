@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -45,7 +47,13 @@ type SandboxOutput struct {
 // Export pauses CH, quiesces every block backend, captures one Sandbox E and
 // commits E as the operation root. The entire sink read stays inside the
 // quiesced window so BlockCOW SnapshotView cannot change underneath it.
-func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resumeAfter bool) (*SandboxOutput, error) {
+func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resumeAfter bool) (_ *SandboxOutput, retErr error) {
+	sinkOpen := sink != nil
+	defer func() {
+		if sinkOpen {
+			retErr = errors.Join(retErr, closeArtifactSink(sink))
+		}
+	}()
 	if err := validateExportSources(sources, sink); err != nil {
 		return nil, err
 	}
@@ -66,14 +74,26 @@ func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resum
 		}
 	}()
 	sources.Quiescer.Quiesce()
-	defer sources.Quiescer.Resume()
+	backendsResumed := false
+	defer func() {
+		if !backendsResumed {
+			sources.Quiescer.Resume()
+		}
+	}()
 
 	dumpStart := time.Now()
 	out, err := captureSandboxAtFreeze(ctx, sources, sink, true)
 	if err != nil {
 		return nil, err
 	}
+	closeErr := closeArtifactSink(sink)
+	sinkOpen = false
+	if closeErr != nil {
+		return nil, closeErr
+	}
 	if resumeAfter {
+		sources.Quiescer.Resume()
+		backendsResumed = true
 		if err := ch.Resume(); err != nil {
 			return nil, fmt.Errorf("export CH resume: %w", err)
 		}
@@ -83,6 +103,16 @@ func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resum
 	out.WallclockDumpMs = time.Since(dumpStart).Milliseconds()
 	succeeded = true
 	return out, nil
+}
+
+func closeArtifactSink(sink ArtifactSink) error {
+	if sink == nil {
+		return nil
+	}
+	if err := sink.Close(); err != nil {
+		return fmt.Errorf("close artifact sink: %w", err)
+	}
+	return nil
 }
 
 func validateExportSources(sources ExportSources, sink ArtifactSink) error {
@@ -111,8 +141,9 @@ func validateExportSources(sources ExportSources, sink ArtifactSink) error {
 		if err != nil {
 			return fmt.Errorf("export: parent Sandbox ref: %w", err)
 		}
-		if !ref.Portable() {
-			return errors.New("export: parent Sandbox ref is not portable")
+		if ref.Scheme == manifest.RefSchemeFile &&
+			(filepath.IsAbs(ref.Path) || filepath.Base(ref.Path) != ref.Path || strings.ContainsAny(ref.Path, `/\`) || ref.Digest == "") {
+			return errors.New("export: parent Sandbox file ref must be a basename content identity")
 		}
 	}
 	if sources.Quiescer == nil {
@@ -136,7 +167,7 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 		DataPaths: make([]string, max(0, len(sources.Diffs)-1)),
 	}
 	for i := 1; i < len(sources.Diffs); i++ {
-		view, holes, cleanup, err := prepareDiskCapture(sources.Diffs[i], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
+		view, holes, cleanup, err := prepareDiskCapture(ctx, sources.Diffs[i], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
 		if err != nil {
 			return nil, fmt.Errorf("export data disk %d SnapshotView: %w", i-1, err)
 		}
@@ -162,7 +193,7 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 	if err != nil {
 		return nil, err
 	}
-	rootView, rootHoles, rootCleanup, err := prepareDiskCapture(sources.Diffs[0], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
+	rootView, rootHoles, rootCleanup, err := prepareDiskCapture(ctx, sources.Diffs[0], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
 	if err != nil {
 		return nil, fmt.Errorf("export root SnapshotView: %w", err)
 	}
@@ -176,7 +207,7 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 	if err != nil {
 		return nil, fmt.Errorf("export root source: %w", err)
 	}
-	sandboxSource, err := sandboxfile.BuildSource(rootSource, nil, runtimeConfig)
+	sandboxSource, err := sandboxfile.BuildSourceContext(ctx, rootSource, nil, runtimeConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +229,7 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 	return out, nil
 }
 
-func prepareDiskCapture(d DiskDiff, codec tarstream.Codec, required bool, opener MergeBaseOpener) (io.ReadSeeker, []sparse.Extent, func() error, error) {
+func prepareDiskCapture(ctx context.Context, d DiskDiff, codec tarstream.Codec, required bool, opener MergeBaseOpener) (io.ReadSeeker, []sparse.Extent, func() error, error) {
 	if d.SnapshotView == nil {
 		return nil, nil, nil, errors.New("nil SnapshotView")
 	}
@@ -214,7 +245,7 @@ func prepareDiskCapture(d DiskDiff, codec tarstream.Codec, required bool, opener
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	base, baseHoles, err := openMergeBaseWithOpener(d.MergeBase, size, codec, required, opener)
+	base, baseHoles, err := openMergeBaseWithOpener(ctx, d.MergeBase, size, codec, required, opener)
 	if err != nil {
 		return nil, nil, nil, err
 	}

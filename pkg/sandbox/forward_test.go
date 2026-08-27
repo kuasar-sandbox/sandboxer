@@ -187,3 +187,66 @@ func TestForwarderPauseAndDrainClosesDialHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestForwarderExecAdmissionFollowsCaptureGate(t *testing.T) {
+	f := NewForwarder("", func(string, ...any) {})
+	if !f.ExecAllowed() {
+		t.Fatal("new forwarder rejected exec admission")
+	}
+	f.PauseAndDrain()
+	if f.ExecAllowed() {
+		t.Fatal("paused forwarder admitted exec")
+	}
+	f.Resume()
+	if !f.ExecAllowed() {
+		t.Fatal("resumed forwarder rejected exec admission")
+	}
+	f.Close()
+	if f.ExecAllowed() {
+		t.Fatal("closed forwarder admitted exec")
+	}
+}
+
+func TestForwarderPauseAndDrainClosesAndJoinsExec(t *testing.T) {
+	f := NewForwarder("", func(string, ...any) {})
+	handler, peer := net.Pipe()
+	defer peer.Close()
+	if !f.beginExec(handler) {
+		t.Fatal("exec admission rejected before capture")
+	}
+
+	connClosed := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	go func() {
+		defer f.endExec(handler)
+		_, _ = handler.Read(make([]byte, 1))
+		close(connClosed)
+		<-releaseHandler
+	}()
+
+	drained := make(chan struct{})
+	go func() {
+		f.PauseAndDrain()
+		close(drained)
+	}()
+
+	select {
+	case <-connClosed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("capture did not close the admitted exec connection")
+	}
+	select {
+	case <-drained:
+		t.Fatal("PauseAndDrain returned before the exec handler exited")
+	default:
+	}
+	if f.beginExec(peer) {
+		t.Fatal("capture gate admitted a new exec while draining")
+	}
+	close(releaseHandler)
+	select {
+	case <-drained:
+	case <-time.After(3 * time.Second):
+		t.Fatal("PauseAndDrain did not join the admitted exec handler")
+	}
+}

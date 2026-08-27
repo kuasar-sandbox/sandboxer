@@ -162,7 +162,11 @@ func TestSnapshotProtocolKeepsStagingAndTypedDropCachesResult(t *testing.T) {
 		t.Fatalf("staging_dir = %q, want %q", gotReq.StagingDir, wantReq.StagingDir)
 	}
 
-	wantResp := Response{Type: TypeSnapshotDone, DropCachesResult: proto.DropCachesSkipped}
+	wantResp := Response{
+		Type: TypeSnapshotDone, DropCachesResult: proto.DropCachesSkipped,
+		SnapshotRef: "file://snapshot.snapshot@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SandboxRef:  "file://sandbox.sandbox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}
 	buf.Reset()
 	if err := WriteMessage(&buf, &wantResp); err != nil {
 		t.Fatal(err)
@@ -173,5 +177,9 @@ func TestSnapshotProtocolKeepsStagingAndTypedDropCachesResult(t *testing.T) {
 	}
 	if gotResp.DropCachesResult != proto.DropCachesSkipped {
 		t.Fatalf("drop_caches_result = %q, want %q", gotResp.DropCachesResult, proto.DropCachesSkipped)
+	}
+	if gotResp.SnapshotRef != wantResp.SnapshotRef || gotResp.SandboxRef != wantResp.SandboxRef {
+		t.Fatalf("snapshot response refs = S:%q E:%q, want S:%q E:%q",
+			gotResp.SnapshotRef, gotResp.SandboxRef, wantResp.SnapshotRef, wantResp.SandboxRef)
 	}
 }

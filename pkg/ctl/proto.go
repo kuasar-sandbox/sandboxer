@@ -66,6 +66,7 @@ type Response struct {
 	WallclockDumpMs     int64                  `json:"wallclock_dump_ms,omitempty"`
 	SnapshotManifestKey string                 `json:"snapshot_manifest_key,omitempty"`
 	OverlayManifestKey  string                 `json:"overlay_manifest_key,omitempty"`
+	SnapshotRef         string                 `json:"snapshot_ref,omitempty"`
 	SnapshotPath        string                 `json:"snapshot_path,omitempty"`
 	OverlayPath         string                 `json:"overlay_path,omitempty"`
 	OverlayRef          string                 `json:"overlay_ref,omitempty"`

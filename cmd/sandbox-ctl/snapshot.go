@@ -32,8 +32,20 @@ func snapshotCmd(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "snapshot: unexpected positional arguments")
+		return 2
+	}
 	if *sandboxID == "" {
 		fmt.Fprintln(os.Stderr, "snapshot: --sandbox-id required")
+		return 2
+	}
+	if err := validateSandboxIDArg(*sandboxID); err != nil {
+		fmt.Fprintf(os.Stderr, "snapshot: --sandbox-id: %v\n", err)
+		return 2
+	}
+	if *timeoutS < 0 {
+		fmt.Fprintln(os.Stderr, "snapshot: --timeout must be >= 0")
 		return 2
 	}
 	modeSet := false
@@ -62,16 +74,12 @@ func snapshotCmd(args []string) int {
 	}
 
 	if *outDir != "" {
-		abs, err := filepath.Abs(*outDir)
+		abs, err := prepareArtifactOutputDir(*outDir)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintf(os.Stderr, "snapshot: output directory: %v\n", err)
 			return 1
 		}
 		*outDir = abs
-		if err := os.MkdirAll(*outDir, 0o755); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
 	}
 
 	rd := *runRoot

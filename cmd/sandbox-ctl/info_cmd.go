@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -29,12 +28,13 @@ func infoCmd(args []string) int {
 		return 2
 	}
 	input := fs.Arg(0)
-	if input == "" {
+	if input == "" || fs.NArg() != 1 {
 		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl info [--json] [--manifest-config <file>] [--ref-location name=file:///path ...] <artifact-ref-or-path>")
 		return 2
 	}
 
-	ctx := context.Background()
+	ctx, stopSignals := commandContext()
+	defer stopSignals()
 	manifestCfg, err := config.LoadManifestConfig(*manifestPath)
 	if err != nil {
 		if !errors.Is(err, manifest.ErrConfigNotProvided) {

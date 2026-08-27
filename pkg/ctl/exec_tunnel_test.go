@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -474,7 +475,7 @@ func assertGenericExecRejection(t *testing.T, raw []byte) {
 	if err := ReadMessage(bytes.NewReader(raw), &response); err != nil {
 		t.Fatalf("read generic rejection: %v (raw %q)", err, raw)
 	}
-	if response != (Response{Type: TypeError, Msg: "exec request rejected"}) {
+	if !reflect.DeepEqual(response, Response{Type: TypeError, Msg: "exec request rejected"}) {
 		t.Fatalf("response = %+v, want generic exec rejection", response)
 	}
 }

@@ -3,7 +3,6 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"net"
 	"os"
 	"strconv"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/fwd"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
@@ -140,12 +140,14 @@ func finishOpenForward(conn net.Conn, spec *proto.ConnectSpec) (net.Conn, error)
 // Forwarder runs the host side of `sandbox-ctl run --connect`: one
 // listener per ForwardSpec, each accepted connection spliced to the guest
 // via a per-connection reverse channel (OpenForward/openAccept → fwd.Relay).
-// It tracks live relays so a snapshot can gate new ones (PauseAndDrain) and collapse
-// active ones (CloseActive), mirroring the guest's quiesce teardown; the
-// guest closes its ends authoritatively (lingered), this just promptly
-// drops the host halves. Accept-mode forwards also park a reverse conn while
-// waiting for the guest's accept; those pre-relay conns are tracked in
-// `pending` so the same snapshot/shutdown teardown collapses them too.
+// It tracks live relays so a capture can gate new ones (PauseAndDrain) and
+// collapse active ones (CloseActive), mirroring the guest's quiesce teardown.
+// The same quiescing bit gates new exec requests; admitted ctl connections are
+// tracked and joined together with forwards. The guest closes its ends
+// authoritatively (lingered), while this promptly drops the host halves.
+// Accept-mode forwards also park a reverse conn while waiting for the guest's
+// accept; those pre-relay conns are tracked in `pending` so the same
+// snapshot/shutdown teardown collapses them too.
 type Forwarder struct {
 	vsockBase string
 	logf      func(string, ...any)
@@ -155,7 +157,8 @@ type Forwarder struct {
 	mu        sync.Mutex
 	relays    map[*fwd.Relay]struct{}
 	pending   map[net.Conn]struct{} // dial/accept reverse conns awaiting connect_ack
-	inflight  sync.WaitGroup        // serve goroutines admitted before the quiesce gate
+	execs     map[net.Conn]struct{} // ctl exec conns admitted before the quiesce gate
+	inflight  sync.WaitGroup        // forward/exec goroutines admitted before the quiesce gate
 	quiescing bool
 	closed    bool
 }
@@ -168,6 +171,7 @@ func NewForwarder(vsockBase string, logf func(string, ...any)) *Forwarder {
 		logf:      logf,
 		relays:    make(map[*fwd.Relay]struct{}),
 		pending:   make(map[net.Conn]struct{}),
+		execs:     make(map[net.Conn]struct{}),
 	}
 }
 
@@ -274,6 +278,41 @@ func (f *Forwarder) beginServe() bool {
 	return true
 }
 
+// ExecAllowed reports whether a new ctl exec request could currently be
+// admitted. Actual handlers use beginExec so admission and inflight tracking
+// are atomic with PauseAndDrain setting the capture gate.
+func (f *Forwarder) ExecAllowed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.quiescing && !f.closed
+}
+
+// beginExec atomically admits and tracks a ctl exec connection. Capture closes
+// every tracked connection, then waits for its handler to return before asking
+// the guest to quiesce; this prevents a request that passed a point-in-time
+// gate check from creating a reverse-channel session inside the freeze window.
+func (f *Forwarder) beginExec(c net.Conn) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.quiescing || f.closed {
+		return false
+	}
+	f.execs[c] = struct{}{}
+	f.inflight.Add(1)
+	return true
+}
+
+func (f *Forwarder) endExec(c net.Conn) {
+	f.mu.Lock()
+	if _, ok := f.execs[c]; ok {
+		delete(f.execs, c)
+		f.mu.Unlock()
+		f.inflight.Done()
+		return
+	}
+	f.mu.Unlock()
+}
+
 func (f *Forwarder) track(r *fwd.Relay) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -365,10 +404,10 @@ func (f *Forwarder) untrackPending(c net.Conn) {
 	f.mu.Unlock()
 }
 
-// PauseAndDrain gates new forwards, closes every pending handshake and live
-// relay admitted before the gate, then waits for their serve goroutines to
-// return. When it completes, no host-side forward can emit teardown after the
-// guest's subsequent quiesced response.
+// PauseAndDrain gates new forwards and execs, closes every pending handshake,
+// live relay, and ctl exec admitted before the gate, then waits for all their
+// handlers to return. When it completes, no host-side session can initiate or
+// emit teardown after the guest's subsequent quiesced response.
 func (f *Forwarder) PauseAndDrain() {
 	f.mu.Lock()
 	f.quiescing = true
@@ -385,6 +424,9 @@ func (f *Forwarder) Resume() { f.mu.Lock(); f.quiescing = false; f.mu.Unlock() }
 // window. The guest closes its ends authoritatively (lingered) so the
 // snapshot is clean; this just collapses the host-side halves promptly.
 func (f *Forwarder) CloseActive() {
+	for _, c := range f.snapshotExecs() {
+		_ = c.Close()
+	}
 	for _, c := range f.snapshotPending() {
 		_ = c.Close()
 	}
@@ -404,12 +446,25 @@ func (f *Forwarder) Close() {
 	f.closed = true
 	f.mu.Unlock()
 	f.closeListeners()
+	for _, c := range f.snapshotExecs() {
+		_ = c.Close()
+	}
 	for _, c := range f.snapshotPending() {
 		_ = c.Close()
 	}
 	for _, r := range f.snapshotRelays() {
 		r.Shutdown(nil)
 	}
+}
+
+func (f *Forwarder) snapshotExecs() []net.Conn {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	result := make([]net.Conn, 0, len(f.execs))
+	for c := range f.execs {
+		result = append(result, c)
+	}
+	return result
 }
 
 func (f *Forwarder) snapshotRelays() []*fwd.Relay {

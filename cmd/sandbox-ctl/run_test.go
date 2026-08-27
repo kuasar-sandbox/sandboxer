@@ -41,6 +41,24 @@ func captureStderr(t *testing.T, fn func() int) (int, string) {
 	return rc, string(body)
 }
 
+func TestRunCmdRejectsUnsafeSandboxID(t *testing.T) {
+	rc, stderr := captureStderr(t, func() int {
+		return runCmd([]string{"--sandbox-id", "../escape", "--config", "missing.yaml"})
+	})
+	if rc != 2 || !strings.Contains(stderr, "one non-empty path component") {
+		t.Fatalf("runCmd rc=%d stderr=%q", rc, stderr)
+	}
+}
+
+func TestRunCmdRejectsPositionalArguments(t *testing.T) {
+	rc, stderr := captureStderr(t, func() int {
+		return runCmd([]string{"--config", "missing.yaml", "extra"})
+	})
+	if rc != 2 || !strings.Contains(stderr, "unexpected positional arguments") {
+		t.Fatalf("runCmd rc=%d stderr=%q", rc, stderr)
+	}
+}
+
 func callRunRestoreForValidation(t *testing.T, cfg *config.SandboxConfig, manifestCfg *config.ManifestConfig, runRoot string) (int, string) {
 	t.Helper()
 	return captureStderr(t, func() int {

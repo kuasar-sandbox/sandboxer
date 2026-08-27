@@ -267,10 +267,23 @@ func OpenEROFSArtifact(ctx context.Context, stream fetch.Stream) (*FlattenedImag
 	}, nil
 }
 
-// BuildSource appends the canonical strict ZIP to payload without flattening
-// its sparse map. imageConfig nil selects the live layout; non-nil selects the
-// EROFS layout and is preserved byte-for-byte.
+// BuildSource appends the canonical strict ZIP using a background context.
+// Request paths should use BuildSourceContext so cancellation also covers the
+// EROFS superblock read performed before the output stream is constructed.
 func BuildSource(payload sparse.Source, imageConfig, runtimeConfig []byte) (sparse.Source, error) {
+	return BuildSourceContext(context.Background(), payload, imageConfig, runtimeConfig)
+}
+
+// BuildSourceContext appends the canonical strict ZIP to payload without
+// flattening its sparse map. imageConfig nil selects the live layout; non-nil
+// selects the EROFS layout and is preserved byte-for-byte.
+func BuildSourceContext(ctx context.Context, payload sparse.Source, imageConfig, runtimeConfig []byte) (sparse.Source, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if payload == nil {
 		return nil, errors.New("sandbox build: nil root payload")
 	}
@@ -299,10 +312,11 @@ func BuildSource(payload sparse.Source, imageConfig, runtimeConfig []byte) (spar
 		if portable.Boot.Root.Base != "self" || portable.Boot.Root.Overlay == nil || portable.Boot.Root.Overlay.Base != "" {
 			return nil, errors.New("sandbox build EROFS layout requires boot.root.base=self and an empty overlay graph")
 		}
-		erofsSize, err := image.ReadEROFSSize(sourceReaderAt{source: payload})
+		preparedPayload, erofsSize, err := prepareEROFSBuildPayload(ctx, payload)
 		if err != nil {
 			return nil, fmt.Errorf("sandbox build EROFS payload: %w", err)
 		}
+		payload = preparedPayload
 		if erofsSize != payload.Size() {
 			return nil, fmt.Errorf("sandbox build EROFS logical size %d does not equal payload size %d", erofsSize, payload.Size())
 		}
@@ -656,13 +670,137 @@ func (r streamReaderAt) ReadAt(buffer []byte, offset int64) (int, error) {
 	return r.stream.ReadAt(r.ctx, buffer, uint64(offset))
 }
 
-type sourceReaderAt struct{ source sparse.Source }
+const erofsBuildProbeBytes = 1024 + 128
 
-func (r sourceReaderAt) ReadAt(buffer []byte, offset int64) (int, error) {
-	if offset < 0 {
+type prefetchedSourceRun struct {
+	offset uint64
+	end    uint64
+	kind   sparse.RunKind
+	body   []byte
+}
+
+func (r prefetchedSourceRun) Offset() uint64       { return r.offset }
+func (r prefetchedSourceRun) End() uint64          { return r.end }
+func (r prefetchedSourceRun) Kind() sparse.RunKind { return r.kind }
+
+func (r prefetchedSourceRun) ReadAt(ctx context.Context, buffer []byte, innerOffset uint64) (int, error) {
+	if innerOffset > r.end-r.offset || uint64(len(buffer)) > r.end-r.offset-innerOffset {
+		return 0, errors.New("sandbox prefetched run read is out of bounds")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if r.kind == sparse.Hole || r.kind == sparse.Zero {
+		clear(buffer)
+		return len(buffer), nil
+	}
+	start := r.offset + innerOffset
+	copy(buffer, r.body[start:start+uint64(len(buffer))])
+	return len(buffer), nil
+}
+
+type prefetchedSource struct {
+	inner  sparse.Source
+	prefix []byte
+	runs   []prefetchedSourceRun
+}
+
+func (s *prefetchedSource) Size() uint64 { return s.inner.Size() }
+
+func (s *prefetchedSource) RunAt(offset, limit uint64) (sparse.Run, error) {
+	if offset >= s.Size() {
+		return nil, io.EOF
+	}
+	if limit == 0 {
+		return nil, errors.New("sandbox prefetched source RunAt limit is zero")
+	}
+	if offset >= uint64(len(s.prefix)) {
+		return s.inner.RunAt(offset, limit)
+	}
+	bound := offset + limit
+	if bound < offset || bound > uint64(len(s.prefix)) {
+		bound = uint64(len(s.prefix))
+	}
+	for _, run := range s.runs {
+		if offset < run.offset || offset >= run.end {
+			continue
+		}
+		end := run.end
+		if end > bound {
+			end = bound
+		}
+		return prefetchedSourceRun{offset: offset, end: end, kind: run.kind, body: s.prefix}, nil
+	}
+	return nil, fmt.Errorf("sandbox prefetched source has no run at offset %d", offset)
+}
+
+func (s *prefetchedSource) ReadAt(ctx context.Context, buffer []byte, offset uint64) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if offset >= s.Size() {
 		return 0, io.EOF
 	}
-	return r.source.ReadAt(context.Background(), buffer, uint64(offset))
+	want := len(buffer)
+	if uint64(want) > s.Size()-offset {
+		want = int(s.Size() - offset)
+	}
+	written := 0
+	if offset < uint64(len(s.prefix)) {
+		prefixEnd := uint64(len(s.prefix))
+		if prefixEnd > offset+uint64(want) {
+			prefixEnd = offset + uint64(want)
+		}
+		written = copy(buffer[:want], s.prefix[offset:prefixEnd])
+		offset += uint64(written)
+	}
+	if written < want {
+		n, err := s.inner.ReadAt(ctx, buffer[written:want], offset)
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if written != want {
+			return written, io.ErrUnexpectedEOF
+		}
+	}
+	if want != len(buffer) {
+		return written, io.EOF
+	}
+	return written, nil
+}
+
+// prepareEROFSBuildPayload validates the EROFS superblock without requiring a
+// random-access Source. It consumes only the minimum prefix once, records its
+// authoritative Hole/Zero/Data runs, and returns a wrapper that replays that
+// prefix before continuing monotonically through the original source.
+func prepareEROFSBuildPayload(ctx context.Context, source sparse.Source) (sparse.Source, uint64, error) {
+	prefixSize := min(source.Size(), uint64(erofsBuildProbeBytes))
+	prefix := make([]byte, int(prefixSize))
+	runs := make([]prefetchedSourceRun, 0, 4)
+	for offset := uint64(0); offset < prefixSize; {
+		run, err := source.RunAt(offset, prefixSize-offset)
+		if err != nil {
+			return nil, 0, err
+		}
+		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > prefixSize {
+			return nil, 0, fmt.Errorf("invalid sparse run at offset %d", offset)
+		}
+		runs = append(runs, prefetchedSourceRun{offset: offset, end: run.End(), kind: run.Kind()})
+		offset = run.End()
+	}
+	n, err := source.ReadAt(ctx, prefix, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, 0, err
+	}
+	if n != len(prefix) {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+	erofsSize, err := image.ReadEROFSSize(bytes.NewReader(prefix))
+	if err != nil {
+		return nil, 0, err
+	}
+	return &prefetchedSource{inner: source, prefix: prefix, runs: runs}, erofsSize, nil
 }
 
 type streamOwner struct {
@@ -738,11 +876,20 @@ func (s *sectionStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 	if err != nil {
 		return nil, err
 	}
-	runEnd := run.End() - s.base
-	if runEnd > end {
-		runEnd = end
+	wantOffset := s.base + offset
+	wantEnd := s.base + end
+	if run == nil || run.Offset() != wantOffset || run.End() <= wantOffset || run.End() > wantEnd {
+		return nil, errors.New("sandbox section source returned invalid run")
 	}
-	if run.Offset() != s.base+offset || runEnd <= offset {
+	// Sandbox payload is a prefix section (base == 0). Return the carrier Run
+	// unchanged so manifest-only capabilities such as fetch.ChunkRun survive
+	// through the logical Sandbox boundary. The strict wantEnd check above
+	// prevents the returned Run from exposing any byte in the ZIP tail.
+	if s.base == 0 {
+		return run, nil
+	}
+	runEnd := run.End() - s.base
+	if runEnd <= offset {
 		return nil, errors.New("sandbox section source returned invalid run")
 	}
 	return sectionRun{inner: run, offset: offset, end: runEnd}, nil
@@ -812,6 +959,9 @@ func (s *appendedSource) RunAt(offset, limit uint64) (sparse.Run, error) {
 		run, err := s.payload.RunAt(offset, payloadEnd-offset)
 		if err != nil {
 			return nil, err
+		}
+		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > payloadEnd {
+			return nil, errors.New("sandbox appended payload returned invalid run")
 		}
 		return appendedRun{source: s, offset: offset, end: run.End(), kind: run.Kind(), payloadRun: run}, nil
 	}

@@ -2,7 +2,9 @@ package guestlink
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -39,43 +41,60 @@ type HostClient struct {
 // (we observed payload-size=824200015 = 0x31204B4F = "OK 1" in tests
 // before this drain was added).
 func (c *HostClient) RoundTrip(req *proto.Message, deadline time.Duration) (*proto.Message, error) {
-	end := time.Now().Add(deadline)
+	return c.RoundTripContext(context.Background(), req, deadline)
+}
 
-	// net.DialTimeout takes a timeout (relative duration), not a
-	// deadline. Use the smaller of (remaining budget, deadline).
-	remaining := time.Until(end)
-	if remaining <= 0 {
-		return nil, fmt.Errorf("launchclient: deadline already exceeded")
+// RoundTripContext is RoundTrip with cancellation spanning CONNECT/OK and the
+// request/response exchange. It is used by the pinger so capture can cancel and
+// join an admitted probe before asking the guest to quiesce.
+func (c *HostClient) RoundTripContext(ctx context.Context, req *proto.Message, deadline time.Duration) (*proto.Message, error) {
+	return c.roundTripContext(ctx, req, deadline, false)
+}
+
+// roundTripUntilEOFContext additionally waits for the guest side to close the
+// management connection after its response. Quiesce uses this as a transport
+// teardown barrier: the next operation may pause the VM, so retaining a
+// half-closed vsock 4-tuple in the snapshot is unsafe.
+func (c *HostClient) roundTripUntilEOFContext(ctx context.Context, req *proto.Message, deadline time.Duration) (*proto.Message, error) {
+	return c.roundTripContext(ctx, req, deadline, true)
+}
+
+func (c *HostClient) roundTripContext(ctx context.Context, req *proto.Message, deadline time.Duration, waitEOF bool) (*proto.Message, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	conn, err := net.DialTimeout("unix", c.BasePath, remaining)
+	conn, err := c.DialRawContext(ctx, deadline)
 	if err != nil {
-		return nil, fmt.Errorf("launchclient: dial %s: %w", c.BasePath, err)
+		return nil, err
 	}
 	defer conn.Close()
-
-	if err := conn.SetDeadline(end); err != nil {
-		return nil, fmt.Errorf("launchclient: set deadline: %w", err)
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	finish := func(err error) error {
+		_ = stopCancel()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
 	}
-
-	// CH hybrid vsock proxy needs the CONNECT preface to know which
-	// guest port to route to. Without it, CH discards the connection.
-	if _, err := conn.Write(proto.HostConnectLine); err != nil {
-		return nil, fmt.Errorf("launchclient: write CONNECT: %w", err)
-	}
-	// Drain CH's "OK <localPort>\n" reply byte-by-byte so the read
-	// cursor lands exactly at the proto.WriteMessage payload that
-	// follows. ReadByte not used since net.Conn doesn't expose it; a
-	// single-byte read loop is fine — at most ~16 bytes of OK line.
-	if err := drainLine(conn); err != nil {
-		return nil, fmt.Errorf("launchclient: drain OK line: %w", err)
-	}
-
 	if err := proto.WriteMessage(conn, req); err != nil {
-		return nil, fmt.Errorf("launchclient: write %s: %w", req.Type, err)
+		return nil, finish(fmt.Errorf("launchclient: write %s: %w", req.Type, err))
 	}
 	resp, err := proto.ReadMessage(conn)
 	if err != nil {
-		return nil, fmt.Errorf("launchclient: read response: %w", err)
+		return nil, finish(fmt.Errorf("launchclient: read response: %w", err))
+	}
+	if waitEOF {
+		var trailing [1]byte
+		n, readErr := conn.Read(trailing[:])
+		if n != 0 {
+			return nil, finish(fmt.Errorf("launchclient: unexpected trailing byte after %s response", req.Type))
+		}
+		if !errors.Is(readErr, io.EOF) {
+			return nil, finish(fmt.Errorf("launchclient: wait for %s connection close: %w", req.Type, readErr))
+		}
+	}
+	if err := finish(nil); err != nil {
+		return nil, err
 	}
 	return resp, nil
 }

@@ -464,7 +464,10 @@ quiesce 是 host `/vm.pause` 之前的最后一次清理机会,目标两件事:
 **quiesce 流程**:
 
 ```
-0. (先按 §3.6 拒绝新 exec 并 SIGKILL 在飞 exec 辅助进程)freeze 应用:
+0. host 原子关闭 exec/forward admission,主动关闭并等待所有已放行的 ctl exec relay;
+   guest 再按 §3.6 拒绝新 exec、SIGKILL 在飞 exec 辅助进程,关闭每条 exec MUX 的
+   lingered vsock,并等待完整 session goroutine 退出. 该排空有界;失败时不进入 freezer、
+   不返回 `quiesced`. 排空完成后 freeze 应用:
    write /sys/fs/cgroup/app/cgroup.freeze = 1,轮询 cgroup.events 至 frozen 1
    (有界等待)。在 sync 前冻结 ⇒ sync 之后应用不再产生新脏页,镜像更确定;
    freezer 原子覆盖整棵子树,含 /init、envd 创建的 user/ptys/socats 等子树和
@@ -565,7 +568,7 @@ host 侧由 CH 把它写到 sandbox-ctl 给 CH 的 stdout(一根匿名管道),sa
 
 ### 3.6 exec 会话(`sandbox-ctl exec`)
 
-`sandbox-ctl exec`(host 侧 CLI + ctl.sock 见 [`sandbox.md`](sandbox.md) §2.4 /
+`sandbox-ctl exec`(host 侧 CLI + ctl.sock 见 [`sandbox.md`](sandbox.md) §2.5 /
 §6.3)在一个**已运行**的沙箱内拉起一条临时命令,它是用户应用的**兄弟进程**,
 既不替换应用、也不重启沙箱。host 经反向通道发 `exec{spec}`(§4.3);sandbox-init
 为这次会话准备 stdio、起进程、回 `exec_ack`,该连接随即成为这条会话**独立**的
@@ -601,9 +604,12 @@ pty**,**再发 `EXIT_STATUS`**(退出码;被信号杀为 128+signo),**再**走 �
 它在降权后重设,并通过私有握手 socket 的无阻塞 EOF 检查确认原 `exec-join` 仍存活,
 之后才 final exec。因而外层辅助进程被杀会一并带走那条命令。会话
 MUX 中途断(host 侧 `sandbox-ctl exec` 退出 / 失联)→ guest SIGKILL 该命令,命令
-不会比其会话存活更久。snapshot quiesce(§3.4)开始时**拒绝新的 exec 并 SIGKILL
-所有在飞的 exec 辅助进程**(快照不能带运行中的 exec 兄弟进程);沙箱在 resume /
-restore(§4.3 `attach` / `restore`)后解除拒绝、重新受理。
+不会比其会话存活更久。snapshot quiesce(§3.4)开始时,host 先原子 gate 新请求、关闭并
+join 已登记的 exec handler;guest 随后**拒绝新的 exec、SIGKILL 所有在飞的 exec
+辅助进程、关闭 lingered session socket,并等待整个 fork/MUX/session cleanup 退出**。
+只杀 child 而不 join session 不构成 freeze barrier:它可能把尚未释放的进程级 fork
+状态或半关闭 vsock 一同捕获。沙箱在 resume / restore(§4.3 `attach` / `restore`)后
+解除拒绝、重新受理;被 capture 中止的单次 exec 不会自动重跑。
 
 ### 3.7 connect 端口转发会话(`sandbox-ctl run --connect`)
 
@@ -904,8 +910,10 @@ guest 发起端收到 `MUX_CLOSE_ACK` 后将该帧作为 MUX read loop 的终态
 **为什么 host 必须主动 close、guest 必须 SO_LINGER**:virtio-vsock 对 guest 单方
 关闭的连接不立即回收——内核挂起延迟移除(默认 8s),等对端 RST 或超时。故 host 回
 ACK 后立即 close(RST 令 guest 端连接进入移除),guest 的 close 用 SO_LINGER 阻塞至
-移除完成。这样 `quiesced`(§3.4)可保证已纳入 quiesce 的 MUX、forward 和在途握手
-全部拆除,没有关连接产生的 transport packet 再与 `/vm.pause` 竞争。
+移除完成。exec MUX 使用相同的 lingered close,且其 session drain 也在 `quiesced`
+之前完成。这样 `quiesced`(§3.4)可保证已纳入 quiesce 的 stdio MUX、exec MUX、
+forward 和在途握手全部拆除,没有关连接产生的 transport packet 再与 `/vm.pause`
+竞争。
 
 这个 barrier **不能单独保证 guest 内核里没有任何旧连接状态**:刚在 gate 前正常结束
 的短连接已经离开 registry,最终承载 `quiesced` 的控制连接也只能在 ACK 写出后关闭。

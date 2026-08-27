@@ -224,7 +224,7 @@ EOF
     set -e
     [ "$rc" -eq 0 ] \
         || { echo "FAIL: run --from $suffix exited $rc"; tail -100 "$log"; exit 1; }
-    grep -q "^GEN=$expected PERSIST=declared EPH=clone-only ENV=artifact/clone-only INIT=2$" "$log" \
+    grep -Fq "GEN=$expected PERSIST=declared EPH=clone-only ENV=artifact/clone-only INIT=2" "$log" \
         || { echo "FAIL: run --from $suffix did not apply cold-start semantics"; tail -100 "$log"; exit 1; }
 }
 
@@ -258,9 +258,19 @@ echo "==> offline flattened-EROFS export"
     --sandbox-id offline --output "$OFFLINE_OUT" | tee "$WORK/export-offline.log"
 OFFLINE_E="$OFFLINE_OUT/offline.sandbox"
 [ -L "$OFFLINE_E" ] || { echo "FAIL: offline Sandbox E alias was not committed"; ls -la "$OFFLINE_OUT"; exit 1; }
-"$BIN/sandbox-ctl" info "$OFFLINE_E" >"$WORK/offline-info.yaml"
-grep -qE '^    base: self$' "$WORK/offline-info.yaml" \
-    || { echo "FAIL: offline E is not direct EROFS self layout"; cat "$WORK/offline-info.yaml"; exit 1; }
+"$BIN/sandbox-ctl" info --json "$OFFLINE_E" >"$WORK/offline-info.json"
+python3 - "$WORK/offline-info.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    cfg = json.load(source)
+root = cfg["Boot"]["Root"]
+overlay = root.get("Overlay") or {}
+if (root.get("Base") != "self" or root.get("BaseFromRefs")
+        or overlay.get("Base") or overlay.get("BaseFromRefs")):
+    raise SystemExit(f"offline E is not direct EROFS self layout: {root!r}")
+PY
 
 # The wrapper is an observable CH side effect. Missing direct-EROFS upper must
 # fail during config/disk preflight and therefore never execute it.

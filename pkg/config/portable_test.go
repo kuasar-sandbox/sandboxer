@@ -93,7 +93,7 @@ func TestPortableSelfExactlyOnceAndOnlyAtRootTop(t *testing.T) {
 		{name: "missing", mutate: func(c *PortableSandboxConfig) { c.Boot.Root.Base = "file://root.overlay@sha256:" + testSHA }, wantErr: "exactly once"},
 		{name: "twice", mutate: func(c *PortableSandboxConfig) {
 			c.Boot.Root.Overlay = &PortableOverlayConfig{Base: "self"}
-		}, wantErr: "exactly once"},
+		}, wantErr: "base=self requires an empty overlay graph"},
 		{name: "root chain", mutate: func(c *PortableSandboxConfig) {
 			c.Boot.Root.BaseFromRefs = []string{"self"}
 		}, wantErr: "base_from_refs[0] cannot be self"},
@@ -101,6 +101,9 @@ func TestPortableSelfExactlyOnceAndOnlyAtRootTop(t *testing.T) {
 			c.Boot.Disks = []PortableDiskConfig{{Name: "data", PortableRootConfig: PortableRootConfig{Base: "self"}}}
 			c.Mounts = []MountConfig{{Target: "/data", Type: "disk", Source: "data"}}
 		}, wantErr: "boot.disks[0].base cannot be self"},
+		{name: "root base with non-empty overlay", mutate: func(c *PortableSandboxConfig) {
+			c.Boot.Root.Overlay = &PortableOverlayConfig{Base: "file://upper.overlay@sha256:" + testSHA2}
+		}, wantErr: "base=self requires an empty overlay graph"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -129,6 +132,19 @@ func TestPortableLayerRefLimitsAndDuplicates(t *testing.T) {
 	}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "exceeds 64 entries") {
 		t.Fatalf("layer limit error = %v", err)
+	}
+
+	cfg = validPortableConfig()
+	cfg.Boot.Disks = []PortableDiskConfig{{
+		Name: "data",
+		PortableRootConfig: PortableRootConfig{
+			Base:         ref,
+			BaseFromRefs: []string{ref},
+		},
+	}}
+	cfg.Mounts = []MountConfig{{Target: "/data", Type: "disk", Source: "data"}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "base duplicates") {
+		t.Fatalf("top/lower duplicate error = %v", err)
 	}
 }
 
@@ -232,6 +248,46 @@ func TestPortableExportedSeparatesRootSelfAndDataRefs(t *testing.T) {
 	}
 	if len(data.BaseFromRefs) != 2 || data.BaseFromRefs[0] != "file://data-old.overlay@sha256:"+testSHA {
 		t.Fatalf("data chain = %v", data.BaseFromRefs)
+	}
+}
+
+func TestPortableExportedMaterializesSingleDiskParentOnce(t *testing.T) {
+	cfg := validPortableConfig()
+	parent := "file://parent.sandbox@sha256:" + testSHA
+	exported, err := cfg.Exported(parent, nil, []bool{false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exported.Boot.Root.Base != "self" {
+		t.Fatalf("root base = %q, want self", exported.Boot.Root.Base)
+	}
+	if len(exported.Boot.Root.BaseFromRefs) != 1 || exported.Boot.Root.BaseFromRefs[0] != parent {
+		t.Fatalf("root parent chain = %v, want [%s]", exported.Boot.Root.BaseFromRefs, parent)
+	}
+}
+
+func TestPortableExportedDoesNotRepeatIdenticalDataTopAsLower(t *testing.T) {
+	dataRef := "file://data.overlay@sha256:" + testSHA
+	cfg := validPortableConfig()
+	cfg.Boot.Disks = []PortableDiskConfig{{
+		Name: "data",
+		PortableRootConfig: PortableRootConfig{
+			Base:         dataRef,
+			BaseFromRefs: []string{"file://lower.overlay@sha256:" + testSHA2},
+		},
+	}}
+	cfg.Mounts = []MountConfig{{Target: "/data", Type: "disk", Source: "data"}}
+
+	exported, err := cfg.Exported("", []string{dataRef}, []bool{false, false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := exported.Boot.Disks[0].PortableRootConfig
+	if data.Base != dataRef {
+		t.Fatalf("data top = %q, want %q", data.Base, dataRef)
+	}
+	if len(data.BaseFromRefs) != 1 || data.BaseFromRefs[0] != "file://lower.overlay@sha256:"+testSHA2 {
+		t.Fatalf("data lower graph = %v", data.BaseFromRefs)
 	}
 }
 

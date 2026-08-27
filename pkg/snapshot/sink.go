@@ -2,12 +2,15 @@ package snapshot
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -29,7 +32,9 @@ func HexKey(k store.ContentKey) string {
 // ArtifactSink is the narrow lifecycle writer shared by export and snapshot.
 // Logical roles are explicit methods; there is intentionally no artifact-kind
 // registry or side metadata. Absorb writes immutable content only. Commit*
-// publishes the operation root (local alias or Bundle root) last.
+// publishes the operation root (local alias or Bundle root) last. Take and
+// Export take ownership of the sink and close it before deciding whether the
+// paused sandbox is resumed or destroyed.
 type ArtifactSink interface {
 	AbsorbOverlay(ctx context.Context, diff io.ReadSeeker, holes []sparse.Extent) (ref, path string, err error)
 	AbsorbOverlaySource(ctx context.Context, source sparse.Source) (ref, path string, err error)
@@ -37,6 +42,7 @@ type ArtifactSink interface {
 	AbsorbSnapshot(ctx context.Context, source sparse.Source) (ref, path string, err error)
 	CommitSandbox(ctx context.Context, ref, path string) error
 	CommitSnapshot(ctx context.Context, ref, path string) error
+	Close() error
 }
 
 // ---------------------------------------------------------------------------
@@ -118,30 +124,10 @@ func (s *FileSink) CommitSnapshot(ctx context.Context, _, path string) error {
 	return s.commitAlias(ctx, "snapshot", path)
 }
 
+func (*FileSink) Close() error { return nil }
+
 func (s *FileSink) commitAlias(ctx context.Context, role, path string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if path == "" {
-		return fmt.Errorf("commit %s alias: empty artifact path", role)
-	}
-	tmp := filepath.Join(s.outDir, fmt.Sprintf(".%s.%s.%d.tmp", s.sandboxID, role, os.Getpid()))
-	_ = os.Remove(tmp)
-	if err := os.Symlink(filepath.Base(path), tmp); err != nil {
-		return fmt.Errorf("create %s alias: %w", role, err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = os.Remove(tmp)
-		}
-	}()
-	alias := filepath.Join(s.outDir, s.sandboxID+"."+role)
-	if err := os.Rename(tmp, alias); err != nil {
-		return fmt.Errorf("commit %s alias: %w", role, err)
-	}
-	committed = true
-	return syncDirectory(s.outDir)
+	return commitArtifactAlias(ctx, s.outDir, s.sandboxID, role, path)
 }
 
 // writeArtifact packs src as a tarstream artifact (payload named kind plus a
@@ -150,6 +136,9 @@ func (s *FileSink) commitAlias(ctx context.Context, role, path string) error {
 // extents flow (holes ride the envelope map); the artifact file itself is dense
 // and survives non-sparse-aware copies and filesystems.
 func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.Source) (string, string, string, error) {
+	if err := validateArtifactAliasID(s.sandboxID); err != nil {
+		return "", "", "", fmt.Errorf("pack %s: %w", kind, err)
+	}
 	if s.required && s.codec == nil {
 		return "", "", "", fmt.Errorf("pack %s: required policy has no codec", kind)
 	}
@@ -257,10 +246,10 @@ func consumeSource(ctx context.Context, source sparse.Source) error {
 		if err != nil {
 			return err
 		}
-		kind, end := run.Kind(), run.End()
-		if end <= offset || end > source.Size() {
-			return fmt.Errorf("invalid sparse run")
+		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > source.Size() {
+			return fmt.Errorf("invalid sparse run at offset %d", offset)
 		}
+		kind, end := run.Kind(), run.End()
 		if kind != sparse.Hole {
 			for position := offset; position < end; {
 				chunk := min(uint64(len(buffer)), end-position)
@@ -284,8 +273,11 @@ func consumeSource(ctx context.Context, source sparse.Source) error {
 // ---------------------------------------------------------------------------
 
 type IngestSink struct {
-	ing  ingest.Ingester
-	logf func(string, ...any)
+	ing       ingest.Ingester
+	closer    io.Closer
+	closeOnce sync.Once
+	closeErr  error
+	logf      func(string, ...any)
 	// Captured for the caller's Response (read via Results after Take).
 	overlayRes *ingest.Result
 	bundleRes  *ingest.Result
@@ -348,6 +340,9 @@ func NewPlannedBundleSink(outDir, sandboxID string, cfg *manifest.Config, keyFn 
 	}
 	if logf == nil {
 		logf = func(string, ...any) {}
+	}
+	if err := validateArtifactAliasID(sandboxID); err != nil {
+		return nil, fmt.Errorf("snapshot Bundle: %w", err)
 	}
 	f, err := os.CreateTemp(outDir, sandboxID+".bundle.*.partial")
 	if err != nil {
@@ -546,17 +541,8 @@ func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, role s
 	if err := syncDirectory(s.outDir); err != nil {
 		return fmt.Errorf("sync snapshot Bundle directory: %w", err)
 	}
-	aliasTmp := filepath.Join(s.outDir, fmt.Sprintf(".%s.%s.%d.tmp", s.sandboxID, role, os.Getpid()))
-	_ = os.Remove(aliasTmp)
-	if err := os.Symlink(filepath.Base(final), aliasTmp); err != nil {
-		return fmt.Errorf("create %s Bundle alias: %w", role, err)
-	}
-	if err := os.Rename(aliasTmp, filepath.Join(s.outDir, s.sandboxID+"."+role)); err != nil {
-		_ = os.Remove(aliasTmp)
+	if err := commitArtifactAlias(ctx, s.outDir, s.sandboxID, role, final); err != nil {
 		return fmt.Errorf("commit %s Bundle alias: %w", role, err)
-	}
-	if err := syncDirectory(s.outDir); err != nil {
-		return fmt.Errorf("sync %s Bundle symlink directory: %w", role, err)
 	}
 	s.finalized = true
 	s.logf("artifact: %s.bundle written as %s root", HexKey(root)[:12], role)
@@ -608,20 +594,150 @@ func (s *BundleSink) Close() error {
 }
 
 func syncDirectory(path string) error {
-	directory, err := os.Open(path)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}
+	directory := os.NewFile(uintptr(fd), path)
 	syncErr := directory.Sync()
 	closeErr := directory.Close()
 	return errors.Join(syncErr, closeErr)
+}
+
+func validateArtifactAliasID(sandboxID string) error {
+	if sandboxID == "" || sandboxID == "." || sandboxID == ".." || filepath.Base(sandboxID) != sandboxID || strings.ContainsAny(sandboxID, `/\`) {
+		return fmt.Errorf("sandbox id %q is not a safe alias component", sandboxID)
+	}
+	return nil
+}
+
+func commitArtifactAlias(ctx context.Context, outDir, sandboxID, role, artifactPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateArtifactAliasID(sandboxID); err != nil {
+		return err
+	}
+	if role != "sandbox" && role != "snapshot" {
+		return fmt.Errorf("unsupported artifact alias role %q", role)
+	}
+	if artifactPath == "" {
+		return fmt.Errorf("commit %s alias: empty artifact path", role)
+	}
+	outAbs, err := filepath.Abs(outDir)
+	if err != nil {
+		return fmt.Errorf("commit %s alias output directory: %w", role, err)
+	}
+	artifactAbs, err := filepath.Abs(artifactPath)
+	if err != nil {
+		return fmt.Errorf("commit %s alias artifact path: %w", role, err)
+	}
+	if filepath.Dir(artifactAbs) != filepath.Clean(outAbs) {
+		return fmt.Errorf("commit %s alias artifact is outside the output directory", role)
+	}
+	fd, err := unix.Open(artifactAbs, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("commit %s alias artifact: %w", role, err)
+	}
+	artifact := os.NewFile(uintptr(fd), artifactAbs)
+	info, statErr := artifact.Stat()
+	closeErr := artifact.Close()
+	if statErr != nil || closeErr != nil {
+		return fmt.Errorf("commit %s alias artifact: %w", role, errors.Join(statErr, closeErr))
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("commit %s alias artifact is not a regular file", role)
+	}
+
+	alias := filepath.Join(outAbs, sandboxID+"."+role)
+	oldTarget := ""
+	hadAlias := false
+	if oldInfo, lstatErr := os.Lstat(alias); lstatErr == nil {
+		if oldInfo.Mode()&os.ModeSymlink == 0 {
+			return fmt.Errorf("commit %s alias refuses to replace a non-symlink", role)
+		}
+		oldTarget, err = os.Readlink(alias)
+		if err != nil {
+			return fmt.Errorf("read existing %s alias: %w", role, err)
+		}
+		hadAlias = true
+	} else if !os.IsNotExist(lstatErr) {
+		return fmt.Errorf("inspect existing %s alias: %w", role, lstatErr)
+	}
+
+	target := filepath.Base(artifactAbs)
+	temporary, err := createAliasSymlink(outAbs, sandboxID, role, target)
+	if err != nil {
+		return err
+	}
+	temporaryOpen := true
+	defer func() {
+		if temporaryOpen {
+			_ = os.Remove(temporary)
+		}
+	}()
+	if err := os.Rename(temporary, alias); err != nil {
+		return fmt.Errorf("commit %s alias: %w", role, err)
+	}
+	temporaryOpen = false
+	if err := syncDirectory(outAbs); err == nil {
+		return nil
+	} else {
+		rollbackErr := rollbackArtifactAlias(outAbs, alias, sandboxID, role, target, hadAlias, oldTarget)
+		return fmt.Errorf("sync %s alias directory: %w", role, errors.Join(err, rollbackErr))
+	}
+}
+
+func createAliasSymlink(outDir, sandboxID, role, target string) (string, error) {
+	for attempt := 0; attempt < 16; attempt++ {
+		var suffix [16]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return "", fmt.Errorf("create %s alias randomness: %w", role, err)
+		}
+		path := filepath.Join(outDir, "."+sandboxID+"."+role+"."+hex.EncodeToString(suffix[:])+".tmp")
+		if err := os.Symlink(target, path); err == nil {
+			return path, nil
+		} else if !os.IsExist(err) {
+			return "", fmt.Errorf("create %s alias temporary symlink: %w", role, err)
+		}
+	}
+	return "", fmt.Errorf("create %s alias temporary symlink: name collision limit exceeded", role)
+}
+
+func rollbackArtifactAlias(outDir, alias, sandboxID, role, newTarget string, hadAlias bool, oldTarget string) error {
+	if hadAlias {
+		temporary, err := createAliasSymlink(outDir, sandboxID, role, oldTarget)
+		if err != nil {
+			return fmt.Errorf("restore prior %s alias: %w", role, err)
+		}
+		if err := os.Rename(temporary, alias); err != nil {
+			_ = os.Remove(temporary)
+			return fmt.Errorf("restore prior %s alias: %w", role, err)
+		}
+	} else {
+		current, err := os.Readlink(alias)
+		if err != nil {
+			return fmt.Errorf("remove failed %s alias: %w", role, err)
+		}
+		if current != newTarget {
+			return fmt.Errorf("remove failed %s alias: target changed concurrently", role)
+		}
+		if err := os.Remove(alias); err != nil {
+			return fmt.Errorf("remove failed %s alias: %w", role, err)
+		}
+	}
+	if err := syncDirectory(outDir); err != nil {
+		return fmt.Errorf("sync restored %s alias directory: %w", role, err)
+	}
+	return nil
 }
 
 func NewIngestSink(ing ingest.Ingester, logf func(string, ...any)) *IngestSink {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &IngestSink{ing: ing, logf: logf}
+	closer, _ := ing.(io.Closer)
+	return &IngestSink{ing: ing, closer: closer, logf: logf}
 }
 
 // Results returns the overlay and bundle ingest results (nil until the
@@ -683,6 +799,18 @@ func (s *IngestSink) AbsorbSnapshot(ctx context.Context, source sparse.Source) (
 
 func (s *IngestSink) CommitSandbox(context.Context, string, string) error  { return nil }
 func (s *IngestSink) CommitSnapshot(context.Context, string, string) error { return nil }
+
+func (s *IngestSink) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		if s.closer != nil {
+			s.closeErr = s.closer.Close()
+		}
+	})
+	return s.closeErr
+}
 
 // run ingests src with a throttled progress log (effective denominator = size
 // minus hole bytes, so % reflects real work).

@@ -13,10 +13,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -69,6 +73,18 @@ func main() {
 	}
 }
 
+func validateSandboxIDArg(sandboxID string) error {
+	if sandboxID == "" || sandboxID == "." || sandboxID == ".." ||
+		filepath.Base(sandboxID) != sandboxID || strings.ContainsAny(sandboxID, `/\`) {
+		return errors.New("sandbox id must be one non-empty path component")
+	}
+	return nil
+}
+
+func commandContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
+
 func printUsage(w *os.File) {
 	fmt.Fprintf(w, `sandbox-ctl — sandbox runtime control
 
@@ -90,8 +106,10 @@ Usage:
                         [--sandbox-id <sid>] (--output <out_dir> | --upload)
                         [--mode local|bundle] [--manifest-config <path>]
                         [--ref-location name=file:///absolute/path ...]
+                        [--timeout <sec>]
   sandbox-ctl snapshot  --sandbox-id <sid> (--output <out_dir> | --upload)
                         [--mode local|bundle] [--resume]
+                        [--drop-caches] [--merge-ref=true|false]
                         [--run-root <dir>] [--timeout <sec>]
   sandbox-ctl exec      [--sandbox-id <sid>] [--run-root <dir>]
                         [--proxy <http[s]://host[:port]>] [--proxy-header 'Name: value' ...]
@@ -129,14 +147,18 @@ ready; run itself continues to own the VM and remains blocked.
 
 export creates a runnable Sandbox E. Live export freezes the guest and all
 block backends but does not call Cloud Hypervisor's snapshot API or read RAM.
-Offline export wraps one flattened EROFS image; offline --resume is invalid.
+It reuses the storage and ref-location bindings owned by the running process.
+Offline export wraps one flattened EROFS image and accepts storage/ref-location
+flags; offline --resume is invalid. In both modes --timeout=0 is unbounded.
 
 snapshot always captures memory execution state. At one freeze point it emits
 the current Sandbox E first and Snapshot S last; S points to E. Local output
 defaults to content-addressed tarstreams, mode=bundle writes one Manifest
 Bundle, and --upload writes the same logical graph to the Manifest store.
 By default a successful live export/snapshot destroys the sandbox; --resume
-keeps the original C0, writable diffs, and memory parent running.
+keeps the original C0, writable diffs, and memory parent running. Recovery
+reattaches the guest MUX before success is reported; an unrecoverable reattach
+failure terminates the VMM instead of leaving a frozen sandbox behind.
 
 exec runs an ad-hoc command inside a running sandbox as a sibling of
 the user app (it does not replace it). The command + args follow '--'.

@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -38,10 +39,16 @@ func (l *tarLayer) Close() error { return l.stream.Close() }
 // identity, so logical basenames remain valid without a basename guess. size
 // must not exceed the entry's logical size.
 func openMergeBase(raw string, size int64, codec tarstream.Codec, required bool) (*tarLayer, []sparse.Extent, error) {
-	return openMergeBaseWithOpener(raw, size, codec, required, nil)
+	return openMergeBaseWithOpener(context.Background(), raw, size, codec, required, nil)
 }
 
-func openMergeBaseWithOpener(raw string, size int64, codec tarstream.Codec, required bool, opener MergeBaseOpener) (*tarLayer, []sparse.Extent, error) {
+func openMergeBaseWithOpener(ctx context.Context, raw string, size int64, codec tarstream.Codec, required bool, opener MergeBaseOpener) (*tarLayer, []sparse.Extent, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if size < 0 {
 		return nil, nil, fmt.Errorf("merge base: negative logical size")
 	}
@@ -49,11 +56,14 @@ func openMergeBaseWithOpener(raw string, size int64, codec tarstream.Codec, requ
 		return nil, nil, fmt.Errorf("merge base: required policy has no codec")
 	}
 	if opener != nil {
-		stream, err := opener(context.Background(), raw)
+		stream, err := opener(ctx, raw)
 		if err != nil {
 			return nil, nil, &mergeArtifactError{err: err}
 		}
-		return prepareMergeBase(stream, size)
+		if stream == nil {
+			return nil, nil, &mergeArtifactError{err: errors.New("opener returned nil stream")}
+		}
+		return prepareMergeBase(ctx, stream, size)
 	}
 	ref, err := manifest.ParseRef(raw)
 	if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Location != "" || ref.Digest == "" || ref.DigestScheme == "manifest" {
@@ -72,10 +82,10 @@ func openMergeBaseWithOpener(raw string, size int64, codec tarstream.Codec, requ
 	if err != nil {
 		return nil, nil, &mergeArtifactError{err: err}
 	}
-	return prepareMergeBase(stream, size)
+	return prepareMergeBase(ctx, stream, size)
 }
 
-func prepareMergeBase(stream fetch.Stream, size int64) (*tarLayer, []sparse.Extent, error) {
+func prepareMergeBase(ctx context.Context, stream fetch.Stream, size int64) (*tarLayer, []sparse.Extent, error) {
 	fail := func(err error) (*tarLayer, []sparse.Extent, error) {
 		_ = stream.Close()
 		return nil, nil, err
@@ -87,7 +97,7 @@ func prepareMergeBase(stream fetch.Stream, size int64) (*tarLayer, []sparse.Exte
 	if err != nil {
 		return fail(fmt.Errorf("merge base: hole map: %w", err))
 	}
-	reader := fetch.NewReaderAt(context.Background(), stream)
+	reader := fetch.NewReaderAt(ctx, stream)
 	return &tarLayer{stream: stream, ReadSeeker: io.NewSectionReader(reader, 0, size)}, holes, nil
 }
 
@@ -129,11 +139,11 @@ func mergeExpectedIdentity(ref manifest.Ref, codec tarstream.Codec, required boo
 // retaining the artifact. Callers use it before guest quiesce so predictable
 // local-artifact failures cannot leave a guest frozen.
 func ValidateMergeBase(path string, size int64, codec tarstream.Codec, required bool) error {
-	return ValidateMergeBaseWithOpener(path, size, codec, required, nil)
+	return ValidateMergeBaseWithOpener(context.Background(), path, size, codec, required, nil)
 }
 
-func ValidateMergeBaseWithOpener(path string, size int64, codec tarstream.Codec, required bool, opener MergeBaseOpener) error {
-	base, _, err := openMergeBaseWithOpener(path, size, codec, required, opener)
+func ValidateMergeBaseWithOpener(ctx context.Context, path string, size int64, codec tarstream.Codec, required bool, opener MergeBaseOpener) error {
+	base, _, err := openMergeBaseWithOpener(ctx, path, size, codec, required, opener)
 	if err != nil {
 		return err
 	}
@@ -147,10 +157,10 @@ func mergeStreamHoles(stream fetch.Stream, size uint64) ([]sparse.Extent, error)
 		if err != nil {
 			return nil, err
 		}
-		kind, end := run.Kind(), run.End()
-		if end <= offset || end > size {
-			return nil, fmt.Errorf("invalid run [%d,%d)", offset, end)
+		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > size {
+			return nil, fmt.Errorf("invalid run at offset %d", offset)
 		}
+		kind, end := run.Kind(), run.End()
 		if kind == sparse.Hole {
 			holes = append(holes, sparse.Extent{Offset: offset, Size: end - offset})
 		}

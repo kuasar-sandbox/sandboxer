@@ -54,15 +54,42 @@ type execRegistry struct {
 	waiters   map[int]chan syscall.WaitStatus
 	pending   map[int]syscall.WaitStatus
 	live      map[int]struct{}
+	sessions  map[*vsockConn]struct{}
+	drained   chan struct{}
 	quiescing bool
 }
 
 func newExecRegistry() *execRegistry {
 	return &execRegistry{
-		waiters: make(map[int]chan syscall.WaitStatus),
-		pending: make(map[int]syscall.WaitStatus),
-		live:    make(map[int]struct{}),
+		waiters:  make(map[int]chan syscall.WaitStatus),
+		pending:  make(map[int]syscall.WaitStatus),
+		live:     make(map[int]struct{}),
+		sessions: make(map[*vsockConn]struct{}),
 	}
+}
+
+// beginSession atomically admits a decoded exec request and records its
+// reverse-channel connection. Keeping the connection registered until its
+// lingered Close completes lets quiesce force and then join the entire session,
+// not merely SIGKILL a child while the fork/MUX cleanup goroutine is still live.
+func (r *execRegistry) beginSession(c *vsockConn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.quiescing {
+		return false
+	}
+	r.sessions[c] = struct{}{}
+	return true
+}
+
+func (r *execRegistry) endSession(c *vsockConn) {
+	r.mu.Lock()
+	delete(r.sessions, c)
+	if len(r.sessions) == 0 && r.drained != nil {
+		close(r.drained)
+		r.drained = nil
+	}
+	r.mu.Unlock()
 }
 
 // register records a freshly-started exec child and returns the channel
@@ -107,16 +134,10 @@ func (r *execRegistry) done(pid int) {
 	r.mu.Unlock()
 }
 
-func (r *execRegistry) isQuiescing() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.quiescing
-}
-
 // beginQuiesce marks the sandbox quiescing (new exec rejected) and
-// returns the in-flight exec child pids to SIGKILL so the snapshot
-// captures no running exec children.
-func (r *execRegistry) beginQuiesce() []int {
+// returns the in-flight children/connections plus a barrier closed only after
+// every admitted session has completed its fork, MUX, and socket teardown.
+func (r *execRegistry) beginQuiesce() ([]int, []*vsockConn, <-chan struct{}) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.quiescing = true
@@ -124,7 +145,19 @@ func (r *execRegistry) beginQuiesce() []int {
 	for pid := range r.live {
 		pids = append(pids, pid)
 	}
-	return pids
+	conns := make([]*vsockConn, 0, len(r.sessions))
+	for conn := range r.sessions {
+		conns = append(conns, conn)
+	}
+	if len(r.sessions) == 0 {
+		drained := make(chan struct{})
+		close(drained)
+		return pids, conns, drained
+	}
+	if r.drained == nil {
+		r.drained = make(chan struct{})
+	}
+	return pids, conns, r.drained
 }
 
 func (r *execRegistry) endQuiesce() {
@@ -133,11 +166,29 @@ func (r *execRegistry) endQuiesce() {
 	r.mu.Unlock()
 }
 
-// killExecChildren SIGKILLs every in-flight exec child. Called by the
-// quiesce handler; sessions tear down once the reaper delivers.
-func killExecChildren(reg *execRegistry) {
-	for _, pid := range reg.beginQuiesce() {
+const execDrainTimeout = 2 * time.Second
+
+// quiesceExecSessions SIGKILLs every in-flight exec child, closes all admitted
+// reverse connections, and joins the session goroutines. The bounded wait is a
+// deadlock guard inside the larger quiesce deadline; failure aborts capture
+// before the app cgroup or VM is frozen.
+func quiesceExecSessions(reg *execRegistry) error {
+	pids, conns, drained := reg.beginQuiesce()
+	for _, pid := range pids {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+	for _, conn := range conns {
+		// SO_LINGER is bounded per connection. Close concurrently so multiple
+		// exec sessions cannot multiply the quiesce latency.
+		go func() { _ = conn.Close() }()
+	}
+	timer := time.NewTimer(execDrainTimeout)
+	defer timer.Stop()
+	select {
+	case <-drained:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("exec: timed out draining %d session(s)", len(conns))
 	}
 }
 
@@ -220,8 +271,14 @@ func (b *execBridge) drain() {
 // for the child, report its exit code, then close the MUX. It owns c
 // (closes it). Blocks until the session ends.
 func runExecSession(c *vsockConn, req *proto.Message, sup *supervisorState) {
-	defer c.Close()
 	reg := sup.execReg
+	admitted := false
+	defer func() {
+		_ = c.Close()
+		if admitted {
+			reg.endSession(c)
+		}
+	}()
 
 	fail := func(msg string) {
 		_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: msg})
@@ -232,9 +289,15 @@ func runExecSession(c *vsockConn, req *proto.Message, sup *supervisorState) {
 		fail("exec: empty argv")
 		return
 	}
-	if reg.isQuiescing() {
+	if !reg.beginSession(c) {
 		fail("exec: sandbox quiescing (snapshot in progress)")
 		return
+	}
+	admitted = true
+	// As with stdio and forward MUX connections, session completion is not a
+	// capture barrier until the virtio-vsock 4-tuple has been removed.
+	if err := c.SetLinger(muxCloseLingerSec); err != nil {
+		logf("exec: SO_LINGER: %v (continuing)", err)
 	}
 
 	cs, cb, err := setupAppStdio(spec.Stdio)

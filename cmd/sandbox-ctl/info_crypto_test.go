@@ -101,6 +101,15 @@ func TestInfoRejectsMalformedSnapshotCfgForRawAndJSON(t *testing.T) {
 	}
 }
 
+func TestInfoRejectsExtraPositionalArgument(t *testing.T) {
+	rc, stdout, stderr := captureInfoOutput(t, func() int {
+		return infoCmd([]string{"first.snapshot", "second.snapshot"})
+	})
+	if rc != 2 || stdout != "" || !strings.Contains(stderr, "usage:") {
+		t.Fatalf("info extra argument rc=%d stdout=%q stderr=%q", rc, stdout, stderr)
+	}
+}
+
 func captureInfoOutput(t *testing.T, fn func() int) (int, string, string) {
 	t.Helper()
 	outR, outW, err := os.Pipe()

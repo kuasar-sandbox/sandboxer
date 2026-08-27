@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -23,6 +25,18 @@ func TestExportCommandRejectsInvalidModeCombinations(t *testing.T) {
 			args: []string{"--sandbox-id", "sid", "--config", "sandbox.yaml", "--output", t.TempDir()},
 		},
 		{
+			name: "live manifest config",
+			args: []string{"--sandbox-id", "sid", "--manifest-config", "manifest.yaml", "--output", t.TempDir()},
+		},
+		{
+			name: "live ref location",
+			args: []string{"--sandbox-id", "sid", "--ref-location", "release=file:///srv/artifacts", "--output", t.TempDir()},
+		},
+		{
+			name: "negative timeout",
+			args: []string{"--sandbox-id", "sid", "--timeout", "-1", "--output", t.TempDir()},
+		},
+		{
 			name: "missing source",
 			args: []string{"--output", t.TempDir()},
 		},
@@ -34,6 +48,14 @@ func TestExportCommandRejectsInvalidModeCombinations(t *testing.T) {
 			name: "upload mode",
 			args: []string{"--sandbox-id", "sid", "--upload", "--mode", "bundle"},
 		},
+		{
+			name: "positional argument",
+			args: []string{"--sandbox-id", "sid", "--output", t.TempDir(), "extra"},
+		},
+		{
+			name: "unsafe sandbox id",
+			args: []string{"--sandbox-id", "../sid", "--output", t.TempDir()},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -41,6 +63,17 @@ func TestExportCommandRejectsInvalidModeCombinations(t *testing.T) {
 				t.Fatalf("export exit = %d, want usage error 2", code)
 			}
 		})
+	}
+}
+
+func TestPrepareArtifactOutputDirRejectsSymlink(t *testing.T) {
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "output")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepareArtifactOutputDir(link); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("prepareArtifactOutputDir error = %v, want symlink rejection", err)
 	}
 }
 

@@ -8,7 +8,7 @@
 #      under sandbox-ctl run (background)
 #   2. Wait until guest is past phase 2 (sees a marker line in log)
 #   3. Run sandbox-ctl snapshot --sandbox-id <sid> --output <out>
-#   4. Verify <sid>.snapshot (S) and <sid>.sandbox (E) commit aliases
+#   4. Verify the <sid>.snapshot commit alias and its content-addressed E
 #   5. Verify S references E and each strict config is inspectable
 #   6. Tear down sandbox
 
@@ -243,15 +243,19 @@ fi
 echo "==> validating snapshot bundle"
 SNAP_FILE="$OUT/$SID.snapshot"
 [ -f "$SNAP_FILE" ] || { echo "FAIL: no $SID.snapshot"; ls -la "$OUT"; exit 1; }
-SANDBOX_FILE="$OUT/$SID.sandbox"
-[ -f "$SANDBOX_FILE" ] || { echo "FAIL: no $SID.sandbox"; ls -la "$OUT"; exit 1; }
+INFO_JSON=$("$BIN/sandbox-ctl" info --json "$SNAP_FILE")
+SANDBOX_REF=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("SandboxRef", ""))' <<<"$INFO_JSON")
+[ -n "$SANDBOX_REF" ] || { echo "==> FAIL: Snapshot S has no sandbox_ref"; echo "$INFO_JSON"; exit 1; }
+SANDBOX_BASENAME=$(python3 -c 'import os,sys; print(os.path.basename(sys.argv[1].split("@",1)[0]))' "$SANDBOX_REF")
+SANDBOX_FILE="$OUT/$SANDBOX_BASENAME"
+[ -f "$SANDBOX_FILE" ] || { echo "FAIL: Snapshot S references missing Sandbox E $SANDBOX_BASENAME"; ls -la "$OUT"; exit 1; }
 mapfile -t OVERLAY_FILES < <(find "$OUT" -maxdepth 1 -type f -name '*.overlay' -print | sort)
 [ "${#OVERLAY_FILES[@]}" -gt 0 ] || { echo "FAIL: no immutable disk dependency"; ls -la "$OUT"; exit 1; }
 
 # Sizes. Artifacts are tarstream envelopes: the FILE is dense (size ≈
 # resident data + envelope), holes ride the envelope map. Sparseness
 # shows as file size ≪ the logical entry size (ramSize = 512 MiB).
-# <sid>.snapshot is a symlink — stat dereferences (-L).
+# <sid>.snapshot is a symlink; Sandbox E is content-addressed.
 SNAP_BYTES=$(stat -L -c%s "$SNAP_FILE")
 SANDBOX_BYTES=$(stat -L -c%s "$SANDBOX_FILE")
 echo "    $SID.snapshot:   artifact=$(numfmt --to=iec $SNAP_BYTES)"
@@ -268,9 +272,6 @@ echo "==> PASS: snapshot artifact carries only resident data ($(numfmt --to=iec 
 
 # The artifact is a tar envelope; info reads snapshot.cfg through it
 # (the same path restore uses).
-INFO_JSON=$("$BIN/sandbox-ctl" info --json "$SNAP_FILE")
-SANDBOX_REF=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("SandboxRef", ""))' <<<"$INFO_JSON")
-[ -n "$SANDBOX_REF" ] || { echo "==> FAIL: Snapshot S has no sandbox_ref"; echo "$INFO_JSON"; exit 1; }
 E_INFO_JSON=$("$BIN/sandbox-ctl" info --json "$SANDBOX_FILE")
 python3 -c 'import json,sys; c=json.load(sys.stdin); assert c["Version"] == 1 and c["Boot"]["Root"]' <<<"$E_INFO_JSON" \
     || { echo "==> FAIL: Sandbox E info is incomplete"; echo "$E_INFO_JSON"; exit 1; }

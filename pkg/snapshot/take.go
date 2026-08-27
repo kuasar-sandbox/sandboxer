@@ -11,6 +11,7 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -113,9 +114,16 @@ type Outputs struct {
 // E is emitted before CH memory state, and S is committed last with sandbox_ref
 // pointing to E.
 //
-// Caller responsibility: create/remove StagingDir and supply the sink
-// (FileSink for --output, IngestSink for --upload, or BundleSink).
-func Take(s Sources, sink ArtifactSink, resumeAfter bool) (*Outputs, error) {
+// Caller responsibility: create/remove StagingDir and transfer ownership of a
+// sink (FileSink for --output, IngestSink for --upload, or BundleSink). Take
+// closes it on every return path.
+func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr error) {
+	sinkOpen := sink != nil
+	defer func() {
+		if sinkOpen {
+			retErr = errors.Join(retErr, closeArtifactSink(sink))
+		}
+	}()
 	logf := s.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
@@ -181,7 +189,12 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (*Outputs, error) {
 			_ = ch.Resume()
 		}
 	}()
-	defer s.Quiescer.Resume() // unconditional
+	backendsResumed := false
+	defer func() {
+		if !backendsResumed {
+			s.Quiescer.Resume()
+		}
+	}()
 
 	// T2b: quiesce backends (steady state before the dump).
 	s.Quiescer.Quiesce()
@@ -232,12 +245,22 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (*Outputs, error) {
 	}
 	var memSrc io.ReadSeeker = memfdReader(s.MemfdFD, s.MemfdSize)
 	memSrcHoles := memHoles
+	memoryBaseOpen := false
+	var closeMemoryBase func() error
+	defer func() {
+		if memoryBaseOpen {
+			if closeErr := closeMemoryBase(); closeErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close memory merge base: %w", closeErr))
+			}
+		}
+	}()
 	if s.MergeBaseSnapshot != "" {
-		base, baseHoles, berr := openMergeBaseWithOpener(s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MemoryMergeBaseOpener)
+		base, baseHoles, berr := openMergeBaseWithOpener(ctx, s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MemoryMergeBaseOpener)
 		if berr != nil {
 			return nil, fmt.Errorf("merge memory base: %w", berr)
 		}
-		defer base.Close()
+		closeMemoryBase = base.Close
+		memoryBaseOpen = true
 		memSrc, memSrcHoles = mergeSparse(memSrc, memHoles, base, baseHoles, s.MemfdSize)
 	}
 	out.MemoryResident = residentBytes(s.MemfdSize, memSrcHoles) // bytes actually written (merged)
@@ -247,16 +270,28 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (*Outputs, error) {
 		return nil, fmt.Errorf("build Snapshot S: %w", err)
 	}
 	out.SnapshotRef, out.SnapshotPath, err = sink.AbsorbSnapshot(ctx, snapshotSource)
-	if err != nil {
-		return nil, fmt.Errorf("absorb Snapshot S: %w", err)
+	var memoryBaseCloseErr error
+	if memoryBaseOpen {
+		memoryBaseCloseErr = closeMemoryBase()
+		memoryBaseOpen = false
+	}
+	if err != nil || memoryBaseCloseErr != nil {
+		return nil, fmt.Errorf("absorb Snapshot S: %w", errors.Join(err, memoryBaseCloseErr))
 	}
 	if err := sink.CommitSnapshot(ctx, out.SnapshotRef, out.SnapshotPath); err != nil {
 		return nil, fmt.Errorf("commit Snapshot S: %w", err)
+	}
+	closeErr := closeArtifactSink(sink)
+	sinkOpen = false
+	if closeErr != nil {
+		return nil, closeErr
 	}
 	dumpEnd := time.Now()
 
 	// T8: resume (destroy path handled by caller).
 	if resumeAfter {
+		s.Quiescer.Resume()
+		backendsResumed = true
 		if err := ch.Resume(); err != nil {
 			return nil, fmt.Errorf("CH resume: %w", err)
 		}
@@ -291,12 +326,17 @@ func absorbOverlayWithOpener(ctx context.Context, sink ArtifactSink, d DiskDiff,
 	var src io.ReadSeeker = diff
 	holes := overlayHoles
 	if merging {
-		base, baseHoles, berr := openMergeBaseWithOpener(d.MergeBase, size, codec, required, opener)
+		base, baseHoles, berr := openMergeBaseWithOpener(ctx, d.MergeBase, size, codec, required, opener)
 		if berr != nil {
 			return "", "", fmt.Errorf("merge overlay base: %w", berr)
 		}
-		defer base.Close()
 		src, holes = mergeSparse(diff, overlayHoles, base, baseHoles, size)
+		ref, path, absorbErr := sink.AbsorbOverlay(ctx, src, holes)
+		closeErr := base.Close()
+		if absorbErr != nil || closeErr != nil {
+			return "", "", errors.Join(absorbErr, closeErr)
+		}
+		return ref, path, nil
 	}
 	return sink.AbsorbOverlay(ctx, src, holes)
 }

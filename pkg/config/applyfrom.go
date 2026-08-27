@@ -147,6 +147,11 @@ func validateFromProtectedFields(artifact *PortableSandboxConfig, host *SandboxC
 	if presence.Has("boot.cmdline") && host.Boot.Cmdline != artifact.Boot.Cmdline {
 		return errors.New("run --from: boot.cmdline is owned by the Sandbox artifact")
 	}
+	if presence.Has("mounts") {
+		if err := validateFromDiskMountTopology(artifact.Mounts, host.Mounts); err != nil {
+			return err
+		}
+	}
 	if presence.Has("boot.root.base") || presence.Has("boot.root.base_from_refs") || host.Boot.Root.Base != "" || len(host.Boot.Root.BaseFromRefs) != 0 {
 		return errors.New("run --from: boot.root immutable graph is owned by the Sandbox artifact")
 	}
@@ -189,6 +194,33 @@ func validateFromProtectedFields(artifact *PortableSandboxConfig, host *SandboxC
 		}
 		if hostDisk.Overlay != nil && (hostDisk.Overlay.Base != "" || len(hostDisk.Overlay.BaseFromRefs) != 0) {
 			return fmt.Errorf("run --from: boot.disks[%d].overlay immutable graph is owned by the Sandbox artifact", i)
+		}
+	}
+	return nil
+}
+
+func validateFromDiskMountTopology(artifactMounts, hostMounts []MountConfig) error {
+	type diskMount struct {
+		source string
+		target string
+	}
+	topology := func(mounts []MountConfig) []diskMount {
+		result := make([]diskMount, 0, len(mounts))
+		for _, mount := range mounts {
+			if mount.Type == "disk" {
+				result = append(result, diskMount{source: mount.Source, target: mount.Target})
+			}
+		}
+		return result
+	}
+	want := topology(artifactMounts)
+	got := topology(hostMounts)
+	if len(got) != len(want) {
+		return fmt.Errorf("run --from: host mounts change artifact-owned data-disk mount topology")
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return fmt.Errorf("run --from: host mounts change artifact-owned disk mount[%d] %q -> %q", i, want[i].source, want[i].target)
 		}
 	}
 	return nil

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -127,6 +128,9 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if opts.SandboxID == "" {
 		opts.SandboxID = generateSandboxID()
 	}
+	if err := validateSandboxID(opts.SandboxID); err != nil {
+		return -1, err
+	}
 	if opts.RuntimeRoot == "" {
 		opts.RuntimeRoot = "/run/sandbox"
 	}
@@ -182,7 +186,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if err := opts.Cfg.ValidateCold(); err != nil {
 		return -1, fmt.Errorf("config: %w", err)
 	}
-	if err := canonicalizeConfiguredTarRefsWithOpener(opts.Cfg, opts.RefLocations, opts.LocalCodec, opts.LocalRequired, fileOpener); err != nil {
+	if err := canonicalizeConfiguredTarRefsWithOpener(ctx, opts.Cfg, opts.RefLocations, opts.LocalCodec, opts.LocalRequired, fileOpener); err != nil {
 		return -1, fmt.Errorf("portable disk refs: %w", err)
 	}
 	identities, err := ResolvePortableProjection(opts.Cfg)
@@ -645,14 +649,14 @@ func ResolvePortableProjection(cfg *config.SandboxConfig) (config.PortableProjec
 // PrepareOfflinePortableConfig validates and canonicalizes an explicit config
 // for offline flattened-EROFS export, then replaces its root graph with the
 // direct EROFS self layout.
-func PrepareOfflinePortableConfig(cfg *config.SandboxConfig, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (*config.PortableSandboxConfig, error) {
+func PrepareOfflinePortableConfig(ctx context.Context, cfg *config.SandboxConfig, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (*config.PortableSandboxConfig, error) {
 	if cfg == nil {
 		return nil, errors.New("offline export config is nil")
 	}
 	if err := cfg.ValidateCold(); err != nil {
 		return nil, err
 	}
-	if err := canonicalizeConfiguredTarRefsWithOpener(cfg, locations, codec, required, opener); err != nil {
+	if err := canonicalizeConfiguredTarRefsWithOpener(ctx, cfg, locations, codec, required, opener); err != nil {
 		return nil, err
 	}
 	identities, err := ResolvePortableProjection(cfg)
@@ -1404,8 +1408,51 @@ type SnapshotHandler struct {
 	Forwarder      *Forwarder               // optional; if non-nil, paused + active relays collapsed around quiesce
 	Reattach       func() error             // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
 	Memory         *resctl.MemoryController // optional; blocks local Budget mutation across capture
+	CHProcess      func() processSignaler   // late-bound after CH starts; used to guarantee destroy completion
 	Context        context.Context
 	Logf           func(string, ...any)
+
+	capture captureGate
+}
+
+// captureGate serializes export and snapshot for one live VM. A successful
+// non-resume capture is terminal because the VMM shutdown is deliberately
+// scheduled after the ctl response can be flushed; no second request may enter
+// that interval.
+type captureGate struct {
+	mu       sync.Mutex
+	active   bool
+	terminal bool
+}
+
+type terminalCaptureError struct{ err error }
+
+func (e *terminalCaptureError) Error() string { return e.err.Error() }
+func (e *terminalCaptureError) Unwrap() error { return e.err }
+
+func isTerminalCaptureError(err error) bool {
+	var terminal *terminalCaptureError
+	return errors.As(err, &terminal)
+}
+
+func (g *captureGate) begin() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.terminal {
+		return errors.New("sandbox capture already committed and shutdown is in progress")
+	}
+	if g.active {
+		return errors.New("sandbox capture already in progress")
+	}
+	g.active = true
+	return nil
+}
+
+func (g *captureGate) finish(terminal bool) {
+	g.mu.Lock()
+	g.active = false
+	g.terminal = g.terminal || terminal
+	g.mu.Unlock()
 }
 
 // Handle dispatches one ctl snapshot_request. Public for restore.Run.
@@ -1413,29 +1460,51 @@ func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
 	return h.handle(req, "", nil)
 }
 
-func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (ctl.Response, error) {
+func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
+	if err := h.capture.begin(); err != nil {
+		return ctl.Response{}, err
+	}
+	defer func() { h.capture.finish((err == nil && !req.ResumeAfter) || isTerminalCaptureError(err)) }()
 	opts := RunOptions{
 		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
 	}
-	return handleSnapshotRequest(h.Context, req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
+	var chProcess processSignaler
+	if h.CHProcess != nil {
+		chProcess = h.CHProcess()
+		if chProcess == nil {
+			return ctl.Response{}, errors.New("snapshot: Cloud Hypervisor process is not started")
+		}
+	}
+	return handleSnapshotRequest(h.Context, req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, chProcess, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
 }
 
 func (h *SnapshotHandler) HandleExport(req ctl.Request) (ctl.Response, error) {
 	return h.handleExport(req, "", nil)
 }
 
-func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (ctl.Response, error) {
+func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
+	if err := h.capture.begin(); err != nil {
+		return ctl.Response{}, err
+	}
+	defer func() { h.capture.finish((err == nil && !req.ResumeAfter) || isTerminalCaptureError(err)) }()
 	opts := RunOptions{
 		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
 	}
+	var chProcess processSignaler
+	if h.CHProcess != nil {
+		chProcess = h.CHProcess()
+		if chProcess == nil {
+			return ctl.Response{}, errors.New("export: Cloud Hypervisor process is not started")
+		}
+	}
 	return handleExportRequest(h.Context, req, opts, h.Disks, h.Servers, h.CHSock, h.RunDir,
-		cgroupPath, chExited, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
+		cgroupPath, chExited, chProcess, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
 }
 
 func handleExportRequest(
@@ -1446,6 +1515,7 @@ func handleExportRequest(
 	servers []*vhost.Server,
 	chSock, runDir, cgroupPath string,
 	chExited <-chan struct{},
+	chProcess processSignaler,
 	pinger *guestlink.Pinger,
 	forwarder *Forwarder,
 	reattachMUX func() error,
@@ -1465,8 +1535,17 @@ func handleExportRequest(
 	if req.MergeRef != nil {
 		return ctl.Response{}, errors.New("export does not accept memory merge options")
 	}
-	if opts.SandboxID == "" || opts.PortableConfig == nil {
+	if err := validateSandboxID(opts.SandboxID); err != nil {
+		return ctl.Response{}, fmt.Errorf("export: %w", err)
+	}
+	if opts.PortableConfig == nil {
 		return ctl.Response{}, errors.New("export: live Sandbox C0/source binding is unavailable")
+	}
+	if err := opts.PortableConfig.Validate(); err != nil {
+		return ctl.Response{}, fmt.Errorf("export: immutable C0: %w", err)
+	}
+	if opts.Cfg == nil {
+		return ctl.Response{}, errors.New("export: runtime host configuration is unavailable")
 	}
 	if len(disks) != 1+len(opts.PortableConfig.Boot.Disks) {
 		return ctl.Response{}, fmt.Errorf("export: runtime disk count %d does not match C0 disk count %d", len(disks), 1+len(opts.PortableConfig.Boot.Disks))
@@ -1485,6 +1564,15 @@ func handleExportRequest(
 	}
 	if mode == ctl.SnapshotModeBundle && opts.ManifestCfg == nil {
 		return ctl.Response{}, errors.New("export Bundle mode requires manifest configuration")
+	}
+	if strings.TrimSpace(chSock) == "" {
+		return ctl.Response{}, errors.New("export: Cloud Hypervisor API socket is unavailable")
+	}
+	if strings.TrimSpace(runDir) == "" {
+		return ctl.Response{}, errors.New("export: run directory is unavailable")
+	}
+	if reattachMUX == nil && (req.ResumeAfter || chProcess == nil) {
+		return ctl.Response{}, errors.New("export: stdio MUX re-attach is unavailable and capture recovery cannot be guaranteed")
 	}
 	if !req.Upload {
 		if err := ensureSnapshotDir(req.OutDir); err != nil {
@@ -1523,7 +1611,7 @@ func handleExportRequest(
 			}
 		}
 		if diskMerged[i] {
-			if err := snapshot.ValidateMergeBaseWithOpener(diff.MergeBase, disk.Size, opts.LocalCodec, opts.LocalRequired, mergeBaseOpener); err != nil {
+			if err := snapshot.ValidateMergeBaseWithOpener(ctx, diff.MergeBase, disk.Size, opts.LocalCodec, opts.LocalRequired, mergeBaseOpener); err != nil {
 				return ctl.Response{}, fmt.Errorf("export: disk %d merge base: %w", i, err)
 			}
 		} else {
@@ -1534,11 +1622,22 @@ func handleExportRequest(
 
 	var (
 		sink                  snapshot.ArtifactSink
-		ingestCloser          io.Closer
 		bundleSink            *snapshot.BundleSink
 		dependencyPlan        *snapshotBundlePlan
 		bundleRefReplacements map[string]string
+		sinkOpen              bool
+		dependencyPlanOpen    bool
 	)
+	defer func() {
+		if sinkOpen {
+			err = errors.Join(err, sink.Close())
+		}
+	}()
+	defer func() {
+		if dependencyPlanOpen {
+			err = errors.Join(err, dependencyPlan.Close())
+		}
+	}()
 	if mode == ctl.SnapshotModeBundle {
 		admission, admissionErr := opts.ManifestCfg.WriteAdmission(ctx)
 		if admissionErr != nil {
@@ -1549,13 +1648,14 @@ func handleExportRequest(
 			return ctl.Response{}, planErr
 		}
 		dependencyPlan = plan
-		defer func() { err = errors.Join(err, plan.Close()) }()
+		dependencyPlanOpen = true
 		bundleSink, err = snapshot.NewPlannedBundleSink(req.OutDir, opts.SandboxID,
 			opts.ManifestCfg, opts.CustomerKeyFn, admission, plan.Refs(), logf)
 		if err != nil {
 			return ctl.Response{}, err
 		}
 		sink = bundleSink
+		sinkOpen = true
 	} else {
 		if req.Upload {
 			if opts.CustomerKeyFn == nil {
@@ -1568,30 +1668,26 @@ func handleExportRequest(
 			if ingestErr != nil {
 				return ctl.Response{}, fmt.Errorf("export ingester: %w", ingestErr)
 			}
-			ingestCloser = ing
 			sink = snapshot.NewIngestSink(ing, logf)
 		} else {
 			sink = snapshot.NewFileSink(req.OutDir, opts.SandboxID, opts.LocalCodec, opts.LocalRequired, logf)
 		}
+		sinkOpen = true
 		dependencyPlan, err = prepareSnapshotDependencyPlan(ctx, opts, nil, diskMerged, req.OutDir, store.WriteAdmission{}, false)
 		if err != nil {
 			return ctl.Response{}, err
 		}
-		defer func() { err = errors.Join(err, dependencyPlan.Close()) }()
+		dependencyPlanOpen = true
 	}
 	if bundleSink != nil {
 		bundleRefReplacements, err = dependencyPlan.Ingest(ctx, bundleSink, logf)
 	} else {
 		bundleRefReplacements, err = dependencyPlan.Emit(ctx, sink, logf)
 	}
-	if err != nil {
-		return ctl.Response{}, fmt.Errorf("export dependencies: %w", err)
-	}
-	if ingestCloser != nil {
-		defer func() { err = errors.Join(err, ingestCloser.Close()) }()
-	}
-	if bundleSink != nil {
-		defer func() { err = errors.Join(err, bundleSink.Close()) }()
+	planCloseErr := dependencyPlan.Close()
+	dependencyPlanOpen = false
+	if err != nil || planCloseErr != nil {
+		return ctl.Response{}, fmt.Errorf("export dependencies: %w", errors.Join(err, planCloseErr))
 	}
 	parentRef := ""
 	if opts.SourceBinding != nil {
@@ -1648,21 +1744,25 @@ func handleExportRequest(
 	}
 	defer func() {
 		if err == nil && !req.ResumeAfter {
-			go destroyAfterSnapshot(chSock, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
+			go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
 		}
 	}()
+	recoveryTerminated := false
 	if forwarder != nil {
 		forwarder.PauseAndDrain()
 		defer func() {
-			if err != nil || req.ResumeAfter {
+			if !recoveryTerminated && (err != nil || req.ResumeAfter) {
 				forwarder.Resume()
 			}
 		}()
 	}
 	if pinger != nil {
-		pinger.Pause()
+		if pauseErr := pinger.PauseContext(ctx); pauseErr != nil {
+			pinger.Resume()
+			return ctl.Response{}, fmt.Errorf("export: drain pinger before quiesce: %w", pauseErr)
+		}
 		defer func() {
-			if err != nil || req.ResumeAfter {
+			if !recoveryTerminated && (err != nil || req.ResumeAfter) {
 				pinger.Resume()
 			}
 		}()
@@ -1672,6 +1772,19 @@ func handleExportRequest(
 		client = pinger.Client
 	}
 	guestRecoveryRequired := false
+	failRecovery := func(recoveryErr error) error {
+		if recoveryErr == nil {
+			return nil
+		}
+		shutdownErr, terminal := terminateAfterCaptureRecoveryFailure(
+			chSock, chProcess, chExited, opts.Cfg.CHApiDeadline(), logf)
+		recoveryTerminated = terminal
+		combined := errors.Join(recoveryErr, shutdownErr)
+		if terminal {
+			return &terminalCaptureError{err: combined}
+		}
+		return combined
+	}
 	reattach := func(reason string) error {
 		if !guestRecoveryRequired {
 			return nil
@@ -1687,10 +1800,11 @@ func handleExportRequest(
 		return nil
 	}
 	guestRecoveryRequired = true
-	if _, quiesceErr := guestlink.SendQuiesce(client, true); quiesceErr != nil {
-		recoveryErr := reattach("failed quiesce")
+	if _, quiesceErr := guestlink.SendQuiesceContext(ctx, client, true); quiesceErr != nil {
+		recoveryErr := failRecovery(reattach("failed quiesce"))
 		return ctl.Response{}, errors.Join(fmt.Errorf("export quiesce: %w", quiesceErr), recoveryErr)
 	}
+	sinkOpen = false // snapshot.Export owns and closes the sink on every path.
 	out, err := snapshot.Export(ctx, snapshot.ExportSources{
 		SandboxID: opts.SandboxID, APISock: chSock, CHApiDeadline: opts.Cfg.CHApiDeadline(),
 		PortableConfig: captureC0, ParentSandboxRef: parentRef,
@@ -1698,11 +1812,11 @@ func handleExportRequest(
 		LocalCodec: opts.LocalCodec, LocalRequired: opts.LocalRequired, MergeBaseOpener: mergeBaseOpener,
 	}, sink, req.ResumeAfter)
 	if err != nil {
-		return ctl.Response{}, errors.Join(err, reattach("failed export"))
+		return ctl.Response{}, errors.Join(err, failRecovery(reattach("failed export")))
 	}
 	if req.ResumeAfter {
 		if reattachErr := reattach("resumed export"); reattachErr != nil {
-			return ctl.Response{}, reattachErr
+			return ctl.Response{}, failRecovery(reattachErr)
 		}
 	}
 	resp = ctl.Response{
@@ -1731,6 +1845,7 @@ func handleSnapshotRequest(
 	chSock, runDir string,
 	cgroupPath string,
 	chExited <-chan struct{},
+	chProcess processSignaler,
 	pinger *guestlink.Pinger,
 	forwarder *Forwarder, // gates new forwards + collapses active relays around quiesce; may be nil
 	reattachMUX func() error, // re-establishes the stdio MUX after a resumed snapshot attempt; may be nil
@@ -1765,15 +1880,11 @@ func handleSnapshotRequest(
 
 	// Finish every predictable request/artifact/directory check before pausing
 	// forwards or the pinger and, critically, before asking the guest to freeze.
-	if opts.SandboxID == "" {
-		return ctl.Response{}, fmt.Errorf("snapshot: empty sandbox id")
+	if err := validateSandboxID(opts.SandboxID); err != nil {
+		return ctl.Response{}, fmt.Errorf("snapshot: %w", err)
 	}
 	if opts.PortableConfig == nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: immutable C0 is unavailable")
-	}
-	if len(disks) != 1+len(opts.Cfg.Boot.Disks) {
-		return ctl.Response{}, fmt.Errorf("snapshot: runtime disk count %d does not match configured disk count %d",
-			len(disks), 1+len(opts.Cfg.Boot.Disks))
 	}
 	if req.Upload && (opts.ManifestCfg == nil || opts.ManifestCfg.Store.Endpoint == "") {
 		return ctl.Response{}, fmt.Errorf("upload mode requires --manifest-config or MANIFEST_CONFIG (manifest store endpoints)")
@@ -1789,6 +1900,28 @@ func handleSnapshotRequest(
 	}
 	if !req.Upload && req.OutDir == "" {
 		return ctl.Response{}, fmt.Errorf("--output and --upload are mutually exclusive; one is required")
+	}
+	if opts.Cfg == nil {
+		return ctl.Response{}, errors.New("snapshot: runtime host configuration is unavailable")
+	}
+	if err := opts.PortableConfig.Validate(); err != nil {
+		return ctl.Response{}, fmt.Errorf("snapshot: immutable C0: %w", err)
+	}
+	if mfd == nil || mfd.Size() == 0 {
+		return ctl.Response{}, errors.New("snapshot: memory backing is unavailable")
+	}
+	if strings.TrimSpace(chSock) == "" {
+		return ctl.Response{}, errors.New("snapshot: Cloud Hypervisor API socket is unavailable")
+	}
+	if strings.TrimSpace(runDir) == "" {
+		return ctl.Response{}, errors.New("snapshot: run directory is unavailable")
+	}
+	if reattachMUX == nil && (req.ResumeAfter || chProcess == nil) {
+		return ctl.Response{}, errors.New("snapshot: stdio MUX re-attach is unavailable and capture recovery cannot be guaranteed")
+	}
+	if len(disks) != 1+len(opts.Cfg.Boot.Disks) {
+		return ctl.Response{}, fmt.Errorf("snapshot: runtime disk count %d does not match configured disk count %d",
+			len(disks), 1+len(opts.Cfg.Boot.Disks))
 	}
 	mergeBaseOpener := newDiskMergeBaseOpener(opts)
 	memoryMergeBaseOpener := newMemoryMergeBaseOpener(opts)
@@ -1849,7 +1982,7 @@ func handleSnapshotRequest(
 			}
 		}
 		if mergeDisk {
-			if err := snapshot.ValidateMergeBaseWithOpener(dd.MergeBase, diffSize, opts.LocalCodec, opts.LocalRequired, mergeBaseOpener); err != nil {
+			if err := snapshot.ValidateMergeBaseWithOpener(ctx, dd.MergeBase, diffSize, opts.LocalCodec, opts.LocalRequired, mergeBaseOpener); err != nil {
 				return ctl.Response{}, fmt.Errorf("snapshot: disk %d merge base: %w", i, err)
 			}
 			diskMerged[i] = true
@@ -1869,7 +2002,7 @@ func handleSnapshotRequest(
 		if err != nil {
 			return ctl.Response{}, fmt.Errorf("snapshot: memory merge base identity: %w", err)
 		}
-		if err := snapshot.ValidateMergeBaseWithOpener(memoryMergeBase, int64(mfd.Size()), opts.LocalCodec, opts.LocalRequired, memoryMergeBaseOpener); err != nil {
+		if err := snapshot.ValidateMergeBaseWithOpener(ctx, memoryMergeBase, int64(mfd.Size()), opts.LocalCodec, opts.LocalRequired, memoryMergeBaseOpener); err != nil {
 			return ctl.Response{}, fmt.Errorf("snapshot: memory merge base: %w", err)
 		}
 		mergeMemory = true
@@ -1879,7 +2012,7 @@ func handleSnapshotRequest(
 			return ctl.Response{}, fmt.Errorf("snapshot: Bundle memory merge base identity: %w", err)
 		}
 		if mergeMemory {
-			if err := snapshot.ValidateMergeBaseWithOpener(memoryMergeBase, int64(mfd.Size()), opts.LocalCodec, opts.LocalRequired, memoryMergeBaseOpener); err != nil {
+			if err := snapshot.ValidateMergeBaseWithOpener(ctx, memoryMergeBase, int64(mfd.Size()), opts.LocalCodec, opts.LocalRequired, memoryMergeBaseOpener); err != nil {
 				return ctl.Response{}, fmt.Errorf("snapshot: Bundle memory merge base: %w", err)
 			}
 		}
@@ -1891,7 +2024,13 @@ func handleSnapshotRequest(
 	var (
 		dependencyPlan        *snapshotBundlePlan
 		bundleRefReplacements map[string]string
+		dependencyPlanOpen    bool
 	)
+	defer func() {
+		if dependencyPlanOpen {
+			err = errors.Join(err, dependencyPlan.Close())
+		}
+	}()
 	if snapshotMode == ctl.SnapshotModeBundle {
 		plan, planErr := prepareSnapshotBundlePlan(ctx, opts, resultMemoryRefs,
 			diskMerged, req.OutDir, bundleAdmission)
@@ -1899,24 +2038,19 @@ func handleSnapshotRequest(
 			return ctl.Response{}, planErr
 		}
 		dependencyPlan = plan
-		defer func() { err = errors.Join(err, plan.Close()) }()
+		dependencyPlanOpen = true
 		bundleSink, err = snapshot.NewPlannedBundleSink(req.OutDir, opts.SandboxID,
 			opts.ManifestCfg, opts.CustomerKeyFn, bundleAdmission, plan.Refs(), logf)
 		if err != nil {
 			return ctl.Response{}, err
 		}
-		defer func() {
-			if closeErr := bundleSink.Close(); closeErr != nil {
-				err = errors.Join(err, fmt.Errorf("snapshot Bundle cleanup: %w", closeErr))
-			}
-		}()
 	} else {
 		dependencyPlan, err = prepareSnapshotDependencyPlan(ctx, opts, resultMemoryRefs,
 			diskMerged, req.OutDir, store.WriteAdmission{}, false)
 		if err != nil {
 			return ctl.Response{}, err
 		}
-		defer func() { err = errors.Join(err, dependencyPlan.Close()) }()
+		dependencyPlanOpen = true
 	}
 
 	// Construct the sink before quiesce as well: malformed manifest/store
@@ -1934,7 +2068,6 @@ func handleSnapshotRequest(
 		if ierr != nil {
 			return ctl.Response{}, fmt.Errorf("snapshot ingester: %w", ierr)
 		}
-		defer ing.Close()
 		ingestSink = snapshot.NewIngestSink(ing, logf)
 		sink = ingestSink
 	} else if snapshotMode == ctl.SnapshotModeBundle {
@@ -1942,13 +2075,21 @@ func handleSnapshotRequest(
 	} else {
 		sink = snapshot.NewFileSink(req.OutDir, opts.SandboxID, opts.LocalCodec, opts.LocalRequired, logf)
 	}
+	sinkOpen := true
+	defer func() {
+		if sinkOpen {
+			err = errors.Join(err, sink.Close())
+		}
+	}()
 	if bundleSink != nil {
 		bundleRefReplacements, err = dependencyPlan.Ingest(ctx, bundleSink, logf)
 	} else {
 		bundleRefReplacements, err = dependencyPlan.Emit(ctx, sink, logf)
 	}
-	if err != nil {
-		return ctl.Response{}, fmt.Errorf("snapshot dependencies: %w", err)
+	planCloseErr := dependencyPlan.Close()
+	dependencyPlanOpen = false
+	if err != nil || planCloseErr != nil {
+		return ctl.Response{}, fmt.Errorf("snapshot dependencies: %w", errors.Join(err, planCloseErr))
 	}
 
 	cfg := opts.Cfg
@@ -1995,6 +2136,7 @@ func handleSnapshotRequest(
 	}()
 
 	guestRecoveryRequired := false
+	recoveryTerminated := false
 	reattachRunningGuest := func(reason string) error {
 		if !guestRecoveryRequired {
 			return nil
@@ -2008,6 +2150,19 @@ func handleSnapshotRequest(
 		logf("stdio MUX re-attached after %s", reason)
 		guestRecoveryRequired = false
 		return nil
+	}
+	failRecovery := func(recoveryErr error) error {
+		if recoveryErr == nil {
+			return nil
+		}
+		shutdownErr, terminal := terminateAfterCaptureRecoveryFailure(
+			chSock, chProcess, chExited, opts.Cfg.CHApiDeadline(), logf)
+		recoveryTerminated = terminal
+		combined := errors.Join(recoveryErr, shutdownErr)
+		if terminal {
+			return &terminalCaptureError{err: combined}
+		}
+		return combined
 	}
 	previousMemoryHigh, memoryHighLock, liftErr := liftVMMMemoryHigh(cgroupPath)
 	if liftErr != nil {
@@ -2062,7 +2217,7 @@ func handleSnapshotRequest(
 	// that is what makes `sandbox-ctl run` return (docs/sandbox.md §6.2).
 	defer func() {
 		if err == nil && !req.ResumeAfter {
-			go destroyAfterSnapshot(chSock, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
+			go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
 		}
 	}()
 	// Gate new port-forward connects and join every admitted handshake/relay
@@ -2073,6 +2228,9 @@ func handleSnapshotRequest(
 	if forwarder != nil {
 		forwarder.PauseAndDrain()
 		defer func() {
+			if recoveryTerminated {
+				return
+			}
 			if err == nil && !req.ResumeAfter {
 				return
 			}
@@ -2080,7 +2238,10 @@ func handleSnapshotRequest(
 		}()
 	}
 	if pinger != nil {
-		pinger.Pause()
+		if pauseErr := pinger.PauseContext(ctx); pauseErr != nil {
+			pinger.Resume()
+			return ctl.Response{}, fmt.Errorf("snapshot: drain pinger before quiesce: %w", pauseErr)
+		}
 		// Resume on the way out UNLESS this is the success + destroy
 		// path: there the VM stays paused while destroyAfterSnapshot
 		// tears it down, so a resumed pinger only spews misleading
@@ -2088,26 +2249,29 @@ func handleSnapshotRequest(
 		// error (sandbox keeps running) or --resume (sandbox resumed),
 		// the pinger must come back.
 		defer func() {
+			if recoveryTerminated {
+				return
+			}
 			if err == nil && !req.ResumeAfter {
 				return
 			}
 			pinger.Resume()
 		}()
-		client := pinger.Client
-		if client == nil {
-			client = &guestlink.HostClient{BasePath: filepath.Join(runDir, "vsock.sock"), Logf: logf}
-		}
-		guestRecoveryRequired = true
-		result, qerr := guestlink.SendQuiesce(client, !dropCaches)
-		if qerr != nil {
-			operationErr := fmt.Errorf("quiesce: %w", qerr)
-			logf("quiesce: %v (aborting snapshot)", operationErr)
-			return ctl.Response{}, errors.Join(operationErr, reattachRunningGuest("failed quiesce"))
-		}
-		dropCachesResult = result
-		guestQuiesced = true
-		logf("quiesce: guest acked (drop_caches=%s, MUX + forwards closed), proceeding to /vm.pause", result)
 	}
+	client := &guestlink.HostClient{BasePath: filepath.Join(runDir, "vsock.sock"), Logf: logf}
+	if pinger != nil && pinger.Client != nil {
+		client = pinger.Client
+	}
+	guestRecoveryRequired = true
+	result, qerr := guestlink.SendQuiesceContext(ctx, client, !dropCaches)
+	if qerr != nil {
+		operationErr := fmt.Errorf("quiesce: %w", qerr)
+		logf("quiesce: %v (aborting snapshot)", operationErr)
+		return ctl.Response{}, errors.Join(operationErr, failRecovery(reattachRunningGuest("failed quiesce")))
+	}
+	dropCachesResult = result
+	guestQuiesced = true
+	logf("quiesce: guest acked (drop_caches=%s, MUX + forwards closed), proceeding to /vm.pause", result)
 	// Record the last guest observation together with one exact CH target/current
 	// pair at the freeze boundary. BeginSnapshot still holds the balloon mutation
 	// gate, and a successful guest quiesce has already stopped the application;
@@ -2155,13 +2319,14 @@ func handleSnapshotRequest(
 	if mergeMemory {
 		src.MergeBaseSnapshot = memoryMergeBase
 	}
+	sinkOpen = false // snapshot.Take owns and closes the sink on every path.
 	out, err := snapshot.Take(src, sink, req.ResumeAfter)
 	if err != nil {
 		// SendQuiesce closes the old MUX and freezes the application. Take
 		// restores the VM/backend state on failure; reattach completes the
 		// guest-side recovery and thaws the application before we return.
 		if guestQuiesced {
-			return ctl.Response{}, errors.Join(err, reattachRunningGuest("failed snapshot"))
+			return ctl.Response{}, errors.Join(err, failRecovery(reattachRunningGuest("failed snapshot")))
 		}
 		return ctl.Response{}, err
 	}
@@ -2173,7 +2338,7 @@ func handleSnapshotRequest(
 	// already running again, isn't blocked on a full stdout pipe for long.
 	if req.ResumeAfter {
 		if reattachErr := reattachRunningGuest("snapshot"); reattachErr != nil {
-			return ctl.Response{}, reattachErr
+			return ctl.Response{}, failRecovery(reattachErr)
 		}
 	}
 
@@ -2183,6 +2348,7 @@ func handleSnapshotRequest(
 		WallclockPauseMs: out.WallclockPauseMs,
 		WallclockDumpMs:  out.WallclockDumpMs,
 		DropCachesResult: dropCachesResult,
+		SnapshotRef:      out.SnapshotRef,
 		SandboxRef:       out.SandboxRef,
 		SandboxPath:      out.SandboxPath,
 	}
@@ -2219,6 +2385,70 @@ func handleSnapshotRequest(
 // over a local UDS; this margin is generous).
 const destroyAfterSnapshotDelay = 300 * time.Millisecond
 
+// terminateAfterCaptureRecoveryFailure is the fail-safe for a resumed
+// capture whose guest MUX cannot be reattached even after the idempotent
+// attach retry. Keeping a VM alive in that state would leave the app cgroup
+// frozen (or running without its stdio transport), so terminate it while the
+// capture's memory/Budget and memory.high lifecycle guards are still held.
+// terminal reports whether teardown was initiated; callers use it to keep the
+// capture gate closed and avoid restarting pinger/forward activity.
+func terminateAfterCaptureRecoveryFailure(
+	chSock string,
+	chProcess processSignaler,
+	chExited <-chan struct{},
+	respDeadline time.Duration,
+	logf func(string, ...any),
+) (retErr error, terminal bool) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	if chProcess == nil && chExited == nil {
+		return errors.New("capture recovery failed and no Cloud Hypervisor lifecycle handle is available"), false
+	}
+	terminal = true
+	shutdownErr := (chapi.Client{Sock: chSock, RespDeadline: respDeadline}).ShutdownVMM()
+	if shutdownErr == nil {
+		logf("capture recovery failed — requested VMM shutdown")
+	} else {
+		logf("capture recovery failed — vmm.shutdown: %v", shutdownErr)
+		if chProcess == nil {
+			retErr = errors.Join(retErr, errors.New("capture recovery teardown cannot signal Cloud Hypervisor"))
+		} else if signalErr := chProcess.Signal(syscall.SIGTERM); signalErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("capture recovery SIGTERM fallback: %w", signalErr))
+		} else {
+			logf("capture recovery failed — sent SIGTERM fallback")
+		}
+	}
+	if chExited == nil {
+		return retErr, terminal
+	}
+	waitForExit := func(duration time.Duration) bool {
+		timer := time.NewTimer(duration)
+		defer timer.Stop()
+		select {
+		case <-chExited:
+			return true
+		case <-timer.C:
+			return false
+		}
+	}
+	if waitForExit(chShutdownGrace) {
+		return retErr, terminal
+	}
+	if chProcess == nil {
+		return errors.Join(retErr, fmt.Errorf("Cloud Hypervisor did not exit within %s and no process signaler is available", chShutdownGrace)), terminal
+	}
+	if signalErr := chProcess.Signal(syscall.SIGKILL); signalErr != nil {
+		retErr = errors.Join(retErr, fmt.Errorf("capture recovery SIGKILL after %s: %w", chShutdownGrace, signalErr))
+	} else {
+		logf("capture recovery failed — sent SIGKILL after %s", chShutdownGrace)
+	}
+	if !waitForExit(chShutdownGrace) {
+		retErr = errors.Join(retErr, fmt.Errorf("Cloud Hypervisor did not exit within %s after SIGKILL", chShutdownGrace))
+	}
+	return retErr, terminal
+}
+
 // destroyAfterSnapshot tears the VMM down (PUT /api/v1/vmm.shutdown) so
 // the `sandbox-ctl run` process owning this ctl.sock returns. Run on a
 // goroutine on the resume_after=false ("destroy") path: by the time the
@@ -2228,10 +2458,24 @@ const destroyAfterSnapshotDelay = 300 * time.Millisecond
 // logged — the sandbox is being torn down regardless.
 func destroyAfterSnapshot(
 	chSock string,
+	chProcess processSignaler,
 	memoryHighLock *os.File,
 	releaseMemoryBarrier func(),
 	chExited <-chan struct{},
 	respDeadline time.Duration,
+	logf func(string, ...any),
+) {
+	destroyAfterSnapshotWithBounds(chSock, chProcess, memoryHighLock, releaseMemoryBarrier,
+		chExited, respDeadline, destroyAfterSnapshotDelay, chShutdownGrace, logf)
+}
+
+func destroyAfterSnapshotWithBounds(
+	chSock string,
+	chProcess processSignaler,
+	memoryHighLock *os.File,
+	releaseMemoryBarrier func(),
+	chExited <-chan struct{},
+	respDeadline, responseDelay, exitGrace time.Duration,
 	logf func(string, ...any),
 ) {
 	if releaseMemoryBarrier != nil {
@@ -2244,15 +2488,50 @@ func destroyAfterSnapshot(
 			}
 		}()
 	}
-	time.Sleep(destroyAfterSnapshotDelay)
-	if err := (chapi.Client{Sock: chSock, RespDeadline: respDeadline}).ShutdownVMM(); err != nil {
-		logf("snapshot: destroy mode — vmm.shutdown: %v", err)
-		logf("snapshot: destroy mode — retaining memory barrier until VMM exit")
+	if responseDelay > 0 {
+		time.Sleep(responseDelay)
+	}
+	shutdownErr := (chapi.Client{Sock: chSock, RespDeadline: respDeadline}).ShutdownVMM()
+	if shutdownErr != nil {
+		logf("snapshot: destroy mode — vmm.shutdown: %v", shutdownErr)
+		if chProcess != nil {
+			if signalErr := chProcess.Signal(syscall.SIGTERM); signalErr != nil {
+				logf("snapshot: destroy mode — SIGTERM fallback: %v", signalErr)
+			} else {
+				logf("snapshot: destroy mode — sent SIGTERM fallback")
+			}
+		}
 	} else {
 		logf("snapshot: destroy mode — VMM shutdown requested")
 	}
-	if chExited != nil {
-		<-chExited
+	if chExited == nil {
+		return
+	}
+	waitForExit := func() bool {
+		timer := time.NewTimer(exitGrace)
+		defer timer.Stop()
+		select {
+		case <-chExited:
+			return true
+		case <-timer.C:
+			return false
+		}
+	}
+	if waitForExit() {
+		return
+	}
+	if chProcess != nil {
+		if signalErr := chProcess.Signal(syscall.SIGKILL); signalErr != nil {
+			logf("snapshot: destroy mode — SIGKILL after %s: %v", exitGrace, signalErr)
+		} else {
+			logf("snapshot: destroy mode — sent SIGKILL after %s", exitGrace)
+		}
+	} else {
+		logf("snapshot: destroy mode — CH still running after %s and process signaler is unavailable", exitGrace)
+		return
+	}
+	if !waitForExit() {
+		logf("snapshot: destroy mode — CH exit was not observed within %s after SIGKILL; releasing lifecycle guards", exitGrace)
 	}
 }
 
@@ -2261,6 +2540,20 @@ func ensureSnapshotDir(dir string) error {
 		return fmt.Errorf("empty path")
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("path must be a real directory, not a symlink or non-directory")
+	}
+	dirFD, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	if err := unix.Close(dirFD); err != nil {
 		return err
 	}
 	f, err := os.CreateTemp(dir, ".snapshot-write-check-*")
@@ -2273,63 +2566,6 @@ func ensureSnapshotDir(dir string) error {
 		return err
 	}
 	return os.Remove(name)
-}
-
-func validateLocalMemoryRefs(outputDir string, refs []string, codec tarstream.Codec, required bool) error {
-	return validateLocalMemoryRefsWithOpener(outputDir, refs, codec, required, nil)
-}
-
-func validateLocalMemoryRefsWithOpener(outputDir string, refs []string, codec tarstream.Codec, required bool, opener snapshot.MergeBaseOpener) error {
-	for i, raw := range refs {
-		ref, err := manifest.ParseRef(raw)
-		if err != nil {
-			return fmt.Errorf("snapshot: memory ref[%d] is invalid", i)
-		}
-		if ref.Portable() {
-			continue
-		}
-		// Local memory dependencies are intentionally portable only as a
-		// sibling artifact set. Never retain an absolute/source-directory path
-		// in snapshot.cfg; resolve the ref basename against W's output bundle.
-		path := filepath.Join(outputDir, filepath.Base(ref.Path))
-		info, err := os.Stat(path)
-		if err != nil {
-			if codec != nil {
-				return fmt.Errorf("snapshot: local memory ref[%d] is not accessible", i)
-			}
-			return fmt.Errorf("snapshot: local memory ref[%d] is not accessible: %w", i, err)
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("snapshot: local memory ref[%d] is not a regular file", i)
-		}
-		var stream fetch.Stream
-		if opener != nil {
-			ref.Path = path
-			stream, err = opener(context.Background(), ref.String())
-		} else {
-			stream, _, err = openLocalDiskStream(path, ref, codec, required)
-		}
-		if err != nil {
-			return fmt.Errorf("snapshot: local memory ref[%d] validation: %w", i, err)
-		}
-		if err := stream.Close(); err != nil {
-			return fmt.Errorf("snapshot: local memory ref[%d] close: %w", i, err)
-		}
-	}
-	return nil
-}
-
-func validatePortableMemoryRefs(refs []string) error {
-	for i, raw := range refs {
-		ref, err := manifest.ParseRef(raw)
-		if err != nil {
-			return fmt.Errorf("snapshot: memory ref[%d] is invalid", i)
-		}
-		if !ref.Portable() {
-			return fmt.Errorf("snapshot: direct upload would retain a local memory lower; use --output then upload-snapshot")
-		}
-	}
-	return nil
 }
 
 type artifactDependencyRole uint8
@@ -2735,51 +2971,6 @@ func snapshotLayerDependencies(opts RunOptions, memoryFromRefs []string, diskMer
 	return dependencies, nil
 }
 
-func snapshotLayerDependencyRefs(opts RunOptions, memoryFromRefs []string, diskMerged []bool) ([]string, error) {
-	dependencies, err := snapshotLayerDependencies(opts, memoryFromRefs, diskMerged)
-	if err != nil {
-		return nil, err
-	}
-	refs := make([]string, len(dependencies))
-	for i := range dependencies {
-		refs[i] = dependencies[i].raw
-	}
-	return refs, nil
-}
-
-func validateNonBundleSnapshotSources(ctx context.Context, opts RunOptions, memoryFromRefs []string, diskMerged []bool) error {
-	refs, err := snapshotLayerDependencyRefs(opts, memoryFromRefs, diskMerged)
-	if err != nil {
-		return err
-	}
-	seen := make(map[store.ContentKey]struct{})
-	for _, raw := range refs {
-		ref, err := manifest.ParseRef(raw)
-		if err != nil {
-			return fmt.Errorf("snapshot dependency %q: %w", raw, err)
-		}
-		if ref.Scheme != manifest.RefSchemeManifest {
-			continue
-		}
-		key, err := manifest.ParseHexKey(ref.Path)
-		if err != nil {
-			return err
-		}
-		if _, duplicate := seen[key]; duplicate {
-			continue
-		}
-		seen[key] = struct{}{}
-		_, _, bundled, err := bundleSourceForManifest(ctx, key, opts)
-		if err != nil {
-			return fmt.Errorf("snapshot source for Manifest %s: %w", manifest.HexKey(key), err)
-		}
-		if bundled {
-			return fmt.Errorf("non-Bundle snapshot cannot retain Bundle-selected Manifest %s without bundle/refs; use --mode=bundle or merge the dependency", manifest.HexKey(key))
-		}
-	}
-	return nil
-}
-
 func bundleSourceForManifest(ctx context.Context, key store.ContentKey, opts RunOptions) (string, string, bool, error) {
 	if opts.BundleFetcher == nil {
 		return "", "", false, nil
@@ -3013,137 +3204,6 @@ func resolveBundleArtifactPath(ref manifest.Ref, raw string, known map[string]st
 	return "", fmt.Errorf("snapshot Bundle cannot resolve unlocated local ref %q before pause", raw)
 }
 
-func ensureBundleSibling(ctx context.Context, sourcePath, outputDir, basename string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	realSource, err := filepath.EvalSymlinks(sourcePath)
-	if err != nil {
-		return err
-	}
-	realSource, err = filepath.Abs(realSource)
-	if err != nil {
-		return err
-	}
-	sourceInfo, err := os.Stat(realSource)
-	if err != nil {
-		return err
-	}
-	if !sourceInfo.Mode().IsRegular() {
-		return fmt.Errorf("source is not a regular file")
-	}
-	destination, err := filepath.Abs(filepath.Join(outputDir, basename))
-	if err != nil {
-		return err
-	}
-	if destinationInfo, statErr := os.Lstat(destination); statErr == nil {
-		if !destinationInfo.Mode().IsRegular() {
-			return fmt.Errorf("destination Bundle sibling is not a regular file")
-		}
-		if os.SameFile(sourceInfo, destinationInfo) {
-			return nil
-		}
-		return requireBundleFilesEqual(ctx, realSource, destination)
-	} else if !os.IsNotExist(statErr) {
-		return statErr
-	}
-
-	temporary, err := os.CreateTemp(outputDir, ".bundle-sibling-*.partial")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o644); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	source, err := os.Open(realSource)
-	if err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	copyErr := copyBundleFile(ctx, temporary, source)
-	copyErr = errors.Join(copyErr, source.Close())
-	if copyErr == nil {
-		copyErr = temporary.Sync()
-	}
-	copyErr = errors.Join(copyErr, temporary.Close())
-	if copyErr != nil {
-		return copyErr
-	}
-	if err := unix.Renameat2(unix.AT_FDCWD, temporaryPath, unix.AT_FDCWD, destination, unix.RENAME_NOREPLACE); err != nil {
-		if !errors.Is(err, unix.EEXIST) {
-			return err
-		}
-		return requireBundleFilesEqual(ctx, realSource, destination)
-	}
-	directory, err := os.Open(outputDir)
-	if err != nil {
-		return err
-	}
-	return errors.Join(directory.Sync(), directory.Close())
-}
-
-func copyBundleFile(ctx context.Context, destination io.Writer, source io.Reader) error {
-	buffer := make([]byte, 128*1024)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		n, readErr := source.Read(buffer)
-		if n != 0 {
-			written, writeErr := destination.Write(buffer[:n])
-			if writeErr != nil {
-				return writeErr
-			}
-			if written != n {
-				return io.ErrShortWrite
-			}
-		}
-		if readErr == io.EOF {
-			return nil
-		}
-		if readErr != nil {
-			return readErr
-		}
-	}
-}
-
-func requireBundleFilesEqual(ctx context.Context, sourcePath, destinationPath string) error {
-	source, err := os.Open(sourcePath)
-	if err != nil {
-		return err
-	}
-	defer source.Close()
-	destination, err := os.OpenFile(destinationPath, os.O_RDONLY|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return err
-	}
-	defer destination.Close()
-	left := make([]byte, 128*1024)
-	right := make([]byte, len(left))
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		leftN, leftErr := io.ReadFull(source, left)
-		rightN, rightErr := io.ReadFull(destination, right)
-		if leftN != rightN || !bytes.Equal(left[:leftN], right[:rightN]) {
-			return fmt.Errorf("destination Bundle bytes differ from source")
-		}
-		if leftErr == io.EOF || leftErr == io.ErrUnexpectedEOF {
-			if rightErr != leftErr {
-				return fmt.Errorf("destination Bundle size differs from source")
-			}
-			return nil
-		}
-		if leftErr != nil || rightErr != nil {
-			return errors.Join(leftErr, rightErr)
-		}
-	}
-}
-
 // memoryRefsForSnapshot returns the memory lowers retained by the next S. A
 // merge replaces only the direct parent S; its existing lowers remain in order.
 func memoryRefsForSnapshot(binding *MemorySourceBinding, mergeParent bool) ([]string, error) {
@@ -3315,10 +3375,16 @@ func prependRef(ref string, rest []string) []string {
 // keeps cold-start lower chains from copying legacy sha256 qualifiers into a
 // newly generated portable Sandbox configuration.
 func canonicalizeConfiguredTarRefs(cfg *config.SandboxConfig, locations config.RefLocations, codec tarstream.Codec, required bool) error {
-	return canonicalizeConfiguredTarRefsWithOpener(cfg, locations, codec, required, nil)
+	return canonicalizeConfiguredTarRefsWithOpener(context.Background(), cfg, locations, codec, required, nil)
 }
 
-func canonicalizeConfiguredTarRefsWithOpener(cfg *config.SandboxConfig, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) error {
+func canonicalizeConfiguredTarRefsWithOpener(ctx context.Context, cfg *config.SandboxConfig, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if cfg == nil {
 		return fmt.Errorf("sandbox config is nil")
 	}
@@ -3326,7 +3392,7 @@ func canonicalizeConfiguredTarRefsWithOpener(cfg *config.SandboxConfig, location
 		if target == nil || *target == "" {
 			return nil
 		}
-		ref, err := canonicalConfiguredTarRefWithOpener(*target, locations, codec, required, opener)
+		ref, err := canonicalConfiguredTarRefWithOpener(ctx, *target, locations, codec, required, opener)
 		if err != nil {
 			return fmt.Errorf("%s: %w", field, err)
 		}
@@ -3368,10 +3434,10 @@ func canonicalizeConfiguredTarRefsWithOpener(cfg *config.SandboxConfig, location
 }
 
 func canonicalConfiguredTarRef(raw string, locations config.RefLocations, codec tarstream.Codec, required bool) (string, error) {
-	return canonicalConfiguredTarRefWithOpener(raw, locations, codec, required, nil)
+	return canonicalConfiguredTarRefWithOpener(context.Background(), raw, locations, codec, required, nil)
 }
 
-func canonicalConfiguredTarRefWithOpener(raw string, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (string, error) {
+func canonicalConfiguredTarRefWithOpener(ctx context.Context, raw string, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (string, error) {
 	ref, err := manifest.ParseRef(raw)
 	if err != nil {
 		return "", protectLocalArtifactError(codec, "parse local artifact ref", err)
@@ -3379,7 +3445,7 @@ func canonicalConfiguredTarRefWithOpener(raw string, locations config.RefLocatio
 	if ref.Scheme == manifest.RefSchemeManifest {
 		return ref.String(), nil
 	}
-	stream, _, err := OpenDiskStreamAtWithOpener(context.Background(), raw, nil, locations, "", codec, required, opener)
+	stream, _, err := OpenDiskStreamAtWithOpener(ctx, raw, nil, locations, "", codec, required, opener)
 	if err != nil {
 		return "", err
 	}
@@ -3501,4 +3567,12 @@ func generateSandboxID() string {
 		return fmt.Sprintf("sb-%x", b)
 	}
 	return "sb-default"
+}
+
+func validateSandboxID(sandboxID string) error {
+	if sandboxID == "" || sandboxID == "." || sandboxID == ".." ||
+		filepath.Base(sandboxID) != sandboxID || strings.ContainsAny(sandboxID, `/\`) {
+		return fmt.Errorf("sandbox id %q must be one non-empty path component", sandboxID)
+	}
+	return nil
 }

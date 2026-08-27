@@ -334,10 +334,14 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		// endQuiesce (restore/attach).
 		sup.quiescing.Store(true)
 		sup.pluginReg.beginQuiesce()
-		// Reject new exec + SIGKILL in-flight exec children so the
-		// snapshot captures no running exec siblings (their sessions
-		// tear down once the reaper delivers).
-		killExecChildren(sup.execReg)
+		// Reject new exec, terminate every in-flight child, and join the full
+		// fork/MUX/socket session before freezing. Capturing only after child
+		// SIGKILL but before its Go cleanup completed could restore with the
+		// process-wide fork path permanently wedged.
+		if err := quiesceExecSessions(sup.execReg); err != nil {
+			logf("reverse-channel: quiesce exec drain failed, NOT sending quiesced: %v", err)
+			return false
+		}
 		// Freeze the app tree BEFORE sync: no new dirty pages after
 		// sync (cleaner deterministic image) and the snapshot captures
 		// the app stopped. NOT best-effort — an unconfirmed freeze is a
@@ -357,6 +361,13 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		// closes the cached accept-mode listeners (unblocking parked accepts).
 		closeConnectSessions(sup.connReg, sup.acceptLn)
 		bridge.closeLiveMUX() // stop forwarding app output, then the MUX_CLOSE handshake
+		// This management connection is the final host→guest vsock flow before
+		// /vm.pause. Arm the same bounded linger as MUX/forward connections;
+		// the host waits for EOF after quiesced, so Close completes a transport
+		// teardown barrier instead of leaving a half-closed 4-tuple in memory S.
+		if err := c.SetLinger(muxCloseLingerSec); err != nil {
+			logf("reverse-channel: quiesce SO_LINGER: %v (continuing)", err)
+		}
 		if err := proto.WriteMessage(c, &proto.Message{
 			Type:             proto.TypeQuiesced,
 			DropCachesResult: dropCachesResult,

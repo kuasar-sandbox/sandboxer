@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 )
 
@@ -130,6 +132,68 @@ func TestOpenRootImageBlockReaderExcludesFlattenedConfigTail(t *testing.T) {
 	}
 	if _, err := reader.ReadAt(make([]byte, 1), int64(len(payload))); err == nil {
 		t.Fatal("vhost reader exposed the flattened ZIP tail")
+	}
+}
+
+func TestOpenRootImageBlockReaderUsesParentSandboxPayloadAndImageConfigOnly(t *testing.T) {
+	dir := t.TempDir()
+	payload := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
+	payload[1024+12] = 12
+	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	imageConfig, err := json.Marshal(&image.RuntimeConfig{Cmd: []string{"/from-image-config"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := strings.Repeat("a", 64)
+	parentPortable := &config.PortableSandboxConfig{
+		Version: config.PortableSandboxConfigVersion,
+		Resources: config.PortableResourcesConfig{
+			Capacity:    config.CapacityConfig{CPU: 1, Memory: "1GiB"},
+			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "1GiB"},
+		},
+		Boot: config.PortableBootConfig{
+			Kernel: "file://kernel@sha256:" + key, Runtime: "file://runtime@sha256:" + key,
+			Root: config.PortableRootConfig{Base: "self", Overlay: &config.PortableOverlayConfig{}},
+		},
+		Launch: config.PortableLaunchConfig{Exec: "/must-not-be-adopted", Workdir: "/", Restart: "never"},
+	}
+	runtimeConfig, err := config.MarshalPortableSandboxConfig(parentPortable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical, err := sandboxfile.BuildSource(
+		sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), imageConfig, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, path, err := snapshot.NewFileSink(dir, "parent", nil, false, nil).AbsorbSandbox(context.Background(), logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := manifest.ParseRef(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed.Path = path
+	reader, size, err := OpenRootImageBlockReaderWithOpener(context.Background(), parsed.String(), nil, nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if size != int64(len(payload)) || reader.Size() != int64(len(payload)) {
+		t.Fatalf("parent Sandbox block size = %d/%d, want %d", size, reader.Size(), len(payload))
+	}
+	defaults, err := LoadImageConfigFrom(reader, reader.Size())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defaults.Cmd) != 1 || defaults.Cmd[0] != "/from-image-config" {
+		t.Fatalf("parent Sandbox image config = %#v", defaults)
+	}
+	if _, err := reader.ReadAt(make([]byte, 1), int64(len(payload))); err == nil {
+		t.Fatal("vhost reader exposed parent Sandbox ZIP tail")
 	}
 }
 

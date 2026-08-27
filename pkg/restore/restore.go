@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -123,6 +124,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	}
 	if opts.SandboxID == "" {
 		opts.SandboxID = "rs-default"
+	}
+	if err := validateRestoreSandboxID(opts.SandboxID); err != nil {
+		return -1, err
 	}
 	if opts.RuntimeRoot == "" {
 		opts.RuntimeRoot = "/run/sandbox"
@@ -303,6 +307,22 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		safeTarget = min(balTarget, balCurrent)
 	}
 
+	// Open and strictly validate every memory parent before creating run-dir,
+	// cgroup, controller lease, network provider, memfd, or VM state. Keep these
+	// exact streams for the later UFFD chain so validation and use cannot race a
+	// second lookup of the same ref.
+	parentMemoryLayers, err := openMemoryParentLayers(ctx, memoryConfig.FromRefs, opts, snapCap)
+	if err != nil {
+		return -1, err
+	}
+	defer func() {
+		for i := len(parentMemoryLayers) - 1; i >= 0; i-- {
+			if closeErr := parentMemoryLayers[i].Close(); closeErr != nil {
+				logf("from_refs[%d] close: %v", i, closeErr)
+			}
+		}
+	}()
+
 	// Preserve both snapshot sides. SafeTarget normalization is deliberately
 	// deferred until restore ACK and MUX establishment.
 	var balloonCtl *resctl.BalloonController
@@ -382,27 +402,15 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if err != nil {
 		return -1, fmt.Errorf("memory controller: %w", err)
 	}
-	// The CH-authoritative Capacity also sizes the memfd and UFFD source.
-	capBytes := snapCap
-
 	// Build the layered memory source: [self bundle] ++ from_refs (§3.5). A
 	// non-resident page (hole) in an upper layer falls through to a lower
 	// layer; a page hole in every layer (merged hole) → ZEROPAGE. Single layer
-	// (no from_refs) degenerates to today's behaviour. The from_refs streams
-	// live until the run exits (closed below); selfStream is closed at open.
-	memLayers := []fetch.Stream{selfStream}
-	for i, ref := range memoryConfig.FromRefs {
-		s, err := openMemorySnapshotRef(ctx, ref, opts)
-		if err != nil {
-			return -1, fmt.Errorf("from_refs[%d]: %w", i, err)
-		}
-		if s.Size() != capBytes {
-			_ = s.Close()
-			return -1, fmt.Errorf("from_refs[%d] memory size=%d does not match capacity=%d", i, s.Size(), capBytes)
-		}
-		defer s.Close()
-		memLayers = append(memLayers, s)
-	}
+	// (no from_refs) degenerates to today's behaviour. Parent streams were
+	// opened during preflight and live until run exit; selfStream is root-owned.
+	capBytes := snapCap
+	memLayers := make([]fetch.Stream, 1, 1+len(parentMemoryLayers))
+	memLayers[0] = selfStream
+	memLayers = append(memLayers, parentMemoryLayers...)
 	source, err := uffd.NewStreamSnapshotSource(fetch.NewLayered(memLayers...), capBytes)
 	if err != nil {
 		return -1, fmt.Errorf("snapshot source: %w", err)
@@ -623,6 +631,14 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	})
 }
 
+func validateRestoreSandboxID(sandboxID string) error {
+	if sandboxID == "" || sandboxID == "." || sandboxID == ".." ||
+		filepath.Base(sandboxID) != sandboxID || strings.ContainsAny(sandboxID, `/\`) {
+		return fmt.Errorf("restore: sandbox id %q must be one non-empty path component", sandboxID)
+	}
+	return nil
+}
+
 // openAndEstablishRestoreMUX is the restore readiness barrier after CH API
 // readiness and /vm.resume: OpenMUXViaRestore returns only after restore_ack,
 // then the host MUX must be established before ready is emitted. The pinger,
@@ -668,21 +684,13 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 
 	// Layered ro base: [captured top] ++ chain.
 	logf("disk %s image: opening captured top", diskKey)
-	top, err := openDiskRefStream(ctx, capturedTop, opts)
+	refs := append([]string{capturedTop}, chain...)
+	baseReader, err := openLayeredDiskBase(ctx, refs, func(ctx context.Context, raw string) (fetch.Stream, error) {
+		return openDiskRefStream(ctx, raw, opts)
+	})
 	if err != nil {
 		return fail(fmt.Errorf("%s: open base: %w", diskKey, err))
 	}
-	layers := []fetch.Stream{top}
-	for i, ref := range chain {
-		s, serr := openDiskRefStream(ctx, ref, opts)
-		if serr != nil {
-			return fail(fmt.Errorf("%s base_from_refs[%d]: %w", diskKey, i, serr))
-		}
-		closers = append(closers, func() { s.Close() })
-		layers = append(layers, s)
-	}
-	baseStream := fetch.NewLayered(layers...)
-	baseReader := vhost.NewStreamReader(ctx, baseStream, int64(baseStream.Size()))
 	closers = append(closers, func() { baseReader.Close() })
 
 	// Fresh writable diff. Empty URI → auto-default (ours to remove).
@@ -725,6 +733,54 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 		closers = append(closers, func() { r.Close() })
 	}
 	return db, cleanup, nil
+}
+
+type restoreDiskStreamOpener func(context.Context, string) (fetch.Stream, error)
+
+// openLayeredDiskBase transfers ownership of every successfully opened layer
+// to one BlockReader. A partial open closes all retained streams exactly once;
+// the success path closes them only through the layered reader.
+func openLayeredDiskBase(ctx context.Context, refs []string, opener restoreDiskStreamOpener) (_ vhost.BlockReader, retErr error) {
+	if len(refs) == 0 || refs[0] == "" {
+		return nil, errors.New("disk layer top is required")
+	}
+	if opener == nil {
+		return nil, errors.New("disk layer opener is required")
+	}
+	streams := make([]fetch.Stream, 0, len(refs))
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		for i := len(streams) - 1; i >= 0; i-- {
+			retErr = errors.Join(retErr, streams[i].Close())
+		}
+	}()
+	var logicalSize uint64
+	for i, raw := range refs {
+		stream, err := opener(ctx, raw)
+		if err != nil {
+			if stream != nil {
+				streams = append(streams, stream)
+			}
+			return nil, fmt.Errorf("layer[%d] %q: %w", i, raw, err)
+		}
+		if stream == nil {
+			return nil, fmt.Errorf("layer[%d] %q returned a nil stream", i, raw)
+		}
+		streams = append(streams, stream)
+		if i == 0 {
+			logicalSize = stream.Size()
+			if logicalSize == 0 || logicalSize > math.MaxInt64 {
+				return nil, fmt.Errorf("layer[0] logical size %d is invalid", logicalSize)
+			}
+			continue
+		}
+		if stream.Size() != logicalSize {
+			return nil, fmt.Errorf("layer[%d] size %d conflicts with top size %d", i, stream.Size(), logicalSize)
+		}
+	}
+	return vhost.NewStreamReader(ctx, fetch.NewLayered(streams...), int64(logicalSize)), nil
 }
 
 // openEROFSBlockReader exposes only the EROFS prefix of a flattened image or
@@ -812,6 +868,33 @@ func openMemorySnapshotRef(ctx context.Context, raw string, opts Options) (fetch
 		return nil, errors.New("snapshot memory parent snapshot.cfg is not canonically encoded")
 	}
 	return root.Memory, nil
+}
+
+func openMemoryParentLayers(ctx context.Context, refs []string, opts Options, capacity uint64) (_ []fetch.Stream, retErr error) {
+	layers := make([]fetch.Stream, 0, len(refs))
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		for i := len(layers) - 1; i >= 0; i-- {
+			retErr = errors.Join(retErr, layers[i].Close())
+		}
+	}()
+	for i, ref := range refs {
+		stream, err := openMemorySnapshotRef(ctx, ref, opts)
+		if err != nil {
+			return nil, fmt.Errorf("from_refs[%d]: %w", i, err)
+		}
+		if stream.Size() != capacity {
+			closeErr := stream.Close()
+			return nil, errors.Join(
+				fmt.Errorf("from_refs[%d] memory size=%d does not match capacity=%d", i, stream.Size(), capacity),
+				closeErr,
+			)
+		}
+		layers = append(layers, stream)
+	}
+	return layers, nil
 }
 
 type openedRootSnapshot struct {

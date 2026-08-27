@@ -3,16 +3,78 @@ package snapshot
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
+
+func TestValidateMergeBaseWithOpenerPropagatesContext(t *testing.T) {
+	type contextKey struct{}
+	wantContext := context.WithValue(context.Background(), contextKey{}, "capture")
+	wantErr := errors.New("stop before remote read")
+	called := false
+	opener := MergeBaseOpener(func(ctx context.Context, raw string) (fetch.Stream, error) {
+		called = true
+		if got := ctx.Value(contextKey{}); got != "capture" {
+			t.Fatalf("merge-base opener context value = %v", got)
+		}
+		if raw != "manifest://parent" {
+			t.Fatalf("merge-base ref = %q", raw)
+		}
+		return nil, wantErr
+	})
+	err := ValidateMergeBaseWithOpener(wantContext, "manifest://parent", 4096, nil, false, opener)
+	if !called {
+		t.Fatal("merge-base opener was not called")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("ValidateMergeBaseWithOpener error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestValidateMergeBaseWithOpenerHonorsPreCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	err := ValidateMergeBaseWithOpener(ctx, "manifest://parent", 4096, nil, false,
+		func(context.Context, string) (fetch.Stream, error) {
+			called = true
+			return nil, nil
+		})
+	if called {
+		t.Fatal("merge-base opener was called after cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ValidateMergeBaseWithOpener error = %v, want context.Canceled", err)
+	}
+}
+
+func TestValidateMergeBaseWithOpenerRejectsNilStream(t *testing.T) {
+	err := ValidateMergeBaseWithOpener(context.Background(), "file://base.overlay", 4096, nil, false,
+		func(context.Context, string) (fetch.Stream, error) { return nil, nil })
+	if err == nil || errors.Unwrap(err) == nil || !strings.Contains(errors.Unwrap(err).Error(), "nil stream") {
+		t.Fatalf("ValidateMergeBaseWithOpener error = %v, want nil stream", err)
+	}
+}
+
+func TestValidateMergeBaseWithOpenerRejectsNilRun(t *testing.T) {
+	err := ValidateMergeBaseWithOpener(context.Background(), "file://base.overlay", 8, nil, false,
+		func(context.Context, string) (fetch.Stream, error) {
+			return &invalidRunSource{size: 8}, nil
+		})
+	if err == nil || !strings.Contains(err.Error(), "invalid run") {
+		t.Fatalf("ValidateMergeBaseWithOpener error = %v, want invalid run", err)
+	}
+}
 
 func TestOpenMergeBaseFollowsSymlink(t *testing.T) {
 	payload := bytes.Repeat([]byte{0x5A}, 4096)

@@ -3,7 +3,9 @@ package artifact
 import (
 	"bytes"
 	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -15,6 +17,22 @@ import (
 )
 
 const publishTestSHA = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func TestNewLocationPublisherRejectsSymlinkDirectory(t *testing.T) {
+	storage, err := NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	link := filepath.Join(t.TempDir(), "published")
+	if err := os.Symlink(t.TempDir(), link); err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewLocationPublisher(storage, "published", link, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("NewLocationPublisher error = %v, want symlink rejection", err)
+	}
+}
 
 func publishSource(t *testing.T, body []byte) sparse.Source {
 	t.Helper()

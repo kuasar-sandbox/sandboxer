@@ -280,12 +280,14 @@ func (p *PortableSandboxConfig) Exported(parentSandboxRef string, dataRefs []str
 			if disk.Base != "" && !merged[i+1] {
 				disk.BaseFromRefs = prependUniqueRef(disk.Base, disk.BaseFromRefs)
 			}
+			disk.BaseFromRefs = withoutPortableRef(disk.BaseFromRefs, captured)
 			disk.Base = captured
 			continue
 		}
 		if disk.Overlay.Base != "" && !merged[i+1] {
 			disk.Overlay.BaseFromRefs = prependUniqueRef(disk.Overlay.Base, disk.Overlay.BaseFromRefs)
 		}
+		disk.Overlay.BaseFromRefs = withoutPortableRef(disk.Overlay.BaseFromRefs, captured)
 		disk.Overlay.Base = captured
 	}
 	if err := clone.Validate(); err != nil {
@@ -339,7 +341,21 @@ func prependUniqueRef(ref string, refs []string) []string {
 	}
 	out := make([]string, 0, 1+len(refs))
 	out = append(out, ref)
-	out = append(out, refs...)
+	for _, existing := range refs {
+		if existing != ref {
+			out = append(out, existing)
+		}
+	}
+	return out
+}
+
+func withoutPortableRef(refs []string, excluded string) []string {
+	out := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if ref != excluded {
+			out = append(out, ref)
+		}
+	}
 	return out
 }
 
@@ -772,6 +788,9 @@ func validatePortableRoot(field string, root *PortableRootConfig, rootDisk bool)
 	if err := validatePortableRefList(field+".base_from_refs", root.BaseFromRefs); err != nil {
 		return err
 	}
+	if root.Base != "" && containsPortableRef(root.BaseFromRefs, root.Base) {
+		return fmt.Errorf("portable %s.base duplicates %s.base_from_refs", field, field)
+	}
 	if len(root.BaseFromRefs) != 0 && root.Base == "" {
 		return fmt.Errorf("portable %s.base is required with base_from_refs", field)
 	}
@@ -790,11 +809,26 @@ func validatePortableRoot(field string, root *PortableRootConfig, rootDisk bool)
 		if err := validatePortableRefList(field+".overlay.base_from_refs", root.Overlay.BaseFromRefs); err != nil {
 			return err
 		}
+		if root.Overlay.Base != "" && containsPortableRef(root.Overlay.BaseFromRefs, root.Overlay.Base) {
+			return fmt.Errorf("portable %s.overlay.base duplicates %s.overlay.base_from_refs", field, field)
+		}
 		if len(root.Overlay.BaseFromRefs) != 0 && root.Overlay.Base == "" {
 			return fmt.Errorf("portable %s.overlay.base is required with base_from_refs", field)
 		}
+		if rootDisk && root.Base == "self" && (root.Overlay.Base != "" || len(root.Overlay.BaseFromRefs) != 0) {
+			return fmt.Errorf("portable %s.base=self requires an empty overlay graph", field)
+		}
 	}
 	return nil
+}
+
+func containsPortableRef(refs []string, target string) bool {
+	for _, ref := range refs {
+		if ref == target {
+			return true
+		}
+	}
+	return false
 }
 
 func validatePortableRefList(field string, refs []string) error {

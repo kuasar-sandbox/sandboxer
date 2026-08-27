@@ -97,9 +97,19 @@ func runCmd(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "sandbox-ctl run: unexpected positional arguments")
+		return 2
+	}
 	if *fromRef != "" && *restoreRef != "" {
 		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --from and --restore are mutually exclusive")
 		return 2
+	}
+	if *sandboxID != "" {
+		if err := validateSandboxIDArg(*sandboxID); err != nil {
+			fmt.Fprintf(os.Stderr, "sandbox-ctl run: --sandbox-id: %v\n", err)
+			return 2
+		}
 	}
 	readyFDSet := false
 	fs.Visit(func(f *flag.Flag) {

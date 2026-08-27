@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
@@ -142,6 +143,56 @@ func TestOpenFileZIPMagicFailsClosedAndTarRejectsManifestSelector(t *testing.T) 
 	}
 	if _, err := storage.OpenFile(context.Background(), tarPath, ref); err == nil || !strings.Contains(err.Error(), "tarstream rejects") {
 		t.Fatalf("tarstream @manifest error = %v", err)
+	}
+}
+
+func TestOpenFileLocatedAliasCannotEscapeLocationDirectory(t *testing.T) {
+	ctx := context.Background()
+	locationDir := t.TempDir()
+	outsideDir := t.TempDir()
+	refRaw, _, outsidePath := writeTarSnapshot(t, outsideDir,
+		[]byte("version: 1\nsandbox_ref: manifest://"+strings.Repeat("a", 64)+"\n"))
+	ref, err := manifest.ParseRef(refRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Path = "outside.snapshot"
+	ref.Location = "artifacts"
+	escaping := filepath.Join(locationDir, ref.Path)
+	if err := os.Symlink(outsidePath, escaping); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := artifact.NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	locations := config.RefLocations{"artifacts": locationDir}
+	if _, err := storage.OpenFileWithLocations(ctx, escaping, ref, locations); err == nil || !strings.Contains(err.Error(), "escapes ref-location") {
+		t.Fatalf("escaping located alias error = %v", err)
+	}
+	if _, err := storage.OpenFileWithLocations(ctx, outsidePath, ref, locations); err == nil || !strings.Contains(err.Error(), "does not match ref-location") {
+		t.Fatalf("mismatched located path error = %v", err)
+	}
+
+	insideRaw, _, insidePath := writeTarSnapshot(t, locationDir,
+		[]byte("version: 1\nsandbox_ref: manifest://"+strings.Repeat("b", 64)+"\n"))
+	insideRef, err := manifest.ParseRef(insideRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insideRef.Path = "inside.snapshot"
+	insideRef.Location = "artifacts"
+	insideAlias := filepath.Join(locationDir, insideRef.Path)
+	if err := os.Symlink(filepath.Base(insidePath), insideAlias); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := storage.OpenFileWithLocations(ctx, insideAlias, insideRef, locations)
+	if err != nil {
+		t.Fatalf("same-directory located alias: %v", err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

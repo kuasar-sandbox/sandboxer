@@ -19,6 +19,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
 
 func TestZeroSourceRunContract(t *testing.T) {
@@ -82,6 +83,53 @@ func TestStreamSnapshotSourcePreservesChunkRunWithoutPayloadIO(t *testing.T) {
 	}
 	if got := getter.chunkCalls.Load(); got != 1 {
 		t.Fatalf("Run.ReadAt chunk Get calls = %d, want 1", got)
+	}
+}
+
+func TestSnapshotMemorySectionPreservesManifestChunkRun(t *testing.T) {
+	memory := bytes.Repeat([]byte{0x6d}, 3*PageSize)
+	tail, err := snapshotfile.BuildZIP(
+		[]byte(`{"memory":{"size":12288}}`),
+		[]byte(`{"state":"ok"}`),
+		[]byte("version: 1\nsandbox_ref: manifest://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical := append(append([]byte(nil), memory...), tail...)
+	key := store.ContentKey(sha256.Sum256(logical))
+	stream, getter := openSnapshotManifest(t, &codec.Manifest{
+		Version:   codec.Version1,
+		ImageSize: uint64(len(logical)),
+		Entries: []codec.ChunkEntry{{
+			Offset:         0,
+			Size:           uint32(len(logical)),
+			CiphertextHash: key,
+		}},
+	}, map[store.ContentKey][]byte{key: logical})
+	root, err := snapshotfile.Open(context.Background(), stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	source, err := NewStreamSnapshotSource(root.Memory, uint64(len(memory)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := source.RunAt(PageSize, 2*PageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := run.(fetch.ChunkRun); !ok {
+		t.Fatalf("Snapshot memory Data Run type %T lost fetch.ChunkRun", run)
+	}
+	if run.End() > uint64(len(memory)) {
+		t.Fatalf("Snapshot memory Run exposed ZIP tail: end=%d memory=%d", run.End(), len(memory))
+	}
+	if got := getter.chunkCalls.Load(); got == 0 {
+		// Opening the strict ZIP necessarily reads carrier data. This assertion
+		// only documents that the test exercised the manifest-backed carrier.
+		t.Fatal("opening Snapshot did not read its manifest chunk")
 	}
 }
 

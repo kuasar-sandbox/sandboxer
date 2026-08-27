@@ -3,11 +3,14 @@ package snapshot
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
@@ -22,6 +25,61 @@ func testSnapshotSource(t testing.TB, memory []byte, holes []sparse.Extent, snap
 		t.Fatal(err)
 	}
 	return logical
+}
+
+type closeTrackingIngester struct {
+	closes int
+	err    error
+}
+
+type invalidRunSource struct {
+	size uint64
+	run  sparse.Run
+}
+
+func (s *invalidRunSource) Size() uint64 { return s.size }
+func (s *invalidRunSource) RunAt(uint64, uint64) (sparse.Run, error) {
+	return s.run, nil
+}
+func (*invalidRunSource) ReadAt(context.Context, []byte, uint64) (int, error) { return 0, nil }
+func (*invalidRunSource) Close() error                                        { return nil }
+
+func TestConsumeSourceRejectsInvalidRun(t *testing.T) {
+	if err := consumeSource(context.Background(), &invalidRunSource{size: 8}); err == nil || !strings.Contains(err.Error(), "invalid sparse run") {
+		t.Fatalf("consumeSource nil-run error = %v", err)
+	}
+	dense := sparse.Dense(bytes.NewReader(make([]byte, 8)), 8)
+	wrongOffset, err := dense.RunAt(1, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := consumeSource(context.Background(), &invalidRunSource{size: 8, run: wrongOffset}); err == nil || !strings.Contains(err.Error(), "invalid sparse run") {
+		t.Fatalf("consumeSource wrong-offset error = %v", err)
+	}
+}
+
+func (*closeTrackingIngester) Ingest(context.Context, sparse.Source, ingest.IngestOption) (*ingest.Result, error) {
+	return &ingest.Result{}, nil
+}
+
+func (i *closeTrackingIngester) Close() error {
+	i.closes++
+	return i.err
+}
+
+func TestIngestSinkCloseIsIdempotent(t *testing.T) {
+	wantErr := errors.New("injected ingester close failure")
+	ingester := &closeTrackingIngester{err: wantErr}
+	sink := NewIngestSink(ingester, nil)
+	if err := sink.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("first Close error = %v, want %v", err, wantErr)
+	}
+	if err := sink.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("second Close error = %v, want %v", err, wantErr)
+	}
+	if ingester.closes != 1 {
+		t.Fatalf("ingester closes = %d, want 1", ingester.closes)
+	}
 }
 
 // FileSink must pack content-addressed tarstream artifacts: the envelope
@@ -124,5 +182,46 @@ func TestFileSinkArtifacts(t *testing.T) {
 	}
 	if link != filepath.Base(bpath) {
 		t.Fatalf("symlink → %s, want %s", link, filepath.Base(bpath))
+	}
+}
+
+func TestFileSinkRejectsUnsafeAliasIDBeforeWriting(t *testing.T) {
+	dir := t.TempDir()
+	sink := NewFileSink(dir, "../escape", nil, false, nil)
+	if _, _, err := sink.AbsorbOverlay(context.Background(), bytes.NewReader(make([]byte, 4096)), nil); err == nil || !strings.Contains(err.Error(), "safe alias component") {
+		t.Fatalf("AbsorbOverlay error = %v, want unsafe alias rejection", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("unsafe alias produced output entries: %v", entries)
+	}
+}
+
+func TestFileSinkRefusesToReplaceNonSymlinkAlias(t *testing.T) {
+	dir := t.TempDir()
+	sink := NewFileSink(dir, "sid", nil, false, nil)
+	ref, path, err := sink.AbsorbSnapshot(context.Background(), testSnapshotSource(t,
+		make([]byte, 4096), nil,
+		[]byte("version: 1\nsandbox_ref: manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(dir, "sid.snapshot")
+	const sentinel = "user-owned"
+	if err := os.WriteFile(alias, []byte(sentinel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.CommitSnapshot(context.Background(), ref, path); err == nil || !strings.Contains(err.Error(), "refuses to replace a non-symlink") {
+		t.Fatalf("CommitSnapshot error = %v, want non-symlink rejection", err)
+	}
+	body, err := os.ReadFile(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != sentinel {
+		t.Fatalf("non-symlink alias content = %q, want %q", body, sentinel)
 	}
 }

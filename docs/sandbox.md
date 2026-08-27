@@ -47,7 +47,7 @@ memory snapshot      ──> E + S, S is operation root
 | Manifest | `manifest://<key>` | chunk/Manifest encryption 和 verification 由 manifest config 控制 |
 | Manifest Bundle | `file://<bundle>@manifest:<key>` | 一个 ZIP64 Bundle 可承载 root 及完整依赖 Manifest graph |
 
-Local 模式的内容寻址文件名为 `<digest>.<role>`. `<sid>.sandbox` 和 `<sid>.snapshot` 是成功 commit 后更新的语义 symlink. Bundle 模式下语义 symlink 指向承载 root Manifest 的 `<key>.bundle`.
+Local 模式的内容寻址文件名为 `<digest>.<role>`. `<sid>.sandbox` 和 `<sid>.snapshot` 是成功 commit 后更新的语义 symlink. Bundle 模式下语义 symlink 指向承载 root Manifest 的 `<key>.bundle`. Alias 的 SID 必须是单一安全 path component;commit 使用临时 symlink + atomic rename + directory fsync,并拒绝覆盖已有 regular file 或 directory.
 
 Block backend、restore 和 publisher 先打开 carrier,再按逻辑角色解析内容. 外层 ZIP magic 只说明 carrier 是 Bundle,不说明 logical role.
 
@@ -127,7 +127,7 @@ sandbox-ctl snapshot \
 
 Snapshot 始终包含 memory execution state. 一次操作在同一 freeze point 产生 E 和 S,S 最后 commit. 默认成功后销毁 VM;`--resume` 恢复原 VM,但不把新 E/S 设为 live baseline.
 
-Local human output同时列出 `Snapshot S` 与 `Sandbox E`. Upload stdout 仍只输出 S Manifest key,便于当前 orchestrator parser 使用. 既有 `memory_size`、`memory_resident`、pause/dump timing 和 compatibility `overlay_*` response 字段保留;`overlay_*` 当前镜像 E identity,真正 disk graph 只在 E 中.
+Local human output同时列出 `Snapshot S` 与 `Sandbox E`. Upload stdout 仍只输出 S Manifest key,便于当前 orchestrator parser 使用. `snapshot_done` 同时返回 `snapshot_ref` 与 `sandbox_ref`;既有 `memory_size`、`memory_resident`、pause/dump timing 和 compatibility `overlay_*` response 字段保留. `overlay_*` 当前镜像 E identity,真正 disk graph 只在 E 中.
 
 `--drop-caches` 只属于 memory snapshot,默认 false. `--merge-ref` 只控制 local memory parent merge,不改变 disk provenance.
 
@@ -154,7 +154,7 @@ sandbox-ctl export \
   [--mode local|bundle]
 ```
 
-Live mode不接受 `--config`;offline mode要求 `--config` 或 `SANDBOX_CONFIG` 且拒绝 `--resume`. Export 不接受 `drop_caches` 或 memory merge 参数,不调用 CH `/vm.snapshot`,不读取 memfd,不生成 memory refs.
+Live mode不接受 `--config`;它复用当前 run 进程已验证的 manifest/ref-location/crypto binding,因此显式 `--manifest-config` 和 `--ref-location` 仅属于 offline mode. Offline mode要求 `--config` 或 `SANDBOX_CONFIG` 且拒绝 `--resume`. 两种模式都支持 `--timeout`;0 表示不设 operation deadline. Export 不接受 `drop_caches` 或 memory merge 参数,不调用 CH `/vm.snapshot`,不读取 memfd,不生成 memory refs.
 
 ### 2.5 `sandbox-ctl exec`
 
@@ -162,7 +162,7 @@ Live mode不接受 `--config`;offline mode要求 `--config` 或 `SANDBOX_CONFIG`
 sandbox-ctl exec --sandbox-id s1 --run-root /run/sandbox -- /bin/sh -c 'id'
 ```
 
-`exec` 通过当前 ctl/MUX 创建 sibling process. Export/snapshot 的 quiesce gate 阻止新 exec/forward 进入不稳定窗口. 已接受的连接在 resume recovery 后恢复服务.
+`exec` 通过当前 ctl/MUX 创建 sibling process. Export/snapshot 的 quiesce gate 原子阻止新 exec/forward 进入不稳定窗口,并关闭、join 已放行的 exec/forward session;在飞 exec 被终止且不会在 `--resume` 后自动重跑. Capture 完成或失败恢复后重新开放新请求. Guest `attach` 是幂等恢复操作;host 在 request/ACK 边界不明确时立即重试一次,且整个 dial/ACK 过程受 lifecycle context cancellation 控制.
 
 远程授权 exec 使用 `pkg/ctl.ServeExecTunnel(ctx, options)`,固定以下顺序:
 
@@ -643,7 +643,7 @@ CH stdin固定 `/dev/null`;console output由 sandbox-ctl bridge. Net provider为
 | Persistent override allowed | resources workload defaults, launch, mounts, files, init, metadata |
 | Instance-only | IP/MAC/hostname, ephemeral files/env, stdio/forward |
 
-受保护字段有冲突时明确报出 field context. Host不能通过省略或 YAML merge静默改变 disk graph.
+受保护字段有冲突时明确报出 field context. Host不能通过省略或 YAML merge静默改变 disk graph. Persistent `mounts` 可以修改普通 tmpfs/empty mount 的声明,但 data-disk mount 的 source、target、name 和 order 必须保持 artifact topology,不能借 mount override移动磁盘.
 
 Network必须满足:
 
@@ -686,7 +686,7 @@ Snapshot Bundle root Manifest是 S;Export Bundle root Manifest是 E. E、data/lo
 T0 output/manifest/local-crypto/ref/Bundle/merge/config/source preflight
 T1 enter MemoryController/Budget mutation barrier
 T2 lock and lift/drain memory.high
-T3 gate exec/forward, freeze guest app, guest sync
+T3 gate/drain exec/forward, freeze guest app, guest sync
 T4 pause pinger/MUX, pause CH, quiesce all block backends
 T5 capture every data disk exactly once
 T6 build C1 from immutable C0 + source binding + captured disk refs
@@ -718,7 +718,9 @@ Failure semantics:
 
 - Data artifacts/E可能成为 content-addressed orphan,由正常 GC回收.
 - Root alias只在 E或S成功后提交.
-- `--resume` success/failure都恢复 backend、CH、MUX、pinger、forward、app和memory barrier.
+- `--resume` success/failure按 backend -> CH -> MUX -> pinger/forward -> app -> resource barrier恢复.
+- `attach` ACK不明确时host幂等重试一次;若仍不能重建MUX,该capture变为terminal failure,host在memory/memory.high guards仍持有时请求VMM shutdown,再以SIGTERM/SIGKILL有界兜底. 失败不会留下可接受新请求但guest仍冻结的VM.
+- 默认destroy也等待CH退出;`/vmm.shutdown`失败或超时后使用SIGTERM/SIGKILL有界兜底,然后才释放lifecycle guards.
 - C0、active diff和live lower graph保持不变.
 - Partial files使用 same-directory temp并清理.
 
@@ -864,7 +866,7 @@ Local immutable artifact支持 `crypto.local=off|auto|required`:
 - `auto`:自动识别plaintext或KDXTS encrypted tarstream;新输出按配置codec.
 - `required`:拒绝plaintext和未绑定key的identity;identity使用`hmac`.
 
-Existing-file reuse必须重新验证role、logical size、content identity和完整stream. Content file使用no-replace atomic commit;semantic alias在root成功后atomic rename. Symlink、regular-file和directory fsync检查fail closed.
+Existing-file reuse必须重新验证role、logical size、content identity和完整stream. Content file使用no-replace atomic commit;semantic alias在root成功后用随机temporary symlink + atomic rename更新. Alias target和existing entry都以`NOFOLLOW`/`lstat` fail closed,不会把regular file或directory替换成symlink;文件与directory fsync完成后才算commit.
 
 Active encrypted `.overlay.diff` 保持KDXTS格式. Export只读取decrypt后的BlockCOW SnapshotView并创建新的immutable logical artifact,绝不把ZIP追加到active diff.
 
@@ -970,7 +972,7 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 - ZIP/path traversal/symlink/regular-file checks fail closed.
 - Remote read/write接受context cancellation.
 - Stream/fetcher/Bundle reader共享明确close owner,失败路径不泄漏fd/mmap/goroutine.
-- Freeze后的任一failure必须thaw app、resume CH/backend/MUX/pinger/forward并释放resource locks.
+- Freeze后的任一failure必须恢复app、CH/backend/MUX/pinger/forward并释放resource locks;若MUX恢复已不可证明,必须在locks仍持有时终止CH并将capture gate置为terminal.
 - Root alias是commit point;dependency orphan不伪装成功.
 
 ## 14. Reliability、performance 与兼容边界

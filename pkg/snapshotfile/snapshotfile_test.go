@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -46,6 +47,21 @@ func TestBuildZIPDeterministic(t *testing.T) {
 type testStream struct {
 	sparse.Source
 	closes int
+}
+
+type nilRunStream struct{ *testStream }
+
+func (*nilRunStream) RunAt(uint64, uint64) (sparse.Run, error) { return nil, nil }
+
+func TestBuildSourceRejectsInvalidMemoryRun(t *testing.T) {
+	memory := &nilRunStream{testStream: &testStream{Source: sparse.Dense(bytes.NewReader(make([]byte, 8)), 8)}}
+	logical, err := BuildSource(memory, []byte("{}"), []byte("{}"), []byte("version: 1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := logical.RunAt(0, 8); err == nil || !strings.Contains(err.Error(), "invalid run") {
+		t.Fatalf("Snapshot appended RunAt error = %v, want invalid run", err)
+	}
 }
 
 func (s *testStream) Close() error {
@@ -104,6 +120,19 @@ func TestOpenStrictSnapshotAndMemorySection(t *testing.T) {
 	}
 	if stream.closes != 1 {
 		t.Fatalf("carrier closed %d times", stream.closes)
+	}
+}
+
+func TestMemorySectionRejectsNilCarrierRun(t *testing.T) {
+	body, memorySize := snapshotBytes(t)
+	stream := &nilRunStream{testStream: openTestStream(t, body, memorySize)}
+	root, err := Open(context.Background(), stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if _, err := root.Memory.RunAt(0, 4096); err == nil || !strings.Contains(err.Error(), "invalid run") {
+		t.Fatalf("Memory.RunAt error = %v", err)
 	}
 }
 

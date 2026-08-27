@@ -126,6 +126,10 @@ func OpenFileWithLocations(
 	if err := ref.Validate(); err != nil {
 		return nil, err
 	}
+	path, err := resolveLocatedFileTarget(path, ref, locations)
+	if err != nil {
+		return nil, err
+	}
 
 	format, err := DetectFileFormat(path)
 	if err != nil {
@@ -135,6 +139,44 @@ func OpenFileWithLocations(
 		return openManifestBundle(ctx, path, ref, manifestCfg, keyFn, remote, locations)
 	}
 	return openTarstream(path, ref, localCodec, localRequired)
+}
+
+// validateLocatedFileTarget confines a named ref-location alias to the same
+// trusted directory as its resolved basename. Semantic aliases may point at a
+// sibling content-addressed file, but cannot escape the named location through
+// a symlink. Unlocated paths are explicit host input and retain existing
+// filesystem semantics.
+func resolveLocatedFileTarget(path string, ref manifest.Ref, locations config.RefLocations) (string, error) {
+	if ref.Location == "" {
+		return path, nil
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("artifact: resolve located path: %w", err)
+	}
+	expected, err := locations.ResolveFile(ref, "")
+	if err != nil {
+		return "", err
+	}
+	expected, err = filepath.Abs(expected)
+	if err != nil {
+		return "", fmt.Errorf("artifact: resolve ref-location path: %w", err)
+	}
+	if filepath.Clean(absolute) != filepath.Clean(expected) {
+		return "", fmt.Errorf("artifact: located ref path does not match ref-location %q", ref.Location)
+	}
+	realDirectory, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err != nil {
+		return "", fmt.Errorf("artifact: resolve ref-location directory: %w", err)
+	}
+	realTarget, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("artifact: resolve located artifact: %w", err)
+	}
+	if filepath.Clean(filepath.Dir(realTarget)) != filepath.Clean(realDirectory) {
+		return "", fmt.Errorf("artifact: located alias target escapes ref-location %q", ref.Location)
+	}
+	return realTarget, nil
 }
 
 // OpenFile uses the process-fixed customer key and lazy remote Fetcher.

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -69,7 +68,9 @@ func publishArtifactCmd(command string, args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	result, publishErr := publisher.Publish(context.Background(), input)
+	ctx, stopSignals := commandContext()
+	defer stopSignals()
+	result, publishErr := publisher.Publish(ctx, input)
 	closeErr := publisher.Close()
 	if err := errors.Join(publishErr, closeErr); err != nil {
 		fmt.Fprintln(os.Stderr, err)

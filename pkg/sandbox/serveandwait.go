@@ -463,6 +463,13 @@ func ServeAndWait(p VMParams) (int, error) {
 	var chExitedOnce sync.Once
 	markCHExited := func() { chExitedOnce.Do(func() { close(chExited) }) }
 	defer markCHExited()
+	var chProcessMu sync.RWMutex
+	var chProcess *os.Process
+	currentCHProcess := func() processSignaler {
+		chProcessMu.RLock()
+		defer chProcessMu.RUnlock()
+		return chProcess
+	}
 
 	// ctl.sock server for snapshot requests. SnapshotHandler is the
 	// shared bundle both Run and restore.Run use.
@@ -489,6 +496,7 @@ func ServeAndWait(p VMParams) (int, error) {
 		Forwarder:      forwarder,
 		Reattach:       reattach,
 		Memory:         p.Memory,
+		CHProcess:      currentCHProcess,
 		Context:        backendCtx,
 		Logf:           logf,
 	}
@@ -502,6 +510,12 @@ func ServeAndWait(p VMParams) (int, error) {
 			return snapHandler.handleExport(req, cgroupPath, chExited)
 		},
 		ExecHandler: func(conn net.Conn, req ctl.Request) {
+			if !forwarder.beginExec(conn) {
+				defer conn.Close()
+				_ = ctl.WriteMessage(conn, ctl.Response{Type: ctl.TypeError, Msg: "exec unavailable during capture"})
+				return
+			}
+			defer forwarder.endExec(conn)
 			guestlink.ServeExecRequest(backendCtx, conn, req, vsockBase, logf)
 		},
 	}
@@ -628,6 +642,9 @@ func ServeAndWait(p VMParams) (int, error) {
 		backendWG.Wait()
 		return -1, fmt.Errorf("spawn CH: %w", err)
 	}
+	chProcessMu.Lock()
+	chProcess = cmd.Process
+	chProcessMu.Unlock()
 	chPid := cmd.Process.Pid
 	logf("CH started pid=%d", chPid)
 

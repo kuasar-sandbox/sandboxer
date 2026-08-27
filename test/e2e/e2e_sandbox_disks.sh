@@ -198,8 +198,10 @@ echo "==> [5] snapshot (--output, destroys sandbox)"
 wait "$P1" 2>/dev/null || true; P1=""
 SNAP="$OUT/$SID1.snapshot"
 [ -f "$SNAP" ] || { echo "FAIL: no snapshot bundle"; ls -la "$OUT"; exit 1; }
-SANDBOX_E="$OUT/$SID1.sandbox"
-[ -f "$SANDBOX_E" ] || { echo "FAIL: no Sandbox E"; ls -la "$OUT"; exit 1; }
+"$BIN/sandbox-ctl" info --json "$SNAP" >"$WORK/e1-s-info.json"
+E1_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/e1-s-info.json")
+SANDBOX_E="$OUT/$E1_BASENAME"
+[ -f "$SANDBOX_E" ] || { echo "FAIL: Snapshot S references missing Sandbox E $E1_BASENAME"; ls -la "$OUT"; exit 1; }
 "$BIN/sandbox-ctl" info --json "$SANDBOX_E" >"$WORK/e1-info.json"
 python3 - "$WORK/e1-info.json" <<'PY'
 import json, sys
@@ -276,11 +278,12 @@ W="$WOUT/$SID2.snapshot"
 [ -f "$W" ] || { echo "FAIL: no working-set snapshot $W"; exit 1; }
 [ -f "$WOUT/$PARENT_MEMORY_BASENAME" ] || { echo "FAIL: memory parent was not materialized into W output"; exit 1; }
 "$BIN/sandbox-ctl" info --json "$W" >"$WORK/w-s-info.json"
+S1_E_REF=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["SandboxRef"])' "$WORK/s1-s-info.json")
 S1_E_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/s1-s-info.json")
 W_E_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/w-s-info.json")
 "$BIN/sandbox-ctl" info --json "$OUT/$S1_E_BASENAME" >"$WORK/s1-e-info.json"
 "$BIN/sandbox-ctl" info --json "$WOUT/$W_E_BASENAME" >"$WORK/w-e-info.json"
-python3 - "$WORK/s1-e-info.json" "$WORK/w-e-info.json" "$WORK/w-s-info.json" "$PARENT_MEMORY_BASENAME" <<'PY'
+python3 - "$WORK/s1-e-info.json" "$WORK/w-e-info.json" "$WORK/w-s-info.json" "$PARENT_MEMORY_BASENAME" "$S1_E_REF" <<'PY'
 import json, os, sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
@@ -312,6 +315,10 @@ if len(parent_nodes) != 3 or len(working_nodes) != 3:
     raise SystemExit(f"disk node counts parent={len(parent_nodes)} working={len(working_nodes)}, want root+2 data")
 for index, (parent_node, working_node) in enumerate(zip(parent_nodes, working_nodes)):
     parent_top = top(parent_node)
+    if index == 0 and parent_top == "self":
+        # `self` is scoped to its containing Sandbox E. Materialize the parent
+        # E binding before comparing it with the newly-created E graph.
+        parent_top = sys.argv[5]
     if top(working_node) == parent_top or parent_top in chain(working_node):
         raise SystemExit(f"disk {index} retained local parent {parent_top!r}; local disks must merge even when memory stacks")
 PY
@@ -355,8 +362,8 @@ timeout -k 5s 30 "$BIN/sandbox-ctl" run --restore "$W" --config "$WORK/restore-w
 MISSING_LOWER_RC=$?
 set -e
 [ "$MISSING_LOWER_RC" -ne 0 ] || { cat "$WORK/missing-lower.log"; echo "FAIL: restore unexpectedly accepted a missing memory lower"; exit 1; }
-grep -Fq 'snapshot memory layer 0' "$WORK/missing-lower.log" \
-    || { cat "$WORK/missing-lower.log"; echo "FAIL: missing-lower error did not identify snapshot memory layer 0"; exit 1; }
+grep -Fq 'from_refs[0]' "$WORK/missing-lower.log" \
+    || { cat "$WORK/missing-lower.log"; echo "FAIL: missing-lower error did not identify from_refs[0]"; exit 1; }
 grep -Fq "$PARENT_MEMORY_BASENAME" "$WORK/missing-lower.log" \
     || { cat "$WORK/missing-lower.log"; echo "FAIL: missing-lower error did not identify $PARENT_MEMORY_BASENAME"; exit 1; }
 [ ! -e "$VMM_MARKER" ] \

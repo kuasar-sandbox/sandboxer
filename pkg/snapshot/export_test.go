@@ -5,9 +5,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+	"net/http"
+	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -19,6 +24,8 @@ type captureSink struct {
 	order       []string
 	sandboxBody []byte
 	committed   bool
+	closeErr    error
+	closes      int
 }
 
 func (s *captureSink) AbsorbOverlay(_ context.Context, diff io.ReadSeeker, _ []sparse.Extent) (string, string, error) {
@@ -52,6 +59,11 @@ func (s *captureSink) CommitSandbox(context.Context, string, string) error {
 }
 func (s *captureSink) CommitSnapshot(context.Context, string, string) error {
 	return errors.New("unexpected snapshot commit")
+}
+func (s *captureSink) Close() error {
+	s.order = append(s.order, "close")
+	s.closes++
+	return s.closeErr
 }
 
 func TestCaptureSandboxAtFreezeDataFirstRootOnceAndC0Unchanged(t *testing.T) {
@@ -104,6 +116,63 @@ func TestCaptureSandboxAtFreezeDataFirstRootOnceAndC0Unchanged(t *testing.T) {
 	defer root.Close()
 	if root.Payload.Size() != 8192 || root.Portable.Boot.Disks[0].Base != out.DataRefs[0] {
 		t.Fatalf("captured E payload/config = %d %#v", root.Payload.Size(), root.Portable.Boot.Disks)
+	}
+}
+
+func TestExportSinkCloseFailureResumesBackendsAndCH(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "ch.sock")
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var requests []string
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.URL.Path)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	serveDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(serveDone)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-serveDone
+	})
+
+	portable := exportTestPortable(t)
+	portable.Boot.Disks = nil
+	portable.Mounts = nil
+	quiescer := &recordingQuiescer{}
+	sink := &captureSink{closeErr: errors.New("injected close failure")}
+	_, err = Export(context.Background(), ExportSources{
+		SandboxID:        "close-failure",
+		APISock:          sock,
+		CHApiDeadline:    time.Second,
+		PortableConfig:   portable,
+		ParentSandboxRef: "file://parent.sandbox@sha256:" + strings.Repeat("a", 64),
+		Diffs: []DiskDiff{{SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			return bytes.NewReader(make([]byte, 4096)), nil, nil
+		}}},
+		Quiescer: quiescer,
+	}, sink, false)
+	if err == nil || !strings.Contains(err.Error(), "close artifact sink") || !strings.Contains(err.Error(), "injected close failure") {
+		t.Fatalf("Export error = %v, want sink close failure", err)
+	}
+	if sink.closes != 1 {
+		t.Fatalf("artifact sink closes = %d, want 1", sink.closes)
+	}
+	if quiescer.quiesce != 1 || quiescer.resume != 1 {
+		t.Fatalf("quiescer calls = quiesce:%d resume:%d (Export error: %v)", quiescer.quiesce, quiescer.resume, err)
+	}
+	mu.Lock()
+	got := strings.Join(requests, ",")
+	mu.Unlock()
+	if want := "/api/v1/vm.pause,/api/v1/vm.resume"; got != want {
+		t.Fatalf("CH requests = %q, want %q", got, want)
 	}
 }
 

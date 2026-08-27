@@ -8,9 +8,11 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -66,6 +68,59 @@ type closeStream struct {
 func (s *closeStream) Close() error {
 	s.closes++
 	return nil
+}
+
+type nilRunStream struct{ *closeStream }
+
+func (*nilRunStream) RunAt(uint64, uint64) (sparse.Run, error) { return nil, nil }
+
+type contextRecordingSource struct {
+	sparse.Source
+	seen context.Context
+}
+
+func (s *contextRecordingSource) ReadAt(ctx context.Context, buffer []byte, offset uint64) (int, error) {
+	s.seen = ctx
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return s.Source.ReadAt(ctx, buffer, offset)
+}
+
+func TestBuildSourceContextPropagatesToEROFSRead(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "offline-export")
+	payload := &contextRecordingSource{Source: dataSource(t, fakeEROFS())}
+	if _, err := BuildSourceContext(ctx, payload, []byte("{}"), erofsPortableBytes(t)); err != nil {
+		t.Fatal(err)
+	}
+	if payload.seen == nil || payload.seen.Value(contextKey{}) != "offline-export" {
+		t.Fatalf("EROFS read context value = %v", payload.seen)
+	}
+}
+
+func TestBuildSourceContextHonorsPreCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	payload := &contextRecordingSource{Source: dataSource(t, fakeEROFS())}
+	_, err := BuildSourceContext(ctx, payload, []byte("{}"), erofsPortableBytes(t))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("BuildSourceContext error = %v, want context.Canceled", err)
+	}
+	if payload.seen != nil {
+		t.Fatal("pre-canceled BuildSourceContext read the payload")
+	}
+}
+
+func TestBuildSourceRejectsInvalidPayloadRun(t *testing.T) {
+	payload := &nilRunStream{closeStream: &closeStream{Source: dataSource(t, make([]byte, 8))}}
+	logical, err := BuildSource(payload, nil, livePortableBytes(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := logical.RunAt(0, 8); err == nil || !strings.Contains(err.Error(), "invalid run") {
+		t.Fatalf("Sandbox appended RunAt error = %v, want invalid run", err)
+	}
 }
 
 func dataSource(t *testing.T, body []byte) sparse.Source {
@@ -142,6 +197,23 @@ func TestLiveSandboxLayoutAndPayloadSection(t *testing.T) {
 	}
 }
 
+func TestPayloadSectionRejectsNilCarrierRun(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x5a}, 4096)
+	logical, err := BuildSource(dataSource(t, payload), nil, livePortableBytes(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &nilRunStream{closeStream: &closeStream{Source: logical}}
+	root, err := Open(context.Background(), stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if _, err := root.Payload.RunAt(0, 4096); err == nil || !strings.Contains(err.Error(), "invalid run") {
+		t.Fatalf("Payload.RunAt error = %v", err)
+	}
+}
+
 func fakeEROFS() []byte {
 	body := make([]byte, 4096)
 	binary.LittleEndian.PutUint32(body[1024:1028], 0xE0F5E1E2)
@@ -174,6 +246,22 @@ func TestEROFSLayoutUsesOneStrictZIPAndPreservesConfigBytes(t *testing.T) {
 	}
 	if len(archive.entries) != 2 || archive.entries[0].name != ImageConfigName || archive.entries[1].name != config.SandboxRuntimeConfigName {
 		t.Fatalf("entries = %#v", archive.entries)
+	}
+}
+
+func TestEROFSBuildSupportsOnePassDensePayload(t *testing.T) {
+	payload := fakeEROFS()
+	logical, err := BuildSource(
+		sparse.Dense(bytes.NewReader(payload), uint64(len(payload))),
+		[]byte(`{"Architecture":"amd64","Os":"linux"}`),
+		erofsPortableBytes(t),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var packed bytes.Buffer
+	if _, _, err := tarstream.WriteTo(context.Background(), &packed, "root.sandbox", logical); err != nil {
+		t.Fatalf("pack one-pass EROFS Sandbox: %v", err)
 	}
 }
 

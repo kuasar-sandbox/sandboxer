@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -21,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
+	"golang.org/x/sys/unix"
 )
 
 func exportCmd(args []string) int {
@@ -40,8 +40,23 @@ func exportCmd(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "export: unexpected positional arguments")
+		return 2
+	}
 	modeSet := false
-	fs.Visit(func(f *flag.Flag) { modeSet = modeSet || f.Name == "mode" })
+	manifestSet := false
+	refLocationSet := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "mode":
+			modeSet = true
+		case "manifest-config":
+			manifestSet = true
+		case "ref-location":
+			refLocationSet = true
+		}
+	})
 	if *mode != ctl.SnapshotModeLocal && *mode != ctl.SnapshotModeBundle {
 		fmt.Fprintf(os.Stderr, "export: --mode %q invalid (want local|bundle)\n", *mode)
 		return 2
@@ -58,6 +73,12 @@ func exportCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "export: live mode requires --sandbox-id")
 		return 2
 	}
+	if *sandboxID != "" {
+		if err := validateSandboxIDArg(*sandboxID); err != nil {
+			fmt.Fprintf(os.Stderr, "export: --sandbox-id: %v\n", err)
+			return 2
+		}
+	}
 	if *from != "" && *resume {
 		fmt.Fprintln(os.Stderr, "export: offline --from does not accept --resume")
 		return 2
@@ -66,17 +87,21 @@ func exportCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "export: live mode does not accept --config")
 		return 2
 	}
+	if *timeoutS < 0 {
+		fmt.Fprintln(os.Stderr, "export: --timeout must be >= 0")
+		return 2
+	}
+	if *from == "" && (manifestSet || refLocationSet) {
+		fmt.Fprintln(os.Stderr, "export: live mode uses the running sandbox storage/ref bindings; --manifest-config and --ref-location are offline-only")
+		return 2
+	}
 	if *outDir != "" {
-		abs, err := filepath.Abs(*outDir)
+		abs, err := prepareArtifactOutputDir(*outDir)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintf(os.Stderr, "export: output directory: %v\n", err)
 			return 1
 		}
 		*outDir = abs
-		if err := os.MkdirAll(*outDir, 0o755); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
 	}
 	if *from != "" {
 		if *configPath == "" {
@@ -86,9 +111,34 @@ func exportCmd(args []string) int {
 			fmt.Fprintln(os.Stderr, "export: offline mode requires --config or SANDBOX_CONFIG")
 			return 2
 		}
-		return offlineExport(*from, *configPath, *sandboxID, *outDir, *upload, *mode, *manifestPath, refLocations)
+		return offlineExport(*from, *configPath, *sandboxID, *outDir, *upload, *mode, *manifestPath, refLocations, *timeoutS)
 	}
 	return liveExport(*sandboxID, *outDir, *upload, *mode, modeSet, *resume, *runRoot, *timeoutS)
+}
+
+func prepareArtifactOutputDir(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(abs)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", errors.New("path must be a real directory, not a symlink or non-directory")
+	}
+	fd, err := unix.Open(abs, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", err
+	}
+	if err := unix.Close(fd); err != nil {
+		return "", err
+	}
+	return abs, nil
 }
 
 func liveExport(sandboxID, outDir string, upload bool, mode string, modeSet, resume bool, runRoot string, timeoutS int) int {
@@ -128,8 +178,14 @@ func liveExport(sandboxID, outDir string, upload bool, mode string, modeSet, res
 	return printExportResult(upload, resp)
 }
 
-func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode, manifestPath string, locations config.RefLocations) int {
-	ctx := context.Background()
+func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode, manifestPath string, locations config.RefLocations, timeoutS int) (exitCode int) {
+	ctx, stopSignals := commandContext()
+	defer stopSignals()
+	if timeoutS > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutS)*time.Second)
+		defer cancel()
+	}
 	cfg, err := config.LoadMerged(strings.Split(configPaths, ":"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -167,7 +223,7 @@ func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode
 		fmt.Fprintf(os.Stderr, "export: image defaults: %v\n", err)
 		return 1
 	}
-	portable, err := sandbox.PrepareOfflinePortableConfig(cfg, locations, storage.LocalCodec(), storage.LocalRequired(), opener)
+	portable, err := sandbox.PrepareOfflinePortableConfig(ctx, cfg, locations, storage.LocalCodec(), storage.LocalRequired(), opener)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: config: %v\n", err)
 		return 1
@@ -197,18 +253,34 @@ func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode
 		fmt.Fprintf(os.Stderr, "export: dependencies: %v\n", err)
 		return 1
 	}
-	defer dependencyPlan.Close()
-	sink, closer, err := newOfflineArtifactSink(ctx, outDir, sandboxID, upload, mode, manifestCfg, storage, admission, dependencyPlan.Refs())
+	dependencyPlanOpen := true
+	defer func() {
+		if dependencyPlanOpen {
+			if closeErr := dependencyPlan.Close(); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "export: close dependency plan: %v\n", closeErr)
+				exitCode = 1
+			}
+		}
+	}()
+	sink, err := newOfflineArtifactSink(outDir, sandboxID, upload, mode, manifestCfg, storage, admission, dependencyPlan.Refs())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	if closer != nil {
-		defer closer.Close()
-	}
+	sinkOpen := true
+	defer func() {
+		if sinkOpen {
+			if closeErr := sink.Close(); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "export: close artifact sink: %v\n", closeErr)
+				exitCode = 1
+			}
+		}
+	}()
 	replacements, err := dependencyPlan.Emit(ctx, sink, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "export: dependencies: %v\n", err)
+	planCloseErr := dependencyPlan.Close()
+	dependencyPlanOpen = false
+	if err != nil || planCloseErr != nil {
+		fmt.Fprintf(os.Stderr, "export: dependencies: %v\n", errors.Join(err, planCloseErr))
 		return 1
 	}
 	portable, err = portable.RewriteDiskArtifactRefs(replacements)
@@ -221,7 +293,7 @@ func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	logical, err := sandboxfile.BuildSource(image.Payload, image.ImageConfig, runtimeBytes)
+	logical, err := sandboxfile.BuildSourceContext(ctx, image.Payload, image.ImageConfig, runtimeBytes)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: build Sandbox E: %v\n", err)
 		return 1
@@ -229,6 +301,10 @@ func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode
 	ref, path, err := sink.AbsorbSandbox(ctx, logical)
 	if err == nil {
 		err = sink.CommitSandbox(ctx, ref, path)
+	}
+	if err == nil {
+		err = sink.Close()
+		sinkOpen = false
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: write Sandbox E: %v\n", err)
@@ -268,22 +344,22 @@ func openFlattenedExportSource(ctx context.Context, raw string, storage *artifac
 	return sandboxfile.OpenFlattenedEROFS(ctx, stream)
 }
 
-func newOfflineArtifactSink(ctx context.Context, outDir, sandboxID string, upload bool, mode string, manifestCfg *config.ManifestConfig, storage *artifact.ProcessStorage, admission store.WriteAdmission, refs []string) (snapshot.ArtifactSink, io.Closer, error) {
+func newOfflineArtifactSink(outDir, sandboxID string, upload bool, mode string, manifestCfg *config.ManifestConfig, storage *artifact.ProcessStorage, admission store.WriteAdmission, refs []string) (snapshot.ArtifactSink, error) {
 	if upload {
 		if manifestCfg == nil || manifestCfg.Store.Endpoint == "" || storage.CustomerKeyFunc() == nil {
-			return nil, nil, errors.New("export upload requires manifest store configuration")
+			return nil, errors.New("export upload requires manifest store configuration")
 		}
 		ing, err := manifestCfg.NewIngester(storage.CustomerKeyFunc(), nil)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		return snapshot.NewIngestSink(ing, nil), ing, nil
+		return snapshot.NewIngestSink(ing, nil), nil
 	}
 	if mode == ctl.SnapshotModeBundle {
 		bundle, err := snapshot.NewPlannedBundleSink(outDir, sandboxID, manifestCfg, storage.CustomerKeyFunc(), admission, refs, nil)
-		return bundle, bundle, err
+		return bundle, err
 	}
-	return snapshot.NewFileSink(outDir, sandboxID, storage.LocalCodec(), storage.LocalRequired(), nil), nil, nil
+	return snapshot.NewFileSink(outDir, sandboxID, storage.LocalCodec(), storage.LocalRequired(), nil), nil
 }
 
 func printExportResult(upload bool, resp ctl.Response) int {

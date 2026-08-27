@@ -411,11 +411,20 @@ func (s *sectionStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 	if err != nil {
 		return nil, err
 	}
-	runEnd := run.End() - s.base
-	if runEnd > end {
-		runEnd = end
+	wantOffset := s.base + offset
+	wantEnd := s.base + end
+	if run == nil || run.Offset() != wantOffset || run.End() <= wantOffset || run.End() > wantEnd {
+		return nil, errors.New("snapshot section source returned invalid run")
 	}
-	if run.Offset() != s.base+offset || runEnd <= offset {
+	// Snapshot memory is a prefix section (base == 0). Return the carrier Run
+	// unchanged so manifest-only capabilities such as fetch.ChunkRun survive
+	// through the logical Snapshot boundary. The strict wantEnd check above
+	// prevents the returned Run from exposing any byte in the ZIP tail.
+	if s.base == 0 {
+		return run, nil
+	}
+	runEnd := run.End() - s.base
+	if runEnd <= offset {
 		return nil, errors.New("snapshot section source returned invalid run")
 	}
 	return sectionRun{inner: run, offset: offset, end: runEnd}, nil
@@ -485,6 +494,9 @@ func (s *appendedSource) RunAt(offset, limit uint64) (sparse.Run, error) {
 		run, err := s.payload.RunAt(offset, payloadEnd-offset)
 		if err != nil {
 			return nil, err
+		}
+		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > payloadEnd {
+			return nil, errors.New("snapshot appended payload returned invalid run")
 		}
 		return appendedRun{source: s, offset: offset, end: run.End(), kind: run.Kind(), payloadRun: run}, nil
 	}

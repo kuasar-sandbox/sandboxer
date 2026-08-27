@@ -264,7 +264,8 @@ assert_manifest_snapshot_refs "$(readlink -f "$OUT1/$SID1.snapshot")" "$WORK/inf
 ROOT1_PATH="$(readlink -f "$OUT1/$SID1.snapshot")"
 ROOT1="$(basename "$ROOT1_PATH" .bundle)"
 LOCATION_A="$WORK/location-a"
-LOCATED_A="$("$BIN/sandbox-ctl" upload-snapshot --to-ref-location A=file://$LOCATION_A --quiet "$OUT1/$SID1.snapshot")"
+LOCATED_A="$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/manifest.yaml" \
+    --to-ref-location A=file://$LOCATION_A --quiet "$OUT1/$SID1.snapshot")"
 case "$LOCATED_A" in
     file://*.snapshot@sha256:*@location:A) ;;
     *) echo "FAIL: located A ref=$LOCATED_A"; exit 1 ;;
@@ -316,7 +317,8 @@ ROOT2_PATH="$(readlink -f "$OUT2/$SID2.snapshot")"
 ROOT2="$(basename "$ROOT2_PATH" .bundle)"
 assert_bundle_refs "$ROOT2_PATH"
 LOCATION_B="$WORK/location-b"
-LOCATED_B="$("$BIN/sandbox-ctl" upload-snapshot --to-ref-location B=file://$LOCATION_B --quiet "$OUT2/$SID2.snapshot")"
+LOCATED_B="$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/manifest.yaml" \
+    --to-ref-location B=file://$LOCATION_B --quiet "$OUT2/$SID2.snapshot")"
 case "$LOCATED_B" in
     file://*.snapshot@sha256:*@location:B) ;;
     *) echo "FAIL: located B ref=$LOCATED_B"; exit 1 ;;

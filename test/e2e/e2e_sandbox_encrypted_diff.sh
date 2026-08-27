@@ -222,8 +222,10 @@ wait "$PID1" 2>/dev/null || true
 SNAP="$OUT/$SID1.snapshot"
 [ -e "$SNAP" ] || { echo "FAIL: local snapshot missing"; cat "$WORK/snapshot-local.log"; exit 1; }
 mapfile -t OVERLAYS < <(find "$OUT" -maxdepth 1 -type f -name '*.overlay' -print | sort)
-SANDBOX_E="$OUT/$SID1.sandbox"
-[ -e "$SANDBOX_E" ] || { echo "FAIL: local Sandbox E missing"; ls -la "$OUT"; exit 1; }
+"$BIN/sandbox-ctl" info --json --manifest-config "$REQUIRED_CONFIG" "$SNAP" > "$WORK/snapshot.json"
+E_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/snapshot.json")
+SANDBOX_E="$OUT/$E_BASENAME"
+[ -e "$SANDBOX_E" ] || { echo "FAIL: Snapshot S references missing local Sandbox E $E_BASENAME"; ls -la "$OUT"; exit 1; }
 [ "${#OVERLAYS[@]}" -ge 3 ] || { echo "FAIL: expected encrypted disk dependencies, got ${#OVERLAYS[@]}"; exit 1; }
 for artifact in "${OVERLAYS[@]}" "$(readlink -f "$SANDBOX_E")" "$(readlink -f "$SNAP")"; do
     magic=$(od -An -tx1 -N8 "$artifact" | tr -d ' \n')
@@ -235,8 +237,6 @@ for marker in ROOT-ACTIVE-OK SCRATCH-ACTIVE-OK DATA-ACTIVE-OK; do
         exit 1
     fi
 done
-"$BIN/sandbox-ctl" info --json --manifest-config "$REQUIRED_CONFIG" "$SNAP" > "$WORK/snapshot.json"
-E_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/snapshot.json")
 "$BIN/sandbox-ctl" info --json --manifest-config "$REQUIRED_CONFIG" "$OUT/$E_BASENAME" > "$WORK/sandbox.json"
 python3 - "$WORK/sandbox.json" <<'PY'
 import json, sys
