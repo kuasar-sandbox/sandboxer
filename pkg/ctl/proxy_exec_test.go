@@ -18,7 +18,7 @@ import (
 )
 
 func TestProxyExecPreservesFirstFrameAndBufferedTail(t *testing.T) {
-	payload := []byte(" \n{\"unknown\":{\"nested\":true},\"type\":\"exec_request\",\"exec\":{\"argv\":[\"/bin/true\"]}}\t")
+	payload := []byte(" \n{\"type\":\"exec_request\",\"exec\":{\"env\":{\"KEY\":\"value\"},\"argv\":[\"/bin/true\"]}}\t")
 	frame := ctlTestFrame(payload)
 	downstream := &memoryRWC{
 		reader:   bytes.NewReader(append(append([]byte(nil), frame...), []byte("client-tail")...)),
@@ -45,8 +45,8 @@ func TestProxyExecPreservesFirstFrameAndBufferedTail(t *testing.T) {
 }
 
 func TestProxyExecFirstFrameSizeBoundary(t *testing.T) {
-	prefix := []byte(`{"type":"exec_request","padding":"`)
-	suffix := []byte(`"}`)
+	prefix := []byte(`{"type":"exec_request","exec":{"argv":["`)
+	suffix := []byte(`"]}}`)
 	payload := append(append(append([]byte(nil), prefix...), bytes.Repeat([]byte{'x'}, MaxMessageBytes-len(prefix)-len(suffix))...), suffix...)
 	if len(payload) != MaxMessageBytes {
 		t.Fatalf("payload size = %d, want %d", len(payload), MaxMessageBytes)
@@ -212,7 +212,7 @@ func TestProxyExecPreservesDownstreamDirectionAfterCtlEOF(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- ProxyExec(context.Background(), downstream, ctlConn) }()
 
-	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+	frame := ctlTestValidExecFrame()
 	if _, err := client.Write(frame); err != nil {
 		t.Fatalf("client write frame: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestProxyExecLargeBidirectionalRelay(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- ProxyExec(context.Background(), downstream, ctlConn) }()
 
-	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+	frame := ctlTestValidExecFrame()
 	wantRequest := append(append([]byte(nil), frame...), bytes.Repeat([]byte("request-data-"), 32*1024)...)
 	wantResponse := bytes.Repeat([]byte("response-data-"), 32*1024)
 	backendRead := make(chan ctlTestReadResult, 1)
@@ -307,7 +307,7 @@ func TestProxyExecLargeBidirectionalRelay(t *testing.T) {
 }
 
 func TestProxyExecDoesNotFullCloseWhenCloseWriteIsUnavailable(t *testing.T) {
-	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+	frame := ctlTestValidExecFrame()
 	eofSeen := make(chan struct{})
 	downstream := &memoryRWC{reader: &eofSignalReader{reader: bytes.NewReader(frame), seen: eofSeen}}
 	backendReader, backendWriter := io.Pipe()
@@ -379,7 +379,7 @@ func TestProxyExecContextCancellationStopsGateAndRelay(t *testing.T) {
 		done := make(chan error, 1)
 		go func() { done <- ProxyExec(ctx, downstream, ctlStream) }()
 
-		frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+		frame := ctlTestValidExecFrame()
 		writeDone := make(chan error, 1)
 		go func() {
 			_, err := client.Write(frame)
@@ -429,7 +429,7 @@ func TestProxyExecCancellationWinsConcurrentCompletionAndError(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
-			frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+			frame := ctlTestValidExecFrame()
 			downstream := &memoryRWC{
 				reader: &cancelingTerminalReader{
 					data:     frame,
@@ -466,7 +466,7 @@ func TestProxyExecCancellationWinsConcurrentCompletionAndError(t *testing.T) {
 
 func TestProxyExecRelayErrorStopsOtherDirection(t *testing.T) {
 	wantErr := errors.New("injected downstream read failure")
-	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+	frame := ctlTestValidExecFrame()
 	downstream := &memoryRWC{reader: &terminalErrorReader{data: frame, err: wantErr}}
 	ctlConn := newBlockingReadRWC()
 
@@ -485,7 +485,7 @@ func TestProxyExecRelayErrorStopsOtherDirection(t *testing.T) {
 
 func TestProxyExecReverseRelayErrorIsNotMaskedByTeardown(t *testing.T) {
 	wantErr := errors.New("injected ctl-to-downstream failure")
-	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+	frame := ctlTestValidExecFrame()
 	downstream := newPrefixedBlockingReadRWC(frame)
 	ctlConn := &memoryRWC{reader: &terminalErrorReader{err: wantErr}}
 
@@ -504,7 +504,7 @@ func TestProxyExecReverseRelayErrorIsNotMaskedByTeardown(t *testing.T) {
 
 func TestProxyExecCloseWriteErrorStopsOtherDirection(t *testing.T) {
 	wantErr := errors.New("injected CloseWrite failure")
-	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+	frame := ctlTestValidExecFrame()
 	downstream := &memoryRWC{reader: bytes.NewReader(frame)}
 	ctlConn := &failingCloseWriteRWC{
 		blockingReadRWC: newBlockingReadRWC(),
@@ -529,7 +529,7 @@ func TestProxyExecCloseWriteErrorStopsOtherDirection(t *testing.T) {
 
 func TestProxyExecReverseCloseWriteErrorIsNotMaskedByTeardown(t *testing.T) {
 	wantErr := errors.New("injected downstream CloseWrite failure")
-	frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+	frame := ctlTestValidExecFrame()
 	downstream := &failingCloseWriteRWC{
 		blockingReadRWC: newPrefixedBlockingReadRWC(frame),
 		err:             wantErr,
@@ -558,7 +558,7 @@ func TestProxyExecSimultaneousRelayErrorsUseDirectionPriority(t *testing.T) {
 		ctlErr := errors.New("ctl-to-downstream failure")
 		ready := make(chan struct{}, 2)
 		release := make(chan struct{})
-		frame := ctlTestFrame([]byte(`{"type":"exec_request"}`))
+		frame := ctlTestValidExecFrame()
 		downstream := &memoryRWC{reader: &barrierErrorReader{
 			data:    frame,
 			err:     downstreamErr,
@@ -882,6 +882,10 @@ func ctlTestFrame(payload []byte) []byte {
 	binary.LittleEndian.PutUint32(frame[:4], uint32(len(payload)))
 	copy(frame[4:], payload)
 	return frame
+}
+
+func ctlTestValidExecFrame() []byte {
+	return ctlTestFrame([]byte(`{"type":"exec_request","exec":{"argv":["true"]}}`))
 }
 
 func ctlTestUnixPair(t *testing.T, name string) (*net.UnixConn, *net.UnixConn) {
