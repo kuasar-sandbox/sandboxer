@@ -36,6 +36,23 @@ func publishArtifactCmd(command string, args []string) int {
 	if *quiet {
 		logf = func(string, ...any) {}
 	}
+	var targetName, targetDirectory string
+	if *toRefLocation != "" {
+		targets := config.RefLocations{}
+		if err := targets.Set(*toRefLocation); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		for targetName, targetDirectory = range targets {
+			if inputDirectory, exists := refLocations[targetName]; exists && inputDirectory != targetDirectory {
+				fmt.Fprintf(os.Stderr, "publish target ref location %q conflicts with input ref location: %q != %q\n", targetName, targetDirectory, inputDirectory)
+				return 2
+			}
+			// Preserve the existing behavior where a target location also resolves
+			// source refs bearing that name when no separate input mapping exists.
+			refLocations[targetName] = targetDirectory
+		}
+	}
 	manifestCfg, loadErr := config.LoadManifestConfig(*manifestPath)
 	if loadErr != nil {
 		if *toRefLocation == "" || !errors.Is(loadErr, manifest.ErrConfigNotProvided) {
@@ -51,18 +68,10 @@ func publishArtifactCmd(command string, args []string) int {
 	}
 	defer storage.Close()
 	var publisher *artifact.Publisher
-	if *toRefLocation == "" {
+	if targetName == "" {
 		publisher, err = artifact.NewManifestPublisher(storage, manifestCfg, refLocations, logf)
 	} else {
-		targets := config.RefLocations{}
-		if err := targets.Set(*toRefLocation); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 2
-		}
-		for name, directory := range targets {
-			refLocations[name] = directory
-			publisher, err = artifact.NewLocationPublisher(storage, name, directory, refLocations, logf)
-		}
+		publisher, err = artifact.NewLocationPublisher(storage, targetName, targetDirectory, refLocations, logf)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

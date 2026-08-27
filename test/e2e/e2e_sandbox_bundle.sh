@@ -160,8 +160,11 @@ with zipfile.ZipFile(path) as archive:
         raise SystemExit("duplicate ZIP entry")
     refs = [name for name in names if name == "bundle/refs"]
     admissions = [name for name in names if name.startswith("bundle/admission/")]
+    indexes = [name for name in names if name == "bundle/index"]
     if len(admissions) != 1:
         raise SystemExit("Bundle does not contain exactly one admission")
+    if indexes != ["bundle/index"] or names[-1] != "bundle/index":
+        raise SystemExit(f"Bundle index must be the sole final entry: {indexes!r}")
     expected_refs = int(expected_refs_text)
     if len(refs) != (1 if expected_refs else 0):
         raise SystemExit(f"bundle/refs presence mismatch: {refs!r}")
@@ -177,7 +180,7 @@ with zipfile.ZipFile(path) as archive:
         raise SystemExit(f"Manifest count {len(manifests)} < {minimum_text}")
     if f"manifest/{root}" not in names:
         raise SystemExit("filename-selected root Manifest is absent")
-    allowed = re.compile(r"(?:bundle/admission/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9a-f]{64}|bundle/refs|(?:manifest|chunk)/[0-9a-f]{64})$")
+    allowed = re.compile(r"(?:bundle/admission/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9a-f]{64}|bundle/(?:refs|index)|(?:manifest|chunk)/[0-9a-f]{64})$")
     for item in archive.infolist():
         if item.compress_type != zipfile.ZIP_STORED:
             raise SystemExit(f"non-Store ZIP entry: {item.filename}")
