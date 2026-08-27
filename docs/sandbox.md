@@ -51,8 +51,8 @@ handler、cgroup/balloon 联动(含 host 端 BalloonController)、与 node-ctl
 
    authorized remote exec
 
-       client ── exec tunnel ──► node proxy ── pkg/ctl.ProxyExec ──► ctl.sock
-                                      authenticate + select exact sandbox
+       client ── exec tunnel ──► node proxy ── pkg/ctl.ServeExecTunnel ──► ctl.sock
+                                      token gate  request gate  backend dial
 ```
 
 Two host-side roots, kept distinct (overridable via --run-root / SANDBOX_RUN_ROOT
@@ -415,9 +415,10 @@ sandbox-init → guest 为这次 exec 起一条**独立的 stdio MUX**(详见
 [`sandbox-init.md`](sandbox-init.md) §3.6 / §4.3)。run 进程在握手后只做
 ctl.sock ↔ guest vsock 的透明字节转发,MUX 端到端跑在 `sandbox-ctl exec` 与
 guest 之间。多个 exec 会话并发互不影响。远程授权 exec 由可信 node proxy
-在完成鉴权并选定目标 sandbox 后,调用 `pkg/ctl.ProxyExec` 对下游首帧做
-`exec_request` gate,再接入同一条 `ctl.sock` 与 MUX 路径;不定义另一套 guest
-wire。
+调用 `pkg/ctl.ServeExecTunnel`:先完成身份/token gate 并接受 tunnel,再严格读取
+`exec_request` 首帧、调用 request gate,只有通过后才允许生命周期准备和
+`ctl.sock` backend dial。该 helper 不理解 KAT、CEL、HTTP、route 或 sandbox
+lifecycle,这些策略均由调用方 callback 提供;它不定义另一套 guest wire。
 
 远程模式只替换上述第一跳拨号:
 
@@ -1698,29 +1699,49 @@ UDS,承载两类宿主侧控制请求:`snapshot`(一问一答)与 `exec`(握手�
 为端到端 stdio MUX)。请求 / 响应都是 JSON,长度前缀(4 字节 LE uint32)+ payload。
 同一 UDS 上多个请求各自独立的连接、可并发(每连接一 goroutine)。
 
-**远程授权 exec 入口**:`pkg/ctl.ProxyExec(ctx, downstream, ctlConn)` 是
-HTTP 无关的 server-side gate/relay。调用方负责在调用前完成用户鉴权、
-目标 sandbox 选择与生命周期准备,并将 `ctlConn` 连到该 sandbox 的
-`<run-dir>/<sid>/ctl.sock`;`ProxyExec` 本身不解析身份或签发凭据。
+**远程授权 exec 入口**:`pkg/ctl.ServeExecTunnel(ctx, options)` 是 HTTP
+无关的 server-side gate/relay。`options` 冻结以下顺序:
+
+```text
+Authorize → AcceptDownstream → ReadExecRequestFrame → AuthorizeRequest
+          → DialBackend → write frame.Raw once → duplex relay
+```
+
+`Authorize` 由调用方在 CONNECT 200 前验证身份/token;`AcceptDownstream`
+负责发送并 flush 成功响应;`AuthorizeRequest` 在 ctl 已完成结构解析后执行
+调用方策略;`DialBackend` 才可做 lifecycle 准备并连接目标。request gate
+失败因此不会拨 backend。`ServeExecTunnel` 和 `ReadExecRequestFrame` 都不
+解析 KAT/CEL、HTTP、route 或 lifecycle,也不签发凭据。`ProxyExec` 保留为
+已有预连接调用方的兼容入口,并复用同一严格首帧读取与 relay primitive。
 
 ```text
 authorized downstream                       existing sandbox path
         │                                             │
         ▼                                             ▼
-node proxy ──► ProxyExec ──► ctl.sock ──► sandbox-ctl run ──► guest exec
+node proxy ──► ServeExecTunnel ──► ctl.sock ──► sandbox-ctl run ──► guest exec
                 │
-                ├─ first frame: exec_request only
-                └─ accepted: transparent ctl/MUX relay
+                ├─ pre-accept: caller authorization
+                ├─ post-accept: strict exec_request + caller request gate
+                └─ admitted: raw frame once + transparent ctl/MUX relay
 ```
 
 gate 按现有 `ctl.sock` framing 先完整读取 4-byte LE 长度和 payload:
 
 - payload 上限与其他 ctl 消息一致,为 64 KiB;长度前缀或 payload 截断、
   超限或非法 JSON 都拒绝。
-- 只接受首帧对象的 `type == "exec_request"`;`snapshot_request` 及其他类型
-  不得向 `ctlConn` 写入任何字节。
+- payload 必须是单一 JSON object;顶层只允许 `type,exec`,nested
+  `ExecSpec/StdioSpec/Winsize` 只允许协议声明字段,任意 duplicate/unknown
+  field、第二个 JSON value、snapshot-only field 都拒绝。
+- 只接受 `type == "exec_request"`、非 nil `exec` 和非空 `argv`;
+  `snapshot_request` 及其他类型不得向 backend 写入任何字节。
 - 验证通过后,原长度前缀和原 JSON payload 逐字节写入 `ctlConn`,不做
   decode/re-encode;已跟在首帧后的 buffered ctl/MUX 字节也不丢失。
+- 首帧完整到达时间固定最多 10 秒(调用方只能缩短);超时或 framing 无法恢复时
+  直接关闭。CONNECT 已接受后,完整识别的 request gate/backend failure 只返回
+  脱敏 ctl error `{"type":"error","msg":"exec request rejected"}`。
+
+严格 gate 不改变现有 stdio wire:TTY=true 时 `stdin/stdout/stderr` 仍是
+ignored flags,它们即使同时出现也不是冲突;原始 request 不被改写。
 
 首帧通过后,两个方向使用有界 buffer 透明复制。一侧正常 EOF 时,如目标
 支持 `CloseWrite`,只传播写侧半关闭,继续排空反向数据;若流不支持
