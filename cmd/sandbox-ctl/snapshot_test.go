@@ -18,14 +18,15 @@ func TestSnapshotCmdBoolFlagMapping(t *testing.T) {
 		wantMergeRef  bool
 		wantMode      string
 	}{
-		{name: "defaults", wantDropCache: true, wantMergeRef: true},
+		{name: "defaults", wantDropCache: false, wantMergeRef: true},
 		{
 			name:          "explicit false",
 			extra:         []string{"--drop-caches=false", "--merge-ref=false"},
 			wantDropCache: false,
 			wantMergeRef:  false,
 		},
-		{name: "explicit bundle", extra: []string{"--mode", "bundle"}, wantDropCache: true, wantMergeRef: true, wantMode: ctl.SnapshotModeBundle},
+		{name: "explicit true", extra: []string{"--drop-caches=true"}, wantDropCache: true, wantMergeRef: true},
+		{name: "explicit bundle", extra: []string{"--mode", "bundle"}, wantDropCache: false, wantMergeRef: true, wantMode: ctl.SnapshotModeBundle},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

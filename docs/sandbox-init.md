@@ -493,11 +493,11 @@ quiesce 是 host `/vm.pause` 之前的最后一次清理机会,目标两件事:
 
 - **sync 在前**:`drop_caches` 只丢 clean,先 sync 把 dirty 转 clean,disk dump
   与 memory dump 看到的是一致状态
-- **drop_caches=3(默认)**:page cache 是确定性 snapshot 的核心污染源;同一应用不同启动
+- **drop_caches=3(请求启用时)**:page cache 是确定性 snapshot 的核心污染源;同一应用不同启动
   序的 page cache 内容按访问顺序、prefetch 时序差异化堆积,跨实例 ~90% 不同;drop
   后每实例 restore 后 page cache 初值统一为空,直接对应 kuasar-sandbox.md §4.6 量化的"确定性
-  50→90% dedup"差距来源。单次 snapshot 可用 `--drop-caches=false` 请求跳过此写入,
-  但 freeze 与 sync 仍照常执行,用于保留 warm-up 形成的 guest cache 状态。
+  50→90% dedup"差距来源。默认跳过此写入;如需清理 cache 以获得更确定且更小的
+  snapshot,显式使用 `--drop-caches=true`;freeze 与 sync 仍照常执行。
 
 `quiesced.drop_caches_result` 回报 `skipped | succeeded | failed`;空值表示旧 guest
 未实现回报(`unknown`)。显式请求 skip 而收到 unknown 时 host 继续快照并告警,因为旧
