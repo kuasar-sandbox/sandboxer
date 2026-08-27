@@ -119,6 +119,20 @@ func TestApplyRestoreRulesRejectsResourceDiskAndNetworkConflicts(t *testing.T) {
 		}
 	})
 
+	t.Run("explicit empty data disks", func(t *testing.T) {
+		artifact := validPortableConfig()
+		artifact.Boot.Disks = []PortableDiskConfig{{
+			Name:               "data",
+			PortableRootConfig: PortableRootConfig{Base: "file://data.overlay@sha256:" + testSHA},
+		}}
+		artifact.Mounts = []MountConfig{{Target: "/data", Type: "disk", Source: "data"}}
+		host := restoreHostConfig()
+		_, _, err := ApplyRestoreRules(artifact, host, restorePresence("boot.disks"))
+		if err == nil || !strings.Contains(err.Error(), "boot.disks count 0 conflicts") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
 	t.Run("missing provider", func(t *testing.T) {
 		artifact := validPortableConfig()
 		artifact.Network = PortableNetworkConfig{Enabled: true, Interface: "eth0"}

@@ -193,7 +193,7 @@ func TestApplyFromRulesRejectsDataDiskCountAndNameChanges(t *testing.T) {
 		disks string
 		want  string
 	}{
-		{name: "explicit empty", disks: "[]", want: ""},
+		{name: "explicit empty", disks: "[]", want: "count"},
 		{name: "name", disks: "[{name: other, diff_template: file:///data.ext4}]", want: "name"},
 		{name: "too many", disks: "[{name: data, diff_template: file:///data.ext4}, {name: extra, diff_template: file:///extra.ext4}]", want: "count"},
 	} {
@@ -204,12 +204,6 @@ func TestApplyFromRulesRejectsDataDiskCountAndNameChanges(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, _, err = ApplyFromRules(artifact, host, presence)
-			if tc.want == "" {
-				if err != nil {
-					t.Fatal(err)
-				}
-				return
-			}
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("data topology error = %v, want %q", err, tc.want)
 			}

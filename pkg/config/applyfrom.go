@@ -171,7 +171,7 @@ func validateFromProtectedFields(artifact *PortableSandboxConfig, host *SandboxC
 		}
 	}
 
-	if len(host.Boot.Disks) != 0 && len(host.Boot.Disks) != len(artifact.Boot.Disks) {
+	if (presence.Has("boot.disks") || len(host.Boot.Disks) != 0) && len(host.Boot.Disks) != len(artifact.Boot.Disks) {
 		return fmt.Errorf("run --from: host boot.disks count %d conflicts with artifact count %d", len(host.Boot.Disks), len(artifact.Boot.Disks))
 	}
 	for i := range host.Boot.Disks {

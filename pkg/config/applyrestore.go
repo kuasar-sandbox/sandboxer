@@ -137,7 +137,7 @@ func validateRestoreDiskBindings(artifact *PortableSandboxConfig, host *SandboxC
 			return errors.New("run --restore: boot.root.overlay immutable graph is owned by the referenced Sandbox")
 		}
 	}
-	if len(host.Boot.Disks) != 0 && len(host.Boot.Disks) != len(artifact.Boot.Disks) {
+	if (presence.Has("boot.disks") || len(host.Boot.Disks) != 0) && len(host.Boot.Disks) != len(artifact.Boot.Disks) {
 		return fmt.Errorf("run --restore: host boot.disks count %d conflicts with Sandbox count %d", len(host.Boot.Disks), len(artifact.Boot.Disks))
 	}
 	for i := range host.Boot.Disks {
