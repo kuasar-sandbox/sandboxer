@@ -13,21 +13,16 @@ import (
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 )
 
-// BenchmarkSnapshotSinkCreate compares the two local snapshot formats over
+// BenchmarkArtifactSinkCreate compares the two local Snapshot S carriers over
 // one memory layer and one disk layer. The inputs share 4 MiB to exercise the
 // Bundle's cross-Manifest object dedup without making the whole fixture
 // artificially compressible.
-func BenchmarkSnapshotSinkCreate(b *testing.B) {
+func BenchmarkArtifactSinkCreate(b *testing.B) {
 	const layerSize = 16 << 20
 	disk := benchmarkBytes(layerSize, 0x1234_5678_9abc_def0)
 	memory := benchmarkBytes(layerSize, 0xfedc_ba98_7654_3210)
 	copy(memory[:4<<20], disk[:4<<20])
-	inner, err := BuildZIP(map[string][]byte{
-		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
-	})
-	if err != nil {
-		b.Fatal(err)
-	}
+	snapshotConfig := []byte("version: 1\nsandbox_ref: manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
 	customerKey := [32]byte{0x91, 0x92, 0x93}
 	cfg := &manifest.Config{
 		Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "512KiB"}},
@@ -53,7 +48,11 @@ func BenchmarkSnapshotSinkCreate(b *testing.B) {
 					if _, _, err := sink.AbsorbOverlay(context.Background(), bytes.NewReader(disk), nil); err != nil {
 						b.Fatal(err)
 					}
-					if _, _, err := sink.AbsorbBundle(context.Background(), bytes.NewReader(memory), nil, bytes.NewReader(inner)); err != nil {
+					ref, path, err := sink.AbsorbSnapshot(context.Background(), testSnapshotSource(b, memory, nil, snapshotConfig))
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err := sink.CommitSnapshot(context.Background(), ref, path); err != nil {
 						b.Fatal(err)
 					}
 				case "manifest-bundle":
@@ -66,7 +65,12 @@ func BenchmarkSnapshotSinkCreate(b *testing.B) {
 						_ = sink.Close()
 						b.Fatal(err)
 					}
-					if _, _, err := sink.AbsorbBundle(context.Background(), bytes.NewReader(memory), nil, bytes.NewReader(inner)); err != nil {
+					ref, _, err := sink.AbsorbSnapshot(context.Background(), testSnapshotSource(b, memory, nil, snapshotConfig))
+					if err != nil {
+						_ = sink.Close()
+						b.Fatal(err)
+					}
+					if err := sink.CommitSnapshot(context.Background(), ref, ""); err != nil {
 						_ = sink.Close()
 						b.Fatal(err)
 					}

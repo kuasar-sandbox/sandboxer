@@ -205,9 +205,10 @@ overlay 数据盘 N: erofs ro → /sysdisks/disk-N-lower;ext4 rw → /sysdisks/d
 `/sysdisks` 子树 switch-root 后不可见,但被 bind(及 overlayfs 对 lower/upper 的引用)持活——与
 root overlay 的 `/overlay/lower+upper` 隐藏后仍活、`/opt/sandbox-runtime` bind 同一机制。**恢复**时
 guest 从内存快照续跑、盘已挂好(不重挂),host 只需按同序重建并 serve N 个设备(restore host yaml 的
-`boot.disks[]` 须与快照同数同序;mounts[] 在 restore 下不必带)。**快照**逐盘捕获其可写 diff
-(root + 各数据盘),`snapshot.cfg` 的 `boot.disks[]` 按序记录每盘 `base_ref`/`overlay.base`/链
-(与 `boot.root` 同结构);本地链逐盘 flatten-merge(同 root)。
+`boot.disks[]` 若显式提供active diff binding,须与 Sandbox E 同数同序;mounts[] 在 restore 下禁止
+重放)。**快照**在同一 pause/quiesce 点逐盘捕获可写 diff(root + 各数据盘),先生成包含完整disk
+graph的Sandbox E,再生成memory Snapshot S;S的`snapshot.cfg`只用`sandbox_ref`引用E并记录
+memory `from_refs`。本地flatten-merge分别作用于E的disk layers和S的memory layers。
 
 ### 3.2 阶段 2:spec 应用 + stdio 接线 + 应用拉起
 
@@ -759,7 +760,7 @@ vsock 端口固定 `5000`,**两个方向都复用同一端口号**,身份按方�
 | **健康探测** | host→guest | `ping{id, t_send_ns}` → `pong{id, t_send_ns}` | 关 | host 计 RTT / 超时 / 失败数(§4.9) |
 | **mem 报告** | guest→host | `mem_report{epoch,seq,mem_*}` → `mem_report_ack` | 关 | guest observation;host sandbox-local controller 验证 epoch/seq 后结合 CH `vm.info` |
 | **快照前** | host→guest | `quiesce` → `quiesced` | 关 | guest 冻结应用进程树 + 跑 prep + 关闭 MUX(§3.4),`quiesced` ⇒ 应用已冻结、可安全 `/vm.pause` |
-| **恢复后** | host→guest | `restore{epoch, wallclock_ns, network?, files?}` → `restore_ack{stdio, app_state}` | **升级 MUX** | 快照恢复 vCPU 起跑后 host 通知 guest;guest 先推进 mem-report epoch,再回 ACK、重连 MUX并最后 thaw。Host 在 ACK+MUX 前不启用 memory policy。其余 clock/network/files 语义见 §4.8。**RNG 重播种未实现** |
+| **恢复后** | host→guest | `restore{epoch, wallclock_ns, network?}` → `restore_ack{stdio, app_state}` | **升级 MUX** | 快照恢复 vCPU 起跑后 host 通知 guest;guest 先推进 mem-report epoch,再回 ACK、重连 MUX并最后 thaw。Host 在 ACK+MUX 前不启用 memory policy。其余 clock/network 语义见 §4.8。`launch`/files/init/plugin 是 cold-only 配置,恢复时不重放。**RNG 重播种未实现** |
 | **MUX 重连** | host→guest | `attach{epoch}` → `attach_ack{stdio, app_state}` | **升级 MUX** | 纯 stdio-MUX 传输重连:MUX 因 vsock 异常断了,host 拨新连接重建;guest 优雅关旧 MUX(已断则硬丢)、回 ack,该连接成为新 MUX(§4.6)。**attach ≠ 快照后 resume**——活 VM 上从未 quiesce 的断线兜底也走它。thaw 不属 attach 语义,而属 quiesce 生命周期(freeze 的逆),**由 guest 自身冻结状态驱动**:仍冻结才补 thaw(仅 `resume_after=true` 同进程续跑路径——VM 原地 resume,attach 恰为首个 post-resume 接触),活 VM 重连本未冻结即跳过 |
 | **执行命令** | host→guest | `exec{spec}` → `exec_ack{stdio}` | **升级 MUX(独立会话)** | guest 为这条 `exec` 起一个兄弟进程并准备其 stdio,回 `exec_ack`,该连接成为这次 exec 会话**独立**的 MUX;并发多条互不影响;命令结束 guest 在 MUX 上发 EXIT_STATUS 再走 §4.6 关闭。详见 §3.6 |
 | **端口转发** | host→guest | `connect{spec}` → `connect_ack` | **升级转发数据通道** | guest 为这条 `connect` 取得 `ConnectSpec.address` 上的目标连接——dial(默认)或 `Accept`(`spec.accept`,accept 模式可无限期阻塞,host 无 deadline park)——回 `connect_ack`,该连接成为这条转发的 fwd 帧数据通道(§4.7),保留 TCP 半关闭;并发多条互不影响;quiesce 时主动拆除(§3.4)。详见 §3.7 |

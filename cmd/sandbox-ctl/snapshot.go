@@ -21,7 +21,7 @@ func snapshotCmd(args []string) int {
 	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
 	sandboxID := fs.String("sandbox-id", "", "target sandbox id (required)")
 	outDir := fs.String("output", "", "local output dir; produces <sid>.snapshot + scheme-qualified content-addressed artifacts")
-	upload := fs.Bool("upload", false, "ingest snapshot bundle + overlay into manifest store; stdout = snapshot manifest key")
+	upload := fs.Bool("upload", false, "ingest Snapshot S, Sandbox E, and dependencies into the manifest store; stdout = S manifest key")
 	mode := fs.String("mode", ctl.SnapshotModeLocal, "local snapshot format: local|bundle (default local)")
 	resume := fs.Bool("resume", false, "keep sandbox running after snapshot (default: destroy via /vm.shutdown)")
 	dropCaches := fs.Bool("drop-caches", false, "drop guest page, inode, and dentry caches before snapshot (default: preserve guest caches)")
@@ -131,8 +131,8 @@ func snapshotCmd(args []string) int {
 		// --upload ...)` work in shell pipelines.
 		fmt.Fprintf(os.Stderr, "snapshot upload done: memory_size=%d resident=%d pause_ms=%d dump_ms=%d\n",
 			resp.MemorySize, resp.MemoryResident, resp.WallclockPauseMs, resp.WallclockDumpMs)
-		if resp.OverlayManifestKey != "" {
-			fmt.Fprintf(os.Stderr, "  overlay manifest key: %s\n", resp.OverlayManifestKey)
+		if resp.SandboxManifestKey != "" {
+			fmt.Fprintf(os.Stderr, "  Sandbox E manifest key: %s\n", resp.SandboxManifestKey)
 		}
 		if resp.Msg != "" {
 			fmt.Fprintf(os.Stderr, "  %s\n", resp.Msg)
@@ -144,10 +144,10 @@ func snapshotCmd(args []string) int {
 	fmt.Printf("snapshot done: memory_size=%d resident=%d pause_ms=%d dump_ms=%d\n",
 		resp.MemorySize, resp.MemoryResident, resp.WallclockPauseMs, resp.WallclockDumpMs)
 	if resp.SnapshotPath != "" {
-		fmt.Printf("  snapshot bundle: %s\n", resp.SnapshotPath)
+		fmt.Printf("  Snapshot S: %s\n", resp.SnapshotPath)
 	}
-	if resp.OverlayPath != "" {
-		fmt.Printf("  overlay file:    %s\n", resp.OverlayPath)
+	if resp.SandboxPath != "" {
+		fmt.Printf("  Sandbox E:  %s\n", resp.SandboxPath)
 	}
 	return 0
 }

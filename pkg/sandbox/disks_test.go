@@ -3,14 +3,18 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 )
 
 func TestOpenDiskStreamValidatesLocatedContentName(t *testing.T) {
@@ -79,5 +83,75 @@ func TestOpenDiskStreamFollowsLocatedSymlink(t *testing.T) {
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpenRootImageBlockReaderExcludesFlattenedConfigTail(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "root.erofs")
+	payload := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
+	payload[1024+12] = 12
+	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	if err := os.WriteFile(imagePath, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := image.AppendConfigZip(imagePath, &image.RuntimeConfig{Cmd: []string{"/app"}}); err != nil {
+		t.Fatal(err)
+	}
+	flattened, err := os.ReadFile(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, artifactPath, err := snapshot.NewFileSink(dir, "root", nil, false, nil).
+		AbsorbOverlaySource(context.Background(), sparse.Dense(bytes.NewReader(flattened), uint64(len(flattened))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := manifest.ParseRef(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed.Path = artifactPath
+	reader, size, err := OpenRootImageBlockReaderWithOpener(context.Background(), parsed.String(), nil, nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if size != int64(len(payload)) || reader.Size() != int64(len(payload)) {
+		t.Fatalf("root block size = %d/%d, want %d", size, reader.Size(), len(payload))
+	}
+	imageCfg, err := LoadImageConfigFrom(reader, reader.Size())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imageCfg.Cmd) != 1 || imageCfg.Cmd[0] != "/app" {
+		t.Fatalf("root image config = %#v", imageCfg)
+	}
+	if _, err := reader.ReadAt(make([]byte, 1), int64(len(payload))); err == nil {
+		t.Fatal("vhost reader exposed the flattened ZIP tail")
+	}
+}
+
+func TestOpenLayeredBlockReaderRejectsMismatchedLogicalSizes(t *testing.T) {
+	dir := t.TempDir()
+	sink := snapshot.NewFileSink(dir, "layers", nil, false, nil)
+	refs := make([]string, 0, 2)
+	for _, body := range [][]byte{make([]byte, 4096), make([]byte, 8192)} {
+		ref, path, err := sink.AbsorbOverlaySource(context.Background(),
+			sparse.Dense(bytes.NewReader(body), uint64(len(body))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := manifest.ParseRef(ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed.Path = path
+		refs = append(refs, parsed.String())
+	}
+	if _, _, err := OpenLayeredBlockReader(context.Background(), refs, nil, nil, nil, false); err == nil ||
+		!strings.Contains(err.Error(), "logical size") {
+		t.Fatalf("mismatched layer error = %v", err)
 	}
 }

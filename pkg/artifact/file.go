@@ -142,7 +142,8 @@ func (s *ProcessStorage) OpenFile(ctx context.Context, path string, ref manifest
 	if s == nil {
 		return nil, fmt.Errorf("artifact: process storage is required")
 	}
-	return OpenFile(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), s.localCodec, s.localRequired)
+	opened, err := OpenFile(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), s.localCodec, s.localRequired)
+	return opened, protectProcessLocalReadError(s.localCodec, "open local artifact", err)
 }
 
 // OpenFileWithLocations supplies ordered Bundle refs with trusted named
@@ -151,7 +152,26 @@ func (s *ProcessStorage) OpenFileWithLocations(ctx context.Context, path string,
 	if s == nil {
 		return nil, fmt.Errorf("artifact: process storage is required")
 	}
-	return OpenFileWithLocations(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), locations, s.localCodec, s.localRequired)
+	opened, err := OpenFileWithLocations(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), locations, s.localCodec, s.localRequired)
+	return opened, protectProcessLocalReadError(s.localCodec, "open local artifact", err)
+}
+
+type processLocalReadError struct {
+	op  string
+	err error
+}
+
+func (e *processLocalReadError) Error() string { return e.op + " failed" }
+func (e *processLocalReadError) Unwrap() error { return e.err }
+
+// protectProcessLocalReadError preserves errors.Is while preventing paths,
+// content identities, and crypto diagnostics from reaching CLI output when a
+// local codec is active.
+func protectProcessLocalReadError(codec tarstream.Codec, op string, err error) error {
+	if codec == nil || err == nil {
+		return err
+	}
+	return &processLocalReadError{op: op, err: err}
 }
 
 // DetectFileFormat performs the non-consuming magic check used by snapshot,

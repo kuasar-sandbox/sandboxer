@@ -10,8 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,9 +31,84 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 	"golang.org/x/sys/unix"
 )
+
+type lifecycleArtifactStream struct{ sparse.Source }
+
+func (*lifecycleArtifactStream) Close() error { return nil }
+
+func lifecycleSnapshotSource(t testing.TB, memory, snapshotConfig []byte) sparse.Source {
+	t.Helper()
+	logical, err := snapshotfile.BuildSource(
+		sparse.Dense(bytes.NewReader(memory), uint64(len(memory))),
+		[]byte("{}"), []byte("{}"), snapshotConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return logical
+}
+
+func TestPrepareSnapshotDependencyRejectsLiveSandboxAsRootImage(t *testing.T) {
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	runtimeConfig, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical, err := sandboxfile.BuildSource(
+		sparse.Dense(bytes.NewReader(bytes.Repeat([]byte{0x51}, 4096)), 4096),
+		nil, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = prepareSnapshotDependencyStream(
+		context.Background(), &lifecycleArtifactStream{Source: logical}, dependencyRootImage,
+	)
+	if err == nil || !strings.Contains(err.Error(), "EROFS") {
+		t.Fatalf("root-image dependency error = %v", err)
+	}
+}
+
+func TestPreflightWritableExt4RejectsUnformattedExplicitDiff(t *testing.T) {
+	dir := t.TempDir()
+	diffPath := filepath.Join(dir, "upper.diff")
+	if err := os.WriteFile(diffPath, make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := &config.RootConfig{
+		Base: "file:///unused.erofs",
+		Overlay: &config.OverlayConfig{
+			Diff: "file://" + diffPath,
+		},
+	}
+	err := preflightWritableExt4(context.Background(), root, "boot.root", "",
+		nil, nil, nil, [32]byte{}, false, nil)
+	if err == nil || !strings.Contains(err.Error(), "formatted ext4") {
+		t.Fatalf("unformatted active diff error = %v", err)
+	}
+}
+
+func lifecycleBundleSnapshot(t testing.TB, sink *snapshot.BundleSink, directory string, memory, snapshotConfig []byte) (string, string) {
+	t.Helper()
+	ref, _, err := sink.AbsorbSnapshot(context.Background(), lifecycleSnapshotSource(t, memory, snapshotConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.CommitSnapshot(context.Background(), ref, ""); err != nil {
+		t.Fatal(err)
+	}
+	key, err := manifest.ParseKeyRef(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref, filepath.Join(directory, manifest.HexKey(key)+".bundle")
+}
 
 func TestValidateLocalMemoryRefsUsesOutputBundleDirectory(t *testing.T) {
 	out := t.TempDir()
@@ -202,15 +275,15 @@ func TestValidatePortableMemoryRefsAcceptsLocatedFileRefs(t *testing.T) {
 
 func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
 	portable := "manifest://" + strings.Repeat("a", 64)
-	prov := config.SnapshotProvenance{
-		ParentSnapshotRef: "file:///bundle/w.snapshot",
-		ParentFromRefs: []string{
+	binding := &MemorySourceBinding{
+		SnapshotRef: "file:///bundle/w.snapshot",
+		FromRefs: []string{
 			"file:///bundle/b.snapshot",
 			portable,
 		},
 	}
 
-	merged, err := snapshotMemoryRefs(prov, true)
+	merged, err := memoryRefsForSnapshot(binding, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +292,7 @@ func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
 		t.Fatalf("merged memory refs = %v, want %v", merged, wantMerged)
 	}
 
-	workingSet, err := snapshotMemoryRefs(prov, false)
+	workingSet, err := memoryRefsForSnapshot(binding, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,12 +301,12 @@ func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
 		t.Fatalf("working-set memory refs = %v, want %v", workingSet, wantWorkingSet)
 	}
 
-	if prov.ParentFromRefs[0] != "file:///bundle/b.snapshot" {
-		t.Fatalf("snapshotMemoryRefs mutated provenance: %v", prov.ParentFromRefs)
+	if binding.FromRefs[0] != "file:///bundle/b.snapshot" {
+		t.Fatalf("memoryRefsForSnapshot mutated binding: %v", binding.FromRefs)
 	}
 }
 
-func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
+func TestPrepareSnapshotBundlePlanCopiesReachableParentManifest(t *testing.T) {
 	customerKey := [32]byte{0x71, 0x72, 0x73}
 	keyFn := func() ([32]byte, error) { return customerKey, nil }
 	configFor := func(generation string) *manifest.Config {
@@ -243,27 +316,19 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 			Crypto:   manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
 		}
 	}
-	inner, err := snapshot.BuildZIP(map[string][]byte{
-		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	snapshotConfig := []byte("version: 1\nsandbox_ref: manifest://" + strings.Repeat("a", 64) + "\n")
 	parentDir := t.TempDir()
 	parentCfg := configFor("G1")
 	parent, err := snapshot.NewBundleSink(context.Background(), parentDir, "parent", parentCfg, keyFn, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	baseRef, _, err := parent.AbsorbOverlay(context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x30}, 8192)), nil)
+	_, _, err = parent.AbsorbOverlay(context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x30}, 8192)), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	parentRef, parentPath, err := parent.AbsorbBundle(context.Background(),
-		bytes.NewReader(bytes.Repeat([]byte{0x31}, 8192)), nil, bytes.NewReader(inner))
-	if err != nil {
-		t.Fatal(err)
-	}
+	parentRef, parentPath := lifecycleBundleSnapshot(t, parent, parentDir,
+		bytes.Repeat([]byte{0x31}, 8192), snapshotConfig)
 	if err := parent.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +348,7 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 	defer opened.Close()
 
 	childDir := t.TempDir()
-	childCfg := configFor("G2")
+	childCfg := configFor("G1")
 	admission, err := childCfg.WriteAdmission(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -291,15 +356,17 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 	sandboxCfg := &config.SandboxConfig{}
 	sandboxCfg.Resources.Capacity.Memory = "8KiB"
 	sandboxCfg.Boot.Root.Overlay = &config.OverlayConfig{}
-	sandboxCfg.SnapshotProvenance = config.SnapshotProvenance{
-		ParentSnapshotRef: parentRef,
-		ParentOverlayBase: baseRef,
-		BundleSource: &config.BundleSourceProvenance{
-			RootRef: "file://" + filepath.Base(parentPath), RootPath: parentPath,
-		},
-	}
 	runOpts := RunOptions{
-		Cfg:           sandboxCfg,
+		Cfg: sandboxCfg,
+		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{
+			Root: config.PortableRootConfig{Base: "self"},
+		}},
+		MemoryBinding: &MemorySourceBinding{
+			SnapshotRef: parentRef,
+			BundleSource: &BundleSourceBinding{
+				RootRef: "file://" + filepath.Base(parentPath), RootPath: parentPath,
+			},
+		},
 		ManifestCfg:   childCfg,
 		Fetcher:       opened.ScopedFetcher(),
 		BundleReader:  opened.BundleReader(),
@@ -330,12 +397,8 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Close()
-	wantSource := "file://" + filepath.Base(parentPath)
-	if got := plan.Refs(); !reflect.DeepEqual(got, []string{wantSource}) {
-		t.Fatalf("plan refs = %v, want [%s]", got, wantSource)
-	}
-	if err := requireBundleFilesEqual(context.Background(), parentPath, filepath.Join(childDir, filepath.Base(parentPath))); err != nil {
-		t.Fatalf("prepared sibling: %v", err)
+	if got := plan.Refs(); len(got) != 0 {
+		t.Fatalf("fully materialized plan has external refs: %v", got)
 	}
 	child, err := snapshot.NewPlannedBundleSink(childDir, "child", childCfg, keyFn, admission, plan.Refs(), nil)
 	if err != nil {
@@ -346,14 +409,11 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(replacements) != 0 {
-		t.Fatalf("Bundle parent was unexpectedly reingested: %v", replacements)
+	if replacements[parentRef] != parentRef {
+		t.Fatalf("exact-copy replacement = %q, want %q", replacements[parentRef], parentRef)
 	}
-	_, childPath, err := child.AbsorbBundle(context.Background(),
-		bytes.NewReader(bytes.Repeat([]byte{0x41}, 8192)), nil, bytes.NewReader(inner))
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, childPath := lifecycleBundleSnapshot(t, child, childDir,
+		bytes.Repeat([]byte{0x41}, 8192), snapshotConfig)
 	if err := child.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -362,11 +422,11 @@ func TestPrepareSnapshotBundlePlanKeepsParentAsExternalRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	if got := reader.Refs(); !reflect.DeepEqual(got, []string{wantSource}) {
-		t.Fatalf("child refs = %v", got)
+	if got := reader.Refs(); len(got) != 0 {
+		t.Fatalf("child retained external refs: %v", got)
 	}
-	if reader.HasManifest(parentKey) {
-		t.Fatal("child copied parent root instead of retaining an external Bundle source")
+	if !reader.HasManifest(parentKey) {
+		t.Fatal("child did not copy the reachable parent Manifest")
 	}
 
 	mergedPlan, err := prepareSnapshotBundlePlan(context.Background(), runOpts,
@@ -389,7 +449,7 @@ func (f *failingManifestFetcher) OpenManifest(context.Context, store.ContentKey)
 	return nil, errors.New("remote Manifest missing")
 }
 
-func TestPrepareSnapshotBundlePlanFlattensOnlyReachableSources(t *testing.T) {
+func TestPrepareSnapshotBundlePlanMaterializesOnlyReachableSources(t *testing.T) {
 	customerKey := [32]byte{0x74, 0x75, 0x76}
 	keyFn := func() ([32]byte, error) { return customerKey, nil }
 	manifestCfg := &manifest.Config{
@@ -414,17 +474,9 @@ func TestPrepareSnapshotBundlePlanFlattensOnlyReachableSources(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		inner, err := snapshot.BuildZIP(map[string][]byte{
-			"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		rootRef, path, err := sink.AbsorbBundle(context.Background(),
-			bytes.NewReader(bytes.Repeat([]byte{fill + 1}, 8192)), nil, bytes.NewReader(inner))
-		if err != nil {
-			t.Fatal(err)
-		}
+		rootRef, path := lifecycleBundleSnapshot(t, sink, directory,
+			bytes.Repeat([]byte{fill + 1}, 8192),
+			[]byte("version: 1\nsandbox_ref: manifest://"+strings.Repeat("a", 64)+"\n"))
 		if err := sink.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -453,13 +505,6 @@ func TestPrepareSnapshotBundlePlanFlattensOnlyReachableSources(t *testing.T) {
 	sandboxCfg := &config.SandboxConfig{}
 	sandboxCfg.Resources.Capacity.Memory = "8KiB"
 	sandboxCfg.Boot.Root.Overlay = &config.OverlayConfig{}
-	sandboxCfg.SnapshotProvenance = config.SnapshotProvenance{
-		ParentSnapshotRef: parentRoot,
-		ParentOverlayBase: layerB,
-		BundleSource: &config.BundleSourceProvenance{
-			RootRef: parentPhysical, RootPath: parentPath, Refs: opened.BundleReader().Refs(),
-		},
-	}
 	childCfg := *manifestCfg
 	childCfg.Manifest.WriteGeneration = "G2"
 	admission, err := childCfg.WriteAdmission(context.Background())
@@ -468,7 +513,17 @@ func TestPrepareSnapshotBundlePlanFlattensOnlyReachableSources(t *testing.T) {
 	}
 	childDir := t.TempDir()
 	plan, err := prepareSnapshotBundlePlan(context.Background(), RunOptions{
-		Cfg: sandboxCfg, ManifestCfg: &childCfg, Fetcher: opened.ScopedFetcher(),
+		Cfg: sandboxCfg,
+		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{
+			Root: config.PortableRootConfig{Base: "self", BaseFromRefs: []string{layerB}},
+		}},
+		MemoryBinding: &MemorySourceBinding{
+			SnapshotRef: parentRoot,
+			BundleSource: &BundleSourceBinding{
+				RootRef: parentPhysical, RootPath: parentPath, Refs: opened.BundleReader().Refs(),
+			},
+		},
+		ManifestCfg: &childCfg, Fetcher: opened.ScopedFetcher(),
 		BundleReader: opened.BundleReader(), BundleFetcher: opened.ManifestFetcher(),
 		RefLocations: locations, CustomerKeyFn: keyFn,
 	}, []string{parentRoot}, []bool{false}, childDir, admission)
@@ -476,28 +531,31 @@ func TestPrepareSnapshotBundlePlanFlattensOnlyReachableSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Close()
-	want := []string{parentPhysical, refB}
-	if got := plan.Refs(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("flattened refs = %v, want %v", got, want)
+	if got := plan.Refs(); len(got) != 0 {
+		t.Fatalf("materialized plan has external refs: %v", got)
 	}
-	if _, err := os.Stat(filepath.Join(childDir, filepath.Base(parentPath))); err != nil {
-		t.Fatalf("direct local parent was not prepared as sibling: %v", err)
+	sink, err := snapshot.NewPlannedBundleSink(childDir, "materialized", &childCfg, keyFn, admission, nil, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if slices.Contains(plan.Refs(), refA) {
-		t.Fatal("unreachable historical Bundle source remained in the new refs")
+	defer sink.Close()
+	replacements, err := plan.Ingest(context.Background(), sink, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacements[parentRoot] == "" || replacements[layerB] == "" {
+		t.Fatalf("reachable dependencies were not materialized: %v", replacements)
+	}
+	if _, retained := replacements[refA]; retained {
+		t.Fatal("unreachable historical Bundle source was materialized")
 	}
 }
 
 func TestPrepareSnapshotBundlePlanIngestsTarstreamParentIntoCurrentAdmission(t *testing.T) {
 	parentDir := t.TempDir()
-	inner, err := snapshot.BuildZIP(map[string][]byte{
-		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	parentRef, parentPath, err := snapshot.NewFileSink(parentDir, "tar-parent", nil, false, nil).AbsorbBundle(
-		context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x56}, 8192)), nil, bytes.NewReader(inner))
+	snapshotConfig := []byte("version: 1\nsandbox_ref: manifest://" + strings.Repeat("a", 64) + "\n")
+	parentRef, parentPath, err := snapshot.NewFileSink(parentDir, "tar-parent", nil, false, nil).AbsorbSnapshot(
+		context.Background(), lifecycleSnapshotSource(t, bytes.Repeat([]byte{0x56}, 8192), snapshotConfig))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -515,12 +573,16 @@ func TestPrepareSnapshotBundlePlanIngestsTarstreamParentIntoCurrentAdmission(t *
 	sandboxCfg := &config.SandboxConfig{}
 	sandboxCfg.Resources.Capacity.Memory = "8KiB"
 	sandboxCfg.Boot.Root.Overlay = &config.OverlayConfig{}
-	sandboxCfg.SnapshotProvenance = config.SnapshotProvenance{
-		ParentSnapshotRef: parentRef, ParentSnapshotPath: parentPath,
-	}
 	outputDir := t.TempDir()
 	plan, err := prepareSnapshotBundlePlan(context.Background(), RunOptions{
-		Cfg: sandboxCfg, ManifestCfg: manifestCfg, CustomerKeyFn: keyFn,
+		Cfg: sandboxCfg,
+		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{
+			Root: config.PortableRootConfig{Base: "self"},
+		}},
+		MemoryBinding: &MemorySourceBinding{
+			SnapshotRef: parentRef, RuntimeRef: parentRef, RelativeDir: filepath.Dir(parentPath),
+		},
+		ManifestCfg: manifestCfg, CustomerKeyFn: keyFn,
 	}, []string{parentRef}, []bool{false}, outputDir, admission)
 	if err != nil {
 		t.Fatal(err)
@@ -542,11 +604,8 @@ func TestPrepareSnapshotBundlePlanIngestsTarstreamParentIntoCurrentAdmission(t *
 	if err != nil {
 		t.Fatalf("tarstream replacement = %q: %v", importedRef, err)
 	}
-	_, childPath, err := sink.AbsorbBundle(context.Background(),
-		bytes.NewReader(bytes.Repeat([]byte{0x57}, 8192)), nil, bytes.NewReader(inner))
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, childPath := lifecycleBundleSnapshot(t, sink, outputDir,
+		bytes.Repeat([]byte{0x57}, 8192), snapshotConfig)
 	if err := sink.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -577,16 +636,8 @@ func TestColdDiskOpenerAutoDetectsBundleSelector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inner, err := snapshot.BuildZIP(map[string][]byte{
-		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, bundlePath, err := sink.AbsorbBundle(context.Background(), bytes.NewReader(make([]byte, 8192)), nil, bytes.NewReader(inner))
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, bundlePath := lifecycleBundleSnapshot(t, sink, directory, make([]byte, 8192),
+		[]byte("version: 1\nsandbox_ref: manifest://"+strings.Repeat("a", 64)+"\n"))
 	if err := sink.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -624,15 +675,28 @@ func TestColdDiskOpenerAutoDetectsBundleSelector(t *testing.T) {
 	}
 }
 
-func TestHandleSnapshotRequestRejectsMergedLocalLowerBeforeQuiesce(t *testing.T) {
+func TestHandleSnapshotRequestRejectsMissingLocalMemoryLowerBeforeQuiesce(t *testing.T) {
 	dir := t.TempDir()
-	parentPath, parentScheme, parentDigest := writeDiskArtifact(t, dir, "snapshot", make([]byte, 4096), nil)
-	cfg := &config.SandboxConfig{}
-	cfg.SnapshotProvenance = config.SnapshotProvenance{
-		ParentSnapshotRef:  fileRef(parentPath, parentScheme, parentDigest),
-		ParentSnapshotPath: parentPath,
-		ParentFromRefs:     []string{"file://base.snapshot"},
+	parentCfg, err := snapshot.MarshalConfig(&snapshot.Config{
+		Version:    snapshot.SnapshotConfigVersion,
+		SandboxRef: "manifest://" + strings.Repeat("9", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	parentSource, err := snapshotfile.BuildSource(
+		sparse.Dense(bytes.NewReader(make([]byte, 4096)), 4096),
+		[]byte("{}"), []byte("{}"), parentCfg,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentRef, parentPath, err := snapshot.NewFileSink(dir, "parent", nil, false, nil).
+		AbsorbSnapshot(context.Background(), parentSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.SandboxConfig{}
 	mfd, err := memory.Create("portable-chain-preflight", 4096)
 	if err != nil {
 		t.Fatal(err)
@@ -643,8 +707,13 @@ func TestHandleSnapshotRequestRejectsMergedLocalLowerBeforeQuiesce(t *testing.T)
 		Client: &guestlink.HostClient{BasePath: filepath.Join(dir, "must-not-dial.sock")},
 	}
 
-	_, err = handleSnapshotRequest(ctl.Request{Upload: true}, RunOptions{
-		Cfg:         cfg,
+	_, err = handleSnapshotRequest(context.Background(), ctl.Request{Upload: true}, RunOptions{
+		Cfg:            cfg,
+		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{Root: config.PortableRootConfig{Base: "self"}}},
+		MemoryBinding: &MemorySourceBinding{
+			SnapshotRef: parentRef, RuntimeRef: parentRef, RelativeDir: filepath.Dir(parentPath),
+			FromRefs: []string{"file://base.snapshot"},
+		},
 		SandboxID:   "test",
 		ManifestCfg: &config.ManifestConfig{Store: manifest.StoreConfig{Endpoint: "unused"}},
 	}, mfd, []SnapDiskRef{{
@@ -655,7 +724,7 @@ func TestHandleSnapshotRequestRejectsMergedLocalLowerBeforeQuiesce(t *testing.T)
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		},
 	}}, nil, "", filepath.Join(dir, "run"), "", nil, pinger, nil, nil, nil, discardLogf)
-	if err == nil || !strings.Contains(err.Error(), "direct upload would retain a local memory lower") {
+	if err == nil || !strings.Contains(err.Error(), "open memory Snapshot file://base.snapshot") {
 		t.Fatalf("local lower preflight error = %v", err)
 	}
 	if viewCalled {
@@ -668,19 +737,408 @@ func TestHandleSnapshotRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T
 		Client: &guestlink.HostClient{BasePath: filepath.Join(t.TempDir(), "must-not-dial.sock")},
 	}
 	baseCfg := &config.SandboxConfig{}
-	baseOpts := RunOptions{Cfg: baseCfg, SandboxID: "test"}
+	baseOpts := RunOptions{
+		Cfg: baseCfg, SandboxID: "test",
+		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{Root: config.PortableRootConfig{Base: "self"}}},
+	}
 	disks := []SnapDiskRef{{DiffPath: filepath.Join(t.TempDir(), "not-needed.diff")}}
 
-	_, err := handleSnapshotRequest(ctl.Request{}, baseOpts, nil, disks, nil,
+	_, err := handleSnapshotRequest(context.Background(), ctl.Request{}, baseOpts, nil, disks, nil,
 		"", t.TempDir(), "", nil, pinger, nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "--output and --upload") {
 		t.Fatalf("missing output error = %v", err)
 	}
 
-	_, err = handleSnapshotRequest(ctl.Request{Upload: true}, baseOpts, nil, disks, nil,
+	_, err = handleSnapshotRequest(context.Background(), ctl.Request{Upload: true}, baseOpts, nil, disks, nil,
 		"", t.TempDir(), "", nil, pinger, nil, nil, nil, discardLogf)
 	if err == nil || !strings.Contains(err.Error(), "manifest") {
 		t.Fatalf("missing manifest config error = %v", err)
+	}
+}
+
+func TestHandleExportRequestResumeUsesExportFreezeWindow(t *testing.T) {
+	dir := t.TempDir()
+	guestSock := filepath.Join(dir, "guest.sock")
+	events := &lifecycleEvents{}
+	guestDone := serveOneQuiesce(t, guestSock, func(request *proto.Message) error {
+		events.add("guest-quiesce")
+		if !request.SkipDropCaches {
+			return errors.New("export quiesce did not force skip_drop_caches")
+		}
+		return nil
+	})
+
+	resumeSeen := atomic.Bool{}
+	chSock, chRequests := serveLifecycleCH(t, dir, func(path string) int {
+		events.add("ch:" + path)
+		if path == "/api/v1/vm.resume" {
+			resumeSeen.Store(true)
+		}
+		if path == "/api/v1/vm.snapshot" {
+			return http.StatusInternalServerError
+		}
+		return http.StatusNoContent
+	})
+
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	if err := portable.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c0Before, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwarder := NewForwarder("", discardLogf)
+	viewCalls := 0
+	reattachCalls := 0
+	outputDir := filepath.Join(dir, "output")
+	resp, err := handleExportRequest(
+		context.Background(),
+		ctl.Request{OutDir: outputDir, ResumeAfter: true},
+		RunOptions{Cfg: &config.SandboxConfig{}, PortableConfig: portable, SandboxID: "test"},
+		[]SnapDiskRef{{
+			Size: 4096,
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				viewCalls++
+				forwarder.mu.Lock()
+				gated := forwarder.quiescing
+				forwarder.mu.Unlock()
+				if !gated {
+					return nil, nil, errors.New("SnapshotView opened before forward gate")
+				}
+				events.add("view")
+				return bytes.NewReader(bytes.Repeat([]byte{0x51}, 4096)), nil, nil
+			},
+		}},
+		nil,
+		chSock,
+		filepath.Join(dir, "run"),
+		"",
+		nil,
+		&guestlink.Pinger{Client: &guestlink.HostClient{BasePath: guestSock}},
+		forwarder,
+		func() error {
+			reattachCalls++
+			if !resumeSeen.Load() {
+				return errors.New("reattach ran before CH resume")
+			}
+			events.add("reattach")
+			return nil
+		},
+		nil,
+		discardLogf,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if guestErr := waitLifecycleResult(t, guestDone); guestErr != nil {
+		t.Fatal(guestErr)
+	}
+	requests := chRequests()
+	if got, want := strings.Join(requests, ","), "/api/v1/vm.pause,/api/v1/vm.resume"; got != want {
+		t.Fatalf("CH requests = %q, want %q", got, want)
+	}
+	if viewCalls != 1 {
+		t.Fatalf("SnapshotView calls = %d, want 1", viewCalls)
+	}
+	if reattachCalls != 1 {
+		t.Fatalf("reattach calls = %d, want 1", reattachCalls)
+	}
+	if got, want := strings.Join(events.snapshot(), ","), "guest-quiesce,ch:/api/v1/vm.pause,view,ch:/api/v1/vm.resume,reattach"; got != want {
+		t.Fatalf("export order = %q, want %q", got, want)
+	}
+	forwarder.mu.Lock()
+	stillGated := forwarder.quiescing
+	forwarder.mu.Unlock()
+	if stillGated {
+		t.Fatal("forwarder remained gated after export --resume")
+	}
+	c0After, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(c0Before, c0After) {
+		t.Fatal("live export mutated immutable C0")
+	}
+	if resp.SandboxPath == "" || resp.SandboxRef == "" {
+		t.Fatalf("export response = %+v", resp)
+	}
+	alias, err := os.Readlink(filepath.Join(outputDir, "test.sandbox"))
+	if err != nil {
+		t.Fatalf("read committed Sandbox alias: %v", err)
+	}
+	if alias != filepath.Base(resp.SandboxPath) {
+		t.Fatalf("Sandbox alias = %q, want %q", alias, filepath.Base(resp.SandboxPath))
+	}
+}
+
+func TestHandleExportRequestResumeReportsReattachFailure(t *testing.T) {
+	dir := t.TempDir()
+	guestSock := filepath.Join(dir, "guest.sock")
+	guestDone := serveOneQuiesce(t, guestSock, nil)
+	chSock, chRequests := serveLifecycleCH(t, dir, func(string) int { return http.StatusNoContent })
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	if err := portable.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	forwarder := NewForwarder("", discardLogf)
+	outputDir := filepath.Join(dir, "output")
+	_, err := handleExportRequest(
+		context.Background(),
+		ctl.Request{OutDir: outputDir, ResumeAfter: true},
+		RunOptions{Cfg: &config.SandboxConfig{}, PortableConfig: portable, SandboxID: "test"},
+		[]SnapDiskRef{{
+			Size: 4096,
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				return bytes.NewReader(bytes.Repeat([]byte{0x52}, 4096)), nil, nil
+			},
+		}},
+		nil, chSock, filepath.Join(dir, "run"), "", nil,
+		&guestlink.Pinger{Client: &guestlink.HostClient{BasePath: guestSock}},
+		forwarder,
+		func() error { return errors.New("injected resumed export reattach failure") },
+		nil, discardLogf,
+	)
+	if err == nil || !strings.Contains(err.Error(), "injected resumed export reattach failure") {
+		t.Fatalf("export resume error = %v", err)
+	}
+	if guestErr := waitLifecycleResult(t, guestDone); guestErr != nil {
+		t.Fatal(guestErr)
+	}
+	if got, want := strings.Join(chRequests(), ","), "/api/v1/vm.pause,/api/v1/vm.resume"; got != want {
+		t.Fatalf("CH requests = %q, want %q", got, want)
+	}
+	forwarder.mu.Lock()
+	stillGated := forwarder.quiescing
+	forwarder.mu.Unlock()
+	if stillGated {
+		t.Fatal("forwarder remained gated after reattach failure")
+	}
+	if _, statErr := os.Lstat(filepath.Join(outputDir, "test.sandbox")); statErr != nil {
+		t.Fatalf("committed export artifact was lost after recovery failure: %v", statErr)
+	}
+}
+
+func TestHandleExportRequestFailureResumesBeforeReattachAndDoesNotCommitAlias(t *testing.T) {
+	dir := t.TempDir()
+	guestSock := filepath.Join(dir, "guest.sock")
+	guestDone := serveOneQuiesce(t, guestSock, nil)
+	var resumed atomic.Bool
+	chSock, chRequests := serveLifecycleCH(t, dir, func(path string) int {
+		if path == "/api/v1/vm.resume" {
+			resumed.Store(true)
+		}
+		if path == "/api/v1/vm.snapshot" {
+			return http.StatusInternalServerError
+		}
+		return http.StatusNoContent
+	})
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	if err := portable.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	forwarder := NewForwarder("", discardLogf)
+	outputDir := filepath.Join(dir, "output")
+	reattachCalls := 0
+	_, err := handleExportRequest(
+		context.Background(),
+		ctl.Request{OutDir: outputDir},
+		RunOptions{Cfg: &config.SandboxConfig{}, PortableConfig: portable, SandboxID: "test"},
+		[]SnapDiskRef{{
+			Size: 4096,
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				return nil, nil, errors.New("injected disk capture failure")
+			},
+		}},
+		nil,
+		chSock,
+		filepath.Join(dir, "run"),
+		"",
+		nil,
+		&guestlink.Pinger{Client: &guestlink.HostClient{BasePath: guestSock}},
+		forwarder,
+		func() error {
+			reattachCalls++
+			if !resumed.Load() {
+				return errors.New("reattach ran before CH resume")
+			}
+			return errors.New("injected export reattach failure")
+		},
+		nil,
+		discardLogf,
+	)
+	if err == nil || !strings.Contains(err.Error(), "injected disk capture failure") ||
+		!strings.Contains(err.Error(), "injected export reattach failure") {
+		t.Fatalf("export error = %v", err)
+	}
+	if guestErr := waitLifecycleResult(t, guestDone); guestErr != nil {
+		t.Fatal(guestErr)
+	}
+	if got, want := strings.Join(chRequests(), ","), "/api/v1/vm.pause,/api/v1/vm.resume"; got != want {
+		t.Fatalf("CH requests = %q, want %q", got, want)
+	}
+	if !resumed.Load() || reattachCalls != 1 {
+		t.Fatalf("failure recovery resumed=%v reattach_calls=%d", resumed.Load(), reattachCalls)
+	}
+	forwarder.mu.Lock()
+	stillGated := forwarder.quiescing
+	forwarder.mu.Unlock()
+	if stillGated {
+		t.Fatal("forwarder remained gated after failed export")
+	}
+	if _, statErr := os.Lstat(filepath.Join(outputDir, "test.sandbox")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("failed export committed root alias: %v", statErr)
+	}
+}
+
+func TestHandleExportRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T) {
+	dir := t.TempDir()
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	viewCalled := false
+	disks := []SnapDiskRef{{Size: 4096, SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+		viewCalled = true
+		return bytes.NewReader(make([]byte, 4096)), nil, nil
+	}}}
+	pinger := &guestlink.Pinger{Client: &guestlink.HostClient{BasePath: filepath.Join(dir, "must-not-dial.sock")}}
+	opts := RunOptions{Cfg: &config.SandboxConfig{}, PortableConfig: portable, SandboxID: "test"}
+
+	_, err := handleExportRequest(context.Background(), ctl.Request{}, opts, disks, nil,
+		filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"), "", nil,
+		pinger, nil, nil, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "--output and --upload") {
+		t.Fatalf("missing output error = %v", err)
+	}
+	if viewCalled {
+		t.Fatal("predictable export error opened SnapshotView")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = handleExportRequest(ctx, ctl.Request{OutDir: filepath.Join(dir, "output")}, opts, disks, nil,
+		filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"), "", nil,
+		pinger, nil, nil, nil, discardLogf)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled export error = %v, want context.Canceled", err)
+	}
+	if viewCalled {
+		t.Fatal("canceled export opened SnapshotView")
+	}
+}
+
+type lifecycleEvents struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (e *lifecycleEvents) add(event string) {
+	e.mu.Lock()
+	e.events = append(e.events, event)
+	e.mu.Unlock()
+}
+
+func (e *lifecycleEvents) snapshot() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.events...)
+}
+
+func serveOneQuiesce(t *testing.T, path string, validate func(*proto.Message) error) <-chan error {
+	t.Helper()
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			done <- acceptErr
+			return
+		}
+		defer conn.Close()
+		line := make([]byte, len(proto.HostConnectLine))
+		if _, readErr := io.ReadFull(conn, line); readErr != nil {
+			done <- readErr
+			return
+		}
+		if !bytes.Equal(line, proto.HostConnectLine) {
+			done <- fmt.Errorf("CONNECT line = %q", line)
+			return
+		}
+		if _, writeErr := conn.Write([]byte("OK 1\n")); writeErr != nil {
+			done <- writeErr
+			return
+		}
+		request, readErr := proto.ReadMessage(conn)
+		if readErr != nil {
+			done <- readErr
+			return
+		}
+		if request.Type != proto.TypeQuiesce {
+			done <- fmt.Errorf("guest request = %q, want %q", request.Type, proto.TypeQuiesce)
+			return
+		}
+		if validate != nil {
+			if validateErr := validate(request); validateErr != nil {
+				done <- validateErr
+				return
+			}
+		}
+		done <- proto.WriteMessage(conn, &proto.Message{
+			Type: proto.TypeQuiesced, DropCachesResult: proto.DropCachesSkipped,
+		})
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+	return done
+}
+
+func serveLifecycleCH(t *testing.T, dir string, status func(string) int) (string, func() []string) {
+	t.Helper()
+	sock := filepath.Join(dir, "ch.sock")
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var requests []string
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		requests = append(requests, request.URL.Path)
+		mu.Unlock()
+		code := http.StatusNoContent
+		if status != nil {
+			code = status(request.URL.Path)
+		}
+		w.WriteHeader(code)
+	})}
+	done := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-done
+	})
+	return sock, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), requests...)
+	}
+}
+
+func waitLifecycleResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for lifecycle test peer")
+		return nil
 	}
 }
 
@@ -689,11 +1147,7 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 	diff := filepath.Join(dir, "must-not-be-opened.diff")
 	digest := strings.Repeat("0", 64)
 	cfg := &config.SandboxConfig{}
-	cfg.SnapshotProvenance = config.SnapshotProvenance{
-		ParentSnapshotRef: "file://base.snapshot@sha256:" + digest,
-		ParentOverlayBase: "file://base.overlay@sha256:" + digest,
-		ParentOverlayPath: filepath.Join(dir, "missing.overlay"),
-	}
+	parentRef := "file://base.overlay@sha256:" + digest
 	pinger := &guestlink.Pinger{
 		Client: &guestlink.HostClient{BasePath: filepath.Join(dir, "must-not-dial.sock")},
 	}
@@ -701,7 +1155,13 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 	req := ctl.Request{OutDir: filepath.Join(dir, "out"), MergeRef: &mergeRef}
 	viewCalled := false
 
-	_, err := handleSnapshotRequest(req, RunOptions{Cfg: cfg, SandboxID: "test"}, nil,
+	_, err := handleSnapshotRequest(context.Background(), req, RunOptions{
+		Cfg: cfg, SandboxID: "test",
+		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{Root: config.PortableRootConfig{Base: "self"}}},
+		SourceBinding: &RunSourceBinding{
+			SandboxRef: parentRef, RuntimeRef: parentRef, RelativeDir: dir,
+		},
+	}, nil,
 		[]SnapDiskRef{{
 			DiffPath: diff,
 			Size:     4096,
@@ -724,10 +1184,11 @@ func TestHandleSnapshotRequestResolvesUploadKeyBeforeSnapshotView(t *testing.T) 
 	cfg := &config.SandboxConfig{}
 	viewCalled := false
 	keyCalls := 0
-	_, err := handleSnapshotRequest(ctl.Request{Upload: true}, RunOptions{
-		Cfg:         cfg,
-		SandboxID:   "test",
-		ManifestCfg: &config.ManifestConfig{Store: manifest.StoreConfig{Endpoint: "unused"}},
+	_, err := handleSnapshotRequest(context.Background(), ctl.Request{Upload: true}, RunOptions{
+		Cfg:            cfg,
+		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{Root: config.PortableRootConfig{Base: "self"}}},
+		SandboxID:      "test",
+		ManifestCfg:    &config.ManifestConfig{Store: manifest.StoreConfig{Endpoint: "unused"}},
 		CustomerKeyFn: func() ([32]byte, error) {
 			keyCalls++
 			return [32]byte{}, errors.New("invalid customer key")
@@ -845,9 +1306,15 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 	defer mfd.Close()
 	reattachCalls := 0
 	reattachedAfterResume := false
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	if err := portable.Validate(); err != nil {
+		t.Fatal(err)
+	}
 	_, err = handleSnapshotRequest(
+		context.Background(),
 		ctl.Request{OutDir: filepath.Join(dir, "out")},
-		RunOptions{Cfg: &config.SandboxConfig{}, SandboxID: "test"},
+		RunOptions{Cfg: &config.SandboxConfig{}, PortableConfig: portable, SandboxID: "test"},
 		mfd,
 		[]SnapDiskRef{{
 			DiffPath: filepath.Join(dir, "diff"),
@@ -869,13 +1336,14 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 				return errors.New("reattach ran before VM resume")
 			}
 			reattachedAfterResume = true
-			return nil
+			return errors.New("injected snapshot reattach failure")
 		},
 		nil,
 		discardLogf,
 	)
-	if err == nil || !strings.Contains(err.Error(), "CH snapshot") {
-		t.Fatalf("snapshot error = %v, want CH snapshot failure", err)
+	if err == nil || !strings.Contains(err.Error(), "CH snapshot") ||
+		!strings.Contains(err.Error(), "injected snapshot reattach failure") {
+		t.Fatalf("snapshot error = %v, want CH snapshot and reattach failures", err)
 	}
 	if guestErr := <-guestDone; guestErr != nil {
 		t.Fatal(guestErr)
@@ -899,6 +1367,91 @@ func TestHandleSnapshotRequestReattachesGuestAfterTakeFailure(t *testing.T) {
 		t.Fatal(readErr)
 	} else if string(value) != "234881024\n" {
 		t.Fatalf("memory.high = %q after failed snapshot, want original value", value)
+	}
+}
+
+func snapshotTestPortable(t *testing.T) *config.PortableSandboxConfig {
+	t.Helper()
+	key := strings.Repeat("a", 64)
+	cfg := &config.PortableSandboxConfig{
+		Version: 1,
+		Resources: config.PortableResourcesConfig{
+			Capacity:    config.CapacityConfig{CPU: 1, Memory: "1GiB"},
+			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "1GiB"},
+		},
+		Boot: config.PortableBootConfig{
+			Kernel: "file://kernel@sha256:" + key, Runtime: "file://runtime@sha256:" + key,
+			Root: config.PortableRootConfig{Base: "file://base@sha256:" + key, Overlay: &config.PortableOverlayConfig{Base: "self"}},
+		},
+		Launch: config.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func TestMergeBaseOpenersExcludeSandboxAndSnapshotZIPTails(t *testing.T) {
+	testRef := func(raw, path string) string {
+		t.Helper()
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref.Path = path
+		return ref.String()
+	}
+	directory := t.TempDir()
+	sink := snapshot.NewFileSink(directory, "merge-openers", nil, false, nil)
+
+	portableBytes, err := config.MarshalPortableSandboxConfig(snapshotTestPortable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskBytes := bytes.Repeat([]byte{0x61}, 8192)
+	diskSource, err := sandboxfile.BuildSource(sparse.Dense(bytes.NewReader(diskBytes), uint64(len(diskBytes))), nil, portableBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskRef, diskPath, err := sink.AbsorbSandbox(context.Background(), diskSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskStream, err := newDiskMergeBaseOpener(RunOptions{})(context.Background(), testRef(diskRef, diskPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer diskStream.Close()
+	if diskStream.Size() != uint64(len(diskBytes)) {
+		t.Fatalf("disk merge source size=%d, want payload %d", diskStream.Size(), len(diskBytes))
+	}
+
+	snapshotCfg, err := snapshot.MarshalConfig(&snapshot.Config{
+		Version:    snapshot.SnapshotConfigVersion,
+		SandboxRef: "manifest://" + strings.Repeat("b", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoryBytes := bytes.Repeat([]byte{0x71}, 4096)
+	memorySource, err := snapshotfile.BuildSource(
+		sparse.Dense(bytes.NewReader(memoryBytes), uint64(len(memoryBytes))),
+		[]byte("{}"), []byte("{}"), snapshotCfg,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoryRef, memoryPath, err := sink.AbsorbSnapshot(context.Background(), memorySource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoryStream, err := newMemoryMergeBaseOpener(RunOptions{})(context.Background(), testRef(memoryRef, memoryPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer memoryStream.Close()
+	if memoryStream.Size() != uint64(len(memoryBytes)) {
+		t.Fatalf("memory merge source size=%d, want payload %d", memoryStream.Size(), len(memoryBytes))
 	}
 }
 

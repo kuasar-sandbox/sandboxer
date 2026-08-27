@@ -17,9 +17,9 @@ node proxy 在完成远程 exec 鉴权后接入现有 exec/MUX 链路。资源�
 
 | 路径 | 角色 |
 |---|---|
-| `cmd/sandbox-ctl` | host 控制平面:`run`(恢复 = `run --restore`)/ `snapshot` / `exec` / `config` / `info` / `upload-snapshot` |
+| `cmd/sandbox-ctl` | host 控制平面:`run --config/--from/--restore` / `export` / `snapshot` / `publish` / `info` / `exec` / `config` |
 | `cmd/sandbox-init` | guest PID 1:三阶段 init + vsock 控制面 + 应用监督;由 `guest-runtime` 打包进 `sandbox-runtime.bundle` |
-| `pkg/sandbox` `pkg/restore` `pkg/snapshot` | 生命周期编排:冷启动 / 恢复 / 快照(含增量分层链) |
+| `pkg/sandbox` `pkg/restore` `pkg/snapshot` | 生命周期编排:显式/E冷启动、E/S同点快照、memory恢复与独立disk/memory provenance |
 | `pkg/uffd` `pkg/memory` | uffd handler 与 memfd 统一内存所有权(懒加载) |
 | `pkg/vhost` | vhost-user-blk 后端(file / manifest 块源 + CoW diff) |
 | `pkg/{guestlink,mux,proto,fwd,stdio}` | host↔guest vsock 控制面、stdio MUX 与端口转发 |
@@ -68,8 +68,8 @@ guest-runtime 构建 runtime 镜像和 build sandbox 内展平镜像时使用的
 
 ## 文档
 
-- [docs/sandbox.md](docs/sandbox.md) — host 控制平面:`sandbox-ctl` 命令行、
-  sandbox.yaml、冷启动/快照/恢复数据流、uffd handler、资源模型。
+- [docs/sandbox.md](docs/sandbox.md) — host 控制平面、PortableSandboxConfig、
+  `.overlay`/Sandbox E/Snapshot S、carrier、export/snapshot/restore/publish与资源模型。
 - [docs/sandbox-init.md](docs/sandbox-init.md) — guest PID 1 ABI:
   `sandbox-init` 三阶段、vsock 控制面 + stdio MUX 协议、应用契约。
 - [docs/cloud-hypervisor.md](docs/cloud-hypervisor.md) — patched CH 与

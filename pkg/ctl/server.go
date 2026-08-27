@@ -20,6 +20,7 @@ type Server struct {
 	// SnapshotHandler services a snapshot_request: it returns the
 	// response and the server writes it back, then closes the conn.
 	SnapshotHandler func(req Request) (Response, error)
+	ExportHandler   func(req Request) (Response, error)
 
 	// ExecHandler services an exec_request. It takes ownership of conn
 	// (including its lifetime): it writes the ctl exec_ack / error
@@ -121,6 +122,23 @@ func (s *Server) handle(conn *net.UnixConn) {
 		resp.Type = TypeSnapshotDone
 		if err := WriteMessage(conn, resp); err != nil {
 			s.Logf("ctl.sock: write resp: %v", err)
+		}
+		return
+
+	case TypeExportRequest:
+		defer conn.Close()
+		if s.ExportHandler == nil {
+			_ = WriteMessage(conn, Response{Type: TypeError, Msg: "export not supported"})
+			return
+		}
+		resp, err := s.ExportHandler(req)
+		if err != nil {
+			_ = WriteMessage(conn, Response{Type: TypeError, Msg: err.Error()})
+			return
+		}
+		resp.Type = TypeExportDone
+		if err := WriteMessage(conn, resp); err != nil {
+			s.Logf("ctl.sock: write export resp: %v", err)
 		}
 		return
 

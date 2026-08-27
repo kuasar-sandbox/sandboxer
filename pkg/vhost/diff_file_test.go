@@ -702,6 +702,57 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 	}
 }
 
+func TestValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t *testing.T) {
+	const size = 2 * cowBlockSize
+	ctx := context.Background()
+	dir := t.TempDir()
+	ext4 := make([]byte, size)
+	ext4[ext4MagicOffset], ext4[ext4MagicOffset+1] = 0x53, 0xef
+	plainPath := filepath.Join(dir, "plain.ext4")
+	writeSparseTemplate(t, plainPath, ext4, []sparse.Extent{{Offset: 1024, Size: 1024}})
+
+	if err := ValidateDiffTemplateExt4(ctx, plainPath, nil); err != nil {
+		t.Fatalf("validate plaintext template: %v", err)
+	}
+	if err := ValidateExistingDiffExt4(ctx, plainPath, nil,
+		WithDiffEncryption(testDiffKey(0x81), true)); !errors.Is(err, ErrDiffPlaintextForbidden) {
+		t.Fatalf("required policy error = %v, want ErrDiffPlaintextForbidden", err)
+	}
+
+	key := testDiffKey(0x82)
+	encryptedPath := filepath.Join(dir, "encrypted.diff")
+	cow, err := OpenBlockCOW(encryptedPath, nil,
+		DiffInit{TemplatePath: plainPath}, WithDiffEncryption(key, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cow.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateExistingDiffExt4(ctx, encryptedPath, nil,
+		WithDiffEncryption(key, true)); err != nil {
+		t.Fatalf("validate encrypted active diff: %v", err)
+	}
+
+	holeTemplate := filepath.Join(dir, "upper-delta")
+	upper := make([]byte, size)
+	upper[cowBlockSize] = 0x7a
+	writeSparseTemplate(t, holeTemplate, upper,
+		[]sparse.Extent{{Offset: cowBlockSize, Size: 1}})
+	if err := ValidateDiffTemplateExt4(ctx, holeTemplate, &fakeReader{data: ext4}); err != nil {
+		t.Fatalf("validate template with base fallback: %v", err)
+	}
+
+	invalidPath := filepath.Join(dir, "invalid")
+	if err := os.WriteFile(invalidPath, make([]byte, size), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateExistingDiffExt4(ctx, invalidPath, nil); err == nil ||
+		!strings.Contains(err.Error(), "formatted ext4") {
+		t.Fatalf("invalid filesystem error = %v", err)
+	}
+}
+
 func TestEmptyPlaceholderConcurrentInitializationDoesNotReplaceWinner(t *testing.T) {
 	const size = 2 * cowBlockSize
 	dir := t.TempDir()

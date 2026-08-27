@@ -8,10 +8,12 @@
 // ctl.sock is a host-local UDS carrying host-side request types, not a
 // guest channel.
 //
-// Two request shapes:
+// Three request shapes:
 //
 //   - snapshot_request — one request, one response, conn closes. The
 //     run process handles it via Server.SnapshotHandler.
+//   - export_request — one request, one response, conn closes. It captures
+//     disk state only and never aliases snapshot_request.
 //   - exec_request — handshake (exec_request → exec_ack|error), then
 //     the SAME connection switches to the stdio MUX (pkg/mux)
 //     end-to-end between `sandbox-ctl exec` and the guest. The run
@@ -67,6 +69,11 @@ type Response struct {
 	SnapshotPath        string                 `json:"snapshot_path,omitempty"`
 	OverlayPath         string                 `json:"overlay_path,omitempty"`
 	OverlayRef          string                 `json:"overlay_ref,omitempty"`
+	SandboxManifestKey  string                 `json:"sandbox_manifest_key,omitempty"`
+	SandboxPath         string                 `json:"sandbox_path,omitempty"`
+	SandboxRef          string                 `json:"sandbox_ref,omitempty"`
+	DiskRefs            []string               `json:"disk_refs,omitempty"`
+	DiskPaths           []string               `json:"disk_paths,omitempty"`
 	DropCachesResult    proto.DropCachesResult `json:"drop_caches_result,omitempty"`
 
 	// exec_ack: the stdio channel set the guest actually established
@@ -109,6 +116,8 @@ func (r Request) SnapshotMode() (string, error) {
 const (
 	TypeSnapshotRequest = "snapshot_request"
 	TypeSnapshotDone    = "snapshot_done"
+	TypeExportRequest   = "export_request"
+	TypeExportDone      = "export_done"
 	TypeExecRequest     = "exec_request"
 	TypeExecAck         = "exec_ack"
 	TypeError           = "error"

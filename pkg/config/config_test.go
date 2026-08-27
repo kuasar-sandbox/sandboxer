@@ -951,6 +951,44 @@ func TestValidateRestoreHostConfigRejectsRelativeCgroupPath(t *testing.T) {
 	}
 }
 
+func TestValidateRestoreHostConfigRejectsColdOnlyInputBeforeArtifactOpen(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*SandboxConfig)
+		want   string
+	}{
+		{name: "files", mutate: func(cfg *SandboxConfig) {
+			cfg.Files = []FileConfig{{Path: "/etc/value", Content: "cold"}}
+		}, want: "files"},
+		{name: "ephemeral env", mutate: func(cfg *SandboxConfig) {
+			cfg.Launch.EphemeralEnv = map[string]string{"TOKEN": "secret"}
+		}, want: "launch"},
+		{name: "init", mutate: func(cfg *SandboxConfig) {
+			cfg.Init = []InitConfig{{Exec: "/bin/true"}}
+		}, want: "init"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &SandboxConfig{}
+			cfg.ApplyDefaults()
+			tc.mutate(cfg)
+			presence := FieldPresence{}
+			switch tc.name {
+			case "files":
+				presence.add("files")
+			case "ephemeral env":
+				presence.add("launch.ephemeral_env")
+			case "init":
+				presence.add("init")
+			}
+			err := cfg.ValidateRestoreHostConfigWithPresence(presence)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateRestoreHostConfig() error=%v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateRestoreHostConfigMemoryPolicy(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -252,7 +252,7 @@ func TestOpenMUXViaRestore(t *testing.T) {
 	})
 	defer proxy.close()
 
-	conn, spec, err := OpenMUXViaRestore(&HostClient{BasePath: base}, 3, nil, nil, 2*time.Second)
+	conn, spec, err := OpenMUXViaRestore(&HostClient{BasePath: base}, 3, nil, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestOpenMUXViaRestoreContextCancelsStalledAck(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		_, _, err := OpenMUXViaRestoreContext(ctx, &HostClient{BasePath: base}, 3, nil, nil, 24*time.Hour)
+		_, _, err := OpenMUXViaRestoreContext(ctx, &HostClient{BasePath: base}, 3, nil, 24*time.Hour)
 		errCh <- err
 	}()
 	select {
@@ -321,7 +321,7 @@ func TestOpenMUXViaRestore_RetriesTransientEOFBeforeRequest(t *testing.T) {
 	})
 	defer proxy.close()
 
-	conn, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 4, nil, nil, time.Second)
+	conn, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 4, nil, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,6 +331,41 @@ func TestOpenMUXViaRestore_RetriesTransientEOFBeforeRequest(t *testing.T) {
 	}
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("restore requests = %d, want exactly 1", got)
+	}
+}
+
+func TestOpenMUXViaAttachRetriesTransientEOFBeforeRequest(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+
+	var connects atomic.Uint32
+	var requests atomic.Uint32
+	proxy := newFakeCHProxyWithBeforeOK(t, base, func(net.Conn) bool {
+		return connects.Add(1) == 1
+	}, func(c net.Conn) {
+		req, err := proto.ReadMessage(c)
+		if err != nil {
+			t.Errorf("guest read: %v", err)
+			return
+		}
+		requests.Add(1)
+		if req.Type != proto.TypeAttach {
+			t.Errorf("request type = %q, want attach", req.Type)
+		}
+		_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeAttachAck, Epoch: req.Epoch})
+	})
+	defer proxy.close()
+
+	conn, _, err := OpenMUXViaAttach(&HostClient{BasePath: base, Logf: t.Logf}, 4, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if got := connects.Load(); got != 2 {
+		t.Fatalf("CONNECT attempts = %d, want 2", got)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("attach requests = %d, want exactly 1", got)
 	}
 }
 
@@ -352,7 +387,7 @@ func TestOpenMUXViaRestore_DoesNotRetryAfterRequest(t *testing.T) {
 	})
 	defer proxy.close()
 
-	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 5, nil, nil, time.Second)
+	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 5, nil, time.Second)
 	if err == nil || !strings.Contains(err.Error(), "read restore_ack") {
 		t.Fatalf("error = %v, want restore_ack read failure", err)
 	}
@@ -378,7 +413,7 @@ func TestOpenMUXViaRestore_TransientRetryIsBounded(t *testing.T) {
 	defer proxy.close()
 
 	started := time.Now()
-	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 6, nil, nil, 250*time.Millisecond)
+	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 6, nil, 250*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected bounded pre-request connect failure")
 	}
@@ -453,7 +488,7 @@ func TestOpenMUXViaRestore_DoesNotRetryNonTransientHandshakeError(t *testing.T) 
 	})
 	defer proxy.close()
 
-	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 7, nil, nil, time.Second)
+	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 7, nil, time.Second)
 	if err == nil || !strings.Contains(err.Error(), "OK line not terminated") {
 		t.Fatalf("error = %v, want non-transient handshake failure", err)
 	}

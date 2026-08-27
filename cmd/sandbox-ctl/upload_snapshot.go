@@ -10,31 +10,30 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
 
-// uploadSnapshotCmd implements the offline local-ref upgrader. It publishes a
-// local snapshot graph to manifest storage or one named file location, preserves
-// existing portable refs, and prints the canonical portable root ref.
-//
-//	sandbox-ctl upload-snapshot [--manifest-config <file>] [--ref-location name=file:///path ...] [--to-ref-location name=file:///path] [--quiet] <snapshot-path>
-func uploadSnapshotCmd(args []string) int {
-	fs := flag.NewFlagSet("upload-snapshot", flag.ContinueOnError)
+// publishCmd publishes either a strict Sandbox E or Snapshot S. The historical
+// upload-snapshot command calls the same implementation as a thin CLI alias.
+func publishCmd(args []string) int { return publishArtifactCmd("publish", args) }
+
+func uploadSnapshotCmd(args []string) int { return publishArtifactCmd("upload-snapshot", args) }
+
+func publishArtifactCmd(command string, args []string) int {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	manifestPath := fs.String("manifest-config", "", "storage config YAML (overrides MANIFEST_CONFIG env); $MANIFEST_KEY supplies the customer key")
-	toRefLocation := fs.String("to-ref-location", "", "publish local refs to name=file:///absolute/path")
+	toRefLocation := fs.String("to-ref-location", "", "publish to name=file:///absolute/path instead of the manifest store")
 	refLocations := config.RefLocations{}
-	fs.Var(refLocations, "ref-location", "trusted Bundle dependency location name=file:///absolute/path (repeatable)")
+	fs.Var(refLocations, "ref-location", "trusted input ref location name=file:///absolute/path (repeatable)")
 	quiet := fs.Bool("quiet", false, "suppress progress logs on stderr")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	path := fs.Arg(0)
-	if path == "" || fs.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl upload-snapshot [--manifest-config <file>] [--ref-location name=file:///path ...] [--to-ref-location name=file:///path] [--quiet] <snapshot-path>")
+	input := fs.Arg(0)
+	if input == "" || fs.NArg() != 1 {
+		fmt.Fprintf(os.Stderr, "usage: sandbox-ctl %s [--manifest-config <file> | --to-ref-location name=file:///path] [--ref-location name=file:///path ...] [--quiet] <artifact>\n", command)
 		return 2
 	}
-
-	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
+	logf := func(format string, values ...any) { fmt.Fprintf(os.Stderr, format+"\n", values...) }
 	if *quiet {
 		logf = func(string, ...any) {}
 	}
@@ -46,33 +45,36 @@ func uploadSnapshotCmd(args []string) int {
 		}
 		manifestCfg = nil
 	}
-	processStorage, err := artifact.NewProcessStorage(manifestCfg)
+	storage, err := artifact.NewProcessStorage(manifestCfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	defer processStorage.Close()
-	keyFn := processStorage.CustomerKeyFunc()
-	manifestFetcher := processStorage.Fetcher()
-	localCodec := processStorage.LocalCodec()
-	localRequired := processStorage.LocalRequired()
-	var ref string
-	if *toRefLocation != "" {
-		locations := config.RefLocations{}
-		if err := locations.Set(*toRefLocation); err != nil {
+	defer storage.Close()
+	var publisher *artifact.Publisher
+	if *toRefLocation == "" {
+		publisher, err = artifact.NewManifestPublisher(storage, manifestCfg, refLocations, logf)
+	} else {
+		targets := config.RefLocations{}
+		if err := targets.Set(*toRefLocation); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 2
 		}
-		for name, directory := range locations {
-			ref, err = restore.PublishLocalToLocation(context.Background(), path, name, directory, localCodec, localRequired, logf)
+		for name, directory := range targets {
+			refLocations[name] = directory
+			publisher, err = artifact.NewLocationPublisher(storage, name, directory, refLocations, logf)
 		}
-	} else {
-		ref, err = restore.UploadLocalWithLocations(context.Background(), path, manifestCfg, keyFn, manifestFetcher, refLocations, localCodec, localRequired, logf)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Println(ref) // manifest://<memKey>
+	result, publishErr := publisher.Publish(context.Background(), input)
+	closeErr := publisher.Close()
+	if err := errors.Join(publishErr, closeErr); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Println(result.Ref)
 	return 0
 }

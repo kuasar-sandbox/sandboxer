@@ -183,6 +183,23 @@ launch:
 EOF
 }
 
+write_restore_config() { # $1=path $2=cgroup $3=headroom $4=diff
+    local path="$1" cgroup="$2" headroom="$3" diff="$4"
+    cat > "$path" <<EOF
+resources:
+  capacity: { cpu: 1, memory: 8GiB }
+  allocatable: { cpu: 1, memory: $headroom, deflate_on_oom: true }
+  overhead: { memory: 32MiB }
+  watermark_high: { ratio: 0.875 }
+  control: { cgroup_path: $cgroup }
+boot:
+  kernel: file://$VMLINUX
+  runtime: file://$BIN/sandbox-runtime.bundle
+  root:
+    overlay: { diff: file://$diff, size: 1GiB }
+EOF
+}
+
 ready() { # $1=sid $2=pid $3=log
     local sid="$1" pid="$2" log="$3"
     for _ in $(seq 1 180); do
@@ -583,9 +600,9 @@ restore_case() { # $1=key $2=resident-floor-bytes
     mincore="$RESULT_ROOT/$key-restore.mincore"
     checksum="${CHECKSUMS[$key]}"
     make_diff "$diff"
-    # startup=64MiB is intentional: restore must ignore it and reserve/use the
-    # snapshot BudgetAtSnapshot instead.
-    write_config "$cfg" "$cgroup" "${HEADROOMS[$key]}" 64MiB "$diff"
+    # resources.startup is cold-only and therefore absent. Restore reserves the
+    # Snapshot's captured BudgetAtSnapshot before accepting new policy input.
+    write_restore_config "$cfg" "$cgroup" "${HEADROOMS[$key]}" "$diff"
 
     echo
     echo "==> restoring $key"

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // TestLoadImageConfig_RoundTrip writes a fake "erofs prefix + appended
@@ -74,5 +75,53 @@ func TestLoadImageConfig_FileMissing(t *testing.T) {
 	_, err := LoadImageConfig("/nonexistent/path.erofs")
 	if err == nil {
 		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestMaterializeImageDefaultsMakesPortableWorkloadSelfContained(t *testing.T) {
+	cfg := &config.SandboxConfig{
+		Launch: config.LaunchConfig{
+			Args: []string{"override"}, Env: map[string]string{"B": "host"},
+			EphemeralEnv: map[string]string{"SECRET": "once"},
+		},
+		Mounts: []config.MountConfig{{Target: "/explicit", Type: "tmpfs"}},
+	}
+	imageCfg := &ImageConfig{
+		Entrypoint: []string{"/entry", "fixed"}, Cmd: []string{"default"},
+		Env: []string{"A=image", "B=image"}, WorkingDir: "/work",
+		User: "1000:1000", StopSignal: "SIGQUIT",
+		Volumes: map[string]struct{}{"/volume": {}, "/explicit": {}},
+	}
+	if err := MaterializeImageDefaults(cfg, imageCfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Launch.Exec != "/entry" || !reflect.DeepEqual(cfg.Launch.Args, []string{"fixed", "override"}) {
+		t.Fatalf("materialized argv = %q %v", cfg.Launch.Exec, cfg.Launch.Args)
+	}
+	if !reflect.DeepEqual(cfg.Launch.Env, map[string]string{"A": "image", "B": "host"}) {
+		t.Fatalf("materialized env = %#v", cfg.Launch.Env)
+	}
+	if !reflect.DeepEqual(cfg.Launch.EphemeralEnv, map[string]string{"SECRET": "once"}) {
+		t.Fatalf("ephemeral env changed: %#v", cfg.Launch.EphemeralEnv)
+	}
+	if cfg.Launch.Workdir != "/work" || cfg.Launch.User != "1000:1000" || cfg.Launch.StopSignal != "3" {
+		t.Fatalf("materialized launch = %#v", cfg.Launch)
+	}
+	wantMounts := []config.MountConfig{
+		{Target: "/explicit", Type: "tmpfs"},
+		{Target: "/volume", Type: "empty"},
+	}
+	if !reflect.DeepEqual(cfg.Mounts, wantMounts) {
+		t.Fatalf("materialized mounts = %#v, want %#v", cfg.Mounts, wantMounts)
+	}
+
+	// Re-reading the same image during run --from must not change C0's
+	// persistent launch/mount projection.
+	firstLaunch, firstMounts := cfg.Launch, append([]config.MountConfig(nil), cfg.Mounts...)
+	if err := MaterializeImageDefaults(cfg, imageCfg); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cfg.Launch, firstLaunch) || !reflect.DeepEqual(cfg.Mounts, firstMounts) {
+		t.Fatalf("materialization is not idempotent: launch=%#v mounts=%#v", cfg.Launch, cfg.Mounts)
 	}
 }

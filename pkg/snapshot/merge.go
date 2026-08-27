@@ -162,7 +162,8 @@ func mergeStreamHoles(stream fetch.Stream, size uint64) ([]sparse.Extent, error)
 // mergeSparse flattens two adjacent sparse layers — top (this run's resident
 // delta) over base (the local parent snapshot this run was restored from) —
 // into a single layer, for the local "replace the next-newest layer" export
-// (docs/sandbox.md §3.5). It is the SAVE-side dual of fetch.Layered: at any
+// (docs/sandbox.md §11.1 and §12.2). It is the SAVE-side dual of
+// fetch.Layered: at any
 // offset top's byte wins where top is resident; where top is a hole, base's
 // byte shows through; where BOTH are holes the position stays a (merged) hole
 // that falls through to the parent's OWN from_refs / base_from_refs (the
@@ -174,9 +175,8 @@ func mergeStreamHoles(stream fetch.Stream, size uint64) ([]sparse.Extent, error)
 // Hole (no IsZero — that is a manifest-chunk concept), so a hole-intersection is
 // the complete merge rule.
 //
-// Returns a ReadSeeker over [0,size) plus the merged hole map. The result is
-// consumed by the existing sink (AbsorbBundle / AbsorbOverlay), which reads only
-// the non-hole data segments — so the merge stays sparse and the sink is unchanged.
+// Returns a ReadSeeker over [0,size) plus the merged hole map. ArtifactSink
+// consumes only non-hole data segments, so the merge remains sparse.
 func mergeSparse(top io.ReadSeeker, topHoles []sparse.Extent, base io.ReadSeeker, baseHoles []sparse.Extent, size int64) (io.ReadSeeker, []sparse.Extent) {
 	m := &mergedReadSeeker{top: top, topHoles: topHoles, base: base, baseHoles: baseHoles, size: size}
 	return m, holeIntersection(topHoles, baseHoles, size)

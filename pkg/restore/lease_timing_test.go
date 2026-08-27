@@ -17,7 +17,6 @@ import (
 )
 
 type blockingSnapshotFetcher struct {
-	path    string
 	mu      sync.Mutex
 	opens   int
 	started chan struct{}
@@ -35,11 +34,7 @@ func (f *blockingSnapshotFetcher) OpenManifest(ctx context.Context, _ store.Cont
 
 func TestRestoreDoesNotPublishLeaseWhileSnapshotOpenIsBlocked(t *testing.T) {
 	dir := t.TempDir()
-	snap := &SnapshotCfg{}
-	snap.Resources.Capacity.CPU = 1
-	snap.Resources.Capacity.Memory = "512MiB"
-	snapshotPath := writePublishSnapshot(t, dir, snap)
-	fetcher := &blockingSnapshotFetcher{path: snapshotPath, started: make(chan struct{})}
+	fetcher := &blockingSnapshotFetcher{started: make(chan struct{})}
 
 	cgroup := filepath.Join(dir, "cgroup")
 	if err := os.Mkdir(cgroup, 0o755); err != nil {
@@ -49,7 +44,6 @@ func TestRestoreDoesNotPublishLeaseWhileSnapshotOpenIsBlocked(t *testing.T) {
 	cfg := &config.SandboxConfig{}
 	cfg.Resources.Capacity = config.CapacityConfig{CPU: 1, Memory: "512MiB"}
 	cfg.Resources.Allocatable = config.AllocatableConfig{CPU: 0.5, Memory: "128MiB"}
-	cfg.Resources.Startup = &config.StartupConfig{Memory: "256MiB"}
 	cfg.Resources.Control.Controller = socket
 	cfg.Resources.Control.CgroupPath = cgroup
 	cfg.ApplyDefaults()

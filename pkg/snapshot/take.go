@@ -1,7 +1,6 @@
-// Package snapshot implements the sandbox-ctl snapshot path: CH
-// /vm.snapshot orchestration, sparse memfd capture, [memory][ZIP]
-// bundle composition into tarstream artifacts, and manifest-store
-// upload.
+// Package snapshot implements the sandbox-ctl export/snapshot path: one
+// quiesced disk capture creates Sandbox E, while memory snapshots additionally
+// call CH /vm.snapshot and create Snapshot S as the operation root.
 //
 // The ctl.sock wire protocol + listener that carries snapshot_request
 // from `sandbox-ctl snapshot` to the run process lives in
@@ -11,7 +10,6 @@
 package snapshot
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -22,6 +20,8 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
 
 // Quiescer abstracts the vhost backend's pause/resume hooks. A typical
@@ -33,11 +33,8 @@ type Quiescer interface {
 }
 
 // Sources gathers the inputs Take needs.
-//
-// SnapshotCfg is rendered late (Take calls it with the final overlay.base
-// ref — a scheme-qualified file ref or manifest://<key>) because that ref depends
-// on how the overlay was absorbed by the sink.
 type Sources struct {
+	Context    context.Context
 	SandboxID  string // <sid> for output filename / symlink
 	APISock    string // CH api socket
 	MemfdFD    int    // memfd backing the zone (read-only here; CH is paused)
@@ -46,9 +43,14 @@ type Sources struct {
 
 	// Diffs are the logical disks' writable diffs to capture, in order: Diffs[0]
 	// is the root, Diffs[1:] are the boot.disks[] data disks (boot.disks[]
-	// order). Take absorbs each as a separate overlay artifact; SnapshotCfg
-	// receives the resulting refs in the same order.
+	// order). Take captures every diff once; data refs and the root payload are
+	// recorded in Sandbox E, never duplicated in snapshot.cfg.
 	Diffs []DiskDiff
+	// PortableConfig is immutable C0. ParentSandboxRef materializes the old
+	// self when E is regenerated; MemoryFromRefs is the independent S chain.
+	PortableConfig   *config.PortableSandboxConfig
+	ParentSandboxRef string
+	MemoryFromRefs   []string
 
 	// CHApiDeadline bounds each CH API call (pause/snapshot/resume); 0 = no
 	// forced. From config.SandboxConfig.CHApiDeadline() (timeouts.ch_api).
@@ -58,13 +60,10 @@ type Sources struct {
 	// scheme-qualified file ref (memory section = [0,MemfdSize)). When set, Take flattens
 	// this run's resident memory delta ONTO it and absorbs the merged result as
 	// the new top — replacing the next-newest local layer instead of stacking
-	// (docs §3.5). Per-disk overlay flattening is driven by DiskDiff.MergeBase.
+	// (docs/sandbox.md §11.1). Per-disk overlay flattening is driven by
+	// DiskDiff.MergeBase.
 	// Empty ⇒ no merge (stack via the parent refs).
 	MergeBaseSnapshot string
-
-	// SnapshotCfg renders snapshot.cfg given the final overlay refs (one per
-	// logical disk, in Diffs order).
-	SnapshotCfg func(overlayRefs []string) ([]byte, error)
 
 	Quiescer      Quiescer
 	Logf          func(string, ...any)
@@ -72,8 +71,12 @@ type Sources struct {
 	LocalRequired bool
 	// MergeBaseOpener opens a resolved file:// tarstream or Manifest Bundle
 	// selector. It is supplied by the lifecycle when Bundle-aware provenance is
-	// possible; nil preserves the legacy tarstream-only opener.
+	// possible; nil selects the ordinary local tarstream opener.
 	MergeBaseOpener MergeBaseOpener
+	// MemoryMergeBaseOpener opens a parent Snapshot S and exposes only its
+	// memory prefix. Keeping it separate prevents either ZIP tail from entering
+	// a merge and keeps disk parents payload-only.
+	MemoryMergeBaseOpener MergeBaseOpener
 }
 
 // DiskDiff is one logical disk's writable diff to capture. SnapshotView is the
@@ -93,10 +96,10 @@ type DiskDiff struct {
 // (scheme-qualified file ref | manifest://<key>); Path is the local file (file mode
 // only, "" for upload). The handler maps these into the ctl.Response.
 type Outputs struct {
-	OverlayRefs  []string // one per logical disk, in Diffs order
-	OverlayPaths []string // local file path per disk (file mode; "" for upload)
 	SnapshotRef  string
 	SnapshotPath string
+	SandboxRef   string
+	SandboxPath  string
 
 	MemorySize       uint64
 	MemoryResident   uint64
@@ -104,15 +107,15 @@ type Outputs struct {
 	WallclockDumpMs  int64
 }
 
-// Take runs the snapshot sequence (§6.2 T2-T8) and streams the two large
-// artifacts (blk1 overlay, memory+ZIP bundle) through the sink — never staging
-// them in the /run tmpfs. Only CH's small config.json/state.json land in
-// StagingDir. The overlay is absorbed first so snapshot.cfg can carry its final
-// overlay.base ref.
+// Take runs the snapshot sequence and streams Sandbox E plus Snapshot S through
+// the sink without staging either large logical source in /run. Only CH's small
+// config.json/state.json files land in StagingDir. Every disk is captured once;
+// E is emitted before CH memory state, and S is committed last with sandbox_ref
+// pointing to E.
 //
-// Caller responsibility: create/remove StagingDir; supply the sink
-// (fileSink for --output, ingestSink for --upload) and the SnapshotCfg builder.
-func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
+// Caller responsibility: create/remove StagingDir and supply the sink
+// (FileSink for --output, IngestSink for --upload, or BundleSink).
+func Take(s Sources, sink ArtifactSink, resumeAfter bool) (*Outputs, error) {
 	logf := s.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
@@ -120,13 +123,45 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	if s.SandboxID == "" {
 		return nil, fmt.Errorf("snapshot: empty SandboxID")
 	}
-	if s.SnapshotCfg == nil {
-		return nil, fmt.Errorf("snapshot: nil SnapshotCfg builder")
+	if s.APISock == "" {
+		return nil, fmt.Errorf("snapshot: empty CH API socket")
+	}
+	if s.StagingDir == "" {
+		return nil, fmt.Errorf("snapshot: empty staging directory")
+	}
+	if s.MemfdFD < 0 {
+		return nil, fmt.Errorf("snapshot: invalid memfd")
+	}
+	if s.PortableConfig == nil {
+		return nil, fmt.Errorf("snapshot: immutable C0 is required")
+	}
+	if err := s.PortableConfig.Validate(); err != nil {
+		return nil, fmt.Errorf("snapshot C0: %w", err)
+	}
+	if len(s.Diffs) != 1+len(s.PortableConfig.Boot.Disks) {
+		return nil, fmt.Errorf("snapshot: runtime disk count %d does not match C0 disk count %d", len(s.Diffs), 1+len(s.PortableConfig.Boot.Disks))
+	}
+	for i := range s.Diffs {
+		if s.Diffs[i].SnapshotView == nil {
+			return nil, fmt.Errorf("snapshot: disk %d has no SnapshotView", i)
+		}
 	}
 	if sink == nil {
 		return nil, fmt.Errorf("snapshot: nil sink")
 	}
-	ctx := context.Background()
+	if s.MemfdSize <= 0 {
+		return nil, fmt.Errorf("snapshot: memory size must be positive")
+	}
+	if s.Quiescer == nil {
+		return nil, fmt.Errorf("snapshot: nil backend Quiescer")
+	}
+	ctx := s.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	out := &Outputs{MemorySize: uint64(s.MemfdSize)}
 	ch := chapi.Client{Sock: s.APISock, RespDeadline: s.CHApiDeadline}
 
@@ -151,10 +186,23 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	// T2b: quiesce backends (steady state before the dump).
 	s.Quiescer.Quiesce()
 
-	// T3: CH /vm.snapshot → staging dir. CH writes only config.json + state.json
+	// T3: capture all disks once and emit Sandbox E while the same CH/backend
+	// freeze remains held. E is a dependency, not yet the operation root.
+	dumpStart := time.Now()
+	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{
+		SandboxID: s.SandboxID, PortableConfig: s.PortableConfig,
+		ParentSandboxRef: s.ParentSandboxRef, Diffs: s.Diffs,
+		LocalCodec: s.LocalCodec, LocalRequired: s.LocalRequired,
+		MergeBaseOpener: s.MergeBaseOpener,
+	}, sink, false)
+	if err != nil {
+		return nil, err
+	}
+	out.SandboxRef, out.SandboxPath = sandboxOut.SandboxRef, sandboxOut.SandboxPath
+
+	// T4: CH /vm.snapshot → staging dir. CH writes only config.json + state.json
 	// there (small); the multi-GiB memory + disk never touch the staging tmpfs —
 	// they stream straight to the sink.
-	dumpStart := time.Now()
 	if err := ch.Snapshot("file://" + s.StagingDir); err != nil {
 		return nil, fmt.Errorf("CH snapshot: %w", err)
 	}
@@ -167,36 +215,15 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 		return nil, fmt.Errorf("read state.json: %w", err)
 	}
 
-	// T4: overlays → sink, one per logical disk (root + data disks), in order.
-	// Done first so snapshot.cfg below carries the final overlay.base refs.
-	// Per-disk flattening is independent from memory flattening. A working-set
-	// snapshot deliberately leaves MergeBaseSnapshot empty so its memory self
-	// layer stays separate, while every local disk still carries MergeBase and
-	// is flattened as before.
-	out.OverlayRefs = make([]string, len(s.Diffs))
-	out.OverlayPaths = make([]string, len(s.Diffs))
-	for i, d := range s.Diffs {
-		ref, path, err := absorbOverlayWithOpener(ctx, sink, d, d.MergeBase != "", s.LocalCodec, s.LocalRequired, s.MergeBaseOpener)
-		if err != nil {
-			return nil, fmt.Errorf("disk %d: %w", i, err)
-		}
-		out.OverlayRefs[i], out.OverlayPaths[i] = ref, path
-	}
-
-	// T5: snapshot.cfg (final overlay refs) → ZIP trailer.
-	snapshotCfg, err := s.SnapshotCfg(out.OverlayRefs)
+	// T5: the memory-only snapshot.cfg points at E and carries only the memory
+	// parent chain.
+	snapshotCfg, err := MarshalConfig(&Config{
+		Version: SnapshotConfigVersion, SandboxRef: out.SandboxRef,
+		FromRefs: append([]string(nil), s.MemoryFromRefs...),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("build snapshot.cfg: %w", err)
 	}
-	zipBytes, err := BuildZIP(map[string][]byte{
-		"config.json":  configJSON,
-		"state.json":   stateJSON,
-		"snapshot.cfg": snapshotCfg,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("build zip: %w", err)
-	}
-
 	// T6: [memory][ZIP] bundle → sink, streamed from the memfd (CH paused, so
 	// the mapping is stable); only resident pages are read/transferred.
 	memHoles, err := WalkHoles(s.MemfdFD, s.MemfdSize)
@@ -206,7 +233,7 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	var memSrc io.ReadSeeker = memfdReader(s.MemfdFD, s.MemfdSize)
 	memSrcHoles := memHoles
 	if s.MergeBaseSnapshot != "" {
-		base, baseHoles, berr := openMergeBaseWithOpener(s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MergeBaseOpener)
+		base, baseHoles, berr := openMergeBaseWithOpener(s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MemoryMergeBaseOpener)
 		if berr != nil {
 			return nil, fmt.Errorf("merge memory base: %w", berr)
 		}
@@ -214,10 +241,17 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 		memSrc, memSrcHoles = mergeSparse(memSrc, memHoles, base, baseHoles, s.MemfdSize)
 	}
 	out.MemoryResident = residentBytes(s.MemfdSize, memSrcHoles) // bytes actually written (merged)
-	out.SnapshotRef, out.SnapshotPath, err = sink.AbsorbBundle(
-		ctx, memSrc, memSrcHoles, bytes.NewReader(zipBytes))
+	memorySource := &seekerSource{rs: memSrc, size: uint64(s.MemfdSize), holes: memSrcHoles}
+	snapshotSource, err := snapshotfile.BuildSource(memorySource, configJSON, stateJSON, snapshotCfg)
 	if err != nil {
-		return nil, fmt.Errorf("absorb bundle: %w", err)
+		return nil, fmt.Errorf("build Snapshot S: %w", err)
+	}
+	out.SnapshotRef, out.SnapshotPath, err = sink.AbsorbSnapshot(ctx, snapshotSource)
+	if err != nil {
+		return nil, fmt.Errorf("absorb Snapshot S: %w", err)
+	}
+	if err := sink.CommitSnapshot(ctx, out.SnapshotRef, out.SnapshotPath); err != nil {
+		return nil, fmt.Errorf("commit Snapshot S: %w", err)
 	}
 	dumpEnd := time.Now()
 
@@ -231,18 +265,18 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 
 	out.WallclockPauseMs = pausedAt.Sub(pauseStart).Milliseconds()
 	out.WallclockDumpMs = dumpEnd.Sub(dumpStart).Milliseconds()
-	logf("snapshot: overlays=%v snapshot=%s memory_resident=%d", out.OverlayRefs, out.SnapshotRef, out.MemoryResident)
+	logf("snapshot: sandbox=%s snapshot=%s memory_resident=%d", out.SandboxRef, out.SnapshotRef, out.MemoryResident)
 	succeeded = true
 	return out, nil
 }
 
 // absorbOverlay streams one disk's diff to the sink, optionally flattening it
 // onto the parent's local overlay (merge, replacing the parent layer).
-func absorbOverlay(ctx context.Context, sink SnapshotSink, d DiskDiff, merging bool, codec tarstream.Codec, required bool) (string, string, error) {
+func absorbOverlay(ctx context.Context, sink ArtifactSink, d DiskDiff, merging bool, codec tarstream.Codec, required bool) (string, string, error) {
 	return absorbOverlayWithOpener(ctx, sink, d, merging, codec, required, nil)
 }
 
-func absorbOverlayWithOpener(ctx context.Context, sink SnapshotSink, d DiskDiff, merging bool, codec tarstream.Codec, required bool, opener MergeBaseOpener) (string, string, error) {
+func absorbOverlayWithOpener(ctx context.Context, sink ArtifactSink, d DiskDiff, merging bool, codec tarstream.Codec, required bool, opener MergeBaseOpener) (string, string, error) {
 	if d.SnapshotView == nil {
 		return "", "", fmt.Errorf("snapshot diff %s has no snapshot view", d.Path)
 	}

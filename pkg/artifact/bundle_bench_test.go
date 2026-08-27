@@ -1,7 +1,6 @@
 package artifact_test
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"path/filepath"
@@ -37,17 +36,8 @@ func BenchmarkBundleReadAt(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	inner, err := snapshot.BuildZIP(map[string][]byte{
-		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
-	})
-	if err != nil {
-		b.Fatal(err)
-	}
-	_, path, err := sink.AbsorbBundle(context.Background(), bytes.NewReader(payload), nil, bytes.NewReader(inner))
-	if err != nil {
-		_ = sink.Close()
-		b.Fatal(err)
-	}
+	_, path := absorbBundleSnapshot(b, sink, directory, payload,
+		[]byte("version: 1\nsandbox_ref: manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"))
 	if err := sink.Close(); err != nil {
 		b.Fatal(err)
 	}
@@ -100,19 +90,14 @@ func BenchmarkBundleReadAt(b *testing.B) {
 }
 
 // BenchmarkSnapshotArtifactReadLatencyQuantiles compares the ordinary local
-// restore read path for the legacy tarstream and the new Bundle. The Bundle
+// restore read path for the local tarstream and Manifest Bundle carriers. The Bundle
 // uses the default strict verification policy; random 4 KiB reads exercise
 // cross-Chunk faults and sequential 1 MiB reads model disk traversal.
 func BenchmarkSnapshotArtifactReadLatencyQuantiles(b *testing.B) {
 	b.StopTimer()
 	const imageSize = 32 << 20
 	payload := bundleBenchmarkBytes(imageSize)
-	inner, err := snapshot.BuildZIP(map[string][]byte{
-		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
-	})
-	if err != nil {
-		b.Fatal(err)
-	}
+	snapshotConfig := []byte("version: 1\nsandbox_ref: manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
 	customerKey := [32]byte{0xb1, 0xb2, 0xb3}
 	verify := true
 	cfg := manifest.Config{
@@ -122,8 +107,8 @@ func BenchmarkSnapshotArtifactReadLatencyQuantiles(b *testing.B) {
 	}
 
 	tarDir := b.TempDir()
-	_, tarPath, err := snapshot.NewFileSink(tarDir, "latency-tar", nil, false, nil).AbsorbBundle(
-		context.Background(), bytes.NewReader(payload), nil, bytes.NewReader(inner))
+	_, tarPath, err := snapshot.NewFileSink(tarDir, "latency-tar", nil, false, nil).AbsorbSnapshot(
+		context.Background(), artifactSnapshotSource(b, payload, snapshotConfig))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -133,11 +118,7 @@ func BenchmarkSnapshotArtifactReadLatencyQuantiles(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	_, bundlePath, err := bundleSink.AbsorbBundle(context.Background(), bytes.NewReader(payload), nil, bytes.NewReader(inner))
-	if err != nil {
-		_ = bundleSink.Close()
-		b.Fatal(err)
-	}
+	_, bundlePath := absorbBundleSnapshot(b, bundleSink, bundleDir, payload, snapshotConfig)
 	if err := bundleSink.Close(); err != nil {
 		b.Fatal(err)
 	}

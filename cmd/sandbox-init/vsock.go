@@ -261,16 +261,6 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 				logf("reverse-channel: restore network re-applied (epoch=%d)", req.Epoch)
 			}
 		}
-		// Inject per-instance files (secrets / instance config) the same way
-		// cold start does (tmpfs+bind, memory-only). Applied before the thaw
-		// so the resumed app sees them; best-effort + logged, like network.
-		if len(req.Files) > 0 {
-			if err := applyFiles(req.Files); err != nil {
-				logf("reverse-channel: restore applyFiles: %v", err)
-			} else {
-				logf("reverse-channel: restore files injected (epoch=%d, n=%d)", req.Epoch, len(req.Files))
-			}
-		}
 		// Establish a new observation epoch and pause sampling before
 		// restore_ack. This serializes with an in-flight mem_report exchange, so
 		// neither an old-epoch delivery nor a pre-ACK sample can become the first
@@ -326,7 +316,7 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		// still frozen, which only holds for the resume_after=true path
 		// (VM resumed in place; this attach is just its first
 		// post-resume contact). Plain reconnect → not frozen → skipped
-		// (docs/sandbox-init.md §4.3, sandbox.md §6.2 T8).
+		// (docs/sandbox-init.md §4.3, sandbox.md §6.2 resume recovery).
 		if frozen, err := cgroupFrozen(); err != nil {
 			logf("reverse-channel: attach cgroupFrozen: %v", err)
 		} else if frozen {

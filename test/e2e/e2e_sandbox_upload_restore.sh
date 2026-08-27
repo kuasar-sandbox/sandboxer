@@ -263,10 +263,8 @@ DIFF_RESTORE="$WORK/runtime/blk1-restore.diff"
 # and diverge from the guest's in-memory ext4 state).
 truncate -s 1G "$DIFF_RESTORE"
 
-# Restore-mode sandbox.yaml: capacity must match snapshot.cfg (declared
-# explicitly, same as the cold yaml). The bundle was manifest:// loaded
-# (snapshotPath=""), so ApplyRules requires host yaml to provide every
-# file:// ref from snapshot.cfg explicitly — here runtime and root.base.
+# Restore host yaml contains only node bindings and fresh instance identity.
+# Snapshot S follows sandbox_ref to E; E owns launch and the disk graph.
 cat > "$WORK/host.yaml" <<EOF
 resources:
   capacity:    { cpu: 1, memory: 512MiB }
@@ -280,13 +278,9 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_RESTORE
       size: 1GiB
-launch:
-  # Snapshot topology is authoritative; every restore host deliberately says false.
-  cgroup_control: false
 EOF
 
 LOG2="$WORK/run2.log"
@@ -353,12 +347,8 @@ uffd_performance_gate "manifest-restore-1-layer" "$RESTORE_MS" 3000 \
     "$WORK/stats2.json" buffered
 
 # ---- phase 4: restore from the CHAINED snapshot -------------------------
-# snap#2 was taken from the restored sandbox, so its snapshot.cfg has
-# from_refs=[snap#1] / base_from_refs=[snap#1.overlay] (incremental layered
-# chain, docs/sandbox.md §3.5). Restoring it builds layeredStream(snap#2,
-# snap#1): pages snap#2 left as holes (not touched during phase-2's run) must
-# fall through to snap#1. If the guest resumes and keeps ticking, the
-# fall-through is correct end-to-end.
+# snap#2 was taken from the restored sandbox. S2.from_refs carries only the
+# memory chain, while E2 independently carries the current disk graph.
 
 echo
 echo "==> phase 4: restore from chained manifest://$SNAP2_MKEY (snap2 over snap1; snap2 frozen at TICK $SNAP2_TICK)"
@@ -378,12 +368,9 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_RESTORE2
       size: 1GiB
-launch:
-  cgroup_control: false
 EOF
 
 LOG3="$WORK/run3.log"
@@ -431,8 +418,9 @@ echo "==> PASS: chained restore reached TICK $WANT_TICK2 in ${RESTORE2_MS} ms (2
 # ---- phase 5: snapshot the chained-restored sandbox → 3-layer chain ------
 # Snapshotting SID3 (itself a chained restore) re-exercises the deterministic
 # quiesce teardown (§4.6) on a chained-restored VM, and produces snap#3 with
-# from_refs=[snap#2, snap#1] / base_from_refs=[snap#2.overlay, snap#1.overlay].
-# Restoring it must build a 3-layer memory+disk source and stay byte-correct.
+# S3.from_refs=[S2,S1]. E3 separately records the current disk graph; S never
+# duplicates disk provenance. Restoring S3 must build three memory layers and
+# reconstruct disks from E3 while remaining byte-correct.
 echo
 echo "==> phase 5: snapshot chained-restored SID3 → snap#3, then restore the 3-layer chain"
 SNAP3_LOG="$WORK/snap3.log"
@@ -463,12 +451,9 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_RESTORE3
       size: 1GiB
-launch:
-  cgroup_control: false
 EOF
 LOG4="$WORK/run4.log"
 SID4="up4-$$"

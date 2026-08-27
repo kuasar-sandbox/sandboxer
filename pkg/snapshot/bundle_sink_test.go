@@ -48,22 +48,20 @@ func TestBundleSinkWritesOneMultiManifestFile(t *testing.T) {
 		t.Fatal("distinct overlays produced the same Manifest ref")
 	}
 
-	inner, err := BuildZIP(map[string][]byte{
-		"config.json":  {},
-		"state.json":   {},
-		"snapshot.cfg": []byte("boot: {}\n"),
-	})
+	snapshotConfig := []byte("version: 1\nsandbox_ref: manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+	rootRef, _, err := sink.AbsorbSnapshot(context.Background(),
+		testSnapshotSource(t, bytes.Repeat([]byte{0x55}, 8192), nil, snapshotConfig))
 	if err != nil {
 		t.Fatal(err)
 	}
-	rootRef, path, err := sink.AbsorbBundle(context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x55}, 8192)), nil, bytes.NewReader(inner))
-	if err != nil {
+	if err := sink.CommitSnapshot(context.Background(), rootRef, ""); err != nil {
 		t.Fatal(err)
 	}
 	rootKey, err := manifest.ParseKeyRef(rootRef)
 	if err != nil {
 		t.Fatal(err)
 	}
+	path := filepath.Join(dir, manifest.HexKey(rootKey)+".bundle")
 	if filepath.Base(path) != manifest.HexKey(rootKey)+".bundle" {
 		t.Fatalf("Bundle path = %q, root = %s", path, rootRef)
 	}
@@ -153,13 +151,13 @@ func TestBundleSinkAcquiresOnlineAdmissionOnlyOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	inner, err := BuildZIP(map[string][]byte{
-		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
-	})
+	rootRef, _, err := sink.AbsorbSnapshot(context.Background(), testSnapshotSource(t,
+		bytes.Repeat([]byte{0x33}, 4096), nil,
+		[]byte("version: 1\nsandbox_ref: manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := sink.AbsorbBundle(context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x33}, 4096)), nil, bytes.NewReader(inner)); err != nil {
+	if err := sink.CommitSnapshot(context.Background(), rootRef, ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := server.calls.Load(); got != 1 {

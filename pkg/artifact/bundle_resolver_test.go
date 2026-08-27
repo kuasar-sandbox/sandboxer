@@ -271,17 +271,9 @@ func writeResolverBundle(t testing.TB, directory, sid string, cfg *manifest.Conf
 			t.Fatal(err)
 		}
 	}
-	inner, err := snapshot.BuildZIP(map[string][]byte{
-		"config.json": {}, "state.json": {}, "snapshot.cfg": []byte("boot: {}\n"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	rootRef, path, err := sink.AbsorbBundle(context.Background(),
-		bytes.NewReader(bytes.Repeat([]byte{fill + 1}, 8192)), nil, bytes.NewReader(inner))
-	if err != nil {
-		t.Fatal(err)
-	}
+	rootRef, path := absorbBundleSnapshot(t, sink, directory,
+		bytes.Repeat([]byte{fill + 1}, 8192),
+		[]byte("version: 1\nsandbox_ref: manifest://"+strings.Repeat("a", 64)+"\n"))
 	if err := sink.Close(); err != nil {
 		t.Fatal(err)
 	}

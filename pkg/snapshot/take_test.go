@@ -3,18 +3,25 @@ package snapshot
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
 
 func TestAbsorbOverlayUsesSnapshotView(t *testing.T) {
@@ -101,13 +108,20 @@ func TestTakeResumesAfterDestroyModeFailure(t *testing.T) {
 	})
 
 	quiescer := &recordingQuiescer{}
+	portable := exportTestPortable(t)
+	portable.Boot.Disks = nil
+	portable.Mounts = nil
 	_, err = Take(Sources{
-		SandboxID:     "resume-on-error",
-		APISock:       sock,
-		StagingDir:    t.TempDir(),
-		CHApiDeadline: time.Second,
-		SnapshotCfg:   func([]string) ([]byte, error) { return nil, nil },
-		Quiescer:      quiescer,
+		SandboxID:      "resume-on-error",
+		APISock:        sock,
+		MemfdSize:      4096,
+		StagingDir:     t.TempDir(),
+		CHApiDeadline:  time.Second,
+		PortableConfig: portable,
+		Diffs: []DiskDiff{{SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			return bytes.NewReader(make([]byte, 4096)), nil, nil
+		}}},
+		Quiescer: quiescer,
 	}, NewFileSink(t.TempDir(), "resume-on-error", nil, false, nil), false)
 	if err == nil || !strings.Contains(err.Error(), "CH snapshot") {
 		t.Fatalf("Take error = %v, want injected CH snapshot failure", err)
@@ -121,6 +135,250 @@ func TestTakeResumesAfterDestroyModeFailure(t *testing.T) {
 	if quiescer.quiesce != 1 || quiescer.resume != 1 {
 		t.Fatalf("quiescer calls = quiesce:%d resume:%d", quiescer.quiesce, quiescer.resume)
 	}
+}
+
+func TestTakeBuildsSandboxAndMemorySnapshotAtOneFreezePoint(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	if err := os.Mkdir(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mfd, err := memory.Create("take-es-integration", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	memoryBytes := bytes.Repeat([]byte{0x7a}, mfd.Size())
+	copy(mfd.Bytes(), memoryBytes)
+
+	events := &takeEvents{}
+	quiescer := &freezeTrackingQuiescer{}
+	chSock := filepath.Join(dir, "ch.sock")
+	listener, err := net.Listen("unix", chSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		events.add("ch:" + request.URL.Path)
+		if request.URL.Path == "/api/v1/vm.snapshot" {
+			if !quiescer.frozen.Load() {
+				http.Error(w, "snapshot outside backend freeze", http.StatusConflict)
+				return
+			}
+			if writeErr := os.WriteFile(filepath.Join(staging, "config.json"), []byte(`{"vm":"config"}`), 0o600); writeErr != nil {
+				http.Error(w, writeErr.Error(), http.StatusInternalServerError)
+				return
+			}
+			if writeErr := os.WriteFile(filepath.Join(staging, "state.json"), []byte(`{"vm":"state"}`), 0o600); writeErr != nil {
+				http.Error(w, writeErr.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	serveDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(serveDone)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-serveDone
+	})
+
+	portable := exportTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	portable.Boot.Disks = nil
+	portable.Mounts = nil
+	if err := portable.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	diskCalls := 0
+	parentMemoryRef := "file://parent.snapshot@sha256:" + strings.Repeat("a", 64)
+	sink := &takeCaptureSink{events: events, frozen: &quiescer.frozen}
+	out, err := Take(Sources{
+		Context: context.Background(), SandboxID: "test", APISock: chSock,
+		MemfdFD: mfd.FD(), MemfdSize: int64(mfd.Size()), StagingDir: staging,
+		PortableConfig: portable, MemoryFromRefs: []string{parentMemoryRef},
+		CHApiDeadline: time.Second, Quiescer: quiescer,
+		Diffs: []DiskDiff{{SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			diskCalls++
+			if !quiescer.frozen.Load() {
+				return nil, nil, errors.New("disk captured outside backend freeze")
+			}
+			events.add("disk-view")
+			return bytes.NewReader(bytes.Repeat([]byte{0x3c}, 4096)), nil, nil
+		}}},
+	}, sink, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diskCalls != 1 {
+		t.Fatalf("disk SnapshotView calls = %d, want 1", diskCalls)
+	}
+	if quiescer.quiesce.Load() != 1 || quiescer.resume.Load() != 1 || quiescer.frozen.Load() {
+		t.Fatalf("backend lifecycle quiesce=%d resume=%d frozen=%v",
+			quiescer.quiesce.Load(), quiescer.resume.Load(), quiescer.frozen.Load())
+	}
+	wantOrder := []string{
+		"ch:/api/v1/vm.pause", "disk-view", "sink:sandbox",
+		"ch:/api/v1/vm.snapshot", "sink:snapshot", "sink:commit-snapshot",
+		"ch:/api/v1/vm.resume",
+	}
+	if got := events.snapshot(); !reflect.DeepEqual(got, wantOrder) {
+		t.Fatalf("snapshot E/S order = %v, want %v", got, wantOrder)
+	}
+	if out.SandboxRef != sink.sandboxRef || out.SnapshotRef != sink.snapshotRef {
+		t.Fatalf("Take refs = E:%q S:%q", out.SandboxRef, out.SnapshotRef)
+	}
+
+	eSource, err := sparse.NewSource(bytes.NewReader(sink.sandboxBody), uint64(len(sink.sandboxBody)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eRoot, err := sandboxfile.Open(context.Background(), &testExportStream{Source: eSource})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eRoot.Portable.Boot.Root.Base != "self" {
+		t.Fatalf("Sandbox E root = %+v", eRoot.Portable.Boot.Root)
+	}
+	if err := eRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sSource, err := sparse.NewSource(bytes.NewReader(sink.snapshotBody), uint64(len(sink.snapshotBody)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sRoot, err := snapshotfile.Open(context.Background(), &testExportStream{Source: sSource})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotCfg, err := ParseConfig(sRoot.SnapshotConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshotCfg.SandboxRef != out.SandboxRef || !reflect.DeepEqual(snapshotCfg.FromRefs, []string{parentMemoryRef}) {
+		t.Fatalf("snapshot.cfg = %+v", snapshotCfg)
+	}
+	if strings.Contains(string(sRoot.SnapshotConfig), "boot:") || strings.Contains(string(sRoot.SnapshotConfig), "launch:") || strings.Contains(string(sRoot.SnapshotConfig), "disks:") {
+		t.Fatalf("snapshot.cfg retained disk or launch provenance: %s", sRoot.SnapshotConfig)
+	}
+	gotMemory := make([]byte, sRoot.Memory.Size())
+	if n, readErr := sRoot.Memory.ReadAt(context.Background(), gotMemory, 0); readErr != nil && !errors.Is(readErr, io.EOF) {
+		t.Fatal(readErr)
+	} else if n != len(gotMemory) {
+		t.Fatalf("memory read = %d, want %d", n, len(gotMemory))
+	}
+	if !bytes.Equal(gotMemory, memoryBytes) {
+		t.Fatal("Snapshot S memory payload differs from memfd")
+	}
+	if err := sRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type takeEvents struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (e *takeEvents) add(event string) {
+	e.mu.Lock()
+	e.events = append(e.events, event)
+	e.mu.Unlock()
+}
+
+func (e *takeEvents) snapshot() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.events...)
+}
+
+type freezeTrackingQuiescer struct {
+	frozen  atomic.Bool
+	quiesce atomic.Int32
+	resume  atomic.Int32
+}
+
+func (q *freezeTrackingQuiescer) Quiesce() {
+	q.quiesce.Add(1)
+	q.frozen.Store(true)
+}
+
+func (q *freezeTrackingQuiescer) Resume() {
+	q.frozen.Store(false)
+	q.resume.Add(1)
+}
+
+type takeCaptureSink struct {
+	events       *takeEvents
+	frozen       *atomic.Bool
+	sandboxBody  []byte
+	snapshotBody []byte
+	sandboxRef   string
+	snapshotRef  string
+}
+
+func (s *takeCaptureSink) AbsorbOverlay(context.Context, io.ReadSeeker, []sparse.Extent) (string, string, error) {
+	return "", "", errors.New("unexpected data overlay")
+}
+
+func (s *takeCaptureSink) AbsorbOverlaySource(context.Context, sparse.Source) (string, string, error) {
+	return "", "", errors.New("unexpected overlay source")
+}
+
+func (s *takeCaptureSink) AbsorbSandbox(ctx context.Context, source sparse.Source) (string, string, error) {
+	if !s.frozen.Load() {
+		return "", "", errors.New("Sandbox E written outside backend freeze")
+	}
+	s.events.add("sink:sandbox")
+	body, err := readTakeSource(ctx, source)
+	if err != nil {
+		return "", "", err
+	}
+	s.sandboxBody = body
+	s.sandboxRef = "file://sandbox.sandbox@sha256:" + strings.Repeat("e", 64)
+	return s.sandboxRef, "", nil
+}
+
+func (s *takeCaptureSink) AbsorbSnapshot(ctx context.Context, source sparse.Source) (string, string, error) {
+	if !s.frozen.Load() {
+		return "", "", errors.New("Snapshot S written outside backend freeze")
+	}
+	s.events.add("sink:snapshot")
+	body, err := readTakeSource(ctx, source)
+	if err != nil {
+		return "", "", err
+	}
+	s.snapshotBody = body
+	s.snapshotRef = "file://memory.snapshot@sha256:" + strings.Repeat("f", 64)
+	return s.snapshotRef, "", nil
+}
+
+func (s *takeCaptureSink) CommitSandbox(context.Context, string, string) error {
+	return errors.New("Sandbox E must not be the snapshot operation root")
+}
+
+func (s *takeCaptureSink) CommitSnapshot(context.Context, string, string) error {
+	if !s.frozen.Load() {
+		return errors.New("Snapshot S committed outside backend freeze")
+	}
+	s.events.add("sink:commit-snapshot")
+	return nil
+}
+
+func readTakeSource(ctx context.Context, source sparse.Source) ([]byte, error) {
+	body := make([]byte, source.Size())
+	n, err := source.ReadAt(ctx, body, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if n != len(body) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return body, nil
 }
 
 type recordingQuiescer struct {

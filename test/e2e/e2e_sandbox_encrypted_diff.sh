@@ -222,35 +222,39 @@ wait "$PID1" 2>/dev/null || true
 SNAP="$OUT/$SID1.snapshot"
 [ -e "$SNAP" ] || { echo "FAIL: local snapshot missing"; cat "$WORK/snapshot-local.log"; exit 1; }
 mapfile -t OVERLAYS < <(find "$OUT" -maxdepth 1 -type f -name '*.overlay' -print | sort)
-[ "${#OVERLAYS[@]}" -eq 3 ] || { echo "FAIL: expected 3 overlay artifacts, got ${#OVERLAYS[@]}"; exit 1; }
-for artifact in "${OVERLAYS[@]}" "$(readlink -f "$SNAP")"; do
+SANDBOX_E="$OUT/$SID1.sandbox"
+[ -e "$SANDBOX_E" ] || { echo "FAIL: local Sandbox E missing"; ls -la "$OUT"; exit 1; }
+[ "${#OVERLAYS[@]}" -ge 3 ] || { echo "FAIL: expected encrypted disk dependencies, got ${#OVERLAYS[@]}"; exit 1; }
+for artifact in "${OVERLAYS[@]}" "$(readlink -f "$SANDBOX_E")" "$(readlink -f "$SNAP")"; do
     magic=$(od -An -tx1 -N8 "$artifact" | tr -d ' \n')
     [ "$magic" = 894b5453454e430a ] || { echo "FAIL: local artifact is not encrypted v1: $artifact"; exit 1; }
 done
 for marker in ROOT-ACTIVE-OK SCRATCH-ACTIVE-OK DATA-ACTIVE-OK; do
-    if grep -aFq "$marker" "${OVERLAYS[@]}" "$(readlink -f "$SNAP")"; then
+    if grep -aFq "$marker" "${OVERLAYS[@]}" "$(readlink -f "$SANDBOX_E")" "$(readlink -f "$SNAP")"; then
         echo "FAIL: guest plaintext marker appears in an encrypted snapshot artifact"
         exit 1
     fi
 done
 "$BIN/sandbox-ctl" info --json --manifest-config "$REQUIRED_CONFIG" "$SNAP" > "$WORK/snapshot.json"
-python3 - "$WORK/snapshot.json" <<'PY'
+E_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/snapshot.json")
+"$BIN/sandbox-ctl" info --json --manifest-config "$REQUIRED_CONFIG" "$OUT/$E_BASENAME" > "$WORK/sandbox.json"
+python3 - "$WORK/sandbox.json" <<'PY'
 import json, sys
 cfg = json.load(open(sys.argv[1]))
 refs = []
 root = cfg["Boot"]["Root"]
-refs.extend([root.get("BaseRef", ""), root.get("Base", "")])
+refs.append(root.get("Base", ""))
 if root.get("Overlay"):
     refs.append(root["Overlay"].get("Base", ""))
     refs.extend(root["Overlay"].get("BaseFromRefs") or [])
 refs.extend(root.get("BaseFromRefs") or [])
 for disk in cfg["Boot"].get("Disks") or []:
-    refs.extend([disk.get("BaseRef", ""), disk.get("Base", "")])
+    refs.append(disk.get("Base", ""))
     refs.extend(disk.get("BaseFromRefs") or [])
     if disk.get("Overlay"):
         refs.append(disk["Overlay"].get("Base", ""))
         refs.extend(disk["Overlay"].get("BaseFromRefs") or [])
-refs = [ref for ref in refs if ref]
+refs = [ref for ref in refs if ref and ref != "self"]
 if not refs or any("@hmac:" not in ref for ref in refs):
     raise SystemExit("disk artifact refs are not uniformly @hmac: %r" % refs)
 PY
@@ -261,13 +265,13 @@ write_restore_config() { # $1=path $2=root diff $3=scratch diff $4=dataset diff 
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: $5 }
 boot:
+  kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: $ROOT_REF
     overlay: { diff: file://$2 }
   disks:
     - { name: scratch, diff: file://$3 }
-    - { name: dataset, base: $DATASET_REF, overlay: { diff: file://$4 } }
+    - { name: dataset, overlay: { diff: file://$4 } }
 EOF
 }
 

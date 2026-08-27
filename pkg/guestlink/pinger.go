@@ -285,18 +285,13 @@ func SendQuiesce(client *HostClient, skipDropCaches bool) (proto.DropCachesResul
 // network (optional) carries a fresh guest IP-layer config the guest
 // re-applies flush-and-replace before thawing, so a clone restored from a
 // golden snapshot takes a new network identity. nil → keep the snapshot's.
-//
-// files (optional) carries per-instance files the guest injects before
-// thawing (same tmpfs+bind mechanism as cold start), so a clone gets
-// instance-specific secrets / config that were never baked into the golden
-// snapshot. nil → no per-instance file injection.
-func OpenMUXViaRestore(client *HostClient, epoch uint32, network *proto.NetworkSpec, files []proto.FileSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
-	return OpenMUXViaRestoreContext(context.Background(), client, epoch, network, files, deadline)
+func OpenMUXViaRestore(client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+	return OpenMUXViaRestoreContext(context.Background(), client, epoch, network, deadline)
 }
 
 // OpenMUXViaRestoreContext is OpenMUXViaRestore with cancellation covering
 // both the pre-request CONNECT/OK retry window and the one-shot restore_ack.
-func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, files []proto.FileSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -318,7 +313,6 @@ func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uin
 		Epoch:       epoch,
 		WallclockNs: time.Now().UnixNano(),
 		Network:     network,
-		Files:       files,
 	}, proto.TypeRestoreAck)
 	if !stopCancel() {
 		_ = rawConn.Close()
@@ -355,10 +349,14 @@ const (
 // the smaller of the overall deadline and retry-window remainder; a successful
 // CONNECT/OK restores the overall deadline before the request is written.
 func dialRawForRestore(client *HostClient, deadline, retryWindow time.Duration) (net.Conn, error) {
-	return dialRawForRestoreContext(context.Background(), client, deadline, retryWindow)
+	return dialRawPreRequestContext(context.Background(), client, deadline, retryWindow, "restore")
 }
 
 func dialRawForRestoreContext(ctx context.Context, client *HostClient, deadline, retryWindow time.Duration) (net.Conn, error) {
+	return dialRawPreRequestContext(ctx, client, deadline, retryWindow, "restore")
+}
+
+func dialRawPreRequestContext(ctx context.Context, client *HostClient, deadline, retryWindow time.Duration, operation string) (net.Conn, error) {
 	deadlineAt := time.Now().Add(deadline)
 
 	backoff := restoreDialRetryInitial
@@ -375,9 +373,9 @@ func dialRawForRestoreContext(ctx context.Context, client *HostClient, deadline,
 		remaining := time.Until(attemptDeadline)
 		if remaining <= 0 {
 			if lastErr != nil {
-				return nil, fmt.Errorf("restore pre-request connect failed after %d attempts: %w", attempt-1, lastErr)
+				return nil, fmt.Errorf("%s pre-request connect failed after %d attempts: %w", operation, attempt-1, lastErr)
 			}
-			return nil, fmt.Errorf("restore pre-request connect: deadline exceeded after %d attempts", attempt-1)
+			return nil, fmt.Errorf("%s pre-request connect: deadline exceeded after %d attempts", operation, attempt-1)
 		}
 
 		conn, err := client.DialRawContext(ctx, remaining)
@@ -386,15 +384,15 @@ func dialRawForRestoreContext(ctx context.Context, client *HostClient, deadline,
 			// write+ACK still owns the original overall restore deadline.
 			if err := conn.SetDeadline(deadlineAt); err != nil {
 				_ = conn.Close()
-				return nil, fmt.Errorf("restore pre-request connect: restore overall deadline: %w", err)
+				return nil, fmt.Errorf("%s pre-request connect: overall deadline: %w", operation, err)
 			}
 			if attempt > 1 && client.Logf != nil {
-				client.Logf("restore pre-request connect recovered on attempt %d", attempt)
+				client.Logf("%s pre-request connect recovered on attempt %d", operation, attempt)
 			}
 			return conn, nil
 		}
 		if !retryUntil.IsZero() && time.Until(retryUntil) <= 0 {
-			return nil, fmt.Errorf("restore pre-request connect failed after %d attempts: %w", attempt, err)
+			return nil, fmt.Errorf("%s pre-request connect failed after %d attempts: %w", operation, attempt, err)
 		}
 		if !retryableRestoreDialError(err) {
 			return nil, err
@@ -409,10 +407,10 @@ func dialRawForRestoreContext(ctx context.Context, client *HostClient, deadline,
 
 		retryRemaining := time.Until(retryUntil)
 		if retryRemaining <= backoff {
-			return nil, fmt.Errorf("restore pre-request connect failed after %d attempts: %w", attempt, err)
+			return nil, fmt.Errorf("%s pre-request connect failed after %d attempts: %w", operation, attempt, err)
 		}
 		if client.Logf != nil {
-			client.Logf("restore pre-request connect attempt %d failed: %v; retrying in %s", attempt, err, backoff)
+			client.Logf("%s pre-request connect attempt %d failed: %v; retrying in %s", operation, attempt, err, backoff)
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -447,7 +445,11 @@ func retryableRestoreDialError(err error) bool {
 // guest gracefully closes any still-live old MUX (or hard-drops it),
 // then ACKs on the new connection.
 func OpenMUXViaAttach(client *HostClient, epoch uint32, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
-	return openMUX(client, &proto.Message{Type: proto.TypeAttach, Epoch: epoch}, proto.TypeAttachAck, deadline)
+	conn, err := dialRawPreRequestContext(context.Background(), client, deadline, restoreDialRetryWindow, "attach")
+	if err != nil {
+		return nil, proto.StdioSpec{}, err
+	}
+	return finishOpenMUX(conn, &proto.Message{Type: proto.TypeAttach, Epoch: epoch}, proto.TypeAttachAck)
 }
 
 // OpenMUXViaExec starts a fresh ad-hoc command inside the running
