@@ -83,6 +83,62 @@ type SandboxConfig struct {
 	Metadata map[string]string `yaml:"metadata,omitempty"`
 }
 
+// MarshalYAML keeps the no-active-root shape useful as a restore-host document.
+// That shape cannot cold boot an overlay root: it has no active writable source,
+// because Snapshot S's referenced Sandbox E owns the complete immutable graph
+// and restore creates the active diffs. Some lifecycle callers retain the
+// original image base while rebuilding their config for restore; it is stale
+// provenance, not a host binding. Emitting it or the cold workload fields would
+// make the host document claim that disk provenance and launch/files/init are
+// re-applied to already-restored processes. Project the shape to host-owned
+// fields instead.
+//
+// This is only a producer-side projection. Strict restore parsing still rejects
+// every cold-only field that is actually present in an input document.
+func (c SandboxConfig) MarshalYAML() (any, error) {
+	if !c.isRestoreHostProjection() {
+		type plain SandboxConfig
+		return plain(c), nil
+	}
+
+	type restoreRootYAML struct {
+		Overlay struct{} `yaml:"overlay"`
+	}
+	type restoreBootYAML struct {
+		Kernel  string          `yaml:"kernel"`
+		Runtime string          `yaml:"runtime"`
+		Root    restoreRootYAML `yaml:"root"`
+	}
+	type restoreHostYAML struct {
+		Resources ResourcesConfig `yaml:"resources"`
+		Network   NetworkConfig   `yaml:"network"`
+		Boot      restoreBootYAML `yaml:"boot"`
+		Timeouts  TimeoutsConfig  `yaml:"timeouts,omitempty"`
+		Restore   RestoreConfig   `yaml:"restore,omitempty"`
+	}
+	return restoreHostYAML{
+		Resources: c.Resources,
+		Network:   c.Network,
+		Boot: restoreBootYAML{
+			Kernel: c.Boot.Kernel, Runtime: c.Boot.Runtime,
+		},
+		Timeouts: c.Timeouts,
+		Restore:  c.Restore,
+	}, nil
+}
+
+func (c SandboxConfig) isRestoreHostProjection() bool {
+	root := c.Boot.Root
+	// Lifecycle producers resolve startup memory before materializing a run.
+	// Requiring that resolved marker keeps generic/incomplete config rendering
+	// lossless while still recognizing every prepared restore document.
+	if c.Resources.Startup == nil || c.Boot.Kernel == "" || c.Boot.Runtime == "" || len(c.Boot.Disks) != 0 || root.Overlay == nil {
+		return false
+	}
+	return root.Diff == "" && root.DiffTemplate == "" && root.DiffSize == "" &&
+		root.Overlay.Diff == "" && root.Overlay.DiffTemplate == "" && root.Overlay.DiffSize == ""
+}
+
 // PrefetchMode selects whether restore requests a best-effort warm-up of the
 // current memory self Stream. The empty value has the same semantics as off.
 type PrefetchMode string
@@ -246,8 +302,10 @@ func (c *WatermarkHighConfig) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-// StartupConfig sets cold-start headroom before the first trusted report.
-// Restore never uses it. It applies in both static and dynamic modes.
+// StartupConfig sets the node's configured startup headroom. A cold start uses
+// it for the initial Budget; restore records the policy in its reservation but
+// admits the captured BudgetAtSnapshot instead. It applies in both static and
+// dynamic modes and is never part of PortableSandboxConfig.
 type StartupConfig struct {
 	Memory string `yaml:"memory"`
 }
@@ -901,9 +959,10 @@ func (c *SandboxConfig) WatermarkHighRatio() (uint64, error) {
 	return resource.RatioFromFloat(c.Resources.WatermarkHigh.Ratio)
 }
 
-// StartupBytes returns cold-start headroom. The default is full Capacity.
-// Restore admission ignores this value and reserves BudgetAtSnapshot instead;
-// callers may still read it to materialize the immutable reservation contract.
+// StartupBytes returns configured startup headroom. The default is full
+// Capacity. Restore admission ignores this value for the initial Budget and
+// reserves BudgetAtSnapshot instead; callers still read it to materialize the
+// node reservation contract.
 func (c *SandboxConfig) StartupBytes() (uint64, error) {
 	if c.Resources.Startup == nil {
 		return c.CapacityMemoryBytes()
@@ -1266,8 +1325,9 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 			return fmt.Errorf("resources.capacity.memory: %w", err)
 		}
 	}
-	// Allocatable is host policy. Startup is parsed here for a field-specific
-	// error, then the common cold-only check below rejects it.
+	// Allocatable and Startup are host policies. The referenced Sandbox owns
+	// their portable workload identities; ApplyRestoreRules checks any explicit
+	// portable values and applies Startup only to the node reservation policy.
 	if c.Resources.Allocatable.Memory != "" {
 		allocMem, err := util.ParseSize(c.Resources.Allocatable.Memory)
 		if err != nil {

@@ -34,6 +34,7 @@ func TestApplyRestoreRulesUsesReferencedSandboxAsImmutableC0(t *testing.T) {
 		t.Fatal(err)
 	}
 	host := restoreHostConfig()
+	host.Resources.Startup = &StartupConfig{Memory: "256MiB"}
 	runtime, c0, err := ApplyRestoreRules(artifact, host, FieldPresence{})
 	if err != nil {
 		t.Fatal(err)
@@ -46,6 +47,9 @@ func TestApplyRestoreRulesUsesReferencedSandboxAsImmutableC0(t *testing.T) {
 	}
 	if runtime.Restore.Prefetch != "memory" || runtime.Timeouts.CHApi != "5s" {
 		t.Fatalf("restore host policy was not applied: restore=%+v timeouts=%+v", runtime.Restore, runtime.Timeouts)
+	}
+	if runtime.Resources.Startup == nil || runtime.Resources.Startup.Memory != "256MiB" {
+		t.Fatalf("restore node startup policy was not applied: %+v", runtime.Resources.Startup)
 	}
 	if runtime.Metadata["owner"] != "artifact" || c0.Metadata["owner"] != "artifact" {
 		t.Fatalf("artifact workload was not retained: runtime=%v C0=%v", runtime.Metadata, c0.Metadata)
@@ -67,9 +71,6 @@ func TestApplyRestoreRulesRejectsColdOnlyConfiguration(t *testing.T) {
 		want     string
 	}{
 		{name: "present launch", presence: restorePresence("launch"), want: "launch is cold-start-only"},
-		{name: "startup policy", mutate: func(c *SandboxConfig) {
-			c.Resources.Startup = &StartupConfig{Memory: "256MiB"}
-		}, want: "resources.startup is cold-start-only"},
 		{name: "persistent files", mutate: func(c *SandboxConfig) {
 			c.Files = []FileConfig{{Path: "/etc/value", Content: "persistent"}}
 		}, want: "mounts/files/init/metadata"},

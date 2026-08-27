@@ -113,6 +113,84 @@ func TestLaunchCgroupControlYAMLRoundTripAndDefault(t *testing.T) {
 	}
 }
 
+func TestSandboxConfigMarshalRestoreHostProjection(t *testing.T) {
+	cfg := &SandboxConfig{
+		Resources: ResourcesConfig{
+			Capacity:    CapacityConfig{CPU: 2, Memory: "2GiB"},
+			Allocatable: AllocatableConfig{CPU: 2, Memory: "1GiB"},
+			Startup:     &StartupConfig{Memory: "2GiB"},
+		},
+		Network: NetworkConfig{TAP: "tap0", Interface: "eth0", IP: "169.254.1.1/31", Hostname: "restored"},
+		Boot: BootConfig{
+			Kernel: "file:///opt/sandbox/vmlinux", Runtime: "file:///opt/sandbox/sandbox-runtime.bundle",
+			Cmdline: "console=hvc0", Root: RootConfig{
+				// Current lifecycle producers can retain the original cold image
+				// base when rendering a paused image's restore document. E owns it.
+				Base: "manifest://old-image", Overlay: &OverlayConfig{},
+			},
+		},
+		Launch:         LaunchConfig{Exec: "/bin/app", Env: map[string]string{"PERSISTENT": "value"}, Restart: "always"},
+		Mounts:         []MountConfig{{Target: "/tmp", Type: "tmpfs"}},
+		Files:          []FileConfig{{Path: "/etc/persistent", Content: "value"}},
+		EphemeralFiles: []FileConfig{{Path: "/etc/ephemeral", Content: "secret"}},
+		Init:           []InitConfig{{Exec: "/bin/setup"}},
+		Metadata:       map[string]string{"persistent": "value"},
+	}
+
+	body, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, presence, err := LoadMergedWithPresence([]string{writeYAML(t, string(body))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"boot.cmdline", "boot.root.base", "launch", "mounts", "files", "ephemeral_files", "init", "metadata"} {
+		if presence.Any(field) {
+			t.Errorf("restore-host YAML retained cold-only field %s:\n%s", field, body)
+		}
+	}
+	if host.Boot.Kernel != cfg.Boot.Kernel || host.Boot.Runtime != cfg.Boot.Runtime || host.Network.TAP != cfg.Network.TAP {
+		t.Fatalf("restore-host YAML lost host bindings: %+v\n%s", host, body)
+	}
+	if host.Resources.Startup == nil || host.Resources.Startup.Memory != "2GiB" || !presence.Has("resources.startup.memory") {
+		t.Fatalf("restore-host YAML lost node startup policy: %+v\n%s", host.Resources.Startup, body)
+	}
+	if host.Boot.Root.Overlay == nil {
+		t.Fatalf("restore-host YAML lost the artifact-owned overlay topology assertion:\n%s", body)
+	}
+	if err := host.ValidateRestoreHostConfigWithPresence(presence); err != nil {
+		t.Fatalf("restore-host YAML is not accepted by strict restore validation: %v\n%s", err, body)
+	}
+	if cfg.Launch.Exec != "/bin/app" || len(cfg.Files) != 1 || cfg.Resources.Startup == nil {
+		t.Fatal("marshal mutated its input config")
+	}
+}
+
+func TestSandboxConfigMarshalColdKeepsWorkload(t *testing.T) {
+	cfg, err := Load(writeYAML(t, minimalCold))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Resources.Startup = &StartupConfig{Memory: "2GiB"}
+	cfg.Files = []FileConfig{{Path: "/etc/persistent", Content: "value"}}
+	cfg.Metadata = map[string]string{"persistent": "value"}
+
+	body, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, presence, err := LoadMergedWithPresence([]string{writeYAML(t, string(body))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"boot.cmdline", "resources.startup", "launch", "files", "metadata"} {
+		if !presence.Any(field) {
+			t.Errorf("cold YAML omitted workload field %s:\n%s", field, body)
+		}
+	}
+}
+
 func TestValidateCold_InheritedCgroupFDIsAuthoritative(t *testing.T) {
 	target, err := os.Open("/sys/fs/cgroup")
 	if err != nil {

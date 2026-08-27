@@ -566,7 +566,7 @@ Runtime semantics:
 - plugin/app 按 cold semantics 重新启动.
 - `run --restore` 不重跑 launch/files/init/plugin.
 
-Restore host若显式提供 `boot.cmdline`、`resources.startup`、launch persistent/ephemeral fields、mounts、files/ephemeral_files、init 或 metadata,会在副作用前拒绝,而不是静默忽略.
+Restore host若显式提供 `boot.cmdline`、launch persistent/ephemeral fields、mounts、files/ephemeral_files、init 或 metadata,会在副作用前拒绝,而不是静默忽略. `resources.startup` 是 host-only node policy,可在 restore 时提供;它写入 node reservation contract,但 Snapshot 捕获的 `BudgetAtSnapshot` 仍是 restore initial Budget 的权威值.
 
 ## 4. 资源模型
 
@@ -592,7 +592,7 @@ Budget              = admitted/locally enforced working allowance
 VMM memory.max      = CapacityMemory + host overhead
 ```
 
-Memory S capture记录 CH config/state 和 memfd sparse content;资源 policy 不写入 `snapshot.cfg`. Restore capacity/allocatable identity来自 E,host若显式给出必须一致.
+Memory S capture记录 CH config/state 和 memfd sparse content;资源 policy 不写入 `snapshot.cfg`. Restore capacity/allocatable identity来自 E,host若显式给出必须一致. `startup`、`overhead`、`watermark_high` 和 resource controller binding来自当前 host.
 
 ### 4.3 CPU 与 balloon
 

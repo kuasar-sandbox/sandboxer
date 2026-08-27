@@ -600,8 +600,8 @@ restore_case() { # $1=key $2=resident-floor-bytes
     mincore="$RESULT_ROOT/$key-restore.mincore"
     checksum="${CHECKSUMS[$key]}"
     make_diff "$diff"
-    # resources.startup is cold-only and therefore absent. Restore reserves the
-    # Snapshot's captured BudgetAtSnapshot before accepting new policy input.
+    # Omit the optional host startup policy here. Restore reserves the
+    # Snapshot's captured BudgetAtSnapshot regardless of that policy.
     write_restore_config "$cfg" "$cgroup" "${HEADROOMS[$key]}" "$diff"
 
     echo

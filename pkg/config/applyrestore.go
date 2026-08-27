@@ -48,7 +48,7 @@ func ApplyRestoreRules(artifact *PortableSandboxConfig, host *SandboxConfig, pre
 	runtime.Resources.Control = host.Resources.Control
 	runtime.Resources.Overhead = host.Resources.Overhead
 	runtime.Resources.WatermarkHigh = host.Resources.WatermarkHigh
-	runtime.Resources.Startup = nil
+	runtime.Resources.Startup = host.Resources.Startup
 	runtime.Timeouts = host.Timeouts
 	runtime.Restore = host.Restore
 
@@ -72,7 +72,7 @@ func ApplyRestoreRules(artifact *PortableSandboxConfig, host *SandboxConfig, pre
 
 func rejectRestoreColdOnly(host *SandboxConfig, presence FieldPresence) error {
 	for _, field := range []string{
-		"boot.cmdline", "resources.startup", "launch", "mounts", "files", "ephemeral_files", "init", "metadata",
+		"boot.cmdline", "launch", "mounts", "files", "ephemeral_files", "init", "metadata",
 	} {
 		if presence.Any(field) {
 			return fmt.Errorf("run --restore: %s is cold-start-only and cannot be applied to restored execution state", field)
@@ -82,9 +82,6 @@ func rejectRestoreColdOnly(host *SandboxConfig, presence FieldPresence) error {
 	// values while tolerating ApplyDefaults' inert launch defaults.
 	if host.Boot.Cmdline != "" {
 		return errors.New("run --restore: boot.cmdline is cold-start-only")
-	}
-	if host.Resources.Startup != nil {
-		return errors.New("run --restore: resources.startup is cold-start-only")
 	}
 	if host.Launch.Exec != "" || len(host.Launch.Args) != 0 || len(host.Launch.Env) != 0 ||
 		len(host.Launch.EphemeralEnv) != 0 || host.Launch.Placeholder || len(host.Launch.Plugin) != 0 ||
