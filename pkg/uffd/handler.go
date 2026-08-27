@@ -20,13 +20,22 @@ const (
 	// PageSize must match the granularity uffd was set up with.
 	PageSize = 4096
 
-	// dataNeighborTailBytes bounds speculative Data population to one page.
+	// dataNeighborTailBytes bounds speculative ChunkRun population to one page.
+	// Ordinary stream Data uses ordinaryDataNeighborTailBytes below: its
+	// deferred read is deliberately larger to amortize the cost of the next
+	// sequential UFFD faults during restore.
 	dataNeighborTailBytes = PageSize
 
-	// dataFaultFillBytes includes the urgent Data page and its one-page tail.
-	// Chunk runs use the combined buffer so one source read serves both copies.
+	// dataFaultFillBytes includes the urgent ChunkRun page and its one-page
+	// tail. Chunk runs use the combined buffer so one source read serves both
+	// copies.
 	dataFaultFillBytes = PageSize + dataNeighborTailBytes
 
+	// ordinaryDataNeighborTailBytes bounds the deferred tail for ordinary
+	// stream Data. Keep this fixed and bounded; do not restore the former
+	// adaptive growth up to 1 MiB.
+	ordinaryDataNeighborTailBytes = 32 << 10
+	ordinaryDataFaultFillBytes    = PageSize + ordinaryDataNeighborTailBytes
 	// zeroFaultFillBytes is the fixed total bound for Hole, Zero, and Released
 	// runs. These paths issue no source read, so a 64 KiB cap preserves cold-boot
 	// performance without restoring the former adaptive growth to 1 MiB.
@@ -287,7 +296,7 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		ctx:        ctx,
 		cancel:     cancel,
 		tailQ:      make(chan tailTask, 1),
-		tailBuf:    make([]byte, dataFaultFillBytes),
+		tailBuf:    make([]byte, ordinaryDataFaultFillBytes),
 		tailIdle:   make(chan struct{}, 1),
 		ops:        realUffdOps,
 	}

@@ -88,9 +88,11 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 }
 
 func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, pageBuf []byte) {
-	// Scan far enough to retain the fixed 64 KiB zero-fill unit. Data reads and
-	// guest population are independently capped at dataFaultFillBytes below.
-	hardEnd := h.stateHardEnd(pageOffset, pageIdx, StateAbsent, zeroFaultFillBytes)
+	// The Run kind is not known until RunAt returns, so scan far enough for its
+	// result to identify the run before the handler chooses its fill policy.
+	// Scan far enough for both the zero-fill unit and the ordinary-Data fill;
+	// the selected Run kind applies the final population policy below.
+	hardEnd := h.stateHardEnd(pageOffset, pageIdx, StateAbsent, absentFaultScanLimit())
 	if hardEnd-pageOffset < PageSize {
 		// The fault was classified as Absent before entering this method,
 		// but a concurrent urgent or tail completion may have populated it
@@ -146,7 +148,9 @@ func (h *Handler) handleChunkFault(uffdFD int, pageVA, pageOffset, pageIdx uint6
 		return
 	}
 
-	runLength := min(run.End()-run.Offset(), uint64(len(h.tailBuf)))
+	// tailBuf is sized for ordinary Data, but ChunkRun must retain its tighter
+	// urgent-plus-one-page bound from #121.
+	runLength := min(run.End()-run.Offset(), uint64(dataFaultFillBytes))
 	if err := h.readRun(run, h.tailBuf[:runLength], 0); err != nil {
 		h.releaseTail()
 		h.failUrgent(uffdFD, pageVA, "chunk read off=0x%x len=%d: %v", pageOffset, runLength, err)
@@ -259,6 +263,13 @@ func (h *Handler) stateHardEnd(pageOffset, pageIdx uint64, expected PageState, m
 	}
 	length -= length % PageSize
 	return pageOffset + length
+}
+
+func absentFaultScanLimit() uint64 {
+	if ordinaryDataFaultFillBytes > zeroFaultFillBytes {
+		return ordinaryDataFaultFillBytes
+	}
+	return zeroFaultFillBytes
 }
 
 func alignedRunEnd(start, end uint64) uint64 {
@@ -477,7 +488,10 @@ func (h *Handler) runTailWorker() {
 
 func (h *Handler) processTail(task tailTask) {
 	maxTailBytes := uint64(dataNeighborTailBytes)
-	if task.kind == tailZero {
+	switch task.kind {
+	case tailDeferredData:
+		maxTailBytes = ordinaryDataNeighborTailBytes
+	case tailZero:
 		maxTailBytes = zeroNeighborTailBytes
 	}
 	maxPages := min((task.end-task.start)/PageSize, maxTailBytes/PageSize)
@@ -530,6 +544,14 @@ func (h *Handler) processTail(task tailTask) {
 }
 
 func (h *Handler) executeTailIO(task tailTask, data []byte, length uint64) (uint64, bool) {
+	// Keep the deferred source read amortized over the whole tail window, but
+	// submit ordinary Data to UFFD one page at a time. This gives each
+	// UFFDIO_COPY a short critical section and a page-level state boundary.
+	// ChunkRun tails and zero tails remain batched.
+	if task.kind == tailDeferredData {
+		return h.executeTailCopyPerPage(task, data, length)
+	}
+
 	started := time.Now()
 	var completed int64
 	var err error
@@ -574,6 +596,65 @@ func (h *Handler) executeTailIO(task tailTask, data []byte, length uint64) (uint
 		return done, false
 	}
 	return done, done == length
+}
+
+func (h *Handler) executeTailCopyPerPage(task tailTask, data []byte, length uint64) (uint64, bool) {
+	if length == 0 || length%PageSize != 0 || uint64(len(data)) < length {
+		h.logf("uffd: per-page tail copy has invalid buffer length=%d data=%d", length, len(data))
+		h.stats.tailPartial.Add(1)
+		return 0, false
+	}
+
+	var totalDone uint64
+	for offset := uint64(0); offset < length; offset += PageSize {
+		pageIdx := task.pageIdx + offset/PageSize
+		if h.state.RunLength(pageIdx, 1, task.expected) != 1 {
+			h.stats.tailConflicts.Add(1)
+			return totalDone, false
+		}
+
+		start := int(offset)
+		end := start + PageSize
+		started := time.Now()
+		completed, ioctlErr := h.ops.copy(task.uffdFD, task.dstVA+offset, data[start:end])
+		h.stats.tailCopyNs.Add(uint64(time.Since(started).Nanoseconds()))
+		h.stats.copies.Add(1)
+
+		done, validationErr := checkedCompletion(completed, PageSize)
+		if validationErr != nil {
+			h.logf("uffd: per-page tail COPY invalid completion: %v", validationErr)
+			h.stats.tailPartial.Add(1)
+			return totalDone, false
+		}
+		if done < PageSize {
+			h.stats.tailPartial.Add(1)
+		}
+
+		if done > 0 {
+			pages := done / PageSize
+			changed := h.state.SetRangeIf(pageIdx, pageIdx+pages, task.expected, StateLoaded)
+			h.stats.pagesCopied.Add(pages)
+			h.stats.tailCompleted.Add(pages)
+			totalDone += done
+			if changed != pages {
+				h.stats.tailConflicts.Add(1)
+				return totalDone, false
+			}
+		}
+
+		if ioctlErr != nil {
+			if errors.Is(ioctlErr, unix.EEXIST) || errors.Is(ioctlErr, unix.EAGAIN) || errors.Is(ioctlErr, unix.ENOENT) {
+				h.stats.tailConflicts.Add(1)
+			} else if !errors.Is(ioctlErr, context.Canceled) {
+				h.logf("uffd: best-effort per-page tail COPY: %v", ioctlErr)
+			}
+			return totalDone, false
+		}
+		if done != PageSize {
+			return totalDone, false
+		}
+	}
+	return totalDone, true
 }
 
 func recordAtomicMax(dst *atomic.Uint64, value uint64) {

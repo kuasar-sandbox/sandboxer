@@ -815,6 +815,39 @@ CH为同一 restored memory mapping注册 missing-page events. Host通过 restor
 
 Fault worker优先处理当前缺页;serial tail用于可预测顺序填充. `EVENT_REMOVE` 使已丢弃范围重新成为missing,避免把旧page state误当resident. Context cancellation停止worker并关闭fd/stream owner.
 
+The handler classifies the serving Run before selecting its fill policy. `RunAt` only
+resolves metadata; payload reads use `Run.ReadAt` and never cross `Run.End()`.
+Manifest `fetch.ChunkRun` retains its bounded buffered path, while ordinary file,
+tar, and NFS Data use the deferred path.
+
+| Run/state | Fault worker | Serial tail worker |
+|---|---|---|
+| manifest `fetch.ChunkRun` | If the tail slot is available, read at most 8 KiB and copy the faulting 4 KiB page | Copy at most one buffered 4 KiB neighbor page |
+| ordinary stream Data | Read and copy the faulting 4 KiB page | Read at most 32 KiB, then issue one 4 KiB `UFFDIO_COPY` per page |
+| Hole/Zero | Zero the faulting 4 KiB page without source I/O | Zero at most 60 KiB of contiguous `StateAbsent` pages |
+| `StateReleased` | Zero the faulting 4 KiB page without source I/O | Zero at most 60 KiB of contiguous `StateReleased` pages |
+| `StateLoaded` | Zero only the faulting page if needed | No speculative tail |
+
+The resulting fixed bounds are:
+
+```text
+ChunkRun:             4 KiB urgent + 4 KiB buffered tail = 8 KiB total
+ordinary Data:        4 KiB urgent + 32 KiB deferred tail = 36 KiB total
+Hole/Zero/Released:   4 KiB urgent + 60 KiB zero tail = 64 KiB total
+```
+
+Every bound is additionally clipped by the current CH UFFD region, RAM end,
+`Run.End()`, layered visibility, and the contiguous expected-state range. These
+policies are fixed; they do not restore the former adaptive growth up to 1 MiB.
+Each Handler has one `tailBusy` reservation, a capacity-one tail queue, and one
+36 KiB shared buffer; a busy reservation is dropped rather than blocking the fault
+worker.
+
+The urgent page is the correctness path. Tail work is best effort: it rechecks page
+state before the ioctl and after any source read, records only explicitly completed
+pages as `Loaded`, and stops on `EEXIST`, `EAGAIN`, or `ENOENT`. A stale tail therefore
+cannot turn a page reclaimed by `EVENT_REMOVE` back into `Loaded`.
+
 ## 9. cgroup 与 balloon
 
 ### 9.1 Memory enforcement

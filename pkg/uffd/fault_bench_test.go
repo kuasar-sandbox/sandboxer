@@ -174,7 +174,8 @@ func benchmarkFaultStrategyRun(b *testing.B, fixture benchmarkSnapshotFixture, p
 
 func benchmarkFaultOffset(size uint64, random bool, iteration uint64, seed *uint64) uint64 {
 	// Keep the 1 MiB query inside the fixture so the former full-batch strategy
-	// remains comparable while the current serial-tail strategy is fixed at 8 KiB.
+	// remains comparable while the serial-tail strategy stays within its
+	// per-run bounded fill policy.
 	offsetSpan := size
 	if size > benchmarkBatchBytes {
 		offsetSpan = size - benchmarkBatchBytes + PageSize
@@ -252,7 +253,7 @@ func benchmarkResolveFault(ctx context.Context, source SnapshotReader, offset ui
 		if err := read(buf[:PageSize], 0); err != nil {
 			return 0, 0, err
 		}
-		tail := min(uint64(dataNeighborTailBytes), aligned-PageSize)
+		tail := min(uint64(ordinaryDataNeighborTailBytes), aligned-PageSize)
 		if tail > 0 {
 			if err := read(buf[:tail], PageSize); err != nil {
 				return 0, 0, err

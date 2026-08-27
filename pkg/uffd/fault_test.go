@@ -111,34 +111,73 @@ func TestChunkRunBusyReadsOnlyUrgentPage(t *testing.T) {
 	}
 }
 
-func TestOrdinaryDataFaultReadsFourKiBBeforeDeferredTail(t *testing.T) {
-	const pages = 20
-	source := newRecordingSnapshot(pages*PageSize, sparse.Data, 0x91)
-	h := newUnitHandler(t, pages*PageSize, source)
-	ioctls := newFakeIoctls()
-	h.ops = ioctls.ops()
+func TestOrdinaryDataFaultUsesBoundedDeferredTail(t *testing.T) {
+	const handlerPages = 24
+	for _, tt := range []struct {
+		name      string
+		runPages  uint64
+		wantTail  uint64
+		wantState uint64
+	}{
+		{
+			name:      "full tail window",
+			runPages:  ordinaryDataFaultFillBytes/PageSize + 3,
+			wantTail:  ordinaryDataNeighborTailBytes,
+			wantState: ordinaryDataFaultFillBytes / PageSize,
+		},
+		{
+			name:      "short run truncates tail",
+			runPages:  5,
+			wantTail:  4 * PageSize,
+			wantState: 5,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			source := newRecordingSnapshot(tt.runPages*PageSize, sparse.Data, 0x91)
+			h := newUnitHandler(t, handlerPages*PageSize, source)
+			ioctls := newFakeIoctls()
+			h.ops = ioctls.ops()
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 7}, make([]byte, PageSize))
-	if got := source.readLengths(); !equalUint64s(got, []uint64{PageSize}) {
-		t.Fatalf("foreground Run.ReadAt lengths = %v, want [4096]", got)
-	}
-	if got := source.runLimits(); !equalUint64s(got, []uint64{zeroFaultFillBytes}) {
-		t.Fatalf("metadata RunAt limits = %v, want [%d]", got, zeroFaultFillBytes)
-	}
-	if !h.tailBusy.Load() || len(h.tailQ) != 1 {
-		t.Fatalf("deferred tail reservation: busy=%v queued=%d", h.tailBusy.Load(), len(h.tailQ))
-	}
+			h.handleFault(faultEvent{address: unitCHVA, uffdFD: 7}, make([]byte, PageSize))
+			if got := source.readLengths(); !equalUint64s(got, []uint64{PageSize}) {
+				t.Fatalf("foreground Run.ReadAt lengths = %v, want [4096]", got)
+			}
+			if got := source.runLimits(); !equalUint64s(got, []uint64{absentFaultScanLimit()}) {
+				t.Fatalf("metadata RunAt limits = %v, want [%d]", got, absentFaultScanLimit())
+			}
+			if !h.tailBusy.Load() || len(h.tailQ) != 1 {
+				t.Fatalf("deferred tail reservation: busy=%v queued=%d", h.tailBusy.Load(), len(h.tailQ))
+			}
 
-	startUnitTail(t, h)
-	waitUnitTail(t, h)
-	if got := source.readLengths(); !equalUint64s(got, []uint64{PageSize, dataNeighborTailBytes}) {
-		t.Fatalf("all Run.ReadAt lengths = %v", got)
-	}
-	if calls := ioctls.snapshot(); len(calls) != 2 || calls[0].length != PageSize || calls[1].length != dataNeighborTailBytes {
-		t.Fatalf("ioctl calls = %+v", calls)
-	}
-	if h.state.Get(0) != StateLoaded || h.state.Get(1) != StateLoaded || h.state.Get(2) != StateAbsent {
-		t.Fatalf("states = %v/%v/%v, want Loaded/Loaded/Absent", h.state.Get(0), h.state.Get(1), h.state.Get(2))
+			startUnitTail(t, h)
+			waitUnitTail(t, h)
+			if got := source.readLengths(); !equalUint64s(got, []uint64{PageSize, tt.wantTail}) {
+				t.Fatalf("all Run.ReadAt lengths = %v, want [4096 %d]", got, tt.wantTail)
+			}
+			calls := ioctls.snapshot()
+			wantCalls := 1 + int(tt.wantTail/PageSize)
+			if len(calls) != wantCalls || calls[0].length != PageSize {
+				t.Fatalf("ioctl calls = %+v, want urgent 4096 then %d page copies", calls, tt.wantTail/PageSize)
+			}
+			for i, call := range calls[1:] {
+				if call.kind != "copy" || call.length != PageSize || call.dst != unitCHVA+uint64(i+1)*PageSize {
+					t.Fatalf("tail ioctl %d = %+v, want copy dst=0x%x len=%d", i, call, unitCHVA+uint64(i+1)*PageSize, PageSize)
+				}
+			}
+			stats := h.Stats()
+			wantTailPages := tt.wantTail / PageSize
+			if stats["copy_calls"] != 1+wantTailPages || stats["tail_pages_planned"] != wantTailPages || stats["tail_pages_completed"] != wantTailPages {
+				t.Fatalf("copy metrics = %#v, want copies=%d planned/completed=%d", stats, 1+wantTailPages, wantTailPages)
+			}
+			for page := uint64(0); page < tt.wantState; page++ {
+				if h.state.Get(page) != StateLoaded {
+					t.Fatalf("page %d state = %v, want Loaded", page, h.state.Get(page))
+				}
+			}
+			if h.state.Get(tt.wantState) != StateAbsent {
+				t.Fatalf("page %d state = %v, want Absent", tt.wantState, h.state.Get(tt.wantState))
+			}
+		})
 	}
 }
 
@@ -699,7 +738,7 @@ func newUnitHandlerWithoutMap(t *testing.T, size uint64, source SnapshotReader) 
 		ctx:      ctx,
 		cancel:   cancel,
 		tailQ:    make(chan tailTask, 1),
-		tailBuf:  make([]byte, dataFaultFillBytes),
+		tailBuf:  make([]byte, ordinaryDataFaultFillBytes),
 		tailIdle: make(chan struct{}, 1),
 	}
 	return h
