@@ -41,8 +41,8 @@ func ServeExecRequest(ctx context.Context, conn net.Conn, req ctl.Request, vsock
 // pipeConns copies bytes both ways between a and b. A read EOF in one
 // direction is propagated as a write-side half-close to the peer so the
 // reverse direction can still deliver trailing protocol frames such as
-// exec exit status. A full close is reserved for context cancellation
-// or after both directions have drained.
+// exec exit status. Context cancellation or a copy error fully closes both
+// transports; otherwise the relay closes them after both directions drain.
 func pipeConns(ctx context.Context, a, b net.Conn) {
 	var closeOnce sync.Once
 	closeBoth := func() {

@@ -1771,9 +1771,14 @@ func handleExportRequest(
 		}
 	}()
 	recoveryTerminated := false
+	forwarderNeedsAbort := false
 	if forwarder != nil {
-		forwarder.PauseAndDrain()
+		forwarder.Pause()
+		forwarderNeedsAbort = true
 		defer func() {
+			if forwarderNeedsAbort {
+				forwarder.AbortAndDrain()
+			}
 			if !recoveryTerminated && (err != nil || req.ResumeAfter) {
 				forwarder.Resume()
 			}
@@ -1824,8 +1829,16 @@ func handleExportRequest(
 	}
 	guestRecoveryRequired = true
 	if _, quiesceErr := guestlink.SendQuiesceContext(ctx, client, true); quiesceErr != nil {
+		if forwarderNeedsAbort {
+			forwarder.AbortAndDrain()
+			forwarderNeedsAbort = false
+		}
 		recoveryErr := failRecovery(reattach("failed quiesce"))
 		return ctl.Response{}, errors.Join(fmt.Errorf("export quiesce: %w", quiesceErr), recoveryErr)
+	}
+	if forwarder != nil {
+		forwarder.Drain()
+		forwarderNeedsAbort = false
 	}
 	sinkOpen = false // snapshot.Export owns and closes the sink on every path.
 	out, err := snapshot.Export(ctx, snapshot.ExportSources{
@@ -1870,7 +1883,7 @@ func handleSnapshotRequest(
 	chExited <-chan struct{},
 	chProcess processSignaler,
 	pinger *guestlink.Pinger,
-	forwarder *Forwarder, // gates new forwards + collapses active relays around quiesce; may be nil
+	forwarder *Forwarder, // gates new work, then drains host relays after guest quiesce; may be nil
 	reattachMUX func() error, // re-establishes the stdio MUX after a resumed snapshot attempt; may be nil
 	memoryController *resctl.MemoryController,
 	logf func(string, ...any),
@@ -2143,6 +2156,9 @@ func handleSnapshotRequest(
 			}
 		}
 	}
+	if err := validateProspectiveMemoryConfig(captureMemoryRefs); err != nil {
+		return ctl.Response{}, fmt.Errorf("snapshot: rewritten memory config: %w", err)
+	}
 	sandboxID := opts.SandboxID
 
 	// Every predictable output, admission, dependency, merge and provenance
@@ -2250,14 +2266,19 @@ func handleSnapshotRequest(
 			go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
 		}
 	}()
-	// Gate new port-forward connects and join every admitted handshake/relay
-	// before asking the guest to quiesce. The later `quiesced` response is then
-	// a barrier after both host and guest teardown, so no forward shutdown can
-	// race /vm.pause. Resume mirrors the pinger: stay paused only on the success
-	// + destroy path.
+	// Gate new port-forward/exec work before asking the guest to quiesce, without
+	// perturbing admitted transports. The guest owns the authoritative
+	// reverse-channel close; after `quiesced`, Drain joins the host handlers so
+	// no teardown can race /vm.pause. Resume mirrors the pinger: stay paused only
+	// on the success + destroy path.
+	forwarderNeedsAbort := false
 	if forwarder != nil {
-		forwarder.PauseAndDrain()
+		forwarder.Pause()
+		forwarderNeedsAbort = true
 		defer func() {
+			if forwarderNeedsAbort {
+				forwarder.AbortAndDrain()
+			}
 			if recoveryTerminated {
 				return
 			}
@@ -2295,9 +2316,17 @@ func handleSnapshotRequest(
 	guestRecoveryRequired = true
 	result, qerr := guestlink.SendQuiesceContext(ctx, client, !dropCaches)
 	if qerr != nil {
+		if forwarderNeedsAbort {
+			forwarder.AbortAndDrain()
+			forwarderNeedsAbort = false
+		}
 		operationErr := fmt.Errorf("quiesce: %w", qerr)
 		logf("quiesce: %v (aborting snapshot)", operationErr)
 		return ctl.Response{}, errors.Join(operationErr, failRecovery(reattachRunningGuest("failed quiesce")))
+	}
+	if forwarder != nil {
+		forwarder.Drain()
+		forwarderNeedsAbort = false
 	}
 	dropCachesResult = result
 	guestQuiesced = true
@@ -3308,19 +3337,28 @@ func memoryRefsForSnapshot(binding *MemorySourceBinding, mergeParent bool) ([]st
 	if err != nil {
 		return nil, err
 	}
+	if err := validateProspectiveMemoryConfig(normalized); err != nil {
+		return nil, fmt.Errorf("snapshot: prospective memory config: %w", err)
+	}
+	return normalized, nil
+}
+
+func validateProspectiveMemoryConfig(refs []string) error {
 	// The final E identity is not known until capture, but every sink emits a
 	// bounded content-addressed ref. Validate the complete prospective S config
-	// now with the longest local E ref shape so count, duplicates, ref syntax
-	// and the serialized-size limit all fail before quiesce.
+	// with the longest local E ref shape so count, duplicates, ref syntax and
+	// the serialized-size limit all fail before quiesce. Callers repeat this
+	// after dependency rewriting because distinct source aliases may collapse
+	// to one content-addressed output identity.
 	probeDigest := strings.Repeat("f", 64)
 	if _, err := snapshot.MarshalConfig(&snapshot.Config{
 		Version:    snapshot.SnapshotConfigVersion,
 		SandboxRef: "file://" + probeDigest + ".sandbox@sha256:" + probeDigest,
-		FromRefs:   normalized,
+		FromRefs:   refs,
 	}); err != nil {
-		return nil, fmt.Errorf("snapshot: prospective memory config: %w", err)
+		return err
 	}
-	return normalized, nil
+	return nil
 }
 
 func currentDiskParentBinding(opts RunOptions, index int) (string, string, error) {

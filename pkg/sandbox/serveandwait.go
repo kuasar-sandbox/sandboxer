@@ -510,13 +510,14 @@ func ServeAndWait(p VMParams) (int, error) {
 			return snapHandler.handleExport(req, cgroupPath, chExited)
 		},
 		ExecHandler: func(conn net.Conn, req ctl.Request) {
-			if !forwarder.beginExec(conn) {
+			execCtx, admitted := forwarder.beginExec(backendCtx, conn)
+			if !admitted {
 				defer conn.Close()
 				_ = ctl.WriteMessage(conn, ctl.Response{Type: ctl.TypeError, Msg: "exec unavailable during capture"})
 				return
 			}
 			defer forwarder.endExec(conn)
-			guestlink.ServeExecRequest(backendCtx, conn, req, vsockBase, logf)
+			guestlink.ServeExecRequest(execCtx, conn, req, vsockBase, logf)
 		},
 	}
 	if err := ctlSrv.Listen(); err != nil {

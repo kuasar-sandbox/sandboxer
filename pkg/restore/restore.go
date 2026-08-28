@@ -242,20 +242,21 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, err
 	}
 
-	// Device sockets in CH --disk order: root (1 single / 2 overlay) + each data
-	// disk (1 / 2), as blk0.sock, blk1.sock, … — matching ServeAndWait's layout.
-	nDev := 1
-	if !snapCfg.SingleDisk() {
-		nDev = 2
-	}
-	for i := range snapCfg.Boot.Disks {
-		if snapCfg.Boot.Disks[i].Single() {
-			nDev++
-		} else {
-			nDev += 2
+	// Device sockets and roles in CH --disk order: every overlay expands to a
+	// read-only EROFS base followed by a writable ext4 upper; every single disk
+	// is one writable ext4 device. Both count and per-slot role must match S.
+	diskReadOnly := make([]bool, 0, 1+2*len(snapCfg.Boot.Disks))
+	appendDiskRoles := func(single bool) {
+		if !single {
+			diskReadOnly = append(diskReadOnly, true)
 		}
+		diskReadOnly = append(diskReadOnly, false)
 	}
-	diskSocks := make([]string, nDev)
+	appendDiskRoles(snapCfg.SingleDisk())
+	for i := range snapCfg.Boot.Disks {
+		appendDiskRoles(snapCfg.Boot.Disks[i].Single())
+	}
+	diskSocks := make([]string, len(diskReadOnly))
 	for i := range diskSocks {
 		diskSocks[i] = filepath.Join(runDir, fmt.Sprintf("blk%d.sock", i))
 	}
@@ -339,10 +340,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// succeeds do we create the run directory and persist immutable C0.
 	vsockSock := filepath.Join(runDir, "vsock.sock")
 	rewritten, err := rewriteConfigPaths(snapshotRoot.ConfigJSON, pathRewrite{
-		UffdSocket: uffdSock,
-		DiskSocks:  diskSocks,
-		APISock:    chSock,
-		VsockSock:  vsockSock,
+		UffdSocket:   uffdSock,
+		DiskSocks:    diskSocks,
+		DiskReadOnly: diskReadOnly,
+		APISock:      chSock,
+		VsockSock:    vsockSock,
 	})
 	if err != nil {
 		return -1, fmt.Errorf("rewrite config.json: %w", err)

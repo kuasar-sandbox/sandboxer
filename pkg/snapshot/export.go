@@ -202,7 +202,12 @@ func ValidateExportGraph(portable *config.PortableSandboxConfig, parentSandboxRe
 	for i := range dataRefs {
 		for salt := 0; ; salt++ {
 			digest := sha256.Sum256([]byte(fmt.Sprintf("sandboxer prospective C1 data disk %d salt %d", i, salt)))
-			candidate := "manifest://" + fmt.Sprintf("%x", digest[:])
+			digestHex := fmt.Sprintf("%x", digest[:])
+			// The plaintext FileSink identity is the longest V1 data-artifact
+			// ref emitted by any sink. Manifest and Bundle refs are shorter, and
+			// local HMAC uses a shorter digest-scheme name. Using this shape makes
+			// the canonical-size check below an upper bound for every carrier.
+			candidate := "file://" + digestHex + ".overlay@sha256:" + digestHex
 			if _, exists := used[candidate]; exists {
 				continue
 			}
@@ -211,7 +216,11 @@ func ValidateExportGraph(portable *config.PortableSandboxConfig, parentSandboxRe
 			break
 		}
 	}
-	_, err := portable.Exported(parentSandboxRef, dataRefs, merged)
+	c1, err := portable.Exported(parentSandboxRef, dataRefs, merged)
+	if err != nil {
+		return err
+	}
+	_, err = config.MarshalPortableSandboxConfig(c1)
 	return err
 }
 

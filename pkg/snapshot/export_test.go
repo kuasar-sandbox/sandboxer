@@ -214,6 +214,36 @@ func TestExportRejectsOverlongProspectiveLayerChainBeforePause(t *testing.T) {
 	}
 }
 
+func TestValidateExportGraphRejectsProspectiveConfigSize(t *testing.T) {
+	portable := exportTestPortable(t)
+	portable.Metadata = make(map[string]string)
+	for i := 0; i < 15; i++ {
+		portable.Metadata[fmt.Sprintf("padding-%02d", i)] = strings.Repeat("x", config.MaxPortableScalarBytes)
+	}
+	portable.Metadata["edge"] = "x"
+	raw, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := config.MaxPortableConfigBytes - len(raw)
+	if remaining <= 0 || remaining >= config.MaxPortableScalarBytes {
+		t.Fatalf("portable config calibration has invalid remaining size %d", remaining)
+	}
+	portable.Metadata["edge"] += strings.Repeat("x", remaining)
+	raw, err = config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != config.MaxPortableConfigBytes {
+		t.Fatalf("calibrated C0 size = %d, want %d", len(raw), config.MaxPortableConfigBytes)
+	}
+
+	err = ValidateExportGraph(portable, "", []bool{true, true})
+	if err == nil || !strings.Contains(err.Error(), "portable config exceeds") {
+		t.Fatalf("ValidateExportGraph error = %v, want prospective config-size rejection", err)
+	}
+}
+
 type testExportStream struct{ sparse.Source }
 
 func (s *testExportStream) Close() error { return nil }

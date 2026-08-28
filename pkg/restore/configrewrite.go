@@ -8,10 +8,11 @@ import (
 // pathRewrite gathers the runtime paths that supersede the values
 // captured in the snapshotted config.json.
 type pathRewrite struct {
-	UffdSocket string
-	DiskSocks  []string // vhost sockets in CH --disk (device) order
-	APISock    string
-	VsockSock  string
+	UffdSocket   string
+	DiskSocks    []string // vhost sockets in CH --disk (device) order
+	DiskReadOnly []bool   // expected readonly role for every device slot
+	APISock      string
+	VsockSock    string
 }
 
 // rewriteConfigPaths takes a config.json blob, parses as a generic map,
@@ -50,6 +51,9 @@ func rewriteConfigPaths(in []byte, p pathRewrite) ([]byte, error) {
 	if len(disks) != len(p.DiskSocks) {
 		return nil, fmt.Errorf("rewriteConfigPaths: disk topology mismatch: snapshot has %d devices, Sandbox E requires %d", len(disks), len(p.DiskSocks))
 	}
+	if len(p.DiskReadOnly) != len(p.DiskSocks) {
+		return nil, fmt.Errorf("rewriteConfigPaths: disk topology mismatch: got %d readonly roles for %d Sandbox E devices", len(p.DiskReadOnly), len(p.DiskSocks))
+	}
 	for i, d := range disks {
 		dm, ok := d.(map[string]any)
 		if !ok || dm == nil {
@@ -57,6 +61,18 @@ func rewriteConfigPaths(in []byte, p pathRewrite) ([]byte, error) {
 		}
 		if p.DiskSocks[i] == "" {
 			return nil, fmt.Errorf("rewriteConfigPaths: empty socket for disk slot %d", i)
+		}
+		readOnly := false
+		if raw, exists := dm["readonly"]; exists {
+			var boolean bool
+			boolean, ok = raw.(bool)
+			if !ok {
+				return nil, fmt.Errorf("rewriteConfigPaths: config.json.disks[%d].readonly must be a boolean", i)
+			}
+			readOnly = boolean
+		}
+		if readOnly != p.DiskReadOnly[i] {
+			return nil, fmt.Errorf("rewriteConfigPaths: disk topology mismatch: config.json.disks[%d] readonly=%t conflicts with Sandbox E readonly=%t", i, readOnly, p.DiskReadOnly[i])
 		}
 		dm["vhost_socket"] = p.DiskSocks[i]
 	}

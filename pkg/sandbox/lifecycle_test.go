@@ -773,6 +773,74 @@ func TestHandleSnapshotRequestRejectsMissingLocalMemoryLowerBeforeQuiesce(t *tes
 	}
 }
 
+func TestHandleSnapshotRequestRejectsMemoryRefCollisionBeforeQuiesce(t *testing.T) {
+	dir := t.TempDir()
+	parentCfg, err := snapshot.MarshalConfig(&snapshot.Config{
+		Version:    snapshot.SnapshotConfigVersion,
+		SandboxRef: "manifest://" + strings.Repeat("9", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentRef, parentPath, err := snapshot.NewFileSink(dir, "parent", nil, false, nil).
+		AbsorbSnapshot(context.Background(), lifecycleSnapshotSource(t, make([]byte, 4096), parentCfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := manifest.ParseRef(parentRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasRef := func(name string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.Link(parentPath, path); err != nil {
+			t.Fatal(err)
+		}
+		ref := parsed
+		ref.Path = name
+		return ref.String()
+	}
+	firstRef := aliasRef("first.snapshot")
+	secondRef := aliasRef("second.snapshot")
+
+	mfd, err := memory.Create("memory-ref-collision", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	viewCalled := false
+	mergeRef := false
+	forwarder := NewForwarder("", discardLogf)
+	_, err = handleSnapshotRequest(context.Background(), ctl.Request{
+		OutDir: filepath.Join(dir, "out"), MergeRef: &mergeRef,
+	}, RunOptions{
+		Cfg: &config.SandboxConfig{}, PortableConfig: snapshotTestLivePortable(t), SandboxID: "collision",
+		MemoryBinding: &MemorySourceBinding{
+			SnapshotRef: firstRef, FromRefs: []string{secondRef}, RelativeDir: dir,
+		},
+	}, mfd, []SnapDiskRef{{
+		DiffPath: filepath.Join(dir, "active.diff"), Size: 4096,
+		SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			viewCalled = true
+			return bytes.NewReader(make([]byte, 4096)), nil, nil
+		},
+	}}, nil, filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"),
+		"", nil, nil, nil, forwarder, func() error { return nil }, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "duplicates from_refs") {
+		t.Fatalf("rewritten memory refs error = %v, want duplicate rejection", err)
+	}
+	if viewCalled {
+		t.Fatal("memory-ref collision opened SnapshotView")
+	}
+	forwarder.mu.Lock()
+	quiescing := forwarder.quiescing
+	forwarder.mu.Unlock()
+	if quiescing {
+		t.Fatal("memory-ref collision reached the capture gate")
+	}
+}
+
 func TestHandleSnapshotRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T) {
 	pinger := &guestlink.Pinger{
 		Client: &guestlink.HostClient{BasePath: filepath.Join(t.TempDir(), "must-not-dial.sock")},
