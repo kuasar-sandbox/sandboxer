@@ -423,7 +423,9 @@ func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishSc
 		if imageErr != nil {
 			return "", imageErr
 		}
-		payload = image.Payload
+		// Root images remain flattened EROFS artifacts. Block consumers narrow
+		// them to Payload; publication retains config.json for image defaults.
+		payload = image.FullStream
 	}
 	defer payload.Close()
 	ref, err := p.target.Put(ctx, RoleOverlay, payload)
