@@ -130,12 +130,15 @@ func (c SandboxConfig) MarshalYAML() (any, error) {
 func (c SandboxConfig) isRestoreHostProjection() bool {
 	root := c.Boot.Root
 	// Lifecycle producers resolve startup memory before materializing a run.
-	// Requiring that resolved marker keeps generic/incomplete config rendering
-	// lossless while still recognizing every prepared restore document.
+	// Requiring that resolved marker and the complete absence of an immutable or
+	// active writable upper keeps every valid cold config lossless: ValidateCold
+	// requires at least one of overlay.{base,diff,diff_template}. A prepared
+	// restore document deliberately has none because Sandbox E owns that graph.
 	if c.Resources.Startup == nil || c.Boot.Kernel == "" || c.Boot.Runtime == "" || len(c.Boot.Disks) != 0 || root.Overlay == nil {
 		return false
 	}
 	return root.Diff == "" && root.DiffTemplate == "" && root.DiffSize == "" &&
+		root.Overlay.Base == "" && len(root.Overlay.BaseFromRefs) == 0 &&
 		root.Overlay.Diff == "" && root.Overlay.DiffTemplate == "" && root.Overlay.DiffSize == ""
 }
 

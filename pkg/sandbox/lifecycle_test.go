@@ -41,6 +41,18 @@ type lifecycleArtifactStream struct{ sparse.Source }
 
 func (*lifecycleArtifactStream) Close() error { return nil }
 
+func TestApplyRunCaptureSourcesForwardsBundleFetcher(t *testing.T) {
+	reader := new(manifestbundle.Reader)
+	fetcher := new(manifestbundle.ManifestFetcher)
+	opts := RunOptions{BundleReader: reader, BundleFetcher: fetcher}
+	params := new(VMParams)
+	applyRunCaptureSources(params, opts)
+	if params.BundleReader != reader || params.BundleFetcher != fetcher {
+		t.Fatalf("capture Bundle sources = reader %p fetcher %p, want %p/%p",
+			params.BundleReader, params.BundleFetcher, reader, fetcher)
+	}
+}
+
 func lifecycleSnapshotSource(t testing.TB, memory, snapshotConfig []byte) sparse.Source {
 	t.Helper()
 	logical, err := snapshotfile.BuildSource(

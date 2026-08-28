@@ -536,7 +536,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// faults, the merged launch spec whose conn becomes the stdio MUX
 	// (WireLaunchMUX), and a settle protocol gated on the guest's
 	// hello / launch_ack handshake.
-	return ServeAndWait(VMParams{
+	params := VMParams{
 		Ctx:                ctx,
 		SandboxID:          opts.SandboxID,
 		RunDir:             runDir,
@@ -569,9 +569,6 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		SourceBinding:     opts.SourceBinding,
 		MemoryBinding:     opts.MemoryBinding,
 		ManifestCfg:       opts.ManifestCfg,
-		Fetcher:           opts.Fetcher,
-		BundleReader:      opts.BundleReader,
-		RefLocations:      opts.RefLocations,
 		CustomerKeyFn:     opts.CustomerKeyFn,
 		LocalCodec:        opts.LocalCodec,
 		LocalRequired:     opts.LocalRequired,
@@ -629,7 +626,21 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 			}()
 			return nil
 		},
-	})
+	}
+	applyRunCaptureSources(&params, opts)
+	return ServeAndWait(params)
+}
+
+// applyRunCaptureSources carries the logical and physical source resolvers into
+// the live capture handler. In particular, a cold run opened from a local
+// Manifest Bundle must retain its selector so later export/snapshot merge plans
+// can identify and copy the exact parent Manifests instead of growing the layer
+// graph as if every Bundle ref were remote.
+func applyRunCaptureSources(params *VMParams, opts RunOptions) {
+	params.Fetcher = opts.Fetcher
+	params.BundleReader = opts.BundleReader
+	params.BundleFetcher = opts.BundleFetcher
+	params.RefLocations = opts.RefLocations
 }
 
 // ResolvePortableProjection verifies host kernel/runtime artifacts and returns

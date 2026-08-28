@@ -157,9 +157,6 @@ func restoreFilter(in []byte) ([]byte, error) {
 	for _, k := range []string{"launch", "mounts", "files", "ephemeral_files", "init", "metadata"} {
 		mapDelete(root, k)
 	}
-	if resources := mapGet(root, "resources"); resources != nil {
-		mapDelete(resources, "startup")
-	}
 	stripImmutableDisk := func(disk *yaml.Node) {
 		if disk == nil {
 			return

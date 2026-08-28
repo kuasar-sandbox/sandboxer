@@ -210,6 +210,62 @@ func TestProjectPortableColdExcludesHostAndEphemeralFields(t *testing.T) {
 	}
 }
 
+func TestProjectPortableColdRetainsDataOverlayTop(t *testing.T) {
+	dataTop := "file:///layers/data-top.overlay@sha256:" + testSHA
+	dataLower := "manifest://" + testSHA2
+	cfg := &SandboxConfig{
+		Resources: ResourcesConfig{
+			Capacity:    CapacityConfig{CPU: 2, Memory: "1GiB"},
+			Allocatable: AllocatableConfig{CPU: 1, Memory: "512MiB"},
+		},
+		Boot: BootConfig{
+			Kernel:  "file:///node/vmlinux",
+			Runtime: "file:///node/sandbox-runtime.bundle",
+			Root: RootConfig{
+				Base:    "file:///images/root.erofs@sha256:" + testSHA,
+				Overlay: &OverlayConfig{DiffTemplate: "file:///node/root.ext4"},
+			},
+			Disks: []DiskConfig{{
+				Name: "data",
+				RootConfig: RootConfig{
+					Base: "file:///images/data.erofs@sha256:" + testSHA2,
+					Overlay: &OverlayConfig{
+						Base: dataTop, BaseFromRefs: []string{dataLower},
+						DiffTemplate: "file:///node/data.ext4",
+					},
+				},
+			}},
+		},
+		Mounts: []MountConfig{{Target: "/data", Type: "disk", Source: "data"}},
+	}
+
+	portable, err := ProjectPortableCold(cfg, PortableProjection{
+		KernelRef:  "file://vmlinux@sha256:" + testSHA,
+		RuntimeRef: "file://sandbox-runtime.bundle@sha256:" + testSHA2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := portable.Boot.Disks[0].Overlay
+	if data == nil || data.Base != "file://data-top.overlay@sha256:"+testSHA {
+		t.Fatalf("portable data overlay top = %#v", data)
+	}
+	if len(data.BaseFromRefs) != 1 || data.BaseFromRefs[0] != dataLower {
+		t.Fatalf("portable data overlay lower graph = %v", data.BaseFromRefs)
+	}
+
+	newTop := "file://captured-data.overlay@sha256:" + testSHA2
+	exported, err := portable.Exported("", []string{newTop}, []bool{false, false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = exported.Boot.Disks[0].Overlay
+	if data.Base != newTop || len(data.BaseFromRefs) != 2 ||
+		data.BaseFromRefs[0] != "file://data-top.overlay@sha256:"+testSHA || data.BaseFromRefs[1] != dataLower {
+		t.Fatalf("exported data overlay graph = %#v", data)
+	}
+}
+
 func TestPortableExportedSeparatesRootSelfAndDataRefs(t *testing.T) {
 	cfg := validPortableConfig()
 	cfg.Boot.Root = PortableRootConfig{

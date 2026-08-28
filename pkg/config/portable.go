@@ -182,11 +182,11 @@ func projectColdRoot(root *RootConfig, isRoot bool) (PortableRootConfig, error) 
 		if err != nil {
 			return PortableRootConfig{}, fmt.Errorf("overlay.base_from_refs: %w", err)
 		}
-		if upperBase != "" {
-			chain = append([]string{upperBase}, chain...)
-		}
-		upper := &PortableOverlayConfig{BaseFromRefs: chain}
+		upper := &PortableOverlayConfig{Base: upperBase, BaseFromRefs: chain}
 		if isRoot {
+			if upperBase != "" {
+				upper.BaseFromRefs = append([]string{upperBase}, upper.BaseFromRefs...)
+			}
 			upper.Base = "self"
 		}
 		return PortableRootConfig{Base: base, Overlay: upper}, nil

@@ -172,6 +172,13 @@ func TestSandboxConfigMarshalColdKeepsWorkload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A pre-existing formatted upper is a complete cold writable source. It
+	// must not be confused with the lifecycle-generated restore-host shape,
+	// whose overlay has no active or immutable upper source at all.
+	cfg.Boot.Root.Overlay.Diff = ""
+	cfg.Boot.Root.Overlay.DiffTemplate = ""
+	cfg.Boot.Root.Overlay.DiffSize = ""
+	cfg.Boot.Root.Overlay.Base = "file:///opt/sandbox/root-upper.ext4"
 	cfg.Resources.Startup = &StartupConfig{Memory: "2GiB"}
 	cfg.Files = []FileConfig{{Path: "/etc/persistent", Content: "value"}}
 	cfg.Metadata = map[string]string{"persistent": "value"}
@@ -184,7 +191,7 @@ func TestSandboxConfigMarshalColdKeepsWorkload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"boot.cmdline", "resources.startup", "launch", "files", "metadata"} {
+	for _, field := range []string{"boot.cmdline", "boot.root.overlay.base", "resources.startup", "launch", "files", "metadata"} {
 		if !presence.Any(field) {
 			t.Errorf("cold YAML omitted workload field %s:\n%s", field, body)
 		}
