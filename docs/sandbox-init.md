@@ -509,8 +509,9 @@ registry 和 quiesce gate 建立生命周期顺序。Host 看到的语义是
   与 memory dump 看到的是一致状态
 - **drop_caches=3(请求启用时)**:clean page cache 由当前实例的访问历史和 prefetch
   时序形成,不是恢复进程状态所必需的 dirty 数据.清理它可以减少 capture 中的 resident
-  cache,但 restore 后重新访问这些页时必须从 root filesystem cold-read.这是更小 capture
-  与恢复后读取成本之间的取舍,必须针对 workload 测量.默认跳过此写入;需要该取舍时
+  cache,但 restore 后重新访问这些页时必须从相应 backing filesystem/device cold-read,
+  包括 root filesystem 和 `boot.disks[]` 数据盘.这是更小 capture 与恢复后读取成本之间的
+  取舍,必须针对 workload 测量.默认跳过此写入;需要该取舍时
   显式使用 `--drop-caches=true`;freeze 与 sync 仍照常执行.
 
 `quiesced.drop_caches_result` 回报 `skipped | succeeded | failed`;空值表示旧 guest
