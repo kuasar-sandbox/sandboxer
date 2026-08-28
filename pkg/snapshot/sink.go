@@ -2,12 +2,15 @@ package snapshot
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -26,25 +29,20 @@ func HexKey(k store.ContentKey) string {
 	return hex.EncodeToString(k[:])
 }
 
-// SnapshotSink absorbs the two large snapshot artifacts — the blk1 overlay and
-// the memory+ZIP bundle — straight from their sources to a destination,
-// WITHOUT staging them in /run tmpfs. Three impls share this interface:
-//
-//   - FileSink packs scheme-qualified content-addressed local tarstream
-//     artifacts (<digest>.overlay / <digest>.snapshot) under an output dir.
-//   - IngestSink streams to a manifest store via ingest.Ingester (--upload).
-//   - BundleSink writes every current Manifest/Chunk into one local ZIP64
-//     Bundle using one pre-resolved WriteAdmission (--mode=bundle).
-//
-// Each method takes the source as an io.ReadSeeker plus its authoritative hole
-// map. Memory holes come from SEEK_HOLE on the live memfd; overlay holes come
-// from BlockCOW's dirty bitmap. From the artifact on, the tar envelope is the
-// hole authority. The sink reads only resident extents. They return the
-// artifact's ref (file://<digest>.ext@<scheme>:<digest> | manifest://<key>)
-// and, for file mode, its local path ("" for ingest).
-type SnapshotSink interface {
+// ArtifactSink is the narrow lifecycle writer shared by export and snapshot.
+// Logical roles are explicit methods; there is intentionally no artifact-kind
+// registry or side metadata. Absorb writes immutable content only. Commit*
+// publishes the operation root (local alias or Bundle root) last. Take and
+// Export take ownership of the sink and close it before deciding whether the
+// paused sandbox is resumed or destroyed.
+type ArtifactSink interface {
 	AbsorbOverlay(ctx context.Context, diff io.ReadSeeker, holes []sparse.Extent) (ref, path string, err error)
-	AbsorbBundle(ctx context.Context, mem io.ReadSeeker, holes []sparse.Extent, zip io.Reader) (ref, path string, err error)
+	AbsorbOverlaySource(ctx context.Context, source sparse.Source) (ref, path string, err error)
+	AbsorbSandbox(ctx context.Context, source sparse.Source) (ref, path string, err error)
+	AbsorbSnapshot(ctx context.Context, source sparse.Source) (ref, path string, err error)
+	CommitSandbox(ctx context.Context, ref, path string) error
+	CommitSnapshot(ctx context.Context, ref, path string) error
+	Close() error
 }
 
 // ---------------------------------------------------------------------------
@@ -80,31 +78,56 @@ func (s *FileSink) AbsorbOverlay(ctx context.Context, diff io.ReadSeeker, holes 
 	return localArtifactRef(digest+".overlay", scheme, digest), final, nil
 }
 
-func (s *FileSink) AbsorbBundle(ctx context.Context, mem io.ReadSeeker, holes []sparse.Extent, zip io.Reader) (string, string, error) {
-	memSize, err := seekerSize(mem)
+// AbsorbOverlaySource is the sparse.Source counterpart used by the unified
+// offline publisher. It shares the exact same atomic, crypto and reuse path as
+// live capture without forcing a random-access Stream through an io.Seeker.
+func (s *FileSink) AbsorbOverlaySource(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("overlay source is nil")
+	}
+	scheme, digest, path, err := s.writeArtifact(ctx, "overlay", source)
 	if err != nil {
 		return "", "", err
 	}
-	tail, err := io.ReadAll(zip) // ZIP trailer is small (KB)
-	if err != nil {
-		return "", "", fmt.Errorf("read zip: %w", err)
+	return localArtifactRef(filepath.Base(path), scheme, digest), path, nil
+}
+
+func (s *FileSink) AbsorbSandbox(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("sandbox source is nil")
 	}
-	concat := &concatReadSeeker{mem: mem, memSize: memSize, tail: tail}
-	scheme, digest, final, err := s.writeArtifact(ctx, "snapshot",
-		&seekerSource{rs: concat, size: uint64(memSize) + uint64(len(tail)), holes: holes})
+	scheme, digest, final, err := s.writeArtifact(ctx, "sandbox", source)
 	if err != nil {
 		return "", "", err
 	}
-	// <sid>.snapshot symlink → the immutable content-addressed name, so
-	// File-mode from_refs chains reference the immutable digest-named snapshot
-	// (docs/sandbox.md §6.1).
-	link := filepath.Join(s.outDir, s.sandboxID+".snapshot")
-	_ = os.Remove(link)
-	if err := os.Symlink(digest+".snapshot", link); err != nil {
-		return "", "", fmt.Errorf("symlink %s.snapshot: %w", s.sandboxID, err)
+	s.logf("artifact: %s.sandbox written", digest[:12])
+	return localArtifactRef(digest+".sandbox", scheme, digest), final, nil
+}
+
+func (s *FileSink) AbsorbSnapshot(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("snapshot source is nil")
 	}
-	s.logf("snapshot: %s.snapshot written", digest[:12])
+	scheme, digest, final, err := s.writeArtifact(ctx, "snapshot", source)
+	if err != nil {
+		return "", "", err
+	}
+	s.logf("artifact: %s.snapshot written", digest[:12])
 	return localArtifactRef(digest+".snapshot", scheme, digest), final, nil
+}
+
+func (s *FileSink) CommitSandbox(ctx context.Context, _, path string) error {
+	return s.commitAlias(ctx, "sandbox", path)
+}
+
+func (s *FileSink) CommitSnapshot(ctx context.Context, _, path string) error {
+	return s.commitAlias(ctx, "snapshot", path)
+}
+
+func (*FileSink) Close() error { return nil }
+
+func (s *FileSink) commitAlias(ctx context.Context, role, path string) error {
+	return commitArtifactAlias(ctx, s.outDir, s.sandboxID, role, path)
 }
 
 // writeArtifact packs src as a tarstream artifact (payload named kind plus a
@@ -113,6 +136,9 @@ func (s *FileSink) AbsorbBundle(ctx context.Context, mem io.ReadSeeker, holes []
 // extents flow (holes ride the envelope map); the artifact file itself is dense
 // and survives non-sparse-aware copies and filesystems.
 func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.Source) (string, string, string, error) {
+	if err := validateArtifactAliasID(s.sandboxID); err != nil {
+		return "", "", "", fmt.Errorf("pack %s: %w", kind, err)
+	}
 	if s.required && s.codec == nil {
 		return "", "", "", fmt.Errorf("pack %s: required policy has no codec", kind)
 	}
@@ -220,10 +246,10 @@ func consumeSource(ctx context.Context, source sparse.Source) error {
 		if err != nil {
 			return err
 		}
-		kind, end := run.Kind(), run.End()
-		if end <= offset || end > source.Size() {
-			return fmt.Errorf("invalid sparse run")
+		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > source.Size() {
+			return fmt.Errorf("invalid sparse run at offset %d", offset)
 		}
+		kind, end := run.Kind(), run.End()
 		if kind != sparse.Hole {
 			for position := offset; position < end; {
 				chunk := min(uint64(len(buffer)), end-position)
@@ -247,11 +273,15 @@ func consumeSource(ctx context.Context, source sparse.Source) error {
 // ---------------------------------------------------------------------------
 
 type IngestSink struct {
-	ing  ingest.Ingester
-	logf func(string, ...any)
+	ing       ingest.Ingester
+	closer    io.Closer
+	closeOnce sync.Once
+	closeErr  error
+	logf      func(string, ...any)
 	// Captured for the caller's Response (read via Results after Take).
 	overlayRes *ingest.Result
 	bundleRes  *ingest.Result
+	sandboxRes *ingest.Result
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +303,7 @@ type BundleSink struct {
 	manifests map[store.ContentKey]struct{}
 
 	overlayResults []*ingest.Result
+	sandboxResult  *ingest.Result
 	bundleResult   *ingest.Result
 	finalized      bool
 	closed         bool
@@ -310,6 +341,9 @@ func NewPlannedBundleSink(outDir, sandboxID string, cfg *manifest.Config, keyFn 
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	if err := validateArtifactAliasID(sandboxID); err != nil {
+		return nil, fmt.Errorf("snapshot Bundle: %w", err)
+	}
 	f, err := os.CreateTemp(outDir, sandboxID+".bundle.*.partial")
 	if err != nil {
 		return nil, fmt.Errorf("snapshot Bundle temporary file: %w", err)
@@ -345,6 +379,8 @@ func (s *BundleSink) Results() (overlays []*ingest.Result, root *ingest.Result) 
 	return append([]*ingest.Result(nil), s.overlayResults...), s.bundleResult
 }
 
+func (s *BundleSink) SandboxResult() *ingest.Result { return s.sandboxResult }
+
 func (s *BundleSink) AbsorbOverlay(ctx context.Context, diff io.ReadSeeker, holes []sparse.Extent) (string, string, error) {
 	size, err := seekerSize(diff)
 	if err != nil {
@@ -358,30 +394,60 @@ func (s *BundleSink) AbsorbOverlay(ctx context.Context, diff io.ReadSeeker, hole
 	return "manifest://" + HexKey(result.ManifestKey), "", nil
 }
 
-func (s *BundleSink) AbsorbBundle(ctx context.Context, mem io.ReadSeeker, holes []sparse.Extent, zip io.Reader) (string, string, error) {
-	memSize, err := seekerSize(mem)
+func (s *BundleSink) AbsorbOverlaySource(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("overlay source is nil")
+	}
+	result, err := s.ingestSource(ctx, source, nil, "overlay dependency")
 	if err != nil {
 		return "", "", err
 	}
-	tail, err := io.ReadAll(zip)
+	s.overlayResults = append(s.overlayResults, result)
+	return "manifest://" + HexKey(result.ManifestKey), "", nil
+}
+
+func (s *BundleSink) AbsorbSandbox(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("sandbox source is nil")
+	}
+	result, err := s.ingestSource(ctx, source, nil, "Sandbox E")
 	if err != nil {
-		return "", "", fmt.Errorf("read inner snapshot ZIP: %w", err)
+		return "", "", err
 	}
-	source := &seekerSource{
-		rs:    &concatReadSeeker{mem: mem, memSize: memSize, tail: tail},
-		size:  uint64(memSize) + uint64(len(tail)),
-		holes: holes,
+	s.sandboxResult = result
+	return "manifest://" + HexKey(result.ManifestKey), "", nil
+}
+
+func (s *BundleSink) AbsorbSnapshot(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("snapshot source is nil")
 	}
-	result, err := s.ingestSource(ctx, source, holes, "memory section")
+	result, err := s.ingestSource(ctx, source, nil, "Snapshot S")
 	if err != nil {
 		return "", "", err
 	}
 	s.bundleResult = result
-	if err := s.finalize(ctx, result.ManifestKey); err != nil {
-		return "", "", err
+	return "manifest://" + HexKey(result.ManifestKey), "", nil
+}
+
+func (s *BundleSink) CommitSandbox(ctx context.Context, ref, _ string) error {
+	return s.commitRoot(ctx, ref, "sandbox")
+}
+
+func (s *BundleSink) CommitSnapshot(ctx context.Context, ref, _ string) error {
+	return s.commitRoot(ctx, ref, "snapshot")
+}
+
+func (s *BundleSink) commitRoot(ctx context.Context, ref, role string) error {
+	parsed, err := manifest.ParseRef(ref)
+	if err != nil || parsed.Scheme != manifest.RefSchemeManifest {
+		return fmt.Errorf("commit Bundle %s root: expected manifest ref", role)
 	}
-	final := filepath.Join(s.outDir, HexKey(result.ManifestKey)+".bundle")
-	return "manifest://" + HexKey(result.ManifestKey), final, nil
+	key, err := manifest.ParseKeyRef(parsed.Path)
+	if err != nil {
+		return fmt.Errorf("commit Bundle %s root: %w", role, err)
+	}
+	return s.finalize(ctx, key, role)
 }
 
 // IngestStream collects one already-decoded local parent or immutable
@@ -445,7 +511,7 @@ func (s *BundleSink) ingestSource(ctx context.Context, source sparse.Source, hol
 	return result, nil
 }
 
-func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey) error {
+func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, role string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -475,16 +541,11 @@ func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey) error 
 	if err := syncDirectory(s.outDir); err != nil {
 		return fmt.Errorf("sync snapshot Bundle directory: %w", err)
 	}
-	link := filepath.Join(s.outDir, s.sandboxID+".snapshot")
-	_ = os.Remove(link)
-	if err := os.Symlink(filepath.Base(final), link); err != nil {
-		return fmt.Errorf("symlink %s.snapshot: %w", s.sandboxID, err)
-	}
-	if err := syncDirectory(s.outDir); err != nil {
-		return fmt.Errorf("sync snapshot Bundle symlink directory: %w", err)
+	if err := commitArtifactAlias(ctx, s.outDir, s.sandboxID, role, final); err != nil {
+		return fmt.Errorf("commit %s Bundle alias: %w", role, err)
 	}
 	s.finalized = true
-	s.logf("snapshot: %s.bundle written", HexKey(root)[:12])
+	s.logf("artifact: %s.bundle written as %s root", HexKey(root)[:12], role)
 	return nil
 }
 
@@ -533,20 +594,150 @@ func (s *BundleSink) Close() error {
 }
 
 func syncDirectory(path string) error {
-	directory, err := os.Open(path)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}
+	directory := os.NewFile(uintptr(fd), path)
 	syncErr := directory.Sync()
 	closeErr := directory.Close()
 	return errors.Join(syncErr, closeErr)
+}
+
+func validateArtifactAliasID(sandboxID string) error {
+	if sandboxID == "" || sandboxID == "." || sandboxID == ".." || filepath.Base(sandboxID) != sandboxID || strings.ContainsAny(sandboxID, `/\`) {
+		return fmt.Errorf("sandbox id %q is not a safe alias component", sandboxID)
+	}
+	return nil
+}
+
+func commitArtifactAlias(ctx context.Context, outDir, sandboxID, role, artifactPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateArtifactAliasID(sandboxID); err != nil {
+		return err
+	}
+	if role != "sandbox" && role != "snapshot" {
+		return fmt.Errorf("unsupported artifact alias role %q", role)
+	}
+	if artifactPath == "" {
+		return fmt.Errorf("commit %s alias: empty artifact path", role)
+	}
+	outAbs, err := filepath.Abs(outDir)
+	if err != nil {
+		return fmt.Errorf("commit %s alias output directory: %w", role, err)
+	}
+	artifactAbs, err := filepath.Abs(artifactPath)
+	if err != nil {
+		return fmt.Errorf("commit %s alias artifact path: %w", role, err)
+	}
+	if filepath.Dir(artifactAbs) != filepath.Clean(outAbs) {
+		return fmt.Errorf("commit %s alias artifact is outside the output directory", role)
+	}
+	fd, err := unix.Open(artifactAbs, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("commit %s alias artifact: %w", role, err)
+	}
+	artifact := os.NewFile(uintptr(fd), artifactAbs)
+	info, statErr := artifact.Stat()
+	closeErr := artifact.Close()
+	if statErr != nil || closeErr != nil {
+		return fmt.Errorf("commit %s alias artifact: %w", role, errors.Join(statErr, closeErr))
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("commit %s alias artifact is not a regular file", role)
+	}
+
+	alias := filepath.Join(outAbs, sandboxID+"."+role)
+	oldTarget := ""
+	hadAlias := false
+	if oldInfo, lstatErr := os.Lstat(alias); lstatErr == nil {
+		if oldInfo.Mode()&os.ModeSymlink == 0 {
+			return fmt.Errorf("commit %s alias refuses to replace a non-symlink", role)
+		}
+		oldTarget, err = os.Readlink(alias)
+		if err != nil {
+			return fmt.Errorf("read existing %s alias: %w", role, err)
+		}
+		hadAlias = true
+	} else if !os.IsNotExist(lstatErr) {
+		return fmt.Errorf("inspect existing %s alias: %w", role, lstatErr)
+	}
+
+	target := filepath.Base(artifactAbs)
+	temporary, err := createAliasSymlink(outAbs, sandboxID, role, target)
+	if err != nil {
+		return err
+	}
+	temporaryOpen := true
+	defer func() {
+		if temporaryOpen {
+			_ = os.Remove(temporary)
+		}
+	}()
+	if err := os.Rename(temporary, alias); err != nil {
+		return fmt.Errorf("commit %s alias: %w", role, err)
+	}
+	temporaryOpen = false
+	if err := syncDirectory(outAbs); err == nil {
+		return nil
+	} else {
+		rollbackErr := rollbackArtifactAlias(outAbs, alias, sandboxID, role, target, hadAlias, oldTarget)
+		return fmt.Errorf("sync %s alias directory: %w", role, errors.Join(err, rollbackErr))
+	}
+}
+
+func createAliasSymlink(outDir, sandboxID, role, target string) (string, error) {
+	for attempt := 0; attempt < 16; attempt++ {
+		var suffix [16]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return "", fmt.Errorf("create %s alias randomness: %w", role, err)
+		}
+		path := filepath.Join(outDir, "."+sandboxID+"."+role+"."+hex.EncodeToString(suffix[:])+".tmp")
+		if err := os.Symlink(target, path); err == nil {
+			return path, nil
+		} else if !os.IsExist(err) {
+			return "", fmt.Errorf("create %s alias temporary symlink: %w", role, err)
+		}
+	}
+	return "", fmt.Errorf("create %s alias temporary symlink: name collision limit exceeded", role)
+}
+
+func rollbackArtifactAlias(outDir, alias, sandboxID, role, newTarget string, hadAlias bool, oldTarget string) error {
+	if hadAlias {
+		temporary, err := createAliasSymlink(outDir, sandboxID, role, oldTarget)
+		if err != nil {
+			return fmt.Errorf("restore prior %s alias: %w", role, err)
+		}
+		if err := os.Rename(temporary, alias); err != nil {
+			_ = os.Remove(temporary)
+			return fmt.Errorf("restore prior %s alias: %w", role, err)
+		}
+	} else {
+		current, err := os.Readlink(alias)
+		if err != nil {
+			return fmt.Errorf("remove failed %s alias: %w", role, err)
+		}
+		if current != newTarget {
+			return fmt.Errorf("remove failed %s alias: target changed concurrently", role)
+		}
+		if err := os.Remove(alias); err != nil {
+			return fmt.Errorf("remove failed %s alias: %w", role, err)
+		}
+	}
+	if err := syncDirectory(outDir); err != nil {
+		return fmt.Errorf("sync restored %s alias directory: %w", role, err)
+	}
+	return nil
 }
 
 func NewIngestSink(ing ingest.Ingester, logf func(string, ...any)) *IngestSink {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &IngestSink{ing: ing, logf: logf}
+	closer, _ := ing.(io.Closer)
+	return &IngestSink{ing: ing, closer: closer, logf: logf}
 }
 
 // Results returns the overlay and bundle ingest results (nil until the
@@ -554,6 +745,8 @@ func NewIngestSink(ing ingest.Ingester, logf func(string, ...any)) *IngestSink {
 func (s *IngestSink) Results() (overlay, bundle *ingest.Result) {
 	return s.overlayRes, s.bundleRes
 }
+
+func (s *IngestSink) SandboxResult() *ingest.Result { return s.sandboxRes }
 
 func (s *IngestSink) AbsorbOverlay(ctx context.Context, diff io.ReadSeeker, holes []sparse.Extent) (string, string, error) {
 	size, err := seekerSize(diff)
@@ -568,26 +761,55 @@ func (s *IngestSink) AbsorbOverlay(ctx context.Context, diff io.ReadSeeker, hole
 	return "manifest://" + HexKey(res.ManifestKey), "", nil
 }
 
-func (s *IngestSink) AbsorbBundle(ctx context.Context, mem io.ReadSeeker, holes []sparse.Extent, zip io.Reader) (string, string, error) {
-	memSize, err := seekerSize(mem)
+func (s *IngestSink) AbsorbOverlaySource(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("overlay source is nil")
+	}
+	res, err := s.run(ctx, source, nil, "overlay dependency")
 	if err != nil {
 		return "", "", err
 	}
-	tail, err := io.ReadAll(zip) // ZIP trailer is small (KB)
-	if err != nil {
-		return "", "", fmt.Errorf("read zip: %w", err)
+	s.overlayRes = res
+	return "manifest://" + HexKey(res.ManifestKey), "", nil
+}
+
+func (s *IngestSink) AbsorbSandbox(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("sandbox source is nil")
 	}
-	// Present [mem][zip] as one sparse source so ingest records the
-	// memory holes and reads only resident extents — no tmpfs copy of
-	// the bundle (the ZIP tail is plain data after the memory section).
-	concat := &concatReadSeeker{mem: mem, memSize: memSize, tail: tail}
-	src := &seekerSource{rs: concat, size: uint64(memSize) + uint64(len(tail)), holes: holes}
-	res, err := s.run(ctx, src, holes, "memory section")
+	res, err := s.run(ctx, source, nil, "Sandbox E")
+	if err != nil {
+		return "", "", err
+	}
+	s.sandboxRes = res
+	return "manifest://" + HexKey(res.ManifestKey), "", nil
+}
+
+func (s *IngestSink) AbsorbSnapshot(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("snapshot source is nil")
+	}
+	res, err := s.run(ctx, source, nil, "Snapshot S")
 	if err != nil {
 		return "", "", err
 	}
 	s.bundleRes = res
 	return "manifest://" + HexKey(res.ManifestKey), "", nil
+}
+
+func (s *IngestSink) CommitSandbox(context.Context, string, string) error  { return nil }
+func (s *IngestSink) CommitSnapshot(context.Context, string, string) error { return nil }
+
+func (s *IngestSink) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		if s.closer != nil {
+			s.closeErr = s.closer.Close()
+		}
+	})
+	return s.closeErr
 }
 
 // run ingests src with a throttled progress log (effective denominator = size
@@ -676,61 +898,6 @@ func (fd fdReaderAt) ReadAt(p []byte, off int64) (int, error) {
 // ownership). CH is paused during snapshot, so the memfd content is stable.
 func memfdReader(fd int, size int64) io.ReadSeeker {
 	return io.NewSectionReader(fdReaderAt(fd), 0, size)
-}
-
-// concatReadSeeker presents [mem (0..memSize)] followed by [tail] as one
-// io.ReadSeeker, so ingest.Ingest can Seek to each data segment across the
-// memory/ZIP boundary (skipping memory holes → resident-only reads).
-type concatReadSeeker struct {
-	mem     io.ReadSeeker
-	memSize int64
-	tail    []byte
-	pos     int64
-}
-
-func (c *concatReadSeeker) Seek(off int64, whence int) (int64, error) {
-	var abs int64
-	switch whence {
-	case io.SeekStart:
-		abs = off
-	case io.SeekCurrent:
-		abs = c.pos + off
-	case io.SeekEnd:
-		abs = c.memSize + int64(len(c.tail)) + off
-	default:
-		return 0, fmt.Errorf("concat: invalid whence %d", whence)
-	}
-	if abs < 0 {
-		return 0, fmt.Errorf("concat: negative position %d", abs)
-	}
-	c.pos = abs
-	if abs < c.memSize {
-		if _, err := c.mem.Seek(abs, io.SeekStart); err != nil {
-			return 0, err
-		}
-	}
-	return abs, nil
-}
-
-func (c *concatReadSeeker) Read(p []byte) (int, error) {
-	total := c.memSize + int64(len(c.tail))
-	if c.pos >= total {
-		return 0, io.EOF
-	}
-	if c.pos < c.memSize {
-		if maxN := c.memSize - c.pos; int64(len(p)) > maxN {
-			p = p[:maxN]
-		}
-		n, err := c.mem.Read(p)
-		c.pos += int64(n)
-		if err == io.EOF {
-			err = nil // memory section ended; the tail still follows
-		}
-		return n, err
-	}
-	n := copy(p, c.tail[c.pos-c.memSize:])
-	c.pos += int64(n)
-	return n, nil
 }
 
 // seekerSource adapts the sink's wire-in pair (io.ReadSeeker + static

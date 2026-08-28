@@ -31,6 +31,7 @@ func DefaultDiffURI(baseRoot, sandboxID string) string {
 // rule:
 //
 //   - existing non-empty diff → kept as-is (size = its on-disk size)
+//   - existing empty diff     → rejected (it cannot be atomically provisioned)
 //   - else diff_template set  → record its logical source path (its size wins)
 //   - else base present       → blank diff sized to the base (vdb = base ext4)
 //   - else                    → error (a blank diff is not a mountable ext4)
@@ -41,6 +42,7 @@ func PrepareDiff(diffPath, templateURI string, baseSize, _ int64) (vhost.DiffIni
 		if st.Size() > 0 {
 			return vhost.DiffInit{Existing: true}, nil
 		}
+		return vhost.DiffInit{}, fmt.Errorf("existing diff %s is empty; remove it or provide a formatted diff", diffPath)
 	} else if !os.IsNotExist(err) {
 		return vhost.DiffInit{}, fmt.Errorf("stat diff %s: %w", diffPath, err)
 	}

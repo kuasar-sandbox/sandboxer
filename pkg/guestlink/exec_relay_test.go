@@ -2,12 +2,55 @@ package guestlink
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
+
+func TestOpenMUXViaExecContextCancelsStalledAck(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	requestRead := make(chan struct{})
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		req, err := proto.ReadMessage(c)
+		if err != nil {
+			t.Errorf("read exec request: %v", err)
+			return
+		}
+		if req.Type != proto.TypeExec {
+			t.Errorf("request type = %q, want %q", req.Type, proto.TypeExec)
+		}
+		close(requestRead)
+		_, _ = io.Copy(io.Discard, c)
+	})
+	defer proxy.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := openMUXViaExecContext(ctx, &HostClient{BasePath: base},
+			&proto.ExecSpec{Argv: []string{"sleep", "60"}}, 24*time.Hour)
+		done <- err
+	}()
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("exec request was not received")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("openMUXViaExecContext() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stalled exec_ack was not cancelled")
+	}
+}
 
 func TestPipeConnsKeepsReverseDirectionAfterHalfClose(t *testing.T) {
 	client, relayClient := unixConnPair(t, "client")
@@ -48,6 +91,74 @@ func TestPipeConnsKeepsReverseDirectionAfterHalfClose(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("pipeConns did not return after both half-closes")
+	}
+}
+
+func TestPipeConnsFullLocalCloseForcesGuestConnectionClosed(t *testing.T) {
+	client, relayClient := unixConnPair(t, "client-full-close")
+	defer client.Close()
+	relayGuest, guest := unixConnPair(t, "guest-full-close")
+	defer guest.Close()
+
+	done := make(chan struct{})
+	go func() {
+		pipeConns(context.Background(), relayClient, relayGuest)
+		close(done)
+	}()
+
+	// Abort/shutdown closes the admitted ctl-side connection itself. That is
+	// distinct from a CLI CloseWrite: the guest reverse session must be fully
+	// closed so its silent read side cannot keep the exec handler in the drain.
+	if err := relayClient.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		_ = guest.Close()
+		<-done
+		t.Fatal("pipeConns remained blocked on the guest after a full local close")
+	}
+}
+
+func TestPipeConnsCaptureCancelAfterLocalHalfCloseClosesGuest(t *testing.T) {
+	client, relayClient := unixConnPair(t, "client-half-then-capture")
+	defer client.Close()
+	relayGuest, guest := unixConnPair(t, "guest-half-then-capture")
+	defer guest.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		pipeConns(ctx, relayClient, relayGuest)
+		close(done)
+	}()
+	if err := client.(*net.UnixConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if err := guest.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := guest.Read(make([]byte, 1)); n != 0 || err == nil {
+		t.Fatalf("guest read after local half-close = %d, %v; want EOF", n, err)
+	}
+	if err := guest.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Abort/shutdown first cancels the admitted exec context, then closes its ctl
+	// connection. The explicit cancellation must close the guest side even though
+	// the ctl-to-guest copy already returned cleanly on EOF.
+	cancel()
+	_ = relayClient.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		_ = guest.Close()
+		<-done
+		t.Fatal("pipeConns remained blocked after capture cancellation")
 	}
 }
 

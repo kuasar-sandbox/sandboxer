@@ -85,6 +85,24 @@ func TestSnapshotCmdRejectsUploadWithExplicitMode(t *testing.T) {
 	}
 }
 
+func TestSnapshotCmdRejectsNegativeTimeout(t *testing.T) {
+	if code := snapshotCmd([]string{"--sandbox-id", "test", "--output", t.TempDir(), "--timeout", "-1"}); code != 2 {
+		t.Fatalf("snapshotCmd exit=%d, want 2", code)
+	}
+}
+
+func TestSnapshotCmdRejectsPositionalArguments(t *testing.T) {
+	if code := snapshotCmd([]string{"--sandbox-id", "test", "--output", t.TempDir(), "extra"}); code != 2 {
+		t.Fatalf("snapshotCmd exit=%d, want 2", code)
+	}
+}
+
+func TestSnapshotCmdRejectsUnsafeSandboxID(t *testing.T) {
+	if code := snapshotCmd([]string{"--sandbox-id", "../test", "--output", t.TempDir()}); code != 2 {
+		t.Fatalf("snapshotCmd exit=%d, want 2", code)
+	}
+}
+
 func TestSnapshotDropCachesWarning(t *testing.T) {
 	tests := []struct {
 		name       string

@@ -3,7 +3,7 @@
 # e2e_sandbox_restore.sh — chained:
 #   1. Cold-start sandbox running a python TICK counter
 #   2. Wait until counter reaches a known value (e.g. TICK 10)
-#   3. snapshot the sandbox to <out>/<sid>.snapshot + <sha256>.overlay
+#   3. snapshot the sandbox to Snapshot S plus its referenced Sandbox E
 #      (--resume=false default destroys sandbox after dump)
 #   4. Run --restore=<file> to resume; vCPU should resume the counter
 #   5. Confirm the restored process keeps counting from where it
@@ -184,9 +184,8 @@ DIFF_RESTORE="$WORK/runtime/blk1-restore.diff"
 truncate -s 1G "$DIFF_RESTORE"
 mkfs.ext4 -q -F "$DIFF_RESTORE"
 
-# Host yaml for restore: capacity/runtime/base must match snapshot.cfg
-# per docs §11.0 — declare them explicitly (same as the cold yaml).
-# overlay.base is always taken from snapshot.cfg (host value ignored).
+# Restore host yaml supplies bindings and policy only. Snapshot S points to E;
+# E owns launch, mounts/files/init and the complete immutable disk graph.
 cat > "$WORK/host.yaml" <<EOF
 resources:
   capacity:    { cpu: 1, memory: 512MiB }
@@ -200,13 +199,9 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_RESTORE
       size: 1GiB
-launch:
-  # Deliberately opposite: snapshot.cfg owns the already-running guest topology.
-  cgroup_control: false
 EOF
 
 LOG2="$WORK/run2.log"

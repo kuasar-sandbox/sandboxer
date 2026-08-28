@@ -218,8 +218,8 @@ func (a *acceptListeners) reopen() {
 // `sessions` and lingered below) and clears the bound addresses so the
 // snapshot captures none; they rebind lazily after resume. Sessions are
 // closed concurrently so the aggregate stays within the quiesce deadline.
-// Called by the quiesce handler, alongside killExecChildren + the stdio MUX
-// close.
+// Called by the quiesce handler, alongside the exec-session drain and stdio
+// MUX close.
 func closeConnectSessions(reg *connRegistry, lns *acceptListeners) {
 	sessions := reg.beginQuiesce()
 	lns.closeAll()

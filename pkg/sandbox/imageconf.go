@@ -1,12 +1,14 @@
 package sandbox
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
@@ -28,6 +30,71 @@ type ImageConfig struct {
 	User       string              // OCI User (uid:gid or name:group)
 	StopSignal string              // OCI StopSignal (name or number)
 	Volumes    map[string]struct{} // OCI Volumes; each → implicit empty mount
+}
+
+// MaterializeImageDefaults folds the persistent OCI image defaults into the
+// portable workload fields of cfg.  A Sandbox artifact must remain runnable
+// after a parent .sandbox used as a disk layer is published as Payload only;
+// consequently C0 cannot depend on recursively reading that parent's
+// config.json. EphemeralEnv is deliberately excluded from the fold and kept
+// as invocation-only input.
+//
+// The resulting launch is idempotent when it is merged with the same image
+// again: Exec is explicit, image environment keys are already present, and
+// image Volumes have become explicit empty mounts.
+func MaterializeImageDefaults(cfg *config.SandboxConfig, image *ImageConfig) error {
+	if cfg == nil {
+		return errors.New("materialize image defaults: nil Sandbox config")
+	}
+	persistent := cfg.Launch
+	persistent.EphemeralEnv = nil
+	spec, err := MergeLaunch(image, persistent)
+	if err != nil {
+		return err
+	}
+	eph := cfg.Launch.EphemeralEnv
+	cfg.Launch.Exec = spec.Exec
+	cfg.Launch.Args = append([]string(nil), spec.Args...)
+	cfg.Launch.Env = cloneLaunchEnv(spec.Env)
+	cfg.Launch.Workdir = spec.Workdir
+	cfg.Launch.Restart = spec.Restart
+	cfg.Launch.CgroupControl = spec.CgroupControl
+	cfg.Launch.Placeholder = spec.Placeholder
+	cfg.Launch.User = spec.User
+	if spec.StopSignal != 0 {
+		cfg.Launch.StopSignal = strconv.Itoa(spec.StopSignal)
+	} else {
+		cfg.Launch.StopSignal = ""
+	}
+	cfg.Launch.EphemeralEnv = eph
+
+	mounts := effectiveMounts(cfg.Mounts, imageVolumes(image))
+	cfg.Mounts = make([]config.MountConfig, len(mounts))
+	for i := range mounts {
+		cfg.Mounts[i] = config.MountConfig{
+			Target: mounts[i].Target, Type: mounts[i].Type,
+			Source: mounts[i].Source, Options: mounts[i].Options,
+		}
+	}
+	return nil
+}
+
+func imageVolumes(image *ImageConfig) map[string]struct{} {
+	if image == nil {
+		return nil
+	}
+	return image.Volumes
+}
+
+func cloneLaunchEnv(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 // LoadImageConfig reads the trailing ZIP from the rootfs erofs at
@@ -69,6 +136,11 @@ func LoadImageConfig(path string) (*ImageConfig, error) {
 // image.RuntimeConfig (persisted shape) into our internal
 // ImageConfig (merge-step shape).
 func LoadImageConfigFrom(r io.ReaderAt, size int64) (*ImageConfig, error) {
+	if provider, ok := r.(interface{ ImageConfigBytes() []byte }); ok {
+		if raw := provider.ImageConfigBytes(); raw != nil {
+			return LoadImageConfigBytes(raw)
+		}
+	}
 	rc, err := image.ReadConfig(r, size)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -76,6 +148,20 @@ func LoadImageConfigFrom(r io.ReaderAt, size int64) (*ImageConfig, error) {
 		}
 		return nil, fmt.Errorf("load image config: %w", err)
 	}
+	return imageConfigFromRuntime(rc), nil
+}
+
+// LoadImageConfigBytes decodes the exact config.json bytes retained by a
+// strict flattened image or Sandbox reader.
+func LoadImageConfigBytes(raw []byte) (*ImageConfig, error) {
+	var rc image.RuntimeConfig
+	if err := json.Unmarshal(raw, &rc); err != nil {
+		return nil, fmt.Errorf("load image config: %w", err)
+	}
+	return imageConfigFromRuntime(&rc), nil
+}
+
+func imageConfigFromRuntime(rc *image.RuntimeConfig) *ImageConfig {
 	return &ImageConfig{
 		Cmd:        rc.Cmd,
 		Entrypoint: rc.Entrypoint,
@@ -84,7 +170,7 @@ func LoadImageConfigFrom(r io.ReaderAt, size int64) (*ImageConfig, error) {
 		User:       rc.User,
 		StopSignal: rc.StopSignal,
 		Volumes:    rc.Volumes,
-	}, nil
+	}
 }
 
 // MergeLaunch combines image defaults with the sandbox.yaml launch
@@ -152,6 +238,9 @@ func MergeLaunch(image *ImageConfig, override config.LaunchConfig) (*proto.Launc
 		}
 	}
 	for k, v := range override.Env {
+		envMap[k] = v
+	}
+	for k, v := range override.EphemeralEnv {
 		envMap[k] = v
 	}
 	if len(envMap) > 0 {

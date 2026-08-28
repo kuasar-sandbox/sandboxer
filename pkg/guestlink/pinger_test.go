@@ -14,14 +14,18 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
-// TestPinger_TickAndPause runs a fake guest behind a fakeCHProxy and
-// verifies the ticker fires, RTT samples accumulate, and Pause stops
-// new attempts without tearing the goroutine down.
+// TestPinger_TickAndPause runs a fake guest behind a fakeCHProxy and verifies
+// Pause joins an in-flight probe through guest connection close before
+// returning, while Resume admits a later probe without tearing down the ticker
+// goroutine.
 func TestPinger_TickAndPause(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "vsock.sock")
 
 	var seen atomic.Uint64
+	requests := make(chan uint64, 4)
+	release := make(chan struct{}, 4)
+	peerDone := make(chan error, 4)
 	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
 		req, err := proto.ReadMessage(c)
 		if err != nil {
@@ -32,17 +36,20 @@ func TestPinger_TickAndPause(t *testing.T) {
 			return
 		}
 		seen.Add(1)
-		_ = proto.WriteMessage(c, &proto.Message{
+		requests <- req.ID
+		<-release
+		writeErr := proto.WriteMessage(c, &proto.Message{
 			Type:    proto.TypePong,
 			ID:      req.ID,
 			TSendNs: req.TSendNs,
 		})
+		peerDone <- writeErr
 	})
 	defer proxy.close()
 
 	p := &Pinger{
 		Client: &HostClient{BasePath: base},
-		Cfg:    PingerConfig{Interval: 30 * time.Millisecond, Timeout: 200 * time.Millisecond},
+		Cfg:    PingerConfig{Interval: 10 * time.Millisecond, Timeout: 2 * time.Second},
 		Stats:  &PingStats{},
 		Logf:   t.Logf,
 	}
@@ -52,37 +59,46 @@ func TestPinger_TickAndPause(t *testing.T) {
 	p.Start(ctx)
 	defer p.Stop()
 
-	// Wait for at least 3 pings.
-	deadline := time.Now().Add(1 * time.Second)
-	for time.Now().Before(deadline) {
-		if seen.Load() >= 3 {
-			break
+	select {
+	case <-requests: // first ping is deliberately held in-flight
+	case <-ctx.Done():
+		t.Fatal("first ping was not admitted")
+	}
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- p.PauseContext(ctx) }()
+	select {
+	case err := <-pauseDone:
+		t.Fatalf("PauseContext returned before the in-flight ping completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := seen.Load(); got != 1 {
+		t.Fatalf("pings admitted before pause barrier = %d, want 1", got)
+	}
+	release <- struct{}{}
+	<-peerDone
+	select {
+	case err := <-pauseDone:
+		if err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
+	case <-ctx.Done():
+		t.Fatal("PauseContext did not join the completed ping")
 	}
-	if seen.Load() < 3 {
-		t.Fatalf("only %d pings seen", seen.Load())
-	}
-
-	p.Pause()
-	frozen := seen.Load()
-	time.Sleep(150 * time.Millisecond)
-	if seen.Load() > frozen+1 {
-		// One more tick may slip in if Pause races with the goroutine
-		// already inside RoundTrip; allow at most +1.
-		t.Errorf("pause did not stop pings: %d -> %d", frozen, seen.Load())
-	}
-
 	p.Resume()
-	deadline = time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if seen.Load() > frozen+1 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case <-requests:
+	case <-ctx.Done():
+		t.Fatal("resume did not admit a new ping")
 	}
-	if seen.Load() <= frozen+1 {
-		t.Errorf("resume did not restart pings: %d -> %d", frozen, seen.Load())
+	release <- struct{}{}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("second ping response: %v", err)
+	}
+	if err := p.PauseContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Load(); got != 2 {
+		t.Fatalf("pings after resume barrier = %d, want 2", got)
 	}
 
 	snap := p.Stats.Snapshot()
@@ -91,6 +107,109 @@ func TestPinger_TickAndPause(t *testing.T) {
 	}
 	if snap.RTTAvgNs == 0 {
 		t.Errorf("Snapshot.RTTAvgNs = 0")
+	}
+}
+
+func TestPingerPauseWaitsForGuestConnectionClose(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	responseWritten := make(chan struct{})
+	releaseClose := make(chan struct{})
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		req, err := proto.ReadMessage(c)
+		if err != nil {
+			return
+		}
+		if err := proto.WriteMessage(c, &proto.Message{
+			Type: proto.TypePong, ID: req.ID, TSendNs: req.TSendNs,
+		}); err != nil {
+			return
+		}
+		close(responseWritten)
+		<-releaseClose
+	})
+	defer proxy.close()
+
+	p := &Pinger{
+		Client: &HostClient{BasePath: base},
+		Cfg:    PingerConfig{Interval: time.Hour, Timeout: 2 * time.Second},
+		Stats:  &PingStats{},
+		Logf:   t.Logf,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	p.Start(ctx)
+	defer p.Stop()
+	<-responseWritten
+
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- p.PauseContext(ctx) }()
+	select {
+	case err := <-pauseDone:
+		t.Fatalf("PauseContext returned before the guest closed the ping connection: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseClose)
+	select {
+	case err := <-pauseDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("PauseContext did not finish after the guest connection closed")
+	}
+}
+
+func TestPingerPauseBoundsAndJoinsNoForcedTimeoutProbe(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	requestRead := make(chan struct{})
+	peerEOF := make(chan error, 1)
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		if _, err := proto.ReadMessage(c); err != nil {
+			peerEOF <- err
+			return
+		}
+		close(requestRead)
+		var one [1]byte
+		_, err := c.Read(one[:])
+		peerEOF <- err
+	})
+	defer proxy.close()
+
+	p := &Pinger{
+		Client: &HostClient{BasePath: base},
+		Cfg:    PingerConfig{Interval: time.Hour, Timeout: time.Hour},
+		Stats:  &PingStats{},
+		Logf:   t.Logf,
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	p.Start(runCtx)
+	defer func() {
+		cancelRun()
+		p.Stop()
+	}()
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("ping was not admitted")
+	}
+
+	const drainTimeout = 50 * time.Millisecond
+	if err := p.pauseContext(context.Background(), drainTimeout); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pauseContext error = %v, want bounded context deadline", err)
+	}
+	select {
+	case err := <-peerEOF:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("guest read after canceled pause = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("PauseContext returned without aborting and joining the admitted ping")
+	}
+	p.tickMu.Lock()
+	done := p.tickDone
+	p.tickMu.Unlock()
+	if done != nil {
+		t.Fatal("PauseContext returned before the canceled ping cleared its barrier state")
 	}
 }
 
@@ -212,6 +331,88 @@ func TestSendQuiesce_Quiesced(t *testing.T) {
 	}
 }
 
+func TestSendQuiesceWaitsForGuestConnectionClose(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	ackWritten := make(chan struct{})
+	releaseClose := make(chan struct{})
+	released := false
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		_, _ = proto.ReadMessage(c)
+		_ = proto.WriteMessage(c, &proto.Message{
+			Type: proto.TypeQuiesced, DropCachesResult: proto.DropCachesSkipped,
+		})
+		close(ackWritten)
+		<-releaseClose
+	})
+	defer func() {
+		if !released {
+			close(releaseClose)
+		}
+		proxy.close()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := SendQuiesce(&HostClient{BasePath: base}, true)
+		done <- err
+	}()
+	<-ackWritten
+	select {
+	case err := <-done:
+		t.Fatalf("SendQuiesce returned before guest connection close: %v", err)
+	case <-time.After(50 * time.Millisecond): // deadlock guard for the close barrier
+	}
+	close(releaseClose)
+	released = true
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SendQuiesce did not finish after guest connection close")
+	}
+}
+
+func TestSendQuiesceContextCancellationInterruptsCloseBarrier(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	ackWritten := make(chan struct{})
+	peerClosed := make(chan struct{})
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		_, _ = proto.ReadMessage(c)
+		_ = proto.WriteMessage(c, &proto.Message{
+			Type: proto.TypeQuiesced, DropCachesResult: proto.DropCachesSkipped,
+		})
+		close(ackWritten)
+		var one [1]byte
+		_, _ = c.Read(one[:])
+		close(peerClosed)
+	})
+	defer proxy.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := SendQuiesceContext(ctx, &HostClient{BasePath: base}, true)
+		done <- err
+	}()
+	<-ackWritten
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("SendQuiesceContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SendQuiesceContext did not interrupt the close barrier")
+	}
+	select {
+	case <-peerClosed:
+	case <-time.After(time.Second):
+		t.Fatal("canceled quiesce did not close the transport")
+	}
+}
+
 func TestSendQuiesce_OldGuestResultUnknown(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "vsock.sock")
@@ -252,7 +453,7 @@ func TestOpenMUXViaRestore(t *testing.T) {
 	})
 	defer proxy.close()
 
-	conn, spec, err := OpenMUXViaRestore(&HostClient{BasePath: base}, 3, nil, nil, 2*time.Second)
+	conn, spec, err := OpenMUXViaRestore(&HostClient{BasePath: base}, 3, nil, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +478,7 @@ func TestOpenMUXViaRestoreContextCancelsStalledAck(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		_, _, err := OpenMUXViaRestoreContext(ctx, &HostClient{BasePath: base}, 3, nil, nil, 24*time.Hour)
+		_, _, err := OpenMUXViaRestoreContext(ctx, &HostClient{BasePath: base}, 3, nil, 24*time.Hour)
 		errCh <- err
 	}()
 	select {
@@ -321,7 +522,7 @@ func TestOpenMUXViaRestore_RetriesTransientEOFBeforeRequest(t *testing.T) {
 	})
 	defer proxy.close()
 
-	conn, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 4, nil, nil, time.Second)
+	conn, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 4, nil, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,6 +532,66 @@ func TestOpenMUXViaRestore_RetriesTransientEOFBeforeRequest(t *testing.T) {
 	}
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("restore requests = %d, want exactly 1", got)
+	}
+}
+
+func TestOpenMUXViaAttachRetriesTransientEOFBeforeRequest(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+
+	var connects atomic.Uint32
+	var requests atomic.Uint32
+	proxy := newFakeCHProxyWithBeforeOK(t, base, func(net.Conn) bool {
+		return connects.Add(1) == 1
+	}, func(c net.Conn) {
+		req, err := proto.ReadMessage(c)
+		if err != nil {
+			t.Errorf("guest read: %v", err)
+			return
+		}
+		requests.Add(1)
+		if req.Type != proto.TypeAttach {
+			t.Errorf("request type = %q, want attach", req.Type)
+		}
+		_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeAttachAck, Epoch: req.Epoch})
+	})
+	defer proxy.close()
+
+	conn, _, err := OpenMUXViaAttach(&HostClient{BasePath: base, Logf: t.Logf}, 4, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if got := connects.Load(); got != 2 {
+		t.Fatalf("CONNECT attempts = %d, want 2", got)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("attach requests = %d, want exactly 1", got)
+	}
+}
+
+func TestOpenMUXViaAttachContextCancelsStalledAck(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	requestRead := make(chan struct{})
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		if _, err := proto.ReadMessage(c); err == nil {
+			close(requestRead)
+		}
+		var one [1]byte
+		_, _ = c.Read(one[:])
+	})
+	defer proxy.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := OpenMUXViaAttachContext(ctx, &HostClient{BasePath: base}, 1, 24*time.Hour)
+		done <- err
+	}()
+	<-requestRead
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("OpenMUXViaAttachContext error = %v, want context.Canceled", err)
 	}
 }
 
@@ -352,7 +613,7 @@ func TestOpenMUXViaRestore_DoesNotRetryAfterRequest(t *testing.T) {
 	})
 	defer proxy.close()
 
-	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 5, nil, nil, time.Second)
+	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 5, nil, time.Second)
 	if err == nil || !strings.Contains(err.Error(), "read restore_ack") {
 		t.Fatalf("error = %v, want restore_ack read failure", err)
 	}
@@ -378,7 +639,7 @@ func TestOpenMUXViaRestore_TransientRetryIsBounded(t *testing.T) {
 	defer proxy.close()
 
 	started := time.Now()
-	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 6, nil, nil, 250*time.Millisecond)
+	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 6, nil, 250*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected bounded pre-request connect failure")
 	}
@@ -396,43 +657,54 @@ func TestOpenMUXViaRestore_TransientRetryIsBounded(t *testing.T) {
 	}
 }
 
-func TestDialRawForRestore_BoundsStalledRetryAttempt(t *testing.T) {
+func TestDialRawForRestore_BoundsEachStalledAttemptAndKeepsRetrying(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "vsock.sock")
 
 	var connects atomic.Uint32
 	releaseStall := make(chan struct{})
 	proxy := newFakeCHProxyWithBeforeOK(t, base, func(net.Conn) bool {
-		if connects.Add(1) == 1 {
+		switch connects.Add(1) {
+		case 1:
 			return true // first attempt: transient EOF before OK
+		case 2:
+			<-releaseStall // second attempt: CH never emits OK
+			return true
+		default:
+			return false // a later attempt reaches the guest
 		}
-		<-releaseStall // retry: CONNECT accepted, but CH never emits OK
-		return true
 	}, func(net.Conn) {
-		t.Error("guest received a connection before CH acknowledgement")
+		// dialRawForRestore stops after CONNECT/OK, before a guest request.
 	})
 	defer proxy.close()
 	defer close(releaseStall)
 
-	done := make(chan error, 1)
+	done := make(chan struct {
+		conn net.Conn
+		err  error
+	}, 1)
 	go func() {
 		conn, err := dialRawForRestore(&HostClient{BasePath: base, Logf: t.Logf}, 2*time.Second, 100*time.Millisecond)
-		if conn != nil {
-			_ = conn.Close()
-		}
-		done <- err
+		done <- struct {
+			conn net.Conn
+			err  error
+		}{conn: conn, err: err}
 	}()
 
 	select {
-	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "restore pre-request connect failed") {
-			t.Fatalf("error = %v, want bounded retry failure", err)
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("dialRawForRestore: %v", result.err)
 		}
+		if result.conn == nil {
+			t.Fatal("dialRawForRestore returned a nil connection")
+		}
+		_ = result.conn.Close()
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("stalled retry exceeded its retry window")
+		t.Fatal("a stalled CONNECT attempt consumed the overall restore budget")
 	}
-	if got := connects.Load(); got != 2 {
-		t.Fatalf("CONNECT attempts = %d, want 2", got)
+	if got := connects.Load(); got != 3 {
+		t.Fatalf("CONNECT attempts = %d, want 3", got)
 	}
 }
 
@@ -453,7 +725,7 @@ func TestOpenMUXViaRestore_DoesNotRetryNonTransientHandshakeError(t *testing.T) 
 	})
 	defer proxy.close()
 
-	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 7, nil, nil, time.Second)
+	_, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 7, nil, time.Second)
 	if err == nil || !strings.Contains(err.Error(), "OK line not terminated") {
 		t.Fatalf("error = %v, want non-transient handshake failure", err)
 	}

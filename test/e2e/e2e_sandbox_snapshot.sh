@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 #
-# e2e_sandbox_snapshot.sh — start a long-running sandbox, snapshot it,
-# verify the snapshot bundle is well-formed.
+# e2e_sandbox_snapshot.sh — start a long-running sandbox and verify that one
+# freeze point produces runnable Sandbox E plus memory Snapshot S.
 #
 # Approach:
 #   1. Run python progress counter (writes /tmp/progress every 100ms)
 #      under sandbox-ctl run (background)
 #   2. Wait until guest is past phase 2 (sees a marker line in log)
 #   3. Run sandbox-ctl snapshot --sandbox-id <sid> --output <out>
-#   4. Verify <out>/<sid>.snapshot exists, is sparse, contains
-#      memory + ZIP at end with config.json/state.json/snapshot.cfg
-#   5. Verify <out>/<sha256>.overlay exists and is sparse
+#   4. Verify the <sid>.snapshot commit alias and its content-addressed E
+#   5. Verify S references E and each strict config is inspectable
 #   6. Tear down sandbox
 
 set -euo pipefail
@@ -244,17 +243,23 @@ fi
 echo "==> validating snapshot bundle"
 SNAP_FILE="$OUT/$SID.snapshot"
 [ -f "$SNAP_FILE" ] || { echo "FAIL: no $SID.snapshot"; ls -la "$OUT"; exit 1; }
-OVERLAY_FILE=$(ls "$OUT"/*.overlay 2>/dev/null | head -1)
-[ -n "$OVERLAY_FILE" ] && [ -f "$OVERLAY_FILE" ] || { echo "FAIL: no <sha256>.overlay"; ls -la "$OUT"; exit 1; }
+INFO_JSON=$("$BIN/sandbox-ctl" info --json "$SNAP_FILE")
+SANDBOX_REF=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("SandboxRef", ""))' <<<"$INFO_JSON")
+[ -n "$SANDBOX_REF" ] || { echo "==> FAIL: Snapshot S has no sandbox_ref"; echo "$INFO_JSON"; exit 1; }
+SANDBOX_BASENAME=$(python3 -c 'import os,sys; print(os.path.basename(sys.argv[1].split("@",1)[0]))' "$SANDBOX_REF")
+SANDBOX_FILE="$OUT/$SANDBOX_BASENAME"
+[ -f "$SANDBOX_FILE" ] || { echo "FAIL: Snapshot S references missing Sandbox E $SANDBOX_BASENAME"; ls -la "$OUT"; exit 1; }
+mapfile -t OVERLAY_FILES < <(find "$OUT" -maxdepth 1 -type f -name '*.overlay' -print | sort)
+[ "${#OVERLAY_FILES[@]}" -gt 0 ] || { echo "FAIL: no immutable disk dependency"; ls -la "$OUT"; exit 1; }
 
 # Sizes. Artifacts are tarstream envelopes: the FILE is dense (size ≈
 # resident data + envelope), holes ride the envelope map. Sparseness
 # shows as file size ≪ the logical entry size (ramSize = 512 MiB).
-# <sid>.snapshot is a symlink — stat dereferences (-L).
+# <sid>.snapshot is a symlink; Sandbox E is content-addressed.
 SNAP_BYTES=$(stat -L -c%s "$SNAP_FILE")
-DISK_BYTES=$(stat -c%s "$OVERLAY_FILE")
+SANDBOX_BYTES=$(stat -L -c%s "$SANDBOX_FILE")
 echo "    $SID.snapshot:   artifact=$(numfmt --to=iec $SNAP_BYTES)"
-echo "    $(basename $OVERLAY_FILE): artifact=$(numfmt --to=iec $DISK_BYTES)"
+echo "    $SID.sandbox:    artifact=$(numfmt --to=iec $SANDBOX_BYTES)"
 RAM_BYTES=$((512 * 1024 * 1024))
 if [ "$SNAP_BYTES" -ge "$RAM_BYTES" ]; then
     echo "==> FAIL: snapshot artifact ($SNAP_BYTES) not smaller than ramSize ($RAM_BYTES) — holes not carried by the envelope?"
@@ -267,14 +272,16 @@ echo "==> PASS: snapshot artifact carries only resident data ($(numfmt --to=iec 
 
 # The artifact is a tar envelope; info reads snapshot.cfg through it
 # (the same path restore uses).
-INFO_JSON=$("$BIN/sandbox-ctl" info --json "$SNAP_FILE")
-grep -qF '"BaseRef"' <<<"$INFO_JSON" || { echo "==> FAIL: info --json missing BaseRef"; echo "$INFO_JSON" | head -10; exit 1; }
-echo "==> PASS: snapshot.cfg readable through the artifact (info --json)"
+E_INFO_JSON=$("$BIN/sandbox-ctl" info --json "$SANDBOX_FILE")
+python3 -c 'import json,sys; c=json.load(sys.stdin); assert c["Version"] == 1 and c["Boot"]["Root"]' <<<"$E_INFO_JSON" \
+    || { echo "==> FAIL: Sandbox E info is incomplete"; echo "$E_INFO_JSON"; exit 1; }
+echo "==> PASS: Snapshot S references Sandbox E; both strict configs are readable"
 
 # Content addressing: the basename matches the digest declared by the
 # artifact's final empty marker. The marker digest covers the deterministic
 # tar prefix, not the self-describing marker or end blocks.
-for f in "$OVERLAY_FILE" "$(readlink -f "$SNAP_FILE")"; do
+ARTIFACT_FILES=("$(readlink -f "$SANDBOX_FILE")" "$(readlink -f "$SNAP_FILE")" "${OVERLAY_FILES[@]}")
+for f in "${ARTIFACT_FILES[@]}"; do
     base=$(basename "$f"); base=${base%.*}
     markers=$(tar -tf "$f" | grep -E '^\.kuasar\.sha256\.[0-9a-f]{64}$' || true)
     marker_count=$(grep -c . <<<"$markers" || true)
@@ -287,18 +294,18 @@ for f in "$OVERLAY_FILE" "$(readlink -f "$SNAP_FILE")"; do
 done
 echo "==> PASS: artifact basenames match their digest markers"
 
-# The envelope is a valid tar; the overlay entry holds an ext4 image.
+# Both operation roots are valid tarstream carriers. Their logical payload
+# boundaries and sparse semantics are covered by sandboxfile/snapshotfile tests;
+# a live upper may legitimately have a Hole at the ext4 superblock position.
 if command -v file >/dev/null && file -L "$SNAP_FILE" 2>&1 | grep -qiE "tar archive"; then
     echo "==> PASS: snapshot artifact is a tar envelope"
 else
     echo "==> WARN: file(1) did not recognize the artifact as tar"
 fi
-UNPACK="$WORK/unpack"; mkdir -p "$UNPACK"
-( cd "$UNPACK" && "$BIN/flatten-ctl" tar extract -f "$OVERLAY_FILE" )
-if command -v file >/dev/null && file "$UNPACK/overlay" 2>&1 | grep -qiE "ext4|ext.* filesystem"; then
-    echo "==> PASS: overlay entry is an ext4 filesystem"
+if command -v file >/dev/null && file -L "$SANDBOX_FILE" 2>&1 | grep -qiE "tar archive"; then
+    echo "==> PASS: Sandbox E artifact is a tar envelope"
 else
-    echo "==> WARN: unpacked overlay not recognized as ext4 by file(1)"
+    echo "==> WARN: file(1) did not recognize Sandbox E as tar"
 fi
 
 echo "==> e2e_sandbox_snapshot: OK"

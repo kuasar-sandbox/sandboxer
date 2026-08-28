@@ -95,28 +95,6 @@ func TestRoundTrip_LaunchPodSpec(t *testing.T) {
 	}
 }
 
-func TestRoundTrip_RestoreFiles(t *testing.T) {
-	m := &Message{
-		Type:        TypeRestore,
-		Epoch:       2,
-		WallclockNs: 123456789,
-		Files: []FileSpec{
-			{Path: "/run/secrets/token", Content: "s3cr3t", Mode: "0400"},
-		},
-	}
-	var buf bytes.Buffer
-	if err := WriteMessage(&buf, m); err != nil {
-		t.Fatal(err)
-	}
-	got, err := ReadMessage(&buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(got, m) {
-		t.Errorf("roundtrip mismatch:\n got=%+v\nwant=%+v", got, m)
-	}
-}
-
 func TestRoundTrip_Hello(t *testing.T) {
 	m := &Message{Type: TypeHello, Phase: "ready"}
 	var buf bytes.Buffer

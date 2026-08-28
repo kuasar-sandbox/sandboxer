@@ -141,10 +141,10 @@ func strictCheckBytes(b []byte, mode string) int {
 	return 0
 }
 
-// restoreFilter deletes the keys a restore invocation ignores (so a cold
-// config can be transformed into a clean restore host yaml): top-level
-// launch / mounts / files / init, boot.kernel / boot.cmdline, and
-// boot.root.overlay.base (the latter comes from snapshot.cfg).
+// restoreFilter turns a cold authoring config into host-only restore input.
+// Snapshot S points to Sandbox E, so workload state and every immutable disk
+// ref are removed instead of being silently ignored. Kernel/runtime paths,
+// active diff bindings, network provider/identity, and host policy remain.
 func restoreFilter(in []byte) ([]byte, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(in, &doc); err != nil {
@@ -154,15 +154,26 @@ func restoreFilter(in []byte) ([]byte, error) {
 		return in, nil
 	}
 	root := doc.Content[0]
-	for _, k := range []string{"launch", "mounts", "files", "init"} {
+	for _, k := range []string{"launch", "mounts", "files", "ephemeral_files", "init", "metadata"} {
 		mapDelete(root, k)
 	}
+	stripImmutableDisk := func(disk *yaml.Node) {
+		if disk == nil {
+			return
+		}
+		mapDelete(disk, "base")
+		mapDelete(disk, "base_from_refs")
+		if overlay := mapGet(disk, "overlay"); overlay != nil {
+			mapDelete(overlay, "base")
+			mapDelete(overlay, "base_from_refs")
+		}
+	}
 	if boot := mapGet(root, "boot"); boot != nil {
-		mapDelete(boot, "kernel")
 		mapDelete(boot, "cmdline")
-		if r := mapGet(boot, "root"); r != nil {
-			if ov := mapGet(r, "overlay"); ov != nil {
-				mapDelete(ov, "base")
+		stripImmutableDisk(mapGet(boot, "root"))
+		if disks := mapGet(boot, "disks"); disks != nil && disks.Kind == yaml.SequenceNode {
+			for _, disk := range disks.Content {
+				stripImmutableDisk(disk)
 			}
 		}
 	}
@@ -224,6 +235,10 @@ boot:
 launch:
   exec: /usr/bin/app                       # or omit to use the image's Entrypoint/Cmd (overlay mode only)
   args: []
+  env:                                     # portable: re-applied by run --from
+    APP_MODE: production
+  # ephemeral_env:                        # instance-only: omitted from Sandbox E
+  #   REQUEST_TOKEN: current-run-only
   restart: never                           # never | on-failure | always (in-place restart + backoff)
   cgroup_control: false                    # false (default): app sees cgroup /;
                                            # true: delegate empty root, managed processes see /init
@@ -241,27 +256,30 @@ launch:
 #   - { target: /var/log, type: empty }
 # files:
 #   - { path: /etc/resolv.conf, mode: "0644", content: "nameserver 169.254.169.253\n" }
+# ephemeral_files:                         # instance-only; same path overrides files[]
+#   - { path: /run/instance-token, mode: "0600", content: "current-run-only" }
 # init:  # one-shot, run-to-completion before the app (use plugin[] for long-running)
 #   - { exec: /bin/sh, args: ["-c", "echo provisioning"], timeout: 30s }
 `
 
-// skeletonRestore is the restore host-yaml template (sandbox-ctl run --restore).
+// skeletonRestore is the host-only restore template. Workload state and the
+// immutable disk graph come from Snapshot S -> Sandbox E and are not repeated.
 const skeletonRestore = `# restore host yaml — sandbox-ctl run --restore <ref> --config <this>
-# Cold-only fields (kernel, launch, mounts, ...) are intentionally absent.
+# Cold-only fields (launch, mounts, files, init, plugin, metadata) are rejected.
 restore:
   prefetch: off                            # off (default) | memory (current memory self)
 resources:
-  capacity: { cpu: 2, memory: 8GiB }       # must equal the snapshot.cfg capacity
+  capacity: { cpu: 2, memory: 8GiB }       # if present, must equal referenced Sandbox E
 network:
-  # Source presence must match the snapshot's NIC topology. Omit this block
-  # (or use "network: {}") when restoring a snapshot that has no NIC.
-  tap: tap0                                # source re-acquired for a snapshot with a NIC
+  # Provider presence must match E's portable network topology. Identity is fresh.
+  tap: tap0
   ip: 169.254.4.1/31                       # clone takes a fresh identity
   hostname: clone-1
 boot:
-  runtime: file:///opt/sandbox/sandbox-runtime.bundle   # must match snapshot.cfg digest
+  kernel:  file:///opt/sandbox/vmlinux                 # host binding; identity verified against E
+  runtime: file:///opt/sandbox/sandbox-runtime.bundle  # host binding; identity verified against E
   root:
-    base: file:///opt/sandbox/app.erofs
-    overlay: {}                            # diff omitted → fresh diff on disk;
-                                           # overlay.base comes from snapshot.cfg
+    overlay:
+      diff_template: file:///opt/sandbox/overlay-templates/basic-1G.ext4
+      # Immutable base/base_from_refs are forbidden here; E owns them.
 `

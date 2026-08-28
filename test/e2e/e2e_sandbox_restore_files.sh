@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 #
-# e2e_sandbox_restore_files.sh — verify per-instance file injection at
-# restore reaches the resumed app:
+# e2e_sandbox_restore_files.sh — verify that memory restore rejects cold-only
+# file injection and resumes the original process unchanged:
 #   1. cold-start an app that prints, each tick, the content of
 #      /etc/instance-id (or "none" if absent)
 #   2. snapshot it (no per-instance file → app prints ID=none)
-#   3. restore with a host.yaml carrying files:[/etc/instance-id="clone-<n>"]
-#   4. assert the resumed app starts printing ID=clone-<n>
+#   3. assert a restore host carrying files:[/etc/instance-id="clone-<n>"]
+#      fails before the VM starts
+#   4. restore without cold-only fields and assert the app still prints ID=none
 #
-# This proves the restore-window file injection (docs/sandbox-init.md
-# §4.3) is visible to the already-running app.
+# This proves memory restore does not claim to re-apply files to an already
+# running process. File declarations are applied only by cold run/run --from.
 
 set -euo pipefail
 
@@ -116,7 +117,33 @@ SNAP_FILE="$OUT/$SID1.snapshot"
 
 DIFF_R="$WORK/runtime/blk1-restore.diff"; truncate -s 1G "$DIFF_R"; mkfs.ext4 -q -F "$DIFF_R"
 
-# Restore host.yaml carries the per-instance file.
+# Restore must reject fields that claim to re-apply cold execution state.
+cat > "$WORK/host-bad.yaml" <<EOF
+resources:
+  capacity:    { cpu: 1, memory: 512MiB }
+  allocatable: { cpu: 1, memory: 512MiB }
+network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-rf }
+boot:
+  kernel: file://$VMLINUX
+  runtime: file://$BIN/sandbox-runtime.bundle
+  root:
+    overlay: { diff: file://$DIFF_R, size: 1GiB }
+files:
+  - path: /etc/instance-id
+    content: "clone-42"
+EOF
+
+set +e
+"$BIN/sandbox-ctl" run --restore "$SNAP_FILE" --config "$WORK/host-bad.yaml" \
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RUNTIME_ROOT" --sandbox-id rf-reject \
+    >"$WORK/reject.log" 2>&1
+REJECT_RC=$?
+set -e
+[ "$REJECT_RC" -ne 0 ] || { echo "FAIL: restore accepted cold-only files"; exit 1; }
+grep -q 'files is cold-start-only' "$WORK/reject.log" \
+    || { echo "FAIL: restore rejection did not identify files"; cat "$WORK/reject.log"; exit 1; }
+echo "==> PASS: memory restore rejected cold-only files before boot"
+
 cat > "$WORK/host.yaml" <<EOF
 resources:
   capacity:    { cpu: 1, memory: 512MiB }
@@ -126,11 +153,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: $BLK0_REF
     overlay: { diff: file://$DIFF_R, size: 1GiB }
-files:
-  - path: /etc/instance-id
-    content: "clone-42"
 EOF
 
 LOG2="$WORK/run2.log"; SID2="rf2-$$"; mkdir -p "$RUNTIME_ROOT/$SID2"
@@ -138,10 +161,10 @@ LOG2="$WORK/run2.log"; SID2="rf2-$$"; mkdir -p "$RUNTIME_ROOT/$SID2"
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$RUNTIME_ROOT" --sandbox-id "$SID2" > "$LOG2" 2>&1 &
 SBPID2=$!
 
-echo "==> waiting for restored app to print ID=clone-42..."
+echo "==> waiting for restored app to keep its original ID=none state..."
 SEEN=0
 for i in $(seq 1 400); do
-    if grep -qE "^TICK [0-9]+ ID=clone-42$" "$LOG2" 2>/dev/null; then SEEN=1; break; fi
+    if grep -qE "^TICK [0-9]+ ID=none$" "$LOG2" 2>/dev/null; then SEEN=1; break; fi
     kill -0 "$SBPID2" 2>/dev/null || break
     sleep 0.05
 done
@@ -156,10 +179,10 @@ wait "$SBPID2" 2>/dev/null || RESTORE_RC=$?
 echo "==> restored app tick samples:"
 grep -oE "^TICK [0-9]+ ID=[^ ]+" "$LOG2" | tail -5 | sed 's/^/    /' || true
 if [ "$SEEN" = "1" ]; then
-    echo "==> PASS: restored app saw injected per-instance file (ID=clone-42)"
+    echo "==> PASS: memory restore did not re-apply files; original process state continued"
     echo "==> e2e_sandbox_restore_files: OK"
 else
-    echo "==> FAIL: restored app never saw ID=clone-42 (running_before_stop=$RESTORE_WAS_RUNNING exit=$RESTORE_RC)"
+    echo "==> FAIL: restored app never resumed with ID=none (running_before_stop=$RESTORE_WAS_RUNNING exit=$RESTORE_RC)"
     echo "==> restore log tail:"
     tail -100 "$LOG2" | sed 's/^/    /' || true
     exit 1

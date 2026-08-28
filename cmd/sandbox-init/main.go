@@ -832,15 +832,76 @@ type memReportStream struct {
 	seq      uint64
 	pending  *proto.MemReport
 	failures int
-	paused   bool
+	// admission packs the paused gate (high bit) and active attempt count
+	// (low bits). One CAS therefore closes admission before pause waits for
+	// every owner/waiter of mu, leaving no snapshot-visible lock handoff state.
+	admission atomic.Uint64
 }
 
 var guestMemReports = &memReportStream{epoch: 1}
+
+const (
+	memReportPausedBit  = uint64(1) << 63
+	memReportActiveMask = memReportPausedBit - 1
+)
+
+func (s *memReportStream) beginAttempt() bool {
+	for {
+		state := s.admission.Load()
+		if state&memReportPausedBit != 0 {
+			return false
+		}
+		if state&memReportActiveMask == memReportActiveMask {
+			return false
+		}
+		if s.admission.CompareAndSwap(state, state+1) {
+			return true
+		}
+	}
+}
+
+func (s *memReportStream) endAttempt() {
+	for {
+		state := s.admission.Load()
+		if state&memReportActiveMask == 0 {
+			panic("mem_report: attempt count underflow")
+		}
+		if s.admission.CompareAndSwap(state, state-1) {
+			return
+		}
+	}
+}
+
+func (s *memReportStream) isPaused() bool {
+	return s.admission.Load()&memReportPausedBit != 0
+}
+
+// pauseAndDrain serializes behind any in-flight guest→host exchange and
+// prevents the periodic reporter from starting another one. Snapshot memory
+// must never capture this stream's mutex while an obsolete vsock connection
+// owns it: that connection cannot complete against a different restore host,
+// and restore would then block forever while advancing the observation epoch.
+func (s *memReportStream) pauseAndDrain() {
+	for {
+		state := s.admission.Load()
+		if state&memReportPausedBit != 0 || s.admission.CompareAndSwap(state, state|memReportPausedBit) {
+			break
+		}
+	}
+	// With the paused bit set, beginAttempt cannot increment the low bits.
+	// Every non-zero attempt owns or is queued on mu and will decrement only
+	// after its whole exchange and state mutation have completed. Sleeping
+	// yields the single guest vCPU to that goroutine instead of spinning.
+	for s.admission.Load() != memReportPausedBit {
+		time.Sleep(time.Millisecond)
+	}
+}
 
 // advanceEpochAndPause serializes behind any in-flight exchange, discards the
 // old epoch's pending observation, and prevents sampling the restored guest
 // until restore_ack + MUX establishment have completed.
 func (s *memReportStream) advanceEpochAndPause() (uint64, error) {
+	s.pauseAndDrain()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.epoch == ^uint64(0) {
@@ -850,14 +911,23 @@ func (s *memReportStream) advanceEpochAndPause() (uint64, error) {
 	s.seq = 0
 	s.pending = nil
 	s.failures = 0
-	s.paused = true
 	return s.epoch, nil
 }
 
 func (s *memReportStream) resumeEpoch() {
-	s.mu.Lock()
-	s.paused = false
-	s.mu.Unlock()
+	// Restore reaches this point after pauseAndDrain, but a plain live attach
+	// may arrive while a periodic report is already admitted. Clear only the
+	// gate bit so that report retains its low-bit ownership until endAttempt;
+	// storing zero here would make its deferred release underflow and panic.
+	for {
+		state := s.admission.Load()
+		if state&memReportPausedBit == 0 {
+			return
+		}
+		if s.admission.CompareAndSwap(state, state&^memReportPausedBit) {
+			return
+		}
+	}
 }
 
 func (s *memReportStream) currentEpoch() uint64 {
@@ -874,11 +944,12 @@ func (s *memReportStream) attempt(
 	notify func(proto.MemReport) error,
 	logf func(string, ...any),
 ) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.paused {
+	if !s.beginAttempt() {
 		return
 	}
+	defer s.endAttempt()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.pending == nil {
 		report, err := read()
 		if err != nil {

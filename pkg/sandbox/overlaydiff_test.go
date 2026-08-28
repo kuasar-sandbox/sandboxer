@@ -56,4 +56,10 @@ func TestPrepareDiffRejectsInvalidFreshSources(t *testing.T) {
 	if _, err := PrepareDiff(target, "", 0, 1<<30); err == nil {
 		t.Fatal("fresh diff without an ext4 source was accepted")
 	}
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareDiff(target, "file:///unused-template", 0, 1<<30); err == nil {
+		t.Fatal("existing empty diff was accepted")
+	}
 }

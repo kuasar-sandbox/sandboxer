@@ -1,13 +1,18 @@
 package guestlink
 
 import (
+	"context"
 	"io"
+	"net"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 )
 
 // fakeMUXConn is a minimal io.ReadWriteCloser for MUXLink tests: Read
@@ -91,4 +96,36 @@ func TestMUXLink_SetReplacesWithoutCleanup(t *testing.T) {
 	}
 	// Clean up the leaked sessA read loop for the race detector.
 	_ = sessA.Close()
+}
+
+func TestMUXLinkReattachRetriesAmbiguousAckOnce(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	var requests atomic.Uint32
+	proxy := newFakeCHProxy(t, base, func(conn net.Conn) {
+		request, err := proto.ReadMessage(conn)
+		if err != nil {
+			return
+		}
+		attempt := requests.Add(1)
+		if request.Type != proto.TypeAttach {
+			t.Errorf("request type = %q", request.Type)
+			return
+		}
+		if attempt == 1 {
+			return // ambiguous: guest consumed attach but the ACK connection closed.
+		}
+		_ = proto.WriteMessage(conn, &proto.Message{
+			Type: proto.TypeAttachAck, Epoch: request.Epoch, Stdio: &proto.StdioSpec{},
+		})
+	})
+	defer proxy.close()
+
+	var link MUXLink
+	if err := link.Reattach(context.Background(), &HostClient{BasePath: base, Logf: t.Logf}, stdio.Mode{}); err != nil {
+		t.Fatal(err)
+	}
+	link.Teardown()
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("attach requests = %d, want 2", got)
+	}
 }

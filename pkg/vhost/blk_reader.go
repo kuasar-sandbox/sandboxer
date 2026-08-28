@@ -51,3 +51,12 @@ func (r *StreamReader) ReadAt(buf []byte, offset int64) (int, error) {
 func (r *StreamReader) Size() int64 { return r.size }
 
 func (r *StreamReader) Close() error { return r.stream.Close() }
+
+// ImageConfigBytes exposes the separately validated config.json carried by a
+// .sandbox EROFS root. It never changes the block-visible Size or ReadAt view.
+func (r *StreamReader) ImageConfigBytes() []byte {
+	if provider, ok := r.stream.(interface{ ImageConfigBytes() []byte }); ok {
+		return provider.ImageConfigBytes()
+	}
+	return nil
+}

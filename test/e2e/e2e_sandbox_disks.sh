@@ -198,9 +198,20 @@ echo "==> [5] snapshot (--output, destroys sandbox)"
 wait "$P1" 2>/dev/null || true; P1=""
 SNAP="$OUT/$SID1.snapshot"
 [ -f "$SNAP" ] || { echo "FAIL: no snapshot bundle"; ls -la "$OUT"; exit 1; }
-NOVL=$(ls -1 "$OUT"/*.overlay 2>/dev/null | wc -l)
-[ "$NOVL" = 3 ] || { echo "FAIL: expected 3 overlay artifacts (root upper + scratch + dataset upper), got $NOVL"; exit 1; }
-echo "==> PASS: 3 writable disks captured as separate overlays"
+"$BIN/sandbox-ctl" info --json "$SNAP" >"$WORK/e1-s-info.json"
+E1_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/e1-s-info.json")
+SANDBOX_E="$OUT/$E1_BASENAME"
+[ -f "$SANDBOX_E" ] || { echo "FAIL: Snapshot S references missing Sandbox E $E1_BASENAME"; ls -la "$OUT"; exit 1; }
+"$BIN/sandbox-ctl" info --json "$SANDBOX_E" >"$WORK/e1-info.json"
+python3 - "$WORK/e1-info.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    cfg = json.load(source)
+disks = cfg["Boot"].get("Disks") or []
+if [disk.get("Name") for disk in disks] != ["scratch", "dataset"]:
+    raise SystemExit(f"Sandbox E data-disk order/names are wrong: {disks!r}")
+PY
+echo "==> PASS: Sandbox E captured root plus ordered scratch/dataset graph"
 
 echo "==> [6] restore + verify persistence"
 truncate -s 512M "$WORK/root-r.ext4"; mkfs.ext4 -q -F "$WORK/root-r.ext4"
@@ -209,13 +220,13 @@ cat > "$WORK/restore.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-disks-r }
 boot:
+  kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: $BLK0_REF
     overlay: { diff: file://$WORK/root-r.ext4, size: 512MiB }
   disks:
     - { name: scratch }
-    - { name: dataset, base: $DATASET_REF, overlay: { diff: file://$WORK/dataset-r.ext4, size: 256MiB } }
+    - { name: dataset, overlay: { diff: file://$WORK/dataset-r.ext4, size: 256MiB } }
 EOF
 SID2=dk-2
 timeout -k 10s 120 "$BIN/sandbox-ctl" run --restore "$SNAP" --config "$WORK/restore.yaml" --sandbox-id "$SID2" \
@@ -251,14 +262,12 @@ for marker in ROOT-W-OK SCRATCH-W-OK DATA-W-OK; do
         || { echo "FAIL: could not write $marker before W capture"; cat "$WORK/w-write.out"; exit 1; }
 done
 WOUT="$WORK/working-set"; mkdir -p "$WOUT"
-# A non-merged local memory parent is an explicit sibling dependency. Place it
-# beside W as the sandboxer local-artifact contract requires; the product does
-# not copy or publish artifacts implicitly.
+# A non-merged local memory parent is an explicit dependency. The unified sink
+# materializes it into the new output before S is committed.
 PARENT_MEMORY_ARTIFACT="$(readlink -f "$SNAP")"
 [ -f "$PARENT_MEMORY_ARTIFACT" ] || { echo "FAIL: parent snapshot target is missing: $PARENT_MEMORY_ARTIFACT"; exit 1; }
 PARENT_MEMORY_BASENAME="$(basename "$PARENT_MEMORY_ARTIFACT")"
-ln "$PARENT_MEMORY_ARTIFACT" "$WOUT/$PARENT_MEMORY_BASENAME"
-"$BIN/sandbox-ctl" info --json "$SNAP" >"$WORK/s1-info.json"
+"$BIN/sandbox-ctl" info --json "$SNAP" >"$WORK/s1-s-info.json"
 echo "==> [7] snapshot restored sandbox with --drop-caches=false --merge-ref=false"
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID2" --output "$WOUT" --run-root "$RR" \
     --drop-caches=false --merge-ref=false 2>&1 | sed 's/^/    /'
@@ -267,18 +276,26 @@ grep -Fq 'quiesce: guest acked (drop_caches=skipped' "$WORK/run2.log" \
     || { tail -60 "$WORK/run2.log"; echo "FAIL: W capture did not report drop_caches=skipped"; exit 1; }
 W="$WOUT/$SID2.snapshot"
 [ -f "$W" ] || { echo "FAIL: no working-set snapshot $W"; exit 1; }
-"$BIN/sandbox-ctl" info --json "$W" >"$WORK/w-info.json"
-python3 - "$WORK/s1-info.json" "$WORK/w-info.json" "$PARENT_MEMORY_BASENAME" <<'PY'
+[ -f "$WOUT/$PARENT_MEMORY_BASENAME" ] || { echo "FAIL: memory parent was not materialized into W output"; exit 1; }
+"$BIN/sandbox-ctl" info --json "$W" >"$WORK/w-s-info.json"
+S1_E_REF=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["SandboxRef"])' "$WORK/s1-s-info.json")
+S1_E_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/s1-s-info.json")
+W_E_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/w-s-info.json")
+"$BIN/sandbox-ctl" info --json "$OUT/$S1_E_BASENAME" >"$WORK/s1-e-info.json"
+"$BIN/sandbox-ctl" info --json "$WOUT/$W_E_BASENAME" >"$WORK/w-e-info.json"
+python3 - "$WORK/s1-e-info.json" "$WORK/w-e-info.json" "$WORK/w-s-info.json" "$PARENT_MEMORY_BASENAME" "$S1_E_REF" <<'PY'
 import json, os, sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     parent = json.load(source)
 with open(sys.argv[2], encoding="utf-8") as source:
     working = json.load(source)
+with open(sys.argv[3], encoding="utf-8") as source:
+    working_snapshot = json.load(source)
 
-refs = working.get("FromRefs") or []
-if len(refs) != 1 or os.path.basename(refs[0].split("@", 1)[0]) != sys.argv[3]:
-    raise SystemExit(f"working-set memory from_refs={refs!r}, want one local parent {sys.argv[3]!r}")
+refs = working_snapshot.get("FromRefs") or []
+if len(refs) != 1 or os.path.basename(refs[0].split("@", 1)[0]) != sys.argv[4]:
+    raise SystemExit(f"working-set memory from_refs={refs!r}, want one local parent {sys.argv[4]!r}")
 
 def disk_nodes(doc):
     boot = doc["Boot"]
@@ -298,6 +315,10 @@ if len(parent_nodes) != 3 or len(working_nodes) != 3:
     raise SystemExit(f"disk node counts parent={len(parent_nodes)} working={len(working_nodes)}, want root+2 data")
 for index, (parent_node, working_node) in enumerate(zip(parent_nodes, working_nodes)):
     parent_top = top(parent_node)
+    if index == 0 and parent_top == "self":
+        # `self` is scoped to its containing Sandbox E. Materialize the parent
+        # E binding before comparing it with the newly-created E graph.
+        parent_top = sys.argv[5]
     if top(working_node) == parent_top or parent_top in chain(working_node):
         raise SystemExit(f"disk {index} retained local parent {parent_top!r}; local disks must merge even when memory stacks")
 PY
@@ -311,13 +332,13 @@ cat > "$WORK/restore-w.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-disks-w }
 boot:
+  kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: $BLK0_REF
     overlay: { diff: file://$WORK/root-w.ext4, size: 512MiB }
   disks:
     - { name: scratch }
-    - { name: dataset, base: $DATASET_REF, overlay: { diff: file://$WORK/dataset-w.ext4, size: 256MiB } }
+    - { name: dataset, overlay: { diff: file://$WORK/dataset-w.ext4, size: 256MiB } }
 EOF
 
 # The local parent is a mandatory sibling artifact. Hide it recoverably and
@@ -341,8 +362,8 @@ timeout -k 5s 30 "$BIN/sandbox-ctl" run --restore "$W" --config "$WORK/restore-w
 MISSING_LOWER_RC=$?
 set -e
 [ "$MISSING_LOWER_RC" -ne 0 ] || { cat "$WORK/missing-lower.log"; echo "FAIL: restore unexpectedly accepted a missing memory lower"; exit 1; }
-grep -Fq 'snapshot memory layer 0' "$WORK/missing-lower.log" \
-    || { cat "$WORK/missing-lower.log"; echo "FAIL: missing-lower error did not identify snapshot memory layer 0"; exit 1; }
+grep -Fq 'from_refs[0]' "$WORK/missing-lower.log" \
+    || { cat "$WORK/missing-lower.log"; echo "FAIL: missing-lower error did not identify from_refs[0]"; exit 1; }
 grep -Fq "$PARENT_MEMORY_BASENAME" "$WORK/missing-lower.log" \
     || { cat "$WORK/missing-lower.log"; echo "FAIL: missing-lower error did not identify $PARENT_MEMORY_BASENAME"; exit 1; }
 [ ! -e "$VMM_MARKER" ] \

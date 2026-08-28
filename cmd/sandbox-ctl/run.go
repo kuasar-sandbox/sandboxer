@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"log"
 	"os"
 	"strconv"
@@ -13,10 +12,12 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
@@ -55,7 +56,8 @@ func runCmd(args []string) int {
 	statsJSON := fs.String("stats-json", "", "if set, write per-backend + uffd stats as JSON to this path on shutdown")
 	readyFD := fs.Int("ready-fd", -1, "write control_ready and ready events to an inherited fd")
 
-	restoreRef := fs.String("restore", "", "snapshot reference (file path or manifest://<hex>) — switches to restore mode")
+	fromRef := fs.String("from", "", "Sandbox artifact reference — cold-start its portable workload and root payload")
+	restoreRef := fs.String("restore", "", "Snapshot reference — restore memory and VMM execution state")
 
 	// stdio flags. The bool flags (--stdin/--stdout/--stderr/--tty) are
 	// tri-state — "not set" must be distinguishable from "set to false"
@@ -94,6 +96,20 @@ func runCmd(args []string) int {
 
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "sandbox-ctl run: unexpected positional arguments")
+		return 2
+	}
+	if *fromRef != "" && *restoreRef != "" {
+		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --from and --restore are mutually exclusive")
+		return 2
+	}
+	if *sandboxID != "" {
+		if err := validateSandboxIDArg(*sandboxID); err != nil {
+			fmt.Fprintf(os.Stderr, "sandbox-ctl run: --sandbox-id: %v\n", err)
+			return 2
+		}
 	}
 	readyFDSet := false
 	fs.Visit(func(f *flag.Flag) {
@@ -219,15 +235,30 @@ func runCmd(args []string) int {
 	if *configPath == "" {
 		*configPath = os.Getenv("SANDBOX_CONFIG")
 	}
-	if *configPath == "" {
+	if *configPath == "" && *fromRef == "" {
 		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --config or SANDBOX_CONFIG required")
 		return 2
 	}
-	// --config accepts ':'-separated paths, deep-merged front-to-back.
-	cfg, err := config.LoadMerged(strings.Split(*configPath, ":"))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+	var (
+		cfg      *config.SandboxConfig
+		presence config.FieldPresence
+	)
+	if *configPath == "" {
+		cfg = &config.SandboxConfig{}
+		cfg.ApplyDefaults()
+	} else if *fromRef != "" || *restoreRef != "" {
+		cfg, presence, err = config.LoadMergedWithPresence(strings.Split(*configPath, ":"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	} else {
+		// --config accepts ':'-separated paths, deep-merged front-to-back.
+		cfg, err = config.LoadMerged(strings.Split(*configPath, ":"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
 	}
 	manifestCfg, err := config.LoadManifestConfig(*manifestPath)
 	if err != nil {
@@ -272,15 +303,48 @@ func runCmd(args []string) int {
 
 	// Restore mode dispatch.
 	if restoreR != "" {
-		return runRestore(ctx, cfg, manifestCfg, restoreR,
+		return runRestore(ctx, cfg, presence, manifestCfg, restoreR,
 			*sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
 			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness)
 	}
 
+	var (
+		portableConfig *config.PortableSandboxConfig
+		sourceBinding  *sandbox.RunSourceBinding
+		bundleReader   = (*manifestbundle.Reader)(nil)
+		bundleFetcher  = (*manifestbundle.ManifestFetcher)(nil)
+	)
+	if *fromRef != "" {
+		source, openErr := openSandboxRunSource(ctx, *fromRef, processStorage, refLocations)
+		if openErr != nil {
+			fmt.Fprintf(os.Stderr, "sandbox-ctl run --from: %v\n", openErr)
+			return 1
+		}
+		defer source.Close()
+		applyDefaultArtifactBindings(cfg, source.Root.Portable, source.RelativeDir)
+		var applyErr error
+		cfg, portableConfig, applyErr = config.ApplyFromRules(source.Root.Portable, cfg, presence)
+		if applyErr != nil {
+			fmt.Fprintf(os.Stderr, "sandbox-ctl run --from: %v\n", applyErr)
+			return 1
+		}
+		sourceBinding = &sandbox.RunSourceBinding{
+			SandboxRef: source.PortableRef, RuntimeRef: source.RuntimeRef, RelativeDir: source.RelativeDir,
+			BundleSource: source.BundleSource,
+		}
+		manifestFetcher = source.Fetcher
+		bundleReader = source.BundleReader
+		bundleFetcher = source.BundleFetcher
+	}
+
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
 		Cfg:                cfg,
+		PortableConfig:     portableConfig,
+		SourceBinding:      sourceBinding,
 		ManifestCfg:        manifestCfg,
 		Fetcher:            manifestFetcher,
+		BundleReader:       bundleReader,
+		BundleFetcher:      bundleFetcher,
 		CustomerKeyFn:      keyFn,
 		LocalCodec:         localCodec,
 		LocalRequired:      localRequired,
@@ -304,7 +368,7 @@ func runCmd(args []string) int {
 }
 
 // runRestore parses the snapshot reference and dispatches to restore.Run.
-func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *config.ManifestConfig,
+func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.FieldPresence, manifestCfg *config.ManifestConfig,
 	ref string, sandboxID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
 	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
@@ -313,7 +377,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 	// Validate host-only restore policy before inspecting the remote reference or
 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
 	// but the CLI owns NewFetcher and must not dial for an invalid config.
-	if _, err := config.ParsePrefetchMode(cfg.Restore.Prefetch); err != nil {
+	if err := cfg.ValidateRestoreHostConfigWithPresence(presence); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -356,6 +420,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
 		SnapshotManifestKey: snapshotKey,
 		SnapshotRef:         snapshotRef,
 		HostCfg:             cfg,
+		HostPresence:        presence,
 		ManifestCfg:         manifestCfg,
 		Fetcher:             fetcher,
 		CustomerKeyFn:       keyFn,

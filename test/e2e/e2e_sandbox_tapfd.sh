@@ -129,16 +129,21 @@ network:
 boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
+EOF
+    if [ "$launch" = "1" ]; then
+        cat >> "$out" <<EOF
   cmdline: "console=hvc0"
   root:
     base: $BLK0_REF
     overlay: { diff: file://$diff, size: 1GiB }
-EOF
-    if [ "$launch" = "1" ]; then
-        cat >> "$out" <<EOF
 launch:
   args: ["-c", "import time; print('MTU='+open('/sys/class/net/eth0/mtu').read().strip(), flush=True); print('NETUP', flush=True); time.sleep(60)"]
   restart: never
+EOF
+    else
+        cat >> "$out" <<EOF
+  root:
+    overlay: { diff: file://$diff, size: 1GiB }
 EOF
     fi
 }

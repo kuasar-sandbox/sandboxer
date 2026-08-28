@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -67,29 +68,79 @@ type SandboxConfig struct {
 	Restore RestoreConfig `yaml:"restore,omitempty"`
 
 	// Mounts / Files / Init drive guest environment setup (applied before
-	// the app is forked). See docs/sandbox.md §3.1.
+	// the app is forked). See docs/sandbox.md §3.8.
 	Mounts []MountConfig `yaml:"mounts,omitempty"`
 	Files  []FileConfig  `yaml:"files,omitempty"`
-	Init   []InitConfig  `yaml:"init,omitempty"`
+	// EphemeralFiles are injected only for this cold-start invocation. They
+	// override Files by path at launch time and are deliberately excluded from
+	// PortableSandboxConfig and every exported Sandbox artifact.
+	EphemeralFiles []FileConfig `yaml:"ephemeral_files,omitempty"`
+	Init           []InitConfig `yaml:"init,omitempty"`
 
-	// Metadata is an opaque key/value passthrough for the platform above:
-	// the runtime never interprets it. It is copied verbatim into a
-	// snapshot's snapshot.cfg (and inherited across restore unless the
-	// host yaml overrides it), making snapshot bundles self-describing
-	// for orchestrator-level concerns (e.g. e2b start/ready commands).
-	// Use namespaced keys ("e2b.start_cmd").
+	// Metadata is an opaque key/value passthrough for the platform above. The
+	// runtime never interprets it. Persistent metadata is part of the portable
+	// Sandbox configuration; memory Snapshot metadata is limited to its E ref
+	// and memory-parent graph.
 	Metadata map[string]string `yaml:"metadata,omitempty"`
+}
 
-	// SnapshotRefs is computed at sandbox boot (lifecycle.go fills it
-	// before snapshot is possible) and not part of the YAML schema.
-	// Exposed publicly so snapshot.cfg builder + applyrules can read.
-	SnapshotRefs SnapshotRefs `yaml:"-"`
+// MarshalYAML keeps the no-active-root shape useful as a restore-host document.
+// That shape cannot cold boot an overlay root: it has no active writable source,
+// because Snapshot S's referenced Sandbox E owns the complete immutable graph
+// and restore creates the active diffs. Some lifecycle callers retain the
+// original image base while rebuilding their config for restore; it is stale
+// provenance, not a host binding. Emitting it or the cold workload fields would
+// make the host document claim that disk provenance and launch/files/init are
+// re-applied to already-restored processes. Project the shape to host-owned
+// fields instead.
+//
+// This is only a producer-side projection. Strict restore parsing still rejects
+// every cold-only field that is actually present in an input document.
+func (c SandboxConfig) MarshalYAML() (any, error) {
+	if !c.isRestoreHostProjection() {
+		type plain SandboxConfig
+		return plain(c), nil
+	}
 
-	// SnapshotProvenance records what this run was restored from, so a
-	// subsequent snapshot can record the incremental layered chain
-	// (from_refs / overlay.base_from_refs; see docs/sandbox.md §3.5). Zero
-	// value on cold start ⇒ empty chains. Not part of the YAML schema.
-	SnapshotProvenance SnapshotProvenance `yaml:"-"`
+	type restoreRootYAML struct {
+		Overlay struct{} `yaml:"overlay"`
+	}
+	type restoreBootYAML struct {
+		Kernel  string          `yaml:"kernel"`
+		Runtime string          `yaml:"runtime"`
+		Root    restoreRootYAML `yaml:"root"`
+	}
+	type restoreHostYAML struct {
+		Resources ResourcesConfig `yaml:"resources"`
+		Network   NetworkConfig   `yaml:"network"`
+		Boot      restoreBootYAML `yaml:"boot"`
+		Timeouts  TimeoutsConfig  `yaml:"timeouts,omitempty"`
+		Restore   RestoreConfig   `yaml:"restore,omitempty"`
+	}
+	return restoreHostYAML{
+		Resources: c.Resources,
+		Network:   c.Network,
+		Boot: restoreBootYAML{
+			Kernel: c.Boot.Kernel, Runtime: c.Boot.Runtime,
+		},
+		Timeouts: c.Timeouts,
+		Restore:  c.Restore,
+	}, nil
+}
+
+func (c SandboxConfig) isRestoreHostProjection() bool {
+	root := c.Boot.Root
+	// Lifecycle producers resolve startup memory before materializing a run.
+	// Requiring that resolved marker and the complete absence of an immutable or
+	// active writable upper keeps every valid cold config lossless: ValidateCold
+	// requires at least one of overlay.{base,diff,diff_template}. A prepared
+	// restore document deliberately has none because Sandbox E owns that graph.
+	if c.Resources.Startup == nil || c.Boot.Kernel == "" || c.Boot.Runtime == "" || len(c.Boot.Disks) != 0 || root.Overlay == nil {
+		return false
+	}
+	return root.Diff == "" && root.DiffTemplate == "" && root.DiffSize == "" &&
+		root.Overlay.Base == "" && len(root.Overlay.BaseFromRefs) == 0 &&
+		root.Overlay.Diff == "" && root.Overlay.DiffTemplate == "" && root.Overlay.DiffSize == ""
 }
 
 // PrefetchMode selects whether restore requests a best-effort warm-up of the
@@ -124,64 +175,6 @@ func ParsePrefetchMode(s string) (PrefetchMode, error) {
 func (c RestoreConfig) validate() error {
 	_, err := ParsePrefetchMode(c.Prefetch)
 	return err
-}
-
-// SnapshotRefs holds precomputed scheme-qualified file refs or manifest refs.
-// (or `manifest://<key>`) refs for boot.runtime and boot.root.base, used
-// when synthesising snapshot.cfg.
-type SnapshotRefs struct {
-	RuntimeRef string // file://<basename>@sha256:<digest>
-	BaseRef    string // file://<basename>@<sha256|hmac>:<digest> or manifest://<key>
-	// DiskBaseRefs are the per-data-disk erofs base refs (boot.disks[] order),
-	// the data-disk analogue of BaseRef. Empty entry for a single-disk data disk
-	// (no erofs base) or one with no base.
-	DiskBaseRefs []string
-}
-
-// SnapshotProvenance carries the parent (restored-from) snapshot's identity
-// and chains so the next snapshot taken by this run can prepend the parent
-// and record the full incremental layered chain. Empty on cold start.
-type SnapshotProvenance struct {
-	ParentSnapshotRef  string   // manifest://<key> or scheme-qualified file snapshot ref; "" on cold start
-	ParentFromRefs     []string // parent's from_refs (memory chain below the parent)
-	ParentOverlayBase  string   // parent's overlay.base (top disk diff); "" on cold start
-	ParentBaseFromRefs []string // parent's overlay.base_from_refs (disk chain below it)
-
-	// ParentSnapshot/OverlayPath are the absolute paths of the parent's local
-	// tarstream snapshot + overlay files, set ONLY when this run was restored
-	// from that LOCAL representation. They let a re-export MERGE the resident delta onto
-	// the parent local layer (replacing it) instead of stacking a second local
-	// layer — keeping the local-layer depth at 1 (docs/sandbox.md §3.5). Empty
-	// for manifest:// / cold-start restores (which stack via ParentSnapshotRef).
-	ParentSnapshotPath string
-	ParentOverlayPath  string
-
-	// ParentDisks is the per-data-disk parent state (boot.disks[] order), the
-	// data-disk analogue of ParentOverlayBase/ParentBaseFromRefs/ParentOverlayPath.
-	// Empty on cold start. Populated by restore from the parent snapshot.cfg's
-	// boot.disks[].
-	ParentDisks []DiskProvenance
-
-	// BundleSource is physical lookup state kept separately from the logical
-	// manifest:// provenance above. It is runtime-only and never serialized
-	// into snapshot.cfg.
-	BundleSource *BundleSourceProvenance
-}
-
-// BundleSourceProvenance identifies the restored current Bundle and its flat
-// ordered refs without adding a physical selector to the logical graph.
-type BundleSourceProvenance struct {
-	RootRef  string   // file://<basename>.bundle, optionally @location; no @manifest
-	RootPath string   // resolved host path used for sibling preparation and merge
-	Refs     []string // immutable copy of the current Bundle's flat ordered refs
-}
-
-// DiskProvenance is one data disk's parent (restored-from) chain — the
-// data-disk analogue of the root fields above.
-type DiskProvenance struct {
-	OverlayBase  string   // parent's boot.disks[i] overlay.base (or single base); "" cold
-	BaseFromRefs []string // parent's boot.disks[i] chain below it
-	OverlayPath  string   // local overlay file path (file:// parent only) for flatten-merge
 }
 
 // ResourcesConfig separates immutable VM capacity from the settled guest
@@ -313,8 +306,10 @@ func (c *WatermarkHighConfig) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-// StartupConfig sets cold-start headroom before the first trusted report.
-// Restore never uses it. It applies in both static and dynamic modes.
+// StartupConfig sets the node's configured startup headroom. A cold start uses
+// it for the initial Budget; restore records the policy in its reservation but
+// admits the captured BudgetAtSnapshot instead. It applies in both static and
+// dynamic modes and is never part of PortableSandboxConfig.
 type StartupConfig struct {
 	Memory string `yaml:"memory"`
 }
@@ -596,8 +591,8 @@ type RootConfig struct {
 	// DiffSize sizes a freshly-created Diff over Base (no template). Applied
 	// only at creation; an existing diff keeps its own size. Empty → 1 GiB.
 	DiffSize string `yaml:"diff_size"`
-	// BaseFromRefs is the single-disk snapshot chain below Base (§3.5),
-	// populated from snapshot.cfg on restore. Not set in a hand-written cold cfg.
+	// BaseFromRefs is the single-disk immutable layer chain below Base. Exported
+	// Sandbox E owns this graph; Snapshot S never duplicates it.
 	BaseFromRefs []string `yaml:"base_from_refs,omitempty"`
 }
 
@@ -640,11 +635,14 @@ type OverlayConfig struct {
 // in the flattened image's appended config.json). For v1 the override
 // is mandatory — auto-extraction of image config is future work.
 type LaunchConfig struct {
-	Exec    string            `yaml:"exec"`
-	Args    []string          `yaml:"args"`
-	Env     map[string]string `yaml:"env"`
-	Workdir string            `yaml:"workdir"`
-	Restart string            `yaml:"restart"` // never|on-failure|always
+	Exec string            `yaml:"exec"`
+	Args []string          `yaml:"args"`
+	Env  map[string]string `yaml:"env"`
+	// EphemeralEnv overrides Env by key for the current cold-start process. It
+	// is host/instance input and is never serialized into a Sandbox artifact.
+	EphemeralEnv map[string]string `yaml:"ephemeral_env,omitempty"`
+	Workdir      string            `yaml:"workdir"`
+	Restart      string            `yaml:"restart"` // never|on-failure|always
 
 	// CgroupControl delegates the application cgroup namespace root to the
 	// application. false (default) runs application processes directly in the
@@ -965,9 +963,10 @@ func (c *SandboxConfig) WatermarkHighRatio() (uint64, error) {
 	return resource.RatioFromFloat(c.Resources.WatermarkHigh.Ratio)
 }
 
-// StartupBytes returns cold-start headroom. The default is full Capacity.
-// Restore admission ignores this value and reserves BudgetAtSnapshot instead;
-// callers may still read it to materialize the immutable reservation contract.
+// StartupBytes returns configured startup headroom. The default is full
+// Capacity. Restore admission ignores this value for the initial Budget and
+// reserves BudgetAtSnapshot instead; callers still read it to materialize the
+// node reservation contract.
 func (c *SandboxConfig) StartupBytes() (uint64, error) {
 	if c.Resources.Startup == nil {
 		return c.CapacityMemoryBytes()
@@ -1046,6 +1045,9 @@ func (c *SandboxConfig) ValidateCold() error {
 	}
 	if allocMem == 0 {
 		return errors.New("resources.allocatable.memory must be > 0")
+	}
+	if math.IsNaN(c.Resources.Allocatable.CPU) || math.IsInf(c.Resources.Allocatable.CPU, 0) {
+		return errors.New("resources.allocatable.cpu must be finite")
 	}
 	if c.Resources.Allocatable.CPU > float64(c.Resources.Capacity.CPU) {
 		return errors.New("resources.allocatable.cpu must be ≤ capacity.cpu")
@@ -1192,16 +1194,13 @@ func (c *SandboxConfig) ValidateCold() error {
 			return fmt.Errorf("mounts[%d].type %q unknown (want tmpfs|empty|disk)", i, m.Type)
 		}
 	}
-	// files: path absolute; mode valid octal if set.
-	for i, f := range c.Files {
-		if !filepath.IsAbs(f.Path) {
-			return fmt.Errorf("files[%d].path must be absolute (got %q)", i, f.Path)
-		}
-		if f.Mode != "" {
-			if _, err := strconv.ParseUint(f.Mode, 8, 32); err != nil {
-				return fmt.Errorf("files[%d].mode %q invalid octal", i, f.Mode)
-			}
-		}
+	// files: path absolute; mode valid octal if set; duplicates inside either
+	// list are ambiguous. Cross-list duplicates are intentional overrides.
+	if err := validateFiles("files", c.Files); err != nil {
+		return err
+	}
+	if err := validateFiles("ephemeral_files", c.EphemeralFiles); err != nil {
+		return err
 	}
 	// init: exec required; timeout parseable.
 	for i, it := range c.Init {
@@ -1264,12 +1263,29 @@ func (c *SandboxConfig) ValidateCold() error {
 	return nil
 }
 
-// ValidateRestoreHostConfig checks the subset of invariants a restore host
-// yaml must satisfy on its own (the snapshot.cfg cross-checks — capacity
-// equality, runtime/base digest — happen later in restore.ApplyRules with the
-// bundle in hand). It is the strict-mode check for `sandbox-ctl config
-// --mode restore`: cold-only fields (kernel, launch, mounts, ...) are not
-// required here.
+func validateFiles(field string, files []FileConfig) error {
+	seen := make(map[string]int, len(files))
+	for i, f := range files {
+		if !filepath.IsAbs(f.Path) {
+			return fmt.Errorf("%s[%d].path must be absolute (got %q)", field, i, f.Path)
+		}
+		if previous, duplicate := seen[f.Path]; duplicate {
+			return fmt.Errorf("%s[%d].path %q duplicates %s[%d]", field, i, f.Path, field, previous)
+		}
+		seen[f.Path] = i
+		if f.Mode != "" {
+			if _, err := strconv.ParseUint(f.Mode, 8, 32); err != nil {
+				return fmt.Errorf("%s[%d].mode %q invalid octal", field, i, f.Mode)
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateRestoreHostConfig checks the host-only bindings and policies a
+// restore document can validate before Snapshot S is opened. S supplies only
+// memory provenance; its sandbox_ref selects E, which owns capacity, launch and
+// the immutable disk graph. ApplyRestoreRules performs the ownership checks.
 func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	if err := c.Restore.validate(); err != nil {
 		return err
@@ -1303,8 +1319,8 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	if err := c.Network.validate(); err != nil {
 		return err
 	}
-	// Capacity is optional in the host yaml (matched against snapshot.cfg);
-	// if provided it must be well-formed.
+	// Capacity is optional in the host yaml. When present it must be well-formed
+	// and ApplyRestoreRules requires it to match Sandbox E.
 	var capMem uint64
 	if c.Resources.Capacity.CPU != 0 || c.Resources.Capacity.Memory != "" {
 		if c.Resources.Capacity.CPU <= 0 {
@@ -1316,8 +1332,9 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 			return fmt.Errorf("resources.capacity.memory: %w", err)
 		}
 	}
-	// These fields are host policy, not snapshot state. Restore does not consume
-	// startup headroom, but it remains part of the same strict config schema.
+	// Allocatable and Startup are host policies. The referenced Sandbox owns
+	// their portable workload identities; ApplyRestoreRules checks any explicit
+	// portable values and applies Startup only to the node reservation policy.
 	if c.Resources.Allocatable.Memory != "" {
 		allocMem, err := util.ParseSize(c.Resources.Allocatable.Memory)
 		if err != nil {
@@ -1360,6 +1377,19 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	return nil
 }
 
+// ValidateRestoreHostConfigWithPresence rejects cold-start-only host input and
+// validates the remaining restore policy before a caller opens Snapshot S or
+// its referenced Sandbox E. Presence is required because ordinary config
+// loading applies inert cold defaults that are indistinguishable by value
+// alone; programmatic callers without YAML presence still get the conservative
+// non-empty-value checks in rejectRestoreColdOnly.
+func (c *SandboxConfig) ValidateRestoreHostConfigWithPresence(presence FieldPresence) error {
+	if err := rejectRestoreColdOnly(c, presence); err != nil {
+		return err
+	}
+	return c.ValidateRestoreHostConfig()
+}
+
 func validateControllerSocket(path string) error {
 	if path == "" {
 		return nil
@@ -1373,7 +1403,7 @@ func validateControllerSocket(path string) error {
 // validateRoot checks boot.root for both disk modes. cold=true enforces the
 // cold-start requirements (a mountable source, and — in single-disk mode —
 // an explicit launch.exec since there is no erofs image config); cold=false
-// (restore) is lenient: base / sources come from the snapshot.cfg.
+// (restore) is lenient: immutable base/layer sources come from Sandbox E.
 //
 //   - overlay mode (Overlay != nil): Base is the erofs image (required cold),
 //     the writable upper is overlay.{base,diff,diff_template}.
@@ -1609,15 +1639,55 @@ func SchemeAndPath(uri string) (scheme, value string, ok bool) {
 	return "", "", false
 }
 
-// ProtoFiles returns the configured files as a proto slice — used by the
-// restore path to push this instance's per-instance files in the restore
-// notify, and by cold start to seed the launch spec.
-func (c *SandboxConfig) ProtoFiles() []proto.FileSpec {
-	if len(c.Files) == 0 {
+// EffectiveFiles merges persistent declarations with instance-only overrides.
+// Persistent order is retained; an ephemeral declaration with the same path
+// replaces it in place, while a new path is appended in ephemeral order.
+func (c *SandboxConfig) EffectiveFiles() []FileConfig {
+	if c == nil || (len(c.Files) == 0 && len(c.EphemeralFiles) == 0) {
 		return nil
 	}
-	out := make([]proto.FileSpec, len(c.Files))
-	for i, f := range c.Files {
+	out := append([]FileConfig(nil), c.Files...)
+	indices := make(map[string]int, len(out))
+	for i := range out {
+		indices[out[i].Path] = i
+	}
+	for _, file := range c.EphemeralFiles {
+		if index, ok := indices[file.Path]; ok {
+			out[index] = file
+			continue
+		}
+		indices[file.Path] = len(out)
+		out = append(out, file)
+	}
+	return out
+}
+
+// EffectiveLaunchEnv returns the launch environment after instance-only
+// overrides. It never aliases either input map.
+func (c *SandboxConfig) EffectiveLaunchEnv() map[string]string {
+	if c == nil || (len(c.Launch.Env) == 0 && len(c.Launch.EphemeralEnv) == 0) {
+		return nil
+	}
+	out := make(map[string]string, len(c.Launch.Env)+len(c.Launch.EphemeralEnv))
+	for key, value := range c.Launch.Env {
+		out[key] = value
+	}
+	for key, value := range c.Launch.EphemeralEnv {
+		out[key] = value
+	}
+	return out
+}
+
+// ProtoFiles returns the effective cold-start file declarations as a proto
+// slice. Memory restore deliberately does not call this method: a restored
+// process already contains its file bindings and cold-only input is rejected.
+func (c *SandboxConfig) ProtoFiles() []proto.FileSpec {
+	files := c.EffectiveFiles()
+	if len(files) == 0 {
+		return nil
+	}
+	out := make([]proto.FileSpec, len(files))
+	for i, f := range files {
 		out[i] = proto.FileSpec{Path: f.Path, Content: f.Content, Mode: f.Mode, Owner: f.Owner, ReadOnly: f.ReadOnly}
 	}
 	return out

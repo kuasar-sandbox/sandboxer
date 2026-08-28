@@ -2,6 +2,8 @@ package guestlink
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
@@ -63,17 +65,27 @@ func (l *MUXLink) Teardown() {
 // noticed the close may be dropped (it self-heals after one byte).
 func (l *MUXLink) Reattach(ctx context.Context, client *HostClient, mode stdio.Mode) error {
 	l.Teardown()
-	conn, established, err := OpenMUXViaAttach(client, 1, proto.DeadlineAttach)
-	if err != nil {
-		return err
+	var attemptErrors []error
+	for attempt := 1; attempt <= 2; attempt++ {
+		conn, established, err := OpenMUXViaAttachContext(ctx, client, uint32(attempt), proto.DeadlineAttach)
+		if err == nil {
+			ss := stdio.StreamSetFor(established)
+			sess := mux.NewSession(conn, ss, mux.Options{})
+			cleanup, bridgeErr := mode.Bridge(ctx, sess, ss)
+			if bridgeErr == nil {
+				l.Set(sess, cleanup)
+				return nil
+			}
+			_ = sess.Close()
+			err = bridgeErr
+		}
+		attemptErrors = append(attemptErrors, err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(append(attemptErrors, ctxErr)...)
+		}
+		if attempt == 1 && client != nil && client.Logf != nil {
+			client.Logf("attach handshake failed after request; retrying once to complete idempotent post-quiesce recovery: %v", err)
+		}
 	}
-	ss := stdio.StreamSetFor(established)
-	sess := mux.NewSession(conn, ss, mux.Options{})
-	cleanup, err := mode.Bridge(ctx, sess, ss)
-	if err != nil {
-		_ = sess.Close()
-		return err
-	}
-	l.Set(sess, cleanup)
-	return nil
+	return fmt.Errorf("attach recovery failed after two attempts: %w", errors.Join(attemptErrors...))
 }

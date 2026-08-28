@@ -86,6 +86,74 @@ func TestValidateRestoreNetworkTopology(t *testing.T) {
 	}
 }
 
+func TestValidateSnapshotVCPUTopology(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   string
+		capacity int
+		wantErr  string
+	}{
+		{
+			name:     "exact",
+			config:   `{"cpus":{"boot_vcpus":2,"max_vcpus":2}}`,
+			capacity: 2,
+		},
+		{
+			name:     "different boot count",
+			config:   `{"cpus":{"boot_vcpus":1,"max_vcpus":1}}`,
+			capacity: 2,
+			wantErr:  "CH boot=1 max=1 Sandbox=2",
+		},
+		{
+			name:     "different max count",
+			config:   `{"cpus":{"boot_vcpus":2,"max_vcpus":4}}`,
+			capacity: 2,
+			wantErr:  "CH boot=2 max=4 Sandbox=2",
+		},
+		{name: "missing cpus", config: `{}`, capacity: 1, wantErr: "config.json.cpus is required"},
+		{name: "null cpus", config: `{"cpus":null}`, capacity: 1, wantErr: "config.json.cpus must be an object"},
+		{
+			name:     "missing boot",
+			config:   `{"cpus":{"max_vcpus":1}}`,
+			capacity: 1,
+			wantErr:  "boot_vcpus is required",
+		},
+		{
+			name:     "missing max",
+			config:   `{"cpus":{"boot_vcpus":1}}`,
+			capacity: 1,
+			wantErr:  "max_vcpus is required",
+		},
+		{
+			name:     "fractional boot",
+			config:   `{"cpus":{"boot_vcpus":1.5,"max_vcpus":2}}`,
+			capacity: 2,
+			wantErr:  "boot_vcpus",
+		},
+		{
+			name:     "zero",
+			config:   `{"cpus":{"boot_vcpus":0,"max_vcpus":0}}`,
+			capacity: 1,
+			wantErr:  "must be positive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSnapshotVCPUTopology([]byte(tt.config), tt.capacity)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateSnapshotVCPUTopology() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateSnapshotVCPUTopology() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestRunValidatesHostNetworkBeforeOpeningSnapshot(t *testing.T) {
 	cfg := &config.SandboxConfig{Network: config.NetworkConfig{IP: "192.0.2.1/24"}}
 	_, err := Run(context.Background(), Options{

@@ -14,12 +14,13 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
 
 // FileStreamOpener opens one already-resolved file:// artifact. Callers that
 // have manifest configuration use it to share the tarstream/Bundle content
-// detector; nil preserves the legacy tarstream-only path.
+// detector; nil selects the ordinary local tarstream path.
 type FileStreamOpener func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error)
 
 // OpenBlockReader resolves a file:// or manifest:// disk URI into a
@@ -48,6 +49,31 @@ func OpenBlockReaderWithOpener(ctx context.Context, uri string, fetcher fetch.Fe
 		return nil, 0, err
 	}
 	return vhost.NewStreamReader(ctx, stream, size), size, nil
+}
+
+// OpenRootImageBlockReaderWithOpener opens the read-only root EROFS image and
+// always removes its configuration ZIP from the block-visible view. A parent
+// .sandbox has already been narrowed by OpenDiskStreamAtWithOpener; a normal
+// container image is then narrowed by the strict flattened-image reader.
+// ImageConfigBytes remains available to LoadImageConfigFrom in both cases.
+func OpenRootImageBlockReaderWithOpener(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (vhost.BlockReader, int64, error) {
+	stream, size, err := OpenDiskStreamAtWithOpener(ctx, uri, fetcher, locations, "", codec, required, opener)
+	if err != nil {
+		return nil, 0, err
+	}
+	if provider, ok := stream.(interface{ ImageConfigBytes() []byte }); ok && provider.ImageConfigBytes() != nil {
+		return vhost.NewStreamReader(ctx, stream, size), size, nil
+	}
+	image, err := sandboxfile.OpenEROFSArtifact(ctx, stream)
+	if err != nil {
+		return nil, 0, fmt.Errorf("root container image: %w", err)
+	}
+	if image.Payload.Size() > math.MaxInt64 {
+		closeErr := image.Close()
+		return nil, 0, errors.Join(errors.New("root container image is too large"), closeErr)
+	}
+	size = int64(image.Payload.Size())
+	return vhost.NewStreamReader(ctx, image.Payload, size), size, nil
 }
 
 // OpenDiskStream resolves a file:// or manifest:// disk URI into a fetch.Stream
@@ -88,18 +114,34 @@ func OpenDiskStreamAtWithOpener(ctx context.Context, uri string, fetcher fetch.F
 			if err != nil {
 				return nil, 0, protectLocalArtifactError(codec, "open local artifact", err)
 			}
-			if stream.Size() > math.MaxInt64 {
-				closeErr := stream.Close()
-				return nil, 0, errors.Join(fmt.Errorf("local artifact is too large"), closeErr)
-			}
-			return stream, int64(stream.Size()), nil
+			return narrowDiskPayload(ctx, stream, filepath.Ext(ref.Path) == ".sandbox", codec)
 		}
-		return openLocalDiskStream(path, ref, codec, required)
+		stream, _, err := openLocalDiskStream(path, ref, codec, required)
+		if err != nil {
+			return nil, 0, err
+		}
+		return narrowDiskPayload(ctx, stream, filepath.Ext(ref.Path) == ".sandbox", codec)
 	case manifest.RefSchemeManifest:
-		return OpenManifestStream(ctx, ref.Path, fetcher)
+		stream, _, err := OpenManifestStream(ctx, ref.Path, fetcher)
+		if err != nil {
+			return nil, 0, err
+		}
+		return narrowDiskPayload(ctx, stream, false, nil)
 	default:
 		return nil, 0, fmt.Errorf("unknown disk URI scheme: %s", ref.Scheme)
 	}
+}
+
+func narrowDiskPayload(ctx context.Context, stream fetch.Stream, requireSandbox bool, codec tarstream.Codec) (fetch.Stream, int64, error) {
+	payload, _, err := sandboxfile.PayloadIfSandbox(ctx, stream, requireSandbox)
+	if err != nil {
+		return nil, 0, protectLocalArtifactError(codec, "open Sandbox payload", err)
+	}
+	if payload.Size() > math.MaxInt64 {
+		closeErr := payload.Close()
+		return nil, 0, errors.Join(fmt.Errorf("artifact is too large"), closeErr)
+	}
+	return payload, int64(payload.Size()), nil
 }
 
 func openLocalDiskStream(path string, ref manifest.Ref, codec tarstream.Codec, required bool) (fetch.Stream, int64, error) {
@@ -131,13 +173,26 @@ func OpenLayeredBlockReaderWithOpener(ctx context.Context, refs []string, fetche
 		return nil, 0, errors.New("disk layer list is empty")
 	}
 	streams := make([]fetch.Stream, 0, len(refs))
+	var logicalSize int64 = -1
 	for i, ref := range refs {
-		stream, _, err := OpenDiskStreamAtWithOpener(ctx, ref, fetcher, locations, "", codec, required, opener)
+		stream, size, err := OpenDiskStreamAtWithOpener(ctx, ref, fetcher, locations, "", codec, required, opener)
 		if err != nil {
 			for _, opened := range streams {
 				_ = opened.Close()
 			}
 			return nil, 0, fmt.Errorf("layer[%d]: %w", i, err)
+		}
+		if logicalSize < 0 {
+			logicalSize = size
+		} else if size != logicalSize {
+			closeErr := stream.Close()
+			for _, opened := range streams {
+				closeErr = errors.Join(closeErr, opened.Close())
+			}
+			return nil, 0, errors.Join(
+				fmt.Errorf("layer[%d] logical size %d differs from layer[0] size %d", i, size, logicalSize),
+				closeErr,
+			)
 		}
 		streams = append(streams, stream)
 	}
@@ -145,8 +200,7 @@ func OpenLayeredBlockReaderWithOpener(ctx context.Context, refs []string, fetche
 	if len(streams) > 1 {
 		stream = fetch.NewLayered(streams...)
 	}
-	size := int64(stream.Size())
-	return vhost.NewStreamReader(ctx, stream, size), size, nil
+	return vhost.NewStreamReader(ctx, stream, logicalSize), logicalSize, nil
 }
 
 type localArtifactError struct {

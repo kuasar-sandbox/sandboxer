@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,17 +8,17 @@ import (
 	"os"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
 
-// infoCmd implements `sandbox-ctl info` — print a snapshot's embedded
-// snapshot.cfg (the post-quiesce platform contract: capacity, runtime_ref,
-// base_ref, overlay.base; docs/sandbox.md §3.4). Mirrors `flatten-ctl info`.
+// infoCmd implements `sandbox-ctl info` for both strict logical roots:
+// sandbox.runtime.cfg for Sandbox E and snapshot.cfg for Snapshot S.
 //
-//	sandbox-ctl info [--json] [--manifest-config <file>] <manifest://hex | snapshot-path>
+//	sandbox-ctl info [--json] [--manifest-config <file>] <artifact-ref-or-path>
 //
-// Default output is the raw snapshot.cfg YAML; --json re-emits the parsed struct.
+// Default output is the canonical raw YAML; --json emits the parsed schema.
 func infoCmd(args []string) int {
 	fs := flag.NewFlagSet("info", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "machine-readable JSON output")
@@ -30,12 +29,13 @@ func infoCmd(args []string) int {
 		return 2
 	}
 	input := fs.Arg(0)
-	if input == "" {
-		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl info [--json] [--manifest-config <file>] <manifest://hex|snapshot-path>")
+	if input == "" || fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl info [--json] [--manifest-config <file>] [--ref-location name=file:///path ...] <artifact-ref-or-path>")
 		return 2
 	}
 
-	ctx := context.Background()
+	ctx, stopSignals := commandContext()
+	defer stopSignals()
 	manifestCfg, err := config.LoadManifestConfig(*manifestPath)
 	if err != nil {
 		if !errors.Is(err, manifest.ErrConfigNotProvided) {
@@ -44,34 +44,47 @@ func infoCmd(args []string) int {
 		}
 		manifestCfg = nil
 	}
-	reader, err := restore.NewSnapshotCfgReader(manifestCfg)
+	storage, err := artifact.NewProcessStorage(manifestCfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	defer reader.Close()
-	readOptions := restore.SnapshotCfgReadOptions{RefLocations: refLocations}
+	defer storage.Close()
+	document, err := storage.Inspect(ctx, input, refLocations)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 
 	if *asJSON {
-		document, err := reader.Read(ctx, input, readOptions)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
+		var value any = document.Sandbox
+		if document.Snapshot != nil {
+			// Keep the established machine-readable contract while changing the
+			// on-disk model atomically. The projection is derived from strict S
+			// and its referenced strict E; no disk provenance is read from or
+			// written back to snapshot.cfg.
+			reader, err := restore.NewSnapshotCfgReader(manifestCfg)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			defer reader.Close()
+			resolved, err := reader.Read(ctx, input, restore.SnapshotCfgReadOptions{RefLocations: refLocations})
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			value = resolved.Config
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		if err := enc.Encode(document.Config); err != nil {
+		if err := enc.Encode(value); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
 		return 0
 	}
-	body, err := reader.ReadRaw(ctx, input, readOptions)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	if _, err := os.Stdout.Write(body); err != nil {
+	if _, err := os.Stdout.Write(document.Raw); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}

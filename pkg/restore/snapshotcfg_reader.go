@@ -1,81 +1,128 @@
 package restore
 
 import (
-	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"math"
 	"path/filepath"
 	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
-	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
 
-// MaxSnapshotCfgSize is the largest uncompressed snapshot.cfg accepted by the
-// single-root reader.
-const MaxSnapshotCfgSize = 1 << 20
+// SnapshotCfg is a process-local compatibility projection for the current
+// orchestrator task-preparation API. It is never decoded from or encoded into
+// snapshot.cfg: the on-disk V1 schema remains snapshot.Config and contains
+// only sandbox_ref plus memory from_refs. Read derives every disk, resource,
+// launch and metadata field below from the referenced Sandbox E.
+type SnapshotCfg struct {
+	Version    int    `yaml:"version"`
+	SandboxRef string `yaml:"sandbox_ref"`
+	Resources  struct {
+		Capacity struct {
+			CPU    int    `yaml:"cpu"`
+			Memory string `yaml:"memory"`
+		} `yaml:"capacity"`
+	} `yaml:"resources"`
+	Metadata map[string]string `yaml:"metadata,omitempty"`
+	FromRefs []string          `yaml:"from_refs"`
+	Launch   struct {
+		CgroupControl bool `yaml:"cgroup_control"`
+	} `yaml:"launch"`
+	Boot struct {
+		RuntimeRef string `yaml:"runtime_ref"`
+		Root       struct {
+			BaseRef      string          `yaml:"base_ref,omitempty"`
+			Overlay      *SnapOverlayCfg `yaml:"overlay,omitempty"`
+			Base         string          `yaml:"base,omitempty"`
+			BaseFromRefs []string        `yaml:"base_from_refs,omitempty"`
+		} `yaml:"root"`
+		Disks []SnapDiskNode `yaml:"disks,omitempty"`
+	} `yaml:"boot"`
+}
 
-// SnapshotCfgReadOptions supplies trusted path resolution inputs. RefLocations
-// is a reader path map (name -> absolute path), not a CLI file:// URI map.
-// RelativeDir is used only for unlocated relative file refs and raw relative
-// paths.
+// SnapDiskNode is one derived data-disk graph in Artifact order.
+type SnapDiskNode struct {
+	BaseRef      string          `yaml:"base_ref,omitempty"`
+	Overlay      *SnapOverlayCfg `yaml:"overlay,omitempty"`
+	Base         string          `yaml:"base,omitempty"`
+	BaseFromRefs []string        `yaml:"base_from_refs,omitempty"`
+}
+
+// SnapOverlayCfg is one derived immutable upper/lower chain.
+type SnapOverlayCfg struct {
+	Base         string   `yaml:"base"`
+	BaseFromRefs []string `yaml:"base_from_refs"`
+}
+
+// ArtifactRefs returns the disk artifacts named by the referenced Sandbox E.
+// It excludes memory FromRefs and the node-provided runtime artifact.
+func (c *SnapshotCfg) ArtifactRefs() []string {
+	if c == nil {
+		return nil
+	}
+	refs := make([]string, 0)
+	appendRef := func(raw string) {
+		if raw != "" {
+			refs = append(refs, raw)
+		}
+	}
+	appendNode := func(baseRef, base string, baseFromRefs []string, overlay *SnapOverlayCfg) {
+		appendRef(baseRef)
+		appendRef(base)
+		for _, raw := range baseFromRefs {
+			appendRef(raw)
+		}
+		if overlay != nil {
+			appendRef(overlay.Base)
+			for _, raw := range overlay.BaseFromRefs {
+				appendRef(raw)
+			}
+		}
+	}
+	appendNode(c.Boot.Root.BaseRef, c.Boot.Root.Base, c.Boot.Root.BaseFromRefs, c.Boot.Root.Overlay)
+	for i := range c.Boot.Disks {
+		disk := &c.Boot.Disks[i]
+		appendNode(disk.BaseRef, disk.Base, disk.BaseFromRefs, disk.Overlay)
+	}
+	return refs
+}
+
+// SnapshotCfgReadOptions supplies trusted local ref resolution inputs.
 type SnapshotCfgReadOptions struct {
 	RefLocations config.RefLocations
 	RelativeDir  string
 }
 
-// SnapshotCfgDocument is the canonical parsed root config together with its
-// original YAML body. Raw is retained for sandbox-ctl info's human-readable
-// output; task callers should consume Config.
+// SnapshotCfgDocument carries the derived compatibility projection and the
+// original canonical new-schema snapshot.cfg bytes.
 type SnapshotCfgDocument struct {
 	Config *SnapshotCfg
 	Raw    []byte
 }
 
-type snapshotCfgStorage interface {
-	Fetcher() fetch.Fetcher
-	LocalCodec() tarstream.Codec
-	LocalRequired() bool
-	Close() error
-}
-
-type snapshotCfgFileOpener interface {
-	OpenFile(context.Context, string, manifest.Ref) (*artifact.OpenedFile, error)
-}
-
-type snapshotCfgLocationFileOpener interface {
-	OpenFileWithLocations(context.Context, string, manifest.Ref, config.RefLocations) (*artifact.OpenedFile, error)
-}
-
-// SnapshotCfgReader reads exactly one root snapshot bundle. It does not walk
-// FromRefs, apply conductor policy, or cache results across tasks.
+// SnapshotCfgReader owns process-local artifact storage for one or more
+// sequential root reads. Callers must Close it.
 type SnapshotCfgReader struct {
-	storage snapshotCfgStorage
+	storage     *artifact.ProcessStorage
+	manifestCfg *config.ManifestConfig
 }
 
-// NewSnapshotCfgReader creates a process-local reader using the existing
-// MANIFEST_KEY convention. The returned reader owns its lazy manifest client
-// and must be closed before a caller replaces its process via exec.
+// NewSnapshotCfgReader creates the reader used by current orchestrator task
+// preparation. The customer key remains process-bound through ProcessStorage.
 func NewSnapshotCfgReader(manifestCfg *config.ManifestConfig) (*SnapshotCfgReader, error) {
 	storage, err := artifact.NewProcessStorage(manifestCfg)
 	if err != nil {
 		return nil, err
 	}
-	return newSnapshotCfgReader(storage), nil
+	return &SnapshotCfgReader{storage: storage, manifestCfg: manifestCfg}, nil
 }
 
-func newSnapshotCfgReader(storage snapshotCfgStorage) *SnapshotCfgReader {
-	return &SnapshotCfgReader{storage: storage}
-}
-
-// Close releases any cache or store client opened while reading the root.
 func (r *SnapshotCfgReader) Close() error {
 	if r == nil || r.storage == nil {
 		return nil
@@ -83,162 +130,180 @@ func (r *SnapshotCfgReader) Close() error {
 	return r.storage.Close()
 }
 
-// Read opens rootRef, extracts exactly one snapshot.cfg ZIP entry under the
-// configured size limit, and returns its canonical parsed representation.
+// Read opens strict Snapshot S, follows its sandbox_ref while S remains open,
+// and derives a compatibility view from Sandbox E. It never accepts the old
+// disk-bearing snapshot.cfg schema.
 func (r *SnapshotCfgReader) Read(ctx context.Context, rootRef string, opts SnapshotCfgReadOptions) (*SnapshotCfgDocument, error) {
-	body, err := r.ReadRaw(ctx, rootRef, opts)
+	opened, root, memoryCfg, err := r.openSnapshot(ctx, rootRef, opts)
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := ParseSnapshotCfg(body)
+	sandboxSource, err := openReferencedSandbox(ctx, memoryCfg.SandboxRef, opened.opts)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(fmt.Errorf("snapshot.cfg sandbox_ref: %w", err), root.Close())
 	}
-	return &SnapshotCfgDocument{Config: cfg, Raw: body}, nil
+
+	projection, projectErr := projectSnapshotCfg(memoryCfg, sandboxSource.Root.Portable)
+	document := &SnapshotCfgDocument{Config: projection, Raw: append([]byte(nil), root.SnapshotConfig...)}
+	closeErr := errors.Join(sandboxSource.Root.Close(), root.Close())
+	if projectErr != nil || closeErr != nil {
+		return nil, errors.Join(projectErr, closeErr)
+	}
+	return document, nil
 }
 
-// ReadRaw performs the same bounded, exact-entry read as Read without parsing
-// the YAML. It exists for sandbox-ctl info's default diagnostic output; task
-// callers should use Read so malformed root configs fail preparation.
+// ReadRaw returns only canonical new-schema snapshot.cfg bytes. It still
+// rejects old/unknown/non-canonical Snapshot roots, but does not open E.
 func (r *SnapshotCfgReader) ReadRaw(ctx context.Context, rootRef string, opts SnapshotCfgReadOptions) ([]byte, error) {
-	if r == nil || r.storage == nil {
-		return nil, errors.New("snapshot.cfg reader is not initialized")
+	_, root, _, err := r.openSnapshot(ctx, rootRef, opts)
+	if err != nil {
+		return nil, err
 	}
-	if rootRef == "" {
-		return nil, errors.New("snapshot root ref is empty")
+	raw := append([]byte(nil), root.SnapshotConfig...)
+	if err := root.Close(); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func (r *SnapshotCfgReader) openSnapshot(ctx context.Context, rootRef string, readOpts SnapshotCfgReadOptions) (*openedRootSnapshot, *snapshotfile.Root, *snapshot.Config, error) {
+	if r == nil || r.storage == nil {
+		return nil, nil, nil, errors.New("snapshot.cfg reader is not initialized")
+	}
+	if strings.TrimSpace(rootRef) == "" {
+		return nil, nil, nil, errors.New("snapshot root ref is empty")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
-
-	stream, size, err := r.openRoot(ctx, rootRef, opts)
+	openOpts, err := r.openOptions(rootRef, readOpts)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
-	body, readErr := readSnapshotCfgEntry(fetch.NewReaderAt(ctx, stream), size)
-	closeErr := stream.Close()
-	if readErr != nil {
-		if closeErr != nil {
-			return nil, errors.Join(readErr, fmt.Errorf("close snapshot stream: %w", closeErr))
-		}
-		return nil, readErr
+	opened, err := openRootSnapshot(ctx, openOpts)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	if closeErr != nil {
-		return nil, fmt.Errorf("close snapshot stream: %w", closeErr)
+	root, err := snapshotfile.Open(ctx, opened.stream)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	return body, nil
+	memoryCfg, err := snapshot.ParseConfig(root.SnapshotConfig)
+	if err != nil {
+		return nil, nil, nil, errors.Join(fmt.Errorf("unsupported snapshot format/version: %w", err), root.Close())
+	}
+	canonical, err := snapshot.MarshalConfig(memoryCfg)
+	if err != nil {
+		return nil, nil, nil, errors.Join(err, root.Close())
+	}
+	if !bytes.Equal(canonical, root.SnapshotConfig) {
+		return nil, nil, nil, errors.Join(errors.New("snapshot.cfg is not canonically encoded"), root.Close())
+	}
+	return opened, root, memoryCfg, nil
 }
 
-func (r *SnapshotCfgReader) openRoot(ctx context.Context, rootRef string, opts SnapshotCfgReadOptions) (fetch.Stream, int64, error) {
-	codec := r.storage.LocalCodec()
-	required := r.storage.LocalRequired()
+func (r *SnapshotCfgReader) openOptions(rootRef string, readOpts SnapshotCfgReadOptions) (Options, error) {
+	opts := Options{
+		ManifestCfg:   r.manifestCfg,
+		Fetcher:       r.storage.Fetcher(),
+		CustomerKeyFn: r.storage.CustomerKeyFunc(),
+		LocalCodec:    r.storage.LocalCodec(),
+		LocalRequired: r.storage.LocalRequired(),
+		RefLocations:  readOpts.RefLocations,
+	}
 	if strings.HasPrefix(rootRef, "manifest://") || strings.HasPrefix(rootRef, "file://") {
 		ref, err := manifest.ParseRef(rootRef)
 		if err != nil {
-			return nil, 0, err
+			return Options{}, err
 		}
-		if ref.Scheme == manifest.RefSchemeFile {
-			path, err := opts.RefLocations.ResolveFile(ref, opts.RelativeDir)
+		switch ref.Scheme {
+		case manifest.RefSchemeManifest:
+			if _, err := manifest.ParseKeyRef(ref.Path); err != nil {
+				return Options{}, err
+			}
+			opts.SnapshotManifestKey = ref.Path
+			opts.SnapshotRef = ref.String()
+		case manifest.RefSchemeFile:
+			path, err := readOpts.RefLocations.ResolveFile(ref, readOpts.RelativeDir)
 			if err != nil {
-				return nil, 0, err
+				return Options{}, err
 			}
-			if opened, handled, err := openSnapshotCfgFile(ctx, r.storage, path, ref, opts.RefLocations); handled {
-				if err != nil {
-					return nil, 0, protectArtifactReadError(codec, "open local snapshot", err)
-				}
-				if opened.Size() > math.MaxInt64 {
-					closeErr := opened.Close()
-					return nil, 0, errors.Join(fmt.Errorf("snapshot bundle is too large"), closeErr)
-				}
-				return opened, int64(opened.Size()), nil
-			}
+			opts.SnapshotPath = path
+			opts.SnapshotRef = ref.String()
+		default:
+			return Options{}, fmt.Errorf("unsupported snapshot root scheme %q", ref.Scheme)
 		}
-		return sandbox.OpenDiskStreamAt(ctx, rootRef, r.storage.Fetcher(), opts.RefLocations, opts.RelativeDir, codec, required)
+		return opts, nil
 	}
-
 	path := rootRef
-	if !filepath.IsAbs(path) && opts.RelativeDir != "" {
-		path = filepath.Join(opts.RelativeDir, path)
+	if !filepath.IsAbs(path) && readOpts.RelativeDir != "" {
+		path = filepath.Join(readOpts.RelativeDir, path)
 	}
-	if opened, handled, err := openSnapshotCfgFile(ctx, r.storage, path, manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path}, opts.RefLocations); handled {
-		if err != nil {
-			return nil, 0, protectArtifactReadError(codec, "open local snapshot", err)
-		}
-		if opened.Size() > math.MaxInt64 {
-			_ = opened.Close()
-			return nil, 0, fmt.Errorf("snapshot bundle is too large")
-		}
-		return opened, int64(opened.Size()), nil
-	}
-	options, err := tarReadOptions(manifest.Ref{}, codec, required)
-	if err != nil {
-		return nil, 0, err
-	}
-	stream, err := fetch.OpenTarStream(path, options...)
-	if err != nil {
-		return nil, 0, protectArtifactReadError(codec, "open local snapshot", err)
-	}
-	if stream.Size() > math.MaxInt64 {
-		_ = stream.Close()
-		return nil, 0, fmt.Errorf("snapshot bundle is too large")
-	}
-	return stream, int64(stream.Size()), nil
+	opts.SnapshotPath = path
+	return opts, nil
 }
 
-func openSnapshotCfgFile(ctx context.Context, storage snapshotCfgStorage, path string, ref manifest.Ref, locations config.RefLocations) (*artifact.OpenedFile, bool, error) {
-	if opener, ok := storage.(snapshotCfgLocationFileOpener); ok {
-		opened, err := opener.OpenFileWithLocations(ctx, path, ref, locations)
-		return opened, true, err
+func projectSnapshotCfg(memoryCfg *snapshot.Config, portable *config.PortableSandboxConfig) (*SnapshotCfg, error) {
+	if memoryCfg == nil || portable == nil {
+		return nil, errors.New("snapshot compatibility projection requires S and E configs")
 	}
-	if opener, ok := storage.(snapshotCfgFileOpener); ok {
-		opened, err := opener.OpenFile(ctx, path, ref)
-		return opened, true, err
+	if err := memoryCfg.Validate(); err != nil {
+		return nil, err
 	}
-	return nil, false, nil
+	if err := portable.Validate(); err != nil {
+		return nil, err
+	}
+	projected := &SnapshotCfg{
+		Version:    memoryCfg.Version,
+		SandboxRef: memoryCfg.SandboxRef,
+		Metadata:   cloneSnapshotMetadata(portable.Metadata),
+		FromRefs:   append([]string(nil), memoryCfg.FromRefs...),
+	}
+	projected.Resources.Capacity.CPU = portable.Resources.Capacity.CPU
+	projected.Resources.Capacity.Memory = portable.Resources.Capacity.Memory
+	projected.Launch.CgroupControl = portable.Launch.CgroupControl
+	projected.Boot.RuntimeRef = portable.Boot.Runtime
+
+	root := projectPortableDisk(portable.Boot.Root, memoryCfg.SandboxRef)
+	projected.Boot.Root.BaseRef = root.BaseRef
+	projected.Boot.Root.Overlay = root.Overlay
+	projected.Boot.Root.Base = root.Base
+	projected.Boot.Root.BaseFromRefs = root.BaseFromRefs
+	projected.Boot.Disks = make([]SnapDiskNode, len(portable.Boot.Disks))
+	for i := range portable.Boot.Disks {
+		projected.Boot.Disks[i] = projectPortableDisk(portable.Boot.Disks[i].PortableRootConfig, memoryCfg.SandboxRef)
+	}
+	return projected, nil
 }
 
-func readSnapshotCfgEntry(reader io.ReaderAt, size int64) ([]byte, error) {
-	if size < 0 {
-		return nil, fmt.Errorf("read snapshot zip: negative bundle size")
-	}
-	zr, err := zip.NewReader(reader, size)
-	if err != nil {
-		return nil, fmt.Errorf("read snapshot zip: %w", err)
-	}
-	var entry *zip.File
-	for _, candidate := range zr.File {
-		if candidate.Name != "snapshot.cfg" {
-			continue
+func projectPortableDisk(root config.PortableRootConfig, sandboxRef string) SnapDiskNode {
+	materialize := func(raw string) string {
+		if raw == "self" {
+			return sandboxRef
 		}
-		if entry != nil {
-			return nil, fmt.Errorf("snapshot bundle has duplicate snapshot.cfg entries")
-		}
-		entry = candidate
+		return raw
 	}
-	if entry == nil {
-		return nil, fmt.Errorf("input has no snapshot.cfg entry (not a snapshot image?)")
+	projected := SnapDiskNode{}
+	if root.Overlay == nil {
+		projected.Base = materialize(root.Base)
+		projected.BaseFromRefs = append([]string(nil), root.BaseFromRefs...)
+		return projected
 	}
-	if entry.UncompressedSize64 > MaxSnapshotCfgSize {
-		return nil, fmt.Errorf("snapshot.cfg exceeds %d-byte limit", MaxSnapshotCfgSize)
+	projected.BaseRef = materialize(root.Base)
+	projected.Overlay = &SnapOverlayCfg{
+		Base:         materialize(root.Overlay.Base),
+		BaseFromRefs: append([]string(nil), root.Overlay.BaseFromRefs...),
 	}
-	rc, err := entry.Open()
-	if err != nil {
-		return nil, fmt.Errorf("open snapshot.cfg: %w", err)
+	return projected
+}
+
+func cloneSnapshotMetadata(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
 	}
-	body, readErr := io.ReadAll(io.LimitReader(rc, MaxSnapshotCfgSize+1))
-	closeErr := rc.Close()
-	if len(body) > MaxSnapshotCfgSize {
-		return nil, fmt.Errorf("snapshot.cfg exceeds %d-byte limit", MaxSnapshotCfgSize)
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
 	}
-	if readErr != nil {
-		readErr = fmt.Errorf("read snapshot.cfg: %w", readErr)
-		if closeErr != nil {
-			return nil, errors.Join(readErr, fmt.Errorf("close snapshot.cfg: %w", closeErr))
-		}
-		return nil, readErr
-	}
-	if closeErr != nil {
-		return nil, fmt.Errorf("close snapshot.cfg: %w", closeErr)
-	}
-	return body, nil
+	return cloned
 }

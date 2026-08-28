@@ -1,20 +1,26 @@
 // sandbox-ctl is the host-side control tool for one sandbox lifecycle.
 // Subcommands:
 //
-//	run       — start a sandbox (cold-start; or with --restore=<ref> from a snapshot)
-//	snapshot  — pause + dump to <sid>.snapshot + <digest>.overlay (or upload)
+//	run       — explicit cold start, Sandbox E cold start, or Snapshot S restore
+//	export    — create a runnable Sandbox E without memory state
+//	snapshot  — create Sandbox E and memory Snapshot S at one freeze point
 //	exec      — run an ad-hoc command inside a running sandbox
 //	config    — produce / merge / validate a sandbox.yaml
-//	info      — print a snapshot's embedded snapshot.cfg
+//	info      — inspect a Sandbox E or Snapshot S
+//	publish   — publish a complete E or S graph
 //
 // See docs/sandbox.md for the full design.
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -45,12 +51,16 @@ func main() {
 		os.Exit(runCmd(os.Args[2:]))
 	case "snapshot":
 		os.Exit(snapshotCmd(os.Args[2:]))
+	case "export":
+		os.Exit(exportCmd(os.Args[2:]))
 	case "exec":
 		os.Exit(execCmd(os.Args[2:]))
 	case "config":
 		os.Exit(configCmd(os.Args[2:]))
 	case "info":
 		os.Exit(infoCmd(os.Args[2:]))
+	case "publish":
+		os.Exit(publishCmd(os.Args[2:]))
 	case "upload-snapshot":
 		os.Exit(uploadSnapshotCmd(os.Args[2:]))
 	case "-h", "--help", "help":
@@ -63,22 +73,43 @@ func main() {
 	}
 }
 
+func validateSandboxIDArg(sandboxID string) error {
+	if sandboxID == "" || sandboxID == "." || sandboxID == ".." ||
+		filepath.Base(sandboxID) != sandboxID || strings.ContainsAny(sandboxID, `/\`) {
+		return errors.New("sandbox id must be one non-empty path component")
+	}
+	return nil
+}
+
+func commandContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
+
 func printUsage(w *os.File) {
 	fmt.Fprintf(w, `sandbox-ctl — sandbox runtime control
 
 Usage:
-  sandbox-ctl run       --config sandbox.yaml [--manifest-config <path>]
+  sandbox-ctl run       [--config host.yaml[:instance.yaml]] [--manifest-config <path>]
                         [--sandbox-id <sid>] [--ch-binary <path>]
                         [--run-root <dir>] [--base-root <dir>]
-			[--restore <snapshot-path|manifest://hex|file://basename@location:name>]
-			[--ref-location name=file:///absolute/path ...]
+                        [--from <sandbox-ref> | --restore <snapshot-ref>]
+                        [--ref-location name=file:///absolute/path ...]
                         [--stdin] [--stdout=false] [--stderr=false]
                         [--stdin-from F] [--stdout-to F] [--stderr-to F]
                         [--tty] [--console off|default|file=PATH]
                         [--ping-fatal-threshold N] [--stats-interval <dur>]
-			[--ready-fd N]
+                        [--ready-fd N]
+  sandbox-ctl export    --sandbox-id <sid> (--output <out_dir> | --upload)
+                        [--mode local|bundle] [--resume]
+                        [--run-root <dir>] [--timeout <sec>]
+  sandbox-ctl export    --from <flattened-erofs-ref> --config sandbox.yaml
+                        [--sandbox-id <sid>] (--output <out_dir> | --upload)
+                        [--mode local|bundle] [--manifest-config <path>]
+                        [--ref-location name=file:///absolute/path ...]
+                        [--timeout <sec>]
   sandbox-ctl snapshot  --sandbox-id <sid> (--output <out_dir> | --upload)
                         [--mode local|bundle] [--resume]
+                        [--drop-caches] [--merge-ref=true|false]
                         [--run-root <dir>] [--timeout <sec>]
   sandbox-ctl exec      [--sandbox-id <sid>] [--run-root <dir>]
                         [--proxy <http[s]://host[:port]>] [--proxy-header 'Name: value' ...]
@@ -90,12 +121,14 @@ Usage:
   sandbox-ctl config    [--config a.yaml[:b.yaml...] | --template]
                         [--mode default|restore] [--check skip|strict] [-o <file>]
                         produce/merge/validate a sandbox.yaml on stdout
-	sandbox-ctl info      [--json] [--manifest-config <p>]
-			[--ref-location name=file:///absolute/path ...] <snapshot-ref|snapshot-path>
-			print a snapshot's embedded snapshot.cfg
-	sandbox-ctl upload-snapshot [--manifest-config <p> | --to-ref-location name=file:///path]
-			[--ref-location name=file:///absolute/path ...] [--quiet] <snapshot-path>
-			publish local refs and print the canonical portable root ref (no boot)
+  sandbox-ctl info      [--json] [--manifest-config <p>]
+                        [--ref-location name=file:///absolute/path ...] <artifact>
+                        print sandbox.runtime.cfg or snapshot.cfg
+  sandbox-ctl publish   [--manifest-config <p> | --to-ref-location name=file:///path]
+                        [--ref-location name=file:///absolute/path ...] [--quiet] <artifact>
+                        publish an E/S graph and print its rewritten root ref
+  sandbox-ctl upload-snapshot
+                        same options as publish; compatibility alias for Snapshot S
 
 --manifest-config (or MANIFEST_CONFIG env) supplies the shared storage
 configuration. It is required for any manifest:// resource and for local
@@ -104,19 +137,28 @@ configurations may omit it. The sensitive manifest.key may be supplied via
 the MANIFEST_KEY env var instead of the config file (MANIFEST_KEY overrides
 a manifest.key set in the file).
 
-run starts one sandbox VM and blocks until the guest exits. With
---restore, the sandbox is resumed from a snapshot bundle instead of
-cold-starting (sandbox.yaml field semantics in restore mode are listed
-in docs/sandbox.md §11.0). --ready-fd writes the one-shot startup wire
+run starts one sandbox VM and blocks until the guest exits. Plain --config is
+an explicit cold start. --from opens a Sandbox E and follows the same cold-start
+path after applying allowed host/instance overrides. --restore opens a memory
+Snapshot S, follows its sandbox_ref to E, and restores VMM/memory execution
+state; --from and --restore are mutually exclusive. --ready-fd writes the one-shot startup wire
 "control_ready\nready\n" to an inherited fd and closes that fd after
 ready; run itself continues to own the VM and remains blocked.
 
-snapshot pauses a running sandbox and writes a snapshot bundle either
-to a local directory (--output) or to the manifest store (--upload).
-The two are mutually exclusive. Local output defaults to the tarstream
-format (mode=local); mode=bundle writes one multi-Manifest ZIP64 file.
---upload cannot be combined with an explicit --mode. By default the sandbox
-is destroyed after a successful snapshot; use --resume to keep it running.
+export creates a runnable Sandbox E. Live export freezes the guest and all
+block backends but does not call Cloud Hypervisor's snapshot API or read RAM.
+It reuses the storage and ref-location bindings owned by the running process.
+Offline export wraps one flattened EROFS image and accepts storage/ref-location
+flags; offline --resume is invalid. In both modes --timeout=0 is unbounded.
+
+snapshot always captures memory execution state. At one freeze point it emits
+the current Sandbox E first and Snapshot S last; S points to E. Local output
+defaults to content-addressed tarstreams, mode=bundle writes one Manifest
+Bundle, and --upload writes the same logical graph to the Manifest store.
+By default a successful live export/snapshot destroys the sandbox; --resume
+keeps the original C0, writable diffs, and memory parent running. Recovery
+reattaches the guest MUX before success is reported; an unrecoverable reattach
+failure terminates the VMM instead of leaving a frozen sandbox behind.
 
 exec runs an ad-hoc command inside a running sandbox as a sibling of
 the user app (it does not replace it). The command + args follow '--'.

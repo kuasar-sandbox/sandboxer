@@ -377,12 +377,6 @@ type Message struct {
 	// snapshot's network as-is. (Cold start carries network via LaunchSpec.)
 	Network *NetworkSpec `json:"network,omitempty"`
 
-	// restore: optional per-instance files. When set, the guest injects
-	// them (same tmpfs+bind mechanism as cold start) before thawing, so a
-	// clone gets instance-specific secrets / resolv.conf that were never
-	// baked into the golden snapshot. nil → no per-instance file injection.
-	Files []FileSpec `json:"files,omitempty"`
-
 	// mem_report: guest → host periodic /proc/meminfo observation. Balloon
 	// current is deliberately absent; the host obtains it from CH vm.info.
 	MemReport *MemReport `json:"mem_report,omitempty"`

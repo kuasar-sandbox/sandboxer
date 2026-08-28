@@ -61,12 +61,15 @@ type Pinger struct {
 	Stats  *PingStats
 	Logf   func(string, ...any)
 
-	mu      sync.Mutex
-	running atomic.Bool
-	paused  atomic.Bool
-	cancel  context.CancelFunc
-	doneCh  chan struct{}
-	nextID  atomic.Uint64
+	mu       sync.Mutex
+	running  atomic.Bool
+	paused   atomic.Bool
+	cancel   context.CancelFunc
+	doneCh   chan struct{}
+	nextID   atomic.Uint64
+	tickMu   sync.Mutex
+	tickDone chan error
+	tickEnd  context.CancelFunc
 
 	// FatalThreshold tracking: consecutiveFails counts failures since
 	// the last success; once it reaches Cfg.FatalThreshold (and that's
@@ -125,10 +128,55 @@ func (p *Pinger) Stop() {
 	}
 }
 
-// Pause halts ping send temporarily without tearing the goroutine down.
-// Used during snapshot quiesce window so the host doesn't dial guest
-// while it's pre-paused (docs/sandbox.md §6.2 quiesce → /vm.pause sequence).
-func (p *Pinger) Pause()  { p.paused.Store(true) }
+// Pause halts ping sends temporarily and joins any probe already admitted by
+// the ticker through the guest-side connection-close barrier. Used during
+// capture so no half-closed management connection can cross the quiesce →
+// /vm.pause boundary.
+func (p *Pinger) Pause() { _ = p.PauseContext(context.Background()) }
+
+// PauseContext is the cancellable capture barrier form of Pause. An admitted
+// probe is allowed to finish through guest EOF, but can never hold the capture
+// barrier beyond the protocol quiesce budget even when timeouts.ping disables
+// its ordinary health-probe deadline.
+func (p *Pinger) PauseContext(ctx context.Context) error {
+	return p.pauseContext(ctx, proto.DeadlineQuiesce)
+}
+
+func (p *Pinger) pauseContext(ctx context.Context, drainTimeout time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	p.paused.Store(true)
+	p.tickMu.Lock()
+	done := p.tickDone
+	end := p.tickEnd
+	p.tickMu.Unlock()
+	if done == nil {
+		return ctx.Err()
+	}
+	drainCtx, cancelDrain := context.WithTimeout(ctx, drainTimeout)
+	defer cancelDrain()
+	select {
+	case err := <-done:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	case <-drainCtx.Done():
+		// Context cancellation is wired to the concrete short connection's
+		// deadline. Join after cancel so capture never continues while a stale
+		// ping still owns a host/guest vsock flow.
+		if end != nil {
+			end()
+		}
+		<-done
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("ping capture drain exceeded %s: %w", drainTimeout, drainCtx.Err())
+	}
+}
+
 func (p *Pinger) Resume() { p.paused.Store(false) }
 
 // Running reports whether the ticker is active (Start called, Stop not yet).
@@ -149,34 +197,57 @@ func (p *Pinger) loop(ctx context.Context, cfg PingerConfig) {
 
 	// Fire first ping immediately — we want sub-ms detection of "guest
 	// agent ready" right after launch is sent.
-	p.tick(cfg.Timeout)
+	p.tick(ctx, cfg.Timeout)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if p.paused.Load() {
-				continue
-			}
-			p.tick(cfg.Timeout)
+			p.tick(ctx, cfg.Timeout)
 		}
 	}
 }
 
-func (p *Pinger) tick(timeout time.Duration) {
+func (p *Pinger) tick(parent context.Context, timeout time.Duration) {
+	p.tickMu.Lock()
+	if p.paused.Load() {
+		p.tickMu.Unlock()
+		return
+	}
+	tickCtx, tickEnd := context.WithCancel(parent)
+	done := make(chan error, 1)
+	p.tickDone = done
+	p.tickEnd = tickEnd
+	p.tickMu.Unlock()
+	var barrierErr error
+	defer func() {
+		tickEnd()
+		p.tickMu.Lock()
+		if p.tickDone == done {
+			p.tickDone = nil
+			p.tickEnd = nil
+		}
+		p.tickMu.Unlock()
+		done <- barrierErr
+		close(done)
+	}()
 	if p.Stats == nil {
 		p.Stats = &PingStats{}
 	}
 	id := p.nextID.Add(1)
 	tSend := time.Now()
 	p.Stats.Attempts.Add(1)
-	resp, err := p.Client.RoundTrip(&proto.Message{
+	resp, err := p.Client.roundTripUntilEOFContext(tickCtx, &proto.Message{
 		Type:    proto.TypePing,
 		ID:      id,
 		TSendNs: tSend.UnixNano(),
 	}, timeout)
 	if err != nil {
+		barrierErr = err
+		if tickCtx.Err() != nil {
+			return
+		}
 		// Best-effort classification — RoundTrip returns wrapped errors.
 		// We treat any error containing "deadline" / "i/o timeout" as a
 		// ping_timeout and everything else as a dial error. This keeps
@@ -194,7 +265,8 @@ func (p *Pinger) tick(timeout time.Duration) {
 	if resp.Type != proto.TypePong || resp.ID != id {
 		p.Stats.DialError.Add(1)
 		p.Logf("ping id=%d unexpected resp %+v", id, resp)
-		p.recordFailure(fmt.Errorf("unexpected response %q (id=%d)", resp.Type, resp.ID))
+		barrierErr = fmt.Errorf("unexpected response %q (id=%d)", resp.Type, resp.ID)
+		p.recordFailure(barrierErr)
 		return
 	}
 	p.Stats.Success.Add(1)
@@ -256,7 +328,13 @@ func indexOf(s, sub string) int {
 // have paused the ping ticker first to avoid concurrent host→guest traffic
 // during the snapshot pre-pause window.
 func SendQuiesce(client *HostClient, skipDropCaches bool) (proto.DropCachesResult, error) {
-	resp, err := client.RoundTrip(&proto.Message{
+	return SendQuiesceContext(context.Background(), client, skipDropCaches)
+}
+
+// SendQuiesceContext is SendQuiesce with cancellation covering the full
+// request, response, and guest-side connection-close transport barrier.
+func SendQuiesceContext(ctx context.Context, client *HostClient, skipDropCaches bool) (proto.DropCachesResult, error) {
+	resp, err := client.roundTripUntilEOFContext(ctx, &proto.Message{
 		Type:           proto.TypeQuiesce,
 		SkipDropCaches: skipDropCaches,
 	}, proto.DeadlineQuiesce)
@@ -285,22 +363,17 @@ func SendQuiesce(client *HostClient, skipDropCaches bool) (proto.DropCachesResul
 // network (optional) carries a fresh guest IP-layer config the guest
 // re-applies flush-and-replace before thawing, so a clone restored from a
 // golden snapshot takes a new network identity. nil → keep the snapshot's.
-//
-// files (optional) carries per-instance files the guest injects before
-// thawing (same tmpfs+bind mechanism as cold start), so a clone gets
-// instance-specific secrets / config that were never baked into the golden
-// snapshot. nil → no per-instance file injection.
-func OpenMUXViaRestore(client *HostClient, epoch uint32, network *proto.NetworkSpec, files []proto.FileSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
-	return OpenMUXViaRestoreContext(context.Background(), client, epoch, network, files, deadline)
+func OpenMUXViaRestore(client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+	return OpenMUXViaRestoreContext(context.Background(), client, epoch, network, deadline)
 }
 
 // OpenMUXViaRestoreContext is OpenMUXViaRestore with cancellation covering
 // both the pre-request CONNECT/OK retry window and the one-shot restore_ack.
-func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, files []proto.FileSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	conn, err := dialRawForRestoreContext(ctx, client, deadline, restoreDialRetryWindow)
+	conn, err := dialRawForRestoreContext(ctx, client, deadline, restoreDialAttemptTimeout)
 	if err != nil {
 		return nil, proto.StdioSpec{}, err
 	}
@@ -318,7 +391,6 @@ func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uin
 		Epoch:       epoch,
 		WallclockNs: time.Now().UnixNano(),
 		Network:     network,
-		Files:       files,
 	}, proto.TypeRestoreAck)
 	if !stopCancel() {
 		_ = rawConn.Close()
@@ -341,9 +413,9 @@ func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uin
 }
 
 const (
-	restoreDialRetryWindow  = 2 * time.Second
-	restoreDialRetryInitial = 25 * time.Millisecond
-	restoreDialRetryMax     = 200 * time.Millisecond
+	restoreDialAttemptTimeout = 2 * time.Second
+	restoreDialRetryInitial   = 25 * time.Millisecond
+	restoreDialRetryMax       = 200 * time.Millisecond
 )
 
 // dialRawForRestore retries only the pre-request hybrid-vsock handshake. After
@@ -351,33 +423,41 @@ const (
 // emits its "OK <port>" line while the restored guest listener is becoming
 // runnable. DialRaw has not written a proto request at that point, so redialing
 // cannot replay restore. finishOpenMUX deliberately remains outside this loop:
-// once restore is written, every error fails closed. Each retry attempt uses
-// the smaller of the overall deadline and retry-window remainder; a successful
-// CONNECT/OK restores the overall deadline before the request is written.
-func dialRawForRestore(client *HostClient, deadline, retryWindow time.Duration) (net.Conn, error) {
-	return dialRawForRestoreContext(context.Background(), client, deadline, retryWindow)
+// once restore is written, every error fails closed. Each CONNECT/OK attempt is
+// bounded independently so a wedged CH proxy cannot consume the whole restore
+// budget; transient failures keep retrying until the configured overall
+// restore deadline or context cancellation. A successful CONNECT/OK restores
+// the overall deadline before the request is written.
+func dialRawForRestore(client *HostClient, deadline, attemptTimeout time.Duration) (net.Conn, error) {
+	return dialRawPreRequestContext(context.Background(), client, deadline, attemptTimeout, "restore")
 }
 
-func dialRawForRestoreContext(ctx context.Context, client *HostClient, deadline, retryWindow time.Duration) (net.Conn, error) {
+func dialRawForRestoreContext(ctx context.Context, client *HostClient, deadline, attemptTimeout time.Duration) (net.Conn, error) {
+	return dialRawPreRequestContext(ctx, client, deadline, attemptTimeout, "restore")
+}
+
+func dialRawPreRequestContext(ctx context.Context, client *HostClient, deadline, attemptTimeout time.Duration, operation string) (net.Conn, error) {
 	deadlineAt := time.Now().Add(deadline)
+	if attemptTimeout <= 0 {
+		attemptTimeout = deadline
+	}
 
 	backoff := restoreDialRetryInitial
 	var lastErr error
-	var retryUntil time.Time
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		attemptDeadline := deadlineAt
-		if !retryUntil.IsZero() && retryUntil.Before(attemptDeadline) {
-			attemptDeadline = retryUntil
+		attemptDeadline := time.Now().Add(attemptTimeout)
+		if deadlineAt.Before(attemptDeadline) {
+			attemptDeadline = deadlineAt
 		}
 		remaining := time.Until(attemptDeadline)
 		if remaining <= 0 {
 			if lastErr != nil {
-				return nil, fmt.Errorf("restore pre-request connect failed after %d attempts: %w", attempt-1, lastErr)
+				return nil, fmt.Errorf("%s pre-request connect failed after %d attempts: %w", operation, attempt-1, lastErr)
 			}
-			return nil, fmt.Errorf("restore pre-request connect: deadline exceeded after %d attempts", attempt-1)
+			return nil, fmt.Errorf("%s pre-request connect: deadline exceeded after %d attempts", operation, attempt-1)
 		}
 
 		conn, err := client.DialRawContext(ctx, remaining)
@@ -386,33 +466,24 @@ func dialRawForRestoreContext(ctx context.Context, client *HostClient, deadline,
 			// write+ACK still owns the original overall restore deadline.
 			if err := conn.SetDeadline(deadlineAt); err != nil {
 				_ = conn.Close()
-				return nil, fmt.Errorf("restore pre-request connect: restore overall deadline: %w", err)
+				return nil, fmt.Errorf("%s pre-request connect: overall deadline: %w", operation, err)
 			}
 			if attempt > 1 && client.Logf != nil {
-				client.Logf("restore pre-request connect recovered on attempt %d", attempt)
+				client.Logf("%s pre-request connect recovered on attempt %d", operation, attempt)
 			}
 			return conn, nil
-		}
-		if !retryUntil.IsZero() && time.Until(retryUntil) <= 0 {
-			return nil, fmt.Errorf("restore pre-request connect failed after %d attempts: %w", attempt, err)
 		}
 		if !retryableRestoreDialError(err) {
 			return nil, err
 		}
 		lastErr = err
-		if retryUntil.IsZero() {
-			retryUntil = time.Now().Add(retryWindow)
-			if deadlineAt.Before(retryUntil) {
-				retryUntil = deadlineAt
-			}
-		}
 
-		retryRemaining := time.Until(retryUntil)
+		retryRemaining := time.Until(deadlineAt)
 		if retryRemaining <= backoff {
-			return nil, fmt.Errorf("restore pre-request connect failed after %d attempts: %w", attempt, err)
+			return nil, fmt.Errorf("%s pre-request connect failed after %d attempts: %w", operation, attempt, err)
 		}
 		if client.Logf != nil {
-			client.Logf("restore pre-request connect attempt %d failed: %v; retrying in %s", attempt, err, backoff)
+			client.Logf("%s pre-request connect attempt %d failed: %v; retrying in %s", operation, attempt, err, backoff)
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -434,11 +505,13 @@ func dialRawForRestoreContext(ctx context.Context, client *HostClient, deadline,
 }
 
 func retryableRestoreDialError(err error) bool {
+	var netErr net.Error
 	return errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.ECONNABORTED) ||
-		errors.Is(err, syscall.EPIPE)
+		errors.Is(err, syscall.EPIPE) ||
+		(errors.As(err, &netErr) && netErr.Timeout())
 }
 
 // OpenMUXViaAttach re-establishes the stdio MUX after the previous one
@@ -447,7 +520,37 @@ func retryableRestoreDialError(err error) bool {
 // guest gracefully closes any still-live old MUX (or hard-drops it),
 // then ACKs on the new connection.
 func OpenMUXViaAttach(client *HostClient, epoch uint32, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
-	return openMUX(client, &proto.Message{Type: proto.TypeAttach, Epoch: epoch}, proto.TypeAttachAck, deadline)
+	return OpenMUXViaAttachContext(context.Background(), client, epoch, deadline)
+}
+
+// OpenMUXViaAttachContext is OpenMUXViaAttach with cancellation covering both
+// the pre-request CONNECT/OK retry window and the one-shot attach_ack.
+func OpenMUXViaAttachContext(ctx context.Context, client *HostClient, epoch uint32, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, err := dialRawPreRequestContext(ctx, client, deadline, restoreDialAttemptTimeout, "attach")
+	if err != nil {
+		return nil, proto.StdioSpec{}, err
+	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	rawConn := conn
+	resultConn, spec, err := finishOpenMUX(rawConn, &proto.Message{Type: proto.TypeAttach, Epoch: epoch}, proto.TypeAttachAck)
+	if !stopCancel() {
+		_ = rawConn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, proto.StdioSpec{}, ctxErr
+		}
+		return nil, proto.StdioSpec{}, context.Canceled
+	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, proto.StdioSpec{}, ctxErr
+		}
+		return nil, proto.StdioSpec{}, err
+	}
+	_ = resultConn.SetDeadline(time.Time{})
+	return resultConn, spec, nil
 }
 
 // OpenMUXViaExec starts a fresh ad-hoc command inside the running
@@ -457,15 +560,41 @@ func OpenMUXViaAttach(client *HostClient, epoch uint32, deadline time.Duration) 
 // stdio it established in exec_ack. The returned conn carries the MUX
 // end-to-end; the caller (run process) pipes it to the CLI.
 func OpenMUXViaExec(client *HostClient, spec *proto.ExecSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
-	return openMUX(client, &proto.Message{Type: proto.TypeExec, Exec: spec}, proto.TypeExecAck, deadline)
+	return openMUXViaExecContext(context.Background(), client, spec, deadline)
 }
 
-func openMUX(client *HostClient, req *proto.Message, wantAck string, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
-	conn, err := client.DialRaw(deadline)
+// openMUXViaExecContext keeps lifecycle cancellation armed through exec_ack.
+// It stays package-private because the context belongs to the run process's
+// capture admission; CLI callers continue to use OpenMUXViaExec.
+func openMUXViaExecContext(ctx context.Context, client *HostClient, spec *proto.ExecSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, err := client.DialRawContext(ctx, deadline)
 	if err != nil {
 		return nil, proto.StdioSpec{}, err
 	}
-	return finishOpenMUX(conn, req, wantAck)
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	rawConn := conn
+	resultConn, established, err := finishOpenMUX(rawConn,
+		&proto.Message{Type: proto.TypeExec, Exec: spec}, proto.TypeExecAck)
+	if !stopCancel() {
+		_ = rawConn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, proto.StdioSpec{}, ctxErr
+		}
+		return nil, proto.StdioSpec{}, context.Canceled
+	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, proto.StdioSpec{}, ctxErr
+		}
+		return nil, proto.StdioSpec{}, err
+	}
+	// finishOpenMUX clears the handshake deadline. Clear it again after the
+	// cancellation callback is stopped to make the live-MUX handoff explicit.
+	_ = resultConn.SetDeadline(time.Time{})
+	return resultConn, established, nil
 }
 
 func finishOpenMUX(conn net.Conn, req *proto.Message, wantAck string) (net.Conn, proto.StdioSpec, error) {

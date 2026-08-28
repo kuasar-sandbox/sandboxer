@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +111,91 @@ func TestLaunchCgroupControlYAMLRoundTripAndDefault(t *testing.T) {
 	invalidDoc := strings.Replace(minimalCold, "launch:\n", "launch:\n  cgroup_control: not-a-bool\n", 1)
 	if _, err := Load(writeYAML(t, invalidDoc)); err == nil {
 		t.Fatal("launch.cgroup_control accepted a non-boolean value")
+	}
+}
+
+func TestSandboxConfigMarshalRestoreHostProjection(t *testing.T) {
+	cfg := &SandboxConfig{
+		Resources: ResourcesConfig{
+			Capacity:    CapacityConfig{CPU: 2, Memory: "2GiB"},
+			Allocatable: AllocatableConfig{CPU: 2, Memory: "1GiB"},
+			Startup:     &StartupConfig{Memory: "2GiB"},
+		},
+		Network: NetworkConfig{TAP: "tap0", Interface: "eth0", IP: "169.254.1.1/31", Hostname: "restored"},
+		Boot: BootConfig{
+			Kernel: "file:///opt/sandbox/vmlinux", Runtime: "file:///opt/sandbox/sandbox-runtime.bundle",
+			Cmdline: "console=hvc0", Root: RootConfig{
+				// Current lifecycle producers can retain the original cold image
+				// base when rendering a paused image's restore document. E owns it.
+				Base: "manifest://old-image", Overlay: &OverlayConfig{},
+			},
+		},
+		Launch:         LaunchConfig{Exec: "/bin/app", Env: map[string]string{"PERSISTENT": "value"}, Restart: "always"},
+		Mounts:         []MountConfig{{Target: "/tmp", Type: "tmpfs"}},
+		Files:          []FileConfig{{Path: "/etc/persistent", Content: "value"}},
+		EphemeralFiles: []FileConfig{{Path: "/etc/ephemeral", Content: "secret"}},
+		Init:           []InitConfig{{Exec: "/bin/setup"}},
+		Metadata:       map[string]string{"persistent": "value"},
+	}
+
+	body, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, presence, err := LoadMergedWithPresence([]string{writeYAML(t, string(body))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"boot.cmdline", "boot.root.base", "launch", "mounts", "files", "ephemeral_files", "init", "metadata"} {
+		if presence.Any(field) {
+			t.Errorf("restore-host YAML retained cold-only field %s:\n%s", field, body)
+		}
+	}
+	if host.Boot.Kernel != cfg.Boot.Kernel || host.Boot.Runtime != cfg.Boot.Runtime || host.Network.TAP != cfg.Network.TAP {
+		t.Fatalf("restore-host YAML lost host bindings: %+v\n%s", host, body)
+	}
+	if host.Resources.Startup == nil || host.Resources.Startup.Memory != "2GiB" || !presence.Has("resources.startup.memory") {
+		t.Fatalf("restore-host YAML lost node startup policy: %+v\n%s", host.Resources.Startup, body)
+	}
+	if host.Boot.Root.Overlay == nil {
+		t.Fatalf("restore-host YAML lost the artifact-owned overlay topology assertion:\n%s", body)
+	}
+	if err := host.ValidateRestoreHostConfigWithPresence(presence); err != nil {
+		t.Fatalf("restore-host YAML is not accepted by strict restore validation: %v\n%s", err, body)
+	}
+	if cfg.Launch.Exec != "/bin/app" || len(cfg.Files) != 1 || cfg.Resources.Startup == nil {
+		t.Fatal("marshal mutated its input config")
+	}
+}
+
+func TestSandboxConfigMarshalColdKeepsWorkload(t *testing.T) {
+	cfg, err := Load(writeYAML(t, minimalCold))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A pre-existing formatted upper is a complete cold writable source. It
+	// must not be confused with the lifecycle-generated restore-host shape,
+	// whose overlay has no active or immutable upper source at all.
+	cfg.Boot.Root.Overlay.Diff = ""
+	cfg.Boot.Root.Overlay.DiffTemplate = ""
+	cfg.Boot.Root.Overlay.DiffSize = ""
+	cfg.Boot.Root.Overlay.Base = "file:///opt/sandbox/root-upper.ext4"
+	cfg.Resources.Startup = &StartupConfig{Memory: "2GiB"}
+	cfg.Files = []FileConfig{{Path: "/etc/persistent", Content: "value"}}
+	cfg.Metadata = map[string]string{"persistent": "value"}
+
+	body, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, presence, err := LoadMergedWithPresence([]string{writeYAML(t, string(body))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"boot.cmdline", "boot.root.overlay.base", "resources.startup", "launch", "files", "metadata"} {
+		if !presence.Any(field) {
+			t.Errorf("cold YAML omitted workload field %s:\n%s", field, body)
+		}
 	}
 }
 
@@ -571,6 +657,15 @@ func TestValidateCold_MissingFields(t *testing.T) {
 		{"alloc cpu > capacity", func(c *SandboxConfig) {
 			c.Resources.Allocatable.CPU = 99
 		}, "allocatable.cpu must be ≤"},
+		{"alloc cpu nan", func(c *SandboxConfig) {
+			c.Resources.Allocatable.CPU = math.NaN()
+		}, "allocatable.cpu must be finite"},
+		{"alloc cpu positive inf", func(c *SandboxConfig) {
+			c.Resources.Allocatable.CPU = math.Inf(1)
+		}, "allocatable.cpu must be finite"},
+		{"alloc cpu negative inf", func(c *SandboxConfig) {
+			c.Resources.Allocatable.CPU = math.Inf(-1)
+		}, "allocatable.cpu must be finite"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -948,6 +1043,44 @@ func TestValidateRestoreHostConfigRejectsRelativeCgroupPath(t *testing.T) {
 	cfg.Resources.Control.Controller = "/run/node-ctl.sock"
 	if err := cfg.ValidateRestoreHostConfig(); err == nil || !strings.Contains(err.Error(), "cgroup_path must be absolute") {
 		t.Fatalf("ValidateRestoreHostConfig relative cgroup error = %v", err)
+	}
+}
+
+func TestValidateRestoreHostConfigRejectsColdOnlyInputBeforeArtifactOpen(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*SandboxConfig)
+		want   string
+	}{
+		{name: "files", mutate: func(cfg *SandboxConfig) {
+			cfg.Files = []FileConfig{{Path: "/etc/value", Content: "cold"}}
+		}, want: "files"},
+		{name: "ephemeral env", mutate: func(cfg *SandboxConfig) {
+			cfg.Launch.EphemeralEnv = map[string]string{"TOKEN": "secret"}
+		}, want: "launch"},
+		{name: "init", mutate: func(cfg *SandboxConfig) {
+			cfg.Init = []InitConfig{{Exec: "/bin/true"}}
+		}, want: "init"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &SandboxConfig{}
+			cfg.ApplyDefaults()
+			tc.mutate(cfg)
+			presence := FieldPresence{}
+			switch tc.name {
+			case "files":
+				presence.add("files")
+			case "ephemeral env":
+				presence.add("launch.ephemeral_env")
+			case "init":
+				presence.add("init")
+			}
+			err := cfg.ValidateRestoreHostConfigWithPresence(presence)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateRestoreHostConfig() error=%v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 

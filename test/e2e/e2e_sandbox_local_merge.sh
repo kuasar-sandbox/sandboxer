@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# e2e_sandbox_local_merge.sh — the local-layer invariant (docs/sandbox.md §3.5):
+# e2e_sandbox_local_merge.sh — the local-layer invariant (docs/sandbox.md §11.1):
 #
 #   1. store-ctl + cache-ctl tiered, a TICK guest that writes /ticks.dat
 #   2. cold-start → snapshot --output  → s1 (LOCAL file, from_refs=[])
 #   3. restore from s1 (LOCAL path) → snapshot --output → s2 (LOCAL): the local
 #      "replace the next-newest layer" MERGE — assert s2.snapshot.cfg from_refs
 #      is EMPTY (the parent s1 was MERGED into s2's top, NOT stacked) and that
-#      restoring s2 builds a SINGLE memory layer (not 2). TICK continuity + the
-#      /ticks.dat blk0 cold marker (written before s1, merged into s2) prove the
-#      merge preserved both layers' data while keeping local depth at 1.
+#      restoring s2 builds a SINGLE memory layer (not 2). Independently,E2's
+#      disk graph merges the E1 root payload;TICK continuity + /ticks.dat prove
+#      both provenance graphs preserve content while keeping local depth at 1.
 #   4. upload-snapshot s2 (offline, no boot) → manifest://<key>, then
 #      run --restore=manifest://<key>: the local→remote promotion round-trips.
 #
@@ -119,13 +119,7 @@ while True:
     print("TICK %d DISK blk0=%s" % (i, blk0), flush=True)
     i+=1
     time.sleep(0.25)'
-write_yaml() { # $1=out $2=hostname [$3=diff override] [$4=base override; "none" omits]
-    local base_line="    base: $BLK0_REF"
-    case "${4:-}" in
-    none) base_line="" ;;       # manifest:// snapshots carry their own base ref
-    "") ;;
-    *) base_line="    base: $4" ;;
-    esac
+write_yaml() { # $1=out $2=hostname [$3=diff override]
     cat > "$1" <<EOF
 resources:
   capacity:    { cpu: 1, memory: 512MiB }
@@ -136,11 +130,24 @@ boot:
   runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
-$base_line
+    base: $BLK0_REF
     overlay: { diff: file://${3:-$DIFF_FILE}, size: 1GiB }
 launch:
   args: ["-c", $(python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" <<<"$PYTICK")]
   restart: never
+EOF
+}
+write_restore_yaml() { # $1=out $2=hostname $3=active diff
+    cat > "$1" <<EOF
+resources:
+  capacity:    { cpu: 1, memory: 512MiB }
+  allocatable: { cpu: 1, memory: 512MiB }
+network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: $2 }
+boot:
+  kernel: file://$VMLINUX
+  runtime: file://$BIN/sandbox-runtime.bundle
+  root:
+    overlay: { diff: file://$3, size: 1GiB }
 EOF
 }
 BLK0_OK="DISK blk0=TICK00000000"
@@ -172,7 +179,7 @@ echo "    s1 from_refs: $("$BIN/sandbox-ctl" info --json "$S1" | python3 -c 'imp
 
 # ---- phase 2: restore s1 (LOCAL) → snapshot --output (s2 = MERGE) --------
 echo "==> phase 2: restore s1 (local) → snapshot --output (s2, merge replaces s1)"
-write_yaml "$WORK/host2.yaml" e2e-merge2 "$WORK/runtime/blk1-r2.diff"
+write_restore_yaml "$WORK/host2.yaml" e2e-merge2 "$WORK/runtime/blk1-r2.diff"
 truncate -s 1G "$WORK/runtime/blk1-r2.diff"
 LOG2="$WORK/run2.log"; SID2="m2-$$"; mkdir -p "$WORK/runtime/$SID2"
 "$BIN/sandbox-ctl" run --restore "$S1" --config "$WORK/host2.yaml" --manifest-config "$WORK/accelerator.yaml" \
@@ -190,7 +197,7 @@ echo "    s2 from_refs: $S2_FROMREFS"
 
 # ---- phase 3: restore s2 (LOCAL) — must be 1-layer + data intact ----------
 echo "==> phase 3: restore s2 (local) — single layer (merged), blk0 fall-through intact"
-write_yaml "$WORK/host3.yaml" e2e-merge3 "$WORK/runtime/blk1-r3.diff"
+write_restore_yaml "$WORK/host3.yaml" e2e-merge3 "$WORK/runtime/blk1-r3.diff"
 truncate -s 1G "$WORK/runtime/blk1-r3.diff"
 LOG3="$WORK/run3.log"; SID3="m3-$$"; mkdir -p "$WORK/runtime/$SID3"
 "$BIN/sandbox-ctl" run --restore "$S2" --config "$WORK/host3.yaml" --manifest-config "$WORK/accelerator.yaml" \
@@ -204,14 +211,13 @@ kill -TERM "$SBPID3" 2>/dev/null; wait "$SBPID3" 2>/dev/null || true   # infinit
 
 # ---- phase 4: upload-snapshot s2 (offline) → restore manifest:// ----------
 echo "==> phase 4: upload-snapshot s2 (offline, no boot) → restore from manifest://"
-# upload-snapshot auto-uploads every local artifact the cfg references;
-# file:// refs resolve as bundle-dir siblings, so co-locate the base image.
-ln -f "$BLK0_EROFS" "$SNAPDIR/$(basename "$BLK0_EROFS")"
+# upload-snapshot is a thin publish alias. Snapshot S points to E, and E
+# explicitly lists every disk dependency already materialized in SNAPDIR.
 MKEY=$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/accelerator.yaml" --quiet "$S2")
 MKEY=${MKEY#manifest://}
 [ ${#MKEY} -eq 64 ] || { echo "FAIL: upload-snapshot key len=${#MKEY}, want 64"; exit 1; }
 echo "    uploaded s2 → manifest://$MKEY"
-write_yaml "$WORK/host4.yaml" e2e-merge4 "$WORK/runtime/blk1-r4.diff" none
+write_restore_yaml "$WORK/host4.yaml" e2e-merge4 "$WORK/runtime/blk1-r4.diff"
 truncate -s 1G "$WORK/runtime/blk1-r4.diff"
 LOG4="$WORK/run4.log"; SID4="m4-$$"; mkdir -p "$WORK/runtime/$SID4"
 "$BIN/sandbox-ctl" run --restore "manifest://$MKEY" --config "$WORK/host4.yaml" --manifest-config "$WORK/accelerator.yaml" \

@@ -32,6 +32,7 @@ const (
 	diffHeaderSealedSize = diffHeaderNonceSize + diffHeaderPlainSize + diffHeaderTagSize
 	diffVersion          = uint16(1)
 	maxDiffScratchSize   = 1 << 20
+	ext4MagicOffset      = int64(1024 + 0x38)
 )
 
 var (
@@ -617,6 +618,90 @@ func openDiffTemplate(path string, encryption *diffEncryption) (diffTemplateSour
 		return nil, err
 	}
 	return &fileDiffTemplate{diff: diff, bitmap: bitmap}, nil
+}
+
+// ValidateExistingDiffExt4 verifies the effective filesystem seen through an
+// existing active diff and its optional immutable base. It opens the diff
+// read-only, applies the same local-encryption policy as OpenBlockCOW, and
+// checks the ext4 superblock magic in the combined view without mutating the
+// diff or inventing sparse data.
+func ValidateExistingDiffExt4(ctx context.Context, path string, base BlockReader, rawOptions ...BlockCOWOption) error {
+	options, err := parseBlockCOWOptions(rawOptions)
+	if err != nil {
+		return err
+	}
+	diff, err := openExistingDiffFile(path, options.encryption, options.required, true)
+	if err != nil {
+		return err
+	}
+	bitmap, err := diff.scanDirtyBlocks()
+	if err != nil {
+		return errors.Join(fmt.Errorf("vhost: scan existing diff: %w", err), diff.Close())
+	}
+	return validateDiffSourceExt4(ctx, &fileDiffTemplate{diff: diff, bitmap: bitmap}, base)
+}
+
+// ValidateDiffTemplateExt4 verifies the effective filesystem produced by a
+// provisioning template over an optional immutable base. Templates retain the
+// existing policy that plaintext is accepted even when newly-created active
+// diffs must be encrypted.
+func ValidateDiffTemplateExt4(ctx context.Context, path string, base BlockReader, rawOptions ...BlockCOWOption) error {
+	options, err := parseBlockCOWOptions(rawOptions)
+	if err != nil {
+		return err
+	}
+	source, err := openDiffTemplate(path, options.encryption)
+	if err != nil {
+		return err
+	}
+	return validateDiffSourceExt4(ctx, source, base)
+}
+
+func validateDiffSourceExt4(ctx context.Context, source diffTemplateSource, base BlockReader) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	validationErr := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if source.Size() < uint64(ext4MagicOffset+2) {
+			return fmt.Errorf("vhost: ext4 source is too small")
+		}
+		if base != nil && base.Size() > int64(source.Size()) {
+			return fmt.Errorf("vhost: base size %d > diff size %d", base.Size(), source.Size())
+		}
+		var magic [2]byte
+		run, err := source.RunAt(uint64(ext4MagicOffset), uint64(len(magic)))
+		if err != nil {
+			return fmt.Errorf("vhost: inspect ext4 superblock run: %w", err)
+		}
+		switch run.Kind() {
+		case sparse.Hole, sparse.Zero:
+			if base != nil && base.Size() >= ext4MagicOffset+int64(len(magic)) {
+				n, readErr := base.ReadAt(magic[:], ext4MagicOffset)
+				if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(magic)) {
+					return fmt.Errorf("vhost: read ext4 magic from base: %w", readErr)
+				}
+				if n != len(magic) {
+					return io.ErrUnexpectedEOF
+				}
+			}
+		default:
+			n, readErr := source.ReadAt(ctx, magic[:], uint64(ext4MagicOffset))
+			if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(magic)) {
+				return fmt.Errorf("vhost: read ext4 magic from diff: %w", readErr)
+			}
+			if n != len(magic) {
+				return io.ErrUnexpectedEOF
+			}
+		}
+		if magic != [2]byte{0x53, 0xef} {
+			return fmt.Errorf("vhost: effective writable disk is not a formatted ext4 filesystem")
+		}
+		return nil
+	}()
+	return errors.Join(validationErr, source.Close())
 }
 
 func (s *fileDiffTemplate) Size() uint64 { return uint64(s.diff.logicalSize) }
