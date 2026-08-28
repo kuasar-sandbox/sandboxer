@@ -190,7 +190,8 @@ sandbox-ctl info [--json] [--manifest-config manifest.yaml] <artifact>
 ```
 
 - 对 E 输出 `sandbox.runtime.cfg`.
-- 对 S 输出 `snapshot.cfg`,其中至少有 `sandbox_ref`.
+- 对 S 的默认输出是原始、精简的 `snapshot.cfg`,其中至少有 `sandbox_ref`.
+- 对 S 的 `--json` 输出保留现有机器调用方需要的 resolved view: `Version`、`SandboxRef`、memory `FromRefs` 来自 S,`Resources`、`Boot`、`Launch` 和 `Metadata` 只从 S 引用的 E 派生. 该 view 不会写回 S,也不是第二套 snapshot provenance.
 - 对 malformed、ambiguous 或既不是 E 也不是 S 的 logical root fail closed.
 
 Local crypto、Manifest、Bundle、selector 和 named ref-location 与 run/publish 使用相同 opener.

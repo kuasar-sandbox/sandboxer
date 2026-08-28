@@ -10,6 +10,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
 
 // infoCmd implements `sandbox-ctl info` for both strict logical roots:
@@ -58,7 +59,22 @@ func infoCmd(args []string) int {
 	if *asJSON {
 		var value any = document.Sandbox
 		if document.Snapshot != nil {
-			value = document.Snapshot
+			// Keep the established machine-readable contract while changing the
+			// on-disk model atomically. The projection is derived from strict S
+			// and its referenced strict E; no disk provenance is read from or
+			// written back to snapshot.cfg.
+			reader, err := restore.NewSnapshotCfgReader(manifestCfg)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			defer reader.Close()
+			resolved, err := reader.Read(ctx, input, restore.SnapshotCfgReadOptions{RefLocations: refLocations})
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			value = resolved.Config
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")

@@ -93,6 +93,9 @@ func TestSnapshotCfgReaderDerivesCompatibilityProjectionFromSandbox(t *testing.T
 		t.Fatalf("raw snapshot.cfg changed:\n%s\nwant:\n%s", document.Raw, sCfgRaw)
 	}
 	cfg := document.Config
+	if cfg.Version != snapshot.SnapshotConfigVersion || cfg.SandboxRef != eRef {
+		t.Fatalf("snapshot identity = version %d sandbox_ref %q", cfg.Version, cfg.SandboxRef)
+	}
 	if cfg.Resources.Capacity.CPU != 2 || cfg.Resources.Capacity.Memory != "1GiB" {
 		t.Fatalf("capacity = %d/%s", cfg.Resources.Capacity.CPU, cfg.Resources.Capacity.Memory)
 	}

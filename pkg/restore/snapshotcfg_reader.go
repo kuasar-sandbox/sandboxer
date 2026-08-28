@@ -21,7 +21,9 @@ import (
 // only sandbox_ref plus memory from_refs. Read derives every disk, resource,
 // launch and metadata field below from the referenced Sandbox E.
 type SnapshotCfg struct {
-	Resources struct {
+	Version    int    `yaml:"version"`
+	SandboxRef string `yaml:"sandbox_ref"`
+	Resources  struct {
 		Capacity struct {
 			CPU    int    `yaml:"cpu"`
 			Memory string `yaml:"memory"`
@@ -252,8 +254,10 @@ func projectSnapshotCfg(memoryCfg *snapshot.Config, portable *config.PortableSan
 		return nil, err
 	}
 	projected := &SnapshotCfg{
-		Metadata: cloneSnapshotMetadata(portable.Metadata),
-		FromRefs: append([]string(nil), memoryCfg.FromRefs...),
+		Version:    memoryCfg.Version,
+		SandboxRef: memoryCfg.SandboxRef,
+		Metadata:   cloneSnapshotMetadata(portable.Metadata),
+		FromRefs:   append([]string(nil), memoryCfg.FromRefs...),
 	}
 	projected.Resources.Capacity.CPU = portable.Resources.Capacity.CPU
 	projected.Resources.Capacity.Memory = portable.Resources.Capacity.Memory
