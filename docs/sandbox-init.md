@@ -508,9 +508,10 @@ registry 和 quiesce gate 建立生命周期顺序。Host 看到的语义是
 - **sync 在前**:`drop_caches` 只丢 clean,先 sync 把 dirty 转 clean,disk dump
   与 memory dump 看到的是一致状态
 - **drop_caches=3(请求启用时)**:clean page cache 由当前实例的访问历史和 prefetch
-  时序形成,不是恢复进程状态所必需的 dirty 数据.清理它可以减少 capture 中的非活跃
-  cache 和后续按需读取量,实际收益必须针对 workload 测量.默认跳过此写入;需要该
-  取舍时显式使用 `--drop-caches=true`;freeze 与 sync 仍照常执行.
+  时序形成,不是恢复进程状态所必需的 dirty 数据.清理它可以减少 capture 中的 resident
+  cache,但 restore 后重新访问这些页时必须从 root filesystem cold-read.这是更小 capture
+  与恢复后读取成本之间的取舍,必须针对 workload 测量.默认跳过此写入;需要该取舍时
+  显式使用 `--drop-caches=true`;freeze 与 sync 仍照常执行.
 
 `quiesced.drop_caches_result` 回报 `skipped | succeeded | failed`;空值表示旧 guest
 未实现回报(`unknown`)。显式请求 skip 而收到 unknown 时 host 继续快照并告警,因为旧
@@ -1245,7 +1246,7 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
 
 | 扩展 | 引入条件 | 影响章节 |
 |---|---|---|
-| 应用 quiesce hook | 应用需要 flush 外部缓冲、完成自定义一致性屏障或准备可恢复状态 | §3.4 quiesce 扩展项表 |
+| 应用 quiesce hook | 应用需要在 freeze 前接收 best-effort preparation signal;当前提案没有完成 ACK,不能作为自定义一致性屏障 | §3.4 quiesce 扩展项表 |
 | 应用 stderr 旁路 | 需要 host 侧 stdout 与 stderr 分流(终端模式天然无此区分,pipe 模式可加一条 vsock 旁路) | §3.5 / §4.5 |
 | 自带 vmlinux | 用户需要平台 kernel 未带的特性(nested userfaultfd / user·net 命名空间 / 别的 kernel 特性);平台 kernel 已含 cgroup cpu/memory/io/pids 控制器 + NFS(v3/v4) + FUSE | sandbox-ctl `boot.kernel: file://...` |
 | 自带 sandbox-runtime | 用户应用对 PID 1 / supervisor 有特殊要求(罕见) | 平台不阻止,但失去 DAX 共享收益 |
