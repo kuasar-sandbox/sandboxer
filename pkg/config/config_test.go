@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -656,6 +657,15 @@ func TestValidateCold_MissingFields(t *testing.T) {
 		{"alloc cpu > capacity", func(c *SandboxConfig) {
 			c.Resources.Allocatable.CPU = 99
 		}, "allocatable.cpu must be ≤"},
+		{"alloc cpu nan", func(c *SandboxConfig) {
+			c.Resources.Allocatable.CPU = math.NaN()
+		}, "allocatable.cpu must be finite"},
+		{"alloc cpu positive inf", func(c *SandboxConfig) {
+			c.Resources.Allocatable.CPU = math.Inf(1)
+		}, "allocatable.cpu must be finite"},
+		{"alloc cpu negative inf", func(c *SandboxConfig) {
+			c.Resources.Allocatable.CPU = math.Inf(-1)
+		}, "allocatable.cpu must be finite"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

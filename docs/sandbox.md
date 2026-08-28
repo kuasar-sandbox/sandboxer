@@ -579,9 +579,9 @@ Restore host若显式提供 `boot.cmdline`、launch persistent/ephemeral fields�
 | Static cgroup | set | empty | 本地设置 CPU/memory limit,可运行 local sensor |
 | Dynamic | set | set | 通过 resource protocol admission/lease/Budget,并运行 local sensor |
 
-`resources.capacity` 是 guest-visible VM capacity,进入 Portable config. `resources.allocatable` 是 workload 默认值,也进入 Portable config. `control`、`overhead`、`watermark_high` 和 `startup` 是 node policy,不进入 E.
+`resources.capacity` 是 guest-visible VM capacity,进入 Portable config. `resources.allocatable` 是 workload 默认值,也进入 Portable config;其中 `allocatable.cpu` 必须是有限数,且满足 `0 < allocatable.cpu <= capacity.cpu`. `control`、`overhead`、`watermark_high` 和 `startup` 是 node policy,不进入 E.
 
-Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Host ping gate 会让已入场探测完成 `pong` + guest EOF transport barrier;guest quiesce 还会排空并暂停周期 `mem_report`,防止 S 捕获持有 stream lock、仍等待旧 host vsock 的 reporter. Restore 在 ACK 前切换到新 observation epoch;`--resume`/失败 attach 恢复原 epoch. Recovery 在 VM、MUX、app 和 backend 恢复后释放 host barrier.
+Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Host ping gate 会让已入场探测完成 `pong` + guest EOF transport barrier;该排空独立受 8 s quiesce budget 约束,即使普通 `timeouts.ping` 关闭强制超时也不会无限阻塞捕获. 到期时 host cancel并join该探测,捕获失败后走完整 recovery. Guest quiesce 还会排空并暂停周期 `mem_report`,防止 S 捕获持有 stream lock、仍等待旧 host vsock 的 reporter. Restore 在 ACK 前切换到新 observation epoch;`--resume`/失败 attach 恢复原 epoch,live attach只重开pause gate且不破坏已入场报告的计数. Recovery 在 VM、MUX、app 和 backend 恢复后释放 host barrier.
 
 ### 4.2 Memory terms
 
@@ -823,7 +823,7 @@ Static/dynamic cgroup模式在CH pause前lift可能竞争的`memory.high`,并等
 
 ### 9.2 CPU
 
-`capacity.cpu` 决定 vCPU count. `allocatable.cpu` 在cgroup模式映射到clamped `cpu.weight`;controller可以在lifecycle内调整grant,但不会改写C0或artifact.
+`capacity.cpu` 决定 vCPU count. `allocatable.cpu` 必须是有限正数且不大于 `capacity.cpu`;在cgroup模式映射到clamped `cpu.weight`. Controller可以在lifecycle内调整grant,但不会改写C0或artifact.
 
 ### 9.3 Balloon
 

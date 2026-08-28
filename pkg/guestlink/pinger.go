@@ -69,6 +69,7 @@ type Pinger struct {
 	nextID   atomic.Uint64
 	tickMu   sync.Mutex
 	tickDone chan error
+	tickEnd  context.CancelFunc
 
 	// FatalThreshold tracking: consecutiveFails counts failures since
 	// the last success; once it reaches Cfg.FatalThreshold (and that's
@@ -133,26 +134,46 @@ func (p *Pinger) Stop() {
 // /vm.pause boundary.
 func (p *Pinger) Pause() { _ = p.PauseContext(context.Background()) }
 
-// PauseContext is the cancellable capture barrier form of Pause.
+// PauseContext is the cancellable capture barrier form of Pause. An admitted
+// probe is allowed to finish through guest EOF, but can never hold the capture
+// barrier beyond the protocol quiesce budget even when timeouts.ping disables
+// its ordinary health-probe deadline.
 func (p *Pinger) PauseContext(ctx context.Context) error {
+	return p.pauseContext(ctx, proto.DeadlineQuiesce)
+}
+
+func (p *Pinger) pauseContext(ctx context.Context, drainTimeout time.Duration) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	p.paused.Store(true)
 	p.tickMu.Lock()
 	done := p.tickDone
+	end := p.tickEnd
 	p.tickMu.Unlock()
 	if done == nil {
 		return ctx.Err()
 	}
+	drainCtx, cancelDrain := context.WithTimeout(ctx, drainTimeout)
+	defer cancelDrain()
 	select {
 	case err := <-done:
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		return err
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-drainCtx.Done():
+		// Context cancellation is wired to the concrete short connection's
+		// deadline. Join after cancel so capture never continues while a stale
+		// ping still owns a host/guest vsock flow.
+		if end != nil {
+			end()
+		}
+		<-done
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("ping capture drain exceeded %s: %w", drainTimeout, drainCtx.Err())
 	}
 }
 
@@ -194,18 +215,22 @@ func (p *Pinger) tick(parent context.Context, timeout time.Duration) {
 		p.tickMu.Unlock()
 		return
 	}
+	tickCtx, tickEnd := context.WithCancel(parent)
 	done := make(chan error, 1)
 	p.tickDone = done
+	p.tickEnd = tickEnd
 	p.tickMu.Unlock()
 	var barrierErr error
 	defer func() {
-		done <- barrierErr
-		close(done)
+		tickEnd()
 		p.tickMu.Lock()
 		if p.tickDone == done {
 			p.tickDone = nil
+			p.tickEnd = nil
 		}
 		p.tickMu.Unlock()
+		done <- barrierErr
+		close(done)
 	}()
 	if p.Stats == nil {
 		p.Stats = &PingStats{}
@@ -213,14 +238,14 @@ func (p *Pinger) tick(parent context.Context, timeout time.Duration) {
 	id := p.nextID.Add(1)
 	tSend := time.Now()
 	p.Stats.Attempts.Add(1)
-	resp, err := p.Client.roundTripUntilEOFContext(parent, &proto.Message{
+	resp, err := p.Client.roundTripUntilEOFContext(tickCtx, &proto.Message{
 		Type:    proto.TypePing,
 		ID:      id,
 		TSendNs: tSend.UnixNano(),
 	}, timeout)
 	if err != nil {
 		barrierErr = err
-		if parent.Err() != nil {
+		if tickCtx.Err() != nil {
 			return
 		}
 		// Best-effort classification — RoundTrip returns wrapped errors.

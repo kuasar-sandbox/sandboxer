@@ -159,6 +159,60 @@ func TestPingerPauseWaitsForGuestConnectionClose(t *testing.T) {
 	}
 }
 
+func TestPingerPauseBoundsAndJoinsNoForcedTimeoutProbe(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	requestRead := make(chan struct{})
+	peerEOF := make(chan error, 1)
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		if _, err := proto.ReadMessage(c); err != nil {
+			peerEOF <- err
+			return
+		}
+		close(requestRead)
+		var one [1]byte
+		_, err := c.Read(one[:])
+		peerEOF <- err
+	})
+	defer proxy.close()
+
+	p := &Pinger{
+		Client: &HostClient{BasePath: base},
+		Cfg:    PingerConfig{Interval: time.Hour, Timeout: time.Hour},
+		Stats:  &PingStats{},
+		Logf:   t.Logf,
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	p.Start(runCtx)
+	defer func() {
+		cancelRun()
+		p.Stop()
+	}()
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("ping was not admitted")
+	}
+
+	const drainTimeout = 50 * time.Millisecond
+	if err := p.pauseContext(context.Background(), drainTimeout); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pauseContext error = %v, want bounded context deadline", err)
+	}
+	select {
+	case err := <-peerEOF:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("guest read after canceled pause = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("PauseContext returned without aborting and joining the admitted ping")
+	}
+	p.tickMu.Lock()
+	done := p.tickDone
+	p.tickMu.Unlock()
+	if done != nil {
+		t.Fatal("PauseContext returned before the canceled ping cleared its barrier state")
+	}
+}
+
 // TestPinger_FatalThreshold simulates a guest that accepts but never
 // replies to pings; verifies the host fires OnFatal after the configured
 // threshold and exactly once (sync.Once), regardless of subsequent ticks.

@@ -915,9 +915,19 @@ func (s *memReportStream) advanceEpochAndPause() (uint64, error) {
 }
 
 func (s *memReportStream) resumeEpoch() {
-	// pauseAndDrain establishes active=0 before either restore or attach can
-	// reach this point, so reopening admission is one exact state transition.
-	s.admission.Store(0)
+	// Restore reaches this point after pauseAndDrain, but a plain live attach
+	// may arrive while a periodic report is already admitted. Clear only the
+	// gate bit so that report retains its low-bit ownership until endAttempt;
+	// storing zero here would make its deferred release underflow and panic.
+	for {
+		state := s.admission.Load()
+		if state&memReportPausedBit == 0 {
+			return
+		}
+		if s.admission.CompareAndSwap(state, state&^memReportPausedBit) {
+			return
+		}
+	}
 }
 
 func (s *memReportStream) currentEpoch() uint64 {

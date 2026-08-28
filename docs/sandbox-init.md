@@ -470,7 +470,8 @@ registry 和 quiesce gate 建立生命周期顺序。Host 看到的语义是
 
 ```
 0. host 原子关闭 exec/forward admission,暂停 ping ticker并等待已入场 ping 完成
-   `pong` + guest EOF transport barrier,但不在 guest 确认前抢先拆已放行的
+   `pong` + guest EOF transport barrier. 此排空独立受 8 s quiesce budget 约束;
+   即使普通 ping timeout 不强制,到期也会 cancel并join该连接、令本次捕获失败,但不在 guest 确认前抢先拆仍能正常完成的
    transport;guest 按 §3.6 拒绝新 exec、SIGKILL 在飞 exec 辅助进程,关闭每条 exec MUX 的
    lingered vsock,并等待完整 session goroutine 退出. 该排空有界;失败时不进入 freezer、
    不返回 `quiesced`.
@@ -1081,7 +1082,7 @@ local port;前者重置 transport epoch,后者维持分配连续性,两者职责
 |---|---|
 | sandbox-ctl 完成 `launch` 写入 | start |
 | sandbox-ctl 收到 `restore_ack` 响应 | start |
-| capture admission 关闭 | stop;已入场 ping 等待 `pong` + guest EOF 后才完成 pause barrier |
+| capture admission 关闭 | stop;已入场 ping 等待 `pong` + guest EOF,最多占用 8 s quiesce budget;超时则 cancel + join并令捕获失败 |
 | CH 进程退出 | stop |
 
 **参数**:
@@ -1090,6 +1091,8 @@ local port;前者重置 transport epoch,后者维持分配连续性,两者职责
 |---|---|---|
 | `interval` | 1 s(固定) | 两次 ping 起始时刻间隔 |
 | `timeout` | sandbox.yaml `timeouts.ping`;默认不强制(生产档 200 ms) | 单次 dial+write+read+guest close/EOF 总预算;到点视为失败。启用 `--ping-fatal-threshold` 时须设有界值(sandbox.md §2.2 / §3.1) |
+
+普通健康探测 timeout 与 capture drain budget 相互独立:前者可以不强制,但已入场探测不能把 export/snapshot 的 capture barrier 无限延长.
 
 **指标**(sandbox-ctl 暴露,统计窗口 = 沙箱生命周期):`ping_attempts_total` /
 `ping_success_total` / `ping_timeout_total` / `ping_dial_error_total` /
@@ -1132,7 +1135,7 @@ host 侧凡由 sandbox.yaml `timeouts.*` 接管的项以配置为准,默认不�
 | `launch_ack`(host 等待) | `launch.start_timeout`,空 / 0 = **无限期** | launch_ack 在 guest 把 spec 全部应用完(含可能很长的 `init`)后才发,故 host 读它的 deadline 由 start_timeout 控制;默认无限期(init 可任意长),生产建议显式设值,否则卡死的 guest 无 host 侧超时。此连接随后转 MUX |
 | `app_started` | guest 侧 200 ms(dial+write+读 ack);host 读死线 `timeouts.app_notify`(默认不强制) | 健康路径 µs 级;guest 侧短预算作"host 已死"的快速失败 |
 | `app_exited` | 同 `app_started` | ack 拿不到也照常 reboot |
-| `ping` | `timeouts.ping`(默认不强制;生产档 200 ms) | 到点计入 `ping_timeout_total`;启用 `--ping-fatal-threshold` 须设有界值 |
+| `ping` | `timeouts.ping`(默认不强制;生产档 200 ms);capture drain最多 8 s | 普通到点计入 `ping_timeout_total`;capture排空到点会cancel + join probe并放弃该次捕获;启用 `--ping-fatal-threshold` 须设有界值 |
 | `quiesce` | 8 s | guest 要 drop caches + 停读 app pipe + MUX_CLOSE 一来回;留足头部 |
 | `restore` | `timeouts.restore`(默认不强制) | kernel vsock 层在此期间 hold 住连接请求等 vCPU 跑起来 accept;请求前 EOF/reset 在同一总 deadline 内短时重拨(最多 2 s),`restore` 一经写出绝不重放;恢复期大量缺页换入会拉长;此连接随后转 MUX |
 | `attach` | 5 s | 同 `restore` 的 hold 语义;此连接随后转 MUX |

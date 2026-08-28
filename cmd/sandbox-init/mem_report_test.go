@@ -349,6 +349,41 @@ func TestMemReportStreamPauseAndDrainWaitsForInflightReport(t *testing.T) {
 	}
 }
 
+func TestMemReportStreamLiveAttachPreservesInflightAdmission(t *testing.T) {
+	stream := &memReportStream{epoch: 1}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	attemptDone := make(chan any, 1)
+	go func() {
+		defer func() { attemptDone <- recover() }()
+		stream.attempt(
+			func() (proto.MemReport, error) { return proto.MemReport{MemTotalBytes: 1}, nil },
+			func(proto.MemReport) error {
+				close(started)
+				<-release
+				return nil
+			},
+			func(string, ...any) {},
+		)
+	}()
+	<-started
+
+	// A plain live attach reopens an already-live epoch. It must clear only
+	// the pause gate; an admitted report still owns the low-bit count until
+	// its exchange returns.
+	stream.resumeEpoch()
+	if got := stream.admission.Load() & memReportActiveMask; got != 1 {
+		t.Errorf("active report count after live attach = %d, want 1", got)
+	}
+	close(release)
+	if panicValue := <-attemptDone; panicValue != nil {
+		t.Fatalf("report completion after live attach panicked: %v", panicValue)
+	}
+	if got := stream.admission.Load(); got != 0 {
+		t.Fatalf("admission after report completion = %#x, want 0", got)
+	}
+}
+
 func TestMemReportStreamRejectsEpochOverflow(t *testing.T) {
 	stream := &memReportStream{epoch: ^uint64(0)}
 	if _, err := stream.advanceEpochAndPause(); err == nil {

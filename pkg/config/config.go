@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -1044,6 +1045,9 @@ func (c *SandboxConfig) ValidateCold() error {
 	}
 	if allocMem == 0 {
 		return errors.New("resources.allocatable.memory must be > 0")
+	}
+	if math.IsNaN(c.Resources.Allocatable.CPU) || math.IsInf(c.Resources.Allocatable.CPU, 0) {
+		return errors.New("resources.allocatable.cpu must be finite")
 	}
 	if c.Resources.Allocatable.CPU > float64(c.Resources.Capacity.CPU) {
 		return errors.New("resources.allocatable.cpu must be ≤ capacity.cpu")

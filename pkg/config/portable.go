@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -588,6 +589,9 @@ func (p *PortableSandboxConfig) Validate() error {
 	capacity, err := util.ParseSize(p.Resources.Capacity.Memory)
 	if err != nil || capacity == 0 {
 		return fmt.Errorf("portable resources.capacity.memory: %w", errOrValue(err))
+	}
+	if math.IsNaN(p.Resources.Allocatable.CPU) || math.IsInf(p.Resources.Allocatable.CPU, 0) {
+		return errors.New("portable resources.allocatable.cpu must be finite")
 	}
 	if p.Resources.Allocatable.CPU <= 0 || p.Resources.Allocatable.CPU > float64(p.Resources.Capacity.CPU) {
 		return errors.New("portable resources.allocatable.cpu must be > 0 and <= capacity.cpu")

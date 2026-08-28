@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,6 +80,44 @@ func TestPortableParserRejectsUnknownDuplicateVersionAndEphemeral(t *testing.T) 
 			_, err := ParsePortableSandboxConfig(tc.raw)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("ParsePortableSandboxConfig error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestPortableRejectsNonFiniteAllocatableCPU(t *testing.T) {
+	for name, cpu := range map[string]float64{
+		"nan":          math.NaN(),
+		"positive inf": math.Inf(1),
+		"negative inf": math.Inf(-1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validPortableConfig()
+			cfg.Resources.Allocatable.CPU = cpu
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "finite") {
+				t.Fatalf("Validate error = %v, want finite CPU rejection", err)
+			}
+		})
+	}
+}
+
+func TestPortableParserRejectsNonFiniteAllocatableCPU(t *testing.T) {
+	raw, err := MarshalPortableSandboxConfig(validPortableConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, scalar := range map[string]string{
+		"nan":          ".nan",
+		"positive inf": ".inf",
+		"negative inf": "-.inf",
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := bytes.Replace(raw, []byte("cpu: 1.5"), []byte("cpu: "+scalar), 1)
+			if bytes.Equal(input, raw) {
+				t.Fatal("canonical allocatable CPU field was not found")
+			}
+			if _, err := ParsePortableSandboxConfig(input); err == nil || !strings.Contains(err.Error(), "finite") {
+				t.Fatalf("ParsePortableSandboxConfig error = %v, want finite CPU rejection", err)
 			}
 		})
 	}
