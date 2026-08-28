@@ -16,7 +16,7 @@
 | 目标 | 实现方式 |
 |---|---|
 | 启动快 | 单一静态 Go 二进制 PID=1,无 systemd / dracut / busybox 链路 |
-| 跨实例可去重 | 启动期内存页内容确定;sandbox-init 自身镜像版本固化 |
+| 启动状态可验证 | sandbox-init 版本固定;launch、quiesce、restore 和 attach 使用显式握手与状态屏障 |
 | 跨 sandbox 共享 | virtio-pmem + DAX 让 host page cache 一份 RAM 跨 N 个 sandbox |
 | 一 VM = 一 app | sandbox-init clone(NEWPID\|NEWNS) 让用户 app 看到自己 PID=1 |
 | 生命周期可寻址 | exit / SIGTERM / quiesce / restore 都通过 vsock 通知 host |
@@ -456,8 +456,7 @@ in-progress 状态。详见 [`sandbox.md`](sandbox.md) §4.2 / §9.3。
 
 quiesce 是 host `/vm.pause` 之前的最后一次清理机会,目标两件事:
 
-1. 把跨实例 snapshot 的内存与磁盘状态推向"确定性",让分块去重率从 50-70% 升至
-   >90%(`kuasar-sandbox/docs/kuasar-sandbox.md` §4.6)。
+1. 冻结应用并同步文件系统,让内存和磁盘工件对应同一个一致 capture point.
 2. **让 MUX 与端口转发连接在快照前彻底关闭**——快照绝不能捕获一条半开/握手中途的
    MUX 连接,或一条仍在飞的 `connect` 端口转发连接(restore 出来后无对端,成为
    悬挂状态;§4.6 / §3.7)。
@@ -479,10 +478,10 @@ registry 和 quiesce gate 建立生命周期顺序。Host 看到的语义是
     排空后不再有 guest→host 观测连接或持锁 reporter 进入 S.
 0b. 排空完成后 freeze 应用:
    write /sys/fs/cgroup/app/cgroup.freeze = 1,轮询 cgroup.events 至 frozen 1
-   (有界等待)。在 sync 前冻结 ⇒ sync 之后应用不再产生新脏页,镜像更确定;
+   (有界等待).在 sync 前冻结 ⇒ sync 之后应用不再产生新脏页,capture point 保持一致;
    freezer 原子覆盖整棵子树,含 /init、envd 创建的 user/ptys/socats 等子树和
    冻结期 fork 出的子进程;不调用 envd /freeze
-1. [prep] sync(2)                                  // ~ms,把 ext4 upperdir 全部 dirty 落地
+1. [prep] sync(2)                                  // 把 ext4 upperdir 的 dirty data 落地
 2. [prep] 若 quiesce.skip_drop_caches=false:
    open("/proc/sys/vm/drop_caches", O_WRONLY) → write("3\n")
                                                     // 同时丢 page cache + dentry/inode cache
@@ -508,11 +507,12 @@ registry 和 quiesce gate 建立生命周期顺序。Host 看到的语义是
 
 - **sync 在前**:`drop_caches` 只丢 clean,先 sync 把 dirty 转 clean,disk dump
   与 memory dump 看到的是一致状态
-- **drop_caches=3(请求启用时)**:page cache 是确定性 snapshot 的核心污染源;同一应用不同启动
-  序的 page cache 内容按访问顺序、prefetch 时序差异化堆积,跨实例 ~90% 不同;drop
-  后每实例 restore 后 page cache 初值统一为空,直接对应 kuasar-sandbox.md §4.6 量化的"确定性
-  50→90% dedup"差距来源。默认跳过此写入;如需清理 cache 以获得更确定且更小的
-  snapshot,显式使用 `--drop-caches=true`;freeze 与 sync 仍照常执行。
+- **drop_caches=3(请求启用时)**:clean page cache 由当前实例的访问历史和 prefetch
+  时序形成,不是恢复进程状态所必需的 dirty 数据.清理它可以减少 capture 中的 resident
+  cache,但 restore 后重新访问这些页时必须从相应 backing filesystem/device cold-read,
+  包括 root filesystem 和 `boot.disks[]` 数据盘.这是更小 capture 与恢复后读取成本之间的
+  取舍,必须针对 workload 测量.默认跳过此写入;需要该取舍时
+  显式使用 `--drop-caches=true`;freeze 与 sync 仍照常执行.
 
 `quiesced.drop_caches_result` 回报 `skipped | succeeded | failed`;空值表示旧 guest
 未实现回报(`unknown`)。显式请求 skip 而收到 unknown 时 host 继续快照并告警,因为旧
@@ -1247,7 +1247,7 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
 
 | 扩展 | 引入条件 | 影响章节 |
 |---|---|---|
-| 应用 quiesce hook | 跨实例去重率超过 kuasar-sandbox.md §4.6 量化的"非确定性 50-70%" 上限的用例 | §3.4 quiesce 扩展项表 |
+| 应用 quiesce hook | 应用需要在 freeze 前接收 best-effort preparation signal;当前提案没有完成 ACK,不能作为自定义一致性屏障 | §3.4 quiesce 扩展项表 |
 | 应用 stderr 旁路 | 需要 host 侧 stdout 与 stderr 分流(终端模式天然无此区分,pipe 模式可加一条 vsock 旁路) | §3.5 / §4.5 |
 | 自带 vmlinux | 用户需要平台 kernel 未带的特性(nested userfaultfd / user·net 命名空间 / 别的 kernel 特性);平台 kernel 已含 cgroup cpu/memory/io/pids 控制器 + NFS(v3/v4) + FUSE | sandbox-ctl `boot.kernel: file://...` |
 | 自带 sandbox-runtime | 用户应用对 PID 1 / supervisor 有特殊要求(罕见) | 平台不阻止,但失去 DAX 共享收益 |
@@ -1262,5 +1262,4 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
 - `sandboxer/docs/cloud-hypervisor.md` §5.2 —— vsock hybrid 代理:host
   侧映射到 UDS 的 CONNECT 行格式;`--console` / `--serial` 的用法
 - `guest-runtime/native-deps/docs/build.md` §2.1 —— mkfs.erofs 构建(`guest-runtime make sandbox-runtime` 的前置工具)
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §4.6 —— quiesce prep 必做项的目标依据
-  (确定性 guest 配置)
+- `kuasar-sandbox/docs/kuasar-sandbox.md` §4 —— 模板实例化与暂停/恢复的用户语义
