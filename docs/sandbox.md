@@ -162,7 +162,7 @@ Live mode不接受 `--config`;它复用当前 run 进程已验证的 manifest/re
 sandbox-ctl exec --sandbox-id s1 --run-root /run/sandbox -- /bin/sh -c 'id'
 ```
 
-`exec` 通过当前 ctl/MUX 创建 sibling process. Export/snapshot 的 quiesce gate 原子阻止新 exec/forward 进入不稳定窗口,并关闭、join 已放行的 exec/forward session;在飞 exec 被终止且不会在 `--resume` 后自动重跑. Capture 完成或失败恢复后重新开放新请求. Guest `attach` 是幂等恢复操作;host 在 request/ACK 边界不明确时立即重试一次,且整个 dial/ACK 过程受 lifecycle context cancellation 控制.
+`exec` 通过当前 ctl/MUX 创建 sibling process. Export/snapshot 的 quiesce gate 原子阻止新 exec/forward 进入不稳定窗口,并关闭、join 已放行的 exec/forward session;在飞 exec 被终止且不会在 `--resume` 后自动重跑. Restore/attach 只有在新 MUX 建立且应用 cgroup 已 thaw 后才重新开放 exec、forward、plugin 和 app restart;ACK 与 thaw 之间抢先到达的请求会被 gate 拒绝,不会向 frozen cgroup fork. Guest `attach` 是幂等恢复操作;host 在 request/ACK 边界不明确时立即重试一次,且整个 dial/ACK 过程受 lifecycle context cancellation 控制.
 
 远程授权 exec 使用 `pkg/ctl.ServeExecTunnel(ctx, options)`,固定以下顺序:
 
@@ -581,7 +581,7 @@ Restore host若显式提供 `boot.cmdline`、launch persistent/ephemeral fields�
 
 `resources.capacity` 是 guest-visible VM capacity,进入 Portable config. `resources.allocatable` 是 workload 默认值,也进入 Portable config. `control`、`overhead`、`watermark_high` 和 `startup` 是 node policy,不进入 E.
 
-Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Recovery 在 VM、MUX、app 和 backend 恢复后释放 barrier.
+Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Host ping gate 会让已入场探测完成 `pong` + guest EOF transport barrier;guest quiesce 还会排空并暂停周期 `mem_report`,防止 S 捕获持有 stream lock、仍等待旧 host vsock 的 reporter. Restore 在 ACK 前切换到新 observation epoch;`--resume`/失败 attach 恢复原 epoch. Recovery 在 VM、MUX、app 和 backend 恢复后释放 host barrier.
 
 ### 4.2 Memory terms
 
@@ -687,8 +687,9 @@ Snapshot Bundle root Manifest是 S;Export Bundle root Manifest是 E. E、data/lo
 T0 output/manifest/local-crypto/ref/Bundle/merge/config/source preflight
 T1 enter MemoryController/Budget mutation barrier
 T2 lock and lift/drain memory.high
-T3 gate/drain exec/forward, freeze guest app, guest sync
-T4 pause pinger/MUX, pause CH, quiesce all block backends
+T3 pause pinger and gate new host exec/forward;guest drains exec/forward and mem_report, freezes app, syncs,
+   closes MUX;after quiesced+EOF host joins residual exec/forward handlers
+T4 pause CH, quiesce all block backends
 T5 capture every data disk exactly once
 T6 build C1 from immutable C0 + source binding + captured disk refs
 T7 capture root once and emit Sandbox E

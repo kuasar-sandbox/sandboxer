@@ -2,12 +2,55 @@ package guestlink
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
+
+func TestOpenMUXViaExecContextCancelsStalledAck(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	requestRead := make(chan struct{})
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		req, err := proto.ReadMessage(c)
+		if err != nil {
+			t.Errorf("read exec request: %v", err)
+			return
+		}
+		if req.Type != proto.TypeExec {
+			t.Errorf("request type = %q, want %q", req.Type, proto.TypeExec)
+		}
+		close(requestRead)
+		_, _ = io.Copy(io.Discard, c)
+	})
+	defer proxy.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := openMUXViaExecContext(ctx, &HostClient{BasePath: base},
+			&proto.ExecSpec{Argv: []string{"sleep", "60"}}, 24*time.Hour)
+		done <- err
+	}()
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("exec request was not received")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("openMUXViaExecContext() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stalled exec_ack was not cancelled")
+	}
+}
 
 func TestPipeConnsKeepsReverseDirectionAfterHalfClose(t *testing.T) {
 	client, relayClient := unixConnPair(t, "client")

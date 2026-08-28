@@ -68,8 +68,7 @@ type Pinger struct {
 	doneCh   chan struct{}
 	nextID   atomic.Uint64
 	tickMu   sync.Mutex
-	tickEnd  context.CancelFunc
-	tickDone chan struct{}
+	tickDone chan error
 
 	// FatalThreshold tracking: consecutiveFails counts failures since
 	// the last success; once it reaches Cfg.FatalThreshold (and that's
@@ -129,8 +128,9 @@ func (p *Pinger) Stop() {
 }
 
 // Pause halts ping sends temporarily and joins any probe already admitted by
-// the ticker. Used during capture so no half-closed management connection can
-// cross the quiesce → /vm.pause boundary.
+// the ticker through the guest-side connection-close barrier. Used during
+// capture so no half-closed management connection can cross the quiesce →
+// /vm.pause boundary.
 func (p *Pinger) Pause() { _ = p.PauseContext(context.Background()) }
 
 // PauseContext is the cancellable capture barrier form of Pause.
@@ -140,17 +140,17 @@ func (p *Pinger) PauseContext(ctx context.Context) error {
 	}
 	p.paused.Store(true)
 	p.tickMu.Lock()
-	cancel, done := p.tickEnd, p.tickDone
-	if cancel != nil {
-		cancel()
-	}
+	done := p.tickDone
 	p.tickMu.Unlock()
 	if done == nil {
 		return ctx.Err()
 	}
 	select {
-	case <-done:
-		return ctx.Err()
+	case err := <-done:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -194,16 +194,16 @@ func (p *Pinger) tick(parent context.Context, timeout time.Duration) {
 		p.tickMu.Unlock()
 		return
 	}
-	tickCtx, cancel := context.WithCancel(parent)
-	done := make(chan struct{})
-	p.tickEnd, p.tickDone = cancel, done
+	done := make(chan error, 1)
+	p.tickDone = done
 	p.tickMu.Unlock()
+	var barrierErr error
 	defer func() {
-		cancel()
+		done <- barrierErr
 		close(done)
 		p.tickMu.Lock()
 		if p.tickDone == done {
-			p.tickEnd, p.tickDone = nil, nil
+			p.tickDone = nil
 		}
 		p.tickMu.Unlock()
 	}()
@@ -213,13 +213,14 @@ func (p *Pinger) tick(parent context.Context, timeout time.Duration) {
 	id := p.nextID.Add(1)
 	tSend := time.Now()
 	p.Stats.Attempts.Add(1)
-	resp, err := p.Client.RoundTripContext(tickCtx, &proto.Message{
+	resp, err := p.Client.roundTripUntilEOFContext(parent, &proto.Message{
 		Type:    proto.TypePing,
 		ID:      id,
 		TSendNs: tSend.UnixNano(),
 	}, timeout)
 	if err != nil {
-		if tickCtx.Err() != nil && (p.paused.Load() || parent.Err() != nil) {
+		barrierErr = err
+		if parent.Err() != nil {
 			return
 		}
 		// Best-effort classification — RoundTrip returns wrapped errors.
@@ -239,7 +240,8 @@ func (p *Pinger) tick(parent context.Context, timeout time.Duration) {
 	if resp.Type != proto.TypePong || resp.ID != id {
 		p.Stats.DialError.Add(1)
 		p.Logf("ping id=%d unexpected resp %+v", id, resp)
-		p.recordFailure(fmt.Errorf("unexpected response %q (id=%d)", resp.Type, resp.ID))
+		barrierErr = fmt.Errorf("unexpected response %q (id=%d)", resp.Type, resp.ID)
+		p.recordFailure(barrierErr)
 		return
 	}
 	p.Stats.Success.Add(1)
@@ -533,15 +535,41 @@ func OpenMUXViaAttachContext(ctx context.Context, client *HostClient, epoch uint
 // stdio it established in exec_ack. The returned conn carries the MUX
 // end-to-end; the caller (run process) pipes it to the CLI.
 func OpenMUXViaExec(client *HostClient, spec *proto.ExecSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
-	return openMUX(client, &proto.Message{Type: proto.TypeExec, Exec: spec}, proto.TypeExecAck, deadline)
+	return openMUXViaExecContext(context.Background(), client, spec, deadline)
 }
 
-func openMUX(client *HostClient, req *proto.Message, wantAck string, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
-	conn, err := client.DialRaw(deadline)
+// openMUXViaExecContext keeps lifecycle cancellation armed through exec_ack.
+// It stays package-private because the context belongs to the run process's
+// capture admission; CLI callers continue to use OpenMUXViaExec.
+func openMUXViaExecContext(ctx context.Context, client *HostClient, spec *proto.ExecSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, err := client.DialRawContext(ctx, deadline)
 	if err != nil {
 		return nil, proto.StdioSpec{}, err
 	}
-	return finishOpenMUX(conn, req, wantAck)
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	rawConn := conn
+	resultConn, established, err := finishOpenMUX(rawConn,
+		&proto.Message{Type: proto.TypeExec, Exec: spec}, proto.TypeExecAck)
+	if !stopCancel() {
+		_ = rawConn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, proto.StdioSpec{}, ctxErr
+		}
+		return nil, proto.StdioSpec{}, context.Canceled
+	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, proto.StdioSpec{}, ctxErr
+		}
+		return nil, proto.StdioSpec{}, err
+	}
+	// finishOpenMUX clears the handshake deadline. Clear it again after the
+	// cancellation callback is stopped to make the live-MUX handoff explicit.
+	_ = resultConn.SetDeadline(time.Time{})
+	return resultConn, established, nil
 }
 
 func finishOpenMUX(conn net.Conn, req *proto.Message, wantAck string) (net.Conn, proto.StdioSpec, error) {

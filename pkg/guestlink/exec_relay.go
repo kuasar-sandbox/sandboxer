@@ -24,7 +24,7 @@ func ServeExecRequest(ctx context.Context, conn net.Conn, req ctl.Request, vsock
 		return
 	}
 	hc := &HostClient{BasePath: vsockBase, Logf: logf}
-	guestConn, established, err := OpenMUXViaExec(hc, req.Exec, proto.DeadlineExec)
+	guestConn, established, err := openMUXViaExecContext(ctx, hc, req.Exec, proto.DeadlineExec)
 	if err != nil {
 		logf("exec: open guest session: %v", err)
 		_ = ctl.WriteMessage(conn, ctl.Response{Type: ctl.TypeError, Msg: err.Error()})

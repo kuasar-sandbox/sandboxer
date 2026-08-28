@@ -262,8 +262,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	}
 
 	// CH snapshot config is the Capacity authority. The referenced Sandbox E
-	// portable config must describe the same exact byte domain, but it is not
-	// used to infer CH total size.
+	// portable config must describe the exact captured CPU topology and memory
+	// byte domain, but it is not used to infer CH's restored shape.
+	if err := validateSnapshotVCPUTopology(snapshotRoot.ConfigJSON, snapCfg.Resources.Capacity.CPU); err != nil {
+		return -1, err
+	}
 	snapCap, err := chmemory.CapacityFromVMConfig(snapshotRoot.ConfigJSON)
 	if err != nil {
 		return -1, fmt.Errorf("snapshot CH capacity: %w", err)

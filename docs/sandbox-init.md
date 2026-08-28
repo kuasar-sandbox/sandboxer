@@ -438,7 +438,11 @@ listener 整个沙箱生命周期(冷启动 + snapshot/restore + MUX 重连 + �
 **mem_report 上报 goroutine**:与 supervisor 并行的第二个常驻 goroutine。
 Launch barrier 后立即采样一次,随后默认每 5 s 读取 `/proc/meminfo`。每份报告
 携带 observation `epoch` 和严格递增 `seq`;restore 在写 `restore_ack` 前建立
-新 epoch并清除旧 pending 报告。
+新 epoch并清除旧 pending 报告。Quiesce 在 freeze 前持有同一 stream lock 等待
+已在途的 guest→host 交换结束,然后暂停新采样。这是 memory capture barrier
+的一部分:不允许 S 保存“互斥锁已持有 + 旧 host vsock 等待中”的状态。
+`restore` 切换到新 epoch 后恢复采样;`attach`(同一 VM 的
+`--resume`/失败恢复)则恢复原 epoch。
 
 报告包含 `MemAvailable` 以及 `MemTotal`、`MemFree`、`Cached`、`AnonPages`、
 `SReclaimable` 诊断字段,不读取或上报 balloon current。Host Capacity 也不能从
@@ -458,16 +462,21 @@ quiesce 是 host `/vm.pause` 之前的最后一次清理机会,目标两件事:
    MUX 连接,或一条仍在飞的 `connect` 端口转发连接(restore 出来后无对端,成为
    悬挂状态;§4.6 / §3.7)。
 
-`attach`/`quiesce` 等短连接由 listener 单线程顺序处理;host 看到的语义是
-"`quiesced` 一回来即可继续 `/vm.pause`"。
+Listener 对每个已 accept 的短连接并发处理;exec/connect/mem-report 各自的
+registry 和 quiesce gate 建立生命周期顺序。Host 看到的语义是
+"`quiesced` 连接关闭屏障完成后可以继续 `/vm.pause`"。
 
 **quiesce 流程**:
 
 ```
-0. host 原子关闭 exec/forward admission,主动关闭并等待所有已放行的 ctl exec relay;
-   guest 再按 §3.6 拒绝新 exec、SIGKILL 在飞 exec 辅助进程,关闭每条 exec MUX 的
+0. host 原子关闭 exec/forward admission,暂停 ping ticker并等待已入场 ping 完成
+   `pong` + guest EOF transport barrier,但不在 guest 确认前抢先拆已放行的
+   transport;guest 按 §3.6 拒绝新 exec、SIGKILL 在飞 exec 辅助进程,关闭每条 exec MUX 的
    lingered vsock,并等待完整 session goroutine 退出. 该排空有界;失败时不进入 freezer、
-   不返回 `quiesced`. 排空完成后 freeze 应用:
+   不返回 `quiesced`.
+0a. guest 等待已在途的 mem_report 完成并暂停 reporter. 其 exchange 有界;
+    排空后不再有 guest→host 观测连接或持锁 reporter 进入 S.
+0b. 排空完成后 freeze 应用:
    write /sys/fs/cgroup/app/cgroup.freeze = 1,轮询 cgroup.events 至 frozen 1
    (有界等待)。在 sync 前冻结 ⇒ sync 之后应用不再产生新脏页,镜像更确定;
    freezer 原子覆盖整棵子树,含 /init、envd 创建的 user/ptys/socats 等子树和
@@ -482,8 +491,9 @@ quiesce 是 host `/vm.pause` 之前的最后一次清理机会,目标两件事:
    关闭 target 连接 + 反向通道 vsock 连接,后者带 SO_LINGER **阻塞至 socket 移除**
    ——与 MUX 同理,不留半开 vsock 残留。多会话**并发**关闭,有界于 quiesce 预算。
    accept 模式额外关闭缓存的 guest listener(唤醒 park 中的 Accept,清空缓存,resume
-   后懒重建)。host 侧 Forwarder 在发送 quiesce 前暂停新建、关闭并等待所有在途 dial/accept
-   握手与活跃中继退出，确保之后不再产生 host 侧 teardown
+   后懒重建)。host 侧 Forwarder 在发送 quiesce 前只暂停新建;
+   收到 guest `quiesced` 并观测到该管理连接 EOF 后,才关闭残留 host half,
+   并等待所有已放行 exec/dial/accept/relay handler 退出,然后 `/vm.pause`
 5. 在 MUX 连接上发起优雅关闭握手(§4.6):MUX_CLOSE → 收 MUX_CLOSE_ACK → close(MUX)。
    close 带 SO_LINGER,**阻塞至该 vsock socket 真正从内核移除**(host 响应方回 ACK
    后立即关闭其连接,RST 回到 guest → 这端 socket 移除),而非"发起关闭即返回"——
@@ -531,7 +541,8 @@ balloon 回收。
 - prep 的 sync / drop_caches 任一失败 → stderr 记录,继续后续步骤(best-effort,
   质量不到位反映在 dedup 率指标上,**不**阻塞快照)
 - **freeze 确认、MUX_CLOSE 握手与 `quiesced` 不是 best-effort**:`quiesced` 写出
-  意味着"应用已冻结、MUX 连接已确认彻底拆除(socket 移除,非仅发起关闭)、guest
+  意味着"应用已冻结、exec/forward/MUX 已确认排空、mem_report 已暂停且无在途
+  exchange、MUX 连接已确认彻底拆除(socket 移除,非仅发起关闭)、guest
   处于稳态"——发起动作不等于完成,quiesce ack 时刻必须已进入稳态。若 cgroup.events 在有界等待
   内未到 `frozen 1` → **不发 `quiesced`**(半冻结的快照恰是要消除的 resume-vs-
   env 竞态源)。若 MUX_CLOSE 握手因连接已断而走不通 → 按硬丢处理(对端也看到了
@@ -1013,6 +1024,7 @@ guest 对 vsock 连接 arm SO_LINGER 再关,阻塞至 host RST 确认拆除,不�
                        ◄── attach_ack{stdio, app_state} ──  reply on this new conn
   send SET_WINSIZE  ════════════════════════════════════►  (this conn ⇒ MUX);  resume reading app pipes; replay residual
                                                            thaw iff still quiesce-frozen: cgroup.freeze=0  (else no-op — attach≠resume)
+                                                           reopen exec/forward/plugin/app-restart gates only after thaw
   resume normal MUX flow                                   resume normal MUX flow
 ```
 
@@ -1021,14 +1033,16 @@ guest 对 vsock 连接 arm SO_LINGER 再关,阻塞至 host RST 确认拆除,不�
 ```
   sandbox-ctl                                              sandbox-init
   ───────────                                              ────────────
-  ping ticker stop
+  ping ticker stop; gate new exec/forward
   dial CID=2:5000 ── quiesce ───────────────────────────►  freeze app: cgroup.freeze=1, await frozen
+                                                           exec + mem_report drain precedes that app freeze
                                                            prep: sync ; echo 3 > drop_caches
                                                            stop reading app stdout/stderr (pty master)
                        ◄══ MUX: MUX_CLOSE ════════════════  on the (separate) MUX conn: send MUX_CLOSE
   ══ MUX: MUX_CLOSE_ACK ════════════════════════════════►  recv ACK → close(MUX);  host: read → EOF → close(MUX)
                        ◄── quiesced ─────────────────────  reply on the quiesce conn; close it
-  ✓ MUX closed + quiesced received  →  /vm.pause  /vm.snapshot
+  wait quiesce EOF; join host exec/forward halves
+  ✓ all channel barriers complete  →  /vm.pause  /vm.snapshot
   snapshot state:  listener up · app session alive (app frozen) · no MUX
                    · CH vsock local_port_last persisted
                    · TRANSPORT_RESET in used ring · reset pending persisted
@@ -1044,9 +1058,11 @@ guest 对 vsock 连接 arm SO_LINGER 再关,阻塞至 host RST 确认拆除,不�
   dial CID=2:5000 (REQUEST buffered behind RX gate)
                        ◄── event queue kick (ack) ─────────  reset complete; CH ungates pending REQUEST
                    ── restore{epoch,wallclock} ──────────►  clock_settime(CLOCK_REALTIME, wallclock_ns)
+                                                           advance paused mem_report stream to a new epoch
                        ◄── restore_ack{stdio, app_state} ─  reply on this conn
   send SET_WINSIZE  ════════════════════════════════════►  (this conn ⇒ MUX);  resume reading app pipes; replay residual
                                                            thaw app: cgroup.freeze=0  ← last, env ready
+                                                           reopen exec/forward/plugin/app-restart gates
   SafeTarget normalization; open new mem-report epoch       next reporter sample uses new epoch/seq
   ping ticker (re)start                                    (listener unchanged across the snapshot)
 ```
@@ -1065,7 +1081,7 @@ local port;前者重置 transport epoch,后者维持分配连续性,两者职责
 |---|---|
 | sandbox-ctl 完成 `launch` 写入 | start |
 | sandbox-ctl 收到 `restore_ack` 响应 | start |
-| sandbox-ctl 完成 `quiesce` 写入 | stop |
+| capture admission 关闭 | stop;已入场 ping 等待 `pong` + guest EOF 后才完成 pause barrier |
 | CH 进程退出 | stop |
 
 **参数**:
@@ -1073,7 +1089,7 @@ local port;前者重置 transport epoch,后者维持分配连续性,两者职责
 | 参数 | 值 | 含义 |
 |---|---|---|
 | `interval` | 1 s(固定) | 两次 ping 起始时刻间隔 |
-| `timeout` | sandbox.yaml `timeouts.ping`;默认不强制(生产档 200 ms) | 单次 dial+write+read 总预算;到点视为失败。启用 `--ping-fatal-threshold` 时须设有界值(sandbox.md §2.2 / §3.1) |
+| `timeout` | sandbox.yaml `timeouts.ping`;默认不强制(生产档 200 ms) | 单次 dial+write+read+guest close/EOF 总预算;到点视为失败。启用 `--ping-fatal-threshold` 时须设有界值(sandbox.md §2.2 / §3.1) |
 
 **指标**(sandbox-ctl 暴露,统计窗口 = 沙箱生命周期):`ping_attempts_total` /
 `ping_success_total` / `ping_timeout_total` / `ping_dial_error_total` /

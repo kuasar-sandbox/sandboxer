@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -249,6 +250,102 @@ func TestMemReportStreamAdvanceWaitsForInflightReport(t *testing.T) {
 	<-attemptDone
 	if epoch := <-advanced; epoch != 2 {
 		t.Fatalf("advanced epoch = %d, want 2", epoch)
+	}
+}
+
+func TestMemReportStreamPauseAndDrainWaitsForInflightReport(t *testing.T) {
+	stream := &memReportStream{epoch: 1}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	attemptDone := make(chan struct{})
+	go func() {
+		stream.attempt(
+			func() (proto.MemReport, error) { return proto.MemReport{MemTotalBytes: 1}, nil },
+			func(proto.MemReport) error {
+				close(started)
+				<-release
+				return nil
+			},
+			func(string, ...any) {},
+		)
+		close(attemptDone)
+	}()
+	<-started
+
+	paused := make(chan struct{})
+	go func() {
+		if err := quiesceExecAndMemoryReports(newExecRegistry(), stream); err != nil {
+			t.Errorf("quiesceExecAndMemoryReports: %v", err)
+		}
+		close(paused)
+	}()
+	gateObserved := make(chan struct{})
+	go func() {
+		for !stream.isPaused() {
+			runtime.Gosched()
+		}
+		close(gateObserved)
+	}()
+	select {
+	case <-gateObserved:
+	case <-time.After(time.Second):
+		t.Fatal("pauseAndDrain did not gate new reports")
+	}
+
+	readCalls := 0
+	rejectedDone := make(chan struct{})
+	go func() {
+		stream.attempt(
+			func() (proto.MemReport, error) {
+				readCalls++
+				return proto.MemReport{MemTotalBytes: 1}, nil
+			},
+			func(proto.MemReport) error { return nil },
+			func(string, ...any) {},
+		)
+		close(rejectedDone)
+	}()
+	select {
+	case <-rejectedDone:
+	case <-time.After(time.Second):
+		t.Fatal("new report blocked behind the in-flight report after the pause gate closed")
+	}
+	if readCalls != 0 {
+		t.Fatalf("pause gate sampled %d new report(s), want 0", readCalls)
+	}
+	select {
+	case <-paused:
+		t.Fatal("pauseAndDrain returned while the admitted report was still in flight")
+	default:
+	}
+
+	close(release)
+	<-attemptDone
+	<-paused
+
+	stream.attempt(
+		func() (proto.MemReport, error) {
+			readCalls++
+			return proto.MemReport{MemTotalBytes: 1}, nil
+		},
+		func(proto.MemReport) error { return nil },
+		func(string, ...any) {},
+	)
+	if readCalls != 0 {
+		t.Fatalf("paused stream sampled %d report(s), want 0", readCalls)
+	}
+
+	stream.resumeEpoch()
+	stream.attempt(
+		func() (proto.MemReport, error) {
+			readCalls++
+			return proto.MemReport{MemTotalBytes: 1}, nil
+		},
+		func(proto.MemReport) error { return nil },
+		func(string, ...any) {},
+	)
+	if readCalls != 1 {
+		t.Fatalf("resumed stream sampled %d report(s), want 1", readCalls)
 	}
 }
 

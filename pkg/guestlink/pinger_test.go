@@ -15,8 +15,9 @@ import (
 )
 
 // TestPinger_TickAndPause runs a fake guest behind a fakeCHProxy and verifies
-// Pause cancels and joins an in-flight probe before returning, while Resume
-// admits a later probe without tearing down the ticker goroutine.
+// Pause joins an in-flight probe through guest connection close before
+// returning, while Resume admits a later probe without tearing down the ticker
+// goroutine.
 func TestPinger_TickAndPause(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "vsock.sock")
@@ -42,8 +43,6 @@ func TestPinger_TickAndPause(t *testing.T) {
 			ID:      req.ID,
 			TSendNs: req.TSendNs,
 		})
-		var one [1]byte
-		_, _ = c.Read(one[:]) // host closes after consuming (or canceling) the response
 		peerDone <- writeErr
 	})
 	defer proxy.close()
@@ -69,17 +68,22 @@ func TestPinger_TickAndPause(t *testing.T) {
 	go func() { pauseDone <- p.PauseContext(ctx) }()
 	select {
 	case err := <-pauseDone:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-ctx.Done():
-		t.Fatal("PauseContext did not cancel and join the in-flight ping")
+		t.Fatalf("PauseContext returned before the in-flight ping completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
 	}
 	if got := seen.Load(); got != 1 {
 		t.Fatalf("pings admitted before pause barrier = %d, want 1", got)
 	}
-	release <- struct{}{} // let the fake peer observe the canceled connection
+	release <- struct{}{}
 	<-peerDone
+	select {
+	case err := <-pauseDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("PauseContext did not join the completed ping")
+	}
 	p.Resume()
 	select {
 	case <-requests:
@@ -103,6 +107,55 @@ func TestPinger_TickAndPause(t *testing.T) {
 	}
 	if snap.RTTAvgNs == 0 {
 		t.Errorf("Snapshot.RTTAvgNs = 0")
+	}
+}
+
+func TestPingerPauseWaitsForGuestConnectionClose(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	responseWritten := make(chan struct{})
+	releaseClose := make(chan struct{})
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		req, err := proto.ReadMessage(c)
+		if err != nil {
+			return
+		}
+		if err := proto.WriteMessage(c, &proto.Message{
+			Type: proto.TypePong, ID: req.ID, TSendNs: req.TSendNs,
+		}); err != nil {
+			return
+		}
+		close(responseWritten)
+		<-releaseClose
+	})
+	defer proxy.close()
+
+	p := &Pinger{
+		Client: &HostClient{BasePath: base},
+		Cfg:    PingerConfig{Interval: time.Hour, Timeout: 2 * time.Second},
+		Stats:  &PingStats{},
+		Logf:   t.Logf,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	p.Start(ctx)
+	defer p.Stop()
+	<-responseWritten
+
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- p.PauseContext(ctx) }()
+	select {
+	case err := <-pauseDone:
+		t.Fatalf("PauseContext returned before the guest closed the ping connection: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseClose)
+	select {
+	case err := <-pauseDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("PauseContext did not finish after the guest connection closed")
 	}
 }
 

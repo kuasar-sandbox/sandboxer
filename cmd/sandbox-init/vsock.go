@@ -208,6 +208,12 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 	switch req.Type {
 	case proto.TypePing:
 		// Echo id + t_send_ns; host computes RTT.
+		// Capture pauses the host ticker and waits for EOF. Linger makes that
+		// EOF exchange a bounded transport teardown instead of leaving this
+		// management 4-tuple half-closed in snapshot memory.
+		if err := c.SetLinger(muxCloseLingerSec); err != nil {
+			logf("reverse-channel: ping SO_LINGER: %v (continuing)", err)
+		}
 		if err := proto.WriteMessage(c, &proto.Message{Type: proto.TypePong, ID: req.ID, TSendNs: req.TSendNs}); err != nil {
 			logf("reverse-channel: write pong: %v", err)
 		}
@@ -229,12 +235,7 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 
 	case proto.TypeRestore:
 		logf("reverse-channel: restore epoch=%d — re-establishing stdio MUX", req.Epoch)
-		sup.execReg.endQuiesce()   // sandbox live again — allow exec
-		sup.connReg.endQuiesce()   // and allow port-forward connects
-		sup.acceptLn.reopen()      // and re-enable accept-mode listener binds
-		sup.pluginReg.endQuiesce() // and resume plugin restarts
-		sup.quiescing.Store(false) // and app in-place restarts
-		bridge.closeLiveMUX()      // drop any stale session first (normally already gone via quiesce)
+		bridge.closeLiveMUX() // drop any stale session first (normally already gone via quiesce)
 		// CH reloaded the snapshot's CLOCK_REALTIME verbatim, so the
 		// guest wall clock is stale by the whole dormant interval. Jump
 		// it to the host's now before the post-reattach thaw, so the
@@ -255,6 +256,7 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		// the thaw so the app resumes onto the new identity. nil → keep the
 		// snapshot's network.
 		if req.Network != nil {
+			logf("reverse-channel: restore network re-apply starting (epoch=%d)", req.Epoch)
 			if err := applyNetworkReplace(req.Network); err != nil {
 				logf("reverse-channel: restore applyNetwork: %v", err)
 			} else {
@@ -265,6 +267,7 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		// restore_ack. This serializes with an in-flight mem_report exchange, so
 		// neither an old-epoch delivery nor a pre-ACK sample can become the first
 		// trusted restore observation.
+		logf("reverse-channel: restore mem_report epoch transition starting")
 		reportEpoch, err := guestMemReports.advanceEpochAndPause()
 		if err != nil {
 			logf("reverse-channel: restore mem_report epoch: %v", err)
@@ -283,10 +286,10 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		// LAST so it resumes only into a wired env, never observing the
 		// stale clock / missing MUX (the freeze rode the snapshot from
 		// quiesce). Idempotent.
-		if err := cgroupThaw(); err != nil {
+		if err := resumeAfterThaw(sup, guestMemReports, cgroupThaw); err != nil {
 			logf("reverse-channel: restore thaw: %v", err)
+			return true
 		}
-		guestMemReports.resumeEpoch()
 		// Restore, like cold boot, sends the first trustworthy observation
 		// immediately after its lifecycle barrier instead of waiting up to one
 		// periodic interval.
@@ -295,12 +298,7 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 
 	case proto.TypeAttach:
 		logf("reverse-channel: attach epoch=%d — re-establishing stdio MUX", req.Epoch)
-		sup.execReg.endQuiesce()   // sandbox live again (post-resume) — allow exec
-		sup.connReg.endQuiesce()   // and allow port-forward connects
-		sup.acceptLn.reopen()      // and re-enable accept-mode listener binds
-		sup.pluginReg.endQuiesce() // and resume plugin restarts
-		sup.quiescing.Store(false) // and app in-place restarts
-		bridge.closeLiveMUX()      // gracefully close the old session, then switch
+		bridge.closeLiveMUX() // gracefully close the old session, then switch
 		spec := bridge.protoSpec()
 		resp := &proto.Message{Type: proto.TypeAttachAck, Epoch: req.Epoch, Stdio: &spec, AppState: proto.AppStateRunning}
 		if err := proto.WriteMessage(c, resp); err != nil {
@@ -317,12 +315,19 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		// (VM resumed in place; this attach is just its first
 		// post-resume contact). Plain reconnect → not frozen → skipped
 		// (docs/sandbox-init.md §4.3, sandbox.md §6.2 resume recovery).
+		var thaw func() error
 		if frozen, err := cgroupFrozen(); err != nil {
 			logf("reverse-channel: attach cgroupFrozen: %v", err)
+			return true
 		} else if frozen {
-			if err := cgroupThaw(); err != nil {
-				logf("reverse-channel: attach thaw: %v", err)
-			}
+			thaw = cgroupThaw
+		}
+		// Quiesce drains and pauses guest→host memory observations before the
+		// VM freeze. Attach resumes the same live epoch; a true restore instead
+		// advances the epoch in the TypeRestore branch above.
+		if err := resumeAfterThaw(sup, guestMemReports, thaw); err != nil {
+			logf("reverse-channel: attach thaw: %v", err)
+			return true
 		}
 		return true
 
@@ -338,7 +343,7 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		// fork/MUX/socket session before freezing. Capturing only after child
 		// SIGKILL but before its Go cleanup completed could restore with the
 		// process-wide fork path permanently wedged.
-		if err := quiesceExecSessions(sup.execReg); err != nil {
+		if err := quiesceExecAndMemoryReports(sup.execReg, guestMemReports); err != nil {
 			logf("reverse-channel: quiesce exec drain failed, NOT sending quiesced: %v", err)
 			return false
 		}
@@ -381,6 +386,43 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: "unknown type"})
 		return false
 	}
+}
+
+// resumeAfterThaw reopens every cold-process launch/forward gate only after
+// the application cgroup is runnable again. os/exec holds Go's process-wide
+// ForkLock while clone3(CLONE_INTO_CGROUP) enters the target cgroup. Reopening
+// exec before thaw lets clone3 block in the frozen cgroup while cgroupThaw's
+// os.WriteFile waits for the same ForkLock to open cgroup.freeze, producing a
+// permanent post-restore deadlock.
+func resumeAfterThaw(sup *supervisorState, reports *memReportStream, thaw func() error) error {
+	if thaw != nil {
+		if err := thaw(); err != nil {
+			return err
+		}
+	}
+	reports.resumeEpoch()
+	sup.execReg.endQuiesce()
+	sup.connReg.endQuiesce()
+	sup.acceptLn.reopen()
+	sup.pluginReg.endQuiesce()
+	sup.quiescing.Store(false)
+	return nil
+}
+
+// quiesceExecAndMemoryReports establishes the guest-side process/management
+// channel barrier before the app freezer. The reporter is paused only after
+// exec teardown succeeds, so a failed exec drain leaves ordinary guest
+// observations running while the host abandons and recovers the capture.
+func quiesceExecAndMemoryReports(execReg *execRegistry, reports *memReportStream) error {
+	if err := quiesceExecSessions(execReg); err != nil {
+		return err
+	}
+	// Drain the periodic guest→host memory report before freezing. Its
+	// stream mutex covers the whole vsock exchange; capturing it locked would
+	// restore a goroutine waiting on an obsolete host connection and
+	// permanently block TypeRestore's epoch transition.
+	reports.pauseAndDrain()
+	return nil
 }
 
 // notifyAppStarted dials the host launch UDS and sends a short-conn
