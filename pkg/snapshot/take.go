@@ -154,6 +154,13 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 			return nil, fmt.Errorf("snapshot: disk %d has no SnapshotView", i)
 		}
 	}
+	merged := make([]bool, len(s.Diffs))
+	for i := range s.Diffs {
+		merged[i] = s.Diffs[i].MergeBase != ""
+	}
+	if err := ValidateExportGraph(s.PortableConfig, s.ParentSandboxRef, merged); err != nil {
+		return nil, fmt.Errorf("snapshot prospective C1: %w", err)
+	}
 	if sink == nil {
 		return nil, fmt.Errorf("snapshot: nil sink")
 	}

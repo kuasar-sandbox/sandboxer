@@ -51,6 +51,34 @@ func TestPipeConnsKeepsReverseDirectionAfterHalfClose(t *testing.T) {
 	}
 }
 
+func TestPipeConnsFullLocalCloseForcesGuestConnectionClosed(t *testing.T) {
+	client, relayClient := unixConnPair(t, "client-full-close")
+	defer client.Close()
+	relayGuest, guest := unixConnPair(t, "guest-full-close")
+	defer guest.Close()
+
+	done := make(chan struct{})
+	go func() {
+		pipeConns(context.Background(), relayClient, relayGuest)
+		close(done)
+	}()
+
+	// Capture closes the admitted ctl-side connection itself. That is distinct
+	// from a CLI CloseWrite: the guest reverse session must be fully closed so
+	// its silent read side cannot keep the exec handler in PauseAndDrain.
+	if err := relayClient.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		_ = guest.Close()
+		<-done
+		t.Fatal("pipeConns remained blocked on the guest after a full local close")
+	}
+}
+
 func unixConnPair(t *testing.T, name string) (net.Conn, net.Conn) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name+".sock")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -173,6 +174,43 @@ func TestExportSinkCloseFailureResumesBackendsAndCH(t *testing.T) {
 	mu.Unlock()
 	if want := "/api/v1/vm.pause,/api/v1/vm.resume"; got != want {
 		t.Fatalf("CH requests = %q, want %q", got, want)
+	}
+}
+
+func TestExportRejectsOverlongProspectiveLayerChainBeforePause(t *testing.T) {
+	portable := exportTestPortable(t)
+	portable.Boot.Disks = nil
+	portable.Mounts = nil
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	for i := 0; i < config.MaxPortableLayerRefs; i++ {
+		portable.Boot.Root.BaseFromRefs = append(portable.Boot.Root.BaseFromRefs,
+			"manifest://"+fmt.Sprintf("%064x", i+1))
+	}
+	if err := portable.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	viewCalls := 0
+	quiescer := &recordingQuiescer{}
+	_, err := Export(context.Background(), ExportSources{
+		SandboxID:        "layer-limit",
+		APISock:          filepath.Join(t.TempDir(), "must-not-call-ch.sock"),
+		PortableConfig:   portable,
+		ParentSandboxRef: "manifest://" + strings.Repeat("f", 64),
+		Diffs: []DiskDiff{{SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			viewCalls++
+			return bytes.NewReader(make([]byte, 4096)), nil, nil
+		}}},
+		Quiescer: quiescer,
+	}, &captureSink{}, true)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 64 entries") {
+		t.Fatalf("Export error = %v, want prospective C1 layer-limit rejection", err)
+	}
+	if quiescer.quiesce != 0 || quiescer.resume != 0 {
+		t.Fatalf("prospective C1 error touched backends: quiesce=%d resume=%d", quiescer.quiesce, quiescer.resume)
+	}
+	if viewCalls != 0 {
+		t.Fatalf("prospective C1 error opened SnapshotView %d times", viewCalls)
 	}
 }
 

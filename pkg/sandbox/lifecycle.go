@@ -109,6 +109,11 @@ type BundleSourceBinding struct {
 	RootRef  string
 	RootPath string
 	Refs     []string
+	// Reader and Fetcher are a paired, runtime-only selector owned by the
+	// stream that opened RootPath. Keeping them on each binding preserves
+	// independent Sandbox E and Snapshot S provenance after restore.
+	Reader  *manifestbundle.Reader
+	Fetcher *manifestbundle.ManifestFetcher
 }
 
 // Run executes one sandbox lifecycle: prepare backends + launch server,
@@ -1630,6 +1635,13 @@ func handleExportRequest(
 		}
 		diffs[i] = diff
 	}
+	prospectiveParentRef := ""
+	if opts.SourceBinding != nil {
+		prospectiveParentRef = opts.SourceBinding.SandboxRef
+	}
+	if err := snapshot.ValidateExportGraph(opts.PortableConfig, prospectiveParentRef, diskMerged); err != nil {
+		return ctl.Response{}, fmt.Errorf("export: prospective C1: %w", err)
+	}
 
 	var (
 		sink                  snapshot.ArtifactSink
@@ -2002,6 +2014,13 @@ func handleSnapshotRequest(
 		}
 		diffs[i] = dd
 	}
+	prospectiveParentRef := ""
+	if opts.SourceBinding != nil {
+		prospectiveParentRef = opts.SourceBinding.SandboxRef
+	}
+	if err := snapshot.ValidateExportGraph(opts.PortableConfig, prospectiveParentRef, diskMerged); err != nil {
+		return ctl.Response{}, fmt.Errorf("snapshot: prospective C1: %w", err)
+	}
 
 	mergeMemory := false
 	memoryMergeBase := ""
@@ -2018,7 +2037,7 @@ func handleSnapshotRequest(
 		}
 		mergeMemory = true
 	} else if mergeRef && memoryBinding != nil && memoryBinding.BundleSource != nil && memoryBinding.SnapshotRef != "" {
-		memoryMergeBase, mergeMemory, err = bundleManifestMergeRef(ctx, memoryBinding.SnapshotRef, opts)
+		memoryMergeBase, mergeMemory, err = bundleMemoryManifestMergeRef(ctx, memoryBinding.SnapshotRef, opts)
 		if err != nil {
 			return ctl.Response{}, fmt.Errorf("snapshot: Bundle memory merge base identity: %w", err)
 		}
@@ -2859,8 +2878,15 @@ func openSnapshotDependency(ctx context.Context, dependency artifactDependency, 
 		if err != nil {
 			return nil, nil, store.ContentKey{}, "", err
 		}
-		if opts.BundleFetcher != nil {
-			source, err := opts.BundleFetcher.SelectManifest(ctx, key)
+		lookup := sandboxBundleLookup(opts)
+		if dependency.role == dependencyMemorySnapshot {
+			lookup = memoryBundleLookup(opts)
+		}
+		if lookup.err != nil {
+			return nil, nil, store.ContentKey{}, "", fmt.Errorf("%s Bundle provenance: %w", label, lookup.err)
+		}
+		if lookup.fetcher != nil {
+			source, err := lookup.fetcher.SelectManifest(ctx, key)
 			if err != nil {
 				return nil, nil, store.ContentKey{}, "", err
 			}
@@ -2982,11 +3008,62 @@ func snapshotLayerDependencies(opts RunOptions, memoryFromRefs []string, diskMer
 	return dependencies, nil
 }
 
+type bundleLookup struct {
+	binding *BundleSourceBinding
+	reader  *manifestbundle.Reader
+	fetcher *manifestbundle.ManifestFetcher
+	err     error
+}
+
+func bundleLookupFor(binding *BundleSourceBinding, fallbackReader *manifestbundle.Reader, fallbackFetcher *manifestbundle.ManifestFetcher) bundleLookup {
+	lookup := bundleLookup{binding: binding}
+	if binding != nil {
+		lookup.reader = binding.Reader
+		lookup.fetcher = binding.Fetcher
+		if (lookup.reader == nil) != (lookup.fetcher == nil) {
+			lookup.err = errors.New("Bundle source reader/fetcher must be paired")
+			return lookup
+		}
+	}
+	if lookup.reader == nil && lookup.fetcher == nil {
+		lookup.reader = fallbackReader
+		lookup.fetcher = fallbackFetcher
+	}
+	if (lookup.reader == nil) != (lookup.fetcher == nil) {
+		lookup.err = errors.New("Bundle lookup reader/fetcher must be paired")
+	}
+	return lookup
+}
+
+func sandboxBundleLookup(opts RunOptions) bundleLookup {
+	if opts.SourceBinding != nil && opts.SourceBinding.BundleSource != nil {
+		return bundleLookupFor(opts.SourceBinding.BundleSource, opts.BundleReader, opts.BundleFetcher)
+	}
+	if opts.MemoryBinding != nil && opts.MemoryBinding.BundleSource != nil {
+		return bundleLookupFor(opts.MemoryBinding.BundleSource, opts.BundleReader, opts.BundleFetcher)
+	}
+	return bundleLookupFor(nil, opts.BundleReader, opts.BundleFetcher)
+}
+
+func memoryBundleLookup(opts RunOptions) bundleLookup {
+	if opts.MemoryBinding == nil || opts.MemoryBinding.BundleSource == nil {
+		return bundleLookup{}
+	}
+	return bundleLookupFor(opts.MemoryBinding.BundleSource, opts.BundleReader, opts.BundleFetcher)
+}
+
 func bundleSourceForManifest(ctx context.Context, key store.ContentKey, opts RunOptions) (string, string, bool, error) {
-	if opts.BundleFetcher == nil {
+	return bundleSourceForLookup(ctx, key, opts, sandboxBundleLookup(opts))
+}
+
+func bundleSourceForLookup(ctx context.Context, key store.ContentKey, opts RunOptions, lookup bundleLookup) (string, string, bool, error) {
+	if lookup.err != nil {
+		return "", "", false, lookup.err
+	}
+	if lookup.fetcher == nil {
 		return "", "", false, nil
 	}
-	source, err := opts.BundleFetcher.SelectManifest(ctx, key)
+	source, err := lookup.fetcher.SelectManifest(ctx, key)
 	if err != nil {
 		return "", "", false, err
 	}
@@ -3000,11 +3077,11 @@ func bundleSourceForManifest(ctx context.Context, key store.ContentKey, opts Run
 		}
 		return "", "", false, nil
 	}
-	bundleSource := activeBundleSource(opts)
+	bundleSource := lookup.binding
 	if bundleSource == nil {
 		return "", "", false, fmt.Errorf("selected Bundle source has no physical provenance")
 	}
-	if source.Reader == opts.BundleReader {
+	if source.Reader == lookup.reader {
 		return bundleSource.RootRef, bundleSource.RootPath, true, nil
 	}
 	if source.Ref == "" {
@@ -3022,16 +3099,18 @@ func bundleSourceForManifest(ctx context.Context, key store.ContentKey, opts Run
 }
 
 func activeBundleSource(opts RunOptions) *BundleSourceBinding {
-	if opts.SourceBinding != nil && opts.SourceBinding.BundleSource != nil {
-		return opts.SourceBinding.BundleSource
-	}
-	if opts.MemoryBinding != nil {
-		return opts.MemoryBinding.BundleSource
-	}
-	return nil
+	return sandboxBundleLookup(opts).binding
 }
 
 func bundleManifestMergeRef(ctx context.Context, raw string, opts RunOptions) (string, bool, error) {
+	return bundleManifestMergeRefWithLookup(ctx, raw, opts, sandboxBundleLookup(opts))
+}
+
+func bundleMemoryManifestMergeRef(ctx context.Context, raw string, opts RunOptions) (string, bool, error) {
+	return bundleManifestMergeRefWithLookup(ctx, raw, opts, memoryBundleLookup(opts))
+}
+
+func bundleManifestMergeRefWithLookup(ctx context.Context, raw string, opts RunOptions, lookup bundleLookup) (string, bool, error) {
 	ref, err := manifest.ParseRef(raw)
 	if err != nil {
 		return "", false, err
@@ -3043,7 +3122,7 @@ func bundleManifestMergeRef(ctx context.Context, raw string, opts RunOptions) (s
 	if err != nil {
 		return "", false, err
 	}
-	sourceRef, sourcePath, found, err := bundleSourceForManifest(ctx, key, opts)
+	sourceRef, sourcePath, found, err := bundleSourceForLookup(ctx, key, opts, lookup)
 	if err != nil || !found {
 		return "", false, err
 	}

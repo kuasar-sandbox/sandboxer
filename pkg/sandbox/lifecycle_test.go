@@ -487,6 +487,111 @@ func TestPrepareSnapshotBundlePlanMaterializesOnlyReachableSources(t *testing.T)
 	}
 }
 
+func TestBundleMemoryMergeUsesSnapshotBundleProvenance(t *testing.T) {
+	ctx := context.Background()
+	customerKey := [32]byte{0x45, 0x46, 0x47}
+	keyFn := func() ([32]byte, error) { return customerKey, nil }
+	manifestCfg := &manifest.Config{
+		Manifest: manifest.ManifestSubConfig{WriteGeneration: "G1"},
+		Chunker:  chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:   manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+	snapshotConfig := []byte("version: 1\nsandbox_ref: manifest://" + strings.Repeat("a", 64) + "\n")
+
+	makeBundle := func(sid string, fill byte) (string, string, *artifact.OpenedFile) {
+		t.Helper()
+		dir := t.TempDir()
+		sink, err := snapshot.NewBundleSink(ctx, dir, sid, manifestCfg, keyFn, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref, path := lifecycleBundleSnapshot(t, sink, dir, bytes.Repeat([]byte{fill}, 4096), snapshotConfig)
+		if err := sink.Close(); err != nil {
+			t.Fatal(err)
+		}
+		key, err := manifest.ParseKeyRef(ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		selector, err := manifest.ParseRef("file://" + path + "@manifest:" + manifest.HexKey(key))
+		if err != nil {
+			t.Fatal(err)
+		}
+		opened, err := artifact.OpenFile(ctx, path, selector, manifestCfg, keyFn, nil, nil, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ref, path, opened
+	}
+
+	sandboxRef, sandboxPath, sandboxOpened := makeBundle("separate-e", 0x51)
+	defer sandboxOpened.Close()
+	snapshotRef, snapshotPath, snapshotOpened := makeBundle("separate-s", 0x61)
+	defer snapshotOpened.Close()
+
+	binding := func(path string, opened *artifact.OpenedFile) *BundleSourceBinding {
+		return &BundleSourceBinding{
+			RootRef: "file://" + filepath.Base(path), RootPath: path, Refs: opened.BundleReader().Refs(),
+			Reader: opened.BundleReader(), Fetcher: opened.ManifestFetcher(),
+		}
+	}
+	opts := RunOptions{
+		SourceBinding: &RunSourceBinding{
+			SandboxRef: sandboxRef, BundleSource: binding(sandboxPath, sandboxOpened),
+		},
+		MemoryBinding: &MemorySourceBinding{
+			SnapshotRef: snapshotRef, BundleSource: binding(snapshotPath, snapshotOpened),
+		},
+		// Reproduce restore's historical single-selector preference for E.
+		BundleReader: sandboxOpened.BundleReader(), BundleFetcher: sandboxOpened.ManifestFetcher(),
+	}
+
+	resolved, merged, err := bundleMemoryManifestMergeRef(ctx, snapshotRef, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !merged {
+		t.Fatal("Snapshot Bundle memory parent was not selected for merge")
+	}
+	ref, err := manifest.ParseRef(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Clean(ref.Path) != filepath.Clean(snapshotPath) {
+		t.Fatalf("memory merge source path = %q, want Snapshot Bundle %q", ref.Path, snapshotPath)
+	}
+	resolved, merged, err = bundleManifestMergeRef(ctx, sandboxRef, opts)
+	if err != nil || !merged {
+		t.Fatalf("Sandbox Bundle disk parent merge = %q, %t, %v", resolved, merged, err)
+	}
+	ref, err = manifest.ParseRef(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Clean(ref.Path) != filepath.Clean(sandboxPath) {
+		t.Fatalf("disk merge source path = %q, want Sandbox Bundle %q", ref.Path, sandboxPath)
+	}
+	for _, dependency := range []struct {
+		name   string
+		value  artifactDependency
+		reader *manifestbundle.Reader
+	}{
+		{name: "memory", value: artifactDependency{raw: snapshotRef, role: dependencyMemorySnapshot}, reader: snapshotOpened.BundleReader()},
+		{name: "disk", value: artifactDependency{raw: sandboxRef, role: dependencyDiskLayer}, reader: sandboxOpened.BundleReader()},
+	} {
+		t.Run(dependency.name+" dependency selector", func(t *testing.T) {
+			stream, reader, _, _, err := openSnapshotDependency(ctx, dependency.value, opts, nil, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stream.Close()
+			if reader != dependency.reader {
+				t.Fatalf("selected Bundle reader = %p, want %p", reader, dependency.reader)
+			}
+		})
+	}
+}
+
 func TestPrepareSnapshotBundlePlanIngestsTarstreamParentIntoCurrentAdmission(t *testing.T) {
 	parentDir := t.TempDir()
 	snapshotConfig := []byte("version: 1\nsandbox_ref: manifest://" + strings.Repeat("a", 64) + "\n")
@@ -1053,6 +1158,61 @@ func TestHandleExportRequestRejectsPredictableErrorsBeforeQuiesce(t *testing.T) 
 	}
 	if viewCalled {
 		t.Fatal("canceled export opened SnapshotView")
+	}
+}
+
+func TestCaptureHandlersRejectProspectiveLayerLimitBeforeQuiesce(t *testing.T) {
+	dir := t.TempDir()
+	portable := snapshotTestLivePortable(t)
+	for i := 0; i < config.MaxPortableLayerRefs; i++ {
+		portable.Boot.Root.BaseFromRefs = append(portable.Boot.Root.BaseFromRefs,
+			"manifest://"+fmt.Sprintf("%064x", i+1))
+	}
+	if err := portable.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	parentRef := "manifest://" + strings.Repeat("f", 64)
+	viewCalls := 0
+	disks := []SnapDiskRef{{
+		DiffPath: filepath.Join(dir, "active.diff"), Size: 4096,
+		SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			viewCalls++
+			return bytes.NewReader(make([]byte, 4096)), nil, nil
+		},
+	}}
+	baseOpts := RunOptions{
+		Cfg: &config.SandboxConfig{}, PortableConfig: portable, SandboxID: "layer-limit",
+		SourceBinding: &RunSourceBinding{SandboxRef: parentRef, RuntimeRef: parentRef},
+	}
+	forwarder := NewForwarder("", discardLogf)
+	pinger := &guestlink.Pinger{Client: &guestlink.HostClient{BasePath: filepath.Join(dir, "must-not-dial.sock")}}
+
+	_, err := handleExportRequest(context.Background(), ctl.Request{OutDir: filepath.Join(dir, "export")},
+		baseOpts, disks, nil, filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"),
+		"", nil, nil, pinger, forwarder, func() error { return nil }, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 64 entries") {
+		t.Fatalf("export prospective C1 error = %v", err)
+	}
+
+	mfd, err := memory.Create("prospective-layer-limit", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	_, err = handleSnapshotRequest(context.Background(), ctl.Request{OutDir: filepath.Join(dir, "snapshot")},
+		baseOpts, mfd, disks, nil, filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"),
+		"", nil, nil, pinger, forwarder, func() error { return nil }, nil, discardLogf)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 64 entries") {
+		t.Fatalf("snapshot prospective C1 error = %v", err)
+	}
+	if viewCalls != 0 {
+		t.Fatalf("prospective C1 preflight opened SnapshotView %d times", viewCalls)
+	}
+	forwarder.mu.Lock()
+	quiescing := forwarder.quiescing
+	forwarder.mu.Unlock()
+	if quiescing {
+		t.Fatal("prospective C1 preflight gated forwards/exec")
 	}
 }
 

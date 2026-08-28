@@ -238,6 +238,10 @@ func TestSeparateSandboxBundleRetainsSnapshotBundleMemoryScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sandboxSource.Root.Close()
+	if sandboxSource.bundleSource == nil || sandboxSource.bundleSource.Reader != sandboxSource.bundleReader ||
+		sandboxSource.bundleSource.Fetcher != sandboxSource.bundleFetcher {
+		t.Fatal("Sandbox E Bundle provenance is not paired with its reader/fetcher")
+	}
 
 	// openReferencedSandbox deliberately nests its scoped fetcher over the
 	// Snapshot Bundle's fetcher. A miss in E therefore falls through to S,

@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -146,6 +147,13 @@ func validateExportSources(sources ExportSources, sink ArtifactSink) error {
 			return errors.New("export: parent Sandbox file ref must be a basename content identity")
 		}
 	}
+	merged := make([]bool, len(sources.Diffs))
+	for i := range sources.Diffs {
+		merged[i] = sources.Diffs[i].MergeBase != ""
+	}
+	if err := ValidateExportGraph(sources.PortableConfig, sources.ParentSandboxRef, merged); err != nil {
+		return fmt.Errorf("export prospective C1: %w", err)
+	}
 	if sources.Quiescer == nil {
 		return errors.New("export: nil backend Quiescer")
 	}
@@ -153,6 +161,58 @@ func validateExportSources(sources ExportSources, sink ArtifactSink) error {
 		return errors.New("export: nil artifact sink")
 	}
 	return nil
+}
+
+// ValidateExportGraph builds the exact prospective C1 shape with bounded,
+// collision-free placeholder refs for data-disk outputs. It lets lifecycle
+// handlers reject predictable layer/config limits before guest quiesce, while
+// the final C1 is still built from the real content identities at the freeze
+// point. Root payload identity remains self and therefore needs no placeholder.
+func ValidateExportGraph(portable *config.PortableSandboxConfig, parentSandboxRef string, merged []bool) error {
+	if portable == nil {
+		return errors.New("portable export: nil C0")
+	}
+	if len(merged) != 1+len(portable.Boot.Disks) {
+		return fmt.Errorf("portable export: got %d merge decisions, want %d", len(merged), 1+len(portable.Boot.Disks))
+	}
+
+	used := make(map[string]struct{}, config.MaxPortableArtifactRefs+len(portable.Boot.Disks)+1)
+	addRoot := func(root *config.PortableRootConfig) {
+		if root == nil {
+			return
+		}
+		used[root.Base] = struct{}{}
+		for _, raw := range root.BaseFromRefs {
+			used[raw] = struct{}{}
+		}
+		if root.Overlay != nil {
+			used[root.Overlay.Base] = struct{}{}
+			for _, raw := range root.Overlay.BaseFromRefs {
+				used[raw] = struct{}{}
+			}
+		}
+	}
+	addRoot(&portable.Boot.Root)
+	for i := range portable.Boot.Disks {
+		addRoot(&portable.Boot.Disks[i].PortableRootConfig)
+	}
+	used[parentSandboxRef] = struct{}{}
+
+	dataRefs := make([]string, len(portable.Boot.Disks))
+	for i := range dataRefs {
+		for salt := 0; ; salt++ {
+			digest := sha256.Sum256([]byte(fmt.Sprintf("sandboxer prospective C1 data disk %d salt %d", i, salt)))
+			candidate := "manifest://" + fmt.Sprintf("%x", digest[:])
+			if _, exists := used[candidate]; exists {
+				continue
+			}
+			dataRefs[i] = candidate
+			used[candidate] = struct{}{}
+			break
+		}
+	}
+	_, err := portable.Exported(parentSandboxRef, dataRefs, merged)
+	return err
 }
 
 // captureSandboxAtFreeze assumes CH is paused and all backends are quiesced.

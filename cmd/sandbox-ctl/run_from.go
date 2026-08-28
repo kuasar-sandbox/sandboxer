@@ -85,6 +85,8 @@ func openSandboxRunSource(ctx context.Context, raw string, storage *artifact.Pro
 				_ = opened.Close()
 				return nil, err
 			}
+			source.BundleSource.Reader = source.BundleReader
+			source.BundleSource.Fetcher = source.BundleFetcher
 		} else {
 			digester, ok := any(opened).(tarstream.Digester)
 			if !ok {

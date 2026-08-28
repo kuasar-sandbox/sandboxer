@@ -204,6 +204,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		}
 		bundleSource = &sandbox.BundleSourceBinding{
 			RootRef: physicalRef, RootPath: physicalPath, Refs: root.bundleReader.Refs(),
+			Reader: root.bundleReader, Fetcher: root.bundleFetcher,
 		}
 	}
 	memoryBinding := &sandbox.MemorySourceBinding{
@@ -1002,6 +1003,7 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 			}
 			source.bundleSource = &sandbox.BundleSourceBinding{
 				RootRef: physicalRef, RootPath: physicalPath, Refs: opened.BundleReader().Refs(),
+				Reader: opened.BundleReader(), Fetcher: opened.ManifestFetcher(),
 			}
 		} else {
 			scheme, digest := opened.Digest()

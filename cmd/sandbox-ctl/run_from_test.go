@@ -145,6 +145,9 @@ func TestOpenSandboxRunSourceManifestBundleDefaultAndExplicitRoot(t *testing.T) 
 			if source.BundleReader == nil || source.BundleFetcher == nil || source.BundleSource == nil {
 				t.Fatalf("Bundle source bindings are incomplete: %+v", source)
 			}
+			if source.BundleSource.Reader != source.BundleReader || source.BundleSource.Fetcher != source.BundleFetcher {
+				t.Fatal("Bundle source provenance is not paired with its reader/fetcher")
+			}
 			if !strings.Contains(source.PortableRef, "@manifest:"+rootKey) {
 				t.Fatalf("portable Bundle ref = %q", source.PortableRef)
 			}

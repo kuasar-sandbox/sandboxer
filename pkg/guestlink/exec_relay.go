@@ -60,8 +60,20 @@ func pipeConns(ctx context.Context, a, b net.Conn) {
 	}
 
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(a, b); closeWrite(a); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(b, a); closeWrite(b); done <- struct{}{} }()
+	copyOne := func(dst, src net.Conn) {
+		_, err := io.Copy(dst, src)
+		if err != nil {
+			// A local full close (capture/shutdown) surfaces as a copy error,
+			// unlike a peer's graceful EOF. Close both transports so a silent
+			// reverse exec session cannot strand the capture drain.
+			closeBoth()
+		} else {
+			closeWrite(dst)
+		}
+		done <- struct{}{}
+	}
+	go copyOne(a, b)
+	go copyOne(b, a)
 
 	for got := 0; got < 2; got++ {
 		select {
