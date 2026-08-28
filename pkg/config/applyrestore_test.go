@@ -63,6 +63,42 @@ func TestApplyRestoreRulesUsesReferencedSandboxAsImmutableC0(t *testing.T) {
 	}
 }
 
+func TestApplyRestoreRulesReappliesTargetAllocatablePolicy(t *testing.T) {
+	artifact := validPortableConfig()
+	artifactDeflate := true
+	artifact.Resources.Allocatable = AllocatableConfig{CPU: 1.5, Memory: "768MiB", DeflateOnOOM: &artifactDeflate}
+	before, err := MarshalPortableSandboxConfig(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := restoreHostConfig()
+	host.Resources.Capacity = artifact.Resources.Capacity
+	targetDeflate := false
+	host.Resources.Allocatable = AllocatableConfig{CPU: 1, Memory: "512MiB", DeflateOnOOM: &targetDeflate}
+	runtime, c0, err := ApplyRestoreRules(artifact, host, restorePresence("resources.capacity", "resources.allocatable"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Resources.Capacity != artifact.Resources.Capacity {
+		t.Fatalf("runtime capacity = %+v, want snapshot capacity %+v", runtime.Resources.Capacity, artifact.Resources.Capacity)
+	}
+	if runtime.Resources.Allocatable.CPU != 1 || runtime.Resources.Allocatable.Memory != "512MiB" ||
+		runtime.Resources.Allocatable.DeflateOnOOM == nil || *runtime.Resources.Allocatable.DeflateOnOOM {
+		t.Fatalf("runtime allocatable policy = %+v, want target-node policy", runtime.Resources.Allocatable)
+	}
+	if c0.Resources.Allocatable.CPU != 1.5 || c0.Resources.Allocatable.Memory != "768MiB" ||
+		c0.Resources.Allocatable.DeflateOnOOM == nil || !*c0.Resources.Allocatable.DeflateOnOOM {
+		t.Fatalf("immutable C0 allocatable = %+v, want artifact policy", c0.Resources.Allocatable)
+	}
+	after, err := MarshalPortableSandboxConfig(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("restore rules mutated the referenced Sandbox config")
+	}
+}
+
 func TestApplyRestoreRulesRejectsColdOnlyConfiguration(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -107,6 +143,15 @@ func TestApplyRestoreRulesRejectsResourceDiskAndNetworkConflicts(t *testing.T) {
 		host.Resources.Capacity = CapacityConfig{CPU: 8, Memory: "8GiB"}
 		_, _, err := ApplyRestoreRules(validPortableConfig(), host, restorePresence("resources.capacity"))
 		if err == nil || !strings.Contains(err.Error(), "resources.capacity conflicts") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("allocatable above snapshot capacity", func(t *testing.T) {
+		host := restoreHostConfig()
+		host.Resources.Allocatable = AllocatableConfig{CPU: 1, Memory: "8GiB"}
+		_, _, err := ApplyRestoreRules(validPortableConfig(), host, restorePresence("resources.allocatable"))
+		if err == nil || !strings.Contains(err.Error(), "resources.allocatable.memory must be > 0 and <= capacity.memory") {
 			t.Fatalf("error = %v", err)
 		}
 	})

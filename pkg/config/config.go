@@ -1285,7 +1285,8 @@ func validateFiles(field string, files []FileConfig) error {
 // ValidateRestoreHostConfig checks the host-only bindings and policies a
 // restore document can validate before Snapshot S is opened. S supplies only
 // memory provenance; its sandbox_ref selects E, which owns capacity, launch and
-// the immutable disk graph. ApplyRestoreRules performs the ownership checks.
+// the immutable disk graph. ApplyRestoreRules performs the ownership checks and
+// applies an explicitly supplied target-node allocatable policy.
 func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	if err := c.Restore.validate(); err != nil {
 		return err
@@ -1332,9 +1333,10 @@ func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 			return fmt.Errorf("resources.capacity.memory: %w", err)
 		}
 	}
-	// Allocatable and Startup are host policies. The referenced Sandbox owns
-	// their portable workload identities; ApplyRestoreRules checks any explicit
-	// portable values and applies Startup only to the node reservation policy.
+	// Allocatable and Startup are host policies. ApplyRestoreRules validates an
+	// explicit Allocatable against the referenced Sandbox capacity and applies it
+	// to this runtime without rewriting portable C0. Startup affects only the
+	// node reservation policy.
 	if c.Resources.Allocatable.Memory != "" {
 		allocMem, err := util.ParseSize(c.Resources.Allocatable.Memory)
 		if err != nil {

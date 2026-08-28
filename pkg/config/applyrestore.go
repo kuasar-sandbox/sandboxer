@@ -30,7 +30,7 @@ func ApplyRestoreRules(artifact *PortableSandboxConfig, host *SandboxConfig, pre
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := validateRestoreResourceIdentity(c0, host, presence); err != nil {
+	if err := validateRestoreResourcePolicy(c0, host, presence); err != nil {
 		return nil, nil, err
 	}
 	runtime := sandboxConfigFromPortable(c0)
@@ -44,7 +44,12 @@ func ApplyRestoreRules(artifact *PortableSandboxConfig, host *SandboxConfig, pre
 	}
 
 	// These fields control the replacement host process and do not claim to
-	// alter already-restored guest execution state.
+	// alter already-restored guest execution state. Allocatable is the target
+	// node's settled workload policy; applying it here leaves immutable C0 and
+	// the Budget captured in Snapshot S unchanged.
+	if presence.Any("resources.allocatable") {
+		runtime.Resources.Allocatable = cloneAllocatable(host.Resources.Allocatable)
+	}
 	runtime.Resources.Control = host.Resources.Control
 	runtime.Resources.Overhead = host.Resources.Overhead
 	runtime.Resources.WatermarkHigh = host.Resources.WatermarkHigh
@@ -97,25 +102,19 @@ func rejectRestoreColdOnly(host *SandboxConfig, presence FieldPresence) error {
 	return nil
 }
 
-func validateRestoreResourceIdentity(artifact *PortableSandboxConfig, host *SandboxConfig, presence FieldPresence) error {
+func validateRestoreResourcePolicy(artifact *PortableSandboxConfig, host *SandboxConfig, presence FieldPresence) error {
 	if presence.Any("resources.capacity") && host.Resources.Capacity != artifact.Resources.Capacity {
 		return fmt.Errorf("run --restore: resources.capacity conflicts with referenced Sandbox")
 	}
 	if presence.Any("resources.allocatable") {
-		want := artifact.Resources.Allocatable
-		got := host.Resources.Allocatable
-		if got.CPU != want.CPU || got.Memory != want.Memory || !sameOptionalBool(got.DeflateOnOOM, want.DeflateOnOOM) {
-			return fmt.Errorf("run --restore: resources.allocatable conflicts with referenced Sandbox")
+		candidate := *artifact
+		candidate.Resources = artifact.Resources
+		candidate.Resources.Allocatable = cloneAllocatable(host.Resources.Allocatable)
+		if err := candidate.Validate(); err != nil {
+			return fmt.Errorf("run --restore resources.allocatable: %w", err)
 		}
 	}
 	return nil
-}
-
-func sameOptionalBool(a, b *bool) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return *a == *b
 }
 
 func validateRestoreDiskBindings(artifact *PortableSandboxConfig, host *SandboxConfig, presence FieldPresence) error {
