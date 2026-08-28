@@ -317,11 +317,18 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 
 func (p *Publisher) publishSandboxRoot(ctx context.Context, identity string, scope publishScope, root *sandboxfile.Root) (string, error) {
 	defer root.Close()
+	refs := portableDiskRefs(root.Portable)
+	roles := make(map[string]bool, len(refs))
+	for _, dependency := range refs {
+		if rootImage, seen := roles[dependency.raw]; seen && rootImage != dependency.rootImage {
+			return "", fmt.Errorf("publish Sandbox dependency %q is used as both root image and disk layer", dependency.raw)
+		}
+		roles[dependency.raw] = dependency.rootImage
+	}
 	if err := p.enter("sandbox:" + identity); err != nil {
 		return "", err
 	}
 	defer p.leave("sandbox:" + identity)
-	refs := portableDiskRefs(root.Portable)
 	replacements := make(map[string]string, len(refs))
 	for i := len(refs) - 1; i >= 0; i-- {
 		raw := refs[i].raw

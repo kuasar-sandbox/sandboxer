@@ -246,6 +246,57 @@ func TestPublisherRejectsLiveSandboxUsedAsEROFSBase(t *testing.T) {
 	}
 }
 
+func TestPublisherRejectsDiskRefUsedWithConflictingRolesBeforeOutput(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	storage, err := NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	sink := snapshot.NewFileSink(dir, "fixture", nil, false, nil)
+
+	conflictingRef := "file://shared.sandbox@sha256:" + publishTestSHA
+	_, portable := publishPortable(t, "")
+	portable.Boot.Root = config.PortableRootConfig{
+		Base: conflictingRef,
+		Overlay: &config.PortableOverlayConfig{
+			Base: "self",
+		},
+	}
+	portable.Boot.Disks = []config.PortableDiskConfig{{
+		Name: "data",
+		PortableRootConfig: config.PortableRootConfig{
+			Base: conflictingRef,
+		},
+	}}
+	portable.Mounts = []config.MountConfig{{Target: "/data", Type: "disk", Source: "data"}}
+	runtimeConfig, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical, err := sandboxfile.BuildSource(
+		publishSource(t, bytes.Repeat([]byte{0x51}, 4096)), nil, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, path, err := sink.AbsorbSandbox(ctx, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := &recordingPublishTarget{}
+	publisher := newPublisher(storage, nil, target, nil)
+	_, err = publisher.Publish(ctx, path)
+	if err == nil || !strings.Contains(err.Error(), "both root image and disk layer") {
+		t.Fatalf("conflicting disk role error = %v", err)
+	}
+	if len(target.calls) != 0 {
+		t.Fatalf("conflicting graph emitted %d artifacts", len(target.calls))
+	}
+}
+
 func TestLocationPublisherCryptoAutoAndRequired(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()
