@@ -143,6 +143,47 @@ func TestPrepareSnapshotDependencyPreservesRootImageConfig(t *testing.T) {
 	}
 }
 
+func TestPrepareSnapshotDependencyPreservesSandboxRootImageConfig(t *testing.T) {
+	payload := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
+	payload[1024+12] = 12
+	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	want := &image.RuntimeConfig{Env: []string{"BUILT=yes"}, WorkingDir: "/home/user"}
+	imageConfig, err := want.MarshalDeterministic()
+	if err != nil {
+		t.Fatal(err)
+	}
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self", Overlay: &config.PortableOverlayConfig{}}
+	runtimeConfig, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical, err := sandboxfile.BuildSource(
+		sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), imageConfig, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, transformed, err := prepareSnapshotDependencyStream(
+		context.Background(), &lifecycleArtifactStream{Source: logical}, dependencyRootImage,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Close()
+	if !transformed {
+		t.Fatal("Sandbox root-image dependency was not rebuilt as a flattened image")
+	}
+	got, err := image.ReadConfig(fetch.NewReaderAt(context.Background(), prepared), int64(prepared.Size()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Sandbox root image config = %#v, want %#v", got, want)
+	}
+}
+
 func TestPreflightWritableExt4RejectsUnformattedExplicitDiff(t *testing.T) {
 	dir := t.TempDir()
 	diffPath := filepath.Join(dir, "upper.diff")

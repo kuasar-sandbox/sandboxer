@@ -20,6 +20,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
@@ -309,10 +310,61 @@ func OpenEROFSArtifact(ctx context.Context, stream fetch.Stream) (*FlattenedImag
 		return OpenFlattenedEROFS(ctx, stream)
 	}
 	owner := &streamOwner{stream: stream}
-	payload := &payloadStream{sectionStream: &sectionStream{owner: owner, size: erofsSize}}
+	var imageConfig []byte
+	if provider, ok := stream.(interface{ ImageConfigBytes() []byte }); ok {
+		imageConfig = provider.ImageConfigBytes()
+	}
+	payload := &payloadStream{
+		sectionStream: &sectionStream{owner: owner, size: erofsSize},
+		imageConfig:   append([]byte(nil), imageConfig...),
+	}
+	full := fetch.Stream(payload)
+	if imageConfig != nil {
+		tail, err := buildFlattenedImageConfigZIP(imageConfig)
+		if err != nil {
+			return nil, errors.Join(err, owner.Close())
+		}
+		if erofsSize > math.MaxUint64-uint64(len(tail)) {
+			return nil, errors.Join(errors.New("flattened image logical size overflow"), owner.Close())
+		}
+		source := &appendedSource{payload: payload, tail: tail, size: erofsSize + uint64(len(tail))}
+		full = &appendedStream{appendedSource: source, owner: owner}
+	}
 	return &FlattenedImage{
-		FullStream: payload, Payload: payload, ArchiveBase: erofsSize, owner: owner,
+		FullStream: full, Payload: payload, ImageConfig: append([]byte(nil), imageConfig...),
+		ArchiveBase: erofsSize, owner: owner,
 	}, nil
+}
+
+// buildFlattenedImageConfigZIP reproduces the accelerator flattened-image
+// trailer while preserving the exact config.json bytes carried beside a
+// Sandbox E payload.
+func buildFlattenedImageConfigZIP(imageConfig []byte) ([]byte, error) {
+	if len(imageConfig) == 0 || len(imageConfig) > MaxImageConfigBytes {
+		return nil, fmt.Errorf("flattened image config.json size %d is outside (0,%d]", len(imageConfig), MaxImageConfigBytes)
+	}
+	if !json.Valid(imageConfig) {
+		return nil, errors.New("flattened image config.json is not valid JSON")
+	}
+	var output bytes.Buffer
+	writer := zip.NewWriter(&output)
+	header := &zip.FileHeader{
+		Name: ImageConfigName, Method: zip.Store,
+		Modified: time.Date(1980, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+	entry, err := writer.CreateHeader(header)
+	if err != nil {
+		_ = writer.Close()
+		return nil, fmt.Errorf("flattened image ZIP create config.json: %w", err)
+	}
+	if _, err := entry.Write(imageConfig); err != nil {
+		_ = writer.Close()
+		return nil, fmt.Errorf("flattened image ZIP write config.json: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("flattened image ZIP close: %w", err)
+	}
+	return output.Bytes(), nil
 }
 
 // BuildSource appends the canonical strict ZIP using a background context.
@@ -985,6 +1037,13 @@ type appendedSource struct {
 	tail    []byte
 	size    uint64
 }
+
+type appendedStream struct {
+	*appendedSource
+	owner *streamOwner
+}
+
+func (s *appendedStream) Close() error { return s.owner.Close() }
 
 func (s *appendedSource) Size() uint64 { return s.size }
 
