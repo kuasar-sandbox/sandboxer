@@ -7,11 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	storeclient "github.com/kuasar-sandbox/accelerator/pkg/store/client"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
@@ -56,6 +59,97 @@ type manifestPublishTarget struct {
 	close func() error
 	logf  func(string, ...any)
 }
+
+type publishStoreObject struct {
+	generation store.Generation
+	partition  store.Partition
+	key        store.ContentKey
+}
+
+type publishPutFlight struct {
+	done  chan struct{}
+	isNew bool
+	err   error
+}
+
+// deduplicatingStoreWriter preserves the configured Store pool for distinct
+// objects while serializing concurrent writes of one physical object. The
+// filesystem Store accepts content-addressed dedup, but two same-key streams
+// can both pass Exists before either commit becomes visible. Coalescing at the
+// publisher boundary prevents that race without reducing graph upload
+// parallelism or changing the accelerator Store contract.
+type deduplicatingStoreWriter struct {
+	inner ingest.StoreWriter
+
+	mu      sync.Mutex
+	flights map[publishStoreObject]*publishPutFlight
+	onWait  func() // deterministic test barrier; nil in production
+}
+
+func newDeduplicatingStoreWriter(inner ingest.StoreWriter) *deduplicatingStoreWriter {
+	return &deduplicatingStoreWriter{
+		inner: inner, flights: make(map[publishStoreObject]*publishPutFlight),
+	}
+}
+
+func (w *deduplicatingStoreWriter) AdmitWrite(ctx context.Context) (store.WriteAdmission, error) {
+	return w.inner.AdmitWrite(ctx)
+}
+
+func (w *deduplicatingStoreWriter) PoolSize() int {
+	if sized, ok := w.inner.(interface{ PoolSize() int }); ok {
+		return sized.PoolSize()
+	}
+	return 1
+}
+
+func (w *deduplicatingStoreWriter) Put(ctx context.Context, admission store.WriteAdmission, partition store.Partition, key store.ContentKey, data []byte) (bool, error) {
+	object := publishStoreObject{generation: admission.Generation, partition: partition, key: key}
+	w.mu.Lock()
+	if flight := w.flights[object]; flight != nil {
+		onWait := w.onWait
+		w.mu.Unlock()
+		if onWait != nil {
+			onWait()
+		}
+		select {
+		case <-flight.done:
+			// Only the leader can have created the physical object. Followers
+			// are dedup hits even when the leader reports isNew=true.
+			return false, flight.err
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	flight := &publishPutFlight{done: make(chan struct{})}
+	w.flights[object] = flight
+	w.mu.Unlock()
+
+	flight.isNew, flight.err = w.inner.Put(ctx, admission, partition, key, data)
+	w.mu.Lock()
+	delete(w.flights, object)
+	close(flight.done)
+	w.mu.Unlock()
+	return flight.isNew, flight.err
+}
+
+type manifestPublishStoreWriter struct {
+	client     *storeclient.Client
+	generation store.Generation
+}
+
+func (w *manifestPublishStoreWriter) AdmitWrite(ctx context.Context) (store.WriteAdmission, error) {
+	if w.generation == "" {
+		return w.client.AdmitWrite(ctx)
+	}
+	return w.client.AdmitWriteFor(ctx, w.generation)
+}
+
+func (w *manifestPublishStoreWriter) Put(ctx context.Context, admission store.WriteAdmission, partition store.Partition, key store.ContentKey, data []byte) (bool, error) {
+	return w.client.Put(ctx, admission, partition, key, data)
+}
+
+func (w *manifestPublishStoreWriter) PoolSize() int { return w.client.PoolSize() }
 
 func (t *manifestPublishTarget) Put(ctx context.Context, role LogicalRole, source sparse.Source) (string, error) {
 	result, err := t.ing.Ingest(ctx, source, ingest.IngestOption{})
@@ -124,11 +218,29 @@ func NewManifestPublisher(storage *ProcessStorage, cfg *config.ManifestConfig, l
 	if storage.CustomerKeyFunc() == nil {
 		return nil, errors.New("publish: customer key resolver is required")
 	}
-	ing, err := cfg.NewIngester(storage.CustomerKeyFunc(), nil)
+	if cfg.Store.Endpoint == "" {
+		return nil, errors.New("manifest: store.endpoint required for ingest")
+	}
+	timeout, err := optionalDuration(cfg.Store.Timeout, "store.timeout")
 	if err != nil {
 		return nil, err
 	}
-	return newPublisher(storage, locations, &manifestPublishTarget{ing: ing, close: ing.Close, logf: logf}, logf), nil
+	client, err := storeclient.New(cfg.Store.Endpoint, cfg.Store.Pool, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: dial store: %w", err)
+	}
+	generation := store.Generation(cfg.Manifest.WriteGeneration)
+	if generation != "" {
+		if err := store.ValidateGeneration(generation); err != nil {
+			return nil, errors.Join(fmt.Errorf("manifest: write_generation: %w", err), client.Close())
+		}
+	}
+	writer := newDeduplicatingStoreWriter(&manifestPublishStoreWriter{client: client, generation: generation})
+	ing, err := cfg.NewIngesterWithWriter(storage.CustomerKeyFunc(), nil, writer)
+	if err != nil {
+		return nil, errors.Join(err, client.Close())
+	}
+	return newPublisher(storage, locations, &manifestPublishTarget{ing: ing, close: client.Close, logf: logf}, logf), nil
 }
 
 // NewLocationPublisher writes content-addressed tarstreams into one trusted
