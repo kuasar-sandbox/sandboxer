@@ -8,6 +8,7 @@ import (
 
 func restoreHostConfig() *SandboxConfig {
 	return &SandboxConfig{
+		Resources: ResourcesConfig{Control: ControlConfig{CgroupPath: "/sys/fs/cgroup/target"}},
 		Boot: BootConfig{
 			Kernel:  "file:///node/vmlinux",
 			Runtime: "file:///node/sandbox-runtime.bundle",
@@ -73,17 +74,19 @@ func TestApplyRestoreRulesReappliesTargetAllocatablePolicy(t *testing.T) {
 	}
 	host := restoreHostConfig()
 	host.Resources.Capacity = artifact.Resources.Capacity
-	targetDeflate := false
-	host.Resources.Allocatable = AllocatableConfig{CPU: 1, Memory: "512MiB", DeflateOnOOM: &targetDeflate}
-	runtime, c0, err := ApplyRestoreRules(artifact, host, restorePresence("resources.capacity", "resources.allocatable"))
+	host.Resources.Allocatable.Memory = "512MiB"
+	host.Resources.Control.CgroupPath = "/sys/fs/cgroup/target"
+	runtime, c0, err := ApplyRestoreRules(artifact, host, restorePresence(
+		"resources.capacity.cpu", "resources.capacity.memory", "resources.allocatable.memory",
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if runtime.Resources.Capacity != artifact.Resources.Capacity {
 		t.Fatalf("runtime capacity = %+v, want snapshot capacity %+v", runtime.Resources.Capacity, artifact.Resources.Capacity)
 	}
-	if runtime.Resources.Allocatable.CPU != 1 || runtime.Resources.Allocatable.Memory != "512MiB" ||
-		runtime.Resources.Allocatable.DeflateOnOOM == nil || *runtime.Resources.Allocatable.DeflateOnOOM {
+	if runtime.Resources.Allocatable.CPU != 1.5 || runtime.Resources.Allocatable.Memory != "512MiB" ||
+		runtime.Resources.Allocatable.DeflateOnOOM == nil || !*runtime.Resources.Allocatable.DeflateOnOOM {
 		t.Fatalf("runtime allocatable policy = %+v, want target-node policy", runtime.Resources.Allocatable)
 	}
 	if c0.Resources.Allocatable.CPU != 1.5 || c0.Resources.Allocatable.Memory != "768MiB" ||
@@ -141,7 +144,7 @@ func TestApplyRestoreRulesRejectsResourceDiskAndNetworkConflicts(t *testing.T) {
 	t.Run("capacity", func(t *testing.T) {
 		host := restoreHostConfig()
 		host.Resources.Capacity = CapacityConfig{CPU: 8, Memory: "8GiB"}
-		_, _, err := ApplyRestoreRules(validPortableConfig(), host, restorePresence("resources.capacity"))
+		_, _, err := ApplyRestoreRules(validPortableConfig(), host, restorePresence("resources.capacity.cpu"))
 		if err == nil || !strings.Contains(err.Error(), "resources.capacity conflicts") {
 			t.Fatalf("error = %v", err)
 		}
@@ -150,8 +153,32 @@ func TestApplyRestoreRulesRejectsResourceDiskAndNetworkConflicts(t *testing.T) {
 	t.Run("allocatable above snapshot capacity", func(t *testing.T) {
 		host := restoreHostConfig()
 		host.Resources.Allocatable = AllocatableConfig{CPU: 1, Memory: "8GiB"}
-		_, _, err := ApplyRestoreRules(validPortableConfig(), host, restorePresence("resources.allocatable"))
+		host.Resources.Control.CgroupPath = "/sys/fs/cgroup/target"
+		_, _, err := ApplyRestoreRules(validPortableConfig(), host, restorePresence("resources.allocatable.memory"))
 		if err == nil || !strings.Contains(err.Error(), "resources.allocatable.memory must be > 0 and <= capacity.memory") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("fractional allocatable without cgroup", func(t *testing.T) {
+		host := restoreHostConfig()
+		host.Resources.Control.CgroupPath = ""
+		host.Resources.Allocatable.CPU = 0.5
+		_, _, err := ApplyRestoreRules(validPortableConfig(), host, restorePresence("resources.allocatable.cpu"))
+		if err == nil || !strings.Contains(err.Error(), "must equal capacity.cpu") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("deflate on OOM", func(t *testing.T) {
+		artifact := validPortableConfig()
+		artifactDeflate := true
+		artifact.Resources.Allocatable.DeflateOnOOM = &artifactDeflate
+		host := restoreHostConfig()
+		targetDeflate := false
+		host.Resources.Allocatable.DeflateOnOOM = &targetDeflate
+		_, _, err := ApplyRestoreRules(artifact, host, restorePresence("resources.allocatable.deflate_on_oom"))
+		if err == nil || !strings.Contains(err.Error(), "deflate_on_oom conflicts") {
 			t.Fatalf("error = %v", err)
 		}
 	})
