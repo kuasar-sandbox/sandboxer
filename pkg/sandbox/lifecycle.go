@@ -2982,7 +2982,10 @@ func prepareSnapshotDependencyStream(ctx context.Context, stream fetch.Stream, r
 		if err != nil {
 			return nil, false, err
 		}
-		return image.Payload, sandboxLayer || image.Payload.Size() != originalSize, nil
+		// A root-image dependency remains a flattened image artifact. Its block
+		// consumer narrows to Payload later; publication must retain config.json
+		// so image defaults remain available to builders and cold starts.
+		return image.FullStream, sandboxLayer || image.FullStream.Size() != originalSize, nil
 	default:
 		return nil, false, errors.Join(fmt.Errorf("unsupported dependency role %d", role), stream.Close())
 	}

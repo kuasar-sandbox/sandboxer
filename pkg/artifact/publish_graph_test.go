@@ -3,15 +3,18 @@ package artifact
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
@@ -243,6 +246,149 @@ func TestPublisherRejectsLiveSandboxUsedAsEROFSBase(t *testing.T) {
 	}
 	if len(target.calls) != 0 {
 		t.Fatalf("invalid root image emitted %d artifacts", len(target.calls))
+	}
+}
+
+func TestPublisherPreservesRootImageConfig(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	storage, err := NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	sink := snapshot.NewFileSink(dir, "fixture", nil, false, nil)
+
+	rootImagePath := filepath.Join(dir, "root.erofs")
+	payload := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
+	payload[1024+12] = 12
+	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	if err := os.WriteFile(rootImagePath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := &image.RuntimeConfig{Env: []string{"BUILT=yes"}, WorkingDir: "/home/user"}
+	if err := image.AppendConfigZip(rootImagePath, want); err != nil {
+		t.Fatal(err)
+	}
+	flattened, err := os.ReadFile(rootImagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootImageRef, _, err := sink.AbsorbOverlaySource(ctx, publishSource(t, flattened))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, portable := publishPortable(t, "")
+	portable.Boot.Root = config.PortableRootConfig{
+		Base: rootImageRef,
+		Overlay: &config.PortableOverlayConfig{
+			Base: "self",
+		},
+	}
+	runtimeConfig, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical, err := sandboxfile.BuildSource(
+		publishSource(t, bytes.Repeat([]byte{0x42}, 4096)), nil, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sandboxPath, err := sink.AbsorbSandbox(ctx, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := &recordingPublishTarget{}
+	publisher := newPublisher(storage, nil, target, nil)
+	if _, err := publisher.Publish(ctx, sandboxPath); err != nil {
+		t.Fatal(err)
+	}
+	if len(target.calls) != 2 || target.calls[0].role != RoleOverlay {
+		t.Fatalf("publish calls = %+v", target.calls)
+	}
+	got, err := image.ReadConfig(bytes.NewReader(target.calls[0].body), int64(len(target.calls[0].body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("published root image config = %#v, want %#v", got, want)
+	}
+}
+
+func TestPublisherPreservesSandboxRootImageConfig(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	storage, err := NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	sink := snapshot.NewFileSink(dir, "fixture", nil, false, nil)
+
+	payload := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
+	payload[1024+12] = 12
+	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	want := &image.RuntimeConfig{Env: []string{"BUILT=yes"}, WorkingDir: "/home/user"}
+	imageConfig, err := want.MarshalDeterministic()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentRuntime, parentPortable := publishPortable(t, "")
+	parentPortable.Boot.Root = config.PortableRootConfig{Base: "self", Overlay: &config.PortableOverlayConfig{}}
+	parentRuntime, err = config.MarshalPortableSandboxConfig(parentPortable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentLogical, err := sandboxfile.BuildSource(publishSource(t, payload), imageConfig, parentRuntime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootImageRef, _, err := sink.AbsorbSandbox(ctx, parentLogical)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, portable := publishPortable(t, "")
+	portable.Boot.Root = config.PortableRootConfig{
+		Base: rootImageRef,
+		Overlay: &config.PortableOverlayConfig{
+			Base: "self",
+		},
+	}
+	runtimeConfig, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical, err := sandboxfile.BuildSource(
+		publishSource(t, bytes.Repeat([]byte{0x42}, 4096)), nil, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sandboxPath, err := sink.AbsorbSandbox(ctx, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := &recordingPublishTarget{}
+	publisher := newPublisher(storage, nil, target, nil)
+	if _, err := publisher.Publish(ctx, sandboxPath); err != nil {
+		t.Fatal(err)
+	}
+	if len(target.calls) != 2 || target.calls[0].role != RoleOverlay {
+		t.Fatalf("publish calls = %+v", target.calls)
+	}
+	got, err := image.ReadConfig(bytes.NewReader(target.calls[0].body), int64(len(target.calls[0].body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("published Sandbox root image config = %#v, want %#v", got, want)
 	}
 }
 

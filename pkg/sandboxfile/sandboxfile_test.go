@@ -360,6 +360,34 @@ func TestOpenEROFSArtifactAcceptsBarePayloadAndStripsFlattenedZIP(t *testing.T) 
 	}
 }
 
+func TestOpenEROFSArtifactRebuildsSandboxPayloadImageConfig(t *testing.T) {
+	payload := fakeEROFS()
+	imageConfig := []byte(`{"Architecture":"amd64","Os":"linux","Env":["BUILT=yes"],"WorkingDir":"/home/user"}`)
+	logical, err := BuildSource(dataSource(t, payload), imageConfig, erofsPortableBytes(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := Open(context.Background(), &closeStream{Source: logical})
+	if err != nil {
+		t.Fatal(err)
+	}
+	flattened, err := OpenEROFSArtifact(context.Background(), root.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer flattened.Close()
+	if flattened.Payload.Size() != uint64(len(payload)) || flattened.FullStream.Size() <= flattened.Payload.Size() {
+		t.Fatalf("rebuilt flattened image sizes = full %d payload %d", flattened.FullStream.Size(), flattened.Payload.Size())
+	}
+	base, got, err := parseFlattenedImageArchive(context.Background(), flattened.FullStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base != uint64(len(payload)) || !bytes.Equal(got, imageConfig) {
+		t.Fatalf("rebuilt flattened image = base %d config %q", base, got)
+	}
+}
+
 func TestSandboxRejectsDoubleZIPAndBadEROFS(t *testing.T) {
 	imageConfig := []byte(`{"Architecture":"amd64","Os":"linux"}`)
 	payload := fakeEROFS()

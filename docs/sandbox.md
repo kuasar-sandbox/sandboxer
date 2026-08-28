@@ -579,7 +579,7 @@ Restore host若显式提供 `boot.cmdline`、launch persistent/ephemeral fields�
 | Static cgroup | set | empty | 本地设置 CPU/memory limit,可运行 local sensor |
 | Dynamic | set | set | 通过 resource protocol admission/lease/Budget,并运行 local sensor |
 
-`resources.capacity` 是 guest-visible VM capacity,进入 Portable config. `resources.allocatable` 是 workload 默认值,也进入 Portable config;其中 `allocatable.cpu` 必须是有限数,且满足 `0 < allocatable.cpu <= capacity.cpu`. `control`、`overhead`、`watermark_high` 和 `startup` 是 node policy,不进入 E.
+`resources.capacity` 是 guest-visible VM capacity,进入 Portable config. `resources.allocatable` 是 cold start 的 workload 默认值,也进入 Portable config;其中 `allocatable.cpu` 必须是有限数,且满足 `0 < allocatable.cpu <= capacity.cpu`. Restore 保持 E 中的 capacity 和已捕获的 `deflate_on_oom`,但可以从目标节点显式重新应用 allocatable CPU/memory;该运行时 policy 不改写 E 或 C0. `control`、`overhead`、`watermark_high` 和 `startup` 是 node policy,不进入 E.
 
 Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Host ping gate 会让已入场探测完成 `pong` + guest EOF transport barrier;该排空独立受 8 s quiesce budget 约束,即使普通 `timeouts.ping` 关闭强制超时也不会无限阻塞捕获. 到期时 host cancel并join该探测,捕获失败后走完整 recovery. Guest quiesce 还会排空并暂停周期 `mem_report`,防止 S 捕获持有 stream lock、仍等待旧 host vsock 的 reporter. Restore 在 ACK 前切换到新 observation epoch;`--resume`/失败 attach 恢复原 epoch,live attach只重开pause gate且不破坏已入场报告的计数. Recovery 在 VM、MUX、app 和 backend 恢复后释放 host barrier.
 
@@ -593,7 +593,7 @@ Budget              = admitted/locally enforced working allowance
 VMM memory.max      = CapacityMemory + host overhead
 ```
 
-Memory S capture记录 CH config/state 和 memfd sparse content;资源 policy 不写入 `snapshot.cfg`. Restore capacity/allocatable identity来自 E,host若显式给出必须一致. `startup`、`overhead`、`watermark_high` 和 resource controller binding来自当前 host.
+Memory S capture记录 CH config/state 和 memfd sparse content;资源 policy 不写入 `snapshot.cfg`. Restore capacity identity来自 E,host若显式给出必须一致. Allocatable CPU/memory、`startup`、`overhead`、`watermark_high` 和 resource controller binding来自当前 host;`deflate_on_oom` 保持与已捕获 VMM state 一致;Snapshot 中的 `BudgetAtSnapshot` 仍是 restore initial Budget 的权威值.
 
 ### 4.3 CPU 与 balloon
 
@@ -784,7 +784,7 @@ Restore不会:
 - 把 E的 `config.json` 当成新的 process launch request;
 - 更新 memory parent或C0作为 re-snapshot side effect.
 
-Host-only允许项包括 network provider/current identity、cgroup/controller、resource enforcement、kernel/runtime actual path、active diff/template、restore prefetch和timeouts. Immutable disk graph、capacity/allocatable identity、network topology由E拥有.
+Host-only允许项包括 network provider/current identity、cgroup/controller、allocatable CPU/memory 与 resource enforcement、kernel/runtime actual path、active diff/template、restore prefetch和timeouts. Immutable disk graph、capacity identity、`deflate_on_oom`、network topology由E拥有.
 
 从 S0 restore后:
 
