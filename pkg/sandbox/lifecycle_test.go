@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
@@ -95,6 +98,48 @@ func TestPrepareSnapshotDependencyRejectsLiveSandboxAsRootImage(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "EROFS") {
 		t.Fatalf("root-image dependency error = %v", err)
+	}
+}
+
+func TestPrepareSnapshotDependencyPreservesRootImageConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "root.erofs")
+	payload := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
+	payload[1024+12] = 12
+	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := &image.RuntimeConfig{Env: []string{"BUILT=yes"}, WorkingDir: "/home/user"}
+	if err := image.AppendConfigZip(path, want); err != nil {
+		t.Fatal(err)
+	}
+	flattened, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := sparse.NewSource(bytes.NewReader(flattened), uint64(len(flattened)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, transformed, err := prepareSnapshotDependencyStream(
+		context.Background(),
+		&lifecycleArtifactStream{Source: source},
+		dependencyRootImage,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Close()
+	if transformed {
+		t.Fatal("ordinary flattened root image was transformed")
+	}
+	got, err := image.ReadConfig(fetch.NewReaderAt(context.Background(), prepared), int64(prepared.Size()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("root image config = %#v, want %#v", got, want)
 	}
 }
 
