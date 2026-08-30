@@ -126,10 +126,59 @@ func TestSnapshotMemorySectionPreservesManifestChunkRun(t *testing.T) {
 	if run.End() > uint64(len(memory)) {
 		t.Fatalf("Snapshot memory Run exposed ZIP tail: end=%d memory=%d", run.End(), len(memory))
 	}
+	chunk := run.(fetch.ChunkRun)
+	chunkCalls := getter.chunkCalls.Load()
+	window, err := source.resolveChunkWindow(chunk, chunkFaultFillBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if window.Offset() != 0 || window.End() != uint64(len(memory)) {
+		t.Fatalf("resolved memory window = [%d,%d), want [0,%d)", window.Offset(), window.End(), len(memory))
+	}
+	if got := getter.chunkCalls.Load(); got != chunkCalls {
+		t.Fatalf("metadata-only window resolution added %d payload Gets", got-chunkCalls)
+	}
 	if got := getter.chunkCalls.Load(); got == 0 {
 		// Opening the strict ZIP necessarily reads carrier data. This assertion
 		// only documents that the test exercised the manifest-backed carrier.
 		t.Fatal("opening Snapshot did not read its manifest chunk")
+	}
+}
+
+func TestStreamSnapshotSourceChunkWindowDoesNotExceedRAM(t *testing.T) {
+	plain := bytes.Repeat([]byte{0x27}, 4*PageSize)
+	hash := sha256.Sum256(plain)
+	stream, getter := openSnapshotManifest(t, &codec.Manifest{
+		Version:   codec.Version1,
+		ImageSize: uint64(len(plain)),
+		Entries: []codec.ChunkEntry{{
+			Offset:         0,
+			Size:           uint32(len(plain)),
+			CiphertextHash: hash,
+		}},
+	}, map[store.ContentKey][]byte{hash: plain})
+	const ramSize = 3 * PageSize
+	source, err := NewStreamSnapshotSource(stream, ramSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := source.RunAt(PageSize, 2*PageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, ok := run.(fetch.ChunkRun)
+	if !ok {
+		t.Fatalf("Run type %T lost fetch.ChunkRun", run)
+	}
+	window, err := source.resolveChunkWindow(chunk, chunkFaultFillBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if window != chunk || window.Offset() != PageSize || window.End() != ramSize {
+		t.Fatalf("raw-carrier RAM fallback = [%d,%d), want original [%d,%d)", window.Offset(), window.End(), PageSize, ramSize)
+	}
+	if got := getter.chunkCalls.Load(); got != 0 {
+		t.Fatalf("window resolution performed %d payload Gets", got)
 	}
 }
 

@@ -98,6 +98,37 @@ func (m *PageStateMap) RunLength(startIdx, max uint64, want PageState) uint64 {
 	return i - startIdx
 }
 
+// RunBounds returns the maximal consecutive range [startIdx,endIdx) equal to
+// want, containing anchorIdx and bounded by [minIdx,maxIdx). Both directions
+// are scanned under one read lock so the ChunkRun fault path does not acquire a
+// lock once per candidate page. If anchorIdx is out of range or does not equal
+// want, the returned range is empty at anchorIdx.
+func (m *PageStateMap) RunBounds(anchorIdx, minIdx, maxIdx uint64, want PageState) (startIdx, endIdx uint64) {
+	pageCount := uint64(len(m.pages))
+	if maxIdx > pageCount {
+		maxIdx = pageCount
+	}
+	if minIdx > anchorIdx || anchorIdx >= maxIdx || anchorIdx >= pageCount {
+		return anchorIdx, anchorIdx
+	}
+	wantByte := uint8(want)
+	m.mu.RLock()
+	if m.pages[anchorIdx] != wantByte {
+		m.mu.RUnlock()
+		return anchorIdx, anchorIdx
+	}
+	startIdx = anchorIdx
+	for startIdx > minIdx && m.pages[startIdx-1] == wantByte {
+		startIdx--
+	}
+	endIdx = anchorIdx + 1
+	for endIdx < maxIdx && m.pages[endIdx] == wantByte {
+		endIdx++
+	}
+	m.mu.RUnlock()
+	return startIdx, endIdx
+}
+
 // SetRangeIf changes each page in [startIdx,endIdx) that still equals old to
 // new and returns the number of pages changed. The conditional commit holds one
 // write lock, preventing a stale tail completion from overwriting a concurrent

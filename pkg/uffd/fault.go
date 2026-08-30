@@ -40,12 +40,14 @@ type tailTask struct {
 
 	run sparse.Run
 
-	uffdFD   int
-	dstVA    uint64
-	pageIdx  uint64
-	start    uint64
-	end      uint64
-	expected PageState
+	uffdFD      int
+	dstVA       uint64
+	pageIdx     uint64
+	start       uint64
+	end         uint64
+	bufferStart uint64
+	prefixStart uint64
+	expected    PageState
 }
 
 type urgentOutcome struct {
@@ -88,10 +90,11 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 }
 
 func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, pageBuf []byte) {
-	// Scan far enough to retain the fixed 64 KiB zero-fill unit. Data reads and
-	// guest population are independently capped at dataFaultFillBytes below.
-	hardEnd := h.stateHardEnd(pageOffset, pageIdx, StateAbsent, zeroFaultFillBytes)
-	if hardEnd-pageOffset < PageSize {
+	// Check the common 64 KiB state boundary before resolving source metadata.
+	// This rejects a stale Absent event without allocating a Run. ChunkRun alone
+	// performs a second, wider state scan after the single metadata lookup.
+	commonHardEnd := h.stateHardEnd(pageOffset, pageIdx, StateAbsent, ordinaryDataFaultFillBytes)
+	if commonHardEnd-pageOffset < PageSize {
 		// The fault was classified as Absent before entering this method,
 		// but a concurrent urgent or tail completion may have populated it
 		// before the run scan acquired the state lock. Converge that stale
@@ -105,12 +108,25 @@ func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint
 		h.failUrgent(uffdFD, pageVA, "no full Absent page at offset 0x%x", pageOffset)
 		return
 	}
-	run, err := h.cfg.Source.RunAt(pageOffset, hardEnd-pageOffset)
-	if err != nil {
-		h.failUrgent(uffdFD, pageVA, "source.RunAt off=0x%x limit=%d: %v", pageOffset, hardEnd-pageOffset, err)
+
+	// Cold-start memory is authoritative zero. Avoid constructing a sparse.Run
+	// interface value on every fault and retain the same 1+15 page fill policy.
+	if isZeroSource(h.cfg.Source) {
+		h.handleResolvedZeroFault(uffdFD, pageVA, pageOffset, pageIdx, StateAbsent, commonHardEnd)
 		return
 	}
-	if err := validateFaultRun(run, pageOffset, hardEnd); err != nil {
+
+	// Resolve metadata once within the common 64 KiB bound. Even a one-page
+	// forward anchor identifies ChunkRun without changing SnapshotReader; the
+	// optional root-visibility resolver may expand it around the fault only after
+	// the shared tail reservation succeeds.
+	// Ordinary Data and no-read runs remain bounded by commonHardEnd below.
+	run, err := h.cfg.Source.RunAt(pageOffset, commonHardEnd-pageOffset)
+	if err != nil {
+		h.failUrgent(uffdFD, pageVA, "source.RunAt off=0x%x limit=%d: %v", pageOffset, commonHardEnd-pageOffset, err)
+		return
+	}
+	if err := validateFaultRun(run, pageOffset, commonHardEnd); err != nil {
 		h.failUrgent(uffdFD, pageVA, "%v", err)
 		return
 	}
@@ -121,62 +137,154 @@ func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint
 
 	switch run.Kind() {
 	case sparse.Data:
-		if _, ok := run.(fetch.ChunkRun); ok {
-			h.handleChunkFault(uffdFD, pageVA, pageOffset, pageIdx, run, pageBuf)
+		if chunk, ok := run.(fetch.ChunkRun); ok {
+			h.handleChunkFault(uffdFD, pageVA, pageOffset, pageIdx, chunk, pageBuf)
 			return
 		}
-		h.handleOrdinaryDataFault(uffdFD, pageVA, pageOffset, pageIdx, run, pageBuf)
+		h.handleOrdinaryDataFault(uffdFD, pageVA, pageOffset, pageIdx, run, min(run.End(), commonHardEnd), pageBuf)
 	case sparse.Hole, sparse.Zero:
-		h.handleResolvedZeroFault(uffdFD, pageVA, pageOffset, pageIdx, StateAbsent, run.End())
+		h.handleResolvedZeroFault(uffdFD, pageVA, pageOffset, pageIdx, StateAbsent, min(run.End(), commonHardEnd))
 	}
 }
 
-func (h *Handler) handleChunkFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, run sparse.Run, pageBuf []byte) {
-	// Keep chunk fetch and guest population bounded to the urgent page plus
-	// one neighbor. Retaining decrypted chunk data is a separate cache design.
+func (h *Handler) handleChunkFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, anchor fetch.ChunkRun, pageBuf []byte) {
 	if !h.tryReserveTail() {
-		if err := h.readRun(run, pageBuf, 0); err != nil {
-			h.failUrgent(uffdFD, pageVA, "chunk urgent read off=0x%x: %v", pageOffset, err)
-			return
-		}
-		if _, err := h.urgentCopy(uffdFD, pageVA, pageIdx, StateAbsent, pageBuf); err != nil {
-			h.logf("uffd: COPY(chunk urgent) va=0x%x: %v", pageVA, err)
-			h.stats.errors.Add(1)
-		}
+		h.handleChunkUrgentOnly(uffdFD, pageVA, pageOffset, pageIdx, anchor, pageBuf)
 		return
 	}
 
-	runLength := min(run.End()-run.Offset(), uint64(len(h.tailBuf)))
-	if err := h.readRun(run, h.tailBuf[:runLength], 0); err != nil {
+	window := anchor
+	if source, ok := h.cfg.Source.(chunkWindowSource); ok {
+		resolved, err := source.resolveChunkWindow(anchor, chunkFaultFillBytes)
+		if err != nil {
+			h.logf("uffd: resolve ChunkRun window at 0x%x: %v; using anchor Run", pageOffset, err)
+		} else if validChunkWindow(resolved, pageOffset, uint64(len(h.tailBuf))) {
+			window = resolved
+		} else {
+			h.logf("uffd: invalid resolved ChunkRun window at 0x%x; using anchor Run", pageOffset)
+		}
+	}
+
+	fillStart, fillEnd, ok := h.chunkPopulationBounds(window, pageOffset, pageIdx)
+	if !ok || (fillStart == pageOffset && fillEnd == pageOffset+PageSize) {
 		h.releaseTail()
-		h.failUrgent(uffdFD, pageVA, "chunk read off=0x%x len=%d: %v", pageOffset, runLength, err)
+		h.handleChunkUrgentOnly(uffdFD, pageVA, pageOffset, pageIdx, anchor, pageBuf)
 		return
 	}
-	outcome, err := h.urgentCopy(uffdFD, pageVA, pageIdx, StateAbsent, h.tailBuf[:PageSize])
+
+	runLength := window.End() - window.Offset()
+	if runLength > uint64(len(h.tailBuf)) {
+		// Construction preallocates chunkFaultFillBytes for every non-zero
+		// source. Preserve urgent progress if a custom source violates that
+		// internal sizing invariant; never allocate or grow here.
+		h.releaseTail()
+		h.handleChunkUrgentOnly(uffdFD, pageVA, pageOffset, pageIdx, anchor, pageBuf)
+		return
+	}
+	if err := h.readRun(window, h.tailBuf[:runLength], 0); err != nil {
+		h.releaseTail()
+		h.failUrgent(uffdFD, pageVA, "chunk window read [%d,%d): %v", window.Offset(), window.End(), err)
+		return
+	}
+	urgentStart := pageOffset - window.Offset()
+	outcome, err := h.urgentCopy(
+		uffdFD,
+		pageVA,
+		pageIdx,
+		StateAbsent,
+		h.tailBuf[urgentStart:urgentStart+PageSize],
+	)
 	if err != nil {
 		h.releaseTail()
 		h.logf("uffd: COPY(chunk urgent) va=0x%x: %v", pageVA, err)
 		h.stats.errors.Add(1)
 		return
 	}
-	tailEnd := pageOffset + (runLength/PageSize)*PageSize
-	if !outcome.tailEligible || tailEnd <= pageOffset+PageSize {
+	if !outcome.tailEligible {
 		h.releaseTail()
 		return
 	}
 	task := tailTask{
-		kind:     tailBufferedData,
-		uffdFD:   uffdFD,
-		dstVA:    pageVA + PageSize,
-		pageIdx:  pageIdx + 1,
-		start:    pageOffset + PageSize,
-		end:      tailEnd,
-		expected: StateAbsent,
+		kind:        tailBufferedData,
+		uffdFD:      uffdFD,
+		dstVA:       pageVA + PageSize,
+		pageIdx:     pageIdx + 1,
+		start:       pageOffset + PageSize,
+		end:         fillEnd,
+		bufferStart: window.Offset(),
+		prefixStart: fillStart,
+		expected:    StateAbsent,
 	}
 	h.enqueueReservedTail(task)
 }
 
-func (h *Handler) handleOrdinaryDataFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, run sparse.Run, pageBuf []byte) {
+func validChunkWindow(window fetch.ChunkRun, pageOffset, bufferBytes uint64) bool {
+	if window == nil || window.Kind() != sparse.Data || window.End() <= window.Offset() {
+		return false
+	}
+	if window.Offset() > pageOffset || pageOffset > ^uint64(0)-PageSize || window.End() < pageOffset+PageSize {
+		return false
+	}
+	return window.End()-window.Offset() <= bufferBytes
+}
+
+func (h *Handler) chunkPopulationBounds(window fetch.ChunkRun, pageOffset, pageIdx uint64) (uint64, uint64, bool) {
+	fillStart := alignedPageStart(window.Offset())
+	fillEnd := alignedPageEnd(window.End())
+	ramEnd := alignedPageEnd(uint64(h.cfg.Size))
+	if fillEnd > ramEnd {
+		fillEnd = ramEnd
+	}
+	regionStart, regionEnd, ok := h.addrMap.CHRegionBounds(pageOffset)
+	if !ok {
+		return pageOffset, pageOffset + PageSize, false
+	}
+	regionStart = alignedPageStart(regionStart)
+	regionEnd = alignedPageEnd(regionEnd)
+	if fillStart < regionStart {
+		fillStart = regionStart
+	}
+	if fillEnd > regionEnd {
+		fillEnd = regionEnd
+	}
+	if fillStart > pageOffset || pageOffset > ^uint64(0)-PageSize || fillEnd < pageOffset+PageSize {
+		return pageOffset, pageOffset + PageSize, false
+	}
+	stateStart, stateEnd := h.state.RunBounds(
+		pageIdx,
+		fillStart/PageSize,
+		fillEnd/PageSize,
+		StateAbsent,
+	)
+	if stateStart == stateEnd {
+		return pageOffset, pageOffset + PageSize, false
+	}
+	return stateStart * PageSize, stateEnd * PageSize, true
+}
+
+func alignedPageStart(offset uint64) uint64 {
+	if remainder := offset % PageSize; remainder != 0 {
+		return offset + PageSize - remainder
+	}
+	return offset
+}
+
+func alignedPageEnd(offset uint64) uint64 {
+	return offset - offset%PageSize
+}
+
+func (h *Handler) handleChunkUrgentOnly(uffdFD int, pageVA, pageOffset, pageIdx uint64, run sparse.Run, pageBuf []byte) {
+	if err := h.readRun(run, pageBuf, 0); err != nil {
+		h.failUrgent(uffdFD, pageVA, "chunk urgent read off=0x%x: %v", pageOffset, err)
+		return
+	}
+	if _, err := h.urgentCopy(uffdFD, pageVA, pageIdx, StateAbsent, pageBuf); err != nil {
+		h.logf("uffd: COPY(chunk urgent) va=0x%x: %v", pageVA, err)
+		h.stats.errors.Add(1)
+	}
+}
+
+func (h *Handler) handleOrdinaryDataFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, run sparse.Run, fillEnd uint64, pageBuf []byte) {
 	if err := h.readRun(run, pageBuf, 0); err != nil {
 		h.failUrgent(uffdFD, pageVA, "data urgent read off=0x%x: %v", pageOffset, err)
 		return
@@ -190,7 +298,7 @@ func (h *Handler) handleOrdinaryDataFault(uffdFD int, pageVA, pageOffset, pageId
 	if !outcome.tailEligible {
 		return
 	}
-	tailEnd := alignedRunEnd(pageOffset, run.End())
+	tailEnd := alignedRunEnd(pageOffset, fillEnd)
 	if tailEnd <= pageOffset+PageSize {
 		return
 	}
@@ -245,15 +353,17 @@ func (h *Handler) handleResolvedZeroFault(uffdFD int, pageVA, pageOffset, pageId
 }
 
 func (h *Handler) stateHardEnd(pageOffset, pageIdx uint64, expected PageState, maxFillBytes uint64) uint64 {
+	hardEnd := h.addressHardEnd(pageOffset, maxFillBytes)
+	maxPages := (hardEnd - pageOffset) / PageSize
+	pages := h.state.RunLength(pageIdx, maxPages, expected)
+	return pageOffset + pages*PageSize
+}
+
+func (h *Handler) addressHardEnd(pageOffset, maxFillBytes uint64) uint64 {
 	if pageOffset >= uint64(h.cfg.Size) {
 		return pageOffset
 	}
-	maxPages := maxFillBytes / PageSize
-	pages := h.state.RunLength(pageIdx, maxPages, expected)
-	length := pages * PageSize
-	if remaining := uint64(h.cfg.Size) - pageOffset; length > remaining {
-		length = remaining
-	}
+	length := min(maxFillBytes, uint64(h.cfg.Size)-pageOffset)
 	if remaining, ok := h.addrMap.CHRegionRemaining(pageOffset, length); ok && remaining < length {
 		length = remaining
 	}
@@ -476,9 +586,19 @@ func (h *Handler) runTailWorker() {
 }
 
 func (h *Handler) processTail(task tailTask) {
-	maxTailBytes := uint64(dataNeighborTailBytes)
-	if task.kind == tailZero {
+	if task.kind == tailBufferedData {
+		h.processBufferedTail(task)
+		return
+	}
+
+	var maxTailBytes uint64
+	switch task.kind {
+	case tailDeferredData:
+		maxTailBytes = ordinaryDataNeighborTailBytes
+	case tailZero:
 		maxTailBytes = zeroNeighborTailBytes
+	default:
+		return
 	}
 	maxPages := min((task.end-task.start)/PageSize, maxTailBytes/PageSize)
 	statePages := h.state.RunLength(task.pageIdx, maxPages, task.expected)
@@ -494,8 +614,6 @@ func (h *Handler) processTail(task tailTask) {
 
 	var data []byte
 	switch task.kind {
-	case tailBufferedData:
-		data = h.tailBuf[PageSize : PageSize+length]
 	case tailDeferredData:
 		data = h.tailBuf[:length]
 		innerOffset := task.start - task.run.Offset()
@@ -527,6 +645,105 @@ func (h *Handler) processTail(task tailTask) {
 
 	h.stats.tailPlanned.Add(length / PageSize)
 	h.executeTailIO(task, data, length)
+}
+
+func (h *Handler) processBufferedTail(task tailTask) {
+	if task.start < PageSize || task.end < task.start {
+		return
+	}
+	faultOffset := task.start - PageSize
+	if task.bufferStart > task.prefixStart || task.prefixStart > faultOffset {
+		return
+	}
+	prefixLength := faultOffset - task.prefixStart
+	suffixLength := task.end - task.start
+	if prefixLength > chunkNeighborTailBytes || suffixLength > chunkNeighborTailBytes-prefixLength {
+		return
+	}
+	if !h.processBufferedSuffix(task) {
+		return
+	}
+	h.processBufferedPrefix(task, faultOffset)
+}
+
+// processBufferedSuffix preserves the natural nearest-to-farthest kernel
+// prefix semantics. If state changed since the fault worker planned the task,
+// copy the still-valid adjacent prefix once and stop the whole tail afterwards.
+func (h *Handler) processBufferedSuffix(task tailTask) bool {
+	length := task.end - task.start
+	if length == 0 {
+		return true
+	}
+	requestedPages := length / PageSize
+	statePages := h.state.RunLength(task.pageIdx, requestedPages, task.expected)
+	if statePages == 0 {
+		h.stats.tailConflicts.Add(1)
+		return false
+	}
+	stateChanged := statePages < requestedPages
+	if stateChanged {
+		length = statePages * PageSize
+		h.stats.tailConflicts.Add(1)
+	}
+	data, ok := h.bufferedTailData(task.bufferStart, task.start, task.start+length)
+	if !ok {
+		return false
+	}
+	h.stats.tailPlanned.Add(length / PageSize)
+	_, full := h.executeTailIO(task, data, length)
+	return full && !stateChanged
+}
+
+// processBufferedPrefix scans backward from the page adjacent to the fault.
+// If state changed since planning, it copies the still-valid adjacent suffix
+// after the first mismatch and abandons everything farther away. UFFDIO_COPY
+// itself still runs in ascending address order; any kernel partial completion
+// is committed as reported and is never retried.
+func (h *Handler) processBufferedPrefix(task tailTask, faultOffset uint64) bool {
+	if faultOffset == task.prefixStart {
+		return true
+	}
+	faultPageIdx := faultOffset / PageSize
+	plannedStartIdx := task.prefixStart / PageSize
+	startIdx, endIdx := h.state.RunBounds(
+		faultPageIdx-1,
+		plannedStartIdx,
+		faultPageIdx,
+		task.expected,
+	)
+	if startIdx == endIdx || endIdx != faultPageIdx {
+		h.stats.tailConflicts.Add(1)
+		return false
+	}
+	if startIdx > plannedStartIdx {
+		h.stats.tailConflicts.Add(1)
+	}
+	start := startIdx * PageSize
+	length := faultOffset - start
+	pages := length / PageSize
+	data, ok := h.bufferedTailData(task.bufferStart, start, faultOffset)
+	if !ok || task.dstVA < PageSize {
+		return false
+	}
+	faultVA := task.dstVA - PageSize
+	if faultVA < length {
+		return false
+	}
+	prefixTask := task
+	prefixTask.dstVA = faultVA - length
+	prefixTask.pageIdx = startIdx
+	prefixTask.start = start
+	prefixTask.end = faultOffset
+	h.stats.tailPlanned.Add(pages)
+	_, full := h.executeTailIO(prefixTask, data, length)
+	return full
+}
+
+func (h *Handler) bufferedTailData(bufferStart, start, end uint64) ([]byte, bool) {
+	if start < bufferStart || end < start || end-bufferStart > uint64(len(h.tailBuf)) {
+		return nil, false
+	}
+	return h.tailBuf[start-bufferStart : end-bufferStart], true
 }
 
 func (h *Handler) executeTailIO(task tailTask, data []byte, length uint64) (uint64, bool) {

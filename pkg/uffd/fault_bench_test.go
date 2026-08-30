@@ -98,8 +98,8 @@ func BenchmarkUFFDFaultStrategies(b *testing.B) {
 	}
 	strategies := []benchmarkFaultStrategy{
 		benchmarkSyncFullBatch,
-		benchmarkFaultFirstOnly,
 		benchmarkFaultFirstTail,
+		benchmarkFaultFirstOnly,
 	}
 	for _, fixture := range fixtures {
 		fixture := fixture
@@ -174,7 +174,7 @@ func benchmarkFaultStrategyRun(b *testing.B, fixture benchmarkSnapshotFixture, p
 
 func benchmarkFaultOffset(size uint64, random bool, iteration uint64, seed *uint64) uint64 {
 	// Keep the 1 MiB query inside the fixture so the former full-batch strategy
-	// remains comparable while the current serial-tail strategy is fixed at 8 KiB.
+	// remains comparable with the current source-aware serial-tail bounds.
 	offsetSpan := size
 	if size > benchmarkBatchBytes {
 		offsetSpan = size - benchmarkBatchBytes + PageSize
@@ -192,6 +192,20 @@ func benchmarkFaultOffset(size uint64, random bool, iteration uint64, seed *uint
 }
 
 func benchmarkResolveFault(ctx context.Context, source SnapshotReader, offset uint64, strategy benchmarkFaultStrategy, buf []byte) (uint64, uint64, error) {
+	if isZeroSource(source) {
+		switch strategy {
+		case benchmarkSyncFullBatch:
+			benchmarkPopulationSink.Add(benchmarkBatchBytes)
+			return 0, benchmarkBatchBytes, nil
+		case benchmarkFaultFirstOnly:
+			benchmarkPopulationSink.Add(PageSize)
+			return 0, PageSize, nil
+		case benchmarkFaultFirstTail:
+			benchmarkPopulationSink.Add(zeroFaultFillBytes)
+			return 0, zeroFaultFillBytes, nil
+		}
+	}
+
 	run, err := source.RunAt(offset, benchmarkBatchBytes)
 	if err != nil {
 		return 0, 0, err
@@ -229,6 +243,15 @@ func benchmarkResolveFault(ctx context.Context, source SnapshotReader, offset ui
 	}
 	switch strategy {
 	case benchmarkSyncFullBatch:
+		if anchor, ok := run.(fetch.ChunkRun); ok {
+			// ChunkRun's irreducible source unit is the final-visible chunk
+			// window for both the synchronous control and the serial-tail
+			// strategy. Comparing the old forward fragment (about half a chunk
+			// for these offsets) with C's whole chunk would turn a byte-volume
+			// difference into a false critical-path regression. Real UFFD wake
+			// scheduling is intentionally outside this no-ioctl harness.
+			return benchmarkReadChunkWindow(ctx, source, anchor, offset, buf)
+		}
 		if err := read(buf[:aligned], 0); err != nil {
 			return 0, 0, err
 		}
@@ -241,18 +264,13 @@ func benchmarkResolveFault(ctx context.Context, source SnapshotReader, offset ui
 		benchmarkPopulationSink.Add(PageSize)
 		return PageSize, PageSize, nil
 	case benchmarkFaultFirstTail:
-		if _, ok := run.(fetch.ChunkRun); ok {
-			fill := min(uint64(dataFaultFillBytes), aligned)
-			if err := read(buf[:fill], 0); err != nil {
-				return 0, 0, err
-			}
-			benchmarkPopulationSink.Add(fill)
-			return fill, fill, nil
+		if anchor, ok := run.(fetch.ChunkRun); ok {
+			return benchmarkReadChunkWindow(ctx, source, anchor, offset, buf)
 		}
 		if err := read(buf[:PageSize], 0); err != nil {
 			return 0, 0, err
 		}
-		tail := min(uint64(dataNeighborTailBytes), aligned-PageSize)
+		tail := min(uint64(ordinaryDataNeighborTailBytes), aligned-PageSize)
 		if tail > 0 {
 			if err := read(buf[:tail], PageSize); err != nil {
 				return 0, 0, err
@@ -263,6 +281,51 @@ func benchmarkResolveFault(ctx context.Context, source SnapshotReader, offset ui
 	default:
 		return 0, 0, fmt.Errorf("unknown benchmark strategy %d", strategy)
 	}
+}
+
+func benchmarkReadChunkWindow(
+	ctx context.Context,
+	source SnapshotReader,
+	anchor fetch.ChunkRun,
+	faultOffset uint64,
+	buf []byte,
+) (uint64, uint64, error) {
+	window := anchor
+	if resolver, ok := source.(chunkWindowSource); ok {
+		resolved, err := resolver.resolveChunkWindow(anchor, chunkFaultFillBytes)
+		if err != nil {
+			return 0, 0, err
+		}
+		if validChunkWindow(resolved, faultOffset, uint64(len(buf))) {
+			window = resolved
+		}
+	}
+	windowBytes := window.End() - window.Offset()
+	if windowBytes > uint64(len(buf)) {
+		return 0, 0, fmt.Errorf("benchmark ChunkRun window is %d bytes, buffer is %d", windowBytes, len(buf))
+	}
+	n, err := window.ReadAt(ctx, buf[:windowBytes], 0)
+	if err != nil {
+		return uint64(n), 0, err
+	}
+	if uint64(n) != windowBytes {
+		return uint64(n), 0, io.ErrUnexpectedEOF
+	}
+	faultInner := faultOffset - window.Offset()
+	benchmarkDataSink.Store(uint32(buf[faultInner]))
+	fillStart := alignedPageStart(window.Offset())
+	fillEnd := alignedPageEnd(window.End())
+	if fillStart > faultOffset || fillEnd < faultOffset+PageSize {
+		return windowBytes, 0, fmt.Errorf(
+			"benchmark ChunkRun window [%d,%d) has no full fault page at %d",
+			window.Offset(),
+			window.End(),
+			faultOffset,
+		)
+	}
+	population := fillEnd - fillStart
+	benchmarkPopulationSink.Add(population)
+	return windowBytes, population, nil
 }
 
 var benchmarkPopulationSink atomic.Uint64

@@ -139,6 +139,27 @@ func (m *AddressMap) CHRegionRemaining(memfdOffset, reqLen uint64) (uint64, bool
 	return reqLen, false
 }
 
+// CHRegionBounds returns the memfd interval [start,end) covered by the one
+// CH-side UFFD region containing memfdOffset. A bidirectional fill must remain
+// within this interval because split CH regions have distinct, non-contiguous
+// virtual addresses and userfaultfds.
+func (m *AddressMap) CHRegionBounds(memfdOffset uint64) (start, end uint64, ok bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for i := range m.vmas {
+		v := &m.vmas[i]
+		if v.process != ProcessCH {
+			continue
+		}
+		size := v.end - v.start
+		regionEnd := v.memfdOffset + size
+		if memfdOffset >= v.memfdOffset && memfdOffset < regionEnd {
+			return v.memfdOffset, regionEnd, true
+		}
+	}
+	return 0, 0, false
+}
+
 // BackendVAFor returns the backendVA address that corresponds to the
 // given memfd offset (for issuing a reciprocal madvise(DONTNEED) on
 // backend mm in response to EVENT_REMOVE on a CH-side VMA). Returns

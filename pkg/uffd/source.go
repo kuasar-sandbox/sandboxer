@@ -21,6 +21,15 @@ type SnapshotReader interface {
 // speculative window: every returned Zero Run is bounded exactly by limit.
 type ZeroSource struct{}
 
+func isZeroSource(source SnapshotReader) bool {
+	switch source.(type) {
+	case ZeroSource, *ZeroSource:
+		return true
+	default:
+		return false
+	}
+}
+
 func (ZeroSource) RunAt(memfdOffset, limit uint64) (sparse.Run, error) {
 	if limit == 0 {
 		return nil, fmt.Errorf("uffd: zero source: limit must be non-zero")
