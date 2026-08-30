@@ -172,15 +172,17 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, err
 	}
 	snapCfg := *merged
-	identities, err := sandbox.ResolvePortableProjection(&snapCfg)
+	// Only the kernel identity re-hash is skipped (issue #158): SHA-256 over
+	// the whole vmlinux costs a fixed ~60ms on every restore while production
+	// nodes deploy kernel artifacts under central control. The runtime bundle
+	// check is kept: its digest marker sits in the ZIP footer and is read
+	// without scanning the artifact.
+	runtimeRef, err := sandbox.ResolveRuntimeProjection(&snapCfg)
 	if err != nil {
 		return -1, err
 	}
-	if c0.Boot.Kernel != identities.KernelRef {
-		return -1, fmt.Errorf("boot.kernel identity mismatch: portable %s, host %s", c0.Boot.Kernel, identities.KernelRef)
-	}
-	if c0.Boot.Runtime != identities.RuntimeRef {
-		return -1, fmt.Errorf("boot.runtime identity mismatch: portable %s, host %s", c0.Boot.Runtime, identities.RuntimeRef)
+	if c0.Boot.Runtime != runtimeRef {
+		return -1, fmt.Errorf("boot.runtime identity mismatch: portable %s, host %s", c0.Boot.Runtime, runtimeRef)
 	}
 	if err := config.BindPortableDiskGraph(&snapCfg, sandboxSource.RuntimeRef, sandboxSource.RelativeDir); err != nil {
 		return -1, fmt.Errorf("Sandbox source binding: %w", err)

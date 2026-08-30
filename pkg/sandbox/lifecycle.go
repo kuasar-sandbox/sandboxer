@@ -194,10 +194,6 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if err := canonicalizeConfiguredTarRefsWithOpener(ctx, opts.Cfg, opts.RefLocations, opts.LocalCodec, opts.LocalRequired, fileOpener); err != nil {
 		return -1, fmt.Errorf("portable disk refs: %w", err)
 	}
-	identities, err := ResolvePortableProjection(opts.Cfg)
-	if err != nil {
-		return -1, err
-	}
 	needsManifest := needsManifestFetcher(opts.Cfg)
 	if needsManifest {
 		if opts.Fetcher == nil {
@@ -224,12 +220,30 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		if err := opts.Cfg.ValidateCold(); err != nil {
 			return -1, fmt.Errorf("materialized config: %w", err)
 		}
+		// The identity projection is only needed to record the digest into
+		// the portable config (the format requires a content identity).
+		// Resuming from an existing portable config deliberately skips the
+		// re-hash (issue #158): it costs a fixed ~60ms per boot for a check
+		// that centrally-managed deployments do not need.
+		identities, err := ResolvePortableProjection(opts.Cfg)
+		if err != nil {
+			return -1, err
+		}
 		c0, err = config.ProjectPortableCold(opts.Cfg, identities)
 		if err != nil {
 			return -1, fmt.Errorf("project portable C0: %w", err)
 		}
-	} else if err := verifyPortableBindings(c0, identities); err != nil {
-		return -1, err
+	} else {
+		// Only the runtime bundle identity is re-checked here: its digest
+		// marker lives in the ZIP footer and is read without scanning the
+		// artifact. The kernel re-hash is skipped (issue #158).
+		runtimeRef, err := ResolveRuntimeProjection(opts.Cfg)
+		if err != nil {
+			return -1, err
+		}
+		if c0.Boot.Runtime != runtimeRef {
+			return -1, fmt.Errorf("boot.runtime identity mismatch: portable %s, host %s", c0.Boot.Runtime, runtimeRef)
+		}
 	}
 
 	runDir := filepath.Join(opts.RuntimeRoot, opts.SandboxID)
@@ -662,6 +676,19 @@ func ResolvePortableProjection(cfg *config.SandboxConfig) (config.PortableProjec
 	return config.PortableProjection{KernelRef: kernelRef, RuntimeRef: runtimeRef}, nil
 }
 
+// ResolveRuntimeProjection verifies the host runtime bundle identity only.
+// It reads the digest marker at the bundle's ZIP footer and never scans the
+// artifact, so it stays on the restore and portable-config boot paths where
+// the full projection (whose kernel SHA-256 costs a fixed ~60ms) is skipped
+// per issue #158.
+func ResolveRuntimeProjection(cfg *config.SandboxConfig) (string, error) {
+	runtimeRef, err := buildRuntimeRef(cfg.Boot.Runtime)
+	if err != nil {
+		return "", fmt.Errorf("boot.runtime identity: %w", err)
+	}
+	return runtimeRef, nil
+}
+
 // PrepareOfflinePortableConfig validates and canonicalizes an explicit config
 // for offline flattened-EROFS export, then replaces its root graph with the
 // direct EROFS self layout.
@@ -680,16 +707,6 @@ func PrepareOfflinePortableConfig(ctx context.Context, cfg *config.SandboxConfig
 		return nil, err
 	}
 	return config.NewPortableEROFS(cfg, identities)
-}
-
-func verifyPortableBindings(c0 *config.PortableSandboxConfig, actual config.PortableProjection) error {
-	if c0.Boot.Kernel != actual.KernelRef {
-		return fmt.Errorf("boot.kernel identity mismatch: portable %s, host %s", c0.Boot.Kernel, actual.KernelRef)
-	}
-	if c0.Boot.Runtime != actual.RuntimeRef {
-		return fmt.Errorf("boot.runtime identity mismatch: portable %s, host %s", c0.Boot.Runtime, actual.RuntimeRef)
-	}
-	return nil
 }
 
 func buildKernelRef(uri string) (string, error) {
