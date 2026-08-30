@@ -19,6 +19,13 @@ type StreamSnapshotSource struct {
 	ramSize uint64
 }
 
+// chunkWindowSource is the package-local optional capability used only by the
+// manifest ChunkRun fault path. SnapshotReader stays unchanged; custom readers
+// that cannot supply root layered visibility retain the safe forward Run.
+type chunkWindowSource interface {
+	resolveChunkWindow(anchor fetch.ChunkRun, maxBytes uint64) (fetch.ChunkRun, error)
+}
+
 // NewStreamSnapshotSource binds stream's memory prefix to a SnapshotReader.
 // Read cancellation is supplied by the Handler to sparse.Run.ReadAt, so the
 // source does not capture a separate context.
@@ -33,6 +40,21 @@ func NewStreamSnapshotSource(stream fetch.Stream, ramSize uint64) (*StreamSnapsh
 		return nil, fmt.Errorf("uffd: ramSize %d exceeds bundle size %d", ramSize, stream.Size())
 	}
 	return &StreamSnapshotSource{stream: stream, ramSize: ramSize}, nil
+}
+
+func (s *StreamSnapshotSource) resolveChunkWindow(anchor fetch.ChunkRun, maxBytes uint64) (fetch.ChunkRun, error) {
+	window, err := fetch.ResolveChunkWindow(s.stream, anchor, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	// The SnapshotReader contract is bounded by RAM even when a caller binds a
+	// raw carrier Stream instead of snapshotfile's memory section. Do not read
+	// carrier bytes after RAM merely to expand a ChunkRun; the original anchor
+	// is already clipped by RunAt and remains the safe fallback.
+	if window.End() > s.ramSize {
+		return anchor, nil
+	}
+	return window, nil
 }
 
 // RunAt implements SnapshotReader. It never reads payload data.

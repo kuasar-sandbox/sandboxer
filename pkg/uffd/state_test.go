@@ -2,48 +2,26 @@ package uffd
 
 import "testing"
 
-func TestPageStateRunLength(t *testing.T) {
-	m := NewPageStateMap(8)
-	m.SetRange(2, 5, StateReleased)
-	for _, tt := range []struct {
-		name       string
-		start, max uint64
-		wantState  PageState
-		want       uint64
-	}{
-		{name: "absent prefix", start: 0, max: 8, wantState: StateAbsent, want: 2},
-		{name: "released run", start: 2, max: 8, wantState: StateReleased, want: 3},
-		{name: "max bound", start: 2, max: 2, wantState: StateReleased, want: 2},
-		{name: "mismatch", start: 2, max: 4, wantState: StateAbsent, want: 0},
-		{name: "end clamp", start: 5, max: 99, wantState: StateAbsent, want: 3},
-		{name: "past end", start: 8, max: 1, wantState: StateAbsent, want: 0},
-		{name: "zero max", start: 0, max: 0, wantState: StateAbsent, want: 0},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := m.RunLength(tt.start, tt.max, tt.wantState); got != tt.want {
-				t.Fatalf("RunLength(%d,%d,%v) = %d, want %d", tt.start, tt.max, tt.wantState, got, tt.want)
-			}
-		})
-	}
-}
+func TestPageStateRunBounds(t *testing.T) {
+	m := NewPageStateMap(12)
+	m.SetRange(0, 12, StateAbsent)
+	m.Set(2, StateLoaded)
+	m.Set(9, StateReleased)
 
-func TestPageStateSetRangeIf(t *testing.T) {
-	m := NewPageStateMap(6)
-	m.Set(2, StateReleased)
-	m.Set(4, StateLoaded)
-	if changed := m.SetRangeIf(0, 9, StateAbsent, StateLoaded); changed != 4 {
-		t.Fatalf("changed = %d, want 4", changed)
+	start, end := m.RunBounds(6, 1, 11, StateAbsent)
+	if start != 3 || end != 9 {
+		t.Fatalf("RunBounds = [%d,%d), want [3,9)", start, end)
 	}
-	want := []PageState{StateLoaded, StateLoaded, StateReleased, StateLoaded, StateLoaded, StateLoaded}
-	for page, state := range want {
-		if got := m.Get(uint64(page)); got != state {
-			t.Fatalf("page %d = %v, want %v", page, got, state)
-		}
+	start, end = m.RunBounds(6, 5, 8, StateAbsent)
+	if start != 5 || end != 8 {
+		t.Fatalf("bounded RunBounds = [%d,%d), want [5,8)", start, end)
 	}
-	if changed := m.SetRangeIf(2, 3, StateAbsent, StateLoaded); changed != 0 {
-		t.Fatalf("stale tail changed Released page: %d", changed)
+	start, end = m.RunBounds(2, 0, 12, StateAbsent)
+	if start != 2 || end != 2 {
+		t.Fatalf("mismatched RunBounds = [%d,%d), want empty at 2", start, end)
 	}
-	if changed := m.SetRangeIf(6, 8, StateAbsent, StateLoaded); changed != 0 {
-		t.Fatalf("out-of-range change count = %d", changed)
+	start, end = m.RunBounds(12, 0, 20, StateAbsent)
+	if start != 12 || end != 12 {
+		t.Fatalf("out-of-range RunBounds = [%d,%d), want empty at 12", start, end)
 	}
 }

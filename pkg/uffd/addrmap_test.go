@@ -45,3 +45,18 @@ func TestAddressMapLocateRejectsBackendOnlyVA(t *testing.T) {
 		t.Fatalf("Locate accepted backend-only VA with offset 0x%x", got)
 	}
 }
+
+func TestAddressMapCHRegionBounds(t *testing.T) {
+	const memfdLen = 8 * PageSize
+	m := NewAddressMap(memfdLen)
+	if err := m.RegisterVMA(ProcessCH, 0x200000, 3*PageSize, 2*PageSize); err != nil {
+		t.Fatal(err)
+	}
+	start, end, ok := m.CHRegionBounds(4 * PageSize)
+	if !ok || start != 2*PageSize || end != 5*PageSize {
+		t.Fatalf("CHRegionBounds = [%d,%d),%v, want [%d,%d),true", start, end, ok, 2*PageSize, 5*PageSize)
+	}
+	if _, _, ok := m.CHRegionBounds(PageSize); ok {
+		t.Fatal("CHRegionBounds found an offset outside every CH region")
+	}
+}

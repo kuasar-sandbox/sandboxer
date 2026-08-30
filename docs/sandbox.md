@@ -813,7 +813,59 @@ CH为同一 restored memory mapping注册 missing-page events. Host通过 restor
 
 ### 8.2 Read path
 
-Fault worker优先处理当前缺页;serial tail用于可预测顺序填充. `EVENT_REMOVE` 使已丢弃范围重新成为missing,避免把旧page state误当resident. Context cancellation停止worker并关闭fd/stream owner.
+UFFD使用`fault 1 page + best-effort serial tail`两阶段填充. Fault worker先保证
+fault页完成,只有该页实际提交为`Loaded`后才能提交tail;每个handler最多保留一个tail
+reservation,并发fault在reservation busy时只处理fault页. Fault页不等待tail worker或
+tail ioctl,同时限制并发source I/O、共享buffer和guest population. `ChunkRun`为复用
+一次物理解码结果,会在urgent copy前完成下述buffered source read.
+
+填充上限按最终可见Run类型确定:
+
+| Run类型 | fault阶段 | tail阶段 | 单次fault总上限 |
+|---|---|---|---:|
+| `Hole`、`Zero`、`Released` | 1页`UFFDIO_ZEROPAGE` | 最多15页 | 16页/64 KiB |
+| ordinary `Data` | 读取并`UFFDIO_COPY` 1页 | deferred读取并填充最多15页 | 16页/64 KiB |
+| manifest `ChunkRun` | 一次读取包含fault页的最终可见chunk窗口,先单独填充fault页 | 先填fault后的suffix,成功后再填fault前的prefix | 1个当前可见chunk,最多1 MiB/256页 |
+| reclaimed `Loaded` | 只恢复当前页 | 无 | 1页 |
+
+`ChunkRun`表示最终serving leaf是一个物理manifest chunk. Chunk是校验、解密和解压缩的
+最小单位,因此handler不再把它按ordinary Data的固定窗口反复读取. `SnapshotReader`
+仍只返回从fault offset开始的forward anchor;`StreamSnapshotSource`通过包内可选
+capability调用`fetch.ResolveChunkWindow`,以最终组合Stream的元数据把anchor扩展为
+同一物理chunk中包含fault的最大连续可见窗口. 解析不读取payload;上层Hole透明,
+上层Data或Zero、memory section末端以及不连续的同一lower chunk都会截断窗口,不能
+直接使用绕过overlay的物理chunk边界.
+
+Tail reservation在窗口解析及payload读取前取得. Busy时只按原anchor读取并填充当前
+4 KiB fault页;取得reservation后,handler把不大于1 MiB的窗口一次读入已有buffer.
+对完整可见chunk,这是一次精确的whole-chunk读取;若overlay截断可见性,source仍在
+内部按chunk完成必要的校验、解密和解压,handler只接收可安全填充的连续窗口. Fault
+worker从buffer中间取当前页执行urgent `UFFDIO_COPY`,tail worker先用一个batch填充
+fault后的邻接suffix;仅该batch完整成功时,再用一个batch填充fault前的邻接prefix.
+Tail执行前从fault邻接页向外重检state,最多缩短为首次不匹配前的连续邻接段;
+任一state冲突、partial completion或ioctl错误都会停止更远范围及后续阶段且不重试,
+所以单个`ChunkRun`最多发出1次urgent和2次tail copy.
+
+普通Data handler在worker启动前分配64 KiB共享buffer,具有chunk window capability的
+manifest handler分配1 MiB,Cold `ZeroSource`不分配该buffer;fault和tail路径不扩容、
+不创建临时payload buffer,每个fault worker只持有固定4 KiB urgent buffer. 这是handler
+自身的零新增分配约束;source内部的Run对象、cache lease及partial-chunk decode
+allocation仍由`SnapshotReader`实现负责. Handler对
+非zero source只调用一次`SnapshotReader.RunAt`;可选chunk window resolver仅在
+accelerator内部继续执行metadata `Stream.RunAt`. Ordinary Data和zero-like run仍分别
+受64 KiB state boundary约束. `ChunkRun`双向候选只包含完整页,并在一次state读锁扫描中截断于
+fault两侧连续`PageState`、RAM末端及当前CH UFFD region;这些guest population边界不
+缩短已经获准的whole-chunk source read. 当前manifest chunk不大于1 MiB;超出上限或
+source不提供window capability时保持原forward anchor,不引入超大chunk专用路径.
+
+Tail对其连续有效范围只发出一次multi-page `UFFDIO_COPY`或
+`UFFDIO_ZEROPAGE`;`ChunkRun`的suffix和prefix各自最多一次. Kernel按页处理并可能
+返回已完成的page-aligned prefix;handler只把该prefix条件提交为`Loaded`,第一次冲突
+或错误后放弃剩余tail且不重试. 因此batch保留内核已完成的成功前缀,同时把普通
+16页策略的tail降为1次ioctl、完整`ChunkRun`的255页tail降为最多2次ioctl.
+
+`EVENT_REMOVE`使已丢弃范围重新成为missing,tail提交使用条件状态更新,不能覆盖并发
+产生的`Released`. Context cancellation停止worker并关闭fd/stream owner.
 
 ## 9. cgroup 与 balloon
 

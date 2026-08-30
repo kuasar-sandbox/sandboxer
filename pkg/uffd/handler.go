@@ -20,18 +20,23 @@ const (
 	// PageSize must match the granularity uffd was set up with.
 	PageSize = 4096
 
-	// dataNeighborTailBytes bounds speculative Data population to one page.
-	dataNeighborTailBytes = PageSize
-
-	// dataFaultFillBytes includes the urgent Data page and its one-page tail.
-	// Chunk runs use the combined buffer so one source read serves both copies.
-	dataFaultFillBytes = PageSize + dataNeighborTailBytes
+	// ordinaryDataFaultFillBytes is the fixed total fill unit for ordinary
+	// stream Data: one urgent page followed by a best-effort 15-page tail.
+	ordinaryDataFaultFillBytes    = 64 << 10
+	ordinaryDataNeighborTailBytes = ordinaryDataFaultFillBytes - PageSize
 
 	// zeroFaultFillBytes is the fixed total bound for Hole, Zero, and Released
-	// runs. These paths issue no source read, so a 64 KiB cap preserves cold-boot
-	// performance without restoring the former adaptive growth to 1 MiB.
+	// runs. These paths issue no source read and use the same one-plus-fifteen
+	// page wake/fill shape as ordinary Data.
 	zeroFaultFillBytes    = 64 << 10
 	zeroNeighborTailBytes = zeroFaultFillBytes - PageSize
+
+	// chunkFaultFillBytes caps one buffered ChunkRun read and its guest
+	// population. Current manifests use chunks no larger than 1 MiB. The
+	// final-visible window is independently clipped by PageState, RAM size, and
+	// the containing CH UFFD region before either directional tail is submitted.
+	chunkFaultFillBytes    = 1 << 20
+	chunkNeighborTailBytes = chunkFaultFillBytes - PageSize
 
 	// MinWorkers is the minimum number of worker goroutines for processing UFFD faults.
 	MinWorkers = 2
@@ -99,7 +104,8 @@ type Config struct {
 //
 // Fault workers resolve exactly one urgent page. EAGAIN/ENOENT wake that page
 // without marking an uncompleted page Loaded, allowing the next fault to retry.
-// The one serial best-effort tail worker may issue a multi-page ioctl; it
+// The one serial best-effort tail worker may issue one multi-page ioctl for a
+// forward tail and, for a buffered ChunkRun, one more for its prefix. It
 // commits only the page-aligned completed prefix and stops on a conflict.
 //
 // 5.10+ kernel compatible — no MINOR_SHMEM / UFFDIO_CONTINUE required.
@@ -273,6 +279,19 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	var tailBuf []byte
+	if !isZeroSource(cfg.Source) {
+		bufferBytes := ordinaryDataFaultFillBytes
+		if _, ok := cfg.Source.(chunkWindowSource); ok {
+			bufferBytes = chunkFaultFillBytes
+		}
+		// Allocate the source-specific maximum before workers start. Fault and
+		// tail processing never grow or replace it, avoiding allocation and GC
+		// assist on the UFFD hot path. Cold ZeroSource handlers need no Data
+		// buffer, ordinary Data needs 64 KiB, and a chunk-window source needs
+		// the current 1 MiB manifest bound.
+		tailBuf = make([]byte, bufferBytes)
+	}
 	h := &Handler{
 		cfg:        cfg,
 		uffds:      []*os.File{os.NewFile(uintptr(uffdCFromCH), "uffd_C_chVA_region0")},
@@ -287,7 +306,7 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		ctx:        ctx,
 		cancel:     cancel,
 		tailQ:      make(chan tailTask, 1),
-		tailBuf:    make([]byte, dataFaultFillBytes),
+		tailBuf:    tailBuf,
 		tailIdle:   make(chan struct{}, 1),
 		ops:        realUffdOps,
 	}
