@@ -38,15 +38,15 @@ make vet test
 make test-e2e                   # 运行 test/e2e/run_all.sh;需要项目主仓组装的完整 BIN
 ```
 
-独立版本通过仓库的 `Release` workflow 发布为 `vX.Y.Z`;发布件
+独立版本通过仓库 `main` 上受信任的 `Release` workflow 发布为 `vX.Y.Z`;发布件
 `sandboxer-vX.Y.Z-linux-x86_64.tar.gz` 包含 `sandbox-ctl`、`sandbox-init`、
 `cloud-hypervisor`。本仓文档与 `test/e2e/` 仅由项目主仓从所选 tag 聚合进
 platform 包。本地可用 `make release VERSION=vX.Y.Z`
 生成并校验相同布局的 release bundle。
-当前 Release 只发布已完成全量构建与 BMS 验证的 Linux x86_64 目标。正式版之前,
-项目主仓的每日协调器按上海日期触发
-`v0.1.0-preview.YYYYMMDD` prerelease;preview 不更新 GitHub Latest,正式
-`v0.1.0` 由独立构建发布。
+当前 Release 只发布已完成全量构建与 BMS 验证的 Linux x86_64 目标。项目主仓的
+每日协调器显式传入源码分支和精确 SHA;组件 `main` 用于主线,`release/vX.Y.x`
+用于对应组件维护线。Preview 不更新 GitHub Latest;维护分支 Stable 也不覆盖
+组件 `main` 发布的 Latest。组件版本与平台聚合版本独立。
 
 构建需要 Go 1.24+;运行还需 **guest-runtime** 发布的 `sandbox-runtime.bundle`
 和 `vmlinux`(guest 内核);patched `cloud-hypervisor` 由本仓
