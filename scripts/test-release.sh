@@ -11,7 +11,31 @@ fail() {
   exit 1
 }
 
+bash "$ROOT/scripts/test-preview-line.sh"
+bash "$ROOT/scripts/test-delete-preview.sh"
+
+mkdir -p "$TMP/source-bin"
+cat > "$TMP/source-bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = api ] || exit 2
+[ "${2:-}" = "repos/$GITHUB_REPOSITORY/git/ref/heads/${FAKE_SOURCE_REF:?}" ] || exit 2
+printf '%s\n' "${FAKE_SOURCE_SHA:?}"
+EOF
+chmod +x "$TMP/source-bin/gh"
+env PATH="$TMP/source-bin:$PATH" GITHUB_REPOSITORY=kuasar-sandbox/sandboxer FAKE_SOURCE_REF=release/v1.2.x FAKE_SOURCE_SHA=1111111111111111111111111111111111111111 bash "$ROOT/scripts/validate-release-source.sh" release/v1.2.x 1111111111111111111111111111111111111111 v1.2.3 sandboxer >/dev/null
+if env PATH="$TMP/source-bin:$PATH" GITHUB_REPOSITORY=kuasar-sandbox/sandboxer FAKE_SOURCE_REF=release/v1.2.x FAKE_SOURCE_SHA=1111111111111111111111111111111111111111 bash "$ROOT/scripts/validate-release-source.sh" release/v1.2.x 1111111111111111111111111111111111111111 v1.3.0 sandboxer >/dev/null 2>&1; then
+  fail "release source validator accepted a tag from another version line"
+fi
+bash -n "$ROOT/scripts/delete-preview.sh" "$ROOT/scripts/validate-release-source.sh"
+
 WORKFLOW="$ROOT/.github/workflows/release.yml"
+grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }}]' \
+  "$WORKFLOW" || fail "release run identity does not pin source and dependencies"
+grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }}' \
+  "$WORKFLOW" || fail "Preview publisher does not receive dependency binding"
+grep -Fq 'kuasar-preview-binding' "$ROOT/scripts/publish-release.sh" \
+  || fail "Preview publisher does not record its build binding"
 for input in accelerator_version connector_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
@@ -65,7 +89,10 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
 "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/sandboxer v1.2.3 \
-  1111111111111111111111111111111111111111
+  1111111111111111111111111111111111111111 main
+bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
+  "$TMP/bundle" kuasar-sandbox/sandboxer v1.2.3 \
+  1111111111111111111111111111111111111111 release/v1.2.x
 
 archive="$TMP/bundle/assets/$ARCHIVE_NAME"
 printf '%s\n' ./ ./bin/ ./bin/cloud-hypervisor ./bin/sandbox-ctl ./bin/sandbox-init \
