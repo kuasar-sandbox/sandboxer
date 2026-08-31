@@ -13,7 +13,8 @@ import (
 
 // memBackend is a tiny Backend stub for tests.
 type memBackend struct {
-	data []byte
+	data     []byte
+	readOnly bool
 }
 
 func (m *memBackend) ReadAt(buf []byte, offset int64) (int, error) {
@@ -31,8 +32,37 @@ func (m *memBackend) WriteAt(buf []byte, offset int64) (int, error) {
 func (m *memBackend) Flush() error                    { return nil }
 func (m *memBackend) Discard(off, length int64) error { return nil }
 func (m *memBackend) Size() int64                     { return int64(len(m.data)) }
-func (m *memBackend) ReadOnly() bool                  { return false }
+func (m *memBackend) ReadOnly() bool                  { return m.readOnly }
 func (m *memBackend) BackendStats() map[string]any    { return nil }
+
+func TestServerAdvertisedFeatures(t *testing.T) {
+	const configFeatures = bitVirtioBlkSizeMax | bitVirtioBlkSegMax | bitVirtioBlkBlkSize
+
+	tests := []struct {
+		name     string
+		readOnly bool
+		wantRO   bool
+	}{
+		{name: "read-write"},
+		{name: "read-only", readOnly: true, wantRO: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := NewServer("/tmp/test.sock-unused", &memBackend{
+				data:     make([]byte, 4096),
+				readOnly: tt.readOnly,
+			}, nil)
+			got := srv.advertisedFeatures()
+			if got&configFeatures != configFeatures {
+				t.Errorf("advertised features 0x%x missing virtio-blk config features 0x%x", got, configFeatures)
+			}
+			gotRO := got&bitVirtioBlkRO != 0
+			if gotRO != tt.wantRO {
+				t.Errorf("VIRTIO_BLK_F_RO advertised=%t, want %t", gotRO, tt.wantRO)
+			}
+		})
+	}
+}
 
 // TestServer_AcceptsAfterMasterDisconnect verifies the regression fix
 // for Issue 1/2: after a master closes the connection, the server must

@@ -463,12 +463,18 @@ func (s *Server) handle(conn *net.UnixConn, m *Message) error {
 // VHOST_USER_F_PROTOCOL_FEATURES = bit 30 in vhost-user features.
 // VIRTIO_F_VERSION_1            = bit 32 in virtio features.
 // VIRTIO_BLK_F_RO               = bit 5
+// VIRTIO_BLK_F_SIZE_MAX         = bit 1
+// VIRTIO_BLK_F_SEG_MAX           = bit 2
+// VIRTIO_BLK_F_BLK_SIZE          = bit 6
 // VIRTIO_BLK_F_FLUSH            = bit 9
 // VIRTIO_BLK_F_DISCARD          = bit 13
 const (
 	bitVhostProtocolFeatures = uint64(1) << 30
 	bitVirtioVersion1        = uint64(1) << 32
+	bitVirtioBlkSizeMax      = uint64(1) << 1
+	bitVirtioBlkSegMax       = uint64(1) << 2
 	bitVirtioBlkRO           = uint64(1) << 5
+	bitVirtioBlkBlkSize      = uint64(1) << 6
 	bitVirtioBlkFlush        = uint64(1) << 9
 	bitVirtioBlkDiscard      = uint64(1) << 13
 )
@@ -480,12 +486,21 @@ const (
 	bitProtocolConfig = uint64(1) << 9
 )
 
-func (s *Server) handleGetFeatures(conn *net.UnixConn, m *Message) error {
-	feats := bitVirtioVersion1 | bitVhostProtocolFeatures | bitVirtioBlkFlush
+func (s *Server) advertisedFeatures() uint64 {
+	feats := bitVirtioVersion1 |
+		bitVhostProtocolFeatures |
+		bitVirtioBlkSizeMax |
+		bitVirtioBlkSegMax |
+		bitVirtioBlkBlkSize |
+		bitVirtioBlkFlush
 	if s.backend.ReadOnly() {
 		feats |= bitVirtioBlkRO
 	}
-	return SendU64Reply(conn, m.Header.Request, feats)
+	return feats
+}
+
+func (s *Server) handleGetFeatures(conn *net.UnixConn, m *Message) error {
+	return SendU64Reply(conn, m.Header.Request, s.advertisedFeatures())
 }
 
 func (s *Server) handleSetFeatures(conn *net.UnixConn, m *Message) error {
