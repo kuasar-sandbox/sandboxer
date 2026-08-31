@@ -56,12 +56,12 @@ type tapIfreq struct {
 // config's tap and re-binding them onto the restored _net0 device via
 // net_fds (CH patch 0008) makes concurrent tap-name-mode restores safe.
 //
-// Attach strategy mirrors net_util: first TUNSETIFF with IFF_VNET_HDR
-// (kernel may refuse with EEXIST/EBUSY when the interface already exists
-// from provisioning without the vnet flag — as `ip tuntap add` does), then
-// a plain IFF_TAP|IFF_NO_PI attach, and finally TUNSETVNETHDRSZ to enable
-// vnet framing on the fd. Only a genuinely held tap (attached by another
-// process) returns an error.
+// Attach requires IFF_VNET_HDR (with an IFF_MULTI_QUEUE first attempt for
+// MQ-provisioned taps): CH's inherited-fd net backend needs virtio-net
+// header framing on the fd, and a device that rejects the vnet attach
+// cannot back a restored net device — it is rejected explicitly. Only a
+// genuinely held tap (attached by another process) or a vnet-incapable
+// provisioning returns an error.
 func OpenTAPFDs(name string, pairs int) ([]*os.File, error) {
 	if err := VerifyTAP(name); err != nil {
 		return nil, err
@@ -85,15 +85,18 @@ func OpenTAPFDs(name string, pairs int) ([]*os.File, error) {
 			}
 			return nil, fmt.Errorf("tap: open /dev/net/tun: %w", err)
 		}
-		// Flag variants to try in order: the interface may have been
-		// provisioned with or without IFF_MULTI_QUEUE / IFF_VNET_HDR;
-		// EINVAL = flag mismatch with the device, EBUSY = queue held or
-		// no free queue. First variant that attaches wins.
+		// Flag variants to try in order: the interface may or may not have
+		// been provisioned multi-queue. Only IFF_VNET_HDR attaches are
+		// accepted — CH's inherited-fd net backend requires virtio-net
+		// header framing on the fd, and TUNSETVNETHDRSZ below only sizes
+		// that framing, it does not enable it. A device that rejects
+		// IFF_VNET_HDR attach (provisioned without vnet support) cannot
+		// serve this restore and is rejected explicitly rather than
+		// returning an fd with malformed framing. EINVAL = flag mismatch
+		// with the device, EBUSY = queue held or no free queue.
 		variants := []uint16{
 			unix.IFF_TAP | unix.IFF_NO_PI | unix.IFF_VNET_HDR | unix.IFF_MULTI_QUEUE,
 			unix.IFF_TAP | unix.IFF_NO_PI | unix.IFF_VNET_HDR,
-			unix.IFF_TAP | unix.IFF_NO_PI | unix.IFF_MULTI_QUEUE,
-			unix.IFF_TAP | unix.IFF_NO_PI,
 		}
 		var lastErr syscall.Errno
 		attached := false
@@ -103,13 +106,7 @@ func OpenTAPFDs(name string, pairs int) ([]*os.File, error) {
 				attached = true
 				break
 			}
-			if en == syscall.EBUSY {
-				// Held by another process or no free queue — remember,
-				// but let the plain variant rule out flag mismatches.
-				lastErr = en
-				continue
-			}
-			if en == syscall.EINVAL {
+			if en == syscall.EBUSY || en == syscall.EINVAL {
 				lastErr = en
 				continue
 			}
@@ -123,7 +120,7 @@ func OpenTAPFDs(name string, pairs int) ([]*os.File, error) {
 			if errors.Is(lastErr, syscall.EBUSY) {
 				return nil, fmt.Errorf("tap: interface %s is held by another process or has no free queue for restore (concurrent restore of one snapshot requires a distinct, multi_queue-capable tap per restore)", name)
 			}
-			return nil, fmt.Errorf("tap: TUNSETIFF %s queue %d: %w", name, i, lastErr)
+			return nil, fmt.Errorf("tap: interface %s does not accept IFF_VNET_HDR attach and cannot back a restored net device (re-provision with vnet support): %w", name, lastErr)
 		}
 		hdrsz := int32(virtioNetHdrV1Size)
 		if _, _, en := unix.Syscall(unix.SYS_IOCTL, f.Fd(), unix.TUNSETVNETHDRSZ, uintptr(unsafe.Pointer(&hdrsz))); en != 0 {
