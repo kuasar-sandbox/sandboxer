@@ -1,5 +1,6 @@
 /bin/
 /build/
 /dist/
+/test/e2e/.work/
 *.test
 *.out

@@ -14,6 +14,12 @@ cases=("$SCRIPT_DIR"/e2e_*.sh)
 }
 
 for script in "${cases[@]}"; do
+    # Manual perf case: long, needs a guest-runtime tree, and is not a
+    # correctness gate. Run it explicitly:
+    #   ./test/e2e/e2e_sandbox_vhost_cow_perf.sh
+    case "$(basename "$script")" in
+        e2e_sandbox_vhost_cow_perf.sh) continue ;;
+    esac
     echo
     echo "========================================="
     echo "  sandboxer/$(basename "$script")"
