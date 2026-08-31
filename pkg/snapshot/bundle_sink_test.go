@@ -99,6 +99,60 @@ func TestBundleSinkWritesOneMultiManifestFile(t *testing.T) {
 	}
 }
 
+func TestBundleSinkRepairsInconsistentExistingFinal(t *testing.T) {
+	dir := t.TempDir()
+	customerKey := [32]byte{0x44, 0x45, 0x46}
+	cfg := &manifest.Config{
+		Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:  manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+	payload := bytes.Repeat([]byte{0x61}, 8192)
+	snapshotConfig := []byte("version: 1\nsandbox_ref: manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+	write := func(sandboxID string) (store.ContentKey, string) {
+		sink, err := NewBundleSink(context.Background(), dir, sandboxID, cfg,
+			func() ([32]byte, error) { return customerKey, nil }, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = sink.Close() })
+		rootRef, _, err := sink.AbsorbSnapshot(context.Background(),
+			testSnapshotSource(t, payload, nil, snapshotConfig))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sink.CommitSnapshot(context.Background(), rootRef, ""); err != nil {
+			t.Fatal(err)
+		}
+		root, err := manifest.ParseKeyRef(rootRef)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return root, filepath.Join(dir, manifest.HexKey(root)+".bundle")
+	}
+
+	root, path := write("first")
+	if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repairedRoot, repairedPath := write("second")
+	if repairedRoot != root || repairedPath != path {
+		t.Fatalf("repaired root/path = %s %q, want %s %q", manifest.HexKey(repairedRoot), repairedPath, manifest.HexKey(root), path)
+	}
+	reader, err := manifestbundle.Open(path)
+	if err != nil {
+		t.Fatalf("open repaired Bundle: %v", err)
+	}
+	defer reader.Close()
+	_, decryptor, err := manifestcrypto.New(cfg.Crypto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.FullVerify(context.Background(), root, customerKey, decryptor,
+		manifestbundle.VerifyOptions{ExpectedManifests: reader.ManifestKeys()}); err != nil {
+		t.Fatalf("verify repaired Bundle: %v", err)
+	}
+}
+
 type admissionOnlyStore struct {
 	pb.UnimplementedStoreServer
 	calls      atomic.Int32

@@ -238,9 +238,22 @@ readiness_assert_wire "$WORK/restore.ready" "$RESTORE_READER_PID" $'control_read
 echo "==> PASS: restore exact readiness wire; ctl.sock and immediate exec succeeded"
 
 echo "==> waiting for restored TICK > $PRE_SNAP_TICK..."
-WANT_TICK=$((PRE_SNAP_TICK + 3))
+# The counter keeps running across the snapshot window, so the restored VM
+# resumes at whichever tick the window length produced — output for a few
+# ticks around PRE_SNAP_TICK is legitimately lost to the freeze. The claim
+# under test is "counting continued past the snapshot", i.e. ANY tick
+# strictly greater than the snapshot-time value, not one exact tick number
+# that a slightly longer snapshot window can skip over.
+max_seen_tick() {
+    # grep exits 1 on no match, which under `set -o pipefail` would fail the
+    # whole pipeline (and, inside a command substitution under `set -e`,
+    # kill the script) — exactly the case while LOG2 is still empty before
+    # the restored guest's first output lands. Normalize to empty output.
+    grep -oE "^TICK [0-9]+" "$1" 2>/dev/null | tail -1 | awk '{print $2}' || true
+}
 for i in $(seq 1 600); do
-    if grep -qE "^TICK $WANT_TICK[[:space:]]*$" "$LOG2" 2>/dev/null; then break; fi
+    seen=$(max_seen_tick "$LOG2")
+    if [ -n "$seen" ] && [ "$seen" -gt "$PRE_SNAP_TICK" ]; then break; fi
     if ! kill -0 "$SBPID2" 2>/dev/null; then
         echo "==> sandbox-ctl run --restore exited early"; tail -50 "$LOG2"; exit 1
     fi
@@ -254,11 +267,12 @@ SBPID2=""
 uffd_performance_gate "file-restore-ready" "$RESTORE_READY_MS" 1500 \
     "$WORK/restore-stats.json" deferred
 
-if grep -qE "^TICK $WANT_TICK[[:space:]]*$" "$LOG2"; then
-    echo "==> PASS: restored sandbox continued counting (saw TICK $WANT_TICK)"
+seen=$(max_seen_tick "$LOG2")
+if [ -n "$seen" ] && [ "$seen" -gt "$PRE_SNAP_TICK" ]; then
+    echo "==> PASS: restored sandbox continued counting (saw TICK $seen > $PRE_SNAP_TICK)"
     echo "==> e2e_sandbox_restore: OK"
 else
-    echo "==> FAIL: restored sandbox did not reach TICK $WANT_TICK"
+    echo "==> FAIL: restored sandbox did not count past TICK $PRE_SNAP_TICK (last seen: ${seen:-none})"
     tail -40 "$LOG2"
     exit 1
 fi

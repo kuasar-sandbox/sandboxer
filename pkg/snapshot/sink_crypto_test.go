@@ -82,7 +82,7 @@ func TestEncryptedFileSinkDeterministicAndNoReplace(t *testing.T) {
 	}
 }
 
-func TestEncryptedFileSinkRejectsInconsistentExistingFinal(t *testing.T) {
+func TestEncryptedFileSinkRepairsInconsistentExistingFinal(t *testing.T) {
 	ctx := context.Background()
 	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x33})
 	dir := t.TempDir()
@@ -101,16 +101,38 @@ func TestEncryptedFileSinkRejectsInconsistentExistingFinal(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := append([]byte(nil), body...)
-	_, _, err = NewFileSink(dir, "second", codec, false, nil).AbsorbOverlay(ctx, bytes.NewReader(payload), nil)
-	if err == nil {
-		t.Fatal("inconsistent existing final was reused")
+	ref, repairedPath, err := NewFileSink(dir, "second", codec, false, nil).AbsorbOverlay(ctx, bytes.NewReader(payload), nil)
+	if err != nil {
+		t.Fatalf("repair inconsistent existing final: %v", err)
+	}
+	if repairedPath != path {
+		t.Fatalf("repaired path = %q, want %q", repairedPath, path)
 	}
 	after, readErr := os.ReadFile(path)
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if !bytes.Equal(after, before) {
-		t.Fatal("inconsistent existing final was overwritten")
+	if bytes.Equal(after, before) {
+		t.Fatal("inconsistent existing final was not repaired")
+	}
+	parsed, err := manifest.ParseRef(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := fetch.OpenTarStream(path,
+		tarstream.WithCodec(codec, true),
+		tarstream.WithExpectedDigest(parsed.DigestScheme, parsed.Digest),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	got := make([]byte, len(payload))
+	if n, err := stream.ReadAt(ctx, got, 0); n != len(got) || err != nil {
+		t.Fatalf("ReadAt=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("repaired encrypted payload mismatch")
 	}
 	partials, _ := filepath.Glob(filepath.Join(dir, "*.partial"))
 	if len(partials) != 0 {
@@ -118,7 +140,7 @@ func TestEncryptedFileSinkRejectsInconsistentExistingFinal(t *testing.T) {
 	}
 }
 
-func TestEncryptedFileSinkRejectsPlaintextExistingFinalInAuto(t *testing.T) {
+func TestEncryptedFileSinkRepairsPlaintextExistingFinalInAuto(t *testing.T) {
 	ctx := context.Background()
 	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x34})
 	dir := t.TempDir()
@@ -148,15 +170,41 @@ func TestEncryptedFileSinkRejectsPlaintextExistingFinalInAuto(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := NewFileSink(dir, "encrypted", codec, false, nil).AbsorbOverlay(ctx, bytes.NewReader(payload), nil); !errors.Is(err, tarstream.ErrPlaintextForbidden) {
-		t.Fatalf("auto plaintext collision error=%v", err)
+	ref, path, err := NewFileSink(dir, "encrypted", codec, false, nil).AbsorbOverlay(ctx, bytes.NewReader(payload), nil)
+	if err != nil {
+		t.Fatalf("repair plaintext collision: %v", err)
+	}
+	if path != final {
+		t.Fatalf("repaired path = %q, want %q", path, final)
 	}
 	after, err := os.ReadFile(final)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(after, before) {
-		t.Fatal("plaintext existing final was modified")
+	if bytes.Equal(after, before) {
+		t.Fatal("plaintext existing final was not replaced")
+	}
+	if _, err := fetch.OpenTarStream(final); !errors.Is(err, tarstream.ErrCodecRequired) {
+		t.Fatalf("repaired encrypted artifact without codec error = %v", err)
+	}
+	parsed, err = manifest.ParseRef(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := fetch.OpenTarStream(final,
+		tarstream.WithCodec(codec, true),
+		tarstream.WithExpectedDigest(parsed.DigestScheme, parsed.Digest),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	got := make([]byte, len(payload))
+	if n, err := stream.ReadAt(ctx, got, 0); n != len(got) || err != nil {
+		t.Fatalf("ReadAt=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("repaired encrypted payload mismatch")
 	}
 }
 

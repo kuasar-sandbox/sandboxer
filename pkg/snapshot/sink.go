@@ -29,6 +29,215 @@ func HexKey(k store.ContentKey) string {
 	return hex.EncodeToString(k[:])
 }
 
+// finalValidator reports the file identity it validated alongside the
+// outcome, so callers can bind later removal to that exact inode.
+type finalValidator func(context.Context, string, bool) (os.FileInfo, error)
+
+// publishFileExclusively publishes sourcePath to destination with the same
+// no-lock, rename-free shared-filesystem contract as named ref-location
+// publication: O_CREATE|O_EXCL ownership, sequential cancellable copy, full
+// validation, file and parent-directory sync, and last-active-writer eventual
+// publication when concurrent writers repair a confirmed-invalid regular
+// final. Cancellation, transient I/O, permission, and unknown validation
+// errors never remove an existing path; neither do symlinks or other
+// non-regular finals. Repair removes the final only while the path still
+// names the inode whose validation reported the mismatch, so a concurrent
+// publisher that completes the same inode is never deleted underneath its
+// own successful validation.
+func publishFileExclusively(ctx context.Context, sourcePath, destination string, validate finalValidator, what string) (reused bool, err error) {
+	if _, err := validate(ctx, sourcePath, false); err != nil {
+		return false, fmt.Errorf("publish %s: validate source: %w", what, err)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, fmt.Errorf("publish %s: %w", what, err)
+		}
+		created, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			if !os.IsExist(err) {
+				return false, fmt.Errorf("publish %s: create final exclusively: %w", what, err)
+			}
+			invalidInfo, validateErr := validate(ctx, destination, true)
+			if os.IsNotExist(validateErr) {
+				continue // raced away between the exclusive open and validation
+			}
+			if validateErr == nil {
+				if err := syncDirectory(filepath.Dir(destination)); err != nil {
+					return false, fmt.Errorf("publish %s: sync parent directory: %w", what, err)
+				}
+				return true, nil
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false, fmt.Errorf("publish %s: %w", what, ctxErr)
+			}
+			if errors.Is(validateErr, context.Canceled) || errors.Is(validateErr, context.DeadlineExceeded) {
+				return false, fmt.Errorf("reuse existing %s: %w", what, validateErr)
+			}
+			if os.IsNotExist(validateErr) {
+				continue
+			}
+			if !isConfirmedFinalMismatch(validateErr) {
+				return false, fmt.Errorf("reuse existing %s: %w", what, validateErr)
+			}
+			if err := removeFinalIfStill(destination, invalidInfo, true); err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				if errors.Is(err, errFinalReplaced) {
+					continue // another publisher owns the path now; revalidate
+				}
+				return false, fmt.Errorf("reuse existing %s: invalid final (%v) cannot be replaced: %w", what, validateErr, err)
+			}
+			continue
+		}
+		ownedInfo, err := created.Stat()
+		if err != nil {
+			_ = created.Close()
+			if removeErr := os.Remove(destination); removeErr != nil && !os.IsNotExist(removeErr) {
+				return false, fmt.Errorf("publish %s: stat created final: %v; remove incomplete final: %w", what, err, removeErr)
+			}
+			return false, fmt.Errorf("publish %s: stat created final: %w", what, err)
+		}
+		owned := true
+		defer func() {
+			if owned {
+				_ = removeFinalIfStill(destination, ownedInfo, false)
+			}
+		}()
+		if err := created.Chmod(0o644); err != nil {
+			_ = created.Close()
+			return false, fmt.Errorf("publish %s: set final permissions: %w", what, err)
+		}
+		if err := copySyncAndClose(ctx, created, sourcePath); err != nil {
+			return false, fmt.Errorf("publish %s: write final: %w", what, err)
+		}
+		if _, err := validate(ctx, destination, false); err != nil {
+			return false, fmt.Errorf("publish %s: validate final: %w", what, err)
+		}
+		if err := syncDirectory(filepath.Dir(destination)); err != nil {
+			return false, fmt.Errorf("publish %s: sync parent directory: %w", what, err)
+		}
+		owned = false
+		return false, nil
+	}
+}
+
+var errFinalMismatch = errors.New("published final mismatch")
+
+func isConfirmedFinalMismatch(err error) bool {
+	for _, mismatch := range []error{
+		errFinalMismatch,
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		tarstream.ErrCodecRequired,
+		tarstream.ErrPlaintextForbidden,
+		tarstream.ErrUnsupportedVersion,
+		tarstream.ErrMalformedEnvelope,
+		tarstream.ErrAuthentication,
+		tarstream.ErrDigestMismatch,
+		tarstream.ErrInvalidCanonicalTarstream,
+		tarstream.ErrUnsupportedEncoding,
+		tarstream.ErrNotFound,
+	} {
+		if errors.Is(err, mismatch) {
+			return true
+		}
+	}
+	return false
+}
+
+// errFinalReplaced reports that the final path no longer names the exact file
+// the caller observed; that file's outcome is not this publisher's to decide.
+var errFinalReplaced = errors.New("final path names a different publisher's file")
+
+// removeFinalIfStill removes the final only while the path still names the
+// observed file. With unchangedContents it also requires unchanged size and
+// modification time, so a concurrent publisher that completes the observed
+// inode is never deleted underneath its owner; owners of a failed partial
+// write pass false because they legitimately changed their own file after
+// observing it.
+func removeFinalIfStill(path string, observed os.FileInfo, unchangedContents bool) error {
+	if observed == nil {
+		return os.Remove(path)
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(observed, current) {
+		return errFinalReplaced
+	}
+	if unchangedContents &&
+		(current.Size() != observed.Size() || !current.ModTime().Equal(observed.ModTime())) {
+		return errFinalReplaced
+	}
+	if !current.Mode().IsRegular() {
+		return fmt.Errorf("existing final is not a regular file")
+	}
+	return os.Remove(path)
+}
+
+// exclusivePublishCopy is a test seam for failures after the publisher owns
+// the exclusively-created final. Production copies are sequential and
+// cancellable.
+var exclusivePublishCopy = copySequentially
+
+func copySequentially(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {
+	buf := make([]byte, 128*1024)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		n, readErr := source.Read(buf)
+		if n > 0 {
+			written, writeErr := destination.Write(buf[:n])
+			total += int64(written)
+			if writeErr != nil {
+				return total, writeErr
+			}
+			if written != n {
+				return total, io.ErrShortWrite
+			}
+		}
+		if readErr == io.EOF {
+			return total, nil
+		}
+		if readErr != nil {
+			return total, readErr
+		}
+	}
+}
+
+func copySyncAndClose(ctx context.Context, destination *os.File, sourcePath string) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		_ = destination.Close()
+		return err
+	}
+	info, statErr := source.Stat()
+	var copied int64
+	if statErr == nil {
+		copied, err = exclusivePublishCopy(ctx, destination, source)
+	}
+	sourceCloseErr := source.Close()
+	if statErr != nil {
+		err = statErr
+	} else if err == nil && copied != info.Size() {
+		err = fmt.Errorf("short copy: wrote %d of %d bytes", copied, info.Size())
+	} else if err == nil && sourceCloseErr != nil {
+		err = sourceCloseErr
+	}
+	if err == nil {
+		err = destination.Sync()
+	}
+	closeErr := destination.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
 // ArtifactSink is the narrow lifecycle writer shared by export and snapshot.
 // Logical roles are explicit methods; there is intentionally no artifact-kind
 // registry or side metadata. Absorb writes immutable content only. Commit*
@@ -174,20 +383,17 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 		return "", "", "", err
 	}
 	final := filepath.Join(s.outDir, digest+"."+kind)
-	err = unix.Renameat2(unix.AT_FDCWD, tmp, unix.AT_FDCWD, final, unix.RENAME_NOREPLACE)
-	if err == unix.EEXIST {
-		// A codec-backed write always emits ciphertext, including in auto
-		// mode. Reuse must therefore prove that an existing final has the
-		// same encoding as the output we attempted to commit.
-		if validateErr := validateArtifactFile(ctx, final, kind, src.Size(), s.codec, s.codec != nil, scheme, digest); validateErr != nil {
-			return "", "", "", fmt.Errorf("reuse existing %s: %w", kind, validateErr)
-		}
-		return scheme, digest, final, nil
+	// A codec-backed write always emits ciphertext, including in auto mode, so
+	// reuse must prove that an existing final has the same encoding as the
+	// output we attempted to commit; publishFileExclusively applies that rule.
+	validate := func(ctx context.Context, path string, syncFile bool) (os.FileInfo, error) {
+		return validateArtifactFile(ctx, path, kind, src.Size(), s.codec, s.codec != nil, scheme, digest, syncFile)
 	}
-	if err != nil {
+	if _, err := publishFileExclusively(ctx, tmp, final, validate, kind); err != nil {
 		return "", "", "", fmt.Errorf("commit %s without replacement: %w", kind, err)
 	}
-	keepTmp = true // rename consumed the path; deferred cleanup has nothing to remove
+	// Copy-mode publication leaves the temporary file in place; the deferred
+	// cleanup removes it once the directory sync below has landed.
 	dir, err := os.Open(s.outDir)
 	if err != nil {
 		return "", "", "", fmt.Errorf("open snapshot output directory: %w", err)
@@ -208,18 +414,20 @@ func localArtifactRef(basename, scheme, digest string) string {
 	return ref.String()
 }
 
-func validateArtifactFile(ctx context.Context, path, name string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string) error {
-	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+// validateArtifactFile reports the file identity it validated so callers can
+// bind later removal to that exact inode.
+func validateArtifactFile(ctx context.Context, path, name string, logicalSize uint64, codec tarstream.Codec, required bool, scheme, digest string, syncFile bool) (os.FileInfo, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("existing final is not a regular file")
+		return info, fmt.Errorf("%w: existing final is not a regular file", errFinalMismatch)
 	}
 	var options []tarstream.ReadOption
 	if codec != nil {
@@ -228,12 +436,20 @@ func validateArtifactFile(ctx context.Context, path, name string, logicalSize ui
 	options = append(options, tarstream.WithExpectedDigest(scheme, digest))
 	source, _, err := tarstream.SourceFrom(f, name, options...)
 	if err != nil {
-		return err
+		return info, err
 	}
 	if source.Size() != logicalSize {
-		return fmt.Errorf("logical size mismatch")
+		return info, fmt.Errorf("%w: existing final logical size", errFinalMismatch)
 	}
-	return consumeSource(ctx, source)
+	if err := consumeSource(ctx, source); err != nil {
+		return info, err
+	}
+	if syncFile {
+		if err := f.Sync(); err != nil {
+			return info, fmt.Errorf("sync existing final: %w", err)
+		}
+	}
+	return info, nil
 }
 
 func consumeSource(ctx context.Context, source sparse.Source) error {
@@ -526,16 +742,14 @@ func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, role s
 	}
 	s.closed = true
 	final := filepath.Join(s.outDir, HexKey(root)+".bundle")
-	err := unix.Renameat2(unix.AT_FDCWD, s.tmpPath, unix.AT_FDCWD, final, unix.RENAME_NOREPLACE)
-	if err == unix.EEXIST {
-		if err := s.validateExisting(ctx, final, root); err != nil {
-			return fmt.Errorf("reuse existing snapshot Bundle: %w", err)
-		}
-		if err := os.Remove(s.tmpPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove duplicate snapshot Bundle temporary file: %w", err)
-		}
-	} else if err != nil {
+	validate := func(ctx context.Context, path string, syncFile bool) (os.FileInfo, error) {
+		return s.validateExisting(ctx, path, root, syncFile)
+	}
+	if _, err := publishFileExclusively(ctx, s.tmpPath, final, validate, "snapshot Bundle"); err != nil {
 		return fmt.Errorf("commit snapshot Bundle without replacement: %w", err)
+	}
+	if err := os.Remove(s.tmpPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove published snapshot Bundle temporary file: %w", err)
 	}
 	s.tmpPath = ""
 	if err := syncDirectory(s.outDir); err != nil {
@@ -549,30 +763,67 @@ func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, role s
 	return nil
 }
 
-func (s *BundleSink) validateExisting(ctx context.Context, path string, root store.ContentKey) error {
-	reader, err := manifestbundle.Open(path)
+// validateExisting reports the file identity it validated so callers can
+// bind later removal to that exact inode.
+func (s *BundleSink) validateExisting(ctx context.Context, path string, root store.ContentKey, syncFile bool) (os.FileInfo, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return info, fmt.Errorf("%w: existing final is not a regular file", errFinalMismatch)
+	}
+	reader, err := manifestbundle.NewReader(file, info.Size())
+	if err != nil {
+		return info, classifyBundleFinalValidationError(err)
 	}
 	defer reader.Close()
 	if reader.Admission() != s.admission {
-		return fmt.Errorf("recorded admission differs")
+		return info, fmt.Errorf("%w: recorded admission differs", errFinalMismatch)
 	}
 	customerKey, err := s.keyFn()
 	if err != nil {
-		return err
+		return info, err
 	}
 	_, decryptor, err := manifestcrypto.New(s.cfg.Crypto)
 	if err != nil {
 		clear(customerKey[:])
-		return err
+		return info, err
 	}
 	defer clear(customerKey[:])
 	expected := make([]store.ContentKey, 0, len(s.manifests))
 	for key := range s.manifests {
 		expected = append(expected, key)
 	}
-	return reader.FullVerify(ctx, root, customerKey, decryptor, manifestbundle.VerifyOptions{ExpectedManifests: expected})
+	if err := classifyBundleFinalValidationError(reader.FullVerify(ctx, root, customerKey, decryptor,
+		manifestbundle.VerifyOptions{ExpectedManifests: expected})); err != nil {
+		return info, err
+	}
+	if syncFile {
+		if err := file.Sync(); err != nil {
+			return info, fmt.Errorf("sync existing final: %w", err)
+		}
+	}
+	return info, nil
+}
+
+func classifyBundleFinalValidationError(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		os.IsNotExist(err) || os.IsPermission(err) || errors.Is(err, unix.EIO) || errors.Is(err, unix.ESTALE) {
+		return err
+	}
+	var pathErr *os.PathError
+	var linkErr *os.LinkError
+	var syscallErr *os.SyscallError
+	if errors.As(err, &pathErr) || errors.As(err, &linkErr) || errors.As(err, &syscallErr) {
+		return err
+	}
+	return errors.Join(errFinalMismatch, err)
 }
 
 func (s *BundleSink) Close() error {
