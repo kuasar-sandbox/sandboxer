@@ -34,10 +34,14 @@ func TestLocationTargetFreshPublicationRejectsReplacedFinal(t *testing.T) {
 
 	fs.wrapCreate = func(path string, file locationWriteFile) locationWriteFile {
 		destination = path
-		return &hookedLocationWriteFile{base: file, closeHook: func() error {
-			if err := file.Close(); err != nil {
+		return &hookedLocationWriteFile{base: file, syncHook: func() error {
+			if err := file.Sync(); err != nil {
 				return err
 			}
+			// Replace the canonical path while the original write fd is still
+			// open. This models the namespace race the post-write SameFile check
+			// must detect and prevents immediate inode-number reuse from making
+			// the test itself ambiguous.
 			if err := os.Remove(path); err != nil {
 				return err
 			}
