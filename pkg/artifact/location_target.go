@@ -23,7 +23,7 @@ import (
 // immutable-object target: it determines the canonical identity without a
 // target write, exclusively creates the content-addressed final, and encodes
 // directly into that final exactly once. Fresh publication relies on checked
-// writes plus fsync and does not reread the shared target; only an O_EXCL
+// writes, fsync, and a lightweight final-path identity check; only an O_EXCL
 // collision is independently opened and fully validated before reuse.
 type locationPublishTarget struct {
 	location  string
@@ -282,9 +282,19 @@ func (t *locationPublishTarget) publishFresh(
 			return fmt.Errorf("validate final: %w", err)
 		}
 	}
-	// The owned final is complete. Do not remove it if only the subsequent
-	// directory durability step fails; a concurrent publisher may already have
-	// reused it.
+	current, err := t.fs.lstat(destination)
+	if os.IsNotExist(err) {
+		return errors.Join(errLocationFinalVanished, err)
+	}
+	if err != nil {
+		return fmt.Errorf("stat fresh final path: %w", err)
+	}
+	if !os.SameFile(ownedInfo, current) {
+		return fmt.Errorf("%w: path changed after write", errLocationFinalVanished)
+	}
+	// The owned final is complete and its canonical path still names the same
+	// inode. Do not remove it if only the subsequent directory durability step
+	// fails; a concurrent publisher may already have reused it.
 	owned = false
 	if err := t.fs.syncDirectory(t.directory); err != nil {
 		return fmt.Errorf("sync parent directory: %w", err)
