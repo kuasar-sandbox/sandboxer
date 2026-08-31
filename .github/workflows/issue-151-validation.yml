@@ -1,0 +1,51 @@
+name: issue-151-validation
+
+on:
+  push:
+    branches:
+      - perf/issue-151-location-no-reread
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sandboxer
+        uses: actions/checkout@v4
+        with:
+          path: sandboxer
+
+      - name: Checkout accelerator
+        uses: actions/checkout@v4
+        with:
+          repository: kuasar-sandbox/accelerator
+          path: accelerator
+
+      - name: Checkout connector
+        uses: actions/checkout@v4
+        with:
+          repository: kuasar-sandbox/connector
+          path: connector
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sandboxer/go.mod
+          cache-dependency-path: |
+            sandboxer/go.sum
+            accelerator/go.sum
+            connector/go.sum
+
+      - name: Check formatting
+        working-directory: sandboxer
+        run: test -z "$(gofmt -l pkg/artifact/location_target.go pkg/artifact/location_target_no_reread_test.go)"
+
+      - name: Test artifact package
+        working-directory: sandboxer
+        run: go test ./pkg/artifact
+
+      - name: Test repository
+        working-directory: sandboxer
+        run: go test ./...
