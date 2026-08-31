@@ -33,8 +33,11 @@ type recordedPublish struct {
 }
 
 type recordingPublishTarget struct {
-	calls []recordedPublish
+	calls  []recordedPublish
+	failAt int
 }
+
+var errRecordedPublishFailure = errors.New("recorded publish failure")
 
 func (t *recordingPublishTarget) Put(ctx context.Context, role LogicalRole, source sparse.Source) (string, error) {
 	body, err := readPublishSource(ctx, source)
@@ -43,6 +46,9 @@ func (t *recordingPublishTarget) Put(ctx context.Context, role LogicalRole, sour
 	}
 	ref := fmt.Sprintf("manifest://%064x", len(t.calls)+1)
 	t.calls = append(t.calls, recordedPublish{role: role, ref: ref, body: body})
+	if t.failAt == len(t.calls) {
+		return "", errRecordedPublishFailure
+	}
 	return ref, nil
 }
 
@@ -194,6 +200,22 @@ func TestPublisherWritesMemorySandboxAndSnapshotBottomUp(t *testing.T) {
 	defer publishedSRoot.Close()
 	if publishedS.SandboxRef != target.calls[2].ref || len(publishedS.FromRefs) != 1 || publishedS.FromRefs[0] != target.calls[0].ref {
 		t.Fatalf("S graph = %+v", publishedS)
+	}
+
+	failingTarget := &recordingPublishTarget{failAt: len(target.calls)}
+	failed, err := newPublisher(storage, nil, failingTarget, nil).Publish(ctx, rootPath)
+	if !errors.Is(err, errRecordedPublishFailure) {
+		t.Fatalf("root publication error = %v, want %v", err, errRecordedPublishFailure)
+	}
+	if failed.Ref != "" || failed.Role != RoleSnapshot {
+		t.Fatalf("failed root publication returned %+v", failed)
+	}
+	failedRoles := make([]LogicalRole, len(failingTarget.calls))
+	for i := range failingTarget.calls {
+		failedRoles[i] = failingTarget.calls[i].role
+	}
+	if !reflect.DeepEqual(failedRoles, roles) || failedRoles[len(failedRoles)-1] != RoleSnapshot {
+		t.Fatalf("failed root publication order = %v, want %v", failedRoles, roles)
 	}
 }
 
@@ -506,6 +528,37 @@ func TestLocationPublisherCryptoAutoAndRequired(t *testing.T) {
 	_ = requiredPublisher.Close()
 	if !errors.Is(err, tarstream.ErrPlaintextForbidden) {
 		t.Fatalf("required plaintext error = %v", err)
+	}
+
+	requiredInputDir := t.TempDir()
+	requiredInput := snapshot.NewFileSink(
+		requiredInputDir,
+		"required",
+		requiredStorage.LocalCodec(),
+		requiredStorage.LocalRequired(),
+		nil,
+	)
+	_, encryptedSourcePath, err := requiredInput.AbsorbSandbox(ctx, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requiredOutputDir := t.TempDir()
+	requiredLocations := config.RefLocations{"required": requiredOutputDir}
+	requiredPublisher, err = NewLocationPublisher(requiredStorage, "required", requiredOutputDir, requiredLocations, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requiredResult, publishErr := requiredPublisher.Publish(ctx, encryptedSourcePath)
+	closeErr = requiredPublisher.Close()
+	if publishErr != nil || closeErr != nil {
+		t.Fatalf("required publish err=%v close=%v", publishErr, closeErr)
+	}
+	requiredRef, err := manifest.ParseRef(requiredResult.Ref)
+	if err != nil || requiredRef.DigestScheme != tarstream.DigestSchemeHMAC || requiredRef.Location != "required" {
+		t.Fatalf("required published ref = %q err=%v", requiredResult.Ref, err)
+	}
+	if document, err := requiredStorage.Inspect(ctx, requiredResult.Ref, requiredLocations); err != nil || document.Role != RoleSandbox {
+		t.Fatalf("inspect required result = %+v err=%v", document, err)
 	}
 }
 

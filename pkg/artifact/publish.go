@@ -170,45 +170,6 @@ func (t *manifestPublishTarget) Close() error {
 	return t.close()
 }
 
-type filePublishTarget struct {
-	sink     *snapshot.FileSink
-	location string
-	logf     func(string, ...any)
-}
-
-func (t *filePublishTarget) Put(ctx context.Context, role LogicalRole, source sparse.Source) (string, error) {
-	var ref string
-	var err error
-	switch role {
-	case RoleOverlay:
-		ref, _, err = t.sink.AbsorbOverlaySource(ctx, source)
-	case RoleSandbox:
-		ref, _, err = t.sink.AbsorbSandbox(ctx, source)
-	case RoleSnapshot:
-		ref, _, err = t.sink.AbsorbSnapshot(ctx, source)
-	default:
-		return "", fmt.Errorf("unsupported publish role %q", role)
-	}
-	if err != nil {
-		return "", err
-	}
-	parsed, err := manifest.ParseRef(ref)
-	if err != nil {
-		return "", err
-	}
-	parsed.Location = t.location
-	if err := parsed.Validate(); err != nil {
-		return "", err
-	}
-	ref = parsed.String()
-	if t.logf != nil {
-		t.logf("publish: %s -> %s", role, ref)
-	}
-	return ref, nil
-}
-
-func (*filePublishTarget) Close() error { return nil }
-
 // NewManifestPublisher publishes every selected logical object through one
 // manifest ingester. Roots are written last by Publish.
 func NewManifestPublisher(storage *ProcessStorage, cfg *config.ManifestConfig, locations config.RefLocations, logf func(string, ...any)) (*Publisher, error) {
@@ -259,8 +220,14 @@ func NewLocationPublisher(storage *ProcessStorage, location, directory string, l
 	if err := ensurePublishDirectory(directory); err != nil {
 		return nil, err
 	}
-	sink := snapshot.NewFileSink(filepath.Clean(directory), "publish", storage.LocalCodec(), storage.LocalRequired(), logf)
-	return newPublisher(storage, locations, &filePublishTarget{sink: sink, location: location, logf: logf}, logf), nil
+	target := newLocationPublishTarget(
+		location,
+		filepath.Clean(directory),
+		storage.LocalCodec(),
+		storage.LocalRequired(),
+		logf,
+	)
+	return newPublisher(storage, locations, target, logf), nil
 }
 
 func newPublisher(storage *ProcessStorage, locations config.RefLocations, target publishTarget, logf func(string, ...any)) *Publisher {
