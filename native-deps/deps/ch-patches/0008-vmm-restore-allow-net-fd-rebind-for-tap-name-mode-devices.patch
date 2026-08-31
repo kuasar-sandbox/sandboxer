@@ -1,6 +1,6 @@
-From b5ddfcfb194de640fea4250a69201d22128a59bc Mon Sep 17 00:00:00 2001
-From: zain <zain@local>
-Date: Sun, 30 Aug 2026 20:37:12 -0400
+From 48460f28da27127e5382b0c08a13fffd0e6c6ee1 Mon Sep 17 00:00:00 2001
+From: Zain Ansari <900381+zainussami@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 00:19:35 -0400
 Subject: [PATCH] vmm: restore: allow net fd rebind for tap-name-mode devices
 
 net_fds restore only rebound devices that were fd-backed at snapshot
@@ -12,14 +12,20 @@ concurrent restore of the same snapshot, which is the scale-out path
 
 When the restore request supplies fresh queue fds for a tap-name-mode
 device, rebind it: clone the fds and clear the tap name so the device
-builder takes the fd-backed branch. Guarded by an fd-count ==
-num_queues match; mismatched counts keep the previous behavior.
+builder takes the fd-backed branch. Guarded by an fd-count*2 ==
+num_queues match (num_queues counts virtqueues); mismatched counts keep
+the previous behavior.
+
+Legacy snapshots (pre-id tap-name devices) are handled host-side:
+sandboxer's config rewrite normalizes their net device id to _net0
+before CH sees the state, so the rebind matches regardless of snapshot
+age.
 ---
  vmm/src/lib.rs | 17 +++++++++++++++++
  1 file changed, 17 insertions(+)
 
 diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
-index dcf6614..34b9d77 100644
+index dcf6614..be7d659 100644
 --- a/vmm/src/lib.rs
 +++ b/vmm/src/lib.rs
 @@ -1762,6 +1762,23 @@ impl RequestHandler for Vmm {
