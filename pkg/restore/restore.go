@@ -491,7 +491,15 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// NetworkSpec the guest re-applies flush-and-replace (clone takes a fresh
 	// L3 identity; the MAC stays the snapshot's, so the provider must use a
 	// stable per-port MAC — see docs/tapfd.md §5).
+	//
+	// tap-name mode: CH --restore re-opens the tap name serialized in the
+	// snapshot VM state (net_fds only rebinds fd-backed devices), and a tap
+	// held by another sandbox — e.g. a concurrent restore of the same
+	// snapshot — surfaces only after VM state load as a bare
+	// "ConfigureTap: EBUSY". Probe the tap up front so that failure is an
+	// explicit, actionable error before CH spawns (sandboxer#161).
 	var tapFile, netnsFile *os.File
+	var extraTapFiles []*os.File
 	var metaMAC, metaIP string
 	if snapCfg.Network.TapFD != nil {
 		f, nsf, meta, err := tapfd.AcquireConfig(ctx, snapCfg.Network.TapFD)
@@ -506,6 +514,25 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		}
 		metaMAC, metaIP = meta.MAC, meta.IP
 		logf("tapfd: received tap fd for restore (mac=%s ip=%s netns=%t)", meta.MAC, meta.IP, netnsFile != nil)
+	} else if snapCfg.Network.TAP != "" {
+		// tap-name mode: CH --restore re-opens the serialized tap name,
+		// which may be held by another sandbox under concurrent restore
+		// of the same snapshot (sandboxer#161). Bind fresh fds to the
+		// restore config's tap instead; the net_fds rebind (CH patch 0008)
+		// attaches them to the restored _net0 device, so every concurrent
+		// restore gets its own tap. One fd = one queue pair (CH
+		// num_queues counts virtqueues).
+		tapFiles, err := sandbox.OpenTAPFDs(snapCfg.Network.TAP, sandbox.DefaultNetQueuePairs)
+		if err != nil {
+			return -1, fmt.Errorf("restore tap: %w", err)
+		}
+		defer func() {
+			for _, f := range tapFiles {
+				f.Close()
+			}
+		}()
+		logf("tap-name mode: bound %d fresh queue fds for tap %s (net_fds rebind)", len(tapFiles), snapCfg.Network.TAP)
+		extraTapFiles = tapFiles
 	}
 	netMAC, netSpec := snapCfg.Network.Effective(metaMAC, metaIP)
 
@@ -542,6 +569,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		Memory:        memoryCtl,
 
 		TapFile:   tapFile, // nil in tap-name/no-network modes; non-nil tapfd is inherited at fd 4
+		TapFiles:  extraTapFiles, // restore tap-name mode queue fds (fds 4..)
 		NetMAC:    netMAC,
 		NetnsFile: netnsFile, // non-nil → launch CH inside the tap's netns
 
@@ -576,14 +604,18 @@ func Run(ctx context.Context, opts Options) (int, error) {
 				return nil, nil, fmt.Errorf("stdio: %w", err)
 			}
 			restoreArg := "source_url=file://" + stateDir
-			if e.TapFDNum > 0 {
-				// CH can't serialize fds, so the snapshot's net fd is dead;
-				// re-bind the fresh tap queue fd (CH fd 4) to the restored net
+			if len(e.TapFDNums) > 0 {
+				// CH can't serialize fds, so the snapshot's net fds are dead;
+				// re-bind fresh tap queue fds (CH fds 4..) to the restored net
 				// device named _net0 at cold boot via net_fds.
 				// net_fds is a CH Tuple<String,Vec<u64>>: the whole value is
 				// bracket-wrapped, each entry is <net-id>@<fd-list>. Single
-				// net _net0 with one fd → [_net0@[N]].
-				restoreArg += fmt.Sprintf(",net_fds=[_net0@[%d]]", e.TapFDNum)
+				// net _net0 with N fds → [_net0@[N1,N2,…]].
+				fdList := make([]string, len(e.TapFDNums))
+				for i, fd := range e.TapFDNums {
+					fdList[i] = fmt.Sprintf("%d", fd)
+				}
+				restoreArg += fmt.Sprintf(",net_fds=[_net0@[%s]]", strings.Join(fdList, ","))
 			}
 			cmd.Args = append(cmd.Args, "--api-socket", e.CHSock, "--restore", restoreArg)
 			logf("spawning %s --api-socket %s --restore %s", opts.CHBinary, e.CHSock, restoreArg)

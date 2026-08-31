@@ -1,0 +1,51 @@
+From b5ddfcfb194de640fea4250a69201d22128a59bc Mon Sep 17 00:00:00 2001
+From: zain <zain@local>
+Date: Sun, 30 Aug 2026 20:37:12 -0400
+Subject: [PATCH] vmm: restore: allow net fd rebind for tap-name-mode devices
+
+net_fds restore only rebound devices that were fd-backed at snapshot
+time; tap-name-mode devices (fds: None) kept their serialized tap name,
+so restoring a snapshot while another sandbox held that tap failed with
+an opaque 'ConfigureTap: EBUSY' deep inside VM restore. This blocks
+concurrent restore of the same snapshot, which is the scale-out path
+(one template snapshot, N concurrent restores).
+
+When the restore request supplies fresh queue fds for a tap-name-mode
+device, rebind it: clone the fds and clear the tap name so the device
+builder takes the fd-backed branch. Guarded by an fd-count ==
+num_queues match; mismatched counts keep the previous behavior.
+---
+ vmm/src/lib.rs | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index dcf6614..34b9d77 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -1762,6 +1762,23 @@ impl RequestHandler for Vmm {
+                     // update only if the net dev is backed by FDs
+                     if net_config.id.as_ref() == Some(&net.id) && net_config.fds.is_some() {
+                         net_config.fds.clone_from(&net.fds);
++                    } else if net_config.id.as_ref() == Some(&net.id)
++                        && net_config.fds.is_none()
++                        && net_config.tap.is_some()
++                        && net
++                            .fds
++                            .as_ref()
++                            .map_or(false, |fds| fds.len() * 2 == net_config.num_queues)
++                    {
++                        // A tap-name-mode device (fds: None) can also be
++                        // rebound at restore: the serialized tap name may be
++                        // held by another sandbox when the same snapshot is
++                        // restored concurrently. Clear the tap so the device
++                        // builder takes the fd-backed branch with the fresh
++                        // queue fds instead of failing with a bare
++                        // ConfigureTap EBUSY after VM state load.
++                        net_config.fds.clone_from(&net.fds);
++                        net_config.tap = None;
+                     }
+                 }
+             }
+-- 
+2.53.0
+
