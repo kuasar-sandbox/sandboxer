@@ -47,7 +47,7 @@ memory snapshot      ──> E + S, S is operation root
 | Manifest | `manifest://<key>` | chunk/Manifest encryption 和 verification 由 manifest config 控制 |
 | Manifest Bundle | `file://<bundle>@manifest:<key>` | 一个 ZIP64 Bundle 可承载 root 及完整依赖 Manifest graph |
 
-Local 模式的内容寻址文件名为 `<digest>.<role>`. `<sid>.sandbox` 和 `<sid>.snapshot` 是成功 commit 后更新的语义 symlink. Bundle 模式下语义 symlink 指向承载 root Manifest 的 `<key>.bundle`. Alias 的 SID 必须是单一安全 path component;commit 使用临时 symlink + atomic rename + directory fsync,并拒绝覆盖已有 regular file 或 directory.
+Local 模式的内容寻址文件名为 `<digest>.<role>`. `<sid>.sandbox` 和 `<sid>.snapshot` 是成功 commit 后更新的语义 symlink. Bundle 模式下语义 symlink 指向承载 root Manifest 的 `<key>.bundle`. Alias 的 SID 必须是单一安全 path component;commit 使用临时 symlink + atomic rename + directory fsync,并拒绝覆盖已有 regular file 或 directory. 这些是节点本地 output 语义;named ref-location 使用 §11.2 的独立 shared-location commit protocol,不创建 alias.
 
 Block backend、restore 和 publisher 先打开 carrier,再按逻辑角色解析内容. 外层 ZIP magic 只说明 carrier 是 Bundle,不说明 logical role.
 
@@ -920,7 +920,21 @@ Local immutable artifact支持 `crypto.local=off|auto|required`:
 - `auto`:自动识别plaintext或KDXTS encrypted tarstream;新输出按配置codec.
 - `required`:拒绝plaintext和未绑定key的identity;identity使用`hmac`.
 
-Existing-file reuse必须重新验证role、logical size、content identity和完整stream. Content file使用no-replace atomic commit;semantic alias在root成功后用随机temporary symlink + atomic rename更新. Alias target和existing entry都以`NOFOLLOW`/`lstat` fail closed,不会把regular file或directory替换成symlink;文件与directory fsync完成后才算commit.
+Existing-file reuse必须重新验证role、logical size、content identity和完整stream. Local output与named ref-location的commit策略刻意分离.
+
+#### Local output
+
+`snapshot/export --output` 的 `FileSink` 在output directory中写unique same-directory temp,执行file `Sync` + `Close`,再以`renameat2(RENAME_NOREPLACE)`完成O(1) final commit. `BundleSink`同样以当前atomic no-replace rename提交完整Bundle;两条本地路径都不会为了final commit再读取并复制完整artifact. Root成功后,semantic alias用随机temporary symlink + atomic rename更新. Alias target和existing entry都以`NOFOLLOW`/`lstat` fail closed,不会把regular file或directory替换成symlink;file与directory fsync完成后才算commit. 因此local output要求节点本地filesystem提供这些atomic rename和symlink语义.
+
+#### Named ref-location
+
+`publish/upload-snapshot --to-ref-location`不复用`FileSink`或`BundleSink`. 独立location target先对可重复读取的canonical logical source做一遍无输出identity计算,再以`O_CREATE|O_EXCL`直接创建`<digest>.overlay|sandbox|snapshot`,第二遍canonical encoding是shared target中的唯一完整write. plaintext输出使用SHA-256 identity;codec-backed输出从同一plaintext identity派生HMAC identity并在最终写后重新比对. target directory中没有完整temp/staging副本,也不创建`<sid>.sandbox`、`<sid>.snapshot`或任何其他semantic alias.
+
+Fresh final固定`0644`,执行file `Sync`、`Close`,随后以`O_RDONLY|O_NOFOLLOW`重新打开并验证regular file、role/payload name、logical size、canonical tarstream、marker、codec、crypto policy、digest scheme/digest和完整sequential stream,最后同步parent directory. Existing valid final通过同一个read-only fd完整验证并`Sync`,随后同步directory并复用;inode和bytes不改变.
+
+Final path在write完成前会短暂可见. 正常consumer只能使用publisher成功返回的root ref;publisher仍按dependencies first、root last顺序发布. Concurrent publisher遇到partial final时重新打开并做有限、context-aware exponential-backoff验证;若writer在窗口内完成则复用. bounded retry后仍不完整或invalid时fail closed并提示显式cleanup/repair,不会删除unknown owner的path. Symlink、directory、FIFO和其他non-regular final同样拒绝且不删除. Publisher只在自身`O_EXCL`成功且path仍指向所记录inode时清理自己的失败写入;abandoned unknown final由显式cleanup/GC处理.
+
+因此named location只依赖`mkdir`、exclusive create、write、read、stat/fstat/lstat、seek/pread、file/directory sync、close,以及删除本进程拥有的不完整file. 它不依赖rename/renameat2、symlink、hardlink、reflink、sparse-file preservation、advisory lock或lock file. Directory sync仍是当前durability success contract;不支持它或返回其他I/O错误时publication失败,不会静默吞错.
 
 Active encrypted `.overlay.diff` 保持KDXTS格式. Export只读取decrypt后的BlockCOW SnapshotView并创建新的immutable logical artifact,绝不把ZIP追加到active diff.
 
@@ -1033,7 +1047,7 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 
 ### 14.1 Atomicity 与 determinism
 
-Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local artifact边写边计算content identity,使用same-directory temp、fsync和no-replace commit. Alias只在root commit后更新.
+Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local `FileSink`/`BundleSink`保持same-directory temp、fsync和atomic no-replace rename,final commit是O(1);alias只在root commit后更新. Named ref-location采用独立的exclusive-create + write-once + full-verify协议,不进入local sink的capture/commit路径.
 
 多盘顺序固定为data disks first、root E last. Snapshot随后写memory S last. 这让S/E root成为可审计的graph commit point.
 

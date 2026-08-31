@@ -137,6 +137,29 @@ func TestLocationPublisherRewritesSandboxAndSnapshotGraphs(t *testing.T) {
 	if sResult.Role != RoleSnapshot {
 		t.Fatalf("S role = %q", sResult.Role)
 	}
+	entries, err := os.ReadDir(outputDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roles := map[string]int{}
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.Mode().IsRegular() {
+			t.Fatalf("named location created non-regular entry %q with mode %s", entry.Name(), info.Mode())
+		}
+		roles[filepath.Ext(entry.Name())]++
+	}
+	if len(entries) != 3 || roles[".overlay"] != 1 || roles[".sandbox"] != 1 || roles[".snapshot"] != 1 {
+		t.Fatalf("named location entries = %v, roles = %v", entries, roles)
+	}
+	for _, alias := range []string{"publish.sandbox", "publish.snapshot", "fixture.sandbox", "fixture.snapshot"} {
+		if _, err := os.Lstat(filepath.Join(outputDir, alias)); !os.IsNotExist(err) {
+			t.Fatalf("named location created semantic alias %q: %v", alias, err)
+		}
+	}
 
 	sRef, err := manifest.ParseRef(sResult.Ref)
 	if err != nil || sRef.Location != "published" {
