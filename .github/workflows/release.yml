@@ -37,7 +37,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: component-release-${{ github.repository }}-${{ inputs.version }}
+  group: component-mutation-${{ github.repository }}-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -276,10 +276,6 @@ jobs:
       - preflight
       - build
     runs-on: [self-hosted, Linux, X64, kuasar-control]
-    concurrency:
-      group: component-publish-${{ github.repository }}
-      cancel-in-progress: false
-      queue: max
     permissions:
       actions: read
       contents: write

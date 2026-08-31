@@ -45,8 +45,12 @@ platform 包。本地可用 `make release VERSION=vX.Y.Z`
 生成并校验相同布局的 release bundle。
 当前 Release 只发布已完成全量构建与 BMS 验证的 Linux x86_64 目标。项目主仓的
 每日协调器显式传入源码分支和精确 SHA;组件 `main` 用于主线,`release/vX.Y.x`
-用于对应组件维护线。Preview 不更新 GitHub Latest;维护分支 Stable 也不覆盖
-组件 `main` 发布的 Latest。组件版本与平台聚合版本独立。
+用于对应组件维护线。Preview 和维护分支 Stable 不更新 GitHub Latest;独立的幂等
+Reconcile Latest 工作流按 `main` 源码提交先后协调主线 Stable,同一提交才比较 SemVer。
+组件版本与平台聚合版本独立,
+平台始终按精确 Tag 选择本组件。
+同版本发布与删除共用完整 workflow mutation group;若 GitHub 合并 pending 请求,项目主仓
+协调器会把 cancelled 状态作为未完成操作自动重跑,不会把它当作发布或 GC 已完成。
 
 构建需要 Go 1.24+;运行还需 **guest-runtime** 发布的 `sandbox-runtime.bundle`
 和 `vmlinux`(guest 内核);patched `cloud-hypervisor` 由本仓
