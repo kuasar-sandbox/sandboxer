@@ -236,7 +236,11 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	} else {
 		// Only the runtime bundle identity is re-checked here: its digest
 		// marker lives in the ZIP footer and is read without scanning the
-		// artifact. The kernel re-hash is skipped (issue #158).
+		// artifact. The kernel gets the cheap artifact preflight only; the
+		// full SHA-256 re-hash is skipped (issue #158).
+		if err := VerifyKernelArtifact(opts.Cfg.Boot.Kernel); err != nil {
+			return -1, fmt.Errorf("boot.kernel identity: %w", err)
+		}
 		runtimeRef, err := ResolveRuntimeProjection(opts.Cfg)
 		if err != nil {
 			return -1, err
@@ -687,6 +691,34 @@ func ResolveRuntimeProjection(cfg *config.SandboxConfig) (string, error) {
 		return "", fmt.Errorf("boot.runtime identity: %w", err)
 	}
 	return runtimeRef, nil
+}
+
+// VerifyKernelArtifact performs the cheap kernel preflight — the binding
+// shape, that the file exists and is a regular file — without the full
+// SHA-256 scan. It preserves buildKernelRef's fail-fast behavior on the
+// restore and portable-config boot paths, where the kernel re-hash is
+// skipped per issue #158.
+func VerifyKernelArtifact(uri string) error {
+	ref, err := manifest.ParseRef(uri)
+	if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Location != "" || !filepath.IsAbs(ref.Path) {
+		return fmt.Errorf("expected absolute unlocated file:// binding")
+	}
+	if ref.Digest != "" {
+		return errors.New("host kernel binding must be a path without an artifact identity")
+	}
+	f, err := os.Open(ref.Path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return errors.New("kernel is not a regular file")
+	}
+	return nil
 }
 
 // PrepareOfflinePortableConfig validates and canonicalizes an explicit config

@@ -177,6 +177,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// nodes deploy kernel artifacts under central control. The runtime bundle
 	// check is kept: its digest marker sits in the ZIP footer and is read
 	// without scanning the artifact.
+	if err := sandbox.VerifyKernelArtifact(snapCfg.Boot.Kernel); err != nil {
+		return -1, fmt.Errorf("boot.kernel identity: %w", err)
+	}
 	runtimeRef, err := sandbox.ResolveRuntimeProjection(&snapCfg)
 	if err != nil {
 		return -1, err
