@@ -39,6 +39,22 @@ func rewriteConfigPaths(in []byte, p pathRewrite) ([]byte, error) {
 		}
 	}
 
+	// net[0]: the restore net_fds rebind (CH patch 0008) addresses the
+	// device by id=_net0, but CH's snapshot serialization auto-assigns
+	// runtime device ids when the boot command line omitted one — legacy
+	// snapshots carry _net2 here. Normalize every fd-less tap device to
+	// id=_net0 so the supplied net_fds entry matches regardless of
+	// snapshot age (sandboxer#161).
+	if nets, ok := cfg["net"].([]any); ok && len(nets) == 1 {
+		if nm, ok := nets[0].(map[string]any); ok {
+			if _, hasFDs := nm["fds"]; !hasFDs || nm["fds"] == nil {
+				if tap, hasTap := nm["tap"].(string); hasTap && tap != "" {
+					nm["id"] = "_net0"
+				}
+			}
+		}
+	}
+
 	// disks[*].vhost_socket — slot i → this run's i-th device socket (device
 	// order: root lower/upper first, then each data disk lower/upper). E and S
 	// are independent roots, so accepting either a surplus or missing device
