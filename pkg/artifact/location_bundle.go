@@ -39,9 +39,6 @@ func (t *locationPublishTarget) PutBundle(ctx context.Context, plan bundlePublis
 		return "", fmt.Errorf("publish Bundle exact verification: %w", err)
 	}
 	rootName := manifest.HexKey(plan.root) + ".bundle"
-	if filepath.Base(plan.path) != rootName {
-		return "", fmt.Errorf("publish Bundle to location: source name %q does not match root Manifest", filepath.Base(plan.path))
-	}
 
 	files := make([]locationBundleFile, 0, len(plan.opened.BundleReader().Refs())+1)
 	seen := make(map[string]struct{})
@@ -166,7 +163,11 @@ func (t *locationPublishTarget) verifyLocatedBundlePlan(
 			}
 		}
 		if reader == nil {
-			return fmt.Errorf("published Bundle graph omits Manifest %s", manifest.HexKey(selected.Key))
+			if _, located := plan.locatedExact[selected.Key]; located {
+				reader = selected.Reader
+			} else {
+				return fmt.Errorf("published Bundle graph omits Manifest %s", manifest.HexKey(selected.Key))
+			}
 		}
 		exactDependencies = append(exactDependencies, manifestbundle.ExactManifest{Key: selected.Key, Reader: reader})
 	}

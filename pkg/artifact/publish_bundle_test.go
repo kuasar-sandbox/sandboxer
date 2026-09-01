@@ -153,6 +153,153 @@ func TestLocationPublisherCopiesBundleExactly(t *testing.T) {
 	}
 }
 
+func TestLocationPublisherCanonicalizesExplicitlySelectedBundleName(t *testing.T) {
+	ctx := context.Background()
+	cfg, storage := manifestPublisherFixture(t)
+	rootRef, sourcePath := bundlePublishFixture(t, cfg, storage)
+	sourceBytes, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	customPath := filepath.Join(t.TempDir(), "release.bundle")
+	if err := os.WriteFile(customPath, sourceBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	root := strings.TrimPrefix(rootRef, "manifest://")
+	input := "file://" + customPath + "@manifest:" + root
+	targetDirectory := t.TempDir()
+	publisher, err := NewLocationPublisher(storage, "shared", targetDirectory, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, publishErr := publisher.Publish(ctx, input)
+	closeErr := publisher.Close()
+	if publishErr != nil || closeErr != nil {
+		t.Fatalf("publish explicitly selected Bundle err=%v close=%v", publishErr, closeErr)
+	}
+	wantRef := "file://" + root + ".bundle@manifest:" + root + "@location:shared"
+	if result.Ref != wantRef {
+		t.Fatalf("published ref = %q, want %q", result.Ref, wantRef)
+	}
+	published, err := os.ReadFile(filepath.Join(targetDirectory, root+".bundle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(published, sourceBytes) {
+		t.Fatal("explicitly selected Bundle was not copied exactly")
+	}
+}
+
+func TestLocationPublisherPreservesLocatedBundleDependency(t *testing.T) {
+	ctx := context.Background()
+	cfg, storage := manifestPublisherFixture(t)
+	keyFn := storage.CustomerKeyFunc()
+
+	externalDirectory := t.TempDir()
+	externalAdmission, err := cfg.WriteAdmission(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalSink, err := snapshot.NewPlannedBundleSink(
+		externalDirectory, "external", cfg, keyFn, externalAdmission, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalRef, _, err := externalSink.AbsorbOverlay(
+		ctx, bytes.NewReader(bytes.Repeat([]byte{0x39}, 8192)), nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := externalSink.CommitSandbox(ctx, externalRef, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := externalSink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	externalKey, err := manifest.ParseKeyRef(externalRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalName := manifest.HexKey(externalKey) + ".bundle"
+
+	rootDirectory := t.TempDir()
+	rootAdmission, err := cfg.WriteAdmission(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalBundleRef := "file://" + externalName + "@location:external"
+	rootSink, err := snapshot.NewPlannedBundleSink(
+		rootDirectory, "root", cfg, keyFn, rootAdmission, []string{externalBundleRef}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeConfig, _ := publishPortable(t, externalRef)
+	rootSource, err := sandboxfile.BuildSource(
+		publishSource(t, bytes.Repeat([]byte{0x4a}, 8192)), nil, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootRef, _, err := rootSink.AbsorbSandbox(ctx, rootSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rootSink.CommitSandbox(ctx, rootRef, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := rootSink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rootKey, err := manifest.ParseKeyRef(rootRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootName := manifest.HexKey(rootKey) + ".bundle"
+	rootPath := filepath.Join(rootDirectory, rootName)
+
+	targetDirectory := t.TempDir()
+	locations := config.RefLocations{
+		"external":  externalDirectory,
+		"published": targetDirectory,
+	}
+	publisher, err := NewLocationPublisher(storage, "published", targetDirectory, locations, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, publishErr := publisher.Publish(ctx, rootPath)
+	closeErr := publisher.Close()
+	if publishErr != nil || closeErr != nil {
+		t.Fatalf("publish Bundle with located dependency err=%v close=%v", publishErr, closeErr)
+	}
+	if result.Role != RoleSandbox {
+		t.Fatalf("published role = %q, want sandbox", result.Role)
+	}
+	wantRef := "file://" + rootName + "@manifest:" + manifest.HexKey(rootKey) + "@location:published"
+	if result.Ref != wantRef {
+		t.Fatalf("published ref = %q, want %q", result.Ref, wantRef)
+	}
+	entries, err := os.ReadDir(targetDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != rootName {
+		t.Fatalf("published location entries = %v, want only root Bundle", entries)
+	}
+	if _, err := os.Lstat(filepath.Join(targetDirectory, externalName)); !os.IsNotExist(err) {
+		t.Fatalf("located dependency was copied into target: %v", err)
+	}
+	info, err := storage.Inspect(ctx, result.Ref, locations)
+	if err != nil {
+		t.Fatalf("official opener rejected published graph: %v", err)
+	}
+	if info.Role != RoleSandbox {
+		t.Fatalf("published graph role = %q, want sandbox", info.Role)
+	}
+}
+
 func TestManifestPublisherUploadsBundleExactly(t *testing.T) {
 	ctx := context.Background()
 	cfg, storage := manifestPublisherFixture(t)

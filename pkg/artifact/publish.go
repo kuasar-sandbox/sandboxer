@@ -57,12 +57,15 @@ type publishTarget interface {
 }
 
 type bundlePublishPlan struct {
-	path               string
-	role               LogicalRole
-	root               store.ContentKey
-	opened             *OpenedFile
-	exactRoot          manifestbundle.ExactManifest
-	exactDependencies  []manifestbundle.ExactManifest
+	path              string
+	role              LogicalRole
+	root              store.ContentKey
+	opened            *OpenedFile
+	exactRoot         manifestbundle.ExactManifest
+	exactDependencies []manifestbundle.ExactManifest
+	// locatedExact are verified Bundle dependencies whose named refs remain
+	// unchanged instead of being copied into the destination location.
+	locatedExact       map[store.ContentKey]struct{}
 	remoteDependencies int
 	keyFn              ingest.CustomerKeyFunc
 	decryptor          manifestcrypto.Decryptor
