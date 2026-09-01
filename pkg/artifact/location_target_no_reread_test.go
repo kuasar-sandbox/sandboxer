@@ -19,7 +19,7 @@ func TestLocationTargetFreshPublicationDoesNotReopenFinal(t *testing.T) {
 			return file.Close()
 		}}
 	}
-	target.fs = &lstatOrderLocationFileSystem{
+	target.fs = &hookedLstatLocationFileSystem{
 		trackingLocationFileSystem: fs,
 		lstatHook: func(path string) (os.FileInfo, error) {
 			if closed {
@@ -41,12 +41,12 @@ func TestLocationTargetFreshPublicationDoesNotReopenFinal(t *testing.T) {
 	}
 }
 
-type lstatOrderLocationFileSystem struct {
+type hookedLstatLocationFileSystem struct {
 	*trackingLocationFileSystem
 	lstatHook func(string) (os.FileInfo, error)
 }
 
-func (f *lstatOrderLocationFileSystem) lstat(path string) (os.FileInfo, error) {
+func (f *hookedLstatLocationFileSystem) lstat(path string) (os.FileInfo, error) {
 	return f.lstatHook(path)
 }
 
@@ -54,7 +54,14 @@ func TestLocationTargetFreshPublicationRejectsReplacedFinal(t *testing.T) {
 	directory := t.TempDir()
 	fs := newTrackingLocationFileSystem()
 	target := locationTestTarget(directory, nil, false)
-	target.fs = fs
+	lstatCalls := 0
+	target.fs = &hookedLstatLocationFileSystem{
+		trackingLocationFileSystem: fs,
+		lstatHook: func(path string) (os.FileInfo, error) {
+			lstatCalls++
+			return fs.base.lstat(path)
+		},
+	}
 	body := bytes.Repeat([]byte("fresh-publish-replaced-final"), 32*1024)
 	replacement := []byte("replacement final from another publisher")
 	var destination string
@@ -89,5 +96,8 @@ func TestLocationTargetFreshPublicationRejectsReplacedFinal(t *testing.T) {
 	}
 	if got := fs.opens.Load(); got != 0 {
 		t.Fatalf("fresh replacement check reopened final %d times, want 0", got)
+	}
+	if lstatCalls != 1 {
+		t.Fatalf("replaced final lstat calls = %d, want only the ownership check", lstatCalls)
 	}
 }

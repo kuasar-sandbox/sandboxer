@@ -272,12 +272,20 @@ func (t *locationPublishTarget) publishFresh(
 	// replacement satisfy os.SameFile.
 	current, err := t.fs.lstat(destination)
 	if os.IsNotExist(err) {
+		// The canonical path no longer identifies the owned inode. Relinquish
+		// cleanup before Close so inode-number reuse cannot make a later entry
+		// look owned to the deferred path-based cleanup.
+		owned = false
 		return errors.Join(errLocationFinalVanished, err, closeCreated())
 	}
 	if err != nil {
+		// Path ownership is unknown. Fail closed and leave explicit cleanup to
+		// the operator rather than risk deleting another publisher's entry.
+		owned = false
 		return fmt.Errorf("stat fresh final path: %w", errors.Join(err, closeCreated()))
 	}
 	if !os.SameFile(ownedInfo, current) {
+		owned = false
 		return errors.Join(
 			fmt.Errorf("%w: path changed after write", errLocationFinalVanished),
 			closeCreated(),
