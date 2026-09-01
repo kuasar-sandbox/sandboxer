@@ -116,7 +116,7 @@ func TestRunRestoreRejectsInvalidPrefetchBeforeRemoteDial(t *testing.T) {
 func TestRunRestoreChecksDigestOnUnlocatedFileRef(t *testing.T) {
 	snapshotPath := writeRunRestoreSnapshot(t)
 	runRoot := filepath.Join(t.TempDir(), "run")
-	ref := "file://" + snapshotPath + "@sha256:" + strings.Repeat("f", 64)
+	ref := "file://" + snapshotPath + "@digest:" + strings.Repeat("f", 64)
 	rc, stderr := captureStderr(t, func() int {
 		return runRestore(
 			context.Background(), &config.SandboxConfig{}, config.FieldPresence{}, nil, ref,

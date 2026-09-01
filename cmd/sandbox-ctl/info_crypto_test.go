@@ -124,8 +124,8 @@ func TestInfoJSONDerivesDiskGraphFromReferencedSandbox(t *testing.T) {
 			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "768MiB"},
 		},
 		Boot: config.PortableBootConfig{
-			Kernel:  "file://vmlinux@sha256:" + digest,
-			Runtime: "file://sandbox-runtime.bundle@sha256:" + digest,
+			Kernel:  "file://vmlinux@digest:" + digest,
+			Runtime: "file://sandbox-runtime.bundle@digest:" + digest,
 			Root:    config.PortableRootConfig{Base: "self"},
 		},
 		Launch:   config.PortableLaunchConfig{Workdir: "/", Restart: "never", CgroupControl: true},

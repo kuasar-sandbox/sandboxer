@@ -121,7 +121,7 @@ func TestPublisherWritesMemorySandboxAndSnapshotBottomUp(t *testing.T) {
 		Version: snapshot.SnapshotConfigVersion,
 		// The parent is an opaque memory layer. Its historical Sandbox need not
 		// exist when the current S explicitly carries the complete E graph.
-		SandboxRef: "file://unavailable.sandbox@sha256:" + publishTestSHA,
+		SandboxRef: "file://unavailable.sandbox@digest:" + publishTestSHA,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +182,7 @@ func TestPublisherWritesMemorySandboxAndSnapshotBottomUp(t *testing.T) {
 	}
 
 	parentRoot, publishedParent := openRecordedSnapshot(t, target.calls[0].body)
-	if publishedParent.SandboxRef != "file://unavailable.sandbox@sha256:"+publishTestSHA {
+	if publishedParent.SandboxRef != "file://unavailable.sandbox@digest:"+publishTestSHA {
 		t.Fatalf("opaque memory parent was traversed or rewritten: %+v", publishedParent)
 	}
 	_ = parentRoot.Close()
@@ -216,6 +216,43 @@ func TestPublisherWritesMemorySandboxAndSnapshotBottomUp(t *testing.T) {
 	}
 	if !reflect.DeepEqual(failedRoles, roles) || failedRoles[len(failedRoles)-1] != RoleSnapshot {
 		t.Fatalf("failed root publication order = %v, want %v", failedRoles, roles)
+	}
+}
+
+func TestPublisherKeepsPortableDependenciesWithoutMaterializingThem(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	storage, err := NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	portableDependency := "manifest://" + strings.Repeat("a", 64)
+	runtimeConfig, _ := publishPortable(t, portableDependency)
+	logical, err := sandboxfile.BuildSource(
+		publishSource(t, bytes.Repeat([]byte{0x29}, 4096)), nil, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := snapshot.NewFileSink(directory, "portable", nil, false, nil)
+	_, path, err := sink.AbsorbSandbox(ctx, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &recordingPublishTarget{}
+	result, err := newPublisher(storage, nil, target, nil).Publish(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Role != RoleSandbox || len(target.calls) != 1 || target.calls[0].role != RoleSandbox {
+		t.Fatalf("publication result=%+v calls=%+v", result, target.calls)
+	}
+	root := openRecordedSandbox(t, target.calls[0].body)
+	defer root.Close()
+	refs := root.Portable.Boot.Root.BaseFromRefs
+	if len(refs) != 1 || refs[0] != portableDependency {
+		t.Fatalf("portable dependency was rewritten: %v", refs)
 	}
 }
 
@@ -424,7 +461,7 @@ func TestPublisherRejectsDiskRefUsedWithConflictingRolesBeforeOutput(t *testing.
 	defer storage.Close()
 	sink := snapshot.NewFileSink(dir, "fixture", nil, false, nil)
 
-	conflictingRef := "file://shared.sandbox@sha256:" + publishTestSHA
+	conflictingRef := "file://shared.sandbox@digest:" + publishTestSHA
 	_, portable := publishPortable(t, "")
 	portable.Boot.Root = config.PortableRootConfig{
 		Base: conflictingRef,

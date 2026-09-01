@@ -21,6 +21,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
 const (
@@ -396,6 +397,29 @@ type sectionStream struct {
 func (s *sectionStream) Size() uint64 { return s.size }
 func (s *sectionStream) Close() error { return s.owner.Close() }
 
+func (s *sectionStream) TarStreamDigest(name string) ([32]byte, bool) {
+	if s.base != 0 || s.owner == nil || s.owner.stream == nil || s.size != s.owner.stream.Size() {
+		return [32]byte{}, false
+	}
+	provider, ok := s.owner.stream.(tarstream.IdentityProvider)
+	if !ok {
+		return [32]byte{}, false
+	}
+	return provider.TarStreamDigest(name)
+}
+
+func (s *sectionStream) PayloadCommitment() (uint64, [32]byte, bool) {
+	if s.base != 0 {
+		return s.size, [32]byte{}, false
+	}
+	provider, ok := s.owner.stream.(tarstream.IdentityProvider)
+	if !ok {
+		return s.size, [32]byte{}, false
+	}
+	size, digest, ok := provider.PayloadCommitment()
+	return size, digest, ok && size == s.size
+}
+
 func (s *sectionStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 	if offset >= s.size {
 		return nil, io.EOF
@@ -474,6 +498,31 @@ type appendedSource struct {
 }
 
 func (s *appendedSource) Size() uint64 { return s.size }
+
+func (s *appendedSource) PayloadCommitment() (uint64, [32]byte, bool) {
+	provider, ok := s.payload.(tarstream.IdentityProvider)
+	if !ok {
+		return s.payload.Size(), [32]byte{}, false
+	}
+	size, digest, ok := provider.PayloadCommitment()
+	if !ok || size != s.payload.Size() {
+		return s.payload.Size(), [32]byte{}, false
+	}
+	return size, digest, true
+}
+
+func (s *appendedSource) TarStreamDigest(name string) ([32]byte, bool) {
+	provider, ok := s.payload.(tarstream.IdentityProvider)
+	if !ok {
+		return [32]byte{}, false
+	}
+	size, digest, ok := provider.PayloadCommitment()
+	if !ok || size != s.payload.Size() {
+		return [32]byte{}, false
+	}
+	result, err := tarstream.ComposeDigest(name, s.size, size, digest, s.tail)
+	return result, err == nil
+}
 
 func (s *appendedSource) RunAt(offset, limit uint64) (sparse.Run, error) {
 	if offset >= s.size {

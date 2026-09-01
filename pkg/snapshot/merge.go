@@ -2,12 +2,10 @@ package snapshot
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"sort"
-	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
@@ -73,11 +71,7 @@ func openMergeBaseWithOpener(ctx context.Context, raw string, size int64, codec 
 	if codec != nil {
 		options = append(options, tarstream.WithCodec(codec, required))
 	}
-	wantScheme, wantDigest, err := mergeExpectedIdentity(ref, codec, required)
-	if err != nil {
-		return nil, nil, err
-	}
-	options = append(options, tarstream.WithExpectedDigest(wantScheme, wantDigest))
+	options = append(options, tarstream.WithExpectedDigest(ref.DigestScheme, ref.Digest))
 	stream, err := fetch.OpenTarStream(ref.Path, options...)
 	if err != nil {
 		return nil, nil, &mergeArtifactError{err: err}
@@ -105,34 +99,6 @@ type mergeArtifactError struct{ err error }
 
 func (e *mergeArtifactError) Error() string { return "merge base: local artifact validation failed" }
 func (e *mergeArtifactError) Unwrap() error { return e.err }
-
-func mergeExpectedIdentity(ref manifest.Ref, codec tarstream.Codec, required bool) (string, string, error) {
-	if codec == nil {
-		if ref.DigestScheme != tarstream.DigestSchemeSHA256 {
-			return "", "", fmt.Errorf("merge base: hmac identity requires local codec")
-		}
-		return ref.DigestScheme, ref.Digest, nil
-	}
-	switch ref.DigestScheme {
-	case tarstream.DigestSchemeHMAC:
-		return ref.DigestScheme, ref.Digest, nil
-	case tarstream.DigestSchemeSHA256:
-		if required {
-			return "", "", fmt.Errorf("merge base: legacy sha256 identity is forbidden by required policy")
-		}
-		var plain [32]byte
-		if len(ref.Digest) != hex.EncodedLen(len(plain)) || strings.ToLower(ref.Digest) != ref.Digest {
-			return "", "", fmt.Errorf("merge base: invalid legacy sha256 identity")
-		}
-		if _, err := hex.Decode(plain[:], []byte(ref.Digest)); err != nil {
-			return "", "", fmt.Errorf("merge base: invalid legacy sha256 identity")
-		}
-		keyed := codec.KeyedDigest(plain)
-		return tarstream.DigestSchemeHMAC, hex.EncodeToString(keyed[:]), nil
-	default:
-		return "", "", fmt.Errorf("merge base: unsupported digest scheme")
-	}
-}
 
 // ValidateMergeBase performs the same structural, expected-identity, and logical
 // size checks Take will apply to a local memory or disk merge base, without

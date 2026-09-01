@@ -30,10 +30,10 @@ func livePortableBytes(t *testing.T) []byte {
 			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "512MiB"},
 		},
 		Boot: config.PortableBootConfig{
-			Kernel:  "file://vmlinux@sha256:" + sandboxTestSHA,
-			Runtime: "file://sandbox-runtime.bundle@sha256:" + sandboxTestSHA2,
+			Kernel:  "file://vmlinux@digest:" + sandboxTestSHA,
+			Runtime: "file://sandbox-runtime.bundle@digest:" + sandboxTestSHA2,
 			Root: config.PortableRootConfig{
-				Base:    "file://root.erofs@sha256:" + sandboxTestSHA,
+				Base:    "file://root.erofs@digest:" + sandboxTestSHA,
 				Overlay: &config.PortableOverlayConfig{Base: "self"},
 			},
 		},

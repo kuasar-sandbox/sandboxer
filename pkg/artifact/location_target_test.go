@@ -27,11 +27,38 @@ import (
 
 func locationTestSource(t *testing.T, body []byte) sparse.Source {
 	t.Helper()
-	source, err := sparse.NewSource(bytes.NewReader(body), uint64(len(body)), nil)
+	payload, err := sparse.NewSource(bytes.NewReader(body), uint64(len(body)), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return source
+	var carrier bytes.Buffer
+	if _, _, err := tarstream.WriteTo(context.Background(), &carrier, "fixture", payload); err != nil {
+		t.Fatal(err)
+	}
+	opened, _, err := tarstream.SourceAt(bytes.NewReader(carrier.Bytes()), int64(carrier.Len()), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	size, digest, ok := opened.(tarstream.IdentityProvider).PayloadCommitment()
+	if !ok || size != uint64(len(body)) {
+		t.Fatal("fixture carrier did not expose its payload commitment")
+	}
+	return &locationTestCarrier{Source: payload, payloadSize: size, payloadDigest: digest}
+}
+
+type locationTestCarrier struct {
+	sparse.Source
+	payloadSize   uint64
+	payloadDigest [32]byte
+}
+
+func (s *locationTestCarrier) TarStreamDigest(name string) ([32]byte, bool) {
+	digest, err := tarstream.ComposeDigest(name, s.Size(), s.payloadSize, s.payloadDigest, nil)
+	return digest, err == nil
+}
+
+func (s *locationTestCarrier) PayloadCommitment() (uint64, [32]byte, bool) {
+	return s.payloadSize, s.payloadDigest, true
 }
 
 func locationTestTarget(directory string, codec tarstream.Codec, required bool) *locationPublishTarget {
@@ -128,7 +155,13 @@ type trackingLocationReadFile struct {
 }
 
 func (f *trackingLocationReadFile) Read(body []byte) (int, error) { return f.base.Read(body) }
-func (f *trackingLocationReadFile) Stat() (os.FileInfo, error)    { return f.base.Stat() }
+func (f *trackingLocationReadFile) ReadAt(body []byte, offset int64) (int, error) {
+	return f.base.ReadAt(body, offset)
+}
+func (f *trackingLocationReadFile) Seek(offset int64, whence int) (int64, error) {
+	return f.base.Seek(offset, whence)
+}
+func (f *trackingLocationReadFile) Stat() (os.FileInfo, error) { return f.base.Stat() }
 func (f *trackingLocationReadFile) Sync() error {
 	f.owner.fileSyncs.Add(1)
 	return f.base.Sync()
@@ -141,10 +174,11 @@ func TestLocationTargetFreshPublicationWritesSharedFinalOnce(t *testing.T) {
 	target := locationTestTarget(directory, nil, false)
 	target.fs = fs
 	body := bytes.Repeat([]byte("rename-free-location"), 64*1024)
+	source := &failingLocationSource{inner: locationTestSource(t, body), fail: ^uint64(0)}
 
 	oldUmask := unix.Umask(0o077)
 	t.Cleanup(func() { unix.Umask(oldUmask) })
-	refRaw, err := target.Put(context.Background(), RoleOverlay, locationTestSource(t, body))
+	refRaw, err := target.Put(context.Background(), RoleOverlay, source)
 	unix.Umask(oldUmask)
 	if err != nil {
 		t.Fatal(err)
@@ -153,7 +187,7 @@ func TestLocationTargetFreshPublicationWritesSharedFinalOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ref.Location != "shared" || ref.DigestScheme != tarstream.DigestSchemeSHA256 || filepath.Ext(ref.Path) != ".overlay" {
+	if ref.Location != "shared" || ref.DigestScheme != tarstream.DigestScheme || filepath.Ext(ref.Path) != ".overlay" {
 		t.Fatalf("published ref = %#v", ref)
 	}
 	path := filepath.Join(directory, ref.Path)
@@ -169,6 +203,9 @@ func TestLocationTargetFreshPublicationWritesSharedFinalOnce(t *testing.T) {
 	}
 	if got := fs.written.Load(); got != info.Size() {
 		t.Fatalf("shared-target write bytes = %d, final size = %d", got, info.Size())
+	}
+	if got := source.read.Load(); got != uint64(len(body)) {
+		t.Fatalf("logical source read bytes = %d, want one %d-byte encoding pass", got, len(body))
 	}
 	entries, err := os.ReadDir(directory)
 	if err != nil {
@@ -343,7 +380,7 @@ func locationTestDestination(t *testing.T, target *locationPublishTarget, role L
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, digest, err := target.determineIdentity(context.Background(), payload, locationTestSource(t, body))
+	_, digest, err := tarstream.CarrierDigest(payload, locationTestSource(t, body), target.writeOptions()...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +484,7 @@ func TestLocationTargetKeepsValidatedFinalWhenDirectorySyncFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheme, digest, err := target.determineIdentity(context.Background(), payload, locationTestSource(t, body))
+	scheme, digest, err := tarstream.CarrierDigest(payload, locationTestSource(t, body), target.writeOptions()...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +493,7 @@ func TestLocationTargetKeepsValidatedFinalWhenDirectorySyncFails(t *testing.T) {
 	if !errors.Is(err, unix.EIO) {
 		t.Fatalf("directory sync error = %v, want EIO", err)
 	}
-	if err := target.validateLocationFinal(context.Background(), path, payload, uint64(len(body)), scheme, digest, false); err != nil {
+	if err := target.validateFinal(context.Background(), path, payload, uint64(len(body)), scheme, digest, false); err != nil {
 		t.Fatalf("validated final was removed after directory sync failure: %v", err)
 	}
 }
@@ -534,24 +571,24 @@ func (f *hookedLocationWriteFile) Close() error {
 	return f.base.Close()
 }
 
-type failAfterFirstPassSource struct {
+type failingLocationSource struct {
 	inner sparse.Source
 	read  atomic.Uint64
-	size  uint64
+	fail  uint64
 }
 
-func (s *failAfterFirstPassSource) Size() uint64 { return s.size }
+func (s *failingLocationSource) Size() uint64 { return s.inner.Size() }
 
-func (s *failAfterFirstPassSource) RunAt(offset, limit uint64) (sparse.Run, error) {
+func (s *failingLocationSource) RunAt(offset, limit uint64) (sparse.Run, error) {
 	run, err := s.inner.RunAt(offset, limit)
 	if err != nil {
 		return nil, err
 	}
-	return &failAfterFirstPassRun{inner: run, source: s}, nil
+	return &failingLocationRun{inner: run, source: s}, nil
 }
 
-func (s *failAfterFirstPassSource) ReadAt(ctx context.Context, body []byte, offset uint64) (int, error) {
-	if s.read.Load() >= s.size {
+func (s *failingLocationSource) ReadAt(ctx context.Context, body []byte, offset uint64) (int, error) {
+	if s.read.Load() >= s.fail {
 		return 0, errInjectedLocationFailure
 	}
 	n, err := s.inner.ReadAt(ctx, body, offset)
@@ -559,16 +596,32 @@ func (s *failAfterFirstPassSource) ReadAt(ctx context.Context, body []byte, offs
 	return n, err
 }
 
-type failAfterFirstPassRun struct {
-	inner  sparse.Run
-	source *failAfterFirstPassSource
+func (s *failingLocationSource) TarStreamDigest(name string) ([32]byte, bool) {
+	provider, ok := s.inner.(tarstream.IdentityProvider)
+	if !ok {
+		return [32]byte{}, false
+	}
+	return provider.TarStreamDigest(name)
 }
 
-func (r *failAfterFirstPassRun) Offset() uint64       { return r.inner.Offset() }
-func (r *failAfterFirstPassRun) End() uint64          { return r.inner.End() }
-func (r *failAfterFirstPassRun) Kind() sparse.RunKind { return r.inner.Kind() }
-func (r *failAfterFirstPassRun) ReadAt(ctx context.Context, body []byte, offset uint64) (int, error) {
-	if r.source.read.Load() >= r.source.size {
+func (s *failingLocationSource) PayloadCommitment() (uint64, [32]byte, bool) {
+	provider, ok := s.inner.(tarstream.IdentityProvider)
+	if !ok {
+		return 0, [32]byte{}, false
+	}
+	return provider.PayloadCommitment()
+}
+
+type failingLocationRun struct {
+	inner  sparse.Run
+	source *failingLocationSource
+}
+
+func (r *failingLocationRun) Offset() uint64       { return r.inner.Offset() }
+func (r *failingLocationRun) End() uint64          { return r.inner.End() }
+func (r *failingLocationRun) Kind() sparse.RunKind { return r.inner.Kind() }
+func (r *failingLocationRun) ReadAt(ctx context.Context, body []byte, offset uint64) (int, error) {
+	if r.source.read.Load() >= r.source.fail {
 		return 0, errInjectedLocationFailure
 	}
 	n, err := r.inner.ReadAt(ctx, body, offset)
@@ -590,7 +643,7 @@ func TestLocationTargetCleansOnlyOwnedPartialFinal(t *testing.T) {
 			}
 			var source sparse.Source = locationTestSource(t, body)
 			if fault == "source-read" {
-				source = &failAfterFirstPassSource{inner: locationTestSource(t, body), size: uint64(len(body))}
+				source = &failingLocationSource{inner: locationTestSource(t, body), fail: 64 * 1024}
 			}
 			fs.wrapCreate = func(_ string, file locationWriteFile) locationWriteFile {
 				hooked := &hookedLocationWriteFile{base: file}
@@ -615,7 +668,7 @@ func TestLocationTargetCleansOnlyOwnedPartialFinal(t *testing.T) {
 			}
 			target.fs = fs
 			if fault == "validation" {
-				target.validate = func(context.Context, string, string, uint64, string, string, bool) error {
+				target.validate = func(context.Context, locationReadFile, os.FileInfo, string, uint64, string, string, bool) error {
 					return errInjectedLocationFailure
 				}
 			}
@@ -750,21 +803,23 @@ func TestLocationTargetSourceContractExcludesRenameAndLinks(t *testing.T) {
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
-	path := filepath.Join(filepath.Dir(current), "location_target.go")
-	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
 	forbidden := map[string]bool{
 		"Rename": true, "Renameat2": true, "Link": true, "Linkat": true, "Symlink": true,
 	}
-	ast.Inspect(parsed, func(node ast.Node) bool {
-		selector, ok := node.(*ast.SelectorExpr)
-		if ok && forbidden[selector.Sel.Name] {
-			t.Errorf("named-location target calls forbidden filesystem operation %s", selector.Sel.Name)
+	for _, name := range []string{"location_target.go", "location_bundle.go"} {
+		path := filepath.Join(filepath.Dir(current), name)
+		parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatal(err)
 		}
-		return true
-	})
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			selector, ok := node.(*ast.SelectorExpr)
+			if ok && forbidden[selector.Sel.Name] {
+				t.Errorf("named-location target %s calls forbidden filesystem operation %s", name, selector.Sel.Name)
+			}
+			return true
+		})
+	}
 }
 
 func TestLocalSinksRetainAtomicRenameCommit(t *testing.T) {
@@ -802,5 +857,5 @@ func TestLocalSinksRetainAtomicRenameCommit(t *testing.T) {
 }
 
 var _ locationFileSystem = (*trackingLocationFileSystem)(nil)
-var _ sparse.Source = (*failAfterFirstPassSource)(nil)
-var _ sparse.Run = (*failAfterFirstPassRun)(nil)
+var _ sparse.Source = (*failingLocationSource)(nil)
+var _ sparse.Run = (*failingLocationRun)(nil)

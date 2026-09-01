@@ -112,7 +112,7 @@ key_bound_ref() { # $1=plaintext artifact $2=encrypted output
     manifest_key=$("$BIN/manifest-ctl" store --manifest-config "$AUTO_CONFIG" --no-progress "$plain")
     "$BIN/manifest-ctl" load --manifest-config "$REQUIRED_CONFIG" --no-progress \
         --output "$encrypted" "$manifest_key"
-    plain_digest=$(tar -tf "$plain" | sed -n 's/^\.kuasar\.sha256\.\([0-9a-f]\{64\}\)$/\1/p')
+    plain_digest=$(tar -tf "$plain" | sed -n 's/^\.kuasar\.digest\.\([0-9a-f]\{64\}\)$/\1/p')
     [ "${#plain_digest}" -eq 64 ] || { echo "FAIL: plaintext fixture has no canonical digest marker" >&2; return 1; }
     digest=$(python3 - "$KEY" "$plain_digest" <<'PY'
 import hashlib, hmac, sys

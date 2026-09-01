@@ -10,7 +10,7 @@ const snapshotConfigTestKey = "0123456789abcdef0123456789abcdef0123456789abcdef0
 
 func TestSnapshotConfigCanonicalStrictSchema(t *testing.T) {
 	cfg := &Config{Version: 1, SandboxRef: "manifest://" + snapshotConfigTestKey,
-		FromRefs: []string{"file://parent.snapshot@sha256:" + snapshotConfigTestKey}}
+		FromRefs: []string{"file://parent.snapshot@digest:" + snapshotConfigTestKey}}
 	a, err := MarshalConfig(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +42,7 @@ func TestSnapshotConfigCanonicalStrictSchema(t *testing.T) {
 
 func TestSnapshotConfigRejectsNonPortableAndDuplicateRefs(t *testing.T) {
 	for _, cfg := range []*Config{
-		{Version: 1, SandboxRef: "file:///tmp/root.sandbox@sha256:" + snapshotConfigTestKey},
+		{Version: 1, SandboxRef: "file:///tmp/root.sandbox@digest:" + snapshotConfigTestKey},
 		{Version: 1, SandboxRef: "manifest://" + snapshotConfigTestKey, FromRefs: []string{"self"}},
 		{Version: 1, SandboxRef: "manifest://" + snapshotConfigTestKey,
 			FromRefs: []string{"manifest://" + snapshotConfigTestKey, "manifest://" + snapshotConfigTestKey}},

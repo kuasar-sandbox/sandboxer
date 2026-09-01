@@ -2,7 +2,6 @@ package artifact
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,9 +21,8 @@ import (
 // committed with an atomic no-replace rename. A named location is a shared
 // immutable-object target: it determines the canonical identity without a
 // target write, exclusively creates the content-addressed final, and encodes
-// directly into that final exactly once. Fresh publication relies on checked
-// writes, fsync, and a lightweight final-path identity check; only an O_EXCL
-// collision is independently opened and fully validated before reuse.
+// directly into that final exactly once. Fresh and reused finals are reopened
+// without following symlinks and fully validated before publication succeeds.
 type locationPublishTarget struct {
 	location  string
 	directory string
@@ -54,7 +52,8 @@ var defaultLocationRetryPolicy = locationRetryPolicy{
 
 type locationValidator func(
 	context.Context,
-	string,
+	locationReadFile,
+	os.FileInfo,
 	string,
 	uint64,
 	string,
@@ -72,6 +71,8 @@ type locationWriteFile interface {
 
 type locationReadFile interface {
 	io.Reader
+	io.ReaderAt
+	io.Seeker
 	Stat() (os.FileInfo, error)
 	Sync() error
 	Close() error
@@ -140,16 +141,9 @@ func (t *locationPublishTarget) Put(ctx context.Context, role LogicalRole, sourc
 		return "", err
 	}
 
-	// tarstream identity covers canonical bytes before the marker and is only
-	// known after reading the logical source. Publisher constructs every source
-	// passed to this private target from a random-access fetch.Stream (possibly
-	// with a deterministic in-memory tail), so two reads are supported even
-	// though sparse.Source's baseline contract also permits one-pass sources.
-	// The first pass writes nowhere; the second pass is the sole complete write
-	// in the shared target.
-	scheme, digest, err := t.determineIdentity(ctx, payload, source)
+	scheme, digest, err := tarstream.CarrierDigest(payload, source, t.writeOptions()...)
 	if err != nil {
-		return "", fmt.Errorf("publish location %s: determine identity: %w", role, err)
+		return "", fmt.Errorf("publish location %s: carrier identity: %w", role, err)
 	}
 	basename := digest + "." + payload
 	ref := manifest.Ref{
@@ -203,19 +197,6 @@ func locationPayloadName(role LogicalRole) (string, error) {
 	}
 }
 
-func (t *locationPublishTarget) determineIdentity(ctx context.Context, payload string, source sparse.Source) (string, string, error) {
-	scheme, digest, err := tarstream.WriteTo(ctx, io.Discard, payload, source)
-	if err != nil || t.codec == nil {
-		return scheme, digest, err
-	}
-	var plain [32]byte
-	if _, err := hex.Decode(plain[:], []byte(digest)); err != nil {
-		return "", "", fmt.Errorf("invalid canonical identity: %w", err)
-	}
-	keyed := t.codec.KeyedDigest(plain)
-	return tarstream.DigestSchemeHMAC, hex.EncodeToString(keyed[:]), nil
-}
-
 func (t *locationPublishTarget) publishFresh(
 	ctx context.Context,
 	created locationWriteFile,
@@ -224,24 +205,42 @@ func (t *locationPublishTarget) publishFresh(
 	source sparse.Source,
 	scheme string,
 	digest string,
+) error {
+	return t.commitFreshLocationFile(
+		created,
+		destination,
+		func(file locationWriteFile) error {
+			writtenScheme, writtenDigest, err := tarstream.WriteTo(ctx, file, payload, source, t.writeOptions()...)
+			if err != nil {
+				return fmt.Errorf("write final: %w", err)
+			}
+			if writtenScheme != scheme || writtenDigest != digest {
+				return errors.New("write final: logical source changed between identity and publication")
+			}
+			return nil
+		},
+		func(file locationReadFile, info os.FileInfo) error {
+			if err := t.validateOpenedFinal(ctx, file, info, payload, source.Size(), scheme, digest, false); err != nil {
+				return fmt.Errorf("validate final: %w", err)
+			}
+			return nil
+		},
+	)
+}
+
+func (t *locationPublishTarget) commitFreshLocationFile(
+	created locationWriteFile,
+	destination string,
+	write func(locationWriteFile) error,
+	validate func(locationReadFile, os.FileInfo) error,
 ) (retErr error) {
 	ownedInfo, err := created.Stat()
 	if err != nil {
-		closeErr := created.Close()
 		// Without fstat identity, path-based removal could delete a replacement.
 		// Leave the unknown entry for explicit cleanup rather than guessing.
-		return fmt.Errorf("stat exclusively-created final: %w", errors.Join(err, closeErr))
+		return fmt.Errorf("stat exclusively-created final: %w", errors.Join(err, created.Close()))
 	}
 	owned := true
-	defer func() {
-		if !owned {
-			return
-		}
-		if cleanupErr := t.removeOwned(destination, ownedInfo); cleanupErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("remove owned incomplete final: %w", cleanupErr))
-		}
-	}()
-
 	closed := false
 	closeCreated := func() error {
 		if closed {
@@ -250,66 +249,112 @@ func (t *locationPublishTarget) publishFresh(
 		closed = true
 		return created.Close()
 	}
+	var guard, verifier locationReadFile
+	guardClosed, verifierClosed := false, false
+	closeGuard := func() error {
+		if guard == nil || guardClosed {
+			return nil
+		}
+		guardClosed = true
+		return guard.Close()
+	}
+	closeVerifier := func() error {
+		if verifier == nil || verifierClosed {
+			return nil
+		}
+		verifierClosed = true
+		return verifier.Close()
+	}
+	defer func() {
+		// Remove while every fd that was successfully opened still pins the
+		// original inode. Closing first would allow inode-number reuse to make a
+		// replacement appear owned to os.SameFile.
+		if owned {
+			if cleanupErr := t.removeOwned(destination, ownedInfo); cleanupErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("remove owned incomplete final: %w", cleanupErr))
+			}
+		}
+		retErr = errors.Join(retErr, closeVerifier(), closeGuard(), closeCreated())
+	}()
 	if err := created.Chmod(0o644); err != nil {
-		return fmt.Errorf("set final permissions: %w", errors.Join(err, closeCreated()))
+		return fmt.Errorf("set final permissions: %w", err)
 	}
-	options := t.writeOptions()
-	writtenScheme, writtenDigest, err := tarstream.WriteTo(ctx, created, payload, source, options...)
-	if err != nil {
-		return fmt.Errorf("write final: %w", errors.Join(err, closeCreated()))
-	}
-	if writtenScheme != scheme || writtenDigest != digest {
-		return errors.Join(
-			errors.New("write final: logical source changed between identity and publication"),
-			closeCreated(),
-		)
+	if err := write(created); err != nil {
+		return err
 	}
 	if err := created.Sync(); err != nil {
-		return fmt.Errorf("sync final: %w", errors.Join(err, closeCreated()))
+		return fmt.Errorf("sync final: %w", err)
 	}
 	// Keep the owned fd open until the namespace check completes. Otherwise an
-	// unlink after Close could immediately recycle its inode number and let a
-	// replacement satisfy os.SameFile.
+	// unlink after Close could recycle its inode number and let a replacement
+	// satisfy os.SameFile.
 	current, err := t.fs.lstat(destination)
 	if os.IsNotExist(err) {
-		// The canonical path no longer identifies the owned inode. Relinquish
-		// cleanup before Close so inode-number reuse cannot make a later entry
-		// look owned to the deferred path-based cleanup.
 		owned = false
-		return errors.Join(errLocationFinalVanished, err, closeCreated())
+		return errors.Join(errLocationFinalVanished, err)
 	}
 	if err != nil {
-		// Path ownership is unknown. Fail closed and leave explicit cleanup to
-		// the operator rather than risk deleting another publisher's entry.
+		// Path ownership is unknown. Preserve the entry rather than risk deleting
+		// another publisher's path.
 		owned = false
-		return fmt.Errorf("stat fresh final path: %w", errors.Join(err, closeCreated()))
+		return fmt.Errorf("stat fresh final path: %w", err)
 	}
 	if !os.SameFile(ownedInfo, current) {
 		owned = false
-		return errors.Join(
-			fmt.Errorf("%w: path changed after write", errLocationFinalVanished),
-			closeCreated(),
-		)
+		return fmt.Errorf("%w: path changed after write", errLocationFinalVanished)
+	}
+	// Pin the exclusively-created inode before closing the write fd. The guard
+	// is metadata-only; content is consumed once through the verifier opened
+	// after Close, as required by the publication contract.
+	guard, err = t.fs.openNoFollow(destination)
+	if err != nil {
+		return fmt.Errorf("open fresh final guard: %w", err)
+	}
+	guardInfo, err := guard.Stat()
+	if err != nil {
+		return fmt.Errorf("stat fresh final guard: %w", err)
+	}
+	if !guardInfo.Mode().IsRegular() || !os.SameFile(ownedInfo, guardInfo) {
+		owned = false
+		return fmt.Errorf("%w: guarded path changed after write", errLocationFinalVanished)
 	}
 	if err := closeCreated(); err != nil {
 		return fmt.Errorf("close final: %w", err)
 	}
-	// validate is an optional fault-injection seam. Production fresh publication
-	// deliberately does not reopen and reread the shared final: WriteTo checked
-	// every source read and destination write, reproduced the identity selected
-	// by the first pass, and the exclusively-created fd has been synced and
-	// closed. Readers authenticate and verify the tarstream on use. A collision,
-	// whose inode is not owned by this publisher, still requires the independent
-	// full validation in reuseExisting.
-	if t.validate != nil {
-		if err := t.validateFinal(ctx, destination, payload, source.Size(), scheme, digest, false); err != nil {
-			return fmt.Errorf("validate final: %w", err)
-		}
+	verifier, err = t.fs.openNoFollow(destination)
+	if err != nil {
+		return fmt.Errorf("reopen final for validation: %w", err)
 	}
-	// The owned final is complete and its canonical path still names the same
-	// inode. Do not remove it if only the subsequent directory durability step
-	// fails; a concurrent publisher may already have reused it.
+	verifierInfo, err := verifier.Stat()
+	if err != nil {
+		return fmt.Errorf("stat reopened final: %w", err)
+	}
+	if !verifierInfo.Mode().IsRegular() || !os.SameFile(guardInfo, verifierInfo) {
+		owned = false
+		return fmt.Errorf("%w: final changed while reopening", errLocationFinalVanished)
+	}
+	if err := validate(verifier, verifierInfo); err != nil {
+		return err
+	}
+	current, err = t.fs.lstat(destination)
+	if os.IsNotExist(err) {
+		owned = false
+		return errors.Join(errLocationFinalVanished, err)
+	}
+	if err != nil {
+		owned = false
+		return fmt.Errorf("stat validated final path: %w", err)
+	}
+	if !os.SameFile(verifierInfo, current) {
+		owned = false
+		return fmt.Errorf("%w: path changed during validation", errLocationFinalVanished)
+	}
+	// Do not remove a fully validated final if only directory durability fails;
+	// a concurrent publisher may already have reused it.
 	owned = false
+	if err := errors.Join(closeVerifier(), closeGuard()); err != nil {
+		return fmt.Errorf("close final validation descriptors: %w", err)
+	}
 	if err := t.fs.syncDirectory(t.directory); err != nil {
 		return fmt.Errorf("sync parent directory: %w", err)
 	}
@@ -411,14 +456,7 @@ func isRetryableLocationMismatch(err error) bool {
 	return false
 }
 
-func (t *locationPublishTarget) validateFinal(ctx context.Context, path, payload string, logicalSize uint64, scheme, digest string, syncFile bool) error {
-	if t.validate != nil {
-		return t.validate(ctx, path, payload, logicalSize, scheme, digest, syncFile)
-	}
-	return t.validateLocationFinal(ctx, path, payload, logicalSize, scheme, digest, syncFile)
-}
-
-func (t *locationPublishTarget) validateLocationFinal(ctx context.Context, path, payload string, logicalSize uint64, scheme, digest string, syncFile bool) (retErr error) {
+func (t *locationPublishTarget) validateFinal(ctx context.Context, path, payload string, logicalSize uint64, scheme, digest string, syncFile bool) (retErr error) {
 	file, err := t.fs.openNoFollow(path)
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
@@ -436,6 +474,26 @@ func (t *locationPublishTarget) validateLocationFinal(ctx context.Context, path,
 	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("%w: mode %s", errLocationFinalNonRegular, info.Mode())
+	}
+	if err := t.validateOpenedFinal(ctx, file, info, payload, logicalSize, scheme, digest, syncFile); err != nil {
+		return err
+	}
+	current, err := t.fs.lstat(path)
+	if os.IsNotExist(err) {
+		return errors.Join(errLocationFinalVanished, err)
+	}
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, current) {
+		return fmt.Errorf("%w: path changed during validation", errLocationFinalVanished)
+	}
+	return nil
+}
+
+func (t *locationPublishTarget) validateOpenedFinal(ctx context.Context, file locationReadFile, info os.FileInfo, payload string, logicalSize uint64, scheme, digest string, syncFile bool) error {
+	if t.validate != nil {
+		return t.validate(ctx, file, info, payload, logicalSize, scheme, digest, syncFile)
 	}
 	options := []tarstream.ReadOption{tarstream.WithExpectedDigest(scheme, digest)}
 	if t.codec != nil {
@@ -460,16 +518,6 @@ func (t *locationPublishTarget) validateLocationFinal(ctx context.Context, path,
 		if err := file.Sync(); err != nil {
 			return fmt.Errorf("sync existing final: %w", err)
 		}
-	}
-	current, err := t.fs.lstat(path)
-	if os.IsNotExist(err) {
-		return errors.Join(errLocationFinalVanished, err)
-	}
-	if err != nil {
-		return err
-	}
-	if !os.SameFile(info, current) {
-		return fmt.Errorf("%w: path changed during validation", errLocationFinalVanished)
 	}
 	return nil
 }

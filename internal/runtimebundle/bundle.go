@@ -1,6 +1,6 @@
 // Package runtimebundle inspects the virtio-pmem runtime artifact without
 // reading its EROFS prefix. The bundle format is raw EROFS + padding followed
-// by one trailing ZIP entry whose empty filename carries the SHA256 identity.
+// by one trailing ZIP entry whose empty filename carries the digest identity.
 package runtimebundle
 
 import (
@@ -20,7 +20,7 @@ const pmemAlignment = int64(2 << 20)
 // Info is the metadata needed by lifecycle and restore paths.
 type Info struct {
 	Size   int64
-	Digest string // "sha256:<64-lowercase-hex>"
+	Digest string // "digest:<64-lowercase-hex>"
 }
 
 // Inspect validates the bundle envelope and reads its declared identity. It
@@ -59,7 +59,7 @@ func Inspect(path string) (Info, error) {
 	if zf.Method != zip.Store || zf.CompressedSize64 != 0 || zf.UncompressedSize64 != 0 {
 		return Info{}, fmt.Errorf("runtime bundle %s: digest marker %q is not empty", path, zf.Name)
 	}
-	hexDigest := strings.TrimPrefix(zf.Name, tarstream.SHA256MarkerPrefix)
+	hexDigest := strings.TrimPrefix(zf.Name, tarstream.DigestMarkerPrefix)
 	if hexDigest == zf.Name || len(hexDigest) != 64 || strings.ToLower(hexDigest) != hexDigest {
 		return Info{}, fmt.Errorf("runtime bundle %s: invalid digest marker %q", path, zf.Name)
 	}
@@ -81,5 +81,5 @@ func Inspect(path string) (Info, error) {
 	if n != 0 {
 		return Info{}, fmt.Errorf("runtime bundle %s: digest marker %q is not empty", path, zf.Name)
 	}
-	return Info{Size: st.Size(), Digest: "sha256:" + hexDigest}, nil
+	return Info{Size: st.Size(), Digest: "digest:" + hexDigest}, nil
 }

@@ -17,7 +17,7 @@ func TestInspect(t *testing.T) {
 	var footer bytes.Buffer
 	zw := zip.NewWriter(&footer)
 	h := &zip.FileHeader{
-		Name:     tarstream.SHA256MarkerPrefix + digest,
+		Name:     tarstream.DigestMarkerPrefix + digest,
 		Method:   zip.Store,
 		Modified: time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
@@ -38,7 +38,7 @@ func TestInspect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size != pmemAlignment || info.Digest != "sha256:"+digest {
+	if info.Size != pmemAlignment || info.Digest != "digest:"+digest {
 		t.Fatalf("info = %+v", info)
 	}
 }
@@ -59,13 +59,13 @@ func TestInspectRejectsInvalidMarkerZIP(t *testing.T) {
 		entries map[string]string
 		trailer []byte
 	}{
-		{name: "invalid-name", entries: map[string]string{tarstream.SHA256MarkerPrefix + "bad": ""}},
-		{name: "nonempty", entries: map[string]string{tarstream.SHA256MarkerPrefix + strings.Repeat("a", 64): "x"}},
+		{name: "invalid-name", entries: map[string]string{tarstream.DigestMarkerPrefix + "bad": ""}},
+		{name: "nonempty", entries: map[string]string{tarstream.DigestMarkerPrefix + strings.Repeat("a", 64): "x"}},
 		{name: "duplicate", entries: map[string]string{
-			tarstream.SHA256MarkerPrefix + strings.Repeat("a", 64): "",
-			tarstream.SHA256MarkerPrefix + strings.Repeat("b", 64): "",
+			tarstream.DigestMarkerPrefix + strings.Repeat("a", 64): "",
+			tarstream.DigestMarkerPrefix + strings.Repeat("b", 64): "",
 		}},
-		{name: "trailing-data", entries: map[string]string{tarstream.SHA256MarkerPrefix + strings.Repeat("a", 64): ""}, trailer: []byte("junk")},
+		{name: "trailing-data", entries: map[string]string{tarstream.DigestMarkerPrefix + strings.Repeat("a", 64): ""}, trailer: []byte("junk")},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

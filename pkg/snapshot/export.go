@@ -207,7 +207,7 @@ func ValidateExportGraph(portable *config.PortableSandboxConfig, parentSandboxRe
 			// ref emitted by any sink. Manifest and Bundle refs are shorter, and
 			// local HMAC uses a shorter digest-scheme name. Using this shape makes
 			// the canonical-size check below an upper bound for every carrier.
-			candidate := "file://" + digestHex + ".overlay@sha256:" + digestHex
+			candidate := "file://" + digestHex + ".overlay@digest:" + digestHex
 			if _, exists := used[candidate]; exists {
 				continue
 			}

@@ -21,7 +21,7 @@ func TestSnapshotCfgReaderDerivesCompatibilityProjectionFromSandbox(t *testing.T
 	)
 	ctx := context.Background()
 	dir := t.TempDir()
-	baseRef := "file://root.erofs@sha256:" + shaAlt
+	baseRef := "file://root.erofs@digest:" + shaAlt
 	lowerRef := "manifest://" + strings.Repeat("b", 64)
 	portable := &config.PortableSandboxConfig{
 		Version: config.PortableSandboxConfigVersion,
@@ -30,8 +30,8 @@ func TestSnapshotCfgReaderDerivesCompatibilityProjectionFromSandbox(t *testing.T
 			Allocatable: config.AllocatableConfig{CPU: 1.5, Memory: "768MiB"},
 		},
 		Boot: config.PortableBootConfig{
-			Kernel:  "file://vmlinux@sha256:" + sha,
-			Runtime: "file://sandbox-runtime.bundle@sha256:" + shaAlt,
+			Kernel:  "file://vmlinux@digest:" + sha,
+			Runtime: "file://sandbox-runtime.bundle@digest:" + shaAlt,
 			Root: config.PortableRootConfig{
 				Base: baseRef,
 				Overlay: &config.PortableOverlayConfig{

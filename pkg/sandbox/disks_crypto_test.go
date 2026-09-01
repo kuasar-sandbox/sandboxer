@@ -32,7 +32,7 @@ func TestOpenDiskStreamLocalCryptoMatrix(t *testing.T) {
 	payload := bytes.Repeat([]byte("local-crypto"), 1024)
 	plainPath, plainScheme, plainDigest := writeDiskArtifact(t, dir, "image", payload, nil)
 	encryptedPath, encryptedScheme, encryptedDigest := writeDiskArtifact(t, dir, "image", payload, codec)
-	if plainScheme != tarstream.DigestSchemeSHA256 || encryptedScheme != tarstream.DigestSchemeHMAC {
+	if plainScheme != tarstream.DigestScheme || encryptedScheme != tarstream.DigestSchemeHMAC {
 		t.Fatalf("schemes plain=%q encrypted=%q", plainScheme, encryptedScheme)
 	}
 
@@ -57,8 +57,8 @@ func TestOpenDiskStreamLocalCryptoMatrix(t *testing.T) {
 	}
 	wantKeyed := codec.KeyedDigest(mustDigestBytes(t, plainDigest))
 	wantHMAC := hex.EncodeToString(wantKeyed[:])
-	if scheme, digest, err := open(plainRef, codec, false); err != nil || scheme != tarstream.DigestSchemeHMAC || digest != wantHMAC {
-		t.Fatalf("auto legacy plaintext = %s:%s err=%v", scheme, digest, err)
+	if scheme, digest, err := open(plainRef, codec, false); err != nil || scheme != tarstream.DigestScheme || digest != plainDigest {
+		t.Fatalf("auto plaintext = %s:%s err=%v", scheme, digest, err)
 	}
 	if scheme, digest, err := open(encryptedRef, codec, false); err != nil || scheme != encryptedScheme || digest != encryptedDigest {
 		t.Fatalf("auto encrypted = %s:%s err=%v", scheme, digest, err)
@@ -67,7 +67,7 @@ func TestOpenDiskStreamLocalCryptoMatrix(t *testing.T) {
 		t.Fatalf("required encrypted = %s:%s err=%v", scheme, digest, err)
 	}
 	if _, _, err := open(plainRef, codec, true); err == nil {
-		t.Fatal("required accepted a legacy sha256 ref")
+		t.Fatal("required accepted a plaintext digest ref")
 	}
 	if _, _, err := open(encryptedRef, wrong, true); !errors.Is(err, tarstream.ErrAuthentication) {
 		t.Fatalf("wrong key error = %v", err)
@@ -76,11 +76,11 @@ func TestOpenDiskStreamLocalCryptoMatrix(t *testing.T) {
 		t.Fatal("required policy accepted a nil codec")
 	}
 
-	// hmac is an identity scheme, not an encoding flag: auto accepts a
-	// historical plaintext artifact when the ref carries its key-bound identity.
+	// The physical carrier supplies the identity scheme. A plaintext carrier
+	// cannot satisfy a ref for the encrypted carrier's keyed identity.
 	plainHMACRef := fileRef(plainPath, tarstream.DigestSchemeHMAC, wantHMAC)
-	if _, _, err := open(plainHMACRef, codec, false); err != nil {
-		t.Fatalf("auto plaintext @hmac: %v", err)
+	if _, _, err := open(plainHMACRef, codec, false); !errors.Is(err, tarstream.ErrDigestMismatch) {
+		t.Fatalf("auto plaintext @hmac error = %v", err)
 	}
 	if _, _, err := open(plainHMACRef, codec, true); !errors.Is(err, tarstream.ErrPlaintextForbidden) {
 		t.Fatalf("required plaintext @hmac error = %v", err)
@@ -115,7 +115,7 @@ func TestOpenDiskStreamBareAndLocatedIdentityRules(t *testing.T) {
 		_ = stream.Close()
 	}
 	if _, _, err := OpenDiskStream(ctx, "file://"+plainPath, nil, nil, codec, true); err == nil {
-		t.Fatal("required accepted a bare legacy plaintext artifact")
+		t.Fatal("required accepted a bare plaintext artifact")
 	}
 
 	logicalName := "logical-root.image"
@@ -147,8 +147,8 @@ func TestBuildDiskRefExportsPolicyIdentity(t *testing.T) {
 	dir := t.TempDir()
 	payload := bytes.Repeat([]byte{0x2a}, 4096)
 	plainPath, _, plainDigest := writeDiskArtifact(t, dir, "image", payload, nil)
-	legacy := fileRef(plainPath, tarstream.DigestSchemeSHA256, plainDigest)
-	canonical, err := buildDiskRef(legacy, nil, codec, false)
+	plain := fileRef(plainPath, tarstream.DigestScheme, plainDigest)
+	canonical, err := buildDiskRef(plain, nil, codec, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,14 +156,14 @@ func TestBuildDiskRefExportsPolicyIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ref.DigestScheme != tarstream.DigestSchemeHMAC || ref.Digest == plainDigest {
-		t.Fatalf("canonical legacy ref=%#v", ref)
+	if ref.DigestScheme != tarstream.DigestScheme || ref.Digest != plainDigest {
+		t.Fatalf("canonical plaintext ref=%#v", ref)
 	}
 	if ref.Path != filepath.Base(plainPath) {
 		t.Fatalf("canonical path=%q want=%q", ref.Path, filepath.Base(plainPath))
 	}
-	if _, err := buildDiskRef(legacy, nil, codec, true); err == nil {
-		t.Fatal("required buildDiskRef accepted a legacy sha256 ref")
+	if _, err := buildDiskRef(plain, nil, codec, true); err == nil {
+		t.Fatal("required buildDiskRef accepted a plaintext digest ref")
 	}
 }
 
@@ -171,16 +171,16 @@ func TestCanonicalizeConfiguredTarRefsConvertsColdChains(t *testing.T) {
 	codec, _ := manifestcrypto.NewTarStreamCodec([32]byte{0x45})
 	dir := t.TempDir()
 	path, _, plainDigest := writeDiskArtifact(t, dir, "image", bytes.Repeat([]byte{0x31}, 4096), nil)
-	legacy := fileRef(path, tarstream.DigestSchemeSHA256, plainDigest)
+	plain := fileRef(path, tarstream.DigestScheme, plainDigest)
 	manifestRef := "manifest://" + strings.Repeat("a", 64)
 	cfg := &config.SandboxConfig{}
-	cfg.Boot.Root.Base = legacy
-	cfg.Boot.Root.BaseFromRefs = []string{legacy, manifestRef}
+	cfg.Boot.Root.Base = plain
+	cfg.Boot.Root.BaseFromRefs = []string{plain, manifestRef}
 	cfg.Boot.Disks = []config.DiskConfig{{RootConfig: config.RootConfig{
-		Base: legacy,
+		Base: plain,
 		Overlay: &config.OverlayConfig{
-			Base:         legacy,
-			BaseFromRefs: []string{legacy},
+			Base:         plain,
+			BaseFromRefs: []string{plain},
 		},
 	}}}
 	if err := canonicalizeConfiguredTarRefs(cfg, nil, codec, false); err != nil {
@@ -195,7 +195,7 @@ func TestCanonicalizeConfiguredTarRefsConvertsColdChains(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ref[%d]: %v", i, err)
 		}
-		if ref.DigestScheme != tarstream.DigestSchemeHMAC || ref.Digest == plainDigest {
+		if ref.DigestScheme != tarstream.DigestScheme || ref.Digest != plainDigest {
 			t.Fatalf("ref[%d] was not canonicalized: %#v", i, ref)
 		}
 	}
@@ -203,9 +203,9 @@ func TestCanonicalizeConfiguredTarRefsConvertsColdChains(t *testing.T) {
 		t.Fatalf("manifest ref changed: %q", cfg.Boot.Root.BaseFromRefs[1])
 	}
 	required := &config.SandboxConfig{}
-	required.Boot.Root.Base = legacy
+	required.Boot.Root.Base = plain
 	if err := canonicalizeConfiguredTarRefs(required, nil, codec, true); err == nil {
-		t.Fatal("required policy accepted a legacy cold-chain ref")
+		t.Fatal("required policy accepted a plaintext cold-chain ref")
 	}
 }
 
@@ -226,7 +226,7 @@ func TestCanonicalizeConfiguredTarRefsAcceptsNamedNodeLocalArtifact(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plainRef.Path != namedPlainPath || plainRef.DigestScheme != tarstream.DigestSchemeHMAC || plainRef.Digest == plainDigest {
+	if plainRef.Path != namedPlainPath || plainRef.DigestScheme != tarstream.DigestScheme || plainRef.Digest != plainDigest {
 		t.Fatalf("canonical named plaintext ref=%#v", plainRef)
 	}
 

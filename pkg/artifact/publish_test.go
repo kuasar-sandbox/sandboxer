@@ -52,8 +52,8 @@ func publishPortable(t *testing.T, parent string) ([]byte, *config.PortableSandb
 			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "1GiB"},
 		},
 		Boot: config.PortableBootConfig{
-			Kernel:  "file://vmlinux@sha256:" + publishTestSHA,
-			Runtime: "file://runtime.bundle@sha256:" + publishTestSHA,
+			Kernel:  "file://vmlinux@digest:" + publishTestSHA,
+			Runtime: "file://runtime.bundle@digest:" + publishTestSHA,
 			Root:    config.PortableRootConfig{Base: "self", BaseFromRefs: nil},
 		},
 		Launch: config.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},
@@ -81,7 +81,7 @@ func TestLocationPublisherRewritesSandboxAndSnapshotGraphs(t *testing.T) {
 
 	// The parent E intentionally names an unavailable lower. When it appears as
 	// a disk ref, publication must consume only its payload and ignore this graph.
-	parentRuntime, parentCfg := publishPortable(t, "file://unavailable.overlay@sha256:"+publishTestSHA)
+	parentRuntime, parentCfg := publishPortable(t, "file://unavailable.overlay@digest:"+publishTestSHA)
 	parentLogical, err := sandboxfile.BuildSource(publishSource(t, bytes.Repeat([]byte{0x31}, 4096)), nil, parentRuntime)
 	if err != nil {
 		t.Fatal(err)

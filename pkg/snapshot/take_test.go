@@ -275,7 +275,7 @@ func TestTakeBuildsSandboxAndMemorySnapshotAtOneFreezePoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	diskCalls := 0
-	parentMemoryRef := "file://parent.snapshot@sha256:" + strings.Repeat("a", 64)
+	parentMemoryRef := "file://parent.snapshot@digest:" + strings.Repeat("a", 64)
 	sink := &takeCaptureSink{events: events, frozen: &quiescer.frozen}
 	out, err := Take(Sources{
 		Context: context.Background(), SandboxID: "test", APISock: chSock,
@@ -425,7 +425,7 @@ func (s *takeCaptureSink) AbsorbSandbox(ctx context.Context, source sparse.Sourc
 		return "", "", err
 	}
 	s.sandboxBody = body
-	s.sandboxRef = "file://sandbox.sandbox@sha256:" + strings.Repeat("e", 64)
+	s.sandboxRef = "file://sandbox.sandbox@digest:" + strings.Repeat("e", 64)
 	return s.sandboxRef, "", nil
 }
 
@@ -439,7 +439,7 @@ func (s *takeCaptureSink) AbsorbSnapshot(ctx context.Context, source sparse.Sour
 		return "", "", err
 	}
 	s.snapshotBody = body
-	s.snapshotRef = "file://memory.snapshot@sha256:" + strings.Repeat("f", 64)
+	s.snapshotRef = "file://memory.snapshot@digest:" + strings.Repeat("f", 64)
 	return s.snapshotRef, "", nil
 }
 

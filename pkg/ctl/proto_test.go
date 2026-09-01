@@ -164,8 +164,8 @@ func TestSnapshotProtocolKeepsStagingAndTypedDropCachesResult(t *testing.T) {
 
 	wantResp := Response{
 		Type: TypeSnapshotDone, DropCachesResult: proto.DropCachesSkipped,
-		SnapshotRef: "file://snapshot.snapshot@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		SandboxRef:  "file://sandbox.sandbox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		SnapshotRef: "file://snapshot.snapshot@digest:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SandboxRef:  "file://sandbox.sandbox@digest:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 	}
 	buf.Reset()
 	if err := WriteMessage(&buf, &wantResp); err != nil {

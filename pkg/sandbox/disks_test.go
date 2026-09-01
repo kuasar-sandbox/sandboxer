@@ -153,7 +153,7 @@ func TestOpenRootImageBlockReaderUsesParentSandboxPayloadAndImageConfigOnly(t *t
 			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "1GiB"},
 		},
 		Boot: config.PortableBootConfig{
-			Kernel: "file://kernel@sha256:" + key, Runtime: "file://runtime@sha256:" + key,
+			Kernel: "file://kernel@digest:" + key, Runtime: "file://runtime@digest:" + key,
 			Root: config.PortableRootConfig{Base: "self", Overlay: &config.PortableOverlayConfig{}},
 		},
 		Launch: config.PortableLaunchConfig{Exec: "/must-not-be-adopted", Workdir: "/", Restart: "never"},

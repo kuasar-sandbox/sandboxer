@@ -19,7 +19,7 @@ func uploadSnapshotCmd(args []string) int { return publishArtifactCmd("upload-sn
 
 func publishArtifactCmd(command string, args []string) int {
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
-	manifestPath := fs.String("manifest-config", "", "storage config YAML (overrides MANIFEST_CONFIG env); $MANIFEST_KEY supplies the customer key")
+	manifestPath := fs.String("manifest-config", "", "storage/Bundle config YAML (overrides MANIFEST_CONFIG env); $MANIFEST_KEY supplies the customer key")
 	toRefLocation := fs.String("to-ref-location", "", "publish to name=file:///absolute/path instead of the manifest store")
 	refLocations := config.RefLocations{}
 	fs.Var(refLocations, "ref-location", "trusted input ref location name=file:///absolute/path (repeatable)")
@@ -29,7 +29,7 @@ func publishArtifactCmd(command string, args []string) int {
 	}
 	input := fs.Arg(0)
 	if input == "" || fs.NArg() != 1 {
-		fmt.Fprintf(os.Stderr, "usage: sandbox-ctl %s [--manifest-config <file> | --to-ref-location name=file:///path] [--ref-location name=file:///path ...] [--quiet] <artifact>\n", command)
+		fmt.Fprintf(os.Stderr, "usage: sandbox-ctl %s [--manifest-config <file>] [--to-ref-location name=file:///path] [--ref-location name=file:///path ...] [--quiet] <artifact>\n", command)
 		return 2
 	}
 	logf := func(format string, values ...any) { fmt.Fprintf(os.Stderr, format+"\n", values...) }

@@ -195,8 +195,8 @@ func testRunFromPortable(t *testing.T) *config.PortableSandboxConfig {
 			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "1GiB"},
 		},
 		Boot: config.PortableBootConfig{
-			Kernel: "file://vmlinux@sha256:" + a, Runtime: "file://runtime.bundle@sha256:" + b,
-			Root: config.PortableRootConfig{Base: "file://base.erofs@sha256:" + a, Overlay: &config.PortableOverlayConfig{Base: "self"}},
+			Kernel: "file://vmlinux@digest:" + a, Runtime: "file://runtime.bundle@digest:" + b,
+			Root: config.PortableRootConfig{Base: "file://base.erofs@digest:" + a, Overlay: &config.PortableOverlayConfig{Base: "self"}},
 		},
 		Launch: config.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},
 	}
