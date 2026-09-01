@@ -21,9 +21,18 @@ import (
 )
 
 func bundlePublishFixture(t *testing.T, cfg *manifest.Config, storage *ProcessStorage) (string, string) {
+	return bundlePublishFixtureWithRefs(t, cfg, storage, nil)
+}
+
+func bundlePublishFixtureWithRefs(t *testing.T, cfg *manifest.Config, storage *ProcessStorage, refs []string) (string, string) {
 	t.Helper()
 	directory := t.TempDir()
-	sink, err := snapshot.NewBundleSink(context.Background(), directory, "exact", cfg, storage.CustomerKeyFunc(), nil)
+	ctx := context.Background()
+	admission, err := cfg.WriteAdmission(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := snapshot.NewPlannedBundleSink(directory, "exact", cfg, storage.CustomerKeyFunc(), admission, refs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +45,7 @@ func bundlePublishFixture(t *testing.T, cfg *manifest.Config, storage *ProcessSt
 	if err != nil {
 		t.Fatal(err)
 	}
-	sandboxRef, _, err := sink.AbsorbSandbox(context.Background(), sandboxSource)
+	sandboxRef, _, err := sink.AbsorbSandbox(ctx, sandboxSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,11 +61,11 @@ func bundlePublishFixture(t *testing.T, cfg *manifest.Config, storage *ProcessSt
 	if err != nil {
 		t.Fatal(err)
 	}
-	rootRef, _, err := sink.AbsorbSnapshot(context.Background(), snapshotSource)
+	rootRef, _, err := sink.AbsorbSnapshot(ctx, snapshotSource)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sink.CommitSnapshot(context.Background(), rootRef, ""); err != nil {
+	if err := sink.CommitSnapshot(ctx, rootRef, ""); err != nil {
 		t.Fatal(err)
 	}
 	root, err := manifest.ParseKeyRef(strings.TrimPrefix(rootRef, "manifest://"))
@@ -64,6 +73,92 @@ func bundlePublishFixture(t *testing.T, cfg *manifest.Config, storage *ProcessSt
 		t.Fatal(err)
 	}
 	return rootRef, filepath.Join(directory, manifest.HexKey(root)+".bundle")
+}
+
+func overlayBundleFixture(t *testing.T, cfg *manifest.Config, storage *ProcessStorage, directory string) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	admission, err := cfg.WriteAdmission(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := snapshot.NewPlannedBundleSink(
+		directory, "external", cfg, storage.CustomerKeyFunc(), admission, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := sink.AbsorbOverlay(
+		ctx, bytes.NewReader(bytes.Repeat([]byte{0x39}, 8192)), nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.CommitSandbox(ctx, ref, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	key, err := manifest.ParseKeyRef(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref, filepath.Join(directory, manifest.HexKey(key)+".bundle")
+}
+
+func unavailableBundleFallbackFixture(t *testing.T) (*ProcessStorage, string, string, []byte) {
+	t.Helper()
+	ctx := context.Background()
+	cfg, storage := manifestPublisherFixture(t)
+	keyFn := storage.CustomerKeyFunc()
+
+	externalDirectory := t.TempDir()
+	externalRef, externalPath := overlayBundleFixture(t, cfg, storage, externalDirectory)
+	externalName := "fallback.bundle"
+	externalBytes, err := os.ReadFile(externalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(rootDirectory, externalName), externalBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rootAdmission, err := cfg.WriteAdmission(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootSink, err := snapshot.NewPlannedBundleSink(
+		rootDirectory, "root", cfg, keyFn, rootAdmission,
+		[]string{"file://missing.bundle", "file://" + externalName}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeConfig, _ := publishPortable(t, externalRef)
+	rootSource, err := sandboxfile.BuildSource(
+		publishSource(t, bytes.Repeat([]byte{0x4a}, 8192)), nil, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootRef, _, err := rootSink.AbsorbSandbox(ctx, rootSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rootSink.CommitSandbox(ctx, rootRef, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := rootSink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rootKey, err := manifest.ParseKeyRef(rootRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPath := filepath.Join(rootDirectory, manifest.HexKey(rootKey)+".bundle")
+	return storage, rootPath, externalName, externalBytes
 }
 
 func TestLocationPublisherCopiesBundleExactly(t *testing.T) {
@@ -154,6 +249,76 @@ func TestLocationPublisherCopiesBundleExactly(t *testing.T) {
 	}
 }
 
+func TestLocationPublisherCopiesPinnedBundleSource(t *testing.T) {
+	ctx := context.Background()
+	cfg, storage := manifestPublisherFixture(t)
+	rootRef, sourcePath := bundlePublishFixture(t, cfg, storage)
+	original, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementRef, replacementPath := bundlePublishFixtureWithRefs(
+		t, cfg, storage, []string{"file://missing.bundle"},
+	)
+	if replacementRef != rootRef {
+		t.Fatalf("replacement root = %q, want %q", replacementRef, rootRef)
+	}
+	replacement, err := os.ReadFile(replacementPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(original, replacement) {
+		t.Fatal("replacement Bundle fixture unexpectedly matches original bytes")
+	}
+
+	targetDirectory := t.TempDir()
+	publisher, err := NewLocationPublisher(storage, "shared", targetDirectory, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := newTrackingLocationFileSystem()
+	var replaceOnce sync.Once
+	fs.wrapCreate = func(_ string, created locationWriteFile) locationWriteFile {
+		replaceOnce.Do(func() {
+			if err := os.Rename(replacementPath, sourcePath); err != nil {
+				t.Fatalf("replace Bundle source: %v", err)
+			}
+		})
+		return created
+	}
+	publisher.target.(*locationPublishTarget).fs = fs
+	result, publishErr := publisher.Publish(ctx, sourcePath)
+	closeErr := publisher.Close()
+	if publishErr != nil || closeErr != nil {
+		t.Fatalf("publish atomically replaced Bundle err=%v close=%v", publishErr, closeErr)
+	}
+	ref, err := manifest.ParseRef(result.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := os.ReadFile(filepath.Join(targetDirectory, ref.Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(published, original) {
+		t.Fatal("publisher copied a path replacement instead of the pinned Bundle source")
+	}
+	currentSource, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(currentSource, replacement) {
+		t.Fatal("test did not replace the source path during publication")
+	}
+	info, err := storage.Inspect(ctx, result.Ref, config.RefLocations{"shared": targetDirectory})
+	if err != nil {
+		t.Fatalf("official opener rejected pinned Bundle publication: %v", err)
+	}
+	if info.Role != RoleSnapshot {
+		t.Fatalf("published graph role = %q, want snapshot", info.Role)
+	}
+}
+
 func TestLocationPublisherCanonicalizesExplicitlySelectedBundleName(t *testing.T) {
 	ctx := context.Background()
 	cfg, storage := manifestPublisherFixture(t)
@@ -197,33 +362,8 @@ func TestLocationPublisherPreservesLocatedBundleDependency(t *testing.T) {
 	keyFn := storage.CustomerKeyFunc()
 
 	externalDirectory := t.TempDir()
-	externalAdmission, err := cfg.WriteAdmission(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	externalSink, err := snapshot.NewPlannedBundleSink(
-		externalDirectory, "external", cfg, keyFn, externalAdmission, nil, nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	externalRef, _, err := externalSink.AbsorbOverlay(
-		ctx, bytes.NewReader(bytes.Repeat([]byte{0x39}, 8192)), nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := externalSink.CommitSandbox(ctx, externalRef, ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := externalSink.Close(); err != nil {
-		t.Fatal(err)
-	}
-	externalKey, err := manifest.ParseKeyRef(externalRef)
-	if err != nil {
-		t.Fatal(err)
-	}
-	externalName := manifest.HexKey(externalKey) + ".bundle"
+	externalRef, externalPath := overlayBundleFixture(t, cfg, storage, externalDirectory)
+	externalName := filepath.Base(externalPath)
 
 	rootDirectory := t.TempDir()
 	rootAdmission, err := cfg.WriteAdmission(ctx)
@@ -301,40 +441,111 @@ func TestLocationPublisherPreservesLocatedBundleDependency(t *testing.T) {
 	}
 }
 
+func TestLocationPublisherSkipsUnavailableBundleFallback(t *testing.T) {
+	ctx := context.Background()
+	storage, rootPath, externalName, _ := unavailableBundleFallbackFixture(t)
+
+	targetDirectory := t.TempDir()
+	locations := config.RefLocations{"published": targetDirectory}
+	publisher, err := NewLocationPublisher(storage, "published", targetDirectory, locations, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, publishErr := publisher.Publish(ctx, rootPath)
+	closeErr := publisher.Close()
+	if publishErr != nil || closeErr != nil {
+		t.Fatalf("publish Bundle with unavailable fallback err=%v close=%v", publishErr, closeErr)
+	}
+	entries, err := os.ReadDir(targetDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("published location entries = %v, want available dependency and root", entries)
+	}
+	if _, err := os.Lstat(filepath.Join(targetDirectory, "missing.bundle")); !os.IsNotExist(err) {
+		t.Fatalf("unavailable fallback was materialized: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(targetDirectory, externalName)); err != nil {
+		t.Fatalf("available fallback was not copied: %v", err)
+	}
+	info, err := storage.Inspect(ctx, result.Ref, locations)
+	if err != nil {
+		t.Fatalf("official opener rejected fallback graph: %v", err)
+	}
+	if info.Role != RoleSandbox {
+		t.Fatalf("published graph role = %q, want sandbox", info.Role)
+	}
+}
+
+func TestLocationPublisherRejectsTargetThatChangesUnavailableFallback(t *testing.T) {
+	for _, concurrent := range []bool{false, true} {
+		name := "preexisting"
+		if concurrent {
+			name = "concurrent"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			storage, rootPath, _, _ := unavailableBundleFallbackFixture(t)
+			targetDirectory := t.TempDir()
+			unexpected := []byte("not a Bundle")
+			unexpectedPath := filepath.Join(targetDirectory, "missing.bundle")
+			if !concurrent {
+				if err := os.WriteFile(unexpectedPath, unexpected, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			publisher, err := NewLocationPublisher(
+				storage, "published", targetDirectory,
+				config.RefLocations{"published": targetDirectory}, nil,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if concurrent {
+				fs := newTrackingLocationFileSystem()
+				var materialize sync.Once
+				fs.wrapCreate = func(_ string, created locationWriteFile) locationWriteFile {
+					materialize.Do(func() {
+						if err := os.WriteFile(unexpectedPath, unexpected, 0o644); err != nil {
+							t.Fatalf("materialize fallback during publication: %v", err)
+						}
+					})
+					return created
+				}
+				publisher.target.(*locationPublishTarget).fs = fs
+			}
+			result, publishErr := publisher.Publish(ctx, rootPath)
+			closeErr := publisher.Close()
+			if publishErr == nil || closeErr != nil {
+				t.Fatalf("publish result=%+v err=%v close=%v, want publication failure", result, publishErr, closeErr)
+			}
+			if !strings.Contains(publishErr.Error(), "would change fallback selection") ||
+				!strings.Contains(publishErr.Error(), "cleanup is required") {
+				t.Fatalf("publish error = %v, want explicit cleanup/fallback error", publishErr)
+			}
+			current, err := os.ReadFile(unexpectedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(current, unexpected) {
+				t.Fatal("publisher modified an unknown-owner fallback file")
+			}
+			if _, err := os.Lstat(filepath.Join(targetDirectory, filepath.Base(rootPath))); !os.IsNotExist(err) {
+				t.Fatalf("publisher exposed root despite conflicting fallback: %v", err)
+			}
+		})
+	}
+}
+
 func TestLocationPublisherPreservesLocatedBundleSourcePrecedence(t *testing.T) {
 	ctx := context.Background()
 	cfg, storage := manifestPublisherFixture(t)
 	keyFn := storage.CustomerKeyFunc()
 
 	externalDirectory := t.TempDir()
-	externalAdmission, err := cfg.WriteAdmission(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	externalSink, err := snapshot.NewPlannedBundleSink(
-		externalDirectory, "external", cfg, keyFn, externalAdmission, nil, nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	externalRef, _, err := externalSink.AbsorbOverlay(
-		ctx, bytes.NewReader(bytes.Repeat([]byte{0x39}, 8192)), nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := externalSink.CommitSandbox(ctx, externalRef, ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := externalSink.Close(); err != nil {
-		t.Fatal(err)
-	}
-	externalKey, err := manifest.ParseKeyRef(externalRef)
-	if err != nil {
-		t.Fatal(err)
-	}
-	externalName := manifest.HexKey(externalKey) + ".bundle"
-	externalPath := filepath.Join(externalDirectory, externalName)
+	externalRef, externalPath := overlayBundleFixture(t, cfg, storage, externalDirectory)
+	externalName := filepath.Base(externalPath)
 
 	rootDirectory := t.TempDir()
 	shadowBytes, err := os.ReadFile(externalPath)
@@ -484,7 +695,7 @@ func bundleLocationFileFixture(t *testing.T) (locationBundleFile, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return locationBundleFile{source: source, root: root}, body
+	return locationBundleFile{source: source, root: root, verifyRoot: true}, body
 }
 
 func TestLocationBundleRetriesInProgressFinal(t *testing.T) {

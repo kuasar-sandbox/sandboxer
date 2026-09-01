@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -19,9 +20,14 @@ type locationBundleFile struct {
 	source      string
 	destination string
 	root        store.ContentKey
+	verifyRoot  bool
+
+	pinned       locationReadFile
+	pinnedInfo   os.FileInfo
+	pinnedReader *manifestbundle.Reader
 }
 
-func (t *locationPublishTarget) PutBundle(ctx context.Context, plan bundlePublishPlan) (string, error) {
+func (t *locationPublishTarget) PutBundle(ctx context.Context, plan bundlePublishPlan) (refString string, retErr error) {
 	if plan.opened == nil || plan.opened.BundleReader() == nil {
 		return "", errors.New("publish Bundle to location: source reader is unavailable")
 	}
@@ -33,62 +39,46 @@ func (t *locationPublishTarget) PutBundle(ctx context.Context, plan bundlePublis
 		return "", err
 	}
 	defer clear(customerKey[:])
+	files, unavailable, pinnedPlan, err := t.pinBundlePlan(plan)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if closeErr := closePinnedBundleFiles(files); closeErr != nil {
+			refString = ""
+			retErr = errors.Join(retErr, fmt.Errorf("close pinned Bundle sources: %w", closeErr))
+		}
+	}()
 	if err := manifestbundle.VerifyExactManifests(
-		ctx, plan.exactRoot, plan.exactDependencies, customerKey, plan.decryptor, manifestbundle.VerifyOptions{},
+		ctx, pinnedPlan.exactRoot, pinnedPlan.exactDependencies, customerKey, plan.decryptor, manifestbundle.VerifyOptions{},
 	); err != nil {
 		return "", fmt.Errorf("publish Bundle exact verification: %w", err)
 	}
+	if err := t.verifyUnavailableBundleTargets(unavailable); err != nil {
+		return "", err
+	}
 	rootName := manifest.HexKey(plan.root) + ".bundle"
 
-	files := make([]locationBundleFile, 0, len(plan.opened.BundleReader().Refs())+1)
-	seen := make(map[string]struct{})
-	for _, raw := range plan.opened.BundleReader().Refs() {
-		ref, err := manifest.ParseRef(raw)
-		if err != nil {
-			return "", err
+	// Dependencies are committed before the root, so a failed operation never
+	// returns a root ref whose available same-directory Bundle sources were not
+	// processed first. Missing refs retain normal Bundle fallback semantics.
+	for index, file := range files {
+		if index == len(files)-1 {
+			// Recheck immediately before publishing the root: a concurrently
+			// materialized earlier fallback must not become reachable through it.
+			if err := t.verifyUnavailableBundleTargets(unavailable); err != nil {
+				return "", err
+			}
 		}
-		if ref.Location != "" {
-			continue
-		}
-		if ref.Scheme != manifest.RefSchemeFile || ref.Digest != "" {
-			return "", fmt.Errorf("publish Bundle to location: invalid exact source ref %q", raw)
-		}
-		if ref.Path == rootName {
-			return "", fmt.Errorf("publish Bundle to location: refs contain the current Bundle %q", raw)
-		}
-		root, err := bundleKeyFromName(ref.Path)
-		if err != nil {
-			return "", fmt.Errorf("publish Bundle to location: ref %q: %w", raw, err)
-		}
-		if _, duplicate := seen[ref.Path]; duplicate {
-			continue
-		}
-		seen[ref.Path] = struct{}{}
-		files = append(files, locationBundleFile{
-			source:      filepath.Join(filepath.Dir(plan.path), ref.Path),
-			destination: filepath.Join(t.directory, ref.Path),
-			root:        root,
-		})
-	}
-	files = append(files, locationBundleFile{
-		source: plan.path, destination: filepath.Join(t.directory, rootName), root: plan.root,
-	})
-
-	// Validate every source before exposing any new target file. Dependencies
-	// are then committed before the root, so a failed operation never returns a
-	// root ref whose same-directory Bundle sources were not processed first.
-	for _, file := range files {
-		if err := t.validateBundleFile(file.source, file.root); err != nil {
-			return "", fmt.Errorf("publish Bundle source %s: %w", filepath.Base(file.source), err)
-		}
-	}
-	for _, file := range files {
 		if err := t.putBundleFile(ctx, file); err != nil {
 			return "", fmt.Errorf("publish Bundle file %s: %w", filepath.Base(file.destination), err)
 		}
 	}
-	if err := t.verifyLocatedBundlePlan(ctx, plan, files, customerKey); err != nil {
+	if err := t.verifyLocatedBundlePlan(ctx, pinnedPlan, files, customerKey); err != nil {
 		return "", fmt.Errorf("verify published Bundle graph: %w", err)
+	}
+	if err := t.verifyUnavailableBundleTargets(unavailable); err != nil {
+		return "", err
 	}
 
 	ref := manifest.Ref{
@@ -100,6 +90,156 @@ func (t *locationPublishTarget) PutBundle(ctx context.Context, plan bundlePublis
 	}
 	t.logf("publish: exact Bundle %s -> %s (dependencies=%d)", plan.role, ref.String(), len(files)-1)
 	return ref.String(), nil
+}
+
+func (t *locationPublishTarget) pinBundlePlan(plan bundlePublishPlan) ([]locationBundleFile, []string, bundlePublishPlan, error) {
+	rootName := manifest.HexKey(plan.root) + ".bundle"
+	expectedRefs := plan.opened.BundleReader().Refs()
+	files := make([]locationBundleFile, 0, len(expectedRefs)+1)
+	unavailable := make([]string, 0)
+	readers := make(map[string]*manifestbundle.Reader, len(expectedRefs))
+	seen := make(map[string]struct{}, len(expectedRefs))
+	fail := func(err error) ([]locationBundleFile, []string, bundlePublishPlan, error) {
+		return nil, nil, bundlePublishPlan{}, errors.Join(err, closePinnedBundleFiles(files))
+	}
+
+	for _, raw := range expectedRefs {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return fail(err)
+		}
+		if ref.Location != "" {
+			continue
+		}
+		if ref.Scheme != manifest.RefSchemeFile || ref.Digest != "" {
+			return fail(fmt.Errorf("publish Bundle to location: invalid exact source ref %q", raw))
+		}
+		if ref.Path == rootName {
+			return fail(fmt.Errorf("publish Bundle to location: refs contain the current Bundle %q", raw))
+		}
+		if _, duplicate := seen[ref.Path]; duplicate {
+			continue
+		}
+		seen[ref.Path] = struct{}{}
+		file, err := pinLocationBundleFile(
+			filepath.Join(filepath.Dir(plan.path), ref.Path),
+			filepath.Join(t.directory, ref.Path),
+			store.ContentKey{},
+			false,
+		)
+		if os.IsNotExist(err) {
+			// An unavailable Bundle source is a clean fallback miss. Do not turn
+			// a valid later-ref or remote selection into a publication failure.
+			unavailable = append(unavailable, filepath.Join(t.directory, ref.Path))
+			continue
+		}
+		if err != nil {
+			return fail(fmt.Errorf("publish Bundle source %s: %w", ref.Path, err))
+		}
+		files = append(files, file)
+		readers[raw] = file.pinnedReader
+	}
+
+	rootFile, err := pinLocationBundleFile(plan.path, filepath.Join(t.directory, rootName), plan.root, true)
+	if err != nil {
+		return fail(fmt.Errorf("publish Bundle root source: %w", err))
+	}
+	files = append(files, rootFile)
+	if !slices.Equal(rootFile.pinnedReader.Refs(), expectedRefs) {
+		return fail(errors.New("publish Bundle: root source changed while constructing the publication plan"))
+	}
+
+	pinnedPlan := plan
+	pinnedPlan.exactRoot.Reader = rootFile.pinnedReader
+	pinnedPlan.exactDependencies = append([]manifestbundle.ExactManifest(nil), plan.exactDependencies...)
+	for index := range pinnedPlan.exactDependencies {
+		selected := &pinnedPlan.exactDependencies[index]
+		raw, ok := plan.selectedSources[selected.Key]
+		if !ok {
+			return fail(fmt.Errorf("publish Bundle: selected source for Manifest %s is unavailable", manifest.HexKey(selected.Key)))
+		}
+		if _, located := plan.locatedExact[selected.Key]; located {
+			continue
+		}
+		if raw == "" {
+			selected.Reader = rootFile.pinnedReader
+			continue
+		}
+		reader := readers[raw]
+		if reader == nil {
+			return fail(fmt.Errorf(
+				"publish Bundle: selected source %q for Manifest %s became unavailable",
+				raw, manifest.HexKey(selected.Key),
+			))
+		}
+		selected.Reader = reader
+	}
+	return files, unavailable, pinnedPlan, nil
+}
+
+func (t *locationPublishTarget) verifyUnavailableBundleTargets(paths []string) error {
+	for _, path := range paths {
+		_, err := t.fs.lstat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("check unavailable Bundle target %s: %w", filepath.Base(path), err)
+		}
+		return fmt.Errorf(
+			"publish Bundle: unavailable source %s is present in the target and would change fallback selection; cleanup is required",
+			filepath.Base(path),
+		)
+	}
+	return nil
+}
+
+func pinLocationBundleFile(source, destination string, root store.ContentKey, verifyRoot bool) (locationBundleFile, error) {
+	resolved, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return locationBundleFile{}, err
+	}
+	file, err := (osLocationFileSystem{}).openNoFollow(resolved)
+	if err != nil {
+		return locationBundleFile{}, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return locationBundleFile{}, errors.Join(err, file.Close())
+	}
+	if !info.Mode().IsRegular() {
+		return locationBundleFile{}, errors.Join(
+			fmt.Errorf("%w: source mode %s", errLocationFinalNonRegular, info.Mode()),
+			file.Close(),
+		)
+	}
+	reader, err := manifestbundle.NewReader(file, info.Size())
+	if err != nil {
+		return locationBundleFile{}, errors.Join(classifyLocationContentError(err), file.Close())
+	}
+	if verifyRoot && !reader.HasManifest(root) {
+		return locationBundleFile{}, errors.Join(
+			fmt.Errorf("%w: root Manifest %s is absent", errLocationFinalMismatch, manifest.HexKey(root)),
+			reader.Close(), file.Close(),
+		)
+	}
+	return locationBundleFile{
+		source: source, destination: destination, root: root, verifyRoot: verifyRoot,
+		pinned: file, pinnedInfo: info, pinnedReader: reader,
+	}, nil
+}
+
+func closePinnedBundleFiles(files []locationBundleFile) error {
+	var closeErr error
+	for index := len(files) - 1; index >= 0; index-- {
+		if files[index].pinnedReader != nil {
+			closeErr = errors.Join(closeErr, files[index].pinnedReader.Close())
+		}
+		if files[index].pinned != nil {
+			closeErr = errors.Join(closeErr, files[index].pinned.Close())
+		}
+	}
+	return closeErr
 }
 
 type openedLocationBundle struct {
@@ -190,37 +330,6 @@ func (t *locationPublishTarget) verifyLocatedBundlePlan(
 	return nil
 }
 
-func bundleKeyFromName(name string) (store.ContentKey, error) {
-	if filepath.Base(name) != name || filepath.Ext(name) != ".bundle" {
-		return store.ContentKey{}, errors.New("Bundle source must be a <64hex>.bundle basename")
-	}
-	return manifest.ParseHexKey(name[:len(name)-len(".bundle")])
-}
-
-func (t *locationPublishTarget) validateBundleFile(path string, root store.ContentKey) (retErr error) {
-	file, err := t.fs.openNoFollow(path)
-	if err != nil {
-		return err
-	}
-	defer func() { retErr = errors.Join(retErr, file.Close()) }()
-	info, err := file.Stat()
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("%w: mode %s", errLocationFinalNonRegular, info.Mode())
-	}
-	reader, err := manifestbundle.NewReader(file, info.Size())
-	if err != nil {
-		return classifyLocationContentError(err)
-	}
-	defer reader.Close()
-	if !reader.HasManifest(root) {
-		return fmt.Errorf("%w: root Manifest %s is absent", errLocationFinalMismatch, manifest.HexKey(root))
-	}
-	return nil
-}
-
 func (t *locationPublishTarget) putBundleFile(ctx context.Context, file locationBundleFile) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -246,17 +355,11 @@ func (t *locationPublishTarget) publishFreshBundle(ctx context.Context, created 
 		created,
 		item.destination,
 		func(destination locationWriteFile) error {
-			source, err := t.fs.openNoFollow(item.source)
+			source, sourceInfo, closeSource, err := t.openBundleSource(item)
 			if err != nil {
 				return fmt.Errorf("open source: %w", err)
 			}
-			sourceInfo, err := source.Stat()
-			if err == nil && !sourceInfo.Mode().IsRegular() {
-				err = fmt.Errorf("source is not a regular file")
-			}
-			if err == nil {
-				err = source.Sync()
-			}
+			err = source.Sync()
 			var copied int64
 			if err == nil {
 				copied, err = copyLocationFile(ctx, destination, source)
@@ -264,7 +367,7 @@ func (t *locationPublishTarget) publishFreshBundle(ctx context.Context, created 
 			if err == nil && copied != sourceInfo.Size() {
 				err = io.ErrUnexpectedEOF
 			}
-			if err := errors.Join(err, source.Close()); err != nil {
+			if err := errors.Join(err, closeSource()); err != nil {
 				return fmt.Errorf("copy source: %w", err)
 			}
 			return nil
@@ -343,15 +446,11 @@ func (t *locationPublishTarget) validateBundleCopy(ctx context.Context, file loc
 }
 
 func (t *locationPublishTarget) validateOpenedBundleCopy(ctx context.Context, file locationBundleFile, destination locationReadFile, destinationInfo os.FileInfo, syncFile bool) (retErr error) {
-	source, err := t.fs.openNoFollow(file.source)
+	source, sourceInfo, closeSource, err := t.openBundleSource(file)
 	if err != nil {
 		return err
 	}
-	defer func() { retErr = errors.Join(retErr, source.Close()) }()
-	sourceInfo, err := source.Stat()
-	if err != nil {
-		return err
-	}
+	defer func() { retErr = errors.Join(retErr, closeSource()) }()
 	if !sourceInfo.Mode().IsRegular() || !destinationInfo.Mode().IsRegular() {
 		return fmt.Errorf("%w: source or destination is not regular", errLocationFinalNonRegular)
 	}
@@ -362,7 +461,7 @@ func (t *locationPublishTarget) validateOpenedBundleCopy(ctx context.Context, fi
 	if err != nil {
 		return classifyLocationContentError(err)
 	}
-	if !reader.HasManifest(file.root) {
+	if file.verifyRoot && !reader.HasManifest(file.root) {
 		_ = reader.Close()
 		return fmt.Errorf("%w: root Manifest %s is absent", errLocationFinalMismatch, manifest.HexKey(file.root))
 	}
@@ -384,6 +483,30 @@ func (t *locationPublishTarget) validateOpenedBundleCopy(ctx context.Context, fi
 		}
 	}
 	return nil
+}
+
+func (t *locationPublishTarget) openBundleSource(file locationBundleFile) (locationReadFile, os.FileInfo, func() error, error) {
+	if file.pinned != nil {
+		if _, err := file.pinned.Seek(0, io.SeekStart); err != nil {
+			return nil, nil, nil, err
+		}
+		return file.pinned, file.pinnedInfo, func() error { return nil }, nil
+	}
+	source, err := t.fs.openNoFollow(file.source)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	info, err := source.Stat()
+	if err != nil {
+		return nil, nil, nil, errors.Join(err, source.Close())
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, nil, errors.Join(
+			fmt.Errorf("source is not a regular file"),
+			source.Close(),
+		)
+	}
+	return source, info, source.Close, nil
 }
 
 func copyLocationFile(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {

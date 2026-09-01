@@ -51,7 +51,7 @@ func (p *Publisher) publishBundle(
 	if !ok || currentRoot != root {
 		return PublishResult{}, errors.New("publish Bundle: root Manifest changed during publication")
 	}
-	exactRoot, exactDependencies, locatedExact, remoteDependencies, err := selectExactBundleSources(ctx, opened, root, dependencies)
+	exactRoot, exactDependencies, selectedSources, locatedExact, remoteDependencies, err := selectExactBundleSources(ctx, opened, root, dependencies)
 	if err != nil {
 		return PublishResult{}, err
 	}
@@ -80,7 +80,8 @@ func (p *Publisher) publishBundle(
 	}
 	ref, err := target.PutBundle(ctx, bundlePublishPlan{
 		path: sourcePath, role: role, root: root, opened: opened,
-		exactRoot: exactRoot, exactDependencies: exactDependencies, locatedExact: locatedExact,
+		exactRoot: exactRoot, exactDependencies: exactDependencies,
+		selectedSources: selectedSources, locatedExact: locatedExact,
 		remoteDependencies: remoteDependencies,
 		keyFn:              p.storage.CustomerKeyFunc(), decryptor: decryptor,
 	})
@@ -92,32 +93,34 @@ func selectExactBundleSources(
 	opened *OpenedFile,
 	root store.ContentKey,
 	dependencies []store.ContentKey,
-) (manifestbundle.ExactManifest, []manifestbundle.ExactManifest, map[store.ContentKey]struct{}, int, error) {
+) (manifestbundle.ExactManifest, []manifestbundle.ExactManifest, map[store.ContentKey]string, map[store.ContentKey]struct{}, int, error) {
 	if opened == nil || opened.ManifestFetcher() == nil {
-		return manifestbundle.ExactManifest{}, nil, nil, 0, errors.New("publish Bundle: source selector is unavailable")
+		return manifestbundle.ExactManifest{}, nil, nil, nil, 0, errors.New("publish Bundle: source selector is unavailable")
 	}
 	rootSource, err := opened.ManifestFetcher().SelectRoot(root)
 	if err != nil {
-		return manifestbundle.ExactManifest{}, nil, nil, 0, err
+		return manifestbundle.ExactManifest{}, nil, nil, nil, 0, err
 	}
 	if rootSource.Reader == nil {
-		return manifestbundle.ExactManifest{}, nil, nil, 0, errors.New("publish Bundle: root is not backed by the current Bundle")
+		return manifestbundle.ExactManifest{}, nil, nil, nil, 0, errors.New("publish Bundle: root is not backed by the current Bundle")
 	}
 	exactRoot := manifestbundle.ExactManifest{Key: root, Reader: rootSource.Reader}
 	exactDependencies := make([]manifestbundle.ExactManifest, 0, len(dependencies))
+	selectedSources := make(map[store.ContentKey]string, len(dependencies))
 	locatedExact := make(map[store.ContentKey]struct{})
 	remoteDependencies := 0
 	for _, key := range dependencies {
 		source, err := opened.ManifestFetcher().SelectManifest(ctx, key)
 		if err != nil {
-			return manifestbundle.ExactManifest{}, nil, nil, 0, fmt.Errorf("publish Bundle dependency %s: %w", manifest.HexKey(key), err)
+			return manifestbundle.ExactManifest{}, nil, nil, nil, 0, fmt.Errorf("publish Bundle dependency %s: %w", manifest.HexKey(key), err)
 		}
 		if source.Reader != nil {
 			exactDependencies = append(exactDependencies, manifestbundle.ExactManifest{Key: key, Reader: source.Reader})
+			selectedSources[key] = source.Ref
 			if source.Ref != "" {
 				ref, err := manifest.ParseRef(source.Ref)
 				if err != nil {
-					return manifestbundle.ExactManifest{}, nil, nil, 0, fmt.Errorf("publish Bundle dependency %s source %q: %w", manifest.HexKey(key), source.Ref, err)
+					return manifestbundle.ExactManifest{}, nil, nil, nil, 0, fmt.Errorf("publish Bundle dependency %s source %q: %w", manifest.HexKey(key), source.Ref, err)
 				}
 				if ref.Location != "" {
 					locatedExact[key] = struct{}{}
@@ -127,16 +130,16 @@ func selectExactBundleSources(
 		}
 		stream, err := source.OpenManifest(ctx, key)
 		if err != nil {
-			return manifestbundle.ExactManifest{}, nil, nil, 0, fmt.Errorf("publish Bundle remote dependency %s: %w", manifest.HexKey(key), err)
+			return manifestbundle.ExactManifest{}, nil, nil, nil, 0, fmt.Errorf("publish Bundle remote dependency %s: %w", manifest.HexKey(key), err)
 		}
 		consumeErr := consumeLocationSource(ctx, stream)
 		closeErr := stream.Close()
 		if err := errors.Join(consumeErr, closeErr); err != nil {
-			return manifestbundle.ExactManifest{}, nil, nil, 0, fmt.Errorf("verify Bundle remote dependency %s: %w", manifest.HexKey(key), err)
+			return manifestbundle.ExactManifest{}, nil, nil, nil, 0, fmt.Errorf("verify Bundle remote dependency %s: %w", manifest.HexKey(key), err)
 		}
 		remoteDependencies++
 	}
-	return exactRoot, exactDependencies, locatedExact, remoteDependencies, nil
+	return exactRoot, exactDependencies, selectedSources, locatedExact, remoteDependencies, nil
 }
 
 func (p *Publisher) inspectBundleRoot(

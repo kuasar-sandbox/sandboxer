@@ -63,6 +63,9 @@ type bundlePublishPlan struct {
 	opened            *OpenedFile
 	exactRoot         manifestbundle.ExactManifest
 	exactDependencies []manifestbundle.ExactManifest
+	// selectedSources records the exact Bundle ref chosen for each selected
+	// dependency. An empty ref means the current root Bundle.
+	selectedSources map[store.ContentKey]string
 	// locatedExact are verified Bundle dependencies whose named refs remain
 	// unchanged instead of being copied into the destination location.
 	locatedExact       map[store.ContentKey]struct{}
