@@ -930,7 +930,7 @@ Existing-file reuse必须重新验证role、logical size、content identity和�
 
 `publish/upload-snapshot --to-ref-location`不复用`FileSink`或`BundleSink`. 独立location target先对可重复读取的canonical logical source做一遍无输出identity计算,再以`O_CREATE|O_EXCL`直接创建`<digest>.overlay|sandbox|snapshot`,第二遍canonical encoding是shared target中的唯一完整write. plaintext输出使用SHA-256 identity;codec-backed输出从同一plaintext identity派生HMAC identity并在最终写后重新比对. target directory中没有完整temp/staging副本,也不创建`<sid>.sandbox`、`<sid>.snapshot`或任何其他semantic alias.
 
-Fresh final固定`0644`. 第二遍`tarstream.WriteTo`在写入过程中检查source read和destination write,并重新产生与第一遍一致的scheme/digest;随后执行file `Sync`、`Close`,再以`lstat` + `SameFile`确认canonical path仍指向本次`O_EXCL`创建的inode,最后同步parent directory. Fresh path不重新打开或全量读取内容;后续consumer打开时仍按ref identity和crypto policy验证. Existing final不由当前publisher拥有,因此仍以`O_RDONLY|O_NOFOLLOW`重新打开,通过同一个read-only fd完整验证regular file、role/payload name、logical size、canonical tarstream、marker、codec、crypto policy、digest scheme/digest和完整sequential stream并`Sync`,随后同步directory并复用;inode和bytes不改变.
+Fresh final固定`0644`. 第二遍`tarstream.WriteTo`在写入过程中检查source read和destination write,并重新产生与第一遍一致的scheme/digest;随后执行file `Sync`,在owned write fd仍打开时以`lstat` + `SameFile`确认canonical path仍指向本次`O_EXCL`创建的inode,再执行`Close`并同步parent directory. Fresh path不重新打开或全量读取内容;后续consumer打开时仍按ref identity和crypto policy验证. Existing final不由当前publisher拥有,因此仍以`O_RDONLY|O_NOFOLLOW`重新打开,通过同一个read-only fd完整验证regular file、role/payload name、logical size、canonical tarstream、marker、codec、crypto policy、digest scheme/digest和完整sequential stream并`Sync`,随后同步directory并复用;inode和bytes不改变.
 
 Final path在write完成前会短暂可见. 正常consumer只能使用publisher成功返回的root ref;publisher仍按dependencies first、root last顺序发布. Concurrent publisher遇到partial final时重新打开并做有限、context-aware exponential-backoff验证;若writer在窗口内完成则复用. bounded retry后仍不完整或invalid时fail closed并提示显式cleanup/repair,不会删除unknown owner的path. Symlink、directory、FIFO和其他non-regular final同样拒绝且不删除. Publisher只在自身`O_EXCL`成功且path仍指向所记录inode时清理自己的失败写入;abandoned unknown final由显式cleanup/GC处理.
 
@@ -1047,7 +1047,7 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 
 ### 14.1 Atomicity 与 determinism
 
-Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local `FileSink`/`BundleSink`保持same-directory temp、fsync和atomic no-replace rename,final commit是O(1);alias只在root commit后更新. Named ref-location采用独立的exclusive-create + checked-write + path-identity commit协议;fresh final不做target reread,仅existing-final reuse执行full content verification,且不进入local sink的capture/commit路径.
+Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local `FileSink`/`BundleSink`保持same-directory temp、fsync和atomic no-replace rename,final commit是O(1);alias只在root commit后更新. Named ref-location采用独立的exclusive-create + checked-write + open-fd path-identity commit协议;fresh final不做target reread,仅existing-final reuse执行full content verification,且不进入local sink的capture/commit路径.
 
 多盘顺序固定为data disks first、root E last. Snapshot随后写memory S last. 这让S/E root成为可审计的graph commit point.
 

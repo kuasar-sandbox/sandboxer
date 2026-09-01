@@ -12,15 +12,42 @@ func TestLocationTargetFreshPublicationDoesNotReopenFinal(t *testing.T) {
 	directory := t.TempDir()
 	fs := newTrackingLocationFileSystem()
 	target := locationTestTarget(directory, nil, false)
-	target.fs = fs
+	closed := false
+	fs.wrapCreate = func(_ string, file locationWriteFile) locationWriteFile {
+		return &hookedLocationWriteFile{base: file, closeHook: func() error {
+			closed = true
+			return file.Close()
+		}}
+	}
+	target.fs = &lstatOrderLocationFileSystem{
+		trackingLocationFileSystem: fs,
+		lstatHook: func(path string) (os.FileInfo, error) {
+			if closed {
+				return nil, errors.New("fresh final identity checked after close")
+			}
+			return fs.base.lstat(path)
+		},
+	}
 	body := bytes.Repeat([]byte("fresh-publish-no-reread"), 64*1024)
 
 	if _, err := target.Put(context.Background(), RoleOverlay, locationTestSource(t, body)); err != nil {
 		t.Fatal(err)
 	}
+	if !closed {
+		t.Fatal("fresh final write fd was not closed")
+	}
 	if got := fs.opens.Load(); got != 0 {
 		t.Fatalf("fresh publication reopened final %d times, want 0", got)
 	}
+}
+
+type lstatOrderLocationFileSystem struct {
+	*trackingLocationFileSystem
+	lstatHook func(string) (os.FileInfo, error)
+}
+
+func (f *lstatOrderLocationFileSystem) lstat(path string) (os.FileInfo, error) {
+	return f.lstatHook(path)
 }
 
 func TestLocationTargetFreshPublicationRejectsReplacedFinal(t *testing.T) {

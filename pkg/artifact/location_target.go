@@ -267,6 +267,22 @@ func (t *locationPublishTarget) publishFresh(
 	if err := created.Sync(); err != nil {
 		return fmt.Errorf("sync final: %w", errors.Join(err, closeCreated()))
 	}
+	// Keep the owned fd open until the namespace check completes. Otherwise an
+	// unlink after Close could immediately recycle its inode number and let a
+	// replacement satisfy os.SameFile.
+	current, err := t.fs.lstat(destination)
+	if os.IsNotExist(err) {
+		return errors.Join(errLocationFinalVanished, err, closeCreated())
+	}
+	if err != nil {
+		return fmt.Errorf("stat fresh final path: %w", errors.Join(err, closeCreated()))
+	}
+	if !os.SameFile(ownedInfo, current) {
+		return errors.Join(
+			fmt.Errorf("%w: path changed after write", errLocationFinalVanished),
+			closeCreated(),
+		)
+	}
 	if err := closeCreated(); err != nil {
 		return fmt.Errorf("close final: %w", err)
 	}
@@ -281,16 +297,6 @@ func (t *locationPublishTarget) publishFresh(
 		if err := t.validateFinal(ctx, destination, payload, source.Size(), scheme, digest, false); err != nil {
 			return fmt.Errorf("validate final: %w", err)
 		}
-	}
-	current, err := t.fs.lstat(destination)
-	if os.IsNotExist(err) {
-		return errors.Join(errLocationFinalVanished, err)
-	}
-	if err != nil {
-		return fmt.Errorf("stat fresh final path: %w", err)
-	}
-	if !os.SameFile(ownedInfo, current) {
-		return fmt.Errorf("%w: path changed after write", errLocationFinalVanished)
 	}
 	// The owned final is complete and its canonical path still names the same
 	// inode. Do not remove it if only the subsequent directory durability step
