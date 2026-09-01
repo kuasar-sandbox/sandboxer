@@ -22,7 +22,9 @@ import (
 // committed with an atomic no-replace rename. A named location is a shared
 // immutable-object target: it determines the canonical identity without a
 // target write, exclusively creates the content-addressed final, and encodes
-// directly into that final exactly once.
+// directly into that final exactly once. Fresh publication relies on checked
+// writes, fsync, and a lightweight final-path identity check; only an O_EXCL
+// collision is independently opened and fully validated before reuse.
 type locationPublishTarget struct {
 	location  string
 	directory string
@@ -265,15 +267,48 @@ func (t *locationPublishTarget) publishFresh(
 	if err := created.Sync(); err != nil {
 		return fmt.Errorf("sync final: %w", errors.Join(err, closeCreated()))
 	}
+	// Keep the owned fd open until the namespace check completes. Otherwise an
+	// unlink after Close could immediately recycle its inode number and let a
+	// replacement satisfy os.SameFile.
+	current, err := t.fs.lstat(destination)
+	if os.IsNotExist(err) {
+		// The canonical path no longer identifies the owned inode. Relinquish
+		// cleanup before Close so inode-number reuse cannot make a later entry
+		// look owned to the deferred path-based cleanup.
+		owned = false
+		return errors.Join(errLocationFinalVanished, err, closeCreated())
+	}
+	if err != nil {
+		// Path ownership is unknown. Fail closed and leave explicit cleanup to
+		// the operator rather than risk deleting another publisher's entry.
+		owned = false
+		return fmt.Errorf("stat fresh final path: %w", errors.Join(err, closeCreated()))
+	}
+	if !os.SameFile(ownedInfo, current) {
+		owned = false
+		return errors.Join(
+			fmt.Errorf("%w: path changed after write", errLocationFinalVanished),
+			closeCreated(),
+		)
+	}
 	if err := closeCreated(); err != nil {
 		return fmt.Errorf("close final: %w", err)
 	}
-	if err := t.validateFinal(ctx, destination, payload, source.Size(), scheme, digest, false); err != nil {
-		return fmt.Errorf("validate final: %w", err)
+	// validate is an optional fault-injection seam. Production fresh publication
+	// deliberately does not reopen and reread the shared final: WriteTo checked
+	// every source read and destination write, reproduced the identity selected
+	// by the first pass, and the exclusively-created fd has been synced and
+	// closed. Readers authenticate and verify the tarstream on use. A collision,
+	// whose inode is not owned by this publisher, still requires the independent
+	// full validation in reuseExisting.
+	if t.validate != nil {
+		if err := t.validateFinal(ctx, destination, payload, source.Size(), scheme, digest, false); err != nil {
+			return fmt.Errorf("validate final: %w", err)
+		}
 	}
-	// The final is complete and has been validated through a freshly opened fd.
-	// Do not remove this valid object if only the subsequent directory durability
-	// step fails; a concurrent publisher may already have reused it.
+	// The owned final is complete and its canonical path still names the same
+	// inode. Do not remove it if only the subsequent directory durability step
+	// fails; a concurrent publisher may already have reused it.
 	owned = false
 	if err := t.fs.syncDirectory(t.directory); err != nil {
 		return fmt.Errorf("sync parent directory: %w", err)
