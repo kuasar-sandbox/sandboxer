@@ -1745,7 +1745,7 @@ func handleExportRequest(
 			sink = snapshot.NewFileSink(req.OutDir, opts.SandboxID, opts.LocalCodec, opts.LocalRequired, logf)
 		}
 		sinkOpen = true
-		dependencyPlan, err = prepareSnapshotDependencyPlan(ctx, opts, nil, diskMerged, req.OutDir, store.WriteAdmission{}, false)
+		dependencyPlan, err = prepareSnapshotDependencyPlan(ctx, opts, nil, diskMerged, req.OutDir, store.WriteAdmission{}, false, false)
 		if err != nil {
 			return ctl.Response{}, err
 		}
@@ -2138,7 +2138,7 @@ func handleSnapshotRequest(
 		}
 	} else {
 		dependencyPlan, err = prepareSnapshotDependencyPlan(ctx, opts, resultMemoryRefs,
-			diskMerged, req.OutDir, store.WriteAdmission{}, false)
+			diskMerged, req.OutDir, store.WriteAdmission{}, false, !req.Upload)
 		if err != nil {
 			return ctl.Response{}, err
 		}
@@ -2739,7 +2739,7 @@ type snapshotBundlePlan struct {
 type SandboxDependencyPlan struct{ plan *snapshotBundlePlan }
 
 func PrepareSandboxDependencyPlan(ctx context.Context, opts RunOptions, diskMerged []bool, outputDir string, admission store.WriteAdmission, bundleTarget bool) (*SandboxDependencyPlan, error) {
-	plan, err := prepareSnapshotDependencyPlan(ctx, opts, nil, diskMerged, outputDir, admission, bundleTarget)
+	plan, err := prepareSnapshotDependencyPlan(ctx, opts, nil, diskMerged, outputDir, admission, bundleTarget, false)
 	if err != nil {
 		return nil, err
 	}
@@ -2882,7 +2882,7 @@ func prepareSnapshotBundlePlan(
 	outputDir string,
 	admission store.WriteAdmission,
 ) (_ *snapshotBundlePlan, retErr error) {
-	return prepareSnapshotDependencyPlan(ctx, opts, memoryFromRefs, diskMerged, outputDir, admission, true)
+	return prepareSnapshotDependencyPlan(ctx, opts, memoryFromRefs, diskMerged, outputDir, admission, true, false)
 }
 
 func prepareSnapshotDependencyPlan(
@@ -2893,6 +2893,7 @@ func prepareSnapshotDependencyPlan(
 	outputDir string,
 	admission store.WriteAdmission,
 	bundleTarget bool,
+	keepPortableRefs bool,
 ) (_ *snapshotBundlePlan, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -2920,6 +2921,17 @@ func prepareSnapshotDependencyPlan(
 			continue
 		}
 		seenLogical[raw] = dependency.role
+		// Portable refs (manifest:// or located file refs) name artifacts that
+		// already exist in shared storage. Materializing them into the local
+		// checkpoint directory re-copies multi-GiB immutable objects on every
+		// pause; the local FileSink checkpoint keeps the reference instead and
+		// every consumer (restore, offline publisher) resolves it in place.
+		// Bundle targets still materialize: a Bundle must stay self-contained.
+		if keepPortableRefs {
+			if ref, parseErr := manifest.ParseRef(raw); parseErr == nil && ref.Portable() {
+				continue
+			}
+		}
 		stream, reader, key, label, err := openSnapshotDependency(ctx, dependency, opts, knownPaths, outputDir)
 		if err != nil {
 			return nil, err
@@ -2939,7 +2951,8 @@ func prepareSnapshotDependencyPlan(
 		})
 	}
 	// Every reachable local/remote dependency is materialized into the new
-	// destination. A Bundle therefore needs no external ordered refs; its refs
+	// destination unless keepPortableRefs held portable refs back as
+	// references. A Bundle therefore needs no external ordered refs; its refs
 	// plan is nevertheless fixed here, before NewWriter emits metadata.
 	plan.refs = nil
 	return plan, nil
