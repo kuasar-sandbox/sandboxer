@@ -78,7 +78,11 @@ func OpenTAPFDs(name string, pairs int) ([]*os.File, error) {
 	}
 	const virtioNetHdrV1Size = 12
 	for i := 0; i < pairs; i++ {
-		f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
+		// O_NONBLOCK from the start: the queue fds are handed to CH's
+		// event-driven net worker, which expects nonblocking descriptors
+		// (Tap::from_tap_fd re-asserts this via fcntl, but the contract is
+		// explicit here so the fds are safe at every point of their life).
+		f, err := os.OpenFile("/dev/net/tun", os.O_RDWR|syscall.O_NONBLOCK, 0)
 		if err != nil {
 			for _, of := range files {
 				of.Close()
