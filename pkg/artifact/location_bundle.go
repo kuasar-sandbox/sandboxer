@@ -152,7 +152,13 @@ func (t *locationPublishTarget) verifyLocatedBundlePlan(
 	exactDependencies := make([]manifestbundle.ExactManifest, 0, len(plan.exactDependencies))
 	for _, selected := range plan.exactDependencies {
 		var reader *manifestbundle.Reader
-		if rootReader.HasManifest(selected.Key) {
+		if _, located := plan.locatedExact[selected.Key]; located {
+			// Preserve the source selected by current -> refs order. A later
+			// same-directory Bundle may contain the same Manifest, but it is
+			// shadowed by this earlier named-location source and must not change
+			// post-copy verification semantics.
+			reader = selected.Reader
+		} else if rootReader.HasManifest(selected.Key) {
 			reader = rootReader
 		} else {
 			for index := 0; index < len(opened)-1; index++ {
@@ -163,11 +169,7 @@ func (t *locationPublishTarget) verifyLocatedBundlePlan(
 			}
 		}
 		if reader == nil {
-			if _, located := plan.locatedExact[selected.Key]; located {
-				reader = selected.Reader
-			} else {
-				return fmt.Errorf("published Bundle graph omits Manifest %s", manifest.HexKey(selected.Key))
-			}
+			return fmt.Errorf("published Bundle graph omits Manifest %s", manifest.HexKey(selected.Key))
 		}
 		exactDependencies = append(exactDependencies, manifestbundle.ExactManifest{Key: selected.Key, Reader: reader})
 	}

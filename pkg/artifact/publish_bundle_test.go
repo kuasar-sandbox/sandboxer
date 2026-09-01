@@ -1,6 +1,7 @@
 package artifact
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"errors"
@@ -298,6 +299,139 @@ func TestLocationPublisherPreservesLocatedBundleDependency(t *testing.T) {
 	if info.Role != RoleSandbox {
 		t.Fatalf("published graph role = %q, want sandbox", info.Role)
 	}
+}
+
+func TestLocationPublisherPreservesLocatedBundleSourcePrecedence(t *testing.T) {
+	ctx := context.Background()
+	cfg, storage := manifestPublisherFixture(t)
+	keyFn := storage.CustomerKeyFunc()
+
+	externalDirectory := t.TempDir()
+	externalAdmission, err := cfg.WriteAdmission(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalSink, err := snapshot.NewPlannedBundleSink(
+		externalDirectory, "external", cfg, keyFn, externalAdmission, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalRef, _, err := externalSink.AbsorbOverlay(
+		ctx, bytes.NewReader(bytes.Repeat([]byte{0x39}, 8192)), nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := externalSink.CommitSandbox(ctx, externalRef, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := externalSink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	externalKey, err := manifest.ParseKeyRef(externalRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalName := manifest.HexKey(externalKey) + ".bundle"
+	externalPath := filepath.Join(externalDirectory, externalName)
+
+	rootDirectory := t.TempDir()
+	shadowBytes, err := os.ReadFile(externalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corruptBundleChunk(t, shadowBytes)
+	shadowPath := filepath.Join(rootDirectory, externalName)
+	if err := os.WriteFile(shadowPath, shadowBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rootAdmission, err := cfg.WriteAdmission(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := []string{
+		"file://" + externalName + "@location:external",
+		"file://" + externalName,
+	}
+	rootSink, err := snapshot.NewPlannedBundleSink(
+		rootDirectory, "root", cfg, keyFn, rootAdmission, refs, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeConfig, _ := publishPortable(t, externalRef)
+	rootSource, err := sandboxfile.BuildSource(
+		publishSource(t, bytes.Repeat([]byte{0x4a}, 8192)), nil, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootRef, _, err := rootSink.AbsorbSandbox(ctx, rootSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rootSink.CommitSandbox(ctx, rootRef, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := rootSink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rootKey, err := manifest.ParseKeyRef(rootRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPath := filepath.Join(rootDirectory, manifest.HexKey(rootKey)+".bundle")
+
+	targetDirectory := t.TempDir()
+	locations := config.RefLocations{
+		"external":  externalDirectory,
+		"published": targetDirectory,
+	}
+	publisher, err := NewLocationPublisher(storage, "published", targetDirectory, locations, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, publishErr := publisher.Publish(ctx, rootPath)
+	closeErr := publisher.Close()
+	if publishErr != nil || closeErr != nil {
+		t.Fatalf("publish Bundle with shadowed local dependency err=%v close=%v", publishErr, closeErr)
+	}
+	publishedShadow, err := os.ReadFile(filepath.Join(targetDirectory, externalName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(publishedShadow, shadowBytes) {
+		t.Fatal("shadowed local Bundle was not copied exactly")
+	}
+	info, err := storage.Inspect(ctx, result.Ref, locations)
+	if err != nil {
+		t.Fatalf("official opener did not preserve located source precedence: %v", err)
+	}
+	if info.Role != RoleSandbox {
+		t.Fatalf("published graph role = %q, want sandbox", info.Role)
+	}
+}
+
+func corruptBundleChunk(t *testing.T, body []byte) {
+	t.Helper()
+	reader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range reader.File {
+		if !strings.HasPrefix(file.Name, "chunk/") || file.UncompressedSize64 == 0 {
+			continue
+		}
+		offset, err := file.DataOffset()
+		if err != nil {
+			t.Fatal(err)
+		}
+		body[offset] ^= 0xff
+		return
+	}
+	t.Fatal("Bundle fixture has no non-empty Chunk entry")
 }
 
 func TestManifestPublisherUploadsBundleExactly(t *testing.T) {
