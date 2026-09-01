@@ -31,7 +31,7 @@ func openTarArtifact(path string, ref manifest.Ref, codec tarstream.Codec, requi
 		_ = stream.Close()
 		return nil, "", "", err
 	}
-	if ref.Digest == "" && !contentAddressedNameMatches(path, digest, codec, required) {
+	if ref.Digest == "" && !contentAddressedNameMatches(path, digest) {
 		_ = stream.Close()
 		return nil, "", "", fmt.Errorf("artifact content name does not match identity")
 	}
@@ -92,38 +92,7 @@ func tarReadOptions(ref manifest.Ref, codec tarstream.Codec, required bool) ([]t
 	if ref.Digest == "" {
 		return options, nil
 	}
-	scheme, digest, err := normalizedRefIdentity(ref, codec, required)
-	if err != nil {
-		return nil, err
-	}
-	return append(options, tarstream.WithExpectedDigest(scheme, digest)), nil
-}
-
-func normalizedRefIdentity(ref manifest.Ref, codec tarstream.Codec, required bool) (string, string, error) {
-	if ref.Digest == "" {
-		return "", "", nil
-	}
-	if codec == nil {
-		if ref.DigestScheme != tarstream.DigestSchemeSHA256 {
-			return "", "", fmt.Errorf("local tarstream: hmac ref requires crypto.local=auto or required")
-		}
-		return ref.DigestScheme, ref.Digest, nil
-	}
-	switch ref.DigestScheme {
-	case tarstream.DigestSchemeHMAC:
-		return ref.DigestScheme, ref.Digest, nil
-	case tarstream.DigestSchemeSHA256:
-		if required {
-			return "", "", fmt.Errorf("local tarstream: legacy sha256 ref is forbidden by required policy")
-		}
-		keyed, err := keyedDigest(codec, ref.Digest)
-		if err != nil {
-			return "", "", fmt.Errorf("local tarstream: invalid legacy sha256 ref")
-		}
-		return tarstream.DigestSchemeHMAC, keyed, nil
-	default:
-		return "", "", fmt.Errorf("local tarstream: unsupported digest scheme")
-	}
+	return append(options, tarstream.WithExpectedDigest(ref.DigestScheme, ref.Digest)), nil
 }
 
 func sourceDigest(source any) (string, string, error) {
@@ -132,7 +101,7 @@ func sourceDigest(source any) (string, string, error) {
 		return "", "", fmt.Errorf("tarstream artifact has no declared digest")
 	}
 	scheme, digest := digester.Digest()
-	if !validDigest(scheme, digest) {
+	if !validCarrierDigest(scheme, digest) {
 		return "", "", fmt.Errorf("tarstream artifact has invalid declared digest")
 	}
 	return scheme, digest, nil
@@ -144,7 +113,7 @@ func readRuntimeBundleDigest(path string) (string, string, error) {
 		return "", "", err
 	}
 	scheme, digest, ok := strings.Cut(info.Digest, ":")
-	if !ok || !validDigest(scheme, digest) {
+	if !ok || scheme != tarstream.DigestScheme || !validHexDigest(digest) {
 		return "", "", fmt.Errorf("runtime bundle has invalid digest")
 	}
 	return scheme, digest, nil
@@ -157,39 +126,24 @@ func matchDigest(gotScheme, gotDigest, wantScheme, wantDigest string) error {
 	return nil
 }
 
-func contentAddressedNameMatches(path, digest string, codec tarstream.Codec, required bool) bool {
+func contentAddressedNameMatches(path, digest string) bool {
 	real := path
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		real = resolved
 	}
 	base := filepath.Base(real)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
-	if digestEqual(stem, digest) {
-		return true
-	}
-	if codec == nil || required {
-		return false
-	}
-	keyed, err := keyedDigest(codec, stem)
-	return err == nil && digestEqual(keyed, digest)
+	return digestEqual(stem, digest)
 }
 
-func keyedDigest(codec tarstream.Codec, plainHex string) (string, error) {
-	var plain [32]byte
-	if len(plainHex) != hex.EncodedLen(len(plain)) || strings.ToLower(plainHex) != plainHex {
-		return "", fmt.Errorf("invalid digest")
-	}
-	if _, err := hex.Decode(plain[:], []byte(plainHex)); err != nil {
-		return "", fmt.Errorf("invalid digest")
-	}
-	keyed := codec.KeyedDigest(plain)
-	return hex.EncodeToString(keyed[:]), nil
-}
-
-func validDigest(scheme, digest string) bool {
-	if scheme != tarstream.DigestSchemeSHA256 && scheme != tarstream.DigestSchemeHMAC {
+func validCarrierDigest(scheme, digest string) bool {
+	if scheme != tarstream.DigestScheme && scheme != tarstream.DigestSchemeHMAC {
 		return false
 	}
+	return validHexDigest(digest)
+}
+
+func validHexDigest(digest string) bool {
 	if len(digest) != 64 || strings.ToLower(digest) != digest {
 		return false
 	}

@@ -10,6 +10,8 @@ import (
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -54,10 +56,26 @@ type publishTarget interface {
 	Close() error
 }
 
+type bundlePublishPlan struct {
+	path               string
+	role               LogicalRole
+	root               store.ContentKey
+	opened             *OpenedFile
+	exactRoot          manifestbundle.ExactManifest
+	exactDependencies  []manifestbundle.ExactManifest
+	remoteDependencies int
+	keyFn              ingest.CustomerKeyFunc
+	decryptor          manifestcrypto.Decryptor
+}
+
+type bundlePublishTarget interface {
+	PutBundle(context.Context, bundlePublishPlan) (string, error)
+}
+
 type manifestPublishTarget struct {
-	ing   ingest.Ingester
-	close func() error
-	logf  func(string, ...any)
+	ing    ingest.Ingester
+	client *storeclient.Client
+	logf   func(string, ...any)
 }
 
 type publishStoreObject struct {
@@ -164,10 +182,38 @@ func (t *manifestPublishTarget) Put(ctx context.Context, role LogicalRole, sourc
 }
 
 func (t *manifestPublishTarget) Close() error {
-	if t == nil || t.close == nil {
+	if t == nil || t.client == nil {
 		return nil
 	}
-	return t.close()
+	return t.client.Close()
+}
+
+func (t *manifestPublishTarget) PutBundle(ctx context.Context, plan bundlePublishPlan) (string, error) {
+	if plan.keyFn == nil || plan.decryptor == nil || plan.exactRoot.Reader == nil {
+		return "", errors.New("publish Bundle to manifest store: exact source verification is unavailable")
+	}
+	customerKey, err := plan.keyFn()
+	if err != nil {
+		return "", err
+	}
+	defer clear(customerKey[:])
+	if err := manifestbundle.UploadExactManifests(
+		ctx,
+		plan.exactRoot,
+		plan.exactDependencies,
+		customerKey,
+		plan.decryptor,
+		t.client,
+		manifestbundle.VerifyOptions{},
+	); err != nil {
+		return "", fmt.Errorf("publish Bundle exact upload: %w", err)
+	}
+	ref := "manifest://" + manifest.HexKey(plan.root)
+	if t.logf != nil {
+		t.logf("publish: exact Bundle %s -> %s (bundled_dependencies=%d remote_dependencies=%d)",
+			plan.role, ref, len(plan.exactDependencies), plan.remoteDependencies)
+	}
+	return ref, nil
 }
 
 // NewManifestPublisher publishes every selected logical object through one
@@ -201,7 +247,9 @@ func NewManifestPublisher(storage *ProcessStorage, cfg *config.ManifestConfig, l
 	if err != nil {
 		return nil, errors.Join(err, client.Close())
 	}
-	return newPublisher(storage, locations, &manifestPublishTarget{ing: ing, close: client.Close, logf: logf}, logf), nil
+	return newPublisher(storage, locations, &manifestPublishTarget{
+		ing: ing, client: client, logf: logf,
+	}, logf), nil
 }
 
 // NewLocationPublisher writes content-addressed tarstreams into one trusted
@@ -261,9 +309,19 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 	if err != nil {
 		return PublishResult{}, err
 	}
+	parsedRoot, err := manifest.ParseRef(rootRef)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	if parsedRoot.Scheme == manifest.RefSchemeManifest {
+		return PublishResult{}, errors.New("publish: manifest root is already portable and cannot be materialized")
+	}
 	stream, childScope, err := p.open(ctx, rootRef, scope)
 	if err != nil {
 		return PublishResult{}, err
+	}
+	if opened, ok := stream.(*OpenedFile); ok && opened.Format() == FileFormatManifestBundle {
+		return p.publishBundle(ctx, rootRef, scope, opened)
 	}
 	sandboxRoot, sandboxErr := sandboxfile.Open(ctx, stream)
 	if sandboxErr == nil {
@@ -347,17 +405,23 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 		}
 		cfg.FromRefs[i] = published
 	}
-	sandboxStream, sandboxScope, err := p.open(ctx, cfg.SandboxRef, scope)
-	if err != nil {
+	if portable, ok, err := portablePublishRef(cfg.SandboxRef); err != nil {
 		return "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
-	}
-	sandboxRoot, err := sandboxfile.Open(ctx, sandboxStream)
-	if err != nil {
-		return "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
-	}
-	cfg.SandboxRef, err = p.publishSandboxRoot(ctx, cfg.SandboxRef, sandboxScope, sandboxRoot)
-	if err != nil {
-		return "", err
+	} else if ok {
+		cfg.SandboxRef = portable
+	} else {
+		sandboxStream, sandboxScope, err := p.open(ctx, cfg.SandboxRef, scope)
+		if err != nil {
+			return "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
+		}
+		sandboxRoot, err := sandboxfile.Open(ctx, sandboxStream)
+		if err != nil {
+			return "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
+		}
+		cfg.SandboxRef, err = p.publishSandboxRoot(ctx, cfg.SandboxRef, sandboxScope, sandboxRoot)
+		if err != nil {
+			return "", err
+		}
 	}
 	newConfig, err := snapshot.MarshalConfig(cfg)
 	if err != nil {
@@ -371,6 +435,11 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 }
 
 func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishScope, rootImage bool) (string, error) {
+	if portable, ok, err := portablePublishRef(raw); err != nil {
+		return "", err
+	} else if ok {
+		return portable, nil
+	}
 	key := scopeKey(scope, fmt.Sprintf("%t\x00%s", rootImage, raw))
 	if ref := p.diskMemo[key]; ref != "" {
 		return ref, nil
@@ -403,6 +472,11 @@ func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishSc
 }
 
 func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope publishScope) (string, error) {
+	if portable, ok, err := portablePublishRef(raw); err != nil {
+		return "", err
+	} else if ok {
+		return portable, nil
+	}
 	key := scopeKey(scope, raw)
 	if ref := p.memoryMemo[key]; ref != "" {
 		return ref, nil
@@ -536,6 +610,17 @@ func (p *Publisher) enter(key string) error {
 func (p *Publisher) leave(key string) { delete(p.visiting, key) }
 
 func scopeKey(scope publishScope, raw string) string { return scope.relativeDir + "\x00" + raw }
+
+func portablePublishRef(raw string) (string, bool, error) {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return "", false, err
+	}
+	if !ref.Portable() {
+		return "", false, nil
+	}
+	return ref.String(), true, nil
+}
 
 func ensurePublishDirectory(path string) error {
 	if err := os.MkdirAll(path, 0o755); err != nil {

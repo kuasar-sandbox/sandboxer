@@ -196,7 +196,7 @@ func TestApplyRestoreRulesRejectsResourceDiskAndNetworkConflicts(t *testing.T) {
 		artifact := validPortableConfig()
 		artifact.Boot.Disks = []PortableDiskConfig{{
 			Name:               "data",
-			PortableRootConfig: PortableRootConfig{Base: "file://data.overlay@sha256:" + testSHA},
+			PortableRootConfig: PortableRootConfig{Base: "file://data.overlay@digest:" + testSHA},
 		}}
 		artifact.Mounts = []MountConfig{{Target: "/data", Type: "disk", Source: "data"}}
 		host := restoreHostConfig()

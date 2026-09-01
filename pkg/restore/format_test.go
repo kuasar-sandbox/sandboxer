@@ -139,8 +139,8 @@ func TestSeparateSandboxBundleRetainsSnapshotBundleMemoryScope(t *testing.T) {
 			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "4KiB"},
 		},
 		Boot: config.PortableBootConfig{
-			Kernel:  "file://vmlinux@sha256:" + sha,
-			Runtime: "file://sandbox-runtime.bundle@sha256:" + sha,
+			Kernel:  "file://vmlinux@digest:" + sha,
+			Runtime: "file://sandbox-runtime.bundle@digest:" + sha,
 			Root:    config.PortableRootConfig{Base: "self"},
 		},
 		Launch: config.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},

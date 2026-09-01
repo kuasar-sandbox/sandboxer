@@ -765,7 +765,7 @@ func buildKernelRef(uri string) (string, error) {
 	if _, err := io.Copy(hash, f); err != nil {
 		return "", err
 	}
-	return "file://" + filepath.Base(ref.Path) + "@sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+	return "file://" + filepath.Base(ref.Path) + "@digest:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func preflightColdArtifacts(
@@ -3405,7 +3405,7 @@ func validateProspectiveMemoryConfig(refs []string) error {
 	probeDigest := strings.Repeat("f", 64)
 	if _, err := snapshot.MarshalConfig(&snapshot.Config{
 		Version:    snapshot.SnapshotConfigVersion,
-		SandboxRef: "file://" + probeDigest + ".sandbox@sha256:" + probeDigest,
+		SandboxRef: "file://" + probeDigest + ".sandbox@digest:" + probeDigest,
 		FromRefs:   refs,
 	}); err != nil {
 		return err
@@ -3567,9 +3567,9 @@ func prependRef(ref string, rest []string) []string {
 
 // canonicalizeConfiguredTarRefs replaces every local immutable disk ref in the
 // live config with the actual policy-normalized identity returned by its
-// artifact. Paths and named locations are preserved for later opens. This
-// keeps cold-start lower chains from copying legacy sha256 qualifiers into a
-// newly generated portable Sandbox configuration.
+// artifact. Paths and named locations are preserved for later opens. The
+// physical carrier determines whether the resulting identity is @digest,
+// @hmac, or a Bundle @manifest selector.
 func canonicalizeConfiguredTarRefs(cfg *config.SandboxConfig, locations config.RefLocations, codec tarstream.Codec, required bool) error {
 	return canonicalizeConfiguredTarRefsWithOpener(context.Background(), cfg, locations, codec, required, nil)
 }

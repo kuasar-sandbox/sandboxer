@@ -43,7 +43,7 @@ memory snapshot      ──> E + S, S is operation root
 
 | Carrier | Reference | Notes |
 |---|---|---|
-| Local tarstream | `file://<basename>@sha256:<digest>` 或 `@hmac:<digest>` | sparse map 由 tarstream envelope 权威声明 |
+| Local tarstream | `file://<basename>@digest:<digest>` 或 `@hmac:<digest>` | sparse map 由 tarstream envelope 权威声明 |
 | Manifest | `manifest://<key>` | chunk/Manifest encryption 和 verification 由 manifest config 控制 |
 | Manifest Bundle | `file://<bundle>@manifest:<key>` | 一个 ZIP64 Bundle 可承载 root 及完整依赖 Manifest graph |
 
@@ -204,12 +204,15 @@ sandbox-ctl publish --manifest-config manifest.yaml ./s1.snapshot
 
 # Publish to a trusted named file location.
 sandbox-ctl publish \
+  --manifest-config manifest.yaml \
   --to-ref-location release=file:///srv/sandbox-artifacts \
   --ref-location source=file:///srv/source \
   ./s1.sandbox
 ```
 
-Publisher 自动严格识别 E 或 S. 它不读取 `artifact.json`,也不存在 artifact-kind registry.
+Publisher 自动严格识别 local E/S carrier. 已经 portable 的 graph dependency 保持原 ref;
+`manifest://` root 本身不再 materialize 到 named location,也不存在 Manifest tail rewrite.
+它不读取 `artifact.json`,也不存在 artifact-kind registry.
 
 ## 3. 配置与制品格式
 
@@ -240,9 +243,9 @@ boot:
   runtime: file:///opt/kuasar/sandbox-runtime.bundle
   cmdline: "console=hvc0"
   root:
-    base: file:///images/root.erofs@sha256:<digest>
+    base: file:///images/root.erofs@digest:<digest>
     overlay:
-      base: file:///layers/parent.overlay@sha256:<digest>
+      base: file:///layers/parent.overlay@digest:<digest>
       base_from_refs: []
       # Host-only active binding:
       diff: file:///var/lib/kuasar/s1.overlay.diff
@@ -250,7 +253,7 @@ boot:
       diff_size: 1GiB
   disks:
     - name: data
-      base: file:///layers/data.overlay@sha256:<digest>
+      base: file:///layers/data.overlay@digest:<digest>
       diff: file:///var/lib/kuasar/s1.data.diff
 
 mounts:
@@ -311,18 +314,18 @@ network:
   enabled: true
   interface: eth0
 boot:
-  kernel: file://vmlinux@sha256:<digest>
-  runtime: file://sandbox-runtime.bundle@sha256:<digest>
+  kernel: file://vmlinux@digest:<digest>
+  runtime: file://sandbox-runtime.bundle@digest:<digest>
   cmdline: "console=hvc0"
   root:
-    base: file://root.erofs@sha256:<digest>
+    base: file://root.erofs@digest:<digest>
     overlay:
       base: self
       base_from_refs:
-        - file://parent.overlay@sha256:<digest>
+        - file://parent.overlay@digest:<digest>
   disks:
     - name: data
-      base: file://data.overlay@sha256:<digest>
+      base: file://data.overlay@digest:<digest>
 launch:
   exec: /usr/bin/app
   args: [serve]
@@ -359,10 +362,10 @@ Portable 内容排除:
 Local immutable ref 必须是 basename + identity,例如:
 
 ```text
-file://vmlinux@sha256:<digest>
-file://sandbox-runtime.bundle@sha256:<digest>
-file://<digest>.overlay@sha256:<digest>
+file://vmlinux@digest:<digest>
+file://sandbox-runtime.bundle@digest:<digest>
 file://<digest>.overlay@hmac:<digest>
+file://<digest>.overlay@digest:<digest>
 ```
 
 目标 host 使用实际 path、source directory 或 named ref-location 完成 binding,并在创建 controller、network、cgroup、VM 或 run directory 副作用前验证 identity.
@@ -438,7 +441,7 @@ root:
 
 # E payload is the ext4 upper top.
 root:
-  base: file://root.erofs@sha256:<digest>
+  base: file://root.erofs@digest:<digest>
   overlay:
     base: self
     base_from_refs: []
@@ -534,9 +537,9 @@ V1 `snapshot.cfg` 完整 schema只有:
 
 ```yaml
 version: 1
-sandbox_ref: file://<digest>.sandbox@sha256:<digest>
+sandbox_ref: file://<digest>.sandbox@digest:<digest>
 from_refs:
-  - file://<parent>.snapshot@sha256:<digest>
+  - file://<parent>.snapshot@digest:<digest>
 ```
 
 `sandbox_ref` 指向同一 freeze point 生成的 E. `from_refs` 是 top-to-bottom memory parent chain. S 不重复 capacity、runtime、root/data graph、launch、mounts、files、init 或 metadata.
@@ -916,7 +919,7 @@ Memory provenance: MemorySourceBinding   -> S/from_refs
 
 Local immutable artifact支持 `crypto.local=off|auto|required`:
 
-- `off`:plaintext tarstream,identity `sha256`.
+- `off`:plaintext tarstream,identity `digest`.
 - `auto`:自动识别plaintext或KDXTS encrypted tarstream;新输出按配置codec.
 - `required`:拒绝plaintext和未绑定key的identity;identity使用`hmac`.
 
@@ -928,9 +931,11 @@ Existing-file reuse必须重新验证role、logical size、content identity和�
 
 #### Named ref-location
 
-`publish/upload-snapshot --to-ref-location`不复用`FileSink`或`BundleSink`. 独立location target先对可重复读取的canonical logical source做一遍无输出identity计算,再以`O_CREATE|O_EXCL`直接创建`<digest>.overlay|sandbox|snapshot`,第二遍canonical encoding是shared target中的唯一完整write. plaintext输出使用SHA-256 identity;codec-backed输出从同一plaintext identity派生HMAC identity并在最终写后重新比对. target directory中没有完整temp/staging副本,也不创建`<sid>.sandbox`、`<sid>.snapshot`或任何其他semantic alias.
+`publish/upload-snapshot --to-ref-location`不复用`FileSink`或`BundleSink`. Tarstream carrier在自身marker中保存payload boundary和payload commitment;完整读取会用payload bytes复验该声明. 打开carrier后可直接提供identity. E/S只替换dense metadata tail时,carrier用旧payload commitment和新tail以O(tail)工作量推导新identity,不读取GiB级payload,也没有首次`io.Discard`编码. Location target取得carrier给出的scheme/digest后,以`O_CREATE|O_EXCL`直接创建`<digest>.overlay|sandbox|snapshot`;canonical encoding是shared target中的唯一完整write. Plaintext输出使用`@digest`,codec-backed输出使用`@hmac`. Target directory中没有完整temp/staging副本,也不创建`<sid>.sandbox`、`<sid>.snapshot`或任何其他semantic alias.
 
-Fresh final固定`0644`. 第二遍`tarstream.WriteTo`在写入过程中检查source read和destination write,并重新产生与第一遍一致的scheme/digest;随后执行file `Sync`,在owned write fd仍打开时以`lstat` + `SameFile`确认canonical path仍指向本次`O_EXCL`创建的inode,再执行`Close`并同步parent directory. Fresh path不重新打开或全量读取内容;后续consumer打开时仍按ref identity和crypto policy验证. Existing final不由当前publisher拥有,因此仍以`O_RDONLY|O_NOFOLLOW`重新打开,通过同一个read-only fd完整验证regular file、role/payload name、logical size、canonical tarstream、marker、codec、crypto policy、digest scheme/digest和完整sequential stream并`Sync`,随后同步directory并复用;inode和bytes不改变.
+Fresh final固定`0644`. `tarstream.WriteTo`在唯一一次写入过程中检查source read和destination write,并重新产生与carrier预先提供值一致的scheme/digest;随后执行file `Sync`,在owned write fd仍打开时以`lstat` + `SameFile`确认canonical path仍指向本次`O_EXCL`创建的inode,再执行`Close`. Publisher随后以`O_RDONLY|O_NOFOLLOW`重新打开并完整验证regular file、role/payload name、logical size、canonical tarstream、marker、codec、crypto policy、digest scheme/digest和完整sequential stream,最后同步parent directory. Existing final走同一完整验证,并在同一read-only fd上`Sync`;验证成功后直接复用,inode和bytes不改变.
+
+Manifest Bundle不进入tarstream E/S重建路径. Carrier以root Manifest key提供`@manifest` identity;location target先强制验证所选Manifest closure、recorded admission、physical keys和crypto domain,再对same-directory依赖Bundle按顺序做exact byte copy,root `<key>.bundle`最后发布. 每个共享final仍只写一次,copy后重新打开、验证canonical Bundle/root并与source逐字节比较,最后在target fd上再次强制验证所选closure. 该路径不创建`.snapshot/.sandbox`替身,也不改写Bundle内的`snapshot.cfg`.
 
 Final path在write完成前会短暂可见. 正常consumer只能使用publisher成功返回的root ref;publisher仍按dependencies first、root last顺序发布. Concurrent publisher遇到partial final时重新打开并做有限、context-aware exponential-backoff验证;若writer在窗口内完成则复用. bounded retry后仍不完整或invalid时fail closed并提示显式cleanup/repair,不会删除unknown owner的path. Symlink、directory、FIFO和其他non-regular final同样拒绝且不删除. Publisher只在自身`O_EXCL`成功且path仍指向所记录inode时清理自己的失败写入;abandoned unknown final由显式cleanup/GC处理.
 
@@ -940,13 +945,13 @@ Active encrypted `.overlay.diff` 保持KDXTS格式. Export只读取decrypt后的
 
 ### 11.3 Manifest upload
 
-Upload按照 bottom-up顺序ingest:
+Local tarstream graph按照bottom-up顺序ingest:
 
 ```text
 data/lower -> E -> S
 ```
 
-Customer key、chunk/Manifest crypto、content verification和store generation admission沿用manifest config. E是export root,S是snapshot root.
+已经portable的Manifest或located dependency保持原ref,不会先materialize再重写. Bundle root走exact-upload快路径:强制验证选择的Manifest closure、recorded admission和physical objects,原样上传Chunk/Manifest,root Manifest最后提交;root key和`snapshot.cfg`不变. Customer key、chunk/Manifest crypto、content verification和store generation admission沿用manifest config. E是export root,S是snapshot root.
 
 ### 11.4 Manifest Bundle
 
@@ -963,26 +968,26 @@ Bundle在pause前完成:
 
 ### 11.5 Publish graph
 
-Publish E:
+Local tarstream Publish E:
 
 ```text
 parse E -> enumerate E explicit disk refs bottom-up
-        -> publish payload dependencies -> rewrite refs
+        -> publish node-local payload dependencies -> rewrite those refs
         -> rebuild E -> publish E last
 ```
 
 `self` 永不重写. 父 `.sandbox` 作为disk ref时发布为`.overlay` payload,不递归父config graph.
 
-Publish S:
+Local tarstream Publish S:
 
 ```text
 publish memory from_refs as opaque memory layers
-publish S.sandbox_ref E graph
-rewrite sandbox_ref
+publish node-local S.sandbox_ref E graph
+rewrite node-local sandbox_ref
 rebuild S -> publish S last
 ```
 
-Memory parent的historical `sandbox_ref` 不递归;当前S引用的E graph是当前disk truth. Named location publication将所有重写ref绑定到target location.
+Memory parent的historical `sandbox_ref` 不递归;当前S引用的E graph是当前disk truth. `manifest://`和已located ref保持不变,不会产生`Manifest -> named location`或Manifest tail rewrite. Bundle carrier整体走exact location copy或exact Store upload,不进入上述重建流程.
 
 ## 12. vhost-user-blk backend
 
@@ -1047,7 +1052,7 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 
 ### 14.1 Atomicity 与 determinism
 
-Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local `FileSink`/`BundleSink`保持same-directory temp、fsync和atomic no-replace rename,final commit是O(1);alias只在root commit后更新. Named ref-location采用独立的exclusive-create + checked-write + open-fd path-identity commit协议;fresh final不做target reread,仅existing-final reuse执行full content verification,且不进入local sink的capture/commit路径.
+Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local `FileSink`/`BundleSink`保持same-directory temp、fsync和atomic no-replace rename,final commit是O(1);alias只在root commit后更新. Named ref-location采用独立的exclusive-create + checked-write/copy-once + reopen-full-verify协议;tarstream由carrier直接提供identity,Bundle保持exact bytes,两者都不进入local sink的capture/commit路径.
 
 多盘顺序固定为data disks first、root E last. Snapshot随后写memory S last. 这让S/E root成为可审计的graph commit point.
 

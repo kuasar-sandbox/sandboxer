@@ -26,6 +26,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -870,6 +871,22 @@ func (s *prefetchedSource) ReadAt(ctx context.Context, buffer []byte, offset uin
 	return written, nil
 }
 
+func (s *prefetchedSource) TarStreamDigest(name string) ([32]byte, bool) {
+	provider, ok := s.inner.(tarstream.IdentityProvider)
+	if !ok {
+		return [32]byte{}, false
+	}
+	return provider.TarStreamDigest(name)
+}
+
+func (s *prefetchedSource) PayloadCommitment() (uint64, [32]byte, bool) {
+	provider, ok := s.inner.(tarstream.IdentityProvider)
+	if !ok {
+		return s.Size(), [32]byte{}, false
+	}
+	return provider.PayloadCommitment()
+}
+
 // prepareEROFSBuildPayload validates the EROFS superblock without requiring a
 // random-access Source. It consumes only the minimum prefix once, records its
 // authoritative Hole/Zero/Data runs, and returns a wrapper that replays that
@@ -949,6 +966,24 @@ func (s *payloadStream) Digest() (string, string) {
 	return "", ""
 }
 
+func (s *payloadStream) PayloadCommitment() (uint64, [32]byte, bool) {
+	provider, ok := s.owner.stream.(tarstream.IdentityProvider)
+	if !ok {
+		return s.size, [32]byte{}, false
+	}
+	size, digest, ok := provider.PayloadCommitment()
+	return size, digest, ok && size == s.size
+}
+
+func (s *payloadStream) TarStreamDigest(name string) ([32]byte, bool) {
+	size, payload, ok := s.PayloadCommitment()
+	if !ok {
+		return [32]byte{}, false
+	}
+	digest, err := tarstream.ComposeDigest(name, s.size, size, payload, nil)
+	return digest, err == nil
+}
+
 func (s *payloadStream) RootManifestKey() (store.ContentKey, bool) {
 	if selected, ok := s.owner.stream.(interface {
 		RootManifestKey() (store.ContentKey, bool)
@@ -960,6 +995,29 @@ func (s *payloadStream) RootManifestKey() (store.ContentKey, bool) {
 
 func (s *sectionStream) Size() uint64 { return s.size }
 func (s *sectionStream) Close() error { return s.owner.Close() }
+
+func (s *sectionStream) TarStreamDigest(name string) ([32]byte, bool) {
+	if s.base != 0 || s.owner == nil || s.owner.stream == nil || s.size != s.owner.stream.Size() {
+		return [32]byte{}, false
+	}
+	provider, ok := s.owner.stream.(tarstream.IdentityProvider)
+	if !ok {
+		return [32]byte{}, false
+	}
+	return provider.TarStreamDigest(name)
+}
+
+func (s *sectionStream) PayloadCommitment() (uint64, [32]byte, bool) {
+	if s.base != 0 {
+		return s.size, [32]byte{}, false
+	}
+	provider, ok := s.owner.stream.(tarstream.IdentityProvider)
+	if !ok {
+		return s.size, [32]byte{}, false
+	}
+	size, digest, ok := provider.PayloadCommitment()
+	return size, digest, ok && size == s.size
+}
 
 func (s *sectionStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 	if offset >= s.size {
@@ -1046,6 +1104,34 @@ type appendedStream struct {
 func (s *appendedStream) Close() error { return s.owner.Close() }
 
 func (s *appendedSource) Size() uint64 { return s.size }
+
+func (s *appendedSource) PayloadCommitment() (uint64, [32]byte, bool) {
+	provider, ok := s.payload.(tarstream.IdentityProvider)
+	if !ok {
+		// A newly captured payload has no prior carrier commitment, but its
+		// authoritative boundary is still needed by WriteTo. The writer computes
+		// and records the commitment during this first encoding.
+		return s.payload.Size(), [32]byte{}, false
+	}
+	size, digest, ok := provider.PayloadCommitment()
+	if !ok || size != s.payload.Size() {
+		return s.payload.Size(), [32]byte{}, false
+	}
+	return size, digest, true
+}
+
+func (s *appendedSource) TarStreamDigest(name string) ([32]byte, bool) {
+	provider, ok := s.payload.(tarstream.IdentityProvider)
+	if !ok {
+		return [32]byte{}, false
+	}
+	size, digest, ok := provider.PayloadCommitment()
+	if !ok || size != s.payload.Size() {
+		return [32]byte{}, false
+	}
+	result, err := tarstream.ComposeDigest(name, s.size, size, digest, s.tail)
+	return result, err == nil
+}
 
 func (s *appendedSource) RunAt(offset, limit uint64) (sparse.Run, error) {
 	if offset >= s.size {

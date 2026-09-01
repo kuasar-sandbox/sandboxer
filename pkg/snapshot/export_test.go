@@ -76,7 +76,7 @@ func TestCaptureSandboxAtFreezeDataFirstRootOnceAndC0Unchanged(t *testing.T) {
 	rootCalls, dataCalls := 0, 0
 	sources := ExportSources{
 		SandboxID: "sid", PortableConfig: c0,
-		ParentSandboxRef: "file://parent.sandbox@sha256:" + strings.Repeat("a", 64),
+		ParentSandboxRef: "file://parent.sandbox@digest:" + strings.Repeat("a", 64),
 		Diffs: []DiskDiff{
 			{SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
 				rootCalls++
@@ -154,7 +154,7 @@ func TestExportSinkCloseFailureResumesBackendsAndCH(t *testing.T) {
 		APISock:          sock,
 		CHApiDeadline:    time.Second,
 		PortableConfig:   portable,
-		ParentSandboxRef: "file://parent.sandbox@sha256:" + strings.Repeat("a", 64),
+		ParentSandboxRef: "file://parent.sandbox@digest:" + strings.Repeat("a", 64),
 		Diffs: []DiskDiff{{SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		}}},
@@ -260,9 +260,9 @@ func exportTestPortable(t *testing.T) *config.PortableSandboxConfig {
 			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "1GiB"},
 		},
 		Boot: config.PortableBootConfig{
-			Kernel: "file://kernel@sha256:" + key, Runtime: "file://runtime@sha256:" + key,
-			Root:  config.PortableRootConfig{Base: "file://base@sha256:" + key, Overlay: &config.PortableOverlayConfig{Base: "self"}},
-			Disks: []config.PortableDiskConfig{{Name: "data", PortableRootConfig: config.PortableRootConfig{Base: "file://old.overlay@sha256:" + key}}},
+			Kernel: "file://kernel@digest:" + key, Runtime: "file://runtime@digest:" + key,
+			Root:  config.PortableRootConfig{Base: "file://base@digest:" + key, Overlay: &config.PortableOverlayConfig{Base: "self"}},
+			Disks: []config.PortableDiskConfig{{Name: "data", PortableRootConfig: config.PortableRootConfig{Base: "file://old.overlay@digest:" + key}}},
 		},
 		Launch: config.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},
 		Mounts: []config.MountConfig{{Target: "/data", Type: "disk", Source: "data"}},

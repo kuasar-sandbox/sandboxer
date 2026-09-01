@@ -1,0 +1,370 @@
+package artifact
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
+	"golang.org/x/sys/unix"
+)
+
+func bundlePublishFixture(t *testing.T, cfg *manifest.Config, storage *ProcessStorage) (string, string) {
+	t.Helper()
+	directory := t.TempDir()
+	sink, err := snapshot.NewBundleSink(context.Background(), directory, "exact", cfg, storage.CustomerKeyFunc(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
+	runtimeConfig, _ := publishPortable(t, "")
+	sandboxSource, err := sandboxfile.BuildSource(
+		publishSource(t, bytes.Repeat([]byte{0x41}, 8192)), nil, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxRef, _, err := sink.AbsorbSandbox(context.Background(), sandboxSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotConfig, err := snapshot.MarshalConfig(&snapshot.Config{
+		Version: snapshot.SnapshotConfigVersion, SandboxRef: sandboxRef,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotSource, err := snapshotfile.BuildSource(
+		publishSource(t, bytes.Repeat([]byte{0x52}, 16*1024)), []byte("{}"), []byte("{}"), snapshotConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootRef, _, err := sink.AbsorbSnapshot(context.Background(), snapshotSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.CommitSnapshot(context.Background(), rootRef, ""); err != nil {
+		t.Fatal(err)
+	}
+	root, err := manifest.ParseKeyRef(strings.TrimPrefix(rootRef, "manifest://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rootRef, filepath.Join(directory, manifest.HexKey(root)+".bundle")
+}
+
+func TestLocationPublisherCopiesBundleExactly(t *testing.T) {
+	ctx := context.Background()
+	cfg, storage := manifestPublisherFixture(t)
+	rootRef, sourcePath := bundlePublishFixture(t, cfg, storage)
+	sourceBytes, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetDirectory := t.TempDir()
+	publisher, err := NewLocationPublisher(storage, "shared", targetDirectory, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := newTrackingLocationFileSystem()
+	publisher.target.(*locationPublishTarget).fs = fs
+	oldUmask := unix.Umask(0o077)
+	t.Cleanup(func() { unix.Umask(oldUmask) })
+	result, publishErr := publisher.Publish(ctx, sourcePath)
+	unix.Umask(oldUmask)
+	if publishErr != nil {
+		t.Fatalf("publish Bundle: %v", publishErr)
+	}
+	if result.Role != RoleSnapshot {
+		t.Fatalf("published role = %q", result.Role)
+	}
+	root := strings.TrimPrefix(rootRef, "manifest://")
+	wantRef := "file://" + root + ".bundle@manifest:" + root + "@location:shared"
+	if result.Ref != wantRef {
+		t.Fatalf("published ref = %q, want %q", result.Ref, wantRef)
+	}
+	entries, err := os.ReadDir(targetDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != root+".bundle" {
+		t.Fatalf("named location entries = %v", entries)
+	}
+	targetBytes, err := os.ReadFile(filepath.Join(targetDirectory, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(targetBytes, sourceBytes) {
+		t.Fatal("named location Bundle is not an exact copy")
+	}
+	targetInfo, err := os.Stat(filepath.Join(targetDirectory, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targetInfo.Mode().Perm() != 0o644 {
+		t.Fatalf("located Bundle mode = %o, want 644", targetInfo.Mode().Perm())
+	}
+	info, err := storage.Inspect(ctx, result.Ref, config.RefLocations{"shared": targetDirectory})
+	if err != nil {
+		t.Fatalf("official opener rejected located Bundle: %v", err)
+	}
+	if info.Role != RoleSnapshot || info.Snapshot.SandboxRef == "" {
+		t.Fatalf("located Bundle root = %+v", info)
+	}
+	if fs.creates.Load() != 1 || fs.written.Load() != int64(len(sourceBytes)) {
+		t.Fatalf("shared target creates=%d write-bytes=%d, want one exact write of %d",
+			fs.creates.Load(), fs.written.Load(), len(sourceBytes))
+	}
+	before, err := os.Stat(filepath.Join(targetDirectory, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writes := fs.written.Load()
+	reused, err := publisher.Publish(ctx, sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(filepath.Join(targetDirectory, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused.Ref != result.Ref || !os.SameFile(before, after) || fs.written.Load() != writes {
+		t.Fatalf("Bundle reuse result=%+v same-inode=%t writes=%d->%d", reused, os.SameFile(before, after), writes, fs.written.Load())
+	}
+	for _, alias := range []string{"exact.snapshot", "exact.sandbox"} {
+		if _, err := os.Lstat(filepath.Join(targetDirectory, alias)); !os.IsNotExist(err) {
+			t.Fatalf("named location created alias %q: %v", alias, err)
+		}
+	}
+	if err := publisher.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManifestPublisherUploadsBundleExactly(t *testing.T) {
+	ctx := context.Background()
+	cfg, storage := manifestPublisherFixture(t)
+	rootRef, sourcePath := bundlePublishFixture(t, cfg, storage)
+	publisher, err := NewManifestPublisher(storage, cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, publishErr := publisher.Publish(ctx, sourcePath)
+	closeErr := publisher.Close()
+	if publishErr != nil || closeErr != nil {
+		t.Fatalf("publish Bundle err=%v close=%v", publishErr, closeErr)
+	}
+	if result.Role != RoleSnapshot || result.Ref != rootRef {
+		t.Fatalf("published result = %+v, want %s", result, rootRef)
+	}
+	info, err := storage.Inspect(ctx, result.Ref, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Role != RoleSnapshot || info.Snapshot.SandboxRef == "" {
+		t.Fatalf("uploaded Bundle root = %+v", info)
+	}
+}
+
+func TestPublisherRejectsManifestRootInsteadOfMaterializingIt(t *testing.T) {
+	storage, err := NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	publisher := newPublisher(storage, nil, &recordingPublishTarget{}, nil)
+	_, err = publisher.Publish(context.Background(), "manifest://"+strings.Repeat("a", 64))
+	if err == nil || !strings.Contains(err.Error(), "already portable") {
+		t.Fatalf("manifest root error = %v", err)
+	}
+}
+
+func bundleLocationFileFixture(t *testing.T) (locationBundleFile, []byte) {
+	t.Helper()
+	cfg, storage := manifestPublisherFixture(t)
+	rootRef, source := bundlePublishFixture(t, cfg, storage)
+	root, err := manifest.ParseKeyRef(strings.TrimPrefix(rootRef, "manifest://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return locationBundleFile{source: source, root: root}, body
+}
+
+func TestLocationBundleRetriesInProgressFinal(t *testing.T) {
+	file, sourceBytes := bundleLocationFileFixture(t)
+	directory := t.TempDir()
+	file.destination = filepath.Join(directory, filepath.Base(file.source))
+	started := make(chan struct{})
+	release := make(chan struct{})
+	aFS := newTrackingLocationFileSystem()
+	aFS.wrapCreate = func(_ string, created locationWriteFile) locationWriteFile {
+		var once sync.Once
+		return &hookedLocationWriteFile{base: created, writeHook: func(body []byte) (int, error) {
+			first := false
+			once.Do(func() { first = true })
+			if !first {
+				return created.Write(body)
+			}
+			limit := max(1, len(body)/2)
+			n, err := created.Write(body[:limit])
+			close(started)
+			<-release
+			return n, err
+		}}
+	}
+	a := locationTestTarget(directory, nil, false)
+	a.fs = aFS
+	a.retry = locationRetryPolicy{window: 2 * time.Second, initial: 2 * time.Millisecond, maximum: 20 * time.Millisecond}
+
+	bFS := newTrackingLocationFileSystem()
+	retried := make(chan struct{})
+	var retriedOnce sync.Once
+	bFS.onOpen = func(count int32) {
+		// Every validation attempt opens source and destination. Reaching four
+		// opens proves that B did not classify A's visible partial as stable.
+		if count >= 4 {
+			retriedOnce.Do(func() { close(retried) })
+		}
+	}
+	b := locationTestTarget(directory, nil, false)
+	b.fs = bFS
+	b.retry = a.retry
+
+	aResult := make(chan error, 1)
+	go func() { aResult <- a.putBundleFile(context.Background(), file) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first Bundle publisher did not expose its partial final")
+	}
+	bResult := make(chan error, 1)
+	go func() { bResult <- b.putBundleFile(context.Background(), file) }()
+	select {
+	case <-retried:
+	case err := <-bResult:
+		t.Fatalf("second Bundle publisher stopped without retrying: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second Bundle publisher did not retry the in-progress final")
+	}
+	close(release)
+	if err := <-aResult; err != nil {
+		t.Fatalf("first Bundle publisher: %v", err)
+	}
+	if err := <-bResult; err != nil {
+		t.Fatalf("second Bundle publisher: %v", err)
+	}
+	got, err := os.ReadFile(file.destination)
+	if err != nil || !bytes.Equal(got, sourceBytes) {
+		t.Fatalf("concurrent Bundle final differs from source: read=%v", err)
+	}
+	if opens := bFS.opens.Load(); opens < 4 || opens > 200 {
+		t.Fatalf("Bundle validation opens = %d, want bounded non-busy retry", opens)
+	}
+}
+
+func TestLocationBundlePreservesUnknownInvalidFinals(t *testing.T) {
+	base, _ := bundleLocationFileFixture(t)
+	for _, kind := range []string{"partial", "symlink", "directory"} {
+		t.Run(kind, func(t *testing.T) {
+			directory := t.TempDir()
+			file := base
+			file.destination = filepath.Join(directory, filepath.Base(file.source))
+			target := locationTestTarget(directory, nil, false)
+			switch kind {
+			case "partial":
+				if err := os.WriteFile(file.destination, []byte("unknown partial Bundle"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				outside := filepath.Join(t.TempDir(), "outside")
+				if err := os.WriteFile(outside, []byte("outside"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, file.destination); err != nil {
+					t.Fatal(err)
+				}
+			case "directory":
+				if err := os.Mkdir(file.destination, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.Lstat(file.destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = target.putBundleFile(context.Background(), file)
+			if err == nil {
+				t.Fatalf("%s Bundle final was accepted", kind)
+			}
+			if kind == "partial" && !strings.Contains(err.Error(), "cleanup/repair is required before retry") {
+				t.Fatalf("partial Bundle error = %v", err)
+			}
+			after, statErr := os.Lstat(file.destination)
+			if statErr != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() {
+				t.Fatalf("%s Bundle final changed: before=%v after=%v err=%v", kind, before, after, statErr)
+			}
+		})
+	}
+}
+
+func TestLocationBundleOwnedPartialCleanupPreservesReplacement(t *testing.T) {
+	base, _ := bundleLocationFileFixture(t)
+	for _, replacement := range []bool{false, true} {
+		name := "remove-owned"
+		if replacement {
+			name = "preserve-replacement"
+		}
+		t.Run(name, func(t *testing.T) {
+			directory := t.TempDir()
+			file := base
+			file.destination = filepath.Join(directory, filepath.Base(file.source))
+			target := locationTestTarget(directory, nil, false)
+			fs := newTrackingLocationFileSystem()
+			fs.wrapCreate = func(path string, created locationWriteFile) locationWriteFile {
+				var once sync.Once
+				return &hookedLocationWriteFile{base: created, writeHook: func([]byte) (int, error) {
+					once.Do(func() {
+						if replacement {
+							if err := os.Remove(path); err != nil {
+								t.Fatal(err)
+							}
+							if err := os.WriteFile(path, []byte("another publisher"), 0o644); err != nil {
+								t.Fatal(err)
+							}
+						}
+					})
+					return 0, errInjectedLocationFailure
+				}}
+			}
+			target.fs = fs
+			err := target.putBundleFile(context.Background(), file)
+			if !errors.Is(err, errInjectedLocationFailure) {
+				t.Fatalf("injected Bundle write error = %v", err)
+			}
+			if replacement {
+				got, readErr := os.ReadFile(file.destination)
+				if readErr != nil || string(got) != "another publisher" {
+					t.Fatalf("replacement Bundle final changed: %q err=%v", got, readErr)
+				}
+			} else if _, statErr := os.Lstat(file.destination); !os.IsNotExist(statErr) {
+				t.Fatalf("owned partial Bundle remains: %v", statErr)
+			}
+		})
+	}
+}

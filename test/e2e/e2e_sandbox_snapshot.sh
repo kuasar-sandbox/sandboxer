@@ -278,21 +278,63 @@ python3 -c 'import json,sys; c=json.load(sys.stdin); assert c["Version"] == 1 an
 echo "==> PASS: Snapshot S references Sandbox E; both strict configs are readable"
 
 # Content addressing: the basename matches the digest declared by the
-# artifact's final empty marker. The marker digest covers the deterministic
-# tar prefix, not the self-describing marker or end blocks.
+# artifact's final marker. The marker records the carrier identity and payload
+# commitment metadata; it is not part of the logical payload.
 ARTIFACT_FILES=("$(readlink -f "$SANDBOX_FILE")" "$(readlink -f "$SNAP_FILE")" "${OVERLAY_FILES[@]}")
 for f in "${ARTIFACT_FILES[@]}"; do
     base=$(basename "$f"); base=${base%.*}
-    markers=$(tar -tf "$f" | grep -E '^\.kuasar\.sha256\.[0-9a-f]{64}$' || true)
+    markers=$(tar -tf "$f" | grep -E '^\.kuasar\.digest\.[0-9a-f]{64}$' || true)
     marker_count=$(grep -c . <<<"$markers" || true)
     [ "$marker_count" = 1 ] || { echo "==> FAIL: $(basename "$f") has $marker_count digest markers"; exit 1; }
-    digest=${markers#.kuasar.sha256.}
+    digest=${markers#.kuasar.digest.}
     if [ "$base" != "$digest" ]; then
         echo "==> FAIL: $(basename "$f") basename != digest marker ($digest)"
         exit 1
     fi
 done
 echo "==> PASS: artifact basenames match their digest markers"
+
+# Exercise the public named-location CLI with the live S/E graph produced
+# above. The location contains content-addressed finals only: no semantic
+# aliases or symlinks. A second publication must validate and reuse the same
+# carrier-provided identities.
+LOCATION_NAME="snapshot-e2e"
+LOCATION_DIR="$WORK/named-location"
+mkdir -p "$LOCATION_DIR"
+LOCATED_REF=$("$BIN/sandbox-ctl" upload-snapshot --quiet \
+    --to-ref-location "$LOCATION_NAME=file://$LOCATION_DIR" "$SNAP_FILE")
+LOCATED_AGAIN=$("$BIN/sandbox-ctl" upload-snapshot --quiet \
+    --to-ref-location "$LOCATION_NAME=file://$LOCATION_DIR" "$SNAP_FILE")
+[ "$LOCATED_AGAIN" = "$LOCATED_REF" ] || {
+    echo "==> FAIL: repeated named publication changed root ref" >&2
+    printf 'first:  %s\nsecond: %s\n' "$LOCATED_REF" "$LOCATED_AGAIN" >&2
+    exit 1
+}
+LOCATED_BASENAME=${LOCATED_REF#file://}
+LOCATED_BASENAME=${LOCATED_BASENAME%%@*}
+LOCATED_DIGEST=${LOCATED_BASENAME%.snapshot}
+[ "$LOCATED_REF" = "file://$LOCATED_BASENAME@digest:$LOCATED_DIGEST@location:$LOCATION_NAME" ] || {
+    echo "==> FAIL: non-canonical located snapshot ref: $LOCATED_REF" >&2
+    exit 1
+}
+[ -f "$LOCATION_DIR/$LOCATED_BASENAME" ] || {
+    echo "==> FAIL: located snapshot final is missing" >&2
+    exit 1
+}
+if find "$LOCATION_DIR" -maxdepth 1 -type l -print -quit | grep -q .; then
+    echo "==> FAIL: named location contains a symlink" >&2
+    find "$LOCATION_DIR" -maxdepth 1 -type l -print >&2
+    exit 1
+fi
+[ ! -e "$LOCATION_DIR/$SID.snapshot" ] && [ ! -e "$LOCATION_DIR/$SID.sandbox" ] || {
+    echo "==> FAIL: named location contains a semantic alias" >&2
+    exit 1
+}
+LOCATED_INFO=$("$BIN/sandbox-ctl" info --json \
+    --ref-location "$LOCATION_NAME=file://$LOCATION_DIR" "$LOCATED_REF")
+python3 -c 'import json,sys; snapshot=json.load(sys.stdin); assert snapshot["SandboxRef"].endswith("@location:" + sys.argv[1]), snapshot' \
+    "$LOCATION_NAME" <<<"$LOCATED_INFO"
+echo "==> PASS: named location publication is canonical, reusable, alias-free, and readable"
 
 # Both operation roots are valid tarstream carriers. Their logical payload
 # boundaries and sparse semantics are covered by sandboxfile/snapshotfile tests;

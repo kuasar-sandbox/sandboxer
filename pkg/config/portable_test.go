@@ -22,8 +22,8 @@ func validPortableConfig() *PortableSandboxConfig {
 			Allocatable: AllocatableConfig{CPU: 1.5, Memory: "768MiB"},
 		},
 		Boot: PortableBootConfig{
-			Kernel:  "file://vmlinux@sha256:" + testSHA,
-			Runtime: "file://sandbox-runtime.bundle@sha256:" + testSHA2,
+			Kernel:  "file://vmlinux@digest:" + testSHA,
+			Runtime: "file://sandbox-runtime.bundle@digest:" + testSHA2,
 			Root:    PortableRootConfig{Base: "self"},
 		},
 		Launch: PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},
@@ -129,7 +129,7 @@ func TestPortableSelfExactlyOnceAndOnlyAtRootTop(t *testing.T) {
 		mutate  func(*PortableSandboxConfig)
 		wantErr string
 	}{
-		{name: "missing", mutate: func(c *PortableSandboxConfig) { c.Boot.Root.Base = "file://root.overlay@sha256:" + testSHA }, wantErr: "exactly once"},
+		{name: "missing", mutate: func(c *PortableSandboxConfig) { c.Boot.Root.Base = "file://root.overlay@digest:" + testSHA }, wantErr: "exactly once"},
 		{name: "twice", mutate: func(c *PortableSandboxConfig) {
 			c.Boot.Root.Overlay = &PortableOverlayConfig{Base: "self"}
 		}, wantErr: "base=self requires an empty overlay graph"},
@@ -141,7 +141,7 @@ func TestPortableSelfExactlyOnceAndOnlyAtRootTop(t *testing.T) {
 			c.Mounts = []MountConfig{{Target: "/data", Type: "disk", Source: "data"}}
 		}, wantErr: "boot.disks[0].base cannot be self"},
 		{name: "root base with non-empty overlay", mutate: func(c *PortableSandboxConfig) {
-			c.Boot.Root.Overlay = &PortableOverlayConfig{Base: "file://upper.overlay@sha256:" + testSHA2}
+			c.Boot.Root.Overlay = &PortableOverlayConfig{Base: "file://upper.overlay@digest:" + testSHA2}
 		}, wantErr: "base=self requires an empty overlay graph"},
 	}
 	for _, tc := range tests {
@@ -157,7 +157,7 @@ func TestPortableSelfExactlyOnceAndOnlyAtRootTop(t *testing.T) {
 }
 
 func TestPortableLayerRefLimitsAndDuplicates(t *testing.T) {
-	ref := "file://lower.overlay@sha256:" + testSHA
+	ref := "file://lower.overlay@digest:" + testSHA
 	cfg := validPortableConfig()
 	cfg.Boot.Root.BaseFromRefs = []string{ref, ref}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "duplicates") {
@@ -200,9 +200,9 @@ func TestProjectPortableColdExcludesHostAndEphemeralFields(t *testing.T) {
 			Kernel:  "file:///node/vmlinux",
 			Runtime: "file:///node/sandbox-runtime.bundle",
 			Root: RootConfig{
-				Base: "file:///images/root.erofs@sha256:" + testSHA,
+				Base: "file:///images/root.erofs@digest:" + testSHA,
 				Overlay: &OverlayConfig{
-					Base:         "file:///layers/old.overlay@sha256:" + testSHA2,
+					Base:         "file:///layers/old.overlay@digest:" + testSHA2,
 					BaseFromRefs: []string{"manifest://" + testSHA},
 					Diff:         "file:///var/lib/sandbox/active.diff",
 					DiffTemplate: "file:///node/upper.ext4",
@@ -221,8 +221,8 @@ func TestProjectPortableColdExcludesHostAndEphemeralFields(t *testing.T) {
 		Restore:        RestoreConfig{Prefetch: "memory"},
 	}
 	p, err := ProjectPortableCold(cfg, PortableProjection{
-		KernelRef:  "file://vmlinux@sha256:" + testSHA,
-		RuntimeRef: "file://sandbox-runtime.bundle@sha256:" + testSHA2,
+		KernelRef:  "file://vmlinux@digest:" + testSHA,
+		RuntimeRef: "file://sandbox-runtime.bundle@digest:" + testSHA2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -243,14 +243,14 @@ func TestProjectPortableColdExcludesHostAndEphemeralFields(t *testing.T) {
 	if p.Boot.Root.Overlay == nil || p.Boot.Root.Overlay.Base != "self" {
 		t.Fatalf("root self = %#v", p.Boot.Root.Overlay)
 	}
-	wantOld := "file://old.overlay@sha256:" + testSHA2
+	wantOld := "file://old.overlay@digest:" + testSHA2
 	if len(p.Boot.Root.Overlay.BaseFromRefs) != 2 || p.Boot.Root.Overlay.BaseFromRefs[0] != wantOld {
 		t.Fatalf("root upper chain = %v", p.Boot.Root.Overlay.BaseFromRefs)
 	}
 }
 
 func TestProjectPortableColdRetainsDataOverlayTop(t *testing.T) {
-	dataTop := "file:///layers/data-top.overlay@sha256:" + testSHA
+	dataTop := "file:///layers/data-top.overlay@digest:" + testSHA
 	dataLower := "manifest://" + testSHA2
 	cfg := &SandboxConfig{
 		Resources: ResourcesConfig{
@@ -261,13 +261,13 @@ func TestProjectPortableColdRetainsDataOverlayTop(t *testing.T) {
 			Kernel:  "file:///node/vmlinux",
 			Runtime: "file:///node/sandbox-runtime.bundle",
 			Root: RootConfig{
-				Base:    "file:///images/root.erofs@sha256:" + testSHA,
+				Base:    "file:///images/root.erofs@digest:" + testSHA,
 				Overlay: &OverlayConfig{DiffTemplate: "file:///node/root.ext4"},
 			},
 			Disks: []DiskConfig{{
 				Name: "data",
 				RootConfig: RootConfig{
-					Base: "file:///images/data.erofs@sha256:" + testSHA2,
+					Base: "file:///images/data.erofs@digest:" + testSHA2,
 					Overlay: &OverlayConfig{
 						Base: dataTop, BaseFromRefs: []string{dataLower},
 						DiffTemplate: "file:///node/data.ext4",
@@ -279,28 +279,28 @@ func TestProjectPortableColdRetainsDataOverlayTop(t *testing.T) {
 	}
 
 	portable, err := ProjectPortableCold(cfg, PortableProjection{
-		KernelRef:  "file://vmlinux@sha256:" + testSHA,
-		RuntimeRef: "file://sandbox-runtime.bundle@sha256:" + testSHA2,
+		KernelRef:  "file://vmlinux@digest:" + testSHA,
+		RuntimeRef: "file://sandbox-runtime.bundle@digest:" + testSHA2,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	data := portable.Boot.Disks[0].Overlay
-	if data == nil || data.Base != "file://data-top.overlay@sha256:"+testSHA {
+	if data == nil || data.Base != "file://data-top.overlay@digest:"+testSHA {
 		t.Fatalf("portable data overlay top = %#v", data)
 	}
 	if len(data.BaseFromRefs) != 1 || data.BaseFromRefs[0] != dataLower {
 		t.Fatalf("portable data overlay lower graph = %v", data.BaseFromRefs)
 	}
 
-	newTop := "file://captured-data.overlay@sha256:" + testSHA2
+	newTop := "file://captured-data.overlay@digest:" + testSHA2
 	exported, err := portable.Exported("", []string{newTop}, []bool{false, false})
 	if err != nil {
 		t.Fatal(err)
 	}
 	data = exported.Boot.Disks[0].Overlay
 	if data.Base != newTop || len(data.BaseFromRefs) != 2 ||
-		data.BaseFromRefs[0] != "file://data-top.overlay@sha256:"+testSHA || data.BaseFromRefs[1] != dataLower {
+		data.BaseFromRefs[0] != "file://data-top.overlay@digest:"+testSHA || data.BaseFromRefs[1] != dataLower {
 		t.Fatalf("exported data overlay graph = %#v", data)
 	}
 }
@@ -308,16 +308,16 @@ func TestProjectPortableColdRetainsDataOverlayTop(t *testing.T) {
 func TestPortableExportedSeparatesRootSelfAndDataRefs(t *testing.T) {
 	cfg := validPortableConfig()
 	cfg.Boot.Root = PortableRootConfig{
-		Base: "file://root.erofs@sha256:" + testSHA,
+		Base: "file://root.erofs@digest:" + testSHA,
 		Overlay: &PortableOverlayConfig{
 			Base:         "self",
-			BaseFromRefs: []string{"file://old.overlay@sha256:" + testSHA2},
+			BaseFromRefs: []string{"file://old.overlay@digest:" + testSHA2},
 		},
 	}
 	cfg.Boot.Disks = []PortableDiskConfig{{
 		Name: "data",
 		PortableRootConfig: PortableRootConfig{
-			Base:         "file://data-old.overlay@sha256:" + testSHA,
+			Base:         "file://data-old.overlay@digest:" + testSHA,
 			BaseFromRefs: []string{"manifest://" + testSHA2},
 		},
 	}}
@@ -326,29 +326,29 @@ func TestPortableExportedSeparatesRootSelfAndDataRefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	exported, err := cfg.Exported(
-		"file://parent.sandbox@sha256:"+testSHA,
-		[]string{"file://new-data.overlay@sha256:" + testSHA2},
+		"file://parent.sandbox@digest:"+testSHA,
+		[]string{"file://new-data.overlay@digest:" + testSHA2},
 		[]bool{false, false},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rootChain := exported.Boot.Root.Overlay.BaseFromRefs
-	if len(rootChain) != 2 || rootChain[0] != "file://parent.sandbox@sha256:"+testSHA {
+	if len(rootChain) != 2 || rootChain[0] != "file://parent.sandbox@digest:"+testSHA {
 		t.Fatalf("root chain = %v", rootChain)
 	}
 	data := exported.Boot.Disks[0].PortableRootConfig
-	if data.Base != "file://new-data.overlay@sha256:"+testSHA2 {
+	if data.Base != "file://new-data.overlay@digest:"+testSHA2 {
 		t.Fatalf("data top = %q", data.Base)
 	}
-	if len(data.BaseFromRefs) != 2 || data.BaseFromRefs[0] != "file://data-old.overlay@sha256:"+testSHA {
+	if len(data.BaseFromRefs) != 2 || data.BaseFromRefs[0] != "file://data-old.overlay@digest:"+testSHA {
 		t.Fatalf("data chain = %v", data.BaseFromRefs)
 	}
 }
 
 func TestPortableExportedMaterializesSingleDiskParentOnce(t *testing.T) {
 	cfg := validPortableConfig()
-	parent := "file://parent.sandbox@sha256:" + testSHA
+	parent := "file://parent.sandbox@digest:" + testSHA
 	exported, err := cfg.Exported(parent, nil, []bool{false})
 	if err != nil {
 		t.Fatal(err)
@@ -362,13 +362,13 @@ func TestPortableExportedMaterializesSingleDiskParentOnce(t *testing.T) {
 }
 
 func TestPortableExportedDoesNotRepeatIdenticalDataTopAsLower(t *testing.T) {
-	dataRef := "file://data.overlay@sha256:" + testSHA
+	dataRef := "file://data.overlay@digest:" + testSHA
 	cfg := validPortableConfig()
 	cfg.Boot.Disks = []PortableDiskConfig{{
 		Name: "data",
 		PortableRootConfig: PortableRootConfig{
 			Base:         dataRef,
-			BaseFromRefs: []string{"file://lower.overlay@sha256:" + testSHA2},
+			BaseFromRefs: []string{"file://lower.overlay@digest:" + testSHA2},
 		},
 	}}
 	cfg.Mounts = []MountConfig{{Target: "/data", Type: "disk", Source: "data"}}
@@ -381,7 +381,7 @@ func TestPortableExportedDoesNotRepeatIdenticalDataTopAsLower(t *testing.T) {
 	if data.Base != dataRef {
 		t.Fatalf("data top = %q, want %q", data.Base, dataRef)
 	}
-	if len(data.BaseFromRefs) != 1 || data.BaseFromRefs[0] != "file://lower.overlay@sha256:"+testSHA2 {
+	if len(data.BaseFromRefs) != 1 || data.BaseFromRefs[0] != "file://lower.overlay@digest:"+testSHA2 {
 		t.Fatalf("data lower graph = %v", data.BaseFromRefs)
 	}
 }

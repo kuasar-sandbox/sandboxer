@@ -259,7 +259,7 @@ func TestCanonicalBundleSourceNormalizesLocatedAlias(t *testing.T) {
 
 func TestNormalizeLocalMemoryRefsEmitsSiblingBasenames(t *testing.T) {
 	digest := strings.Repeat("b", 64)
-	locatedRef := "file://located.snapshot@sha256:" + digest + "@location:parent"
+	locatedRef := "file://located.snapshot@digest:" + digest + "@location:parent"
 	manifestRef := "manifest://" + strings.Repeat("a", 64)
 	got, err := normalizeLocalMemoryRefs([]string{
 		"file:///legacy/path/base.snapshot",
@@ -285,9 +285,9 @@ func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
 	wDigest := strings.Repeat("b", 64)
 	bDigest := strings.Repeat("c", 64)
 	binding := &MemorySourceBinding{
-		SnapshotRef: "file:///bundle/w.snapshot@sha256:" + wDigest,
+		SnapshotRef: "file:///bundle/w.snapshot@digest:" + wDigest,
 		FromRefs: []string{
-			"file:///bundle/b.snapshot@sha256:" + bDigest,
+			"file:///bundle/b.snapshot@digest:" + bDigest,
 			portable,
 		},
 	}
@@ -296,7 +296,7 @@ func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantMerged := []string{"file://b.snapshot@sha256:" + bDigest, portable}
+	wantMerged := []string{"file://b.snapshot@digest:" + bDigest, portable}
 	if strings.Join(merged, ",") != strings.Join(wantMerged, ",") {
 		t.Fatalf("merged memory refs = %v, want %v", merged, wantMerged)
 	}
@@ -306,15 +306,15 @@ func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantWorkingSet := []string{
-		"file://w.snapshot@sha256:" + wDigest,
-		"file://b.snapshot@sha256:" + bDigest,
+		"file://w.snapshot@digest:" + wDigest,
+		"file://b.snapshot@digest:" + bDigest,
 		portable,
 	}
 	if strings.Join(workingSet, ",") != strings.Join(wantWorkingSet, ",") {
 		t.Fatalf("working-set memory refs = %v, want %v", workingSet, wantWorkingSet)
 	}
 
-	if binding.FromRefs[0] != "file:///bundle/b.snapshot@sha256:"+bDigest {
+	if binding.FromRefs[0] != "file:///bundle/b.snapshot@digest:"+bDigest {
 		t.Fatalf("memoryRefsForSnapshot mutated binding: %v", binding.FromRefs)
 	}
 }
@@ -325,7 +325,7 @@ func TestSnapshotMemoryRefsRejectsProspectiveChainOverLimit(t *testing.T) {
 		FromRefs:    make([]string, snapshot.MaxMemoryFromRefs),
 	}
 	for i := range binding.FromRefs {
-		binding.FromRefs[i] = fmt.Sprintf("file://%064x.snapshot@sha256:%064x", i+1, i+1)
+		binding.FromRefs[i] = fmt.Sprintf("file://%064x.snapshot@digest:%064x", i+1, i+1)
 	}
 
 	if _, err := memoryRefsForSnapshot(binding, false); err == nil || !strings.Contains(err.Error(), "exceeds 64 entries") {
@@ -839,7 +839,7 @@ func TestHandleSnapshotRequestRejectsMissingLocalMemoryLowerBeforeQuiesce(t *tes
 		PortableConfig: snapshotTestLivePortable(t),
 		MemoryBinding: &MemorySourceBinding{
 			SnapshotRef: parentRef, RuntimeRef: parentRef, RelativeDir: filepath.Dir(parentPath),
-			FromRefs: []string{"file://base.snapshot@sha256:" + strings.Repeat("a", 64)},
+			FromRefs: []string{"file://base.snapshot@digest:" + strings.Repeat("a", 64)},
 		},
 		SandboxID:   "test",
 		ManifestCfg: &config.ManifestConfig{Store: manifest.StoreConfig{Endpoint: "unused"}},
@@ -851,7 +851,7 @@ func TestHandleSnapshotRequestRejectsMissingLocalMemoryLowerBeforeQuiesce(t *tes
 			return bytes.NewReader(make([]byte, 4096)), nil, nil
 		},
 	}}, nil, filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"), "", nil, nil, pinger, nil, func() error { return nil }, nil, discardLogf)
-	if err == nil || !strings.Contains(err.Error(), "open memory Snapshot file://base.snapshot@sha256:") {
+	if err == nil || !strings.Contains(err.Error(), "open memory Snapshot file://base.snapshot@digest:") {
 		t.Fatalf("local lower preflight error = %v", err)
 	}
 	if viewCalled {
@@ -1554,7 +1554,7 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 	diff := filepath.Join(dir, "must-not-be-opened.diff")
 	digest := strings.Repeat("0", 64)
 	cfg := &config.SandboxConfig{}
-	parentRef := "file://base.overlay@sha256:" + digest
+	parentRef := "file://base.overlay@digest:" + digest
 	pinger := &guestlink.Pinger{
 		Client: &guestlink.HostClient{BasePath: filepath.Join(dir, "must-not-dial.sock")},
 	}
@@ -1817,8 +1817,8 @@ func snapshotTestPortable(t *testing.T) *config.PortableSandboxConfig {
 			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "1GiB"},
 		},
 		Boot: config.PortableBootConfig{
-			Kernel: "file://kernel@sha256:" + key, Runtime: "file://runtime@sha256:" + key,
-			Root: config.PortableRootConfig{Base: "file://base@sha256:" + key, Overlay: &config.PortableOverlayConfig{Base: "self"}},
+			Kernel: "file://kernel@digest:" + key, Runtime: "file://runtime@digest:" + key,
+			Root: config.PortableRootConfig{Base: "file://base@digest:" + key, Overlay: &config.PortableOverlayConfig{Base: "self"}},
 		},
 		Launch: config.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},
 	}

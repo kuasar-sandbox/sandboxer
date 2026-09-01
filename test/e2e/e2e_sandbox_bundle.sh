@@ -207,6 +207,19 @@ if got != expected:
 PY
 }
 
+assert_located_bundle() {
+    local ref="$1" location_name="$2" location_dir="$3" root="$4" source="$5"
+    local expected="file://$root.bundle@manifest:$root@location:$location_name"
+    [ "$ref" = "$expected" ] || { echo "FAIL: located Bundle ref=$ref, want $expected"; exit 1; }
+    [ -f "$location_dir/$root.bundle" ] || { echo "FAIL: located Bundle final is absent"; exit 1; }
+    cmp "$source" "$location_dir/$root.bundle" \
+        || { echo "FAIL: located Bundle is not an exact copy"; exit 1; }
+    [ "$(find "$location_dir" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] \
+        || { echo "FAIL: named location contains aliases or extra artifacts"; find "$location_dir" -mindepth 1 -maxdepth 1 -ls; exit 1; }
+    [ -z "$(find "$location_dir" -mindepth 1 -maxdepth 1 -type l -print -quit)" ] \
+        || { echo "FAIL: named location contains a symlink"; exit 1; }
+}
+
 assert_manifest_snapshot_refs() {
     local bundle="$1" snapshot_json="$2" want_parents="$3"
     local sandbox_ref sandbox_key sandbox_json
@@ -269,12 +282,7 @@ ROOT1="$(basename "$ROOT1_PATH" .bundle)"
 LOCATION_A="$WORK/location-a"
 LOCATED_A="$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/manifest.yaml" \
     --to-ref-location A=file://$LOCATION_A --quiet "$OUT1/$SID1.snapshot")"
-case "$LOCATED_A" in
-    file://*.snapshot@sha256:*@location:A) ;;
-    *) echo "FAIL: located A ref=$LOCATED_A"; exit 1 ;;
-esac
-[ -n "$(find "$LOCATION_A" -maxdepth 1 -type f -name '*.sandbox' -print -quit)" ] \
-    || { echo "FAIL: location A has no published Sandbox E"; exit 1; }
+assert_located_bundle "$LOCATED_A" A "$LOCATION_A" "$ROOT1" "$ROOT1_PATH"
 
 write_restore_yaml() {
     local output="$1" hostname="$2" root_diff="$3"
@@ -322,10 +330,7 @@ assert_bundle_refs "$ROOT2_PATH"
 LOCATION_B="$WORK/location-b"
 LOCATED_B="$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/manifest.yaml" \
     --to-ref-location B=file://$LOCATION_B --quiet "$OUT2/$SID2.snapshot")"
-case "$LOCATED_B" in
-    file://*.snapshot@sha256:*@location:B) ;;
-    *) echo "FAIL: located B ref=$LOCATED_B"; exit 1 ;;
-esac
+assert_located_bundle "$LOCATED_B" B "$LOCATION_B" "$ROOT2" "$ROOT2_PATH"
 
 rm -rf "$OUT1" "$OUT2" "$LOCATION_A"
 echo "==> phase 3: located B alone restores -> self-contained Bundle C"

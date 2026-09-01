@@ -3,7 +3,6 @@ package artifact
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -69,6 +68,22 @@ func (f *OpenedFile) RootManifestKey() (store.ContentKey, bool) {
 // Digest implements tarstream.Digester for tarstream callers. Bundle callers
 // select identity with RootManifestKey instead.
 func (f *OpenedFile) Digest() (string, string) { return f.digestScheme, f.digest }
+
+func (f *OpenedFile) TarStreamDigest(name string) ([32]byte, bool) {
+	provider, ok := f.Stream.(tarstream.IdentityProvider)
+	if !ok {
+		return [32]byte{}, false
+	}
+	return provider.TarStreamDigest(name)
+}
+
+func (f *OpenedFile) PayloadCommitment() (uint64, [32]byte, bool) {
+	provider, ok := f.Stream.(tarstream.IdentityProvider)
+	if !ok {
+		return f.Size(), [32]byte{}, false
+	}
+	return provider.PayloadCommitment()
+}
 
 func (f *OpenedFile) Close() error {
 	f.closeOnce.Do(func() {
@@ -332,7 +347,7 @@ func openTarstream(path string, ref manifest.Ref, codec tarstream.Codec, require
 	if err != nil {
 		return nil, err
 	}
-	if err := validateTarIdentity(ref, path, stream, codec, required); err != nil {
+	if err := validateTarIdentity(ref, path, stream); err != nil {
 		_ = stream.Close()
 		return nil, err
 	}
@@ -346,50 +361,26 @@ func openTarstream(path string, ref manifest.Ref, codec tarstream.Codec, require
 }
 
 func tarReadOptions(ref manifest.Ref, codec tarstream.Codec, required bool) ([]tarstream.ReadOption, error) {
-	if codec == nil {
-		if required {
-			return nil, fmt.Errorf("local tarstream: required policy has no codec")
-		}
-		if ref.DigestScheme == tarstream.DigestSchemeHMAC {
-			return nil, fmt.Errorf("local tarstream: hmac ref requires crypto.local=auto or required")
-		}
-		if ref.DigestScheme == tarstream.DigestSchemeSHA256 {
-			return []tarstream.ReadOption{tarstream.WithExpectedDigest(ref.DigestScheme, ref.Digest)}, nil
-		}
-		return nil, nil
+	if required && codec == nil {
+		return nil, fmt.Errorf("local tarstream: required policy has no codec")
 	}
-
-	options := []tarstream.ReadOption{tarstream.WithCodec(codec, required)}
-	switch ref.DigestScheme {
-	case "":
-		return options, nil
-	case tarstream.DigestSchemeHMAC:
-		return append(options, tarstream.WithExpectedDigest(tarstream.DigestSchemeHMAC, ref.Digest)), nil
-	case tarstream.DigestSchemeSHA256:
-		if required {
-			return nil, fmt.Errorf("local tarstream: legacy sha256 ref is forbidden by required policy")
-		}
-		keyed, err := keyedDigestHex(codec, ref.Digest)
-		if err != nil {
-			return nil, fmt.Errorf("local tarstream: invalid legacy sha256 ref")
-		}
-		return append(options, tarstream.WithExpectedDigest(tarstream.DigestSchemeHMAC, keyed)), nil
-	default:
-		return nil, fmt.Errorf("local tarstream: unsupported identity scheme %q", ref.DigestScheme)
+	var options []tarstream.ReadOption
+	if codec != nil {
+		options = append(options, tarstream.WithCodec(codec, required))
 	}
+	if ref.Digest != "" {
+		options = append(options, tarstream.WithExpectedDigest(ref.DigestScheme, ref.Digest))
+	}
+	return options, nil
 }
 
-func validateTarIdentity(ref manifest.Ref, path string, stream fetch.Stream, codec tarstream.Codec, required bool) error {
+func validateTarIdentity(ref manifest.Ref, path string, stream fetch.Stream) error {
 	digester, ok := stream.(tarstream.Digester)
 	if !ok {
 		return fmt.Errorf("local tarstream: artifact has no declared digest")
 	}
 	scheme, digest := digester.Digest()
-	wantScheme := tarstream.DigestSchemeSHA256
-	if codec != nil {
-		wantScheme = tarstream.DigestSchemeHMAC
-	}
-	if scheme != wantScheme {
+	if scheme != tarstream.DigestScheme && scheme != tarstream.DigestSchemeHMAC {
 		return fmt.Errorf("local tarstream: artifact digest scheme is incompatible with policy")
 	}
 	if ref.Digest != "" {
@@ -404,32 +395,10 @@ func validateTarIdentity(ref manifest.Ref, path string, stream fetch.Stream, cod
 	}
 	base := filepath.Base(realPath)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
-	if codec == nil || required {
-		if !digestEqual(stem, digest) {
-			return fmt.Errorf("local tarstream: content name does not match artifact identity")
-		}
-		return nil
-	}
 	if digestEqual(stem, digest) {
 		return nil
 	}
-	legacy, err := keyedDigestHex(codec, stem)
-	if err != nil || !digestEqual(legacy, digest) {
-		return fmt.Errorf("local tarstream: content name does not match artifact identity")
-	}
-	return nil
-}
-
-func keyedDigestHex(codec tarstream.Codec, plainHex string) (string, error) {
-	var plain [32]byte
-	if len(plainHex) != hex.EncodedLen(len(plain)) || strings.ToLower(plainHex) != plainHex {
-		return "", fmt.Errorf("invalid digest")
-	}
-	if _, err := hex.Decode(plain[:], []byte(plainHex)); err != nil {
-		return "", fmt.Errorf("invalid digest")
-	}
-	keyed := codec.KeyedDigest(plain)
-	return hex.EncodeToString(keyed[:]), nil
+	return fmt.Errorf("local tarstream: content name does not match artifact identity")
 }
 
 func digestEqual(left, right string) bool {

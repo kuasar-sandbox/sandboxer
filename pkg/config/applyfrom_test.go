@@ -15,8 +15,8 @@ func portableFromFixture() *PortableSandboxConfig {
 		},
 		Network: PortableNetworkConfig{Enabled: true, Interface: "eth0"},
 		Boot: PortableBootConfig{
-			Kernel:  "file://vmlinux@sha256:" + testSHA,
-			Runtime: "file://sandbox-runtime.bundle@sha256:" + testSHA2,
+			Kernel:  "file://vmlinux@digest:" + testSHA,
+			Runtime: "file://sandbox-runtime.bundle@digest:" + testSHA2,
 			Root:    PortableRootConfig{Base: "self", Overlay: &PortableOverlayConfig{}},
 		},
 		Launch: PortableLaunchConfig{
@@ -182,7 +182,7 @@ func TestApplyFromRulesRejectsDataDiskCountAndNameChanges(t *testing.T) {
 	artifact := portableFromFixture()
 	artifact.Boot.Disks = []PortableDiskConfig{{
 		Name:               "data",
-		PortableRootConfig: PortableRootConfig{Base: "file://data.overlay@sha256:" + testSHA},
+		PortableRootConfig: PortableRootConfig{Base: "file://data.overlay@digest:" + testSHA},
 	}}
 	artifact.Mounts = []MountConfig{{Target: "/data", Type: "disk", Source: "data"}}
 	if err := artifact.Validate(); err != nil {
@@ -215,7 +215,7 @@ func TestApplyFromRulesPreservesDataDiskMountTopology(t *testing.T) {
 	artifact := portableFromFixture()
 	artifact.Boot.Disks = []PortableDiskConfig{{
 		Name:               "data",
-		PortableRootConfig: PortableRootConfig{Base: "file://data.overlay@sha256:" + testSHA},
+		PortableRootConfig: PortableRootConfig{Base: "file://data.overlay@digest:" + testSHA},
 	}}
 	artifact.Mounts = []MountConfig{
 		{Target: "/data", Type: "disk", Source: "data", Options: "ro"},
