@@ -70,12 +70,20 @@ func TestDefaultDiffPathSeparatesPathIDFromSandboxID(t *testing.T) {
 	if want := filepath.Join(baseRoot, "phase-b"); baseDir != want {
 		t.Fatalf("base dir = %q, want %q", baseDir, want)
 	}
-	if got, want := DefaultDiffURI(baseDir, "logical-sandbox"),
+	if got, want := DefaultDiffURIForBaseDir(baseDir, "logical-sandbox"),
 		"file://"+filepath.Join(baseRoot, "phase-b", "logical-sandbox.overlay.diff"); got != want {
 		t.Fatalf("default diff = %q, want %q", got, want)
 	}
 	if got, want := DefaultDiskDiffURI(baseDir, "logical-sandbox", "disk0"),
 		"file://"+filepath.Join(baseRoot, "phase-b", "logical-sandbox.disk0.diff"); got != want {
 		t.Fatalf("default data diff = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultDiffURIPreservesBaseRootContract(t *testing.T) {
+	baseRoot := filepath.Join(t.TempDir(), "base")
+	if got, want := DefaultDiffURI(baseRoot, "logical-sandbox"),
+		"file://"+filepath.Join(baseRoot, "logical-sandbox", "logical-sandbox.overlay.diff"); got != want {
+		t.Fatalf("default diff = %q, want %q", got, want)
 	}
 }

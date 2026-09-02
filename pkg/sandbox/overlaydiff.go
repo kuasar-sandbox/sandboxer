@@ -20,10 +20,17 @@ func DefaultBaseDir(baseRoot, pathID string) string {
 	return filepath.Join(baseRoot, pathID)
 }
 
-// DefaultDiffURI returns the auto-default overlay diff URI (on disk, under the
-// already-derived baseDir). The filename retains logical SandboxID identity.
-// Used when boot.root.overlay.diff is empty.
-func DefaultDiffURI(baseDir, sandboxID string) string {
+// DefaultDiffURI returns the auto-default overlay diff URI below the logical
+// SandboxID directory. It preserves the original baseRoot/SandboxID contract
+// for callers that do not use a distinct PathID.
+func DefaultDiffURI(baseRoot, sandboxID string) string {
+	return DefaultDiffURIForBaseDir(DefaultBaseDir(baseRoot, sandboxID), sandboxID)
+}
+
+// DefaultDiffURIForBaseDir returns the auto-default overlay diff URI below an
+// already-derived, PathID-specific baseDir. The filename retains logical
+// SandboxID identity. Used when boot.root.overlay.diff is empty.
+func DefaultDiffURIForBaseDir(baseDir, sandboxID string) string {
 	return "file://" + filepath.Join(baseDir, sandboxID+".overlay.diff")
 }
 

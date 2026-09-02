@@ -504,7 +504,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		if err := os.MkdirAll(baseDir, 0o755); err != nil {
 			return -1, fmt.Errorf("mkdir base dir %s: %w", baseDir, err)
 		}
-		diffURI = DefaultDiffURI(baseDir, opts.SandboxID)
+		diffURI = DefaultDiffURIForBaseDir(baseDir, opts.SandboxID)
 		defer func() {
 			_ = os.Remove(filepath.Join(baseDir, opts.SandboxID+".overlay.diff"))
 			_ = os.Remove(baseDir)
@@ -805,7 +805,7 @@ func preflightColdArtifacts(
 		}
 		imageDefaults = imageCfg
 	}
-	if err := preflightWritableExt4(ctx, root, "boot.root", DefaultDiffURI(baseDir, sandboxID),
+	if err := preflightWritableExt4(ctx, root, "boot.root", DefaultDiffURIForBaseDir(baseDir, sandboxID),
 		fetcher, locations, codec, diffCustomerKey, required, opener); err != nil {
 		return nil, err
 	}
