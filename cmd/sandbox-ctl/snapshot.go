@@ -19,7 +19,8 @@ import (
 // See docs/sandbox.md §2.3.
 func snapshotCmd(args []string) int {
 	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
-	sandboxID := fs.String("sandbox-id", "", "target sandbox id (required)")
+	sandboxID := fs.String("sandbox-id", "", "target sandbox id (path fallback when --path-id is omitted)")
+	pathID := fs.String("path-id", "", "run-root directory leaf (takes precedence over --sandbox-id)")
 	outDir := fs.String("output", "", "local output dir; produces <sid>.snapshot + scheme-qualified content-addressed artifacts")
 	upload := fs.Bool("upload", false, "ingest Snapshot S, Sandbox E, and dependencies into the manifest store; stdout = S manifest key")
 	mode := fs.String("mode", ctl.SnapshotModeLocal, "local snapshot format: local|bundle (default local)")
@@ -36,12 +37,13 @@ func snapshotCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "snapshot: unexpected positional arguments")
 		return 2
 	}
-	if *sandboxID == "" {
-		fmt.Fprintln(os.Stderr, "snapshot: --sandbox-id required")
+	if *sandboxID == "" && *pathID == "" {
+		fmt.Fprintln(os.Stderr, "snapshot: --sandbox-id or --path-id is required")
 		return 2
 	}
-	if err := validateSandboxIDArg(*sandboxID); err != nil {
-		fmt.Fprintf(os.Stderr, "snapshot: --sandbox-id: %v\n", err)
+	targetPathID, err := resolveTargetPathID(*sandboxID, *pathID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "snapshot: target path: %v\n", err)
 		return 2
 	}
 	if *timeoutS < 0 {
@@ -90,7 +92,7 @@ func snapshotCmd(args []string) int {
 		rd = "/run/sandbox"
 	}
 
-	ctlSock := filepath.Join(rd, *sandboxID, "ctl.sock")
+	ctlSock := filepath.Join(rd, targetPathID, "ctl.sock")
 	c, err := net.DialTimeout("unix", ctlSock, 5*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "snapshot: dial %s: %v\n", ctlSock, err)

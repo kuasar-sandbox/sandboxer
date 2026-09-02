@@ -94,6 +94,35 @@ sandbox-ctl run --from ./s1.sandbox --config host.yaml --sandbox-id s2
 sandbox-ctl run --restore ./s1.snapshot --config restore-host.yaml --sandbox-id s3
 ```
 
+RunRoot/BaseRoot 是调用级根目录，RunDir/BaseDir 是本次 Sandbox 的实际目录。
+`SandboxID` 始终是逻辑身份；`PathID` 仅是两个 root 下共同使用的目录 leaf：
+
+```text
+pathID  = PathID（若显式给出），否则为 SandboxID
+RunDir  = RunRoot/pathID
+BaseDir = BaseRoot/pathID
+```
+
+例如 Build phase 可保留全局唯一 SandboxID，同时使用固定私有目录：
+
+```bash
+sandbox-ctl run \
+  --config phase-a.yaml \
+  --sandbox-id build-01-phase-a \
+  --path-id a \
+  --run-root /run/sandbox/builds/build-01 \
+  --base-root /var/lib/sandbox/builds/build-01
+```
+
+PathID 必须是非空、安全的单一路径分量，不能是 `.`、`..`，也不能包含
+`/`、`\\` 或 NUL。它不与 SandboxID 比较，也没有 PathID→SandboxID 映射。
+root/data disk 的默认 writable diff 位于 PathID 派生的 BaseDir，但文件名继续
+使用逻辑 SandboxID，例如
+`BaseRoot/a/build-01-phase-a.overlay.diff` 与
+`BaseRoot/a/build-01-phase-a.disk0.diff`。cold、`--from` 和 `--restore` 使用同一
+规则。Sandbox 正常退出只清理当前 PathID 的 RunDir 和 owned diff；不会递归
+删除传入的 RunRoot/BaseRoot 或 sibling PathID。
+
 `--from` 与 `--restore` 互斥. `--config` 在三种模式中的所有权不同:
 
 - 普通 run:完整显式 cold config.
@@ -117,7 +146,8 @@ sandbox-ctl run --restore ./s1.snapshot --config restore-host.yaml --sandbox-id 
 
 ```bash
 sandbox-ctl snapshot \
-  --sandbox-id s1 \
+  --path-id a \
+  --run-root /run/sandbox/builds/build-01 \
   (--output /artifacts | --upload) \
   [--mode local|bundle] \
   [--resume] \
@@ -131,13 +161,19 @@ Local human output同时列出 `Snapshot S` 与 `Sandbox E`. Upload stdout 仍�
 
 `--drop-caches` 只属于 memory snapshot,默认 false. `--merge-ref` 只控制 local memory parent merge,不改变 disk provenance.
 
+local `snapshot` 只需 `--sandbox-id` 或 `--path-id` 之一。两者同时给出时
+PathID 只选择 `RunRoot/PathID/ctl.sock`，不做身份一致性校验。`--output` 可以位于
+BaseRoot 文件系统（例如 `BuildBaseDir/checkpoint`）；运行进程只清理自己的
+RunDir/owned diff，不会把 output 当作运行目录删除。
+
 ### 2.4 `sandbox-ctl export`
 
 Live export:
 
 ```bash
 sandbox-ctl export \
-  --sandbox-id s1 \
+  --path-id a \
+  --run-root /run/sandbox/builds/build-01 \
   (--output /artifacts | --upload) \
   [--mode local|bundle] \
   [--resume]
@@ -156,11 +192,20 @@ sandbox-ctl export \
 
 Live mode不接受 `--config`;它复用当前 run 进程已验证的 manifest/ref-location/crypto binding,因此显式 `--manifest-config` 和 `--ref-location` 仅属于 offline mode. Offline mode要求 `--config` 或 `SANDBOX_CONFIG` 且拒绝 `--resume`. 两种模式都支持 `--timeout`;0 表示不设 operation deadline. Export 不接受 `drop_caches` 或 memory merge 参数,不调用 CH `/vm.snapshot`,不读取 memfd,不生成 memory refs.
 
+live mode 与 local snapshot 相同，可只给 PathID；同时给出 SandboxID/PathID 时
+PathID 只定位 ctl socket。offline mode 不接受 PathID，原有 `--sandbox-id` 仍仅是
+输出 artifact alias，语义不变。
+
 ### 2.5 `sandbox-ctl exec`
 
 ```bash
-sandbox-ctl exec --sandbox-id s1 --run-root /run/sandbox -- /bin/sh -c 'id'
+sandbox-ctl exec --path-id a --run-root /run/sandbox/builds/build-01 -- /bin/sh -c 'id'
 ```
+
+local exec 可只给 `--path-id`；若同时给
+`--sandbox-id build-01-phase-a --path-id a`，仍只拨号
+`RunRoot/a/ctl.sock`，请求本身不增加 SandboxID 或一致性检查。未给 PathID 时
+继续使用 `RunRoot/SandboxID/ctl.sock`。
 
 `exec` 通过当前 ctl/MUX 创建 sibling process. Export/snapshot 的 quiesce gate 原子阻止新 exec/forward 进入不稳定窗口,并关闭、join 已放行的 exec/forward session;在飞 exec 被终止且不会在 `--resume` 后自动重跑. Restore/attach 只有在新 MUX 建立且应用 cgroup 已 thaw 后才重新开放 exec、forward、plugin 和 app restart;ACK 与 thaw 之间抢先到达的请求会被 gate 拒绝,不会向 frozen cgroup fork. Guest `attach` 是幂等恢复操作;host 在 request/ACK 边界不明确时立即重试一次,且整个 dial/ACK 过程受 lifecycle context cancellation 控制.
 
@@ -731,6 +776,9 @@ Failure semantics:
 - Partial files使用 same-directory temp并清理.
 
 ### 6.3 `ctl.sock` protocol
+
+socket 固定位于 `RunRoot/PathID/ctl.sock`；PathID 省略时等于 SandboxID。
+PathID 是 host-side 定位参数，不进入以下 wire request：
 
 Snapshot和export使用独立 request type:
 

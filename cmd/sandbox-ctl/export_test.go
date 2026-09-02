@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 )
 
@@ -56,11 +58,74 @@ func TestExportCommandRejectsInvalidModeCombinations(t *testing.T) {
 			name: "unsafe sandbox id",
 			args: []string{"--sandbox-id", "../sid", "--output", t.TempDir()},
 		},
+		{
+			name: "unsafe path id",
+			args: []string{"--path-id", "../phase", "--output", t.TempDir()},
+		},
+		{
+			name: "offline path id",
+			args: []string{"--from", "image.erofs", "--config", "sandbox.yaml", "--path-id", "phase", "--output", t.TempDir()},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			if code := exportCmd(test.args); code != 2 {
 				t.Fatalf("export exit = %d, want usage error 2", code)
+			}
+		})
+	}
+}
+
+func TestExportCommandUsesPathIDWithoutSandboxIDAndWithPrecedence(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		sandboxID string
+	}{
+		{name: "path id only"},
+		{name: "path id takes precedence", sandboxID: "logical-sandbox"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runRoot, err := os.MkdirTemp("", "pathid-export-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(runRoot) })
+			pathID := "phase-a"
+			runDir := filepath.Join(runRoot, pathID)
+			if err := os.MkdirAll(runDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			listener, err := net.Listen("unix", filepath.Join(runDir, "ctl.sock"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+
+			serverDone := make(chan error, 1)
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					serverDone <- err
+					return
+				}
+				defer conn.Close()
+				var req ctl.Request
+				if err := ctl.ReadMessage(conn, &req); err != nil {
+					serverDone <- err
+					return
+				}
+				serverDone <- ctl.WriteMessage(conn, &ctl.Response{Type: ctl.TypeExportDone})
+			}()
+
+			args := []string{"--path-id", pathID, "--run-root", runRoot, "--output", filepath.Join(t.TempDir(), "out")}
+			if test.sandboxID != "" {
+				args = append(args, "--sandbox-id", test.sandboxID)
+			}
+			if code := exportCmd(args); code != 0 {
+				t.Fatalf("exportCmd exit=%d", code)
+			}
+			if err := <-serverDone; err != nil {
+				t.Fatal(err)
 			}
 		})
 	}

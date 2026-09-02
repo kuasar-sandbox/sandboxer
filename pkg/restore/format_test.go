@@ -64,6 +64,23 @@ boot:
 	}
 }
 
+func TestRunRejectsUnsafePathIDBeforeOpeningSnapshot(t *testing.T) {
+	runtimeRoot := filepath.Join(t.TempDir(), "run")
+	_, err := Run(context.Background(), Options{
+		SnapshotPath: filepath.Join(t.TempDir(), "missing.snapshot"),
+		HostCfg:      &config.SandboxConfig{},
+		SandboxID:    "logical-sandbox",
+		PathID:       "../escape",
+		RuntimeRoot:  runtimeRoot,
+	})
+	if err == nil || !strings.Contains(err.Error(), "path id") {
+		t.Fatalf("restore error = %v, want PathID rejection", err)
+	}
+	if _, statErr := os.Stat(runtimeRoot); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe PathID created runtime state: %v", statErr)
+	}
+}
+
 func TestPreflightRestoreDiskGraphRejectsUnformattedActiveDiff(t *testing.T) {
 	dir := t.TempDir()
 	ext4 := make([]byte, 4096)

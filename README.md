@@ -28,6 +28,23 @@ node proxy 在完成远程 exec 鉴权后接入现有 exec/MUX 链路。资源�
 | `pkg/util` | 内联工具(`ParseSize` / `LocateBinary` 等,跨模块导出) |
 | `pkg/resource` | **导出面**:节点资源控制协议(`orchestrator` 的 node-ctl import) |
 
+## 本地目录身份
+
+`sandbox-ctl run` 将 `--run-root` / `--base-root` 视为调用级 **RunRoot** /
+**BaseRoot**。每个调用在两者下使用同一个 **PathID** leaf，形成实际
+**RunDir** / **BaseDir**：
+
+```text
+RunDir  = RunRoot/PathID
+BaseDir = BaseRoot/PathID
+```
+
+`--path-id` 省略时默认等于逻辑 **SandboxID**，因此既有调用的路径不变。
+显式 PathID 只允许一个安全路径分量；它只负责 host 目录和 `ctl.sock` 定位，
+不改变 SandboxID 在资源、日志、memfd、artifact 或 writable diff 文件名中的
+逻辑身份。`exec`、`snapshot` 和 live `export` 可只用 `--path-id` 定位运行中
+Sandbox；同时给出两者时 PathID 优先，ctl 协议不携带额外身份字段。
+
 ## 构建
 
 ```bash

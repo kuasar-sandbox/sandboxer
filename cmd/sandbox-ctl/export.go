@@ -26,6 +26,7 @@ import (
 func exportCmd(args []string) int {
 	fs := flag.NewFlagSet("export", flag.ContinueOnError)
 	sandboxID := fs.String("sandbox-id", "", "live sandbox id; optional output alias for offline export")
+	pathID := fs.String("path-id", "", "live run-root directory leaf (takes precedence over --sandbox-id)")
 	from := fs.String("from", "", "offline flattened EROFS reference")
 	configPath := fs.String("config", "", "offline sandbox.yaml path(s), ':'-separated (or SANDBOX_CONFIG)")
 	outDir := fs.String("output", "", "local output directory")
@@ -69,8 +70,8 @@ func exportCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "export: exactly one of --output or --upload is required")
 		return 2
 	}
-	if *from == "" && *sandboxID == "" {
-		fmt.Fprintln(os.Stderr, "export: live mode requires --sandbox-id")
+	if *from == "" && *sandboxID == "" && *pathID == "" {
+		fmt.Fprintln(os.Stderr, "export: live mode requires --sandbox-id or --path-id")
 		return 2
 	}
 	if *sandboxID != "" {
@@ -79,8 +80,18 @@ func exportCmd(args []string) int {
 			return 2
 		}
 	}
+	if *pathID != "" {
+		if err := validatePathIDArg(*pathID); err != nil {
+			fmt.Fprintf(os.Stderr, "export: --path-id: %v\n", err)
+			return 2
+		}
+	}
 	if *from != "" && *resume {
 		fmt.Fprintln(os.Stderr, "export: offline --from does not accept --resume")
+		return 2
+	}
+	if *from != "" && *pathID != "" {
+		fmt.Fprintln(os.Stderr, "export: offline --from does not accept --path-id")
 		return 2
 	}
 	if *from == "" && *configPath != "" {
@@ -113,7 +124,12 @@ func exportCmd(args []string) int {
 		}
 		return offlineExport(*from, *configPath, *sandboxID, *outDir, *upload, *mode, *manifestPath, refLocations, *timeoutS)
 	}
-	return liveExport(*sandboxID, *outDir, *upload, *mode, modeSet, *resume, *runRoot, *timeoutS)
+	targetPathID, err := resolveTargetPathID(*sandboxID, *pathID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "export: target path: %v\n", err)
+		return 2
+	}
+	return liveExport(targetPathID, *outDir, *upload, *mode, modeSet, *resume, *runRoot, *timeoutS)
 }
 
 func prepareArtifactOutputDir(path string) (string, error) {
@@ -141,14 +157,14 @@ func prepareArtifactOutputDir(path string) (string, error) {
 	return abs, nil
 }
 
-func liveExport(sandboxID, outDir string, upload bool, mode string, modeSet, resume bool, runRoot string, timeoutS int) int {
+func liveExport(pathID, outDir string, upload bool, mode string, modeSet, resume bool, runRoot string, timeoutS int) int {
 	if runRoot == "" {
 		runRoot = os.Getenv("SANDBOX_RUN_ROOT")
 	}
 	if runRoot == "" {
 		runRoot = "/run/sandbox"
 	}
-	ctlSock := filepath.Join(runRoot, sandboxID, "ctl.sock")
+	ctlSock := filepath.Join(runRoot, pathID, "ctl.sock")
 	conn, err := net.DialTimeout("unix", ctlSock, 5*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: dial %s: %v\n", ctlSock, err)

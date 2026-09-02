@@ -14,14 +14,13 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strings"
 	"syscall"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 )
 
 func init() {
@@ -74,11 +73,18 @@ func main() {
 }
 
 func validateSandboxIDArg(sandboxID string) error {
-	if sandboxID == "" || sandboxID == "." || sandboxID == ".." ||
-		filepath.Base(sandboxID) != sandboxID || strings.ContainsAny(sandboxID, `/\`) {
-		return errors.New("sandbox id must be one non-empty path component")
+	if err := sandbox.ValidatePathID(sandboxID); err != nil {
+		return fmt.Errorf("sandbox id must be one non-empty path component")
 	}
 	return nil
+}
+
+func validatePathIDArg(pathID string) error {
+	return sandbox.ValidatePathID(pathID)
+}
+
+func resolveTargetPathID(sandboxID, pathID string) (string, error) {
+	return sandbox.ResolvePathID(sandboxID, pathID)
 }
 
 func commandContext() (context.Context, context.CancelFunc) {
@@ -90,7 +96,7 @@ func printUsage(w *os.File) {
 
 Usage:
   sandbox-ctl run       [--config host.yaml[:instance.yaml]] [--manifest-config <path>]
-                        [--sandbox-id <sid>] [--ch-binary <path>]
+                        [--sandbox-id <sid>] [--path-id <leaf>] [--ch-binary <path>]
                         [--run-root <dir>] [--base-root <dir>]
                         [--from <sandbox-ref> | --restore <snapshot-ref>]
                         [--ref-location name=file:///absolute/path ...]
@@ -99,7 +105,8 @@ Usage:
                         [--tty] [--console off|default|file=PATH]
                         [--ping-fatal-threshold N] [--stats-interval <dur>]
                         [--ready-fd N]
-  sandbox-ctl export    --sandbox-id <sid> (--output <out_dir> | --upload)
+  sandbox-ctl export    [--sandbox-id <sid>] [--path-id <leaf>]
+                        (--output <out_dir> | --upload)
                         [--mode local|bundle] [--resume]
                         [--run-root <dir>] [--timeout <sec>]
   sandbox-ctl export    --from <flattened-erofs-ref> --config sandbox.yaml
@@ -107,11 +114,12 @@ Usage:
                         [--mode local|bundle] [--manifest-config <path>]
                         [--ref-location name=file:///absolute/path ...]
                         [--timeout <sec>]
-  sandbox-ctl snapshot  --sandbox-id <sid> (--output <out_dir> | --upload)
+  sandbox-ctl snapshot  [--sandbox-id <sid>] [--path-id <leaf>]
+                        (--output <out_dir> | --upload)
                         [--mode local|bundle] [--resume]
                         [--drop-caches] [--merge-ref=true|false]
                         [--run-root <dir>] [--timeout <sec>]
-  sandbox-ctl exec      [--sandbox-id <sid>] [--run-root <dir>]
+  sandbox-ctl exec      [--sandbox-id <sid>] [--path-id <leaf>] [--run-root <dir>]
                         [--proxy <http[s]://host[:port]>] [--proxy-header 'Name: value' ...]
                         [--cwd <dir>]
                         [--env KEY=VAL ...]
@@ -143,7 +151,9 @@ path after applying allowed host/instance overrides. --restore opens a memory
 Snapshot S, follows its sandbox_ref to E, and restores VMM/memory execution
 state; --from and --restore are mutually exclusive. --ready-fd writes the one-shot startup wire
 "control_ready\nready\n" to an inherited fd and closes that fd after
-ready; run itself continues to own the VM and remains blocked.
+ready; run itself continues to own the VM and remains blocked. SandboxID is the
+logical identity. PathID is the run-root/base-root directory leaf and defaults
+to SandboxID; it must be one safe path component.
 
 export creates a runnable Sandbox E. Live export freezes the guest and all
 block backends but does not call Cloud Hypervisor's snapshot API or read RAM.
@@ -165,7 +175,9 @@ the user app (it does not replace it). The command + args follow '--'.
 Stdio works exactly like run (--tty / --stdin / --stdout / --stderr
 and their -from/-to variants). exec exits with the guest command's
 exit code. Rejected while a snapshot is quiescing the sandbox. Without
---proxy it dials the local sandbox ctl.sock and requires --sandbox-id.
+--proxy it dials the local sandbox ctl.sock and requires --sandbox-id or
+--path-id. When both are present, --path-id selects the socket; the ctl request
+does not carry either identity.
 With --proxy it sends HTTP CONNECT directly to that endpoint and adds
 each repeatable --proxy-header without interpreting route/auth values.
 

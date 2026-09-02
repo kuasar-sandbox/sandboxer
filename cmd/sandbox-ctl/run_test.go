@@ -50,6 +50,15 @@ func TestRunCmdRejectsUnsafeSandboxID(t *testing.T) {
 	}
 }
 
+func TestRunCmdRejectsUnsafePathID(t *testing.T) {
+	rc, stderr := captureStderr(t, func() int {
+		return runCmd([]string{"--sandbox-id", "logical", "--path-id", "../escape", "--config", "missing.yaml"})
+	})
+	if rc != 2 || !strings.Contains(stderr, "--path-id") || !strings.Contains(stderr, "one non-empty path component") {
+		t.Fatalf("runCmd rc=%d stderr=%q", rc, stderr)
+	}
+}
+
 func TestRunCmdRejectsPositionalArguments(t *testing.T) {
 	rc, stderr := captureStderr(t, func() int {
 		return runCmd([]string{"--config", "missing.yaml", "extra"})
@@ -64,7 +73,7 @@ func callRunRestoreForValidation(t *testing.T, cfg *config.SandboxConfig, manife
 	return captureStderr(t, func() int {
 		return runRestore(
 			context.Background(), cfg, config.FieldPresence{}, manifestCfg, "manifest://deadbeef",
-			"test-sandbox", "/nonexistent/cloud-hypervisor",
+			"test-sandbox", "", "/nonexistent/cloud-hypervisor",
 			runRoot, filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil,
 			nil, nil, nil, false, nil,
 		)
@@ -120,7 +129,7 @@ func TestRunRestoreChecksDigestOnUnlocatedFileRef(t *testing.T) {
 	rc, stderr := captureStderr(t, func() int {
 		return runRestore(
 			context.Background(), &config.SandboxConfig{}, config.FieldPresence{}, nil, ref,
-			"test-sandbox", "/nonexistent/cloud-hypervisor", runRoot,
+			"test-sandbox", "", "/nonexistent/cloud-hypervisor", runRoot,
 			filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil,
 			nil, nil, nil, false, nil,
 		)

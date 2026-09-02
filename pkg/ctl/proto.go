@@ -1,5 +1,5 @@
 // Package ctl is the host-local control protocol spoken on
-// <run-dir>/<sid>/ctl.sock between the short-lived sandbox-ctl
+// <run-root>/<path-id>/ctl.sock between the short-lived sandbox-ctl
 // subcommands (snapshot / exec) and the long-running sandbox-ctl run
 // process that owns the VMM.
 //

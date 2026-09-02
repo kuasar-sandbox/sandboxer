@@ -46,6 +46,7 @@ func runCmd(args []string) int {
 	configPath := fs.String("config", "", "sandbox.yaml path(s), ':'-separated, merged front-to-back (or SANDBOX_CONFIG env)")
 	manifestPath := fs.String("manifest-config", "", "path to storage config YAML (overrides MANIFEST_CONFIG env; required for manifest:// or crypto.local=auto|required)")
 	sandboxID := fs.String("sandbox-id", "", "sandbox id (overrides sandbox.yaml)")
+	pathID := fs.String("path-id", "", "run-root/base-root directory leaf (default: sandbox-id)")
 	chBinary := fs.String("ch-binary", "", "path to cloud-hypervisor binary (default: SANDBOX_CH_PATH env, exe-dir, or PATH)")
 	runRoot := fs.String("run-root", "", "tmpfs run root: sockets + snap staging (overrides SANDBOX_RUN_ROOT env; default /run/sandbox)")
 	baseRoot := fs.String("base-root", "", "on-disk base root: overlay diff (overrides SANDBOX_BASE_ROOT env; default /var/lib/sandbox)")
@@ -108,6 +109,12 @@ func runCmd(args []string) int {
 	if *sandboxID != "" {
 		if err := validateSandboxIDArg(*sandboxID); err != nil {
 			fmt.Fprintf(os.Stderr, "sandbox-ctl run: --sandbox-id: %v\n", err)
+			return 2
+		}
+	}
+	if *pathID != "" {
+		if err := validatePathIDArg(*pathID); err != nil {
+			fmt.Fprintf(os.Stderr, "sandbox-ctl run: --path-id: %v\n", err)
 			return 2
 		}
 	}
@@ -304,7 +311,7 @@ func runCmd(args []string) int {
 	// Restore mode dispatch.
 	if restoreR != "" {
 		return runRestore(ctx, cfg, presence, manifestCfg, restoreR,
-			*sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
+			*sandboxID, *pathID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
 			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness)
 	}
 
@@ -350,6 +357,7 @@ func runCmd(args []string) int {
 		LocalRequired:      localRequired,
 		RefLocations:       refLocations,
 		SandboxID:          *sandboxID,
+		PathID:             *pathID,
 		CHBinary:           chBin,
 		RuntimeRoot:        rd,
 		BaseRoot:           br,
@@ -369,7 +377,7 @@ func runCmd(args []string) int {
 
 // runRestore parses the snapshot reference and dispatches to restore.Run.
 func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.FieldPresence, manifestCfg *config.ManifestConfig,
-	ref string, sandboxID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
+	ref string, sandboxID, pathID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
 	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
 	notifyReadiness sandbox.ReadinessNotify,
@@ -428,6 +436,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 		LocalRequired:       localRequired,
 		RefLocations:        refLocations,
 		SandboxID:           sandboxID,
+		PathID:              pathID,
 		CHBinary:            chBin,
 		RuntimeRoot:         runDir,
 		BaseRoot:            baseRoot,
