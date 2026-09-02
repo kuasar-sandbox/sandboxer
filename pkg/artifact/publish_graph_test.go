@@ -3,7 +3,6 @@ package artifact
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -319,10 +318,7 @@ func TestPublisherPreservesRootImageConfig(t *testing.T) {
 	sink := snapshot.NewFileSink(dir, "fixture", nil, false, nil)
 
 	rootImagePath := filepath.Join(dir, "root.erofs")
-	payload := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
-	payload[1024+12] = 12
-	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	payload := publishEROFSFixture()
 	if err := os.WriteFile(rootImagePath, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +330,7 @@ func TestPublisherPreservesRootImageConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rootImageRef, _, err := sink.AbsorbOverlaySource(ctx, publishSource(t, flattened))
+	rootImageRef, _, err := sink.AbsorbImageSource(ctx, publishSource(t, flattened))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +362,7 @@ func TestPublisherPreservesRootImageConfig(t *testing.T) {
 	if _, err := publisher.Publish(ctx, sandboxPath); err != nil {
 		t.Fatal(err)
 	}
-	if len(target.calls) != 2 || target.calls[0].role != RoleOverlay {
+	if len(target.calls) != 2 || target.calls[0].role != RoleImage {
 		t.Fatalf("publish calls = %+v", target.calls)
 	}
 	got, err := image.ReadConfig(bytes.NewReader(target.calls[0].body), int64(len(target.calls[0].body)))
@@ -388,10 +384,7 @@ func TestPublisherPreservesSandboxRootImageConfig(t *testing.T) {
 	defer storage.Close()
 	sink := snapshot.NewFileSink(dir, "fixture", nil, false, nil)
 
-	payload := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
-	payload[1024+12] = 12
-	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	payload := publishEROFSFixture()
 	want := &image.RuntimeConfig{Env: []string{"BUILT=yes"}, WorkingDir: "/home/user"}
 	imageConfig, err := want.MarshalDeterministic()
 	if err != nil {
@@ -439,7 +432,7 @@ func TestPublisherPreservesSandboxRootImageConfig(t *testing.T) {
 	if _, err := publisher.Publish(ctx, sandboxPath); err != nil {
 		t.Fatal(err)
 	}
-	if len(target.calls) != 2 || target.calls[0].role != RoleOverlay {
+	if len(target.calls) != 2 || target.calls[0].role != RoleImage {
 		t.Fatalf("publish calls = %+v", target.calls)
 	}
 	got, err := image.ReadConfig(bytes.NewReader(target.calls[0].body), int64(len(target.calls[0].body)))

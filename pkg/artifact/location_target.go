@@ -186,6 +186,8 @@ func (*locationPublishTarget) Close() error { return nil }
 
 func locationPayloadName(role LogicalRole) (string, error) {
 	switch role {
+	case RoleImage:
+		return "image", nil
 	case RoleOverlay:
 		return "overlay", nil
 	case RoleSandbox:

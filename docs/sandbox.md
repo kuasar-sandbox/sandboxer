@@ -12,8 +12,8 @@
 
 | Role | Suffix | Logical content | Purpose |
 |---|---|---|---|
-| Container image | image-specific | `EROFS + ZIP(config.json)` | 只读容器 rootfs 与 OCI image defaults |
-| Disk layer | `.overlay` | sparse block payload | root/data disk 的不可变 block layer |
+| Container image | `.image` when materialized | `EROFS + ZIP(config.json)` | 只读容器 rootfs 与 OCI image defaults |
+| Disk overlay | `.overlay` | sparse block payload | 保存root/data disk可写层 |
 | Sandbox E | `.sandbox` | root payload + strict ZIP | 可重复冷启动的完整 portable workload |
 | Snapshot S | `.snapshot` | memory payload + strict ZIP | 恢复已运行进程和 VMM/guest memory state |
 
@@ -39,7 +39,7 @@ memory snapshot      ──> E + S, S is operation root
 
 ### 1.2 逻辑角色与物理 carrier
 
-逻辑内容与物理 carrier 正交. 同一个 `.overlay`、`.sandbox` 或 `.snapshot` logical source 可以由以下 carrier 承载:
+逻辑内容与物理 carrier 正交. 同一个 `.image`、`.overlay`、`.sandbox` 或 `.snapshot` logical source 可以由以下 carrier 承载:
 
 | Carrier | Reference | Notes |
 |---|---|---|
@@ -47,7 +47,7 @@ memory snapshot      ──> E + S, S is operation root
 | Manifest | `manifest://<key>` | chunk/Manifest encryption 和 verification 由 manifest config 控制 |
 | Manifest Bundle | `file://<bundle>@manifest:<key>` | 一个 ZIP64 Bundle 可承载 root 及完整依赖 Manifest graph |
 
-Local 模式的内容寻址文件名为 `<digest>.<role>`. `<sid>.sandbox` 和 `<sid>.snapshot` 是成功 commit 后更新的语义 symlink. Bundle 模式下语义 symlink 指向承载 root Manifest 的 `<key>.bundle`. Alias 的 SID 必须是单一安全 path component;commit 使用临时 symlink + atomic rename + directory fsync,并拒绝覆盖已有 regular file 或 directory. 这些是节点本地 output 语义;named ref-location 使用 §11.2 的独立 shared-location commit protocol,不创建 alias.
+Local 模式物化的内容寻址文件名为 `<digest>.<role>`,其中immutable root carrier使用`.image`,`.overlay`只表示单独物化的可写disk layer. 当前root writable top已经是Sandbox E的payload,不会再复制为`.overlay`. Provisioned container image输入仍可使用`.erofs`等显式basename. `<sid>.sandbox` 和 `<sid>.snapshot` 是成功 commit 后更新的语义 symlink. Bundle 模式下语义 symlink 指向承载 root Manifest 的 `<key>.bundle`. Alias 的 SID 必须是单一安全 path component;commit 使用临时 symlink + atomic rename + directory fsync,并拒绝覆盖已有 regular file 或 directory. 这些是节点本地 output 语义;named ref-location 使用 §11.2 的独立 shared-location commit protocol,不创建 alias.
 
 Block backend、restore 和 publisher 先打开 carrier,再按逻辑角色解析内容. 外层 ZIP magic 只说明 carrier 是 Bundle,不说明 logical role.
 
@@ -364,6 +364,7 @@ Local immutable ref 必须是 basename + identity,例如:
 ```text
 file://vmlinux@digest:<digest>
 file://sandbox-runtime.bundle@digest:<digest>
+file://<digest>.image@digest:<digest>
 file://<digest>.overlay@hmac:<digest>
 file://<digest>.overlay@digest:<digest>
 ```
@@ -915,6 +916,15 @@ Memory provenance: MemorySourceBinding   -> S/from_refs
 
 二者不共享schema. Re-snapshot可以独立merge disk layer或memory layer,不能借由一个旧`SnapshotConfig`同时修改两张graph.
 
+Snapshot/export的dependency planning只物化没有portable provenance的节点本地依赖. 远端
+`manifest://`保持原ref;已经located的file ref保持原ref;若logical Manifest来自located
+Bundle,则改写为该Bundle的canonical located `@manifest` selector. 因此Manifest-backed
+immutable root image不会在每次保存或发布快照时再生成一份`.overlay`,located parent chain
+也不会被复制到新的publication directory. 未located的本地tarstream或Bundle依赖仍在
+freeze前完整校验并物化,避免产生依赖调用节点私有路径的portable root. 其中immutable
+root carrier物化为`.image`;只有需要作为独立dependency保存的root/data writable layer物化为
+`.overlay`. 当前root writable top由Sandbox E payload承载,不生成第二份`.overlay`.
+
 ### 11.2 Local tarstream 与 crypto
 
 Local immutable artifact支持 `crypto.local=off|auto|required`:
@@ -931,7 +941,7 @@ Existing-file reuse必须重新验证role、logical size、content identity和�
 
 #### Named ref-location
 
-`publish/upload-snapshot --to-ref-location`不复用`FileSink`或`BundleSink`. Tarstream carrier在自身marker中保存payload boundary和payload commitment;完整读取会用payload bytes复验该声明. 打开carrier后可直接提供identity. E/S只替换dense metadata tail时,carrier用旧payload commitment和新tail以O(tail)工作量推导新identity,不读取GiB级payload,也没有首次`io.Discard`编码. Location target取得carrier给出的scheme/digest后,以`O_CREATE|O_EXCL`直接创建`<digest>.overlay|sandbox|snapshot`;canonical encoding是shared target中的唯一完整write. Plaintext输出使用`@digest`,codec-backed输出使用`@hmac`. Target directory中没有完整temp/staging副本,也不创建`<sid>.sandbox`、`<sid>.snapshot`或任何其他semantic alias.
+`publish/upload-snapshot --to-ref-location`不复用`FileSink`或`BundleSink`. Tarstream carrier在自身marker中保存payload boundary和payload commitment;完整读取会用payload bytes复验该声明. 打开carrier后可直接提供identity. E/S只替换dense metadata tail时,carrier用旧payload commitment和新tail以O(tail)工作量推导新identity,不读取GiB级payload,也没有首次`io.Discard`编码. Location target取得carrier给出的scheme/digest后,以`O_CREATE|O_EXCL`直接创建`<digest>.image|overlay|sandbox|snapshot`;canonical encoding是shared target中的唯一完整write. `.image`承载immutable root image,`.overlay`只承载独立的writable disk dependency;Sandbox E payload不会重复发布为`.overlay`. Plaintext输出使用`@digest`,codec-backed输出使用`@hmac`. Target directory中没有完整temp/staging副本,也不创建`<sid>.sandbox`、`<sid>.snapshot`或任何其他semantic alias.
 
 Fresh final固定`0644`. `tarstream.WriteTo`在唯一一次写入过程中检查source read和destination write,并重新产生与carrier预先提供值一致的scheme/digest;随后执行file `Sync`,在owned write fd仍打开时以`lstat` + `SameFile`确认canonical path仍指向本次`O_EXCL`创建的inode,再执行`Close`. Publisher随后以`O_RDONLY|O_NOFOLLOW`重新打开并完整验证regular file、role/payload name、logical size、canonical tarstream、marker、codec、crypto policy、digest scheme/digest和完整sequential stream,最后同步parent directory. Existing final走同一完整验证,并在同一read-only fd上`Sync`;验证成功后直接复用,inode和bytes不改变.
 
@@ -951,16 +961,17 @@ Local tarstream graph按照bottom-up顺序ingest:
 data/lower -> E -> S
 ```
 
-已经portable的Manifest或located dependency保持原ref,不会先materialize再重写. Bundle root走exact-upload快路径:强制验证选择的Manifest closure、recorded admission和physical objects,原样上传Chunk/Manifest,root Manifest最后提交;root key和`snapshot.cfg`不变. Customer key、chunk/Manifest crypto、content verification和store generation admission沿用manifest config. E是export root,S是snapshot root.
+已经portable的Manifest或located dependency保持原ref,不会先materialize再重写. Bundle root走exact-upload快路径:强制验证选择的Manifest closure、recorded admission和physical objects,原样上传Chunk/Manifest,root Manifest最后提交;root key和`snapshot.cfg`不变. 因此Bundle内已有的located selector仍要求consumer配置对应ref-location,不会被暗中改写成Manifest ref. Customer key、chunk/Manifest crypto、content verification和store generation admission沿用manifest config. E是export root,S是snapshot root.
 
 ### 11.4 Manifest Bundle
 
 Bundle在pause前完成:
 
 - write admission;
-- external ordered refs plan;
+- portable dependency retention和located Bundle selector rewrite;
+- unlocated local dependency materialization plan;
 - current operation依赖集合;
-- parent Bundle精确Manifest copy或remote fallback;
+- unlocated parent Bundle精确Manifest copy或remote fallback;located parent保留canonical selector;
 - local tarstream dependency ingest;
 - all ref replacements.
 
@@ -976,7 +987,7 @@ parse E -> enumerate E explicit disk refs bottom-up
         -> rebuild E -> publish E last
 ```
 
-`self` 永不重写. 父 `.sandbox` 作为disk ref时发布为`.overlay` payload,不递归父config graph.
+`self` 永不重写. 父 `.sandbox` 作为writable disk layer时发布为`.overlay` payload;作为two-disk root image carrier时提取EROFS payload与image config并发布为`.image`. 两种情况都不递归父config graph.
 
 Local tarstream Publish S:
 

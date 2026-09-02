@@ -7,15 +7,17 @@
 #   2. Cold-start sandbox running a python TICK counter that also writes a
 #      fresh 4 KiB block per tick to /ticks.dat (blk1 overlay) and reads back
 #      block 0 → "TICK <i> DISK blk0=<marker>"
-#   3. Wait for TICK 10 (with blk0=cold marker) in stdout, snapshot --upload
-#   5. run --restore manifest://<hex>; verify TICK > snapshot tick (vCPU
-#      resumed) AND blk0 still reads the cold marker (disk fall-through)
-#   7. Snapshot the restored sandbox again → snap#2 (from_refs=[snap#1]),
+#   3. Wait for TICK 10 (with blk0=cold marker) in stdout, snapshot --upload.
+#   4. run --restore manifest://<hex>; verify TICK > snapshot tick (vCPU
+#      resumed) AND blk0 still reads the cold marker (disk fall-through).
+#   5. Snapshot the manifest-backed sandbox locally and publish it to a named
+#      location; verify portable dependencies do not create a redundant overlay.
+#   6. Snapshot the restored sandbox again → snap#2 (from_refs=[snap#1]),
 #      restore it: the incremental 2-layer chain (mem + disk overlay)
-#   8. Snapshot THAT chained-restored sandbox → snap#3 (3-layer chain),
+#   7. Snapshot THAT chained-restored sandbox → snap#3 (3-layer chain),
 #      restore it: validates the recurring quiesce teardown + deep-chain
 #      mem/disk fall-through (asserts restore builds 3 memory layers)
-#   9. Print perf metrics: dedup ratio, lazy-load ratio, restore wallclock
+#   8. Print perf metrics: dedup ratio, lazy-load ratio, restore wallclock
 
 set -euo pipefail
 
@@ -320,6 +322,51 @@ fi
 RESTORE_MS=$(( (T_FIRST_TICK_NS - T_RES_BEG) / 1000000 ))
 assert_cgroup_init "$SID2" "restore #1"
 echo "==> restore + TICK $WANT_TICK (disk blk0 OK) seen in ${RESTORE_MS} ms"
+
+# A snapshot taken from a manifest-backed restore must retain the remote root
+# image and parent layers as portable refs. It therefore emits only the new E/S
+# carriers locally, and publishing those carriers into a named location must
+# not copy the immutable root image into a redundant .overlay file.
+echo
+echo "==> phase 2b: manifest-backed local/named snapshot keeps portable dependencies"
+PORTABLE_OUT="$WORK/portable-snapshot"
+PORTABLE_LOCATION="$WORK/portable-location"
+PORTABLE_LOCATION_NAME="manifest-parent-e2e"
+mkdir -p "$PORTABLE_OUT" "$PORTABLE_LOCATION"
+"$BIN/sandbox-ctl" snapshot \
+    --sandbox-id "$SID2" \
+    --output "$PORTABLE_OUT" \
+    --resume \
+    --run-root "$WORK/runtime" >"$WORK/portable-snapshot.log" 2>&1
+PORTABLE_SNAPSHOT="$PORTABLE_OUT/$SID2.snapshot"
+[ -e "$PORTABLE_SNAPSHOT" ] || {
+    echo "FAIL: manifest-backed local snapshot is missing"; ls -la "$PORTABLE_OUT"; exit 1;
+}
+if find "$PORTABLE_OUT" -maxdepth 1 -type f -name '*.overlay' -print -quit | grep -q .; then
+    echo "FAIL: manifest-backed local snapshot copied a portable dependency into .overlay"
+    find "$PORTABLE_OUT" -maxdepth 1 -type f -print
+    exit 1
+fi
+PORTABLE_LOCATED_REF=$("$BIN/sandbox-ctl" publish --quiet \
+    --manifest-config "$WORK/accelerator.yaml" \
+    --to-ref-location "$PORTABLE_LOCATION_NAME=file://$PORTABLE_LOCATION" \
+    "$PORTABLE_SNAPSHOT")
+case "$PORTABLE_LOCATED_REF" in
+    file://*.snapshot@digest:*@location:"$PORTABLE_LOCATION_NAME") ;;
+    *) echo "FAIL: non-canonical located snapshot ref: $PORTABLE_LOCATED_REF"; exit 1 ;;
+esac
+if find "$PORTABLE_LOCATION" -maxdepth 1 -type f -name '*.overlay' -print -quit | grep -q .; then
+    echo "FAIL: named publication copied a portable dependency into .overlay"
+    find "$PORTABLE_LOCATION" -maxdepth 1 -type f -print
+    exit 1
+fi
+[ "$(find "$PORTABLE_LOCATION" -maxdepth 1 -type f -name '*.sandbox' | wc -l)" -eq 1 ] || {
+    echo "FAIL: named publication did not contain exactly one new Sandbox E"; ls -la "$PORTABLE_LOCATION"; exit 1;
+}
+[ "$(find "$PORTABLE_LOCATION" -maxdepth 1 -type f -name '*.snapshot' | wc -l)" -eq 1 ] || {
+    echo "FAIL: named publication did not contain exactly one new Snapshot S"; ls -la "$PORTABLE_LOCATION"; exit 1;
+}
+echo "==> PASS: manifest/located dependencies remained refs; no redundant .overlay was created"
 
 # ---- second snapshot --upload (dedup pass) ------------------------------
 

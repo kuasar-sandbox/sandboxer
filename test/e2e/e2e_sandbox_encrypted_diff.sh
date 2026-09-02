@@ -222,17 +222,19 @@ wait "$PID1" 2>/dev/null || true
 SNAP="$OUT/$SID1.snapshot"
 [ -e "$SNAP" ] || { echo "FAIL: local snapshot missing"; cat "$WORK/snapshot-local.log"; exit 1; }
 mapfile -t OVERLAYS < <(find "$OUT" -maxdepth 1 -type f -name '*.overlay' -print | sort)
+mapfile -t IMAGES < <(find "$OUT" -maxdepth 1 -type f -name '*.image' -print | sort)
 "$BIN/sandbox-ctl" info --json --manifest-config "$REQUIRED_CONFIG" "$SNAP" > "$WORK/snapshot.json"
 E_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/snapshot.json")
 SANDBOX_E="$OUT/$E_BASENAME"
 [ -e "$SANDBOX_E" ] || { echo "FAIL: Snapshot S references missing local Sandbox E $E_BASENAME"; ls -la "$OUT"; exit 1; }
-[ "${#OVERLAYS[@]}" -ge 3 ] || { echo "FAIL: expected encrypted disk dependencies, got ${#OVERLAYS[@]}"; exit 1; }
-for artifact in "${OVERLAYS[@]}" "$(readlink -f "$SANDBOX_E")" "$(readlink -f "$SNAP")"; do
+[ "${#OVERLAYS[@]}" -eq 2 ] || { echo "FAIL: expected two encrypted data-disk writable overlays, got ${#OVERLAYS[@]}"; exit 1; }
+[ "${#IMAGES[@]}" -eq 2 ] || { echo "FAIL: expected two encrypted immutable images, got ${#IMAGES[@]}"; exit 1; }
+for artifact in "${IMAGES[@]}" "${OVERLAYS[@]}" "$(readlink -f "$SANDBOX_E")" "$(readlink -f "$SNAP")"; do
     magic=$(od -An -tx1 -N8 "$artifact" | tr -d ' \n')
     [ "$magic" = 894b5453454e430a ] || { echo "FAIL: local artifact is not encrypted v1: $artifact"; exit 1; }
 done
 for marker in ROOT-ACTIVE-OK SCRATCH-ACTIVE-OK DATA-ACTIVE-OK; do
-    if grep -aFq "$marker" "${OVERLAYS[@]}" "$(readlink -f "$SANDBOX_E")" "$(readlink -f "$SNAP")"; then
+    if grep -aFq "$marker" "${IMAGES[@]}" "${OVERLAYS[@]}" "$(readlink -f "$SANDBOX_E")" "$(readlink -f "$SNAP")"; then
         echo "FAIL: guest plaintext marker appears in an encrypted snapshot artifact"
         exit 1
     fi
@@ -258,7 +260,7 @@ refs = [ref for ref in refs if ref and ref != "self"]
 if not refs or any("@hmac:" not in ref for ref in refs):
     raise SystemExit("disk artifact refs are not uniformly @hmac: %r" % refs)
 PY
-echo "==> PASS: local snapshot contains encrypted @hmac disk artifacts"
+echo "==> PASS: local snapshot contains distinct encrypted @hmac image and writable-overlay artifacts"
 
 write_restore_config() { # $1=path $2=root diff $3=scratch diff $4=dataset diff $5=hostname
     cat > "$1" <<EOF

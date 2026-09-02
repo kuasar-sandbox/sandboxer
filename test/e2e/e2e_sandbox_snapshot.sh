@@ -250,7 +250,9 @@ SANDBOX_BASENAME=$(python3 -c 'import os,sys; print(os.path.basename(sys.argv[1]
 SANDBOX_FILE="$OUT/$SANDBOX_BASENAME"
 [ -f "$SANDBOX_FILE" ] || { echo "FAIL: Snapshot S references missing Sandbox E $SANDBOX_BASENAME"; ls -la "$OUT"; exit 1; }
 mapfile -t OVERLAY_FILES < <(find "$OUT" -maxdepth 1 -type f -name '*.overlay' -print | sort)
-[ "${#OVERLAY_FILES[@]}" -gt 0 ] || { echo "FAIL: no immutable disk dependency"; ls -la "$OUT"; exit 1; }
+mapfile -t IMAGE_FILES < <(find "$OUT" -maxdepth 1 -type f -name '*.image' -print | sort)
+[ "${#OVERLAY_FILES[@]}" -eq 0 ] || { echo "FAIL: root image or Sandbox E payload was duplicated as .overlay"; ls -la "$OUT"; exit 1; }
+[ "${#IMAGE_FILES[@]}" -eq 1 ] || { echo "FAIL: expected one immutable root image, got ${#IMAGE_FILES[@]}"; ls -la "$OUT"; exit 1; }
 
 # Sizes. Artifacts are tarstream envelopes: the FILE is dense (size ≈
 # resident data + envelope), holes ride the envelope map. Sparseness
@@ -273,14 +275,14 @@ echo "==> PASS: snapshot artifact carries only resident data ($(numfmt --to=iec 
 # The artifact is a tar envelope; info reads snapshot.cfg through it
 # (the same path restore uses).
 E_INFO_JSON=$("$BIN/sandbox-ctl" info --json "$SANDBOX_FILE")
-python3 -c 'import json,sys; c=json.load(sys.stdin); assert c["Version"] == 1 and c["Boot"]["Root"]' <<<"$E_INFO_JSON" \
+python3 -c 'import json,sys; c=json.load(sys.stdin); root=c["Boot"]["Root"]; assert c["Version"] == 1 and root["Base"].split("@",1)[0].endswith(".image") and root["Overlay"]["Base"] == "self"' <<<"$E_INFO_JSON" \
     || { echo "==> FAIL: Sandbox E info is incomplete"; echo "$E_INFO_JSON"; exit 1; }
-echo "==> PASS: Snapshot S references Sandbox E; both strict configs are readable"
+echo "==> PASS: Snapshot S references Sandbox E; root image is .image and the current writable root is the E payload"
 
 # Content addressing: the basename matches the digest declared by the
 # artifact's final marker. The marker records the carrier identity and payload
 # commitment metadata; it is not part of the logical payload.
-ARTIFACT_FILES=("$(readlink -f "$SANDBOX_FILE")" "$(readlink -f "$SNAP_FILE")" "${OVERLAY_FILES[@]}")
+ARTIFACT_FILES=("$(readlink -f "$SANDBOX_FILE")" "$(readlink -f "$SNAP_FILE")" "${IMAGE_FILES[@]}" "${OVERLAY_FILES[@]}")
 for f in "${ARTIFACT_FILES[@]}"; do
     base=$(basename "$f"); base=${base%.*}
     markers=$(tar -tf "$f" | grep -E '^\.kuasar\.digest\.[0-9a-f]{64}$' || true)
@@ -330,11 +332,21 @@ fi
     echo "==> FAIL: named location contains a semantic alias" >&2
     exit 1
 }
+[ "$(find "$LOCATION_DIR" -maxdepth 1 -type f -name '*.image' | wc -l)" -eq 1 ] || {
+    echo "==> FAIL: named location did not contain exactly one root .image" >&2
+    find "$LOCATION_DIR" -maxdepth 1 -type f -print >&2
+    exit 1
+}
+[ "$(find "$LOCATION_DIR" -maxdepth 1 -type f -name '*.overlay' | wc -l)" -eq 0 ] || {
+    echo "==> FAIL: named location duplicated the root image or Sandbox E payload as .overlay" >&2
+    find "$LOCATION_DIR" -maxdepth 1 -type f -print >&2
+    exit 1
+}
 LOCATED_INFO=$("$BIN/sandbox-ctl" info --json \
     --ref-location "$LOCATION_NAME=file://$LOCATION_DIR" "$LOCATED_REF")
 python3 -c 'import json,sys; snapshot=json.load(sys.stdin); assert snapshot["SandboxRef"].endswith("@location:" + sys.argv[1]), snapshot' \
     "$LOCATION_NAME" <<<"$LOCATED_INFO"
-echo "==> PASS: named location publication is canonical, reusable, alias-free, and readable"
+echo "==> PASS: named location publication is canonical, reusable, alias-free, role-correct, and readable"
 
 # Both operation roots are valid tarstream carriers. Their logical payload
 # boundaries and sparse semantics are covered by sandboxfile/snapshotfile tests;

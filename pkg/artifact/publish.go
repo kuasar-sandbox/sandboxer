@@ -27,6 +27,7 @@ import (
 type LogicalRole string
 
 const (
+	RoleImage    LogicalRole = "image"
 	RoleOverlay  LogicalRole = "overlay"
 	RoleSandbox  LogicalRole = "sandbox"
 	RoleSnapshot LogicalRole = "snapshot"
@@ -460,6 +461,7 @@ func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishSc
 	if err != nil {
 		return "", err
 	}
+	role := RoleOverlay
 	if rootImage {
 		image, imageErr := sandboxfile.OpenEROFSArtifact(ctx, payload)
 		if imageErr != nil {
@@ -468,9 +470,10 @@ func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishSc
 		// Root images remain flattened EROFS artifacts. Block consumers narrow
 		// them to Payload; publication retains config.json for image defaults.
 		payload = image.FullStream
+		role = RoleImage
 	}
 	defer payload.Close()
-	ref, err := p.target.Put(ctx, RoleOverlay, payload)
+	ref, err := p.target.Put(ctx, role, payload)
 	if err == nil {
 		p.diskMemo[key] = ref
 	}

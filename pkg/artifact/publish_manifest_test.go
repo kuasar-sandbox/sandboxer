@@ -195,7 +195,18 @@ func TestManifestPublisherPublishesAndReopensSandboxAndSnapshot(t *testing.T) {
 	cfg, storage := manifestPublisherFixture(t)
 	inputDir := t.TempDir()
 	sink := snapshot.NewFileSink(inputDir, "manifest", nil, false, nil)
-	runtimeBytes, _ := publishPortable(t, "")
+	imageRef, _, err := sink.AbsorbImageSource(ctx, publishSource(t, publishEROFSFixture()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, portable := publishPortable(t, "")
+	portable.Boot.Root = config.PortableRootConfig{
+		Base: imageRef, Overlay: &config.PortableOverlayConfig{Base: "self"},
+	}
+	runtimeBytes, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
 	eLogical, err := sandboxfile.BuildSource(publishSource(t, bytes.Repeat([]byte{0x41}, 8192)), nil, runtimeBytes)
 	if err != nil {
 		t.Fatal(err)
@@ -216,8 +227,16 @@ func TestManifestPublisherPublishesAndReopensSandboxAndSnapshot(t *testing.T) {
 	if eResult.Role != RoleSandbox {
 		t.Fatalf("E role = %q", eResult.Role)
 	}
-	if info, err := storage.Inspect(ctx, eResult.Ref, nil); err != nil || info.Role != RoleSandbox {
+	info, err := storage.Inspect(ctx, eResult.Ref, nil)
+	if err != nil || info.Role != RoleSandbox {
 		t.Fatalf("inspect E = %+v err=%v", info, err)
+	}
+	rootImage, err := manifest.ParseRef(info.Sandbox.Boot.Root.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootImage.Scheme != manifest.RefSchemeManifest {
+		t.Fatalf("Manifest publisher root image ref = %s", rootImage.String())
 	}
 
 	sCfg, err := snapshot.MarshalConfig(&snapshot.Config{
@@ -246,7 +265,7 @@ func TestManifestPublisherPublishesAndReopensSandboxAndSnapshot(t *testing.T) {
 	if sResult.Role != RoleSnapshot {
 		t.Fatalf("S role = %q", sResult.Role)
 	}
-	info, err := storage.Inspect(ctx, sResult.Ref, nil)
+	info, err = storage.Inspect(ctx, sResult.Ref, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

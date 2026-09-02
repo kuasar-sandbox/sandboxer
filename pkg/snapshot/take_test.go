@@ -415,6 +415,10 @@ func (s *takeCaptureSink) AbsorbOverlaySource(context.Context, sparse.Source) (s
 	return "", "", errors.New("unexpected overlay source")
 }
 
+func (s *takeCaptureSink) AbsorbImageSource(context.Context, sparse.Source) (string, string, error) {
+	return "", "", errors.New("unexpected image source")
+}
+
 func (s *takeCaptureSink) AbsorbSandbox(ctx context.Context, source sparse.Source) (string, string, error) {
 	if !s.frozen.Load() {
 		return "", "", errors.New("Sandbox E written outside backend freeze")
