@@ -38,6 +38,9 @@ func (s *captureSink) AbsorbOverlay(_ context.Context, diff io.ReadSeeker, _ []s
 func (s *captureSink) AbsorbOverlaySource(context.Context, sparse.Source) (string, string, error) {
 	return "manifest://" + strings.Repeat("d", 64), "", nil
 }
+func (s *captureSink) AbsorbImageSource(context.Context, sparse.Source) (string, string, error) {
+	return "", "", errors.New("unexpected image source")
+}
 func (s *captureSink) AbsorbSandbox(ctx context.Context, source sparse.Source) (string, string, error) {
 	s.order = append(s.order, "sandbox")
 	s.sandboxBody = make([]byte, source.Size())

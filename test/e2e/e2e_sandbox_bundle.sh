@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# e2e_sandbox_bundle.sh — self-contained E/S Manifest Bundle lifecycle:
+# e2e_sandbox_bundle.sh — portable E/S Manifest Bundle lifecycle:
 #   A cold Bundle -> published location A -> B -> published location B -> C,
-#   exact Store upload, and remote restore. Each Bundle contains S, referenced
-#   E, and all explicit disk/memory dependencies under one admission.
+#   exact Store upload, and remote restore. A contains the cold graph; B and C
+#   retain canonical located Manifest selectors instead of copying ancestors.
 
 set -euo pipefail
 shopt -s nullglob
@@ -138,7 +138,7 @@ validate_bundle() {
     local root_bundle
     root_bundle="$(readlink -f "$directory/$sid.snapshot")"
     [ -f "$root_bundle" ] || { echo "FAIL: sid symlink does not select a Bundle"; exit 1; }
-    if find "$directory" -maxdepth 1 -type f \( -name '*.overlay' -o -name '*.snapshot' -o -name '*.partial' \) | grep -q .; then
+    if find "$directory" -maxdepth 1 -type f \( -name '*.image' -o -name '*.overlay' -o -name '*.snapshot' -o -name '*.partial' \) | grep -q .; then
         echo "FAIL: Bundle mode emitted a tarstream/partial sibling"
         find "$directory" -maxdepth 1 -printf '%f\n'
         exit 1
@@ -221,15 +221,16 @@ assert_located_bundle() {
 }
 
 assert_manifest_snapshot_refs() {
-    local bundle="$1" snapshot_json="$2" want_parents="$3"
+    local bundle="$1" snapshot_json="$2" want_parents="$3" want_locations="$4"
     local sandbox_ref sandbox_key sandbox_json
     sandbox_ref=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["SandboxRef"])' "$snapshot_json")
     sandbox_key=${sandbox_ref#manifest://}
     sandbox_json="$snapshot_json.sandbox"
     "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
         "file://$bundle@manifest:$sandbox_key" >"$sandbox_json"
-    python3 - "$snapshot_json" "$sandbox_json" "$want_parents" <<'PY'
+    python3 - "$snapshot_json" "$sandbox_json" "$want_parents" "$want_locations" <<'PY'
 import json
+import re
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
@@ -239,8 +240,24 @@ with open(sys.argv[2], encoding="utf-8") as source:
 parents = snapshot.get("FromRefs") or []
 if len(parents) != int(sys.argv[3]):
     raise SystemExit(f"from_refs={parents!r}, want {sys.argv[3]} entries")
-if any(not ref.startswith("manifest://") for ref in parents):
-    raise SystemExit(f"Snapshot S has non-Manifest memory refs: {parents!r}")
+
+allowed_locations = set(filter(None, sys.argv[4].split(",")))
+seen_locations = set()
+manifest_ref = re.compile(r"manifest://[0-9a-f]{64}$")
+located_ref = re.compile(
+    r"file://[0-9a-f]{64}\.bundle@manifest:[0-9a-f]{64}@location:([A-Za-z0-9][A-Za-z0-9._-]{0,127})$"
+)
+
+def validate(ref):
+    if manifest_ref.fullmatch(ref):
+        return
+    match = located_ref.fullmatch(ref)
+    if not match or match.group(1) not in allowed_locations:
+        raise SystemExit(f"non-canonical or unexpected portable ref: {ref!r}")
+    seen_locations.add(match.group(1))
+
+for ref in parents:
+    validate(ref)
 
 refs = []
 boot = sandbox["Boot"]
@@ -251,11 +268,11 @@ for node in [boot["Root"], *(boot.get("Disks") or [])]:
     if overlay:
         refs.append(overlay.get("Base", ""))
         refs.extend(overlay.get("BaseFromRefs") or [])
-bad = [ref for ref in refs if ref and ref != "self" and not ref.startswith("manifest://")]
-if bad:
-    raise SystemExit(f"Sandbox E retained non-Manifest disk refs: {bad!r}")
-if any(len(ref) != len("manifest://") + 64 for ref in refs if ref and ref != "self"):
-    raise SystemExit(f"invalid Manifest refs: {refs!r}")
+for ref in refs:
+    if ref and ref != "self":
+        validate(ref)
+if seen_locations != allowed_locations:
+    raise SystemExit(f"located dependency set={sorted(seen_locations)!r}, want {sorted(allowed_locations)!r}")
 PY
 }
 
@@ -275,7 +292,7 @@ start_ns="$(date +%s%N)"
 echo "    create_ms=$((($(date +%s%N)-start_ns)/1000000))"
 wait "$P1" 2>/dev/null || true
 validate_bundle "$OUT1" "$SID1" 3 0 1 "$WORK/info1.json"
-assert_manifest_snapshot_refs "$(readlink -f "$OUT1/$SID1.snapshot")" "$WORK/info1.json" 0
+assert_manifest_snapshot_refs "$(readlink -f "$OUT1/$SID1.snapshot")" "$WORK/info1.json" 0 ""
 
 ROOT1_PATH="$(readlink -f "$OUT1/$SID1.snapshot")"
 ROOT1="$(basename "$ROOT1_PATH" .bundle)"
@@ -302,7 +319,7 @@ boot:
 EOF
 }
 
-echo "==> phase 2: located A restore -> self-contained Bundle B"
+echo "==> phase 2: located A restore -> Bundle B retaining A selectors"
 write_restore_yaml "$WORK/restore2.yaml" bundle-child "$WORK/root-r2.ext4"
 SID2="bundle-2-$$"
 OUT2="$WORK/out2"
@@ -322,7 +339,7 @@ echo "    local_restore_ready_ms=$((($(date +%s%N)-start_ns)/1000000))"
     --drop-caches=false --run-root "$RR" >"$WORK/snapshot2.out" 2>"$WORK/snapshot2.log"
 wait "$P2" 2>/dev/null || true
 validate_bundle "$OUT2" "$SID2" 3 0 1 "$WORK/info2.json"
-assert_manifest_snapshot_refs "$(readlink -f "$OUT2/$SID2.snapshot")" "$WORK/info2.json" 1
+assert_manifest_snapshot_refs "$(readlink -f "$OUT2/$SID2.snapshot")" "$WORK/info2.json" 1 "A"
 
 ROOT2_PATH="$(readlink -f "$OUT2/$SID2.snapshot")"
 ROOT2="$(basename "$ROOT2_PATH" .bundle)"
@@ -332,14 +349,14 @@ LOCATED_B="$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/manifes
     --to-ref-location B=file://$LOCATION_B --quiet "$OUT2/$SID2.snapshot")"
 assert_located_bundle "$LOCATED_B" B "$LOCATION_B" "$ROOT2" "$ROOT2_PATH"
 
-rm -rf "$OUT1" "$OUT2" "$LOCATION_A"
-echo "==> phase 3: located B alone restores -> self-contained Bundle C"
+rm -rf "$OUT1" "$OUT2"
+echo "==> phase 3: located A+B restore -> Bundle C retaining both locations"
 write_restore_yaml "$WORK/restore3.yaml" bundle-grandchild "$WORK/root-r3.ext4"
 SID3="bundle-3-$$"
 OUT3="$WORK/out3"
 mkdir -p "$OUT3"
 timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "$LOCATED_B" \
-    --ref-location B=file://$LOCATION_B --config "$WORK/restore3.yaml" \
+    --ref-location A=file://$LOCATION_A --ref-location B=file://$LOCATION_B --config "$WORK/restore3.yaml" \
     --manifest-config "$WORK/manifest.yaml" --sandbox-id "$SID3" --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$RR" >"$WORK/run3.log" 2>&1 &
 P3=$!
@@ -351,12 +368,12 @@ ready "$SID3" "$P3" "$WORK/ready3" || { tail -80 "$WORK/run3.log"; exit 1; }
     --drop-caches=false --run-root "$RR" >"$WORK/snapshot3.out" 2>"$WORK/snapshot3.log"
 wait "$P3" 2>/dev/null || true
 validate_bundle "$OUT3" "$SID3" 3 0 1 "$WORK/info3.json"
-assert_manifest_snapshot_refs "$(readlink -f "$OUT3/$SID3.snapshot")" "$WORK/info3.json" 2
+assert_manifest_snapshot_refs "$(readlink -f "$OUT3/$SID3.snapshot")" "$WORK/info3.json" 2 "A,B"
 ROOT3_PATH="$(readlink -f "$OUT3/$SID3.snapshot")"
 ROOT3="$(basename "$ROOT3_PATH" .bundle)"
 assert_bundle_refs "$ROOT3_PATH"
 
-echo "==> phase 4: self-contained local C restore (20 samples)"
+echo "==> phase 4: local C plus located A+B restore (20 samples)"
 RESTORE_SAMPLES="$WORK/a-b-c-restore-ms"
 : >"$RESTORE_SAMPLES"
 for sample in $(seq 1 20); do
@@ -364,6 +381,7 @@ for sample in $(seq 1 20); do
     SID4="bundle-4-$sample-$$"
     start_ns="$(date +%s%N)"
     timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "$OUT3/$SID3.snapshot" \
+        --ref-location A=file://$LOCATION_A --ref-location B=file://$LOCATION_B \
         --config "$WORK/restore4-$sample.yaml" \
         --manifest-config "$WORK/manifest.yaml" --sandbox-id "$SID4" --ch-binary "$BIN/cloud-hypervisor" \
         --run-root "$RR" >"$WORK/run4-$sample.log" 2>&1 &
@@ -393,20 +411,22 @@ def percentile(value):
 print(f"    A_to_B_to_C_restore_ready_ms n={len(samples)} p50={percentile(0.50)} p95={percentile(0.95)} p99={percentile(0.99)}")
 PY
 
-echo "==> phase 5: publish self-contained C to the Manifest store"
+echo "==> phase 5: exact-upload C while retaining its located A+B dependencies"
 start_ns="$(date +%s%N)"
 UPLOADED="$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/manifest.yaml" \
+    --ref-location A=file://$LOCATION_A --ref-location B=file://$LOCATION_B \
     --quiet "$OUT3/$SID3.snapshot")"
 echo "    exact_upload_ms=$((($(date +%s%N)-start_ns)/1000000))"
 [ "$UPLOADED" = "manifest://$ROOT3" ] || { echo "FAIL: exact upload changed root: $UPLOADED"; exit 1; }
 "$BIN/manifest-ctl" verify --manifest-config "$WORK/manifest.yaml" "$ROOT3" >/dev/null
 
-rm -rf "$OUT3" "$LOCATION_B"
-echo "==> phase 6: Store-only restore of the byte-identical C root"
+rm -rf "$OUT3"
+echo "==> phase 6: byte-identical Manifest root restore with located A+B dependencies"
 write_restore_yaml "$WORK/restore5.yaml" bundle-remote "$WORK/root-r5.ext4"
 SID5="bundle-5-$$"
 start_ns="$(date +%s%N)"
 timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "manifest://$ROOT3" --config "$WORK/restore5.yaml" \
+    --ref-location A=file://$LOCATION_A --ref-location B=file://$LOCATION_B \
     --manifest-config "$WORK/manifest.yaml" --sandbox-id "$SID5" --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$RR" >"$WORK/run5.log" 2>&1 &
 P5=$!
@@ -420,6 +440,7 @@ for marker in ROOT-BASE ROOT-CHILD ROOT-C DATA-BASE DATA-CHILD DATA-C; do
 done
 kill "$P5" 2>/dev/null || true
 wait "$P5" 2>/dev/null || true
+rm -rf "$LOCATION_A" "$LOCATION_B"
 
 echo
-echo "==> e2e_sandbox_bundle: OK (self-contained E/S Bundles, located publish/restore, Store publish, multi-disk)"
+echo "==> e2e_sandbox_bundle: OK (located dependency retention, exact Store upload without ref rewrite, multi-disk)"

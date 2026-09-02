@@ -3,6 +3,7 @@ package artifact
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,14 @@ import (
 )
 
 const publishTestSHA = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func publishEROFSFixture() []byte {
+	payload := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
+	payload[1024+12] = 12
+	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	return payload
+}
 
 func TestNewLocationPublisherRejectsSymlinkDirectory(t *testing.T) {
 	storage, err := NewProcessStorage(nil)
@@ -208,5 +217,109 @@ func TestLocationPublisherRewritesSandboxAndSnapshotGraphs(t *testing.T) {
 	}
 	if parentOverlay.Location != "published" || filepath.Ext(parentOverlay.Path) != ".overlay" {
 		t.Fatalf("parent .sandbox was not published as payload overlay: %s", parentOverlay.String())
+	}
+}
+
+func TestLocationPublisherPublishesRootCarrierAsImage(t *testing.T) {
+	ctx := context.Background()
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+	storage, err := NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	inputSink := snapshot.NewFileSink(inputDir, "fixture", nil, false, nil)
+	imageRef, _, err := inputSink.AbsorbImageSource(ctx, publishSource(t, publishEROFSFixture()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, portable := publishPortable(t, "")
+	portable.Boot.Root = config.PortableRootConfig{
+		Base: imageRef, Overlay: &config.PortableOverlayConfig{Base: "self"},
+	}
+	runtimeConfig, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical, err := sandboxfile.BuildSource(
+		publishSource(t, bytes.Repeat([]byte{0x42}, 4096)), nil, runtimeConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sandboxPath, err := inputSink.AbsorbSandbox(ctx, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	locations := config.RefLocations{"published": outputDir}
+	publisher, err := NewLocationPublisher(storage, "published", outputDir, locations, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisher.Close()
+	result, err := publisher.Publish(ctx, sandboxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Role != RoleSandbox {
+		t.Fatalf("published role = %q, want %q", result.Role, RoleSandbox)
+	}
+
+	entries, err := os.ReadDir(outputDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roles := map[string]int{}
+	for _, entry := range entries {
+		roles[filepath.Ext(entry.Name())]++
+	}
+	if len(entries) != 2 || roles[".image"] != 1 || roles[".sandbox"] != 1 || roles[".overlay"] != 0 {
+		t.Fatalf("named root publication entries = %v, roles = %v", entries, roles)
+	}
+
+	rootRef, err := manifest.ParseRef(result.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPath, err := locations.ResolveFile(rootRef, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	openedRoot, err := storage.OpenFileWithLocations(ctx, rootPath, rootRef, locations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := sandboxfile.Open(ctx, openedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	publishedImage, err := manifest.ParseRef(root.Portable.Boot.Root.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publishedImage.Location != "published" || filepath.Ext(publishedImage.Path) != ".image" {
+		t.Fatalf("published root image ref = %s", publishedImage.String())
+	}
+	imagePath, err := locations.ResolveFile(publishedImage, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	openedImage, err := storage.OpenFileWithLocations(ctx, imagePath, publishedImage, locations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageRoot, err := sandboxfile.OpenEROFSArtifact(ctx, openedImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imageRoot.Payload.Size() != uint64(len(publishEROFSFixture())) {
+		t.Fatalf("published root image size = %d", imageRoot.Payload.Size())
+	}
+	if err := imageRoot.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -2703,11 +2703,10 @@ type artifactDependency struct {
 }
 
 type dependencyPlanImport struct {
-	raw         string
-	label       string
-	role        artifactDependencyRole
-	stream      fetch.Stream
-	transformed bool
+	raw    string
+	label  string
+	role   artifactDependencyRole
+	stream fetch.Stream
 }
 
 type dependencyPlanCopy struct {
@@ -2827,8 +2826,10 @@ func (p *snapshotBundlePlan) emit(ctx context.Context, sink snapshot.ArtifactSin
 		switch item.role {
 		case dependencyMemorySnapshot:
 			ref, _, absorbErr = sink.AbsorbSnapshot(ctx, item.stream)
-		case dependencyDiskLayer, dependencyRootImage:
+		case dependencyDiskLayer:
 			ref, _, absorbErr = sink.AbsorbOverlaySource(ctx, item.stream)
+		case dependencyRootImage:
+			ref, _, absorbErr = sink.AbsorbImageSource(ctx, item.stream)
 		default:
 			absorbErr = fmt.Errorf("unsupported dependency role %d", item.role)
 		}
@@ -2928,6 +2929,19 @@ func prepareSnapshotDependencyPlan(
 		if err != nil {
 			return nil, fmt.Errorf("prepare %s %q: %w", dependency.role, raw, err)
 		}
+		portable, retain, err := portableSnapshotDependencyRef(ctx, dependency, reader, opts)
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("retain %s %q: %w", dependency.role, raw, err), prepared.Close())
+		}
+		if retain {
+			if err := prepared.Close(); err != nil {
+				return nil, fmt.Errorf("close retained %s %q: %w", dependency.role, raw, err)
+			}
+			if portable != raw {
+				plan.replacements[raw] = portable
+			}
+			continue
+		}
 		if bundleTarget && reader != nil && reader.Admission() == admission && !transformed {
 			plan.copies = append(plan.copies, dependencyPlanCopy{
 				raw: raw, label: label, key: key, reader: reader, stream: prepared,
@@ -2935,14 +2949,56 @@ func prepareSnapshotDependencyPlan(
 			continue
 		}
 		plan.imports = append(plan.imports, dependencyPlanImport{
-			raw: raw, label: label, role: dependency.role, stream: prepared, transformed: transformed,
+			raw: raw, label: label, role: dependency.role, stream: prepared,
 		})
 	}
-	// Every reachable local/remote dependency is materialized into the new
-	// destination. A Bundle therefore needs no external ordered refs; its refs
-	// plan is nevertheless fixed here, before NewWriter emits metadata.
+	// Portable refs retain their own explicit provenance. Unlocated local
+	// dependencies are materialized into the new destination, so a Bundle does
+	// not need external ordered refs and its plan remains fixed before NewWriter
+	// emits metadata.
 	plan.refs = nil
 	return plan, nil
+}
+
+// portableSnapshotDependencyRef keeps dependencies whose carrier already has
+// portable provenance. A logical Manifest selected from a located Bundle is
+// made explicit as that Bundle's located @manifest selector; a Manifest that
+// came from the remote fetcher and an already-located file ref remain unchanged.
+// Unlocated Bundle/file sources deliberately fall through to materialization.
+func portableSnapshotDependencyRef(ctx context.Context, dependency artifactDependency, reader *manifestbundle.Reader, opts RunOptions) (string, bool, error) {
+	ref, err := manifest.ParseRef(dependency.raw)
+	if err != nil {
+		return "", false, err
+	}
+	if ref.Scheme == manifest.RefSchemeFile {
+		if ref.Location == "" {
+			return "", false, nil
+		}
+		return ref.String(), true, nil
+	}
+	if ref.Scheme != manifest.RefSchemeManifest {
+		return "", false, nil
+	}
+	if reader == nil {
+		return ref.String(), true, nil
+	}
+
+	lookup := snapshotDependencyBundleLookup(dependency, opts)
+	if lookup.binding == nil {
+		return "", false, nil
+	}
+	physical, found, err := bundleManifestMergeRefWithLookup(ctx, dependency.raw, opts, lookup)
+	if err != nil || !found {
+		return "", false, err
+	}
+	physicalRef, err := manifest.ParseRef(physical)
+	if err != nil {
+		return "", false, err
+	}
+	if !physicalRef.Portable() {
+		return "", false, nil
+	}
+	return physicalRef.String(), true, nil
 }
 
 func openSnapshotDependency(ctx context.Context, dependency artifactDependency, opts RunOptions, knownPaths map[string]string, outputDir string) (fetch.Stream, *manifestbundle.Reader, store.ContentKey, string, error) {
@@ -2956,10 +3012,7 @@ func openSnapshotDependency(ctx context.Context, dependency artifactDependency, 
 		if err != nil {
 			return nil, nil, store.ContentKey{}, "", err
 		}
-		lookup := sandboxBundleLookup(opts)
-		if dependency.role == dependencyMemorySnapshot {
-			lookup = memoryBundleLookup(opts)
-		}
+		lookup := snapshotDependencyBundleLookup(dependency, opts)
 		if lookup.err != nil {
 			return nil, nil, store.ContentKey{}, "", fmt.Errorf("%s Bundle provenance: %w", label, lookup.err)
 		}
@@ -3131,6 +3184,13 @@ func memoryBundleLookup(opts RunOptions) bundleLookup {
 		return bundleLookup{}
 	}
 	return bundleLookupFor(opts.MemoryBinding.BundleSource, opts.BundleReader, opts.BundleFetcher)
+}
+
+func snapshotDependencyBundleLookup(dependency artifactDependency, opts RunOptions) bundleLookup {
+	if dependency.role == dependencyMemorySnapshot {
+		return memoryBundleLookup(opts)
+	}
+	return sandboxBundleLookup(opts)
 }
 
 func bundleSourceForManifest(ctx context.Context, key store.ContentKey, opts RunOptions) (string, string, bool, error) {

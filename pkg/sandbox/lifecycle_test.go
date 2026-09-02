@@ -44,6 +44,31 @@ type lifecycleArtifactStream struct{ sparse.Source }
 
 func (*lifecycleArtifactStream) Close() error { return nil }
 
+type lifecycleManifestFetcher struct {
+	body  []byte
+	opens int
+}
+
+func (f *lifecycleManifestFetcher) OpenManifest(ctx context.Context, _ store.ContentKey) (fetch.Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.opens++
+	source, err := sparse.NewSource(bytes.NewReader(f.body), uint64(len(f.body)), nil)
+	if err != nil {
+		return nil, err
+	}
+	return &lifecycleArtifactStream{Source: source}, nil
+}
+
+func lifecycleEROFSFixture() []byte {
+	payload := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
+	payload[1024+12] = 12
+	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	return payload
+}
+
 func TestApplyRunCaptureSourcesForwardsBundleFetcher(t *testing.T) {
 	reader := new(manifestbundle.Reader)
 	fetcher := new(manifestbundle.ManifestFetcher)
@@ -103,10 +128,7 @@ func TestPrepareSnapshotDependencyRejectsLiveSandboxAsRootImage(t *testing.T) {
 
 func TestPrepareSnapshotDependencyPreservesRootImageConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "root.erofs")
-	payload := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
-	payload[1024+12] = 12
-	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	payload := lifecycleEROFSFixture()
 	if err := os.WriteFile(path, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -144,10 +166,7 @@ func TestPrepareSnapshotDependencyPreservesRootImageConfig(t *testing.T) {
 }
 
 func TestPrepareSnapshotDependencyPreservesSandboxRootImageConfig(t *testing.T) {
-	payload := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
-	payload[1024+12] = 12
-	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	payload := lifecycleEROFSFixture()
 	want := &image.RuntimeConfig{Env: []string{"BUILT=yes"}, WorkingDir: "/home/user"}
 	imageConfig, err := want.MarshalDeterministic()
 	if err != nil {
@@ -181,6 +200,145 @@ func TestPrepareSnapshotDependencyPreservesSandboxRootImageConfig(t *testing.T) 
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Sandbox root image config = %#v, want %#v", got, want)
+	}
+}
+
+func TestPrepareSnapshotDependencyPlanMaterializesRootCarrierAsImage(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	refRaw, sourcePath, err := snapshot.NewFileSink(sourceDir, "source", nil, false, nil).AbsorbImageSource(
+		ctx, sparse.Dense(bytes.NewReader(lifecycleEROFSFixture()), 4096),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := manifest.ParseRef(refRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Path = sourcePath
+	refRaw = ref.String()
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{
+		Base: refRaw, Overlay: &config.PortableOverlayConfig{Base: "self"},
+	}
+	outputDir := t.TempDir()
+	plan, err := prepareSnapshotDependencyPlan(ctx, RunOptions{
+		PortableConfig: portable,
+	}, nil, []bool{false}, outputDir, store.WriteAdmission{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	replacements, err := plan.Emit(ctx, snapshot.NewFileSink(outputDir, "snapshot", nil, false, nil), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := manifest.ParseRef(replacements[refRaw])
+	if err != nil {
+		t.Fatalf("root image replacement = %q: %v", replacements[refRaw], err)
+	}
+	if filepath.Ext(published.Path) != ".image" {
+		t.Fatalf("root image replacement = %s, want .image carrier", published.String())
+	}
+	if overlays, err := filepath.Glob(filepath.Join(outputDir, "*.overlay")); err != nil {
+		t.Fatal(err)
+	} else if len(overlays) != 0 {
+		t.Fatalf("root image was mislabeled as writable overlay: %v", overlays)
+	}
+	images, err := filepath.Glob(filepath.Join(outputDir, "*.image"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(images) != 1 || filepath.Base(images[0]) != published.Path {
+		t.Fatalf("root image files = %v, replacement = %s", images, published.String())
+	}
+	opened, err := artifact.OpenFile(ctx, images[0], published, nil, nil, nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageRoot, err := sandboxfile.OpenEROFSArtifact(ctx, opened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imageRoot.Payload.Size() != 4096 {
+		t.Fatalf("root image payload size = %d, want 4096", imageRoot.Payload.Size())
+	}
+	if err := imageRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrepareSnapshotDependencyPlanKeepsRemoteManifestRoot(t *testing.T) {
+	key := strings.Repeat("c", 64)
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{
+		Base: "manifest://" + key, Overlay: &config.PortableOverlayConfig{Base: "self"},
+	}
+	fetcher := &lifecycleManifestFetcher{body: lifecycleEROFSFixture()}
+	outputDir := t.TempDir()
+	plan, err := prepareSnapshotDependencyPlan(context.Background(), RunOptions{
+		PortableConfig: portable,
+		Fetcher:        fetcher,
+	}, nil, []bool{false}, outputDir, store.WriteAdmission{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	replacements, err := plan.Emit(context.Background(), snapshot.NewFileSink(outputDir, "remote", nil, false, nil), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetcher.opens != 1 {
+		t.Fatalf("remote Manifest opens = %d, want one preflight validation", fetcher.opens)
+	}
+	if len(replacements) != 0 {
+		t.Fatalf("remote Manifest replacement = %v, want unchanged ref", replacements)
+	}
+	if overlays, err := filepath.Glob(filepath.Join(outputDir, "*.overlay")); err != nil {
+		t.Fatal(err)
+	} else if len(overlays) != 0 {
+		t.Fatalf("remote Manifest root was copied into overlay files: %v", overlays)
+	}
+}
+
+func TestPrepareSnapshotDependencyPlanKeepsLocatedRootCarrier(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	refRaw, _, err := snapshot.NewFileSink(sourceDir, "source", nil, false, nil).AbsorbImageSource(
+		ctx, sparse.Dense(bytes.NewReader(lifecycleEROFSFixture()), 4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := manifest.ParseRef(refRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Location = "shared"
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{
+		Base: ref.String(), Overlay: &config.PortableOverlayConfig{Base: "self"},
+	}
+	outputDir := t.TempDir()
+	plan, err := prepareSnapshotDependencyPlan(ctx, RunOptions{
+		PortableConfig: portable,
+		RefLocations:   config.RefLocations{"shared": sourceDir},
+	}, nil, []bool{false}, outputDir, store.WriteAdmission{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	replacements, err := plan.Emit(ctx, snapshot.NewFileSink(outputDir, "located", nil, false, nil), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replacements) != 0 {
+		t.Fatalf("located root replacement = %v, want unchanged ref", replacements)
+	}
+	if overlays, err := filepath.Glob(filepath.Join(outputDir, "*.overlay")); err != nil {
+		t.Fatal(err)
+	} else if len(overlays) != 0 {
+		t.Fatalf("located root was copied into overlay files: %v", overlays)
 	}
 }
 
@@ -386,10 +544,25 @@ func TestPrepareSnapshotBundlePlanCopiesReachableParentManifest(t *testing.T) {
 	sandboxCfg := &config.SandboxConfig{}
 	sandboxCfg.Resources.Capacity.Memory = "8KiB"
 	sandboxCfg.Boot.Root.Overlay = &config.OverlayConfig{}
+	imageDir := t.TempDir()
+	imageRefRaw, imagePath, err := snapshot.NewFileSink(imageDir, "image", nil, false, nil).AbsorbImageSource(
+		context.Background(), sparse.Dense(bytes.NewReader(lifecycleEROFSFixture()), 4096),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageRef, err := manifest.ParseRef(imageRefRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageRef.Path = imagePath
+	imageRefRaw = imageRef.String()
 	runOpts := RunOptions{
 		Cfg: sandboxCfg,
 		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{
-			Root: config.PortableRootConfig{Base: "self"},
+			Root: config.PortableRootConfig{
+				Base: imageRefRaw, Overlay: &config.PortableOverlayConfig{Base: "self"},
+			},
 		}},
 		MemoryBinding: &MemorySourceBinding{
 			SnapshotRef: parentRef,
@@ -434,6 +607,17 @@ func TestPrepareSnapshotBundlePlanCopiesReachableParentManifest(t *testing.T) {
 	if replacements[parentRef] != parentRef {
 		t.Fatalf("exact-copy replacement = %q, want %q", replacements[parentRef], parentRef)
 	}
+	publishedImage, err := manifest.ParseRef(replacements[imageRefRaw])
+	if err != nil || publishedImage.Scheme != manifest.RefSchemeManifest {
+		t.Fatalf("Bundle root image replacement = %q, err=%v", replacements[imageRefRaw], err)
+	}
+	imageKey, err := manifest.ParseKeyRef(publishedImage.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overlays, _ := child.Results(); len(overlays) != 0 {
+		t.Fatalf("Bundle root image was counted as %d writable overlays", len(overlays))
+	}
 	_, childPath := lifecycleBundleSnapshot(t, child, childDir,
 		bytes.Repeat([]byte{0x41}, 8192), snapshotConfig)
 	if err := child.Close(); err != nil {
@@ -450,6 +634,9 @@ func TestPrepareSnapshotBundlePlanCopiesReachableParentManifest(t *testing.T) {
 	if !reader.HasManifest(parentKey) {
 		t.Fatal("child did not copy the reachable parent Manifest")
 	}
+	if !reader.HasManifest(imageKey) {
+		t.Fatal("child did not ingest the root image Manifest")
+	}
 
 	mergedPlan, err := prepareSnapshotBundlePlan(context.Background(), runOpts,
 		nil, []bool{true}, t.TempDir(), admission)
@@ -462,6 +649,100 @@ func TestPrepareSnapshotBundlePlanCopiesReachableParentManifest(t *testing.T) {
 	}
 }
 
+func TestPrepareSnapshotBundlePlanKeepsManifestFromLocatedBundle(t *testing.T) {
+	ctx := context.Background()
+	customerKey := [32]byte{0x81, 0x82, 0x83}
+	keyFn := func() ([32]byte, error) { return customerKey, nil }
+	manifestCfg := &manifest.Config{
+		Manifest: manifest.ManifestSubConfig{WriteGeneration: "G1"},
+		Chunker:  chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:   manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+	parentDir := t.TempDir()
+	parent, err := snapshot.NewBundleSink(ctx, parentDir, "parent", manifestCfg, keyFn, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentRef, parentPath := lifecycleBundleSnapshot(t, parent, parentDir,
+		bytes.Repeat([]byte{0x84}, 8192),
+		[]byte("version: 1\nsandbox_ref: manifest://"+strings.Repeat("a", 64)+"\n"))
+	if err := parent.Close(); err != nil {
+		t.Fatal(err)
+	}
+	parentKey, err := manifest.ParseKeyRef(parentRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector, err := manifest.ParseRef("file://" + parentPath + "@manifest:" + manifest.HexKey(parentKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := artifact.OpenFile(ctx, parentPath, selector, manifestCfg, keyFn, nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+
+	admission, err := manifestCfg.WriteAdmission(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputDir := t.TempDir()
+	plan, err := prepareSnapshotBundlePlan(ctx, RunOptions{
+		PortableConfig: &config.PortableSandboxConfig{Boot: config.PortableBootConfig{
+			Root: config.PortableRootConfig{Base: "self"},
+		}},
+		MemoryBinding: &MemorySourceBinding{
+			SnapshotRef: parentRef,
+			BundleSource: &BundleSourceBinding{
+				RootRef:  "file://" + filepath.Base(parentPath) + "@location:shared",
+				RootPath: parentPath,
+				Reader:   opened.BundleReader(), Fetcher: opened.ManifestFetcher(),
+			},
+		},
+		ManifestCfg: manifestCfg, CustomerKeyFn: keyFn,
+		RefLocations: config.RefLocations{"shared": parentDir},
+	}, []string{parentRef}, []bool{false}, outputDir, admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	child, err := snapshot.NewPlannedBundleSink(outputDir, "child", manifestCfg, keyFn, admission, plan.Refs(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	replacements, err := plan.Ingest(ctx, child, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := manifest.ParseRef(replacements[parentRef])
+	if err != nil {
+		t.Fatalf("located Bundle replacement = %q: %v", replacements[parentRef], err)
+	}
+	if got.Scheme != manifest.RefSchemeFile || got.Path != filepath.Base(parentPath) ||
+		got.DigestScheme != "manifest" || got.Digest != manifest.HexKey(parentKey) || got.Location != "shared" {
+		t.Fatalf("located Bundle replacement = %+v", got)
+	}
+	childRef, childPath := lifecycleBundleSnapshot(t, child, outputDir,
+		bytes.Repeat([]byte{0x85}, 8192),
+		[]byte("version: 1\nsandbox_ref: manifest://"+strings.Repeat("b", 64)+"\nfrom_refs:\n  - "+replacements[parentRef]+"\n"))
+	if childRef == "" {
+		t.Fatal("child Bundle root ref is empty")
+	}
+	if err := child.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := manifestbundle.Open(childPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if reader.HasManifest(parentKey) {
+		t.Fatal("located parent Manifest was copied into the child Bundle")
+	}
+}
+
 type failingManifestFetcher struct {
 	calls int
 }
@@ -471,7 +752,7 @@ func (f *failingManifestFetcher) OpenManifest(context.Context, store.ContentKey)
 	return nil, errors.New("remote Manifest missing")
 }
 
-func TestPrepareSnapshotBundlePlanMaterializesOnlyReachableSources(t *testing.T) {
+func TestPrepareSnapshotBundlePlanHandlesOnlyReachableSources(t *testing.T) {
 	customerKey := [32]byte{0x74, 0x75, 0x76}
 	keyFn := func() ([32]byte, error) { return customerKey, nil }
 	manifestCfg := &manifest.Config{
@@ -554,7 +835,7 @@ func TestPrepareSnapshotBundlePlanMaterializesOnlyReachableSources(t *testing.T)
 	}
 	defer plan.Close()
 	if got := plan.Refs(); len(got) != 0 {
-		t.Fatalf("materialized plan has external refs: %v", got)
+		t.Fatalf("dependency plan has unexpected bundle/refs: %v", got)
 	}
 	sink, err := snapshot.NewPlannedBundleSink(childDir, "materialized", &childCfg, keyFn, admission, nil, nil)
 	if err != nil {
@@ -565,8 +846,20 @@ func TestPrepareSnapshotBundlePlanMaterializesOnlyReachableSources(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replacements[parentRoot] == "" || replacements[layerB] == "" {
-		t.Fatalf("reachable dependencies were not materialized: %v", replacements)
+	if replacements[parentRoot] == "" {
+		t.Fatalf("unlocated reachable parent was not materialized: %v", replacements)
+	}
+	locatedLayer, err := manifest.ParseRef(replacements[layerB])
+	if err != nil {
+		t.Fatalf("located layer replacement = %q: %v", replacements[layerB], err)
+	}
+	layerKey, err := manifest.ParseKeyRef(layerB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if locatedLayer.Scheme != manifest.RefSchemeFile || locatedLayer.Location != "B" ||
+		locatedLayer.DigestScheme != "manifest" || locatedLayer.Digest != manifest.HexKey(layerKey) {
+		t.Fatalf("located reachable layer replacement = %+v", locatedLayer)
 	}
 	if _, retained := replacements[refA]; retained {
 		t.Fatal("unreachable historical Bundle source was materialized")

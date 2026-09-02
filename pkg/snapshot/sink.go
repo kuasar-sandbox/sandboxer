@@ -38,6 +38,7 @@ func HexKey(k store.ContentKey) string {
 type ArtifactSink interface {
 	AbsorbOverlay(ctx context.Context, diff io.ReadSeeker, holes []sparse.Extent) (ref, path string, err error)
 	AbsorbOverlaySource(ctx context.Context, source sparse.Source) (ref, path string, err error)
+	AbsorbImageSource(ctx context.Context, source sparse.Source) (ref, path string, err error)
 	AbsorbSandbox(ctx context.Context, source sparse.Source) (ref, path string, err error)
 	AbsorbSnapshot(ctx context.Context, source sparse.Source) (ref, path string, err error)
 	CommitSandbox(ctx context.Context, ref, path string) error
@@ -86,6 +87,19 @@ func (s *FileSink) AbsorbOverlaySource(ctx context.Context, source sparse.Source
 		return "", "", fmt.Errorf("overlay source is nil")
 	}
 	scheme, digest, path, err := s.writeArtifact(ctx, "overlay", source)
+	if err != nil {
+		return "", "", err
+	}
+	return localArtifactRef(filepath.Base(path), scheme, digest), path, nil
+}
+
+// AbsorbImageSource preserves an immutable root-image carrier as the image
+// logical role. Writable root/data layers use AbsorbOverlaySource instead.
+func (s *FileSink) AbsorbImageSource(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("image source is nil")
+	}
+	scheme, digest, path, err := s.writeArtifact(ctx, "image", source)
 	if err != nil {
 		return "", "", err
 	}
@@ -403,6 +417,17 @@ func (s *BundleSink) AbsorbOverlaySource(ctx context.Context, source sparse.Sour
 		return "", "", err
 	}
 	s.overlayResults = append(s.overlayResults, result)
+	return "manifest://" + HexKey(result.ManifestKey), "", nil
+}
+
+func (s *BundleSink) AbsorbImageSource(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("image source is nil")
+	}
+	result, err := s.ingestSource(ctx, source, nil, "root image dependency")
+	if err != nil {
+		return "", "", err
+	}
 	return "manifest://" + HexKey(result.ManifestKey), "", nil
 }
 
@@ -770,6 +795,17 @@ func (s *IngestSink) AbsorbOverlaySource(ctx context.Context, source sparse.Sour
 		return "", "", err
 	}
 	s.overlayRes = res
+	return "manifest://" + HexKey(res.ManifestKey), "", nil
+}
+
+func (s *IngestSink) AbsorbImageSource(ctx context.Context, source sparse.Source) (string, string, error) {
+	if source == nil {
+		return "", "", fmt.Errorf("image source is nil")
+	}
+	res, err := s.run(ctx, source, nil, "root image dependency")
+	if err != nil {
+		return "", "", err
+	}
 	return "manifest://" + HexKey(res.ManifestKey), "", nil
 }
 

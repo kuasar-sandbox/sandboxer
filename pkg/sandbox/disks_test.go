@@ -106,7 +106,7 @@ func TestOpenRootImageBlockReaderExcludesFlattenedConfigTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref, artifactPath, err := snapshot.NewFileSink(dir, "root", nil, false, nil).
-		AbsorbOverlaySource(context.Background(), sparse.Dense(bytes.NewReader(flattened), uint64(len(flattened))))
+		AbsorbImageSource(context.Background(), sparse.Dense(bytes.NewReader(flattened), uint64(len(flattened))))
 	if err != nil {
 		t.Fatal(err)
 	}

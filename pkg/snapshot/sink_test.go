@@ -140,6 +140,27 @@ func TestFileSinkArtifacts(t *testing.T) {
 		t.Fatal("overlay content mismatch")
 	}
 
+	imageRef, imagePath, err := sink.AbsorbImageSource(ctx, sparse.Dense(bytes.NewReader(mem), size))
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageRaw, err := os.ReadFile(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageSource, _, err := tarstream.SourceAt(bytes.NewReader(imageRaw), int64(len(imageRaw)), "image")
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageDigester, ok := imageSource.(tarstream.Digester)
+	if !ok {
+		t.Fatal("image source has no digest marker")
+	}
+	imageScheme, imageDigest := imageDigester.Digest()
+	if want := "file://" + imageDigest + ".image@" + imageScheme + ":" + imageDigest; imageRef != want {
+		t.Fatalf("image ref = %s, want %s", imageRef, want)
+	}
+
 	// Snapshot S: [memory][ZIP] as one entry named "snapshot", with the alias
 	// committed only after the logical root is complete.
 	bref, bpath, err := sink.AbsorbSnapshot(ctx, testSnapshotSource(t, mem, holes, snapshotConfig))
