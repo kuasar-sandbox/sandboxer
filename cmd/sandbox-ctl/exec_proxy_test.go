@@ -549,7 +549,7 @@ func TestExecCmdProxyDoesNotRequireSandboxIDOrEchoHeaders(t *testing.T) {
 	}
 
 	code, stderr = captureStderr(t, func() int { return execCmd([]string{"--", "/bin/true"}) })
-	if code != 2 || !strings.Contains(stderr, "exec: --sandbox-id required\n") {
+	if code != 2 || !strings.Contains(stderr, "exec: --sandbox-id or --path-id is required\n") {
 		t.Fatalf("local exec validation code=%d stderr=%q", code, stderr)
 	}
 

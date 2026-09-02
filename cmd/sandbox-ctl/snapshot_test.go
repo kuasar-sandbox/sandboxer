@@ -79,6 +79,61 @@ func TestSnapshotCmdBoolFlagMapping(t *testing.T) {
 	}
 }
 
+func TestSnapshotCmdUsesPathIDWithoutSandboxIDAndWithPrecedence(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		sandboxID string
+	}{
+		{name: "path id only"},
+		{name: "path id takes precedence", sandboxID: "logical-sandbox"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runRoot, err := os.MkdirTemp("", "pathid-snapshot-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(runRoot) })
+			pathID := "phase-c"
+			runDir := filepath.Join(runRoot, pathID)
+			if err := os.MkdirAll(runDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			listener, err := net.Listen("unix", filepath.Join(runDir, "ctl.sock"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+
+			serverDone := make(chan error, 1)
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					serverDone <- err
+					return
+				}
+				defer conn.Close()
+				var req ctl.Request
+				if err := ctl.ReadMessage(conn, &req); err != nil {
+					serverDone <- err
+					return
+				}
+				serverDone <- ctl.WriteMessage(conn, &ctl.Response{Type: ctl.TypeSnapshotDone})
+			}()
+
+			args := []string{"--path-id", pathID, "--run-root", runRoot, "--output", filepath.Join(t.TempDir(), "out")}
+			if test.sandboxID != "" {
+				args = append(args, "--sandbox-id", test.sandboxID)
+			}
+			if code := snapshotCmd(args); code != 0 {
+				t.Fatalf("snapshotCmd exit=%d", code)
+			}
+			if err := <-serverDone; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestSnapshotCmdRejectsUploadWithExplicitMode(t *testing.T) {
 	if code := snapshotCmd([]string{"--sandbox-id", "test", "--upload", "--mode", "local"}); code != 2 {
 		t.Fatalf("snapshotCmd exit=%d, want 2", code)
@@ -99,6 +154,12 @@ func TestSnapshotCmdRejectsPositionalArguments(t *testing.T) {
 
 func TestSnapshotCmdRejectsUnsafeSandboxID(t *testing.T) {
 	if code := snapshotCmd([]string{"--sandbox-id", "../test", "--output", t.TempDir()}); code != 2 {
+		t.Fatalf("snapshotCmd exit=%d, want 2", code)
+	}
+}
+
+func TestSnapshotCmdRejectsUnsafePathID(t *testing.T) {
+	if code := snapshotCmd([]string{"--path-id", "../test", "--output", t.TempDir()}); code != 2 {
 		t.Fatalf("snapshotCmd exit=%d, want 2", code)
 	}
 }

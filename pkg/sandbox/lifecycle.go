@@ -57,6 +57,7 @@ type RunOptions struct {
 	BundleFetcher  *manifestbundle.ManifestFetcher
 	RefLocations   config.RefLocations    // trusted logical location -> host directory mappings
 	SandboxID      string                 // generated if empty
+	PathID         string                 // run/base-root directory leaf; defaults to SandboxID
 	CHBinary       string                 // path to bin/cloud-hypervisor
 	RuntimeRoot    string                 // tmpfs run root (sockets / snap staging); "/run/sandbox" by default
 	BaseRoot       string                 // on-disk base root (overlay diff); "/var/lib/sandbox" by default
@@ -136,6 +137,11 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if err := validateSandboxID(opts.SandboxID); err != nil {
 		return -1, err
 	}
+	pathID, err := ResolvePathID(opts.SandboxID, opts.PathID)
+	if err != nil {
+		return -1, err
+	}
+	opts.PathID = pathID
 	if opts.RuntimeRoot == "" {
 		opts.RuntimeRoot = "/run/sandbox"
 	}
@@ -208,8 +214,9 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 			}
 		}
 	}
+	baseDir := DefaultBaseDir(opts.BaseRoot, pathID)
 	imageDefaults, err := preflightColdArtifacts(ctx, opts.Cfg, opts.Fetcher, opts.RefLocations,
-		opts.BaseRoot, opts.SandboxID, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener)
+		baseDir, opts.SandboxID, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener)
 	if err != nil {
 		return -1, err
 	}
@@ -250,7 +257,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		}
 	}
 
-	runDir := filepath.Join(opts.RuntimeRoot, opts.SandboxID)
+	runDir := filepath.Join(opts.RuntimeRoot, pathID)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return -1, fmt.Errorf("mkdir %s: %w", runDir, err)
 	}
@@ -494,11 +501,10 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// diff is ours: removed when the sandbox ends.
 	ownedDiff := diffURI == ""
 	if ownedDiff {
-		baseDir := DefaultBaseDir(opts.BaseRoot, opts.SandboxID)
 		if err := os.MkdirAll(baseDir, 0o755); err != nil {
 			return -1, fmt.Errorf("mkdir base dir %s: %w", baseDir, err)
 		}
-		diffURI = DefaultDiffURI(opts.BaseRoot, opts.SandboxID)
+		diffURI = DefaultDiffURI(baseDir, opts.SandboxID)
 		defer func() {
 			_ = os.Remove(filepath.Join(baseDir, opts.SandboxID+".overlay.diff"))
 			_ = os.Remove(baseDir)
@@ -542,7 +548,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		OwnedDiff: ownedDiff,
 	}}
 	for i := range opts.Cfg.Boot.Disks {
-		db, dcleanup, derr := prepColdDataDisk(ctx, &opts.Cfg.Boot.Disks[i], i, opts.BaseRoot, opts.SandboxID, fetcher, opts.RefLocations, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener)
+		db, dcleanup, derr := prepColdDataDisk(ctx, &opts.Cfg.Boot.Disks[i], i, baseDir, opts.SandboxID, fetcher, opts.RefLocations, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener)
 		if derr != nil {
 			return -1, derr
 		}
@@ -773,7 +779,7 @@ func preflightColdArtifacts(
 	cfg *config.SandboxConfig,
 	fetcher fetch.Fetcher,
 	locations config.RefLocations,
-	baseRoot, sandboxID string,
+	baseDir, sandboxID string,
 	codec tarstream.Codec,
 	diffCustomerKey [32]byte,
 	required bool,
@@ -799,7 +805,7 @@ func preflightColdArtifacts(
 		}
 		imageDefaults = imageCfg
 	}
-	if err := preflightWritableExt4(ctx, root, "boot.root", DefaultDiffURI(baseRoot, sandboxID),
+	if err := preflightWritableExt4(ctx, root, "boot.root", DefaultDiffURI(baseDir, sandboxID),
 		fetcher, locations, codec, diffCustomerKey, required, opener); err != nil {
 		return nil, err
 	}
@@ -814,7 +820,7 @@ func preflightColdArtifacts(
 				return nil, fmt.Errorf("preflight boot.disks[%d].base close: %w", i, err)
 			}
 		}
-		defaultDiff := "file://" + filepath.Join(DefaultBaseDir(baseRoot, sandboxID), fmt.Sprintf("%s.disk%d.diff", sandboxID, i))
+		defaultDiff := DefaultDiskDiffURI(baseDir, sandboxID, fmt.Sprintf("disk%d", i))
 		if err := preflightWritableExt4(ctx, disk, fmt.Sprintf("boot.disks[%d]", i), defaultDiff,
 			fetcher, locations, codec, diffCustomerKey, required, opener); err != nil {
 			return nil, err
@@ -1345,7 +1351,7 @@ func resolveDiskMounts(mounts []proto.MountSpec, disks []config.DiskConfig, root
 // optional ro base(s) and builds its writable CoW diff (same machinery as the
 // root). ordinal is its boot.disks[] index (used for the auto-default diff name).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, baseRoot, sandboxID string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, diffCustomerKey [32]byte, required bool, opener FileStreamOpener) (DiskBackend, func(), error) {
+func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, baseDir, sandboxID string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, diffCustomerKey [32]byte, required bool, opener FileStreamOpener) (DiskBackend, func(), error) {
 	var db DiskBackend
 	var closers []func()
 	cleanup := func() {
@@ -1390,12 +1396,11 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 	}
 
 	if diffURI == "" { // auto-default a per-disk diff on the base dir; ours to remove
-		baseDir := DefaultBaseDir(baseRoot, sandboxID)
 		if err := os.MkdirAll(baseDir, 0o755); err != nil {
 			return fail(fmt.Errorf("%s mkdir base dir: %w", field, err))
 		}
-		p := filepath.Join(baseDir, fmt.Sprintf("%s.disk%d.diff", sandboxID, ordinal))
-		diffURI = "file://" + p
+		diffURI = DefaultDiskDiffURI(baseDir, sandboxID, fmt.Sprintf("disk%d", ordinal))
+		_, p, _ := config.SchemeAndPath(diffURI)
 		db.OwnedDiff = true
 		closers = append(closers, func() { _ = os.Remove(p) })
 	}
@@ -3826,8 +3831,7 @@ func generateSandboxID() string {
 }
 
 func validateSandboxID(sandboxID string) error {
-	if sandboxID == "" || sandboxID == "." || sandboxID == ".." ||
-		filepath.Base(sandboxID) != sandboxID || strings.ContainsAny(sandboxID, `/\`) {
+	if err := ValidatePathID(sandboxID); err != nil {
 		return fmt.Errorf("sandbox id %q must be one non-empty path component", sandboxID)
 	}
 	return nil

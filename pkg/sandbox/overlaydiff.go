@@ -14,15 +14,23 @@ import (
 // Overridable via --base-root / SANDBOX_BASE_ROOT.
 const DefaultBaseRoot = "/var/lib/sandbox"
 
-// DefaultBaseDir returns the per-sandbox base directory under baseRoot.
-func DefaultBaseDir(baseRoot, sandboxID string) string {
-	return filepath.Join(baseRoot, sandboxID)
+// DefaultBaseDir returns the per-sandbox base directory under baseRoot. PathID
+// is the host directory leaf and is independent from logical SandboxID.
+func DefaultBaseDir(baseRoot, pathID string) string {
+	return filepath.Join(baseRoot, pathID)
 }
 
 // DefaultDiffURI returns the auto-default overlay diff URI (on disk, under the
-// base dir). Used when boot.root.overlay.diff is empty.
-func DefaultDiffURI(baseRoot, sandboxID string) string {
-	return "file://" + filepath.Join(DefaultBaseDir(baseRoot, sandboxID), sandboxID+".overlay.diff")
+// already-derived baseDir). The filename retains logical SandboxID identity.
+// Used when boot.root.overlay.diff is empty.
+func DefaultDiffURI(baseDir, sandboxID string) string {
+	return "file://" + filepath.Join(baseDir, sandboxID+".overlay.diff")
+}
+
+// DefaultDiskDiffURI returns an auto-default data-disk diff URI below the
+// PathID-derived baseDir while retaining SandboxID in the filename.
+func DefaultDiskDiffURI(baseDir, sandboxID, diskKey string) string {
+	return "file://" + filepath.Join(baseDir, fmt.Sprintf("%s.%s.diff", sandboxID, diskKey))
 }
 
 // PrepareDiff inspects only enough state to describe how OpenBlockCOW should

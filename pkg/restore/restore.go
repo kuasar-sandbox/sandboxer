@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -65,6 +64,7 @@ type Options struct {
 	RefLocations        config.RefLocations    // trusted named file locations
 	ArtifactRelativeDir string                 // trusted directory of the referenced Sandbox E
 	SandboxID           string
+	PathID              string // run/base-root directory leaf; defaults to SandboxID
 	CHBinary            string
 	RuntimeRoot         string        // tmpfs run root; "/run/sandbox" by default
 	BaseRoot            string        // on-disk base root (fresh overlay diff); "/var/lib/sandbox" by default
@@ -128,6 +128,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if err := validateRestoreSandboxID(opts.SandboxID); err != nil {
 		return -1, err
 	}
+	pathID, err := sandbox.ResolvePathID(opts.SandboxID, opts.PathID)
+	if err != nil {
+		return -1, fmt.Errorf("restore: %w", err)
+	}
+	opts.PathID = pathID
 	if opts.RuntimeRoot == "" {
 		opts.RuntimeRoot = "/run/sandbox"
 	}
@@ -220,7 +225,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		memoryBinding.RelativeDir = filepath.Dir(opts.SnapshotPath)
 	}
 
-	runDir := filepath.Join(opts.RuntimeRoot, opts.SandboxID)
+	runDir := filepath.Join(opts.RuntimeRoot, pathID)
 	chSock := filepath.Join(runDir, "ch.sock")
 	uffdSock := filepath.Join(runDir, "uffd.sock")
 	stateDir := filepath.Join(runDir, "snap-state")
@@ -643,8 +648,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 }
 
 func validateRestoreSandboxID(sandboxID string) error {
-	if sandboxID == "" || sandboxID == "." || sandboxID == ".." ||
-		filepath.Base(sandboxID) != sandboxID || strings.ContainsAny(sandboxID, `/\`) {
+	if err := sandbox.ValidatePathID(sandboxID); err != nil {
 		return fmt.Errorf("restore: sandbox id %q must be one non-empty path component", sandboxID)
 	}
 	return nil
@@ -706,12 +710,12 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 
 	// Fresh writable diff. Empty URI → auto-default (ours to remove).
 	if diffURI == "" {
-		baseDir := sandbox.DefaultBaseDir(opts.BaseRoot, opts.SandboxID)
+		baseDir := sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID)
 		if err := os.MkdirAll(baseDir, 0o755); err != nil {
 			return fail(fmt.Errorf("%s: mkdir base dir: %w", diskKey, err))
 		}
-		p := filepath.Join(baseDir, fmt.Sprintf("%s.%s.diff", opts.SandboxID, diskKey))
-		diffURI = "file://" + p
+		diffURI = sandbox.DefaultDiskDiffURI(baseDir, opts.SandboxID, diskKey)
+		_, p, _ := config.SchemeAndPath(diffURI)
 		db.OwnedDiff = true
 		closers = append(closers, func() { _ = os.Remove(p) })
 	}
@@ -1157,8 +1161,8 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		}
 		defer func() { retErr = errors.Join(retErr, base.Close()) }()
 		if diffURI == "" {
-			diffURI = "file://" + filepath.Join(sandbox.DefaultBaseDir(opts.BaseRoot, opts.SandboxID),
-				fmt.Sprintf("%s.%s.diff", opts.SandboxID, diskKey))
+			diffURI = sandbox.DefaultDiskDiffURI(
+				sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID), opts.SandboxID, diskKey)
 		}
 		scheme, diffPath, ok := config.SchemeAndPath(diffURI)
 		if !ok || scheme != "file" {

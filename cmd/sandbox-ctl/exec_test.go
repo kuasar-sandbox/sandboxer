@@ -2,6 +2,8 @@ package main
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,6 +12,83 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 )
+
+func TestExecCmdUsesPathIDWithoutSandboxIDAndWithPrecedence(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		sandboxID string
+	}{
+		{name: "path id only"},
+		{name: "path id takes precedence", sandboxID: "logical-sandbox"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runRoot, err := os.MkdirTemp("", "pathid-exec-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(runRoot) })
+			pathID := "phase-b"
+			runDir := filepath.Join(runRoot, pathID)
+			if err := os.MkdirAll(runDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			listener, err := net.Listen("unix", filepath.Join(runDir, "ctl.sock"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+
+			serverDone := make(chan error, 1)
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					serverDone <- err
+					return
+				}
+				defer conn.Close()
+				var req ctl.Request
+				if err := ctl.ReadMessage(conn, &req); err != nil {
+					serverDone <- err
+					return
+				}
+				if req.Type != ctl.TypeExecRequest || req.Exec == nil {
+					serverDone <- &unexpectedExecRequestError{request: req}
+					return
+				}
+				if err := ctl.WriteMessage(conn, &ctl.Response{Type: ctl.TypeExecAck, Stdio: &req.Exec.Stdio}); err != nil {
+					serverDone <- err
+					return
+				}
+				session := mux.NewSession(conn, mux.StreamSet{}, mux.Options{})
+				defer session.Close()
+				if err := session.SendExitStatus(0); err != nil {
+					serverDone <- err
+					return
+				}
+				serverDone <- session.InitMuxClose()
+			}()
+
+			args := []string{"--path-id", pathID, "--run-root", runRoot, "--stdout=false", "--stderr=false", "--", "/bin/true"}
+			if test.sandboxID != "" {
+				args = append([]string{"--sandbox-id", test.sandboxID}, args...)
+			}
+			if code := execCmd(args); code != 0 {
+				t.Fatalf("execCmd exit=%d", code)
+			}
+			if err := <-serverDone; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+type unexpectedExecRequestError struct {
+	request ctl.Request
+}
+
+func (e *unexpectedExecRequestError) Error() string {
+	return "unexpected exec request type " + e.request.Type
+}
 
 func TestRunExecWaitsForGuestMUXCloseAfterExitStatus(t *testing.T) {
 	hostConn, guestConn := net.Pipe()

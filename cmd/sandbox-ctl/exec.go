@@ -43,7 +43,8 @@ func (e *envFlag) Set(v string) error {
 // Stdio model: docs/sandbox.md §2.2.
 func execCmd(args []string) int {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
-	sandboxID := fs.String("sandbox-id", "", "target sandbox id (required without --proxy)")
+	sandboxID := fs.String("sandbox-id", "", "target sandbox id (local path fallback when --path-id is omitted)")
+	pathID := fs.String("path-id", "", "local run-root directory leaf (takes precedence over --sandbox-id)")
 	runRoot := fs.String("run-root", "", "tmpfs run root (overrides SANDBOX_RUN_ROOT env; default /run/sandbox)")
 	proxyURL := fs.String("proxy", "", "HTTP/HTTPS CONNECT endpoint (remote mode)")
 	var proxyHeaders proxyHeaderFlag
@@ -72,9 +73,18 @@ func execCmd(args []string) int {
 		return 2
 	}
 	connectHeaders := proxyHeaders.Header()
-	if *proxyURL == "" && *sandboxID == "" {
-		fmt.Fprintln(os.Stderr, "exec: --sandbox-id required")
-		return 2
+	targetPathID := ""
+	if *proxyURL == "" {
+		if *sandboxID == "" && *pathID == "" {
+			fmt.Fprintln(os.Stderr, "exec: --sandbox-id or --path-id is required")
+			return 2
+		}
+		var err error
+		targetPathID, err = resolveTargetPathID(*sandboxID, *pathID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "exec: target path: %v\n", err)
+			return 2
+		}
 	}
 	if *proxyURL == "" && len(connectHeaders) != 0 {
 		fmt.Fprintln(os.Stderr, "exec: --proxy-header requires --proxy")
@@ -83,7 +93,7 @@ func execCmd(args []string) int {
 	command := fs.Args()
 	if len(command) == 0 {
 		if *proxyURL == "" {
-			fmt.Fprintln(os.Stderr, "exec: missing command (use: sandbox-ctl exec --sandbox-id <sid> [flags] -- CMD [ARGS...])")
+			fmt.Fprintln(os.Stderr, "exec: missing command (use: sandbox-ctl exec [--sandbox-id <sid>] [--path-id <leaf>] [flags] -- CMD [ARGS...])")
 		} else {
 			fmt.Fprintln(os.Stderr, "exec: missing command (use: sandbox-ctl exec --proxy <url> [flags] -- CMD [ARGS...])")
 		}
@@ -150,7 +160,7 @@ func execCmd(args []string) int {
 			return dialProxyExec(ctx, *proxyURL, connectHeaders)
 		}
 	} else {
-		ctlSock = filepath.Join(rd, *sandboxID, "ctl.sock")
+		ctlSock = filepath.Join(rd, targetPathID, "ctl.sock")
 		dial = func(ctx context.Context) (net.Conn, error) {
 			return dialLocalExec(ctx, ctlSock)
 		}
