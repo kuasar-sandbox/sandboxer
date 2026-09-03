@@ -59,6 +59,7 @@ func runCmd(args []string) int {
 
 	fromRef := fs.String("from", "", "Sandbox artifact reference — cold-start its portable workload and root payload")
 	restoreRef := fs.String("restore", "", "Snapshot reference — restore memory and VMM execution state")
+	replaceBoot := fs.Bool("replace-boot", false, "with --from, replace the complete boot definition from host config")
 
 	// stdio flags. The bool flags (--stdin/--stdout/--stderr/--tty) are
 	// tri-state — "not set" must be distinguishable from "set to false"
@@ -104,6 +105,21 @@ func runCmd(args []string) int {
 	}
 	if *fromRef != "" && *restoreRef != "" {
 		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --from and --restore are mutually exclusive")
+		return 2
+	}
+	if *replaceBoot && *restoreRef != "" {
+		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --replace-boot is not valid with --restore")
+		return 2
+	}
+	if *replaceBoot && *fromRef == "" {
+		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --replace-boot requires --from")
+		return 2
+	}
+	if *configPath == "" {
+		*configPath = os.Getenv("SANDBOX_CONFIG")
+	}
+	if *replaceBoot && *configPath == "" {
+		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --replace-boot requires --config or SANDBOX_CONFIG")
 		return 2
 	}
 	if *sandboxID != "" {
@@ -239,9 +255,6 @@ func runCmd(args []string) int {
 	// + env). The orchestrator delivers per-sandbox config by writing these files;
 	// the secret manifest key rides in the MANIFEST_KEY env (resolved by
 	// pkg/manifest). orchestrator-ctl run-task sets both up before exec'ing here.
-	if *configPath == "" {
-		*configPath = os.Getenv("SANDBOX_CONFIG")
-	}
 	if *configPath == "" && *fromRef == "" {
 		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --config or SANDBOX_CONFIG required")
 		return 2
@@ -327,21 +340,33 @@ func runCmd(args []string) int {
 			fmt.Fprintf(os.Stderr, "sandbox-ctl run --from: %v\n", openErr)
 			return 1
 		}
-		defer source.Close()
-		applyDefaultArtifactBindings(cfg, source.Root.Portable, source.RelativeDir)
+		if !*replaceBoot {
+			defer source.Close()
+			applyDefaultArtifactBindings(cfg, source.Root.Portable, source.RelativeDir)
+		}
 		var applyErr error
-		cfg, portableConfig, applyErr = config.ApplyFromRules(source.Root.Portable, cfg, presence)
+		cfg, portableConfig, applyErr = config.ApplyFromRules(source.Root.Portable, cfg, presence, config.ApplyFromOptions{ReplaceBoot: *replaceBoot})
 		if applyErr != nil {
+			if *replaceBoot {
+				_ = source.Close()
+			}
 			fmt.Fprintf(os.Stderr, "sandbox-ctl run --from: %v\n", applyErr)
 			return 1
 		}
-		sourceBinding = &sandbox.RunSourceBinding{
-			SandboxRef: source.PortableRef, RuntimeRef: source.RuntimeRef, RelativeDir: source.RelativeDir,
-			BundleSource: source.BundleSource,
+		if *replaceBoot {
+			if closeErr := source.Close(); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "sandbox-ctl run --from: close source: %v\n", closeErr)
+				return 1
+			}
+		} else {
+			sourceBinding = &sandbox.RunSourceBinding{
+				SandboxRef: source.PortableRef, RuntimeRef: source.RuntimeRef, RelativeDir: source.RelativeDir,
+				BundleSource: source.BundleSource,
+			}
+			manifestFetcher = source.Fetcher
+			bundleReader = source.BundleReader
+			bundleFetcher = source.BundleFetcher
 		}
-		manifestFetcher = source.Fetcher
-		bundleReader = source.BundleReader
-		bundleFetcher = source.BundleFetcher
 	}
 
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{

@@ -56,10 +56,10 @@ if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 WORK=$(mktemp -d /tmp/e2e-disks-XXXXXX)
 RR=$WORK/runtime; mkdir -p "$RR"
 OUT=$WORK/out; mkdir -p "$OUT"
-P1=""; P2=""; P3=""; TAP_CREATED=0; HIDDEN_PARENT=""; PARENT_SIBLING=""
+P1=""; P2=""; P3=""; P4=""; TAP_CREATED=0; HIDDEN_PARENT=""; PARENT_SIBLING=""
 cleanup() {
     set +e
-    for P in "$P1" "$P2" "$P3"; do [ -n "$P" ] && kill -0 "$P" 2>/dev/null && kill -KILL "$P" 2>/dev/null; done
+    for P in "$P1" "$P2" "$P3" "$P4"; do [ -n "$P" ] && kill -0 "$P" 2>/dev/null && kill -KILL "$P" 2>/dev/null; done
     pkill -f "cloud-hypervisor.*dk-" 2>/dev/null
     if [ -n "$HIDDEN_PARENT" ] && [ -e "$HIDDEN_PARENT" ] && [ -n "$PARENT_SIBLING" ] && [ ! -e "$PARENT_SIBLING" ]; then
         mv "$HIDDEN_PARENT" "$PARENT_SIBLING"
@@ -212,6 +212,96 @@ if [disk.get("Name") for disk in disks] != ["scratch", "dataset"]:
     raise SystemExit(f"Sandbox E data-disk order/names are wrong: {disks!r}")
 PY
 echo "==> PASS: Sandbox E captured root plus ordered scratch/dataset graph"
+
+# ---- boot replacement: source E supplies only non-boot defaults -----------
+# Replace the source's root plus both data disks with a new root plus one
+# single-disk data disk. Export and then snapshot the same cold C0; neither
+# output may retain the source E or its old disk topology as provenance.
+mkdir -p "$WORK/replace-base"
+truncate -s 512M "$WORK/replace-root.ext4"; mkfs.ext4 -q -F "$WORK/replace-root.ext4"
+truncate -s 256M "$WORK/replace-fresh.ext4"; mkfs.ext4 -q -F "$WORK/replace-fresh.ext4"
+cat > "$WORK/replace.yaml" <<EOF
+network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-replace-boot }
+boot:
+  kernel: file://$VMLINUX
+  runtime: file://$BIN/sandbox-runtime.bundle
+  cmdline: "console=hvc0 printk.time=1 replace_boot=true"
+  root:
+    base: $BLK0_REF
+    overlay: { diff_template: file://$WORK/replace-root.ext4, diff_size: 512MiB }
+  disks:
+    - { name: fresh, diff_template: file://$WORK/replace-fresh.ext4, diff_size: 256MiB }
+mounts:
+  - { target: /fresh, type: disk, source: fresh }
+EOF
+
+SID_REPLACE=dk-replace
+echo "==> [replace-boot] cold derive E with a complete new root/data graph"
+timeout -k 10s 120 "$BIN/sandbox-ctl" run --from "$SANDBOX_E" --replace-boot \
+    --config "$WORK/replace.yaml" --sandbox-id "$SID_REPLACE" \
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RR" --base-root "$WORK/replace-base" \
+    > "$WORK/replace-run.log" 2>&1 &
+P4=$!
+ready "$SID_REPLACE" || { echo "FAIL: replacement cold boot not ready"; tail -80 "$WORK/replace-run.log"; exit 1; }
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID_REPLACE" --run-root "$RR" -- /bin/sh -c \
+    'grep -q " /fresh " /proc/mounts; ! grep -qE " /(scratch|data) " /proc/mounts; echo REPLACEMENT-ROOT > /replacement-root; echo REPLACEMENT-DATA > /fresh/replacement-data; sync'
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID_REPLACE" --run-root "$RR" -- /bin/sh -c \
+    'set -- /dev/vd?; [ "$#" -eq 3 ]' \
+    || { echo "FAIL: replacement inherited source data-disk devices"; exit 1; }
+
+REPLACE_EXPORT_OUT="$WORK/replace-export"; mkdir -p "$REPLACE_EXPORT_OUT"
+"$BIN/sandbox-ctl" export --sandbox-id "$SID_REPLACE" --run-root "$RR" \
+    --output "$REPLACE_EXPORT_OUT" --resume >/dev/null
+REPLACE_EXPORT_E="$REPLACE_EXPORT_OUT/$SID_REPLACE.sandbox"
+[ -L "$REPLACE_EXPORT_E" ] || { echo "FAIL: replacement export did not commit Sandbox E"; exit 1; }
+"$BIN/sandbox-ctl" info --json "$REPLACE_EXPORT_E" > "$WORK/replace-export-info.json"
+
+assert_replacement_graph() { # portable info json
+    python3 - "$1" "$E1_BASENAME" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    cfg = json.load(source)
+disks = cfg["Boot"].get("Disks") or []
+if [disk.get("Name") for disk in disks] != ["fresh"]:
+    raise SystemExit(f"replacement disk graph is not atomic: {disks!r}")
+mounts = cfg.get("Mounts") or []
+disk_mounts = [(mount.get("Source"), mount.get("Target")) for mount in mounts if mount.get("Type") == "disk"]
+if disk_mounts != [("fresh", "/fresh")]:
+    raise SystemExit(f"replacement mount graph is wrong: {disk_mounts!r}")
+encoded = json.dumps(cfg, sort_keys=True)
+for forbidden in (sys.argv[2], "old-data", '"Name": "scratch"', '"Name": "dataset"'):
+    if forbidden and forbidden in encoded:
+        raise SystemExit(f"replacement retained source provenance/topology {forbidden!r}")
+PY
+}
+assert_replacement_graph "$WORK/replace-export-info.json"
+echo "==> PASS: replacement export contains only the replacement disk graph"
+
+REPLACE_SNAPSHOT_OUT="$WORK/replace-snapshot"; mkdir -p "$REPLACE_SNAPSHOT_OUT"
+"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID_REPLACE" --run-root "$RR" \
+    --output "$REPLACE_SNAPSHOT_OUT" >/dev/null
+wait "$P4" 2>/dev/null || true; P4=""
+REPLACE_S="$REPLACE_SNAPSHOT_OUT/$SID_REPLACE.snapshot"
+[ -L "$REPLACE_S" ] || { echo "FAIL: replacement snapshot did not commit Snapshot S"; exit 1; }
+"$BIN/sandbox-ctl" info --json "$REPLACE_S" > "$WORK/replace-snapshot-info.json"
+REPLACE_S_E_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/replace-snapshot-info.json")
+[ -f "$REPLACE_SNAPSHOT_OUT/$REPLACE_S_E_BASENAME" ] \
+    || { echo "FAIL: replacement Snapshot S references missing Sandbox E"; exit 1; }
+"$BIN/sandbox-ctl" info --json "$REPLACE_SNAPSHOT_OUT/$REPLACE_S_E_BASENAME" > "$WORK/replace-snapshot-e-info.json"
+assert_replacement_graph "$WORK/replace-snapshot-e-info.json"
+python3 - "$WORK/replace-snapshot-info.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    cfg = json.load(source)
+if cfg.get("FromRefs"):
+    raise SystemExit(f"cold replacement Snapshot S retained a memory parent: {cfg['FromRefs']!r}")
+PY
+echo "==> PASS: replacement snapshot is S -> new E with no source E/memory parent"
 
 echo "==> [6] restore + verify persistence"
 truncate -s 512M "$WORK/root-r.ext4"; mkfs.ext4 -q -F "$WORK/root-r.ext4"

@@ -98,7 +98,7 @@ Usage:
   sandbox-ctl run       [--config host.yaml[:instance.yaml]] [--manifest-config <path>]
                         [--sandbox-id <sid>] [--path-id <leaf>] [--ch-binary <path>]
                         [--run-root <dir>] [--base-root <dir>]
-                        [--from <sandbox-ref> | --restore <snapshot-ref>]
+                        [--from <sandbox-ref> [--replace-boot] | --restore <snapshot-ref>]
                         [--ref-location name=file:///absolute/path ...]
                         [--stdin] [--stdout=false] [--stderr=false]
                         [--stdin-from F] [--stdout-to F] [--stderr-to F]
@@ -149,7 +149,9 @@ run starts one sandbox VM and blocks until the guest exits. Plain --config is
 an explicit cold start. --from opens a Sandbox E and follows the same cold-start
 path after applying allowed host/instance overrides. --restore opens a memory
 Snapshot S, follows its sandbox_ref to E, and restores VMM/memory execution
-state; --from and --restore are mutually exclusive. --ready-fd writes the one-shot startup wire
+state. --replace-boot makes --from use E only for non-boot defaults and takes
+the complete boot definition from --config; it never applies to --restore.
+--from and --restore are mutually exclusive. --ready-fd writes the one-shot startup wire
 "control_ready\nready\n" to an inherited fd and closes that fd after
 ready; run itself continues to own the VM and remains blocked. SandboxID is the
 logical identity. PathID is the run-root/base-root directory leaf and defaults

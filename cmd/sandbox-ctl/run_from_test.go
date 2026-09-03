@@ -184,6 +184,24 @@ func TestRunFromAndRestoreAreMutuallyExclusive(t *testing.T) {
 	}
 }
 
+func TestReplaceBootCLIValidation(t *testing.T) {
+	t.Setenv("SANDBOX_CONFIG", "")
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "without from", args: []string{"--replace-boot"}},
+		{name: "with restore", args: []string{"--replace-boot", "--restore", "source.snapshot"}},
+		{name: "without config", args: []string{"--replace-boot", "--from", "source.sandbox"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if code := runCmd(tc.args); code != 2 {
+				t.Fatalf("runCmd(%v) exit = %d, want 2", tc.args, code)
+			}
+		})
+	}
+}
+
 func testRunFromPortable(t *testing.T) *config.PortableSandboxConfig {
 	t.Helper()
 	const a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
