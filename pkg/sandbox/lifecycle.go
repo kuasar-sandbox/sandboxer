@@ -734,7 +734,7 @@ func PrepareOfflinePortableConfig(ctx context.Context, cfg *config.SandboxConfig
 	if cfg == nil {
 		return nil, errors.New("offline export config is nil")
 	}
-	if err := cfg.ValidateCold(); err != nil {
+	if err := cfg.ValidateColdProjection(); err != nil {
 		return nil, err
 	}
 	if err := canonicalizeConfiguredTarRefsWithOpener(ctx, cfg, locations, codec, required, opener); err != nil {

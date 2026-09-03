@@ -227,6 +227,25 @@ func TestValidateCold_InheritedCgroupFDIsAuthoritative(t *testing.T) {
 	}
 }
 
+func TestValidateColdProjectionDoesNotRequireRuntimeCgroup(t *testing.T) {
+	cfg, err := Load(writeYAML(t, minimalCold))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Resources.Allocatable.CPU = 1.5
+	cfg.Resources.Control.Controller = "/run/kuasar/resource.sock"
+	cfg.Resources.Overhead = &OverheadConfig{Memory: "64MiB"}
+	cfg.Resources.WatermarkHigh = &WatermarkHighConfig{Ratio: 0.8}
+	cfg.Resources.Startup = &StartupConfig{Memory: "1536MiB"}
+
+	if err := cfg.ValidateCold(); err == nil || !strings.Contains(err.Error(), "requires resources.control.cgroup_path") {
+		t.Fatalf("ValidateCold error = %v, want missing runtime cgroup capability", err)
+	}
+	if err := cfg.ValidateColdProjection(); err != nil {
+		t.Fatalf("ValidateColdProjection rejected portable resource policy: %v", err)
+	}
+}
+
 func TestValidateCold_TapFDSocket(t *testing.T) {
 	cfg, err := Load(writeYAML(t, strings.Replace(minimalCold, "  tap: tap0", `  tapfd:
     socket: /run/kuasar/connector/sw0/tapfd.sock

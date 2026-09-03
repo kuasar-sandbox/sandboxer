@@ -1026,6 +1026,20 @@ func (c *SandboxConfig) DiffSizeBytes() (int64, error) {
 //   - Allocatable.memory and Startup.memory are independently in (0, Capacity]
 //   - WatermarkHigh.ratio is in (0, 1)
 func (c *SandboxConfig) ValidateCold() error {
+	return c.validateCold(true)
+}
+
+// ValidateColdProjection validates an explicit cold configuration before it
+// is projected into a portable Sandbox config. Unlike ValidateCold, it does
+// not require a live cgroup capability for host-only resource policy: offline
+// assembly never starts a VM, and the portable projection retains only
+// capacity and allocatable resources. Resource values and all other cold
+// configuration are still validated normally.
+func (c *SandboxConfig) ValidateColdProjection() error {
+	return c.validateCold(false)
+}
+
+func (c *SandboxConfig) validateCold(requireCgroupCapability bool) error {
 	if err := c.Restore.validate(); err != nil {
 		return err
 	}
@@ -1060,19 +1074,19 @@ func (c *SandboxConfig) ValidateCold() error {
 	cgroupSet := c.Resources.Control.CgroupPath != ""
 	controllerSet := c.Resources.Control.Controller != ""
 
-	if controllerSet && !cgroupSet {
+	if requireCgroupCapability && controllerSet && !cgroupSet {
 		return errors.New("resources.control.controller requires resources.control.cgroup_path")
 	}
 	if err := validateControllerSocket(c.Resources.Control.Controller); err != nil {
 		return err
 	}
-	if !cgroupSet && c.Resources.Overhead != nil {
+	if requireCgroupCapability && !cgroupSet && c.Resources.Overhead != nil {
 		return errors.New("resources.overhead requires resources.control.cgroup_path")
 	}
-	if !cgroupSet && c.Resources.WatermarkHigh != nil {
+	if requireCgroupCapability && !cgroupSet && c.Resources.WatermarkHigh != nil {
 		return errors.New("resources.watermark_high requires resources.control.cgroup_path")
 	}
-	if !cgroupSet && c.Resources.Allocatable.CPU != float64(c.Resources.Capacity.CPU) {
+	if requireCgroupCapability && !cgroupSet && c.Resources.Allocatable.CPU != float64(c.Resources.Capacity.CPU) {
 		return fmt.Errorf("resources.allocatable.cpu must equal capacity.cpu (%d) when cgroup_path is not set; got %g (fractional cpu requires cgroup_path)",
 			c.Resources.Capacity.CPU, c.Resources.Allocatable.CPU)
 	}
@@ -1083,31 +1097,36 @@ func (c *SandboxConfig) ValidateCold() error {
 		if !filepath.IsAbs(c.Resources.Control.CgroupPath) {
 			return fmt.Errorf("resources.control.cgroup_path must be absolute: %q", c.Resources.Control.CgroupPath)
 		}
-		if fd := c.Resources.Control.CgroupFD; fd != 0 {
-			if fd < 3 {
-				return fmt.Errorf("resources.control.cgroup fd must be >= 3, got %d", fd)
-			}
-			var st unix.Stat_t
-			if err := unix.Fstat(fd, &st); err != nil {
-				return fmt.Errorf("resources.control.cgroup fd %d: %w", fd, err)
-			}
-			if st.Mode&unix.S_IFMT != unix.S_IFDIR {
-				return fmt.Errorf("resources.control.cgroup fd %d is not a directory", fd)
-			}
-			var fs unix.Statfs_t
-			if err := unix.Fstatfs(fd, &fs); err != nil {
-				return fmt.Errorf("resources.control.cgroup fd %d statfs: %w", fd, err)
-			}
-			if fs.Type != unix.CGROUP2_SUPER_MAGIC {
-				return fmt.Errorf("resources.control.cgroup fd %d is not on cgroup v2", fd)
-			}
-		} else {
-			st, err := os.Stat(c.Resources.Control.CgroupPath)
-			if err != nil {
-				return fmt.Errorf("resources.control.cgroup_path %q does not exist: %w", c.Resources.Control.CgroupPath, err)
-			}
-			if !st.IsDir() {
-				return fmt.Errorf("resources.control.cgroup_path %q is not a directory", c.Resources.Control.CgroupPath)
+		// CgroupPath/CgroupFD are not part of the portable projection. Keep
+		// validating path syntax, but do not require this host's runtime
+		// capability to exist for an offline artifact-only operation.
+		if requireCgroupCapability {
+			if fd := c.Resources.Control.CgroupFD; fd != 0 {
+				if fd < 3 {
+					return fmt.Errorf("resources.control.cgroup fd must be >= 3, got %d", fd)
+				}
+				var st unix.Stat_t
+				if err := unix.Fstat(fd, &st); err != nil {
+					return fmt.Errorf("resources.control.cgroup fd %d: %w", fd, err)
+				}
+				if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+					return fmt.Errorf("resources.control.cgroup fd %d is not a directory", fd)
+				}
+				var fs unix.Statfs_t
+				if err := unix.Fstatfs(fd, &fs); err != nil {
+					return fmt.Errorf("resources.control.cgroup fd %d statfs: %w", fd, err)
+				}
+				if fs.Type != unix.CGROUP2_SUPER_MAGIC {
+					return fmt.Errorf("resources.control.cgroup fd %d is not on cgroup v2", fd)
+				}
+			} else {
+				st, err := os.Stat(c.Resources.Control.CgroupPath)
+				if err != nil {
+					return fmt.Errorf("resources.control.cgroup_path %q does not exist: %w", c.Resources.Control.CgroupPath, err)
+				}
+				if !st.IsDir() {
+					return fmt.Errorf("resources.control.cgroup_path %q is not a directory", c.Resources.Control.CgroupPath)
+				}
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -27,6 +28,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
@@ -78,6 +80,63 @@ func TestApplyRunCaptureSourcesForwardsBundleFetcher(t *testing.T) {
 	if params.BundleReader != reader || params.BundleFetcher != fetcher {
 		t.Fatalf("capture Bundle sources = reader %p fetcher %p, want %p/%p",
 			params.BundleReader, params.BundleFetcher, reader, fetcher)
+	}
+}
+
+func TestPrepareOfflinePortableConfigDoesNotRequireRuntimeCgroup(t *testing.T) {
+	dir := t.TempDir()
+	kernel := filepath.Join(dir, "vmlinux")
+	if err := os.WriteFile(kernel, []byte("kernel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var footer bytes.Buffer
+	zw := zip.NewWriter(&footer)
+	header := &zip.FileHeader{
+		Name:     tarstream.DigestMarkerPrefix + strings.Repeat("a", 64),
+		Method:   zip.Store,
+		Modified: time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	if _, err := zw.CreateHeader(header); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime := make([]byte, 2<<20)
+	copy(runtime[len(runtime)-footer.Len():], footer.Bytes())
+	runtimePath := filepath.Join(dir, "sandbox-runtime.bundle")
+	if err := os.WriteFile(runtimePath, runtime, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.SandboxConfig{
+		Resources: config.ResourcesConfig{
+			Capacity:    config.CapacityConfig{CPU: 2, Memory: "2GiB"},
+			Allocatable: config.AllocatableConfig{CPU: 1.5, Memory: "1GiB"},
+			Control:     config.ControlConfig{Controller: "/run/kuasar/resource.sock"},
+			Overhead:    &config.OverheadConfig{Memory: "64MiB"},
+			WatermarkHigh: &config.WatermarkHighConfig{
+				Ratio: 0.8,
+			},
+			Startup: &config.StartupConfig{Memory: "1536MiB"},
+		},
+		Boot: config.BootConfig{
+			Kernel:  "file://" + kernel,
+			Runtime: "file://" + runtimePath,
+			Root: config.RootConfig{
+				Base: "manifest://" + strings.Repeat("b", 64),
+				Overlay: &config.OverlayConfig{
+					DiffTemplate: "file:///var/lib/sandbox/overlay.ext4",
+				},
+			},
+		},
+	}
+	portable, err := PrepareOfflinePortableConfig(context.Background(), cfg, nil, nil, false, nil)
+	if err != nil {
+		t.Fatalf("PrepareOfflinePortableConfig rejected host resource policy: %v", err)
+	}
+	if portable.Resources.Capacity.CPU != 2 || portable.Resources.Allocatable.CPU != 1.5 || portable.Resources.Allocatable.Memory != "1GiB" {
+		t.Fatalf("portable resources = %+v", portable.Resources)
 	}
 }
 
