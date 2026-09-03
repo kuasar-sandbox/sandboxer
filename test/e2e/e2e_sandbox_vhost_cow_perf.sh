@@ -14,17 +14,19 @@
 # analysis). Set LOSS_MAX_PCT to turn the table into a gate.
 #
 # Knobs:
-#   IO_MIB          sequential size (default 32)
+#   IO_MIB          sequential size (default 32); overlay upper is max(256, 2*IO_MIB) MiB
 #   SEQ_CHUNK_KIB   sequential chunk (default 1024)
 #   RAND_OPS        4K random operations (default 4096)
 #   PERF_RESULTS_JSON  extra copy of the results JSON
 #   LOSS_MAX_PCT    optional: fail if any sequential loss exceeds this
 #
 # Not part of test/e2e/run_all.sh — run this file yourself when you want the
-# measurement. All host files stay under sandboxer/test/e2e/.work/. The test
-# does not create a TAP, does not docker-pull, and does not write
-# /proc/sys/vm/drop_caches. Missing KVM/binaries skip (exit 0) unless
-# REQUIRE_KVM=1.
+# measurement. Host scratch (including --run-root sockets) lives under /tmp
+# so Unix paths stay below Linux sun_path; a deep CI checkout exceeds that
+# limit. The test does not create a TAP, does not docker-pull, and does not
+# write /proc/sys/vm/drop_caches. Cold guest reads posix_fadvise the live
+# host-side overlay.diff (BlockCOW buffered I/O) between phases instead.
+# Missing KVM/binaries skip (exit 0) unless REQUIRE_KVM=1.
 #
 # Binaries: sandboxer `make build` plus guest-runtime flatten-ctl / bundle /
 # vmlinux. Set BIN= to force a single assembled directory.
@@ -33,7 +35,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-. "$SCRIPT_DIR/lib/tarstream.sh"
 IMAGE="${IMAGE:-python:3.12-slim}"
 SID="${SID:-cowperf1}"
 IO_MIB="${IO_MIB:-32}"
@@ -74,24 +75,27 @@ find_artifact() {
 }
 
 require_artifact() {
-    local name="$1" path
+    # Look up $1 and optionally assign the path to $2. Must be called from the
+    # main shell (not $(...)): skip has to exit this process, not a subshell.
+    local name="$1" dest="${2:-}" path
     path="$(find_artifact "$name")" \
         || skip "missing $name — make -C sandboxer build, and make -C guest-runtime flatten-ctl sandbox-runtime vmlinux (or set BIN=)"
-    printf '%s\n' "$path"
+    if [ -n "$dest" ]; then
+        printf -v "$dest" '%s' "$path"
+    fi
 }
 
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
-[ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
-SANDBOX_CTL="$(require_artifact sandbox-ctl)"
-require_artifact sandbox-init >/dev/null
-CH_BIN="$(require_artifact cloud-hypervisor)"
-FLATTEN_CTL="$(require_artifact flatten-ctl)"
-RUNTIME_BUNDLE="$(require_artifact sandbox-runtime.bundle)"
+require_artifact sandbox-ctl SANDBOX_CTL
+require_artifact sandbox-init
+require_artifact cloud-hypervisor CH_BIN
+require_artifact flatten-ctl FLATTEN_CTL
+require_artifact sandbox-runtime.bundle RUNTIME_BUNDLE
 if [ -n "${VMLINUX:-}" ]; then
     [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX"
 else
-    VMLINUX="$(require_artifact vmlinux)"
+    require_artifact vmlinux VMLINUX
 fi
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH (apt install e2fsprogs)"
 
@@ -101,6 +105,7 @@ if [ "$(id -u)" -ne 0 ]; then
     fi
     echo "==> sudo -n unavailable; continuing as $(id -un) (need rw /dev/kvm)"
 fi
+[ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
 
 case "$IO_MIB" in
     ''|*[!0-9]*|0) echo "$0: IO_MIB must be a positive integer" >&2; exit 1 ;;
@@ -111,12 +116,16 @@ esac
 case "$RAND_OPS" in
     ''|*[!0-9]*|0) echo "$0: RAND_OPS must be a positive integer" >&2; exit 1 ;;
 esac
+# Bench file + ext4 journal/reserved blocks + overlayfs boot copy-up. The
+# default IO_MIB=32 keeps the historical 256MiB upper.
+OVERLAY_MIB=$((IO_MIB * 2))
+if [ "$OVERLAY_MIB" -lt 256 ]; then
+    OVERLAY_MIB=256
+fi
 
-# Host scratch lives only under the repo. TMPDIR is pointed here so flatten-ctl
-# / python mktemp also stay inside kuasar.
-WORK_ROOT="$REPO_ROOT/test/e2e/.work"
-mkdir -p "$WORK_ROOT"
-WORK="$(mktemp -d "$WORK_ROOT/cow-perf-XXXXXX")"
+# Scratch under /tmp (same as the other e2e cases). --run-root sockets such as
+# uffd.sock must fit in sockaddr_un.sun_path (108 bytes including NUL).
+WORK="$(mktemp -d /tmp/e2e-cow-perf-XXXXXX)"
 mkdir -p "$WORK/tmp"
 export TMPDIR="$WORK/tmp"
 RR="$WORK/run"; mkdir -p "$RR"
@@ -152,10 +161,16 @@ import sys
 import time
 
 
-def evict_file_cache(path):
-    """Drop this file from page cache only. Does not write /proc or sync the host."""
+def evict_file_cache(path, sync=False):
+    """Drop this file from page cache only. Does not write /proc/sys/vm/drop_caches.
+
+    sync=True fsyncs the inode first so DONTNEED can drop pages dirtied by
+    another fd (the live BlockCOW overlay.diff opened with buffered I/O).
+    """
     fd = os.open(path, os.O_RDONLY)
     try:
+        if sync:
+            os.fsync(fd)
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
     finally:
         os.close(fd)
@@ -228,26 +243,35 @@ def timed_rand(path, io_size, ops, write, seed):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--path", required=True)
-    p.add_argument("--bytes", type=int, required=True)
-    p.add_argument("--chunk", type=int, required=True)
-    p.add_argument("--rand-ops", type=int, required=True)
-    p.add_argument("--side", required=True)
+    p.add_argument("--evict-only", metavar="PATH")
+    p.add_argument("--path")
+    p.add_argument("--bytes", type=int)
+    p.add_argument("--chunk", type=int)
+    p.add_argument("--rand-ops", type=int)
+    p.add_argument("--side", default="")
+    p.add_argument(
+        "--phase",
+        choices=("all", "seq-write", "seq-read", "rand-write", "rand-read"),
+        default="all",
+    )
     args = p.parse_args()
+    if args.evict_only:
+        evict_file_cache(args.evict_only, sync=True)
+        return
+    missing = [
+        flag
+        for flag, value in (
+            ("--path", args.path),
+            ("--bytes", args.bytes),
+            ("--chunk", args.chunk),
+            ("--rand-ops", args.rand_ops),
+            ("--side", args.side),
+        )
+        if value in (None, "")
+    ]
+    if missing:
+        p.error("the following arguments are required: " + ", ".join(missing))
     rand_size = 4096
-    print(f"{args.side}: seq write first {args.bytes} bytes", file=sys.stderr, flush=True)
-    seq_write_first_ns = timed_seq_write(args.path, args.bytes, args.chunk, False)
-    print(f"{args.side}: seq write overwrite", file=sys.stderr, flush=True)
-    seq_write_overwrite_ns = timed_seq_write(args.path, args.bytes, args.chunk, True)
-    print(f"{args.side}: seq read cold", file=sys.stderr, flush=True)
-    evict_file_cache(args.path)
-    seq_read_cold_ns = timed_seq_read(args.path, args.chunk)
-    print(f"{args.side}: rand 4k write ops={args.rand_ops}", file=sys.stderr, flush=True)
-    evict_file_cache(args.path)
-    rand4k_write_ns = timed_rand(args.path, rand_size, args.rand_ops, True, 1)
-    print(f"{args.side}: rand 4k read ops={args.rand_ops}", file=sys.stderr, flush=True)
-    evict_file_cache(args.path)
-    rand4k_read_ns = timed_rand(args.path, rand_size, args.rand_ops, False, 2)
     result = {
         "side": args.side,
         "path": args.path,
@@ -255,12 +279,25 @@ def main():
         "chunk": args.chunk,
         "rand_ops": args.rand_ops,
         "rand_io": rand_size,
-        "seq_write_first_ns": seq_write_first_ns,
-        "seq_write_overwrite_ns": seq_write_overwrite_ns,
-        "seq_read_cold_ns": seq_read_cold_ns,
-        "rand4k_write_ns": rand4k_write_ns,
-        "rand4k_read_ns": rand4k_read_ns,
     }
+    run_all = args.phase == "all"
+    if run_all or args.phase == "seq-write":
+        print(f"{args.side}: seq write first {args.bytes} bytes", file=sys.stderr, flush=True)
+        result["seq_write_first_ns"] = timed_seq_write(args.path, args.bytes, args.chunk, False)
+        print(f"{args.side}: seq write overwrite", file=sys.stderr, flush=True)
+        result["seq_write_overwrite_ns"] = timed_seq_write(args.path, args.bytes, args.chunk, True)
+    if run_all or args.phase == "seq-read":
+        print(f"{args.side}: seq read cold", file=sys.stderr, flush=True)
+        evict_file_cache(args.path)
+        result["seq_read_cold_ns"] = timed_seq_read(args.path, args.chunk)
+    if run_all or args.phase == "rand-write":
+        print(f"{args.side}: rand 4k write ops={args.rand_ops}", file=sys.stderr, flush=True)
+        evict_file_cache(args.path)
+        result["rand4k_write_ns"] = timed_rand(args.path, rand_size, args.rand_ops, True, 1)
+    if run_all or args.phase == "rand-read":
+        print(f"{args.side}: rand 4k read ops={args.rand_ops}", file=sys.stderr, flush=True)
+        evict_file_cache(args.path)
+        result["rand4k_read_ns"] = timed_rand(args.path, rand_size, args.rand_ops, False, 2)
     json.dump(result, sys.stdout)
     sys.stdout.write("\n")
     sys.stdout.flush()
@@ -277,7 +314,7 @@ if [ "$CHUNK" -gt "$BYTES" ]; then
     exit 1
 fi
 
-echo "==> building rootfs + 256MiB overlay template"
+echo "==> building rootfs + ${OVERLAY_MIB}MiB overlay template"
 # flatten-ctl looks next to itself, then $PATH. Prefer the kuasar mkfs.erofs
 # (file cap cap_dac_override) over a distro copy that cannot read root-owned
 # dirs in the extracted image when we are not root.
@@ -293,22 +330,47 @@ if [ -z "$BLK0_IMAGE" ]; then
     command -v docker >/dev/null 2>&1 || skip "docker not available; provide BLK0_IMAGE=path/to/prebuilt.erofs"
     docker image inspect "$IMAGE" >/dev/null 2>&1 \
         || skip "docker image $IMAGE is not present locally; pull it yourself or set BLK0_IMAGE= (this test does not docker-pull)"
-    CACHE_IMG="$WORK_ROOT/cache/$(echo "$IMAGE" | tr '/:' '__').erofs"
+    CACHE_DIR="/tmp/e2e-cow-perf-cache"
+    CACHE_IMG="$CACHE_DIR/$(echo "$IMAGE" | tr '/:' '__').erofs"
     if [ -s "$CACHE_IMG" ]; then
         echo "==> reusing cached flatten $CACHE_IMG"
         BLK0_IMAGE="$CACHE_IMG"
     else
-        mkdir -p "$WORK_ROOT/cache"
+        mkdir -p "$CACHE_DIR"
         BLK0_IMAGE="$WORK/blk0.img"
         docker save "$IMAGE" | "$FLATTEN_CTL" export --output "$BLK0_IMAGE" --tmpdir "$WORK/tmp" --no-progress
         cp -f "$BLK0_IMAGE" "$CACHE_IMG"
         BLK0_IMAGE="$CACHE_IMG"
     fi
 fi
-BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
+# flatten-ctl writes .kuasar.sha256.<hex>; the shared e2e helper only
+# accepts .kuasar.digest.<hex>. Read whichever marker is on the artifact.
+blk0_tarstream_ref() {
+    local path="$1" listing marker scheme digest
+    if [ ! -f "$path" ]; then
+        echo "plaintext tarstream does not exist: $path" >&2
+        return 1
+    fi
+    if ! listing="$(tar -tf "$path")"; then
+        echo "failed to inspect plaintext tarstream: $path" >&2
+        return 1
+    fi
+    marker="$(grep -E '^\.kuasar\.(digest|sha256)\.[0-9a-f]{64}$' <<<"$listing" || true)"
+    if [ "$(grep -c . <<<"$marker")" != 1 ]; then
+        echo "plaintext tarstream must contain exactly one digest marker: $path" >&2
+        return 1
+    fi
+    case "$marker" in
+        .kuasar.digest.*) scheme=digest; digest="${marker#.kuasar.digest.}" ;;
+        .kuasar.sha256.*) scheme=sha256; digest="${marker#.kuasar.sha256.}" ;;
+        *) echo "plaintext tarstream must contain exactly one digest marker: $path" >&2; return 1 ;;
+    esac
+    printf 'file://%s@%s:%s\n' "$path" "$scheme" "$digest"
+}
+BLK0_REF="$(blk0_tarstream_ref "$BLK0_IMAGE")"
 
 TEMPLATE="$WORK/overlay.ext4"
-truncate -s 256M "$TEMPLATE"
+truncate -s "${OVERLAY_MIB}M" "$TEMPLATE"
 mkfs.ext4 -q -F "$TEMPLATE"
 
 cat > "$WORK/sandbox.yaml" <<EOF
@@ -331,8 +393,12 @@ EOF
 
 STATS_JSON="${PERF_STATS_JSON:-$WORK/stats.json}"
 RESULTS_JSON="${PERF_RESULTS_JSON:-$WORK/perf-results.json}"
-under_repo "$STATS_JSON" || { echo "==> FAIL: PERF_STATS_JSON must be under $REPO_ROOT (got $STATS_JSON)" >&2; exit 1; }
-under_repo "$RESULTS_JSON" || { echo "==> FAIL: PERF_RESULTS_JSON must be under $REPO_ROOT (got $RESULTS_JSON)" >&2; exit 1; }
+if [ -n "${PERF_STATS_JSON:-}" ]; then
+    under_repo "$STATS_JSON" || { echo "==> FAIL: PERF_STATS_JSON must be under $REPO_ROOT (got $STATS_JSON)" >&2; exit 1; }
+fi
+if [ -n "${PERF_RESULTS_JSON:-}" ]; then
+    under_repo "$RESULTS_JSON" || { echo "==> FAIL: PERF_RESULTS_JSON must be under $REPO_ROOT (got $RESULTS_JSON)" >&2; exit 1; }
+fi
 LOG="$WORK/run.log"
 echo "==> launching sandbox-ctl run (sid=$SID, IO=${IO_MIB}MiB)"
 # Run sandbox-ctl directly (not under GNU timeout) so SIGTERM reaches it and
@@ -372,27 +438,82 @@ echo "==> install io_bench.py in guest"
 "$SANDBOX_CTL" exec --stdin --sandbox-id "$SID" --run-root "$RR" -- \
     /bin/sh -c 'cat > /cow-io-bench.py' < "$WORK/io_bench.py"
 
-echo "==> guest (internal) I/O through vhost-user-blk COW"
-set +e
-ex -- python3 /cow-io-bench.py \
-    --path /cow-io.bin \
-    --bytes "$BYTES" \
-    --chunk "$CHUNK" \
-    --rand-ops "$RAND_OPS" \
-    --side guest \
-    > "$WORK/guest.out" 2>"$WORK/guest.err"
-GUEST_RC=$?
-set -e
-if [ "$GUEST_RC" -ne 0 ]; then
-    echo "==> FAIL: guest bench exited $GUEST_RC"
-    sed 's/^/    /' "$WORK/guest.err" "$WORK/guest.out"
-    tail -40 "$LOG"
+# Auto-default overlay upper: --base-root/<sid>/<sid>.overlay.diff. Guest
+# posix_fadvise only drops guest page cache; BlockCOW keeps this file open
+# with buffered I/O, so cold reads must also DONTNEED it on the host.
+DIFF_PATH="$BASE_ROOT/$SID/$SID.overlay.diff"
+[ -f "$DIFF_PATH" ] || {
+    echo "==> FAIL: expected overlay diff at $DIFF_PATH"
+    find "$BASE_ROOT" -type f 2>/dev/null | sed 's/^/    /' || true
     exit 1
-fi
-sed 's/^/    /' "$WORK/guest.err" || true
-grep -E '^\{' "$WORK/guest.out" | tail -1 > "$WORK/guest.json"
-python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$WORK/guest.json" \
-    || { echo "==> FAIL: guest bench stdout is not JSON"; sed 's/^/    /' "$WORK/guest.out"; exit 1; }
+}
+
+evict_host_cow() {
+    echo "==> evict host-side COW overlay cache ($DIFF_PATH)"
+    python3 "$WORK/io_bench.py" --evict-only "$DIFF_PATH"
+}
+
+run_guest_phase() {
+    local phase="$1"
+    echo "==> guest (internal) I/O through vhost-user-blk COW: $phase"
+    set +e
+    ex -- python3 /cow-io-bench.py \
+        --phase "$phase" \
+        --path /cow-io.bin \
+        --bytes "$BYTES" \
+        --chunk "$CHUNK" \
+        --rand-ops "$RAND_OPS" \
+        --side guest \
+        > "$WORK/guest-${phase}.out" 2>"$WORK/guest-${phase}.err"
+    local rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        echo "==> FAIL: guest bench phase $phase exited $rc"
+        sed 's/^/    /' "$WORK/guest-${phase}.err" "$WORK/guest-${phase}.out"
+        tail -40 "$LOG"
+        exit 1
+    fi
+    sed 's/^/    /' "$WORK/guest-${phase}.err" || true
+    grep -E '^\{' "$WORK/guest-${phase}.out" | tail -1 > "$WORK/guest-${phase}.json"
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$WORK/guest-${phase}.json" \
+        || { echo "==> FAIL: guest bench phase $phase stdout is not JSON"; sed 's/^/    /' "$WORK/guest-${phase}.out"; exit 1; }
+}
+
+run_guest_phase seq-write
+evict_host_cow
+run_guest_phase seq-read
+evict_host_cow
+run_guest_phase rand-write
+evict_host_cow
+run_guest_phase rand-read
+python3 - \
+    "$WORK/guest-seq-write.json" \
+    "$WORK/guest-seq-read.json" \
+    "$WORK/guest-rand-write.json" \
+    "$WORK/guest-rand-read.json" \
+    "$WORK/guest.json" <<'PY'
+import json
+import sys
+
+*inputs, dest = sys.argv[1:]
+merged = {}
+for path in inputs:
+    with open(path, encoding="utf-8") as fh:
+        merged.update(json.load(fh))
+required = (
+    "seq_write_first_ns",
+    "seq_write_overwrite_ns",
+    "seq_read_cold_ns",
+    "rand4k_write_ns",
+    "rand4k_read_ns",
+)
+missing = [key for key in required if key not in merged]
+if missing:
+    raise SystemExit(f"FAIL: merged guest JSON missing {missing}")
+with open(dest, "w", encoding="utf-8") as fh:
+    json.dump(merged, fh)
+    fh.write("\n")
+PY
 
 echo "==> host (external) I/O on the overlay's filesystem"
 set +e
@@ -416,8 +537,14 @@ echo "==> stopping sandbox to harvest --stats-json"
 kill -TERM "$SBPID" 2>/dev/null || true
 set +e
 wait "$SBPID"
+SB_RC=$?
 set -e
 SBPID=""
+if [ "$SB_RC" -ne 0 ]; then
+    echo "==> FAIL: sandbox-ctl exited $SB_RC after SIGTERM (want 0)"
+    tail -60 "$LOG"
+    exit 1
+fi
 sleep 0.2
 
 RESULTS_JSON="${PERF_RESULTS_JSON:-$WORK/perf-results.json}"
@@ -515,32 +642,41 @@ print()
 print("    loss % = (1 - guest_rate / host_rate) * 100")
 print("    Positive loss = guest is slower (expected). Negative = guest faster.")
 print("    seq write (first) includes COW 4K materialize; overwrite is dirty-page.")
-print("    Reads evict only the bench file from page cache (posix_fadvise), not the host.")
+print("    Cold reads: guest posix_fadvise on the bench file, plus host posix_fadvise")
+print("    on the live BlockCOW overlay.diff (buffered I/O) between guest phases.")
 
 if vhost is None:
     print()
-    print("==> WARN: --stats-json missing blk1/COW backend (sandbox may not have flushed stats)")
-else:
-    wr, rd = vhost["write"], vhost["read"]
-    extra = vhost.get("extra") or {}
-    print()
-    print(f"==> vhost {vhost['name']} (COW overlay) from --stats-json")
-    print(f"    write: count={wr['count']} bytes={wr['bytes']} err={wr['err_count']} "
-          f"p50={wr['p50_ns']/1000:.1f}us p99={wr['p99_ns']/1000:.1f}us max={wr['lat_max_ns']/1000:.1f}us")
-    print(f"    read:  count={rd['count']} bytes={rd['bytes']} err={rd['err_count']} "
-          f"p50={rd['p50_ns']/1000:.1f}us p99={rd['p99_ns']/1000:.1f}us max={rd['lat_max_ns']/1000:.1f}us")
-    if extra:
-        dirty = extra.get("diff_dirty_blocks")
-        total = extra.get("diff_total_blocks")
-        pct = extra.get("diff_dirty_percent")
-        print(f"    dirty: {dirty}/{total} blocks ({pct}%)")
-
-    if wr["count"] <= 0 or wr["bytes"] < guest["bytes"]:
+    if stats is None:
         raise SystemExit(
-            f"FAIL: COW backend wrote count={wr['count']} bytes={wr['bytes']}; "
-            f"expected guest sequential writes of {guest['bytes']} bytes"
+            f"FAIL: --stats-json missing or empty at {stats_path}; "
+            "cannot verify guest writes reached the vhost-user-blk COW backend"
         )
-    print("==> PASS: guest writes reached the vhost-user-blk COW backend")
+    raise SystemExit(
+        "FAIL: --stats-json has no blk1/COW backend; "
+        "cannot verify guest writes reached BlockCOW"
+    )
+
+wr, rd = vhost["write"], vhost["read"]
+extra = vhost.get("extra") or {}
+print()
+print(f"==> vhost {vhost['name']} (COW overlay) from --stats-json")
+print(f"    write: count={wr['count']} bytes={wr['bytes']} err={wr['err_count']} "
+      f"p50={wr['p50_ns']/1000:.1f}us p99={wr['p99_ns']/1000:.1f}us max={wr['lat_max_ns']/1000:.1f}us")
+print(f"    read:  count={rd['count']} bytes={rd['bytes']} err={rd['err_count']} "
+      f"p50={rd['p50_ns']/1000:.1f}us p99={rd['p99_ns']/1000:.1f}us max={rd['lat_max_ns']/1000:.1f}us")
+if extra:
+    dirty = extra.get("diff_dirty_blocks")
+    total = extra.get("diff_total_blocks")
+    pct = extra.get("diff_dirty_percent")
+    print(f"    dirty: {dirty}/{total} blocks ({pct}%)")
+
+if wr["count"] <= 0 or wr["bytes"] < guest["bytes"]:
+    raise SystemExit(
+        f"FAIL: COW backend wrote count={wr['count']} bytes={wr['bytes']}; "
+        f"expected guest sequential writes of {guest['bytes']} bytes"
+    )
+print("==> PASS: guest writes reached the vhost-user-blk COW backend")
 
 doc = {
     "guest": guest,
