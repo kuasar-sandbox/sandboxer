@@ -5,10 +5,20 @@ import (
 	"fmt"
 )
 
+// ApplyFromOptions selects the explicit run-from derivation contract.
+type ApplyFromOptions struct {
+	// ReplaceBoot discards the source artifact's complete boot definition and
+	// uses the host boot as one atomic value. The returned portable C0 is nil so
+	// callers take the ordinary explicit-cold projection path and retain no
+	// source parent provenance.
+	ReplaceBoot bool
+}
+
 // ApplyFromRules applies one presence-aware host/instance document to a
-// Sandbox artifact. It returns the runtime config and immutable portable C0.
-// Artifact disk topology is never merged through the generic YAML loader.
-func ApplyFromRules(artifact *PortableSandboxConfig, host *SandboxConfig, presence FieldPresence) (*SandboxConfig, *PortableSandboxConfig, error) {
+// Sandbox artifact. Normal inheritance returns the runtime config and immutable
+// source-derived C0. ReplaceBoot returns a fully materialized explicit-cold
+// config and a nil C0; artifact boot fields are never partially merged.
+func ApplyFromRules(artifact *PortableSandboxConfig, host *SandboxConfig, presence FieldPresence, options ApplyFromOptions) (*SandboxConfig, *PortableSandboxConfig, error) {
 	if artifact == nil {
 		return nil, nil, errors.New("run --from: missing Sandbox portable config")
 	}
@@ -18,8 +28,10 @@ func ApplyFromRules(artifact *PortableSandboxConfig, host *SandboxConfig, presen
 	if err := artifact.Validate(); err != nil {
 		return nil, nil, err
 	}
-	if err := validateFromProtectedFields(artifact, host, presence); err != nil {
-		return nil, nil, err
+	if !options.ReplaceBoot {
+		if err := validateFromProtectedFields(artifact, host, presence); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	c0, err := artifact.Clone()
@@ -27,13 +39,17 @@ func ApplyFromRules(artifact *PortableSandboxConfig, host *SandboxConfig, presen
 		return nil, nil, err
 	}
 	applyPersistentFromOverrides(c0, host, presence)
-	if err := c0.Validate(); err != nil {
-		return nil, nil, fmt.Errorf("run --from persistent override: %w", err)
-	}
 
 	runtime := sandboxConfigFromPortable(c0)
-	runtime.Boot.Kernel = host.Boot.Kernel
-	runtime.Boot.Runtime = host.Boot.Runtime
+	if options.ReplaceBoot {
+		runtime.Boot = cloneBootConfig(host.Boot)
+	} else {
+		if err := c0.Validate(); err != nil {
+			return nil, nil, fmt.Errorf("run --from persistent override: %w", err)
+		}
+		runtime.Boot.Kernel = host.Boot.Kernel
+		runtime.Boot.Runtime = host.Boot.Runtime
+	}
 	if runtime.Boot.Kernel == "" {
 		return nil, nil, errors.New("run --from: host boot.kernel binding is required")
 	}
@@ -72,7 +88,35 @@ func ApplyFromRules(artifact *PortableSandboxConfig, host *SandboxConfig, presen
 	}
 
 	applyActiveDiskBindings(runtime, host)
+	if options.ReplaceBoot {
+		if err := runtime.ValidateCold(); err != nil {
+			return nil, nil, fmt.Errorf("run --from replacement config: %w", err)
+		}
+		return runtime, nil, nil
+	}
 	return runtime, c0, nil
+}
+
+func cloneBootConfig(in BootConfig) BootConfig {
+	out := in
+	out.Root = cloneRootConfig(in.Root)
+	out.Disks = make([]DiskConfig, len(in.Disks))
+	for i := range in.Disks {
+		out.Disks[i] = in.Disks[i]
+		out.Disks[i].RootConfig = cloneRootConfig(in.Disks[i].RootConfig)
+	}
+	return out
+}
+
+func cloneRootConfig(in RootConfig) RootConfig {
+	out := in
+	out.BaseFromRefs = append([]string(nil), in.BaseFromRefs...)
+	if in.Overlay != nil {
+		overlay := *in.Overlay
+		overlay.BaseFromRefs = append([]string(nil), in.Overlay.BaseFromRefs...)
+		out.Overlay = &overlay
+	}
+	return out
 }
 
 func applyPersistentFromOverrides(c0 *PortableSandboxConfig, host *SandboxConfig, presence FieldPresence) {

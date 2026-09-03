@@ -90,6 +90,10 @@ sandbox-ctl run --config sandbox.yaml --sandbox-id s1
 # Cold start from Sandbox E.
 sandbox-ctl run --from ./s1.sandbox --config host.yaml --sandbox-id s2
 
+# Cold derivation from Sandbox E defaults with a completely new boot graph.
+sandbox-ctl run --from ./s1.sandbox --replace-boot \
+  --config replacement.yaml --sandbox-id s2-rebased
+
 # Resume memory execution state from Snapshot S.
 sandbox-ctl run --restore ./s1.snapshot --config restore-host.yaml --sandbox-id s3
 ```
@@ -127,6 +131,7 @@ root/data disk 的默认 writable diff 位于 PathID 派生的 BaseDir，但文�
 
 - 普通 run:完整显式 cold config.
 - `--from`:host/instance overlay;portable workload 来自 E.
+- `--from --replace-boot`:E 只提供 non-boot portable defaults;host config 必须提供完整 boot.
 - `--restore`:host-only restore bindings/policy;执行状态和 portable workload 来自 S 引用的 E.
 
 `--config a.yaml:b.yaml` 继续按顺序 merge. `SANDBOX_CONFIG` 可替代 `--config`. `LoadConfigBytesWithPresence` 为 config-socket 等内存入口提供相同的 presence-aware 规则.
@@ -451,6 +456,9 @@ explicit cold config + persistent fields + canonical identities
 E.sandbox.runtime.cfg + allowed persistent overrides
   + canonical host bindings - ephemeral = C0 for run --from
 
+E.sandbox.runtime.cfg non-boot defaults + allowed persistent overrides
+  + complete replacement boot - ephemeral = a new explicit-cold C0
+
 S.sandbox_ref -> E.sandbox.runtime.cfg
   + allowed restore host bindings = C0 for run --restore
 ```
@@ -499,6 +507,8 @@ root:
 ```
 
 `run --from` 通过 source binding 把 `self` 绑定到当前 E payload. Export C1 先把 C0 的旧 `self` 物化为原 source ref,再把新 root payload 位置设为 `self`;这避免 E digest 自引用循环.
+
+`run --from --replace-boot` 不建立 source binding. 来源 E 在读取 non-boot defaults 后即不再参与 run；新的 root active writable layer 经普通 explicit-cold projection 占据唯一 `self`. 后续 export/snapshot 因此不会把来源 E 当作 disk parent 或 dependency.
 
 父 `.sandbox` 出现在 disk-ref 字段时只提供 `Payload`:
 
@@ -705,6 +715,20 @@ portable interface       == explicitly supplied host interface
 Direct EROFS E只有 read-only image. 目标 host必须提供 pre-formatted `diff_template`,或已格式化的 explicit diff. 缺少可挂载 upper时在 controller/network/CH side effect 前失败.
 
 最终调用普通 `sandbox.Run`;`run --from` 不进入 `restore.Run`.
+
+默认 `run --from` 继续执行上述强 ownership rules. `--replace-boot` 只选择另一条显式、原子的 cold derivation:
+
+```text
+source E 的 non-boot portable defaults
+  + presence-aware persistent overrides
+  + host config 的完整 boot 值
+  + host/instance-only bindings
+  -> ordinary ValidateCold / artifact preflight / ProjectPortableCold
+```
+
+完整 replacement 同时覆盖 `boot.kernel`、`boot.runtime`、`boot.cmdline`、`boot.root` 和整个 `boot.disks[]`;不存在 root-only 或 leaf-level graph merge. Host config 没有写 `boot.disks` 就表示零个 data disk，而不是继承来源 disks. 若来源 mounts 仍引用已移除或改名的 disk，调用方必须同时替换 mounts；普通 cold disk/mount 1:1 validation 会在 controller、cgroup、run directory、network 或 VM side effect 前拒绝不一致结果.
+
+Replacement 不复用来源 E 的 kernel/runtime 默认 binding、`self`、`RunSourceBinding` 或 Bundle reader/fetcher. Host boot refs仍通过普通 cold canonicalization、local crypto、Manifest/Bundle lookup和preflight. 生成的新 C0及后续 E/S disk closure只依赖replacement boot. `--replace-boot` 必须与`--from`和显式`--config`（或`SANDBOX_CONFIG`）一起使用，且永远不能与`--restore`一起使用.
 
 ## 6. Export 与 snapshot 数据流
 
@@ -1091,6 +1115,7 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 ### 13.3 CLI mutual exclusion
 
 - `run --from` 与 `--restore` 互斥.
+- `run --replace-boot` 仅允许与`--from`一起使用，要求host config，并拒绝`--restore`.
 - export/snapshot都要求`--output`与`--upload`二选一.
 - Explicit `--mode` 与 `--upload`互斥.
 - Live export拒绝`--config`;offline export要求`--from + --config`且拒绝`--resume`.
