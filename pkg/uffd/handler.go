@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"runtime"
 	"sort"
@@ -728,14 +727,19 @@ func (h *Handler) runWorker(idx int) {
 	}
 }
 
+// pageIdxHash spreads page indices across worker queues. Same page idx
+// always maps to the same worker (same-page convergence). The splitmix64
+// finalizer is branch-free arithmetic the compiler inlines at the call
+// site — unlike a per-fault FNV hasher behind hash.Hash64 interface
+// dispatch — and mixes well enough that stride workloads don't pile onto
+// one queue regardless of worker count.
 func pageIdxHash(idx uint64) uint64 {
-	h := fnv.New64a()
-	var b [8]byte
-	for i := 0; i < 8; i++ {
-		b[i] = byte(idx >> (i * 8))
-	}
-	_, _ = h.Write(b[:])
-	return h.Sum64()
+	idx ^= idx >> 30
+	idx *= 0xbf58476d1ce4e5b9
+	idx ^= idx >> 27
+	idx *= 0x94d049bb133111eb
+	idx ^= idx >> 31
+	return idx
 }
 
 // Stats returns a snapshot of counter values for diagnostics.
