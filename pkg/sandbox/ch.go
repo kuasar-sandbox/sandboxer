@@ -151,9 +151,7 @@ func chNetArg(tapName string, tapFDNum int, mac string) string {
 	case tapFDNum > 0:
 		return fmt.Sprintf("fd=%d%s,id=_net0,iommu=off", tapFDNum, macPart)
 	case tapName != "":
-		// id=_net0 matches the fd-mode layout so that restore can rebind
-		// a fresh queue fd via --restore net_fds (sandboxer#161).
-		return fmt.Sprintf("tap=%s%s,id=_net0,iommu=off", tapName, macPart)
+		return fmt.Sprintf("tap=%s%s,iommu=off", tapName, macPart)
 	default:
 		return ""
 	}

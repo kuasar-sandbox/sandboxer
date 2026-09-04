@@ -188,8 +188,8 @@ func TestCHCommand_TapNameModeMirrorsMAC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if joined := strings.Join(args, " "); !strings.Contains(joined, "--net tap=tap0,mac=02:00:00:00:80:01,id=_net0,iommu=off") {
-		t.Errorf("tap-mode --net should carry mac and the _net0 id (restore net_fds rebind addresses it), got: %s", joined)
+	if joined := strings.Join(args, " "); !strings.Contains(joined, "--net tap=tap0,mac=02:00:00:00:80:01,iommu=off") {
+		t.Errorf("tap-mode --net should carry mac, got: %s", joined)
 	}
 }
 

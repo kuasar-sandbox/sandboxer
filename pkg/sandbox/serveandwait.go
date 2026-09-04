@@ -54,9 +54,6 @@ type CmdEnv struct {
 	// no network). NetMAC is the effective virtio-net MAC the cmd builder puts
 	// in CH's --net mac= (tapfd metadata override or config). See docs/sandbox.md.
 	TapFDNum int
-	// TapFDNums lists the CH-visible fds of ALL inherited tap queues
-	// (cmd.ExtraFiles after memfd → 4, 5, …), for --restore net_fds.
-	TapFDNums []int
 	NetMAC   string
 }
 
@@ -132,12 +129,6 @@ type VMParams struct {
 	// fd 4) and surfaces CmdEnv.TapFDNum=4; the caller closes it after the run.
 	// NetMAC is the effective virtio-net MAC, surfaced as CmdEnv.NetMAC.
 	TapFile *os.File
-
-	// TapFiles, when non-empty, are additional tap queue fds bound by the
-	// caller (restore tap-name mode, sandboxer#161): fd 4 is TapFile's slot
-	// contract — here the whole set lands at fds 4.. and CmdEnv.TapFDNums
-	// carries the CH-visible numbers for --restore net_fds.
-	TapFiles []*os.File
 	NetMAC  string
 
 	// Cgroup, when active, creates CH directly in the per-sandbox cgroup.
@@ -586,13 +577,8 @@ func ServeAndWait(p VMParams) (int, error) {
 	// memfd is cmd.ExtraFiles[0] → CH fd 3; an optional tapfd-handoff queue
 	// fd is appended next → CH fd 4 (referenced by --net fd= / restore net_fds).
 	tapFDNum := 0
-	tapFDNums := []int{}
 	if p.TapFile != nil {
 		tapFDNum = 4
-		tapFDNums = append(tapFDNums, 4)
-	}
-	for range p.TapFiles {
-		tapFDNums = append(tapFDNums, 4+len(tapFDNums))
 	}
 	// CH --disk args in device order (root first, then data disks); BuildCmd
 	// (CHCommand / restore config rewrite) emits one --disk per entry.
@@ -608,7 +594,6 @@ func ServeAndWait(p VMParams) (int, error) {
 		UffdSock:  uffdSockPath,
 		RunDir:    runDir,
 		TapFDNum:  tapFDNum,
-		TapFDNums: tapFDNums,
 		NetMAC:    p.NetMAC,
 	})
 	if err != nil {
@@ -624,9 +609,6 @@ func ServeAndWait(p VMParams) (int, error) {
 	cmd.ExtraFiles = []*os.File{memfd.File()}
 	if p.TapFile != nil {
 		cmd.ExtraFiles = append(cmd.ExtraFiles, p.TapFile) // CH fd 4
-	}
-	for _, tf := range p.TapFiles {
-		cmd.ExtraFiles = append(cmd.ExtraFiles, tf) // CH fds 5.. (or 4.. when TapFile is nil)
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := p.Cgroup.ConfigureSysProcAttr(cmd.SysProcAttr); err != nil {
