@@ -359,11 +359,7 @@ func (t *locationPublishTarget) publishFreshBundle(ctx context.Context, created 
 			if err != nil {
 				return fmt.Errorf("open source: %w", err)
 			}
-			err = source.Sync()
-			var copied int64
-			if err == nil {
-				copied, err = copyLocationFile(ctx, destination, source)
-			}
+			copied, err := copyLocationFile(ctx, destination, source)
 			if err == nil && copied != sourceInfo.Size() {
 				err = io.ErrUnexpectedEOF
 			}
@@ -373,7 +369,7 @@ func (t *locationPublishTarget) publishFreshBundle(ctx context.Context, created 
 			return nil
 		},
 		func(destination locationReadFile, info os.FileInfo) error {
-			if err := t.validateOpenedBundleCopy(ctx, item, destination, info, false); err != nil {
+			if err := t.validateOpenedBundleCopy(ctx, item, destination, info); err != nil {
 				return fmt.Errorf("validate copied final: %w", err)
 			}
 			return nil
@@ -391,11 +387,8 @@ func (t *locationPublishTarget) reuseExistingBundle(ctx context.Context, file lo
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := t.validateBundleCopy(ctx, file, true)
+		err := t.validateBundleCopy(ctx, file)
 		if err == nil {
-			if err := t.fs.syncDirectory(t.directory); err != nil {
-				return fmt.Errorf("sync parent directory after reuse: %w", err)
-			}
 			return nil
 		}
 		if os.IsNotExist(err) || errors.Is(err, errLocationFinalVanished) {
@@ -422,7 +415,7 @@ func (t *locationPublishTarget) reuseExistingBundle(ctx context.Context, file lo
 	}
 }
 
-func (t *locationPublishTarget) validateBundleCopy(ctx context.Context, file locationBundleFile, syncFile bool) (retErr error) {
+func (t *locationPublishTarget) validateBundleCopy(ctx context.Context, file locationBundleFile) (retErr error) {
 	destination, err := t.fs.openNoFollow(file.destination)
 	if err != nil {
 		return err
@@ -432,7 +425,7 @@ func (t *locationPublishTarget) validateBundleCopy(ctx context.Context, file loc
 	if err != nil {
 		return err
 	}
-	if err := t.validateOpenedBundleCopy(ctx, file, destination, destinationInfo, syncFile); err != nil {
+	if err := t.validateOpenedBundleCopy(ctx, file, destination, destinationInfo); err != nil {
 		return err
 	}
 	current, err := t.fs.lstat(file.destination)
@@ -445,7 +438,7 @@ func (t *locationPublishTarget) validateBundleCopy(ctx context.Context, file loc
 	return nil
 }
 
-func (t *locationPublishTarget) validateOpenedBundleCopy(ctx context.Context, file locationBundleFile, destination locationReadFile, destinationInfo os.FileInfo, syncFile bool) (retErr error) {
+func (t *locationPublishTarget) validateOpenedBundleCopy(ctx context.Context, file locationBundleFile, destination locationReadFile, destinationInfo os.FileInfo) (retErr error) {
 	source, sourceInfo, closeSource, err := t.openBundleSource(file)
 	if err != nil {
 		return err
@@ -476,11 +469,6 @@ func (t *locationPublishTarget) validateOpenedBundleCopy(ctx context.Context, fi
 	}
 	if err := compareLocationFiles(ctx, source, destination); err != nil {
 		return classifyLocationContentError(err)
-	}
-	if syncFile {
-		if err := destination.Sync(); err != nil {
-			return fmt.Errorf("sync existing final: %w", err)
-		}
 	}
 	return nil
 }

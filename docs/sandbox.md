@@ -48,7 +48,7 @@ memory snapshot          ──> E + S, S is operation root
 | Manifest | `manifest://<key>` | chunk/Manifest encryption 和 verification 由 manifest config 控制 |
 | Manifest Bundle | `file://<bundle>@manifest:<key>` | 一个 ZIP64 Bundle 可承载 root 及完整依赖 Manifest graph |
 
-Local 模式物化的内容寻址文件名为 `<digest>.<role>`,其中immutable root carrier使用`.image`,`.overlay`只表示单独物化的可写disk layer. 当前root writable top已经是Sandbox E的payload,不会再复制为`.overlay`. Provisioned container image输入仍可使用`.erofs`等显式basename. `<sid>.sandbox` 和 `<sid>.snapshot` 是成功 commit 后更新的语义 symlink. Bundle 模式下语义 symlink 指向承载 root Manifest 的 `<key>.bundle`. Alias 的 SID 必须是单一安全 path component;commit 使用临时 symlink + atomic rename + directory fsync,并拒绝覆盖已有 regular file 或 directory. 这些是节点本地 output 语义;named ref-location 使用 §11.2 的独立 shared-location commit protocol,不创建 alias.
+Local 模式物化的内容寻址文件名为 `<digest>.<role>`,其中immutable root carrier使用`.image`,`.overlay`只表示单独物化的可写disk layer. 当前root writable top已经是Sandbox E的payload,不会再复制为`.overlay`. Provisioned container image输入仍可使用`.erofs`等显式basename. `<sid>.sandbox` 和 `<sid>.snapshot` 是成功 commit 后更新的语义 symlink. Bundle 模式下语义 symlink 指向承载 root Manifest 的 `<key>.bundle`. Alias 的 SID 必须是单一安全 path component;commit 使用临时 symlink + atomic rename,并拒绝覆盖已有 regular file 或 directory. 这些是节点本地 output 语义;named ref-location 使用 §11.2 的独立 shared-location commit protocol,不创建 alias.
 
 Block backend、restore 和 publisher 先打开 carrier,再按逻辑角色解析内容. 外层 ZIP magic 只说明 carrier 是 Bundle,不说明 logical role.
 
@@ -1022,17 +1022,17 @@ Local immutable artifact支持 `crypto.local=off|auto|required`:
 - `auto`:自动识别plaintext或KDXTS encrypted tarstream;新输出按配置codec.
 - `required`:拒绝plaintext和未绑定key的identity;identity使用`hmac`.
 
-Existing-file reuse必须重新验证role、logical size、content identity和完整stream. Local output与named ref-location的commit策略刻意分离.
+Existing-file reuse必须重新验证role、logical size、content identity和完整stream. Local output与named ref-location的commit策略刻意分离. Artifact capture/publication只定义logical completion,不定义stable-storage durability:local output依赖完整写入、`Close()`检查、内容寻址no-replace rename与alias atomic rename;named-location依赖`O_EXCL`写入、`Close()`检查、最终路径reopen/full verification与路径身份检查. 两者都不执行显式file/directory flush,物理写回由文件系统或底层存储实现定义.
 
 #### Local output
 
-`snapshot/export --output` 的 `FileSink` 在output directory中写unique same-directory temp,执行file `Sync` + `Close`,再以`renameat2(RENAME_NOREPLACE)`完成O(1) final commit. `BundleSink`同样以当前atomic no-replace rename提交完整Bundle;两条本地路径都不会为了final commit再读取并复制完整artifact. Root成功后,semantic alias用随机temporary symlink + atomic rename更新. Alias target和existing entry都以`NOFOLLOW`/`lstat` fail closed,不会把regular file或directory替换成symlink;file与directory fsync完成后才算commit. 因此local output要求节点本地filesystem提供这些atomic rename和symlink语义.
+`snapshot/export --output` 的 `FileSink` 在output directory中写unique same-directory temp,完整写入并检查`Close`错误,再以`renameat2(RENAME_NOREPLACE)`完成O(1) final commit. `BundleSink`同样以当前atomic no-replace rename提交完整Bundle;两条本地路径都不会为了final commit再读取并复制完整artifact. Root成功后,semantic alias用随机temporary symlink + atomic rename更新. Alias target和existing entry都以`NOFOLLOW`/`lstat` fail closed,不会把regular file或directory替换成symlink;commit由完整写入、`Close()`检查与atomic rename定义,不执行显式file/directory fsync. 因此local output要求节点本地filesystem提供这些atomic rename和symlink语义.
 
 #### Named ref-location
 
 `publish/upload-snapshot --to-ref-location`不复用`FileSink`或`BundleSink`. Tarstream carrier在自身marker中保存payload boundary和payload commitment;完整读取会用payload bytes复验该声明. 打开carrier后可直接提供identity. E/S只替换dense metadata tail时,carrier用旧payload commitment和新tail以O(tail)工作量推导新identity,不读取GiB级payload,也没有首次`io.Discard`编码. Location target取得carrier给出的scheme/digest后,以`O_CREATE|O_EXCL`直接创建`<digest>.image|overlay|sandbox|snapshot`;canonical encoding是shared target中的唯一完整write. `.image`承载immutable root image,`.overlay`只承载独立的writable disk dependency;Sandbox E payload不会重复发布为`.overlay`. Plaintext输出使用`@digest`,codec-backed输出使用`@hmac`. Target directory中没有完整temp/staging副本,也不创建`<sid>.sandbox`、`<sid>.snapshot`或任何其他semantic alias.
 
-Fresh final固定`0644`. `tarstream.WriteTo`在唯一一次写入过程中检查source read和destination write,并重新产生与carrier预先提供值一致的scheme/digest;随后执行file `Sync`,在owned write fd仍打开时以`lstat` + `SameFile`确认canonical path仍指向本次`O_EXCL`创建的inode,再执行`Close`. Publisher随后以`O_RDONLY|O_NOFOLLOW`重新打开并完整验证regular file、role/payload name、logical size、canonical tarstream、marker、codec、crypto policy、digest scheme/digest和完整sequential stream,最后同步parent directory. Existing final走同一完整验证,并在同一read-only fd上`Sync`;验证成功后直接复用,inode和bytes不改变.
+Fresh final固定`0644`. `tarstream.WriteTo`在唯一一次写入过程中检查source read和destination write,并重新产生与carrier预先提供值一致的scheme/digest;在owned write fd仍打开时以`lstat` + `SameFile`确认canonical path仍指向本次`O_EXCL`创建的inode,再执行`Close`. Publisher随后以`O_RDONLY|O_NOFOLLOW`重新打开并完整验证regular file、role/payload name、logical size、canonical tarstream、marker、codec、crypto policy、digest scheme/digest和完整sequential stream. Existing final走同一完整验证;验证成功后直接复用,inode和bytes不改变.
 
 Manifest Bundle不进入tarstream E/S重建路径. Carrier以root Manifest key提供`@manifest` identity;location target先强制验证所选Manifest closure、recorded admission、physical keys和crypto domain,再对same-directory依赖Bundle按顺序做exact byte copy,root `<key>.bundle`最后发布. 每个共享final仍只写一次,copy后重新打开、验证canonical Bundle/root并与source逐字节比较,最后在target fd上再次强制验证所选closure. 该路径不创建`.snapshot/.sandbox`替身,也不改写Bundle内的`snapshot.cfg`.
 
@@ -1048,7 +1048,7 @@ logical source
   -> Manifest ingest with fixed write admission/customer key
   -> Bundle root finalize + FullVerify in target-directory temporary file
   -> exclusive-create content-addressed <root>.bundle
-  -> reopen/strict validate + file/directory fsync
+  -> reopen/strict validate
   -> file://<root>.bundle@manifest:<root>#<location>
 ```
 
@@ -1057,7 +1057,7 @@ logical source
 只含这个 logical root 的 Manifest/chunks；root logical role由 typed调用点决定，reader
 仍以 strict image 或 Sandbox parser验证。existing same-key final必须与新生成 Bundle 的
 admission、root、crypto和exact bytes全部一致才可复用；并发writer使用与普通 named
-publication 相同的有限等待、exclusive-create、full validation和directory durability
+publication 相同的有限等待、exclusive-create和full validation
 协议收敛。失败或取消不返回 ref，并清理自身 target-directory temporary file与
 owned incomplete final。
 
@@ -1067,7 +1067,7 @@ role-specific payload 与 sparse envelope，使用 `@digest`/`@hmac` identity；
 `@manifest` root identity。single-root Bundle publication不得先建立 tarstream，反之也
 不得仅按 `.image`/`.sandbox` 扩展名推导 Bundle root。
 
-因此named location只依赖`mkdir`、exclusive create、write、read、stat/fstat/lstat、seek/pread、file/directory sync、close,以及删除本进程拥有的不完整file. 它不依赖rename/renameat2、symlink、hardlink、reflink、sparse-file preservation、advisory lock或lock file. Directory sync仍是当前durability success contract;不支持它或返回其他I/O错误时publication失败,不会静默吞错.
+因此named location只依赖`mkdir`、exclusive create、write、read、stat/fstat/lstat、seek/pread、close,以及删除本进程拥有的不完整file. 它不依赖rename/renameat2、symlink、hardlink、reflink、sparse-file preservation、advisory lock或lock file,也不执行显式file/directory sync;publication的success contract由`O_EXCL`写入、`Close()`检查、最终路径reopen/full verification与路径身份检查定义,物理写回由文件系统或底层存储实现定义.
 
 Active encrypted `.overlay.diff` 保持KDXTS格式. Export只读取decrypt后的BlockCOW SnapshotView并创建新的immutable logical artifact,绝不把ZIP追加到active diff.
 
@@ -1187,7 +1187,7 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 
 ### 14.1 Atomicity 与 determinism
 
-Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local `FileSink`/`BundleSink`保持same-directory temp、fsync和atomic no-replace rename,final commit是O(1);alias只在root commit后更新. Named ref-location采用独立的exclusive-create + checked-write/copy-once + reopen-full-verify协议;tarstream由carrier直接提供identity,Bundle保持exact bytes,两者都不进入local sink的capture/commit路径.
+Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local `FileSink`/`BundleSink`保持same-directory temp、完整写入/`Close()`检查和atomic no-replace rename,final commit是O(1);alias只在root commit后更新. artifact capture/publication只定义logical completion,不定义stable-storage durability;两条本地路径都不执行显式file/directory fsync,物理写回由文件系统或底层存储实现定义. Named ref-location采用独立的exclusive-create + checked-write/copy-once + reopen-full-verify协议;tarstream由carrier直接提供identity,Bundle保持exact bytes,两者都不进入local sink的capture/commit路径.
 
 多盘顺序固定为data disks first、root E last. Snapshot随后写memory S last. 这让S/E root成为可审计的graph commit point.
 

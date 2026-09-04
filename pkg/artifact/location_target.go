@@ -58,14 +58,12 @@ type locationValidator func(
 	uint64,
 	string,
 	string,
-	bool,
 ) error
 
 type locationWriteFile interface {
 	io.Writer
 	Stat() (os.FileInfo, error)
 	Chmod(os.FileMode) error
-	Sync() error
 	Close() error
 }
 
@@ -74,7 +72,6 @@ type locationReadFile interface {
 	io.ReaderAt
 	io.Seeker
 	Stat() (os.FileInfo, error)
-	Sync() error
 	Close() error
 }
 
@@ -83,7 +80,6 @@ type locationFileSystem interface {
 	openNoFollow(string) (locationReadFile, error)
 	lstat(string) (os.FileInfo, error)
 	remove(string) error
-	syncDirectory(string) error
 }
 
 type osLocationFileSystem struct{}
@@ -107,17 +103,6 @@ func (osLocationFileSystem) lstat(path string) (os.FileInfo, error) {
 }
 
 func (osLocationFileSystem) remove(path string) error { return os.Remove(path) }
-
-func (osLocationFileSystem) syncDirectory(path string) error {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return err
-	}
-	directory := os.NewFile(uintptr(fd), path)
-	syncErr := directory.Sync()
-	closeErr := directory.Close()
-	return errors.Join(syncErr, closeErr)
-}
 
 func newLocationPublishTarget(location, directory string, codec tarstream.Codec, required bool, logf func(string, ...any)) *locationPublishTarget {
 	if logf == nil {
@@ -222,7 +207,7 @@ func (t *locationPublishTarget) publishFresh(
 			return nil
 		},
 		func(file locationReadFile, info os.FileInfo) error {
-			if err := t.validateOpenedFinal(ctx, file, info, payload, source.Size(), scheme, digest, false); err != nil {
+			if err := t.validateOpenedFinal(ctx, file, info, payload, source.Size(), scheme, digest); err != nil {
 				return fmt.Errorf("validate final: %w", err)
 			}
 			return nil
@@ -284,9 +269,10 @@ func (t *locationPublishTarget) commitFreshLocationFile(
 	if err := write(created); err != nil {
 		return err
 	}
-	if err := created.Sync(); err != nil {
-		return fmt.Errorf("sync final: %w", err)
-	}
+	// The fresh final is intentionally not fsynced, and the parent directory is
+	// never synced: publication defines logical completion, not stable-storage
+	// durability. Readers (including cross-process validators) are served
+	// correctly from the page cache. See #184.
 	// Keep the owned fd open until the namespace check completes. Otherwise an
 	// unlink after Close could recycle its inode number and let a replacement
 	// satisfy os.SameFile.
@@ -351,14 +337,9 @@ func (t *locationPublishTarget) commitFreshLocationFile(
 		owned = false
 		return fmt.Errorf("%w: path changed during validation", errLocationFinalVanished)
 	}
-	// Do not remove a fully validated final if only directory durability fails;
-	// a concurrent publisher may already have reused it.
 	owned = false
 	if err := errors.Join(closeVerifier(), closeGuard()); err != nil {
 		return fmt.Errorf("close final validation descriptors: %w", err)
-	}
-	if err := t.fs.syncDirectory(t.directory); err != nil {
-		return fmt.Errorf("sync parent directory: %w", err)
 	}
 	return nil
 }
@@ -389,11 +370,8 @@ func (t *locationPublishTarget) reuseExisting(ctx context.Context, path, payload
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := t.validateFinal(ctx, path, payload, logicalSize, scheme, digest, true)
+		err := t.validateFinal(ctx, path, payload, logicalSize, scheme, digest)
 		if err == nil {
-			if err := t.fs.syncDirectory(t.directory); err != nil {
-				return fmt.Errorf("sync parent directory after reuse: %w", err)
-			}
 			return nil
 		}
 		if os.IsNotExist(err) {
@@ -458,7 +436,7 @@ func isRetryableLocationMismatch(err error) bool {
 	return false
 }
 
-func (t *locationPublishTarget) validateFinal(ctx context.Context, path, payload string, logicalSize uint64, scheme, digest string, syncFile bool) (retErr error) {
+func (t *locationPublishTarget) validateFinal(ctx context.Context, path, payload string, logicalSize uint64, scheme, digest string) (retErr error) {
 	file, err := t.fs.openNoFollow(path)
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
@@ -477,7 +455,7 @@ func (t *locationPublishTarget) validateFinal(ctx context.Context, path, payload
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("%w: mode %s", errLocationFinalNonRegular, info.Mode())
 	}
-	if err := t.validateOpenedFinal(ctx, file, info, payload, logicalSize, scheme, digest, syncFile); err != nil {
+	if err := t.validateOpenedFinal(ctx, file, info, payload, logicalSize, scheme, digest); err != nil {
 		return err
 	}
 	current, err := t.fs.lstat(path)
@@ -493,9 +471,9 @@ func (t *locationPublishTarget) validateFinal(ctx context.Context, path, payload
 	return nil
 }
 
-func (t *locationPublishTarget) validateOpenedFinal(ctx context.Context, file locationReadFile, info os.FileInfo, payload string, logicalSize uint64, scheme, digest string, syncFile bool) error {
+func (t *locationPublishTarget) validateOpenedFinal(ctx context.Context, file locationReadFile, info os.FileInfo, payload string, logicalSize uint64, scheme, digest string) error {
 	if t.validate != nil {
-		return t.validate(ctx, file, info, payload, logicalSize, scheme, digest, syncFile)
+		return t.validate(ctx, file, info, payload, logicalSize, scheme, digest)
 	}
 	options := []tarstream.ReadOption{tarstream.WithExpectedDigest(scheme, digest)}
 	if t.codec != nil {
@@ -515,11 +493,6 @@ func (t *locationPublishTarget) validateOpenedFinal(ctx context.Context, file lo
 	}
 	if err := consumeLocationSource(ctx, source); err != nil {
 		return classifyLocationContentError(err)
-	}
-	if syncFile {
-		if err := file.Sync(); err != nil {
-			return fmt.Errorf("sync existing final: %w", err)
-		}
 	}
 	return nil
 }

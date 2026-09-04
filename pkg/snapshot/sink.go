@@ -149,6 +149,11 @@ func (s *FileSink) commitAlias(ctx context.Context, role, path string) error {
 // while writing, then commits without replacement to <digest>.<kind>. Only data
 // extents flow (holes ride the envelope map); the artifact file itself is dense
 // and survives non-sparse-aware copies and filesystems.
+//
+// The artifact is not fsynced, nor is the output directory: capture defines
+// logical completion, not stable-storage durability. Physical writeback is
+// delegated to the filesystem and underlying storage implementation.
+// See #184.
 func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.Source) (string, string, string, error) {
 	if err := validateArtifactAliasID(s.sandboxID); err != nil {
 		return "", "", "", fmt.Errorf("pack %s: %w", kind, err)
@@ -180,10 +185,6 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 		_ = f.Close()
 		return "", "", "", fmt.Errorf("pack %s: %w", kind, err)
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return "", "", "", err
-	}
 	if err := f.Close(); err != nil {
 		return "", "", "", err
 	}
@@ -202,18 +203,6 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 		return "", "", "", fmt.Errorf("commit %s without replacement: %w", kind, err)
 	}
 	keepTmp = true // rename consumed the path; deferred cleanup has nothing to remove
-	dir, err := os.Open(s.outDir)
-	if err != nil {
-		return "", "", "", fmt.Errorf("open snapshot output directory: %w", err)
-	}
-	syncErr := dir.Sync()
-	closeErr := dir.Close()
-	if syncErr != nil {
-		return "", "", "", fmt.Errorf("sync snapshot output directory: %w", syncErr)
-	}
-	if closeErr != nil {
-		return "", "", "", fmt.Errorf("close snapshot output directory: %w", closeErr)
-	}
 	return scheme, digest, final, nil
 }
 
@@ -543,9 +532,6 @@ func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, role s
 	if err := s.writer.Finalize(root); err != nil {
 		return err
 	}
-	if err := s.file.Sync(); err != nil {
-		return fmt.Errorf("sync snapshot Bundle: %w", err)
-	}
 	if err := s.file.Close(); err != nil {
 		return fmt.Errorf("close snapshot Bundle: %w", err)
 	}
@@ -563,9 +549,6 @@ func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, role s
 		return fmt.Errorf("commit snapshot Bundle without replacement: %w", err)
 	}
 	s.tmpPath = ""
-	if err := syncDirectory(s.outDir); err != nil {
-		return fmt.Errorf("sync snapshot Bundle directory: %w", err)
-	}
 	if err := commitArtifactAlias(ctx, s.outDir, s.sandboxID, role, final); err != nil {
 		return fmt.Errorf("commit %s Bundle alias: %w", role, err)
 	}
@@ -618,17 +601,6 @@ func (s *BundleSink) Close() error {
 	return result
 }
 
-func syncDirectory(path string) error {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return err
-	}
-	directory := os.NewFile(uintptr(fd), path)
-	syncErr := directory.Sync()
-	closeErr := directory.Close()
-	return errors.Join(syncErr, closeErr)
-}
-
 func validateArtifactAliasID(sandboxID string) error {
 	if sandboxID == "" || sandboxID == "." || sandboxID == ".." || filepath.Base(sandboxID) != sandboxID || strings.ContainsAny(sandboxID, `/\`) {
 		return fmt.Errorf("sandbox id %q is not a safe alias component", sandboxID)
@@ -675,17 +647,10 @@ func commitArtifactAlias(ctx context.Context, outDir, sandboxID, role, artifactP
 	}
 
 	alias := filepath.Join(outAbs, sandboxID+"."+role)
-	oldTarget := ""
-	hadAlias := false
 	if oldInfo, lstatErr := os.Lstat(alias); lstatErr == nil {
 		if oldInfo.Mode()&os.ModeSymlink == 0 {
 			return fmt.Errorf("commit %s alias refuses to replace a non-symlink", role)
 		}
-		oldTarget, err = os.Readlink(alias)
-		if err != nil {
-			return fmt.Errorf("read existing %s alias: %w", role, err)
-		}
-		hadAlias = true
 	} else if !os.IsNotExist(lstatErr) {
 		return fmt.Errorf("inspect existing %s alias: %w", role, lstatErr)
 	}
@@ -705,12 +670,7 @@ func commitArtifactAlias(ctx context.Context, outDir, sandboxID, role, artifactP
 		return fmt.Errorf("commit %s alias: %w", role, err)
 	}
 	temporaryOpen = false
-	if err := syncDirectory(outAbs); err == nil {
-		return nil
-	} else {
-		rollbackErr := rollbackArtifactAlias(outAbs, alias, sandboxID, role, target, hadAlias, oldTarget)
-		return fmt.Errorf("sync %s alias directory: %w", role, errors.Join(err, rollbackErr))
-	}
+	return nil
 }
 
 func createAliasSymlink(outDir, sandboxID, role, target string) (string, error) {
@@ -727,34 +687,6 @@ func createAliasSymlink(outDir, sandboxID, role, target string) (string, error) 
 		}
 	}
 	return "", fmt.Errorf("create %s alias temporary symlink: name collision limit exceeded", role)
-}
-
-func rollbackArtifactAlias(outDir, alias, sandboxID, role, newTarget string, hadAlias bool, oldTarget string) error {
-	if hadAlias {
-		temporary, err := createAliasSymlink(outDir, sandboxID, role, oldTarget)
-		if err != nil {
-			return fmt.Errorf("restore prior %s alias: %w", role, err)
-		}
-		if err := os.Rename(temporary, alias); err != nil {
-			_ = os.Remove(temporary)
-			return fmt.Errorf("restore prior %s alias: %w", role, err)
-		}
-	} else {
-		current, err := os.Readlink(alias)
-		if err != nil {
-			return fmt.Errorf("remove failed %s alias: %w", role, err)
-		}
-		if current != newTarget {
-			return fmt.Errorf("remove failed %s alias: target changed concurrently", role)
-		}
-		if err := os.Remove(alias); err != nil {
-			return fmt.Errorf("remove failed %s alias: %w", role, err)
-		}
-	}
-	if err := syncDirectory(outDir); err != nil {
-		return fmt.Errorf("sync restored %s alias directory: %w", role, err)
-	}
-	return nil
 }
 
 func NewIngestSink(ing ingest.Ingester, logf func(string, ...any)) *IngestSink {
