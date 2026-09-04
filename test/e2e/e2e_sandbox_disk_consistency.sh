@@ -13,7 +13,8 @@
 #        restore (resume) → verify markers + whole-disk checksums
 #        → every WRITE_EVERY cycles: WRITE_ITERS overwrite R/W passes of a
 #          fixed WRITE_MIB file on scratch + dataset, then refresh checksums
-#        → snapshot for the next iteration
+#        → snapshot for the next iteration; reclaim the previous snapshot tree
+#          and this cycle's host restore diffs
 #   5. restore the final snapshot once more and verify consistency
 #
 # Consistency is checked inside the guest: markers confirm mounts are correctly
@@ -373,6 +374,26 @@ snapshot_sandbox() { # $1=sid $2=output-dir
     [ -n "$LAST_MEM_MIB" ] || LAST_MEM_MIB="?"
 }
 
+# Drop a prior snapshot tree once a newer CURRENT_SNAP exists.  Keeps only the
+# live restore baseline so cycle overlays / memory dumps do not accumulate.
+reclaim_snapshot_dir() { # $1=dir
+    local dir=$1
+    [ -n "$dir" ] || return 0
+    [ -d "$dir" ] || return 0
+    case "$CURRENT_SNAP" in
+        "$dir"/*) return 0 ;;  # still the live baseline
+    esac
+    rm -rf "$dir"
+}
+
+# Drop host-bound restore diffs for a finished cycle tag.  Safe after snapshot
+# (VM destroyed); those empty uppers are not part of the next restore baseline.
+reclaim_restore_diffs() { # $1=tag
+    local tag=$1
+    [ -n "$tag" ] || return 0
+    rm -f "$WORK/root-${tag}.ext4" "$WORK/dataset-${tag}.ext4"
+}
+
 restore_sandbox() { # $1=snapshot $2=sid $3=tag
     local snap=$1 sid=$2 tag=$3
     local log="$WORK/run-${tag}.log"
@@ -521,6 +542,7 @@ section "2.  Running Pause/Resume Cycles [markers + checksums | bulk ${WRITE_ITE
 for cycle in $(seq 1 "$PAUSE_RESUME_CYCLES"); do
     sid="dk-consistency-${cycle}"
     line="[$cycle/$PAUSE_RESUME_CYCLES]"
+    prev_snap_dir=$(dirname "$CURRENT_SNAP")
 
     restore_sandbox "$CURRENT_SNAP" "$sid" "c${cycle}"
     line+=" -> Restore $OK"
@@ -536,6 +558,10 @@ for cycle in $(seq 1 "$PAUSE_RESUME_CYCLES"); do
 
     snapshot_sandbox "$sid" "$WORK/snaps/cycle-${cycle}"
     line+=" | Snapshot committed (Dump: ${LAST_DUMP_MS}ms)"
+
+    # Keep only the newest snapshot + reclaim this cycle's host restore diffs.
+    reclaim_snapshot_dir "$prev_snap_dir"
+    reclaim_restore_diffs "c${cycle}"
     echo "$line"
 done
 

@@ -71,7 +71,7 @@ cleanup() {
     pkill -KILL -f "cloud-hypervisor.*disk-quota-control" 2>/dev/null
     [ "$TAP_CREATED" = 1 ] && ip link del "$TAP_NAME" 2>/dev/null
     if [ -n "${E2E_KEEP:-}" ]; then
-        step "Kept work dir: $WORK (includes 30G scratch disk)."
+        step "Kept work dir: $WORK"
     else
         rm -rf "$WORK"
     fi
