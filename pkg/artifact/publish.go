@@ -38,9 +38,9 @@ type PublishResult struct {
 	Ref  string
 }
 
-// Publisher is the sole E/S graph publisher. Input carrier lookup and target
-// writing are separate from logical roles; no artifact registry or metadata
-// entry participates in role detection.
+// Publisher publishes logical image/E/S roots and their selected graphs. Input
+// carrier lookup and target writing are separate from logical roles; no
+// artifact registry or metadata entry participates in role detection.
 type Publisher struct {
 	storage   *ProcessStorage
 	locations config.RefLocations
@@ -224,7 +224,8 @@ func (t *manifestPublishTarget) PutBundle(ctx context.Context, plan bundlePublis
 }
 
 // NewManifestPublisher publishes every selected logical object through one
-// manifest ingester. Roots are written last by Publish.
+// manifest ingester. Root Manifest objects are written after their Chunks by
+// both Publish and PublishSource.
 func NewManifestPublisher(storage *ProcessStorage, cfg *config.ManifestConfig, locations config.RefLocations, logf func(string, ...any)) (*Publisher, error) {
 	if storage == nil || cfg == nil {
 		return nil, errors.New("publish: process storage and manifest config are required")
@@ -305,6 +306,36 @@ func (p *Publisher) Close() error {
 type publishScope struct {
 	fetcher     fetch.Fetcher
 	relativeDir string
+}
+
+// PublishSource publishes one already-assembled logical image or Sandbox
+// source directly to this Publisher's target. The caller retains ownership of
+// source and must keep it valid until PublishSource returns. Dependencies named
+// by a Sandbox source must already be portable; this method deliberately does
+// not infer a graph from filenames or extensions.
+func (p *Publisher) PublishSource(ctx context.Context, role LogicalRole, source sparse.Source) (PublishResult, error) {
+	if p == nil || p.target == nil {
+		return PublishResult{}, errors.New("publish source: publisher is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return PublishResult{}, err
+	}
+	if source == nil {
+		return PublishResult{}, errors.New("publish source: logical source is required")
+	}
+	switch role {
+	case RoleImage, RoleSandbox:
+	default:
+		return PublishResult{}, fmt.Errorf("publish source: unsupported root role %q", role)
+	}
+	ref, err := p.target.Put(ctx, role, source)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	return PublishResult{Role: role, Ref: ref}, nil
 }
 
 // Publish auto-detects exactly one strict logical root and publishes its graph.

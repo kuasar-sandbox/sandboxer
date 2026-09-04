@@ -160,8 +160,9 @@ to SandboxID; it must be one safe path component.
 export creates a runnable Sandbox E. Live export freezes the guest and all
 block backends but does not call Cloud Hypervisor's snapshot API or read RAM.
 It reuses the storage and ref-location bindings owned by the running process.
-Offline export wraps one flattened EROFS image and accepts storage/ref-location
-flags; offline --resume is invalid. In both modes --timeout=0 is unbounded.
+Image-to-Sandbox-E assembly wraps one flattened EROFS image without starting a
+VM and accepts storage/ref-location flags; assembly --resume is invalid. In
+both modes --timeout=0 is unbounded.
 
 snapshot always captures memory execution state. At one freeze point it emits
 the current Sandbox E first and Snapshot S last; S points to E. Local output

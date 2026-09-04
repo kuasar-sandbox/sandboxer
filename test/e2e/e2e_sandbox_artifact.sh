@@ -5,7 +5,7 @@
 #   - run --from performs a cold start from each captured disk point
 #   - persistent and ephemeral file/env semantics stay separated
 #   - init runs again on cold start while the original active diff stays bound
-#   - offline flattened-EROFS export produces a direct EROFS Sandbox E
+#   - image-to-Sandbox-E assembly produces a direct EROFS Sandbox E without a VM
 #   - direct EROFS run --from requires a pre-formatted writable upper before CH
 
 set -euo pipefail
@@ -231,10 +231,10 @@ EOF
 run_from_export "$E1" E1 e1
 run_from_export "$E2" E2 e2
 
-OFFLINE_TEMPLATE="$WORK/offline-template.ext4"
-truncate -s 512M "$OFFLINE_TEMPLATE"
-mkfs.ext4 -q -F "$OFFLINE_TEMPLATE"
-cat > "$WORK/offline.yaml" <<EOF
+ASSEMBLY_TEMPLATE="$WORK/assembly-template.ext4"
+truncate -s 512M "$ASSEMBLY_TEMPLATE"
+mkfs.ext4 -q -F "$ASSEMBLY_TEMPLATE"
+cat > "$WORK/assembly.yaml" <<EOF
 resources:
   capacity:    { cpu: 1, memory: 512MiB }
   allocatable: { cpu: 1, memory: 512MiB }
@@ -245,21 +245,21 @@ boot:
   root:
     base: $BLK0_REF
     overlay:
-      diff_template: file://$OFFLINE_TEMPLATE
+      diff_template: file://$ASSEMBLY_TEMPLATE
 launch:
   exec: /bin/true
   restart: never
 EOF
 
-OFFLINE_OUT="$WORK/offline-out"
-mkdir -p "$OFFLINE_OUT"
-echo "==> offline flattened-EROFS export"
-"$BIN/sandbox-ctl" export --from "$BLK0_IMAGE" --config "$WORK/offline.yaml" \
-    --sandbox-id offline --output "$OFFLINE_OUT" | tee "$WORK/export-offline.log"
-OFFLINE_E="$OFFLINE_OUT/offline.sandbox"
-[ -L "$OFFLINE_E" ] || { echo "FAIL: offline Sandbox E alias was not committed"; ls -la "$OFFLINE_OUT"; exit 1; }
-"$BIN/sandbox-ctl" info --json "$OFFLINE_E" >"$WORK/offline-info.json"
-python3 - "$WORK/offline-info.json" <<'PY'
+ASSEMBLY_OUT="$WORK/assembly-out"
+mkdir -p "$ASSEMBLY_OUT"
+echo "==> image-to-Sandbox-E assembly"
+"$BIN/sandbox-ctl" export --from "$BLK0_IMAGE" --config "$WORK/assembly.yaml" \
+    --sandbox-id assembly --output "$ASSEMBLY_OUT" | tee "$WORK/export-assembly.log"
+ASSEMBLY_E="$ASSEMBLY_OUT/assembly.sandbox"
+[ -L "$ASSEMBLY_E" ] || { echo "FAIL: assembled Sandbox E alias was not committed"; ls -la "$ASSEMBLY_OUT"; exit 1; }
+"$BIN/sandbox-ctl" info --json "$ASSEMBLY_E" >"$WORK/assembly-info.json"
+python3 - "$WORK/assembly-info.json" <<'PY'
 import json
 import sys
 
@@ -269,7 +269,7 @@ root = cfg["Boot"]["Root"]
 overlay = root.get("Overlay") or {}
 if (root.get("Base") != "self" or root.get("BaseFromRefs")
         or overlay.get("Base") or overlay.get("BaseFromRefs")):
-    raise SystemExit(f"offline E is not direct EROFS self layout: {root!r}")
+    raise SystemExit(f"assembled E is not direct EROFS self layout: {root!r}")
 PY
 
 # The wrapper is an observable CH side effect. Missing direct-EROFS upper must
@@ -282,7 +282,7 @@ touch "$CH_MARKER"
 exec "$BIN/cloud-hypervisor" "\$@"
 EOF
 chmod 0755 "$CH_WRAPPER"
-cat > "$WORK/offline-missing-upper.yaml" <<EOF
+cat > "$WORK/assembly-missing-upper.yaml" <<EOF
 boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
@@ -290,38 +290,38 @@ boot:
     overlay: {}
 EOF
 set +e
-"$BIN/sandbox-ctl" run --from "$OFFLINE_E" --config "$WORK/offline-missing-upper.yaml" \
-    --sandbox-id offline-reject --ch-binary "$CH_WRAPPER" --run-root "$RUN_ROOT" --base-root "$BASE_ROOT" \
-    >"$WORK/offline-reject.log" 2>&1
-OFFLINE_REJECT_RC=$?
+"$BIN/sandbox-ctl" run --from "$ASSEMBLY_E" --config "$WORK/assembly-missing-upper.yaml" \
+    --sandbox-id assembly-reject --ch-binary "$CH_WRAPPER" --run-root "$RUN_ROOT" --base-root "$BASE_ROOT" \
+    >"$WORK/assembly-reject.log" 2>&1
+ASSEMBLY_REJECT_RC=$?
 set -e
-[ "$OFFLINE_REJECT_RC" -ne 0 ] || { echo "FAIL: direct EROFS run accepted a missing upper"; exit 1; }
+[ "$ASSEMBLY_REJECT_RC" -ne 0 ] || { echo "FAIL: direct EROFS run accepted a missing upper"; exit 1; }
 [ ! -e "$CH_MARKER" ] \
     || { echo "FAIL: missing direct-EROFS upper failed only after Cloud Hypervisor started"; exit 1; }
-grep -qE 'diff_template|mountable|formatted|upper' "$WORK/offline-reject.log" \
-    || { echo "FAIL: missing-upper error lacked field context"; cat "$WORK/offline-reject.log"; exit 1; }
+grep -qE 'diff_template|mountable|formatted|upper' "$WORK/assembly-reject.log" \
+    || { echo "FAIL: missing-upper error lacked field context"; cat "$WORK/assembly-reject.log"; exit 1; }
 
-cat > "$WORK/offline-host.yaml" <<EOF
+cat > "$WORK/assembly-host.yaml" <<EOF
 boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
     overlay:
-      diff_template: file://$OFFLINE_TEMPLATE
+      diff_template: file://$ASSEMBLY_TEMPLATE
 launch:
   exec: /bin/sh
-  args: ["-c", "echo OFFLINE-RUN-OK"]
+  args: ["-c", "echo ASSEMBLY-RUN-OK"]
 EOF
 set +e
-timeout -k 10s 90 "$BIN/sandbox-ctl" run --from "$OFFLINE_E" --config "$WORK/offline-host.yaml" \
-    --sandbox-id offline-run --ch-binary "$BIN/cloud-hypervisor" \
-    --run-root "$RUN_ROOT" --base-root "$BASE_ROOT" >"$WORK/offline-run.log" 2>&1
-OFFLINE_RUN_RC=$?
+timeout -k 10s 90 "$BIN/sandbox-ctl" run --from "$ASSEMBLY_E" --config "$WORK/assembly-host.yaml" \
+    --sandbox-id assembly-run --ch-binary "$BIN/cloud-hypervisor" \
+    --run-root "$RUN_ROOT" --base-root "$BASE_ROOT" >"$WORK/assembly-run.log" 2>&1
+ASSEMBLY_RUN_RC=$?
 set -e
-[ "$OFFLINE_RUN_RC" -eq 0 ] \
-    || { echo "FAIL: direct EROFS run --from exited $OFFLINE_RUN_RC"; tail -100 "$WORK/offline-run.log"; exit 1; }
-grep -q '^OFFLINE-RUN-OK$' "$WORK/offline-run.log" \
-    || { echo "FAIL: direct EROFS run --from did not start the cold app"; tail -100 "$WORK/offline-run.log"; exit 1; }
+[ "$ASSEMBLY_RUN_RC" -eq 0 ] \
+    || { echo "FAIL: direct EROFS run --from exited $ASSEMBLY_RUN_RC"; tail -100 "$WORK/assembly-run.log"; exit 1; }
+grep -q '^ASSEMBLY-RUN-OK$' "$WORK/assembly-run.log" \
+    || { echo "FAIL: direct EROFS run --from did not start the cold app"; tail -100 "$WORK/assembly-run.log"; exit 1; }
 
-echo "==> PASS: live E1/E2, immutable C0, cold semantics, and offline direct EROFS"
+echo "==> PASS: live E1/E2, immutable C0, cold semantics, and direct EROFS assembly"
 echo "==> e2e_sandbox_artifact: OK"

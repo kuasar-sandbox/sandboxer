@@ -1,6 +1,7 @@
-// Package artifact provides process-local access to snapshot and disk
-// artifacts. It owns the customer-key binding, local tarstream codec, and the
-// lazily-created manifest client used by one task or tool process.
+// Package artifact opens and publishes logical image, disk, Sandbox, and
+// Snapshot artifacts independently of their physical carrier. It owns the
+// customer-key binding, local tarstream codec, and lazily-created manifest
+// client used by one task or tool process.
 package artifact
 
 import (
@@ -35,12 +36,27 @@ type ProcessStorage struct {
 }
 
 // NewProcessStorage initializes process-local artifact access from cfg and the
-// existing MANIFEST_KEY environment convention. It never accepts a key value
-// from the caller.
+// existing MANIFEST_KEY environment convention.
 func NewProcessStorage(cfg *config.ManifestConfig) (*ProcessStorage, error) {
+	var keyFn ingest.CustomerKeyFunc
+	if cfg != nil {
+		keyFn = cfg.CustomerKey
+	}
+	return NewProcessStorageWithCustomerKey(cfg, keyFn)
+}
+
+// NewProcessStorageWithCustomerKey initializes process-local artifact access
+// with an explicit customer-key resolver. It is intended for embedding callers
+// whose authoritative key is task-scoped rather than process-global. The
+// resolver is evaluated at most once and its result is fixed for every fetch,
+// ingest, and local-codec operation owned by the returned storage.
+func NewProcessStorageWithCustomerKey(cfg *config.ManifestConfig, customerKey ingest.CustomerKeyFunc) (*ProcessStorage, error) {
 	s := &ProcessStorage{cfg: cfg}
 	if cfg == nil {
 		return s, nil
+	}
+	if customerKey == nil {
+		return nil, fmt.Errorf("artifact storage: customer key resolver is required")
 	}
 
 	var (
@@ -49,7 +65,7 @@ func NewProcessStorage(cfg *config.ManifestConfig) (*ProcessStorage, error) {
 		keyErr error
 	)
 	s.keyFn = func() ([32]byte, error) {
-		once.Do(func() { key, keyErr = cfg.CustomerKey() })
+		once.Do(func() { key, keyErr = customerKey() })
 		return key, keyErr
 	}
 

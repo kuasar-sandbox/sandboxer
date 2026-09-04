@@ -68,8 +68,8 @@ func (r *Root) Close() error {
 	return r.owner.Close()
 }
 
-// FlattenedImage is a validated EROFS + ZIP(config.json) input used by offline
-// export. Its ImageConfig bytes are retained exactly for the rebuilt Sandbox.
+// FlattenedImage is a validated EROFS + ZIP(config.json) input used to assemble
+// a top-level Sandbox E. Its ImageConfig bytes are retained exactly.
 type FlattenedImage struct {
 	FullStream  fetch.Stream
 	Payload     fetch.Stream
