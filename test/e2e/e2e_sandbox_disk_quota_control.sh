@@ -2,14 +2,18 @@
 #
 # e2e_sandbox_disk_quota_control.sh — verify writable disk capacity enforcement.
 #
-# Boots a sandbox with a 30GiB data disk, fills ~28GiB, then asserts that a
-# further 4GiB write fails with "No space left on device" (guest ENOSPC from
-# the sized vhost-blk COW / ext4, not a host-side sandbox exit).
+# Boots a sandbox with a 30GiB data disk, fills exactly 28GiB (7×4GiB shreds;
+# per-file retry up to 3 times on failure), asserts remaining space is under
+# 4GiB, then that a further 4GiB write fails with "No space left on device"
+# (guest ENOSPC from the sized vhost-blk COW / ext4, not a host-side sandbox exit).
 #
 # Prerequisites (missing → skip, exit 0; REQUIRE_KVM=1 to fail hard):
 #   /dev/kvm rw · bin/{cloud-hypervisor,sandbox-ctl,sandbox-init,
 #   sandbox-runtime.bundle,flatten-ctl,mkfs.erofs} · $VMLINUX · docker (or
-#   BLK0_IMAGE=) · mkfs.ext4 · shred · root (tap/vsock).
+#   BLK0_IMAGE=) · mkfs.ext4 · shred (in guest) · root (tap/vsock).
+#
+# In the 30GB disk, the ext4 reserved blocks are around 24K which is 1% of the disk.
+# It is still safe to write 28GiB to the disk and then test the quota enforcement.
 
 set -euo pipefail
 
@@ -17,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
-IMAGE="${IMAGE:-node-server:latest}"
+IMAGE="${IMAGE:-python:3.12-slim}"
 TAP_NAME="${TAP_NAME:-sb-tap0}"
 
 info()  { printf '[INFO]  %s\n' "$*"; }
@@ -42,7 +46,6 @@ done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH (apt install e2fsprogs)"
-command -v shred >/dev/null 2>&1 || skip "shred not on PATH (apt install coreutils) in image $IMAGE"
 
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 
@@ -129,36 +132,103 @@ ready() { # $1=sid
 }
 ready "$SID" || { fail "Cold boot not ready"; tail -60 "$WORK/run.log"; exit 1; }
 
+# Verify shred is available in the guest image.
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- \
+    /bin/sh -c 'command -v shred >/dev/null' \
+    || skip "shred not in guest image $IMAGE (apt install coreutils)"
+
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- df -h /scratch > "$WORK/df_check.out"
 grep -q "30G" "$WORK/df_check.out" || { fail "30G disk not present"; cat "$WORK/df_check.out"; exit 1; }
 pass "Sandbox booted successfully."
 echo
 
 ex1() { "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" "$@"; }
-# Background guest exec; track PIDs so wait does not block on $P (sandbox-ctl run).
-BK_PIDS=()
-ex_bk() {
-    (
-        "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" "$@"
-    ) &
-    BK_PIDS+=($!)
-}
+
+FOUR_GIB=$((4 * 1024 * 1024 * 1024))
+FILL_FILES=7
+FILL_TOTAL_GIB=$((FILL_FILES * 4))
+MAX_FILL_ATTEMPTS=3
 
 run "Testing disk quota control..."
-step "-> Writing 7 files of 4GB each in parallel (Total: 28GB)"
-step "-> [•] Writing files 1, 2, 3, 4, 5, 6, 7..."
-BK_PIDS=()
-for i in {1..7}; do
-    ex1 -- touch /scratch/4gb_file_$i.bin
-    ex_bk -- shred -n 1 -s 4G /scratch/4gb_file_$i.bin
+step "-> Writing $FILL_FILES files of 4GiB each in parallel (Total: ${FILL_TOTAL_GIB}GiB)"
+
+pending=()
+attempts=()
+for i in $(seq 1 "$FILL_FILES"); do
+    pending+=("$i")
+    attempts[$i]=0
 done
-for pid in "${BK_PIDS[@]}"; do wait "$pid" || true; done
-step "-> [✓] All 28GB successfully written to disk."
+
+while [ "${#pending[@]}" -gt 0 ]; do
+    BK_PIDS=()
+    BK_IDXS=()
+    step "-> [•] Writing file(s): ${pending[*]}"
+    for i in "${pending[@]}"; do
+        attempts[$i]=$((${attempts[$i]} + 1))
+        if [ "${attempts[$i]}" -gt 1 ]; then
+            step "-> retrying file $i (attempt ${attempts[$i]}/$MAX_FILL_ATTEMPTS)"
+            ex1 -- rm -f "/scratch/4gb_file_$i.bin" >/dev/null 2>&1 || true
+        fi
+        if ! ex1 -- touch "/scratch/4gb_file_$i.bin"; then
+            fail "touch /scratch/4gb_file_$i.bin failed"
+            for pid in "${BK_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+            exit 1
+        fi
+        (
+            "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- \
+                shred -n 1 -s 4G "/scratch/4gb_file_$i.bin"
+        ) &
+        BK_PIDS+=($!)
+        BK_IDXS+=("$i")
+    done
+
+    next_pending=()
+    for j in "${!BK_PIDS[@]}"; do
+        pid=${BK_PIDS[$j]}
+        i=${BK_IDXS[$j]}
+        ok=1
+        if ! wait "$pid"; then
+            ok=0
+            step "-> shred failed for file $i (attempt ${attempts[$i]}/$MAX_FILL_ATTEMPTS)"
+        elif ! sz=$(ex1 -- /bin/sh -c "stat -c %s /scratch/4gb_file_$i.bin" 2>/dev/null | tr -d '[:space:]') \
+                || [ -z "$sz" ] || [ "$sz" != "$FOUR_GIB" ]; then
+            ok=0
+            step "-> file $i size is '${sz:-missing}', want $FOUR_GIB (attempt ${attempts[$i]}/$MAX_FILL_ATTEMPTS)"
+        fi
+        if [ "$ok" -eq 1 ]; then
+            step "-> [✓] file $i complete (4GiB)"
+            continue
+        fi
+        ex1 -- rm -f "/scratch/4gb_file_$i.bin" >/dev/null 2>&1 || true
+        if [ "${attempts[$i]}" -ge "$MAX_FILL_ATTEMPTS" ]; then
+            fail "file $i failed after $MAX_FILL_ATTEMPTS attempts"
+            exit 1
+        fi
+        next_pending+=("$i")
+    done
+    pending=()
+    if [ "${#next_pending[@]}" -gt 0 ]; then
+        pending=("${next_pending[@]}")
+    fi
+done
+
+step "-> [✓] All ${FILL_TOTAL_GIB}GiB successfully written to disk ($FILL_FILES × 4GiB)."
 echo
 
 check "Verifying remaining disk space..."
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- df -h /scratch > "$WORK/df.out"
+ex1 -- df -h /scratch > "$WORK/df.out"
 sed 's/^/        /' "$WORK/df.out"
+AVAIL_BYTES=$(ex1 -- /bin/sh -c 'df -P -B1 /scratch | awk "NR==2 {print \$4}"' | tr -d '[:space:]')
+case "$AVAIL_BYTES" in
+    ''|*[!0-9]*)
+        fail "could not parse remaining bytes from df (got '${AVAIL_BYTES:-empty}')"
+        exit 1
+        ;;
+esac
+if [ "$AVAIL_BYTES" -ge "$FOUR_GIB" ]; then
+    fail "remaining $AVAIL_BYTES bytes >= 4GiB; another 4GiB write would not exceed the 30GiB disk"
+    exit 1
+fi
 echo
 
 run "Writing 1 additional 4GB file to test quota enforcement..."
