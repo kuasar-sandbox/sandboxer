@@ -14,6 +14,7 @@
 #        → every WRITE_EVERY cycles: WRITE_ITERS overwrite R/W passes of a
 #          fixed WRITE_MIB file on scratch + dataset, then refresh checksums
 #        → snapshot for the next iteration
+#   5. restore the final snapshot once more and verify consistency
 #
 # Consistency is checked inside the guest: markers confirm mounts are correctly
 # wired, and whole-filesystem tar checksums catch silent content corruption
@@ -109,7 +110,7 @@ WORK=$(mktemp -d /tmp/e2e-disk-consistency-XXXXXX)
 RR=$WORK/runtime
 mkdir -p "$RR"
 MANIFEST="$WORK/manifest.tsv"
-P=""
+P=0
 TAP_CREATED=0
 CURRENT_SNAP=""
 LAST_DUMP_MS=""
@@ -117,10 +118,26 @@ LAST_MEM_MIB=""
 
 cleanup() {
     set +e
-    [ -n "$P" ] && kill -0 "$P" 2>/dev/null && kill -KILL "$P" 2>/dev/null
-    pkill -f "cloud-hypervisor.*dk-consistency-" 2>/dev/null
+    if [ -n "$P" ] && [ "$P" != 0 ] && kill -0 "$P" 2>/dev/null; then
+        kill -TERM "$P" 2>/dev/null
+        for _ in $(seq 1 50); do
+            kill -0 "$P" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$P" 2>/dev/null; then
+            disown "$P" 2>/dev/null
+            kill -KILL "$P" 2>/dev/null
+        fi
+        wait "$P" 2>/dev/null
+    fi
+    P=0
+    pkill -KILL -f "cloud-hypervisor.*dk-consistency-" 2>/dev/null
     [ "$TAP_CREATED" = 1 ] && ip link del "$TAP_NAME" 2>/dev/null
-    [ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"
+    if [ -n "${E2E_KEEP:-}" ]; then
+        echo "kept: $WORK"
+    else
+        rm -rf "$WORK"
+    fi
 }
 trap cleanup EXIT
 
@@ -164,11 +181,8 @@ PY
 #   - Unrelated runtime writes (logs, temp files) can land on / between cycles.
 # We tar only the root filesystem (--one-file-system skips /scratch and /data
 # because they are separate mounts), save owners as numbers (--numeric-owner),
-# exclude volatile pseudo-fs paths, and pin tar metadata
+# exclude volatile pseudo-fs paths
 # (--sort=name --mtime=@0 --clamp-mtime) for reproducible hashes.
-#
-# Scratch and dataset use the same metadata pinning so checksums stay stable
-# across restore even when wall-clock mtimes would otherwise differ.
 ROOT_IMAGE_TAR='sync; tar -C / --one-file-system --numeric-owner --sort=name --mtime=@0 --clamp-mtime \
     --exclude=./proc --exclude=./sys --exclude=./dev --exclude=./run --exclude=./tmp \
     -cf - . | sha256sum | awk "{print \$1}"'
@@ -297,9 +311,9 @@ ready() { # $1=sid
 }
 
 wait_sandbox() {
-    [ -n "$P" ] || return 0
+    [ -n "$P" ] && [ "$P" != 0 ] || return 0
     wait "$P" 2>/dev/null || true
-    P=""
+    P=0
 }
 
 # Restore host yaml supplies fresh writable uppers only.  Snapshot Sandbox E
@@ -524,6 +538,11 @@ for cycle in $(seq 1 "$PAUSE_RESUME_CYCLES"); do
     line+=" | Snapshot committed (Dump: ${LAST_DUMP_MS}ms)"
     echo "$line"
 done
+
+# Verify consistency of the final snapshot
+restore_sandbox "$CURRENT_SNAP" "dk-consistency-final" "final"
+verify_consistency "dk-consistency-final" "final-restore"
+pass "Final snapshot restore + consistency check"
 
 echo
 echo "$HR"
