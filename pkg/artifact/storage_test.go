@@ -2,6 +2,7 @@ package artifact
 
 import (
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -28,6 +29,39 @@ func TestProcessStorageFixesCustomerKey(t *testing.T) {
 	}
 	if got != first {
 		t.Fatal("customer key changed after process initialization")
+	}
+}
+
+func TestProcessStorageUsesExplicitCustomerKeyResolver(t *testing.T) {
+	t.Setenv("MANIFEST_KEY", strings.Repeat("ff", 32))
+	want := [32]byte{1, 2, 3}
+	calls := 0
+	storage, err := NewProcessStorageWithCustomerKey(&config.ManifestConfig{}, func() ([32]byte, error) {
+		calls++
+		return want, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+
+	for range 2 {
+		got, err := storage.CustomerKeyFunc()()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("customer key = %x, want %x", got, want)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("customer key resolver calls = %d, want 1", calls)
+	}
+}
+
+func TestProcessStorageRequiresExplicitCustomerKeyResolver(t *testing.T) {
+	if _, err := NewProcessStorageWithCustomerKey(&config.ManifestConfig{}, nil); err == nil {
+		t.Fatal("NewProcessStorageWithCustomerKey accepted a nil resolver")
 	}
 }
 

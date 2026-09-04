@@ -1,6 +1,6 @@
 # sandbox — 沙箱控制与制品生命周期
 
-`sandbox-ctl` 是 kuasar-sandbox 的单沙箱 host 控制面. 它负责显式冷启动、从 Sandbox 制品冷启动、内存恢复、在线/离线导出、内存快照、制品发布以及运行期 `exec`/forward. Guest 侧协议见 `sandbox-init.md`.
+`sandbox-ctl` 是 kuasar-sandbox 的单沙箱 host 控制面. 它负责显式冷启动、从 Sandbox 制品冷启动、内存恢复、live export、无 VM 的 image-to-Sandbox-E assembly、内存快照、制品发布以及运行期 `exec`/forward. Guest 侧协议见 `sandbox-init.md`.
 
 本文只描述当前格式和行为. 项目尚未发布,旧 `snapshot.cfg` 磁盘图不属于兼容输入.
 
@@ -25,8 +25,9 @@ Sandbox E             ── run --from   ──> cold start
 Snapshot S ── sandbox_ref ──> E
            └──────── run --restore ────> memory restore
 
-live/offline export ──> E
-memory snapshot      ──> E + S, S is operation root
+live export              ──> E
+image-to-Sandbox-E build ──> E
+memory snapshot          ──> E + S, S is operation root
 ```
 
 不存在以下模型:
@@ -184,7 +185,7 @@ sandbox-ctl export \
   [--resume]
 ```
 
-Offline flattened EROFS export:
+Image-to-Sandbox-E assembly（不启动 VM）:
 
 ```bash
 sandbox-ctl export \
@@ -195,10 +196,10 @@ sandbox-ctl export \
   [--mode local|bundle]
 ```
 
-Live mode不接受 `--config`;它复用当前 run 进程已验证的 manifest/ref-location/crypto binding,因此显式 `--manifest-config` 和 `--ref-location` 仅属于 offline mode. Offline mode要求 `--config` 或 `SANDBOX_CONFIG` 且拒绝 `--resume`. 两种模式都支持 `--timeout`;0 表示不设 operation deadline. Export 不接受 `drop_caches` 或 memory merge 参数,不调用 CH `/vm.snapshot`,不读取 memfd,不生成 memory refs.
+Live mode不接受 `--config`;它复用当前 run 进程已验证的 manifest/ref-location/crypto binding,因此显式 `--manifest-config` 和 `--ref-location` 仅属于 assembly mode. Assembly mode要求 `--config` 或 `SANDBOX_CONFIG` 且拒绝 `--resume`. 两种模式都支持 `--timeout`;0 表示不设 operation deadline. Export 不接受 `drop_caches` 或 memory merge 参数,不调用 CH `/vm.snapshot`,不读取 memfd,不生成 memory refs.
 
 live mode 与 local snapshot 相同，可只给 PathID；同时给出 SandboxID/PathID 时
-PathID 只定位 ctl socket。offline mode 不接受 PathID，原有 `--sandbox-id` 仍仅是
+PathID 只定位 ctl socket。Assembly mode 不接受 PathID，原有 `--sandbox-id` 仍仅是
 输出 artifact alias，语义不变。
 
 ### 2.5 `sandbox-ctl exec`
@@ -537,7 +538,7 @@ Live ext4/sparse root export:
 ]
 ```
 
-Offline flattened EROFS export:
+Top-level Sandbox E direct EROFS layout:
 
 ```text
 [EROFS payload]
@@ -547,7 +548,7 @@ Offline flattened EROFS export:
 ]
 ```
 
-Offline conversion定位原 `EROFS + ZIP(config.json)` 的 archive base,原样保留 EROFS prefix 和经过校验的 `config.json` bytes,然后重建一个 canonical two-entry ZIP. `ZIP(config.json) + ZIP(sandbox.runtime.cfg)` 是非法 double ZIP.
+Image-to-Sandbox-E assembly定位原 `EROFS + ZIP(config.json)` 的 archive base,原样保留 EROFS prefix 和经过校验的 `config.json` bytes,然后重建一个 canonical two-entry ZIP. `ZIP(config.json) + ZIP(sandbox.runtime.cfg)` 是非法 double ZIP.
 
 Reader 从 ZIP structure 推导 `[0, archiveBase)` payload,不信任第二个 `payload_size`. Strict ZIP contract:
 
@@ -816,9 +817,9 @@ Export不是 `snapshot_request{memory:false}`. Request在 run process中执行,�
 
 Response中的 secret不回显. Remote Manifest upload可以耗时较长,CLI `--timeout=0` 表示不设置 operation deadline;context cancel仍中断 read/write.
 
-### 6.4 Offline EROFS export
+### 6.4 Image-to-Sandbox-E assembly
 
-Offline input必须是 flattened `EROFS + ZIP(config.json)`,不能是已包装 `.sandbox`. 流程:
+输入必须是 flattened `EROFS + ZIP(config.json)`,不能是已包装 `.sandbox`. 流程:
 
 ```text
 open carrier -> validate flattened image -> retain config.json bytes
@@ -827,7 +828,23 @@ rebuild EROFS + ZIP(config.json,sandbox.runtime.cfg)
 emit local/Manifest/Bundle E -> commit E root
 ```
 
-它不创建 VM、不需要 freeze,但仍执行 portable identity、limits、carrier admission和output atomicity检查.
+它不创建 VM、不需要 freeze,但仍执行 portable identity、limits、carrier admission和output atomicity检查。CLI 是 package API 的薄包装：
+
+```text
+OpenFlattenedImage
+  -> PrepareSandboxEConfig
+  -> AssembleSandboxE (logical sparse.Source)
+  -> caller-selected direct publisher
+```
+
+`AssembleSandboxE` 不创建完整中间 `.sandbox`。它借用调用者持有的
+`FlattenedImage`，保留 payload 的 Hole/Zero/Data map 和 byte-for-byte `config.json`，
+只追加 canonical `sandbox.runtime.cfg`。context cancellation 可中断 open、config
+ref canonicalization、image validation 和后续 sink consumption。malformed image、JSON
+或 portable config 在发布 root ref 前 fail closed。嵌入式多任务进程不得通过修改全局
+`MANIFEST_KEY` 切换租户；它应以 `NewProcessStorageWithCustomerKey` 传入 task-scoped
+resolver。`ProcessStorage` 至多求值一次并为其拥有的 fetch、ingest 与 local codec 固定
+同一个 customer key。
 
 ## 7. Memory restore 数据流
 
@@ -1021,11 +1038,45 @@ Manifest Bundle不进入tarstream E/S重建路径. Carrier以root Manifest key�
 
 Final path在write完成前会短暂可见. 正常consumer只能使用publisher成功返回的root ref;publisher仍按dependencies first、root last顺序发布. Concurrent publisher遇到partial final时重新打开并做有限、context-aware exponential-backoff验证;若writer在窗口内完成则复用. bounded retry后仍不完整或invalid时fail closed并提示显式cleanup/repair,不会删除unknown owner的path. Symlink、directory、FIFO和其他non-regular final同样拒绝且不删除. Publisher只在自身`O_EXCL`成功且path仍指向所记录inode时清理自己的失败写入;abandoned unknown final由显式cleanup/GC处理.
 
+#### Single-root image/Sandbox Manifest Bundle
+
+`NewSingleRootBundlePublisher` 是已经组装好的 `RoleImage` 或 `RoleSandbox`
+`sparse.Source` 的 typed named-location sink。数据流是：
+
+```text
+logical source
+  -> Manifest ingest with fixed write admission/customer key
+  -> Bundle root finalize + FullVerify in target-directory temporary file
+  -> exclusive-create content-addressed <root>.bundle
+  -> reopen/strict validate + file/directory fsync
+  -> file://<root>.bundle@manifest:<root>#<location>
+```
+
+该路径不生成 role tarstream，不上传 Manifest store，不创建
+`<root>.image`/`<root>.sandbox`，也不创建 BuildID/SandboxID semantic alias。Bundle
+只含这个 logical root 的 Manifest/chunks；root logical role由 typed调用点决定，reader
+仍以 strict image 或 Sandbox parser验证。existing same-key final必须与新生成 Bundle 的
+admission、root、crypto和exact bytes全部一致才可复用；并发writer使用与普通 named
+publication 相同的有限等待、exclusive-create、full validation和directory durability
+协议收敛。失败或取消不返回 ref，并清理自身 target-directory temporary file与
+owned incomplete final。
+
+Tarstream 与 Bundle 都是 physical carrier，不是 logical role。Tarstream 包含单一
+role-specific payload 与 sparse envelope，使用 `@digest`/`@hmac` identity；Bundle
+包含 Manifest/chunk records、write admission与可选local encryption，使用
+`@manifest` root identity。single-root Bundle publication不得先建立 tarstream，反之也
+不得仅按 `.image`/`.sandbox` 扩展名推导 Bundle root。
+
 因此named location只依赖`mkdir`、exclusive create、write、read、stat/fstat/lstat、seek/pread、file/directory sync、close,以及删除本进程拥有的不完整file. 它不依赖rename/renameat2、symlink、hardlink、reflink、sparse-file preservation、advisory lock或lock file. Directory sync仍是当前durability success contract;不支持它或返回其他I/O错误时publication失败,不会静默吞错.
 
 Active encrypted `.overlay.diff` 保持KDXTS格式. Export只读取decrypt后的BlockCOW SnapshotView并创建新的immutable logical artifact,绝不把ZIP追加到active diff.
 
 ### 11.3 Manifest upload
+
+已经组装好的 image 或顶层 Sandbox E 可通过
+`NewManifestPublisher(...).PublishSource(ctx, RoleImage|RoleSandbox, source)`
+直接 ingest。调用者保留 source ownership；该路径不生成 local tarstream，Chunks
+与去重对象先写，root Manifest最后写入并返回`manifest://<root>`。
 
 Local tarstream graph按照bottom-up顺序ingest:
 
@@ -1118,7 +1169,7 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 - `run --replace-boot` 仅允许与`--from`一起使用，要求host config，并拒绝`--restore`.
 - export/snapshot都要求`--output`与`--upload`二选一.
 - Explicit `--mode` 与 `--upload`互斥.
-- Live export拒绝`--config`;offline export要求`--from + --config`且拒绝`--resume`.
+- Live export拒绝`--config`;image-to-Sandbox-E assembly要求`--from + --config`且拒绝`--resume`.
 - Snapshot没有memory toggle.
 - `exec` command必须位于`--`之后;local与proxy target rules互斥.
 

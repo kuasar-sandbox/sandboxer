@@ -15,6 +15,8 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	storefs "github.com/kuasar-sandbox/accelerator/pkg/store/fs"
 	"github.com/kuasar-sandbox/accelerator/pkg/store/pb"
@@ -271,5 +273,74 @@ func TestManifestPublisherPublishesAndReopensSandboxAndSnapshot(t *testing.T) {
 	}
 	if info.Role != RoleSnapshot || info.Snapshot.SandboxRef == "" {
 		t.Fatalf("inspect S = %+v", info)
+	}
+}
+
+func TestManifestPublisherPublishesDirectImageAndSandboxSources(t *testing.T) {
+	ctx := context.Background()
+	cfg, storage := manifestPublisherFixture(t)
+	flattened, imageConfig := sourceBundleFlattenedImage(t)
+
+	for _, test := range []struct {
+		name   string
+		role   LogicalRole
+		source func() sparse.Source
+		open   func(fetch.Stream) error
+	}{
+		{
+			name: "image", role: RoleImage,
+			source: func() sparse.Source { return publishSource(t, flattened) },
+			open: func(stream fetch.Stream) error {
+				image, err := sandboxfile.OpenFlattenedEROFS(ctx, stream)
+				if err != nil {
+					return err
+				}
+				if !bytes.Equal(image.ImageConfig, imageConfig) {
+					return errors.New("direct Manifest image changed config.json")
+				}
+				return image.Close()
+			},
+		},
+		{
+			name: "sandbox", role: RoleSandbox,
+			source: func() sparse.Source { return sourceBundleSandbox(t, imageConfig) },
+			open: func(stream fetch.Stream) error {
+				root, err := sandboxfile.Open(ctx, stream)
+				if err != nil {
+					return err
+				}
+				return root.Close()
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			publisher, err := NewManifestPublisher(storage, cfg, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, publishErr := publisher.PublishSource(ctx, test.role, test.source())
+			closeErr := publisher.Close()
+			if publishErr != nil || closeErr != nil {
+				t.Fatalf("publish source err=%v close=%v", publishErr, closeErr)
+			}
+			if result.Role != test.role {
+				t.Fatalf("role = %q, want %q", result.Role, test.role)
+			}
+			ref, err := manifest.ParseRef(result.Ref)
+			if err != nil || ref.Scheme != manifest.RefSchemeManifest {
+				t.Fatalf("Manifest ref = %#v, err=%v", ref, err)
+			}
+			key, err := manifest.ParseKeyRef(ref.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream, err := storage.Fetcher().OpenManifest(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := test.open(stream); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

@@ -89,12 +89,12 @@ func (s *contextRecordingSource) ReadAt(ctx context.Context, buffer []byte, offs
 
 func TestBuildSourceContextPropagatesToEROFSRead(t *testing.T) {
 	type contextKey struct{}
-	ctx := context.WithValue(context.Background(), contextKey{}, "offline-export")
+	ctx := context.WithValue(context.Background(), contextKey{}, "sandbox-e-assembly")
 	payload := &contextRecordingSource{Source: dataSource(t, fakeEROFS())}
 	if _, err := BuildSourceContext(ctx, payload, []byte("{}"), erofsPortableBytes(t)); err != nil {
 		t.Fatal(err)
 	}
-	if payload.seen == nil || payload.seen.Value(contextKey{}) != "offline-export" {
+	if payload.seen == nil || payload.seen.Value(contextKey{}) != "sandbox-e-assembly" {
 		t.Fatalf("EROFS read context value = %v", payload.seen)
 	}
 }
@@ -265,7 +265,7 @@ func TestEROFSBuildSupportsOnePassDensePayload(t *testing.T) {
 	}
 }
 
-func TestOfflineFlattenedEROFSRebuildPreservesConfigAndRemovesOldZIP(t *testing.T) {
+func TestFlattenedEROFSAssemblyPreservesConfigAndRemovesOldZIP(t *testing.T) {
 	payload := fakeEROFS()
 	imageConfig := []byte(`{"Architecture":"arm64","Os":"linux","Cmd":["/app"]}`)
 	legacyZIP := legacyConfigZIP(t, imageConfig)
@@ -290,7 +290,7 @@ func TestOfflineFlattenedEROFSRebuildPreservesConfigAndRemovesOldZIP(t *testing.
 		t.Fatalf("rebuilt payload retained old ZIP: archive base=%d want=%d", rebuilt.ArchiveBase, len(payload))
 	}
 	if !bytes.Equal(rebuilt.ImageConfig, imageConfig) {
-		t.Fatal("offline conversion changed config.json bytes")
+		t.Fatal("Sandbox E assembly changed config.json bytes")
 	}
 	if err := rebuilt.Close(); err != nil {
 		t.Fatal(err)

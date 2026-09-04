@@ -673,7 +673,7 @@ func applyRunCaptureSources(params *VMParams, opts RunOptions) {
 }
 
 // ResolvePortableProjection verifies host kernel/runtime artifacts and returns
-// their basename identities for C0. Offline export shares this preflight.
+// their basename identities for C0. Image-to-Sandbox-E assembly shares this preflight.
 func ResolvePortableProjection(cfg *config.SandboxConfig) (config.PortableProjection, error) {
 	kernelRef, err := buildKernelRef(cfg.Boot.Kernel)
 	if err != nil {
@@ -725,26 +725,6 @@ func VerifyKernelArtifact(uri string) error {
 		return errors.New("kernel is not a regular file")
 	}
 	return nil
-}
-
-// PrepareOfflinePortableConfig validates and canonicalizes an explicit config
-// for offline flattened-EROFS export, then replaces its root graph with the
-// direct EROFS self layout.
-func PrepareOfflinePortableConfig(ctx context.Context, cfg *config.SandboxConfig, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (*config.PortableSandboxConfig, error) {
-	if cfg == nil {
-		return nil, errors.New("offline export config is nil")
-	}
-	if err := cfg.ValidateColdProjection(); err != nil {
-		return nil, err
-	}
-	if err := canonicalizeConfiguredTarRefsWithOpener(ctx, cfg, locations, codec, required, opener); err != nil {
-		return nil, err
-	}
-	identities, err := ResolvePortableProjection(cfg)
-	if err != nil {
-		return nil, err
-	}
-	return config.NewPortableEROFS(cfg, identities)
 }
 
 func buildKernelRef(uri string) (string, error) {
@@ -2737,7 +2717,7 @@ type snapshotBundlePlan struct {
 }
 
 // SandboxDependencyPlan is the narrow two-phase dependency closure used by
-// offline EROFS export. Planning opens and validates every explicit disk ref;
+// image-to-Sandbox-E assembly. Planning opens and validates every explicit disk ref;
 // Bundle callers can then create their writer with the final refs list before
 // emitting any metadata. It is intentionally specific to the Sandbox graph.
 type SandboxDependencyPlan struct{ plan *snapshotBundlePlan }

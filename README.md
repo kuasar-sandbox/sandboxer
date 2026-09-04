@@ -20,6 +20,8 @@ node proxy 在完成远程 exec 鉴权后接入现有 exec/MUX 链路。资源�
 | `cmd/sandbox-ctl` | host 控制平面:`run --config/--from/--restore` / `export` / `snapshot` / `publish` / `info` / `exec` / `config` |
 | `cmd/sandbox-init` | guest PID 1:三阶段 init + vsock 控制面 + 应用监督;由 `guest-runtime` 打包进 `sandbox-runtime.bundle` |
 | `pkg/sandbox` `pkg/restore` `pkg/snapshot` | 生命周期编排:显式/E冷启动、E/S同点快照、memory恢复与独立disk/memory provenance |
+| `pkg/sandboxfile` | strict Sandbox E 与 flattened image parser，以及保留 sparse map 的顶层 E source 组装 |
+| `pkg/artifact` | logical image/Sandbox source 的 Manifest store 与 named-location single-root Bundle 发布 API |
 | `pkg/uffd` `pkg/memory` | uffd handler 与 memfd 统一内存所有权(懒加载) |
 | `pkg/vhost` | vhost-user-blk 后端(file / manifest 块源 + CoW diff) |
 | `pkg/{guestlink,mux,proto,fwd,stdio}` | host↔guest vsock 控制面、stdio MUX 与端口转发 |
@@ -27,6 +29,33 @@ node proxy 在完成远程 exec 鉴权后接入现有 exec/MUX 链路。资源�
 | `pkg/{config,resctl,chapi,tapfd}` | sandbox.yaml、cgroup+balloon 联动、CH API 客户端、tapfd 消费 |
 | `pkg/util` | 内联工具(`ParseSize` / `LocateBinary` 等,跨模块导出) |
 | `pkg/resource` | **导出面**:节点资源控制协议(`orchestrator` 的 node-ctl import) |
+
+## 顶层 Sandbox E 组装与直接发布
+
+上层构建器无需启动 VM，也无需先写完整 `.sandbox` 文件。`pkg/sandbox` 的
+`OpenFlattenedImage`、`PrepareSandboxEConfig` 和 `AssembleSandboxE` 接受 local
+digest-qualified tarstream、`manifest://` 或 located Manifest Bundle image，生成保留
+Hole/Zero/Data map 的标准 Sandbox E `sparse.Source`。输入 `FlattenedImage` 由调用者
+关闭；组装所得 source 借用它，必须在 image 关闭前消费完毕。原始 `config.json`
+bytes 原样保留，`sandbox.runtime.cfg` 使用 canonical encoding，root 为 direct EROFS
+`self` layout。每任务持有权威 key 的嵌入式调用者使用
+`artifact.NewProcessStorageWithCustomerKey` 显式传入 resolver；该 resolver 至多求值一次，
+不会退回或覆盖为进程级 `MANIFEST_KEY`。
+
+`pkg/artifact.Publisher.PublishSource` 将已经组装的 `RoleImage` 或 `RoleSandbox`
+直接 ingest 到 Manifest store。`NewSingleRootBundlePublisher` 则将同样的 logical
+source 直接形成 named-location Manifest Bundle，返回
+`file://<key>.bundle@manifest:<key>#<location>`；它不先生成 tarstream、不先上传
+Manifest store，也不创建 `.image`、`.sandbox` 或 BuildID/SandboxID alias。调用者
+保留 source 的所有权。
+
+single-root Bundle 使用调用者预先取得的 write admission 与 customer key，在目标
+目录内完成 ingest/finalize 和完整验证，再通过 shared-location exclusive-create
+协议发布内容寻址 final。file 与 directory 都会 fsync；同 key 的并发 writer 收敛到
+经过严格验证的同一 final，corrupt、mismatched、symlink 或 non-regular existing
+final 均 fail closed。Local tarstream 是一个 role-specific transport file；Manifest
+Bundle 则是带 admission、Manifest/chunk 与 crypto domain 的自包含 carrier，两者不能
+仅凭扩展名互换。
 
 ## 本地目录身份
 

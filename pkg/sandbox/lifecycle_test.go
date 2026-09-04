@@ -83,7 +83,7 @@ func TestApplyRunCaptureSourcesForwardsBundleFetcher(t *testing.T) {
 	}
 }
 
-func TestPrepareOfflinePortableConfigDoesNotRequireRuntimeCgroup(t *testing.T) {
+func TestPrepareSandboxEConfigDoesNotRequireRuntimeCgroup(t *testing.T) {
 	dir := t.TempDir()
 	kernel := filepath.Join(dir, "vmlinux")
 	if err := os.WriteFile(kernel, []byte("kernel"), 0o600); err != nil {
@@ -131,9 +131,9 @@ func TestPrepareOfflinePortableConfigDoesNotRequireRuntimeCgroup(t *testing.T) {
 			},
 		},
 	}
-	portable, err := PrepareOfflinePortableConfig(context.Background(), cfg, nil, nil, false, nil)
+	portable, err := PrepareSandboxEConfig(context.Background(), cfg, []byte(`{"Cmd":["/bin/true"]}`), nil, nil, false, nil)
 	if err != nil {
-		t.Fatalf("PrepareOfflinePortableConfig rejected host resource policy: %v", err)
+		t.Fatalf("PrepareSandboxEConfig rejected host resource policy: %v", err)
 	}
 	if portable.Resources.Capacity.CPU != 2 || portable.Resources.Allocatable.CPU != 1.5 || portable.Resources.Allocatable.Memory != "1GiB" {
 		t.Fatalf("portable resources = %+v", portable.Resources)

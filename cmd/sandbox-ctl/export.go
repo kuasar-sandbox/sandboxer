@@ -18,17 +18,16 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
-	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"golang.org/x/sys/unix"
 )
 
 func exportCmd(args []string) int {
 	fs := flag.NewFlagSet("export", flag.ContinueOnError)
-	sandboxID := fs.String("sandbox-id", "", "live sandbox id; optional output alias for offline export")
+	sandboxID := fs.String("sandbox-id", "", "live sandbox id; optional output alias for image assembly")
 	pathID := fs.String("path-id", "", "live run-root directory leaf (takes precedence over --sandbox-id)")
-	from := fs.String("from", "", "offline flattened EROFS reference")
-	configPath := fs.String("config", "", "offline sandbox.yaml path(s), ':'-separated (or SANDBOX_CONFIG)")
+	from := fs.String("from", "", "flattened EROFS reference for image-to-Sandbox-E assembly")
+	configPath := fs.String("config", "", "assembly sandbox.yaml path(s), ':'-separated (or SANDBOX_CONFIG)")
 	outDir := fs.String("output", "", "local output directory")
 	upload := fs.Bool("upload", false, "upload artifacts to the manifest store")
 	mode := fs.String("mode", ctl.SnapshotModeLocal, "local carrier: local|bundle")
@@ -87,11 +86,11 @@ func exportCmd(args []string) int {
 		}
 	}
 	if *from != "" && *resume {
-		fmt.Fprintln(os.Stderr, "export: offline --from does not accept --resume")
+		fmt.Fprintln(os.Stderr, "export: image assembly with --from does not accept --resume")
 		return 2
 	}
 	if *from != "" && *pathID != "" {
-		fmt.Fprintln(os.Stderr, "export: offline --from does not accept --path-id")
+		fmt.Fprintln(os.Stderr, "export: image assembly with --from does not accept --path-id")
 		return 2
 	}
 	if *from == "" && *configPath != "" {
@@ -103,7 +102,7 @@ func exportCmd(args []string) int {
 		return 2
 	}
 	if *from == "" && (manifestSet || refLocationSet) {
-		fmt.Fprintln(os.Stderr, "export: live mode uses the running sandbox storage/ref bindings; --manifest-config and --ref-location are offline-only")
+		fmt.Fprintln(os.Stderr, "export: live mode uses the running sandbox storage/ref bindings; --manifest-config and --ref-location are assembly-only")
 		return 2
 	}
 	if *outDir != "" {
@@ -119,10 +118,10 @@ func exportCmd(args []string) int {
 			*configPath = os.Getenv("SANDBOX_CONFIG")
 		}
 		if *configPath == "" {
-			fmt.Fprintln(os.Stderr, "export: offline mode requires --config or SANDBOX_CONFIG")
+			fmt.Fprintln(os.Stderr, "export: image assembly requires --config or SANDBOX_CONFIG")
 			return 2
 		}
-		return offlineExport(*from, *configPath, *sandboxID, *outDir, *upload, *mode, *manifestPath, refLocations, *timeoutS)
+		return assembleSandboxEExport(*from, *configPath, *sandboxID, *outDir, *upload, *mode, *manifestPath, refLocations, *timeoutS)
 	}
 	targetPathID, err := resolveTargetPathID(*sandboxID, *pathID)
 	if err != nil {
@@ -194,7 +193,7 @@ func liveExport(pathID, outDir string, upload bool, mode string, modeSet, resume
 	return printExportResult(upload, resp)
 }
 
-func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode, manifestPath string, locations config.RefLocations, timeoutS int) (exitCode int) {
+func assembleSandboxEExport(raw, configPaths, sandboxID, outDir string, upload bool, mode, manifestPath string, locations config.RefLocations, timeoutS int) (exitCode int) {
 	ctx, stopSignals := commandContext()
 	defer stopSignals()
 	if timeoutS > 0 {
@@ -221,7 +220,7 @@ func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode
 		return 1
 	}
 	defer storage.Close()
-	image, err := openFlattenedExportSource(ctx, raw, storage, locations)
+	image, err := sandbox.OpenFlattenedImage(ctx, raw, storage, locations)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: %v\n", err)
 		return 1
@@ -230,22 +229,13 @@ func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode
 	opener := sandbox.FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
 		return storage.OpenFileWithLocations(ctx, path, ref, locations)
 	})
-	imageDefaults, err := sandbox.LoadImageConfigBytes(image.ImageConfig)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "export: config.json: %v\n", err)
-		return 1
-	}
-	if err := sandbox.MaterializeImageDefaults(cfg, imageDefaults); err != nil {
-		fmt.Fprintf(os.Stderr, "export: image defaults: %v\n", err)
-		return 1
-	}
-	portable, err := sandbox.PrepareOfflinePortableConfig(ctx, cfg, locations, storage.LocalCodec(), storage.LocalRequired(), opener)
+	portable, err := sandbox.PrepareSandboxEConfig(ctx, cfg, image.ImageConfig, locations, storage.LocalCodec(), storage.LocalRequired(), opener)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: config: %v\n", err)
 		return 1
 	}
 	if sandboxID == "" {
-		sandboxID = "offline"
+		sandboxID = "assembly"
 	}
 	bundleTarget := !upload && mode == ctl.SnapshotModeBundle
 	var admission store.WriteAdmission
@@ -278,7 +268,7 @@ func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode
 			}
 		}
 	}()
-	sink, err := newOfflineArtifactSink(outDir, sandboxID, upload, mode, manifestCfg, storage, admission, dependencyPlan.Refs())
+	sink, err := newAssemblyArtifactSink(outDir, sandboxID, upload, mode, manifestCfg, storage, admission, dependencyPlan.Refs())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -304,12 +294,7 @@ func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode
 		fmt.Fprintf(os.Stderr, "export: dependency refs: %v\n", err)
 		return 1
 	}
-	runtimeBytes, err := config.MarshalPortableSandboxConfig(portable)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	logical, err := sandboxfile.BuildSourceContext(ctx, image.Payload, image.ImageConfig, runtimeBytes)
+	logical, err := sandbox.AssembleSandboxE(ctx, image, portable)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: build Sandbox E: %v\n", err)
 		return 1
@@ -333,34 +318,7 @@ func offlineExport(raw, configPaths, sandboxID, outDir string, upload bool, mode
 	return printExportResult(upload, resp)
 }
 
-func openFlattenedExportSource(ctx context.Context, raw string, storage *artifact.ProcessStorage, locations config.RefLocations) (*sandboxfile.FlattenedImage, error) {
-	ref, path, err := resolveRunSourceRef(raw, locations)
-	if err != nil {
-		return nil, err
-	}
-	var stream fetch.Stream
-	if ref.Scheme == manifest.RefSchemeManifest {
-		if storage.Fetcher() == nil {
-			return nil, errors.New("manifest:// flattened EROFS requires manifest configuration")
-		}
-		key, err := manifest.ParseKeyRef(ref.Path)
-		if err != nil {
-			return nil, err
-		}
-		stream, err = storage.Fetcher().OpenManifest(ctx, key)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		stream, err = storage.OpenFileWithLocations(ctx, path, ref, locations)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return sandboxfile.OpenFlattenedEROFS(ctx, stream)
-}
-
-func newOfflineArtifactSink(outDir, sandboxID string, upload bool, mode string, manifestCfg *config.ManifestConfig, storage *artifact.ProcessStorage, admission store.WriteAdmission, refs []string) (snapshot.ArtifactSink, error) {
+func newAssemblyArtifactSink(outDir, sandboxID string, upload bool, mode string, manifestCfg *config.ManifestConfig, storage *artifact.ProcessStorage, admission store.WriteAdmission, refs []string) (snapshot.ArtifactSink, error) {
 	if upload {
 		if manifestCfg == nil || manifestCfg.Store.Endpoint == "" || storage.CustomerKeyFunc() == nil {
 			return nil, errors.New("export upload requires manifest store configuration")
