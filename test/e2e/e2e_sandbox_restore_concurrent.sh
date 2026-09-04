@@ -163,11 +163,18 @@ ping_guest() { # <tap> <guest_ip>
     return 1
 }
 
-# assert_net_config <sid> <want_tap|-> <want_fds|absent|placeholder> [want_mac]
+# captured_net_id <sid> — the id CH captured for net[0], preserved by the
+# rewrite; read from the per-restore snap-state/config.json.
+captured_net_id() {
+    python3 -c 'import json,sys; n=(json.load(open(sys.argv[1])).get("net") or [{}])[0]; print(n.get("id") or "")' \
+        "$RUNTIME_ROOT/$1/snap-state/config.json"
+}
+
+# assert_net_config <sid> <want_tap|-> <want_fds|absent|placeholder> [want_mac] [want_id]
 assert_net_config() {
-    python3 - "$RUNTIME_ROOT/$1/snap-state/config.json" "$2" "$3" "${4:-}" <<'PY'
+    python3 - "$RUNTIME_ROOT/$1/snap-state/config.json" "$2" "$3" "${4:-}" "${5:-}" <<'PY'
 import json, sys
-path, want_tap, want_fds, want_mac = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+path, want_tap, want_fds, want_mac, want_id = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 cfg = json.load(open(path))
 net = cfg.get("net") or []
 assert len(net) == 1, f"expected exactly one net device, got {net!r}"
@@ -182,6 +189,8 @@ elif want_fds == "placeholder":
     assert n.get("fds") == [-1], f"fds={n.get('fds')!r}, want [-1]"
 if want_mac:
     assert n.get("mac") == want_mac, f"mac={n.get('mac')!r}, want {want_mac!r}"
+if want_id:
+    assert n.get("id") == want_id, f"id={n.get('id')!r}, want {want_id!r}"
 PY
 }
 
@@ -336,13 +345,20 @@ for s in b c; do
         ok "name-mode restore $s used the rebound tap (no net_fds)"
     fi
 done
-if assert_net_config "scr-b-$$" "$TAP_B" absent "$MAC_A"; then
-    ok "B snap-state/config.json: tap rebound to $TAP_B, fds removed, MAC preserved"
+NET_ID_B="$(captured_net_id "scr-b-$$")"
+NET_ID_C="$(captured_net_id "scr-c-$$")"
+if [ -n "$NET_ID_B" ] && [ "$NET_ID_B" = "$NET_ID_C" ]; then
+    ok "B/C captured the same net device id '$NET_ID_B' from snapshot S"
+else
+    bad "net device id capture mismatch: B='$NET_ID_B' C='$NET_ID_C'"
+fi
+if assert_net_config "scr-b-$$" "$TAP_B" absent "$MAC_A" "$NET_ID_B"; then
+    ok "B snap-state/config.json: tap rebound to $TAP_B, fds removed, id/MAC preserved"
 else
     bad "B snap-state/config.json rebinding wrong"
 fi
-if assert_net_config "scr-c-$$" "$TAP_C" absent "$MAC_A"; then
-    ok "C snap-state/config.json: tap rebound to $TAP_C, fds removed, MAC preserved"
+if assert_net_config "scr-c-$$" "$TAP_C" absent "$MAC_A" "$NET_ID_C"; then
+    ok "C snap-state/config.json: tap rebound to $TAP_C, fds removed, id/MAC preserved"
 else
     bad "C snap-state/config.json rebinding wrong"
 fi
@@ -388,12 +404,16 @@ else
     echo "--- restore-x.log tail ---"; tail -40 "$WORK/restore-x.log"
     bad "cross-mode tap→tapfd restore did not keep counting"
 fi
-if grep -q "net_fds=\[_net0@\[" "$WORK/restore-x.log"; then
-    ok "cross-mode tap→tapfd re-bound fd via net_fds"
+# The captured id is CH's runtime-assigned device id (not always _net0 for
+# name-mode snapshots) — cross-check it survived the mode swap and that the
+# restore carried net_fds for exactly that id.
+NET_ID_X="$(captured_net_id "scr-x-$$")"
+if [ "$NET_ID_X" = "$NET_ID_B" ] && [ -n "$NET_ID_X" ] && grep -qF "net_fds=[$NET_ID_X@[" "$WORK/restore-x.log"; then
+    ok "cross-mode tap→tapfd re-bound fd via net_fds (id $NET_ID_X)"
 else
-    bad "no net_fds rebind in cross-mode tap→tapfd restore"
+    bad "no net_fds rebind in cross-mode tap→tapfd restore (captured id: '$NET_ID_X', want '$NET_ID_B')"
 fi
-if assert_net_config "scr-x-$$" "-" placeholder "$MAC_A"; then
+if assert_net_config "scr-x-$$" "-" placeholder "$MAC_A" "$NET_ID_X"; then
     ok "X snap-state/config.json: tap removed, fds=[-1] placeholder, MAC preserved"
 else
     bad "X snap-state/config.json rebinding wrong"
