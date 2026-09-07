@@ -200,7 +200,7 @@ sandbox-ctl export \
   [--mode local|bundle]
 ```
 
-Live mode不接受 `--config`;它复用当前 run 进程已验证的 manifest/ref-location/crypto binding,因此显式 `--manifest-config` 和 `--ref-location` 仅属于 assembly mode. Assembly mode要求 `--config` 或 `SANDBOX_CONFIG` 且拒绝 `--resume`. 两种模式都支持 `--timeout`;0 表示不设 operation deadline. Export 不接受 `drop_caches` 或 memory merge 参数,不调用 CH `/vm.snapshot`,不读取 memfd,不生成 memory refs.
+Live mode不接受 `--config`;它复用当前 run 进程已验证的 manifest/ref-location/crypto binding,因此显式 `--manifest-config` 和 `--ref-location` 仅属于 assembly mode. Assembly mode要求 `--config` 或 `SANDBOX_CONFIG` 且拒绝 `--resume`。两种模式都支持 `--timeout`：live mode 限制客户端等待 ctl socket 的时间，assembly 则给自己的 operation context 设置 deadline；0 关闭各自的 CLI 限制。两者都不会给 live-export request 增加服务端 deadline。Export 不接受 `drop_caches` 或 memory merge 参数,不调用 CH `/vm.snapshot`,不读取 memfd,不生成 memory refs.
 
 live mode 与 local snapshot 相同，可只给 PathID；同时给出 SandboxID/PathID 时
 PathID 只定位 ctl socket。Assembly mode 不接受 PathID，原有 `--sandbox-id` 仍仅是
@@ -607,7 +607,7 @@ from_refs:
 
 `sandbox_ref` 指向同一 freeze point 生成的 E. `from_refs` 是 top-to-bottom memory parent chain. S 不重复 capacity、runtime、root/data graph、launch、mounts、files、init 或 metadata.
 
-Snapshot ZIP 与 config 同样 strict、bounded、canonical. 旧 disk-schema input 返回 `unsupported snapshot format/version`,不 dual-read、不 migration、不 cold fallback.
+Snapshot ZIP 与 config 同样 strict、bounded、canonical。`config.json` 和 `state.json` 各限 16 MiB，`snapshot.cfg` 限 1 MiB，`from_refs` 最多 64 项。源码见 [snapshotfile.go](../pkg/snapshotfile/snapshotfile.go) 和 [snapshot/config.go](../pkg/snapshot/config.go)。旧 disk-schema input 返回 `unsupported snapshot format/version`,不 dual-read、不 migration、不 cold fallback.
 
 ### 3.8 files、env 与 ephemeral
 
@@ -821,7 +821,7 @@ exec_request     -> exec_ack      | error
 
 Export不是 `snapshot_request{memory:false}`. Request在 run process中执行,因此可以复用当前 lifecycle barrier、guest/MUX gate、CH API socket和live vhost SnapshotView.
 
-Response 中不回显 secret。Remote Manifest upload 可以耗时较长，CLI `--timeout=0` 表示不设置 operation deadline；operation context 仍控制支持取消的 I/O。Local snapshot/live export 的 CLI timeout 限制 ctl connection 的等待，不是 wire request 中的服务端 deadline；CLI 超时不能证明没有 artifact 被 commit。
+Response 中不回显 secret。Remote Manifest upload 可以耗时较长。Local snapshot/live export 的 CLI `--timeout=0` 不给 ctl connection 设置 deadline；正数只限制该客户端的等待。两者都不是 wire request 中的服务端 deadline 字段。服务端 lifecycle context 仍控制支持取消的 I/O，CLI 超时不能证明没有 artifact 被 commit。Image-to-Sandbox-E assembly 则将正数 timeout 应用于自己的 operation context（§2.4）。
 
 ### 6.4 Image-to-Sandbox-E assembly
 
@@ -900,7 +900,7 @@ next snapshot:
 
 ### 7.1 Memory prefetch
 
-`restore.prefetch: memory` 是 host-only optimization,只预热当前 S memory self的 file page cache或Manifest chunks. 它不改变 sparse truth、fault ordering、C0、S或memory parents. 默认 `off`。Invalid configured mode 在副作用前验证失败；缺少 prefetch capability 或预取 I/O 失败属于 best-effort，不使 restore 失败，而是记录日志并继续 on-demand。异步任务在 stream 关闭前被 cancel 并 join。源码见 [prefetch.go](../pkg/restore/prefetch.go)。
+`restore.prefetch: memory` 是 host-only optimization，预热当前 S self 的 file page cache 或 Manifest chunks，不包含 parent memory layers 和 disk streams。调用传入的是 opened root stream，因此范围也可能包含 S 的有界 ZIP metadata tail，并非仅 memory payload section。它不改变 sparse truth、fault ordering、C0、S或memory parents. 默认 `off`。Invalid configured mode 在副作用前验证失败；缺少 prefetch capability 或预取 I/O 失败属于 best-effort，不使 restore 失败，而是记录日志并继续 on-demand。异步任务在 stream 关闭前被 cancel 并 join。源码见 [prefetch.go](../pkg/restore/prefetch.go) 及 [restore.go](../pkg/restore/restore.go) 中的调用。
 
 ## 8. UFFD handler
 
@@ -1144,7 +1144,7 @@ Read 顺序为 active diff -> captured top -> `base_from_refs` -> root image（�
 
 ### 12.4 BlockCOW state
 
-BlockCOW使用clean/dirty/discard三态跟踪active upper. Discard对应Hole语义;写入zero bytes仍是Data/Zero事实,不能扫描为Hole. Export/snapshot不rotate active diff,也不把新E设为backend base.
+BlockCOW 以 dirty bitmap 跟踪 4 KiB active-upper block，并非 clean/dirty/discard 三态 map。Dirty block 从 diff 读取；clean block 回落到 base，没有 base 才返回零。底层 `Discard` helper 只对完整 block 打洞并清除 dirty bit，使 base 再次可见；它不持久化能遮蔽 lower layer 的显式 Zero。当前 vhost profile 不公告 DISCARD 或 WRITE_ZEROES，request dispatcher 对两者都返回 unsupported，不调用这个 helper。写入 zero bytes 仍使 block 保持 dirty，不能扫描为 Hole。Export/snapshot 不 rotate active diff，也不把新 E 设为 backend base。源码见 [blk_cow.go](../pkg/vhost/blk_cow.go)、[server.go](../pkg/vhost/server.go) 和 [worker.go](../pkg/vhost/worker.go)。
 
 ### 12.5 Quiesce / Resume
 
