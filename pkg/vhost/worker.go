@@ -335,20 +335,14 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 			*status = BlkStatusIOErr
 		}
 
-	case BlkTypeDiscard, BlkTypeWriteZero:
-		// v1: parse the request range and call backend.Discard. The
-		// virtio-blk DISCARD payload is a list of {sector, num_sectors,
-		// flags} 16-byte entries in the readable segments after header.
-		// v1 ignores actual range and treats as no-op success.
-		_ = s.backend.Discard(0, 0)
-
 	default:
+		// Optional commands, including DISCARD and WRITE_ZEROES, are not
+		// advertised by our minimal profile. Never report false success.
 		*status = BlkStatusUnsupp
 	}
 
 	// Number of bytes written to device-writable buffers = data bytes for
-	// IN + 1 status byte. For OUT/FLUSH/DISCARD, only the status byte is
-	// written → 1.
+	// IN + 1 status byte. Other commands write only the status byte.
 	ret := 1
 	if hdr.Type == BlkTypeIn {
 		ret = bytesIO + 1
