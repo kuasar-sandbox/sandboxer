@@ -48,11 +48,11 @@ type CowBackend struct{ C *BlockCOW }
 
 func (b *CowBackend) ReadAt(buf []byte, offset int64) (int, error)  { return b.C.ReadAt(buf, offset) }
 func (b *CowBackend) WriteAt(buf []byte, offset int64) (int, error) { return b.C.WriteAt(buf, offset) }
-func (b *CowBackend) Flush() error                               { return b.C.Flush() }
-func (b *CowBackend) Discard(offset, length int64) error         { return b.C.Discard(offset, length) }
-func (b *CowBackend) Size() int64                                { return b.C.Size() }
-func (b *CowBackend) ReadOnly() bool                             { return false }
-func (b *CowBackend) BackendStats() map[string]any               { return b.C.BackendStats() }
+func (b *CowBackend) Flush() error                                  { return b.C.Flush() }
+func (b *CowBackend) Discard(offset, length int64) error            { return b.C.Discard(offset, length) }
+func (b *CowBackend) Size() int64                                   { return b.C.Size() }
+func (b *CowBackend) ReadOnly() bool                                { return false }
+func (b *CowBackend) BackendStats() map[string]any                  { return b.C.BackendStats() }
 
 // ErrReadOnly is returned by WriteAt on a read-only backend.
 var ErrReadOnly = fmt.Errorf("vhost: backend is read-only")
@@ -254,12 +254,14 @@ func (s *Server) Serve(ctx context.Context) error {
 
 // serveOneMaster runs the vhost-user protocol loop on a single master
 // connection until the master disconnects (EOF / socket close) or Stop
-// fires (which closes activeConn here to break out of ReadMessage). Errors
+// fires (which closes activeConn to break out of ReadMessage). Errors
 // are logged; the loop never returns them up to Serve, since a wedged
 // master should not kill the listener.
 //
-// No read deadline is set: vhost-user has no keepalive semantics — it's silent
-// throughout normal steady-state operation (kick/call eventfds carry traffic).
+// No read deadline is set: the vhost-user control socket has no
+// keepalive semantics — it's silent throughout normal steady-state
+// operation (kick/call eventfds carry all the traffic). A per-read
+// deadline misclassifies that silence as disconnect.
 func (s *Server) serveOneMaster(conn *net.UnixConn) {
 	defer conn.Close()
 	for {
@@ -485,6 +487,9 @@ func (s *Server) handleGetFeatures(conn *net.UnixConn, m *Message) error {
 }
 
 func (s *Server) handleSetFeatures(conn *net.UnixConn, m *Message) error {
+	if len(m.Payload) != 8 {
+		return fmt.Errorf("vhost: SET_FEATURES payload size %d, want 8", len(m.Payload))
+	}
 	v, err := ParseU64(m.Payload)
 	if err != nil {
 		return err
@@ -506,6 +511,9 @@ func (s *Server) handleGetProtocolFeatures(conn *net.UnixConn, m *Message) error
 }
 
 func (s *Server) handleSetProtocolFeatures(conn *net.UnixConn, m *Message) error {
+	if len(m.Payload) != 8 {
+		return fmt.Errorf("vhost: SET_PROTOCOL_FEATURES payload size %d, want 8", len(m.Payload))
+	}
 	v, err := ParseU64(m.Payload)
 	if err != nil {
 		return err
@@ -701,7 +709,7 @@ func (s *Server) handleSetVringCall(m *Message) error {
 	idx := int(binary.LittleEndian.Uint32(m.Payload[0:4]) & 0xff)
 	if idx >= NumQueues {
 		closeFds(m.Fds)
-		return fmt.Errorf("vhost: SET_VRING_CALL idx %d", idx)
+		return fmt.Errorf("vhost: queue idx %d", idx)
 	}
 	if len(m.Fds) != 1 {
 		closeFds(m.Fds)
