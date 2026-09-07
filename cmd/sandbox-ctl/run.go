@@ -96,6 +96,13 @@ func runCmd(args []string) int {
 		"port-forward LOCAL:TARGET (guest dials) or LOCAL::TARGET (guest accepts); "+
 			"LOCAL = UDS path or fd=N; TARGET = host:port or /path|@abstract (repeatable)")
 
+	// --debug / -d: raise cloud-hypervisor's log level from its warn
+	// default to info (-v appended at the end of the CH argv on both the
+	// cold-start and restore paths). Go's flag package has no shorthand
+	// mechanism, so -d is registered as its own alias flag.
+	debug := fs.Bool("debug", false, "raise cloud-hypervisor logging from warn to info (passes -v to CH)")
+	debugShort := fs.Bool("d", false, "shorthand for --debug")
+
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -103,6 +110,7 @@ func runCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "sandbox-ctl run: unexpected positional arguments")
 		return 2
 	}
+	debugOn := *debug || *debugShort
 	if *fromRef != "" && *restoreRef != "" {
 		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --from and --restore are mutually exclusive")
 		return 2
@@ -325,7 +333,7 @@ func runCmd(args []string) int {
 	if restoreR != "" {
 		return runRestore(ctx, cfg, presence, manifestCfg, restoreR,
 			*sandboxID, *pathID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
-			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness)
+			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, debugOn)
 	}
 
 	var (
@@ -392,6 +400,7 @@ func runCmd(args []string) int {
 		PingFatalThreshold: *pingFatal,
 		Forwards:           forwards,
 		NotifyReadiness:    notifyReadiness,
+		Debug:              debugOn,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -405,7 +414,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 	ref string, sandboxID, pathID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
 	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
-	notifyReadiness sandbox.ReadinessNotify,
+	notifyReadiness sandbox.ReadinessNotify, debug bool,
 ) int {
 	// Validate host-only restore policy before inspecting the remote reference or
 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
@@ -471,6 +480,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 		PingFatalThreshold:  pingFatal,
 		Forwards:            forwards,
 		NotifyReadiness:     notifyReadiness,
+		Debug:               debug,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

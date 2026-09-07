@@ -135,6 +135,19 @@ func CHCommandWithInitialBudget(cfg *config.SandboxConfig, initialBudget uint64,
 	return args, nil
 }
 
+// CHDebugArgs returns the extra cloud-hypervisor argv tokens implied by
+// `sandbox-ctl run --debug`: `-v` alone raises CH's log level from its
+// warn default to info. The tokens are appended last on both spawn
+// paths — after `--cmdline` (cold start) and after `--restore`
+// (restore), which each take exactly one value — so a leading-dash
+// token can never be absorbed as a variadic flag value (--disk/--net).
+func CHDebugArgs(debug bool) []string {
+	if !debug {
+		return nil
+	}
+	return []string{"-v"}
+}
+
 // chNetArg builds CH's --net value. tapfd handoff (tapFDNum>0) drives
 // virtio-net off a pre-opened tap queue fd inherited by CH (vnet_hdr framing,
 // docs/tapfd.md §2.6); a non-empty tapName selects a named host tap; with

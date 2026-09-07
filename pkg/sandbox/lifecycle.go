@@ -82,6 +82,10 @@ type RunOptions struct {
 	// NotifyReadiness receives the one-shot startup milestones for this run.
 	// nil preserves the historical behavior exactly.
 	NotifyReadiness ReadinessNotify
+
+	// Debug mirrors `sandbox-ctl run --debug`: it appends CHDebugArgs
+	// (-v, CH info logs) to the CH command line.
+	Debug bool
 }
 
 // RunSourceBinding is the non-serializable provenance needed to resolve the
@@ -291,6 +295,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		return -1, err
 	}
 	initialBudget := resctl.AlignedBudget(capBytes, startupHeadroom)
+
 	// Reject a CH-inexpressible memory domain before creating a lease or
 	// acquiring any node reservation. Validate both the cold command-line
 	// target and the farthest target the settled policy can request.
@@ -623,6 +628,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 				cleanup()
 				return nil, nil, fmt.Errorf("CH cmdline: %w", err)
 			}
+			args = append(args, CHDebugArgs(opts.Debug)...)
 			cmd.Args = append(cmd.Args, args...)
 			logf("CH args: %s", strings.Join(args, " "))
 			return cmd, cleanup, nil

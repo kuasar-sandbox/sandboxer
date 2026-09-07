@@ -75,7 +75,7 @@ func callRunRestoreForValidation(t *testing.T, cfg *config.SandboxConfig, manife
 			context.Background(), cfg, config.FieldPresence{}, manifestCfg, "manifest://deadbeef",
 			"test-sandbox", "", "/nonexistent/cloud-hypervisor",
 			runRoot, filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil,
-			nil, nil, nil, false, nil,
+			nil, nil, nil, false, nil, false,
 		)
 	})
 }
@@ -131,7 +131,7 @@ func TestRunRestoreChecksDigestOnUnlocatedFileRef(t *testing.T) {
 			context.Background(), &config.SandboxConfig{}, config.FieldPresence{}, nil, ref,
 			"test-sandbox", "", "/nonexistent/cloud-hypervisor", runRoot,
 			filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil,
-			nil, nil, nil, false, nil,
+			nil, nil, nil, false, nil, false,
 		)
 	})
 	if rc != 1 || !strings.Contains(stderr, "digest mismatch") {
@@ -175,4 +175,31 @@ func writeRunRestoreSnapshot(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// TestRunCmdDebugFlagAccepted covers --debug / -d parsing: every valid
+// form reaches the config-load stage (exit 1 on the missing config),
+// while an unknown flag exits 2 at parse. The argv effect (CH gets -v)
+// is covered by TestCHDebugArgs and the e2e runs.
+func TestRunCmdDebugFlagAccepted(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		rc   int
+		want string
+	}{
+		{name: "long form", args: []string{"--debug", "--config", "missing.yaml"}, rc: 1, want: "missing.yaml"},
+		{name: "short form", args: []string{"-d", "--config", "missing.yaml"}, rc: 1, want: "missing.yaml"},
+		{name: "short form set false", args: []string{"-d=false", "--config", "missing.yaml"}, rc: 1, want: "missing.yaml"},
+		{name: "unknown flag", args: []string{"--nope", "--config", "missing.yaml"}, rc: 2, want: "flag provided but not defined"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SANDBOX_CH_PATH", "/nonexistent/cloud-hypervisor")
+			rc, stderr := captureStderr(t, func() int { return runCmd(tc.args) })
+			if rc != tc.rc || !strings.Contains(stderr, tc.want) {
+				t.Fatalf("runCmd rc=%d stderr=%q, want rc=%d containing %q", rc, stderr, tc.rc, tc.want)
+			}
+		})
+	}
 }
