@@ -161,8 +161,14 @@ func TestMinimalProfileFeatureSubsets(t *testing.T) {
 					}
 				}
 			}
-			if err := srv.handle(nil, &Message{Header: Header{Request: req}, Payload: make([]byte, 7)}); err == nil || *state != supported {
-				t.Fatalf("%s malformed payload accepted or changed state", MsgName(req))
+			// Oversized payloads start with the valid but different zero
+			// subset. Accepting just their first eight bytes would mutate
+			// the prior state, so this assertion cannot pass accidentally.
+			for _, size := range []int{0, 1, 7, 9, 16} {
+				m := &Message{Header: Header{Request: req}, Payload: make([]byte, size)}
+				if err := srv.handle(nil, m); err == nil || *state != supported {
+					t.Fatalf("%s payload size %d accepted or changed state to %#x", MsgName(req), size, *state)
+				}
 			}
 		}
 	}
@@ -171,32 +177,50 @@ func TestMinimalProfileFeatureSubsets(t *testing.T) {
 func TestMinimalProfileRejectReconnect(t *testing.T) {
 	for _, req := range []uint32{MsgSetFeatures, MsgSetProtocolFeatures} {
 		t.Run(MsgName(req), func(t *testing.T) {
-			srv, dial := startMinimalProfileServer(t, &memBackend{data: make([]byte, 512)})
-			c := dial()
-			minimalProfileRequest(t, c, MsgGetFeatures, nil)
-			if err := WriteMessage(c, Header{Request: req, Flags: FlagVersion1}, minimalProfileU64(1<<63)); err != nil {
-				t.Fatal(err)
+			supported := uint64(0x140000200)
+			if req == MsgSetProtocolFeatures {
+				supported = 0x200
 			}
-			// SET has no reply-ack. A following GET is a barrier: the
-			// unsupported SET must close the connection instead of letting
-			// subsequent setup continue. A timeout is not a successful test.
-			_ = WriteMessage(c, Header{Request: MsgGetFeatures, Flags: FlagVersion1}, nil)
-			if _, err := ReadMessage(c); err == nil {
-				t.Fatal("unsupported SET left connection usable")
-			} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				t.Fatalf("connection was not rejected before deadline: %v", err)
-			}
-			c.Close()
-			c2 := dial()
-			reply := minimalProfileRequest(t, c2, MsgGetFeatures, nil)
-			if !bytes.Equal(reply.Payload, minimalProfileU64(0x140000200)) {
-				t.Fatalf("reconnected profile=%x", reply.Payload)
-			}
-			srv.mu.Lock()
-			features, protocol := srv.features, srv.protocolFeatures
-			srv.mu.Unlock()
-			if features != 0 || protocol != 0 {
-				t.Fatalf("new connection inherited state: %#x / %#x", features, protocol)
+			for _, tc := range []struct {
+				name    string
+				payload []byte
+			}{
+				{"unknown-bit", minimalProfileU64(1 << 63)},
+				{"short", make([]byte, 7)},
+				{"oversized", make([]byte, 9)},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					srv, dial := startMinimalProfileServer(t, &memBackend{data: make([]byte, 512)})
+					c := dial()
+					if err := WriteMessage(c, Header{Request: req, Flags: FlagVersion1}, minimalProfileU64(supported)); err != nil {
+						t.Fatal(err)
+					}
+					minimalProfileRequest(t, c, MsgGetFeatures, nil)
+					if err := WriteMessage(c, Header{Request: req, Flags: FlagVersion1}, tc.payload); err != nil {
+						t.Fatal(err)
+					}
+					// SET has no reply-ack. A following GET is a barrier:
+					// invalid SET must close the connection, not allow setup
+					// to continue. A timeout is not a successful rejection.
+					_ = WriteMessage(c, Header{Request: MsgGetFeatures, Flags: FlagVersion1}, nil)
+					if _, err := ReadMessage(c); err == nil {
+						t.Fatal("invalid SET left connection usable")
+					} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						t.Fatalf("connection was not rejected before deadline: %v", err)
+					}
+					c.Close()
+					c2 := dial()
+					reply := minimalProfileRequest(t, c2, MsgGetFeatures, nil)
+					if !bytes.Equal(reply.Payload, minimalProfileU64(0x140000200)) {
+						t.Fatalf("reconnected profile=%x", reply.Payload)
+					}
+					srv.mu.Lock()
+					features, protocol := srv.features, srv.protocolFeatures
+					srv.mu.Unlock()
+					if features != 0 || protocol != 0 {
+						t.Fatalf("new connection inherited state: %#x / %#x", features, protocol)
+					}
+				})
 			}
 		})
 	}
@@ -259,6 +283,7 @@ func TestMinimalProfileBlockCommands(t *testing.T) {
 			srv := NewServer("unused", b, nil)
 			mem := make([]byte, 2048)
 			const uva = uint64(0x1000)
+			const chainHead = 3
 			srv.memTable.SetRegions([]MemRegion{{GuestPhysAddr: 0, UserspaceAddr: uva, MemorySize: uint64(len(mem)), mmapBytes: mem}})
 			q := &virtq{num: 8, descAddr: uva, usedAddr: uva + 128, kickFd: -1, callFd: -1}
 			putDesc := func(idx int, addr uint64, length uint32, flags, next uint16) {
@@ -269,7 +294,7 @@ func TestMinimalProfileBlockCommands(t *testing.T) {
 				binary.LittleEndian.PutUint16(d[14:16], next)
 			}
 			binary.LittleEndian.PutUint32(mem[256:260], kind)
-			putDesc(0, 256, 16, descFlagNext, 1)
+			putDesc(chainHead, 256, 16, descFlagNext, chainHead+1)
 			dataLen := uint32(16)
 			dataFlags := descFlagNext
 			if kind == BlkTypeIn || kind == BlkTypeOut {
@@ -282,15 +307,15 @@ func TestMinimalProfileBlockCommands(t *testing.T) {
 			if kind == BlkTypeIn {
 				dataFlags |= descFlagWrite
 			}
-			putDesc(1, 512, dataLen, dataFlags, 2)
-			putDesc(2, 1536, 1, descFlagWrite, 0)
+			putDesc(chainHead+1, 512, dataLen, dataFlags, chainHead+2)
+			putDesc(chainHead+2, 1536, 1, descFlagWrite, 0)
 			if kind == BlkTypeFlush {
-				putDesc(0, 256, 16, descFlagNext, 2)
+				putDesc(chainHead, 256, 16, descFlagNext, chainHead+2)
 			}
 			mem[1536] = 0xff
 			before := append([]byte(nil), b.data...)
 			payloadBefore := append([]byte(nil), mem[512:512+int(dataLen)]...)
-			n, err := srv.processChain(q, 0)
+			n, err := srv.processChain(q, chainHead)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -313,11 +338,13 @@ func TestMinimalProfileBlockCommands(t *testing.T) {
 			if mem[1536] != wantStatus || n != wantLen {
 				t.Fatalf("status=%d len=%d, want %d/%d", mem[1536], n, wantStatus, wantLen)
 			}
-			if err := srv.publishUsed(q, 0, uint32(n)); err != nil {
+			if err := srv.publishUsed(q, chainHead, uint32(n)); err != nil {
 				t.Fatal(err)
 			}
-			if binary.LittleEndian.Uint16(mem[130:132]) != 1 || binary.LittleEndian.Uint32(mem[136:140]) != uint32(wantLen) {
-				t.Fatal("incorrect used-ring completion")
+			if binary.LittleEndian.Uint16(mem[130:132]) != 1 ||
+				binary.LittleEndian.Uint32(mem[132:136]) != chainHead ||
+				binary.LittleEndian.Uint32(mem[136:140]) != uint32(wantLen) {
+				t.Fatal("incorrect used-ring completion idx/id/len")
 			}
 			wantFlushes := 0
 			if kind == BlkTypeFlush {
