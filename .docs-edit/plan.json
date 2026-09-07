@@ -1,0 +1,71 @@
+{
+  "repository": "kuasar-sandbox/sandboxer",
+  "parent_sha": "c29f9af875c595df68491b50e872007e9285ef48",
+  "message": "docs: translate VMM and native build specifications and correct source drift",
+  "translations": [
+    {
+      "path": "docs/cloud-hypervisor.md",
+      "source_blob": "27a1537aa6f085fd0dec0c2d28599219e2ddae9b",
+      "input": ".docs-edit/ch-en.md",
+      "chinese_replacements": [
+        {"old": "这些能力 upstream CH 都不直接支持。", "new": "这些组合能力在所固定的 upstream CH 版本中未直接提供。", "count": 1},
+        {"old": "### 1.2 patch 范围(总结)\n", "new": "### 1.2 patch 范围(总结)\n\n以下行数对应 sandboxer 提交 `c29f9af875c595df68491b50e872007e9285ef48` 的补丁集合,\n是该版本的近似范围说明,不是永久的大小或兼容性保证。\n", "count": 1},
+        {"old": "balloon release 对 user-managed zone 的空洞 run 跳过", "new": "balloon release 对 file-backed region 的空洞 run 跳过", "count": 1},
+        {"old": "7 个 commit 合计 1,665 insertions / 136 deletions", "new": "7 个 patch 文件合计 1,665 insertions / 136 deletions", "count": 1},
+        {"old": "- patch 文件位置:`deps/ch-patches/000{1,2,3,4,5,6,7}-*.patch`", "new": "- 仓库相对 patch 路径:`native-deps/deps/ch-patches/000{1,2,3,4,5,6,7}-*.patch`", "count": 1},
+        {"old": "- 应用方式:`make ch-patches-apply`(在 `make cloud-hypervisor` 内自动调);", "new": "- 在 `sandboxer/native-deps` 中执行 `make ch-patches-apply`(全新 `make cloud-hypervisor` 构建也会执行);", "count": 1},
+        {"old": "- 跟 upstream rebase:每个 CH 大版本(~3 月)review 一次,几行 conflict\n  人工 fix", "new": "- 每次计划升级 upstream 时复核补丁,依据实际上游变化解决冲突;不假定固定发布周期或固定 rebase 工作量", "count": 1},
+        {"old": "- **不写 fd**(也不写 uffd_socket):完全等同 upstream 行为(memfd_create 自管 RAM,\n  无 uffd)。所有不依赖外部托管的调用者(测试用例、其他工具)无须改动", "new": "- **不写 fd**(也不写 uffd_socket):内存分配沿用 upstream 的 backing-file/memfd 路径,\n  不启用这里的外部 uffd handler。这仅描述内存 backing,不表示 lifecycle、vsock 等其他补丁被禁用", "count": 1},
+        {"old": "--memory-zone size=8G,shared=on,fd=3,", "new": "--memory-zone id=ram0,size=8G,shared=on,fd=3,", "count": 1},
+        {"old": "详细命令行(冷启动 / 恢复)见 `sandboxer/docs/sandbox.md` §5.2 与 §7。", "new": "解析器要求 zone `id`;平台使用 `ram0`。详细命令行(冷启动 / 恢复)见 `sandboxer/docs/sandbox.md` §5.2 与 §7。", "count": 1},
+        {
+          "old": "- `MemoryZoneConfig` 新增 `pub fd: Option<i32>`(序列化时 `serde(skip)`,因为\n  fd 不能跨 serialize)\n- `MemoryConfig::parse` 识别 `fd=N` 形式,调 `File::from_raw_fd(N)`,**不**\n  关闭原 fd(由调用方 ExtraFiles 管理生命周期)\n- `MemoryManager::new` / `create_ram_region` 看到 `zone.fd.is_some()`:\n  - 跳过 `memfd_create`,直接 `mmap(NULL, size, PROT_RW, MAP_SHARED, fd, 0)`\n  - 在 `MemoryZone` 上标记 `user_managed: true`\n- 多 region per zone(x86_64 zone > 3 GiB 时跨 PCI hole 切两段):\n  每 region `try_clone()` 一份 fd,各自 `File` ownership;mmap 对同一 inode\n  产生多个 VMA,共享 host page cache\n\n",
+          "new": "- `MemoryZoneConfig` 新增 `pub fd: Option<i32>`,当前补丁使用 `#[serde(default)]`,\n  并非 `serde(skip)`。序列化的 fd 数字不是可迁移的内核引用;新的 CH 进程仍需继承相应 fd。\n- `MemoryConfig::parse` 解析 `fd=N`;实际 `File::from_raw_fd` 在 memory-manager\n  构建路径中接管继承的描述符,不在 CLI parser 中执行。CH 拥有这些 `File` 及其 clone;\n  父进程另持自己的描述符,生命周期相互独立。\n- zone 提供 fd 时,memory manager 将该 backing 传给 `create_ram_region`,不另建 memfd;\n  patch 0002 再把 zone 记为 `user_managed: true`。\n- 一个 zone 可含多个 region,例如较大的 x86_64 zone 跨越 PCI MMIO hole。\n  每个 region 通过 `try_clone()` 获得自己的 `File` ownership;各映射及其 file offset\n  仍指向同一 backing inode,共享 host page-cache 数据。\n\n",
+          "count": 1
+        },
+        {"old": "inode,内容由 sandbox-ctl 的 uffd handler 按需提供", "new": "inode;配置了外部 uffd 时,内容由 sandbox-ctl handler 按需提供", "count": 1},
+        {"old": "`CAP_SYS_PTRACE`,导致 UFFDIO_API 返回 EPERM。", "new": "`CAP_SYS_PTRACE`,权限不足时可能导致 UFFDIO_API 返回 EPERM。", "count": 1},
+        {
+          "old": "**背景**。guest balloon 驱动充气分配的页**从不被 guest 写入**:\n`balloon_page_alloc` 不带 `__GFP_ZERO`,平台 guest 内核未启用 `init_on_alloc`,\nfill 路径只动 struct page 元数据与 PFN 数组。又因 user-managed zone 从不\nprefault(memfd 稀疏,内容由 uffd handler 按需填),balloon 让出的 offset\n绝大多数(冷启动时**全部**)在 memfd 上本就是空洞——无 inode 页,CH 与\nsandbox-ctl 都无 PTE。\n\n但 CH 的 balloon inflate 处理对每个让出 run 仍调 `release_memory_range`:\n`fallocate(PUNCH_HOLE|KEEP_SIZE)` on memfd + `madvise(MADV_DONTNEED)` on chVA。\n后者落在 uffd 注册的 chVA 上,内核**无条件**(与该 run 是否驻留无关)合成\n一条 `EVENT_REMOVE`,且 `MADV_DONTNEED` **同步阻塞**到外部 handler 消费完\n该事件才返回。冷启动充气覆盖整个 `Capacity − InitialBudget` 区间时,这是一场\n\"对从未存在的页\"的空 `EVENT_REMOVE` 风暴:压垮 handler 单 reader,并反压\nCH 的 balloon 线程。`EVENT_REMOVE` 的真正来源是 chVA 上的 `MADV_DONTNEED`\n(不是 memfd 的 fallocate)——所以**必须同时跳过两者**才能不发事件。\n\n**要点**:\n\n- `release_memory_range` 对**有 file_offset 的 region**(即 user-managed\n  fd-backed zone)在动作前,用一次 `lseek(fd, file_off, SEEK_DATA)` 探测目标\n  `[file_off, file_off + len)`:\n  - `ENXIO`,或返回的下一数据字节偏移 `≥ file_off + len` ⇒ 整段空洞 ⇒\n    **跳过 fallocate 与 madvise,直接 `Ok(())`**\n  - 段内有数据 ⇒ 维持原逻辑(`PUNCH_HOLE` + `MADV_DONTNEED` 覆盖整 run)\n  - `lseek` 其他错误不吞:落回原路径,不掩盖\n- 仅作用于 `region.file_offset().is_some()` 的 zone。无 fd 的 upstream 匿名\n  zone 无可探测,**行为完全不变**(契约同 §6:不写 `fd=` 等同 upstream)\n- 该 zone 的 memfd fd 在 CH 内仅经 mmap + `fallocate`(显式 offset)使用,\n  无定位读写,故 `lseek` 移动文件位置无副作用\n- **seccomp 放行**:balloon device 线程的 seccomp 仅允许 `fallocate`\n  (madvise 来自 virtio 公共集),新增 `SYS_lseek`;否则首次探测即 `SIGSYS`\n  杀死 balloon 线程,CH 退出(filter 在 `virtio-devices/src/seccomp_filters.rs`,\n  与 §3.3 放行 `userfaultfd` 同理)\n\n**正确性**:跳过只命中真空洞(无可释放物);任何**确需回收**的页必有数据,\n永不被跳过。被抑制的 `EVENT_REMOVE` 本只驱动 handler 对 backendVA 的\nprocess-level reclaim,而空洞 offset sandbox-ctl 也从未 fault → 那一步本就\n是 no-op。跳过前后 host 内存终态完全一致。\n\n**效果与取舍**:改动前 balloon 充满 `Capacity − InitialBudget` 时,**每个 4K\n页**(`pbp` 在 x86-4K 被旁路)都对 uffd VMA 做 `MADV_DONTNEED`,而该调用\n**同步阻塞**到外部单 reader handler 消费完 `EVENT_REMOVE` 才返回——\n`≈ 充气字节 / 4K` 次串行跨进程往返,正是数十秒收敛(及偶发 boot 软死锁)\n的根因。改动后冷启动充气页**实测 ~99% 是从未触碰的空洞**,`lseek(SEEK_DATA)`\n探测后整段跳过 `PUNCH_HOLE` 与 `MADV_DONTNEED`:无 madvise → 无同步握手 →\nballoon 线程以内存速度扫过 → **收敛近乎瞬时**。剩 ~1% 是 guest 启动期经 vhost-blk / 内核进过 page\ncache 又释放、folio 仍驻留 memfd 的页,`lseek` 见数据**不跳过**,照常回收\n——有界合法,行为同 upstream。guest 退出时整 zone unmap 产生的大\n`EVENT_REMOVE` 与本 patch 无关、不计入充气阶段。x86-4K 下空洞探测退化为每\n页一次 `lseek`——纯 in-kernel xarray 走查,无事件 / 无 handler 握手 / 无\n共享 inode madvise 争用,本地廉价。\n\n",
+          "new": "**背景**。配置中的 guest balloon 分配不带 `__GFP_ZERO`,平台 guest 内核未启用\n`init_on_alloc`;inflate 路径修改 page 元数据与 PFN 数组,而非把交还的每页清零。\n外部托管 zone 不做 prefault,因此 guest 此前从未访问的 offset 可能仍是 memfd 空洞,\n没有 inode 页,两个进程也没有相应 PTE。但这不代表冷启动交给 balloon 的每一页都必然是\n空洞:guest 可能已经访问并释放过其中一部分页。\n\n不做探测时,CH 对每个交还 run 调用 `release_memory_range`:\nmemfd 上的 `fallocate(PUNCH_HOLE|KEEP_SIZE)` 加 chVA 上的 `madvise(MADV_DONTNEED)`。\n在这里的 uffd 模型中,即使范围已空,后者仍产生 `EVENT_REMOVE` 并等待外部 handler\n消费。对稀疏的 `Capacity − InitialBudget` 区间充气会产生多余串行握手并反压 balloon\n线程。该握手来自 chVA 的 `MADV_DONTNEED`,不只是 memfd 的 fallocate,所以对空 run\n必须同时跳过两者。\n\n**机制**:\n\n- 对具有 file offset 的 region,`release_memory_range` 使用\n  `lseek(fd, file_off, SEEK_DATA)` 探测 `[file_off, file_off + len)`:\n  - `ENXIO`,或下一数据 offset `≥ file_off + len`:整段为空洞,跳过 fallocate 和 madvise,\n    直接 `Ok(())`。\n  - run 内有数据:保持覆盖整段的 `PUNCH_HOLE` + `MADV_DONTNEED`。\n  - 其他 lseek 错误:落回原 release 路径,不能把错误当作范围为空的证据。\n- 实际条件为 `region.file_offset().is_some()`,而不是 `user_managed` 标志;\n  其他 file-backed region 也可能进入探测。没有 file offset 的 region 保持原路径。\n- 平台对 memfd 使用 mmap 与显式 offset 的 fallocate,不依赖共享文件位置进行读写;\n  lseek 修改文件位置不影响该数据路径。\n- **seccomp**:balloon 线程增加 `SYS_lseek`。fallocate 已在 allowlist 中,madvise 来自\n  virtio 公共集合;缺少新增项时第一次探测可能触发 SIGSYS。\n\n**正确性**:只跳过探测为空的 run;真正需要回收的驻留数据仍执行完整 release。\n对前述从未触碰的外部内存空洞,被抑制的 backendVA reclaim 本身也是 no-op,\n所以 host 内存终态不变。\n\n**效果与取舍**:x86_64 4 KiB 路径绕过 pbp 批处理时,若不探测,完全稀疏的充气区间\n可能产生约 `充气字节 / 4 KiB` 次同步 handler 握手。探测用本地 lseek 替代这些多余操作;\nguest 先前访问后仍驻留的页不会被跳过。guest 退出时 unmap 及其事件独立于充气阶段。\n该路径仍可能每页执行一次 lseek,但避免对应空范围的 madvise、handler 握手和共享 inode\n失效工作。空洞比例及收敛时间取决于工作负载与环境,本文不作普遍 99% 空洞率或瞬时收敛承诺。\n\n",
+          "count": 1
+        },
+        {
+          "old": "产物由 `sandboxer/native-deps` 构建:`make cloud-hypervisor` = 取 pin 的 v51.1 tarball +\n`git am deps/ch-patches/*.patch` + `cargo build --release --locked`,冷构建\n~5-10 min、热(cargo 缓存)秒级,产物 `bin/<arch>/cloud-hypervisor`。构建以\n`--remap-path-prefix` 把源树与 registry 依赖映射为相对路径 / `/cargo` 前缀,\npanic 消息与 DWARF 不泄漏构建机绝对路径。\n\npatch 开发循环(`ch-fetch` / `ch-patches-format`、`patches-apply` 的幂等\nsanity 检查)、产物同步和边界说明见 `sandboxer/native-deps/README.md`。\n\n",
+          "new": "`sandboxer/native-deps` 从固定 v51.1 tarball 构建,应用\n`git am deps/ch-patches/*.patch`,再执行 `cargo build --release --locked`。\n输出为 `native-deps/bin/<arch>/cloud-hypervisor`;从 sandboxer 根目录执行\n`make cloud-hypervisor` 还会同步到 `bin/<arch>/cloud-hypervisor`。\n构建时间取决于工具链、机器和缓存。\n\n构建使用 `--remap-path-prefix` 将源树映射为相对路径、Cargo 依赖映射为 `/cargo`,\n避免把这些构建机绝对源路径嵌入 panic 消息和 DWARF。\n\n`ch-fetch` / `ch-patches-format`、幂等检查、产物同步与边界见\n[Native Build 文档](../native-deps/README_zh.md)。\n\n",
+          "count": 1
+        },
+        {"old": "restore 沿用 `config.json` 中的设备拓扑,不能新增或删除 virtio-net.sandboxer 在", "new": "上面的两块 virtio-blk 描述 root base/overlay 对;配置数据盘时还会增加对应设备槽位。\n\nrestore 沿用 `config.json` 中的设备拓扑,不能新增或删除 virtio-net.sandboxer 在", "count": 1},
+        {"old": "不启用(广播 mmu_notifier 会饿死 guest vsock kthread)", "new": "不启用(mmu_notifier 广播压力可能影响 guest vsock 进展)", "count": 1},
+        {"old": "| 命令行不写 `fd=` | ✓(memfd_create 自管 RAM) | ✓(同 upstream)|", "new": "| 不写 `fd=` 时的内存 backing | upstream memfd/file 路径 | 同一分配路径;不表示其他补丁禁用 |", "count": 1},
+        {"old": "| `/vm.restore` 对 user_managed zone | (不适用) | 跳过 fill;mmap 直接 fault 触发 uffd |", "new": "| `/vm.restore` 对 user_managed zone | (不适用) | 跳过 fill;配置 uffd 时由映射缺页触发外部 handler |", "count": 1},
+        {"old": "| balloon release 对 user_managed zone 的空洞 run | (不适用) | 跳过 `PUNCH_HOLE`+`madvise`,不合成 `EVENT_REMOVE`;有数据的 run 同 upstream |", "new": "| balloon release 对 file-backed region 的空洞 run | 原 release 路径 | 跳过 `PUNCH_HOLE`+`madvise`;驻留 run 保留原 release |", "count": 1},
+        {"old": "平台**不**使用 `free_page_reporting`——upstream 支持完好,但在统一 memfd /\n外部 uffd 模型下其持续 `madvise(MADV_DONTNEED)` 会广播 mmu_notifier 失效到\nKVM EPT,IPI shootdown 饿死 guest vsock kthread(机理与替代反馈环见", "new": "平台**不**使用 `free_page_reporting`。在统一 memfd / 外部 uffd 模型下,持续\n`madvise(MADV_DONTNEED)` 可能产生 mmu_notifier/EPT 与 IPI shootdown 压力,\n影响 guest vsock 进展(机理与替代反馈环见", "count": 1},
+        {"old": "- **CH v52+ 升级窗口**:每次 CH 大版本会有 `vmm/src/memory_manager.rs` 内部\n  重构,patch 0001/0002 通常需要小幅 rebase。0003(uffd ioctl)改动较大,需要\n  多花时间 review。0004 仅触 `virtio-devices/src/balloon.rs` 单函数\n  (`release_memory_range`),rebase 面最小。0005/0006 需要随 upstream vsock device\n  queue/restore 生命周期变化一起复核。0007 应随 upstream sound\n  `immediate_exit` 支持一起复核\n", "new": "- **包括 v52 及之后的 upstream 升级**:依据实际 `vmm/src/memory_manager.rs` 变化\n  复核 0001/0002;0003 的 uffd ioctl 需要重点检查。0004 同时修改 balloon release\n  函数及 seccomp allowlist。0005/0006 随 vsock queue/restore lifecycle 变化复核;\n  0007 与可靠的 upstream immediate_exit 实现一起评估,不承诺固定 rebase 工作量。\n", "count": 1}
+      ]
+    },
+    {
+      "path": "native-deps/README.md",
+      "source_blob": "a695d7160b85b724a072bfff21f99124a8d0cbc5",
+      "input": ".docs-edit/native-en.md",
+      "chinese_replacements": [
+        {"old": "首版只包含 patched", "new": "当前包含 patched", "count": 1},
+        {"old": "```bash\nmake build", "new": "以下命令从 `sandboxer/native-deps` 目录运行。\n\n```bash\nmake build", "count": 1},
+        {"old": "`bin/<arch>/cloud-hypervisor` 或执行 `make clean` 后重跑。", "new": "`bin/<arch>/cloud-hypervisor` 或执行 `make clean` 后重跑。格式化 patch 本身不会使\n已有 binary 失效。`make clean` 删除 native 构建输出与 bin,保留 patch 源码工作区和 tarball 缓存。", "count": 1},
+        {"old": "make ch-patches-format\nmake cloud-hypervisor", "new": "make ch-patches-format\nmake clean\nmake cloud-hypervisor", "count": 1},
+        {"old": "  user-managed memory zone、通过 unix fd 交接 uffd、balloon 不对外部托管内存\n  `PUNCH_HOLE/MADV_DONTNEED`、restore-safe vsock,以及可靠的 VM", "new": "  user-managed memory zone、通过 unix fd 交接 uffd、balloon 对已经为空的 file-backed\n  run 跳过 `PUNCH_HOLE/MADV_DONTNEED`(驻留数据仍正常回收)、restore-safe vsock,以及可靠的 VM", "count": 1},
+        {"old": "patch 语义和设备模型详见 `sandboxer/docs/cloud-hypervisor.md`。", "new": "patch 语义和设备模型详见 [cloud-hypervisor 文档](../docs/cloud-hypervisor_zh.md)。", "count": 1},
+        {"old": "../bin/$(uname -m)/cloud-hypervisor --version", "new": "./bin/$(uname -m)/cloud-hypervisor --version", "count": 1},
+        {"old": "make -C ../kuasar-sandbox test-e2e-sandbox-cold", "new": "make test-e2e", "count": 1},
+        {"old": "真实 e2e 需要 `/dev/kvm`、guest runtime、vmlinux 和 tap/network 前置条件。\n缺失时脚本会 skip;发布前应在具备 KVM 的环境跑完整 platform e2e。", "new": "组件 E2E 使用 `E2E_BIN` 指定的聚合二进制目录。完整平台构建与门禁是在 sandboxer\n根目录执行 `make -C ../kuasar-sandbox test-e2e`;旧的 `test-e2e-sandbox-cold` 目标不存在。\n\n真实 E2E 需要 `/dev/kvm`、guest runtime、vmlinux 和相关 TAP/network 前置条件。\n某些单项脚本直接运行时可以 skip,但 `test/e2e/run_all.sh` 设置 `REQUIRE_KVM=1`,\n组件及发布门禁遇到缺失条件会失败,不会把跳过计为成功。发布前应在具备 KVM 的环境运行完整平台门禁。", "count": 1}
+      ]
+    },
+    {"path": "LICENSE_SCOPE.md", "source_blob": "4faac93aabe1211c1731bc6ddd2ec167ed23ef66", "input": ".docs-edit/license-en.md", "chinese_replacements": []}
+  ],
+  "patches": [
+    {"path": "README_zh.md", "source_blob": "6d3a9cb1e865b8bf2bff76ac01ae0bc4f003862f", "replacements": [
+      {"old": "[docs/cloud-hypervisor.md](docs/cloud-hypervisor.md)", "new": "[docs/cloud-hypervisor_zh.md](docs/cloud-hypervisor_zh.md)", "count": 1},
+      {"old": "[LICENSE_SCOPE.md](LICENSE_SCOPE.md)", "new": "[LICENSE_SCOPE_zh.md](LICENSE_SCOPE_zh.md)", "count": 1}
+    ]}
+  ]
+}
