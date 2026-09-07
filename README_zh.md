@@ -124,11 +124,11 @@ guest-runtime 构建 runtime 镜像和 build sandbox 内展平镜像时使用的
   `.overlay`/Sandbox E/Snapshot S、carrier、export/snapshot/restore/publish与资源模型。
 - [docs/sandbox-init.md](docs/sandbox-init.md) — guest PID 1 ABI:
   `sandbox-init` 三阶段、vsock 控制面 + stdio MUX 协议、应用契约。
-- [docs/cloud-hypervisor.md](docs/cloud-hypervisor.md) — patched CH 与
+- [docs/cloud-hypervisor_zh.md](docs/cloud-hypervisor_zh.md) — patched CH 与
   `sandbox-ctl` 的外部 memfd/uffd/balloon 契约。
 
 ## License
 
 本仓库的项目原创内容采用 [Apache License 2.0](LICENSE).Cloud Hypervisor patch
-中保留的上游许可证边界见 [LICENSE_SCOPE.md](LICENSE_SCOPE.md).
+中保留的上游许可证边界见 [LICENSE_SCOPE_zh.md](LICENSE_SCOPE_zh.md).
 贡献授权说明见 [CONTRIBUTING.md](CONTRIBUTING.md).
