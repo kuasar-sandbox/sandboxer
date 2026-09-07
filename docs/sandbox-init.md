@@ -486,7 +486,7 @@ would not normally enter that namespace. Before forking, PID 1 marks
 `MS_REC|MS_SLAVE`. PID 1 mount events then propagate one way into the app,
 while app mounts such as proc do not propagate back. Cold-start injection
 precedes fork and is inherited without this mechanism; restore injection
-needs it. Network replacement does not: the app uses CLONE_NEWNS, not
+would need it; current restore does not replay LaunchSpec files/mounts/init. Network replacement does not: the app uses CLONE_NEWNS, not
 CLONE_NEWNET, so it shares PID 1's network namespace and sees netlink changes.
 
 **applyNetwork is not a listener prerequisite.** An absent LaunchSpec network
@@ -637,7 +637,7 @@ EOF, and completing its own admitted-handler drains.
    The app is frozen and residual output is bounded.
 4. Tear down all connect forwards (§3.7):
    gate new connect; close each target and reverse-vsock connection.
-   SO_LINGER is bounded (2 s) and best-effort; sessions close concurrently
+   SO_LINGER is bounded (3 s, connectLingerSec) and best-effort; sessions close concurrently
    within the quiesce budget.
    Accept mode also closes and clears cached guest listeners, waking parked
    Accept calls; listeners are recreated lazily after resume.
@@ -1437,8 +1437,10 @@ This is best-effort classification, not a typed network-error taxonomy.
   optional fatal threshold above; there is no universal corresponding
   `*_error_total` metric or “never kill on control failure” rule.
 - Before sending restore, if CH accepted CONNECT but returns EOF/reset before
-  OK, the host retries connection setup with initial 25 ms backoff, for at most
-  2 s within the total restore deadline. No restore payload has been sent at
+  OK, the host retries connection setup with 25 ms initial exponential backoff,
+  capped at 200 ms. Each CONNECT/OK attempt is bounded at 2 s and by the remaining
+  overall restore deadline; retryable failures can continue until that overall
+  deadline or context cancellation. No restore payload has been sent at
   that stage. Once writing restore begins, any failure fails closed and the
   request is never replayed. Failure to obtain restore_ack terminates that
   restore through the CH VM shutdown path and returns an error.
@@ -1453,6 +1455,8 @@ This is best-effort classification, not a typed network-error taxonomy.
 Host items managed by sandbox.yaml `timeouts.*` use their configured value,
 defaulting to no forced response deadline where documented; connection setup
 still has its own bounds ([sandbox lifecycle §3.1](sandbox.md)).
+The retry implementation is [guestlink/pinger.go](../pkg/guestlink/pinger.go);
+forward teardown uses [sandbox-init/connect.go](../cmd/sandbox-init/connect.go).
 Other budgets are protocol constants or guest-side waits:
 
 | Message | Deadline/budget | Notes |
@@ -1463,7 +1467,7 @@ Other budgets are protocol constants or guest-side waits:
 | app_exited | Same as app_started | Missing ACK does not prevent POWER_OFF. |
 | ping | timeouts.ping, default no forced bound; production profile 200 ms; capture drain at most 8 s | Ordinary failure updates ping stats; capture expiry cancels/joins and fails capture. Fatal threshold requires a bounded probe. |
 | quiesce | 8 s | Exec/report drain, freeze, sync, optional cache drop, forwarding teardown and MUX close must fit the capture protocol. |
-| restore | timeouts.restore, default no forced response bound | Connection setup waits for guest acceptance; pre-request EOF/reset retries at most 2 s inside the total budget. No replay after request write. Demand paging can lengthen restoration; connection then becomes MUX. |
+| restore | timeouts.restore, default no forced response bound | Connection setup waits for guest acceptance; pre-request EOF/reset retries can continue through the total budget or context cancellation, with each CONNECT/OK attempt bounded at 2 s or the shorter remaining budget. No replay after request write. Demand paging can lengthen restoration; connection then becomes MUX. |
 | attach | 5 s | Covers the replacement handshake; connection then becomes MUX. |
 | exec | 10 s | Guest forks/execs and resolves PATH before ACK. Handshake only; clear deadline for MUX command execution. |
 | connect | 10 s for dial-mode handshake, including guest target dial ≤5 s | Clear deadline for fwd. Accept mode clears the ACK deadline after request write and may wait indefinitely; the pending connection remains registered for cancellation/quiesce. |

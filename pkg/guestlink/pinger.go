@@ -358,11 +358,12 @@ func SendQuiesceContext(ctx context.Context, client *HostClient, skipDropCaches 
 // app_state}`, clears the handshake deadline, and returns the live
 // connection together with the channel set the guest established. The
 // caller wraps the conn in a mux.Session and bridges those streams, then
-// (re)starts the ping ticker. epoch distinguishes successive restores.
+// (re)starts the ping ticker. The current guest echoes epoch; it does not
+// use it as a generic duplicate-request filter. ACK precedes guest thaw.
 //
-// network (optional) carries a fresh guest IP-layer config the guest
-// re-applies flush-and-replace before thawing, so a clone restored from a
-// golden snapshot takes a new network identity. nil → keep the snapshot's.
+// network (optional) asks the guest to attempt flush-and-replace before
+// thawing. Failure is logged without preventing ACK, which therefore does
+// not prove the new identity was applied. nil keeps snapshot networking.
 func OpenMUXViaRestore(client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
 	return OpenMUXViaRestoreContext(context.Background(), client, epoch, network, deadline)
 }
@@ -379,12 +380,9 @@ func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uin
 	}
 	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 
-	// WallclockNs lets the guest jump CLOCK_REALTIME forward by the
-	// dormant interval (CH reloads the snapshot's stale clock verbatim).
-	// Captured after the connection is ready, as close to the send as
-	// possible; the residual
-	// host→guest propagation skew is sub-ms (kernel-microsecond dial,
-	// the guest's reverse-channel listener survived the snapshot).
+	// WallclockNs requests a best-effort CLOCK_REALTIME adjustment because
+	// CH reloads the snapshot's stale clock. Capture after connecting, near
+	// the send; this does not bound propagation or guest scheduling delay.
 	rawConn := conn
 	resultConn, spec, err := finishOpenMUX(rawConn, &proto.Message{
 		Type:        proto.TypeRestore,
@@ -462,7 +460,7 @@ func dialRawPreRequestContext(ctx context.Context, client *HostClient, deadline,
 
 		conn, err := client.DialRawContext(ctx, remaining)
 		if err == nil {
-			// A retry's CONNECT/OK exchange is capped by retryUntil. Restore
+			// Each CONNECT/OK attempt has its own bound. Restore
 			// write+ACK still owns the original overall restore deadline.
 			if err := conn.SetDeadline(deadlineAt); err != nil {
 				_ = conn.Close()
