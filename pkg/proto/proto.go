@@ -2,33 +2,34 @@
 // sandbox-init control channel that runs over virtio-vsock, plus the
 // constants shared with the stdio MUX sub-protocol (pkg/mux).
 //
-// Two kinds of connections (docs/sandbox-init.md §4):
+// Three connection classes (docs/sandbox-init.md §4):
 //
-//	(1) Management short connections — one request + one response per
-//	    connection, then close. Both directions reuse port 5000:
+//	(1) Management connections — a fresh connection per operation. Ordinary
+//	    operations request/respond and close; launch uses four messages,
+//	    and upgrade operations retain the connection. Both directions use port 5000:
 //	      - guest → host: sandbox-init dial(CID=2, port=5000); CH hybrid
 //	        vsock proxies to "<vsock-base>_5000" UDS that sandbox-ctl
 //	        listens on. Carries: hello/launch handshake, app_started,
 //	        app_exited, mem_report.
 //	      - host → guest: sandbox-ctl dial(<vsock-base>) UDS, write
 //	        "CONNECT 5000\n" first; CH proxies the rest to guest port
-//	        5000 listener. Carries: ping, quiesce, restore, attach.
+//	        5000 listener. Carries: ping, quiesce, restore, attach, exec, connect.
 //	    Wire: [4 bytes LE length][JSON Message].
 //
-//	(2) The MUX long connection — at most one. The launch / restore /
-//	    attach operations DON'T close their connection after the *_ack:
-//	    it stays open and switches to the framed MUX sub-protocol
-//	    (pkg/mux) which carries the app's stdin/stdout/stderr
-//	    (or a pty). See StdioSpec for what's negotiated in the *_ack.
+//	(2) MUX connections — at most one for the primary app, plus one per
+//	    concurrent exec session. Launch / restore / attach / exec retain
+//	    their connection after the ACK exchange and switch to pkg/mux
+//	    framing for that session's stdin/stdout/stderr or PTY.
+//	    StdioSpec selects the channels; windows use pkg/mux defaults.
 //
 //	(3) Forward long connections — 0..N. Each `sandbox-ctl run --connect`
 //	    port forward opens one reverse-channel conn per accepted local
 //	    connection: a `connect{ConnectSpec}` → `connect_ack` handshake,
 //	    then the conn switches to the fwd frame sub-protocol
-//	    (pkg/fwd) which splices the bytes to a guest-side dial
-//	    target with TCP half-close preserved (docs/sandbox-init.md §3.7).
+//	    (pkg/fwd), pairing a guest-side dial or accepted target connection
+//	    with TCP half-close preserved (docs/sandbox-init.md §3.7).
 //
-// This package is dependency-light (stdlib only) so the guest
+// This package uses the standard library and the small internal/wireio helper, so the guest
 // sandbox-init binary can import it without dragging in YAML or other
 // heavy deps.
 package proto
@@ -55,7 +56,7 @@ const VsockGuestCID = 3
 // host:LaunchPort for the cold-start hello/launch handshake and for
 // app_started/app_exited/mem_report notifications; sandbox-init also
 // listens on guest:LaunchPort so sandbox-ctl can push ping/restore/
-// quiesce/attach.
+// quiesce/attach/exec/connect.
 const LaunchPort = 5000
 
 // MaxMessageBytes bounds the JSON payload size for one management message.
@@ -322,9 +323,9 @@ type Message struct {
 
 	// launch_ack / restore_ack / attach_ack: guest → host. Stdio = the
 	// channel set the guest actually established (the host bridges
-	// exactly these MUX streams). For restore_ack / attach_ack, AppState
-	// reports whether the user app is still running, plus Code/TermSignal
-	// if it already exited.
+	// exactly these MUX streams). Current restore_ack / attach_ack handlers
+	// always send AppStateRunning; they do not derive an exited state.
+	// These ACKs precede thaw and are not application-health guarantees.
 	Stdio    *StdioSpec `json:"stdio,omitempty"`
 	AppState string     `json:"app_state,omitempty"`
 
@@ -332,13 +333,13 @@ type Message struct {
 	PID int `json:"pid,omitempty"`
 
 	// app_exited: guest → host before reboot. TermSignal != 0 means the
-	// app was killed by that signal (Code is then the signal number too,
-	// per shell 128+sig convention applied host-side).
+	// app was killed by that signal; the current guest reports Code as
+	// 128+signal on that terminal path.
 	Code       int `json:"code,omitempty"`
 	TermSignal int `json:"term_signal,omitempty"`
 
-	// ping/pong: monotonic id host-assigned; host clock t_send_ns
-	// echoed back in pong so host computes RTT without time-sync.
+	// ping/pong: host-assigned monotonic ID and echoed UnixNano wall time.
+	// The host measures elapsed RTT with time.Since, not wall-clock subtraction.
 	ID      uint64 `json:"id,omitempty"`
 	TSendNs int64  `json:"t_send_ns,omitempty"`
 
@@ -350,8 +351,8 @@ type Message struct {
 	// means the peer predates result reporting.
 	DropCachesResult DropCachesResult `json:"drop_caches_result,omitempty"`
 
-	// restore / attach: incremented on each restore/attach. Lets guest
-	// distinguish "fresh wake" from a duplicate message in flight.
+	// restore / attach: host request epoch, echoed by the current guest.
+	// It is not a generic duplicate-request filter; MemReport has its own epoch.
 	Epoch uint32 `json:"epoch,omitempty"`
 
 	// exec: the command + stdio to run inside the running sandbox. The
@@ -367,14 +368,15 @@ type Message struct {
 	// restore: host wall clock (UnixNano) captured just before the
 	// notify is sent. A snapshot's CLOCK_REALTIME is reloaded verbatim
 	// by CH on restore, so the guest's wall clock is stale by the whole
-	// dormant interval; the guest jumps CLOCK_REALTIME to this on
-	// restore. Unset (0) on attach — a live VM's clock is fine.
+	// dormant interval. The guest attempts CLOCK_REALTIME adjustment when
+	// this is positive; failure is logged and does not prevent ACK.
+	// Attach omits it for a live VM.
 	WallclockNs int64 `json:"wallclock_ns,omitempty"`
 
 	// restore: optional new guest IP-layer config. When set, the guest
-	// re-applies it flush-and-replace before thawing, so a clone restored
-	// from a golden snapshot takes a fresh network identity. nil → keep the
-	// snapshot's network as-is. (Cold start carries network via LaunchSpec.)
+	// attempts flush-and-replace before thawing. Failure is logged and does
+	// not prevent ACK, so ACK does not prove a new network identity was applied.
+	// nil keeps snapshot networking. Cold start carries network via LaunchSpec.
 	Network *NetworkSpec `json:"network,omitempty"`
 
 	// mem_report: guest → host periodic /proc/meminfo observation. Balloon

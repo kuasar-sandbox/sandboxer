@@ -343,7 +343,7 @@ virtio-console → hvc0,内核 dmesg;--console tty(写到 CH 进程的 stdout = 
                  故 CH 不 raw 化任何宿主终端。应用 stdio 不走此设备(走 vsock MUX)
 virtio-vsock   → CID=3。控制面短连接(launch / ping / app_started / app_exited /
                  mem_report / quiesce / restore / attach)+ launch/restore/attach 那条
-                 连接握手后升级而成的应用 stdio MUX(详见 sandbox-init.md §4)
+                 连接握手后升级而成的应用 stdio MUX(详见 sandbox-init_zh.md §4)
 virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on];sandbox-local
                  BalloonController 通过 /vm.resize 推 target,并以 vm.info 的
                  memory_actual_size 观察 current(见 [sandbox_zh.md](sandbox_zh.md) §9.3);free_page_reporting
@@ -377,7 +377,7 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 对应 port 的 listener。两个方向的连接对 CH 而言都是普通字节流——`launch` /
 `restore` / `attach` 这三种连接在应用层握手后由 sandbox-ctl / sandbox-init 自行
 转入帧收发态(stdio MUX),CH 不感知。详细见 [sandbox_zh.md](sandbox_zh.md) §5.2 与
-`sandboxer/docs/sandbox-init.md` §4.2。
+[sandbox-init_zh.md](sandbox-init_zh.md) §4.2。
 
 ## 6. 行为契约总结
 
