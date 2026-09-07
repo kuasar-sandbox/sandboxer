@@ -102,7 +102,7 @@ Full design and reference documents:
 - [`docs/sandbox-init.md`](docs/sandbox-init.md) — guest PID 1 ABI, staged initialization, vsock control, stdio multiplexing, and application contract;
 - [`docs/cloud-hypervisor.md`](docs/cloud-hypervisor.md) — patched Cloud Hypervisor source, build, and runtime contracts.
 
-The lifecycle and VMM guides provide complete English defaults and Chinese counterparts through their language selectors. The remaining guest ABI translation is tracked in [#192](https://github.com/kuasar-sandbox/sandboxer/issues/192).
+The lifecycle, guest ABI and VMM guides provide complete English defaults and Chinese counterparts through their reciprocal language selectors. Native-build and license-scope documentation is also available in both languages.
 
 ## Project boundaries
 

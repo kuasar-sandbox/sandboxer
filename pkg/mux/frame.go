@@ -1,13 +1,13 @@
 // Package mux implements the stdio MUX sub-protocol that runs over the
-// vsock connection born from a launch / restore / attach management
+// vsock connection born from a launch / restore / attach / exec management
 // operation (docs/sandbox-init.md §4.5 / §4.6).
 //
 // One MUX connection carries the user application's stdin/stdout/stderr
 // (pipe mode) or a single pty (tty mode), each as a logical stream,
-// plus a control stream for window updates, winsize changes, and the
-// graceful-close handshake.
+// plus control frames for winsize changes and the graceful-close handshake.
+// WINDOW_UPDATE carries the relevant data stream ID.
 //
-// stdlib-only: the guest sandbox-init binary imports this package.
+// Uses the standard library plus internal/wireio; imported by sandbox-init.
 package mux
 
 import (

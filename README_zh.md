@@ -121,7 +121,7 @@ guest-runtime 构建 runtime 镜像和 build sandbox 内展平镜像时使用的
 
 - [docs/sandbox_zh.md](docs/sandbox_zh.md) — host 控制平面、PortableSandboxConfig、
   `.overlay`/Sandbox E/Snapshot S、carrier、export/snapshot/restore/publish与资源模型。
-- [docs/sandbox-init.md](docs/sandbox-init.md) — guest PID 1 ABI:
+- [docs/sandbox-init_zh.md](docs/sandbox-init_zh.md) — guest PID 1 ABI:
   `sandbox-init` 三阶段、vsock 控制面 + stdio MUX 协议、应用契约。
 - [docs/cloud-hypervisor_zh.md](docs/cloud-hypervisor_zh.md) — patched CH 与
   `sandbox-ctl` 的外部 memfd/uffd/balloon 契约。

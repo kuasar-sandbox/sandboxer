@@ -2,7 +2,7 @@
 
 # sandbox — 沙箱控制与制品生命周期
 
-`sandbox-ctl` 是 kuasar-sandbox 的单沙箱 host 控制面. 它负责显式冷启动、从 Sandbox 制品冷启动、内存恢复、live export、无 VM 的 image-to-Sandbox-E assembly、内存快照、制品发布以及运行期 `exec`/forward. Guest 侧协议见 [sandbox-init.md](sandbox-init.md)。
+`sandbox-ctl` 是 kuasar-sandbox 的单沙箱 host 控制面. 它负责显式冷启动、从 Sandbox 制品冷启动、内存恢复、live export、无 VM 的 image-to-Sandbox-E assembly、内存快照、制品发布以及运行期 `exec`/forward. Guest 侧协议见 [sandbox-init_zh.md](sandbox-init_zh.md)。
 
 本文只描述当前格式和行为。当前 reader 拒绝旧 `snapshot.cfg` 磁盘图 schema，不提供双读、自动迁移或跨版本兼容保证；这一格式边界不表示项目从未发布版本。
 
@@ -1239,7 +1239,7 @@ E2B memory=true
 
 ## 15. See Also
 
-- [sandbox-init.md](sandbox-init.md) — guest PID 1、launch/quiesce/MUX 协议。
+- [sandbox-init_zh.md](sandbox-init_zh.md) — guest PID 1、launch/quiesce/MUX 协议。
 - [cloud-hypervisor_zh.md](cloud-hypervisor_zh.md) — CH build、API 与 restore 边界。
 - [Connector TAPFD 协议](https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd_zh.md) — TAP descriptor handoff 与 network namespace，由 connector 维护。
 - [timeouts-production.yaml](../examples/timeouts-production.yaml) — production host timeout 示例。
