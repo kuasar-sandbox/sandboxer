@@ -1,0 +1,117 @@
+# sandboxer/native-deps
+
+This directory builds native artifacts consumed directly by `sandboxer` at
+runtime but not included in its Go module. It currently contains patched
+`cloud-hypervisor`. `vmlinux`, `mkfs.erofs`, `fsck.erofs`, and `envd` belong to
+`guest-runtime/native-deps`; `librocksdb` belongs to `accelerator`.
+
+## 1. Artifact
+
+| Artifact | Source | Consumer |
+| --- | --- | --- |
+| `cloud-hypervisor` | Cloud Hypervisor v51.1 plus `deps/ch-patches/` | The VMM subprocess started by `sandbox-ctl` |
+
+Output paths, relative to the sandboxer repository and its native-deps directory,
+respectively, are:
+
+```text
+native-deps/bin/<arch>/cloud-hypervisor
+../bin/<arch>/cloud-hypervisor
+```
+
+The native build itself produces `native-deps/bin/<arch>/cloud-hypervisor`.
+The top-level sandboxer `make cloud-hypervisor` target copies that output to
+`sandboxer/bin/<arch>/`, where release packaging places it beside `sandbox-ctl`
+and where the default `sandbox-ctl --ch-binary` lookup expects it.
+
+## 2. Build
+
+Run the following commands from `sandboxer/native-deps`:
+
+```bash
+make build
+make cloud-hypervisor
+make cloud-hypervisor TARGET_ARCH=aarch64
+```
+
+A fresh `make cloud-hypervisor` performs these steps:
+
+1. Download and cache the pinned Cloud Hypervisor source tarball.
+2. Extract it into `build/src/cloud-hypervisor`.
+3. Initialize the Git baseline and apply `deps/ch-patches/*.patch`.
+4. Build `cloud-hypervisor` with Cargo when the target output is absent.
+5. Copy the artifact to this directory's `bin/<arch>/cloud-hypervisor`.
+
+An existing target is skipped. Delete that output, or run `make clean`, before
+rerunning to force a rebuild. In particular, formatting a changed patch does not
+by itself invalidate the existing binary. `make clean` removes the native build
+output and `bin/`, but preserves the source patch workspace and tarball cache.
+
+## 3. Patch development cycle
+
+```bash
+make ch-fetch
+cd build/src/cloud-hypervisor
+# Edit the source and record the changes with git commit.
+cd ../../..
+make ch-patches-format
+make clean
+make cloud-hypervisor
+```
+
+Conventions:
+
+- Patches cover CH behavior required by the platform: external memfd memory
+  zones, skipping user-managed RAM in snapshots, handing uffd to the external
+  owner over a Unix socket, skipping `PUNCH_HOLE`/`MADV_DONTNEED` for already-empty
+  file-backed balloon ranges, restore-safe vsock, and reliable
+  pause/resume/ordered-shutdown barriers. Resident memory still follows the
+  ordinary balloon release path.
+- Patch files are stored in commit order in `deps/ch-patches/`.
+- For an upstream CH upgrade, update the pin, fetch/import the intended source,
+  reapply the patches, build, and run the sandboxer and platform E2E suites.
+- `build/src/cloud-hypervisor` is the patch workspace. Do not remove it before
+  exporting local patch work with `ch-patches-format`.
+
+Patch semantics and the device model are specified in
+[cloud-hypervisor.md](../docs/cloud-hypervisor.md).
+
+## 4. Boundaries with other native dependencies
+
+```text
+guest-runtime/native-deps ──► vmlinux / mkfs.erofs / fsck.erofs / envd
+sandboxer/native-deps     ──► cloud-hypervisor
+accelerator               ──► librocksdb
+```
+
+`cloud-hypervisor` is a host VMM subprocess, not part of the guest runtime image.
+`vmlinux` is not built here either: `guest-runtime` releases it independently and
+`sandbox-ctl` selects it through configuration.
+
+## 5. Validation
+
+For a native build, verify the artifact produced in this directory:
+
+```bash
+make cloud-hypervisor
+./bin/$(uname -m)/cloud-hypervisor --version
+```
+
+For broader validation, run from the `sandboxer/` repository root:
+
+```bash
+make test
+make test-e2e
+```
+
+The component E2E target uses the assembled platform binaries selected by
+`E2E_BIN`. The complete platform build-and-test gate is
+`make -C ../kuasar-sandbox test-e2e` from the sandboxer repository root; the old
+`test-e2e-sandbox-cold` platform target does not exist.
+
+Real E2E requires `/dev/kvm`, the guest runtime, `vmlinux`, and the network/TAP
+prerequisites of the selected cases. Some individual scripts can skip missing
+prerequisites when invoked directly, but `test/e2e/run_all.sh` exports
+`REQUIRE_KVM=1`: the component and release gates fail rather than treating those
+missing prerequisites as success. Run the full platform gate in a suitable KVM
+environment before release.
