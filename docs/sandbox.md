@@ -203,7 +203,7 @@ sandbox-ctl export \
   [--mode local|bundle]
 ```
 
-Live mode rejects `--config` and reuses the running process's validated Manifest/ref-location/crypto bindings. Explicit `--manifest-config` and `--ref-location` therefore belong only to assembly mode. Assembly requires `--config` or `SANDBOX_CONFIG` and rejects `--resume`. Both modes support `--timeout`: zero imposes no operation deadline. Export accepts neither `drop_caches` nor memory-merge parameters, does not call CH `/vm.snapshot`, does not read the memfd, and produces no memory refs.
+Live mode rejects `--config` and reuses the running process's validated Manifest/ref-location/crypto bindings. Explicit `--manifest-config` and `--ref-location` therefore belong only to assembly mode. Assembly requires `--config` or `SANDBOX_CONFIG` and rejects `--resume`. Both modes support `--timeout`: live mode bounds the client's ctl-socket wait, while assembly sets a context deadline for its own operation; zero disables the respective CLI limit. Neither setting adds a server-side deadline to a live-export request. Export accepts neither `drop_caches` nor memory-merge parameters, does not call CH `/vm.snapshot`, does not read the memfd, and produces no memory refs.
 
 Like local snapshot, live mode may use PathID alone. When SandboxID and PathID are both supplied, PathID only locates the ctl socket. Assembly rejects PathID; its existing `--sandbox-id` remains only an output-artifact alias.
 
@@ -611,7 +611,7 @@ from_refs:
 
 `sandbox_ref` points to the E produced at the same freeze point. `from_refs` is the top-to-bottom memory-parent chain. S does not duplicate capacity, runtime, root/data graphs, launch, mounts, files, init, or metadata.
 
-Snapshot ZIP and configuration are also strict, bounded, and canonical. Old disk-schema inputs return `unsupported snapshot format/version`; there is no dual-read, migration, or cold fallback.
+Snapshot ZIP and configuration are also strict, bounded, and canonical. `config.json` and `state.json` are each limited to 16 MiB, `snapshot.cfg` to 1 MiB, and `from_refs` to 64 entries. See [snapshotfile.go](../pkg/snapshotfile/snapshotfile.go) and [snapshot/config.go](../pkg/snapshot/config.go). Old disk-schema inputs return `unsupported snapshot format/version`; there is no dual-read, migration, or cold fallback.
 
 <a id="38-filesenv-与-ephemeral"></a>
 
@@ -843,7 +843,7 @@ exec_request     -> exec_ack      | error
 
 Export is not `snapshot_request{memory:false}`. Requests execute in the run process, reusing its lifecycle barrier, guest/MUX gate, CH API socket, and live vhost SnapshotView.
 
-Responses do not echo secret values. Remote Manifest uploads may take a long time. CLI `--timeout=0` imposes no operation deadline; operation contexts still govern cancellable I/O. A local snapshot/live-export CLI timeout bounds its ctl connection wait and is not a server-side deadline field in the wire request; callers must not interpret a timed-out CLI as proof that no artifact was committed.
+Responses do not echo secret values. Remote Manifest uploads may take a long time. For local snapshot/live export, CLI `--timeout=0` leaves the ctl connection without a deadline; a positive value bounds that client's wait. Neither value sets a server-side deadline field in the wire request. Server lifecycle contexts still govern cancellable I/O, and callers must not interpret a timed-out CLI as proof that no artifact was committed. Image-to-Sandbox-E assembly instead applies a positive timeout to its own operation context (§2.4).
 
 ### 6.4 Image-to-Sandbox-E assembly
 
@@ -917,7 +917,7 @@ After an explicit cold start or cold start from E, the memory-parent list is emp
 
 ### 7.1 Memory prefetch
 
-`restore.prefetch: memory` is a host-only optimization. It warms only the current S memory self's file page cache or Manifest chunks. It changes neither sparse truth, fault ordering, C0, S, nor memory parents. The default is `off`. An invalid configured mode fails validation before side effects; lack of prefetch capability or a prefetch I/O failure is best-effort and does not fail restore. It is logged and restore continues on demand. The asynchronous task is canceled and joined before its streams close. See [prefetch.go](../pkg/restore/prefetch.go).
+`restore.prefetch: memory` is a host-only optimization. It warms the current S self's file page cache or Manifest chunks, excluding parent memory layers and disk streams. The call receives the opened root stream, so its scope may also include S's bounded ZIP metadata tail; it is not a memory-payload-only section. It changes neither sparse truth, fault ordering, C0, S, nor memory parents. The default is `off`. An invalid configured mode fails validation before side effects; lack of prefetch capability or a prefetch I/O failure is best-effort and does not fail restore. It is logged and restore continues on demand. The asynchronous task is canceled and joined before its streams close. See [prefetch.go](../pkg/restore/prefetch.go) and its call in [restore.go](../pkg/restore/restore.go).
 
 ## 8. UFFD handler
 
@@ -1119,7 +1119,7 @@ Read order is active diff → captured top → `base_from_refs` → root image w
 
 ### 12.4 BlockCOW state
 
-BlockCOW tracks active-upper clean/dirty/discard state. Discard uses Hole semantics. Writing zero bytes remains a Data/Zero fact and must not be scanned into Hole. Export/snapshot neither rotates the active diff nor makes the new E a backend base.
+BlockCOW uses a dirty bitmap for 4 KiB active-upper blocks, not a three-state discard map. Dirty blocks read from the diff; clean blocks fall through to the base, or return zeros when no base exists. The low-level `Discard` helper punches only complete blocks and clears their dirty bits, exposing the base again; it does not persist an explicit Zero that masks a lower layer. The current vhost profile advertises neither DISCARD nor WRITE_ZEROES, and its request dispatcher returns unsupported for both instead of calling this helper. Writing zero bytes keeps a block dirty and must not be scanned into Hole. Export/snapshot neither rotates the active diff nor makes the new E a backend base. See [blk_cow.go](../pkg/vhost/blk_cow.go), [server.go](../pkg/vhost/server.go), and [worker.go](../pkg/vhost/worker.go).
 
 ### 12.5 Quiesce / Resume
 

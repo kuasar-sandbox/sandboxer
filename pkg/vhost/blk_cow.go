@@ -24,7 +24,8 @@ import (
 // SEEK_DATA / SEEK_HOLE — any byte range marked as data in the diff is
 // considered dirty (i.e. came from a previous write to this diff).
 //
-// DISCARD requests are accepted but currently no-op (v1 limitation).
+// The vhost profile does not advertise DISCARD or WRITE_ZEROES and rejects
+// those wire requests. The low-level Discard helper has hole semantics below.
 type BlockCOW struct {
 	base      BlockReader // optional; may be nil for no base layer
 	diff      *diffFile
@@ -267,15 +268,11 @@ func (c *BlockCOW) Flush() error {
 	return c.diff.Sync()
 }
 
-// Discard handles virtio-blk DISCARD/WRITE_ZEROES. Punches a hole in the
-// diff file for the requested range and clears the corresponding dirty
-// bits, so subsequent reads see zeros via the no-base-layer path.
-//
-// Correctness depends on base layer being nil — the case we hit in cold
-// start and P2 snapshot. With a base layer (P3 restore), bitmap=clean
-// would route reads to base.ReadAt instead of zero, returning stale
-// content the guest considered freed. The P3-era extension switches to
-// a 3-state stateMap (clean/dirty/discard); see sandbox.md §12.4.
+// Discard punches complete blocks in the diff and clears their dirty bits.
+// Subsequent reads fall through to the base, or return zeros without a base;
+// this helper does not create an explicit zero that masks lower-layer data.
+// Partial edge blocks retain their contents. The current vhost dispatcher
+// does not call this helper: DISCARD and WRITE_ZEROES requests are unsupported.
 func (c *BlockCOW) Discard(offset, length int64) error {
 	if offset < 0 || offset > c.size || length < 0 || length > c.size-offset {
 		return fmt.Errorf("vhost: discard out of bounds: off=%d len=%d size=%d",
