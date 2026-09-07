@@ -370,14 +370,14 @@ pinned cgroup namespace并挂 scoped cgroup2;placement/setup/exec 失败按 plug
 `MS_REC|MS_SHARED`(rshared),app 子进程在 `mount /proc` **之前**把自己的副本标为
 `MS_REC|MS_SLAVE`(rslave)——PID1 的挂载事件单向传播给 app,app 自己的挂载(如
 `/proc`)不外泄回 PID1。冷启动注入不依赖此机制(那时 bind 早于 fork、随副本带入);
-**唯独 restore 注入靠它**。网络 restore 重配无此问题:app 只 `CLONE_NEWNS`、不
+**后续注入会需要它，但当前 restore 不重放 LaunchSpec files/mounts/init**。网络 restore 重配无此问题:app 只 `CLONE_NEWNS`、不
 `CLONE_NEWNET`,与 PID1 共享网络 ns,netlink 改动天然可见。
 
 **applyNetwork 不是 listener 的前置依赖**——LaunchSpec 不带 network 时直接跳过,
 guest 仍有 `lo`;applyNetwork 只对应用层外部网络服务有意义,vsock 控制面与网络
 配置正交.
 
-**fast-fail**:一次性沙箱模型下,网络 / 挂载 / 文件 / init 任一失败都让应用悄悄跑
+**cold-start fast-fail**：冷启动的网络 / 挂载 / 文件 / init 任一失败都让应用悄悄跑
 是反模式——上层调度器期望"沙箱起不来 = 重新调度",而不是"起来了但环境不对"。
 
 ### 3.3 阶段 3:supervisor
@@ -489,7 +489,7 @@ Listener 并发处理每个已 accept 的管理连接，exec/connect/mem_report 
 3. 随 MUX 关闭暂停 app 输出转发；应用已冻结，残留输出有界。
 4. 拆除 connect 转发（§3.7）：
    gate 新 connect；逐条关闭 target + reverse vsock。
-   SO_LINGER 有界（2 s）且 best-effort；多会话并发关闭，受 quiesce budget 限制。
+   SO_LINGER 有界（3 s，connectLingerSec）且 best-effort；多会话并发关闭，受 quiesce budget 限制。
    accept 模式另关闭并清空缓存 guest listener，唤醒 park 的 Accept；
    resume 后懒重建。
    host 发 quiesce 前只 gate 新 forward；收到 quiesced + guest EOF 后，
@@ -642,7 +642,7 @@ socket,host 用 `net.FileListener` 包装后关掉原 fd,避免泄漏进 CH)或 
     ├───────────────►│ accept(UDS/fd)                             │
     │                │ DialRaw vsock + "CONNECT 5000\n"           │
     │                ├──────────────────────────────►│ accept :5000│
-    │                │ connect{addr:"127.0.0.1:49983"}│───────────►│ net.Dial(tcp, addr)
+    │                │ connect{address:"127.0.0.1:49983"}│───────────►│ net.Dial(tcp, addr)
     │                │                                │            ├──────────►│ 49983
     │                │ connect_ack │ (或 error)       │◄───────────┤  ok       │◄─────────┤
     │                │◄──────────────────────────────┤            │
@@ -662,7 +662,7 @@ socket,host 用 `net.FileListener` 包装后关掉原 fd,避免泄漏进 CH)或 
     ├───────────────►│ accept(UDS/fd)                             │
     │                │ DialRaw vsock + "CONNECT 5000\n"           │
     │                ├──────────────────────────────►│ accept :5000│
-    │                │ connect{accept,addr:"/run/up.sock"}│──────►│ Accept(address) ◄────────┤ connect
+    │                │ connect{accept:true,address:"/run/up.sock"}│──────►│ Accept(address) ◄────────┤ connect
     │                │  (park,无 deadline)             │          │  └ 返回 connB            │
     │                │ connect_ack │ (或 error)        │◄──────────┤                          │
     │                │◄──────────────────────────────┤            │
@@ -678,7 +678,7 @@ socket,host 用 `net.FileListener` 包装后关掉原 fd,避免泄漏进 CH)或 
 (`shutdown(SHUT_WR)`:一端发完仍可继续收)。但 CH hybrid vsock proxy 是用户态字节
 泵,**不**把传输层的 `SHUT_WR` 翻译过 UDS↔vsock 边界(它连"对端已关"都只在下次 I/O
 才浮现——同 §4.6 注),裸中继靠转发传输层关闭会丢半关闭。故数据通道走 `fwd` 帧子协议
-(§4.7):关闭信号以 **EOF/RST 帧**走数据面一个字节,proxy 当不透明字节原样搬运,
+(§4.7):关闭信号以带 3-byte header 的 **EOF/RST 帧**走 in-band 数据面,proxy 当不透明字节原样搬运,
 在正常传输上保留显式半关闭；不保证 transport error 下仍完整交付。单条转发=单条逻辑流,无需流 ID 与应用窗口——vsock 连接自身的内核缓冲背压
 即流控(与 §4.5 MUX 的多流窗口不同)。
 
@@ -698,10 +698,10 @@ Forwarder 在发送 quiesce 前暂停新建,并收拢、等待活跃中继**与 
 ### 4.1 连接分类
 
 ```
-  (1) management short-conn  — one new conn per management op; request/response; close
+  (1) management handshake — one new conn per operation; ordinary request/response closes
         │  ops:  hello/launch · app_started · app_exited · ping · mem_report ·
-        │        quiesce · restore · attach · exec                    (§4.3 / §4.4)
-        │  wire: [4B LE len][JSON]    ·    no multiplexing    ·    no keepalive
+        │        quiesce · restore · attach · exec · connect          (§4.3 / §4.4)
+        │  wire: [4B LE len][JSON]; launch has four messages; upgrade operations retain conn
 
   (2) MUX long-conn          — carries one session's stdin/stdout/stderr (or a pty)
         │  born from a launch / restore / attach / exec conn, which stays open
@@ -762,7 +762,7 @@ vsock 端口固定 `5000`,**两个方向都复用同一端口号**,身份按方�
 |---|---|---|---|---|
 | **冷启动** | guest→host | `hello` → `launch{spec}` → `launch_ack{stdio}` → `ack` | **升级 MUX** | guest 报 ready,host 回 LaunchSpec;guest 准备好 app stdio 后回 launch_ack,该连接成为 MUX |
 | **应用启动通知** | guest→host | `app_started{pid}` → `ack` | 关 | guest 已 fork/exec 用户进程 |
-| **应用退出通知** | guest→host | `app_exited{code, term_signal}` → `ack` | 关 | 用户进程退出;guest 收 ack 后再 reboot;host 用作自身退出码 |
+| **应用退出通知** | guest→host | `app_exited{code, term_signal}` → `ack` | 关 | primary 终态退出；guest 在预算内等 ACK，超时仍 POWER_OFF；host 收到通知后用作退出码 |
 | **健康探测** | host→guest | `ping{id, t_send_ns}` → `pong{id, t_send_ns}` | 关 | host 计 RTT / 超时 / 失败数(§4.9) |
 | **mem 报告** | guest→host | `mem_report{mem_report:{epoch,seq,mem_*}}` → `mem_report_ack` | 关 | guest observation;host sandbox-local controller 验证 epoch/seq 后结合 CH `vm.info` |
 | **快照前** | host→guest | `quiesce{skip_drop_caches}` → `quiesced{drop_caches_result}` | 关 | guest 冻结应用进程树 + 跑 prep + 关闭 MUX(§3.4),host 还须控制连接 EOF 和自身 admitted-handler drain 才可 `/vm.pause` |
@@ -852,7 +852,7 @@ Restore/attach request epoch 被回显，不是通用重复请求过滤；mem_re
 ```
 
 **stream 集合 = pty 模式 XOR pipe 模式**(在 `launch_ack` / `restore_ack` /
-`attach_ack` 的 `stdio` 字段里声明):
+`attach_ack` / `exec_ack` 的 `stdio` 字段里声明):
 
 - **pty 模式**:CONTROL(0)+ PTY(4)。终端没有独立 stderr——应用的 stdout+stderr
   都到这个伪终端,合并在 PTY 流上
@@ -884,9 +884,8 @@ Pump 持有的未写字节与内核 pipe 字节有界，可随 memory capture �
 
 **per-stream 状态机**:
 
-- 未在协商集合里的 stream 上收到任何帧 = **协议违规** → 拆掉整条 MUX 连接(这是
-  bug,要响)
-- 某方向发过 `EOF` 后,在该方向再发 `DATA` = 协议违规 → 拆连接
+- 无效或未协商的 data stream 上收到 DATA/EOF/RESET/WINDOW_UPDATE 是协议违规，拆整条 MUX。
+- 某方向 EOF 或 RESET 后再收 DATA、或 DATA 超过接收窗口，均为协议违规并拆连接
 - 收到 RESET → 该 stream 双向 reset；bridge 决定本地 fd 关闭及后续 EOF/SIGPIPE，codec 本身不发送 OS signal
 - 对端不要你 offer 的某条流(资源级,非协议违规)→ 不开它 / 回 `RESET` 该流,连接继续
 - `EOF` 是单向半关:STDIN 上 host→guest 的 `EOF` 关应用 stdin 的写端;STDOUT/STDERR
@@ -907,7 +906,7 @@ guest 等 ACK 期间仍处理到达帧。Host 回 ACK 后立即关；guest 用�
     │
     │ ── MUX_CLOSE (CONTROL frame) ────────────────────►    (guest sends no more data frames after this)
     │ ◄── may still receive WINDOW_UPDATE / leftover STDIN DATA   (guest processes these normally)
-    │ ◄── MUX_CLOSE_ACK (CONTROL frame) ──────────────      host: flush pending → ACK → close(MUX)
+    │ ◄── MUX_CLOSE_ACK (CONTROL frame) ──────────────      host: serialized ACK → immediate close(MUX)
     │     on ACK → close(MUX) [SO_LINGER]                    host close → RST ─┐
     │ ◄── RST ────────────────────────────────────────────────────────────────┘
     ▼     normal RST drains teardown; guest SO_LINGER is bounded at 2s, not a removal proof
@@ -1136,7 +1135,8 @@ RTT 在完整 pong/guest-EOF exchange 后用 host time.Since(tSend) 计算，保
 - 各操作分别处理失败。Ping 有前述统计与可选 fatal threshold；
   没有通用相应 *_error_total 指标，也不能笼统声称控制失败绝不终止 VM。
 - Restore 请求发送前，CH 已收 CONNECT 但在 OK 前 EOF/reset 时，host 从 25 ms 起步退避，
-  在总 restore deadline 内最多重拨 2 s；此时尚未写 restore。
+  指数退避上限 200 ms；每次 CONNECT/OK 尝试最多 2 s，且不超过剩余总 restore budget。
+  可重试错误会一直重拨至总 deadline 或 context cancel，而非整段只重试 2 s；此时尚未写 restore。
   一旦开始写请求，任何失败都 fail closed，绝不重放。最终没有 restore_ack，
   则通过 CH VM shutdown 路径终结本次恢复并返回错误。
 - 意外 MUX error 可使转发中断、app 输出反压。当前只有 capture recovery/resume 显式调用 reattach；
@@ -1147,7 +1147,8 @@ RTT 在完整 pong/guest-EOF exchange 后用 host time.Since(tSend) 计算，保
 
 Host 的 timeouts.* 项以 sandbox.yaml 配置为准，文档指明的默认是不强制 response deadline，
 连接建立仍有独立限制（[sandbox 生命周期 §3.1](sandbox_zh.md)）。
-其他预算来自 proto 常量或 guest 等待：
+重试实现见 [guestlink/pinger.go](../pkg/guestlink/pinger.go)，forward teardown 见
+[sandbox-init/connect.go](../cmd/sandbox-init/connect.go)。其他预算来自 proto 常量或 guest 等待：
 
 | 消息 | deadline/budget | 备注 |
 |---|---|---|
@@ -1157,7 +1158,7 @@ Host 的 timeouts.* 项以 sandbox.yaml 配置为准，文档指明的默认是�
 | app_exited | 同 app_started | 没有 ACK 仍 POWER_OFF |
 | ping | timeouts.ping 默认不强制，production 200 ms；capture drain 至多 8 s | 普通失败更新统计；capture 超时 cancel/join 并失败；fatal threshold 须有界 |
 | quiesce | 8 s | exec/report drain、freeze、sync、可选 drop、forward 与 MUX teardown 的协议预算 |
-| restore | timeouts.restore 默认不强制 response deadline | request 前 EOF/reset retry 在总预算内至多 2 s；写请求后不重放；demand paging 可延后恢复；之后转 MUX |
+| restore | timeouts.restore 默认不强制 response deadline | request 前 EOF/reset 可重试至总 deadline 或 context cancel；每次 CONNECT/OK 最多 2 s 或更短的剩余预算；写请求后不重放；demand paging 可延后恢复；之后转 MUX |
 | attach | 5 s | 替换握手，之后转 MUX |
 | exec | 10 s | guest fork/exec 与 PATH 解析后 ACK；只限握手，运行命令前清 deadline |
 | connect | dial 模式握手 10 s，含 guest target dial ≤5 s | 转 fwd 后清 deadline；accept 模式写请求后清 ACK deadline，可无限 park，但 pending conn 仍登记以便 cancel/quiesce |
@@ -1287,5 +1288,5 @@ FileSpec 还支持 read_only，省略时 bind 可写。Tmpfs 注入避免直接�
   文件系统 / virtio-console / 网络功能为何如此
 - [Cloud Hypervisor 文档](cloud-hypervisor_zh.md) §5.2 —— vsock hybrid 代理:host
   侧映射到 UDS 的 CONNECT 行格式;`--console` / `--serial` 的用法
-- [guest-runtime native build](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/docs/build_zh.md) §2.1 —— mkfs.erofs 构建(`guest-runtime make sandbox-runtime` 的前置工具)
+- [guest-runtime native build](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/docs/build_zh.md) §2.1 —— mkfs.erofs 构建(`make -C guest-runtime sandbox-runtime` 的前置工具)
 - [项目系统设计](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md) §4 —— 模板实例化与暂停/恢复的用户语义
