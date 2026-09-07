@@ -1,0 +1,41 @@
+name: Assemble reviewed documentation objects
+
+on:
+  push:
+    branches: [docs/review-snapshot-20260907]
+    paths: ['.docs-edit/plan.json', '.github/workflows/docs-edit.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Read exact candidate inputs without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read immutable Markdown-only control helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/kuasar-sandbox
+          ref: 3199e8c8e25ab727308fba61e523e3f10d25b6e1
+          path: control
+          persist-credentials: false
+      - name: Assemble Markdown and create objects only, never update a reference
+        id: edit
+        working-directory: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ../control/.docs-edit/assemble.py --output "$RUNNER_TEMP/docs-edit" --publish-objects
+      - name: Return same-repository review evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: documentation-edit-${{ steps.edit.outputs.sha }}
+          path: ${{ runner.temp }}/docs-edit/
+          retention-days: 1
+          if-no-files-found: error
