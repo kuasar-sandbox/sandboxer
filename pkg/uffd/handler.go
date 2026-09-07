@@ -73,16 +73,18 @@ type Config struct {
 	Logf func(string, ...any)
 }
 
-// Handler manages a single userfaultfd:
-//   - uffdC: created in CH's process, registered MISSING on chVA,
+// Handler manages CH-side userfaultfd descriptors for one shared memfd:
+//   - uffdC: each is created in CH's process, registered MISSING on a chVA region,
 //     handed to sandbox-ctl via SCM_RIGHTS in the va_report handshake.
 //     Catches first-touch from vCPU. The backendVA mmap that
 //     sandbox-ctl holds for the same memfd is left WITHOUT any uffd
 //     registration; kernel handles backend-mm faults via plain shmem
 //     fileops.
 //
-// Single-uffd correctness rests on EEXIST + UFFDIO_WAKE recovery, not
-// on a vhost-side touch-before-publish invariant:
+// Multiple CH regions (for example around the x86 PCI hole) join the same
+// handler through AddUffd. There is no second UFFD on the backend mapping.
+// Correctness rests on EEXIST + UFFDIO_WAKE recovery, not on a vhost-side
+// touch-before-publish invariant:
 //
 //   - vhost-blk write path: Linux virtio_blk routinely places newly
 //     allocated, never-touched page-cache pages into the request's

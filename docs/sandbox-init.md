@@ -450,7 +450,7 @@ MemTotal 推导;host 把报告与 CH `vm.info` 组合后在 sandbox 本地计算
 
 发送失败时保留完全相同的 epoch/seq/payload,下一 ticker 重试;成功 ACK 后才清除
 pending 并允许下次采样。EAGAIN、timeout 或 ACK 丢失不会把 reporter 永久卡在
-in-progress 状态。详见 [`sandbox.md`](sandbox.md) §4.2 / §9.3。
+in-progress 状态。详见 [`sandbox_zh.md`](sandbox_zh.md) §4.2 / §9.3。
 
 ### 3.4 quiesce 处理
 
@@ -549,7 +549,7 @@ balloon 回收。
   env 竞态源)。若 MUX_CLOSE 握手因连接已断而走不通 → 按硬丢处理(对端也看到了
   断链),仍可发 `quiesced`;若 `quiesced` 未发或写不出去(host 侧不可达)→ host
   在 deadline 内拿不到响应 → host 视为协议失败、放弃此次 snapshot,sandbox 继续
-  运行(详见 §4.10 与 [`sandbox.md`](sandbox.md) §6.2)
+  运行(详见 §4.10 与 [`sandbox_zh.md`](sandbox_zh.md) §6.2)
 
 ### 3.5 应用 stdio / console 接线
 
@@ -575,12 +575,12 @@ sandbox-init 持有 pty master 端 / 各 pipe 的 sandbox-init 端,起桥接 gor
 
 **内核 dmesg**:走 `/dev/hvc0`(virtio-console),与应用 stdio 是完全独立的一条道;
 host 侧由 CH 把它写到 sandbox-ctl 给 CH 的 stdout(一根匿名管道),sandbox-ctl
-按 `--console` 标志决定丢弃 / 写 stderr / 写文件(详见 [`sandbox.md`](sandbox.md)
+按 `--console` 标志决定丢弃 / 写 stderr / 写文件(详见 [`sandbox_zh.md`](sandbox_zh.md)
 §2.2 / §5.2)。`--serial off`——没有 8250 UART。
 
 ### 3.6 exec 会话(`sandbox-ctl exec`)
 
-`sandbox-ctl exec`(host 侧 CLI + ctl.sock 见 [`sandbox.md`](sandbox.md) §2.5 /
+`sandbox-ctl exec`(host 侧 CLI + ctl.sock 见 [`sandbox_zh.md`](sandbox_zh.md) §2.5 /
 §6.3)在一个**已运行**的沙箱内拉起一条临时命令,它是用户应用的**兄弟进程**,
 既不替换应用、也不重启沙箱。host 经反向通道发 `exec{spec}`(§4.3);sandbox-init
 为这次会话准备 stdio、起进程、回 `exec_ack`,该连接随即成为这条会话**独立**的
@@ -1090,7 +1090,7 @@ local port;前者重置 transport epoch,后者维持分配连续性,两者职责
 | 参数 | 值 | 含义 |
 |---|---|---|
 | `interval` | 1 s(固定) | 两次 ping 起始时刻间隔 |
-| `timeout` | sandbox.yaml `timeouts.ping`;默认不强制(生产档 200 ms) | 单次 dial+write+read+guest close/EOF 总预算;到点视为失败。启用 `--ping-fatal-threshold` 时须设有界值(sandbox.md §2.2 / §3.1) |
+| `timeout` | sandbox.yaml `timeouts.ping`;默认不强制(生产档 200 ms) | 单次 dial+write+read+guest close/EOF 总预算;到点视为失败。启用 `--ping-fatal-threshold` 时须设有界值(sandbox_zh.md §2.2 / §3.1) |
 
 普通健康探测 timeout 与 capture drain budget 相互独立:前者可以不强制,但已入场探测不能把 export/snapshot 的 capture barrier 无限延长.
 
@@ -1126,7 +1126,7 @@ local port;前者重置 transport epoch,后者维持分配连续性,两者职责
   (绝不带半状态/半开 MUX 快照),sandbox 继续运行
 
 host 侧凡由 sandbox.yaml `timeouts.*` 接管的项以配置为准,默认不强制(host 等待
-任意时长,dial 仍有界;详见 [`sandbox.md`](sandbox.md) §3.1);其余为 `pkg/proto`
+任意时长,dial 仍有界;详见 [`sandbox_zh.md`](sandbox_zh.md) §3.1);其余为 `pkg/proto`
 协议常量:
 
 | 消息 | 单次 deadline | 备注 |
@@ -1151,7 +1151,7 @@ host 侧凡由 sandbox.yaml `timeouts.*` 接管的项以配置为准,默认不�
 sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合并后
 通过 launch 协议下发。`stdio` 节由 host 侧 `sandbox-ctl run` 的 `--tty` / `--stdin`
 / `--stdout` / `--stderr`(及它们的 `-from`/`-to`)解析决定(详见
-[`sandbox.md`](sandbox.md) §2.2)。
+[`sandbox_zh.md`](sandbox_zh.md) §2.2)。
 
 ```json
 {
@@ -1240,7 +1240,7 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
   等 `launch.stop_grace_period`(默认 10s)后超时 SIGKILL
 - tty 模式下,host 终端在 raw 态时键盘 `^C`(0x03)作为字节经 MUX PTY 流送到 guest
   伪终端,由 guest 的行规程转成 SIGINT 发给应用——这是想要的;杀沙箱另走 SIGTERM
-  或转义序列(详见 [`sandbox.md`](sandbox.md) §2.2)
+  或转义序列(详见 [`sandbox_zh.md`](sandbox_zh.md) §2.2)
 - `quiesce.signal`(§3.4 扩展项,未实现)发给 user app 做应用层清理
 
 ## 6. 扩展点
@@ -1255,7 +1255,7 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
 
 ## 7. See Also
 
-- [`sandbox.md`](sandbox.md) §2.2(`run` 的 `--tty` / `--console` / stdio 标志)、
+- [`sandbox_zh.md`](sandbox_zh.md) §2.2(`run` 的 `--tty` / `--console` / stdio 标志)、
   §5.2(CH 冷启动命令行)、§6.2 / §6.3(snapshot 时序 / ctl.sock 协议)、§7(恢复)
 - `guest-runtime/docs/vmlinux.md` —— guest kernel 启用的 namespace /
   文件系统 / virtio-console / 网络功能为何如此
