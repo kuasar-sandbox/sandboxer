@@ -104,7 +104,7 @@ Usage:
                         [--stdin-from F] [--stdout-to F] [--stderr-to F]
                         [--tty] [--console off|default|file=PATH]
                         [--ping-fatal-threshold N] [--stats-interval <dur>]
-                        [--ready-fd N]
+                        [--ready-fd N] [--debug]
   sandbox-ctl export    [--sandbox-id <sid>] [--path-id <leaf>]
                         (--output <out_dir> | --upload)
                         [--mode local|bundle] [--resume]
@@ -155,7 +155,8 @@ the complete boot definition from --config; it never applies to --restore.
 "control_ready\nready\n" to an inherited fd and closes that fd after
 ready; run itself continues to own the VM and remains blocked. SandboxID is the
 logical identity. PathID is the run-root/base-root directory leaf and defaults
-to SandboxID; it must be one safe path component.
+to SandboxID; it must be one safe path component. --debug (short -d) raises
+cloud-hypervisor's log level from its warn default to info by passing -v.
 
 export creates a runnable Sandbox E. Live export freezes the guest and all
 block backends but does not call Cloud Hypervisor's snapshot API or read RAM.

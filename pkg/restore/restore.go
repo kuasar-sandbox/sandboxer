@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -84,6 +85,10 @@ type Options struct {
 	// NotifyReadiness receives the one-shot startup milestones for this run.
 	// nil preserves the historical behavior exactly.
 	NotifyReadiness sandbox.ReadinessNotify
+
+	// Debug mirrors `sandbox-ctl run --debug`: it appends sandbox.CHDebugArgs
+	// (-v, CH info logs) to the restored CH command line.
+	Debug bool
 }
 
 // Run executes restore. Returns the CH exit code.
@@ -585,8 +590,10 @@ func Run(ctx context.Context, opts Options) (int, error) {
 				// net _net0 with one fd → [_net0@[N]].
 				restoreArg += fmt.Sprintf(",net_fds=[_net0@[%d]]", e.TapFDNum)
 			}
-			cmd.Args = append(cmd.Args, "--api-socket", e.CHSock, "--restore", restoreArg)
-			logf("spawning %s --api-socket %s --restore %s", opts.CHBinary, e.CHSock, restoreArg)
+			chArgs := []string{"--api-socket", e.CHSock, "--restore", restoreArg}
+			chArgs = append(chArgs, sandbox.CHDebugArgs(opts.Debug)...)
+			cmd.Args = append(cmd.Args, chArgs...)
+			logf("spawning %s %s", opts.CHBinary, strings.Join(chArgs, " "))
 			return cmd, cleanup, nil
 		},
 

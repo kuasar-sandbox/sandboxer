@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -285,5 +286,24 @@ func TestCHCommand_MemoryStringsHonored(t *testing.T) {
 	}
 	if !strings.Contains(joined, "--balloon size=0") {
 		t.Errorf("default startup=Capacity must retain a target-zero balloon device, got: %s", joined)
+	}
+}
+
+func TestCHDebugArgs(t *testing.T) {
+	cases := []struct {
+		name  string
+		debug bool
+		want  []string
+	}{
+		{name: "off adds nothing", debug: false, want: nil},
+		{name: "on passes -v for CH info logs", debug: true, want: []string{"-v"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := CHDebugArgs(tc.debug)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("CHDebugArgs(%v) = %v, want %v", tc.debug, got, tc.want)
+			}
+		})
 	}
 }
