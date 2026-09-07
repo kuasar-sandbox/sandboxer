@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -36,6 +37,7 @@ func TestApplyRestoreRulesUsesReferencedSandboxAsImmutableC0(t *testing.T) {
 	}
 	host := restoreHostConfig()
 	host.Resources.Startup = &StartupConfig{Memory: "256MiB"}
+	host.CH = CHConfig{ExtraArgs: []string{"-vv", "--log-file", "/tmp/ch.log"}}
 	runtime, c0, err := ApplyRestoreRules(artifact, host, FieldPresence{})
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +50,9 @@ func TestApplyRestoreRulesUsesReferencedSandboxAsImmutableC0(t *testing.T) {
 	}
 	if runtime.Restore.Prefetch != "memory" || runtime.Timeouts.CHApi != "5s" {
 		t.Fatalf("restore host policy was not applied: restore=%+v timeouts=%+v", runtime.Restore, runtime.Timeouts)
+	}
+	if !slices.Equal(runtime.CH.ExtraArgs, []string{"-vv", "--log-file", "/tmp/ch.log"}) {
+		t.Fatalf("restore host CH extra args were not applied: %v", runtime.CH.ExtraArgs)
 	}
 	if runtime.Resources.Startup == nil || runtime.Resources.Startup.Memory != "256MiB" {
 		t.Fatalf("restore node startup policy was not applied: %+v", runtime.Resources.Startup)

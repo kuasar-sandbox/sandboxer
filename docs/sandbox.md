@@ -333,6 +333,8 @@ metadata: { workload.kind: api }
 
 restore:
   prefetch: off
+ch:                        # host-only CH argv additions (cold AND restore)
+  extra_args: ["-vv", "--log-file", "/tmp/ch.log"]   # 一项一 token,原样追加到 CH 命令行末尾
 timeouts:
   ch_api: 30s
 ```
@@ -692,6 +694,8 @@ Block devices只绑定 logical Payload:
 - ZIP tail永不暴露给 vhost.
 
 CH stdin固定 `/dev/null`;console output由 sandbox-ctl bridge. Net provider为 TAP 或 TapFD,而 portable topology只说明 NIC是否存在和 interface name.
+
+`ch.extra_args`(host-only,不进 portable/snapshot)是 **privileged host escape hatch**: 一个 list item = 一个 argv token,原样追加到 CH argv 最末尾——cold 在 `--cmdline` 之后、restore 在 `--restore` 之后,两者都只取单值,变长 flag(`--disk`/`--net`/`--memory-zone`)吞不到这些 token;没有空白拆分、没有 shell quoting,含空格的值以独立 token 传入. `-v`/`--log-file` 属 CH logging 组,两种模式都合法;restore 模式下 vm-config 组参数由 CH 自己拒绝(clap requires vm-payload,fail-fast). sandboxer 自己发射的 flag(`--api-socket`/`--restore`/`--kernel`/`--pmem`/`--memory`/`--memory-zone`/`--cpus`/`--vsock`/`--console`/`--serial`/`--disk`/`--balloon`/`--net`/`--cmdline` 及 `-h`/`-V`/`--`)在 validation 阶段拒绝,`=` 连写(`--api-socket=/x`)经 `chFlagName` normalize 后同样匹配. 该段可改变 VMM 安全/运行策略(如 `--seccomp`),因此 sandbox.yaml 必须仅由可信 host/node operator 控制——host-only 解决的是 artifact 持久化边界,不是权限边界. `--config a.yaml:b.yaml` 深合并下该列表整体替换(与既有 list 语义一致).
 
 ### 5.3 `run --from` rules
 

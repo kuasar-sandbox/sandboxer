@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -85,6 +86,48 @@ func TestCHCommand_HasExpectedFlags(t *testing.T) {
 		if strings.Contains(joined, banned) {
 			t.Errorf("CH cmdline must not contain %q (launch goes via vsock now)", banned)
 		}
+	}
+}
+
+func TestCHCommand_ExtraArgsAppendedAtEnd(t *testing.T) {
+	base, err := CHCommand(makeMinimalCfg(), nil, "/run/sb/ch.sock", "/run/sb/vsock.sock",
+		"/vmlinux", "/sandbox-runtime.bundle", "/run/sb/uffd.sock", "tty", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		extraArgs []string
+		wantTail  []string // argv must end with these tokens, verbatim
+	}{
+		{"none", nil, nil},
+		{"count flag", []string{"-vv"}, []string{"-vv"}},
+		{"flag and value as separate entries", []string{"-v", "--log-file", "/tmp/ch.log"}, []string{"-v", "--log-file", "/tmp/ch.log"}},
+		{"= joined flag and value stays one token", []string{"-vv", "--log-file=/tmp/ch.log"}, []string{"-vv", "--log-file=/tmp/ch.log"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := makeMinimalCfg()
+			cfg.CH.ExtraArgs = tc.extraArgs
+			args, err := CHCommand(cfg, nil, "/run/sb/ch.sock", "/run/sb/vsock.sock",
+				"/vmlinux", "/sandbox-runtime.bundle", "/run/sb/uffd.sock", "tty", 0, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The managed prefix (ending in the single-valued --cmdline) must be
+			// untouched, so no variadic CH flag can swallow the appended tokens.
+			if len(args) != len(base)+len(tc.wantTail) {
+				t.Fatalf("argv length = %d, want %d (baseline %d + tail %d)\n  got: %s",
+					len(args), len(base)+len(tc.wantTail), len(base), len(tc.wantTail), strings.Join(args, " "))
+			}
+			if !slices.Equal(args[:len(base)], base) {
+				t.Errorf("managed prefix changed:\n  got:  %s\n  want: %s",
+					strings.Join(args, " "), strings.Join(base, " "))
+			}
+			if len(tc.wantTail) > 0 && !slices.Equal(args[len(base):], tc.wantTail) {
+				t.Errorf("argv tail = %v, want %v", args[len(base):], tc.wantTail)
+			}
+		})
 	}
 }
 

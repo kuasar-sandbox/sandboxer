@@ -132,6 +132,15 @@ func CHCommandWithInitialBudget(cfg *config.SandboxConfig, initialBudget uint64,
 	}
 
 	args = append(args, "--cmdline", buildCmdline(cfg))
+
+	// ch.extra_args: raw operator additions (-v/-vv log level, --log-file,
+	// ...), appended verbatim at the very END of the argv — one list entry
+	// is one argv token, no splitting, no quoting. Every sandboxer-managed
+	// flag precedes them and --cmdline takes exactly one value, so no
+	// variadic CH flag (--disk/--net/--memory-zone) can swallow these
+	// tokens. The restore spawn path appends the same list after --restore
+	// (pkg/restore/restore.go).
+	args = append(args, cfg.CH.ExtraArgs...)
 	return args, nil
 }
 

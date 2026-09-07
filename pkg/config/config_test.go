@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -136,6 +137,7 @@ func TestSandboxConfigMarshalRestoreHostProjection(t *testing.T) {
 		EphemeralFiles: []FileConfig{{Path: "/etc/ephemeral", Content: "secret"}},
 		Init:           []InitConfig{{Exec: "/bin/setup"}},
 		Metadata:       map[string]string{"persistent": "value"},
+		CH:             CHConfig{ExtraArgs: []string{"-vv", "--log-file", "/tmp/ch.log"}},
 	}
 
 	body, err := yaml.Marshal(cfg)
@@ -162,6 +164,9 @@ func TestSandboxConfigMarshalRestoreHostProjection(t *testing.T) {
 	}
 	if err := host.ValidateRestoreHostConfigWithPresence(presence); err != nil {
 		t.Fatalf("restore-host YAML is not accepted by strict restore validation: %v\n%s", err, body)
+	}
+	if !slices.Equal(host.CH.ExtraArgs, []string{"-vv", "--log-file", "/tmp/ch.log"}) || !presence.Has("ch.extra_args") {
+		t.Fatalf("restore-host YAML lost ch.extra_args:\n%s", body)
 	}
 	if cfg.Launch.Exec != "/bin/app" || len(cfg.Files) != 1 || cfg.Resources.Startup == nil {
 		t.Fatal("marshal mutated its input config")
@@ -623,6 +628,118 @@ func TestRestorePrefetchMergedOverride(t *testing.T) {
 	}
 	if err := cfg.ValidateRestoreHostConfig(); err != nil {
 		t.Fatalf("ValidateRestoreHostConfig(off): %v", err)
+	}
+}
+
+func TestCHExtraArgsValidate(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		extraArgs []string
+		wantErr   string // empty means accepted
+	}{
+		{"empty list", nil, ""},
+		{"count flag", []string{"-vv"}, ""},
+		{"value tokens", []string{"--log-file", "/tmp/ch.log"}, ""},
+		{"= joined flag and value", []string{"--log-file=/tmp/ch.log"}, ""},
+		{"value containing whitespace", []string{"/tmp/a b.log"}, ""},
+		{"empty entry", []string{"-v", ""}, "ch.extra_args[1]"},
+		{"reserved api-socket", []string{"--api-socket", "/tmp/x"}, "ch.extra_args[0]"},
+		{"reserved restore", []string{"--restore", "source_url=file:///x"}, "ch.extra_args[0]"},
+		{"reserved memory-zone", []string{"--memory-zone", "id=ram0"}, "ch.extra_args[0]"},
+		{"reserved cmdline", []string{"--cmdline", "quiet"}, "ch.extra_args[0]"},
+		{"reserved balloon", []string{"--balloon", "size=0"}, "ch.extra_args[0]"},
+		{"reserved via = join", []string{"--api-socket=/tmp/x"}, "ch.extra_args[0]"},
+		{"reserved version", []string{"-V"}, "ch.extra_args[0]"},
+		{"reserved end of flags", []string{"--"}, "ch.extra_args[0]"},
+		{"reserved in later entry", []string{"-vv", "--cpus", "boot=4"}, "ch.extra_args[1]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := (CHConfig{ExtraArgs: tc.extraArgs}).validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validate rejected valid extra args: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("validate error = %v, want mention of %s", err, tc.wantErr)
+			}
+		})
+	}
+
+	// The whole reserved set must stay rejected: iterate the map so an
+	// entry can never be dropped silently when a spawn path changes.
+	for flag := range chReservedFlags {
+		t.Run("reserved "+flag, func(t *testing.T) {
+			err := (CHConfig{ExtraArgs: []string{flag, "v"}}).validate()
+			if err == nil || !strings.Contains(err.Error(), "ch.extra_args[0]") {
+				t.Errorf("reserved flag %q not rejected (error: %v)", flag, err)
+			}
+		})
+	}
+}
+
+func TestCHExtraArgsValidation(t *testing.T) {
+	cfg, err := Load(writeYAML(t, minimalCold+"\nch:\n  extra_args: [\"-vv\", \"--log-file\", \"/tmp/ch.log\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.CH.ExtraArgs, []string{"-vv", "--log-file", "/tmp/ch.log"}; !slices.Equal(got, want) {
+		t.Fatalf("ch.extra_args = %v, want %v (one entry = one argv token, no splitting)", got, want)
+	}
+	if err := cfg.ValidateCold(); err != nil {
+		t.Fatalf("ValidateCold: %v", err)
+	}
+	if err := cfg.ValidateRestoreHostConfig(); err != nil {
+		t.Fatalf("ValidateRestoreHostConfig: %v", err)
+	}
+
+	cfg.CH.ExtraArgs = []string{"--api-socket", "/tmp/hijack.sock"}
+	for name, validate := range map[string]func() error{
+		"cold":    cfg.ValidateCold,
+		"restore": cfg.ValidateRestoreHostConfig,
+	} {
+		if err := validate(); err == nil || !strings.Contains(err.Error(), "ch.extra_args[0]") {
+			t.Errorf("%s validation error = %v, want ch.extra_args[0] reserved-flag error", name, err)
+		}
+	}
+}
+
+func TestCHExtraArgsMergedOverride(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.yaml")
+	over := filepath.Join(dir, "over.yaml")
+	if err := os.WriteFile(base, []byte(minimalCold+"\nch:\n  extra_args: [\"-v\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name        string
+		over        string
+		want        []string
+		wantCleared bool
+	}{
+		{"later file replaces the list", "ch:\n  extra_args: [\"-vv\"]\n", []string{"-vv"}, false},
+		{"later file without ch keeps the list", "network:\n  hostname: h2\n", []string{"-v"}, false},
+		{"later file with empty list clears it", "ch:\n  extra_args: []\n", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(over, []byte(tc.over), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadMerged([]string{base, over})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantCleared {
+				if len(cfg.CH.ExtraArgs) != 0 {
+					t.Fatalf("ch.extra_args = %v, want cleared", cfg.CH.ExtraArgs)
+				}
+				return
+			}
+			if !slices.Equal(cfg.CH.ExtraArgs, tc.want) {
+				t.Fatalf("ch.extra_args = %v, want %v", cfg.CH.ExtraArgs, tc.want)
+			}
+		})
 	}
 }
 

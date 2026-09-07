@@ -64,6 +64,7 @@ func ApplyFromRules(artifact *PortableSandboxConfig, host *SandboxConfig, presen
 	runtime.Resources.Startup = host.Resources.Startup
 	runtime.Timeouts = host.Timeouts
 	runtime.Restore = host.Restore
+	runtime.CH = host.CH
 	runtime.Launch.StartTimeout = host.Launch.StartTimeout
 
 	// Instance-only launch/file input is applied to the cold launch but absent

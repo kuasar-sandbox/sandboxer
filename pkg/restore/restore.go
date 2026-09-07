@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -84,6 +85,15 @@ type Options struct {
 	// NotifyReadiness receives the one-shot startup milestones for this run.
 	// nil preserves the historical behavior exactly.
 	NotifyReadiness sandbox.ReadinessNotify
+}
+
+// restoreCHArgv returns the restore-mode CH argv tail: the fixed
+// --api-socket/--restore pair followed by ch.extra_args verbatim (one list
+// entry = one argv token). --restore takes exactly one value, so the
+// appended tokens can never be swallowed by it.
+func restoreCHArgv(chSock, restoreArg string, extra []string) []string {
+	argv := []string{"--api-socket", chSock, "--restore", restoreArg}
+	return append(argv, extra...)
 }
 
 // Run executes restore. Returns the CH exit code.
@@ -585,8 +595,15 @@ func Run(ctx context.Context, opts Options) (int, error) {
 				// net _net0 with one fd → [_net0@[N]].
 				restoreArg += fmt.Sprintf(",net_fds=[_net0@[%d]]", e.TapFDNum)
 			}
-			cmd.Args = append(cmd.Args, "--api-socket", e.CHSock, "--restore", restoreArg)
-			logf("spawning %s --api-socket %s --restore %s", opts.CHBinary, e.CHSock, restoreArg)
+			// ch.extra_args: host-local additions from THIS invocation's
+			// host yaml, appended verbatim (one list entry = one argv
+			// token). -v/-vv and --log-file are valid in restore mode too;
+			// vm-config-group flags are rejected by CH itself here (clap
+			// requires a vm-payload alongside) — fail fast, clear error, no
+			// sandboxer-side pre-filtering.
+			argv := restoreCHArgv(e.CHSock, restoreArg, opts.HostCfg.CH.ExtraArgs)
+			cmd.Args = append(cmd.Args, argv...)
+			logf("spawning %s %s", opts.CHBinary, strings.Join(argv, " "))
 			return cmd, cleanup, nil
 		},
 

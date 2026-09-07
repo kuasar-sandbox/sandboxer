@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -26,6 +27,53 @@ func portableFromFixture() *PortableSandboxConfig {
 		},
 		Files:    []FileConfig{{Path: "/etc/artifact", Content: "artifact"}},
 		Metadata: map[string]string{"source": "artifact"},
+	}
+}
+
+func TestApplyFromRulesAppliesCHExtraArgs(t *testing.T) {
+	host, presence, err := LoadConfigBytesWithPresence([]byte(`
+ch:
+  extra_args: ["-vv", "--log-file", "/tmp/ch.log"]
+network:
+  tap: tap0
+boot:
+  kernel: file:///node/vmlinux
+  runtime: file:///node/sandbox-runtime.bundle
+  root:
+    overlay:
+      diff_template: file:///node/upper.ext4
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, c0, err := ApplyFromRules(portableFromFixture(), host, presence, ApplyFromOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(runtime.CH.ExtraArgs, []string{"-vv", "--log-file", "/tmp/ch.log"}) {
+		t.Fatalf("run --from dropped host ch.extra_args: %v", runtime.CH.ExtraArgs)
+	}
+	raw, err := MarshalPortableSandboxConfig(c0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"extra_args", "-vv", "/tmp/ch.log"} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("C0 leaked %q into the portable artifact:\n%s", forbidden, raw)
+		}
+	}
+
+	// The merged runtime must still see the section, so reserved-flag
+	// validation cannot be silently bypassed by routing through --from:
+	// CH.validate runs near the top of validateCold, so a reserved flag
+	// surfaces even if later host-fs checks would also fail.
+	host.CH.ExtraArgs = []string{"--api-socket", "/tmp/hijack.sock"}
+	runtime, _, err = ApplyFromRules(portableFromFixture(), host, presence, ApplyFromOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.ValidateCold(); err == nil || !strings.Contains(err.Error(), "ch.extra_args[0]") {
+		t.Fatalf("ValidateCold after --from merge = %v, want ch.extra_args[0] reserved-flag error", err)
 	}
 }
 

@@ -260,6 +260,12 @@ launch:
 #   - { path: /run/instance-token, mode: "0600", content: "current-run-only" }
 # init:  # one-shot, run-to-completion before the app (use plugin[] for long-running)
 #   - { exec: /bin/sh, args: ["-c", "echo provisioning"], timeout: 30s }
+# ch:                                      # privileged host escape hatch: raw cloud-hypervisor
+#   extra_args: ["-vv"]                    # argv additions (cold AND restore). ONE list item =
+#                                          # ONE argv token (no splitting/quoting), appended at
+#                                          # the very END of the CH command line; "-vv" = CH
+#                                          # Debug logging. Flags sandboxer emits itself are
+#                                          # rejected.
 `
 
 // skeletonRestore is the host-only restore template. Workload state and the
@@ -282,4 +288,9 @@ boot:
     overlay:
       diff_template: file:///opt/sandbox/overlay-templates/basic-1G.ext4
       # Immutable base/base_from_refs are forbidden here; E owns them.
+# ch:
+#   extra_args: ["-vv"]                    # host-only CH argv additions (one item = one argv
+#                                          # token), appended after --restore; logging flags
+#                                          # (-v, --log-file) are valid here, vm-config flags
+#                                          # are rejected by CH
 `

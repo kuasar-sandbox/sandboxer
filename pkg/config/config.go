@@ -67,6 +67,12 @@ type SandboxConfig struct {
 	// of snapshot.cfg and is never inherited from the snapshot being restored.
 	Restore RestoreConfig `yaml:"restore,omitempty"`
 
+	// CH carries host-local cloud-hypervisor process knobs. Host policy like
+	// Restore: applied on BOTH CH spawn paths (cold-start argv and restore
+	// argv), never part of PortableSandboxConfig or snapshot state, and never
+	// inherited from the snapshot being restored.
+	CH CHConfig `yaml:"ch,omitempty"`
+
 	// Mounts / Files / Init drive guest environment setup (applied before
 	// the app is forked). See docs/sandbox.md §3.8.
 	Mounts []MountConfig `yaml:"mounts,omitempty"`
@@ -116,6 +122,7 @@ func (c SandboxConfig) MarshalYAML() (any, error) {
 		Boot      restoreBootYAML `yaml:"boot"`
 		Timeouts  TimeoutsConfig  `yaml:"timeouts,omitempty"`
 		Restore   RestoreConfig   `yaml:"restore,omitempty"`
+		CH        CHConfig        `yaml:"ch,omitempty"`
 	}
 	return restoreHostYAML{
 		Resources: c.Resources,
@@ -125,6 +132,7 @@ func (c SandboxConfig) MarshalYAML() (any, error) {
 		},
 		Timeouts: c.Timeouts,
 		Restore:  c.Restore,
+		CH:       c.CH,
 	}, nil
 }
 
@@ -175,6 +183,60 @@ func ParsePrefetchMode(s string) (PrefetchMode, error) {
 func (c RestoreConfig) validate() error {
 	_, err := ParsePrefetchMode(c.Prefetch)
 	return err
+}
+
+// CHConfig carries host-local cloud-hypervisor process knobs. The first and
+// currently only knob is the raw extra_args escape hatch; future typed
+// fields (log_level, log_file, ...) join this section and get translated
+// into argv by the spawn-path builders.
+type CHConfig struct {
+	// ExtraArgs is appended verbatim to the very END of the CH command line,
+	// after every sandboxer-managed flag. ONE list entry is exactly ONE argv
+	// token — no whitespace splitting, no shell quoting — so a value that
+	// contains spaces is expressed as its own single entry and reaches CH as
+	// one argument. As a raw escape hatch it can change VMM security and
+	// runtime policy (--seccomp, ...): sandbox.yaml must only ever be
+	// authored by a trusted host/node operator. Under --config a.yaml:b.yaml
+	// the list follows the usual deep-merge list semantics: replaced
+	// wholesale by the last file that sets it.
+	ExtraArgs []string `yaml:"extra_args,omitempty"`
+}
+
+// chReservedFlags are the CH flags sandboxer itself emits (cold argv in
+// pkg/sandbox/ch.go, restore argv in pkg/restore/restore.go) plus the flags
+// that stop CH before a VM exists. Duplicating any of them via
+// ch.extra_args would override a sandboxer-managed value or trip clap's
+// "cannot be used multiple times" far from the cause, so they are rejected
+// up front with a ch.extra_args[i]-attributed error. Everything else
+// (--log-file, --seccomp, -v, ...) passes through untouched. Keep this set
+// in sync when a spawn path gains a flag.
+var chReservedFlags = map[string]struct{}{
+	"--api-socket": {}, "--restore": {}, "--kernel": {}, "--pmem": {},
+	"--memory": {}, "--memory-zone": {}, "--cpus": {}, "--vsock": {},
+	"--console": {}, "--serial": {}, "--disk": {}, "--balloon": {},
+	"--net": {}, "--cmdline": {},
+	"-h": {}, "--help": {}, "-V": {}, "--version": {}, "--": {},
+}
+
+// chFlagName normalizes one argv token for the reserved-flag lookup: the
+// =-joined spelling "--api-socket=/x" folds to "--api-socket", so the guard
+// cannot be bypassed by fusing flag and value into one token.
+func chFlagName(tok string) string {
+	flag, _, _ := strings.Cut(tok, "=")
+	return flag
+}
+
+func (c CHConfig) validate() error {
+	for i, tok := range c.ExtraArgs {
+		if tok == "" {
+			return fmt.Errorf("ch.extra_args[%d]: entry is empty", i)
+		}
+		flag := chFlagName(tok)
+		if _, reserved := chReservedFlags[flag]; reserved {
+			return fmt.Errorf("ch.extra_args[%d]: %q is emitted by sandboxer and cannot be set via ch.extra_args", i, flag)
+		}
+	}
+	return nil
 }
 
 // ResourcesConfig separates immutable VM capacity from the settled guest
@@ -1043,6 +1105,9 @@ func (c *SandboxConfig) validateCold(requireCgroupCapability bool) error {
 	if err := c.Restore.validate(); err != nil {
 		return err
 	}
+	if err := c.CH.validate(); err != nil {
+		return err
+	}
 	if c.Resources.Capacity.CPU <= 0 {
 		return errors.New("resources.capacity.cpu must be > 0")
 	}
@@ -1308,6 +1373,9 @@ func validateFiles(field string, files []FileConfig) error {
 // applies explicitly supplied target-node allocatable CPU/memory policy.
 func (c *SandboxConfig) ValidateRestoreHostConfig() error {
 	if err := c.Restore.validate(); err != nil {
+		return err
+	}
+	if err := c.CH.validate(); err != nil {
 		return err
 	}
 	cgroupSet := c.Resources.Control.CgroupPath != ""
