@@ -1,11 +1,26 @@
-# 许可证范围
+[English](LICENSE_SCOPE.md) | [简体中文](LICENSE_SCOPE_zh.md)
 
-除下述上游内容外,本仓库中未另行声明许可证的项目原创内容适用根目录的 Apache License 2.0.
+<a id="许可证范围"></a>
+# License scope
 
-## Cloud Hypervisor patch
+Except for the upstream material described below, original project content in
+this repository without a separate license declaration is covered by the Apache
+License 2.0 in the repository root.
 
-`native-deps/deps/ch-patches/` 中的 patch 基于 Cloud Hypervisor v51.1.本项目新增的修改按 Apache-2.0 提交;mbox patch 中保留的上游上下文继续适用对应 Cloud Hypervisor 源文件已有的许可证声明.
+<a id="cloud-hypervisor-patch"></a>
+## Cloud Hypervisor patches
 
-Cloud Hypervisor v51.1 的源码以 Apache-2.0 为主,部分文件包含 BSD-3-Clause 代码.因此本仓库不为整组 patch 声明一个会误导的统一 `Apache-2.0 OR BSD-3-Clause` SPDX 表达式.根目录 `LICENSE` 提供 Apache-2.0 全文,[`LICENSES/BSD-3-Clause.txt`](LICENSES/BSD-3-Clause.txt) 保留 patch 所涉及上游源码使用的 BSD-3-Clause 文本及归属声明.
+The patches in `native-deps/deps/ch-patches/` are based on Cloud Hypervisor v51.1.
+The project's new modifications are submitted under Apache-2.0. Upstream context
+retained in the mbox patches remains subject to the existing license declarations
+of the corresponding Cloud Hypervisor source files.
 
-构建时下载且未跟踪在本仓库中的 Cloud Hypervisor 源码继续适用其上游逐文件许可证声明.
+Cloud Hypervisor v51.1 is predominantly Apache-2.0, with BSD-3-Clause code in some
+files. This repository therefore does not assign a misleading uniform
+`Apache-2.0 OR BSD-3-Clause` SPDX expression to the complete patch set. The root
+`LICENSE` contains the full Apache-2.0 text.
+[`LICENSES/BSD-3-Clause.txt`](LICENSES/BSD-3-Clause.txt) preserves the BSD-3-Clause
+text and attribution used by the upstream source represented in the patches.
+
+Cloud Hypervisor sources downloaded during the build and not tracked in this
+repository remain subject to their upstream per-file license declarations.

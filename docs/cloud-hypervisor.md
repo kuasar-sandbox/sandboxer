@@ -1,154 +1,189 @@
-# cloud-hypervisor — VMM 与平台 patches
+[English](cloud-hypervisor.md) | [简体中文](cloud-hypervisor_zh.md)
 
-平台用 cloud-hypervisor(CH)作为 microVM 监视器。绝大多数路径跑 upstream
-行为,外部托管内存、restore-safe vsock 和可靠 VM lifecycle 通过本仓维护的
-7 个 patch 实现。
-本文档定义 patch 范围、构建方式及对应行为契约。
+<a id="cloud-hypervisor--vmm-与平台-patches"></a>
+# cloud-hypervisor — VMM and platform patches
 
-## 1. 概述
+The platform uses Cloud Hypervisor (CH) as its microVM monitor. Most paths use
+upstream behavior. Externally managed memory, restore-safe vsock, and reliable VM
+lifecycle barriers are supplied by seven patches maintained in this repository.
+This document defines their scope, build procedure, and behavioral contracts.
 
-### 1.1 为什么需要 patch
+<a id="1-概述"></a>
+## 1. Overview
 
-平台对 VMM 有四条非 upstream 的诉求:
+<a id="11-为什么需要-patch"></a>
+### 1.1 Why patches are required
 
-1. **外部托管 sandbox RAM**:host 进程(sandbox-ctl)持有 memfd inode,CH 通过
-   继承 fd 把同一 inode mmap 到自己地址空间——而不是 CH 自己 `memfd_create`。
-   这样 sandbox-ctl 拥有内存所有权,快照时直接通过 SEEK_DATA/HOLE 扫驻留页,
-   绕过 CH→file→sandbox-ctl 的中转
-2. **外部 uffd handler**:sandbox-ctl 接管 sandbox RAM 缺页,实现按需从快照
-   或零页填充。CH 自己创建 uffd(必须绑到 CH mm),通过 SCM_RIGHTS 把 fd 传
-   给 sandbox-ctl 的 handler
-3. **restore-safe vsock**:CH restore 会重建空的 Unix backend,guest 却保留
-   已连接 socket。快照时必须向 guest event queue 预发布 virtio-vsock transport
-   reset,恢复时重发该事件的 IRQ,并在 guest 确认清理旧连接前阻止新 backend RX
-   包进入
-4. **可靠 VM lifecycle**:pause、snapshot、resume 和 ordered shutdown 在数值
-   `cpu.max` 与 host contention 下不能丢失 vCPU kick,也不能因 CPU 或 virtio
-   worker 的旧 acknowledgement 提前返回或永久阻塞
+The platform has four requirements beyond the pinned upstream VMM behavior:
 
-这些能力 upstream CH 都不直接支持。第二条尤其本质——upstream uffd handler 模型
-是 CH 调外部 socket,handler 提供数据,但平台需要 handler 接管 fault 投递
-路由,upstream 的 listener 模型不够。此外这一模型带来一条派生修复:balloon
-释放路径对从未驻留的空洞 run 不能合成 `EVENT_REMOVE` 风暴(patch 0004,§3.4)。
+1. **Externally owned sandbox RAM**: the host process (`sandbox-ctl`) owns the
+   memfd inode. CH maps that same inode through an inherited descriptor rather
+   than allocating the backing with its own `memfd_create`. The owner can scan
+   resident data with `SEEK_DATA`/`SEEK_HOLE` during snapshotting, without a
+   CH-to-file-to-sandbox-ctl intermediate copy.
+2. **An external uffd handler**: sandbox-ctl handles sandbox RAM faults and fills
+   pages from a snapshot or with zeroes on demand. CH creates the uffd because it
+   must be associated with CH's memory map, then passes the descriptor to the
+   sandbox-ctl handler with `SCM_RIGHTS`.
+3. **Restore-safe vsock**: CH restore recreates an empty Unix backend, while the
+   guest retains connected sockets. Snapshotting must stage a virtio-vsock
+   transport reset in the guest event queue. Restore reasserts its IRQ and blocks
+   new backend RX packets until the guest acknowledges cleanup of old connections.
+4. **Reliable VM lifecycle operations**: pause, snapshot, resume, and ordered
+   shutdown must not lose vCPU kicks under a numeric `cpu.max` and host contention.
+   Old acknowledgements from vCPUs or virtio workers must not cause premature
+   completion or indefinite waits.
 
-### 1.2 patch 范围(总结)
+The pinned upstream interface does not directly provide this combination. The
+second requirement is particularly important: the platform needs to own fault
+handling and delivery, not just supply data to an upstream external-listener
+model. This memory model also requires avoiding an `EVENT_REMOVE` storm when
+balloon release encounters ranges that have never been resident (patch 0004,
+§3.4).
 
-| 文件 | 改动行数 | 内容 |
-|------|----------|------|
-| `vmm/src/vm_config.rs` | ~19 | `MemoryZoneConfig` 新增 `fd` / `uffd_socket` 字段 |
-| `vmm/src/config.rs` | ~9 | `MemoryConfig::parse` 增加两个 key 解析 |
-| `vmm/src/memory_manager.rs` | ~338 | fd 注入 + user_managed skip + create_ram_region 内创建 uffd + va_report sendmsg(SCM_RIGHTS) + UFFDIO_REGISTER |
-| `vmm/src/seccomp_filters.rs` | ~17 | allowlist `userfaultfd` syscall + `UFFDIO_API` / `UFFDIO_REGISTER` ioctl |
-| `virtio-devices/src/balloon.rs` | ~38 | balloon release 对 user-managed zone 的空洞 run 跳过 `PUNCH_HOLE`/`MADV_DONTNEED`(`SEEK_DATA` 探测)|
-| `virtio-devices/src/seccomp_filters.rs` | ~8 | balloon 线程 seccomp 放行 `SYS_lseek`(skip-hole 探测所需)|
-| `virtio-devices/src/vsock/unix/muxer.rs` | ~20 | 持久化 host local-port 分配游标 |
-| `virtio-devices/src/vsock/device.rs` / `mod.rs` | ~330 | snapshot 时发布 transport reset,restore 重发 IRQ,guest 确认前 gate RX |
-| `hypervisor/src/cpu.rs` / `kvm/mod.rs` | ~110 | `KVM_SET_SIGNAL_MASK` no-miss vCPU kick,userspace 保持 blocked mask |
-| `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~550 | lifecycle 安全点消费 kick、请求级 ACK/deadline、KVM ioctl allowlist |
-| `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~280 | pause event publish/wake + resume 双向 barrier,覆盖自定义 worker |
+<a id="12-patch-范围总结"></a>
+### 1.2 Patch scope summary
 
-7 个 commit 合计 1,665 insertions / 136 deletions,基于 cloud-hypervisor `v51.1`。
+The following line counts describe the reviewed patch set at sandboxer commit
+`c29f9af875c595df68491b50e872007e9285ef48`; they are revision-specific estimates,
+not a permanent size or compatibility guarantee.
 
-### 1.3 维护策略
+| File | Approximate changed lines | Purpose |
+| --- | --- | --- |
+| `vmm/src/vm_config.rs` | ~19 | Add `fd` and `uffd_socket` to `MemoryZoneConfig` |
+| `vmm/src/config.rs` | ~9 | Parse the two additional `MemoryConfig::parse` keys |
+| `vmm/src/memory_manager.rs` | ~338 | Inherited backing fd, user-managed skip, in-process uffd creation, `va_report` with `SCM_RIGHTS`, and `UFFDIO_REGISTER` |
+| `vmm/src/seccomp_filters.rs` | ~17 | Allow `userfaultfd`, `UFFDIO_API`, and `UFFDIO_REGISTER` |
+| `virtio-devices/src/balloon.rs` | ~38 | Probe with `SEEK_DATA`; skip `PUNCH_HOLE` and `MADV_DONTNEED` for hole-only file-backed runs |
+| `virtio-devices/src/seccomp_filters.rs` | ~8 | Allow the balloon thread's `SYS_lseek` probe |
+| `virtio-devices/src/vsock/unix/muxer.rs` | ~20 | Persist the host local-port allocation cursor |
+| `virtio-devices/src/vsock/device.rs` / `mod.rs` | ~330 | Stage transport reset at snapshot, reassert its IRQ at restore, and gate RX until guest acknowledgement |
+| `hypervisor/src/cpu.rs` / `kvm/mod.rs` | ~110 | No-miss vCPU kicks with `KVM_SET_SIGNAL_MASK` and a blocked userspace signal mask |
+| `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~550 | Consume kicks at lifecycle safe points, per-request ACKs/deadlines, and KVM ioctl allowlisting |
+| `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~280 | Publish/wake pause events and provide a two-way resume barrier, including custom workers |
 
-- patch 文件位置:`deps/ch-patches/000{1,2,3,4,5,6,7}-*.patch`
-- 应用方式:`make ch-patches-apply`(在 `make cloud-hypervisor` 内自动调);
-  开发循环与幂等 sanity 语义见 `sandboxer/native-deps/README.md` §3
-- 跟 upstream rebase:每个 CH 大版本(~3 月)review 一次,几行 conflict
-  人工 fix
-- 外部 RAM/UFFD patch 的设计选择(SCM_RIGHTS in-process +
-  `create_ram_region` 里跑 ioctl)与 upstream 风格偏差明显,本项目维持自有
-  patch;vCPU kick 与 worker barrier 若有 upstream 等价修复,升级时应优先替换
-  `0007`,不长期维护重复实现
+The seven patch files contain 1,665 insertions and 136 deletions in total and
+apply to Cloud Hypervisor `v51.1`.
 
-## 2. 启用条件与命令行
+<a id="13-维护策略"></a>
+### 1.3 Maintenance strategy
 
-CH `--memory-zone` 增加两个 key:
+- The repository-relative patch directory is
+  `native-deps/deps/ch-patches/000{1,2,3,4,5,6,7}-*.patch`.
+- Run `make ch-patches-apply` from `sandboxer/native-deps`; it is also part of a
+  fresh `make cloud-hypervisor` build. The development cycle and idempotency
+  checks are described in [native-deps/README.md](../native-deps/README.md) §3.
+- Review the patch set for each intended upstream upgrade. Resolve conflicts
+  against the actual upstream changes; neither a fixed release cadence nor a
+  fixed amount of rebase work is assumed.
+- The external RAM/UFFD design uses in-process creation, `SCM_RIGHTS`, and ioctls
+  in `create_ram_region`, and remains a project-maintained patch set. When an
+  equivalent upstream vCPU-kick or worker-barrier fix is available, prefer it
+  when upgrading rather than indefinitely maintaining duplicate patch 0007 logic.
 
-| key | 类型 | 含义 |
-|-----|------|------|
-| `fd` | int | 由父进程通过 cmd.ExtraFiles 注入的文件描述符,用作 zone 的 backing |
-| `uffd_socket` | path | 普通 UDS 路径,CH 在该 socket 上 sendmsg(va_report; SCM_RIGHTS=uffd_C) |
+<a id="2-启用条件与命令行"></a>
+## 2. Activation and command line
 
-行为契约:
+CH `--memory-zone` accepts two additional keys:
 
-- **不写 fd**(也不写 uffd_socket):完全等同 upstream 行为(memfd_create 自管 RAM,
-  无 uffd)。所有不依赖外部托管的调用者(测试用例、其他工具)无须改动
-- **仅写 fd**:CH 把 fd 当 backing,跳过 memfd_create;snapshot 时跳过 dump;
-  restore 时不 fill。这条独立成立(无 uffd 仍可外部托管)
-- **fd + uffd_socket 同时写**:在 fd 行为基础上叠加,CH 内 `userfaultfd()`
-  → `UFFDIO_API` → `UFFDIO_REGISTER MISSING on chVA` → `connect uffd_socket`
-  → `sendmsg(va_report; SCM_RIGHTS=uffd_fd)` → 等 ack。ack 之前 vCPU 不允许
-  跑
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `fd` | int | Backing descriptor inherited from the parent, for example through `cmd.ExtraFiles` |
+| `uffd_socket` | path | Ordinary UDS path used by CH for `sendmsg(va_report; SCM_RIGHTS=uffd_C)` |
 
-平台 sandbox-ctl 调用形式(冷启动 + 恢复完全相同):
+The memory-backing and external-fault-handler contracts are:
 
-```
+- **Neither `fd` nor `uffd_socket` is set**: memory allocation follows the
+  upstream backing-file/memfd path and this external uffd handler is not enabled.
+  This is not a claim that every other patch, such as the lifecycle or vsock
+  fixes, is disabled.
+- **Only `fd` is set**: CH uses the supplied backing instead of creating a memfd.
+  Snapshot does not dump this user-managed zone and restore does not fill it.
+  Externally owned backing does not itself require uffd.
+- **Both `fd` and `uffd_socket` are set**: in addition to the backing behavior,
+  CH performs `userfaultfd()` → `UFFDIO_API` →
+  `UFFDIO_REGISTER MISSING on chVA` → `connect uffd_socket` →
+  `sendmsg(va_report; SCM_RIGHTS=uffd_fd)` → wait for acknowledgement.
+  vCPUs must not run before the acknowledgement.
+
+The backing/handler combination used by sandbox-ctl is the same for cold start
+and restore:
+
+```text
 cloud-hypervisor \
-  --memory-zone size=8G,shared=on,fd=3,uffd_socket=/run/sandbox/<sid>/uffd.sock \
+  --memory-zone id=ram0,size=8G,shared=on,fd=3,uffd_socket=/run/sandbox/<sid>/uffd.sock \
   ...
-# fd=3 ← memfd from sandbox-ctl via cmd.ExtraFiles[0]
+# fd=3 is the memfd inherited through sandbox-ctl cmd.ExtraFiles[0].
 ```
 
-详细命令行(冷启动 / 恢复)见 `sandboxer/docs/sandbox.md` §5.2 与 §7。
+The zone `id` is required by the parser; the platform uses `ram0`. Complete cold
+start and restore commands are described in [sandbox.md](sandbox.md) §5.2 and §7.
 
-## 3. patch 提交结构
+<a id="3-patch-提交结构"></a>
+## 3. Patch organization
 
 ### 3.1 0001 — externally allocated memfd-backed memory zone
 
-主题:**memory: support externally allocated memfd-backed memory zone**
+Subject: **memory: support externally allocated memfd-backed memory zone**.
 
-改动文件:`vm_config.rs` / `config.rs` / `memory_manager.rs`
+Changed files: `vm_config.rs`, `config.rs`, and `memory_manager.rs`.
 
-要点:
+Key points:
 
-- `MemoryZoneConfig` 新增 `pub fd: Option<i32>`(序列化时 `serde(skip)`,因为
-  fd 不能跨 serialize)
-- `MemoryConfig::parse` 识别 `fd=N` 形式,调 `File::from_raw_fd(N)`,**不**
-  关闭原 fd(由调用方 ExtraFiles 管理生命周期)
-- `MemoryManager::new` / `create_ram_region` 看到 `zone.fd.is_some()`:
-  - 跳过 `memfd_create`,直接 `mmap(NULL, size, PROT_RW, MAP_SHARED, fd, 0)`
-  - 在 `MemoryZone` 上标记 `user_managed: true`
-- 多 region per zone(x86_64 zone > 3 GiB 时跨 PCI hole 切两段):
-  每 region `try_clone()` 一份 fd,各自 `File` ownership;mmap 对同一 inode
-  产生多个 VMA,共享 host page cache
+- `MemoryZoneConfig` adds `pub fd: Option<i32>` with `#[serde(default)]` in the
+  maintained patch, not `serde(skip)`. A serialized descriptor number is not a
+  transferable kernel reference; each new CH process still needs the appropriate
+  inherited descriptor.
+- `MemoryConfig::parse` parses `fd=N`. The memory-manager construction paths,
+  rather than the CLI parser, adopt the inherited descriptor with
+  `File::from_raw_fd`. CH owns those `File` handles and clones; the parent has its
+  own descriptor and lifetime.
+- When the zone supplies a descriptor, the memory manager passes that backing to
+  `create_ram_region` instead of creating another memfd and records the zone as
+  `user_managed: true` through patch 0002.
+- A zone can contain multiple regions, for example when a large x86_64 zone
+  crosses the PCI MMIO hole. Each region obtains a `try_clone()` and owns its
+  `File`; the mappings and their file offsets refer to the same backing inode and
+  share host page-cache data.
 
-`Transportable::send` 与 `fill_saved_regions` 都遍历 `snapshot_memory_ranges`
-表,**这两处不需要单独 patch**——靠 commit 0002 在 `memory_range_table` 处过滤
-即可同时影响快照和恢复路径。
+`Transportable::send` and `fill_saved_regions` both traverse
+`snapshot_memory_ranges`. They do not need separate patches: patch 0002 filters
+`memory_range_table`, affecting both snapshot and restore.
 
 ### 3.2 0002 — snapshot skip user-managed memory zones
 
-主题:**snapshot: skip user-managed memory zones**
+Subject: **snapshot: skip user-managed memory zones**.
 
-改动文件:`memory_manager.rs`
+Changed file: `memory_manager.rs`.
 
-要点:
+Key points:
 
-- `memory_range_table` 在生成 `snapshot_memory_ranges` 时检测每个 zone 的
-  `user_managed` 标志,user_managed=true 的 zone 在表中**不出现**
-- 这样 `Transportable::send`(快照 dump 路径)看到的 ranges 不含 user-managed
-  zone,自然 `Ok(())` 即返回——CH **不**写 8 GiB memory-ranges 文件
-- 同理 restore 路径 `fill_saved_regions` 看到的 ranges 表不含此 zone,
-  fill 操作变成空操作——guest 物理地址通过 mmap 直接映到 sandbox-ctl 的 memfd
-  inode,内容由 sandbox-ctl 的 uffd handler 按需提供
+- `memory_range_table` checks each zone's `user_managed` flag when constructing
+  `snapshot_memory_ranges`. A `user_managed=true` zone is omitted.
+- The snapshot dump path, `Transportable::send`, therefore has no ranges to dump
+  for that zone and returns successfully without writing its RAM to a
+  memory-ranges file. For the 8 GiB example, CH does not write an 8 GiB RAM dump.
+- Restore's `fill_saved_regions` similarly has nothing to fill for the zone.
+  Guest physical addresses are backed directly by the sandbox-ctl memfd mapping;
+  sandbox-ctl's uffd handler supplies the contents on demand when configured.
 
-upstream 已有"file-backed + MAP_SHARED + hardlink"的等价 skip 分支(用于
-share-storage live migration 场景)。我们的 user_managed zone 满足"file-backed
-+ MAP_SHARED",但 memfd 没有 hardlink(`st_nlink == 0`),所以不能复用现有
-分支——添加平行分支识别 `user_managed` 标志。
+Upstream already has a skip path for a file-backed, `MAP_SHARED`, hard-linked
+region used in shared-storage migration. The external memfd is file-backed and
+shared but has no hard link (`st_nlink == 0`), so the project adds the explicit
+`user_managed` branch instead of reusing that hard-link test.
 
 ### 3.3 0003 — external uffd handler via in-process create + SCM_RIGHTS
 
-主题:**memory: external uffd handler via in-process create + SCM_RIGHTS handoff**
+Subject: **memory: external uffd handler via in-process create + SCM_RIGHTS handoff**.
 
-改动文件:`memory_manager.rs` / `seccomp_filters.rs`
+Changed files: `memory_manager.rs` and `seccomp_filters.rs`.
 
-要点:
+Key points:
 
-- `create_ram_region` 在 mmap 完成后,如果 zone 配了 `uffd_socket`:
+- After mapping a region, `create_ram_region` performs the following when
+  `uffd_socket` is configured:
 
-  ```
+  ```text
   uffd = userfaultfd(O_CLOEXEC | O_NONBLOCK)
   UFFDIO_API features = UFFD_FEATURE_MISSING_SHMEM
                       | UFFD_FEATURE_EVENT_REMOVE
@@ -158,284 +193,333 @@ share-storage live migration 场景)。我们的 user_managed zone 满足"file-b
   conn = connect(uffd_socket)
   sendmsg(conn, iov=va_report{chVA, size}, cmsg=SCM_RIGHTS([uffd]))
   recvmsg(conn, expect ack)
-  // 回到 create_ram_region 主流程,继续 vCPU 启动
+  // Return to create_ram_region and continue vCPU startup.
   ```
 
-- feature bits **必须严格按内核头位置**:
+- Feature-bit positions must match the kernel headers exactly:
 
-  ```
+  ```text
   UFFD_FEATURE_MISSING_SHMEM = 1 << 5
   UFFD_FEATURE_EVENT_REMOVE  = 1 << 3
   UFFD_FEATURE_EVENT_UNMAP   = 1 << 6
   UFFD_FEATURE_THREAD_ID     = 1 << 8
   ```
 
-  位置写错会被内核解读成别的 feature。例如 `1 << 1` 是 `EVENT_FORK`,要求
-  `CAP_SYS_PTRACE`,导致 UFFDIO_API 返回 EPERM。
+  A wrong position requests a different feature. For example, `1 << 1` is
+  `EVENT_FORK`, which requires `CAP_SYS_PTRACE` and can cause `UFFDIO_API` to
+  return `EPERM` when that capability is unavailable.
+- The seccomp filter allows `SYS_userfaultfd` and the `UFFDIO_API` /
+  `UFFDIO_REGISTER` ioctls.
 
-- seccomp 放行:`SYS_userfaultfd` syscall + `UFFDIO_API` / `UFFDIO_REGISTER`
-  ioctl(filter 在 `seccomp_filters.rs`)
+**Why uffd is created inside CH**: the uffd context belongs to the memory map of
+its creating process. An uffd created by sandbox-ctl cannot register CH's chVA
+mappings. CH therefore creates and registers the uffd, then transfers the
+file descriptor with `SCM_RIGHTS` so sandbox-ctl can consume its events. Descriptor
+tables are process-local, but the context still routes events using the creator's
+virtual addresses; the event addresses received by sandbox-ctl are CH's chVA.
 
-**为什么 uffd 必须 CH 内创建**:Linux 内核把 uffd 上下文绑到 `userfaultfd()`
-调用进程的 mm。sandbox-ctl 创建的 uffd 上 `UFFDIO_REGISTER` 只能 register
-sandbox-ctl mm 的 VMA,不能 register CH mm 的 chVA。所以 uffd 必须在 CH 内
-创建,然后通过 SCM_RIGHTS 把 fd(而非内核内部对象)传给 sandbox-ctl 让它读
-事件。fd 表是进程级的,但 uffd ctx 的事件路由按创建者 mm 的 VA 解析,
-sandbox-ctl 收到 fd 后读出来的事件 va 就是 CH 视角的 chVA。
+<a id="34-0004--balloon-release-跳过-user-managed-zone-的空洞-run"></a>
+### 3.4 0004 — skip hole-only runs during balloon release
 
-### 3.4 0004 — balloon release 跳过 user-managed zone 的空洞 run
+Subject: **virtio-devices: balloon — skip PUNCH_HOLE/MADV_DONTNEED on already-sparse
+user-managed ranges**.
 
-主题:**virtio-devices: balloon — skip PUNCH_HOLE/MADV_DONTNEED on already-sparse
-user-managed ranges**
+Changed files: `virtio-devices/src/balloon.rs` and
+`virtio-devices/src/seccomp_filters.rs`.
 
-改动文件:`virtio-devices/src/balloon.rs` / `virtio-devices/src/seccomp_filters.rs`
+**Background**: balloon allocation in the configured guest does not request
+`__GFP_ZERO`, and the platform guest configuration does not enable `init_on_alloc`.
+The inflate path updates page metadata and PFN arrays rather than zeroing every
+returned page. The externally managed zone is not prefaulted. Offsets never
+previously touched by the guest can therefore still be holes in the memfd, with
+no inode page or PTE in either process. This does not mean every balloon page at
+cold start is necessarily a hole: the guest can have touched and released pages
+before handing them to the balloon.
 
-**背景**。guest balloon 驱动充气分配的页**从不被 guest 写入**:
-`balloon_page_alloc` 不带 `__GFP_ZERO`,平台 guest 内核未启用 `init_on_alloc`,
-fill 路径只动 struct page 元数据与 PFN 数组。又因 user-managed zone 从不
-prefault(memfd 稀疏,内容由 uffd handler 按需填),balloon 让出的 offset
-绝大多数(冷启动时**全部**)在 memfd 上本就是空洞——无 inode 页,CH 与
-sandbox-ctl 都无 PTE。
+Without the probe, CH calls `release_memory_range` for each returned run:
+`fallocate(PUNCH_HOLE|KEEP_SIZE)` on the memfd plus `madvise(MADV_DONTNEED)` on chVA.
+In the documented uffd model, `MADV_DONTNEED` produces an `EVENT_REMOVE` even for an
+already empty range and waits for the external handler to consume it. Inflating
+across sparse `Capacity − InitialBudget` memory can thus create unnecessary
+serialized work and back-pressure the balloon thread. The chVA `MADV_DONTNEED`,
+not merely the memfd `fallocate`, is the source of this handshake, so avoiding it
+requires skipping both operations for an empty run.
 
-但 CH 的 balloon inflate 处理对每个让出 run 仍调 `release_memory_range`:
-`fallocate(PUNCH_HOLE|KEEP_SIZE)` on memfd + `madvise(MADV_DONTNEED)` on chVA。
-后者落在 uffd 注册的 chVA 上,内核**无条件**(与该 run 是否驻留无关)合成
-一条 `EVENT_REMOVE`,且 `MADV_DONTNEED` **同步阻塞**到外部 handler 消费完
-该事件才返回。冷启动充气覆盖整个 `Capacity − InitialBudget` 区间时,这是一场
-"对从未存在的页"的空 `EVENT_REMOVE` 风暴:压垮 handler 单 reader,并反压
-CH 的 balloon 线程。`EVENT_REMOVE` 的真正来源是 chVA 上的 `MADV_DONTNEED`
-(不是 memfd 的 fallocate)——所以**必须同时跳过两者**才能不发事件。
+**Mechanism**:
 
-**要点**:
+- For a region with a file offset, `release_memory_range` probes
+  `[file_off, file_off + len)` with `lseek(fd, file_off, SEEK_DATA)`:
+  - `ENXIO`, or a next-data offset at or beyond `file_off + len`, means the whole
+    run is a hole. Skip both `fallocate` and `madvise` and return `Ok(())`.
+  - Data within the run retains the ordinary `PUNCH_HOLE` plus
+    `MADV_DONTNEED` release of the complete run.
+  - Other `lseek` errors fall through to the ordinary release path; they are not
+    interpreted as proof that the range is empty.
+- The actual predicate is `region.file_offset().is_some()`, not the
+  `user_managed` flag. The probe can also apply to other file-backed regions.
+  Regions without a file offset retain the original path.
+- In the platform memfd use, CH uses mappings and explicitly positioned
+  `fallocate`, not reads/writes dependent on the shared file position. Moving the
+  position for the probe therefore does not change that data path.
+- **Seccomp**: the balloon thread adds `SYS_lseek` to its allowlist. `fallocate`
+  was already allowed and `madvise` comes from the virtio common set. Without this
+  addition, the first probe could terminate the thread with `SIGSYS`.
 
-- `release_memory_range` 对**有 file_offset 的 region**(即 user-managed
-  fd-backed zone)在动作前,用一次 `lseek(fd, file_off, SEEK_DATA)` 探测目标
-  `[file_off, file_off + len)`:
-  - `ENXIO`,或返回的下一数据字节偏移 `≥ file_off + len` ⇒ 整段空洞 ⇒
-    **跳过 fallocate 与 madvise,直接 `Ok(())`**
-  - 段内有数据 ⇒ 维持原逻辑(`PUNCH_HOLE` + `MADV_DONTNEED` 覆盖整 run)
-  - `lseek` 其他错误不吞:落回原路径,不掩盖
-- 仅作用于 `region.file_offset().is_some()` 的 zone。无 fd 的 upstream 匿名
-  zone 无可探测,**行为完全不变**(契约同 §6:不写 `fd=` 等同 upstream)
-- 该 zone 的 memfd fd 在 CH 内仅经 mmap + `fallocate`(显式 offset)使用,
-  无定位读写,故 `lseek` 移动文件位置无副作用
-- **seccomp 放行**:balloon device 线程的 seccomp 仅允许 `fallocate`
-  (madvise 来自 virtio 公共集),新增 `SYS_lseek`;否则首次探测即 `SIGSYS`
-  杀死 balloon 线程,CH 退出(filter 在 `virtio-devices/src/seccomp_filters.rs`,
-  与 §3.3 放行 `userfaultfd` 同理)
+**Correctness**: only a run found to contain no data is skipped. A resident run
+that actually requires reclaiming retains the release operations. For the
+untouched external-memory holes described above, the suppressed backendVA
+reclaim would itself be a no-op, so the final host-memory state is unchanged.
 
-**正确性**:跳过只命中真空洞(无可释放物);任何**确需回收**的页必有数据,
-永不被跳过。被抑制的 `EVENT_REMOVE` 本只驱动 handler 对 backendVA 的
-process-level reclaim,而空洞 offset sandbox-ctl 也从未 fault → 那一步本就
-是 no-op。跳过前后 host 内存终态完全一致。
+**Effect and tradeoffs**: on the x86_64 4 KiB path, where `pbp` batching is bypassed,
+releasing an entirely sparse balloon interval without the probe can entail about
+`inflated bytes / 4 KiB` synchronous handler handshakes. The probe substitutes a
+local `lseek` for those unnecessary release operations. Pages still resident from
+previous guest activity are not skipped. Guest-exit unmapping and its events are
+separate from inflation. On this path, probing can still cost one `lseek` per
+page; it avoids the corresponding empty-range `madvise`, handler handshake, and
+shared-inode invalidation work. The hole fraction and convergence time depend on
+the workload and environment; this specification makes no universal 99% hole-rate
+or instantaneous-convergence claim.
 
-**效果与取舍**:改动前 balloon 充满 `Capacity − InitialBudget` 时,**每个 4K
-页**(`pbp` 在 x86-4K 被旁路)都对 uffd VMA 做 `MADV_DONTNEED`,而该调用
-**同步阻塞**到外部单 reader handler 消费完 `EVENT_REMOVE` 才返回——
-`≈ 充气字节 / 4K` 次串行跨进程往返,正是数十秒收敛(及偶发 boot 软死锁)
-的根因。改动后冷启动充气页**实测 ~99% 是从未触碰的空洞**,`lseek(SEEK_DATA)`
-探测后整段跳过 `PUNCH_HOLE` 与 `MADV_DONTNEED`:无 madvise → 无同步握手 →
-balloon 线程以内存速度扫过 → **收敛近乎瞬时**。剩 ~1% 是 guest 启动期经 vhost-blk / 内核进过 page
-cache 又释放、folio 仍驻留 memfd 的页,`lseek` 见数据**不跳过**,照常回收
-——有界合法,行为同 upstream。guest 退出时整 zone unmap 产生的大
-`EVENT_REMOVE` 与本 patch 无关、不计入充气阶段。x86-4K 下空洞探测退化为每
-页一次 `lseek`——纯 in-kernel xarray 走查,无事件 / 无 handler 握手 / 无
-共享 inode madvise 争用,本地廉价。
+<a id="35-0005--持久化-vsock-host-local-port-游标"></a>
+### 3.5 0005 — persist the vsock host local-port cursor
 
-### 3.5 0005 — 持久化 vsock host local-port 游标
+Restore recreates CH's Unix vsock backend. Resetting its local-port allocator to
+`0x40000000` can make the first host-initiated connection reuse a tuple retained
+in the guest snapshot and receive an RST. This patch stores `local_port_last` in
+`VsockState` and continues from the next port after restoring the backend. Nested
+snapshots preserve the cursor at each layer rather than relying on a process-local
+cursor that only covers one restore.
 
-CH 的 Unix vsock backend 在 restore 时重新创建。若 host local-port 分配器回到
-`0x40000000`,首个 host-init 连接可能复用 guest 快照里仍存在的四元组并收到 RST。
-patch 把 `local_port_last` 纳入 `VsockState`,恢复 backend 后从下一端口继续分配。
-该状态在嵌套快照中逐层保存,不是只覆盖一次 restore 的进程内游标。
+<a id="36-0006--snapshot-时预发布-vsock-transport-reset"></a>
+### 3.6 0006 — stage a vsock transport reset before snapshot
 
-### 3.6 0006 — snapshot 时预发布 vsock transport reset
+Avoiding port reuse alone is insufficient. CH does not serialize the backend
+connection map, while the guest snapshot retains sockets, credits, and closing
+state. The two endpoints would therefore resume in different transport epochs.
+Guest RAM is restored lazily through external userfaultfd; device activation
+cannot depend on finding a fresh event-queue descriptor in the restored avail
+ring. The patch uses this protocol:
 
-仅避免端口复用仍不完整:CH 不序列化 backend connection map,而 guest 内核会把
-连接 socket、credit 与关闭状态一并带入快照。restore 后两端因此处于不同 transport
-epoch。restore 的 guest RAM 又由外部 userfaultfd 惰性恢复,设备 `activate` 阶段读取
-event virtqueue 页可能只看到尚未 fault-in 的空 avail ring,不能在这里要求新 descriptor。
-patch 执行以下协议:
+1. After the VM is paused, `Vsock::snapshot` consumes a guest-provided writable
+   descriptor from the **source VM's live event virtqueue**, writes
+   `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET`, advances the used ring, and sets
+   `transport_reset_pending`. An ordinary `/vm.pause` does not stage a reset.
+2. The pending state is saved in `VsockState`. Both source-VM resume and target
+   restore activation only reassert the IRQ for the already-used event. Restore
+   neither reads nor consumes another event descriptor.
+3. While pending, the backend may accept host UDS connections, but it retains all
+   RX packets instead of placing them in the guest RX queue.
+4. The Linux guest processes the reset: connected sockets are closed, the CID is
+   reread, and listeners remain bound/listening. It then replenishes the event
+   descriptor and kicks the event queue. CH treats this kick as acknowledgement,
+   lifts the RX gate, and immediately drains pending RX.
 
-1. VM 已暂停后,`Vsock::snapshot` 从**源 VM 的 live event virtqueue**取一个 guest
-   提供的 writable descriptor,写入 `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET`,推进 used
-   ring 并置 `transport_reset_pending`。普通 `/vm.pause` 不发布 reset。
-2. pending 状态随 `VsockState` 持久化。源 VM resume 与目标设备 restore activation
-   都只重发该 used-ring event 的 IRQ;restore 不再读取或消费 event descriptor。
-3. pending 期间 backend 可接收 host UDS,但所有 RX packet 都留在 backend,不能进入
-   guest RX queue。
-4. Linux guest 处理 reset:关闭 connected sockets、重新读取 CID,listener 保持
-   bind/listen;随后补回 event descriptor 并 kick event queue。CH 把该 kick 作为
-   acknowledgement,解除 RX gate 并立即排空 pending RX。
+Snapshot staging first drains eventfd kicks that predate the reset. If an old
+notification is still present in the same epoll batch after the device thread
+resumes, a nonblocking read returns `EAGAIN` and keeps the gate closed; it is not
+mistaken for the new reset acknowledgement.
 
-snapshot staging 会先排空 reset 之前已经到达的 eventfd kick。设备线程 resume 后若
-同一批 epoll 仍带着该旧通知,非阻塞 read 返回 `EAGAIN` 并保持 gate,不会把旧 kick
-误当成新 reset 的 acknowledgement。
+The first `restore` control connection can therefore be initiated immediately
+after VM resume, but its REQUEST becomes visible only after guest cleanup of the
+old connections. This protocol adds no retry, sleep, or relaxed deadline. A
+missing or invalid descriptor makes the source snapshot fail explicitly. Target
+restore activation must succeed without any new available descriptor because the
+reset already exists in the snapshot's used ring.
 
-因此首个 `restore` 控制连接可以在 VM resume 后立即发起,但其 REQUEST 必定在 guest
-完成旧连接清理后才可见。这里没有 retry、sleep 或放宽 deadline。源 VM snapshot
-阶段若 descriptor 缺失或非法会明确失败;目标 restore activation 即使没有任何新
-available descriptor 也必须成功,因为 reset 已经存在于快照的 used ring 中。
+<a id="37-0007--vm-pauseresume-与-ordered-shutdown-可靠性"></a>
+### 3.7 0007 — reliable VM pause/resume and ordered shutdown
 
-### 3.7 0007 — VM pause/resume 与 ordered shutdown 可靠性
+CH v51.1 uses a no-op `SIGRTMIN` handler to interrupt `KVM_RUN`. The control thread
+publishes pause/kill state, calls `pthread_kill` for each vCPU, and waits for loop
+acknowledgement. A signal arriving in userspace after the state check but before
+entry to `KVM_RUN` can be consumed too early, leaving that vCPU blocked in the
+next call. Repeating it every 10 ms reduces probability but does not close the
+race.
 
-CH v51.1 用 no-op `SIGRTMIN` handler 中断 `KVM_RUN`:控制线程先发布 pause/kill
-状态,再 `pthread_kill` 每个 vCPU,等待 vCPU loop 写入 acknowledgement。若 signal
-在 vCPU 检查状态之后、进入下一次 `KVM_RUN` 之前到达 userspace,handler 返回后该
-vCPU 仍可阻塞在 `KVM_RUN`;每 10 ms 重发只能降低概率,不能关闭竞态窗口。
+The patch closes the lifecycle-barrier races through three related changes:
 
-patch 通过三组相互独立但同属 lifecycle barrier 的修复关闭该问题:
+1. Before spawning a vCPU, the creating thread configures `KVM_SET_SIGNAL_MASK`
+   and blocks the kick signal so the child inherits the mask from its first
+   instruction. Configuration failure returns directly, avoiding an early-exited
+   child outside the startup barrier. The vCPU keeps the signal blocked while
+   reading lifecycle state. `KVM_RUN` atomically unblocks it with the configured
+   mask and restores the blocked mask on exit. A signal between the state check
+   and `KVM_RUN` remains pending and interrupts that same call. Userspace PIO/MMIO
+   exit handling does not consume it. Only after the outer loop observes the
+   corresponding lifecycle request and completes pending KVM I/O does it briefly
+   `SIG_UNBLOCK`/`SIG_BLOCK`, consume the kick through the empty handler, and
+   restore the mask. This prevents an old pending kick from repeatedly causing
+   immediate `KVM_RUN` returns. The common VMM KVM ioctl seccomp set explicitly
+   allows `KVM_SET_SIGNAL_MASK`.
+2. Pause, shutdown, NMI, and vCPU removal clear old ACKs before publishing a
+   request. A vCPU writes an ACK only in the corresponding pause/NMI/kill branch;
+   a natural reset, shutdown, run error, or panic is not an acknowledgement.
+   The KVM no-miss path sends one kick per request. Pause/NMI consume an already
+   pending kick before acknowledging and again after park/unpark, covering the
+   ordering in which the vCPU sees shared state before the controller sends the
+   signal. NMI uses a two-way ACK-set/ACK-clear barrier, and the controller waits
+   for all vCPUs to clear the current ACK. A previous request's drain cannot then
+   swallow the next pause kick. A naturally finished, unjoined vCPU is excluded
+   from the signal barrier using `JoinHandle::is_finished()` while its ACK remains
+   false; shutdown cleanup does not wait for an impossible acknowledgement.
+   Failed pause revokes the request, unparks participants, and waits for recovery.
+   NMI completes ACK-clear cleanup even after a signal timeout. Both failure
+   paths receive a separate fresh deadline. Non-KVM backends retain the 10 ms
+   retry. All waits use a 1 s deadline with `CLOCK_MONOTONIC` semantics.
+3. Runtime pause publishes the shared pause event before explicitly unparking
+   ordinary and custom workers, closing the startup race between a zero-time
+   epoll poll and `thread::park`. Resume drains the event before waking workers.
+   After returning from park, workers participate in a second barrier; the
+   controller waits for resume ACKs before another pause. Custom net and
+   vhost-user worker handles participate in both the pause wake and resume
+   barrier. A restored device that has not received a runtime pause event does
+   not wait for a nonexistent ACK.
 
-1. 创建线程在 spawn vCPU 前配置 `KVM_SET_SIGNAL_MASK` 并阻塞 kick signal,使子线程
-   从第一条指令起继承 blocked mask;配置失败直接返回,不会让一个提前退出的 vCPU
-   留在启动 barrier 之外。vCPU loop 在读取 lifecycle 状态前保持 signal blocked;
-   `KVM_RUN` 通过已配置的 mask 原子 unblock,退出时恢复 blocked mask。signal 在状态
-   检查与 `KVM_RUN` 之间到达会保持 pending 并中断同一次调用;KVM 返回后处理 PIO/MMIO
-   等 userspace exit 时仍不消费该 signal。outer loop 观察到对应 lifecycle 请求并完成
-   必要的 pending KVM I/O 后,才短暂执行 `SIG_UNBLOCK`/`SIG_BLOCK`,由空 handler 消费
-   本次 kick 并立即恢复 blocked mask,避免后续 `KVM_RUN` 因旧 pending signal 持续
-   立即返回。VMM seccomp 的公共 KVM ioctl 集显式放行 `KVM_SET_SIGNAL_MASK`。
-2. pause、shutdown、NMI 和 vCPU removal 在发布请求前清除旧 ACK;vCPU 只有进入当前
-   请求的 pause/NMI/kill 分支后才写 ACK,自然 reset、shutdown、run error 或 panic
-   不能冒充请求确认。KVM no-miss 路径每个请求只发一次 kick;pause/NMI 分支在 ACK 前
-   消费已 pending 的本次 kick,并在 park/unpark 后再次消费,覆盖 vCPU 先看到共享状态、
-   控制线程后发送 kick 的顺序。NMI 使用 ACK set/clear 双向 barrier,控制线程在所有
-   vCPU 清除本次 ACK 后才返回,
-   因此前一请求的 drain 不会吞掉下一次 pause 的 kick。已经自然结束但尚未 join 的
-   vCPU thread 由 `JoinHandle::is_finished()` 从 signal barrier 排除,其 ACK 仍保持
-   false,避免正常 shutdown 清理等待一个不可能到达的 ACK。pause 失败会撤销请求、
-   unpark 并等待已参与 vCPU 恢复;NMI 即使 signal 超时也会完成 ACK-clear cleanup,
-   两条错误路径都使用独立的新 deadline。非 KVM backend 保留 10 ms retry。所有等待
-   统一使用 `CLOCK_MONOTONIC` 语义的 1 s deadline。
-3. runtime pause 先发布共享 pause event,再显式 unpark 所有普通与自定义 worker,
-   关闭 worker 的 zero-time epoll poll 到 `thread::park` 之间的启动竞态。resume 先
-   drain 该 event 再唤醒 worker;worker 从 park 恢复后参加第二次 barrier,control
-   thread 收齐 resume ACK 才允许下一次 pause。net 与 vhost-user 的自定义 worker
-   handle 同时加入 pause wake 和 resume barrier。恢复态设备若尚未收到 runtime
-   pause event,不会等待一个不存在的 ACK。
+This patch does not change sandbox configuration, the CH HTTP API, snapshot
+format, or resource protocol, and does not adjust `cpu.max` around lifecycle
+operations. Timeouts remain bounded failure protection, not the race fix.
 
-该 patch 不改变 sandbox 配置、CH HTTP API、snapshot 格式或资源协议,也不在
-lifecycle 前后修改 `cpu.max`。超时仍是最终有界失败保护,不是竞态修复方法。
+<a id="4-构建工作流"></a>
+## 4. Build workflow
 
-## 4. 构建工作流
+`sandboxer/native-deps` builds the artifact from the pinned v51.1 tarball,
+`git am deps/ch-patches/*.patch`, and `cargo build --release --locked`.
+Its output is `native-deps/bin/<arch>/cloud-hypervisor`; running
+`make cloud-hypervisor` from the sandboxer root also copies it to
+`bin/<arch>/cloud-hypervisor`. Build duration depends on the toolchain, machine,
+and caches.
 
-产物由 `sandboxer/native-deps` 构建:`make cloud-hypervisor` = 取 pin 的 v51.1 tarball +
-`git am deps/ch-patches/*.patch` + `cargo build --release --locked`,冷构建
-~5-10 min、热(cargo 缓存)秒级,产物 `bin/<arch>/cloud-hypervisor`。构建以
-`--remap-path-prefix` 把源树与 registry 依赖映射为相对路径 / `/cargo` 前缀,
-panic 消息与 DWARF 不泄漏构建机绝对路径。
+The build uses `--remap-path-prefix` to map the source tree to relative paths and
+Cargo dependencies to `/cargo`, rather than embedding those build-machine
+absolute source paths in panic messages and DWARF.
 
-patch 开发循环(`ch-fetch` / `ch-patches-format`、`patches-apply` 的幂等
-sanity 检查)、产物同步和边界说明见 `sandboxer/native-deps/README.md`。
+See [native-deps/README.md](../native-deps/README.md) for `ch-fetch`,
+`ch-patches-format`, idempotency checks, output synchronization, and ownership
+boundaries.
 
-## 5. 启动协议(per-arch)
+<a id="5-启动协议per-arch"></a>
+## 5. Boot protocols by architecture
 
-CH 自适应启动协议,sandbox-ctl 命令行不区分 arch:
+CH selects the architecture-specific boot protocol; sandbox-ctl does not require
+a different command-line interface per architecture:
 
-| arch | 协议 | kernel 入口 | CH 准备 |
-|------|------|-------------|---------|
-| x86_64 | PVH | ELF entry,zero page 由 CH 填 | memmap(E820) + cmdline + ACPI 表 |
-| aarch64 | EFI stub + ACPI | PE Image start,EFI stub 解析 ACPI | UEFI memmap + ACPI 表 + GICv3 节点 |
+| Architecture | Protocol | Kernel entry | Prepared by CH |
+| --- | --- | --- | --- |
+| x86_64 | PVH | ELF entry with a CH-populated zero page | E820 memory map, command line, and ACPI tables |
+| aarch64 | EFI stub + ACPI | PE Image entry; the EFI stub parses ACPI | UEFI memory map, ACPI tables, and GICv3 description |
 
-### 5.1 设备模型(平台用法)
+<a id="51-设备模型平台用法"></a>
+### 5.1 Device model used by the platform
 
-CH 暴露给 guest 的设备清单(冷启动):
+The cold-start device layout is:
 
+```text
+virtio-pmem    → sandbox-runtime.bundle (DAX, MAP_SHARED host page-cache sharing)
+virtio-blk × 2 → blk0 (read-only base) + blk1 (writable overlay COW), vhost-user backend
+virtio-net     → optional eth0 with host TAP backing; absent when no network source is configured
+virtio-console → hvc0 for kernel dmesg; --console tty writes to CH stdout, an anonymous
+                 pipe supplied by sandbox-ctl; --serial off disables the 8250 UART.
+                 CH stdin is /dev/null, so CH does not raw-mode a host terminal.
+                 Application stdio uses the vsock MUX, not this console.
+virtio-vsock   → CID=3; short control connections (launch / ping / app_started /
+                 app_exited / mem_report / quiesce / restore / attach), plus the
+                 application stdio MUX upgraded from launch/restore/attach handshakes
+virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on]; the sandbox-local
+                 BalloonController sets targets with /vm.resize and observes current
+                 memory_actual_size through vm.info; free_page_reporting is not enabled
+virtio-mem     → host-driven unplug supported by CH; not enabled in the fixed-Capacity
+                 Budget model used here
 ```
-virtio-pmem    → sandbox-runtime.bundle (DAX, MAP_SHARED 共享 host page cache)
-virtio-blk × 2 → blk0 (base, ro) + blk1 (overlay COW, rw),vhost-user backend
-virtio-net     → 可选;配置网络源时为 eth0,host TAP 后端;无源时不创建设备
-virtio-console → hvc0,内核 dmesg;--console tty(写到 CH 进程的 stdout = sandbox-ctl
-                 给的匿名管道),--serial off(无 8250 UART)。CH 进程的 stdin=/dev/null
-                 故 CH 不 raw 化任何宿主终端。应用 stdio 不走此设备(走 vsock MUX)
-virtio-vsock   → CID=3。控制面短连接(launch / ping / app_started / app_exited /
-                 mem_report / quiesce / restore / attach)+ launch/restore/attach 那条
-                 连接握手后升级而成的应用 stdio MUX(详见 sandbox-init.md §4)
-virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on];sandbox-local
-                 BalloonController 通过 /vm.resize 推 target,并以 vm.info 的
-                 memory_actual_size 观察 current(见 `sandboxer/docs/sandbox.md` §9.3);free_page_reporting
-                 不启用(广播 mmu_notifier 会饿死 guest vsock kthread)
-virtio-mem     → host-driven 主动 unplug(CH 能力;当前固定 Capacity Budget 模型不启用)
+
+The two block devices above describe the root base/overlay pair; configured data
+disks add their corresponding device slots. See [sandbox.md](sandbox.md) §9.3
+for balloon control and [sandbox-init.md](sandbox-init.md) §4 for the stdio MUX.
+
+Restore retains the topology from `config.json`; it cannot add or remove the
+virtio-net device. Before starting CH, sandboxer checks that the presence of a
+host network source matches NIC presence in the snapshot.
+
+`--restore source_url=<state.json dir>` restores the saved device topology, so
+`--kernel` and `--vsock` do not have to be repeated. Complete cold/restore data
+flows are described in [sandbox.md](sandbox.md) §5 and §7.
+
+<a id="52-vsock-hybrid-代理"></a>
+### 5.2 Vsock hybrid proxy
+
+The host-side hybrid proxy maps vsock traffic to UDS endpoints:
+
+```text
+guest VM (CID=3) → host CID=2 → CH forwards to:
+  /run/sandbox/<sid>/vsock.sock_<port>       guest → host; host listens on this UDS
+  /run/sandbox/<sid>/vsock.sock + "CONNECT <port>\n"
+                                           host → guest; guest listens on the port
 ```
 
-restore 沿用 `config.json` 中的设备拓扑,不能新增或删除 virtio-net.sandboxer 在
-启动 CH 前要求 host restore 配置是否提供网络源与快照中的 NIC 是否存在一致.
+For host-to-guest traffic, the first write is ASCII `CONNECT <port>\n`. CH returns
+`OK <local_port>\n`, which the host must consume before reading subsequent
+payload, then proxies to the guest listener. Both directions are ordinary byte
+streams to CH. The `launch`, `restore`, and `attach` connections become framed
+stdio MUX streams only after the application handshake between sandbox-ctl and
+sandbox-init; CH does not interpret those frames. See [sandbox.md](sandbox.md)
+§5.2 and [sandbox-init.md](sandbox-init.md) §4.2.
 
-恢复路径设备拓扑通过 `--restore source_url=<state.json dir>` 从 snapshot
-state 还原,不需要重新指定 `--kernel` / `--vsock`。
+<a id="6-行为契约总结"></a>
+## 6. Behavioral contract summary
 
-详细命令行示例与冷启动/恢复差异见 `sandboxer/docs/sandbox.md` §5(冷启动
-数据流)与 §7(恢复数据流)。
+Platform code (`sandbox-ctl` and `node-ctl`) relies on the following pinned CH
+behavior, including the patches:
 
-### 5.2 vsock hybrid 代理
+| Behavior | Upstream | Patched |
+| --- | --- | --- |
+| Memory backing without `fd=` | Managed memfd/file backing | Same allocation path; not a statement that all other patches are disabled |
+| Explicit `fd=` | Not accepted by the unpatched parser | Map the inherited backing and mark the zone user-managed |
+| `fd=` plus `uffd_socket=` | Not available | Create uffd, send it with metadata, and wait for ACK |
+| `/vm.snapshot` of a user-managed zone | Not applicable | Omit the zone from memory-ranges and skip the RAM dump |
+| `/vm.restore` of a user-managed zone | Not applicable | Skip fill; the mapping faults into the external handler when configured |
+| Balloon release of a hole-only file-backed run | Ordinary release path | Skip `PUNCH_HOLE` and `madvise`; resident runs retain ordinary release |
+| Balloon `deflate_on_oom=on` | Supported in v51.1 | Supported |
+| `vm.resize` `desired_balloon` | Supported | Used by the sandbox-local BalloonController |
+| virtio-mem `vm.resize` | Supported | Supported |
+| Vsock local-port cursor across restore | Not persisted by this upstream version | `VsockState.local_port_last` |
+| Matching backend/guest vsock transport epochs | Not provided by this upstream restore path | Reset event plus RX acknowledgement gate |
 
-vsock 在 host 端通过 hybrid 代理映射到 UDS:
+The platform does not use `free_page_reporting`. In the unified memfd/external
+uffd model, its repeated `madvise(MADV_DONTNEED)` invalidations can create
+mmu_notifier/EPT and IPI-shootdown pressure and interfere with guest vsock progress.
+The rationale and replacement feedback loop are described in the
+[guest kernel specification](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md)
+§5.5. The sandbox-local BalloonController instead pushes inflate targets through
+`/vm.resize`, with at most one 64 MiB steady-shrink step for each fresh report.
+Patch 0004 skips empty ranges covered by the cold-start target; runtime reclaim
+of resident pages still performs the complete release operations.
+`deflate_on_oom` is native to upstream v51.1 and needs no additional patch.
 
-```
-guest VM (CID=3) → CID=2 (host) → CH 把流量转发到
-  /run/sandbox/<sid>/vsock.sock_<port>     guest → host 方向(host 在该 UDS 上 listen)
-  /run/sandbox/<sid>/vsock.sock + "CONNECT <port>\n" 行    host → guest 方向(guest 在 port 上 listen)
-```
+<a id="7-已知限制"></a>
+## 7. Known limitations
 
-host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回一行
-`OK <local_port>\n`(host 须先排空再读后续 payload),之后 CH 把流量代理到 guest
-对应 port 的 listener。两个方向的连接对 CH 而言都是普通字节流——`launch` /
-`restore` / `attach` 这三种连接在应用层握手后由 sandbox-ctl / sandbox-init 自行
-转入帧收发态(stdio MUX),CH 不感知。详细见 `sandboxer/docs/sandbox.md` §5.2 与
-`sandboxer/docs/sandbox-init.md` §4.2。
+- **Upstream upgrades, including v52 and later**: inspect actual
+  `vmm/src/memory_manager.rs` changes before rebasing 0001/0002. Patch 0003's uffd
+  ioctls require particular review. Patch 0004 changes the balloon release
+  function and its seccomp allowlist. Review 0005/0006 with upstream vsock queue
+  and restore-lifecycle changes, and 0007 with any sound upstream
+  `immediate_exit` implementation. No fixed rebase cost is promised.
+- **vCPU signal-mask overhead**: the KVM vCPU userspace-exit loop still performs
+  an idempotent signal block. Unblock/reblock occurs only at a safe point after
+  observing a lifecycle request. CPU-bound guests gain no new VM exit from this
+  mechanism, but PIO/MMIO-heavy workloads incur additional syscall work. This is
+  the no-miss path until a suitable `immediate_exit` interface can replace it.
+- **Multiple fd-backed zones**: the platform currently uses one zone and one
+  memfd for all sandbox RAM. Multiple zones for NUMA or virtio-mem expansion
+  require corresponding per-zone handoffs in patch 0003 and address maps in
+  sandbox-ctl; they are not implied by the current single-zone integration.
 
-## 6. 行为契约总结
+## 8. See also
 
-平台代码(sandbox-ctl + node-ctl)依赖的 CH 行为(包含 patch):
-
-| 行为 | upstream | patched |
-|------|----------|---------|
-| 命令行不写 `fd=` | ✓(memfd_create 自管 RAM) | ✓(同 upstream)|
-| 命令行写 `fd=` | ✗(parse 错误) | ✓(用 fd mmap,标记 user_managed)|
-| 命令行写 `fd=` + `uffd_socket=` | ✗ | ✓(创建 uffd + sendmsg + 等 ack)|
-| `/vm.snapshot` 对 user_managed zone | (不适用) | 跳过 dump,memory-ranges 表无此 zone |
-| `/vm.restore` 对 user_managed zone | (不适用) | 跳过 fill;mmap 直接 fault 触发 uffd |
-| balloon release 对 user_managed zone 的空洞 run | (不适用) | 跳过 `PUNCH_HOLE`+`madvise`,不合成 `EVENT_REMOVE`;有数据的 run 同 upstream |
-| balloon `deflate_on_oom=on` | ✓(v51.1 已就绪) | ✓ |
-| `vm.resize` `desired_balloon` | ✓ | ✓(sandbox-local BalloonController 调用)|
-| virtio-mem `vm.resize` | ✓ | ✓ |
-| vsock local-port cursor 跨 restore | ✗ | ✓(`VsockState.local_port_last`) |
-| vsock backend/guest transport epoch 对齐 | ✗ | ✓(reset event + RX acknowledgement gate) |
-
-平台**不**使用 `free_page_reporting`——upstream 支持完好,但在统一 memfd /
-外部 uffd 模型下其持续 `madvise(MADV_DONTNEED)` 会广播 mmu_notifier 失效到
-KVM EPT,IPI shootdown 饿死 guest vsock kthread(机理与替代反馈环见
-`guest-runtime/docs/vmlinux.md` §5.5)。改由 sandbox-local BalloonController
-经 `/vm.resize` 推 inflate target;steady shrink 每份 fresh report 最多一个
-64MiB step。冷启动命令行 target
-覆盖的稀疏区间由 patch 0004(§3.4)跳过,不产生 `madvise` 广播与
-`EVENT_REMOVE`;运行时回收已驻留页仍走完整 release 路径。
-`deflate_on_oom` 是 upstream v51.1 原生,无需新 patch。
-
-## 7. 已知限制
-
-- **CH v52+ 升级窗口**:每次 CH 大版本会有 `vmm/src/memory_manager.rs` 内部
-  重构,patch 0001/0002 通常需要小幅 rebase。0003(uffd ioctl)改动较大,需要
-  多花时间 review。0004 仅触 `virtio-devices/src/balloon.rs` 单函数
-  (`release_memory_range`),rebase 面最小。0005/0006 需要随 upstream vsock device
-  queue/restore 生命周期变化一起复核。0007 应随 upstream sound
-  `immediate_exit` 支持一起复核
-- **vCPU kick 掩码开销**:KVM vCPU 每轮 userspace exit 仍执行一次幂等 signal block;
-  unblock/reblock 只发生在已观察 lifecycle 请求的安全点。CPU-bound guest 不增加
-  VM exit;PIO/MMIO 密集负载会承担额外 syscall 成本。该路径用于在 sound
-  `immediate_exit` 接口可用前保持无漏唤醒语义
-- **多 fd-backed zone**:当前限定单 zone(整段 sandbox RAM 一个 memfd)。多
-  zone(NUMA / virtio-mem 横向扩展)需要在 patch 0003 处对每 zone 各自 sendmsg
-  一次,sandbox-ctl 端各自维护 addrMap
-
-## 8. See Also
-
-- `sandboxer/docs/sandbox.md` §5(冷启动数据流,§5.2 CH 命令行)/ §7(恢复
-  数据流)—— sandbox-ctl 怎么用 patched CH 跑沙箱;命令行示例
-- `sandboxer/docs/sandbox.md` §8(uffd handler)—— sandbox-ctl 接收到 uffd_C
-  之后如何处理 fault 事件
-- `guest-runtime/docs/vmlinux.md` —— guest kernel 如何配合 CH 启动
-  协议(PVH / EFI stub)
-- `sandboxer/native-deps/README.md` —— `make cloud-hypervisor` 工作流与 patch
-  开发循环
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §2.4 —— VMM 与 Guest 环境在系统中的位置
+- [sandbox.md](sandbox.md) §5, §5.2, and §7 — cold start, CH commands, and restore.
+- [sandbox.md](sandbox.md) §8 — handling faults after receiving `uffd_C`.
+- [Guest kernel](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md)
+  — PVH/EFI-stub integration.
+- [Native build](../native-deps/README.md) — Cloud Hypervisor build and patch cycle.
+- [System overview](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md)
+  §2.4 — VMM and guest environment within the system.

@@ -1,27 +1,36 @@
+[English](README.md) | [简体中文](README_zh.md)
+
 # sandboxer/native-deps
 
-本目录构建 `sandboxer` 运行期直接消费、但不属于 Go module 的原生产物。
-首版只包含 patched `cloud-hypervisor`。`vmlinux`、`mkfs.erofs`、`fsck.erofs`
-和 `envd` 属于 `guest-runtime/native-deps`;`librocksdb` 属于 `accelerator`。
+This directory builds native artifacts consumed directly by `sandboxer` at
+runtime but not included in its Go module. It currently contains patched
+`cloud-hypervisor`. `vmlinux`, `mkfs.erofs`, `fsck.erofs`, and `envd` belong to
+`guest-runtime/native-deps`; `librocksdb` belongs to `accelerator`.
 
-## 1. 产物
+<a id="1-产物"></a>
+## 1. Artifact
 
-| 产物 | 来源 | 消费方 |
-|---|---|---|
-| `cloud-hypervisor` | Cloud Hypervisor v51.1 + `deps/ch-patches/` | `sandbox-ctl` VMM 子进程 |
+| Artifact | Source | Consumer |
+| --- | --- | --- |
+| `cloud-hypervisor` | Cloud Hypervisor v51.1 plus `deps/ch-patches/` | The VMM subprocess started by `sandbox-ctl` |
 
-输出路径:
+Output paths, relative to the sandboxer repository and its native-deps directory,
+respectively, are:
 
-```
+```text
 native-deps/bin/<arch>/cloud-hypervisor
 ../bin/<arch>/cloud-hypervisor
 ```
 
-顶层 `sandboxer` Makefile 会把 native-deps 输出同步到 `sandboxer/bin/<arch>/`,
-使 release 包把它放在 `sandbox-ctl` 旁边,也匹配 `sandbox-ctl --ch-binary`
-的默认查找路径。
+The native build itself produces `native-deps/bin/<arch>/cloud-hypervisor`.
+The top-level sandboxer `make cloud-hypervisor` target copies that output to
+`sandboxer/bin/<arch>/`, where release packaging places it beside `sandbox-ctl`
+and where the default `sandbox-ctl --ch-binary` lookup expects it.
 
-## 2. 构建
+<a id="2-构建"></a>
+## 2. Build
+
+Run the following commands from `sandboxer/native-deps`:
 
 ```bash
 make build
@@ -29,69 +38,87 @@ make cloud-hypervisor
 make cloud-hypervisor TARGET_ARCH=aarch64
 ```
 
-`make cloud-hypervisor` 流程:
+A fresh `make cloud-hypervisor` performs these steps:
 
-1. 下载并缓存 Cloud Hypervisor pin 版本 tarball。
-2. 解压到 `build/src/cloud-hypervisor`。
-3. 初始化 git 基线并应用 `deps/ch-patches/*.patch`。
-4. 若目标文件不存在,用 cargo 构建 `cloud-hypervisor`。
-5. 拷贝到 `bin/<arch>/cloud-hypervisor`。
+1. Download and cache the pinned Cloud Hypervisor source tarball.
+2. Extract it into `build/src/cloud-hypervisor`.
+3. Initialize the Git baseline and apply `deps/ch-patches/*.patch`.
+4. Build `cloud-hypervisor` with Cargo when the target output is absent.
+5. Copy the artifact to this directory's `bin/<arch>/cloud-hypervisor`.
 
-已有目标文件时构建会跳过。需要强制重建时删除
-`bin/<arch>/cloud-hypervisor` 或执行 `make clean` 后重跑。
+An existing target is skipped. Delete that output, or run `make clean`, before
+rerunning to force a rebuild. In particular, formatting a changed patch does not
+by itself invalidate the existing binary. `make clean` removes the native build
+output and `bin/`, but preserves the source patch workspace and tarball cache.
 
-## 3. Patch 开发循环
+<a id="3-patch-开发循环"></a>
+## 3. Patch development cycle
 
 ```bash
 make ch-fetch
 cd build/src/cloud-hypervisor
-# edit + git commit
+# Edit the source and record the changes with git commit.
 cd ../../..
 make ch-patches-format
+make clean
 make cloud-hypervisor
 ```
 
-约定:
+Conventions:
 
-- patch 只覆盖平台必须改动的 CH 行为:外部 memfd memory-zone、snapshot 跳过
-  user-managed memory zone、通过 unix fd 交接 uffd、balloon 不对外部托管内存
-  `PUNCH_HOLE/MADV_DONTNEED`、restore-safe vsock,以及可靠的 VM
-  pause/resume/ordered shutdown barrier。
-- patch 文件按 commit 顺序落在 `deps/ch-patches/`。
-- 升级 CH 版本时先更新 pin,再重新执行 `ch-fetch`、应用 patch、构建、跑
-  sandboxer 和 platform e2e。
-- `build/src/cloud-hypervisor` 是 patch 工作区;不要在未 format patch 前
-  清理该目录。
+- Patches cover CH behavior required by the platform: external memfd memory
+  zones, skipping user-managed RAM in snapshots, handing uffd to the external
+  owner over a Unix socket, skipping `PUNCH_HOLE`/`MADV_DONTNEED` for already-empty
+  file-backed balloon ranges, restore-safe vsock, and reliable
+  pause/resume/ordered-shutdown barriers. Resident memory still follows the
+  ordinary balloon release path.
+- Patch files are stored in commit order in `deps/ch-patches/`.
+- For an upstream CH upgrade, update the pin, fetch/import the intended source,
+  reapply the patches, build, and run the sandboxer and platform E2E suites.
+- `build/src/cloud-hypervisor` is the patch workspace. Do not remove it before
+  exporting local patch work with `ch-patches-format`.
 
-patch 语义和设备模型详见 `sandboxer/docs/cloud-hypervisor.md`。
+Patch semantics and the device model are specified in
+[cloud-hypervisor.md](../docs/cloud-hypervisor.md).
 
-## 4. 与其他 native-deps 的边界
+<a id="4-与其他-native-deps-的边界"></a>
+## 4. Boundaries with other native dependencies
 
-```
+```text
 guest-runtime/native-deps ──► vmlinux / mkfs.erofs / fsck.erofs / envd
 sandboxer/native-deps     ──► cloud-hypervisor
 accelerator               ──► librocksdb
 ```
 
-`cloud-hypervisor` 不进入 guest runtime 镜像;它是 host 侧 VMM 子进程。
-`vmlinux` 也不在本目录构建;它由 `guest-runtime` 独立发布,供 `sandbox-ctl`
-通过配置引用。
+`cloud-hypervisor` is a host VMM subprocess, not part of the guest runtime image.
+`vmlinux` is not built here either: `guest-runtime` releases it independently and
+`sandbox-ctl` selects it through configuration.
 
-## 5. 验证
+<a id="5-验证"></a>
+## 5. Validation
 
-最低验证:
+For a native build, verify the artifact produced in this directory:
 
 ```bash
 make cloud-hypervisor
-../bin/$(uname -m)/cloud-hypervisor --version
+./bin/$(uname -m)/cloud-hypervisor --version
 ```
 
-完整验证应在 `sandboxer/` 仓库根运行:
+For broader validation, run from the `sandboxer/` repository root:
 
 ```bash
 make test
-make -C ../kuasar-sandbox test-e2e-sandbox-cold
+make test-e2e
 ```
 
-真实 e2e 需要 `/dev/kvm`、guest runtime、vmlinux 和 tap/network 前置条件。
-缺失时脚本会 skip;发布前应在具备 KVM 的环境跑完整 platform e2e。
+The component E2E target uses the assembled platform binaries selected by
+`E2E_BIN`. The complete platform build-and-test gate is
+`make -C ../kuasar-sandbox test-e2e` from the sandboxer repository root; the old
+`test-e2e-sandbox-cold` platform target does not exist.
+
+Real E2E requires `/dev/kvm`, the guest runtime, `vmlinux`, and the network/TAP
+prerequisites of the selected cases. Some individual scripts can skip missing
+prerequisites when invoked directly, but `test/e2e/run_all.sh` exports
+`REQUIRE_KVM=1`: the component and release gates fail rather than treating those
+missing prerequisites as success. Run the full platform gate in a suitable KVM
+environment before release.
