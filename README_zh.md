@@ -53,7 +53,7 @@ Manifest store，也不创建 `.image`、`.sandbox` 或 BuildID/SandboxID alias�
 
 single-root Bundle 使用调用者预先取得的 write admission 与 customer key，在目标
 目录内完成 ingest/finalize 和完整验证，再通过 shared-location exclusive-create
-协议发布内容寻址 final。file 与 directory 都会 fsync；同 key 的并发 writer 收敛到
+协议发布内容寻址 final；同 key 的并发 writer 收敛到
 经过严格验证的同一 final，corrupt、mismatched、symlink 或 non-regular existing
 final 均 fail closed。Local tarstream 是一个 role-specific transport file；Manifest
 Bundle 则是带 admission、Manifest/chunk 与 crypto domain 的自包含 carrier，两者不能

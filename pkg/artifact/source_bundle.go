@@ -144,10 +144,6 @@ func (t *singleRootBundleTarget) Put(ctx context.Context, role LogicalRole, sour
 		if removeStaged {
 			if err := removeOwnedSingleRootStaging(stagedPath, stagedInfo); err != nil {
 				retErr = errors.Join(retErr, err)
-			} else {
-				if syncErr := (osLocationFileSystem{}).syncDirectory(t.directory); syncErr != nil {
-					retErr = errors.Join(retErr, fmt.Errorf("sync single-root Bundle directory after cleanup: %w", syncErr))
-				}
 			}
 		}
 		if retErr != nil {
@@ -172,9 +168,6 @@ func (t *singleRootBundleTarget) Put(ctx context.Context, role LogicalRole, sour
 	root := result.ManifestKey
 	if err := writer.Finalize(root); err != nil {
 		return "", fmt.Errorf("single-root Bundle finalize %s: %w", role, err)
-	}
-	if err := staged.Sync(); err != nil {
-		return "", fmt.Errorf("single-root Bundle sync staged file: %w", err)
 	}
 	if err := staged.Close(); err != nil {
 		return "", fmt.Errorf("single-root Bundle close staged file: %w", err)
@@ -218,9 +211,6 @@ func (t *singleRootBundleTarget) Put(ctx context.Context, role LogicalRole, sour
 		return "", err
 	}
 	removeStaged = false
-	if err := commit.fs.syncDirectory(t.directory); err != nil {
-		return "", fmt.Errorf("single-root Bundle sync directory after cleanup: %w", err)
-	}
 
 	ref := manifest.Ref{
 		Scheme: manifest.RefSchemeFile, Path: basename,

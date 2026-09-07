@@ -70,16 +70,13 @@ func locationTestTarget(directory string, codec tarstream.Codec, required bool) 
 type trackingLocationFileSystem struct {
 	base locationFileSystem
 
-	creates       atomic.Int32
-	opens         atomic.Int32
-	written       atomic.Int64
-	fileSyncs     atomic.Int32
-	directorySync atomic.Int32
+	creates atomic.Int32
+	opens   atomic.Int32
+	written atomic.Int64
 
 	wrapCreate func(string, locationWriteFile) locationWriteFile
 	onOpen     func(int32)
 	openErr    error
-	dirSyncErr error
 }
 
 func newTrackingLocationFileSystem() *trackingLocationFileSystem {
@@ -120,14 +117,6 @@ func (f *trackingLocationFileSystem) lstat(path string) (os.FileInfo, error) {
 
 func (f *trackingLocationFileSystem) remove(path string) error { return f.base.remove(path) }
 
-func (f *trackingLocationFileSystem) syncDirectory(path string) error {
-	f.directorySync.Add(1)
-	if f.dirSyncErr != nil {
-		return f.dirSyncErr
-	}
-	return f.base.syncDirectory(path)
-}
-
 type trackingLocationWriteFile struct {
 	base  locationWriteFile
 	owner *trackingLocationFileSystem
@@ -142,10 +131,6 @@ func (f *trackingLocationWriteFile) Write(body []byte) (int, error) {
 func (f *trackingLocationWriteFile) Stat() (os.FileInfo, error) { return f.base.Stat() }
 func (f *trackingLocationWriteFile) Chmod(mode os.FileMode) error {
 	return f.base.Chmod(mode)
-}
-func (f *trackingLocationWriteFile) Sync() error {
-	f.owner.fileSyncs.Add(1)
-	return f.base.Sync()
 }
 func (f *trackingLocationWriteFile) Close() error { return f.base.Close() }
 
@@ -162,10 +147,6 @@ func (f *trackingLocationReadFile) Seek(offset int64, whence int) (int64, error)
 	return f.base.Seek(offset, whence)
 }
 func (f *trackingLocationReadFile) Stat() (os.FileInfo, error) { return f.base.Stat() }
-func (f *trackingLocationReadFile) Sync() error {
-	f.owner.fileSyncs.Add(1)
-	return f.base.Sync()
-}
 func (f *trackingLocationReadFile) Close() error { return f.base.Close() }
 
 func TestLocationTargetFreshPublicationWritesSharedFinalOnce(t *testing.T) {
@@ -233,7 +214,7 @@ func TestLocationTargetFreshPublicationWritesSharedFinalOnce(t *testing.T) {
 	}
 }
 
-func TestLocationTargetReusesValidFinalDurablyWithoutWriting(t *testing.T) {
+func TestLocationTargetReusesValidFinalWithoutWriting(t *testing.T) {
 	directory := t.TempDir()
 	fs := newTrackingLocationFileSystem()
 	target := locationTestTarget(directory, nil, false)
@@ -257,8 +238,6 @@ func TestLocationTargetReusesValidFinalDurablyWithoutWriting(t *testing.T) {
 		t.Fatal(err)
 	}
 	writesBefore := fs.written.Load()
-	syncsBefore := fs.fileSyncs.Load()
-	directorySyncsBefore := fs.directorySync.Load()
 
 	second, err := target.Put(context.Background(), RoleSandbox, locationTestSource(t, body))
 	if err != nil {
@@ -280,10 +259,6 @@ func TestLocationTargetReusesValidFinalDurablyWithoutWriting(t *testing.T) {
 	}
 	if fs.creates.Load() != 1 || fs.written.Load() != writesBefore {
 		t.Fatalf("reuse created/wrote final: creates=%d writes=%d before=%d", fs.creates.Load(), fs.written.Load(), writesBefore)
-	}
-	if fs.fileSyncs.Load() <= syncsBefore || fs.directorySync.Load() <= directorySyncsBefore {
-		t.Fatalf("reuse did not sync validated fd and directory: file=%d->%d dir=%d->%d",
-			syncsBefore, fs.fileSyncs.Load(), directorySyncsBefore, fs.directorySync.Load())
 	}
 }
 
@@ -307,7 +282,6 @@ func (f *blockingLocationWriteFile) Stat() (os.FileInfo, error) { return f.base.
 func (f *blockingLocationWriteFile) Chmod(mode os.FileMode) error {
 	return f.base.Chmod(mode)
 }
-func (f *blockingLocationWriteFile) Sync() error  { return f.base.Sync() }
 func (f *blockingLocationWriteFile) Close() error { return f.base.Close() }
 
 func TestLocationTargetRetriesInProgressFinal(t *testing.T) {
@@ -473,31 +447,6 @@ func TestLocationTargetExistingRetryHonorsContext(t *testing.T) {
 	}
 }
 
-func TestLocationTargetKeepsValidatedFinalWhenDirectorySyncFails(t *testing.T) {
-	directory := t.TempDir()
-	body := bytes.Repeat([]byte{0x65}, 128*1024)
-	target := locationTestTarget(directory, nil, false)
-	fs := newTrackingLocationFileSystem()
-	fs.dirSyncErr = unix.EIO
-	target.fs = fs
-	payload, err := locationPayloadName(RoleSandbox)
-	if err != nil {
-		t.Fatal(err)
-	}
-	scheme, digest, err := tarstream.CarrierDigest(payload, locationTestSource(t, body), target.writeOptions()...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(directory, digest+"."+payload)
-	_, err = target.Put(context.Background(), RoleSandbox, locationTestSource(t, body))
-	if !errors.Is(err, unix.EIO) {
-		t.Fatalf("directory sync error = %v, want EIO", err)
-	}
-	if err := target.validateFinal(context.Background(), path, payload, uint64(len(body)), scheme, digest, false); err != nil {
-		t.Fatalf("validated final was removed after directory sync failure: %v", err)
-	}
-}
-
 func TestLocationTargetPreservesSymlinkAndNonRegularFinals(t *testing.T) {
 	body := bytes.Repeat([]byte{0x62}, 32*1024)
 	for _, kind := range []string{"symlink", "directory", "fifo"} {
@@ -543,7 +492,6 @@ var errInjectedLocationFailure = errors.New("injected location publication failu
 type hookedLocationWriteFile struct {
 	base      locationWriteFile
 	writeHook func([]byte) (int, error)
-	syncHook  func() error
 	closeHook func() error
 }
 
@@ -557,12 +505,6 @@ func (f *hookedLocationWriteFile) Write(body []byte) (int, error) {
 func (f *hookedLocationWriteFile) Stat() (os.FileInfo, error) { return f.base.Stat() }
 func (f *hookedLocationWriteFile) Chmod(mode os.FileMode) error {
 	return f.base.Chmod(mode)
-}
-func (f *hookedLocationWriteFile) Sync() error {
-	if f.syncHook != nil {
-		return f.syncHook()
-	}
-	return f.base.Sync()
 }
 func (f *hookedLocationWriteFile) Close() error {
 	if f.closeHook != nil {
@@ -631,7 +573,7 @@ func (r *failingLocationRun) ReadAt(ctx context.Context, body []byte, offset uin
 
 func TestLocationTargetCleansOnlyOwnedPartialFinal(t *testing.T) {
 	body := bytes.Repeat([]byte{0x73}, 512*1024)
-	for _, fault := range []string{"source-read", "target-write", "context", "short-write", "sync", "close", "validation"} {
+	for _, fault := range []string{"source-read", "target-write", "context", "short-write", "close", "validation"} {
 		t.Run(fault, func(t *testing.T) {
 			directory := t.TempDir()
 			target := locationTestTarget(directory, nil, false)
@@ -659,8 +601,6 @@ func TestLocationTargetCleansOnlyOwnedPartialFinal(t *testing.T) {
 					}
 				case "short-write":
 					hooked.writeHook = func([]byte) (int, error) { return 0, nil }
-				case "sync":
-					hooked.syncHook = func() error { return errInjectedLocationFailure }
 				case "close":
 					hooked.closeHook = func() error { return errors.Join(file.Close(), errInjectedLocationFailure) }
 				}
@@ -668,7 +608,7 @@ func TestLocationTargetCleansOnlyOwnedPartialFinal(t *testing.T) {
 			}
 			target.fs = fs
 			if fault == "validation" {
-				target.validate = func(context.Context, locationReadFile, os.FileInfo, string, uint64, string, string, bool) error {
+				target.validate = func(context.Context, locationReadFile, os.FileInfo, string, uint64, string, string) error {
 					return errInjectedLocationFailure
 				}
 			}

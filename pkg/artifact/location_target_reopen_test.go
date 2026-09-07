@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 )
 
@@ -60,18 +61,25 @@ func TestLocationTargetFreshPublicationRejectsReplacedFinal(t *testing.T) {
 
 	fs.wrapCreate = func(path string, file locationWriteFile) locationWriteFile {
 		destination = path
-		return &hookedLocationWriteFile{base: file, syncHook: func() error {
-			if err := file.Sync(); err != nil {
-				return err
-			}
-			// Replace the canonical path while the original write fd is still
-			// open. This models the namespace race the post-write SameFile check
-			// must detect and prevents immediate inode-number reuse from making
-			// the test itself ambiguous.
-			if err := os.Remove(path); err != nil {
-				return err
-			}
-			return os.WriteFile(path, replacement, 0o644)
+		var once sync.Once
+		return &hookedLocationWriteFile{base: file, writeHook: func(body []byte) (int, error) {
+			n, err := file.Write(body)
+			once.Do(func() {
+				if err != nil {
+					return
+				}
+				// Replace the canonical path while the original write fd is still
+				// open. This models the namespace race the post-write SameFile check
+				// must detect and prevents immediate inode-number reuse from making
+				// the test itself ambiguous.
+				if rmErr := os.Remove(path); rmErr != nil {
+					panic(rmErr)
+				}
+				if writeErr := os.WriteFile(path, replacement, 0o644); writeErr != nil {
+					panic(writeErr)
+				}
+			})
+			return n, err
 		}}
 	}
 
@@ -142,7 +150,7 @@ func TestLocationTargetValidationFailurePreservesReplacement(t *testing.T) {
 		destination = path
 		return file
 	}
-	target.validate = func(_ context.Context, _ locationReadFile, _ os.FileInfo, _ string, _ uint64, _, _ string, _ bool) error {
+	target.validate = func(_ context.Context, _ locationReadFile, _ os.FileInfo, _ string, _ uint64, _, _ string) error {
 		if err := os.Remove(destination); err != nil {
 			return err
 		}
