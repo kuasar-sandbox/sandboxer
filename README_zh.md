@@ -10,10 +10,9 @@ microVM 沙箱生命周期引擎:冷启动、快照、恢复,以及块设备(vho
 
 控制相关的跨仓薄导出面包括:`pkg/resource` 提供节点资源控制协议
 (wire + `Client`,由 `orchestrator` 的 **node-ctl** 作控制器侧 import),
-`pkg/ctl` 提供 host-local `ctl.sock` 协议与 `ProxyExec` 入口,供可信
-node proxy 在完成远程 exec 鉴权后接入现有 exec/MUX 链路。资源协议
-规范见 [`orchestrator/docs/node-resource.md`](https://github.com/kuasar-sandbox/orchestrator/blob/main/docs/node-resource.md)
-§5;`ctl.sock` 与 `ProxyExec` 合同见 [`docs/sandbox.md`](docs/sandbox.md) §6.3。
+`pkg/ctl` 提供 host-local `ctl.sock` 协议，以及通过 caller policy callback 在 backend dial 前完成鉴权的 `ServeExecTunnel`；`ProxyExec` 只 relay 已连接 backend。可信 node proxy 通过这些入口接入现有 exec/MUX 链路。资源协议
+规范见 [`orchestrator/docs/node-resource_zh.md`](https://github.com/kuasar-sandbox/orchestrator/blob/main/docs/node-resource_zh.md)
+§5;`ctl.sock` 与 `ServeExecTunnel` 合同见 [`docs/sandbox_zh.md`](docs/sandbox_zh.md) §6.3。
 
 ## 组成
 
@@ -27,7 +26,7 @@ node proxy 在完成远程 exec 鉴权后接入现有 exec/MUX 链路。资源�
 | `pkg/uffd` `pkg/memory` | uffd handler 与 memfd 统一内存所有权(懒加载) |
 | `pkg/vhost` | vhost-user-blk 后端(file / manifest 块源 + CoW diff) |
 | `pkg/{guestlink,mux,proto,fwd,stdio}` | host↔guest vsock 控制面、stdio MUX 与端口转发 |
-| `pkg/ctl` | **导出面**:host-local `ctl.sock` 协议 + 经鉴权 exec 隧道的 `ProxyExec` gate/relay |
+| `pkg/ctl` | **导出面**:host-local `ctl.sock` 协议 + `ServeExecTunnel` request gate；`ProxyExec` 仅 relay 已连接 backend |
 | `pkg/{config,resctl,chapi,tapfd}` | sandbox.yaml、cgroup+balloon 联动、CH API 客户端、tapfd 消费 |
 | `pkg/util` | 内联工具(`ParseSize` / `LocateBinary` 等,跨模块导出) |
 | `pkg/resource` | **导出面**:节点资源控制协议(`orchestrator` 的 node-ctl import) |
@@ -120,7 +119,7 @@ guest-runtime 构建 runtime 镜像和 build sandbox 内展平镜像时使用的
 
 ## 文档
 
-- [docs/sandbox.md](docs/sandbox.md) — host 控制平面、PortableSandboxConfig、
+- [docs/sandbox_zh.md](docs/sandbox_zh.md) — host 控制平面、PortableSandboxConfig、
   `.overlay`/Sandbox E/Snapshot S、carrier、export/snapshot/restore/publish与资源模型。
 - [docs/sandbox-init.md](docs/sandbox-init.md) — guest PID 1 ABI:
   `sandbox-init` 三阶段、vsock 控制面 + stdio MUX 协议、应用契约。

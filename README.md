@@ -35,7 +35,7 @@ Snapshot reuse is represented by explicit parent and child references. Multiple 
 | Package | Purpose |
 | --- | --- |
 | `pkg/resource` | Node resource-control wire contract and client, consumed by `orchestrator` |
-| `pkg/ctl` | Host-local control-socket protocol and authenticated `ProxyExec` relay |
+| `pkg/ctl` | Host-local control-socket protocol and policy callbacks for `ServeExecTunnel`; `ProxyExec` relays an already connected backend |
 | `pkg/sandbox`, `pkg/restore`, `pkg/snapshot` | Lifecycle, restore, and snapshot orchestration |
 | `pkg/artifact` | Typed publication to a Manifest store or a named-location Bundle |
 | `pkg/uffd`, `pkg/memory` | On-demand memory loading and memfd ownership |
@@ -96,13 +96,13 @@ See the [project release documentation](https://github.com/kuasar-sandbox/kuasar
 
 ## Documentation
 
-Detailed design and reference documents are currently maintained primarily in Chinese:
+Full design and reference documents:
 
 - [`docs/sandbox.md`](docs/sandbox.md) — host control plane, sandbox formats, artifacts, snapshot/export/restore, named locations, and resource semantics;
 - [`docs/sandbox-init.md`](docs/sandbox-init.md) — guest PID 1 ABI, staged initialization, vsock control, stdio multiplexing, and application contract;
 - [`docs/cloud-hypervisor.md`](docs/cloud-hypervisor.md) — patched Cloud Hypervisor source, build, and runtime contracts.
 
-The English README contains the complete public component entry path. A full translation of every design document is not required to build or contribute to the component.
+The lifecycle and VMM guides provide complete English defaults and Chinese counterparts through their language selectors. The remaining guest ABI translation is tracked in [#192](https://github.com/kuasar-sandbox/sandboxer/issues/192).
 
 ## Project boundaries
 

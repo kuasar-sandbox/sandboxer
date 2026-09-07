@@ -94,7 +94,7 @@ cloud-hypervisor \
 # fd=3 ← memfd from sandbox-ctl via cmd.ExtraFiles[0]
 ```
 
-解析器要求 zone `id`;平台使用 `ram0`。详细命令行(冷启动 / 恢复)见 `sandboxer/docs/sandbox.md` §5.2 与 §7。
+解析器要求 zone `id`;平台使用 `ram0`。详细命令行(冷启动 / 恢复)见 [sandbox_zh.md](sandbox_zh.md) §5.2 与 §7。
 
 ## 3. patch 提交结构
 
@@ -346,7 +346,7 @@ virtio-vsock   → CID=3。控制面短连接(launch / ping / app_started / app_
                  连接握手后升级而成的应用 stdio MUX(详见 sandbox-init.md §4)
 virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on];sandbox-local
                  BalloonController 通过 /vm.resize 推 target,并以 vm.info 的
-                 memory_actual_size 观察 current(见 `sandboxer/docs/sandbox.md` §9.3);free_page_reporting
+                 memory_actual_size 观察 current(见 [sandbox_zh.md](sandbox_zh.md) §9.3);free_page_reporting
                  不启用(mmu_notifier 广播压力可能影响 guest vsock 进展)
 virtio-mem     → host-driven 主动 unplug(CH 能力;当前固定 Capacity Budget 模型不启用)
 ```
@@ -359,7 +359,7 @@ restore 沿用 `config.json` 中的设备拓扑,不能新增或删除 virtio-net
 恢复路径设备拓扑通过 `--restore source_url=<state.json dir>` 从 snapshot
 state 还原,不需要重新指定 `--kernel` / `--vsock`。
 
-详细命令行示例与冷启动/恢复差异见 `sandboxer/docs/sandbox.md` §5(冷启动
+详细命令行示例与冷启动/恢复差异见 [sandbox_zh.md](sandbox_zh.md) §5(冷启动
 数据流)与 §7(恢复数据流)。
 
 ### 5.2 vsock hybrid 代理
@@ -376,7 +376,7 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 `OK <local_port>\n`(host 须先排空再读后续 payload),之后 CH 把流量代理到 guest
 对应 port 的 listener。两个方向的连接对 CH 而言都是普通字节流——`launch` /
 `restore` / `attach` 这三种连接在应用层握手后由 sandbox-ctl / sandbox-init 自行
-转入帧收发态(stdio MUX),CH 不感知。详细见 `sandboxer/docs/sandbox.md` §5.2 与
+转入帧收发态(stdio MUX),CH 不感知。详细见 [sandbox_zh.md](sandbox_zh.md) §5.2 与
 `sandboxer/docs/sandbox-init.md` §4.2。
 
 ## 6. 行为契约总结
@@ -423,9 +423,9 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 
 ## 8. See Also
 
-- `sandboxer/docs/sandbox.md` §5(冷启动数据流,§5.2 CH 命令行)/ §7(恢复
+- [sandbox_zh.md](sandbox_zh.md) §5(冷启动数据流,§5.2 CH 命令行)/ §7(恢复
   数据流)—— sandbox-ctl 怎么用 patched CH 跑沙箱;命令行示例
-- `sandboxer/docs/sandbox.md` §8(uffd handler)—— sandbox-ctl 接收到 uffd_C
+- [sandbox_zh.md](sandbox_zh.md) §8(uffd handler)—— sandbox-ctl 接收到 uffd_C
   之后如何处理 fault 事件
 - `guest-runtime/docs/vmlinux.md` —— guest kernel 如何配合 CH 启动
   协议(PVH / EFI stub)

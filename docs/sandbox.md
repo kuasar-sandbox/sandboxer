@@ -1,23 +1,31 @@
-# sandbox — 沙箱控制与制品生命周期
+[English](sandbox.md) | [简体中文](sandbox_zh.md)
 
-`sandbox-ctl` 是 kuasar-sandbox 的单沙箱 host 控制面. 它负责显式冷启动、从 Sandbox 制品冷启动、内存恢复、live export、无 VM 的 image-to-Sandbox-E assembly、内存快照、制品发布以及运行期 `exec`/forward. Guest 侧协议见 `sandbox-init.md`.
+<a id="sandbox--沙箱控制与制品生命周期"></a>
 
-本文只描述当前格式和行为. 项目尚未发布,旧 `snapshot.cfg` 磁盘图不属于兼容输入.
+# sandbox — Sandbox control and artifact lifecycle
 
-## 1. 概述
+`sandbox-ctl` is kuasar-sandbox's host control plane for one sandbox. It handles explicit cold starts, cold starts from Sandbox artifacts, memory restore, live export, image-to-Sandbox-E assembly without a VM, memory snapshots, artifact publication, and runtime `exec`/forwarding. The guest protocol is documented in [sandbox-init.md](sandbox-init.md).
 
-### 1.1 逻辑角色
+This document describes the current format and behavior. The current reader rejects the old `snapshot.cfg` disk-graph schema; it provides no dual reader, automatic migration, or cross-version compatibility guarantee. This format boundary does not mean that the project has never published releases.
 
-系统区分 4 个逻辑角色:
+<a id="1-概述"></a>
+
+## 1. Overview
+
+<a id="11-逻辑角色"></a>
+
+### 1.1 Logical roles
+
+The system distinguishes four logical roles:
 
 | Role | Suffix | Logical content | Purpose |
 |---|---|---|---|
-| Container image | `.image` when materialized | `EROFS + ZIP(config.json)` | 只读容器 rootfs 与 OCI image defaults |
-| Disk overlay | `.overlay` | sparse block payload | 保存root/data disk可写层 |
-| Sandbox E | `.sandbox` | root payload + strict ZIP | 可重复冷启动的完整 portable workload |
-| Snapshot S | `.snapshot` | memory payload + strict ZIP | 恢复已运行进程和 VMM/guest memory state |
+| Container image | `.image` when materialized | `EROFS + ZIP(config.json)` | Read-only container rootfs and OCI image defaults |
+| Disk overlay | `.overlay` | Sparse block payload | Writable layer of a root or data disk |
+| Sandbox E | `.sandbox` | Root payload + strict ZIP | Complete portable workload for repeatable cold starts |
+| Snapshot S | `.snapshot` | Memory payload + strict ZIP | Resume running processes and VMM/guest memory state |
 
-`E` 表示 runnable Sandbox artifact,`S` 表示 memory Snapshot. 两者职责不可互换:
+`E` means a runnable Sandbox artifact; `S` means a memory Snapshot. Their responsibilities are not interchangeable:
 
 ```text
 explicit sandbox.yaml ── run --config ──> cold start
@@ -30,42 +38,50 @@ image-to-Sandbox-E build ──> E
 memory snapshot          ──> E + S, S is operation root
 ```
 
-不存在以下模型:
+The following models do not exist:
 
-- 不存在 `snapshot --memory=false`.
-- 不存在 zero-size memory Snapshot.
-- 不存在 `run --restore` 的 cold-boot 分支.
-- `snapshot.cfg` 不保存 disk graph、launch、mounts、files 或 init.
-- cold boot 不包装成 restore.
+- There is no `snapshot --memory=false`.
+- There is no zero-size memory Snapshot.
+- `run --restore` has no cold-boot branch.
+- `snapshot.cfg` does not store the disk graph, launch, mounts, files, or init.
+- Cold boot is not wrapped as restore.
 
-### 1.2 逻辑角色与物理 carrier
+<a id="12-逻辑角色与物理-carrier"></a>
 
-逻辑内容与物理 carrier 正交. 同一个 `.image`、`.overlay`、`.sandbox` 或 `.snapshot` logical source 可以由以下 carrier 承载:
+### 1.2 Logical roles and physical carriers
+
+Logical content and physical carrier are independent. The same `.image`, `.overlay`, `.sandbox`, or `.snapshot` logical source can use these carriers:
 
 | Carrier | Reference | Notes |
 |---|---|---|
-| Local tarstream | `file://<basename>@digest:<digest>` 或 `@hmac:<digest>` | sparse map 由 tarstream envelope 权威声明 |
-| Manifest | `manifest://<key>` | chunk/Manifest encryption 和 verification 由 manifest config 控制 |
-| Manifest Bundle | `file://<bundle>@manifest:<key>` | 一个 ZIP64 Bundle 可承载 root 及完整依赖 Manifest graph |
+| Local tarstream | `file://<basename>@digest:<digest>` or `@hmac:<digest>` | The tarstream envelope authoritatively declares the sparse map |
+| Manifest | `manifest://<key>` | Manifest configuration controls chunk/Manifest encryption and verification |
+| Manifest Bundle | `file://<bundle>@manifest:<key>` | One ZIP64 Bundle can carry the root and its complete dependent Manifest graph |
 
-Local 模式物化的内容寻址文件名为 `<digest>.<role>`,其中immutable root carrier使用`.image`,`.overlay`只表示单独物化的可写disk layer. 当前root writable top已经是Sandbox E的payload,不会再复制为`.overlay`. Provisioned container image输入仍可使用`.erofs`等显式basename. `<sid>.sandbox` 和 `<sid>.snapshot` 是成功 commit 后更新的语义 symlink. Bundle 模式下语义 symlink 指向承载 root Manifest 的 `<key>.bundle`. Alias 的 SID 必须是单一安全 path component;commit 使用临时 symlink + atomic rename,并拒绝覆盖已有 regular file 或 directory. 这些是节点本地 output 语义;named ref-location 使用 §11.2 的独立 shared-location commit protocol,不创建 alias.
+In local mode, materialized content-addressed filenames are `<digest>.<role>`. Immutable root carriers use `.image`; `.overlay` denotes a separately materialized writable disk layer. The current writable root top is already the Sandbox E payload and is not duplicated as an `.overlay`. Provisioned container-image inputs may still use an explicit basename such as `.erofs`. `<sid>.sandbox` and `<sid>.snapshot` are semantic symlinks updated after a successful commit. In Bundle mode, the semantic symlink points to the `<key>.bundle` carrying the root Manifest. An alias SID must be one safe path component. Commit uses a temporary symlink and atomic rename, and refuses to replace an existing regular file or directory. These are node-local output semantics; named ref-locations use the separate shared-location commit protocol in §11.2 and create no aliases.
 
-Block backend、restore 和 publisher 先打开 carrier,再按逻辑角色解析内容. 外层 ZIP magic 只说明 carrier 是 Bundle,不说明 logical role.
+The block backend, restore code, and publisher first open the carrier, then parse the content according to its logical role. Outer ZIP magic identifies a Bundle carrier, not its logical role.
 
-### 1.3 责任边界
+<a id="13-责任边界"></a>
 
-`sandboxer` 提供完整 E/S 能力,但不决定 orchestrator 的 durable API. 上层的推荐映射是:
+### 1.3 Responsibility boundaries
+
+`sandboxer` provides the complete E/S capabilities but does not define orchestrator's durable API. The recommended upper-layer mapping is:
 
 ```text
 memory=true  -> kind=snapshot, ref=<Snapshot S>
 memory=false -> kind=sandbox,  ref=<Sandbox E>
 ```
 
-普通数据面不得把 Sandbox E 当成可自动唤醒的内存状态. 从 E 启动是显式 cold `Connect` 语义.
+The ordinary data plane must not treat Sandbox E as memory state that can wake automatically. Starting from E requires explicit cold `Connect` semantics.
 
-## 2. 命令行接口
+<a id="2-命令行接口"></a>
 
-### 2.1 子命令总览
+## 2. Command-line interface
+
+<a id="21-子命令总览"></a>
+
+### 2.1 Subcommands
 
 ```text
 sandbox-ctl run
@@ -78,11 +94,11 @@ sandbox-ctl publish
 sandbox-ctl upload-snapshot
 ```
 
-`upload-snapshot` 是 `publish` 的 thin compatibility alias,两者调用同一 publisher 和 graph traversal.
+`upload-snapshot` is a thin compatibility alias for `publish`; both call the same publisher and graph traversal.
 
 ### 2.2 `sandbox-ctl run`
 
-三种输入模式严格分离:
+The three input modes are strictly separate:
 
 ```bash
 # Explicit cold start.
@@ -99,16 +115,15 @@ sandbox-ctl run --from ./s1.sandbox --replace-boot \
 sandbox-ctl run --restore ./s1.snapshot --config restore-host.yaml --sandbox-id s3
 ```
 
-RunRoot/BaseRoot 是调用级根目录，RunDir/BaseDir 是本次 Sandbox 的实际目录。
-`SandboxID` 始终是逻辑身份；`PathID` 仅是两个 root 下共同使用的目录 leaf：
+RunRoot/BaseRoot are invocation-level roots; RunDir/BaseDir are the actual directories for this Sandbox. `SandboxID` always denotes logical identity. `PathID` is only the directory leaf shared under the two roots:
 
 ```text
-pathID  = PathID（若显式给出），否则为 SandboxID
+pathID  = explicitly supplied PathID, otherwise SandboxID
 RunDir  = RunRoot/pathID
 BaseDir = BaseRoot/pathID
 ```
 
-例如 Build phase 可保留全局唯一 SandboxID，同时使用固定私有目录：
+For example, a Build phase can retain a globally unique SandboxID while using a fixed private directory:
 
 ```bash
 sandbox-ctl run \
@@ -119,38 +134,33 @@ sandbox-ctl run \
   --base-root /var/lib/sandbox/builds/build-01
 ```
 
-PathID 必须是非空、安全的单一路径分量，不能是 `.`、`..`，也不能包含
-`/`、`\\` 或 NUL。它不与 SandboxID 比较，也没有 PathID→SandboxID 映射。
-root/data disk 的默认 writable diff 位于 PathID 派生的 BaseDir，但文件名继续
-使用逻辑 SandboxID，例如
-`BaseRoot/a/build-01-phase-a.overlay.diff` 与
-`BaseRoot/a/build-01-phase-a.disk0.diff`。cold、`--from` 和 `--restore` 使用同一
-规则。Sandbox 正常退出只清理当前 PathID 的 RunDir 和 owned diff；不会递归
-删除传入的 RunRoot/BaseRoot 或 sibling PathID。
+PathID must be a nonempty, safe, single path component: neither `.` nor `..`, and containing no `/`, backslash, or NUL. It is not compared with SandboxID, and there is no PathID-to-SandboxID mapping. Default writable diffs for root/data disks reside in the PathID-derived BaseDir, but their filenames still use logical SandboxID, for example `BaseRoot/a/build-01-phase-a.overlay.diff` and `BaseRoot/a/build-01-phase-a.disk0.diff`. Cold, `--from`, and `--restore` modes use the same rule. Normal Sandbox exit cleans up only the current PathID's RunDir and owned diffs; it does not recursively remove the supplied RunRoot/BaseRoot or sibling PathIDs.
 
-`--from` 与 `--restore` 互斥. `--config` 在三种模式中的所有权不同:
+`--from` and `--restore` are mutually exclusive. Ownership of `--config` differs by mode:
 
-- 普通 run:完整显式 cold config.
-- `--from`:host/instance overlay;portable workload 来自 E.
-- `--from --replace-boot`:E 只提供 non-boot portable defaults;host config 必须提供完整 boot.
-- `--restore`:host-only restore bindings/policy;执行状态和 portable workload 来自 S 引用的 E.
+- Ordinary run: a complete explicit cold configuration.
+- `--from`: a host/instance overlay; E supplies the portable workload.
+- `--from --replace-boot`: E supplies only non-boot portable defaults; the host configuration must supply the complete boot definition.
+- `--restore`: host-only restore bindings/policy; S and its referenced E supply execution state and the portable workload.
 
-`--config a.yaml:b.yaml` 继续按顺序 merge. `SANDBOX_CONFIG` 可替代 `--config`. `LoadConfigBytesWithPresence` 为 config-socket 等内存入口提供相同的 presence-aware 规则.
+`--config a.yaml:b.yaml` still merges files in order. `SANDBOX_CONFIG` can replace `--config`. `LoadConfigBytesWithPresence` supplies the same presence-aware rules for in-memory inputs such as config-socket.
 
-`--from` 和 `--restore` 支持:
+`--from` and `--restore` support:
 
-- raw absolute/relative local path;
-- scheme-qualified local tarstream;
-- `manifest://<key>`;
-- `file://<bundle>@manifest:<key>`;
-- Bundle 默认 root key 推导;
-- named `--ref-location name=file:///absolute/path`.
+- Raw absolute or relative local paths.
+- Scheme-qualified local tarstreams.
+- `manifest://<key>`.
+- `file://<bundle>@manifest:<key>`.
+- Inference of a Bundle's default root key.
+- Named `--ref-location name=file:///absolute/path` bindings.
 
-`run` 的 stdio、TTY、console、`--ready-fd`、connect forward 和资源参数在三种模式中保持相同 host 控制语义. Memory restore 不重新发送 cold launch spec.
+Run's stdio, TTY, console, `--ready-fd`, connect forwarding, and resource parameters retain the same host control semantics in all three modes. Memory restore does not resend the cold launch specification.
 
 ### 2.3 `sandbox-ctl snapshot`
 
-```bash
+The following is command syntax; choose one output alternative and omit the square-bracket notation when executing:
+
+```text
 sandbox-ctl snapshot \
   --path-id a \
   --run-root /run/sandbox/builds/build-01 \
@@ -161,22 +171,19 @@ sandbox-ctl snapshot \
   [--merge-ref=true]
 ```
 
-Snapshot 始终包含 memory execution state. 一次操作在同一 freeze point 产生 E 和 S,S 最后 commit. 默认成功后销毁 VM;`--resume` 恢复原 VM,但不把新 E/S 设为 live baseline.
+A Snapshot always contains memory execution state. One operation produces E and S at the same freeze point, committing S last. On success, the default is to destroy the VM. `--resume` resumes the original VM without making the new E/S its live baseline.
 
-Local human output同时列出 `Snapshot S` 与 `Sandbox E`. Upload stdout 仍只输出 S Manifest key,便于当前 orchestrator parser 使用. `snapshot_done` 同时返回 `snapshot_ref` 与 `sandbox_ref`;既有 `memory_size`、`memory_resident`、pause/dump timing 和 compatibility `overlay_*` response 字段保留. `overlay_*` 当前镜像 E identity,真正 disk graph 只在 E 中.
+Human-readable local output lists both `Snapshot S` and `Sandbox E`. Upload stdout still contains only the S Manifest key for the existing orchestrator parser. `snapshot_done` returns both `snapshot_ref` and `sandbox_ref`; existing `memory_size`, `memory_resident`, pause/dump timing, and compatibility `overlay_*` response fields remain. `overlay_*` currently mirrors E's identity; only E contains the actual disk graph.
 
-`--drop-caches` 只属于 memory snapshot,默认 false. `--merge-ref` 只控制 local memory parent merge,不改变 disk provenance.
+`--drop-caches` belongs only to memory snapshot and defaults to false. `--merge-ref` controls only local memory-parent merging and does not change disk provenance.
 
-local `snapshot` 只需 `--sandbox-id` 或 `--path-id` 之一。两者同时给出时
-PathID 只选择 `RunRoot/PathID/ctl.sock`，不做身份一致性校验。`--output` 可以位于
-BaseRoot 文件系统（例如 `BuildBaseDir/checkpoint`）；运行进程只清理自己的
-RunDir/owned diff，不会把 output 当作运行目录删除。
+A local `snapshot` needs either `--sandbox-id` or `--path-id`. When both are supplied, PathID only selects `RunRoot/PathID/ctl.sock`; no identity consistency check is performed. `--output` may reside on the BaseRoot filesystem, for example `BuildBaseDir/checkpoint`. The running process cleans its own RunDir/owned diffs and does not treat output as a runtime directory to delete.
 
 ### 2.4 `sandbox-ctl export`
 
-Live export:
+Live export syntax:
 
-```bash
+```text
 sandbox-ctl export \
   --path-id a \
   --run-root /run/sandbox/builds/build-01 \
@@ -185,9 +192,9 @@ sandbox-ctl export \
   [--resume]
 ```
 
-Image-to-Sandbox-E assembly（不启动 VM）:
+Image-to-Sandbox-E assembly syntax, without starting a VM:
 
-```bash
+```text
 sandbox-ctl export \
   --from ./flattened.img \
   --config sandbox.yaml \
@@ -196,11 +203,9 @@ sandbox-ctl export \
   [--mode local|bundle]
 ```
 
-Live mode不接受 `--config`;它复用当前 run 进程已验证的 manifest/ref-location/crypto binding,因此显式 `--manifest-config` 和 `--ref-location` 仅属于 assembly mode. Assembly mode要求 `--config` 或 `SANDBOX_CONFIG` 且拒绝 `--resume`. 两种模式都支持 `--timeout`;0 表示不设 operation deadline. Export 不接受 `drop_caches` 或 memory merge 参数,不调用 CH `/vm.snapshot`,不读取 memfd,不生成 memory refs.
+Live mode rejects `--config` and reuses the running process's validated Manifest/ref-location/crypto bindings. Explicit `--manifest-config` and `--ref-location` therefore belong only to assembly mode. Assembly requires `--config` or `SANDBOX_CONFIG` and rejects `--resume`. Both modes support `--timeout`: zero imposes no operation deadline. Export accepts neither `drop_caches` nor memory-merge parameters, does not call CH `/vm.snapshot`, does not read the memfd, and produces no memory refs.
 
-live mode 与 local snapshot 相同，可只给 PathID；同时给出 SandboxID/PathID 时
-PathID 只定位 ctl socket。Assembly mode 不接受 PathID，原有 `--sandbox-id` 仍仅是
-输出 artifact alias，语义不变。
+Like local snapshot, live mode may use PathID alone. When SandboxID and PathID are both supplied, PathID only locates the ctl socket. Assembly rejects PathID; its existing `--sandbox-id` remains only an output-artifact alias.
 
 ### 2.5 `sandbox-ctl exec`
 
@@ -208,21 +213,18 @@ PathID 只定位 ctl socket。Assembly mode 不接受 PathID，原有 `--sandbox
 sandbox-ctl exec --path-id a --run-root /run/sandbox/builds/build-01 -- /bin/sh -c 'id'
 ```
 
-local exec 可只给 `--path-id`；若同时给
-`--sandbox-id build-01-phase-a --path-id a`，仍只拨号
-`RunRoot/a/ctl.sock`，请求本身不增加 SandboxID 或一致性检查。未给 PathID 时
-继续使用 `RunRoot/SandboxID/ctl.sock`。
+Local exec may use only `--path-id`. Supplying both `--sandbox-id build-01-phase-a --path-id a` still dials only `RunRoot/a/ctl.sock`; the request gains neither a SandboxID nor a consistency check. Without PathID it continues to use `RunRoot/SandboxID/ctl.sock`.
 
-`exec` 通过当前 ctl/MUX 创建 sibling process. Export/snapshot 的 quiesce gate 原子阻止新 exec/forward 进入不稳定窗口,并关闭、join 已放行的 exec/forward session;在飞 exec 被终止且不会在 `--resume` 后自动重跑. Restore/attach 只有在新 MUX 建立且应用 cgroup 已 thaw 后才重新开放 exec、forward、plugin 和 app restart;ACK 与 thaw 之间抢先到达的请求会被 gate 拒绝,不会向 frozen cgroup fork. Guest `attach` 是幂等恢复操作;host 在 request/ACK 边界不明确时立即重试一次,且整个 dial/ACK 过程受 lifecycle context cancellation 控制.
+Exec creates a sibling process through the current ctl/MUX. The export/snapshot quiesce gate atomically prevents new exec/forward sessions from entering the unstable window, and closes and joins already admitted sessions. In-flight execs are terminated and do not automatically rerun after `--resume`. Restore/attach reopens exec, forwarding, plugins, and app restart only after establishing the new MUX and thawing the application cgroup. Requests racing between ACK and thaw are rejected by the gate rather than forking into the frozen cgroup. Guest `attach` is an idempotent recovery operation. The host immediately retries once when the request/ACK boundary is ambiguous; lifecycle-context cancellation controls the entire dial/ACK sequence.
 
-远程授权 exec 使用 `pkg/ctl.ServeExecTunnel(ctx, options)`,固定以下顺序:
+Remote authorized exec uses `pkg/ctl.ServeExecTunnel(ctx, options)` in this fixed order:
 
 ```text
 Authorize -> AcceptDownstream -> ReadExecRequestFrame -> AuthorizeRequest
           -> DialBackend -> write frame.Raw once -> duplex relay
 ```
 
-Request gate 通过前不得拨号 backend 或触发 Sandbox lifecycle. 首帧上限 64 KiB,必须是单一、字段集严格且无 duplicate 的 `exec_request`,包含非空 `exec.argv`;读取最多等待 10s,调用方只能缩短. 通过后原始 frame 只写入一次,不 decode/re-encode. 已识别的 request/backend rejection 只对外返回脱敏 `exec request rejected`;`ProxyExec` 仅保留给已预连接 backend 的调用方.
+Before request admission succeeds, the caller must not dial the backend or trigger Sandbox lifecycle changes. The first frame's JSON payload is limited to 64 KiB, plus its four-byte length prefix. It must contain one `exec_request` with strict field sets, no duplicate fields, and a nonempty `exec.argv` array. Reading waits at most 10 seconds; callers may only shorten that limit. After admission, the original frame is written exactly once without decode/re-encode. Recognized request/backend rejections expose only the sanitized `exec request rejected`; `ProxyExec` remains available only for callers with an already connected backend.
 
 ### 2.6 `sandbox-ctl config`
 
@@ -232,7 +234,7 @@ sandbox-ctl config --config host.yaml:instance.yaml --check strict
 sandbox-ctl config --config restore.yaml --mode restore --check strict
 ```
 
-Template 同时标明 portable、host-only 和 ephemeral 字段. Restore mode 输出 host-only 文档并删除 cold-only workload 与 immutable disk refs;它不会生成第二套 restore schema.
+The template identifies portable, host-only, and ephemeral fields. Restore mode emits a host-only document, removing cold-only workload fields and immutable disk refs. It does not introduce a second restore schema.
 
 ### 2.7 `sandbox-ctl info`
 
@@ -240,12 +242,12 @@ Template 同时标明 portable、host-only 和 ephemeral 字段. Restore mode �
 sandbox-ctl info [--json] [--manifest-config manifest.yaml] <artifact>
 ```
 
-- 对 E 输出 `sandbox.runtime.cfg`.
-- 对 S 的默认输出是原始、精简的 `snapshot.cfg`,其中至少有 `sandbox_ref`.
-- 对 S 的 `--json` 输出保留现有机器调用方需要的 resolved view: `Version`、`SandboxRef`、memory `FromRefs` 来自 S,`Resources`、`Boot`、`Launch` 和 `Metadata` 只从 S 引用的 E 派生. 该 view 不会写回 S,也不是第二套 snapshot provenance.
-- 对 malformed、ambiguous 或既不是 E 也不是 S 的 logical root fail closed.
+- For E, output is `sandbox.runtime.cfg`.
+- For S, default output is the original minimal `snapshot.cfg`, containing at least `sandbox_ref`.
+- For S, `--json` preserves the resolved view needed by existing machine callers: `Version`, `SandboxRef`, and memory `FromRefs` come from S; `Resources`, `Boot`, `Launch`, and `Metadata` derive only from the E referenced by S. This view is not written back to S and is not a second snapshot provenance schema.
+- Malformed, ambiguous, or logical roots that are neither E nor S fail closed.
 
-Local crypto、Manifest、Bundle、selector 和 named ref-location 与 run/publish 使用相同 opener.
+Local crypto, Manifest, Bundle, selectors, and named ref-locations use the same opener as run/publish.
 
 ### 2.8 `sandbox-ctl publish`
 
@@ -261,15 +263,15 @@ sandbox-ctl publish \
   ./s1.sandbox
 ```
 
-Publisher 自动严格识别 local E/S carrier. 已经 portable 的 graph dependency 保持原 ref;
-`manifest://` root 本身不再 materialize 到 named location,也不存在 Manifest tail rewrite.
-它不读取 `artifact.json`,也不存在 artifact-kind registry.
+The publisher strictly identifies local E/S carriers automatically. Already portable graph dependencies keep their original refs. A `manifest://` root is not materialized into a named location, and there is no Manifest tail rewrite. The publisher does not read `artifact.json` and has no artifact-kind registry.
 
-## 3. 配置与制品格式
+<a id="3-配置与制品格式"></a>
+
+## 3. Configuration and artifact formats
 
 ### 3.1 `sandbox.yaml`
 
-`sandbox.yaml` 是 host 输入,可以包含 portable workload、host policy 和 instance data. 以下示例展示字段归属,不是固定部署值:
+`sandbox.yaml` is host input and may contain a portable workload, host policy, and instance data. This example illustrates ownership, not prescribed deployment values:
 
 ```yaml
 resources:
@@ -337,17 +339,17 @@ timeouts:
   ch_api: 30s
 ```
 
-普通 cold run 使用完整 validation. `run --from` 和 `run --restore` 先严格解析 artifact,再按字段 presence 应用各自 rules,不能使用无约束 `LoadMerged` 覆盖 artifact graph.
+Ordinary cold run performs full validation. `run --from` and `run --restore` first strictly parse the artifact, then apply their respective field-presence rules. An unconstrained `LoadMerged` must not overwrite the artifact graph.
 
 ### 3.2 PortableSandboxConfig
 
-唯一 portable 文件名是:
+The sole portable filename is:
 
 ```go
 const SandboxRuntimeConfigName = "sandbox.runtime.cfg"
 ```
 
-同一 canonical bytes 写入:
+The same canonical bytes are written to:
 
 ```text
 <run_dir>/sandbox.runtime.cfg
@@ -391,26 +393,26 @@ init:
 metadata: { workload.kind: api }
 ```
 
-Portable 内容包括:
+Portable content includes:
 
-- `resources.capacity` 和 workload 默认 `resources.allocatable`;
-- `network.enabled/interface` topology fact;
-- kernel/runtime basename + content identity;
-- boot cmdline;
-- root/data immutable graph,以及 data disk name/order/mount topology;
-- persistent launch/plugin/mounts/files/init/metadata.
+- `resources.capacity` and workload defaults in `resources.allocatable`.
+- The `network.enabled/interface` topology facts.
+- Kernel/runtime basenames and content identities.
+- Boot cmdline.
+- The immutable root/data graph, plus data-disk names, order, and mount topology.
+- Persistent launch/plugin/mounts/files/init/metadata.
 
-Portable 内容排除:
+Portable content excludes:
 
-- cgroup path/fd/controller、overhead/watermark/startup;
-- TAP/TapFD provider、helper、socket以及 IP/MAC/hostname;
-- CH binary、run-root/base-root、active diff path;
-- manifest/customer key、crypto secret、access token、ref-location host path;
-- restore prefetch、host protocol timeout;
-- stdio/forward endpoint;
-- `ephemeral_files` 和 `launch.ephemeral_env`.
+- Cgroup paths/fds/controllers, overhead, watermark, and startup.
+- TAP/TapFD providers, helpers, sockets, IP/MAC/hostname.
+- The CH binary, run-root/base-root, and active diff paths.
+- Manifest/customer keys, crypto secrets, access tokens, and ref-location host paths.
+- Restore prefetch and host protocol timeouts.
+- Stdio/forward endpoints.
+- `ephemeral_files` and `launch.ephemeral_env`.
 
-Local immutable ref 必须是 basename + identity,例如:
+Local immutable refs must contain a basename and identity, for example:
 
 ```text
 file://vmlinux@digest:<digest>
@@ -420,11 +422,13 @@ file://<digest>.overlay@hmac:<digest>
 file://<digest>.overlay@digest:<digest>
 ```
 
-目标 host 使用实际 path、source directory 或 named ref-location 完成 binding,并在创建 controller、network、cgroup、VM 或 run directory 副作用前验证 identity.
+The destination host binds these through actual paths, a source directory, or named ref-locations before controller, network, cgroup, VM, or run-directory side effects. Verification is specific to the input: explicit cold projection hashes the kernel; `run --from` and restore check its absolute file binding and regular-file existence but deliberately skip the full kernel re-hash. They compare the runtime Bundle footer identity with C0. Thus these paths do not independently prove the supplied kernel matches E's recorded digest; kernel deployment remains a trusted host responsibility. Carrier metadata and configured content verification retain their own checks. See [lifecycle.go](../pkg/sandbox/lifecycle.go) and [restore.go](../pkg/restore/restore.go).
 
-### 3.3 Strict encoding 与 limits
+<a id="33-strict-encoding-与-limits"></a>
 
-Portable config 使用 deterministic YAML marshal 和 strict known-fields parse. Reader 拒绝 unknown field、unknown version、duplicate key、YAML alias/merge key、多 document、非法 ref 和 non-canonical bytes.
+### 3.3 Strict encoding and limits
+
+Portable configuration uses deterministic YAML marshaling and strict known-fields parsing. The artifact reader rejects unknown fields/versions, duplicate keys, YAML aliases/merge keys, multiple documents, invalid refs, and noncanonical bytes. The schema parser alone accepts valid noncanonical YAML; `sandboxfile.Open` enforces canonical byte equality after re-marshaling.
 
 V1 limits:
 
@@ -444,11 +448,15 @@ V1 limits:
 | Total artifact refs | 256 |
 | Data disks | 8 |
 
-`<run_dir>/sandbox.runtime.cfg` 用 same-directory temp、0600、file fsync、rename 和 directory fsync 写入. 同一 lifecycle 只允许 write once;已存在且 bytes 不相同会失败.
+These limits apply together: strict YAML's 64 KiB scalar-byte limit also applies to a file's inline `content` scalar; the separate 256 KiB per-file bound does not override it.
 
-### 3.4 C0、C1 与 source binding
+`<run_dir>/sandbox.runtime.cfg` is written using a same-directory temporary file, mode 0600, file fsync, no-replace rename, and directory fsync. The lifecycle baseline is write-once: any existing final path causes failure, even if its bytes would match. This is stricter than merely rejecting different bytes. See [portable.go](../pkg/config/portable.go).
 
-`C0` 是一次 run lifecycle 的 immutable portable baseline:
+<a id="34-c0c1-与-source-binding"></a>
+
+### 3.4 C0, C1, and source binding
+
+`C0` is the immutable portable baseline of one run lifecycle:
 
 ```text
 explicit cold config + persistent fields + canonical identities
@@ -464,29 +472,31 @@ S.sandbox_ref -> E.sandbox.runtime.cfg
   + allowed restore host bindings = C0 for run --restore
 ```
 
-`C0` 在 VM side effect 前写入 run directory,之后字节不变. Live runtime 另持有不序列化的 `RunSourceBinding`:
+C0 is written in the run directory before VM side effects and its bytes remain unchanged thereafter. The live runtime separately holds a nonserialized `RunSourceBinding`:
 
-- current `self` 对应的 source E/root artifact;
-- root payload 与 optional image config;
-- resolved local path/source directory;
-- Bundle reader/fetcher/source refs;
-- named ref locations;
-- host-only disk bindings和当前 active diff.
+- The source E/root artifact corresponding to the current `self`.
+- Root payload and optional image configuration.
+- Resolved local path/source directory.
+- Bundle reader/fetcher/source refs.
+- Named ref-locations.
+- Host-only disk bindings and current active diffs.
 
-Memory restore另持有 `MemorySourceBinding`,其中 Snapshot S identity 与 `from_refs` 只管理 memory provenance.
+Memory restore additionally holds `MemorySourceBinding`; its Snapshot S identity and `from_refs` manage memory provenance only.
 
-`C1 = Export(C0, disks at T)` 只写入新 E. `export --resume` 和 `snapshot --resume` 不修改 C0、active diff、lower graph 或 memory parent. 因此同一 VM 可以产生 `E1@T1` 和 `E2@T2`,同时继续使用原 C0 + writable diffs.
+`C1 = Export(C0, disks at T)` is written only to a new E. `export --resume` and `snapshot --resume` do not change C0, active diffs, the lower graph, or memory parents. The same VM can therefore produce `E1@T1` and `E2@T2` while continuing to use its original C0 and writable diffs.
 
-### 3.5 `self` 与 disk provenance
+<a id="35-self-与-disk-provenance"></a>
 
-Portable graph 必须恰好出现一次保留值 `self`,且只能位于:
+### 3.5 `self` and disk provenance
+
+The portable graph must contain the reserved value `self` exactly once, and only at:
 
 ```text
 boot.root.base
 boot.root.overlay.base
 ```
 
-Data disk 和所有 `base_from_refs` 禁止 `self`. 三种合法 root 关系:
+Data disks and every `base_from_refs` list must not contain `self`. Three root relationships are valid:
 
 ```yaml
 # Direct EROFS Sandbox E.
@@ -507,29 +517,29 @@ root:
   base_from_refs: []
 ```
 
-`run --from` 通过 source binding 把 `self` 绑定到当前 E payload. Export C1 先把 C0 的旧 `self` 物化为原 source ref,再把新 root payload 位置设为 `self`;这避免 E digest 自引用循环.
+`run --from` binds `self` to the current E payload through source binding. When exporting C1, it first materializes C0's old `self` as the original source ref, then sets the new root payload position to `self`. This avoids a self-referential E digest cycle.
 
-`run --from --replace-boot` 不建立 source binding. 来源 E 在读取 non-boot defaults 后即不再参与 run；新的 root active writable layer 经普通 explicit-cold projection 占据唯一 `self`. 后续 export/snapshot 因此不会把来源 E 当作 disk parent 或 dependency.
+`run --from --replace-boot` creates no source binding. After reading non-boot defaults, the source E no longer participates in the run. The new active writable root layer occupies the sole `self` through ordinary explicit-cold projection. Later export/snapshot therefore does not treat the source E as a disk parent or dependency.
 
-父 `.sandbox` 出现在 disk-ref 字段时只提供 `Payload`:
+When a parent `.sandbox` occurs in a disk-ref field, it supplies only `Payload`:
 
-- ext4 upper/lower 或 data disk:忽略其 `sandbox.runtime.cfg` 和 `config.json`.
-- root EROFS base:block backend 仍只消费 Payload;host 可以读取 optional `config.json` 作为 image defaults,但绝不采用父 E 的 portable config.
+- For an ext4 upper/lower layer or data disk, its `sandbox.runtime.cfg` and `config.json` are not adopted.
+- For a root EROFS base, the block backend still consumes only Payload. The host may read optional `config.json` for image defaults, but never adopts the parent E's portable configuration.
 
-当前 E 必须显式列出它真正依赖的 lower/data refs. Publisher 不因扩展名 `.sandbox` 而递归父 E 的 config graph.
+The current E must explicitly list the lower/data refs it actually depends on. The publisher does not recursively traverse a parent E's configuration graph merely because the extension is `.sandbox`.
 
-Local merge 分两类:
+Local merging has two categories:
 
-- Disk merge只作用于 E 的 sparse disk layers.
-- Memory merge只作用于 S 的 memory layers.
+- Disk merging operates only on E's sparse disk layers.
+- Memory merging operates only on S's memory layers.
 
-三态 sparse 语义保持 `Hole`、`Zero`、`Data`. Hole 只来自 authoritative metadata;不得扫描 zero bytes 发明 Hole.
+Three-state sparse semantics remain `Hole`, `Zero`, and `Data`. Holes come only from authoritative metadata; scanning zero bytes must not invent holes.
 
 ### 3.6 `.sandbox` logical format
 
-只接受两种 layout.
+Only two layouts are accepted.
 
-Live ext4/sparse root export:
+Live ext4/sparse-root export:
 
 ```text
 [root sparse payload]
@@ -538,7 +548,7 @@ Live ext4/sparse root export:
 ]
 ```
 
-Top-level Sandbox E direct EROFS layout:
+Top-level Sandbox E with a direct EROFS layout:
 
 ```text
 [EROFS payload]
@@ -548,21 +558,21 @@ Top-level Sandbox E direct EROFS layout:
 ]
 ```
 
-Image-to-Sandbox-E assembly定位原 `EROFS + ZIP(config.json)` 的 archive base,原样保留 EROFS prefix 和经过校验的 `config.json` bytes,然后重建一个 canonical two-entry ZIP. `ZIP(config.json) + ZIP(sandbox.runtime.cfg)` 是非法 double ZIP.
+Image-to-Sandbox-E assembly locates the archive base of the original `EROFS + ZIP(config.json)`, preserves the EROFS prefix and validated `config.json` bytes, then rebuilds one canonical two-entry ZIP. `ZIP(config.json) + ZIP(sandbox.runtime.cfg)` is an invalid double ZIP.
 
-Reader 从 ZIP structure 推导 `[0, archiveBase)` payload,不信任第二个 `payload_size`. Strict ZIP contract:
+The reader derives payload `[0, archiveBase)` from ZIP structure and does not trust a second `payload_size`. The strict ZIP contract requires:
 
-- EOCD 必须位于 logical EOF且 comment 为空;
-- 拒绝 ZIP64 和 multi-disk ZIP;
-- exact entry set只能是 `{sandbox.runtime.cfg}` 或 `{config.json,sandbox.runtime.cfg}`;
-- duplicate、unknown、directory、path traversal entry 均拒绝;
-- method固定 Store;
-- fixed order/time/metadata;
-- entry size有界;
-- CRC、local header、central header必须一致;
-- malformed/truncated input在 VM side effect 前失败.
+- EOCD at logical EOF with an empty comment.
+- No ZIP64 or multidisk ZIP.
+- Exactly `{sandbox.runtime.cfg}` or `{config.json,sandbox.runtime.cfg}`.
+- No duplicate, unknown, directory, or path-traversal entries.
+- Store compression method.
+- Fixed order, timestamps, and metadata.
+- Bounded entry sizes.
+- Matching CRC, local-header, and central-header values.
+- Malformed/truncated inputs to fail before VM side effects.
 
-Opened root 提供:
+An opened root exposes the following views; the actual type also carries parsed configuration and archive-boundary bookkeeping:
 
 ```go
 type Root struct {
@@ -573,9 +583,9 @@ type Root struct {
 }
 ```
 
-`Payload` 是保留 sparse `RunAt`/`ReadAt` 的 section view. Shared close owner保证 FullStream/Payload/Root 任一 close 最终只释放 carrier 一次. Vhost 只能看到 Payload,不能看到 ZIP tail.
+Payload is a section view preserving sparse `RunAt`/`ReadAt`. A shared close owner ensures that closing FullStream, Payload, or Root ultimately releases the carrier exactly once. Vhost sees only Payload, never the ZIP tail.
 
-Live BlockCOW SnapshotView 是 upper-only sparse delta,ext4 superblock offset 可以是 Hole,所以不能要求每个 live payload独立通过 ext4 magic. Reader 校验 logical size、graph/self 关系和最终 composition. Direct EROFS payload则严格校验 EROFS logical size/magic.
+A live BlockCOW SnapshotView is an upper-only sparse delta. Its ext4-superblock offset can be a Hole, so not every live payload can be required to pass an independent ext4-magic check. The reader checks logical size, graph/self relationships, and the final composition. Direct EROFS payloads undergo strict EROFS logical-size/magic checks.
 
 ### 3.7 `.snapshot` logical format
 
@@ -590,7 +600,7 @@ Snapshot S layout:
 ]
 ```
 
-V1 `snapshot.cfg` 完整 schema只有:
+The complete V1 `snapshot.cfg` schema is only:
 
 ```yaml
 version: 1
@@ -599,49 +609,55 @@ from_refs:
   - file://<parent>.snapshot@digest:<digest>
 ```
 
-`sandbox_ref` 指向同一 freeze point 生成的 E. `from_refs` 是 top-to-bottom memory parent chain. S 不重复 capacity、runtime、root/data graph、launch、mounts、files、init 或 metadata.
+`sandbox_ref` points to the E produced at the same freeze point. `from_refs` is the top-to-bottom memory-parent chain. S does not duplicate capacity, runtime, root/data graphs, launch, mounts, files, init, or metadata.
 
-Snapshot ZIP 与 config 同样 strict、bounded、canonical. 旧 disk-schema input 返回 `unsupported snapshot format/version`,不 dual-read、不 migration、不 cold fallback.
+Snapshot ZIP and configuration are also strict, bounded, and canonical. Old disk-schema inputs return `unsupported snapshot format/version`; there is no dual-read, migration, or cold fallback.
 
-### 3.8 files、env 与 ephemeral
+<a id="38-filesenv-与-ephemeral"></a>
 
-Cold launch merge:
+### 3.8 Files, environment, and ephemeral data
+
+Cold-launch merging:
 
 ```text
 files < ephemeral_files       # same path: ephemeral wins
 launch.env < ephemeral_env    # same key: ephemeral wins
 ```
 
-每个 files 列表内部 duplicate path 都拒绝. Persistent `files` 和 `launch.env` 进入 C0/C1;ephemeral 字段不进入 Portable schema.
+Duplicate paths within either files list are rejected. Persistent `files` and `launch.env` enter C0/C1; ephemeral fields do not enter the Portable schema.
 
 Runtime semantics:
 
-- `files` 由 sandbox-init 使用 tmpfs backing + bind 注入.
-- Export 保存 file declaration,不保存 injected file 的运行期修改.
-- `run --from` 再次注入 persistent files,并再次应用 persistent env.
-- `ephemeral_files` 和 `ephemeral_env` 只影响当前 cold invocation.
-- Ephemeral 不表示从 memory snapshot 中擦除;RAM 仍可能含其内容.
-- disk-backed `type: empty` volume随所属 root/data disk export.
-- `type: tmpfs` 内容不随 export.
-- `init` 在 `run --from` 时重新执行.
-- plugin/app 按 cold semantics 重新启动.
-- `run --restore` 不重跑 launch/files/init/plugin.
+- sandbox-init injects `files` using tmpfs backing and bind mounts.
+- Export saves file declarations, not runtime modifications to injected files.
+- `run --from` reinjects persistent files and reapplies persistent environment.
+- `ephemeral_files` and `ephemeral_env` affect only the current cold invocation.
+- Ephemeral does not mean erased from a memory snapshot: RAM can still contain the data. If the guest copies it into an exported disk-backed file, excluding the declaration also does not erase that copy.
+- Disk-backed `type: empty` volumes export with their owning root/data disk.
+- `type: tmpfs` contents do not accompany export.
+- `init` reruns on `run --from`.
+- Plugins/apps restart with cold semantics.
+- `run --restore` does not rerun launch/files/init/plugin.
 
-Restore host若显式提供 `boot.cmdline`、launch persistent/ephemeral fields、mounts、files/ephemeral_files、init 或 metadata,会在副作用前拒绝,而不是静默忽略. `resources.startup` 是 host-only node policy,可在 restore 时提供;它写入 node reservation contract,但 Snapshot 捕获的 `BudgetAtSnapshot` 仍是 restore initial Budget 的权威值.
+If the restore host explicitly supplies `boot.cmdline`, persistent/ephemeral launch fields, mounts, files/ephemeral_files, init, or metadata, validation rejects them before side effects instead of silently ignoring them. `resources.startup` is host-only node policy and may be supplied on restore. It is included in the node reservation contract, but the Snapshot's captured `BudgetAtSnapshot` remains authoritative for the initial restore Budget.
 
-## 4. 资源模型
+<a id="4-资源模型"></a>
 
-### 4.1 三种部署模式
+## 4. Resource model
+
+<a id="41-三种部署模式"></a>
+
+### 4.1 Three deployment modes
 
 | Mode | `cgroup_path` | `controller` | Behavior |
 |---|---|---|---|
-| No cgroup | empty | empty | 不写 cgroup;allocatable 必须与 capacity 约束一致 |
-| Static cgroup | set | empty | 本地设置 CPU/memory limit,可运行 local sensor |
-| Dynamic | set | set | 通过 resource protocol admission/lease/Budget,并运行 local sensor |
+| No cgroup | Empty | Empty | No cgroup writes; allocatable CPU must equal capacity CPU, and allocatable memory must remain within capacity |
+| Static cgroup | Set | Empty | Configure local CPU/memory limits and optionally run the local sensor |
+| Dynamic | Set | Set | Use resource-protocol admission/leases/Budget and run the local sensor |
 
-`resources.capacity` 是 guest-visible VM capacity,进入 Portable config. `resources.allocatable` 是 cold start 的 workload 默认值,也进入 Portable config;其中 `allocatable.cpu` 必须是有限数,且满足 `0 < allocatable.cpu <= capacity.cpu`. Restore 保持 E 中的 capacity 和已捕获的 `deflate_on_oom`,但可以从目标节点显式重新应用 allocatable CPU/memory;该运行时 policy 不改写 E 或 C0. `control`、`overhead`、`watermark_high` 和 `startup` 是 node policy,不进入 E.
+`resources.capacity` is guest-visible VM capacity and enters Portable configuration. `resources.allocatable` is the cold-start workload default and also enters Portable configuration. `allocatable.cpu` must be finite and satisfy `0 < allocatable.cpu <= capacity.cpu`. Restore retains capacity and the captured `deflate_on_oom` from E, but can explicitly reapply the destination node's allocatable CPU/memory. This runtime policy does not rewrite E or C0. `control`, `overhead`, `watermark_high`, and `startup` are node policy and do not enter E.
 
-Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Host ping gate 会让已入场探测完成 `pong` + guest EOF transport barrier;该排空独立受 8 s quiesce budget 约束,即使普通 `timeouts.ping` 关闭强制超时也不会无限阻塞捕获. 到期时 host cancel并join该探测,捕获失败后走完整 recovery. Guest quiesce 还会排空并暂停周期 `mem_report`,防止 S 捕获持有 stream lock、仍等待旧 host vsock 的 reporter. Restore 在 ACK 前切换到新 observation epoch;`--resume`/失败 attach 恢复原 epoch,live attach只重开pause gate且不破坏已入场报告的计数. Recovery 在 VM、MUX、app 和 backend 恢复后释放 host barrier.
+Export/snapshot acquires the MemoryController mutation barrier and, before freezing, lifts and drains any `memory.high` operation that could race with CH pause. The host ping gate lets an admitted probe complete both `pong` and the guest-EOF transport barrier. This drain has its own 8-second quiesce budget; capture cannot wait forever merely because ordinary `timeouts.ping` has no forced timeout. On expiry, the host cancels and joins the probe, and failed capture enters full recovery. Guest quiesce also drains and pauses periodic `mem_report`, preventing S from capturing a reporter that holds the stream lock while waiting on the old host vsock. Restore switches to a new observation epoch before ACK; `--resume` and failed-capture attach recover the original epoch. A live attach only reopens the pause gate and does not corrupt accounting for already admitted reports. Recovery releases the host barrier after VM, MUX, app, and backends recover.
 
 ### 4.2 Memory terms
 
@@ -653,87 +669,97 @@ Budget              = admitted/locally enforced working allowance
 VMM memory.max      = CapacityMemory + host overhead
 ```
 
-Memory S capture记录 CH config/state 和 memfd sparse content;资源 policy 不写入 `snapshot.cfg`. Restore capacity identity来自 E,host若显式给出必须一致. Allocatable CPU/memory、`startup`、`overhead`、`watermark_high` 和 resource controller binding来自当前 host;`deflate_on_oom` 保持与已捕获 VMM state 一致;Snapshot 中的 `BudgetAtSnapshot` 仍是 restore initial Budget 的权威值.
+Memory S capture records CH configuration/state and sparse memfd content. Resource policy is not written to `snapshot.cfg`. Restore obtains capacity identity from E, and any explicitly supplied host capacity must match. Allocatable CPU/memory, `startup`, `overhead`, `watermark_high`, and resource-controller bindings come from the current host. `deflate_on_oom` must remain consistent with captured VMM state. The Snapshot's `BudgetAtSnapshot` remains authoritative for the initial restore Budget.
 
-### 4.3 CPU 与 balloon
+<a id="43-cpu-与-balloon"></a>
 
-Capacity CPU 决定 vCPU topology. Allocatable CPU 在 cgroup 模式映射为 `cpu.weight`;无 cgroup时不能表达 fractional CPU. Balloon current state由 CH restore state权威恢复,host不从 S 发明第二个 balloon state.
+### 4.3 CPU and balloon
 
-## 5. Cold start 与 `run --from`
+Capacity CPU determines vCPU topology. In cgroup mode, allocatable CPU maps to `cpu.weight`; without a cgroup it must equal capacity CPU, so a separate fractional allocation cannot be expressed. CH restore state authoritatively restores the current balloon state; the host does not invent another balloon state from S.
 
-### 5.1 显式 cold start
+<a id="5-cold-start-与-run---from"></a>
 
-普通 `run --config` 的 preflight 顺序:
+## 5. Cold start and `run --from`
+
+<a id="51-显式-cold-start"></a>
+
+### 5.1 Explicit cold start
+
+The ordinary `run --config` preparation and launch sequence is:
 
 ```text
 T0 parse/merge/validate config and limits
-T1 open and verify immutable refs, kernel/runtime identities and image defaults
+T1 open/check immutable refs and image defaults; derive kernel/runtime identities
 T2 project portable C0 and validate exactly one self
-T3 prepare active diffs and source binding
-T4 atomically write <run_dir>/sandbox.runtime.cfg once
-T5 acquire controller/cgroup/network resources
+T3 preflight active diff requirements and source binding
+T4 create run directory and atomically write sandbox.runtime.cfg once
+T5 acquire controller/cgroup resources; materialize active diffs and network binding
 T6 construct vhost block devices from payload-only streams
 T7 spawn/configure CH
 T8 launch sandbox-init spec and app
 T9 establish MUX/pinger/forward/resource lifecycle
 ```
 
-所有可预测的 config/ref/identity/format 错误应在 T4 之前或最迟在任何 external side effect 前返回.
+Predictable config/ref/format failures are intended to fail in preflight before controller/network/VM side effects. This does not promise that every later operation is side-effect-free: creating the run directory, writing C0, creating diffs, and acquiring resources are explicit subsequent steps that can fail and require cleanup. Kernel/runtime verification differs for an existing portable C0 as explained in §3.2.
 
-### 5.2 CH command line boundary
+### 5.2 CH command-line boundary
 
-Cold start 用 host-bound kernel/runtime paths、memfd、vhost sockets、active diffs 和 optional net provider构建 CH argv. Portable config从不保存这些绝对 path/fd.
+Cold start constructs CH argv from host-bound kernel/runtime paths, memfd, vhost sockets, active diffs, and an optional network provider. Portable configuration never stores these absolute paths/fds.
 
-Block devices只绑定 logical Payload:
+Block devices bind only logical Payload:
 
-- Container image或 direct EROFS E:EROFS prefix only.
-- Parent E作为 ext4 layer:E root payload only.
-- Current run-from E:self resolves to E payload section only.
-- ZIP tail永不暴露给 vhost.
+- Container image or direct EROFS E: EROFS prefix only.
+- Parent E as an ext4 layer: its root payload only.
+- Current run-from E: `self` resolves only to the E payload section.
+- The ZIP tail is never exposed to vhost.
 
-CH stdin固定 `/dev/null`;console output由 sandbox-ctl bridge. Net provider为 TAP 或 TapFD,而 portable topology只说明 NIC是否存在和 interface name.
+CH stdin is fixed to `/dev/null`; sandbox-ctl bridges console output. The network provider is TAP or TapFD; portable topology records only NIC presence and interface name.
 
 ### 5.3 `run --from` rules
 
-`ApplyFromRules` 使用 YAML field presence执行 ownership:
+`ApplyFromRules` applies ownership using YAML field presence:
 
 | Owner | Fields |
 |---|---|
-| Artifact strong | root/data immutable graph, disk count/order/name, topology, self position, cmdline |
-| Host strong | kernel/runtime actual path, active diff/template, cgroup/controller, network provider, timeout, manifest/crypto/ref-location, CH binary |
-| Persistent override allowed | resources workload defaults, launch, mounts, files, init, metadata |
+| Artifact strong | Immutable root/data graph, disk count/order/name, topology, self position, cmdline |
+| Host strong | Actual kernel/runtime paths, active diff/template, cgroup/controller, network provider, timeouts, Manifest/crypto/ref-location, CH binary |
+| Persistent override allowed | Resource workload defaults, launch, mounts, files, init, metadata |
 | Instance-only | IP/MAC/hostname, ephemeral files/env, stdio/forward |
 
-受保护字段有冲突时明确报出 field context. Host不能通过省略或 YAML merge静默改变 disk graph. Persistent `mounts` 可以修改普通 tmpfs/empty mount 的声明,但 data-disk mount 的 source、target、name 和 order 必须保持 artifact topology,不能借 mount override移动磁盘.
+Conflicts with protected fields return explicit field context. Hosts cannot silently change disk graphs through omission or YAML merging. Persistent `mounts` may change ordinary tmpfs/empty declarations, but data-disk mount sources, targets, names, and order must retain artifact topology. A mount override cannot move a disk.
 
-Network必须满足:
+Networking must satisfy:
 
 ```text
 portable network.enabled == host provider presence
 portable interface       == explicitly supplied host interface
 ```
 
-Direct EROFS E只有 read-only image. 目标 host必须提供 pre-formatted `diff_template`,或已格式化的 explicit diff. 缺少可挂载 upper时在 controller/network/CH side effect 前失败.
+A direct EROFS E contains only a read-only image. The destination host must supply a preformatted `diff_template` or an explicitly bound, already formatted diff. A missing mountable upper fails before controller/network/CH side effects.
 
-最终调用普通 `sandbox.Run`;`run --from` 不进入 `restore.Run`.
+The final call is ordinary `sandbox.Run`; `run --from` does not enter `restore.Run`.
 
-默认 `run --from` 继续执行上述强 ownership rules. `--replace-boot` 只选择另一条显式、原子的 cold derivation:
+Default `run --from` continues to enforce these strong ownership rules. `--replace-boot` selects a separate, explicit, atomic cold derivation:
 
 ```text
-source E 的 non-boot portable defaults
+source E's non-boot portable defaults
   + presence-aware persistent overrides
-  + host config 的完整 boot 值
+  + the host configuration's complete boot value
   + host/instance-only bindings
   -> ordinary ValidateCold / artifact preflight / ProjectPortableCold
 ```
 
-完整 replacement 同时覆盖 `boot.kernel`、`boot.runtime`、`boot.cmdline`、`boot.root` 和整个 `boot.disks[]`;不存在 root-only 或 leaf-level graph merge. Host config 没有写 `boot.disks` 就表示零个 data disk，而不是继承来源 disks. 若来源 mounts 仍引用已移除或改名的 disk，调用方必须同时替换 mounts；普通 cold disk/mount 1:1 validation 会在 controller、cgroup、run directory、network 或 VM side effect 前拒绝不一致结果.
+Complete replacement covers `boot.kernel`, `boot.runtime`, `boot.cmdline`, `boot.root`, and the entire `boot.disks[]` together. There is no root-only or leaf-level graph merge. An omitted host `boot.disks` means zero data disks, not inheritance of the source disks. If inherited mounts still reference removed/renamed disks, the caller must also replace mounts. Ordinary cold disk/mount 1:1 validation rejects an inconsistent result before controller, cgroup, run-directory, network, or VM side effects.
 
-Replacement 不复用来源 E 的 kernel/runtime 默认 binding、`self`、`RunSourceBinding` 或 Bundle reader/fetcher. Host boot refs仍通过普通 cold canonicalization、local crypto、Manifest/Bundle lookup和preflight. 生成的新 C0及后续 E/S disk closure只依赖replacement boot. `--replace-boot` 必须与`--from`和显式`--config`（或`SANDBOX_CONFIG`）一起使用，且永远不能与`--restore`一起使用.
+Replacement does not reuse the source E's default kernel/runtime bindings, `self`, `RunSourceBinding`, or Bundle reader/fetcher. Host boot refs still undergo ordinary cold canonicalization, local crypto, Manifest/Bundle lookup, and preflight. The new C0 and subsequent E/S disk closure depend only on replacement boot. `--replace-boot` requires both `--from` and explicit `--config` (or `SANDBOX_CONFIG`) and can never be combined with `--restore`.
 
-## 6. Export 与 snapshot 数据流
+<a id="6-export-与-snapshot-数据流"></a>
 
-### 6.1 Output graph 与 commit point
+## 6. Export and snapshot data flow
+
+<a id="61-output-graph-与-commit-point"></a>
+
+### 6.1 Output graph and commit point
 
 Live export graph:
 
@@ -751,18 +777,21 @@ disk dependencies -> Sandbox E -> Snapshot S
                                   ^ operation root / alias commit
 ```
 
-Snapshot Bundle root Manifest是 S;Export Bundle root Manifest是 E. E、data/lower Manifest和 S memory dependencies属于同一个 planned Bundle graph. Writer emit metadata prefix前必须完成 admission、ordered source、parent copy和ref replacement plan.
+The Snapshot Bundle's root Manifest is S; the Export Bundle's root is E. E, data/lower Manifests, and S's memory dependencies belong to one planned Bundle graph. Before emitting the metadata prefix, the writer must complete admission, ordered source selection, parent copying, and the ref-replacement plan.
 
-### 6.2 Freeze sequence 与 failure recovery
+<a id="62-freeze-sequence-与-failure-recovery"></a>
 
-所有 predictable preflight在 guest freeze 前完成:
+### 6.2 Freeze sequence and failure recovery
+
+Predictable preflight work completes before guest freeze:
 
 ```text
-T0 output/manifest/local-crypto/ref/Bundle/merge/config/source preflight
+T0 output/Manifest/local-crypto/ref/Bundle/merge/config/source preflight
 T1 enter MemoryController/Budget mutation barrier
 T2 lock and lift/drain memory.high
-T3 pause pinger and gate new host exec/forward;guest drains exec/forward and mem_report, freezes app, syncs,
-   closes MUX;after quiesced+EOF host joins residual exec/forward handlers
+T3 pause pinger and gate new host exec/forward; guest drains exec/forward and
+   mem_report, freezes app, syncs, closes MUX; after quiesced+EOF the host
+   joins residual exec/forward handlers
 T4 pause CH, quiesce all block backends
 T5 capture every data disk exactly once
 T6 build C1 from immutable C0 + source binding + captured disk refs
@@ -776,7 +805,7 @@ T8 commit E last
 T9 destroy, or --resume backend -> CH -> MUX/pinger/forward -> app -> barrier
 ```
 
-Snapshot continues in the same T4 freeze:
+Snapshot continues within the same T4 freeze:
 
 ```text
 T8  CH /vm.snapshot -> config.json/state.json
@@ -786,26 +815,25 @@ T11 commit S last
 T12 destroy, or --resume full recovery
 ```
 
-Export固定不执行 drop_caches,不调用 `/vm.snapshot`,不读取 CH snapshot files或 memfd. Snapshot只读取一次 disks,不会先为 E捕获一次再走旧 disk path第二次.
+Export never drops caches, invokes `/vm.snapshot`, or reads CH snapshot files or memfd. Snapshot reads disks once, rather than capturing them once for E and a second time through an old disk path.
 
-BlockCOW SnapshotView只在 backend quiesced时稳定. V1在整个 sink read窗口保持 VM paused;不能恢复 VM后继续读取 view.
+BlockCOW SnapshotView is stable only while the backend is quiesced. V1 keeps the VM paused throughout sink reads; the VM cannot resume while the sink continues reading that view.
 
 Failure semantics:
 
-- Data artifacts/E可能成为 content-addressed orphan,由正常 GC回收.
-- Root alias只在 E或S成功后提交.
-- `--resume` success/failure按 backend -> CH -> MUX -> pinger/forward -> app -> resource barrier恢复.
-- `attach` ACK不明确时host幂等重试一次;若仍不能重建MUX,该capture变为terminal failure,host在memory/memory.high guards仍持有时请求VMM shutdown,再以SIGTERM/SIGKILL有界兜底. 失败不会留下可接受新请求但guest仍冻结的VM.
-- 默认destroy也等待CH退出;`/vmm.shutdown`失败或超时后使用SIGTERM/SIGKILL有界兜底,然后才释放lifecycle guards.
-- C0、active diff和live lower graph保持不变.
-- Partial files使用 same-directory temp并清理.
+- Data artifacts/E can remain as content-addressed orphans. Reclamation belongs to the owning storage/retention policy; sandboxer does not promise automatic graph-aware collection of local output or a shared location.
+- The root alias is committed only after E or S succeeds.
+- `--resume` recovery after success or failure follows backend → CH → MUX → pinger/forward → app → resource barrier.
+- With an ambiguous attach ACK, the host retries the idempotent operation once. If it still cannot establish MUX, capture becomes a terminal failure. While retaining memory/`memory.high` guards, the host requests VMM shutdown and uses bounded SIGTERM/SIGKILL fallback. It does not leave a VM that accepts new requests while the guest remains frozen.
+- Default destruction also waits for CH exit. Failed or timed-out `/vmm.shutdown` falls back to bounded SIGTERM/SIGKILL before lifecycle guards are released.
+- C0, active diffs, and the live lower graph remain unchanged.
+- Local capture uses same-directory temporary files and cleans failed partial output. Named-location publication has its separate ownership-checked cleanup rules in §11.2.
 
 ### 6.3 `ctl.sock` protocol
 
-socket 固定位于 `RunRoot/PathID/ctl.sock`；PathID 省略时等于 SandboxID。
-PathID 是 host-side 定位参数，不进入以下 wire request：
+The socket is always `RunRoot/PathID/ctl.sock`; omitted PathID defaults to SandboxID. PathID is a host-side locator and does not enter the wire request.
 
-Snapshot和export使用独立 request type:
+Snapshot and export use distinct request types:
 
 ```text
 snapshot_request -> snapshot_done | error
@@ -813,13 +841,13 @@ export_request   -> export_done   | error
 exec_request     -> exec_ack      | error
 ```
 
-Export不是 `snapshot_request{memory:false}`. Request在 run process中执行,因此可以复用当前 lifecycle barrier、guest/MUX gate、CH API socket和live vhost SnapshotView.
+Export is not `snapshot_request{memory:false}`. Requests execute in the run process, reusing its lifecycle barrier, guest/MUX gate, CH API socket, and live vhost SnapshotView.
 
-Response中的 secret不回显. Remote Manifest upload可以耗时较长,CLI `--timeout=0` 表示不设置 operation deadline;context cancel仍中断 read/write.
+Responses do not echo secret values. Remote Manifest uploads may take a long time. CLI `--timeout=0` imposes no operation deadline; operation contexts still govern cancellable I/O. A local snapshot/live-export CLI timeout bounds its ctl connection wait and is not a server-side deadline field in the wire request; callers must not interpret a timed-out CLI as proof that no artifact was committed.
 
 ### 6.4 Image-to-Sandbox-E assembly
 
-输入必须是 flattened `EROFS + ZIP(config.json)`,不能是已包装 `.sandbox`. 流程:
+Input must be a flattened `EROFS + ZIP(config.json)`, not an already wrapped `.sandbox`:
 
 ```text
 open carrier -> validate flattened image -> retain config.json bytes
@@ -828,7 +856,7 @@ rebuild EROFS + ZIP(config.json,sandbox.runtime.cfg)
 emit local/Manifest/Bundle E -> commit E root
 ```
 
-它不创建 VM、不需要 freeze,但仍执行 portable identity、limits、carrier admission和output atomicity检查。CLI 是 package API 的薄包装：
+This creates no VM and needs no freeze, but still validates portable identities, limits, carrier admission, and output atomicity. The CLI is a thin wrapper around package APIs:
 
 ```text
 OpenFlattenedImage
@@ -837,18 +865,13 @@ OpenFlattenedImage
   -> caller-selected direct publisher
 ```
 
-`AssembleSandboxE` 不创建完整中间 `.sandbox`。它借用调用者持有的
-`FlattenedImage`，保留 payload 的 Hole/Zero/Data map 和 byte-for-byte `config.json`，
-只追加 canonical `sandbox.runtime.cfg`。context cancellation 可中断 open、config
-ref canonicalization、image validation 和后续 sink consumption。malformed image、JSON
-或 portable config 在发布 root ref 前 fail closed。嵌入式多任务进程不得通过修改全局
-`MANIFEST_KEY` 切换租户；它应以 `NewProcessStorageWithCustomerKey` 传入 task-scoped
-resolver。`ProcessStorage` 至多求值一次并为其拥有的 fetch、ingest 与 local codec 固定
-同一个 customer key。
+`AssembleSandboxE` does not create a complete intermediate `.sandbox`. It borrows the caller-owned `FlattenedImage`, preserves the payload's Hole/Zero/Data map and byte-for-byte `config.json`, and appends canonical `sandbox.runtime.cfg`. Context cancellation can interrupt opening, configuration-ref canonicalization, image validation, and later sink consumption. Malformed image, JSON, or portable configuration fails closed before a root ref is published. Embedded multitask processes must not switch tenants by changing global `MANIFEST_KEY`; they should pass a task-scoped resolver through `NewProcessStorageWithCustomerKey`. `ProcessStorage` evaluates it at most once and fixes the same customer key for its fetch, ingest, and local-codec operations.
 
-## 7. Memory restore 数据流
+<a id="7-memory-restore-数据流"></a>
 
-`run --restore S` 只处理真正的 memory Snapshot:
+## 7. Memory restore data flow
+
+`run --restore S` handles only genuine memory Snapshots:
 
 ```text
 T0 parse host config with presence
@@ -856,30 +879,30 @@ T1 open carrier and strict-parse S
 T2 parse canonical snapshot.cfg
 T3 open S.sandbox_ref and strict-parse E
 T4 apply restore host-only rules to E config -> immutable lifecycle C0
-T5 verify kernel/runtime/ref identities and every disk source
+T5 preflight kernel binding, compare runtime identity, and check disk sources
 T6 atomically write run-dir C0
 T7 bind self and reconstruct root/data disks from E
 T8 create memfd and layer S.memory over S.from_refs
 T9 create UFFD/va_report endpoints and CH restore argv
 T10 start CH from config.json/state.json
-T11 transfer UFFD and complete restore handshake
+T11 transfer UFFD descriptor(s) and complete restore handshake
 T12 /vm.resume
 T13 establish restore MUX and resume original process
 T14 settle balloon/resource observation
-T15 start pinger,forward,sensor and steady lifecycle
+T15 start pinger, forwarder, sensor, and steady lifecycle
 ```
 
-Restore不会:
+Restore does not:
 
-- 从 `snapshot.cfg` 读取 disk graph;
-- 对 zero memory执行 cold start;
-- 重跑 init/files/launch/plugin;
-- 把 E的 `config.json` 当成新的 process launch request;
-- 更新 memory parent或C0作为 re-snapshot side effect.
+- Read a disk graph from `snapshot.cfg`.
+- Cold-start on zero memory.
+- Rerun init/files/launch/plugin.
+- Treat E's `config.json` as a new process-launch request.
+- Update memory parents or C0 as a re-snapshot side effect.
 
-Host-only允许项包括 network provider/current identity、cgroup/controller、allocatable CPU/memory 与 resource enforcement、kernel/runtime actual path、active diff/template、restore prefetch和timeouts. Immutable disk graph、capacity identity、`deflate_on_oom`、network topology由E拥有.
+Allowed host-only fields include the network provider/current identity, cgroup/controller, allocatable CPU/memory and resource enforcement, actual kernel/runtime paths, active diff/template, restore prefetch, and timeouts. E owns the immutable disk graph, capacity identity, `deflate_on_oom`, and network topology. The kernel re-hash exception and runtime-footer comparison are described in §3.2.
 
-从 S0 restore后:
+After restoring S0:
 
 ```text
 C0 = E0 portable config
@@ -890,89 +913,60 @@ next snapshot:
   S1 = memory self + from_refs=[S0,...] + sandbox_ref=E1
 ```
 
-从 explicit cold或E cold start后,memory parent为空. `snapshot --resume`不偷偷把 S1设为当前 parent.
+After an explicit cold start or cold start from E, the memory-parent list is empty. `snapshot --resume` does not silently make S1 the current parent.
 
 ### 7.1 Memory prefetch
 
-`restore.prefetch: memory` 是 host-only optimization,只预热当前 S memory self的 file page cache或Manifest chunks. 它不改变 sparse truth、fault ordering、C0、S或memory parents. 默认 `off`;不满足资格或invalid mode在副作用前失败.
+`restore.prefetch: memory` is a host-only optimization. It warms only the current S memory self's file page cache or Manifest chunks. It changes neither sparse truth, fault ordering, C0, S, nor memory parents. The default is `off`. An invalid configured mode fails validation before side effects; lack of prefetch capability or a prefetch I/O failure is best-effort and does not fail restore. It is logged and restore continues on demand. The asynchronous task is canceled and joined before its streams close. See [prefetch.go](../pkg/restore/prefetch.go).
 
 ## 8. UFFD handler
 
-Memory restore使用一个 memfd和一个 userfaultfd管理 CH memory zone. S self及`from_refs`被打开为 layered sparse source;top resident data覆盖lower,top Hole向parent fall through,Zero仍是显式zero.
+Memory restore uses one shared memfd and a host handler that adopts CH-side userfaultfd descriptors. CH can report multiple regions of the same memory zone, for example when x86 RAM is split around the PCI hole; those descriptors share the handler's epoll set and address map. S self and `from_refs` are opened as a layered sparse source: resident top-layer data overrides lower layers, a top Hole falls through to its parent, and Zero remains explicit zero.
 
 ### 8.1 Single UFFD contract
 
-CH为同一 restored memory mapping注册 missing-page events. Host通过 restore handshake接收 UFFD,并用 CH state中的memory zone bounds验证 fault address. 超界、重复协议或截断 source fail closed.
+The single-UFFD design means faults are handled on CH's mapping rather than registering a second UFFD on sandbox-ctl's backend mapping. It does not require exactly one CH descriptor for every layout. CH registers missing-page events for its restored memory regions; the host receives the descriptors through the restore handshake and validates region bounds and nonoverlap against the shared memfd address map. The first report starts the handler; later valid regions use `AddUffd`. Out-of-range faults, duplicate/invalid region registration, and truncated sources fail closed. See [serveandwait.go](../pkg/sandbox/serveandwait.go), [handler.go](../pkg/uffd/handler.go), and [addrmap.go](../pkg/uffd/addrmap.go).
 
 ### 8.2 Read path
 
-UFFD使用`fault 1 page + best-effort serial tail`两阶段填充. Fault worker先保证
-fault页完成,只有该页实际提交为`Loaded`后才能提交tail;每个handler最多保留一个tail
-reservation,并发fault在reservation busy时只处理fault页. Fault页不等待tail worker或
-tail ioctl,同时限制并发source I/O、共享buffer和guest population. `ChunkRun`为复用
-一次物理解码结果,会在urgent copy前完成下述buffered source read.
+UFFD uses two-stage population: one fault page followed by a best-effort serial tail. The fault worker first completes the fault page. It may submit the tail only after that page is actually committed as `Loaded`. Each handler retains at most one tail reservation; concurrent faults handle only their fault page when the reservation is busy. The fault page does not wait for a tail worker or tail ioctl. Concurrent source I/O, shared buffers, and guest population remain bounded. To reuse one physical decode result, `ChunkRun` completes the buffered source read described below before the urgent copy.
 
-填充上限按最终可见Run类型确定:
+Population bounds depend on the final visible Run type:
 
-| Run类型 | fault阶段 | tail阶段 | 单次fault总上限 |
+| Run type | Fault stage | Tail stage | Total maximum per fault |
 |---|---|---|---:|
-| `Hole`、`Zero`、`Released` | 1页`UFFDIO_ZEROPAGE` | 最多15页 | 16页/64 KiB |
-| ordinary `Data` | 读取并`UFFDIO_COPY` 1页 | deferred读取并填充最多15页 | 16页/64 KiB |
-| manifest `ChunkRun` | 一次读取包含fault页的最终可见chunk窗口,先单独填充fault页 | 先填fault后的suffix,成功后再填fault前的prefix | 1个当前可见chunk,最多1 MiB/256页 |
-| reclaimed `Loaded` | 只恢复当前页 | 无 | 1页 |
+| `Hole`, `Zero`, `Released` | One page via `UFFDIO_ZEROPAGE` | Up to 15 pages | 16 pages / 64 KiB |
+| Ordinary `Data` | Read and `UFFDIO_COPY` one page | Deferred read/population of up to 15 pages | 16 pages / 64 KiB |
+| Manifest `ChunkRun` | Read the final visible chunk window containing the fault once; populate the fault page separately first | Populate the following suffix, then the preceding prefix only after success | One current visible window, at most 1 MiB / 256 pages |
+| Reclaimed `Loaded` | Restore only the current page | None | One page |
 
-`ChunkRun`表示最终serving leaf是一个物理manifest chunk. Chunk是校验、解密和解压缩的
-最小单位,因此handler不再把它按ordinary Data的固定窗口反复读取. `SnapshotReader`
-仍只返回从fault offset开始的forward anchor;`StreamSnapshotSource`通过包内可选
-capability调用`fetch.ResolveChunkWindow`,以最终组合Stream的元数据把anchor扩展为
-同一物理chunk中包含fault的最大连续可见窗口. 解析不读取payload;上层Hole透明,
-上层Data或Zero、memory section末端以及不连续的同一lower chunk都会截断窗口,不能
-直接使用绕过overlay的物理chunk边界.
+`ChunkRun` means the final serving leaf is a physical Manifest chunk. A chunk is the unit of decryption/decompression and, when enabled, ordinary content verification. The handler therefore avoids repeatedly reading it through ordinary Data's fixed window. `SnapshotReader` still returns only a forward anchor starting at the fault offset. Through a package-local optional capability, `StreamSnapshotSource` calls `fetch.ResolveChunkWindow` and uses metadata from the final composed Stream to expand that anchor to the largest contiguous visible window containing the fault within the same physical chunk. Resolution reads no payload. Upper Holes are transparent; upper Data/Zero, the memory section's end, and discontinuous visibility of the same lower chunk all truncate the window. Physical chunk bounds must not bypass the overlay.
 
-Tail reservation在窗口解析及payload读取前取得. Busy时只按原anchor读取并填充当前
-4 KiB fault页;取得reservation后,handler把不大于1 MiB的窗口一次读入已有buffer.
-对完整可见chunk,这是一次精确的whole-chunk读取;若overlay截断可见性,source仍在
-内部按chunk完成必要的校验、解密和解压,handler只接收可安全填充的连续窗口. Fault
-worker从buffer中间取当前页执行urgent `UFFDIO_COPY`,tail worker先用一个batch填充
-fault后的邻接suffix;仅该batch完整成功时,再用一个batch填充fault前的邻接prefix.
-Tail执行前从fault邻接页向外重检state,最多缩短为首次不匹配前的连续邻接段;
-任一state冲突、partial completion或ioctl错误都会停止更远范围及后续阶段且不重试,
-所以单个`ChunkRun`最多发出1次urgent和2次tail copy.
+The tail reservation is acquired before window resolution or payload reads. If busy, only the current 4 KiB fault page is read/populated from the original anchor. With the reservation, the handler reads a window no larger than 1 MiB into its existing buffer once. For an entirely visible chunk within that bound, this is an exact whole-chunk read. If an overlay truncates visibility, the source still performs the necessary chunk-level decryption, decompression, and configured verification internally; the handler receives only the contiguous window that is safe to populate. The fault worker takes the current page from the middle of the buffer for urgent `UFFDIO_COPY`. The tail worker first fills the adjacent suffix with one batch; only if that batch succeeds completely does it fill the adjacent prefix with one batch. Before executing a tail, it rechecks states outward from the fault's adjacent page and truncates at the first mismatch. Any state conflict, partial completion, or ioctl error stops more distant population and later stages without retry. One `ChunkRun` therefore issues at most one urgent copy and two tail copies.
 
-普通Data handler在worker启动前分配64 KiB共享buffer,具有chunk window capability的
-manifest handler分配1 MiB,Cold `ZeroSource`不分配该buffer;fault和tail路径不扩容、
-不创建临时payload buffer,每个fault worker只持有固定4 KiB urgent buffer. 这是handler
-自身的零新增分配约束;source内部的Run对象、cache lease及partial-chunk decode
-allocation仍由`SnapshotReader`实现负责. Handler对
-非zero source只调用一次`SnapshotReader.RunAt`;可选chunk window resolver仅在
-accelerator内部继续执行metadata `Stream.RunAt`. Ordinary Data和zero-like run仍分别
-受64 KiB state boundary约束. `ChunkRun`双向候选只包含完整页,并在一次state读锁扫描中截断于
-fault两侧连续`PageState`、RAM末端及当前CH UFFD region;这些guest population边界不
-缩短已经获准的whole-chunk source read. 当前manifest chunk不大于1 MiB;超出上限或
-source不提供window capability时保持原forward anchor,不引入超大chunk专用路径.
+Before workers start, an ordinary Data handler allocates a 64 KiB shared buffer; a source with chunk-window capability uses 1 MiB. A cold `ZeroSource` allocates neither buffer. Fault/tail paths do not grow these buffers or allocate temporary payload buffers; each fault worker holds a fixed 4 KiB urgent buffer. This is a constraint on the handler's additional payload allocation, not on source internals: Run objects, cache leases, and partial-chunk decode allocations remain the `SnapshotReader` implementation's responsibility. The handler calls `SnapshotReader.RunAt` once for a nonzero source; the optional window resolver performs further metadata `Stream.RunAt` calls only within accelerator. Ordinary Data and zero-like runs remain limited by the 64 KiB state boundary. Bidirectional `ChunkRun` candidates contain complete pages only. One scan under the state read lock clips them to contiguous `PageState` on both sides, RAM bounds, and the current CH UFFD region. These guest-population boundaries do not shorten an already admitted whole-chunk source read.
 
-Tail对其连续有效范围只发出一次multi-page `UFFDIO_COPY`或
-`UFFDIO_ZEROPAGE`;`ChunkRun`的suffix和prefix各自最多一次. Kernel按页处理并可能
-返回已完成的page-aligned prefix;handler只把该prefix条件提交为`Loaded`,第一次冲突
-或错误后放弃剩余tail且不重试. 因此batch保留内核已完成的成功前缀,同时把普通
-16页策略的tail降为1次ioctl、完整`ChunkRun`的255页tail降为最多2次ioctl.
+Default CDC chunks have a 1 MiB maximum, but Manifest configuration can admit larger chunks within its decoded-format limit. The UFFD buffer/window cap remains 1 MiB regardless. An unavailable, invalid, or over-limit expanded window retains the original safe forward anchor; if a buffered window cannot fit, the handler makes urgent-page progress without allocating a larger buffer. No oversized-chunk-specific population path is introduced. See [fault.go](../pkg/uffd/fault.go) and accelerator's [chunker configuration](https://github.com/kuasar-sandbox/accelerator/blob/main/pkg/manifest/chunker/chunker.go).
 
-`EVENT_REMOVE`使已丢弃范围重新成为missing,tail提交使用条件状态更新,不能覆盖并发
-产生的`Released`. Context cancellation停止worker并关闭fd/stream owner.
+A tail issues a single multipage `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` for its contiguous valid range; `ChunkRun` suffix and prefix each issue at most one. The kernel processes pages individually and may return a completed page-aligned prefix. The handler conditionally commits only that prefix as `Loaded`, abandoning the remaining tail without retry after the first conflict/error. Batching therefore retains the successful kernel-completed prefix while reducing the ordinary 16-page policy's tail to one ioctl and a fully visible 256-page window's 255-page tail to at most two.
 
-## 9. cgroup 与 balloon
+`EVENT_REMOVE` makes discarded ranges missing again. Conditional tail-state updates must not overwrite concurrently produced `Released` state. Context cancellation stops workers and closes the owned descriptors/streams.
+
+<a id="9-cgroup-与-balloon"></a>
+
+## 9. Cgroups and balloon
 
 ### 9.1 Memory enforcement
 
-Static/dynamic cgroup模式在CH pause前lift可能竞争的`memory.high`,并等待已有high事件drain. Snapshot/export recovery恢复原值. VMM cgroup只承载CH进程,不把`sandbox-ctl`自身算入workload Budget.
+Static/dynamic cgroup modes lift a potentially competing `memory.high` before CH pause and wait for existing high events to drain. Snapshot/export recovery restores the previous value. The VMM cgroup contains CH, not sandbox-ctl itself; sandbox-ctl is not charged to that workload Budget.
 
 ### 9.2 CPU
 
-`capacity.cpu` 决定 vCPU count. `allocatable.cpu` 必须是有限正数且不大于 `capacity.cpu`;在cgroup模式映射到clamped `cpu.weight`. Controller可以在lifecycle内调整grant,但不会改写C0或artifact.
+`capacity.cpu` determines the vCPU count. `allocatable.cpu` must be finite, positive, and no greater than capacity CPU; cgroup mode maps it to a clamped `cpu.weight`. This weight is relative contention policy, not a hard fractional-core quota; the VMM's `cpu.max` is based on capacity. Controllers may adjust grants during a lifecycle but do not rewrite C0 or the artifact.
 
 ### 9.3 Balloon
 
-Balloon mutation与snapshot/export通过同一barrier序列化. Freeze window不会与async balloon resize并发. Restore以CH state为真实current,再进入新的observation epoch;不会用host YAML重建已恢复balloon瞬时值.
+Balloon mutations serialize with snapshot/export through the same barrier. The freeze window cannot overlap asynchronous balloon resize. Restore takes CH state as the actual current value, then enters a new observation epoch; host YAML does not reconstruct the restored balloon's instantaneous state.
 
 ## 10. Resource protocol
 
@@ -984,64 +978,64 @@ prepare -> admit -> start -> ready -> steady
 restore -> resume -> settle -> steady
 ```
 
-Controller lease、heartbeat和recovery inventory只管理host resource ownership,不进入Portable config.
+Controller leases, heartbeats, and recovery inventory manage only host resource ownership and do not enter Portable configuration.
 
 ### 10.2 Capture barrier
 
-Snapshot/export开始前阻止新的Budget mutation和balloon transition. 已在进行的mutation完成后才能freeze. Recovery必须在guest/app可继续运行后释放barrier,否则会出现resume后永久失去resource updates的liveness bug.
+Before snapshot/export, new Budget mutations and balloon transitions are blocked. Already running mutations must complete before freeze. Recovery releases the barrier only when the guest/app can continue; otherwise a liveness bug would permanently prevent resource updates after resume.
 
 ### 10.3 Pressure sensor
 
-Static/dynamic模式可使用PSI或`memory.events.local` polling. PSI默认trigger与debounce由host config决定,不写入E. Sensor在capture gate期间停止发起growth,restore后建立new observation epoch.
+Static/dynamic modes can use PSI or `memory.events.local` polling. Host configuration determines the PSI trigger and debounce; they are not written to E. The sensor stops initiating growth during the capture gate and establishes a new observation epoch after restore.
 
-## 11. Provenance、publish 与 carrier
+<a id="11-provenancepublish-与-carrier"></a>
 
-### 11.1 Disk 与 memory provenance
+## 11. Provenance, publication, and carriers
+
+<a id="111-disk-与-memory-provenance"></a>
+
+### 11.1 Disk and memory provenance
 
 ```text
 Disk provenance:   C0 + RunSourceBinding -> E/C1 disk graph
 Memory provenance: MemorySourceBinding   -> S/from_refs
 ```
 
-二者不共享schema. Re-snapshot可以独立merge disk layer或memory layer,不能借由一个旧`SnapshotConfig`同时修改两张graph.
+These use separate schemas. Re-snapshot can merge disk layers and memory layers independently; an old `SnapshotConfig` cannot be used to modify both graphs together.
 
-Snapshot/export的dependency planning只物化没有portable provenance的节点本地依赖. 远端
-`manifest://`保持原ref;已经located的file ref保持原ref;若logical Manifest来自located
-Bundle,则改写为该Bundle的canonical located `@manifest` selector. 因此Manifest-backed
-immutable root image不会在每次保存或发布快照时再生成一份`.overlay`,located parent chain
-也不会被复制到新的publication directory. 未located的本地tarstream或Bundle依赖仍在
-freeze前完整校验并物化,避免产生依赖调用节点私有路径的portable root. 其中immutable
-root carrier物化为`.image`;只有需要作为独立dependency保存的root/data writable layer物化为
-`.overlay`. 当前root writable top由Sandbox E payload承载,不生成第二份`.overlay`.
+Snapshot/export dependency planning materializes only node-local dependencies that lack portable provenance. Remote `manifest://` refs remain unchanged, as do already located file refs. If a logical Manifest comes from a located Bundle, its ref becomes that Bundle's canonical located `@manifest` selector. Consequently a Manifest-backed immutable root image is not duplicated as a new `.overlay` every time a snapshot is saved or published, and located parent chains are not copied into the new publication directory. Unlocated local tarstream/Bundle dependencies are still fully validated and materialized before freeze so the portable root does not depend on the calling node's private paths. Immutable root carriers materialize as `.image`; only root/data writable layers that must be retained as separate dependencies materialize as `.overlay`. The current writable root top is carried by Sandbox E's payload and does not produce another `.overlay`.
 
-### 11.2 Local tarstream 与 crypto
+<a id="112-local-tarstream-与-crypto"></a>
 
-Local immutable artifact支持 `crypto.local=off|auto|required`:
+### 11.2 Local tarstream and crypto
 
-- `off`:plaintext tarstream,identity `digest`.
-- `auto`:自动识别plaintext或KDXTS encrypted tarstream;新输出按配置codec.
-- `required`:拒绝plaintext和未绑定key的identity;identity使用`hmac`.
+Local immutable artifacts support `crypto.local=off|auto|required`:
 
-Existing-file reuse必须重新验证role、logical size、content identity和完整stream. Local output与named ref-location的commit策略刻意分离. Artifact capture/publication只定义logical completion,不定义stable-storage durability:local output依赖完整写入、`Close()`检查、内容寻址no-replace rename与alias atomic rename;named-location依赖`O_EXCL`写入、`Close()`检查、最终路径reopen/full verification与路径身份检查. 两者都不执行显式file/directory flush,物理写回由文件系统或底层存储实现定义.
+- `off`: plaintext tarstream, with `digest` identity.
+- `auto`: recognize plaintext or KDXTS-encrypted tarstreams; configured codec governs new output.
+- `required`: reject plaintext and identities not bound to the key; use `hmac` identity.
+
+The omitted policy defaults to `off`. With `auto` or `required`, storage construction resolves the customer key even for a file-only operation. No Manifest config means no local codec or lazy Manifest client; file-only operation does not by itself imply that configured crypto can omit its key. See [storage.go](../pkg/artifact/storage.go).
+
+Reusing an existing file requires revalidation of its role, logical size, content identity, and complete stream. Local output and named ref-location commit strategies are deliberately separate. Artifact capture/publication defines logical completion, not stable-storage durability. Local output relies on complete writes, checked `Close()`, content-addressed no-replace rename, and atomic alias rename. Named locations rely on exclusive creation, checked `Close()`, final-path reopening/full verification, and path-identity checks. Neither artifact-publication path explicitly flushes files/directories; physical writeback depends on the filesystem/storage implementation. This differs from the fsynced run-directory C0 write in §3.3.
 
 #### Local output
 
-`snapshot/export --output` 的 `FileSink` 在output directory中写unique same-directory temp,完整写入并检查`Close`错误,再以`renameat2(RENAME_NOREPLACE)`完成O(1) final commit. `BundleSink`同样以当前atomic no-replace rename提交完整Bundle;两条本地路径都不会为了final commit再读取并复制完整artifact. Root成功后,semantic alias用随机temporary symlink + atomic rename更新. Alias target和existing entry都以`NOFOLLOW`/`lstat` fail closed,不会把regular file或directory替换成symlink;commit由完整写入、`Close()`检查与atomic rename定义,不执行显式file/directory fsync. 因此local output要求节点本地filesystem提供这些atomic rename和symlink语义.
+For `snapshot/export --output`, `FileSink` writes a unique same-directory temporary file, completes all writes and checks `Close` errors, then uses `renameat2(RENAME_NOREPLACE)` for an O(1) final commit. `BundleSink` likewise commits a complete Bundle with an atomic no-replace rename. Neither path rereads and copies the entire artifact merely to commit it. After root success, a semantic alias is updated with a random temporary symlink and atomic rename. Alias targets and existing entries use `NOFOLLOW`/`lstat` checks that fail closed, refusing to replace regular files or directories with symlinks. Complete writes, checked `Close()`, and atomic rename define commit; there is no explicit artifact file/directory fsync. Local output therefore requires a node-local filesystem with these atomic rename and symlink semantics.
 
 #### Named ref-location
 
-`publish/upload-snapshot --to-ref-location`不复用`FileSink`或`BundleSink`. Tarstream carrier在自身marker中保存payload boundary和payload commitment;完整读取会用payload bytes复验该声明. 打开carrier后可直接提供identity. E/S只替换dense metadata tail时,carrier用旧payload commitment和新tail以O(tail)工作量推导新identity,不读取GiB级payload,也没有首次`io.Discard`编码. Location target取得carrier给出的scheme/digest后,以`O_CREATE|O_EXCL`直接创建`<digest>.image|overlay|sandbox|snapshot`;canonical encoding是shared target中的唯一完整write. `.image`承载immutable root image,`.overlay`只承载独立的writable disk dependency;Sandbox E payload不会重复发布为`.overlay`. Plaintext输出使用`@digest`,codec-backed输出使用`@hmac`. Target directory中没有完整temp/staging副本,也不创建`<sid>.sandbox`、`<sid>.snapshot`或任何其他semantic alias.
+`publish/upload-snapshot --to-ref-location` does not reuse `FileSink` or `BundleSink`. A tarstream carrier's marker records payload boundaries and a payload commitment. Reading the complete carrier verifies that declaration against payload bytes; opening the carrier already exposes its declared identity. When only E/S's dense metadata tail changes, the carrier combines the old payload commitment with the new tail to derive a new identity in O(tail) work. It does not read GiB-scale payloads just to derive this value or first encode to `io.Discard`. After obtaining the carrier's scheme/digest, the location target creates `<digest>.image|overlay|sandbox|snapshot` directly with `O_CREATE|O_EXCL`. Canonical encoding is the only complete write into the shared target. `.image` carries an immutable root image; `.overlay` carries only a separate writable-disk dependency. The Sandbox E payload is not published again as `.overlay`. Plaintext output uses `@digest`; codec-backed output uses `@hmac`. The target directory holds no complete staging copy for this tarstream path and creates no `<sid>.sandbox`, `<sid>.snapshot`, or other semantic alias.
 
-Fresh final固定`0644`. `tarstream.WriteTo`在唯一一次写入过程中检查source read和destination write,并重新产生与carrier预先提供值一致的scheme/digest;在owned write fd仍打开时以`lstat` + `SameFile`确认canonical path仍指向本次`O_EXCL`创建的inode,再执行`Close`. Publisher随后以`O_RDONLY|O_NOFOLLOW`重新打开并完整验证regular file、role/payload name、logical size、canonical tarstream、marker、codec、crypto policy、digest scheme/digest和完整sequential stream. Existing final走同一完整验证;验证成功后直接复用,inode和bytes不改变.
+Fresh finals have mode `0644`. During the sole write, `tarstream.WriteTo` checks source reads and destination writes, reproducing the carrier-provided scheme/digest. While the owned write fd is still open, `lstat` and `SameFile` confirm the canonical path still identifies the inode created by this invocation's `O_EXCL`. A metadata-only guard fd pins that inode across checked `Close`. The publisher then reopens with `O_RDONLY|O_NOFOLLOW` (also nonblocking so unexpected FIFOs cannot stall validation) and fully verifies regular-file type, role/payload name, logical size, canonical tarstream, marker, codec, crypto policy, digest scheme/digest, and the complete sequential stream. Path identity is checked again after validation. Existing finals undergo the same complete content validation; successful reuse does not change inode or bytes.
 
-Manifest Bundle不进入tarstream E/S重建路径. Carrier以root Manifest key提供`@manifest` identity;location target先强制验证所选Manifest closure、recorded admission、physical keys和crypto domain,再对same-directory依赖Bundle按顺序做exact byte copy,root `<key>.bundle`最后发布. 每个共享final仍只写一次,copy后重新打开、验证canonical Bundle/root并与source逐字节比较,最后在target fd上再次强制验证所选closure. 该路径不创建`.snapshot/.sandbox`替身,也不改写Bundle内的`snapshot.cfg`.
+Manifest Bundles do not enter the tarstream E/S rebuilding path. Their root Manifest key supplies `@manifest` identity. The location target first forces verification of the selected Manifest closure, recorded admission, physical keys, and crypto domain. It then performs ordered exact-byte copying of same-directory dependency Bundles and publishes the root `<key>.bundle` last. Each shared final is written once, reopened, validated as a canonical Bundle/root, and compared byte-for-byte with its source; the selected closure is strictly reverified through the target fd. This creates no `.snapshot`/`.sandbox` substitute and does not rewrite the Bundle's `snapshot.cfg`.
 
-Final path在write完成前会短暂可见. 正常consumer只能使用publisher成功返回的root ref;publisher仍按dependencies first、root last顺序发布. Concurrent publisher遇到partial final时重新打开并做有限、context-aware exponential-backoff验证;若writer在窗口内完成则复用. bounded retry后仍不完整或invalid时fail closed并提示显式cleanup/repair,不会删除unknown owner的path. Symlink、directory、FIFO和其他non-regular final同样拒绝且不删除. Publisher只在自身`O_EXCL`成功且path仍指向所记录inode时清理自己的失败写入;abandoned unknown final由显式cleanup/GC处理.
+The final path is briefly visible before writing finishes. Normal consumers must use only a root ref returned successfully by the publisher, which continues to publish dependencies first and root last. A concurrent publisher encountering a partial final reopens and validates it with bounded, context-aware exponential backoff. If the writer completes within that window, the final is reused. A still-incomplete or invalid final after bounded retries fails closed with an explicit cleanup/repair requirement; the publisher does not delete another owner's path. Symlinks, directories, FIFOs, and other nonregular finals are also rejected and preserved. Cleanup removes only a failed write for which this publisher successfully acquired `O_EXCL` and whose path still identifies the recorded inode. Abandoned finals of unknown ownership need explicit cleanup or an owning retention/GC policy.
 
 #### Single-root image/Sandbox Manifest Bundle
 
-`NewSingleRootBundlePublisher` 是已经组装好的 `RoleImage` 或 `RoleSandbox`
-`sparse.Source` 的 typed named-location sink。数据流是：
+`NewSingleRootBundlePublisher` is a typed named-location sink for an already assembled `RoleImage` or `RoleSandbox` `sparse.Source`:
 
 ```text
 logical source
@@ -1052,57 +1046,43 @@ logical source
   -> file://<root>.bundle@manifest:<root>#<location>
 ```
 
-该路径不生成 role tarstream，不上传 Manifest store，不创建
-`<root>.image`/`<root>.sandbox`，也不创建 BuildID/SandboxID semantic alias。Bundle
-只含这个 logical root 的 Manifest/chunks；root logical role由 typed调用点决定，reader
-仍以 strict image 或 Sandbox parser验证。existing same-key final必须与新生成 Bundle 的
-admission、root、crypto和exact bytes全部一致才可复用；并发writer使用与普通 named
-publication 相同的有限等待、exclusive-create和full validation
-协议收敛。失败或取消不返回 ref，并清理自身 target-directory temporary file与
-owned incomplete final。
+This path creates no role tarstream, uploads nothing to Manifest store, creates neither `<root>.image` nor `<root>.sandbox`, and creates no BuildID/SandboxID semantic alias. The Bundle contains only this logical root's Manifest/chunks. The typed call site determines the root's logical role, and the reader still applies the strict image or Sandbox parser. An existing same-key final may be reused only if its admission, root, crypto, and exact bytes all match the newly generated Bundle. Concurrent writers converge through the same bounded waiting, exclusive-create, and full-validation protocol as ordinary named publication. Failure/cancellation returns no ref and removes the publisher's target-directory temporary file and owned incomplete final.
 
-Tarstream 与 Bundle 都是 physical carrier，不是 logical role。Tarstream 包含单一
-role-specific payload 与 sparse envelope，使用 `@digest`/`@hmac` identity；Bundle
-包含 Manifest/chunk records、write admission与可选local encryption，使用
-`@manifest` root identity。single-root Bundle publication不得先建立 tarstream，反之也
-不得仅按 `.image`/`.sandbox` 扩展名推导 Bundle root。
+Tarstream and Bundle are physical carriers, not logical roles. Tarstream contains a single role-specific payload and sparse envelope, with `@digest`/`@hmac` identity. Bundle contains Manifest/chunk records, write admission, and optional local encryption, with `@manifest` root identity. Single-root Bundle publication must not first build a tarstream; conversely, a Bundle root cannot be inferred just from an `.image`/`.sandbox` extension.
 
-因此named location只依赖`mkdir`、exclusive create、write、read、stat/fstat/lstat、seek/pread、close,以及删除本进程拥有的不完整file. 它不依赖rename/renameat2、symlink、hardlink、reflink、sparse-file preservation、advisory lock或lock file,也不执行显式file/directory sync;publication的success contract由`O_EXCL`写入、`Close()`检查、最终路径reopen/full verification与路径身份检查定义,物理写回由文件系统或底层存储实现定义.
+Named locations therefore require directory creation, exclusive file creation, writes/reads, stat/fstat/lstat, permission setting, seek/pread, close, and removal of incomplete files owned by this process. They do not rely on rename/renameat2, symlinks, hardlinks, reflinks, preservation of filesystem holes, advisory locks, or lock files, and perform no explicit file/directory sync. Successful publication is defined by exclusive writes, checked `Close()`, final-path reopening/full verification, and path-identity checks; the filesystem or underlying storage defines physical writeback.
 
-Active encrypted `.overlay.diff` 保持KDXTS格式. Export只读取decrypt后的BlockCOW SnapshotView并创建新的immutable logical artifact,绝不把ZIP追加到active diff.
+Active encrypted `.overlay.diff` files remain in KDXTS format. Export reads only the decrypted BlockCOW SnapshotView and creates a new immutable logical artifact. It never appends ZIP data to an active diff.
 
 ### 11.3 Manifest upload
 
-已经组装好的 image 或顶层 Sandbox E 可通过
-`NewManifestPublisher(...).PublishSource(ctx, RoleImage|RoleSandbox, source)`
-直接 ingest。调用者保留 source ownership；该路径不生成 local tarstream，Chunks
-与去重对象先写，root Manifest最后写入并返回`manifest://<root>`。
+An already assembled image or top-level Sandbox E can be ingested directly with `NewManifestPublisher(...).PublishSource(ctx, RoleImage|RoleSandbox, source)`. The caller retains source ownership. This path creates no local tarstream: chunks and deduplicated objects are written first, the root Manifest last, returning `manifest://<root>`.
 
-Local tarstream graph按照bottom-up顺序ingest:
+Local tarstream graphs are ingested bottom-up:
 
 ```text
 data/lower -> E -> S
 ```
 
-已经portable的Manifest或located dependency保持原ref,不会先materialize再重写. Bundle root走exact-upload快路径:强制验证选择的Manifest closure、recorded admission和physical objects,原样上传Chunk/Manifest,root Manifest最后提交;root key和`snapshot.cfg`不变. 因此Bundle内已有的located selector仍要求consumer配置对应ref-location,不会被暗中改写成Manifest ref. Customer key、chunk/Manifest crypto、content verification和store generation admission沿用manifest config. E是export root,S是snapshot root.
+Already portable Manifest/located dependencies retain their refs rather than being materialized and rewritten. Bundle roots use the exact-upload fast path: force verification of the selected Manifest closure, recorded admission, and physical objects; upload Chunk/Manifest objects unchanged; commit the root Manifest last. The root key and `snapshot.cfg` remain unchanged. Existing located selectors inside a Bundle therefore still require consumers to configure the corresponding ref-location; they are not silently rewritten into Manifest refs. Customer key, chunk/Manifest crypto, content verification, and store-generation admission follow Manifest configuration. E is the export root; S is the snapshot root.
 
 ### 11.4 Manifest Bundle
 
-Bundle在pause前完成:
+Before pause, a Bundle completes:
 
-- write admission;
-- portable dependency retention和located Bundle selector rewrite;
-- unlocated local dependency materialization plan;
-- current operation依赖集合;
-- unlocated parent Bundle精确Manifest copy或remote fallback;located parent保留canonical selector;
-- local tarstream dependency ingest;
-- all ref replacements.
+- Write admission.
+- Retention of portable dependencies and rewriting of located Bundle selectors.
+- The plan to materialize unlocated local dependencies.
+- The dependency set for the current operation.
+- Exact Manifest copying from an unlocated parent Bundle or remote fallback; located parents retain canonical selectors.
+- Ingestion of local tarstream dependencies.
+- All ref replacements.
 
-然后writer一次性emit metadata prefix,写入Manifest/Chunk,最后以E或S root key finalize. `FullVerify`使用完整expected Manifest集合. V1不以外层ZIP magic推断E/S.
+The writer then emits the metadata prefix once, writes Manifest/Chunk data, and finalizes with E's or S's root key. `FullVerify` uses the complete expected Manifest set. V1 does not infer E/S from outer ZIP magic.
 
 ### 11.5 Publish graph
 
-Local tarstream Publish E:
+Publishing local tarstream E:
 
 ```text
 parse E -> enumerate E explicit disk refs bottom-up
@@ -1110,9 +1090,9 @@ parse E -> enumerate E explicit disk refs bottom-up
         -> rebuild E -> publish E last
 ```
 
-`self` 永不重写. 父 `.sandbox` 作为writable disk layer时发布为`.overlay` payload;作为two-disk root image carrier时提取EROFS payload与image config并发布为`.image`. 两种情况都不递归父config graph.
+`self` is never rewritten. A parent `.sandbox` used as a writable-disk layer is published as an `.overlay` payload. Used as the root-image carrier in a two-disk layout, its EROFS payload and image configuration are extracted and published as `.image`. Neither case recursively traverses the parent's configuration graph.
 
-Local tarstream Publish S:
+Publishing local tarstream S:
 
 ```text
 publish memory from_refs as opaque memory layers
@@ -1121,104 +1101,114 @@ rewrite node-local sandbox_ref
 rebuild S -> publish S last
 ```
 
-Memory parent的historical `sandbox_ref` 不递归;当前S引用的E graph是当前disk truth. `manifest://`和已located ref保持不变,不会产生`Manifest -> named location`或Manifest tail rewrite. Bundle carrier整体走exact location copy或exact Store upload,不进入上述重建流程.
+A memory parent's historical `sandbox_ref` is not traversed recursively. The E graph referenced by the current S is current disk truth. `manifest://` and already located refs remain unchanged; there is no `Manifest -> named location` materialization or Manifest-tail rewriting. Bundle carriers use exact location copying or exact Store upload as a whole, bypassing these rebuilding flows.
 
 ## 12. vhost-user-blk backend
 
 ### 12.1 Payload boundary
 
-Vhost backend接收`fetch.Stream` Payload section,不是FullStream. 任何 `.sandbox` ZIP tail进入block logical size都属于bug,由format/unit tests覆盖.
+The vhost backend receives the `fetch.Stream` Payload section, not FullStream. Including a `.sandbox` ZIP tail in the block device's logical size is a bug covered by format/unit tests.
 
 ### 12.2 Layered reads
 
-Read顺序为active diff -> captured top -> `base_from_refs` -> root image. Hole fall through,Zero/Data stop traversal. Layer logical size必须一致.
+Read order is active diff → captured top → `base_from_refs` → root image where applicable. Hole falls through; Zero/Data stop traversal. The immutable layers composed within one writable block device must have matching logical sizes. In the EROFS-plus-ext4 topology, the read-only EROFS base is a separate vhost device; it is not the final fall-through layer of the writable ext4 BlockCOW device. See [disks.go](../pkg/sandbox/disks.go) and [serveandwait.go](../pkg/sandbox/serveandwait.go).
 
 ### 12.3 SnapshotView
 
-`BlockCOW.SnapshotView` 暴露decrypt后的upper-only logical view和authoritative hole map. View不重新打开active diff path,并且只在backend quiesced期间稳定.
+`BlockCOW.SnapshotView` exposes the decrypted upper-only logical view and authoritative hole map. It does not reopen the active-diff path and is stable only while the backend is quiesced.
 
 ### 12.4 BlockCOW state
 
-BlockCOW使用clean/dirty/discard三态跟踪active upper. Discard对应Hole语义;写入zero bytes仍是Data/Zero事实,不能扫描为Hole. Export/snapshot不rotate active diff,也不把新E设为backend base.
+BlockCOW tracks active-upper clean/dirty/discard state. Discard uses Hole semantics. Writing zero bytes remains a Data/Zero fact and must not be scanned into Hole. Export/snapshot neither rotates the active diff nor makes the new E a backend base.
 
 ### 12.5 Quiesce / Resume
 
-Quiesce等待in-flight block request退出并阻止新request. 所有data/root views在同一quiesce窗口读取. Recovery顺序先恢复backend可服务状态,再恢复CH和guest连接,避免VM恢复后block request永久阻塞.
+Quiesce waits for in-flight block requests to leave and prevents new ones. All data/root views are read within the same quiesce window. Recovery makes backends serviceable before resuming CH and guest connections, avoiding permanent blocking of block requests after VM resume.
 
-## 13. Validation、错误与安全
+<a id="13-validation错误与安全"></a>
+
+## 13. Validation, errors, and security
 
 ### 13.1 Cold validation
 
-普通 cold config至少验证:
+Ordinary cold configuration validates at least:
 
-- capacity/allocatable和resource mode一致;
-- kernel/runtime为absolute unlocated file binding;
-- network provider唯一且identity字段有provider;
-- root/data topology合法,数据盘name/order和mount 1:1;
-- active diff/template/size组合可生成mountable filesystem;
-- local/Manifest/Bundle ref与crypto policy一致;
-- launch/files/init/plugin/metadata limits.
+- Capacity/allocatable consistency with resource mode.
+- Absolute, unlocated file bindings for kernel/runtime.
+- A unique network provider, and a provider for any identity fields.
+- Valid root/data topology, disk names/order, and a 1:1 disk-to-mount relationship.
+- Active diff/template/size combinations capable of yielding a mountable filesystem.
+- Consistent local/Manifest/Bundle refs and crypto policy.
+- Launch/files/init/plugin/metadata limits.
 
-### 13.2 `run --from` 与 restore validation
+<a id="132-run---from-与-restore-validation"></a>
 
-两种模式都先严格parse logical artifact和canonical config,再验证host ownership. `--from`允许persistent workload override;restore拒绝所有cold-only字段. Kernel/runtime identity、network topology/provider、disk count/name/topology和active diff bindings在side effect前完成.
+### 13.2 `run --from` and restore validation
+
+Both modes strictly parse the logical artifact and canonical configuration before checking host ownership. `--from` permits persistent-workload overrides; restore rejects all cold-only fields. Kernel binding preflight, runtime identity comparison, network topology/provider, disk count/names/topology, and active-diff binding checks precede external lifecycle side effects. This does not add a kernel-digest re-hash to these two modes; see §3.2.
 
 ### 13.3 CLI mutual exclusion
 
-- `run --from` 与 `--restore` 互斥.
-- `run --replace-boot` 仅允许与`--from`一起使用，要求host config，并拒绝`--restore`.
-- export/snapshot都要求`--output`与`--upload`二选一.
-- Explicit `--mode` 与 `--upload`互斥.
-- Live export拒绝`--config`;image-to-Sandbox-E assembly要求`--from + --config`且拒绝`--resume`.
-- Snapshot没有memory toggle.
-- `exec` command必须位于`--`之后;local与proxy target rules互斥.
+- `run --from` and `--restore` are mutually exclusive.
+- `run --replace-boot` is allowed only with `--from`, requires host configuration, and rejects `--restore`.
+- Export/snapshot require exactly one of `--output` and `--upload`.
+- Explicit `--mode` and `--upload` are mutually exclusive.
+- Live export rejects `--config`; image-to-Sandbox-E assembly requires `--from` plus `--config` or `SANDBOX_CONFIG`, and rejects `--resume`.
+- Snapshot has no memory toggle.
+- The exec command must follow `--`; local and proxy target rules are mutually exclusive.
 
 ### 13.4 Failure contract
 
-- Error包含field/entry/ref/disk index context,但不打印inline file/env value、customer key或plaintext digest.
-- Local crypto错误保持protected presentation.
-- ZIP/path traversal/symlink/regular-file checks fail closed.
-- Remote read/write接受context cancellation.
-- Stream/fetcher/Bundle reader共享明确close owner,失败路径不泄漏fd/mmap/goroutine.
-- Freeze后的任一failure必须恢复app、CH/backend/MUX/pinger/forward并释放resource locks;若MUX恢复已不可证明,必须在locks仍持有时终止CH并将capture gate置为terminal.
-- Root alias是commit point;dependency orphan不伪装成功.
+- Errors provide field/entry/ref/disk-index context without printing inline file/env values, customer keys, or plaintext digests.
+- Local crypto errors retain protected presentation.
+- ZIP/path-traversal/symlink/regular-file checks fail closed.
+- Remote I/O receives operation contexts; cancellation follows the owning I/O implementation and is not proof of rollback of already committed objects.
+- Streams, fetchers, and Bundle readers share explicit close ownership; failure cleanup must not leak fds, mappings, or goroutines.
+- Any post-freeze failure must recover app, CH/backends/MUX/pinger/forwarding and release resource locks. If MUX recovery can no longer be established, CH must be terminated while locks remain held and the capture gate becomes terminal.
+- Successful operation-root publication is the commit point, followed by the semantic alias for local output. Named locations have no alias. Orphan dependencies do not constitute success.
 
-## 14. Reliability、performance 与兼容边界
+<a id="14-reliabilityperformance-与兼容边界"></a>
 
-### 14.1 Atomicity 与 determinism
+## 14. Reliability, performance, and compatibility boundaries
 
-Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local `FileSink`/`BundleSink`保持same-directory temp、完整写入/`Close()`检查和atomic no-replace rename,final commit是O(1);alias只在root commit后更新. artifact capture/publication只定义logical completion,不定义stable-storage durability;两条本地路径都不执行显式file/directory fsync,物理写回由文件系统或底层存储实现定义. Named ref-location采用独立的exclusive-create + checked-write/copy-once + reopen-full-verify协议;tarstream由carrier直接提供identity,Bundle保持exact bytes,两者都不进入local sink的capture/commit路径.
+<a id="141-atomicity-与-determinism"></a>
 
-多盘顺序固定为data disks first、root E last. Snapshot随后写memory S last. 这让S/E root成为可审计的graph commit point.
+### 14.1 Atomicity and determinism
 
-### 14.2 Streaming 与 memory use
+Portable YAML and E/S ZIP use canonical order, fixed metadata, and bounded bytes. Local `FileSink`/`BundleSink` retain same-directory temporaries, complete writes/checked `Close()`, and atomic no-replace rename; final commit is O(1). The alias updates only after root commit. Artifact capture/publication defines logical completion, not stable-storage durability. Neither local artifact path explicitly fsyncs files/directories; the filesystem/storage implementation governs physical writeback. Named ref-locations use a separate exclusive-create, checked-write/copy-once, reopen-and-full-verify protocol. Tarstream carriers directly supply identity; Bundle copying preserves exact bytes. Neither uses the local sink's capture/commit path.
 
-- Sparse tarstream不spool logical stream到disk.
-- Manifest ingest只读取resident extents.
-- E/S大payload不进入`/run`;只有CH小型config/state staging files进入tmpfs.
-- Bundle dependency plan在pause前执行remote I/O和admission.
-- V1 `--resume` 可以在sink写完整期间保持VM paused,换取SnapshotView稳定性.
+Multidisk ordering is fixed: data disks first, root E last. Snapshot then writes memory S last. This makes the S/E root an auditable graph commit point.
+
+<a id="142-streaming-与-memory-use"></a>
+
+### 14.2 Streaming and memory use
+
+- Sparse tarstream does not spool the logical stream to disk.
+- Manifest ingest reads resident extents rather than materializing holes.
+- Large E/S payloads are not staged in the per-run `/run` directory; CH's bounded config/state staging files go there. Caller-selected output directories and named-location temporary Bundle files remain separate and consume their selected filesystem's capacity.
+- Bundle dependency planning performs remote I/O and admission before pause.
+- V1 `--resume` may keep the VM paused until sink writes finish, preserving SnapshotView stability.
 
 ### 14.3 Performance observations
 
-关键指标:
+Key metrics:
 
-- preflight latency;
-- guest freeze ack latency;
-- CH pause latency;
-- disk/E emit time;
-- CH memory snapshot与resident memory emit time;
-- resume/reattach latency;
-- Manifest stored/dedup chunks;
-- UFFD fault latency和restore-ready latency.
+- Preflight latency.
+- Guest freeze-ACK latency.
+- CH pause latency.
+- Disk/E emission time.
+- CH memory-snapshot and resident-memory emission time.
+- Resume/reattach latency.
+- Manifest stored/deduplicated chunks.
+- UFFD fault latency and restore-ready latency.
 
-Benchmark分别覆盖local tarstream/Bundle create、Bundle read、sparse merge和UFFD fault. 性能优化不能改变Hole/Zero/Data、commit order、identity verification或freeze safety.
+Benchmarks separately cover local tarstream/Bundle creation, Bundle reads, sparse merging, and UFFD faults. Performance optimization must not alter Hole/Zero/Data semantics, commit order, identity-verification policy, or freeze safety.
 
 ### 14.4 Incompatibility
 
-本切换直接替换旧snapshot provenance. 旧`SnapshotConfig`若包含resource/runtime/root/data/launch字段会返回明确unsupported error. 不提供alias、dual reader、migration shim、feature flag或zero-memory compatibility path.
+The current provenance schema replaces the old snapshot provenance. An old `SnapshotConfig` containing resource/runtime/root/data/launch fields returns an explicit unsupported-format error. There is no old-format alias, dual reader, migration shim, feature flag, or zero-memory compatibility path. The `upload-snapshot` CLI alias in §2.1 does not provide format compatibility.
 
-E2B mapping只发生在orchestrator层:
+E2B mapping occurs only in orchestrator:
 
 ```text
 E2B memory=false
@@ -1234,9 +1224,9 @@ E2B memory=true
 
 ## 15. See Also
 
-- `docs/sandbox-init.md` — guest PID 1、launch/quiesce/MUX协议.
-- `docs/cloud-hypervisor.md` — CH build、API与restore边界.
-- `docs/tapfd.md` — TapFD handoff与network namespace.
-- `examples/timeouts-production.yaml` — production host timeout示例.
-- `examples/restore-prefetch-memory.yaml` — explicit memory prefetch示例.
-- `README.md` — build、release与repository入口.
+- [sandbox-init.md](sandbox-init.md) — Guest PID 1 and launch/quiesce/MUX protocols.
+- [cloud-hypervisor.md](cloud-hypervisor.md) — CH build, API, and restore boundaries.
+- [Connector TAPFD protocol](https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md) — TAP descriptor handoff and network namespaces, owned by connector.
+- [timeouts-production.yaml](../examples/timeouts-production.yaml) — Production host-timeout example.
+- [restore-prefetch-memory.yaml](../examples/restore-prefetch-memory.yaml) — Explicit memory-prefetch example.
+- [README.md](../README.md) — Build, release, and repository entry points.
