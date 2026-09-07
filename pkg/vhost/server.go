@@ -48,11 +48,11 @@ type CowBackend struct{ C *BlockCOW }
 
 func (b *CowBackend) ReadAt(buf []byte, offset int64) (int, error)  { return b.C.ReadAt(buf, offset) }
 func (b *CowBackend) WriteAt(buf []byte, offset int64) (int, error) { return b.C.WriteAt(buf, offset) }
-func (b *CowBackend) Flush() error                                  { return b.C.Flush() }
-func (b *CowBackend) Discard(offset, length int64) error            { return b.C.Discard(offset, length) }
-func (b *CowBackend) Size() int64                                   { return b.C.Size() }
-func (b *CowBackend) ReadOnly() bool                                { return false }
-func (b *CowBackend) BackendStats() map[string]any                  { return b.C.BackendStats() }
+func (b *CowBackend) Flush() error                               { return b.C.Flush() }
+func (b *CowBackend) Discard(offset, length int64) error         { return b.C.Discard(offset, length) }
+func (b *CowBackend) Size() int64                                { return b.C.Size() }
+func (b *CowBackend) ReadOnly() bool                             { return false }
+func (b *CowBackend) BackendStats() map[string]any               { return b.C.BackendStats() }
 
 // ErrReadOnly is returned by WriteAt on a read-only backend.
 var ErrReadOnly = fmt.Errorf("vhost: backend is read-only")
@@ -111,19 +111,9 @@ type virtq struct {
 	done chan struct{}
 }
 
-// NumQueues is the number of virtio queues we advertise. v1 uses a single
-// queue per device (sufficient for cold-start MVP).
+// NumQueues is the fixed number of request queues per device. The minimal
+// profile does not advertise MQ, so virtio_blk_config.num_queues is inactive.
 const NumQueues = 1
-
-// MaxBlockSizeBytes is the maximum I/O segment size advertised to the
-// guest via virtio_blk_config.size_max. 1 MiB is a comfortable default
-// for cloud-hypervisor's clamp behaviour.
-const MaxBlockSizeBytes = 1 << 20
-
-// MaxSegments caps virtio_blk_config.seg_max — the longest chain the
-// backend will accept. 128 is plenty for the typical 3-descriptor
-// header+data+status pattern.
-const MaxSegments = 128
 
 // NewServer returns an unstarted server bound to socketPath. backend
 // owns disk IO. logf may be nil (defaults to no-op).
@@ -264,14 +254,12 @@ func (s *Server) Serve(ctx context.Context) error {
 
 // serveOneMaster runs the vhost-user protocol loop on a single master
 // connection until the master disconnects (EOF / socket close) or Stop
-// fires (which closes activeConn to break out of ReadMessage). Errors
+// fires (which closes activeConn here to break out of ReadMessage). Errors
 // are logged; the loop never returns them up to Serve, since a wedged
 // master should not kill the listener.
 //
-// No read deadline is set: the vhost-user control socket has no
-// keepalive semantics — it's silent throughout normal steady-state
-// operation (kick/call eventfds carry all the traffic). A per-read
-// deadline misclassifies that silence as disconnect.
+// No read deadline is set: vhost-user has no keepalive semantics — it's silent
+// throughout normal steady-state operation (kick/call eventfds carry traffic).
 func (s *Server) serveOneMaster(conn *net.UnixConn) {
 	defer conn.Close()
 	for {
@@ -480,18 +468,31 @@ const (
 	bitProtocolConfig = uint64(1) << 9
 )
 
-func (s *Server) handleGetFeatures(conn *net.UnixConn, m *Message) error {
+// advertisedFeatures is the fixed minimal device profile. Do not advertise
+// optional features merely because their config fields exist on the wire.
+// Existing snapshots keep this same feature set; inactive config bytes do
+// not require a new snapshot version or renegotiation.
+func (s *Server) advertisedFeatures() uint64 {
 	feats := bitVirtioVersion1 | bitVhostProtocolFeatures | bitVirtioBlkFlush
 	if s.backend.ReadOnly() {
 		feats |= bitVirtioBlkRO
 	}
-	return SendU64Reply(conn, m.Header.Request, feats)
+	return feats
+}
+
+func (s *Server) handleGetFeatures(conn *net.UnixConn, m *Message) error {
+	return SendU64Reply(conn, m.Header.Request, s.advertisedFeatures())
 }
 
 func (s *Server) handleSetFeatures(conn *net.UnixConn, m *Message) error {
 	v, err := ParseU64(m.Payload)
 	if err != nil {
 		return err
+	}
+	supported := s.advertisedFeatures()
+	if unsupported := v &^ supported; unsupported != 0 {
+		return fmt.Errorf("vhost: unsupported virtio features: requested=%#x supported=%#x unsupported=%#x",
+			v, supported, unsupported)
 	}
 	s.mu.Lock()
 	s.features = v
@@ -509,6 +510,10 @@ func (s *Server) handleSetProtocolFeatures(conn *net.UnixConn, m *Message) error
 	if err != nil {
 		return err
 	}
+	if unsupported := v &^ bitProtocolConfig; unsupported != 0 {
+		return fmt.Errorf("vhost: unsupported protocol features: requested=%#x supported=%#x unsupported=%#x",
+			v, bitProtocolConfig, unsupported)
+	}
 	s.mu.Lock()
 	s.protocolFeatures = v
 	s.mu.Unlock()
@@ -516,33 +521,29 @@ func (s *Server) handleSetProtocolFeatures(conn *net.UnixConn, m *Message) error
 }
 
 func (s *Server) handleGetConfig(conn *net.UnixConn, m *Message) error {
-	// Master sends [offset:u32, size:u32, flags:u32] + zero buf of size.
-	// We just return a virtio_blk_config of the requested size.
-	if len(m.Payload) < 12 {
-		return fmt.Errorf("vhost: GET_CONFIG payload too short: %d", len(m.Payload))
+	// GET_CONFIG carries [offset:u32, size:u32, flags:u32] and size bytes.
+	// On error the protocol requires an empty reply payload, not a
+	// successful truncated config or an allocation from an unchecked size.
+	const configHeaderSize = 12
+	if len(m.Payload) < configHeaderSize {
+		return SendReply(conn, m.Header.Request, nil)
 	}
 	offset := binary.LittleEndian.Uint32(m.Payload[0:4])
 	size := binary.LittleEndian.Uint32(m.Payload[4:8])
-	flags := binary.LittleEndian.Uint32(m.Payload[8:12])
-	_ = offset
-	_ = flags
+	end := uint64(offset) + uint64(size)
+	if size == 0 || end > BlkConfigSize ||
+		uint64(len(m.Payload)) != configHeaderSize+uint64(size) {
+		return SendReply(conn, m.Header.Request, nil)
+	}
 
-	cfg := BlkConfig{
-		Capacity:  uint64(s.backend.Size()) / SectorSize,
-		SizeMax:   MaxBlockSizeBytes,
-		SegMax:    MaxSegments,
-		BlkSize:   SectorSize,
-		NumQueues: NumQueues,
-	}
+	// The pinned CH frontend reads the full 60-byte wire layout. Only
+	// capacity is active in our profile; all feature-gated bytes are zero.
+	// GET flags are echoed, including CH's normal WRITABLE request flag.
+	cfg := BlkConfig{Capacity: uint64(s.backend.Size()) / SectorSize}
 	full := cfg.Marshal()
-	// Reply must echo the request header (offset/size/flags) followed
-	// by the config bytes of size `size`.
-	out := make([]byte, 12+int(size))
-	copy(out[0:12], m.Payload[0:12])
-	if int(size) > len(full) {
-		size = uint32(len(full))
-	}
-	copy(out[12:12+size], full[:size])
+	out := make([]byte, configHeaderSize+int(size))
+	copy(out[:configHeaderSize], m.Payload[:configHeaderSize])
+	copy(out[configHeaderSize:], full[int(offset):int(end)])
 	return SendReply(conn, m.Header.Request, out)
 }
 
