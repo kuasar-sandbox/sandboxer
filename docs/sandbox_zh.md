@@ -304,14 +304,33 @@ timeouts:
 
 普通 cold run 使用完整 validation. `run --from` 和 `run --restore` 先严格解析 artifact,再按字段 presence 应用各自 rules,不能使用无约束 `LoadMerged` 覆盖 artifact graph.
 
-<a id="便携工件配置"></a>
-### 3.2 便携工件配置
+### 3.2 PortableSandboxConfig
 
-C0/C1、PortableSandboxConfig、严格解码、磁盘绑定、E/S 编码和身份校验统一见[沙箱工件](sandbox-artifacts_zh.md)。下文继续说明实际运行时 YAML 的文件与环境行为。
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#32-portablesandboxconfig)。
 
+### 3.3 Strict encoding 与 limits
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#33-strict-encoding-与-limits)。
+
+### 3.4 C0、C1 与 source binding
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#34-c0c1-与-source-binding)。
+
+### 3.5 `self` 与 disk provenance
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#35-self-与-disk-provenance)。
+
+### 3.6 `.sandbox` logical format
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#36-sandbox-logical-format)。
+
+### 3.7 `.snapshot` logical format
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#37-snapshot-logical-format)。
 
 <a id="38-filesenv-与-ephemeral"></a>
-### 3.3 files、env 与 ephemeral
+<a id="33-filesenv-与-ephemeral"></a>
+### 3.8 files、env 与 ephemeral
 
 Cold launch merge:
 
@@ -704,6 +723,25 @@ Static/dynamic模式可使用PSI或`memory.events.local` polling. PSI默认trigg
 
 磁盘和内存引用、tarstream/Manifest/Bundle 输出、精确发布与提交规则见[沙箱工件](sandbox-artifacts_zh.md)。运行时捕获顺序仍由本篇定义。
 
+### 11.1 Disk 与 memory provenance
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#111-disk-与-memory-provenance)。
+
+### 11.2 Local tarstream 与 crypto
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#112-local-tarstream-与-crypto)。
+
+### 11.3 Manifest upload
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#113-manifest-upload)。
+
+### 11.4 Manifest Bundle
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#114-manifest-bundle)。
+
+### 11.5 Publish graph
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#115-publish-graph)。
 
 ## 12. vhost-user-blk backend
 
@@ -767,8 +805,13 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 
 ## 14. Reliability、performance 与兼容边界
 
+### 14.1 Atomicity 与 determinism
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#141-atomicity-与-determinism)。
+
 <a id="142-streaming-与-memory-use"></a>
-### 14.1 Streaming 与 memory use
+<a id="141-streaming-与-memory-use"></a>
+### 14.2 Streaming 与 memory use
 
 - Sparse tarstream不spool logical stream到disk.
 - Manifest ingest只读取resident extents.
@@ -777,7 +820,8 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 - V1 `--resume` 可以在sink写完整期间保持VM paused,换取SnapshotView稳定性.
 
 <a id="143-performance-observations"></a>
-### 14.2 Performance observations
+<a id="142-performance-observations"></a>
+### 14.3 Performance observations
 
 关键指标:
 
@@ -791,6 +835,10 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 - UFFD fault latency和restore-ready latency.
 
 Benchmark分别覆盖local tarstream/Bundle create、Bundle read、sparse merge和UFFD fault. 性能优化不能改变Hole/Zero/Data、commit order、identity verification或freeze safety.
+
+### 14.4 Incompatibility
+
+完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#144-incompatibility)。
 
 ## 15. See Also
 

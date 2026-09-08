@@ -298,16 +298,38 @@ timeouts:
 
 Ordinary cold run performs full validation. `run --from` and `run --restore` first strictly parse the artifact, then apply their respective field-presence rules. An unconstrained `LoadMerged` must not overwrite the artifact graph.
 
-<a id="portable-artifact-configuration"></a>
-### 3.2 Portable artifact configuration
+### 3.2 PortableSandboxConfig
 
-[Sandbox artifacts](sandbox-artifacts.md) owns C0/C1, PortableSandboxConfig, strict decoding, disk binding, E/S encoding and identity checks. The following section continues the runtime YAML file and environment behavior.
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#32-portablesandboxconfig).
 
+<a id="33-strict-encoding-与-limits"></a>
+### 3.3 Strict encoding and limits
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#33-strict-encoding-and-limits).
+
+<a id="34-c0c1-与-source-binding"></a>
+### 3.4 C0, C1, and source binding
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#34-c0-c1-and-source-binding).
+
+<a id="35-self-与-disk-provenance"></a>
+### 3.5 `self` and disk provenance
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#35-self-and-disk-provenance).
+
+### 3.6 `.sandbox` logical format
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#36-sandbox-logical-format).
+
+### 3.7 `.snapshot` logical format
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#37-snapshot-logical-format).
 
 <a id="38-filesenv-与-ephemeral"></a>
 
 <a id="38-files-environment-and-ephemeral-data"></a>
-### 3.3 Files, environment, and ephemeral data
+<a id="33-files-environment-and-ephemeral-data"></a>
+### 3.8 Files, environment, and ephemeral data
 
 Cold-launch merging:
 
@@ -685,6 +707,27 @@ Static/dynamic modes can use PSI or `memory.events.local` polling. Host configur
 
 See [Sandbox artifacts](sandbox-artifacts.md) for disk/memory references, tarstream/Manifest/Bundle outputs, exact publication and commit rules. This runtime specification retains capture sequencing.
 
+<a id="111-disk-与-memory-provenance"></a>
+### 11.1 Disk and memory provenance
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#111-disk-and-memory-provenance).
+
+<a id="112-local-tarstream-与-crypto"></a>
+### 11.2 Local tarstream and crypto
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#112-local-tarstream-and-crypto).
+
+### 11.3 Manifest upload
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#113-manifest-upload).
+
+### 11.4 Manifest Bundle
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#114-manifest-bundle).
+
+### 11.5 Publish graph
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#115-publish-graph).
 
 ## 12. vhost-user-blk backend
 
@@ -754,10 +797,16 @@ Both modes strictly parse the logical artifact and canonical configuration befor
 
 ## 14. Reliability, performance, and compatibility boundaries
 
+<a id="141-atomicity-与-determinism"></a>
+### 14.1 Atomicity and determinism
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#141-atomicity-and-determinism).
+
 <a id="142-streaming-与-memory-use"></a>
 
 <a id="142-streaming-and-memory-use"></a>
-### 14.1 Streaming and memory use
+<a id="141-streaming-and-memory-use"></a>
+### 14.2 Streaming and memory use
 
 - Sparse tarstream does not spool the logical stream to disk.
 - Manifest ingest reads resident extents rather than materializing holes.
@@ -766,7 +815,8 @@ Both modes strictly parse the logical artifact and canonical configuration befor
 - V1 `--resume` may keep the VM paused until sink writes finish, preserving SnapshotView stability.
 
 <a id="143-performance-observations"></a>
-### 14.2 Performance observations
+<a id="142-performance-observations"></a>
+### 14.3 Performance observations
 
 Key metrics:
 
@@ -780,6 +830,10 @@ Key metrics:
 - UFFD fault latency and restore-ready latency.
 
 Benchmarks separately cover local tarstream/Bundle creation, Bundle reads, sparse merging, and UFFD faults. Performance optimization must not alter Hole/Zero/Data semantics, commit order, identity-verification policy, or freeze safety.
+
+### 14.4 Incompatibility
+
+The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#144-incompatibility).
 
 ## 15. See Also
 
