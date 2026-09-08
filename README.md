@@ -99,6 +99,7 @@ See the [project release documentation](https://github.com/kuasar-sandbox/kuasar
 Full design and reference documents:
 
 - [`docs/sandbox.md`](docs/sandbox.md) — host control plane, sandbox formats, artifacts, snapshot/export/restore, named locations, and resource semantics;
+- [`docs/journald.md`](docs/journald.md) — independent output targets, custom journal fields, component diagnostics, encoding, and fallback;
 - [`docs/sandbox-init.md`](docs/sandbox-init.md) — guest PID 1 ABI, staged initialization, vsock control, stdio multiplexing, and application contract;
 - [`docs/cloud-hypervisor.md`](docs/cloud-hypervisor.md) — patched Cloud Hypervisor source, build, and runtime contracts.
 

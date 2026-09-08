@@ -85,6 +85,7 @@ func (w *Writer) append(p []byte) {
 }
 
 func (w *Writer) emit(line []byte, lineEnd bool) {
+	original := line
 	if lineEnd {
 		line = bytes.TrimRight(line, "\r")
 	}
@@ -94,9 +95,11 @@ func (w *Writer) emit(line []byte, lineEnd bool) {
 	if err := w.send(string(line), w.fields); err == nil {
 		return
 	}
+	// Normalize CRLF only for native MESSAGE. The fallback keeps the input's
+	// CR so Bridge's conversion still works while the controlling TTY is raw.
 	// Use the original sink, never log.Writer(), which might be this writer.
 	if w.fallback != nil {
-		_, _ = fmt.Fprintf(w.fallback, "%s%s\n", w.prefix, line)
+		_, _ = fmt.Fprintf(w.fallback, "%s%s\n", w.prefix, original)
 	}
 }
 

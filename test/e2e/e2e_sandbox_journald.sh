@@ -27,11 +27,13 @@ if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 journalctl --sync || skip 'journal is not accessible'
 
 WORK="$(mktemp -d /tmp/e2e-journald-XXXXXX)"
-CASE="journal-$$-$(date +%s)"
+CASE="journal-$$-$(date +%s)-${WORK##*-}"
 APP="e2e-app-$$"
 CONSOLE="e2e-console-$$"
 CTL="e2e-ctl-$$"
-BARE="e2e-bare-$$"
+# This output intentionally has no TEST_ID field. Its identifier must still
+# distinguish this invocation from earlier uses of the same PID on the host.
+BARE="e2e-bare-$CASE"
 TAP_NAME="${TAP_NAME:-jlog$$}"
 TAP_CREATED=0
 PID=""
