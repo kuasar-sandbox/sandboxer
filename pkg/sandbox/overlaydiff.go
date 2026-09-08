@@ -42,17 +42,17 @@ func DefaultDiskDiffURI(baseDir, sandboxID, diskKey string) string {
 
 // PrepareDiff inspects only enough state to describe how OpenBlockCOW should
 // open or initialize the active diff. It never copies, truncates, or creates a
-// target. For a fresh (absent/empty) diff it enforces the cold-boot ext4-source
-// rule:
+// target. Capacity comes from the selected source, never a separate limit:
 //
-//   - existing non-empty diff → kept as-is (size = its on-disk size)
+//   - existing non-empty diff → kept as-is (its logical size is read on open)
 //   - existing empty diff     → rejected (it cannot be atomically provisioned)
 //   - else diff_template set  → record its logical source path (its size wins)
 //   - else base present       → blank diff sized to the base (vdb = base ext4)
 //   - else                    → error (a blank diff is not a mountable ext4)
 //
-// baseSize is 0 when there is no overlay.base; templateURI is "" when unset.
-func PrepareDiff(diffPath, templateURI string, baseSize, _ int64) (vhost.DiffInit, error) {
+// baseSize is the COW base's logical size, or 0 without a base;
+// templateURI is "" when unset. No filesystem resize or quota is performed.
+func PrepareDiff(diffPath, templateURI string, baseSize int64) (vhost.DiffInit, error) {
 	if st, err := os.Stat(diffPath); err == nil {
 		if st.Size() > 0 {
 			return vhost.DiffInit{Existing: true}, nil
@@ -61,6 +61,7 @@ func PrepareDiff(diffPath, templateURI string, baseSize, _ int64) (vhost.DiffIni
 	} else if !os.IsNotExist(err) {
 		return vhost.DiffInit{}, fmt.Errorf("stat diff %s: %w", diffPath, err)
 	}
+
 	switch {
 	case templateURI != "":
 		scheme, templatePath, ok := config.SchemeAndPath(templateURI)

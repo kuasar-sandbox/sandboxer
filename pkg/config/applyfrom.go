@@ -204,7 +204,7 @@ func validateFromProtectedFields(artifact *PortableSandboxConfig, host *SandboxC
 			return errors.New("run --from: host boot.root.overlay changes the artifact's single-disk topology")
 		}
 	} else {
-		if host.Boot.Root.Diff != "" || host.Boot.Root.DiffTemplate != "" || host.Boot.Root.DiffSize != "" {
+		if host.Boot.Root.Diff != "" || host.Boot.Root.DiffTemplate != "" {
 			return errors.New("run --from: root overlay topology requires active diff fields under boot.root.overlay")
 		}
 		if host.Boot.Root.Overlay != nil && (host.Boot.Root.Overlay.Base != "" || len(host.Boot.Root.Overlay.BaseFromRefs) != 0) {
@@ -233,7 +233,7 @@ func validateFromProtectedFields(artifact *PortableSandboxConfig, host *SandboxC
 			}
 			continue
 		}
-		if hostDisk.Diff != "" || hostDisk.DiffTemplate != "" || hostDisk.DiffSize != "" {
+		if hostDisk.Diff != "" || hostDisk.DiffTemplate != "" {
 			return fmt.Errorf("run --from: boot.disks[%d] overlay active diff fields must be under overlay", i)
 		}
 		if hostDisk.Overlay != nil && (hostDisk.Overlay.Base != "" || len(hostDisk.Overlay.BaseFromRefs) != 0) {
@@ -318,11 +318,9 @@ func applyActiveDiskBindings(runtime, host *SandboxConfig) {
 	if runtime.Boot.Root.Overlay == nil {
 		runtime.Boot.Root.Diff = host.Boot.Root.Diff
 		runtime.Boot.Root.DiffTemplate = host.Boot.Root.DiffTemplate
-		runtime.Boot.Root.DiffSize = host.Boot.Root.DiffSize
 	} else if host.Boot.Root.Overlay != nil {
 		runtime.Boot.Root.Overlay.Diff = host.Boot.Root.Overlay.Diff
 		runtime.Boot.Root.Overlay.DiffTemplate = host.Boot.Root.Overlay.DiffTemplate
-		runtime.Boot.Root.Overlay.DiffSize = host.Boot.Root.Overlay.DiffSize
 	}
 	for i := range runtime.Boot.Disks {
 		if i >= len(host.Boot.Disks) {
@@ -331,11 +329,10 @@ func applyActiveDiskBindings(runtime, host *SandboxConfig) {
 		target := &runtime.Boot.Disks[i].RootConfig
 		source := &host.Boot.Disks[i].RootConfig
 		if target.Overlay == nil {
-			target.Diff, target.DiffTemplate, target.DiffSize = source.Diff, source.DiffTemplate, source.DiffSize
+			target.Diff, target.DiffTemplate = source.Diff, source.DiffTemplate
 		} else if source.Overlay != nil {
 			target.Overlay.Diff = source.Overlay.Diff
 			target.Overlay.DiffTemplate = source.Overlay.DiffTemplate
-			target.Overlay.DiffSize = source.Overlay.DiffSize
 		}
 	}
 }
