@@ -58,6 +58,10 @@ type DiffInit struct {
 	Existing     bool
 	TemplatePath string
 	CreateSize   int64
+	// Transient skips file and directory fsync during creation only. Use it
+	// for run-owned diffs that are discarded with the VM, never for a
+	// caller-owned path whose initialization must survive a host crash.
+	Transient bool
 }
 
 // BlockCOWOption configures active-diff storage without changing the COW
@@ -285,10 +289,10 @@ func createFreshDiffFile(path string, init DiffInit, encryption *diffEncryption)
 	if err := validateDiffLogicalSize(logicalSize); err != nil {
 		return nil, fmt.Errorf("vhost: fresh diff: %w", err)
 	}
-	return initializeFreshDiffFile(path, logicalSize, encryption, template)
+	return initializeFreshDiffFile(path, logicalSize, encryption, template, init.Transient)
 }
 
-func initializeFreshDiffFile(path string, logicalSize int64, encryption *diffEncryption, template diffTemplateSource) (*diffFile, error) {
+func initializeFreshDiffFile(path string, logicalSize int64, encryption *diffEncryption, template diffTemplateSource, transient bool) (*diffFile, error) {
 	directory := filepath.Dir(path)
 	tmp, err := os.CreateTemp(directory, "."+filepath.Base(path)+".*.partial")
 	if err != nil {
@@ -323,8 +327,10 @@ func initializeFreshDiffFile(path string, logicalSize int64, encryption *diffEnc
 			return nil, fmt.Errorf("vhost: seed diff template: %w", err)
 		}
 	}
-	if err := target.Sync(); err != nil {
-		return nil, fmt.Errorf("vhost: sync fresh diff: %w", err)
+	if !transient {
+		if err := target.Sync(); err != nil {
+			return nil, fmt.Errorf("vhost: sync fresh diff: %w", err)
+		}
 	}
 	if err := target.Close(); err != nil {
 		return nil, fmt.Errorf("vhost: close fresh diff: %w", err)
@@ -333,8 +339,10 @@ func initializeFreshDiffFile(path string, logicalSize int64, encryption *diffEnc
 		return nil, err
 	}
 	committed = true
-	if err := syncDirectory(directory); err != nil {
-		return nil, err
+	if !transient {
+		if err := syncDirectory(directory); err != nil {
+			return nil, err
+		}
 	}
 	// An encryption-backed writer always produced encrypted v1, even in auto mode.
 	return openExistingDiffFile(path, encryption, encryption != nil, false)
