@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strconv"
@@ -68,14 +69,16 @@ func runCmd(args []string) int {
 	stdoutFlag := fs.Bool("stdout", true, "pipe mode: app stdout → sandbox-ctl stdout (default on; --stdout=false discards)")
 	stderrFlag := fs.Bool("stderr", true, "pipe mode: app stderr → sandbox-ctl stderr (default on; --stderr=false discards)")
 	stdinFrom := fs.String("stdin-from", "", "pipe mode: app stdin reads from FILE (implies --stdin)")
-	stdoutTo := fs.String("stdout-to", "", "pipe mode: app stdout → FILE or journald=TAG (implies --stdout)")
-	stderrTo := fs.String("stderr-to", "", "pipe mode: app stderr → FILE or journald=TAG (implies --stderr)")
+	stdoutTo := fs.String("stdout-to", "", "pipe mode: app stdout → FILE or journald=TAG[,FIELD=VALUE...] (implies --stdout)")
+	stderrTo := fs.String("stderr-to", "", "pipe mode: app stderr → FILE or journald=TAG[,FIELD=VALUE...] (implies --stderr)")
 	ttyFlag := fs.Bool("tty", false, "give the app a pty + put our terminal in raw mode (default: auto = on iff stdin&stdout are terminals; mutually exclusive with --stdin/--stdout/--stderr/--*-from/--*-to)")
-	console := fs.String("console", "default", "guest kernel dmesg sink: off | default (our stderr) | file=PATH | journald=TAG")
+	console := fs.String("console", "default", "guest kernel dmesg sink: off | default (our stderr) | file=PATH | journald=TAG[,FIELD=VALUE...]")
+
+	logTo := fs.String("log-to", "default", "component diagnostics: default (stderr) | journald=TAG[,FIELD=VALUE...]")
 
 	// Reliability backstop: after N consecutive failed pings, sandbox-ctl
 	// SIGTERMs CH so cmd.Wait returns rather than hanging on a wedged-
-	// but-alive guest. 0 = disabled (default — wait for outer signal).
+	// but-alive guest. 0 = disabled (default — wait for the user's signal).
 	// With the default 1 s ping interval, 30 ≈ 30 s of unreachability.
 	pingFatal := fs.Int("ping-fatal-threshold", 0,
 		"consecutive ping failures before SIGTERMing CH (overrides SANDBOX_PING_FATAL_THRESHOLD env; 0 disables)")
@@ -99,38 +102,46 @@ func runCmd(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	diagnostics, closeLog, err := componentLog(*logTo)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sandbox-ctl run: --log-to: %v\n", err)
+		return 2
+	}
+	// Registered first so lifecycle cleanup and terminal errors finish before
+	// the component writer is flushed and the previous logger is restored.
+	defer closeLog()
 	if fs.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "sandbox-ctl run: unexpected positional arguments")
+		fmt.Fprintln(diagnostics, "sandbox-ctl run: unexpected positional arguments")
 		return 2
 	}
 	if *fromRef != "" && *restoreRef != "" {
-		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --from and --restore are mutually exclusive")
+		fmt.Fprintln(diagnostics, "sandbox-ctl run: --from and --restore are mutually exclusive")
 		return 2
 	}
 	if *replaceBoot && *restoreRef != "" {
-		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --replace-boot is not valid with --restore")
+		fmt.Fprintln(diagnostics, "sandbox-ctl run: --replace-boot is not valid with --restore")
 		return 2
 	}
 	if *replaceBoot && *fromRef == "" {
-		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --replace-boot requires --from")
+		fmt.Fprintln(diagnostics, "sandbox-ctl run: --replace-boot requires --from")
 		return 2
 	}
 	if *configPath == "" {
 		*configPath = os.Getenv("SANDBOX_CONFIG")
 	}
 	if *replaceBoot && *configPath == "" {
-		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --replace-boot requires --config or SANDBOX_CONFIG")
+		fmt.Fprintln(diagnostics, "sandbox-ctl run: --replace-boot requires --config or SANDBOX_CONFIG")
 		return 2
 	}
 	if *sandboxID != "" {
 		if err := validateSandboxIDArg(*sandboxID); err != nil {
-			fmt.Fprintf(os.Stderr, "sandbox-ctl run: --sandbox-id: %v\n", err)
+			fmt.Fprintf(diagnostics, "sandbox-ctl run: --sandbox-id: %v\n", err)
 			return 2
 		}
 	}
 	if *pathID != "" {
 		if err := validatePathIDArg(*pathID); err != nil {
-			fmt.Fprintf(os.Stderr, "sandbox-ctl run: --path-id: %v\n", err)
+			fmt.Fprintf(diagnostics, "sandbox-ctl run: --path-id: %v\n", err)
 			return 2
 		}
 	}
@@ -147,7 +158,7 @@ func runCmd(args []string) int {
 			log.Printf("[sandbox-ctl] "+format, args...)
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "sandbox-ctl run: %v\n", err)
+			fmt.Fprintf(diagnostics, "sandbox-ctl run: %v\n", err)
 			return 2
 		}
 		// Every subsequent return closes the descriptor, so startup failure is
@@ -169,7 +180,7 @@ func runCmd(args []string) int {
 		if s := os.Getenv("SANDBOX_PING_FATAL_THRESHOLD"); s != "" {
 			n, err := strconv.Atoi(s)
 			if err != nil || n < 0 {
-				fmt.Fprintf(os.Stderr, "sandbox-ctl run: bad SANDBOX_PING_FATAL_THRESHOLD=%q (want non-negative int)\n", s)
+				fmt.Fprintf(diagnostics, "sandbox-ctl run: bad SANDBOX_PING_FATAL_THRESHOLD=%q (want non-negative int)\n", s)
 				return 2
 			}
 			*pingFatal = n
@@ -187,7 +198,7 @@ func runCmd(args []string) int {
 		if s := os.Getenv("SANDBOX_STATS_INTERVAL"); s != "" {
 			d, err := time.ParseDuration(s)
 			if err != nil || d < 0 {
-				fmt.Fprintf(os.Stderr, "sandbox-ctl run: bad SANDBOX_STATS_INTERVAL=%q (want non-negative duration)\n", s)
+				fmt.Fprintf(diagnostics, "sandbox-ctl run: bad SANDBOX_STATS_INTERVAL=%q (want non-negative duration)\n", s)
 				return 2
 			}
 			*statsInterval = d
@@ -219,7 +230,7 @@ func runCmd(args []string) int {
 		tri(stdinSet, stdinFlag), tri(stdoutSet, stdoutFlag), tri(stderrSet, stderrFlag),
 		*stdinFrom, *stdoutTo, *stderrTo, tri(ttySet, ttyFlag), *console)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "sandbox-ctl run: %v\n", err)
+		fmt.Fprintf(diagnostics, "sandbox-ctl run: %v\n", err)
 		return 2
 	}
 
@@ -246,7 +257,7 @@ func runCmd(args []string) int {
 	if chBin == "" {
 		chBin, err = locateCH()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "sandbox-ctl run: cloud-hypervisor not found: %v\n", err)
+			fmt.Fprintf(diagnostics, "sandbox-ctl run: cloud-hypervisor not found: %v\n", err)
 			return 1
 		}
 	}
@@ -256,7 +267,7 @@ func runCmd(args []string) int {
 	// the secret manifest key rides in the MANIFEST_KEY env (resolved by
 	// pkg/manifest). orchestrator-ctl run-task sets both up before exec'ing here.
 	if *configPath == "" && *fromRef == "" {
-		fmt.Fprintln(os.Stderr, "sandbox-ctl run: --config or SANDBOX_CONFIG required")
+		fmt.Fprintln(diagnostics, "sandbox-ctl run: --config or SANDBOX_CONFIG required")
 		return 2
 	}
 	var (
@@ -269,28 +280,28 @@ func runCmd(args []string) int {
 	} else if *fromRef != "" || *restoreRef != "" {
 		cfg, presence, err = config.LoadMergedWithPresence(strings.Split(*configPath, ":"))
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintln(diagnostics, err)
 			return 1
 		}
 	} else {
 		// --config accepts ':'-separated paths, deep-merged front-to-back.
 		cfg, err = config.LoadMerged(strings.Split(*configPath, ":"))
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintln(diagnostics, err)
 			return 1
 		}
 	}
 	manifestCfg, err := config.LoadManifestConfig(*manifestPath)
 	if err != nil {
 		if !errors.Is(err, manifest.ErrConfigNotProvided) {
-			fmt.Fprintf(os.Stderr, "[sandbox-ctl] manifest config: %v\n", err)
+			fmt.Fprintf(diagnostics, "[sandbox-ctl] manifest config: %v\n", err)
 			return 1
 		}
 		manifestCfg = nil
 	}
 	processStorage, err := artifact.NewProcessStorage(manifestCfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[sandbox-ctl] local crypto: %v\n", err)
+		fmt.Fprintf(diagnostics, "[sandbox-ctl] local crypto: %v\n", err)
 		return 1
 	}
 	defer processStorage.Close()
@@ -303,7 +314,7 @@ func runCmd(args []string) int {
 	if *cgroupPath != "" {
 		resolved, inherited, rerr := resolveCgroupPathArg(*cgroupPath)
 		if rerr != nil {
-			fmt.Fprintf(os.Stderr, "[sandbox-ctl] --cgroup-path: %v\n", rerr)
+			fmt.Fprintf(diagnostics, "[sandbox-ctl] --cgroup-path: %v\n", rerr)
 			return 1
 		}
 		if inherited != nil {
@@ -325,7 +336,7 @@ func runCmd(args []string) int {
 	if restoreR != "" {
 		return runRestore(ctx, cfg, presence, manifestCfg, restoreR,
 			*sandboxID, *pathID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
-			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness)
+			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics)
 	}
 
 	var (
@@ -337,7 +348,7 @@ func runCmd(args []string) int {
 	if *fromRef != "" {
 		source, openErr := openSandboxRunSource(ctx, *fromRef, processStorage, refLocations)
 		if openErr != nil {
-			fmt.Fprintf(os.Stderr, "sandbox-ctl run --from: %v\n", openErr)
+			fmt.Fprintf(diagnostics, "sandbox-ctl run --from: %v\n", openErr)
 			return 1
 		}
 		if !*replaceBoot {
@@ -350,12 +361,12 @@ func runCmd(args []string) int {
 			if *replaceBoot {
 				_ = source.Close()
 			}
-			fmt.Fprintf(os.Stderr, "sandbox-ctl run --from: %v\n", applyErr)
+			fmt.Fprintf(diagnostics, "sandbox-ctl run --from: %v\n", applyErr)
 			return 1
 		}
 		if *replaceBoot {
 			if closeErr := source.Close(); closeErr != nil {
-				fmt.Fprintf(os.Stderr, "sandbox-ctl run --from: close source: %v\n", closeErr)
+				fmt.Fprintf(diagnostics, "sandbox-ctl run --from: close source: %v\n", closeErr)
 				return 1
 			}
 		} else {
@@ -394,7 +405,7 @@ func runCmd(args []string) int {
 		NotifyReadiness:    notifyReadiness,
 	})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(diagnostics, err)
 		return 1
 	}
 	return exit
@@ -405,13 +416,13 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 	ref string, sandboxID, pathID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
 	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
-	notifyReadiness sandbox.ReadinessNotify,
+	notifyReadiness sandbox.ReadinessNotify, diagnostics io.Writer,
 ) int {
 	// Validate host-only restore policy before inspecting the remote reference or
 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
 	// but the CLI owns NewFetcher and must not dial for an invalid config.
 	if err := cfg.ValidateRestoreHostConfigWithPresence(presence); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(diagnostics, err)
 		return 1
 	}
 
@@ -423,7 +434,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 	if strings.HasPrefix(ref, "manifest://") || strings.HasPrefix(ref, "file://") {
 		parsed, err := manifest.ParseRef(ref)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintln(diagnostics, err)
 			return 2
 		}
 		switch parsed.Scheme {
@@ -431,13 +442,13 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 			snapshotRef = parsed.String()
 			snapshotKey = parsed.Path
 			if manifestCfg == nil {
-				fmt.Fprintln(os.Stderr, "sandbox-ctl run --restore=manifest://: requires --manifest-config or MANIFEST_CONFIG")
+				fmt.Fprintln(diagnostics, "sandbox-ctl run --restore=manifest://: requires --manifest-config or MANIFEST_CONFIG")
 				return 2
 			}
 		case manifest.RefSchemeFile:
 			snapshotPath, err = refLocations.ResolveFile(parsed, "")
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
+				fmt.Fprintln(diagnostics, err)
 				return 2
 			}
 			if parsed.Location != "" || parsed.Digest != "" {
@@ -473,7 +484,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 		NotifyReadiness:     notifyReadiness,
 	})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(diagnostics, err)
 		return 1
 	}
 	return exit

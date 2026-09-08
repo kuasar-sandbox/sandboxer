@@ -75,7 +75,7 @@ func callRunRestoreForValidation(t *testing.T, cfg *config.SandboxConfig, manife
 			context.Background(), cfg, config.FieldPresence{}, manifestCfg, "manifest://deadbeef",
 			"test-sandbox", "", "/nonexistent/cloud-hypervisor",
 			runRoot, filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil,
-			nil, nil, nil, false, nil,
+			nil, nil, nil, false, nil, os.Stderr,
 		)
 	})
 }
@@ -131,7 +131,7 @@ func TestRunRestoreChecksDigestOnUnlocatedFileRef(t *testing.T) {
 			context.Background(), &config.SandboxConfig{}, config.FieldPresence{}, nil, ref,
 			"test-sandbox", "", "/nonexistent/cloud-hypervisor", runRoot,
 			filepath.Join(t.TempDir(), "base"), "", stdio.Defaults, 0, 0, nil, nil,
-			nil, nil, nil, false, nil,
+			nil, nil, nil, false, nil, os.Stderr,
 		)
 	})
 	if rc != 1 || !strings.Contains(stderr, "digest mismatch") {
