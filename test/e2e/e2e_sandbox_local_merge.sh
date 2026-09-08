@@ -131,7 +131,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $BLK0_REF
-    overlay: { diff: file://${3:-$DIFF_FILE}, size: 1GiB }
+    overlay: { diff: file://${3:-$DIFF_FILE} }
 launch:
   args: ["-c", $(python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" <<<"$PYTICK")]
   restart: never
@@ -147,7 +147,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    overlay: { diff: file://$3, size: 1GiB }
+    overlay: { diff: file://$3 }
 EOF
 }
 BLK0_OK="DISK blk0=TICK00000000"

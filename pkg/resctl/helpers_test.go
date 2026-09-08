@@ -29,7 +29,7 @@ boot:
   cmdline: "console=hvc0"
   root:
     base: file:///container.erofs
-    overlay: { diff: file:///run/sb/diff.ext4, size: 1GiB }
+    overlay: { diff: file:///run/sb/diff.ext4 }
 launch:
   exec: /usr/bin/echo
   args: ["hello", "world"]

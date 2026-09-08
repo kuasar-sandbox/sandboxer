@@ -161,7 +161,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $BLK0_REF
-    overlay: { diff: file://$diff, size: 1GiB }
+    overlay: { diff: file://$diff }
 launch:
   exec: /usr/local/bin/python3
   args:
@@ -196,7 +196,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    overlay: { diff: file://$diff, size: 1GiB }
+    overlay: { diff: file://$diff }
 EOF
 }
 
