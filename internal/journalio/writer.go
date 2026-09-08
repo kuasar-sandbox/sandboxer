@@ -47,6 +47,18 @@ func (w *Writer) Write(p []byte) (int, error) {
 	}
 	n := len(p)
 	for len(p) != 0 {
+		if len(w.buf) == MaxLine {
+			// Retain a full frame until the next byte (possibly in another
+			// Write) distinguishes an actual line ending from a forced split.
+			// Close still flushes a full unterminated frame without trimming.
+			lineEnd := p[0] == '\n'
+			w.emit(w.buf, lineEnd)
+			w.buf = w.buf[:0]
+			if lineEnd {
+				p = p[1:]
+			}
+			continue
+		}
 		limit := min(len(p), MaxLine-len(w.buf))
 		chunk := p[:limit]
 		if i := bytes.IndexByte(chunk, '\n'); i >= 0 {
@@ -62,11 +74,6 @@ func (w *Writer) Write(p []byte) (int, error) {
 		}
 		w.append(chunk)
 		p = p[limit:]
-		if len(w.buf) == MaxLine {
-			// A size boundary is not a line ending; retain CR bytes here.
-			w.emit(w.buf, false)
-			w.buf = w.buf[:0]
-		}
 	}
 	return n, nil
 }
