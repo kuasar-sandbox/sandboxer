@@ -149,6 +149,46 @@ func TestEncryptedBlockCOWPolicyAndReopen(t *testing.T) {
 	}
 }
 
+func TestTransientDiffFlushAndReopen(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "transient.diff")
+			var options []BlockCOWOption
+			if encrypted {
+				options = append(options, WithDiffEncryption(testDiffKey(0x23), true))
+			}
+			cow, err := OpenBlockCOW(path, nil, DiffInit{CreateSize: 2 * cowBlockSize, Transient: true}, options...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := bytes.Repeat([]byte{0x57}, cowBlockSize)
+			if _, err := cow.WriteAt(payload, cowBlockSize); err != nil {
+				_ = cow.Close()
+				t.Fatal(err)
+			}
+			if err := cow.Flush(); err != nil {
+				_ = cow.Close()
+				t.Fatal(err)
+			}
+			if err := cow.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := OpenBlockCOW(path, nil, DiffInit{Existing: true}, options...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			got := make([]byte, 2*cowBlockSize)
+			if _, err := reopened.ReadAt(got, 0); err != nil {
+				t.Fatal(err)
+			}
+			if !allZero(got[:cowBlockSize]) || !bytes.Equal(got[cowBlockSize:], payload) || reopened.DirtyCount() != 1 {
+				t.Fatal("transient creation changed sparse data or flush/reopen behavior")
+			}
+		})
+	}
+}
+
 func TestEncryptedDiffHeaderValidation(t *testing.T) {
 	key := testDiffKey(0x31)
 	create := func(t *testing.T) string {
@@ -691,7 +731,7 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 	}
 
 	seedFailure := filepath.Join(dir, "seed-failure.diff")
-	if _, err := initializeFreshDiffFile(seedFailure, size, encryption, failingDiffTemplate{size: size}); err == nil {
+	if _, err := initializeFreshDiffFile(seedFailure, size, encryption, failingDiffTemplate{size: size}, false); err == nil {
 		t.Fatal("injected template read failure was accepted")
 	}
 	if _, err := os.Stat(seedFailure); !os.IsNotExist(err) {

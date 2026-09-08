@@ -98,7 +98,7 @@ func TestPreflightRestoreDiskGraphRejectsUnformattedActiveDiff(t *testing.T) {
 		Base: baseRef,
 		Diff: "file://" + diffPath,
 	}}}
-	err = preflightRestoreDiskGraph(context.Background(), cfg, Options{
+	_, err = preflightRestoreDiskGraph(context.Background(), cfg, Options{
 		SandboxID: "restore-preflight",
 		BaseRoot:  filepath.Join(dir, "base"),
 	}, dir, [32]byte{})

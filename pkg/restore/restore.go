@@ -195,9 +195,14 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if err := config.BindPortableDiskGraph(&snapCfg, sandboxSource.RuntimeRef, sandboxSource.RelativeDir); err != nil {
 		return -1, fmt.Errorf("Sandbox source binding: %w", err)
 	}
-	if err := preflightRestoreDiskGraph(ctx, &snapCfg, opts, sandboxSource.RelativeDir, diffCustomerKey); err != nil {
+	// Validate the disk graph and keep the opened readers: reconstructDisk
+	// consumes exactly these — the same open-once handoff parentMemoryLayers
+	// uses for the memory chain, so no layer is opened twice.
+	diskReaders, err := preflightRestoreDiskGraph(ctx, &snapCfg, opts, sandboxSource.RelativeDir, diffCustomerKey)
+	if err != nil {
 		return -1, fmt.Errorf("restore disk graph preflight: %w", err)
 	}
+	defer diskReaders.Close()
 
 	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl run --restore] "+format, a...) }
 	startUnixNs := time.Now().UnixNano()
@@ -437,25 +442,15 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// memory-layer Close defer so cancellation and join always run first.
 	defer prefetch.Stop()
 
-	// Reconstruct each logical disk (root + data disks, in order): layer the
-	// captured base ([top] ++ base_from_refs) into a ro base, build a fresh
-	// writable CoW on top, and (overlay mode) open the erofs base as the ro
-	// device. All disk provenance comes from E/C0; S contributes no disk fields.
-	rootTop, rootChain := snapCfg.Boot.Root.Base, append([]string(nil), snapCfg.Boot.Root.BaseFromRefs...)
-	if !snapCfg.SingleDisk() {
-		rootTop = snapCfg.Boot.Root.Overlay.Base
-		rootChain = append([]string(nil), snapCfg.Boot.Root.Overlay.BaseFromRefs...)
-	}
-	rootDiffURI, rootDiffTmpl := snapCfg.Boot.Root.Diff, snapCfg.Boot.Root.DiffTemplate
-	if !snapCfg.SingleDisk() {
-		rootDiffURI, rootDiffTmpl = snapCfg.Boot.Root.Overlay.Diff, snapCfg.Boot.Root.Overlay.DiffTemplate
-	}
+	// Reconstruct each logical disk (root + data disks, in order): build a
+	// fresh writable CoW on the preflight-validated ro base, and (overlay
+	// mode) serve the erofs base as the ro device. All disk provenance comes
+	// from E/C0; S contributes no disk fields.
 	rootDiffSize, err := snapCfg.DiffSizeBytes()
 	if err != nil {
 		return -1, err
 	}
-	rootDB, rootCleanup, err := reconstructDisk(ctx, opts, diffCustomerKey, snapCfg.SingleDisk(), rootTop, rootChain,
-		snapCfg.Boot.Root.Base, rootDiffURI, rootDiffTmpl, rootDiffSize, "overlay", logf)
+	rootDB, rootCleanup, err := reconstructDisk(opts, diffCustomerKey, &snapCfg.Boot.Root, rootDiffSize, "overlay", diskReaders[0])
 	if err != nil {
 		return -1, err
 	}
@@ -464,18 +459,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
 
 	for i := range snapCfg.Boot.Disks {
 		d := &snapCfg.Boot.Disks[i]
-		single := d.Single()
-		top, chain := d.Base, append([]string(nil), d.BaseFromRefs...)
-		diffURI, diffTmpl := d.Diff, d.DiffTemplate
-		if !single {
-			top, chain = d.Overlay.Base, append([]string(nil), d.Overlay.BaseFromRefs...)
-			diffURI, diffTmpl = d.Overlay.Diff, d.Overlay.DiffTemplate
-		}
 		dsz, err := d.RootConfig.DiffSizeBytes(fmt.Sprintf("boot.disks[%d]", i))
 		if err != nil {
 			return -1, err
 		}
-		db, dcleanup, derr := reconstructDisk(ctx, opts, diffCustomerKey, single, top, chain, d.Base, diffURI, diffTmpl, dsz, fmt.Sprintf("disk%d", i), logf)
+		db, dcleanup, derr := reconstructDisk(opts, diffCustomerKey, &d.RootConfig, dsz, fmt.Sprintf("disk%d", i), diskReaders[1+i])
 		if derr != nil {
 			return -1, derr
 		}
@@ -678,15 +666,11 @@ func openAndEstablishRestoreMUX(
 	return spec, nil
 }
 
-// reconstructDisk rebuilds one logical disk for restore: the read-only base is
-// [captured top] ++ chain (§3.5) layered into a Stream; a FRESH writable CoW is
-// built on top (single mode: this IS the disk; overlay mode: the ext4 upper).
-// In overlay mode the erofs base (erofsBaseURI) is opened as the ro device.
-// capturedTop/chain come from Sandbox E's portable disk graph;
-// diffURI/diffTemplate come from the restore host binding (or the auto-default
-// <sid>.<diskKey>.diff).
-// The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate string, diffSize int64, diskKey string, logf func(string, ...any)) (sandbox.DiskBackend, func(), error) {
+// reconstructDisk rebuilds one logical disk from the preflight-opened base
+// readers: base feeds the fresh writable CoW; erofs (overlay mode) serves
+// as the ro device directly. Callers own the readers' lifetime (Run defers
+// their Close); the returned cleanup only covers what this function created.
+func reconstructDisk(opts Options, diffCustomerKey [32]byte, root *config.RootConfig, diffSize int64, diskKey string, readers restoreDiskReaders) (sandbox.DiskBackend, func(), error) {
 	var db sandbox.DiskBackend
 	var closers []func()
 	cleanup := func() {
@@ -695,18 +679,12 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 		}
 	}
 	fail := func(e error) (sandbox.DiskBackend, func(), error) { cleanup(); return sandbox.DiskBackend{}, nil, e }
-	db.Overlay = !single
-
-	// Layered ro base: [captured top] ++ chain.
-	logf("disk %s image: opening captured top", diskKey)
-	refs := append([]string{capturedTop}, chain...)
-	baseReader, err := openLayeredDiskBase(ctx, refs, func(ctx context.Context, raw string) (fetch.Stream, error) {
-		return openDiskRefStream(ctx, raw, opts)
-	})
-	if err != nil {
-		return fail(fmt.Errorf("%s: open base: %w", diskKey, err))
+	db.Overlay = root.Overlay != nil
+	diffURI, diffTemplate := root.Diff, root.DiffTemplate
+	if db.Overlay {
+		diffURI, diffTemplate = root.Overlay.Diff, root.Overlay.DiffTemplate
+		db.Reader, db.BasePath = readers.erofs, root.Base
 	}
-	closers = append(closers, func() { baseReader.Close() })
 
 	// Fresh writable diff. Empty URI → auto-default (ours to remove).
 	if diffURI == "" {
@@ -723,30 +701,22 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	if !ok {
 		return fail(fmt.Errorf("%s: bad diff uri: %s", diskKey, diffURI))
 	}
-	diffInit, err := sandbox.PrepareDiff(diffPath, diffTemplate, baseReader.Size(), diffSize)
+	diffInit, err := sandbox.PrepareDiff(diffPath, diffTemplate, readers.base.Size(), diffSize)
 	if err != nil {
 		return fail(fmt.Errorf("%s: prepare diff: %w", diskKey, err))
 	}
+	diffInit.Transient = db.OwnedDiff
 	var cowOptions []vhost.BlockCOWOption
 	if opts.LocalCodec != nil {
 		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
 	}
-	cow, err := vhost.OpenBlockCOW(diffPath, baseReader, diffInit, cowOptions...)
+	cow, err := vhost.OpenBlockCOW(diffPath, readers.base, diffInit, cowOptions...)
 	if err != nil {
 		return fail(fmt.Errorf("%s: open BlockCOW: %w", diskKey, err))
 	}
 	closers = append(closers, func() { cow.Close() })
 	db.Cow, db.DiffPath = cow, diffPath
 
-	// Overlay mode: the ro erofs base device.
-	if !single {
-		r, _, rerr := openEROFSBlockReader(ctx, erofsBaseURI, opts)
-		if rerr != nil {
-			return fail(fmt.Errorf("%s: open erofs base: %w", diskKey, rerr))
-		}
-		db.Reader, db.BasePath = r, erofsBaseURI
-		closers = append(closers, func() { r.Close() })
-	}
 	return db, cleanup, nil
 }
 
@@ -1060,106 +1030,57 @@ func applyDefaultRestoreArtifactBindings(host *config.SandboxConfig, portable *c
 	bind(&host.Boot.Runtime, portable.Boot.Runtime)
 }
 
-func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, opts Options, relativeDir string, diffCustomerKey [32]byte) error {
+// restoreDiskReaders holds one disk's validated base and optional EROFS device.
+type restoreDiskReaders struct {
+	base, erofs vhost.BlockReader
+}
+
+// restoreDiskGraph owns readers in disk order: root, then boot.disks[].
+type restoreDiskGraph []restoreDiskReaders
+
+func (disks restoreDiskGraph) Close() error {
+	var err error
+	for _, disk := range disks {
+		if disk.erofs != nil {
+			err = errors.Join(err, disk.erofs.Close())
+		}
+		if disk.base != nil {
+			err = errors.Join(err, disk.base.Close())
+		}
+	}
+	return err
+}
+
+// preflightRestoreDiskGraph validates the immutable layers and writable diff
+// plan before side effects. On success the caller owns the retained readers;
+// on failure this function closes every reader opened so far.
+func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, opts Options, relativeDir string, diffCustomerKey [32]byte) (_ restoreDiskGraph, retErr error) {
 	if cfg == nil {
-		return errors.New("nil restored Sandbox config")
+		return nil, errors.New("nil restored Sandbox config")
 	}
 	opts.ArtifactRelativeDir = relativeDir
-	seen := make(map[string]uint64)
-	seenImages := make(map[string]uint64)
-	open := func(field, raw string) (uint64, error) {
-		if raw == "" {
-			return 0, fmt.Errorf("%s is empty", field)
+	disks := make(restoreDiskGraph, 1+len(cfg.Boot.Disks))
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, disks.Close())
 		}
-		if size, ok := seen[raw]; ok {
-			return size, nil
-		}
-		stream, err := openDiskRefStream(ctx, raw, opts)
-		if err != nil {
-			return 0, fmt.Errorf("%s: %w", field, err)
-		}
-		size := stream.Size()
-		if closeErr := stream.Close(); closeErr != nil {
-			return 0, fmt.Errorf("%s close: %w", field, closeErr)
-		}
-		seen[raw] = size
-		return size, nil
-	}
-	openImage := func(field, raw string) (uint64, error) {
-		if raw == "" {
-			return 0, fmt.Errorf("%s is empty", field)
-		}
-		if size, ok := seenImages[raw]; ok {
-			return size, nil
-		}
-		reader, size, err := openEROFSBlockReader(ctx, raw, opts)
-		if err != nil {
-			return 0, fmt.Errorf("%s: %w", field, err)
-		}
-		if closeErr := reader.Close(); closeErr != nil {
-			return 0, fmt.Errorf("%s close: %w", field, closeErr)
-		}
-		seenImages[raw] = uint64(size)
-		return uint64(size), nil
-	}
-	checkLayers := func(field, top string, lowers []string) error {
-		want, err := open(field, top)
-		if err != nil {
-			return err
-		}
-		for i, raw := range lowers {
-			size, err := open(fmt.Sprintf("%s.base_from_refs[%d]", field, i), raw)
-			if err != nil {
-				return err
-			}
-			if size != want {
-				return fmt.Errorf("%s layer size %d conflicts with top size %d", field, size, want)
-			}
-		}
-		return nil
-	}
+	}()
+	// openLayers opens [top] ++ lowers once, size-checks every layer, and
+	// returns the layered reader for the caller to keep open.
 	openLayers := func(field, top string, lowers []string) (vhost.BlockReader, error) {
-		refs := append([]string{top}, lowers...)
-		streams := make([]fetch.Stream, 0, len(refs))
-		var logicalSize uint64
-		fail := func(cause error) (vhost.BlockReader, error) {
-			for _, stream := range streams {
-				cause = errors.Join(cause, stream.Close())
-			}
-			return nil, cause
+		reader, err := openLayeredDiskBase(ctx, append([]string{top}, lowers...), func(ctx context.Context, raw string) (fetch.Stream, error) {
+			return openDiskRefStream(ctx, raw, opts)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", field, err)
 		}
-		for i, raw := range refs {
-			stream, err := openDiskRefStream(ctx, raw, opts)
-			if err != nil {
-				return fail(fmt.Errorf("%s layer[%d]: %w", field, i, err))
-			}
-			if i == 0 {
-				logicalSize = stream.Size()
-				if logicalSize > math.MaxInt64 {
-					streams = append(streams, stream)
-					return fail(fmt.Errorf("%s logical size %d exceeds host block-reader limit", field, logicalSize))
-				}
-			} else if stream.Size() != logicalSize {
-				streams = append(streams, stream)
-				return fail(fmt.Errorf("%s layer[%d] size %d conflicts with top size %d", field, i, stream.Size(), logicalSize))
-			}
-			streams = append(streams, stream)
-		}
-		layered := fetch.NewLayered(streams...)
-		return vhost.NewStreamReader(ctx, layered, int64(logicalSize)), nil
+		return reader, nil
 	}
-	validateWritable := func(field string, root *config.RootConfig, diskKey string) (retErr error) {
-		top, lowers := root.Base, root.BaseFromRefs
+	validateWritable := func(field string, root *config.RootConfig, diskKey string, base vhost.BlockReader) error {
 		diffURI, templateURI := root.Diff, root.DiffTemplate
 		if root.Overlay != nil {
-			top, lowers = root.Overlay.Base, root.Overlay.BaseFromRefs
 			diffURI, templateURI = root.Overlay.Diff, root.Overlay.DiffTemplate
 		}
-		base, err := openLayers(field, top, lowers)
-		if err != nil {
-			return err
-		}
-		defer func() { retErr = errors.Join(retErr, base.Close()) }()
 		if diffURI == "" {
 			diffURI = sandbox.DefaultDiskDiffURI(
 				sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID), opts.SandboxID, diskKey)
@@ -1198,30 +1119,34 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		}
 		return nil
 	}
-	checkRoot := func(field string, root *config.RootConfig) error {
+	checkRoot := func(field string, root *config.RootConfig, readers *restoreDiskReaders) error {
+		var err error
 		if root.Overlay == nil {
-			return checkLayers(field, root.Base, root.BaseFromRefs)
-		}
-		if _, err := openImage(field+".base", root.Base); err != nil {
+			readers.base, err = openLayers(field, root.Base, root.BaseFromRefs)
 			return err
 		}
-		return checkLayers(field+".overlay", root.Overlay.Base, root.Overlay.BaseFromRefs)
-	}
-	if err := checkRoot("boot.root", &cfg.Boot.Root); err != nil {
+		// Overlay mode: the ro image device, then the ext4 layer graph.
+		readers.erofs, _, err = openEROFSBlockReader(ctx, root.Base, opts)
+		if err != nil {
+			return fmt.Errorf("%s.base: %w", field, err)
+		}
+		readers.base, err = openLayers(field+".overlay", root.Overlay.Base, root.Overlay.BaseFromRefs)
 		return err
 	}
-	if err := validateWritable("boot.root", &cfg.Boot.Root, "overlay"); err != nil {
-		return err
-	}
-	for i := range cfg.Boot.Disks {
-		if err := checkRoot(fmt.Sprintf("boot.disks[%d]", i), &cfg.Boot.Disks[i].RootConfig); err != nil {
-			return err
+	for i := range disks {
+		root, field, key := &cfg.Boot.Root, "boot.root", "overlay"
+		if i > 0 {
+			root = &cfg.Boot.Disks[i-1].RootConfig
+			field, key = fmt.Sprintf("boot.disks[%d]", i-1), fmt.Sprintf("disk%d", i-1)
 		}
-		if err := validateWritable(fmt.Sprintf("boot.disks[%d]", i), &cfg.Boot.Disks[i].RootConfig, fmt.Sprintf("disk%d", i)); err != nil {
-			return err
+		if err := checkRoot(field, root, &disks[i]); err != nil {
+			return nil, err
+		}
+		if err := validateWritable(field, root, key, disks[i].base); err != nil {
+			return nil, err
 		}
 	}
-	return nil
+	return disks, nil
 }
 
 func validateRestoreExt4Reader(ctx context.Context, reader vhost.BlockReader) error {
