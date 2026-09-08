@@ -152,7 +152,7 @@ func validateRestoreDiskBindings(artifact *PortableSandboxConfig, host *SandboxC
 			return errors.New("run --restore: host boot.root.overlay changes the Sandbox disk topology")
 		}
 	} else {
-		if host.Boot.Root.Diff != "" || host.Boot.Root.DiffTemplate != "" || host.Boot.Root.DiffSize != "" {
+		if host.Boot.Root.Diff != "" || host.Boot.Root.DiffTemplate != "" {
 			return errors.New("run --restore: root overlay active diff fields must be under boot.root.overlay")
 		}
 		if host.Boot.Root.Overlay != nil && (host.Boot.Root.Overlay.Base != "" || len(host.Boot.Root.Overlay.BaseFromRefs) != 0) {
@@ -177,7 +177,7 @@ func validateRestoreDiskBindings(artifact *PortableSandboxConfig, host *SandboxC
 			}
 			continue
 		}
-		if hostDisk.Diff != "" || hostDisk.DiffTemplate != "" || hostDisk.DiffSize != "" {
+		if hostDisk.Diff != "" || hostDisk.DiffTemplate != "" {
 			return fmt.Errorf("run --restore: boot.disks[%d] overlay active diff fields must be under overlay", i)
 		}
 		if hostDisk.Overlay != nil && (hostDisk.Overlay.Base != "" || len(hostDisk.Overlay.BaseFromRefs) != 0) {

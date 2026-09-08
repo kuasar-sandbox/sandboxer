@@ -30,8 +30,7 @@ func makeMinimalCfg() *config.SandboxConfig {
 			Root: config.RootConfig{
 				Base: "file:///c.erofs",
 				Overlay: &config.OverlayConfig{
-					Diff:     "file:///d.ext4",
-					DiffSize: "1GiB",
+					Diff: "file:///d.ext4",
 				},
 			},
 		},

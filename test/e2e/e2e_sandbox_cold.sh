@@ -147,7 +147,6 @@ boot:
     base: $BLK0_REF
     overlay:
       diff: file://$DIFF_FILE
-      size: 1GiB
 launch:
   # Args use a uniquely-shaped python expression: the script computes
   # version components and emits a marker the e2e grep can distinguish

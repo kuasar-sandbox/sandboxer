@@ -78,11 +78,9 @@ boot:
     base: $BLK0_REF
     overlay:
       diff_template: file://$WORK/root-template.ext4
-      size: 512MiB
   disks:
     - name: scratch
       diff_template: file://$WORK/data-template.ext4
-      diff_size: 256MiB
 mounts:
   - { target: /scratch, type: disk, source: scratch }
 launch: { exec: /bin/sleep, args: ["3600"], restart: never }
@@ -150,11 +148,9 @@ boot:
   root:
     overlay:
       diff_template: file://$WORK/root-template.ext4
-      size: 512MiB
   disks:
     - name: scratch
       diff_template: file://$WORK/data-template.ext4
-      diff_size: 256MiB
 EOF
 
 SID_C="logical-phase-c"

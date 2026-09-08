@@ -87,7 +87,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $BLK0_REF
-    overlay: { diff: file://$DIFF_FILE, size: 1GiB }
+    overlay: { diff: file://$DIFF_FILE }
 launch:
   args: ["-c", $(python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))' <<<"$PYCODE")]
   restart: never
@@ -127,7 +127,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    overlay: { diff: file://$DIFF_R, size: 1GiB }
+    overlay: { diff: file://$DIFF_R }
 files:
   - path: /etc/instance-id
     content: "clone-42"
@@ -153,7 +153,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    overlay: { diff: file://$DIFF_R, size: 1GiB }
+    overlay: { diff: file://$DIFF_R }
 EOF
 
 LOG2="$WORK/run2.log"; SID2="rf2-$$"; mkdir -p "$RUNTIME_ROOT/$SID2"

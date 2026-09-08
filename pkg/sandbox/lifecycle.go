@@ -518,11 +518,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if cowBase != nil {
 		baseSize = cowBase.Size()
 	}
-	diffSize, err := opts.Cfg.DiffSizeBytes()
-	if err != nil {
-		return -1, err
-	}
-	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize, diffSize)
+	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize)
 	if err != nil {
 		return -1, fmt.Errorf("prepare diff: %w", err)
 	}
@@ -1392,11 +1388,7 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 	if cowBase != nil {
 		baseSize = cowBase.Size()
 	}
-	diffSize, err := d.RootConfig.DiffSizeBytes(field)
-	if err != nil {
-		return fail(err)
-	}
-	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize, diffSize)
+	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize)
 	if err != nil {
 		return fail(fmt.Errorf("%s prepare diff: %w", field, err))
 	}

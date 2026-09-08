@@ -96,11 +96,11 @@ See the [project release documentation](https://github.com/kuasar-sandbox/kuasar
 
 ## Documentation
 
-- [Sandbox artifacts](docs/sandbox-artifacts.md) — complete contract and usage entry.
+- [Sandbox artifacts](docs/sandbox-artifacts.md) — portable E/S configuration, parent/reference graph, carriers, integrity and publication contracts.
 
 Full design and reference documents:
 
-- [`docs/sandbox.md`](docs/sandbox.md) — host control plane, sandbox formats, artifacts, snapshot/export/restore, named locations, and resource semantics;
+- [`docs/sandbox.md`](docs/sandbox.md) — host control plane, configuration, cold start, snapshot/export/restore sequencing, resource execution, and cleanup;
 - [`docs/sandbox-init.md`](docs/sandbox-init.md) — guest PID 1 ABI, staged initialization, vsock control, stdio multiplexing, and application contract;
 - [`docs/cloud-hypervisor.md`](docs/cloud-hypervisor.md) — patched Cloud Hypervisor source, build, and runtime contracts.
 

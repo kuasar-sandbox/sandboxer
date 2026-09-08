@@ -14,7 +14,7 @@ func TestPrepareDiffReturnsInitializationPlanWithoutSideEffects(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	plan, err := PrepareDiff(target, "file://"+template, 0, 1<<30)
+	plan, err := PrepareDiff(target, "file://"+template, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +25,7 @@ func TestPrepareDiffReturnsInitializationPlanWithoutSideEffects(t *testing.T) {
 		t.Fatalf("planning created target: %v", err)
 	}
 
-	plan, err = PrepareDiff(target, "", 8*4096, 1<<30)
+	plan, err = PrepareDiff(target, "", 8*4096)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestPrepareDiffReturnsInitializationPlanWithoutSideEffects(t *testing.T) {
 	if err := os.WriteFile(target, []byte("existing"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	plan, err = PrepareDiff(target, "not-a-valid-template-uri", 8*4096, 1<<30)
+	plan, err = PrepareDiff(target, "not-a-valid-template-uri", 8*4096)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,16 +50,16 @@ func TestPrepareDiffReturnsInitializationPlanWithoutSideEffects(t *testing.T) {
 
 func TestPrepareDiffRejectsInvalidFreshSources(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "active.diff")
-	if _, err := PrepareDiff(target, "manifest://not-a-file", 0, 1<<30); err == nil {
+	if _, err := PrepareDiff(target, "manifest://not-a-file", 0); err == nil {
 		t.Fatal("manifest diff template was accepted")
 	}
-	if _, err := PrepareDiff(target, "", 0, 1<<30); err == nil {
+	if _, err := PrepareDiff(target, "", 0); err == nil {
 		t.Fatal("fresh diff without an ext4 source was accepted")
 	}
 	if err := os.WriteFile(target, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := PrepareDiff(target, "file:///unused-template", 0, 1<<30); err == nil {
+	if _, err := PrepareDiff(target, "file:///unused-template", 0); err == nil {
 		t.Fatal("existing empty diff was accepted")
 	}
 }

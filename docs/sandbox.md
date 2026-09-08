@@ -260,7 +260,6 @@ boot:
       # Host-only active binding:
       diff: file:///var/lib/kuasar/s1.overlay.diff
       diff_template: file:///opt/kuasar/empty.ext4
-      diff_size: 1GiB
   disks:
     - name: data
       base: file:///layers/data.overlay@digest:<digest>
@@ -843,3 +842,52 @@ The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#144
 - [timeouts-production.yaml](../examples/timeouts-production.yaml) — Production host-timeout example.
 - [restore-prefetch-memory.yaml](../examples/restore-prefetch-memory.yaml) — Explicit memory-prefetch example.
 - [README.md](../README.md) — Build, release, and repository entry points.
+
+## Writable disk capacity and migration
+
+Writable disk capacity is inherited from the selected filesystem source, not
+from a separate size setting. An existing non-empty active `diff` keeps its
+logical capacity. A fresh diff initialized from `diff_template` inherits the
+template's logical capacity; without a template, a fresh diff over a COW `base`
+inherits that base's logical capacity. An empty existing diff or a fresh disk
+without a filesystem source remains invalid. In two-device overlay mode, this
+COW base belongs to the writable ext4 upper, not the read-only EROFS image.
+These rules apply to both `boot.root` and `boot.disks[]` and remain unchanged
+for cold starts, `run --from`, and memory restores.
+
+The former `diff_size` setting never enforced capacity or a quota in these
+supported paths. It has been removed, together with its misleading 1 GiB
+default. Configurations that explicitly supply `diff_size` or the mistaken
+`size` spelling directly under a root/data disk or its `overlay` now fail with
+an actionable error, including empty and null values. Remove these keys from
+existing configuration and provision a filesystem source with the required
+capacity. New configuration output does not emit them. Unrelated fields and
+opaque metadata are unaffected.
+
+For a **new**, empty 512 MiB scratch filesystem, prepare a new template and
+select it without a size override:
+
+```bash
+truncate -s 512M /tmp/scratch-512m.ext4
+mkfs.ext4 -F /tmp/scratch-512m.ext4
+```
+
+```yaml
+boot:
+  # Keep the other required boot fields from the complete configuration.
+  disks:
+    - name: scratch
+      diff_template: file:///tmp/scratch-512m.ext4
+mounts:
+  - target: /scratch
+    type: disk
+    source: scratch
+```
+
+Use a new active diff: an existing diff takes precedence, so changing a template
+does not resize or replace existing data. Do not truncate an existing filesystem
+to impose a smaller limit. Sandboxer does not automatically resize filesystems,
+cap COW dirty bytes, or change disk capacity at startup or restore. Logical block
+device capacity is distinct from an encrypted file's physical length, host disk
+allocation, and the guest filesystem's available file-data space. This migration
+does not introduce arbitrary per-instance capacity selection from one template.

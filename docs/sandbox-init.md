@@ -76,6 +76,9 @@ This file defines the runtime contract of the image's `/sbin/init` and how
   restore/attach. Each exec session has a separate, independently concurrent
   MUX lasting for that command (§3.6).
 
+<a id="2-sandbox-runtimebundle-镜像结构"></a>
+<a id="2-sandbox-runtimebundle-image-layout"></a>
+
 ## 2. Runtime image consumption prerequisites
 
 The [Runtime Bundle specification](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime.md) owns complete packaging, file inventory, versioning and build rules. PID 1 relies on these consumption boundaries:

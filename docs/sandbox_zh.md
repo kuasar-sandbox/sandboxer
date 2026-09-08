@@ -266,7 +266,6 @@ boot:
       # Host-only active binding:
       diff: file:///var/lib/kuasar/s1.overlay.diff
       diff_template: file:///opt/kuasar/empty.ext4
-      diff_size: 1GiB
   disks:
     - name: data
       base: file:///layers/data.overlay@digest:<digest>
@@ -848,3 +847,44 @@ Benchmark分别覆盖local tarstream/Bundle create、Bundle read、sparse merge�
 - [timeouts-production.yaml](../examples/timeouts-production.yaml) — production host timeout 示例。
 - [restore-prefetch-memory.yaml](../examples/restore-prefetch-memory.yaml) — explicit memory prefetch 示例。
 - [README_zh.md](../README_zh.md) — build、release 与 repository 入口。
+
+## 可写磁盘容量与配置迁移
+
+可写磁盘的容量继承自所选文件系统来源，而不是独立的大小配置。已有且非空的活动
+`diff` 保留其逻辑容量；从 `diff_template` 初始化的新 diff 继承模板的逻辑容量；
+没有模板时，基于 COW `base` 创建的新 diff 继承该 base 的逻辑容量。已有的空 diff，
+以及没有文件系统来源的新磁盘，仍然属于无效输入。在双设备 overlay 模式下，这里的
+COW base 属于可写 ext4 upper，不是只读 EROFS 镜像。这些规则同时适用于 `boot.root`
+和 `boot.disks[]`，冷启动、`run --from` 以及内存快照恢复均保持原有行为。
+
+原来的 `diff_size` 在这些受支持的路径上从未实施容量或配额限制。该配置及其具有误导性
+的 1 GiB 默认值现已删除。在 root、数据盘或其 `overlay` 下显式配置 `diff_size`，
+或使用错误的 `size` 写法，现在都会返回附带迁移指引的错误，包括空字符串和 null 值。
+请从已有配置中删除这些键，并准备具有所需容量的文件系统来源。新生成的配置不再输出
+这些键；无关配置字段和不透明的 metadata 不受影响。
+
+对于一个**新建的**、空白的 512 MiB scratch 文件系统，可以准备新模板，使用时不再指定
+大小覆盖项：
+
+```bash
+truncate -s 512M /tmp/scratch-512m.ext4
+mkfs.ext4 -F /tmp/scratch-512m.ext4
+```
+
+```yaml
+boot:
+  # 保留完整配置中的其他必需 boot 字段。
+  disks:
+    - name: scratch
+      diff_template: file:///tmp/scratch-512m.ext4
+mounts:
+  - target: /scratch
+    type: disk
+    source: scratch
+```
+
+必须使用新的活动 diff：已有 diff 优先，因此更换模板不会调整容量或替换已有数据。
+不要通过截断已有文件系统来实施更小的限制。Sandboxer 不会自动调整文件系统大小，
+不会限制 COW 脏数据字节数，也不会在启动或恢复时改变磁盘容量。逻辑块设备容量与加密
+文件的物理长度、宿主磁盘实际分配空间、guest 文件系统可用于文件数据的空间并不是
+同一个概念。本次迁移不提供从同一个模板任意选择各实例容量的新能力。

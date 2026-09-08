@@ -62,6 +62,8 @@
   那条 MUX 任一时刻至多一条(launch 生,restore/attach 续);exec 每次会话另起一条
   独立、短生命的 MUX,可并发多条(§3.6)
 
+<a id="2-sandbox-runtimebundle-镜像结构"></a>
+
 ## 2. Runtime 镜像消费前提
 
 完整的 sandbox-runtime.bundle 包装、文件清单、版本和构建规则由 [Runtime Bundle](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime_zh.md)维护。此处只定义 PID 1 必须满足的消费边界：
