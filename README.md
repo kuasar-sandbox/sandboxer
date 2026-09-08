@@ -96,6 +96,8 @@ See the [project release documentation](https://github.com/kuasar-sandbox/kuasar
 
 ## Documentation
 
+- [Sandbox artifacts](docs/sandbox-artifacts.md) — complete contract and usage entry.
+
 Full design and reference documents:
 
 - [`docs/sandbox.md`](docs/sandbox.md) — host control plane, sandbox formats, artifacts, snapshot/export/restore, named locations, and resource semantics;

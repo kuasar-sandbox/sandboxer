@@ -119,6 +119,8 @@ guest-runtime 构建 runtime 镜像和 build sandbox 内展平镜像时使用的
 
 ## 文档
 
+- [沙箱工件](docs/sandbox-artifacts_zh.md) — 完整契约与使用入口。
+
 - [docs/sandbox_zh.md](docs/sandbox_zh.md) — host 控制平面、PortableSandboxConfig、
   `.overlay`/Sandbox E/Snapshot S、carrier、export/snapshot/restore/publish与资源模型。
 - [docs/sandbox-init_zh.md](docs/sandbox-init_zh.md) — guest PID 1 ABI:

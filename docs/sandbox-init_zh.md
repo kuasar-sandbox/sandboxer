@@ -62,38 +62,17 @@
   那条 MUX 任一时刻至多一条(launch 生,restore/attach 续);exec 每次会话另起一条
   独立、短生命的 MUX,可并发多条(§3.6)
 
-## 2. sandbox-runtime.bundle 镜像结构
+## 2. Runtime 镜像消费前提
 
-```
-/sbin/init                sandbox-init 静态 Go 二进制
-/proc/                    空挂载点
-/sys/                     空挂载点
-/dev/                     空挂载点
-/overlay/lower/           空挂载点(blk0/vda EROFS 挂入点 = overlayfs lowerdir)
-/overlay/upper/           空挂载点(blk1/vdb ext4 挂入点;内含 upperdir/ workdir/ volumes/)
-/sysroot/                 空挂载点(overlayfs 合并目标 + chroot 目标)
-/sysdisks/disk-{0..7}{,-lower,-upper}/  24 个预建数据盘 staging 挂载点
-/opt/sandbox-runtime/     Guest 侧发布件根(平台保留);phase1a 末 bind 进 /sysroot 同名路径
-/opt/sandbox-runtime/bin/{envd,flatten-ctl,mkfs.erofs}  target arch guest 工具
-```
+完整的 sandbox-runtime.bundle 包装、文件清单、版本和构建规则由 [Runtime Bundle](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime_zh.md)维护。此处只定义 PID 1 必须满足的消费边界：
 
-**除 `/sbin/init`、挂载目录与 `/opt/sandbox-runtime/` 外，外层镜像不提供发行版文件树**：
-无 /etc、/usr、/var、/lib 或共享库目录。init 自身的文件系统操作不依赖外部工具；内置 payload 工具有独立的应用用途。
+- `/sbin/init` 必须是匹配 Guest 架构的 sandbox-init；本仓 `make sandbox-init` 生成它。
+- Runtime 预建早期挂载及数据盘 staging 目录；phase 1a 按下文构造实际用户 rootfs，外层 Runtime 不是通用发行版 `/etc`、`/usr` 或共享库环境。
+- `/opt/sandbox-runtime/` 是保留的只读 Guest payload 根，phase 1a 将其 bind 到用户 rootfs 同名路径，遮蔽用户镜像已有内容；应用必须遵守应用环境章节的约束。
+- virtio-pmem/DAX 复用相同 backing file 的只读页，不共享各 Guest 私有可写 RAM。init 和 payload 可执行文件都必须匹配目标架构。
 
-`/opt/sandbox-runtime/` 是 **Guest 侧发布件根**:随 runtime 镜像出厂的平台运行时
-组件放此处,经 virtio-pmem + DAX 跨 sandbox 共享一份、与 sandbox-init 原子同版;
-phase1a 把它 bind 进新 root 同名路径(§3.1),应用在自身 rootfs 内以**只读**看到它,
-且该路径遮蔽 app 镜像在此的任何内容(§5.2)。实际镜像由 `guest-runtime` 打包,
-首版内置 `/opt/sandbox-runtime/bin/{envd,flatten-ctl,mkfs.erofs}`。
+Runtime 生产、host/target mkfs 区分和 Native 构建操作见 [Runtime 构建](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime_zh.md#3-构建)及 [Native 指南](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/README_zh.md)。Host–Guest 握手、挂载次序与 ABI 继续由本文完整定义。
 
-早期 init 二进制约 10–15 MiB、镜像约 15 MiB、驻留工作集约 10 MiB 是历史估计，
-不是当前包含 payload 的 bundle 的实测或大小保证，须对实际工件与 workload 测量。
-DAX 共享同一 backing file 的只读页，不共享 guest 私有可写 RAM。EROFS 格式 endian-neutral，
-host-native mkfs.erofs 可构建任意目标架构镜像，但 init 与 guest payload 二进制必须匹配 target arch。
-
-`sandbox-init` 由本仓 `make sandbox-init` 构建;`sandbox-runtime.bundle` 由
-`guest-runtime` 消费该二进制并通过 `make sandbox-runtime` 打包。mkfs.erofs 构建详见
-[guest-runtime native build](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/docs/build_zh.md) §2.1。
 
 ## 3. sandbox-init 三阶段
 
@@ -1288,5 +1267,5 @@ FileSpec 还支持 read_only，省略时 bind 可写。Tmpfs 注入避免直接�
   文件系统 / virtio-console / 网络功能为何如此
 - [Cloud Hypervisor 文档](cloud-hypervisor_zh.md) §5.2 —— vsock hybrid 代理:host
   侧映射到 UDS 的 CONNECT 行格式;`--console` / `--serial` 的用法
-- [guest-runtime native build](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/docs/build_zh.md) §2.1 —— mkfs.erofs 构建(`make -C guest-runtime sandbox-runtime` 的前置工具)
+- [guest-runtime native build](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/README_zh.md) §2.1 —— mkfs.erofs 构建(`make -C guest-runtime sandbox-runtime` 的前置工具)
 - [项目系统设计](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md) §4 —— 模板实例化与暂停/恢复的用户语义
