@@ -138,9 +138,9 @@ func (c SandboxConfig) isRestoreHostProjection() bool {
 	if c.Resources.Startup == nil || c.Boot.Kernel == "" || c.Boot.Runtime == "" || len(c.Boot.Disks) != 0 || root.Overlay == nil {
 		return false
 	}
-	return root.Diff == "" && root.DiffTemplate == "" && root.DiffSize == "" &&
+	return root.Diff == "" && root.DiffTemplate == "" &&
 		root.Overlay.Base == "" && len(root.Overlay.BaseFromRefs) == 0 &&
-		root.Overlay.Diff == "" && root.Overlay.DiffTemplate == "" && root.Overlay.DiffSize == ""
+		root.Overlay.Diff == "" && root.Overlay.DiffTemplate == ""
 }
 
 // PrefetchMode selects whether restore requests a best-effort warm-up of the
@@ -557,6 +557,9 @@ type DiskConfig struct {
 	RootConfig `yaml:",inline"`
 }
 
+// RootConfig describes a filesystem source and its host-local active diff.
+// Writable capacity comes from the existing diff, template, or base logical
+// size; boot does not resize filesystems or impose a COW storage quota.
 type RootConfig struct {
 	// Base is the read-only bottom layer of the root.
 	//   - overlay mode (Overlay != nil): the flattened container image
@@ -588,9 +591,6 @@ type RootConfig struct {
 	// crypto.local, so a single-disk cold boot gets a mountable rw root without
 	// mkfs. Ignored if Diff already exists.
 	DiffTemplate string `yaml:"diff_template"`
-	// DiffSize sizes a freshly-created Diff over Base (no template). Applied
-	// only at creation; an existing diff keeps its own size. Empty → 1 GiB.
-	DiffSize string `yaml:"diff_size"`
 	// BaseFromRefs is the single-disk immutable layer chain below Base. Exported
 	// Sandbox E owns this graph; Snapshot S never duplicates it.
 	BaseFromRefs []string `yaml:"base_from_refs,omitempty"`
@@ -625,10 +625,6 @@ type OverlayConfig struct {
 	// according to crypto.local, so cold boot gets a mountable upper layer
 	// without mkfs. Ignored if the diff already exists.
 	DiffTemplate string `yaml:"diff_template"`
-	// DiffSize is the size of a freshly-created blank diff (no template, no
-	// base). Applied ONLY at creation; an existing diff keeps its own size.
-	// Optional; defaults to 1 GiB.
-	DiffSize string `yaml:"diff_size"`
 }
 
 // LaunchConfig overrides the container's default launch (which lives
@@ -986,32 +982,6 @@ func (c *SandboxConfig) CPUWeight() uint64 {
 		w = 10000
 	}
 	return uint64(w)
-}
-
-// DiffSizeBytes returns the size used when CREATING a fresh blank diff
-// (no template, no base). It never applies to an existing diff — that keeps
-// its own on-disk size (truncating it would corrupt its filesystem). If
-// unset, defaults to 1 GiB.
-// diffSizeBytes returns the configured diff size for this disk — single-disk
-// diff_size or overlay.diff_size — defaulting to 1 GiB. field is the config
-// path prefix for error messages (e.g. "boot.root", "boot.disks[0]").
-func (r *RootConfig) DiffSizeBytes(field string) (int64, error) {
-	raw, f := r.DiffSize, field+".diff_size"
-	if r.Overlay != nil {
-		raw, f = r.Overlay.DiffSize, field+".overlay.diff_size"
-	}
-	if raw == "" {
-		return 1 << 30, nil
-	}
-	v, err := util.ParseSize(raw)
-	if err != nil {
-		return 0, fmt.Errorf("%s: %w", f, err)
-	}
-	return int64(v), nil
-}
-
-func (c *SandboxConfig) DiffSizeBytes() (int64, error) {
-	return c.Boot.Root.DiffSizeBytes("boot.root")
 }
 
 // ValidateCold checks invariants required for the cold-start path.
@@ -1439,8 +1409,8 @@ func validateControllerSocket(path string) error {
 func validateDiskSource(r *RootConfig, prefix string, cold bool) error {
 	if r.Overlay != nil {
 		// single-disk fields are mutually exclusive with overlay.
-		if r.Diff != "" || r.DiffTemplate != "" || r.DiffSize != "" || len(r.BaseFromRefs) > 0 {
-			return fmt.Errorf("%s.{diff,diff_template,diff_size,base_from_refs} are single-disk only — remove them, or remove %s.overlay to select single-disk mode", prefix, prefix)
+		if r.Diff != "" || r.DiffTemplate != "" || len(r.BaseFromRefs) > 0 {
+			return fmt.Errorf("%s.{diff,diff_template,base_from_refs} are single-disk only — remove them, or remove %s.overlay to select single-disk mode", prefix, prefix)
 		}
 		if cold && r.Base == "" {
 			return fmt.Errorf("%s.base is required (overlay mode)", prefix)
@@ -1474,9 +1444,6 @@ func validateDiskSource(r *RootConfig, prefix string, cold bool) error {
 				return err
 			}
 		}
-		if _, err := r.DiffSizeBytes(prefix); err != nil {
-			return err
-		}
 		// Cold boot needs a mountable ext4 source for the upper layer — a
 		// fresh blank diff is not a valid filesystem.
 		if cold && ov.DiffTemplate == "" && ov.Base == "" && ov.Diff == "" {
@@ -1508,9 +1475,6 @@ func validateDiskSource(r *RootConfig, prefix string, cold bool) error {
 		if err := requireAbsIfFile(fmt.Sprintf("%s.base_from_refs[%d]", prefix, i), ref); err != nil {
 			return err
 		}
-	}
-	if _, err := r.DiffSizeBytes(prefix); err != nil {
-		return err
 	}
 	// The single disk is always writable ext4; with no overlayfs lower and no
 	// guest-side mkfs it needs a mountable ext4 source.

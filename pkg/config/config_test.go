@@ -40,7 +40,6 @@ boot:
     base: file:///container.erofs
     overlay:
       diff: file:///run/sb/diff.ext4
-      size: 1GiB
 launch:
   exec: /usr/bin/echo
   args: ["hello", "world"]
@@ -178,7 +177,6 @@ func TestSandboxConfigMarshalColdKeepsWorkload(t *testing.T) {
 	// whose overlay has no active or immutable upper source at all.
 	cfg.Boot.Root.Overlay.Diff = ""
 	cfg.Boot.Root.Overlay.DiffTemplate = ""
-	cfg.Boot.Root.Overlay.DiffSize = ""
 	cfg.Boot.Root.Overlay.Base = "file:///opt/sandbox/root-upper.ext4"
 	cfg.Resources.Startup = &StartupConfig{Memory: "2GiB"}
 	cfg.Files = []FileConfig{{Path: "/etc/persistent", Content: "value"}}
@@ -477,29 +475,6 @@ launch: { args: ["c"], env: { K2: v2x, K3: v3 } }
 	// map merged (K1 kept, K2 overridden, K3 added)
 	if cfg.Launch.Env["K1"] != "v1" || cfg.Launch.Env["K2"] != "v2x" || cfg.Launch.Env["K3"] != "v3" {
 		t.Errorf("launch.env merge mismatch: %v", cfg.Launch.Env)
-	}
-}
-
-func TestDiffSize_Defaults(t *testing.T) {
-	cfg, _ := Load(writeYAML(t, `
-resources:
-  capacity: { cpu: 1, memory: 256MiB }
-network: { tap: tap0 }
-boot:
-  kernel: file:///k
-  runtime: file:///r
-  root:
-    base: file:///b
-    overlay:
-      diff: file:///d
-launch: { exec: /bin/true }
-`))
-	got, err := cfg.DiffSizeBytes()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != 1<<30 {
-		t.Errorf("default diff size = %d, want 1GiB", got)
 	}
 }
 

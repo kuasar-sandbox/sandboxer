@@ -190,7 +190,6 @@ boot:
     base: $BLK0_REF
     overlay:
       diff: file://$DIFF_FILE
-      size: 1GiB
 launch:
   args: ["-c", "import os,time\nprint('PYBOOT-OK', flush=True)\nfd=os.open('/ticks.dat', os.O_RDWR|os.O_CREAT, 0o644)\ni=0\nwhile True:\n    os.pwrite(fd, ('TICK%08d' % i).encode().ljust(4096, b'.'), i*4096)\n    os.fsync(fd)\n    blk0=os.pread(fd, 12, 0).decode()\n    print('TICK %d DISK blk0=%s' % (i, blk0), flush=True)\n    i+=1\n    time.sleep(0.25)"]
   restart: never
@@ -282,7 +281,6 @@ boot:
   root:
     overlay:
       diff: file://$DIFF_RESTORE
-      size: 1GiB
 EOF
 
 LOG2="$WORK/run2.log"
@@ -417,7 +415,6 @@ boot:
   root:
     overlay:
       diff: file://$DIFF_RESTORE2
-      size: 1GiB
 EOF
 
 LOG3="$WORK/run3.log"
@@ -500,7 +497,6 @@ boot:
   root:
     overlay:
       diff: file://$DIFF_RESTORE3
-      size: 1GiB
 EOF
 LOG4="$WORK/run4.log"
 SID4="up4-$$"

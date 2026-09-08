@@ -218,7 +218,6 @@ boot:
     base: manifest://$MKEY
     overlay:
       diff: file://$DIFF_FILE
-      size: 1GiB
 launch:
   # No exec: rely on image config extraction (Cmd=[python3] from the
   # appended ZIP). manifest:// goes through the same LoadImageConfigFrom

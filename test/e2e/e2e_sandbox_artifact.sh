@@ -88,7 +88,6 @@ boot:
     base: $BLK0_REF
     overlay:
       diff: file://$SOURCE_DIFF
-      diff_size: 1GiB
 files:
   - path: /etc/kuasar-persistent
     content: declared
@@ -206,7 +205,6 @@ boot:
   root:
     overlay:
       diff: file://$diff
-      diff_size: 1GiB
 ephemeral_files:
   - path: /etc/kuasar-ephemeral
     content: clone-only

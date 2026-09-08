@@ -109,9 +109,9 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $BLK0_REF
-    overlay: { diff: file://$WORK/root-upper.ext4, size: 512MiB }
+    overlay: { diff: file://$WORK/root-upper.ext4 }
   disks:
-    - { name: scratch, diff_template: file://$WORK/scratch-template.ext4, diff_size: 256MiB }
+    - { name: scratch, diff_template: file://$WORK/scratch-template.ext4 }
 mounts:
   - { target: /scratch, type: disk, source: scratch }
 launch: { exec: /bin/sleep, args: ["3600"] }
@@ -313,7 +313,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    overlay: { diff: file://$root_diff, size: 512MiB }
+    overlay: { diff: file://$root_diff }
   disks:
     - { name: scratch }
 EOF

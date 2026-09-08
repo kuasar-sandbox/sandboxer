@@ -96,7 +96,6 @@ boot:
     base: $BLK0_REF
     overlay:
       diff: file://$DIFF_FILE
-      size: 1GiB
 mounts:
   - { target: /tmp,     type: tmpfs, options: "nosuid,nodev,mode=1777" }
   - { target: /var/log, type: empty }

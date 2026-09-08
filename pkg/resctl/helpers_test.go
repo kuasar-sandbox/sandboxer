@@ -29,7 +29,7 @@ boot:
   cmdline: "console=hvc0"
   root:
     base: file:///container.erofs
-    overlay: { diff: file:///run/sb/diff.ext4, size: 1GiB }
+    overlay: { diff: file:///run/sb/diff.ext4 }
 launch:
   exec: /usr/bin/echo
   args: ["hello", "world"]
@@ -48,7 +48,7 @@ func makeMinimalCfg() *config.SandboxConfig {
 			Cmdline: "console=hvc0",
 			Root: config.RootConfig{
 				Base:    "file:///c.erofs",
-				Overlay: &config.OverlayConfig{Diff: "file:///d.ext4", DiffSize: "1GiB"},
+				Overlay: &config.OverlayConfig{Diff: "file:///d.ext4"},
 			},
 		},
 		Launch: config.LaunchConfig{Exec: "/usr/bin/echo", Args: []string{"hello", "world"}, Workdir: "/", Restart: "never"},
