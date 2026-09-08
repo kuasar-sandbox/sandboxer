@@ -1,50 +1,32 @@
-name: Issue 191 isolated edit verification
+name: Issue 191 isolated source audit
 on:
   push:
     branches: [work/191-complete-cleanup]
 permissions:
-  contents: write
+  contents: read
 jobs:
-  edit:
+  audit:
     if: github.repository == 'kuasar-sandbox/sandboxer'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: fix/191-remove-ineffective-disk-size
+          ref: 6bbbfc9f5c55bad957f583bc81d1951f78e79926
           fetch-depth: 0
-      - name: Remove remaining retired size examples
+          persist-credentials: false
+      - name: Archive the exact candidate and inspect size-key fixtures
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = ffaf3bbde44dc593c91479ffa0206ac022c8645a
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          python3 - <<'PY'
-          from pathlib import Path
-          import re, subprocess
-          paths = {
-              'pkg/resctl/helpers_test.go': 1,
-              'test/e2e/e2e_sandbox_local_merge.sh': 2,
-              'test/e2e/e2e_sandbox_memory_budget_workingset.sh': 2,
-              'test/e2e/e2e_sandbox_restore_files.sh': 3,
-              'test/e2e/e2e_sandbox_tapfd.sh': 2,
-          }
-          for name, count in paths.items():
-              p = Path(name)
-              s = p.read_text()
-              actual = sum(len(re.findall(r',\s*size:\s*[A-Za-z0-9.]+', line)) for line in s.splitlines() if 'overlay:' in line)
-              assert actual == count, (name, actual, count)
-              p.write_text('\n'.join(re.sub(r',\s*size:\s*[A-Za-z0-9.]+', '', line) if 'overlay:' in line else line for line in s.split('\n')))
-              if name.endswith('.sh'):
-                  subprocess.check_call(['bash', '-n', name])
-          subprocess.check_call(['gofmt', '-w', 'pkg/resctl/helpers_test.go'])
-          subprocess.check_call(['git', 'diff', '--check'])
-          r = subprocess.run(['git', 'grep', '-n', '-E', r'overlay:.*\bsize:|\bDiffSize\b|DiffSizeBytes', '--', '*.go', '*.sh', '*.yaml', '*.yml'], text=True, capture_output=True)
-          unexpected = [line for line in r.stdout.splitlines() if 'pkg/config/disk_size_test.go:' not in line]
-          assert r.returncode in (0, 1) and not unexpected, unexpected or r.stderr
-          subprocess.check_call(['git', 'diff', '--stat'])
-          subprocess.check_call(['git', 'add', '--', *paths])
-          subprocess.check_call(['git', 'commit', '-m', 'test: remove remaining obsolete overlay size inputs'])
-          subprocess.check_call(['git', 'push', 'origin', 'HEAD:refs/heads/fix/191-remove-ineffective-disk-size'])
-          PY
+          test "$(git rev-parse HEAD)" = 6bbbfc9f5c55bad957f583bc81d1951f78e79926
+          git archive --format=tar HEAD > "$RUNNER_TEMP/issue-191-candidate.tar"
+          git diff 76dba47d54c5d670ab29669d25e9e0f977a30030...HEAD > "$RUNNER_TEMP/issue-191.diff"
+          git grep -n -E '(^|[^[:alnum:]_])(diff_size|size)[[:space:]]*:' -- '*.go' '*.sh' '*.yaml' '*.yml' '*.md' || test "$?" = 1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: issue-191-exact-source
+          path: |
+            ${{ runner.temp }}/issue-191-candidate.tar
+            ${{ runner.temp }}/issue-191.diff
+          if-no-files-found: error
+          retention-days: 1
