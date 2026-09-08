@@ -19,8 +19,8 @@ fi
 if [[ -n "$SOURCE" && -f "$SOURCE/pkg/config/disk_size_test.go" ]]; then
   (
     cd "$SOURCE"
-    go test -count=1 -timeout=2m ./pkg/config ./pkg/sandbox \
-      -run 'Test(RemovedDiskSize|BootDecodePreservesSequentialMerge|DiskConfigMarshalDoesNotEmitRetiredSizeKeys|PrepareDiff)'
+    go test -count=1 -timeout=2m ./pkg/config
+    go test -count=1 -timeout=2m ./pkg/sandbox -run '^TestPrepareDiff'
   )
 else
   echo "Source-only Go regressions unavailable; running binary CLI coverage."
