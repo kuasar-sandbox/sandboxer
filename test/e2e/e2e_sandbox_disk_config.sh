@@ -20,7 +20,7 @@ if [[ -n "$SOURCE" && -f "$SOURCE/pkg/config/disk_size_test.go" ]]; then
   (
     cd "$SOURCE"
     go test -count=1 -timeout=2m ./pkg/config
-    go test -count=1 -timeout=2m ./pkg/sandbox -run '^TestPrepareDiff'
+    go test -count=1 -timeout=2m ./pkg/sandbox -run '^Test(PrepareDiff|BuildLaunchSpec)'
   )
 else
   echo "Source-only Go regressions unavailable; running binary CLI coverage."
