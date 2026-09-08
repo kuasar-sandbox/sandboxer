@@ -104,10 +104,10 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $BLK0_REF
-    overlay: { diff: file://$WORK/root-up.ext4, size: 512MiB }
+    overlay: { diff: file://$WORK/root-up.ext4 }
   disks:
-    - { name: scratch, diff_template: file://$WORK/scratch.ext4, diff_size: 256MiB }
-    - { name: dataset, base: $DATASET_REF, overlay: { diff_template: file://$WORK/dataset-up.ext4, diff_size: 256MiB } }
+    - { name: scratch, diff_template: file://$WORK/scratch.ext4 }
+    - { name: dataset, base: $DATASET_REF, overlay: { diff_template: file://$WORK/dataset-up.ext4 } }
 mounts:
   - { target: /scratch, type: disk, source: scratch }
   - { target: /data,    type: disk, source: dataset }
@@ -228,9 +228,9 @@ boot:
   cmdline: "console=hvc0 printk.time=1 replace_boot=true"
   root:
     base: $BLK0_REF
-    overlay: { diff_template: file://$WORK/replace-root.ext4, diff_size: 512MiB }
+    overlay: { diff_template: file://$WORK/replace-root.ext4 }
   disks:
-    - { name: fresh, diff_template: file://$WORK/replace-fresh.ext4, diff_size: 256MiB }
+    - { name: fresh, diff_template: file://$WORK/replace-fresh.ext4 }
 mounts:
   - { target: /fresh, type: disk, source: fresh }
 EOF
@@ -313,10 +313,10 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    overlay: { diff: file://$WORK/root-r.ext4, size: 512MiB }
+    overlay: { diff: file://$WORK/root-r.ext4 }
   disks:
     - { name: scratch }
-    - { name: dataset, overlay: { diff: file://$WORK/dataset-r.ext4, size: 256MiB } }
+    - { name: dataset, overlay: { diff: file://$WORK/dataset-r.ext4 } }
 EOF
 SID2=dk-2
 timeout -k 10s 120 "$BIN/sandbox-ctl" run --restore "$SNAP" --config "$WORK/restore.yaml" --sandbox-id "$SID2" \
@@ -425,10 +425,10 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    overlay: { diff: file://$WORK/root-w.ext4, size: 512MiB }
+    overlay: { diff: file://$WORK/root-w.ext4 }
   disks:
     - { name: scratch }
-    - { name: dataset, overlay: { diff: file://$WORK/dataset-w.ext4, size: 256MiB } }
+    - { name: dataset, overlay: { diff: file://$WORK/dataset-w.ext4 } }
 EOF
 
 # The local parent is a mandatory sibling artifact. Hide it recoverably and

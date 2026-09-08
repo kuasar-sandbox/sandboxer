@@ -82,7 +82,6 @@ boot:
   disks:
     - name: scratch
       diff_template: file://$WORK/data-template.ext4
-      diff_size: 256MiB
 mounts:
   - { target: /scratch, type: disk, source: scratch }
 launch: { exec: /bin/sleep, args: ["3600"], restart: never }
@@ -154,7 +153,6 @@ boot:
   disks:
     - name: scratch
       diff_template: file://$WORK/data-template.ext4
-      diff_size: 256MiB
 EOF
 
 SID_C="logical-phase-c"

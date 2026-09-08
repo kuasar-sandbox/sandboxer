@@ -450,12 +450,8 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if !snapCfg.SingleDisk() {
 		rootDiffURI, rootDiffTmpl = snapCfg.Boot.Root.Overlay.Diff, snapCfg.Boot.Root.Overlay.DiffTemplate
 	}
-	rootDiffSize, err := snapCfg.DiffSizeBytes()
-	if err != nil {
-		return -1, err
-	}
 	rootDB, rootCleanup, err := reconstructDisk(ctx, opts, diffCustomerKey, snapCfg.SingleDisk(), rootTop, rootChain,
-		snapCfg.Boot.Root.Base, rootDiffURI, rootDiffTmpl, rootDiffSize, "overlay", logf)
+		snapCfg.Boot.Root.Base, rootDiffURI, rootDiffTmpl, "overlay", logf)
 	if err != nil {
 		return -1, err
 	}
@@ -471,11 +467,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			top, chain = d.Overlay.Base, append([]string(nil), d.Overlay.BaseFromRefs...)
 			diffURI, diffTmpl = d.Overlay.Diff, d.Overlay.DiffTemplate
 		}
-		dsz, err := d.RootConfig.DiffSizeBytes(fmt.Sprintf("boot.disks[%d]", i))
-		if err != nil {
-			return -1, err
-		}
-		db, dcleanup, derr := reconstructDisk(ctx, opts, diffCustomerKey, single, top, chain, d.Base, diffURI, diffTmpl, dsz, fmt.Sprintf("disk%d", i), logf)
+		db, dcleanup, derr := reconstructDisk(ctx, opts, diffCustomerKey, single, top, chain, d.Base, diffURI, diffTmpl, fmt.Sprintf("disk%d", i), logf)
 		if derr != nil {
 			return -1, derr
 		}
@@ -686,7 +678,7 @@ func openAndEstablishRestoreMUX(
 // diffURI/diffTemplate come from the restore host binding (or the auto-default
 // <sid>.<diskKey>.diff).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate string, diffSize int64, diskKey string, logf func(string, ...any)) (sandbox.DiskBackend, func(), error) {
+func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate, diskKey string, logf func(string, ...any)) (sandbox.DiskBackend, func(), error) {
 	var db sandbox.DiskBackend
 	var closers []func()
 	cleanup := func() {
@@ -723,7 +715,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	if !ok {
 		return fail(fmt.Errorf("%s: bad diff uri: %s", diskKey, diffURI))
 	}
-	diffInit, err := sandbox.PrepareDiff(diffPath, diffTemplate, baseReader.Size(), diffSize)
+	diffInit, err := sandbox.PrepareDiff(diffPath, diffTemplate, baseReader.Size())
 	if err != nil {
 		return fail(fmt.Errorf("%s: prepare diff: %w", diskKey, err))
 	}

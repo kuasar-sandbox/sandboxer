@@ -690,7 +690,7 @@ func ResolvePortableProjection(cfg *config.SandboxConfig) (config.PortableProjec
 func ResolveRuntimeProjection(cfg *config.SandboxConfig) (string, error) {
 	runtimeRef, err := buildRuntimeRef(cfg.Boot.Runtime)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("boot.runtime identity: %w", err)
 	}
 	return runtimeRef, nil
 }
@@ -1443,7 +1443,7 @@ type SnapshotHandler struct {
 	SandboxID      string // required: snapshot.Take rejects empty
 	Memfd          *memory.Memfd
 	Disks          []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
-	Servers        []*vhost.Server // all vhost servers (quiesced together)
+	Servers        []*vhost.Server // all vhost servers (quiesced together around the dump)
 	CHSock         string
 	RunDir         string
 	Pinger         *guestlink.Pinger        // optional; if non-nil, paused around quiesce/Take
@@ -2003,7 +2003,7 @@ func handleSnapshotRequest(
 	if snapshotMode == ctl.SnapshotModeBundle {
 		bundleAdmission, err = opts.ManifestCfg.WriteAdmission(ctx)
 		if err != nil {
-			return ctl.Response{}, err
+			return ctl.Response{}, fmt.Errorf("snapshot Bundle admission: %w", err)
 		}
 	}
 
@@ -2449,7 +2449,7 @@ func handleSnapshotRequest(
 
 	// Upload mode: the IngestSink already streamed the overlays + bundle to the
 	// store during Take (resident pages only). Report the manifest keys it
-	// produced (out.*Ref are manifest://) plus per-artifact dedup stats.
+	// produced (out.*Ref are manifest://<key>) plus per-artifact dedup stats.
 	// OverlayRef stays scheme-tagged as a compatibility mirror of SandboxRef.
 	_, bundleRes := ingestSink.Results()
 	sandboxRes := ingestSink.SandboxResult()
