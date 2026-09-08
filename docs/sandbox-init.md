@@ -77,51 +77,19 @@ This file defines the runtime contract of the image's `/sbin/init` and how
   MUX lasting for that command (§3.6).
 
 <a id="2-sandbox-runtimebundle-镜像结构"></a>
+<a id="2-sandbox-runtimebundle-image-layout"></a>
 
-## 2. sandbox-runtime.bundle image layout
+## 2. Runtime image consumption prerequisites
 
-```
-/sbin/init                Static Go sandbox-init binary
-/proc/                    Empty mountpoint
-/sys/                     Empty mountpoint
-/dev/                     Empty mountpoint
-/overlay/lower/           Empty mountpoint: blk0/vda EROFS, the overlayfs lowerdir
-/overlay/upper/           Empty mountpoint: blk1/vdb ext4; upperdir/, workdir/, volumes/
-/sysroot/                 Empty mountpoint: merged root and chroot target
-/sysdisks/disk-{0..7}{,-lower,-upper}/
-                          24 prebuilt data-disk staging mountpoints
-/opt/sandbox-runtime/     Reserved guest payload root, bound into /sysroot in phase 1a
-/opt/sandbox-runtime/bin/{envd,flatten-ctl,mkfs.erofs}
-                          Target-architecture guest payload executables
-```
+The [Runtime Bundle specification](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime.md) owns complete packaging, file inventory, versioning and build rules. PID 1 relies on these consumption boundaries:
 
-Apart from `/sbin/init`, the mountpoint directories and
-`/opt/sandbox-runtime/`, the outer image does not provide a distribution's
-`/etc`, `/usr`, `/var`, `/lib` or shared-library tree. Init's own filesystem
-operations do not require external utilities; the bundled payload tools have
-their own application-facing roles.
+- `/sbin/init` must be sandbox-init for the guest architecture; this repository builds it with `make sandbox-init`.
+- Runtime supplies the early-mount and data-disk staging directories. Phase 1a constructs the actual user rootfs below; the outer runtime is not a distribution `/etc`, `/usr` or shared-library environment.
+- `/opt/sandbox-runtime/` is the reserved read-only guest-payload root. Phase 1a bind-mounts it into the same path of the user rootfs, hiding existing image contents there; applications must respect the application-environment contract.
+- virtio-pmem/DAX reuses the same backing file’s read-only pages, not each guest’s private writable RAM. Init and payload executables must match the target architecture.
 
-`/opt/sandbox-runtime/` is the **guest payload root**. Platform runtime
-components shipped with the runtime image live here. Their read-only file
-pages can be shared across sandboxes through virtio-pmem + DAX, and their version
-is tied to sandbox-init's runtime artifact. Phase 1a bind-mounts this directory
-at the same path in the new root (§3.1). Applications see it read-only, hiding
-any image content at that path (§5.2). `guest-runtime` builds the image with
-`envd`, `flatten-ctl` and `mkfs.erofs` under its `bin/` directory.
+See [Runtime builds](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime.md#3-build) and the [Native guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/README.md) for production of the bundle and host/target mkfs selection. This specification continues to define the complete host/guest handshake, mount ordering and ABI.
 
-The earlier approximate figures of a 10–15 MiB init binary, 15 MiB image and
-10 MiB resident working set are historical estimates, not measurements or size
-guarantees for the current payload-inclusive bundle. Measure the actual artifact
-and workload. DAX shares the same backing file's read-only pages, not each
-guest's private writable RAM. EROFS is endian-neutral: a host-native
-`mkfs.erofs` can construct either target architecture's image, while init and
-the guest payload executables must match the target architecture.
-
-Build `sandbox-init` in this repository with `make sandbox-init`.
-`guest-runtime` consumes that binary and packages it with
-`make sandbox-runtime`. See its
-[native build guide, §2.1](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/docs/build.md)
-for `mkfs.erofs`.
 
 <a id="3-sandbox-init-三阶段"></a>
 
@@ -1653,7 +1621,7 @@ them until thaw (§3.3).
   namespaces, filesystems, virtio-console and networking features.
 - [Cloud Hypervisor guide](cloud-hypervisor.md), §5.2: hybrid-vsock CONNECT
   addressing and console/serial options.
-- [guest-runtime native build guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/docs/build.md),
+- [guest-runtime native build guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/README.md),
   §2.1: mkfs.erofs for make sandbox-runtime.
 - [project system design](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md),
   §4: user-visible template instantiation, pause and restore semantics.

@@ -119,8 +119,10 @@ guest-runtime 构建 runtime 镜像和 build sandbox 内展平镜像时使用的
 
 ## 文档
 
-- [docs/sandbox_zh.md](docs/sandbox_zh.md) — host 控制平面、PortableSandboxConfig、
-  `.overlay`/Sandbox E/Snapshot S、carrier、export/snapshot/restore/publish与资源模型。
+- [沙箱工件](docs/sandbox-artifacts_zh.md) — 便携 E/S 配置、父引用图、载体、完整性与发布契约。
+
+- [docs/sandbox_zh.md](docs/sandbox_zh.md) — host 控制平面、运行配置、冷启动、
+  snapshot/export/restore 执行顺序、资源执行与清理。
 - [docs/journald_zh.md](docs/journald_zh.md) — 逐输出目标、自定义 journal 字段、组件诊断、编码与失败回退。
 - [docs/sandbox-init_zh.md](docs/sandbox-init_zh.md) — guest PID 1 ABI:
   `sandbox-init` 三阶段、vsock 控制面 + stdio MUX 协议、应用契约。
