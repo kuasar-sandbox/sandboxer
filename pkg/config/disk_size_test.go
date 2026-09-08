@@ -12,13 +12,16 @@ import (
 
 func TestRemovedDiskSizeKeysRejectedByAllByteLoaders(t *testing.T) {
 	shapes := []struct {
-		path string
-		yaml string
+		path, style, yaml string
 	}{
-		{"boot.root", "boot: {root: {%s: %s}}"},
-		{"boot.root.overlay", "boot: {root: {overlay: {%s: %s}}}"},
-		{"boot.disks[0]", "boot: {disks: [{name: data, %s: %s}]}"},
-		{"boot.disks[0].overlay", "boot: {disks: [{name: data, overlay: {%s: %s}}]}"},
+		{"boot.root", "flow", "boot: {root: {%s: %s}}"},
+		{"boot.root.overlay", "flow", "boot: {root: {overlay: {%s: %s}}}"},
+		{"boot.disks[0]", "flow", "boot: {disks: [{name: data, %s: %s}]}"},
+		{"boot.disks[0].overlay", "flow", "boot: {disks: [{name: data, overlay: {%s: %s}}]}"},
+		{"boot.root", "block", "boot:\n  root:\n    %s: %s\n"},
+		{"boot.root.overlay", "block", "boot:\n  root:\n    overlay:\n      %s: %s\n"},
+		{"boot.disks[0]", "block", "boot:\n  disks:\n    - name: data\n      %s: %s\n"},
+		{"boot.disks[0].overlay", "block", "boot:\n  disks:\n    - name: data\n      overlay:\n        %s: %s\n"},
 	}
 	loaders := map[string]func([]byte) error{
 		"bytes": func(raw []byte) error {
@@ -38,7 +41,7 @@ func TestRemovedDiskSizeKeysRejectedByAllByteLoaders(t *testing.T) {
 		for _, key := range []string{"diff_size", "size"} {
 			for _, value := range []string{"512MiB", `""`, "null", "0", "{}"} {
 				for name, load := range loaders {
-					t.Run(shape.path+"/"+key+"/"+value+"/"+name, func(t *testing.T) {
+					t.Run(shape.path+"/"+shape.style+"/"+key+"/"+value+"/"+name, func(t *testing.T) {
 						err := load([]byte(fmt.Sprintf(shape.yaml, key, value)))
 						want := shape.path + "." + key + " is not supported"
 						if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "required logical capacity") {
@@ -132,7 +135,7 @@ func TestBootDecodePreservesSequentialMerge(t *testing.T) {
 
 func TestDiskConfigMarshalDoesNotEmitRetiredSizeKeys(t *testing.T) {
 	cfg := SandboxConfig{Boot: BootConfig{
-		Root: RootConfig{Overlay: &OverlayConfig{DiffTemplate: "file:///template"}},
+		Root:  RootConfig{Overlay: &OverlayConfig{DiffTemplate: "file:///template"}},
 		Disks: []DiskConfig{{Name: "data", RootConfig: RootConfig{Diff: "file:///data"}}},
 	}}
 	raw, err := yaml.Marshal(cfg)

@@ -130,7 +130,6 @@ boot:
     base: $BLK0_REF
     overlay:
       diff: file://$diff
-      size: 1GiB
 files:
   - path: /cgroup-fork-probe.b64
     mode: "0644"

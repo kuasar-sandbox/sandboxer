@@ -107,7 +107,6 @@ boot:
     base: $BLK0_REF
     overlay:
       diff: file://$DIFF_FILE
-      size: 1GiB
 launch:
   args: ["-c", "import time, sys; print('PROTO-BOOT-OK'); sys.stdout.flush(); time.sleep(4); print('PROTO-DONE')"]
   restart: never

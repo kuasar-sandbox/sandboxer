@@ -119,7 +119,6 @@ boot:
     base: $BLK0_REF
     overlay:
       diff: file://$DIFF
-      size: 1GiB
 launch:
   placeholder: true        # no exec — anchor app; forced restart=always
 EOF

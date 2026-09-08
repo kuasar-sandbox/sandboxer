@@ -106,7 +106,6 @@ boot:
     base: $BLK0_REF
     overlay:
       diff: file://$DIFF_FILE
-      size: 1GiB
 launch:
   args: ["-c", "import sys,time\nprint('PYBOOT-OK', flush=True)\ni=0\nwhile True:\n    print('TICK', i, flush=True)\n    i+=1\n    time.sleep(0.25)"]
   restart: never
@@ -201,7 +200,6 @@ boot:
   root:
     overlay:
       diff: file://$DIFF_RESTORE
-      size: 1GiB
 EOF
 
 LOG2="$WORK/run2.log"

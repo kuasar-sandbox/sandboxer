@@ -37,7 +37,6 @@ boot:
     base: file:///container.erofs
     overlay:
       diff: file:///run/sb/diff.ext4
-      size: 1GiB
 launch:
   exec: /usr/bin/echo
   args: ["hello", "world"]

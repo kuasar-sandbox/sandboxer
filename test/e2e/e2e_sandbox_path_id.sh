@@ -78,7 +78,6 @@ boot:
     base: $BLK0_REF
     overlay:
       diff_template: file://$WORK/root-template.ext4
-      size: 512MiB
   disks:
     - name: scratch
       diff_template: file://$WORK/data-template.ext4
@@ -149,7 +148,6 @@ boot:
   root:
     overlay:
       diff_template: file://$WORK/root-template.ext4
-      size: 512MiB
   disks:
     - name: scratch
       diff_template: file://$WORK/data-template.ext4

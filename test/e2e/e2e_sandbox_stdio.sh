@@ -86,7 +86,6 @@ boot:
     base: $BLK0_REF
     overlay:
       diff: file://$diff
-      size: 1GiB
 launch:
   args: ["-c", "print('STDIO-MARKER-12345', flush=True)"]
   restart: never
