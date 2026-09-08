@@ -1,0 +1,25 @@
+name: Issue 191 isolated edit verification
+on:
+  push:
+    branches: [work/191-complete-cleanup]
+permissions:
+  contents: write
+jobs:
+  edit:
+    if: github.repository == 'kuasar-sandbox/sandboxer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/191-remove-ineffective-disk-size
+          fetch-depth: 0
+      - name: Apply bounded edits and verify formatting
+        env:
+          HELPER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git show "$HELPER_SHA:.github/issue-191-edit.py" > "$RUNNER_TEMP/issue-191-edit.py"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python3 "$RUNNER_TEMP/issue-191-edit.py"
