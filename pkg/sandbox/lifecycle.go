@@ -518,11 +518,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if cowBase != nil {
 		baseSize = cowBase.Size()
 	}
-	diffSize, err := opts.Cfg.DiffSizeBytes()
-	if err != nil {
-		return -1, err
-	}
-	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize, diffSize)
+	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize)
 	if err != nil {
 		return -1, fmt.Errorf("prepare diff: %w", err)
 	}
@@ -694,7 +690,7 @@ func ResolvePortableProjection(cfg *config.SandboxConfig) (config.PortableProjec
 func ResolveRuntimeProjection(cfg *config.SandboxConfig) (string, error) {
 	runtimeRef, err := buildRuntimeRef(cfg.Boot.Runtime)
 	if err != nil {
-		return "", fmt.Errorf("boot.runtime identity: %w", err)
+		return "", err
 	}
 	return runtimeRef, nil
 }
@@ -1392,11 +1388,7 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 	if cowBase != nil {
 		baseSize = cowBase.Size()
 	}
-	diffSize, err := d.RootConfig.DiffSizeBytes(field)
-	if err != nil {
-		return fail(err)
-	}
-	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize, diffSize)
+	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize)
 	if err != nil {
 		return fail(fmt.Errorf("%s prepare diff: %w", field, err))
 	}
@@ -1451,7 +1443,7 @@ type SnapshotHandler struct {
 	SandboxID      string // required: snapshot.Take rejects empty
 	Memfd          *memory.Memfd
 	Disks          []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
-	Servers        []*vhost.Server // all vhost servers (quiesced together around the dump)
+	Servers        []*vhost.Server // all vhost servers (quiesced together)
 	CHSock         string
 	RunDir         string
 	Pinger         *guestlink.Pinger        // optional; if non-nil, paused around quiesce/Take
@@ -2011,7 +2003,7 @@ func handleSnapshotRequest(
 	if snapshotMode == ctl.SnapshotModeBundle {
 		bundleAdmission, err = opts.ManifestCfg.WriteAdmission(ctx)
 		if err != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot Bundle admission: %w", err)
+			return ctl.Response{}, err
 		}
 	}
 
@@ -2457,7 +2449,7 @@ func handleSnapshotRequest(
 
 	// Upload mode: the IngestSink already streamed the overlays + bundle to the
 	// store during Take (resident pages only). Report the manifest keys it
-	// produced (out.*Ref are manifest://<key>) plus per-artifact dedup stats.
+	// produced (out.*Ref are manifest://) plus per-artifact dedup stats.
 	// OverlayRef stays scheme-tagged as a compatibility mirror of SandboxRef.
 	_, bundleRes := ingestSink.Results()
 	sandboxRes := ingestSink.SandboxResult()
