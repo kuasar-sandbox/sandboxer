@@ -61,8 +61,8 @@ func execCmd(args []string) int {
 	stdoutFlag := fs.Bool("stdout", true, "pipe mode: command stdout → exec stdout (default on; --stdout=false discards)")
 	stderrFlag := fs.Bool("stderr", true, "pipe mode: command stderr → exec stderr (default on; --stderr=false discards)")
 	stdinFrom := fs.String("stdin-from", "", "pipe mode: command stdin reads from FILE (implies --stdin)")
-	stdoutTo := fs.String("stdout-to", "", "pipe mode: command stdout → FILE or journald=TAG (implies --stdout)")
-	stderrTo := fs.String("stderr-to", "", "pipe mode: command stderr → FILE or journald=TAG (implies --stderr)")
+	stdoutTo := fs.String("stdout-to", "", "pipe mode: command stdout → FILE or journald=TAG[,FIELD=VALUE...] (implies --stdout)")
+	stderrTo := fs.String("stderr-to", "", "pipe mode: command stderr → FILE or journald=TAG[,FIELD=VALUE...] (implies --stderr)")
 	ttyFlag := fs.Bool("tty", false, "give the command a pty + put our terminal in raw mode (default: auto = on iff stdin&stdout are terminals; mutually exclusive with --stdin/--stdout/--stderr/--*-from/--*-to)")
 
 	if err := fs.Parse(args); err != nil {

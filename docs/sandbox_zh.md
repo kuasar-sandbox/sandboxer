@@ -9,6 +9,8 @@
 ## 1. 概述
 
 <a id="工件模型"></a>
+<a id="11-逻辑角色"></a>
+<a id="12-逻辑角色与物理-carrier"></a>
 ### 1.1 工件模型
 
 运行时消费 image、Sandbox E 和 Snapshot S。E 描述便携沙箱配置及磁盘图，S 关联 E 与捕获的 VMM/内存状态；逻辑对象与文件/命名位置/Manifest/Bundle 载体是独立维度。完整角色、字段和验证规则见[沙箱工件](sandbox-artifacts_zh.md)。
@@ -697,6 +699,25 @@ Static/dynamic cgroup模式在CH pause前lift可能竞争的`memory.high`,并等
 
 Balloon mutation与snapshot/export通过同一barrier序列化. Freeze window不会与async balloon resize并发. Restore以CH state为真实current,再进入新的observation epoch;不会用host YAML重建已恢复balloon瞬时值.
 
+Sandbox-local `MemoryController` 将一份已接收的 Guest ABI `mem_report` 与 CH `vm.info` 合并。Guest 在 cold-launch barrier 后立即报告，此后默认每 5 秒报告一次；epoch/sequence、重试和 quiesce 协议由 [Guest ABI](sandbox-init_zh.md) 定义。`Capacity` 取自 host 权威的 CH memory 配置，不能从 Guest `MemTotal` 反推。CH `config.balloon.size` 是 `AcceptedTarget`，`memory_actual_size` 是 `CurrentBudget`，因此 `BalloonCurrent = Capacity - CurrentBudget`，`TargetBudget = Capacity - AcceptedTarget`。`DesiredTarget` 是独立的本地意图。两项观测都已知且 `TargetBudget == CurrentBudget` 才是 `Stable`；`ObservedBudget` 取两者最大值。`vm.resize` 成功仅表示 target 已接受，不证明 current 已收敛。
+
+本地计算为：
+
+```text
+DemandMemory = max(CurrentBudget - MemAvailable, 0)
+RawRequested = min(Capacity, saturating_add(DemandMemory, AllocatableMemory))
+DesiredTarget = align_down(Capacity - RawRequested, 64 MiB)
+RequestedBudget = Capacity - DesiredTarget
+```
+
+Guest 诊断字段与 host `memory.current` 不决定 Budget；host `memory.current` 仅作为 `memory.high` 的安全下界。
+
+增长先预留 Budget，再提高所需 `memory.high` 额度，随后通过 `PUT /api/v1/vm.resize` 降低 balloon target，并以 `vm.info` 确认接受。Node 的 partial grant 必须累积到可表示且不超过 reservation 的 Budget，不能取整产生未预留的内存。通过 lifecycle barrier 后，即使 target/current 尚不稳定，安全增长仍可执行。Reservation、high 或不明确的 resize 失败保留向前增长目标并重试，后续较小报告不会隐式回滚它。
+
+收缩要求 fresh、未被更新报告取代的观测及 Stable CH target/current。每份报告最多允许一个 64 MiB inflate step，desired 与 accepted target 间距须大于一个完整 step，保留一个 step 的 deadband。Resize 前还须在 mutation gate 内再次查询 CH。Target 接受后，控制器等待 `CurrentBudget` 收敛，确认更新的已接收报告没有使事务失效，再设置 `memory.high`，最后才提交较小的绝对 reservation baseline。收敛前接收的报告不能授权下一步。CH 观测不可用或不稳定、更新报告待处理、high/reservation 操作失败时，保留待完成事务，阻止过早释放 reservation。Guest 应急 deflate 不能绕过这些条件。
+
+源码见 [memory.go](../pkg/resctl/memory.go)、[memory_controller.go](../pkg/resctl/memory_controller.go) 和 [balloon.go](../pkg/resctl/balloon.go)。稀疏 `PUNCH_HOLE`/`MADV_DONTNEED` 与 hole-only skipping 仍由 [VMM patch 0004](cloud-hypervisor_zh.md#34-0004--balloon-release-跳过-user-managed-zone-的空洞-run) 定义。
+
 ## 10. Resource protocol
 
 ### 10.1 Lifecycle states
@@ -718,6 +739,7 @@ Snapshot/export开始前阻止新的Budget mutation和balloon transition. 已在
 Static/dynamic模式可使用PSI或`memory.events.local` polling. PSI默认trigger与debounce由host config决定,不写入E. Sensor在capture gate期间停止发起growth,restore后建立new observation epoch.
 
 <a id="工件来源与发布"></a>
+<a id="11-provenancepublish-与-carrier"></a>
 ## 11. 工件来源与发布
 
 磁盘和内存引用、tarstream/Manifest/Bundle 输出、精确发布与提交规则见[沙箱工件](sandbox-artifacts_zh.md)。运行时捕获顺序仍由本篇定义。
@@ -729,6 +751,15 @@ Static/dynamic模式可使用PSI或`memory.events.local` polling. PSI默认trigg
 ### 11.2 Local tarstream 与 crypto
 
 完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#112-local-tarstream-与-crypto)。
+
+<a id="local-output"></a>
+[Local output](sandbox-artifacts_zh.md#local-output) 定义本地 tarstream 发布。
+
+<a id="named-ref-location"></a>
+[Named ref location](sandbox-artifacts_zh.md#named-ref-location) 定义命名 carrier 发布。
+
+<a id="single-root-imagesandbox-manifest-bundle"></a>
+[Single-root image/Sandbox Manifest Bundle](sandbox-artifacts_zh.md#single-root-imagesandbox-manifest-bundle) 定义该 carrier 的发布规则。
 
 ### 11.3 Manifest upload
 

@@ -1,82 +1,84 @@
 package stdio
 
 import (
-	"strings"
+	"os/exec"
+	"reflect"
 	"testing"
 )
 
 func TestFromFlags_JournaldStreams(t *testing.T) {
-	m, err := FromFlags(nil, nil, nil, "", "journald=build", "journald=build", boolp(false), "off")
+	m, err := FromFlags(nil, nil, nil, "", "journald=app,WORKLOAD_ID=w-1,STREAM=stdout", "journald=app,STREAM=stderr", boolp(false), "journald=console")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Stdout.Kind != StreamJournald || m.Stdout.Tag != "build" {
-		t.Errorf("stdout = %+v, want journald tag=build", m.Stdout)
+	if m.Stdout.Kind != StreamJournald || m.Stdout.Journal.Tag != "app" || !reflect.DeepEqual(m.Stdout.Journal.Fields, map[string]string{"WORKLOAD_ID": "w-1", "STREAM": "stdout"}) {
+		t.Fatalf("stdout=%+v", m.Stdout)
 	}
-	if m.Stderr.Kind != StreamJournald || m.Stderr.Tag != "build" {
-		t.Errorf("stderr = %+v, want journald tag=build", m.Stderr)
+	if m.Stderr.Kind != StreamJournald || m.Stderr.Journal.Tag != "app" || !reflect.DeepEqual(m.Stderr.Journal.Fields, map[string]string{"STREAM": "stderr"}) {
+		t.Fatalf("stderr=%+v", m.Stderr)
 	}
-	// A plain path still resolves to a file.
-	m, err = FromFlags(nil, nil, nil, "", "/tmp/out.img", "", boolp(false), "off")
-	if err != nil {
-		t.Fatal(err)
+	if m.Console.Journal == nil || len(m.Console.Journal.Fields) != 0 {
+		t.Fatal("console inherited fields")
 	}
-	if m.Stdout.Kind != StreamFile || m.Stdout.Path != "/tmp/out.img" {
-		t.Errorf("stdout = %+v, want file /tmp/out.img", m.Stdout)
+	m.Stdout.Journal.Fields["STREAM"] = "changed"
+	if m.Stderr.Journal.Fields["STREAM"] != "stderr" {
+		t.Fatal("same tag shared fields")
 	}
-}
-
-func TestParseConsole_Journald(t *testing.T) {
-	c, err := parseConsole("journald=console")
-	if err != nil {
-		t.Fatal(err)
+	if !m.ProtoSpec().Stdout || !m.ProtoSpec().Stderr || m.ProtoSpec().TTY {
+		t.Fatal("journal changed guest stream protocol")
 	}
-	if c.Kind != ConsoleJournald || c.Tag != "console" {
-		t.Errorf("console = %+v, want journald tag=console", c)
-	}
-	for _, bad := range []string{"journald=", "journald=bad tag", "journald=a/b"} {
-		if _, err := parseConsole(bad); err == nil {
-			t.Errorf("parseConsole(%q): want error", bad)
+	for _, path := range []string{"/tmp/out.img", "/tmp/a,b=c%2C", "file=x,y=z%"} {
+		m, err = FromFlags(nil, nil, nil, "", path, "", boolp(false), "off")
+		if err != nil || m.Stdout.Kind != StreamFile || m.Stdout.Path != path {
+			t.Fatalf("path=%q m=%+v err=%v", path, m, err)
 		}
 	}
 }
 
-// journaldWriter falls back to a prefixed stderr when journald is unavailable;
-// drive that path directly to assert line framing (split on \n, strip \r,
-// drop empty lines, flush the partial tail on Close).
-func TestJournaldWriterLineFraming(t *testing.T) {
-	var sink strings.Builder
-	w := &journaldWriter{tag: "build", fallback: &sink}
-
-	w.Write([]byte("pull: 1/3 layers\npull: 2/3 lay"))
-	w.Write([]byte("ers\r\n\nflatten: build-erofs"))
-	if err := w.Close(); err != nil {
+func TestParseConsole_Journald(t *testing.T) {
+	c, err := parseConsole("journald=console,WORKLOAD_ID=a%2Cb,EMPTY=")
+	if err != nil {
 		t.Fatal(err)
 	}
-	got := sink.String()
-	want := "[build] pull: 1/3 layers\n[build] pull: 2/3 layers\n[build] flatten: build-erofs\n"
-	if got != want {
-		t.Errorf("framed output:\n%q\nwant:\n%q", got, want)
+	if c.Kind != ConsoleJournald || c.Journal.Tag != "console" || c.Journal.Fields["WORKLOAD_ID"] != "a,b" {
+		t.Fatalf("console=%+v", c)
+	}
+	for _, bad := range []string{"journald=", "journald=bad tag", "journald=a/b", "journald=x,A=1,A=2", "journald=x,A=%", "journald=x,_PID=1"} {
+		if _, err := parseConsole(bad); err == nil {
+			t.Errorf("console accepted %q", bad)
+		}
+		if _, err := parseStreamTarget(bad); err == nil {
+			t.Errorf("stream accepted %q", bad)
+		}
+	}
+	c, err = parseConsole("file=/tmp/a,b=c%2C")
+	if err != nil || c.Kind != ConsoleFile || c.Path != "/tmp/a,b=c%2C" {
+		t.Fatal(c, err)
 	}
 }
 
-func TestJournaldWriterKuasarIdentityFields(t *testing.T) {
-	t.Setenv("KUASAR_RUN_ID", "sr-test")
-	t.Setenv("KUASAR_SANDBOX_ID", "sandbox-test")
-	t.Setenv("KUASAR_BUILD_ID", "")
+func TestJournalOutputsWithoutFieldsRemainIndependent(t *testing.T) {
+	m, err := FromFlags(nil, nil, nil, "", "journald=app", "journald=app", boolp(false), "journald=app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Stdout.Journal == m.Stderr.Journal || m.Stdout.Journal == m.Console.Journal {
+		t.Fatal("shared targets")
+	}
+	if len(m.Stdout.Journal.Fields) != 0 || len(m.Stderr.Journal.Fields) != 0 || len(m.Console.Journal.Fields) != 0 {
+		t.Fatal("unexpected fields")
+	}
+	cmd := &exec.Cmd{}
+	arg, close, err := m.SetupCHStdio(cmd)
+	if err != nil || arg != "tty" || cmd.Stdout == nil {
+		t.Fatalf("console open: %s %v", arg, err)
+	}
+	close()
+}
 
-	w := newJournaldWriter("sandbox")
-	if got := w.fields["SYSLOG_IDENTIFIER"]; got != "sandbox" {
-		t.Fatalf("SYSLOG_IDENTIFIER = %q", got)
-	}
-	if got := w.fields["KUASAR_RUN_ID"]; got != "sr-test" {
-		t.Fatalf("KUASAR_RUN_ID = %q", got)
-	}
-	if got := w.fields["KUASAR_SANDBOX_ID"]; got != "sandbox-test" {
-		t.Fatalf("KUASAR_SANDBOX_ID = %q", got)
-	}
-	if _, ok := w.fields["KUASAR_BUILD_ID"]; ok {
-		t.Fatal("empty KUASAR_BUILD_ID should be omitted")
+func TestMissingJournalTargetIsRejected(t *testing.T) {
+	if _, err := openJournal(nil); err == nil {
+		t.Fatal("missing target accepted")
 	}
 }
 

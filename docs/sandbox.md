@@ -13,6 +13,10 @@ This document describes the current format and behavior. The current reader reje
 ## 1. Overview
 
 <a id="artifact-model"></a>
+<a id="11-逻辑角色"></a>
+<a id="11-logical-roles"></a>
+<a id="12-逻辑角色与物理-carrier"></a>
+<a id="12-logical-roles-and-physical-carriers"></a>
 ### 1.1 Artifact model
 
 The runtime consumes images, Sandbox E and Snapshot S. E describes portable configuration and the disk graph; S binds E to captured VMM/memory state. Logical objects are independent of file/named-location/Manifest/Bundle carriers. See [Sandbox artifacts](sandbox-artifacts.md) for full roles, fields and validation.
@@ -681,6 +685,25 @@ Static/dynamic cgroup modes lift a potentially competing `memory.high` before CH
 
 Balloon mutations serialize with snapshot/export through the same barrier. The freeze window cannot overlap asynchronous balloon resize. Restore takes CH state as the actual current value, then enters a new observation epoch; host YAML does not reconstruct the restored balloon's instantaneous state.
 
+The sandbox-local `MemoryController` combines one accepted Guest ABI `mem_report` with CH `vm.info`. Guest reports start immediately after the cold-launch barrier and repeat every five seconds by default; [Guest ABI](sandbox-init.md) owns their epoch/sequence, retry and quiesce protocol. `Capacity` comes from the host-owned CH memory configuration, never Guest `MemTotal`. CH `config.balloon.size` is `AcceptedTarget`; `memory_actual_size` is `CurrentBudget`, so `BalloonCurrent = Capacity - CurrentBudget` and `TargetBudget = Capacity - AcceptedTarget`. `DesiredTarget` is separate local intent. `Stable` means both observations are known and `TargetBudget == CurrentBudget`; `ObservedBudget` is their maximum. A successful `vm.resize` accepts a target and does not prove current convergence.
+
+The local calculation is:
+
+```text
+DemandMemory = max(CurrentBudget - MemAvailable, 0)
+RawRequested = min(Capacity, saturating_add(DemandMemory, AllocatableMemory))
+DesiredTarget = align_down(Capacity - RawRequested, 64 MiB)
+RequestedBudget = Capacity - DesiredTarget
+```
+
+Diagnostic Guest fields and host `memory.current` do not determine Budget. Host `memory.current` is only a lower bound when choosing `memory.high`.
+
+Growth reserves Budget first, raises the required `memory.high` allowance, then lowers the balloon target through `PUT /api/v1/vm.resize` and confirms acceptance with `vm.info`. Partial node grants accumulate until a representable Budget fits within the reservation; rounding must never create unreserved memory. Safety growth can proceed after the lifecycle barrier even while target/current are unstable. Reservation, high or ambiguous-resize failures retain the forward growth objective for retry; a later smaller report does not implicitly roll it back.
+
+Shrink requires a fresh, non-superseded report and Stable CH target/current. Each report permits at most one 64 MiB inflation step, and the desired/accepted target gap must exceed one full step, retaining one step as a deadband. Immediately before resize, CH is checked again under the mutation gate. After acceptance, the controller waits for `CurrentBudget` to converge, checks that newer admitted reports have not invalidated the transaction, applies `memory.high`, and only then sends the smaller absolute reservation baseline. A report accepted before that convergence cannot authorize the next step. Unavailable/unstable CH state, pending newer observations or failed high/reservation operations retain the pending transaction and prevent premature reservation release. Guest emergency deflation does not bypass these conditions.
+
+See [memory.go](../pkg/resctl/memory.go), [memory_controller.go](../pkg/resctl/memory_controller.go) and [balloon.go](../pkg/resctl/balloon.go). Sparse `PUNCH_HOLE`/`MADV_DONTNEED` and hole-only skipping remain in [VMM patch 0004](cloud-hypervisor.md#34-0004--skip-hole-only-runs-during-balloon-release).
+
 ## 10. Resource protocol
 
 ### 10.1 Lifecycle states
@@ -702,6 +725,8 @@ Before snapshot/export, new Budget mutations and balloon transitions are blocked
 Static/dynamic modes can use PSI or `memory.events.local` polling. Host configuration determines the PSI trigger and debounce; they are not written to E. The sensor stops initiating growth during the capture gate and establishes a new observation epoch after restore.
 
 <a id="artifact-provenance-and-publication"></a>
+<a id="11-provenancepublish-与-carrier"></a>
+<a id="11-provenance-publication-and-carriers"></a>
 ## 11. Artifact provenance and publication
 
 See [Sandbox artifacts](sandbox-artifacts.md) for disk/memory references, tarstream/Manifest/Bundle outputs, exact publication and commit rules. This runtime specification retains capture sequencing.
@@ -715,6 +740,15 @@ The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#111
 ### 11.2 Local tarstream and crypto
 
 The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#112-local-tarstream-and-crypto).
+
+<a id="local-output"></a>
+[Local output](sandbox-artifacts.md#local-output) defines local tarstream publication.
+
+<a id="named-ref-location"></a>
+[Named ref location](sandbox-artifacts.md#named-ref-location) defines publication to a named carrier.
+
+<a id="single-root-imagesandbox-manifest-bundle"></a>
+[Single-root image/Sandbox Manifest Bundle](sandbox-artifacts.md#single-root-imagesandbox-manifest-bundle) defines that carrier's publication rules.
 
 ### 11.3 Manifest upload
 
