@@ -44,7 +44,7 @@ for shape in root root-overlay disk disk-overlay; do
           restore) extra=(--restore "file://$WORK/missing.snapshot") ;;
         esac
         if timeout 10s "$CTL" run --config "$WORK/input.yaml" \
-          --runtime-root "$WORK/run" --base-root "$WORK/base" \
+          --run-root "$WORK/run" --base-root "$WORK/base" \
           "${extra[@]}" > "$WORK/output" 2>&1; then
           echo "Accepted $field.$key=$value in $mode mode" >&2
           exit 1
