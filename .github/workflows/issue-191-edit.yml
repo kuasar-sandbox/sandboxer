@@ -22,4 +22,18 @@ jobs:
           git show "$HELPER_SHA:.github/issue-191-edit.py" > "$RUNNER_TEMP/issue-191-edit.py"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path(os.environ['RUNNER_TEMP']) / 'issue-191-edit.py'
+          s = p.read_text()
+          needle = "    assert 'DiffSizeBytes' not in s"
+          assert s.count(needle) == 1
+          replacement = '''    if path == 'pkg/config/config_test.go':
+                  s = replace(s, '\\tcfg.Boot.Root.Overlay.DiffSize = ""\\n', '')
+                  s = replace(s, '      diff: file:///run/sb/diff.ext4\\n      size: 1GiB\\n', '      diff: file:///run/sb/diff.ext4\\n')
+              assert 'DiffSizeBytes' not in s'''
+          s = s.replace(needle, replacement)
+          p.write_text(s)
+          PY
           python3 "$RUNNER_TEMP/issue-191-edit.py"
