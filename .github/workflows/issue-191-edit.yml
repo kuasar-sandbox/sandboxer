@@ -1,32 +1,32 @@
-name: Issue 191 isolated source audit
+name: Issue 191 isolated fixture completion
 on:
   push:
     branches: [work/191-complete-cleanup]
 permissions:
-  contents: read
+  contents: write
 jobs:
-  audit:
+  edit:
     if: github.repository == 'kuasar-sandbox/sandboxer'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 6bbbfc9f5c55bad957f583bc81d1951f78e79926
+          ref: fix/191-remove-ineffective-disk-size
           fetch-depth: 0
-          persist-credentials: false
-      - name: Archive the exact candidate and inspect size-key fixtures
+      - name: Apply the bounded fixture completion
+        env:
+          HELPER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = 6bbbfc9f5c55bad957f583bc81d1951f78e79926
-          git archive --format=tar HEAD > "$RUNNER_TEMP/issue-191-candidate.tar"
-          git diff 76dba47d54c5d670ab29669d25e9e0f977a30030...HEAD > "$RUNNER_TEMP/issue-191.diff"
-          git grep -n -E '(^|[^[:alnum:]_])(diff_size|size)[[:space:]]*:' -- '*.go' '*.sh' '*.yaml' '*.yml' '*.md' || test "$?" = 1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: issue-191-exact-source
-          path: |
-            ${{ runner.temp }}/issue-191-candidate.tar
-            ${{ runner.temp }}/issue-191.diff
-          if-no-files-found: error
-          retention-days: 1
+          git show "$HELPER_SHA:.github/issue-191-complete.py" > "$RUNNER_TEMP/issue-191-complete.py"
+          python3 "$RUNNER_TEMP/issue-191-complete.py"
+          git diff > "$RUNNER_TEMP/completion.diff"
+          test "$(sha256sum "$RUNNER_TEMP/completion.diff" | cut -d' ' -f1)" = 8d4c1cd29171ec4c796a11c2387804027d048ac2460ebcb41c1ffd7d283eaca6
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- pkg/config/disk_size_test.go pkg/sandbox/helpers_test.go test/e2e
+          git commit -m 'test: complete disk-size fixture migration and block-style coverage'
+          git push origin HEAD:refs/heads/fix/191-remove-ineffective-disk-size
+          git rev-parse HEAD
