@@ -51,10 +51,10 @@ func (w *Writer) Write(p []byte) (int, error) {
 		chunk := p[:limit]
 		if i := bytes.IndexByte(chunk, '\n'); i >= 0 {
 			if len(w.buf) == 0 {
-				w.emit(chunk[:i])
+				w.emit(chunk[:i], true)
 			} else {
 				w.append(chunk[:i])
-				w.emit(w.buf)
+				w.emit(w.buf, true)
 				w.buf = w.buf[:0]
 			}
 			p = p[i+1:]
@@ -63,7 +63,8 @@ func (w *Writer) Write(p []byte) (int, error) {
 		w.append(chunk)
 		p = p[limit:]
 		if len(w.buf) == MaxLine {
-			w.emit(w.buf)
+			// A size boundary is not a line ending; retain CR bytes here.
+			w.emit(w.buf, false)
 			w.buf = w.buf[:0]
 		}
 	}
@@ -83,8 +84,10 @@ func (w *Writer) append(p []byte) {
 	w.buf = append(w.buf, p...)
 }
 
-func (w *Writer) emit(line []byte) {
-	line = bytes.TrimRight(line, "\r")
+func (w *Writer) emit(line []byte, lineEnd bool) {
+	if lineEnd {
+		line = bytes.TrimRight(line, "\r")
+	}
 	if len(line) == 0 {
 		return
 	}
@@ -103,7 +106,7 @@ func (w *Writer) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !w.closed {
-		w.emit(w.buf)
+		w.emit(w.buf, false)
 		w.buf = nil
 		w.closed = true
 	}
