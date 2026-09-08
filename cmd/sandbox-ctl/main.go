@@ -101,8 +101,9 @@ Usage:
                         [--from <sandbox-ref> [--replace-boot] | --restore <snapshot-ref>]
                         [--ref-location name=file:///absolute/path ...]
                         [--stdin] [--stdout=false] [--stderr=false]
-                        [--stdin-from F] [--stdout-to F] [--stderr-to F]
-                        [--tty] [--console off|default|file=PATH]
+                        [--stdin-from F] [--stdout-to TARGET] [--stderr-to TARGET]
+                        [--tty] [--console off|default|file=PATH|journald=TAG[,FIELD=VALUE...]]
+                        [--log-to default|journald=TAG[,FIELD=VALUE...]]
                         [--ping-fatal-threshold N] [--stats-interval <dur>]
                         [--ready-fd N]
   sandbox-ctl export    [--sandbox-id <sid>] [--path-id <leaf>]
@@ -124,7 +125,7 @@ Usage:
                         [--cwd <dir>]
                         [--env KEY=VAL ...]
                         [--stdin] [--stdout=false] [--stderr=false]
-                        [--stdin-from F] [--stdout-to F] [--stderr-to F]
+                        [--stdin-from F] [--stdout-to TARGET] [--stderr-to TARGET]
                         [--tty] -- CMD [ARGS...]
   sandbox-ctl config    [--config a.yaml[:b.yaml...] | --template]
                         [--mode default|restore] [--check skip|strict] [-o <file>]
@@ -137,6 +138,12 @@ Usage:
                         publish an E/S graph and print its rewritten root ref
   sandbox-ctl upload-snapshot
                         same options as publish; compatibility alias for Snapshot S
+
+Output TARGET is a file path or journald=TAG[,FIELD=VALUE...]. Each journal
+output owns its fields independently; values use one-time percent decoding.
+No fields are inherited from other outputs or discovered from the environment.
+run --log-to selects only component diagnostics and defaults to stderr; it does
+not change guest stderr, TTY selection, or process descriptors. See docs/journald.md.
 
 --manifest-config (or MANIFEST_CONFIG env) supplies the shared storage
 configuration. It is required for any manifest:// resource and for local

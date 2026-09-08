@@ -22,10 +22,12 @@
 //	--stdin / --stdout / --stderr  (bool; pipe mode; default false / true / true)
 //	--stdin-from / --stdout-to / --stderr-to FILE
 //	--console off | default | file=PATH    (default: default)
+//
+// Output targets also accept journald=TAG[,FIELD=VALUE...], independently per
+// output. Values use percent encoding; see docs/journald.md.
 package stdio
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -38,7 +40,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/coreos/go-systemd/v22/journal"
+	"github.com/kuasar-sandbox/sandboxer/internal/journalio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"golang.org/x/sys/unix"
@@ -53,14 +55,14 @@ const (
 	StreamNone     StreamKind = iota // no channel (guest wires the app fd to /dev/null for stdin)
 	StreamInherit                    // os.Stdin / os.Stdout / os.Stderr
 	StreamFile                       // open Path
-	StreamJournald                   // line-write to journald, SYSLOG_IDENTIFIER=Tag
+	StreamJournald                   // line-write using this output's journal target
 )
 
 // Stream is one resolved app data-stream endpoint (pipe mode only).
 type Stream struct {
-	Kind StreamKind
-	Path string // when Kind == StreamFile
-	Tag  string // when Kind == StreamJournald (SYSLOG_IDENTIFIER)
+	Kind    StreamKind
+	Path    string            // when Kind == StreamFile
+	Journal *journalio.Target // when Kind == StreamJournald; never shared by tag
 }
 
 func (s Stream) active() bool { return s.Kind != StreamNone }
@@ -72,14 +74,14 @@ const (
 	ConsoleStderr   ConsoleKind = iota // sandbox-ctl's stderr (default)
 	ConsoleOff                         // discarded (CH --console off)
 	ConsoleFile                        // a file
-	ConsoleJournald                    // line-write to journald, SYSLOG_IDENTIFIER=Tag
+	ConsoleJournald                    // line-write using this output's journal target
 )
 
 // Console is the resolved kernel-dmesg sink.
 type Console struct {
-	Kind ConsoleKind
-	Path string // when Kind == ConsoleFile
-	Tag  string // when Kind == ConsoleJournald (SYSLOG_IDENTIFIER)
+	Kind    ConsoleKind
+	Path    string            // when Kind == ConsoleFile
+	Journal *journalio.Target // when Kind == ConsoleJournald
 }
 
 // Mode is the fully resolved stdio configuration for one run.
@@ -182,29 +184,17 @@ func FromFlags(stdin, stdout, stderr *bool, stdinFrom, stdoutTo, stderrTo string
 	return m, nil
 }
 
-// parseStreamTarget resolves a --stdout-to / --stderr-to value: "journald=<tag>"
-// → a journald sink (SYSLOG_IDENTIFIER=tag); anything else → a file path.
+// parseStreamTarget resolves one output. Only journald= is special; all other
+// strings remain file paths, including paths containing commas or percentages.
 func parseStreamTarget(to string) (Stream, error) {
-	if tag, ok := strings.CutPrefix(to, "journald="); ok {
-		if err := validTag(tag); err != nil {
+	if strings.HasPrefix(to, journalio.Prefix) {
+		target, err := journalio.Parse(to)
+		if err != nil {
 			return Stream{}, err
 		}
-		return Stream{Kind: StreamJournald, Tag: tag}, nil
+		return Stream{Kind: StreamJournald, Journal: &target}, nil
 	}
 	return Stream{Kind: StreamFile, Path: to}, nil
-}
-
-// validTag checks a journald SYSLOG_IDENTIFIER tag is a non-empty token.
-func validTag(tag string) error {
-	if tag == "" {
-		return errors.New("journald= requires a tag")
-	}
-	for _, r := range tag {
-		if !(r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
-			return fmt.Errorf("journald tag %q: only [A-Za-z0-9_-] allowed", tag)
-		}
-	}
-	return nil
 }
 
 func parseConsole(s string) (Console, error) {
@@ -219,89 +209,22 @@ func parseConsole(s string) (Console, error) {
 			return Console{}, errors.New("--console: file= requires a path")
 		}
 		return Console{Kind: ConsoleFile, Path: p}, nil
-	case strings.HasPrefix(s, "journald="):
-		tag := strings.TrimPrefix(s, "journald=")
-		if err := validTag(tag); err != nil {
+	case strings.HasPrefix(s, journalio.Prefix):
+		target, err := journalio.Parse(s)
+		if err != nil {
 			return Console{}, err
 		}
-		return Console{Kind: ConsoleJournald, Tag: tag}, nil
+		return Console{Kind: ConsoleJournald, Journal: &target}, nil
 	default:
-		return Console{}, fmt.Errorf("--console must be off, default, file=<path>, or journald=<tag> (got %q)", s)
+		return Console{}, fmt.Errorf("--console must be off, default, file=<path>, or journald=<tag>[,<FIELD>=<VALUE>...] (got %q)", s)
 	}
 }
 
-// --- journald sink --------------------------------------------------
-
-// journaldMaxLine bounds an unterminated line before it is force-flushed,
-// keeping the buffer from growing without a newline (and well under
-// journald's field-size limit).
-const journaldMaxLine = 60 << 10
-
-// journaldWriter line-buffers a byte stream and writes each line to journald
-// as one entry tagged SYSLOG_IDENTIFIER=<tag>, PRIORITY=info (stdout, stderr
-// and kernel console all log at info; build failure is conveyed out-of-band by
-// the build status, not the log level). When journald is unavailable (sandbox-ctl
-// run outside systemd, e.g. a direct e2e run), it falls back to the process
-// stderr with a "[tag] " line prefix so output is never silently lost.
-type journaldWriter struct {
-	tag      string
-	fields   map[string]string
-	fallback io.Writer // non-nil ⇒ journald unavailable
-	buf      []byte
-}
-
-func newJournaldWriter(tag string) *journaldWriter {
-	fields := map[string]string{"SYSLOG_IDENTIFIER": tag}
-	for _, key := range []string{"KUASAR_RUN_ID", "KUASAR_SANDBOX_ID", "KUASAR_BUILD_ID"} {
-		if v := os.Getenv(key); v != "" {
-			fields[key] = v
-		}
+func openJournal(target *journalio.Target) (*journalio.Writer, error) {
+	if target == nil {
+		return nil, errors.New("stdio: journal target is missing")
 	}
-	w := &journaldWriter{tag: tag, fields: fields}
-	if !journal.Enabled() {
-		w.fallback = os.Stderr
-	}
-	return w
-}
-
-func (w *journaldWriter) Write(p []byte) (int, error) {
-	w.buf = append(w.buf, p...)
-	for {
-		i := bytes.IndexByte(w.buf, '\n')
-		if i < 0 {
-			break
-		}
-		w.emit(w.buf[:i])
-		w.buf = w.buf[i+1:]
-	}
-	if len(w.buf) >= journaldMaxLine { // very long line, no newline yet: force-flush
-		w.emit(w.buf)
-		w.buf = w.buf[:0]
-	}
-	return len(p), nil
-}
-
-func (w *journaldWriter) emit(line []byte) {
-	line = bytes.TrimRight(line, "\r")
-	if len(line) == 0 {
-		return
-	}
-	if w.fallback != nil {
-		fmt.Fprintf(w.fallback, "[%s] %s\n", w.tag, line)
-		return
-	}
-	_ = journal.Send(string(line), journal.PriInfo, w.fields)
-}
-
-// Close flushes any buffered partial line. Callers invoke it only after the
-// producer (the exec copy goroutine / CH) has finished, so there is no
-// concurrent Write.
-func (w *journaldWriter) Close() error {
-	if len(w.buf) > 0 {
-		w.emit(w.buf)
-		w.buf = w.buf[:0]
-	}
-	return nil
+	return journalio.New(*target, os.Stderr, "["+target.Tag+"] ")
 }
 
 // --- mapping to the launch protocol / MUX ---------------------------
@@ -375,7 +298,10 @@ func (m Mode) SetupCHStdio(cmd *exec.Cmd) (consoleArg string, cleanup func(), er
 		// goroutine (joined by cmd.Wait), so CH sees a non-tty stdout (skips
 		// sigwinch/raw, as in the ConsoleStderr pipe case) and its kernel
 		// dmesg is line-written to journald. cleanup flushes the partial line.
-		jw := newJournaldWriter(m.Console.Tag)
+		jw, err := openJournal(m.Console.Journal)
+		if err != nil {
+			return "", nil, err
+		}
 		cmd.Stdout = jw
 		return "tty", func() { _ = jw.Close() }, nil
 	default: // ConsoleStderr
@@ -535,7 +461,10 @@ func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamS
 			dst = f
 			closers = append(closers, f)
 		case StreamJournald:
-			jw := newJournaldWriter(s.Tag)
+			jw, err := openJournal(s.Journal)
+			if err != nil {
+				return err
+			}
 			dst = jw
 			closers = append(closers, jw) // Close (flush) runs after the copy goroutine is waited
 		default: // StreamNone — should not happen if streams[streamID]
