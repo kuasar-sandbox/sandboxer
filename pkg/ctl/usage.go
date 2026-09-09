@@ -22,7 +22,9 @@ func WriteUsageResponse(w io.Writer, response Response) error {
 		return err
 	}
 	if len(body) > MaxUsageResponseBytes {
-		return errors.New("ctl: usage response too large; reduce history limit")
+		// Replace before writing any bytes. After a partial write, callers
+		// must close the connection, never append a second framed response.
+		body, _ = json.Marshal(Response{Type: TypeError, Msg: "ctl: usage response too large; reduce history limit"})
 	}
 	var header [4]byte
 	binary.LittleEndian.PutUint32(header[:], uint32(len(body)))

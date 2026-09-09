@@ -55,6 +55,9 @@ type Manager struct {
 	closeFn   func()
 	closeOnce sync.Once
 	runStart  time.Time
+	// An existing empty/partial first record cannot establish prior CPU usage.
+	// Once counters exist their persistent Complete bits retain this fact.
+	historyUnknown bool
 }
 
 func newManager(s Snapshot, recovered Recovery, w Writer, dirSync func() error) *Manager {
@@ -74,7 +77,12 @@ func Open(baseDir, sandboxID, epoch string, start time.Time, sample, flush time.
 		return nil, fmt.Errorf("usage directory: %w", err)
 	}
 	dir := os.NewFile(uintptr(dirFD), baseDir)
-	fd, err := unix.Openat(dirFD, sandboxID+".usage", unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o600)
+	flags := unix.O_RDWR | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK
+	fd, err := unix.Openat(dirFD, sandboxID+".usage", flags|unix.O_CREAT|unix.O_EXCL, 0o600)
+	created := err == nil
+	if errors.Is(err, unix.EEXIST) {
+		fd, err = unix.Openat(dirFD, sandboxID+".usage", flags, 0)
+	}
 	if err != nil {
 		dir.Close()
 		return nil, fmt.Errorf("usage file: %w", err)
@@ -107,6 +115,7 @@ func Open(baseDir, sandboxID, epoch string, start time.Time, sample, flush time.
 	m := newManager(s, recovered, f, dir.Sync)
 	m.reader, m.closeFn = f, closeFiles
 	m.runStart = start
+	m.historyUnknown = !created && (recovered.Record == nil || len(recovered.Record.Snapshot.Counters) == 0)
 	return m, nil
 }
 
@@ -186,7 +195,12 @@ func (m *Manager) Counter(name, source string, raw, hertz uint64, created bool) 
 	}
 	for i := range m.live.Counters {
 		if m.live.Counters[i].Name == name {
-			return m.live.Counters[i].Observe(source, raw, hertz, created)
+			c := &m.live.Counters[i]
+			err := c.Observe(source, raw, hertz, created)
+			if m.historyUnknown {
+				c.Complete = false
+			}
+			return err
 		}
 	}
 	if len(m.live.Counters) >= MaxCounters {
@@ -195,6 +209,9 @@ func (m *Manager) Counter(name, source string, raw, hertz uint64, created bool) 
 	c := Counter{Name: name}
 	if err := c.Observe(source, raw, hertz, created); err != nil {
 		return err
+	}
+	if m.historyUnknown {
+		c.Complete = false
 	}
 	m.live.Counters = append(m.live.Counters, c)
 	return nil
@@ -214,7 +231,7 @@ func (m *Manager) CounterMissing(name string, final bool) {
 		}
 	}
 	if len(m.live.Counters) < MaxCounters {
-		m.live.Counters = append(m.live.Counters, Counter{Name: name, Status: Missing})
+		m.live.Counters = append(m.live.Counters, Counter{Name: name, Status: Missing, Complete: !final && !m.historyUnknown})
 	}
 }
 

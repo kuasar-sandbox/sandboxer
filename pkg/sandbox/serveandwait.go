@@ -741,8 +741,11 @@ func ServeAndWait(p VMParams) (int, error) {
 				cancel()
 			} else {
 				logf("usage final waitid: %v", waitIDErr)
-				usageManager.CounterMissing("guest.cpu", true)
-				usageManager.CounterMissing("ch.cpu", true)
+				// No retained process endpoint: close sampler admission and
+				// mark every CH/vCPU counter's terminal segment unknown.
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				usageSampler.FinalCH(ctx)
 			}
 		}
 		waitErr := cmd.Wait()

@@ -19,7 +19,7 @@ func TestUsageDefaultsStrictAndOverrides(t *testing.T) {
 	if err != nil || c.Usage.Enabled || s != time.Second || f != 5*time.Minute {
 		t.Fatalf("%+v %v", c.Usage, err)
 	}
-	for _, body := range []string{"usage: {enabeld: true}", "usage: {enabled: 'true'}", "usage: {sample_interval: ''}", "usage: {enabled: true, enabled: false}"} {
+	for _, body := range []string{"usage: {enabeld: true}", "usage: {enabled: 'true'}", "usage: {sample_interval: ''}", "usage: {enabled: true, enabled: false}", "usage: null", "usage: ~", "usage: []", "usage: {enabled: null}", "defaults: &defaults {usage: null}\n<<: *defaults", "defaults: &defaults {enabled: true}\nusage: {<<: *defaults}"} {
 		if _, err := LoadConfigBytes([]byte(body)); err == nil {
 			t.Fatal(body)
 		}

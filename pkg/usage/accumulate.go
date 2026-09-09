@@ -12,7 +12,7 @@ const (
 	Invalid     = "invalid"
 	Paused      = "paused"
 	MaxCounters = 1027
-	MaxGauges   = 69 // Guest memory, 64 managed filesystems, four process RSS items.
+	MaxGauges   = 14 // Guest memory, root + eight data filesystems, four RSS items.
 )
 
 // Window summarizes only intervals and observations assigned to this record.
@@ -163,6 +163,9 @@ type Counter struct {
 	SourceKnown bool    `json:"source_known"`
 	Complete    bool    `json:"complete"`
 	Status      string  `json:"status"`
+	// Reconstructed only from a normally closed record. A newly created
+	// replacement source does not prove the previous source's final endpoint.
+	sourceClosed bool
 }
 
 func (c *Counter) Observe(source string, raw, hertz uint64, created bool) error {
@@ -179,8 +182,12 @@ func (c *Counter) Observe(source string, raw, hertz uint64, created bool) error 
 		delta = raw - n.LastRaw
 	} else {
 		if !n.SourceKnown {
-			n.Complete = created
-		} else if !created {
+			if n.Status == "" {
+				n.Complete = created
+			} else {
+				n.Complete = n.Complete && created
+			}
+		} else if !created || !n.sourceClosed {
 			n.Complete = false
 		}
 		if created {
@@ -198,6 +205,7 @@ func (c *Counter) Observe(source string, raw, hertz uint64, created bool) error 
 	}
 	n.Source, n.LastRaw, n.Hertz, n.Remainder = source, raw, hertz, remainder
 	n.SourceKnown, n.Status = true, OK
+	n.sourceClosed = false
 	*c = n
 	return nil
 }
@@ -222,11 +230,19 @@ func (s Snapshot) clone() Snapshot {
 }
 
 func (s *Snapshot) newRun(epoch string, start time.Time, sample, flush time.Duration) {
+	for i := range s.Counters {
+		c := &s.Counters[i]
+		c.sourceClosed = s.Closed
+		if !s.Closed {
+			c.Complete, c.Status = false, Missing
+		}
+	}
 	s.RunEpoch, s.StartedUTC = epoch, start.UnixNano()
 	s.SampleInterval, s.FlushInterval, s.Closed = int64(sample), int64(flush), false
 	for i := range s.Gauges {
 		s.Gauges[i].Break(Missing)
 		s.Gauges[i].LastRequest = 0
+		s.Gauges[i].LastAt, s.Gauges[i].LastValueAt = 0, 0
 		s.Gauges[i].Window = Window{}
 	}
 }

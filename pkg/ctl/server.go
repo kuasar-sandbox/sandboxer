@@ -115,7 +115,6 @@ func (s *Server) handle(conn *net.UnixConn) {
 		}
 		resp.Type = TypeUsageResponse
 		if err := WriteUsageResponse(conn, resp); err != nil {
-			_ = WriteMessage(conn, Response{Type: TypeError, Msg: err.Error()})
 			s.Logf("ctl.sock usage response: %v", err)
 		}
 		return

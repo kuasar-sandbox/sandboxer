@@ -37,6 +37,7 @@ sandbox-ctl run
 sandbox-ctl export
 sandbox-ctl snapshot
 sandbox-ctl exec
+sandbox-ctl usage
 sandbox-ctl config
 sandbox-ctl info
 sandbox-ctl publish
@@ -232,6 +233,18 @@ Publisher 自动严格识别 local E/S carrier. 已经 portable 的 graph depend
 `manifest://` root 本身不再 materialize 到 named location,也不存在 Manifest tail rewrite.
 它不读取 `artifact.json`,也不存在 artifact-kind registry.
 
+### 2.9 `sandbox-ctl usage`
+
+```bash
+sandbox-ctl usage --sandbox-id s1
+sandbox-ctl usage --sandbox-id s1 --saved
+sandbox-ctl usage --sandbox-id s1 --offline --history --limit 10
+```
+
+该只读命令返回已有 live/saved 用量或有界历史. `--path-id` 选择既有
+RunDir/BaseDir, 逻辑 SandboxID 标识用量文件及记录. 查询不触发 Guest/CH
+采集或保存. 完整参数、JSON 单位、有效性及文件格式由 [usage](usage_zh.md) 统一定义.
+
 ## 3. 配置与制品格式
 
 ### 3.1 `sandbox.yaml`
@@ -301,6 +314,10 @@ restore:
   prefetch: off
 timeouts:
   ch_api: 30s
+usage:
+  enabled: false
+  sample_interval: 1s
+  flush_interval: 5m
 ```
 
 普通 cold run 使用完整 validation. `run --from` 和 `run --restore` 先严格解析 artifact,再按字段 presence 应用各自 rules,不能使用无约束 `LoadMerged` 覆盖 artifact graph.
@@ -356,6 +373,13 @@ Runtime semantics:
 - `run --restore` 不重跑 launch/files/init/plugin.
 
 Restore host若显式提供 `boot.cmdline`、launch persistent/ephemeral fields、mounts、files/ephemeral_files、init 或 metadata,会在副作用前拒绝,而不是静默忽略. `resources.startup` 是 host-only node policy,可在 restore 时提供;它写入 node reservation contract,但 Snapshot 捕获的 `BudgetAtSnapshot` 仍是 restore initial Budget 的权威值.
+
+### 3.9 Usage policy
+
+`usage` 是严格解析的 host-only policy. 在 cold/from/restore 中遵循配置顺序
+覆盖, 不进入 Portable/E/S. 默认关闭不增加 sampler、usage 长连接或周期写盘,
+既有资源控制仍工作, 旧文件仍可离线读取. 参见
+[usage 配置](usage_zh.md#3-配置) 和 [host overlay 示例](../examples/usage-enabled.yaml).
 
 ## 4. 资源模型
 
@@ -428,7 +452,7 @@ CH stdin固定 `/dev/null`;console output由 sandbox-ctl bridge. Net provider为
 | Owner | Fields |
 |---|---|
 | Artifact strong | root/data immutable graph, disk count/order/name, topology, self position, cmdline |
-| Host strong | kernel/runtime actual path, active diff/template, cgroup/controller, network provider, timeout, manifest/crypto/ref-location, CH binary |
+| Host strong | kernel/runtime actual path, active diff/template, cgroup/controller, network provider, timeout, usage, manifest/crypto/ref-location, CH binary |
 | Persistent override allowed | resources workload defaults, launch, mounts, files, init, metadata |
 | Instance-only | IP/MAC/hostname, ephemeral files/env, stdio/forward |
 
@@ -487,6 +511,7 @@ Snapshot Bundle root Manifest是 S;Export Bundle root Manifest是 E. E、data/lo
 
 ```text
 T0 output/manifest/local-crypto/ref/Bundle/merge/config/source preflight
+   Close usage admission and break Gauge continuity before the resource barrier.
 T1 enter MemoryController/Budget mutation barrier
 T2 lock and lift/drain memory.high
 T3 pause pinger and gate new host exec/forward;guest drains exec/forward and mem_report, freezes app, syncs,
@@ -539,9 +564,14 @@ Snapshot和export使用独立 request type:
 snapshot_request -> snapshot_done | error
 export_request   -> export_done   | error
 exec_request     -> exec_ack      | error
+usage_request    -> usage_response | error
 ```
 
 Export不是 `snapshot_request{memory:false}`. Request在 run process中执行,因此可以复用当前 lifecycle barrier、guest/MUX gate、CH API socket和live vhost SnapshotView.
+
+Usage 只读取 owner 已有 `usage.Snapshot`/`usage.Record` 或已确认文件历史,
+不采样、不保存、不获取 capture/CH mutation barrier. 只有其 response 采用
+独立的 1 MiB JSON 上限, 普通 ctl framing 和上限不变.
 
 Response 中不回显 secret。Remote Manifest upload 可以耗时较长。Local snapshot/live export 的 CLI `--timeout=0` 不给 ctl connection 设置 deadline；正数只限制该客户端的等待。两者都不是 wire request 中的服务端 deadline 字段。服务端 lifecycle context 仍控制支持取消的 I/O，CLI 超时不能证明没有 artifact 被 commit。Image-to-Sandbox-E assembly 则将正数 timeout 应用于自己的 operation context（§2.4）。
 
@@ -623,6 +653,19 @@ next snapshot:
 ### 7.1 Memory prefetch
 
 `restore.prefetch: memory` 是 host-only optimization，预热当前 S self 的 file page cache 或 Manifest chunks，不包含 parent memory layers 和 disk streams。调用传入的是 opened root stream，因此范围也可能包含 S 的有界 ZIP metadata tail，并非仅 memory payload section。它不改变 sparse truth、fault ordering、C0、S或memory parents. 默认 `off`。Invalid configured mode 在副作用前验证失败；缺少 prefetch capability 或预取 I/O 失败属于 best-effort，不使 restore 失败，而是记录日志并继续 on-demand。异步任务在 stream 关闭前被 cancel 并 join。源码见 [prefetch.go](../pkg/restore/prefetch.go) 及 [restore.go](../pkg/restore/restore.go) 中的调用。
+
+### 7.2 跨运行代次的 Usage
+
+Cold/restore 进入同一 Host usage owner. CPU 观测随进程开始, Guest 观测只在
+真正 launch/restore ready 后开始. 捕获前 Host 暂停准入, Guest 关闭旧 usage
+连接但不替换阻塞 source worker. 成功 thaw 和失败恢复重新开放准入, restore
+接受新 Host epoch. restored balloon seed 不是新 actual 观测.
+
+`BaseDir/<SandboxID>.usage` 跟随逻辑身份且位于 E/S 之外. 恢复旧 S 不回滚
+用量, 新 SandboxID 的克隆不继承用量. 新运行重建时钟和 Gauge 基线, 当前
+内存/文件系统占用不扣除恢复初值. 正常停止有界尽力最终读取/保存, 删除不等待
+成功也不单独保留用量. live/saved 回退、未知尾部及损失边界见
+[usage 可靠性](usage_zh.md#7-可靠性与生命周期).
 
 ## 8. UFFD handler
 
@@ -872,6 +915,7 @@ Benchmark分别覆盖local tarstream/Bundle create、Bundle read、sparse merge�
 
 ## 15. See Also
 
+- [usage_zh.md](usage_zh.md) — Host-only 资源用量、查询、单位和持久化.
 - [sandbox-init_zh.md](sandbox-init_zh.md) — guest PID 1、launch/quiesce/MUX 协议。
 - [cloud-hypervisor_zh.md](cloud-hypervisor_zh.md) — CH build、API 与 restore 边界。
 - [Connector TAPFD 协议](https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd_zh.md) — TAP descriptor handoff 与 network namespace，由 connector 维护。

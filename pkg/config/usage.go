@@ -15,6 +15,24 @@ type UsageConfig struct {
 	FlushInterval  string `yaml:"flush_interval"`
 }
 
+// yaml.v3 bypasses a field's UnmarshalYAML for null. Inspect usage presence
+// (including root merge keys) before decoding, without changing other fields'
+// established permissive/ordered merge behavior.
+func (c *SandboxConfig) UnmarshalYAML(node *yaml.Node) error {
+	var fields map[string]yaml.Node
+	if err := node.Decode(&fields); err != nil {
+		return err
+	}
+	if value, exists := fields["usage"]; exists {
+		var checked UsageConfig
+		if err := checked.UnmarshalYAML(&value); err != nil {
+			return err
+		}
+	}
+	type plain SandboxConfig
+	return node.Decode((*plain)(c))
+}
+
 func (u *UsageConfig) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
 		return errors.New("usage must be a mapping")

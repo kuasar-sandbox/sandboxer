@@ -41,11 +41,11 @@ func runUsage(args []string, out io.Writer) error {
 	cursor := fs.Int64("cursor", 0, "history byte cursor")
 	limit := fs.Int("limit", 10, "history records per page (1..100)")
 	timeout := fs.Duration("timeout", 5*time.Second, "online query budget")
-	_ = fs.Bool("json", true, "output lossless JSON (the only usage output format)")
+	jsonOutput := fs.Bool("json", true, "output lossless JSON (the only usage output format)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 0 || *limit < 1 || *limit > 100 || *cursor < 0 || *timeout <= 0 {
+	if fs.NArg() != 0 || *limit < 1 || *limit > 100 || *cursor < 0 || *timeout <= 0 || !*jsonOutput {
 		return errors.New("invalid usage query arguments")
 	}
 	if *file != "" {

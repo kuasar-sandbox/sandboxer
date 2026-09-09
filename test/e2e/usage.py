@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Real usage integration; keep complete per-case evidence, never synthesize usage."""
+import argparse
+import atexit
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import tarfile
+import tempfile
+import time
+
+REPO = Path(__file__).resolve().parents[2]
+BIN = Path(os.environ["BIN"]).resolve()
+
+
+def run(*args, timeout=60, **kw):
+    return subprocess.run([str(a) for a in args], check=True, timeout=timeout,
+                          text=True, capture_output=True, **kw).stdout
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for b in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def image_ref(path):
+    with tarfile.open(path) as archive:
+        names = [n for n in archive.getnames() if n.startswith(".kuasar.digest.")]
+    assert len(names) == 1, names
+    return f"file://{path}@digest:{names[0].removeprefix('.kuasar.digest.')}"
+
+
+def ext4(path, root=None):
+    with path.open("wb") as f:
+        f.truncate(256 * 1024 * 1024)
+    args = ["mkfs.ext4", "-q", "-F"]
+    if root is not None:
+        args += ["-d", str(root)]
+    run(*args, path)
+
+
+class Sandbox:
+    def __init__(self, work, name, config, restore=None, sandbox_id=None, base_root=None):
+        self.dir = work / name
+        self.dir.mkdir()
+        self.name = sandbox_id or name
+        self.runroot = self.dir / "run"
+        self.baseroot = base_root or self.dir / "base"
+        self.config = self.dir / "config.yaml"
+        write_json(self.config, config)  # JSON is a strict subset of YAML.
+        self.log = (self.dir / "run.log").open("w")
+        command = [
+            str(BIN / "sandbox-ctl"), "run", "--config", str(self.config),
+            "--sandbox-id", self.name, "--path-id", "instance", "--run-root", str(self.runroot),
+            "--base-root", str(self.baseroot), "--ch-binary", str(BIN / "cloud-hypervisor")]
+        if restore is not None:
+            command += ["--restore", str(restore)]
+        self.process = subprocess.Popen(command,
+            stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+
+    def cli(self, command, *args, timeout=15):
+        return run(BIN / "sandbox-ctl", command, "--sandbox-id", self.name,
+                   "--path-id", "instance", "--run-root", self.runroot, *args, timeout=timeout)
+
+    def ready(self):
+        end = time.monotonic() + 45
+        while self.process.poll() is None and time.monotonic() < end:
+            try:
+                self.cli("exec", "--", "/probe", "true", timeout=2)
+                return
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                time.sleep(.1)
+        raise AssertionError(f"guest not ready; complete log: {self.dir / 'run.log'}")
+
+    def view(self):
+        return json.loads(self.cli("usage", "--base-root", self.baseroot))
+
+    def stop(self):
+        if self.process.poll() is None:
+            try:
+                self.cli("exec", "--", "/probe", "exit")
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                os.killpg(self.process.pid, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.process.pid, signal.SIGKILL)
+                self.process.wait(timeout=5)
+        self.log.close()
+        assert self.process.returncode == 0, f"sandbox exit={self.process.returncode}; log={self.dir / 'run.log'}"
+
+
+def metric(snapshot, group, name):
+    return next(m for m in snapshot[group] if m["name"] == name)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cases", default="off,overlay,single,balloon,multidisk,restore,defaults")
+    parser.add_argument("--seconds", type=int, default=12)
+    args = parser.parse_args()
+    assert args.seconds >= 6
+    work = Path(tempfile.mkdtemp(prefix="e2e-usage-"))
+    print(f"usage evidence: {work}", flush=True)
+    # Only small evidence files enter the CI artifact, not disk/runtime images.
+    # The packaged suite has no Git checkout/go.mod; compile the stdlib-only
+    # probe by filename and record binary build identities in both layouts.
+    if os.environ.get("KUASAR_CI_DIR"):
+        evidence = Path(os.environ["KUASAR_CI_DIR"]) / "usage"
+        def collect_evidence():
+            evidence.mkdir(parents=True, exist_ok=True)
+            for path in work.rglob("*"):
+                if path.is_file() and path.suffix in (".json", ".log", ".usage"):
+                    dest = evidence / path.relative_to(work)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, dest)
+        atexit.register(collect_evidence)
+    metadata = {"sandbox_ctl_build": run("go", "version", "-m", BIN / "sandbox-ctl"),
+                "sandbox_init_build": run("go", "version", "-m", BIN / "sandbox-init"),
+                "host_kernel": run("uname", "-a").strip(),
+                "ch_version": run(BIN / "cloud-hypervisor", "--version").strip(),
+                "artifacts": {n: digest(BIN / n) for n in ("sandbox-ctl", "sandbox-init", "sandbox-runtime.bundle", "vmlinux", "cloud-hypervisor")},
+                "seconds": args.seconds, "cases": args.cases.split(",")}
+    if (REPO / ".git").exists():
+        metadata["sandboxer_head"] = run("git", "rev-parse", "HEAD", cwd=REPO).strip()
+        metadata["sandboxer_diff_sha256"] = hashlib.sha256(run("git", "diff", "HEAD", cwd=REPO).encode()).hexdigest()
+    write_json(work / "source-set.json", metadata)
+    root = work / "rootfs"
+    root.mkdir()
+    for name in ("tmp", "proc", "sys", "dev", "data", "cache", "other"):
+        (root / name).mkdir()
+    run("go", "build", "-trimpath", "-o", root / "probe", Path(__file__).parent / "usageprobe/main.go",
+        env={**os.environ, "CGO_ENABLED": "0", "GOWORK": "off"})
+    image = work / "root.img"
+    run(BIN / "flatten-ctl", "export", "--output", image, "--no-progress", root)
+    ref = image_ref(image)
+    results = []
+    for name in metadata["cases"]:
+        assert name in ("off", "overlay", "single", "balloon", "multidisk", "restore", "defaults"), name
+        diff = work / f"{name}.ext4"
+        ext4(diff, root if name == "single" else None)
+        config = {"resources": {"capacity": {"cpu": 1, "memory": "512MiB"},
+                                "allocatable": {"cpu": 1, "memory": "256MiB" if name == "balloon" else "512MiB",
+                                                "deflate_on_oom": name == "balloon"}},
+                  "boot": {"kernel": f"file://{BIN / 'vmlinux'}", "runtime": f"file://{BIN / 'sandbox-runtime.bundle'}",
+                           "cmdline": "console=hvc0 printk.time=1",
+                           "root": {"diff": f"file://{diff}"} if name == "single" else
+                           {"base": ref, "overlay": {"diff": f"file://{diff}"}}},
+                  # Shared PID namespace makes /proc/1/exe the real init for
+                  # artifact verification; the default private namespace's PID 1 is the app.
+                  "launch": {"exec": "/probe", "args": ["wait"], "restart": "never", "pid_namespace": "shared"},
+                  "usage": {"enabled": name != "off", "sample_interval": "1s", "flush_interval": "5s"}}
+        if name == "defaults":
+            config["usage"] = {"enabled": True}
+        if name == "multidisk":
+            config["boot"]["disks"] = []
+            config["mounts"] = []
+            for ordinal, target in enumerate(("/data", "/other")):
+                disk = work / f"data-{ordinal}.ext4"
+                ext4(disk)
+                config["boot"]["disks"].append({"name": f"data{ordinal}", "diff": f"file://{disk}"})
+                config["mounts"].append({"type": "disk", "source": f"data{ordinal}", "target": target})
+            config["mounts"].append({"type": "empty", "target": "/data/cache"})
+        sb = Sandbox(work, name, config)
+        try:
+            sb.ready()
+            inspect = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
+            write_json(sb.dir / "guest.json", inspect)
+            assert inspect["sandbox_init_sha256"] == metadata["artifacts"]["sandbox-init"], "runtime bundle does not contain the selected sandbox-init"
+            assert inspect["balloon_proc_field"] == "false", "this case requires the unpatched Balloon proc ABI"
+            assert "pagesets" in inspect["zoneinfo"] and "count:" in inspect["zoneinfo"], "PCP source missing"
+            time.sleep(2.2)
+            before = sb.view()
+            write_json(sb.dir / "before.json", before)
+            started = time.monotonic()
+            sb.cli("exec", "--", "/probe", "cpu", "2")
+            sb.cli("exec", "--", "/probe", "write", "/tmp/usage-data", "16")
+            if name == "multidisk":
+                sb.cli("exec", "--", "/probe", "write", "/data/cache/usage-data", "16")
+            seconds = max(303, args.seconds) if name == "defaults" else args.seconds
+            time.sleep(max(0, seconds - (time.monotonic() - started)))
+            after = sb.view()
+            write_json(sb.dir / "after.json", after)
+            if name == "off":
+                assert not after["enabled"] and "live" not in after
+                assert not list(sb.baseroot.rglob("*.usage"))
+            else:
+                b, a = before["live"], after["live"]
+                cpu = int(metric(a, "counters", "guest.cpu")["known_total_ns"]) - int(metric(b, "counters", "guest.cpu")["known_total_ns"])
+                assert cpu > 1_000_000_000, ("guest CPU did not observe busy workload", cpu)
+                for field in ("guest.memory", "filesystem.root", "ch.rss_anon", "ch.rss_file", "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file"):
+                    gauge = metric(a, "gauges", field)
+                    assert gauge["status"] == "ok" and int(gauge["covered_total_ns"]) > 0, gauge
+                fs_before = int(metric(b, "gauges", "filesystem.root")["last_value_bytes"])
+                fs_after = int(metric(a, "gauges", "filesystem.root")["last_value_bytes"])
+                assert fs_after - fs_before >= 16 * 1024 * 1024, (fs_before, fs_after)
+                count = sum(g["name"].startswith("filesystem.") for g in a["gauges"])
+                assert count == (3 if name == "multidisk" else 1), count
+                assert after.get("saved") and int(after["saved_end"]) > 0, after
+                if name == "defaults":
+                    assert not before.get("saved") and after["saved"]["sequence"] == "1", "default cadence is not five minutes"
+                assert a["sandbox_id"] == name and (sb.baseroot / "instance" / f"{name}.usage").exists()
+                write_json(sb.dir / "history.json", json.loads(sb.cli("usage", "--history", "--limit", "10")))
+                if name == "restore":
+                    output = sb.dir / "snapshot"
+                    output.mkdir()
+                    capture = sb.cli("snapshot", "--output", output, "--resume", "--drop-caches=false", "--merge-ref=false", timeout=60)
+                    (sb.dir / "snapshot.log").write_text(capture)
+                    assert (output / f"{name}.snapshot").is_file()
+                    sb.cli("exec", "--", "/probe", "cpu", "2")
+                    time.sleep(2)
+                    write_json(sb.dir / "resumed.json", sb.view())
+            results.append({"case": name, "passed": True})
+        finally:
+            sb.stop()
+        if name != "off":
+            saved = sb.view()
+            write_json(sb.dir / "stopped.json", saved)
+            assert saved["saved"]["snapshot"]["closed"], saved
+            if name == "restore":
+                parent = saved["saved"]["snapshot"]
+                parent_cpu = int(metric(parent, "counters", "guest.cpu")["known_total_ns"])
+                parent_fs = int(metric(parent, "gauges", "filesystem.root")["last_value_bytes"])
+                host = {"boot": {"kernel": config["boot"]["kernel"], "runtime": config["boot"]["runtime"]},
+                        "restore": {"prefetch": "off"}, "usage": config["usage"], "timeouts": {"restore": "30s"}}
+                for same_id in (False, True):
+                    role = "same-restore" if same_id else "clone-restore"
+                    child = Sandbox(work, role, host, restore=output / f"{name}.snapshot",
+                                    sandbox_id=name if same_id else role,
+                                    base_root=sb.baseroot if same_id else None)
+                    try:
+                        child.ready()
+                        time.sleep(3)
+                        v = child.view()
+                        write_json(child.dir / "restored.json", v)
+                        live = v["live"]
+                        cpu = int(metric(live, "counters", "guest.cpu")["known_total_ns"])
+                        assert (cpu >= parent_cpu) if same_id else (cpu < parent_cpu), (same_id, cpu, parent_cpu)
+                        fs = metric(live, "gauges", "filesystem.root")
+                        assert fs["status"] == "ok" and int(fs["last_value_bytes"]) >= parent_fs, fs
+                        assert metric(live, "gauges", "guest.memory")["status"] == "ok"
+                        assert live["run_epoch"] != parent["run_epoch"]
+                    finally:
+                        child.stop()
+        print(f"PASS usage/{name}", flush=True)
+    write_json(work / "results.json", results)
+
+
+if __name__ == "__main__":
+    main()

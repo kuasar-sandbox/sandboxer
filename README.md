@@ -36,6 +36,7 @@ Snapshot reuse is represented by explicit parent and child references. Multiple 
 | --- | --- |
 | `pkg/resource` | Node resource-control wire contract and client, consumed by `orchestrator` |
 | `pkg/ctl` | Host-local control-socket protocol and policy callbacks for `ServeExecTunnel`; `ProxyExec` relays an already connected backend |
+| `pkg/usage` | Host-only cumulative resource usage, snapshots, records and offline readers |
 | `pkg/sandbox`, `pkg/restore`, `pkg/snapshot` | Lifecycle, restore, and snapshot orchestration |
 | `pkg/artifact` | Typed publication to a Manifest store or a named-location Bundle |
 | `pkg/uffd`, `pkg/memory` | On-demand memory loading and memfd ownership |
@@ -112,6 +113,7 @@ See the [project release documentation](https://github.com/kuasar-sandbox/kuasar
 
 Full design and reference documents:
 
+- [`docs/usage.md`](docs/usage.md) — optional resource accounting, live/saved queries, units, persistence and loss boundaries;
 - [`docs/sandbox.md`](docs/sandbox.md) — host control plane, configuration, cold start, snapshot/export/restore sequencing, resource execution, and cleanup;
 - [`docs/journald.md`](docs/journald.md) — independent output targets, custom journal fields, component diagnostics, encoding, and fallback;
 - [`docs/sandbox-init.md`](docs/sandbox-init.md) — guest PID 1 ABI, staged initialization, vsock control, stdio multiplexing, and application contract;

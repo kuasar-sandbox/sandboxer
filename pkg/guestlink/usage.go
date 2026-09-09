@@ -108,7 +108,8 @@ func (c *UsageClient) Read(ctx context.Context, epoch string, id uint64) (UsageW
 	seen := map[string]bool{}
 	for i := range r.Filesystems {
 		fs := &r.Filesystems[i]
-		if fs.Disk == "" || len(fs.Disk) > 128 || len(fs.Incarnation) > 256 || seen[fs.Disk] {
+		knownDisk := fs.Disk == "root" || (len(fs.Disk) == 6 && fs.Disk[:5] == "disk-" && fs.Disk[5] >= '0' && fs.Disk[5] <= '7')
+		if !knownDisk || len(fs.Incarnation) > 256 || seen[fs.Disk] {
 			return UsageWindow{}, errors.New("usage: invalid filesystem identities")
 		}
 		seen[fs.Disk] = true
