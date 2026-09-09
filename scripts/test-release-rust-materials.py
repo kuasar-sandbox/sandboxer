@@ -211,6 +211,74 @@ class MaterialsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 materials.configure_cargo_home(original, destination)
 
+    def rust_fixture(self):
+        sysroot = self.root / "rust"
+        library = sysroot / "lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-fixture.rlib"
+        library.parent.mkdir(parents=True)
+        library.write_bytes(b"fixture linked Rust standard library")
+        rustc = sysroot / "bin/rustc"
+        rustc.parent.mkdir()
+        rustc.write_bytes(b"fixture compiler")
+        link_map = self.root / "rust.map"
+        link_map.write_text("LOAD " + str(library) + "\n")
+        return sysroot, rustc, library, link_map
+
+    def test_linked_standard_library_digest_tracks_actual_bytes(self):
+        sysroot, _, library, link_map = self.rust_fixture()
+        stage = self.root / "stage"
+        first = materials.rust_standard_library_inventory(stage, sysroot, link_map)
+        inventory = stage / "share/sources/sandboxer/RUST-STDLIB.tsv"
+        self.assertIn(hashlib.sha256(library.read_bytes()).hexdigest(), inventory.read_text())
+        self.assertNotIn(str(self.root), inventory.read_text())
+        self.assertEqual(inventory.stat().st_mode & 0o777, 0o644)
+        library.write_bytes(b"locally replaced standard library")
+        self.assertNotEqual(first, materials.rust_standard_library_inventory(stage, sysroot, link_map))
+        link_map.write_text("LOAD relative.rlib\n")
+        with self.assertRaisesRegex(ValueError, "relative"):
+            materials.rust_standard_library_inventory(stage, sysroot, link_map)
+        link_map.write_text("LOAD " + str(self.archive) + "\n")
+        with self.assertRaisesRegex(ValueError, "omits"):
+            materials.rust_standard_library_inventory(stage, sysroot, link_map)
+
+    def test_debian_toolchain_uses_matching_source_package_not_rpm(self):
+        sysroot, rustc, _, link_map = self.rust_fixture()
+        copyright = self.root / "debian/copyright"
+        copyright.parent.mkdir()
+        copyright.write_text("fixture Debian Rust standard library copyright\n")
+        def query(command, **_):
+            if command == [str(rustc), "-vV"]:
+                return "release: 1.89.0\ncommit-hash: " + "1" * 40 + "\n"
+            if command == [str(rustc), "--print", "sysroot"]:
+                return str(sysroot) + "\n"
+            self.assertEqual(command[0], "dpkg-query")
+            if command[1] == "-S":
+                return "rustc: " + str(rustc) + "\n"
+            if command[1:3] == ["-L", "libstd-rust:amd64"]:
+                return str(copyright) + "\n"
+            if command[1] == "-W" and command[-1] == "rustc":
+                return "rustc\t1.89.0+fixture\n"
+            if command[1] == "-W":
+                return ("installed\tlibstd-rust:amd64\trustc\t1.89.0+fixture\n"
+                        "installed\tother-rust\trustc\t0.0.0+unrelated\n")
+            self.fail("unexpected package query: " + repr(command))
+        with patch.object(materials.shutil, "which", side_effect=lambda name: "/usr/bin/dpkg-query"
+                          if name == "dpkg-query" else None), \
+                patch.object(materials.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), \
+                patch.object(materials.subprocess, "check_output", side_effect=query):
+            row = materials.rust_toolchain_materials(self.root / "stage", rustc, link_map)
+        self.assertEqual(row[3], "deb-source:rustc@1.89.0+fixture")
+        self.assertIn(";linked-stdlib-sha256:", row[4])
+        copied = self.root / "stage" / row[5] / str(copyright).lstrip("/")
+        self.assertEqual(copied.read_text(), copyright.read_text())
+
+    def test_unknown_toolchain_layout_has_actionable_error(self):
+        sysroot, rustc, _, link_map = self.rust_fixture()
+        with patch.object(materials.shutil, "which", return_value=None), \
+                patch.object(materials.subprocess, "check_output", side_effect=[
+                    "release: 1.89.0\ncommit-hash: " + "1" * 40 + "\n", str(sysroot) + "\n"]):
+            with self.assertRaisesRegex(ValueError, "install rust-docs"):
+                materials.rust_toolchain_materials(self.root / "stage", rustc, link_map)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -90,6 +90,12 @@ crate. No current branch or separately maintained version list selects them.
 
 The component archive carries those crates' license/notice files and the Rust
 toolchain's copyright and license materials in component-specific directories.
+Rustup's standard-library notices or matching installed Debian/RPM source-package
+notices are collected; missing toolchain documentation fails with an installation
+hint. `RUST-STDLIB.tsv` lists the sysroot-relative paths and SHA-256 digests of the
+standard-library `.rlib` inputs selected by the final link map, and its digest is
+bound into the Rust toolchain record. These are actual input digests, not an
+assertion that a locally modified toolchain is an unmodified upstream release.
 The fresh final-link map also selects the system static libraries and startup
 objects actually used by Cloud Hypervisor. Their installed source-package
 identities, input digests, copyright and referenced license texts are included;

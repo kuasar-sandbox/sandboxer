@@ -347,7 +347,8 @@ chmod 0755 "$root/bin/x86_64/cloud-hypervisor"
 printf '%s\n' \
   '{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#fixture@1.0.0","target":{"name":"cloud-hypervisor"},"executable":"/fixture/cloud-hypervisor"}' \
   '{"reason":"build-finished","success":true}' > "$CH_BUILD_REPORT"
-printf 'LOAD %s\n' "$fixture_root/system/fixture.o" > "$CH_LINK_MAP"
+printf 'LOAD %s\n' "$fixture_root/system/fixture.o" \
+  "$fixture_root/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-fixture.rlib" > "$CH_LINK_MAP"
 EOF
 cat > "$TMP/release-build-bin/cargo" <<'EOF'
 #!/usr/bin/env bash
@@ -365,6 +366,8 @@ elif [ "$1" = --print ] && [ "$2" = sysroot ]; then
 else exit 1; fi
 EOF
 mkdir -p "$TMP/rust/bin" "$TMP/system"
+mkdir -p "$TMP/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib"
+printf 'fixture linked Rust standard library\n' > "$TMP/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-fixture.rlib"
 install -m 0755 "$TMP/release-build-bin/rustc" "$TMP/rust/bin/rustc"
 printf 'fixture static object\n' > "$TMP/system/fixture.o"
 printf 'fixture system license\n' > "$TMP/system/LICENSE"
@@ -435,6 +438,7 @@ for path in ./bin/cloud-hypervisor ./bin/sandbox-ctl ./bin/sandbox-init \
   ./share/licenses/sandboxer/connector/LICENSE \
   ./share/licenses/sandboxer/go-toolchain/"$go_toolchain"/LICENSE \
   ./share/sources/sandboxer/CLOUD-HYPERVISOR-Cargo.lock \
+  ./share/sources/sandboxer/RUST-STDLIB.tsv \
   ./share/sources/sandboxer/SOURCES.tsv \
   ./share/sources/sandboxer/GO-BUILD-INFO.tsv \
   ./share/sources/sandboxer/GO-MODULES.tsv \
@@ -482,6 +486,22 @@ for column in 3 4 5; do
     fail "validator accepted project provenance column $column with regenerated checksums"
   fi
 done
+
+candidate="$TMP/changed-rust-stdlib-inventory"
+cp -a "$TMP/bundle" "$candidate"
+mkdir "$candidate/root"
+tar -xzf "$archive" -C "$candidate/root"
+printf 'altered inventory\n' >> "$candidate/root/share/sources/sandboxer/RUST-STDLIB.tsv"
+release_materials_hash_tree "$candidate/root" sandboxer \
+  "$candidate/root/share/sources/sandboxer/MATERIALS.sha256"
+tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+  -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+(cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/rejection.log" 2>&1; then
+  fail "validator accepted changed Rust stdlib inventory with regenerated material checksums"
+fi
+grep -Fq 'Rust standard-library inventory is not bound' "$candidate/rejection.log" \
+  || fail "Rust stdlib inventory was rejected for an unrelated reason"
 
 cp -a "$TMP/bundle" "$TMP/tampered"
 printf 'tampered\n' >> "$TMP/tampered/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz"

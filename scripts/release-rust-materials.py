@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -197,13 +198,40 @@ def git_materials(package, locked, destination):
     return source[4:].split("?", 1)[0].split("#", 1)[0], "git:" + commit
 
 
-def rust_toolchain_materials(stage, rustc):
+def rust_standard_library_inventory(stage, sysroot, link_map):
+    libraries = {}
+    for line in link_map.read_text().splitlines():
+        fields = line.split()
+        if len(fields) != 2 or fields[0] != "LOAD" or not fields[1].endswith(".rlib"):
+            continue
+        path = Path(fields[1])
+        require(path.is_absolute(), "unresolved relative Rust link input")
+        path = path.resolve(strict=True)
+        if not path.is_relative_to(sysroot):
+            continue  # Fresh Cargo outputs are covered by the observed package records.
+        relative = path.relative_to(sysroot).as_posix()
+        require(re.fullmatch(r"lib/rustlib/[A-Za-z0-9._+-]+/lib/lib[A-Za-z0-9._+-]+\.rlib", relative),
+                "unexpected Rust standard-library input path")
+        libraries[relative] = hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+    require(any(PurePosixPath(path).name.startswith("libstd-") for path in libraries),
+            "link map omits the linked Rust standard library")
+    inventory = "sysroot_path\tsha256\n" + "".join(path + "\t" + digest + "\n"
+        for path, digest in sorted(libraries.items()))
+    destination = stage / "share/sources/sandboxer/RUST-STDLIB.tsv"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(inventory)
+    destination.chmod(0o644)
+    return hashlib.sha256(inventory.encode()).hexdigest()
+
+
+def rust_toolchain_materials(stage, rustc, link_map):
     info = subprocess.check_output([str(rustc), "-vV"], text=True)
     fields = dict(line.split(": ", 1) for line in info.splitlines() if ": " in line)
     version, commit = fields.get("release", ""), fields.get("commit-hash", "")
     require(re.fullmatch(r"[0-9a-f]{40}", commit), "Rust toolchain has no source commit")
     require(re.fullmatch(r"[0-9A-Za-z.+-]+", version), "invalid Rust toolchain version")
-    sysroot = Path(subprocess.check_output([str(rustc), "--print", "sysroot"], text=True).strip())
+    sysroot = Path(subprocess.check_output([str(rustc), "--print", "sysroot"], text=True).strip()).resolve()
+    stdlib_digest = rust_standard_library_inventory(stage, sysroot, link_map)
     docs = sysroot / "share" / "doc" / "rust"
     destination = stage / "share" / "licenses" / "sandboxer" / "rust-toolchain" / version
     source = "https://github.com/rust-lang/rust/tree/" + commit
@@ -211,7 +239,35 @@ def rust_toolchain_materials(stage, rustc):
     if (docs / "COPYRIGHT-library.html").is_file() and (docs / "licenses").is_dir():
         paths = [docs / "COPYRIGHT-library.html", *sorted((docs / "licenses").rglob("*"))]
         paths = [(p, str(p.relative_to(docs))) for p in paths if p.is_file()]
-    else:
+    elif shutil.which("dpkg-query") and subprocess.run(
+            ["dpkg-query", "-S", str(rustc.resolve())], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL).returncode == 0:
+        ownership = subprocess.check_output(["dpkg-query", "-S", str(rustc.resolve())], text=True).strip()
+        owner = ownership.rsplit(": ", 1)[0]
+        require("\n" not in owner and "," not in owner, "ambiguous Rust Debian package owner")
+        identity = subprocess.check_output(["dpkg-query", "-W", "-f=${source:Package}\t${source:Version}\n",
+                                            owner], text=True).strip().split("\t")
+        require(len(identity) == 2 and all(identity), "Rust Debian package has no source identity")
+        source = "deb-source:" + identity[0] + "@" + identity[1]
+        owners = subprocess.check_output(["dpkg-query", "-W",
+            "-f=${db:Status-Status}\t${binary:Package}\t${source:Package}\t${source:Version}\n"], text=True)
+        for record in owners.splitlines():
+            fields = record.split("\t")
+            if len(fields) != 4 or fields[0] != "installed" or fields[2:] != identity:
+                continue
+            for value in subprocess.check_output(["dpkg-query", "-L", fields[1]], text=True).splitlines():
+                path = Path(value)
+                if not path.is_file() or not material_name(path.name):
+                    continue
+                paths.append((path, value.lstrip("/")))
+                for common in sorted(set(re.findall(r"/usr/share/common-licenses/[A-Za-z0-9.+-]+",
+                                                    path.read_text(errors="replace")))):
+                    common_path = Path(common)
+                    if not common_path.exists() and common.endswith("."):
+                        common_path = Path(common[:-1])
+                    require(common_path.is_file(), "referenced Rust Debian license is missing")
+                    paths.append((common_path, str(common_path).lstrip("/")))
+    elif shutil.which("rpm"):
         # Distribution Rust installs keep notices in RPM subpackages, not the
         # rustup documentation layout. Select only siblings of the same SRPM.
         query = subprocess.check_output(["rpm", "-qf", "--qf", "%{SOURCERPM}", str(sysroot / "bin" / "rustc")],
@@ -227,12 +283,17 @@ def rust_toolchain_materials(stage, rustc):
                 path = Path(value)
                 if path.is_file() and (material_name(path.name) or value.startswith("/usr/share/licenses/")):
                     paths.append((path, value.lstrip("/")))
-    require(paths, "Rust toolchain copyright/license material is missing")
+    else:
+        raise ValueError("Rust toolchain notices are unavailable: install rust-docs for the selected rustup "
+                         "toolchain, or its matching Debian/RPM copyright and license packages")
+    require(paths, "Rust toolchain copyright/license material is missing; install the selected toolchain's "
+                   "documentation/license package before release packaging")
     for path, relative in paths:
         require(not path.is_symlink(), "Rust toolchain license material is a symbolic link")
         put_material(destination, relative, path.read_bytes())
     return ["bin/cloud-hypervisor", "Rust toolchain", version, source,
-            "git:" + commit + ";compiler-sha256:" + hashlib.sha256(rustc.read_bytes()).hexdigest(),
+            "git:" + commit + ";compiler-sha256:" + hashlib.sha256(rustc.read_bytes()).hexdigest()
+            + ";linked-stdlib-sha256:" + stdlib_digest,
             "share/licenses/sandboxer/rust-toolchain/" + version]
 
 
@@ -286,12 +347,12 @@ def main():
         subprocess.run(sys.argv[5:], env=environment, check=True)
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("metadata", "build-report", "lock", "cargo-home", "source-root", "stage", "rustc"):
+    for name in ("metadata", "build-report", "lock", "cargo-home", "source-root", "stage", "rustc", "link-map"):
         parser.add_argument("--" + name, type=Path, required=True)
     args = parser.parse_args()
     rows = collect(json.loads(args.metadata.read_text()), args.build_report.read_text(),
                    tomllib.loads(args.lock.read_text()), args.cargo_home, args.source_root, args.stage)
-    rows.append(rust_toolchain_materials(args.stage, args.rustc))
+    rows.append(rust_toolchain_materials(args.stage, args.rustc, args.link_map))
     for row in rows:
         require(all(value and "\n" not in value and "\t" not in value for value in row),
                 "invalid Rust source material field")

@@ -153,6 +153,13 @@ validate_bundle() {
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-patches' "$version"
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-cargo-lock' "v51.1"
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'Rust toolchain' ""
+  local stdlib_digest
+  stdlib_digest="$(sha256sum "$extract/share/sources/$NAME/RUST-STDLIB.tsv" | awk '{print $1}')"
+  awk -F '\t' -v digest="$stdlib_digest" '
+    $1 == "bin/cloud-hypervisor" && $2 == "Rust toolchain" &&
+      $5 ~ (";linked-stdlib-sha256:" digest "$") {found=1}
+    END {exit !found}
+  ' "$extract/share/sources/$NAME/SOURCES.tsv" || fail "Rust standard-library inventory is not bound to the toolchain"
   awk -F '\t' '$1 == "bin/cloud-hypervisor" && $2 ~ /^rust-build-input:/ {found=1} END {exit !found}' \
     "$extract/share/sources/$NAME/SOURCES.tsv" || fail "Rust dependency materials are missing"
   release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'accelerator' ""
@@ -230,7 +237,7 @@ package_release() {
   python3 "$ROOT/scripts/release-rust-materials.py" \
     --metadata "$WORK/ch-metadata.json" --build-report "$WORK/ch-build.jsonl" \
     --lock "$ch_source/Cargo.lock" --cargo-home "$WORK/cargo-home" \
-    --source-root "$ch_source" --stage "$STAGE" --rustc "$CH_RELEASE_RUSTC" \
+    --source-root "$ch_source" --stage "$STAGE" --rustc "$CH_RELEASE_RUSTC" --link-map "$WORK/ch-link.map" \
     >> "$RELEASE_MATERIALS_WORK/sources"
   release_native_link_inputs "$WORK/ch-link.map" "$WORK/native-build" "$WORK/rust-tmp" bin/cloud-hypervisor
   install -m 0644 "$ch_source/Cargo.lock" \
