@@ -97,7 +97,8 @@ for entrypoint in test/e2e/e2e_sandbox_*.sh test/e2e/run_all.sh; do
     || fail "$entrypoint is not executable in the Git index"
 done
 
-mkdir -p "$TMP/bin" "$TMP/src"
+mkdir -p "$TMP/bin" "$TMP/src" "$TMP/cloud-hypervisor/LICENSES" \
+  "$TMP/accelerator" "$TMP/connector"
 printf 'package main\nfunc main() {}\n' > "$TMP/src/main.go"
 GO111MODULE=off go build -o "$TMP/go-fixture" "$TMP/src/main.go"
 for binary in sandbox-ctl sandbox-init; do
@@ -105,8 +106,21 @@ for binary in sandbox-ctl sandbox-init; do
 done
 printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/cloud-hypervisor"
 chmod +x "$TMP/bin/cloud-hypervisor"
+printf 'fixture credits\n' > "$TMP/cloud-hypervisor/CREDITS.md"
+printf 'fixture Apache license\n' > "$TMP/cloud-hypervisor/LICENSES/Apache-2.0.txt"
+printf 'fixture BSD license\n' > "$TMP/cloud-hypervisor/LICENSES/BSD-3-Clause.txt"
+printf 'version = 3\n' > "$TMP/cloud-hypervisor/Cargo.lock"
+printf 'fixture accelerator license\n' > "$TMP/accelerator/LICENSE"
+printf 'fixture connector license\n' > "$TMP/connector/LICENSE"
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+  RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR="$TMP/cloud-hypervisor" \
+  RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
+  RELEASE_ACCELERATOR_SOURCE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  RELEASE_ACCELERATOR_VERSION=v0.1.3 \
+  RELEASE_CONNECTOR_SOURCE_DIR="$TMP/connector" \
+  RELEASE_CONNECTOR_SOURCE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  RELEASE_CONNECTOR_VERSION=v0.1.2 \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
@@ -117,14 +131,30 @@ bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
   1111111111111111111111111111111111111111 release/v1.2.x
 
 archive="$TMP/bundle/assets/$ARCHIVE_NAME"
-printf '%s\n' ./ ./bin/ ./bin/cloud-hypervisor ./bin/sandbox-ctl ./bin/sandbox-init \
-  > "$TMP/expected-archive-entries"
-LC_ALL=C tar --quoting-style=escape -tzf "$archive" | LC_ALL=C sort \
-  > "$TMP/actual-archive-entries"
-cmp -s "$TMP/expected-archive-entries" "$TMP/actual-archive-entries" \
-  || fail "packager did not emit the exact archive entry set"
+for path in ./bin/cloud-hypervisor ./bin/sandbox-ctl ./bin/sandbox-init \
+  ./share/licenses/sandboxer/project/LICENSE \
+  ./share/licenses/sandboxer/cloud-hypervisor/CREDITS.md \
+  ./share/licenses/sandboxer/cloud-hypervisor/LICENSES/Apache-2.0.txt \
+  ./share/licenses/sandboxer/cloud-hypervisor/LICENSES/BSD-3-Clause.txt \
+  ./share/licenses/sandboxer/accelerator/LICENSE \
+  ./share/licenses/sandboxer/connector/LICENSE \
+  ./share/sources/sandboxer/CLOUD-HYPERVISOR-Cargo.lock \
+  ./share/sources/sandboxer/SOURCES.tsv \
+  ./share/sources/sandboxer/GO-BUILD-INFO.tsv \
+  ./share/sources/sandboxer/GO-MODULES.tsv \
+  ./share/sources/sandboxer/MATERIALS.sha256; do
+  tar -tzf "$archive" | grep -Fx "$path" >/dev/null \
+    || fail "archive is missing $path"
+done
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+  RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR="$TMP/cloud-hypervisor" \
+  RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
+  RELEASE_ACCELERATOR_SOURCE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  RELEASE_ACCELERATOR_VERSION=v0.1.3 \
+  RELEASE_CONNECTOR_SOURCE_DIR="$TMP/connector" \
+  RELEASE_CONNECTOR_SOURCE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  RELEASE_CONNECTOR_VERSION=v0.1.2 \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
@@ -168,6 +198,13 @@ mkdir "$TMP/extra-directory-root/etc"
 cp -a "$TMP/bundle" "$TMP/extra-directory-bundle"
 repack_bundle "$TMP/extra-directory-bundle" "$TMP/extra-directory-root"
 expect_invalid_archive "$TMP/extra-directory-bundle" "an unexpected directory"
+
+cp -a "$TMP/archive-root" "$TMP/foreign-material-root"
+mkdir -p "$TMP/foreign-material-root/share/licenses/another-unit"
+printf 'foreign material\n' > "$TMP/foreign-material-root/share/licenses/another-unit/LICENSE"
+cp -a "$TMP/bundle" "$TMP/foreign-material-bundle"
+repack_bundle "$TMP/foreign-material-bundle" "$TMP/foreign-material-root"
+expect_invalid_archive "$TMP/foreign-material-bundle" "another release unit's material namespace"
 
 cp -a "$TMP/archive-root" "$TMP/mode-root"
 chmod 0777 "$TMP/mode-root/bin"

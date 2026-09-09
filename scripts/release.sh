@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+umask 022
 
 NAME=sandboxer
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+# shellcheck source=scripts/release-materials.sh
+source "$ROOT/scripts/release-materials.sh"
 
 fail() {
   echo "release: $*" >&2
@@ -94,6 +97,7 @@ validate_bundle() {
   rm -rf "$extract"
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
+  release_materials_validate "$extract" "$NAME"
   local file
   for file in sandbox-ctl sandbox-init; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
@@ -105,7 +109,8 @@ validate_bundle() {
 
 package_release() {
   [ "$#" -eq 3 ] || fail "usage: release.sh package <version> <arch> <output-dir>"
-  local version="$1" arch output="$3" archive epoch bin_dir
+  local version="$1" arch output="$3" archive epoch bin_dir ch_source project_sha cargo_sha
+  local accelerator_source connector_source accelerator_version connector_version accelerator_sha connector_sha
   arch="$(normalize_arch "$2")"
   archive="$(archive_name "$version" "$arch")"
   if [ -z "$output" ] || [ "$output" = / ] || [ "$output" = . ]; then
@@ -124,6 +129,52 @@ package_release() {
   copy_executable "$bin_dir/cloud-hypervisor" bin/cloud-hypervisor
   check_go_binary "$STAGE/bin/sandbox-ctl"
   check_go_binary "$STAGE/bin/sandbox-init"
+
+  ch_source="${RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR:-$ROOT/native-deps/build/src/cloud-hypervisor}"
+  accelerator_source="${RELEASE_ACCELERATOR_SOURCE_DIR:-$ROOT/../accelerator}"
+  connector_source="${RELEASE_CONNECTOR_SOURCE_DIR:-$ROOT/../connector}"
+  accelerator_version="${RELEASE_ACCELERATOR_VERSION:-${ACCELERATOR_VERSION:-}}"
+  connector_version="${RELEASE_CONNECTOR_VERSION:-${CONNECTOR_VERSION:-}}"
+  [[ "$accelerator_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+    || fail "RELEASE_ACCELERATOR_VERSION must identify the selected accelerator release"
+  [[ "$connector_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+    || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
+  [ -f "$ch_source/Cargo.lock" ] || fail "Cloud Hypervisor Cargo.lock is missing from $ch_source"
+  project_sha="$(git -C "$ROOT" rev-parse HEAD)"
+  [[ "$project_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the sandboxer source commit"
+  accelerator_sha="${RELEASE_ACCELERATOR_SOURCE_SHA:-$(git -C "$accelerator_source" rev-parse HEAD 2>/dev/null || true)}"
+  connector_sha="${RELEASE_CONNECTOR_SOURCE_SHA:-$(git -C "$connector_source" rev-parse HEAD 2>/dev/null || true)}"
+  [[ "$accelerator_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the selected accelerator source commit"
+  [[ "$connector_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the selected connector source commit"
+  cargo_sha="$(sha256sum "$ch_source/Cargo.lock" | awk '{print $1}')"
+  release_materials_init "$STAGE" "$WORK/materials" "$NAME"
+  release_materials_copy_licenses "$ROOT" project
+  release_materials_copy_licenses "$ch_source" cloud-hypervisor
+  release_materials_copy_licenses "$accelerator_source" accelerator
+  release_materials_copy_licenses "$connector_source" connector
+  install -m 0644 "$ch_source/Cargo.lock" \
+    "$STAGE/share/sources/$NAME/CLOUD-HYPERVISOR-Cargo.lock"
+  release_materials_record_source 'bin/sandbox-ctl,bin/sandbox-init' sandboxer "$version" \
+    "https://github.com/kuasar-sandbox/sandboxer/commit/$project_sha" \
+    "git:$project_sha" project
+  release_materials_record_source bin/cloud-hypervisor cloud-hypervisor v51.1 \
+    'https://github.com/cloud-hypervisor/cloud-hypervisor/archive/refs/tags/v51.1.tar.gz' \
+    'sha256:a2393046c0230f6360792ed2ef1b60968aa4e04d12b6be419c86306774e2e4ef' cloud-hypervisor
+  release_materials_record_source bin/cloud-hypervisor cloud-hypervisor-patches "$version" \
+    "https://github.com/kuasar-sandbox/sandboxer/tree/$project_sha/native-deps/deps/ch-patches" \
+    "git:$project_sha" project
+  release_materials_record_source bin/cloud-hypervisor cloud-hypervisor-cargo-lock v51.1 \
+    "https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/Cargo.lock" \
+    "sha256:$cargo_sha" cloud-hypervisor
+  release_materials_record_source bin/sandbox-ctl accelerator "$accelerator_version" \
+    "https://github.com/kuasar-sandbox/accelerator/commit/$accelerator_sha" \
+    "git:$accelerator_sha" accelerator
+  release_materials_record_source bin/sandbox-ctl connector "$connector_version" \
+    "https://github.com/kuasar-sandbox/connector/commit/$connector_sha" \
+    "git:$connector_sha" connector
+  release_materials_add_go_binary "$STAGE/bin/sandbox-ctl" bin/sandbox-ctl
+  release_materials_add_go_binary "$STAGE/bin/sandbox-init" bin/sandbox-init
+  release_materials_finish
 
   mkdir -p "$output/assets"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
