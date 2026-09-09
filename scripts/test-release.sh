@@ -413,10 +413,10 @@ env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 \
 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/sandboxer v1.2.3 \
-  1111111111111111111111111111111111111111 main
+  "$fixture_project_sha" main
 bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/sandboxer v1.2.3 \
-  1111111111111111111111111111111111111111 release/v1.2.x
+  "$fixture_project_sha" release/v1.2.x
 
 archive="$TMP/bundle/assets/$ARCHIVE_NAME"
 go_toolchain="$(go version | awk '{print $3}')"
@@ -450,6 +450,32 @@ env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 \
   "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
+
+# The archive name is the requested release target; an untagged source record
+# identifies the actual commit and does not pretend that target tag exists.
+tar -xOf "$archive" ./share/sources/sandboxer/SOURCES.tsv | \
+  awk -F '\t' -v sha="$fixture_project_sha" \
+    '$2 == "sandboxer" && $3 == "git:" sha {found=1} END {exit !found}' \
+  || fail "pre-tag project source was recorded as an existing release"
+for column in 3 4 5; do
+  candidate="$TMP/project-source-$column"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  inventory="$candidate/root/share/sources/sandboxer/SOURCES.tsv"
+  awk -F '\t' -v OFS='\t' -v column="$column" \
+    '$2 == "sandboxer" {$column="not-the-selected-source"} {print}' \
+    "$inventory" > "$candidate/changed.tsv"
+  mv "$candidate/changed.tsv" "$inventory"
+  release_materials_hash_tree "$candidate/root" sandboxer \
+    "$candidate/root/share/sources/sandboxer/MATERIALS.sha256"
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+    -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" >/dev/null 2>&1; then
+    fail "validator accepted project provenance column $column with regenerated checksums"
+  fi
+done
 
 cp -a "$TMP/bundle" "$TMP/tampered"
 printf 'tampered\n' >> "$TMP/tampered/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz"

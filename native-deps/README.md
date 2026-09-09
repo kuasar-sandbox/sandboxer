@@ -59,6 +59,11 @@ binaries are not copied; `RELEASE_BIN_DIR` overrides are rejected. The resulting
 Go VCS information is checked against the selected project commit before staging.
 The Go build uses the same credential-filtered environment policy, with private
 build/module caches; credential-free HTTPS `GOPROXY` routing may be retained.
+The archive name remains the requested release target. The project source record
+uses that version only when its local tag matches the selected commit, otherwise
+`git:<commit>`. Validation binds both Go binaries and the project source URL/digest
+to that commit; publication supplies the expected commit and rejects a mismatch
+before any Tag or Release write.
 It extracts the selected sandboxer commit into a temporary directory, verifies
 the pinned Cloud Hypervisor tarball, applies that commit's patches, and performs
 a locked build with a fresh private Cargo home. Python 3.11 or newer collects

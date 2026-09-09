@@ -143,7 +143,8 @@ validate_bundle() {
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
   release_materials_validate "$extract" "$NAME"
-  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl,bin/sandbox-init' 'sandboxer' "$version"
+  release_materials_require_project_source "$extract" "$NAME" 'bin/sandbox-ctl,bin/sandbox-init' "$version" \
+    bin/sandbox-ctl bin/sandbox-init
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor' "v51.1"
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-patches' "$version"
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-cargo-lock' "v51.1"
@@ -191,6 +192,8 @@ package_release() {
   [[ "$connector_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
     || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" sandboxer)"
+  local project_version
+  project_version="$(release_materials_git_version "$ROOT" "$version" "$project_sha")"
   accelerator_sha="$(release_materials_resolve_git_source "$accelerator_source" \
     "${RELEASE_ACCELERATOR_SOURCE_SHA:-}" accelerator)"
   connector_sha="$(release_materials_resolve_git_source "$connector_source" \
@@ -228,7 +231,7 @@ package_release() {
   release_native_link_inputs "$WORK/ch-link.map" "$WORK/native-build" "$WORK/rust-tmp" bin/cloud-hypervisor
   install -m 0644 "$ch_source/Cargo.lock" \
     "$STAGE/share/sources/$NAME/CLOUD-HYPERVISOR-Cargo.lock"
-  release_materials_record_source 'bin/sandbox-ctl,bin/sandbox-init' sandboxer "$version" \
+  release_materials_record_source 'bin/sandbox-ctl,bin/sandbox-init' sandboxer "$project_version" \
     "https://github.com/kuasar-sandbox/sandboxer/commit/$project_sha" \
     "git:$project_sha" project
   release_materials_record_source bin/cloud-hypervisor cloud-hypervisor v51.1 \

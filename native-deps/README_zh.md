@@ -50,7 +50,10 @@ accelerator、connector commit 建立全新 checkout,以 `GOWORK=off` 和只读 
 解析重新构建 `sandbox-ctl`、`sandbox-init`。不会复制被忽略的开发输入或旧兄弟
 二进制,并拒绝 `RELEASE_BIN_DIR` 覆盖。暂存前会核对 Go VCS 信息是否匹配所选
 项目 commit。Go 构建采用相同的凭据过滤策略及私有构建/module 缓存,可保留
-无凭据的 HTTPS `GOPROXY` 路由。它把选定的 sandboxer commit
+无凭据的 HTTPS `GOPROXY` 路由。归档名称仍标识请求的发行目标;项目来源记录
+只有在本地 Tag 匹配所选 commit 时才使用该版本,否则记录 `git:<commit>`。
+验证器将两个 Go 二进制及项目来源 URL/摘要绑定到该 commit;发布者传入预期
+commit,在任何 Tag/Release 写入前拒绝不匹配的包。它把选定的 sandboxer commit
 解到临时目录,验证 pin 的 Cloud Hypervisor tarball、应用该 commit 的 patch,
 再用本次所属的私有 Cargo home 按锁文件重新构建。Python 3.11 或更新版本从
 实际 Cargo 构建报告采集来源材料:registry crate 归档必须匹配 `Cargo.lock`
