@@ -10,6 +10,42 @@ release_native_copy_file() {
   install -m 0644 "$source" "$destination"
 }
 
+release_native_verify_package_file() {
+  local input="$1" format="$2" owner="$3" records expected actual
+  # Ownership alone also matches locally replaced files. Compare only this
+  # linked input with the trusted build host's installed package metadata.
+  [[ "$input" != *[[:space:]]* ]] || fail "unsupported native package path: $input"
+  case "$format" in
+    deb)
+      records="$(dpkg-query --control-show "$owner" md5sums)" \
+        || fail "native Debian file digests are unavailable: $owner"
+      expected="$(awk -v path="${input#/}" '$2 == path {print $1}' <<< "$records")"
+      [[ "$expected" =~ ^[0-9a-f]{32}$ ]] || fail "missing or ambiguous native Debian file digest: $input"
+      actual="$(md5sum "$input" | awk '{print $1}')"
+      ;;
+    rpm)
+      records="$(rpm -qf --dump "$input")" || fail "native RPM file digests are unavailable: $input"
+      expected="$(awk -v path="$input" '$1 == path {print $4}' <<< "$records")"
+      # RPM records the digest of each installed payload file. Querying these
+      # records does not execute package verification scriptlets or inspect
+      # unrelated mutable configuration files from the same package.
+      case "$expected" in
+        *[!0-9a-f]*|'') fail "missing or ambiguous native RPM file digest: $input" ;;
+      esac
+      case "${#expected}" in
+        32) actual="$(md5sum "$input" | awk '{print $1}')" ;;
+        40) actual="$(sha1sum "$input" | awk '{print $1}')" ;;
+        64) actual="$(sha256sum "$input" | awk '{print $1}')" ;;
+        96) actual="$(sha384sum "$input" | awk '{print $1}')" ;;
+        128) actual="$(sha512sum "$input" | awk '{print $1}')" ;;
+        *) fail "unsupported native RPM file digest: $input" ;;
+      esac
+      ;;
+    *) fail "unsupported native package format: $format" ;;
+  esac
+  [ "$actual" = "$expected" ] || fail "native package file content differs from installed metadata: $input"
+}
+
 release_native_system_input() {
   local input="$1" payload="$2" query owner source_name version label copyright common
   local source_id rpm_source sibling file count=0
@@ -19,6 +55,7 @@ release_native_system_input() {
     && query="$(dpkg-query -S "$input" 2>/dev/null)"; then
     owner="${query%%: /*}"
     [[ "$owner" != *$'\n'* && "$owner" != *,* ]] || fail "ambiguous native package owner"
+    release_native_verify_package_file "$input" deb "$owner"
     query="$(dpkg-query -W -f '${source:Package}\t${source:Version}\n' "$owner")"
     IFS=$'\t' read -r source_name version <<< "$query"
     if [ -z "$source_name" ] || [ -z "$version" ]; then
@@ -38,6 +75,7 @@ release_native_system_input() {
   elif command -v rpm >/dev/null 2>&1 \
     && query="$(rpm -qf --qf '%{NAME}\t%{VERSION}-%{RELEASE}\t%{SOURCERPM}\n' "$input" 2>/dev/null)"; then
     IFS=$'\t' read -r owner version rpm_source <<< "$query"
+    release_native_verify_package_file "$input" rpm "$owner"
     if [ -z "$rpm_source" ] || [ "$rpm_source" = '(none)' ]; then
       fail "native RPM source identity is missing: $input"
     fi
@@ -81,4 +119,3 @@ release_native_link_inputs() {
   done < <(awk '$1 == "LOAD" && $2 ~ /\.(a|o)$/ {print $2}' "$map" | LC_ALL=C sort -u)
   [ "$count" -gt 0 ] || fail "native linker map contains no system inputs"
 }
-

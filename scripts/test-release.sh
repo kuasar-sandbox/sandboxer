@@ -376,7 +376,13 @@ cat > "$TMP/release-build-bin/rpm" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$1" in
-  -qf) printf 'fixture-native\t1.0-1\tfixture-native-1.0-1.src.rpm\n' ;;
+  -qf)
+    if [ "$2" = --dump ]; then
+      printf '%s 1 0 %s 0100644 root root 0 0 0 X\n' "$3" "$(sha256sum "$3" | awk '{print $1}')"
+    else
+      printf 'fixture-native\t1.0-1\tfixture-native-1.0-1.src.rpm\n'
+    fi
+    ;;
   -qa) printf 'fixture-native.x86_64\tfixture-native-1.0-1.src.rpm\n' ;;
   -ql) printf '%s/system/LICENSE\n' "$(cd "$(dirname "$0")/.." && pwd)" ;;
   *) exit 1 ;;

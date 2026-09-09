@@ -94,6 +94,10 @@ The fresh final-link map also selects the system static libraries and startup
 objects actually used by Cloud Hypervisor. Their installed source-package
 identities, input digests, copyright and referenced license texts are included;
 temporary objects from this build remain covered by the CH/Rust source records.
+Each installed system input must also match its file digest in the trusted
+build host's Debian or RPM database; ownership alone is insufficient. Missing,
+ambiguous or changed file records fail packaging. This checks installed file
+integrity, not the trustworthiness of a compromised host or package database.
 Unknown sources, missing materials, altered archives, and unsuccessful builds
 fail packaging. Existing `RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR` and upstream
 tarball environment overrides are not accepted by the release packager; source
