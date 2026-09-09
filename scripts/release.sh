@@ -149,6 +149,8 @@ package_release() {
     || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
   [ -f "$ch_source/Cargo.lock" ] || fail "Cloud Hypervisor Cargo.lock is missing from $ch_source"
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" sandboxer)"
+  release_materials_require_go_revision "$STAGE/bin/sandbox-ctl" "$project_sha"
+  release_materials_require_go_revision "$STAGE/bin/sandbox-init" "$project_sha"
   accelerator_sha="$(release_materials_resolve_git_source "$accelerator_source" \
     "${RELEASE_ACCELERATOR_SOURCE_SHA:-}" accelerator)"
   connector_sha="$(release_materials_resolve_git_source "$connector_source" \
