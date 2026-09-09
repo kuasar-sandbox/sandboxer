@@ -9,6 +9,7 @@ from unittest.mock import patch
 from usage import autonomous_balloon_prefix
 import usage_perf
 import usage_trace
+import usage_faults
 
 
 class BalloonWitnessTests(unittest.TestCase):
@@ -134,6 +135,37 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(trace.process.wait.call_count, 2)
         trace.close()
         trace.process.kill.assert_called_once()
+
+    def test_injection_timeout_reaps_and_closes_log(self):
+        tracer, log = unittest.mock.Mock(), io.StringIO()
+        tracer.poll.return_value = None
+        tracer.wait.side_effect = [subprocess.TimeoutExpired("strace", 10), 0]
+        with self.assertRaisesRegex(AssertionError, "strace did not stop cleanly"):
+            usage_faults.detach((tracer, log))
+        self.assertTrue(log.closed)
+        tracer.kill.assert_called_once()
+        self.assertEqual(tracer.wait.call_count, 2)
+        usage_faults.detach((tracer, log))
+        tracer.kill.assert_called_once()
+
+    def test_injection_start_failure_closes_log(self):
+        sb, log = unittest.mock.Mock(), io.StringIO()
+        sb.baseroot, sb.dir, sb.name = Path("base"), Path("dir"), "test"
+        with patch.object(usage_faults.Path, "open", return_value=log), \
+             patch.object(usage_faults.subprocess, "Popen", side_effect=OSError("spawn failed")):
+            with self.assertRaisesRegex(OSError, "spawn failed"):
+                usage_faults.inject(sb, "fsync", "error=EIO")
+        self.assertTrue(log.closed)
+
+    def test_evidence_copy_failure_does_not_skip_unmount(self):
+        sb = unittest.mock.Mock()
+        sb.name, sb.dir = "test", Path("destination")
+        with patch.object(usage_faults.Path, "exists", return_value=True), \
+             patch.object(usage_faults.shutil, "copy2", side_effect=OSError(errno.ENOSPC, "evidence full")), \
+             patch.object(usage_faults, "run") as run:
+            with self.assertRaises(OSError):
+                usage_faults.collect_and_unmount(Path("mounted"), sb)
+        run.assert_called_once_with("umount", Path("mounted"))
 
 
 if __name__ == "__main__":

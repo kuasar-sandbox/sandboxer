@@ -13,6 +13,7 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -22,21 +23,51 @@ from usage import BIN, Sandbox, digest, ext4, image_ref, metric, run, write_json
 def inject(sb, syscall, action):
     path = sb.baseroot / "instance" / f"{sb.name}.usage"
     log = (sb.dir / "injection.log").open("w")
-    tracer = subprocess.Popen(["strace", "-f", "-yy", "-ttt", "-T", "-p", str(sb.process.pid),
-                               "-e", f"trace={syscall}", "-e", f"inject={syscall}:{action}",
-                               "-P", str(path)], stdout=log, stderr=subprocess.STDOUT)
-    time.sleep(.5)
-    assert tracer.poll() is None, f"cannot attach injection; see {sb.dir / 'injection.log'}"
+    tracer = None
+    try:
+        tracer = subprocess.Popen(["strace", "-f", "-yy", "-ttt", "-T", "-p", str(sb.process.pid),
+                                   "-e", f"trace={syscall}", "-e", f"inject={syscall}:{action}",
+                                   "-P", str(path)], stdout=log, stderr=subprocess.STDOUT)
+        time.sleep(.5)
+        assert tracer.poll() is None, f"cannot attach injection; see {sb.dir / 'injection.log'}"
+    except BaseException:
+        if tracer is None:
+            log.close()
+        else:
+            try:
+                detach((tracer, log))
+            except BaseException as error:
+                print(f"usage injection cleanup: {error}", file=sys.stderr)
+        raise
     return tracer, log
 
 
 def detach(injection):
     tracer, log = injection
-    if tracer.poll() is None:
-        tracer.send_signal(signal.SIGINT)
-        tracer.wait(timeout=10)
-    log.close()
+    if log.closed:
+        return
+    try:
+        if tracer.poll() is None:
+            tracer.send_signal(signal.SIGINT)
+            try:
+                tracer.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                tracer.kill()
+                tracer.wait(timeout=5)
+                raise AssertionError("strace did not stop cleanly")
+    finally:
+        log.close()
     assert tracer.returncode in (0, -signal.SIGINT), f"strace exit={tracer.returncode}"
+
+
+def collect_and_unmount(mount, sb):
+    try:
+        if sb is not None:
+            path = mount / "instance" / f"{sb.name}.usage"
+            if path.exists():
+                shutil.copy2(path, sb.dir / "final.usage")
+    finally:
+        run("umount", mount)
 
 
 def main():
@@ -198,11 +229,7 @@ def main():
                         sb.stop()
                 finally:
                     if mount is not None:
-                        if sb is not None:
-                            path = mount / "instance" / f"{sb.name}.usage"
-                            if path.exists():
-                                shutil.copy2(path, sb.dir / "final.usage")
-                        run("umount", mount)
+                        collect_and_unmount(mount, sb)
         write_json(work / "results.json", results)
     write_json(work / "results.json", results)
 
