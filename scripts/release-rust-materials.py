@@ -212,7 +212,8 @@ def rust_standard_library_inventory(stage, sysroot, link_map):
         relative = path.relative_to(sysroot).as_posix()
         require(re.fullmatch(r"lib/rustlib/[A-Za-z0-9._+-]+/lib/lib[A-Za-z0-9._+-]+\.rlib", relative),
                 "unexpected Rust standard-library input path")
-        libraries[relative] = hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+        with path.open("rb") as contents:
+            libraries[relative] = hashlib.file_digest(contents, "sha256").hexdigest()
     require(any(PurePosixPath(path).name.startswith("libstd-") for path in libraries),
             "link map omits the linked Rust standard library")
     inventory = "sysroot_path\tsha256\n" + "".join(path + "\t" + digest + "\n"
