@@ -33,7 +33,10 @@ import (
 // Request is a control request on ctl.sock. Type selects which fields
 // are populated.
 type Request struct {
-	Type string `json:"type"`
+	UsageHistory bool   `json:"usage_history,omitempty"`
+	UsageCursor  int64  `json:"usage_cursor,omitempty,string"`
+	UsageLimit   int    `json:"usage_limit,omitempty"`
+	Type         string `json:"type"`
 
 	// snapshot_request: OutDir and Upload are mutually exclusive (the
 	// receiving run process enforces); ResumeAfter defaults to false
@@ -57,7 +60,8 @@ type Request struct {
 
 // Response is the run-process reply.
 type Response struct {
-	Type string `json:"type"`
+	Usage json.RawMessage `json:"usage,omitempty"`
+	Type  string          `json:"type"`
 
 	// snapshot_done fields.
 	MemorySize          uint64                 `json:"memory_size,omitempty"`
@@ -122,6 +126,8 @@ const (
 	TypeExecRequest     = "exec_request"
 	TypeExecAck         = "exec_ack"
 	TypeError           = "error"
+	TypeUsageRequest    = "usage_request"
+	TypeUsageResponse   = "usage_response"
 )
 
 // MaxMessageBytes caps any single message on ctl.sock.

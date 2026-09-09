@@ -2,6 +2,9 @@ package sandbox
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -29,6 +32,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
+	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
 )
@@ -90,6 +94,8 @@ type PostSpawnCtx struct {
 type VMParams struct {
 	Ctx                context.Context
 	SandboxID          string
+	BaseDir            string
+	Balloon            *resctl.BalloonController
 	RunDir             string // already created by the caller (caller defers RemoveAll)
 	Logf               func(string, ...any)
 	StdioMode          stdio.Mode
@@ -226,6 +232,15 @@ func ServeAndWait(p VMParams) (int, error) {
 	}
 	logf := p.Logf
 	readiness := newReadinessEmitter(p.NotifyReadiness)
+	var usageManager *usage.Manager
+	var usageSampler *usage.Sampler
+	usageError := ""
+	notifyReady := func() {
+		if usageSampler != nil {
+			usageSampler.Ready()
+		}
+		readiness.notifyReady()
+	}
 	runDir := p.RunDir
 	chSock := filepath.Join(runDir, "ch.sock")
 	vsockBase := filepath.Join(runDir, "vsock.sock")
@@ -401,7 +416,7 @@ func ServeAndWait(p VMParams) (int, error) {
 		OnAppStarted: func(pid int) {
 			logf("guest reports user app pid=%d", pid)
 			if p.ReadyOnAppStarted {
-				readiness.notifyReady()
+				notifyReady()
 			}
 		},
 		OnAppExited: func(code int) { logf("guest reports user app exited code=%d", code) },
@@ -451,6 +466,36 @@ func ServeAndWait(p VMParams) (int, error) {
 		Logf:   logf,
 	}
 
+	if p.SnapCfg != nil && p.SnapCfg.Usage.Enabled {
+		sampleInterval, flushInterval, usageErr := p.SnapCfg.Usage.Intervals()
+		if usageErr == nil {
+			usageErr = os.MkdirAll(p.BaseDir, 0o755)
+		}
+		var epoch [16]byte
+		if usageErr == nil {
+			_, usageErr = rand.Read(epoch[:])
+		}
+		if usageErr == nil {
+			usageManager, usageErr = usage.Open(p.BaseDir, p.SandboxID, fmt.Sprintf("%x", epoch), time.Now(), sampleInterval, flushInterval)
+		}
+		if usageErr == nil {
+			usageSampler, usageErr = usage.NewSampler(usageManager, p.SnapCfg.Resources.Capacity.CPU, len(p.Disks), pinger.Client, p.Balloon, nil)
+		}
+		if usageErr != nil {
+			usageError = usageErr.Error()
+			logf("usage unavailable: %v", usageErr)
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if usageSampler != nil {
+				usageSampler.Stop(ctx)
+			} else if usageManager != nil {
+				usageManager.Close(ctx, time.Now())
+			}
+		}()
+	}
+
 	// Port-forward listeners. Built here so the snapshot handler can pause
 	// + collapse active relays around quiesce (symmetric with the pinger);
 	// started below alongside the other backend servers.
@@ -496,6 +541,7 @@ func ServeAndWait(p VMParams) (int, error) {
 		Forwarder:      forwarder,
 		Reattach:       reattach,
 		Memory:         p.Memory,
+		usageSampler:   usageSampler,
 		CHProcess:      currentCHProcess,
 		Context:        backendCtx,
 		Logf:           logf,
@@ -503,6 +549,31 @@ func ServeAndWait(p VMParams) (int, error) {
 	ctlSrv := &ctl.Server{
 		Path: ctlSockPath,
 		Logf: logf,
+		UsageHandler: func(req ctl.Request) (ctl.Response, error) {
+			view := usage.View{Enabled: p.SnapCfg != nil && p.SnapCfg.Usage.Enabled, ReadError: usageError}
+			if usageManager != nil {
+				view = usageManager.View()
+				if usageError != "" {
+					view.ReadError = usageError
+				}
+			}
+			if req.UsageHistory {
+				if usageManager == nil {
+					return ctl.Response{}, errors.New("usage history unavailable; read the saved file offline")
+				}
+				records, next, err := usageManager.History(req.UsageCursor, req.UsageLimit)
+				if err != nil {
+					return ctl.Response{}, err
+				}
+				body, err := json.Marshal(struct {
+					Records []usage.Record `json:"records"`
+					Next    int64          `json:"next_cursor,string"`
+				}{records, next})
+				return ctl.Response{Usage: body}, err
+			}
+			body, err := json.Marshal(view)
+			return ctl.Response{Usage: body}, err
+		},
 		SnapshotHandler: func(req ctl.Request) (ctl.Response, error) {
 			return snapHandler.handle(req, cgroupPath, chExited)
 		},
@@ -648,6 +719,36 @@ func ServeAndWait(p VMParams) (int, error) {
 	chProcessMu.Unlock()
 	chPid := cmd.Process.Pid
 	logf("CH started pid=%d", chPid)
+	if usageSampler != nil {
+		usageSampler.Start(backendCtx, chPid)
+	}
+	// This goroutine is the sole reaper on every post-spawn path, including
+	// failed restore setup. WNOWAIT keeps native process counters readable.
+	doneCh := make(chan error, 1)
+	go func() {
+		if usageSampler != nil {
+			var info unix.Siginfo
+			var waitIDErr error
+			for {
+				waitIDErr = unix.Waitid(unix.P_PID, chPid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+				if !errors.Is(waitIDErr, unix.EINTR) {
+					break
+				}
+			}
+			if waitIDErr == nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+				usageSampler.FinalCH(ctx)
+				cancel()
+			} else {
+				logf("usage final waitid: %v", waitIDErr)
+				usageManager.CounterMissing("guest.cpu", true)
+				usageManager.CounterMissing("ch.cpu", true)
+			}
+		}
+		waitErr := cmd.Wait()
+		markCHExited()
+		doneCh <- waitErr
+	}()
 
 	// PingFatalThreshold wiring: when the threshold is hit (opt-in),
 	// SIGTERM CH so cmd.Wait returns; waitForCHWithSignalEscalation then
@@ -668,10 +769,11 @@ func ServeAndWait(p VMParams) (int, error) {
 		Memory:       p.Memory,
 		CHSock:       chSock,
 		Logf:         logf,
-		NotifyReady:  readiness.notifyReady,
+		NotifyReady:  notifyReady,
 	}); err != nil {
 		if !runShutdownRequested(p.Ctx) {
 			_ = cmd.Process.Kill()
+			<-doneCh
 			cancelBackends()
 			backendWG.Wait()
 			return -1, err
@@ -681,13 +783,6 @@ func ServeAndWait(p VMParams) (int, error) {
 		// the normal CH shutdown/escalation protocol.
 		logf("post-spawn interrupted by shutdown: %v", err)
 	}
-
-	doneCh := make(chan error, 1)
-	go func() {
-		waitErr := cmd.Wait()
-		markCHExited()
-		doneCh <- waitErr
-	}()
 
 	waitErr := waitForCHWithSignalEscalation(doneCh, sigCh, cmd.Process, chPid, chSock, cgroupPath, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf)
 	cancelBackends()

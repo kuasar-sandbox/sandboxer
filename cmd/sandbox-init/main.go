@@ -301,6 +301,13 @@ func phase1aAssembleRoot() error {
 	for _, dir := range []string{"/sysroot/proc", "/sysroot/sys", "/sysroot/dev"} {
 		_ = os.MkdirAll(dir, 0o755)
 	}
+	usageRoot := "/overlay/upper"
+	if singleDiskRoot {
+		usageRoot = "/sysroot"
+	}
+	if err := guestUsage.register("root", usageRoot); err != nil {
+		logf("usage root registration: %v", err)
+	}
 
 	// Project the guest-side runtime payload (/opt/sandbox-runtime, shipped in
 	// the pmem rootfs) into the new root. The source lives on the pmem EROFS,
@@ -789,6 +796,7 @@ func waitOrTimeout(pid int, timeout time.Duration) {
 }
 
 func doReboot() {
+	guestUsage.close()
 	// POWER_OFF (not RESTART): the sandbox model is one-shot — when
 	// the user app exits, the sandbox is done and CH should exit too.
 	// LINUX_REBOOT_CMD_RESTART triggers CH's "reboot in place" flow,

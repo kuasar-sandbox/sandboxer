@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -29,6 +30,8 @@ type vsockConn struct {
 	fd        int
 	closeOnce sync.Once
 	closeErr  error
+	fdMu      sync.Mutex
+	closed    bool
 }
 
 type fdIOFunc func(int, []byte) (int, error)
@@ -55,8 +58,19 @@ func (c *vsockConn) Write(b []byte) (int, error) {
 	return retryInterruptedIO(syscall.Write, c.fd, b)
 }
 func (c *vsockConn) Close() error {
-	c.closeOnce.Do(func() { c.closeErr = syscall.Close(c.fd) })
+	c.fdMu.Lock()
+	defer c.fdMu.Unlock()
+	c.closeOnce.Do(func() { c.closed = true; c.closeErr = syscall.Close(c.fd) })
 	return c.closeErr
+}
+
+func (c *vsockConn) shutdown() error {
+	c.fdMu.Lock()
+	defer c.fdMu.Unlock()
+	if c.closed {
+		return nil
+	}
+	return unix.Shutdown(c.fd, unix.SHUT_RDWR)
 }
 
 // SetDeadline applies SO_RCVTIMEO + SO_SNDTIMEO. AF_VSOCK supports both
@@ -206,6 +220,9 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		return false
 	}
 	switch req.Type {
+	case proto.TypeUsageRequest:
+		guestUsage.serve(c, req)
+		return false
 	case proto.TypePing:
 		// Echo id + t_send_ns; host computes RTT.
 		// Capture pauses the host ticker and waits for EOF. Linger makes that
@@ -234,6 +251,13 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		return true
 
 	case proto.TypeRestore:
+		usageCtx, usageCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		usageErr := guestUsage.pause(usageCtx)
+		usageCancel()
+		if usageErr != nil {
+			logf("usage restore barrier: %v", usageErr)
+			return false
+		}
 		logf("reverse-channel: restore epoch=%d — re-establishing stdio MUX", req.Epoch)
 		bridge.closeLiveMUX() // drop any stale session first (normally already gone via quiesce)
 		// CH reloaded the snapshot's CLOCK_REALTIME verbatim, so the
@@ -290,6 +314,7 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 			logf("reverse-channel: restore thaw: %v", err)
 			return true
 		}
+		guestUsage.resume(true)
 		// Restore, like cold boot, sends the first trustworthy observation
 		// immediately after its lifecycle barrier instead of waiting up to one
 		// periodic interval.
@@ -332,6 +357,13 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		return true
 
 	case proto.TypeQuiesce:
+		usageCtx, usageCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		usageErr := guestUsage.pause(usageCtx)
+		usageCancel()
+		if usageErr != nil {
+			logf("usage quiesce barrier: %v", usageErr)
+			return false
+		}
 		logf("reverse-channel: quiesce — freeze + prep + MUX/forward close")
 		// Gate restarts: the snapshot must not fork a new app/plugin into the
 		// freeze window. Running plugins stay frozen with the app cgroup; the
@@ -406,6 +438,7 @@ func resumeAfterThaw(sup *supervisorState, reports *memReportStream, thaw func()
 	sup.acceptLn.reopen()
 	sup.pluginReg.endQuiesce()
 	sup.quiescing.Store(false)
+	guestUsage.resume(false)
 	return nil
 }
 

@@ -312,7 +312,9 @@ const (
 // Message is the typed envelope for management-connection messages.
 // Only fields relevant to Type are populated.
 type Message struct {
-	Type string `json:"type"`
+	Type          string         `json:"type"`
+	UsageRequest  *UsageRequest  `json:"usage_request,omitempty"`
+	UsageResponse *UsageResponse `json:"usage_response,omitempty"`
 
 	// hello: guest → host first message; phase carries an optional hint
 	// (e.g. "ready"). v1 just uses presence of the message.

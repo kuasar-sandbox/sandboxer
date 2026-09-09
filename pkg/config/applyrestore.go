@@ -55,6 +55,7 @@ func ApplyRestoreRules(artifact *PortableSandboxConfig, host *SandboxConfig, pre
 	runtime.Resources.Startup = host.Resources.Startup
 	runtime.Timeouts = host.Timeouts
 	runtime.Restore = host.Restore
+	runtime.Usage = host.Usage
 
 	hostHasNetwork := host.Network.hasSource()
 	if hostHasNetwork != c0.Network.Enabled {

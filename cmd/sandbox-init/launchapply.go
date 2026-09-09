@@ -109,6 +109,13 @@ func assembleDataDisk(m proto.MountSpec) error {
 		}
 	}
 	tgt := "/sysroot" + m.Target
+	usagePath := asm
+	if m.DiskOverlay {
+		usagePath = asm + "-upper"
+	}
+	if err := guestUsage.register(fmt.Sprintf("disk-%d", m.DiskIndex), usagePath); err != nil {
+		logf("usage disk registration: %v", err)
+	}
 	if err := os.MkdirAll(tgt, 0o755); err != nil {
 		return fmt.Errorf("disk %d mkdir target %s: %w", m.DiskIndex, tgt, err)
 	}

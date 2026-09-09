@@ -511,6 +511,8 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	// by PostSpawn over the reverse channel), and a settle protocol of
 	// waitAPI → /vm.resume → restore{epoch} → local restore normalization.
 	return sandbox.ServeAndWait(sandbox.VMParams{
+		BaseDir:            sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID),
+		Balloon:            balloonCtl,
 		Ctx:                ctx,
 		SandboxID:          opts.SandboxID,
 		RunDir:             runDir,

@@ -39,13 +39,15 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/tapfd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
+	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
 )
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
-	Cfg *config.SandboxConfig
+	usageSampler *usage.Sampler
+	Cfg          *config.SandboxConfig
 	// PortableConfig is immutable C0. nil selects projection from an explicit
 	// cold config; non-nil selects a Sandbox source and requires SourceBinding.
 	PortableConfig *config.PortableSandboxConfig
@@ -562,6 +564,8 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// (WireLaunchMUX), and a settle protocol gated on the guest's
 	// hello / launch_ack handshake.
 	params := VMParams{
+		BaseDir:            baseDir,
+		Balloon:            balloonCtl,
 		Ctx:                ctx,
 		SandboxID:          opts.SandboxID,
 		RunDir:             runDir,
@@ -1428,6 +1432,7 @@ func (q *allQuiescer) Resume() {
 // that owns the bundle holds references; the snapshot path consumes
 // them when a request arrives.
 type SnapshotHandler struct {
+	usageSampler   *usage.Sampler
 	Cfg            *config.SandboxConfig
 	PortableConfig *config.PortableSandboxConfig
 	SourceBinding  *RunSourceBinding
@@ -1508,7 +1513,8 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 	}
 	defer func() { h.capture.finish((err == nil && !req.ResumeAfter) || isTerminalCaptureError(err)) }()
 	opts := RunOptions{
-		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
+		usageSampler: h.usageSampler,
+		Cfg:          h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
@@ -1533,7 +1539,8 @@ func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExi
 	}
 	defer func() { h.capture.finish((err == nil && !req.ResumeAfter) || isTerminalCaptureError(err)) }()
 	opts := RunOptions{
-		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
+		usageSampler: h.usageSampler,
+		Cfg:          h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
@@ -1757,6 +1764,14 @@ func handleExportRequest(
 	// output, admission, dependency, merge and C1-source check has completed.
 	// From here through sink commit (and destroy/resume recovery), balloon and
 	// memory.high lifecycle changes are serialized with the freeze point.
+	if opts.usageSampler != nil {
+		opts.usageSampler.Pause()
+		defer func() {
+			if (err != nil && !isTerminalCaptureError(err)) || req.ResumeAfter {
+				opts.usageSampler.Resume()
+			}
+		}()
+	}
 	releaseMemoryBarrier := func() {}
 	if memoryController != nil {
 		releaseMemoryBarrier, err = memoryController.BeginSnapshot(ctx)
@@ -2186,6 +2201,14 @@ func handleSnapshotRequest(
 		return ctl.Response{}, fmt.Errorf("snapshot: rewritten memory config: %w", err)
 	}
 	sandboxID := opts.SandboxID
+	if opts.usageSampler != nil {
+		opts.usageSampler.Pause()
+		defer func() {
+			if (err != nil && !isTerminalCaptureError(err)) || req.ResumeAfter {
+				opts.usageSampler.Resume()
+			}
+		}()
+	}
 
 	// Every predictable output, admission, dependency, merge and provenance
 	// check has completed. Hold the memory/Budget mutation barrier only for the

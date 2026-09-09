@@ -21,6 +21,7 @@ type Server struct {
 	// response and the server writes it back, then closes the conn.
 	SnapshotHandler func(req Request) (Response, error)
 	ExportHandler   func(req Request) (Response, error)
+	UsageHandler    func(req Request) (Response, error)
 
 	// ExecHandler services an exec_request. It takes ownership of conn
 	// (including its lifetime): it writes the ctl exec_ack / error
@@ -101,6 +102,23 @@ func (s *Server) handle(conn *net.UnixConn) {
 	}
 
 	switch req.Type {
+	case TypeUsageRequest:
+		defer conn.Close()
+		if s.UsageHandler == nil {
+			_ = WriteMessage(conn, Response{Type: TypeError, Msg: "usage unavailable"})
+			return
+		}
+		resp, err := s.UsageHandler(req)
+		if err != nil {
+			_ = WriteMessage(conn, Response{Type: TypeError, Msg: err.Error()})
+			return
+		}
+		resp.Type = TypeUsageResponse
+		if err := WriteUsageResponse(conn, resp); err != nil {
+			_ = WriteMessage(conn, Response{Type: TypeError, Msg: err.Error()})
+			s.Logf("ctl.sock usage response: %v", err)
+		}
+		return
 	case TypeExecRequest:
 		if s.ExecHandler == nil {
 			_ = WriteMessage(conn, Response{Type: TypeError, Msg: "exec not supported"})

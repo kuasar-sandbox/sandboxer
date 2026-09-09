@@ -54,6 +54,7 @@ type SandboxConfig struct {
 	Network   NetworkConfig   `yaml:"network"`
 	Boot      BootConfig      `yaml:"boot"`
 	Launch    LaunchConfig    `yaml:"launch"`
+	Usage     UsageConfig     `yaml:"usage,omitempty"`
 
 	// Timeouts tunes host-side restore/lifecycle deadlines. Every field
 	// defaults to 0 = NO FORCED TIMEOUT — the host waits as long as the
@@ -116,6 +117,7 @@ func (c SandboxConfig) MarshalYAML() (any, error) {
 		Boot      restoreBootYAML `yaml:"boot"`
 		Timeouts  TimeoutsConfig  `yaml:"timeouts,omitempty"`
 		Restore   RestoreConfig   `yaml:"restore,omitempty"`
+		Usage     UsageConfig     `yaml:"usage,omitempty"`
 	}
 	return restoreHostYAML{
 		Resources: c.Resources,
@@ -125,6 +127,7 @@ func (c SandboxConfig) MarshalYAML() (any, error) {
 		},
 		Timeouts: c.Timeouts,
 		Restore:  c.Restore,
+		Usage:    c.Usage,
 	}, nil
 }
 
@@ -767,6 +770,12 @@ func LoadConfigBytes(data []byte) (*SandboxConfig, error) {
 }
 
 func (c *SandboxConfig) ApplyDefaults() {
+	if c.Usage.SampleInterval == "" {
+		c.Usage.SampleInterval = "1s"
+	}
+	if c.Usage.FlushInterval == "" {
+		c.Usage.FlushInterval = "5m"
+	}
 	if c.Resources.Capacity.CPU == 0 {
 		c.Resources.Capacity.CPU = 1
 	}
@@ -1010,6 +1019,9 @@ func (c *SandboxConfig) ValidateColdProjection() error {
 }
 
 func (c *SandboxConfig) validateCold(requireCgroupCapability bool) error {
+	if _, _, err := c.Usage.Intervals(); err != nil {
+		return err
+	}
 	if err := c.Restore.validate(); err != nil {
 		return err
 	}
@@ -1277,6 +1289,9 @@ func validateFiles(field string, files []FileConfig) error {
 // the immutable disk graph. ApplyRestoreRules performs the ownership checks and
 // applies explicitly supplied target-node allocatable CPU/memory policy.
 func (c *SandboxConfig) ValidateRestoreHostConfig() error {
+	if _, _, err := c.Usage.Intervals(); err != nil {
+		return err
+	}
 	if err := c.Restore.validate(); err != nil {
 		return err
 	}
