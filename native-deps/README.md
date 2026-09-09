@@ -51,6 +51,25 @@ rerunning to force a rebuild. In particular, formatting a changed patch does not
 by itself invalidate the existing binary. `make clean` removes the native build
 output and `bin/`, but preserves the source patch workspace and tarball cache.
 
+Release packaging does not reuse that development binary or patch workspace.
+It extracts the selected sandboxer commit into a temporary directory, verifies
+the pinned Cloud Hypervisor tarball, applies that commit's patches, and performs
+a locked build with a fresh private Cargo home. Python 3.11 or newer collects
+source material from the actual Cargo build report: registry crate archives must
+match `Cargo.lock` checksums, and Git dependencies must match its full commits.
+Only observed build inputs are listed, including build-time/procedural-macro
+dependencies; this is not a claim that every listed crate's code is shipped.
+Editable extracted cache files are not the authority for registry licenses.
+
+The component archive carries those crates' license/notice files and the Rust
+toolchain's copyright and license materials in component-specific directories.
+Unknown sources, missing materials, altered archives, and unsuccessful builds
+fail packaging. Existing `RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR` and upstream
+tarball environment overrides are not accepted by the release packager; source
+development overrides remain available through the Makefile. A pin change must
+update and validate the build recipe and source records together. These checks
+support release review, not a legal certification.
+
 <a id="3-patch-开发循环"></a>
 ## 3. Patch development cycle
 

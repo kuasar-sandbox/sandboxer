@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Collect materials for Cargo packages observed in the actual CH build.
+
+Registry licenses are read from checksum-verified .crate archives, never from
+an editable extracted Cargo cache. Git dependencies must match the lock commit.
+The caller builds in a fresh private Cargo home and supplies its build report.
+"""
+import argparse
+import fnmatch
+import hashlib
+import json
+from pathlib import Path, PurePosixPath
+import re
+import subprocess
+import tarfile
+import tomllib
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def safe_relative(value):
+    path = PurePosixPath(value)
+    return bool(value and not path.is_absolute() and ".." not in path.parts
+                and re.fullmatch(r"[A-Za-z0-9._+@/=-]+", value))
+
+
+def material_name(name, declared=None):
+    path = PurePosixPath(name)
+    return name == declared or any(
+        fnmatch.fnmatchcase(path.name.lower(), pattern)
+        for pattern in ("license*", "copying*", "notice*", "copyright*", "authors*", "credits*", "patents*")
+    ) or any(part.lower() in ("licenses", "license") for part in path.parts[:-1])
+
+
+def put_material(destination, relative, contents):
+    require(safe_relative(relative), "unsafe Rust license material path")
+    require(contents, "empty Rust license material: " + relative)
+    target = destination / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(contents)
+    target.chmod(0o644)
+
+
+def registry_materials(package, locked, cargo_home, destination):
+    name, version = package["name"], package["version"]
+    checksum = locked.get("checksum", "")
+    require(re.fullmatch(r"[0-9a-f]{64}", checksum), "registry crate has no lock checksum")
+    archives = list((cargo_home / "registry" / "cache").glob(f"*/{name}-{version}.crate"))
+    require(len(archives) == 1, f"missing or ambiguous downloaded crate: {name}@{version}")
+    archive = archives[0]
+    require(hashlib.sha256(archive.read_bytes()).hexdigest() == checksum,
+            f"crate archive checksum mismatch: {name}@{version}")
+    declared = package.get("license_file")
+    if declared:
+        declared = str(Path(declared).relative_to(Path(package["manifest_path"]).parent))
+    count = 0
+    with tarfile.open(archive) as source:
+        for member in source:
+            parts = PurePosixPath(member.name).parts
+            require(parts and parts[0] == f"{name}-{version}", "unexpected crate archive root")
+            relative = "/".join(parts[1:])
+            if not relative or member.isdir():
+                continue
+            require(safe_relative(relative) and member.isfile(), "unsafe crate archive member")
+            if material_name(relative, declared):
+                put_material(destination, relative, source.extractfile(member).read())
+                count += 1
+    require(count, f"crate contains no license/notice material: {name}@{version}")
+    return f"https://static.crates.io/crates/{name}/{name}-{version}.crate", "sha256:" + checksum
+
+
+def git_materials(package, locked, destination):
+    source = locked["source"]
+    commit = source.rsplit("#", 1)[-1]
+    require(re.fullmatch(r"[0-9a-f]{40}", commit), "Git crate is not locked to a full commit")
+    directory = Path(package["manifest_path"]).parent.resolve()
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
+    require(git("rev-parse", "HEAD") == commit, "Git crate checkout differs from Cargo.lock")
+    require(not git("status", "--porcelain", "--untracked-files=no"), "Git crate checkout is dirty")
+    root = Path(git("rev-parse", "--show-toplevel"))
+    count = 0
+    for relative in subprocess.check_output(["git", "-C", str(root), "ls-files"], text=True).splitlines():
+        if not material_name(relative):
+            continue
+        path = root / relative
+        require(path.is_file() and not path.is_symlink(), "invalid Git crate material")
+        put_material(destination, str(path.relative_to(root)), path.read_bytes())
+        count += 1
+    require(count, "Git crate has no tracked license/notice material")
+    return source[4:].split("?", 1)[0].split("#", 1)[0], "git:" + commit
+
+
+def rust_toolchain_materials(stage):
+    info = subprocess.check_output(["rustc", "-vV"], text=True)
+    fields = dict(line.split(": ", 1) for line in info.splitlines() if ": " in line)
+    version, commit = fields.get("release", ""), fields.get("commit-hash", "")
+    require(re.fullmatch(r"[0-9a-f]{40}", commit), "Rust toolchain has no source commit")
+    require(re.fullmatch(r"[0-9A-Za-z.+-]+", version), "invalid Rust toolchain version")
+    sysroot = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip())
+    docs = sysroot / "share" / "doc" / "rust"
+    destination = stage / "share" / "licenses" / "sandboxer" / "rust-toolchain" / version
+    source = "https://github.com/rust-lang/rust/tree/" + commit
+    paths = []
+    if (docs / "COPYRIGHT-library.html").is_file() and (docs / "licenses").is_dir():
+        paths = [docs / "COPYRIGHT-library.html", *sorted((docs / "licenses").rglob("*"))]
+        paths = [(p, str(p.relative_to(docs))) for p in paths if p.is_file()]
+    else:
+        # Distribution Rust installs keep notices in RPM subpackages, not the
+        # rustup documentation layout. Select only siblings of the same SRPM.
+        query = subprocess.check_output(["rpm", "-qf", "--qf", "%{SOURCERPM}", str(sysroot / "bin" / "rustc")],
+                                        text=True).strip()
+        require(query and query != "(none)", "Rust RPM has no source identity")
+        source = "rpm-source:" + query
+        owners = subprocess.check_output(["rpm", "-qa", "--qf", "%{NAME}.%{ARCH}\t%{SOURCERPM}\n"], text=True)
+        for owner in owners.splitlines():
+            name, source_rpm = owner.split("\t")
+            if source_rpm != query:
+                continue
+            for value in subprocess.check_output(["rpm", "-ql", name], text=True).splitlines():
+                path = Path(value)
+                if path.is_file() and (material_name(path.name) or value.startswith("/usr/share/licenses/")):
+                    paths.append((path, value.lstrip("/")))
+    require(paths, "Rust toolchain copyright/license material is missing")
+    for path, relative in paths:
+        require(not path.is_symlink(), "Rust toolchain license material is a symbolic link")
+        put_material(destination, relative, path.read_bytes())
+    return ["bin/cloud-hypervisor", "Rust toolchain", version, source, "git:" + commit,
+            "share/licenses/sandboxer/rust-toolchain/" + version]
+
+
+def collect(metadata, build_report, lock, cargo_home, source_root, stage):
+    packages = {p["id"]: p for p in metadata["packages"]}
+    observed = set()
+    completed = False
+    executable = False
+    for line in build_report.splitlines():
+        message = json.loads(line)
+        if message.get("reason") == "compiler-artifact":
+            observed.add(message["package_id"])
+            if message.get("target", {}).get("name") == "cloud-hypervisor" and message.get("executable"):
+                executable = True
+        if message.get("reason") == "build-finished":
+            completed = message.get("success") is True
+    require(completed and executable, "missing successful Cloud Hypervisor build report")
+    require(observed <= packages.keys(), "Cargo metadata omits an observed build package")
+    locked = {(p["name"], p["version"], p.get("source")): p for p in lock["package"]}
+    rows = []
+    for identifier in sorted(observed):
+        package = packages[identifier]
+        source = package.get("source")
+        if source is None:
+            require(Path(package["manifest_path"]).resolve().is_relative_to(source_root.resolve()),
+                    "local Cargo dependency escaped the selected Cloud Hypervisor source")
+            continue  # Covered by the freshly extracted/patched CH source material.
+        key = package["name"], package["version"], source
+        require(key in locked, "observed Cargo package is absent from Cargo.lock")
+        label = f"rust/{package['name']}@{package['version']}"
+        require(safe_relative(label), "unsafe Cargo package identity")
+        directory = stage / "share" / "licenses" / "sandboxer" / label
+        if source == "registry+https://github.com/rust-lang/crates.io-index":
+            url, integrity = registry_materials(package, locked[key], cargo_home, directory)
+        elif source.startswith("git+https://"):
+            url, integrity = git_materials(package, locked[key], directory)
+        else:
+            raise ValueError("unsupported Rust release source: " + source)
+        rows.append(["bin/cloud-hypervisor", "rust-build-input:" + package["name"],
+                     package["version"], url, integrity, "share/licenses/sandboxer/" + label])
+    require(rows, "Cloud Hypervisor build report contains no external crates")
+    return rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("metadata", "build-report", "lock", "cargo-home", "source-root", "stage"):
+        parser.add_argument("--" + name, type=Path, required=True)
+    args = parser.parse_args()
+    rows = collect(json.loads(args.metadata.read_text()), args.build_report.read_text(),
+                   tomllib.loads(args.lock.read_text()), args.cargo_home, args.source_root, args.stage)
+    rows.append(rust_toolchain_materials(args.stage))
+    for row in rows:
+        require(all(value and "\n" not in value and "\t" not in value for value in row),
+                "invalid Rust source material field")
+        print("\t".join(row))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as error:
+        raise SystemExit("release Rust materials: " + str(error))

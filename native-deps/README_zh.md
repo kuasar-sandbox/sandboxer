@@ -45,6 +45,20 @@ make cloud-hypervisor TARGET_ARCH=aarch64
 `bin/<arch>/cloud-hypervisor` 或执行 `make clean` 后重跑。格式化 patch 本身不会使
 已有 binary 失效。`make clean` 删除 native 构建输出与 bin,保留 patch 源码工作区和 tarball 缓存。
 
+发行打包不复用上述开发二进制或 patch 工作区。它把选定的 sandboxer commit
+解到临时目录,验证 pin 的 Cloud Hypervisor tarball、应用该 commit 的 patch,
+再用本次所属的私有 Cargo home 按锁文件重新构建。Python 3.11 或更新版本从
+实际 Cargo 构建报告采集来源材料:registry crate 归档必须匹配 `Cargo.lock`
+checksum,Git 依赖必须匹配锁文件中的完整 commit。清单只列本次实际构建输入,
+包括构建期和过程宏依赖;不表示所列每个 crate 的代码都进入交付物。可修改的
+解压缓存不是 registry 许可证的权威来源。
+
+组件归档按组件目录隔离这些 crate 的许可/NOTICE 文件及 Rust 工具链的版权和
+许可材料。未知来源、材料缺失、归档被改动或构建未成功都会导致打包失败。
+发行打包器不接受 `RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR` 和上游 tarball 环境覆盖项;
+源码开发仍可通过 Makefile 覆盖输入。变更 pin 必须同时更新、验证构建配方和来源
+记录。这些检查支持发行检视,不构成法律认证。
+
 ## 3. Patch 开发循环
 
 ```bash

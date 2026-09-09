@@ -15,6 +15,7 @@ fail() {
 source "$ROOT/scripts/release-materials.sh"
 
 bash "$ROOT/scripts/test-release-materials.sh"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-rust-materials.py"
 
 init_fixture_repo() {
   local directory="$1"
@@ -256,15 +257,17 @@ done
 mkdir -p "$TMP/bin" "$TMP/src" "$TMP/cloud-hypervisor/LICENSES" \
   "$TMP/accelerator" "$TMP/connector"
 fixture_root="$TMP/project"
-mkdir -p "$fixture_root/scripts"
+mkdir -p "$fixture_root/scripts" "$fixture_root/native-deps"
 install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
 printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
 install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
+install -m 0644 "$ROOT/scripts/release-rust-materials.py" "$fixture_root/scripts/release-rust-materials.py"
+install -m 0644 "$ROOT/native-deps/Makefile" "$fixture_root/native-deps/Makefile"
 printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
 printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
-fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts go.mod main.go)"
+fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts native-deps/Makefile go.mod main.go)"
 (cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" .)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
 printf '// dirty fixture\n' >> "$fixture_root/main.go"
@@ -295,8 +298,56 @@ printf 'fixture connector license\n' > "$TMP/connector/LICENSE"
 accelerator_sha="$(init_fixture_repo "$TMP/accelerator" LICENSE)"
 connector_sha="$(init_fixture_repo "$TMP/connector" LICENSE)"
 
-SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
-  RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR="$TMP/cloud-hypervisor" \
+mkdir -p "$TMP/release-build-bin" "$TMP/crate/fixture-1.0.0" "$TMP/rust/share/doc/rust/licenses"
+printf 'fixture Rust crate license\n' > "$TMP/crate/fixture-1.0.0/LICENSE"
+tar -czf "$TMP/fixture-1.0.0.crate" -C "$TMP/crate" fixture-1.0.0
+printf 'fixture Rust standard library copyright\n' > "$TMP/rust/share/doc/rust/COPYRIGHT-library.html"
+printf 'fixture Rust toolchain license\n' > "$TMP/rust/share/doc/rust/licenses/Apache-2.0.txt"
+cat > "$TMP/release-build-bin/make" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+while [ "$#" -gt 0 ] && [ "$1" != -C ]; do shift; done
+[ "$1" = -C ]
+root="$2"
+[[ "$root" == */native-build/native-deps ]]
+source="$root/build/src/cloud-hypervisor"
+[ ! -e "$source" ]
+mkdir -p "$source/LICENSES" "$root/bin/x86_64" "$CARGO_HOME/registry/cache/fixture"
+cp "$RELEASE_TEST_CH_SOURCE/CREDITS.md" "$source/"
+cp "$RELEASE_TEST_CH_SOURCE/LICENSES/"* "$source/LICENSES/"
+cp "$RELEASE_TEST_CRATE" "$CARGO_HOME/registry/cache/fixture/fixture-1.0.0.crate"
+printf '[workspace]\n' > "$source/Cargo.toml"
+printf 'version = 3\n[[package]]\nname = "fixture"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "%s"\n' \
+  "$(sha256sum "$RELEASE_TEST_CRATE" | awk '{print $1}')" > "$source/Cargo.lock"
+printf '#!/bin/sh\n# fresh native fixture\nexit 0\n' > "$root/bin/x86_64/cloud-hypervisor"
+chmod 0755 "$root/bin/x86_64/cloud-hypervisor"
+printf '%s\n' \
+  '{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#fixture@1.0.0","target":{"name":"cloud-hypervisor"},"executable":"/fixture/cloud-hypervisor"}' \
+  '{"reason":"build-finished","success":true}' > "$CH_BUILD_REPORT"
+EOF
+cat > "$TMP/release-build-bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = metadata ]
+printf '%s\n' '{"packages":[{"name":"fixture","version":"1.0.0","id":"registry+https://github.com/rust-lang/crates.io-index#fixture@1.0.0","source":"registry+https://github.com/rust-lang/crates.io-index","manifest_path":"/fixture/fixture-1.0.0/Cargo.toml","license_file":null}]}'
+EOF
+cat > "$TMP/release-build-bin/rustc" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1" = -vV ]; then
+  printf 'rustc 1.0.0\nrelease: 1.0.0\ncommit-hash: 3333333333333333333333333333333333333333\n'
+elif [ "$1" = --print ] && [ "$2" = sysroot ]; then
+  printf '%s\n' "$RELEASE_TEST_RUST_ROOT"
+else exit 1; fi
+EOF
+chmod 0755 "$TMP/release-build-bin/make" "$TMP/release-build-bin/cargo" "$TMP/release-build-bin/rustc"
+native_fixture_env=(
+  PATH="$TMP/release-build-bin:$PATH"
+  RELEASE_TEST_CH_SOURCE="$TMP/cloud-hypervisor"
+  RELEASE_TEST_CRATE="$TMP/fixture-1.0.0.crate"
+  RELEASE_TEST_RUST_ROOT="$TMP/rust"
+)
+env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
   RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
   RELEASE_ACCELERATOR_VERSION=v0.1.3 \
@@ -334,8 +385,7 @@ tar -xOf "$archive" ./share/sources/sandboxer/SOURCES.tsv \
   | grep -Fq $'\tGo toolchain\t'"$go_toolchain"$'\t' \
   || fail "archive does not associate its Go toolchain with license material"
 
-SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
-  RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR="$TMP/cloud-hypervisor" \
+env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
   RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
   RELEASE_ACCELERATOR_VERSION=v0.1.3 \

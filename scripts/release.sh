@@ -67,6 +67,35 @@ validate_archive_contract() {
     || fail "$archive violates the exact entry contract"
 }
 
+prepare_cloud_hypervisor() {
+  local project_sha="$1" arch="$2" native_root="$WORK/native-build/native-deps" variable
+  for variable in RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR CLOUD_HYPERVISOR_TARBALL \
+    CLOUD_HYPERVISOR_TARBALL_SHA256; do
+    [ -z "${!variable:-}" ] || fail "$variable override is not supported by release source materials"
+  done
+  [ "$(sed -n 's/^CLOUD_HYPERVISOR_TARBALL  *?= //p' "$ROOT/native-deps/Makefile")" = \
+    'https://codeload.github.com/cloud-hypervisor/cloud-hypervisor/tar.gz/refs/tags/v51.1\#cloud-hypervisor-51.1.tar.gz' ] \
+    || fail "Cloud Hypervisor source pin differs from its release source record"
+  [ "$(sed -n 's/^CLOUD_HYPERVISOR_TARBALL_SHA256 *?= //p' "$ROOT/native-deps/Makefile")" = \
+    a2393046c0230f6360792ed2ef1b60968aa4e04d12b6be419c86306774e2e4ef ] \
+    || fail "Cloud Hypervisor source checksum differs from its release source record"
+  mkdir -p "$WORK/native-build" "$WORK/cargo-home"
+  chmod 0700 "$WORK/cargo-home"
+  git -C "$ROOT" archive "$project_sha" native-deps | tar -x -C "$WORK/native-build"
+  local native_env=(
+    env -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES
+    CARGO_HOME="$WORK/cargo-home" CARGO_NET_GIT_FETCH_WITH_CLI=true
+    CH_BUILD_REPORT="$WORK/ch-build.jsonl"
+  )
+  "${native_env[@]}" make --no-print-directory -C "$native_root" \
+    TARGET_ARCH="$arch" TARBALL_DIR="$ROOT/native-deps/build/tarball" ch-patches-apply ch-build
+  CH_RELEASE_SOURCE="$native_root/build/src/cloud-hypervisor"
+  copy_executable "$native_root/bin/$arch/cloud-hypervisor" bin/cloud-hypervisor
+  "${native_env[@]}" cargo metadata --locked --format-version=1 \
+    --filter-platform "$arch-unknown-linux-gnu" \
+    --manifest-path "$CH_RELEASE_SOURCE/Cargo.toml" > "$WORK/ch-metadata.json"
+}
+
 validate_bundle() {
   [ "$#" -eq 3 ] || fail "usage: release.sh validate <version> <arch> <bundle-dir>"
   local version="$1" arch archive bundle="$3"
@@ -102,6 +131,9 @@ validate_bundle() {
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor' "v51.1"
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-patches' "$version"
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-cargo-lock' "v51.1"
+  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'Rust toolchain' ""
+  awk -F '\t' '$1 == "bin/cloud-hypervisor" && $2 ~ /^rust-build-input:/ {found=1} END {exit !found}' \
+    "$extract/share/sources/$NAME/SOURCES.tsv" || fail "Rust dependency materials are missing"
   release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'accelerator' ""
   release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'connector' ""
   release_materials_require_go "$extract" "$NAME" 'bin/sandbox-ctl'
@@ -134,11 +166,9 @@ package_release() {
   bin_dir="${RELEASE_BIN_DIR:-$ROOT/bin/$arch}"
   copy_executable "$bin_dir/sandbox-ctl" bin/sandbox-ctl
   copy_executable "$bin_dir/sandbox-init" bin/sandbox-init
-  copy_executable "$bin_dir/cloud-hypervisor" bin/cloud-hypervisor
   check_go_binary "$STAGE/bin/sandbox-ctl"
   check_go_binary "$STAGE/bin/sandbox-init"
 
-  ch_source="${RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR:-$ROOT/native-deps/build/src/cloud-hypervisor}"
   accelerator_source="${RELEASE_ACCELERATOR_SOURCE_DIR:-$ROOT/../accelerator}"
   connector_source="${RELEASE_CONNECTOR_SOURCE_DIR:-$ROOT/../connector}"
   accelerator_version="${RELEASE_ACCELERATOR_VERSION:-${ACCELERATOR_VERSION:-}}"
@@ -147,10 +177,11 @@ package_release() {
     || fail "RELEASE_ACCELERATOR_VERSION must identify the selected accelerator release"
   [[ "$connector_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
     || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
-  [ -f "$ch_source/Cargo.lock" ] || fail "Cloud Hypervisor Cargo.lock is missing from $ch_source"
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" sandboxer)"
   release_materials_require_go_revision "$STAGE/bin/sandbox-ctl" "$project_sha"
   release_materials_require_go_revision "$STAGE/bin/sandbox-init" "$project_sha"
+  prepare_cloud_hypervisor "$project_sha" "$arch"
+  ch_source="$CH_RELEASE_SOURCE"
   accelerator_sha="$(release_materials_resolve_git_source "$accelerator_source" \
     "${RELEASE_ACCELERATOR_SOURCE_SHA:-}" accelerator)"
   connector_sha="$(release_materials_resolve_git_source "$connector_source" \
@@ -163,6 +194,10 @@ package_release() {
   release_materials_copy_licenses "$ch_source" cloud-hypervisor
   release_materials_copy_licenses "$accelerator_source" accelerator
   release_materials_copy_licenses "$connector_source" connector
+  python3 "$ROOT/scripts/release-rust-materials.py" \
+    --metadata "$WORK/ch-metadata.json" --build-report "$WORK/ch-build.jsonl" \
+    --lock "$ch_source/Cargo.lock" --cargo-home "$WORK/cargo-home" \
+    --source-root "$ch_source" --stage "$STAGE" >> "$RELEASE_MATERIALS_WORK/sources"
   install -m 0644 "$ch_source/Cargo.lock" \
     "$STAGE/share/sources/$NAME/CLOUD-HYPERVISOR-Cargo.lock"
   release_materials_record_source 'bin/sandbox-ctl,bin/sandbox-init' sandboxer "$version" \
