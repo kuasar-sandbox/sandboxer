@@ -63,6 +63,10 @@ Editable extracted cache files are not the authority for registry licenses.
 Only credential-free HTTPS registry routing from the caller's Cargo source
 configuration is carried into the private home. Tokens, credential providers,
 build wrappers and directory/git source overrides are not copied.
+The published `vhost` crate omits its workspace-root licenses. Its supplemental
+files come from the exact Git commit in its checksum-verified Cargo VCS record,
+after comparing the upstream package manifest with `Cargo.toml.orig` from that
+crate. No current branch or separately maintained version list selects them.
 
 The component archive carries those crates' license/notice files and the Rust
 toolchain's copyright and license materials in component-specific directories.

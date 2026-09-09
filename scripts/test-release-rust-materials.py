@@ -10,6 +10,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("materials", Path(__file__).with_name("release-rust-materials.py"))
 materials = importlib.util.module_from_spec(spec)
@@ -71,6 +72,46 @@ class MaterialsTests(unittest.TestCase):
         lock["package"][0]["checksum"] = "0" * 64
         with self.assertRaisesRegex(ValueError, "checksum"):
             self.collect(lock=lock)
+
+    def test_unshipped_test_filename_is_not_a_license_path(self):
+        with tarfile.open(self.archive, "w:gz") as archive:
+            for name in ("LICENSE", "tests/!complex-expressions/example.rs"):
+                contents = b"fixture\n"
+                member = tarfile.TarInfo("fixture-1.0.0/" + name)
+                member.size = len(contents)
+                archive.addfile(member, io.BytesIO(contents))
+        self.lock["package"][0]["checksum"] = hashlib.sha256(self.archive.read_bytes()).hexdigest()
+        self.collect()
+        self.assertFalse((self.root / "stage/share/licenses/sandboxer/rust/fixture@1.0.0/tests").exists())
+
+    def test_license_traversal_still_rejected(self):
+        with tarfile.open(self.archive, "w:gz") as archive:
+            member = tarfile.TarInfo("fixture-1.0.0/../LICENSE")
+            member.size = 8
+            archive.addfile(member, io.BytesIO(b"fixture\n"))
+        self.lock["package"][0]["checksum"] = hashlib.sha256(self.archive.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "unsafe"):
+            self.collect()
+
+    def test_vhost_workspace_licenses_match_the_published_manifest(self):
+        archive = self.root / "vhost-0.14.0.crate"
+        original = b'[package]\nname="vhost"\nversion="0.14.0"\n'
+        vcs = json.dumps({"git": {"sha1": "1" * 40}, "path_in_vcs": "vhost"}).encode()
+        with tarfile.open(archive, "w:gz") as output:
+            for name, value in ((".cargo_vcs_info.json", vcs), ("Cargo.toml.orig", original)):
+                member = tarfile.TarInfo("vhost-0.14.0/" + name)
+                member.size = len(value)
+                output.addfile(member, io.BytesIO(value))
+        package = {"name": "vhost", "version": "0.14.0", "repository": "https://github.com/rust-vmm/vhost"}
+        destination = self.root / "vhost-material"
+        with patch.object(materials, "urlopen", side_effect=lambda url, timeout: io.BytesIO(
+                original if url.endswith("vhost/Cargo.toml") else b"fixture upstream license\n")):
+            identity = materials.vhost_workspace_materials(package, archive, destination)
+        self.assertEqual(identity, ";license-source-git:" + "1" * 40)
+        self.assertTrue((destination / "upstream/LICENSE-BSD-3-Clause").is_file())
+        with patch.object(materials, "urlopen", return_value=io.BytesIO(b"different manifest")):
+            with self.assertRaisesRegex(ValueError, "differs"):
+                materials.vhost_workspace_materials(package, archive, destination)
 
     def test_failed_build_and_missing_package_rejected(self):
         messages = copy.deepcopy(self.messages)

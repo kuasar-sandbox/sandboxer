@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tomllib
 from urllib.parse import urlsplit
+from urllib.request import urlopen
 
 
 def require(condition, message):
@@ -79,6 +80,33 @@ def put_material(destination, relative, contents):
     target.chmod(0o644)
 
 
+def vhost_workspace_materials(package, archive, destination):
+    # The published vhost crate omits the workspace-root license files.
+    # Its checksum-bound Cargo VCS record selects the exact upstream revision;
+    # also compare the original manifest before collecting those root files.
+    require(package["name"] == "vhost" and package.get("repository") == "https://github.com/rust-vmm/vhost",
+            "crate contains no license/notice material: " + package["name"] + "@" + package["version"])
+    prefix = package["name"] + "-" + package["version"] + "/"
+    with tarfile.open(archive) as source:
+        def read_member(name):
+            member = source.getmember(prefix + name)
+            require(member.isfile(), "invalid vhost source identity member")
+            return source.extractfile(member).read()
+        vcs = json.loads(read_member(".cargo_vcs_info.json"))
+        original_manifest = read_member("Cargo.toml.orig")
+    commit = vcs.get("git", {}).get("sha1", "")
+    require(re.fullmatch(r"[0-9a-f]{40}", commit) and not vcs.get("git", {}).get("dirty", False)
+            and vcs.get("path_in_vcs") == "vhost", "unverifiable vhost workspace source")
+    base = "https://raw.githubusercontent.com/rust-vmm/vhost/" + commit + "/"
+    def download(name):
+        with urlopen(base + name, timeout=30) as response:
+            return response.read()
+    require(download("vhost/Cargo.toml") == original_manifest, "vhost workspace manifest differs from crate")
+    for name in ("LICENSE", "LICENSE-BSD-3-Clause"):
+        put_material(destination, "upstream/" + name, download(name))
+    return ";license-source-git:" + commit
+
+
 def registry_materials(package, locked, cargo_home, destination):
     name, version = package["name"], package["version"]
     checksum = locked.get("checksum", "")
@@ -90,7 +118,11 @@ def registry_materials(package, locked, cargo_home, destination):
             f"crate archive checksum mismatch: {name}@{version}")
     declared = package.get("license_file")
     if declared:
-        declared = str(Path(declared).relative_to(Path(package["manifest_path"]).parent))
+        declared_path = Path(declared)
+        if declared_path.is_absolute():
+            declared_path = declared_path.relative_to(Path(package["manifest_path"]).parent)
+        declared = declared_path.as_posix()
+        require(safe_relative(declared), "unsafe declared Rust license path")
     count = 0
     with tarfile.open(archive) as source:
         for member in source:
@@ -99,12 +131,13 @@ def registry_materials(package, locked, cargo_home, destination):
             relative = "/".join(parts[1:])
             if not relative or member.isdir():
                 continue
-            require(safe_relative(relative) and member.isfile(), "unsafe crate archive member")
-            if material_name(relative, declared):
-                put_material(destination, relative, source.extractfile(member).read())
-                count += 1
-    require(count, f"crate contains no license/notice material: {name}@{version}")
-    return f"https://static.crates.io/crates/{name}/{name}-{version}.crate", "sha256:" + checksum
+            if not material_name(relative, declared):
+                continue  # Not extracted or read; upstream test filenames may contain '!'.
+            require(safe_relative(relative) and member.isfile(), "unsafe Rust license archive member")
+            put_material(destination, relative, source.extractfile(member).read())
+            count += 1
+    supplemental = "" if count else vhost_workspace_materials(package, archive, destination)
+    return f"https://static.crates.io/crates/{name}/{name}-{version}.crate", "sha256:" + checksum + supplemental
 
 
 def git_materials(package, locked, destination):
