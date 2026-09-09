@@ -324,7 +324,10 @@ def collect(metadata, build_report, lock, cargo_home, source_root, stage):
             continue  # Covered by the freshly extracted/patched CH source material.
         key = package["name"], package["version"], source
         require(key in locked, "observed Cargo package is absent from Cargo.lock")
-        label = f"rust/{package['name']}@{package['version']}"
+        # Cargo permits a registry package and a Git fork with the same name
+        # and version in one graph. Keep their notices in distinct namespaces.
+        source_digest = hashlib.sha256(source.encode()).hexdigest()
+        label = f"rust/{package['name']}@{package['version']}/source-{source_digest}"
         require(safe_relative(label), "unsafe Cargo package identity")
         directory = stage / "share" / "licenses" / "sandboxer" / label
         if source == "registry+https://github.com/rust-lang/crates.io-index":

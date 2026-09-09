@@ -90,6 +90,9 @@ crate. No current branch or separately maintained version list selects them.
 
 The component archive carries those crates' license/notice files and the Rust
 toolchain's copyright and license materials in component-specific directories.
+Crate directories also include a digest of the complete Cargo source identity,
+so same-name/version packages from different registries or Git commits do not
+overwrite one another's license files.
 Rustup's standard-library notices or matching installed Debian/RPM source-package
 notices are collected; missing toolchain documentation fails with an installation
 hint. `RUST-STDLIB.tsv` lists the sysroot-relative paths and SHA-256 digests of the

@@ -51,7 +51,8 @@ class MaterialsTests(unittest.TestCase):
     def test_archive_license_and_namespace(self):
         rows = self.collect()
         self.assertEqual(rows[0][1], "rust-build-input:fixture")
-        path = self.root / "stage/share/licenses/sandboxer/rust/fixture@1.0.0/LICENSE"
+        label = "source-" + hashlib.sha256(self.registry.encode()).hexdigest()
+        path = self.root / "stage/share/licenses/sandboxer/rust/fixture@1.0.0" / label / "LICENSE"
         self.assertEqual(path.read_text(), "fixture license\n")
         self.assertEqual(path.stat().st_mode & 0o777, 0o644)
 
@@ -160,6 +161,29 @@ class MaterialsTests(unittest.TestCase):
             materials.git_materials(package, locked, destination)
         with self.assertRaisesRegex(ValueError, "differs"):
             materials.git_materials(package, {"source": "git+https://example.invalid/fixture#" + "0" * 40}, destination)
+
+    def test_same_name_version_with_distinct_sources_keeps_both_licenses(self):
+        git_root = self.root / "git-fork"
+        git_root.mkdir()
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(git_root), *args], text=True).strip()
+        git("init", "-q")
+        git("config", "--local", "user.name", "Chen Xiaohui")
+        git("config", "--local", "user.email", "graych@gmail.com")
+        (git_root / "LICENSE").write_text("distinct Git fork license\n")
+        (git_root / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="1.0.0"\n')
+        git("add", "--", "LICENSE", "Cargo.toml")
+        git("commit", "-qm", "test: create same-name Cargo source fixture")
+        source = "git+https://example.invalid/fixture#" + git("rev-parse", "HEAD")
+        package = {**self.package, "id": source, "source": source,
+                   "manifest_path": str(git_root / "Cargo.toml")}
+        metadata = {"packages": [self.package, package]}
+        lock = {"package": [*self.lock["package"], {"name": "fixture", "version": "1.0.0", "source": source}]}
+        messages = [*self.messages, {"reason": "compiler-artifact", "package_id": source}]
+        rows = self.collect(metadata, messages, lock)
+        self.assertEqual(len({row[5] for row in rows}), 2)
+        licenses = {(self.root / "stage" / row[5] / "LICENSE").read_text() for row in rows}
+        self.assertEqual(licenses, {"fixture license\n", "distinct Git fork license\n"})
 
     def test_cargo_configuration_excludes_credentials(self):
         original, destination = self.root / "original-home", self.root / "private-home"

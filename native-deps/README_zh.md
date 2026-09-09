@@ -74,6 +74,8 @@ Token、凭据提供器、构建包装器或 directory/git source 覆盖项。
 
 组件归档按组件目录隔离这些 crate 的许可/NOTICE 文件及 Rust 工具链的版权和
 许可材料。未知来源、材料缺失、归档被改动或构建未成功都会导致打包失败。
+crate 目录还包含完整 Cargo 来源身份的摘要,不同 registry 或 Git commit 中同名、
+同版本的包不会相互覆盖许可文件。
 采集 rustup 标准库声明或已安装的同源 Debian/RPM 包声明;工具链文档缺失时
 会给出安装提示并拒绝打包。`RUST-STDLIB.tsv` 列出最终链接映射选中的标准库
 `.rlib` 输入相对 sysroot 的路径及 SHA-256,其清单摘要绑定到 Rust 工具链记录。
