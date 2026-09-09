@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from usage import autonomous_balloon_prefix
+from usage import Sandbox, autonomous_balloon_prefix
 import usage_perf
 import usage_trace
 import usage_faults
@@ -34,6 +34,21 @@ class BalloonWitnessTests(unittest.TestCase):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_stop_cli_spawn_failure_still_reaps_owned_vm(self):
+        sb = Sandbox.__new__(Sandbox)
+        sb.process, sb.log = unittest.mock.Mock(), io.StringIO()
+        sb.process.pid, sb.process.returncode = 123, 0
+        sb.process.poll.return_value = None
+        original = OSError(errno.EMFILE, "cannot start stop CLI")
+        sb.cli = unittest.mock.Mock(side_effect=original)
+        with patch("usage.os.killpg") as kill:
+            with self.assertRaises(OSError) as caught:
+                sb.stop()
+        self.assertIs(caught.exception, original)
+        kill.assert_called_once_with(123, usage_faults.signal.SIGTERM)
+        sb.process.wait.assert_called_once_with(timeout=20)
+        self.assertTrue(sb.log.closed)
+
     def test_all_vms_stopped_without_masking_readiness_failure(self):
         instances, stopped = [], []
 

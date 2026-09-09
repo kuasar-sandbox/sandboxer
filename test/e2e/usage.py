@@ -107,11 +107,14 @@ class Sandbox:
             connection.close()
 
     def stop(self):
+        command_error = None
         try:
             if self.process.poll() is None:
                 try:
                     self.cli("exec", "--", "/probe", "exit")
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+                    if isinstance(error, OSError):
+                        command_error = error
                     try:
                         os.killpg(self.process.pid, signal.SIGTERM)
                     except ProcessLookupError:
@@ -126,6 +129,8 @@ class Sandbox:
                     self.process.wait(timeout=5)
         finally:
             self.log.close()
+        if command_error is not None:
+            raise command_error
         assert self.process.returncode == 0, f"sandbox exit={self.process.returncode}; log={self.dir / 'run.log'}"
 
 
