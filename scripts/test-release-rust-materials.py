@@ -67,6 +67,15 @@ class MaterialsTests(unittest.TestCase):
         (extracted / "LICENSE").write_text("changed extracted cache")
         self.test_archive_license_and_namespace()
 
+    def test_relative_and_absolute_declared_license_paths(self):
+        for declared in ("LICENSE", str(Path(self.package["manifest_path"]).parent / "LICENSE")):
+            metadata = copy.deepcopy(self.metadata)
+            metadata["packages"][0]["license_file"] = declared
+            self.collect(metadata=metadata)
+        metadata["packages"][0]["license_file"] = "../LICENSE"
+        with self.assertRaisesRegex(ValueError, "unsafe"):
+            self.collect(metadata=metadata)
+
     def test_other_lock_checksum_rejected(self):
         lock = copy.deepcopy(self.lock)
         lock["package"][0]["checksum"] = "0" * 64
@@ -167,6 +176,21 @@ class MaterialsTests(unittest.TestCase):
         self.assertNotIn("wrapper", copied)
         self.assertEqual((destination / "config.toml").stat().st_mode & 0o777, 0o600)
         self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+
+    def test_build_environment_does_not_inherit_credentials(self):
+        environment = materials.native_build_environment(
+            {"PATH": "/usr/bin", "CARGO_BUILD_JOBS": "2", "GH_TOKEN": "fixture",
+             "CARGO_REGISTRIES_CRATES_IO_TOKEN": "fixture", "AWS_SECRET_ACCESS_KEY": "fixture",
+             "CARGO_REGISTRY_CREDENTIAL_PROVIDER": "fixture", "SSH_AUTH_SOCK": "/fixture"},
+            self.root / "home", self.home, Path("/toolchain/bin/rustc"))
+        self.assertEqual(environment["RUSTC"], "/toolchain/bin/rustc")
+        self.assertEqual(environment["CARGO_BUILD_JOBS"], "2")
+        self.assertNotIn("fixture", environment.values())
+        self.assertNotIn("SSH_AUTH_SOCK", environment)
+        for name in ("RUSTC", "RUSTC_WRAPPER", "CARGO_BUILD_RUSTC"):
+            with self.assertRaisesRegex(ValueError, "does not accept"):
+                materials.native_build_environment({name: "fixture"}, self.root / "home", self.home,
+                                                   Path("/toolchain/bin/rustc"))
 
     def test_cargo_directory_and_authenticated_registry_rejected(self):
         original, destination = self.root / "original-home", self.root / "private-home"

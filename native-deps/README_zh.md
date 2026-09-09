@@ -54,12 +54,19 @@ checksum,Git 依赖必须匹配锁文件中的完整 commit。清单只列本次
 解压缓存不是 registry 许可证的权威来源。
 私有 Cargo home 只继承调用者源配置中无凭据的 HTTPS registry 路由,不复制
 Token、凭据提供器、构建包装器或 directory/git source 覆盖项。
+原生构建命令使用显式环境允许列表和私有 home,不继承 Cargo Token、云/发布凭据
+或 SSH agent 设置。发行打包拒绝编译器及 wrapper 覆盖;Cargo 和材料记录使用
+选定工具链的同一个精确 `rustc` 可执行文件,并记录其摘要。这是可信发行输入的
+凭据卫生措施,不能代替对不可信 CI 候选的隔离。
 已发布的 `vhost` crate 未包含 workspace 根许可证。补充文件取自通过 checksum
 验证的 crate 内 Cargo VCS 记录所指的精确 Git commit,且先将上游 package manifest
 与该 crate 的 `Cargo.toml.orig` 对比。不会按当前分支或另行维护的版本清单选取材料。
 
 组件归档按组件目录隔离这些 crate 的许可/NOTICE 文件及 Rust 工具链的版权和
 许可材料。未知来源、材料缺失、归档被改动或构建未成功都会导致打包失败。
+本次最终链接映射还用于选择 Cloud Hypervisor 实际使用的系统静态库和启动对象,
+收录其已安装源包标识、输入摘要、版权及引用的许可正文。本次构建临时对象仍由
+CH/Rust 来源记录覆盖。
 发行打包器不接受 `RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR` 和上游 tarball 环境覆盖项;
 源码开发仍可通过 Makefile 覆盖输入。变更 pin 必须同时更新、验证构建配方和来源
 记录。这些检查支持发行检视,不构成法律认证。

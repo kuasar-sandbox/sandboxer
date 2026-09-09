@@ -9,6 +9,7 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -55,6 +56,30 @@ def configure_cargo_home(original, destination):
     target = destination / "config.toml"
     target.write_text("\n".join(rendered))
     target.chmod(0o600)
+
+
+def native_build_environment(original, home, cargo_home, rustc):
+    """Pass build settings, not the caller's authentication environment."""
+    for name in ("RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+                 "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER",
+                 "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"):
+        require(not original.get(name), "release native build does not accept " + name)
+    allowed = {"PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
+               "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+               "http_proxy", "https_proxy", "all_proxy", "no_proxy", "CARGO_BUILD_JOBS"}
+    environment = {name: value for name, value in original.items() if name in allowed}
+    for name, value in environment.items():
+        if name.lower() in ("http_proxy", "https_proxy", "all_proxy"):
+            parsed = urlsplit(value)
+            require(parsed.username is None and parsed.password is None,
+                    "release native build does not pass authenticated proxy URLs")
+    home.mkdir(parents=True, exist_ok=True)
+    home.chmod(0o700)
+    environment.update(HOME=str(home), CARGO_HOME=str(cargo_home), RUSTC=str(rustc),
+                       PATH=str(rustc.parent) + os.pathsep + environment.get("PATH", os.defpath),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       CARGO_NET_GIT_FETCH_WITH_CLI="true")
+    return environment
 
 
 def safe_relative(value):
@@ -162,13 +187,13 @@ def git_materials(package, locked, destination):
     return source[4:].split("?", 1)[0].split("#", 1)[0], "git:" + commit
 
 
-def rust_toolchain_materials(stage):
-    info = subprocess.check_output(["rustc", "-vV"], text=True)
+def rust_toolchain_materials(stage, rustc):
+    info = subprocess.check_output([str(rustc), "-vV"], text=True)
     fields = dict(line.split(": ", 1) for line in info.splitlines() if ": " in line)
     version, commit = fields.get("release", ""), fields.get("commit-hash", "")
     require(re.fullmatch(r"[0-9a-f]{40}", commit), "Rust toolchain has no source commit")
     require(re.fullmatch(r"[0-9A-Za-z.+-]+", version), "invalid Rust toolchain version")
-    sysroot = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip())
+    sysroot = Path(subprocess.check_output([str(rustc), "--print", "sysroot"], text=True).strip())
     docs = sysroot / "share" / "doc" / "rust"
     destination = stage / "share" / "licenses" / "sandboxer" / "rust-toolchain" / version
     source = "https://github.com/rust-lang/rust/tree/" + commit
@@ -196,7 +221,8 @@ def rust_toolchain_materials(stage):
     for path, relative in paths:
         require(not path.is_symlink(), "Rust toolchain license material is a symbolic link")
         put_material(destination, relative, path.read_bytes())
-    return ["bin/cloud-hypervisor", "Rust toolchain", version, source, "git:" + commit,
+    return ["bin/cloud-hypervisor", "Rust toolchain", version, source,
+            "git:" + commit + ";compiler-sha256:" + hashlib.sha256(rustc.read_bytes()).hexdigest(),
             "share/licenses/sandboxer/rust-toolchain/" + version]
 
 
@@ -245,13 +271,17 @@ def main():
     if len(sys.argv) == 4 and sys.argv[1] == "configure-cargo-home":
         configure_cargo_home(Path(sys.argv[2]), Path(sys.argv[3]))
         return
+    if len(sys.argv) >= 6 and sys.argv[1] == "run-native":
+        environment = native_build_environment(os.environ, *map(Path, sys.argv[2:5]))
+        subprocess.run(sys.argv[5:], env=environment, check=True)
+        return
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("metadata", "build-report", "lock", "cargo-home", "source-root", "stage"):
+    for name in ("metadata", "build-report", "lock", "cargo-home", "source-root", "stage", "rustc"):
         parser.add_argument("--" + name, type=Path, required=True)
     args = parser.parse_args()
     rows = collect(json.loads(args.metadata.read_text()), args.build_report.read_text(),
                    tomllib.loads(args.lock.read_text()), args.cargo_home, args.source_root, args.stage)
-    rows.append(rust_toolchain_materials(args.stage))
+    rows.append(rust_toolchain_materials(args.stage, args.rustc))
     for row in rows:
         require(all(value and "\n" not in value and "\t" not in value for value in row),
                 "invalid Rust source material field")

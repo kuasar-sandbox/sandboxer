@@ -17,6 +17,7 @@ source "$ROOT/scripts/release-materials.sh"
 bash "$ROOT/scripts/test-release-materials.sh"
 bash "$ROOT/native-deps/deps/test-common.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-rust-materials.py"
+bash "$ROOT/scripts/test-release-native-materials.sh"
 
 init_fixture_repo() {
   local directory="$1"
@@ -265,6 +266,7 @@ install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
 install -m 0644 "$ROOT/scripts/release-rust-materials.py" "$fixture_root/scripts/release-rust-materials.py"
+install -m 0644 "$ROOT/scripts/release-native-materials.sh" "$fixture_root/scripts/release-native-materials.sh"
 install -m 0644 "$ROOT/native-deps/Makefile" "$fixture_root/native-deps/Makefile"
 printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
 printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
@@ -307,6 +309,12 @@ printf 'fixture Rust toolchain license\n' > "$TMP/rust/share/doc/rust/licenses/A
 cat > "$TMP/release-build-bin/make" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+fixture_root="$(cd "$(dirname "$0")/.." && pwd)"
+RELEASE_TEST_CH_SOURCE="$fixture_root/cloud-hypervisor"
+RELEASE_TEST_CRATE="$fixture_root/fixture-1.0.0.crate"
+[ -z "${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}" ]
+[ -z "${GH_TOKEN:-}" ]
+"$RUSTC" -vV >/dev/null
 while [ "$#" -gt 0 ] && [ "$1" != -C ]; do shift; done
 [ "$1" = -C ]
 root="$2"
@@ -325,6 +333,7 @@ chmod 0755 "$root/bin/x86_64/cloud-hypervisor"
 printf '%s\n' \
   '{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#fixture@1.0.0","target":{"name":"cloud-hypervisor"},"executable":"/fixture/cloud-hypervisor"}' \
   '{"reason":"build-finished","success":true}' > "$CH_BUILD_REPORT"
+printf 'LOAD %s\n' "$fixture_root/system/fixture.o" > "$CH_LINK_MAP"
 EOF
 cat > "$TMP/release-build-bin/cargo" <<'EOF'
 #!/usr/bin/env bash
@@ -338,15 +347,35 @@ set -euo pipefail
 if [ "$1" = -vV ]; then
   printf 'rustc 1.0.0\nrelease: 1.0.0\ncommit-hash: 3333333333333333333333333333333333333333\n'
 elif [ "$1" = --print ] && [ "$2" = sysroot ]; then
-  printf '%s\n' "$RELEASE_TEST_RUST_ROOT"
+  cd "$(dirname "$(readlink -f "$0")")/.." && pwd
 else exit 1; fi
 EOF
+mkdir -p "$TMP/rust/bin" "$TMP/system"
+install -m 0755 "$TMP/release-build-bin/rustc" "$TMP/rust/bin/rustc"
+printf 'fixture static object\n' > "$TMP/system/fixture.o"
+printf 'fixture system license\n' > "$TMP/system/LICENSE"
+cat > "$TMP/release-build-bin/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+cat > "$TMP/release-build-bin/rpm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  -qf) printf 'fixture-native\t1.0-1\tfixture-native-1.0-1.src.rpm\n' ;;
+  -qa) printf 'fixture-native.x86_64\tfixture-native-1.0-1.src.rpm\n' ;;
+  -ql) printf '%s/system/LICENSE\n' "$(cd "$(dirname "$0")/.." && pwd)" ;;
+  *) exit 1 ;;
+esac
+EOF
+rm "$TMP/release-build-bin/rustc"
+ln -s ../rust/bin/rustc "$TMP/release-build-bin/rustc"
 chmod 0755 "$TMP/release-build-bin/make" "$TMP/release-build-bin/cargo" "$TMP/release-build-bin/rustc"
+chmod 0755 "$TMP/release-build-bin/dpkg-query" "$TMP/release-build-bin/rpm"
 native_fixture_env=(
   PATH="$TMP/release-build-bin:$PATH"
-  RELEASE_TEST_CH_SOURCE="$TMP/cloud-hypervisor"
-  RELEASE_TEST_CRATE="$TMP/fixture-1.0.0.crate"
-  RELEASE_TEST_RUST_ROOT="$TMP/rust"
+  CARGO_REGISTRIES_CRATES_IO_TOKEN=fixture-must-not-reach-build
+  GH_TOKEN=fixture-must-not-reach-build
 )
 env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \

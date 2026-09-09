@@ -63,6 +63,12 @@ Editable extracted cache files are not the authority for registry licenses.
 Only credential-free HTTPS registry routing from the caller's Cargo source
 configuration is carried into the private home. Tokens, credential providers,
 build wrappers and directory/git source overrides are not copied.
+Native build commands receive an explicit environment allowlist and a private
+home: Cargo tokens, cloud/release credentials and SSH-agent settings are not
+inherited. Compiler/wrapper overrides are rejected for release packaging; the
+selected toolchain's exact `rustc` executable is used both for Cargo and the
+material record, including its digest. This is credential hygiene for trusted
+release inputs, not a substitute for isolating untrusted CI candidates.
 The published `vhost` crate omits its workspace-root licenses. Its supplemental
 files come from the exact Git commit in its checksum-verified Cargo VCS record,
 after comparing the upstream package manifest with `Cargo.toml.orig` from that
@@ -70,6 +76,10 @@ crate. No current branch or separately maintained version list selects them.
 
 The component archive carries those crates' license/notice files and the Rust
 toolchain's copyright and license materials in component-specific directories.
+The fresh final-link map also selects the system static libraries and startup
+objects actually used by Cloud Hypervisor. Their installed source-package
+identities, input digests, copyright and referenced license texts are included;
+temporary objects from this build remain covered by the CH/Rust source records.
 Unknown sources, missing materials, altered archives, and unsuccessful builds
 fail packaging. Existing `RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR` and upstream
 tarball environment overrides are not accepted by the release packager; source

@@ -9,6 +9,8 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
+# shellcheck source=scripts/release-native-materials.sh
+source "$ROOT/scripts/release-native-materials.sh"
 
 fail() {
   echo "release: $*" >&2
@@ -79,15 +81,18 @@ prepare_cloud_hypervisor() {
   [ "$(sed -n 's/^CLOUD_HYPERVISOR_TARBALL_SHA256 *?= //p' "$ROOT/native-deps/Makefile")" = \
     a2393046c0230f6360792ed2ef1b60968aa4e04d12b6be419c86306774e2e4ef ] \
     || fail "Cloud Hypervisor source checksum differs from its release source record"
-  mkdir -p "$WORK/native-build" "$WORK/cargo-home"
+  mkdir -p "$WORK/native-build" "$WORK/cargo-home" "$WORK/rust-tmp"
   chmod 0700 "$WORK/cargo-home"
   python3 "$ROOT/scripts/release-rust-materials.py" configure-cargo-home \
     "${CARGO_HOME:-$HOME/.cargo}" "$WORK/cargo-home"
   git -C "$ROOT" archive "$project_sha" native-deps | tar -x -C "$WORK/native-build"
+  CH_RELEASE_RUSTC="$(rustc --print sysroot)/bin/rustc"
+  [ -x "$CH_RELEASE_RUSTC" ] || fail "selected Rust compiler is missing"
   local native_env=(
-    env -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES
-    CARGO_HOME="$WORK/cargo-home" CARGO_NET_GIT_FETCH_WITH_CLI=true
-    CH_BUILD_REPORT="$WORK/ch-build.jsonl"
+    python3 "$ROOT/scripts/release-rust-materials.py" run-native
+    "$WORK/native-home" "$WORK/cargo-home" "$CH_RELEASE_RUSTC" env
+    CH_BUILD_REPORT="$WORK/ch-build.jsonl" CH_LINK_MAP="$WORK/ch-link.map"
+    TMPDIR="$WORK/rust-tmp"
   )
   "${native_env[@]}" make --no-print-directory -C "$native_root" \
     TARGET_ARCH="$arch" TARBALL_DIR="$ROOT/native-deps/build/tarball" ch-patches-apply ch-build
@@ -199,7 +204,9 @@ package_release() {
   python3 "$ROOT/scripts/release-rust-materials.py" \
     --metadata "$WORK/ch-metadata.json" --build-report "$WORK/ch-build.jsonl" \
     --lock "$ch_source/Cargo.lock" --cargo-home "$WORK/cargo-home" \
-    --source-root "$ch_source" --stage "$STAGE" >> "$RELEASE_MATERIALS_WORK/sources"
+    --source-root "$ch_source" --stage "$STAGE" --rustc "$CH_RELEASE_RUSTC" \
+    >> "$RELEASE_MATERIALS_WORK/sources"
+  release_native_link_inputs "$WORK/ch-link.map" "$WORK/native-build" "$WORK/rust-tmp" bin/cloud-hypervisor
   install -m 0644 "$ch_source/Cargo.lock" \
     "$STAGE/share/sources/$NAME/CLOUD-HYPERVISOR-Cargo.lock"
   release_materials_record_source 'bin/sandbox-ctl,bin/sandbox-init' sandboxer "$version" \
