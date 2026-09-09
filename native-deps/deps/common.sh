@@ -61,7 +61,8 @@ resolve_tarball() {
     elif [ -n "$url" ]; then
         require_cmd curl
         log "downloading $url → $cache" >&2
-        curl -fL --retry 3 -o "$cache.tmp" "$url"
+        curl -fL --retry 3 -o "$cache.tmp" "$url" \
+            || die "source download failed; temporary bytes were not promoted into the cache"
         mv "$cache.tmp" "$cache"
     elif [ -n "$local_src" ]; then
         log "copying $local_src → $cache" >&2

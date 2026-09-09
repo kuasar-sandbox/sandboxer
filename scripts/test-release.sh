@@ -15,6 +15,7 @@ fail() {
 source "$ROOT/scripts/release-materials.sh"
 
 bash "$ROOT/scripts/test-release-materials.sh"
+bash "$ROOT/native-deps/deps/test-common.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-rust-materials.py"
 
 init_fixture_repo() {
