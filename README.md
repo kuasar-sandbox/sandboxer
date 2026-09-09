@@ -84,7 +84,15 @@ The Go import surface is intentionally narrow:
 | `accelerator` | Manifest, cache/store clients, sparse/image helpers | Snapshot ingest/fetch, block reads, and flattened-image configuration |
 | `connector` | `pkg/tapfd` | Receive TAP and network-namespace file descriptors |
 
-The repository uses sibling-directory `replace` directives for coordinated source development. Clone the Kuasar Sandbox repositories as siblings or use the project workspace described in the [project README](https://github.com/kuasar-sandbox/kuasar-sandbox).
+Go-only source builds need this repository plus sibling `accelerator` and
+`connector` checkouts. The tracked local `replace` directives remain active with
+`GOWORK=off`. Internal `require` versions describe each component's target formal
+release (Daily Preview uses that target without the preview suffix); the target
+tag need not exist yet because builds use the sibling source. Record the actual
+source SHAs for validation rather than treating that version label as the compiled
+revision. Use the [project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox)
+for the complete system. Patched Cloud Hypervisor, Guest Runtime and Kernel are
+separate native/runtime prerequisites, not dependencies of every Go-only check.
 
 ## Release model
 
@@ -113,7 +121,7 @@ The lifecycle, guest ABI and VMM guides provide complete English defaults and Ch
 - data access, storage, encryption, and caching belong to [`accelerator`](https://github.com/kuasar-sandbox/accelerator);
 - MicroVM networking belongs to [`connector`](https://github.com/kuasar-sandbox/connector);
 - guest runtime image and kernel artifacts belong to [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime);
-- system-level design, shared BMS, and aggregate releases belong to [`kuasar-sandbox/kuasar-sandbox`](https://github.com/kuasar-sandbox/kuasar-sandbox).
+- system-level design, shared integration tests, and aggregate releases belong to [`kuasar-sandbox/kuasar-sandbox`](https://github.com/kuasar-sandbox/kuasar-sandbox).
 
 ## Contributing and security
 
