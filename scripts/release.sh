@@ -6,7 +6,7 @@ umask 022
 NAME=sandboxer
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'chmod -R u+w "$WORK"; rm -rf "$WORK"' EXIT
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
 # shellcheck source=scripts/release-native-materials.sh
@@ -74,8 +74,12 @@ stage_go_source() {
   # A new checkout contains only committed inputs, including when the caller's
   # development tree has ignored .go/embed files. A real .git directory keeps
   # Go VCS stamping available; no commit or tag is created.
-  git clone --quiet --no-hardlinks --no-checkout --single-branch --no-tags "$source" "$destination"
-  git -C "$destination" -c advice.detachedHead=false checkout --quiet --detach "$sha"
+  [ ! -e "$destination" ] || fail "fresh release checkout already exists"
+  mkdir -p "$destination"
+  local -a git_env=(env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null)
+  "${git_env[@]}" git -C "$destination" init --quiet --template=
+  "${git_env[@]}" git -C "$destination" fetch --quiet --depth=1 "$source" "$sha"
+  "${git_env[@]}" git -C "$destination" -c advice.detachedHead=false checkout --quiet --detach "$sha"
 }
 
 prepare_cloud_hypervisor() {
