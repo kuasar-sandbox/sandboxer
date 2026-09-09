@@ -98,6 +98,14 @@ validate_bundle() {
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
   release_materials_validate "$extract" "$NAME"
+  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl,bin/sandbox-init' 'sandboxer' "$version"
+  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor' "v51.1"
+  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-patches' "$version"
+  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-cargo-lock' "v51.1"
+  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'accelerator' ""
+  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'connector' ""
+  release_materials_require_go "$extract" "$NAME" 'bin/sandbox-ctl'
+  release_materials_require_go "$extract" "$NAME" 'bin/sandbox-init'
   local file
   for file in sandbox-ctl sandbox-init; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
