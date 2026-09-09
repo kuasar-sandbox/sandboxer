@@ -68,8 +68,12 @@ class Sandbox:
             "--base-root", str(self.baseroot), "--ch-binary", str(BIN / "cloud-hypervisor")]
         if restore is not None:
             command += ["--restore", str(restore)]
-        self.process = subprocess.Popen(command,
-            stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            self.process = subprocess.Popen(command,
+                stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+        except BaseException:
+            self.log.close()
+            raise
 
     def cli(self, command, *args, timeout=15):
         return run(BIN / "sandbox-ctl", command, "--sandbox-id", self.name,
@@ -103,17 +107,25 @@ class Sandbox:
             connection.close()
 
     def stop(self):
-        if self.process.poll() is None:
-            try:
-                self.cli("exec", "--", "/probe", "exit")
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                os.killpg(self.process.pid, signal.SIGTERM)
-            try:
-                self.process.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, signal.SIGKILL)
-                self.process.wait(timeout=5)
-        self.log.close()
+        try:
+            if self.process.poll() is None:
+                try:
+                    self.cli("exec", "--", "/probe", "exit")
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    try:
+                        os.killpg(self.process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass  # The owned process may have exited meanwhile.
+                try:
+                    self.process.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(self.process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    self.process.wait(timeout=5)
+        finally:
+            self.log.close()
         assert self.process.returncode == 0, f"sandbox exit={self.process.returncode}; log={self.dir / 'run.log'}"
 
 

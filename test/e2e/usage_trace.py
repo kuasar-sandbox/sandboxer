@@ -11,6 +11,7 @@ import platform
 import re
 import signal
 import subprocess
+import sys
 import time
 
 from usage import BIN, run, write_json
@@ -97,29 +98,40 @@ class Trace:
         except BaseException:
             self.log.close()
             raise
-        deadline = time.monotonic()+20
-        while time.monotonic() < deadline and self.process.poll() is None:
-            if "TRACE_READY" in self.log_path.read_text():
-                time.sleep(.5)
-                break
-            time.sleep(.1)
-        else:
-            self.close()
-            raise AssertionError(f"tracer did not attach; see {self.log_path}")
-        write_json(directory / "trace-method.json", {
-            "binary": binary, "api_mutex_offset": api_offset, "malloc_offset": malloc_at,
-            "hosts": hosts, "chs": chs, "bpftrace": run(bpftrace, "--version"),
-            "definition": "perturbed load/query/stop diagnostic; mallocgc requested sizes, not rounded heap objects; wakeups include tracked process threads; management bytes are usage frames excluding CONNECT handshake; api wait is contended lockSlow duration; no uretprobe"})
+        try:
+            deadline = time.monotonic()+20
+            while time.monotonic() < deadline and self.process.poll() is None:
+                if "TRACE_READY" in self.log_path.read_text():
+                    time.sleep(.5)
+                    break
+                time.sleep(.1)
+            else:
+                raise AssertionError(f"tracer did not attach; see {self.log_path}")
+            write_json(directory / "trace-method.json", {
+                "binary": binary, "api_mutex_offset": api_offset, "malloc_offset": malloc_at,
+                "hosts": hosts, "chs": chs, "bpftrace": run(bpftrace, "--version"),
+                "definition": "perturbed load/query/stop diagnostic; mallocgc requested sizes, not rounded heap objects; wakeups include tracked process threads; management bytes are usage frames excluding CONNECT handshake; api wait is contended lockSlow duration; no uretprobe"})
+        except BaseException:
+            # The caller has no Trace instance until __init__ returns.
+            try:
+                self.close()
+            except BaseException as error:
+                print(f"usage tracer cleanup: {error}", file=sys.stderr)
+            raise
 
     def close(self):
-        if self.process.poll() is None:
-            self.process.send_signal(signal.SIGINT)
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
-                raise AssertionError("tracer did not stop cleanly")
-        self.log.close()
+        if self.log.closed:
+            return
+        try:
+            if self.process.poll() is None:
+                self.process.send_signal(signal.SIGINT)
+                try:
+                    self.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+                    raise AssertionError("tracer did not stop cleanly")
+        finally:
+            self.log.close()
         assert self.process.returncode == 0, f"tracer exit={self.process.returncode}; see {self.log_path}"
         write_json(self.directory / "trace-window.json", {"elapsed_ns": time.monotonic_ns()-self.started})

@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -90,6 +91,28 @@ def record_sizes(path):
         sizes.append(size)
         pos += size
     return sizes
+
+
+def cleanup(trace, sandboxes):
+    # One failed teardown must not abandon the remaining owned processes or
+    # hide the workload failure that brought us here.
+    original = sys.exc_info()[1]
+    errors = []
+    if trace is not None:
+        try:
+            trace.close()
+        except BaseException as error:
+            errors.append(error)
+    for sb in sandboxes:
+        try:
+            sb.stop()
+        except BaseException as error:
+            errors.append(error)
+    if errors:
+        if original is None:
+            raise errors[0]
+        for error in errors:
+            print(f"usage performance cleanup: {error}", file=sys.stderr)
 
 
 def measure(work, name, density, workload, enabled, seconds, root, ref, read_g, trace_enabled):
@@ -189,13 +212,7 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g, 
             write_json(group / "result.json", result)
             return {k: v for k, v in result.items() if k not in ("measurements", "business_latency_ns")}
         finally:
-            try:
-                if trace is not None:
-                    trace.close()
-            finally:
-                for sb in sandboxes:
-                    if sb.process.poll() is None:
-                        sb.stop()
+            cleanup(trace, sandboxes)
 
 
 def main():
