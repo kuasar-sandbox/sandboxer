@@ -58,6 +58,8 @@ Token、凭据提供器、构建包装器或 directory/git source 覆盖项。
 或 SSH agent 设置。发行打包拒绝编译器及 wrapper 覆盖;Cargo 和材料记录使用
 选定工具链的同一个精确 `rustc` 可执行文件,并记录其摘要。这是可信发行输入的
 凭据卫生措施,不能代替对不可信 CI 候选的隔离。
+保留标准 `CARGO_NET_GIT_FETCH_WITH_CLI` 布尔选项;Git CLI 传输不可用时,
+可设为 `false` 选择 Cargo 内置 Git 传输。
 已发布的 `vhost` crate 未包含 workspace 根许可证。补充文件取自通过 checksum
 验证的 crate 内 Cargo VCS 记录所指的精确 Git commit,且先将上游 package manifest
 与该 crate 的 `Cargo.toml.orig` 对比。不会按当前分支或另行维护的版本清单选取材料。

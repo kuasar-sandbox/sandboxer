@@ -66,8 +66,12 @@ def native_build_environment(original, home, cargo_home, rustc):
         require(not original.get(name), "release native build does not accept " + name)
     allowed = {"PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-               "http_proxy", "https_proxy", "all_proxy", "no_proxy", "CARGO_BUILD_JOBS"}
+               "http_proxy", "https_proxy", "all_proxy", "no_proxy", "CARGO_BUILD_JOBS",
+               "CARGO_NET_GIT_FETCH_WITH_CLI"}
     environment = {name: value for name, value in original.items() if name in allowed}
+    environment.setdefault("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
+    require(environment["CARGO_NET_GIT_FETCH_WITH_CLI"] in ("true", "false"),
+            "invalid Cargo Git transport setting")
     for name, value in environment.items():
         if name.lower() in ("http_proxy", "https_proxy", "all_proxy"):
             parsed = urlsplit(value)
@@ -77,8 +81,7 @@ def native_build_environment(original, home, cargo_home, rustc):
     home.chmod(0o700)
     environment.update(HOME=str(home), CARGO_HOME=str(cargo_home), RUSTC=str(rustc),
                        PATH=str(rustc.parent) + os.pathsep + environment.get("PATH", os.defpath),
-                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       CARGO_NET_GIT_FETCH_WITH_CLI="true")
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
     return environment
 
 

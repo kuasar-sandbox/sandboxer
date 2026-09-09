@@ -69,6 +69,8 @@ inherited. Compiler/wrapper overrides are rejected for release packaging; the
 selected toolchain's exact `rustc` executable is used both for Cargo and the
 material record, including its digest. This is credential hygiene for trusted
 release inputs, not a substitute for isolating untrusted CI candidates.
+The standard `CARGO_NET_GIT_FETCH_WITH_CLI` boolean is preserved; use `false`
+to select Cargo's built-in Git transport when the Git CLI transport is unavailable.
 The published `vhost` crate omits its workspace-root licenses. Its supplemental
 files come from the exact Git commit in its checksum-verified Cargo VCS record,
 after comparing the upstream package manifest with `Cargo.toml.orig` from that
