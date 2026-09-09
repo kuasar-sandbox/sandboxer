@@ -345,8 +345,10 @@ non-dead Go G counts, actual record bytes, concentrated-stop duration and
 end-to-end exec p95/p99. Go G includes runtime system goroutines; it is not
 `runtime.NumGoroutine`. Exact-binary DWARF/symbol inspection requires `gdb`
 and Go tools. The separate Linux amd64 tracing run requires a `bpftrace` build
-with instruction-offset support and tracefs access (`BPFTRACE_BIN` can select
-an already installed tool). It adds wakeups, mallocgc requests/requested bytes, usage
+with instruction-offset support, tracefs access and the initial PID namespace
+(`BPFTRACE_BIN` can select an installed tool). A preflight rejects differing
+kernel and `/proc` PID identities before attaching target probes. Empty or
+failed tracing is not zero overhead. It adds wakeups, mallocgc requests/requested bytes, usage
 framing traffic, CH info requests, contended API mutex wait and save-worker
 duration. It verifies ordinary instruction probes against the exact binary;
 it does not insert Go return trampolines. Tracing perturbs timing, so its

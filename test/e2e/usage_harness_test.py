@@ -124,6 +124,7 @@ class CleanupTests(unittest.TestCase):
                     return "bpftrace fake\n"
 
                 with patch.object(usage_trace, "run", run), \
+                     patch.object(usage_trace, "check_pid_namespace", return_value={}), \
                      patch.object(usage_trace.subprocess, "Popen", Process), \
                      patch.object(usage_trace.platform, "machine", return_value="x86_64"), \
                      patch.object(usage_trace.Path, "iterdir", return_value=[]), \
@@ -181,6 +182,32 @@ class CleanupTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 usage_faults.collect_and_unmount(Path("mounted"), sb)
         run.assert_called_once_with("umount", Path("mounted"))
+
+
+class TraceIdentityTests(unittest.TestCase):
+    def test_initial_pid_identity(self):
+        process = unittest.mock.Mock(pid=123, returncode=0)
+        process.communicate.return_value = ('{"type":"printf","data":"USAGE_TRACE_PID 123\\n"}\n', None)
+        with patch.object(usage_trace.subprocess, "Popen", return_value=process):
+            self.assertEqual(usage_trace.check_pid_namespace("bpftrace"), {"proc_pid": 123, "kernel_pid": 123})
+
+    def test_nested_pid_namespace_and_missing_witness_are_rejected(self):
+        for output in ('{"data":"USAGE_TRACE_PID 456\\n"}', "", "USAGE_TRACE_PID 123\nUSAGE_TRACE_PID 123"):
+            with self.subTest(output=output):
+                process = unittest.mock.Mock(pid=123, returncode=0)
+                process.communicate.return_value = (output, None)
+                with patch.object(usage_trace.subprocess, "Popen", return_value=process):
+                    with self.assertRaisesRegex(AssertionError, "initial PID namespace"):
+                        usage_trace.check_pid_namespace("bpftrace")
+
+    def test_preflight_timeout_reaps_own_process(self):
+        process = unittest.mock.Mock()
+        process.communicate.side_effect = [subprocess.TimeoutExpired("preflight", 15), ("", None)]
+        with patch.object(usage_trace.subprocess, "Popen", return_value=process):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                usage_trace.check_pid_namespace("bpftrace")
+        process.kill.assert_called_once()
+        self.assertEqual(process.communicate.call_count, 2)
 
 
 if __name__ == "__main__":

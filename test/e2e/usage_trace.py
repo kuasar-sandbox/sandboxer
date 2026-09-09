@@ -17,9 +17,31 @@ import time
 from usage import BIN, run, write_json
 
 
+def check_pid_namespace(bpftrace):
+    # sched arguments and pid/tid use kernel identities. Check our own probe
+    # process before attaching target probes; nested /proc IDs must not select
+    # unrelated kernel PIDs. The harness requires the initial PID namespace.
+    process = subprocess.Popen([bpftrace, "-f", "json", "-e",
+                                'BEGIN { printf("USAGE_TRACE_PID %d\\n", pid); exit(); }'],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        output, _ = process.communicate(timeout=15)
+    except BaseException:
+        process.kill()
+        process.communicate(timeout=5)
+        raise
+    assert process.returncode == 0, f"tracing preflight failed: {output}"
+    observed = re.findall(r"USAGE_TRACE_PID (\d+)", output)
+    assert len(observed) == 1 and int(observed[0]) == process.pid, \
+        "usage tracing requires the initial PID namespace (/proc and eBPF PID identities differ)"
+    return {"proc_pid": process.pid, "kernel_pid": int(observed[0])}
+
+
 class Trace:
     def __init__(self, directory, hosts, chs):
         assert platform.machine() == "x86_64", "diagnostic register probes require amd64"
+        bpftrace = os.environ.get("BPFTRACE_BIN", "bpftrace")
+        namespace = check_pid_namespace(bpftrace)
         self.directory = directory
         binary = str((BIN / "sandbox-ctl").resolve())
         assert not any(c in binary for c in ':"\n')
@@ -89,7 +111,6 @@ class Trace:
         self.log_path = directory / "trace.log"
         self.log = self.log_path.open("w")
         self.started = time.monotonic_ns()
-        bpftrace = os.environ.get("BPFTRACE_BIN", "bpftrace")
         # Require a build with instruction-offset support. Never bypass its
         # instruction validation or replace Go return addresses.
         try:
@@ -109,6 +130,7 @@ class Trace:
                 raise AssertionError(f"tracer did not attach; see {self.log_path}")
             write_json(directory / "trace-method.json", {
                 "binary": binary, "api_mutex_offset": api_offset, "malloc_offset": malloc_at,
+                "pid_namespace_preflight": namespace,
                 "hosts": hosts, "chs": chs, "bpftrace": run(bpftrace, "--version"),
                 "definition": "perturbed load/query/stop diagnostic; mallocgc requested sizes, not rounded heap objects; wakeups include tracked process threads; management bytes are usage frames excluding CONNECT handshake; api wait is contended lockSlow duration; no uretprobe"})
         except BaseException:
