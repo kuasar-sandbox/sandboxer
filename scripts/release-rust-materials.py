@@ -12,13 +12,48 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import sys
 import tarfile
 import tomllib
+from urllib.parse import urlsplit
 
 
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def configure_cargo_home(original, destination):
+    """Carry public registry routing only, never credentials or writable caches."""
+    configs = [p for p in (original / "config", original / "config.toml") if p.is_file()]
+    require(len(configs) <= 1, "ambiguous Cargo source configuration")
+    if not configs:
+        return
+    sources = tomllib.loads(configs[0].read_text()).get("source", {})
+    require(isinstance(sources, dict), "invalid Cargo source configuration")
+    rendered = []
+    for name, value in sorted(sources.items()):
+        require(re.fullmatch(r"[A-Za-z0-9_-]+", name), "invalid Cargo source name")
+        require(isinstance(value, dict) and set(value) <= {"replace-with", "registry"},
+                "release Cargo sources must be public registries, not directory/git overrides")
+        rendered.append("[source." + name + "]")
+        for key, item in sorted(value.items()):
+            require(isinstance(item, str), "invalid Cargo source value")
+            if key == "registry":
+                parsed = urlsplit(item.removeprefix("sparse+"))
+                require(parsed.scheme == "https" and parsed.hostname and
+                        parsed.username is None and parsed.password is None and
+                        not parsed.query and not parsed.fragment,
+                        "release Cargo registry must use credential-free HTTPS")
+            else:
+                require(re.fullmatch(r"[A-Za-z0-9_-]+", item), "invalid Cargo source replacement")
+            rendered.append(key + " = " + json.dumps(item))
+        rendered.append("")
+    destination.mkdir(parents=True, exist_ok=True)
+    destination.chmod(0o700)
+    target = destination / "config.toml"
+    target.write_text("\n".join(rendered))
+    target.chmod(0o600)
 
 
 def safe_relative(value):
@@ -174,6 +209,9 @@ def collect(metadata, build_report, lock, cargo_home, source_root, stage):
 
 
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "configure-cargo-home":
+        configure_cargo_home(Path(sys.argv[2]), Path(sys.argv[3]))
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("metadata", "build-report", "lock", "cargo-home", "source-root", "stage"):
         parser.add_argument("--" + name, type=Path, required=True)

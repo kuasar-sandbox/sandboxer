@@ -111,6 +111,31 @@ class MaterialsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differs"):
             materials.git_materials(package, {"source": "git+https://example.invalid/fixture#" + "0" * 40}, destination)
 
+    def test_cargo_configuration_excludes_credentials(self):
+        original, destination = self.root / "original-home", self.root / "private-home"
+        original.mkdir()
+        (original / "config.toml").write_text(
+            '[source.crates-io]\nreplace-with="public-mirror"\n'
+            '[source.public-mirror]\nregistry="sparse+https://mirror.example.invalid/index/"\n'
+            '[registry]\ntoken="fixture credential must not be copied"\n'
+            '[build]\nrustc-wrapper="/fixture/wrapper"\n')
+        materials.configure_cargo_home(original, destination)
+        copied = (destination / "config.toml").read_text()
+        self.assertIn("public-mirror", copied)
+        self.assertNotIn("token", copied)
+        self.assertNotIn("wrapper", copied)
+        self.assertEqual((destination / "config.toml").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+
+    def test_cargo_directory_and_authenticated_registry_rejected(self):
+        original, destination = self.root / "original-home", self.root / "private-home"
+        original.mkdir()
+        for value in ('[source.cache]\ndirectory="/fixture/cache"\n',
+                      '[source.cache]\nregistry="sparse+https://fixture:fixture@mirror.example.invalid/"\n'):
+            (original / "config.toml").write_text(value)
+            with self.assertRaises(ValueError):
+                materials.configure_cargo_home(original, destination)
+
 
 if __name__ == "__main__":
     unittest.main()

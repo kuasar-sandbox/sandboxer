@@ -81,6 +81,8 @@ prepare_cloud_hypervisor() {
     || fail "Cloud Hypervisor source checksum differs from its release source record"
   mkdir -p "$WORK/native-build" "$WORK/cargo-home"
   chmod 0700 "$WORK/cargo-home"
+  python3 "$ROOT/scripts/release-rust-materials.py" configure-cargo-home \
+    "${CARGO_HOME:-$HOME/.cargo}" "$WORK/cargo-home"
   git -C "$ROOT" archive "$project_sha" native-deps | tar -x -C "$WORK/native-build"
   local native_env=(
     env -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES

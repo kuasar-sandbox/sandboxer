@@ -60,6 +60,9 @@ match `Cargo.lock` checksums, and Git dependencies must match its full commits.
 Only observed build inputs are listed, including build-time/procedural-macro
 dependencies; this is not a claim that every listed crate's code is shipped.
 Editable extracted cache files are not the authority for registry licenses.
+Only credential-free HTTPS registry routing from the caller's Cargo source
+configuration is carried into the private home. Tokens, credential providers,
+build wrappers and directory/git source overrides are not copied.
 
 The component archive carries those crates' license/notice files and the Rust
 toolchain's copyright and license materials in component-specific directories.
