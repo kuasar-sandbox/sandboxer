@@ -112,8 +112,11 @@ CH 的唯一 wait owner 使用 `waitid(WNOWAIT)`, 重试 EINTR, 在 proc 状态�
 存活时尽力最终读取, 然后调用 `cmd.Wait`. 不增加第二回收者, 不改变退出升级
 或输出排空. 即使总量可用, 未知逐线程末段仍标记 incomplete. 活动的
 sandbox-ctl 无法观察自身最后一次读取之后的退出/保存 CPU, 因而其终态记录保留
-已知总量但不声称完整. 未封口的旧记录、已有空文件或截断的首记录, 都不能在
-重启后证明此前 CPU 历史完整.
+已知总量但不声称完整. 重新打开任何已有 usage 文件都会保留已知 CPU 累计,
+但将跨进程历史标记 incomplete. 即使最后记录正常封口, 也不能排除其后有一次
+消耗 CPU 却未写出任何记录便崩溃的运行. 空文件和部分追加同样无法证明历史
+完整. 只有新建文件能确认逻辑历史的已知起点; 本实现不增加同步启动标记或 WAL
+来证明各次运行相邻.
 
 ### 4.2 Guest 内存和 Balloon
 
@@ -255,8 +258,8 @@ timeout/busy. 不保证掉电下无损持久化, SIGKILL 测试不能证明掉�
 [guestlink](../pkg/guestlink) 和 [sandbox-init](../cmd/sandbox-init).
 组件自有 [usage E2E](../test/e2e/e2e_usage.sh) 由
 [run_all.sh](../test/e2e/run_all.sh) 发现, 必须使用真实 KVM, 并核验 Guest 内
-运行的 init 哈希与所提供的新 runtime bundle 一致. 短保存周期案例只验证集成,
-不代替默认五分钟真实时间或生产密度性能结论.
+运行的 init 哈希与所提供的新 runtime bundle 一致. 短保存周期案例验证集成;
+独立的 `defaults` 案例等待实际默认五分钟保存. 两者都不是生产密度性能测量.
 
 Off/on 对比必须使用相同源集、runtime/kernel/CH、配置、密度及负载, 报告
 Guest/Host CPU、唤醒、分配、FD/goroutine、常驻内存、管理通信、CH 查询次数/

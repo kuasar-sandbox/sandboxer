@@ -115,7 +115,10 @@ func Open(baseDir, sandboxID, epoch string, start time.Time, sample, flush time.
 	m := newManager(s, recovered, f, dir.Sync)
 	m.reader, m.closeFn = f, closeFiles
 	m.runStart = start
-	m.historyUnknown = !created && (recovered.Record == nil || len(recovered.Record.Snapshot.Counters) == 0)
+	// No startup checkpoint/WAL is part of this format. An existing file,
+	// including a closed last record, cannot certify that no intervening
+	// process consumed CPU and vanished before its first save.
+	m.historyUnknown = !created
 	return m, nil
 }
 

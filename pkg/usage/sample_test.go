@@ -138,7 +138,7 @@ func TestRecoveredCounterCompleteness(t *testing.T) {
 			if err := s.Counters[0].Observe("source-B", 5, 100, true); err != nil {
 				t.Fatal(err)
 			}
-			if s.Counters[0].Complete != (closed && endpoint) {
+			if s.Counters[0].Complete {
 				t.Fatalf("closed=%v endpoint=%v: %+v", closed, endpoint, s.Counters[0])
 			}
 		}
@@ -148,6 +148,61 @@ func TestRecoveredCounterCompleteness(t *testing.T) {
 	_ = c.Observe("thread-B", 5, 100, true)
 	if c.Complete || c.KnownTotal != (Uint128{Lo: 1050000000}) {
 		t.Fatalf("replacement: %+v", c)
+	}
+}
+
+func TestClosedRecordCannotProveAdjacentRun(t *testing.T) {
+	for _, partial := range []bool{false, true} {
+		name := "zero-write"
+		if partial {
+			name = "partial-append"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			open := func(epoch string) *Manager {
+				m, err := Open(dir, "test", epoch, time.Now(), time.Second, 5*time.Minute)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return m
+			}
+			a := open("run-A")
+			if err := a.Counter("guest.cpu", "process-A", 100, 100, true); err != nil {
+				t.Fatal(err)
+			}
+			if !a.View().Live.Counters[0].Complete {
+				t.Fatal("known-created file and process lost completeness")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			a.Close(ctx, time.Now())
+			cancel()
+			b := open("run-B")
+			if err := b.Counter("guest.cpu", "process-B", 20, 100, true); err != nil {
+				t.Fatal(err)
+			}
+			if partial {
+				v := b.View()
+				frame, err := EncodeRecord(Record{Sequence: v.Saved.Sequence + 1, Snapshot: *v.Live})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := b.writer.WriteAt(frame[:len(frame)/2], v.SavedEnd); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Logical process-disappearance test, not a power-loss experiment.
+			b.closeFiles()
+			c := open("run-C")
+			defer c.closeFiles()
+			if err := c.Counter("guest.cpu", "process-C", 5, 100, true); err != nil {
+				t.Fatal(err)
+			}
+			v := c.View()
+			counter := v.Live.Counters[0]
+			if counter.Complete || counter.KnownTotal != (Uint128{Lo: 1050000000}) || v.UnknownTail != partial {
+				t.Fatalf("lost run-B CPU mislabeled or known total changed: %+v, unknown_tail=%v", counter, v.UnknownTail)
+			}
+		})
 	}
 }
 

@@ -135,8 +135,12 @@ add another reaper or alter shutdown escalation/output draining. Unknown
 thread terminal segments remain incomplete even when the total is available.
 The live sandbox-ctl cannot observe CPU consumed after its own final read;
 its saved terminal counter therefore retains a known total but is incomplete.
-An unclosed old record, or an existing empty/partial first record, cannot
-establish complete prior CPU history after restart.
+Reopening any existing usage file preserves known CPU totals but marks
+cross-process history incomplete. Even a normally closed last record cannot
+exclude an intervening run that consumed CPU and crashed without writing a
+record. Empty files and partial appends have the same limitation. Only a
+newly created file can establish the logical history's known starting point;
+there is no synchronous startup marker or WAL to prove adjacency of runs.
 
 ### 4.2 Guest memory and balloon
 
@@ -317,8 +321,9 @@ a measured constant. CPU/Gauge aggregation and persistence tests are in
 The component-owned [usage E2E](../test/e2e/e2e_usage.sh) is discovered by
 [`run_all.sh`](../test/e2e/run_all.sh), requires real KVM, and verifies the
 running Guest init hash against the supplied freshly rebuilt runtime bundle.
-Its short-save cases exercise integration, not the default five-minute
-real-time cadence or a production-density performance claim.
+Its short-save cases exercise integration; a separate `defaults` case waits
+for the actual default five-minute save. Neither is a production-density
+performance measurement.
 
 Measure off/on using the same source set, runtime/kernel/CH, configuration,
 density and load. Report Guest/Host CPU, wakeups, allocations, FD/goroutines,

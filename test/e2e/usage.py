@@ -232,7 +232,8 @@ def main():
                 parent = saved["saved"]["snapshot"]
                 parent_cpu = int(metric(parent, "counters", "guest.cpu")["known_total_ns"])
                 parent_fs = int(metric(parent, "gauges", "filesystem.root")["last_value_bytes"])
-                host = {"boot": {"kernel": config["boot"]["kernel"], "runtime": config["boot"]["runtime"]},
+                host = {"resources": config["resources"],
+                        "boot": {"kernel": config["boot"]["kernel"], "runtime": config["boot"]["runtime"]},
                         "restore": {"prefetch": "off"}, "usage": config["usage"], "timeouts": {"restore": "30s"}}
                 for same_id in (False, True):
                     role = "same-restore" if same_id else "clone-restore"
