@@ -140,12 +140,11 @@ package_release() {
   [[ "$connector_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
     || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
   [ -f "$ch_source/Cargo.lock" ] || fail "Cloud Hypervisor Cargo.lock is missing from $ch_source"
-  project_sha="$(git -C "$ROOT" rev-parse HEAD)"
-  [[ "$project_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the sandboxer source commit"
-  accelerator_sha="${RELEASE_ACCELERATOR_SOURCE_SHA:-$(git -C "$accelerator_source" rev-parse HEAD 2>/dev/null || true)}"
-  connector_sha="${RELEASE_CONNECTOR_SOURCE_SHA:-$(git -C "$connector_source" rev-parse HEAD 2>/dev/null || true)}"
-  [[ "$accelerator_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the selected accelerator source commit"
-  [[ "$connector_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the selected connector source commit"
+  project_sha="$(release_materials_resolve_git_source "$ROOT" "" sandboxer)"
+  accelerator_sha="$(release_materials_resolve_git_source "$accelerator_source" \
+    "${RELEASE_ACCELERATOR_SOURCE_SHA:-}" accelerator)"
+  connector_sha="$(release_materials_resolve_git_source "$connector_source" \
+    "${RELEASE_CONNECTOR_SOURCE_SHA:-}" connector)"
   cargo_sha="$(sha256sum "$ch_source/Cargo.lock" | awk '{print $1}')"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"
   release_materials_copy_licenses "$ROOT" project

@@ -11,6 +11,46 @@ fail() {
   exit 1
 }
 
+# shellcheck source=scripts/release-materials.sh
+source "$ROOT/scripts/release-materials.sh"
+
+init_fixture_repo() {
+  local directory="$1"
+  shift
+  git -C "$directory" init -q
+  git -C "$directory" config --local user.name "Chen Xiaohui"
+  git -C "$directory" config --local user.email "graych@gmail.com"
+  git -C "$directory" add -- "$@"
+  git -C "$directory" commit -q -m "test: create release source fixture"
+  git -C "$directory" rev-parse HEAD
+}
+
+mkdir -p "$TMP/git-source" \
+  "$TMP/material-hash/share/licenses/hash-test/LICENSES" \
+  "$TMP/material-hash/share/sources/hash-test"
+printf 'fixture license\n' > "$TMP/git-source/LICENSE"
+fixture_git_sha="$(init_fixture_repo "$TMP/git-source" LICENSE)"
+[ "$(release_materials_resolve_git_source "$TMP/git-source" "$fixture_git_sha" fixture)" = "$fixture_git_sha" ] \
+  || fail "clean source worktree did not resolve to its selected commit"
+if (release_materials_resolve_git_source "$TMP/git-source" \
+  0000000000000000000000000000000000000000 fixture >/dev/null 2>&1); then
+  fail "source resolver accepted a commit that differs from the selected commit"
+fi
+printf 'untracked source\n' > "$TMP/git-source/untracked.go"
+if (release_materials_resolve_git_source "$TMP/git-source" "" fixture >/dev/null 2>&1); then
+  fail "source resolver accepted a dirty source worktree"
+fi
+printf 'nested license manifest\n' \
+  > "$TMP/material-hash/share/licenses/hash-test/LICENSES/MATERIALS.sha256"
+printf 'generated inventory\n' \
+  > "$TMP/material-hash/share/sources/hash-test/MATERIALS.sha256"
+release_materials_hash_tree "$TMP/material-hash" hash-test "$TMP/material-hash-actual"
+grep -Fq 'share/licenses/hash-test/LICENSES/MATERIALS.sha256' "$TMP/material-hash-actual" \
+  || fail "license file named MATERIALS.sha256 was omitted from the material inventory"
+if grep -Fq 'share/sources/hash-test/MATERIALS.sha256' "$TMP/material-hash-actual"; then
+  fail "generated material inventory included itself"
+fi
+
 bash "$ROOT/scripts/test-preview-line.sh"
 bash "$ROOT/scripts/test-delete-preview.sh"
 
@@ -112,14 +152,16 @@ printf 'fixture BSD license\n' > "$TMP/cloud-hypervisor/LICENSES/BSD-3-Clause.tx
 printf 'version = 3\n' > "$TMP/cloud-hypervisor/Cargo.lock"
 printf 'fixture accelerator license\n' > "$TMP/accelerator/LICENSE"
 printf 'fixture connector license\n' > "$TMP/connector/LICENSE"
+accelerator_sha="$(init_fixture_repo "$TMP/accelerator" LICENSE)"
+connector_sha="$(init_fixture_repo "$TMP/connector" LICENSE)"
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR="$TMP/cloud-hypervisor" \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
-  RELEASE_ACCELERATOR_SOURCE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
   RELEASE_ACCELERATOR_VERSION=v0.1.3 \
   RELEASE_CONNECTOR_SOURCE_DIR="$TMP/connector" \
-  RELEASE_CONNECTOR_SOURCE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  RELEASE_CONNECTOR_SOURCE_SHA="$connector_sha" \
   RELEASE_CONNECTOR_VERSION=v0.1.2 \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
@@ -131,6 +173,7 @@ bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
   1111111111111111111111111111111111111111 release/v1.2.x
 
 archive="$TMP/bundle/assets/$ARCHIVE_NAME"
+go_toolchain="$(go version | awk '{print $3}')"
 for path in ./bin/cloud-hypervisor ./bin/sandbox-ctl ./bin/sandbox-init \
   ./share/licenses/sandboxer/project/LICENSE \
   ./share/licenses/sandboxer/cloud-hypervisor/CREDITS.md \
@@ -138,6 +181,7 @@ for path in ./bin/cloud-hypervisor ./bin/sandbox-ctl ./bin/sandbox-init \
   ./share/licenses/sandboxer/cloud-hypervisor/LICENSES/BSD-3-Clause.txt \
   ./share/licenses/sandboxer/accelerator/LICENSE \
   ./share/licenses/sandboxer/connector/LICENSE \
+  ./share/licenses/sandboxer/go-toolchain/"$go_toolchain"/LICENSE \
   ./share/sources/sandboxer/CLOUD-HYPERVISOR-Cargo.lock \
   ./share/sources/sandboxer/SOURCES.tsv \
   ./share/sources/sandboxer/GO-BUILD-INFO.tsv \
@@ -146,14 +190,17 @@ for path in ./bin/cloud-hypervisor ./bin/sandbox-ctl ./bin/sandbox-init \
   tar -tzf "$archive" | grep -Fx "$path" >/dev/null \
     || fail "archive is missing $path"
 done
+tar -xOf "$archive" ./share/sources/sandboxer/SOURCES.tsv \
+  | grep -Fq $'\tGo toolchain\t'"$go_toolchain"$'\t' \
+  || fail "archive does not associate its Go toolchain with license material"
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR="$TMP/cloud-hypervisor" \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
-  RELEASE_ACCELERATOR_SOURCE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
   RELEASE_ACCELERATOR_VERSION=v0.1.3 \
   RELEASE_CONNECTOR_SOURCE_DIR="$TMP/connector" \
-  RELEASE_CONNECTOR_SOURCE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  RELEASE_CONNECTOR_SOURCE_SHA="$connector_sha" \
   RELEASE_CONNECTOR_VERSION=v0.1.2 \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz" \
