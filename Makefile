@@ -8,7 +8,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench test-e2e release test-release clean help
+.PHONY: all build sandbox-ctl sandbox-init journal-writer cloud-hypervisor native-deps test vet bench test-e2e release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -62,6 +62,15 @@ sandbox-init:
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '-s -w' -o $(BINDIR)/sandbox-init ./cmd/sandbox-init
 	$(call link_bin,sandbox-init)
 
+# journal-writer: test harness for the FE2026072900156 performance test
+# (see docs + the markdown spec; replicates sandbox-ctl's journald writer
+# with controllable rate / line-size / pipe-mode, self-reports drops + latency).
+# Build separately: `make journal-writer`. Not part of `make build`.
+journal-writer:
+	@mkdir -p $(BINDIR)
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/journal-writer ./cmd/journal-writer
+	$(call link_bin,journal-writer)
+
 native-deps:
 	$(MAKE) -C native-deps build TARGET_ARCH=$(TARGET_ARCH)
 
@@ -109,6 +118,7 @@ test-release:
 help:
 	@echo "sandboxer. Targets:"
 	@echo "  build              sandbox-ctl + sandbox-init"
+	@echo "  journal-writer     perf-test harness (FE2026072900156)"
 	@echo "  cloud-hypervisor   patched VMM consumed by sandbox-ctl"
 	@echo "  sandbox-ctl        host control plane"
 	@echo "  sandbox-init       guest PID 1 binary consumed by guest-runtime"
