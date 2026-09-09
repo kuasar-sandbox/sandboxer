@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
+	"strings"
 )
 
 type entryContract struct {
@@ -22,6 +24,46 @@ var archiveContract = map[string]entryContract{
 	"./bin/cloud-hypervisor": {typeflag: tar.TypeReg, mode: 0o755},
 	"./bin/sandbox-ctl":      {typeflag: tar.TypeReg, mode: 0o755},
 	"./bin/sandbox-init":     {typeflag: tar.TypeReg, mode: 0o755},
+	"./share/licenses/sandboxer/project/LICENSE":                            {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/sandboxer/cloud-hypervisor/LICENSES/Apache-2.0.txt":   {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/sandboxer/cloud-hypervisor/LICENSES/BSD-3-Clause.txt": {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/sources/sandboxer/CLOUD-HYPERVISOR-Cargo.lock":                 {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/sources/sandboxer/GO-BUILD-INFO.tsv":                           {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/sources/sandboxer/GO-MODULES.tsv":                              {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/sources/sandboxer/MATERIALS.sha256":                            {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/sources/sandboxer/SOURCES.tsv":                                 {typeflag: tar.TypeReg, mode: 0o644},
+}
+
+func materialContract(name string) (entryContract, bool) {
+	for _, directory := range []string{
+		"./share/",
+		"./share/licenses/",
+		"./share/licenses/sandboxer/",
+		"./share/sources/",
+		"./share/sources/sandboxer/",
+	} {
+		if name == directory {
+			return entryContract{typeflag: tar.TypeDir, mode: 0o755}, true
+		}
+	}
+	if !strings.HasPrefix(name, "./share/licenses/sandboxer/") &&
+		!strings.HasPrefix(name, "./share/sources/sandboxer/") {
+		return entryContract{}, false
+	}
+	clean := path.Clean(strings.TrimPrefix(name, "./"))
+	if clean == "." || strings.HasPrefix(clean, "../") || strings.Contains(clean, "/../") {
+		return entryContract{}, false
+	}
+	if strings.HasSuffix(name, "/") {
+		if name != "./"+clean+"/" {
+			return entryContract{}, false
+		}
+		return entryContract{typeflag: tar.TypeDir, mode: 0o755}, true
+	}
+	if name != "./"+clean {
+		return entryContract{}, false
+	}
+	return entryContract{typeflag: tar.TypeReg, mode: 0o644}, true
 }
 
 func main() {
@@ -61,7 +103,10 @@ func validateArchive(path string) error {
 
 		contract, ok := archiveContract[header.Name]
 		if !ok {
-			return fmt.Errorf("unexpected member %q", header.Name)
+			contract, ok = materialContract(header.Name)
+			if !ok {
+				return fmt.Errorf("unexpected member %q", header.Name)
+			}
 		}
 		if _, ok := seen[header.Name]; ok {
 			return fmt.Errorf("duplicate member %q", header.Name)

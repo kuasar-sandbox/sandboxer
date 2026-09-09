@@ -91,11 +91,15 @@ test-e2e:
 	BIN="$(E2E_BIN)" bash test/e2e/run_all.sh
 
 VERSION ?= v0.1.0
+ACCELERATOR_VERSION ?= v0.1.3
+CONNECTOR_VERSION ?= v0.1.2
 
 release: build
 	@mkdir -p $(BUILD_DIR)
 	rm -rf $(BUILD_DIR)/release-bundle
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
+	RELEASE_ACCELERATOR_VERSION="$(ACCELERATOR_VERSION)" \
+	RELEASE_CONNECTOR_VERSION="$(CONNECTOR_VERSION)" \
 		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" \
 		$(BUILD_DIR)/release-bundle
 
