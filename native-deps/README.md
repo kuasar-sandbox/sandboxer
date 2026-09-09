@@ -95,9 +95,11 @@ so same-name/version packages from different registries or Git commits do not
 overwrite one another's license files.
 Rustup's standard-library notices or matching installed Debian/RPM source-package
 notices are collected; missing toolchain documentation fails with an installation
-hint. `RUST-STDLIB.tsv` lists the sysroot-relative paths and SHA-256 digests of the
-standard-library `.rlib` inputs selected by the final link map, and its digest is
-bound into the Rust toolchain record. These are actual input digests, not an
+hint. The final link map identifies the selected target sysroot. `RUST-STDLIB.tsv`
+lists the relative paths and SHA-256 digests of that target's complete `.rlib`
+input set, including standard-library bitcode consumed before final linking by
+LTO; it does not claim every listed archive is linked into the result. Its digest
+is bound into the Rust toolchain record. These are actual toolchain input digests, not an
 assertion that a locally modified toolchain is an unmodified upstream release.
 The fresh final-link map also selects the system static libraries and startup
 objects actually used by Cloud Hypervisor. Their installed source-package

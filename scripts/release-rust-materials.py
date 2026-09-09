@@ -199,7 +199,7 @@ def git_materials(package, locked, destination):
 
 
 def rust_standard_library_inventory(stage, sysroot, link_map):
-    libraries = {}
+    target_directories = set()
     for line in link_map.read_text().splitlines():
         fields = line.split()
         if len(fields) != 2 or fields[0] != "LOAD" or not fields[1].endswith(".rlib"):
@@ -214,10 +214,22 @@ def rust_standard_library_inventory(stage, sysroot, link_map):
         relative = path.relative_to(sysroot).as_posix()
         require(re.fullmatch(r"lib/rustlib/[A-Za-z0-9._+-]+/lib/lib[A-Za-z0-9._+-]+\.rlib", relative),
                 "unexpected Rust standard-library input path")
+        require(path.is_file(), "linked Rust sysroot archive is missing")
+        target_directories.add(path.parent)
+    require(len(target_directories) == 1, "link map omits or mixes Rust target sysroots")
+    # Fat LTO consumes std/core bitcode before invoking the system linker, so
+    # its map may retain only compiler_builtins. Inventory the selected target's
+    # complete .rlib input set, not a falsely precise post-LTO linked subset.
+    libraries = {}
+    for path in sorted(next(iter(target_directories)).glob("*.rlib")):
+        require(path.is_file() and not path.is_symlink(), "invalid Rust target standard-library archive")
+        relative = path.relative_to(sysroot).as_posix()
+        require(re.fullmatch(r"lib/rustlib/[A-Za-z0-9._+-]+/lib/lib[A-Za-z0-9._+-]+\.rlib", relative),
+                "unexpected Rust standard-library input path")
         with path.open("rb") as contents:
             libraries[relative] = hashlib.file_digest(contents, "sha256").hexdigest()
     require(any(PurePosixPath(path).name.startswith("libstd-") for path in libraries),
-            "link map omits the linked Rust standard library")
+            "selected Rust target sysroot omits its standard library")
     inventory = "sysroot_path\tsha256\n" + "".join(path + "\t" + digest + "\n"
         for path, digest in sorted(libraries.items()))
     destination = stage / "share/sources/sandboxer/RUST-STDLIB.tsv"
@@ -296,7 +308,7 @@ def rust_toolchain_materials(stage, rustc, link_map):
         put_material(destination, relative, path.read_bytes())
     return ["bin/cloud-hypervisor", "Rust toolchain", version, source,
             "git:" + commit + ";compiler-sha256:" + hashlib.sha256(rustc.read_bytes()).hexdigest()
-            + ";linked-stdlib-sha256:" + stdlib_digest,
+            + ";target-stdlib-sha256:" + stdlib_digest,
             "share/licenses/sandboxer/rust-toolchain/" + version]
 
 

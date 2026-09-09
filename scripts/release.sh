@@ -157,7 +157,7 @@ validate_bundle() {
   stdlib_digest="$(sha256sum "$extract/share/sources/$NAME/RUST-STDLIB.tsv" | awk '{print $1}')"
   awk -F '\t' -v digest="$stdlib_digest" '
     $1 == "bin/cloud-hypervisor" && $2 == "Rust toolchain" &&
-      $5 ~ (";linked-stdlib-sha256:" digest "$") {found=1}
+      $5 ~ (";target-stdlib-sha256:" digest "$") {found=1}
     END {exit !found}
   ' "$extract/share/sources/$NAME/SOURCES.tsv" || fail "Rust standard-library inventory is not bound to the toolchain"
   awk -F '\t' '$1 == "bin/cloud-hypervisor" && $2 ~ /^rust-build-input:/ {found=1} END {exit !found}' \

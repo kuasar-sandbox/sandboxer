@@ -267,6 +267,26 @@ class MaterialsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "omits"):
             materials.rust_standard_library_inventory(stage, sysroot, link_map)
 
+    def test_lto_inventory_keeps_the_target_stdlib_input_set(self):
+        sysroot, _, library, link_map = self.rust_fixture()
+        builtins = library.with_name("libcompiler_builtins-fixture.rlib")
+        builtins.write_bytes(b"fixture compiler builtins")
+        link_map.write_text("LOAD " + str(builtins) + "\n")
+        stage = self.root / "stage"
+        first = materials.rust_standard_library_inventory(stage, sysroot, link_map)
+        inventory = (stage / "share/sources/sandboxer/RUST-STDLIB.tsv").read_text()
+        self.assertIn(library.name, inventory)
+        self.assertIn(builtins.name, inventory)
+        library.write_bytes(b"changed bitcode used before the final linker")
+        self.assertNotEqual(first, materials.rust_standard_library_inventory(stage, sysroot, link_map))
+        other = sysroot / "lib/rustlib/aarch64-unknown-linux-gnu/lib/libstd-fixture.rlib"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"other target")
+        with link_map.open("a") as output:
+            output.write("LOAD " + str(other) + "\n")
+        with self.assertRaisesRegex(ValueError, "mixes"):
+            materials.rust_standard_library_inventory(stage, sysroot, link_map)
+
     def test_debian_toolchain_uses_matching_source_package_not_rpm(self):
         sysroot, rustc, _, link_map = self.rust_fixture()
         copyright = self.root / "debian/copyright"
@@ -294,7 +314,7 @@ class MaterialsTests(unittest.TestCase):
                 patch.object(materials.subprocess, "check_output", side_effect=query):
             row = materials.rust_toolchain_materials(self.root / "stage", rustc, link_map)
         self.assertEqual(row[3], "deb-source:rustc@1.89.0+fixture")
-        self.assertIn(";linked-stdlib-sha256:", row[4])
+        self.assertIn(";target-stdlib-sha256:", row[4])
         copied = self.root / "stage" / row[5] / str(copyright).lstrip("/")
         self.assertEqual(copied.read_text(), copyright.read_text())
 
