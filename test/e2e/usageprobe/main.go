@@ -43,8 +43,12 @@ func main() {
 	case "exit":
 		fail(os.WriteFile("/tmp/usage-exit", nil, 0600))
 	case "true":
-	case "cpu":
-		end := time.Now().Add(time.Duration(number(os.Args[2])) * time.Second)
+	case "cpu", "cpu-ms":
+		unit := time.Second
+		if os.Args[1] == "cpu-ms" {
+			unit = time.Millisecond
+		}
+		end := time.Now().Add(time.Duration(number(os.Args[2])) * unit)
 		var n uint64
 		for time.Now().Before(end) {
 			for i := 0; i < 100000; i++ {

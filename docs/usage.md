@@ -325,6 +325,34 @@ Its short-save cases exercise integration; a separate `defaults` case waits
 for the actual default five-minute save. Neither is a production-density
 performance measurement.
 
+The [storage-fault E2E](../test/e2e/e2e_usage_faults.sh) uses a private bounded
+tmpfs for real ENOSPC and path-restricted `strace` injection for usage Sync
+failure and delayed writes. It also exercises SIGKILL and a sub-second Guest
+run. Injection never targets the business writable disk's sync operations;
+these tests do not simulate physical power loss. `strace`, mount privileges
+and the ordinary KVM E2E prerequisites are required.
+
+Run the [off/on harness](../test/e2e/usage_perf.py) without concurrent test
+loads, supplying the assembled `BIN` and root privileges:
+
+```bash
+python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3
+python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3 --trace
+```
+
+The baseline measures native process CPU, RssAnon/RssFile, FD/thread and
+non-dead Go G counts, actual record bytes, concentrated-stop duration and
+end-to-end exec p95/p99. Go G includes runtime system goroutines; it is not
+`runtime.NumGoroutine`. Exact-binary DWARF/symbol inspection requires `gdb`
+and Go tools. The separate Linux amd64 tracing run requires a `bpftrace` build
+with instruction-offset support and tracefs access (`BPFTRACE_BIN` can select
+an already installed tool). It adds wakeups, mallocgc requests/requested bytes, usage
+framing traffic, CH info requests, contended API mutex wait and save-worker
+duration. It verifies ordinary instruction probes against the exact binary;
+it does not insert Go return trampolines. Tracing perturbs timing, so its
+latencies cannot replace the untraced baseline. The harness checks available
+memory before admitting density and does not change host resource limits.
+
 Measure off/on using the same source set, runtime/kernel/CH, configuration,
 density and load. Report Guest/Host CPU, wakeups, allocations, FD/goroutines,
 resident memory, management traffic, CH query count/lock wait, bytes per

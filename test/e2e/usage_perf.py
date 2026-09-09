@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import time
 
-from usage import BIN, Sandbox, digest, ext4, image_ref, run, write_json
+from usage import BIN, REPO, Sandbox, digest, ext4, image_ref, run, write_json
 
 
 def percentile(values, q):
@@ -92,10 +92,11 @@ def record_sizes(path):
     return sizes
 
 
-def measure(work, name, density, workload, enabled, seconds, root, ref, read_g):
+def measure(work, name, density, workload, enabled, seconds, root, ref, read_g, trace_enabled):
     group = work / name
     group.mkdir()
     sandboxes, tasks, rows, latency = [], [], [], []
+    trace = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=density) as pool:
         try:
             for ordinal in range(density):
@@ -127,6 +128,9 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g):
                 matches = re.findall(r"CH started pid=(\d+)", (sb.dir / "run.log").read_text())
                 assert len(matches) == 1
                 chs.append(int(matches[0]))
+            if trace_enabled:
+                from usage_trace import Trace
+                trace = Trace(group, hosts, chs)
             if workload in ("cpu", "memory", "multidisk"):
                 for sb in sandboxes:
                     args = {"cpu": ["cpu", str(seconds+2)], "memory": ["memory", "320", str(seconds+2)],
@@ -155,6 +159,15 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g):
             stop_at = time.monotonic_ns()
             list(pool.map(lambda sb: sb.stop(), sandboxes))
             stop_ns = time.monotonic_ns()-stop_at
+            if trace is not None:
+                trace.close()
+                trace = None
+                trace_output = (group / "trace.log").read_text()
+                assert '"@mallocgc_calls"' in trace_output and '"@wakeups"' in trace_output, "required trace measurements absent"
+                if enabled:
+                    assert '"@usage_requests"' in trace_output and '"@saves"' in trace_output, "usage trace did not observe requests and final save"
+                else:
+                    assert '"@usage_requests"' not in trace_output and '"@saves"' not in trace_output, "disabled usage performed periodic work"
             hz = os.sysconf("SC_CLK_TCK")  # Harness only; product uses AT_CLKTCK.
             deltas = []
             for b, a in zip(before, after):
@@ -176,9 +189,13 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g):
             write_json(group / "result.json", result)
             return {k: v for k, v in result.items() if k not in ("measurements", "business_latency_ns")}
         finally:
-            for sb in sandboxes:
-                if sb.process.poll() is None:
-                    sb.stop()
+            try:
+                if trace is not None:
+                    trace.close()
+            finally:
+                for sb in sandboxes:
+                    if sb.process.poll() is None:
+                        sb.stop()
 
 
 def main():
@@ -187,6 +204,7 @@ def main():
     parser.add_argument("--workloads", default="idle,cpu,memory,multidisk,save,stop")
     parser.add_argument("--seconds", type=int, default=30)
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--trace", action="store_true", help="separate perturbed bpftrace diagnostics, not baseline latency")
     args = parser.parse_args()
     assert os.geteuid() == 0 and args.seconds >= 10 and args.repeat >= 1
     densities = [int(x) for x in args.densities.split(",")]
@@ -200,12 +218,18 @@ def main():
     work = Path(tempfile.mkdtemp(prefix="perf-usage-"))
     print(f"usage performance evidence: {work}", flush=True)
     read_g, layout = goroutine_reader()
-    metadata = {"arguments": vars(args), "host_kernel": run("uname", "-a"), "lscpu": run("lscpu"),
+    metadata = {"completed": False, "arguments": vars(args), "host_kernel": run("uname", "-a"), "lscpu": run("lscpu"),
                 "go_runtime_layout": layout, "ch": run(BIN / "cloud-hypervisor", "--version"),
                 "build": run("go", "version", "-m", BIN / "sandbox-ctl"),
                 "artifacts": {n: digest(BIN / n) for n in ("sandbox-ctl", "sandbox-init", "sandbox-runtime.bundle", "vmlinux", "cloud-hypervisor")},
-                "measurement": "untraced descriptive local CH/KVM; common .2s resource/exec probes; no production-density inference",
-                "not_measured_here": ["wakeups", "allocations", "management traffic", "CH API calls/lock wait", "per-save duration"]}
+                "measurement": "descriptive local CH/KVM; common .2s resource/exec probes; trace flag identifies perturbed diagnostics; no production-density inference",
+                "not_measured_here": [] if args.trace else ["wakeups", "allocations", "management traffic", "CH API calls/lock wait", "per-save duration"]}
+    metadata["harness_sha256"] = {p.name: digest(p) for p in Path(__file__).parent.glob("usage*.py")}
+    metadata["harness_sha256"]["usageprobe/main.go"] = digest(Path(__file__).parent / "usageprobe/main.go")
+    if (REPO / ".git").exists():
+        metadata["source_revisions"] = {name: run("git", "rev-parse", "HEAD", cwd=REPO.parent / name).strip()
+                                        for name in ("sandboxer", "accelerator", "connector", "guest-runtime")
+                                        if (REPO.parent / name / ".git").exists()}
     write_json(work / "source-set.json", metadata)
     root = work / "rootfs"
     root.mkdir()
@@ -222,9 +246,11 @@ def main():
                 # Alternate order between repeats to expose warm/order bias.
                 for enabled in ((False, True) if repeat % 2 == 0 else (True, False)):
                     name = f"r{repeat}-n{density}-{workload}-{'on' if enabled else 'off'}"
-                    results.append(measure(work, name, density, workload, enabled, args.seconds, root, ref, read_g))
+                    results.append(measure(work, name, density, workload, enabled, args.seconds, root, ref, read_g, args.trace))
                     write_json(work / "results.json", results)
                     print(f"PASS measured {name}", flush=True)
+    metadata["completed"] = True
+    write_json(work / "source-set.json", metadata)
 
 
 if __name__ == "__main__":

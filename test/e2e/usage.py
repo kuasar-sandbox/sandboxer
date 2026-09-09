@@ -121,6 +121,18 @@ def metric(snapshot, group, name):
     return next(m for m in snapshot[group] if m["name"] == name)
 
 
+def autonomous_balloon_prefix(capacity, target, actual, observations):
+    """A converged baseline plus actual growth before the first target change."""
+    if target <= 0 or actual != capacity-target:
+        return False
+    for observation in observations:
+        if observation["target"] != target:
+            return False
+        if observation["actual"] > actual:
+            return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", default="off,overlay,single,balloon,balloon-no-oom,oom,multidisk,restore,defaults")
@@ -232,9 +244,29 @@ def main():
                 if balloon:
                     initial = sb.ch_info()
                     write_json(sb.dir / "ch-before-pressure.json", initial)
-                    assert initial["config"]["balloon"]["size"] > 0, "balloon never inflated"
+                    assert initial["config"]["balloon"]["size"] > 0 and initial["memory_actual_size"] < 512*1024*1024, "no actual balloon inflation observed"
                     assert initial["config"]["balloon"]["deflate_on_oom"] == (name != "balloon-no-oom")
                 if name == "oom":
+                    # Begin just after an existing resource-control report to
+                    # leave time for allocation before the next five-second
+                    # control report. Do not disable or mutate that loop.
+                    report_offset = (sb.dir / "run.log").stat().st_size
+                    deadline = time.monotonic()+7
+                    while time.monotonic() < deadline:
+                        with (sb.dir / "run.log").open("rb") as log:
+                            log.seek(report_offset)
+                            if b"memory: shrink committed" in log.read():
+                                break
+                        time.sleep(.01)
+                    else:
+                        raise AssertionError("no stable control-report boundary")
+                    initial = sb.ch_info()
+                    write_json(sb.dir / "ch-oom-baseline.json", initial)
+                    assert initial["memory_actual_size"] == 512*1024*1024-initial["config"]["balloon"]["size"], "OOM baseline is not converged"
+                    initial_target = initial["config"]["balloon"]["size"]
+                    initial_actual = initial["memory_actual_size"]
+                    log_offset = (sb.dir / "run.log").stat().st_size
+                    autonomous = False
                     pressure_log = (sb.dir / "pressure.log").open("w")
                     pressure = subprocess.Popen([
                         str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", name,
@@ -249,6 +281,14 @@ def main():
                             observations.append({"at_monotonic_ns": time.monotonic_ns(),
                                                  "target": info["config"]["balloon"]["size"],
                                                  "actual": info["memory_actual_size"]})
+                            if not autonomous and autonomous_balloon_prefix(512*1024*1024, initial_target, initial_actual, observations):
+                                with (sb.dir / "run.log").open("rb") as log:
+                                    log.seek(log_offset)
+                                    segment = log.read().decode(errors="replace")
+                                (sb.dir / "autonomous-window.log").write_text(segment)
+                                # No accepted resize may explain this increase.
+                                assert "balloon: CH accepted target=" not in segment and "after lost/ambiguous resize" not in segment, segment
+                                autonomous = True
                             time.sleep(.02)
                         pressure.wait(timeout=10)
                         assert pressure.returncode == 0, "memory workload failed; see pressure.log"
@@ -259,10 +299,10 @@ def main():
                         pressure_log.close()
                         write_json(sb.dir / "ch-pressure.json", observations)
                     # These are real CH readings, not usage's sampled sequence.
-                    # actual > Capacity-target demonstrates Guest deflation
-                    # without a matching target write; do not call a control
-                    # grow transaction autonomous deflation.
-                    assert any(p["actual"] > 512*1024*1024-p["target"] for p in observations), "no autonomous OOM deflation observed"
+                    # Only the first unchanged-target segment after a proven
+                    # converged baseline qualifies. A later ordinary shrink
+                    # also has actual > Capacity-target and must not pass.
+                    assert autonomous, "no autonomous deflation before the first target change"
                     time.sleep(2)
                     pressure_view = sb.view()
                     write_json(sb.dir / "after-pressure.json", pressure_view)

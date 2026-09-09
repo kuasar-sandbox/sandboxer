@@ -261,6 +261,29 @@ timeout/busy. 不保证掉电下无损持久化, SIGKILL 测试不能证明掉�
 运行的 init 哈希与所提供的新 runtime bundle 一致. 短保存周期案例验证集成;
 独立的 `defaults` 案例等待实际默认五分钟保存. 两者都不是生产密度性能测量.
 
+[存储故障 E2E](../test/e2e/e2e_usage_faults.sh) 使用私有有界 tmpfs 产生真实
+ENOSPC, 并用限定 usage 路径的 `strace` 注入 Sync 失败和延迟写入; 还覆盖
+SIGKILL 与亚秒级 Guest 运行. 注入不作用于业务可写盘的同步操作, 也不模拟
+物理掉电. 需要 `strace`、mount 权限及普通 KVM E2E 前置条件.
+
+在没有其他并发测试负载时, 以 root 权限和已组装的 `BIN` 运行
+[off/on 测量脚本](../test/e2e/usage_perf.py):
+
+```bash
+python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3
+python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3 --trace
+```
+
+基线测量原生进程 CPU、RssAnon/RssFile、FD/thread、非 dead 的 Go G 数量、
+实际记录字节数、集中停止耗时和端到端 exec p95/p99. Go G 包含 runtime 系统
+goroutine, 不等于 `runtime.NumGoroutine`. 精确二进制 DWARF/symbol 检查需要
+`gdb` 和 Go tools. 独立的 Linux amd64 跟踪运行需要具备指令偏移支持的
+`bpftrace` 构建及 tracefs 权限 (`BPFTRACE_BIN` 可选择已安装工具),
+补充唤醒、mallocgc 请求/请求字节、usage framing 通信、CH info 请求、
+有争用的 API mutex 等待及保存 worker 耗时. 普通指令探针按精确二进制核验,
+不插入 Go 返回跳板. 跟踪会扰动时序, 其延迟不能替代无跟踪基线. 脚本检查可用
+内存再准入密度, 不修改宿主资源上限.
+
 Off/on 对比必须使用相同源集、runtime/kernel/CH、配置、密度及负载, 报告
 Guest/Host CPU、唤醒、分配、FD/goroutine、常驻内存、管理通信、CH 查询次数/
 锁等待、记录字节数、保存耗时及业务 p95/p99. 单元模型和普通进程实验不能替代
