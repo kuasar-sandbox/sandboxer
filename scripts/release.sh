@@ -154,6 +154,8 @@ package_release() {
   connector_sha="$(release_materials_resolve_git_source "$connector_source" \
     "${RELEASE_CONNECTOR_SOURCE_SHA:-}" connector)"
   cargo_sha="$(sha256sum "$ch_source/Cargo.lock" | awk '{print $1}')"
+  accelerator_version="$(release_materials_git_version "$accelerator_source" "$accelerator_version" "$accelerator_sha")"
+  connector_version="$(release_materials_git_version "$connector_source" "$connector_version" "$connector_sha")"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"
   release_materials_copy_licenses "$ROOT" project
   release_materials_copy_licenses "$ch_source" cloud-hypervisor
