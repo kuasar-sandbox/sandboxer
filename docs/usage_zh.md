@@ -43,8 +43,10 @@ sandbox-ctl usage --sandbox-id s1 --history --limit 10 --cursor 0
 返回活动尾部. 普通 ctl 请求的 framing 和大小上限不变.
 
 View 包含 `enabled`, 可选的 `live`/`saved`, `saved_end`, `saving`,
-`unknown_tail` 和可选 `save_error`/`read_error`. `saved` 表示当前 writer 已
-确认保存, 不只是 CRC 可读. `live` 包含已经接收但仍在保存或尚未提交的输入,
+`unknown_tail` 和可选 `save_error`/`read_error`. 在线 `saved` 是 owner 已采用
+的基线: 启动时恢复的完整存活记录, 或该 owner 后续已确认保存的记录. 本进程
+新写入的 CRC 可读不能单独推进基线. 离线 `saved` 是恢复校验通过的最后一条
+完整存活记录, 不证明原 writer 已确认 Sync. `live` 包含已经接收但仍在保存或尚未提交的输入,
 崩溃后可以回退到存活的 saved. 缺测、未持久化和文件尾部不确定是不同状态.
 
 在线查询只复制已有状态或读取已确认历史, 不触发 Guest/CH 采集、累计推进或
@@ -112,8 +114,10 @@ CH 的唯一 wait owner 使用 `waitid(WNOWAIT)`, 重试 EINTR, 在 proc 状态�
 存活时尽力最终读取, 然后调用 `cmd.Wait`. 不增加第二回收者, 不改变退出升级
 或输出排空. 即使总量可用, 未知逐线程末段仍标记 incomplete. 活动的
 sandbox-ctl 无法观察自身最后一次读取之后的退出/保存 CPU, 因而其终态记录保留
-已知总量但不声称完整. 重新打开任何已有 usage 文件都会保留已知 CPU 累计,
-但将跨进程历史标记 incomplete. 即使最后记录正常封口, 也不能排除其后有一次
+已知总量但不声称完整. 新 Host owner 重新打开已有 usage 文件供后续累计时,
+保留已知 CPU 累计, 但将 `live` 的跨进程历史标记 incomplete. 已保存或离线读取
+的记录保留写入时的完整性标志; 标志描述已记录的前缀, 不证明其后未知尾部完整.
+即使最后记录正常封口, 也不能排除其后有一次
 消耗 CPU 却未写出任何记录便崩溃的运行. 空文件和部分追加同样无法证明历史
 完整. 只有新建文件能确认逻辑历史的已知起点; 本实现不增加同步启动标记或 WAL
 来证明各次运行相邻.

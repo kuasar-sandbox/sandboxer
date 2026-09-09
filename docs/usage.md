@@ -48,8 +48,12 @@ the page size if a page cannot fit. History does not return the active tail.
 Ordinary ctl requests retain their existing framing and limits.
 
 The view contains `enabled`, optional `live` and `saved`, `saved_end`,
-`saving`, `unknown_tail`, and optional `save_error`/`read_error`. `saved` is
-confirmed by the current writer, not merely a readable CRC. `live` includes
+`saving`, `unknown_tail`, and optional `save_error`/`read_error`. Online `saved`
+is the owner's adopted baseline: a complete surviving record recovered at
+startup, or a later save this owner has confirmed. A readable CRC from its
+new write cannot alone advance that baseline. Offline `saved` is the last
+complete surviving record validated by recovery, not proof that its former
+writer confirmed Sync. `live` includes
 accepted input still in flight or not yet submitted for saving; it can roll
 back to surviving saved state after a crash. Missing observation, unsaved
 input and an uncertain file tail are different conditions.
@@ -135,8 +139,11 @@ add another reaper or alter shutdown escalation/output draining. Unknown
 thread terminal segments remain incomplete even when the total is available.
 The live sandbox-ctl cannot observe CPU consumed after its own final read;
 its saved terminal counter therefore retains a known total but is incomplete.
-Reopening any existing usage file preserves known CPU totals but marks
-cross-process history incomplete. Even a normally closed last record cannot
+When a new Host owner reopens an existing usage file for further accumulation,
+it preserves known CPU totals but marks cross-process history incomplete in
+`live`. Saved/offline records retain their completeness flags as recorded;
+those flags describe the stored prefix, not any later unknown tail.
+Even a normally closed last record cannot
 exclude an intervening run that consumed CPU and crashed without writing a
 record. Empty files and partial appends have the same limitation. Only a
 newly created file can establish the logical history's known starting point;

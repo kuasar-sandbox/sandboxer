@@ -41,6 +41,9 @@ func TestUsageOfflineIdentityAndLiveWriter(t *testing.T) {
 	if v.Live != nil || v.Saved == nil || v.Saved.Snapshot.SandboxID != "logical" {
 		t.Fatalf("%s", out.Bytes())
 	}
+	if len(v.Saved.Snapshot.Counters) != 1 || !v.Saved.Snapshot.Counters[0].Complete {
+		t.Fatal("offline query changed the saved prefix's completeness")
+	}
 	before, err := os.ReadFile(filepath.Join(dir, "logical.usage"))
 	if err != nil {
 		t.Fatal(err)
@@ -69,5 +72,29 @@ func TestUsageOfflineIdentityAndLiveWriter(t *testing.T) {
 	}
 	if err := runUsage(append(args, "--json=false"), &out); err == nil {
 		t.Fatal("unsupported output format")
+	}
+	// Only a new accumulating owner's live baseline is downgraded. Its adopted
+	// saved record, and the bytes returned by an offline read, remain unchanged.
+	next, err := usage.Open(dir, "logical", "next", time.Now(), time.Second, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	defer next.Close(ctx, time.Now())
+	got := next.View()
+	if got.Saved == nil || got.Live == nil || len(got.Live.Counters) != 1 {
+		t.Fatalf("reopen lost the saved/live baseline: %+v", got)
+	}
+	encoded, err := usage.EncodeRecord(*got.Saved)
+	if err != nil || !bytes.Equal(before, encoded) {
+		t.Fatalf("reopen changed the adopted saved record: %v", err)
+	}
+	if got.Live.Counters[0].Complete || got.Live.Counters[0].KnownTotal != v.Saved.Snapshot.Counters[0].KnownTotal {
+		t.Fatalf("incorrect live history baseline: %+v", got.Live.Counters[0])
+	}
+	after, err = os.ReadFile(filepath.Join(dir, "logical.usage"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("adopting saved state modified the file: %v", err)
 	}
 }
