@@ -206,7 +206,9 @@ def rust_standard_library_inventory(stage, sysroot, link_map):
             continue
         path = Path(fields[1])
         require(path.is_absolute(), "unresolved relative Rust link input")
-        path = path.resolve(strict=True)
+        # rustc may remove its own intermediate rlibs immediately after linking.
+        # Only sysroot inputs must still exist for standard-library collection.
+        path = path.resolve()
         if not path.is_relative_to(sysroot):
             continue  # Fresh Cargo outputs are covered by the observed package records.
         relative = path.relative_to(sysroot).as_posix()

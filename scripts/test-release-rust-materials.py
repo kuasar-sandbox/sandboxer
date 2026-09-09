@@ -91,8 +91,8 @@ class MaterialsTests(unittest.TestCase):
                 member.size = len(contents)
                 archive.addfile(member, io.BytesIO(contents))
         self.lock["package"][0]["checksum"] = hashlib.sha256(self.archive.read_bytes()).hexdigest()
-        self.collect()
-        self.assertFalse((self.root / "stage/share/licenses/sandboxer/rust/fixture@1.0.0/tests").exists())
+        rows = self.collect()
+        self.assertFalse((self.root / "stage" / rows[0][5] / "tests").exists())
 
     def test_license_traversal_still_rejected(self):
         with tarfile.open(self.archive, "w:gz") as archive:
@@ -251,6 +251,9 @@ class MaterialsTests(unittest.TestCase):
         sysroot, _, library, link_map = self.rust_fixture()
         stage = self.root / "stage"
         first = materials.rust_standard_library_inventory(stage, sysroot, link_map)
+        with link_map.open("a") as output:
+            output.write("LOAD " + str(self.root / "removed-rustc-temporary/intermediate.rlib") + "\n")
+        self.assertEqual(first, materials.rust_standard_library_inventory(stage, sysroot, link_map))
         inventory = stage / "share/sources/sandboxer/RUST-STDLIB.tsv"
         self.assertIn(hashlib.sha256(library.read_bytes()).hexdigest(), inventory.read_text())
         self.assertNotIn(str(self.root), inventory.read_text())
