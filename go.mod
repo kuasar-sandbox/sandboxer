@@ -19,8 +19,8 @@ require (
 
 require (
 	github.com/coreos/go-systemd/v22 v22.5.0
-	github.com/kuasar-sandbox/accelerator v0.0.0
-	github.com/kuasar-sandbox/connector v0.0.0
+	github.com/kuasar-sandbox/accelerator v0.1.3
+	github.com/kuasar-sandbox/connector v0.1.2
 	golang.org/x/crypto v0.47.0
 	golang.org/x/net v0.49.0
 	golang.org/x/sys v0.40.0

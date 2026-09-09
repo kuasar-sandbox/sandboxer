@@ -2,135 +2,125 @@
 
 # sandboxer
 
-microVM 沙箱生命周期引擎:冷启动、快照、恢复,以及块设备(vhost-user-blk)与
-按需内存(uffd 懒加载)的 host 侧编排;guest 侧由 PID 1
-(`sandbox-init`)承接,并由 `guest-runtime` 打包进 `sandbox-runtime.bundle`。是
-[kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的运行时
-核心,独立演进。
+`sandboxer` 是 [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 的 **MicroVM 生命周期引擎**。它创建 Sandbox,捕获并恢复状态,控制 guest,提供块设备,按需加载内存和磁盘数据,并协调每个 Sandbox 的 cgroup、balloon 与 VMM 生命周期。
 
-控制相关的跨仓薄导出面包括:`pkg/resource` 提供节点资源控制协议
-(wire + `Client`,由 `orchestrator` 的 **node-ctl** 作控制器侧 import),
-`pkg/ctl` 提供 host-local `ctl.sock` 协议，以及通过 caller policy callback 在 backend dial 前完成鉴权的 `ServeExecTunnel`；`ProxyExec` 只 relay 已连接 backend。可信 node proxy 通过这些入口接入现有 exec/MUX 链路。资源协议
-规范见 [`orchestrator/docs/node-resource_zh.md`](https://github.com/kuasar-sandbox/orchestrator/blob/main/docs/node-resource_zh.md)
-§5;`ctl.sock` 与 `ServeExecTunnel` 合同见 [`docs/sandbox_zh.md`](docs/sandbox_zh.md) §6.3。
+本仓既是完整 Kuasar Sandbox 平台的组件,也可作为独立 Runtime 引擎使用。它提供窄 Go package 和 host-local 协议,不会把编排、存储服务或 eBPF 实现引入 Runtime 依赖闭包。
 
-## 组成
+## 提供的能力
 
-| 路径 | 角色 |
-|---|---|
-| `cmd/sandbox-ctl` | host 控制平面:`run --config/--from/--restore` / `export` / `snapshot` / `publish` / `info` / `exec` / `config` |
-| `cmd/sandbox-init` | guest PID 1:三阶段 init + vsock 控制面 + 应用监督;由 `guest-runtime` 打包进 `sandbox-runtime.bundle` |
-| `pkg/sandbox` `pkg/restore` `pkg/snapshot` | 生命周期编排:显式/E冷启动、E/S同点快照、memory恢复与独立disk/memory provenance |
-| `pkg/sandboxfile` | strict Sandbox E 与 flattened image parser，以及保留 sparse map 的顶层 E source 组装 |
-| `pkg/artifact` | logical image/Sandbox source 的 Manifest store 与 named-location single-root Bundle 发布 API |
-| `pkg/uffd` `pkg/memory` | uffd handler 与 memfd 统一内存所有权(懒加载) |
-| `pkg/vhost` | vhost-user-blk 后端(file / manifest 块源 + CoW diff) |
-| `pkg/{guestlink,mux,proto,fwd,stdio}` | host↔guest vsock 控制面、stdio MUX 与端口转发 |
-| `pkg/ctl` | **导出面**:host-local `ctl.sock` 协议 + `ServeExecTunnel` request gate；`ProxyExec` 仅 relay 已连接 backend |
-| `pkg/{config,resctl,chapi,tapfd}` | sandbox.yaml、cgroup+balloon 联动、CH API 客户端、tapfd 消费 |
-| `pkg/util` | 内联工具(`ParseSize` / `LocateBinary` 等,跨模块导出) |
-| `pkg/resource` | **导出面**:节点资源控制协议(`orchestrator` 的 node-ctl import) |
+- 从已展平 image 冷创建 Sandbox;
+- 从 snapshot template 创建相互独立的实例;
+- 对一个逻辑 Sandbox 执行 pause、snapshot、export、publish、restore 和 resume;
+- 通过外部 memfd/userfaultfd 路径按需加载 guest memory;
+- 为本地文件或 Manifest-backed 数据提供 vhost-user block backend,并维护实例独立的 copy-on-write diff;
+- 通过 vsock 和多路复用 stdio/port-forwarding 路径受控通信;
+- 在平台授权后供可信 node service 使用的 host-local control socket;
+- 通过 cgroup 与 virtio-balloon 协调每个 Sandbox 的资源执行;
+- 接收 `connector` 交接的 TAP file descriptor;
+- 组装和发布 image-class 与 snapshot artifact 的 package API。
 
-## 顶层 Sandbox E 组装与直接发布
+Snapshot 复用由显式 parent/child 引用表示。从同一 template 创建的多个实例共享 immutable parent state,同时保有独立 writable change。Runtime 不要求多个独立运行的 VM 生成高度相同的 memory snapshot。
 
-上层构建器无需启动 VM，也无需先写完整 `.sandbox` 文件。`pkg/sandbox` 的
-`OpenFlattenedImage`、`PrepareSandboxEConfig` 和 `AssembleSandboxE` 接受 local
-digest-qualified tarstream、`manifest://` 或 located Manifest Bundle image，生成保留
-Hole/Zero/Data map 的标准 Sandbox E `sparse.Source`。输入 `FlattenedImage` 由调用者
-关闭；组装所得 source 借用它，必须在 image 关闭前消费完毕。原始 `config.json`
-bytes 原样保留，`sandbox.runtime.cfg` 使用 canonical encoding，root 为 direct EROFS
-`self` layout。每任务持有权威 key 的嵌入式调用者使用
-`artifact.NewProcessStorageWithCustomerKey` 显式传入 resolver；该 resolver 至多求值一次，
-不会退回或覆盖为进程级 `MANIFEST_KEY`。
+## 主要二进制
 
-`pkg/artifact.Publisher.PublishSource` 将已经组装的 `RoleImage` 或 `RoleSandbox`
-直接 ingest 到 Manifest store。`NewSingleRootBundlePublisher` 则将同样的 logical
-source 直接形成 named-location Manifest Bundle，返回
-`file://<key>.bundle@manifest:<key>#<location>`；它不先生成 tarstream、不先上传
-Manifest store，也不创建 `.image`、`.sandbox` 或 BuildID/SandboxID alias。调用者
-保留 source 的所有权。
+| 二进制 | 用途 |
+| --- | --- |
+| `sandbox-ctl` | Host 控制面:run、snapshot、export、publish、restore、inspect、execute 和 render config |
+| `sandbox-init` | Guest PID 1:分阶段初始化、应用监督、vsock 控制、stdio 多路复用和 guest 生命周期响应 |
 
-single-root Bundle 使用调用者预先取得的 write admission 与 customer key，在目标
-目录内完成 ingest/finalize 和完整验证，再通过 shared-location exclusive-create
-协议发布内容寻址 final；同 key 的并发 writer 收敛到
-经过严格验证的同一 final，corrupt、mismatched、symlink 或 non-regular existing
-final 均 fail closed。Local tarstream 是一个 role-specific transport file；Manifest
-Bundle 则是带 admission、Manifest/chunk 与 crypto domain 的自包含 carrier，两者不能
-仅凭扩展名互换。
+`sandbox-init` 在本仓构建,再由 [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime) 打包进 `sandbox-runtime.bundle`。
 
-## 本地目录身份
+## 公开集成 package
 
-`sandbox-ctl run` 将 `--run-root` / `--base-root` 视为调用级 **RunRoot** /
-**BaseRoot**。每个调用在两者下使用同一个 **PathID** leaf，形成实际
-**RunDir** / **BaseDir**：
+| Package | 用途 |
+| --- | --- |
+| `pkg/resource` | 节点资源控制 wire contract 与 client,由 `orchestrator` 使用 |
+| `pkg/ctl` | Host-local control socket 协议和 `ServeExecTunnel` policy callback;`ProxyExec` 仅 relay 已连接 backend |
+| `pkg/sandbox`、`pkg/restore`、`pkg/snapshot` | 生命周期、restore 和 snapshot 编排 |
+| `pkg/artifact` | 向 Manifest store 或 named-location Bundle 进行 typed publication |
+| `pkg/uffd`、`pkg/memory` | 按需 memory 加载与 memfd 所有权 |
+| `pkg/vhost` | vhost-user-blk backend 与 copy-on-write 数据路径 |
+| `pkg/guestlink`、`pkg/mux`、`pkg/proto`、`pkg/fwd`、`pkg/stdio` | Host/guest 控制、多路复用和 forwarding |
+| `pkg/config`、`pkg/resctl`、`pkg/chapi`、`pkg/tapfd` | Runtime 配置、资源执行、Cloud Hypervisor API 和 TAP 交接 |
 
-```text
-RunDir  = RunRoot/PathID
-BaseDir = BaseRoot/PathID
-```
+## 数据路径
 
-`--path-id` 省略时默认等于逻辑 **SandboxID**，因此既有调用的路径不变。
-显式 PathID 只允许一个安全路径分量；它只负责 host 目录和 `ctl.sock` 定位，
-不改变 SandboxID 在资源、日志、memfd、artifact 或 writable diff 文件名中的
-逻辑身份。`exec`、`snapshot` 和 live `export` 可只用 `--path-id` 定位运行中
-Sandbox；同时给出两者时 PathID 优先，ctl 协议不携带额外身份字段。
+生命周期层通过同一 sparse-data interface 使用本地文件和 Manifest-backed content。因此部署可将 snapshot 放在本地存储、NAS/NFS 等共享文件系统,或带 cache 的 object storage 上。编排 API 与所选 backend 保持独立。
 
-## 构建
+Memory 按 page fault-in,磁盘按 block 读取。未访问的数据无需在恢复后的 Sandbox 继续运行前全部加载。
+
+## 构建与测试
 
 ```bash
-make build                      # sandbox-ctl + sandbox-init
-make sandbox-ctl sandbox-init   # 两个纯 Go 二进制(CGO_ENABLED=0)
-make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
-make vet test
-make test-e2e                   # 运行 test/e2e/run_all.sh;需要项目主仓组装的完整 BIN
+make build                      # sandbox-ctl and sandbox-init
+make sandbox-ctl sandbox-init   # explicit binary targets
+make build TARGET_ARCH=aarch64  # cross-compile; amd64/arm64 aliases are accepted
+make vet test                   # static checks and unit tests
+make test-e2e                   # component owner suite; requires the assembled project BIN
 ```
 
-独立版本通过仓库 `main` 上受信任的 `Release` workflow 发布为 `vX.Y.Z`;发布件
-`sandboxer-vX.Y.Z-linux-x86_64.tar.gz` 包含 `sandbox-ctl`、`sandbox-init`、
-`cloud-hypervisor`。本仓文档与 `test/e2e/` 仅由项目主仓从所选 tag 聚合进
-platform 包。本地可用 `make release VERSION=vX.Y.Z`
-生成并校验相同布局的 release bundle。
-当前 Release 只发布已完成全量构建与 BMS 验证的 Linux x86_64 目标。项目主仓的
-每日协调器显式传入源码分支和精确 SHA;组件 `main` 用于主线,`release/vX.Y.x`
-用于对应组件维护线。Preview 和维护分支 Stable 不更新 GitHub Latest;独立的幂等
-Reconcile Latest 工作流按 `main` 源码提交先后协调主线 Stable,同一提交才比较 SemVer。
-组件版本与平台聚合版本独立,
-平台始终按精确 Tag 选择本组件。
-同版本发布与删除共用完整 workflow mutation group;若 GitHub 合并 pending 请求,项目主仓
-协调器会把 cancelled 状态作为未完成操作自动重跑,不会把它当作发布或 GC 已完成。
+前置条件:
 
-构建需要 Go 1.24+;运行还需 **guest-runtime** 发布的 `sandbox-runtime.bundle`
-和 `vmlinux`(guest 内核);patched `cloud-hypervisor` 由本仓
-`sandboxer/native-deps` 构建并由 `sandbox-ctl` 启动。`mkfs.erofs` 是
-guest-runtime 构建 runtime 镜像和 build sandbox 内展平镜像时使用的工具,
-不是 sandboxer host 侧运行依赖。
+- 源码构建使用 Go 1.24+;
+- 真实 Runtime 操作需要 Linux 和 root 权限;
+- MicroVM E2E 需要 KVM 和相应 kernel interface;
+- 需要 `guest-runtime` 提供 `sandbox-runtime.bundle` 和 VMLinux;
+- 需要 `sandboxer/native-deps` 构建的 patched Cloud Hypervisor。
 
-## 跨仓依赖(薄)
+Unit/static 检查不能证明 privileged KVM、TAP、cgroup、vhost 或 restore 路径已执行。被 skip 的 privileged suite 不能表述为已完成集成验证。
 
-| 依赖 | 用途 | 解析 |
-|---|---|---|
-| `accelerator/pkg/manifest`(+ `cache`/`store` client) | 快照 ingest/fetch、vhost 块读 | `replace => ../accelerator` |
-| `accelerator/pkg/image` | 读取展平镜像内嵌的 RuntimeConfig | `replace => ../accelerator` |
-| `connector/pkg/tapfd` | tapfd 交接消费侧(`RecvFdsWithNetns`) | `replace => ../connector` |
+## Cloud Hypervisor 边界
 
-均为纯 Go、无 CGO 的导入面——整仓 `CGO_ENABLED=0` 构建,不引入 rocksdb / eBPF
-等重依赖。`replace` 指向兄弟仓相对路径:clone 全组织为兄弟目录即可离线构建;
-组织级 `go.work` 见 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox)。
+`sandboxer` 维护项目 Cloud Hypervisor patch set 和构建支持。Patch set 提供 Runtime 所需的 external-memory、userfaultfd、balloon 和生命周期合同。上游源码、精确 patch target、构建输入及许可证边界记录在 [`docs/cloud-hypervisor_zh.md`](docs/cloud-hypervisor_zh.md) 和 [`LICENSE_SCOPE_zh.md`](LICENSE_SCOPE_zh.md)。
+
+Cloud Hypervisor 仍是采用上游许可证的第三方软件。项目原创 Go code 不会重许可上游代码,也不会重许可保留上游 copyright 和 license 的 patch。
+
+## 跨仓依赖
+
+Go import surface 保持窄边界:
+
+| 仓库 | Import surface | 用途 |
+| --- | --- | --- |
+| `accelerator` | Manifest、cache/store client、sparse/image helper | Snapshot ingest/fetch、block read 和 flattened-image 配置 |
+| `connector` | `pkg/tapfd` | 接收 TAP 与 network namespace file descriptor |
+
+Go-only 源码构建需要本仓以及兄弟目录中的 `accelerator` 和 `connector`。即使设置 `GOWORK=off`,已有本地 `replace` 仍会生效。内部 `require` 版本描述各组件目标正式 Release(Daily Preview 使用去掉 preview 后缀的同一目标);目标 Tag 可以尚不存在,因为实际构建使用兄弟目录源码。验证必须记录实际源码 SHA,不能把版本标签当作编译使用的 revision。完整系统使用[项目工作区](https://github.com/kuasar-sandbox/kuasar-sandbox)。Patched Cloud Hypervisor、Guest Runtime 和 Kernel 是独立 Native/Runtime 前置,不是所有 Go-only 检查的依赖。
+
+## Release 模型
+
+`sandboxer` 独立发布 `vX.Y.Z` 组件版本。x86_64 archive 包含 `sandbox-ctl`、`sandbox-init` 和 patched `cloud-hypervisor` binary。组件文档与 E2E source 从选定 Tag 收集进项目 platform archive,不会在组件 archive 中重复交付。
+
+项目仓独立发布 `release-vX.Y.Z` 聚合版本,精确选择一个 `sandboxer` Tag 和其他各发行单元版本,并验证组合后的完整系统。
+
+版本关系见[项目 Release 文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md),可用的 Stable 聚合版本由 [GitHub Latest Release](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest) 渠道解析。
 
 ## 文档
 
-- [沙箱工件](docs/sandbox-artifacts_zh.md) — 便携 E/S 配置、父引用图、载体、完整性与发布契约。
+- [Sandbox artifact](docs/sandbox-artifacts_zh.md) - 便携 E/S 配置、parent/reference graph、carrier、integrity 和 publication contract。
 
-- [docs/sandbox_zh.md](docs/sandbox_zh.md) — host 控制平面、运行配置、冷启动、
-  snapshot/export/restore 执行顺序、资源执行与清理。
-- [docs/journald_zh.md](docs/journald_zh.md) — 逐输出目标、自定义 journal 字段、组件诊断、编码与失败回退。
-- [docs/sandbox-init_zh.md](docs/sandbox-init_zh.md) — guest PID 1 ABI:
-  `sandbox-init` 三阶段、vsock 控制面 + stdio MUX 协议、应用契约。
-- [docs/cloud-hypervisor_zh.md](docs/cloud-hypervisor_zh.md) — patched CH 与
-  `sandbox-ctl` 的外部 memfd/uffd/balloon 契约。
+完整设计与参考文档:
+
+- [`docs/sandbox_zh.md`](docs/sandbox_zh.md) - host 控制面、配置、cold start、snapshot/export/restore 顺序、资源执行和清理;
+- [`docs/journald_zh.md`](docs/journald_zh.md) - 独立输出目标、自定义 journal field、组件诊断、编码和 fallback;
+- [`docs/sandbox-init_zh.md`](docs/sandbox-init_zh.md) - guest PID 1 ABI、分阶段初始化、vsock 控制、stdio 多路复用和应用合同;
+- [`docs/cloud-hypervisor_zh.md`](docs/cloud-hypervisor_zh.md) - patched Cloud Hypervisor source、build 和 Runtime contract。
+
+生命周期、guest ABI 与 VMM 指南通过相互语言选择器提供完整英文默认文档和中文对应文档。Native build 与 license scope 文档也提供英中版本。
+
+## 项目边界
+
+- Node/cluster 编排属于 [`orchestrator`](https://github.com/kuasar-sandbox/orchestrator);
+- 数据访问、存储、加密与缓存属于 [`accelerator`](https://github.com/kuasar-sandbox/accelerator);
+- MicroVM 网络属于 [`connector`](https://github.com/kuasar-sandbox/connector);
+- Guest Runtime image 与 Kernel artifact 属于 [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime);
+- 系统设计、共享集成测试与聚合 Release 属于 [`kuasar-sandbox/kuasar-sandbox`](https://github.com/kuasar-sandbox/kuasar-sandbox)。
+
+## 贡献与安全
+
+阅读[组织贡献指南](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md)。修改 exported package 或跨仓合同必须双向关联 companion PR,并通过精确源码组合的项目验证。
+
+不要在公开 Issue 报告漏洞。按 [Kuasar Sandbox 安全策略](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy)使用 GitHub private vulnerability reporting。
 
 ## License
 
-本仓库的项目原创内容采用 [Apache License 2.0](LICENSE).Cloud Hypervisor patch
-中保留的上游许可证边界见 [LICENSE_SCOPE_zh.md](LICENSE_SCOPE_zh.md).
-贡献授权说明见 [CONTRIBUTING.md（英文）](CONTRIBUTING.md).
+项目原创内容采用 [Apache License 2.0](LICENSE)。Cloud Hypervisor 和其他第三方边界记录在 [`LICENSE_SCOPE_zh.md`](LICENSE_SCOPE_zh.md)。保留上游 copyright、attribution、NOTICE 和 SPDX declaration。
