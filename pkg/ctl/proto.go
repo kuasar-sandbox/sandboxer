@@ -8,7 +8,7 @@
 // ctl.sock is a host-local UDS carrying host-side request types, not a
 // guest channel.
 //
-// Three request shapes:
+// Four request shapes:
 //
 //   - snapshot_request — one request, one response, conn closes. The
 //     run process handles it via Server.SnapshotHandler.
@@ -18,6 +18,8 @@
 //     the SAME connection switches to the stdio MUX (pkg/mux)
 //     end-to-end between `sandbox-ctl exec` and the guest. The run
 //     process pipes bytes through transparently after the ack.
+//   - usage_request — read existing live/saved/history state, one response;
+//     never triggers observations or persistence.
 package ctl
 
 import (

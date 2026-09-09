@@ -728,24 +728,11 @@ func ServeAndWait(p VMParams) (int, error) {
 	go func() {
 		if usageSampler != nil {
 			var info unix.Siginfo
-			var waitIDErr error
-			for {
-				waitIDErr = unix.Waitid(unix.P_PID, chPid, &info, unix.WEXITED|unix.WNOWAIT, nil)
-				if !errors.Is(waitIDErr, unix.EINTR) {
-					break
-				}
-			}
-			if waitIDErr == nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-				usageSampler.FinalCH(ctx)
-				cancel()
-			} else {
+			waitIDErr := observeCHExit(func() error {
+				return unix.Waitid(unix.P_PID, chPid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+			}, usageSampler.FinalCH)
+			if waitIDErr != nil {
 				logf("usage final waitid: %v", waitIDErr)
-				// No retained process endpoint: close sampler admission and
-				// mark every CH/vCPU counter's terminal segment unknown.
-				ctx, cancel := context.WithCancel(context.Background())
-				cancel()
-				usageSampler.FinalCH(ctx)
 			}
 		}
 		waitErr := cmd.Wait()

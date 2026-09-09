@@ -3,11 +3,13 @@
 import argparse
 import atexit
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import shutil
 import signal
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -86,6 +88,20 @@ class Sandbox:
     def view(self):
         return json.loads(self.cli("usage", "--base-root", self.baseroot))
 
+    def ch_info(self):
+        connection = http.client.HTTPConnection("localhost", timeout=2)
+        connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.sock.settimeout(2)
+        connection.sock.connect(str(self.runroot / "instance/ch.sock"))
+        try:
+            connection.request("GET", "/api/v1/vm.info")
+            response = connection.getresponse()
+            body = response.read()
+            assert response.status == 200, body
+            return json.loads(body)
+        finally:
+            connection.close()
+
     def stop(self):
         if self.process.poll() is None:
             try:
@@ -107,7 +123,7 @@ def metric(snapshot, group, name):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cases", default="off,overlay,single,balloon,multidisk,restore,defaults")
+    parser.add_argument("--cases", default="off,overlay,single,balloon,balloon-no-oom,oom,multidisk,restore,defaults")
     parser.add_argument("--seconds", type=int, default=12)
     args = parser.parse_args()
     assert args.seconds >= 6
@@ -147,12 +163,13 @@ def main():
     ref = image_ref(image)
     results = []
     for name in metadata["cases"]:
-        assert name in ("off", "overlay", "single", "balloon", "multidisk", "restore", "defaults"), name
+        assert name in ("off", "overlay", "single", "balloon", "balloon-no-oom", "oom", "multidisk", "restore", "defaults"), name
+        balloon = name in ("balloon", "balloon-no-oom", "oom")
         diff = work / f"{name}.ext4"
         ext4(diff, root if name == "single" else None)
         config = {"resources": {"capacity": {"cpu": 1, "memory": "512MiB"},
-                                "allocatable": {"cpu": 1, "memory": "256MiB" if name == "balloon" else "512MiB",
-                                                "deflate_on_oom": name == "balloon"}},
+                                "allocatable": {"cpu": 1, "memory": "256MiB" if balloon else "512MiB",
+                                                "deflate_on_oom": name in ("balloon", "oom")}},
                   "boot": {"kernel": f"file://{BIN / 'vmlinux'}", "runtime": f"file://{BIN / 'sandbox-runtime.bundle'}",
                            "cmdline": "console=hvc0 printk.time=1",
                            "root": {"diff": f"file://{diff}"} if name == "single" else
@@ -212,6 +229,45 @@ def main():
                     assert not before.get("saved") and after["saved"]["sequence"] == "1", "default cadence is not five minutes"
                 assert a["sandbox_id"] == name and (sb.baseroot / "instance" / f"{name}.usage").exists()
                 write_json(sb.dir / "history.json", json.loads(sb.cli("usage", "--history", "--limit", "10")))
+                if balloon:
+                    initial = sb.ch_info()
+                    write_json(sb.dir / "ch-before-pressure.json", initial)
+                    assert initial["config"]["balloon"]["size"] > 0, "balloon never inflated"
+                    assert initial["config"]["balloon"]["deflate_on_oom"] == (name != "balloon-no-oom")
+                if name == "oom":
+                    pressure_log = (sb.dir / "pressure.log").open("w")
+                    pressure = subprocess.Popen([
+                        str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", name,
+                        "--path-id", "instance", "--run-root", str(sb.runroot),
+                        "--", "/probe", "memory", "440", "4"],
+                        stdout=pressure_log, stderr=subprocess.STDOUT)
+                    observations = []
+                    try:
+                        end = time.monotonic() + 8
+                        while time.monotonic() < end:
+                            info = sb.ch_info()
+                            observations.append({"at_monotonic_ns": time.monotonic_ns(),
+                                                 "target": info["config"]["balloon"]["size"],
+                                                 "actual": info["memory_actual_size"]})
+                            time.sleep(.02)
+                        pressure.wait(timeout=10)
+                        assert pressure.returncode == 0, "memory workload failed; see pressure.log"
+                    finally:
+                        if pressure.poll() is None:
+                            pressure.terminate()
+                            pressure.wait(timeout=5)
+                        pressure_log.close()
+                        write_json(sb.dir / "ch-pressure.json", observations)
+                    # These are real CH readings, not usage's sampled sequence.
+                    # actual > Capacity-target demonstrates Guest deflation
+                    # without a matching target write; do not call a control
+                    # grow transaction autonomous deflation.
+                    assert any(p["actual"] > 512*1024*1024-p["target"] for p in observations), "no autonomous OOM deflation observed"
+                    time.sleep(2)
+                    pressure_view = sb.view()
+                    write_json(sb.dir / "after-pressure.json", pressure_view)
+                    ram = metric(pressure_view["live"], "gauges", "guest.memory")
+                    assert ram["status"] == "ok" and int(ram["covered_total_ns"]) > int(metric(a, "gauges", "guest.memory")["covered_total_ns"]), ram
                 if name == "restore":
                     output = sb.dir / "snapshot"
                     output.mkdir()

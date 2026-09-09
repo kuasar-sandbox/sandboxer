@@ -2,7 +2,7 @@
 // sandbox-init control channel that runs over virtio-vsock, plus the
 // constants shared with the stdio MUX sub-protocol (pkg/mux).
 //
-// Three connection classes (docs/sandbox-init.md §4):
+// Four connection classes (docs/sandbox-init.md §4):
 //
 //	(1) Management connections — a fresh connection per operation. Ordinary
 //	    operations request/respond and close; launch uses four messages,
@@ -28,6 +28,11 @@
 //	    then the conn switches to the fwd frame sub-protocol
 //	    (pkg/fwd), pairing a guest-side dial or accepted target connection
 //	    with TCP half-close preserved (docs/sandbox-init.md §3.7).
+//
+//	(4) Usage observation connection — at most one dedicated reusable
+//	    management connection for fresh raw usage_request/usage_response
+//	    rounds. It never switches to MUX or retains historical observations
+//	    (docs/sandbox-init.md §4.11).
 //
 // This package uses the standard library and the small internal/wireio helper, so the guest
 // sandbox-init binary can import it without dragging in YAML or other
