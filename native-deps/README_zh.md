@@ -45,7 +45,12 @@ make cloud-hypervisor TARGET_ARCH=aarch64
 `bin/<arch>/cloud-hypervisor` 或执行 `make clean` 后重跑。格式化 patch 本身不会使
 已有 binary 失效。`make clean` 删除 native 构建输出与 bin,保留 patch 源码工作区和 tarball 缓存。
 
-发行打包不复用上述开发二进制或 patch 工作区。它把选定的 sandboxer commit
+发行打包不复用上述开发二进制或 patch 工作区。它还从选定的 sandboxer、
+accelerator、connector commit 建立全新 checkout,以 `GOWORK=off` 和只读 module
+解析重新构建 `sandbox-ctl`、`sandbox-init`。不会复制被忽略的开发输入或旧兄弟
+二进制,并拒绝 `RELEASE_BIN_DIR` 覆盖。暂存前会核对 Go VCS 信息是否匹配所选
+项目 commit。Go 构建采用相同的凭据过滤策略及私有构建/module 缓存,可保留
+无凭据的 HTTPS `GOPROXY` 路由。它把选定的 sandboxer commit
 解到临时目录,验证 pin 的 Cloud Hypervisor tarball、应用该 commit 的 patch,
 再用本次所属的私有 Cargo home 按锁文件重新构建。Python 3.11 或更新版本从
 实际 Cargo 构建报告采集来源材料:registry crate 归档必须匹配 `Cargo.lock`

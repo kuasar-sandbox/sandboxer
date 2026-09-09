@@ -67,11 +67,18 @@ def native_build_environment(original, home, cargo_home, rustc):
     allowed = {"PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
                "http_proxy", "https_proxy", "all_proxy", "no_proxy", "CARGO_BUILD_JOBS",
-               "CARGO_NET_GIT_FETCH_WITH_CLI"}
+               "CARGO_NET_GIT_FETCH_WITH_CLI", "GOPROXY"}
     environment = {name: value for name, value in original.items() if name in allowed}
     environment.setdefault("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
     require(environment["CARGO_NET_GIT_FETCH_WITH_CLI"] in ("true", "false"),
             "invalid Cargo Git transport setting")
+    for value in environment.get("GOPROXY", "").replace("|", ",").split(","):
+        if value in ("", "direct", "off"):
+            continue
+        parsed = urlsplit(value)
+        require(parsed.scheme == "https" and parsed.hostname and parsed.username is None
+                and parsed.password is None and not parsed.query and not parsed.fragment,
+                "release Go proxy routing must use credential-free HTTPS")
     for name, value in environment.items():
         if name.lower() in ("http_proxy", "https_proxy", "all_proxy"):
             parsed = urlsplit(value)

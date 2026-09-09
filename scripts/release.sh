@@ -69,6 +69,15 @@ validate_archive_contract() {
     || fail "$archive violates the exact entry contract"
 }
 
+stage_go_source() {
+  local source="$1" sha="$2" destination="$3"
+  # A new checkout contains only committed inputs, including when the caller's
+  # development tree has ignored .go/embed files. A real .git directory keeps
+  # Go VCS stamping available; no commit or tag is created.
+  git clone --quiet --no-hardlinks --no-checkout --single-branch --no-tags "$source" "$destination"
+  git -C "$destination" -c advice.detachedHead=false checkout --quiet --detach "$sha"
+}
+
 prepare_cloud_hypervisor() {
   local project_sha="$1" arch="$2" native_root="$WORK/native-build/native-deps" variable
   for variable in RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR CLOUD_HYPERVISOR_TARBALL \
@@ -170,11 +179,8 @@ package_release() {
   STAGE="$WORK/stage"
   rm -rf "$STAGE"
   install -d -m 0755 "$STAGE" "$STAGE/bin"
-  bin_dir="${RELEASE_BIN_DIR:-$ROOT/bin/$arch}"
-  copy_executable "$bin_dir/sandbox-ctl" bin/sandbox-ctl
-  copy_executable "$bin_dir/sandbox-init" bin/sandbox-init
-  check_go_binary "$STAGE/bin/sandbox-ctl"
-  check_go_binary "$STAGE/bin/sandbox-init"
+  [ -z "${RELEASE_BIN_DIR:-}" ] \
+    || fail "RELEASE_BIN_DIR is not supported: release Go payloads are rebuilt from selected sources"
 
   accelerator_source="${RELEASE_ACCELERATOR_SOURCE_DIR:-$ROOT/../accelerator}"
   connector_source="${RELEASE_CONNECTOR_SOURCE_DIR:-$ROOT/../connector}"
@@ -185,14 +191,27 @@ package_release() {
   [[ "$connector_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
     || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" sandboxer)"
-  release_materials_require_go_revision "$STAGE/bin/sandbox-ctl" "$project_sha"
-  release_materials_require_go_revision "$STAGE/bin/sandbox-init" "$project_sha"
-  prepare_cloud_hypervisor "$project_sha" "$arch"
-  ch_source="$CH_RELEASE_SOURCE"
   accelerator_sha="$(release_materials_resolve_git_source "$accelerator_source" \
     "${RELEASE_ACCELERATOR_SOURCE_SHA:-}" accelerator)"
   connector_sha="$(release_materials_resolve_git_source "$connector_source" \
     "${RELEASE_CONNECTOR_SOURCE_SHA:-}" connector)"
+  mkdir -p "$WORK/go-build"
+  stage_go_source "$ROOT" "$project_sha" "$WORK/go-build/sandboxer"
+  stage_go_source "$accelerator_source" "$accelerator_sha" "$WORK/go-build/accelerator"
+  stage_go_source "$connector_source" "$connector_sha" "$WORK/go-build/connector"
+  python3 "$ROOT/scripts/release-rust-materials.py" run-native \
+    "$WORK/go-home" "$WORK/cargo-home" "$(rustc --print sysroot)/bin/rustc" env \
+    GOWORK=off GOENV=off GOFLAGS=-mod=readonly GOCACHE="$WORK/go-cache" GOMODCACHE="$WORK/go-mod" \
+    make --no-print-directory -C "$WORK/go-build/sandboxer" TARGET_ARCH="$arch" sandbox-ctl sandbox-init
+  bin_dir="$WORK/go-build/sandboxer/bin/$arch"
+  copy_executable "$bin_dir/sandbox-ctl" bin/sandbox-ctl
+  copy_executable "$bin_dir/sandbox-init" bin/sandbox-init
+  check_go_binary "$STAGE/bin/sandbox-ctl"
+  check_go_binary "$STAGE/bin/sandbox-init"
+  release_materials_require_go_revision "$STAGE/bin/sandbox-ctl" "$project_sha"
+  release_materials_require_go_revision "$STAGE/bin/sandbox-init" "$project_sha"
+  prepare_cloud_hypervisor "$project_sha" "$arch"
+  ch_source="$CH_RELEASE_SOURCE"
   cargo_sha="$(sha256sum "$ch_source/Cargo.lock" | awk '{print $1}')"
   accelerator_version="$(release_materials_git_version "$accelerator_source" "$accelerator_version" "$accelerator_sha")"
   connector_version="$(release_materials_git_version "$connector_source" "$connector_version" "$connector_sha")"
@@ -229,7 +248,7 @@ package_release() {
     "git:$connector_sha" connector
   release_materials_add_go_binary "$STAGE/bin/sandbox-ctl" bin/sandbox-ctl
   release_materials_add_go_binary "$STAGE/bin/sandbox-init" bin/sandbox-init
-  release_materials_finish
+  GOMODCACHE="$WORK/go-mod" release_materials_finish
 
   mkdir -p "$output/assets"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \

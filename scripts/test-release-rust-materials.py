@@ -181,12 +181,14 @@ class MaterialsTests(unittest.TestCase):
         environment = materials.native_build_environment(
             {"PATH": "/usr/bin", "CARGO_BUILD_JOBS": "2", "GH_TOKEN": "fixture",
              "CARGO_NET_GIT_FETCH_WITH_CLI": "false",
+             "GOPROXY": "https://proxy.example.invalid,direct",
              "CARGO_REGISTRIES_CRATES_IO_TOKEN": "fixture", "AWS_SECRET_ACCESS_KEY": "fixture",
              "CARGO_REGISTRY_CREDENTIAL_PROVIDER": "fixture", "SSH_AUTH_SOCK": "/fixture"},
             self.root / "home", self.home, Path("/toolchain/bin/rustc"))
         self.assertEqual(environment["RUSTC"], "/toolchain/bin/rustc")
         self.assertEqual(environment["CARGO_BUILD_JOBS"], "2")
         self.assertEqual(environment["CARGO_NET_GIT_FETCH_WITH_CLI"], "false")
+        self.assertEqual(environment["GOPROXY"], "https://proxy.example.invalid,direct")
         self.assertNotIn("fixture", environment.values())
         self.assertNotIn("SSH_AUTH_SOCK", environment)
         for name in ("RUSTC", "RUSTC_WRAPPER", "CARGO_BUILD_RUSTC"):
@@ -195,6 +197,9 @@ class MaterialsTests(unittest.TestCase):
                                                    Path("/toolchain/bin/rustc"))
         with self.assertRaisesRegex(ValueError, "Git transport"):
             materials.native_build_environment({"CARGO_NET_GIT_FETCH_WITH_CLI": "invalid"},
+                                               self.root / "home", self.home, Path("/toolchain/bin/rustc"))
+        with self.assertRaisesRegex(ValueError, "Go proxy"):
+            materials.native_build_environment({"GOPROXY": "https://fixture:fixture@proxy.example.invalid"},
                                                self.root / "home", self.home, Path("/toolchain/bin/rustc"))
 
     def test_cargo_directory_and_authenticated_registry_rejected(self):

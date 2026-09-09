@@ -314,10 +314,24 @@ RELEASE_TEST_CH_SOURCE="$fixture_root/cloud-hypervisor"
 RELEASE_TEST_CRATE="$fixture_root/fixture-1.0.0.crate"
 [ -z "${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}" ]
 [ -z "${GH_TOKEN:-}" ]
-"$RUSTC" -vV >/dev/null
 while [ "$#" -gt 0 ] && [ "$1" != -C ]; do shift; done
 [ "$1" = -C ]
 root="$2"
+if [[ "$root" == */go-build/sandboxer ]]; then
+  [ "$GOWORK" = off ] && [ "$GOFLAGS" = -mod=readonly ]
+  [ ! -e "$root/ignored-release-input.go" ]
+  [ ! -e "$root/../accelerator/ignored-release-input.go" ]
+  [ ! -e "$root/../connector/ignored-release-input.go" ]
+  for component in sandboxer accelerator connector; do
+    [ "$(git -C "$root/../$component" rev-parse HEAD)" = \
+      "$(git -C "$fixture_root/${component/sandboxer/project}" rev-parse HEAD)" ]
+  done
+  mkdir -p "$root/bin/x86_64"
+  install -m 0755 "$fixture_root/go-fixture" "$root/bin/x86_64/sandbox-ctl"
+  install -m 0755 "$fixture_root/go-fixture" "$root/bin/x86_64/sandbox-init"
+  exit 0
+fi
+"$RUSTC" -vV >/dev/null
 [[ "$root" == */native-build/native-deps ]]
 source="$root/build/src/cloud-hypervisor"
 [ ! -e "$source" ]
@@ -377,7 +391,18 @@ native_fixture_env=(
   CARGO_REGISTRIES_CRATES_IO_TOKEN=fixture-must-not-reach-build
   GH_TOKEN=fixture-must-not-reach-build
 )
-env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+for source in "$fixture_root" "$TMP/accelerator" "$TMP/connector"; do
+  printf 'ignored-release-input.go\n' >> "$source/.git/info/exclude"
+  printf 'this ignored file must not enter a release build\n' > "$source/ignored-release-input.go"
+done
+if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 \
+  "$TMP/prebuilt-override" > "$TMP/prebuilt-override.log" 2>&1; then
+  fail "packager accepted a prebuilt Go payload override"
+fi
+grep -Fq 'RELEASE_BIN_DIR is not supported' "$TMP/prebuilt-override.log" \
+  || fail "prebuilt Go payload override failed for an unrelated reason"
+[ ! -e "$TMP/prebuilt-override" ] || fail "rejected prebuilt override created an output bundle"
+env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
   RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
   RELEASE_ACCELERATOR_VERSION=v0.1.3 \
@@ -415,7 +440,7 @@ tar -xOf "$archive" ./share/sources/sandboxer/SOURCES.tsv \
   | grep -Fq $'\tGo toolchain\t'"$go_toolchain"$'\t' \
   || fail "archive does not associate its Go toolchain with license material"
 
-env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
   RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
   RELEASE_ACCELERATOR_VERSION=v0.1.3 \
@@ -491,11 +516,11 @@ repack_bundle_with_owner_names \
 expect_invalid_archive "$TMP/numeric-owner-name-bundle" \
   "literal numeric owner names paired with root numeric IDs"
 
-if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
+if "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
   "$TMP/invalid-version" >/dev/null 2>&1; then
   fail "packager accepted an invalid version"
 fi
-if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
+if "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
   "$TMP/invalid-arch" >/dev/null 2>&1; then
   fail "packager accepted an unvalidated release architecture"
 fi

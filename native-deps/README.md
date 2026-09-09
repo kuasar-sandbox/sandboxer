@@ -52,6 +52,13 @@ by itself invalidate the existing binary. `make clean` removes the native build
 output and `bin/`, but preserves the source patch workspace and tarball cache.
 
 Release packaging does not reuse that development binary or patch workspace.
+It also rebuilds `sandbox-ctl` and `sandbox-init` in fresh checkouts of the
+selected sandboxer, accelerator and connector commits with `GOWORK=off` and
+read-only module resolution. Ignored development inputs and old sibling
+binaries are not copied; `RELEASE_BIN_DIR` overrides are rejected. The resulting
+Go VCS information is checked against the selected project commit before staging.
+The Go build uses the same credential-filtered environment policy, with private
+build/module caches; credential-free HTTPS `GOPROXY` routing may be retained.
 It extracts the selected sandboxer commit into a temporary directory, verifies
 the pinned Cloud Hypervisor tarball, applies that commit's patches, and performs
 a locked build with a fresh private Cargo home. Python 3.11 or newer collects
