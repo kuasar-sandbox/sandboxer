@@ -209,6 +209,18 @@ class TraceIdentityTests(unittest.TestCase):
         process.kill.assert_called_once()
         self.assertEqual(process.communicate.call_count, 2)
 
+    def test_preflight_second_timeout_closes_pipe_and_preserves_first_error(self):
+        process = unittest.mock.Mock()
+        original = subprocess.TimeoutExpired("preflight", 15)
+        process.communicate.side_effect = [original, subprocess.TimeoutExpired("reap", 5)]
+        with patch.object(usage_trace.subprocess, "Popen", return_value=process), \
+             patch.object(usage_trace.sys, "stderr", io.StringIO()):
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                usage_trace.check_pid_namespace("bpftrace")
+        self.assertIs(caught.exception, original)
+        process.kill.assert_called_once()
+        process.stdout.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

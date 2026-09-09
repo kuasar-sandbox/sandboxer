@@ -27,9 +27,15 @@ def check_pid_namespace(bpftrace):
     try:
         output, _ = process.communicate(timeout=15)
     except BaseException:
-        process.kill()
-        process.communicate(timeout=5)
+        try:
+            process.kill()
+            process.communicate(timeout=5)
+        except BaseException as error:
+            print(f"usage tracing preflight cleanup: {error}", file=sys.stderr)
         raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
     assert process.returncode == 0, f"tracing preflight failed: {output}"
     observed = re.findall(r"USAGE_TRACE_PID (\d+)", output)
     assert len(observed) == 1 and int(observed[0]) == process.pid, \
