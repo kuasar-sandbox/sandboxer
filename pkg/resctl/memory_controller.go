@@ -420,7 +420,7 @@ func (m *MemoryController) advanceNormalizationLocked(ctx context.Context) error
 			return err
 		}
 		release, err := m.balloon.acquireMutation(ctx)
-		if err != nil {
+	if err != nil {
 			return err
 		}
 		state, applyErr := m.balloon.applyDesiredHeld(ctx)
@@ -491,6 +491,19 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 			m.txn = nil
 			return m.startGrowLocked(ctx, budget.RequestedBudget, budget.DemandMemory,
 				resource.UrgencyNormal, "guest_report")
+		}
+		if budget.ObservedBudget > m.reservationNow() {
+			// This fresh observation also invalidates an unissued candidate.
+			// Do not refresh its decision and inflate against uncovered actual.
+			if m.balloon != nil {
+				if err := m.balloon.SetDesiredTarget(state.AcceptedTarget); err != nil {
+					return err
+				}
+			}
+			m.logf("memory: observed Budget=%d exceeds reservation=%d; pending shrink discarded",
+				budget.ObservedBudget, m.reservationNow())
+			m.finishShrinkLocked(txn)
+			return nil
 		}
 		// A larger demand produces a no-lower memory.high. Keep the most
 		// conservative demand observed by reports that still support this
@@ -823,6 +836,16 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 			}
 		}
 		m.recordBalloonStateLocked(state)
+		if errors.Is(err, errShrinkObservationChanged) {
+			// CH confirmed that this candidate was not issued. Discard only
+			// local intent; a fresh report must choose another bounded target.
+			if resetErr := m.balloon.SetDesiredTarget(state.AcceptedTarget); resetErr != nil {
+				return resetErr
+			}
+			m.logf("memory: discarded unexecuted shrink target=%d: %v", txn.target, err)
+			m.finishShrinkLocked(txn)
+			return nil
+		}
 		if err != nil {
 			return err
 		}
