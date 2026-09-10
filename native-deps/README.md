@@ -59,6 +59,9 @@ payload and material file to that completed build, even if the bundle's own
 checksums are regenerated. Local packaging and standalone validation do not
 require this publication input. The receipt does not attest compiler provenance
 or isolate untrusted candidate code.
+The trusted publisher generates the standard release text and source/Preview
+markers from its validated request. Downloaded `release-notes.md` is a local
+bundle aid, not an authority for the public release body or reconciliation.
 
 Release packaging does not reuse that development binary or patch workspace.
 It also rebuilds `sandbox-ctl` and `sandbox-init` in fresh checkouts of the
