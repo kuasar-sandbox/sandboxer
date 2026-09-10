@@ -26,6 +26,8 @@ type fakeCHMemory struct {
 	resizeFailures int
 	dropResizeACKs int
 	infoFailures   int
+	infoCalls      int
+	onInfo         func(*fakeCHMemory)
 	autoConverge   bool
 	onResize       func(uint64)
 }
@@ -49,6 +51,10 @@ func newFakeCHMemory(t *testing.T, capacity uint64) *fakeCHMemory {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/vm.info", func(w http.ResponseWriter, _ *http.Request) {
 		fake.mu.Lock()
+		fake.infoCalls++
+		if fake.onInfo != nil {
+			fake.onInfo(fake)
+		}
 		if fake.infoFailures > 0 {
 			fake.infoFailures--
 			fake.mu.Unlock()
@@ -145,7 +151,7 @@ func TestBalloonObserveSeparatesAcceptedTargetAndCurrent(t *testing.T) {
 	if state.AcceptedTarget != 3<<30 || state.CurrentBudget != 6<<30 || state.BalloonCurrent != 2<<30 {
 		t.Fatalf("state = %+v", state)
 	}
-	if state.Stable(capacity) {
+	if state.TargetReached(capacity) {
 		t.Fatal("accepted target was incorrectly treated as guest current")
 	}
 	if observed, ok := state.ObservedBudget(capacity); !ok || observed != 6<<30 {
@@ -178,13 +184,18 @@ func TestBalloonApplyGrowDoesNotWaitForCurrent(t *testing.T) {
 	if state.AcceptedTarget != 3<<30 || state.CurrentBudget != 4<<30 {
 		t.Fatalf("state = %+v", state)
 	}
-	if state.Stable(capacity) {
+	if state.TargetReached(capacity) {
 		t.Fatal("grow waited for or fabricated current convergence")
 	}
 }
 
 func TestBalloonShrinkRechecksCurrentImmediatelyBeforeResize(t *testing.T) {
 	const capacity = uint64(8 << 30)
+	const nextTarget = uint64(4<<30) + 64<<20
+	observed := BalloonState{
+		AcceptedTarget: 4 << 30, AcceptedTargetKnown: true,
+		CurrentBudget: 4 << 30, BalloonCurrent: 4 << 30, BalloonCurrentKnown: true,
+	}
 	fake := newFakeCHMemory(t, capacity)
 	fake.configure(func(f *fakeCHMemory) {
 		f.acceptedTarget = 4 << 30
@@ -192,41 +203,41 @@ func TestBalloonShrinkRechecksCurrentImmediatelyBeforeResize(t *testing.T) {
 		f.autoConverge = true
 	})
 	b := NewBalloonController(fake.sock, capacity, time.Second, nil)
-	if err := b.SetDesiredTarget(5 << 30); err != nil {
+	if err := b.SetDesiredTarget(nextTarget); err != nil {
 		t.Fatal(err)
 	}
 	release, err := b.acquireMutation(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = b.applyShrinkDesiredHeld(context.Background())
+	_, err = b.applyShrinkDesiredHeld(context.Background(), observed)
 	release()
 	if err == nil {
-		t.Fatal("unstable target/current allowed a shrink resize")
+		t.Fatal("actual reversal allowed a shrink resize")
 	}
 	if calls := fake.calls(); len(calls) != 0 {
-		t.Fatalf("unstable shrink issued resize calls: %v", calls)
+		t.Fatalf("invalidated shrink issued resize calls: %v", calls)
 	}
-	if state := b.State(); state.DesiredTarget != 5<<30 {
+	if state := b.State(); state.DesiredTarget != nextTarget {
 		t.Fatalf("deferred shrink lost its forward target: %+v", state)
 	}
 
-	// Once the old target/current pair converges, the retained target advances
-	// normally without needing another guest report to repeat the intent.
+	// Repeating the same decision is valid once the current sample again
+	// satisfies its bounds. No equality classifier participates in execution.
 	fake.configure(func(f *fakeCHMemory) { f.currentBudget = 4 << 30 })
 	release, err = b.acquireMutation(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := b.applyShrinkDesiredHeld(context.Background())
+	state, err := b.applyShrinkDesiredHeld(context.Background(), observed)
 	release()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.AcceptedTarget != 5<<30 || state.CurrentBudget != 3<<30 {
+	if state.AcceptedTarget != nextTarget || state.CurrentBudget != capacity-nextTarget {
 		t.Fatalf("converged shrink state = %+v", state)
 	}
-	if calls := fake.calls(); !reflect.DeepEqual(calls, []uint64{5 << 30}) {
+	if calls := fake.calls(); !reflect.DeepEqual(calls, []uint64{nextTarget}) {
 		t.Fatalf("converged shrink calls = %v", calls)
 	}
 }
@@ -243,14 +254,17 @@ func TestBalloonShrinkRequiresPreResizeObservation(t *testing.T) {
 	if err := b.SeedColdTarget(4 << 30); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.SetDesiredTarget(5 << 30); err != nil {
+	if err := b.SetDesiredTarget(4<<30 + 64<<20); err != nil {
 		t.Fatal(err)
 	}
 	release, err := b.acquireMutation(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = b.applyShrinkDesiredHeld(context.Background())
+	_, err = b.applyShrinkDesiredHeld(context.Background(), BalloonState{
+		AcceptedTarget: 4 << 30, AcceptedTargetKnown: true,
+		CurrentBudget: 4 << 30, BalloonCurrent: 4 << 30, BalloonCurrentKnown: true,
+	})
 	release()
 	if err == nil {
 		t.Fatal("shrink proceeded without a fresh pre-resize observation")
