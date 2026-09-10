@@ -339,7 +339,12 @@ def rustup_toolchain_notices(sysroot, fields, destination, stage):
         # The local date only locates a fixed official manifest. Its full commit
         # and exact release string must still match; no moving channel is used.
         selector = date + "/channel-rust-" + ("nightly" if match[1] == "nightly" else "beta") + ".toml"
-    manifest_url = "https://static.rust-lang.org/dist/" + selector
+    server = os.environ.get("RUSTUP_DIST_SERVER", "https://static.rust-lang.org").rstrip("/")
+    require(re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:/[A-Za-z0-9._-]+)*", server)
+            and all(part not in (".", "..") for part in urlsplit(server).path.split("/")),
+            "Rust distribution server must be credential-free HTTPS")
+    distribution = server + "/dist/"
+    manifest_url = distribution + selector
     with urlopen(manifest_url, timeout=30) as response:
         manifest_bytes = response.read(8 * 1024 * 1024 + 1)
     require(len(manifest_bytes) <= 8 * 1024 * 1024, "Rust distribution manifest is too large")
@@ -351,11 +356,19 @@ def rustup_toolchain_notices(sysroot, fields, destination, stage):
     target = package["target"][host]
     require(target.get("available") is True, "selected Rust compiler distribution is unavailable")
     archive_url, digest = target["xz_url"], target["xz_hash"]
+    require(isinstance(archive_url, str) and isinstance(digest, str), "invalid Rust distribution source fields")
+    # Mirrors may retain upstream URLs in the version-bound manifest or rewrite
+    # them to their own base. Never follow an unrelated origin from its content.
+    relative = None
+    for base in (distribution, "https://static.rust-lang.org/dist/"):
+        if archive_url.startswith(base):
+            relative = archive_url[len(base):]
+            break
+    require(isinstance(relative, str)
+            and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}/rustc-[A-Za-z0-9_.+-]+\.tar\.xz", relative)
+            and relative.endswith("-" + host + ".tar.xz"), "invalid Rust compiler distribution URL")
+    archive_url = distribution + relative
     parsed = urlsplit(archive_url)
-    require(parsed.scheme == "https" and parsed.netloc == "static.rust-lang.org"
-            and not parsed.query and not parsed.fragment
-            and re.fullmatch(r"/dist/[0-9]{4}-[0-9]{2}-[0-9]{2}/rustc-[A-Za-z0-9_.+-]+\.tar\.xz", parsed.path)
-            and parsed.path.endswith("-" + host + ".tar.xz"), "invalid Rust compiler distribution URL")
     require(re.fullmatch(r"[0-9a-f]{64}", digest), "invalid Rust compiler distribution digest")
     prefix = PurePosixPath(parsed.path).name.removesuffix(".tar.xz") + "/rustc/share/doc/rust/"
     notices = {}

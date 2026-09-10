@@ -23,6 +23,7 @@ GOWORK=off go test -race "$ROOT/scripts/release-go-toolchain.go" "$ROOT/scripts/
 bash "$ROOT/native-deps/deps/test-common.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-rust-materials.py"
 bash "$ROOT/scripts/test-release-native-materials.sh"
+bash "$ROOT/scripts/test-release-rpm-enumeration.sh"
 
 init_fixture_repo() {
   local directory="$1"

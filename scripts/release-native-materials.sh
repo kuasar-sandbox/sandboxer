@@ -131,7 +131,16 @@ release_native_system_input() {
     source_name="$owner"
     source_id="rpm-source:$rpm_source"
     # Static/devel subpackages may keep notices in a sibling from the SAME SRPM.
+    # Capture each status before consuming output; partial listings are not a
+    # complete license inventory even if another sibling supplied valid files.
+    local packages siblings files
+    packages="$(rpm -qa --qf '%{NAME}.%{ARCH}\t%{SOURCERPM}\n')" \
+      || fail "cannot enumerate installed RPM packages for license collection"
+    siblings="$(awk -F '\t' -v source="$rpm_source" '$2 == source {print $1}' <<< "$packages")" \
+      || fail "cannot select same-source RPM license packages"
     while IFS= read -r sibling; do
+      [ -n "$sibling" ] || continue
+      files="$(rpm -ql "$sibling")" || fail "cannot enumerate RPM license files: $sibling"
       while IFS= read -r file; do
         case "$(basename "$file")" in
           LICENSE*|COPYING*|NOTICE*|COPYRIGHT*|copyright|AUTHORS*|CREDITS*) ;;
@@ -141,9 +150,8 @@ release_native_system_input() {
         release_native_verify_license_file "$file" rpm "$source_id"
         release_native_copy_file "$file" "$label" "${file#/}"
         count=$((count + 1))
-      done < <(rpm -ql "$sibling")
-    done < <(rpm -qa --qf '%{NAME}.%{ARCH}\t%{SOURCERPM}\n' \
-      | awk -F '\t' -v source="$rpm_source" '$2 == source {print $1}')
+      done <<< "$files"
+    done <<< "$siblings"
     [ "$count" -gt 0 ] || fail "native RPM license material is missing: $rpm_source"
   else
     fail "native input has no verifiable package/source material: $input"

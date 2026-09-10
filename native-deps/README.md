@@ -68,6 +68,9 @@ payload names before any source or toolchain download; path aliases are rejected
 These release checks do not change ordinary development module authentication.
 Source inventories reject duplicate or excessive records before per-row work;
 each metadata table is capped at 16 MiB and the source inventory at 16,384 rows.
+RPM notice collection checks both the installed-package listing and every
+same-source sibling file listing. A partial failure aborts collection even when
+another sibling supplied valid notices; partial output is not complete coverage.
 
 The trusted publisher generates the standard release text and source/Preview
 markers from its validated request. Downloaded `release-notes.md` is a local
@@ -171,6 +174,12 @@ archive must match the manifest's SHA-256 before its generated library copyright
 and license texts are collected. Stable selection uses the exact version;
 beta/nightly selection uses a fixed installed date and verifies it against the
 same full commit. `RUST-NOTICES.tsv` records the manifest/archive URLs and digests.
+The collector honors the credential-free HTTPS `RUSTUP_DIST_SERVER` root used by
+the build (default `https://static.rust-lang.org`), including mirror path prefixes.
+Both manifest and compiler downloads use that root; upstream URLs retained in a
+mirror manifest are routed through the same configured mirror. Other origins or
+credential-bearing server URLs are rejected, without dropping commit/hash checks.
+See the [Rustup environment reference](https://rust-lang.github.io/rustup/environment-variables.html).
 The toolchain is not replaced or installed by this check. See Rust's
 [distribution layout](https://forge.rust-lang.org/infra/channel-layout.html).
 Matching installed Debian/RPM source-package notices remain supported; missing

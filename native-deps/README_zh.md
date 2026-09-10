@@ -57,6 +57,8 @@ Go 依赖及工具链下载使用全新的私有 module/VCS 状态、已启用�
 路径别名会被拒绝。这些发行检查不改变普通开发中的 module 认证方式。
 来源清单在逐行处理前拒绝重复或过量记录;每份元数据表上限为 16 MiB,
 来源清单上限为 16,384 行。
+RPM 声明收集核对已安装包列表及每个同源兄弟包文件列表的真实退出状态。
+即使另一个包已提供有效声明,部分枚举失败仍会终止收集,不把部分输出当作完整覆盖。
 
 可信发布端根据已验证请求生成标准发行正文及来源/Preview 标记。下载的
 `release-notes.md` 只是本地 bundle 辅助说明,不能决定公开发行正文或对账来源。
@@ -133,6 +135,10 @@ Rustup 标准库声明取自官方 `rustc` 分发,不取自可修改的本地文
 须匹配清单中的 SHA-256 后,才采集生成的标准库版权及许可正文。Stable 按精确
 版本选择;beta/nightly 按已安装的固定日期定位清单,并核对同一完整 commit。
 `RUST-NOTICES.tsv` 记录清单/归档 URL 和摘要。该检查不替换或安装工具链。
+采集器采用构建所用的无凭据 HTTPS `RUSTUP_DIST_SERVER` 根地址,默认值为
+`https://static.rust-lang.org`,支持镜像路径前缀。清单与编译器下载均使用该根地址;
+镜像清单保留的上游 URL 也经相同镜像读取。其他来源或含凭据的服务器 URL
+会被拒绝,不省略 commit/摘要检查。参见 [Rustup 环境变量说明](https://rust-lang.github.io/rustup/environment-variables.html)。
 参见 Rust 的[分发布局](https://forge.rust-lang.org/infra/channel-layout.html)。
 继续支持已安装的同源 Debian/RPM 包声明;材料缺失时给出安装提示并拒绝打包。
 发行版 Rust 声明的字节必须匹配已安装包摘要和源包

@@ -24,6 +24,9 @@ fixture_spec.loader.exec_module(distribution_fixture)
 
 class MaterialsTests(unittest.TestCase):
     def setUp(self):
+        distribution_environment = patch.dict(os.environ, {"RUSTUP_DIST_SERVER": "https://static.rust-lang.org"})
+        distribution_environment.start()
+        self.addCleanup(distribution_environment.stop)
         self.temporary = tempfile.TemporaryDirectory(prefix="rust-material-test-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -439,6 +442,36 @@ class MaterialsTests(unittest.TestCase):
             self.assertEqual((self.root / "stage" / row[5] / relative).read_bytes(), contents)
         self.assertIn(";notices-archive-sha256:", row[4])
         self.assertTrue((self.root / "stage/share/sources/sandboxer/RUST-NOTICES.tsv").is_file())
+
+    def test_rustup_distribution_uses_only_the_configured_mirror(self):
+        fields, notices, responses = distribution_fixture.rust_distribution_fixture()
+        original = "https://static.rust-lang.org"
+        for server in ("https://mirror.example.invalid", "https://mirror.example.invalid/rustup"):
+            for rewritten in (False, True):
+                with self.subTest(server=server, rewritten=rewritten):
+                    mirrored = {url.replace(original, server, 1):
+                                (contents.replace(original.encode(), server.encode())
+                                 if rewritten and url.endswith(".toml") else contents)
+                                for url, contents in responses.items()}
+                    stage = self.root / ("stage-" + str(len(list(self.root.glob("stage-*")))))
+                    with patch.dict(os.environ, {"RUSTUP_DIST_SERVER": server + "/"}), \
+                            patch.object(materials, "urlopen", side_effect=lambda url, timeout: io.BytesIO(mirrored[url])) as network:
+                        materials.rustup_toolchain_notices(self.root / "rust", fields, stage / "notices", stage)
+                    self.assertEqual(len(network.call_args_list), 2)
+                    self.assertTrue(all(call.args[0].startswith(server + "/dist/") for call in network.call_args_list))
+                    receipt = (stage / "share/sources/sandboxer/RUST-NOTICES.tsv").read_text()
+                    self.assertNotIn(original, receipt)
+                    self.assertEqual((stage / "notices/COPYRIGHT-library.html").read_bytes(), notices["COPYRIGHT-library.html"])
+
+    def test_rustup_distribution_rejects_unsafe_server_before_network(self):
+        fields, _, _ = distribution_fixture.rust_distribution_fixture()
+        for server in ("http://mirror.example.invalid", "https://user:password@mirror.example.invalid",
+                       "https://mirror.example.invalid/?secret=x", "https://mirror.example.invalid/#fragment",
+                       "https://mirror.example.invalid/../rust", "file:///fixture", "https://mirror.example.invalid\n"):
+            with self.subTest(server=server), patch.dict(os.environ, {"RUSTUP_DIST_SERVER": server}), \
+                    patch.object(materials, "urlopen") as network, self.assertRaisesRegex(ValueError, "credential-free HTTPS"):
+                materials.rustup_toolchain_notices(self.root / "rust", fields, self.root / "notices", self.root / "stage")
+            network.assert_not_called()
 
     def test_rustup_distribution_identity_and_checksums(self):
         fields, notices, responses = distribution_fixture.rust_distribution_fixture()

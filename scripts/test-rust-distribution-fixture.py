@@ -2,13 +2,14 @@
 import hashlib
 import io
 import json
+import os
 import tarfile
 
 
 def rust_distribution_fixture(version="1.0.0", commit="3" * 40, host="x86_64-unknown-linux-gnu"):
     fields = {"release": version, "commit-hash": commit, "host": host}
     name = "rustc-" + version + "-" + host
-    base = "https://static.rust-lang.org/dist/"
+    base = os.environ.get("RUSTUP_DIST_SERVER", "https://static.rust-lang.org").rstrip("/") + "/dist/"
     manifest_url = base + "channel-rust-" + version + ".toml"
     archive_url = base + "2025-08-07/" + name + ".tar.xz"
     notices = {"COPYRIGHT-library.html": b"fixture Rust standard library copyright\n",
