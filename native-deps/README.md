@@ -51,6 +51,15 @@ rerunning to force a rebuild. In particular, formatting a changed patch does not
 by itself invalidate the existing binary. `make clean` removes the native build
 output and `bin/`, but preserves the source patch workspace and tarball cache.
 
+The release workflow records the completed archive's SHA-256 as a build-job
+output before uploading it. The publisher receives that independent value as
+`RELEASE_ARCHIVE_SHA256` and checks it before any Tag or Release write; a value
+recalculated from the downloaded bundle is not a substitute. This binds every
+payload and material file to that completed build, even if the bundle's own
+checksums are regenerated. Local packaging and standalone validation do not
+require this publication input. The receipt does not attest compiler provenance
+or isolate untrusted candidate code.
+
 Release packaging does not reuse that development binary or patch workspace.
 It also rebuilds `sandbox-ctl` and `sandbox-init` in fresh checkouts of the
 selected sandboxer, accelerator and connector commits with `GOWORK=off` and

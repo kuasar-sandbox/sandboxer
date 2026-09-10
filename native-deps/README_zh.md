@@ -45,6 +45,12 @@ make cloud-hypervisor TARGET_ARCH=aarch64
 `bin/<arch>/cloud-hypervisor` 或执行 `make clean` 后重跑。格式化 patch 本身不会使
 已有 binary 失效。`make clean` 删除 native 构建输出与 bin,保留 patch 源码工作区和 tarball 缓存。
 
+发行工作流在上传前把已完成归档的 SHA-256 记录为 build job output。发布者通过
+`RELEASE_ARCHIVE_SHA256` 接收这一独立值,在任何 Tag/Release 写入前核对;不能用
+下载后从 bundle 重新计算的值代替。即使重算 bundle 自身的校验和,全部载荷与材料
+仍须匹配该次已完成构建。本地打包和独立验证不要求这个发布输入。该记录不证明
+编译器来源,也不构成对不可信候选代码的隔离。
+
 发行打包不复用上述开发二进制或 patch 工作区。它还从选定的 sandboxer、
 accelerator、connector commit 建立全新 checkout,以 `GOWORK=off` 和只读 module
 解析重新构建 `sandbox-ctl`、`sandbox-init`。不会复制被忽略的开发输入或旧兄弟
