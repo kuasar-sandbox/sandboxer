@@ -206,6 +206,7 @@ class MaterialsTests(unittest.TestCase):
             {"PATH": "/usr/bin", "CARGO_BUILD_JOBS": "2", "GH_TOKEN": "fixture",
              "CARGO_NET_GIT_FETCH_WITH_CLI": "false",
              "GOPROXY": "https://proxy.example.invalid,direct",
+             "GOSUMDB": "sum.golang.google.cn", "GOTOOLCHAIN": "local",
              "CARGO_REGISTRIES_CRATES_IO_TOKEN": "fixture", "AWS_SECRET_ACCESS_KEY": "fixture",
              "CARGO_REGISTRY_CREDENTIAL_PROVIDER": "fixture", "SSH_AUTH_SOCK": "/fixture"},
             self.root / "home", self.home, Path("/toolchain/bin/rustc"))
@@ -213,6 +214,8 @@ class MaterialsTests(unittest.TestCase):
         self.assertEqual(environment["CARGO_BUILD_JOBS"], "2")
         self.assertEqual(environment["CARGO_NET_GIT_FETCH_WITH_CLI"], "false")
         self.assertEqual(environment["GOPROXY"], "https://proxy.example.invalid,direct")
+        self.assertEqual(environment["GOSUMDB"], "sum.golang.google.cn")
+        self.assertEqual(environment["GOTOOLCHAIN"], "local")
         self.assertNotIn("fixture", environment.values())
         self.assertNotIn("SSH_AUTH_SOCK", environment)
         for name in ("RUSTC", "RUSTC_WRAPPER", "CARGO_BUILD_RUSTC"):
@@ -225,6 +228,28 @@ class MaterialsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Go proxy"):
             materials.native_build_environment({"GOPROXY": "https://fixture:fixture@proxy.example.invalid"},
                                                self.root / "home", self.home, Path("/toolchain/bin/rustc"))
+
+    def test_go_build_policies_and_defaults(self):
+        def filtered(values):
+            return materials.native_build_environment(values, self.root / "home", self.home,
+                                                      Path("/toolchain/bin/rustc"))
+        defaults = filtered({})
+        self.assertEqual(defaults["GOSUMDB"], "sum.golang.org")
+        self.assertEqual(defaults["GOTOOLCHAIN"], "local")
+        for sumdb in ("sum.golang.google.cn", "sum.golang.org https://sum.example.invalid", "off"):
+            self.assertEqual(filtered({"GOSUMDB": sumdb})["GOSUMDB"], sumdb)
+        for toolchain in ("local", "auto", "path", "go1.26.4", "go1.26.4+auto", "go1.27rc1+path"):
+            self.assertEqual(filtered({"GOTOOLCHAIN": toolchain})["GOTOOLCHAIN"], toolchain)
+        for sumdb in ("", "sum.golang.org\n", "sum.golang.org\r", "sum.golang.org extra fields",
+                      "sum.golang.org https://fixture:fixture@sum.example.invalid",
+                      "sum.golang.org http://sum.example.invalid",
+                      "sum.golang.org https://sum.example.invalid?fixture",
+                      "sum.golang.org https://sum.example.invalid#fixture"):
+            with self.subTest(sumdb=sumdb), self.assertRaisesRegex(ValueError, "checksum database"):
+                filtered({"GOSUMDB": sumdb})
+        for toolchain in ("", "go1.26.4+invalid", "../toolchain", "local\n", "go1.26.4 auto"):
+            with self.subTest(toolchain=toolchain), self.assertRaisesRegex(ValueError, "Go toolchain"):
+                filtered({"GOTOOLCHAIN": toolchain})
 
     def test_cargo_directory_and_authenticated_registry_rejected(self):
         original, destination = self.root / "original-home", self.root / "private-home"

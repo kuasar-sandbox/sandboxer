@@ -59,6 +59,10 @@ binaries are not copied; `RELEASE_BIN_DIR` overrides are rejected. The resulting
 Go VCS information is checked against the selected project commit before staging.
 The Go build uses the same credential-filtered environment policy, with private
 build/module caches; credential-free HTTPS `GOPROXY` routing may be retained.
+The configured `GOSUMDB` identity and optional credential-free HTTPS mirror are
+preserved, as is `GOTOOLCHAIN` selection. Their defaults are `sum.golang.org`
+and `local`, respectively; local-only CI does not silently enable toolchain
+downloads. Malformed or authenticated routing values fail before building.
 The archive name remains the requested release target. The project source record
 uses that version only when its local tag matches the selected commit, otherwise
 `git:<commit>`. Validation binds both Go binaries and the project source URL/digest

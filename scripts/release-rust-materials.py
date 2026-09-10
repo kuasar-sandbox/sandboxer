@@ -68,7 +68,7 @@ def native_build_environment(original, home, cargo_home, rustc):
     allowed = {"PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
                "http_proxy", "https_proxy", "all_proxy", "no_proxy", "CARGO_BUILD_JOBS",
-               "CARGO_NET_GIT_FETCH_WITH_CLI", "GOPROXY"}
+               "CARGO_NET_GIT_FETCH_WITH_CLI", "GOPROXY", "GOSUMDB", "GOTOOLCHAIN"}
     environment = {name: value for name, value in original.items() if name in allowed}
     environment.setdefault("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
     require(environment["CARGO_NET_GIT_FETCH_WITH_CLI"] in ("true", "false"),
@@ -80,6 +80,21 @@ def native_build_environment(original, home, cargo_home, rustc):
         require(parsed.scheme == "https" and parsed.hostname and parsed.username is None
                 and parsed.password is None and not parsed.query and not parsed.fragment,
                 "release Go proxy routing must use credential-free HTTPS")
+    sumdb = environment.setdefault("GOSUMDB", "sum.golang.org")
+    require("\n" not in sumdb and "\r" not in sumdb,
+            "release checksum database routing must be a single line")
+    fields = sumdb.split()
+    require(1 <= len(fields) <= 2 and re.fullmatch(r"[A-Za-z0-9._+/:=-]+", fields[0]),
+            "invalid release checksum database identity")
+    if len(fields) == 2:
+        parsed = urlsplit(fields[1])
+        require(parsed.scheme == "https" and parsed.hostname and parsed.username is None
+                and parsed.password is None and not parsed.query and not parsed.fragment,
+                "release checksum database routing must use credential-free HTTPS")
+    toolchain = environment.setdefault("GOTOOLCHAIN", "local")
+    require(re.fullmatch(r"(?:local|auto|path|go[0-9]+\.[0-9]+(?:\.[0-9]+|beta[0-9]+|rc[0-9]+)?"
+                         r"(?:\+(?:auto|path))?)", toolchain),
+            "invalid release Go toolchain selection")
     for name, value in environment.items():
         if name.lower() in ("http_proxy", "https_proxy", "all_proxy"):
             parsed = urlsplit(value)

@@ -319,6 +319,7 @@ while [ "$#" -gt 0 ] && [ "$1" != -C ]; do shift; done
 root="$2"
 if [[ "$root" == */go-build/sandboxer ]]; then
   [ "$GOWORK" = off ] && [ "$GOFLAGS" = -mod=readonly ]
+  [ "$GOSUMDB" = sum.golang.google.cn ] && [ "$GOTOOLCHAIN" = local ]
   [ ! -e "$root/ignored-release-input.go" ]
   [ ! -e "$root/../accelerator/ignored-release-input.go" ]
   [ ! -e "$root/../connector/ignored-release-input.go" ]
@@ -397,6 +398,8 @@ chmod 0755 "$TMP/release-build-bin/make" "$TMP/release-build-bin/cargo" "$TMP/re
 chmod 0755 "$TMP/release-build-bin/dpkg-query" "$TMP/release-build-bin/rpm"
 native_fixture_env=(
   PATH="$TMP/release-build-bin:$PATH"
+  GOSUMDB=sum.golang.google.cn
+  GOTOOLCHAIN=local
   CARGO_REGISTRIES_CRATES_IO_TOKEN=fixture-must-not-reach-build
   GH_TOKEN=fixture-must-not-reach-build
 )

@@ -50,7 +50,10 @@ accelerator、connector commit 建立全新 checkout,以 `GOWORK=off` 和只读 
 解析重新构建 `sandbox-ctl`、`sandbox-init`。不会复制被忽略的开发输入或旧兄弟
 二进制,并拒绝 `RELEASE_BIN_DIR` 覆盖。暂存前会核对 Go VCS 信息是否匹配所选
 项目 commit。Go 构建采用相同的凭据过滤策略及私有构建/module 缓存,可保留
-无凭据的 HTTPS `GOPROXY` 路由。归档名称仍标识请求的发行目标;项目来源记录
+无凭据的 HTTPS `GOPROXY` 路由。还保留配置的 `GOSUMDB` 标识及可选的无凭据
+HTTPS 镜像,以及 `GOTOOLCHAIN` 选择;默认分别为 `sum.golang.org` 和 `local`,
+不会使仅用本地工具链的 CI 静默启用工具链下载。格式非法或带认证的路由在构建前
+即被拒绝。归档名称仍标识请求的发行目标;项目来源记录
 只有在本地 Tag 匹配所选 commit 时才使用该版本,否则记录 `git:<commit>`。
 验证器将两个 Go 二进制及项目来源 URL/摘要绑定到该 commit;发布者传入预期
 commit,在任何 Tag/Release 写入前拒绝不匹配的包。它把选定的 sandboxer commit
