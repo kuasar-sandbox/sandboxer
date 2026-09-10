@@ -14,7 +14,10 @@ fail() {
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
 
+export FIXTURE_GO_DISTRIBUTION_CACHE
+FIXTURE_GO_DISTRIBUTION_CACHE="$(go env GOMODCACHE)"
 bash "$ROOT/scripts/test-release-materials.sh"
+GOWORK=off go test -race "$ROOT/scripts/release-go-toolchain.go" "$ROOT/scripts/release-go-toolchain_test.go"
 bash "$ROOT/native-deps/deps/test-common.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-rust-materials.py"
 bash "$ROOT/scripts/test-release-native-materials.sh"
@@ -194,6 +197,17 @@ grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [ac
 grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }}' \
   "$WORKFLOW" || fail "Preview publisher does not receive dependency binding"
 workflow="$ROOT/.github/workflows/release.yml"
+for job in build publish; do
+  for routing in 'GOPROXY: https://goproxy.cn,direct' 'GOSUMDB: sum.golang.google.cn' 'GOTOOLCHAIN: local'; do
+    awk -v job="$job" '
+      $0 == "  " job ":" { inside=1; next }
+      inside && /^  [A-Za-z0-9_-]+:/ { exit }
+      inside && /^    steps:/ { exit }
+      inside { print }
+    ' "$workflow" | grep -Fx "      $routing" >/dev/null \
+      || fail "$workflow $job is missing the verified Go routing policy: $routing"
+  done
+done
 [ "$(grep -Fc 'archive_sha256: ${{ steps.release-archive-digest.outputs.archive_sha256 }}' \
   "$workflow")" -eq 1 ] \
   || fail "$workflow does not expose exactly one independent build archive digest"
@@ -271,6 +285,12 @@ install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
 printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
 install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
+install -m 0644 "$ROOT/scripts/release-go-toolchain.go" "$fixture_root/scripts/release-go-toolchain.go"
+cat >> "$fixture_root/scripts/release-materials.sh" <<'EOF'
+release_materials_download_go_toolchain() {
+  GOMODCACHE="${FIXTURE_GO_DISTRIBUTION_CACHE:?}" _release_materials_download_go_toolchain "$@"
+}
+EOF
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
 install -m 0644 "$ROOT/scripts/release-rust-materials.py" "$fixture_root/scripts/release-rust-materials.py"
 install -m 0644 "$ROOT/scripts/release-native-materials.sh" "$fixture_root/scripts/release-native-materials.sh"

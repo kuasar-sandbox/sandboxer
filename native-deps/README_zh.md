@@ -58,8 +58,21 @@ accelerator、connector commit 建立全新 checkout,以 `GOWORK=off` 和只读 
 项目 commit。Go 构建采用相同的凭据过滤策略及私有构建/module 缓存,可保留
 无凭据的 HTTPS `GOPROXY` 路由。还保留配置的 `GOSUMDB` 标识及可选的无凭据
 HTTPS 镜像,以及 `GOTOOLCHAIN` 选择;默认分别为 `sum.golang.org` 和 `local`,
-不会使仅用本地工具链的 CI 静默启用工具链下载。格式非法或带认证的路由在构建前
-即被拒绝。归档名称仍标识请求的发行目标;项目来源记录
+不会使仅用本地工具链的 CI 静默启用编译器自动选择。格式非法或带认证的路由在构建前
+即被拒绝。
+
+发行打包记录全新构建上下文实际选定的 Go 编译器,在构建前后将其分发输入与匹配的
+`golang.org/toolchain` 归档逐项比较;归档由配置的 checksum database 认证。这覆盖
+编译器、标准库源码及该分发中的其他文件。完整 Go 安装中额外的非构建 `api`、
+`doc`、`misc`、`test` 文件不在认证范围,也不作为发行许可来源;核对时处理标准的
+`go.mod`/`_go.mod` 安装转换。Go 许可/NOTICE 正文来自已验证归档,包括编译器和
+标准库内嵌依赖的材料,保留各自相对路径。独立验证还会
+重新核对其字节、来源 URL 和 module h1。版本字符串或重算 bundle 校验和不能替代
+来源核对。验证要求启用 checksum database 并取得匹配的归档/缓存;即使采用
+`GOTOOLCHAIN=local`,也可能获取核验材料,但不切换构建编译器或静默启用工具链
+自动选择。这些检查以可信构建主机为前提,不证明已失陷主机可信。
+
+归档名称仍标识请求的发行目标;项目来源记录
 只有在本地 Tag 匹配所选 commit 时才使用该版本,否则记录 `git:<commit>`。
 验证器将两个 Go 二进制及项目来源 URL/摘要绑定到该 commit;发布者传入预期
 commit,在任何 Tag/Release 写入前拒绝不匹配的包。提供 `RELEASE_DEPENDENCIES`

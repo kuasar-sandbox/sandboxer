@@ -70,8 +70,26 @@ The Go build uses the same credential-filtered environment policy, with private
 build/module caches; credential-free HTTPS `GOPROXY` routing may be retained.
 The configured `GOSUMDB` identity and optional credential-free HTTPS mirror are
 preserved, as is `GOTOOLCHAIN` selection. Their defaults are `sum.golang.org`
-and `local`, respectively; local-only CI does not silently enable toolchain
-downloads. Malformed or authenticated routing values fail before building.
+and `local`, respectively; local-only CI does not silently enable automatic
+compiler selection. Malformed or authenticated routing values fail before building.
+
+Release packaging records the Go compiler selected in the fresh build context,
+then compares its distribution inputs before and after building with the matching
+`golang.org/toolchain` archive authenticated by the configured checksum database.
+This covers the compiler, standard-library sources and other files in that
+distribution; extra non-build `api`, `doc`, `misc` and `test` files in a full Go
+installation are not authenticated or used as release license sources. The
+standard `go.mod`/`_go.mod` installation transformation is accounted for.
+Go license/notice bytes, including nested compiler and standard-library dependency
+materials, come from the verified archive with their relative paths retained.
+Standalone validation
+rechecks their bytes, source URL and module h1. A version string or recomputed
+bundle checksum cannot substitute for that source check. Verification requires
+an enabled checksum database and its matching archive/cache; it may fetch
+verification material with `GOTOOLCHAIN=local` but does not switch the build
+compiler or silently enable automatic toolchain selection. These checks assume
+the trusted build host and do not attest a compromised host.
+
 The archive name remains the requested release target. The project source record
 uses that version only when its local tag matches the selected commit, otherwise
 `git:<commit>`. Validation binds both Go binaries and the project source URL/digest

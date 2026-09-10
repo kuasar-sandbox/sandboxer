@@ -238,10 +238,16 @@ package_release() {
   stage_go_source "$ROOT" "$project_sha" "$WORK/go-build/sandboxer"
   stage_go_source "$accelerator_source" "$accelerator_sha" "$WORK/go-build/accelerator"
   stage_go_source "$connector_source" "$connector_sha" "$WORK/go-build/connector"
-  python3 "$ROOT/scripts/release-rust-materials.py" run-native \
-    "$WORK/go-home" "$WORK/cargo-home" "$(rustc --print sysroot)/bin/rustc" env \
-    GOWORK=off GOENV=off GOFLAGS=-mod=readonly GOCACHE="$WORK/go-cache" GOMODCACHE="$WORK/go-mod" \
-    make --no-print-directory -C "$WORK/go-build/sandboxer" TARGET_ARCH="$arch" sandbox-ctl sandbox-init
+  local -a go_build_env=(python3 "$ROOT/scripts/release-rust-materials.py" run-native
+    "$WORK/go-home" "$WORK/cargo-home" "$(rustc --print sysroot)/bin/rustc" env
+    GOWORK=off GOENV=off GOFLAGS=-mod=readonly GOCACHE="$WORK/go-cache" GOMODCACHE="$WORK/go-mod")
+  RELEASE_MATERIALS_GO_ENV="$WORK/go-build-toolchain.json"
+  "${go_build_env[@]}" go -C "$WORK/go-build/sandboxer" env -json GOROOT GOVERSION GOHOSTOS GOHOSTARCH \
+    > "$RELEASE_MATERIALS_GO_ENV"
+  RELEASE_MATERIALS_WORK="$WORK/go-toolchain-before-build" GOMODCACHE="$WORK/go-mod" \
+    release_materials_verify_build_go "$RELEASE_MATERIALS_GO_ENV"
+  "${go_build_env[@]}" make --no-print-directory -C "$WORK/go-build/sandboxer" \
+    TARGET_ARCH="$arch" sandbox-ctl sandbox-init
   bin_dir="$WORK/go-build/sandboxer/bin/$arch"
   copy_executable "$bin_dir/sandbox-ctl" bin/sandbox-ctl
   copy_executable "$bin_dir/sandbox-init" bin/sandbox-init
