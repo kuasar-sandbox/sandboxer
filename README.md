@@ -96,6 +96,10 @@ separate native/runtime prerequisites, not dependencies of every Go-only check.
 
 ## Release model
 
+Package source records keep an internal dependency's release version only when
+its local Git tag matches the selected source commit. Untagged source builds
+record `git:<commit>`; this does not require creating target release tags.
+
 `sandboxer` publishes independent component versions named `vX.Y.Z`. The x86_64 archive contains `sandbox-ctl`, `sandbox-init`, and the patched `cloud-hypervisor` binary. Component documentation and E2E sources are collected from the selected tag into the project platform archive rather than duplicated in the component archive.
 
 The project repository publishes an independently numbered aggregate `release-vX.Y.Z`, selecting an exact `sandboxer` tag together with exact versions of the other release units and validating the combined system.

@@ -30,6 +30,7 @@ var archiveContract = map[string]entryContract{
 	"./share/sources/sandboxer/CLOUD-HYPERVISOR-Cargo.lock":                 {typeflag: tar.TypeReg, mode: 0o644},
 	"./share/sources/sandboxer/GO-BUILD-INFO.tsv":                           {typeflag: tar.TypeReg, mode: 0o644},
 	"./share/sources/sandboxer/GO-MODULES.tsv":                              {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/sources/sandboxer/RUST-STDLIB.tsv":                             {typeflag: tar.TypeReg, mode: 0o644},
 	"./share/sources/sandboxer/MATERIALS.sha256":                            {typeflag: tar.TypeReg, mode: 0o644},
 	"./share/sources/sandboxer/SOURCES.tsv":                                 {typeflag: tar.TypeReg, mode: 0o644},
 }

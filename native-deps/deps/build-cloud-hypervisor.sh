@@ -229,9 +229,21 @@ do_build() {
     cargo_env+=("RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$CH_SRC=. --remap-path-prefix=$cargo_home=/cargo")
 
     log "cargo build --release --bin cloud-hypervisor (cache hot ≈ seconds; cold ≈ 5-10 min)"
-    env "${cargo_env[@]}" CARGO_TARGET_DIR="$CH_BUILD_OUT" cargo build --release --locked \
-        "${cargo_target_args[@]}" \
-        --manifest-path "$CH_SRC/Cargo.toml" --bin cloud-hypervisor
+    if [ -n "${CH_LINK_MAP:-}" ]; then
+        [ -n "${CH_BUILD_REPORT:-}" ] || die "CH_LINK_MAP requires CH_BUILD_REPORT"
+        env "${cargo_env[@]}" CARGO_TARGET_DIR="$CH_BUILD_OUT" cargo rustc --release --locked \
+            "${cargo_target_args[@]}" --message-format=json-render-diagnostics \
+            --manifest-path "$CH_SRC/Cargo.toml" --package cloud-hypervisor --bin cloud-hypervisor \
+            -- -C "link-arg=-Wl,-Map,$CH_LINK_MAP" | tee "$CH_BUILD_REPORT"
+    elif [ -n "${CH_BUILD_REPORT:-}" ]; then
+        env "${cargo_env[@]}" CARGO_TARGET_DIR="$CH_BUILD_OUT" cargo build --release --locked \
+            "${cargo_target_args[@]}" --message-format=json-render-diagnostics \
+            --manifest-path "$CH_SRC/Cargo.toml" --bin cloud-hypervisor | tee "$CH_BUILD_REPORT"
+    else
+        env "${cargo_env[@]}" CARGO_TARGET_DIR="$CH_BUILD_OUT" cargo build --release --locked \
+            "${cargo_target_args[@]}" \
+            --manifest-path "$CH_SRC/Cargo.toml" --bin cloud-hypervisor
+    fi
     mkdir -p "$BINDIR"
     cp "$CH_BUILD_OUT/$artifact_subdir/cloud-hypervisor" "$out_bin"
     chmod +x "$out_bin"

@@ -88,6 +88,9 @@ Go-only 源码构建需要本仓以及兄弟目录中的 `accelerator` 和 `conn
 
 ## Release 模型
 
+包内来源记录只有在本地 Git Tag 与所选源码 commit 一致时才保留内部依赖的发行
+版本。未打 Tag 的源码构建记录 `git:<commit>`,不要求创建目标发行 Tag。
+
 `sandboxer` 独立发布 `vX.Y.Z` 组件版本。x86_64 archive 包含 `sandbox-ctl`、`sandbox-init` 和 patched `cloud-hypervisor` binary。组件文档与 E2E source 从选定 Tag 收集进项目 platform archive,不会在组件 archive 中重复交付。
 
 项目仓独立发布 `release-vX.Y.Z` 聚合版本,精确选择一个 `sandboxer` Tag 和其他各发行单元版本,并验证组合后的完整系统。
