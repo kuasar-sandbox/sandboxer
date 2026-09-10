@@ -80,7 +80,10 @@ HTTPS 镜像,以及 `GOTOOLCHAIN` 选择;默认分别为 `sum.golang.org` 和 `l
 commit,在任何 Tag/Release 写入前拒绝不匹配的包。独立验证将完整项目许可/NOTICE
 集合(含嵌套 `LICENSES`)与所选 commit 的 Git blob 比较;即使重算 bundle 校验和,
 内容变化、缺失或额外文件仍会被拒绝。验证前须取得该精确 commit;可信发布者获取
-源码历史用于检查,不执行候选源码或辅助脚本。提供 `RELEASE_DEPENDENCIES`
+源码历史用于检查,不执行候选源码或辅助脚本。验证还要求 Cloud Hypervisor pin 的
+来源 URL/摘要、所选项目 patch 集的 URL/commit,以及 pin 的上游 `Cargo.lock`
+URL 和字节。构建时也会用该预期 lock 摘要核对全新源码;更新 pin 或 lock 时必须
+同步更新此绑定。提供 `RELEASE_DEPENDENCIES`
 时,验证要求 accelerator、connector 的发行版本与请求完全一致;绑定缺失、重复、
 包含其他组件或发生冲突时,发布前即失败。普通的本地 replace 源码构建仍不要求
 远端目标 Tag。许可证收集拒绝不可读子目录和不完整遍历,不会仅发布可读的材料。

@@ -154,6 +154,12 @@ release_materials_require_git_licenses() {
   )
 }
 
+release_materials_cloud_hypervisor_lock_sha() {
+  # Cargo.lock from the checksum-pinned v51.1 source. Current project patches
+  # do not change it; a source/lock update must update and verify this binding.
+  printf '%s\n' da048c19408bebd62dbb76f5ef94fe8836bd54b5bfabfba0be0cb2e14e740b2d
+}
+
 release_materials_record_source() {
   [ "$#" -eq 6 ] || fail "release_materials_record_source requires payload, name, version, source, integrity and license directory"
   local value

@@ -294,6 +294,11 @@ cat >> "$fixture_root/scripts/release-materials.sh" <<'EOF'
 release_materials_download_go_toolchain() {
   GOMODCACHE="${FIXTURE_GO_DISTRIBUTION_CACHE:?}" _release_materials_download_go_toolchain "$@"
 }
+# This synthetic crate graph has its own independently selected fixture lock;
+# the production binding is verified separately against the pinned upstream tar.
+release_materials_cloud_hypervisor_lock_sha() {
+  sha256sum "$(dirname "$ROOT")/cloud-hypervisor/Cargo.lock" | awk '{print $1}'
+}
 EOF
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
 install -m 0644 "$ROOT/scripts/release-rust-materials.py" "$fixture_root/scripts/release-rust-materials.py"
@@ -337,6 +342,8 @@ git -C "$TMP/connector" tag v0.1.2 "$connector_sha"
 mkdir -p "$TMP/release-build-bin" "$TMP/crate/fixture-1.0.0" "$TMP/rust/share/doc/rust/licenses"
 printf 'fixture Rust crate license\n' > "$TMP/crate/fixture-1.0.0/LICENSE"
 tar -czf "$TMP/fixture-1.0.0.crate" -C "$TMP/crate" fixture-1.0.0
+printf 'version = 3\n[[package]]\nname = "fixture"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "%s"\n' \
+  "$(sha256sum "$TMP/fixture-1.0.0.crate" | awk '{print $1}')" > "$TMP/cloud-hypervisor/Cargo.lock"
 printf 'fixture Rust standard library copyright\n' > "$TMP/rust/share/doc/rust/COPYRIGHT-library.html"
 printf 'fixture Rust toolchain license\n' > "$TMP/rust/share/doc/rust/licenses/Apache-2.0.txt"
 cat > "$TMP/release-build-bin/make" <<'EOF'
@@ -374,8 +381,7 @@ cp "$RELEASE_TEST_CH_SOURCE/CREDITS.md" "$source/"
 cp "$RELEASE_TEST_CH_SOURCE/LICENSES/"* "$source/LICENSES/"
 cp "$RELEASE_TEST_CRATE" "$CARGO_HOME/registry/cache/fixture/fixture-1.0.0.crate"
 printf '[workspace]\n' > "$source/Cargo.toml"
-printf 'version = 3\n[[package]]\nname = "fixture"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "%s"\n' \
-  "$(sha256sum "$RELEASE_TEST_CRATE" | awk '{print $1}')" > "$source/Cargo.lock"
+cp "$RELEASE_TEST_CH_SOURCE/Cargo.lock" "$source/Cargo.lock"
 printf '#!/bin/sh\n# fresh native fixture\nexit 0\n' > "$root/bin/x86_64/cloud-hypervisor"
 chmod 0755 "$root/bin/x86_64/cloud-hypervisor"
 printf '%s\n' \
@@ -478,6 +484,41 @@ bash "$ROOT/scripts/test-publisher.sh" "$fixture_root/scripts/publish-release.sh
   "$fixture_project_sha" release/v1.2.x
 
 archive="$TMP/bundle/assets/$ARCHIVE_NAME"
+for source_name in cloud-hypervisor cloud-hypervisor-patches cloud-hypervisor-cargo-lock; do
+  for column in 4 5; do
+    candidate="$TMP/ch-source-$source_name-$column"
+    cp -a "$TMP/bundle" "$candidate"
+    mkdir "$candidate/root"
+    tar -xzf "$archive" -C "$candidate/root"
+    source_table="$candidate/root/share/sources/sandboxer/SOURCES.tsv"
+    awk -F '\t' -v OFS='\t' -v name="$source_name" -v column="$column" '
+      NR > 1 && $2 == name { $column="not-the-selected-native-source" }
+      { print }
+    ' "$source_table" > "$candidate/sources.changed"
+    install -m 0644 "$candidate/sources.changed" "$source_table"
+    release_materials_hash_tree "$candidate/root" sandboxer \
+      "$candidate/root/share/sources/sandboxer/MATERIALS.sha256"
+    repack_bundle "$candidate" "$candidate/root"
+    if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+      fail "validator accepted altered $source_name source column $column"
+    fi
+    grep -Fq "missing or inconsistent source record for $source_name" "$candidate/result.log" \
+      || fail "native source mutation failed for an unrelated reason"
+  done
+done
+candidate="$TMP/ch-lock-bytes"
+cp -a "$TMP/bundle" "$candidate"
+mkdir "$candidate/root"
+tar -xzf "$archive" -C "$candidate/root"
+printf 'altered lock bytes\n' >> "$candidate/root/share/sources/sandboxer/CLOUD-HYPERVISOR-Cargo.lock"
+release_materials_hash_tree "$candidate/root" sandboxer \
+  "$candidate/root/share/sources/sandboxer/MATERIALS.sha256"
+repack_bundle "$candidate" "$candidate/root"
+if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+  fail "validator accepted changed Cargo.lock bytes with regenerated checksums"
+fi
+grep -Fq 'Cloud Hypervisor Cargo.lock differs from the pinned source' "$candidate/result.log" \
+  || fail "Cargo.lock byte mutation failed for an unrelated reason"
 for mutation in top-level nested missing extra; do
   candidate="$TMP/project-license-$mutation"
   cp -a "$TMP/bundle" "$candidate"

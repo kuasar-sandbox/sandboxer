@@ -172,12 +172,19 @@ validate_bundle() {
   project_sha="$(go version -m "$extract/bin/sandbox-ctl" | \
     awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}')"
   release_materials_require_git_licenses "$extract" "$NAME" "$ROOT" "$project_sha" project
-  release_materials_validate "$extract" "$NAME"
   release_materials_require_project_source "$extract" "$NAME" 'bin/sandbox-ctl,bin/sandbox-init' "$version" \
     bin/sandbox-ctl bin/sandbox-init
-  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor' "v51.1"
-  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-patches' "$version"
-  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-cargo-lock' "v51.1"
+  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor' "v51.1" \
+    'https://github.com/cloud-hypervisor/cloud-hypervisor/archive/refs/tags/v51.1.tar.gz' \
+    'sha256:a2393046c0230f6360792ed2ef1b60968aa4e04d12b6be419c86306774e2e4ef'
+  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-patches' "$version" \
+    "https://github.com/kuasar-sandbox/sandboxer/tree/$project_sha/native-deps/deps/ch-patches" "git:$project_sha"
+  local expected_cargo_sha
+  expected_cargo_sha="$(release_materials_cloud_hypervisor_lock_sha)"
+  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-cargo-lock' "v51.1" \
+    'https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/Cargo.lock' "sha256:$expected_cargo_sha"
+  [ "$(sha256sum "$extract/share/sources/$NAME/CLOUD-HYPERVISOR-Cargo.lock" | awk '{print $1}')" = "$expected_cargo_sha" ] \
+    || fail "Cloud Hypervisor Cargo.lock differs from the pinned source"
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'Rust toolchain' ""
   local stdlib_digest
   stdlib_digest="$(sha256sum "$extract/share/sources/$NAME/RUST-STDLIB.tsv" | awk '{print $1}')"
@@ -193,6 +200,7 @@ validate_bundle() {
   expected_connector="$(requested_dependency_version connector)" || fail "invalid connector release binding"
   release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'accelerator' "$expected_accelerator"
   release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'connector' "$expected_connector"
+  release_materials_validate "$extract" "$NAME"
   release_materials_require_go "$extract" "$NAME" 'bin/sandbox-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/sandbox-init'
   local file
@@ -262,6 +270,8 @@ package_release() {
   prepare_cloud_hypervisor "$project_sha" "$arch"
   ch_source="$CH_RELEASE_SOURCE"
   cargo_sha="$(sha256sum "$ch_source/Cargo.lock" | awk '{print $1}')"
+  [ "$cargo_sha" = "$(release_materials_cloud_hypervisor_lock_sha)" ] \
+    || fail "Cloud Hypervisor Cargo.lock differs from the pinned source"
   accelerator_version="$(release_materials_git_version "$accelerator_source" "$accelerator_version" "$accelerator_sha")"
   connector_version="$(release_materials_git_version "$connector_source" "$connector_version" "$connector_sha")"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"

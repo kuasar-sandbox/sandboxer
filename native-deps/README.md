@@ -103,6 +103,10 @@ nested `LICENSES`, with the selected commit's Git blobs. It rejects changed,
 missing and extra files, even when bundle checksums have been regenerated.
 Fetch that exact commit before validation; the trusted publisher fetches source
 history for inspection without executing candidate source or helper files.
+Validation also requires the pinned Cloud Hypervisor source URL/digest, the
+selected project's patch-set URL/commit, and the pinned upstream `Cargo.lock`
+URL and bytes. The expected lock digest is checked against the fresh source at
+build time as well; changing the pin or lock requires updating that binding.
 If `RELEASE_DEPENDENCIES` is supplied, validation requires exactly the requested
 accelerator and connector release versions; missing, duplicate, unexpected or
 conflicting bindings fail before publication. Ordinary local-replacement source
