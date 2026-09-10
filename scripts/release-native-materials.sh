@@ -46,6 +46,53 @@ release_native_verify_package_file() {
   [ "$actual" = "$expected" ] || fail "native package file content differs from installed metadata: $input"
 }
 
+release_native_verify_license_file() {
+  local file="$1" format="$2" expected_source="${3:-}" query owner source_name source_version actual_source
+  local line owner_list count=0
+  local -a owners
+  file="$(realpath -e "$file")" || fail "native license input is missing"
+  [ -f "$file" ] || fail "native license input is not a regular file"
+  case "$format" in
+    deb)
+      query="$(dpkg-query -S "$file" 2>/dev/null)" || fail "native license has no Debian package owner"
+      # Multi-Arch packages can co-own one copyright file. Every owner must
+      # independently agree on its installed bytes and the required source.
+      while IFS= read -r line; do
+        [[ "$line" == *": $file" ]] || fail "ambiguous native license package owner"
+        owner_list="${line%": $file"}"
+        IFS=', ' read -r -a owners <<< "$owner_list"
+        for owner in "${owners[@]}"; do
+          [[ "$owner" =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9]+)?$ ]] \
+            || fail "invalid native license package owner"
+          release_native_verify_package_file "$file" deb "$owner"
+          if [ -n "$expected_source" ]; then
+            query="$(dpkg-query -W -f '${source:Package}\t${source:Version}\n' "$owner")" \
+              || fail "native license source identity is unavailable"
+            IFS=$'\t' read -r source_name source_version <<< "$query"
+            actual_source="deb-source:$source_name@$source_version"
+            [ "$actual_source" = "$expected_source" ] \
+              || fail "native license belongs to a different source package"
+          fi
+          count=$((count + 1))
+        done
+      done <<< "$query"
+      [ "$count" -gt 0 ] || fail "native license has no Debian package owner"
+      return 0
+      ;;
+    rpm)
+      release_native_verify_package_file "$file" rpm ""
+      if [ -n "$expected_source" ]; then
+        query="$(rpm -qf --qf '%{SOURCERPM}\n' "$file")" || fail "native license source identity is unavailable"
+        actual_source="rpm-source:$query"
+      fi
+      ;;
+    *) fail "unsupported native license package format" ;;
+  esac
+  if [ -n "$expected_source" ] && [ "$actual_source" != "$expected_source" ]; then
+    fail "native license belongs to a different source package"
+  fi
+}
+
 release_native_system_input() {
   local input="$1" payload="$2" query owner source_name version label copyright common
   local source_id rpm_source sibling file count=0
@@ -63,6 +110,7 @@ release_native_system_input() {
     fi
     source_id="deb-source:$source_name@$version"
     copyright="/usr/share/doc/${owner%%:*}/copyright"
+    release_native_verify_license_file "$copyright" deb "$source_id"
     release_native_copy_file "$copyright" "$label" copyright
     # Debian copyright files refer to common license texts outside the package.
     while IFS= read -r common; do
@@ -70,6 +118,7 @@ release_native_system_input() {
       if [ ! -e "$common" ] && [[ "$common" == *. ]]; then
         common="${common%.}"
       fi
+      release_native_verify_license_file "$common" deb
       release_native_copy_file "$common" "$label" "common-licenses/$(basename "$common")"
     done < <(grep -Eo '/usr/share/common-licenses/[A-Za-z0-9.+-]+' "$copyright" | LC_ALL=C sort -u)
   elif command -v rpm >/dev/null 2>&1 \
@@ -84,11 +133,12 @@ release_native_system_input() {
     # Static/devel subpackages may keep notices in a sibling from the SAME SRPM.
     while IFS= read -r sibling; do
       while IFS= read -r file; do
-        [ -f "$file" ] || continue
         case "$(basename "$file")" in
           LICENSE*|COPYING*|NOTICE*|COPYRIGHT*|copyright|AUTHORS*|CREDITS*) ;;
           *) [[ "$file" == /usr/share/licenses/* ]] || continue ;;
         esac
+        [ ! -d "$file" ] || continue
+        release_native_verify_license_file "$file" rpm "$source_id"
         release_native_copy_file "$file" "$label" "${file#/}"
         count=$((count + 1))
       done < <(rpm -ql "$sibling")

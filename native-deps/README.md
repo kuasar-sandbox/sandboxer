@@ -117,6 +117,11 @@ Each installed system input must also match its file digest in the trusted
 build host's Debian or RPM database; ownership alone is insufficient. Missing,
 ambiguous or changed file records fail packaging. This checks installed file
 integrity, not the trustworthiness of a compromised host or package database.
+Copyright, license and NOTICE bytes also must match their installed package
+digests and the linked input's source package; referenced Debian common-license
+texts are verified against their own owners. Multi-Arch co-owners must all agree
+on the bytes and required source identity. Missing, changed or conflicting
+license records fail collection.
 Unknown sources, missing materials, altered archives, and unsuccessful builds
 fail packaging. Existing `RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR` and upstream
 tarball environment overrides are not accepted by the release packager; source

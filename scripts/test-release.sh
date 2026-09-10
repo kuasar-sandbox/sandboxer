@@ -385,6 +385,8 @@ case "$1" in
   -qf)
     if [ "$2" = --dump ]; then
       printf '%s 1 0 %s 0100644 root root 0 0 0 X\n' "$3" "$(sha256sum "$3" | awk '{print $1}')"
+    elif [ "$3" = '%{SOURCERPM}\n' ]; then
+      printf 'fixture-native-1.0-1.src.rpm\n'
     else
       printf 'fixture-native\t1.0-1\tfixture-native-1.0-1.src.rpm\n'
     fi
