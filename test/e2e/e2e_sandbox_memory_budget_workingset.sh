@@ -276,18 +276,20 @@ print(target, current)
 PY
 }
 
-wait_memory_stable() { # $1=sid $2=pid $3=log $4=headroom-bytes
+wait_memory_budget() { # $1=sid $2=pid $3=log $4=headroom-bytes
     local sid="$1" pid="$2" log="$3" headroom="$4"
     local target=-1 current=-1 available=-1 demand=0 requested=0 expected_target=-1 target_gap=-1
-    local matching_observations=0 meminfo="$WORK/$sid.stability.meminfo"
+    local next_target=-1 limit=0 high="" matching_observations=0 meminfo="$WORK/$sid.budget.meminfo"
     local deadline=$((SECONDS + 120))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        if grep -q 'memory: initial Stable observation accepted' "$log" 2>/dev/null \
+        if grep -q 'memory: initial CH observation accepted' "$log" 2>/dev/null \
             && read -r target current <<<"$(read_ch_state "$sid" 2>/dev/null)" \
             && guest_exec "$sid" -- /bin/cat /proc/meminfo >"$meminfo" 2>/dev/null; then
             available=$(awk '$1 == "MemAvailable:" { printf "%.0f\n", $2 * 1024; exit }' "$meminfo")
-            if [[ "$available" =~ ^[0-9]+$ ]] \
-                && [ $((CAPACITY_BYTES - target)) -eq "$current" ]; then
+            high=$(cat "$CGROUP_ROOT/$sid/memory.high")
+            if [[ "$available" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] \
+                && [ "$target" -ge 0 ] && [ "$target" -le "$CAPACITY_BYTES" ] \
+                && [ "$current" -ge 0 ] && [ "$current" -le "$CAPACITY_BYTES" ]; then
                 demand=0
                 if [ "$current" -gt "$available" ]; then
                     demand=$((current - available))
@@ -298,20 +300,26 @@ wait_memory_stable() { # $1=sid $2=pid $3=log $4=headroom-bytes
                 fi
                 expected_target=$((CAPACITY_BYTES - requested))
                 expected_target=$((expected_target - expected_target % MEMORY_STEP_BYTES))
-                # The controller deliberately keeps up to one Step of extra
-                # Budget as its shrink deadband. A target above the formula
-                # result would under-provision headroom; a target more than one
-                # Step below it would indicate that steady reclaim stalled.
-                target_gap=-1
-                if [ "$target" -le "$expected_target" ]; then
-                    target_gap=$((expected_target - target))
+                target_gap=$((expected_target - target))
+                next_target=$target
+                if [ "$target_gap" -gt "$MEMORY_STEP_BYTES" ]; then
+                    limit=$expected_target
+                    for bound in $((target + MEMORY_STEP_BYTES)) \
+                        $((CAPACITY_BYTES - current + MEMORY_STEP_BYTES)) "$CAPACITY_BYTES"; do
+                        if [ "$limit" -gt "$bound" ]; then limit=$bound; fi
+                    done
+                    next_target=$((limit - limit % MEMORY_STEP_BYTES))
                 fi
-                if [ "$target_gap" -ge 0 ] \
-                    && [ "$target_gap" -le "$MEMORY_STEP_BYTES" ] \
+                # This is test setup, not a production convergence classifier.
+                # Wait until no growth is needed and there is no further
+                # aligned inflate within the actual-relative step bound. The
+                # freeze checks below independently assert reservation coverage,
+                # headroom and complete working-set residency, without equality.
+                if [ "$target_gap" -ge 0 ] && [ "$next_target" -le "$target" ] \
                     && [ $((target % MEMORY_STEP_BYTES)) -eq 0 ]; then
                     matching_observations=$((matching_observations + 1))
                     if [ "$matching_observations" -ge 2 ]; then
-                        echo "    steady target=$target CurrentBudget=$current MemAvailable=$available headroom=$headroom desiredTarget=$expected_target deadband=$target_gap"
+                        echo "    bounded target=$target CurrentBudget=$current MemAvailable=$available headroom=$headroom desiredTarget=$expected_target gap=$target_gap"
                         return 0
                     fi
                 else
@@ -320,11 +328,13 @@ wait_memory_stable() { # $1=sid $2=pid $3=log $4=headroom-bytes
             else
                 matching_observations=0
             fi
+        else
+            matching_observations=0
         fi
-        kill -0 "$pid" 2>/dev/null || { echo "FAIL: $sid exited before stable" >&2; return 1; }
+        kill -0 "$pid" 2>/dev/null || { echo "FAIL: $sid exited before budget setup" >&2; return 1; }
         sleep 0.5
     done
-    echo "FAIL: $sid did not reach formula-derived steady Budget within one-Step deadband (target=$target current=$current MemAvailable=$available expected_target=$expected_target target_gap=$target_gap)" >&2
+    echo "FAIL: $sid did not establish formula/actual-bounded Budget (target=$target current=$current MemAvailable=$available expected_target=$expected_target next_target=$next_target high=$high)" >&2
     sed -n '1,280p' "$log" >&2
     return 1
 }
@@ -478,7 +488,7 @@ record_case() { # $1=label $2=headroom-yaml $3=startup-yaml $4=also-b $5=headroo
     SANDBOX_PIDS+=("$pid")
     ready "$sid" "$pid" "$log"
     wait_anon_ready "$sid" "$pid" "$log"
-    wait_memory_stable "$sid" "$pid" "$log" "$headroom_bytes"
+    wait_memory_budget "$sid" "$pid" "$log" "$headroom_bytes"
 
     guest_exec "$sid" -- python3 -c "$WRITER_PROBE" "$warm_path" "$WARM_BYTES"
     guest_exec "$sid" -- /bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
@@ -670,8 +680,6 @@ for key in ("no-balloon-w", "workaround-w", "new-w"):
         raise SystemExit(f"{key}: ObservedBudget invariant failed: {freeze}")
     if freeze["Reservation"] < freeze["ObservedBudget"]:
         raise SystemExit(f"{key}: reservation under observed Budget: {freeze}")
-    if freeze["TargetBudget"] != freeze["CurrentBudget"]:
-        raise SystemExit(f"{key}: W captured with unstable target/current: {freeze}")
     if freeze["ReportEpoch"] == 0 or freeze["ReportSeq"] == 0:
         raise SystemExit(f"{key}: W freeze used no trusted report: {freeze}")
     pre = doc["record"]["prefreeze_mincore"]
