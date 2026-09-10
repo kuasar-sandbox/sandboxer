@@ -109,7 +109,7 @@ jobs:
       contents: read
     env:
       TARGET_ARCH: x86_64
-      GOPROXY: https://goproxy.cn,direct
+      GOPROXY: https://goproxy.cn
       GOSUMDB: sum.golang.google.cn
       GOTOOLCHAIN: local
       RUSTUP_DIST_SERVER: https://rsproxy.cn
@@ -284,12 +284,13 @@ jobs:
           retention-days: 1
 
   publish:
+    timeout-minutes: 30
     needs:
       - preflight
       - build
     runs-on: [self-hosted, Linux, X64, kuasar-control]
     env:
-      GOPROXY: https://goproxy.cn,direct
+      GOPROXY: https://goproxy.cn
       GOSUMDB: sum.golang.google.cn
       GOTOOLCHAIN: local
     permissions:
