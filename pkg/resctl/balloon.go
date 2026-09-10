@@ -14,6 +14,8 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/internal/chmemory"
 )
 
+var errShrinkObservationChanged = errors.New("balloon shrink decision changed")
+
 // BalloonState keeps the local target intent, Cloud Hypervisor's accepted
 // target, and the guest driver's observed current balloon size separate.
 // A successful vm.resize advances only AcceptedTarget. CurrentBudget and
@@ -225,11 +227,11 @@ func (b *BalloonController) applyDesiredHeldMode(ctx context.Context, shrinkObse
 			observed := *shrinkObservation
 			if !observed.AcceptedTargetKnown || !observed.BalloonCurrentKnown ||
 				state.AcceptedTarget != observed.AcceptedTarget || state.CurrentBudget > observed.CurrentBudget {
-				return state, fmt.Errorf("balloon shrink deferred: decision observation changed (target/current=%d/%d)",
-					state.AcceptedTarget, state.BalloonCurrent)
+				return state, fmt.Errorf("%w: decision observation changed (target/current=%d/%d)",
+					errShrinkObservationChanged, state.AcceptedTarget, state.BalloonCurrent)
 			}
 			if desired <= state.AcceptedTarget || desired > shrinkTargetLimit(b.Capacity, state.AcceptedTarget, state.CurrentBudget) {
-				return state, fmt.Errorf("balloon shrink deferred: target=%d exceeds the accepted/actual step bound", desired)
+				return state, fmt.Errorf("%w: target=%d exceeds the accepted/actual step bound", errShrinkObservationChanged, desired)
 			}
 		}
 	} else if shrinkObservation != nil {
