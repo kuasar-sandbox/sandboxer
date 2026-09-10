@@ -293,7 +293,16 @@ install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/rele
 install -m 0644 "$ROOT/scripts/release-go-toolchain.go" "$fixture_root/scripts/release-go-toolchain.go"
 cat >> "$fixture_root/scripts/release-materials.sh" <<'EOF'
 release_materials_download_go_toolchain() {
-  GOMODCACHE="${FIXTURE_GO_DISTRIBUTION_CACHE:?}" _release_materials_download_go_toolchain "$@"
+  # Seed only public distribution cache files, never HOME/netrc/VCS/auth state.
+  # The real filtered downloader still checks sumdb; the ZIP verifier checks h1.
+  local cached="${FIXTURE_GO_DISTRIBUTION_CACHE:?}/cache/download/golang.org/toolchain/@v"
+  local destination="${WORK:-$RELEASE_MATERIALS_WORK}/toolchain-download/module-cache/cache/download/golang.org/toolchain/@v"
+  local suffix identity="v0.0.1-$1.linux-amd64"
+  mkdir -p "$destination"
+  for suffix in zip ziphash info mod; do
+    [ ! -f "$cached/$identity.$suffix" ] || cp --reflink=auto "$cached/$identity.$suffix" "$destination/"
+  done
+  _release_materials_download_go_toolchain "$@"
 }
 # This synthetic crate graph has its own independently selected fixture lock;
 # the production binding is verified separately against the pinned upstream tar.
