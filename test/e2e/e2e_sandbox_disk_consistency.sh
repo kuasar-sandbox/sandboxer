@@ -326,10 +326,10 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    overlay: { diff: file://$3, size: 512MiB }
+    overlay: { diff: file://$3 }
   disks:
     - { name: scratch }
-    - { name: dataset, overlay: { diff: file://$4, size: $DATA_DISK_YAML_SIZE } }
+    - { name: dataset, overlay: { diff: file://$4 } }
 EOF
 }
 
@@ -495,10 +495,10 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $BLK0_REF
-    overlay: { diff: file://$ROOT_DIFF_PATH, size: 512MiB }
+    overlay: { diff: file://$ROOT_DIFF_PATH }
   disks:
-    - { name: scratch, diff: file://$SCRATCH_DIFF_PATH, diff_size: $DATA_DISK_YAML_SIZE }
-    - { name: dataset, base: $DATASET_REF, overlay: { diff: file://$DATASET_DIFF_PATH, diff_size: $DATA_DISK_YAML_SIZE } }
+    - { name: scratch, diff: file://$SCRATCH_DIFF_PATH }
+    - { name: dataset, base: $DATASET_REF, overlay: { diff: file://$DATASET_DIFF_PATH } }
 mounts:
   - { target: /scratch, type: disk, source: scratch }
   - { target: /data,    type: disk, source: dataset }
