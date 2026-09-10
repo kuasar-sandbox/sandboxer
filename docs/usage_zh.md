@@ -109,6 +109,11 @@ Counter 保留已知累计 ns、原始 ticks、尺度、换算余数及来源/�
 来源计入首次轮询前 CPU. 整数换算跨轮询保留余数, 不逐秒舍入后相加. 来源计数
 回退不会下溢或悄悄扣除已知用量. 同一原生 Counter 可在漏轮询后恢复差值,
 但这不恢复 Gauge coverage. 新来源的已知创建基线不证明旧来源末段已知.
+已确认身份的 vCPU 暂时失读时保留已知基线, 后续同身份 Counter 可补齐漏读 ticks.
+首次身份未知、确认线程退出/更换、映射歧义或终态读取失败仍标记 incomplete;
+重新发现线程不能恢复已经丢失的完整性.
+来源丢失的有效性标记按 vCPU 有界保留, 不因结果被拒收而遗忘; 被拒收结果本身
+不计入 CPU ticks, 也不改变其时间戳.
 
 CH 的唯一 wait owner 使用 `waitid(WNOWAIT)`, 重试 EINTR, 在 proc 状态仍
 存活时尽力最终读取, 然后调用 `cmd.Wait`. 不增加第二回收者, 不改变退出升级
@@ -237,6 +242,10 @@ frame 上限 512 KiB, 字符串 256 byte, Counter 1,027 个, Gauge 14 个.
 单调位置和 Gauge 基线, 不用旧单调位置与当前时钟相减.
 
 ## 7. 可靠性与生命周期
+
+Sampler 初始化失败时报告既有的不可用/错误状态, 释放文件所有权, 不保存或截断
+checkpoint. 原有字节仍可离线读取, 新建文件可能保持为空. 该次尝试不暴露未初始化
+的 live/saved 视图, 也不写入新的 closed 记录.
 
 采样接入 Host 进程生命周期. Guest 请求只有在真正 launch/restore ready 后
 开放, ctl.sock 存在不算 Guest ready. 捕获前 Host 关闭 usage 准入并断开 Gauge

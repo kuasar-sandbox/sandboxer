@@ -482,6 +482,9 @@ func ServeAndWait(p VMParams) (int, error) {
 			usageSampler, usageErr = usage.NewSampler(usageManager, p.SnapCfg.Resources.Capacity.CPU, len(p.Disks), pinger.Client, p.Balloon, nil)
 		}
 		if usageErr != nil {
+			// A failed sampler has released the freshly opened manager without
+			// saving. Do not expose or close that uninitialized run as live usage.
+			usageManager = nil
 			usageError = usageErr.Error()
 			logf("usage unavailable: %v", usageErr)
 		}
@@ -490,8 +493,6 @@ func ServeAndWait(p VMParams) (int, error) {
 			defer cancel()
 			if usageSampler != nil {
 				usageSampler.Stop(ctx)
-			} else if usageManager != nil {
-				usageManager.Close(ctx, time.Now())
 			}
 		}()
 	}

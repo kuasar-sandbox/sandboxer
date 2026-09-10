@@ -221,20 +221,27 @@ func (m *Manager) Counter(name, source string, raw, hertz uint64, created bool) 
 }
 
 func (m *Manager) CounterMissing(name string, final bool) {
+	m.counterMissing(name, final, false)
+}
+
+// A vCPU without an accepted identity may have been replaced before its first
+// successful read. Native process counters instead have a creation baseline
+// from the sole process owner, even if their first proc read fails.
+func (m *Manager) counterMissing(name string, final, requireSource bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i := range m.live.Counters {
 		c := &m.live.Counters[i]
 		if c.Name == name {
 			c.Status = Missing
-			if final {
+			if final || (requireSource && !c.SourceKnown) {
 				c.Complete = false
 			}
 			return
 		}
 	}
 	if len(m.live.Counters) < MaxCounters {
-		m.live.Counters = append(m.live.Counters, Counter{Name: name, Status: Missing, Complete: !final && !m.historyUnknown})
+		m.live.Counters = append(m.live.Counters, Counter{Name: name, Status: Missing, Complete: !final && !requireSource && !m.historyUnknown})
 	}
 }
 

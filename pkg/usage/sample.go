@@ -72,11 +72,28 @@ type Sampler struct {
 	sources         map[string]string
 }
 
+// NewSampler takes ownership of a freshly opened Manager, before it is shared
+// or starts saving. Construction failure only releases its pinned descriptors;
+// it must not seal a run that never sampled. On success Stop owns cleanup.
 func NewSampler(m *Manager, vcpus, disks int, host *guestlink.HostClient, balloon *resctl.BalloonController, clock Clock) (*Sampler, error) {
+	return newSampler(m, vcpus, disks, host, balloon, clock, newProcReader)
+}
+
+// The proc bootstrap seam exercises failures before sampling without changing
+// the process-wide /proc mount or adding a runtime provider abstraction.
+func newSampler(m *Manager, vcpus, disks int, host *guestlink.HostClient, balloon *resctl.BalloonController, clock Clock, openProc func(int) (*procReader, error)) (_ *Sampler, err error) {
+	defer func() {
+		if err != nil && m != nil {
+			m.closeFiles()
+		}
+	}()
+	if m == nil {
+		return nil, errors.New("usage: manager unavailable")
+	}
 	if vcpus < 1 || vcpus > MaxCounters-3 || disks < 1 || disks > proto.MaxUsageFilesystems {
 		return nil, errors.New("usage: unsupported resource count")
 	}
-	p, err := newProcReader(vcpus)
+	p, err := openProc(vcpus)
 	if err != nil {
 		return nil, err
 	}
@@ -267,18 +284,35 @@ func (s *Sampler) processMissing(name string, final bool) {
 	if name == "ch" {
 		s.m.CounterMissing("guest.cpu", final)
 		for cpu := 0; cpu < s.proc.vcpuCount; cpu++ {
-			s.m.CounterMissing(fmt.Sprintf("guest.vcpu.%d", cpu), final)
+			s.m.counterMissing(fmt.Sprintf("guest.vcpu.%d", cpu), final, true)
 		}
 	}
 }
 
 func (s *Sampler) readProcess(pid int, name string, id uint64, final bool) func() {
 	start := s.clock.Now()
+	if name == "ch" && s.proc.incomplete == nil {
+		s.proc.incomplete = make([]bool, s.proc.vcpuCount)
+	}
 	path := filepath.Join(s.proc.root, strconv.Itoa(pid))
 	stat, err := s.proc.stat(filepath.Join(path, "stat"))
 	if err != nil || stat.PID != pid {
+		var incomplete []bool
+		if name == "ch" {
+			for cpu := 0; cpu < s.proc.vcpuCount; cpu++ {
+				if _, known := s.proc.threads[cpu]; !known {
+					s.proc.incomplete[cpu] = true
+				}
+			}
+			incomplete = append([]bool(nil), s.proc.incomplete...)
+		}
 		return func() {
 			s.processMissing(name, final)
+			for cpu, lost := range incomplete {
+				if lost {
+					s.m.CounterMissing(fmt.Sprintf("guest.vcpu.%d", cpu), true)
+				}
+			}
 			s.missing(map[bool]int{true: 0, false: 1}[name == "ch"], id, s.clock.Now())
 		}
 	}
@@ -292,28 +326,41 @@ func (s *Sampler) readProcess(pid int, name string, id uint64, final bool) func(
 		cpu  int
 		stat procStat
 		err  error
+		gone bool
 	}
 	var threads []threadValue
 	if name == "ch" {
+		previous := s.proc.threads
+		ambiguous := false
 		if s.proc.threadCount != stat.Threads || len(s.proc.threads) != s.proc.vcpuCount {
-			_ = s.proc.discover(pid, stat.Threads)
+			ambiguous = errors.Is(s.proc.discover(pid, stat.Threads), errAmbiguousVCPU)
 		}
 		for cpu := 0; cpu < s.proc.vcpuCount; cpu++ {
 			entry, known := s.proc.threads[cpu]
 			var ts procStat
 			var te error
-			if !known {
+			gone := false
+			if ambiguous {
+				te, gone = errAmbiguousVCPU, true
+			} else if !known {
 				te = errors.New("vCPU thread unavailable")
+				gone = true
 			} else {
-				ts, te = s.proc.stat(filepath.Join(path, "task", strconv.Itoa(entry.tid), "stat"))
-				if te == nil && (ts.PID != entry.tid || ts.Start != entry.start || ts.Comm != "vcpu"+strconv.Itoa(cpu)) {
-					te = errors.New("vCPU identity changed")
+				if old, existed := previous[cpu]; existed && old != entry {
+					gone = true
 				}
-				if te != nil {
+				ts, te = s.proc.stat(filepath.Join(path, "task", strconv.Itoa(entry.tid), "stat"))
+				currentGone := errors.Is(te, os.ErrNotExist)
+				if te == nil && (ts.PID != entry.tid || ts.Start != entry.start || ts.Comm != "vcpu"+strconv.Itoa(cpu)) {
+					te, currentGone = errors.New("vCPU identity changed"), true
+				}
+				if currentGone {
 					delete(s.proc.threads, cpu)
 				}
+				gone = gone || currentGone
 			}
-			threads = append(threads, threadValue{cpu, ts, te})
+			s.proc.incomplete[cpu] = s.proc.incomplete[cpu] || gone
+			threads = append(threads, threadValue{cpu, ts, te, s.proc.incomplete[cpu]})
 		}
 	}
 	end := s.clock.Now()
@@ -330,8 +377,11 @@ func (s *Sampler) readProcess(pid int, name string, id uint64, final bool) func(
 			for _, thread := range threads {
 				key := fmt.Sprintf("guest.vcpu.%d", thread.cpu)
 				if thread.err != nil {
-					s.m.CounterMissing(key, true)
+					s.m.counterMissing(key, final || thread.gone, true)
 				} else {
+					if thread.gone {
+						s.m.CounterMissing(key, true)
+					}
 					_ = s.m.Counter(key, s.proc.identity(thread.stat), thread.stat.Guest, s.proc.hertz, true)
 				}
 			}

@@ -132,6 +132,12 @@ instead of rounding every interval independently. A source regression does
 not underflow or silently subtract known usage. After a missed poll the same
 native counter can recover its delta; this does not recover Gauge coverage.
 Changing a source cannot certify the old source's unknown terminal segment.
+For an already identified vCPU, transient reads retain the known baseline and
+the next successful same-identity counter covers the missed ticks. An unknown
+first identity, confirmed thread exit/replacement, ambiguous mapping or failed
+terminal read remains incomplete; rediscovery never restores lost completeness.
+Source-loss validity is bounded per vCPU and survives a rejected result; the
+rejected result itself never contributes CPU ticks or changes its timestamp.
 
 CH's sole wait owner uses `waitid(WNOWAIT)`, retries EINTR, attempts the final
 read while proc state still exists, and then calls `cmd.Wait`. It does not
@@ -293,6 +299,11 @@ but rebuild current monotonic positions and Gauge baselines. They never
 subtract a saved old monotonic position from the current clock.
 
 ## 7. Reliability and lifecycle
+
+If sampler initialization fails, usage reports the existing unavailable/error
+state and releases its file ownership without saving or truncating a checkpoint.
+Existing bytes remain readable offline; a newly created file may remain empty.
+There is no uninitialized live/saved view or new closed record for that attempt.
 
 Sampling starts from the Host process lifecycle; Guest requests are admitted
 only after real launch/restore readiness, not merely ctl.sock existence.

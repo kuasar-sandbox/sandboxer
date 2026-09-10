@@ -155,6 +155,9 @@ type vcpuThread struct {
 	tid   int
 	start uint64
 }
+
+var errAmbiguousVCPU = errors.New("usage: ambiguous vCPU mapping")
+
 type procReader struct {
 	root, boot  string
 	hertz       uint64
@@ -163,6 +166,9 @@ type procReader struct {
 	threads     map[int]vcpuThread
 	threadCount int
 	vcpuCount   int
+	// Only the CH proc execution slot accesses this bounded validity state.
+	// A discarded result cannot make a confirmed source loss complete again.
+	incomplete []bool
 }
 
 func newProcReader(vcpus int) (*procReader, error) {
@@ -207,6 +213,19 @@ func (p *procReader) discover(pid, count int) error {
 		}
 		s, e := p.stat(filepath.Join(path, entry.Name(), "stat"))
 		if e != nil {
+			// An unrelated topology change can force discovery while a known
+			// thread's stat temporarily fails. Keep only its previously checked
+			// identity; readProcess revalidates it before accepting any ticks.
+			if !errors.Is(e, os.ErrNotExist) {
+				for cpu, cached := range p.threads {
+					if cached.tid == tid {
+						if _, exists := found[cpu]; exists {
+							return errAmbiguousVCPU
+						}
+						found[cpu] = cached
+					}
+				}
+			}
 			continue
 		}
 		if !strings.HasPrefix(s.Comm, "vcpu") {
@@ -217,7 +236,7 @@ func (p *procReader) discover(pid, count int) error {
 			continue
 		}
 		if _, exists := found[cpu]; exists {
-			return errors.New("usage: ambiguous vCPU mapping")
+			return errAmbiguousVCPU
 		}
 		found[cpu] = vcpuThread{tid, s.Start}
 	}
