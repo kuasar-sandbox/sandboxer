@@ -66,6 +66,8 @@ bypasses, Git configuration and caller credentials while retaining validated,
 credential-free routing. Uploaded Go record keys must match the exact official
 payload names before any source or toolchain download; path aliases are rejected.
 These release checks do not change ordinary development module authentication.
+Source inventories reject duplicate or excessive records before per-row work;
+each metadata table is capped at 16 MiB and the source inventory at 16,384 rows.
 
 The trusted publisher generates the standard release text and source/Preview
 markers from its validated request. Downloaded `release-notes.md` is a local
@@ -131,6 +133,10 @@ source material from the actual Cargo build report: registry crate archives must
 match `Cargo.lock` checksums, and Git dependencies must match its full commits.
 Only observed build inputs are listed, including build-time/procedural-macro
 dependencies; this is not a claim that every listed crate's code is shipped.
+Git crate materials include the manifest's explicit `license-file`, even for
+nonstandard names or a workspace-root file above the crate. The path must stay
+inside the selected repository and identify a tracked regular file; all collected
+bytes come from the locked Git commit, not editable checkout notices.
 Editable extracted cache files are not the authority for registry licenses.
 Only credential-free HTTPS registry routing from the caller's Cargo source
 configuration is carried into the private home. Tokens, credential providers,
@@ -138,6 +144,9 @@ build wrappers and directory/git source overrides are not copied.
 Native build commands receive an explicit environment allowlist and a private
 home: Cargo tokens, cloud/release credentials and SSH-agent settings are not
 inherited. Compiler/wrapper overrides are rejected for release packaging; the
+fresh release build also explicitly rejects nonempty `GOEXPERIMENT`, `RUSTFLAGS`
+and `CARGO_ENCODED_RUSTFLAGS` instead of silently discarding requested settings.
+Ordinary development builds continue to accept their existing build flags. The
 selected toolchain's exact `rustc` executable is used both for Cargo and the
 material record, including its digest. This is credential hygiene for trusted
 release inputs, not a substitute for isolating untrusted CI candidates.
@@ -155,9 +164,17 @@ so same-name/version packages from different registries or Git commits do not
 overwrite one another's license files.
 If two distinct native link inputs would use the same system-material name,
 packaging refuses the collision before the second input can overwrite notices.
-Rustup's standard-library notices or matching installed Debian/RPM source-package
-notices are collected; missing toolchain documentation fails with an installation
-hint. Distribution Rust notice bytes must match their installed package digests
+Rustup's standard-library notices come from the official `rustc` distribution,
+not editable local documentation. Its HTTPS release manifest must match the
+selected compiler's complete Git commit, release string and host; the complete
+archive must match the manifest's SHA-256 before its generated library copyright
+and license texts are collected. Stable selection uses the exact version;
+beta/nightly selection uses a fixed installed date and verifies it against the
+same full commit. `RUST-NOTICES.tsv` records the manifest/archive URLs and digests.
+The toolchain is not replaced or installed by this check. See Rust's
+[distribution layout](https://forge.rust-lang.org/infra/channel-layout.html).
+Matching installed Debian/RPM source-package notices remain supported; missing
+materials fail with an installation hint. Distribution Rust notice bytes must match their installed package digests
 and source identity. Package-owned symlinks are copied as regular files only after
 verifying the resolved target; all Debian Multi-Arch co-owners must agree. Referenced
 common-license texts retain their own package identity. This does not attest the

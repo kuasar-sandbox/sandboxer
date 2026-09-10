@@ -55,6 +55,8 @@ Go 依赖来源验证使用全新的私有 module/VCS 状态和已启用的 chec
 它清除持久化 Go 设置、私有 module 绕过规则、Git 配置与调用者凭据,仅保留已验证的
 无凭据路由。下载来源或工具链之前,上传的 Go 记录键必须匹配官方载荷的精确名称;
 路径别名会被拒绝。这些发行检查不改变普通开发中的 module 认证方式。
+来源清单在逐行处理前拒绝重复或过量记录;每份元数据表上限为 16 MiB,
+来源清单上限为 16,384 行。
 
 可信发布端根据已验证请求生成标准发行正文及来源/Preview 标记。下载的
 `release-notes.md` 只是本地 bundle 辅助说明,不能决定公开发行正文或对账来源。
@@ -102,10 +104,16 @@ URL 和字节。构建时也会用该预期 lock 摘要核对全新源码;更新
 checksum,Git 依赖必须匹配锁文件中的完整 commit。清单只列本次实际构建输入,
 包括构建期和过程宏依赖;不表示所列每个 crate 的代码都进入交付物。可修改的
 解压缓存不是 registry 许可证的权威来源。
+Git crate 材料包括 manifest 显式声明的 `license-file`,即使它采用非标准文件名,
+或位于 crate 上层的 workspace 根目录。路径必须留在选定仓库内,且对应已跟踪的
+普通文件;所有收集字节取自锁定的 Git commit,不取自可修改的 checkout 声明。
 私有 Cargo home 只继承调用者源配置中无凭据的 HTTPS registry 路由,不复制
 Token、凭据提供器、构建包装器或 directory/git source 覆盖项。
 原生构建命令使用显式环境允许列表和私有 home,不继承 Cargo Token、云/发布凭据
-或 SSH agent 设置。发行打包拒绝编译器及 wrapper 覆盖;Cargo 和材料记录使用
+或 SSH agent 设置。发行打包拒绝编译器及 wrapper 覆盖;全新发行构建还明确
+拒绝非空的 `GOEXPERIMENT`、`RUSTFLAGS` 和
+`CARGO_ENCODED_RUSTFLAGS`,不会静默丢弃请求的设置。普通开发构建继续接受已有
+构建 flag。Cargo 和材料记录使用
 选定工具链的同一个精确 `rustc` 可执行文件,并记录其摘要。这是可信发行输入的
 凭据卫生措施,不能代替对不可信 CI 候选的隔离。
 保留标准 `CARGO_NET_GIT_FETCH_WITH_CLI` 布尔选项;Git CLI 传输不可用时,
@@ -120,8 +128,14 @@ crate 目录还包含完整 Cargo 来源身份的摘要,不同 registry 或 Git 
 同版本的包不会相互覆盖许可文件。
 若两个不同原生链接输入将使用同一个系统材料名称,打包会在第二个输入覆盖声明
 之前拒绝冲突。
-采集 rustup 标准库声明或已安装的同源 Debian/RPM 包声明;工具链文档缺失时
-会给出安装提示并拒绝打包。发行版 Rust 声明的字节必须匹配已安装包摘要和源包
+Rustup 标准库声明取自官方 `rustc` 分发,不取自可修改的本地文档。其 HTTPS
+发行清单必须匹配所选编译器的完整 Git commit、release 字符串及 host;完整归档
+须匹配清单中的 SHA-256 后,才采集生成的标准库版权及许可正文。Stable 按精确
+版本选择;beta/nightly 按已安装的固定日期定位清单,并核对同一完整 commit。
+`RUST-NOTICES.tsv` 记录清单/归档 URL 和摘要。该检查不替换或安装工具链。
+参见 Rust 的[分发布局](https://forge.rust-lang.org/infra/channel-layout.html)。
+继续支持已安装的同源 Debian/RPM 包声明;材料缺失时给出安装提示并拒绝打包。
+发行版 Rust 声明的字节必须匹配已安装包摘要和源包
 身份。包所属的符号链接仅在解析后目标通过核验时复制为普通文件;Debian
 Multi-Arch 共同所有者必须全部一致。引用的 common-license 正文保留自身的包
 身份。这些检查不证明主机或包数据库可信。

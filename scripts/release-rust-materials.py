@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import tomllib
 from urllib.parse import urlsplit
 from urllib.request import urlopen
@@ -63,7 +64,8 @@ def native_build_environment(original, home, cargo_home, rustc):
     """Pass build settings, not the caller's authentication environment."""
     for name in ("RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
                  "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER",
-                 "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"):
+                 "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "GOEXPERIMENT",
+                 "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         require(not original.get(name), "release native build does not accept " + name)
     allowed = {"PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
@@ -200,15 +202,36 @@ def git_materials(package, locked, destination):
         return subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
     require(git("rev-parse", "HEAD") == commit, "Git crate checkout differs from Cargo.lock")
     require(not git("status", "--porcelain", "--untracked-files=no"), "Git crate checkout is dirty")
-    root = Path(git("rev-parse", "--show-toplevel"))
+    root = Path(git("rev-parse", "--show-toplevel")).resolve()
+    declared = package.get("license_file")
+    if declared:
+        require(isinstance(declared, str), "invalid declared Git license path")
+        declared_path = Path(declared)
+        if not declared_path.is_absolute():
+            declared_path = directory / declared_path
+        # Normalize lexically, without following a symlink into another file.
+        # Workspace-root licenses may be above the crate but not above the repo.
+        declared_path = Path(os.path.normpath(declared_path))
+        require(declared_path.is_relative_to(root), "declared Git license escapes selected repository")
+        declared = declared_path.relative_to(root).as_posix()
+        require(safe_relative(declared), "unsafe declared Git license path")
     count = 0
-    for relative in subprocess.check_output(["git", "-C", str(root), "ls-files"], text=True).splitlines():
-        if not material_name(relative):
+    declared_found = not declared
+    tree = subprocess.check_output(["git", "-C", str(root), "ls-tree", "-rz", "--full-tree", commit])
+    for record in tree.split(b"\0"):
+        if not record:
             continue
-        path = root / relative
-        require(path.is_file() and not path.is_symlink(), "invalid Git crate material")
-        put_material(destination, str(path.relative_to(root)), path.read_bytes())
+        metadata, name = record.split(b"\t", 1)
+        relative = os.fsdecode(name)
+        if not material_name(relative, declared):
+            continue
+        mode, kind, blob = metadata.split()
+        require(kind == b"blob" and mode in (b"100644", b"100755"), "invalid Git crate material")
+        contents = subprocess.check_output(["git", "-C", str(root), "cat-file", "blob", blob.decode("ascii")])
+        put_material(destination, relative, contents)
+        declared_found = declared_found or relative == declared
         count += 1
+    require(declared_found, "declared Git license is not a tracked regular material")
     require(count, "Git crate has no tracked license/notice material")
     return source[4:].split("?", 1)[0].split("#", 1)[0], "git:" + commit
 
@@ -296,6 +319,83 @@ def rust_installed_license_bytes(path, package_format, expected_source=None):
     return contents
 
 
+def rustup_toolchain_notices(sysroot, fields, destination, stage):
+    """Read notices from Rust's HTTPS manifest-bound compiler distribution.
+
+    The rustc component, not rust-docs, installs share/doc/rust's generated
+    copyright and REUSE license files. Local editable notice bytes are unused.
+    """
+    version, commit, host = fields["release"], fields["commit-hash"], fields.get("host", "")
+    require(re.fullmatch(r"[A-Za-z0-9_.+-]{1,100}", host), "invalid Rust distribution host")
+    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        selector = "channel-rust-" + version + ".toml"
+    else:
+        match = re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+-(nightly|beta(?:\.[0-9]+)?)", version)
+        require(match, "Rust notices require a released or dated official toolchain")
+        installed = tomllib.loads((sysroot / "lib/rustlib/multirust-channel-manifest.toml").read_text())
+        date = installed.get("date", "")
+        require(isinstance(date, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date),
+                "invalid installed Rust channel date")
+        # The local date only locates a fixed official manifest. Its full commit
+        # and exact release string must still match; no moving channel is used.
+        selector = date + "/channel-rust-" + ("nightly" if match[1] == "nightly" else "beta") + ".toml"
+    manifest_url = "https://static.rust-lang.org/dist/" + selector
+    with urlopen(manifest_url, timeout=30) as response:
+        manifest_bytes = response.read(8 * 1024 * 1024 + 1)
+    require(len(manifest_bytes) <= 8 * 1024 * 1024, "Rust distribution manifest is too large")
+    manifest = tomllib.loads(manifest_bytes.decode())
+    require(manifest.get("manifest-version") == "2", "unsupported Rust distribution manifest")
+    package = manifest["pkg"]["rustc"]
+    require(package.get("git_commit_hash") == commit and package.get("version", "").split(" ", 1)[0] == version,
+            "Rust distribution differs from selected compiler commit or release")
+    target = package["target"][host]
+    require(target.get("available") is True, "selected Rust compiler distribution is unavailable")
+    archive_url, digest = target["xz_url"], target["xz_hash"]
+    parsed = urlsplit(archive_url)
+    require(parsed.scheme == "https" and parsed.netloc == "static.rust-lang.org"
+            and not parsed.query and not parsed.fragment
+            and re.fullmatch(r"/dist/[0-9]{4}-[0-9]{2}-[0-9]{2}/rustc-[A-Za-z0-9_.+-]+\.tar\.xz", parsed.path)
+            and parsed.path.endswith("-" + host + ".tar.xz"), "invalid Rust compiler distribution URL")
+    require(re.fullmatch(r"[0-9a-f]{64}", digest), "invalid Rust compiler distribution digest")
+    prefix = PurePosixPath(parsed.path).name.removesuffix(".tar.xz") + "/rustc/share/doc/rust/"
+    notices = {}
+    with tempfile.TemporaryFile() as downloaded:
+        total = 0
+        actual = hashlib.sha256()
+        with urlopen(archive_url, timeout=30) as response:
+            while block := response.read(1024 * 1024):
+                total += len(block)
+                require(total <= 512 * 1024 * 1024, "Rust compiler distribution is too large")
+                actual.update(block)
+                downloaded.write(block)
+        require(actual.hexdigest() == digest, "Rust compiler distribution checksum mismatch")
+        downloaded.seek(0)
+        notice_size = 0
+        with tarfile.open(fileobj=downloaded, mode="r|xz") as archive:
+            for member in archive:
+                if not member.name.startswith(prefix):
+                    continue
+                relative = member.name[len(prefix):]
+                if member.isdir() or not (relative == "COPYRIGHT-library.html" or relative.startswith("licenses/")):
+                    continue
+                require(safe_relative(relative) and member.isfile() and relative not in notices,
+                        "invalid or duplicate Rust distribution notice")
+                notice_size += member.size
+                require(0 < member.size <= 16 * 1024 * 1024 and notice_size <= 32 * 1024 * 1024,
+                        "Rust distribution notices exceed size limit")
+                notices[relative] = archive.extractfile(member).read()
+    require("COPYRIGHT-library.html" in notices and any(name.startswith("licenses/") for name in notices),
+            "Rust compiler distribution omits standard-library copyright or license texts")
+    for relative, contents in sorted(notices.items()):
+        put_material(destination, relative, contents)
+    receipt = stage / "share/sources/sandboxer/RUST-NOTICES.tsv"
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text("input\tsource\tsha256\nmanifest\t" + manifest_url + "\t"
+                       + hashlib.sha256(manifest_bytes).hexdigest() + "\ncompiler-archive\t" + archive_url + "\t" + digest + "\n")
+    receipt.chmod(0o644)
+    return digest
+
+
 def rust_toolchain_materials(stage, rustc, link_map):
     info = subprocess.check_output([str(rustc), "-vV"], text=True)
     fields = dict(line.split(": ", 1) for line in info.splitlines() if ": " in line)
@@ -310,9 +410,9 @@ def rust_toolchain_materials(stage, rustc, link_map):
     paths = []
     package_format = None
     common_paths = set()
+    notices_digest = ""
     if (docs / "COPYRIGHT-library.html").is_file() and (docs / "licenses").is_dir():
-        paths = [docs / "COPYRIGHT-library.html", *sorted((docs / "licenses").rglob("*"))]
-        paths = [(p, str(p.relative_to(docs))) for p in paths if p.is_file()]
+        notices_digest = rustup_toolchain_notices(sysroot, fields, destination, stage)
     elif shutil.which("dpkg-query") and subprocess.run(
             ["dpkg-query", "-S", str(rustc.resolve())], stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL).returncode == 0:
@@ -361,19 +461,16 @@ def rust_toolchain_materials(stage, rustc, link_map):
                 if path.is_file() and (material_name(path.name) or value.startswith("/usr/share/licenses/")):
                     paths.append((path, value.lstrip("/")))
     else:
-        raise ValueError("Rust toolchain notices are unavailable: install rust-docs for the selected rustup "
-                         "toolchain, or its matching Debian/RPM copyright and license packages")
-    require(paths, "Rust toolchain copyright/license material is missing; install the selected toolchain's "
+        raise ValueError("Rust toolchain notices are unavailable: restore the selected rustup rustc "
+                         "component, or install its matching Debian/RPM copyright and license packages")
+    require(paths or notices_digest, "Rust toolchain copyright/license material is missing; install the selected toolchain's "
                    "documentation/license package before release packaging")
     for path, relative in paths:
-        if package_format is None:
-            require(not path.is_symlink(), "Rust toolchain license material is a symbolic link")
-            contents = path.read_bytes()
-        else:
-            contents = rust_installed_license_bytes(path, package_format, None if path in common_paths else source)
+        contents = rust_installed_license_bytes(path, package_format, None if path in common_paths else source)
         put_material(destination, relative, contents)
     return ["bin/cloud-hypervisor", "Rust toolchain", version, source,
             "git:" + commit + ";compiler-sha256:" + hashlib.sha256(rustc.read_bytes()).hexdigest()
+            + (";notices-archive-sha256:" + notices_digest if notices_digest else "")
             + ";target-stdlib-sha256:" + stdlib_digest,
             "share/licenses/sandboxer/rust-toolchain/" + version]
 

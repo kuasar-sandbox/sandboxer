@@ -5,8 +5,10 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -15,6 +17,9 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("materials", Path(__file__).with_name("release-rust-materials.py"))
 materials = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(materials)
+fixture_spec = importlib.util.spec_from_file_location("distribution_fixture", Path(__file__).with_name("test-rust-distribution-fixture.py"))
+distribution_fixture = importlib.util.module_from_spec(fixture_spec)
+fixture_spec.loader.exec_module(distribution_fixture)
 
 
 class MaterialsTests(unittest.TestCase):
@@ -184,6 +189,62 @@ class MaterialsTests(unittest.TestCase):
         self.assertEqual(len({row[5] for row in rows}), 2)
         licenses = {(self.root / "stage" / row[5] / "LICENSE").read_text() for row in rows}
         self.assertEqual(licenses, {"fixture license\n", "distinct Git fork license\n"})
+
+    def test_git_declared_notices_come_from_the_locked_tree(self):
+        git_root = self.root / "git-declared"
+        crate = git_root / "nested"
+        (crate / "legal").mkdir(parents=True)
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(git_root), *args], text=True).strip()
+        git("init", "-q")
+        git("config", "--local", "user.name", "Chen Xiaohui")
+        git("config", "--local", "user.email", "graych@gmail.com")
+        (git_root / "LICENSE").write_text("fixture root notice\n")
+        (git_root / "root-terms.txt").write_text("fixture workspace terms\n")
+        (crate / "legal/MIT.txt").write_text("fixture declared license\n")
+        (crate / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="1.0.0"\nlicense-file="legal/MIT.txt"\n')
+        (crate / "legal/link.txt").symlink_to("MIT.txt")
+        git("add", "--", "LICENSE", "root-terms.txt", "nested")
+        git("commit", "-qm", "test: declare nonstandard Git crate notices")
+        locked = {"source": "git+https://example.invalid/fixture#" + git("rev-parse", "HEAD")}
+        package = {**self.package, "manifest_path": str(crate / "Cargo.toml")}
+        for declared, relative, contents in (
+                ("legal/MIT.txt", "nested/legal/MIT.txt", "fixture declared license\n"),
+                (str(crate / "legal/MIT.txt"), "nested/legal/MIT.txt", "fixture declared license\n"),
+                ("../root-terms.txt", "root-terms.txt", "fixture workspace terms\n")):
+            with self.subTest(declared=declared):
+                destination = self.root / "declared-material"
+                materials.git_materials({**package, "license_file": declared}, locked, destination)
+                self.assertEqual((destination / relative).read_text(), contents)
+        for declared, error in (("legal/missing.txt", "not a tracked"),
+                                ("legal/link.txt", "invalid Git crate material"),
+                                ("../../outside.txt", "escapes"),
+                                (str(self.root / "outside.txt"), "escapes")):
+            with self.subTest(declared=declared), self.assertRaisesRegex(ValueError, error):
+                materials.git_materials({**package, "license_file": declared}, locked, self.root / "rejected")
+        git("update-index", "--assume-unchanged", "nested/legal/MIT.txt")
+        (crate / "legal/MIT.txt").write_text("modified cache must not become license authority")
+        destination = self.root / "locked-notice"
+        materials.git_materials({**package, "license_file": "legal/MIT.txt"}, locked, destination)
+        self.assertEqual((destination / "nested/legal/MIT.txt").read_text(), "fixture declared license\n")
+
+    def test_requested_build_flags_fail_before_the_subprocess(self):
+        marker = self.root / "command-ran"
+        command = [sys.executable, str(Path(materials.__file__)), "run-native",
+                   str(self.root / "home"), str(self.home), "/fixture/bin/rustc",
+                   sys.executable, "-c", "from pathlib import Path; Path(" + repr(str(marker)) + ").touch()"]
+        for name, value in (("GOEXPERIMENT", "fieldtrack"), ("RUSTFLAGS", "-C target-cpu=x86-64-v2"),
+                            ("CARGO_ENCODED_RUSTFLAGS", "-C\x1ftarget-cpu=x86-64-v2")):
+            with self.subTest(flag=name):
+                result = subprocess.run(command, env={"PATH": os.defpath, name: value},
+                                        text=True, capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("does not accept " + name, result.stderr)
+                self.assertFalse(marker.exists())
+        result = subprocess.run(command, env={"PATH": os.defpath, "GOEXPERIMENT": "", "RUSTFLAGS": ""},
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists())
 
     def test_cargo_configuration_excludes_credentials(self):
         original, destination = self.root / "original-home", self.root / "private-home"
@@ -359,6 +420,81 @@ class MaterialsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "bytes differ"):
                 materials.rust_toolchain_materials(self.root / "changed-stage", rustc, link_map)
 
+    def test_rustup_notices_ignore_modified_local_files(self):
+        sysroot, rustc, _, link_map = self.rust_fixture()
+        fields, notices, responses = distribution_fixture.rust_distribution_fixture()
+        docs = sysroot / "share/doc/rust"
+        (docs / "licenses").mkdir(parents=True)
+        for relative in notices:
+            (docs / relative).write_text("modified local material must not be attributed to upstream")
+        def query(command, **_):
+            if command == [str(rustc), "-vV"]:
+                return "\n".join(key + ": " + value for key, value in fields.items()) + "\n"
+            self.assertEqual(command, [str(rustc), "--print", "sysroot"])
+            return str(sysroot) + "\n"
+        with patch.object(materials.subprocess, "check_output", side_effect=query), \
+                patch.object(materials, "urlopen", side_effect=lambda url, timeout: io.BytesIO(responses[url])):
+            row = materials.rust_toolchain_materials(self.root / "stage", rustc, link_map)
+        for relative, contents in notices.items():
+            self.assertEqual((self.root / "stage" / row[5] / relative).read_bytes(), contents)
+        self.assertIn(";notices-archive-sha256:", row[4])
+        self.assertTrue((self.root / "stage/share/sources/sandboxer/RUST-NOTICES.tsv").is_file())
+
+    def test_rustup_distribution_identity_and_checksums(self):
+        fields, notices, responses = distribution_fixture.rust_distribution_fixture()
+        manifest_url, archive_url = responses
+        for mutation in ("commit", "version", "url", "host", "archive", "missing-license", "symlink"):
+            altered = dict(responses)
+            if mutation in ("commit", "version", "url", "host"):
+                before, after = {
+                    "commit": (fields["commit-hash"].encode(), b"0" * 40),
+                    "version": (b'1.0.0 (', b'9.0.0 ('),
+                    "url": (b'https://static.rust-lang.org/dist/2025', b'https://example.invalid/dist/2025'),
+                    "host": (b'x86_64-unknown-linux-gnu]', b'aarch64-unknown-linux-gnu]'),
+                }[mutation]
+                altered[manifest_url] = altered[manifest_url].replace(before, after)
+            elif mutation == "archive":
+                altered[archive_url] += b"changed"
+            else:
+                output = io.BytesIO()
+                with tarfile.open(fileobj=output, mode="w:xz") as archive:
+                    member = tarfile.TarInfo("rustc-1.0.0-x86_64-unknown-linux-gnu/rustc/share/doc/rust/COPYRIGHT-library.html")
+                    if mutation == "symlink":
+                        member.type = tarfile.SYMTYPE
+                        member.linkname = "/fixture"
+                        archive.addfile(member)
+                    else:
+                        member.size = len(notices["COPYRIGHT-library.html"])
+                        archive.addfile(member, io.BytesIO(notices["COPYRIGHT-library.html"]))
+                changed = output.getvalue()
+                altered[manifest_url] = altered[manifest_url].replace(hashlib.sha256(responses[archive_url]).hexdigest().encode(),
+                                                                    hashlib.sha256(changed).hexdigest().encode())
+                altered[archive_url] = changed
+            with self.subTest(mutation=mutation), \
+                    patch.object(materials, "urlopen", side_effect=lambda url, timeout: io.BytesIO(altered[url])), \
+                    self.assertRaises((ValueError, KeyError)):
+                materials.rustup_toolchain_notices(self.root / "rust", fields, self.root / "notices", self.root / "stage")
+            self.assertFalse((self.root / "notices").exists())
+
+    def test_rustup_nightly_uses_a_dated_manifest_bound_to_the_full_commit(self):
+        fields, notices, responses = distribution_fixture.rust_distribution_fixture(version="1.1.0-nightly")
+        versioned, archive_url = responses
+        dated = "https://static.rust-lang.org/dist/2025-08-07/channel-rust-nightly.toml"
+        responses[dated] = responses.pop(versioned)
+        sysroot = self.root / "nightly"
+        manifest = sysroot / "lib/rustlib/multirust-channel-manifest.toml"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text('date="2025-08-07"\n')
+        with patch.object(materials, "urlopen", side_effect=lambda url, timeout: io.BytesIO(responses[url])):
+            materials.rustup_toolchain_notices(sysroot, fields, self.root / "notices", self.root / "stage")
+        self.assertEqual((self.root / "notices/COPYRIGHT-library.html").read_bytes(), notices["COPYRIGHT-library.html"])
+        receipt = (self.root / "stage/share/sources/sandboxer/RUST-NOTICES.tsv").read_text()
+        self.assertIn(dated, receipt)
+        manifest.write_text('date="../../untrusted"\n')
+        with patch.object(materials, "urlopen") as network, self.assertRaisesRegex(ValueError, "channel date"):
+            materials.rustup_toolchain_notices(sysroot, fields, self.root / "other", self.root / "other-stage")
+        network.assert_not_called()
+
     def test_installed_rust_license_bytes_source_and_symlink(self):
         license_file = self.root / "copyright"
         original = b"fixture package-owned Rust copyright\n"
@@ -414,7 +550,7 @@ class MaterialsTests(unittest.TestCase):
         with patch.object(materials.shutil, "which", return_value=None), \
                 patch.object(materials.subprocess, "check_output", side_effect=[
                     "release: 1.89.0\ncommit-hash: " + "1" * 40 + "\n", str(sysroot) + "\n"]):
-            with self.assertRaisesRegex(ValueError, "install rust-docs"):
+            with self.assertRaisesRegex(ValueError, "restore the selected rustup rustc component"):
                 materials.rust_toolchain_materials(self.root / "stage", rustc, link_map)
 
 

@@ -303,6 +303,22 @@ release_materials_cloud_hypervisor_lock_sha() {
 EOF
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
 install -m 0644 "$ROOT/scripts/release-rust-materials.py" "$fixture_root/scripts/release-rust-materials.py"
+install -m 0644 "$ROOT/scripts/test-rust-distribution-fixture.py" "$fixture_root/scripts/test-rust-distribution-fixture.py"
+# Only this synthetic packaging checkout supplies fixture TLS response bytes.
+# The actual manifest/commit/hash/notices checks still execute without a network
+# bypass option in production; independent helper tests mutate each binding.
+python3 - "$fixture_root/scripts/release-rust-materials.py" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+source = path.read_text()
+marker = 'if __name__ == "__main__":\n'
+assert source.count(marker) == 1
+source = source.replace(marker, marker +
+    '    exec(compile(Path(__file__).with_name("test-rust-distribution-fixture.py").read_text(), "fixture-transport", "exec"), globals())\n'
+    '    urlopen = fixture_urlopen\n')
+path.write_text(source)
+PY
 install -m 0644 "$ROOT/scripts/release-native-materials.sh" "$fixture_root/scripts/release-native-materials.sh"
 install -m 0644 "$ROOT/native-deps/Makefile" "$fixture_root/native-deps/Makefile"
 printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
@@ -401,7 +417,7 @@ cat > "$TMP/release-build-bin/rustc" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "$1" = -vV ]; then
-  printf 'rustc 1.0.0\nrelease: 1.0.0\ncommit-hash: 3333333333333333333333333333333333333333\n'
+  printf 'rustc 1.0.0\nrelease: 1.0.0\ncommit-hash: 3333333333333333333333333333333333333333\nhost: x86_64-unknown-linux-gnu\n'
 elif [ "$1" = --print ] && [ "$2" = sysroot ]; then
   cd "$(dirname "$(readlink -f "$0")")/.." && pwd
 else exit 1; fi
