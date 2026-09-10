@@ -116,6 +116,28 @@ prepare_cloud_hypervisor() {
     --manifest-path "$CH_RELEASE_SOURCE/Cargo.toml" > "$WORK/ch-metadata.json"
 }
 
+requested_dependency_version() {
+  local name="$1" binding="${RELEASE_DEPENDENCIES:-}" entry value result=""
+  local -a entries
+  [ -n "$binding" ] || return 0 # Local source packages can use untagged commits.
+  [[ "$binding" != *, && "$binding" != ,* && "$binding" != *,,* ]] \
+    || fail "invalid release dependency list"
+  IFS=, read -r -a entries <<< "$binding"
+  [ "${#entries[@]}" -eq 2 ] || fail "sandboxer release must bind its 2 internal dependencies"
+  for entry in "${entries[@]}"; do
+    case "${entry%%=*}" in accelerator|connector) ;; *) fail "unexpected sandboxer dependency" ;; esac
+    value="${entry#*=}"
+    [[ "$value" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+      || fail "invalid sandboxer dependency version"
+    if [ "${entry%%=*}" = "$name" ]; then
+      [ -z "$result" ] || fail "duplicate sandboxer dependency: $name"
+      result="$value"
+    fi
+  done
+  [ -n "$result" ] || fail "missing sandboxer dependency: $name"
+  printf '%s\n' "$result"
+}
+
 validate_bundle() {
   [ "$#" -eq 3 ] || fail "usage: release.sh validate <version> <arch> <bundle-dir>"
   local version="$1" arch archive bundle="$3"
@@ -162,8 +184,11 @@ validate_bundle() {
   ' "$extract/share/sources/$NAME/SOURCES.tsv" || fail "Rust standard-library inventory is not bound to the toolchain"
   awk -F '\t' '$1 == "bin/cloud-hypervisor" && $2 ~ /^rust-build-input:/ {found=1} END {exit !found}' \
     "$extract/share/sources/$NAME/SOURCES.tsv" || fail "Rust dependency materials are missing"
-  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'accelerator' ""
-  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'connector' ""
+  local expected_accelerator expected_connector
+  expected_accelerator="$(requested_dependency_version accelerator)" || fail "invalid accelerator release binding"
+  expected_connector="$(requested_dependency_version connector)" || fail "invalid connector release binding"
+  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'accelerator' "$expected_accelerator"
+  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'connector' "$expected_connector"
   release_materials_require_go "$extract" "$NAME" 'bin/sandbox-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/sandbox-init'
   local file

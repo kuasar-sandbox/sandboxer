@@ -300,6 +300,8 @@ printf 'fixture accelerator license\n' > "$TMP/accelerator/LICENSE"
 printf 'fixture connector license\n' > "$TMP/connector/LICENSE"
 accelerator_sha="$(init_fixture_repo "$TMP/accelerator" LICENSE)"
 connector_sha="$(init_fixture_repo "$TMP/connector" LICENSE)"
+git -C "$TMP/accelerator" tag v0.1.3 "$accelerator_sha"
+git -C "$TMP/connector" tag v0.1.2 "$connector_sha"
 
 mkdir -p "$TMP/release-build-bin" "$TMP/crate/fixture-1.0.0" "$TMP/rust/share/doc/rust/licenses"
 printf 'fixture Rust crate license\n' > "$TMP/crate/fixture-1.0.0/LICENSE"
@@ -423,6 +425,18 @@ env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 \
   RELEASE_CONNECTOR_VERSION=v0.1.2 \
   "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
+RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2 \
+  "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
+for binding in accelerator=v9.0.0,connector=v0.1.2 accelerator=v0.1.3,connector=v9.0.0 \
+  accelerator=v0.1.3 accelerator=v0.1.3,accelerator=v0.1.3 \
+  accelerator=v0.1.3,unexpected=v0.1.2 'accelerator=v0.1.3,connector=v0.1.2,'; do
+  if RELEASE_DEPENDENCIES="$binding" "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 \
+    "$TMP/bundle" > "$TMP/dependency-binding.log" 2>&1; then
+    fail "validator accepted a conflicting or malformed dependency release request"
+  fi
+  grep -Eq 'source record|release binding|dependency|dependencies' "$TMP/dependency-binding.log" \
+    || fail "dependency binding was rejected for an unrelated reason"
+done
 bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/sandboxer v1.2.3 \
   "$fixture_project_sha" main

@@ -68,6 +68,10 @@ uses that version only when its local tag matches the selected commit, otherwise
 `git:<commit>`. Validation binds both Go binaries and the project source URL/digest
 to that commit; publication supplies the expected commit and rejects a mismatch
 before any Tag or Release write.
+If `RELEASE_DEPENDENCIES` is supplied, validation requires exactly the requested
+accelerator and connector release versions; missing, duplicate, unexpected or
+conflicting bindings fail before publication. Ordinary local-replacement source
+builds still do not require remote target tags.
 It extracts the selected sandboxer commit into a temporary directory, verifies
 the pinned Cloud Hypervisor tarball, applies that commit's patches, and performs
 a locked build with a fresh private Cargo home. Python 3.11 or newer collects

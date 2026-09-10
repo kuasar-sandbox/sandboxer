@@ -56,7 +56,10 @@ HTTPS 镜像,以及 `GOTOOLCHAIN` 选择;默认分别为 `sum.golang.org` 和 `l
 即被拒绝。归档名称仍标识请求的发行目标;项目来源记录
 只有在本地 Tag 匹配所选 commit 时才使用该版本,否则记录 `git:<commit>`。
 验证器将两个 Go 二进制及项目来源 URL/摘要绑定到该 commit;发布者传入预期
-commit,在任何 Tag/Release 写入前拒绝不匹配的包。它把选定的 sandboxer commit
+commit,在任何 Tag/Release 写入前拒绝不匹配的包。提供 `RELEASE_DEPENDENCIES`
+时,验证要求 accelerator、connector 的发行版本与请求完全一致;绑定缺失、重复、
+包含其他组件或发生冲突时,发布前即失败。普通的本地 replace 源码构建仍不要求
+远端目标 Tag。它把选定的 sandboxer commit
 解到临时目录,验证 pin 的 Cloud Hypervisor tarball、应用该 commit 的 patch,
 再用本次所属的私有 Cargo home 按锁文件重新构建。Python 3.11 或更新版本从
 实际 Cargo 构建报告采集来源材料:registry crate 归档必须匹配 `Cargo.lock`
