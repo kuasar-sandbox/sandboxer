@@ -268,7 +268,7 @@ repack_bundle_with_owner_names() {
 
 expect_invalid_archive() {
   local bundle="$1" description="$2"
-  if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$bundle" >/dev/null 2>&1; then
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$bundle" >/dev/null 2>&1; then
     fail "validator accepted $description"
   fi
 }
@@ -281,10 +281,13 @@ done
 mkdir -p "$TMP/bin" "$TMP/src" "$TMP/cloud-hypervisor/LICENSES" \
   "$TMP/accelerator" "$TMP/connector"
 fixture_root="$TMP/project"
-mkdir -p "$fixture_root/scripts" "$fixture_root/native-deps"
+mkdir -p "$fixture_root/scripts" "$fixture_root/native-deps" "$fixture_root/LICENSES"
 install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
+printf 'fixture nested project notice\n' > "$fixture_root/LICENSES/NOTICE.txt"
+printf 'fixture project attribution\n' > "$fixture_root/NOTICE"
 printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
 install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
+install -m 0755 "$ROOT/scripts/publish-release.sh" "$fixture_root/scripts/publish-release.sh"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
 install -m 0644 "$ROOT/scripts/release-go-toolchain.go" "$fixture_root/scripts/release-go-toolchain.go"
 cat >> "$fixture_root/scripts/release-materials.sh" <<'EOF'
@@ -298,7 +301,7 @@ install -m 0644 "$ROOT/scripts/release-native-materials.sh" "$fixture_root/scrip
 install -m 0644 "$ROOT/native-deps/Makefile" "$fixture_root/native-deps/Makefile"
 printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
 printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
-fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts native-deps/Makefile go.mod main.go)"
+fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE LICENSES NOTICE .gitignore scripts native-deps/Makefile go.mod main.go)"
 (cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" .)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
 printf '// dirty fixture\n' >> "$fixture_root/main.go"
@@ -467,14 +470,35 @@ for binding in accelerator=v9.0.0,connector=v0.1.2 accelerator=v0.1.3,connector=
   grep -Eq 'source record|release binding|dependency|dependencies' "$TMP/dependency-binding.log" \
     || fail "dependency binding was rejected for an unrelated reason"
 done
-bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
+bash "$ROOT/scripts/test-publisher.sh" "$fixture_root/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/sandboxer v1.2.3 \
   "$fixture_project_sha" main
-bash "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
+bash "$ROOT/scripts/test-publisher.sh" "$fixture_root/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/sandboxer v1.2.3 \
   "$fixture_project_sha" release/v1.2.x
 
 archive="$TMP/bundle/assets/$ARCHIVE_NAME"
+for mutation in top-level nested missing extra; do
+  candidate="$TMP/project-license-$mutation"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  license_root="$candidate/root/share/licenses/sandboxer/project"
+  case "$mutation" in
+    top-level) printf 'altered project license\n' > "$license_root/LICENSE" ;;
+    nested) printf 'altered nested license\n' > "$license_root/LICENSES/NOTICE.txt" ;;
+    missing) rm "$license_root/NOTICE" ;;
+    extra) printf 'extra unauthenticated notice\n' > "$license_root/NOTICE.extra" ;;
+  esac
+  release_materials_hash_tree "$candidate/root" sandboxer \
+    "$candidate/root/share/sources/sandboxer/MATERIALS.sha256"
+  repack_bundle "$candidate" "$candidate/root"
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted $mutation project-license mutation with regenerated checksums"
+  fi
+  grep -Fq 'license bytes differ from selected Git source: project' "$candidate/result.log" \
+    || fail "project-license mutation failed for an unrelated reason"
+done
 go_toolchain="$(go version | awk '{print $3}')"
 for path in ./bin/cloud-hypervisor ./bin/sandbox-ctl ./bin/sandbox-init \
   ./share/licenses/sandboxer/project/LICENSE \

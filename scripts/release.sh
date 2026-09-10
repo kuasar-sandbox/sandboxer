@@ -168,6 +168,10 @@ validate_bundle() {
   rm -rf "$extract"
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
+  local project_sha
+  project_sha="$(go version -m "$extract/bin/sandbox-ctl" | \
+    awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}')"
+  release_materials_require_git_licenses "$extract" "$NAME" "$ROOT" "$project_sha" project
   release_materials_validate "$extract" "$NAME"
   release_materials_require_project_source "$extract" "$NAME" 'bin/sandbox-ctl,bin/sandbox-init' "$version" \
     bin/sandbox-ctl bin/sandbox-init

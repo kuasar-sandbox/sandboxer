@@ -77,7 +77,10 @@ HTTPS 镜像,以及 `GOTOOLCHAIN` 选择;默认分别为 `sum.golang.org` 和 `l
 归档名称仍标识请求的发行目标;项目来源记录
 只有在本地 Tag 匹配所选 commit 时才使用该版本,否则记录 `git:<commit>`。
 验证器将两个 Go 二进制及项目来源 URL/摘要绑定到该 commit;发布者传入预期
-commit,在任何 Tag/Release 写入前拒绝不匹配的包。提供 `RELEASE_DEPENDENCIES`
+commit,在任何 Tag/Release 写入前拒绝不匹配的包。独立验证将完整项目许可/NOTICE
+集合(含嵌套 `LICENSES`)与所选 commit 的 Git blob 比较;即使重算 bundle 校验和,
+内容变化、缺失或额外文件仍会被拒绝。验证前须取得该精确 commit;可信发布者获取
+源码历史用于检查,不执行候选源码或辅助脚本。提供 `RELEASE_DEPENDENCIES`
 时,验证要求 accelerator、connector 的发行版本与请求完全一致;绑定缺失、重复、
 包含其他组件或发生冲突时,发布前即失败。普通的本地 replace 源码构建仍不要求
 远端目标 Tag。许可证收集拒绝不可读子目录和不完整遍历,不会仅发布可读的材料。

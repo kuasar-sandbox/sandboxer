@@ -98,6 +98,11 @@ uses that version only when its local tag matches the selected commit, otherwise
 `git:<commit>`. Validation binds both Go binaries and the project source URL/digest
 to that commit; publication supplies the expected commit and rejects a mismatch
 before any Tag or Release write.
+Standalone validation compares the complete project license/notice set, including
+nested `LICENSES`, with the selected commit's Git blobs. It rejects changed,
+missing and extra files, even when bundle checksums have been regenerated.
+Fetch that exact commit before validation; the trusted publisher fetches source
+history for inspection without executing candidate source or helper files.
 If `RELEASE_DEPENDENCIES` is supplied, validation requires exactly the requested
 accelerator and connector release versions; missing, duplicate, unexpected or
 conflicting bindings fail before publication. Ordinary local-replacement source
