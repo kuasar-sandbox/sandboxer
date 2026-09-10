@@ -80,7 +80,10 @@ HTTPS 镜像,以及 `GOTOOLCHAIN` 选择;默认分别为 `sum.golang.org` 和 `l
 commit,在任何 Tag/Release 写入前拒绝不匹配的包。提供 `RELEASE_DEPENDENCIES`
 时,验证要求 accelerator、connector 的发行版本与请求完全一致;绑定缺失、重复、
 包含其他组件或发生冲突时,发布前即失败。普通的本地 replace 源码构建仍不要求
-远端目标 Tag。它把选定的 sandboxer commit
+远端目标 Tag。许可证收集拒绝不可读子目录和不完整遍历,不会仅发布可读的材料。
+官方组件包不支持没有已认证 module 校验和的第三方本地 Go 替换,应选择带版本
+的 module 替换。现有 Kuasar 兄弟仓本地替换和普通源码开发不变。
+它把选定的 sandboxer commit
 解到临时目录,验证 pin 的 Cloud Hypervisor tarball、应用该 commit 的 patch,
 再用本次所属的私有 Cargo home 按锁文件重新构建。Python 3.11 或更新版本从
 实际 Cargo 构建报告采集来源材料:registry crate 归档必须匹配 `Cargo.lock`
@@ -103,8 +106,14 @@ Token、凭据提供器、构建包装器或 directory/git source 覆盖项。
 许可材料。未知来源、材料缺失、归档被改动或构建未成功都会导致打包失败。
 crate 目录还包含完整 Cargo 来源身份的摘要,不同 registry 或 Git commit 中同名、
 同版本的包不会相互覆盖许可文件。
+若两个不同原生链接输入将使用同一个系统材料名称,打包会在第二个输入覆盖声明
+之前拒绝冲突。
 采集 rustup 标准库声明或已安装的同源 Debian/RPM 包声明;工具链文档缺失时
-会给出安装提示并拒绝打包。最终链接映射确定所选目标的 sysroot。`RUST-STDLIB.tsv`
+会给出安装提示并拒绝打包。发行版 Rust 声明的字节必须匹配已安装包摘要和源包
+身份。包所属的符号链接仅在解析后目标通过核验时复制为普通文件;Debian
+Multi-Arch 共同所有者必须全部一致。引用的 common-license 正文保留自身的包
+身份。这些检查不证明主机或包数据库可信。
+最终链接映射确定所选目标的 sysroot。`RUST-STDLIB.tsv`
 列出该目标完整 `.rlib` 输入集相对 sysroot 的路径及 SHA-256,包括 LTO 在最终
 链接前消费的标准库 bitcode,不声称清单中每个归档都链入了结果。清单摘要绑定到
 Rust 工具链记录。这些是实际工具链输入的摘要,不将本地修改过的工具链声称为

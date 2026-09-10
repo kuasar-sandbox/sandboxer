@@ -153,7 +153,8 @@ release_native_system_input() {
 }
 
 release_native_link_inputs() {
-  local map="$1" build_root="$2" temporary_root="$3" payload="$4" input canonical count=0
+  local map="$1" build_root="$2" temporary_root="$3" payload="$4" input canonical name count=0
+  local -A selected_inputs=()
   [ -s "$map" ] || fail "fresh native linker map is missing"
   build_root="$(realpath -e "$build_root")"
   temporary_root="$(realpath -e "$temporary_root")"
@@ -164,6 +165,11 @@ release_native_link_inputs() {
     case "$canonical" in
       "$build_root"/*|"$temporary_root"/*) continue ;; # Fresh owned build objects, not system inputs.
     esac
+    name="$(basename "$canonical")"
+    if [ -n "${selected_inputs[$name]:-}" ] && [ "${selected_inputs[$name]}" != "$canonical" ]; then
+      fail "distinct native link inputs share a material name: $name"
+    fi
+    selected_inputs[$name]="$canonical"
     release_native_system_input "$canonical" "$payload"
     count=$((count + 1))
   done < <(awk '$1 == "LOAD" && $2 ~ /\.(a|o)$/ {print $2}' "$map" | LC_ALL=C sort -u)

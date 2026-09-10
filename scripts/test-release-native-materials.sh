@@ -186,3 +186,19 @@ for mutation in missing empty relative; do
   fi
 done
 printf 'test-native-materials: exact system/owned-input selection PASS\n'
+
+mkdir -p "$test_root/system-a" "$test_root/system-b"
+printf 'first native input\n' > "$test_root/system-a/same.a"
+printf 'second native input\n' > "$test_root/system-b/same.a"
+printf 'LOAD %s\n' "$test_root/system-a/same.a" "$test_root/system-b/same.a" > "$test_root/collision.map"
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/collision.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor > "$test_root/collision.log" 2>&1); then
+  fail "accepted two distinct native inputs with one material directory name"
+fi
+grep -Fq 'distinct native link inputs share a material name' "$test_root/collision.log" \
+  || fail "native input collision was rejected for an unrelated reason"
+printf '%s\t%s\n' "$test_root/system-a/same.a" bin/cloud-hypervisor > "$test_root/expected"
+cmp "$test_root/expected" "$test_root/observed" \
+  || fail "second native input reached the shared material destination"
+printf 'test-native-materials: colliding input rejected before overwriting materials PASS\n'

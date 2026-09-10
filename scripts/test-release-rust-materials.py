@@ -317,6 +317,10 @@ class MaterialsTests(unittest.TestCase):
         copyright = self.root / "debian/copyright"
         copyright.parent.mkdir()
         copyright.write_text("fixture Debian Rust standard library copyright\n")
+        copyright_digest = hashlib.md5(copyright.read_bytes()).hexdigest()
+        owned_target = copyright.with_name("COPYING")
+        copyright.rename(owned_target)
+        copyright.symlink_to(owned_target)
         def query(command, **_):
             if command == [str(rustc), "-vV"]:
                 return "release: 1.89.0\ncommit-hash: " + "1" * 40 + "\n"
@@ -324,10 +328,14 @@ class MaterialsTests(unittest.TestCase):
                 return str(sysroot) + "\n"
             self.assertEqual(command[0], "dpkg-query")
             if command[1] == "-S":
+                if command[-1] == str(owned_target):
+                    return "libstd-rust:amd64: " + str(owned_target) + "\n"
                 return "rustc: " + str(rustc) + "\n"
+            if command[1] == "--control-show":
+                return copyright_digest + "  " + str(owned_target).lstrip("/") + "\n"
             if command[1:3] == ["-L", "libstd-rust:amd64"]:
                 return str(copyright) + "\n"
-            if command[1] == "-W" and command[-1] == "rustc":
+            if command[1] == "-W" and command[-1] in ("rustc", "libstd-rust:amd64"):
                 return "rustc\t1.89.0+fixture\n"
             if command[1] == "-W":
                 return ("installed\tlibstd-rust:amd64\trustc\t1.89.0+fixture\n"
@@ -342,6 +350,64 @@ class MaterialsTests(unittest.TestCase):
         self.assertIn(";target-stdlib-sha256:", row[4])
         copied = self.root / "stage" / row[5] / str(copyright).lstrip("/")
         self.assertEqual(copied.read_text(), copyright.read_text())
+        self.assertFalse(copied.is_symlink())
+        owned_target.write_text("locally altered package-owned Rust license\n")
+        with patch.object(materials.shutil, "which", side_effect=lambda name: "/usr/bin/dpkg-query"
+                          if name == "dpkg-query" else None), \
+                patch.object(materials.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), \
+                patch.object(materials.subprocess, "check_output", side_effect=query):
+            with self.assertRaisesRegex(ValueError, "bytes differ"):
+                materials.rust_toolchain_materials(self.root / "changed-stage", rustc, link_map)
+
+    def test_installed_rust_license_bytes_source_and_symlink(self):
+        license_file = self.root / "copyright"
+        original = b"fixture package-owned Rust copyright\n"
+        license_file.write_bytes(original)
+        alias = self.root / "LICENSE"
+        alias.symlink_to(license_file)
+        mutation = "none"
+        def query(command, **_):
+            if command[:2] == ["dpkg-query", "-S"]:
+                owners = "rust-doc:amd64, rust-doc:i386" if mutation.startswith("coowned") else "rust-doc:amd64"
+                return owners + ": " + str(license_file) + "\n"
+            if command[:2] == ["dpkg-query", "--control-show"]:
+                value = hashlib.md5(original).hexdigest()
+                if mutation == "coowned-bytes" and command[2].endswith(":i386"):
+                    value = "0" * 32
+                record = value + "  " + str(license_file).lstrip("/") + "\n"
+                return "" if mutation == "missing" else record * (2 if mutation == "duplicate" else 1)
+            if command[:2] == ["dpkg-query", "-W"]:
+                return "other\t2\n" if mutation in ("wrong-source", "coowned-source") and (mutation == "wrong-source" or command[-1].endswith(":i386")) else "rustc\t1\n"
+            if command[:3] == ["rpm", "-qf", "--dump"]:
+                record = str(license_file) + " 1 0 " + hashlib.sha256(original).hexdigest() + " 0100644 root root 0 0 0 X\n"
+                return "" if mutation == "missing" else record * (2 if mutation == "duplicate" else 1)
+            if command[:3] == ["rpm", "-qf", "--qf"]:
+                return "other-2.src.rpm\n" if mutation == "wrong-source" else "rustc-1.src.rpm\n"
+            self.fail("unexpected package query")
+        with patch.object(materials.subprocess, "check_output", side_effect=query):
+            for package_format, expected in (("deb", "deb-source:rustc@1"), ("rpm", "rpm-source:rustc-1.src.rpm")):
+                self.assertEqual(materials.rust_installed_license_bytes(alias, package_format, expected), original)
+                for mutation in ("missing", "duplicate", "wrong-source"):
+                    with self.subTest(format=package_format, mutation=mutation), self.assertRaisesRegex(ValueError, "digest|different source"):
+                        materials.rust_installed_license_bytes(alias, package_format, expected)
+                mutation = "none"
+                license_file.write_bytes(b"changed but still package-owned copyright\n")
+                with self.assertRaisesRegex(ValueError, "bytes differ"):
+                    materials.rust_installed_license_bytes(alias, package_format, expected)
+                license_file.write_bytes(original)
+            mutation = "coowned"
+            self.assertEqual(materials.rust_installed_license_bytes(alias, "deb", "deb-source:rustc@1"), original)
+            for mutation in ("coowned-bytes", "coowned-source"):
+                with self.assertRaisesRegex(ValueError, "bytes differ|different source"):
+                    materials.rust_installed_license_bytes(alias, "deb", "deb-source:rustc@1")
+            mutation = "wrong-source"
+            # Referenced common-license texts have their own package/source;
+            # their bytes remain checked without claiming the Rust source ID.
+            self.assertEqual(materials.rust_installed_license_bytes(alias, "deb"), original)
+        alias.unlink()
+        alias.symlink_to(self.root / "missing-target")
+        with self.assertRaises(FileNotFoundError):
+            materials.rust_installed_license_bytes(alias, "deb")
 
     def test_unknown_toolchain_layout_has_actionable_error(self):
         sysroot, rustc, _, link_map = self.rust_fixture()

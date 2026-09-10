@@ -102,6 +102,11 @@ If `RELEASE_DEPENDENCIES` is supplied, validation requires exactly the requested
 accelerator and connector release versions; missing, duplicate, unexpected or
 conflicting bindings fail before publication. Ordinary local-replacement source
 builds still do not require remote target tags.
+License collection refuses unreadable subtrees and incomplete traversals rather
+than publishing only the readable notices. Third-party local Go replacements
+without authenticated module checksums are not supported in official component
+packages; use versioned module replacements. Existing Kuasar sibling replacements
+and ordinary source development are unchanged.
 It extracts the selected sandboxer commit into a temporary directory, verifies
 the pinned Cloud Hypervisor tarball, applies that commit's patches, and performs
 a locked build with a fresh private Cargo home. Python 3.11 or newer collects
@@ -131,9 +136,16 @@ toolchain's copyright and license materials in component-specific directories.
 Crate directories also include a digest of the complete Cargo source identity,
 so same-name/version packages from different registries or Git commits do not
 overwrite one another's license files.
+If two distinct native link inputs would use the same system-material name,
+packaging refuses the collision before the second input can overwrite notices.
 Rustup's standard-library notices or matching installed Debian/RPM source-package
 notices are collected; missing toolchain documentation fails with an installation
-hint. The final link map identifies the selected target sysroot. `RUST-STDLIB.tsv`
+hint. Distribution Rust notice bytes must match their installed package digests
+and source identity. Package-owned symlinks are copied as regular files only after
+verifying the resolved target; all Debian Multi-Arch co-owners must agree. Referenced
+common-license texts retain their own package identity. This does not attest the
+host or its package database.
+The final link map identifies the selected target sysroot. `RUST-STDLIB.tsv`
 lists the relative paths and SHA-256 digests of that target's complete `.rlib`
 input set, including standard-library bitcode consumed before final linking by
 LTO; it does not claim every listed archive is linked into the result. Its digest

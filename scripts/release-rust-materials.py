@@ -254,6 +254,48 @@ def rust_standard_library_inventory(stage, sysroot, link_map):
     return hashlib.sha256(inventory.encode()).hexdigest()
 
 
+def rust_installed_license_bytes(path, package_format, expected_source=None):
+    # Distribution copyright files can be package-owned symlinks. Follow the
+    # link only to a regular file whose own installed bytes/source are verified.
+    resolved = path.resolve(strict=True)
+    require(resolved.is_file(), "Rust package license is not a regular file")
+    contents = resolved.read_bytes()
+    require(contents, "Rust package license is empty")
+    if package_format == "deb":
+        ownership = subprocess.check_output(["dpkg-query", "-S", str(resolved)], text=True)
+        owners = []
+        for line in ownership.splitlines():
+            require(line.endswith(": " + str(resolved)), "ambiguous Rust license package owner")
+            owners.extend(line.removesuffix(": " + str(resolved)).split(", "))
+        require(owners, "Rust license has no package owner")
+        for owner in owners:
+            require(re.fullmatch(r"[a-z0-9][a-z0-9+.-]*(:[a-z0-9]+)?", owner), "invalid Rust license package owner")
+            records = subprocess.check_output(["dpkg-query", "--control-show", owner, "md5sums"], text=True)
+            digests = [fields[0] for line in records.splitlines()
+                       if len(fields := line.split(maxsplit=1)) == 2 and fields[1] == str(resolved).lstrip("/")]
+            require(len(digests) == 1 and re.fullmatch(r"[0-9a-f]{32}", digests[0]), "missing or ambiguous Rust license package digest")
+            require(hashlib.md5(contents).hexdigest() == digests[0], "Rust license bytes differ from installed package metadata")
+            if expected_source is not None:
+                identity = subprocess.check_output(["dpkg-query", "-W", "-f=${source:Package}\t${source:Version}\n", owner], text=True).strip().split("\t")
+                require(len(identity) == 2 and "deb-source:" + "@".join(identity) == expected_source,
+                        "Rust license belongs to a different source package")
+    elif package_format == "rpm":
+        records = subprocess.check_output(["rpm", "-qf", "--dump", str(resolved)], text=True)
+        digests = [fields[3] for line in records.splitlines()
+                   if len(fields := line.split()) >= 4 and fields[0] == str(resolved)]
+        require(len(digests) == 1 and re.fullmatch(r"[0-9a-f]+", digests[0]), "missing or ambiguous Rust license package digest")
+        algorithm = {32: "md5", 40: "sha1", 64: "sha256", 96: "sha384", 128: "sha512"}.get(len(digests[0]))
+        require(algorithm is not None, "unsupported Rust license package digest")
+        require(hashlib.new(algorithm, contents).hexdigest() == digests[0], "Rust license bytes differ from installed package metadata")
+        if expected_source is not None:
+            identity = subprocess.check_output(["rpm", "-qf", "--qf", "%{SOURCERPM}\n", str(resolved)], text=True).strip()
+            require(identity and identity != "(none)" and "rpm-source:" + identity == expected_source,
+                    "Rust license belongs to a different source package")
+    else:
+        raise ValueError("unsupported Rust license package format")
+    return contents
+
+
 def rust_toolchain_materials(stage, rustc, link_map):
     info = subprocess.check_output([str(rustc), "-vV"], text=True)
     fields = dict(line.split(": ", 1) for line in info.splitlines() if ": " in line)
@@ -266,6 +308,8 @@ def rust_toolchain_materials(stage, rustc, link_map):
     destination = stage / "share" / "licenses" / "sandboxer" / "rust-toolchain" / version
     source = "https://github.com/rust-lang/rust/tree/" + commit
     paths = []
+    package_format = None
+    common_paths = set()
     if (docs / "COPYRIGHT-library.html").is_file() and (docs / "licenses").is_dir():
         paths = [docs / "COPYRIGHT-library.html", *sorted((docs / "licenses").rglob("*"))]
         paths = [(p, str(p.relative_to(docs))) for p in paths if p.is_file()]
@@ -279,6 +323,7 @@ def rust_toolchain_materials(stage, rustc, link_map):
                                             owner], text=True).strip().split("\t")
         require(len(identity) == 2 and all(identity), "Rust Debian package has no source identity")
         source = "deb-source:" + identity[0] + "@" + identity[1]
+        package_format = "deb"
         owners = subprocess.check_output(["dpkg-query", "-W",
             "-f=${db:Status-Status}\t${binary:Package}\t${source:Package}\t${source:Version}\n"], text=True)
         for record in owners.splitlines():
@@ -297,6 +342,7 @@ def rust_toolchain_materials(stage, rustc, link_map):
                         common_path = Path(common[:-1])
                     require(common_path.is_file(), "referenced Rust Debian license is missing")
                     paths.append((common_path, str(common_path).lstrip("/")))
+                    common_paths.add(common_path)
     elif shutil.which("rpm"):
         # Distribution Rust installs keep notices in RPM subpackages, not the
         # rustup documentation layout. Select only siblings of the same SRPM.
@@ -304,6 +350,7 @@ def rust_toolchain_materials(stage, rustc, link_map):
                                         text=True).strip()
         require(query and query != "(none)", "Rust RPM has no source identity")
         source = "rpm-source:" + query
+        package_format = "rpm"
         owners = subprocess.check_output(["rpm", "-qa", "--qf", "%{NAME}.%{ARCH}\t%{SOURCERPM}\n"], text=True)
         for owner in owners.splitlines():
             name, source_rpm = owner.split("\t")
@@ -319,8 +366,12 @@ def rust_toolchain_materials(stage, rustc, link_map):
     require(paths, "Rust toolchain copyright/license material is missing; install the selected toolchain's "
                    "documentation/license package before release packaging")
     for path, relative in paths:
-        require(not path.is_symlink(), "Rust toolchain license material is a symbolic link")
-        put_material(destination, relative, path.read_bytes())
+        if package_format is None:
+            require(not path.is_symlink(), "Rust toolchain license material is a symbolic link")
+            contents = path.read_bytes()
+        else:
+            contents = rust_installed_license_bytes(path, package_format, None if path in common_paths else source)
+        put_material(destination, relative, contents)
     return ["bin/cloud-hypervisor", "Rust toolchain", version, source,
             "git:" + commit + ";compiler-sha256:" + hashlib.sha256(rustc.read_bytes()).hexdigest()
             + ";target-stdlib-sha256:" + stdlib_digest,
