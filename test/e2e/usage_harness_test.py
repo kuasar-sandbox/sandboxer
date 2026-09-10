@@ -187,9 +187,34 @@ class CleanupTests(unittest.TestCase):
 class TraceIdentityTests(unittest.TestCase):
     def test_initial_pid_identity(self):
         process = unittest.mock.Mock(pid=123, returncode=0)
-        process.communicate.return_value = ('{"type":"printf","data":"USAGE_TRACE_PID 123\\n"}\n', None)
+        process.communicate.return_value = ('{"type":"printf","data":"USAGE_TRACE_PID 123\\n"}\n'
+                                           '{"type":"printf","data":"USAGE_TRACE_EXEC 124 124 124\\n"}\n', None)
+        with patch.object(usage_trace.subprocess, "Popen", return_value=process) as popen:
+            self.assertEqual(usage_trace.check_pid_namespace("bpftrace"), {
+                "proc_pid": 123, "bpf_pid": 123, "child_proc_pid": 124,
+                "child_bpf_pid": 124, "child_sched_pid": 124})
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("-c")+1], "/bin/true")
+        self.assertIn("args->pid", command[-1])
+
+    def test_namespaced_bare_pid_cannot_hide_sched_identity_mismatch(self):
+        # bpftrace >= 0.23: BEGIN now agrees with /proc even in a nested ns.
+        # The kernel sched argument for its own child is still different.
+        for witness in ("124 124 456", "124 456 456", "0 0 0", ""):
+            with self.subTest(witness=witness):
+                process = unittest.mock.Mock(pid=123, returncode=0)
+                process.communicate.return_value = (
+                    f"USAGE_TRACE_PID 123\nUSAGE_TRACE_EXEC {witness}\n", None)
+                with patch.object(usage_trace.subprocess, "Popen", return_value=process):
+                    with self.assertRaisesRegex(AssertionError, "initial PID namespace"):
+                        usage_trace.check_pid_namespace("bpftrace")
+
+    def test_duplicate_exec_witness_is_rejected(self):
+        process = unittest.mock.Mock(pid=123, returncode=0)
+        process.communicate.return_value = ("USAGE_TRACE_PID 123\n" + "USAGE_TRACE_EXEC 124 124 124\n"*2, None)
         with patch.object(usage_trace.subprocess, "Popen", return_value=process):
-            self.assertEqual(usage_trace.check_pid_namespace("bpftrace"), {"proc_pid": 123, "kernel_pid": 123})
+            with self.assertRaisesRegex(AssertionError, "initial PID namespace"):
+                usage_trace.check_pid_namespace("bpftrace")
 
     def test_nested_pid_namespace_and_missing_witness_are_rejected(self):
         for output in ('{"data":"USAGE_TRACE_PID 456\\n"}', "", "USAGE_TRACE_PID 123\nUSAGE_TRACE_PID 123"):
@@ -220,6 +245,109 @@ class TraceIdentityTests(unittest.TestCase):
         self.assertIs(caught.exception, original)
         process.kill.assert_called_once()
         process.stdout.close.assert_called_once()
+
+
+class ProcEvidenceTests(unittest.TestCase):
+    def stat(self, pid=123, comm="CH (vcpu) ) worker"):
+        fields = ["S"] + ["0"]*49
+        for index, value in ((11, 90), (12, 3), (19, 500), (40, 173)):
+            fields[index] = str(value)
+        return f"{pid} ({comm}) {' '.join(fields)}\n"
+
+    def test_raw_and_separate_ticks_preserve_native_anomaly(self):
+        raw = self.stat()
+        values = usage_perf.proc_stat(raw, 123)
+        self.assertEqual(values, {"pid": 123, "start_ticks": 500, "utime_ticks": 90,
+                                 "stime_ticks": 3, "cpu_ticks": 93, "guest_ticks": 173,
+                                 "stat_raw": raw})
+        # Preserve observed values; no clamping or alternate CPU definition.
+        self.assertGreater(values["guest_ticks"], values["cpu_ticks"])
+
+    def test_invalid_stat_fails_closed(self):
+        for raw in (self.stat(pid=456), "123 (bad) S", self.stat().replace(" 90 ", " -1 "),
+                    self.stat().replace(" 173 ", " bogus ")):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                usage_perf.proc_stat(raw, 123)
+
+    def test_read_window_is_retained(self):
+        raw = self.stat()
+        status = "voluntary_ctxt_switches: 1\nnonvoluntary_ctxt_switches: 2\nRssAnon: 4 kB\nRssFile: 5 kB\nVmRSS: 9 kB\nThreads: 1\n"
+        with patch.object(usage_perf.Path, "read_text", side_effect=[raw, status]), \
+             patch.object(usage_perf.Path, "iterdir", return_value=[]), \
+             patch.object(usage_perf.time, "monotonic_ns", side_effect=[100, 120]):
+            values = usage_perf.proc(123)
+        self.assertEqual((values["stat_read_started_ns"], values["stat_read_finished_ns"]), (100, 120))
+        self.assertEqual(values["stat_raw"], raw)
+
+    def test_partial_sampling_and_evidence_failure_do_not_abandon_vm(self):
+        for storage_fails in (False, True):
+            with self.subTest(storage_fails=storage_fails), tempfile.TemporaryDirectory() as directory:
+                sb = unittest.mock.Mock()
+                sb.dir, sb.process.pid = Path(directory), 123
+                sb.cli.return_value = '{"sandbox_init_sha256":"hash"}'
+                endpoint = usage_perf.proc_stat(self.stat(), 123)
+                original = OSError("CH proc read failed")
+                saved = []
+
+                def write(path, value):
+                    if path.name == "proc-observations.json":
+                        saved.append(value)
+                        if storage_fails:
+                            raise OSError(errno.ENOSPC, "evidence full")
+
+                with patch.object(usage_perf, "Sandbox", return_value=sb), \
+                     patch.object(usage_perf, "ext4"), \
+                     patch.object(usage_perf, "digest", return_value="hash"), \
+                     patch.object(usage_perf, "write_json", side_effect=write), \
+                     patch.object(usage_perf.Path, "read_text", return_value="CH started pid=456"), \
+                     patch.object(usage_perf, "proc", side_effect=[endpoint, original]), \
+                     patch.object(usage_perf.time, "sleep"), \
+                     patch.object(usage_perf.sys, "stderr", io.StringIO()):
+                    with self.assertRaises(OSError) as caught:
+                        usage_perf.measure(Path(directory), "case", 1, "idle", False, 10, None, "ref", None, False)
+                self.assertIs(caught.exception, original)
+                sb.stop.assert_called_once()
+                self.assertEqual(len(saved), 1)
+                self.assertEqual(saved[0]["before"], [endpoint])
+                self.assertEqual(saved[0]["after"], [])
+                self.assertFalse(saved[0]["measurement_complete"])
+                self.assertEqual(saved[0]["error"], str(original))
+
+    def test_incomplete_pair_and_business_failure_preserve_completed_reads(self):
+        for phase in ("ch-read", "business"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                sb = unittest.mock.Mock()
+                sb.dir, sb.process.pid = Path(directory), 123
+                original = RuntimeError(f"{phase} failed")
+                sb.cli.side_effect = ['{"sandbox_init_sha256":"hash"}', original]
+                host = usage_perf.proc_stat(self.stat(), 123)
+                ch = usage_perf.proc_stat(self.stat(pid=456), 456)
+                reads = [host, ch, dict(host), original if phase == "ch-read" else dict(ch)]
+                saved = []
+
+                def write(path, value):
+                    if path.name == "proc-observations.json":
+                        saved.append(value)
+
+                with patch.object(usage_perf, "Sandbox", return_value=sb), \
+                     patch.object(usage_perf, "ext4"), \
+                     patch.object(usage_perf, "digest", return_value="hash"), \
+                     patch.object(usage_perf, "write_json", side_effect=write), \
+                     patch.object(usage_perf.Path, "read_text", return_value="CH started pid=456"), \
+                     patch.object(usage_perf, "proc", side_effect=reads), \
+                     patch.object(usage_perf.time, "sleep"):
+                    with self.assertRaises(RuntimeError) as caught:
+                        usage_perf.measure(Path(directory), "case", 1, "idle", False, 10, None, "ref", lambda pid: 5, False)
+                self.assertIs(caught.exception, original)
+                sb.stop.assert_called_once()
+                self.assertEqual(len(saved), 1)
+                self.assertEqual(saved[0]["before"], [host, ch])
+                self.assertEqual(saved[0]["after"], [])
+                self.assertFalse(saved[0]["measurement_complete"])
+                row, = saved[0]["measurements"]
+                self.assertEqual(row["host"]["stat_raw"], host["stat_raw"])
+                self.assertEqual(row["complete"], phase == "business")
+                self.assertEqual("ch" in row, phase == "business")
 
 
 if __name__ == "__main__":

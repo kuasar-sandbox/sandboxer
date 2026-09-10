@@ -281,10 +281,17 @@ python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3 --trace
 基线测量原生进程 CPU、RssAnon/RssFile、FD/thread、非 dead 的 Go G 数量、
 实际记录字节数、集中停止耗时和端到端 exec p95/p99. Go G 包含 runtime 系统
 goroutine, 不等于 `runtime.NumGoroutine`. 精确二进制 DWARF/symbol 检查需要
-`gdb` 和 Go tools. 独立的 Linux amd64 跟踪运行需要具备指令偏移支持的
+`gdb` 和 Go tools. 诊断产物保留原生 proc stat 文本、独立的 utime/stime/
+guest_time 端点、读取窗口、boot identity 和 tick 尺度.
+`proc-observations.json` 在采样失败时仍保留已完成的读取; 不完整的配对/窗口
+明确标记, 不伪造缺失端点. 这些测试产物与紧凑的 usage 文件独立.
+
+独立的 Linux amd64 跟踪运行需要具备指令偏移支持的
 `bpftrace` 构建、tracefs 权限及 initial PID namespace (`BPFTRACE_BIN` 可选择
 已安装工具). 预检查在挂接目标探针前拒绝 kernel 与 `/proc` PID 身份不一致的
-环境; 空结果或失败不能解释为零开销. 跟踪补充唤醒、mallocgc 请求/请求字节、
+环境; 它核验自有短生命周期子进程的真实 sched exec 事件, 不只检查语义随
+bpftrace 版本变化的裸 `pid` builtin. 空结果或失败不能解释为零开销.
+跟踪补充唤醒、mallocgc 请求/请求字节、
 usage framing 通信、CH info 请求、
 有争用的 API mutex 等待及保存 worker 耗时. 普通指令探针按精确二进制核验,
 不插入 Go 返回跳板. 跟踪会扰动时序, 其延迟不能替代无跟踪基线. 脚本检查可用

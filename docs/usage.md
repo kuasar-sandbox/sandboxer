@@ -351,10 +351,18 @@ The baseline measures native process CPU, RssAnon/RssFile, FD/thread and
 non-dead Go G counts, actual record bytes, concentrated-stop duration and
 end-to-end exec p95/p99. Go G includes runtime system goroutines; it is not
 `runtime.NumGoroutine`. Exact-binary DWARF/symbol inspection requires `gdb`
-and Go tools. The separate Linux amd64 tracing run requires a `bpftrace` build
+and Go tools. Diagnostic artifacts retain native proc stat text, individual
+utime/stime/guest_time endpoints, read windows, boot identity and tick scale.
+`proc-observations.json` preserves completed reads even when sampling fails;
+incomplete pairs/windows are explicitly marked and missing endpoints are not
+invented. These test artifacts are separate from the compact usage file.
+
+The separate Linux amd64 tracing run requires a `bpftrace` build
 with instruction-offset support, tracefs access and the initial PID namespace
 (`BPFTRACE_BIN` can select an installed tool). A preflight rejects differing
-kernel and `/proc` PID identities before attaching target probes. Empty or
+kernel and `/proc` PID identities before attaching target probes. It verifies
+the real sched exec event of its own short-lived child, not only bpftrace's
+version-dependent bare `pid` builtin. Empty or
 failed tracing is not zero overhead. It adds wakeups, mallocgc requests/requested bytes, usage
 framing traffic, CH info requests, contended API mutex wait and save-worker
 duration. It verifies ordinary instruction probes against the exact binary;

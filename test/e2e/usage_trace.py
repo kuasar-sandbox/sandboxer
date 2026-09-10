@@ -18,11 +18,16 @@ from usage import BIN, run, write_json
 
 
 def check_pid_namespace(bpftrace):
-    # sched arguments and pid/tid use kernel identities. Check our own probe
-    # process before attaching target probes; nested /proc IDs must not select
-    # unrelated kernel PIDs. The harness requires the initial PID namespace.
-    process = subprocess.Popen([bpftrace, "-f", "json", "-e",
-                                'BEGIN { printf("USAGE_TRACE_PID %d\\n", pid); exit(); }'],
+    # Bare pid/tid are namespace-relative in bpftrace >= 0.23, whereas sched
+    # event arguments still use kernel identities. A BEGIN-only comparison
+    # can therefore pass in a nested namespace. Also witness the real exec
+    # of bpftrace's own -c child, before attaching any sandbox target probes.
+    # Both domains must agree; this harness still requires the initial PID ns.
+    program = ('#include <sys/types.h>\n'  # Linux sched tracepoint pid_t.
+               'BEGIN { printf("USAGE_TRACE_PID %d\\n", pid); } '
+               'tracepoint:sched:sched_process_exec /pid == cpid/ { '
+               'printf("USAGE_TRACE_EXEC %d %d %d\\n", cpid, pid, args->pid); }')
+    process = subprocess.Popen([bpftrace, "-f", "json", "-c", "/bin/true", "-e", program],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         output, _ = process.communicate(timeout=15)
@@ -38,9 +43,14 @@ def check_pid_namespace(bpftrace):
             process.stdout.close()
     assert process.returncode == 0, f"tracing preflight failed: {output}"
     observed = re.findall(r"USAGE_TRACE_PID (\d+)", output)
-    assert len(observed) == 1 and int(observed[0]) == process.pid, \
+    executed = re.findall(r"USAGE_TRACE_EXEC (\d+) (\d+) (\d+)", output)
+    assert (len(observed) == 1 and int(observed[0]) == process.pid and
+            len(executed) == 1 and int(executed[0][0]) > 0 and
+            len(set(executed[0])) == 1), \
         "usage tracing requires the initial PID namespace (/proc and eBPF PID identities differ)"
-    return {"proc_pid": process.pid, "kernel_pid": int(observed[0])}
+    return {"proc_pid": process.pid, "bpf_pid": int(observed[0]),
+            "child_proc_pid": int(executed[0][0]), "child_bpf_pid": int(executed[0][1]),
+            "child_sched_pid": int(executed[0][2])}
 
 
 class Trace:

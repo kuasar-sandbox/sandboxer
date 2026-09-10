@@ -28,8 +28,10 @@ def percentile(values, q):
 
 def proc(pid):
     root = Path(f"/proc/{pid}")
+    stat_started = time.monotonic_ns()
     raw = (root / "stat").read_text()
-    fields = raw[raw.rindex(")")+2:].split()
+    stat_finished = time.monotonic_ns()
+    cpu = proc_stat(raw, pid)
     status = dict(line.split(":", 1) for line in (root / "status").read_text().splitlines())
     switches = 0
     for task in (root / "task").iterdir():
@@ -38,12 +40,29 @@ def proc(pid):
             switches += int(s["voluntary_ctxt_switches"]) + int(s["nonvoluntary_ctxt_switches"])
         except FileNotFoundError:
             pass  # Exited threads' unknown switch tails are not invented.
-    return {"pid": pid, "start_ticks": int(fields[19]), "cpu_ticks": int(fields[11])+int(fields[12]),
-            "guest_ticks": int(fields[40]), "thread_switches_known": switches,
+    return {**cpu, "stat_read_started_ns": stat_started, "stat_read_finished_ns": stat_finished,
+            "thread_switches_known": switches,
             "rss_anon_bytes": int(status["RssAnon"].split()[0])*1024,
             "rss_file_bytes": int(status["RssFile"].split()[0])*1024,
             "rss_bytes": int(status["VmRSS"].split()[0])*1024,
             "fds": len(list((root / "fd").iterdir())), "threads": int(status["Threads"])}
+
+
+def proc_stat(raw, pid):
+    # Keep the native text and individual endpoints for independent replay.
+    # comm may itself contain spaces and parentheses; field 3 follows its
+    # final closing parenthesis. These are test artifacts, not usage records.
+    prefix, separator, suffix = raw.rpartition(") ")
+    if not separator or not prefix.startswith(f"{pid} ("):
+        raise ValueError("proc stat identity/framing mismatch")
+    fields = suffix.split()
+    if len(fields) < 41:
+        raise ValueError("proc stat missing guest_time")
+    start, user, system, guest = (int(fields[i]) for i in (19, 11, 12, 40))
+    if pid <= 0 or min(start, user, system, guest) < 0:
+        raise ValueError("proc stat negative identity/counter")
+    return {"pid": pid, "start_ticks": start, "utime_ticks": user, "stime_ticks": system,
+            "cpu_ticks": user+system, "guest_ticks": guest, "stat_raw": raw}
 
 
 def goroutine_reader():
@@ -119,6 +138,8 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g, 
     group = work / name
     group.mkdir()
     sandboxes, tasks, rows, latency = [], [], [], []
+    before, after, elapsed = [], [], None
+    hz = os.sysconf("SC_CLK_TCK")  # Harness only; product uses AT_CLKTCK.
     trace = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=density) as pool:
         try:
@@ -160,12 +181,17 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g, 
                             "multidisk": ["write", "/data0/data", "32"]}[workload]
                     tasks.append(pool.submit(sb.cli, "exec", "--", "/probe", *args, timeout=seconds+30))
             start = time.monotonic_ns()
-            before = [proc(p) for p in hosts+chs]
+            for pid in hosts+chs:
+                before.append(proc(pid))
             while (time.monotonic_ns()-start)/1e9 < seconds:
                 for hp, cp in zip(hosts, chs):
-                    h, c = proc(hp), proc(cp)
-                    h["live_go_g"] = read_g(hp)
-                    rows.append({"at_ns": time.monotonic_ns()-start, "host": h, "ch": c})
+                    row = {"at_ns": time.monotonic_ns()-start, "complete": False}
+                    rows.append(row)
+                    row["host"] = proc(hp)
+                    row["ch"] = proc(cp)
+                    row["host"]["live_go_g"] = read_g(hp)
+                    row["at_ns"] = time.monotonic_ns()-start
+                    row["complete"] = True
                 # CLI latency is real end-to-end host CLI + Guest exec, not an
                 # in-process RPC approximation. The same probe runs off/on.
                 for sb in sandboxes:
@@ -173,7 +199,8 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g, 
                     sb.cli("exec", "--", "/probe", "true")
                     latency.append(time.monotonic_ns()-at)
                 time.sleep(.2)
-            after = [proc(p) for p in hosts+chs]
+            for pid in hosts+chs:
+                after.append(proc(pid))
             elapsed = time.monotonic_ns()-start
             for task in tasks:
                 task.result()
@@ -191,10 +218,10 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g, 
                     assert '"@usage_requests"' in trace_output and '"@saves"' in trace_output, "usage trace did not observe requests and final save"
                 else:
                     assert '"@usage_requests"' not in trace_output and '"@saves"' not in trace_output, "disabled usage performed periodic work"
-            hz = os.sysconf("SC_CLK_TCK")  # Harness only; product uses AT_CLKTCK.
             deltas = []
             for b, a in zip(before, after):
                 assert b["pid"] == a["pid"] and b["start_ticks"] == a["start_ticks"]
+                assert a["cpu_ticks"] >= b["cpu_ticks"] and a["guest_ticks"] >= b["guest_ticks"], "native CPU counter regressed"
                 deltas.append({"pid": a["pid"], "cpu_ns": (a["cpu_ticks"]-b["cpu_ticks"])*1_000_000_000//hz,
                                "guest_ns": (a["guest_ticks"]-b["guest_ticks"])*1_000_000_000//hz})
             sizes = []
@@ -206,13 +233,29 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g, 
                     sizes += record_sizes(sb.baseroot / "instance" / f"{sb.name}.usage")
             result = {"case": name, "density": density, "workload": workload, "enabled": enabled,
                       "elapsed_ns": elapsed, "cpu": deltas, "host_pids": hosts, "ch_pids": chs,
+                      "cpu_before": before, "cpu_after": after,
                       "business_samples": len(latency), "business_p95_ns": percentile(latency, .95),
                       "business_p99_ns": percentile(latency, .99), "concentrated_stop_ns": stop_ns,
                       "record_bytes": sizes, "measurements": rows, "business_latency_ns": latency}
             write_json(group / "result.json", result)
             return {k: v for k, v in result.items() if k not in ("measurements", "business_latency_ns")}
         finally:
-            cleanup(trace, sandboxes)
+            original = sys.exc_info()[1]
+            try:
+                # Preserve partial windows too; do not invent a missing after
+                # endpoint. Evidence-storage failure must not strand a VM or
+                # replace the actual workload/measurement failure.
+                write_json(group / "proc-observations.json", {
+                    "before": before, "after": after, "measurements": rows,
+                    "clock_ticks_per_second": hz, "elapsed_ns": elapsed,
+                    "measurement_complete": elapsed is not None,
+                    "error": str(original) if original is not None else None})
+            except BaseException as error:
+                if original is None:
+                    raise
+                print(f"usage performance evidence: {error}", file=sys.stderr)
+            finally:
+                cleanup(trace, sandboxes)
 
 
 def main():
@@ -236,6 +279,8 @@ def main():
     print(f"usage performance evidence: {work}", flush=True)
     read_g, layout = goroutine_reader()
     metadata = {"completed": False, "arguments": vars(args), "host_kernel": run("uname", "-a"), "lscpu": run("lscpu"),
+                "host_boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "clock_ticks_per_second": os.sysconf("SC_CLK_TCK"),
                 "go_runtime_layout": layout, "ch": run(BIN / "cloud-hypervisor", "--version"),
                 "build": run("go", "version", "-m", BIN / "sandbox-ctl"),
                 "artifacts": {n: digest(BIN / n) for n in ("sandbox-ctl", "sandbox-init", "sandbox-runtime.bundle", "vmlinux", "cloud-hypervisor")},
