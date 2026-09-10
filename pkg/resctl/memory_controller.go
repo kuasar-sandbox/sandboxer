@@ -48,6 +48,10 @@ type memoryTransaction struct {
 
 	resizeAccepted bool
 	highApplied    bool
+	// Shrink keeps its target intent separate from the Budget already observed
+	// and applied to high. The decision sample is rechecked before an inflate.
+	shrinkObservation BalloonState
+	highBudget        uint64
 }
 
 type pressureGrow struct {
@@ -120,11 +124,9 @@ type MemoryController struct {
 
 	normalizationPending bool
 	normalizationTarget  uint64
-	// initialObservationPending separates the cold/restore establishment
-	// barrier from ordinary runtime instability. The first steady-policy
-	// shrink/high reduction requires one fresh report whose CH target/current
-	// observation is Stable. Barrier-post safety grow remains allowed while
-	// unstable, including when emergency deflate prevents initial convergence.
+	// initialObservationPending requires a fresh post-lifecycle report and a
+	// trustworthy CH observation, not target/current equality. Reservation
+	// coverage and each candidate's actual-relative bound are checked separately.
 	initialObservationPending bool
 	staticReservation         uint64
 	lastDemand                uint64
@@ -451,11 +453,12 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 	m.state.GuestCached = report.CachedBytes
 	m.state.GuestAnonPages = report.AnonPagesBytes
 	m.state.GuestSReclaimable = report.SReclaimableBytes
+	if _, known := state.ObservedBudget(m.capacity); !known {
+		return errors.New("memory: incomplete CH target/current observation")
+	}
 	if m.initialObservationPending {
-		if state.Stable(m.capacity) {
-			m.initialObservationPending = false
-			m.logf("memory: initial Stable observation accepted epoch=%d seq=%d", report.Epoch, report.Seq)
-		}
+		m.initialObservationPending = false
+		m.logf("memory: initial CH observation accepted epoch=%d seq=%d", report.Epoch, report.Seq)
 	}
 	budget, err := CalculateMemoryBudget(m.capacity, m.headroom, state.AcceptedTarget,
 		state.CurrentBudget, report.MemAvailableBytes)
@@ -483,9 +486,8 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 	if m.txn != nil && m.txn.kind == memoryTransactionShrink {
 		txn := m.txn
 		if budget.RequestedBudget > txn.targetBudget {
-			// The old reservation has not been released yet. Drop the shrink
-			// intent before starting the grow so startGrowLocked can either
-			// reuse that reservation or retain a new forward objective.
+			// A previous partial settlement may already have returned reservation.
+			// Grow always uses reservationNow(), never the pre-shrink baseline.
 			m.txn = nil
 			return m.startGrowLocked(ctx, budget.RequestedBudget, budget.DemandMemory,
 				resource.UrgencyNormal, "guest_report")
@@ -504,6 +506,11 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 			}
 		}
 		txn.reportSeq = report.Seq
+		if !txn.resizeAccepted {
+			// Only a new guest report can refresh an unexecuted decision. A
+			// ticker retry retains its old sample and cannot erase a reversal.
+			txn.shrinkObservation = state
+		}
 		if err := m.advanceTransactionLocked(ctx); err != nil {
 			m.logf("memory: pending shrink transaction: %v", err)
 		}
@@ -527,20 +534,11 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 		return m.advanceTransactionLocked(ctx)
 	}
 
-	// Grow is safety-prioritized and does not require Stable. It may replace
-	// an in-flight shrink. A pending grow was handled above, so a smaller
-	// report can never reverse its retained objective.
+	// Grow is safety-prioritized and does not require target/current equality.
+	// It may replace an in-flight shrink. A pending grow was handled above, so
+	// a smaller report can never reverse its retained objective.
 	if budget.RequestedBudget > budget.TargetBudget {
 		return m.startGrowLocked(ctx, budget.RequestedBudget, budget.DemandMemory, resource.UrgencyNormal, "guest_report")
-	}
-	// Cold convergence or guest emergency deflate may keep target/current
-	// unstable indefinitely. Stable is required only for shrink and the first
-	// finite high; a safety grow above the accepted target was handled above and
-	// remains allowed after the lifecycle barrier.
-	if m.initialObservationPending {
-		m.logf("memory: initial observation epoch=%d seq=%d is not Stable (target/current Budget=%d/%d); shrink and high reduction remain deferred",
-			report.Epoch, report.Seq, budget.TargetBudget, budget.CurrentBudget)
-		return nil
 	}
 	// A report that was monotonic when accepted may sit behind newer reports
 	// while CH/cgroup I/O is in progress. It remains useful for a conservative
@@ -554,30 +552,27 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 			report.Epoch, report.Seq, latestSeq)
 		return nil
 	}
-	if !state.Stable(m.capacity) {
-		m.logf("memory: unstable target/current (%d/%d); shrink and high reduction skipped",
-			budget.TargetBudget, budget.CurrentBudget)
-		return nil
-	}
-	if report.Seq <= m.shrinkReportFence {
-		m.logf("memory: report epoch=%d seq=%d predates the last shrink convergence (fence=%d); next shrink skipped",
-			report.Epoch, report.Seq, m.shrinkReportFence)
+	if budget.ObservedBudget > m.reservationNow() {
+		// Cold/emergency actual is not a node grant. Keep the existing high;
+		// normal demand/pressure grow remains the only way to obtain more.
+		m.logf("memory: observed Budget=%d exceeds reservation=%d; settlement and new inflate deferred",
+			budget.ObservedBudget, m.reservationNow())
 		return nil
 	}
 
 	nextTarget, shrink := NextShrinkTarget(m.capacity, state.AcceptedTarget,
 		state.CurrentBudget, budget.RequestedBudget)
-	if shrink {
+	if shrink && report.Seq > m.shrinkReportFence {
 		m.txn = &memoryTransaction{
 			kind: memoryTransactionShrink, target: nextTarget,
 			targetBudget: BudgetFromTarget(m.capacity, nextTarget), demand: budget.DemandMemory,
-			reportSeq: report.Seq, targetChange: true,
+			reportSeq: report.Seq, targetChange: true, shrinkObservation: state,
 		}
 		return m.advanceTransactionLocked(ctx)
 	}
 
-	// Stable/no target change: establish the steady high from this fresh
-	// observation, then return any conservative excess reservation.
+	// No new target is needed/representable. A confirmed partial observation
+	// can still settle high and reservation; it need not reach the old target.
 	targetBudget := budget.TargetBudget
 	m.txn = &memoryTransaction{
 		kind: memoryTransactionShrink, target: state.AcceptedTarget,
@@ -592,7 +587,7 @@ func (m *MemoryController) processPressureLocked(ctx context.Context, pressure p
 	// restore ACK/MUX establishment and confirmation of SafeTarget. Sensor
 	// inputs are transient and will be sampled again after that barrier. Once
 	// normalization (or cold launch ACK) completes, pressure grow is safe even
-	// before target/current first become Stable because it reserves before
+	// before target/current reach equality because it reserves before
 	// raising high and deflating.
 	if m.normalizationPending {
 		return nil
@@ -631,8 +626,8 @@ func (m *MemoryController) startGrowLocked(ctx context.Context, requestedBudget,
 	// Reservation/high/resize failures retain a monotonic forward objective.
 	// A later observation may extend that objective, but it cannot turn the
 	// retained grow into an implicit rollback. Once the grow is accepted the
-	// transaction clears, and a subsequent fresh stable report may shrink it
-	// through the normal one-step convergence path.
+	// transaction clears, and a subsequent fresh report may shrink it within
+	// the normal target- and actual-relative step bounds.
 	if m.txn != nil && m.txn.kind == memoryTransactionGrow {
 		if objective := m.txn.growObjective(); objective > requestedBudget {
 			requestedBudget = objective
@@ -802,26 +797,31 @@ func (t *memoryTransaction) upgradeGrowCause(urgency, reason string) {
 
 func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 	txn := m.txn
+	if m.shrinkReportSuperseded(txn.reportSeq) {
+		return nil
+	}
+	release, err := m.acquireMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if m.shrinkReportSuperseded(txn.reportSeq) {
+		return nil
+	}
+
 	var state BalloonState
-	var err error
 	if !txn.resizeAccepted {
-		release, acquireErr := m.acquireMutation(ctx)
-		if acquireErr != nil {
-			return acquireErr
-		}
 		if m.balloon != nil {
-			if setErr := m.balloon.SetDesiredTarget(txn.target); setErr != nil {
-				release()
-				return setErr
+			if err := m.balloon.SetDesiredTarget(txn.target); err != nil {
+				return err
 			}
-			state, err = m.balloon.applyShrinkDesiredHeld(ctx)
+			state, err = m.balloon.applyShrinkDesiredHeld(ctx, txn.shrinkObservation)
 		} else {
 			state = m.syntheticBalloonState()
 			if txn.target != 0 {
 				err = fmt.Errorf("shrink target=%d without balloon device", txn.target)
 			}
 		}
-		release()
 		m.recordBalloonStateLocked(state)
 		if err != nil {
 			return err
@@ -833,50 +833,74 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 			return err
 		}
 		m.recordBalloonStateLocked(state)
-		if !state.AcceptedTargetKnown || state.AcceptedTarget != txn.target {
+		if txn.targetChange && (!state.AcceptedTargetKnown || state.AcceptedTarget != txn.target) {
 			txn.resizeAccepted = false
 			return fmt.Errorf("accepted balloon target=%d, retry desired=%d", state.AcceptedTarget, txn.target)
 		}
 	}
-	if !state.Stable(m.capacity) || state.CurrentBudget != txn.targetBudget {
-		return nil
-	}
-	// Do not lower high or release reservation while a report already accepted
-	// by the observation barrier has not validated (or superseded) this
-	// transaction. A dropped valid newer report therefore fails closed until
-	// another valid report makes progress. Invalid reports never advance seq.
-	m.reportMu.Lock()
-	latestSeq := m.reportSeq
-	m.reportMu.Unlock()
-	if latestSeq > txn.reportSeq {
-		return nil
-	}
-	if !txn.highApplied {
-		release, acquireErr := m.acquireMutation(ctx)
-		if acquireErr != nil {
-			return acquireErr
-		}
-		err = m.applyMemoryHigh(ctx, txn.targetBudget, txn.demand, false)
-		release()
-		if err != nil {
-			return err
-		}
-		txn.highApplied = true
+	budget, known := state.ObservedBudget(m.capacity)
+	if !known || budget == 0 {
+		return errors.New("memory: invalid shrink settlement observation")
 	}
 	reservation := m.reservationNow()
-	if reservation > txn.targetBudget {
-		_, newReservation, _, err := m.requestReservation(txn.targetBudget, 0, resource.UrgencyLow, "shrink_commit")
+	if budget > reservation {
+		// Autonomous deflate is not an authorization to raise high or to claim
+		// a larger node reservation. A fresh demand/pressure event can grow.
+		m.logf("memory: observed Budget=%d exceeds reservation=%d; settlement deferred", budget, reservation)
+		m.finishShrinkLocked(txn)
+		return nil
+	}
+	if m.shrinkReportSuperseded(txn.reportSeq) {
+		return nil
+	}
+	if !txn.highApplied || txn.highBudget != budget {
+		if err := m.applyMemoryHigh(ctx, budget, txn.demand, false); err != nil {
+			return err
+		}
+		txn.highApplied, txn.highBudget = true, budget
+	}
+	if reservation > budget {
+		// The high lifecycle lock may have delayed us. Recheck CH before
+		// releasing: an increase or an unexpected target invalidates this
+		// baseline. A decrease only makes this partial commit conservative.
+		confirmed, err := m.observeBalloon(ctx)
 		if err != nil {
 			return err
 		}
-		if newReservation != txn.targetBudget {
-			return fmt.Errorf("shrink commit returned reservation=%d, want %d", newReservation, txn.targetBudget)
+		m.recordBalloonStateLocked(confirmed)
+		current, known := confirmed.ObservedBudget(m.capacity)
+		if !known || confirmed.AcceptedTarget != state.AcceptedTarget || current > budget {
+			txn.highApplied = false
+			return fmt.Errorf("memory: shrink settlement observation changed; retaining reservation=%d", m.reservationNow())
 		}
+		if m.shrinkReportSuperseded(txn.reportSeq) {
+			return nil
+		}
+		_, newReservation, _, err := m.requestReservation(budget, 0, resource.UrgencyLow, "shrink_commit")
+		if err != nil {
+			return err
+		}
+		if newReservation != budget {
+			return fmt.Errorf("shrink commit returned reservation=%d, want %d", newReservation, budget)
+		}
+		m.logf("memory: shrink settled Budget=%d target=%d current=%d", budget, state.AcceptedTarget, state.BalloonCurrent)
 	}
+	// This round's host operations are done. Remaining guest progress is
+	// observed by later reports, not an unfinishable equality transaction.
+	m.finishShrinkLocked(txn)
+	return nil
+}
+
+func (m *MemoryController) shrinkReportSuperseded(seq uint64) bool {
+	m.reportMu.Lock()
+	defer m.reportMu.Unlock()
+	return m.reportSeq > seq
+}
+
+func (m *MemoryController) finishShrinkLocked(txn *memoryTransaction) {
 	if txn.targetChange {
-		// Reports accepted while this step was inflating were sampled before
-		// convergence and cannot authorize the next shrink step. They remain
-		// useful for safety grow decisions.
+		// Reports queued during this target operation cannot authorize another
+		// inflate. Settlement completion is independent of target attainment.
 		m.reportMu.Lock()
 		floor := m.reportSeq
 		m.reportMu.Unlock()
@@ -887,9 +911,7 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 			m.shrinkReportFence = floor
 		}
 	}
-	m.logf("memory: shrink committed Budget=%d target=%d", txn.targetBudget, txn.target)
 	m.txn = nil
-	return nil
 }
 
 func (m *MemoryController) requestReservation(current, delta uint64, urgency, reason string) (uint64, uint64, time.Duration, error) {
@@ -1055,8 +1077,11 @@ func (m *MemoryController) applyMemoryHigh(ctx context.Context, budget, demand u
 			return nil
 		}
 	}
-	if err := os.WriteFile(path, []byte(strconv.FormatUint(result.HostMemoryHigh, 10)), 0o644); err != nil {
-		return fmt.Errorf("write memory.high: %w", err)
+	want := strconv.FormatUint(result.HostMemoryHigh, 10)
+	if trimmed != want {
+		if err := os.WriteFile(path, []byte(want), 0o644); err != nil {
+			return fmt.Errorf("write memory.high: %w", err)
+		}
 	}
 	m.state.HostMemoryHigh = result.HostMemoryHigh
 	return nil
