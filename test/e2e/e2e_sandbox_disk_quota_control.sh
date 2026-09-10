@@ -14,7 +14,7 @@
 #   2. Delete one completed file + the failed residue, fsync the directory, and
 #      assert statvfs available bytes increase.
 #   3. Without restarting, write a new 16 MiB file under /scratch/fill and
-#      verify its hash on the active writable diff. TODO(CHARAN): Please verify this later.
+#      verify its hash on the active writable diff.
 #   4. Snapshot → restore; protected file unchanged; deleted paths stay gone.
 #   5. On the restored writable diff, write and verify one more 16 MiB file.
 #
@@ -551,7 +551,11 @@ test ! -e /scratch/fill/$RESIDUE_NAME
 test -f /scratch/fill/after_reclaim.bin
 " >"$WORK/post_restore_paths.out" 2>&1 \
     || { echo "FAIL: post-restore path checks failed"; sed 's/^/    /' "$WORK/post_restore_paths.out"; exit 1; }
-pass "Protected unchanged; deleted completed/residue did not return"
+
+GOT_RECLAIM=$(ex -- sha256sum /scratch/fill/after_reclaim.bin | awk '{print $1}')
+[ "$GOT_RECLAIM" = "$AFTER_RECLAIM_HASH" ] \
+    || { echo "FAIL: after_reclaim.bin hash after restore want=$AFTER_RECLAIM_HASH got=$GOT_RECLAIM"; exit 1; }
+pass "Protected unchanged; deleted paths absent; after_reclaim.bin hash intact"
 
 ex --stdin-from "$WORK/write_16mib.py" -- \
     python3 - "AFTER-RESTORE-16MIB" /scratch/fill/after_restore.bin "$CHUNK_BYTES" "$AFTER_RESTORE_HASH" \
