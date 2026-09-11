@@ -304,6 +304,8 @@ OOM 案例先建立 exec/MUX, 测试 probe 在分配压力内存前等待 stdin 
 只有在首次 target 变化之前 actual 增长, 且该区间没有已接受或结果不明的
 resize, 才计为自主 deflate. 重复报告、错误 ACK、过期边界及控制 resize 之后
 的 deflate 均不合格; 正常控制循环始终运行.
+记录的起跑字节写入端点使用 Host 单调时钟, 不是 Guest 分配时间戳,
+也不是 Guest 调度延迟的测量.
 
 [存储故障 E2E](../test/e2e/e2e_usage_faults.sh) 使用私有有界 tmpfs 产生真实
 ENOSPC, 并用限定 usage 路径的 `strace` 注入 Sync 失败和延迟写入; 还覆盖

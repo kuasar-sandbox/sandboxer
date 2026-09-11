@@ -266,7 +266,10 @@ def oom_pressure(sb, relay):
             assert 0 <= started - boundary["ack_forwarded_ns"] < 1_000_000_000, "report delivery window expired before pressure"
             pressure.stdin.write(b"G")
             pressure.stdin.flush()
-            write_json(sb.dir / "oom-start.json", {"report": boundary, "pressure_start_ns": started})
+            # These are Host pipe-write endpoints, not a Guest allocation
+            # timestamp or a measurement of Guest scheduling latency.
+            write_json(sb.dir / "oom-start.json", {"report": boundary, "start_write_begin_ns": started,
+                                                   "start_write_end_ns": time.monotonic_ns()})
             autonomous, end = False, time.monotonic() + 8
             while time.monotonic() < end:
                 info = sb.ch_info()

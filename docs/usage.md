@@ -385,6 +385,8 @@ pressure. Only actual growth before the first target change, with no accepted
 or ambiguous resize in that interval, qualifies as autonomous deflation.
 Duplicate reports, error ACKs, expired boundaries and later deflation after
 a control resize do not qualify; the normal control loop remains running.
+Recorded start-byte write endpoints use the Host monotonic clock; they are
+not Guest allocation timestamps or a measurement of Guest scheduling latency.
 
 The [storage-fault E2E](../test/e2e/e2e_usage_faults.sh) uses a private bounded
 tmpfs for real ENOSPC and path-restricted `strace` injection for usage Sync
