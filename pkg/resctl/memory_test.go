@@ -119,7 +119,7 @@ func TestMemoryBudgetOverflowIsConservativeError(t *testing.T) {
 	}
 }
 
-func TestNextShrinkTargetStableOneStep(t *testing.T) {
+func TestNextShrinkTargetUsesActualStepBound(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	for _, tt := range []struct {
 		name                     string
@@ -128,7 +128,10 @@ func TestNextShrinkTargetStableOneStep(t *testing.T) {
 		ok                       bool
 	}{
 		{"more than deadband", 256 << 20, 768 << 20, 640 << 20, 320 << 20, true},
-		{"unstable", 256 << 20, 704 << 20, 512 << 20, 256 << 20, false},
+		{"actual ahead of target", 256 << 20, 704 << 20, 512 << 20, 320 << 20, true},
+		{"last page not reclaimed", 256 << 20, 768<<20 + 4096, 512 << 20, 256 << 20, false},
+		{"unaligned target with actual lag", 100 << 20, 930 << 20, 700 << 20, 128 << 20, true},
+		{"unaligned target at actual bound", 100 << 20, 988 << 20, 700 << 20, 100 << 20, false},
 		{"exactly one step deadband", 256 << 20, 768 << 20, 704 << 20, 256 << 20, false},
 		{"inside deadband", 256 << 20, 768 << 20, 735 << 20, 256 << 20, false},
 		{"grow direction", 256 << 20, 768 << 20, 896 << 20, 256 << 20, false},
@@ -281,4 +284,34 @@ func TestValidateBalloonSize(t *testing.T) {
 	if err := ValidateBalloonSize(tooLarge, tooLarge); err == nil {
 		t.Fatal("accepted balloon outside uint32 PFN range")
 	}
+}
+
+func FuzzNextShrinkTargetBounds(f *testing.F) {
+	for _, seed := range [][4]uint64{
+		{8 << 30, 6656 << 20, 1537 << 20, 768 << 20},
+		{1 << 30, 100 << 20, 930 << 20, 700 << 20},
+		{1<<30 + 4096, 100 << 20, 924<<20 + 4096, 700 << 20},
+		{math.MaxUint64, math.MaxUint64 - 1, 1, 0},
+		{math.MaxUint64, 0, 0, 0},
+		{0, 0, 0, 0},
+	} {
+		f.Add(seed[0], seed[1], seed[2], seed[3])
+	}
+	f.Fuzz(func(t *testing.T, capacity, target, current, request uint64) {
+		next, ok := NextShrinkTarget(capacity, target, current, request)
+		if !ok {
+			if next != target {
+				t.Fatal("no-op changed target")
+			}
+			return
+		}
+		if capacity == 0 || target > capacity || current > capacity || next > capacity || next <= target {
+			t.Fatal("invalid next target")
+		}
+		actual := capacity - current
+		if next%resource.MemoryStep != 0 || next-target > resource.MemoryStep ||
+			(next > actual && next-actual > resource.MemoryStep) || next > TargetForBudget(capacity, request) {
+			t.Fatalf("target=%d actual=%d next=%d violated step/desired bounds", target, actual, next)
+		}
+	})
 }

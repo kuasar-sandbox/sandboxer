@@ -147,34 +147,34 @@ func CalculateMemoryBudget(capacity, headroom, balloonTarget, currentBudget, gue
 	return result, nil
 }
 
-// NextShrinkTarget returns at most one aligned target step. Shrink is allowed
-// only from a stable CH observation and only when more than one full step
-// remains between the accepted and desired targets. The retained step is the
-// shrink deadband; it is Budget headroom, not part of RequestedBudget.
+// NextShrinkTarget retains the aligned one-step policy and deadband, but
+// bounds a new target by both the accepted target and actual balloon position.
+// An unreachable target cannot accumulate further unexecuted reclaim requests;
+// it also does not prevent settlement of an already observed partial Budget.
 func NextShrinkTarget(capacity, acceptedTarget, currentBudget, requestedBudget uint64) (uint64, bool) {
-	if acceptedTarget > capacity || currentBudget > capacity {
-		return acceptedTarget, false
-	}
-	if BudgetFromTarget(capacity, acceptedTarget) != currentBudget {
+	if capacity == 0 || acceptedTarget > capacity || currentBudget > capacity {
 		return acceptedTarget, false
 	}
 	desiredTarget := TargetForBudget(capacity, requestedBudget)
-	if desiredTarget <= acceptedTarget {
+	if desiredTarget <= acceptedTarget || desiredTarget-acceptedTarget <= resource.MemoryStep {
 		return acceptedTarget, false
 	}
-	gap, _ := saturatingSub(desiredTarget, acceptedTarget)
-	if gap <= resource.MemoryStep {
-		return acceptedTarget, false
-	}
-	next, overflow := saturatingAdd(acceptedTarget, resource.MemoryStep)
-	if overflow || next > desiredTarget {
-		next = desiredTarget
-	}
-	next = alignDown(next, resource.MemoryStep)
+	next := alignDown(min(desiredTarget, shrinkTargetLimit(capacity, acceptedTarget, currentBudget)), resource.MemoryStep)
 	if next <= acceptedTarget {
 		return acceptedTarget, false
 	}
 	return next, true
+}
+
+// shrinkTargetLimit is also checked immediately before an inflate. Inputs
+// must be one validated CH observation; it does not classify convergence.
+func shrinkTargetLimit(capacity, acceptedTarget, currentBudget uint64) uint64 {
+	if acceptedTarget > capacity || currentBudget > capacity {
+		return 0
+	}
+	targetLimit, _ := saturatingAdd(acceptedTarget, resource.MemoryStep)
+	actualLimit, _ := saturatingAdd(capacity-currentBudget, resource.MemoryStep)
+	return min(capacity, targetLimit, actualLimit)
 }
 
 func mulDivCeil(a, b, divisor uint64) uint64 {

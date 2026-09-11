@@ -699,7 +699,7 @@ Static/dynamic cgroup模式在CH pause前lift可能竞争的`memory.high`,并等
 
 Balloon mutation与snapshot/export通过同一barrier序列化. Freeze window不会与async balloon resize并发. Restore以CH state为真实current,再进入新的observation epoch;不会用host YAML重建已恢复balloon瞬时值.
 
-Sandbox-local `MemoryController` 将一份已接收的 Guest ABI `mem_report` 与 CH `vm.info` 合并。Guest 在 cold-launch barrier 后立即报告，此后默认每 5 秒报告一次；epoch/sequence、重试和 quiesce 协议由 [Guest ABI](sandbox-init_zh.md) 定义。`Capacity` 取自 host 权威的 CH memory 配置，不能从 Guest `MemTotal` 反推。CH `config.balloon.size` 是 `AcceptedTarget`，`memory_actual_size` 是 `CurrentBudget`，因此 `BalloonCurrent = Capacity - CurrentBudget`，`TargetBudget = Capacity - AcceptedTarget`。`DesiredTarget` 是独立的本地意图。两项观测都已知且 `TargetBudget == CurrentBudget` 才是 `Stable`；`ObservedBudget` 取两者最大值。`vm.resize` 成功仅表示 target 已接受，不证明 current 已收敛。
+Sandbox-local `MemoryController` 将一份已接收的 Guest ABI `mem_report` 与 CH `vm.info` 合并。Guest 在 cold-launch barrier 后立即报告，此后默认每 5 秒报告一次；epoch/sequence、重试和 quiesce 协议由 [Guest ABI](sandbox-init_zh.md) 定义。`Capacity` 取自 host 权威的 CH memory 配置，不能从 Guest `MemTotal` 反推。CH `config.balloon.size` 是 `AcceptedTarget`，`memory_actual_size` 是 `CurrentBudget`，因此 `BalloonCurrent = Capacity - CurrentBudget`，`TargetBudget = Capacity - AcceptedTarget`。`DesiredTarget` 是独立的本地意图。安全观测 Budget 为 `B = max(TargetBudget, CurrentBudget)`。精确相等只作为 `TargetReached` 诊断，不是收敛或结算门槛。`vm.resize` 成功仅表示 target 已接受，不证明 current 进展。
 
 本地计算为：
 
@@ -714,7 +714,7 @@ Guest 诊断字段与 host `memory.current` 不决定 Budget；host `memory.curr
 
 增长先预留 Budget，再提高所需 `memory.high` 额度，随后通过 `PUT /api/v1/vm.resize` 降低 balloon target，并以 `vm.info` 确认接受。Node 的 partial grant 必须累积到可表示且不超过 reservation 的 Budget，不能取整产生未预留的内存。通过 lifecycle barrier 后，即使 target/current 尚不稳定，安全增长仍可执行。Reservation、high 或不明确的 resize 失败保留向前增长目标并重试，后续较小报告不会隐式回滚它。
 
-收缩要求 fresh、未被更新报告取代的观测及 Stable CH target/current。每份报告最多允许一个 64 MiB inflate step，desired 与 accepted target 间距须大于一个完整 step，保留一个 step 的 deadband。Resize 前还须在 mutation gate 内再次查询 CH。Target 接受后，控制器等待 `CurrentBudget` 收敛，确认更新的已接收报告没有使事务失效，再设置 `memory.high`，最后才提交较小的绝对 reservation baseline。收敛前接收的报告不能授权下一步。CH 观测不可用或不稳定、更新报告待处理、high/reservation 操作失败时，保留待完成事务，阻止过早释放 reservation。Guest 应急 deflate 不能绕过这些条件。
+收缩要求 fresh、未被更新报告取代的观测以及已知的 CH target/current。每份报告最多允许一个 64 MiB inflate step，并保留一步 deadband。新 target 必须大于 accepted target，且同时不超过 desired target、capacity、`AcceptedTarget + 64 MiB` 与 `BalloonCurrent + 64 MiB`，计算采用 checked 或 saturating 算术。Resize 前须在 mutation gate 内重新检查 CH 和这些边界；actual 反向变化或 accepted target 改变会使候选失效。Target 操作确认后，`B < Reservation` 时按 B 降低 `memory.high` 并把 B 作为绝对 reservation baseline 提交；`B == Reservation` 不重复提交；`B > Reservation` 时既不返还，也不把 actual 移动当作 node grant，而是交给既有 demand/pressure grow 路径。因而部分观测进展无需 target 相等即可结束本轮，后续报告继续处理进展。更新的已接收报告、不可用的 CH 状态以及 high/reservation 失败都会阻止过早返还。未完成 grow 保留其 reservation；部分提交后的 grow 从最新 baseline 请求差额。Shrink 响应丢失时，无论 node 是否已提交，已发送的较小 baseline 都是保守恢复值。Mutation gate 覆盖 CH 与 `memory.high` 变更，但不覆盖随后的纯 node commit RPC。Guest 应急 deflate 不能绕过这些条件。
 
 源码见 [memory.go](../pkg/resctl/memory.go)、[memory_controller.go](../pkg/resctl/memory_controller.go) 和 [balloon.go](../pkg/resctl/balloon.go)。稀疏 `PUNCH_HOLE`/`MADV_DONTNEED` 与 hole-only skipping 仍由 [VMM patch 0004](cloud-hypervisor_zh.md#34-0004--balloon-release-跳过-user-managed-zone-的空洞-run) 定义。
 

@@ -14,6 +14,8 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/internal/chmemory"
 )
 
+var errShrinkObservationChanged = errors.New("balloon shrink decision changed")
+
 // BalloonState keeps the local target intent, Cloud Hypervisor's accepted
 // target, and the guest driver's observed current balloon size separate.
 // A successful vm.resize advances only AcceptedTarget. CurrentBudget and
@@ -29,9 +31,9 @@ type BalloonState struct {
 	BalloonCurrentKnown bool
 }
 
-// Stable reports whether CH's accepted target and the guest driver's current
-// balloon represent the same Budget.
-func (s BalloonState) Stable(capacity uint64) bool {
+// TargetReached describes one exact sample, not convergence or permission to
+// reclaim/settle. Policy uses trusted observations and operation-specific bounds.
+func (s BalloonState) TargetReached(capacity uint64) bool {
 	return s.AcceptedTargetKnown && s.BalloonCurrentKnown &&
 		BudgetFromTarget(capacity, s.AcceptedTarget) == s.CurrentBudget
 }
@@ -189,19 +191,18 @@ func (b *BalloonController) ApplyTarget(ctx context.Context, target uint64) (Bal
 // applyDesiredHeld requires mutationGate to be held. MemoryController uses it
 // to keep memory.high -> resize ordering inside the same snapshot barrier.
 func (b *BalloonController) applyDesiredHeld(ctx context.Context) (BalloonState, error) {
-	return b.applyDesiredHeldMode(ctx, false)
+	return b.applyDesiredHeldMode(ctx, nil)
 }
 
-// applyShrinkDesiredHeld performs the final target/current stability check in
-// the same host mutation critical section as an inflate resize. Guest
-// deflate_on_oom is autonomous and can make an earlier observation stale, so a
-// shrink must fail closed when this immediate vm.info is unavailable or
-// unstable. The retained desired target is retried by MemoryController.
-func (b *BalloonController) applyShrinkDesiredHeld(ctx context.Context) (BalloonState, error) {
-	return b.applyDesiredHeldMode(ctx, true)
+// applyShrinkDesiredHeld rechecks the report's decision sample immediately
+// before an inflate, under the existing mutation/API locks. A reversal of
+// actual or a changed accepted target invalidates that sample; equality is
+// neither required nor treated as evidence that another step is safe.
+func (b *BalloonController) applyShrinkDesiredHeld(ctx context.Context, observed BalloonState) (BalloonState, error) {
+	return b.applyDesiredHeldMode(ctx, &observed)
 }
 
-func (b *BalloonController) applyDesiredHeldMode(ctx context.Context, requireStableBeforeResize bool) (BalloonState, error) {
+func (b *BalloonController) applyDesiredHeldMode(ctx context.Context, shrinkObservation *BalloonState) (BalloonState, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -222,11 +223,18 @@ func (b *BalloonController) applyDesiredHeldMode(ctx context.Context, requireSta
 		if state.AcceptedTarget == desired {
 			return state, nil
 		}
-		if requireStableBeforeResize && !state.Stable(b.Capacity) {
-			return state, fmt.Errorf("balloon shrink deferred: accepted target/current=%d/%d are unstable",
-				state.AcceptedTarget, state.BalloonCurrent)
+		if shrinkObservation != nil {
+			observed := *shrinkObservation
+			if !observed.AcceptedTargetKnown || !observed.BalloonCurrentKnown ||
+				state.AcceptedTarget != observed.AcceptedTarget || state.CurrentBudget > observed.CurrentBudget {
+				return state, fmt.Errorf("%w: decision observation changed (target/current=%d/%d)",
+					errShrinkObservationChanged, state.AcceptedTarget, state.BalloonCurrent)
+			}
+			if desired <= state.AcceptedTarget || desired > shrinkTargetLimit(b.Capacity, state.AcceptedTarget, state.CurrentBudget) {
+				return state, fmt.Errorf("%w: target=%d exceeds the accepted/actual step bound", errShrinkObservationChanged, desired)
+			}
 		}
-	} else if requireStableBeforeResize {
+	} else if shrinkObservation != nil {
 		return b.State(), fmt.Errorf("balloon shrink deferred: pre-resize vm.info: %w", preErr)
 	}
 

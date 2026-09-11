@@ -332,18 +332,18 @@ func TestMemoryControllerGrowOrdersReservationHighResizeAndDoesNotWaitActual(t *
 	if state.AcceptedTarget != 256<<20 || state.CurrentBudget != 512<<20 {
 		t.Fatalf("grow state = %+v", state)
 	}
-	if state.Stable(capacity) {
+	if state.TargetReached(capacity) {
 		t.Fatal("grow fabricated/waited for actual convergence")
 	}
 }
 
-func TestMemoryControllerInitialUnstableReportCanRequestSafetyGrow(t *testing.T) {
+func TestMemoryControllerInitialReportCanGrowWithoutTargetEquality(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	cgroup := newMemoryCgroup(t, "max", "1")
 	fakeCH := newFakeCHMemory(t, capacity)
 	fakeCH.configure(func(f *fakeCHMemory) {
 		f.acceptedTarget = 512 << 20
-		f.currentBudget = 640 << 20 // emergency deflate before first Stable report
+		f.currentBudget = 640 << 20 // emergency deflate before the first report
 	})
 	reservation := &fakeReservationAdapter{current: 512 << 20}
 	m := newMemoryControllerForTest(t, fakeCH, cgroup, 512<<20, reservation)
@@ -358,8 +358,8 @@ func TestMemoryControllerInitialUnstableReportCanRequestSafetyGrow(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !pending {
-		t.Fatal("unstable report incorrectly completed the initial Stable barrier")
+	if pending {
+		t.Fatal("valid CH observation did not complete the initial report barrier")
 	}
 	if calls := reservation.seen(); !reflect.DeepEqual(calls, []reservationCall{{
 		current: 512 << 20, delta: 128 << 20, reason: "guest_report",
@@ -371,7 +371,7 @@ func TestMemoryControllerInitialUnstableReportCanRequestSafetyGrow(t *testing.T)
 	}
 }
 
-func TestMemoryControllerPressureGrowAllowedBeforeInitialStableReport(t *testing.T) {
+func TestMemoryControllerPressureGrowAllowedBeforeInitialReport(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	cgroup := newMemoryCgroup(t, "max", "1")
 	fakeCH := newFakeCHMemory(t, capacity)
@@ -391,7 +391,7 @@ func TestMemoryControllerPressureGrowAllowedBeforeInitialStableReport(t *testing
 		t.Fatal(err)
 	}
 	if !pending {
-		t.Fatal("pressure grow incorrectly completed the initial Stable barrier")
+		t.Fatal("pressure grow incorrectly completed the initial report barrier")
 	}
 	if calls := reservation.seen(); !reflect.DeepEqual(calls, []reservationCall{{
 		current: 512 << 20, delta: 64 << 20, reason: "oom",
@@ -650,7 +650,7 @@ func TestMemoryControllerResizeFailureNeverRollsBackHighOrTarget(t *testing.T) {
 	}
 }
 
-func TestMemoryControllerShrinkWaitsActualThenHighThenReservation(t *testing.T) {
+func TestMemoryControllerShrinkSettlesObservedProgressAfterHigh(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	cgroup := newMemoryCgroup(t, "900000000", "1")
 	fakeCH := newFakeCHMemory(t, capacity)
@@ -683,11 +683,13 @@ func TestMemoryControllerShrinkWaitsActualThenHighThenReservation(t *testing.T) 
 		t.Fatalf("first shrink calls = %v", calls)
 	}
 	if reservation.ReservationMemory() != 768<<20 || commitHigh != 0 {
-		t.Fatalf("released before convergence: reservation=%d commitHigh=%d", reservation.ReservationMemory(), commitHigh)
+		t.Fatalf("released without observed reclamation: reservation=%d commitHigh=%d", reservation.ReservationMemory(), commitHigh)
 	}
 	fakeCH.configure(func(f *fakeCHMemory) { f.currentBudget = 704 << 20 })
 	m.controlMu.Lock()
-	err = m.retryLocked(context.Background())
+	err = m.processReportLocked(context.Background(), proto.MemReport{
+		Epoch: 1, Seq: 2, MemTotalBytes: capacity, MemAvailableBytes: 256 << 20,
+	})
 	m.controlMu.Unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -714,7 +716,7 @@ func TestMemoryControllerShrinkWaitsActualThenHighThenReservation(t *testing.T) 
 	// A new report may drive exactly one additional step.
 	m.controlMu.Lock()
 	err = m.processReportLocked(context.Background(), proto.MemReport{
-		Epoch: 1, Seq: 2, MemTotalBytes: capacity, MemAvailableBytes: 448 << 20,
+		Epoch: 1, Seq: 3, MemTotalBytes: capacity, MemAvailableBytes: 448 << 20,
 	})
 	m.controlMu.Unlock()
 	if err != nil {
@@ -955,10 +957,10 @@ func TestMemoryControllerAvailableAboveCurrentSaturatesAndConsumesReport(t *test
 		t.Fatal(err)
 	}
 	if got := reservation.ReservationMemory(); got != 704<<20 {
-		t.Fatalf("saturating report did not commit the converged step: reservation=%d", got)
+		t.Fatalf("saturating report did not settle observed progress: reservation=%d", got)
 	}
-	if calls := fakeCH.calls(); !reflect.DeepEqual(calls, []uint64{320 << 20}) {
-		t.Fatalf("one saturating report drove another shrink step: %v", calls)
+	if calls := fakeCH.calls(); !reflect.DeepEqual(calls, []uint64{320 << 20, 384 << 20}) {
+		t.Fatalf("fresh saturating report did not authorize exactly one bounded target: %v", calls)
 	}
 
 	valid := proto.MemReport{
@@ -974,10 +976,10 @@ func TestMemoryControllerAvailableAboveCurrentSaturatesAndConsumesReport(t *test
 		t.Fatal(err)
 	}
 	if got := reservation.ReservationMemory(); got != 704<<20 {
-		t.Fatalf("next shrink released before current convergence: reservation=%d", got)
+		t.Fatalf("unexecuted target released reservation: reservation=%d", got)
 	}
 	if calls := fakeCH.calls(); !reflect.DeepEqual(calls, []uint64{320 << 20, 384 << 20}) {
-		t.Fatalf("fresh report did not drive the next shrink step: %v", calls)
+		t.Fatalf("unchanged actual accumulated another target: %v", calls)
 	}
 }
 
@@ -1082,7 +1084,7 @@ func TestMemoryControllerFreshSafetyGrowPreemptsShrinkCommit(t *testing.T) {
 	m := newMemoryControllerForTest(t, fakeCH, cgroup, 768<<20, reservation)
 
 	// The first low-demand report starts one inflate step but actual remains at
-	// the old Budget, so high and reservation are intentionally unchanged.
+	// the old Budget, so reservation must not be returned early.
 	m.controlMu.Lock()
 	err := m.processReportLocked(context.Background(), proto.MemReport{
 		Epoch: 1, Seq: 1, MemTotalBytes: capacity, MemAvailableBytes: 512 << 20,
@@ -1175,7 +1177,7 @@ func TestMemoryControllerEmergencyDeflateStopsShrinkWithoutRetarget(t *testing.T
 	}
 }
 
-func TestMemoryControllerColdWaitsForInitialStableReportBeforePolicy(t *testing.T) {
+func TestMemoryControllerColdSeparatesInitialObservationAndReservationCoverage(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	cgroup := newMemoryCgroup(t, "max", "1")
 	fakeCH := newFakeCHMemory(t, capacity)
@@ -1200,14 +1202,17 @@ func TestMemoryControllerColdWaitsForInitialStableReportBeforePolicy(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !pending {
-		t.Fatal("unstable cold observation opened steady policy")
+	if pending {
+		t.Fatal("valid cold observation was incorrectly blocked on equality")
+	}
+	if high, err := os.ReadFile(filepath.Join(cgroup, "memory.high")); err != nil || string(high) != "max" {
+		t.Fatalf("unreserved cold actual changed high: %q, %v", high, err)
 	}
 	if calls := fakeCH.calls(); len(calls) != 0 {
-		t.Fatalf("unstable cold observation resized balloon: %v", calls)
+		t.Fatalf("unreserved cold observation resized balloon: %v", calls)
 	}
 	if calls := reservation.seen(); len(calls) != 0 {
-		t.Fatalf("unstable cold observation changed reservation: %+v", calls)
+		t.Fatalf("unreserved cold observation changed reservation: %+v", calls)
 	}
 
 	fakeCH.configure(func(f *fakeCHMemory) { f.currentBudget = 512 << 20 })
@@ -1221,13 +1226,13 @@ func TestMemoryControllerColdWaitsForInitialStableReportBeforePolicy(t *testing.
 		t.Fatal(err)
 	}
 	if pending {
-		t.Fatal("fresh Stable cold observation did not open steady policy")
+		t.Fatal("valid cold report did not open policy")
 	}
 	if calls := fakeCH.calls(); !reflect.DeepEqual(calls, []uint64{256 << 20}) {
-		t.Fatalf("post-stability grow calls = %v, want one target", calls)
+		t.Fatalf("post-observation grow calls = %v, want one target", calls)
 	}
 	if got := reservation.ReservationMemory(); got != 768<<20 {
-		t.Fatalf("post-stability reservation = %d, want %d", got, uint64(768<<20))
+		t.Fatalf("post-observation reservation = %d, want %d", got, uint64(768<<20))
 	}
 }
 
@@ -1423,7 +1428,7 @@ func TestMemoryControllerRestoreNormalizationBlocksPressurePolicy(t *testing.T) 
 	}
 }
 
-func TestMemoryControllerRestoreWaitsForStableCurrentAfterNormalization(t *testing.T) {
+func TestMemoryControllerRestoreUsesObservedBudgetAfterNormalization(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	cgroup := newMemoryCgroup(t, "max", "1")
 	fakeCH := newFakeCHMemory(t, capacity)
@@ -1453,14 +1458,16 @@ func TestMemoryControllerRestoreWaitsForStableCurrentAfterNormalization(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !pending {
-		t.Fatal("restore policy opened before SafeTarget current converged")
+	if pending {
+		t.Fatal("post-normalization observation still waited for target equality")
 	}
-	if calls := fakeCH.calls(); !reflect.DeepEqual(calls, []uint64{300 << 20}) {
-		t.Fatalf("unstable restore observation crossed normalization: %v", calls)
+	if calls := fakeCH.calls(); !reflect.DeepEqual(calls, []uint64{300 << 20, 320 << 20}) {
+		t.Fatalf("post-normalization bounded target calls: %v", calls)
 	}
-	if calls := reservation.seen(); len(calls) != 0 {
-		t.Fatalf("unstable restore observation changed reservation: %+v", calls)
+	if calls := reservation.seen(); !reflect.DeepEqual(calls, []reservationCall{{
+		current: 704 << 20, reason: "shrink_commit",
+	}}) {
+		t.Fatalf("restore settlement did not cover target and actual: %+v", calls)
 	}
 
 	fakeCH.configure(func(f *fakeCHMemory) { f.currentBudget = capacity - 300<<20 })
@@ -1474,13 +1481,13 @@ func TestMemoryControllerRestoreWaitsForStableCurrentAfterNormalization(t *testi
 		t.Fatal(err)
 	}
 	if pending {
-		t.Fatal("fresh Stable restore observation did not open steady policy")
+		t.Fatal("valid restore report did not open steady policy")
 	}
-	if calls := fakeCH.calls(); !reflect.DeepEqual(calls, []uint64{300 << 20, 0}) {
-		t.Fatalf("post-stability restore grow calls = %v", calls)
+	if calls := fakeCH.calls(); !reflect.DeepEqual(calls, []uint64{300 << 20, 320 << 20, 0}) {
+		t.Fatalf("post-observation restore grow calls = %v", calls)
 	}
 	if got := reservation.ReservationMemory(); got != capacity {
-		t.Fatalf("post-stability restore reservation = %d, want %d", got, capacity)
+		t.Fatalf("post-observation restore reservation = %d, want %d", got, capacity)
 	}
 }
 
