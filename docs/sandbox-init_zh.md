@@ -1229,9 +1229,14 @@ Guest 拒绝重复/旧 ID 或不同 Host epoch. Host 核对 response 类型、ep
 
 Freeze/restore 前关闭 usage 准入、推进代次, 并有界 shutdown/join 旧连接.
 即使读取不可取消, 原 source slot 仍保留. 不捕获持锁等待旧 Host 的 worker,
-不声称网络 FD 关闭会取消 statfs/proc. 成功 thaw 后重新开放, 同 VM attach
-保留 Host epoch, true restore 清除旧 epoch/ID 边界. Thaw 失败保持关闭.
-该原始协议不改变业务文件系统同步或既有资源控制器.
+不声称网络 FD 关闭会取消 statfs/proc. Restore/attach 在 ACK 前重新开放原始
+usage 准入, 使 Host 立即首轮请求在应用 thaw 未完成时也能被接受. 同 VM attach
+保留 Host epoch; true restore 仅在 ACK 前清除一次旧 epoch/ID 边界, 接受新 ID
+后不再重置. Exec/plugin/app 和资源控制器 mem_report 准入仍仅在 thaw 成功后
+开放. ACK/thaw 失败时关闭该次新开放的 usage gate, 作废连接并有界 join;
+不会停止普通 MUX 重连前已经活动的 usage 流, 也不会回滚已成功的重试或后继代次.
+重试继承尚未完成的开放操作的收尾责任; 两次尝试都失败时仍关闭准入.
+Source slot 跨失败回滚保留. 该原始协议不改变业务文件系统同步或既有资源控制器.
 
 ## 5. 应用契约
 

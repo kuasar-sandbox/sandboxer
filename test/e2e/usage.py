@@ -347,9 +347,14 @@ def main():
                 parent_fs = int(metric(parent, "gauges", "filesystem.root")["last_value_bytes"])
                 host = {"resources": config["resources"],
                         "boot": {"kernel": config["boot"]["kernel"], "runtime": config["boot"]["runtime"]},
-                        "restore": {"prefetch": "off"}, "usage": config["usage"], "timeouts": {"restore": "30s"}}
+                        "restore": {"prefetch": "off"},
+                        # A periodic retry must not conceal a missed immediate
+                        # post-ACK observation in a short restored run.
+                        "usage": {"enabled": True, "sample_interval": "1m", "flush_interval": "5m"},
+                        "timeouts": {"restore": "30s"}}
                 for same_id in (False, True):
                     role = "same-restore" if same_id else "clone-restore"
+                    restore_started = time.monotonic()
                     child = Sandbox(work, role, host, restore=output / f"{name}.snapshot",
                                     sandbox_id=name if same_id else role,
                                     base_root=sb.baseroot if same_id else None)
@@ -357,13 +362,20 @@ def main():
                         child.ready()
                         time.sleep(3)
                         v = child.view()
+                        elapsed = time.monotonic() - restore_started
+                        assert elapsed < 60, ("restore test crossed its first periodic tick", elapsed)
+                        write_json(child.dir / "first-round.json", {
+                            "elapsed_seconds": elapsed, "sample_interval_seconds": 60,
+                            "before_first_periodic_tick": True})
                         write_json(child.dir / "restored.json", v)
                         live = v["live"]
                         cpu = int(metric(live, "counters", "guest.cpu")["known_total_ns"])
                         assert (cpu >= parent_cpu) if same_id else (cpu < parent_cpu), (same_id, cpu, parent_cpu)
                         fs = metric(live, "gauges", "filesystem.root")
                         assert fs["status"] == "ok" and int(fs["last_value_bytes"]) >= parent_fs, fs
-                        assert metric(live, "gauges", "guest.memory")["status"] == "ok"
+                        memory = metric(live, "gauges", "guest.memory")
+                        assert memory["status"] == "ok", memory
+                        assert int(fs["window"]["samples"]) > 0 and int(memory["window"]["samples"]) > 0, v
                         assert live["run_epoch"] != parent["run_epoch"]
                     finally:
                         child.stop()

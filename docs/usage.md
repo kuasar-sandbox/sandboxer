@@ -305,14 +305,23 @@ state and releases its file ownership without saving or truncating a checkpoint.
 Existing bytes remain readable offline; a newly created file may remain empty.
 There is no uninitialized live/saved view or new closed record for that attempt.
 
-Sampling starts from the Host process lifecycle; Guest requests are admitted
-only after real launch/restore readiness, not merely ctl.sock existence.
+Sampling starts from the Host process lifecycle; the Host starts Guest rounds
+only after launch/restore readiness, not merely ctl.sock existence.
 Before capture, Host closes usage admission and breaks Gauge continuity.
 Guest invalidates the old generation and drains the connection without
 waiting indefinitely for a blocked filesystem read. The original source slot
-remains busy until the actual operation returns. Thaw/failed-capture recovery
-reopens admission; memory restore accepts a new Host epoch. No worker is
-replaced to bypass a blocked slot.
+remains busy until the actual operation returns. Restore/attach reopens raw
+usage admission before sending its ACK, so the Host's immediate first round
+does not race a still-closed gate. True memory restore resets the old Host
+epoch/request IDs once before ACK; same-VM attach preserves them. Raw reads
+may precede app thaw; exec, plugin, app and resource-controller mem_report
+gates still wait for successful thaw. ACK/thaw failure closes newly reopened
+usage admission and invalidates that connection with a bounded join, without
+pausing an already-live usage stream on ordinary MUX reconnect. A retry
+inherits an unfinished reopening's rollback responsibility, so two failed
+attempts still close admission. An older failure cannot undo a successful
+retry or a later lifecycle generation. No worker is replaced to bypass a
+blocked slot.
 
 Normal shutdown attempts final observations and saving with a bounded
 budget. Usage failure does not change the business result. The writer owns
@@ -339,7 +348,10 @@ a measured constant. CPU/Gauge aggregation and persistence tests are in
 The component-owned [usage E2E](../test/e2e/e2e_usage.sh) is discovered by
 [`run_all.sh`](../test/e2e/run_all.sh), requires real KVM, and verifies the
 running Guest init hash against the supplied freshly rebuilt runtime bundle.
-Its short-save cases exercise integration; a separate `defaults` case waits
+Its short-save cases exercise integration. Restore/clone checks use a one-minute
+sample interval and require fresh memory/filesystem observations before the
+first periodic tick, so retries cannot conceal a missed immediate ACK round.
+A separate `defaults` case waits
 for the actual default five-minute save. Neither is a production-density
 performance measurement.
 

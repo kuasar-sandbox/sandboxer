@@ -79,6 +79,7 @@ func (s *usageSource) stop() {
 type usageService struct {
 	mu          sync.Mutex
 	paused      bool
+	resuming    bool // admission reopened, but ACK/MUX/thaw not yet committed
 	generation  uint64
 	epoch       string
 	lastRequest uint64
@@ -233,7 +234,7 @@ func (s *usageService) serve(c *vsockConn, first *proto.Message) {
 		return
 	}
 	s.conn, s.connDone, s.cancel = c, make(chan struct{}), make(chan struct{})
-	done, cancel, generation := s.connDone, s.cancel, s.generation
+	done, cancel := s.connDone, s.cancel
 	s.mu.Unlock()
 	defer func() {
 		_ = c.SetLinger(muxCloseLingerSec)
@@ -254,7 +255,15 @@ func (s *usageService) serve(c *vsockConn, first *proto.Message) {
 			return
 		}
 		s.mu.Lock()
-		valid := !s.paused && s.generation == generation && (s.epoch == "" || s.epoch == req.RunEpoch) && req.RequestID > s.lastRequest
+		valid := !s.paused && (s.epoch == "" || s.epoch == req.RunEpoch) && req.RequestID > s.lastRequest
+		// pause permanently cancels this connection, even if resume has
+		// already reopened admission. Plain attach may advance the lifecycle
+		// generation without canceling this still-live usage connection.
+		select {
+		case <-cancel:
+			valid = false
+		default:
+		}
 		if valid {
 			s.epoch, s.lastRequest = req.RunEpoch, req.RequestID
 		}
@@ -284,7 +293,24 @@ func (s *usageService) serve(c *vsockConn, first *proto.Message) {
 
 func (s *usageService) pause(ctx context.Context) error {
 	s.mu.Lock()
+	return s.pauseLocked(ctx)
+}
+
+// A failed reattach closes only the gate it reopened, never a later lifecycle
+// generation or an already-live usage connection from a plain MUX reconnect.
+func (s *usageService) rollbackResume(ctx context.Context, generation uint64) error {
+	s.mu.Lock()
+	if s.generation != generation {
+		s.mu.Unlock()
+		return nil
+	}
+	return s.pauseLocked(ctx)
+}
+
+// pauseLocked consumes mu; no lock is held while joining the network owner.
+func (s *usageService) pauseLocked(ctx context.Context) error {
 	s.paused = true
+	s.resuming = false
 	s.generation++
 	c, done := s.conn, s.connDone
 	if c != nil {
@@ -308,13 +334,29 @@ func (s *usageService) pause(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
-func (s *usageService) resume(newHost bool) {
+func (s *usageService) resume(newHost bool) (needsRollback bool, generation uint64) {
 	s.mu.Lock()
+	// A retry owns its own rollback boundary even without an intervening
+	// pause. An older failed ACK/thaw must not close a newer admitted gate.
+	s.generation++
+	// A retry inherits an uncommitted reopening, not the already-live state
+	// of an ordinary MUX reconnect. If both attempts fail, admission closes.
+	needsRollback, generation = s.paused || s.resuming, s.generation
+	s.resuming = needsRollback
 	if newHost {
 		s.epoch = ""
 		s.lastRequest = 0
 	}
 	s.paused = false
+	s.mu.Unlock()
+	return needsRollback, generation
+}
+
+func (s *usageService) commitResume(generation uint64) {
+	s.mu.Lock()
+	if s.generation == generation {
+		s.resuming = false
+	}
 	s.mu.Unlock()
 }
 func (s *usageService) close() {

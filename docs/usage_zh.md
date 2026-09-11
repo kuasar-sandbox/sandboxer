@@ -247,11 +247,17 @@ Sampler 初始化失败时报告既有的不可用/错误状态, 释放文件所
 checkpoint. 原有字节仍可离线读取, 新建文件可能保持为空. 该次尝试不暴露未初始化
 的 live/saved 视图, 也不写入新的 closed 记录.
 
-采样接入 Host 进程生命周期. Guest 请求只有在真正 launch/restore ready 后
-开放, ctl.sock 存在不算 Guest ready. 捕获前 Host 关闭 usage 准入并断开 Gauge
+采样接入 Host 进程生命周期. Host 只有在 launch/restore ready 后才开始 Guest
+round, ctl.sock 存在不算 Guest ready. 捕获前 Host 关闭 usage 准入并断开 Gauge
 连续性. Guest 作废旧代次并排空连接, 不无限等待阻塞文件系统读取; 原执行槽
-直到实际读取完成前一直 busy. Thaw/失败恢复重新开放准入, 内存恢复接受新 Host
-epoch. 不重建 worker 绕过阻塞槽的有界性.
+直到实际读取完成前一直 busy. Restore/attach 在发送 ACK 前重新开放原始 usage
+准入, 避免 Host 的立即首轮请求碰到尚未开放的 gate. True memory restore 在
+ACK 前仅重置一次旧 Host epoch/request ID; 同 VM attach 保留它们. 原始读取
+可早于应用 thaw, exec、plugin、app 和资源控制器 mem_report 准入仍等待 thaw
+成功. ACK/thaw 失败时关闭该次新开放的 usage 准入, 作废连接并有界 join; 普通
+MUX 重连不会因此暂停原本活动的 usage 流. 重试继承尚未完成的开放操作的收尾
+责任, 因此两次尝试都失败时仍关闭准入; 旧失败不会回滚已成功的重试或后继代次.
+不重建 worker 绕过阻塞槽的有界性.
 
 正常退出在有界预算内尽力最终观测和保存. Usage 失败不改变业务结果. Writer
 持有 pinned 文件/目录 FD, 迟到写入不能重建已删除目录, 也不能写到同名新实例.
@@ -271,7 +277,9 @@ timeout/busy. 不保证掉电下无损持久化, SIGKILL 测试不能证明掉�
 [guestlink](../pkg/guestlink) 和 [sandbox-init](../cmd/sandbox-init).
 组件自有 [usage E2E](../test/e2e/e2e_usage.sh) 由
 [run_all.sh](../test/e2e/run_all.sh) 发现, 必须使用真实 KVM, 并核验 Guest 内
-运行的 init 哈希与所提供的新 runtime bundle 一致. 短保存周期案例验证集成;
+运行的 init 哈希与所提供的新 runtime bundle 一致. 短保存周期案例验证集成.
+Restore/clone 检查采用一分钟采样周期, 要求第一次周期 tick 前已得到新的内存/
+文件系统观测, 不允许周期重试掩盖 ACK 后立即首轮漏采.
 独立的 `defaults` 案例等待实际默认五分钟保存. 两者都不是生产密度性能测量.
 
 [存储故障 E2E](../test/e2e/e2e_usage_faults.sh) 使用私有有界 tmpfs 产生真实

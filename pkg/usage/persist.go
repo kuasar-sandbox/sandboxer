@@ -69,6 +69,11 @@ func newManager(s Snapshot, recovered Recovery, w Writer, dirSync func() error) 
 // never recreates BaseDir. Removing/replacing the directory cannot redirect a
 // late writer into a new sandbox with the same pathname.
 func Open(baseDir, sandboxID, epoch string, start time.Time, sample, flush time.Duration) (*Manager, error) {
+	// The exported API must enforce the same domain as configuration and
+	// Gauge.Observe before opening files or constructing sampler tickers.
+	if sample <= 0 || sample > time.Duration(1<<62-1) || flush < sample {
+		return nil, errors.New("usage: invalid sample/flush intervals")
+	}
 	if sandboxID == "" || sandboxID == "." || sandboxID == ".." || strings.ContainsAny(sandboxID, "/\\\x00") {
 		return nil, errors.New("usage: invalid sandbox ID")
 	}
@@ -158,9 +163,17 @@ func (m *Manager) Gauge(name, source string, request uint64, at int64, value uin
 	if m.stopping {
 		return context.Canceled
 	}
+	if request == 0 {
+		return nil
+	}
 	for i := range m.live.Gauges {
 		if m.live.Gauges[i].Name == name {
 			g := &m.live.Gauges[i]
+			// Lifecycle statuses also belong to the ordered request stream.
+			// A late break must not discard a newer valid baseline.
+			if request <= g.LastRequest {
+				return nil
+			}
 			if status == Unsupported || status == Paused {
 				g.Break(status)
 				g.LastRequest = request

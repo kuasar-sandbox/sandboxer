@@ -1540,10 +1540,19 @@ Before freeze or restore, usage admission closes, generation advances and
 the old connection is shut down and joined with a bounded budget. Source
 slots are retained even if reads cannot be canceled. No captured worker holds
 a mutex while waiting for the old Host, and closing a network FD is not
-claimed to cancel statfs/proc. Successful thaw reopens admission; same-VM
-attach keeps the Host epoch, true restore clears the old epoch/ID boundary.
-Failed thaw keeps admission closed. This raw protocol neither changes
-business filesystem synchronization nor the existing resource controller.
+claimed to cancel statfs/proc. Restore/attach reopens raw usage admission
+before ACK, making the Host's immediate first round eligible even while app
+thaw is pending. Same-VM attach keeps the Host epoch; true restore clears
+the old epoch/ID boundary once, before ACK, never after accepting new IDs.
+Exec/plugin/app and resource-controller mem_report gates still reopen only
+after successful thaw. Failed ACK/thaw closes the usage gate it reopened
+and invalidates/joins its connection within a bounded budget; it neither
+stops an already-live usage stream on ordinary MUX reconnect nor rolls back
+a successful retry or later lifecycle generation. A retry inherits an
+unfinished reopening's rollback responsibility; if both attempts fail,
+admission still closes. Source slots survive this rollback. This raw
+protocol changes neither business filesystem synchronization nor the
+existing resource controller.
 
 <a id="5-应用契约"></a>
 
