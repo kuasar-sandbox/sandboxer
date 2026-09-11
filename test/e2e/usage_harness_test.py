@@ -132,14 +132,14 @@ class SourceFaultTests(unittest.TestCase):
         base_memory.update(integral_total_byte_ns="100", last_value_bytes="20")
         for index, row in enumerate(rows):
             row["live"]["gauges"][1].update(covered_total_ns="0", integral_total_byte_ns="100", last_value_bytes="20", status="missing" if index == 0 else "ok")
-        for gauge in rows[-1]["live"]["gauges"][4:]:
+        for gauge in rows[-1]["live"]["gauges"][2:]:
             gauge.update(covered_total_ns="40000000000", last_request_id="41")
         usage_sources.validate_wire_progress(baseline, rows)
         changed = copy.deepcopy(rows)
         changed[1]["live"]["gauges"][1]["covered_total_ns"] = "1"
         with self.assertRaises(AssertionError):
             usage_sources.validate_wire_progress(baseline, changed)
-        for index in range(4, 8):
+        for index in range(2, 8):
             changed = copy.deepcopy(rows)
             changed[-1]["live"]["gauges"][index]["covered_total_ns"] = "0"
             with self.assertRaises(AssertionError):
@@ -173,6 +173,23 @@ class SourceFaultTests(unittest.TestCase):
             changed[0]["live"]["gauges"][index]["status"] = "ok"
             with self.assertRaises(AssertionError):
                 usage_sources.validate_wire_views(changed, requests)
+        for index, disk in ((1, "root"), (3, "disk-1")):
+            for status in ("timeout", "unsupported", "busy"):
+                changed = copy.deepcopy(values[-1:])
+                changed[0]["live"]["gauges"][index]["status"] = status
+                bad_requests = copy.deepcopy(requests)
+                next(fs for fs in bad_requests[1]["response"]["usage_response"]["filesystems"]
+                     if fs["disk"] == disk)["status"] = status
+                with self.assertRaises(AssertionError):
+                    usage_sources.validate_wire_views(changed, bad_requests)
+            changed = copy.deepcopy(values[-1:])
+            for gauge in changed[0]["live"]["gauges"]:
+                if gauge["name"] != f"filesystem.{disk}":
+                    gauge["last_request_id"] = "7"
+            newer = copy.deepcopy(requests[1])
+            newer["request"]["request_id"] = "7"
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_wire_views(changed, requests+[newer])
         busy_tick = copy.deepcopy(values[0])
         for gauge in busy_tick["live"]["gauges"]:
             gauge["last_request_id"] = "3"

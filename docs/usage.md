@@ -450,6 +450,9 @@ read or Guest admission slot exits. New-connection recovery is checked separatel
 Live-query evidence
 retains changes to every metric's request ID and compares each metric with
 its own raw request; it does not assume atomic publication of a whole round.
+The uninjected root/second filesystem must independently return healthy raw
+data and advance its own request identity and covered time; agreement between
+two failed statuses or retention of an old successful value cannot pass.
 The `restore` case keeps one occupied filesystem slot across same-process
 quiesce/thaw and then lazy memory restore with the same SandboxID/usage file.
 A bounded, test-only tracer owner joins the disposable Guest's root cgroup

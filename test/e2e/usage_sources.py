@@ -280,6 +280,16 @@ def validate_wire_progress(baseline, observed):
         after = metric(observed[-1]["live"], "gauges", name)
         assert int(after["covered_total_ns"]) - int(before["covered_total_ns"]) >= 40_000_000_000, name
         assert int(after["last_request_id"]) - int(before["last_request_id"]) >= 40, name
+    for name in ("filesystem.root", "filesystem.disk-1"):
+        before = metric(baseline["live"], "gauges", name)
+        after = metric(observed[-1]["live"], "gauges", name)
+        # Deliberate whole-response faults remove both the failed interval
+        # and the first recovery interval. Healthy FS must still accumulate
+        # substantial real coverage and reach recent requests, not freeze at
+        # an old OK value that happened to match an earlier raw frame.
+        assert after["status"] == "ok", name
+        assert int(after["covered_total_ns"]) - int(before["covered_total_ns"]) >= 20_000_000_000, name
+        assert int(after["last_request_id"]) - int(before["last_request_id"]) >= 40, name
 
 
 def wait_observer_ready(observer, path):
@@ -302,10 +312,18 @@ def wire_view_key(view):
 
 def validate_wire_views(values, requests):
     by_id = {int(row["request"]["request_id"]): row for row in requests}
+    for row in requests:
+        response = row.get("response", {})
+        if response.get("type") == "usage_response":
+            for disk in ("root", "disk-1"):
+                fs = next(fs for fs in response["usage_response"]["filesystems"] if fs["disk"] == disk)
+                assert fs["status"] == "ok", (disk, row["request"], fs)
     for view in values:
+        memory_id = int(metric(view["live"], "gauges", "guest.memory")["last_request_id"])
         for name in ("guest.memory", "filesystem.root", "filesystem.disk-0", "filesystem.disk-1"):
             gauge = metric(view["live"], "gauges", name)
             request = int(gauge["last_request_id"])
+            assert 0 <= memory_id - request <= 1, (name, memory_id, request, "stale publication")
             row = by_id.get(request)
             # An occupied Host slot can reject a tick without sending a new
             # request. Faulted frames also produce missing, never a new value.

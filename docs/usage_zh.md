@@ -352,6 +352,8 @@ API 锁控制事务. 选择时要求 target 低于先前真实 target, 暂扣的
 起点验证读取 deadline. 原 Host 读取或 Guest 准入槽退出期间, 中间一个 tick
 可以按设计继续缺测; 新连接恢复另行验证. Live 查询证据保留每项指标 request ID 的变化,
 并分别对应各自的原始请求, 不假定整轮归并为原子发布.
+未注入故障的 root/第二文件系统必须独立返回正常原始数据, 且各自的 request
+身份和覆盖时间继续推进; 两端同为失败或保留旧成功值都不能通过.
 `restore` 案例让同一个已占用文件系统槽跨同进程 quiesce/thaw, 再以相同
 SandboxID/usage 文件执行 lazy 内存恢复. 有界的测试专用 tracer owner 在
 启动 `strace` 前仅将自己加入可丢弃 Guest 的 root cgroup; 不移动 PID 1、
