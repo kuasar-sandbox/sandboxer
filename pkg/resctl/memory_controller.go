@@ -914,8 +914,11 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 		}
 		// CH and memory.high mutations are complete. Keep controlMu as the
 		// transaction serializer, but do not make a node-only reservation RPC
-		// part of the snapshot mutation barrier.
-		release()
+		// part of the snapshot mutation barrier. Static settlement mutates local
+		// state read by CaptureState, so it remains under the barrier.
+		if m.reservation != nil && m.reservation.Enabled() {
+			release()
+		}
 		_, newReservation, _, err := m.requestReservation(budget, 0, resource.UrgencyLow, "shrink_commit")
 		if err != nil {
 			return err

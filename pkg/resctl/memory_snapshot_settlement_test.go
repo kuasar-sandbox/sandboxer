@@ -106,6 +106,80 @@ func TestMemoryProgressNodeCommitDoesNotBlockBeginSnapshot(t *testing.T) {
 	}
 }
 
+func TestMemoryProgressStaticCommitSynchronizesSnapshotCapture(t *testing.T) {
+	const capacity = uint64(1 << 30)
+	cgroup := newMemoryCgroup(t, "max", "1")
+	fakeCH := newFakeCHMemory(t, capacity)
+	fakeCH.configure(func(f *fakeCHMemory) {
+		f.acceptedTarget, f.currentBudget = 320<<20, 705<<20
+	})
+	initial := &fakeReservationAdapter{current: 768 << 20}
+	m := newProgressController(t, fakeCH, cgroup, initial)
+	// A nil adapter selects the production static-reservation path. The initial
+	// baseline was copied into staticReservation by NewMemoryController.
+	m.reservation = nil
+
+	report := proto.MemReport{Epoch: 1, Seq: 1, MemTotalBytes: capacity, MemAvailableBytes: 449 << 20}
+	if !m.SubmitGuestReport(report) {
+		t.Fatal("fresh report rejected")
+	}
+	report = <-m.reportEvents
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	processed := make(chan error, 1)
+	joined := false
+	defer func() {
+		cancel()
+		if !joined {
+			select {
+			case <-processed:
+			case <-time.After(5 * time.Second):
+				t.Error("static report worker did not exit after cleanup")
+			}
+		}
+	}()
+	go func() {
+		m.controlMu.Lock()
+		defer m.controlMu.Unlock()
+		processed <- m.processReportLocked(ctx, report)
+	}()
+
+	for {
+		release, err := m.BeginSnapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state, captureErr := m.CaptureState(ctx)
+		release()
+		if captureErr != nil {
+			t.Fatal(captureErr)
+		}
+		if state.Reservation != 768<<20 && state.Reservation != 705<<20 {
+			t.Fatalf("snapshot captured invalid reservation=%d", state.Reservation)
+		}
+		select {
+		case err := <-processed:
+			joined = true
+			if err != nil {
+				t.Fatal(err)
+			}
+			finalRelease, err := m.BeginSnapshot(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			final, captureErr := m.CaptureState(ctx)
+			finalRelease()
+			if captureErr != nil {
+				t.Fatal(captureErr)
+			}
+			if final.Reservation != 705<<20 {
+				t.Fatalf("snapshot reservation=%d after static settlement, want %d", final.Reservation, 705<<20)
+			}
+			return
+		default:
+		}
+	}
+}
+
 func TestMemorySettlementReboundRepairsHighBeforeFailedRetry(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	cgroup := newMemoryCgroup(t, "max", "1")
