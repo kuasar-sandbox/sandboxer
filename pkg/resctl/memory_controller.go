@@ -420,7 +420,7 @@ func (m *MemoryController) advanceNormalizationLocked(ctx context.Context) error
 			return err
 		}
 		release, err := m.balloon.acquireMutation(ctx)
-	if err != nil {
+		if err != nil {
 			return err
 		}
 		state, applyErr := m.balloon.applyDesiredHeld(ctx)
@@ -899,6 +899,10 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 		if m.shrinkReportSuperseded(txn.reportSeq) {
 			return nil
 		}
+		// CH and memory.high mutations are complete. Keep controlMu as the
+		// transaction serializer, but do not make a node-only reservation RPC
+		// part of the snapshot mutation barrier.
+		release()
 		_, newReservation, _, err := m.requestReservation(budget, 0, resource.UrgencyLow, "shrink_commit")
 		if err != nil {
 			return err
