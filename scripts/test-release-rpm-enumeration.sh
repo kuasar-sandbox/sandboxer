@@ -13,10 +13,7 @@ printf 'fixture native input\n' > "$TMP/input"
 printf 'fixture first notice\n' > "$TMP/NOTICE-sibling1"
 printf 'fixture second notice\n' > "$TMP/NOTICE-sibling2"
 dpkg-query() { return 1; }
-# File/source authentication has separate coverage. This fixture isolates the
-# real collector's enumeration control flow and actual file/source recording.
-release_native_verify_package_file() { :; }
-release_native_verify_license_file() { :; }
+# Isolate complete/partial RPM enumeration and actual source/notice collection.
 rpm() {
   case "$1" in
     -qf) printf 'fixture-owner\t1.0-1\tfixture-source-1.0-1.src.rpm\n' ;;
