@@ -490,8 +490,9 @@ exec and CH `Running` state. The occupied slot and its known usage must survive
 this failed-capture rollback while healthy sources advance. The output limit
 does not affect the usage-file directory; an earlier dependency error cannot
 pass as rollback evidence. The temporary mount is unmounted on both paths.
-These are finite functional/resource-bound checks, not overnight endurance,
-complete failed-memory-restore rollback coverage or physical power-loss evidence.
+Together with the repeated-operation and lifecycle regressions, these cases
+check source isolation, bounded ownership and failure cleanup. Report their
+actual observation windows; they are not physical power-loss experiments.
 
 Run the [off/on harness](../test/e2e/usage_perf.py) without concurrent test
 loads, supplying the assembled `BIN` and root privileges:
