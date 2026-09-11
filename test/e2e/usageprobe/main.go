@@ -59,7 +59,18 @@ func main() {
 			}
 		}
 		fmt.Println(n)
-	case "memory":
+	case "memory", "memory-wait":
+		if os.Args[1] == "memory-wait" {
+			// Pre-establish exec/MUX without allocating the pressure buffer.
+			watchdog := time.AfterFunc(30*time.Second, func() { os.Exit(2) })
+			fmt.Println("MEMORY-ARMED")
+			var start [1]byte
+			_, err := io.ReadFull(os.Stdin, start[:])
+			fail(err)
+			if !watchdog.Stop() || start[0] != 'G' {
+				panic("invalid or expired memory start")
+			}
+		}
 		b := make([]byte, number(os.Args[2])*1024*1024)
 		for i := range b {
 			b[i] = byte(i*17 + 1)

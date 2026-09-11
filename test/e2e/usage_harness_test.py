@@ -24,6 +24,7 @@ import usage_faults
 import usage_sources
 from usage_ch_relay import CHRelay
 from usage_vsock_relay import UsageRelay, exact, frame, line
+from usage_report_relay import ReportRelay
 
 
 class SourceFaultTests(unittest.TestCase):
@@ -516,7 +517,126 @@ class RestoreWrapperTests(unittest.TestCase):
             self.assertEqual((state / "config.json").read_text(), "do not edit")
 
 
+class ReportRelayTests(unittest.TestCase):
+    def wire(self, message):
+        body = json.dumps(message, separators=(",", ":")).encode()
+        return struct.pack("<I", len(body)) + body
+
+    def test_mux_stays_raw_and_only_new_successful_reports_advance_boundary(self):
+        owner = self
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.settimeout(2)
+                _, message = frame(self.request)
+                if message["type"] == "hello":
+                    self.request.sendall(b"opaque MUX start")
+                    owner.assertEqual(exact(self.request, 8), b"raw\0data")
+                    self.request.sendall(b"unchanged\0bytes")
+                else:
+                    kind = "error" if message.get("test_error") else "mem_report_ack"
+                    self.request.sendall(owner.wire({"type": kind}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reports.sock"
+            native = socketserver.UnixStreamServer(str(path)+".real", Handler)
+            thread = threading.Thread(target=native.serve_forever, kwargs={"poll_interval": .05})
+            thread.start()
+            relay = ReportRelay(path)
+
+            def exchange(message):
+                before = len(relay.requests)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.settimeout(2)
+                    client.connect(str(path))
+                    client.sendall(self.wire(message))
+                    response, _ = frame(client)
+                with relay.report_condition:
+                    self.assertTrue(relay.report_condition.wait_for(lambda: len(relay.requests) > before, timeout=2))
+                row = relay.requests[-1]
+                self.assertEqual(row["request_hex"], self.wire(message).hex())
+                self.assertEqual(row["response_hex"], response.hex())
+                self.assertGreaterEqual(row["ack_forwarded_ns"], row["received_ns"])
+                return row
+
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.settimeout(2)
+                    client.connect(str(path))
+                    client.sendall(self.wire({"type": "hello"}))
+                    self.assertEqual(exact(client, 16), b"opaque MUX start")
+                    client.sendall(b"raw\0data")
+                    self.assertEqual(exact(client, 15), b"unchanged\0bytes")
+                self.assertFalse(relay.requests)
+                message = {"type": "mem_report", "mem_report": {"epoch": 2, "seq": 1}}
+                first = exchange(message)
+                self.assertIs(relay.latest_report, first)
+                exchange(message)
+                self.assertIs(relay.latest_report, first)
+                exchange({"type": "mem_report", "test_error": True, "mem_report": {"epoch": 2, "seq": 2}})
+                self.assertIs(relay.latest_report, first)
+                exchange({"type": "mem_report", "mem_report": {"epoch": 1, "seq": 9}})
+                self.assertIs(relay.latest_report, first)
+                next_row = {"type": "mem_report", "mem_report": {"epoch": 2, "seq": 2}}
+                newer = exchange(next_row)
+                self.assertIs(relay.latest_report, newer)
+                with patch.object(relay.report_condition, "wait_for", return_value=False):
+                    with self.assertRaisesRegex(AssertionError, "no fresh"):
+                        relay.next_report()
+            finally:
+                relay.stop()
+                native.shutdown()
+                native.server_close()
+                thread.join(timeout=2)
+            self.assertFalse(relay.errors)
+
+
 class BalloonWitnessTests(unittest.TestCase):
+    def test_expired_delivery_does_not_start_prearmed_pressure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sb, relay, process = (unittest.mock.Mock() for _ in range(3))
+            sb.dir, sb.name, sb.runroot = Path(directory), "oom", Path(directory)
+            (sb.dir / "run.log").write_text("")
+            process.poll.return_value = None
+            relay.next_report.return_value = {"ack_forwarded_ns": 1}
+            baseline = {"config": {"balloon": {"size": 128}}, "memory_actual_size": 384}
+            def popen(*args, **kwargs):
+                kwargs["stdout"].write("MEMORY-ARMED\n")
+                kwargs["stdout"].flush()
+                return process
+            with patch.object(usage.subprocess, "Popen", side_effect=popen), \
+                 patch.object(usage, "oom_baseline", return_value=baseline), \
+                 patch.object(usage.time, "monotonic_ns", return_value=1_000_000_002):
+                with self.assertRaisesRegex(AssertionError, "expired"):
+                    usage.oom_pressure(sb, relay)
+            process.stdin.write.assert_not_called()
+            process.stdin.close.assert_called_once()
+            process.terminate.assert_called_once()
+            process.wait.assert_called_once_with(timeout=5)
+
+    def test_prearmed_pressure_is_reaped_if_report_boundary_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sb, relay, process = (unittest.mock.Mock() for _ in range(3))
+            sb.dir, sb.name, sb.runroot = Path(directory), "oom", Path(directory)
+            process.poll.return_value = None
+            process.wait.side_effect = [subprocess.TimeoutExpired("pressure", 5), 0]
+            original = RuntimeError("no report boundary")
+            relay.next_report.side_effect = original
+            def popen(*args, **kwargs):
+                kwargs["stdout"].write("MEMORY-ARMED\n")
+                kwargs["stdout"].flush()
+                return process
+            with patch.object(usage.subprocess, "Popen", side_effect=popen):
+                with self.assertRaises(RuntimeError) as caught:
+                    usage.oom_pressure(sb, relay)
+            self.assertIs(caught.exception, original)
+            process.stdin.write.assert_not_called()
+            process.stdin.close.assert_called_once()
+            process.terminate.assert_called_once()
+            process.kill.assert_called_once()
+            self.assertEqual(process.wait.call_count, 2)
+            self.assertEqual(json.loads((sb.dir / "ch-pressure.json").read_text()), [])
+
     def test_converged_baseline_without_control_log_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
             sb = unittest.mock.Mock()

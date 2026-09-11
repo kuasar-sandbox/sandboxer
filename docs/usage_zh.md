@@ -297,6 +297,14 @@ Restore/clone 检查采用一分钟采样周期, 要求第一次周期 tick 前�
 文件系统观测, 不允许周期重试掩盖 ACK 后立即首轮漏采.
 独立的 `defaults` 案例等待实际默认五分钟保存. 两者都不是生产密度性能测量.
 
+OOM 案例先建立 exec/MUX, 测试 probe 在分配压力内存前等待 stdin 的一个字节.
+有界的测试专用 LaunchPort 中继原样转发普通 hello/MUX 流及 report/ACK 帧.
+新 epoch/sequence 的 ACK 成功转发只提供报告交付边界, 不证明 Host 控制事务
+已完成. 测试要求真实 CH 收敛基线及新鲜交付边界, 然后才启动压力.
+只有在首次 target 变化之前 actual 增长, 且该区间没有已接受或结果不明的
+resize, 才计为自主 deflate. 重复报告、错误 ACK、过期边界及控制 resize 之后
+的 deflate 均不合格; 正常控制循环始终运行.
+
 [存储故障 E2E](../test/e2e/e2e_usage_faults.sh) 使用私有有界 tmpfs 产生真实
 ENOSPC, 并用限定 usage 路径的 `strace` 注入 Sync 失败和延迟写入; 还覆盖
 SIGKILL 与亚秒级 Guest 运行. 注入不作用于业务可写盘的同步操作, 也不模拟

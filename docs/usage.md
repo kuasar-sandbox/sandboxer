@@ -375,6 +375,17 @@ A separate `defaults` case waits
 for the actual default five-minute save. Neither is a production-density
 performance measurement.
 
+The OOM case pre-establishes an exec/MUX whose test probe waits for one stdin
+byte before allocating pressure memory. A bounded test-only LaunchPort relay
+forwards the ordinary hello/MUX stream and report/ACK frames unchanged. A new
+epoch/sequence with a successfully forwarded ACK supplies a report-delivery
+boundary, not proof that the Host control transaction has completed. The test
+requires a real converged CH baseline and a fresh boundary before starting
+pressure. Only actual growth before the first target change, with no accepted
+or ambiguous resize in that interval, qualifies as autonomous deflation.
+Duplicate reports, error ACKs, expired boundaries and later deflation after
+a control resize do not qualify; the normal control loop remains running.
+
 The [storage-fault E2E](../test/e2e/e2e_usage_faults.sh) uses a private bounded
 tmpfs for real ENOSPC and path-restricted `strace` injection for usage Sync
 failure and delayed writes. It also exercises SIGKILL and a sub-second Guest

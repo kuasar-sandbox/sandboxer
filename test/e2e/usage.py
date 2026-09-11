@@ -18,6 +18,8 @@ import tarfile
 import tempfile
 import time
 
+from usage_report_relay import ReportRelay
+
 REPO = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ["BIN"]).resolve()
 
@@ -236,6 +238,87 @@ def oom_baseline(sb, capacity):
         write_json(sb.dir / "ch-oom-baseline-probes.json", readings)
 
 
+def oom_pressure(sb, relay):
+    observations, pressure, failure = [], None, None
+    try:
+        with (sb.dir / "pressure.log").open("w") as pressure_log:
+            pressure = subprocess.Popen([
+                str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
+                "--path-id", "instance", "--run-root", str(sb.runroot), "--stdin",
+                "--", "/probe", "memory-wait", "440", "4"],
+                stdin=subprocess.PIPE, stdout=pressure_log, stderr=subprocess.STDOUT)
+            end = time.monotonic() + 5
+            while time.monotonic() < end:
+                assert pressure.poll() is None, "pressure probe exited before arming"
+                if "MEMORY-ARMED\n" in (sb.dir / "pressure.log").read_text():
+                    break
+                time.sleep(.01)
+            else:
+                raise AssertionError("pressure probe did not arm")
+            # Observe delivery of a new real report, not a periodic log or
+            # assumed completion of its asynchronous Host control transaction.
+            boundary = relay.next_report()
+            log_offset = (sb.dir / "run.log").stat().st_size
+            initial = oom_baseline(sb, 512*1024*1024)
+            write_json(sb.dir / "ch-oom-baseline.json", initial)
+            initial_target, initial_actual = initial["config"]["balloon"]["size"], initial["memory_actual_size"]
+            started = time.monotonic_ns()
+            assert 0 <= started - boundary["ack_forwarded_ns"] < 1_000_000_000, "report delivery window expired before pressure"
+            pressure.stdin.write(b"G")
+            pressure.stdin.flush()
+            write_json(sb.dir / "oom-start.json", {"report": boundary, "pressure_start_ns": started})
+            autonomous, end = False, time.monotonic() + 8
+            while time.monotonic() < end:
+                info = sb.ch_info()
+                observations.append({"at_monotonic_ns": time.monotonic_ns(),
+                                     "target": info["config"]["balloon"]["size"], "actual": info["memory_actual_size"]})
+                if not autonomous and autonomous_balloon_prefix(512*1024*1024, initial_target, initial_actual, observations):
+                    with (sb.dir / "run.log").open("rb") as log:
+                        log.seek(log_offset)
+                        segment = log.read().decode(errors="replace")
+                    (sb.dir / "autonomous-window.log").write_text(segment)
+                    # A later unchanged-target deflate after a control resize
+                    # cannot qualify: only the first target prefix is tested.
+                    assert "balloon: CH accepted target=" not in segment and "after lost/ambiguous resize" not in segment, segment
+                    autonomous = True
+                time.sleep(.02)
+            pressure.wait(timeout=10)
+            assert pressure.returncode == 0, "memory workload failed; see pressure.log"
+            assert "MEMORY-READY 461373440" in (sb.dir / "pressure.log").read_text()
+            assert autonomous, "no autonomous deflation before the first target change"
+            assert not relay.errors, relay.errors
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        errors = []
+        if pressure is not None:
+            try:
+                pressure.stdin.close()
+            except BaseException as error:
+                errors.append(error)
+            try:
+                if pressure.poll() is None:
+                    try:
+                        pressure.terminate()
+                    finally:
+                        try:
+                            pressure.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                pressure.kill()
+                            finally:
+                                pressure.wait(timeout=5)
+            except BaseException as error:
+                errors.append(error)
+        write_json(sb.dir / "ch-pressure.json", observations)
+        if errors:
+            if failure is None:
+                raise errors[0]
+            for error in errors:
+                print(f"usage OOM cleanup: {error}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", default="off,overlay,single,balloon,balloon-no-oom,oom,multidisk,restore,defaults")
@@ -304,8 +387,11 @@ def main():
                 config["boot"]["disks"].append({"name": f"data{ordinal}", "diff": f"file://{disk}"})
                 config["mounts"].append({"type": "disk", "source": f"data{ordinal}", "target": target})
             config["mounts"].append({"type": "empty", "target": "/data/cache"})
-        sb = Sandbox(work, name, config)
+        sb = Sandbox(work, name, config, ch_binary=Path(__file__).with_name("usage_oom_wrapper.py") if name == "oom" else None)
+        relay, failure = None, None
         try:
+            if name == "oom":
+                relay = ReportRelay(sb.runroot / "instance/vsock.sock.oom_5000")
             sb.ready()
             inspect = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
             write_json(sb.dir / "guest.json", inspect)
@@ -350,49 +436,7 @@ def main():
                     assert initial["config"]["balloon"]["size"] > 0 and initial["memory_actual_size"] < 512*1024*1024, "no actual balloon inflation observed"
                     assert initial["config"]["balloon"]["deflate_on_oom"] == (name != "balloon-no-oom")
                 if name == "oom":
-                    initial = oom_baseline(sb, 512*1024*1024)
-                    write_json(sb.dir / "ch-oom-baseline.json", initial)
-                    assert initial["memory_actual_size"] == 512*1024*1024-initial["config"]["balloon"]["size"], "OOM baseline is not converged"
-                    initial_target = initial["config"]["balloon"]["size"]
-                    initial_actual = initial["memory_actual_size"]
-                    log_offset = (sb.dir / "run.log").stat().st_size
-                    autonomous = False
-                    pressure_log = (sb.dir / "pressure.log").open("w")
-                    pressure = subprocess.Popen([
-                        str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", name,
-                        "--path-id", "instance", "--run-root", str(sb.runroot),
-                        "--", "/probe", "memory", "440", "4"],
-                        stdout=pressure_log, stderr=subprocess.STDOUT)
-                    observations = []
-                    try:
-                        end = time.monotonic() + 8
-                        while time.monotonic() < end:
-                            info = sb.ch_info()
-                            observations.append({"at_monotonic_ns": time.monotonic_ns(),
-                                                 "target": info["config"]["balloon"]["size"],
-                                                 "actual": info["memory_actual_size"]})
-                            if not autonomous and autonomous_balloon_prefix(512*1024*1024, initial_target, initial_actual, observations):
-                                with (sb.dir / "run.log").open("rb") as log:
-                                    log.seek(log_offset)
-                                    segment = log.read().decode(errors="replace")
-                                (sb.dir / "autonomous-window.log").write_text(segment)
-                                # No accepted resize may explain this increase.
-                                assert "balloon: CH accepted target=" not in segment and "after lost/ambiguous resize" not in segment, segment
-                                autonomous = True
-                            time.sleep(.02)
-                        pressure.wait(timeout=10)
-                        assert pressure.returncode == 0, "memory workload failed; see pressure.log"
-                    finally:
-                        if pressure.poll() is None:
-                            pressure.terminate()
-                            pressure.wait(timeout=5)
-                        pressure_log.close()
-                        write_json(sb.dir / "ch-pressure.json", observations)
-                    # These are real CH readings, not usage's sampled sequence.
-                    # Only the first unchanged-target segment after a proven
-                    # converged baseline qualifies. A later ordinary shrink
-                    # also has actual > Capacity-target and must not pass.
-                    assert autonomous, "no autonomous deflation before the first target change"
+                    oom_pressure(sb, relay)
                     time.sleep(2)
                     pressure_view = sb.view()
                     write_json(sb.dir / "after-pressure.json", pressure_view)
@@ -408,8 +452,29 @@ def main():
                     time.sleep(2)
                     write_json(sb.dir / "resumed.json", sb.view())
             results.append({"case": name, "passed": True})
+        except BaseException as error:
+            failure = error
+            raise
         finally:
-            sb.stop()
+            try:
+                try:
+                    sb.stop()
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+                        raise
+                    print(f"usage sandbox cleanup: {error}", file=sys.stderr)
+            finally:
+                if relay is not None:
+                    try:
+                        try:
+                            relay.stop()
+                        finally:
+                            write_json(sb.dir / "reports.json", {"requests": relay.requests, "errors": relay.errors})
+                    except BaseException as error:
+                        if failure is None:
+                            raise
+                        print(f"usage report relay cleanup: {error}", file=sys.stderr)
         if name != "off":
             saved = sb.view()
             write_json(sb.dir / "stopped.json", saved)
