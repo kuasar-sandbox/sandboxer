@@ -68,6 +68,7 @@ make cloud-hypervisor TARGET_ARCH=aarch64
 发布者在 Tag/Release 写入前把选定项目 SHA 传入验证器,采用 bundle 中
 `release-notes.md` 正文,追加既有来源/Preview 标记。可信源码选择、构建/发布
 权限分离及拒绝替换已发布资产的要求保持不变。
+生产者提供的说明不得夹带发布者专属的来源/Preview 标记。
 
 组件包包含 `sandbox-ctl`、`sandbox-init` 和 `cloud-hypervisor`。使用已有的
 `RELEASE_*_SOURCE_DIR`、`RELEASE_*_SOURCE_SHA` 与 `RELEASE_*_VERSION`
