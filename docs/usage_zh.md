@@ -46,10 +46,11 @@ sandbox-ctl usage --sandbox-id s1 --history --limit 10 --cursor 0
 
 View 包含 `enabled`, 可选的 `live`/`saved`, `saved_end`, `saving`,
 `unknown_tail` 和可选 `save_error`/`read_error`. 在线 `saved` 是 owner 已采用
-的基线: 启动时恢复的完整存活记录, 或该 owner 后续已确认保存的记录. 本进程
-新写入的 CRC 可读不能单独推进基线. 离线 `saved` 是恢复校验通过的最后一条
-完整存活记录, 不证明原 writer 已确认 Sync. `live` 包含已经接收但仍在保存或尚未提交的输入,
-崩溃后可以回退到存活的 saved. 缺测、未持久化和文件尾部不确定是不同状态.
+的基线: 启动时恢复的完整存活记录, 或该 owner 后续已确认完整追加的记录.
+在途写入的 CRC 可读不能单独推进基线. 离线 `saved` 是恢复校验通过的最后一条
+完整存活记录, 不证明原 writer 已确认追加. 两种视图都不保证宿主崩溃或掉电后
+仍存活, 写回边界见第 6 节. `live` 包含已经接收但仍在保存或尚未提交的输入,
+崩溃后可以回退到存活的 saved. 缺测、未保存输入和文件尾部不确定是不同状态.
 
 Live 状态可在逐项指标归并之间复制, 不是整轮观测的原子发布. 应分别读取
 各 Gauge 的 `last_request_id`、状态和位置; 内存可能已反映恢复后的请求,
@@ -74,6 +75,7 @@ usage:
 且两倍 sample interval 必须可由受支持的有符号 duration 表示. 未知 key、
 重复 key 和错误 scalar 类型报错. 配置文件按顺序覆盖, 省略的 usage 成员保留
 前值, 显式 false 关闭采样.
+`flush_interval` 调度记录追加, 不表示文件系统同步或设备缓存刷盘.
 
 Usage 在普通 cold、`run --from` 和 `run --restore` 中都是 host policy,
 不进入 `PortableSandboxConfig`、E 或 S. 恢复后使用当前 host policy, 不继承
@@ -230,10 +232,16 @@ F = immutable record currently being saved/reconciled
 A = active observations merged while F is in flight
 ```
 
-Live 累计包含 F/A. 成功只把 S 推进到 F. 追加失败后, 只有 truncate-to-S 加
-Sync 确定回退, 才能把区间统计并回 A. Write/Sync/truncate 结果不确定时保留
-F 原身份及内容, 先处理尾部. CRC 可读不是当前进程的 Sync 确认; 新进程采用
-完整存活记录是另一种情形.
+Live 累计包含 F/A. `WriteAt` 完整写入且没有错误时, 只把 S 推进到 F.
+追加失败或短写后, 只有 truncate-to-S 成功确定逻辑回退, 才能把区间统计并回 A.
+截断失败保留 F 原身份及内容, 在下次追加前先处理尾部. CRC 可读不能推翻
+当前 writer 的追加失败或未完成状态; 新进程采用完整存活记录是另一种情形.
+
+Usage 不执行显式文件、目录或文件系统同步: 不调用 `fsync`、`fdatasync`、
+`syncfs`、`sync`, 不强制范围写回, 不使用同步打开标志. 此规则覆盖创建、
+周期保存、回退、恢复和正常退出. 写回由操作系统及底层存储决定.
+`saved` 仅表示逻辑追加完成, 不表示稳定存储持久化. 宿主崩溃或掉电可能丢失
+已经确认的记录甚至整个文件, 也可能留下损坏; 恢复只能使用实际存活的有效字节.
 
 每个 frame 的 16-byte header 依次为 `KUUSAGE1`, little-endian uint16
 format/algorithm version (均为 1), uint32 frame 总长度. Payload 用显式
@@ -291,7 +299,8 @@ discard、drop_caches 或懒加载操作.
 异常退出可丢失未保存尾部. 五分钟是正常保存周期, 不是持续故障或存储卡住时的
 无条件损失上限. Writer 只有一个执行槽, 不排队积累五分钟批次. Guest 慢盘
 同样每来源只有一个槽, 内存及健康文件系统已完成的新值仍可报告, 阻塞项报告
-timeout/busy. 不保证掉电下无损持久化, SIGKILL 测试不能证明掉电语义.
+timeout/busy. 成功保存同样不提供宿主崩溃或掉电持久化保证, 具体见第 6 节.
+SIGKILL 测试覆盖进程终止, 不模拟物理掉电.
 
 ## 8. 性能与验证
 
@@ -317,7 +326,7 @@ resize, 才计为自主 deflate. 重复报告、错误 ACK、过期边界及控�
 也不是 Guest 调度延迟的测量.
 
 [存储故障 E2E](../test/e2e/e2e_usage_faults.sh) 使用私有有界 tmpfs 产生真实
-ENOSPC, 并用限定 usage 路径的 `strace` 注入 Sync 失败和延迟写入; 还覆盖
+ENOSPC, 并用限定 usage 路径的 `strace` 注入写入 EIO 和延迟写入; 还覆盖
 SIGKILL 与亚秒级 Guest 运行. 注入不作用于业务可写盘的同步操作, 也不模拟
 物理掉电. Host 强杀案例在崩溃前固定并验证自己的 CH 子进程, 然后通过
 pidfd 确认该子进程在有界清理预算内退出, 不把清理留给 runner.

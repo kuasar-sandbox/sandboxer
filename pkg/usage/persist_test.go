@@ -15,11 +15,11 @@ import (
 )
 
 type faultWriter struct {
-	mu                             sync.Mutex
-	data                           []byte
-	writeErr, syncErr, truncateErr error
-	partial                        int
-	entered, release               chan struct{}
+	mu                    sync.Mutex
+	data                  []byte
+	writeErr, truncateErr error
+	partial               int
+	entered, release      chan struct{}
 }
 
 func (f *faultWriter) WriteAt(b []byte, offset int64) (int, error) {
@@ -40,7 +40,6 @@ func (f *faultWriter) WriteAt(b []byte, offset int64) (int, error) {
 	copy(f.data[int(offset):], b[:n])
 	return n, f.writeErr
 }
-func (f *faultWriter) Sync() error { f.mu.Lock(); defer f.mu.Unlock(); return f.syncErr }
 func (f *faultWriter) Truncate(n int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -55,7 +54,7 @@ func testManager(w Writer) *Manager {
 	s := sampleRecord().Snapshot
 	s.Counters = nil
 	s.Gauges = nil
-	return newManager(s, Recovery{}, w, nil)
+	return newManager(s, Recovery{}, w)
 }
 func awaitSave(t *testing.T, m *Manager) {
 	t.Helper()
@@ -90,7 +89,7 @@ func TestSaveConcurrentActiveAndFrozen(t *testing.T) {
 }
 
 func TestSaveRollbackAndUncertainTail(t *testing.T) {
-	for _, mode := range []string{"partial", "enospc", "sync", "truncate"} {
+	for _, mode := range []string{"partial", "enospc", "write-error", "truncate"} {
 		t.Run(mode, func(t *testing.T) {
 			w := &faultWriter{}
 			switch mode {
@@ -98,8 +97,10 @@ func TestSaveRollbackAndUncertainTail(t *testing.T) {
 				w.partial = 25
 			case "enospc":
 				w.partial, w.writeErr = 25, syscall.ENOSPC
-			case "sync":
-				w.syncErr = syscall.EIO
+			case "write-error":
+				// Even a complete readable frame must not advance S when
+				// WriteAt reports an error alongside its byte count.
+				w.writeErr = syscall.EIO
 			case "truncate":
 				w.writeErr, w.truncateErr = syscall.ENOSPC, syscall.EIO
 			}
@@ -112,7 +113,7 @@ func TestSaveRollbackAndUncertainTail(t *testing.T) {
 			if v.Saved != nil || v.SaveError == "" || v.Live.Gauges[0].Window.Peak != 90 {
 				t.Fatalf("%+v", v)
 			}
-			uncertain := mode == "sync" || mode == "truncate"
+			uncertain := mode == "truncate"
 			if v.UnknownTail != uncertain || (m.pending != nil) != uncertain {
 				t.Fatalf("unknown=%v pending=%v", v.UnknownTail, m.pending)
 			}
@@ -122,7 +123,7 @@ func TestSaveRollbackAndUncertainTail(t *testing.T) {
 				t.Fatal("changed F content")
 			}
 			w.mu.Lock()
-			w.partial, w.writeErr, w.syncErr, w.truncateErr = 0, nil, nil, nil
+			w.partial, w.writeErr, w.truncateErr = 0, nil, nil
 			w.mu.Unlock()
 			m.Save(time.Now())
 			awaitSave(t, m)
@@ -141,6 +142,78 @@ func TestSaveRollbackAndUncertainTail(t *testing.T) {
 				t.Fatalf("duplicate write: %d %v", len(records), err)
 			}
 		})
+	}
+}
+
+func TestBufferedFileSaveReopenAndTailRepair(t *testing.T) {
+	base := t.TempDir()
+	path := filepath.Join(base, "test.usage")
+	start := time.Now()
+	m, err := Open(base, "test", "first", start, time.Second, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.closeFiles)
+	if err := m.Gauge("ram", "memory", 1, 0, 10, OK, 0); err != nil {
+		t.Fatal(err)
+	}
+	m.Save(start)
+	awaitSave(t, m)
+	first := m.View()
+	if first.Saved == nil || first.SaveError != "" || first.Saved.Sequence != 1 {
+		t.Fatalf("complete buffered append was not adopted: %+v", first)
+	}
+	// Release the owner without a final save. This is a same-host restart,
+	// not a claim that buffered bytes survive a host crash or power loss.
+	m.closeFiles()
+	partial := *first.Saved
+	partial.Sequence++
+	frame, err := EncodeRecord(partial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := f.WriteAt(frame[:len(frame)/2], first.SavedEnd)
+	closeErr := f.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatalf("partial tail setup: %v, %v", writeErr, closeErr)
+	}
+	m, err = Open(base, "test", "second", start.Add(time.Second), time.Second, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.closeFiles)
+	if v := m.View(); !v.UnknownTail || !reflect.DeepEqual(v.Saved, first.Saved) || v.SavedEnd != first.SavedEnd {
+		t.Fatalf("recovery changed the surviving baseline: %+v", v)
+	}
+	if err := m.Gauge("ram", "memory", 1, 0, 20, OK, 0); err != nil {
+		t.Fatal(err)
+	}
+	m.Save(start.Add(2 * time.Second))
+	awaitSave(t, m)
+	if v := m.View(); v.UnknownTail || v.SaveError != "" || v.Saved.Sequence != 2 || v.Saved.Snapshot.RunEpoch != "second" {
+		t.Fatalf("truncate/reappend failed: %+v", v)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	m.Close(ctx, start.Add(3*time.Second))
+	v := m.View()
+	if v.Saved.Sequence != 3 || !v.Saved.Snapshot.Closed || v.SaveError != "" {
+		t.Fatalf("buffered close did not seal the current run: %+v", v)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, end, err := ReadHistory(bytes.NewReader(data), int64(len(data)), 0, 10, "test")
+	if err != nil || len(records) != 3 || end != v.SavedEnd {
+		t.Fatalf("repaired history: %d records, end=%d, err=%v", len(records), end, err)
+	}
+	if records[1].Snapshot.Gauges[0].IntegralTotal != (Uint128{}) || records[1].Snapshot.Gauges[0].Window.Peak != 20 {
+		t.Fatal("restart integrated across epochs or reused the previous peak")
 	}
 }
 

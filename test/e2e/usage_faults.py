@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Faults affect only disposable test VMs and their usage files.
 
-ENOSPC is real bounded tmpfs exhaustion. Sync failure and blocked writes are
+ENOSPC is real bounded tmpfs exhaustion. Write errors and blocked writes are
 explicit syscall injection, not hardware failure or a power-loss experiment.
 """
 import argparse
@@ -72,11 +72,11 @@ def collect_and_unmount(mount, sb):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cases", default="enospc,sync,writer,kill,short")
+    parser.add_argument("--cases", default="enospc,write-error,writer,kill,short")
     args = parser.parse_args()
     assert os.geteuid() == 0
     cases = args.cases.split(",")
-    assert set(cases) <= {"enospc", "sync", "writer", "kill", "short"}
+    assert set(cases) <= {"enospc", "write-error", "writer", "kill", "short"}
     work = Path(tempfile.mkdtemp(prefix="e2e-usage-faults-"))
     print(f"usage fault evidence: {work}", flush=True)
     if os.environ.get("KUASAR_CI_DIR"):
@@ -148,8 +148,8 @@ def main():
                         except OSError as error:
                             assert error.errno == errno.ENOSPC
                             break
-            elif name == "sync":
-                injection = inject(sb, "fsync", "error=EIO")
+            elif name == "write-error":
+                injection = inject(sb, "pwrite64", "error=EIO")
             elif name == "writer":
                 injection = inject(sb, "pwrite64", "delay_enter=15000000:when=1")
             elif name == "kill":

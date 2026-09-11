@@ -1029,7 +1029,7 @@ class CleanupTests(unittest.TestCase):
         with patch.object(usage_faults.Path, "open", return_value=log), \
              patch.object(usage_faults.subprocess, "Popen", side_effect=OSError("spawn failed")):
             with self.assertRaisesRegex(OSError, "spawn failed"):
-                usage_faults.inject(sb, "fsync", "error=EIO")
+                usage_faults.inject(sb, "pwrite64", "error=EIO")
         self.assertTrue(log.closed)
 
     def test_evidence_copy_failure_does_not_skip_unmount(self):

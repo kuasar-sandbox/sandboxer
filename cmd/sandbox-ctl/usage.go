@@ -109,8 +109,8 @@ func runUsage(args []string, out io.Writer) error {
 			return err
 		}
 		defer f.Close()
-		// A running writer's readable CRC is not proof that it has synced F.
-		// Such a query must use its ctl.sock confirmed S, never this recovery path.
+		// A readable CRC cannot certify that a running writer has accepted
+		// its append; it may still roll F back. Query its ctl.sock S instead.
 		if err := unix.Flock(int(f.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
 			return fmt.Errorf("usage file has a live writer; query ctl.sock: %w", err)
 		}

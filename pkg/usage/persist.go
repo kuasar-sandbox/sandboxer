@@ -14,16 +14,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Writer is the narrow, injectable persistence boundary. No operation is
-// assumed cancelable; a blocked call retains its one writer execution slot.
+// Writer is the narrow, injectable file boundary. Successful writes establish
+// logical saved state, not stable-storage durability; usage never forces
+// writeback. No operation is assumed cancelable, so a blocked call retains
+// its one writer execution slot.
 type Writer interface {
 	WriteAt([]byte, int64) (int, error)
 	Truncate(int64) error
-	Sync() error
 }
 
 // View distinguishes accepted live input, confirmed saved input and a write
-// whose rollback is not yet known. Queries do not schedule observation or I/O.
+// whose rollback is not yet known. Saved is not a power-loss guarantee.
+// Queries do not schedule observation or I/O.
 type View struct {
 	Enabled     bool      `json:"enabled"`
 	Live        *Snapshot `json:"live,omitempty"`
@@ -44,7 +46,6 @@ type Manager struct {
 	offset    int64
 	pending   *Record
 	writer    Writer
-	dirSync   func() error
 	reader    io.ReaderAt
 	busy      bool
 	unknown   bool
@@ -60,9 +61,9 @@ type Manager struct {
 	historyUnknown bool
 }
 
-func newManager(s Snapshot, recovered Recovery, w Writer, dirSync func() error) *Manager {
+func newManager(s Snapshot, recovered Recovery, w Writer) *Manager {
 	return &Manager{live: s, saved: recovered.Record, offset: recovered.End,
-		writer: w, dirSync: dirSync, unknown: recovered.IncompleteTail}
+		writer: w, unknown: recovered.IncompleteTail}
 }
 
 // Open pins both the directory and the file before asynchronous writes. It
@@ -124,7 +125,7 @@ func Open(baseDir, sandboxID, epoch string, start time.Time, sample, flush time.
 		closeFiles()
 		return nil, errors.New("usage: record too large for continued accumulation")
 	}
-	m := newManager(s, recovered, f, dir.Sync)
+	m := newManager(s, recovered, f)
 	m.reader, m.closeFn = f, closeFiles
 	m.runStart = start
 	// No startup checkpoint/WAL is part of this format. An existing file,
@@ -361,17 +362,10 @@ func (m *Manager) saveLocked(now time.Time) {
 	go m.write(frozen, offset, unknown, done)
 }
 
-func (m *Manager) rollback(offset int64) error {
-	if err := m.writer.Truncate(offset); err != nil {
-		return err
-	}
-	return m.writer.Sync()
-}
-
 func (m *Manager) write(frozen *Record, offset int64, unknown bool, done chan struct{}) {
 	encoded, err := EncodeRecord(*frozen)
 	if err == nil && unknown {
-		err = m.rollback(offset)
+		err = m.writer.Truncate(offset)
 	}
 	if err == nil {
 		var n int
@@ -379,16 +373,10 @@ func (m *Manager) write(frozen *Record, offset int64, unknown bool, done chan st
 		if err == nil && n != len(encoded) {
 			err = io.ErrShortWrite
 		}
-		if err == nil {
-			err = m.writer.Sync()
-		}
-		if err == nil && m.dirSync != nil {
-			err = m.dirSync()
-		}
 	}
 	rolledBack := false
 	if err != nil {
-		rolledBack = m.rollback(offset) == nil
+		rolledBack = m.writer.Truncate(offset) == nil
 	}
 	m.mu.Lock()
 	if err == nil {
@@ -397,7 +385,8 @@ func (m *Manager) write(frozen *Record, offset int64, unknown bool, done chan st
 	} else {
 		m.saveError, m.unknown = err.Error(), !rolledBack
 		if rolledBack {
-			// Only a synchronized rollback permits F to be merged into A.
+			// A successful truncate establishes logical rollback before F
+			// is merged into A. Neither append nor rollback forces writeback.
 			for i := range m.live.Gauges {
 				for _, g := range frozen.Snapshot.Gauges {
 					if g.Name == m.live.Gauges[i].Name {

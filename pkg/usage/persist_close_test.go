@@ -12,20 +12,20 @@ import (
 	"time"
 )
 
-// Fail the initial append's Sync and rollback Sync, then allow recovery of
-// exactly that uncertain F. The ordinary blocked WriteAt remains injectable.
+// Fail rollback of the initial append, then allow recovery of exactly that
+// uncertain F. The ordinary blocked/error WriteAt remains injectable.
 type closeRetryWriter struct {
 	faultWriter
-	syncFailures atomic.Int32
+	truncateFailures atomic.Int32
 }
 
-func (w *closeRetryWriter) Sync() error {
-	for remaining := w.syncFailures.Load(); remaining > 0; remaining = w.syncFailures.Load() {
-		if w.syncFailures.CompareAndSwap(remaining, remaining-1) {
+func (w *closeRetryWriter) Truncate(offset int64) error {
+	for remaining := w.truncateFailures.Load(); remaining > 0; remaining = w.truncateFailures.Load() {
+		if w.truncateFailures.CompareAndSwap(remaining, remaining-1) {
 			return syscall.EIO
 		}
 	}
-	return w.faultWriter.Sync()
+	return w.faultWriter.Truncate(offset)
 }
 
 func TestCloseFencesProducersBeforeSealing(t *testing.T) {
@@ -55,7 +55,7 @@ func TestCloseFencesProducersBeforeSealing(t *testing.T) {
 					epoch = r.Snapshot.RunEpoch
 				}
 				s.newRun(epoch, time.Now(), time.Second, time.Minute)
-				m = newManager(s, Recovery{Record: &r, End: int64(len(w.data))}, w, nil)
+				m = newManager(s, Recovery{Record: &r, End: int64(len(w.data))}, w)
 			}
 			var closed atomic.Int32
 			m.closeFn = func() { closed.Add(1) }
@@ -116,7 +116,8 @@ func TestCloseFencesProducersBeforeSealing(t *testing.T) {
 				if mode == "recovered-rollback" || mode == "recovered-same-epoch" {
 					w.writeErr = syscall.ENOSPC
 				} else if mode == "recovered-uncertain" {
-					w.syncFailures.Store(2)
+					w.writeErr = syscall.EIO
+					w.truncateFailures.Store(1)
 				}
 				w.mu.Unlock()
 				w.release <- struct{}{}
@@ -128,7 +129,7 @@ func TestCloseFencesProducersBeforeSealing(t *testing.T) {
 					t.Fatal("Close did not attempt its second save")
 				}
 				w.mu.Lock()
-				w.writeErr, w.syncErr = nil, nil
+				w.writeErr = nil
 				w.mu.Unlock()
 			}
 			release()

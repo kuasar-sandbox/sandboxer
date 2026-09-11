@@ -53,10 +53,11 @@ Ordinary ctl requests retain their existing framing and limits.
 The view contains `enabled`, optional `live` and `saved`, `saved_end`,
 `saving`, `unknown_tail`, and optional `save_error`/`read_error`. Online `saved`
 is the owner's adopted baseline: a complete surviving record recovered at
-startup, or a later save this owner has confirmed. A readable CRC from its
-new write cannot alone advance that baseline. Offline `saved` is the last
-complete surviving record validated by recovery, not proof that its former
-writer confirmed Sync. `live` includes
+startup, or a later complete append this owner has confirmed. A readable CRC
+from a pending write cannot alone advance that baseline. Offline `saved` is
+the last complete surviving record validated by recovery, not proof that its
+former writer confirmed the append. Neither view guarantees survival of host
+crash or power loss; the writeback boundary is defined in Section 6. `live` includes
 accepted input still in flight or not yet submitted for saving; it can roll
 back to surviving saved state after a crash. Missing observation, unsaved
 input and an uncertain file tail are different conditions.
@@ -88,6 +89,8 @@ The default is `enabled: false`, `sample_interval: 1s`,
 the supported signed duration range. Unknown keys, duplicate keys and wrong
 scalar types are errors. File overlays apply in order; omitted usage members
 retain the preceding value and explicit false disables sampling.
+`flush_interval` schedules record appends, not filesystem synchronization or
+device-cache flushing.
 
 Usage is host policy in ordinary cold start, `run --from`, and `run --restore`.
 It is excluded from `PortableSandboxConfig`, E and S. Current host policy,
@@ -281,12 +284,21 @@ F = immutable record currently being saved/reconciled
 A = active observations merged while F is in flight
 ```
 
-Live cumulative values include F and A. Success advances S only to F. A
-failed append can merge its interval statistics back into A only after
-truncate-to-S and Sync establish rollback. Uncertain write/Sync/truncate
-results retain F's exact identity/content and reconcile the tail first.
-A readable CRC is not the current process's Sync confirmation. A new process
-recovering a complete surviving record is a different situation.
+Live cumulative values include F and A. A complete `WriteAt` with no error
+advances S only to F. A failed or short append can merge its interval
+statistics back into A only after successful truncate-to-S establishes logical
+rollback. A failed truncate retains F's exact identity/content and reconciles
+the tail before the next append. A readable CRC cannot override the current
+writer's failed or unfinished append. A new process recovering a complete
+surviving record is a different situation.
+
+Usage performs no explicit file, directory or filesystem synchronization:
+no `fsync`, `fdatasync`, `syncfs`, `sync`, forced range writeback or synchronous
+open flags. This applies to creation, periodic saves, rollback, recovery and
+normal shutdown. The operating system and underlying storage govern writeback.
+`saved` means logical append completion, not stable-storage durability. Host
+crash or power loss may lose already acknowledged records or the file itself,
+or leave corruption; recovery can use only the valid bytes that survive.
 
 Each frame has an explicit 16-byte header: `KUUSAGE1`, little-endian uint16
 format and algorithm versions (both 1), and uint32 total frame length. The
@@ -367,8 +379,9 @@ cadence, not an unconditional loss bound under continuous faults or blocked
 storage. There is one writer slot and no queue of five-minute batches.
 Slow Guest filesystems likewise keep one slot per source: completed memory
 and healthy filesystems remain reportable while the blocked item reports
-timeout/busy. Lossless local persistence is not guaranteed across power loss;
-SIGKILL tests do not prove power-loss durability.
+timeout/busy. Successful saves also provide no host-crash or power-loss
+durability guarantee, as specified in Section 6. SIGKILL tests cover process
+termination, not physical power loss.
 
 ## 8. Performance and validation
 
@@ -401,8 +414,8 @@ Recorded start-byte write endpoints use the Host monotonic clock; they are
 not Guest allocation timestamps or a measurement of Guest scheduling latency.
 
 The [storage-fault E2E](../test/e2e/e2e_usage_faults.sh) uses a private bounded
-tmpfs for real ENOSPC and path-restricted `strace` injection for usage Sync
-failure and delayed writes. It also exercises SIGKILL and a sub-second Guest
+tmpfs for real ENOSPC and path-restricted `strace` injection for usage write
+EIO and delayed writes. It also exercises SIGKILL and a sub-second Guest
 run. Injection never targets the business writable disk's sync operations;
 these tests do not simulate physical power loss. The Host-kill case pins and
 verifies its CH child before the crash, then confirms that child's bounded
