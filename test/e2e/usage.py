@@ -216,6 +216,26 @@ def autonomous_balloon_prefix(capacity, target, actual, observations):
     return False
 
 
+def oom_baseline(sb, capacity):
+    # Control settlement logs are not periodic report boundaries. Require a
+    # real converged CH baseline; never mutate or pause the controller to get
+    # one. The pressure witness must still precede the first target change.
+    end, readings = time.monotonic() + 7, []
+    try:
+        while time.monotonic() < end:
+            info = sb.ch_info()
+            readings.append({"at_monotonic_ns": time.monotonic_ns(), "info": info})
+            balloon = info["config"].get("balloon")
+            assert balloon and balloon["deflate_on_oom"], "OOM case requires an enabled deflate-on-OOM device"
+            target, actual = balloon["size"], info["memory_actual_size"]
+            if 0 < target < capacity and actual == capacity-target:
+                return info
+            time.sleep(.02)
+        raise AssertionError("no converged CH OOM baseline within budget")
+    finally:
+        write_json(sb.dir / "ch-oom-baseline-probes.json", readings)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", default="off,overlay,single,balloon,balloon-no-oom,oom,multidisk,restore,defaults")
@@ -330,20 +350,7 @@ def main():
                     assert initial["config"]["balloon"]["size"] > 0 and initial["memory_actual_size"] < 512*1024*1024, "no actual balloon inflation observed"
                     assert initial["config"]["balloon"]["deflate_on_oom"] == (name != "balloon-no-oom")
                 if name == "oom":
-                    # Begin just after an existing resource-control report to
-                    # leave time for allocation before the next five-second
-                    # control report. Do not disable or mutate that loop.
-                    report_offset = (sb.dir / "run.log").stat().st_size
-                    deadline = time.monotonic()+7
-                    while time.monotonic() < deadline:
-                        with (sb.dir / "run.log").open("rb") as log:
-                            log.seek(report_offset)
-                            if b"memory: shrink committed" in log.read():
-                                break
-                        time.sleep(.01)
-                    else:
-                        raise AssertionError("no stable control-report boundary")
-                    initial = sb.ch_info()
+                    initial = oom_baseline(sb, 512*1024*1024)
                     write_json(sb.dir / "ch-oom-baseline.json", initial)
                     assert initial["memory_actual_size"] == 512*1024*1024-initial["config"]["balloon"]["size"], "OOM baseline is not converged"
                     initial_target = initial["config"]["balloon"]["size"]

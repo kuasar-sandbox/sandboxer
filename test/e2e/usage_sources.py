@@ -133,7 +133,7 @@ def reap_source_process(process):
                 process.wait(timeout=5)
 
 
-def cleanup_sources(sb, trace=None, processes=(), relay=None, failure=None):
+def cleanup_sources(sb, trace=None, processes=(), relay=None, failure=None, owned_trace=False):
     # Fixed test-owned processes, not an unbounded cleanup queue. Preserve the
     # case's explicit failure; an unrelated enclosing except is not that failure.
     errors = []
@@ -144,6 +144,8 @@ def cleanup_sources(sb, trace=None, processes=(), relay=None, failure=None):
         except BaseException as error:
             errors.append(error)
 
+    if owned_trace and sb.process.poll() is None:
+        attempt(lambda: finish_owned_trace(sb))
     if trace is not None and trace.poll() is None:
         def detach():
             sb.cli("exec", "--", "/probe", "trace-stop")
@@ -444,6 +446,165 @@ def validate_ch_missing(samples, baseline):
         assert int(last["covered_total_ns"]) - int(first["covered_total_ns"]) >= 6_000_000_000, name
 
 
+def finish_owned_trace(sb):
+    sb.cli("exec", "--", "/probe", "trace-stop", timeout=3)
+    end = time.monotonic() + 5
+    while time.monotonic() < end:
+        state = json.loads(sb.cli("exec", "--", "/probe", "trace-state", timeout=2))
+        if state.get("usage-owned-done") == "detached":
+            return state
+        time.sleep(.1)
+    raise AssertionError("snapshot-owned Guest tracer did not detach")
+
+
+def validate_preserved_slot(baseline, view):
+    disk = metric(view["live"], "gauges", "filesystem.disk-0")
+    assert disk["status"] == "busy" and not disk["continuous"], "lifecycle replaced the occupied slot"
+    for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
+        assert disk[field] == baseline[field], "lifecycle filled or extended the blocked source"
+    for name in ("guest.memory", "filesystem.root", "filesystem.disk-1", "ch.rss_anon", "ch.rss_file", "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file"):
+        assert metric(view["live"], "gauges", name)["status"] == "ok", name
+
+
+def validate_old_epoch(requests, old_epoch, new_epoch):
+    faults = [row for row in requests if row["mode"] == "old-epoch"]
+    assert len(faults) == 1
+    fault = faults[0]
+    raw = fault["response"]["usage_response"]
+    forwarded = fault["forwarded"]["usage_response"]
+    assert old_epoch != new_epoch and raw["run_epoch"] == new_epoch
+    assert forwarded == {**raw, "run_epoch": old_epoch}, "fault changed more than the old run identity"
+    assert raw["request_id"] == fault["request"]["request_id"]
+    assert fault.get("sent_ns") and fault.get("client_closed_ns"), "Host did not reject the old-epoch connection"
+    later = [row for row in requests if int(row["request"]["request_id"]) > int(raw["request_id"])]
+    assert later and later[0]["connection"] != fault["connection"], "Host accepted the old epoch"
+    ids = [int(row["request"]["request_id"]) for row in requests]
+    assert all(b > a for a, b in zip(ids, ids[1:])), "restore reconnect reset request identity"
+    for row in requests:
+        assert row["request"]["run_epoch"] == new_epoch
+        if row.get("response", {}).get("type") == "usage_response":
+            response = row["response"]["usage_response"]
+            assert response["memory"]["status"] == "ok"
+            disk = next(fs for fs in response["filesystems"] if fs["disk"] == "disk-0")
+            assert disk["status"] == "busy", "restore or reconnect created a replacement worker"
+
+
+def restore_case(work, ref):
+    config = filesystem_config(work, "restore-source", ref)
+    sb = Sandbox(work, "restore-original", config, sandbox_id="restore-source")
+    child, relay, release, failure, launched = None, None, None, None, False
+    try:
+        sb.ready()
+        guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
+        write_json(sb.dir / "guest.json", guest)
+        assert guest["sandbox_init_sha256"] == digest(BIN / "sandbox-init")
+        assert guest["balloon_proc_field"] == "false" and "pagesets" in guest["zoneinfo"] and "count:" in guest["zoneinfo"]
+        sb.cli("exec", "--", "/probe", "write", "/data/payload", "8")
+        time.sleep(3)
+        # This bounded test owner alone joins the disposable Guest's root
+        # cgroup. Ordinary execs are correctly killed by quiesce; neither
+        # PID 1 nor application/exec-join processes are moved by this test.
+        launched = True
+        launch = json.loads(sb.cli("exec", "--", "/probe", "trace-launch", "/data", "80000"))
+        write_json(sb.dir / "trace-launch.json", launch)
+        time.sleep(3)
+        state = json.loads(sb.cli("exec", "--", "/probe", "trace-state"))
+        write_json(sb.dir / "trace-start.json", state)
+        owner_identity = state["usage-owned-ready.json"]
+        assert json.loads(state["usage-owned-ready.json"])["owner_pid"] == launch["owner_pid"]
+        assert "usage-owned-done" not in state
+        before = sb.view()
+        write_json(sb.dir / "before.json", before)
+        baseline = metric(before["live"], "gauges", "filesystem.disk-0")
+        validate_preserved_slot(baseline, before)
+        sb.cli("exec", "--", "/probe", "write", "/data/after-read", "8")
+        output = sb.dir / "snapshot"
+        output.mkdir()
+        capture = sb.cli("snapshot", "--output", output, "--resume", "--drop-caches=false", "--merge-ref=false", timeout=60)
+        (sb.dir / "snapshot.log").write_text(capture)
+        snapshot = output / "restore-source.snapshot"
+        snapshot_hash = digest(snapshot)
+        sb.cli("exec", "--", "/probe", "true")
+        time.sleep(3)
+        resumed = sb.view()
+        write_json(sb.dir / "resumed.json", resumed)
+        assert resumed["live"]["run_epoch"] == before["live"]["run_epoch"]
+        validate_preserved_slot(baseline, resumed)
+        write_json(sb.dir / "trace-done.json", finish_owned_trace(sb))
+        sb.stop()
+        parent = sb.view()
+        write_json(sb.dir / "stopped.json", parent)
+        old_epoch = parent["saved"]["snapshot"]["run_epoch"]
+        host = {"resources": config["resources"],
+                "boot": {"kernel": config["boot"]["kernel"], "runtime": config["boot"]["runtime"]},
+                "restore": {"prefetch": "off"}, "usage": config["usage"], "timeouts": {"restore": "30s"}}
+        child = Sandbox(work, "restore-child", host, restore=snapshot, sandbox_id=sb.name,
+                        base_root=sb.baseroot, ch_binary=Path(__file__).with_name("usage_vsock_wrapper.py"))
+        # CH restore reads the socket from private run-state config, not from
+        # --vsock. The wrapper relays that socket without editing the snapshot.
+        relay = UsageRelay(child.runroot / "instance/vsock.sock", old_epoch=old_epoch)
+        child.ready()
+        assert digest(snapshot) == snapshot_hash
+        restored_guest = json.loads(child.cli("exec", "--", "/probe", "inspect"))
+        write_json(child.dir / "guest.json", restored_guest)
+        assert restored_guest["sandbox_init_sha256"] == guest["sandbox_init_sha256"]
+        time.sleep(3)
+        state = json.loads(child.cli("exec", "--", "/probe", "trace-state"))
+        write_json(child.dir / "trace-restored.json", state)
+        assert state["usage-owned-ready.json"] == owner_identity
+        assert "usage-owned-done" not in state, "snapshot lost its blocked tracer"
+        restored = child.view()
+        write_json(child.dir / "restored.json", restored)
+        new_epoch = restored["live"]["run_epoch"]
+        assert new_epoch != old_epoch
+        validate_preserved_slot(metric(parent["saved"]["snapshot"], "gauges", "filesystem.disk-0"), restored)
+        with relay.lock:
+            requests = list(relay.requests)
+        validate_old_epoch(requests, old_epoch, new_epoch)
+        child.cli("exec", "--", "/probe", "write", "/data/after-restore", "8")
+        raw = json.loads(child.cli("exec", "--", "/probe", "statfs", "/data"))
+        write_json(child.dir / "current-statfs.json", raw)
+        expected = (raw["Blocks"] - raw["Bfree"]) * (raw["Frsize"] or raw["Bsize"])
+        baseline = metric(child.view()["live"], "gauges", "filesystem.disk-0")
+        assert baseline["status"] == "busy" and expected > int(baseline["last_value_bytes"])
+        start_id = last = int(baseline["last_request_id"])
+        with (child.dir / "release.log").open("w") as log:
+            release = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", child.name,
+                "--path-id", "instance", "--run-root", str(child.runroot), "--", "/probe", "trace-stop"],
+                stdout=log, stderr=subprocess.STDOUT)
+            recovered, end = [], time.monotonic() + 5
+            while time.monotonic() < end:
+                view = child.view()
+                request = int(metric(view["live"], "gauges", "filesystem.disk-0")["last_request_id"])
+                if request > last:
+                    recovered.append(view)
+                    last = request
+                time.sleep(.1)
+            release.wait(timeout=5)
+            assert release.returncode == 0
+        write_json(child.dir / "recovered.json", recovered)
+        validate_recovery(recovered, start_id, baseline, expected)
+        state = json.loads(child.cli("exec", "--", "/probe", "trace-state"))
+        write_json(child.dir / "trace-done.json", state)
+        assert state.get("usage-owned-done") == "detached"
+        assert len(re.findall(r"fstatfs\(\d+<", state["usage-owned-trace.log"])) == 1
+        assert not relay.errors, relay.errors
+        print("PASS usage-sources/restore (occupied slot across quiesce/lazy restore; old epoch rejected; fresh recovery)", flush=True)
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            if child is not None:
+                cleanup_sources(child, processes=(release,), relay=relay, failure=failure, owned_trace=True)
+        except BaseException as error:
+            if failure is None:
+                failure = error
+            raise
+        finally:
+            cleanup_sources(sb, failure=failure, owned_trace=launched)
+
+
 def validate_ch_recovery(samples, baseline):
     last, first_valid, valid = int(baseline["last_request_id"]), None, 0
     for row in samples:
@@ -565,12 +726,12 @@ def ch_case(work, ref, mode):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seconds", type=int, default=30)
-    parser.add_argument("--cases", default="filesystem,ch-info,ch-resize,vsock")
+    parser.add_argument("--cases", default="filesystem,ch-info,ch-resize,vsock,restore")
     args = parser.parse_args()
     assert 20 <= args.seconds <= 60
     assert os.geteuid() == 0
     cases = args.cases.split(",")
-    assert set(cases) <= {"filesystem", "ch-info", "ch-resize", "vsock"}
+    assert set(cases) <= {"filesystem", "ch-info", "ch-resize", "vsock", "restore"}
     work = Path(tempfile.mkdtemp(prefix="e2e-usage-sources-"))
     print(f"usage source evidence: {work}", flush=True)
     if os.environ.get("KUASAR_CI_DIR"):
@@ -600,6 +761,8 @@ def main():
             filesystem_case(work, ref, args.seconds)
         elif case == "vsock":
             vsock_case(work, ref)
+        elif case == "restore":
+            restore_case(work, ref)
         else:
             ch_case(work, ref, case.removeprefix("ch-"))
 

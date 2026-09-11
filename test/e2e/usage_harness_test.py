@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import socket
 import socketserver
@@ -140,7 +141,63 @@ class SourceFaultTests(unittest.TestCase):
             changed[-1]["live"]["gauges"][index]["covered_total_ns"] = "0"
             with self.assertRaises(AssertionError):
                 usage_sources.validate_wire_progress(baseline, changed)
+
+    def test_restore_preserves_busy_slot_and_independent_sources(self):
+        view = self.samples()[1]
+        baseline = copy.deepcopy(view["live"]["gauges"][0])
+        usage_sources.validate_preserved_slot(baseline, view)
+        for field, value in (("status", "timeout"), ("status", "ok"), ("continuous", True),
+                             ("covered_total_ns", "11"), ("integral_total_byte_ns", "101"), ("last_value_bytes", "0")):
+            changed = copy.deepcopy(view)
+            changed["live"]["gauges"][0][field] = value
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_preserved_slot(baseline, changed)
+        for index in range(1, 8):
+            changed = copy.deepcopy(view)
+            changed["live"]["gauges"][index]["status"] = "missing"
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_preserved_slot(baseline, changed)
+
+    def test_old_epoch_requires_real_response_host_close_and_new_connection(self):
+        raw = {"request_id": "2", "run_epoch": "new", "memory": {"status": "ok"},
+               "filesystems": [{"disk": "disk-0", "status": "busy"}]}
+        rows = [{"mode": "old-epoch", "connection": 1, "request": {"request_id": "2", "run_epoch": "new"},
+                 "response": {"usage_response": raw, "type": "usage_response"},
+                 "forwarded": {"usage_response": {**raw, "run_epoch": "old"}},
+                 "sent_ns": 10, "client_closed_ns": 11},
+                {"mode": None, "connection": 2, "request": {"request_id": "3", "run_epoch": "new"},
+                 "response": {"usage_response": {**raw, "request_id": "3"}, "type": "usage_response"}}]
+        usage_sources.validate_old_epoch(rows, "old", "new")
+        mutations = [lambda r: r[0].pop("client_closed_ns"),
+                     lambda r: r[1].update(connection=1),
+                     lambda r: r[1]["request"].update(request_id="2"),
+                     lambda r: r[0]["forwarded"]["usage_response"].update(request_id="1"),
+                     lambda r: r[1]["response"]["usage_response"]["filesystems"][0].update(status="ok"),
+                     lambda r: r[1]["request"].update(run_epoch="old")]
+        for mutate in mutations:
+            changed = copy.deepcopy(rows)
+            mutate(changed)
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_old_epoch(changed, "old", "new")
+
+
 class SourceCleanupTests(unittest.TestCase):
+    def test_owned_detach_failure_still_reaps_release_and_stops_both_owners(self):
+        sb, process, relay = (unittest.mock.Mock() for _ in range(3))
+        sb.process.poll.return_value = None
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("release", 5), 0]
+        relay.requests, relay.errors = [], []
+        original = RuntimeError("restore assertion failed")
+        with patch.object(usage_sources, "finish_owned_trace", side_effect=RuntimeError("detach failed")), \
+             patch.object(usage_sources, "write_json"), patch.object(usage_sources.sys, "stderr", io.StringIO()):
+            usage_sources.cleanup_sources(sb, processes=(process,), relay=relay, failure=original, owned_trace=True)
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        self.assertEqual(process.wait.call_count, 2)
+        sb.stop.assert_called_once()
+        relay.stop.assert_called_once()
+
     def test_observer_ready_requires_first_complete_frame_before_deadline(self):
         observer, path = unittest.mock.Mock(), unittest.mock.Mock()
         observer.poll.return_value = None
@@ -297,6 +354,50 @@ class UsageRelayTests(unittest.TestCase):
             left.close()
             right.close()
 
+    def test_old_epoch_changes_only_identity_without_manufacturing_eof(self):
+        owner = self
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.settimeout(2)
+                try:
+                    owner.assertEqual(line(self.request), b"CONNECT 5000\n")
+                    self.request.sendall(b"OK 1\n")
+                    for _ in range(2):
+                        _, message = frame(self.request)
+                        self.request.sendall(owner.wire("usage_response", int(message["usage_request"]["request_id"])))
+                except EOFError:
+                    pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vsock.sock"
+            native = socketserver.UnixStreamServer(str(path)+".real", Handler)
+            thread = threading.Thread(target=native.serve_forever, kwargs={"poll_interval": .05})
+            thread.start()
+            relay = UsageRelay(path, old_epoch="previous")
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(2)
+            try:
+                client.connect(str(path))
+                client.sendall(b"CONNECT 5000\n")
+                self.assertEqual(line(client), b"OK 1\n")
+                client.sendall(self.wire("usage_request", 2))
+                _, response = frame(client)
+                self.assertEqual(response["usage_response"], {"request_id": "2", "run_epoch": "previous"})
+                # A broken Host which accepts this reply can continue. Only
+                # actual Host closure may witness rejection in the KVM case.
+                client.sendall(self.wire("usage_request", 3))
+                self.assertEqual(frame(client)[0], self.wire("usage_response", 3))
+            finally:
+                client.close()
+                relay.stop()
+                native.shutdown()
+                native.server_close()
+                thread.join(timeout=2)
+            self.assertFalse(relay.errors)
+            self.assertEqual(relay.requests[0]["response"]["usage_response"], {"request_id": "2", "run_epoch": "run"})
+            self.assertEqual(relay.requests[0]["connection"], relay.requests[1]["connection"])
+
     def test_only_usage_is_replayed_and_new_connection_reads_new_frame(self):
         owner = self
 
@@ -380,7 +481,64 @@ class UsageRelayTests(unittest.TestCase):
             self.assertNotIn("client_closed_ns", relay.requests[-1])
 
 
+class RestoreWrapperTests(unittest.TestCase):
+    def test_only_private_run_config_socket_is_relocated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "run/snap-state"
+            state.mkdir(parents=True)
+            value = {"vsock": {"socket": str(root / "run/vsock.sock"), "cid": 3}, "memory": {"size": 512}, "disks": ["unchanged"]}
+            original = json.dumps(value)
+            snapshot = root / "business-config.json"
+            snapshot.write_text(original)
+            (state / "config.json").write_text(original)
+            args = ["wrapper", "--api-socket", str(root / "run/ch.sock"), "--restore", "source_url=file://"+str(state)]
+            with patch.object(os, "execv", side_effect=SystemExit) as execute, \
+                 patch.dict(os.environ, {"USAGE_TEST_CH": "/test/ch"}), patch("sys.argv", args):
+                with self.assertRaises(SystemExit):
+                    runpy.run_path(str(Path(__file__).with_name("usage_vsock_wrapper.py")))
+            self.assertEqual(snapshot.read_text(), original)
+            changed = json.loads((state / "config.json").read_text())
+            self.assertEqual(changed, {**value, "vsock": {**value["vsock"], "socket": value["vsock"]["socket"]+".real"}})
+            self.assertEqual(os.readlink(root / "run/vsock.sock.real_5000"), str(root / "run/vsock.sock_5000"))
+            execute.assert_called_once_with("/test/ch", ["/test/ch", *args[1:]])
+
+    def test_non_private_restore_path_is_not_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "business-snapshot"
+            state.mkdir()
+            (state / "config.json").write_text("do not edit")
+            args = ["wrapper", "--api-socket", str(Path(directory) / "run/ch.sock"), "--restore", "source_url=file://"+str(state)]
+            with patch.object(os, "execv") as execute, patch("sys.argv", args):
+                with self.assertRaisesRegex(AssertionError, "disposable restore state"):
+                    runpy.run_path(str(Path(__file__).with_name("usage_vsock_wrapper.py")))
+            execute.assert_not_called()
+            self.assertEqual((state / "config.json").read_text(), "do not edit")
+
+
 class BalloonWitnessTests(unittest.TestCase):
+    def test_converged_baseline_without_control_log_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sb = unittest.mock.Mock()
+            sb.dir = Path(directory)  # No run.log or periodic settlement event.
+            info = {"config": {"balloon": {"size": 128, "deflate_on_oom": True}}, "memory_actual_size": 384}
+            sb.ch_info.return_value = info
+            self.assertEqual(usage.oom_baseline(sb, 512), info)
+            self.assertEqual(len(json.loads((sb.dir / "ch-oom-baseline-probes.json").read_text())), 1)
+
+    def test_nonconverged_or_missing_oom_device_never_qualifies(self):
+        for balloon, actual in (({"size": 128, "deflate_on_oom": True}, 400),
+                                ({"size": 0, "deflate_on_oom": True}, 512),
+                                ({"size": 128, "deflate_on_oom": False}, 384), (None, 384)):
+            with self.subTest(balloon=balloon), tempfile.TemporaryDirectory() as directory:
+                sb = unittest.mock.Mock()
+                sb.dir = Path(directory)
+                sb.ch_info.return_value = {"config": {"balloon": balloon}, "memory_actual_size": actual}
+                with patch.object(usage.time, "monotonic", side_effect=[0, .1, 8]), patch.object(usage.time, "sleep"):
+                    with self.assertRaises(AssertionError):
+                        usage.oom_baseline(sb, 512)
+                self.assertEqual(len(json.loads((sb.dir / "ch-oom-baseline-probes.json").read_text())), 1)
+
     def test_unchanged_target_growth(self):
         self.assertTrue(autonomous_balloon_prefix(512, 128, 384, [
             {"target": 128, "actual": 384}, {"target": 128, "actual": 388}]))

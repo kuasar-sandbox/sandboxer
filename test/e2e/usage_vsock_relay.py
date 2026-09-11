@@ -39,7 +39,7 @@ class UsageRelay(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
     block_on_close = False
 
-    def __init__(self, path):
+    def __init__(self, path, old_epoch=None):
         self.real = str(path) + ".real"
         self.lock = threading.Lock()
         self.stopping = threading.Event()
@@ -47,6 +47,9 @@ class UsageRelay(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.slots = threading.BoundedSemaphore(8)
         self.requests, self.errors = [], []
         self.next_connection, self.mode, self.first_response = 0, None, None
+        self.old_epoch = old_epoch
+        if old_epoch is not None:
+            self.mode = "old-epoch"
         path.parent.mkdir(parents=True, exist_ok=True)
         super().__init__(str(path), UsageHandler)
         self.worker = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": .1})
@@ -149,6 +152,16 @@ class UsageHandler(socketserver.BaseRequestHandler):
                 if mode == "delay":
                     self.server.stopping.wait(1.4)
                     row["delay_released_ns"] = time.monotonic_ns()
+                if mode == "old-epoch":
+                    # Deliberate identity corruption, not an unmodified old
+                    # frame: keep this real reply's values and request ID, but
+                    # inject the actual previous run's epoch. Record both.
+                    forwarded = json.loads(response[4:])
+                    assert forwarded["usage_response"]["run_epoch"] != self.server.old_epoch
+                    forwarded["usage_response"]["run_epoch"] = self.server.old_epoch
+                    payload = json.dumps(forwarded).encode()
+                    response = struct.pack("<I", len(payload)) + payload
+                    row["forwarded"] = forwarded
                 if mode == "repeat":
                     assert first is not None and first != response
                     response = first

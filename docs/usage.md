@@ -394,8 +394,8 @@ Both data disks receive real writes. Bytes written after the delayed read
 distinguish a new observation from a replayed old buffer after release.
 A single long-lived test exec records all Guest FDs, identities, threads and
 RSS; it does not create an exec per observation or label threads as goroutines.
-The default fault lasts 30 seconds; `--seconds 60` extends it. This is neither
-a power-loss test nor proof of a blocked worker surviving snapshot/restore.
+The filesystem case's default fault lasts 30 seconds; `--seconds 60` extends it.
+It is a syscall-return delay, not a physical-device failure or power-loss test.
 The installed native `strace`, its `ldd`-resolved loader and libraries are
 copied into the disposable application image only, never the product runtime.
 Its `ch-info` and `ch-resize` cases place a test-only Unix HTTP relay before
@@ -418,8 +418,25 @@ remain a separate source. One observer exec streams resource diagnostics
 across all eleven faults. Its first complete output establishes MUX readiness
 before injection. Additional health/stop execs run outside the all-FD observation
 window while the filesystem is still blocked; no FD samples are discarded.
-These are finite functional/resource-bound checks,
-not an overnight endurance run or a real blocked-worker restore experiment.
+The `restore` case keeps one occupied filesystem slot across same-process
+quiesce/thaw and then lazy memory restore with the same SandboxID/usage file.
+A bounded, test-only tracer owner joins the disposable Guest's root cgroup
+before spawning `strace`; PID 1, the application and exec-join processes are
+not moved. The Guest reaper owns the adopted helper, which alone waits for
+its tracer. This avoids ordinary exec's intentional termination at quiesce.
+The test-only CH wrapper relocates the vsock socket in private restore run
+state, not in the immutable business snapshot. On the first restored response,
+the relay replaces only the epoch with the real previous run's identity,
+retaining the new request ID and values. This is explicit identity corruption,
+not an unmodified historical frame. Host closure and a new request on another
+connection must demonstrate rejection. Raw replies must still report the
+original busy slot, while memory and healthy filesystems remain available.
+Writes after the original read and after restore distinguish fresh recovery
+from a late old buffer; the first new value cannot integrate the missing gap.
+Both original and restored tracer owners must detach, and failure cleanup
+still stops the owned VMs and reaps Host-side test subprocesses.
+These are finite functional/resource-bound checks, not overnight endurance,
+failed-restore rollback coverage or physical power-loss evidence.
 
 Run the [off/on harness](../test/e2e/usage_perf.py) without concurrent test
 loads, supplying the assembled `BIN` and root privileges:

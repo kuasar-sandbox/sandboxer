@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -85,6 +86,12 @@ func main() {
 		fail(json.NewEncoder(os.Stdout).Encode(s))
 	case "trace-fs":
 		traceFilesystem(os.Args[2], time.Duration(number(os.Args[3]))*time.Millisecond)
+	case "trace-launch":
+		launchOwnedTrace(os.Args[2], os.Args[3])
+	case "trace-owned":
+		ownedTrace(os.Args[2], os.Args[3])
+	case "trace-state":
+		ownedTraceState()
 	case "trace-stop":
 		fail(os.WriteFile("/tmp/usage-fs-trace-stop", nil, 0600))
 	case "init-resources":
@@ -110,6 +117,81 @@ func main() {
 	default:
 		panic("unknown workload")
 	}
+}
+
+// A normal exec is killed by quiesce. This test-only owner forks with separate
+// stdio and a new session; the launching exec's PDEATHSIG is not inherited.
+// Guest PID 1 reaps the adopted owner, which alone waits for its strace child.
+func launchOwnedTrace(path, delay string) {
+	if ms := number(delay); ms == 0 || ms > 80000 {
+		panic("invalid bounded tracer delay")
+	}
+	log, err := os.OpenFile("/tmp/usage-owned-trace.log", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	fail(err)
+	defer log.Close()
+	input, err := os.Open(os.DevNull)
+	fail(err)
+	defer input.Close()
+	cmd := exec.Command("/probe", "trace-owned", path, delay)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = input, log, log
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	fail(cmd.Start())
+	fail(json.NewEncoder(os.Stdout).Encode(map[string]int{"owner_pid": cmd.Process.Pid}))
+	fail(cmd.Process.Release())
+}
+
+func ownedTrace(path, delay string) {
+	ms := number(delay)
+	if ms == 0 || ms > 80000 || os.Geteuid() != 0 {
+		panic("bounded root/shared-PID disposable Guest required")
+	}
+	// Linux UAPI: x86_64 asm/unistd_64.h and arm64 asm-generic/unistd.h.
+	nr, ok := map[string]uintptr{"amd64": 308, "arm64": 268}[runtime.GOARCH]
+	if !ok {
+		panic("unsupported setns architecture")
+	}
+	runtime.LockOSThread() // strace must fork from this joined thread.
+	ns, err := os.Open("/proc/1/ns/cgroup")
+	fail(err)
+	_, _, errno := syscall.RawSyscall(nr, ns.Fd(), 0x02000000, 0) // CLONE_NEWCGROUP
+	if errno != 0 {
+		fail(errno)
+	}
+	fail(ns.Close())
+	// Move only this dedicated test owner, before forking strace. Never move
+	// PID 1, the application, or an exec-join process out of their cgroups.
+	fail(os.WriteFile("/proc/1/root/sys/fs/cgroup/cgroup.procs", []byte(strconv.Itoa(os.Getpid())), 0600))
+	own, err := os.ReadFile("/proc/self/cgroup")
+	fail(err)
+	root, err := os.ReadFile("/proc/1/cgroup")
+	fail(err)
+	if strings.TrimSpace(string(own)) != strings.TrimSpace(string(root)) {
+		panic("test tracer owner did not enter Guest root cgroup")
+	}
+	info, err := json.Marshal(map[string]any{"owner_pid": os.Getpid(), "cgroup": string(own)})
+	fail(err)
+	fail(os.WriteFile("/tmp/usage-owned-ready.json", info, 0600))
+	traceFilesystem(path, time.Duration(ms)*time.Millisecond)
+	fail(os.WriteFile("/tmp/usage-owned-done", []byte("detached"), 0600))
+}
+
+func ownedTraceState() {
+	result := map[string]string{}
+	for _, name := range []string{"usage-owned-ready.json", "usage-owned-trace.log", "usage-owned-done"} {
+		file, err := os.Open("/tmp/" + name)
+		if os.IsNotExist(err) {
+			continue
+		}
+		fail(err)
+		value, err := io.ReadAll(io.LimitReader(file, 2*1024*1024+1))
+		fail(err)
+		fail(file.Close())
+		if len(value) > 2*1024*1024 {
+			panic("test trace output too large")
+		}
+		result[name] = string(value)
+	}
+	fail(json.NewEncoder(os.Stdout).Encode(result))
 }
 
 func initResources(sequence int) {
