@@ -517,6 +517,58 @@ def validate_preserved_slot(baseline, view):
         assert metric(view["live"], "gauges", name)["status"] == "ok", name
 
 
+def validate_capture_failure(capture, log):
+    # Predictable dependency failures occur before quiesce and cannot establish
+    # rollback. This specific error is emitted only inside capture after Pause.
+    assert capture["returncode"] != 0, "snapshot unexpectedly succeeded"
+    message = capture["stdout"] + capture["stderr"]
+    assert "export data disk 0: pack overlay:" in message, message
+    assert "no space left on device" in message, message
+    assert "snapshot dependencies:" not in message, message
+    assert "quiesce: guest acked" in log and "proceeding to /vm.pause" in log
+    assert "stdio MUX re-attached after failed snapshot" in log
+
+
+def capture_enospc(sb, work):
+    output = sb.dir / "limited-snapshot"
+    output.mkdir()
+    # The immutable root image is emitted before quiesce. Allow its actual
+    # carrier plus bounded slack, but not the 16 MiB written to disk-0. This
+    # derives the allowance for the installed architecture's probe/strace.
+    image_bytes = (work / "root.img").stat().st_size
+    assert image_bytes <= 64 * 1024 * 1024, "unexpectedly large test root image"
+    limit = ((image_bytes + 4095) // 4096) * 4096 + 4 * 1024 * 1024
+    run("mount", "-t", "tmpfs", "-o", f"size={limit},mode=700,nosuid,nodev,noexec", "tmpfs", output)
+    failure = None
+    try:
+        log_start = (sb.dir / "run.log").stat().st_size
+        started = time.monotonic_ns()
+        try:
+            stdout = sb.cli("snapshot", "--output", output, "--resume", "--drop-caches=false", "--merge-ref=false", timeout=60)
+            capture = {"returncode": 0, "stdout": stdout, "stderr": ""}
+        except subprocess.CalledProcessError as error:
+            capture = {"returncode": error.returncode, "stdout": error.stdout, "stderr": error.stderr}
+        capture.update(elapsed_ns=time.monotonic_ns() - started, output_limit_bytes=limit,
+                       output_statvfs=list(os.statvfs(output)),
+                       remaining_files=[path.name for path in output.iterdir()])
+        with (sb.dir / "run.log").open("rb") as log:
+            log.seek(log_start)
+            capture_log = log.read().decode()
+        write_json(sb.dir / "capture-failure.json", capture)
+        (sb.dir / "capture-failure.log").write_text(capture_log)
+        validate_capture_failure(capture, capture_log)
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            run("umount", output)
+        except BaseException as error:
+            if failure is None:
+                raise
+            print(f"usage source output unmount: {error}", file=sys.stderr)
+
+
 def validate_old_epoch(requests, old_epoch, new_epoch):
     faults = [row for row in requests if row["mode"] == "old-epoch"]
     assert len(faults) == 1
@@ -569,6 +621,27 @@ def restore_case(work, ref):
         baseline = metric(before["live"], "gauges", "filesystem.disk-0")
         validate_preserved_slot(baseline, before)
         sb.cli("exec", "--", "/probe", "write", "/data/after-read", "8")
+        capture_enospc(sb, work)
+        # Recovery must reopen the Guest and retain the occupied source, not
+        # recreate a worker after the failed capture. The usage path is on a
+        # different filesystem and is unaffected by the limited output mount.
+        sb.cli("exec", "--", "/probe", "true")
+        info = sb.ch_info()
+        write_json(sb.dir / "post-failure-ch.json", info)
+        assert info["state"] == "Running", info
+        time.sleep(3)
+        state = json.loads(sb.cli("exec", "--", "/probe", "trace-state"))
+        write_json(sb.dir / "trace-after-failure.json", state)
+        assert state["usage-owned-ready.json"] == owner_identity and "usage-owned-done" not in state
+        rolled_back = sb.view()
+        write_json(sb.dir / "rolled-back.json", rolled_back)
+        assert rolled_back["live"]["run_epoch"] == before["live"]["run_epoch"]
+        validate_preserved_slot(baseline, rolled_back)
+        assert int(metric(rolled_back["live"], "gauges", "filesystem.disk-0")["last_request_id"]) > int(baseline["last_request_id"])
+        for name in ("guest.memory", "filesystem.root", "filesystem.disk-1"):
+            first = metric(before["live"], "gauges", name)
+            latest = metric(rolled_back["live"], "gauges", name)
+            assert int(latest["covered_total_ns"]) > int(first["covered_total_ns"]), name
         output = sb.dir / "snapshot"
         output.mkdir()
         capture = sb.cli("snapshot", "--output", output, "--resume", "--drop-caches=false", "--merge-ref=false", timeout=60)
@@ -640,7 +713,7 @@ def restore_case(work, ref):
         assert state.get("usage-owned-done") == "detached"
         assert len(re.findall(r"fstatfs\(\d+<", state["usage-owned-trace.log"])) == 1
         assert not relay.errors, relay.errors
-        print("PASS usage-sources/restore (occupied slot across quiesce/lazy restore; old epoch rejected; fresh recovery)", flush=True)
+        print("PASS usage-sources/restore (occupied slot across failed capture rollback/quiesce/lazy restore; old epoch rejected; fresh recovery)", flush=True)
     except BaseException as error:
         failure = error
         raise

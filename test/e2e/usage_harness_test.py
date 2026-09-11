@@ -236,6 +236,22 @@ class SourceFaultTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 usage_sources.validate_preserved_slot(baseline, changed)
 
+    def test_capture_failure_requires_post_pause_enospc_and_reattachment(self):
+        capture = {"returncode": 1, "stdout": "",
+                   "stderr": "export data disk 0: pack overlay: no space left on device"}
+        lines = ("quiesce: guest acked, proceeding to /vm.pause",
+                 "stdio MUX re-attached after failed snapshot")
+        log = "\n".join(lines)
+        usage_sources.validate_capture_failure(capture, log)
+        for update in ({"returncode": 0}, {"stderr": "snapshot dependencies: no space left on device"},
+                       {"stderr": "export data disk 0: pack overlay: I/O error"},
+                       {"stderr": "snapshot dependencies: " + capture["stderr"]}):
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_capture_failure({**capture, **update}, log)
+        for partial in lines:
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_capture_failure(capture, partial)
+
     def test_old_epoch_requires_real_response_host_close_and_new_connection(self):
         raw = {"request_id": "2", "run_epoch": "new", "memory": {"status": "ok"},
                "filesystems": [{"disk": "disk-0", "status": "busy"}]}
@@ -260,6 +276,57 @@ class SourceFaultTests(unittest.TestCase):
 
 
 class SourceCleanupTests(unittest.TestCase):
+    def test_capture_unmounts_and_preserves_primary_failure(self):
+        for fault in (RuntimeError("capture failed"), subprocess.TimeoutExpired("snapshot", 60)):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                (work / "root.img").write_bytes(b"root image")
+                sb = unittest.mock.Mock(dir=work / "case")
+                sb.dir.mkdir()
+                (sb.dir / "run.log").write_text("")
+                sb.cli.side_effect = fault
+                with patch.object(usage_sources, "run", side_effect=[None, OSError("unmount failed")]) as command, \
+                     patch.object(usage_sources.sys, "stderr", io.StringIO()):
+                    with self.assertRaises(type(fault)) as caught:
+                        usage_sources.capture_enospc(sb, work)
+                self.assertIs(caught.exception, fault)
+                self.assertEqual(command.call_count, 2)
+                self.assertEqual(command.call_args.args, ("umount", sb.dir / "limited-snapshot"))
+
+    def test_capture_unmount_failure_is_not_a_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "root.img").write_bytes(b"root image")
+            sb = unittest.mock.Mock(dir=work / "case")
+            sb.dir.mkdir()
+            (sb.dir / "run.log").write_text("")
+            def fail(*args, **kwargs):
+                (sb.dir / "run.log").write_text("quiesce: guest acked, proceeding to /vm.pause\nstdio MUX re-attached after failed snapshot\n")
+                raise subprocess.CalledProcessError(1, ["snapshot"], output="",
+                    stderr="export data disk 0: pack overlay: no space left on device")
+            sb.cli.side_effect = fail
+            with patch.object(usage_sources, "run", side_effect=[None, OSError("unmount failed")]) as command:
+                with self.assertRaisesRegex(OSError, "unmount failed"):
+                    usage_sources.capture_enospc(sb, work)
+            self.assertEqual(command.call_count, 2)
+            self.assertIn("size=4198400,mode=700,nosuid,nodev,noexec", command.call_args_list[0].args)
+            self.assertTrue((sb.dir / "capture-failure.json").is_file())
+
+    def test_old_capture_log_cannot_establish_current_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "root.img").write_bytes(b"root image")
+            sb = unittest.mock.Mock(dir=work / "case")
+            sb.dir.mkdir()
+            (sb.dir / "run.log").write_text("quiesce: guest acked, proceeding to /vm.pause\nstdio MUX re-attached after failed snapshot\n")
+            sb.cli.side_effect = subprocess.CalledProcessError(1, ["snapshot"], output="",
+                stderr="export data disk 0: pack overlay: no space left on device")
+            with patch.object(usage_sources, "run") as command:
+                with self.assertRaises(AssertionError):
+                    usage_sources.capture_enospc(sb, work)
+            self.assertEqual(command.call_count, 2)
+            self.assertEqual((sb.dir / "capture-failure.log").read_text(), "")
+
     def test_owned_detach_failure_still_reaps_release_and_stops_both_owners(self):
         sb, process, relay = (unittest.mock.Mock() for _ in range(3))
         sb.process.poll.return_value = None

@@ -470,8 +470,15 @@ Writes after the original read and after restore distinguish fresh recovery
 from a late old buffer; the first new value cannot integrate the missing gap.
 Both original and restored tracer owners must detach, and failure cleanup
 still stops the owned VMs and reaps Host-side test subprocesses.
+Before successful capture, the same case exhausts a test-owned snapshot-output
+tmpfs after the immutable dependency preflight. The test requires a data-disk
+capture ENOSPC after Guest quiesce/CH pause, MUX reattachment, a real health
+exec and CH `Running` state. The occupied slot and its known usage must survive
+this failed-capture rollback while healthy sources advance. The output limit
+does not affect the usage-file directory; an earlier dependency error cannot
+pass as rollback evidence. The temporary mount is unmounted on both paths.
 These are finite functional/resource-bound checks, not overnight endurance,
-failed-restore rollback coverage or physical power-loss evidence.
+complete failed-memory-restore rollback coverage or physical power-loss evidence.
 
 Run the [off/on harness](../test/e2e/usage_perf.py) without concurrent test
 loads, supplying the assembled `BIN` and root privileges:
