@@ -52,6 +52,9 @@ type memoryTransaction struct {
 	// and applied to high. The decision sample is rechecked before an inflate.
 	shrinkObservation BalloonState
 	highBudget        uint64
+	// repairCurrentBudget is the largest actual sample already charged to the
+	// retained repair demand. It prevents retrying one rebound from adding it twice.
+	repairCurrentBudget uint64
 }
 
 type pressureGrow struct {
@@ -519,6 +522,9 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 			}
 		}
 		txn.reportSeq = report.Seq
+		// This fresh report establishes a new actual baseline for any later
+		// repair, while txn.demand remains the conservative retained maximum.
+		txn.repairCurrentBudget = state.CurrentBudget
 		if !txn.resizeAccepted {
 			// Only a new guest report can refresh an unexecuted decision. A
 			// ticker retry retains its old sample and cannot erase a reversal.
@@ -808,6 +814,18 @@ func (t *memoryTransaction) upgradeGrowCause(urgency, reason string) {
 	}
 }
 
+// retainRepairDemand conservatively charges newly observed actual growth to
+// demand without re-pairing old MemAvailable with a new sample. Only growth
+// beyond the actual watermark already accounted for by this transaction is new.
+func (t *memoryTransaction) retainRepairDemand(sample, confirmed, repairBudget uint64) uint64 {
+	baseline := max(sample, t.repairCurrentBudget)
+	rebound, _ := saturatingSub(confirmed, baseline)
+	demand, _ := saturatingAdd(t.demand, rebound)
+	t.demand = min(demand, repairBudget)
+	t.repairCurrentBudget = max(baseline, confirmed)
+	return t.demand
+}
+
 func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 	txn := m.txn
 	if m.shrinkReportSuperseded(txn.reportSeq) {
@@ -904,7 +922,11 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 			if known && confirmed.AcceptedTargetKnown && confirmed.AcceptedTarget == state.AcceptedTarget && current <= reservation {
 				repairBudget = current
 			}
-			if repairErr := m.applyMemoryHigh(ctx, repairBudget, txn.demand, true); repairErr != nil {
+			repairDemand := txn.demand
+			if confirmed.BalloonCurrentKnown {
+				repairDemand = txn.retainRepairDemand(state.CurrentBudget, confirmed.CurrentBudget, repairBudget)
+			}
+			if repairErr := m.applyMemoryHigh(ctx, repairBudget, repairDemand, true); repairErr != nil {
 				return errors.Join(observationErr, fmt.Errorf("repair memory.high after changed shrink observation: %w", repairErr))
 			}
 			return observationErr

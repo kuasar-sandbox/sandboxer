@@ -2,6 +2,7 @@ package resctl
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -197,7 +198,7 @@ func TestMemorySettlementReboundRepairsHighBeforeFailedRetry(t *testing.T) {
 	if err := processProgressReport(t, m, 1, 449<<20); err == nil {
 		t.Fatal("rebounded actual did not invalidate settlement")
 	}
-	want, err := CalculateMemoryHigh(capacity, 64<<20, 710<<20, 256<<20,
+	want, err := CalculateMemoryHigh(capacity, 64<<20, 710<<20, 261<<20,
 		resource.DefaultWatermarkHighRatio, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -236,7 +237,7 @@ func TestMemorySettlementReboundAboveReservationUsesAuthorizedHigh(t *testing.T)
 	if err := processProgressReport(t, m, 1, 449<<20); err == nil {
 		t.Fatal("rebound beyond reservation did not invalidate settlement")
 	}
-	want, err := CalculateMemoryHigh(capacity, 64<<20, 768<<20, 256<<20,
+	want, err := CalculateMemoryHigh(capacity, 64<<20, 768<<20, 351<<20,
 		resource.DefaultWatermarkHighRatio, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -272,5 +273,88 @@ func TestMemorySettlementHighRepairFailureRetainsReservation(t *testing.T) {
 	}
 	if reservation.ReservationMemory() != 768<<20 || len(reservation.seen()) != 0 {
 		t.Fatal("failed high repair returned reservation")
+	}
+}
+
+func TestMemorySettlementReboundRetainsRatioReserveDemand(t *testing.T) {
+	const capacity = uint64(8 << 30)
+	const initialBudget = uint64(1537 << 20)
+	const reboundBudget = uint64(1545 << 20)
+	const initialDemand = uint64(512 << 20)
+	const repairedDemand = initialDemand + reboundBudget - initialBudget
+	cgroup := newMemoryCgroup(t, "max", "1")
+	fakeCH := newFakeCHMemory(t, capacity)
+	fakeCH.configure(func(f *fakeCHMemory) {
+		f.acceptedTarget, f.currentBudget = 6656<<20, initialBudget
+		f.onInfo = func(f *fakeCHMemory) {
+			if f.infoCalls == 3 {
+				f.currentBudget = reboundBudget
+			}
+		}
+	})
+	reservation := &fakeReservationAdapter{current: 1600 << 20}
+	m := newProgressController(t, fakeCH, cgroup, reservation)
+	if err := processProgressReport(t, m, 1, initialBudget-initialDemand); err == nil {
+		t.Fatal("rebound did not defer the smaller settlement")
+	}
+	want, err := CalculateMemoryHigh(capacity, 64<<20, reboundBudget, repairedDemand,
+		resource.DefaultWatermarkHighRatio, 1)
+	if err != nil || want.PressureReserve <= resource.MemoryStep {
+		t.Fatalf("test did not exercise ratio reserve: %+v, %v", want, err)
+	}
+	if got := readProgressHigh(t, cgroup); got != want.HostMemoryHigh {
+		t.Fatalf("repair high=%d, want conservative-demand high=%d", got, want.HostMemoryHigh)
+	}
+	if m.txn == nil || m.txn.demand != repairedDemand {
+		t.Fatalf("repair demand was not retained: %+v", m.txn)
+	}
+
+	fakeCH.configure(func(f *fakeCHMemory) { f.infoFailures = 2 })
+	for range 2 {
+		m.controlMu.Lock()
+		err = m.retryLocked(context.Background())
+		m.controlMu.Unlock()
+		if err == nil {
+			t.Fatal("injected CH failure was hidden")
+		}
+		if got := readProgressHigh(t, cgroup); got != want.HostMemoryHigh {
+			t.Fatalf("failed retry changed repaired high=%d", got)
+		}
+	}
+	if reservation.ReservationMemory() != 1600<<20 || len(reservation.seen()) != 0 {
+		t.Fatal("failed CH retries released reservation")
+	}
+
+	// A later confirmed retry must not undo the raise by using the old demand.
+	// Retain the transaction through a failed node call, then retry once more.
+	reservation.failures = 1
+	for attempt := range 2 {
+		m.controlMu.Lock()
+		err = m.retryLocked(context.Background())
+		m.controlMu.Unlock()
+		if (attempt == 0) != (err != nil) {
+			t.Fatalf("retry %d error=%v", attempt, err)
+		}
+		if got := readProgressHigh(t, cgroup); got != want.HostMemoryHigh {
+			t.Fatalf("confirmed retry undid repaired high=%d", got)
+		}
+	}
+	if reservation.ReservationMemory() != reboundBudget || m.txn != nil {
+		t.Fatal("confirmed retry did not settle the covered rebound Budget")
+	}
+}
+
+func TestMemoryTransactionRepairDemandCountsNewActualOnly(t *testing.T) {
+	txn := &memoryTransaction{demand: 512 << 20}
+	for _, sample := range []uint64{1537 << 20, 1537 << 20, 1545 << 20} {
+		if got := txn.retainRepairDemand(sample, 1545<<20, 1600<<20); got != 520<<20 {
+			t.Fatalf("repeated rebound double-counted demand=%d", got)
+		}
+	}
+	if got := txn.retainRepairDemand(1545<<20, 1553<<20, 1600<<20); got != 528<<20 {
+		t.Fatalf("new rebound demand=%d, want %d", got, 528<<20)
+	}
+	if got := txn.retainRepairDemand(1553<<20, math.MaxUint64, 1600<<20); got != 1600<<20 {
+		t.Fatalf("overflow/excess actual escaped authorized Budget: %d", got)
 	}
 }
