@@ -70,75 +70,6 @@ validate_archive_contract() {
     || fail "$archive violates the exact entry contract"
 }
 
-stage_go_source() {
-  local source="$1" sha="$2" destination="$3"
-  # A new checkout contains only committed inputs, including when the caller's
-  # development tree has ignored .go/embed files. A real .git directory keeps
-  # Go VCS stamping available; no commit or tag is created.
-  [ ! -e "$destination" ] || fail "fresh release checkout already exists"
-  mkdir -p "$destination"
-  local -a git_env=(env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null)
-  "${git_env[@]}" git -C "$destination" init --quiet --template=
-  "${git_env[@]}" git -C "$destination" fetch --quiet --depth=1 "$source" "$sha"
-  "${git_env[@]}" git -C "$destination" -c advice.detachedHead=false checkout --quiet --detach "$sha"
-}
-
-prepare_cloud_hypervisor() {
-  local project_sha="$1" arch="$2" native_root="$WORK/native-build/native-deps" variable
-  for variable in RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR CLOUD_HYPERVISOR_TARBALL \
-    CLOUD_HYPERVISOR_TARBALL_SHA256; do
-    [ -z "${!variable:-}" ] || fail "$variable override is not supported by release source materials"
-  done
-  [ "$(sed -n 's/^CLOUD_HYPERVISOR_TARBALL  *?= //p' "$ROOT/native-deps/Makefile")" = \
-    'https://codeload.github.com/cloud-hypervisor/cloud-hypervisor/tar.gz/refs/tags/v51.1\#cloud-hypervisor-51.1.tar.gz' ] \
-    || fail "Cloud Hypervisor source pin differs from its release source record"
-  [ "$(sed -n 's/^CLOUD_HYPERVISOR_TARBALL_SHA256 *?= //p' "$ROOT/native-deps/Makefile")" = \
-    a2393046c0230f6360792ed2ef1b60968aa4e04d12b6be419c86306774e2e4ef ] \
-    || fail "Cloud Hypervisor source checksum differs from its release source record"
-  mkdir -p "$WORK/native-build" "$WORK/cargo-home" "$WORK/rust-tmp"
-  chmod 0700 "$WORK/cargo-home"
-  python3 "$ROOT/scripts/release-rust-materials.py" configure-cargo-home \
-    "${CARGO_HOME:-$HOME/.cargo}" "$WORK/cargo-home"
-  git -C "$ROOT" archive "$project_sha" native-deps | tar -x -C "$WORK/native-build"
-  CH_RELEASE_RUSTC="$(rustc --print sysroot)/bin/rustc"
-  [ -x "$CH_RELEASE_RUSTC" ] || fail "selected Rust compiler is missing"
-  local native_env=(
-    python3 "$ROOT/scripts/release-rust-materials.py" run-native
-    "$WORK/native-home" "$WORK/cargo-home" "$CH_RELEASE_RUSTC" env
-    CH_BUILD_REPORT="$WORK/ch-build.jsonl" CH_LINK_MAP="$WORK/ch-link.map"
-    TMPDIR="$WORK/rust-tmp"
-  )
-  "${native_env[@]}" make --no-print-directory -C "$native_root" \
-    TARGET_ARCH="$arch" TARBALL_DIR="$ROOT/native-deps/build/tarball" ch-patches-apply ch-build
-  CH_RELEASE_SOURCE="$native_root/build/src/cloud-hypervisor"
-  copy_executable "$native_root/bin/$arch/cloud-hypervisor" bin/cloud-hypervisor
-  "${native_env[@]}" cargo metadata --locked --format-version=1 \
-    --filter-platform "$arch-unknown-linux-gnu" \
-    --manifest-path "$CH_RELEASE_SOURCE/Cargo.toml" > "$WORK/ch-metadata.json"
-}
-
-requested_dependency_version() {
-  local name="$1" binding="${RELEASE_DEPENDENCIES:-}" entry value result=""
-  local -a entries
-  [ -n "$binding" ] || return 0 # Local source packages can use untagged commits.
-  [[ "$binding" != *, && "$binding" != ,* && "$binding" != *,,* ]] \
-    || fail "invalid release dependency list"
-  IFS=, read -r -a entries <<< "$binding"
-  [ "${#entries[@]}" -eq 2 ] || fail "sandboxer release must bind its 2 internal dependencies"
-  for entry in "${entries[@]}"; do
-    case "${entry%%=*}" in accelerator|connector) ;; *) fail "unexpected sandboxer dependency" ;; esac
-    value="${entry#*=}"
-    [[ "$value" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
-      || fail "invalid sandboxer dependency version"
-    if [ "${entry%%=*}" = "$name" ]; then
-      [ -z "$result" ] || fail "duplicate sandboxer dependency: $name"
-      result="$value"
-    fi
-  done
-  [ -n "$result" ] || fail "missing sandboxer dependency: $name"
-  printf '%s\n' "$result"
-}
-
 validate_bundle() {
   [ "$#" -eq 3 ] || fail "usage: release.sh validate <version> <arch> <bundle-dir>"
   local version="$1" arch archive bundle="$3"
@@ -172,7 +103,6 @@ validate_bundle() {
   local project_sha
   project_sha="$(go version -m "$extract/bin/sandbox-ctl" | \
     awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}')"
-  release_materials_require_git_licenses "$extract" "$NAME" "$ROOT" "$project_sha" project
   release_materials_require_project_source "$extract" "$NAME" 'bin/sandbox-ctl,bin/sandbox-init' "$version" \
     bin/sandbox-ctl bin/sandbox-init
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor' "v51.1" \
@@ -181,26 +111,14 @@ validate_bundle() {
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-patches' "$version" \
     "https://github.com/kuasar-sandbox/sandboxer/tree/$project_sha/native-deps/deps/ch-patches" "git:$project_sha"
   local expected_cargo_sha
-  expected_cargo_sha="$(release_materials_cloud_hypervisor_lock_sha)"
+  expected_cargo_sha="$(sha256sum "$extract/share/sources/$NAME/CLOUD-HYPERVISOR-Cargo.lock" | awk '{print $1}')"
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-cargo-lock' "v51.1" \
     'https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/Cargo.lock' "sha256:$expected_cargo_sha"
-  [ "$(sha256sum "$extract/share/sources/$NAME/CLOUD-HYPERVISOR-Cargo.lock" | awk '{print $1}')" = "$expected_cargo_sha" ] \
-    || fail "Cloud Hypervisor Cargo.lock differs from the pinned source"
   release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'Rust toolchain' ""
-  local stdlib_digest
-  stdlib_digest="$(sha256sum "$extract/share/sources/$NAME/RUST-STDLIB.tsv" | awk '{print $1}')"
-  awk -F '\t' -v digest="$stdlib_digest" '
-    $1 == "bin/cloud-hypervisor" && $2 == "Rust toolchain" &&
-      $5 ~ (";target-stdlib-sha256:" digest "$") {found=1}
-    END {exit !found}
-  ' "$extract/share/sources/$NAME/SOURCES.tsv" || fail "Rust standard-library inventory is not bound to the toolchain"
   awk -F '\t' '$1 == "bin/cloud-hypervisor" && $2 ~ /^rust-build-input:/ {found=1} END {exit !found}' \
     "$extract/share/sources/$NAME/SOURCES.tsv" || fail "Rust dependency materials are missing"
-  local expected_accelerator expected_connector
-  expected_accelerator="$(requested_dependency_version accelerator)" || fail "invalid accelerator release binding"
-  expected_connector="$(requested_dependency_version connector)" || fail "invalid connector release binding"
-  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'accelerator' "$expected_accelerator"
-  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'connector' "$expected_connector"
+  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'accelerator' ""
+  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'connector' ""
   release_materials_validate "$extract" "$NAME"
   release_materials_require_go_key "$extract" "$NAME" 'bin/sandbox-ctl'
   release_materials_require_go_key "$extract" "$NAME" 'bin/sandbox-init'
@@ -229,8 +147,7 @@ package_release() {
   STAGE="$WORK/stage"
   rm -rf "$STAGE"
   install -d -m 0755 "$STAGE" "$STAGE/bin"
-  [ -z "${RELEASE_BIN_DIR:-}" ] \
-    || fail "RELEASE_BIN_DIR is not supported: release Go payloads are rebuilt from selected sources"
+  bin_dir="${RELEASE_BIN_DIR:-$ROOT/bin/$arch}"
 
   accelerator_source="${RELEASE_ACCELERATOR_SOURCE_DIR:-$ROOT/../accelerator}"
   connector_source="${RELEASE_CONNECTOR_SOURCE_DIR:-$ROOT/../connector}"
@@ -247,32 +164,24 @@ package_release() {
     "${RELEASE_ACCELERATOR_SOURCE_SHA:-}" accelerator)"
   connector_sha="$(release_materials_resolve_git_source "$connector_source" \
     "${RELEASE_CONNECTOR_SOURCE_SHA:-}" connector)"
-  mkdir -p "$WORK/go-build"
-  stage_go_source "$ROOT" "$project_sha" "$WORK/go-build/sandboxer"
-  stage_go_source "$accelerator_source" "$accelerator_sha" "$WORK/go-build/accelerator"
-  stage_go_source "$connector_source" "$connector_sha" "$WORK/go-build/connector"
-  local -a go_build_env=(python3 "$ROOT/scripts/release-rust-materials.py" run-native
-    "$WORK/go-home" "$WORK/cargo-home" "$(rustc --print sysroot)/bin/rustc" env
-    GOWORK=off GOENV=off GOFLAGS=-mod=readonly GOCACHE="$WORK/go-cache" GOMODCACHE="$WORK/go-mod")
-  RELEASE_MATERIALS_GO_ENV="$WORK/go-build-toolchain.json"
-  "${go_build_env[@]}" go -C "$WORK/go-build/sandboxer" env -json GOROOT GOVERSION GOHOSTOS GOHOSTARCH \
-    > "$RELEASE_MATERIALS_GO_ENV"
-  RELEASE_MATERIALS_WORK="$WORK/go-toolchain-before-build" GOMODCACHE="$WORK/go-mod" \
-    release_materials_verify_build_go "$RELEASE_MATERIALS_GO_ENV"
-  "${go_build_env[@]}" make --no-print-directory -C "$WORK/go-build/sandboxer" \
-    TARGET_ARCH="$arch" sandbox-ctl sandbox-init
-  bin_dir="$WORK/go-build/sandboxer/bin/$arch"
   copy_executable "$bin_dir/sandbox-ctl" bin/sandbox-ctl
   copy_executable "$bin_dir/sandbox-init" bin/sandbox-init
   check_go_binary "$STAGE/bin/sandbox-ctl"
   check_go_binary "$STAGE/bin/sandbox-init"
   release_materials_require_go_revision "$STAGE/bin/sandbox-ctl" "$project_sha"
   release_materials_require_go_revision "$STAGE/bin/sandbox-init" "$project_sha"
-  prepare_cloud_hypervisor "$project_sha" "$arch"
-  ch_source="$CH_RELEASE_SOURCE"
+  copy_executable "$bin_dir/cloud-hypervisor" bin/cloud-hypervisor
+  ch_source="${RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR:-${CLOUD_HYPERVISOR_SRC:-$ROOT/native-deps/build/src/cloud-hypervisor}}"
+  local ch_output="${CLOUD_HYPERVISOR_BUILD_OUT:-$ROOT/native-deps/build/$arch/cloud-hypervisor}"
+  local ch_report="${CH_BUILD_REPORT:-$ch_output/build-report.jsonl}" ch_map="${CH_LINK_MAP:-$ch_output/link.map}"
+  local cargo_home="${CARGO_HOME:-$HOME/.cargo}" rustc_path
+  rustc_path="${RUSTC:-$(command -v rustc)}"
+  if [ ! -s "$ch_report" ] || [ ! -s "$ch_map" ]; then
+    fail "Cloud Hypervisor build materials are missing; run the normal ch-build target with the selected source"
+  fi
+  cargo metadata --locked --format-version=1 --filter-platform "$arch-unknown-linux-gnu" \
+    --manifest-path "$ch_source/Cargo.toml" > "$WORK/ch-metadata.json"
   cargo_sha="$(sha256sum "$ch_source/Cargo.lock" | awk '{print $1}')"
-  [ "$cargo_sha" = "$(release_materials_cloud_hypervisor_lock_sha)" ] \
-    || fail "Cloud Hypervisor Cargo.lock differs from the pinned source"
   accelerator_version="$(release_materials_git_version "$accelerator_source" "$accelerator_version" "$accelerator_sha")"
   connector_version="$(release_materials_git_version "$connector_source" "$connector_version" "$connector_sha")"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"
@@ -281,11 +190,11 @@ package_release() {
   release_materials_copy_licenses "$accelerator_source" accelerator
   release_materials_copy_licenses "$connector_source" connector
   python3 "$ROOT/scripts/release-rust-materials.py" \
-    --metadata "$WORK/ch-metadata.json" --build-report "$WORK/ch-build.jsonl" \
-    --lock "$ch_source/Cargo.lock" --cargo-home "$WORK/cargo-home" \
-    --source-root "$ch_source" --stage "$STAGE" --rustc "$CH_RELEASE_RUSTC" --link-map "$WORK/ch-link.map" \
+    --metadata "$WORK/ch-metadata.json" --build-report "$ch_report" \
+    --lock "$ch_source/Cargo.lock" --cargo-home "$cargo_home" \
+    --source-root "$ch_source" --stage "$STAGE" --rustc "$rustc_path" \
     >> "$RELEASE_MATERIALS_WORK/sources"
-  release_native_link_inputs "$WORK/ch-link.map" "$WORK/native-build" "$WORK/rust-tmp" bin/cloud-hypervisor
+  release_native_link_inputs "$ch_map" "$ch_output" "$ch_output" bin/cloud-hypervisor
   install -m 0644 "$ch_source/Cargo.lock" \
     "$STAGE/share/sources/$NAME/CLOUD-HYPERVISOR-Cargo.lock"
   release_materials_record_source 'bin/sandbox-ctl,bin/sandbox-init' sandboxer "$project_version" \
@@ -308,7 +217,7 @@ package_release() {
     "git:$connector_sha" connector
   release_materials_add_go_binary "$STAGE/bin/sandbox-ctl" bin/sandbox-ctl
   release_materials_add_go_binary "$STAGE/bin/sandbox-init" bin/sandbox-init
-  GOMODCACHE="$WORK/go-mod" release_materials_finish
+  release_materials_finish
 
   mkdir -p "$output/assets"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \

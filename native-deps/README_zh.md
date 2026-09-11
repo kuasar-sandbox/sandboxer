@@ -38,139 +38,80 @@ make cloud-hypervisor TARGET_ARCH=aarch64
 1. 下载并缓存 Cloud Hypervisor pin 版本 tarball。
 2. 解压到 `build/src/cloud-hypervisor`。
 3. 初始化 git 基线并应用 `deps/ch-patches/*.patch`。
-4. 若目标文件不存在,用 cargo 构建 `cloud-hypervisor`。
+4. 若目标文件或材料记录不存在,用 Cargo 构建 `cloud-hypervisor`。
 5. 拷贝到 `bin/<arch>/cloud-hypervisor`。
 
-已有目标文件时构建会跳过。需要强制重建时删除
+目标文件、构建报告和链接映射均存在时构建会跳过。需要强制重建时删除
 `bin/<arch>/cloud-hypervisor` 或执行 `make clean` 后重跑。格式化 patch 本身不会使
 已有 binary 失效。`make clean` 删除 native 构建输出与 bin,保留 patch 源码工作区和 tarball 缓存。
 
-发行工作流在上传前把已完成归档的 SHA-256 记录为 build job output。发布者通过
-`RELEASE_ARCHIVE_SHA256` 接收这一独立值,在任何 Tag/Release 写入前核对;不能用
-下载后从 bundle 重新计算的值代替。即使重算 bundle 自身的校验和,全部载荷与材料
-仍须匹配该次已完成构建。本地打包和独立验证不要求这个发布输入。该记录不证明
-编译器来源,也不构成对不可信候选代码的隔离。
+使用组件 Makefile 从选定源码构建。`release.sh package` 使用匹配的
+`bin/<arch>` 二进制,或显式指定的 `RELEASE_BIN_DIR`;只收集材料并生成 bundle,
+不重新构建二进制,不重置源码或构建缓存。所选源码 checkout、依赖版本、原生
+构建记录与产物应一并保留。
 
-发行验证要求无凭据、仅 HTTPS 代理的 module 路由:拒绝 `direct` 回退,
-并用 `GOVCS=*:off` 禁止访问 module 选择的 VCS 主机。收集与验证最多接受
-512 个实际 Go module;每个 Go 验证子进程有五分钟期限,发布 job 有 30 分钟期限。
-每个声明文件及目录都必须属于已验证的源码、module、toolchain 或系统材料根目录;
-布局父目录不允许夹带未声明的兄弟材料。这些限制不改变普通开发的路由配置。
+打包记录实际 Go 版本和生效的 module 替换。Go/module LICENSE、NOTICE 取自所选
+编译器安装和匹配的 module 源码,保留嵌套路径。模块解析沿用正常 Go 缓存与路由,
+下载模块的校验和须匹配二进制记录。只有明确单独采集的内部兄弟组件使用其自身
+源码材料;组织命名空间本身不豁免其他模块。官方包中不受支持的第三方本地替换
+需要改用带版本的 module 输入。现有 Kuasar 本地 `replace` 继续使用。
 
-Go 依赖及工具链下载使用全新的私有 module/VCS 状态、已启用的 checksum database
-和 `GOAUTH=off`。它们清除持久化 Go 设置、私有 module 绕过规则、Git 配置与调用者凭据,仅保留已验证的
-无凭据路由。下载来源或工具链之前,上传的 Go 记录键必须匹配官方载荷的精确名称;
-路径别名会被拒绝。这些发行检查不改变普通开发中的 module 认证方式。
-只有精确的 Accelerator 和 Connector module 使用单独认证的内部源码声明。
-组织内的其他 module 与外部依赖一样,必须通过 module 校验和与许可材料验证。
-来源清单在逐行处理前拒绝重复或过量记录;每份元数据表上限为 16 MiB,
-来源清单上限为 16,384 行。
-RPM 声明收集核对已安装包列表及每个同源兄弟包文件列表的真实退出状态。
-即使另一个包已提供有效声明,部分枚举失败仍会终止收集,不把部分输出当作完整覆盖。
+材料放在 `share/licenses/<component>` 和 `share/sources/<component>`。
+后者包含 `SOURCES.tsv`、`GO-BUILD-INFO.tsv`、`GO-MODULES.tsv` 与
+`MATERIALS.sha256`。声明缺失、子目录不可读或遍历不完整时收集失败。
+独立验证检查交付清单、校验和、必需文件、来源记录相符性、载荷身份及归档路径/
+类型/权限。它不获取源码 checkout 或 Go 模块,不与远端源码树比较许可正文,
+也不下载或认证编译器分发。校验和及 VCS 记录是相符性检查,不能证明任意生产者的身份。
 
-可信发布端根据已验证请求生成标准发行正文及来源/Preview 标记。下载的
-`release-notes.md` 只是本地 bundle 辅助说明,不能决定公开发行正文或对账来源。
+归档名称标识请求的发行目标。项目及内部依赖记录在本地 Tag 匹配所选 commit 时
+使用发行版本,否则记录 `git:<commit>`;打包不要求创建未来目标 Tag。
+发布者在 Tag/Release 写入前把选定项目 SHA 传入验证器,采用 bundle 中
+`release-notes.md` 正文,追加既有来源/Preview 标记。可信源码选择、构建/发布
+权限分离及拒绝替换已发布资产的要求保持不变。
 
-发行打包不复用上述开发二进制或 patch 工作区。它还从选定的 sandboxer、
-accelerator、connector commit 建立全新 checkout,以 `GOWORK=off` 和只读 module
-解析重新构建 `sandbox-ctl`、`sandbox-init`。不会复制被忽略的开发输入或旧兄弟
-二进制,并拒绝 `RELEASE_BIN_DIR` 覆盖。暂存前会核对 Go VCS 信息是否匹配所选
-项目 commit。Go 构建采用相同的凭据过滤策略及私有构建/module 缓存,可保留
-无凭据的 HTTPS `GOPROXY` 路由。还保留配置的 `GOSUMDB` 标识及可选的无凭据
-HTTPS 镜像,以及 `GOTOOLCHAIN` 选择;默认分别为 `sum.golang.org` 和 `local`,
-不会使仅用本地工具链的 CI 静默启用编译器自动选择。格式非法或带认证的路由在构建前
-即被拒绝。
+组件包包含 `sandbox-ctl`、`sandbox-init` 和 `cloud-hypervisor`。使用已有的
+`RELEASE_*_SOURCE_DIR`、`RELEASE_*_SOURCE_SHA` 与 `RELEASE_*_VERSION`
+选择匹配的 Accelerator/Connector 源码。普通本地替换构建不要求远端目标 Tag。
+Go VCS 记录必须匹配所选 sandboxer commit。
 
-发行打包记录全新构建上下文实际选定的 Go 编译器,在构建前后将其分发输入与匹配的
-`golang.org/toolchain` 归档逐项比较;归档由配置的 checksum database 认证。这覆盖
-编译器、标准库源码及该分发中的其他文件。完整 Go 安装中额外的非构建 `api`、
-`doc`、`misc`、`test` 文件不在认证范围,也不作为发行许可来源;核对时处理标准的
-`go.mod`/`_go.mod` 安装转换。Go 许可/NOTICE 正文来自已验证归档,包括编译器和
-标准库内嵌依赖的材料,保留各自相对路径。独立验证还会
-重新核对其字节、来源 URL 和 module h1。版本字符串或重算 bundle 校验和不能替代
-来源核对。验证要求启用 checksum database 并取得匹配的归档/缓存;即使采用
-`GOTOOLCHAIN=local`,也可能获取核验材料,但不切换构建编译器或静默启用工具链
-自动选择。这些检查以可信构建主机为前提,不证明已失陷主机可信。
+Cloud Hypervisor 打包使用所选预构建二进制及其源码树,默认源码位置为
+`native-deps/build/src/cloud-hypervisor`;可用已有的
+`RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR` 或 `CLOUD_HYPERVISOR_SRC` 选择另一个
+匹配位置。正常 Cargo 构建在 `native-deps/build/<arch>/cloud-hypervisor`
+保留 `build-report.jsonl` 与 `link.map`。
+`CLOUD_HYPERVISOR_BUILD_OUT`、`CH_BUILD_REPORT`、`CH_LINK_MAP` 可选择已有
+输出及记录的位置。旧二进制没有这些记录时,用匹配源码执行正常的
+`make -C native-deps ch-build` (在 sandboxer 根目录);打包本身不建立新 checkout 或重建。
+构建 flag、正常 Cargo 缓存及路由继续可用。
 
-归档名称仍标识请求的发行目标;项目来源记录
-只有在本地 Tag 匹配所选 commit 时才使用该版本,否则记录 `git:<commit>`。
-验证器将两个 Go 二进制及项目来源 URL/摘要绑定到该 commit;发布者传入预期
-commit,在任何 Tag/Release 写入前拒绝不匹配的包。独立验证将完整项目许可/NOTICE
-集合(含嵌套 `LICENSES`)与所选 commit 的 Git blob 比较;即使重算 bundle 校验和,
-内容变化、缺失或额外文件仍会被拒绝。验证前须取得该精确 commit;可信发布者获取
-源码历史用于检查,不执行候选源码或辅助脚本。验证还要求 Cloud Hypervisor pin 的
-来源 URL/摘要、所选项目 patch 集的 URL/commit,以及 pin 的上游 `Cargo.lock`
-URL 和字节。构建时也会用该预期 lock 摘要核对全新源码;更新 pin 或 lock 时必须
-同步更新此绑定。提供 `RELEASE_DEPENDENCIES`
-时,验证要求 accelerator、connector 的发行版本与请求完全一致;绑定缺失、重复、
-包含其他组件或发生冲突时,发布前即失败。普通的本地 replace 源码构建仍不要求
-远端目标 Tag。许可证收集拒绝不可读子目录和不完整遍历,不会仅发布可读的材料。
-官方组件包不支持没有已认证 module 校验和的第三方本地 Go 替换,应选择带版本
-的 module 替换。现有 Kuasar 兄弟仓本地替换和普通源码开发不变。
-它把选定的 sandboxer commit
-解到临时目录,验证 pin 的 Cloud Hypervisor tarball、应用该 commit 的 patch,
-再用本次所属的私有 Cargo home 按锁文件重新构建。Python 3.11 或更新版本从
-实际 Cargo 构建报告采集来源材料:registry crate 归档必须匹配 `Cargo.lock`
-checksum,Git 依赖必须匹配锁文件中的完整 commit。清单只列本次实际构建输入,
-包括构建期和过程宏依赖;不表示所列每个 crate 的代码都进入交付物。可修改的
-解压缓存不是 registry 许可证的权威来源。
-Git crate 材料包括 manifest 显式声明的 `license-file`,即使它采用非标准文件名,
-或位于 crate 上层的 workspace 根目录。路径必须留在选定仓库内,且对应已跟踪的
-普通文件;所有收集字节取自锁定的 Git commit,不取自可修改的 checkout 声明。
-私有 Cargo home 只继承调用者源配置中无凭据的 HTTPS registry 路由,不复制
-Token、凭据提供器、构建包装器或 directory/git source 覆盖项。
-原生构建命令使用显式环境允许列表和私有 home,不继承 Cargo Token、云/发布凭据
-或 SSH agent 设置。发行打包拒绝编译器及 wrapper 覆盖;全新发行构建还明确
-拒绝非空的 `GOEXPERIMENT`、`RUSTFLAGS` 和
-`CARGO_ENCODED_RUSTFLAGS`,不会静默丢弃请求的设置。普通开发构建继续接受已有
-构建 flag。Cargo 和材料记录使用
-选定工具链的同一个精确 `rustc` 可执行文件,并记录其摘要。这是可信发行输入的
-凭据卫生措施,不能代替对不可信 CI 候选的隔离。
-保留标准 `CARGO_NET_GIT_FETCH_WITH_CLI` 布尔选项;Git CLI 传输不可用时,
-可设为 `false` 选择 Cargo 内置 Git 传输。
-已发布的 `vhost` crate 未包含 workspace 根许可证。补充文件取自通过 checksum
-验证的 crate 内 Cargo VCS 记录所指的精确 Git commit,且先将上游 package manifest
-与该 crate 的 `Cargo.toml.orig` 对比。不会按当前分支或另行维护的版本清单选取材料。
+Python 3.11 或更新版本从实际 Cargo 构建报告和锁定的依赖图收集材料。
+Registry crate 归档须匹配 `Cargo.lock` checksum,Git 依赖使用其中的完整
+commit。清单只列实际观察到的输入,包括构建期及过程宏依赖;不表示每个 crate
+的代码都进入交付物。收集的 `Cargo.lock` 与其来源记录须一致。原生 pin 变化
+需要同步更新配方、来源记录与材料。
 
-组件归档按组件目录隔离这些 crate 的许可/NOTICE 文件及 Rust 工具链的版权和
-许可材料。未知来源、材料缺失、归档被改动或构建未成功都会导致打包失败。
-crate 目录还包含完整 Cargo 来源身份的摘要,不同 registry 或 Git commit 中同名、
-同版本的包不会相互覆盖许可文件。
-若两个不同原生链接输入将使用同一个系统材料名称,打包会在第二个输入覆盖声明
-之前拒绝冲突。
-Rustup 标准库声明取自官方 `rustc` 分发,不取自可修改的本地文档。其 HTTPS
-发行清单必须匹配所选编译器的完整 Git commit、release 字符串及 host;完整归档
-须匹配清单中的 SHA-256 后,才采集生成的标准库版权及许可正文。Stable 按精确
-版本选择;beta/nightly 按已安装的固定日期定位清单,并核对同一完整 commit。
-`RUST-NOTICES.tsv` 记录清单/归档 URL 和摘要。该检查不替换或安装工具链。
-采集器采用构建所用的无凭据 HTTPS `RUSTUP_DIST_SERVER` 根地址,默认值为
-`https://static.rust-lang.org`,支持镜像路径前缀。清单与编译器下载均使用该根地址;
-镜像清单保留的上游 URL 也经相同镜像读取。其他来源或含凭据的服务器 URL
-会被拒绝,不省略 commit/摘要检查。参见 [Rustup 环境变量说明](https://rust-lang.github.io/rustup/environment-variables.html)。
-参见 Rust 的[分发布局](https://forge.rust-lang.org/infra/channel-layout.html)。
-继续支持已安装的同源 Debian/RPM 包声明;材料缺失时给出安装提示并拒绝打包。
-发行版 Rust 声明的字节必须匹配已安装包摘要和源包
-身份。包所属的符号链接仅在解析后目标通过核验时复制为普通文件;Debian
-Multi-Arch 共同所有者必须全部一致。引用的 common-license 正文保留自身的包
-身份。这些检查不证明主机或包数据库可信。
-最终链接映射确定所选目标的 sysroot。`RUST-STDLIB.tsv`
-列出该目标完整 `.rlib` 输入集相对 sysroot 的路径及 SHA-256,包括 LTO 在最终
-链接前消费的标准库 bitcode,不声称清单中每个归档都链入了结果。清单摘要绑定到
-Rust 工具链记录。这些是实际工具链输入的摘要,不将本地修改过的工具链声称为
-未经修改的上游发行物。
-本次最终链接映射还用于选择 Cloud Hypervisor 实际使用的系统静态库和启动对象,
-收录其已安装源包标识、输入摘要、版权及引用的许可正文。本次构建临时对象仍由
-CH/Rust 来源记录覆盖。
-每个已安装系统输入还必须匹配可信构建主机 Debian 或 RPM 数据库中的文件摘要,
-仅有包归属不足以证明来源。文件记录缺失、歧义或内容变更都会导致打包失败。
-这检查已安装文件的完整性,不证明已失陷主机或包数据库可信。
-版权、许可和 NOTICE 正文字节也必须匹配已安装包的文件摘要,且所属源包与链接
-输入一致。引用的 Debian common-license 正文按其自身所有者核验;Multi-Arch
-共同所有者必须全部认同文件字节与要求的源包身份。许可记录缺失、内容变化或
-归属冲突时拒绝收集。
-发行打包器不接受 `RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR` 和上游 tarball 环境覆盖项;
-源码开发仍可通过 Makefile 覆盖输入。变更 pin 必须同时更新、验证构建配方和来源
-记录。这些检查支持发行检视,不构成法律认证。
+Git crate 材料包含 manifest 显式声明的 `license-file`,即使文件名非标准或
+位于 crate 上层的 workspace 根目录。路径须留在所选仓库内并指向已跟踪的普通
+文件;收集读取锁定的 Git commit。Registry 声明取自匹配的 crate 归档。
+已发布的 `vhost` crate 缺少 workspace 根许可证:补充文件取自通过 checksum
+验证的 Cargo VCS 记录所指的精确 Git commit,且先将上游 package manifest 与
+该 crate 的 `Cargo.toml.orig` 比较,不由移动分支选择材料。
+
+Crate 材料目录包含完整 Cargo 来源身份的摘要,不同 registry 或 Git commit 中
+同名、同版本的包不能相互覆盖声明。Rust 版权及许可正文取自所选安装的
+`share/doc/rust/COPYRIGHT-library.html`、`licenses/`,或对应的 Debian/RPM
+源包声明。记录实际 Rust 版本与编译器报告的源码 commit。声明缺失时给出安装
+提示;收集文件均为普通文件。
+
+匹配的 Cloud Hypervisor 链接映射选择实际使用的系统静态库及启动对象。打包记录
+文件摘要和已安装源包身份,收集版权/NOTICE 及引用的许可正文。本次构建临时对象
+由 CH/Rust 来源记录覆盖。不同输入不得覆盖同名材料。RPM 收集检查已安装包列表
+及每个同源兄弟包文件列表;即使其他兄弟包已提供有效声明,部分枚举仍算失败。
+已安装包归属用于来源归类,不用于与 dpkg/RPM 文件摘要逐字节认证或共同所有者认证。
+
+独立验证读取 bundle 自身的记录和声明,不需要项目/依赖 checkout、Cargo 下载或
+原生构建。组件载荷/材料命名空间、来源记录、权限及校验和检查保留。这些材料
+服务于发行检视,不构成法律认证,也不构成对不可信 CI 候选的隔离。
 
 ## 3. Patch 开发循环
 

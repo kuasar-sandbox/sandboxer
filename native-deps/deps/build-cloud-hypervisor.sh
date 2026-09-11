@@ -14,8 +14,8 @@
 #   - patches-apply requires HEAD == ch-patches-base; otherwise refuses
 #     and tells the user to format-extract WIP first, then reset.
 #   - patches-format clears stale .patch files before regenerating.
-#   - build skips if $BINDIR/cloud-hypervisor already exists; cargo is
-#     otherwise incremental.
+#   - build skips when the binary and material records already exist; Cargo
+#     otherwise reuses its normal incremental cache.
 #
 # Inputs (env, all optional):
 #   CLOUD_HYPERVISOR_TARBALL         URL or local path; supports "url#filename" form.
@@ -176,8 +176,10 @@ do_patches_format() {
 
 do_build() {
     local out_bin="$BINDIR/cloud-hypervisor"
-    if [ -x "$out_bin" ]; then
-        log "already built: $out_bin (delete it to force rebuild)"
+    local report="${CH_BUILD_REPORT:-$CH_BUILD_OUT/build-report.jsonl}"
+    local link_map="${CH_LINK_MAP:-$CH_BUILD_OUT/link.map}"
+    if [ -x "$out_bin" ] && [ -s "$report" ] && [ -s "$link_map" ]; then
+        log "already built: $out_bin (build materials retained)"
         exit 0
     fi
 
@@ -229,21 +231,13 @@ do_build() {
     cargo_env+=("RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$CH_SRC=. --remap-path-prefix=$cargo_home=/cargo")
 
     log "cargo build --release --bin cloud-hypervisor (cache hot ≈ seconds; cold ≈ 5-10 min)"
-    if [ -n "${CH_LINK_MAP:-}" ]; then
-        [ -n "${CH_BUILD_REPORT:-}" ] || die "CH_LINK_MAP requires CH_BUILD_REPORT"
-        env "${cargo_env[@]}" CARGO_TARGET_DIR="$CH_BUILD_OUT" cargo rustc --release --locked \
-            "${cargo_target_args[@]}" --message-format=json-render-diagnostics \
-            --manifest-path "$CH_SRC/Cargo.toml" --package cloud-hypervisor --bin cloud-hypervisor \
-            -- -C "link-arg=-Wl,-Map,$CH_LINK_MAP" | tee "$CH_BUILD_REPORT"
-    elif [ -n "${CH_BUILD_REPORT:-}" ]; then
-        env "${cargo_env[@]}" CARGO_TARGET_DIR="$CH_BUILD_OUT" cargo build --release --locked \
-            "${cargo_target_args[@]}" --message-format=json-render-diagnostics \
-            --manifest-path "$CH_SRC/Cargo.toml" --bin cloud-hypervisor | tee "$CH_BUILD_REPORT"
-    else
-        env "${cargo_env[@]}" CARGO_TARGET_DIR="$CH_BUILD_OUT" cargo build --release --locked \
-            "${cargo_target_args[@]}" \
-            --manifest-path "$CH_SRC/Cargo.toml" --bin cloud-hypervisor
-    fi
+    # Keep the existing Cargo/linker observations next to the normal build.
+    # Packaging consumes these records without a fresh checkout or cache reset.
+    env "${cargo_env[@]}" CARGO_TARGET_DIR="$CH_BUILD_OUT" TMPDIR="$CH_BUILD_OUT" \
+        cargo rustc --release --locked "${cargo_target_args[@]}" \
+        --message-format=json-render-diagnostics \
+        --manifest-path "$CH_SRC/Cargo.toml" --package cloud-hypervisor --bin cloud-hypervisor \
+        -- -C "link-arg=-Wl,-Map,$link_map" | tee "$report"
     mkdir -p "$BINDIR"
     cp "$CH_BUILD_OUT/$artifact_subdir/cloud-hypervisor" "$out_bin"
     chmod +x "$out_bin"
