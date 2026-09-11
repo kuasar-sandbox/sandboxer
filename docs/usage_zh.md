@@ -285,7 +285,9 @@ Restore/clone 检查采用一分钟采样周期, 要求第一次周期 tick 前�
 [存储故障 E2E](../test/e2e/e2e_usage_faults.sh) 使用私有有界 tmpfs 产生真实
 ENOSPC, 并用限定 usage 路径的 `strace` 注入 Sync 失败和延迟写入; 还覆盖
 SIGKILL 与亚秒级 Guest 运行. 注入不作用于业务可写盘的同步操作, 也不模拟
-物理掉电. 需要 `strace`、mount 权限及普通 KVM E2E 前置条件.
+物理掉电. Host 强杀案例在崩溃前固定并验证自己的 CH 子进程, 然后通过
+pidfd 确认该子进程在有界清理预算内退出, 不把清理留给 runner.
+需要 Linux/Python pidfd 支持、`strace`、mount 权限及普通 KVM E2E 前置条件.
 
 在没有其他并发测试负载时, 以 root 权限和已组装的 `BIN` 运行
 [off/on 测量脚本](../test/e2e/usage_perf.py):

@@ -1,5 +1,6 @@
 import errno
 import io
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -7,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from usage import Sandbox, autonomous_balloon_prefix
+import usage
 import usage_perf
 import usage_trace
 import usage_faults
@@ -34,6 +36,32 @@ class BalloonWitnessTests(unittest.TestCase):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_crash_cleanup_terminates_a_real_pinned_process(self):
+        # Exercise real Linux pidfd readiness/signal/close, without KVM or
+        # killing the test process standing in for the already-dead Host.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sleeper = usage_faults.shutil.which("sleep")
+            self.assertIsNotNone(sleeper)
+            (root / "cloud-hypervisor").symlink_to(sleeper)
+            child = subprocess.Popen([sleeper, "30"], start_new_session=True)
+            try:
+                (root / "run.log").write_text(f"CH started pid={child.pid}\n")
+                sb = unittest.mock.Mock()
+                sb.dir, sb.process.pid = root, os.getpid()
+                sb.process.poll.return_value = None
+                sb.process.wait.return_value = -usage_faults.signal.SIGKILL
+                with patch.object(usage, "BIN", root):
+                    result = usage_faults.kill_host_and_stop_ch(sb)
+                self.assertTrue(result["ch_exited"])
+                self.assertEqual(result["ch_pid"], child.pid)
+                self.assertIn(child.wait(timeout=2), (-usage_faults.signal.SIGTERM, -usage_faults.signal.SIGKILL))
+                sb.process.kill.assert_called_once()
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+
     def test_stop_cli_spawn_failure_still_reaps_owned_vm(self):
         sb = Sandbox.__new__(Sandbox)
         sb.process, sb.log = unittest.mock.Mock(), io.StringIO()
@@ -182,6 +210,183 @@ class CleanupTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 usage_faults.collect_and_unmount(Path("mounted"), sb)
         run.assert_called_once_with("umount", Path("mounted"))
+
+
+class CrashCleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.sb = unittest.mock.Mock()
+        self.sb.dir, self.sb.process.pid = Path("owned"), 123
+        self.sb.process.poll.return_value = None
+        self.sb.process.wait.return_value = -usage_faults.signal.SIGKILL
+
+        def start(target, *args, **kwargs):
+            p = patch.object(target, *args, **kwargs)
+            value = p.start()
+            self.addCleanup(p.stop)
+            return value
+
+        self.read = start(usage_faults.Path, "read_text", side_effect=["CH started pid=456\n", "PPid:\t123\n"])
+        self.identity = start(usage_faults.Path, "samefile", return_value=True)
+        self.open = start(usage_faults.os, "pidfd_open", return_value=42)
+        self.close = start(usage_faults.os, "close")
+        self.send = start(usage_faults.signal, "pidfd_send_signal")
+        self.poller = start(usage.select, "poll").return_value
+        self.poller.poll.side_effect = [[], [(42, usage.select.POLLIN)]]
+
+    def test_host_crashes_before_ch_cleanup(self):
+        self.send.side_effect = lambda *_: self.sb.process.wait.assert_called_once_with(timeout=10)
+        result = usage_faults.kill_host_and_stop_ch(self.sb)
+        self.assertEqual(result, {"host_pid": 123, "ch_pid": 456, "signals": [15], "ch_exited": True})
+        self.open.assert_called_once_with(456)
+        self.send.assert_called_once_with(42, usage_faults.signal.SIGTERM)
+        self.close.assert_called_once_with(42)
+        self.sb.process.kill.assert_called_once()
+
+    def test_term_timeout_escalates_only_the_pinned_child(self):
+        self.poller.poll.side_effect = [[], [], [(42, usage.select.POLLIN)]]
+        result = usage_faults.kill_host_and_stop_ch(self.sb)
+        self.assertEqual(result["signals"], [15, 9])
+        self.assertEqual(self.poller.poll.call_args_list, [unittest.mock.call(0), unittest.mock.call(2000), unittest.mock.call(5000)])
+        self.assertEqual(self.send.call_args_list, [unittest.mock.call(42, 15), unittest.mock.call(42, 9)])
+        self.close.assert_called_once_with(42)
+
+    def test_already_exited_child_is_not_signalled(self):
+        self.poller.poll.side_effect = [[(42, usage.select.POLLIN)]]
+        self.assertTrue(usage_faults.kill_host_and_stop_ch(self.sb)["ch_exited"])
+        self.send.assert_not_called()
+        self.close.assert_called_once_with(42)
+
+    def test_pid_reuse_or_wrong_binary_fails_before_host_kill(self):
+        for parent, binary in ((999, True), (123, False)):
+            with self.subTest(parent=parent, binary=binary):
+                self.read.side_effect = ["CH started pid=456\n", f"PPid:\t{parent}\n"]
+                self.identity.return_value = binary
+                with self.assertRaises(AssertionError):
+                    usage_faults.kill_host_and_stop_ch(self.sb)
+        self.sb.process.kill.assert_not_called()
+        self.send.assert_not_called()
+        self.assertEqual(self.close.call_count, 2)
+
+    def test_host_wait_failure_still_stops_ch(self):
+        original = subprocess.TimeoutExpired("host", 10)
+        self.sb.process.wait.side_effect = original
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            usage_faults.kill_host_and_stop_ch(self.sb)
+        self.assertIs(caught.exception, original)
+        self.send.assert_called_once_with(42, usage_faults.signal.SIGTERM)
+        self.close.assert_called_once_with(42)
+
+    def test_ch_timeout_is_not_success(self):
+        self.poller.poll.side_effect = [[], [], []]
+        with self.assertRaisesRegex(AssertionError, "cleanup budget"):
+            usage_faults.kill_host_and_stop_ch(self.sb)
+        self.close.assert_called_once_with(42)
+
+    def test_enclosing_handled_timeout_does_not_hide_cleanup_failure(self):
+        self.poller.poll.side_effect = [[], [], []]
+        try:
+            raise subprocess.TimeoutExpired("normal stop", 20)
+        except subprocess.TimeoutExpired:
+            with self.assertRaisesRegex(AssertionError, "cleanup budget"):
+                usage.kill_host_and_stop_ch(self.sb)
+        self.close.assert_called_once_with(42)
+
+    def test_stop_timeout_uses_pinned_ch_cleanup(self):
+        self.sb.log = io.StringIO()
+        self.sb.process.wait.side_effect = [subprocess.TimeoutExpired("host", 20), -9]
+        self.sb.process.returncode = -9
+        self.read.side_effect = ["CH started pid=456\n", "CH started pid=456\n", "PPid:\t123\n"]
+        with patch.object(usage, "write_json") as write:
+            with self.assertRaisesRegex(AssertionError, "sandbox exit=-9"):
+                Sandbox.stop(self.sb)
+        self.sb.process.kill.assert_called_once()
+        self.send.assert_called_once_with(42, usage.signal.SIGTERM)
+        self.assertTrue(self.sb.log.closed)
+        self.assertTrue(write.call_args.args[1]["ch_exited"])
+        self.close.assert_called_once_with(42)
+
+    def test_stop_timeout_before_ch_start_still_kills_host(self):
+        self.sb.log = io.StringIO()
+        self.sb.process.wait.side_effect = [subprocess.TimeoutExpired("host", 20), -9]
+        self.sb.process.returncode = -9
+        self.read.side_effect = ["setup not complete\n"]
+        with self.assertRaisesRegex(AssertionError, "sandbox exit=-9"):
+            Sandbox.stop(self.sb)
+        self.sb.process.kill.assert_called_once()
+        self.open.assert_not_called()
+        self.send.assert_not_called()
+        self.assertTrue(self.sb.log.closed)
+
+    def test_stop_timeout_after_ch_reaped_still_kills_host(self):
+        self.sb.log = io.StringIO()
+        self.sb.process.wait.side_effect = [subprocess.TimeoutExpired("host", 20), -9]
+        self.read.side_effect = ["CH started pid=456\n", "CH started pid=456\n"]
+        original = ProcessLookupError("CH already reaped")
+        self.open.side_effect = original
+        with self.assertRaises(ProcessLookupError) as caught:
+            Sandbox.stop(self.sb)
+        self.assertIs(caught.exception, original)
+        self.sb.process.kill.assert_called_once()
+        self.assertEqual(self.sb.process.wait.call_args_list, [unittest.mock.call(timeout=20), unittest.mock.call(timeout=5)])
+        self.send.assert_not_called()
+        self.close.assert_not_called()
+        self.assertTrue(self.sb.log.closed)
+
+    def test_stop_identity_failure_never_signals_unverified_child(self):
+        self.sb.log = io.StringIO()
+        self.sb.process.wait.side_effect = [subprocess.TimeoutExpired("host", 20), -9]
+        self.read.side_effect = ["CH started pid=456\n", "CH started pid=456\n", "PPid:\t999\n"]
+        with self.assertRaisesRegex(AssertionError, "not this live Host"):
+            Sandbox.stop(self.sb)
+        self.sb.process.kill.assert_called_once()
+        self.send.assert_not_called()
+        self.close.assert_called_once_with(42)
+        self.assertTrue(self.sb.log.closed)
+
+    def test_stop_host_cleanup_error_preserves_ch_pin_failure(self):
+        self.sb.log = io.StringIO()
+        self.sb.process.wait.side_effect = subprocess.TimeoutExpired("host", 20)
+        self.sb.process.kill.side_effect = PermissionError("Host signal failed")
+        self.read.side_effect = ["CH started pid=456\n", "CH started pid=456\n"]
+        original = ProcessLookupError("CH already reaped")
+        self.open.side_effect = original
+        with patch.object(usage.sys, "stderr", io.StringIO()) as errors:
+            with self.assertRaises(ProcessLookupError) as caught:
+                Sandbox.stop(self.sb)
+        self.assertIs(caught.exception, original)
+        self.assertIn("Host signal failed", errors.getvalue())
+        self.send.assert_not_called()
+        self.assertTrue(self.sb.log.closed)
+
+    def test_stop_log_read_failure_still_kills_owned_host(self):
+        self.sb.log = io.StringIO()
+        self.sb.process.wait.side_effect = [subprocess.TimeoutExpired("host", 20), -9]
+        original = OSError("log read failed")
+        self.read.side_effect = original
+        with self.assertRaises(OSError) as caught:
+            Sandbox.stop(self.sb)
+        self.assertIs(caught.exception, original)
+        self.sb.process.kill.assert_called_once()
+        self.open.assert_not_called()
+        self.send.assert_not_called()
+        self.assertTrue(self.sb.log.closed)
+
+    def test_double_failure_preserves_host_error(self):
+        original = OSError("host kill failed")
+        self.sb.process.kill.side_effect = original
+        self.send.side_effect = PermissionError("CH signal failed")
+        with patch.object(usage_faults.sys, "stderr", io.StringIO()) as errors:
+            with self.assertRaises(OSError) as caught:
+                usage_faults.kill_host_and_stop_ch(self.sb)
+        self.assertIs(caught.exception, original)
+        self.assertIn("CH signal failed", errors.getvalue())
+        self.close.assert_called_once_with(42)
+
+    def test_bad_pidfd_event_is_not_exit(self):
+        self.poller.poll.side_effect = [[(42, usage.select.POLLNVAL)]]
+        with self.assertRaisesRegex(AssertionError, "unexpected pidfd event"):
+            usage_faults.kill_host_and_stop_ch(self.sb)
+        self.close.assert_called_once_with(42)
 
 
 class TraceIdentityTests(unittest.TestCase):

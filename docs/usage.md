@@ -359,7 +359,10 @@ The [storage-fault E2E](../test/e2e/e2e_usage_faults.sh) uses a private bounded
 tmpfs for real ENOSPC and path-restricted `strace` injection for usage Sync
 failure and delayed writes. It also exercises SIGKILL and a sub-second Guest
 run. Injection never targets the business writable disk's sync operations;
-these tests do not simulate physical power loss. `strace`, mount privileges
+these tests do not simulate physical power loss. The Host-kill case pins and
+verifies its CH child before the crash, then confirms that child's bounded
+termination through a pidfd; it does not leave cleanup to the runner.
+Linux/Python pidfd support, `strace`, mount privileges
 and the ordinary KVM E2E prerequisites are required.
 
 Run the [off/on harness](../test/e2e/usage_perf.py) without concurrent test

@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-from usage import BIN, Sandbox, digest, ext4, image_ref, metric, run, write_json
+from usage import BIN, Sandbox, digest, ext4, image_ref, kill_host_and_stop_ch, metric, run, write_json
 
 
 def inject(sb, syscall, action):
@@ -155,8 +155,7 @@ def main():
             elif name == "kill":
                 sb.cli("exec", "--", "/probe", "cpu", "1")
                 live = sb.view()
-                os.killpg(sb.process.pid, signal.SIGKILL)
-                sb.process.wait(timeout=10)
+                write_json(sb.dir / "crash-cleanup.json", kill_host_and_stop_ch(sb))
                 sb.log.close()
                 saved = sb.view()
                 write_json(sb.dir / "killed-live.json", live)

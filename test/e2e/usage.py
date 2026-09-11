@@ -7,10 +7,13 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
+import select
 import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -123,15 +126,77 @@ class Sandbox:
                     self.process.wait(timeout=20)
                 except subprocess.TimeoutExpired:
                     try:
-                        os.killpg(self.process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    self.process.wait(timeout=5)
+                        if "CH started pid=" in (self.dir / "run.log").read_text():
+                            write_json(self.dir / "crash-cleanup.json", kill_host_and_stop_ch(self))
+                        else:
+                            self.process.kill()
+                            self.process.wait(timeout=5)
+                    except BaseException:
+                        # CH may already have been reaped while the Host is
+                        # draining backends. A log/pin/cleanup failure must
+                        # still terminate this owned Popen Host.
+                        try:
+                            if self.process.poll() is None:
+                                self.process.kill()
+                                self.process.wait(timeout=5)
+                        except BaseException as error:
+                            print(f"usage Host cleanup: {error}", file=sys.stderr)
+                        raise
         finally:
             self.log.close()
         if command_error is not None:
             raise command_error
         assert self.process.returncode == 0, f"sandbox exit={self.process.returncode}; log={self.dir / 'run.log'}"
+
+
+def kill_host_and_stop_ch(sb):
+    # CH has its own process group. Killing the Host's group does not stop
+    # that VMM. Pin and verify this test's child before the Host dies; never
+    # signal a numeric CH PID parsed from an old log after it can be reused.
+    matches = re.findall(r"CH started pid=(\d+)", (sb.dir / "run.log").read_text())
+    assert len(matches) == 1, "expected one owned CH process"
+    ch_pid = int(matches[0])
+    ch_fd = os.pidfd_open(ch_pid)
+    result = {"host_pid": sb.process.pid, "ch_pid": ch_pid, "signals": [], "ch_exited": False}
+    try:
+        status = dict(line.split(":", 1) for line in Path(f"/proc/{ch_pid}/status").read_text().splitlines())
+        assert int(status["PPid"]) == sb.process.pid and sb.process.poll() is None, "CH is not this live Host's child"
+        assert Path(f"/proc/{ch_pid}/exe").samefile(BIN / "cloud-hypervisor"), "CH executable identity mismatch"
+        poller = select.poll()
+        poller.register(ch_fd, select.POLLIN)
+
+        def exited(timeout):
+            events = poller.poll(timeout)
+            assert all(fd == ch_fd and flags & select.POLLIN for fd, flags in events), "unexpected pidfd event"
+            return bool(events)
+
+        host_error = None
+        try:
+            sb.process.kill()  # SIGKILL the Host, not a graceful usage save.
+            assert sb.process.wait(timeout=10) == -signal.SIGKILL, "Host was not killed by SIGKILL"
+        except BaseException as error:
+            host_error = error
+            raise
+        finally:
+            try:
+                result["ch_exited"] = exited(0)
+                for sig, budget_ms in ((signal.SIGTERM, 2000), (signal.SIGKILL, 5000)):
+                    if result["ch_exited"]:
+                        break
+                    try:
+                        signal.pidfd_send_signal(ch_fd, sig)
+                        result["signals"].append(int(sig))
+                    except ProcessLookupError:
+                        pass  # Exit raced the signal; still verify the pidfd.
+                    result["ch_exited"] = exited(budget_ms)
+                assert result["ch_exited"], "owned CH did not exit within cleanup budget"
+            except BaseException as error:
+                if host_error is None:
+                    raise
+                print(f"usage crash cleanup: {error}", file=sys.stderr)
+    finally:
+        os.close(ch_fd)
+    return result
 
 
 def metric(snapshot, group, name):
