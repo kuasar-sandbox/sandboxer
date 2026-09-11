@@ -18,6 +18,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
+	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
 )
 
@@ -117,5 +118,105 @@ func TestUsageInitFailure(t *testing.T) {
 				t.Fatalf("failed sampler wrote/truncated history: before=%d after=%d err=%v", len(before), len(after), err)
 			}
 		})
+	}
+}
+
+// A constructed sampler accounts for the Host process even when later setup
+// fails before CH exists. This differs from an uninitialized sampler above.
+func TestUsagePreSpawnFailurePreservesHistoryAndAccountsForHost(t *testing.T) {
+	for _, failure := range []string{"build", "spawn", "cancel", "forward"} {
+		for _, mode := range []string{"empty", "saved", "tail"} {
+			t.Run(failure+"/"+mode, func(t *testing.T) {
+				base, runDir := t.TempDir(), t.TempDir()
+				path := filepath.Join(base, "test.usage")
+				var previous []byte
+				if mode != "empty" {
+					m, err := usage.Open(base, "test", "old", time.Now(), time.Second, 5*time.Minute)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := m.Counter("guest.cpu", "old-source", 25, 100, true); err != nil {
+						t.Fatal(err)
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					m.Close(ctx, time.Now())
+					cancel()
+					previous, err = os.ReadFile(path)
+					if err != nil || m.View().Saved == nil {
+						t.Fatalf("seed: %v %+v", err, m.View())
+					}
+					if mode == "tail" {
+						if err := os.WriteFile(path, append(append([]byte(nil), previous...), []byte("KUUSAGE1")...), 0600); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				cow, err := vhost.OpenBlockCOW(filepath.Join(t.TempDir(), "disk"), nil, vhost.DiffInit{CreateSize: 4096})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer cow.Close()
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				buildErr := errors.New("injected pre-spawn build failure")
+				params := VMParams{
+					Ctx: ctx, SandboxID: "test", BaseDir: base, RunDir: runDir,
+					Logf: func(string, ...any) {}, CapBytes: 4096, UffdSource: uffd.ZeroSource{},
+					LaunchSpec: &proto.LaunchSpec{}, Disks: []DiskBackend{{Cow: cow}},
+					SnapCfg: &config.SandboxConfig{Usage: config.UsageConfig{Enabled: true},
+						Resources: config.ResourcesConfig{Capacity: config.CapacityConfig{CPU: 1}}},
+					BuildCmd: func(CmdEnv) (*exec.Cmd, func(), error) {
+						if failure == "build" {
+							return nil, func() {}, buildErr
+						}
+						if failure == "cancel" {
+							cancel()
+						}
+						return exec.Command(filepath.Join(runDir, "absent-CH")), func() {}, nil
+					},
+				}
+				if failure == "forward" {
+					params.Forwards = []ForwardSpec{{UDSPath: filepath.Join(runDir, "absent", "forward.sock"),
+						Network: "tcp", Address: "127.0.0.1:1"}}
+				}
+				_, businessErr := ServeAndWait(params)
+				if businessErr == nil || (failure == "build" && !errors.Is(businessErr, buildErr)) {
+					t.Fatalf("business failure changed: %v", businessErr)
+				}
+				after, err := os.ReadFile(path)
+				if err != nil || len(after) <= len(previous) || !bytes.HasPrefix(after, previous) {
+					t.Fatalf("previous complete record bytes changed: %v", err)
+				}
+				f, err := os.Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer f.Close()
+				if err := unix.Flock(int(f.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
+					t.Fatalf("failure retained writer ownership: %v", err)
+				}
+				recovered, err := usage.Recover(f, int64(len(after)), "test")
+				if err != nil || recovered.Record == nil || recovered.IncompleteTail || !recovered.Record.Snapshot.Closed {
+					t.Fatalf("final Host observation was not saved: %+v %v", recovered, err)
+				}
+				host, guest := false, false
+				for _, c := range recovered.Record.Snapshot.Counters {
+					switch c.Name {
+					case "sandbox_ctl.cpu":
+						host = c.SourceKnown && c.Source != "" && c.Hertz != 0
+					case "guest.cpu":
+						guest = true
+						if c.KnownTotal != (usage.Uint128{Lo: 250_000_000}) || c.Source != "old-source" {
+							t.Fatalf("failed new run changed previous Guest consumption: %+v", c)
+						}
+					default:
+						t.Fatalf("invented unstarted process observation: %+v", c)
+					}
+				}
+				if !host || guest != (mode != "empty") {
+					t.Fatalf("wrong source accounting: %+v", recovered.Record.Snapshot.Counters)
+				}
+			})
+		}
 	}
 }

@@ -290,6 +290,16 @@ bytes, counters 1,027, and Gauges 14. The ordered codec is
 [`format.go`](../pkg/usage/format.go); there is no database or compression
 framework.
 
+The Host manager checks identities and metric metadata against these limits
+before admitting them; counter and Gauge names share one namespace. It reserves
+space for numeric growth when adding metrics or lengthening sources. Individual
+string/array limits do not imply that their largest combination fits a frame.
+A saved record without sufficient growth space stays readable offline, but
+opening a new live owner fails without changing its bytes and releases the lock.
+Malformed metadata for an existing Gauge's newer request breaks continuity with
+`invalid`, without storing the malformed string; zero, duplicate and older
+requests remain no-ops. Empty Gauge sources and empty statuses remain encodable.
+
 Current recovery reads at most two maximum frames at the tail to find the
 last valid self-contained record and a recognizable incomplete append. It
 does not scan or certify all history. History queries validate encountered
@@ -304,6 +314,12 @@ If sampler initialization fails, usage reports the existing unavailable/error
 state and releases its file ownership without saving or truncating a checkpoint.
 Existing bytes remain readable offline; a newly created file may remain empty.
 There is no uninitialized live/saved view or new closed record for that attempt.
+
+If initialization succeeds but later Host setup or CH spawning fails, bounded
+shutdown still attempts to read and save actual sandbox-ctl CPU/RSS. This is
+Host process usage, not evidence that a Guest ran. Earlier cumulative totals and complete
+record bytes remain intact; the new epoch uses the conservative completeness
+rules in Section 4.1. Failing to spawn CH does not exempt consumed Host CPU.
 
 Sampling starts from the Host process lifecycle; the Host starts Guest rounds
 only after launch/restore readiness, not merely ctl.sock existence.

@@ -41,11 +41,39 @@ func (e *encoder) flag(v bool) {
 	}
 }
 func (e *encoder) text(s string) {
-	if len(s) > maxString || !utf8.ValidString(s) {
+	if !validText(s) {
 		e.err = errors.New("usage: invalid string")
 	}
 	e.u(uint64(len(s)))
 	e.b = append(e.b, s...)
+}
+
+func validText(s string) bool { return len(s) <= maxString && utf8.ValidString(s) }
+
+// These bounds mirror EncodeRecord, reserving full-width varints so accepting
+// an identity cannot make a later numeric update unencodable. Gauge status is
+// caller supplied; counter status is set internally. No sample is serialized
+// to check capacity, and no budget state is maintained alongside S/F/A.
+func counterSizeBound(c Counter) int {
+	status := max(len(c.Status), len(OK), len(Missing), len(Invalid))
+	return 5*binary.MaxVarintLen64 + 2 + 3*2 + len(c.Name) + len(c.Source) + status
+}
+
+func gaugeSizeBound(g Gauge) int {
+	// Eight endpoint and eight window varints, plus four boolean flags.
+	return 16*binary.MaxVarintLen64 + 4 + 3*2 + len(g.Name) + len(g.Source) + maxString
+}
+
+func recordSizeBound(s Snapshot) int {
+	// Sequence, saved/start times, two intervals, two array counts, closed.
+	n := frameHeader + frameFooter + 7*binary.MaxVarintLen64 + 1 + 2*2 + len(s.SandboxID) + len(s.RunEpoch)
+	for _, c := range s.Counters {
+		n += counterSizeBound(c)
+	}
+	for _, g := range s.Gauges {
+		n += gaugeSizeBound(g)
+	}
+	return n
 }
 func (e *encoder) wide(v Uint128) { e.u(v.Hi); e.u(v.Lo) }
 func (e *encoder) window(w Window) {

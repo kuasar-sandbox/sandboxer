@@ -236,6 +236,13 @@ signed/unsigned varint、有界 UTF-8 字符串和数组编码 Record/Snapshot�
 frame 上限 512 KiB, 字符串 256 byte, Counter 1,027 个, Gauge 14 个.
 字段顺序由 [format.go](../pkg/usage/format.go) 定义, 不引入数据库或压缩框架.
 
+Host manager 在接纳身份和指标元数据前检查这些限制; Counter 和 Gauge 名称共用
+一个命名空间. 新增指标或加长来源时为数值增长预留空间. 单项字符串/数组上限不
+代表其最大组合也能放进一条 frame. 缺少增长空间的已保存记录仍可离线读取,
+但新 live owner 打开失败, 释放锁且不改变已有字节. 已有 Gauge 的较新请求若
+元数据非法, 以 `invalid` 断开连续性, 不保存非法字符串; 零、重复和更旧请求仍
+不改变状态. Gauge 空来源和空状态仍可编码.
+
 当前恢复至多读取尾部两个最大 frame 的范围, 找到最后有效自包含记录及可识别的
 不完整追加. 不扫描或声明校验全部历史. 历史查询逐条验证遇到的 frame, 损坏
 明确报错; 不接受错误身份、版本、长度或校验. 新运行保留累计端点, 重建当前
@@ -246,6 +253,11 @@ frame 上限 512 KiB, 字符串 256 byte, Counter 1,027 个, Gauge 14 个.
 Sampler 初始化失败时报告既有的不可用/错误状态, 释放文件所有权, 不保存或截断
 checkpoint. 原有字节仍可离线读取, 新建文件可能保持为空. 该次尝试不暴露未初始化
 的 live/saved 视图, 也不写入新的 closed 记录.
+
+若初始化成功, 随后的 Host 设置或 CH 启动失败, 收尾仍按既有预算尽力读取并
+保存实际 sandbox-ctl CPU/RSS. 这是 Host 进程用量, 不代表 Guest 已运行. 之前的累计值
+和完整记录字节保持不变; 新 epoch 遵循第 4.1 节的保守完整性规则. CH 未能启动
+不免除已经消耗的 Host CPU.
 
 采样接入 Host 进程生命周期. Host 只有在 launch/restore ready 后才开始 Guest
 round, ctl.sock 存在不算 Guest ready. 捕获前 Host 关闭 usage 准入并断开 Gauge

@@ -74,8 +74,11 @@ func Open(baseDir, sandboxID, epoch string, start time.Time, sample, flush time.
 	if sample <= 0 || sample > time.Duration(1<<62-1) || flush < sample {
 		return nil, errors.New("usage: invalid sample/flush intervals")
 	}
-	if sandboxID == "" || sandboxID == "." || sandboxID == ".." || strings.ContainsAny(sandboxID, "/\\\x00") {
+	if sandboxID == "" || !validText(sandboxID) || sandboxID == "." || sandboxID == ".." || strings.ContainsAny(sandboxID, "/\\\x00") {
 		return nil, errors.New("usage: invalid sandbox ID")
+	}
+	if epoch == "" || !validText(epoch) {
+		return nil, errors.New("usage: invalid run epoch")
 	}
 	dirFD, err := unix.Open(baseDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
@@ -117,6 +120,10 @@ func Open(baseDir, sandboxID, epoch string, start time.Time, sample, flush time.
 		s = recovered.Record.Snapshot.clone()
 	}
 	s.newRun(epoch, start, sample, flush)
+	if recordSizeBound(s) > MaxRecordBytes {
+		closeFiles()
+		return nil, errors.New("usage: record too large for continued accumulation")
+	}
 	m := newManager(s, recovered, f, dir.Sync)
 	m.reader, m.closeFn = f, closeFiles
 	m.runStart = start
@@ -174,16 +181,32 @@ func (m *Manager) Gauge(name, source string, request uint64, at int64, value uin
 			if request <= g.LastRequest {
 				return nil
 			}
+			if !validText(source) || !validText(status) {
+				g.Status, g.Continuous, g.LastRequest = Invalid, false, request
+				return errors.New("usage: invalid gauge metadata")
+			}
 			if status == Unsupported || status == Paused {
 				g.Break(status)
 				g.LastRequest = request
 				return nil
 			}
+			if len(source) > len(g.Source) && recordSizeBound(m.live)+len(source)-len(g.Source) > MaxRecordBytes {
+				g.Status, g.Continuous, g.LastRequest = Invalid, false, request
+				return errors.New("usage: record too large")
+			}
 			err := g.Observe(source, request, at, value, status, width, time.Duration(m.live.SampleInterval))
 			if err != nil {
-				g.Status, g.Continuous = Invalid, false
+				g.Status, g.Continuous, g.LastRequest = Invalid, false, request
 			}
 			return err
+		}
+	}
+	if name == "" || !validText(name) || !validText(source) || !validText(status) {
+		return errors.New("usage: invalid gauge metadata")
+	}
+	for _, c := range m.live.Counters {
+		if c.Name == name {
+			return errors.New("usage: metric name already belongs to a counter")
 		}
 	}
 	if len(m.live.Gauges) >= MaxGauges {
@@ -193,11 +216,11 @@ func (m *Manager) Gauge(name, source string, request uint64, at int64, value uin
 	if status == Unsupported || status == Paused {
 		g.Break(status)
 		g.LastRequest = request
-		m.live.Gauges = append(m.live.Gauges, g)
-		return nil
-	}
-	if err := g.Observe(source, request, at, value, status, width, time.Duration(m.live.SampleInterval)); err != nil {
+	} else if err := g.Observe(source, request, at, value, status, width, time.Duration(m.live.SampleInterval)); err != nil {
 		return err
+	}
+	if recordSizeBound(m.live)+gaugeSizeBound(g) > MaxRecordBytes {
+		return errors.New("usage: record too large")
 	}
 	m.live.Gauges = append(m.live.Gauges, g)
 	return nil
@@ -209,14 +232,25 @@ func (m *Manager) Counter(name, source string, raw, hertz uint64, created bool) 
 	if m.stopping {
 		return context.Canceled
 	}
+	if name == "" || !validText(name) || !validText(source) {
+		return errors.New("usage: invalid counter metadata")
+	}
 	for i := range m.live.Counters {
 		if m.live.Counters[i].Name == name {
 			c := &m.live.Counters[i]
+			if len(source) > len(c.Source) && recordSizeBound(m.live)+len(source)-len(c.Source) > MaxRecordBytes {
+				return errors.New("usage: record too large")
+			}
 			err := c.Observe(source, raw, hertz, created)
 			if m.historyUnknown {
 				c.Complete = false
 			}
 			return err
+		}
+	}
+	for _, g := range m.live.Gauges {
+		if g.Name == name {
+			return errors.New("usage: metric name already belongs to a gauge")
 		}
 	}
 	if len(m.live.Counters) >= MaxCounters {
@@ -225,6 +259,9 @@ func (m *Manager) Counter(name, source string, raw, hertz uint64, created bool) 
 	c := Counter{Name: name}
 	if err := c.Observe(source, raw, hertz, created); err != nil {
 		return err
+	}
+	if recordSizeBound(m.live)+counterSizeBound(c) > MaxRecordBytes {
+		return errors.New("usage: record too large")
 	}
 	if m.historyUnknown {
 		c.Complete = false
@@ -243,6 +280,9 @@ func (m *Manager) CounterMissing(name string, final bool) {
 func (m *Manager) counterMissing(name string, final, requireSource bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if name == "" || !validText(name) {
+		return
+	}
 	for i := range m.live.Counters {
 		c := &m.live.Counters[i]
 		if c.Name == name {
@@ -253,14 +293,23 @@ func (m *Manager) counterMissing(name string, final, requireSource bool) {
 			return
 		}
 	}
-	if len(m.live.Counters) < MaxCounters {
-		m.live.Counters = append(m.live.Counters, Counter{Name: name, Status: Missing, Complete: !final && !requireSource && !m.historyUnknown})
+	for _, g := range m.live.Gauges {
+		if g.Name == name {
+			return
+		}
+	}
+	c := Counter{Name: name, Status: Missing, Complete: !final && !requireSource && !m.historyUnknown}
+	if len(m.live.Counters) < MaxCounters && recordSizeBound(m.live)+counterSizeBound(c) <= MaxRecordBytes {
+		m.live.Counters = append(m.live.Counters, c)
 	}
 }
 
 func (m *Manager) BreakGauges(status string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !validText(status) {
+		status = Invalid
+	}
 	for i := range m.live.Gauges {
 		m.live.Gauges[i].Break(status)
 	}
