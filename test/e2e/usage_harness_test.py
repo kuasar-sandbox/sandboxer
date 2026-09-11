@@ -140,6 +140,101 @@ class SourceFaultTests(unittest.TestCase):
             changed[-1]["live"]["gauges"][index]["covered_total_ns"] = "0"
             with self.assertRaises(AssertionError):
                 usage_sources.validate_wire_progress(baseline, changed)
+class SourceCleanupTests(unittest.TestCase):
+    def test_observer_ready_requires_first_complete_frame_before_deadline(self):
+        observer, path = unittest.mock.Mock(), unittest.mock.Mock()
+        observer.poll.return_value = None
+        path.read_text.side_effect = ["", '{"sequence":0}', '{"sequence":0}\n']
+        with patch.object(usage_sources.time, "sleep"), \
+             patch.object(usage_sources.time, "monotonic", side_effect=[0, .1, .2, .3]):
+            usage_sources.wait_observer_ready(observer, path)
+        self.assertEqual(path.read_text.call_count, 3)
+        with patch.object(usage_sources.time, "monotonic", side_effect=[0, 6]):
+            with self.assertRaisesRegex(AssertionError, "did not become ready"):
+                usage_sources.wait_observer_ready(observer, path)
+        observer.poll.return_value = 1
+        with self.assertRaisesRegex(AssertionError, "exited before ready"):
+            usage_sources.wait_observer_ready(observer, path)
+
+    def test_each_trace_entry_escalates_without_masking_sampling_failure(self):
+        for case in ("filesystem", "vsock"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                sb, trace, relay = unittest.mock.Mock(), unittest.mock.Mock(), unittest.mock.Mock()
+                sb.dir, sb.name, sb.runroot = Path(directory), "case", Path(directory)
+                original = RuntimeError("original sampling failure")
+                cleanup_error = RuntimeError("Guest trace-stop failed")
+                guest = {"sandbox_init_sha256": "hash", "balloon_proc_field": "false", "zoneinfo": "pagesets count:"}
+
+                def cli(*args, **kwargs):
+                    if args[-1] == "trace-stop":
+                        raise cleanup_error
+                    return json.dumps(guest)
+
+                sb.cli.side_effect = cli
+                sb.stop.side_effect = RuntimeError("sandbox stop also failed")
+                trace.poll.return_value = None
+                trace.wait.side_effect = [subprocess.TimeoutExpired("owned trace", 5), 0]
+                relay.requests, relay.errors = [], []
+                views = [{"live": {"gauges": [{"name": name, "last_value_bytes": str(value)}
+                         for name in ("filesystem.disk-0", "filesystem.disk-1")]}}
+                         for value in (0, 8*1024*1024)]
+                sb.view.side_effect = views if case == "filesystem" else original
+                with patch.object(usage_sources, "filesystem_config", return_value={}), \
+                     patch.object(usage_sources, "Sandbox", return_value=sb), \
+                     patch.object(usage_sources, "UsageRelay", return_value=relay), \
+                     patch.object(usage_sources, "digest", return_value="hash"), \
+                     patch.object(usage_sources, "write_json"), \
+                     patch.object(usage_sources.subprocess, "Popen", return_value=trace), \
+                     patch.object(usage_sources.time, "sleep"), \
+                     patch.object(usage_sources.time, "monotonic", side_effect=original), \
+                     patch.object(usage_sources.sys, "stderr", io.StringIO()) as errors:
+                    with self.assertRaises(RuntimeError) as caught:
+                        if case == "filesystem":
+                            usage_sources.filesystem_case(Path(directory), "ref", 30)
+                        else:
+                            usage_sources.vsock_case(Path(directory), "ref")
+                self.assertIs(caught.exception, original)
+                trace.terminate.assert_called_once()
+                trace.kill.assert_called_once()
+                self.assertEqual(trace.wait.call_args_list, [unittest.mock.call(timeout=5)]*2)
+                sb.stop.assert_called_once()
+                if case == "vsock":
+                    relay.stop.assert_called_once()
+                self.assertIn("Guest trace-stop failed", errors.getvalue())
+                self.assertIn("sandbox stop also failed", errors.getvalue())
+
+    def test_cleanup_only_error_is_not_hidden_by_enclosing_except(self):
+        sb = unittest.mock.Mock()
+        original = RuntimeError("real cleanup failure")
+        sb.stop.side_effect = original
+        try:
+            raise ValueError("unrelated already handled error")
+        except ValueError:
+            with self.assertRaises(RuntimeError) as caught:
+                usage_sources.cleanup_sources(sb)
+        self.assertIs(caught.exception, original)
+
+    def test_failed_term_still_attempts_kill_wait_and_remaining_cleanup(self):
+        sb, process, other, relay = (unittest.mock.Mock() for _ in range(4))
+        sb.dir = Path("unused")
+        relay.requests, relay.errors = [], []
+        process.poll.return_value = None
+        other.poll.return_value = None
+        original = RuntimeError("TERM failed")
+        process.terminate.side_effect = original
+        process.wait.side_effect = [subprocess.TimeoutExpired("owned CLI", 5), 0]
+        with patch.object(usage_sources, "write_json"):
+            with self.assertRaises(RuntimeError) as caught:
+                usage_sources.cleanup_sources(sb, processes=(process, other), relay=relay)
+        self.assertIs(caught.exception, original)
+        process.kill.assert_called_once()
+        self.assertEqual(process.wait.call_args_list, [unittest.mock.call(timeout=5)]*2)
+        other.terminate.assert_called_once()
+        other.wait.assert_called_once_with(timeout=5)
+        sb.stop.assert_called_once()
+        relay.stop.assert_called_once()
+
+
 class CHRelayTests(unittest.TestCase):
     def test_real_body_is_held_then_forwarded_without_modification(self):
         body = b'{"memory_actual_size":503316480}'

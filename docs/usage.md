@@ -415,7 +415,10 @@ while one managed filesystem syscall remains occupied. Raw Guest responses
 must continue to report the same busy slot across new connections. Failed
 rounds break Gauge coverage rather than filling zero; native CPU counters
 remain a separate source. One observer exec streams resource diagnostics
-across all eleven faults. These are finite functional/resource-bound checks,
+across all eleven faults. Its first complete output establishes MUX readiness
+before injection. Additional health/stop execs run outside the all-FD observation
+window while the filesystem is still blocked; no FD samples are discarded.
+These are finite functional/resource-bound checks,
 not an overnight endurance run or a real blocked-worker restore experiment.
 
 Run the [off/on harness](../test/e2e/usage_perf.py) without concurrent test

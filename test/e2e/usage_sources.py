@@ -118,10 +118,54 @@ def filesystem_config(work, name, ref):
     return config
 
 
+def reap_source_process(process):
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    finally:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            finally:
+                process.wait(timeout=5)
+
+
+def cleanup_sources(sb, trace=None, processes=(), relay=None, failure=None):
+    # Fixed test-owned processes, not an unbounded cleanup queue. Preserve the
+    # case's explicit failure; an unrelated enclosing except is not that failure.
+    errors = []
+
+    def attempt(action):
+        try:
+            action()
+        except BaseException as error:
+            errors.append(error)
+
+    if trace is not None and trace.poll() is None:
+        def detach():
+            sb.cli("exec", "--", "/probe", "trace-stop")
+            trace.wait(timeout=10)
+        attempt(detach)
+    for process in (trace, *processes):
+        attempt(lambda: reap_source_process(process))
+    attempt(sb.stop)
+    if relay is not None:
+        attempt(relay.stop)
+        attempt(lambda: write_json(sb.dir / "relay.json", {"requests": relay.requests, "errors": relay.errors}))
+    if errors:
+        if failure is None:
+            raise errors[0]
+        for error in errors:
+            print(f"usage source cleanup: {error}", file=sys.stderr)
+
+
 def filesystem_case(work, ref, seconds):
     config = filesystem_config(work, "filesystem", ref)
     sb, trace, observer, release = Sandbox(work, "filesystem", config), None, None, None
-    samples, observed_resources = [], []
+    samples, observed_resources, failure = [], [], None
     try:
         sb.ready()
         guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
@@ -161,7 +205,7 @@ def filesystem_case(work, ref, seconds):
                         # A single exec observer avoids creating a new Go
                         # Process/pidfd for each measurement. Count all FDs.
                         observer = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
-                            "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "init-resources-stream", str(seconds+2)],
+                            "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "init-resources-stream", str(seconds-5)],
                             stdout=guest_output, stderr=subprocess.STDOUT)
                         changed = True
                     if len(samples) % 5 == 0:
@@ -171,6 +215,9 @@ def filesystem_case(work, ref, seconds):
             write_json(sb.dir / "during.json", samples)
             write_json(sb.dir / "resources.json", observed_resources)
             faults = validate_blocked(samples, metric(grown["live"], "gauges", "filesystem.disk-0"))
+            # The observer ends before the next ordinary exec opens transient
+            # stdio/handshake FDs. Keep every recorded FD and the original bound.
+            assert observer.poll() == 0, "resource observer outlived its fault-only window"
             raw = json.loads(sb.cli("exec", "--", "/probe", "statfs", "/data"))
             expected = (raw["Blocks"] - raw["Bfree"]) * (raw["Frsize"] or raw["Bsize"])
             write_json(sb.dir / "current-statfs.json", raw)
@@ -205,36 +252,11 @@ def filesystem_case(work, ref, seconds):
             counts = [row["fds"] for row in rows]
             assert len(counts) >= 3 and max(counts) - min(counts) <= 4, (owner, counts)
         print(f"PASS usage-sources/filesystem ({len(faults)} timeout/busy rounds)", flush=True)
+    except BaseException as error:
+        failure = error
+        raise
     finally:
-        try:
-            if trace is not None and trace.poll() is None:
-                try:
-                    sb.cli("exec", "--", "/probe", "trace-stop")
-                    trace.wait(timeout=10)
-                except BaseException as error:
-                    print(f"Guest tracer cleanup: {error}", file=sys.stderr)
-                    trace.terminate()
-                    trace.wait(timeout=5)
-        finally:
-            try:
-                if release is not None and release.poll() is None:
-                    release.terminate()
-                    try:
-                        release.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        release.kill()
-                        release.wait(timeout=5)
-            finally:
-                try:
-                    if observer is not None and observer.poll() is None:
-                        observer.terminate()
-                        try:
-                            observer.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            observer.kill()
-                            observer.wait(timeout=5)
-                finally:
-                    sb.stop()
+        cleanup_sources(sb, trace, (release, observer), failure=failure)
 
 
 def validate_wire_progress(baseline, observed):
@@ -258,10 +280,22 @@ def validate_wire_progress(baseline, observed):
         assert int(after["last_request_id"]) - int(before["last_request_id"]) >= 40, name
 
 
+def wait_observer_ready(observer, path):
+    end = time.monotonic() + 5
+    while time.monotonic() < end:
+        assert observer.poll() is None, "resource observer exited before ready"
+        text = path.read_text()
+        if "\n" in text:
+            assert json.loads(text.split("\n", 1)[0])["sequence"] == 0
+            return
+        time.sleep(.02)
+    raise AssertionError("resource observer MUX did not become ready")
+
+
 def vsock_case(work, ref):
     sb = Sandbox(work, "vsock", filesystem_config(work, "vsock", ref),
                  ch_binary=Path(__file__).with_name("usage_vsock_wrapper.py"))
-    relay, trace, observer = None, None, None
+    relay, trace, observer, failure = None, None, None, None
     try:
         relay = UsageRelay(sb.runroot / "instance/vsock.sock")
         sb.ready()
@@ -276,9 +310,14 @@ def vsock_case(work, ref):
             time.sleep(3)
             baseline = sb.view()
             assert metric(baseline["live"], "gauges", "filesystem.disk-0")["status"] == "busy"
+            # Test ordinary exec while the filesystem is busy, but outside the
+            # all-FD observer window: its temporary stdio/handshake FDs are not
+            # a reconnect leak. The observer MUX spans all eleven wire faults.
+            sb.cli("exec", "--", "/probe", "true")
             observer = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
                 "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "init-resources-stream", "61"],
                 stdout=guest_output, stderr=subprocess.STDOUT)
+            wait_observer_ready(observer, sb.dir / "guest-resources.log")
             observed, counts, faults = [], [], []
             for ordinal, mode in enumerate(["drop"]*8 + ["delay", "repeat", "fragment"]):
                 relay.arm(mode)
@@ -339,19 +378,16 @@ def vsock_case(work, ref):
                         assert metric(view["live"], "gauges", name)["status"] == "ok", name
                 observed.extend(values)
                 counts.append(resources(sb))
-                # The one observer exec keeps its real MUX streaming across
-                # every disconnect. Probe a fresh ordinary exec at both ends,
-                # without creating a Process/pidfd per resource observation.
-                if ordinal in (0, 10):
-                    sb.cli("exec", "--", "/probe", "true")
             write_json(sb.dir / "during.json", observed)
             write_json(sb.dir / "resources.json", counts)
+            observer.wait(timeout=10)
+            assert observer.returncode == 0
+            assert metric(sb.view()["live"], "gauges", "filesystem.disk-0")["status"] == "busy"
+            sb.cli("exec", "--", "/probe", "true")
             release_started = time.monotonic_ns()
             sb.cli("exec", "--", "/probe", "trace-stop")
             trace.wait(timeout=10)
             assert trace.returncode == 0
-            observer.wait(timeout=10)
-            assert observer.returncode == 0
         text = (sb.dir / "guest-trace.log").read_text()
         assert len(re.findall(r"fstatfs\(\d+<", text)) == 1, text
         with relay.lock:
@@ -375,33 +411,11 @@ def vsock_case(work, ref):
         validate_wire_progress(baseline, observed)
         assert not relay.errors, relay.errors
         print("PASS usage-sources/vsock (11 real frame faults across one blocked filesystem slot)", flush=True)
+    except BaseException as error:
+        failure = error
+        raise
     finally:
-        try:
-            if trace is not None and trace.poll() is None:
-                try:
-                    sb.cli("exec", "--", "/probe", "trace-stop")
-                    trace.wait(timeout=10)
-                except BaseException:
-                    trace.terminate()
-                    trace.wait(timeout=5)
-        finally:
-            try:
-                if observer is not None and observer.poll() is None:
-                    observer.terminate()
-                    try:
-                        observer.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        observer.kill()
-                        observer.wait(timeout=5)
-            finally:
-                try:
-                    sb.stop()
-                finally:
-                    if relay is not None:
-                        try:
-                            relay.stop()
-                        finally:
-                            write_json(sb.dir / "relay.json", {"requests": relay.requests, "errors": relay.errors})
+        cleanup_sources(sb, trace, (observer,), relay, failure)
 
 
 def validate_ch_missing(samples, baseline):
@@ -458,7 +472,7 @@ def ch_case(work, ref, mode):
               "launch": {"exec": "/probe", "args": ["wait"], "restart": "never", "pid_namespace": "shared"},
               "usage": {"enabled": True, "sample_interval": "1s", "flush_interval": "5s"}}
     sb = Sandbox(work, f"ch-{mode}", config, ch_binary=Path(__file__).with_name("usage_ch_wrapper.py"))
-    relay, pressure = None, None
+    relay, pressure, failure = None, None, None
     try:
         relay = CHRelay(sb.runroot / "instance/ch.sock")
         sb.ready()
@@ -539,26 +553,13 @@ def ch_case(work, ref, mode):
             assert "MEMORY-READY 335544320" in (sb.dir / "pressure.log").read_text()
         assert not relay.errors, relay.errors
         print(f"PASS usage-sources/ch-{mode} (real reply held for 12s)", flush=True)
+    except BaseException as error:
+        failure = error
+        raise
     finally:
         if relay is not None:
             relay.release.set()
-        try:
-            if pressure is not None and pressure.poll() is None:
-                pressure.terminate()
-                try:
-                    pressure.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pressure.kill()
-                    pressure.wait(timeout=5)
-        finally:
-            try:
-                sb.stop()
-            finally:
-                if relay is not None:
-                    try:
-                        relay.stop()
-                    finally:
-                        write_json(sb.dir / "relay.json", {"requests": relay.requests, "errors": relay.errors})
+        cleanup_sources(sb, processes=(pressure,), relay=relay, failure=failure)
 
 
 def main():
