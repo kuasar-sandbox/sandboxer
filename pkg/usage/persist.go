@@ -167,7 +167,7 @@ func (m *Manager) View() View {
 func (m *Manager) Gauge(name, source string, request uint64, at int64, value uint64, status string, width time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.stopping {
+	if m.stopping || m.live.Closed {
 		return context.Canceled
 	}
 	if request == 0 {
@@ -229,7 +229,7 @@ func (m *Manager) Gauge(name, source string, request uint64, at int64, value uin
 func (m *Manager) Counter(name, source string, raw, hertz uint64, created bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.stopping {
+	if m.stopping || m.live.Closed {
 		return context.Canceled
 	}
 	if name == "" || !validText(name) || !validText(source) {
@@ -280,7 +280,7 @@ func (m *Manager) CounterMissing(name string, final bool) {
 func (m *Manager) counterMissing(name string, final, requireSource bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if name == "" || !validText(name) {
+	if m.stopping || m.live.Closed || name == "" || !validText(name) {
 		return
 	}
 	for i := range m.live.Counters {
@@ -307,6 +307,9 @@ func (m *Manager) counterMissing(name string, final, requireSource bool) {
 func (m *Manager) BreakGauges(status string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.stopping || m.live.Closed {
+		return
+	}
 	if !validText(status) {
 		status = Invalid
 	}
@@ -318,6 +321,9 @@ func (m *Manager) BreakGauges(status string) {
 func (m *Manager) discontinue() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.stopping || m.live.Closed {
+		return
+	}
 	for i := range m.live.Gauges {
 		m.live.Gauges[i].Continuous = false
 	}
@@ -425,11 +431,13 @@ func (m *Manager) closeFiles() {
 	})
 }
 
-// Close makes at most two bounded attempts: finish F, then seal the current A.
+// Close fences observations using the existing Closed state before making at
+// most two bounded save attempts: finish F, then seal the current A.
 // Expiring the caller budget cannot cancel a filesystem syscall. Its sole
 // worker retains and eventually closes the original file descriptors.
 func (m *Manager) Close(ctx context.Context, now time.Time) {
 	m.mu.Lock()
+	savedBeforeClose := m.saved
 	m.live.Closed = true
 	m.mu.Unlock()
 	for attempt := 0; attempt < 2; attempt++ {
@@ -447,7 +455,7 @@ func (m *Manager) Close(ctx context.Context, now time.Time) {
 			attempt = 2
 		}
 		m.mu.Lock()
-		complete := m.saved != nil && m.saved.Snapshot.Closed
+		complete := m.saved != nil && m.saved != savedBeforeClose && m.saved.Snapshot.Closed
 		m.mu.Unlock()
 		if complete {
 			break

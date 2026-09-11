@@ -340,7 +340,11 @@ retry or a later lifecycle generation. No worker is replaced to bypass a
 blocked slot.
 
 Normal shutdown attempts final observations and saving with a bounded
-budget. Usage failure does not change the business result. The writer owns
+budget. Closing the manager fences new observations before freezing the final
+record, while its existing writer may finish F and seal A within that budget.
+A previously saved closed record is not completion of this close attempt. Retrying
+an uncertain F can exhaust the budget without saving A or a closed checkpoint.
+Usage failure does not change the business result. The writer owns
 pinned file/directory descriptors: a late write cannot recreate a deleted
 directory or write a replacement instance at the same path. Deletion does
 not wait for saving/export success and adds no retention policy. Usage never

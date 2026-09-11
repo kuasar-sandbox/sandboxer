@@ -100,7 +100,10 @@ func (g *Gauge) Observe(source string, request uint64, at int64, value uint64, s
 	}
 	valid := status == OK
 	if n.PositionKnown && source == n.Source {
-		dt := uint64(at - n.LastAt)
+		// The signed ordering check above makes the mathematical difference
+		// positive and representable in uint64, even across zero or when it
+		// exceeds MaxInt64. Subtract in that domain without a signed overflow.
+		dt := uint64(at) - uint64(n.LastAt)
 		var err error
 		if n.SpanTotal, err = add64(n.SpanTotal, dt); err != nil {
 			return err

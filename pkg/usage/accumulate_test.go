@@ -3,6 +3,7 @@ package usage
 import (
 	"bytes"
 	"encoding/json"
+	"math/big"
 	"math/rand"
 	"reflect"
 	"testing"
@@ -168,5 +169,80 @@ func TestUint128JSONAndAverage(t *testing.T) {
 	}
 	if n, ok := Average(product(1234, 5678), 5678); !ok || n != 1234 {
 		t.Fatalf("%d %v", n, ok)
+	}
+}
+
+func TestGaugeFullWidthTimeDifferences(t *testing.T) {
+	const min, max int64 = -1 << 63, 1<<63 - 1
+	pairs := [][2]int64{{min, max}, {min, 0}, {-1, max}, {-3, 4}, {min, min + 1}, {max - 1, max}, {1, 2}, {-2, -1}}
+	rng := rand.New(rand.NewSource(211))
+	for i := 0; i < 10000; i++ {
+		a, b := int64(rng.Uint64()), int64(rng.Uint64())
+		if a > b {
+			a, b = b, a
+		}
+		if a != b {
+			pairs = append(pairs, [2]int64{a, b})
+		}
+	}
+	for _, pair := range pairs {
+		difference := new(big.Int).Sub(big.NewInt(pair[1]), big.NewInt(pair[0]))
+		if !difference.IsUint64() {
+			t.Fatal("ordered int64 endpoints exceeded the uint64 difference domain")
+		}
+		want := difference.Uint64()
+		g := Gauge{Name: "ram"}
+		if err := g.Observe("memory", 1, pair[0], 3, OK, 0, 4); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Observe("memory", 2, pair[1], 5, OK, 0, 4); err != nil {
+			t.Fatal(err)
+		}
+		covered := uint64(0)
+		if want <= 8 {
+			covered = want
+		}
+		if g.SpanTotal != want || g.Window.Span != want || g.CoveredTotal != covered || g.IntegralTotal != product(3, covered) {
+			t.Fatalf("%v: mathematical difference %s; gauge=%+v", pair, difference, g)
+		}
+	}
+	// A maximal individual gap is representable. Adding it to an existing
+	// nonzero span is the true overflow, rejected without partial mutation.
+	g := Gauge{Name: "ram"}
+	_ = g.Observe("memory", 1, min, 3, OK, 0, time.Second)
+	g.SpanTotal = 1
+	before := g
+	if err := g.Observe("memory", 2, max, 5, OK, 0, time.Second); err != ErrOverflow || g != before {
+		t.Fatalf("cumulative span overflow not transactional: %+v, %v", g, err)
+	}
+	// Full-width totals remain lossless in both persisted and JSON forms.
+	m := testManager(&faultWriter{})
+	if err := m.Gauge("ram", "memory", 1, min, 3, OK, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Gauge("ram", "memory", 2, max, 5, OK, 0); err != nil {
+		t.Fatal(err)
+	}
+	m.Save(time.Now())
+	awaitSave(t, m)
+	r := m.View().Saved
+	if r == nil {
+		t.Fatal("full-width gap was not saved")
+	}
+	encoded, err := EncodeRecord(*r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeRecord(encoded, "test")
+	if err != nil || !reflect.DeepEqual(decoded.Snapshot.Gauges, r.Snapshot.Gauges) {
+		t.Fatalf("file changed full-width span: %+v, %v", decoded, err)
+	}
+	encoded, err = json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fromJSON Record
+	if err := json.Unmarshal(encoded, &fromJSON); err != nil || !reflect.DeepEqual(fromJSON, *r) {
+		t.Fatalf("JSON changed full-width span: %+v, %v", fromJSON, err)
 	}
 }
