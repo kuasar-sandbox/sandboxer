@@ -54,7 +54,8 @@ func TestUsageHistoryWireShapeAndSelectedSavedPrefix(t *testing.T) {
 		history := func(offset int64, n int) ([]usage.Record, int64, error) {
 			calls = append(calls, offset)
 			// Simulate a newer committed S. No record past selected end=3
-			// may be included or preloaded as part of the response page.
+			// may enter the response. Validating an empty terminal page can
+			// read one newer committed record together with its predecessor.
 			return []usage.Record{{Sequence: uint64(offset + 1)}}, offset + 1, nil
 		}
 		body, err := marshalUsageHistory(history, 3, cursor, 100)
