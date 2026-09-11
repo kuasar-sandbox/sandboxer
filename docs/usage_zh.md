@@ -304,6 +304,32 @@ SIGKILL 与亚秒级 Guest 运行. 注入不作用于业务可写盘的同步操
 pidfd 确认该子进程在有界清理预算内退出, 不把清理留给 runner.
 需要 Linux/Python pidfd 支持、`strace`、mount 权限及普通 KVM E2E 前置条件.
 
+[慢来源 E2E](../test/e2e/e2e_usage_sources.sh) 按设备身份选择一个已登记的
+数据文件系统句柄, 核对 CLOEXEC 后, 仅在可丢弃 Guest 内延迟该 `fstatfs`
+返回. 测试要求首次 timeout、同一个已占用槽后续返回 busy、内存及健康文件
+系统持续获得新覆盖, 且 trace 中只有一次该文件系统调用. 两块数据盘均执行
+真实写入; 延迟读取后新增的字节用于区分释放后的新观测与旧 buffer 重放.
+单个长存测试 exec 记录 Guest 全部 FD、身份、线程和 RSS, 不为每次观测创建
+exec, 也不把线程数称为 goroutine 数. 默认故障持续 30 秒, `--seconds 60`
+可延长验证. 这不是掉电测试, 也不证明阻塞 worker 已跨快照/恢复验证.
+已安装的原生 `strace` 及 `ldd` 解析的 loader、依赖库仅复制到可丢弃应用镜像,
+不进入产品 runtime.
+其中 `ch-info` 和 `ch-resize` 案例在真实 CH 可执行文件前放置仅用于测试的
+Unix HTTP 中继, 原样转发响应正文并暂扣一次实际响应 12 秒. Resize 由真实
+Guest 分配触发, 不是测试直接调用 resize; 暂扣其响应覆盖既有 mutation gate/
+API 锁控制事务. 选择时要求 target 低于先前真实 target, 暂扣的是 PUT 响应
+或紧随其后的确认 GET. 旧观测过期后, Guest 内存必须缺测, 文件系统/RSS 覆盖继续
+增长, 且不能堆积更多 CH 请求. 恢复必须经过新的成功 `vm.info` 读取.
+这些有界功能故障不测量无测试中继时的 API 时延或生产密度开销, 也不声称
+已逐一确定所有 info 读取的调用者.
+`vsock` 案例中继真实的专用 usage 帧并保持普通管理/MUX 流量. 在一个受管理
+文件系统调用仍被占用时, 执行八次断连、一次迟到响应、已捕获的旧响应重放,
+以及超过原始整轮 deadline 的慢分段传输. 跨新连接的 Guest 原始响应必须
+继续报告同一个 busy 槽. 请求失败断开 Gauge 覆盖, 不补零; 原生 CPU Counter
+仍是独立来源. 一个观察 exec 跨全部十一项故障持续传送资源诊断.
+这些是有限时长的功能/资源边界检查, 不是通宵耐久测试或真实阻塞 worker
+跨恢复实验.
+
 在没有其他并发测试负载时, 以 root 权限和已组装的 `BIN` 运行
 [off/on 测量脚本](../test/e2e/usage_perf.py):
 

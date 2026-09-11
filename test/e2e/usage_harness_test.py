@@ -1,9 +1,17 @@
+import copy
 import errno
+import http.client
+import http.server
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
+import socket
+import socketserver
+import struct
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +20,269 @@ import usage
 import usage_perf
 import usage_trace
 import usage_faults
+import usage_sources
+from usage_ch_relay import CHRelay
+from usage_vsock_relay import UsageRelay, exact, frame, line
+
+
+class SourceFaultTests(unittest.TestCase):
+    def baseline(self):
+        return {**self.samples()[0]["live"]["gauges"][0], "status": "ok", "last_request_id": "0"}
+
+    def samples(self):
+        healthy = ("guest.memory", "filesystem.root", "filesystem.disk-1", "ch.rss_anon", "ch.rss_file", "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file")
+        values = []
+        for index in range(11):
+            gauges = [{"name": "filesystem.disk-0", "status": "timeout" if index == 0 else "busy",
+                       "continuous": False, "covered_total_ns": "10", "integral_total_byte_ns": "100",
+                       "last_value_bytes": "10", "span_total_ns": str(index+10), "last_request_id": str(index+1)}]
+            gauges += [{"name": name, "status": "ok", "covered_total_ns": str(index*1_000_000_000),
+                        "last_request_id": str(index+1)} for name in healthy]
+            values.append({"live": {"gauges": gauges}})
+        return values
+
+    def test_complete_partial_responses(self):
+        self.assertEqual(len(usage_sources.validate_blocked(self.samples(), self.baseline())), 11)
+
+    def test_reject_missing_first_timeout_replacement_and_fill(self):
+        for field, value in (("status", "busy"), ("continuous", True)):
+            with self.subTest(field=field):
+                samples = self.samples()
+                samples[0]["live"]["gauges"][0][field] = value
+                with self.assertRaises(AssertionError):
+                    usage_sources.validate_blocked(samples, self.baseline())
+        for field, value in (("status", "timeout"), ("status", "ok"), ("covered_total_ns", "11"),
+                             ("integral_total_byte_ns", "101"), ("last_value_bytes", "0")):
+            with self.subTest(field=field):
+                samples = self.samples()
+                samples[5]["live"]["gauges"][0][field] = value
+                with self.assertRaises(AssertionError):
+                    usage_sources.validate_blocked(samples, self.baseline())
+
+    def test_reject_unobserved_fault_round(self):
+        samples = self.samples()
+        del samples[4]
+        with self.assertRaises(AssertionError):
+            usage_sources.validate_blocked(samples, self.baseline())
+
+    def test_first_timeout_cannot_clear_known_usage(self):
+        rows = self.samples()
+        for row in rows:
+            row["live"]["gauges"][0].update(covered_total_ns="0", integral_total_byte_ns="0", last_value_bytes="0")
+        with self.assertRaises(AssertionError):
+            usage_sources.validate_blocked(rows, self.baseline())
+
+    def test_recovery_requires_unbroken_observation_and_new_value(self):
+        baseline = self.samples()[0]["live"]["gauges"][0]
+        rows = self.samples()[:2]
+        for row in rows:
+            row["live"]["gauges"][0].update(status="ok", last_value_bytes="20")
+        usage_sources.validate_recovery(rows, 0, baseline, 20)
+        for field, value in (("last_request_id", "2"), ("last_value_bytes", "10"),
+                             ("covered_total_ns", "11"), ("integral_total_byte_ns", "101")):
+            original = rows[0]["live"]["gauges"][0][field]
+            rows[0]["live"]["gauges"][0][field] = value
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_recovery(rows, 0, baseline, 20)
+            rows[0]["live"]["gauges"][0][field] = original
+
+    def test_reject_other_source_failure_or_frozen_coverage(self):
+        for failed in range(1, 8):
+            samples = self.samples()
+            samples[4]["live"]["gauges"][failed]["status"] = "missing"
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_blocked(samples, self.baseline())
+            samples = self.samples()
+            samples[-1]["live"]["gauges"][failed]["covered_total_ns"] = "0"
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_blocked(samples, self.baseline())
+
+    def test_tracer_dependencies_include_loader(self):
+        self.assertEqual(usage_sources.tracer_dependencies("libc.so.6 => /lib/libc.so.6 (0x123)\n/lib64/ld.so (0x456)\n"),
+                         ["/lib/libc.so.6", "/lib64/ld.so"])
+        self.assertEqual(usage_sources.tracer_dependencies("statically linked"), [])
+        for invalid in ("libc => not found", "unexpected ldd output"):
+            with self.assertRaises(ValueError):
+                usage_sources.tracer_dependencies(invalid)
+
+    def test_slow_ch_does_not_mask_other_sources_or_extend_old_memory(self):
+        rows = self.samples()
+        rows.append(self.samples()[-1])
+        for row in rows:
+            memory = row["live"]["gauges"][1]
+            memory.update(status="missing", covered_total_ns="10", integral_total_byte_ns="100", last_value_bytes="20")
+        baseline = {**rows[0]["live"]["gauges"][1], "status": "ok"}
+        usage_sources.validate_ch_missing(rows, baseline)
+        rows[7]["live"]["gauges"][1]["last_value_bytes"] = "0"
+        with self.assertRaises(AssertionError):
+            usage_sources.validate_ch_missing(rows, baseline)
+        for row in rows:
+            row["live"]["gauges"][1].update(covered_total_ns="0", integral_total_byte_ns="0", last_value_bytes="0")
+        with self.assertRaises(AssertionError):
+            usage_sources.validate_ch_missing(rows, baseline)
+
+    def test_wire_recovery_cannot_integrate_gap_or_freeze_rss(self):
+        rows = self.samples()[:3]
+        baseline = copy.deepcopy(rows[0])
+        base_memory = baseline["live"]["gauges"][1]
+        base_memory.update(integral_total_byte_ns="100", last_value_bytes="20")
+        for index, row in enumerate(rows):
+            row["live"]["gauges"][1].update(covered_total_ns="0", integral_total_byte_ns="100", last_value_bytes="20", status="missing" if index == 0 else "ok")
+        for gauge in rows[-1]["live"]["gauges"][4:]:
+            gauge.update(covered_total_ns="40000000000", last_request_id="41")
+        usage_sources.validate_wire_progress(baseline, rows)
+        changed = copy.deepcopy(rows)
+        changed[1]["live"]["gauges"][1]["covered_total_ns"] = "1"
+        with self.assertRaises(AssertionError):
+            usage_sources.validate_wire_progress(baseline, changed)
+        for index in range(4, 8):
+            changed = copy.deepcopy(rows)
+            changed[-1]["live"]["gauges"][index]["covered_total_ns"] = "0"
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_wire_progress(baseline, changed)
+class CHRelayTests(unittest.TestCase):
+    def test_real_body_is_held_then_forwarded_without_modification(self):
+        body = b'{"memory_actual_size":503316480}'
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ch.sock"
+            native = socketserver.UnixStreamServer(str(path)+".real", Handler)
+            native_thread = threading.Thread(target=native.serve_forever, kwargs={"poll_interval": .05})
+            native_thread.start()
+            relay, connection = CHRelay(path), http.client.HTTPConnection("localhost", timeout=2)
+            connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.sock.settimeout(.1)
+            connection.sock.connect(str(path))
+            try:
+                relay.arm("/api/v1/vm.info")
+                connection.request("GET", "/api/v1/vm.info")
+                self.assertTrue(relay.held.wait(timeout=2))
+                with self.assertRaises(TimeoutError):
+                    connection.sock.recv(1, socket.MSG_PEEK)
+                relay.release.set()
+                connection.sock.settimeout(2)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), body)
+            finally:
+                connection.close()
+                relay.stop()
+                native.shutdown()
+                native.server_close()
+                native_thread.join(timeout=2)
+            self.assertFalse(relay.errors)
+            self.assertEqual(relay.requests[0]["response_body"], body.decode())
+
+
+class UsageRelayTests(unittest.TestCase):
+    def wire(self, kind, number):
+        body = json.dumps({"type": kind, kind: {"request_id": str(number), "run_epoch": "run"}}, separators=(",", ":")).encode()
+        return struct.pack("<I", len(body)) + body
+
+    def test_length_and_preface_are_bounded(self):
+        left, right = socket.socketpair()
+        try:
+            left.sendall(struct.pack("<I", (1 << 20) + 1))
+            with self.assertRaises(AssertionError):
+                frame(right)
+            left.sendall(b"a"*128)
+            with self.assertRaises(ValueError):
+                line(right)
+        finally:
+            left.close()
+            right.close()
+
+    def test_only_usage_is_replayed_and_new_connection_reads_new_frame(self):
+        owner = self
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                try:
+                    self.request.settimeout(2)
+                    owner.assertEqual(line(self.request), b"CONNECT 5000\n")
+                    self.request.sendall(b"OK 1\n")
+                    while True:
+                        data, message = frame(self.request)
+                        if message["type"] != "usage_request":
+                            self.request.sendall(data)
+                            return
+                        if message["usage_request"]["request_id"] == "7":
+                            return  # Guest EOF must not be attributed to Host.
+                        self.request.sendall(owner.wire("usage_response", int(message["usage_request"]["request_id"])))
+                except EOFError:
+                    pass
+
+        class Native(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vsock.sock"
+            native = Native(str(path)+".real", Handler)
+            thread = threading.Thread(target=native.serve_forever, kwargs={"poll_interval": .05})
+            thread.start()
+            relay = UsageRelay(path)
+
+            def connect():
+                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                connection.settimeout(2)
+                connection.connect(str(path))
+                connection.sendall(b"CONNECT 5000\n")
+                self.assertEqual(line(connection), b"OK 1\n")
+                return connection
+
+            client = ordinary = replacement = None
+            try:
+                client = connect()
+                client.sendall(self.wire("usage_request", 1))
+                self.assertEqual(frame(client)[0], self.wire("usage_response", 1))
+                relay.arm("repeat")
+                client.sendall(self.wire("usage_request", 2))
+                self.assertEqual(frame(client)[0], self.wire("usage_response", 1))
+                # The relay cannot create a later EOF which disguises a
+                # client wrongly accepting the old frame as a timeout.
+                client.sendall(self.wire("usage_request", 3))
+                self.assertEqual(frame(client)[0], self.wire("usage_response", 3))
+                client.close()
+                ordinary = connect()
+                ordinary.sendall(self.wire("ping", 9))
+                self.assertEqual(frame(ordinary)[0], self.wire("ping", 9))
+                replacement = connect()
+                replacement.sendall(self.wire("usage_request", 4))
+                self.assertEqual(frame(replacement)[0], self.wire("usage_response", 4))
+                relay.arm("drop")
+                replacement.sendall(self.wire("usage_request", 5))
+                self.assertEqual(replacement.recv(1), b"")
+                replacement.close()
+                replacement = connect()
+                replacement.sendall(self.wire("usage_request", 6))
+                self.assertEqual(frame(replacement)[0], self.wire("usage_response", 6))
+                relay.arm("repeat")
+                replacement.sendall(self.wire("usage_request", 7))
+                self.assertEqual(replacement.recv(1), b"")
+            finally:
+                for connection in (client, ordinary, replacement):
+                    if connection:
+                        connection.close()
+                relay.stop()
+                native.shutdown()
+                native.server_close()
+                thread.join(timeout=2)
+            self.assertFalse(relay.errors)
+            self.assertEqual([row["request"]["request_id"] for row in relay.requests], ["1", "2", "3", "4", "5", "6", "7"])
+            self.assertEqual(relay.requests[1]["response"]["usage_response"]["request_id"], "2")
+            self.assertEqual(relay.requests[1]["forwarded"]["usage_response"]["request_id"], "1")
+            self.assertIn("guest_closed_ns", relay.requests[-1])
+            self.assertNotIn("client_closed_ns", relay.requests[-1])
 
 
 class BalloonWitnessTests(unittest.TestCase):

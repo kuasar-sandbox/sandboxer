@@ -56,7 +56,7 @@ def ext4(path, root=None):
 
 
 class Sandbox:
-    def __init__(self, work, name, config, restore=None, sandbox_id=None, base_root=None):
+    def __init__(self, work, name, config, restore=None, sandbox_id=None, base_root=None, ch_binary=None):
         self.dir = work / name
         self.dir.mkdir()
         self.name = sandbox_id or name
@@ -68,12 +68,13 @@ class Sandbox:
         command = [
             str(BIN / "sandbox-ctl"), "run", "--config", str(self.config),
             "--sandbox-id", self.name, "--path-id", "instance", "--run-root", str(self.runroot),
-            "--base-root", str(self.baseroot), "--ch-binary", str(BIN / "cloud-hypervisor")]
+            "--base-root", str(self.baseroot), "--ch-binary", str(ch_binary or BIN / "cloud-hypervisor")]
         if restore is not None:
             command += ["--restore", str(restore)]
         try:
             self.process = subprocess.Popen(command,
-                stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+                stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True,
+                env={**os.environ, "USAGE_TEST_CH": str(BIN / "cloud-hypervisor")} if ch_binary else None)
         except BaseException:
             self.log.close()
             raise

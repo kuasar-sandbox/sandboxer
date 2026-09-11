@@ -385,6 +385,39 @@ termination through a pidfd; it does not leave cleanup to the runner.
 Linux/Python pidfd support, `strace`, mount privileges
 and the ordinary KVM E2E prerequisites are required.
 
+The [slow-source E2E](../test/e2e/e2e_usage_sources.sh) selects one registered
+data-filesystem handle by device identity and checks CLOEXEC before delaying
+only that `fstatfs` return inside the disposable Guest. It requires a first
+timeout, subsequent busy responses from the same occupied slot, fresh memory
+and healthy-filesystem coverage, and exactly one traced filesystem call.
+Both data disks receive real writes. Bytes written after the delayed read
+distinguish a new observation from a replayed old buffer after release.
+A single long-lived test exec records all Guest FDs, identities, threads and
+RSS; it does not create an exec per observation or label threads as goroutines.
+The default fault lasts 30 seconds; `--seconds 60` extends it. This is neither
+a power-loss test nor proof of a blocked worker surviving snapshot/restore.
+The installed native `strace`, its `ldd`-resolved loader and libraries are
+copied into the disposable application image only, never the product runtime.
+Its `ch-info` and `ch-resize` cases place a test-only Unix HTTP relay before
+the real CH executable. The relay forwards unchanged response bodies and
+holds one actual reply for 12 seconds. The resize is driven by a real Guest
+allocation, not by a test-issued resize. Selection requires a target lower
+than the preceding real target; the held PUT reply or its immediate confirming
+GET exercises the existing mutation-gate/API-lock transaction. Once the old observation expires, Guest
+memory must be missing while filesystem/RSS coverage advances, without more
+CH requests piling up. Recovery requires a new successful `vm.info` read.
+These bounded functional faults do not measure uninstrumented API latency or
+production-density overhead, nor identify which caller owns every info read.
+The `vsock` case relays the real dedicated usage frames and preserves ordinary
+management/MUX traffic. It exercises eight disconnects, one late reply, a
+captured old response and slow fragments beyond the original round deadline,
+while one managed filesystem syscall remains occupied. Raw Guest responses
+must continue to report the same busy slot across new connections. Failed
+rounds break Gauge coverage rather than filling zero; native CPU counters
+remain a separate source. One observer exec streams resource diagnostics
+across all eleven faults. These are finite functional/resource-bound checks,
+not an overnight endurance run or a real blocked-worker restore experiment.
+
 Run the [off/on harness](../test/e2e/usage_perf.py) without concurrent test
 loads, supplying the assembled `BIN` and root privileges:
 

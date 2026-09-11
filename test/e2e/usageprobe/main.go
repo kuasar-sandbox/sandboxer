@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -81,6 +83,17 @@ func main() {
 		var s syscall.Statfs_t
 		fail(syscall.Statfs(os.Args[2], &s))
 		fail(json.NewEncoder(os.Stdout).Encode(s))
+	case "trace-fs":
+		traceFilesystem(os.Args[2], time.Duration(number(os.Args[3]))*time.Millisecond)
+	case "trace-stop":
+		fail(os.WriteFile("/tmp/usage-fs-trace-stop", nil, 0600))
+	case "init-resources":
+		initResources(0)
+	case "init-resources-stream":
+		for i := 0; i < number(os.Args[2]); i++ {
+			initResources(i)
+			time.Sleep(time.Second)
+		}
 	case "inspect":
 		out := map[string]string{}
 		init, err := os.ReadFile("/proc/1/exe")
@@ -96,5 +109,103 @@ func main() {
 		fail(json.NewEncoder(os.Stdout).Encode(out))
 	default:
 		panic("unknown workload")
+	}
+}
+
+func initResources(sequence int) {
+	fds, err := os.ReadDir("/proc/1/fd")
+	fail(err)
+	threads, err := os.ReadDir("/proc/1/task")
+	fail(err)
+	status, err := os.ReadFile("/proc/1/status")
+	fail(err)
+	identities, infos := make(map[string]string), make(map[string]string)
+	for _, fd := range fds {
+		link, err := os.Readlink("/proc/1/fd/" + fd.Name())
+		if err == nil {
+			identities[fd.Name()] = link
+			info, err := os.ReadFile("/proc/1/fdinfo/" + fd.Name())
+			if err == nil {
+				infos[fd.Name()] = string(info)
+			}
+		}
+	}
+	fail(json.NewEncoder(os.Stdout).Encode(map[string]any{"sequence": sequence, "fds": len(fds), "fd_identities": identities,
+		"fdinfo": infos, "threads": len(threads), "status": string(status)}))
+}
+
+// traceFilesystem is a test-only tracer owner. Select the retained directory
+// handle by the mounted filesystem's device, not by a guessed fd or a user
+// mount enumeration. The native strace and its loader live only in this test's
+// application image, never in the product runtime bundle.
+func traceFilesystem(path string, delay time.Duration) {
+	var target syscall.Stat_t
+	fail(syscall.Stat(path, &target))
+	entries, err := os.ReadDir("/proc/1/fd")
+	fail(err)
+	selected, selectedFD := "", ""
+	for _, entry := range entries {
+		fdPath := filepath.Join("/proc/1/fd", entry.Name())
+		var st syscall.Stat_t
+		if syscall.Stat(fdPath, &st) != nil || st.Dev != target.Dev || st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+			continue
+		}
+		if selected != "" {
+			panic("multiple retained directory handles for selected filesystem")
+		}
+		selected, err = os.Readlink(fdPath)
+		fail(err)
+		selectedFD = entry.Name()
+	}
+	if selected == "" {
+		panic("managed filesystem handle not found")
+	}
+	info, err := os.ReadFile("/proc/1/fdinfo/" + selectedFD)
+	fail(err)
+	flags := uint64(0)
+	for _, line := range strings.Split(string(info), "\n") {
+		if value, ok := strings.CutPrefix(line, "flags:\t"); ok {
+			flags, err = strconv.ParseUint(value, 8, 64)
+			fail(err)
+		}
+	}
+	if flags&syscall.O_CLOEXEC == 0 {
+		panic("managed filesystem handle is not CLOEXEC")
+	}
+	fail(json.NewEncoder(os.Stdout).Encode(map[string]string{"fd": selectedFD, "path": selected, "fdinfo": string(info)}))
+	cmd := exec.Command("/strace", "-f", "-qq", "-yy", "-ttt", "-T", "-p", "1",
+		"-e", "trace=fstatfs", "-e", "signal=none", "-e", fmt.Sprintf("inject=fstatfs:delay_exit=%d", delay.Microseconds()), "-P", selected)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	fail(cmd.Start())
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	limit := time.NewTimer(90 * time.Second)
+	defer limit.Stop()
+	for {
+		select {
+		case err := <-done:
+			fail(err)
+			panic("tracer ended before requested stop")
+		case <-ticker.C:
+			if _, err := os.Stat("/tmp/usage-fs-trace-stop"); err != nil {
+				continue
+			}
+		case <-limit.C:
+		}
+		fail(cmd.Process.Signal(syscall.SIGINT))
+		select {
+		case err := <-done:
+			if exit, ok := err.(*exec.ExitError); ok && exit.ProcessState.Sys().(syscall.WaitStatus).Signal() == syscall.SIGINT {
+				return
+			}
+			fail(err)
+			return
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+			panic("tracer failed to detach")
+		}
 	}
 }
