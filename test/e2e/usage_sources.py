@@ -294,6 +294,53 @@ def wait_observer_ready(observer, path):
     raise AssertionError("resource observer MUX did not become ready")
 
 
+def wire_view_key(view):
+    # Live queries can cut between the Manager's per-metric merges. Retain
+    # changes to any metric, not only the first merged memory field.
+    return tuple((g["name"], g["last_request_id"]) for g in view["live"]["gauges"])
+
+
+def validate_wire_views(values, requests):
+    by_id = {int(row["request"]["request_id"]): row for row in requests}
+    for view in values:
+        for name in ("guest.memory", "filesystem.root", "filesystem.disk-0", "filesystem.disk-1"):
+            gauge = metric(view["live"], "gauges", name)
+            request = int(gauge["last_request_id"])
+            row = by_id.get(request)
+            # An occupied Host slot can reject a tick without sending a new
+            # request. Faulted frames also produce missing, never a new value.
+            expected = "missing"
+            if row is not None and not row["mode"]:
+                assert row.get("sent_ns"), "unforwarded response became visible"
+                response = row["response"]
+                if response["type"] == "usage_response":
+                    raw = response["usage_response"]
+                    if name == "guest.memory":
+                        expected = raw["memory"]["status"]
+                    else:
+                        expected = next(fs["status"] for fs in raw["filesystems"] if fs["disk"] == name.split(".")[1])
+                else:
+                    assert response == {"type": "error", "msg": "usage busy"}, response
+            assert gauge["status"] == expected, (name, request, gauge["status"], expected)
+
+
+def validate_wire_deadline(fault, requests):
+    fault_id = int(fault["request"]["request_id"])
+    later = [row for row in requests if int(row["request"]["request_id"]) > fault_id]
+    assert later and later[0]["connection"] != fault["connection"]
+    # Observe actual peer closure during the held reply. The next ticker can
+    # see a Host read or Guest admission slot still exiting and correctly
+    # report busy/missing;
+    # a replacement request's start time is not the preceding read deadline.
+    assert 0 < fault["client_closed_ns"] - fault["start_ns"] < 1_300_000_000
+    assert later[0]["start_ns"] - fault["start_ns"] < 2_300_000_000
+    if fault["mode"] == "delay":
+        assert fault["delay_released_ns"] - fault["received_ns"] >= 1_300_000_000
+        assert fault["client_closed_ns"] < fault["delay_released_ns"]
+    else:
+        assert len(fault["fragments_sent_ns"]) >= 2
+
+
 def vsock_case(work, ref):
     sb = Sandbox(work, "vsock", filesystem_config(work, "vsock", ref),
                  ch_binary=Path(__file__).with_name("usage_vsock_wrapper.py"))
@@ -311,6 +358,7 @@ def vsock_case(work, ref):
                 stdout=output, stderr=subprocess.STDOUT)
             time.sleep(3)
             baseline = sb.view()
+            write_json(sb.dir / "baseline.json", baseline)
             assert metric(baseline["live"], "gauges", "filesystem.disk-0")["status"] == "busy"
             # Test ordinary exec while the filesystem is busy, but outside the
             # all-FD observer window: its temporary stdio/handshake FDs are not
@@ -323,20 +371,20 @@ def vsock_case(work, ref):
             observed, counts, faults = [], [], []
             for ordinal, mode in enumerate(["drop"]*8 + ["delay", "repeat", "fragment"]):
                 relay.arm(mode)
-                values, started, last = [], time.monotonic(), 0
+                values, started, last = [], time.monotonic(), None
                 while time.monotonic() - started < 5:
                     assert trace.poll() is None and observer.poll() is None
                     view = sb.view()
-                    memory = metric(view["live"], "gauges", "guest.memory")
-                    request = int(memory["last_request_id"])
-                    if request > last:
-                        last = request
+                    key = wire_view_key(view)
+                    if key != last:
+                        last = key
                         values.append(view)
                     time.sleep(.1)
                 entries = [row for row in relay.requests if row["mode"]]
                 assert len(entries) == ordinal + 1 and entries[-1]["mode"] == mode, "fault did not reach the dedicated usage connection"
                 fault = entries[-1]
                 faults.append(fault)
+                write_json(sb.dir / f"fault-{ordinal}.json", {"fault": fault, "values": values})
                 fault_id = int(fault["request"]["request_id"])
                 assert fault.get("response", {}).get("type") == "usage_response", "fault did not intercept a real raw response"
                 raw = fault["response"]["usage_response"]
@@ -353,25 +401,10 @@ def vsock_case(work, ref):
                 if mode != "drop":
                     assert fault.get("client_closed_ns"), "Host did not reject the fault connection"
                 if mode in ("delay", "fragment"):
-                    later = [row for row in relay.requests if int(row["request"]["request_id"]) > fault_id]
-                    assert later and later[0]["connection"] != fault["connection"]
-                    # A new real request, not an aggregate last-status check,
-                    # witnesses the Host leaving the original 1s round. Allow
-                    # scheduling jitter, but never the full injected delay.
-                    assert later[0]["start_ns"] - fault["start_ns"] < 1_300_000_000
-                    if mode == "delay":
-                        assert fault["delay_released_ns"] - fault["received_ns"] >= 1_300_000_000
-                        assert later[0]["start_ns"] < fault["delay_released_ns"]
-                    else:
-                        assert len(fault["fragments_sent_ns"]) >= 2
-                for view in missing:
-                    for name in ("filesystem.root", "filesystem.disk-0", "filesystem.disk-1"):
-                        assert metric(view["live"], "gauges", name)["status"] == "missing", (mode, name)
+                    validate_wire_deadline(fault, relay.requests)
+                validate_wire_views(values, relay.requests)
                 assert metric(values[-1]["live"], "gauges", "guest.memory")["status"] == "ok", "connection did not recover with new data"
                 for view in values:
-                    if metric(view["live"], "gauges", "guest.memory")["status"] == "ok":
-                        for name in ("filesystem.root", "filesystem.disk-1"):
-                            assert metric(view["live"], "gauges", name)["status"] == "ok", name
                     disk = metric(view["live"], "gauges", "filesystem.disk-0")
                     assert disk["status"] in ("busy", "missing"), "reconnect replaced the blocked source"
                     for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):

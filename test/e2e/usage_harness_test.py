@@ -13,6 +13,8 @@ import socketserver
 import struct
 import tempfile
 import threading
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -23,7 +25,7 @@ import usage_trace
 import usage_faults
 import usage_sources
 from usage_ch_relay import CHRelay
-from usage_vsock_relay import UsageRelay, exact, frame, line
+from usage_vsock_relay import UsageHandler, UsageRelay, exact, frame, line
 from usage_report_relay import ReportRelay
 
 
@@ -142,6 +144,64 @@ class SourceFaultTests(unittest.TestCase):
             changed[-1]["live"]["gauges"][index]["covered_total_ns"] = "0"
             with self.assertRaises(AssertionError):
                 usage_sources.validate_wire_progress(baseline, changed)
+
+    def test_live_wire_validation_uses_each_metrics_request(self):
+        names = ("guest.memory", "filesystem.root", "filesystem.disk-0", "filesystem.disk-1")
+        raw = {"memory": {"status": "ok"}, "filesystems": [
+            {"disk": "root", "status": "ok"}, {"disk": "disk-0", "status": "busy"},
+            {"disk": "disk-1", "status": "ok"}]}
+        requests = [{"request": {"request_id": "1"}, "mode": "drop"},
+                    {"request": {"request_id": "2"}, "mode": None, "sent_ns": 1,
+                     "response": {"type": "usage_response", "usage_response": raw}}]
+        values = []
+        for completed in range(5):
+            values.append({"live": {"gauges": [
+                {"name": name, "last_request_id": "2" if i < completed else "1",
+                 "status": ("busy" if i == 2 else "ok") if i < completed else "missing"}
+                for i, name in enumerate(names)]}})
+        usage_sources.validate_wire_views(values, requests)
+        self.assertEqual(len({usage_sources.wire_view_key(v) for v in values}), 5)
+        # A same-request healthy-source failure is still rejected; different
+        # request IDs are not permission to fill zeros or accept old frames.
+        for index in range(4):
+            changed = copy.deepcopy(values)
+            changed[-1]["live"]["gauges"][index]["status"] = "missing"
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_wire_views(changed, requests)
+        for index in range(4):
+            changed = copy.deepcopy(values)
+            changed[0]["live"]["gauges"][index]["status"] = "ok"
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_wire_views(changed, requests)
+        busy_tick = copy.deepcopy(values[0])
+        for gauge in busy_tick["live"]["gauges"]:
+            gauge["last_request_id"] = "3"
+        usage_sources.validate_wire_views([busy_tick], requests)
+        guest_busy = {"request": {"request_id": "3"}, "mode": None, "sent_ns": 1,
+                      "response": {"type": "error", "msg": "usage busy"}}
+        usage_sources.validate_wire_views([busy_tick], requests+[guest_busy])
+        with self.assertRaises(AssertionError):
+            usage_sources.validate_wire_views([busy_tick], requests+[
+                {**guest_busy, "response": {"type": "error", "msg": "unexpected error"}}])
+        busy_tick["live"]["gauges"][0]["status"] = "ok"
+        with self.assertRaises(AssertionError):
+            usage_sources.validate_wire_views([busy_tick], requests)
+        with self.assertRaises(AssertionError):
+            usage_sources.validate_wire_views([busy_tick], requests+[guest_busy])
+
+    def test_wire_deadline_is_peer_close_not_next_tick(self):
+        fault = {"request": {"request_id": "50"}, "mode": "delay", "connection": 1,
+                 "start_ns": 1, "received_ns": 1_000_001,
+                 "client_closed_ns": 1_001_000_001, "delay_released_ns": 1_401_000_001}
+        later = {"request": {"request_id": "52"}, "connection": 2, "start_ns": 2_001_000_001}
+        usage_sources.validate_wire_deadline(fault, [fault, later])
+        for key, value in (("client_closed_ns", 1_400_000_001), ("client_closed_ns", 0),
+                           ("delay_released_ns", 1_100_000_001)):
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_wire_deadline({**fault, key: value}, [fault, later])
+        for key, value in (("start_ns", 2_400_000_001), ("connection", 1)):
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_wire_deadline(fault, [fault, {**later, key: value}])
 
     def test_restore_preserves_busy_slot_and_independent_sources(self):
         view = self.samples()[1]
@@ -338,6 +398,49 @@ class CHRelayTests(unittest.TestCase):
 
 
 class UsageRelayTests(unittest.TestCase):
+    def test_fault_wait_witnesses_eof_without_ending_delay(self):
+        left, right = socket.socketpair()
+        handler = UsageHandler.__new__(UsageHandler)
+        handler.request = left
+        handler.server = SimpleNamespace(stopping=threading.Event())
+        row = {}
+        thread = threading.Thread(target=handler.wait_fault, args=(.3, row))
+        try:
+            started = time.monotonic_ns()
+            thread.start()
+            right.close()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertGreaterEqual(time.monotonic_ns() - started, 280_000_000)
+            self.assertLess(row["client_closed_ns"] - started, 250_000_000)
+            self.assertNotIn("client_data_before_reply_ns", row)
+            self.assertGreaterEqual(left.fileno(), 0)  # Observer did not close it.
+        finally:
+            handler.server.stopping.set()
+            thread.join(timeout=2)
+            left.close()
+            right.close()
+
+    def test_fault_wait_neither_consumes_data_nor_invents_eof(self):
+        left, right = socket.socketpair()
+        handler = UsageHandler.__new__(UsageHandler)
+        handler.request = left
+        handler.server = SimpleNamespace(stopping=threading.Event())
+        try:
+            row = {}
+            right.sendall(b"next request")
+            handler.wait_fault(.02, row)
+            self.assertIn("client_data_before_reply_ns", row)
+            self.assertNotIn("client_closed_ns", row)
+            self.assertEqual(left.recv(12), b"next request")
+            handler.wait_fault(.02, row)
+            self.assertNotIn("client_closed_ns", row)
+            left.sendall(b"reply")
+            self.assertEqual(right.recv(5), b"reply")
+        finally:
+            left.close()
+            right.close()
+
     def wire(self, kind, number):
         body = json.dumps({"type": kind, kind: {"request_id": str(number), "run_epoch": "run"}}, separators=(",", ":")).encode()
         return struct.pack("<I", len(body)) + body

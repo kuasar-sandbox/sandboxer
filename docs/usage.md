@@ -61,6 +61,12 @@ accepted input still in flight or not yet submitted for saving; it can roll
 back to surviving saved state after a crash. Missing observation, unsaved
 input and an uncertain file tail are different conditions.
 
+Live state is copied between individual metric merges, not as an atomic
+whole-round observation. Read each Gauge's own `last_request_id`, status and
+position; memory may already reflect a recovered request while a filesystem
+still describes the preceding missing request. Queries do not wait for a
+whole-round boundary or change either metric's accepted input.
+
 Online queries only copy existing state or read confirmed history. They do
 not sample Guest/CH, advance counters, or flush. Offline readers take a
 nonblocking shared file lock and reject an active writer: use its ctl socket
@@ -437,6 +443,13 @@ remain a separate source. One observer exec streams resource diagnostics
 across all eleven faults. Its first complete output establishes MUX readiness
 before injection. Additional health/stop execs run outside the all-FD observation
 window while the filesystem is still blocked; no FD samples are discarded.
+The relay observes peer EOF while a late or fragmented reply is still held,
+so the read-deadline witness is Host closure, not the next request's start.
+One intervening tick may correctly remain missing while the original Host
+read or Guest admission slot exits. New-connection recovery is checked separately.
+Live-query evidence
+retains changes to every metric's request ID and compares each metric with
+its own raw request; it does not assume atomic publication of a whole round.
 The `restore` case keeps one occupied filesystem slot across same-process
 quiesce/thaw and then lazy memory restore with the same SandboxID/usage file.
 A bounded, test-only tracer owner joins the disposable Guest's root cgroup

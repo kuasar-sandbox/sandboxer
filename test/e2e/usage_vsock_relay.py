@@ -150,7 +150,7 @@ class UsageHandler(socketserver.BaseRequestHandler):
                     row["dropped"] = True
                     return
                 if mode == "delay":
-                    self.server.stopping.wait(1.4)
+                    self.wait_fault(1.4, row)
                     row["delay_released_ns"] = time.monotonic_ns()
                 if mode == "old-epoch":
                     # Deliberate identity corruption, not an unmodified old
@@ -174,7 +174,7 @@ class UsageHandler(socketserver.BaseRequestHandler):
                     width = (len(response)-4+3)//4
                     row["fragments_sent_ns"] = []
                     for start in range(4, len(response), width):
-                        self.server.stopping.wait(.4)
+                        self.wait_fault(.4, row)
                         self.request.sendall(response[start:start+width])
                         row["fragments_sent_ns"].append(time.monotonic_ns())
                 else:
@@ -187,7 +187,7 @@ class UsageHandler(socketserver.BaseRequestHandler):
                 data, message = frame(self.request)
         except (EOFError, BrokenPipeError, ConnectionResetError):
             if row is not None and operation in ("host_read", "host_send"):
-                row["client_closed_ns"] = time.monotonic_ns()
+                row.setdefault("client_closed_ns", time.monotonic_ns())
             elif row is not None and operation in ("guest_read", "guest_send"):
                 row["guest_closed_ns"] = time.monotonic_ns()
         except OSError as error:
@@ -197,6 +197,27 @@ class UsageHandler(socketserver.BaseRequestHandler):
             self.server.errors.append(str(error))
         finally:
             upstream.close()
+
+    def wait_fault(self, seconds, row):
+        # Witness peer EOF while the reply is still held, rather than dating
+        # a failed send after the delay. Keep the original delay even after
+        # EOF; observing it must not close the relay or advance another slot.
+        end = time.monotonic() + seconds
+        while not self.server.stopping.is_set():
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            if "client_closed_ns" in row or "client_data_before_reply_ns" in row:
+                self.server.stopping.wait(remaining)
+                return
+            readable, _, _ = select.select([self.request], [], [], min(.05, remaining))
+            if readable:
+                try:
+                    data = self.request.recv(1, socket.MSG_PEEK)
+                except ConnectionResetError:
+                    data = b""
+                key = "client_data_before_reply_ns" if data else "client_closed_ns"
+                row[key] = time.monotonic_ns()
 
     def raw(self, upstream):
         sockets = [self.request, upstream]

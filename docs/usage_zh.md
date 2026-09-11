@@ -51,6 +51,11 @@ View 包含 `enabled`, 可选的 `live`/`saved`, `saved_end`, `saving`,
 完整存活记录, 不证明原 writer 已确认 Sync. `live` 包含已经接收但仍在保存或尚未提交的输入,
 崩溃后可以回退到存活的 saved. 缺测、未持久化和文件尾部不确定是不同状态.
 
+Live 状态可在逐项指标归并之间复制, 不是整轮观测的原子发布. 应分别读取
+各 Gauge 的 `last_request_id`、状态和位置; 内存可能已反映恢复后的请求,
+而文件系统仍描述前一次缺测请求. 查询不等待整轮边界, 也不改变任一指标
+已接收的输入.
+
 在线查询只复制已有状态或读取已确认历史, 不触发 Guest/CH 采集、累计推进或
 flush. 离线 reader 获取非阻塞共享文件锁, 拒绝与活动 writer 并行读取; 此时应
 查询该 writer 的 ctl socket. 关闭 usage 不删除已有文件, 仍可离线读取.
@@ -343,6 +348,10 @@ API 锁控制事务. 选择时要求 target 低于先前真实 target, 暂扣的
 仍是独立来源. 一个观察 exec 跨全部十一项故障持续传送资源诊断,
 注入前以第一份完整输出确认 MUX 已建立. 额外的健康检查/停止 exec 位于
 全部 FD 的观测窗口之外, 此时文件系统仍阻塞; 不丢弃任何 FD 样本.
+中继在仍暂扣迟到/分段响应时观察 peer EOF, 以 Host 关闭连接而非下一请求
+起点验证读取 deadline. 原 Host 读取或 Guest 准入槽退出期间, 中间一个 tick
+可以按设计继续缺测; 新连接恢复另行验证. Live 查询证据保留每项指标 request ID 的变化,
+并分别对应各自的原始请求, 不假定整轮归并为原子发布.
 `restore` 案例让同一个已占用文件系统槽跨同进程 quiesce/thaw, 再以相同
 SandboxID/usage 文件执行 lazy 内存恢复. 有界的测试专用 tracer owner 在
 启动 `strace` 前仅将自己加入可丢弃 Guest 的 root cgroup; 不移动 PID 1、
