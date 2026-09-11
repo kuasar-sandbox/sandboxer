@@ -562,14 +562,7 @@ func ServeAndWait(p VMParams) (int, error) {
 				if usageManager == nil {
 					return ctl.Response{}, errors.New("usage history unavailable; read the saved file offline")
 				}
-				records, next, err := usageManager.History(req.UsageCursor, req.UsageLimit)
-				if err != nil {
-					return ctl.Response{}, err
-				}
-				body, err := json.Marshal(struct {
-					Records []usage.Record `json:"records"`
-					Next    int64          `json:"next_cursor,string"`
-				}{records, next})
+				body, err := marshalUsageHistory(usageManager.History, view.SavedEnd, req.UsageCursor, req.UsageLimit)
 				return ctl.Response{Usage: body}, err
 			}
 			body, err := json.Marshal(view)

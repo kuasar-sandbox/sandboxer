@@ -369,10 +369,39 @@ func checkIncomplete(b []byte) error {
 }
 
 // ReadHistory reads complete records within an already selected saved prefix.
-// A cursor is a byte offset. Any encountered corruption is returned explicitly.
+// A cursor is a byte offset. The immediately preceding frame is validated at
+// page boundaries; this is not a validation of the entire unrequested prefix.
 func ReadHistory(reader io.ReaderAt, end, cursor int64, limit int, sandboxID string) ([]Record, int64, error) {
 	if cursor < 0 || cursor > end || limit < 1 || limit > 100 {
 		return nil, cursor, errors.New("usage: invalid history range")
+	}
+	var previous uint64
+	if cursor != 0 {
+		// Read a single bounded predecessor, not Recover: an incomplete tail
+		// before the cursor is an invalid page boundary, not a rollback hint.
+		if cursor < frameFooter {
+			return nil, cursor, ErrCorrupt
+		}
+		var footer [frameFooter]byte
+		if _, err := reader.ReadAt(footer[:], cursor-frameFooter); err != nil {
+			return nil, cursor, err
+		}
+		n := int64(binary.LittleEndian.Uint32(footer[4:8]))
+		if !bytes.Equal(footer[8:], tailMagic) || n < frameHeader+frameFooter || n > MaxRecordBytes || n > cursor {
+			return nil, cursor, ErrCorrupt
+		}
+		b := make([]byte, int(n))
+		if _, err := reader.ReadAt(b, cursor-n); err != nil {
+			return nil, cursor, err
+		}
+		r, err := DecodeRecord(b, sandboxID)
+		if err != nil {
+			return nil, cursor, fmt.Errorf("usage offset %d: %w", cursor-n, err)
+		}
+		if n == cursor && r.Sequence != 1 {
+			return nil, cursor, ErrCorrupt
+		}
+		previous = r.Sequence
 	}
 	out := make([]Record, 0, limit)
 	for cursor < end && len(out) < limit {
@@ -395,9 +424,10 @@ func ReadHistory(reader io.ReaderAt, end, cursor int64, limit int, sandboxID str
 		if err != nil {
 			return nil, cursor, fmt.Errorf("usage offset %d: %w", cursor, err)
 		}
-		if len(out) > 0 && r.Sequence != out[len(out)-1].Sequence+1 {
+		if previous == ^uint64(0) || r.Sequence != previous+1 {
 			return nil, cursor, ErrCorrupt
 		}
+		previous = r.Sequence
 		out = append(out, r)
 		cursor += n
 	}

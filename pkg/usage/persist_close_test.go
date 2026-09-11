@@ -38,10 +38,16 @@ func TestCloseFencesProducersBeforeSealing(t *testing.T) {
 			if mode == "recovered-rollback" || mode == "recovered-uncertain" || mode == "recovered-same-epoch" {
 				r := Record{Sequence: 7, Snapshot: m.live.clone()}
 				r.Snapshot.Closed = true
-				var err error
-				w.data, err = EncodeRecord(r)
-				if err != nil {
-					t.Fatal(err)
+				// A recovered S at sequence 7 has an actual complete prefix;
+				// an isolated sequence-7 frame is not valid full history.
+				for sequence := uint64(1); sequence <= r.Sequence; sequence++ {
+					prior := r
+					prior.Sequence = sequence
+					frame, err := EncodeRecord(prior)
+					if err != nil {
+						t.Fatal(err)
+					}
+					w.data = append(w.data, frame...)
 				}
 				s := r.Snapshot.clone()
 				epoch := "new-epoch"

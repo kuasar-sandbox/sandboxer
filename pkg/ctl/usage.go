@@ -17,6 +17,13 @@ func WriteUsageResponse(w io.Writer, response Response) error {
 	if response.Type != TypeUsageResponse && response.Type != TypeError {
 		return errors.New("ctl: invalid usage response type")
 	}
+	tooLarge := Response{Type: TypeError, Msg: "ctl: usage response too large; reduce history limit"}
+	// Reject an already oversized raw page before json.Marshal copies and
+	// HTML-escapes it. History construction also limits its accumulated page;
+	// the final encoded-size check below still covers escaping and framing.
+	if len(response.Usage) > MaxUsageResponseBytes || len(response.Msg) > MaxUsageResponseBytes {
+		response = tooLarge
+	}
 	body, err := json.Marshal(response)
 	if err != nil {
 		return err
@@ -24,7 +31,7 @@ func WriteUsageResponse(w io.Writer, response Response) error {
 	if len(body) > MaxUsageResponseBytes {
 		// Replace before writing any bytes. After a partial write, callers
 		// must close the connection, never append a second framed response.
-		body, _ = json.Marshal(Response{Type: TypeError, Msg: "ctl: usage response too large; reduce history limit"})
+		body, _ = json.Marshal(tooLarge)
 	}
 	var header [4]byte
 	binary.LittleEndian.PutUint32(header[:], uint32(len(body)))

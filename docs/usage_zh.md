@@ -39,8 +39,10 @@ sandbox-ctl usage --sandbox-id s1 --history --limit 10 --cursor 0
 去掉 `.usage` 后缀的文件名推导 SandboxID.
 
 `--saved` 省略 `live`. 历史查询采用非负字节 cursor 和 1–100 条记录的 limit,
-默认 10. Host usage response 上限 1 MiB, 一页放不下时须减小 limit. 历史不
-返回活动尾部. 普通 ctl 请求的 framing 和大小上限不变.
+默认 10. Host usage response 上限 1 MiB, 一页放不下时须减小 limit.
+在线读取器每次只解码、编码一条有界记录, 在保留或编码完整请求记录集合前
+拒绝超出 JSON 预算的页, 并计入字符串转义膨胀. 历史不返回活动尾部.
+普通 ctl 请求的 framing 和大小上限不变.
 
 View 包含 `enabled`, 可选的 `live`/`saved`, `saved_end`, `saving`,
 `unknown_tail` 和可选 `save_error`/`read_error`. 在线 `saved` 是 owner 已采用
@@ -245,7 +247,9 @@ Host manager 在接纳身份和指标元数据前检查这些限制; Counter 和
 
 当前恢复至多读取尾部两个最大 frame 的范围, 找到最后有效自包含记录及可识别的
 不完整追加. 不扫描或声明校验全部历史. 历史查询逐条验证遇到的 frame, 损坏
-明确报错; 不接受错误身份、版本、长度或校验. 新运行保留累计端点, 重建当前
+明确报错; 不接受错误身份、版本、长度或校验. 文件首条必须为 sequence 1.
+非零分页 cursor 验证紧邻的前一完整帧及跨边界序号, 包括每页仅一条记录的情况;
+不会扫描或声明校验未请求的整个前缀. 新运行保留累计端点, 重建当前
 单调位置和 Gauge 基线, 不用旧单调位置与当前时钟相减.
 
 ## 7. 可靠性与生命周期

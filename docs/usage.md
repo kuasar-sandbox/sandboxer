@@ -44,7 +44,10 @@ and can infer SandboxID from the filename without `.usage`.
 
 `--saved` omits `live`. History uses a nonnegative byte cursor and a record
 limit of 1–100, default 10. The host usage response is bounded to 1 MiB; reduce
-the page size if a page cannot fit. History does not return the active tail.
+the page size if a page cannot fit. The online reader decodes and encodes one
+bounded record at a time, rejecting an oversized JSON page before retaining
+or encoding the complete requested record set, including string-escaping
+expansion. History does not return the active tail.
 Ordinary ctl requests retain their existing framing and limits.
 
 The view contains `enabled`, optional `live` and `saved`, `saved_end`,
@@ -304,7 +307,10 @@ Current recovery reads at most two maximum frames at the tail to find the
 last valid self-contained record and a recognizable incomplete append. It
 does not scan or certify all history. History queries validate encountered
 frames and report corruption explicitly; bad identities, versions, lengths
-and checksums are not silently accepted. New runs retain cumulative endpoints
+and checksums are not silently accepted. The first frame must have sequence 1.
+A nonzero page cursor validates the immediately preceding complete frame and
+the sequence across that boundary, including one-record pages; it does not
+scan or certify the entire unrequested prefix. New runs retain cumulative endpoints
 but rebuild current monotonic positions and Gauge baselines. They never
 subtract a saved old monotonic position from the current clock.
 
