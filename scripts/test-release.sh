@@ -412,7 +412,7 @@ for source_name in cloud-hypervisor cloud-hypervisor-patches cloud-hypervisor-ca
     candidate="$TMP/ch-source-$source_name-$column"
     cp -a "$TMP/bundle" "$candidate"
     mkdir "$candidate/root"
-    tar -xzf "$archive" -C "$candidate/root"
+    tar --same-permissions -xzf "$archive" -C "$candidate/root"
     source_table="$candidate/root/share/sources/sandboxer/SOURCES.tsv"
     awk -F '\t' -v OFS='\t' -v name="$source_name" -v column="$column" '
       NR > 1 && $2 == name { $column="not-the-selected-native-source" }
@@ -426,13 +426,13 @@ for source_name in cloud-hypervisor cloud-hypervisor-patches cloud-hypervisor-ca
       fail "validator accepted altered $source_name source column $column"
     fi
     grep -Fq "missing or inconsistent source record for $source_name" "$candidate/result.log" \
-      || fail "native source mutation failed for an unrelated reason"
+      || { cat "$candidate/result.log" >&2; fail "native source mutation failed for an unrelated reason"; }
   done
 done
 candidate="$TMP/ch-lock-bytes"
 cp -a "$TMP/bundle" "$candidate"
 mkdir "$candidate/root"
-tar -xzf "$archive" -C "$candidate/root"
+tar --same-permissions -xzf "$archive" -C "$candidate/root"
 printf 'altered lock bytes\n' >> "$candidate/root/share/sources/sandboxer/CLOUD-HYPERVISOR-Cargo.lock"
 release_materials_hash_tree "$candidate/root" sandboxer \
   "$candidate/root/share/sources/sandboxer/MATERIALS.sha256"
@@ -441,7 +441,7 @@ if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$ca
   fail "validator accepted changed Cargo.lock bytes with regenerated checksums"
 fi
 grep -Fq 'missing or inconsistent source record for cloud-hypervisor-cargo-lock' "$candidate/result.log" \
-  || fail "Cargo.lock byte mutation failed for an unrelated reason"
+  || { cat "$candidate/result.log" >&2; fail "Cargo.lock byte mutation failed for an unrelated reason"; }
 cp -a "$TMP/bundle" "$TMP/tampered"
 printf 'tampered\n' >> "$TMP/tampered/assets/sandboxer-v1.2.3-linux-x86_64.tar.gz"
 if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/tampered" >/dev/null 2>&1; then
@@ -455,7 +455,7 @@ if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra" >/dev/
 fi
 
 mkdir -p "$TMP/archive-root"
-tar -xzf "$archive" -C "$TMP/archive-root"
+tar --same-permissions -xzf "$archive" -C "$TMP/archive-root"
 
 cp -a "$TMP/archive-root" "$TMP/extra-file-root"
 printf 'unexpected\n' > "$TMP/extra-file-root/bin/unexpected"
