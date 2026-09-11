@@ -175,7 +175,7 @@ package_release() {
   local ch_output="${CLOUD_HYPERVISOR_BUILD_OUT:-$ROOT/native-deps/build/$arch/cloud-hypervisor}"
   local ch_report="${CH_BUILD_REPORT:-$ch_output/build-report.jsonl}" ch_map="${CH_LINK_MAP:-$ch_output/link.map}"
   local cargo_home="${CARGO_HOME:-$HOME/.cargo}" rustc_path
-  rustc_path="${RUSTC:-$(command -v rustc)}"
+  rustc_path="$(command -v "${RUSTC:-rustc}")"
   if [ ! -s "$ch_report" ] || [ ! -s "$ch_map" ]; then
     fail "Cloud Hypervisor build materials are missing; run the normal ch-build target with the selected source"
   fi

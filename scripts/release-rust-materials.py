@@ -80,11 +80,12 @@ def registry_materials(package, locked, cargo_home, destination):
     name, version = package["name"], package["version"]
     checksum = locked.get("checksum", "")
     require(re.fullmatch(r"[0-9a-f]{64}", checksum), "registry crate has no lock checksum")
-    archives = list((cargo_home / "registry" / "cache").glob(f"*/{name}-{version}.crate"))
-    require(len(archives) == 1, f"missing or ambiguous downloaded crate: {name}@{version}")
-    archive = archives[0]
-    require(hashlib.sha256(archive.read_bytes()).hexdigest() == checksum,
+    archives = sorted((cargo_home / "registry" / "cache").glob(f"*/{name}-{version}.crate"))
+    require(archives, f"missing downloaded crate: {name}@{version}")
+    matching = [path for path in archives if hashlib.sha256(path.read_bytes()).hexdigest() == checksum]
+    require(matching,
             f"crate archive checksum mismatch: {name}@{version}")
+    archive = matching[0]
     declared = package.get("license_file")
     if declared:
         declared_path = Path(declared)

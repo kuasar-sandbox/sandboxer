@@ -103,10 +103,15 @@ the existing output/record locations. If an older binary has no such records,
 run `make -C native-deps ch-build` from the sandboxer root with matching sources;
 packaging itself does not perform a fresh checkout or rebuild. Build flags and
 the normal Cargo cache/routing remain available.
+The existing report is kept incomplete until the binary and link map have been
+copied successfully, so a failed build cannot satisfy the completed-output reuse
+check. No additional completion marker or build receipt is required.
 
 Python 3.11 or newer collects materials from the actual Cargo build report and
 locked dependency graph. Registry crate archives must match `Cargo.lock`
-checksums; Git dependencies use its full commits. Only observed inputs are
+checksums; identical archives in multiple registry cache namespaces are allowed,
+and a matching archive is selected by that checksum. Git dependencies use the
+lockfile's full commits. Only observed inputs are
 listed, including build-time and procedural-macro dependencies; this is not a
 claim that every listed crate's code is shipped. The collected `Cargo.lock`
 and its source record must agree. Native pin changes require updating the
@@ -127,6 +132,7 @@ commits from overwriting each other's notices. Rust copyright and license texts
 come from the selected installation's `share/doc/rust/COPYRIGHT-library.html`
 and `licenses/`, or the corresponding Debian/RPM source-package notices.
 Records include the actual Rust version and compiler-reported source commit.
+An explicit bare `RUSTC` command is resolved through the caller's `PATH`.
 Missing notices produce an installation hint; collected files are regular files.
 
 The matching Cloud Hypervisor link map selects the system static libraries and

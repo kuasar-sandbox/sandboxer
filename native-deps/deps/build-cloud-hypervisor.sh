@@ -174,7 +174,7 @@ do_patches_format() {
     log "extracted $n patch(es) to $PATCHES_DIR"
 }
 
-do_build() {
+do_build() (
     local out_bin="$BINDIR/cloud-hypervisor"
     local report="${CH_BUILD_REPORT:-$CH_BUILD_OUT/build-report.jsonl}"
     local link_map="${CH_LINK_MAP:-$CH_BUILD_OUT/link.map}"
@@ -185,7 +185,7 @@ do_build() {
 
     require_cmd cargo rustc
     [ -f "$CH_SRC/Cargo.toml" ] || die "no source at $CH_SRC; run 'make ch-fetch' first"
-    mkdir -p "$CH_BUILD_OUT"
+    mkdir -p "$CH_BUILD_OUT" "$(dirname "$report")" "$(dirname "$link_map")"
     log "kernel source: $CH_SRC"
     log "cargo target:  $CH_BUILD_OUT"
 
@@ -233,14 +233,27 @@ do_build() {
     log "cargo build --release --bin cloud-hypervisor (cache hot ≈ seconds; cold ≈ 5-10 min)"
     # Keep the existing Cargo/linker observations next to the normal build.
     # Packaging consumes these records without a fresh checkout or cache reset.
+    local pending_report pending_map
+    pending_report="$(mktemp "$report.pending.XXXXXX")"
+    pending_map="$(mktemp "$link_map.pending.XXXXXX")" \
+        || { rm -f "$pending_report"; exit 1; }
+    trap 'rm -f "$pending_report" "$pending_map"' EXIT
+    # A failed or interrupted attempt must not make an old binary reusable with
+    # new observations. The existing report is published last, after all outputs.
+    : > "$report"
     env "${cargo_env[@]}" CARGO_TARGET_DIR="$CH_BUILD_OUT" TMPDIR="$CH_BUILD_OUT" \
         cargo rustc --release --locked "${cargo_target_args[@]}" \
         --message-format=json-render-diagnostics \
         --manifest-path "$CH_SRC/Cargo.toml" --package cloud-hypervisor --bin cloud-hypervisor \
-        -- -C "link-arg=-Wl,-Map,$link_map" | tee "$report"
+        -- -C "link-arg=-Wl,-Map,$pending_map" | tee "$pending_report"
+    if [ ! -s "$pending_report" ] || [ ! -s "$pending_map" ]; then
+        die "Cloud Hypervisor build records are missing"
+    fi
     mkdir -p "$BINDIR"
     cp "$CH_BUILD_OUT/$artifact_subdir/cloud-hypervisor" "$out_bin"
     chmod +x "$out_bin"
+    mv "$pending_map" "$link_map"
+    mv "$pending_report" "$report"
     log "built $out_bin ($(du -h "$out_bin" | cut -f1))"
     # --version only runs on host-native binaries; cross-builds show file info instead.
     if [ -z "${RUST_TARGET:-}" ] || [ "$RUST_TARGET" = "$(rustc -vV 2>/dev/null | awk '/^host:/{print $2}')" ]; then
@@ -248,7 +261,7 @@ do_build() {
     else
         file "$out_bin" 2>&1 | head -1 || true
     fi
-}
+)
 
 case "$STAGE" in
     fetch)          do_fetch ;;

@@ -62,6 +62,30 @@ class MaterialsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checksum"):
             self.collect()
 
+
+    def test_duplicate_registry_cache_namespaces_use_locked_archive(self):
+        duplicate = self.home / "registry/cache/another-index" / self.archive.name
+        duplicate.parent.mkdir(parents=True)
+        duplicate.write_bytes(self.archive.read_bytes())
+        self.test_archive_license_and_namespace()
+        duplicate.write_bytes(b"unrelated cached archive")
+        self.test_archive_license_and_namespace()
+
+    def test_packager_resolves_bare_rustc_using_path(self):
+        tools = self.root / "tools"
+        tools.mkdir()
+        compiler = tools / "selected-rustc"
+        compiler.write_text("#!/bin/sh\nexit 0\n")
+        compiler.chmod(0o755)
+        source = Path(__file__).with_name("release.sh").read_text()
+        assignment = next(line for line in source.splitlines() if line.strip().startswith("rustc_path="))
+        for selected in ("selected-rustc", str(compiler)):
+            env = dict(os.environ, RUSTC=selected, PATH=str(tools) + os.pathsep + os.environ["PATH"])
+            result = subprocess.run(["bash", "-c", 'set -e; ' + assignment +
+                                     '\nprintf "%s\n" "$rustc_path"'],
+                                    env=env, text=True, capture_output=True, check=True)
+            self.assertEqual(result.stdout.strip(), str(compiler))
+
     def test_extracted_cache_not_used(self):
         extracted = Path(self.package["manifest_path"]).parent
         extracted.mkdir(parents=True)

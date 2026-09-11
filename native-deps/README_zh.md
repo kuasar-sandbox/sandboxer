@@ -84,9 +84,12 @@ Cloud Hypervisor 打包使用所选预构建二进制及其源码树,默认源�
 输出及记录的位置。旧二进制没有这些记录时,用匹配源码执行正常的
 `make -C native-deps ch-build` (在 sandboxer 根目录);打包本身不建立新 checkout 或重建。
 构建 flag、正常 Cargo 缓存及路由继续可用。
+现有报告在二进制和链接映射成功拷贝之前保持不完整,失败构建不能满足完整产物
+复用条件。不新增完成标记或构建 receipt。
 
 Python 3.11 或更新版本从实际 Cargo 构建报告和锁定的依赖图收集材料。
-Registry crate 归档须匹配 `Cargo.lock` checksum,Git 依赖使用其中的完整
+Registry crate 归档须匹配 `Cargo.lock` checksum;多个 registry 缓存命名空间中
+允许存在相同归档,按该 checksum 选择匹配项。Git 依赖使用锁文件中的完整
 commit。清单只列实际观察到的输入,包括构建期及过程宏依赖;不表示每个 crate
 的代码都进入交付物。收集的 `Cargo.lock` 与其来源记录须一致。原生 pin 变化
 需要同步更新配方、来源记录与材料。
@@ -103,6 +106,7 @@ Crate 材料目录包含完整 Cargo 来源身份的摘要,不同 registry 或 G
 `share/doc/rust/COPYRIGHT-library.html`、`licenses/`,或对应的 Debian/RPM
 源包声明。记录实际 Rust 版本与编译器报告的源码 commit。声明缺失时给出安装
 提示;收集文件均为普通文件。
+显式的裸 `RUSTC` 命令通过调用者的 `PATH` 解析。
 
 匹配的 Cloud Hypervisor 链接映射选择实际使用的系统静态库及启动对象。打包记录
 文件摘要和已安装源包身份,收集版权/NOTICE 及引用的许可正文。本次构建临时对象
