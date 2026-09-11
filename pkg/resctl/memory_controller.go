@@ -894,7 +894,20 @@ func (m *MemoryController) advanceShrinkLocked(ctx context.Context) error {
 		current, known := confirmed.ObservedBudget(m.capacity)
 		if !known || confirmed.AcceptedTarget != state.AcceptedTarget || current > budget {
 			txn.highApplied = false
-			return fmt.Errorf("memory: shrink settlement observation changed; retaining reservation=%d", m.reservationNow())
+			observationErr := fmt.Errorf("memory: shrink settlement observation changed; retaining reservation=%d", reservation)
+			// The smaller high was based on an observation that is no longer
+			// valid. Repair it before returning while the confirming CH sample is
+			// still available. A confirmed Budget within the reservation is safe;
+			// movement beyond it is not a grant, so restore only to the authorized
+			// reservation baseline. Raise-only preserves any still safer high.
+			repairBudget := reservation
+			if known && confirmed.AcceptedTargetKnown && confirmed.AcceptedTarget == state.AcceptedTarget && current <= reservation {
+				repairBudget = current
+			}
+			if repairErr := m.applyMemoryHigh(ctx, repairBudget, txn.demand, true); repairErr != nil {
+				return errors.Join(observationErr, fmt.Errorf("repair memory.high after changed shrink observation: %w", repairErr))
+			}
+			return observationErr
 		}
 		if m.shrinkReportSuperseded(txn.reportSeq) {
 			return nil

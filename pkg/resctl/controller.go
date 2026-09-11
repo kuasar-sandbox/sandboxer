@@ -165,8 +165,9 @@ func (h *ControllerHooks) Connected() bool {
 // ReservationMemory returns the safe absolute reservation baseline used by
 // StateSync. A grow response advances it before local high/resize work. A
 // shrink request may lower it without a response because the local controller
-// sends that request only after actual convergence and high reduction; if the
-// node did not commit the request, StateSync completes the release.
+// sends that request only after a confirmed safe observed Budget and high
+// reduction; if the node did not commit the request, StateSync completes the
+// release.
 func (h *ControllerHooks) ReservationMemory() uint64 {
 	if h == nil {
 		return 0
@@ -348,8 +349,9 @@ func (h *ControllerHooks) RequestBudget(currentAlloc, requestedDelta uint64, urg
 		h.lifetimeCtx, currentAlloc, requestedDelta, urgency, reason)
 	if err != nil {
 		baseline := state.reservation
-		// A shrink request is sent only after local balloon actual converged
-		// and memory.high was lowered. If its response is lost, CurrentAlloc
+		// A shrink request is sent only after the accepted target/current pair
+		// establishes a safe observed Budget and memory.high was lowered. If
+		// its response is lost, CurrentAlloc
 		// is therefore the only reusable local baseline that is safe whether
 		// the node committed the request or not. A lost grow response keeps the
 		// old smaller baseline because no local grow has been applied yet.
