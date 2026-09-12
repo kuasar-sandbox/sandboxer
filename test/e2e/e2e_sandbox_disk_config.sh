@@ -10,7 +10,7 @@ CTL="$BIN/sandbox-ctl"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# The standard BMS source workspace contains the candidate module. Do not
+# The standard CI source workspace contains the candidate module. Do not
 # require a Go toolchain or source checkout for the assembled binary e2e suite.
 SOURCE=""
 if command -v go >/dev/null 2>&1; then
