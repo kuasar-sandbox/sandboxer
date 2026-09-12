@@ -490,11 +490,22 @@ func (s *Sampler) stableSource(name, identity string) (string, bool) {
 }
 
 func (s *Sampler) Pause() {
+	s.fence(true)
+}
+
+// Final process reads need the last accepted RSS endpoint. A snapshot pause
+// instead ends every Gauge time domain; both paths fence periodic admission.
+func (s *Sampler) fence(pauseGauges bool) {
 	s.mu.Lock()
 	s.paused.Store(true)
 	s.generation++
 	cancel := s.cancelRound
-	s.m.BreakGauges(Paused)
+	s.cancelRound = nil // This round is invalidated once, not again by Stop.
+	if pauseGauges {
+		s.m.BreakGauges(Paused)
+	} else if cancel != nil {
+		s.m.discontinuePending(s.request.Load())
+	}
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -506,15 +517,19 @@ func (s *Sampler) Resume() { s.paused.Store(false); s.Ready() }
 // FinalCH is called by the one process reaper while WNOWAIT retains /proc.
 // A stuck proc slot cannot stall cmd.Wait or create a second reader.
 func (s *Sampler) FinalCH(ctx context.Context) {
-	s.Pause()
-	if ctx.Err() != nil {
+	s.fence(false)
+	id := s.request.Add(1)
+	missing := func() {
 		s.processMissing("ch", true)
+		s.missing(0, id, s.clock.Now())
+	}
+	if ctx.Err() != nil {
+		missing()
 		return
 	}
 	out := make(chan sampleResult, 1)
-	id := s.request.Add(1)
 	if !s.slots[0].start(0, out, func() func() { return s.readProcess(s.pid, "ch", id, true) }) {
-		s.processMissing("ch", true)
+		missing()
 		return
 	}
 	select {
@@ -522,15 +537,15 @@ func (s *Sampler) FinalCH(ctx context.Context) {
 		if ctx.Err() == nil {
 			result.apply()
 		} else {
-			s.processMissing("ch", true)
+			missing()
 		}
 	case <-ctx.Done():
-		s.processMissing("ch", true)
+		missing()
 	}
 }
 
 func (s *Sampler) Stop(ctx context.Context) {
-	s.Pause()
+	s.fence(false)
 	s.mu.Lock()
 	cancel, done := s.cancel, s.done
 	s.mu.Unlock()
@@ -547,15 +562,19 @@ func (s *Sampler) Stop(ctx context.Context) {
 	// once more through the original slot, independently from Guest readiness.
 	id := s.request.Add(1)
 	out := make(chan sampleResult, 1)
-	if s.slots[1].start(1, out, func() func() { return s.readProcess(os.Getpid(), "sandbox_ctl", id, true) }) {
+	if ctx.Err() == nil && s.slots[1].start(1, out, func() func() { return s.readProcess(os.Getpid(), "sandbox_ctl", id, true) }) {
 		select {
 		case result := <-out:
 			if ctx.Err() == nil {
 				result.apply()
+			} else {
+				s.missing(1, id, s.clock.Now())
 			}
 		case <-ctx.Done():
-			s.m.CounterMissing("sandbox_ctl.cpu", true)
+			s.missing(1, id, s.clock.Now())
 		}
+	} else {
+		s.missing(1, id, s.clock.Now())
 	}
 	// This process necessarily performs shutdown/save work after its last
 	// self-observation; it cannot certify its own terminal CPU endpoint.

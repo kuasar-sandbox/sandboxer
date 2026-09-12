@@ -16,8 +16,11 @@ import (
 )
 
 func TestOpenRejectsUnencodableIdentityBeforeFileAccess(t *testing.T) {
-	for _, bad := range []string{"", strings.Repeat("x", maxString+1), strings.Repeat("😀", 65), "bad\xff"} {
+	for _, bad := range []string{"", strings.Repeat("x", 129), strings.Repeat("😀", 33), strings.Repeat("x", maxString+1), strings.Repeat("😀", 65), "bad\xff"} {
 		for _, field := range []string{"epoch", "sandbox ID"} {
+			if field == "sandbox ID" && bad != "" && validText(bad) {
+				continue // Only the wire epoch has the tighter 128-byte bound.
+			}
 			for _, mode := range []string{"absent-directory", "new-file", "saved-file", "locked-file"} {
 				t.Run(fmt.Sprintf("%s/%s/%x", field, mode, bad), func(t *testing.T) {
 					base := t.TempDir()
@@ -209,7 +212,7 @@ func TestRejectedGaugeMetadataBreaksContinuity(t *testing.T) {
 
 func TestManagerAcceptsCodecStringBoundaries(t *testing.T) {
 	for _, text := range []string{strings.Repeat("x", maxString), strings.Repeat("😀", 64)} {
-		m, err := Open(t.TempDir(), "test", text, time.Now(), time.Second, time.Minute)
+		m, err := Open(t.TempDir(), "test", text[:128], time.Now(), time.Second, time.Minute)
 		if err != nil {
 			t.Fatal(err)
 		}

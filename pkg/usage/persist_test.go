@@ -145,6 +145,61 @@ func TestSaveRollbackAndUncertainTail(t *testing.T) {
 	}
 }
 
+func TestWriterHandoffPreservesFinalRecord(t *testing.T) {
+	for _, priorSave := range []bool{false, true} {
+		t.Run(map[bool]string{false: "empty", true: "saved"}[priorSave], func(t *testing.T) {
+			base := t.TempDir()
+			open := func(epoch string) *Manager {
+				m, err := Open(base, "test", epoch, time.Now(), time.Second, time.Minute)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(m.closeFiles)
+				return m
+			}
+			old := open("old")
+			if err := old.Counter("cpu", "boot/pid/start", 10, 100, true); err != nil {
+				t.Fatal(err)
+			}
+			if priorSave {
+				old.Save(time.Now())
+				awaitSave(t, old)
+			}
+			if other, err := Open(base, "test", "blocked", time.Now(), time.Second, time.Minute); err == nil || other != nil || !errors.Is(err, syscall.EWOULDBLOCK) {
+				if other != nil {
+					other.closeFiles()
+				}
+				t.Fatalf("second writer acquired the owned file: %v", err)
+			}
+			if err := old.Counter("cpu", "boot/pid/start", 110, 100, true); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			old.Close(ctx, time.Now())
+			closed := old.View()
+			prefix, err := os.ReadFile(filepath.Join(base, "test.usage"))
+			if err != nil || closed.Saved == nil || closed.SaveError != "" || int64(len(prefix)) != closed.SavedEnd {
+				t.Fatalf("old owner failed final append: %+v, %v", closed, err)
+			}
+			next := open("next")
+			v := next.View()
+			if !reflect.DeepEqual(v.Saved, closed.Saved) || v.SavedEnd != closed.SavedEnd || v.Live.Counters[0].KnownTotal != (Uint128{Lo: 1100000000}) {
+				t.Fatalf("successor lost the final record: %+v", v)
+			}
+			next.Close(ctx, time.Now())
+			data, err := os.ReadFile(filepath.Join(base, "test.usage"))
+			if err != nil || !bytes.HasPrefix(data, prefix) || len(data) <= len(prefix) {
+				t.Fatalf("successor overwrote confirmed history: %v", err)
+			}
+			r, err := Recover(bytes.NewReader(data), int64(len(data)), "test")
+			if err != nil || r.Record == nil || r.Record.Sequence != closed.Saved.Sequence+1 || r.Record.Snapshot.Counters[0].KnownTotal != (Uint128{Lo: 1100000000}) {
+				t.Fatalf("successor final recovery: %+v, %v", r, err)
+			}
+		})
+	}
+}
+
 func TestBufferedFileSaveReopenAndTailRepair(t *testing.T) {
 	base := t.TempDir()
 	path := filepath.Join(base, "test.usage")

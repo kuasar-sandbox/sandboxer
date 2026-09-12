@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -85,6 +86,12 @@ func TestFinalCHFailuresMarkEveryCounter(t *testing.T) {
 	for _, mode := range []string{"busy", "stat", "timeout", "waitid"} {
 		t.Run(mode, func(t *testing.T) {
 			s := samplerFixture(t)
+			s.request.Store(1)
+			for _, field := range []string{"rss_anon", "rss_file"} {
+				if err := s.m.Gauge("ch."+field, s.source("ch."+field, ""), 1, 0, 42, OK, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 			defer cancel()
 			release := make(chan struct{})
@@ -107,6 +114,11 @@ func TestFinalCHFailuresMarkEveryCounter(t *testing.T) {
 					t.Fatalf("unknown tail labeled complete: %+v", c)
 				}
 			}
+			for _, g := range s.m.View().Live.Gauges {
+				if g.Continuous || g.Status == OK || g.CoveredTotal != 0 || g.LastValue != 42 {
+					t.Fatalf("failed final RSS fabricated an observation: %+v", g)
+				}
+			}
 		})
 	}
 }
@@ -121,6 +133,109 @@ func TestFinalSelfBusyMarksUnknown(t *testing.T) {
 		if c.Name == "sandbox_ctl.cpu" && c.Complete {
 			t.Fatalf("unknown self tail: %+v", c)
 		}
+	}
+}
+
+func TestFinalRSSClosesOnlyAcceptedIntervals(t *testing.T) {
+	for _, mode := range []string{"idle", "guest-pending", "ch-unapplied", "self-unapplied", "paused"} {
+		t.Run(mode, func(t *testing.T) {
+			s := samplerFixture(t)
+			s.pid = 123
+			clock := s.clock.(*testClock)
+			setTime := func(at time.Duration) {
+				clock.mu.Lock()
+				clock.now = s.start.Add(at)
+				clock.mu.Unlock()
+			}
+			final := false
+			s.proc.readDir = func(string) ([]os.DirEntry, error) { return nil, nil }
+			s.proc.read = func(path string, _ int64) ([]byte, error) {
+				if filepath.Base(path) == "stat" {
+					pid := filepath.Base(filepath.Dir(path))
+					return []byte(strings.Replace(string(procFixture("process")), "123 (", pid+" (", 1)), nil
+				}
+				if final {
+					clock.mu.Lock()
+					clock.now = clock.now.Add(200 * time.Millisecond)
+					clock.mu.Unlock()
+					return []byte("RssAnon: 8 kB\nRssFile: 9 kB\n"), nil
+				}
+				return []byte("RssAnon: 1 kB\nRssFile: 2 kB\n"), nil
+			}
+			s.request.Store(1)
+			s.readProcess(s.pid, "ch", 1, false)()
+			s.readProcess(os.Getpid(), "sandbox_ctl", 1, false)()
+			for _, name := range []string{"guest.memory", "filesystem.root"} {
+				if err := s.m.Gauge(name, name, 1, 0, 42, OK, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			setTime(500 * time.Millisecond)
+			if strings.Contains(mode, "pending") || strings.Contains(mode, "unapplied") {
+				s.request.Store(2)
+				s.cancelRound = func() {}
+				// A completed raw read is not accepted until its callback runs.
+				// Both slots are free here, including the unapplied source.
+				for _, process := range []struct {
+					pid  int
+					name string
+				}{{s.pid, "ch"}, {os.Getpid(), "sandbox_ctl"}} {
+					apply := s.readProcess(process.pid, process.name, 2, false)
+					if (mode == "ch-unapplied" && process.name == "ch") || (mode == "self-unapplied" && process.name == "sandbox_ctl") {
+						continue
+					}
+					apply()
+				}
+			}
+			if mode == "paused" {
+				s.Pause()
+				s.Resume()
+			}
+			s.m.Save(clock.Now())
+			awaitSave(t, s.m)
+			before := s.m.View().Saved.Snapshot
+			final = true
+			setTime(time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			s.FinalCH(ctx)
+			s.acceptResult(ctx, 0, 2, sampleResult{source: 0, apply: func() { t.Fatal("fenced callback applied") }})
+			setTime(1500 * time.Millisecond)
+			s.Stop(ctx)
+			v := s.m.View()
+			if v.Saved == nil || !v.Saved.Snapshot.Closed {
+				t.Fatalf("final record missing: %+v", v)
+			}
+			for _, g := range v.Saved.Snapshot.Gauges {
+				if g.Name == "guest.memory" || g.Name == "filesystem.root" {
+					if g.CoveredTotal != 0 || g.IntegralTotal != (Uint128{}) {
+						t.Fatalf("unobserved Guest tail extended: %+v", g)
+					}
+					continue
+				}
+				at := 1100 * time.Millisecond // Actual read-window midpoint, not receive time.
+				if strings.HasPrefix(g.Name, "sandbox_ctl.") {
+					at = 1600 * time.Millisecond
+				}
+				covered := uint64(at)
+				if mode == "paused" || (mode == "ch-unapplied" && strings.HasPrefix(g.Name, "ch.")) || (mode == "self-unapplied" && strings.HasPrefix(g.Name, "sandbox_ctl.")) {
+					covered = 0
+				}
+				left, peak := uint64(1024), uint64(8*1024)
+				if strings.HasSuffix(g.Name, "rss_file") {
+					left, peak = 2*1024, 9*1024
+				}
+				prior := uint64(0)
+				for _, old := range before.Gauges {
+					if old.Name == g.Name {
+						prior = old.CoveredTotal
+					}
+				}
+				if g.CoveredTotal != covered || g.IntegralTotal != product(left, covered) || g.LastValueAt != int64(at) || g.Window.Covered != covered-prior || g.Window.Area != product(left, covered-prior) || g.Window.Peak != peak {
+					t.Fatalf("final RSS boundary/area/window: %+v; want covered=%s", g, time.Duration(covered))
+				}
+			}
+		})
 	}
 }
 

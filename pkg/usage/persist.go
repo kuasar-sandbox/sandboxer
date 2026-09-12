@@ -78,7 +78,9 @@ func Open(baseDir, sandboxID, epoch string, start time.Time, sample, flush time.
 	if sandboxID == "" || !validText(sandboxID) || sandboxID == "." || sandboxID == ".." || strings.ContainsAny(sandboxID, "/\\\x00") {
 		return nil, errors.New("usage: invalid sandbox ID")
 	}
-	if epoch == "" || !validText(epoch) {
+	// The current run must fit the existing Guest usage_request contract;
+	// persisted strings and metric/source identities retain their codec limit.
+	if epoch == "" || len(epoch) > 128 || !validText(epoch) {
 		return nil, errors.New("usage: invalid run epoch")
 	}
 	dirFD, err := unix.Open(baseDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
@@ -98,6 +100,12 @@ func Open(baseDir, sandboxID, epoch string, start time.Time, sample, flush time.
 	}
 	f := os.NewFile(uintptr(fd), filepath.Join(baseDir, sandboxID+".usage"))
 	closeFiles := func() { _ = f.Close(); _ = dir.Close() }
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		closeFiles()
+		return nil, fmt.Errorf("usage writer ownership: %w", err)
+	}
+	// The previous owner may append its final record immediately before
+	// releasing the lock. Only size the recovery tail after taking ownership.
 	stat, err := f.Stat()
 	if err != nil {
 		closeFiles()
@@ -106,10 +114,6 @@ func Open(baseDir, sandboxID, epoch string, start time.Time, sample, flush time.
 	if !stat.Mode().IsRegular() {
 		closeFiles()
 		return nil, errors.New("usage: not a regular file")
-	}
-	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		closeFiles()
-		return nil, fmt.Errorf("usage writer ownership: %w", err)
 	}
 	recovered, err := Recover(f, stat.Size(), sandboxID)
 	if err != nil {
@@ -327,6 +331,24 @@ func (m *Manager) discontinue() {
 	}
 	for i := range m.live.Gauges {
 		m.live.Gauges[i].Continuous = false
+	}
+}
+
+// A cancelled round may have completed some sources but not others. LastRequest
+// is changed only by accepted results, so a free raw-read slot is not enough to
+// prove that its result was merged. Retain accepted endpoints for final reads;
+// rejected pending observations break continuity without inventing a timestamp.
+func (m *Manager) discontinuePending(request uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopping || m.live.Closed {
+		return
+	}
+	for i := range m.live.Gauges {
+		g := &m.live.Gauges[i]
+		if g.LastRequest < request {
+			g.Continuous, g.Status = false, Missing
+		}
 	}
 }
 
