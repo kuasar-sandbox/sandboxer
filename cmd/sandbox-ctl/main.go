@@ -58,6 +58,8 @@ func main() {
 		os.Exit(configCmd(os.Args[2:]))
 	case "info":
 		os.Exit(infoCmd(os.Args[2:]))
+	case "usage":
+		os.Exit(usageCmd(os.Args[2:]))
 	case "publish":
 		os.Exit(publishCmd(os.Args[2:]))
 	case "upload-snapshot":
@@ -133,6 +135,11 @@ Usage:
   sandbox-ctl info      [--json] [--manifest-config <p>]
                         [--ref-location name=file:///absolute/path ...] <artifact>
                         print sandbox.runtime.cfg or snapshot.cfg
+  sandbox-ctl usage     --sandbox-id <sid> [--path-id <leaf>]
+                        [--run-root <dir>] [--base-root <dir>]
+                        [--saved] [--offline | --file <path>]
+                        [--history --cursor <offset> --limit <1..100>]
+                        read lossless JSON; never triggers observation or saving
   sandbox-ctl publish   [--manifest-config <p> | --to-ref-location name=file:///path]
                         [--ref-location name=file:///absolute/path ...] [--quiet] <artifact>
                         publish an E/S graph and print its rewritten root ref

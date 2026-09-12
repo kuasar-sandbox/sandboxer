@@ -51,6 +51,8 @@
 
 ### 1.3 不做的事
 
+- **不在 Guest 归并用量**: 按请求返回原始 usage 观测, 不增加 Guest ticker、
+  累计、面积、峰值或历史补发 (§4.11).
 - **无容器运行时**:平台直接管理 sandbox 生命周期,不引入 runc / crun / podman
 - **无 systemd / OpenRC**:进程监督由 sandbox-init 自己写的 supervisor 完成
 - **init 操作不依赖 busybox / util-linux**:mount / mkdir / chdir / chroot /
@@ -193,6 +195,12 @@ guest 从内存快照续跑、盘已挂好(不重挂),host 只需按同序重建
 重放)。**快照**在同一 pause/quiesce 点逐盘捕获可写 diff(root + 各数据盘),先生成包含完整disk
 graph的Sandbox E,再生成memory Snapshot S;S的`snapshot.cfg`只用`sandbox_ref`引用E并记录
 memory `from_refs`。本地flatten-merge分别作用于E的disk layers和S的memory layers。
+
+Usage 在上述受控 root/data 组装处保留每个可写盘的私有 CLOEXEC 文件系统句柄,
+先于 switch-root 隐藏 staging path. Single 指向 ext4 本身, overlay 指向
+原始 upper 而不是合并 root. Bind/empty volume 不增加来源. 句柄随内存恢复
+保留, 不进入应用 exec, 与 init 一同关闭; 不可取消的在途读取保留原句柄/槽,
+直至实际结束 (§4.11).
 
 ### 3.2 阶段 2:spec 应用 + stdio 接线 + 应用拉起
 
@@ -436,6 +444,9 @@ MemTotal 推导;host 把报告与 CH `vm.info` 组合后在 sandbox 本地计算
 pending 并允许下次采样。EAGAIN、timeout 或 ACK 丢失不会把 reporter 永久卡在
 in-progress 状态。详见 [`sandbox_zh.md`](sandbox_zh.md) §4.2 / §9.3。
 
+`mem_report` 仍是既有资源控制交换. Usage 不复用其 retained payload、周期或
+ACK 队列; Host 通过独立连接请求新的原始 usage 观测 (§4.11).
+
 ### 3.4 quiesce 处理
 
 quiesce 是 host /vm.pause 之前的最后一次 guest 清理机会，目标是：
@@ -451,6 +462,9 @@ Listener 并发处理每个已 accept 的管理连接，exec/connect/mem_report 
 
 ```
 0. host 原子关闭 exec/forward admission，暂停 ping ticker；
+   Usage admission is paused before the Host memory barrier; Guest invalidates
+   its generation and closes/joins the connection. Blocked reads retain their
+   original slots without locks waiting on the old Host.
    等已入场 ping 完成 pong + guest EOF transport barrier。
    排空独立受 8 s quiesce budget 约束，即使普通 ping timeout 不强制也一样。
    到期 cancel + join 并令捕获失败；不在 guest 确认前抢先拆能正常完成的 transport。
@@ -697,6 +711,10 @@ Forwarder 在发送 quiesce 前暂停新建,并收拢、等待活跃中继**与 
         │  switches to the fwd frame sub-protocol                     (§3.7 / §4.7)
         │  one per accepted `--connect` local connection — 0..N concurrent
         │  wire: [type:u8][len:u16 BE][payload]   ·   TCP half-close preserved, no window
+
+  (4) usage connection      — one reusable Host-initiated management connection
+        │  sequential usage_request/usage_response; one round in flight
+        │  wire: [4B LE len][JSON]; no MUX or history replay (§4.11)
 ```
 
 管理连接不做帧复用；普通操作一次请求/响应，冷启动有 hello→launch→launch_ack→ack 四消息握手，升级操作保留连接。MUX 是带帧多路复用与流控
@@ -746,6 +764,7 @@ vsock 端口固定 `5000`,**两个方向都复用同一端口号**,身份按方�
 | **应用退出通知** | guest→host | `app_exited{code, term_signal}` → `ack` | 关 | primary 终态退出；guest 在预算内等 ACK，超时仍 POWER_OFF；host 收到通知后用作退出码 |
 | **健康探测** | host→guest | `ping{id, t_send_ns}` → `pong{id, t_send_ns}` | 关 | host 计 RTT / 超时 / 失败数(§4.9) |
 | **mem 报告** | guest→host | `mem_report{mem_report:{epoch,seq,mem_*}}` → `mem_report_ack` | 关 | guest observation;host sandbox-local controller 验证 epoch/seq 后结合 CH `vm.info` |
+| **用量观测** | host→guest | `usage_request{usage_request}` → `usage_response{usage_response}` | 复用 | 只返回新的原始内存/文件系统观测, Host 唯一归并 (§4.11) |
 | **快照前** | host→guest | `quiesce{skip_drop_caches}` → `quiesced{drop_caches_result}` | 关 | guest 冻结应用进程树 + 跑 prep + 关闭 MUX(§3.4),host 还须控制连接 EOF 和自身 admitted-handler drain 才可 `/vm.pause` |
 | **恢复后** | host→guest | `restore{epoch, wallclock_ns, network?}` → `restore_ack{epoch,stdio,app_state}` | **升级 MUX** | 快照恢复 vCPU 起跑后 host 通知 guest;guest 先推进 mem-report epoch,再回 ACK、重连 MUX并最后 thaw。Host 在 ACK+MUX 前不启用 memory policy。clock/network 更新是 best-effort，失败也可能发 ACK；thaw 在 ACK 后，失败则 gate 保持关闭（§4.8）。`launch`/files/init/plugin 是 cold-only 配置,恢复时不重放。**RNG 重播种未实现** |
 | **MUX 重连** | host→guest | `attach{epoch}` → `attach_ack{epoch,stdio,app_state}` | **升级 MUX** | 有界尝试关闭/硬丢旧 MUX，接上新连接；guest 仍冻结时先 thaw 再重新开 gate，涵盖同进程 resume 和失败 capture recovery，未冻结则跳过。Attach 是 stdio 传输替换，与 VM resume 不同；冻结查询或 thaw 失败时 ACK 可能已发，但 gate 保持关闭。 |
@@ -1145,6 +1164,80 @@ Host 的 timeouts.* 项以 sandbox.yaml 配置为准，文档指明的默认是�
 | connect | dial 模式握手 10 s，含 guest target dial ≤5 s | 转 fwd 后清 deadline；accept 模式写请求后清 ACK deadline，可无限 park，但 pending conn 仍登记以便 cancel/quiesce |
 | mem_report | guest dial retry 5 s + 独立连接后 4 s exchange deadline；host 用 timeouts.app_notify | launch barrier 后立即采样，此后每 5 s；失败保留同 payload 重试 |
 
+<a id="usage-observations"></a>
+
+### 4.11 原始 Usage 观测
+
+Host 使用同一管理 listener 和带长度前缀的 JSON framing, 但连接专用且可复用.
+不改变普通短连接、ping、mem_report 或 MUX. `pkg/proto/usage.go` 定义原始
+payload, 单位、指标计算、输出及记录格式由
+[usage](usage_zh.md#4-指标单位和计算) 统一说明.
+
+```jsonc
+{
+  "type": "usage_request",
+  "usage_request": {
+    "run_epoch": "<host-run-identity>",
+    "request_id": "17",
+    "read_budget_ns": "250000000"
+  }
+}
+{
+  "type": "usage_response",
+  "usage_response": {
+    "run_epoch": "<same-host-run-identity>",
+    "request_id": "17",
+    "memory": {
+      "status": "ok", "read_duration_ns": "<elapsed>",
+      "domain": "<validated-node-zone-domain>",
+      "present_pages": "<raw>", "buddy_free_pages": "<raw>",
+      "pcp_free_pages": "<raw>", "page_size": "<raw>"
+    },
+    "filesystems": [{
+      "disk": "root", "incarnation": "<pinned-filesystem-identity>",
+      "status": "ok", "read_duration_ns": "<elapsed>",
+      "blocks": "<raw>", "bfree": "<raw>", "block_size": "<raw>",
+      "fragment_size": "<raw>", "fs_type": "<raw>"
+    }]
+  }
+}
+```
+
+以上是 schema 示意, 不是实测数据. 磁盘 ID 为按受管理盘顺序排列的 `root` 和
+`disk-0` 至 `disk-7`, 最多九项; Host 拒绝重复/未知 ID. 每项状态为 `ok`、
+`busy`、`timeout`、`unsupported`、`invalid` 或 `error`. 缺少必需字段不
+代表零. 整轮请求失败成为 Host Gauge missing, 不重放以前的原始 payload.
+
+至多一个连接和请求活动. 每来源只有一个属于 Guest 实例的执行槽, 不随连接/
+请求新建. 各来源独立读取, 不持 mutex 做文件系统 I/O. 到分项 deadline 时
+返回内存及健康盘已经完成的新值, 尚未结束的项返回 timeout. 后续请求在原 syscall
+完成前返回 busy; 旧请求结果丢弃, 不换时间戳重新发布. 重连/超时不创建替代
+worker, 不积累无界结果队列.
+
+Host 整轮 deadline 为 `min(sample_interval, 1s)`, 包含 dial、握手及所有
+读写. 建立连接后至多将剩余预算的一半分配给 Guest 读取. Guest 另外保留其
+read budget 的四分之一用于编码/传输, 仍早于 Host 剩余 deadline. Socket
+操作按绝对 deadline 剩余量执行, 不在每次 partial Read/Write 或 EINTR 后
+重获完整预算. 空闲复用连接没有继承握手 timeout, 等待下一请求或 close/quiesce;
+每个新请求建立新的有界 round, 不增加 keepalive ticker. Host 断连/deadline
+结束交换, 不等于原始来源 syscall 已取消.
+
+Run epoch 和严格递增 request ID 跨重连保留. Restore transition 授权之前,
+Guest 拒绝重复/旧 ID 或不同 Host epoch. Host 核对 response 类型、epoch、ID、
+分项 identity 和 duration, 丢弃旧/迟到结果. Guest 返回 elapsed read duration,
+不发送用于与 Host UTC 相减的时间戳; 实际请求窗口及单调中点由 Host 提供.
+
+Freeze/restore 前关闭 usage 准入、推进代次, 并有界 shutdown/join 旧连接.
+即使读取不可取消, 原 source slot 仍保留. 不捕获持锁等待旧 Host 的 worker,
+不声称网络 FD 关闭会取消 statfs/proc. Restore/attach 在 ACK 前重新开放原始
+usage 准入, 使 Host 立即首轮请求在应用 thaw 未完成时也能被接受. 同 VM attach
+保留 Host epoch; true restore 仅在 ACK 前清除一次旧 epoch/ID 边界, 接受新 ID
+后不再重置. Exec/plugin/app 和资源控制器 mem_report 准入仍仅在 thaw 成功后
+开放. ACK/thaw 失败时关闭该次新开放的 usage gate, 作废连接并有界 join;
+不会停止普通 MUX 重连前已经活动的 usage 流, 也不会回滚已成功的重试或后继代次.
+重试继承尚未完成的开放操作的收尾责任; 两次尝试都失败时仍关闭准入.
+Source slot 跨失败回滚保留. 该原始协议不改变业务文件系统同步或既有资源控制器.
+
 ## 5. 应用契约
 
 ### 5.1 launch 配置(LaunchSpec)
@@ -1263,6 +1356,7 @@ FileSpec 还支持 read_only，省略时 bind 可写。Tmpfs 注入避免直接�
 
 ## 7. See Also
 
+- [usage_zh.md](usage_zh.md) — Host-only 归并、单位、查询及保存.
 - [`sandbox_zh.md`](sandbox_zh.md) §2.2(`run` 的 `--tty` / `--console` / stdio 标志)、
   §5.2(CH 冷启动命令行)、§6.2 / §6.3(snapshot 时序 / ctl.sock 协议)、§7(恢复)
 - [guest kernel 文档](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux_zh.md) —— guest kernel 启用的 namespace /

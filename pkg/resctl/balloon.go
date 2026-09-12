@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/internal/chmemory"
@@ -55,7 +56,24 @@ type balloonObservation struct {
 	AcceptedTarget uint64
 	CurrentBudget  uint64
 	BalloonCurrent uint64
+	started        time.Time
+	finished       time.Time
 }
+
+// BalloonActualObservation describes a successful read of the device's actual
+// state. Target writes and snapshot seeds never refresh this observation.
+// Times retain the host monotonic clock; Instance belongs to this controller.
+type BalloonActualObservation struct {
+	Current  uint64
+	Started  time.Time
+	Finished time.Time
+	Sequence uint64
+	Instance uint64
+	Live     bool
+}
+
+var balloonInstance atomic.Uint64
+var ErrBalloonObservationBusy = errors.New("balloon observation busy")
 
 // BalloonController is the sandbox-local, single writer for Cloud
 // Hypervisor's balloon target. It contains no guest-demand policy and no node
@@ -68,6 +86,8 @@ type BalloonController struct {
 
 	stateMu sync.Mutex
 	state   BalloonState
+	actual  BalloonActualObservation
+	now     func() time.Time
 
 	// apiMu serializes vm.info and vm.resize exchanges. mutationGate extends
 	// serialization across the local high -> resize transaction and is also
@@ -94,6 +114,8 @@ func NewBalloonController(chSock string, capacity uint64, timeout time.Duration,
 		Logf:         logf,
 		client:       &http.Client{Transport: transport, Timeout: timeout},
 		mutationGate: make(chan struct{}, 1),
+		actual:       BalloonActualObservation{Instance: balloonInstance.Add(1)},
+		now:          time.Now,
 	}
 	b.mutationGate <- struct{}{}
 	return b
@@ -107,6 +129,7 @@ func (b *BalloonController) SeedColdTarget(target uint64) error {
 		return err
 	}
 	b.stateMu.Lock()
+	b.actual.Live = false
 	b.state = BalloonState{
 		DesiredTarget: target, AcceptedTarget: target,
 		AcceptedTargetKnown: true,
@@ -127,6 +150,7 @@ func (b *BalloonController) SeedRestoredState(snapshotTarget, snapshotCurrent ui
 	}
 	currentBudget := BudgetFromTarget(b.Capacity, snapshotCurrent)
 	b.stateMu.Lock()
+	b.actual.Live = false
 	b.state = BalloonState{
 		DesiredTarget:  snapshotTarget,
 		AcceptedTarget: snapshotTarget, AcceptedTargetKnown: true,
@@ -142,6 +166,41 @@ func (b *BalloonController) State() BalloonState {
 	b.stateMu.Lock()
 	defer b.stateMu.Unlock()
 	return b.state
+}
+
+// ActualObservation reads the already published metadata without any CH I/O.
+func (b *BalloonController) ActualObservation() BalloonActualObservation {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	return b.actual
+}
+
+// TryObserveActual admits at most one read without waiting for either the
+// high/resize transaction gate or the API mutex. It reuses the control client's
+// transport and decoder and never changes a target or waits for convergence.
+func (b *BalloonController) TryObserveActual(ctx context.Context) (BalloonActualObservation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return b.ActualObservation(), err
+	}
+	select {
+	case <-b.mutationGate:
+		defer func() { b.mutationGate <- struct{}{} }()
+	default:
+		return b.ActualObservation(), ErrBalloonObservationBusy
+	}
+	if !b.apiMu.TryLock() {
+		return b.ActualObservation(), ErrBalloonObservationBusy
+	}
+	defer b.apiMu.Unlock()
+	observation, err := b.readMemoryObservation(ctx)
+	if err != nil {
+		return b.ActualObservation(), err
+	}
+	b.commitObservation(observation)
+	return b.ActualObservation(), nil
 }
 
 // SetDesiredTarget updates local intent without issuing an HTTP request. A
@@ -307,6 +366,10 @@ func (b *BalloonController) commitObservation(observation balloonObservation) Ba
 	b.state.CurrentBudget = observation.CurrentBudget
 	b.state.BalloonCurrent = observation.BalloonCurrent
 	b.state.BalloonCurrentKnown = true
+	b.actual.Current = observation.BalloonCurrent
+	b.actual.Started, b.actual.Finished = observation.started, observation.finished
+	b.actual.Sequence++
+	b.actual.Live = true
 	state := b.state
 	b.stateMu.Unlock()
 	return state
@@ -336,6 +399,7 @@ func (b *BalloonController) callResize(ctx context.Context, sizeBytes uint64) er
 }
 
 func (b *BalloonController) readMemoryObservation(ctx context.Context) (balloonObservation, error) {
+	started := b.now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://ch/api/v1/vm.info", nil)
 	if err != nil {
 		return balloonObservation{}, err
@@ -392,5 +456,7 @@ func (b *BalloonController) readMemoryObservation(ctx context.Context) (balloonO
 		AcceptedTarget: target,
 		CurrentBudget:  currentBudget,
 		BalloonCurrent: balloonCurrent,
+		started:        started,
+		finished:       b.now(),
 	}, nil
 }

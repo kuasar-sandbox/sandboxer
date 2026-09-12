@@ -1,0 +1,5 @@
+# Host-only overlay; apply after a complete cold/from/restore configuration.
+usage:
+  enabled: true
+  sample_interval: 1s
+  flush_interval: 5m

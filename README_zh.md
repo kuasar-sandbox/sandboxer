@@ -36,6 +36,7 @@ Snapshot 复用由显式 parent/child 引用表示。从同一 template 创建�
 | --- | --- |
 | `pkg/resource` | 节点资源控制 wire contract 与 client,由 `orchestrator` 使用 |
 | `pkg/ctl` | Host-local control socket 协议和 `ServeExecTunnel` policy callback;`ProxyExec` 仅 relay 已连接 backend |
+| `pkg/usage` | Host-only 累计资源用量、Snapshot、Record 及离线读取 |
 | `pkg/sandbox`、`pkg/restore`、`pkg/snapshot` | 生命周期、restore 和 snapshot 编排 |
 | `pkg/artifact` | 向 Manifest store 或 named-location Bundle 进行 typed publication |
 | `pkg/uffd`、`pkg/memory` | 按需 memory 加载与 memfd 所有权 |
@@ -103,6 +104,7 @@ Go-only 源码构建需要本仓以及兄弟目录中的 `accelerator` 和 `conn
 
 完整设计与参考文档:
 
+- [`docs/usage_zh.md`](docs/usage_zh.md) - 可选资源用量、live/saved 查询、单位、持久化及损失边界;
 - [`docs/sandbox_zh.md`](docs/sandbox_zh.md) - host 控制面、配置、cold start、snapshot/export/restore 顺序、资源执行和清理;
 - [`docs/journald_zh.md`](docs/journald_zh.md) - 独立输出目标、自定义 journal field、组件诊断、编码和 fallback;
 - [`docs/sandbox-init_zh.md`](docs/sandbox-init_zh.md) - guest PID 1 ABI、分阶段初始化、vsock 控制、stdio 多路复用和应用合同;

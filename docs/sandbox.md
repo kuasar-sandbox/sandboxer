@@ -49,6 +49,7 @@ sandbox-ctl run
 sandbox-ctl export
 sandbox-ctl snapshot
 sandbox-ctl exec
+sandbox-ctl usage
 sandbox-ctl config
 sandbox-ctl info
 sandbox-ctl publish
@@ -226,6 +227,20 @@ sandbox-ctl publish \
 
 The publisher strictly identifies local E/S carriers automatically. Already portable graph dependencies keep their original refs. A `manifest://` root is not materialized into a named location, and there is no Manifest tail rewrite. The publisher does not read `artifact.json` and has no artifact-kind registry.
 
+### 2.9 `sandbox-ctl usage`
+
+```bash
+sandbox-ctl usage --sandbox-id s1
+sandbox-ctl usage --sandbox-id s1 --saved
+sandbox-ctl usage --sandbox-id s1 --offline --history --limit 10
+```
+
+This read-only command returns existing live/saved usage or bounded history.
+`--path-id` selects the existing RunDir/BaseDir; the logical SandboxID names
+the usage file and its records. Queries do not trigger Guest/CH sampling or
+save operations. Complete flags, JSON units, validity and file-format rules
+are owned by [usage](usage.md).
+
 <a id="3-配置与制品格式"></a>
 
 ## 3. Configuration and artifact formats
@@ -297,6 +312,10 @@ restore:
   prefetch: off
 timeouts:
   ch_api: 30s
+usage:
+  enabled: false
+  sample_interval: 1s
+  flush_interval: 5m
 ```
 
 Ordinary cold run performs full validation. `run --from` and `run --restore` first strictly parse the artifact, then apply their respective field-presence rules. An unconstrained `LoadMerged` must not overwrite the artifact graph.
@@ -357,6 +376,15 @@ Runtime semantics:
 - `run --restore` does not rerun launch/files/init/plugin.
 
 If the restore host explicitly supplies `boot.cmdline`, persistent/ephemeral launch fields, mounts, files/ephemeral_files, init, or metadata, validation rejects them before side effects instead of silently ignoring them. `resources.startup` is host-only node policy and may be supplied on restore. It is included in the node reservation contract, but the Snapshot's captured `BudgetAtSnapshot` remains authoritative for the initial restore Budget.
+
+### 3.9 Usage policy
+
+`usage` is strictly parsed host-only policy. It follows ordered configuration
+overrides in cold, from and restore modes and never enters Portable/E/S.
+The default disabled state adds no sampler, usage long connection or periodic
+write; existing resource control remains active. An old file can still be
+read offline. See [usage configuration](usage.md#3-configuration) and the
+[host-overlay example](../examples/usage-enabled.yaml).
 
 <a id="4-资源模型"></a>
 
@@ -439,7 +467,7 @@ CH stdin is fixed to `/dev/null`; sandbox-ctl bridges console output. The networ
 | Owner | Fields |
 |---|---|
 | Artifact strong | Immutable root/data graph, disk count/order/name, topology, self position, cmdline |
-| Host strong | Actual kernel/runtime paths, active diff/template, cgroup/controller, network provider, timeouts, Manifest/crypto/ref-location, CH binary |
+| Host strong | Actual kernel/runtime paths, active diff/template, cgroup/controller, network provider, timeouts, usage, Manifest/crypto/ref-location, CH binary |
 | Persistent override allowed | Resource workload defaults, launch, mounts, files, init, metadata |
 | Instance-only | IP/MAC/hostname, ephemeral files/env, stdio/forward |
 
@@ -504,6 +532,7 @@ Predictable preflight work completes before guest freeze:
 
 ```text
 T0 output/Manifest/local-crypto/ref/Bundle/merge/config/source preflight
+   Close usage admission and break Gauge continuity before the resource barrier.
 T1 enter MemoryController/Budget mutation barrier
 T2 lock and lift/drain memory.high
 T3 pause pinger and gate new host exec/forward; guest drains exec/forward and
@@ -556,9 +585,15 @@ Snapshot and export use distinct request types:
 snapshot_request -> snapshot_done | error
 export_request   -> export_done   | error
 exec_request     -> exec_ack      | error
+usage_request    -> usage_response | error
 ```
 
 Export is not `snapshot_request{memory:false}`. Requests execute in the run process, reusing its lifecycle barrier, guest/MUX gate, CH API socket, and live vhost SnapshotView.
+
+Usage reads the owner's existing `usage.Snapshot`/`usage.Record` or confirmed
+file history. It has no sampling/save side effect and does not acquire the
+capture or CH mutation barrier. Only its response has a separate 1 MiB JSON
+bound; ordinary ctl framing and limits remain unchanged.
 
 Responses do not echo secret values. Remote Manifest uploads may take a long time. For local snapshot/live export, CLI `--timeout=0` leaves the ctl connection without a deadline; a positive value bounds that client's wait. Neither value sets a server-side deadline field in the wire request. Server lifecycle contexts still govern cancellable I/O, and callers must not interpret a timed-out CLI as proof that no artifact was committed. Image-to-Sandbox-E assembly instead applies a positive timeout to its own operation context (§2.4).
 
@@ -635,6 +670,23 @@ After an explicit cold start or cold start from E, the memory-parent list is emp
 ### 7.1 Memory prefetch
 
 `restore.prefetch: memory` is a host-only optimization. It warms the current S self's file page cache or Manifest chunks, excluding parent memory layers and disk streams. The call receives the opened root stream, so its scope may also include S's bounded ZIP metadata tail; it is not a memory-payload-only section. It changes neither sparse truth, fault ordering, C0, S, nor memory parents. The default is `off`. An invalid configured mode fails validation before side effects; lack of prefetch capability or a prefetch I/O failure is best-effort and does not fail restore. It is logged and restore continues on demand. The asynchronous task is canceled and joined before its streams close. See [prefetch.go](../pkg/restore/prefetch.go) and its call in [restore.go](../pkg/restore/restore.go).
+
+### 7.2 Usage across execution generations
+
+Cold and restore enter the same Host usage owner. CPU observation starts with
+the processes; Guest observation starts after actual launch/restore readiness.
+Before capture the Host pauses usage admission; Guest closes the old usage
+connection without replacing blocked source workers. Successful thaw and
+failed-capture recovery reopen admission, while restore accepts a new Host
+epoch. Restored balloon seed is not a fresh actual observation.
+
+`BaseDir/<SandboxID>.usage` follows logical identity and stays outside E/S.
+Restoring an old S does not roll back usage, and a clone's new SandboxID does
+not inherit it. New clocks and Gauge baselines are established; current
+memory/filesystem occupancy is not reduced by a restored initial value.
+Normal stop has bounded best-effort final reads/save; deletion does not wait
+for success or retain usage separately. See [usage reliability](usage.md#7-reliability-and-lifecycle)
+for live/saved rollback, unknown tails and loss boundaries.
 
 ## 8. UFFD handler
 
@@ -870,6 +922,7 @@ The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#144
 
 ## 15. See Also
 
+- [usage.md](usage.md) — Host-only resource accounting, query, units and persistence.
 - [sandbox-init.md](sandbox-init.md) — Guest PID 1 and launch/quiesce/MUX protocols.
 - [cloud-hypervisor.md](cloud-hypervisor.md) — CH build, API, and restore boundaries.
 - [Connector TAPFD protocol](https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md) — TAP descriptor handoff and network namespaces, owned by connector.

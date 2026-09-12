@@ -62,6 +62,8 @@ This file defines the runtime contract of the image's `/sbin/init` and how
 
 - **No container runtime:** the platform manages sandbox lifecycles directly,
   without introducing runc / crun / podman.
+- **No Guest usage aggregation:** raw on-request usage observations have no
+  Guest ticker, totals, areas, peaks or historical replay (§4.11).
 - **No systemd / OpenRC:** sandbox-init implements process supervision.
 - **No busybox / util-linux dependency for init operations:** mounting, directory
   creation, chdir, chroot, reboot and openpty use Go syscall interfaces.
@@ -261,6 +263,13 @@ same pause/quiesce point, creates Sandbox E with the complete disk graph,
 then creates memory Snapshot S. S's `snapshot.cfg` references E through
 `sandbox_ref` and records memory `from_refs`. Local flatten-merge operates
 separately on E's disk layers and S's memory layers.
+
+At these controlled root/data assembly points, usage retains one private
+CLOEXEC filesystem handle per writable disk, before switch-root hides staging
+paths. Single mode pins ext4 itself; overlay mode pins the raw upper, not the
+merged root. Bind/empty volumes do not add sources. Handles survive memory
+restore, never enter app exec, and close with init; an in-flight uncancelable
+read retains its original handle/slot until it finishes (§4.11).
 
 <a id="32-阶段-2spec-应用--stdio-接线--应用拉起"></a>
 
@@ -559,6 +568,10 @@ Only a successful ACK clears pending and permits another sample. EAGAIN,
 timeout or a lost ACK does not permanently leave reporting in progress.
 See [sandbox lifecycle](sandbox.md), §4.2 / §9.3.
 
+`mem_report` remains the existing resource-control exchange. Usage does not
+reuse its retained payload, cadence or ACK queue: the Host requests new raw
+usage observations over a separate connection (§4.11).
+
 <a id="34-quiesce-处理"></a>
 
 ### 3.4 Quiesce handling
@@ -581,6 +594,9 @@ EOF, and completing its own admitted-handler drains.
 
 ```
 0. Host atomically closes exec/forward admission and pauses the ping ticker.
+   Usage admission is already paused before the Host memory barrier;
+   Guest invalidates the usage generation and closes/joins its connection.
+   Blocked source reads keep their original slots, not locks waiting on Host.
    Drain admitted ping through pong plus guest EOF transport barrier.
    This drain has an independent 8 s quiesce budget, even if ordinary ping
    timeout is disabled. Expiry cancels and joins the exchange and fails capture;
@@ -894,6 +910,10 @@ arguments.
     connection after connect_ack as a fwd relay                     (§3.7 / §4.7).
     One per accepted local --connect connection; 0..N concurrent.
     Wire: [type:u8][len:u16 BE][payload], half-close, no application window.
+
+(4) Usage connection: one reusable Host-initiated management connection.
+    Sequential usage_request/usage_response only; one round in flight.
+    Wire: unchanged [4B LE length][JSON]; no MUX or history replay (§4.11).
 ```
 
 Management operations are not multiplexed over the primary MUX.
@@ -945,6 +965,7 @@ The last column describes whether the connection closes or upgrades.
 | App exit notification | guest→host | `app_exited{code,term_signal}` → `ack` | Close | Terminal primary exit; guest waits for ACK up to its budget before powering off. Host uses this for its exit status. |
 | Health probe | host→guest | `ping{id,t_send_ns}` → `pong{id,t_send_ns}` | Close | Host measures RTT, timeouts and failures (§4.9). |
 | Memory report | guest→host | `mem_report{mem_report:{epoch,seq,mem_*}}` → `mem_report_ack` | Close | Guest observation; host validates epoch/seq and combines it with CH vm.info in the sandbox-local controller. |
+| Usage observation | host→guest | `usage_request{usage_request}` → `usage_response{usage_response}` | Reuse | New raw memory/filesystem reads only; Host alone accumulates (§4.11). |
 | Before capture | host→guest | `quiesce{skip_drop_caches}` → `quiesced{drop_caches_result}` | Close | Freeze app, run prep and tear down sessions (§3.4); host then requires control EOF and its handler barriers before pause. |
 | After restore | host→guest | `restore{epoch,wallclock_ns,network?}` → `restore_ack{epoch,stdio,app_state}` | MUX | After vCPUs resume, guest advances the report epoch, replies, reconnects MUX and thaws last. Host enables memory policy only after ACK/MUX setup. Clock/network updates are best-effort (§4.8); launch/files/init/plugins are cold-only and not replayed. RNG reseeding is not implemented. |
 | MUX replacement | host→guest | `attach{epoch}` → `attach_ack{epoch,stdio,app_state}` | MUX | Close/drop old MUX and attach the new connection. If the guest is still frozen, thaw it before reopening gates, including same-process resume and failed-capture recovery; otherwise skip thaw. Attach and VM resume are distinct operations. |
@@ -1441,6 +1462,98 @@ Other budgets are protocol constants or guest-side waits:
 | connect | 10 s for dial-mode handshake, including guest target dial ≤5 s | Clear deadline for fwd. Accept mode clears the ACK deadline after request write and may wait indefinitely; the pending connection remains registered for cancellation/quiesce. |
 | mem_report | Guest has a separate 5 s dial retry budget and a 4 s post-connect exchange deadline; host read uses timeouts.app_notify | Immediate sample after launch barrier, then every 5 s; failures retain the same payload for retry. |
 
+<a id="usage-observations"></a>
+
+### 4.11 Raw usage observations
+
+The Host uses a dedicated reusable connection through the same management
+listener and length-prefixed JSON framing. This changes neither ordinary
+short connections, ping, mem_report nor MUX. `pkg/proto/usage.go` owns the
+raw payload types; [usage](usage.md#4-metrics-units-and-arithmetic) owns units,
+metric calculations, output and record formats.
+
+```jsonc
+{
+  "type": "usage_request",
+  "usage_request": {
+    "run_epoch": "<host-run-identity>",
+    "request_id": "17",
+    "read_budget_ns": "250000000"
+  }
+}
+{
+  "type": "usage_response",
+  "usage_response": {
+    "run_epoch": "<same-host-run-identity>",
+    "request_id": "17",
+    "memory": {
+      "status": "ok", "read_duration_ns": "<elapsed>",
+      "domain": "<validated-node-zone-domain>",
+      "present_pages": "<raw>", "buddy_free_pages": "<raw>",
+      "pcp_free_pages": "<raw>", "page_size": "<raw>"
+    },
+    "filesystems": [{
+      "disk": "root", "incarnation": "<pinned-filesystem-identity>",
+      "status": "ok", "read_duration_ns": "<elapsed>",
+      "blocks": "<raw>", "bfree": "<raw>", "block_size": "<raw>",
+      "fragment_size": "<raw>", "fs_type": "<raw>"
+    }]
+  }
+}
+```
+
+This is a schema sketch, not measured data. Disk identifiers are `root` and
+`disk-0` through `disk-7` in managed disk order. There are at most nine
+filesystem entries; duplicate/unknown identities are rejected by the Host.
+Each item's status is `ok`, `busy`, `timeout`, `unsupported`, `invalid` or
+`error`. Missing required fields cannot mean zero. A failed whole request
+becomes Host Gauge missing; no previous raw payload is replayed.
+
+One connection and request may be active at once. Each source has one
+execution slot belonging to this Guest instance, not to a connection or
+request. Source reads run independently and keep no mutex across filesystem
+I/O. At the read deadline the response includes newly completed memory and
+healthy disks; pending reads return timeout. Subsequent requests report busy
+until that original syscall finishes. The old per-request result is discarded,
+never republished with a new timestamp. Repeated reconnect/timeout cannot
+create replacement workers or unbounded result queues.
+
+The Host round deadline is `min(sample_interval, 1s)`, including dial,
+handshake and every read/write. After connection setup it sends at most half
+the remaining budget to Guest reads. Guest reserves another quarter of its
+read budget for encoding/transmission, still inside the Host remainder.
+Socket operations use the remaining absolute deadline rather than renewing
+it for each partial Read/Write or EINTR. Idle reusable connections have no
+handshake-derived timeout and wait for the next request or close/quiesce;
+each received request establishes a new, bounded round. There is no keepalive
+ticker. Host disconnect/deadline ends the exchange, not necessarily the raw
+source syscall.
+
+Run epoch and strictly increasing request ID remain valid across reconnects.
+Guest rejects duplicate/older IDs or a different Host epoch until the restore
+transition authorizes it. Host checks response type, epoch, ID, item identities
+and durations and drops stale/late results. Guest sends elapsed read durations,
+not timestamps to subtract from Host UTC. Host supplies the actual request
+window and its monotonic midpoint.
+
+Before freeze or restore, usage admission closes, generation advances and
+the old connection is shut down and joined with a bounded budget. Source
+slots are retained even if reads cannot be canceled. No captured worker holds
+a mutex while waiting for the old Host, and closing a network FD is not
+claimed to cancel statfs/proc. Restore/attach reopens raw usage admission
+before ACK, making the Host's immediate first round eligible even while app
+thaw is pending. Same-VM attach keeps the Host epoch; true restore clears
+the old epoch/ID boundary once, before ACK, never after accepting new IDs.
+Exec/plugin/app and resource-controller mem_report gates still reopen only
+after successful thaw. Failed ACK/thaw closes the usage gate it reopened
+and invalidates/joins its connection within a bounded budget; it neither
+stops an already-live usage stream on ordinary MUX reconnect nor rolls back
+a successful retry or later lifecycle generation. A retry inherits an
+unfinished reopening's rollback responsibility; if both attempts fail,
+admission still closes. Source slots survive this rollback. This raw
+protocol changes neither business filesystem synchronization nor the
+existing resource controller.
+
 <a id="5-应用契约"></a>
 
 ## 5. Application contract
@@ -1614,6 +1727,7 @@ them until thaw (§3.3).
 
 ## 7. See Also
 
+- [usage.md](usage.md) — Host-only aggregation, units, query and persistence.
 - [sandbox lifecycle](sandbox.md), §2.2 (run tty/console/stdio flags),
   §5.2 (CH cold-start command), §6.2 / §6.3 (capture ordering and ctl.sock),
   and §7 (restore).
