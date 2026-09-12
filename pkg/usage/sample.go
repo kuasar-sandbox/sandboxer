@@ -149,9 +149,13 @@ func (s *Sampler) loop(ctx context.Context) {
 				firstTick = tick
 			}
 			slot := tickSlot(tick.Sub(firstTick), s.interval)
-			if slot > lastSlot+1 {
+			s.mu.Lock()
+			// FinalCH can fence admission while the sole reaper is still
+			// draining output. Fenced ticks must not erase final RSS endpoints.
+			if !s.paused.Load() && slot > lastSlot+1 {
 				s.m.discontinue()
 			}
+			s.mu.Unlock()
 			lastSlot = slot
 			if !s.paused.Load() {
 				s.round(ctx)
