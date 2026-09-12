@@ -388,7 +388,6 @@ health exec 和 CH `Running` 状态. 此次捕获失败回滚必须保留已占�
 
 ```bash
 python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3
-python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3 --trace
 ```
 
 基线测量原生进程 CPU、RssAnon/RssFile、FD/thread、非 dead 的 Go G 数量、
@@ -399,7 +398,13 @@ guest_time 端点、读取窗口、boot identity 和 tick 尺度.
 `proc-observations.json` 在采样失败时仍保留已完成的读取; 不完整的配对/窗口
 明确标记, 不伪造缺失端点. 这些测试产物与紧凑的 usage 文件独立.
 
-独立的 Linux amd64 跟踪运行需要具备指令偏移支持的
+可选诊断可以帮助分析基线, 不是独立的性能验收目标, 也不是本功能合入的前置条件:
+
+```bash
+python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3 --trace
+```
+
+此可选 Linux amd64 跟踪运行需要具备指令偏移支持的
 `bpftrace` 构建、tracefs 权限及 initial PID namespace (`BPFTRACE_BIN` 可选择
 已安装工具). 预检查在挂接目标探针前拒绝 kernel 与 `/proc` PID 身份不一致的
 环境; 它核验自有短生命周期子进程的真实 sched exec 事件, 不只检查语义随
@@ -410,10 +415,16 @@ usage framing 通信、CH info 请求、
 不插入 Go 返回跳板. 跟踪会扰动时序, 其延迟不能替代无跟踪基线. 脚本检查可用
 内存再准入密度, 不修改宿主资源上限.
 
-Off/on 对比必须使用相同源集、runtime/kernel/CH、配置、密度及负载, 报告
-Guest/Host CPU、唤醒、分配、FD/goroutine、常驻内存、管理通信、CH 查询次数/
-锁等待、记录字节数、保存耗时及业务 p95/p99. 单元模型和普通进程实验不能替代
-CH/KVM 证据. 提交/run 对应证据及未通过验收保留在 PR 和可信 CI artifact,
+Off/on 对比必须使用相同源集、runtime/kernel/CH、配置、密度及负载. 记录这些
+输入, 报告空闲、忙 CPU、内存压力、多盘和保存负载下的 Guest/Host CPU、
+各进程 RssAnon/RssFile、FD/goroutine、实际记录字节数、集中停止耗时及业务
+p95/p99. 这是本功能的描述性验证, 不增加 SLO 或生产密度认证.
+
+唤醒、分配、管理通信、CH API 次数/锁等待及单次保存耗时属于可选诊断.
+无法获得的测量明确保留为未测, 不记作零或通过; 取得特权 profiling 环境不是
+合入前置条件. 功能正确性、来源/writer 所有权有界、生命周期和故障回归, 以及
+仓库正常 review 和精确集成 CI 仍然必需. 单元模型和普通进程实验不能替代
+CH/KVM 证据. PR 和证据产物保留实际测量的提交、环境和限制,
 本文不从设计推导虚构 benchmark 数字.
 
 ## 9. See Also

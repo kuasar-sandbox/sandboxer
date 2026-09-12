@@ -499,7 +499,6 @@ loads, supplying the assembled `BIN` and root privileges:
 
 ```bash
 python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3
-python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3 --trace
 ```
 
 The baseline measures native process CPU, RssAnon/RssFile, FD/thread and
@@ -512,7 +511,14 @@ utime/stime/guest_time endpoints, read windows, boot identity and tick scale.
 incomplete pairs/windows are explicitly marked and missing endpoints are not
 invented. These test artifacts are separate from the compact usage file.
 
-The separate Linux amd64 tracing run requires a `bpftrace` build
+Optional diagnostics can help investigate the baseline; they are not a separate
+performance acceptance target or a prerequisite for merging this feature:
+
+```bash
+python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3 --trace
+```
+
+This optional Linux amd64 tracing run requires a `bpftrace` build
 with instruction-offset support, tracefs access and the initial PID namespace
 (`BPFTRACE_BIN` can select an installed tool). A preflight rejects differing
 kernel and `/proc` PID identities before attaching target probes. It verifies
@@ -526,12 +532,21 @@ latencies cannot replace the untraced baseline. The harness checks available
 memory before admitting density and does not change host resource limits.
 
 Measure off/on using the same source set, runtime/kernel/CH, configuration,
-density and load. Report Guest/Host CPU, wakeups, allocations, FD/goroutines,
-resident memory, management traffic, CH query count/lock wait, bytes per
-record, save latency and business p95/p99. Unit models and ordinary-process
-experiments cannot replace CH/KVM evidence. Commit/run-specific evidence and
-unpassed acceptance remain in the PR and trusted CI artifacts; no benchmark
-number here is inferred from the design.
+density and load. Record those inputs and report Guest/Host CPU, per-process
+RssAnon/RssFile, FD/goroutines, actual record bytes, concentrated-stop duration
+and business p95/p99 across idle, busy CPU, memory pressure, multiple disks
+and saves. This is descriptive feature validation, with no added SLO or
+production-density certification.
+
+Wakeups, allocations, management traffic, CH API counts/lock timing and
+per-save duration are optional diagnostics. Unavailable measurements stay
+explicitly unmeasured, not zero or passed; obtaining a privileged profiling
+environment is not a merge prerequisite. Functional correctness, bounded
+source/writer ownership, lifecycle and fault regressions, and the repository's
+normal review and exact-integration CI remain required. Unit models and
+ordinary-process experiments cannot replace CH/KVM evidence. Keep exact
+measurement revisions, environments and limitations in the PR and evidence
+artifacts; no benchmark number here is inferred from the design.
 
 ## 9. See Also
 
