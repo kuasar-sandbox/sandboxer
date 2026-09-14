@@ -18,8 +18,8 @@ fail() {
 }
 
 validate_version() {
-  [[ "$1" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
-    || fail "version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD"
+  [[ "$1" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
+    || fail "version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD[.N]"
 }
 
 normalize_arch() {
@@ -153,9 +153,9 @@ package_release() {
   connector_source="${RELEASE_CONNECTOR_SOURCE_DIR:-$ROOT/../connector}"
   accelerator_version="${RELEASE_ACCELERATOR_VERSION:-${ACCELERATOR_VERSION:-}}"
   connector_version="${RELEASE_CONNECTOR_VERSION:-${CONNECTOR_VERSION:-}}"
-  [[ "$accelerator_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+  [[ "$accelerator_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
     || fail "RELEASE_ACCELERATOR_VERSION must identify the selected accelerator release"
-  [[ "$connector_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+  [[ "$connector_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
     || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" sandboxer)"
   local project_version
