@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Check native resource reads against the actual frozen VMM cgroup."""
+"""Check native resource reads against the actual stopped VMM's cgroup."""
 import json
+import os
 from pathlib import Path
+import signal
 import socket
 import struct
 import sys
@@ -43,13 +45,20 @@ def check(path, cgroup, sid, owner_pid, headroom):
     assert process_cgroup(vmm_pids[0]).samefile(cgroup)
     assert not process_cgroup(owner_pid).samefile(cgroup), "ctl is charged to VMM scope"
     controls = {name: (cgroup / name).read_text() for name in ("memory.high", "memory.max", "cpu.max", "cpu.weight")}
-    # Freezing is owned by this test. Successful reads while the VMM cannot
-    # answer also prove that resource stats never requires a guest/CH request.
-    (cgroup / "cgroup.freeze").write_text("1")
+    # Stop the VMM's userspace thread group, independently of any kernel task
+    # charged to its cgroup. Verify every VMM thread really stopped; a freezer
+    # request alone is not evidence that the VMM cannot answer guest/CH calls.
+    vmm_pid = int(vmm_pids[0])
+    os.kill(vmm_pid, signal.SIGSTOP)
     try:
         deadline = time.monotonic() + 3
-        while "frozen 1" not in (cgroup / "cgroup.events").read_text():
-            assert time.monotonic() < deadline, "VMM did not freeze"
+        while True:
+            states = {task.name: next(line for line in (task / "status").read_text().splitlines()
+                                     if line.startswith("State:"))
+                      for task in Path(f"/proc/{vmm_pid}/task").iterdir()}
+            if states and all(value.split()[1] == "T" for value in states.values()):
+                break
+            assert time.monotonic() < deadline, ("VMM did not stop", states)
             time.sleep(.01)
         def counters():
             memory = int((cgroup / "memory.current").read_text())
@@ -68,7 +77,7 @@ def check(path, cgroup, sid, owner_pid, headroom):
             assert int(stats["memory_capacity"]) == 8 * 1024**3
             assert int(stats["memory_headroom"]) == int(headroom)
             # Kernel accounting/charge release is not an atomic two-file read,
-            # even when userspace is frozen. Bracket each actual observation.
+            # even when userspace is stopped. Bracket each actual observation.
             for index, name in enumerate(("memory_used", "cpu_usage_usec")):
                 assert min(before[index], after[index]) <= int(stats[name]) <= max(before[index], after[index]), (stats, before, after)
             assert begin <= stats["timestamp_unix"] <= int(time.time())
@@ -77,9 +86,10 @@ def check(path, cgroup, sid, owner_pid, headroom):
         assert usage["type"] == "usage_response" and not usage["usage"]["enabled"], usage
         assert "live" not in usage["usage"], "resource stats started usage"
         assert controls == {name: (cgroup / name).read_text() for name in controls}, "read changed resource policy"
-        print(json.dumps({"vmm_pid": int(vmm_pids[0]), "owner_pid": int(owner_pid), "cgroup_procs": members, "resource_reads": rows}))
+        print(json.dumps({"vmm_pid": vmm_pid, "owner_pid": int(owner_pid), "cgroup_procs": members,
+                          "stopped_vmm_threads": states, "resource_reads": rows}))
     finally:
-        (cgroup / "cgroup.freeze").write_text("0")
+        os.kill(vmm_pid, signal.SIGCONT)
 
 
 if __name__ == "__main__":
