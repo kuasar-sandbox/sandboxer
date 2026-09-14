@@ -118,7 +118,7 @@ func TestResourceStatsZeroMissingResetAndNoLive(t *testing.T) {
 	if err != nil || got.MemoryUsed != nil || got.CPUUsageUsec != nil || got.TimestampUnix != nil {
 		t.Fatal("no-cgroup mode invented an observation", got, err)
 	}
-	for _, bad := range []string{"usage_usec NaN\n", "usage_usec 1\nusage_usec 2\n", "usage_usec -1\n", "usage_usec\n"} {
+	for _, bad := range []string{"", "\n\t ", "user_usec 7\nsystem_usec 8\n", "usage_usec NaN\n", "usage_usec 1\nusage_usec 2\n", "usage_usec -1\n", "usage_usec\n"} {
 		statsFile(t, dir, "cpu.stat", bad)
 		if _, err := readResourceStats("sid", cfg, dir, true); err == nil {
 			t.Fatalf("invalid counter accepted: %q", bad)

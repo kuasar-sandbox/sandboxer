@@ -73,6 +73,9 @@ func readResourceStats(sandboxID string, cfg *config.SandboxConfig, cgroupPath s
 		}
 		stats.CPUUsageUsec = &value
 	}
+	if cpu != nil && stats.CPUUsageUsec == nil {
+		return ctl.ResourceStats{}, errors.New("resource stats: cpu.stat missing usage_usec")
+	}
 	if stats.MemoryUsed != nil || stats.CPUUsageUsec != nil {
 		timestamp := time.Now().Unix()
 		stats.TimestampUnix = &timestamp

@@ -559,7 +559,9 @@ The response includes `sandbox_id` for exact identity verification by
 independently optional: missing is omitted, valid zero is present. An actual
 host read supplies `timestamp_unix`; specification-only reads, no cgroup and
 no live VMM do not invent a host observation or timestamp. Malformed or
-unreadable configured counters fail explicitly. No sampler, history, Guest
+unreadable configured counters fail explicitly. A present `cpu.stat` without
+`usage_usec` is malformed, including an empty file; it is not a missing counter.
+No sampler, history, Guest
 request, CH resize or controller mutation is involved. Static and dynamic
 control modes use this same read path, with usage and telemetry independently
 disabled. The existing ctl connection context/deadline bounds client waiting.

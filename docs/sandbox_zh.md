@@ -567,6 +567,7 @@ Headroom 是 `resources.allocatable.memory`, 不是当前 Budget、Guest free
 核对精确身份. 两个宿主 counter 分别保留有效性: 缺测省略, 合法零值保留.
 实际宿主读取提供 `timestamp_unix`; 只有规格、无 cgroup 或无 live VMM 时,
 不伪造宿主观测和时间戳. 已配置 counter 无法读取或格式非法时明确失败.
+存在但缺少 `usage_usec` 的 `cpu.stat` 属于格式非法, 包括空文件, 不作为缺测处理.
 此读取没有 sampler、历史、Guest 请求、CH resize 或 controller mutation.
 Static/dynamic control 共用同一读取路径, usage 和 telemetry 可以独立关闭.
 既有 ctl connection context/deadline 限制客户端等待.
