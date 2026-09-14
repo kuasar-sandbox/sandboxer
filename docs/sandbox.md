@@ -534,6 +534,8 @@ file history. It has no sampling/save side effect and does not acquire the
 capture or CH mutation barrier. Only its response has a separate 1 MiB JSON
 bound; ordinary ctl framing and limits remain unchanged.
 
+The reader rejects missing or invalid required specifications: CPU capacity and allocatable must be positive, allocatable cannot exceed capacity, and memory capacity/headroom must be positive with headroom no greater than capacity. These checks do not reject a valid zero host counter.
+
 `resource_stats_request` is a separate narrow read. The shared cold/from/restore
 runtime returns its effective capacity CPU, allocatable CPU, capacity memory
 and allocatable memory headroom. These are the values used to configure that

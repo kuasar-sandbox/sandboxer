@@ -547,6 +547,8 @@ Usage 只读取 owner 已有 `usage.Snapshot`/`usage.Record` 或已确认文件�
 不采样、不保存、不获取 capture/CH mutation barrier. 只有其 response 采用
 独立的 1 MiB JSON 上限, 普通 ctl framing 和上限不变.
 
+Reader 拒绝缺失或无效的必填规格: CPU capacity 和 allocatable 必须为正,allocatable 不得超过 capacity;memory capacity/headroom 必须为正,headroom 不得超过 capacity. 这些校验不会拒绝合法的宿主零计数.
+
 `resource_stats_request` 是独立的窄只读请求. cold/from/restore 共用的 runtime
 返回本次运行最终生效的 capacity CPU、allocatable CPU、capacity memory 和
 allocatable memory headroom, 包括 host override. Allocatable CPU 对应相对

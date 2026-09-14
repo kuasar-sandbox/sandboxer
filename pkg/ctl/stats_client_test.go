@@ -3,6 +3,7 @@ package ctl
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
@@ -78,7 +79,8 @@ func TestResourceStatsDispatchAndIdentity(t *testing.T) {
 		t.Error("resource read triggered snapshot")
 		return Response{}, errors.New("unexpected snapshot")
 	}, ResourceStatsHandler: func(Request) (Response, error) {
-		return Response{ResourceStats: &ResourceStats{SandboxID: "sid", MemoryUsed: &value, CPUUsageUsec: &value}}, nil
+		return Response{ResourceStats: &ResourceStats{SandboxID: "sid", CPUCapacity: 2, CPUAllocatable: .5,
+			MemoryCapacity: 4096, MemoryHeadroom: 1024, MemoryUsed: &value, CPUUsageUsec: &value}}, nil
 	}}
 	if err := server.Listen(); err != nil {
 		t.Fatal(err)
@@ -99,5 +101,60 @@ func TestResourceStatsDispatchAndIdentity(t *testing.T) {
 	}
 	if _, err := ReadResourceStats(ctx, path, "stable-alias"); err == nil {
 		t.Fatal("different SandboxID was accepted")
+	}
+}
+
+func TestResourceStatsRequiredSpecification(t *testing.T) {
+	dir := t.TempDir()
+	for i, test := range []struct {
+		name   string
+		change func(*ResourceStats)
+		valid  bool
+	}{
+		{"valid-host-zero", func(*ResourceStats) {}, true},
+		{"missing-spec", func(s *ResourceStats) { *s = ResourceStats{SandboxID: "sid"} }, false},
+		{"cpu-zero", func(s *ResourceStats) { s.CPUCapacity = 0 }, false},
+		{"cpu-negative", func(s *ResourceStats) { s.CPUCapacity = -1 }, false},
+		{"allocatable-zero", func(s *ResourceStats) { s.CPUAllocatable = 0 }, false},
+		{"allocatable-negative", func(s *ResourceStats) { s.CPUAllocatable = -.5 }, false},
+		{"allocatable-over", func(s *ResourceStats) { s.CPUAllocatable = 3 }, false},
+		{"memory-zero", func(s *ResourceStats) { s.MemoryCapacity = 0 }, false},
+		{"headroom-zero", func(s *ResourceStats) { s.MemoryHeadroom = 0 }, false},
+		{"headroom-over", func(s *ResourceStats) { s.MemoryHeadroom = 4097 }, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			zero := uint64(0)
+			stats := ResourceStats{SandboxID: "sid", CPUCapacity: 2, CPUAllocatable: .5,
+				MemoryCapacity: 4096, MemoryHeadroom: 1024, MemoryUsed: &zero, CPUUsageUsec: &zero}
+			test.change(&stats)
+			server := &Server{Path: filepath.Join(dir, fmt.Sprintf("%d.sock", i)), SnapshotHandler: func(Request) (Response, error) {
+				t.Error("resource read triggered snapshot")
+				return Response{}, errors.New("unexpected snapshot")
+			}, ResourceStatsHandler: func(Request) (Response, error) {
+				return Response{ResourceStats: &stats}, nil
+			}}
+			if err := server.Listen(); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- server.Serve(ctx) }()
+			defer func() {
+				cancel()
+				if err := <-done; err != nil {
+					t.Error(err)
+				}
+			}()
+			got, err := ReadResourceStats(ctx, server.Path, "sid")
+			if !test.valid {
+				if err == nil {
+					t.Fatalf("invalid required spec accepted: %+v", got)
+				}
+				return
+			}
+			if err != nil || got.MemoryUsed == nil || *got.MemoryUsed != 0 || got.CPUUsageUsec == nil || *got.CPUUsageUsec != 0 || got.CPUAllocatable != .5 {
+				t.Fatalf("valid specification/zero host counters lost: %+v, %v", got, err)
+			}
+		})
 	}
 }

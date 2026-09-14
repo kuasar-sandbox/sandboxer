@@ -3,6 +3,7 @@ package ctl
 import (
 	"context"
 	"errors"
+	"math"
 )
 
 // ResourceStats is a read of the owner's effective configuration and current
@@ -48,6 +49,12 @@ func ReadResourceStats(ctx context.Context, socket, sandboxID string) (stats Res
 	}
 	if response.Type != TypeResourceStatsResponse || response.ResourceStats == nil || response.ResourceStats.SandboxID != sandboxID {
 		return ResourceStats{}, errors.New("ctl: invalid resource stats response or sandbox identity")
+	}
+	spec := response.ResourceStats
+	if spec.CPUCapacity <= 0 || spec.CPUAllocatable <= 0 || spec.CPUAllocatable > float64(spec.CPUCapacity) ||
+		math.IsNaN(spec.CPUAllocatable) || math.IsInf(spec.CPUAllocatable, 0) ||
+		spec.MemoryCapacity == 0 || spec.MemoryHeadroom == 0 || spec.MemoryHeadroom > spec.MemoryCapacity {
+		return ResourceStats{}, errors.New("ctl: invalid required resource specification")
 	}
 	return *response.ResourceStats, nil
 }
