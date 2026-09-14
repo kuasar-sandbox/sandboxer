@@ -62,8 +62,13 @@ TAP_NAME="${TAP_NAME:-sb-tap0}"
 # Data disks (scratch + dataset) are 1GiB.  Each write cycle overwrites a single
 # WRITE_MIB urandom file WRITE_ITERS times (write then full read) on both mounts.
 # 750MiB leaves headroom under 1GiB for ext4 overhead + persist markers.
-PAUSE_RESUME_CYCLES="${PAUSE_RESUME_CYCLES:-15}"
-WRITE_EVERY="${WRITE_EVERY:-5}"
+if [ -n "${RELEASE_VERSION:-}" ]; then
+    PAUSE_RESUME_CYCLES="${PAUSE_RESUME_CYCLES:-15}"
+    WRITE_EVERY="${WRITE_EVERY:-5}"
+else
+    PAUSE_RESUME_CYCLES="${PAUSE_RESUME_CYCLES:-3}"
+    WRITE_EVERY="${WRITE_EVERY:-1}"
+fi
 DATA_DISK_SIZE="${DATA_DISK_SIZE:-1G}"
 DATA_DISK_YAML_SIZE="${DATA_DISK_YAML_SIZE:-1GiB}"
 WRITE_MIB="${WRITE_MIB:-750}"
