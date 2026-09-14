@@ -45,6 +45,9 @@ func Read(ctx context.Context, options Options) (json.RawMessage, error) {
 	if !options.Offline {
 		response, connected, err := ctl.ReadUsage(ctx, options.ControlSocket, options.History, options.Cursor, options.Limit)
 		if err == nil {
+			if response.SandboxID != options.SandboxID {
+				return nil, errors.New("usage: owner sandbox identity mismatch")
+			}
 			if options.History {
 				var page *struct {
 					Records []usage.Record `json:"records"`
@@ -85,7 +88,9 @@ func Read(ctx context.Context, options Options) (json.RawMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	f, err := os.Open(options.File)
+	// A FIFO must not block before the regular-file check. O_NONBLOCK has no
+	// effect on regular usage files and does not change their lock/recovery rules.
+	f, err := os.OpenFile(options.File, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
