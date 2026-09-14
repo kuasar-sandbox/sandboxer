@@ -565,6 +565,7 @@ Headroom 是 `resources.allocatable.memory`, 不是当前 Budget、Guest free
 
 响应携带 `sandbox_id`, 供 [ctl.ReadResourceStats](../pkg/ctl/resource_stats.go)
 核对精确身份. 两个宿主 counter 分别保留有效性: 缺测省略, 合法零值保留.
+时间戳必须与至少一个宿主 counter 一同存在; ctl reader 拒绝其他组合.
 实际宿主读取提供 `timestamp_unix`; 只有规格、无 cgroup 或无 live VMM 时,
 不伪造宿主观测和时间戳. 已配置 counter 无法读取或格式非法时明确失败.
 存在但缺少 `usage_usec` 的 `cpu.stat` 属于格式非法, 包括空文件, 不作为缺测处理.

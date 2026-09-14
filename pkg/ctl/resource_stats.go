@@ -56,5 +56,8 @@ func ReadResourceStats(ctx context.Context, socket, sandboxID string) (stats Res
 		spec.MemoryCapacity == 0 || spec.MemoryHeadroom == 0 || spec.MemoryHeadroom > spec.MemoryCapacity {
 		return ResourceStats{}, errors.New("ctl: invalid required resource specification")
 	}
+	if (spec.TimestampUnix != nil) != (spec.MemoryUsed != nil || spec.CPUUsageUsec != nil) {
+		return ResourceStats{}, errors.New("ctl: host resource counters and observation timestamp disagree")
+	}
 	return *response.ResourceStats, nil
 }

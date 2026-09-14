@@ -556,8 +556,9 @@ cumulative accounting remains native usage.
 
 The response includes `sandbox_id` for exact identity verification by
 [`ctl.ReadResourceStats`](../pkg/ctl/resource_stats.go). Each host counter is
-independently optional: missing is omitted, valid zero is present. An actual
-host read supplies `timestamp_unix`; specification-only reads, no cgroup and
+independently optional: missing is omitted, valid zero is present. The ctl reader
+requires a timestamp exactly when at least one host counter is present.
+An actual host read supplies `timestamp_unix`; specification-only reads, no cgroup and
 no live VMM do not invent a host observation or timestamp. Malformed or
 unreadable configured counters fail explicitly. A present `cpu.stat` without
 `usage_usec` is malformed, including an empty file; it is not a missing counter.
