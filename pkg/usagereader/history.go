@@ -13,11 +13,16 @@ import (
 // bounded record. Encoding a whole []Record with a limited Writer would still
 // let encoding/json allocate the entire oversized page before its first Write.
 // end is the already selected confirmed S, not a later concurrent save.
-func MarshalHistory(history func(int64, int) ([]usage.Record, int64, error), end, cursor int64, limit int) (json.RawMessage, error) {
+func MarshalHistory(sandboxID string, history func(int64, int) ([]usage.Record, int64, error), end, cursor int64, limit int) (json.RawMessage, error) {
 	if cursor < 0 || cursor > end || limit < 1 || limit > 100 {
 		return nil, errors.New("usage: invalid history range")
 	}
-	const envelope = len(`{"usage":`) + len(`,"type":"usage_response"}`)
+	// Budget the actual owner-identified envelope, including JSON escaping.
+	encoded, err := json.Marshal(ctl.Response{Type: ctl.TypeUsageResponse, SandboxID: sandboxID, Usage: json.RawMessage(`{}`)})
+	if err != nil {
+		return nil, err
+	}
+	envelope := len(encoded) - len(`{}`)
 	body := make([]byte, 0, 1024)
 	body = append(body, `{"records":[`...)
 	for count := 0; count < limit; count++ {
@@ -56,5 +61,8 @@ func MarshalHistory(history func(int64, int) ([]usage.Record, int64, error), end
 	body = append(body, `],"next_cursor":"`...)
 	body = strconv.AppendInt(body, cursor, 10)
 	body = append(body, `"}`...)
+	if len(body)+envelope > ctl.MaxUsageResponseBytes {
+		return nil, errors.New("ctl: usage response too large; reduce history limit")
+	}
 	return body, nil
 }

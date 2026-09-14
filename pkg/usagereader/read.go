@@ -111,7 +111,7 @@ func Read(ctx context.Context, options Options) (json.RawMessage, error) {
 		return nil, err
 	}
 	if options.History {
-		return MarshalHistory(func(cursor int64, limit int) ([]usage.Record, int64, error) {
+		return MarshalHistory(options.SandboxID, func(cursor int64, limit int) ([]usage.Record, int64, error) {
 			return usage.ReadHistory(reader, recovered.End, cursor, limit, options.SandboxID)
 		}, recovered.End, options.Cursor, options.Limit)
 	}
