@@ -126,3 +126,17 @@ func TestResourceStatsZeroMissingResetAndNoLive(t *testing.T) {
 		read(false) // An unavailable runtime does not read even corrupt host files.
 	}
 }
+
+func TestResourceStatsDropsObservationOnExitDuringRead(t *testing.T) {
+	dir := t.TempDir()
+	statsFile(t, dir, "memory.current", "123")
+	statsFile(t, dir, "cpu.stat", "usage_usec 456\n")
+	checks := 0
+	stats, err := readCurrentResourceStats("sid", statsConfig(), dir, func() bool {
+		checks++
+		return checks == 1
+	})
+	if err != nil || checks != 2 || stats.MemoryUsed != nil || stats.CPUUsageUsec != nil || stats.TimestampUnix != nil || stats.MemoryHeadroom != 256<<10 {
+		t.Fatal("read crossing exit retained host observation", stats, checks, err)
+	}
+}

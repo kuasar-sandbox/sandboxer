@@ -13,6 +13,17 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
+// readCurrentResourceStats checks runtime liveness on both sides of the read.
+// The sole reaper marks an observed exit before native usage final sampling;
+// that saved endpoint remains usable by usage without becoming a live snapshot.
+func readCurrentResourceStats(sandboxID string, cfg *config.SandboxConfig, cgroupPath string, live func() bool) (ctl.ResourceStats, error) {
+	stats, err := readResourceStats(sandboxID, cfg, cgroupPath, live())
+	if !live() {
+		stats.MemoryUsed, stats.CPUUsageUsec, stats.TimestampUnix = nil, nil, nil
+	}
+	return stats, err
+}
+
 // readResourceStats uses only the effective run configuration and the existing
 // pinned VMM cgroup descriptor path. It neither samples native usage nor calls
 // the guest, Cloud Hypervisor API, resource controller or balloon controller.

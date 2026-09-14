@@ -525,6 +525,8 @@ usage_request    -> usage_response | error
 resource_stats_request -> resource_stats_response | error
 ```
 
+The sole reaper ends live resource observations as soon as `waitid(WEXITED|WNOWAIT)` confirms VMM exit, before the existing final usage sample and `cmd.Wait`. The same exit notification applies when usage is disabled, without adding samples or changing stop/save behavior. During exit, only effective specification fields remain; an exited VMM receives no fresh host observation timestamp.
+
 Export is not `snapshot_request{memory:false}`. Requests execute in the run process, reusing its lifecycle barrier, guest/MUX gate, CH API socket, and live vhost SnapshotView.
 
 Usage reads the owner's existing `usage.Snapshot`/`usage.Record` or confirmed

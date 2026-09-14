@@ -539,6 +539,8 @@ usage_request    -> usage_response | error
 resource_stats_request -> resource_stats_response | error
 ```
 
+唯一 reaper 在 `waitid(WEXITED|WNOWAIT)` 确认 VMM 退出后立即撤销 resource 的 live 观测,然后按既有顺序执行 usage 最后采样与 `cmd.Wait`. usage 关闭时也使用同一退出通知;不增加采样或改变停止/保存语义. 退出期间仅保留有效规格字段,不为已退出 VMM 返回新的宿主观测时间.
+
 Export不是 `snapshot_request{memory:false}`. Request在 run process中执行,因此可以复用当前 lifecycle barrier、guest/MUX gate、CH API socket和live vhost SnapshotView.
 
 Usage 只读取 owner 已有 `usage.Snapshot`/`usage.Record` 或已确认文件历史,

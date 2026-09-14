@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -508,7 +509,11 @@ func ServeAndWait(p VMParams) (int, error) {
 	}
 	chExited := make(chan struct{})
 	var chExitedOnce sync.Once
-	markCHExited := func() { chExitedOnce.Do(func() { close(chExited) }) }
+	var chExitObserved atomic.Bool
+	markCHExited := func() {
+		chExitObserved.Store(true)
+		chExitedOnce.Do(func() { close(chExited) })
+	}
 	defer markCHExited()
 	var chProcessMu sync.RWMutex
 	var chProcess *os.Process
@@ -552,22 +557,11 @@ func ServeAndWait(p VMParams) (int, error) {
 		Path: ctlSockPath,
 		Logf: logf,
 		ResourceStatsHandler: func(_ ctl.Request) (ctl.Response, error) {
-			chProcessMu.RLock()
-			live := chProcess != nil
-			chProcessMu.RUnlock()
-			select {
-			case <-chExited:
-				live = false
-			default:
-			}
-			stats, err := readResourceStats(p.SandboxID, p.SnapCfg, cgroupPath, live)
-			// Exit during the read cannot become a fresh host observation for a
-			// sandbox that no longer has a live VMM.
-			select {
-			case <-chExited:
-				stats.MemoryUsed, stats.CPUUsageUsec, stats.TimestampUnix = nil, nil, nil
-			default:
-			}
+			stats, err := readCurrentResourceStats(p.SandboxID, p.SnapCfg, cgroupPath, func() bool {
+				chProcessMu.RLock()
+				defer chProcessMu.RUnlock()
+				return chProcess != nil && !chExitObserved.Load()
+			})
 			return ctl.Response{ResourceStats: &stats}, err
 		},
 		UsageHandler: func(req ctl.Request) (ctl.Response, error) {
@@ -740,14 +734,16 @@ func ServeAndWait(p VMParams) (int, error) {
 	// failed restore setup. WNOWAIT keeps native process counters readable.
 	doneCh := make(chan error, 1)
 	go func() {
-		if usageSampler != nil {
-			var info unix.Siginfo
-			waitIDErr := observeCHExit(func() error {
-				return unix.Waitid(unix.P_PID, chPid, &info, unix.WEXITED|unix.WNOWAIT, nil)
-			}, usageSampler.FinalCH)
-			if waitIDErr != nil {
-				logf("usage final waitid: %v", waitIDErr)
+		var info unix.Siginfo
+		waitIDErr := observeCHExit(func() error {
+			return unix.Waitid(unix.P_PID, chPid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+		}, func() { chExitObserved.Store(true) }, func(ctx context.Context) {
+			if usageSampler != nil {
+				usageSampler.FinalCH(ctx)
 			}
+		})
+		if waitIDErr != nil {
+			logf("CH exit waitid: %v", waitIDErr)
 		}
 		waitErr := cmd.Wait()
 		markCHExited()
