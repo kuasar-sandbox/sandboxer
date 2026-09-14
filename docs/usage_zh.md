@@ -70,12 +70,19 @@ control socket 和保存文件路径, 再传入精确 SandboxID、context、snap
 浮点中间值; live、saved 或 history 数据中的 SandboxID 不匹配时拒绝.
 ctl response envelope 始终携带 owner 的 `sandbox_id`, 即使 usage 关闭、
 live/saved 为空或历史为空, 也必须核对身份. 该字段不改变 native View/Record 或文件格式.
-空历史返回 `records: []` 及已校验的 next cursor. 离线 open 使用非阻塞标志,
+空历史返回 `records: []` 及已校验的 next cursor. 在线分页必须显式返回不回退的
+cursor: 非空页推进 cursor, 空页保持 cursor, 记录数不得超过请求 limit.
+saved view 必须在且仅在存在 saved record 时携带正数 `saved_end`.
+非法 owner response 不允许回退离线读取. 离线 open 使用非阻塞标志,
 先拒绝 FIFO 等非 regular file, 不会为等待 FIFO writer 而绕过 timeout.
 
 只有 socket 不存在或拒绝连接时允许回退. 一旦已连接 owner, EOF、非法 response、
 owner 错误、取消或超时都使查询失败, 不能被可读的保存文件替代. 取消会关闭当前
-ctl connection, 离线读取之间也会检查取消. Telemetry 通过 conductor 消费原生 stats,
+ctl connection. 离线取消会停止调用方等待, 并在文件读取之间检查取消.
+阻塞的文件系统调用继续持有执行槽和共享锁, 直到实际返回; 每进程最多有 8 个
+离线执行, 包括调用方已取消的执行. 等待执行槽同样遵守查询 deadline.
+这不会使文件系统调用变成可中断操作, 也不改变 native saving.
+Telemetry 通过 conductor 消费原生 stats,
 不直接调用此 ctl/file reader.
 
 ## 3. 配置

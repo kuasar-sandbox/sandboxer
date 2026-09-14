@@ -86,13 +86,22 @@ floating-point intermediate; a different SandboxID in live, saved or history
 data is rejected. The ctl response envelope always includes the owner SandboxID, even when
 usage is disabled, live/saved are absent or history is empty. This does not
 change native View/Record or the file format. Empty history has `records: []`
-and its validated next cursor. Offline open uses a nonblocking flag and rejects
+and its validated next cursor. Online pages require an explicit, nonregressing
+cursor: nonempty pages advance it, empty pages retain it, and record count cannot
+exceed the requested limit. A saved view requires a positive `saved_end` exactly
+when a saved record exists. Invalid owner replies never trigger offline fallback.
+Offline open uses a nonblocking flag and rejects
 FIFOs and other nonregular files without waiting for a writer beyond timeout.
 
 Only failure to connect to an absent/refused socket permits fallback. Once
 connected, EOF, invalid replies, owner errors, cancellation and deadlines fail
 the query; a readable saved file does not replace them. Cancellation closes
-the active ctl connection and is checked between offline reads. Telemetry
+the active ctl connection. Offline cancellation stops the caller's wait and is
+checked between file reads. A blocked file syscall retains its execution slot
+and shared lock until it returns; there are at most eight offline executions
+per process, including canceled ones. Waiting for a slot also honors the query
+deadline. This does not make file syscalls interruptible or change native saving.
+Telemetry
 consumes native stats through conductor, never this ctl/file reader directly.
 
 ## 3. Configuration

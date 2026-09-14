@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -227,6 +228,119 @@ func TestEmptyOwnerResponseStillRequiresIdentity(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestOwnerCursorValidationDoesNotFallBack(t *testing.T) {
+	for _, history := range []bool{false, true} {
+		for _, saved := range []bool{false, true} {
+			for _, cursor := range []string{"missing", "null", "bad", "-1", "0", "7", "8"} {
+				t.Run(fmt.Sprintf("history=%v/record=%v/cursor=%s", history, saved, cursor), func(t *testing.T) {
+					options, record, _ := savedFixture(t)
+					options.History = history
+					body := map[string]any{}
+					field := "saved_end"
+					if history {
+						options.Cursor = 7
+						field = "next_cursor"
+						body["records"] = []usage.Record{}
+						if saved {
+							body["records"] = []usage.Record{record}
+						}
+					} else if saved {
+						body["saved"] = record
+					}
+					if cursor != "missing" {
+						if cursor == "null" {
+							body[field] = nil
+						} else {
+							body[field] = cursor
+						}
+					}
+					raw, err := json.Marshal(body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					startOwner(t, options.ControlSocket, func(ctl.Request) (ctl.Response, error) {
+						return ctl.Response{SandboxID: options.SandboxID, Usage: raw}, nil
+					})
+					valid := saved && (cursor == "7" || cursor == "8") || !saved && (cursor == "0" || cursor == "missing" || cursor == "null")
+					if history {
+						valid = saved && cursor == "8" || !saved && cursor == "7"
+					}
+					got, err := Read(context.Background(), options)
+					if (err == nil) != valid || valid && !bytes.Equal(got, raw) {
+						t.Fatalf("owner cursor validation: valid=%v, got=%s, err=%v", valid, got, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCanceledOfflineReadsRetainBoundedSlotsAndFileLocks(t *testing.T) {
+	options, _, raw := savedFixture(t)
+	release := make(chan struct{})
+	var workers sync.WaitGroup
+	t.Cleanup(func() {
+		close(release)
+		workers.Wait()
+	})
+	for range cap(offlineSlots) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		started, returned := make(chan error, 1), make(chan error, 1)
+		workers.Add(1)
+		go func() {
+			_, err := waitOffline(ctx, func() (json.RawMessage, error) {
+				defer workers.Done()
+				f, err := os.Open(options.File)
+				if err != nil {
+					started <- err
+					return nil, err
+				}
+				defer f.Close()
+				if err := unix.Flock(int(f.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
+					started <- err
+					return nil, err
+				}
+				started <- nil
+				// Model a file syscall that does not honor context cancellation.
+				// Its real shared lock must remain owned until execution ends.
+				<-release
+				_, err = usage.Recover(f, int64(len(raw)), options.SandboxID)
+				return nil, err
+			})
+			returned <- err
+		}()
+		if err := <-started; err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		select {
+		case err := <-returned:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatal("cancellation lost", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("caller remained blocked in file I/O")
+		}
+	}
+	f, err := os.Open(options.File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); !errors.Is(err, unix.EWOULDBLOCK) {
+		t.Fatal("canceled read released a lock before I/O ended", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := waitOffline(ctx, func() (json.RawMessage, error) {
+		t.Error("blocked reads exceeded the execution bound")
+		return nil, nil
+	}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("exhausted reader slots ignored deadline", err)
 	}
 }
 

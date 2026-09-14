@@ -51,11 +51,13 @@ func Read(ctx context.Context, options Options) (json.RawMessage, error) {
 			if options.History {
 				var page *struct {
 					Records []usage.Record `json:"records"`
+					Next    *int64         `json:"next_cursor,string"`
 				}
 				if err := json.Unmarshal(response.Usage, &page); err != nil {
 					return nil, err
 				}
-				if page == nil {
+				if page == nil || page.Records == nil || page.Next == nil || *page.Next < options.Cursor ||
+					len(page.Records) > options.Limit || (len(page.Records) == 0) != (*page.Next == options.Cursor) {
 					return nil, errors.New("usage: invalid owner history")
 				}
 				for _, record := range page.Records {
@@ -75,6 +77,9 @@ func Read(ctx context.Context, options Options) (json.RawMessage, error) {
 			if (view.Live != nil && view.Live.SandboxID != options.SandboxID) || (view.Saved != nil && view.Saved.Snapshot.SandboxID != options.SandboxID) {
 				return nil, errors.New("usage: sandbox identity mismatch")
 			}
+			if view.SavedEnd < 0 || (view.Saved != nil) != (view.SavedEnd > 0) {
+				return nil, errors.New("usage: saved record and cursor disagree")
+			}
 			if !options.Saved {
 				return response.Usage, nil
 			}
@@ -85,6 +90,42 @@ func Read(ctx context.Context, options Options) (json.RawMessage, error) {
 			return nil, err
 		}
 	}
+	return waitOffline(ctx, func() (json.RawMessage, error) { return readOffline(ctx, options) })
+}
+
+// File syscalls are not assumed interruptible. A canceled caller stops waiting,
+// while the operation retains its slot and file lock until the syscall returns.
+// This bounds stuck readers without changing Recover or native writer ownership.
+var offlineSlots = make(chan struct{}, 8)
+
+func waitOffline(ctx context.Context, read func() (json.RawMessage, error)) (json.RawMessage, error) {
+	select {
+	case offlineSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	type result struct {
+		body json.RawMessage
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer func() { <-offlineSlots }()
+		body, err := read()
+		done <- result{body, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-done:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return result.body, result.err
+	}
+}
+
+func readOffline(ctx context.Context, options Options) (json.RawMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
