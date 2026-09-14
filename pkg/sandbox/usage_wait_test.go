@@ -8,13 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync/atomic"
-
-	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"golang.org/x/sys/unix"
 )
 
