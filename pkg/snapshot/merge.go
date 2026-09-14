@@ -138,7 +138,7 @@ func mergeStreamHoles(stream fetch.Stream, size uint64) ([]sparse.Extent, error)
 // mergeSparse flattens two adjacent sparse layers — top (this run's resident
 // delta) over base (the local parent snapshot this run was restored from) —
 // into a single layer, for the local "replace the next-newest layer" export
-// (docs/sandbox.md §11.1 and §12.2). It is the SAVE-side dual of
+// (docs/sandbox-artifacts.md §9.1 and docs/sandbox.md §11.2). It is the SAVE-side dual of
 // fetch.Layered: at any
 // offset top's byte wins where top is resident; where top is a hole, base's
 // byte shows through; where BOTH are holes the position stays a (merged) hole

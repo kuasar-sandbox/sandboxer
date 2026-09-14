@@ -6,24 +6,21 @@ This document defines persistent Sandbox E / Snapshot S, portable configuration,
 
 **Reading path**
 
-- [Logical roles](#11-logical-roles)
-- [Logical roles and physical carriers](#12-logical-roles-and-physical-carriers)
-- [PortableSandboxConfig](#32-portablesandboxconfig)
-- [Strict encoding and limits](#33-strict-encoding-and-limits)
-- [C0, C1, and source binding](#34-c0-c1-and-source-binding)
-- [`self` and disk provenance](#35-self-and-disk-provenance)
-- [`.sandbox` logical format](#36-sandbox-logical-format)
-- [`.snapshot` logical format](#37-snapshot-logical-format)
-- [Provenance, publication, and carriers](#11-provenance-publication-and-carriers)
-- [Atomicity and determinism](#141-atomicity-and-determinism)
-- [Incompatibility](#144-incompatibility)
+- [Logical roles](#1-logical-roles)
+- [Logical roles and physical carriers](#2-logical-roles-and-physical-carriers)
+- [PortableSandboxConfig](#3-portablesandboxconfig)
+- [Strict encoding and limits](#4-strict-encoding-and-limits)
+- [C0, C1, and source binding](#5-c0-c1-and-source-binding)
+- [`self` and disk provenance](#6-self-and-disk-provenance)
+- [`.sandbox` logical format](#7-sandbox-logical-format)
+- [`.snapshot` logical format](#8-snapshot-logical-format)
+- [Provenance, publication, and carriers](#9-provenance-publication-and-carriers)
+- [Atomicity and determinism](#10-atomicity-and-determinism)
+- [Incompatibility](#11-incompatibility)
 
 
 
 
-<a id="11-逻辑角色"></a>
-
-<a id="11-logical-roles"></a>
 ## 1. Logical roles
 
 The system distinguishes four logical roles:
@@ -58,9 +55,6 @@ The following models do not exist:
 
 
 
-<a id="12-逻辑角色与物理-carrier"></a>
-
-<a id="12-logical-roles-and-physical-carriers"></a>
 ## 2. Logical roles and physical carriers
 
 Logical content and physical carrier are independent. The same `.image`, `.overlay`, `.sandbox`, or `.snapshot` logical source can use these carriers:
@@ -77,7 +71,6 @@ The block backend, restore code, and publisher first open the carrier, then pars
 
 
 
-<a id="32-portablesandboxconfig"></a>
 ## 3. PortableSandboxConfig
 
 The sole portable filename is:
@@ -163,9 +156,6 @@ The destination host binds these through actual paths, a source directory, or na
 
 
 
-<a id="33-strict-encoding-与-limits"></a>
-
-<a id="33-strict-encoding-and-limits"></a>
 ## 4. Strict encoding and limits
 
 Portable configuration uses deterministic YAML marshaling and strict known-fields parsing. The artifact reader rejects unknown fields/versions, duplicate keys, YAML aliases/merge keys, multiple documents, invalid refs, and noncanonical bytes. The schema parser alone accepts valid noncanonical YAML; `sandboxfile.Open` enforces canonical byte equality after re-marshaling.
@@ -194,9 +184,6 @@ These limits apply together: strict YAML's 64 KiB scalar-byte limit also applies
 
 
 
-<a id="34-c0c1-与-source-binding"></a>
-
-<a id="34-c0-c1-and-source-binding"></a>
 ## 5. C0, C1, and source binding
 
 `C0` is the immutable portable baseline of one run lifecycle:
@@ -230,9 +217,6 @@ Memory restore additionally holds `MemorySourceBinding`; its Snapshot S identity
 
 
 
-<a id="35-self-与-disk-provenance"></a>
-
-<a id="35-self-and-disk-provenance"></a>
 ## 6. `self` and disk provenance
 
 The portable graph must contain the reserved value `self` exactly once, and only at:
@@ -283,7 +267,6 @@ Three-state sparse semantics remain `Hole`, `Zero`, and `Data`. Holes come only 
 
 
 
-<a id="36-sandbox-logical-format"></a>
 ## 7. `.sandbox` logical format
 
 Only two layouts are accepted.
@@ -338,7 +321,6 @@ A live BlockCOW SnapshotView is an upper-only sparse delta. Its ext4-superblock 
 
 
 
-<a id="37-snapshot-logical-format"></a>
 ## 8. `.snapshot` logical format
 
 Snapshot S layout:
@@ -367,14 +349,8 @@ Snapshot ZIP and configuration are also strict, bounded, and canonical. `config.
 
 
 
-<a id="11-provenancepublish-与-carrier"></a>
-
-<a id="11-provenance-publication-and-carriers"></a>
 ## 9. Provenance, publication, and carriers
 
-<a id="111-disk-与-memory-provenance"></a>
-
-<a id="111-disk-and-memory-provenance"></a>
 ### 9.1 Disk and memory provenance
 
 ```text
@@ -386,9 +362,6 @@ These use separate schemas. Re-snapshot can merge disk layers and memory layers 
 
 Snapshot/export dependency planning materializes only node-local dependencies that lack portable provenance. Remote `manifest://` refs remain unchanged, as do already located file refs. If a logical Manifest comes from a located Bundle, its ref becomes that Bundle's canonical located `@manifest` selector. Consequently a Manifest-backed immutable root image is not duplicated as a new `.overlay` every time a snapshot is saved or published, and located parent chains are not copied into the new publication directory. Unlocated local tarstream/Bundle dependencies are still fully validated and materialized before freeze so the portable root does not depend on the calling node's private paths. Immutable root carriers materialize as `.image`; only root/data writable layers that must be retained as separate dependencies materialize as `.overlay`. The current writable root top is carried by Sandbox E's payload and does not produce another `.overlay`.
 
-<a id="112-local-tarstream-与-crypto"></a>
-
-<a id="112-local-tarstream-and-crypto"></a>
 ### 9.2 Local tarstream and crypto
 
 Local immutable artifacts support `crypto.local=off|auto|required`:
@@ -439,7 +412,6 @@ Named locations therefore require directory creation, exclusive file creation, w
 
 Active encrypted `.overlay.diff` files remain in KDXTS format. Export reads only the decrypted BlockCOW SnapshotView and creates a new immutable logical artifact. It never appends ZIP data to an active diff.
 
-<a id="113-manifest-upload"></a>
 ### 9.3 Manifest upload
 
 An already assembled image or top-level Sandbox E can be ingested directly with `NewManifestPublisher(...).PublishSource(ctx, RoleImage|RoleSandbox, source)`. The caller retains source ownership. This path creates no local tarstream: chunks and deduplicated objects are written first, the root Manifest last, returning `manifest://<root>`.
@@ -452,7 +424,6 @@ data/lower -> E -> S
 
 Already portable Manifest/located dependencies retain their refs rather than being materialized and rewritten. Bundle roots use the exact-upload fast path: force verification of the selected Manifest closure, recorded admission, and physical objects; upload Chunk/Manifest objects unchanged; commit the root Manifest last. The root key and `snapshot.cfg` remain unchanged. Existing located selectors inside a Bundle therefore still require consumers to configure the corresponding ref-location; they are not silently rewritten into Manifest refs. Customer key, chunk/Manifest crypto, content verification, and store-generation admission follow Manifest configuration. E is the export root; S is the snapshot root.
 
-<a id="114-manifest-bundle"></a>
 ### 9.4 Manifest Bundle
 
 Before pause, a Bundle completes:
@@ -467,7 +438,6 @@ Before pause, a Bundle completes:
 
 The writer then emits the metadata prefix once, writes Manifest/Chunk data, and finalizes with E's or S's root key. `FullVerify` uses the complete expected Manifest set. V1 does not infer E/S from outer ZIP magic.
 
-<a id="115-publish-graph"></a>
 ### 9.5 Publish graph
 
 Publishing local tarstream E:
@@ -493,9 +463,6 @@ A memory parent's historical `sandbox_ref` is not traversed recursively. The E g
 
 
 
-<a id="141-atomicity-与-determinism"></a>
-
-<a id="141-atomicity-and-determinism"></a>
 ## 10. Atomicity and determinism
 
 Portable YAML and E/S ZIP use canonical order, fixed metadata, and bounded bytes. Local `FileSink`/`BundleSink` retain same-directory temporaries, complete writes/checked `Close()`, and atomic no-replace rename; final commit is O(1). The alias updates only after root commit. Artifact capture/publication defines logical completion, not stable-storage durability. Neither local artifact path explicitly fsyncs files/directories; the filesystem/storage implementation governs physical writeback. Named ref-locations use a separate exclusive-create, checked-write/copy-once, reopen-and-full-verify protocol. Tarstream carriers directly supply identity; Bundle copying preserves exact bytes. Neither uses the local sink's capture/commit path.
@@ -504,7 +471,6 @@ Multidisk ordering is fixed: data disks first, root E last. Snapshot then writes
 
 
 
-<a id="144-incompatibility"></a>
 ## 11. Incompatibility
 
 The current provenance schema replaces the old snapshot provenance. An old `SnapshotConfig` containing resource/runtime/root/data/launch fields returns an explicit unsupported-format error. There is no old-format alias, dual reader, migration shim, feature flag, or zero-memory compatibility path. The `upload-snapshot` CLI alias in [Subcommands](sandbox.md#21-subcommands) does not provide format compatibility.

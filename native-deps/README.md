@@ -7,7 +7,6 @@ runtime but not included in its Go module. It currently contains patched
 `cloud-hypervisor`. `vmlinux`, `mkfs.erofs`, `fsck.erofs`, and `envd` belong to
 `guest-runtime/native-deps`; `librocksdb` belongs to `accelerator`.
 
-<a id="1-产物"></a>
 ## 1. Artifact
 
 | Artifact | Source | Consumer |
@@ -27,7 +26,6 @@ The top-level sandboxer `make cloud-hypervisor` target copies that output to
 `sandboxer/bin/<arch>/`, where release packaging places it beside `sandbox-ctl`
 and where the default `sandbox-ctl --ch-binary` lookup expects it.
 
-<a id="2-构建"></a>
 ## 2. Build
 
 Run the following commands from `sandboxer/native-deps`:
@@ -151,7 +149,6 @@ component payload/material namespace, source-record, permission and checksum
 checks. These materials support release review, not a legal certification or
 isolation of untrusted CI candidates.
 
-<a id="3-patch-开发循环"></a>
 ## 3. Patch development cycle
 
 ```bash
@@ -181,7 +178,6 @@ Conventions:
 Patch semantics and the device model are specified in
 [cloud-hypervisor.md](../docs/cloud-hypervisor.md).
 
-<a id="4-与其他-native-deps-的边界"></a>
 ## 4. Boundaries with other native dependencies
 
 ```text
@@ -194,7 +190,6 @@ accelerator               ──► librocksdb
 `vmlinux` is not built here either: `guest-runtime` releases it independently and
 `sandbox-ctl` selects it through configuration.
 
-<a id="5-验证"></a>
 ## 5. Validation
 
 For a native build, verify the artifact produced in this directory:

@@ -1,6 +1,5 @@
 [English](cloud-hypervisor.md) | [简体中文](cloud-hypervisor_zh.md)
 
-<a id="cloud-hypervisor--vmm-与平台-patches"></a>
 # cloud-hypervisor — VMM and platform patches
 
 The platform uses Cloud Hypervisor (CH) as its microVM monitor. Most paths use
@@ -8,10 +7,8 @@ upstream behavior. Externally managed memory, restore-safe vsock, and reliable V
 lifecycle barriers are supplied by seven patches maintained in this repository.
 This document defines their scope, build procedure, and behavioral contracts.
 
-<a id="1-概述"></a>
 ## 1. Overview
 
-<a id="11-为什么需要-patch"></a>
 ### 1.1 Why patches are required
 
 The platform has four requirements beyond the pinned upstream VMM behavior:
@@ -41,7 +38,6 @@ model. This memory model also requires avoiding an `EVENT_REMOVE` storm when
 balloon release encounters ranges that have never been resident (patch 0004,
 §3.4).
 
-<a id="12-patch-范围总结"></a>
 ### 1.2 Patch scope summary
 
 The following line counts describe the reviewed patch set at sandboxer commit
@@ -65,14 +61,13 @@ not a permanent size or compatibility guarantee.
 The seven patch files contain 1,665 insertions and 136 deletions in total and
 apply to Cloud Hypervisor `v51.1`.
 
-<a id="13-维护策略"></a>
 ### 1.3 Maintenance strategy
 
 - The repository-relative patch directory is
   `native-deps/deps/ch-patches/000{1,2,3,4,5,6,7}-*.patch`.
 - Run `make ch-patches-apply` from `sandboxer/native-deps`; it is also part of a
   fresh `make cloud-hypervisor` build. The development cycle and idempotency
-  checks are described in [native-deps/README.md](../native-deps/README.md) §3.
+  checks are described in [native-deps/README.md §3](../native-deps/README.md#3-patch-development-cycle).
 - Review the patch set for each intended upstream upgrade. Resolve conflicts
   against the actual upstream changes; neither a fixed release cadence nor a
   fixed amount of rebase work is assumed.
@@ -81,7 +76,6 @@ apply to Cloud Hypervisor `v51.1`.
   equivalent upstream vCPU-kick or worker-barrier fix is available, prefer it
   when upgrading rather than indefinitely maintaining duplicate patch 0007 logic.
 
-<a id="2-启用条件与命令行"></a>
 ## 2. Activation and command line
 
 CH `--memory-zone` accepts two additional keys:
@@ -119,7 +113,6 @@ cloud-hypervisor \
 The zone `id` is required by the parser; the platform uses `ram0`. Complete cold
 start and restore commands are described in [sandbox.md](sandbox.md) §5.2 and §7.
 
-<a id="3-patch-提交结构"></a>
 ## 3. Patch organization
 
 ### 3.1 0001 — externally allocated memfd-backed memory zone
@@ -218,7 +211,6 @@ file descriptor with `SCM_RIGHTS` so sandbox-ctl can consume its events. Descrip
 tables are process-local, but the context still routes events using the creator's
 virtual addresses; the event addresses received by sandbox-ctl are CH's chVA.
 
-<a id="34-0004--balloon-release-跳过-user-managed-zone-的空洞-run"></a>
 ### 3.4 0004 — skip hole-only runs during balloon release
 
 Subject: **virtio-devices: balloon — skip PUNCH_HOLE/MADV_DONTNEED on already-sparse
@@ -281,7 +273,6 @@ shared-inode invalidation work. The hole fraction and convergence time depend on
 the workload and environment; this specification makes no universal 99% hole-rate
 or instantaneous-convergence claim.
 
-<a id="35-0005--持久化-vsock-host-local-port-游标"></a>
 ### 3.5 0005 — persist the vsock host local-port cursor
 
 Restore recreates CH's Unix vsock backend. Resetting its local-port allocator to
@@ -291,7 +282,6 @@ in the guest snapshot and receive an RST. This patch stores `local_port_last` in
 snapshots preserve the cursor at each layer rather than relying on a process-local
 cursor that only covers one restore.
 
-<a id="36-0006--snapshot-时预发布-vsock-transport-reset"></a>
 ### 3.6 0006 — stage a vsock transport reset before snapshot
 
 Avoiding port reuse alone is insufficient. CH does not serialize the backend
@@ -327,7 +317,6 @@ missing or invalid descriptor makes the source snapshot fail explicitly. Target
 restore activation must succeed without any new available descriptor because the
 reset already exists in the snapshot's used ring.
 
-<a id="37-0007--vm-pauseresume-与-ordered-shutdown-可靠性"></a>
 ### 3.7 0007 — reliable VM pause/resume and ordered shutdown
 
 CH v51.1 uses a no-op `SIGRTMIN` handler to interrupt `KVM_RUN`. The control thread
@@ -380,7 +369,6 @@ This patch does not change sandbox configuration, the CH HTTP API, snapshot
 format, or resource protocol, and does not adjust `cpu.max` around lifecycle
 operations. Timeouts remain bounded failure protection, not the race fix.
 
-<a id="4-构建工作流"></a>
 ## 4. Build workflow
 
 `sandboxer/native-deps` builds the artifact from the pinned v51.1 tarball,
@@ -398,7 +386,6 @@ See [native-deps/README.md](../native-deps/README.md) for `ch-fetch`,
 `ch-patches-format`, idempotency checks, output synchronization, and ownership
 boundaries.
 
-<a id="5-启动协议per-arch"></a>
 ## 5. Boot protocols by architecture
 
 CH selects the architecture-specific boot protocol; sandbox-ctl does not require
@@ -409,7 +396,6 @@ a different command-line interface per architecture:
 | x86_64 | PVH | ELF entry with a CH-populated zero page | E820 memory map, command line, and ACPI tables |
 | aarch64 | EFI stub + ACPI | PE Image entry; the EFI stub parses ACPI | UEFI memory map, ACPI tables, and GICv3 description |
 
-<a id="51-设备模型平台用法"></a>
 ### 5.1 Device model used by the platform
 
 The cold-start device layout is:
@@ -444,7 +430,6 @@ host network source matches NIC presence in the snapshot.
 `--kernel` and `--vsock` do not have to be repeated. Complete cold/restore data
 flows are described in [sandbox.md](sandbox.md) §5 and §7.
 
-<a id="52-vsock-hybrid-代理"></a>
 ### 5.2 Vsock hybrid proxy
 
 The host-side hybrid proxy maps vsock traffic to UDS endpoints:
@@ -464,7 +449,6 @@ stdio MUX streams only after the application handshake between sandbox-ctl and
 sandbox-init; CH does not interpret those frames. See [sandbox.md](sandbox.md)
 §5.2 and [sandbox-init.md](sandbox-init.md) §4.2.
 
-<a id="6-行为契约总结"></a>
 ## 6. Behavioral contract summary
 
 Platform code (`sandbox-ctl` and `node-ctl`) relies on the following pinned CH
@@ -488,14 +472,12 @@ The platform does not use `free_page_reporting`. In the unified memfd/external
 uffd model, its repeated `madvise(MADV_DONTNEED)` invalidations can create
 mmu_notifier/EPT and IPI-shootdown pressure and interfere with guest vsock progress.
 The rationale and replacement feedback loop are described in the
-[guest kernel specification](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md)
-§5.5. The sandbox-local BalloonController instead pushes inflate targets through
+[guest kernel specification §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md#55-why-free_page_reporting-is-not-negotiated-and-the-role-of-virtio_mem). The sandbox-local BalloonController instead pushes inflate targets through
 `/vm.resize`, with at most one 64 MiB steady-shrink step for each fresh report.
 Patch 0004 skips empty ranges covered by the cold-start target; runtime reclaim
 of resident pages still performs the complete release operations.
 `deflate_on_oom` is native to upstream v51.1 and needs no additional patch.
 
-<a id="7-已知限制"></a>
 ## 7. Known limitations
 
 - **Upstream upgrades, including v52 and later**: inspect actual
@@ -521,5 +503,4 @@ of resident pages still performs the complete release operations.
 - [Guest kernel](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md)
   — PVH/EFI-stub integration.
 - [Native build](../native-deps/README.md) — Cloud Hypervisor build and patch cycle.
-- [System overview](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md)
-  §2.4 — VMM and guest environment within the system.
+- [System overview §3.2](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md#32-component-responsibilities) — VMM and guest environment within the system.

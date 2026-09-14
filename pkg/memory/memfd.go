@@ -23,7 +23,7 @@ import (
 type Memfd struct {
 	file  *os.File // owns the fd; Close() closes it
 	data  []byte   // backendVA: mmap of [0, size) with MAP_SHARED
-	inode uint64   // for SET_MEM_TABLE inode-match invariant (§12.2)
+	inode uint64   // for SET_MEM_TABLE inode-match invariant (docs/cloud-hypervisor.md §3.1)
 }
 
 // Create allocates a fresh memfd of size bytes:
@@ -104,7 +104,7 @@ func (m *Memfd) Size() int { return len(m.data) }
 
 // Inode returns the memfd's tmpfs inode. SET_MEM_TABLE handlers compare
 // fstat(received_fd).Ino against this to confirm CH passed back the
-// same memfd we gave it (§12.2 inode-match invariant).
+// same memfd we gave it (docs/cloud-hypervisor.md §3.1 inode-match invariant).
 func (m *Memfd) Inode() uint64 { return m.inode }
 
 // Bytes returns the backing slice for direct memory access. Mutations

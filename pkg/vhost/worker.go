@@ -58,7 +58,7 @@ func (s *Server) runWorker(idx int, q *virtq) {
 			return
 		}
 
-		// Quiesce gate (§12.5): pauseMu is held by Quiesce(), so workers
+		// Quiesce gate (docs/sandbox.md §11.5): pauseMu is held by Quiesce(), so workers
 		// block here while a snapshot is in progress. Once Resume()
 		// releases it, this iteration runs and processQueue will scan
 		// the avail ring including any KICKs that piled up during pause.

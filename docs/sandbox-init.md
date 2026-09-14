@@ -13,11 +13,7 @@ For image packaging, bundled guest payloads, versioning and builds, see
 This file defines the runtime contract of the image's `/sbin/init` and how
 `sandbox-ctl` communicates with it after starting the microVM.
 
-<a id="1-概述"></a>
-
 ## 1. Overview
-
-<a id="11-设计目标"></a>
 
 ### 1.1 Design goals
 
@@ -29,8 +25,6 @@ This file defines the runtime contract of the image's `/sbin/init` and how
 | One VM, one primary app | Default private PID mode uses clone(NEWPID\|NEWNS), making the app PID 1 in its namespace; shared PID mode is also available |
 | Observable lifecycle | Application start/exit notifications and explicit quiesce/restore exchanges use vsock; host VMM shutdown is a separate path (§5.4) |
 | Separate app I/O | Application stdin/stdout/stderr, or a pseudoterminal, is forwarded over vsock separately from kernel dmesg |
-
-<a id="12-系统中的位置"></a>
 
 ### 1.2 Position in the system
 
@@ -56,8 +50,6 @@ This file defines the runtime contract of the image's `/sbin/init` and how
                                      |<----- CH exits -----------|
 ```
 
-<a id="13-不做的事"></a>
-
 ### 1.3 Non-goals
 
 - **No container runtime:** the platform manages sandbox lifecycles directly,
@@ -78,9 +70,6 @@ This file defines the runtime contract of the image's `/sbin/init` and how
   restore/attach. Each exec session has a separate, independently concurrent
   MUX lasting for that command (§3.6).
 
-<a id="2-sandbox-runtimebundle-镜像结构"></a>
-<a id="2-sandbox-runtimebundle-image-layout"></a>
-
 ## 2. Runtime image consumption prerequisites
 
 The [Runtime Bundle specification](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime.md) owns complete packaging, file inventory, versioning and build rules. PID 1 relies on these consumption boundaries:
@@ -90,14 +79,10 @@ The [Runtime Bundle specification](https://github.com/kuasar-sandbox/guest-runti
 - `/opt/sandbox-runtime/` is the reserved read-only guest-payload root. Phase 1a bind-mounts it into the same path of the user rootfs, hiding existing image contents there; applications must respect the application-environment contract.
 - virtio-pmem/DAX reuses the same backing file’s read-only pages, not each guest’s private writable RAM. Init and payload executables must match the target architecture.
 
-See [Runtime builds](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime.md#3-build) and the [Native guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/README.md) for production of the bundle and host/target mkfs selection. This specification continues to define the complete host/guest handshake, mount ordering and ABI.
+See the [Native guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/README.md) for production of the bundle and host/target mkfs selection. This specification continues to define the complete host/guest handshake, mount ordering and ABI.
 
-
-<a id="3-sandbox-init-三阶段"></a>
 
 ## 3. The three sandbox-init phases
-
-<a id="31-阶段-1早期挂载--并发取-launch-spec--switch-root"></a>
 
 ### 3.1 Phase 1: early mounts, concurrent launch-spec fetch and switch-root
 
@@ -271,8 +256,6 @@ merged root. Bind/empty volumes do not add sources. Handles survive memory
 restore, never enter app exec, and close with init; an in-flight uncancelable
 read retains its original handle/slot until it finishes (§4.11).
 
-<a id="32-阶段-2spec-应用--stdio-接线--应用拉起"></a>
-
 ### 3.2 Phase 2: apply the spec, wire stdio and start the app
 
 Phase 1's JOIN supplies LaunchSpec and the vsock connection that exchanged
@@ -363,8 +346,6 @@ after switch-root.
     - short-conn dials host:5000, sends app_started{pid}, waits for ack, closes;
     - starts launch.plugin[] companions, then enters phase 3.
 ```
-
-<a id="321-应用-cgroup-namespace-与-controller-拓扑"></a>
 
 #### 3.2.1 Application cgroup namespace and controller topology
 
@@ -475,8 +456,6 @@ must not silently launch an app with the wrong environment. The scheduler
 needs a failed startup it can reschedule. Restore's best-effort clock/network
 handling is a distinct contract (§4.3).
 
-<a id="33-阶段-3supervisor"></a>
-
 ### 3.3 Phase 3: supervisor
 
 ```
@@ -571,8 +550,6 @@ See [sandbox lifecycle](sandbox.md), §4.2 / §9.3.
 `mem_report` remains the existing resource-control exchange. Usage does not
 reuse its retained payload, cadence or ACK queue: the Host requests new raw
 usage observations over a separate connection (§4.11).
-
-<a id="34-quiesce-处理"></a>
 
 ### 3.4 Quiesce handling
 
@@ -689,8 +666,6 @@ same-VM recovery and reattach; it continues running only if that recovery
 succeeds, otherwise the host terminates the failed recovery. See §4.10 and
 [sandbox lifecycle §6.2](sandbox.md).
 
-<a id="35-应用-stdio--console-接线"></a>
-
 ### 3.5 Application stdio and console wiring
 
 sandbox-init creates the application's stdin/stdout/stderr or pseudoterminal
@@ -722,8 +697,6 @@ CH writes it to the stdout pipe provided by sandbox-ctl, which discards it,
 writes it to stderr or writes it to a file according to `--console`
 ([sandbox lifecycle](sandbox.md), §2.2 / §5.2).
 `--serial off` disables the 8250 UART.
-
-<a id="36-exec-会话sandbox-ctl-exec"></a>
 
 ### 3.6 Exec sessions (`sandbox-ctl exec`)
 
@@ -784,8 +757,6 @@ Killing only the child is not a freeze barrier: unreleased process-wide fork
 state or half-closed vsock state could otherwise enter S.
 Resume/restore reopens admission only after thaw (§4.3).
 An exec interrupted by capture is not automatically rerun.
-
-<a id="37-connect-端口转发会话sandbox-ctl-run---connect"></a>
 
 ### 3.7 Connect port-forward sessions (`sandbox-ctl run --connect`)
 
@@ -882,11 +853,7 @@ cache. Host forwarding listeners survive same-process quiesce; a separate
 restore process must recreate/take ownership through equivalent `--connect`
 arguments.
 
-<a id="4-vsock-控制面--console-mux-协议"></a>
-
 ## 4. Vsock control plane and console MUX protocol
-
-<a id="41-两类连接"></a>
 
 ### 4.1 Connection classes
 
@@ -924,8 +891,6 @@ concurrent with the primary and other exec sessions.
 Connect also upgrades its handshake connection, but uses the thinner,
 single-stream fwd protocol, with no application window.
 
-<a id="42-通道与寻址"></a>
-
 ### 4.2 Channels and addressing
 
 Both directions use **port 5000**, with endpoints distinguished by direction:
@@ -949,8 +914,6 @@ Example <vsock-base>:    /run/sandbox/<sid>/vsock.sock
   quiesce, restore/attach, per-command exec MUX and connect fwd sessions.
 - The directions have independent addressing. Host→guest ping and
   guest→host app_started can run simultaneously on separate new connections.
-
-<a id="43-管理操作集"></a>
 
 ### 4.3 Management operations
 
@@ -985,8 +948,6 @@ state, but the handlers do not currently derive a live exited state or return
 structured `exited{code,term_signal}`. ACK is not an application-health or
 successful-thaw guarantee: thaw is attempted afterward and failure leaves the
 launch/forward/report gates closed.
-
-<a id="44-管理消息-wire-format-与字段"></a>
 
 ### 4.4 Management wire format and fields
 
@@ -1043,8 +1004,6 @@ The guest ping handler echoes even zero/missing id or timestamp; the host
 pinger validates response type and its expected ID.
 The restore/attach request epoch is echoed, not an implemented generic
 duplicate-request filter; memory reporting has its own epoch/seq validation.
-
-<a id="45-mux-子协议"></a>
 
 ### 4.5 MUX sub-protocol
 
@@ -1136,8 +1095,6 @@ The guest applies TIOCSWINSZ to the PTY master, causing a foreground-process-gro
 SIGWINCH. It matters only in PTY mode. The host sends initial size on entering
 MUX, including after restore/attach.
 
-<a id="46-mux-优雅关闭握手"></a>
-
 ### 4.6 MUX graceful-close handshake
 
 The orderly-close protocol is a small application-layer FIN/FIN-ACK exchange,
@@ -1212,8 +1169,6 @@ still active. The current host does not run a universal automatic reconnect loop
 capture resume/recovery explicitly invokes reattach, while other callers must
 handle interrupted forwarding (§4.3 / §4.10).
 
-<a id="47-connect-转发帧子协议fwd"></a>
-
 ### 4.7 Connect forwarding frame sub-protocol (fwd)
 
 After connect_ack, the connection switches to shared `pkg/fwd` framing and
@@ -1252,8 +1207,6 @@ through sync.Once, closing each underlying connection once. Double-closing a
 guest raw fd could otherwise close an unrelated connection that reused its
 number. Quiesce arms bounded SO_LINGER before guest vsock close; the wider
 transport-reset contract remains §4.6.
-
-<a id="48-时序"></a>
 
 ### 4.8 Timelines
 
@@ -1352,8 +1305,6 @@ closing bind/listen sockets. CH also resumes local port allocation from saved
 local_port_last + 1. Resetting the transport epoch and keeping port allocation
 continuous are separate responsibilities.
 
-<a id="49-ping-健康探测"></a>
-
 ### 4.9 Ping health probes
 
 Ping measures guest-agent liveness and response latency, **not application
@@ -1397,8 +1348,6 @@ the echoed wall-clock value nor requires guest clock synchronization.
 Errors containing deadline / i/o timeout / timed out are classified as timeout;
 other failures, including an unexpected pong type/ID, count as dial_error.
 This is best-effort classification, not a typed network-error taxonomy.
-
-<a id="410-失败语义"></a>
 
 ### 4.10 Failure semantics
 
@@ -1554,11 +1503,7 @@ admission still closes. Source slots survive this rollback. This raw
 protocol changes neither business filesystem synchronization nor the
 existing resource controller.
 
-<a id="5-应用契约"></a>
-
 ## 5. Application contract
-
-<a id="51-launch-配置launchspec"></a>
 
 ### 5.1 Launch configuration (LaunchSpec)
 
@@ -1624,8 +1569,6 @@ The wire NetworkSpec key is **ip_cidr**, not the host YAML key ip.
 `start_timeout` is absent from LaunchSpec because it controls only the
 host's launch_ack wait (§4.10).
 
-<a id="52-用户应用看到的环境"></a>
-
 ### 5.2 The application environment
 
 - **PID 1:** in default pid_namespace=private, the app is PID 1 of its own
@@ -1668,8 +1611,6 @@ host's launch_ack wait (§4.10).
   requirement. Memory availability, reclaim effects and timing can still be
   observable to applications.
 
-<a id="53-退出语义"></a>
-
 ### 5.3 Exit semantics
 
 - **restart: never:** app exit → bounded MUX drain → app_exited notification →
@@ -1686,8 +1627,6 @@ An in-place restart forks within the existing guest lifecycle rather than
 repeating the complete sandbox boot. Backoff is 10 ms→60 s, reset after 60 s
 uptime. Shutdown suppresses further restarts, while a quiesce window delays
 them until thaw (§3.3).
-
-<a id="54-信号处理"></a>
 
 ### 5.4 Signal handling
 
@@ -1712,8 +1651,6 @@ them until thaw (§3.3).
   SIGINT for the application. Host sandbox termination or terminal escape uses
   the separate lifecycle controls ([sandbox lifecycle §2.2](sandbox.md)).
 - The proposed quiesce.signal hook (§3.4) is not implemented.
-
-<a id="6-扩展点"></a>
 
 ## 6. Extension points
 

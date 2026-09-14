@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# e2e_sandbox_local_merge.sh — the local-layer invariant (docs/sandbox.md §11.1):
+# e2e_sandbox_local_merge.sh — the local-layer invariant (docs/sandbox-artifacts.md §9.1):
 #
 #   1. store-ctl + cache-ctl tiered, a TICK guest that writes /ticks.dat
 #   2. cold-start → snapshot --output  → s1 (LOCAL file, from_refs=[])

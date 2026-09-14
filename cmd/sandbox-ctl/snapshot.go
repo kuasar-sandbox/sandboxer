@@ -65,7 +65,7 @@ func snapshotCmd(args []string) int {
 		return 2
 	}
 
-	// Strict mutual exclusion (docs/sandbox.md §13.3).
+	// Strict mutual exclusion (docs/sandbox.md §12.3).
 	if *upload && *outDir != "" {
 		fmt.Fprintln(os.Stderr, "snapshot: --output and --upload are mutually exclusive")
 		return 2

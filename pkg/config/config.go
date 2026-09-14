@@ -69,7 +69,7 @@ type SandboxConfig struct {
 	Restore RestoreConfig `yaml:"restore,omitempty"`
 
 	// Mounts / Files / Init drive guest environment setup (applied before
-	// the app is forked). See docs/sandbox.md §3.8.
+	// the app is forked). See docs/sandbox.md §3.2.
 	Mounts []MountConfig `yaml:"mounts,omitempty"`
 	Files  []FileConfig  `yaml:"files,omitempty"`
 	// EphemeralFiles are injected only for this cold-start invocation. They
@@ -995,7 +995,7 @@ func (c *SandboxConfig) CPUWeight() uint64 {
 
 // ValidateCold checks invariants required for the cold-start path.
 //
-// Resource-control gating rules (see docs/sandbox.md §13):
+// Resource-control gating rules (see docs/sandbox.md §12):
 //   - Controller requires CgroupPath
 //   - Overhead / WatermarkHigh require CgroupPath
 //   - allocatable.cpu == capacity.cpu when CgroupPath is empty (no

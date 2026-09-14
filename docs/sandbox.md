@@ -1,30 +1,19 @@
 [English](sandbox.md) | [简体中文](sandbox_zh.md)
 
-<a id="sandbox--沙箱控制与制品生命周期"></a>
-
 # sandbox — Sandbox control and artifact lifecycle
 
 `sandbox-ctl` is kuasar-sandbox's host control plane for one sandbox. It handles explicit cold starts, cold starts from Sandbox artifacts, memory restore, live export, image-to-Sandbox-E assembly without a VM, memory snapshots, artifact publication, and runtime `exec`/forwarding. The guest protocol is documented in [sandbox-init.md](sandbox-init.md).
 
 This document describes the current format and behavior. The current reader rejects the old `snapshot.cfg` disk-graph schema; it provides no dual reader, automatic migration, or cross-version compatibility guarantee. This format boundary does not mean that the project has never published releases.
 
-<a id="1-概述"></a>
-
 ## 1. Overview
 
 <a id="artifact-model"></a>
-<a id="11-逻辑角色"></a>
-<a id="11-logical-roles"></a>
-<a id="12-逻辑角色与物理-carrier"></a>
-<a id="12-logical-roles-and-physical-carriers"></a>
 ### 1.1 Artifact model
 
 The runtime consumes images, Sandbox E and Snapshot S. E describes portable configuration and the disk graph; S binds E to captured VMM/memory state. Logical objects are independent of file/named-location/Manifest/Bundle carriers. See [Sandbox artifacts](sandbox-artifacts.md) for full roles, fields and validation.
 
 
-<a id="13-责任边界"></a>
-
-<a id="13-responsibility-boundaries"></a>
 ### 1.2 Responsibility boundaries
 
 `sandboxer` provides the complete E/S capabilities but does not define orchestrator's durable API. The recommended upper-layer mapping is:
@@ -36,11 +25,7 @@ memory=false -> kind=sandbox,  ref=<Sandbox E>
 
 The ordinary data plane must not treat Sandbox E as memory state that can wake automatically. Starting from E requires explicit cold `Connect` semantics.
 
-<a id="2-命令行接口"></a>
-
 ## 2. Command-line interface
-
-<a id="21-子命令总览"></a>
 
 ### 2.1 Subcommands
 
@@ -241,8 +226,6 @@ the usage file and its records. Queries do not trigger Guest/CH sampling or
 save operations. Complete flags, JSON units, validity and file-format rules
 are owned by [usage](usage.md).
 
-<a id="3-配置与制品格式"></a>
-
 ## 3. Configuration and artifact formats
 
 ### 3.1 `sandbox.yaml`
@@ -320,38 +303,7 @@ usage:
 
 Ordinary cold run performs full validation. `run --from` and `run --restore` first strictly parse the artifact, then apply their respective field-presence rules. An unconstrained `LoadMerged` must not overwrite the artifact graph.
 
-### 3.2 PortableSandboxConfig
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#32-portablesandboxconfig).
-
-<a id="33-strict-encoding-与-limits"></a>
-### 3.3 Strict encoding and limits
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#33-strict-encoding-and-limits).
-
-<a id="34-c0c1-与-source-binding"></a>
-### 3.4 C0, C1, and source binding
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#34-c0-c1-and-source-binding).
-
-<a id="35-self-与-disk-provenance"></a>
-### 3.5 `self` and disk provenance
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#35-self-and-disk-provenance).
-
-### 3.6 `.sandbox` logical format
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#36-sandbox-logical-format).
-
-### 3.7 `.snapshot` logical format
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#37-snapshot-logical-format).
-
-<a id="38-filesenv-与-ephemeral"></a>
-
-<a id="38-files-environment-and-ephemeral-data"></a>
-<a id="33-files-environment-and-ephemeral-data"></a>
-### 3.8 Files, environment, and ephemeral data
+### 3.2 Files, environment, and ephemeral data
 
 Cold-launch merging:
 
@@ -377,7 +329,7 @@ Runtime semantics:
 
 If the restore host explicitly supplies `boot.cmdline`, persistent/ephemeral launch fields, mounts, files/ephemeral_files, init, or metadata, validation rejects them before side effects instead of silently ignoring them. `resources.startup` is host-only node policy and may be supplied on restore. It is included in the node reservation contract, but the Snapshot's captured `BudgetAtSnapshot` remains authoritative for the initial restore Budget.
 
-### 3.9 Usage policy
+### 3.3 Usage policy
 
 `usage` is strictly parsed host-only policy. It follows ordered configuration
 overrides in cold, from and restore modes and never enters Portable/E/S.
@@ -386,11 +338,7 @@ write; existing resource control remains active. An old file can still be
 read offline. See [usage configuration](usage.md#3-configuration) and the
 [host-overlay example](../examples/usage-enabled.yaml).
 
-<a id="4-资源模型"></a>
-
 ## 4. Resource model
-
-<a id="41-三种部署模式"></a>
 
 ### 4.1 Three deployment modes
 
@@ -416,17 +364,11 @@ VMM memory.max      = CapacityMemory + host overhead
 
 Memory S capture records CH configuration/state and sparse memfd content. Resource policy is not written to `snapshot.cfg`. Restore obtains capacity identity from E, and any explicitly supplied host capacity must match. Allocatable CPU/memory, `startup`, `overhead`, `watermark_high`, and resource-controller bindings come from the current host. `deflate_on_oom` must remain consistent with captured VMM state. The Snapshot's `BudgetAtSnapshot` remains authoritative for the initial restore Budget.
 
-<a id="43-cpu-与-balloon"></a>
-
 ### 4.3 CPU and balloon
 
 Capacity CPU determines vCPU topology. In cgroup mode, allocatable CPU maps to `cpu.weight`; without a cgroup it must equal capacity CPU, so a separate fractional allocation cannot be expressed. CH restore state authoritatively restores the current balloon state; the host does not invent another balloon state from S.
 
-<a id="5-cold-start-与-run---from"></a>
-
 ## 5. Cold start and `run --from`
-
-<a id="51-显式-cold-start"></a>
 
 ### 5.1 Explicit cold start
 
@@ -445,7 +387,7 @@ T8 launch sandbox-init spec and app
 T9 establish MUX/pinger/forward/resource lifecycle
 ```
 
-Predictable config/ref/format failures are intended to fail in preflight before controller/network/VM side effects. This does not promise that every later operation is side-effect-free: creating the run directory, writing C0, creating diffs, and acquiring resources are explicit subsequent steps that can fail and require cleanup. Kernel/runtime verification differs for an existing portable C0 as explained in [PortableSandboxConfig](sandbox-artifacts.md#32-portablesandboxconfig).
+Predictable config/ref/format failures are intended to fail in preflight before controller/network/VM side effects. This does not promise that every later operation is side-effect-free: creating the run directory, writing C0, creating diffs, and acquiring resources are explicit subsequent steps that can fail and require cleanup. Kernel/runtime verification differs for an existing portable C0 as explained in [PortableSandboxConfig](sandbox-artifacts.md#3-portablesandboxconfig).
 
 ### 5.2 CH command-line boundary
 
@@ -498,11 +440,7 @@ Complete replacement covers `boot.kernel`, `boot.runtime`, `boot.cmdline`, `boot
 
 Replacement does not reuse the source E's default kernel/runtime bindings, `self`, `RunSourceBinding`, or Bundle reader/fetcher. Host boot refs still undergo ordinary cold canonicalization, local crypto, Manifest/Bundle lookup, and preflight. The new C0 and subsequent E/S disk closure depend only on replacement boot. `--replace-boot` requires both `--from` and explicit `--config` (or `SANDBOX_CONFIG`) and can never be combined with `--restore`.
 
-<a id="6-export-与-snapshot-数据流"></a>
-
 ## 6. Export and snapshot data flow
-
-<a id="61-output-graph-与-commit-point"></a>
 
 ### 6.1 Output graph and commit point
 
@@ -523,8 +461,6 @@ disk dependencies -> Sandbox E -> Snapshot S
 ```
 
 The Snapshot Bundle's root Manifest is S; the Export Bundle's root is E. E, data/lower Manifests, and S's memory dependencies belong to one planned Bundle graph. Before emitting the metadata prefix, the writer must complete admission, ordered source selection, parent copying, and the ref-replacement plan.
-
-<a id="62-freeze-sequence-与-failure-recovery"></a>
 
 ### 6.2 Freeze sequence and failure recovery
 
@@ -573,7 +509,7 @@ Failure semantics:
 - With an ambiguous attach ACK, the host retries the idempotent operation once. If it still cannot establish MUX, capture becomes a terminal failure. While retaining memory/`memory.high` guards, the host requests VMM shutdown and uses bounded SIGTERM/SIGKILL fallback. It does not leave a VM that accepts new requests while the guest remains frozen.
 - Default destruction also waits for CH exit. Failed or timed-out `/vmm.shutdown` falls back to bounded SIGTERM/SIGKILL before lifecycle guards are released.
 - C0, active diffs, and the live lower graph remain unchanged.
-- Local capture uses same-directory temporary files and cleans failed partial output. Named-location publication has its separate ownership-checked cleanup rules in [Local tarstream and crypto](sandbox-artifacts.md#112-local-tarstream-and-crypto).
+- Local capture uses same-directory temporary files and cleans failed partial output. Named-location publication has its separate ownership-checked cleanup rules in [Local tarstream and crypto](sandbox-artifacts.md#92-local-tarstream-and-crypto).
 
 ### 6.3 `ctl.sock` protocol
 
@@ -619,8 +555,6 @@ OpenFlattenedImage
 
 `AssembleSandboxE` does not create a complete intermediate `.sandbox`. It borrows the caller-owned `FlattenedImage`, preserves the payload's Hole/Zero/Data map and byte-for-byte `config.json`, and appends canonical `sandbox.runtime.cfg`. Context cancellation can interrupt opening, configuration-ref canonicalization, image validation, and later sink consumption. Malformed image, JSON, or portable configuration fails closed before a root ref is published. Embedded multitask processes must not switch tenants by changing global `MANIFEST_KEY`; they should pass a task-scoped resolver through `NewProcessStorageWithCustomerKey`. `ProcessStorage` evaluates it at most once and fixes the same customer key for its fetch, ingest, and local-codec operations.
 
-<a id="7-memory-restore-数据流"></a>
-
 ## 7. Memory restore data flow
 
 `run --restore S` handles only genuine memory Snapshots:
@@ -652,7 +586,7 @@ Restore does not:
 - Treat E's `config.json` as a new process-launch request.
 - Update memory parents or C0 as a re-snapshot side effect.
 
-Allowed host-only fields include the network provider/current identity, cgroup/controller, allocatable CPU/memory and resource enforcement, actual kernel/runtime paths, active diff/template, restore prefetch, and timeouts. E owns the immutable disk graph, capacity identity, `deflate_on_oom`, and network topology. The kernel re-hash exception and runtime-footer comparison are described in [PortableSandboxConfig](sandbox-artifacts.md#32-portablesandboxconfig).
+Allowed host-only fields include the network provider/current identity, cgroup/controller, allocatable CPU/memory and resource enforcement, actual kernel/runtime paths, active diff/template, restore prefetch, and timeouts. E owns the immutable disk graph, capacity identity, `deflate_on_oom`, and network topology. The kernel re-hash exception and runtime-footer comparison are described in [PortableSandboxConfig](sandbox-artifacts.md#3-portablesandboxconfig).
 
 After restoring S0:
 
@@ -721,8 +655,6 @@ A tail issues a single multipage `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` for its cont
 
 `EVENT_REMOVE` makes discarded ranges missing again. Conditional tail-state updates must not overwrite concurrently produced `Released` state. Context cancellation stops workers and closes the owned descriptors/streams.
 
-<a id="9-cgroup-与-balloon"></a>
-
 ## 9. Cgroups and balloon
 
 ### 9.1 Memory enforcement
@@ -776,71 +708,31 @@ Before snapshot/export, new Budget mutations and balloon transitions are blocked
 
 Static/dynamic modes can use PSI or `memory.events.local` polling. Host configuration determines the PSI trigger and debounce; they are not written to E. The sensor stops initiating growth during the capture gate and establishes a new observation epoch after restore.
 
-<a id="artifact-provenance-and-publication"></a>
-<a id="11-provenancepublish-与-carrier"></a>
-<a id="11-provenance-publication-and-carriers"></a>
-## 11. Artifact provenance and publication
+## 11. vhost-user-blk backend
 
-See [Sandbox artifacts](sandbox-artifacts.md) for disk/memory references, tarstream/Manifest/Bundle outputs, exact publication and commit rules. This runtime specification retains capture sequencing.
-
-<a id="111-disk-与-memory-provenance"></a>
-### 11.1 Disk and memory provenance
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#111-disk-and-memory-provenance).
-
-<a id="112-local-tarstream-与-crypto"></a>
-### 11.2 Local tarstream and crypto
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#112-local-tarstream-and-crypto).
-
-<a id="local-output"></a>
-[Local output](sandbox-artifacts.md#local-output) defines local tarstream publication.
-
-<a id="named-ref-location"></a>
-[Named ref location](sandbox-artifacts.md#named-ref-location) defines publication to a named carrier.
-
-<a id="single-root-imagesandbox-manifest-bundle"></a>
-[Single-root image/Sandbox Manifest Bundle](sandbox-artifacts.md#single-root-imagesandbox-manifest-bundle) defines that carrier's publication rules.
-
-### 11.3 Manifest upload
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#113-manifest-upload).
-
-### 11.4 Manifest Bundle
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#114-manifest-bundle).
-
-### 11.5 Publish graph
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#115-publish-graph).
-
-## 12. vhost-user-blk backend
-
-### 12.1 Payload boundary
+### 11.1 Payload boundary
 
 The vhost backend receives the `fetch.Stream` Payload section, not FullStream. Including a `.sandbox` ZIP tail in the block device's logical size is a bug covered by format/unit tests.
 
-### 12.2 Layered reads
+### 11.2 Layered reads
 
 Read order is active diff → captured top → `base_from_refs` → root image where applicable. Hole falls through; Zero/Data stop traversal. The immutable layers composed within one writable block device must have matching logical sizes. In the EROFS-plus-ext4 topology, the read-only EROFS base is a separate vhost device; it is not the final fall-through layer of the writable ext4 BlockCOW device. See [disks.go](../pkg/sandbox/disks.go) and [serveandwait.go](../pkg/sandbox/serveandwait.go).
 
-### 12.3 SnapshotView
+### 11.3 SnapshotView
 
 `BlockCOW.SnapshotView` exposes the decrypted upper-only logical view and authoritative hole map. It does not reopen the active-diff path and is stable only while the backend is quiesced.
 
-### 12.4 BlockCOW state
+### 11.4 BlockCOW state
 
 BlockCOW uses a dirty bitmap for 4 KiB active-upper blocks, not a three-state discard map. Dirty blocks read from the diff; clean blocks fall through to the base, or return zeros when no base exists. The low-level `Discard` helper punches only complete blocks and clears their dirty bits, exposing the base again; it does not persist an explicit Zero that masks a lower layer. The current vhost profile advertises neither DISCARD nor WRITE_ZEROES, and its request dispatcher returns unsupported for both instead of calling this helper. Writing zero bytes keeps a block dirty and must not be scanned into Hole. Export/snapshot neither rotates the active diff nor makes the new E a backend base. See [blk_cow.go](../pkg/vhost/blk_cow.go), [server.go](../pkg/vhost/server.go), and [worker.go](../pkg/vhost/worker.go).
 
-### 12.5 Quiesce / Resume
+### 11.5 Quiesce / Resume
 
 Quiesce waits for in-flight block requests to leave and prevents new ones. All data/root views are read within the same quiesce window. Recovery makes backends serviceable before resuming CH and guest connections, avoiding permanent blocking of block requests after VM resume.
 
-<a id="13-validation错误与安全"></a>
+## 12. Validation, errors, and security
 
-## 13. Validation, errors, and security
-
-### 13.1 Cold validation
+### 12.1 Cold validation
 
 Ordinary cold configuration validates at least:
 
@@ -852,13 +744,11 @@ Ordinary cold configuration validates at least:
 - Consistent local/Manifest/Bundle refs and crypto policy.
 - Launch/files/init/plugin/metadata limits.
 
-<a id="132-run---from-与-restore-validation"></a>
+### 12.2 `run --from` and restore validation
 
-### 13.2 `run --from` and restore validation
+Both modes strictly parse the logical artifact and canonical configuration before checking host ownership. `--from` permits persistent-workload overrides; restore rejects all cold-only fields. Kernel binding preflight, runtime identity comparison, network topology/provider, disk count/names/topology, and active-diff binding checks precede external lifecycle side effects. This does not add a kernel-digest re-hash to these two modes; see [PortableSandboxConfig](sandbox-artifacts.md#3-portablesandboxconfig).
 
-Both modes strictly parse the logical artifact and canonical configuration before checking host ownership. `--from` permits persistent-workload overrides; restore rejects all cold-only fields. Kernel binding preflight, runtime identity comparison, network topology/provider, disk count/names/topology, and active-diff binding checks precede external lifecycle side effects. This does not add a kernel-digest re-hash to these two modes; see [PortableSandboxConfig](sandbox-artifacts.md#32-portablesandboxconfig).
-
-### 13.3 CLI mutual exclusion
+### 12.3 CLI mutual exclusion
 
 - `run --from` and `--restore` are mutually exclusive.
 - `run --replace-boot` is allowed only with `--from`, requires host configuration, and rejects `--restore`.
@@ -868,7 +758,7 @@ Both modes strictly parse the logical artifact and canonical configuration befor
 - Snapshot has no memory toggle.
 - The exec command must follow `--`; local and proxy target rules are mutually exclusive.
 
-### 13.4 Failure contract
+### 12.4 Failure contract
 
 - Errors provide field/entry/ref/disk-index context without printing inline file/env values, customer keys, or plaintext digests.
 - Local crypto errors retain protected presentation.
@@ -878,20 +768,9 @@ Both modes strictly parse the logical artifact and canonical configuration befor
 - Any post-freeze failure must recover app, CH/backends/MUX/pinger/forwarding and release resource locks. If MUX recovery can no longer be established, CH must be terminated while locks remain held and the capture gate becomes terminal.
 - Successful operation-root publication is the commit point, followed by the semantic alias for local output. Named locations have no alias. Orphan dependencies do not constitute success.
 
-<a id="14-reliabilityperformance-与兼容边界"></a>
+## 13. Reliability, performance, and compatibility boundaries
 
-## 14. Reliability, performance, and compatibility boundaries
-
-<a id="141-atomicity-与-determinism"></a>
-### 14.1 Atomicity and determinism
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#141-atomicity-and-determinism).
-
-<a id="142-streaming-与-memory-use"></a>
-
-<a id="142-streaming-and-memory-use"></a>
-<a id="141-streaming-and-memory-use"></a>
-### 14.2 Streaming and memory use
+### 13.1 Streaming and memory use
 
 - Sparse tarstream does not spool the logical stream to disk.
 - Manifest ingest reads resident extents rather than materializing holes.
@@ -899,9 +778,7 @@ The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#141
 - Bundle dependency planning performs remote I/O and admission before pause.
 - V1 `--resume` may keep the VM paused until sink writes finish, preserving SnapshotView stability.
 
-<a id="143-performance-observations"></a>
-<a id="142-performance-observations"></a>
-### 14.3 Performance observations
+### 13.2 Performance observations
 
 Key metrics:
 
@@ -916,11 +793,7 @@ Key metrics:
 
 Benchmarks separately cover local tarstream/Bundle creation, Bundle reads, sparse merging, and UFFD faults. Performance optimization must not alter Hole/Zero/Data semantics, commit order, identity-verification policy, or freeze safety.
 
-### 14.4 Incompatibility
-
-The complete contract is defined in [Sandbox artifacts](sandbox-artifacts.md#144-incompatibility).
-
-## 15. See Also
+## 14. See Also
 
 - [usage.md](usage.md) — Host-only resource accounting, query, units and persistence.
 - [sandbox-init.md](sandbox-init.md) — Guest PID 1 and launch/quiesce/MUX protocols.
