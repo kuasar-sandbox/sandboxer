@@ -45,52 +45,63 @@ func Read(ctx context.Context, options Options) (json.RawMessage, error) {
 	if !options.Offline {
 		response, connected, err := ctl.ReadUsage(ctx, options.ControlSocket, options.History, options.Cursor, options.Limit)
 		if err == nil {
-			if response.SandboxID != options.SandboxID {
-				return nil, errors.New("usage: owner sandbox identity mismatch")
-			}
-			if options.History {
-				var page *struct {
-					Records []usage.Record `json:"records"`
-					Next    *int64         `json:"next_cursor,string"`
-				}
-				if err := json.Unmarshal(response.Usage, &page); err != nil {
-					return nil, err
-				}
-				if page == nil || page.Records == nil || page.Next == nil || *page.Next < options.Cursor ||
-					len(page.Records) > options.Limit || (len(page.Records) == 0) != (*page.Next == options.Cursor) {
-					return nil, errors.New("usage: invalid owner history")
-				}
-				for _, record := range page.Records {
-					if record.Snapshot.SandboxID != options.SandboxID {
-						return nil, errors.New("usage: sandbox identity mismatch")
-					}
-				}
-				return response.Usage, nil
-			}
-			var view *usage.View
-			if err := json.Unmarshal(response.Usage, &view); err != nil {
-				return nil, err
-			}
-			if view == nil {
-				return nil, errors.New("usage: invalid owner snapshot")
-			}
-			if (view.Live != nil && view.Live.SandboxID != options.SandboxID) || (view.Saved != nil && view.Saved.Snapshot.SandboxID != options.SandboxID) {
-				return nil, errors.New("usage: sandbox identity mismatch")
-			}
-			if view.SavedEnd < 0 || (view.Saved != nil) != (view.SavedEnd > 0) {
-				return nil, errors.New("usage: saved record and cursor disagree")
-			}
-			if !options.Saved {
-				return response.Usage, nil
-			}
-			view.Live = nil
-			return json.Marshal(view)
+			return decodeOwner(ctx, options, response)
 		}
 		if connected || (!errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED)) {
 			return nil, err
 		}
 	}
 	return waitOffline(ctx, func() (json.RawMessage, error) { return readOffline(ctx, options) })
+}
+
+// decodeOwner includes JSON decoding, identity/cursor validation and saved-view
+// projection in the caller's cancellation boundary, after transport has ended.
+func decodeOwner(ctx context.Context, options Options, response ctl.Response) (body json.RawMessage, err error) {
+	defer func() {
+		if canceled := ctx.Err(); canceled != nil {
+			body, err = nil, canceled
+		}
+	}()
+	if response.SandboxID != options.SandboxID {
+		return nil, errors.New("usage: owner sandbox identity mismatch")
+	}
+	if options.History {
+		var page *struct {
+			Records []usage.Record `json:"records"`
+			Next    *int64         `json:"next_cursor,string"`
+		}
+		if err := json.Unmarshal(response.Usage, &page); err != nil {
+			return nil, err
+		}
+		if page == nil || page.Records == nil || page.Next == nil || *page.Next < options.Cursor ||
+			len(page.Records) > options.Limit || (len(page.Records) == 0) != (*page.Next == options.Cursor) {
+			return nil, errors.New("usage: invalid owner history")
+		}
+		for _, record := range page.Records {
+			if record.Snapshot.SandboxID != options.SandboxID {
+				return nil, errors.New("usage: sandbox identity mismatch")
+			}
+		}
+		return response.Usage, nil
+	}
+	var view *usage.View
+	if err := json.Unmarshal(response.Usage, &view); err != nil {
+		return nil, err
+	}
+	if view == nil {
+		return nil, errors.New("usage: invalid owner snapshot")
+	}
+	if (view.Live != nil && view.Live.SandboxID != options.SandboxID) || (view.Saved != nil && view.Saved.Snapshot.SandboxID != options.SandboxID) {
+		return nil, errors.New("usage: sandbox identity mismatch")
+	}
+	if view.SavedEnd < 0 || (view.Saved != nil) != (view.SavedEnd > 0) {
+		return nil, errors.New("usage: saved record and cursor disagree")
+	}
+	if !options.Saved {
+		return response.Usage, nil
+	}
+	view.Live = nil
+	return json.Marshal(view)
 }
 
 // File syscalls are not assumed interruptible. A canceled caller stops waiting,

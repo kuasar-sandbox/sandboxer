@@ -78,7 +78,8 @@ saved view 必须在且仅在存在 saved record 时携带正数 `saved_end`.
 
 只有 socket 不存在或拒绝连接时允许回退. 一旦已连接 owner, EOF、非法 response、
 owner 错误、取消或超时都使查询失败, 不能被可读的保存文件替代. 取消会关闭当前
-ctl connection. 离线取消会停止调用方等待, 并在文件读取之间检查取消.
+ctl connection. Owner response 完成 JSON 解码、验证和 saved view 投影后,
+也会检查取消. 离线取消会停止调用方等待, 并在文件读取之间检查取消.
 阻塞的文件系统调用继续持有执行槽和共享锁, 直到实际返回; 每进程最多有 8 个
 离线执行, 包括调用方已取消的执行. 等待执行槽同样遵守查询 deadline.
 这不会使文件系统调用变成可中断操作, 也不改变 native saving.

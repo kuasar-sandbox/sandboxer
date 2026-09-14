@@ -96,7 +96,8 @@ FIFOs and other nonregular files without waiting for a writer beyond timeout.
 Only failure to connect to an absent/refused socket permits fallback. Once
 connected, EOF, invalid replies, owner errors, cancellation and deadlines fail
 the query; a readable saved file does not replace them. Cancellation closes
-the active ctl connection. Offline cancellation stops the caller's wait and is
+the active ctl connection. The completed owner response is also checked for
+cancellation after JSON decoding, validation and saved-view projection. Offline cancellation stops the caller's wait and is
 checked between file reads. A blocked file syscall retains its execution slot
 and shared lock until it returns; there are at most eight offline executions
 per process, including canceled ones. Waiting for a slot also honors the query

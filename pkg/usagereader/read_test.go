@@ -278,6 +278,42 @@ func TestOwnerCursorValidationDoesNotFallBack(t *testing.T) {
 	}
 }
 
+func TestOwnerCancellationAfterTransport(t *testing.T) {
+	for _, view := range []string{"current", "saved", "history"} {
+		t.Run(view, func(t *testing.T) {
+			options, record, _ := savedFixture(t)
+			options.Saved, options.History = view == "saved", view == "history"
+			// A bounded but large legal JSON page exercises the second decode,
+			// beyond ReadUsage's completed connection/deadline checks.
+			record.Snapshot.Counters[0].Source = strings.Repeat("x", 900000)
+			var value any = usage.View{Saved: &record, SavedEnd: 1}
+			if options.History {
+				value = map[string]any{"records": []usage.Record{record}, "next_cursor": "1"}
+			}
+			raw, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			startOwner(t, options.ControlSocket, func(ctl.Request) (ctl.Response, error) {
+				return ctl.Response{SandboxID: options.SandboxID, Usage: raw}, nil
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			response, connected, err := ctl.ReadUsage(ctx, options.ControlSocket, options.History, options.Cursor, options.Limit)
+			if err != nil || !connected {
+				t.Fatal("owner transport", connected, err)
+			}
+			if _, err := decodeOwner(ctx, options, response); err != nil {
+				t.Fatal("valid owner page", err)
+			}
+			cancel() // No transport remains to observe this cancellation.
+			if body, err := decodeOwner(ctx, options, response); len(body) != 0 || !errors.Is(err, context.Canceled) {
+				t.Fatalf("post-transport processing returned canceled data: bytes=%d err=%v", len(body), err)
+			}
+		})
+	}
+}
+
 func TestCanceledOfflineReadsRetainBoundedSlotsAndFileLocks(t *testing.T) {
 	options, _, raw := savedFixture(t)
 	release := make(chan struct{})
