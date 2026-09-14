@@ -37,6 +37,7 @@ Snapshot reuse is represented by explicit parent and child references. Multiple 
 | `pkg/resource` | Node resource-control wire contract and client, consumed by `orchestrator` |
 | `pkg/ctl` | Host-local control-socket protocol and policy callbacks for `ServeExecTunnel`; `ProxyExec` relays an already connected backend |
 | `pkg/usage` | Host-only cumulative resource usage, snapshots, records and offline readers |
+| `pkg/usagereader` | Shared lossless live/saved/history reads for the CLI and local conductor adapters |
 | `pkg/sandbox`, `pkg/restore`, `pkg/snapshot` | Lifecycle, restore, and snapshot orchestration |
 | `pkg/artifact` | Typed publication to a Manifest store or a named-location Bundle |
 | `pkg/uffd`, `pkg/memory` | On-demand memory loading and memfd ownership |

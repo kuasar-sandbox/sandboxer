@@ -20,7 +20,7 @@ if [ -n "${CANDIDATE_REPOSITORY:-}" ]; then
         cd "$source_root"
         echo "==> sandboxer source unit and memory-controller race regressions"
         CGO_ENABLED=0 go test -count=1 ./...
-        CGO_ENABLED=1 go test -race -count=1 ./pkg/resctl
+        CGO_ENABLED=1 go test -race -count=1 ./pkg/resctl ./pkg/ctl ./pkg/usagereader ./pkg/sandbox
         CGO_ENABLED=0 go vet ./...
     )
 fi

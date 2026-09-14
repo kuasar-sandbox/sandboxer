@@ -1,4 +1,4 @@
-package sandbox
+package usagereader
 
 import (
 	"encoding/json"
@@ -9,11 +9,11 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
 )
 
-// marshalUsageHistory retains at most a wire-sized page and one decoded
+// MarshalHistory retains at most a wire-sized page and one decoded
 // bounded record. Encoding a whole []Record with a limited Writer would still
 // let encoding/json allocate the entire oversized page before its first Write.
 // end is the already selected confirmed S, not a later concurrent save.
-func marshalUsageHistory(history func(int64, int) ([]usage.Record, int64, error), end, cursor int64, limit int) (json.RawMessage, error) {
+func MarshalHistory(history func(int64, int) ([]usage.Record, int64, error), end, cursor int64, limit int) (json.RawMessage, error) {
 	if cursor < 0 || cursor > end || limit < 1 || limit > 100 {
 		return nil, errors.New("usage: invalid history range")
 	}

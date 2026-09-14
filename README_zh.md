@@ -37,6 +37,7 @@ Snapshot 复用由显式 parent/child 引用表示。从同一 template 创建�
 | `pkg/resource` | 节点资源控制 wire contract 与 client,由 `orchestrator` 使用 |
 | `pkg/ctl` | Host-local control socket 协议和 `ServeExecTunnel` policy callback;`ProxyExec` 仅 relay 已连接 backend |
 | `pkg/usage` | Host-only 累计资源用量、Snapshot、Record 及离线读取 |
+| `pkg/usagereader` | CLI 与本机 conductor adapter 共用的无损 live/saved/history 读取 |
 | `pkg/sandbox`、`pkg/restore`、`pkg/snapshot` | 生命周期、restore 和 snapshot 编排 |
 | `pkg/artifact` | 向 Manifest store 或 named-location Bundle 进行 typed publication |
 | `pkg/uffd`、`pkg/memory` | 按需 memory 加载与 memfd 所有权 |
