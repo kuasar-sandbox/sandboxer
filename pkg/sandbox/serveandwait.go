@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
+	"github.com/kuasar-sandbox/sandboxer/pkg/usagereader"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
 )
@@ -507,7 +509,11 @@ func ServeAndWait(p VMParams) (int, error) {
 	}
 	chExited := make(chan struct{})
 	var chExitedOnce sync.Once
-	markCHExited := func() { chExitedOnce.Do(func() { close(chExited) }) }
+	var chExitObserved atomic.Bool
+	markCHExited := func() {
+		chExitObserved.Store(true)
+		chExitedOnce.Do(func() { close(chExited) })
+	}
 	defer markCHExited()
 	var chProcessMu sync.RWMutex
 	var chProcess *os.Process
@@ -550,6 +556,14 @@ func ServeAndWait(p VMParams) (int, error) {
 	ctlSrv := &ctl.Server{
 		Path: ctlSockPath,
 		Logf: logf,
+		ResourceStatsHandler: func(_ ctl.Request) (ctl.Response, error) {
+			stats, err := readCurrentResourceStats(p.SandboxID, p.SnapCfg, cgroupPath, func() bool {
+				chProcessMu.RLock()
+				defer chProcessMu.RUnlock()
+				return chProcess != nil && !chExitObserved.Load()
+			})
+			return ctl.Response{ResourceStats: &stats}, err
+		},
 		UsageHandler: func(req ctl.Request) (ctl.Response, error) {
 			view := usage.View{Enabled: p.SnapCfg != nil && p.SnapCfg.Usage.Enabled, ReadError: usageError}
 			if usageManager != nil {
@@ -562,11 +576,11 @@ func ServeAndWait(p VMParams) (int, error) {
 				if usageManager == nil {
 					return ctl.Response{}, errors.New("usage history unavailable; read the saved file offline")
 				}
-				body, err := marshalUsageHistory(usageManager.History, view.SavedEnd, req.UsageCursor, req.UsageLimit)
-				return ctl.Response{Usage: body}, err
+				body, err := usagereader.MarshalHistory(p.SandboxID, usageManager.History, view.SavedEnd, req.UsageCursor, req.UsageLimit)
+				return ctl.Response{SandboxID: p.SandboxID, Usage: body}, err
 			}
 			body, err := json.Marshal(view)
-			return ctl.Response{Usage: body}, err
+			return ctl.Response{SandboxID: p.SandboxID, Usage: body}, err
 		},
 		SnapshotHandler: func(req ctl.Request) (ctl.Response, error) {
 			return snapHandler.handle(req, cgroupPath, chExited)
@@ -720,14 +734,16 @@ func ServeAndWait(p VMParams) (int, error) {
 	// failed restore setup. WNOWAIT keeps native process counters readable.
 	doneCh := make(chan error, 1)
 	go func() {
-		if usageSampler != nil {
-			var info unix.Siginfo
-			waitIDErr := observeCHExit(func() error {
-				return unix.Waitid(unix.P_PID, chPid, &info, unix.WEXITED|unix.WNOWAIT, nil)
-			}, usageSampler.FinalCH)
-			if waitIDErr != nil {
-				logf("usage final waitid: %v", waitIDErr)
+		var info unix.Siginfo
+		waitIDErr := observeCHExit(func() error {
+			return unix.Waitid(unix.P_PID, chPid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+		}, func() { chExitObserved.Store(true) }, func(ctx context.Context) {
+			if usageSampler != nil {
+				usageSampler.FinalCH(ctx)
 			}
+		})
+		if waitIDErr != nil {
+			logf("CH exit waitid: %v", waitIDErr)
 		}
 		waitErr := cmd.Wait()
 		markCHExited()

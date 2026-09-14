@@ -1,4 +1,4 @@
-package sandbox
+package usagereader
 
 import (
 	"bytes"
@@ -36,7 +36,7 @@ func TestUsageHistoryBudgetStopsBeforeReadingWholePage(t *testing.T) {
 					r.Sequence = uint64(cursor + 1)
 					return []usage.Record{r}, cursor + 1, nil
 				}
-				body, err := marshalUsageHistory(history, 100, 0, limit)
+				body, err := MarshalHistory("test", history, 100, 0, limit)
 				if err == nil || !strings.Contains(err.Error(), "reduce history limit") || body != nil {
 					t.Fatalf("page limit=%d: body=%d err=%v", limit, len(body), err)
 				}
@@ -58,12 +58,12 @@ func TestUsageHistoryWireShapeAndSelectedSavedPrefix(t *testing.T) {
 			// read one newer committed record together with its predecessor.
 			return []usage.Record{{Sequence: uint64(offset + 1)}}, offset + 1, nil
 		}
-		body, err := marshalUsageHistory(history, 3, cursor, 100)
+		body, err := MarshalHistory("test", history, 3, cursor, 100)
 		if err != nil {
 			t.Fatal(err)
 		}
 		var wire bytes.Buffer
-		if err := ctl.WriteUsageResponse(&wire, ctl.Response{Type: ctl.TypeUsageResponse, Usage: body}); err != nil {
+		if err := ctl.WriteUsageResponse(&wire, ctl.Response{Type: ctl.TypeUsageResponse, SandboxID: "test", Usage: body}); err != nil {
 			t.Fatal(err)
 		}
 		response, err := ctl.ReadUsageResponse(&wire)
@@ -82,7 +82,7 @@ func TestUsageHistoryWireShapeAndSelectedSavedPrefix(t *testing.T) {
 		}
 	}
 	for _, args := range [][3]int64{{-1, 0, 1}, {0, -1, 1}, {0, 1, 1}, {1, 0, 0}, {1, 0, 101}} {
-		_, err := marshalUsageHistory(func(int64, int) ([]usage.Record, int64, error) {
+		_, err := MarshalHistory("test", func(int64, int) ([]usage.Record, int64, error) {
 			t.Fatal("read invalid range")
 			return nil, 0, nil
 		}, args[0], args[1], int(args[2]))
@@ -91,7 +91,71 @@ func TestUsageHistoryWireShapeAndSelectedSavedPrefix(t *testing.T) {
 		}
 	}
 	want := errors.New("bad predecessor")
-	if _, err := marshalUsageHistory(func(int64, int) ([]usage.Record, int64, error) { return nil, 3, want }, 3, 3, 1); !errors.Is(err, want) {
+	if _, err := MarshalHistory("test", func(int64, int) ([]usage.Record, int64, error) { return nil, 3, want }, 3, 3, 1); !errors.Is(err, want) {
 		t.Fatalf("terminal cursor validation hidden: %v", err)
+	}
+}
+
+func TestUsageHistoryBudgetsEscapedOwnerAtWireLimit(t *testing.T) {
+	for _, owner := range []string{"test", `owner<&\"` + strings.Repeat("x", 120)} {
+		for _, extra := range []int{0, 1} {
+			t.Run(fmt.Sprintf("owner%d/extra%d", len(owner), extra), func(t *testing.T) {
+				records := make([]usage.Record, 20)
+				for i := range records {
+					records[i] = usage.Record{Sequence: uint64(i + 1), Snapshot: usage.Snapshot{SandboxID: owner, RunEpoch: "epoch", SampleInterval: 1, FlushInterval: 1}}
+					for j := range 192 {
+						records[i].Snapshot.Counters = append(records[i].Snapshot.Counters, usage.Counter{Name: fmt.Sprintf("counter%d", j)})
+					}
+				}
+				read := func(cursor int64, _ int) ([]usage.Record, int64, error) {
+					return records[cursor : cursor+1], cursor + 1, nil
+				}
+				body, err := MarshalHistory(owner, read, 20, 0, 20)
+				if err != nil {
+					t.Fatal(err)
+				}
+				encoded, err := json.Marshal(ctl.Response{Type: ctl.TypeUsageResponse, SandboxID: owner, Usage: body})
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Pad legal individual records to make the real wire response
+				// exactly fit, or exceed the limit by one byte.
+				padding := ctl.MaxUsageResponseBytes - len(encoded) + extra
+				for i := range records {
+					for j := range records[i].Snapshot.Counters {
+						n := min(padding, 256)
+						records[i].Snapshot.Counters[j].Source = strings.Repeat("x", n)
+						padding -= n
+					}
+					if _, err := usage.EncodeRecord(records[i]); err != nil {
+						t.Fatal("invalid boundary record", err)
+					}
+				}
+				if padding != 0 {
+					t.Fatal("insufficient fixture padding", padding)
+				}
+				body, err = MarshalHistory(owner, read, 20, 0, 20)
+				if extra != 0 {
+					if body != nil || err == nil || !strings.Contains(err.Error(), "reduce history limit") {
+						t.Fatal("oversized owner envelope accepted", len(body), err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				var wire bytes.Buffer
+				if err := ctl.WriteUsageResponse(&wire, ctl.Response{Type: ctl.TypeUsageResponse, SandboxID: owner, Usage: body}); err != nil {
+					t.Fatal(err)
+				}
+				if wire.Len() != ctl.MaxUsageResponseBytes+4 {
+					t.Fatal("fixture did not reach exact wire boundary", wire.Len())
+				}
+				response, err := ctl.ReadUsageResponse(&wire)
+				if err != nil || response.Type != ctl.TypeUsageResponse || response.SandboxID != owner {
+					t.Fatal("accepted page was replaced by an error", response.Type, err)
+				}
+			})
+		}
 	}
 }

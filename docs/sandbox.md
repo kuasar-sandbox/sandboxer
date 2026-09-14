@@ -522,7 +522,10 @@ snapshot_request -> snapshot_done | error
 export_request   -> export_done   | error
 exec_request     -> exec_ack      | error
 usage_request    -> usage_response | error
+resource_stats_request -> resource_stats_response | error
 ```
+
+The sole reaper ends live resource observations as soon as `waitid(WEXITED|WNOWAIT)` confirms VMM exit, before the existing final usage sample and `cmd.Wait`. The same exit notification applies when usage is disabled, without adding samples or changing stop/save behavior. During exit, only effective specification fields remain; an exited VMM receives no fresh host observation timestamp.
 
 Export is not `snapshot_request{memory:false}`. Requests execute in the run process, reusing its lifecycle barrier, guest/MUX gate, CH API socket, and live vhost SnapshotView.
 
@@ -530,6 +533,44 @@ Usage reads the owner's existing `usage.Snapshot`/`usage.Record` or confirmed
 file history. It has no sampling/save side effect and does not acquire the
 capture or CH mutation barrier. Only its response has a separate 1 MiB JSON
 bound; ordinary ctl framing and limits remain unchanged.
+
+The reader rejects missing or invalid required specifications: CPU capacity and allocatable must be positive, allocatable cannot exceed capacity, and memory capacity/headroom must be positive with headroom no greater than capacity. These checks do not reject a valid zero host counter.
+
+`resource_stats_request` is a separate narrow read. The shared cold/from/restore
+runtime returns its effective capacity CPU, allocatable CPU, capacity memory
+and allocatable memory headroom. These are the values used to configure that
+run, including host overrides. Allocatable CPU selects relative `cpu.weight`,
+not a fractional-core quota or unconditional performance guarantee. Headroom
+is `resources.allocatable.memory`, not the current Budget, Guest free memory
+or the node reservation. The node controller remains the authority for the
+reservation; it is not guessed in this response.
+
+For a live VMM with a configured cgroup, the same pinned cgroup descriptor is
+used for `memory.current` and `cpu.stat.usage_usec`. The response's
+`memory_used` and `cpu_usage_usec` retain unsigned integers as decimal strings;
+the conductor HTTP adapter expresses CPU in seconds. The read excludes the
+host ctl process and does not add Guest CPU, subtract inactive file/balloon
+memory, or clip VMM memory to Guest capacity. CPU is the current source's
+cumulative value and may reset when that source is recreated. Lifecycle
+cumulative accounting remains native usage.
+
+The response includes `sandbox_id` for exact identity verification by
+[`ctl.ReadResourceStats`](../pkg/ctl/resource_stats.go). Each host counter is
+independently optional: missing is omitted, valid zero is present. The ctl reader
+requires a timestamp exactly when at least one host counter is present.
+An actual host read supplies `timestamp_unix`; specification-only reads, no cgroup and
+no live VMM do not invent a host observation or timestamp. Malformed or
+unreadable configured counters fail explicitly. A present `cpu.stat` without
+`usage_usec` is malformed, including an empty file; it is not a missing counter.
+No sampler, history, Guest
+request, CH resize or controller mutation is involved. Static and dynamic
+control modes use this same read path, with usage and telemetry independently
+disabled. The existing ctl connection context/deadline bounds client waiting.
+
+The real memory-budget E2E compares repeated ctl reads with the frozen VMM's
+actual cgroup files, checks that the ctl process is outside that cgroup, and
+verifies usage remains off and the reads do not modify resource controls.
+Freezing belongs only to the test; the production reader does not freeze VMs.
 
 Responses do not echo secret values. Remote Manifest uploads may take a long time. For local snapshot/live export, CLI `--timeout=0` leaves the ctl connection without a deadline; a positive value bounds that client's wait. Neither value sets a server-side deadline field in the wire request. Server lifecycle contexts still govern cancellable I/O, and callers must not interpret a timed-out CLI as proof that no artifact was committed. Image-to-Sandbox-E assembly instead applies a positive timeout to its own operation context (§2.4).
 

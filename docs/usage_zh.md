@@ -34,13 +34,13 @@ sandbox-ctl usage --sandbox-id s1 --history --limit 10 --cursor 0
 
 输出是无损 JSON, `--json` 默认 true. `--run-root` 默认 `/run/sandbox`,
 `--base-root` 默认 `/var/lib/sandbox`, `--path-id` 默认 SandboxID.
-`--timeout` 限制在线查询, 默认 5 s 且必须为正. ctl socket 不存在或拒绝连接时
+`--timeout` 限制查询, 包括离线 recovery/history, 默认 5 s 且必须为正. ctl socket 不存在或拒绝连接时
 允许离线回退, 其他连接/协议错误明确失败. `--file` 隐含 `--offline`, 可以从
 去掉 `.usage` 后缀的文件名推导 SandboxID.
 
 `--saved` 省略 `live`. 历史查询采用非负字节 cursor 和 1–100 条记录的 limit,
 默认 10. Host usage response 上限 1 MiB, 一页放不下时须减小 limit.
-在线读取器每次只解码、编码一条有界记录, 在保留或编码完整请求记录集合前
+在线和离线读取器每次只解码、编码一条有界记录, 在保留或编码完整请求记录集合前
 拒绝超出 JSON 预算的页, 并计入字符串转义膨胀. 历史不返回活动尾部.
 普通 ctl 请求的 framing 和大小上限不变.
 
@@ -60,6 +60,31 @@ Live 状态可在逐项指标归并之间复制, 不是整轮观测的原子发�
 在线查询只复制已有状态或读取已确认历史, 不触发 Guest/CH 采集、累计推进或
 flush. 离线 reader 获取非阻塞共享文件锁, 拒绝与活动 writer 并行读取; 此时应
 查询该 writer 的 ctl socket. 关闭 usage 不删除已有文件, 仍可离线读取.
+
+CLI 使用 [pkg/usagereader.Read](../pkg/usagereader/read.go), 这是 CLI 和本机
+conductor adapter 的公共读取入口. 调用方沿既有生命周期权威定位当前对象的
+control socket 和保存文件路径, 再传入精确 SandboxID、context、snapshot/saved/history
+选择、cursor 和 limit. Reader 复用既有 `Recover`、`ReadHistory` 和文件锁;
+[MarshalHistory](../pkg/usagereader/history.go) 与在线 owner 共用同一个有界分页编码器.
+不增加第二套 codec、恢复算法、累计器或持久状态. Native JSON 保持无损, 不经过
+浮点中间值; live、saved 或 history 数据中的 SandboxID 不匹配时拒绝.
+ctl response envelope 始终携带 owner 的 `sandbox_id`, 即使 usage 关闭、
+live/saved 为空或历史为空, 也必须核对身份. 该字段不改变 native View/Record 或文件格式.
+空历史返回 `records: []` 及已校验的 next cursor. 在线分页必须显式返回不回退的
+cursor: 非空页推进 cursor, 空页保持 cursor, 记录数不得超过请求 limit.
+saved view 必须在且仅在存在 saved record 时携带正数 `saved_end`.
+非法 owner response 不允许回退离线读取. 离线 open 使用非阻塞标志,
+先拒绝 FIFO 等非 regular file, 不会为等待 FIFO writer 而绕过 timeout.
+
+只有 socket 不存在或拒绝连接时允许回退. 一旦已连接 owner, EOF、非法 response、
+owner 错误、取消或超时都使查询失败, 不能被可读的保存文件替代. 取消会关闭当前
+ctl connection. Owner response 完成 JSON 解码、验证和 saved view 投影后,
+也会检查取消. 离线取消会停止调用方等待, 并在文件读取之间检查取消.
+阻塞的文件系统调用继续持有执行槽和共享锁, 直到实际返回; 每进程最多有 8 个
+离线执行, 包括调用方已取消的执行. 等待执行槽同样遵守查询 deadline.
+这不会使文件系统调用变成可中断操作, 也不改变 native saving.
+Telemetry 通过 conductor 消费原生 stats,
+不直接调用此 ctl/file reader.
 
 ## 3. 配置
 

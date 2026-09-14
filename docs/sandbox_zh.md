@@ -536,13 +536,46 @@ snapshot_request -> snapshot_done | error
 export_request   -> export_done   | error
 exec_request     -> exec_ack      | error
 usage_request    -> usage_response | error
+resource_stats_request -> resource_stats_response | error
 ```
+
+唯一 reaper 在 `waitid(WEXITED|WNOWAIT)` 确认 VMM 退出后立即撤销 resource 的 live 观测,然后按既有顺序执行 usage 最后采样与 `cmd.Wait`. usage 关闭时也使用同一退出通知;不增加采样或改变停止/保存语义. 退出期间仅保留有效规格字段,不为已退出 VMM 返回新的宿主观测时间.
 
 Export不是 `snapshot_request{memory:false}`. Request在 run process中执行,因此可以复用当前 lifecycle barrier、guest/MUX gate、CH API socket和live vhost SnapshotView.
 
 Usage 只读取 owner 已有 `usage.Snapshot`/`usage.Record` 或已确认文件历史,
 不采样、不保存、不获取 capture/CH mutation barrier. 只有其 response 采用
 独立的 1 MiB JSON 上限, 普通 ctl framing 和上限不变.
+
+Reader 拒绝缺失或无效的必填规格: CPU capacity 和 allocatable 必须为正,allocatable 不得超过 capacity;memory capacity/headroom 必须为正,headroom 不得超过 capacity. 这些校验不会拒绝合法的宿主零计数.
+
+`resource_stats_request` 是独立的窄只读请求. cold/from/restore 共用的 runtime
+返回本次运行最终生效的 capacity CPU、allocatable CPU、capacity memory 和
+allocatable memory headroom, 包括 host override. Allocatable CPU 对应相对
+调度规格 `cpu.weight`, 不是 fractional-core quota 或无条件性能保证.
+Headroom 是 `resources.allocatable.memory`, 不是当前 Budget、Guest free
+或节点 reservation. Reservation 仍以节点 controller 为权威, 本响应不猜测它.
+
+有 live VMM 且已配置 cgroup 时, `memory.current` 和 `cpu.stat.usage_usec`
+使用同一个已固定的 cgroup descriptor. 响应的 `memory_used`、`cpu_usage_usec`
+以十进制字符串无损保留无符号整数, conductor HTTP adapter 将 CPU 表达为秒.
+读取不纳入宿主 ctl 进程, 不重复加 Guest CPU, 不扣除 inactive file/balloon,
+不把 VMM memory 截断到 Guest capacity. CPU 是当前统计来源的累计值,
+来源重建可以重置; 生命周期累计仍由 native usage 负责.
+
+响应携带 `sandbox_id`, 供 [ctl.ReadResourceStats](../pkg/ctl/resource_stats.go)
+核对精确身份. 两个宿主 counter 分别保留有效性: 缺测省略, 合法零值保留.
+时间戳必须与至少一个宿主 counter 一同存在; ctl reader 拒绝其他组合.
+实际宿主读取提供 `timestamp_unix`; 只有规格、无 cgroup 或无 live VMM 时,
+不伪造宿主观测和时间戳. 已配置 counter 无法读取或格式非法时明确失败.
+存在但缺少 `usage_usec` 的 `cpu.stat` 属于格式非法, 包括空文件, 不作为缺测处理.
+此读取没有 sampler、历史、Guest 请求、CH resize 或 controller mutation.
+Static/dynamic control 共用同一读取路径, usage 和 telemetry 可以独立关闭.
+既有 ctl connection context/deadline 限制客户端等待.
+
+真实 memory-budget E2E 将重复 ctl 读取与已冻结 VMM 的实际 cgroup 文件对照,
+检查 ctl 进程位于该 cgroup 之外, 并验证 usage 保持关闭、读取不修改资源控制.
+冻结仅属于测试操作, 生产 reader 不冻结 VM.
 
 Response 中不回显 secret。Remote Manifest upload 可以耗时较长。Local snapshot/live export 的 CLI `--timeout=0` 不给 ctl connection 设置 deadline；正数只限制该客户端的等待。两者都不是 wire request 中的服务端 deadline 字段。服务端 lifecycle context 仍控制支持取消的 I/O，CLI 超时不能证明没有 artifact 被 commit。Image-to-Sandbox-E assembly 则将正数 timeout 应用于自己的 operation context（§2.4）。
 

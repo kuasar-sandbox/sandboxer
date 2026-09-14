@@ -490,6 +490,10 @@ record_case() { # $1=label $2=headroom-yaml $3=startup-yaml $4=also-b $5=headroo
     wait_anon_ready "$sid" "$pid" "$log"
     wait_memory_budget "$sid" "$pid" "$log" "$headroom_bytes"
 
+    python3 "$SCRIPT_DIR/lib/resource_stats.py" "$RUN_ROOT/$sid/ctl.sock" \
+        "$cgroup" "$sid" "$pid" "$headroom_bytes" > "$WORK/$label-resource-stats.json"
+    echo "==> PASS: native resource stats use the frozen VMM cgroup; usage off; no control writes"
+
     guest_exec "$sid" -- python3 -c "$WRITER_PROBE" "$warm_path" "$WARM_BYTES"
     guest_exec "$sid" -- /bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
     guest_exec "$sid" -- sha256sum "$warm_path" >"$WORK/$label-sha.out"

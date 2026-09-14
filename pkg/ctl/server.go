@@ -19,9 +19,10 @@ type Server struct {
 
 	// SnapshotHandler services a snapshot_request: it returns the
 	// response and the server writes it back, then closes the conn.
-	SnapshotHandler func(req Request) (Response, error)
-	ExportHandler   func(req Request) (Response, error)
-	UsageHandler    func(req Request) (Response, error)
+	SnapshotHandler      func(req Request) (Response, error)
+	ExportHandler        func(req Request) (Response, error)
+	UsageHandler         func(req Request) (Response, error)
+	ResourceStatsHandler func(req Request) (Response, error)
 
 	// ExecHandler services an exec_request. It takes ownership of conn
 	// (including its lifetime): it writes the ctl exec_ack / error
@@ -102,6 +103,22 @@ func (s *Server) handle(conn *net.UnixConn) {
 	}
 
 	switch req.Type {
+	case TypeResourceStatsRequest:
+		defer conn.Close()
+		if s.ResourceStatsHandler == nil {
+			_ = WriteMessage(conn, Response{Type: TypeError, Msg: "resource stats unavailable"})
+			return
+		}
+		resp, err := s.ResourceStatsHandler(req)
+		if err != nil {
+			_ = WriteMessage(conn, Response{Type: TypeError, Msg: err.Error()})
+			return
+		}
+		resp.Type = TypeResourceStatsResponse
+		if err := WriteMessage(conn, resp); err != nil {
+			s.Logf("ctl.sock resource stats response: %v", err)
+		}
+		return
 	case TypeUsageRequest:
 		defer conn.Close()
 		if s.UsageHandler == nil {
