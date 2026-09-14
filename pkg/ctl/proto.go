@@ -8,7 +8,7 @@
 // ctl.sock is a host-local UDS carrying host-side request types, not a
 // guest channel.
 //
-// Four request shapes:
+// Request shapes:
 //
 //   - snapshot_request — one request, one response, conn closes. The
 //     run process handles it via Server.SnapshotHandler.
@@ -20,6 +20,8 @@
 //     process pipes bytes through transparently after the ack.
 //   - usage_request — read existing live/saved/history state, one response;
 //     never triggers observations or persistence.
+//   - resource_stats_request — read the effective resource specification and
+//     live host VMM cgroup counters, without guest or controller operations.
 package ctl
 
 import (
@@ -62,8 +64,9 @@ type Request struct {
 
 // Response is the run-process reply.
 type Response struct {
-	Usage json.RawMessage `json:"usage,omitempty"`
-	Type  string          `json:"type"`
+	ResourceStats *ResourceStats  `json:"resource_stats,omitempty"`
+	Usage         json.RawMessage `json:"usage,omitempty"`
+	Type          string          `json:"type"`
 
 	// snapshot_done fields.
 	MemorySize          uint64                 `json:"memory_size,omitempty"`
@@ -121,15 +124,17 @@ func (r Request) SnapshotMode() (string, error) {
 }
 
 const (
-	TypeSnapshotRequest = "snapshot_request"
-	TypeSnapshotDone    = "snapshot_done"
-	TypeExportRequest   = "export_request"
-	TypeExportDone      = "export_done"
-	TypeExecRequest     = "exec_request"
-	TypeExecAck         = "exec_ack"
-	TypeError           = "error"
-	TypeUsageRequest    = "usage_request"
-	TypeUsageResponse   = "usage_response"
+	TypeSnapshotRequest       = "snapshot_request"
+	TypeSnapshotDone          = "snapshot_done"
+	TypeExportRequest         = "export_request"
+	TypeExportDone            = "export_done"
+	TypeExecRequest           = "exec_request"
+	TypeExecAck               = "exec_ack"
+	TypeError                 = "error"
+	TypeUsageRequest          = "usage_request"
+	TypeUsageResponse         = "usage_response"
+	TypeResourceStatsRequest  = "resource_stats_request"
+	TypeResourceStatsResponse = "resource_stats_response"
 )
 
 // MaxMessageBytes caps any single message on ctl.sock.

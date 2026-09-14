@@ -7,17 +7,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
-	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
-	"golang.org/x/sys/unix"
+	"github.com/kuasar-sandbox/sandboxer/pkg/usagereader"
 )
 
 func usageCmd(args []string) int {
@@ -64,79 +60,18 @@ func runUsage(args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	var value any
-	if !*offline {
-		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-		defer cancel()
-		conn, dialErr := (&net.Dialer{}).DialContext(ctx, "unix", filepath.Join(*runRoot, leaf, "ctl.sock"))
-		if dialErr == nil {
-			defer conn.Close()
-			end, _ := ctx.Deadline()
-			if err := conn.SetDeadline(end); err != nil {
-				return err
-			}
-			if err := ctl.WriteMessage(conn, ctl.Request{Type: ctl.TypeUsageRequest, UsageHistory: *history, UsageCursor: *cursor, UsageLimit: *limit}); err != nil {
-				return err
-			}
-			response, err := ctl.ReadUsageResponse(conn)
-			if err != nil {
-				return err
-			}
-			if response.Type == ctl.TypeError {
-				return errors.New(response.Msg)
-			}
-			if *saved && !*history {
-				var view usage.View
-				if err := json.Unmarshal(response.Usage, &view); err != nil {
-					return err
-				}
-				view.Live = nil
-				value = view
-			} else {
-				value = response.Usage
-			}
-		} else if !errors.Is(dialErr, syscall.ENOENT) && !errors.Is(dialErr, syscall.ECONNREFUSED) {
-			return dialErr
-		}
+	path := *file
+	if path == "" {
+		path = filepath.Join(sandbox.DefaultBaseDir(*baseRoot, leaf), *sid+".usage")
 	}
-	if value == nil {
-		path := *file
-		if path == "" {
-			path = filepath.Join(sandbox.DefaultBaseDir(*baseRoot, leaf), *sid+".usage")
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		// A readable CRC cannot certify that a running writer has accepted
-		// its append; it may still roll F back. Query its ctl.sock S instead.
-		if err := unix.Flock(int(f.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
-			return fmt.Errorf("usage file has a live writer; query ctl.sock: %w", err)
-		}
-		stat, err := f.Stat()
-		if err != nil {
-			return err
-		}
-		if !stat.Mode().IsRegular() {
-			return errors.New("usage file is not regular")
-		}
-		recovered, err := usage.Recover(f, stat.Size(), *sid)
-		if err != nil {
-			return err
-		}
-		if *history {
-			records, next, err := usage.ReadHistory(f, recovered.End, *cursor, *limit, *sid)
-			if err != nil {
-				return err
-			}
-			value = struct {
-				Records []usage.Record `json:"records"`
-				Next    int64          `json:"next_cursor,string"`
-			}{records, next}
-		} else {
-			value = usage.View{Saved: recovered.Record, SavedEnd: recovered.End, UnknownTail: recovered.IncompleteTail}
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	value, err := usagereader.Read(ctx, usagereader.Options{
+		SandboxID: *sid, ControlSocket: filepath.Join(*runRoot, leaf, "ctl.sock"), File: path,
+		Offline: *offline, Saved: *saved, History: *history, Cursor: *cursor, Limit: *limit,
+	})
+	if err != nil {
+		return err
 	}
 	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "  ")

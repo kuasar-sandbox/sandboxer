@@ -33,6 +33,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
+	"github.com/kuasar-sandbox/sandboxer/pkg/usagereader"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
 )
@@ -550,6 +551,25 @@ func ServeAndWait(p VMParams) (int, error) {
 	ctlSrv := &ctl.Server{
 		Path: ctlSockPath,
 		Logf: logf,
+		ResourceStatsHandler: func(_ ctl.Request) (ctl.Response, error) {
+			chProcessMu.RLock()
+			live := chProcess != nil
+			chProcessMu.RUnlock()
+			select {
+			case <-chExited:
+				live = false
+			default:
+			}
+			stats, err := readResourceStats(p.SandboxID, p.SnapCfg, cgroupPath, live)
+			// Exit during the read cannot become a fresh host observation for a
+			// sandbox that no longer has a live VMM.
+			select {
+			case <-chExited:
+				stats.MemoryUsed, stats.CPUUsageUsec, stats.TimestampUnix = nil, nil, nil
+			default:
+			}
+			return ctl.Response{ResourceStats: &stats}, err
+		},
 		UsageHandler: func(req ctl.Request) (ctl.Response, error) {
 			view := usage.View{Enabled: p.SnapCfg != nil && p.SnapCfg.Usage.Enabled, ReadError: usageError}
 			if usageManager != nil {
@@ -562,7 +582,7 @@ func ServeAndWait(p VMParams) (int, error) {
 				if usageManager == nil {
 					return ctl.Response{}, errors.New("usage history unavailable; read the saved file offline")
 				}
-				body, err := marshalUsageHistory(usageManager.History, view.SavedEnd, req.UsageCursor, req.UsageLimit)
+				body, err := usagereader.MarshalHistory(usageManager.History, view.SavedEnd, req.UsageCursor, req.UsageLimit)
 				return ctl.Response{Usage: body}, err
 			}
 			body, err := json.Marshal(view)

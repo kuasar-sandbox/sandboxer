@@ -1,4 +1,4 @@
-package sandbox
+package usagereader
 
 import (
 	"bytes"
@@ -36,7 +36,7 @@ func TestUsageHistoryBudgetStopsBeforeReadingWholePage(t *testing.T) {
 					r.Sequence = uint64(cursor + 1)
 					return []usage.Record{r}, cursor + 1, nil
 				}
-				body, err := marshalUsageHistory(history, 100, 0, limit)
+				body, err := MarshalHistory(history, 100, 0, limit)
 				if err == nil || !strings.Contains(err.Error(), "reduce history limit") || body != nil {
 					t.Fatalf("page limit=%d: body=%d err=%v", limit, len(body), err)
 				}
@@ -58,7 +58,7 @@ func TestUsageHistoryWireShapeAndSelectedSavedPrefix(t *testing.T) {
 			// read one newer committed record together with its predecessor.
 			return []usage.Record{{Sequence: uint64(offset + 1)}}, offset + 1, nil
 		}
-		body, err := marshalUsageHistory(history, 3, cursor, 100)
+		body, err := MarshalHistory(history, 3, cursor, 100)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -82,7 +82,7 @@ func TestUsageHistoryWireShapeAndSelectedSavedPrefix(t *testing.T) {
 		}
 	}
 	for _, args := range [][3]int64{{-1, 0, 1}, {0, -1, 1}, {0, 1, 1}, {1, 0, 0}, {1, 0, 101}} {
-		_, err := marshalUsageHistory(func(int64, int) ([]usage.Record, int64, error) {
+		_, err := MarshalHistory(func(int64, int) ([]usage.Record, int64, error) {
 			t.Fatal("read invalid range")
 			return nil, 0, nil
 		}, args[0], args[1], int(args[2]))
@@ -91,7 +91,7 @@ func TestUsageHistoryWireShapeAndSelectedSavedPrefix(t *testing.T) {
 		}
 	}
 	want := errors.New("bad predecessor")
-	if _, err := marshalUsageHistory(func(int64, int) ([]usage.Record, int64, error) { return nil, 3, want }, 3, 3, 1); !errors.Is(err, want) {
+	if _, err := MarshalHistory(func(int64, int) ([]usage.Record, int64, error) { return nil, 3, want }, 3, 3, 1); !errors.Is(err, want) {
 		t.Fatalf("terminal cursor validation hidden: %v", err)
 	}
 }

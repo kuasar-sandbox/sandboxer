@@ -37,14 +37,14 @@ sandbox-ctl usage --sandbox-id s1 --history --limit 10 --cursor 0
 
 Output is lossless JSON. `--json` defaults to true. `--run-root` defaults to
 `/run/sandbox`; `--base-root` defaults to `/var/lib/sandbox`. `--path-id`
-defaults to SandboxID. `--timeout` bounds an online query (default 5 s,
+defaults to SandboxID. `--timeout` bounds a query, including offline recovery/history (default 5 s,
 strictly positive). A nonexistent/refused ctl socket permits offline fallback;
 other connection/protocol failures are errors. `--file` implies `--offline`
 and can infer SandboxID from the filename without `.usage`.
 
 `--saved` omits `live`. History uses a nonnegative byte cursor and a record
 limit of 1–100, default 10. The host usage response is bounded to 1 MiB; reduce
-the page size if a page cannot fit. The online reader decodes and encodes one
+the page size if a page cannot fit. Both online and offline readers decode and encode one
 bounded record at a time, rejecting an oversized JSON page before retaining
 or encoding the complete requested record set, including string-escaping
 expansion. History does not return the active tail.
@@ -73,6 +73,23 @@ not sample Guest/CH, advance counters, or flush. Offline readers take a
 nonblocking shared file lock and reject an active writer: use its ctl socket
 instead. Disabling usage does not remove an existing file; offline reading
 remains available.
+
+The CLI uses [`pkg/usagereader.Read`](../pkg/usagereader/read.go), the common
+read entry for local conductor adapters. Callers resolve the current object's
+control socket and saved-file path using their existing lifecycle authority,
+then supply the exact SandboxID, context, snapshot/saved/history selection,
+cursor and limit. The reader uses the existing `Recover`, `ReadHistory` and
+file lock; [`MarshalHistory`](../pkg/usagereader/history.go) is the same bounded
+page encoder used by the online owner. It does not add another codec, recovery
+algorithm, accumulator or persistent state. Native JSON is retained without a
+floating-point intermediate; a different SandboxID in live, saved or history
+data is rejected. Empty history has `records: []` and its validated next cursor.
+
+Only failure to connect to an absent/refused socket permits fallback. Once
+connected, EOF, invalid replies, owner errors, cancellation and deadlines fail
+the query; a readable saved file does not replace them. Cancellation closes
+the active ctl connection and is checked between offline reads. Telemetry
+consumes native stats through conductor, never this ctl/file reader directly.
 
 ## 3. Configuration
 
