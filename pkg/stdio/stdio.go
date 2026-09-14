@@ -1,6 +1,5 @@
 // Package stdio resolves `sandbox-ctl run`'s stdio model and bridges it
-// to the guest. Two concerns (docs/sandbox.md §2.2, docs/sandbox-runtime
-// .md §3.5 / §4.5):
+// to the guest. Two concerns (docs/sandbox.md §2.2, docs/sandbox-init.md §3.5 / §4.5):
 //
 //  1. The application's stdin/stdout/stderr — or a single pty in tty
 //     mode — travel over the vsock stdio MUX (pkg/mux). The host

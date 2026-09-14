@@ -58,7 +58,7 @@
 
 - 仓库相对 patch 路径:`native-deps/deps/ch-patches/000{1,2,3,4,5,6,7}-*.patch`
 - 在 `sandboxer/native-deps` 中执行 `make ch-patches-apply`(全新 `make cloud-hypervisor` 构建也会执行);
-  开发循环与幂等 sanity 语义见 `sandboxer/native-deps/README.md` §3
+  开发循环与幂等 sanity 语义见 [Native 构建 §3](../native-deps/README_zh.md#3-patch-开发循环)
 - 每次计划升级 upstream 时复核补丁,依据实际上游变化解决冲突;不假定固定发布周期或固定 rebase 工作量
 - 外部 RAM/UFFD patch 的设计选择(SCM_RIGHTS in-process +
   `create_ram_region` 里跑 ioctl)与 upstream 风格偏差明显,本项目维持自有
@@ -400,7 +400,7 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 平台**不**使用 `free_page_reporting`。在统一 memfd / 外部 uffd 模型下,持续
 `madvise(MADV_DONTNEED)` 可能产生 mmu_notifier/EPT 与 IPI shootdown 压力,
 影响 guest vsock 进展(机理与替代反馈环见
-`guest-runtime/docs/vmlinux.md` §5.5)。改由 sandbox-local BalloonController
+[Guest Kernel §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux_zh.md#55-为什么不启用-free_page_reporting以及-virtio_mem-的角色))。改由 sandbox-local BalloonController
 经 `/vm.resize` 推 inflate target;steady shrink 每份 fresh report 最多一个
 64MiB step。冷启动命令行 target
 覆盖的稀疏区间由 patch 0004(§3.4)跳过,不产生 `madvise` 广播与
@@ -427,8 +427,8 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
   数据流)—— sandbox-ctl 怎么用 patched CH 跑沙箱;命令行示例
 - [sandbox_zh.md](sandbox_zh.md) §8(uffd handler)—— sandbox-ctl 接收到 uffd_C
   之后如何处理 fault 事件
-- `guest-runtime/docs/vmlinux.md` —— guest kernel 如何配合 CH 启动
+- [Guest Kernel](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux_zh.md) —— guest kernel 如何配合 CH 启动
   协议(PVH / EFI stub)
-- `sandboxer/native-deps/README.md` —— `make cloud-hypervisor` 工作流与 patch
+- [Native 构建](../native-deps/README_zh.md) —— `make cloud-hypervisor` 工作流与 patch
   开发循环
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §2.4 —— VMM 与 Guest 环境在系统中的位置
+- [系统总览 §3.2](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md#32-组件职责) —— VMM 与 Guest 环境在系统中的位置

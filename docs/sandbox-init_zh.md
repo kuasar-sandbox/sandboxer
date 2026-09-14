@@ -64,8 +64,6 @@
   那条 MUX 任一时刻至多一条(launch 生,restore/attach 续);exec 每次会话另起一条
   独立、短生命的 MUX,可并发多条(§3.6)
 
-<a id="2-sandbox-runtimebundle-镜像结构"></a>
-
 ## 2. Runtime 镜像消费前提
 
 完整的 sandbox-runtime.bundle 包装、文件清单、版本和构建规则由 [Runtime Bundle](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime_zh.md)维护。此处只定义 PID 1 必须满足的消费边界：
@@ -75,7 +73,7 @@
 - `/opt/sandbox-runtime/` 是保留的只读 Guest payload 根，phase 1a 将其 bind 到用户 rootfs 同名路径，遮蔽用户镜像已有内容；应用必须遵守应用环境章节的约束。
 - virtio-pmem/DAX 复用相同 backing file 的只读页，不共享各 Guest 私有可写 RAM。init 和 payload 可执行文件都必须匹配目标架构。
 
-Runtime 生产、host/target mkfs 区分和 Native 构建操作见 [Runtime 构建](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime_zh.md#3-构建)及 [Native 指南](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/README_zh.md)。Host–Guest 握手、挂载次序与 ABI 继续由本文完整定义。
+Runtime 生产、host/target mkfs 区分和 Native 构建操作见 [Native 指南](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/README_zh.md)。Host–Guest 握手、挂载次序与 ABI 继续由本文完整定义。
 
 
 ## 3. sandbox-init 三阶段
@@ -687,8 +685,6 @@ Forwarder 在发送 quiesce 前暂停新建,并收拢、等待活跃中继**与 
 `attach`(§4.3)后解除拒绝、重新受理(并 reopen accept listener 缓存)。host 的转发 listener 在同进程 quiesce 中不关闭；独立 restore 进程须用等价 `--connect` 参数重新创建/接管，不能把原进程 listener 视作随工件迁移。
 
 ## 4. vsock 控制面 + console MUX 协议
-
-<a id="41-两类连接"></a>
 
 ### 4.1 连接分类
 

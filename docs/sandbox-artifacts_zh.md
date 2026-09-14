@@ -6,22 +6,21 @@
 
 **阅读顺序**
 
-- [逻辑角色](#11-逻辑角色)
-- [逻辑角色与物理 carrier](#12-逻辑角色与物理-carrier)
-- [PortableSandboxConfig](#32-portablesandboxconfig)
-- [Strict encoding 与 limits](#33-strict-encoding-与-limits)
-- [C0、C1 与 source binding](#34-c0c1-与-source-binding)
-- [`self` 与 disk provenance](#35-self-与-disk-provenance)
-- [`.sandbox` logical format](#36-sandbox-logical-format)
-- [`.snapshot` logical format](#37-snapshot-logical-format)
-- [Provenance、publish 与 carrier](#11-provenancepublish-与-carrier)
-- [Atomicity 与 determinism](#141-atomicity-与-determinism)
-- [Incompatibility](#144-incompatibility)
+- [逻辑角色](#1-逻辑角色)
+- [逻辑角色与物理 carrier](#2-逻辑角色与物理-carrier)
+- [PortableSandboxConfig](#3-portablesandboxconfig)
+- [Strict encoding 与 limits](#4-strict-encoding-与-limits)
+- [C0、C1 与 source binding](#5-c0c1-与-source-binding)
+- [`self` 与 disk provenance](#6-self-与-disk-provenance)
+- [`.sandbox` logical format](#7-sandbox-logical-format)
+- [`.snapshot` logical format](#8-snapshot-logical-format)
+- [Provenance、publish 与 carrier](#9-provenancepublish-与-carrier)
+- [Atomicity 与 determinism](#10-atomicity-与-determinism)
+- [Incompatibility](#11-incompatibility)
 
 
 
 
-<a id="11-逻辑角色"></a>
 ## 1. 逻辑角色
 
 系统区分 4 个逻辑角色:
@@ -56,7 +55,6 @@ memory snapshot          ──> E + S, S is operation root
 
 
 
-<a id="12-逻辑角色与物理-carrier"></a>
 ## 2. 逻辑角色与物理 carrier
 
 逻辑内容与物理 carrier 正交. 同一个 `.image`、`.overlay`、`.sandbox` 或 `.snapshot` logical source 可以由以下 carrier 承载:
@@ -73,7 +71,6 @@ Block backend、restore 和 publisher 先打开 carrier,再按逻辑角色解析
 
 
 
-<a id="32-portablesandboxconfig"></a>
 ## 3. PortableSandboxConfig
 
 唯一 portable 文件名是:
@@ -159,7 +156,6 @@ file://<digest>.overlay@digest:<digest>
 
 
 
-<a id="33-strict-encoding-与-limits"></a>
 ## 4. Strict encoding 与 limits
 
 Portable config 使用 deterministic YAML marshal 和 strict known-fields parse。Artifact reader 拒绝 unknown field、unknown version、duplicate key、YAML alias/merge key、多 document、非法 ref 和 non-canonical bytes。单独 schema parser 可以接受有效但非 canonical 的 YAML；`sandboxfile.Open` 在重新 marshal 后检查字节相等。
@@ -188,7 +184,6 @@ V1 limits:
 
 
 
-<a id="34-c0c1-与-source-binding"></a>
 ## 5. C0、C1 与 source binding
 
 `C0` 是一次 run lifecycle 的 immutable portable baseline:
@@ -222,7 +217,6 @@ Memory restore另持有 `MemorySourceBinding`,其中 Snapshot S identity 与 `fr
 
 
 
-<a id="35-self-与-disk-provenance"></a>
 ## 6. `self` 与 disk provenance
 
 Portable graph 必须恰好出现一次保留值 `self`,且只能位于:
@@ -273,7 +267,6 @@ Local merge 分两类:
 
 
 
-<a id="36-sandbox-logical-format"></a>
 ## 7. `.sandbox` logical format
 
 只接受两种 layout.
@@ -328,7 +321,6 @@ Live BlockCOW SnapshotView 是 upper-only sparse delta,ext4 superblock offset �
 
 
 
-<a id="37-snapshot-logical-format"></a>
 ## 8. `.snapshot` logical format
 
 Snapshot S layout:
@@ -357,10 +349,8 @@ Snapshot ZIP 与 config 同样 strict、bounded、canonical。`config.json` 和 
 
 
 
-<a id="11-provenancepublish-与-carrier"></a>
 ## 9. Provenance、publish 与 carrier
 
-<a id="111-disk-与-memory-provenance"></a>
 ### 9.1 Disk 与 memory provenance
 
 ```text
@@ -379,7 +369,6 @@ freeze前完整校验并物化,避免产生依赖调用节点私有路径的port
 root carrier物化为`.image`;只有需要作为独立dependency保存的root/data writable layer物化为
 `.overlay`. 当前root writable top由Sandbox E payload承载,不生成第二份`.overlay`.
 
-<a id="112-local-tarstream-与-crypto"></a>
 ### 9.2 Local tarstream 与 crypto
 
 Local immutable artifact支持 `crypto.local=off|auto|required`:
@@ -442,7 +431,6 @@ role-specific payload 与 sparse envelope，使用 `@digest`/`@hmac` identity；
 
 Active encrypted `.overlay.diff` 保持KDXTS格式. Export只读取decrypt后的BlockCOW SnapshotView并创建新的immutable logical artifact,绝不把ZIP追加到active diff.
 
-<a id="113-manifest-upload"></a>
 ### 9.3 Manifest upload
 
 已经组装好的 image 或顶层 Sandbox E 可通过
@@ -458,7 +446,6 @@ data/lower -> E -> S
 
 已经portable的Manifest或located dependency保持原ref,不会先materialize再重写. Bundle root走exact-upload快路径:强制验证选择的Manifest closure、recorded admission和physical objects,原样上传Chunk/Manifest,root Manifest最后提交;root key和`snapshot.cfg`不变. 因此Bundle内已有的located selector仍要求consumer配置对应ref-location,不会被暗中改写成Manifest ref. Customer key、chunk/Manifest crypto、content verification和store generation admission沿用manifest config. E是export root,S是snapshot root.
 
-<a id="114-manifest-bundle"></a>
 ### 9.4 Manifest Bundle
 
 Bundle在pause前完成:
@@ -473,7 +460,6 @@ Bundle在pause前完成:
 
 然后writer一次性emit metadata prefix,写入Manifest/Chunk,最后以E或S root key finalize. `FullVerify`使用完整expected Manifest集合. V1不以外层ZIP magic推断E/S.
 
-<a id="115-publish-graph"></a>
 ### 9.5 Publish graph
 
 Local tarstream Publish E:
@@ -499,7 +485,6 @@ Memory parent的historical `sandbox_ref` 不递归;当前S引用的E graph是当
 
 
 
-<a id="141-atomicity-与-determinism"></a>
 ## 10. Atomicity 与 determinism
 
 Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local `FileSink`/`BundleSink`保持same-directory temp、完整写入/`Close()`检查和atomic no-replace rename,final commit是O(1);alias只在root commit后更新. artifact capture/publication只定义logical completion,不定义stable-storage durability;两条本地路径都不执行显式file/directory fsync,物理写回由文件系统或底层存储实现定义. Named ref-location采用独立的exclusive-create + checked-write/copy-once + reopen-full-verify协议;tarstream由carrier直接提供identity,Bundle保持exact bytes,两者都不进入local sink的capture/commit路径.
@@ -508,7 +493,6 @@ Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. L
 
 
 
-<a id="144-incompatibility"></a>
 ## 11. Incompatibility
 
 本切换直接替换旧snapshot provenance. 旧`SnapshotConfig`若包含resource/runtime/root/data/launch字段会返回明确unsupported error. 不提供 old-format alias、dual reader、migration shim、feature flag 或 zero-memory compatibility path。[子命令总览](sandbox_zh.md#21-子命令总览) 的 `upload-snapshot` CLI alias 不提供格式兼容。

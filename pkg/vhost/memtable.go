@@ -17,7 +17,7 @@ import (
 // mmapOffset is the offset into the underlying fd corresponding to GPA 0.
 // mmapBytes is the backend-process slice covering this region, sub-sliced
 // from a caller-supplied memfd-mapped slab (unified-memfd invariant,
-// §12.2). The backend does NOT own the mmap; the slab is provided by
+// docs/cloud-hypervisor.md §3.1). The backend does NOT own the mmap; the slab is provided by
 // pkg/memory.
 type MemRegion struct {
 	GuestPhysAddr uint64
@@ -141,7 +141,7 @@ func ParseSetMemTable(payload []byte, fds []int) ([]MemRegion, error) {
 // same memfd, see pkg/memory.Memfd).
 //
 // Returns an error if any fd's inode differs from expectedInode (the
-// unified-memfd invariant; §12.2) or if a region's [mmap_offset,
+// unified-memfd invariant; docs/cloud-hypervisor.md §3.1) or if a region's [mmap_offset,
 // mmap_offset + memory_size) exceeds the slab.
 //
 // The backend never opens its own mmap — the kernel page cache shares

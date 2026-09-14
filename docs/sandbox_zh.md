@@ -9,14 +9,11 @@
 ## 1. 概述
 
 <a id="工件模型"></a>
-<a id="11-逻辑角色"></a>
-<a id="12-逻辑角色与物理-carrier"></a>
 ### 1.1 工件模型
 
 运行时消费 image、Sandbox E 和 Snapshot S。E 描述便携沙箱配置及磁盘图，S 关联 E 与捕获的 VMM/内存状态；逻辑对象与文件/命名位置/Manifest/Bundle 载体是独立维度。完整角色、字段和验证规则见[沙箱工件](sandbox-artifacts_zh.md)。
 
 
-<a id="13-责任边界"></a>
 ### 1.2 责任边界
 
 `sandboxer` 提供完整 E/S 能力,但不决定 orchestrator 的 durable API. 上层的推荐映射是:
@@ -322,33 +319,7 @@ usage:
 
 普通 cold run 使用完整 validation. `run --from` 和 `run --restore` 先严格解析 artifact,再按字段 presence 应用各自 rules,不能使用无约束 `LoadMerged` 覆盖 artifact graph.
 
-### 3.2 PortableSandboxConfig
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#32-portablesandboxconfig)。
-
-### 3.3 Strict encoding 与 limits
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#33-strict-encoding-与-limits)。
-
-### 3.4 C0、C1 与 source binding
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#34-c0c1-与-source-binding)。
-
-### 3.5 `self` 与 disk provenance
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#35-self-与-disk-provenance)。
-
-### 3.6 `.sandbox` logical format
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#36-sandbox-logical-format)。
-
-### 3.7 `.snapshot` logical format
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#37-snapshot-logical-format)。
-
-<a id="38-filesenv-与-ephemeral"></a>
-<a id="33-filesenv-与-ephemeral"></a>
-### 3.8 files、env 与 ephemeral
+### 3.2 files、env 与 ephemeral
 
 Cold launch merge:
 
@@ -374,7 +345,7 @@ Runtime semantics:
 
 Restore host若显式提供 `boot.cmdline`、launch persistent/ephemeral fields、mounts、files/ephemeral_files、init 或 metadata,会在副作用前拒绝,而不是静默忽略. `resources.startup` 是 host-only node policy,可在 restore 时提供;它写入 node reservation contract,但 Snapshot 捕获的 `BudgetAtSnapshot` 仍是 restore initial Budget 的权威值.
 
-### 3.9 Usage policy
+### 3.3 Usage policy
 
 `usage` 是严格解析的 host-only policy. 在 cold/from/restore 中遵循配置顺序
 覆盖, 不进入 Portable/E/S. 默认关闭不增加 sampler、usage 长连接或周期写盘,
@@ -430,7 +401,7 @@ T8 launch sandbox-init spec and app
 T9 establish MUX/pinger/forward/resource lifecycle
 ```
 
-可预测的 config/ref/format 错误应在 preflight、controller/network/VM 副作用前失败。这不保证后续操作全部无副作用：创建 run directory、写 C0、创建 diff 和获取资源是可能失败并需要清理的后续步骤。已有 portable C0 的 kernel/runtime 验证差异见 [PortableSandboxConfig](sandbox-artifacts_zh.md#32-portablesandboxconfig)。
+可预测的 config/ref/format 错误应在 preflight、controller/network/VM 副作用前失败。这不保证后续操作全部无副作用：创建 run directory、写 C0、创建 diff 和获取资源是可能失败并需要清理的后续步骤。已有 portable C0 的 kernel/runtime 验证差异见 [PortableSandboxConfig](sandbox-artifacts_zh.md#3-portablesandboxconfig)。
 
 ### 5.2 CH command line boundary
 
@@ -551,7 +522,7 @@ Failure semantics:
 - `attach` ACK不明确时host幂等重试一次;若仍不能重建MUX,该capture变为terminal failure,host在memory/memory.high guards仍持有时请求VMM shutdown,再以SIGTERM/SIGKILL有界兜底. 失败不会留下可接受新请求但guest仍冻结的VM.
 - 默认destroy也等待CH退出;`/vmm.shutdown`失败或超时后使用SIGTERM/SIGKILL有界兜底,然后才释放lifecycle guards.
 - C0、active diff和live lower graph保持不变.
-- Local capture 使用 same-directory temp 并清理失败的 partial output；named-location publication 使用 [Local tarstream 与 crypto](sandbox-artifacts_zh.md#112-local-tarstream-与-crypto) 的独立所有权检查与清理规则。
+- Local capture 使用 same-directory temp 并清理失败的 partial output；named-location publication 使用 [Local tarstream 与 crypto](sandbox-artifacts_zh.md#92-local-tarstream-与-crypto) 的独立所有权检查与清理规则。
 
 ### 6.3 `ctl.sock` protocol
 
@@ -635,7 +606,7 @@ Restore不会:
 - 把 E的 `config.json` 当成新的 process launch request;
 - 更新 memory parent或C0作为 re-snapshot side effect.
 
-Host-only允许项包括 network provider/current identity、cgroup/controller、allocatable CPU/memory 与 resource enforcement、kernel/runtime actual path、active diff/template、restore prefetch和timeouts. Immutable disk graph、capacity identity、`deflate_on_oom`、network topology 由 E 拥有。Kernel 重哈希例外与 runtime-footer 比较见 [PortableSandboxConfig](sandbox-artifacts_zh.md#32-portablesandboxconfig)。
+Host-only允许项包括 network provider/current identity、cgroup/controller、allocatable CPU/memory 与 resource enforcement、kernel/runtime actual path、active diff/template、restore prefetch和timeouts. Immutable disk graph、capacity identity、`deflate_on_oom`、network topology 由 E 拥有。Kernel 重哈希例外与 runtime-footer 比较见 [PortableSandboxConfig](sandbox-artifacts_zh.md#3-portablesandboxconfig)。
 
 从 S0 restore后:
 
@@ -781,66 +752,31 @@ Snapshot/export开始前阻止新的Budget mutation和balloon transition. 已在
 
 Static/dynamic模式可使用PSI或`memory.events.local` polling. PSI默认trigger与debounce由host config决定,不写入E. Sensor在capture gate期间停止发起growth,restore后建立new observation epoch.
 
-<a id="工件来源与发布"></a>
-<a id="11-provenancepublish-与-carrier"></a>
-## 11. 工件来源与发布
+## 11. vhost-user-blk backend
 
-磁盘和内存引用、tarstream/Manifest/Bundle 输出、精确发布与提交规则见[沙箱工件](sandbox-artifacts_zh.md)。运行时捕获顺序仍由本篇定义。
-
-### 11.1 Disk 与 memory provenance
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#111-disk-与-memory-provenance)。
-
-### 11.2 Local tarstream 与 crypto
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#112-local-tarstream-与-crypto)。
-
-<a id="local-output"></a>
-[Local output](sandbox-artifacts_zh.md#local-output) 定义本地 tarstream 发布。
-
-<a id="named-ref-location"></a>
-[Named ref location](sandbox-artifacts_zh.md#named-ref-location) 定义命名 carrier 发布。
-
-<a id="single-root-imagesandbox-manifest-bundle"></a>
-[Single-root image/Sandbox Manifest Bundle](sandbox-artifacts_zh.md#single-root-imagesandbox-manifest-bundle) 定义该 carrier 的发布规则。
-
-### 11.3 Manifest upload
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#113-manifest-upload)。
-
-### 11.4 Manifest Bundle
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#114-manifest-bundle)。
-
-### 11.5 Publish graph
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#115-publish-graph)。
-
-## 12. vhost-user-blk backend
-
-### 12.1 Payload boundary
+### 11.1 Payload boundary
 
 Vhost backend接收`fetch.Stream` Payload section,不是FullStream. 任何 `.sandbox` ZIP tail进入block logical size都属于bug,由format/unit tests覆盖.
 
-### 12.2 Layered reads
+### 11.2 Layered reads
 
 Read 顺序为 active diff -> captured top -> `base_from_refs` -> root image（适用时）。Hole fall through，Zero/Data stop traversal。同一 writable block device 中组合的 immutable layers 的 logical size 必须一致。EROFS + ext4 拓扑中，read-only EROFS base 是独立 vhost device，不是 writable ext4 BlockCOW device 最后一层 fall-through。源码见 [disks.go](../pkg/sandbox/disks.go) 与 [serveandwait.go](../pkg/sandbox/serveandwait.go)。
 
-### 12.3 SnapshotView
+### 11.3 SnapshotView
 
 `BlockCOW.SnapshotView` 暴露decrypt后的upper-only logical view和authoritative hole map. View不重新打开active diff path,并且只在backend quiesced期间稳定.
 
-### 12.4 BlockCOW state
+### 11.4 BlockCOW state
 
 BlockCOW 以 dirty bitmap 跟踪 4 KiB active-upper block，并非 clean/dirty/discard 三态 map。Dirty block 从 diff 读取；clean block 回落到 base，没有 base 才返回零。底层 `Discard` helper 只对完整 block 打洞并清除 dirty bit，使 base 再次可见；它不持久化能遮蔽 lower layer 的显式 Zero。当前 vhost profile 不公告 DISCARD 或 WRITE_ZEROES，request dispatcher 对两者都返回 unsupported，不调用这个 helper。写入 zero bytes 仍使 block 保持 dirty，不能扫描为 Hole。Export/snapshot 不 rotate active diff，也不把新 E 设为 backend base。源码见 [blk_cow.go](../pkg/vhost/blk_cow.go)、[server.go](../pkg/vhost/server.go) 和 [worker.go](../pkg/vhost/worker.go)。
 
-### 12.5 Quiesce / Resume
+### 11.5 Quiesce / Resume
 
 Quiesce等待in-flight block request退出并阻止新request. 所有data/root views在同一quiesce窗口读取. Recovery顺序先恢复backend可服务状态,再恢复CH和guest连接,避免VM恢复后block request永久阻塞.
 
-## 13. Validation、错误与安全
+## 12. Validation、错误与安全
 
-### 13.1 Cold validation
+### 12.1 Cold validation
 
 普通 cold config至少验证:
 
@@ -852,11 +788,11 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 - local/Manifest/Bundle ref与crypto policy一致;
 - launch/files/init/plugin/metadata limits.
 
-### 13.2 `run --from` 与 restore validation
+### 12.2 `run --from` 与 restore validation
 
-两种模式都先严格parse logical artifact和canonical config,再验证host ownership. `--from`允许persistent workload override;restore拒绝所有cold-only字段. Kernel binding preflight、runtime identity comparison、network topology/provider、disk count/name/topology 和 active diff binding 检查在 external lifecycle side effect 前完成；这不增加两种模式的 kernel digest 重哈希，见 [PortableSandboxConfig](sandbox-artifacts_zh.md#32-portablesandboxconfig)。
+两种模式都先严格parse logical artifact和canonical config,再验证host ownership. `--from`允许persistent workload override;restore拒绝所有cold-only字段. Kernel binding preflight、runtime identity comparison、network topology/provider、disk count/name/topology 和 active diff binding 检查在 external lifecycle side effect 前完成；这不增加两种模式的 kernel digest 重哈希，见 [PortableSandboxConfig](sandbox-artifacts_zh.md#3-portablesandboxconfig)。
 
-### 13.3 CLI mutual exclusion
+### 12.3 CLI mutual exclusion
 
 - `run --from` 与 `--restore` 互斥.
 - `run --replace-boot` 仅允许与`--from`一起使用，要求host config，并拒绝`--restore`.
@@ -866,7 +802,7 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 - Snapshot没有memory toggle.
 - `exec` command必须位于`--`之后;local与proxy target rules互斥.
 
-### 13.4 Failure contract
+### 12.4 Failure contract
 
 - Error包含field/entry/ref/disk index context,但不打印inline file/env value、customer key或plaintext digest.
 - Local crypto错误保持protected presentation.
@@ -876,15 +812,9 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 - Freeze后的任一failure必须恢复app、CH/backend/MUX/pinger/forward并释放resource locks;若MUX恢复已不可证明,必须在locks仍持有时终止CH并将capture gate置为terminal.
 - Operation root 成功发布是 commit point；local output 随后更新 semantic alias，named location 没有 alias。Dependency orphan 不伪装成功。
 
-## 14. Reliability、performance 与兼容边界
+## 13. Reliability、performance 与兼容边界
 
-### 14.1 Atomicity 与 determinism
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#141-atomicity-与-determinism)。
-
-<a id="142-streaming-与-memory-use"></a>
-<a id="141-streaming-与-memory-use"></a>
-### 14.2 Streaming 与 memory use
+### 13.1 Streaming 与 memory use
 
 - Sparse tarstream不spool logical stream到disk.
 - Manifest ingest只读取resident extents.
@@ -892,9 +822,7 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 - Bundle dependency plan在pause前执行remote I/O和admission.
 - V1 `--resume` 可以在sink写完整期间保持VM paused,换取SnapshotView稳定性.
 
-<a id="143-performance-observations"></a>
-<a id="142-performance-observations"></a>
-### 14.3 Performance observations
+### 13.2 Performance observations
 
 关键指标:
 
@@ -909,11 +837,7 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 
 Benchmark分别覆盖local tarstream/Bundle create、Bundle read、sparse merge和UFFD fault. 性能优化不能改变Hole/Zero/Data、commit order、identity verification或freeze safety.
 
-### 14.4 Incompatibility
-
-完整契约见 [Sandbox 工件](sandbox-artifacts_zh.md#144-incompatibility)。
-
-## 15. See Also
+## 14. See Also
 
 - [usage_zh.md](usage_zh.md) — Host-only 资源用量、查询、单位和持久化.
 - [sandbox-init_zh.md](sandbox-init_zh.md) — guest PID 1、launch/quiesce/MUX 协议。
