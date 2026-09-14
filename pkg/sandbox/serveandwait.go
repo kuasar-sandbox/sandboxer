@@ -583,10 +583,10 @@ func ServeAndWait(p VMParams) (int, error) {
 					return ctl.Response{}, errors.New("usage history unavailable; read the saved file offline")
 				}
 				body, err := usagereader.MarshalHistory(usageManager.History, view.SavedEnd, req.UsageCursor, req.UsageLimit)
-				return ctl.Response{Usage: body}, err
+				return ctl.Response{SandboxID: p.SandboxID, Usage: body}, err
 			}
 			body, err := json.Marshal(view)
-			return ctl.Response{Usage: body}, err
+			return ctl.Response{SandboxID: p.SandboxID, Usage: body}, err
 		},
 		SnapshotHandler: func(req ctl.Request) (ctl.Response, error) {
 			return snapHandler.handle(req, cgroupPath, chExited)

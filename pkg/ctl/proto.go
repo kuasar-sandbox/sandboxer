@@ -64,6 +64,8 @@ type Request struct {
 
 // Response is the run-process reply.
 type Response struct {
+	// SandboxID identifies the usage owner even when live/saved/history is empty.
+	SandboxID     string          `json:"sandbox_id,omitempty"`
 	ResourceStats *ResourceStats  `json:"resource_stats,omitempty"`
 	Usage         json.RawMessage `json:"usage,omitempty"`
 	Type          string          `json:"type"`

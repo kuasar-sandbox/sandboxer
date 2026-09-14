@@ -28,9 +28,20 @@ def request(path, kind):
 
 def check(path, cgroup, sid, owner_pid, headroom):
     cgroup = Path(cgroup)
-    vmm_pids = (cgroup / "cgroup.procs").read_text().split()
-    assert len(vmm_pids) == 1 and str(owner_pid) not in vmm_pids, vmm_pids
+    members = (cgroup / "cgroup.procs").read_text().split()
+    # cgroup.procs prints task_pid_vnr: tasks without a PID in the reader's
+    # namespace can appear as 0. Preserve that evidence, and verify the visible
+    # VMM and owner through their actual /proc cgroup bindings.
+    vmm_pids = sorted(set(pid for pid in members if int(pid) > 0))
+    assert len(vmm_pids) == 1 and str(owner_pid) not in vmm_pids, members
     assert Path(f"/proc/{vmm_pids[0]}/exe").resolve().name == "cloud-hypervisor"
+    def process_cgroup(pid):
+        rows = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+        unified = [row[3:] for row in rows if row.startswith("0::")]
+        assert len(unified) == 1, rows
+        return Path("/sys/fs/cgroup") / unified[0].lstrip("/")
+    assert process_cgroup(vmm_pids[0]).samefile(cgroup)
+    assert not process_cgroup(owner_pid).samefile(cgroup), "ctl is charged to VMM scope"
     controls = {name: (cgroup / name).read_text() for name in ("memory.high", "memory.max", "cpu.max", "cpu.weight")}
     # Freezing is owned by this test. Successful reads while the VMM cannot
     # answer also prove that resource stats never requires a guest/CH request.
@@ -40,27 +51,33 @@ def check(path, cgroup, sid, owner_pid, headroom):
         while "frozen 1" not in (cgroup / "cgroup.events").read_text():
             assert time.monotonic() < deadline, "VMM did not freeze"
             time.sleep(.01)
-        memory = int((cgroup / "memory.current").read_text())
-        cpu = int(dict(line.split() for line in (cgroup / "cpu.stat").read_text().splitlines())["usage_usec"])
+        def counters():
+            memory = int((cgroup / "memory.current").read_text())
+            cpu = int(dict(line.split() for line in (cgroup / "cpu.stat").read_text().splitlines())["usage_usec"])
+            return memory, cpu
         begin = int(time.time())
         rows = []
         for _ in range(8):
+            before = counters()
             response = request(path, "resource_stats_request")
+            after = counters()
             assert response["type"] == "resource_stats_response", response
             stats = response["resource_stats"]
             assert stats["sandbox_id"] == sid
             assert stats["cpu_capacity"] == 1 and stats["cpu_allocatable"] == 1
             assert int(stats["memory_capacity"]) == 8 * 1024**3
             assert int(stats["memory_headroom"]) == int(headroom)
-            assert int(stats["memory_used"]) == memory, (stats, memory)
-            assert int(stats["cpu_usage_usec"]) == cpu, (stats, cpu)
+            # Kernel accounting/charge release is not an atomic two-file read,
+            # even when userspace is frozen. Bracket each actual observation.
+            for index, name in enumerate(("memory_used", "cpu_usage_usec")):
+                assert min(before[index], after[index]) <= int(stats[name]) <= max(before[index], after[index]), (stats, before, after)
             assert begin <= stats["timestamp_unix"] <= int(time.time())
             rows.append(stats)
         usage = request(path, "usage_request")
         assert usage["type"] == "usage_response" and not usage["usage"]["enabled"], usage
         assert "live" not in usage["usage"], "resource stats started usage"
         assert controls == {name: (cgroup / name).read_text() for name in controls}, "read changed resource policy"
-        print(json.dumps({"vmm_pid": int(vmm_pids[0]), "owner_pid": int(owner_pid), "resource_reads": rows}))
+        print(json.dumps({"vmm_pid": int(vmm_pids[0]), "owner_pid": int(owner_pid), "cgroup_procs": members, "resource_reads": rows}))
     finally:
         (cgroup / "cgroup.freeze").write_text("0")
 

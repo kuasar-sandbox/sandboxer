@@ -5,16 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
+	"golang.org/x/sys/unix"
 )
 
 func savedFixture(t testing.TB) (Options, usage.Record, []byte) {
@@ -148,7 +151,7 @@ func TestOwnerLiveSavedHistoryAndWriterLock(t *testing.T) {
 			}{records, next}
 		}
 		raw, err := json.Marshal(value)
-		return ctl.Response{Usage: raw}, err
+		return ctl.Response{SandboxID: options.SandboxID, Usage: raw}, err
 	})
 	for _, saved := range []bool{false, true} {
 		options.Saved = saved
@@ -191,17 +194,65 @@ func TestOnlineErrorsNeverFallback(t *testing.T) {
 				case "owner-error":
 					return ctl.Response{}, errors.New("owner failed")
 				case "bad-json":
-					return ctl.Response{Usage: json.RawMessage(`"wrong shape"`)}, nil
+					return ctl.Response{SandboxID: options.SandboxID, Usage: json.RawMessage(`"wrong shape"`)}, nil
 				case "null-snapshot", "null-history":
-					return ctl.Response{Usage: json.RawMessage(`null`)}, nil
+					return ctl.Response{SandboxID: options.SandboxID, Usage: json.RawMessage(`null`)}, nil
 				default:
-					return ctl.Response{Usage: json.RawMessage(`{"live":{"sandbox_id":"another"}}`)}, nil
+					return ctl.Response{SandboxID: options.SandboxID, Usage: json.RawMessage(`{"live":{"sandbox_id":"another"}}`)}, nil
 				}
 			})
 			if _, err := Read(context.Background(), options); err == nil {
 				t.Fatal("online error replaced with readable saved file")
 			}
 		})
+	}
+}
+
+func TestEmptyOwnerResponseStillRequiresIdentity(t *testing.T) {
+	for _, history := range []bool{false, true} {
+		for _, ownerID := range []string{"", "different", "exact-sid"} {
+			t.Run(fmt.Sprintf("history=%v/owner=%s", history, ownerID), func(t *testing.T) {
+				options, _, _ := savedFixture(t)
+				options.History = history
+				startOwner(t, options.ControlSocket, func(ctl.Request) (ctl.Response, error) {
+					body := json.RawMessage(`{"enabled":false,"saved_end":"0","saving":false,"unknown_tail":false}`)
+					if history {
+						body = json.RawMessage(`{"records":[],"next_cursor":"0"}`)
+					}
+					return ctl.Response{SandboxID: ownerID, Usage: body}, nil
+				})
+				_, err := Read(context.Background(), options)
+				if (err == nil) != (ownerID == options.SandboxID) {
+					t.Fatalf("empty owner's identity check: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestOfflineFIFOIsRejectedWithoutWaitingForWriter(t *testing.T) {
+	options, _, _ := savedFixture(t)
+	options.File, options.Offline = filepath.Join(t.TempDir(), "blocked.usage"), true
+	if err := unix.Mkfifo(options.File, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := Read(ctx, options); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "not regular") {
+			t.Fatal("FIFO not rejected", err)
+		}
+	case <-time.After(time.Second):
+		// Release a regressed blocking open before failing, so the test cannot
+		// retain a goroutine or let cleanup hide the missing timeout guarantee.
+		f, _ := os.OpenFile(options.File, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if f != nil {
+			_ = f.Close()
+		}
+		t.Fatal("offline open waited for a FIFO writer")
 	}
 }
 

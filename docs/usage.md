@@ -83,7 +83,11 @@ file lock; [`MarshalHistory`](../pkg/usagereader/history.go) is the same bounded
 page encoder used by the online owner. It does not add another codec, recovery
 algorithm, accumulator or persistent state. Native JSON is retained without a
 floating-point intermediate; a different SandboxID in live, saved or history
-data is rejected. Empty history has `records: []` and its validated next cursor.
+data is rejected. The ctl response envelope always includes the owner SandboxID, even when
+usage is disabled, live/saved are absent or history is empty. This does not
+change native View/Record or the file format. Empty history has `records: []`
+and its validated next cursor. Offline open uses a nonblocking flag and rejects
+FIFOs and other nonregular files without waiting for a writer beyond timeout.
 
 Only failure to connect to an absent/refused socket permits fallback. Once
 connected, EOF, invalid replies, owner errors, cancellation and deadlines fail

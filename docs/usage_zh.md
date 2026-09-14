@@ -68,7 +68,10 @@ control socket 和保存文件路径, 再传入精确 SandboxID、context、snap
 [MarshalHistory](../pkg/usagereader/history.go) 与在线 owner 共用同一个有界分页编码器.
 不增加第二套 codec、恢复算法、累计器或持久状态. Native JSON 保持无损, 不经过
 浮点中间值; live、saved 或 history 数据中的 SandboxID 不匹配时拒绝.
-空历史返回 `records: []` 及已校验的 next cursor.
+ctl response envelope 始终携带 owner 的 `sandbox_id`, 即使 usage 关闭、
+live/saved 为空或历史为空, 也必须核对身份. 该字段不改变 native View/Record 或文件格式.
+空历史返回 `records: []` 及已校验的 next cursor. 离线 open 使用非阻塞标志,
+先拒绝 FIFO 等非 regular file, 不会为等待 FIFO writer 而绕过 timeout.
 
 只有 socket 不存在或拒绝连接时允许回退. 一旦已连接 owner, EOF、非法 response、
 owner 错误、取消或超时都使查询失败, 不能被可读的保存文件替代. 取消会关闭当前
