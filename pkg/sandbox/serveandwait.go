@@ -232,28 +232,33 @@ func ServeAndWait(p VMParams) (int, error) {
 	if err := p.Ctx.Err(); err != nil {
 		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
 	}
-	var readFatalMu sync.Mutex
+	readiness := newReadinessEmitter(p.NotifyReadiness)
 	var firstReadFatal error
 	readFatal := func() error {
-		readFatalMu.Lock()
-		defer readFatalMu.Unlock()
+		readiness.mu.Lock()
+		defer readiness.mu.Unlock()
 		return firstReadFatal
 	}
 	var chProcessMu sync.RWMutex
 	var chProcess *os.Process
 	logf := p.Logf
-	readiness := newReadinessEmitter(p.NotifyReadiness)
 	var usageManager *usage.Manager
 	var usageSampler *usage.Sampler
 	usageError := ""
 	notifyReady := func() {
-		if readFatal() != nil {
+		readiness.mu.Lock()
+		if firstReadFatal != nil {
+			readiness.mu.Unlock()
 			return
 		}
 		if usageSampler != nil {
 			usageSampler.Ready()
 		}
-		readiness.notifyReady()
+		notify := readiness.commitReadyLocked()
+		readiness.mu.Unlock()
+		if notify != nil {
+			notify(ReadinessReady)
+		}
 	}
 	runDir := p.RunDir
 	chSock := filepath.Join(runDir, "ch.sock")
@@ -275,14 +280,14 @@ func ServeAndWait(p VMParams) (int, error) {
 		if err == nil {
 			return
 		}
-		readFatalMu.Lock()
+		readiness.mu.Lock()
 		if firstReadFatal != nil {
-			readFatalMu.Unlock()
+			readiness.mu.Unlock()
 			return
 		}
 		firstReadFatal = fmt.Errorf("mandatory source read: %w", err)
 		cause := firstReadFatal
-		readFatalMu.Unlock()
+		readiness.mu.Unlock()
 		// Reporters never join workers. Termination is effective even while
 		// this owner is synchronously waiting for PostSpawn/readiness.
 		cancelPostSpawn()

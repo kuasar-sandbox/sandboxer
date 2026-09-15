@@ -11,6 +11,7 @@ import (
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
@@ -54,7 +55,7 @@ func openSandboxRunSource(ctx context.Context, raw string, storage *artifact.Pro
 		if err != nil {
 			return nil, fmt.Errorf("Sandbox manifest ref: %w", err)
 		}
-		stream, err = source.Fetcher.OpenManifest(ctx, key)
+		stream, err = readretry.Open(ctx, func() (fetch.Stream, error) { return source.Fetcher.OpenManifest(ctx, key) })
 		if err != nil {
 			return nil, fmt.Errorf("open Sandbox manifest: %w", err)
 		}

@@ -45,14 +45,23 @@ func (e *readinessEmitter) notifyControlReady() {
 }
 
 func (e *readinessEmitter) notifyReady() {
-	if e == nil || e.notify == nil {
+	if e == nil {
 		return
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if !e.controlReady || e.ready {
-		return
+	notify := e.commitReadyLocked()
+	e.mu.Unlock()
+	if notify != nil {
+		notify(ReadinessReady)
 	}
-	e.notify(ReadinessReady)
+}
+
+// commitReadyLocked is the readiness transition. Delivery may block in the
+// caller's notifier; it must not hold the lock needed to record a fatal read.
+func (e *readinessEmitter) commitReadyLocked() ReadinessNotify {
+	if e.notify == nil || !e.controlReady || e.ready {
+		return nil
+	}
 	e.ready = true
+	return e.notify
 }

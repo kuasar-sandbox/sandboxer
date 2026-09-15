@@ -1,6 +1,7 @@
 package vhost
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 )
 
@@ -78,7 +80,9 @@ func (s *Server) runWorker(idx int, q *virtq) {
 		err = s.processQueue(q)
 		// Publish the runtime cause before Quiesce can pass this request.
 		// The owner callback must never synchronously join this worker.
-		if readretry.IsTerminal(err) && q.stopped() == nil && s.onReadFatal != nil {
+		// Classify the returned terminal, not a later queue-stop race.
+		// Explicit permanent causes can themselves wrap cancellation.
+		if readretry.IsTerminal(err) && (readerr.IsPermanent(err) || !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) && s.onReadFatal != nil {
 			s.onReadFatal(err)
 		}
 		s.inflight.Done()

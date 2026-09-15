@@ -10,7 +10,7 @@
 
 ## 2. CLI
 
-该行为覆盖冷启动、内存恢复及随后的磁盘和内存读取. 只读制品打开和元数据检查也使用同一 helper. 非法命令参数向调用者返回错误. 管理输入错误或可选预取失败不会通知运行 fatal.
+该行为覆盖冷启动, 包括 `run --from manifest://...`, 以及内存恢复和随后的磁盘、内存读取. 只读制品打开和元数据检查也使用同一 helper. 非法命令参数向调用者返回错误. 管理输入错误或可选预取失败不会通知运行 fatal.
 
 不增加命令、重试次数参数或恢复模式. 操作由现有 context 或沙箱关闭结束. 来源停机可能延迟就绪、exec 或快照排空, 因为这些操作可能需要尚不可用的数据.
 
@@ -36,7 +36,7 @@ UFFD 直接重试必需的 `Run.ReadAt`. urgent 页及包含它的 Chunk window 
 
 `processChain` 和 `processQueue` 都识别停止或终态的必需读取. 此时 status byte、used ring 和队列 base 保持未完成. COW 写入内部的基底读取同样遵守该规则. 普通不支持请求及独立的可写 diff 错误保留现有协议行为.
 
-worker 在释放 inflight 所有权前报告必需读取 fatal. `ServeAndWait` 记录首因, 取消相关等待和 PostSpawn/握手工作, 然后直接杀死 CH. 现有唯一 `cmd.Wait` 负责回收和输出排空. worker 不同步等待自己的清理. 记录 fatal 后, 延迟到达的就绪事件不能宣告 VM 可用.
+worker 在释放 inflight 所有权前报告必需读取 fatal; 后发生的 queue stop 不能遮蔽后端已经返回的永久原因. `ServeAndWait` 记录首因, 取消相关等待和 PostSpawn/握手工作, 然后直接杀死 CH. 现有唯一 `cmd.Wait` 负责回收和输出排空. worker 不同步等待自己的清理. Ready 提交和 fatal 登记共用一把锁, 已登记 fatal 会阻止新的 Ready 状态转换. 已提交 Ready 事件的通知在锁外交付; 通知回调阻塞不会延迟 fatal 取消或 CH 终止.
 
 快照和 export 保留冻结、排空和一致性条件. 重试可以延长排空, 不减少 inflight 来通过冻结. 捕获在提交前和成功返回前检查操作是否结束; 无法满足捕获条件时失败. 队列停止先取消读取及快照 gate 等待, 再 join; 旧 worker 不能向替换后的 master memory table 写入. UFFD 队列投递也观察取消. 关闭仍先结束 reader, 再让 remove flusher 最终 drain, 最后回收资源.
 

@@ -10,7 +10,7 @@ A required runtime read keeps its original request, buffer and inflight ownershi
 
 ## 2. CLI
 
-The behavior applies to cold start, memory restore and subsequent disk/memory reads. Read-only artifact opening and metadata inspection use the same helper. Invalid command arguments return an error to their caller. A management input error or optional prefetch failure is not a runtime fatal notification.
+The behavior applies to cold start, including `run --from manifest://...`, memory restore and subsequent disk/memory reads. Read-only artifact opening and metadata inspection use the same helper. Invalid command arguments return an error to their caller. A management input error or optional prefetch failure is not a runtime fatal notification.
 
 There is no additional command, retry-count argument or recovery mode. An operation can be ended by its existing context or sandbox shutdown. A source outage may delay readiness, exec, or snapshot drain because those operations can need the unavailable data.
 
@@ -36,7 +36,7 @@ Lazy process Fetcher initialization, referenced Bundle resolution and Bundle Chu
 
 Both `processChain` and `processQueue` recognize stopped/terminal required reads. They leave the status byte, used ring and queue base uncompleted. This also applies to the implicit base read inside a COW write. Ordinary unsupported requests and independent writable-diff errors keep their existing protocol behavior.
 
-The worker reports a required read fatal before releasing inflight ownership. `ServeAndWait` records the first cause, cancels related waits and PostSpawn/handshake work, and directly kills CH. The existing sole `cmd.Wait` owns reaping and output draining. A worker never synchronously waits for its own cleanup. No late readiness event may announce a VM with a recorded fatal read.
+The worker reports a required read fatal before releasing inflight ownership; a later queue stop cannot suppress a permanent cause already returned by the backend. `ServeAndWait` records the first cause, cancels related waits and PostSpawn/handshake work, and directly kills CH. The existing sole `cmd.Wait` owns reaping and output draining. A worker never synchronously waits for its own cleanup. Ready commitment and fatal recording share one lock, so a recorded fatal prevents any new Ready transition. Delivery of an already committed Ready event runs outside that lock; a blocked notifier cannot delay fatal cancellation or CH termination.
 
 Snapshot/export retain their freeze, drain and consistency conditions. Retries may extend the drain; inflight accounting is not reduced to pass it. Capture checks operation termination before committing and before returning success. If capture conditions cannot be met, the operation fails. Queue stop cancels waiting reads and the snapshot gate wait before join; old workers cannot write into a replacement master's memory table. UFFD queue submission also observes cancellation. Shutdown preserves reader completion before the remove flusher's final drain and then releases resources.
 

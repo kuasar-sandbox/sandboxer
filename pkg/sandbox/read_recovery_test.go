@@ -28,6 +28,14 @@ type fatalSnapshotSource struct{ cause error }
 func (s fatalSnapshotSource) RunAt(uint64, uint64) (sparse.Run, error) { return nil, s.cause }
 
 func TestMandatoryReadFatalDuringPostSpawnReapsCHOnce(t *testing.T) {
+	for _, blockReady := range []bool{false, true} {
+		t.Run(map[bool]string{false: "late-ready", true: "blocked-notifier"}[blockReady], func(t *testing.T) {
+			testMandatoryReadFatalDuringPostSpawn(t, blockReady)
+		})
+	}
+}
+
+func testMandatoryReadFatalDuringPostSpawn(t *testing.T, blockReady bool) {
 	runDir := t.TempDir()
 	marker := filepath.Join(runDir, "child-ready")
 	cow, err := vhost.OpenBlockCOW(filepath.Join(t.TempDir(), "diff"), nil, vhost.DiffInit{CreateSize: 4096})
@@ -38,6 +46,17 @@ func TestMandatoryReadFatalDuringPostSpawnReapsCHOnce(t *testing.T) {
 	var cmd *exec.Cmd
 	var environment CmdEnv
 	var ready atomic.Int32
+	readyEntered, releaseReady, readyDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	defer func() {
+		close(releaseReady)
+		if blockReady {
+			select {
+			case <-readyDone:
+			case <-time.After(time.Second):
+				t.Error("readiness delivery did not finish")
+			}
+		}
+	}()
 	cause := readerr.Mark(errors.New("injected mandatory source failure"), false)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -47,6 +66,10 @@ func TestMandatoryReadFatalDuringPostSpawnReapsCHOnce(t *testing.T) {
 		NotifyReadiness: func(e ReadinessEvent) {
 			if e == ReadinessReady {
 				ready.Add(1)
+				if blockReady {
+					close(readyEntered)
+					<-releaseReady
+				}
 			}
 		},
 		BuildCmd: func(env CmdEnv) (*exec.Cmd, func(), error) {
@@ -97,6 +120,10 @@ func TestMandatoryReadFatalDuringPostSpawnReapsCHOnce(t *testing.T) {
 				return errors.New(string(ack))
 			}
 			var fault [32]byte
+			if blockReady {
+				go func() { pc.NotifyReady(); close(readyDone) }()
+				<-readyEntered
+			}
 			fault[0] = 0x12
 			binary.LittleEndian.PutUint64(fault[16:], 0x100000)
 			if _, err = unix.Write(fds[1], fault[:]); err != nil {
@@ -110,7 +137,11 @@ func TestMandatoryReadFatalDuringPostSpawnReapsCHOnce(t *testing.T) {
 	if code != -1 || !errors.Is(err, cause) {
 		t.Fatalf("first fatal cause lost: code=%d err=%v", code, err)
 	}
-	if ready.Load() != 0 || cmd.ProcessState == nil {
+	wantReady := int32(0)
+	if blockReady {
+		wantReady = 1 // committed before fatal; delivery is still blocked
+	}
+	if ready.Load() != wantReady || cmd.ProcessState == nil {
 		t.Fatalf("ready=%d process state=%v", ready.Load(), cmd.ProcessState)
 	}
 	var status unix.WaitStatus

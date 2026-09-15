@@ -196,6 +196,63 @@ func TestCanceledQueueRetainsCompletion(t *testing.T) {
 	}
 	assertPending(t, q, mem)
 }
+
+type stopAfterReadBackend struct {
+	Backend
+	stop func()
+}
+
+func (b stopAfterReadBackend) readAt(ctx context.Context, p []byte, off int64) (int, error) {
+	n, err := b.Backend.(interface {
+		readAt(context.Context, []byte, int64) (int, error)
+	}).readAt(ctx, p, off)
+	b.stop()
+	return n, err
+}
+
+func (b stopAfterReadBackend) writeAt(ctx context.Context, p []byte, off int64) (int, error) {
+	n, err := b.Backend.(interface {
+		writeAt(context.Context, []byte, int64) (int, error)
+	}).writeAt(ctx, p, off)
+	b.stop()
+	return n, err
+}
+
+func TestPermanentReadSurvivesConcurrentQueueStop(t *testing.T) {
+	for _, write := range []bool{false, true} {
+		for _, cause := range []error{io.EOF, context.Canceled, context.DeadlineExceeded} {
+			s, q, mem, _ := recoveryQueue(t, recoveryStream{read: func(context.Context, []byte) (int, error) {
+				return 0, readerr.Mark(cause, false)
+			}}, write)
+			// Stop only after the real backend has returned its terminal. A
+			// cancellation inside its attempt would correctly end that operation.
+			s.backend = stopAfterReadBackend{Backend: s.backend, stop: q.stopReading}
+			fd, err := unix.Eventfd(1, unix.EFD_CLOEXEC)
+			if err != nil {
+				t.Fatal(err)
+			}
+			q.kickFd, q.done = fd, make(chan struct{})
+			fatal := make(chan error, 1)
+			s.SetReadFatal(func(err error) { fatal <- err })
+			go s.runWorker(0, q)
+			select {
+			case <-q.done:
+			case <-time.After(time.Second):
+				t.Fatal("stopped queue failed to exit")
+			}
+			unix.Close(fd)
+			select {
+			case err := <-fatal:
+				if !errors.Is(err, cause) || !readerr.IsPermanent(err) {
+					t.Fatalf("fatal cause changed: %v", err)
+				}
+			default:
+				t.Fatal("queue stop suppressed returned permanent cause")
+			}
+			assertPending(t, q, mem)
+		}
+	}
+}
 func TestFatalPrecedesQuiesceDrain(t *testing.T) {
 	s, q, mem, _ := recoveryQueue(t, recoveryStream{read: func(_ context.Context, p []byte) (int, error) { return 0, readerr.Mark(io.EOF, false) }}, false)
 	fd, err := unix.Eventfd(1, unix.EFD_CLOEXEC)
@@ -251,6 +308,8 @@ func TestGetVringBaseAndStopJoinSameWorker(t *testing.T) {
 	for range 20 {
 		entered := make(chan struct{})
 		s, q, mem, _ := recoveryQueue(t, recoveryStream{read: func(ctx context.Context, p []byte) (int, error) { close(entered); <-ctx.Done(); return 0, ctx.Err() }}, false)
+		var fatalCalls atomic.Int32
+		s.SetReadFatal(func(error) { fatalCalls.Add(1) })
 		fd, err := unix.Eventfd(1, unix.EFD_CLOEXEC)
 		if err != nil {
 			t.Fatal(err)
@@ -293,6 +352,9 @@ func TestGetVringBaseAndStopJoinSameWorker(t *testing.T) {
 			}
 		}
 		assertPending(t, q, mem)
+		if fatalCalls.Load() != 0 {
+			t.Fatal("normal queue cancellation reported a fatal source")
+		}
 		s.resetConnectionState()
 		conns[0].Close()
 		conns[1].Close()
