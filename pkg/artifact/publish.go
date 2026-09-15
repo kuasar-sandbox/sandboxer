@@ -17,6 +17,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	storeclient "github.com/kuasar-sandbox/accelerator/pkg/store/client"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
@@ -565,7 +566,7 @@ func (p *Publisher) open(ctx context.Context, raw string, scope publishScope) (f
 		if err != nil {
 			return nil, scope, err
 		}
-		stream, err := fetcher.OpenManifest(ctx, key)
+		stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return fetcher.OpenManifest(ctx, key) })
 		return stream, scope, err
 	case manifest.RefSchemeFile:
 		path, err := p.locations.ResolveFile(ref, scope.relativeDir)

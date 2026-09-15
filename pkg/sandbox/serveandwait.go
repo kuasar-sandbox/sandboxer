@@ -232,12 +232,24 @@ func ServeAndWait(p VMParams) (int, error) {
 	if err := p.Ctx.Err(); err != nil {
 		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
 	}
+	var readFatalMu sync.Mutex
+	var firstReadFatal error
+	readFatal := func() error {
+		readFatalMu.Lock()
+		defer readFatalMu.Unlock()
+		return firstReadFatal
+	}
+	var chProcessMu sync.RWMutex
+	var chProcess *os.Process
 	logf := p.Logf
 	readiness := newReadinessEmitter(p.NotifyReadiness)
 	var usageManager *usage.Manager
 	var usageSampler *usage.Sampler
 	usageError := ""
 	notifyReady := func() {
+		if readFatal() != nil {
+			return
+		}
 		if usageSampler != nil {
 			usageSampler.Ready()
 		}
@@ -254,8 +266,35 @@ func ServeAndWait(p VMParams) (int, error) {
 	// servers run under (and the stdio MUX bridge). Cancelled when CH
 	// exits (or earlier via signal escalation); the deferred cancel is a
 	// backstop for the early-error returns below.
-	backendCtx, cancelBackends := context.WithCancel(VMLifecycleContext(p.Ctx))
+	backendCtx, cancelBackendCause := context.WithCancelCause(VMLifecycleContext(p.Ctx))
+	cancelBackends := func() { cancelBackendCause(context.Canceled) }
 	defer cancelBackends()
+	postSpawnCtx, cancelPostSpawn := context.WithCancel(p.Ctx)
+	defer cancelPostSpawn()
+	reportReadFatal := func(err error) {
+		if err == nil {
+			return
+		}
+		readFatalMu.Lock()
+		if firstReadFatal != nil {
+			readFatalMu.Unlock()
+			return
+		}
+		firstReadFatal = fmt.Errorf("mandatory source read: %w", err)
+		cause := firstReadFatal
+		readFatalMu.Unlock()
+		// Reporters never join workers. Termination is effective even while
+		// this owner is synchronously waiting for PostSpawn/readiness.
+		cancelPostSpawn()
+		cancelBackendCause(cause)
+		chProcessMu.RLock()
+		process := chProcess
+		chProcessMu.RUnlock()
+		if process != nil {
+			_ = process.Kill()
+		}
+		logf("sandbox mandatory source read failed: %v", cause)
+	}
 
 	// Exactly one stdio MUX at a time; which conn backs it changes across
 	// launch → restore → attach. muxLink guards the pair so the snapshot
@@ -321,6 +360,8 @@ func ServeAndWait(p VMParams) (int, error) {
 				BackendVA:  memfd.Addr(),
 				Size:       memfd.Size(),
 				Source:     p.UffdSource,
+				Context:    backendCtx,
+				ReadFatal:  reportReadFatal,
 				NumWorkers: numWorkers,
 				Logf:       logf,
 			})
@@ -364,6 +405,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	var snapDisks []SnapDiskRef // per logical disk: writable diff for snapshot
 	addServer := func(sock string, backend vhost.Backend, label, path string, ro bool) error {
 		s := vhost.NewServer(sock, backend, logf)
+		s.SetReadFatal(reportReadFatal)
 		s.EnableStats(label, path)
 		s.SetMemfd(memfd.Inode(), memfd.Bytes())
 		if err := s.Listen(); err != nil {
@@ -515,8 +557,6 @@ func ServeAndWait(p VMParams) (int, error) {
 		chExitedOnce.Do(func() { close(chExited) })
 	}
 	defer markCHExited()
-	var chProcessMu sync.RWMutex
-	var chProcess *os.Process
 	currentCHProcess := func() processSignaler {
 		chProcessMu.RLock()
 		defer chProcessMu.RUnlock()
@@ -725,6 +765,9 @@ func ServeAndWait(p VMParams) (int, error) {
 	chProcessMu.Lock()
 	chProcess = cmd.Process
 	chProcessMu.Unlock()
+	if readFatal() != nil {
+		_ = cmd.Process.Kill()
+	}
 	chPid := cmd.Process.Pid
 	logf("CH started pid=%d", chPid)
 	if usageSampler != nil {
@@ -746,6 +789,8 @@ func ServeAndWait(p VMParams) (int, error) {
 			logf("CH exit waitid: %v", waitIDErr)
 		}
 		waitErr := cmd.Wait()
+		cancelPostSpawn()
+		cancelBackends()
 		markCHExited()
 		doneCh <- waitErr
 	}()
@@ -760,7 +805,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	})
 
 	if err := p.PostSpawn(PostSpawnCtx{
-		Ctx:          p.Ctx,
+		Ctx:          postSpawnCtx,
 		Cmd:          cmd,
 		Pinger:       pinger,
 		Launch:       launch,
@@ -771,11 +816,14 @@ func ServeAndWait(p VMParams) (int, error) {
 		Logf:         logf,
 		NotifyReady:  notifyReady,
 	}); err != nil {
-		if !runShutdownRequested(p.Ctx) {
+		if readFatal() != nil || !runShutdownRequested(p.Ctx) {
 			_ = cmd.Process.Kill()
 			<-doneCh
 			cancelBackends()
 			backendWG.Wait()
+			if fatal := readFatal(); fatal != nil {
+				return -1, fatal
+			}
 			return -1, err
 		}
 		// A retained signal interrupted the synchronous restore barrier. Keep
@@ -829,6 +877,9 @@ func ServeAndWait(p VMParams) (int, error) {
 		} else {
 			logf("stats json written to %s", p.StatsJSONPath)
 		}
+	}
+	if fatal := readFatal(); fatal != nil {
+		return -1, fatal
 	}
 	return exit, nil
 }

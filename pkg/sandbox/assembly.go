@@ -11,6 +11,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -44,7 +45,7 @@ func OpenFlattenedImage(ctx context.Context, raw string, storage *artifact.Proce
 		if err != nil {
 			return nil, fmt.Errorf("open flattened image manifest ref: %w", err)
 		}
-		stream, err = storage.Fetcher().OpenManifest(ctx, key)
+		stream, err = readretry.Open(ctx, func() (fetch.Stream, error) { return storage.Fetcher().OpenManifest(ctx, key) })
 		if err != nil {
 			return nil, fmt.Errorf("open flattened image manifest: %w", err)
 		}

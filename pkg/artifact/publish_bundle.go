@@ -10,7 +10,9 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
@@ -110,7 +112,12 @@ func selectExactBundleSources(
 	locatedExact := make(map[store.ContentKey]struct{})
 	remoteDependencies := 0
 	for _, key := range dependencies {
-		source, err := opened.ManifestFetcher().SelectManifest(ctx, key)
+		var source manifestbundle.ManifestSource
+		err := readretry.Do(ctx, func() error {
+			var selectErr error
+			source, selectErr = opened.ManifestFetcher().SelectManifest(ctx, key)
+			return selectErr
+		})
 		if err != nil {
 			return manifestbundle.ExactManifest{}, nil, nil, nil, 0, fmt.Errorf("publish Bundle dependency %s: %w", manifest.HexKey(key), err)
 		}
@@ -128,7 +135,7 @@ func selectExactBundleSources(
 			}
 			continue
 		}
-		stream, err := source.OpenManifest(ctx, key)
+		stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return source.OpenManifest(ctx, key) })
 		if err != nil {
 			return manifestbundle.ExactManifest{}, nil, nil, nil, 0, fmt.Errorf("publish Bundle remote dependency %s: %w", manifest.HexKey(key), err)
 		}
@@ -198,7 +205,7 @@ func (p *Publisher) inspectBundleRoot(
 		if err != nil {
 			return "", nil, err
 		}
-		sandboxStream, err := childScope.fetcher.OpenManifest(ctx, key)
+		sandboxStream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return childScope.fetcher.OpenManifest(ctx, key) })
 		if err != nil {
 			return "", nil, fmt.Errorf("publish Bundle: open snapshot sandbox_ref: %w", err)
 		}

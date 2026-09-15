@@ -26,6 +26,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -808,7 +809,7 @@ type failingManifestFetcher struct {
 
 func (f *failingManifestFetcher) OpenManifest(context.Context, store.ContentKey) (fetch.Stream, error) {
 	f.calls++
-	return nil, errors.New("remote Manifest missing")
+	return nil, readerr.Mark(store.ErrNotFound, false)
 }
 
 func TestPrepareSnapshotBundlePlanHandlesOnlyReachableSources(t *testing.T) {

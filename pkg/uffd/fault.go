@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"golang.org/x/sys/unix"
 )
 
@@ -121,17 +124,25 @@ func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint
 	// optional root-visibility resolver may expand it around the fault only after
 	// the shared tail reservation succeeds.
 	// Ordinary Data and no-read runs remain bounded by commonHardEnd below.
-	run, err := h.cfg.Source.RunAt(pageOffset, commonHardEnd-pageOffset)
+	var run sparse.Run
+	err := readretry.Do(h.ctx, func() error {
+		var err error
+		run, err = h.cfg.Source.RunAt(pageOffset, commonHardEnd-pageOffset)
+		if err == io.EOF {
+			return readerr.Mark(err, false)
+		}
+		return err
+	})
 	if err != nil {
-		h.failUrgent(uffdFD, pageVA, "source.RunAt off=0x%x limit=%d: %v", pageOffset, commonHardEnd-pageOffset, err)
+		h.failRead(fmt.Errorf("uffd: source.RunAt off=0x%x: %w", pageOffset, err))
 		return
 	}
 	if err := validateFaultRun(run, pageOffset, commonHardEnd); err != nil {
-		h.failUrgent(uffdFD, pageVA, "%v", err)
+		h.failRead(err)
 		return
 	}
 	if run.End()-pageOffset < PageSize {
-		h.failUrgent(uffdFD, pageVA, "source Run [%d,%d) does not cover fault page", run.Offset(), run.End())
+		h.failRead(fmt.Errorf("uffd: source Run [%d,%d) does not cover fault page", run.Offset(), run.End()))
 		return
 	}
 
@@ -181,9 +192,9 @@ func (h *Handler) handleChunkFault(uffdFD int, pageVA, pageOffset, pageIdx uint6
 		h.handleChunkUrgentOnly(uffdFD, pageVA, pageOffset, pageIdx, anchor, pageBuf)
 		return
 	}
-	if err := h.readRun(window, h.tailBuf[:runLength], 0); err != nil {
+	if err := h.readRequiredRun(window, h.tailBuf[:runLength], 0); err != nil {
 		h.releaseTail()
-		h.failUrgent(uffdFD, pageVA, "chunk window read [%d,%d): %v", window.Offset(), window.End(), err)
+		h.failRead(fmt.Errorf("uffd: chunk window read [%d,%d): %w", window.Offset(), window.End(), err))
 		return
 	}
 	urgentStart := pageOffset - window.Offset()
@@ -274,8 +285,8 @@ func alignedPageEnd(offset uint64) uint64 {
 }
 
 func (h *Handler) handleChunkUrgentOnly(uffdFD int, pageVA, pageOffset, pageIdx uint64, run sparse.Run, pageBuf []byte) {
-	if err := h.readRun(run, pageBuf, 0); err != nil {
-		h.failUrgent(uffdFD, pageVA, "chunk urgent read off=0x%x: %v", pageOffset, err)
+	if err := h.readRequiredRun(run, pageBuf, 0); err != nil {
+		h.failRead(fmt.Errorf("uffd: chunk urgent read off=0x%x: %w", pageOffset, err))
 		return
 	}
 	if _, err := h.urgentCopy(uffdFD, pageVA, pageIdx, StateAbsent, pageBuf); err != nil {
@@ -285,8 +296,8 @@ func (h *Handler) handleChunkUrgentOnly(uffdFD int, pageVA, pageOffset, pageIdx 
 }
 
 func (h *Handler) handleOrdinaryDataFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, run sparse.Run, fillEnd uint64, pageBuf []byte) {
-	if err := h.readRun(run, pageBuf, 0); err != nil {
-		h.failUrgent(uffdFD, pageVA, "data urgent read off=0x%x: %v", pageOffset, err)
+	if err := h.readRequiredRun(run, pageBuf, 0); err != nil {
+		h.failRead(fmt.Errorf("uffd: data urgent read off=0x%x: %w", pageOffset, err))
 		return
 	}
 	outcome, err := h.urgentCopy(uffdFD, pageVA, pageIdx, StateAbsent, pageBuf)
@@ -401,6 +412,26 @@ func (h *Handler) failUrgent(uffdFD int, pageVA uint64, format string, args ...a
 	h.wake(uffdFD, pageVA, PageSize)
 }
 
+// failRead never wakes or fills a failed mandatory request. The owner can
+// kill CH immediately, without waiting for this worker's cleanup.
+func (h *Handler) failRead(err error) {
+	if h.ctx.Err() != nil {
+		return
+	}
+	h.fatalOnce.Do(func() {
+		h.stats.errors.Add(1)
+		h.logf("uffd: mandatory source read failed: %v", err)
+		if h.cfg.ReadFatal != nil {
+			h.cfg.ReadFatal(err)
+		}
+		h.cancel()
+	})
+}
+
+func (h *Handler) readRequiredRun(run sparse.Run, buf []byte, innerOffset uint64) error {
+	return readretry.Do(h.ctx, func() error { return h.readRun(run, buf, innerOffset) })
+}
+
 func (h *Handler) readRun(run sparse.Run, buf []byte, innerOffset uint64) error {
 	started := time.Now()
 	n, err := run.ReadAt(h.ctx, buf, innerOffset)
@@ -410,17 +441,31 @@ func (h *Handler) readRun(run sparse.Run, buf []byte, innerOffset uint64) error 
 		h.stats.sourceReadBytes.Add(uint64(n))
 	}
 	h.stats.sourceReadNs.Add(elapsed)
-	if err == nil && n == len(buf) {
+	if !readerr.IsPermanent(err) && !readretry.IsTerminal(err) && n == len(buf) && (err == nil || err == io.EOF) {
 		h.stats.pageIn.record(elapsed)
 		return nil
 	}
 	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return readerr.Mark(err, false)
+		}
 		return err
 	}
-	return fmt.Errorf("short Run.ReadAt: %d of %d bytes", n, len(buf))
+	return readerr.Mark(fmt.Errorf("short Run.ReadAt: %d of %d bytes", n, len(buf)), false)
 }
 
 func (h *Handler) urgentCopy(fd int, dst uint64, pageIdx uint64, expected PageState, page []byte) (urgentOutcome, error) {
+	if err := h.ctx.Err(); err != nil {
+		return urgentOutcome{}, err
+	}
+	// A synchronous source retry may outlive an observed REMOVE or another
+	// installation. Its old bytes no longer describe a Released page. Apply
+	// the same zero/EEXIST convergence as a fresh fault in that state, and do
+	// not schedule a tail from the obsolete read plan.
+	if state := h.state.Get(pageIdx); state != expected {
+		_, err := h.urgentZero(fd, dst, pageIdx, state)
+		return urgentOutcome{}, err
+	}
 	started := time.Now()
 	completed, err := h.ops.copy(fd, dst, page)
 	h.stats.urgentCopyNs.Add(uint64(time.Since(started).Nanoseconds()))
@@ -430,6 +475,9 @@ func (h *Handler) urgentCopy(fd int, dst uint64, pageIdx uint64, expected PageSt
 }
 
 func (h *Handler) urgentZero(fd int, dst uint64, pageIdx uint64, expected PageState) (urgentOutcome, error) {
+	if err := h.ctx.Err(); err != nil {
+		return urgentOutcome{}, err
+	}
 	started := time.Now()
 	completed, err := h.ops.zeropage(fd, dst, PageSize)
 	h.stats.urgentZeroNs.Add(uint64(time.Since(started).Nanoseconds()))

@@ -205,6 +205,9 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 
 	// T2b: quiesce backends (steady state before the dump).
 	s.Quiescer.Quiesce()
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 
 	// T3: capture all disks once and emit Sandbox E while the same CH/backend
 	// freeze remains held. E is a dependency, not yet the operation root.
@@ -285,6 +288,9 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if err != nil || memoryBaseCloseErr != nil {
 		return nil, fmt.Errorf("absorb Snapshot S: %w", errors.Join(err, memoryBaseCloseErr))
 	}
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 	if err := sink.CommitSnapshot(ctx, out.SnapshotRef, out.SnapshotPath); err != nil {
 		return nil, fmt.Errorf("commit Snapshot S: %w", err)
 	}
@@ -308,6 +314,9 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	out.WallclockPauseMs = pausedAt.Sub(pauseStart).Milliseconds()
 	out.WallclockDumpMs = dumpEnd.Sub(dumpStart).Milliseconds()
 	logf("snapshot: sandbox=%s snapshot=%s memory_resident=%d", out.SandboxRef, out.SnapshotRef, out.MemoryResident)
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 	succeeded = true
 	return out, nil
 }

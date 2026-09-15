@@ -11,6 +11,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 )
 
 // tarLayer is a parent local artifact (tarstream envelope) opened as a
@@ -72,7 +73,7 @@ func openMergeBaseWithOpener(ctx context.Context, raw string, size int64, codec 
 		options = append(options, tarstream.WithCodec(codec, required))
 	}
 	options = append(options, tarstream.WithExpectedDigest(ref.DigestScheme, ref.Digest))
-	stream, err := fetch.OpenTarStream(ref.Path, options...)
+	stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return fetch.OpenTarStream(ref.Path, options...) })
 	if err != nil {
 		return nil, nil, &mergeArtifactError{err: err}
 	}
@@ -91,8 +92,25 @@ func prepareMergeBase(ctx context.Context, stream fetch.Stream, size int64) (*ta
 	if err != nil {
 		return fail(fmt.Errorf("merge base: hole map: %w", err))
 	}
-	reader := fetch.NewReaderAt(ctx, stream)
+	reader := retryMergeReader{ctx: ctx, stream: stream}
 	return &tarLayer{stream: stream, ReadSeeker: io.NewSectionReader(reader, 0, size)}, holes, nil
+}
+
+type retryMergeReader struct {
+	ctx    context.Context
+	stream fetch.Stream
+}
+
+func (r retryMergeReader) ReadAt(buf []byte, offset int64) (int, error) {
+	if offset < 0 || uint64(offset) >= r.stream.Size() {
+		return 0, io.EOF
+	}
+	length := min(uint64(len(buf)), r.stream.Size()-uint64(offset))
+	n, err := readretry.ReadAt(r.ctx, int(length), func() (int, error) { return r.stream.ReadAt(r.ctx, buf[:length], uint64(offset)) })
+	if err == nil && n < len(buf) {
+		err = io.EOF
+	}
+	return n, err
 }
 
 type mergeArtifactError struct{ err error }

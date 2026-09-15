@@ -3,6 +3,7 @@ package uffd
 import (
 	"context"
 	"fmt"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"math"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -32,10 +33,10 @@ func isZeroSource(source SnapshotReader) bool {
 
 func (ZeroSource) RunAt(memfdOffset, limit uint64) (sparse.Run, error) {
 	if limit == 0 {
-		return nil, fmt.Errorf("uffd: zero source: limit must be non-zero")
+		return nil, readerr.Mark(fmt.Errorf("uffd: zero source: limit must be non-zero"), false)
 	}
 	if limit > math.MaxUint64-memfdOffset {
-		return nil, fmt.Errorf("uffd: zero source: range overflows uint64")
+		return nil, readerr.Mark(fmt.Errorf("uffd: zero source: range overflows uint64"), false)
 	}
 	return snapshotZeroRun{offset: memfdOffset, end: memfdOffset + limit}, nil
 }
@@ -64,11 +65,11 @@ func (r snapshotZeroRun) ReadAt(ctx context.Context, buf []byte, innerOffset uin
 
 func validateSnapshotRunRead(offset, end, innerOffset uint64, length int) error {
 	if end <= offset {
-		return fmt.Errorf("uffd: invalid snapshot run [%d,%d)", offset, end)
+		return readerr.Mark(fmt.Errorf("uffd: invalid snapshot run [%d,%d)", offset, end), false)
 	}
 	runLength := end - offset
 	if innerOffset > runLength || uint64(length) > runLength-innerOffset {
-		return fmt.Errorf("uffd: snapshot run read offset %d length %d outside [0,%d)", innerOffset, length, runLength)
+		return readerr.Mark(fmt.Errorf("uffd: snapshot run read offset %d length %d outside [0,%d)", innerOffset, length, runLength), false)
 	}
 	return nil
 }

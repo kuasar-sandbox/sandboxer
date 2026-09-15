@@ -16,8 +16,10 @@ import (
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -129,6 +131,26 @@ func OpenFileWithLocations(
 	localCodec tarstream.Codec,
 	localRequired bool,
 ) (*OpenedFile, error) {
+	return readretry.Open(ctx, func() (*OpenedFile, error) {
+		opened, err := openFileWithLocations(ctx, path, ref, manifestCfg, keyFn, remote, locations, localCodec, localRequired)
+		if errors.Is(err, os.ErrNotExist) {
+			err = readerr.Mark(err, false)
+		}
+		return opened, err
+	})
+}
+
+func openFileWithLocations(
+	ctx context.Context,
+	path string,
+	ref manifest.Ref,
+	manifestCfg *config.ManifestConfig,
+	keyFn ingest.CustomerKeyFunc,
+	remote fetch.Fetcher,
+	locations config.RefLocations,
+	localCodec tarstream.Codec,
+	localRequired bool,
+) (*OpenedFile, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -136,10 +158,10 @@ func OpenFileWithLocations(
 		ref = manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path}
 	}
 	if ref.Scheme != manifest.RefSchemeFile {
-		return nil, fmt.Errorf("artifact: file opener requires file:// ref")
+		return nil, readerr.Mark(fmt.Errorf("artifact: file opener requires file:// ref"), false)
 	}
 	if err := ref.Validate(); err != nil {
-		return nil, err
+		return nil, readerr.Mark(err, false)
 	}
 	path, err := resolveLocatedFileTarget(path, ref, locations)
 	if err != nil {
@@ -171,14 +193,14 @@ func resolveLocatedFileTarget(path string, ref manifest.Ref, locations config.Re
 	}
 	expected, err := locations.ResolveFile(ref, "")
 	if err != nil {
-		return "", err
+		return "", readerr.Mark(err, false)
 	}
 	expected, err = filepath.Abs(expected)
 	if err != nil {
 		return "", fmt.Errorf("artifact: resolve ref-location path: %w", err)
 	}
 	if filepath.Clean(absolute) != filepath.Clean(expected) {
-		return "", fmt.Errorf("artifact: located ref path does not match ref-location %q", ref.Location)
+		return "", readerr.Mark(fmt.Errorf("artifact: located ref path does not match ref-location %q", ref.Location), false)
 	}
 	realDirectory, err := filepath.EvalSymlinks(filepath.Dir(absolute))
 	if err != nil {
@@ -189,7 +211,7 @@ func resolveLocatedFileTarget(path string, ref manifest.Ref, locations config.Re
 		return "", fmt.Errorf("artifact: resolve located artifact: %w", err)
 	}
 	if filepath.Clean(filepath.Dir(realTarget)) != filepath.Clean(realDirectory) {
-		return "", fmt.Errorf("artifact: located alias target escapes ref-location %q", ref.Location)
+		return "", readerr.Mark(fmt.Errorf("artifact: located alias target escapes ref-location %q", ref.Location), false)
 	}
 	return realTarget, nil
 }
@@ -197,7 +219,7 @@ func resolveLocatedFileTarget(path string, ref manifest.Ref, locations config.Re
 // OpenFile uses the process-fixed customer key and lazy remote Fetcher.
 func (s *ProcessStorage) OpenFile(ctx context.Context, path string, ref manifest.Ref) (*OpenedFile, error) {
 	if s == nil {
-		return nil, fmt.Errorf("artifact: process storage is required")
+		return nil, readerr.Mark(fmt.Errorf("artifact: process storage is required"), false)
 	}
 	opened, err := OpenFile(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), s.localCodec, s.localRequired)
 	return opened, protectProcessLocalReadError(s.localCodec, "open local artifact", err)
@@ -207,7 +229,7 @@ func (s *ProcessStorage) OpenFile(ctx context.Context, path string, ref manifest
 // location resolution while retaining ProcessStorage ownership.
 func (s *ProcessStorage) OpenFileWithLocations(ctx context.Context, path string, ref manifest.Ref, locations config.RefLocations) (*OpenedFile, error) {
 	if s == nil {
-		return nil, fmt.Errorf("artifact: process storage is required")
+		return nil, readerr.Mark(fmt.Errorf("artifact: process storage is required"), false)
 	}
 	opened, err := OpenFileWithLocations(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), locations, s.localCodec, s.localRequired)
 	return opened, protectProcessLocalReadError(s.localCodec, "open local artifact", err)
@@ -253,10 +275,10 @@ func DetectFileFormat(path string) (FileFormat, error) {
 
 func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc, remote fetch.Fetcher, locations config.RefLocations) (*OpenedFile, error) {
 	if ref.DigestScheme != "" && ref.DigestScheme != "manifest" {
-		return nil, fmt.Errorf("manifest Bundle rejects @%s identity", ref.DigestScheme)
+		return nil, readerr.Mark(fmt.Errorf("manifest Bundle rejects @%s identity", ref.DigestScheme), false)
 	}
 	if cfg == nil || keyFn == nil {
-		return nil, fmt.Errorf("manifest Bundle requires manifest configuration and customer key")
+		return nil, readerr.Mark(fmt.Errorf("manifest Bundle requires manifest configuration and customer key"), false)
 	}
 	resolvedPath, err := filepath.EvalSymlinks(path)
 	if err != nil {
@@ -283,16 +305,16 @@ func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg 
 		return fail(err)
 	}
 	if !reader.HasManifest(root) {
-		return fail(fmt.Errorf("manifest Bundle root %s is absent", manifest.HexKey(root)))
+		return fail(readerr.Mark(fmt.Errorf("manifest Bundle root %s is absent", manifest.HexKey(root)), false))
 	}
 	customerKey, err := keyFn()
 	if err != nil {
-		return fail(fmt.Errorf("manifest Bundle customer key: %w", err))
+		return fail(readerr.Mark(fmt.Errorf("manifest Bundle customer key: %w", err), false))
 	}
 	_, decryptor, err := manifestcrypto.New(cfg.Crypto)
 	if err != nil {
 		clear(customerKey[:])
-		return fail(err)
+		return fail(readerr.Mark(err, false))
 	}
 	if len(reader.Refs()) != 0 {
 		resolver = newBundleSourceResolver(filepath.Dir(resolvedPath), locations, customerKey, decryptor, verificationOptions(cfg))
@@ -316,7 +338,7 @@ func BundleRootKey(path string, ref manifest.Ref) (store.ContentKey, error) {
 	if ref.DigestScheme == "manifest" {
 		key, err := manifest.ParseHexKey(ref.Digest)
 		if err != nil {
-			return key, fmt.Errorf("manifest Bundle selector: %w", err)
+			return key, readerr.Mark(fmt.Errorf("manifest Bundle selector: %w", err), false)
 		}
 		return key, nil
 	}
@@ -326,18 +348,18 @@ func BundleRootKey(path string, ref manifest.Ref) (store.ContentKey, error) {
 	}
 	base := filepath.Base(realPath)
 	if filepath.Ext(base) != ".bundle" {
-		return store.ContentKey{}, fmt.Errorf("manifest Bundle without @manifest selector requires <64hex>.bundle final filename")
+		return store.ContentKey{}, readerr.Mark(fmt.Errorf("manifest Bundle without @manifest selector requires <64hex>.bundle final filename"), false)
 	}
 	key, err := manifest.ParseHexKey(strings.TrimSuffix(base, ".bundle"))
 	if err != nil {
-		return key, fmt.Errorf("manifest Bundle root from final filename: %w", err)
+		return key, readerr.Mark(fmt.Errorf("manifest Bundle root from final filename: %w", err), false)
 	}
 	return key, nil
 }
 
 func openTarstream(path string, ref manifest.Ref, codec tarstream.Codec, required bool) (*OpenedFile, error) {
 	if ref.DigestScheme == "manifest" {
-		return nil, fmt.Errorf("tarstream rejects @manifest selector")
+		return nil, readerr.Mark(fmt.Errorf("tarstream rejects @manifest selector"), false)
 	}
 	options, err := tarReadOptions(ref, codec, required)
 	if err != nil {
@@ -354,7 +376,7 @@ func openTarstream(path string, ref manifest.Ref, codec tarstream.Codec, require
 	digester, ok := stream.(tarstream.Digester)
 	if !ok {
 		_ = stream.Close()
-		return nil, fmt.Errorf("local tarstream has no declared digest")
+		return nil, readerr.Mark(fmt.Errorf("local tarstream has no declared digest"), false)
 	}
 	scheme, digest := digester.Digest()
 	return &OpenedFile{Stream: stream, format: FileFormatTarstream, digestScheme: scheme, digest: digest}, nil
@@ -362,7 +384,7 @@ func openTarstream(path string, ref manifest.Ref, codec tarstream.Codec, require
 
 func tarReadOptions(ref manifest.Ref, codec tarstream.Codec, required bool) ([]tarstream.ReadOption, error) {
 	if required && codec == nil {
-		return nil, fmt.Errorf("local tarstream: required policy has no codec")
+		return nil, readerr.Mark(fmt.Errorf("local tarstream: required policy has no codec"), false)
 	}
 	var options []tarstream.ReadOption
 	if codec != nil {
@@ -377,11 +399,11 @@ func tarReadOptions(ref manifest.Ref, codec tarstream.Codec, required bool) ([]t
 func validateTarIdentity(ref manifest.Ref, path string, stream fetch.Stream) error {
 	digester, ok := stream.(tarstream.Digester)
 	if !ok {
-		return fmt.Errorf("local tarstream: artifact has no declared digest")
+		return readerr.Mark(fmt.Errorf("local tarstream: artifact has no declared digest"), false)
 	}
 	scheme, digest := digester.Digest()
 	if scheme != tarstream.DigestScheme && scheme != tarstream.DigestSchemeHMAC {
-		return fmt.Errorf("local tarstream: artifact digest scheme is incompatible with policy")
+		return readerr.Mark(fmt.Errorf("local tarstream: artifact digest scheme is incompatible with policy"), false)
 	}
 	if ref.Digest != "" {
 		return nil
@@ -398,7 +420,7 @@ func validateTarIdentity(ref manifest.Ref, path string, stream fetch.Stream) err
 	if digestEqual(stem, digest) {
 		return nil
 	}
-	return fmt.Errorf("local tarstream: content name does not match artifact identity")
+	return readerr.Mark(fmt.Errorf("local tarstream: content name does not match artifact identity"), false)
 }
 
 func digestEqual(left, right string) bool {
