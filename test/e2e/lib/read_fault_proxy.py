@@ -34,7 +34,8 @@ def frame(conn):
 def record(mode, request):
     with lock, open(evidence, "a", encoding="utf8") as out:
         out.write(json.dumps({"mode": mode, "opcode": request[4],
-                              "namespace": request[5]}) + "\n")
+                              "namespace": request[5],
+                              "key": request[7:39].hex()}) + "\n")
 
 
 def serve(client):
@@ -46,9 +47,10 @@ def serve(client):
             connections.add(backend)
         while not stop.is_set():
             request = frame(client)
-            mode = pathlib.Path(control).read_text().strip()
+            mode, _, keys = pathlib.Path(control).read_text().strip().partition(":")
             chunk = request[4] == 1 and request[5] == 1
-            if chunk and mode == "offline":
+            selected = mode not in ("cow", "disk-read") or request[7:39].hex() in keys.split(",")
+            if chunk and selected and mode in ("offline", "cow", "disk-read"):
                 record(mode, request)
                 return  # one transport failure; caller must retain its request
             backend.sendall(request)

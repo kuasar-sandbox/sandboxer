@@ -33,6 +33,15 @@ wait_file() {
     done
     echo "timed out: $pattern in $path" >&2; cat "$path" >&2; return 1
 }
+wait_new_fault() {
+    local before=$1 pid=$2
+    for _ in $(seq 1 200); do
+        [ "$(wc -l < "$WORK/faults.jsonl")" -gt "$before" ] && return
+        kill -0 "$pid" || return 1
+        sleep .05
+    done
+    echo "no new source failure after $before records" >&2; return 1
+}
 mode() { printf '%s\n' "$1" > "$WORK/mode.next"; mv "$WORK/mode.next" "$WORK/mode"; }
 STORE_PORT=$(free_port); CACHE_PORT=$(free_port); HEALTH_PORT=$(free_port)
 cat > "$WORK/store.yaml" <<YAML
@@ -82,6 +91,27 @@ docker image inspect "$IMAGE" --format 'Guest image: {{.Id}} {{json .RepoDigests
 docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$WORK/root.img" --no-progress
 ROOT=$("$BIN/manifest-ctl" store --manifest-config "$WORK/manifest.yaml" --no-progress "$WORK/root.img")
 [ "${#ROOT}" -eq 64 ]
+# A separate data disk isolates the COW and ordinary disk read faults. Its
+# payload's middle blocks are untouched by startup and the warm-up read.
+python3 - "$WORK" <<'PY'
+import json,pathlib,sys
+w=pathlib.Path(sys.argv[1])
+(w/'chunks.before.json').write_text(json.dumps(sorted(p.name for p in (w/'store/chunk').rglob('*') if p.is_file())))
+(w/'cow-data').mkdir()
+with (w/'cow-data/payload').open('wb') as f:
+ for i in range(512): f.write(bytes([i % 251]) * 4096)
+PY
+truncate -s 64M "$WORK/cow.raw"
+mkfs.ext4 -q -F -d "$WORK/cow-data" "$WORK/cow.raw"
+"$BIN/flatten-ctl" tar stream -f "$WORK/cow.img" "$WORK/cow.raw"
+COW_ROOT=$("$BIN/manifest-ctl" store --manifest-config "$WORK/manifest.yaml" --no-progress "$WORK/cow.img")
+python3 - "$WORK" <<'PY'
+import json,pathlib,sys
+w=pathlib.Path(sys.argv[1]);before=set(json.loads((w/'chunks.before.json').read_text()))
+keys=sorted({p.name for p in (w/'store/chunk').rglob('*') if p.is_file()}-before)
+assert keys and all(len(k)==64 for k in keys)
+(w/'cow.keys').write_text(','.join(keys))
+PY
 # The Guest touches captured anonymous pages and partially updates captured
 # disk blocks. Direct I/O forces post-restore COW materialization from source.
 cat > "$WORK/workload.py" <<'PY'
@@ -140,6 +170,85 @@ launch() {
         --stats-json "$WORK/$sid.stats.json" > "$WORK/$sid.log" 2>&1 &
     RUN_PID=$!; SESSIONS+=($RUN_PID)
 }
+# Only the dedicated data disk's immutable chunks fail in this phase. Root
+# reads and UFFD remain available, so neither can delay the Guest before the
+# first partial write reaches the COW base materialization boundary.
+python3 - "$WORK" "$ROOT" "$COW_ROOT" "$BIN" <<'PY'
+import json,pathlib,sys
+w,root,cow,binpath=sys.argv[1:]
+script="""import mmap, os, time
+fd=os.open('/data/payload', os.O_RDWR | os.O_DIRECT)
+buf=mmap.mmap(-1,4096)
+assert os.preadv(fd,[buf],0)==4096 and buf[:]==bytes(4096)
+buf[:512]=b'W'*512
+print('COW-ARMED',flush=True)
+time.sleep(7)
+print('COW-BEGIN',flush=True)
+assert os.pwritev(fd,[memoryview(buf)[:512]],512<<10)==512
+assert os.preadv(fd,[buf],512<<10)==4096
+assert buf[:512]==b'W'*512 and buf[512:]==bytes([128])*3584
+os.fsync(fd)
+print('COW-RECOVERED',flush=True)
+print('DISK-READ-ARMED',flush=True)
+time.sleep(7)
+print('DISK-READ-BEGIN',flush=True)
+assert os.preadv(fd,[buf],1<<20)==4096 and buf[:]==bytes([5])*4096
+print('DISK-READ-RECOVERED',flush=True)
+while True: time.sleep(1)
+"""
+pathlib.Path(w,'cow.yaml').write_text('''resources:
+  capacity: {cpu: 1, memory: 512MiB}
+  allocatable: {cpu: 1, memory: 512MiB}
+boot:
+  kernel: file://%s/vmlinux
+  runtime: file://%s/sandbox-runtime.bundle
+  root:
+    base: manifest://%s
+    overlay: {diff_template: file://%s/seed.diff}
+  disks:
+    - {name: cow, base: manifest://%s}
+mounts:
+  - {target: /data, type: disk, source: cow}
+launch:
+  exec: /usr/local/bin/python3
+  args: %s
+  restart: never
+''' % (binpath,binpath,root,w,cow,json.dumps(['-c',script])))
+PY
+launch cow --config "$WORK/cow.yaml"
+wait_file "$WORK/cow.log" '^COW-ARMED$' "$RUN_PID"
+"$BIN/sandbox-ctl" exec --sandbox-id cow --run-root "$WORK/run" -- /bin/true
+mode "cow:$(cat "$WORK/cow.keys")"
+wait_file "$WORK/cow.log" '^COW-BEGIN$' "$RUN_PID"
+wait_file "$WORK/faults.jsonl" '"mode": "cow"' "$RUN_PID"
+sleep 3
+kill -0 "$RUN_PID"
+! grep -q '^COW-RECOVERED$' "$WORK/cow.log"
+mode healthy
+wait_file "$WORK/cow.log" '^DISK-READ-ARMED$' "$RUN_PID"
+mode "disk-read:$(cat "$WORK/cow.keys")"
+wait_file "$WORK/cow.log" '^DISK-READ-BEGIN$' "$RUN_PID"
+wait_file "$WORK/faults.jsonl" '"mode": "disk-read"' "$RUN_PID"
+sleep 3
+kill -0 "$RUN_PID"
+! grep -q '^DISK-READ-RECOVERED$' "$WORK/cow.log"
+mode healthy
+wait_file "$WORK/cow.log" '^DISK-READ-RECOVERED$' "$RUN_PID"
+kill -TERM "$RUN_PID"; wait "$RUN_PID"
+SESSIONS=()
+python3 - "$WORK/cow.stats.json" "$WORK/faults.jsonl" "$WORK/cow.keys" <<'PY'
+import json,pathlib,sys
+d=json.loads(pathlib.Path(sys.argv[1]).read_text())
+b=next(b for b in d['backends'] if b['name']=='blk2')
+assert b['write']['lat_max_ns']>3_000_000_000, 'COW write never waited for its implicit base read'
+assert b['read']['lat_max_ns']>3_000_000_000, 'ordinary disk read never waited'
+for backend in d['backends']:
+ for kind in ('read','write','flush'): assert backend[kind]['err_count']==0,(backend['name'],kind)
+keys=set(pathlib.Path(sys.argv[3]).read_text().split(','))
+faults=[json.loads(line) for line in pathlib.Path(sys.argv[2]).read_text().splitlines()]
+assert {f['mode'] for f in faults}=={'cow','disk-read'} and all(f['key'] in keys for f in faults)
+print('PASS: isolated real COW partial write and ordinary disk read; unchanged suffix verified; no Guest I/O errors',b['write']['lat_max_ns'],b['read']['lat_max_ns'])
+PY
 launch seed --config "$WORK/sandbox.yaml"
 wait_file "$WORK/seed.log" '^RECOVERY-TICK 20$' "$RUN_PID"
 SNAP=$("$BIN/sandbox-ctl" snapshot --sandbox-id seed --upload --run-root "$WORK/run" 2> "$WORK/seed.snapshot.log")
@@ -197,18 +306,16 @@ mode healthy
 wait_file "$WORK/pending-exec.log" '^READ-RECOVERED$' "$RUN_PID"
 wait "$EXEC_PID"
 # A capture requiring unavailable pages must wait, then preserve the contents.
+BEFORE_OUTAGE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
 mode offline
-sleep 6
+wait_new_fault "$BEFORE_OUTAGE_FAULTS" "$RUN_PID"
 BEFORE_CAPTURE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
 "$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
 CAPTURE_PID=$!
-for _ in $(seq 1 100); do
-    [ "$(wc -l < "$WORK/faults.jsonl")" -gt "$BEFORE_CAPTURE_FAULTS" ] && break
-    kill -0 "$CAPTURE_PID"
-    sleep .1
-done
-[ "$(wc -l < "$WORK/faults.jsonl")" -gt "$BEFORE_CAPTURE_FAULTS" ]
-sleep 3
+wait_new_fault "$BEFORE_CAPTURE_FAULTS" "$CAPTURE_PID"
+# Stay within the existing eight-second quiesce/drain budget. A source
+# retry must delay this operation, not require disabling its health policy.
+sleep 1
 kill -0 "$RUN_PID"; kill -0 "$CAPTURE_PID"
 [ ! -s "$WORK/next.key" ]
 mode healthy
@@ -221,26 +328,34 @@ import json,pathlib,re,sys
 d=json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert d['uffd']['source_read_calls']>0 and d['uffd']['tail_buffered_data']>0
 assert re.search(r'uffd .*inflight=[1-9]',pathlib.Path(sys.argv[2]).read_text())
-assert any(b['write']['lat_max_ns']>1_000_000_000 for b in d['backends']), 'COW write never waited for its implicit base read'
 for b in d['backends']:
  for kind in ('read','write','flush'): assert b[kind]['err_count']==0,(b['name'],kind)
-print('PASS: real UFFD/Chunk window and COW implicit base read; no Guest I/O errors')
+print('PASS: real UFFD/Chunk window; no Guest I/O errors')
 PY
 launch verified --restore "manifest://$NEXT" --config "$WORK/host.yaml"
 wait_file "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
-# A complete corrupt immutable response is a deterministic failure.
+# A complete corrupt immutable response is a deterministic failure, including
+# while a capture is waiting on the runtime's still-required source read.
+BEFORE_OUTAGE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
+mode offline
+wait_new_fault "$BEFORE_OUTAGE_FAULTS" "$RUN_PID"
+BEFORE_FATAL_FAULTS=$(wc -l < "$WORK/faults.jsonl")
+"$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
+FATAL_CAPTURE_PID=$!
+wait_new_fault "$BEFORE_FATAL_FAULTS" "$FATAL_CAPTURE_PID"
+kill -0 "$FATAL_CAPTURE_PID"
+[ ! -s "$WORK/fatal.key" ]
 mode corrupt
-sleep 6
-"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- sh -c 'echo 3 > /proc/sys/vm/drop_caches; cat /recovery.data >/dev/null' > "$WORK/fatal-exec.log" 2>&1 &
-PIDS+=($!)
 wait_file "$WORK/faults.jsonl" '"mode": "corrupt"' "$RUN_PID"
 for _ in $(seq 1 200); do kill -0 "$RUN_PID" 2>/dev/null || break; sleep .05; done
 if kill -0 "$RUN_PID" 2>/dev/null; then echo "fatal did not stop sandbox" >&2; exit 1; fi
 if wait "$RUN_PID"; then echo "fatal returned success" >&2; exit 1; fi
+if wait "$FATAL_CAPTURE_PID"; then echo "fatal capture returned success" >&2; exit 1; fi
+[ ! -s "$WORK/fatal.key" ]
 ! pgrep -s "$RUN_PID" -x cloud-hyperviso >/dev/null
 # The fatal owner must record the source cause, not only a pinger/timeout exit.
 grep 'mandatory source read' "$WORK/verified.log"
 ! grep -qE 'Traceback|Input/output error' "$WORK/verified.log"
 cat "$WORK/faults.jsonl"
-echo "PASS: real CH source recovery, recovered snapshot contents, and whole-VM fatal"
+echo "PASS: real CH source recovery, recovered snapshot contents, and whole-VM fatal without a successful capture"
