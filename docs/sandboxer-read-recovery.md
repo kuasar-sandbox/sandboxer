@@ -1,4 +1,4 @@
-[English](read-recovery.md) | [简体中文](read-recovery_zh.md)
+[English](sandboxer-read-recovery.md) | [简体中文](sandboxer-read-recovery_zh.md)
 
 # Synchronous source read recovery
 
@@ -50,5 +50,5 @@ The healthy retry helper allocates no timer and starts no goroutine. A failed sy
 
 - [Sandbox lifecycle](sandbox.md)
 - [Artifact contracts](sandbox-artifacts.md)
-- [Accelerator read errors and recovery](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/read-recovery.md)
+- [Accelerator read errors and recovery](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/accelerator-read-recovery.md)
 - [Proposal and acceptance checklist](https://github.com/kuasar-sandbox/sandboxer/issues/225)

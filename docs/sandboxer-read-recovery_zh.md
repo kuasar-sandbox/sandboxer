@@ -1,4 +1,4 @@
-[English](read-recovery.md) | [简体中文](read-recovery_zh.md)
+[English](sandboxer-read-recovery.md) | [简体中文](sandboxer-read-recovery_zh.md)
 
 # 同步源读取恢复
 
@@ -50,5 +50,5 @@ worker 在释放 inflight 所有权前报告必需读取 fatal. `ServeAndWait` �
 
 - [Sandbox 生命周期](sandbox_zh.md)
 - [制品合同](sandbox-artifacts_zh.md)
-- [Accelerator 读取错误与恢复](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/read-recovery_zh.md)
+- [Accelerator 读取错误与恢复](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/accelerator-read-recovery_zh.md)
 - [提案与验收清单](https://github.com/kuasar-sandbox/sandboxer/issues/225)

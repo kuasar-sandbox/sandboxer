@@ -893,4 +893,4 @@ device capacity is distinct from an encrypted file's physical length, host disk
 allocation, and the guest filesystem's available file-data space. This migration
 does not introduce arbitrary per-instance capacity selection from one template.
 
-Required source reads, terminal completion rules and shutdown ordering are specified in [Synchronous source read recovery](read-recovery.md).
+Required source reads, terminal completion rules and shutdown ordering are specified in [Synchronous source read recovery](sandboxer-read-recovery.md).

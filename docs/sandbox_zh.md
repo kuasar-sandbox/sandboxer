@@ -922,4 +922,4 @@ mounts:
 文件的物理长度、宿主磁盘实际分配空间、guest 文件系统可用于文件数据的空间并不是
 同一个概念。本次迁移不提供从同一个模板任意选择各实例容量的新能力。
 
-必需源读取、终态 completion 规则和关闭顺序见[同步源读取恢复](read-recovery_zh.md).
+必需源读取、终态 completion 规则和关闭顺序见[同步源读取恢复](sandboxer-read-recovery_zh.md).
