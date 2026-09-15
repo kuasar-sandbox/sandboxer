@@ -704,7 +704,8 @@ capability调用`fetch.ResolveChunkWindow`,以最终组合Stream的元数据把a
 直接使用绕过overlay的物理chunk边界.
 
 Tail reservation在窗口解析及payload读取前取得. Busy时只按原anchor读取并填充当前
-4 KiB fault页;取得reservation后,handler把不大于1 MiB的窗口一次读入已有buffer.
+4 KiB fault页; 取得 reservation 后, handler 同步将不大于 1 MiB 的窗口读入已有 buffer.
+必需源读取暂时失败时, 重新尝试整个窗口.
 对完整可见chunk,这是一次精确的whole-chunk读取;若overlay截断可见性,source仍在
 内部按 chunk 完成必要的解密、解压及配置启用的验证，handler 只接收可安全填充的连续窗口。 Fault
 worker从buffer中间取当前页执行urgent `UFFDIO_COPY`,tail worker先用一个batch填充
@@ -716,7 +717,7 @@ Tail执行前从fault邻接页向外重检state,最多缩短为首次不匹配�
 普通Data handler在worker启动前分配64 KiB共享buffer,具有chunk window capability的
 manifest handler分配1 MiB,Cold `ZeroSource`不分配该buffer;fault和tail路径不扩容、
 不创建临时payload buffer,每个fault worker只持有固定4 KiB urgent buffer. 这是 handler 自身的零新增 payload 分配约束；source内部的Run对象、cache lease及partial-chunk decode
-allocation仍由`SnapshotReader`实现负责. Handler对
+allocation仍由`SnapshotReader`实现负责. 健康路径中, Handler对
 非zero source只调用一次`SnapshotReader.RunAt`;可选chunk window resolver仅在
 accelerator内部继续执行metadata `Stream.RunAt`. Ordinary Data和zero-like run仍分别
 受64 KiB state boundary约束. `ChunkRun`双向候选只包含完整页,并在一次state读锁扫描中截断于
@@ -920,3 +921,5 @@ mounts:
 不会限制 COW 脏数据字节数，也不会在启动或恢复时改变磁盘容量。逻辑块设备容量与加密
 文件的物理长度、宿主磁盘实际分配空间、guest 文件系统可用于文件数据的空间并不是
 同一个概念。本次迁移不提供从同一个模板任意选择各实例容量的新能力。
+
+必需源读取、终态 completion 规则和关闭顺序见[同步源读取恢复](sandboxer-read-recovery_zh.md).

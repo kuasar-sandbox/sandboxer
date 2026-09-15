@@ -12,12 +12,12 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 type cachedBundleSource struct {
 	source bundle.ManifestSource
-	err    error
 }
 
 // bundleSourceResolver owns the flat, lazy, race-safe Reader cache for one
@@ -49,10 +49,10 @@ func (r *bundleSourceResolver) ResolveBundle(ctx context.Context, raw string) (b
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		return bundle.ManifestSource{}, fmt.Errorf("artifact: Bundle resolver is closed")
+		return bundle.ManifestSource{}, readerr.Mark(fmt.Errorf("artifact: Bundle resolver is closed"), false)
 	}
 	if cached, ok := r.cache[raw]; ok {
-		return cached.source, cached.err
+		return cached.source, nil
 	}
 	ref, err := manifest.ParseRef(raw)
 	if err != nil {
@@ -60,16 +60,18 @@ func (r *bundleSourceResolver) ResolveBundle(ctx context.Context, raw string) (b
 	}
 	path, err := r.locations.ResolveFile(ref, r.rootDir)
 	if err != nil {
-		err = fmt.Errorf("%w: %s: %v", bundle.ErrSourceUnavailable, raw, err)
-		r.cache[raw] = cachedBundleSource{err: err}
+		err = fmt.Errorf("%w: %s: %w", bundle.ErrSourceUnavailable, raw, err)
 		return bundle.ManifestSource{}, err
 	}
 	reader, err := bundle.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			err = fmt.Errorf("%w: %s: %v", bundle.ErrSourceUnavailable, raw, err)
+			err = fmt.Errorf("%w: %s: %w", bundle.ErrSourceUnavailable, raw, err)
 		}
-		r.cache[raw] = cachedBundleSource{err: err}
+		return bundle.ManifestSource{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = reader.Close()
 		return bundle.ManifestSource{}, err
 	}
 	source := bundle.ManifestSource{

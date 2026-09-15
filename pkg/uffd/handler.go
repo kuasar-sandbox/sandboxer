@@ -45,6 +45,11 @@ const (
 // Config gathers everything the handler needs from the caller. Memfd /
 // BackendVA / Size come from pkg/memory.Memfd.
 type Config struct {
+	// Context follows the VM read lifetime. ReadFatal reports a mandatory
+	// source failure to its owner and must not synchronously join this handler.
+	Context   context.Context
+	ReadFatal func(error)
+
 	// Underlying memfd fd (for pread on the rare Loaded fault path).
 	MemfdFD int
 
@@ -144,6 +149,7 @@ type Handler struct {
 	readerDone chan struct{} // closed when runReader exits — Close() waits on this before signalling stop, so the flusher's drain pass sees no further pushes
 	readerStop atomic.Bool
 	closeOnce  sync.Once
+	fatalOnce  sync.Once
 	wg         sync.WaitGroup
 	queue      []chan faultEvent
 
@@ -280,7 +286,11 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		queues[i] = make(chan faultEvent, 256)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	parent := cfg.Context
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
 	var tailBuf []byte
 	if !isZeroSource(cfg.Source) {
 		bufferBytes := ordinaryDataFaultFillBytes
@@ -340,6 +350,9 @@ func (h *Handler) AddUffd(uffdFD int) error {
 	}
 	h.uffdsMu.Lock()
 	defer h.uffdsMu.Unlock()
+	if h.closing.Load() || h.ctx.Err() != nil {
+		return errors.New("uffd: handler is closed")
+	}
 	idx := len(h.uffds)
 	ev := unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(uffdFD)}
 	if err := unix.EpollCtl(h.epfd, unix.EPOLL_CTL_ADD, uffdFD, &ev); err != nil {
@@ -524,6 +537,7 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 		case h.queue[hashed] <- faultEvent{address: pf.Address, flags: pf.Flags, uffdFD: fromFD, queued: time.Now()}:
 			recordAtomicMax(&h.stats.queueDepthHWM, uint64(h.QueueDepth()))
 		case <-h.stop:
+		case <-h.ctx.Done():
 		}
 	case uffdEventRemove, uffdEventUnmap:
 		rm := (*uffdMsgRemove)(unsafe.Pointer(&msg.Arg[0]))
@@ -718,8 +732,10 @@ func (h *Handler) runWorker(idx int) {
 		select {
 		case <-h.stop:
 			return
+		case <-h.ctx.Done():
+			return
 		case ev, ok := <-q:
-			if !ok {
+			if !ok || h.ctx.Err() != nil {
 				return
 			}
 			if !ev.queued.IsZero() {

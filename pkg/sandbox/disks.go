@@ -12,6 +12,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
@@ -231,7 +232,7 @@ func OpenManifestStream(ctx context.Context, keyRef string, fetcher fetch.Fetche
 	if err != nil {
 		return nil, 0, err
 	}
-	stream, err := fetcher.OpenManifest(ctx, key)
+	stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return fetcher.OpenManifest(ctx, key) })
 	if err != nil {
 		return nil, 0, err
 	}

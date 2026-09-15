@@ -17,6 +17,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	storeclient "github.com/kuasar-sandbox/accelerator/pkg/store/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -139,31 +140,39 @@ func (s *ProcessStorage) Close() error {
 }
 
 type onDemandManifestFetcher struct {
-	mu          sync.Mutex
-	cfg         *config.ManifestConfig
-	keyFn       ingest.CustomerKeyFunc
-	initialized bool
-	closed      bool
-	inner       fetch.Fetcher
-	closer      io.Closer
-	err         error
+	mu     sync.Mutex
+	cfg    *config.ManifestConfig
+	keyFn  ingest.CustomerKeyFunc
+	closed bool
+	inner  fetch.Fetcher
+	closer io.Closer
 }
 
 func (f *onDemandManifestFetcher) OpenManifest(ctx context.Context, key store.ContentKey) (fetch.Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
-		return nil, fmt.Errorf("manifest fetcher is closed")
+		return nil, readerr.Mark(fmt.Errorf("manifest fetcher is closed"), false)
 	}
-	if !f.initialized {
-		f.inner, f.closer, f.err = newManifestFetcher(f.cfg, f.keyFn)
-		f.initialized = true
+	if f.inner == nil {
+		inner, closer, err := newManifestFetcher(f.cfg, f.keyFn)
+		if err == nil {
+			err = ctx.Err()
+		}
+		if err != nil {
+			if closer != nil {
+				_ = closer.Close()
+			}
+			f.mu.Unlock()
+			return nil, err
+		}
+		f.inner, f.closer = inner, closer
 	}
-	inner, err := f.inner, f.err
+	inner := f.inner
 	f.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
 	return inner.OpenManifest(ctx, key)
 }
 
@@ -185,19 +194,19 @@ func (f *onDemandManifestFetcher) Close() error {
 
 func newManifestFetcher(cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc) (fetch.Fetcher, io.Closer, error) {
 	if cfg == nil {
-		return nil, nil, fmt.Errorf("manifest config is required")
+		return nil, nil, readerr.Mark(fmt.Errorf("manifest config is required"), false)
 	}
 	if keyFn == nil {
-		return nil, nil, fmt.Errorf("customer key resolver is required")
+		return nil, nil, readerr.Mark(fmt.Errorf("customer key resolver is required"), false)
 	}
 	customerKey, err := keyFn()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, readerr.Mark(err, false)
 	}
 	defer clear(customerKey[:])
 	_, decryptor, err := crypto.New(cfg.Crypto)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, readerr.Mark(err, false)
 	}
 	if cfg.Cache.Endpoint != "" {
 		timeout, err := optionalDuration(cfg.Cache.Timeout, "cache.timeout")
@@ -211,7 +220,7 @@ func newManifestFetcher(cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc
 		return fetch.NewFetcherWithOptions(customerKey, client, decryptor, verificationOptions(cfg)), client, nil
 	}
 	if cfg.Store.Endpoint == "" {
-		return nil, nil, fmt.Errorf("manifest: cache.endpoint or store.endpoint required for fetch")
+		return nil, nil, readerr.Mark(fmt.Errorf("manifest: cache.endpoint or store.endpoint required for fetch"), false)
 	}
 	timeout, err := optionalDuration(cfg.Store.Timeout, "store.timeout")
 	if err != nil {
@@ -230,7 +239,7 @@ func optionalDuration(raw, field string) (time.Duration, error) {
 	}
 	value, err := time.ParseDuration(raw)
 	if err != nil {
-		return 0, fmt.Errorf("manifest: %s: %w", field, err)
+		return 0, readerr.Mark(fmt.Errorf("manifest: %s: %w", field, err), false)
 	}
 	return value, nil
 }

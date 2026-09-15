@@ -1,11 +1,16 @@
 package vhost
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"runtime"
 	"syscall"
 	"unsafe"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 )
 
 // runWorker handles virtq IO for one queue. It blocks reading the kick
@@ -62,13 +67,29 @@ func (s *Server) runWorker(idx int, q *virtq) {
 		// block here while a snapshot is in progress. Once Resume()
 		// releases it, this iteration runs and processQueue will scan
 		// the avail ring including any KICKs that piled up during pause.
-		s.pauseMu.Lock()
+		if err := s.pauseMu.lock(q.readContext()); err != nil {
+			return
+		}
+		if q.stopped() != nil {
+			s.pauseMu.Unlock()
+			return
+		}
 		s.inflight.Add(1)
 		s.pauseMu.Unlock()
 
 		err = s.processQueue(q)
+		// Publish the runtime cause before Quiesce can pass this request.
+		// The owner callback must never synchronously join this worker.
+		// Classify the returned terminal, not a later queue-stop race.
+		// Explicit permanent causes can themselves wrap cancellation.
+		if readretry.IsTerminal(err) && (readerr.IsPermanent(err) || !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) && s.onReadFatal != nil {
+			s.onReadFatal(err)
+		}
 		s.inflight.Done()
 		if err != nil {
+			if readretry.IsTerminal(err) {
+				return
+			}
 			if errors.Is(err, syscall.EBADF) {
 				select {
 				case <-q.stop:
@@ -91,8 +112,17 @@ func (s *Server) processQueue(q *virtq) error {
 	headIdx := availRing.idx
 
 	for q.baseIdx != headIdx {
+		if err := q.stopped(); err != nil {
+			return err
+		}
 		descIdx := availRing.ring[q.baseIdx%uint16(q.num)]
 		written, err := s.processChain(q, descIdx)
+		if readretry.IsTerminal(err) {
+			return err
+		}
+		if stopped := q.stopped(); stopped != nil {
+			return stopped
+		}
 		if err != nil {
 			s.logf("vhost: chain %d: %v", descIdx, err)
 		}
@@ -259,6 +289,9 @@ func (s *Server) appendSeg(c *chain, d vringDesc) error {
 // the IO, and writes the status byte. Returns the number of bytes written
 // to device-writable buffers (i.e. to put in the used ring entry).
 func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
+	if err := q.stopped(); err != nil {
+		return 0, err
+	}
 	c, err := s.walkChain(q, headIdx)
 	if err != nil {
 		return 0, err
@@ -279,7 +312,7 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 	// Status byte is the last byte of the last writable segment.
 	statusSeg := c.writeSegs[len(c.writeSegs)-1]
 	status := &statusSeg[len(statusSeg)-1]
-	*status = BlkStatusOK
+	statusValue := byte(BlkStatusOK)
 
 	bytesIO := 0
 	switch hdr.Type {
@@ -291,21 +324,33 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 				// last segment may contain status byte at end; if it's only
 				// 1 byte, skip data here. Otherwise, use all but last byte.
 				if len(seg) > 1 {
-					n, err := s.backend.ReadAt(seg[:len(seg)-1], offset)
+					n, err := s.readAt(q.readContext(), seg[:len(seg)-1], offset)
+					if readretry.IsTerminal(err) {
+						return 0, err
+					}
+					if stopped := q.stopped(); stopped != nil {
+						return 0, stopped
+					}
 					bytesIO += n
 					offset += int64(n)
-					if err != nil && !errors.Is(err, syscall.EAGAIN) {
-						*status = BlkStatusIOErr
+					if err != nil && !errors.Is(err, syscall.EAGAIN) && !(errors.Is(err, io.EOF) && n == len(seg)-1) {
+						statusValue = BlkStatusIOErr
 						break
 					}
 				}
 				continue
 			}
-			n, err := s.backend.ReadAt(seg, offset)
+			n, err := s.readAt(q.readContext(), seg, offset)
+			if readretry.IsTerminal(err) {
+				return 0, err
+			}
+			if stopped := q.stopped(); stopped != nil {
+				return 0, stopped
+			}
 			bytesIO += n
 			offset += int64(n)
-			if err != nil && !errors.Is(err, syscall.EAGAIN) {
-				*status = BlkStatusIOErr
+			if err != nil && !errors.Is(err, syscall.EAGAIN) && !(errors.Is(err, io.EOF) && n == len(seg)) {
+				statusValue = BlkStatusIOErr
 				break
 			}
 		}
@@ -317,14 +362,20 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 			if i == 0 {
 				continue // header
 			}
-			n, err := s.backend.WriteAt(seg, offset)
+			n, err := s.writeAt(q.readContext(), seg, offset)
+			if readretry.IsTerminal(err) {
+				return 0, err
+			}
+			if stopped := q.stopped(); stopped != nil {
+				return 0, stopped
+			}
 			bytesIO += n
 			offset += int64(n)
 			if err != nil {
 				if errors.Is(err, ErrReadOnly) {
-					*status = BlkStatusUnsupp
+					statusValue = BlkStatusUnsupp
 				} else {
-					*status = BlkStatusIOErr
+					statusValue = BlkStatusIOErr
 				}
 				break
 			}
@@ -332,14 +383,19 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 
 	case BlkTypeFlush:
 		if err := s.backend.Flush(); err != nil {
-			*status = BlkStatusIOErr
+			statusValue = BlkStatusIOErr
 		}
 
 	default:
 		// Optional commands, including DISCARD and WRITE_ZEROES, are not
 		// advertised by our minimal profile. Never report false success.
-		*status = BlkStatusUnsupp
+		statusValue = BlkStatusUnsupp
 	}
+
+	if err := q.stopped(); err != nil {
+		return 0, err
+	}
+	*status = statusValue
 
 	// Number of bytes written to device-writable buffers = data bytes for
 	// IN + 1 status byte. Other commands write only the status byte.

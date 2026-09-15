@@ -297,3 +297,42 @@ func openResolverRoot(t testing.TB, path string, cfg *manifest.Config, keyFn fun
 	}
 	return opened
 }
+
+func TestBundleResolverFailureAndCancellationAreNotSticky(t *testing.T) {
+	customerKey := [32]byte{0x44}
+	keyFn := func() ([32]byte, error) { return customerKey, nil }
+	cfg := &manifest.Config{Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}}, Crypto: manifestcrypto.Config{Chunk: "aes", Manifest: "aes"}}
+	directory := t.TempDir()
+	_, sourcePath, key := writeResolverBundle(t, directory, "recover-source", cfg, keyFn, nil, true, 0x51)
+	_, rootPath, _ := writeResolverBundle(t, directory, "recover-root", cfg, keyFn, []string{"file://" + filepath.Base(sourcePath)}, false, 0x52)
+	if err := os.Rename(sourcePath, sourcePath+".offline"); err != nil {
+		t.Fatal(err)
+	}
+	opened := openResolverRoot(t, rootPath, cfg, keyFn, nil)
+	defer opened.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := opened.ManifestFetcher().SelectManifest(ctx, key); err == nil {
+		t.Fatal("canceled selection succeeded")
+	}
+	if _, err := opened.ManifestFetcher().SelectManifest(context.Background(), key); err == nil {
+		t.Fatal("missing source selected")
+	}
+	if err := os.Rename(sourcePath+".offline", sourcePath); err != nil {
+		t.Fatal(err)
+	}
+	selected, err := opened.ManifestFetcher().SelectManifest(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := opened.ManifestFetcher().SelectManifest(context.Background(), key)
+	if err != nil || again.Reader != selected.Reader {
+		t.Fatalf("successful source not reused: %v", err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.ManifestFetcher().SelectManifest(context.Background(), key); err == nil {
+		t.Fatal("closed resolver revived")
+	}
+}

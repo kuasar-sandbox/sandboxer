@@ -10,6 +10,8 @@ import (
 	"os"
 	"sync"
 	"syscall"
+
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 )
 
 // Backend is the per-device abstraction. blk0 (read-only base image)
@@ -61,10 +63,12 @@ var ErrReadOnly = fmt.Errorf("vhost: backend is read-only")
 // hypervisor master connects exactly once; on disconnect, the server
 // reaps virtq workers and stops.
 type Server struct {
-	socketPath string
-	backend    Backend
-	logf       func(format string, args ...any)
-	stats      *Stats
+	socketPath  string
+	backend     Backend
+	logf        func(format string, args ...any)
+	stats       *Stats
+	ctx         context.Context
+	onReadFatal func(error)
 
 	// unified-memfd invariant (docs/cloud-hypervisor.md §3.1): SET_MEM_TABLE must arrive with
 	// fds whose inode matches memfdInode; mmapBytes are sub-slices of
@@ -73,7 +77,7 @@ type Server struct {
 	memfdSlab  []byte
 
 	// Quiesce/Resume gate for snapshot pause window (docs/sandbox.md §11.5).
-	pauseMu  sync.Mutex
+	pauseMu  pauseGate
 	inflight sync.WaitGroup
 
 	// negotiated state (modified by master)
@@ -107,8 +111,12 @@ type virtq struct {
 	callFd    int
 	enabled   bool
 
-	stop chan struct{}
-	done chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stopOnce sync.Once
+	drainMu  sync.Mutex
 }
 
 // NumQueues is the fixed number of request queues per device. The minimal
@@ -128,6 +136,67 @@ func NewServer(socketPath string, backend Backend, logf func(format string, args
 		queues:     make([]*virtq, NumQueues),
 		stop:       make(chan struct{}),
 	}
+}
+
+// SetReadFatal installs the runtime owner's non-blocking termination report.
+// It must be set before Serve; it must not synchronously Stop or join workers.
+func (s *Server) SetReadFatal(report func(error)) { s.onReadFatal = report }
+
+func (q *virtq) readContext() context.Context {
+	if q.ctx != nil {
+		return q.ctx
+	}
+	return context.Background()
+}
+
+func (q *virtq) stopped() error {
+	select {
+	case <-q.stop:
+		return readretry.Terminal(context.Canceled)
+	default:
+	}
+	return readretry.Terminal(q.readContext().Err())
+}
+
+func (q *virtq) stopReading() {
+	if q.cancel != nil {
+		q.cancel()
+	}
+	if q.stop != nil {
+		q.stopOnce.Do(func() {
+			select {
+			case <-q.stop:
+			default:
+				close(q.stop)
+			}
+		})
+	}
+}
+
+func (b *ReadOnlyBackend) readAt(ctx context.Context, buf []byte, off int64) (int, error) {
+	return readBlock(ctx, b.R, buf, off)
+}
+func (b *CowBackend) readAt(ctx context.Context, buf []byte, off int64) (int, error) {
+	return b.C.readAt(ctx, buf, off)
+}
+func (b *CowBackend) writeAt(ctx context.Context, buf []byte, off int64) (int, error) {
+	return b.C.writeAt(ctx, buf, off)
+}
+func (s *Server) readAt(ctx context.Context, buf []byte, off int64) (int, error) {
+	if b, ok := s.backend.(interface {
+		readAt(context.Context, []byte, int64) (int, error)
+	}); ok {
+		return b.readAt(ctx, buf, off)
+	}
+	return s.backend.ReadAt(buf, off)
+}
+func (s *Server) writeAt(ctx context.Context, buf []byte, off int64) (int, error) {
+	if b, ok := s.backend.(interface {
+		writeAt(context.Context, []byte, int64) (int, error)
+	}); ok {
+		return b.writeAt(ctx, buf, off)
+	}
+	return s.backend.WriteAt(buf, off)
 }
 
 // EnableStats turns on per-request counters and coverage tracking,
@@ -218,7 +287,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	if s.listener == nil {
 		return fmt.Errorf("vhost: Listen not called")
 	}
-	defer s.cleanup()
+	s.ctx = ctx
+	defer func() { s.Stop(); s.cleanup() }()
 
 	go func() {
 		<-ctx.Done()
@@ -340,27 +410,23 @@ func stopAndDrainQueues(queues []*virtq) {
 		if q == nil {
 			continue
 		}
-		if q.stop != nil {
-			select {
-			case <-q.stop:
-			default:
-				close(q.stop)
-			}
-		}
+		q.drainMu.Lock()
+		q.stopReading()
 		if q.kickFd >= 0 {
 			// Wake the blocking Read.
 			one := []byte{1, 0, 0, 0, 0, 0, 0, 0}
 			_, _ = syscall.Write(q.kickFd, one)
 			_ = syscall.Close(q.kickFd)
-			q.kickFd = -1
-		}
-		if q.callFd >= 0 {
-			_ = syscall.Close(q.callFd)
-			q.callFd = -1
 		}
 		if q.done != nil {
 			<-q.done
 		}
+		q.kickFd = -1
+		if q.callFd >= 0 {
+			_ = syscall.Close(q.callFd)
+			q.callFd = -1
+		}
+		q.drainMu.Unlock()
 	}
 }
 
@@ -660,15 +726,25 @@ func (s *Server) handleGetVringBase(conn *net.UnixConn, m *Message) error {
 	}
 	s.mu.Lock()
 	q := s.ensureQueue(idx)
-	base := q.baseIdx
-	q.enabled = false
 	s.mu.Unlock()
+	q.drainMu.Lock()
+	defer q.drainMu.Unlock()
 	// Stop the worker if running.
 	if q.stop != nil {
-		close(q.stop)
+		q.stopReading()
+		// Reuse the existing eventfd wake mechanism, retaining the descriptor
+		// for a subsequent SET_VRING_BASE/ENABLE on this same master.
+		_, _ = syscall.Write(q.kickFd, []byte{1, 0, 0, 0, 0, 0, 0, 0})
 		<-q.done
-		q.stop = nil
+		select {
+		case <-s.stop:
+		default:
+			q.stop = nil
+			q.stopOnce = sync.Once{}
+		}
 	}
+	base := q.baseIdx
+	q.enabled = false
 	out := make([]byte, 8)
 	binary.LittleEndian.PutUint32(out[0:4], uint32(idx))
 	binary.LittleEndian.PutUint32(out[4:8], uint32(base))
@@ -693,11 +769,19 @@ func (s *Server) handleSetVringKick(m *Message) error {
 	}
 	s.mu.Lock()
 	q := s.ensureQueue(idx)
+	s.mu.Unlock()
+	q.drainMu.Lock()
+	select {
+	case <-s.stop:
+		q.drainMu.Unlock()
+		return net.ErrClosed
+	default:
+	}
 	if q.kickFd >= 0 {
 		_ = syscall.Close(q.kickFd)
 	}
 	q.kickFd = m.Fds[0]
-	s.mu.Unlock()
+	q.drainMu.Unlock()
 	s.maybeStartWorker(idx)
 	return nil
 }
@@ -717,11 +801,19 @@ func (s *Server) handleSetVringCall(m *Message) error {
 	}
 	s.mu.Lock()
 	q := s.ensureQueue(idx)
+	s.mu.Unlock()
+	q.drainMu.Lock()
+	select {
+	case <-s.stop:
+		q.drainMu.Unlock()
+		return net.ErrClosed
+	default:
+	}
 	if q.callFd >= 0 {
 		_ = syscall.Close(q.callFd)
 	}
 	q.callFd = m.Fds[0]
-	s.mu.Unlock()
+	q.drainMu.Unlock()
 	return nil
 }
 
@@ -749,13 +841,27 @@ func (s *Server) handleSetVringEnable(m *Message) error {
 func (s *Server) maybeStartWorker(idx int) {
 	s.mu.Lock()
 	q := s.queues[idx]
-	if q == nil || q.kickFd < 0 || q.callFd < 0 || q.descAddr == 0 || q.stop != nil {
-		s.mu.Unlock()
+	s.mu.Unlock()
+	if q == nil {
+		return
+	}
+	q.drainMu.Lock()
+	defer q.drainMu.Unlock()
+	select {
+	case <-s.stop:
+		return
+	default:
+	}
+	if q.kickFd < 0 || q.callFd < 0 || q.descAddr == 0 || q.stop != nil {
 		return
 	}
 	q.stop = make(chan struct{})
 	q.done = make(chan struct{})
-	s.mu.Unlock()
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	q.ctx, q.cancel = context.WithCancel(ctx)
 	go s.runWorker(idx, q)
 	s.logf("vhost: started worker for queue %d", idx)
 }

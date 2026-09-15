@@ -1,12 +1,14 @@
 package vhost
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 )
 
 // BlockCOW provides a COW (copy-on-write) read-write block view on top
@@ -133,6 +135,10 @@ func (c *BlockCOW) blockLock(blk int64) *sync.RWMutex {
 // ReadAt reads len(buf) bytes starting at offset, routing per-block
 // reads to either the diff file or the base reader.
 func (c *BlockCOW) ReadAt(buf []byte, offset int64) (int, error) {
+	return c.readAt(nil, buf, offset)
+}
+
+func (c *BlockCOW) readAt(ctx context.Context, buf []byte, offset int64) (int, error) {
 	if len(buf) == 0 {
 		if offset < 0 || offset > c.size {
 			return 0, io.EOF
@@ -165,10 +171,8 @@ func (c *BlockCOW) ReadAt(buf []byte, offset int64) (int, error) {
 				return int(pos), err
 			}
 		} else if c.base != nil && offset+pos < c.base.Size() {
-			n, err := c.base.ReadAt(chunk, offset+pos)
-			if err != nil && !errors.Is(err, io.EOF) {
-				// Zero the rest of the chunk if base reader returned partial.
-				zeroSlice(chunk[n:])
+			n, err := readBlock(ctx, c.base, chunk, offset+pos)
+			if readretry.IsTerminal(err) || (err != nil && !errors.Is(err, io.EOF)) {
 				lock.RUnlock()
 				return int(pos) + n, err
 			}
@@ -186,6 +190,10 @@ func (c *BlockCOW) ReadAt(buf []byte, offset int64) (int, error) {
 // clean block materializes the complete block from base (or zeros), merges the
 // caller's bytes, writes the complete block, and only then marks it dirty.
 func (c *BlockCOW) WriteAt(buf []byte, offset int64) (int, error) {
+	return c.writeAt(nil, buf, offset)
+}
+
+func (c *BlockCOW) writeAt(ctx context.Context, buf []byte, offset int64) (int, error) {
 	if offset < 0 || offset > c.size || int64(len(buf)) > c.size-offset {
 		return 0, fmt.Errorf("vhost: write out of bounds: offset=%d len=%d size=%d", offset, len(buf), c.size)
 	}
@@ -201,7 +209,7 @@ func (c *BlockCOW) WriteAt(buf []byte, offset int64) (int, error) {
 
 		lock := c.blockLock(blk)
 		lock.Lock()
-		n, err := c.writeBlockLocked(buf[written:written+chunkLen], pos, blk)
+		n, err := c.writeBlockLocked(ctx, buf[written:written+chunkLen], pos, blk)
 		lock.Unlock()
 		written += n
 		if err != nil {
@@ -213,7 +221,7 @@ func (c *BlockCOW) WriteAt(buf []byte, offset int64) (int, error) {
 
 // writeBlockLocked writes a range wholly contained in blk. The caller holds
 // that block's stripe lock exclusively.
-func (c *BlockCOW) writeBlockLocked(buf []byte, offset, blk int64) (int, error) {
+func (c *BlockCOW) writeBlockLocked(ctx context.Context, buf []byte, offset, blk int64) (int, error) {
 	if c.blockDirty(blk) {
 		return c.diff.WriteAt(buf, offset)
 	}
@@ -233,8 +241,8 @@ func (c *BlockCOW) writeBlockLocked(buf []byte, offset, blk int64) (int, error) 
 		if remaining := c.base.Size() - blockStart; remaining < readLen {
 			readLen = remaining
 		}
-		n, err := c.base.ReadAt(block[:readLen], blockStart)
-		if err != nil && !errors.Is(err, io.EOF) {
+		n, err := readBlock(ctx, c.base, block[:readLen], blockStart)
+		if readretry.IsTerminal(err) || (err != nil && !errors.Is(err, io.EOF)) {
 			return 0, fmt.Errorf("vhost: materialize block %d from base: %w", blk, err)
 		}
 		if int64(n) != readLen {

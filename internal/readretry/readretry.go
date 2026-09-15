@@ -1,0 +1,124 @@
+// Package readretry owns synchronous retries of immutable source reads.
+// The caller retains its request and buffers until Do returns. Only the
+// runtime owner decides whether a terminal mandatory read ends the VM.
+package readretry
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"time"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
+)
+
+// terminal distinguishes a stopped source read from an independent writable
+// diff error or an unsupported guest request. In particular EOF/EAGAIN
+// compatibility paths must not consume it as a normal completion.
+type terminal struct{ err error }
+
+func (e *terminal) Error() string { return e.err.Error() }
+func (e *terminal) Unwrap() error { return e.err }
+
+// Terminal identifies a source result that the consuming flow must not
+// publish as a guest completion. It carries no process-termination policy.
+func Terminal(err error) error {
+	if err == nil || IsTerminal(err) {
+		return err
+	}
+	return &terminal{err}
+}
+
+// IsTerminal recognizes a source read that cannot complete in this operation.
+func IsTerminal(err error) bool {
+	if err == nil {
+		return false
+	}
+	var e *terminal
+	return errors.As(err, &e)
+}
+
+// ReadAt retries one declared complete range, without joining partial
+// responses from different attempts. A full read with ordinary EOF is valid.
+func ReadAt(ctx context.Context, size int, read func() (int, error)) (int, error) {
+	var n int
+	err := Do(ctx, func() error {
+		var err error
+		n, err = read()
+		if IsTerminal(err) || readerr.IsPermanent(err) {
+			return err
+		}
+		if n == size && (err == nil || err == io.EOF) {
+			return nil
+		}
+		if err == nil || err == io.EOF || err == io.ErrUnexpectedEOF {
+			return readerr.Mark(fmt.Errorf("source read %d of %d bytes: %w", n, size, io.ErrUnexpectedEOF), false)
+		}
+		return err
+	})
+	return n, err
+}
+
+// Open retries a read-only open whose unsuccessful attempts already clean
+// up their resources. A successful open concurrent with operation cancellation
+// is closed here rather than escaping into an ended operation.
+func Open[T io.Closer](ctx context.Context, open func() (T, error)) (T, error) {
+	var value T
+	opened := false
+	err := Do(ctx, func() error {
+		var err error
+		value, err = open()
+		opened = err == nil
+		return err
+	})
+	if err != nil && opened {
+		_ = value.Close()
+		var zero T
+		return zero, err
+	}
+	return value, err
+}
+
+// Do retries only the supplied read attempt. Unknown access failures and
+// backend-local timeouts/cancellations remain retryable while ctx is alive.
+// There is no attempt or elapsed-time limit. The healthy path needs neither
+// a timer nor a goroutine; retries use one interruptible timer.
+func Do(ctx context.Context, read func() error) error {
+	const initial, maximum = 10 * time.Millisecond, time.Second
+	delay := initial
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		if err := context.Cause(ctx); err != nil {
+			return &terminal{err}
+		}
+		err := read()
+		if cause := context.Cause(ctx); cause != nil {
+			return &terminal{cause}
+		}
+		if err == nil {
+			return nil
+		}
+		if IsTerminal(err) || readerr.IsPermanent(err) {
+			return &terminal{err}
+		}
+		wait := delay/2 + time.Duration(rand.Int64N(int64(delay-delay/2)+1))
+		if timer == nil {
+			timer = time.NewTimer(wait)
+		} else {
+			timer.Reset(wait)
+		}
+		select {
+		case <-ctx.Done():
+			return &terminal{context.Cause(ctx)}
+		case <-timer.C:
+		}
+		delay = min(delay*2, maximum)
+	}
+}

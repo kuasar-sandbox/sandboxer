@@ -7,7 +7,9 @@ import (
 	"io"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 )
 
 // StreamSnapshotSource resolves a snapshot bundle's memory prefix through a
@@ -70,7 +72,7 @@ func (s *StreamSnapshotSource) RunAt(memfdOffset, limit uint64) (sparse.Run, err
 		return nil, io.EOF
 	}
 	if limit == 0 {
-		return nil, fmt.Errorf("uffd: snapshot RunAt: limit must be non-zero")
+		return nil, readerr.Mark(fmt.Errorf("uffd: snapshot RunAt: limit must be non-zero"), false)
 	}
 
 	bound := s.ramSize
@@ -84,6 +86,9 @@ func (s *StreamSnapshotSource) RunAt(memfdOffset, limit uint64) (sparse.Run, err
 
 	run, err := s.stream.RunAt(memfdOffset, bound-memfdOffset)
 	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			err = readerr.Mark(err, false)
+		}
 		return nil, fmt.Errorf("uffd: snapshot RunAt at %d: %w", memfdOffset, err)
 	}
 	if err := validateResolvedSnapshotRun(run, memfdOffset, bound); err != nil {
@@ -100,6 +105,9 @@ func (s *StreamSnapshotSource) RunAt(memfdOffset, limit uint64) (sparse.Run, err
 	for zeroEnd < bound {
 		next, nextErr := s.stream.RunAt(zeroEnd, bound-zeroEnd)
 		if nextErr != nil {
+			if nextErr == io.EOF || nextErr == io.ErrUnexpectedEOF {
+				nextErr = readerr.Mark(nextErr, false)
+			}
 			return nil, fmt.Errorf("uffd: snapshot RunAt at %d: %w", zeroEnd, nextErr)
 		}
 		if err := validateResolvedSnapshotRun(next, zeroEnd, bound); err != nil {
@@ -118,16 +126,16 @@ func (s *StreamSnapshotSource) RunAt(memfdOffset, limit uint64) (sparse.Run, err
 
 func validateResolvedSnapshotRun(run sparse.Run, offset, bound uint64) error {
 	if run == nil {
-		return fmt.Errorf("uffd: snapshot RunAt at %d returned nil", offset)
+		return readerr.Mark(fmt.Errorf("uffd: snapshot RunAt at %d returned nil", offset), false)
 	}
 	if run.Offset() != offset || run.End() <= offset || run.End() > bound {
-		return fmt.Errorf("uffd: snapshot RunAt at %d returned invalid range [%d,%d), bound %d", offset, run.Offset(), run.End(), bound)
+		return readerr.Mark(fmt.Errorf("uffd: snapshot RunAt at %d returned invalid range [%d,%d), bound %d", offset, run.Offset(), run.End(), bound), false)
 	}
 	switch run.Kind() {
 	case sparse.Hole, sparse.Zero, sparse.Data:
 		return nil
 	default:
-		return fmt.Errorf("uffd: snapshot RunAt at %d returned invalid kind %d", offset, run.Kind())
+		return readerr.Mark(fmt.Errorf("uffd: snapshot RunAt at %d returned invalid kind %d", offset, run.Kind()), false)
 	}
 }
 
@@ -152,11 +160,14 @@ func (r streamPageRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint6
 		return 0, nil
 	}
 	n, err := r.stream.ReadAt(ctx, buf, r.offset+innerOffset)
-	if n == len(buf) && (err == nil || errors.Is(err, io.EOF)) {
+	if n == len(buf) && !readerr.IsPermanent(err) && !readretry.IsTerminal(err) && (err == nil || err == io.EOF) {
 		return n, nil
 	}
 	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			err = readerr.Mark(err, false)
+		}
 		return n, fmt.Errorf("uffd: snapshot page read at %d: %w", r.offset+innerOffset, err)
 	}
-	return n, fmt.Errorf("uffd: snapshot page short read at %d: %d of %d bytes", r.offset+innerOffset, n, len(buf))
+	return n, readerr.Mark(fmt.Errorf("uffd: snapshot page short read at %d: %d of %d bytes: %w", r.offset+innerOffset, n, len(buf), io.ErrUnexpectedEOF), false)
 }

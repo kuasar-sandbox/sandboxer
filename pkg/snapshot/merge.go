@@ -9,8 +9,10 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 )
 
 // tarLayer is a parent local artifact (tarstream envelope) opened as a
@@ -72,7 +74,7 @@ func openMergeBaseWithOpener(ctx context.Context, raw string, size int64, codec 
 		options = append(options, tarstream.WithCodec(codec, required))
 	}
 	options = append(options, tarstream.WithExpectedDigest(ref.DigestScheme, ref.Digest))
-	stream, err := fetch.OpenTarStream(ref.Path, options...)
+	stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return fetch.OpenTarStream(ref.Path, options...) })
 	if err != nil {
 		return nil, nil, &mergeArtifactError{err: err}
 	}
@@ -87,12 +89,29 @@ func prepareMergeBase(ctx context.Context, stream fetch.Stream, size int64) (*ta
 	if stream.Size() < uint64(size) {
 		return fail(fmt.Errorf("merge base: entry size %d < expected layer size %d", stream.Size(), size))
 	}
-	holes, err := mergeStreamHoles(stream, uint64(size))
+	holes, err := mergeStreamHoles(ctx, stream, uint64(size))
 	if err != nil {
 		return fail(fmt.Errorf("merge base: hole map: %w", err))
 	}
-	reader := fetch.NewReaderAt(ctx, stream)
+	reader := retryMergeReader{ctx: ctx, stream: stream}
 	return &tarLayer{stream: stream, ReadSeeker: io.NewSectionReader(reader, 0, size)}, holes, nil
+}
+
+type retryMergeReader struct {
+	ctx    context.Context
+	stream fetch.Stream
+}
+
+func (r retryMergeReader) ReadAt(buf []byte, offset int64) (int, error) {
+	if offset < 0 || uint64(offset) >= r.stream.Size() {
+		return 0, io.EOF
+	}
+	length := min(uint64(len(buf)), r.stream.Size()-uint64(offset))
+	n, err := readretry.ReadAt(r.ctx, int(length), func() (int, error) { return r.stream.ReadAt(r.ctx, buf[:length], uint64(offset)) })
+	if err == nil && n < len(buf) {
+		err = io.EOF
+	}
+	return n, err
 }
 
 type mergeArtifactError struct{ err error }
@@ -116,15 +135,23 @@ func ValidateMergeBaseWithOpener(ctx context.Context, path string, size int64, c
 	return base.Close()
 }
 
-func mergeStreamHoles(stream fetch.Stream, size uint64) ([]sparse.Extent, error) {
+func mergeStreamHoles(ctx context.Context, stream fetch.Stream, size uint64) ([]sparse.Extent, error) {
 	var holes []sparse.Extent
 	for offset := uint64(0); offset < size; {
-		run, err := stream.RunAt(offset, size-offset)
+		var run sparse.Run
+		err := readretry.Do(ctx, func() error {
+			var err error
+			run, err = stream.RunAt(offset, size-offset)
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return readerr.Mark(err, false)
+			}
+			return err
+		})
 		if err != nil {
 			return nil, err
 		}
 		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > size {
-			return nil, fmt.Errorf("invalid run at offset %d", offset)
+			return nil, readerr.Mark(fmt.Errorf("invalid run at offset %d", offset), false)
 		}
 		kind, end := run.Kind(), run.End()
 		if kind == sparse.Hole {
@@ -219,12 +246,24 @@ func (m *mergedReadSeeker) readFrom(layer io.ReadSeeker, p []byte) (int, error) 
 	if _, err := layer.Seek(m.pos, io.SeekStart); err != nil {
 		return 0, err
 	}
-	rd, err := io.ReadFull(layer, p)
-	m.pos += int64(rd)
-	if err == io.ErrUnexpectedEOF {
-		err = nil // short read at the layer's end; pos advanced by what we got
+	// io.ReadFull discards a reader error when it receives enough bytes. A
+	// failed source attempt may have filled p, so inspect each result first.
+	rd := 0
+	for rd < len(p) {
+		n, err := layer.Read(p[rd:])
+		rd += n
+		m.pos += int64(n)
+		if readretry.IsTerminal(err) || readerr.IsPermanent(err) {
+			return rd, err
+		}
+		if err == io.ErrUnexpectedEOF || (err == io.EOF && rd > 0) {
+			return rd, nil // preserve the short layer-end contract
+		}
+		if err != nil {
+			return rd, err
+		}
 	}
-	return rd, err
+	return rd, nil
 }
 
 func (m *mergedReadSeeker) Seek(off int64, whence int) (int64, error) {

@@ -22,8 +22,10 @@ import (
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/internal/runtimebundle"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
@@ -903,7 +905,7 @@ func validateExt4BlockReader(ctx context.Context, reader vhost.BlockReader) erro
 	}
 	var magic [2]byte
 	n, err := reader.ReadAt(magic[:], ext4SuperblockMagicOffset)
-	if err != nil && !(errors.Is(err, io.EOF) && n == len(magic)) {
+	if err != nil && (readretry.IsTerminal(err) || readerr.IsPermanent(err) || !(errors.Is(err, io.EOF) && n == len(magic))) {
 		return fmt.Errorf("read ext4 superblock magic: %w", err)
 	}
 	if n != len(magic) {
@@ -1896,6 +1898,9 @@ func handleExportRequest(
 			return ctl.Response{}, failRecovery(reattachErr)
 		}
 	}
+	if err := context.Cause(ctx); err != nil {
+		return ctl.Response{}, err
+	}
 	resp = ctl.Response{
 		SandboxRef: out.SandboxRef, SandboxPath: out.SandboxPath,
 		DiskRefs: out.DataRefs, DiskPaths: out.DataPaths,
@@ -2460,6 +2465,9 @@ func handleSnapshotRequest(
 		SandboxRef:       out.SandboxRef,
 		SandboxPath:      out.SandboxPath,
 	}
+	if err := context.Cause(ctx); err != nil {
+		return ctl.Response{}, err
+	}
 	// Keep the established overlay_* response fields populated for current
 	// callers. Their value is now the committed Sandbox E; the disk graph is
 	// carried exclusively by E.sandbox.runtime.cfg.
@@ -3017,17 +3025,22 @@ func openSnapshotDependency(ctx context.Context, dependency artifactDependency, 
 			return nil, nil, store.ContentKey{}, "", fmt.Errorf("%s Bundle provenance: %w", label, lookup.err)
 		}
 		if lookup.fetcher != nil {
-			source, err := lookup.fetcher.SelectManifest(ctx, key)
+			var source manifestbundle.ManifestSource
+			err := readretry.Do(ctx, func() error {
+				var selectErr error
+				source, selectErr = lookup.fetcher.SelectManifest(ctx, key)
+				return selectErr
+			})
 			if err != nil {
 				return nil, nil, store.ContentKey{}, "", err
 			}
-			stream, err := source.OpenManifest(ctx, key)
+			stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return source.OpenManifest(ctx, key) })
 			return stream, source.Reader, key, label, err
 		}
 		if opts.Fetcher == nil {
 			return nil, nil, store.ContentKey{}, "", fmt.Errorf("%s requires a Manifest fetcher", label)
 		}
-		stream, err := opts.Fetcher.OpenManifest(ctx, key)
+		stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return opts.Fetcher.OpenManifest(ctx, key) })
 		return stream, nil, key, label, err
 	}
 	if ref.Scheme != manifest.RefSchemeFile {
@@ -3204,12 +3217,17 @@ func bundleSourceForLookup(ctx context.Context, key store.ContentKey, opts RunOp
 	if lookup.fetcher == nil {
 		return "", "", false, nil
 	}
-	source, err := lookup.fetcher.SelectManifest(ctx, key)
+	var source manifestbundle.ManifestSource
+	err := readretry.Do(ctx, func() error {
+		var selectErr error
+		source, selectErr = lookup.fetcher.SelectManifest(ctx, key)
+		return selectErr
+	})
 	if err != nil {
 		return "", "", false, err
 	}
 	if source.Reader == nil {
-		stream, err := source.OpenManifest(ctx, key)
+		stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return source.OpenManifest(ctx, key) })
 		if err != nil {
 			return "", "", false, err
 		}

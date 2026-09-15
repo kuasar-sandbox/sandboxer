@@ -75,6 +75,10 @@ func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resum
 		}
 	}()
 	sources.Quiescer.Quiesce()
+	if err := context.Cause(ctx); err != nil {
+		sources.Quiescer.Resume()
+		return nil, err
+	}
 	backendsResumed := false
 	defer func() {
 		if !backendsResumed {
@@ -102,6 +106,9 @@ func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resum
 	}
 	out.WallclockPauseMs = pausedAt.Sub(pauseStart).Milliseconds()
 	out.WallclockDumpMs = time.Since(dumpStart).Milliseconds()
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 	succeeded = true
 	return out, nil
 }
@@ -289,10 +296,16 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 	if cleanupErr != nil {
 		return nil, fmt.Errorf("export root cleanup: %w", cleanupErr)
 	}
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 	if commitRoot {
 		if err := sink.CommitSandbox(ctx, out.SandboxRef, out.SandboxPath); err != nil {
 			return nil, fmt.Errorf("commit Sandbox E: %w", err)
 		}
+	}
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
 	}
 	out.PortableConfig = c1
 	return out, nil

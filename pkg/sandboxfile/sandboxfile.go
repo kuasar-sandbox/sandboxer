@@ -24,9 +24,11 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -140,7 +142,7 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 		if portable.Boot.Root.Base != "self" || portable.Boot.Root.Overlay == nil || portable.Boot.Root.Overlay.Base != "" {
 			return fail(errors.New("sandbox EROFS layout requires boot.root.base=self and an empty overlay graph"))
 		}
-		erofsSize, err := image.ReadEROFSSize(streamReaderAt{ctx: ctx, stream: stream})
+		erofsSize, err := image.ReadEROFSSize(&streamReaderAt{ctx: ctx, stream: stream})
 		if err != nil {
 			return fail(fmt.Errorf("sandbox EROFS payload: %w", err))
 		}
@@ -277,7 +279,7 @@ func OpenFlattenedEROFS(ctx context.Context, stream fetch.Stream) (*FlattenedIma
 	if err != nil {
 		return fail(err)
 	}
-	erofsSize, err := image.ReadEROFSSize(streamReaderAt{ctx: ctx, stream: stream})
+	erofsSize, err := image.ReadEROFSSize(&streamReaderAt{ctx: ctx, stream: stream})
 	if err != nil {
 		return fail(fmt.Errorf("flattened EROFS payload: %w", err))
 	}
@@ -303,7 +305,7 @@ func OpenEROFSArtifact(ctx context.Context, stream fetch.Stream) (*FlattenedImag
 	if stream == nil {
 		return nil, errors.New("EROFS artifact: nil logical stream")
 	}
-	erofsSize, err := image.ReadEROFSSize(streamReaderAt{ctx: ctx, stream: stream})
+	erofsSize, err := image.ReadEROFSSize(&streamReaderAt{ctx: ctx, stream: stream})
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("EROFS artifact payload: %w", err), stream.Close())
 	}
@@ -709,7 +711,13 @@ func parseFlattenedImageArchive(ctx context.Context, stream fetch.Stream) (uint6
 	if stream.Size() > math.MaxInt64 {
 		return 0, nil, errors.New("flattened image is too large for ZIP reader")
 	}
-	reader, err := zip.NewReader(streamReaderAt{ctx: ctx, stream: stream}, int64(stream.Size()))
+	// ZIP's internal ReadFull/ReadAll calls can discard a full read's error.
+	// Keep the source cause for this parse, including successful ZIP results.
+	source := &streamReaderAt{ctx: ctx, stream: stream}
+	reader, err := zip.NewReader(source, int64(stream.Size()))
+	if source.err != nil {
+		return 0, nil, source.err
+	}
 	if err != nil {
 		return 0, nil, fmt.Errorf("flattened image ZIP: %w", err)
 	}
@@ -724,13 +732,19 @@ func parseFlattenedImageArchive(ctx context.Context, stream fetch.Stream) (uint6
 		return 0, nil, fmt.Errorf("flattened image config.json exceeds %d bytes", MaxImageConfigBytes)
 	}
 	body, err := file.Open()
+	if source.err != nil {
+		if body != nil {
+			_ = body.Close()
+		}
+		return 0, nil, source.err
+	}
 	if err != nil {
 		return 0, nil, err
 	}
 	data, readErr := io.ReadAll(body)
 	closeErr := body.Close()
-	if readErr != nil || closeErr != nil {
-		return 0, nil, errors.Join(readErr, closeErr)
+	if source.err != nil || readErr != nil || closeErr != nil {
+		return 0, nil, errors.Join(source.err, readErr, closeErr)
 	}
 	if !json.Valid(data) {
 		return 0, nil, errors.New("flattened image config.json is not valid JSON")
@@ -749,8 +763,8 @@ func readStreamAt(ctx context.Context, stream fetch.Stream, offset, length uint6
 	if len(body) == 0 {
 		return body, nil
 	}
-	n, err := stream.ReadAt(ctx, body, offset)
-	if err != nil && !errors.Is(err, io.EOF) {
+	n, err := readretry.ReadAt(ctx, len(body), func() (int, error) { return stream.ReadAt(ctx, body, offset) })
+	if err != nil && (readretry.IsTerminal(err) || readerr.IsPermanent(err) || err != io.EOF) {
 		return nil, err
 	}
 	if n != len(body) {
@@ -762,13 +776,28 @@ func readStreamAt(ctx context.Context, stream fetch.Stream, offset, length uint6
 type streamReaderAt struct {
 	ctx    context.Context
 	stream fetch.Stream
+	err    error // first terminal result in this synchronous metadata parse
 }
 
-func (r streamReaderAt) ReadAt(buffer []byte, offset int64) (int, error) {
+func (r *streamReaderAt) ReadAt(buffer []byte, offset int64) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
 	if offset < 0 {
 		return 0, io.EOF
 	}
-	return r.stream.ReadAt(r.ctx, buffer, uint64(offset))
+	if uint64(offset) >= r.stream.Size() {
+		return 0, io.EOF
+	}
+	length := min(uint64(len(buffer)), r.stream.Size()-uint64(offset))
+	n, err := readretry.ReadAt(r.ctx, int(length), func() (int, error) { return r.stream.ReadAt(r.ctx, buffer[:length], uint64(offset)) })
+	if readretry.IsTerminal(err) || readerr.IsPermanent(err) {
+		r.err = err
+	}
+	if err == nil && n < len(buffer) {
+		err = io.EOF
+	}
+	return n, err
 }
 
 const erofsBuildProbeBytes = 1024 + 128
@@ -896,26 +925,31 @@ func prepareEROFSBuildPayload(ctx context.Context, source sparse.Source) (sparse
 	prefix := make([]byte, int(prefixSize))
 	runs := make([]prefetchedSourceRun, 0, 4)
 	for offset := uint64(0); offset < prefixSize; {
-		run, err := source.RunAt(offset, prefixSize-offset)
+		var run sparse.Run
+		err := readretry.Do(ctx, func() error {
+			var err error
+			run, err = source.RunAt(offset, prefixSize-offset)
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return readerr.Mark(err, false)
+			}
+			return err
+		})
 		if err != nil {
 			return nil, 0, err
 		}
 		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > prefixSize {
-			return nil, 0, fmt.Errorf("invalid sparse run at offset %d", offset)
+			return nil, 0, readerr.Mark(fmt.Errorf("invalid sparse run at offset %d", offset), false)
 		}
 		runs = append(runs, prefetchedSourceRun{offset: offset, end: run.End(), kind: run.Kind()})
 		offset = run.End()
 	}
-	n, err := source.ReadAt(ctx, prefix, 0)
-	if err != nil && !errors.Is(err, io.EOF) {
+	_, err := readretry.ReadAt(ctx, len(prefix), func() (int, error) { return source.ReadAt(ctx, prefix, 0) })
+	if err != nil {
 		return nil, 0, err
-	}
-	if n != len(prefix) {
-		return nil, 0, io.ErrUnexpectedEOF
 	}
 	erofsSize, err := image.ReadEROFSSize(bytes.NewReader(prefix))
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, readerr.Mark(err, false)
 	}
 	return &prefetchedSource{inner: source, prefix: prefix, runs: runs}, erofsSize, nil
 }
@@ -1024,7 +1058,7 @@ func (s *sectionStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 		return nil, io.EOF
 	}
 	if limit == 0 {
-		return nil, errors.New("sandbox section RunAt limit is zero")
+		return nil, readerr.Mark(errors.New("sandbox section RunAt limit is zero"), false)
 	}
 	end := offset + limit
 	if end < offset || end > s.size {
@@ -1037,7 +1071,7 @@ func (s *sectionStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 	wantOffset := s.base + offset
 	wantEnd := s.base + end
 	if run == nil || run.Offset() != wantOffset || run.End() <= wantOffset || run.End() > wantEnd {
-		return nil, errors.New("sandbox section source returned invalid run")
+		return nil, readerr.Mark(errors.New("sandbox section source returned invalid run"), false)
 	}
 	// Sandbox payload is a prefix section (base == 0). Return the carrier Run
 	// unchanged so manifest-only capabilities such as fetch.ChunkRun survive
@@ -1048,7 +1082,7 @@ func (s *sectionStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 	}
 	runEnd := run.End() - s.base
 	if runEnd <= offset {
-		return nil, errors.New("sandbox section source returned invalid run")
+		return nil, readerr.Mark(errors.New("sandbox section source returned invalid run"), false)
 	}
 	return sectionRun{inner: run, offset: offset, end: runEnd}, nil
 }
@@ -1064,7 +1098,7 @@ func (s *sectionStream) ReadAt(ctx context.Context, buffer []byte, offset uint64
 		eof = io.EOF
 	}
 	n, err := s.owner.stream.ReadAt(ctx, buffer[:length], s.base+offset)
-	if err != nil && !errors.Is(err, io.EOF) {
+	if err != nil && (readretry.IsTerminal(err) || readerr.IsPermanent(err) || err != io.EOF) {
 		return n, err
 	}
 	if n != length {
@@ -1085,7 +1119,7 @@ func (r sectionRun) Kind() sparse.RunKind { return r.inner.Kind() }
 
 func (r sectionRun) ReadAt(ctx context.Context, buffer []byte, innerOffset uint64) (int, error) {
 	if innerOffset > r.end-r.offset || uint64(len(buffer)) > r.end-r.offset-innerOffset {
-		return 0, errors.New("sandbox section run read is out of bounds")
+		return 0, readerr.Mark(errors.New("sandbox section run read is out of bounds"), false)
 	}
 	return r.inner.ReadAt(ctx, buffer, innerOffset)
 }
@@ -1178,7 +1212,7 @@ func (s *appendedSource) ReadAt(ctx context.Context, buffer []byte, offset uint6
 			part = int(available)
 		}
 		n, err := s.payload.ReadAt(ctx, buffer[:part], offset)
-		if err != nil && !errors.Is(err, io.EOF) {
+		if err != nil && (readretry.IsTerminal(err) || readerr.IsPermanent(err) || err != io.EOF) {
 			return n, err
 		}
 		if n != part {

@@ -4,15 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	storefs "github.com/kuasar-sandbox/accelerator/pkg/store/fs"
@@ -24,6 +28,8 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestOpenSandboxRunSourceLocalTarstream(t *testing.T) {
@@ -178,6 +184,59 @@ func TestOpenSandboxRunSourceManifestStore(t *testing.T) {
 	}
 }
 
+func TestOpenSandboxRunSourceManifestReadRecovery(t *testing.T) {
+	for _, kind := range []string{"recover", "cancel", "permanent"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(context.Canceled)
+			timer := time.AfterFunc(5*time.Second, func() { cancel(context.DeadlineExceeded) })
+			defer timer.Stop()
+			stop := errors.New("run source operation stopped")
+			var active atomic.Bool
+			var calls atomic.Int32
+			cfg, storage := runFromManifestStore(t, grpc.StreamInterceptor(func(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+				if active.Load() && strings.HasSuffix(info.FullMethod, "/Get") {
+					n := calls.Add(1)
+					switch kind {
+					case "recover":
+						if n <= 2 {
+							return status.Error([]codes.Code{codes.Unavailable, codes.DeadlineExceeded}[n-1], "injected source attempt")
+						}
+					case "cancel":
+						cancel(stop)
+						return status.Error(codes.Canceled, "operation canceled")
+					case "permanent":
+						return status.Error(codes.InvalidArgument, "invalid source request")
+					}
+				}
+				return handler(srv, stream)
+			}))
+			ingester, err := cfg.NewIngester(storage.CustomerKeyFunc(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref, _, err := snapshot.NewIngestSink(ingester, nil).AbsorbSandbox(ctx, runFromLogical(t, runFromDirectPortable(t)))
+			closeErr := ingester.Close()
+			if err != nil || closeErr != nil {
+				t.Fatalf("seed Sandbox: %v / %v", err, closeErr)
+			}
+			active.Store(true)
+			source, err := openSandboxRunSource(ctx, ref, storage, nil)
+			if kind == "recover" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer source.Close()
+				if calls.Load() < 3 || source.PortableRef != ref || source.RuntimeRef != ref || source.Root.Portable.Boot.Root.Base != "self" {
+					t.Fatalf("source did not recover intact: calls=%d source=%+v", calls.Load(), source)
+				}
+			} else if calls.Load() != 1 || source != nil || err == nil || kind == "cancel" && !errors.Is(err, stop) || kind == "permanent" && !readerr.IsPermanent(err) {
+				t.Fatalf("source terminal changed: calls=%d source=%v err=%v", calls.Load(), source, err)
+			}
+		})
+	}
+}
+
 func TestRunFromAndRestoreAreMutuallyExclusive(t *testing.T) {
 	if code := runCmd([]string{"--from", "a.sandbox", "--restore", "b.snapshot"}); code != 2 {
 		t.Fatalf("exit = %d, want 2", code)
@@ -260,7 +319,7 @@ func runFromManifestConfig(key [32]byte, endpoint string) *config.ManifestConfig
 	}
 }
 
-func runFromManifestStore(t *testing.T) (*config.ManifestConfig, *artifact.ProcessStorage) {
+func runFromManifestStore(t *testing.T, options ...grpc.ServerOption) (*config.ManifestConfig, *artifact.ProcessStorage) {
 	t.Helper()
 	backend, err := storefs.New(storefs.Config{Root: t.TempDir()})
 	if err != nil {
@@ -277,7 +336,7 @@ func runFromManifestStore(t *testing.T) (*config.ManifestConfig, *artifact.Proce
 	if err != nil {
 		t.Fatal(err)
 	}
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(options...)
 	pb.RegisterStoreServer(grpcServer, server)
 	go func() { _ = grpcServer.Serve(listener) }()
 	t.Cleanup(func() {

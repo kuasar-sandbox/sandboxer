@@ -16,7 +16,9 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"golang.org/x/crypto/xts"
 	"golang.org/x/sys/unix"
 )
@@ -680,7 +682,7 @@ func validateDiffSourceExt4(ctx context.Context, source diffTemplateSource, base
 		case sparse.Hole, sparse.Zero:
 			if base != nil && base.Size() >= ext4MagicOffset+int64(len(magic)) {
 				n, readErr := base.ReadAt(magic[:], ext4MagicOffset)
-				if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(magic)) {
+				if readErr != nil && (readretry.IsTerminal(readErr) || readerr.IsPermanent(readErr) || !(errors.Is(readErr, io.EOF) && n == len(magic))) {
 					return fmt.Errorf("vhost: read ext4 magic from base: %w", readErr)
 				}
 				if n != len(magic) {
@@ -689,7 +691,7 @@ func validateDiffSourceExt4(ctx context.Context, source diffTemplateSource, base
 			}
 		default:
 			n, readErr := source.ReadAt(ctx, magic[:], uint64(ext4MagicOffset))
-			if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(magic)) {
+			if readErr != nil && (readretry.IsTerminal(readErr) || readerr.IsPermanent(readErr) || !(errors.Is(readErr, io.EOF) && n == len(magic))) {
 				return fmt.Errorf("vhost: read ext4 magic from diff: %w", readErr)
 			}
 			if n != len(magic) {
