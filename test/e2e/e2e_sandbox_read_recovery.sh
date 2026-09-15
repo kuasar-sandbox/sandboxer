@@ -223,7 +223,9 @@ wait_file "$WORK/cow.log" '^COW-BEGIN$' "$RUN_PID"
 wait_file "$WORK/faults.jsonl" '"mode": "cow"' "$RUN_PID"
 sleep 3
 kill -0 "$RUN_PID"
-! grep -q '^COW-RECOVERED$' "$WORK/cow.log"
+if grep -q '^COW-RECOVERED$' "$WORK/cow.log"; then
+    echo "COW write completed while its base source was unavailable" >&2; exit 1
+fi
 mode healthy
 wait_file "$WORK/cow.log" '^DISK-READ-ARMED$' "$RUN_PID"
 mode "disk-read:$(cat "$WORK/cow.keys")"
@@ -231,7 +233,9 @@ wait_file "$WORK/cow.log" '^DISK-READ-BEGIN$' "$RUN_PID"
 wait_file "$WORK/faults.jsonl" '"mode": "disk-read"' "$RUN_PID"
 sleep 3
 kill -0 "$RUN_PID"
-! grep -q '^DISK-READ-RECOVERED$' "$WORK/cow.log"
+if grep -q '^DISK-READ-RECOVERED$' "$WORK/cow.log"; then
+    echo "disk read completed while its source was unavailable" >&2; exit 1
+fi
 mode healthy
 wait_file "$WORK/cow.log" '^DISK-READ-RECOVERED$' "$RUN_PID"
 kill -TERM "$RUN_PID"; wait "$RUN_PID"
@@ -284,8 +288,12 @@ pathlib.Path(sys.argv[3]).write_text(json.dumps(out))
 PY
 sleep 18
 kill -0 "$RUN_PID"
-! grep -q '^READ-RECOVERED$' "$WORK/pending-exec.log"
-! grep -qE 'Traceback|Input/output error|mandatory source read' "$WORK/recovered.log"
+if grep -q '^READ-RECOVERED$' "$WORK/pending-exec.log"; then
+    echo "pending read completed before source recovery" >&2; exit 1
+fi
+if grep -qE 'Traceback|Input/output error|mandatory source read' "$WORK/recovered.log"; then
+    echo "transient source outage caused a Guest error or fatal exit" >&2; exit 1
+fi
 python3 - "$WORK/resources.before.json" "$WORK/resources.after.json" <<'PY'
 import json,pathlib,sys
 before=json.loads(pathlib.Path(sys.argv[1]).read_text());after={}
@@ -353,9 +361,13 @@ if kill -0 "$RUN_PID" 2>/dev/null; then echo "fatal did not stop sandbox" >&2; e
 if wait "$RUN_PID"; then echo "fatal returned success" >&2; exit 1; fi
 if wait "$FATAL_CAPTURE_PID"; then echo "fatal capture returned success" >&2; exit 1; fi
 [ ! -s "$WORK/fatal.key" ]
-! pgrep -s "$RUN_PID" -x cloud-hyperviso >/dev/null
+if pgrep -s "$RUN_PID" -x cloud-hyperviso >/dev/null; then
+    echo "CH survived the sandbox's fatal exit" >&2; exit 1
+fi
 # The fatal owner must record the source cause, not only a pinger/timeout exit.
 grep 'mandatory source read' "$WORK/verified.log"
-! grep -qE 'Traceback|Input/output error' "$WORK/verified.log"
+if grep -qE 'Traceback|Input/output error' "$WORK/verified.log"; then
+    echo "fatal source failure reached the Guest as an I/O error" >&2; exit 1
+fi
 cat "$WORK/faults.jsonl"
 echo "PASS: real CH source recovery, recovered snapshot contents, and whole-VM fatal without a successful capture"
