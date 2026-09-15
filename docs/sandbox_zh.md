@@ -717,7 +717,7 @@ Tail执行前从fault邻接页向外重检state,最多缩短为首次不匹配�
 普通Data handler在worker启动前分配64 KiB共享buffer,具有chunk window capability的
 manifest handler分配1 MiB,Cold `ZeroSource`不分配该buffer;fault和tail路径不扩容、
 不创建临时payload buffer,每个fault worker只持有固定4 KiB urgent buffer. 这是 handler 自身的零新增 payload 分配约束；source内部的Run对象、cache lease及partial-chunk decode
-allocation仍由`SnapshotReader`实现负责. Handler对
+allocation仍由`SnapshotReader`实现负责. 健康路径中, Handler对
 非zero source只调用一次`SnapshotReader.RunAt`;可选chunk window resolver仅在
 accelerator内部继续执行metadata `Stream.RunAt`. Ordinary Data和zero-like run仍分别
 受64 KiB state boundary约束. `ChunkRun`双向候选只包含完整页,并在一次state读锁扫描中截断于

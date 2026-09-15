@@ -86,6 +86,9 @@ func (s *StreamSnapshotSource) RunAt(memfdOffset, limit uint64) (sparse.Run, err
 
 	run, err := s.stream.RunAt(memfdOffset, bound-memfdOffset)
 	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			err = readerr.Mark(err, false)
+		}
 		return nil, fmt.Errorf("uffd: snapshot RunAt at %d: %w", memfdOffset, err)
 	}
 	if err := validateResolvedSnapshotRun(run, memfdOffset, bound); err != nil {
@@ -102,6 +105,9 @@ func (s *StreamSnapshotSource) RunAt(memfdOffset, limit uint64) (sparse.Run, err
 	for zeroEnd < bound {
 		next, nextErr := s.stream.RunAt(zeroEnd, bound-zeroEnd)
 		if nextErr != nil {
+			if nextErr == io.EOF || nextErr == io.ErrUnexpectedEOF {
+				nextErr = readerr.Mark(nextErr, false)
+			}
 			return nil, fmt.Errorf("uffd: snapshot RunAt at %d: %w", zeroEnd, nextErr)
 		}
 		if err := validateResolvedSnapshotRun(next, zeroEnd, bound); err != nil {
@@ -158,6 +164,9 @@ func (r streamPageRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint6
 		return n, nil
 	}
 	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			err = readerr.Mark(err, false)
+		}
 		return n, fmt.Errorf("uffd: snapshot page read at %d: %w", r.offset+innerOffset, err)
 	}
 	return n, readerr.Mark(fmt.Errorf("uffd: snapshot page short read at %d: %d of %d bytes: %w", r.offset+innerOffset, n, len(buf), io.ErrUnexpectedEOF), false)

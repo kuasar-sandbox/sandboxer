@@ -16,8 +16,90 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"golang.org/x/sys/unix"
 )
+
+type failingPageStream struct {
+	fetch.Stream
+	n        int
+	cause    error
+	metadata bool
+	calls    int
+}
+
+func (s *failingPageStream) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) {
+	s.calls++
+	if s.calls == 1 {
+		return s.n, s.cause
+	}
+	return s.Stream.ReadAt(ctx, p, off)
+}
+func (s *failingPageStream) RunAt(off, limit uint64) (sparse.Run, error) {
+	if s.metadata {
+		s.calls++
+		if s.calls == 1 {
+			return nil, s.cause
+		}
+	}
+	return s.Stream.RunAt(off, limit)
+}
+
+func TestMixedSnapshotPageAndMetadataEOFClassification(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		n         int
+		cause     error
+		permanent bool
+	}{
+		{"short EOF", 17, io.EOF, true},
+		{"short unexpected EOF", 17, io.ErrUnexpectedEOF, true},
+		{"full unexpected EOF", PageSize, io.ErrUnexpectedEOF, true},
+		{"full EOF", PageSize, io.EOF, false},
+		{"retryable EOF", 17, readerr.Mark(io.EOF, true), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			base, err := sparse.NewSource(bytes.NewReader(bytes.Repeat([]byte{0x42}, PageSize)), PageSize, []sparse.Extent{{Offset: 0, Size: 17}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream := &failingPageStream{Stream: testStream{base}, n: tt.n, cause: tt.cause}
+			source, _ := NewStreamSnapshotSource(stream, PageSize)
+			run, err := source.RunAt(0, PageSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := run.(streamPageRun); !ok {
+				t.Fatalf("not mixed page fallback: %T", run)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_, err = readretry.ReadAt(ctx, PageSize, func() (int, error) { return run.ReadAt(ctx, make([]byte, PageSize), 0) })
+			if tt.permanent {
+				if !readerr.IsPermanent(err) || !errors.Is(err, tt.cause) || stream.calls != 1 {
+					t.Fatalf("truncation retried: calls=%d err=%v", stream.calls, err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	for _, cause := range []error{io.EOF, io.ErrUnexpectedEOF, readerr.Mark(io.EOF, true)} {
+		base, _ := sparse.NewSource(bytes.NewReader(make([]byte, PageSize)), PageSize, nil)
+		stream := &failingPageStream{Stream: testStream{base}, metadata: true, cause: cause}
+		source, _ := NewStreamSnapshotSource(stream, PageSize)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err := readretry.Do(ctx, func() error { _, err := source.RunAt(0, PageSize); return err })
+		cancel()
+		if cause == io.EOF || cause == io.ErrUnexpectedEOF {
+			if !readerr.IsPermanent(err) || stream.calls != 1 {
+				t.Fatalf("metadata EOF retried: %v", err)
+			}
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 type recoveringChunkRun struct {
 	fetch.ChunkRun
