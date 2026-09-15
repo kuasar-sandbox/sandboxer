@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"golang.org/x/sys/unix"
 )
 
@@ -540,23 +542,28 @@ func consumeLocationSource(ctx context.Context, source sparse.Source) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		run, err := source.RunAt(offset, source.Size()-offset)
+		var run sparse.Run
+		err := readretry.Do(ctx, func() error {
+			var err error
+			run, err = source.RunAt(offset, source.Size()-offset)
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return readerr.Mark(err, false)
+			}
+			return err
+		})
 		if err != nil {
 			return err
 		}
 		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > source.Size() {
-			return fmt.Errorf("invalid sparse run at offset %d", offset)
+			return readerr.Mark(fmt.Errorf("invalid sparse run at offset %d", offset), false)
 		}
 		kind, end := run.Kind(), run.End()
 		if kind != sparse.Hole {
 			for position := offset; position < end; {
 				chunk := min(uint64(len(buffer)), end-position)
-				n, readErr := source.ReadAt(ctx, buffer[:int(chunk)], position)
-				if readErr != nil && readErr != io.EOF {
+				_, readErr := readretry.ReadAt(ctx, int(chunk), func() (int, error) { return source.ReadAt(ctx, buffer[:int(chunk)], position) })
+				if readErr != nil {
 					return readErr
-				}
-				if n != int(chunk) {
-					return io.ErrUnexpectedEOF
 				}
 				position += chunk
 			}

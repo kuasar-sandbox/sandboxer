@@ -9,6 +9,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -70,6 +71,9 @@ func (s *ProcessStorage) Inspect(ctx context.Context, input string, locations co
 		return &Info{
 			Role: RoleSandbox, Raw: append([]byte(nil), sandboxRoot.RuntimeConfig...), Sandbox: sandboxRoot.Portable,
 		}, nil
+	}
+	if readretry.IsTerminal(sandboxErr) || readerr.IsPermanent(sandboxErr) {
+		return nil, sandboxErr
 	}
 	stream, err = open()
 	if err != nil {

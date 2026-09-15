@@ -18,9 +18,11 @@ import (
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"golang.org/x/sys/unix"
 )
 
@@ -932,6 +934,9 @@ func (r seekerRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (
 		return len(buf), nil
 	}
 	n, err := r.source.ReadAt(ctx, buf, r.offset+innerOffset)
+	if readretry.IsTerminal(err) || readerr.IsPermanent(err) {
+		return n, err
+	}
 	if n == len(buf) && (err == nil || errors.Is(err, io.EOF)) {
 		return n, nil
 	}
@@ -954,8 +959,24 @@ func (s *seekerSource) ReadAt(_ context.Context, buf []byte, offset uint64) (int
 	if _, err := s.rs.Seek(int64(offset), io.SeekStart); err != nil {
 		return 0, err
 	}
-	if _, err := io.ReadFull(s.rs, buf[:n]); err != nil {
-		return 0, err
+	// Preserve a terminal source error even when the failed attempt filled
+	// the requested range; io.ReadFull would discard that error.
+	read := 0
+	for read < n {
+		count, err := s.rs.Read(buf[read:n])
+		read += count
+		if readretry.IsTerminal(err) || readerr.IsPermanent(err) {
+			return 0, err
+		}
+		if err == io.EOF && read == n {
+			break
+		}
+		if err != nil {
+			if err == io.EOF && read > 0 {
+				err = io.ErrUnexpectedEOF
+			}
+			return 0, err
+		}
 	}
 	return n, eof
 }

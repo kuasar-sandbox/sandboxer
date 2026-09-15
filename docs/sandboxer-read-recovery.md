@@ -30,6 +30,8 @@ UFFD directly retries required `Run.ReadAt` operations. The urgent page and any 
 
 Each attempt may overwrite the same buffer, but later attempts read the full requested range again. Partial responses are not spliced. Parallel backend reads join all workers before returning; a derived cancellation cannot hide an original or later permanent cause. A legal complete read accompanied by ordinary EOF retains its normal contract. Terminal wrappers around EOF or EAGAIN are checked before compatibility or zero-fill branches.
 
+Read-only coverage includes location-source verification, EROFS build-prefix probing and merge-parent sparse metadata. They retry individual source reads, without replaying publication or capture writes. Merge/seeker adapters and Ext4 validation preserve a terminal error even if its attempt filled the requested buffer. ZIP metadata parsing retains the source's first terminal error for that parse, because library helpers can otherwise discard a full read's error. Artifact format detection stops on that cause; missing source data is not treated as an absent optional image configuration. Ordinary format detection and optional configuration absence keep their existing behavior.
+
 Lazy process Fetcher initialization, referenced Bundle resolution and Bundle Chunk-index preparation cache only successful results. Failed or canceled initialization leaves later calls able to try again. Closing an owner prevents initialization or resource publication from resurrecting it. Once a Manifest source is selected, a failed data read stays with that source.
 
 ## 5. Reliability and capture

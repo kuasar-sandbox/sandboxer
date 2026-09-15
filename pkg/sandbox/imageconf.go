@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
@@ -141,7 +143,14 @@ func LoadImageConfigFrom(r io.ReaderAt, size int64) (*ImageConfig, error) {
 			return LoadImageConfigBytes(raw)
 		}
 	}
-	rc, err := image.ReadConfig(r, size)
+	// The ZIP library may accept all requested bytes despite a source error,
+	// or translate a failed probe into an absent trailer. Preserve the cause
+	// across this synchronous parse before accepting a result or soft miss.
+	source := &imageConfigReader{ReaderAt: r}
+	rc, err := image.ReadConfig(source, size)
+	if source.err != nil {
+		return nil, fmt.Errorf("load image config: %w", source.err)
+	}
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return &ImageConfig{}, nil
@@ -149,6 +158,22 @@ func LoadImageConfigFrom(r io.ReaderAt, size int64) (*ImageConfig, error) {
 		return nil, fmt.Errorf("load image config: %w", err)
 	}
 	return imageConfigFromRuntime(rc), nil
+}
+
+type imageConfigReader struct {
+	io.ReaderAt
+	err error
+}
+
+func (r *imageConfigReader) ReadAt(buffer []byte, offset int64) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	n, err := r.ReaderAt.ReadAt(buffer, offset)
+	if readretry.IsTerminal(err) || readerr.IsPermanent(err) {
+		r.err = err
+	}
+	return n, err
 }
 
 // LoadImageConfigBytes decodes the exact config.json bytes retained by a

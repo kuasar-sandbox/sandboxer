@@ -14,6 +14,7 @@ import (
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	storeclient "github.com/kuasar-sandbox/accelerator/pkg/store/client"
@@ -365,6 +366,9 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 	if sandboxErr == nil {
 		ref, err := p.publishSandboxRoot(ctx, rootRef, childScope, sandboxRoot)
 		return PublishResult{Role: RoleSandbox, Ref: ref}, err
+	}
+	if readretry.IsTerminal(sandboxErr) || readerr.IsPermanent(sandboxErr) {
+		return PublishResult{}, sandboxErr
 	}
 	stream, childScope, err = p.open(ctx, rootRef, scope)
 	if err != nil {

@@ -11,6 +11,7 @@ import (
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -160,6 +161,8 @@ func (p *Publisher) inspectBundleRoot(
 		defer sandboxRoot.Close()
 		dependencies, err := manifestDependenciesFromSandbox(sandboxRoot.Portable, rootKey)
 		return RoleSandbox, dependencies, err
+	} else if readretry.IsTerminal(err) || readerr.IsPermanent(err) {
+		return "", nil, err
 	}
 
 	stream, childScope, err := p.open(ctx, rootRef, scope)

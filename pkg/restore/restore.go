@@ -21,9 +21,11 @@ import (
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/internal/chmemory"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -1228,7 +1230,7 @@ func validateRestoreExt4Reader(ctx context.Context, reader vhost.BlockReader) er
 	}
 	var magic [2]byte
 	n, err := reader.ReadAt(magic[:], magicOffset)
-	if err != nil && !(errors.Is(err, io.EOF) && n == len(magic)) {
+	if err != nil && (readretry.IsTerminal(err) || readerr.IsPermanent(err) || !(errors.Is(err, io.EOF) && n == len(magic))) {
 		return fmt.Errorf("read ext4 superblock magic: %w", err)
 	}
 	if n != len(magic) {
