@@ -613,11 +613,23 @@ T8 create memfd and layer S.memory over S.from_refs
 T9 create UFFD/va_report endpoints and CH restore argv
 T10 start CH from config.json/state.json
 T11 transfer UFFD descriptor(s) and complete restore handshake
-T12 /vm.resume
-T13 establish restore MUX and resume original process
-T14 settle balloon/resource observation
-T15 start pinger, forwarder, sensor, and steady lifecycle
+T12 poll GET /vm.info until the restored VM is Paused
+T13 /vm.resume
+T14 establish restore MUX and resume original process
+T15 settle balloon/resource observation
+T16 start pinger, forwarder, sensor, and steady lifecycle
 ```
+
+Cloud Hypervisor v51.1 binds its API socket before its CLI submits `VmRestore`,
+so socket connectivity is not restore readiness. The `vm.info` Paused check is
+the correctness barrier before the existing external `/vm.resume`; only the
+version's structured VM-not-created response and a not-yet-listening socket are
+pending conditions. `timeouts.api_ready` bounds that entire barrier, including
+a connected but stalled response. `timeouts.ch_api` independently bounds the
+subsequent resume response, and `timeouts.restore` bounds the guest restore ACK
+and MUX establishment. This completes the restore-readiness correctness part of
+#72; eliminating the resume round trip remains a future optimization and would
+require a compatible Cloud Hypervisor version.
 
 Restore does not:
 

@@ -625,11 +625,20 @@ T8 create memfd and layer S.memory over S.from_refs
 T9 create UFFD/va_report endpoints and CH restore argv
 T10 start CH from config.json/state.json
 T11 transfer UFFD descriptor(s) and complete restore handshake
-T12 /vm.resume
-T13 establish restore MUX and resume original process
-T14 settle balloon/resource observation
-T15 start pinger,forward,sensor and steady lifecycle
+T12 轮询 GET /vm.info，直到已恢复 VM 明确处于 Paused
+T13 /vm.resume
+T14 establish restore MUX and resume original process
+T15 settle balloon/resource observation
+T16 start pinger,forward,sensor and steady lifecycle
 ```
+
+Cloud Hypervisor v51.1 会在 CLI 提交 `VmRestore` 前绑定 API socket，因此 socket
+可连接不代表 restore ready。`vm.info` 的 Paused 检查是既有外部 `/vm.resume`
+之前的正确性 barrier；只有该版本的结构化 VM-not-created 响应和 socket 尚未监听
+可视为 pending。`timeouts.api_ready` 覆盖整个 barrier，包括连接成功但响应阻塞；
+`timeouts.ch_api` 独立约束后续 resume 响应，`timeouts.restore` 独立约束 Guest
+restore ACK 与 MUX 建立。这完成 #72 的 restore-readiness 正确性部分；消除 resume
+往返仍是未来优化，并且需要兼容的 Cloud Hypervisor 版本。
 
 Restore不会:
 
