@@ -353,7 +353,7 @@ read offline. See [usage configuration](usage.md#3-configuration) and the
 
 Export/snapshot acquires the MemoryController mutation barrier and, before freezing, lifts and drains any `memory.high` operation that could race with CH pause. The host ping gate lets an admitted probe complete both `pong` and the guest-EOF transport barrier. This drain has its own 8-second quiesce budget; capture cannot wait forever merely because ordinary `timeouts.ping` has no forced timeout. On expiry, the host cancels and joins the probe, and failed capture enters full recovery. Guest quiesce also drains and pauses periodic `mem_report`, preventing S from capturing a reporter that holds the stream lock while waiting on the old host vsock. Restore switches to a new observation epoch before ACK; `--resume` and failed-capture attach recover the original epoch. A live attach only reopens the pause gate and does not corrupt accounting for already admitted reports. Recovery releases the host barrier after VM, MUX, app, and backends recover.
 
-`resources.diff_cow` gives root/data active diffs one shared bounded plaintext cache in the host process, independent of guest memory and VMM overhead. See the [complete configuration, non-durable FLUSH and disk-filesystem contract](diff-cow-cache.md).
+`resources.diff_cow` gives root/data active diffs one shared bounded plaintext cache in the host process, independent of guest memory and VMM overhead. This cache is shared across tmpfs and disk-backed diffs; it does not cap tmpfs file storage in memory/swap. See the [complete configuration, non-durable FLUSH and filesystem contract](diff-cow-cache.md).
 
 ### 4.2 Memory terms
 
@@ -780,7 +780,7 @@ Read order is active diff → captured top → `base_from_refs` → root image w
 
 ### 11.4 BlockCOW state
 
-The bitmap tracks logical upper-present 4 KiB blocks, published when the plaintext cache accepts a complete page. Cache clean/dirty/writeback state is separate. Absent blocks fall through to base or zeros. One sandbox shares `resources.diff_cow.cache_size` (default 32MiB) and its `max_dirty_size` subset (16MiB) across root/data diffs. Active bodies use direct I/O; guest FLUSH is a healthy no-op with explicitly non-durable semantics. Normal Close drains accepted writes without fsync. Low-level Discard waits for in-flight writeback before punching complete blocks and exposing base again; wire DISCARD/WRITE_ZEROES remain unsupported. Zero writes remain upper data. Export/snapshot does not rotate the diff or change its base. See the complete [cache, direct I/O and lifecycle contract](diff-cow-cache.md).
+The bitmap tracks logical upper-present 4 KiB blocks, published when the plaintext cache accepts a complete page. Cache clean/dirty/writeback state is separate. Absent blocks fall through to base or zeros. One sandbox shares `resources.diff_cow.cache_size` (default 32MiB) and its `max_dirty_size` subset (16MiB) across root/data diffs. Active bodies, including tmpfs files, request O_DIRECT through the same aligned positioned-I/O API without filesystem-specific policy; flag acceptance does not guarantee physical cache bypass; guest FLUSH is a healthy no-op with explicitly non-durable semantics. Normal Close drains accepted writes without fsync. Low-level Discard waits for in-flight writeback before punching complete blocks and exposing base again; wire DISCARD/WRITE_ZEROES remain unsupported. Zero writes remain upper data. Export/snapshot does not rotate the diff or change its base. See the complete [cache, filesystem I/O and lifecycle contract](diff-cow-cache.md).
 
 ### 11.5 Quiesce / Resume
 
@@ -903,7 +903,7 @@ mounts:
 Use a new active diff: an existing diff takes precedence, so changing a template
 does not resize or replace existing data. Do not truncate an existing filesystem
 to impose a smaller limit. Sandboxer does not automatically resize filesystems,
-cap the materialized COW disk footprint (pending cache writeback is bounded separately by `resources.diff_cow`), or change disk capacity at startup or restore. Logical block
+cap materialized COW storage (including tmpfs file memory/swap; pending cache writeback is bounded separately by `resources.diff_cow`), or change disk capacity at startup or restore. Logical block
 device capacity is distinct from an encrypted file's physical length, host disk
 allocation, and the guest filesystem's available file-data space. This migration
 does not introduce arbitrary per-instance capacity selection from one template.

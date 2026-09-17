@@ -1,9 +1,12 @@
 [English](diff-cow-cache.md) | [简体中文](diff-cow-cache_zh.md)
 
-# 活动 COW direct I/O 与明文缓存
+# 活动 COW I/O 与明文缓存
 
-活动可写 diff 使用 direct I/O，以及由 `sandbox-ctl` 为每个沙箱持有的一份有界明文页缓存。
-Root 与数据盘共享预算。这实现了 [issue #230](https://github.com/kuasar-sandbox/sandboxer/issues/230)。
+活动可写 diff（包括 tmpfs 上的文件）通过同一定位 I/O API 请求 O_DIRECT。
+运行时策略不识别底层文件系统类型。
+`sandbox-ctl` 为每个沙箱持有一份有界明文页缓存；root 与数据盘共享预算，包括混合使用
+tmpfs 与磁盘的情况。这实现了 [issue #230](https://github.com/kuasar-sandbox/sandboxer/issues/230)，
+并由 [issue #238](https://github.com/kuasar-sandbox/sandboxer/issues/238) 恢复 tmpfs 兼容性。
 改动范围是活动数据访问、配置与生命周期；immutable base、template、历史 overlay、manifest
 解密缓存、制品输出、tarstream 表示、cgroup、balloon 和 guest 资源预算保持现有行为。
 
@@ -19,7 +22,7 @@ resources:
 两个字段都必须是正数且为 4 KiB 的整数倍，满足 `0 < max_dirty_size <= cache_size`。
 缺省字段各自采用以上默认值，包括没有 `diff_cow` 的旧配置。只提供一个字段时，补全默认值后
 也必须满足大小关系。这些是有限的工程初值，不是生产 SLA 或最优性能声明。没有零值/无限制、
-关闭开关、buffered 回退或其他写入模式。
+关闭开关、错误触发的 buffered 回退或可配置的其他写入模式。
 
 `max_dirty_size` 是 `cache_size` 的子集，不是额外池或预留分区。没有脏页时 clean 可以使用
 全部缓存。添加磁盘不会乘以预算。这些 host 进程资源独立于 guest capacity、allocatable/startup
@@ -34,7 +37,7 @@ Go 调用者可通过 `WithCOWCache` 向多个 `OpenBlockCOW` 传入同一 `COWC
 
 ## 逻辑状态与记账
 
-分层为 `BlockCOW -> 明文缓存 -> diffFile 编码 -> 对齐 direct I/O -> 活动文件`。
+分层为 `BlockCOW -> 明文缓存 -> diffFile 编码 -> 自有 I/O 工作区 -> 活动文件`。
 页大小为 4096 字节。Base 读取不会填充缓存或物化 upper。缓存按活动文件与块号索引。
 
 | 状态或转换 | 总占用 | 脏占用 |
@@ -51,7 +54,13 @@ Go 调用者可通过 `WithCOWCache` 向多个 `OpenBlockCOW` 传入同一 `COWC
 独立有界开销包括每沙箱一个 1 MiB 明文批工作区与最多 256 个页指针，每个活动文件两个独立
 1 MiB MAP_SHARED I/O 工作区（每个额外对齐 padding 小于 1 MiB），以及随页数线性有界的
 页元数据、索引和 Go 分配器开销。`cache_size` 不是进程 RSS、guest memfd 映射、
-immutable-source cache 或快照输出内存的上限。
+immutable-source cache、tmpfs 文件存储或快照输出内存的上限。
+
+Tmpfs 文件页是位于内存（也可能位于 swap）中的文件系统存储，与这份有界进程缓存分开。
+回写成功会释放脏额度，但不会释放已存入 tmpfs 的文件数据；淘汰 clean 缓存也不会删除它。
+`cache_size` 不限制这些字节，也不承诺 tmpfs 页零驻留。该存储由现有 tmpfs 挂载的大小、
+inode 限额和宿主内存控制约束。Sandboxer 不重挂 tmpfs、不改变 cgroup、不扩大缓存预算，
+也不新增持久化保证。参见 [Linux tmpfs 文档](https://www.kernel.org/doc/html/v6.1/filesystems/tmpfs.html)。
 
 Bitmap 表示**逻辑 upper-present**，独立于 clean/dirty 状态。新页完整发布到缓存及 bitmap
 后才应答写入。回写成功或淘汰不清除此 bit。重开按现有格式从稀疏文件 extent 重建 upper
@@ -64,9 +73,9 @@ Read loading 预留总容量；没有可用 clean 槽时，可以用有界前台
 绝不能绕过较新的缓存页。
 
 运行读取与快照读取共用有界 upper 连续区间批处理。仅本次请求的连续冷 upper 页合并为
-一次 direct read（最多 1 MiB）；缓存命中、base 或 hole 边界会结束该区间。按 stripe
+一次物理读取（最多 1 MiB）；缓存命中、base 或 hole 边界会结束该区间。按 stripe
 编号排序的一次性范围读锁防止并发写入/Discard，Loading 预留防止淘汰。缓存容量小于
-区间时，剩余冷页在相同 stripe 保护下直接读取但不入缓存。读取/解密保持在现有私有 DIO
+区间时，剩余冷页在相同 stripe 保护下直接读取但不入缓存。读取/解密保持在自有 MAP_SHARED I/O
 工作区内，先从该工作区填充并发布 clean 页，再复制到可被调用者或 guest 修改的输出
 内存。不新增与请求长度成比例的 payload 分配或 base 预取。
 
@@ -118,38 +127,50 @@ Close 幂等，排空及关闭错误沿 run/restore 传播。销毁也必须等�
 释放其 buffer。
 
 回写与短写错误具有粘性：失败页仍计脏额度，新写失败，唤醒所有等待者，以不 self-join 的
-非阻塞 fatal 通知报告 runtime。部分 direct 写可能已改变文件。清理首次物化块不能对同批
+非阻塞 fatal 通知报告 runtime。部分物理写可能已改变文件。清理首次物化块不能对同批
 原有 upper 页打洞。不承诺写事务性或崩溃恢复，不静默 buffered 重试。
 
 必须先记录原始错误并通知 owner，再执行清理 I/O。回滚期间仍持有在途 I/O 所有权、冻结页及其额度，Close 不能提前释放文件或缓冲。清理错误在结束后追加，不掩盖原始失败。
 
-## Direct I/O 契约
+## 活动文件 I/O 契约
 
-仅活动 body 使用 O_DIRECT：新目标在 **seeding 前**启用；已有活动文件校验、运行与
-快照读取均使用。Header/格式探测在并发 body I/O 前有界完成；template/base 保留现有
-buffered/read-only 行为。明文与密文文件格式、固定 4 KiB 密文 header、本地加密
-off/auto/required 策略和 512 字节 XTS 数据单元编号不变。
+每个活动 body 都在其已打开的描述符上请求 O_DIRECT，并使用相同的有界对齐工作区。
+新目标在 **seeding 前**启用；已有活动文件校验、运行与快照读取使用同一路径。
+运行时代码不检查文件系统类型、名称、挂载策略或文件系统专有 inode flags。
+Header/格式探测在并发 body I/O 前有界完成；template/base 保留 buffered/read-only 行为。
+明文与密文文件格式、固定 4 KiB 密文 header、本地加密 off/auto/required 策略和
+512 字节 XTS 数据单元编号不变。
 
-查询已打开文件的 `STATX_DIOALIGN`，区分 buffer 地址与 offset/length 约束。偏移对齐
-必须整除 4096，且 body 边界和大小满足要求。Statx 支持未知时，只能使用经验证文件系统的
-保守路径；当前仅对已核实 inode flags 及 ordered/writeback 挂载模式的旧 ext4 使用 4 KiB 对齐；旧 XFS 必须提供 STATX_DIOALIGN。拒绝大于 4 KiB 的文件系统块。明确不支持则报错。Tmpfs 接受 O_DIRECT 不代表绕过 page cache。不支持的文件
-系统/对齐要求带诊断报错，绝不回退。测试使用磁盘上的 ext4/XFS 任务目录，不能用 tmpfs `/tmp`。
+对已打开 fd 查询 `STATX_DIOALIGN`，区分 buffer 地址与 offset/length 约束。
+报告的正数约束必须满足工作区上限与 4 KiB COW 几何要求；偏移对齐必须整除 4096，
+且 body 边界和大小满足要求。缺少 mask、查询返回不可用的 ENOSYS/EINVAL/EOPNOTSUPP，
+或两个对齐字段同时为零时，选择保守的 4096 字节对齐。这仅是对齐选择，不证明缓存绕过，
+也不允许去掉 O_DIRECT。只有一个字段为零或其他无效约束、真实 statx/描述符错误、
+设置标志错误及实际 I/O 失败仍然报错。应用层不会用 buffered 重试掩盖 EIO、ENOSPC、
+对齐错误或短 I/O。参见 [statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html)。
+
+内核及底层实现决定如何满足 O_DIRECT 请求。成功设置标志并完成对齐 I/O 证明操作可用，
+不证明所有底层存储都会绕过物理磁盘缓存。Tmpfs 文件页仍是 `cache_size` 之外的内存/swap
+存储。没有文件系统白名单、专用 tmpfs 后端、新配置模式或数据 I/O 失败后的回退。
+参见 [open(2)](https://man7.org/linux/man-pages/man2/open.2.html)。
 
 I/O 使用有界、对齐的匿名 `MAP_SHARED` 工作区，其 lifetime 覆盖 syscall 完成，避免
 private heap/fork 风险。任意调用者切片和子页读取经过这些 buffer，大操作分块。
-缓存整页回写避免读改写。短写报错，不重试未对齐余下切片。参见
-[open(2)](https://man7.org/linux/man-pages/man2/open.2.html)、
-[statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html) 与
+缓存整页回写避免读改写。短写报错，不重试未对齐余下切片；参见
 [write(2)](https://man7.org/linux/man-pages/man2/write.2.html)。
-
-旧 ext4 的 fscrypt、verity、inline data 或 data journaling 可能导致内核静默回退，不能只凭 O_DIRECT flag 接受。此限制依据 [Linux ext4 DIO 判断](https://github.com/torvalds/linux/blob/master/fs/ext4/file.c)及[对齐查询](https://github.com/torvalds/linux/blob/master/fs/ext4/inode.c)。
 
 ## 验证
 
 用确定性 worker gate 和注入错误覆盖额度转换、FIFO/LRU、一页容量、取消、多盘竞争、
 冻结页读写、FLUSH、快照、Discard 与 Close。真实 direct-I/O 检查覆盖对齐、稀疏边界、
-template、明/密文重开和 mincore 驻留。执行 targeted tests、race、vet、build、broader
-tests 与 CH/KVM E2E；明确报告跳过与基础设施故障。
+template、明/密文重开，以及磁盘 fixture 上的 mincore 驻留。通用对齐测试覆盖正数、缺失、
+双零及无效约束、不可用查询和真实错误。独立真实 tmpfs 测试验证 fixture 描述符类型及相同的 O_DIRECT 请求、
+明/密文 I/O、有界工作区与 copyout、模板 seeding、稀疏 hole、混合文件系统共享额度/背压、
+dirty/writeback 捕获、Drain/Close 与重开。隔离 user/mount namespace 可用时，以小型私有
+挂载测试真实 ENOSPC，绝不耗尽或重挂共享挂载。DIO/mincore 基准保留磁盘 fixture。
+Tmpfs 功能测试不能作为磁盘缓存绕过证据。
+执行 targeted tests、race、vet、build、broader tests，以及活动 diff 位于真实 tmpfs 的
+CH/KVM guest 冷启动/读写和 pause/export/restore；明确报告跳过与基础设施故障。
 
 性能比较的数据集必须远大于缓存，分别报告前台 admission latency 与含 Drain 总耗时。
 覆盖顺序/随机 4 KiB、512 字节更新、热点覆盖、加密和多盘。报告尾延迟、逻辑/物理写量、

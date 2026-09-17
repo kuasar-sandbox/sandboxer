@@ -1,13 +1,10 @@
 package vhost
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"unsafe"
 
@@ -41,6 +38,8 @@ func (m *alignedMapping) close() error {
 	return err
 }
 
+// directWorkspace stages the common O_DIRECT API requests. The kernel decides
+// how those requests are fulfilled; this is not proof of physical cache bypass.
 type directWorkspace struct {
 	readMu, writeMu          sync.Mutex
 	read, write              *alignedMapping
@@ -73,101 +72,26 @@ func (b directBody) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func directAlignment(fd int, bodyOffset, size int64) (int, int, error) {
-	var fs unix.Statfs_t
-	if err := unix.Fstatfs(fd, &fs); err != nil {
-		return 0, 0, fmt.Errorf("statfs: %w", err)
-	}
-	// These are the verified local sparse/DIO filesystems. In particular tmpfs
-	// accepts O_DIRECT on some kernels while continuing to use its page cache.
-	if fs.Type != unix.EXT4_SUPER_MAGIC && fs.Type != unix.XFS_SUPER_MAGIC {
-		return 0, 0, fmt.Errorf("unsupported active diff filesystem 0x%x (requires disk-backed ext4/XFS)", fs.Type)
-	}
-	if fs.Bsize <= 0 || fs.Bsize > cowBlockSize || cowBlockSize%fs.Bsize != 0 {
-		return 0, 0, fmt.Errorf("unsupported active diff filesystem block size %d", fs.Bsize)
-	}
 	var st unix.Statx_t
 	err := unix.Statx(fd, "", unix.AT_EMPTY_PATH, unix.STATX_DIOALIGN, &st)
+	return directAlignmentFromStatx(st, err, bodyOffset, size)
+}
+
+func directAlignmentFromStatx(st unix.Statx_t, queryErr error, bodyOffset, size int64) (int, int, error) {
+	if queryErr != nil && !errors.Is(queryErr, unix.ENOSYS) && !errors.Is(queryErr, unix.EINVAL) && !errors.Is(queryErr, unix.EOPNOTSUPP) {
+		return 0, 0, fmt.Errorf("statx DIOALIGN: %w", queryErr)
+	}
+	// Missing constraints (including a both-zero report) do not identify the
+	// backing filesystem. Use the format's conservative alignment and let
+	// O_DIRECT setup and actual I/O determine whether operations are supported.
 	memory, offset := 4096, 4096
-	if err == nil && st.Mask&unix.STATX_DIOALIGN != 0 {
-		// Zero is an explicit unsupported result, not permission to assume 4 KiB.
+	if queryErr == nil && st.Mask&unix.STATX_DIOALIGN != 0 && (st.Dio_mem_align != 0 || st.Dio_offset_align != 0) {
 		memory, offset = int(st.Dio_mem_align), int(st.Dio_offset_align)
-	} else {
-		if err != nil && !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.EOPNOTSUPP) {
-			return 0, 0, fmt.Errorf("statx DIOALIGN: %w", err)
-		}
-		// Older ext4 can silently buffer O_DIRECT for data=journal, fscrypt,
-		// verity or inline data. Verify both inode and mount before using its
-		// conservative 4 KiB path. Unknown XFS needs STATX_DIOALIGN: realtime
-		// allocation units can exceed the format's page size.
-		if fs.Type != unix.EXT4_SUPER_MAGIC {
-			return 0, 0, fmt.Errorf("STATX_DIOALIGN unavailable; no verified legacy DIO path for filesystem 0x%x", fs.Type)
-		}
-		flags, flagErr := unix.IoctlGetInt(fd, unix.FS_IOC_GETFLAGS)
-		if flagErr != nil {
-			return 0, 0, fmt.Errorf("legacy ext4 DIO inode flags: %w", flagErr)
-		}
-		mode, modeErr := ext4DataMode(fd)
-		if modeErr != nil {
-			return 0, 0, modeErr
-		}
-		if err := validateLegacyExt4(flags, mode); err != nil {
-			return 0, 0, err
-		}
 	}
 	if err := validateDirectAlignment(memory, offset, bodyOffset, size); err != nil {
 		return 0, 0, err
 	}
 	return memory, offset, nil
-}
-
-// Values are Linux UAPI FS_*_FL, not on-disk encrypted-diff policy flags.
-func validateLegacyExt4(flags int, mode string) error {
-	const unsupported = 0x4 | 0x800 | 0x4000 | 0x100000 | 0x10000000 // compression, fscrypt, journal-data, verity, inline
-	if flags&unsupported != 0 || (mode != "ordered" && mode != "writeback") {
-		return fmt.Errorf("STATX_DIOALIGN unavailable; unsupported legacy ext4 DIO flags=0x%x data=%s", flags, mode)
-	}
-	return nil
-}
-func ext4DataMode(fd int) (string, error) {
-	// Bind mount policy to the opened descriptor's mount ID, not a path which
-	// could have been renamed or overmounted. Bound reads of proc metadata.
-	info, err := os.ReadFile(fmt.Sprintf("/proc/self/fdinfo/%d", fd))
-	if err != nil {
-		return "", fmt.Errorf("legacy ext4 DIO fdinfo: %w", err)
-	}
-	id := ""
-	for _, line := range strings.Split(string(info), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[0] == "mnt_id:" {
-			id = fields[1]
-		}
-	}
-	if _, err := strconv.ParseUint(id, 10, 64); err != nil {
-		return "", fmt.Errorf("legacy ext4 DIO missing mount ID")
-	}
-	mounts, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return "", err
-	}
-	defer mounts.Close()
-	scan := bufio.NewScanner(io.LimitReader(mounts, 4<<20))
-	scan.Buffer(make([]byte, 4096), 64<<10)
-	for scan.Scan() {
-		fields := strings.Fields(scan.Text())
-		if len(fields) < 10 || fields[0] != id {
-			continue
-		}
-		for i, field := range fields {
-			if field == "-" && i+3 < len(fields) && fields[i+1] == "ext4" {
-				for _, option := range strings.Split(fields[i+3], ",") {
-					if strings.HasPrefix(option, "data=") {
-						return strings.TrimPrefix(option, "data="), nil
-					}
-				}
-			}
-		}
-	}
-	return "", errors.Join(fmt.Errorf("legacy ext4 DIO could not verify mount data policy"), scan.Err())
 }
 
 func validateDirectAlignment(memory, offset int, bodyOffset, size int64) error {

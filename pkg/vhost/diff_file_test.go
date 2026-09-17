@@ -561,8 +561,15 @@ func TestFreshEncryptedDiffRejectsPreallocatedBody(t *testing.T) {
 }
 
 func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
+	testDiffTemplateMatrixAndAtomicCommit(t, t.TempDir())
+}
+
+func TestTmpfsDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
+	testDiffTemplateMatrixAndAtomicCommit(t, tmpfsTestDir(t))
+}
+
+func testDiffTemplateMatrixAndAtomicCommit(t *testing.T, dir string) {
 	const size = 4 * cowBlockSize
-	dir := t.TempDir()
 	templatePath := filepath.Join(dir, "template.ext4")
 	want := make([]byte, size)
 	copy(want[cowBlockSize+123:], bytes.Repeat([]byte{0x71}, 257))
@@ -570,6 +577,12 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 	writeSparseTemplate(t, templatePath, want, []sparse.Extent{
 		{Offset: cowBlockSize + 123, Size: 257},
 		{Offset: 3 * cowBlockSize, Size: cowBlockSize},
+	})
+	t.Cleanup(func() {
+		got, err := os.ReadFile(templatePath)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("immutable template changed: %v", err)
+		}
 	})
 	key := testDiffKey(0x61)
 	encryption := mustDiffEncryption(t, key)
@@ -717,9 +730,16 @@ func TestDiffTemplateMatrixAndAtomicCommit(t *testing.T) {
 }
 
 func TestValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t *testing.T) {
+	testValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t, t.TempDir())
+}
+
+func TestTmpfsValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t *testing.T) {
+	testValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t, tmpfsTestDir(t))
+}
+
+func testValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t *testing.T, dir string) {
 	const size = 2 * cowBlockSize
 	ctx := context.Background()
-	dir := t.TempDir()
 	ext4 := make([]byte, size)
 	ext4[ext4MagicOffset], ext4[ext4MagicOffset+1] = 0x53, 0xef
 	plainPath := filepath.Join(dir, "plain.ext4")

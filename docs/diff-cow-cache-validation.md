@@ -2,12 +2,27 @@
 
 # Issue #230 validation observations
 
-The [cache/direct I/O contract](diff-cow-cache.md) bounds active-diff memory but
+The [cache/I/O contract](diff-cow-cache.md) bounds the sandbox-ctl plaintext cache but
 changes I/O completion and performance. The original d601fa0 measurements below show lower file
 page-cache residency and substantial throughput regressions against the buffered
 baseline on this storage. They are retained as historical observations, not
 performance targets. Revision measurements and independently supplied d601
 CH/KVM evidence are recorded separately below.
+
+## Compatibility correction (#238)
+
+The historical tmpfs rejection and filesystem-specific legacy restrictions below
+are superseded by [issue #238](https://github.com/kuasar-sandbox/sandboxer/issues/238).
+Every active body now requests O_DIRECT through the same aligned positioned-I/O
+API, with generic STATX_DIOALIGN constraints or conservative 4096-byte alignment
+when constraints are unavailable/both-zero. Runtime no longer identifies
+filesystem types, inode flags or mount policies. Setup and I/O errors remain
+errors; there is no buffered retry. Successful O_DIRECT requests do not prove
+physical disk-cache bypass on every backing implementation. Tmpfs file storage
+in memory/swap is separate from the bounded shared process cache; see the
+[current memory and I/O contract](diff-cow-cache.md). Historical data, source
+hashes and disk-backed DIO/mincore measurements below are unchanged and are not
+measurements of tmpfs storage residency or tmpfs guest behavior.
 
 ## Environment and method
 
@@ -144,7 +159,7 @@ suite, whole-repository vet/build and the broader Go suite were run with
 `-tags no_rocksdb`. Deterministic gates cover new/clean/dirty/loading/writeback
 quota accounting, one-page capacity, requests larger than cache, FIFO/LRU,
 frozen-page reads, canceled waits, Discard, Close and sticky failures.
-Real disk tests cover alignment, mmap buffers, tmpfs rejection, seeding,
+Real disk tests cover alignment, mmap buffers, the then-required tmpfs rejection (superseded by #238), seeding,
 plaintext/encrypted reopen and mincore. Artifact snapshot/export/readback tests
 restore unflushed dirty/writeback data and reject a failure after the last disk
 read. Those tests simulate CH's API; they are not actual CH/KVM E2E.
@@ -153,7 +168,8 @@ The broader suite retains one existing skip:
 `TestSendU64Reply_RoundTrip` uses net.Pipe, not UnixConn, and is marked indirectly
 covered by `TestParseSetMemTable_Layout`. Three packages contain no test files.
 No new tests were skipped. The supplied disk environment exercised ext4, not a
-real XFS mount; legacy unsupported-mode rejection has deterministic unit coverage.
+real XFS mount; that historical suite included deterministic legacy unsupported-mode
+rejection tests, superseded by the generic alignment tests in #238.
 Parent subsequently passed default-tag targeted and whole-repository tests,
 vet, build and six-package races on immutable `d601fa0`, with `GOFLAGS` empty
 and `CGO_ENABLED=1`. The previous native-check gap is closed for that revision;
