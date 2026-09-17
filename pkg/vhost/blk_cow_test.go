@@ -2,6 +2,7 @@ package vhost
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -399,7 +400,7 @@ func TestBlockCOW_ConcurrentOverlappingFirstWrites(t *testing.T) {
 	}
 }
 
-func TestBlockCOW_FailedMaterializationDoesNotMarkDirty(t *testing.T) {
+func TestBlockCOW_AcceptedWriteSurvivesUntilBackgroundFailure(t *testing.T) {
 	const size = cowBlockSize
 	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff.ext4"), &fakeReader{data: patternedBytes(size)}, DiffInit{CreateSize: size})
 	if err != nil {
@@ -408,11 +409,17 @@ func TestBlockCOW_FailedMaterializationDoesNotMarkDirty(t *testing.T) {
 	if err := cow.diff.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cow.WriteAt([]byte("partial"), 17); err == nil {
-		t.Fatal("WriteAt succeeded with closed diff")
+	if _, err := cow.WriteAt([]byte("partial"), 17); err != nil {
+		t.Fatal(err)
 	}
-	if cow.blockDirty(0) {
-		t.Fatal("failed materialization marked block dirty")
+	if !cow.blockDirty(0) {
+		t.Fatal("accepted page was not logically upper-present")
+	}
+	if err := cow.Drain(context.Background()); err == nil {
+		t.Fatal("Drain hid closed diff failure")
+	}
+	if err := cow.Close(); err == nil {
+		t.Fatal("Close hid writeback/close failure")
 	}
 }
 

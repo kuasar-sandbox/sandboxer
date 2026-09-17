@@ -9,7 +9,7 @@ done
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || { echo "KVM is required" >&2; exit 1; }
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE bash "$0" "$@"; fi
 source "$SCRIPT_DIR/lib/readiness_helpers.sh"
-WORK="$(mktemp -d /tmp/e2e-read-recovery-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-read-recovery-XXXXXX")"
 PIDS=()
 SESSIONS=()
 cleanup() {

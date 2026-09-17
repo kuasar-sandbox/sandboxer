@@ -257,10 +257,7 @@ func BenchmarkBlockCOWSnapshotView(b *testing.B) {
 
 func resetBenchmarkCOW(b *testing.B, cow *BlockCOW) {
 	b.Helper()
-	if err := cow.diff.punchHole(0, cow.size); err != nil {
+	if err := cow.Discard(0, cow.size); err != nil {
 		b.Fatal(err)
 	}
-	cow.bitmapMu.Lock()
-	clear(cow.bitmap)
-	cow.bitmapMu.Unlock()
 }

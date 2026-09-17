@@ -53,7 +53,7 @@ if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
 fi
 if [ "$(id -u)" -ne 0 ]; then skip "must run as root"; fi
 
-WORK="$(mktemp -d /tmp/e2e-restore-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-restore-XXXXXX")"
 SBPID1=""
 SBPID2=""
 cleanup() {

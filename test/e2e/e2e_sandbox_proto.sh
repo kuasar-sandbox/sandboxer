@@ -61,7 +61,7 @@ if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
     TAP_CREATED_BY_TEST=1
 fi
 
-WORK="$(mktemp -d /tmp/e2e-proto-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-proto-XXXXXX")"
 trap '[ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"; [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null; true' EXIT
 
 BLK0_IMAGE="${BLK0_IMAGE:-}"

@@ -218,6 +218,7 @@ type SnapDiskRef struct {
 	OwnedDiff    bool
 	Size         int64
 	SnapshotView func() (io.ReadSeeker, []sparse.Extent, error)
+	CheckError   func() error
 }
 
 // ServeAndWait owns the half of the sandbox lifecycle that is identical
@@ -285,7 +286,7 @@ func ServeAndWait(p VMParams) (int, error) {
 			readiness.mu.Unlock()
 			return
 		}
-		firstReadFatal = fmt.Errorf("mandatory source read: %w", err)
+		firstReadFatal = fmt.Errorf("fatal sandbox I/O: %w", err)
 		cause := firstReadFatal
 		readiness.mu.Unlock()
 		// Reporters never join workers. Termination is effective even while
@@ -298,7 +299,15 @@ func ServeAndWait(p VMParams) (int, error) {
 		if process != nil {
 			_ = process.Kill()
 		}
-		logf("sandbox mandatory source read failed: %v", cause)
+		logf("sandbox fatal I/O: %v", cause)
+	}
+
+	// Background writeback reports directly, including while the frontend is
+	// quiesced or idle. The reporter cancels and signals; it never joins workers.
+	for _, d := range p.Disks {
+		if d.Cow != nil {
+			d.Cow.SetFatalHandler(reportReadFatal)
+		}
 	}
 
 	// Exactly one stdio MUX at a time; which conn backs it changes across
@@ -445,6 +454,7 @@ func ServeAndWait(p VMParams) (int, error) {
 			OwnedDiff:    d.OwnedDiff,
 			Size:         d.Cow.Size(),
 			SnapshotView: d.Cow.SnapshotView,
+			CheckError:   d.Cow.Err,
 		})
 	}
 

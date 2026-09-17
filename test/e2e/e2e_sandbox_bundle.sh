@@ -34,7 +34,7 @@ command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 command -v openssl >/dev/null 2>&1 || skip "openssl not on PATH"
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 
-WORK="$(mktemp -d /tmp/e2e-manifest-bundle-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-manifest-bundle-XXXXXX")"
 RR="$WORK/runtime"
 mkdir -p "$RR"
 PIDS=()

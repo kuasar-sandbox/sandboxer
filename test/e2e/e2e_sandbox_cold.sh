@@ -78,7 +78,7 @@ if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
 fi
 
 # ---- prepare blk0 (python:3.12-slim → erofs with appended config.json) ----
-WORK="$(mktemp -d /tmp/e2e-sandbox-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-sandbox-XXXXXX")"
 SBPID=""
 POST_PID=""
 cleanup() {

@@ -97,7 +97,7 @@ if [ -z "$BLK0_IMAGE" ]; then
     docker image inspect python:3.12-slim >/dev/null 2>&1 || docker pull python:3.12-slim >/dev/null
 fi
 
-WORK="$(mktemp -d /tmp/e2e-tapfd-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-tapfd-XXXXXX")"
 # No tap cleanup needed: connector-ctl creates a non-persistent, per-run tap that
 # vanishes when the consuming VM (CH) exits.
 trap '[ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"; true' EXIT

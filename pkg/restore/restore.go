@@ -89,7 +89,7 @@ type Options struct {
 }
 
 // Run executes restore. Returns the CH exit code.
-func Run(ctx context.Context, opts Options) (int, error) {
+func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if opts.SnapshotPath == "" && opts.SnapshotManifestKey == "" {
 		return -1, errors.New("restore: SnapshotPath or SnapshotManifestKey required")
 	}
@@ -452,12 +452,31 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	if !snapCfg.SingleDisk() {
 		rootDiffURI, rootDiffTmpl = snapCfg.Boot.Root.Overlay.Diff, snapCfg.Boot.Root.Overlay.DiffTemplate
 	}
-	rootDB, rootCleanup, err := reconstructDisk(ctx, opts, diffCustomerKey, snapCfg.SingleDisk(), rootTop, rootChain,
-		snapCfg.Boot.Root.Base, rootDiffURI, rootDiffTmpl, "overlay", logf)
+	cacheSize, maxDirtySize, err := snapCfg.Resources.DiffCOW.Bytes()
 	if err != nil {
 		return -1, err
 	}
-	defer rootCleanup()
+	cowCache, err := vhost.NewCOWCache(cacheSize, maxDirtySize)
+	if err != nil {
+		return -1, err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, cowCache.Close())
+		if retErr != nil {
+			code = -1
+		}
+	}()
+	rootDB, rootCleanup, err := reconstructDisk(ctx, opts, diffCustomerKey, snapCfg.SingleDisk(), rootTop, rootChain,
+		snapCfg.Boot.Root.Base, rootDiffURI, rootDiffTmpl, "overlay", logf, cowCache)
+	if err != nil {
+		return -1, err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, rootCleanup())
+		if retErr != nil {
+			code = -1
+		}
+	}()
 	disks := []sandbox.DiskBackend{rootDB}
 
 	for i := range snapCfg.Boot.Disks {
@@ -469,11 +488,16 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			top, chain = d.Overlay.Base, append([]string(nil), d.Overlay.BaseFromRefs...)
 			diffURI, diffTmpl = d.Overlay.Diff, d.Overlay.DiffTemplate
 		}
-		db, dcleanup, derr := reconstructDisk(ctx, opts, diffCustomerKey, single, top, chain, d.Base, diffURI, diffTmpl, fmt.Sprintf("disk%d", i), logf)
+		db, dcleanup, derr := reconstructDisk(ctx, opts, diffCustomerKey, single, top, chain, d.Base, diffURI, diffTmpl, fmt.Sprintf("disk%d", i), logf, cowCache)
 		if derr != nil {
 			return -1, derr
 		}
-		defer dcleanup()
+		defer func() {
+			retErr = errors.Join(retErr, dcleanup())
+			if retErr != nil {
+				code = -1
+			}
+		}()
 		disks = append(disks, db)
 	}
 
@@ -682,15 +706,19 @@ func openAndEstablishRestoreMUX(
 // diffURI/diffTemplate come from the restore host binding (or the auto-default
 // <sid>.<diskKey>.diff).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate, diskKey string, logf func(string, ...any)) (sandbox.DiskBackend, func(), error) {
+func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate, diskKey string, logf func(string, ...any), cowCache *vhost.COWCache) (sandbox.DiskBackend, func() error, error) {
 	var db sandbox.DiskBackend
-	var closers []func()
-	cleanup := func() {
+	var closers []func() error
+	cleanup := func() error {
+		var err error
 		for i := len(closers) - 1; i >= 0; i-- {
-			closers[i]()
+			err = errors.Join(err, closers[i]())
 		}
+		return err
 	}
-	fail := func(e error) (sandbox.DiskBackend, func(), error) { cleanup(); return sandbox.DiskBackend{}, nil, e }
+	fail := func(e error) (sandbox.DiskBackend, func() error, error) {
+		return sandbox.DiskBackend{}, nil, errors.Join(e, cleanup())
+	}
 	db.Overlay = !single
 
 	// Layered ro base: [captured top] ++ chain.
@@ -702,7 +730,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	if err != nil {
 		return fail(fmt.Errorf("%s: open base: %w", diskKey, err))
 	}
-	closers = append(closers, func() { baseReader.Close() })
+	closers = append(closers, baseReader.Close)
 
 	// Fresh writable diff. Empty URI → auto-default (ours to remove).
 	if diffURI == "" {
@@ -713,7 +741,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 		diffURI = sandbox.DefaultDiskDiffURI(baseDir, opts.SandboxID, diskKey)
 		_, p, _ := config.SchemeAndPath(diffURI)
 		db.OwnedDiff = true
-		closers = append(closers, func() { _ = os.Remove(p) })
+		closers = append(closers, func() error { _ = os.Remove(p); return nil })
 	}
 	_, diffPath, ok := config.SchemeAndPath(diffURI)
 	if !ok {
@@ -723,7 +751,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	if err != nil {
 		return fail(fmt.Errorf("%s: prepare diff: %w", diskKey, err))
 	}
-	var cowOptions []vhost.BlockCOWOption
+	cowOptions := []vhost.BlockCOWOption{vhost.WithCOWCache(cowCache)}
 	if opts.LocalCodec != nil {
 		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
 	}
@@ -731,7 +759,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	if err != nil {
 		return fail(fmt.Errorf("%s: open BlockCOW: %w", diskKey, err))
 	}
-	closers = append(closers, func() { cow.Close() })
+	closers = append(closers, cow.Close)
 	db.Cow, db.DiffPath = cow, diffPath
 
 	// Overlay mode: the ro erofs base device.
@@ -741,7 +769,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 			return fail(fmt.Errorf("%s: open erofs base: %w", diskKey, rerr))
 		}
 		db.Reader, db.BasePath = r, erofsBaseURI
-		closers = append(closers, func() { r.Close() })
+		closers = append(closers, r.Close)
 	}
 	return db, cleanup, nil
 }

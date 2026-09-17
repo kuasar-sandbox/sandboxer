@@ -71,7 +71,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/e2e-memory-budget-ws-XXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-memory-budget-ws-XXXXXX")"
 RUN_ROOT="$WORK/run"
 BASE_ROOT="$WORK/base"
 RESULT_ROOT="$WORK/results"

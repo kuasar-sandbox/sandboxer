@@ -257,6 +257,7 @@ resources:
   overhead: { memory: 128MiB }
   watermark_high: { ratio: 0.875 }
   startup: { memory: 512MiB }
+  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB }
 
 network:
   # Host provider and current identity:
@@ -365,6 +366,8 @@ Restore host若显式提供 `boot.cmdline`、launch persistent/ephemeral fields�
 `resources.capacity` 是 guest-visible VM capacity,进入 Portable config. `resources.allocatable` 是 cold start 的 workload 默认值,也进入 Portable config;其中 `allocatable.cpu` 必须是有限数,且满足 `0 < allocatable.cpu <= capacity.cpu`. Restore 保持 E 中的 capacity 和已捕获的 `deflate_on_oom`,但可以从目标节点显式重新应用 allocatable CPU/memory;该运行时 policy 不改写 E 或 C0. `control`、`overhead`、`watermark_high` 和 `startup` 是 node policy,不进入 E.
 
 Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Host ping gate 会让已入场探测完成 `pong` + guest EOF transport barrier;该排空独立受 8 s quiesce budget 约束,即使普通 `timeouts.ping` 关闭强制超时也不会无限阻塞捕获. 到期时 host cancel并join该探测,捕获失败后走完整 recovery. Guest quiesce 还会排空并暂停周期 `mem_report`,防止 S 捕获持有 stream lock、仍等待旧 host vsock 的 reporter. Restore 在 ACK 前切换到新 observation epoch;`--resume`/失败 attach 恢复原 epoch,live attach只重开pause gate且不破坏已入场报告的计数. Recovery 在 VM、MUX、app 和 backend 恢复后释放 host barrier.
+
+`resources.diff_cow` 是不进入 E 的 host 策略，为 root/data 活动 diff 提供一份共享有界明文缓存，与 guest 内存及 VMM overhead 无关。配置、非持久化 FLUSH 和磁盘文件系统要求见[完整契约](diff-cow-cache_zh.md)。
 
 ### 4.2 Memory terms
 
@@ -798,11 +801,11 @@ Read 顺序为 active diff -> captured top -> `base_from_refs` -> root image（�
 
 ### 11.3 SnapshotView
 
-`BlockCOW.SnapshotView` 暴露decrypt后的upper-only logical view和authoritative hole map. View不重新打开active diff path,并且只在backend quiesced期间稳定.
+`BlockCOW.SnapshotView` 暴露 upper-only 明文逻辑视图及 authoritative hole map。读取优先最新 dirty/writeback 缓存页。捕获只复制 bitmap，不复制整份缓存，全程要求前台 quiesce。不执行 Drain 或 fsync；后台 fatal 使捕获失败并通知 runtime owner。
 
 ### 11.4 BlockCOW state
 
-BlockCOW 以 dirty bitmap 跟踪 4 KiB active-upper block，并非 clean/dirty/discard 三态 map。Dirty block 从 diff 读取；clean block 回落到 base，没有 base 才返回零。底层 `Discard` helper 只对完整 block 打洞并清除 dirty bit，使 base 再次可见；它不持久化能遮蔽 lower layer 的显式 Zero。当前 vhost profile 不公告 DISCARD 或 WRITE_ZEROES，request dispatcher 对两者都返回 unsupported，不调用这个 helper。写入 zero bytes 仍使 block 保持 dirty，不能扫描为 Hole。Export/snapshot 不 rotate active diff，也不把新 E 设为 backend base。源码见 [blk_cow.go](../pkg/vhost/blk_cow.go)、[server.go](../pkg/vhost/server.go) 和 [worker.go](../pkg/vhost/worker.go)。
+Bitmap 跟踪逻辑 upper-present 4 KiB 块，在明文缓存接受完整页时发布，与 cache clean/dirty/writeback 状态独立。缺失块回落 base 或零。每沙箱 root/data diff 共享 `resources.diff_cow.cache_size`（默认 32MiB）及其 `max_dirty_size` 子集（16MiB）。活动 body 使用 direct I/O；guest FLUSH 在健康时是 no-op，明确不提供持久化语义。普通 Close 排空已接受写入，不 fsync。底层 Discard 等在途回写结束后，对完整块打洞并重新暴露 base；wire DISCARD/WRITE_ZEROES 仍不支持。写零仍是 upper 数据。Export/snapshot 不 rotate diff 或改变 base。完整契约见[缓存、direct I/O 与生命周期](diff-cow-cache_zh.md)。
 
 ### 11.5 Quiesce / Resume
 
@@ -918,7 +921,7 @@ mounts:
 
 必须使用新的活动 diff：已有 diff 优先，因此更换模板不会调整容量或替换已有数据。
 不要通过截断已有文件系统来实施更小的限制。Sandboxer 不会自动调整文件系统大小，
-不会限制 COW 脏数据字节数，也不会在启动或恢复时改变磁盘容量。逻辑块设备容量与加密
+不会限制 COW 已物化的磁盘占用（待回写缓存由 `resources.diff_cow` 单独限制），也不会在启动或恢复时改变磁盘容量。逻辑块设备容量与加密
 文件的物理长度、宿主磁盘实际分配空间、guest 文件系统可用于文件数据的空间并不是
 同一个概念。本次迁移不提供从同一个模板任意选择各实例容量的新能力。
 

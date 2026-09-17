@@ -43,7 +43,7 @@ if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
     TAP_CREATED_BY_TEST=1
 fi
 
-WORK="$(mktemp -d /tmp/e2e-artifact-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-artifact-XXXXXX")"
 SOURCE_PID=""
 trap '
     if [ -n "$SOURCE_PID" ] && kill -0 "$SOURCE_PID" 2>/dev/null; then

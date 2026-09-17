@@ -186,6 +186,7 @@ func (c RestoreConfig) validate() error {
 // See docs/sandbox.md §4.1 for the three deployment modes driven by
 // Control.CgroupPath / Control.Controller presence.
 type ResourcesConfig struct {
+	DiffCOW     DiffCOWConfig     `yaml:"diff_cow,omitempty"`
 	Capacity    CapacityConfig    `yaml:"capacity"`
 	Allocatable AllocatableConfig `yaml:"allocatable"`
 
@@ -770,6 +771,7 @@ func LoadConfigBytes(data []byte) (*SandboxConfig, error) {
 }
 
 func (c *SandboxConfig) ApplyDefaults() {
+	c.Resources.DiffCOW.defaults()
 	if c.Usage.SampleInterval == "" {
 		c.Usage.SampleInterval = "1s"
 	}
@@ -1019,6 +1021,9 @@ func (c *SandboxConfig) ValidateColdProjection() error {
 }
 
 func (c *SandboxConfig) validateCold(requireCgroupCapability bool) error {
+	if _, _, err := c.Resources.DiffCOW.Bytes(); err != nil {
+		return err
+	}
 	if _, _, err := c.Usage.Intervals(); err != nil {
 		return err
 	}
@@ -1289,6 +1294,9 @@ func validateFiles(field string, files []FileConfig) error {
 // the immutable disk graph. ApplyRestoreRules performs the ownership checks and
 // applies explicitly supplied target-node allocatable CPU/memory policy.
 func (c *SandboxConfig) ValidateRestoreHostConfig() error {
+	if _, _, err := c.Resources.DiffCOW.Bytes(); err != nil {
+		return err
+	}
 	if _, _, err := c.Usage.Intervals(); err != nil {
 		return err
 	}

@@ -75,7 +75,7 @@ func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resum
 		}
 	}()
 	sources.Quiescer.Quiesce()
-	if err := context.Cause(ctx); err != nil {
+	if err := checkDiskCapture(ctx, sources.Diffs); err != nil {
 		sources.Quiescer.Resume()
 		return nil, err
 	}
@@ -106,7 +106,7 @@ func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resum
 	}
 	out.WallclockPauseMs = pausedAt.Sub(pauseStart).Milliseconds()
 	out.WallclockDumpMs = time.Since(dumpStart).Milliseconds()
-	if err := context.Cause(ctx); err != nil {
+	if err := checkDiskCapture(ctx, sources.Diffs); err != nil {
 		return nil, err
 	}
 	succeeded = true
@@ -296,7 +296,7 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 	if cleanupErr != nil {
 		return nil, fmt.Errorf("export root cleanup: %w", cleanupErr)
 	}
-	if err := context.Cause(ctx); err != nil {
+	if err := checkDiskCapture(ctx, sources.Diffs); err != nil {
 		return nil, err
 	}
 	if commitRoot {
@@ -304,7 +304,7 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 			return nil, fmt.Errorf("commit Sandbox E: %w", err)
 		}
 	}
-	if err := context.Cause(ctx); err != nil {
+	if err := checkDiskCapture(ctx, sources.Diffs); err != nil {
 		return nil, err
 	}
 	out.PortableConfig = c1
@@ -347,4 +347,20 @@ func newSeekerSource(reader io.ReadSeeker, holes []sparse.Extent) (sparse.Source
 		return nil, fmt.Errorf("invalid logical size %d", size)
 	}
 	return &seekerSource{rs: reader, size: uint64(size), holes: append([]sparse.Extent(nil), holes...)}, nil
+}
+
+// A disk may fail in the background after its last snapshot read, or while
+// another disk/memory is being captured. Check all disks at publication edges.
+func checkDiskCapture(ctx context.Context, disks []DiskDiff) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	for i, d := range disks {
+		if d.CheckError != nil {
+			if err := d.CheckError(); err != nil {
+				return fmt.Errorf("snapshot disk %d: %w", i, err)
+			}
+		}
+	}
+	return nil
 }

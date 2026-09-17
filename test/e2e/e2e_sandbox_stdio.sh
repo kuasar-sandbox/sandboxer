@@ -47,7 +47,7 @@ if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
 fi
 [ "$(id -u)" -eq 0 ] || skip "must run as root"
 
-WORK="$(mktemp -d /tmp/e2e-stdio-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-stdio-XXXXXX")"
 trap '[ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"; [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null; true' EXIT
 
 IMAGE="${IMAGE:-python:3.12-slim}"

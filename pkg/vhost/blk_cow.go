@@ -14,21 +14,22 @@ import (
 // BlockCOW provides a COW (copy-on-write) read-write block view on top
 // of an optional read-only base layer plus a local sparse diff file.
 //
-// Read path: each 4K block is checked against the in-memory dirty bitmap.
-// If dirty (i.e. ever written since this backend started), pread from
-// diff. Otherwise, pread from base; if base is nil, return zeros.
-//
-// Write path: a first partial write materializes the complete 4K block from
-// base (or zeros), merges the update, writes the complete block, then marks it
-// dirty. Reads and writes to the same block share a striped RWMutex.
-//
-// At backend startup, we rebuild the bitmap from diff file by walking
-// SEEK_DATA / SEEK_HOLE — any byte range marked as data in the diff is
-// considered dirty (i.e. came from a previous write to this diff).
+// The bitmap tracks logical upper presence, published with a complete cached
+// plaintext page. Reads prefer latest cached data; only misses reach the diff.
+// First partial writes materialize from base/zeros. A shared bounded cache
+// asynchronously writes frozen full pages. Block stripes serialize frontend
+// access; the worker never acquires them. Reopen rebuilds presence from extents.
 //
 // The vhost profile does not advertise DISCARD or WRITE_ZEROES and rejects
 // those wire requests. The low-level Discard helper has hole semantics below.
 type BlockCOW struct {
+	opMu      sync.RWMutex // lifetime of frontend operations; never taken by writeback
+	lifeCtx   context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	closeErr  error
+	cache     *COWCache
+	ownCache  bool
 	base      BlockReader // optional; may be nil for no base layer
 	diff      *diffFile
 	size      int64
@@ -44,7 +45,7 @@ const (
 )
 
 // OpenBlockCOW opens or atomically creates the active diff described by init,
-// builds the dirty bitmap from its body, and pairs it with the optional base.
+// rebuilds logical upper presence from its body, and pairs it with the optional base.
 //
 // If base is nil, reads to clean blocks return zeros.
 func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions ...BlockCOWOption) (*BlockCOW, error) {
@@ -75,6 +76,23 @@ func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions .
 		blockMu:   make([]sync.RWMutex, cowLockStripes),
 		blockSize: cowBlockSize,
 	}
+	cow.lifeCtx, cow.cancel = context.WithCancel(context.Background())
+	cow.cache = options.cache
+	if cow.cache == nil {
+		cow.cache, err = NewCOWCache(DefaultCOWCacheSize, DefaultCOWMaxDirtySize)
+		if err != nil {
+			cow.cancel()
+			return nil, errors.Join(err, diff.Close())
+		}
+		cow.ownCache = true
+	}
+	if err := cow.cache.attach(cow); err != nil {
+		cow.cancel()
+		if cow.ownCache {
+			_ = cow.cache.Close()
+		}
+		return nil, errors.Join(err, diff.Close())
+	}
 	return cow, nil
 }
 
@@ -92,12 +110,13 @@ func (c *BlockCOW) DirtyCount() int {
 // BackendStats reports cow-specific metrics. Implements StatsReporter.
 // The dirty-block count includes blocks already present in the diff
 // file when the server started (rebuilt from SEEK_DATA), so it tracks
-// the persisted upper-layer footprint, not just this-run writes.
+// the logical upper-layer footprint, including accepted unflushed writes.
 func (c *BlockCOW) BackendStats() map[string]any {
 	dirty := c.DirtyCount()
 	total := c.size / c.blockSize
 	return map[string]any{
 		"diff_dirty_blocks":  dirty,
+		"diff_cow_cache":     c.cache.Stats(),
 		"diff_total_blocks":  total,
 		"diff_block_bytes":   c.blockSize,
 		"diff_dirty_percent": fmt.Sprintf("%.2f", float64(dirty)*100/float64(total)),
@@ -139,6 +158,11 @@ func (c *BlockCOW) ReadAt(buf []byte, offset int64) (int, error) {
 }
 
 func (c *BlockCOW) readAt(ctx context.Context, buf []byte, offset int64) (int, error) {
+	ctx, endOp, err := c.begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer endOp()
 	if len(buf) == 0 {
 		if offset < 0 || offset > c.size {
 			return 0, io.EOF
@@ -166,7 +190,7 @@ func (c *BlockCOW) readAt(ctx context.Context, buf []byte, offset int64) (int, e
 		lock := c.blockLock(blk)
 		lock.RLock()
 		if c.blockDirty(blk) {
-			if _, err := c.diff.ReadAt(chunk, offset+pos); err != nil && !errors.Is(err, io.EOF) {
+			if _, err := c.cache.read(ctx, c, chunk, offset+pos); err != nil && !errors.Is(err, io.EOF) {
 				lock.RUnlock()
 				return int(pos), err
 			}
@@ -186,14 +210,18 @@ func (c *BlockCOW) readAt(ctx context.Context, buf []byte, offset int64) (int, e
 	return int(pos), nil
 }
 
-// WriteAt writes buf at offset to the diff file. The first partial write to a
-// clean block materializes the complete block from base (or zeros), merges the
-// caller's bytes, writes the complete block, and only then marks it dirty.
+// WriteAt accepts complete plaintext pages into the bounded cache. First
+// partial writes preserve base/zero bytes before publishing upper presence.
 func (c *BlockCOW) WriteAt(buf []byte, offset int64) (int, error) {
 	return c.writeAt(nil, buf, offset)
 }
 
 func (c *BlockCOW) writeAt(ctx context.Context, buf []byte, offset int64) (int, error) {
+	ctx, endOp, err := c.begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer endOp()
 	if offset < 0 || offset > c.size || int64(len(buf)) > c.size-offset {
 		return 0, fmt.Errorf("vhost: write out of bounds: offset=%d len=%d size=%d", offset, len(buf), c.size)
 	}
@@ -211,6 +239,14 @@ func (c *BlockCOW) writeAt(ctx context.Context, buf []byte, offset int64) (int, 
 		lock.Lock()
 		n, err := c.writeBlockLocked(ctx, buf[written:written+chunkLen], pos, blk)
 		lock.Unlock()
+		if retry, ok := err.(*cacheRetry); ok {
+			select {
+			case <-retry.wake:
+				continue
+			case <-ctx.Done():
+				return written, ctx.Err()
+			}
+		}
 		written += n
 		if err != nil {
 			return written, err
@@ -219,62 +255,46 @@ func (c *BlockCOW) writeAt(ctx context.Context, buf []byte, offset int64) (int, 
 	return written, nil
 }
 
-// writeBlockLocked writes a range wholly contained in blk. The caller holds
-// that block's stripe lock exclusively.
+// writeBlockLocked fills a quota-reserved page, then publishes upper presence.
+// The worker never takes the caller's block stripe, including while it waits.
 func (c *BlockCOW) writeBlockLocked(ctx context.Context, buf []byte, offset, blk int64) (int, error) {
-	if c.blockDirty(blk) {
-		return c.diff.WriteAt(buf, offset)
-	}
-
-	blockStart := blk * c.blockSize
-	if offset == blockStart && int64(len(buf)) == c.blockSize {
-		if err := c.writeFreshBlock(buf, blockStart); err != nil {
-			return 0, err
+	upper := c.blockDirty(blk)
+	start := blk * c.blockSize
+	return c.cache.write(ctx, c, buf, offset, blk, upper, func(page []byte) error {
+		if offset == start && int64(len(buf)) == c.blockSize {
+			return nil
 		}
-		c.markDirty(blk)
-		return len(buf), nil
-	}
-
-	block := make([]byte, c.blockSize)
-	if c.base != nil && blockStart < c.base.Size() {
-		readLen := c.blockSize
-		if remaining := c.base.Size() - blockStart; remaining < readLen {
-			readLen = remaining
+		if upper {
+			return readFullAt(c.diff, page, start)
 		}
-		n, err := readBlock(ctx, c.base, block[:readLen], blockStart)
+		if c.base == nil || start >= c.base.Size() {
+			return nil
+		}
+		readLen := min(c.blockSize, c.base.Size()-start)
+		n, err := readBlock(ctx, c.base, page[:readLen], start)
 		if readretry.IsTerminal(err) || (err != nil && !errors.Is(err, io.EOF)) {
-			return 0, fmt.Errorf("vhost: materialize block %d from base: %w", blk, err)
+			return fmt.Errorf("vhost: materialize block %d from base: %w", blk, err)
 		}
 		if int64(n) != readLen {
-			return 0, fmt.Errorf("vhost: materialize block %d from base: %w", blk, io.ErrUnexpectedEOF)
+			return fmt.Errorf("vhost: materialize block %d from base: %w", blk, io.ErrUnexpectedEOF)
 		}
-	}
-	copy(block[offset-blockStart:], buf)
-	if err := c.writeFreshBlock(block, blockStart); err != nil {
-		return 0, err
-	}
-	c.markDirty(blk)
-	return len(buf), nil
-}
-
-func (c *BlockCOW) writeFreshBlock(block []byte, offset int64) error {
-	n, err := c.diff.WriteAt(block, offset)
-	if err == nil && n != len(block) {
-		err = io.ErrShortWrite
-	}
-	if err == nil {
 		return nil
-	}
-	// A clean block must remain a hole after a failed materialization so a
-	// future reopen cannot mistake a partial write for a complete dirty block.
-	_ = c.diff.punchHole(offset, c.blockSize)
-	return fmt.Errorf("vhost: materialize diff block at %d: %w", offset, err)
+	})
 }
 
-// Flush is called on virtio-blk FLUSH; sync diff file to disk.
-func (c *BlockCOW) Flush() error {
-	return c.diff.Sync()
+// Flush is the project's non-durable guest FLUSH: health check only, with no
+// writeback wakeup, Drain or filesystem sync. Wire features remain unchanged.
+func (c *BlockCOW) Flush() error { return c.Err() }
+func (c *BlockCOW) Err() error {
+	if err := c.cache.Err(); err != nil {
+		return err
+	}
+	return c.lifeCtx.Err()
 }
+func (c *BlockCOW) SetFatalHandler(report func(error)) { c.cache.SetFatalHandler(report) }
+
+// Drain is an internal completion boundary, not a guest durability operation.
+func (c *BlockCOW) Drain(ctx context.Context) error { return c.cache.drain(ctx, c) }
 
 // Discard punches complete blocks in the diff and clears their dirty bits.
 // Subsequent reads fall through to the base, or return zeros without a base;
@@ -282,6 +302,11 @@ func (c *BlockCOW) Flush() error {
 // Partial edge blocks retain their contents. The current vhost dispatcher
 // does not call this helper: DISCARD and WRITE_ZEROES requests are unsupported.
 func (c *BlockCOW) Discard(offset, length int64) error {
+	ctx, endOp, err := c.begin(nil)
+	if err != nil {
+		return err
+	}
+	defer endOp()
 	if offset < 0 || offset > c.size || length < 0 || length > c.size-offset {
 		return fmt.Errorf("vhost: discard out of bounds: off=%d len=%d size=%d",
 			offset, length, c.size)
@@ -300,29 +325,31 @@ func (c *BlockCOW) Discard(offset, length int64) error {
 		return nil
 	}
 
-	punchOff := startBlk * blockSize
-	punchLen := (endBlk - startBlk) * blockSize
-	if err := c.diff.punchHole(punchOff, punchLen); err != nil {
-		return fmt.Errorf("vhost: punch_hole [%d,%d): %w",
-			punchOff, punchOff+punchLen, err)
-	}
-
-	c.bitmapMu.Lock()
 	for blk := startBlk; blk < endBlk; blk++ {
-		c.bitmap[blk/64] &^= 1 << (uint64(blk) % 64)
+		lock := c.blockLock(blk)
+		lock.Lock()
+		err := c.cache.discard(ctx, c, blk)
+		lock.Unlock()
+		if err != nil {
+			return err
+		}
 	}
-	c.bitmapMu.Unlock()
 
 	return nil
 }
 
-// SnapshotView returns a read-only, upper-only view of the diff at the current
-// dirty-bitmap state. Dirty blocks expose their complete plaintext diff bytes;
-// clean blocks are holes and defensively read as zeros rather than falling
-// through to base. The caller must keep the BlockCOW open while using the view.
+// SnapshotView returns a read-only, upper-only view at the current logical
+// upper-present bitmap. Present blocks expose complete latest plaintext, including
+// unflushed cache pages. Absent blocks are holes and defensively read as zeros
+// rather than falling through to base. Keep the BlockCOW open while using the view.
 // Snapshot orchestration calls this after quiescing every vhost backend, so the
 // dirty block contents stay stable for the view's lifetime.
 func (c *BlockCOW) SnapshotView() (io.ReadSeeker, []sparse.Extent, error) {
+	_, endOp, err := c.begin(nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer endOp()
 	c.bitmapMu.RLock()
 	bitmap := append([]uint64(nil), c.bitmap...)
 	c.bitmapMu.RUnlock()
@@ -337,6 +364,11 @@ type cowSnapshotReaderAt struct {
 }
 
 func (r *cowSnapshotReaderAt) ReadAt(buf []byte, offset int64) (int, error) {
+	ctx, endOp, err := r.cow.begin(nil)
+	if err != nil {
+		return 0, err
+	}
+	defer endOp()
 	if len(buf) == 0 {
 		if offset < 0 || offset > r.cow.size {
 			return 0, io.EOF
@@ -359,20 +391,13 @@ func (r *cowSnapshotReaderAt) ReadAt(buf []byte, offset int64) (int, error) {
 		blk := pos / r.cow.blockSize
 		dirty := bitmapBlockDirty(r.bitmap, blk)
 		runEnd := min((blk+1)*r.cow.blockSize, offset+int64(n))
-		for runEnd < offset+int64(n) {
-			nextBlk := runEnd / r.cow.blockSize
-			if bitmapBlockDirty(r.bitmap, nextBlk) != dirty {
-				break
-			}
-			runEnd = min((nextBlk+1)*r.cow.blockSize, offset+int64(n))
-		}
 		chunkLen := int(runEnd - pos)
 		chunk := buf[written : written+chunkLen]
 
 		if dirty {
 			lastBlk := (runEnd - 1) / r.cow.blockSize
 			r.cow.rlockBlockRange(blk, lastBlk)
-			read, err := r.cow.diff.ReadAt(chunk, pos)
+			read, err := r.cow.cache.read(ctx, r.cow, chunk, pos)
 			r.cow.runlockBlockRange(blk, lastBlk)
 			written += read
 			if err != nil && !(errors.Is(err, io.EOF) && read == len(chunk)) {
@@ -387,13 +412,15 @@ func (r *cowSnapshotReaderAt) ReadAt(buf []byte, offset int64) (int, error) {
 		clear(chunk)
 		written += len(chunk)
 	}
+	if err := r.cow.Err(); err != nil {
+		return written, err
+	}
 	return written, eof
 }
 
 // rlockBlockRange locks each stripe touched by the inclusive block range once,
-// in numeric stripe order. Snapshot reads can then issue one pread for a
-// contiguous dirty run without weakening same-block exclusion or recursively
-// taking an RWMutex when a range spans more than one full stripe cycle.
+// in numeric stripe order, without recursively taking an RWMutex when a range
+// spans more than one full stripe cycle.
 func (c *BlockCOW) rlockBlockRange(first, last int64) {
 	stripeCount := int64(len(c.blockMu))
 	blockCount := last - first + 1
@@ -471,9 +498,38 @@ func snapshotHoles(bitmap []uint64, size int64) []sparse.Extent {
 // Size returns the visible block-device size in bytes.
 func (c *BlockCOW) Size() int64 { return c.size }
 
-// Close releases the diff file. Base is closed by its owner.
+// begin joins frontend lifetime and cancellation without a payload goroutine.
+// AfterFunc only runs on Close; runtime queue cancellation remains independent
+// from the cache worker, which must drain healthy accepted writes.
+func (c *BlockCOW) begin(ctx context.Context) (context.Context, func(), error) {
+	c.opMu.RLock()
+	if err := c.Err(); err != nil {
+		c.opMu.RUnlock()
+		return nil, nil, err
+	}
+	if ctx == nil {
+		return c.lifeCtx, c.opMu.RUnlock, nil
+	}
+	merged, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(c.lifeCtx, cancel)
+	return merged, func() { stop(); cancel(); c.opMu.RUnlock() }, nil
+}
+
+// Close stops admission, drains accepted writes without fsync, and waits for
+// real I/O before releasing plaintext and the FD. Base is closed by its owner.
 func (c *BlockCOW) Close() error {
-	return c.diff.Close()
+	c.closeOnce.Do(func() {
+		c.cancel()
+		c.opMu.Lock()
+		c.opMu.Unlock() // canceled admission makes this a lifetime barrier only
+		c.closeErr = c.cache.drain(context.Background(), c)
+		c.cache.detach(c)
+		if c.ownCache {
+			c.closeErr = errors.Join(c.closeErr, c.cache.Close())
+		}
+		c.closeErr = errors.Join(c.closeErr, c.diff.Close())
+	})
+	return c.closeErr
 }
 
 func zeroSlice(b []byte) {

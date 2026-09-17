@@ -37,7 +37,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
 
-WORK="$(mktemp -d /tmp/e2e-cgroup-control-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-cgroup-control-XXXXXX")"
 PIDS=()
 cleanup() {
     set +e

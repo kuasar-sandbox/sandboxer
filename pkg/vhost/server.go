@@ -23,7 +23,7 @@ type Backend interface {
 	// WriteAt writes to the virtual disk; returns ErrReadOnly if the
 	// backend is read-only.
 	WriteAt(buf []byte, offset int64) (int, error)
-	// Flush syncs the writable layer (no-op for read-only).
+	// Flush checks health; COW uses the documented non-durable no-op.
 	Flush() error
 	// Discard hints that a range is no longer needed (may be no-op).
 	Discard(offset, length int64) error

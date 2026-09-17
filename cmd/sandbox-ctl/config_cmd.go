@@ -210,6 +210,8 @@ func mapDelete(m *yaml.Node, key string) {
 const skeletonCold = `# sandbox.yaml — sandbox-ctl run --config <this>
 # Fill the placeholder paths/values. Schema reference: docs/sandbox.md §3.
 resources:
+  # One sandbox-wide plaintext COW budget; dirty is a subset of total.
+  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB }
   capacity:    { cpu: 2, memory: 8GiB }   # vCPU / memory the guest sees
   allocatable: { cpu: 2, memory: 8GiB }   # <= capacity (no cgroup ⇒ cpu == capacity.cpu)
 network:
@@ -269,6 +271,8 @@ const skeletonRestore = `# restore host yaml — sandbox-ctl run --restore <ref>
 restore:
   prefetch: off                            # off (default) | memory (current memory self)
 resources:
+  # One sandbox-wide plaintext COW budget; dirty is a subset of total.
+  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB }
   capacity: { cpu: 2, memory: 8GiB }       # if present, must equal referenced Sandbox E
 network:
   # Provider presence must match E's portable network topology. Identity is fresh.

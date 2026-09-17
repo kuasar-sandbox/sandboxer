@@ -411,19 +411,33 @@ func TestEncryptedBlockCOWArbitraryIOAndShortIO(t *testing.T) {
 	}
 	defer failed.Close()
 	failed.diff.bodyIO = shortDiffBodyIO{inner: failed.diff.bodyIO, shortWrite: true}
-	if _, err := failed.WriteAt([]byte("partial"), 17); !errors.Is(err, io.ErrShortWrite) {
-		t.Fatalf("short encrypted write error=%v", err)
-	}
-	if failed.blockDirty(0) {
-		t.Fatal("short encrypted materialization marked block dirty")
-	}
-	failed.diff.bodyIO = failed.diff.f
-	if _, err := failed.WriteAt(bytes.Repeat([]byte{0x66}, cowBlockSize), 0); err != nil {
+	if _, err := failed.WriteAt([]byte("partial"), 17); err != nil {
 		t.Fatal(err)
 	}
-	failed.diff.bodyIO = shortDiffBodyIO{inner: failed.diff.bodyIO, shortRead: true}
-	if _, err := failed.ReadAt(make([]byte, 512), 0); !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("short encrypted read error=%v", err)
+	if !failed.blockDirty(0) {
+		t.Fatal("accepted encrypted page was not published")
+	}
+	if err := failed.Drain(context.Background()); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short encrypted writeback: %v", err)
+	}
+	if _, err := failed.WriteAt([]byte("retry"), 17); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("failure was not sticky: %v", err)
+	}
+	// Use a healthy independent file: a fatal cache cannot be reset/reused.
+	healthy, err := OpenBlockCOW(filepath.Join(t.TempDir(), "read.diff"), nil, DiffInit{CreateSize: cowBlockSize}, WithDiffEncryption(testDiffKey(0x52), false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer healthy.Close()
+	if _, err := healthy.WriteAt(bytes.Repeat([]byte{0x66}, cowBlockSize), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := healthy.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	healthy.diff.bodyIO = shortDiffBodyIO{inner: healthy.diff.bodyIO, shortRead: true}
+	if _, err := healthy.diff.ReadAt(make([]byte, 512), 0); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("short encrypted read: %v", err)
 	}
 }
 
@@ -895,22 +909,22 @@ func (s shortDiffBodyIO) ReadAt(buf []byte, offset int64) (int, error) {
 	if !s.shortRead || len(buf) == 0 {
 		return s.inner.ReadAt(buf, offset)
 	}
-	n, err := s.inner.ReadAt(buf[:len(buf)-1], offset)
+	n, err := s.inner.ReadAt(buf, offset)
 	if err != nil {
 		return n, err
 	}
-	return n, nil
+	return n - 1, nil
 }
 
 func (s shortDiffBodyIO) WriteAt(buf []byte, offset int64) (int, error) {
 	if !s.shortWrite || len(buf) == 0 {
 		return s.inner.WriteAt(buf, offset)
 	}
-	n, err := s.inner.WriteAt(buf[:len(buf)-1], offset)
+	n, err := s.inner.WriteAt(buf, offset)
 	if err != nil {
 		return n, err
 	}
-	return n, nil
+	return n - 1, nil
 }
 
 func testDiffKey(first byte) [32]byte {
