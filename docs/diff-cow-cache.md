@@ -165,6 +165,8 @@ the file. Cleanup of newly materialized blocks cannot punch previously existing
 upper pages in the same batch. There is no transactional-write or crash-recovery
 promise and no silent buffered retry.
 
+The original error is latched and the owner notified before cleanup I/O. While rollback runs, active-I/O ownership, frozen pages and their quotas remain held so Close cannot release the file or buffers early. Cleanup errors are joined afterward without masking the original failure.
+
 ## Direct I/O contract
 
 Only active bodies use O_DIRECT: fresh targets enable it **before seeding**,

@@ -97,6 +97,7 @@ type cacheHooks struct {
 	newTimer      func() (<-chan time.Time, func())
 	aggregating   func()
 	beforeWrite   func([]*cachePage) error
+	beforeCleanup func() error // deterministic failure-path I/O gate for tests
 }
 
 func NewCOWCache(cacheSize, maxDirtySize uint64) (*COWCache, error) {
@@ -508,13 +509,30 @@ func (c *COWCache) run() {
 		if err == nil {
 			err = writeFullAt(cow.diff, buffer[:len(batch)*cowBlockSize], off)
 		}
-		clear(buffer[:len(batch)*cowBlockSize])
 		if err != nil {
+			// A known failure must be visible before any potentially blocking
+			// rollback. Keep active and the frozen pages until that I/O ends.
+			c.mu.Lock()
+			report := c.failLocked(fmt.Errorf("vhost: diff writeback %s at %d: %w", cow.diff.f.Name(), off, err))
+			fatal := c.err
+			c.mu.Unlock()
+			if report != nil {
+				report(fatal)
+			}
+		}
+		clear(buffer[:len(batch)*cowBlockSize])
+		var cleanupErr error
+		if err != nil {
+			if c.hooks.beforeCleanup != nil {
+				cleanupErr = c.hooks.beforeCleanup()
+			}
 			// Only genuinely new upper blocks can be punched after a partial batch.
 			// Existing upper blocks may already be partially changed; never hole them.
-			for _, p := range batch {
-				if p.fresh {
-					err = errors.Join(err, cow.diff.punchHole(p.key.block*cowBlockSize, cowBlockSize))
+			if cleanupErr == nil {
+				for _, p := range batch {
+					if p.fresh {
+						cleanupErr = errors.Join(cleanupErr, cow.diff.punchHole(p.key.block*cowBlockSize, cowBlockSize))
+					}
 				}
 			}
 		}
@@ -532,17 +550,12 @@ func (c *COWCache) run() {
 				c.clean.push(p)
 			}
 		}
-		var report func(error)
-		if err != nil {
-			report = c.failLocked(fmt.Errorf("vhost: diff writeback %s at %d: %w", cow.diff.f.Name(), off, err))
+		if cleanupErr != nil {
+			c.err = errors.Join(c.err, fmt.Errorf("vhost: diff cleanup %s at %d: %w", cow.diff.f.Name(), off, cleanupErr))
 		}
-		fatal := c.err
 		c.signalLocked()
 		c.mu.Unlock()
 		clear(batch)
-		if report != nil {
-			report(fatal)
-		}
 	}
 }
 
