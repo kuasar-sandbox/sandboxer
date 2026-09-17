@@ -22,11 +22,27 @@ from usage_report_relay import ReportRelay
 
 REPO = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ["BIN"]).resolve()
+# sudo can replace PATH while preserving the caller's explicit Go distribution.
+# Keep its driver and compiler paired; an invalid root must fail, not fall back.
+GO = str(Path(os.environ["GOROOT"]) / "bin/go") if os.environ.get("GOROOT") else "go"
 
 
 def run(*args, timeout=60, **kw):
-    return subprocess.run([str(a) for a in args], check=True, timeout=timeout,
-                          text=True, capture_output=True, **kw).stdout
+    result = subprocess.run([str(a) for a in args], check=False, timeout=timeout,
+                            text=True, capture_output=True, **kw)
+    if result.returncode:
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", file=sys.stderr)
+        if result.stderr:
+            print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
+        result.check_returncode()
+    return result.stdout
+
+
+def build_probe(output, source=None):
+    source = source or Path(__file__).parent / "usageprobe/main.go"
+    return run(GO, "build", "-trimpath", "-o", output, source,
+               env={**os.environ, "CGO_ENABLED": "0", "GOWORK": "off"})
 
 
 def write_json(path, value):
@@ -343,8 +359,8 @@ def main():
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(path, dest)
         atexit.register(collect_evidence)
-    metadata = {"sandbox_ctl_build": run("go", "version", "-m", BIN / "sandbox-ctl"),
-                "sandbox_init_build": run("go", "version", "-m", BIN / "sandbox-init"),
+    metadata = {"sandbox_ctl_build": run(GO, "version", "-m", BIN / "sandbox-ctl"),
+                "sandbox_init_build": run(GO, "version", "-m", BIN / "sandbox-init"),
                 "host_kernel": run("uname", "-a").strip(),
                 "ch_version": run(BIN / "cloud-hypervisor", "--version").strip(),
                 "artifacts": {n: digest(BIN / n) for n in ("sandbox-ctl", "sandbox-init", "sandbox-runtime.bundle", "vmlinux", "cloud-hypervisor")},
@@ -357,8 +373,7 @@ def main():
     root.mkdir()
     for name in ("tmp", "proc", "sys", "dev", "data", "cache", "other"):
         (root / name).mkdir()
-    run("go", "build", "-trimpath", "-o", root / "probe", Path(__file__).parent / "usageprobe/main.go",
-        env={**os.environ, "CGO_ENABLED": "0", "GOWORK": "off"})
+    build_probe(root / "probe")
     image = work / "root.img"
     run(BIN / "flatten-ctl", "export", "--output", image, "--no-progress", root)
     ref = image_ref(image)
