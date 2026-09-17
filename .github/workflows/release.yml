@@ -248,6 +248,10 @@ jobs:
         working-directory: src/sandboxer
         run: |
           set -euo pipefail
+          # Disk DIO tests need the workspace filesystem; tmpfs tests select /dev/shm.
+          test_tmp=$(mktemp -d "$GITHUB_WORKSPACE/.release-test.XXXXXX")
+          trap 'rm -rf "$test_tmp"' EXIT
+          export TMPDIR="$test_tmp"
           make test
           make vet
           make build
