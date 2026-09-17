@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Active diff bodies require disk-backed storage; /tmp may be tmpfs.
+export TMPDIR="${TMPDIR:-/var/tmp}"
 : "${BIN:?set BIN to the assembled runtime binary directory}"
 [[ -r /dev/kvm && -w /dev/kvm ]] || { echo 'usage sources requires KVM' >&2; exit 1; }
 for command in strace ldd mkfs.ext4 mount umount python3 go; do

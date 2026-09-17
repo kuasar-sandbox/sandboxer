@@ -123,9 +123,9 @@ func TestPipeConnsFullLocalCloseForcesGuestConnectionClosed(t *testing.T) {
 }
 
 func TestPipeConnsCaptureCancelAfterLocalHalfCloseClosesGuest(t *testing.T) {
-	client, relayClient := unixConnPair(t, "client-half-then-capture")
+	client, relayClient := unixConnPair(t, "client")
 	defer client.Close()
-	relayGuest, guest := unixConnPair(t, "guest-half-then-capture")
+	relayGuest, guest := unixConnPair(t, "guest")
 	defer guest.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

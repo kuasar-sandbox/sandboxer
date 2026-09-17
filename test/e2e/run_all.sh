@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+# Active diff bodies require disk-backed storage; /tmp may be tmpfs.
+export TMPDIR="${TMPDIR:-/var/tmp}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${BIN:?BIN must point to the assembled platform binary directory}"

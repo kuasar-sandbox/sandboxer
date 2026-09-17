@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Component-owned real CH/KVM usage integration. Missing prerequisites fail.
 set -euo pipefail
+# Active diff bodies require disk-backed storage; /tmp may be tmpfs.
+export TMPDIR="${TMPDIR:-/var/tmp}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 : "${BIN:?BIN must contain the assembled binaries and newly rebuilt runtime bundle}"

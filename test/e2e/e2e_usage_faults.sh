@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Active diff bodies require disk-backed storage; /tmp may be tmpfs.
+export TMPDIR="${TMPDIR:-/var/tmp}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${BIN:?BIN must contain the assembled binaries and rebuilt runtime bundle}"
 test -r /dev/kvm && test -w /dev/kvm || { echo "KVM is required" >&2; exit 1; }
