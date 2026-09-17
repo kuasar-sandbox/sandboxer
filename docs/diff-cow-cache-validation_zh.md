@@ -2,10 +2,22 @@
 
 # Issue #230 验证观测
 
-[缓存/direct I/O 契约](diff-cow-cache_zh.md) 为活动 diff 内存设定上限，同时改变 I/O 完成边界
+[缓存/I/O 契约](diff-cow-cache_zh.md) 为 sandbox-ctl 明文缓存设定上限，同时改变 I/O 完成边界
 和性能。以下原始 d601fa0 测量显示文件 page-cache 驻留降低，但在本存储上，相比 buffered
 基线存在显著吞吐回退。保留这些历史观测，不作为性能目标。修订版测量及 parent 独立提供的
 d601 CH/KVM 证据在下文单独记录。
+
+## 兼容性修正（#238）
+
+下文历史上的 tmpfs 拒绝及文件系统专有 legacy 限制已被
+[issue #238](https://github.com/kuasar-sandbox/sandboxer/issues/238) 取代。每个活动 body
+现在通过同一对齐定位 I/O API 请求 O_DIRECT，使用通用 STATX_DIOALIGN 约束；约束不可用
+或双零时使用保守的 4096 字节对齐。运行时不再识别文件系统类型、inode flags 或挂载策略。
+不支持 O_DIRECT 设置时，通过同一应用缓冲继续普通文件 I/O；其他设置错误和数据 I/O 错误
+仍然报错，不在数据 I/O 失败后进行 buffered 重试。成功的 O_DIRECT 请求不证明所有底层
+实现都会绕过物理磁盘缓存。Tmpfs 文件在内存/swap 中的存储与有界共享进程缓存分开；
+参见[当前内存与 I/O 契约](diff-cow-cache_zh.md)。下文历史数据、源码哈希及磁盘上的
+DIO/mincore 测量保持不变，不是 tmpfs 存储驻留或 tmpfs guest 行为的测量。
 
 ## 环境与方法
 
@@ -122,13 +134,14 @@ harness buffer，不能单独归因为缓存开销，也不承诺最大 RSS。Bu
 已用 `-tags no_rocksdb` 执行 vhost/config/sandbox/restore/snapshot/CLI targeted tests、
 六包 race suite、全仓 vet/build 和 broader Go suite。确定性 gate 覆盖新页/clean/dirty/
 loading/writeback 额度、一页容量、大于缓存的请求、FIFO/LRU、冻结页读取、取消等待、
-Discard、Close 和粘性错误。真实磁盘测试覆盖对齐、mmap buffer、拒绝 tmpfs、seeding、
+Discard、Close 和粘性错误。真实磁盘测试覆盖对齐、mmap buffer、当时要求的 tmpfs 拒绝（已被 #238 取代）、seeding、
 明/密文重开及 mincore。制品 snapshot/export/readback 测试从未排空 dirty/writeback 数据
 恢复，并在最后一次磁盘读取后发生故障时拒绝发布。这些测试模拟 CH API，并非真实 CH/KVM E2E。
 
 Broader suite 保留一个已有 skip：`TestSendU64Reply_RoundTrip` 使用 net.Pipe 而非 UnixConn，
 并注明由 `TestParseSetMemTable_Layout` 间接覆盖。另三个包没有测试文件。没有跳过新增测试。
-本磁盘环境实际验证的是 ext4，而非真实 XFS 挂载；旧模式拒绝有确定性单测覆盖。
+本磁盘环境实际验证的是 ext4，而非真实 XFS 挂载；当时的测试套件包含确定性旧模式拒绝
+测试，已被 #238 的通用对齐测试取代。
 Parent 随后在不可变的 `d601fa0` 上通过默认 tag 的 targeted/全仓测试、vet、build
 和六包 race，`GOFLAGS` 为空、`CGO_ENABLED=1`。该版本原先的 native 检查缺口已关闭；
 trusted exact-integration CI 仍是独立要求。

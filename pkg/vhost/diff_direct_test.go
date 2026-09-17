@@ -29,8 +29,9 @@ func TestDiffDirectAlignmentAndUnalignedCallers(t *testing.T) {
 			}
 			defer cow.Close()
 			d := cow.diff
+			checkDiskActiveIO(t, d)
 			if d.direct == nil {
-				t.Fatal("active diff is buffered")
+				t.Fatal("active diff has no owned workspace")
 			}
 			flags, err := unix.FcntlInt(d.f.Fd(), unix.F_GETFL, 0)
 			if err != nil || flags&unix.O_DIRECT == 0 {
@@ -81,43 +82,6 @@ func TestDiffDirectAlignmentAndUnalignedCallers(t *testing.T) {
 	}
 }
 
-func TestDiffDirectRejectsTmpfsWithoutFallback(t *testing.T) {
-	dir, err := os.MkdirTemp("/dev/shm", "diff-cow-230-test-")
-	if err != nil {
-		t.Fatalf("tmpfs negative-test fixture: %v", err)
-	}
-	defer os.RemoveAll(dir)
-	var fs unix.Statfs_t
-	if err := unix.Statfs(dir, &fs); err != nil {
-		t.Fatal(err)
-	}
-	if fs.Type != unix.TMPFS_MAGIC {
-		t.Fatalf("negative-test fixture is not tmpfs: 0x%x", fs.Type)
-	}
-	path := filepath.Join(dir, "active.diff")
-	if c, err := OpenBlockCOW(path, nil, DiffInit{CreateSize: cowBlockSize}); err == nil {
-		_ = c.Close()
-		t.Fatal("tmpfs used as real DIO")
-	} else if !strings.Contains(err.Error(), "unsupported active diff filesystem") {
-		t.Fatalf("missing diagnostic %v", err)
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("unsupported target committed: %v", err)
-	}
-	// The same filesystem remains valid for an immutable buffered template.
-	if err := os.WriteFile(path, make([]byte, cowBlockSize), 0600); err != nil {
-		t.Fatal(err)
-	}
-	src, err := openDiffTemplate(path, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer src.Close()
-	if _, err := src.ReadAt(context.Background(), make([]byte, 17), 0); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // mincore only queries residency; it never faults data in or evicts/flushes it.
 func diffResidentPages(t *testing.T, d *diffFile) int {
 	t.Helper()
@@ -162,6 +126,7 @@ func TestDiffDirectBodyDoesNotPopulatePageCache(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			checkDiskActiveIO(t, cow.diff)
 			if resident := diffResidentPages(t, cow.diff); resident != 0 {
 				t.Fatalf("active DIO body has %d resident file-cache pages", resident)
 			}
@@ -185,7 +150,14 @@ func (p directSeedProbe) ReadAt(ctx context.Context, buf []byte, off uint64) (in
 	return p.diffTemplateSource.ReadAt(ctx, buf, off)
 }
 func TestDiffDirectEnabledBeforeTemplateSeed(t *testing.T) {
-	dir := t.TempDir()
+	testDiffIOBeforeTemplateSeed(t, t.TempDir(), false)
+}
+
+func TestDiffTmpfsPreparedBeforeTemplateSeed(t *testing.T) {
+	testDiffIOBeforeTemplateSeed(t, tmpfsTestDir(t), true)
+}
+
+func testDiffIOBeforeTemplateSeed(t *testing.T, dir string, tmpfs bool) {
 	srcPath := filepath.Join(dir, "template")
 	if err := os.WriteFile(srcPath, patternedBytes(2*cowBlockSize), 0600); err != nil {
 		t.Fatal(err)
@@ -224,8 +196,15 @@ func TestDiffDirectEnabledBeforeTemplateSeed(t *testing.T) {
 			if err != nil {
 				return err
 			}
+			var fs unix.Statfs_t
+			if err := unix.Fstatfs(fd, &fs); err != nil {
+				return err
+			}
+			if tmpfs && fs.Type != unix.TMPFS_MAGIC {
+				return fmt.Errorf("seed fd is not tmpfs: %x", fs.Type)
+			}
 			if flags&unix.O_DIRECT == 0 {
-				return fmt.Errorf("target was buffered during seeding")
+				return fmt.Errorf("seed target did not request O_DIRECT")
 			}
 			calls++
 			return nil
@@ -237,6 +216,9 @@ func TestDiffDirectEnabledBeforeTemplateSeed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer target.Close()
+	if tmpfs {
+		checkTmpfsActiveIO(t, target)
+	}
 	if calls != 2 {
 		t.Fatalf("seed calls=%d", calls)
 	}
@@ -249,20 +231,259 @@ func TestDiffDirectEnabledBeforeTemplateSeed(t *testing.T) {
 	}
 }
 
-func TestLegacyExt4RejectsSilentBufferedModes(t *testing.T) {
-	for _, mode := range []string{"journal", "", "unknown"} {
-		if err := validateLegacyExt4(0, mode); err == nil {
-			t.Fatalf("accepted data=%s", mode)
-		}
+func checkDiskActiveIO(t *testing.T, d *diffFile) {
+	t.Helper()
+	var fs unix.Statfs_t
+	if err := unix.Fstatfs(int(d.f.Fd()), &fs); err != nil {
+		t.Fatal(err)
 	}
-	for _, flag := range []int{0x4, 0x800, 0x4000, 0x100000, 0x10000000} {
-		if err := validateLegacyExt4(flag, "ordered"); err == nil {
-			t.Fatalf("accepted flag %x", flag)
-		}
+	if fs.Type != unix.EXT4_SUPER_MAGIC && fs.Type != unix.XFS_SUPER_MAGIC {
+		t.Fatalf("DIO test needs real disk-backed ext4/XFS: 0x%x", fs.Type)
 	}
-	for _, mode := range []string{"ordered", "writeback"} {
-		if err := validateLegacyExt4(0x80000, mode); err != nil {
-			t.Fatal(err)
+	flags, err := unix.FcntlInt(d.f.Fd(), unix.F_GETFL, 0)
+	if err != nil || flags&unix.O_DIRECT == 0 {
+		t.Fatalf("O_DIRECT flags=%x err=%v", flags, err)
+	}
+}
+
+func TestDiffDirectErrorDoesNotFallBack(t *testing.T) {
+	cow := cachedCOW(t, testCache(t, 1, 1, cacheHooks{}), 2, nil)
+	checkDiskActiveIO(t, cow.diff)
+	// Offset 1 is invalid on the verified disk DIO path. Do not retry buffered.
+	if _, err := cow.diff.bodyIO.WriteAt(cow.diff.direct.write.bytes[:cowBlockSize], 1); !errors.Is(err, unix.EINVAL) {
+		t.Fatalf("unaligned physical write: %v", err)
+	}
+	checkDiskActiveIO(t, cow.diff)
+}
+
+func TestDiffDirectAlignmentFromStatx(t *testing.T) {
+	reported := func(memory, offset uint32) unix.Statx_t {
+		return unix.Statx_t{Mask: unix.STATX_DIOALIGN, Dio_mem_align: memory, Dio_offset_align: offset}
+	}
+	for _, tc := range []struct {
+		name           string
+		stat           unix.Statx_t
+		queryErr       error
+		body, size     int64
+		memory, offset int
+		wantErr        bool
+	}{
+		{name: "positive", stat: reported(512, 512), body: 4096, size: 8192, memory: 512, offset: 512},
+		{name: "independent address alignment", stat: reported(65536, 512), body: 4096, size: 8192, memory: 65536, offset: 512},
+		{name: "missing mask", stat: unix.Statx_t{}, body: 4096, size: 8192, memory: 4096, offset: 4096},
+		{name: "ignore unreported fields", stat: unix.Statx_t{Dio_mem_align: 512, Dio_offset_align: 0}, body: 4096, size: 8192, memory: 4096, offset: 4096},
+		{name: "both zero", stat: reported(0, 0), body: 4096, size: 8192, memory: 4096, offset: 4096},
+		{name: "ENOSYS", queryErr: unix.ENOSYS, body: 4096, size: 8192, memory: 4096, offset: 4096},
+		{name: "EINVAL", queryErr: unix.EINVAL, body: 4096, size: 8192, memory: 4096, offset: 4096},
+		{name: "EOPNOTSUPP", queryErr: unix.EOPNOTSUPP, body: 4096, size: 8192, memory: 4096, offset: 4096},
+		{name: "zero address", stat: reported(0, 512), body: 4096, size: 8192, wantErr: true},
+		{name: "zero offset", stat: reported(512, 0), body: 4096, size: 8192, wantErr: true},
+		{name: "oversized address", stat: reported(2<<20, 512), body: 4096, size: 8192, wantErr: true},
+		{name: "oversized offset", stat: reported(4096, 8192), body: 4096, size: 8192, wantErr: true},
+		{name: "nondividing offset", stat: reported(4096, 1000), body: 4096, size: 8192, wantErr: true},
+		{name: "misaligned body", stat: reported(512, 512), body: 4097, size: 8192, wantErr: true},
+		{name: "misaligned size", stat: reported(512, 512), body: 4096, size: 8193, wantErr: true},
+		{name: "invalid conservative body", stat: reported(0, 0), body: 512, size: 8192, wantErr: true},
+		{name: "invalid conservative size", body: 4096, size: 8193, wantErr: true},
+		{name: "EIO", queryErr: unix.EIO, body: 4096, size: 8192, wantErr: true},
+		{name: "EBADF", queryErr: unix.EBADF, body: 4096, size: 8192, wantErr: true},
+		{name: "EACCES", queryErr: unix.EACCES, body: 4096, size: 8192, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			memory, offset, err := directAlignmentFromStatx(tc.stat, tc.queryErr, tc.body, tc.size)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("invalid constraint/query accepted")
+				}
+				if tc.queryErr != nil && !errors.Is(err, tc.queryErr) {
+					t.Fatalf("query error lost: %v", err)
+				}
+				return
+			}
+			if err != nil || memory != tc.memory || offset != tc.offset {
+				t.Fatalf("alignment %d/%d err=%v", memory, offset, err)
+			}
+		})
+	}
+}
+
+func TestDiffDirectAlignmentClosedFD(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "closed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d := &diffFile{f: f, bodyIO: f, logicalSize: cowBlockSize}
+	if err := d.enableDirect(); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("closed fd: %v", err)
+	}
+	if d.direct != nil {
+		t.Fatal("workspace committed after statx failure")
+	}
+}
+
+func TestDiffDirectSetupFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		cmd         int
+		err         error
+		unsupported bool
+	}{
+		{name: "supported"},
+		{"SET EINVAL", unix.F_SETFL, unix.EINVAL, true},
+		{"SET EOPNOTSUPP", unix.F_SETFL, unix.EOPNOTSUPP, true},
+		{"SET ENOTSUP", unix.F_SETFL, unix.ENOTSUP, true},
+		{"GET EINVAL", unix.F_GETFL, unix.EINVAL, false},
+		{"GET EOPNOTSUPP", unix.F_GETFL, unix.EOPNOTSUPP, false},
+		{"GET EIO", unix.F_GETFL, unix.EIO, false},
+		{"GET EBADF", unix.F_GETFL, unix.EBADF, false},
+		{"SET EIO", unix.F_SETFL, unix.EIO, false},
+		{"SET EBADF", unix.F_SETFL, unix.EBADF, false},
+		{"SET ENOSPC", unix.F_SETFL, unix.ENOSPC, false},
+		{"SET EPERM", unix.F_SETFL, unix.EPERM, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "diff")
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := &diffFile{f: f, bodyIO: f, logicalSize: cowBlockSize}
+			defer d.Close()
+			fd := f.Fd()
+			flags, err := unix.FcntlInt(fd, unix.F_GETFL, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			flags |= unix.O_NONBLOCK
+			if _, err := unix.FcntlInt(fd, unix.F_SETFL, flags); err != nil {
+				t.Fatal(err)
+			}
+			fdFlags, err := unix.FcntlInt(fd, unix.F_GETFD, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			err = d.enableDirectWithFcntl(func(gotFD uintptr, cmd, arg int) (int, error) {
+				calls++
+				if gotFD != fd || (calls == 1 && (cmd != unix.F_GETFL || arg != 0)) ||
+					(calls == 2 && (cmd != unix.F_SETFL || arg != flags|unix.O_DIRECT)) || calls > 2 {
+					t.Fatalf("fcntl call %d: fd=%d cmd=%d arg=%x", calls, gotFD, cmd, arg)
+				}
+				if cmd == tc.cmd {
+					return -1, tc.err
+				}
+				return unix.FcntlInt(gotFD, cmd, arg)
+			})
+			wantCalls := 2
+			if tc.cmd == unix.F_GETFL {
+				wantCalls = 1
+			}
+			if calls != wantCalls || d.f != f || d.f.Fd() != fd {
+				t.Fatalf("setup changed descriptor or retried: calls=%d", calls)
+			}
+			wantFlags := flags
+			if tc.err == nil {
+				wantFlags |= unix.O_DIRECT
+			}
+			if got, err := unix.FcntlInt(fd, unix.F_GETFL, 0); err != nil || got != wantFlags {
+				t.Fatalf("status flags=%x want=%x err=%v", got, wantFlags, err)
+			}
+			if got, err := unix.FcntlInt(fd, unix.F_GETFD, 0); err != nil || got != fdFlags {
+				t.Fatalf("descriptor flags=%x want=%x err=%v", got, fdFlags, err)
+			}
+			if tc.err != nil && !tc.unsupported {
+				if !errors.Is(err, tc.err) || d.direct != nil || d.bodyIO != f {
+					t.Fatalf("setup error=%v workspace=%v body=%T", err, d.direct, d.bodyIO)
+				}
+				return
+			}
+			if err != nil || d.direct == nil || d.bodyIO != (directBody{f}) {
+				t.Fatalf("setup error=%v workspace=%v body=%T", err, d.direct, d.bodyIO)
+			}
+			for _, m := range []*alignedMapping{d.direct.read, d.direct.write} {
+				if len(m.bytes) != maxDiffScratchSize || len(m.mapping) >= 2*maxDiffScratchSize ||
+					uintptr(unsafe.Pointer(&m.bytes[0]))%uintptr(d.direct.memoryAlign) != 0 {
+					t.Fatal("missing bounded aligned workspace")
+				}
+			}
+			workspace := d.direct
+			if err := d.enableDirectWithFcntl(func(uintptr, int, int) (int, error) {
+				t.Fatal("initialized workspace repeated flag setup")
+				return 0, nil
+			}); err != nil || d.direct != workspace {
+				t.Fatalf("replaced initialized workspace: %v", err)
+			}
+		})
+	}
+}
+
+func TestDiffDirectUnsupportedSetupIO(t *testing.T) {
+	for _, unsupported := range []error{unix.EINVAL, unix.EOPNOTSUPP, unix.ENOTSUP} {
+		for _, encrypted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%v/encrypted=%t", unsupported, encrypted), func(t *testing.T) {
+				f, err := os.CreateTemp(t.TempDir(), "diff")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = f.Close() })
+				d := &diffFile{f: f, bodyIO: f, logicalSize: 3 * maxDiffScratchSize}
+				if encrypted {
+					d, err = createEncryptedDiffFile(f, d.logicalSize, mustDiffEncryption(t, testDiffKey(21)),
+						bytes.NewReader(patternedBytes(diffXTSKeySize+diffHeaderNonceSize)))
+				} else {
+					err = f.Truncate(d.logicalSize)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer d.Close()
+				if err := d.enableDirectWithFcntl(func(fd uintptr, cmd, arg int) (int, error) {
+					if cmd == unix.F_SETFL {
+						return -1, unsupported
+					}
+					return unix.FcntlInt(fd, cmd, arg)
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if d.direct == nil || len(d.direct.read.bytes) != maxDiffScratchSize || len(d.direct.write.bytes) != maxDiffScratchSize {
+					t.Fatal("unsupported setup lost owned buffers")
+				}
+				if flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFL, 0); err != nil || flags&unix.O_DIRECT != 0 {
+					t.Fatalf("unsupported setup flags=%x err=%v", flags, err)
+				}
+				backing := patternedBytes(2*maxDiffScratchSize + 2)
+				payload := backing[1 : len(backing)-1]
+				want := bytes.Clone(payload)
+				if n, err := d.WriteAt(payload, 0); err != nil || n != len(payload) {
+					t.Fatalf("write n=%d err=%v", n, err)
+				}
+				clear(payload)
+				update := []byte("partial update across workspace boundary")
+				const offset = maxDiffScratchSize - 7
+				if n, err := d.WriteAt(update, offset); err != nil || n != len(update) {
+					t.Fatalf("partial write n=%d err=%v", n, err)
+				}
+				copy(want[offset:], update)
+				got := make([]byte, len(want)+2)
+				if n, err := d.ReadAt(got[1:len(got)-1], 0); err != nil || n != len(want) || !bytes.Equal(got[1:len(got)-1], want) {
+					t.Fatalf("read n=%d err=%v match=%t", n, err, bytes.Equal(got[1:len(got)-1], want))
+				}
+				if n, err := d.ReadAt(got[1:18], 509); err != nil || n != 17 || !bytes.Equal(got[1:18], want[509:526]) {
+					t.Fatalf("partial read n=%d err=%v", n, err)
+				}
+				if !allZero(d.direct.read.bytes) || !allZero(d.direct.write.bytes) {
+					t.Fatal("owned scratch was not cleared")
+				}
+				physical := make([]byte, cowBlockSize)
+				if err := readFullAt(d.bodyIO, physical, d.bodyOffset); err != nil {
+					t.Fatal(err)
+				}
+				if bytes.Equal(physical, want[:cowBlockSize]) == encrypted {
+					t.Fatal("physical plaintext/XTS encoding changed")
+				}
+			})
 		}
 	}
 }

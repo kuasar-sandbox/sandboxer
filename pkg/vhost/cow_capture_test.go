@@ -85,6 +85,36 @@ func (s *failAfterCaptureSink) CommitSnapshot(ctx context.Context, a, b string) 
 // This uses real artifact sinks/readers and a restored BlockCOW over the
 // captured payload. CH's API is simulated; it is not claimed as a KVM E2E.
 func TestCacheDirtyWritebackSnapshotExportRestore(t *testing.T) {
+	testCacheDirtyWritebackSnapshotExportRestore(t, (*testing.T).TempDir)
+}
+
+func TestTmpfsCacheDirtyWritebackSnapshotExportRestore(t *testing.T) {
+	testCacheDirtyWritebackSnapshotExportRestore(t, tmpfsCaptureDir)
+}
+
+func tmpfsCaptureDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/dev/shm", "diff-cow-238-capture-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	f, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var fs unix.Statfs_t
+	if err := unix.Fstatfs(int(f.Fd()), &fs); err != nil {
+		t.Fatal(err)
+	}
+	if fs.Type != unix.TMPFS_MAGIC {
+		t.Fatalf("capture fixture fd is not tmpfs: %x", fs.Type)
+	}
+	return dir
+}
+
+func testCacheDirtyWritebackSnapshotExportRestore(t *testing.T, diffDir func(*testing.T) string) {
 	for _, captureMemory := range []bool{false, true} {
 		for _, writeback := range []bool{false, true} {
 			for _, encrypted := range []bool{false, true} {
@@ -119,7 +149,7 @@ func TestCacheDirtyWritebackSnapshotExportRestore(t *testing.T) {
 							t.Fatal(err)
 						}
 					}
-					cow, err := vhost.OpenBlockCOW(filepath.Join(t.TempDir(), "diff"), nil, vhost.DiffInit{CreateSize: 8192}, append(options, vhost.WithCOWCache(cache))...)
+					cow, err := vhost.OpenBlockCOW(filepath.Join(diffDir(t), "diff"), nil, vhost.DiffInit{CreateSize: 8192}, append(options, vhost.WithCOWCache(cache))...)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -178,7 +208,7 @@ func TestCacheDirtyWritebackSnapshotExportRestore(t *testing.T) {
 					}
 					defer captured.Close()
 					base := vhost.NewStreamReader(context.Background(), captured.Payload, int64(captured.Payload.Size()))
-					restored, err := vhost.OpenBlockCOW(filepath.Join(t.TempDir(), "restored.diff"), base, vhost.DiffInit{CreateSize: 8192}, options...)
+					restored, err := vhost.OpenBlockCOW(filepath.Join(diffDir(t), "restored.diff"), base, vhost.DiffInit{CreateSize: 8192}, options...)
 					if err != nil {
 						t.Fatal(err)
 					}

@@ -364,8 +364,9 @@ if wait "$FATAL_CAPTURE_PID"; then echo "fatal capture returned success" >&2; ex
 if pgrep -s "$RUN_PID" -x cloud-hyperviso >/dev/null; then
     echo "CH survived the sandbox's fatal exit" >&2; exit 1
 fi
-# The fatal owner must record the source cause, not only a pinger/timeout exit.
-grep 'mandatory source read' "$WORK/verified.log"
+# The runtime owner must record the injected corruption, not only a timeout.
+# Either UFFD or COW can observe the failing immutable source first.
+grep -E 'sandbox fatal I/O:.*ciphertext hash mismatch' "$WORK/verified.log"
 if grep -qE 'Traceback|Input/output error' "$WORK/verified.log"; then
     echo "fatal source failure reached the Guest as an I/O error" >&2; exit 1
 fi

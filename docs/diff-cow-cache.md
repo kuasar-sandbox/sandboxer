@@ -1,10 +1,12 @@
 [English](diff-cow-cache.md) | [简体中文](diff-cow-cache_zh.md)
 
-# Active COW direct I/O and plaintext cache
+# Active COW I/O and plaintext cache
 
-Active writable diffs use direct I/O and one bounded plaintext page cache owned
-by `sandbox-ctl` for each sandbox. Root and data disks share this budget. This
-implements [issue #230](https://github.com/kuasar-sandbox/sandboxer/issues/230).
+Active writable diffs request O_DIRECT through one common positioned-I/O API,
+including on tmpfs. Runtime policy does not identify the backing filesystem.
+One bounded plaintext page cache is owned by `sandbox-ctl` for each sandbox; root and data disks share it, including mixed tmpfs/disk storage. This
+implements [issue #230](https://github.com/kuasar-sandbox/sandboxer/issues/230), with
+tmpfs compatibility restored by [issue #238](https://github.com/kuasar-sandbox/sandboxer/issues/238).
 It changes active data access, configuration and lifecycle; immutable base images,
 templates, historical overlays, manifest decryption caches, artifact outputs,
 tarstream representation, cgroups, balloon and guest resource budgets retain
@@ -24,7 +26,8 @@ Both fields are positive multiples of 4 KiB, with
 values above, including old configs without `diff_cow`. A single supplied field
 must still satisfy the relationship after defaults. These are finite engineering
 defaults, not a production SLA or a claim of optimal performance. There is no
-zero/unlimited value, disable switch, buffered fallback or alternate write mode.
+zero/unlimited value, disable switch, failed-data-I/O buffered retry or
+configurable alternate write mode.
 
 `max_dirty_size` is a subset of `cache_size`, never an additional pool or a
 reserved partition. Clean pages may use the entire cache when there are no dirty
@@ -44,9 +47,9 @@ COW owns a finite default cache and closes it itself.
 
 ## Logical state and accounting
 
-The stack is `BlockCOW -> plaintext cache -> diffFile encoding -> aligned direct
-I/O -> active file`. Pages are 4096 bytes. Base reads do not populate or materialize
-the upper cache. Each cached page is indexed by active file and block number.
+The stack is `BlockCOW -> plaintext cache -> diffFile encoding -> owned I/O
+workspace -> active file`. Pages are 4096 bytes. Base reads do not populate or
+materialize the upper cache. Each cached page is indexed by active file and block number.
 
 | State or transition | Total used | Dirty used |
 | --- | --- | --- |
@@ -65,7 +68,15 @@ copy and at most 256 page pointers per sandbox, two independent 1 MiB MAP_SHARED
 I/O workspaces per active file (each with less than 1 MiB alignment padding),
 and page metadata/index/Go allocator overhead proportional to page capacity.
 `cache_size` is not a cap on process RSS, guest memfd mappings, immutable-source
-caches or snapshot output memory.
+caches, tmpfs file storage or snapshot output memory.
+
+Tmpfs file pages are filesystem storage in memory (and potentially swap), separate
+from this bounded process cache. Successful writeback releases dirty quota but
+does not release stored tmpfs data; clean-cache eviction does not remove it either.
+`cache_size` does not bound those bytes or promise zero tmpfs page residency.
+Existing tmpfs mount size/inode limits and host memory controls govern that
+storage. Sandboxer does not remount tmpfs, change cgroups, inflate cache budgets
+or add persistence guarantees. See the [Linux tmpfs documentation](https://www.kernel.org/doc/html/v6.1/filesystems/tmpfs.html).
 
 The bitmap means **logical upper-present**, independent of clean/dirty state.
 A complete new page is published to the cache and bitmap before acknowledging
@@ -81,11 +92,11 @@ clean slot is available, a bounded foreground workspace can service the read
 without insertion. It never bypasses a newer cached page.
 
 Live and snapshot reads share bounded upper-run batching. Only contiguous cold
-pages of the requested upper range enter a direct read (at most 1 MiB); cache
+pages of the requested upper range enter a physical read (at most 1 MiB); cache
 hits and base/hole boundaries stop the run. Sorted stripe-range locks prevent
 concurrent writes/discard, while reserved Loading pages prevent eviction. With
 less cache capacity than the run, remaining cold pages bypass caching under the
-same stripes. Read/decrypt stays in the existing private DIO workspace: clean
+same stripes. Read/decrypt stays in the owned MAP_SHARED I/O workspace: clean
 pages are populated from that workspace before copying out to mutable caller or
 guest memory. No request-sized payload allocation or base prefetch is added.
 
@@ -160,44 +171,49 @@ before freeing their buffers.
 
 Writeback and short-write failures are sticky: failed pages remain dirty-accounted,
 new writes fail, all waiters wake, and the runtime receives a non-blocking fatal
-notification without self-joining. A partial direct write may already have changed
+notification without self-joining. A partial physical write may already have changed
 the file. Cleanup of newly materialized blocks cannot punch previously existing
 upper pages in the same batch. There is no transactional-write or crash-recovery
 promise and no silent buffered retry.
 
 The original error is latched and the owner notified before cleanup I/O. While rollback runs, active-I/O ownership, frozen pages and their quotas remain held so Close cannot release the file or buffers early. Cleanup errors are joined afterward without masking the original failure.
 
-## Direct I/O contract
+## Active-file I/O contract
 
-Only active bodies use O_DIRECT: fresh targets enable it **before seeding**,
-existing active validation uses it, and runtime/snapshot reads use it. Header and
-format probing are bounded before concurrent body I/O; templates and base remain
-buffered/read-only as before. Plaintext and encrypted file formats, the fixed
-4 KiB encrypted header, local encryption off/auto/required policy and 512-byte XTS
-data-unit numbering do not change.
+Every active body attempts O_DIRECT on its opened descriptor and always uses the
+same bounded aligned workspaces. If that F_SETFL request returns EINVAL or
+EOPNOTSUPP/ENOTSUP, the descriptor keeps ordinary positioned I/O; the application
+buffer and cache are unchanged. This initialization-only capability decision
+does not inspect the filesystem and is not a retry after failed data I/O. Fresh targets complete this setup **before seeding**; existing
+active validation and runtime/snapshot reads use the same path. Runtime code does
+not inspect filesystem types, names, mount policies or filesystem-specific inode
+flags. Header and format probing are bounded before concurrent body I/O;
+templates and base remain buffered/read-only. Plaintext and encrypted file
+formats, the fixed 4 KiB encrypted header, local encryption off/auto/required
+policy and 512-byte XTS data-unit numbering do not change.
 
-The opened file's `STATX_DIOALIGN` describes separate address and offset/length
-constraints. Offset alignment must divide 4096 and fit body boundary and size.
-Unknown statx support requires a conservative verified filesystem path; an
-explicit unsupported result is an error. The legacy path is limited to ext4
-with verified inode flags and an ordered/writeback mount policy, using 4 KiB
-alignment; older XFS requires STATX_DIOALIGN. Filesystem blocks larger than 4 KiB
-are rejected. Tmpfs accepting O_DIRECT is not evidence
-of bypassing page cache. Unsupported filesystems/alignment fail with diagnostics,
-never fallback. Tests need a disk-backed ext4/XFS task directory, not tmpfs `/tmp`.
+`STATX_DIOALIGN` on the open fd supplies separate address and offset/length
+constraints. Positive reported constraints must fit the workspace bound and
+4 KiB COW geometry; offset alignment must divide 4096 and fit body boundary and
+size. A missing mask, query-unavailable ENOSYS/EINVAL/EOPNOTSUPP, or both-zero
+alignment fields selects conservative 4096-byte alignment. This is an alignment
+choice, not proof of cache bypass. One-zero or
+other invalid constraints, genuine statx/descriptor errors, other flag-setup errors and
+actual I/O failures remain errors. No application-side buffered retry hides EIO,
+ENOSPC, alignment errors or short I/O. See [statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html).
+
+The kernel and backing implementation determine how an O_DIRECT request is
+fulfilled. Successful flag setup and aligned I/O establish usable operations,
+not universal physical disk-cache bypass. Tmpfs file pages remain memory/swap
+storage outside `cache_size`. There is no filesystem allowlist, special tmpfs
+backend, new configuration mode or fallback after failed data I/O. See
+[open(2)](https://man7.org/linux/man-pages/man2/open.2.html).
 
 I/O uses bounded, aligned anonymous `MAP_SHARED` workspaces with lifetime through
 syscall completion, avoiding the private-heap/fork hazard. Arbitrary caller slices
 and subpage reads are copied through these buffers; large operations are chunked.
 Full-page cache writeback avoids read/modify/write. Short writes fail rather than
-retrying an unaligned remainder. See [open(2)](https://man7.org/linux/man-pages/man2/open.2.html),
-[statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html) and
-[write(2)](https://man7.org/linux/man-pages/man2/write.2.html).
-
-Older ext4 can silently buffer direct I/O for fscrypt, verity, inline data or data
-journaling; accepting the O_DIRECT flag alone is insufficient. These checks follow
-the [Linux ext4 DIO decision](https://github.com/torvalds/linux/blob/master/fs/ext4/file.c)
-and [alignment query](https://github.com/torvalds/linux/blob/master/fs/ext4/inode.c).
+retrying an unaligned remainder; see [write(2)](https://man7.org/linux/man-pages/man2/write.2.html).
 
 ## Validation
 
@@ -205,8 +221,18 @@ Use deterministic worker gates and injected failures for quota transitions,
 FIFO/LRU, one-page capacity, cancellation, multi-disk contention, frozen-page
 reads/rewrites, FLUSH, snapshots, Discard and Close. Real direct-I/O checks cover
 alignment, sparse boundaries, templates, plaintext/encrypted reopen and mincore
-page residency. Run targeted tests, race, vet, build, broader tests and CH/KVM E2E;
-report skips and infrastructure failures explicitly.
+page residency on a disk-backed fixture. Generic alignment tests cover positive,
+missing, both-zero and malformed constraints, unavailable queries and genuine
+errors. Dedicated real-tmpfs tests verify the fixture descriptor type and the
+same O_DIRECT request, plaintext/encrypted I/O, bounded staging and copyout,
+template seeding,
+sparse holes, shared mixed-filesystem quotas/backpressure, dirty/writeback capture,
+Drain/Close and reopen. A small private tmpfs mount tests real ENOSPC when isolated
+user/mount namespaces are available; it never exhausts or remounts a shared mount.
+DIO/mincore benchmarks retain disk-backed fixtures. Tmpfs functional tests are
+not evidence of disk cache bypass. Run targeted tests, race, vet, build, broader
+tests and real CH/KVM tmpfs guest cold-start/read-write
+and pause/export/restore; report skips and infrastructure failures explicitly.
 
 Performance comparisons need datasets much larger than the cache and separate
 frontend admission latency from total elapsed time including Drain. Cover

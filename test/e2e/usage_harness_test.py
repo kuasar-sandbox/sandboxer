@@ -31,6 +31,34 @@ from usage_vsock_relay import UsageHandler, UsageRelay, exact, frame, line
 from usage_report_relay import ReportRelay
 
 
+class ReadRecoveryFatalCauseTests(unittest.TestCase):
+    def test_runtime_owner_reports_corruption_from_either_read_path(self):
+        script = Path(__file__).with_name("e2e_sandbox_read_recovery.sh").read_text()
+        assertions = [line for line in script.splitlines()
+                      if line.startswith("grep ") and '"$WORK/verified.log"' in line]
+        self.assertEqual(len(assertions), 1)
+        cases = {
+            "uffd": ("sandbox fatal I/O: uffd: mandatory source read failed: "
+                     "fetch: chunk 20: ciphertext hash mismatch\n", True),
+            "cow": ("sandbox fatal I/O: fatal sandbox I/O: vhost: materialize "
+                    "block 65600 from base: fetch: chunk 20: ciphertext hash mismatch\n", True),
+            "pinger": ("sandbox fatal I/O: guest pinger timed out\n", False),
+            "canceled": ("uffd: mandatory source read failed: context canceled\n", False),
+            "capture-only": ("snapshot: fetch: ciphertext hash mismatch\n", False),
+            "unrelated-lines": ("sandbox fatal I/O: timeout\n"
+                                "snapshot: ciphertext hash mismatch\n", False),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for name, (contents, expected) in cases.items():
+                with self.subTest(name=name):
+                    Path(directory, "verified.log").write_text(contents)
+                    result = subprocess.run(
+                        ["bash", "-c", assertions[0]], text=True, capture_output=True,
+                        env={**os.environ, "WORK": directory})
+                    self.assertEqual(result.returncode, 0 if expected else 1,
+                                     result.stdout + result.stderr)
+
+
 class HarnessProcessTests(unittest.TestCase):
     def test_explicit_goroot_wins_over_reset_path(self):
         with tempfile.TemporaryDirectory() as directory:
