@@ -3,9 +3,8 @@
 // stdlib deps) so every caller — restore, lifecycle shutdown, snapshot — uses
 // the same request/response + timeout policy.
 //
-// CH speaks plain HTTP/1.1 on the UDS exposed by --api-socket. The call rate is
-// low (pause / resume / snapshot / shutdown), so a hand-rolled request keeps the
-// dependency surface minimal compared to net/http.
+// Lifecycle operations retain their existing small HTTP client. Restore
+// readiness separately reads a complete framed vm.info response in ready.go.
 package chapi
 
 import (
@@ -19,12 +18,6 @@ import (
 // the response deadline is "no forced"), so a missing/dead socket fails fast
 // while a slow RESPONSE can still be waited out per RespDeadline.
 const dialTimeout = 5 * time.Second
-
-const (
-	waitReadyDialTimeout = 50 * time.Millisecond
-	waitReadyInitialPoll = 1 * time.Millisecond
-	waitReadyMaxPoll     = 20 * time.Millisecond
-)
 
 // Client issues management calls against one CH api-socket. The zero value is
 // usable except for Sock. RespDeadline bounds the response read; 0 = no forced
@@ -112,81 +105,4 @@ func (c Client) doContext(ctx context.Context, method, path, body string) error 
 		return fmt.Errorf("ch api %s %s non-2xx: %q", method, path, resp)
 	}
 	return nil
-}
-
-// WaitReady polls the CH api-socket until it accepts a connection (CH creates
-// it during startup). deadline <= 0 polls until ctx is cancelled (e.g. CH exit
-// / SIGINT); a positive deadline bounds the wait. Used by restore before the
-// post-spawn /vm.resume.
-func WaitReady(ctx context.Context, sock string, deadline time.Duration) error {
-	var end time.Time
-	if deadline > 0 {
-		end = time.Now().Add(deadline)
-	}
-	poll := waitReadyInitialPoll
-	var lastErr error
-	for {
-		if ctx.Err() != nil {
-			return fmt.Errorf("ch api socket not ready: %w", ctx.Err())
-		}
-		if !end.IsZero() && !time.Now().Before(end) {
-			if lastErr != nil {
-				return fmt.Errorf("ch api socket not ready before deadline: %w", lastErr)
-			}
-			return fmt.Errorf("ch api socket not ready before deadline")
-		}
-
-		dialCtx := ctx
-		cancel := func() {}
-		timeout := waitReadyDialTimeout
-		if !end.IsZero() {
-			remaining := time.Until(end)
-			if remaining <= 0 {
-				continue
-			}
-			if remaining < timeout {
-				timeout = remaining
-			}
-		}
-		if timeout > 0 {
-			dialCtx, cancel = context.WithTimeout(ctx, timeout)
-		}
-
-		c, err := (&net.Dialer{}).DialContext(dialCtx, "unix", sock)
-		cancel()
-		if err == nil {
-			_ = c.Close()
-			return nil
-		}
-		lastErr = err
-
-		sleep := poll
-		if !end.IsZero() {
-			remaining := time.Until(end)
-			if remaining <= 0 {
-				continue
-			}
-			if remaining < sleep {
-				sleep = remaining
-			}
-		}
-		timer := time.NewTimer(sleep)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			return fmt.Errorf("ch api socket not ready: %w", ctx.Err())
-		case <-timer.C:
-		}
-		if poll < waitReadyMaxPoll {
-			poll *= 2
-			if poll > waitReadyMaxPoll {
-				poll = waitReadyMaxPoll
-			}
-		}
-	}
 }
