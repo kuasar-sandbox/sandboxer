@@ -61,7 +61,7 @@ if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
 fi
 [ "$(id -u)" -eq 0 ] || skip "must run as root (cgroup + uffd)"
 
-WORK="$(mktemp -d /tmp/e2e-snap-upload-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-snap-upload-XXXXXX")"
 PIDS=()
 cleanup() {
     for pid in "${PIDS[@]}"; do

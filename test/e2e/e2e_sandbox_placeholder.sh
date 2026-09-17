@@ -65,7 +65,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
 
-WORK="$(mktemp -d /tmp/e2e-placeholder-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-placeholder-XXXXXX")"
 RUNROOT="$WORK/runtime"; mkdir -p "$RUNROOT"
 RUNLOG="$WORK/run.log"
 RUNPID=""

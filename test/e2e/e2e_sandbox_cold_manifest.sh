@@ -66,7 +66,7 @@ command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
 
 # ---- workspace -----------------------------------------------------------
 
-WORK="$(mktemp -d /tmp/e2e-sandbox-manifest-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-sandbox-manifest-XXXXXX")"
 PIDS=()
 
 cleanup() {

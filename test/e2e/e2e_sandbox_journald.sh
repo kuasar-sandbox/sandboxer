@@ -26,7 +26,7 @@ if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 [ -S /run/systemd/journal/socket ] || skip 'native journal socket unavailable'
 journalctl --sync || skip 'journal is not accessible'
 
-WORK="$(mktemp -d /tmp/e2e-journald-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-journald-XXXXXX")"
 CASE="journal-$$-$(date +%s)-${WORK##*-}"
 APP="e2e-app-$$"
 CONSOLE="e2e-console-$$"

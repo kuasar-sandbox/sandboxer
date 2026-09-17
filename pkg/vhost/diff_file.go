@@ -72,6 +72,7 @@ type blockCOWOptions struct {
 	encryption    *diffEncryption
 	required      bool
 	encryptionSet bool
+	cache         *COWCache
 }
 
 type diffEncryptionBlockCOWOption struct {
@@ -123,6 +124,8 @@ type diffFile struct {
 	logicalSize int64
 	bodyOffset  int64
 	xts         *xts.Cipher
+	direct      *directWorkspace
+	syncFile    func() error
 }
 
 type diffBodyIO interface {
@@ -178,6 +181,11 @@ func openExistingDiffFile(path string, encryption *diffEncryption, required, rea
 		if err != nil {
 			return fail(err)
 		}
+		if !readOnly {
+			if err := diff.enableDirect(); err != nil {
+				return fail(err)
+			}
+		}
 		return diff, nil
 	}
 	if required {
@@ -186,7 +194,13 @@ func openExistingDiffFile(path string, encryption *diffEncryption, required, rea
 	if err := validateDiffLogicalSize(info.Size()); err != nil {
 		return fail(fmt.Errorf("vhost: plaintext diff: %w", err))
 	}
-	return &diffFile{f: f, bodyIO: f, logicalSize: info.Size()}, nil
+	diff := &diffFile{f: f, bodyIO: f, logicalSize: info.Size()}
+	if !readOnly {
+		if err := diff.enableDirect(); err != nil {
+			return fail(err)
+		}
+	}
+	return diff, nil
 }
 
 func openEncryptedDiffFile(f *os.File, physicalSize int64, encryption *diffEncryption) (*diffFile, error) {
@@ -319,6 +333,10 @@ func initializeFreshDiffFile(path string, logicalSize int64, encryption *diffEnc
 		if err := target.validateFreshEncryptedBodySparse(); err != nil {
 			return nil, err
 		}
+	}
+	defer target.Close()
+	if err := target.enableDirect(); err != nil {
+		return nil, err
 	}
 	if template != nil {
 		if err := seedDiffTemplate(context.Background(), target, template); err != nil {
@@ -460,6 +478,13 @@ func (d *diffFile) ReadAt(buf []byte, offset int64) (int, error) {
 		n = int(d.logicalSize - offset)
 		eof = io.EOF
 	}
+	if d.direct != nil {
+		read, err := d.directReadAt(buf[:n], offset)
+		if err != nil {
+			return read, err
+		}
+		return read, eof
+	}
 	if !d.encrypted {
 		read, err := d.bodyIO.ReadAt(buf[:n], offset)
 		if err != nil && !(errors.Is(err, io.EOF) && read == n) {
@@ -493,6 +518,9 @@ func (d *diffFile) WriteAt(buf []byte, offset int64) (int, error) {
 	}
 	if len(buf) == 0 {
 		return 0, nil
+	}
+	if d.direct != nil {
+		return d.directWriteAt(buf, offset)
 	}
 	if !d.encrypted {
 		written, err := d.bodyIO.WriteAt(buf, offset)
@@ -596,8 +624,23 @@ func (d *diffFile) punchHole(offset, length int64) error {
 		d.bodyOffset+offset, length)
 }
 
-func (d *diffFile) Sync() error  { return d.f.Sync() }
-func (d *diffFile) Close() error { return d.f.Close() }
+func (d *diffFile) Sync() error {
+	if d.syncFile != nil {
+		return d.syncFile()
+	}
+	return d.f.Sync()
+}
+func (d *diffFile) Close() error {
+	// Owners join all operations before Close; the locks protect direct users too.
+	if d.direct == nil {
+		return d.f.Close()
+	}
+	d.direct.readMu.Lock()
+	defer d.direct.readMu.Unlock()
+	d.direct.writeMu.Lock()
+	defer d.direct.writeMu.Unlock()
+	return errors.Join(d.direct.read.close(), d.direct.write.close(), d.f.Close())
+}
 
 type diffTemplateSource interface {
 	sparse.Source
@@ -635,6 +678,9 @@ func ValidateExistingDiffExt4(ctx context.Context, path string, base BlockReader
 	diff, err := openExistingDiffFile(path, options.encryption, options.required, true)
 	if err != nil {
 		return err
+	}
+	if err := diff.enableDirect(); err != nil {
+		return errors.Join(err, diff.Close())
 	}
 	bitmap, err := diff.scanDirtyBlocks()
 	if err != nil {

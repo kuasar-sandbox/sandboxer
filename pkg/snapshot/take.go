@@ -91,6 +91,8 @@ type DiskDiff struct {
 	Owned        bool
 	MergeBase    string
 	SnapshotView func() (io.ReadSeeker, []sparse.Extent, error)
+	// CheckError rechecks asynchronous COW failures, including after the last read.
+	CheckError func() error
 }
 
 // Outputs describes what was produced. Refs are scheme-tagged
@@ -205,7 +207,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 
 	// T2b: quiesce backends (steady state before the dump).
 	s.Quiescer.Quiesce()
-	if err := context.Cause(ctx); err != nil {
+	if err := checkDiskCapture(ctx, s.Diffs); err != nil {
 		return nil, err
 	}
 
@@ -288,7 +290,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if err != nil || memoryBaseCloseErr != nil {
 		return nil, fmt.Errorf("absorb Snapshot S: %w", errors.Join(err, memoryBaseCloseErr))
 	}
-	if err := context.Cause(ctx); err != nil {
+	if err := checkDiskCapture(ctx, s.Diffs); err != nil {
 		return nil, err
 	}
 	if err := sink.CommitSnapshot(ctx, out.SnapshotRef, out.SnapshotPath); err != nil {
@@ -314,7 +316,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	out.WallclockPauseMs = pausedAt.Sub(pauseStart).Milliseconds()
 	out.WallclockDumpMs = dumpEnd.Sub(dumpStart).Milliseconds()
 	logf("snapshot: sandbox=%s snapshot=%s memory_resident=%d", out.SandboxRef, out.SnapshotRef, out.MemoryResident)
-	if err := context.Cause(ctx); err != nil {
+	if err := checkDiskCapture(ctx, s.Diffs); err != nil {
 		return nil, err
 	}
 	succeeded = true

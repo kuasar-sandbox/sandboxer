@@ -40,7 +40,7 @@ for command in docker mkfs.ext4 openssl python3; do
 done
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 
-WORK="$(mktemp -d /tmp/e2e-encrypted-diff-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-encrypted-diff-XXXXXX")"
 RUN_ROOT="$WORK/run"
 OUT="$WORK/out"
 mkdir -p "$RUN_ROOT" "$OUT"

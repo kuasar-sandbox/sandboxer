@@ -49,7 +49,7 @@ if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
     TAP_CREATED_BY_TEST=1
 fi
 
-WORK="$(mktemp -d /tmp/e2e-snap-merge-XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-snap-merge-XXXXXX")"
 PIDS=()
 cleanup() {
     for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; done

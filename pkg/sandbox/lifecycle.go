@@ -124,7 +124,7 @@ type BundleSourceBinding struct {
 // Run executes one sandbox lifecycle: prepare backends + launch server,
 // spawn CH, wait for exit, cleanup. Returns CH's exit code or an error
 // if setup failed.
-func Run(ctx context.Context, opts RunOptions) (int, error) {
+func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	startUnixNs := time.Now().UnixNano()
 	if opts.Cfg == nil {
 		return -1, fmt.Errorf("RunOptions.Cfg is nil")
@@ -526,7 +526,21 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if err != nil {
 		return -1, fmt.Errorf("prepare diff: %w", err)
 	}
-	var cowOptions []vhost.BlockCOWOption
+	cacheSize, maxDirtySize, err := opts.Cfg.Resources.DiffCOW.Bytes()
+	if err != nil {
+		return -1, err
+	}
+	cowCache, err := vhost.NewCOWCache(cacheSize, maxDirtySize)
+	if err != nil {
+		return -1, err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, cowCache.Close())
+		if retErr != nil {
+			code = -1
+		}
+	}()
+	cowOptions := []vhost.BlockCOWOption{vhost.WithCOWCache(cowCache)}
 	if opts.LocalCodec != nil {
 		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
 	}
@@ -534,7 +548,12 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	if err != nil {
 		return -1, fmt.Errorf("root COW: %w", err)
 	}
-	defer cow.Close()
+	defer func() {
+		retErr = errors.Join(retErr, cow.Close())
+		if retErr != nil {
+			code = -1
+		}
+	}()
 
 	// Root logical disk (Disks[0]): single → one writable Cow (blk0); overlay →
 	// ro erofs base (blk0) + writable Cow (blk1). Data disks (boot.disks[], in
@@ -548,11 +567,16 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		OwnedDiff: ownedDiff,
 	}}
 	for i := range opts.Cfg.Boot.Disks {
-		db, dcleanup, derr := prepColdDataDisk(ctx, &opts.Cfg.Boot.Disks[i], i, baseDir, opts.SandboxID, fetcher, opts.RefLocations, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener)
+		db, dcleanup, derr := prepColdDataDisk(ctx, &opts.Cfg.Boot.Disks[i], i, baseDir, opts.SandboxID, fetcher, opts.RefLocations, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener, cowCache)
 		if derr != nil {
 			return -1, derr
 		}
-		defer dcleanup()
+		defer func() {
+			retErr = errors.Join(retErr, dcleanup())
+			if retErr != nil {
+				code = -1
+			}
+		}()
 		disks = append(disks, db)
 	}
 	// Resolve mounts[].type=disk → guest device paths (name→ordinal→/dev/vdX);
@@ -1333,15 +1357,17 @@ func resolveDiskMounts(mounts []proto.MountSpec, disks []config.DiskConfig, root
 // optional ro base(s) and builds its writable CoW diff (same machinery as the
 // root). ordinal is its boot.disks[] index (used for the auto-default diff name).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, baseDir, sandboxID string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, diffCustomerKey [32]byte, required bool, opener FileStreamOpener) (DiskBackend, func(), error) {
+func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, baseDir, sandboxID string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, diffCustomerKey [32]byte, required bool, opener FileStreamOpener, cowCache *vhost.COWCache) (DiskBackend, func() error, error) {
 	var db DiskBackend
-	var closers []func()
-	cleanup := func() {
+	var closers []func() error
+	cleanup := func() error {
+		var err error
 		for i := len(closers) - 1; i >= 0; i-- {
-			closers[i]()
+			err = errors.Join(err, closers[i]())
 		}
+		return err
 	}
-	fail := func(e error) (DiskBackend, func(), error) { cleanup(); return DiskBackend{}, nil, e }
+	fail := func(e error) (DiskBackend, func() error, error) { return DiskBackend{}, nil, errors.Join(e, cleanup()) }
 
 	single := d.RootConfig.Single()
 	db.Overlay = !single
@@ -1356,7 +1382,7 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 			return fail(fmt.Errorf("%s erofs base: %w", field, err))
 		}
 		db.Reader, db.BasePath = r, d.Base
-		closers = append(closers, func() { r.Close() })
+		closers = append(closers, r.Close)
 		cowBaseURI, diffURI, diffTemplate = d.Overlay.Base, d.Overlay.Diff, d.Overlay.DiffTemplate
 	}
 
@@ -1374,7 +1400,7 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 			return fail(fmt.Errorf("%s cow base: %w", field, err))
 		}
 		cowBase = r
-		closers = append(closers, func() { r.Close() })
+		closers = append(closers, r.Close)
 	}
 
 	if diffURI == "" { // auto-default a per-disk diff on the base dir; ours to remove
@@ -1384,7 +1410,7 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 		diffURI = DefaultDiskDiffURI(baseDir, sandboxID, fmt.Sprintf("disk%d", ordinal))
 		_, p, _ := config.SchemeAndPath(diffURI)
 		db.OwnedDiff = true
-		closers = append(closers, func() { _ = os.Remove(p) })
+		closers = append(closers, func() error { _ = os.Remove(p); return nil })
 	}
 	_, diffPath, ok := config.SchemeAndPath(diffURI)
 	if !ok {
@@ -1398,7 +1424,7 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 	if err != nil {
 		return fail(fmt.Errorf("%s prepare diff: %w", field, err))
 	}
-	var cowOptions []vhost.BlockCOWOption
+	cowOptions := []vhost.BlockCOWOption{vhost.WithCOWCache(cowCache)}
 	if codec != nil {
 		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, required))
 	}
@@ -1406,7 +1432,7 @@ func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, ba
 	if err != nil {
 		return fail(fmt.Errorf("%s COW: %w", field, err))
 	}
-	closers = append(closers, func() { cow.Close() })
+	closers = append(closers, cow.Close)
 	db.Cow, db.DiffPath = cow, diffPath
 	return db, cleanup, nil
 }
@@ -1640,7 +1666,7 @@ func handleExportRequest(
 	diffs := make([]snapshot.DiskDiff, len(disks))
 	diskMerged := make([]bool, len(disks))
 	for i, disk := range disks {
-		diff := snapshot.DiskDiff{Path: disk.DiffPath, Owned: disk.OwnedDiff, SnapshotView: disk.SnapshotView}
+		diff := snapshot.DiskDiff{Path: disk.DiffPath, Owned: disk.OwnedDiff, SnapshotView: disk.SnapshotView, CheckError: disk.CheckError}
 		parentRef, parentPath, parentErr := currentDiskParentBinding(opts, i)
 		if parentErr != nil {
 			return ctl.Response{}, fmt.Errorf("export: disk %d parent binding: %w", i, parentErr)
@@ -2034,6 +2060,7 @@ func handleSnapshotRequest(
 			Path:         d.DiffPath,
 			Owned:        d.OwnedDiff,
 			SnapshotView: d.SnapshotView,
+			CheckError:   d.CheckError,
 		}
 		if dd.SnapshotView == nil {
 			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q has no snapshot view", i, dd.Path)

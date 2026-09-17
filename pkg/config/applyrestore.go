@@ -49,6 +49,7 @@ func ApplyRestoreRules(artifact *PortableSandboxConfig, host *SandboxConfig, pre
 	// target-node settled workload policy; applying them here leaves immutable
 	// C0, captured deflate_on_oom, and Snapshot S Budget unchanged.
 	runtime.Resources.Allocatable = allocatable
+	runtime.Resources.DiffCOW = host.Resources.DiffCOW
 	runtime.Resources.Control = host.Resources.Control
 	runtime.Resources.Overhead = host.Resources.Overhead
 	runtime.Resources.WatermarkHigh = host.Resources.WatermarkHigh

@@ -134,7 +134,7 @@ Portable content includes:
 
 Portable content excludes:
 
-- Cgroup paths/fds/controllers, overhead, watermark, and startup.
+- Cgroup paths/fds/controllers, overhead, watermark, startup, and `resources.diff_cow` cache policy.
 - TAP/TapFD providers, helpers, sockets, IP/MAC/hostname.
 - The CH binary, run-root/base-root, and active diff paths.
 - Manifest/customer keys, crypto secrets, access tokens, and ref-location host paths.

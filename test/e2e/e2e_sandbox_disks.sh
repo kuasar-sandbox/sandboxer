@@ -53,7 +53,7 @@ command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 
-WORK=$(mktemp -d /tmp/e2e-disks-XXXXXX)
+WORK=$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-disks-XXXXXX")
 RR=$WORK/runtime; mkdir -p "$RR"
 OUT=$WORK/out; mkdir -p "$OUT"
 P1=""; P2=""; P3=""; P4=""; TAP_CREATED=0; HIDDEN_PARENT=""; PARENT_SIBLING=""

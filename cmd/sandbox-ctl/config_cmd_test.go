@@ -47,6 +47,7 @@ metadata: { owner: test }
 
 func TestRestoreFilter(t *testing.T) {
 	in := `resources:
+  diff_cow: { cache_size: 8MiB, max_dirty_size: 4MiB }
   capacity: { cpu: 2, memory: 8GiB }
   startup: { memory: 1GiB }
 network: { tap: tap0 }
@@ -82,7 +83,7 @@ restore:
 			t.Errorf("restore filter should have dropped %q; output:\n%s", dropped, got)
 		}
 	}
-	for _, kept := range []string{"kernel:", "runtime:", "tap0", "diff_template", "capacity", "startup:", "memory: 1GiB", "prefetch: memory"} {
+	for _, kept := range []string{"kernel:", "runtime:", "tap0", "diff_template", "capacity", "startup:", "memory: 1GiB", "prefetch: memory", "cache_size: 8MiB", "max_dirty_size: 4MiB"} {
 		if !strings.Contains(got, kept) {
 			t.Errorf("restore filter should have kept %q; output:\n%s", kept, got)
 		}

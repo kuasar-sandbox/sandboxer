@@ -134,7 +134,7 @@ Portable 内容包括:
 
 Portable 内容排除:
 
-- cgroup path/fd/controller、overhead/watermark/startup;
+- cgroup path/fd/controller、overhead/watermark/startup、`resources.diff_cow` 缓存策略;
 - TAP/TapFD provider、helper、socket以及 IP/MAC/hostname;
 - CH binary、run-root/base-root、active diff path;
 - manifest/customer key、crypto secret、access token、ref-location host path;
