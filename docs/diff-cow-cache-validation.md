@@ -167,9 +167,8 @@ CH/runtime/kernel BIN and ran all four real CH/KVM cases on exact `d601fa0`;
 each exited **0**. Evidence is in the task's `kvm-d601-results.log` and immutable
 BMS `/var/tmp/diff-cow-230-kvm-lb6t8B/d601/evidence`. Default/native results are
 in `native-d601-tests.log` and `native-d601-full.log` (both exit 0), with parent
-also confirming six-package races. These are d601 results, not final-revision
-KVM evidence. Parent will build an immutable final-head directory and rerun
-after the scoped revision commit. The generic invocation remains:
+also confirming six-package races. These are the historical d601 results. Final revised-runtime KVM evidence
+is recorded in the last section below. The generic invocation remains:
 
 ```sh
 export REQUIRE_KVM=1 TMPDIR=/absolute/disk-backed/task/tmp
@@ -341,7 +340,23 @@ mapping before copyout, never from mutable guest/caller output. Guest FLUSH,
 quota, Close, fatal and unflushed snapshot tests remain passing. Only the existing
 `TestSendU64Reply_RoundTrip` skip remains; three packages have no test files.
 
-The four actual CH/KVM passes and parent native passes described above apply to
-d601. Final-head CH/KVM and trusted exact-integration CI remain separate evidence;
-parent will rerun KVM from an immutable directory after this commit. PR #231 is
-Draft at d601; this revision is a local commit only, with no push or merge.
+The earlier CH/KVM and native passes apply to d601. The final section records
+the repeated checks on immutable revised runtime187974b. Both implementation
+revisions have been published to PR #231; trusted exact-integration CI remains
+a separate merge requirement.
+
+## Final revised-runtime verification
+
+The independently reviewed runtime and fixture head is `187974bba30b636050a909a7f2ffa0cced85f5f1` (batching commit `c0bbe9e2642a3285d3447bf19d8e56a567b500f5`). The full default-tag tests, source-CI-equivalent `CGO_ENABLED=0` full tests, nine relevant packages under race, whole-repository vet and build passed. Source tests used disk-backed `TMPDIR=/var/tmp`; the source-suite and standalone usage wrappers now supply that default while preserving explicit overrides. Two socket labels in the existing guestlink half-close test were shortened to stay within the Unix socket path limit; its behavior and assertions are unchanged. No new test was skipped.
+
+All four real CH/KVM cases passed again from an immutable archive of this head: `diff_template`, `encrypted_diff`, `snapshot` (including its default 100 CH pause/resume barrier cycles), and `disks` (root/data disks and local working-set recovery). Tests ran in separate PID, mount and network namespaces, with `REQUIRE_KVM=1` and disk-backed active files. The source archive SHA-256 was `1b894ed56e8831aae8d5697d2d2e7bdb4d0b21396d47b5ecbf026a51bd22d1c7`; the default-tag sandbox-ctl binary SHA-256 was `ea19b2b101b86107aca5159cb4b6df4c10338a118c9609fd0fa58d1842fd6bcf`. The task retained `kvm-187974b-results.log`, `final-ci-equivalent-tests.log`, and the immutable `187974b/evidence` directory. These local checks do not replace trusted exact-integration CI.
+
+An unchanged real-guest probe was also run on this binary. Python used guest `O_DIRECT`, an aligned mmap buffer, 64 MiB sequential writes/reads with 1 MiB requests, then 4,096 reads of 4 KiB over the first 4 MiB. The hot-region phase includes its initial cold warm-up and is not a pure hit-only benchmark. Every request checked its transfer count; reads checked payload bytes. No guest fsync or host Drain was requested by this probe, so write timing measures admission rather than complete background writeback.
+
+| Guest phase | Buffered baseline MiB/s | d601 MiB/s | Revised 187974b MiB/s | Revised p50 / p99 µs |
+| --- | ---: | ---: | ---: | ---: |
+| Sequential 1 MiB write | 1779.77 | 308.81 | 303.02 | 3780.20 / 6834.05 |
+| Sequential 1 MiB read | 3714.38 | 18.31 | 220.36 | 3753.00 / 17637.55 |
+| 4 KiB hot-region read, initial warm-up included | 232.45 | 64.64 | 59.07 | 15.20 / 371.13 |
+
+This is one probe per source on a shared test host, not a production percentile or parity guarantee. The intermediate uncommitted preview's sequential-read observation (208.72 MiB/s) is superseded for final-head reporting by the immutable-head result above, not silently selected as an extra sample. Guest descriptor segmentation remains unchanged. The probe confirms actual guest sequential-read improvement, while the hot-region throughput and sequential-write rows show that not every metric improved. The buffered baseline still benefits from host file caching beyond the configured COW cache; the uncached DIO reference in the four-way backend comparison remains the relevant separate comparison for physical-path overhead.

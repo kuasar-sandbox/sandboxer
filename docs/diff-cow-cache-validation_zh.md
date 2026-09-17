@@ -140,8 +140,8 @@ trusted exact-integration CI 仍是独立要求。
 `kvm-d601-results.log`，以及 BMS 不可变目录
 `/var/tmp/diff-cow-230-kvm-lb6t8B/d601/evidence`。默认/native 结果位于
 `native-d601-tests.log` 和 `native-d601-full.log`（均退出 0），parent 也确认六包 race
-通过。这些是 d601 的结果，不是最终修订版 KVM 证据。Parent 将在修订提交后构建不可变
-final-head 目录并重跑。通用调用方式仍为：
+通过。这些是 d601 的历史结果；文末另行记录最终修订运行代码的 KVM 证据。
+通用调用方式仍为：
 
 ```sh
 export REQUIRE_KVM=1 TMPDIR=/absolute/disk-backed/task/tmp
@@ -291,6 +291,22 @@ base/hole 边界、未对齐请求、短读预留清理。明/密文恶意输出
 额度、Close、fatal 和未排空快照测试继续通过。仅保留已有
 `TestSendU64Reply_RoundTrip` skip；三个包没有测试文件。
 
-前述四个真实 CH/KVM 通过及 parent native 通过适用于 d601。Final-head CH/KVM 与 trusted
-exact-integration CI 仍需单独证据；parent 将在本提交后从不可变目录重跑 KVM。PR #231
-目前为 d601 的 Draft；此次修订仅本地提交，没有 push 或 merge。
+前述 CH/KVM 及 native 通过适用于 d601；文末记录了不可变修订运行代码187974b 的
+重复验证结果。两个实现修订均已发布至 PR #231；可信 exact-integration CI 仍是独立的
+合入要求。
+
+## 修订运行代码的最终验证
+
+经过独立检视的运行代码及测试适配提交为 `187974bba30b636050a909a7f2ffa0cced85f5f1`（批处理提交为 `c0bbe9e2642a3285d3447bf19d8e56a567b500f5`）。默认构建模式全仓测试、与源码 CI 等价的 `CGO_ENABLED=0` 全仓测试、九个相关包的 race 检查、全仓 vet 和 build 均通过。源码测试使用磁盘支持的 `TMPDIR=/var/tmp`；源码套件及独立 usage 入口现在提供该默认值，同时保留显式覆盖。现有 guestlink 半关闭测试的两个 socket 文件名已缩短，避免超过 Unix socket 路径长度限制，测试行为和断言没有改变。没有新增测试被跳过。
+
+基于该提交的不可变源码归档，四组真实 CH/KVM 用例再次全部通过：`diff_template`、`encrypted_diff`、`snapshot`（包括默认 100 次 CH pause/resume 屏障循环）和 `disks`（根盘、数据盘及本地工作集恢复）。测试在独立 PID、mount、network namespace 中执行，设置 `REQUIRE_KVM=1`，活动文件位于磁盘文件系统。源码归档 SHA-256 为 `1b894ed56e8831aae8d5697d2d2e7bdb4d0b21396d47b5ecbf026a51bd22d1c7`；默认构建模式 sandbox-ctl 二进制 SHA-256 为 `ea19b2b101b86107aca5159cb4b6df4c10338a118c9609fd0fa58d1842fd6bcf`。任务保留了 `kvm-187974b-results.log`、`final-ci-equivalent-tests.log` 及不可变 `187974b/evidence` 目录。这些本地检查不替代可信的 exact-integration CI。
+
+同时用该二进制运行了未修改的真实 guest 探针：Python 使用 guest `O_DIRECT` 和对齐 mmap 缓冲，以 1 MiB 请求顺序写入、读取 64 MiB，然后在前 4 MiB 区域执行 4,096 次 4 KiB 读取。热点区域阶段包含最初的冷数据预热，并不是纯缓存命中基准。所有请求检查完整传输数量，读取检查内容字节。探针没有请求 guest fsync 或宿主 Drain，因此写入计时衡量接收速度，不代表后台回写全部完成。
+
+| Guest 阶段 | Buffered 基线 MiB/s | d601 MiB/s | 修订 187974b MiB/s | 修订 p50 / p99 µs |
+| --- | ---: | ---: | ---: | ---: |
+| 1 MiB 顺序写 | 1779.77 | 308.81 | 303.02 | 3780.20 / 6834.05 |
+| 1 MiB 顺序读 | 3714.38 | 18.31 | 220.36 | 3753.00 / 17637.55 |
+| 4 KiB 热点区域读，包含初始预热 | 232.45 | 64.64 | 59.07 | 15.20 / 371.13 |
+
+每个源码版本仅运行一次该探针，且宿主为共享测试环境，不能作为生产分位数或性能持平保证。未提交中间预览版的顺序读观测（208.72 MiB/s）不再用于最终提交报告，而由上表不可变提交的结果替代；没有把它悄悄挑选成额外样本。Guest descriptor 分段方式保持不变。探针确认实际 guest 顺序读获得改进，但热点区域吞吐和顺序写两行也说明并非每项指标都改善。Buffered 基线仍可使用超过配置 COW 缓存大小的宿主文件缓存；分析实际物理路径额外开销时，应另看四组后端对照中的无缓存 DIO 参考。
