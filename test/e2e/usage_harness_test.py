@@ -7,10 +7,12 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import subprocess
 import socket
 import socketserver
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -27,6 +29,46 @@ import usage_sources
 from usage_ch_relay import CHRelay
 from usage_vsock_relay import UsageHandler, UsageRelay, exact, frame, line
 from usage_report_relay import ReportRelay
+
+
+class HarnessProcessTests(unittest.TestCase):
+    def test_run_returns_only_successful_stdout(self):
+        self.assertEqual(usage.run(sys.executable, "-c",
+            "import sys; print('answer'); print('note', file=sys.stderr)"), "answer\n")
+
+    def test_run_emits_captured_compiler_failure_and_preserves_exception(self):
+        selected = shutil.which(usage.GO)
+        self.assertIsNotNone(selected)
+        diagnostics = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "broken.go"
+            source.write_text("package main\nfunc main() { this is not Go }\n")
+            with patch.object(usage, "GO", selected), patch.object(usage.sys, "stderr", diagnostics), \
+                 self.assertRaises(subprocess.CalledProcessError) as caught:
+                usage.build_probe(Path(directory) / "probe", source)
+        self.assertNotEqual(caught.exception.returncode, 0)
+        self.assertTrue(caught.exception.stderr)
+        self.assertIn(caught.exception.stderr, diagnostics.getvalue())
+        self.assertRegex(diagnostics.getvalue(), r"(syntax error|unexpected name)")
+
+    def test_selected_go_survives_path_reset_and_builds_without_go_mod(self):
+        selected = shutil.which(usage.GO)
+        self.assertIsNotNone(selected)
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "assembled" / "usageprobe" / "main.go"
+            source.parent.mkdir(parents=True)
+            source.write_text("package main\nimport \"fmt\"\nfunc main() { fmt.Print(\"probe\") }\n")
+            output = work / "rootfs" / "probe"
+            output.parent.mkdir()
+            # Model sudo secure_path with a PATH that cannot resolve `go`.
+            with patch.object(usage, "GO", selected), patch.dict(os.environ, {"PATH": "/nonexistent"}):
+                usage.build_probe(output, source)
+                version = usage.run(selected, "version")
+            self.assertTrue(output.is_file())
+            self.assertIn("go version go", version)
+            self.assertFalse((work / "go.mod").exists())
+            self.assertFalse((work / "assembled" / "go.mod").exists())
 
 
 class SourceFaultTests(unittest.TestCase):
