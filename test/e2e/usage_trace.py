@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from usage import BIN, run, write_json
+from usage import BIN, GO, run, write_json
 
 
 def check_pid_namespace(bpftrace):
@@ -73,7 +73,7 @@ class Trace:
         assert 0 < api_offset < 4096
 
         def instructions(function):
-            output = run("go", "tool", "objdump", "-s", "^"+re.escape(function)+"$", binary)
+            output = run(GO, "tool", "objdump", "-s", "^"+re.escape(function)+"$", binary)
             rows = re.findall(r"\s(0x[0-9a-f]+)\s+[0-9a-f]+\s+([^\n]+)", output)
             assert rows, function
             return [(int(address, 16), op.strip()) for address, op in rows]

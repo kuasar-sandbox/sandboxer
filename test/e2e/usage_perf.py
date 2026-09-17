@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 
-from usage import BIN, REPO, Sandbox, digest, ext4, image_ref, run, write_json
+from usage import BIN, GO, REPO, Sandbox, build_probe, digest, ext4, image_ref, run, write_json
 
 
 def percentile(values, q):
@@ -72,7 +72,7 @@ def goroutine_reader():
         ident = f.read(20)
     assert ident[:6] == b"\x7fELF\x02\x01" and struct.unpack_from("<H", ident, 16)[0] == 2, "requires ELF64 LE ET_EXEC"
     symbols = {}
-    for line in run("go", "tool", "nm", BIN / "sandbox-ctl").splitlines():
+    for line in run(GO, "tool", "nm", BIN / "sandbox-ctl").splitlines():
         fields = line.split()
         if len(fields) == 3:
             symbols[fields[2]] = int(fields[0], 16)
@@ -282,7 +282,7 @@ def main():
                 "host_boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                 "clock_ticks_per_second": os.sysconf("SC_CLK_TCK"),
                 "go_runtime_layout": layout, "ch": run(BIN / "cloud-hypervisor", "--version"),
-                "build": run("go", "version", "-m", BIN / "sandbox-ctl"),
+                "build": run(GO, "version", "-m", BIN / "sandbox-ctl"),
                 "artifacts": {n: digest(BIN / n) for n in ("sandbox-ctl", "sandbox-init", "sandbox-runtime.bundle", "vmlinux", "cloud-hypervisor")},
                 "measurement": "descriptive local CH/KVM; common .2s resource/exec probes; trace flag identifies perturbed diagnostics; no production-density inference",
                 "not_measured_here": [] if args.trace else ["wakeups", "allocations", "management traffic", "CH API calls/lock wait", "per-save duration"]}
@@ -297,8 +297,7 @@ def main():
     root.mkdir()
     for path in ("tmp", "proc", "sys", "dev", "data0", "data1"):
         (root / path).mkdir()
-    run("go", "build", "-trimpath", "-o", root / "probe", Path(__file__).parent / "usageprobe/main.go",
-        env={**os.environ, "CGO_ENABLED": "0", "GOWORK": "off"})
+    build_probe(root / "probe")
     image = work / "root.img"
     run(BIN / "flatten-ctl", "export", "--output", image, "--no-progress", root)
     ref, results = image_ref(image), []

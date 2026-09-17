@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-from usage import BIN, Sandbox, digest, ext4, image_ref, kill_host_and_stop_ch, metric, run, write_json
+from usage import BIN, GO, Sandbox, build_probe, digest, ext4, image_ref, kill_host_and_stop_ch, metric, run, write_json
 
 
 def inject(sb, syscall, action):
@@ -88,7 +88,7 @@ def main():
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(path, dest)
         atexit.register(collect)
-    metadata = {"host_kernel": run("uname", "-a"), "build": run("go", "version", "-m", BIN / "sandbox-ctl"),
+    metadata = {"host_kernel": run("uname", "-a"), "build": run(GO, "version", "-m", BIN / "sandbox-ctl"),
                 "ch": run(BIN / "cloud-hypervisor", "--version"), "cases": cases,
                 "artifacts": {n: digest(BIN / n) for n in ("sandbox-ctl", "sandbox-init", "sandbox-runtime.bundle", "vmlinux", "cloud-hypervisor")}}
     write_json(work / "source-set.json", metadata)
@@ -96,8 +96,7 @@ def main():
     root.mkdir()
     for name in ("tmp", "proc", "sys", "dev"):
         (root / name).mkdir()
-    run("go", "build", "-trimpath", "-o", root / "probe", Path(__file__).parent / "usageprobe/main.go",
-        env={**os.environ, "CGO_ENABLED": "0", "GOWORK": "off"})
+    build_probe(root / "probe")
     image = work / "root.img"
     run(BIN / "flatten-ctl", "export", "--output", image, "--no-progress", root)
     ref, results = image_ref(image), []

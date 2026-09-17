@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-from usage import BIN, Sandbox, digest, ext4, image_ref, metric, run, write_json
+from usage import BIN, Sandbox, build_probe, digest, ext4, image_ref, metric, run, write_json
 from usage_ch_relay import CHRelay
 from usage_vsock_relay import UsageRelay
 
@@ -875,8 +875,7 @@ def main():
                 "artifacts": {name: digest(BIN / name) for name in ("sandbox-ctl", "sandbox-init", "sandbox-runtime.bundle", "vmlinux", "cloud-hypervisor")},
                 "tracer": install_tracer(root)}
     write_json(work / "source-set.json", metadata)
-    run("go", "build", "-trimpath", "-o", root / "probe", Path(__file__).parent / "usageprobe/main.go",
-        env={**os.environ, "CGO_ENABLED": "0", "GOWORK": "off"})
+    build_probe(root / "probe")
     image = work / "root.img"
     run(BIN / "flatten-ctl", "export", "--output", image, "--no-progress", root)
     ref = image_ref(image)
