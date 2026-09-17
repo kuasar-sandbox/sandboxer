@@ -610,8 +610,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			return cmd, cleanup, nil
 		},
 
-		// Restore settle (docs/sandbox.md §7 T14-T15): wait for CH's
-		// API, /vm.resume to release the vCPUs from the snapshot point,
+		// Restore settle (docs/sandbox.md §7 T11-T15): wait until vm.info
+		// proves VmRestore completed in Paused state, then use /vm.resume
+		// to release the vCPUs from the snapshot point,
 		// then notify the guest (restore{epoch=1}) and turn that
 		// reverse-channel conn into the stdio MUX. Synchronous — a
 		// non-nil return aborts the run (ServeAndWait kills CH); we
