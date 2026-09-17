@@ -80,6 +80,15 @@ may read/decrypt the active file. Read loading reserves total capacity; if no
 clean slot is available, a bounded foreground workspace can service the read
 without insertion. It never bypasses a newer cached page.
 
+Live and snapshot reads share bounded upper-run batching. Only contiguous cold
+pages of the requested upper range enter a direct read (at most 1 MiB); cache
+hits and base/hole boundaries stop the run. Sorted stripe-range locks prevent
+concurrent writes/discard, while reserved Loading pages prevent eviction. With
+less cache capacity than the run, remaining cold pages bypass caching under the
+same stripes. Read/decrypt stays in the existing private DIO workspace: clean
+pages are populated from that workspace before copying out to mutable caller or
+guest memory. No request-sized payload allocation or base prefetch is added.
+
 Writes acquire total and dirty capacity together before constructing a new page.
 Clean promotion needs only dirty quota; rewriting an unselected dirty page needs
 no extra quota or queue node. Full-page overwrites need no old-data read. First
@@ -97,7 +106,7 @@ not acquire these locks.
 
 ## Writeback and FLUSH
 
-One sandbox worker serves dirty pages in first-dirtied FIFO order. Hot overwrites
+One sandbox worker anchors each batch on the oldest dirty page. Hot overwrites
 do not move a page to the tail. It may batch adjacent dirty pages of the same
 file up to 1 MiB, without filling holes or preallocating gaps. A fixed 1 ms
 aggregation window allows low-rate traffic to progress; quota pressure and
@@ -105,6 +114,12 @@ internal Drain wake it immediately. Selected pages become frozen writeback:
 reads remain possible and same-page writes wait. The worker copies plaintext to
 a bounded batch workspace, encrypts the copy, and performs I/O without cache or
 global locks. Foreground reads have a separate workspace.
+
+The bounded page index supplies contiguous dirty neighbours from the same file,
+regardless of arrival order; unselected FIFO age is unchanged. Ordinary write
+notifications neither end nor restart the fixed aggregation deadline. Pressure
+and Drain interrupt it. An already aggregated backlog proceeds without a new
+1 ms wait per batch, including batches that contain only one page.
 
 A healthy, valid guest **FLUSH is a no-op**. It neither initiates writeback,
 waits for dirty pages nor invokes Drain, fsync or fdatasync. Request ordering and

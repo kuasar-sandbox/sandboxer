@@ -91,9 +91,12 @@ type COWCache struct {
 
 // Hooks are installed before starting the worker, only by deterministic tests.
 type cacheHooks struct {
-	waiting      func()
-	beforeSelect func()
-	beforeWrite  func([]*cachePage) error
+	afterReadCopy func()
+	waiting       func()
+	beforeSelect  func()
+	newTimer      func() (<-chan time.Time, func())
+	aggregating   func()
+	beforeWrite   func([]*cachePage) error
 }
 
 func NewCOWCache(cacheSize, maxDirtySize uint64) (*COWCache, error) {
@@ -103,7 +106,7 @@ func newCOWCache(size, dirty uint64, hooks cacheHooks) (*COWCache, error) {
 	if size == 0 || dirty == 0 || dirty > size || size%cowBlockSize != 0 || dirty%cowBlockSize != 0 || size > uint64(int(^uint(0)>>1)) {
 		return nil, fmt.Errorf("vhost: COW cache sizes must be positive 4 KiB multiples with max_dirty_size <= cache_size")
 	}
-	c := &COWCache{capacity: int(size / cowBlockSize), maxDirty: int(dirty / cowBlockSize), pages: make(map[cacheKey]*cachePage), clients: make(map[*BlockCOW]int), changed: make(chan struct{}), kick: make(chan struct{}, 1), done: make(chan struct{}), hooks: hooks}
+	c := &COWCache{capacity: int(size / cowBlockSize), maxDirty: int(dirty / cowBlockSize), pages: make(map[cacheKey]*cachePage), clients: make(map[*BlockCOW]int), kick: make(chan struct{}, 1), done: make(chan struct{}), hooks: hooks}
 	go c.run()
 	return c, nil
 }
@@ -130,7 +133,21 @@ func (c *COWCache) attach(cow *BlockCOW) error {
 	c.clients[cow] = 0
 	return nil
 }
-func (c *COWCache) signalLocked() { close(c.changed); c.changed = make(chan struct{}) }
+
+// Allocate a broadcast generation only when someone actually waits. Hot page
+// publication need not allocate a channel for a nonexistent waiter.
+func (c *COWCache) changeLocked() <-chan struct{} {
+	if c.changed == nil {
+		c.changed = make(chan struct{})
+	}
+	return c.changed
+}
+func (c *COWCache) signalLocked() {
+	if c.changed != nil {
+		close(c.changed)
+		c.changed = nil
+	}
+}
 func (c *COWCache) kickLocked(urgent bool) {
 	c.urgent = c.urgent || urgent
 	select {
@@ -148,7 +165,7 @@ func (c *COWCache) checkLocked(ctx context.Context) error {
 	return ctx.Err()
 }
 func (c *COWCache) waitLocked(ctx context.Context) error {
-	ch := c.changed
+	ch := c.changeLocked()
 	if c.hooks.waiting != nil {
 		c.hooks.waiting()
 	}
@@ -207,35 +224,55 @@ func (c *COWCache) releaseLocked(p *cachePage) {
 	c.free = append(c.free, p)
 }
 
-// read is called with the foreground block stripe held. Copies on hits occur
-// under mu; slow misses and bypass reads perform disk I/O after dropping it.
+// read is called with every foreground stripe for this upper-only range held.
+// Hits copy under mu; cold full-page runs reserve bounded Loading entries, then
+// use the existing DIO workspace outside mu. Stripes prevent writes/discard even
+// when a full cache requires bypass; Loading entries cannot be evicted.
 func (c *COWCache) read(ctx context.Context, cow *BlockCOW, buf []byte, offset int64) (int, error) {
-	key := cacheKey{cow, offset / cowBlockSize}
-	for {
+	done := 0
+	for done < len(buf) {
+		pos := offset + int64(done)
+		key := cacheKey{cow, pos / cowBlockSize}
+		length := min(len(buf)-done, cowBlockSize-int(pos%cowBlockSize))
 		c.mu.Lock()
 		if err := c.checkLocked(ctx); err != nil {
 			c.mu.Unlock()
-			return 0, err
+			return done, err
 		}
 		if p := c.pages[key]; p != nil {
 			if p.state == cacheLoading || p.state == cacheConstructing || p.state == cacheDiscarding {
 				if err := c.waitLocked(ctx); err != nil {
-					return 0, err
+					return done, err
 				}
 				continue
 			}
-			copy(buf, p.data[offset%cowBlockSize:])
+			copy(buf[done:done+length], p.data[pos%cowBlockSize:])
 			if p.state == cacheClean {
 				c.clean.remove(p)
 				c.clean.push(p)
 			}
 			c.mu.Unlock()
-			return len(buf), nil
+			done += length
+			continue
 		}
+		if pos%cowBlockSize == 0 && length == cowBlockSize {
+			n, err := c.readColdRunLocked(ctx, cow, buf[done:], pos)
+			done += n
+			if err != nil {
+				return done, err
+			}
+			continue
+		}
+		// Partial edges retain full-page loading without allocating a request buffer.
 		p := c.reserveLocked(key, false)
 		c.mu.Unlock()
 		if p == nil {
-			return cow.diff.ReadAt(buf, offset)
+			n, err := cow.diff.ReadAt(buf[done:done+length], pos)
+			done += n
+			if err != nil {
+				return done, err
+			}
+			continue
 		}
 		err := readFullAt(cow.diff, p.data[:], key.block*cowBlockSize)
 		c.mu.Lock()
@@ -244,17 +281,72 @@ func (c *COWCache) read(ctx context.Context, cow *BlockCOW, buf []byte, offset i
 		}
 		if err != nil {
 			c.releaseLocked(p)
-			c.signalLocked()
-			c.mu.Unlock()
-			return 0, err
+		} else {
+			p.state = cacheClean
+			c.clean.push(p)
+			copy(buf[done:done+length], p.data[pos%cowBlockSize:])
 		}
-		p.state = cacheClean
-		c.clean.push(p)
-		copy(buf, p.data[offset%cowBlockSize:])
 		c.signalLocked()
 		c.mu.Unlock()
-		return len(buf), nil
+		if err != nil {
+			return done, err
+		}
+		done += length
 	}
+	return done, nil
+}
+
+// Starts at a missing aligned page, with mu held; returns with it unlocked.
+// Only the requested cold run is read. No dirty, writeback, loading, clean hit,
+// base page or hole is included. The fixed pointer array adds no payload buffer.
+func (c *COWCache) readColdRunLocked(ctx context.Context, cow *BlockCOW, buf []byte, offset int64) (int, error) {
+	var reserved [maxDiffScratchSize / cowBlockSize]*cachePage
+	count := 0
+	for count < min(len(reserved), len(buf)/cowBlockSize) {
+		key := cacheKey{cow, offset/cowBlockSize + int64(count)}
+		if c.pages[key] != nil {
+			break
+		}
+		reserved[count] = c.reserveLocked(key, false)
+		count++
+	}
+	c.mu.Unlock()
+	length := count * cowBlockSize
+	err := cow.diff.withDirectRead(length, offset, func(plain []byte) error {
+		c.mu.Lock()
+		if err := c.checkLocked(ctx); err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		for i, p := range reserved[:count] {
+			if p == nil {
+				continue
+			}
+			copy(p.data[:], plain[i*cowBlockSize:(i+1)*cowBlockSize])
+			p.state = cacheClean
+			c.clean.push(p)
+		}
+		c.signalLocked()
+		c.mu.Unlock()
+		// Publish from private plaintext before exposing any bytes to the caller.
+		copy(buf[:length], plain)
+		if c.hooks.afterReadCopy != nil {
+			c.hooks.afterReadCopy()
+		}
+		return nil
+	})
+	if err != nil {
+		c.mu.Lock()
+		for _, p := range reserved[:count] {
+			if p != nil {
+				c.releaseLocked(p)
+			}
+		}
+		c.signalLocked()
+		c.mu.Unlock()
+		return 0, err
+	}
+	return length, nil
 }
 
 // A foreground writer drops its block stripe before sleeping. The wake channel
@@ -264,7 +356,7 @@ type cacheRetry struct{ wake <-chan struct{} }
 
 func (*cacheRetry) Error() string { return "vhost: retry cache admission" }
 func (c *COWCache) retryLocked() error {
-	retry := &cacheRetry{c.changed}
+	retry := &cacheRetry{c.changeLocked()}
 	if c.hooks.waiting != nil {
 		c.hooks.waiting()
 	}
@@ -343,6 +435,7 @@ func (c *COWCache) run() {
 	buffer := make([]byte, maxWritebackPages*cowBlockSize)
 	defer clear(buffer)
 	batch := make([]*cachePage, 0, maxWritebackPages)
+	aggregated := false
 	for {
 		c.mu.Lock()
 		if c.err != nil || c.closed {
@@ -350,26 +443,19 @@ func (c *COWCache) run() {
 			return
 		}
 		if c.dirty.first == nil {
+			aggregated = false
 			c.mu.Unlock()
 			<-c.kick
 			continue
 		}
-		urgent := c.urgent
-		c.urgent = false
+		wait := !aggregated && !c.urgent
 		c.mu.Unlock()
-		if !urgent {
-			timer := time.NewTimer(time.Millisecond)
-			select {
-			case <-timer.C:
-			case <-c.kick:
-			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+		if wait {
+			c.aggregate()
 		}
+		// A burst gets one fixed window. Drain an existing backlog immediately,
+		// including noncontiguous singletons, instead of sleeping per batch.
+		aggregated = true
 		if c.hooks.beforeSelect != nil {
 			c.hooks.beforeSelect()
 		}
@@ -378,17 +464,29 @@ func (c *COWCache) run() {
 			c.mu.Unlock()
 			return
 		}
+		c.urgent = false
 		batch = batch[:0]
-		for p := c.dirty.first; p != nil && len(batch) < maxWritebackPages; p = c.dirty.first {
-			if len(batch) > 0 {
-				last := batch[len(batch)-1]
-				if p.key.cow != last.key.cow || p.key.block != last.key.block+1 {
+		if anchor := c.dirty.first; anchor != nil {
+			// Always include the oldest page, then find contiguous dirty neighbours
+			// in the bounded index regardless of arrival order. Unselected FIFO age
+			// is untouched. Scan at most one batch backwards and forwards.
+			first := anchor
+			for lenBack := 1; lenBack < maxWritebackPages && first.key.block > 0; lenBack++ {
+				p := c.pages[cacheKey{anchor.key.cow, first.key.block - 1}]
+				if p == nil || p.state != cacheDirty {
 					break
 				}
+				first = p
 			}
-			c.dirty.remove(p)
-			p.state = cacheWriteback
-			batch = append(batch, p)
+			for block := first.key.block; len(batch) < maxWritebackPages; block++ {
+				p := c.pages[cacheKey{anchor.key.cow, block}]
+				if p == nil || p.state != cacheDirty {
+					break
+				}
+				c.dirty.remove(p)
+				p.state = cacheWriteback
+				batch = append(batch, p)
+			}
 		}
 		if len(batch) == 0 {
 			c.mu.Unlock()
@@ -447,6 +545,37 @@ func (c *COWCache) run() {
 		}
 	}
 }
+
+// Ordinary kicks do not shorten or restart the aggregation deadline. Pressure,
+// Drain, failure and Close interrupt it. Tests supply a manually fired timer.
+func (c *COWCache) aggregate() {
+	var deadline <-chan time.Time
+	var stop func()
+	if c.hooks.newTimer != nil {
+		deadline, stop = c.hooks.newTimer()
+	} else {
+		timer := time.NewTimer(time.Millisecond)
+		deadline, stop = timer.C, func() { timer.Stop() }
+	}
+	defer stop()
+	for {
+		c.mu.Lock()
+		urgent := c.urgent || c.err != nil || c.closed
+		c.mu.Unlock()
+		if urgent {
+			return
+		}
+		if c.hooks.aggregating != nil {
+			c.hooks.aggregating()
+		}
+		select {
+		case <-deadline:
+			return
+		case <-c.kick:
+		}
+	}
+}
+
 func (c *COWCache) failLocked(err error) func(error) {
 	if c.err != nil {
 		return nil

@@ -3,8 +3,9 @@
 # Issue #230 验证观测
 
 [缓存/direct I/O 契约](diff-cow-cache_zh.md) 为活动 diff 内存设定上限，同时改变 I/O 完成边界
-和性能。以下测量显示文件 page-cache 驻留降低，但在本存储上，相比 buffered 基线存在显著
-吞吐回退。这些是观测，不是性能目标，也不代表 KVM E2E 通过。
+和性能。以下原始 d601fa0 测量显示文件 page-cache 驻留降低，但在本存储上，相比 buffered
+基线存在显著吞吐回退。保留这些历史观测，不作为性能目标。修订版测量及 parent 独立提供的
+d601 CH/KVM 证据在下文单独记录。
 
 ## 环境与方法
 
@@ -16,7 +17,7 @@ TMPDIR，因为部分已有 Unix-socket fixture 在长 TMPDIR 下超出路径限
 比较 canonical 路径。没有为此弱化任何测试。
 
 B 为精确 main `b1db083dee2cacac141d4033bbf41b518cf80c9e`，仅加入相同 benchmark harness
-和基线 adapter。C 为本 issue 实现，使用默认共享总量 32 MiB / 脏子集 16 MiB。
+和基线 adapter。历史 C 为 `d601fa0`，即本 issue 的初版实现，使用默认共享总量 32 MiB / 脏子集 16 MiB。
 [公共 harness](../pkg/vhost/blk_cow_workingset_bench_test.go) 在两版本中保持相同，搭配
 [候选 adapter](../pkg/vhost/cow_cache_bench_adapter_test.go) 或以下基线替代文件：
 
@@ -52,7 +53,7 @@ Setup 不计入耗时与 I/O 差值。请求延迟包含额度等待；admission
 两版本都没有为比较强制 fsync、DONTNEED 或 drop_caches。读样本有意保留 B 自然变热的
 文件缓存。新文件元数据初始化在测量外保留原有 sync 行为；guest FLUSH、回写和 Drain 不增加 sync。
 
-## 耗时、吞吐与请求延迟
+## d601 历史耗时、吞吐与请求延迟
 
 在所示精度下 B admission 与 total 相等。吞吐为逻辑 MiB 除以 total；p50/p99 对应单个请求，
 不包括 Drain 本身。
@@ -74,7 +75,7 @@ Setup 不计入耗时与 I/O 差值。请求延迟包含额度等待；admission
 | `random-read` | true | 1.155 | 17.46 | 17.46 | 221.6 / 14.66 | 17.49 / 19.24 | 218.1 / 614.5 |
 | `multi-disk` | true | 1.182 | 1.939 | 2.069 | 216.5 / 123.7 | 4602 / 4796 | 7916 / 11218 |
 
-## 流量与内存证据
+## d601 历史流量与内存证据
 
 Body write 是成功活动 body syscall 的字节数，不含 setup。`proc write` / `proc read`
 是 Linux `/proc/self/io` 中 `write_bytes` / `read_bytes` 的差值；属于文件系统 I/O 记账，
@@ -128,13 +129,19 @@ Discard、Close 和粘性错误。真实磁盘测试覆盖对齐、mmap buffer�
 Broader suite 保留一个已有 skip：`TestSendU64Reply_RoundTrip` 使用 net.Pipe 而非 UnixConn，
 并注明由 `TestParseSetMemTable_Layout` 间接覆盖。另三个包没有测试文件。没有跳过新增测试。
 本磁盘环境实际验证的是 ext4，而非真实 XFS 挂载；旧模式拒绝有确定性单测覆盖。
-RocksDB/native 变体与 trusted exact-integration CI 仍是独立检查。
+Parent 随后在不可变的 `d601fa0` 上通过默认 tag 的 targeted/全仓测试、vet、build
+和六包 race，`GOFLAGS` 为空、`CGO_ENABLED=1`。该版本原先的 native 检查缺口已关闭；
+trusted exact-integration CI 仍是独立要求。
 
-以 `REQUIRE_KVM=1` 尝试 `diff_template`、`encrypted_diff`、`snapshot`、`disks`，均因缺少
-任务内 `bin/cloud-hypervisor` 前置依赖而退出 **1**。`/dev/kvm` 存在，但任务没有组装好的
-CH/runtime/kernel BIN，BMS 命令 PATH 中也没有 cargo/rustc。没有借用其他运行中 worktree 的
-内容，也没有全局安装。这是验证阻碍，不是四个通过或静默跳过的 E2E。准备好满足仓库 patched
-VMM/runtime 要求的可信 BIN 后，执行：
+最初以 `REQUIRE_KVM=1` 尝试 `diff_template`、`encrypted_diff`、`snapshot`、`disks`，
+均因缺少任务内 `bin/cloud-hypervisor` 前置依赖而退出 **1**。保留这些失败尝试记录，
+但**制品缺失阻碍现已解除**：parent 组装任务专用 CH/runtime/kernel BIN 后，在精确
+`d601fa0` 上运行了全部四个真实 CH/KVM case，均退出 **0**。证据位于任务的
+`kvm-d601-results.log`，以及 BMS 不可变目录
+`/var/tmp/diff-cow-230-kvm-lb6t8B/d601/evidence`。默认/native 结果位于
+`native-d601-tests.log` 和 `native-d601-full.log`（均退出 0），parent 也确认六包 race
+通过。这些是 d601 的结果，不是最终修订版 KVM 证据。Parent 将在修订提交后构建不可变
+final-head 目录并重跑。通用调用方式仍为：
 
 ```sh
 export REQUIRE_KVM=1 TMPDIR=/absolute/disk-backed/task/tmp
@@ -145,3 +152,145 @@ done
 ```
 
 发布/合并前仍须独立 review 及正常 exact-integration CI；这些本地观测不能替代它们。
+
+## 修订后的批处理测量
+
+以下是在同一 host、磁盘、256 MiB 数据模式、请求大小和 32/16 MiB 限额下新执行的完整
+顺序测量。B 仍为精确 `b1db083`，d601 为精确 `d601fa0`，C 为与本报告同一提交的局部
+修订，D 为**仅供测试的无缓存同步 direct-I/O 参考**。公共 harness 新增实际 body 调用
+计数；B 和 d601 使用隔离归档的生产源码及相同 harness。每个模式均完整执行全部 14 个
+case 一次。上面的原始测量保持不变，没有挑选更快样本。
+
+D 使用相同的活动 diff、direct 对齐工作区和 XTS 编码；首次 512 字节写仍构造完整 4 KiB
+页。它不保留明文缓存页，写入同步完成。该参考不是可选的生产缓存模式。读取前的预填充也
+使用 DIO，从而避免把有界缓存 miss 与 B 自然保留的 256 MiB warm 内核缓存混为一谈。
+Setup 仍在计时之外；B 完成仍表示 buffered 接收，不表示介质持久化。测量没有调用 fsync、
+DONTNEED 或 drop_caches。所有原始报告指标（含 `/proc/self/io`）保存于
+[修订数据](diff-cow-cache-revision-data.json)。
+
+运行使用任务的 `run-bms-check` helper、canonical 磁盘 TMPDIR `/var/q`，`GOFLAGS`
+为空、`CGO_ENABLED=1`。Benchmark 使用 `-tags no_rocksdb`，与原始比较保持一致。
+在各源码上按前文运行公共 benchmark；D 改用 `-bench '^BenchmarkCOWDirectWorkingSet$'`，
+其余参数相同。参考实现位于
+[cow_direct_workingset_bench_test.go](../pkg/vhost/cow_direct_workingset_bench_test.go)。
+
+### 总耗时与吞吐
+
+每格为**含 Drain 秒数 / 逻辑 MiB/s**。D 没有待处理队列；B 和 D 的 admission 与 total
+在显示精度下相同。
+
+| 工作负载 | XTS | B | d601 | C | D |
+| --- | --- | --- | --- | --- | --- |
+| `seq-write` | false | 0.132 / 1939 | 1.135 / 225.5 | 1.303 / 196.5 | 1.193 / 214.5 |
+| `random-4k` | false | 0.1841 / 1390 | 29.86 / 8.574 | 29.64 / 8.637 | 29.09 / 8.801 |
+| `partial-512` | false | 0.2966 / 107.9 | 29.39 / 1.089 | 29.76 / 1.075 | 29.24 / 1.094 |
+| `hot-overwrite` | false | 0.06408 / 3995 | 3.908 / 65.5 | 2.994 / 85.51 | 25.82 / 9.916 |
+| `seq-read` | false | 0.0814 / 3145 | 13.89 / 18.43 | 1.345 / 190.3 | 1.199 / 213.6 |
+| `random-read` | false | 0.1086 / 2358 | 15.86 / 16.14 | 16.26 / 15.74 | 16.2 / 15.8 |
+| `multi-disk` | false | 0.1295 / 1976 | 1.052 / 243.4 | 1.057 / 242.2 | 1.005 / 254.7 |
+| `seq-write` | true | 1.196 / 214 | 1.903 / 134.5 | 2.304 / 111.1 | 2.036 / 125.7 |
+| `random-4k` | true | 1.228 / 208.4 | 30.94 / 8.273 | 30.65 / 8.353 | 30.5 / 8.392 |
+| `partial-512` | true | 1.383 / 23.14 | 31.04 / 1.031 | 30.83 / 1.038 | 30.41 / 1.052 |
+| `hot-overwrite` | true | 1.154 / 221.9 | 4.061 / 63.04 | 3.092 / 82.78 | 26.52 / 9.653 |
+| `seq-read` | true | 1.176 / 217.7 | 14.75 / 17.36 | 2.241 / 114.2 | 2.109 / 121.4 |
+| `random-read` | true | 1.142 / 224.2 | 16.93 / 15.12 | 17.09 / 14.98 | 17.6 / 14.55 |
+| `multi-disk` | true | 1.182 / 216.7 | 2.061 / 124.2 | 2.064 / 124.1 | 2.007 / 127.5 |
+
+### 接收耗时与请求延迟
+
+每格为 **admission 秒数 / p50 µs / p99 µs**。百分位针对前台请求；上表 total 包含剩余 Drain。
+
+| 工作负载 | XTS | B | d601 | C | D |
+| --- | --- | --- | --- | --- | --- |
+| `seq-write` | false | 0.132 / 499.8 / 679.8 | 1.083 / 3229 / 6952 | 1.23 / 4089 / 6676 | 1.193 / 3791 / 6061 |
+| `random-4k` | false | 0.1841 / 2.595 / 4.918 | 28.03 / 395.2 / 1586 | 27.79 / 392.6 / 1526 | 29.09 / 389 / 1714 |
+| `partial-512` | false | 0.2966 / 3.725 / 12.64 | 27.54 / 390.4 / 1545 | 27.89 / 393.5 / 1675 | 29.24 / 392.2 / 1641 |
+| `hot-overwrite` | false | 0.06408 / 0.826 / 1.747 | 2.145 / 1.103 / 441.9 | 1.575 / 0.794 / 432.2 | 25.82 / 351.2 / 1092 |
+| `seq-read` | false | 0.0814 / 301.2 / 420.6 | 13.89 / 5.332e+04 / 6.724e+04 | 1.345 / 4019 / 5646 | 1.199 / 3018 / 4378 |
+| `random-read` | false | 0.1086 / 1.566 / 2.264 | 15.86 / 193.7 / 576.6 | 16.26 / 197.9 / 645.8 | 16.2 / 195.6 / 645.7 |
+| `multi-disk` | false | 0.1295 / 496.8 / 585.7 | 0.994 / 3792 / 6981 | 0.9919 / 3982 / 5933 | 1.005 / 3805 / 6917 |
+| `seq-write` | true | 1.196 / 4645 / 4942 | 1.788 / 7246 / 1.226e+04 | 2.164 / 7982 / 1.014e+04 | 2.036 / 7716 / 1.199e+04 |
+| `random-4k` | true | 1.228 / 18.43 / 22.66 | 28.94 / 409.8 / 1693 | 28.72 / 410 / 1652 | 30.5 / 406.8 / 1736 |
+| `partial-512` | true | 1.383 / 20.25 / 29.16 | 29.1 / 412.1 / 1788 | 28.94 / 409.9 / 1809 | 30.41 / 406.7 / 1737 |
+| `hot-overwrite` | true | 1.154 / 16.84 / 27.2 | 2.191 / 0.979 / 460.8 | 1.626 / 0.74 / 440 | 26.52 / 361.7 / 1155 |
+| `seq-read` | true | 1.176 / 4473 / 5663 | 14.75 / 5.683e+04 / 6.944e+04 | 2.241 / 8724 / 1.095e+04 | 2.109 / 8379 / 1.025e+04 |
+| `random-read` | true | 1.142 / 17.26 / 20.98 | 16.93 / 211 / 590 | 17.09 / 211.3 / 618.1 | 17.6 / 217 / 641.1 |
+| `multi-disk` | true | 1.182 / 4604 / 4789 | 1.933 / 7956 / 1.027e+04 | 1.937 / 7979 / 1.011e+04 | 2.007 / 7755 / 1.104e+04 |
+
+### 实际 body 调用与字节量
+
+每格为**读调用数/读取 MiB；写调用数/写入 MiB**，不含 setup。这些是活动 body syscall，
+不代表设备持久化或更底层的放大率。
+
+| 工作负载 | XTS | B | d601 | C | D |
+| --- | --- | --- | --- | --- | --- |
+| `seq-write` | false | 0/0; 65536/256 | 0/0; 257/256 | 0/0; 256/256 | 0/0; 256/256 |
+| `random-4k` | false | 0/0; 65536/256 | 0/0; 65536/256 | 0/0; 65536/256 | 0/0; 65536/256 |
+| `partial-512` | false | 0/0; 65536/256 | 0/0; 65536/256 | 0/0; 65536/256 | 0/0; 65536/256 |
+| `hot-overwrite` | false | 0/0; 65536/256 | 0/0; 9103/35.56 | 0/0; 6493/41.41 | 0/0; 65536/256 |
+| `seq-read` | false | 65536/256; 0/0 | 65536/256; 0/0 | 256/256; 0/0 | 256/256; 0/0 |
+| `random-read` | false | 65536/256; 0/0 | 65002/253.9; 0/0 | 65002/253.9; 0/0 | 65536/256; 0/0 |
+| `multi-disk` | false | 0/0; 65536/256 | 0/0; 257/256 | 0/0; 256/256 | 0/0; 256/256 |
+| `seq-write` | true | 0/0; 65536/256 | 0/0; 257/256 | 0/0; 256/256 | 0/0; 256/256 |
+| `random-4k` | true | 0/0; 65536/256 | 0/0; 65536/256 | 0/0; 65536/256 | 0/0; 65536/256 |
+| `partial-512` | true | 0/0; 65536/256 | 0/0; 65536/256 | 0/0; 65536/256 | 0/0; 65536/256 |
+| `hot-overwrite` | true | 0/0; 65536/256 | 0/0; 9094/35.52 | 0/0; 6533/42.02 | 0/0; 65536/256 |
+| `seq-read` | true | 65536/256; 0/0 | 65536/256; 0/0 | 256/256; 0/0 | 256/256; 0/0 |
+| `random-read` | true | 65536/256; 0/0 | 65002/253.9; 0/0 | 65002/253.9; 0/0 | 65536/256; 0/0 |
+| `multi-disk` | true | 0/0; 65536/256 | 0/0; 257/256 | 0/0; 256/256 | 0/0; 256/256 |
+
+### 内存与分配证据
+
+范围覆盖全部 14 个 case；峰值含预填充。缓存计数表示共享 payload 预算，不是 RSS；
+进程 heap/RSS 还包含元数据、固定映射、harness buffer 和分配器保留空间。D 保留常规
+ diff/owner 结构，但不接收明文缓存页。`proc` 列是文件系统记账范围，不是设备级完成；
+JSON 保留每个 case。所有测量的 `cancelled_write_bytes` 差值为零。mincore 不包含
+base/template、export 或 guest 内存驻留。
+
+| 模式 | mincore MiB | 缓存 / 脏峰值 MiB | 结束脏量 MiB | HeapInuse MiB | RSS MiB | proc read / write MiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| B | 256–256 | — | — | 3.336–5.945 | 18.65–25.33 | 0–0 / 0–256 |
+| d601 | 0–0 | 32–32 / 16–16 | 0–0 | 45.67–66.08 | 71.45–94.88 | 0–256 / 0–256 |
+| C | 0–0 | 32–32 / 16–16 | 0–0 | 43.9–51.88 | 65.71–80.21 | 0–256 / 0–256 |
+| D | 0–0 | — | — | 4.602–8.617 | 32.29–38.02 | 0–256 / 0–256 |
+
+聚焦的 `BenchmarkCOWCacheHot` 在两个源码版本上每条路径运行三个样本。表中使用 ns/op
+中位数，三个样本的分配计数相同。无等待者的通知现在仅在等待者注册时创建广播 channel；
+普通/background-context 命中避免完成回调闭包和不必要的 context 合并。可取消请求仍通过
+AfterFunc 将取消与 Close 合并，保留五次分配，本次样本略慢。未牺牲取消保证以换取不可取消
+路径的速度。
+
+| 路径 | d601 ns/op; B/op; allocs/op | C ns/op; B/op; allocs/op |
+| --- | --- | --- |
+| `context=nil` | 216.2; 16; 1 | 199.2; 0; 0 |
+| `context=background` | 724.7; 256; 5 | 203.4; 0; 0 |
+| `context=cancelable` | 830.3; 256; 5 | 852.3; 248; 5 |
+| `signal-without-waiters` | 100.9; 112; 1 | 15.68; 0; 0 |
+
+### 解读与验证
+
+256 MiB 冷顺序读现使用 256 次 body syscall，d601 为 65,536 次。C 测得明文 190.3 MiB/s、
+密文 114.2 MiB/s；D 分别为 213.6 和 121.4。剩余缓存/索引/复制成本和存储波动仍可见。
+C 仍显著慢于 warm buffered B。部分顺序写耗时也较本次 d601 样本变差（明文 1.303 秒，
+d601 为 1.135 秒）。随机排列下同时为脏的邻页很少：d601 和 C 仍发出 65,536 次写入。
+C 的随机写和部分写总耗时仍接近 D 的物理 I/O 参考，而非逼近 buffered B。热点覆盖的写
+调用从 9,103 降到 6,493/6,533（明/密文），总耗时降至 2.994/3.092 秒。这些是单次样本，
+不是置信区间，也不声称跨硬件性能一致。
+
+`processChain` 仍逐个 guest descriptor segment 调用后端。1 MiB host ReadAt 可以使用
+新批处理；一系列 4 KiB guest segment 仍可能分别执行冷读。本 benchmark 未测 guest
+顺序吞吐；此次修订没有新增 virtqueue gather/scatter、readahead、MQ 或 io_uring 改动。
+
+修订通过默认 tag 的 `go test -json -count=1 -timeout 180s ./...`（29 个有测试包）、
+六包 `-race`、`go vet ./...` 和 `go build ./...`，均通过 helper 执行，`GOFLAGS` 为空、
+`CGO_ENABLED=1`。Cache race 子集另通过十次重复。新增确定性测试覆盖手动聚合截止时间、
+非紧急通知、压力/Drain 推进、积压单页不逐批等待、乱序空间合并和最老页公平性、有界
+syscall 数、容量小于区间、cached/dirty/writeback/loading 混合、重叠读取、取消、
+base/hole 边界、未对齐请求、短读预留清理。明/密文恶意输出修改测试确认 clean 缓存内容
+在 copyout 前来自拥有所有权的 DIO 映射，从不信任可变 guest/调用者输出。Guest FLUSH、
+额度、Close、fatal 和未排空快照测试继续通过。仅保留已有
+`TestSendU64Reply_RoundTrip` skip；三个包没有测试文件。
+
+前述四个真实 CH/KVM 通过及 parent native 通过适用于 d601。Final-head CH/KVM 与 trusted
+exact-integration CI 仍需单独证据；parent 将在本提交后从不可变目录重跑 KVM。PR #231
+目前为 d601 的 Draft；此次修订仅本地提交，没有 push 或 merge。

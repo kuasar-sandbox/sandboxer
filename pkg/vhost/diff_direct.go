@@ -207,27 +207,41 @@ func (d *diffFile) enableDirect() error {
 	return nil
 }
 
-func (d *diffFile) directReadAt(buf []byte, offset int64) (int, error) {
+// withDirectRead keeps plaintext in the fixed owned mapping until consume has
+// published any cache pages and copied out. Caller/guest memory is never a
+// trusted source for clean cache contents. consume must not retain the slice.
+func (d *diffFile) withDirectRead(length int, offset int64, consume func([]byte) error) error {
 	d.direct.readMu.Lock()
 	defer d.direct.readMu.Unlock()
 	if d.direct.read.bytes == nil {
-		return 0, os.ErrClosed
+		return os.ErrClosed
 	}
-	used := 0
-	defer func() { clear(d.direct.read.bytes[:used]) }()
+	start := offset / cowBlockSize * cowBlockSize
+	end := alignUp(offset+int64(length), cowBlockSize)
+	if length <= 0 || end-start > maxDiffScratchSize {
+		return fmt.Errorf("vhost: invalid bounded direct read length %d", length)
+	}
+	scratch := d.direct.read.bytes[:int(end-start)]
+	defer clear(scratch)
+	if err := readFullAt(d.bodyIO, scratch, d.bodyOffset+start); err != nil {
+		return err
+	}
+	d.cryptUnits(scratch, start, false)
+	return consume(scratch[offset-start : offset-start+int64(length)])
+}
+
+func (d *diffFile) directReadAt(buf []byte, offset int64) (int, error) {
 	done := 0
 	for done < len(buf) {
 		pos := offset + int64(done)
-		start := pos / cowBlockSize * cowBlockSize
-		length := min(len(buf)-done, maxDiffScratchSize-int(pos-start))
-		end := alignUp(pos+int64(length), cowBlockSize)
-		scratch := d.direct.read.bytes[:int(end-start)]
-		used = max(used, len(scratch))
-		if err := readFullAt(d.bodyIO, scratch, d.bodyOffset+start); err != nil {
+		length := min(len(buf)-done, maxDiffScratchSize-int(pos%cowBlockSize))
+		err := d.withDirectRead(length, pos, func(plain []byte) error {
+			copy(buf[done:done+length], plain)
+			return nil
+		})
+		if err != nil {
 			return done, err
 		}
-		d.cryptUnits(scratch, start, false)
-		copy(buf[done:done+length], scratch[pos-start:pos-start+int64(length)])
 		done += length
 	}
 	return done, nil

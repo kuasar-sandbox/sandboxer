@@ -21,21 +21,26 @@ import (
 // -benchtime=1x: each case transfers across a 256 MiB working set, 8x defaults.
 type workingSetCache struct {
 	options []BlockCOWOption
+	readAt  func(*BlockCOW, []byte, int64) (int, error)
+	writeAt func(*BlockCOW, []byte, int64) (int, error)
 	drain   func() error
 	stats   func() map[string]float64
 	close   func() error
 }
 type workingSetIO struct {
 	diffBodyIO
-	writes, reads atomic.Uint64
+	writes, reads         atomic.Uint64
+	writeCalls, readCalls atomic.Uint64
 }
 
 func (p *workingSetIO) WriteAt(buf []byte, off int64) (int, error) {
+	p.writeCalls.Add(1)
 	n, err := p.diffBodyIO.WriteAt(buf, off)
 	p.writes.Add(uint64(n))
 	return n, err
 }
 func (p *workingSetIO) ReadAt(buf []byte, off int64) (int, error) {
+	p.readCalls.Add(1)
 	n, err := p.diffBodyIO.ReadAt(buf, off)
 	p.reads.Add(uint64(n))
 	return n, err
@@ -44,21 +49,27 @@ func (p *workingSetIO) ReadAt(buf []byte, off int64) (int, error) {
 func BenchmarkCOWWorkingSet(b *testing.B) {
 	for _, encrypted := range []bool{false, true} {
 		for _, work := range []string{"seq-write", "random-4k", "partial-512", "hot-overwrite", "seq-read", "random-read", "multi-disk"} {
-			b.Run(fmt.Sprintf("%s/encrypted=%t", work, encrypted), func(b *testing.B) { benchmarkCOWWorkingSet(b, work, encrypted) })
+			b.Run(fmt.Sprintf("%s/encrypted=%t", work, encrypted), func(b *testing.B) { benchmarkCOWWorkingSet(b, work, encrypted, newWorkingSetCache) })
 		}
 	}
 }
-func benchmarkCOWWorkingSet(b *testing.B, work string, encrypted bool) {
+func benchmarkCOWWorkingSet(b *testing.B, work string, encrypted bool, factory func() (workingSetCache, error)) {
 	const dataset = 256 << 20
 	disks := 1
 	if work == "multi-disk" {
 		disks = 2
 	}
-	group, err := newWorkingSetCache()
+	group, err := factory()
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer group.close()
+	if group.readAt == nil {
+		group.readAt = (*BlockCOW).ReadAt
+	}
+	if group.writeAt == nil {
+		group.writeAt = (*BlockCOW).WriteAt
+	}
 	cows := make([]*BlockCOW, disks)
 	ios := make([]*workingSetIO, disks)
 	for i := range cows {
@@ -82,7 +93,7 @@ func benchmarkCOWWorkingSet(b *testing.B, work string, encrypted bool) {
 	if reads || work == "hot-overwrite" {
 		for _, cow := range cows {
 			for off := int64(0); off < cow.size; off += int64(len(payload)) {
-				if _, err := cow.WriteAt(payload, off); err != nil {
+				if _, err := group.writeAt(cow, payload, off); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -94,6 +105,8 @@ func benchmarkCOWWorkingSet(b *testing.B, work string, encrypted bool) {
 	for _, p := range ios {
 		p.writes.Store(0)
 		p.reads.Store(0)
+		p.writeCalls.Store(0)
+		p.readCalls.Store(0)
 	}
 	request := 4096
 	if work == "seq-write" || work == "seq-read" || work == "multi-disk" {
@@ -132,9 +145,9 @@ func benchmarkCOWWorkingSet(b *testing.B, work string, encrypted bool) {
 			}
 			before := time.Now()
 			if reads {
-				_, err = cows[disk].ReadAt(payload[:request], off)
+				_, err = group.readAt(cows[disk], payload[:request], off)
 			} else {
-				_, err = cows[disk].WriteAt(payload[:request], off)
+				_, err = group.writeAt(cows[disk], payload[:request], off)
 			}
 			latencies[i] = time.Since(before).Nanoseconds()
 			if err != nil {
@@ -161,12 +174,16 @@ func benchmarkCOWWorkingSet(b *testing.B, work string, encrypted bool) {
 	b.ReportMetric(float64(operations*request*b.N)/(1<<20)/total.Seconds(), "drained-MiB/s")
 	b.ReportMetric(float64(latencies[len(latencies)*50/100])/1000, "p50-us")
 	b.ReportMetric(float64(latencies[len(latencies)*99/100])/1000, "p99-us")
-	var writes, readsBytes, resident uint64
+	var writes, readsBytes, writeCalls, readCalls, resident uint64
 	for i, cow := range cows {
 		writes += ios[i].writes.Load()
+		writeCalls += ios[i].writeCalls.Load()
+		readCalls += ios[i].readCalls.Load()
 		readsBytes += ios[i].reads.Load()
 		resident += workingSetResident(b, cow.diff)
 	}
+	b.ReportMetric(float64(writeCalls)/float64(b.N), "body-write-calls")
+	b.ReportMetric(float64(readCalls)/float64(b.N), "body-read-calls")
 	b.ReportMetric(float64(writes)/float64(b.N), "body-written-B")
 	b.ReportMetric(float64(readsBytes)/float64(b.N), "body-read-B")
 	b.ReportMetric(float64(resident), "file-resident-B")

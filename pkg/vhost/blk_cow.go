@@ -162,7 +162,7 @@ func (c *BlockCOW) readAt(ctx context.Context, buf []byte, offset int64) (int, e
 	if err != nil {
 		return 0, err
 	}
-	defer endOp()
+	defer c.end(endOp)
 	if len(buf) == 0 {
 		if offset < 0 || offset > c.size {
 			return 0, io.EOF
@@ -176,38 +176,75 @@ func (c *BlockCOW) readAt(ctx context.Context, buf []byte, offset int64) (int, e
 	if int64(len(buf)) > available {
 		buf = buf[:c.size-offset]
 	}
-	end := offset + int64(len(buf))
+	return c.readRange(ctx, buf, offset, nil)
+}
 
-	pos := int64(0)
-	for offset+pos < end {
-		blk := (offset + pos) / c.blockSize
-		// How much of this block remains.
-		blkEnd := (blk + 1) * c.blockSize
-		if blkEnd > end {
-			blkEnd = end
+// readRange is shared by live and snapshot upper reads. Lock bounded ranges in
+// numeric stripe order once, before inspecting presence. No recursive RLock or
+// cache/global lock spans I/O; the worker never needs a frontend stripe.
+// A non-nil bitmap denotes the snapshot's upper-only view.
+func (c *BlockCOW) readRange(ctx context.Context, buf []byte, offset int64, bitmap []uint64) (int, error) {
+	done := 0
+	for done < len(buf) {
+		pos := offset + int64(done)
+		length := min(len(buf)-done, maxDiffScratchSize-int(pos%cowBlockSize))
+		first, last := pos/cowBlockSize, (pos+int64(length)-1)/cowBlockSize
+		c.rlockBlockRange(first, last)
+		n, err := c.readRangeLocked(ctx, buf[done:done+length], pos, bitmap)
+		c.runlockBlockRange(first, last)
+		done += n
+		if err != nil {
+			return done, err
 		}
-		chunk := buf[pos : pos+(blkEnd-(offset+pos))]
-		lock := c.blockLock(blk)
-		lock.RLock()
-		if c.blockDirty(blk) {
-			if _, err := c.cache.read(ctx, c, chunk, offset+pos); err != nil && !errors.Is(err, io.EOF) {
-				lock.RUnlock()
-				return int(pos), err
-			}
-		} else if c.base != nil && offset+pos < c.base.Size() {
-			n, err := readBlock(ctx, c.base, chunk, offset+pos)
-			if readretry.IsTerminal(err) || (err != nil && !errors.Is(err, io.EOF)) {
-				lock.RUnlock()
-				return int(pos) + n, err
-			}
-			zeroSlice(chunk[n:])
-		} else {
-			zeroSlice(chunk)
-		}
-		lock.RUnlock()
-		pos += int64(len(chunk))
 	}
-	return int(pos), nil
+	return done, nil
+}
+
+func (c *BlockCOW) readRangeLocked(ctx context.Context, buf []byte, offset int64, bitmap []uint64) (int, error) {
+	done := 0
+	end := offset + int64(len(buf))
+	for done < len(buf) {
+		pos := offset + int64(done)
+		block := pos / cowBlockSize
+		runEnd := min((block+1)*cowBlockSize, end)
+		bits := bitmap
+		if bitmap == nil {
+			c.bitmapMu.RLock()
+			bits = c.bitmap
+		}
+		upper := bitmapBlockDirty(bits, block)
+		if upper {
+			for runEnd < end && bitmapBlockDirty(bits, runEnd/cowBlockSize) {
+				runEnd = min(runEnd+cowBlockSize, end)
+			}
+		}
+		if bitmap == nil {
+			c.bitmapMu.RUnlock()
+		}
+		chunk := buf[done : done+int(runEnd-pos)]
+		if upper {
+			n, err := c.cache.read(ctx, c, chunk, pos)
+			done += n
+			if err != nil {
+				return done, err
+			}
+		} else {
+			if err := ctx.Err(); err != nil {
+				return done, err
+			}
+			if bitmap == nil && c.base != nil && pos < c.base.Size() {
+				n, err := readBlock(ctx, c.base, chunk, pos)
+				if readretry.IsTerminal(err) || (err != nil && !errors.Is(err, io.EOF)) {
+					return done + n, err
+				}
+				zeroSlice(chunk[n:])
+			} else {
+				zeroSlice(chunk)
+			}
+			done += len(chunk)
+		}
+	}
+	return done, nil
 }
 
 // WriteAt accepts complete plaintext pages into the bounded cache. First
@@ -221,7 +258,7 @@ func (c *BlockCOW) writeAt(ctx context.Context, buf []byte, offset int64) (int, 
 	if err != nil {
 		return 0, err
 	}
-	defer endOp()
+	defer c.end(endOp)
 	if offset < 0 || offset > c.size || int64(len(buf)) > c.size-offset {
 		return 0, fmt.Errorf("vhost: write out of bounds: offset=%d len=%d size=%d", offset, len(buf), c.size)
 	}
@@ -306,7 +343,7 @@ func (c *BlockCOW) Discard(offset, length int64) error {
 	if err != nil {
 		return err
 	}
-	defer endOp()
+	defer c.end(endOp)
 	if offset < 0 || offset > c.size || length < 0 || length > c.size-offset {
 		return fmt.Errorf("vhost: discard out of bounds: off=%d len=%d size=%d",
 			offset, length, c.size)
@@ -349,7 +386,7 @@ func (c *BlockCOW) SnapshotView() (io.ReadSeeker, []sparse.Extent, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	defer endOp()
+	defer c.end(endOp)
 	c.bitmapMu.RLock()
 	bitmap := append([]uint64(nil), c.bitmap...)
 	c.bitmapMu.RUnlock()
@@ -368,7 +405,7 @@ func (r *cowSnapshotReaderAt) ReadAt(buf []byte, offset int64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer endOp()
+	defer r.cow.end(endOp)
 	if len(buf) == 0 {
 		if offset < 0 || offset > r.cow.size {
 			return 0, io.EOF
@@ -385,32 +422,9 @@ func (r *cowSnapshotReaderAt) ReadAt(buf []byte, offset int64) (int, error) {
 		eof = io.EOF
 	}
 
-	written := 0
-	for written < n {
-		pos := offset + int64(written)
-		blk := pos / r.cow.blockSize
-		dirty := bitmapBlockDirty(r.bitmap, blk)
-		runEnd := min((blk+1)*r.cow.blockSize, offset+int64(n))
-		chunkLen := int(runEnd - pos)
-		chunk := buf[written : written+chunkLen]
-
-		if dirty {
-			lastBlk := (runEnd - 1) / r.cow.blockSize
-			r.cow.rlockBlockRange(blk, lastBlk)
-			read, err := r.cow.cache.read(ctx, r.cow, chunk, pos)
-			r.cow.runlockBlockRange(blk, lastBlk)
-			written += read
-			if err != nil && !(errors.Is(err, io.EOF) && read == len(chunk)) {
-				return written, err
-			}
-			if read != len(chunk) {
-				return written, io.ErrUnexpectedEOF
-			}
-			continue
-		}
-
-		clear(chunk)
-		written += len(chunk)
+	written, err := r.cow.readRange(ctx, buf[:n], offset, r.bitmap)
+	if err != nil {
+		return written, err
 	}
 	if err := r.cow.Err(); err != nil {
 		return written, err
@@ -507,12 +521,19 @@ func (c *BlockCOW) begin(ctx context.Context) (context.Context, func(), error) {
 		c.opMu.RUnlock()
 		return nil, nil, err
 	}
-	if ctx == nil {
-		return c.lifeCtx, c.opMu.RUnlock, nil
+	if ctx == nil || ctx == context.Background() || ctx == context.TODO() {
+		return c.lifeCtx, nil, nil
 	}
 	merged, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(c.lifeCtx, cancel)
-	return merged, func() { stop(); cancel(); c.opMu.RUnlock() }, nil
+	return merged, func() { stop(); cancel() }, nil
+}
+
+func (c *BlockCOW) end(cancel func()) {
+	if cancel != nil {
+		cancel()
+	}
+	c.opMu.RUnlock()
 }
 
 // Close stops admission, drains accepted writes without fsync, and waits for
