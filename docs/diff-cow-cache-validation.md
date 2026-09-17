@@ -16,8 +16,9 @@ are superseded by [issue #238](https://github.com/kuasar-sandbox/sandboxer/issue
 Every active body now requests O_DIRECT through the same aligned positioned-I/O
 API, with generic STATX_DIOALIGN constraints or conservative 4096-byte alignment
 when constraints are unavailable/both-zero. Runtime no longer identifies
-filesystem types, inode flags or mount policies. Setup and I/O errors remain
-errors; there is no buffered retry. Successful O_DIRECT requests do not prove
+filesystem types, inode flags or mount policies. Unsupported O_DIRECT setup
+keeps ordinary file I/O through the same application buffer. Other setup and
+data-I/O errors remain errors; there is no failed-data-I/O buffered retry. Successful O_DIRECT requests do not prove
 physical disk-cache bypass on every backing implementation. Tmpfs file storage
 in memory/swap is separate from the bounded shared process cache; see the
 [current memory and I/O contract](diff-cow-cache.md). Historical data, source

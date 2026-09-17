@@ -22,7 +22,7 @@ resources:
 两个字段都必须是正数且为 4 KiB 的整数倍，满足 `0 < max_dirty_size <= cache_size`。
 缺省字段各自采用以上默认值，包括没有 `diff_cow` 的旧配置。只提供一个字段时，补全默认值后
 也必须满足大小关系。这些是有限的工程初值，不是生产 SLA 或最优性能声明。没有零值/无限制、
-关闭开关、错误触发的 buffered 回退或可配置的其他写入模式。
+关闭开关、数据 I/O 失败后触发的 buffered 重试或可配置的其他写入模式。
 
 `max_dirty_size` 是 `cache_size` 的子集，不是额外池或预留分区。没有脏页时 clean 可以使用
 全部缓存。添加磁盘不会乘以预算。这些 host 进程资源独立于 guest capacity、allocatable/startup
@@ -134,8 +134,10 @@ Close 幂等，排空及关闭错误沿 run/restore 传播。销毁也必须等�
 
 ## 活动文件 I/O 契约
 
-每个活动 body 都在其已打开的描述符上请求 O_DIRECT，并使用相同的有界对齐工作区。
-新目标在 **seeding 前**启用；已有活动文件校验、运行与快照读取使用同一路径。
+每个活动 body 都在其已打开的描述符上尝试 O_DIRECT，并始终使用相同的有界对齐工作区。
+如果该 F_SETFL 请求返回 EINVAL 或 EOPNOTSUPP/ENOTSUP，描述符保持普通定位 I/O，
+应用缓冲和缓存不变。这只是在初始化时处理操作是否受支持，不识别文件系统，也不是数据 I/O 失败后的重试。
+新目标在 **seeding 前**完成上述初始化；已有活动文件校验、运行与快照读取使用同一路径。
 运行时代码不检查文件系统类型、名称、挂载策略或文件系统专有 inode flags。
 Header/格式探测在并发 body I/O 前有界完成；template/base 保留 buffered/read-only 行为。
 明文与密文文件格式、固定 4 KiB 密文 header、本地加密 off/auto/required 策略和
@@ -144,9 +146,9 @@ Header/格式探测在并发 body I/O 前有界完成；template/base 保留 buf
 对已打开 fd 查询 `STATX_DIOALIGN`，区分 buffer 地址与 offset/length 约束。
 报告的正数约束必须满足工作区上限与 4 KiB COW 几何要求；偏移对齐必须整除 4096，
 且 body 边界和大小满足要求。缺少 mask、查询返回不可用的 ENOSYS/EINVAL/EOPNOTSUPP，
-或两个对齐字段同时为零时，选择保守的 4096 字节对齐。这仅是对齐选择，不证明缓存绕过，
-也不允许去掉 O_DIRECT。只有一个字段为零或其他无效约束、真实 statx/描述符错误、
-设置标志错误及实际 I/O 失败仍然报错。应用层不会用 buffered 重试掩盖 EIO、ENOSPC、
+或两个对齐字段同时为零时，选择保守的 4096 字节对齐。这仅是对齐选择，不证明缓存绕过。
+只有一个字段为零或其他无效约束、真实 statx/描述符错误、
+其他设置标志错误及实际 I/O 失败仍然报错。应用层不会用 buffered 重试掩盖 EIO、ENOSPC、
 对齐错误或短 I/O。参见 [statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html)。
 
 内核及底层实现决定如何满足 O_DIRECT 请求。成功设置标志并完成对齐 I/O 证明操作可用，

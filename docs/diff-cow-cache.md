@@ -26,7 +26,7 @@ Both fields are positive multiples of 4 KiB, with
 values above, including old configs without `diff_cow`. A single supplied field
 must still satisfy the relationship after defaults. These are finite engineering
 defaults, not a production SLA or a claim of optimal performance. There is no
-zero/unlimited value, disable switch, error-triggered buffered fallback or
+zero/unlimited value, disable switch, failed-data-I/O buffered retry or
 configurable alternate write mode.
 
 `max_dirty_size` is a subset of `cache_size`, never an additional pool or a
@@ -180,8 +180,11 @@ The original error is latched and the owner notified before cleanup I/O. While r
 
 ## Active-file I/O contract
 
-Every active body requests O_DIRECT on its opened descriptor and uses the same
-bounded aligned workspaces. Fresh targets enable it **before seeding**; existing
+Every active body attempts O_DIRECT on its opened descriptor and always uses the
+same bounded aligned workspaces. If that F_SETFL request returns EINVAL or
+EOPNOTSUPP/ENOTSUP, the descriptor keeps ordinary positioned I/O; the application
+buffer and cache are unchanged. This initialization-only capability decision
+does not inspect the filesystem and is not a retry after failed data I/O. Fresh targets complete this setup **before seeding**; existing
 active validation and runtime/snapshot reads use the same path. Runtime code does
 not inspect filesystem types, names, mount policies or filesystem-specific inode
 flags. Header and format probing are bounded before concurrent body I/O;
@@ -194,8 +197,8 @@ constraints. Positive reported constraints must fit the workspace bound and
 4 KiB COW geometry; offset alignment must divide 4096 and fit body boundary and
 size. A missing mask, query-unavailable ENOSYS/EINVAL/EOPNOTSUPP, or both-zero
 alignment fields selects conservative 4096-byte alignment. This is an alignment
-choice, not proof of cache bypass or permission to drop O_DIRECT. One-zero or
-other invalid constraints, genuine statx/descriptor errors, flag-setup errors and
+choice, not proof of cache bypass. One-zero or
+other invalid constraints, genuine statx/descriptor errors, other flag-setup errors and
 actual I/O failures remain errors. No application-side buffered retry hides EIO,
 ENOSPC, alignment errors or short I/O. See [statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html).
 

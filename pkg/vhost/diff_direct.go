@@ -104,6 +104,11 @@ func validateDirectAlignment(memory, offset int, bodyOffset, size int64) error {
 // enableDirect runs after bounded header probing/creation and before *any*
 // active body access, including provisioning from a read-only template.
 func (d *diffFile) enableDirect() error {
+	return d.enableDirectWithFcntl(unix.FcntlInt)
+}
+
+// The callback is a per-call test seam, not a filesystem policy or runtime mode.
+func (d *diffFile) enableDirectWithFcntl(fcntl func(uintptr, int, int) (int, error)) error {
 	if d.direct != nil {
 		return nil
 	}
@@ -119,9 +124,14 @@ func (d *diffFile) enableDirect() error {
 	if err != nil {
 		return errors.Join(err, r.close())
 	}
-	flags, err := unix.FcntlInt(d.f.Fd(), unix.F_GETFL, 0)
+	flags, err := fcntl(d.f.Fd(), unix.F_GETFL, 0)
 	if err == nil {
-		_, err = unix.FcntlInt(d.f.Fd(), unix.F_SETFL, flags|unix.O_DIRECT)
+		_, err = fcntl(d.f.Fd(), unix.F_SETFL, flags|unix.O_DIRECT)
+		// O_DIRECT is optional; unsupported setup keeps the same owned buffers.
+		// This does not retry any failed data I/O or ignore other setup errors.
+		if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP) {
+			err = nil
+		}
 	}
 	if err != nil {
 		return errors.Join(fmt.Errorf("vhost: enable O_DIRECT %s: %w", d.f.Name(), err), r.close(), w.close())

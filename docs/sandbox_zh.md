@@ -814,7 +814,7 @@ Read 顺序为 active diff -> captured top -> `base_from_refs` -> root image（�
 
 ### 11.4 BlockCOW state
 
-Bitmap 跟踪逻辑 upper-present 4 KiB 块，在明文缓存接受完整页时发布，与 cache clean/dirty/writeback 状态独立。缺失块回落 base 或零。每沙箱 root/data diff 共享 `resources.diff_cow.cache_size`（默认 32MiB）及其 `max_dirty_size` 子集（16MiB）。活动 body（包括 tmpfs 文件）通过相同的对齐定位 I/O API 请求 O_DIRECT，不采用文件系统专属策略；接受标志不保证物理缓存绕过；guest FLUSH 在健康时是 no-op，明确不提供持久化语义。普通 Close 排空已接受写入，不 fsync。底层 Discard 等在途回写结束后，对完整块打洞并重新暴露 base；wire DISCARD/WRITE_ZEROES 仍不支持。写零仍是 upper 数据。Export/snapshot 不 rotate diff 或改变 base。完整契约见[缓存、文件系统 I/O 与生命周期](diff-cow-cache_zh.md)。
+Bitmap 跟踪逻辑 upper-present 4 KiB 块，在明文缓存接受完整页时发布，与 cache clean/dirty/writeback 状态独立。缺失块回落 base 或零。每沙箱 root/data diff 共享 `resources.diff_cow.cache_size`（默认 32MiB）及其 `max_dirty_size` 子集（16MiB）。活动 body（包括 tmpfs 文件）通过相同的对齐定位 I/O API 尝试支持的 O_DIRECT；不支持设置时仍通过同一应用缓冲进行普通 I/O，不采用文件系统专属策略；接受标志不保证物理缓存绕过；guest FLUSH 在健康时是 no-op，明确不提供持久化语义。普通 Close 排空已接受写入，不 fsync。底层 Discard 等在途回写结束后，对完整块打洞并重新暴露 base；wire DISCARD/WRITE_ZEROES 仍不支持。写零仍是 upper 数据。Export/snapshot 不 rotate diff 或改变 base。完整契约见[缓存、文件系统 I/O 与生命周期](diff-cow-cache_zh.md)。
 
 ### 11.5 Quiesce / Resume
 

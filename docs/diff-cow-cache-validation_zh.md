@@ -13,7 +13,8 @@ d601 CH/KVM 证据在下文单独记录。
 [issue #238](https://github.com/kuasar-sandbox/sandboxer/issues/238) 取代。每个活动 body
 现在通过同一对齐定位 I/O API 请求 O_DIRECT，使用通用 STATX_DIOALIGN 约束；约束不可用
 或双零时使用保守的 4096 字节对齐。运行时不再识别文件系统类型、inode flags 或挂载策略。
-设置和 I/O 错误仍然报错，不进行 buffered 重试。成功的 O_DIRECT 请求不证明所有底层
+不支持 O_DIRECT 设置时，通过同一应用缓冲继续普通文件 I/O；其他设置错误和数据 I/O 错误
+仍然报错，不在数据 I/O 失败后进行 buffered 重试。成功的 O_DIRECT 请求不证明所有底层
 实现都会绕过物理磁盘缓存。Tmpfs 文件在内存/swap 中的存储与有界共享进程缓存分开；
 参见[当前内存与 I/O 契约](diff-cow-cache_zh.md)。下文历史数据、源码哈希及磁盘上的
 DIO/mincore 测量保持不变，不是 tmpfs 存储驻留或 tmpfs guest 行为的测量。
