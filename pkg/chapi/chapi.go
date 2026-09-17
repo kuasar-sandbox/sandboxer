@@ -9,9 +9,16 @@
 package chapi
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -24,6 +31,7 @@ const (
 	waitReadyDialTimeout = 50 * time.Millisecond
 	waitReadyInitialPoll = 1 * time.Millisecond
 	waitReadyMaxPoll     = 20 * time.Millisecond
+	maxReadyResponseBody = 1 << 20
 )
 
 // Client issues management calls against one CH api-socket. The zero value is
@@ -114,10 +122,12 @@ func (c Client) doContext(ctx context.Context, method, path, body string) error 
 	return nil
 }
 
-// WaitReady polls the CH api-socket until it accepts a connection (CH creates
-// it during startup). deadline <= 0 polls until ctx is cancelled (e.g. CH exit
-// / SIGINT); a positive deadline bounds the wait. Used by restore before the
-// post-spawn /vm.resume.
+// WaitReady polls vm.info until CH reports the restored VM in Paused state.
+// Merely connecting to the api-socket is insufficient: CH v51.1 starts its
+// HTTP server before its CLI has submitted VmRestore. deadline <= 0 polls until
+// ctx is cancelled; a positive deadline covers dial, request, and the complete
+// response read. Probes are sequential, so a slow response cannot accumulate
+// requests in CH's single API event loop.
 func WaitReady(ctx context.Context, sock string, deadline time.Duration) error {
 	var end time.Time
 	if deadline > 0 {
@@ -155,10 +165,23 @@ func WaitReady(ctx context.Context, sock string, deadline time.Duration) error {
 		c, err := (&net.Dialer{}).DialContext(dialCtx, "unix", sock)
 		cancel()
 		if err == nil {
+			ready, pending, probeErr := probePaused(ctx, c, end)
 			_ = c.Close()
-			return nil
+			if ready {
+				return nil
+			}
+			if !pending {
+				if !end.IsZero() && !time.Now().Before(end) {
+					return fmt.Errorf("ch api VM not ready before deadline: %w", probeErr)
+				}
+				return fmt.Errorf("ch api VM not ready: %w", probeErr)
+			}
+			lastErr = probeErr
+		} else if errorsIsSocketPending(err) {
+			lastErr = err
+		} else {
+			return fmt.Errorf("ch api socket: %w", err)
 		}
-		lastErr = err
 
 		sleep := poll
 		if !end.IsZero() {
@@ -189,4 +212,97 @@ func WaitReady(ctx context.Context, sock string, deadline time.Duration) error {
 			}
 		}
 	}
+}
+
+func errorsIsSocketPending(err error) bool {
+	return errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)
+}
+
+func probePaused(ctx context.Context, conn net.Conn, end time.Time) (ready, pending bool, err error) {
+	// Install the deadline before cancellation so it cannot overwrite cancellation.
+	if !end.IsZero() {
+		if err := conn.SetDeadline(end); err != nil {
+			return false, false, err
+		}
+	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
+	if _, err := io.WriteString(conn, "GET /api/v1/vm.info HTTP/1.1\r\nHost: ch\r\nConnection: close\r\n\r\n"); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, false, ctxErr
+		}
+		return false, false, fmt.Errorf("vm.info write: %w", err)
+	}
+	// Bound the entire wire response, including headers and chunk framing. A body
+	// close must not drain an unbounded response after reaching the size limit.
+	wire := &io.LimitedReader{R: conn, N: maxReadyResponseBody + 1}
+	resp, err := http.ReadResponse(bufio.NewReader(wire), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, false, ctxErr
+		}
+		return false, false, fmt.Errorf("vm.info response: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReadyResponseBody+1))
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, false, ctxErr
+		}
+		return false, false, fmt.Errorf("vm.info body: %w", err)
+	}
+	if wire.N == 0 || len(body) > maxReadyResponseBody {
+		return false, false, fmt.Errorf("vm.info response exceeds %d bytes", maxReadyResponseBody)
+	}
+	if resp.StatusCode == http.StatusInternalServerError && isVMNotCreated(body) {
+		return false, true, fmt.Errorf("VM is not created")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, false, fmt.Errorf("vm.info HTTP %d: %q", resp.StatusCode, body)
+	}
+	var info struct {
+		State string `json:"state"`
+	}
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	if err := dec.Decode(&info); err != nil {
+		return false, false, fmt.Errorf("vm.info JSON: %w", err)
+	}
+	if err := requireJSONEOF(dec); err != nil {
+		return false, false, fmt.Errorf("vm.info JSON: %w", err)
+	}
+	if info.State != "Paused" {
+		return false, false, fmt.Errorf("vm.info unexpected state %q", info.State)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, false, err
+	}
+	return true, false, nil
+}
+
+func isVMNotCreated(body []byte) bool {
+	var messages []string
+	if err := json.Unmarshal(body, &messages); err != nil {
+		return false
+	}
+	want := []string{"Error from API", "The VM info is not available", "VM is not created"}
+	if len(messages) != len(want) {
+		return false
+	}
+	for i := range want {
+		if messages[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func requireJSONEOF(dec *json.Decoder) error {
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }
