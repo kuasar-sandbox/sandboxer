@@ -32,6 +32,30 @@ from usage_report_relay import ReportRelay
 
 
 class HarnessProcessTests(unittest.TestCase):
+    def test_explicit_goroot_wins_over_reset_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected = root / "toolchain" / "bin" / "go"
+            selected.parent.mkdir(parents=True)
+            selected.write_text("#!/bin/sh\nprintf 'selected-driver\\n'\n")
+            selected.chmod(0o755)
+            other = root / "secure-path" / "go"
+            other.parent.mkdir()
+            other.write_text("#!/bin/sh\nprintf 'wrong-driver\\n' >&2\nexit 47\n")
+            other.chmod(0o755)
+            with patch.dict(os.environ, {"GOROOT": str(selected.parent.parent), "PATH": str(other.parent)}):
+                selected_usage = runpy.run_path(usage.__file__)
+                self.assertEqual(selected_usage["GO"], str(selected))
+                self.assertEqual(selected_usage["run"](selected_usage["GO"], "version"), "selected-driver\n")
+                selected.unlink()
+                with self.assertRaises(FileNotFoundError):
+                    selected_usage["run"](selected_usage["GO"], "version")
+
+    def test_without_goroot_preserves_path_selection(self):
+        with patch.dict(os.environ, {"GOROOT": ""}):
+            selected_usage = runpy.run_path(usage.__file__)
+            self.assertEqual(selected_usage["GO"], "go")
+
     def test_run_returns_only_successful_stdout(self):
         self.assertEqual(usage.run(sys.executable, "-c",
             "import sys; print('answer'); print('note', file=sys.stderr)"), "answer\n")
@@ -1018,7 +1042,7 @@ class CleanupTests(unittest.TestCase):
                 def run(*args, **kwargs):
                     if args[0] == "gdb":
                         return "$1 = 0x40\n"
-                    if args[0] == "go":
+                    if args[0] == usage.GO:
                         return "  source.go:1 0x1000 00 TESTQ AX, AX\n  source.go:2 0x1001 c3 RET\n"
                     if failure == "version":
                         raise RuntimeError("version failure")
