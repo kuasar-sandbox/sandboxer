@@ -146,7 +146,10 @@ release_native_lld_ambiguous_candidate() {
       # a non-empty member wrapper. Its existence must not invalidate a later
       # direct-object owner whose filename itself contains `:(`.
       path=''
-    elif [ -f "$owner" ]; then
+    elif [[ "$owner" == *.rlib ]] && [ -f "$owner" ]; then
+      # Only a real Rust archive is a known non-native lld owner here. An
+      # arbitrary regular-file prefix cannot disambiguate a missing native
+      # object interpretation.
       canonical="$(realpath -e "$owner")" || return 1
       path="$canonical"
       kind=non-native

@@ -192,6 +192,22 @@ fi
   || fail "processed a later valid input after an lld directory candidate"
 printf 'test-native-materials: lld directory owner candidate rejection PASS\n'
 
+# An arbitrary regular file at a longer delimiter prefix is not a known lld
+# owner kind. It must not hide a missing unowned native interpretation.
+printf 'unrelated regular file\n' > "$test_root/lld-system/deleted-file.o:(.foo)"
+cat > "$test_root/lld-regular-prefix-candidate.map" <<EOF
+0 0 0 1         $test_root/lld-system/deleted-file.o:(.foo):(.bar)
+0 0 0 1         $test_root/lld-system/Scrt1.o:(.text)
+EOF
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/lld-regular-prefix-candidate.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted an arbitrary regular file as an lld owner candidate"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a later valid input after an arbitrary lld regular-file prefix"
+printf 'test-native-materials: lld arbitrary regular-file owner rejection PASS\n'
+
 # Native and Cargo-covered interpretations remain ambiguous even when symlink
 # names canonicalize to the same file. Provenance kind is part of the identity.
 printf 'shared archive\n' > "$test_root/lld-system/shared-kind-archive"
