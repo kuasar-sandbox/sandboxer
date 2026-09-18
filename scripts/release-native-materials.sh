@@ -72,6 +72,26 @@ release_native_system_input() {
     "$source_id" "sha256:$(sha256sum "$input" | awk '{print $1}');package:$source_name" "$label"
 }
 
+release_native_validate_link_map() {
+  local map="$1"
+  awk '
+    $1 == "LOAD" { next }
+    {
+      input = $5
+      if (input == "") {
+        next
+      }
+      if (input ~ /\.a\(/) {
+        if (input !~ /\.a\([^)]*\):\([^)]*\)$/) {
+          exit 1
+        }
+      } else if (input ~ /\.o([:(]|$)/ && input !~ /\.o:\([^)]*\)$/) {
+        exit 1
+      }
+    }
+  ' "$map" || fail "native linker map contains a malformed input"
+}
+
 release_native_link_input_candidates() {
   local map="$1"
   awk '
@@ -96,6 +116,7 @@ release_native_link_inputs() {
   local map="$1" build_root="$2" temporary_root="$3" payload="$4" input canonical name count=0
   local -A selected_inputs=()
   [ -s "$map" ] || fail "fresh native linker map is missing"
+  release_native_validate_link_map "$map"
   build_root="$(realpath -e "$build_root")"
   temporary_root="$(realpath -e "$temporary_root")"
   while IFS= read -r input; do

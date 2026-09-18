@@ -65,6 +65,19 @@ for mutation in lld-relative lld-malformed lld-owned-only; do
 done
 printf 'test-native-materials: rust-lld malformed/relative/owned-only rejection PASS\n'
 
+cat > "$test_root/lld-mixed-malformed.map" <<EOF
+0 0 0 1 $test_root/lld-system/Scrt1.o:(.text)
+0 0 0 1 $test_root/lld-system/libfixture.a(member.o)
+EOF
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/lld-mixed-malformed.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted a mixed valid/malformed rust-lld map"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a valid rust-lld input before rejecting a malformed row"
+printf 'test-native-materials: mixed valid/malformed rust-lld rejection PASS\n'
+
 mkdir -p "$test_root/system-a" "$test_root/system-b"
 printf 'first native input\n' > "$test_root/system-a/same.a"
 printf 'second native input\n' > "$test_root/system-b/same.a"
