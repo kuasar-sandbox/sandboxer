@@ -95,9 +95,111 @@ release_native_system_input() {
     "$source_id" "sha256:$(sha256sum "$input" | awk '{print $1}');package:$source_name" "$label"
 }
 
+release_native_candidate_canonical() {
+  local candidate="$1" build_root="$2" temporary_root="$3" canonical
+  [[ "$candidate" == /* ]] || return 1
+  if [ -e "$candidate" ]; then
+    realpath -e "$candidate"
+    return
+  fi
+  canonical="$(realpath -m "$candidate")" || return 1
+  case "$canonical" in
+    "$build_root"/*|"$temporary_root"/*)
+      printf '%s\n' "$canonical"
+      return
+      ;;
+  esac
+  return 1
+}
+
+# Resolve only lld rows whose textual owner boundary is ambiguous. lld does not
+# escape `:(` or parentheses in file/member names, so syntax alone cannot
+# distinguish those bytes from the owner/section wrapper. In that rare case,
+# require one unique file/archive candidate that actually exists (or belongs to
+# the known build/temporary roots). Multiple plausible files fail closed rather
+# than allowing provenance to be attributed to the wrong path.
+release_native_lld_ambiguous_candidate() {
+  local input="$1" build_root="$2" temporary_root="$3"
+  local rest="$input" prefix='' before owner body archive_rest archive_prefix archive_before member
+  local canonical path kind='' found_path='' found_kind='' invalid_native=false
+
+  [[ "$input" == *')' ]] || return 1
+  while [[ "$rest" == *':('* ]]; do
+    before="${rest%%":("*}"
+    prefix+="$before"
+    owner="$prefix"
+
+    if [[ "$owner" == *.o ]]; then
+      if canonical="$(release_native_candidate_canonical "$owner" "$build_root" "$temporary_root")"; then
+        path="$canonical"
+        kind=native
+      else
+        path=''
+      fi
+    elif [[ "$owner" == *.a ]] && canonical="$(release_native_candidate_canonical "$owner" "$build_root" "$temporary_root")"; then
+      # A bare archive path is not an lld input-section owner; archives require
+      # a non-empty member wrapper.
+      invalid_native=true
+      path=''
+    elif [ -e "$owner" ]; then
+      canonical="$(realpath -e "$owner")" || return 1
+      path="$canonical"
+      kind=non-native
+    else
+      path=''
+    fi
+    if [ -n "$path" ]; then
+      if [ -n "$found_path" ] && [ "$found_path" != "$path" ]; then
+        return 1
+      fi
+      found_path="$path"
+      found_kind="$kind"
+    fi
+
+    # For archive syntax, the last byte of the owner is the lld wrapper `)`.
+    # The member bytes before it are opaque: they may contain balanced or
+    # unbalanced parentheses and even `:(`. Check every `.a(` marker against
+    # the filesystem instead of trying to balance member-name punctuation.
+    if [[ "$owner" == *')' ]]; then
+      body="${owner%?}"
+      archive_rest="$body"
+      archive_prefix=''
+      while [[ "$archive_rest" == *'.a('* ]]; do
+        archive_before="${archive_rest%%".a("*}"
+        archive_prefix+="$archive_before.a"
+        member="${archive_rest#*".a("}"
+        if [ -n "$member" ]; then
+          if canonical="$(release_native_candidate_canonical "$archive_prefix" "$build_root" "$temporary_root")"; then
+            if [ -n "$found_path" ] && [ "$found_path" != "$canonical" ]; then
+              return 1
+            fi
+            found_path="$canonical"
+            found_kind=native
+          fi
+        elif canonical="$(release_native_candidate_canonical "$archive_prefix" "$build_root" "$temporary_root")"; then
+          # If the candidate archive itself is real, this is an empty member,
+          # not punctuation from some unrelated path component.
+          invalid_native=true
+        fi
+        archive_rest="$member"
+        archive_prefix+='('
+      done
+    fi
+
+    rest="${rest#*":("}"
+    prefix+=':('
+  done
+
+  $invalid_native && return 1
+  [ -n "$found_path" ] || return 1
+  if [ "$found_kind" = native ]; then
+    printf '%s\n' "$found_path"
+  fi
+}
+
 release_native_link_input_candidates() {
-  local map="$1"
-  awk '
+  local map="$1" build_root="$2" temporary_root="$3" rows kind value resolved
+  if ! rows="$(awk '
     function archive_path(owner,    offset, relative, marker, i, char, depth) {
       offset = 1
       while ((relative = index(substr(owner, offset), ".a(")) > 0) {
@@ -110,9 +212,6 @@ release_native_link_input_candidates() {
           } else if (char == ")") {
             depth--
             if (depth == 0) {
-              # A real archive/member marker closes at the end of the owner.
-              # This rejects directory names such as cache.a(old)/libx.a(...)
-              # while permitting balanced parentheses inside the member name.
               if (i == length(owner) && i > marker + 3) {
                 return substr(owner, 1, marker + 1)
               }
@@ -155,9 +254,6 @@ release_native_link_input_candidates() {
         pos = offset + relative - 1
         owner = substr(input, 1, pos - 1)
         archive = archive_path(owner)
-        # The first syntactically complete owner delimiter starts the section
-        # wrapper. A direct-object-looking delimiter inside an open archive
-        # member is not an owner boundary (for example foo.o:(bar).o).
         if (archive != "" || (owner ~ /\.o$/ && !has_open_archive_member(owner))) {
           return pos
         }
@@ -165,17 +261,22 @@ release_native_link_input_candidates() {
       }
       return 0
     }
+    function delimiter_count(input,    rest, pos, count) {
+      rest = input
+      while ((pos = index(rest, ":(")) > 0) {
+        count++
+        rest = substr(rest, pos + 2)
+      }
+      return count
+    }
     function looks_like_native_input(input) {
-      # Fail closed for malformed object/archive-shaped input rows, including
-      # suffix punctuation such as `.o):(`. Do not confuse ordinary names like
-      # `.old` with an object suffix.
       return input ~ /\.(a|o)($|[^[:alnum:]_.+-])/
     }
     $1 == "LOAD" {
       load = $0
       sub(/^[ \t]*LOAD[ \t]+/, "", load)
       if (load ~ /\.(a|o)$/) {
-        print load
+        print "P\t" load
       } else if (looks_like_native_input(load)) {
         exit 1
       }
@@ -186,11 +287,6 @@ release_native_link_input_candidates() {
           $3 !~ /^[[:xdigit:]]+$/ || $4 !~ /^[[:digit:]]+$/) {
         next
       }
-
-      # lld map rows have four numeric columns followed by one space for an
-      # output row, nine spaces for an input-section row, and deeper
-      # indentation for symbol rows. Keep the input remainder byte-for-byte so
-      # whitespace in an absolute path is not lost through awk field splitting.
       work = $0
       sub(/^[ \t]*/, "", work)
       for (i = 1; i <= 4; i++) {
@@ -208,39 +304,62 @@ release_native_link_input_candidates() {
       }
       input = substr(work, indent + 1)
 
-      # Find a section wrapper whose owner is a direct object or a non-empty
-      # archive member. Choosing an owner-valid delimiter also permits `)` (and
-      # even `:(`) inside the section name without confusing it with the owner.
+      # More than one textual delimiter is inherently ambiguous because lld
+      # leaves both file/member names and section names unescaped. Resolve that
+      # rare row against the actual link inputs outside awk.
+      if (delimiter_count(input) > 1) {
+        print "R\t" input
+        next
+      }
       delimiter = valid_owner_delimiter(input)
       if (delimiter == 0 || substr(input, length(input), 1) != ")") {
         if (looks_like_native_input(input)) {
-          exit 1
+          print "R\t" input
         }
         next
       }
       owner = substr(input, 1, delimiter - 1)
       archive = archive_path(owner)
       if (archive != "") {
-        print archive
+        print "P\t" archive
       } else if (owner ~ /\.o$/ && !has_open_archive_member(owner)) {
-        print owner
+        print "P\t" owner
       } else {
-        exit 1
+        print "R\t" input
       }
     }
-  ' "$map"
-}
+  ' "$map")"; then
+    return 1
+  fi
 
+  while IFS=$'\t' read -r kind value; do
+    [ -n "$kind" ] || continue
+    case "$kind" in
+      P)
+        printf '%s\n' "$value"
+        ;;
+      R)
+        if ! resolved="$(release_native_lld_ambiguous_candidate "$value" "$build_root" "$temporary_root")"; then
+          return 1
+        fi
+        [ -z "$resolved" ] || printf '%s\n' "$resolved"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done <<< "$rows"
+}
 release_native_link_inputs() {
   local map="$1" build_root="$2" temporary_root="$3" payload="$4" input canonical name count=0
   local -A selected_inputs=()
   local candidates
   [ -s "$map" ] || fail "fresh native linker map is missing"
-  if ! candidates="$(release_native_link_input_candidates "$map")"; then
-    fail "native linker map contains a malformed input"
-  fi
   build_root="$(realpath -e "$build_root")"
   temporary_root="$(realpath -e "$temporary_root")"
+  if ! candidates="$(release_native_link_input_candidates "$map" "$build_root" "$temporary_root")"; then
+    fail "native linker map contains a malformed input"
+  fi
   while IFS= read -r input; do
     [ -n "$input" ] || continue
     [[ "$input" == /* ]] || fail "native linker map contains an unresolved relative input"

@@ -69,6 +69,8 @@ mkdir -p "$test_root/lld-system" "$test_root/lld system" "$test_root/lld-system/
 printf 'archive\n' > "$test_root/lld-system/libfixture.a"
 printf 'nested archive\n' > "$test_root/lld-system/cache.a(old)/libnested.a"
 printf 'startup object\n' > "$test_root/lld-system/Scrt1.o"
+printf 'delimiter object\n' > "$test_root/lld-system/foo.o:(bar).o"
+printf 'non-native object\n' > "$test_root/lld-system/libfixture.rlib"
 printf 'spaced object\n' > "$test_root/lld system/space object.o"
 printf 'owned object\n' > "$test_root/build/owned.o"
 printf 'temporary object\n' > "$test_root/temporary/transient.o"
@@ -78,9 +80,13 @@ cat > "$test_root/lld.map" <<EOF
              238              238       1c     1         $test_root/lld-system/libfixture.a(member.o):(.text)
              248              248       10     1         $test_root/lld-system/libfixture.a(a(b).o):(.rodata)
              250              250        8     1         $test_root/lld-system/libfixture.a(foo.o:(bar).o):(.data)
-             252              252        8     1         $test_root/lld-system/cache.a(old)/libnested.a(member.o):(.data)
+             251              251        8     1         $test_root/lld-system/libfixture.a(a(.o):(.data)
+             252              252        8     1         $test_root/lld-system/libfixture.a(a).o):(.data)
+             253              253        8     1         $test_root/lld-system/cache.a(old)/libnested.a(member.o):(.data)
              254              254       20     4         $test_root/lld-system/Scrt1.o:(.foo)bar)
              258              258        4     4         $test_root/lld-system/Scrt1.o:(.foo.o:(bar))
+             260              260        4     4         $test_root/lld-system/foo.o:(bar).o:(.text)
+             262              262        4     4         $test_root/lld-system/libfixture.rlib:(.foo.o)
              264              264       10     4         $test_root/lld system/space object.o:(.text)
              264              264        0     1                 foo.o
              274              274       10     4         $test_root/build/owned.o:(.text)
@@ -92,6 +98,7 @@ printf '%s\t%s\n' \
   "$test_root/lld-system/Scrt1.o" bin/cloud-hypervisor \
   "$test_root/lld-system/libfixture.a" bin/cloud-hypervisor \
   "$test_root/lld-system/cache.a(old)/libnested.a" bin/cloud-hypervisor \
+  "$test_root/lld-system/foo.o:(bar).o" bin/cloud-hypervisor \
   "$test_root/lld system/space object.o" bin/cloud-hypervisor \
   | LC_ALL=C sort > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/observed"
@@ -131,6 +138,19 @@ EOF
     || fail "processed a valid rust-lld input before rejecting malformed $malformed row"
 done
 printf 'test-native-materials: mixed valid/malformed rust-lld rejection PASS\n'
+
+# If both an early delimiter prefix and the full delimiter-bearing object exist,
+# the textual lld row is genuinely ambiguous. Fail closed rather than choosing
+# one provenance source by delimiter position.
+printf 'prefix object\n' > "$test_root/lld-system/ambiguous.o"
+printf 'full object\n' > "$test_root/lld-system/ambiguous.o:(member).o"
+printf '0 0 0 1         %s:(.text)\n' \
+  "$test_root/lld-system/ambiguous.o:(member).o" > "$test_root/lld-ambiguous.map"
+if (release_native_link_inputs "$test_root/lld-ambiguous.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted an lld row with two existing owner interpretations"
+fi
+printf 'test-native-materials: ambiguous existing lld owners fail closed PASS\n'
 
 mkdir -p "$test_root/system-a" "$test_root/system-b"
 printf 'first native input\n' > "$test_root/system-a/same.a"
