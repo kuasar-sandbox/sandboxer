@@ -248,6 +248,8 @@ jobs:
         working-directory: src/sandboxer
         run: |
           set -euo pipefail
+          # /tmp is tmpfs on the runner; Go tests need a short, real disk-backed path.
+          export TMPDIR=/var/tmp
           make test
           make vet
           make build
