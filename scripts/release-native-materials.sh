@@ -72,6 +72,26 @@ release_native_system_input() {
     "$source_id" "sha256:$(sha256sum "$input" | awk '{print $1}');package:$source_name" "$label"
 }
 
+release_native_link_input_candidates() {
+  local map="$1"
+  awk '
+    $1 == "LOAD" && $2 ~ /\.(a|o)$/ {
+      print $2
+      next
+    }
+    {
+      input = $5
+      if (input ~ /\.a\([^)]*\):\([^)]*\)$/) {
+        sub(/\([^)]*\):\([^)]*\)$/, "", input)
+        print input
+      } else if (input ~ /\.o:\([^)]*\)$/) {
+        sub(/:\([^)]*\)$/, "", input)
+        print input
+      }
+    }
+  ' "$map"
+}
+
 release_native_link_inputs() {
   local map="$1" build_root="$2" temporary_root="$3" payload="$4" input canonical name count=0
   local -A selected_inputs=()
@@ -92,6 +112,6 @@ release_native_link_inputs() {
     selected_inputs[$name]="$canonical"
     release_native_system_input "$canonical" "$payload"
     count=$((count + 1))
-  done < <(awk '$1 == "LOAD" && $2 ~ /\.(a|o)$/ {print $2}' "$map" | LC_ALL=C sort -u)
+  done < <(release_native_link_input_candidates "$map" | LC_ALL=C sort -u)
   [ "$count" -gt 0 ] || fail "native linker map contains no system inputs"
 }
