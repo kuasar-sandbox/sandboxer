@@ -101,6 +101,13 @@ release_native_candidate_canonical() {
   realpath -e "$candidate"
 }
 
+release_native_candidate_owned_root() {
+  local candidate="$1" build_root="$2" temporary_root="$3" normalized
+  [[ "$candidate" == /* ]] || return 1
+  normalized="$(realpath -m -- "$candidate")" || return 1
+  [[ "$normalized" == "$build_root/"* || "$normalized" == "$temporary_root/"* ]]
+}
+
 # Resolve only lld rows whose textual owner boundary is ambiguous. lld does not
 # escape `:(` or parentheses in file/member names, so syntax alone cannot
 # distinguish those bytes from the owner/section wrapper. In that rare case,
@@ -110,7 +117,8 @@ release_native_candidate_canonical() {
 release_native_lld_ambiguous_candidate() {
   local input="$1" build_root="$2" temporary_root="$3"
   local rest="$input" prefix='' before owner body archive_rest archive_prefix archive_before member
-  local canonical path kind='' found_path='' found_kind='' invalid_native=false
+  local rust_rest rust_prefix rust_before
+  local canonical path kind='' found_path='' found_kind='' invalid_native=false missing_owned_candidate=false
 
   [[ "$input" == *')' ]] || return 1
   while [[ "$rest" == *':('* ]]; do
@@ -124,11 +132,14 @@ release_native_lld_ambiguous_candidate() {
         kind=native
       else
         path=''
+        if release_native_candidate_owned_root "$owner" "$build_root" "$temporary_root"; then
+          missing_owned_candidate=true
+        fi
       fi
-    elif [[ "$owner" == *.a ]] && canonical="$(release_native_candidate_canonical "$owner" "$build_root" "$temporary_root")"; then
+    elif [[ "$owner" == *.a ]]; then
       # A bare archive path is not an lld input-section owner; archives require
-      # a non-empty member wrapper.
-      invalid_native=true
+      # a non-empty member wrapper. Its existence must not invalidate a later
+      # direct-object owner whose filename itself contains `:(`.
       path=''
     elif [ -e "$owner" ]; then
       canonical="$(realpath -e "$owner")" || return 1
@@ -164,6 +175,8 @@ release_native_lld_ambiguous_candidate() {
             fi
             found_path="$canonical"
             found_kind=native
+          elif release_native_candidate_owned_root "$archive_prefix" "$build_root" "$temporary_root"; then
+            missing_owned_candidate=true
           fi
         elif canonical="$(release_native_candidate_canonical "$archive_prefix" "$build_root" "$temporary_root")"; then
           # If the candidate archive itself is real, this is an empty member,
@@ -173,6 +186,32 @@ release_native_lld_ambiguous_candidate() {
         archive_rest="$member"
         archive_prefix+='('
       done
+
+      # Rust `.rlib` member rows are non-native inputs: Cargo/toolchain
+      # provenance already covers them. Resolve the actual archive rather than
+      # matching the member `.o` text, so a direct `.o` filename containing
+      # `.rlib(` is still treated as native unless an rlib archive really
+      # participates in the same ambiguous row.
+      rust_rest="$body"
+      rust_prefix=''
+      while [[ "$rust_rest" == *'.rlib('* ]]; do
+        rust_before="${rust_rest%%".rlib("*}"
+        rust_prefix+="$rust_before.rlib"
+        member="${rust_rest#*".rlib("}"
+        if [ -n "$member" ]; then
+          if canonical="$(release_native_candidate_canonical "$rust_prefix" "$build_root" "$temporary_root")"; then
+            if [ -n "$found_path" ] && [ "$found_path" != "$canonical" ]; then
+              return 1
+            fi
+            found_path="$canonical"
+            found_kind=non-native
+          elif release_native_candidate_owned_root "$rust_prefix" "$build_root" "$temporary_root"; then
+            missing_owned_candidate=true
+          fi
+        fi
+        rust_rest="$member"
+        rust_prefix+='('
+      done
     fi
 
     rest="${rest#*":("}"
@@ -180,7 +219,10 @@ release_native_lld_ambiguous_candidate() {
   done
 
   $invalid_native && return 1
-  [ -n "$found_path" ] || return 1
+  if [ -z "$found_path" ]; then
+    $missing_owned_candidate && return 0
+    return 1
+  fi
   if [ "$found_kind" = native ]; then
     printf '%s\n' "$found_path"
   fi

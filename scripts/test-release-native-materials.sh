@@ -70,6 +70,8 @@ printf 'archive\n' > "$test_root/lld-system/libfixture.a"
 printf 'nested archive\n' > "$test_root/lld-system/cache.a(old)/libnested.a"
 printf 'startup object\n' > "$test_root/lld-system/Scrt1.o"
 printf 'delimiter object\n' > "$test_root/lld-system/foo.o:(bar).o"
+printf 'bare archive prefix\n' > "$test_root/lld-system/direct-prefix.a"
+printf 'direct object after archive prefix\n' > "$test_root/lld-system/direct-prefix.a:(x).o"
 printf 'nested-marker archive\n' > "$test_root/lld-system/outer-missing.a(inner.a"
 printf 'non-native object\n' > "$test_root/lld-system/libfixture.rlib"
 printf 'spaced object\n' > "$test_root/lld system/space object.o"
@@ -90,7 +92,9 @@ cat > "$test_root/lld.map" <<EOF
              260              260        4     4         $test_root/lld-system/foo.o:(bar).o:(.text)
              261              261        4     4         $test_root/lld-system/outer-missing.a(inner.a(member.o):(.text)
              262              262        4     4         $test_root/lld-system/libfixture.rlib:(.foo.o)
+             263              263        4     4         $test_root/lld-system/libfixture.rlib(member.o):(.text)
              264              264       10     4         $test_root/lld system/space object.o:(.text)
+             265              265        4     4         $test_root/lld-system/direct-prefix.a:(x).o:(.text)
              264              264        0     1                 foo.o
              274              274       10     4         $test_root/build/owned.o:(.text)
              275              275       10     4         $test_root/build/libowned.a(foo.o:(bar).o):(.text)
@@ -104,10 +108,26 @@ printf '%s\t%s\n' \
   "$test_root/lld-system/cache.a(old)/libnested.a" bin/cloud-hypervisor \
   "$test_root/lld-system/foo.o:(bar).o" bin/cloud-hypervisor \
   "$test_root/lld-system/outer-missing.a(inner.a" bin/cloud-hypervisor \
+  "$test_root/lld-system/direct-prefix.a:(x).o" bin/cloud-hypervisor \
   "$test_root/lld system/space object.o" bin/cloud-hypervisor \
   | LC_ALL=C sort > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/observed"
 printf 'test-native-materials: rust-lld structured archive/direct inputs and owned filtering PASS\n'
+
+# Ambiguous owned inputs may legitimately be gone by packaging time. Preserve
+# the GNU-LOAD contract: if every plausible missing native candidate belongs to
+# the build/temp roots, filter the row rather than rejecting an otherwise valid
+# map. Do not create the delimiter-bearing owned object.
+cat > "$test_root/lld-removed-owned.map" <<EOF
+0 0 0 1         $test_root/lld-system/Scrt1.o:(.text)
+0 0 0 1         $test_root/build/removed.o:(bar).o:(.text)
+EOF
+: > "$test_root/observed"
+release_native_link_inputs "$test_root/lld-removed-owned.map" "$test_root/build" \
+  "$test_root/temporary" bin/cloud-hypervisor
+printf '%s\t%s\n' "$test_root/lld-system/Scrt1.o" bin/cloud-hypervisor > "$test_root/expected"
+cmp "$test_root/expected" "$test_root/observed"
+printf 'test-native-materials: removed ambiguous owned lld input filtering PASS\n'
 
 for mutation in lld-relative lld-malformed lld-archive-no-member lld-archive-empty-member lld-object-bad-suffix lld-owned-only; do
   case "$mutation" in
