@@ -146,14 +146,12 @@ release_native_lld_ambiguous_candidate() {
       # a non-empty member wrapper. Its existence must not invalidate a later
       # direct-object owner whose filename itself contains `:(`.
       path=''
-    elif [[ "$owner" == *.rlib ]] && [ -f "$owner" ]; then
-      # Only a real Rust archive is a known non-native lld owner here. An
-      # arbitrary regular-file prefix cannot disambiguate a missing native
-      # object interpretation.
-      canonical="$(realpath -e "$owner")" || return 1
-      path="$canonical"
-      kind=non-native
     else
+      # A bare `.rlib` prefix is not an lld input-section owner either. Real
+      # Cargo-covered Rust contributions use `.rlib(member)` and are resolved
+      # below. Treating a bare archive prefix as non-native could otherwise
+      # hide a missing direct-object interpretation whose filename contains
+      # `:(`.
       path=''
     fi
     if [ -n "$path" ]; then
@@ -231,7 +229,12 @@ release_native_lld_ambiguous_candidate() {
     prefix+=':('
   done
 
-  $invalid_native && return 1
+  # An empty archive-member spelling is malformed only when it is the row's
+  # actual owner. The same bytes may legally occur inside a later direct-object
+  # filename; a unique real owner found above wins over that impossible prefix.
+  if $invalid_native && [ -z "$found_path" ]; then
+    return 1
+  fi
   if [ -z "$found_path" ]; then
     $missing_unowned_native_candidate && return 1
     $missing_owned_candidate && return 0
@@ -338,6 +341,13 @@ release_native_link_input_candidates() {
     {
       if (NF < 5 || $1 !~ /^[[:xdigit:]]+$/ || $2 !~ /^[[:xdigit:]]+$/ ||
           $3 !~ /^[[:xdigit:]]+$/ || $4 !~ /^[[:digit:]]+$/) {
+        # lld writes input path bytes verbatim. A newline in a linked native
+        # pathname therefore splits one input-section row across physical map
+        # lines; the continuation loses the four numeric columns. Reject any
+        # such native-looking continuation instead of silently omitting it.
+        if (looks_like_native_input($0) && $0 ~ /:\(/) {
+          exit 1
+        }
         next
       }
       work = $0

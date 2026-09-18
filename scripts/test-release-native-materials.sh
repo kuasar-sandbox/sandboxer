@@ -101,6 +101,8 @@ printf 'startup object\n' > "$test_root/lld-system/Scrt1.o"
 printf 'delimiter object\n' > "$test_root/lld-system/foo.o:(bar).o"
 printf 'bare archive prefix\n' > "$test_root/lld-system/direct-prefix.a"
 printf 'direct object after archive prefix\n' > "$test_root/lld-system/direct-prefix.a:(x).o"
+printf 'empty member archive prefix\n' > "$test_root/lld-system/empty-prefix.a"
+printf 'direct object after empty member prefix\n' > "$test_root/lld-system/empty-prefix.a():(foo).o"
 printf 'nested-marker archive\n' > "$test_root/lld-system/outer-missing.a(inner.a"
 printf 'non-native object\n' > "$test_root/lld-system/libfixture.rlib"
 printf 'spaced object\n' > "$test_root/lld system/space object.o"
@@ -120,11 +122,11 @@ cat > "$test_root/lld.map" <<EOF
              258              258        4     4         $test_root/lld-system/Scrt1.o:(.foo.o:(bar))
              260              260        4     4         $test_root/lld-system/foo.o:(bar).o:(.text)
              261              261        4     4         $test_root/lld-system/outer-missing.a(inner.a(member.o):(.text)
-             262              262        4     4         $test_root/lld-system/libfixture.rlib:(.foo.o)
              263              263        4     4         $test_root/lld-system/libfixture.rlib(member.o):(.text)
              263              263        4     4         $test_root/lld-system/libfixture.rlib(member.a(foo.o):(.text)
              264              264       10     4         $test_root/lld system/space object.o:(.text)
              265              265        4     4         $test_root/lld-system/direct-prefix.a:(x).o:(.text)
+             266              266        4     4         $test_root/lld-system/empty-prefix.a():(foo).o:(.text)
              264              264        0     1                 foo.o
              274              274       10     4         $test_root/build/owned.o:(.text)
              275              275       10     4         $test_root/build/libowned.a(foo.o:(bar).o):(.text)
@@ -139,6 +141,7 @@ printf '%s\t%s\n' \
   "$test_root/lld-system/foo.o:(bar).o" bin/cloud-hypervisor \
   "$test_root/lld-system/outer-missing.a(inner.a" bin/cloud-hypervisor \
   "$test_root/lld-system/direct-prefix.a:(x).o" bin/cloud-hypervisor \
+  "$test_root/lld-system/empty-prefix.a():(foo).o" bin/cloud-hypervisor \
   "$test_root/lld system/space object.o" bin/cloud-hypervisor \
   | LC_ALL=C sort > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/observed"
@@ -207,6 +210,41 @@ fi
 [ ! -s "$test_root/observed" ] \
   || fail "processed a later valid input after an arbitrary lld regular-file prefix"
 printf 'test-native-materials: lld arbitrary regular-file owner rejection PASS\n'
+
+# A bare `.rlib` archive is not itself an lld input-section owner. If a missing
+# direct-object interpretation embeds `:(` after that prefix, the archive must
+# not hide the missing unowned native input.
+printf 'cargo archive\n' > "$test_root/lld-system/deleted-prefix.rlib"
+cat > "$test_root/lld-bare-rlib-prefix.map" <<EOF
+0 0 0 1         $test_root/lld-system/deleted-prefix.rlib:(foo).o:(.text)
+0 0 0 1         $test_root/lld-system/Scrt1.o:(.text)
+EOF
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/lld-bare-rlib-prefix.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted a bare rlib prefix as a Cargo-owned lld input"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a later valid input after a bare rlib prefix"
+printf 'test-native-materials: bare rlib delimiter cannot hide missing native owner PASS\n'
+
+# lld preserves newlines in pathnames, which physically splits the map row.
+# Reject the native-looking continuation before dispatching an earlier valid
+# candidate, rather than silently dropping the split input from provenance.
+newline_input="$test_root/lld-system/newline"$'\n'"break.o"
+printf 'newline object\n' > "$newline_input"
+{
+  printf '0 0 0 1         %s:(.text)\n' "$test_root/lld-system/Scrt1.o"
+  printf '0 0 0 1         %s:(.text)\n' "$newline_input"
+} > "$test_root/lld-newline-input.map"
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/lld-newline-input.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted a newline-split lld native input"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a valid input before rejecting a newline-split lld row"
+printf 'test-native-materials: newline-split lld native input rejection PASS\n'
 
 # Native and Cargo-covered interpretations remain ambiguous even when symlink
 # names canonicalize to the same file. Provenance kind is part of the identity.
