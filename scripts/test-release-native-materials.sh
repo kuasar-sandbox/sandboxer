@@ -31,16 +31,22 @@ for mutation in missing empty relative; do
 done
 printf 'test-native-materials: exact system/owned-input selection PASS\n'
 
-# rust-lld maps describe native inputs in input-section rows instead of GNU LOAD rows.
-mkdir -p "$test_root/lld-system"
+# rust-lld maps describe native inputs in structurally indented input-section
+# rows instead of GNU LOAD rows. Output and symbol rows must not be interpreted
+# as inputs, and the complete input remainder may contain whitespace.
+mkdir -p "$test_root/lld-system" "$test_root/lld system"
 printf 'archive\n' > "$test_root/lld-system/libfixture.a"
 printf 'startup object\n' > "$test_root/lld-system/Scrt1.o"
+printf 'spaced object\n' > "$test_root/lld system/space object.o"
 printf 'owned object\n' > "$test_root/build/owned.o"
 printf 'temporary object\n' > "$test_root/temporary/transient.o"
 cat > "$test_root/lld.map" <<EOF
              VMA              LMA     Size Align Out     In      Symbol
+             238              238       1c     1 .text
              238              238       1c     1         $test_root/lld-system/libfixture.a(member.o):(.text)
-             254              254       20     4         $test_root/lld-system/Scrt1.o:(.note.ABI-tag)
+             254              254       20     4         $test_root/lld-system/Scrt1.o:(.foo)bar)
+             264              264       10     4         $test_root/lld system/space object.o:(.text)
+             264              264        0     1                 foo.o
              274              274       10     4         $test_root/build/owned.o:(.text)
              284              284       10     4         $test_root/temporary/transient.o:(.text)
 EOF
@@ -48,15 +54,19 @@ EOF
 release_native_link_inputs "$test_root/lld.map" "$test_root/build" "$test_root/temporary" bin/cloud-hypervisor
 printf '%s\t%s\n' \
   "$test_root/lld-system/Scrt1.o" bin/cloud-hypervisor \
-  "$test_root/lld-system/libfixture.a" bin/cloud-hypervisor > "$test_root/expected"
+  "$test_root/lld-system/libfixture.a" bin/cloud-hypervisor \
+  "$test_root/lld system/space object.o" bin/cloud-hypervisor \
+  | LC_ALL=C sort > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/observed"
-printf 'test-native-materials: rust-lld archive/direct inputs and owned filtering PASS\n'
+printf 'test-native-materials: rust-lld structured archive/direct inputs and owned filtering PASS\n'
 
-for mutation in lld-relative lld-malformed lld-owned-only; do
+for mutation in lld-relative lld-malformed lld-archive-no-member lld-archive-empty-member lld-owned-only; do
   case "$mutation" in
-    lld-relative) printf '0 0 0 1 foreign.o:(.text)\n' > "$test_root/$mutation.map" ;;
-    lld-malformed) printf '0 0 0 1 %s(member.o)\n' "$test_root/lld-system/libfixture.a" > "$test_root/$mutation.map" ;;
-    lld-owned-only) printf '0 0 0 1 %s:(.text)\n' "$test_root/build/owned.o" > "$test_root/$mutation.map" ;;
+    lld-relative) printf '0 0 0 1         foreign.o:(.text)\n' > "$test_root/$mutation.map" ;;
+    lld-malformed) printf '0 0 0 1         %s(member.o)\n' "$test_root/lld-system/libfixture.a" > "$test_root/$mutation.map" ;;
+    lld-archive-no-member) printf '0 0 0 1         %s:(.text)\n' "$test_root/lld-system/libfixture.a" > "$test_root/$mutation.map" ;;
+    lld-archive-empty-member) printf '0 0 0 1         %s():(.text)\n' "$test_root/lld-system/libfixture.a" > "$test_root/$mutation.map" ;;
+    lld-owned-only) printf '0 0 0 1         %s:(.text)\n' "$test_root/build/owned.o" > "$test_root/$mutation.map" ;;
   esac
   if (release_native_link_inputs "$test_root/$mutation.map" "$test_root/build" \
       "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
@@ -66,8 +76,8 @@ done
 printf 'test-native-materials: rust-lld malformed/relative/owned-only rejection PASS\n'
 
 cat > "$test_root/lld-mixed-malformed.map" <<EOF
-0 0 0 1 $test_root/lld-system/Scrt1.o:(.text)
-0 0 0 1 $test_root/lld-system/libfixture.a(member.o)
+0 0 0 1         $test_root/lld-system/Scrt1.o:(.text)
+0 0 0 1         $test_root/lld-system/libfixture.a(member.o)
 EOF
 : > "$test_root/observed"
 if (release_native_link_inputs "$test_root/lld-mixed-malformed.map" "$test_root/build" \
