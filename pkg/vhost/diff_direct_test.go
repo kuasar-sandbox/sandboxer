@@ -246,14 +246,75 @@ func checkDiskActiveIO(t *testing.T, d *diffFile) {
 	}
 }
 
+type failingDirectBody struct {
+	diffBodyIO
+	err               error
+	readCalls, writes int
+}
+
+func (b *failingDirectBody) ReadAt([]byte, int64) (int, error) {
+	b.readCalls++
+	return 0, b.err
+}
+
+func (b *failingDirectBody) WriteAt([]byte, int64) (int, error) {
+	b.writes++
+	return 0, b.err
+}
+
 func TestDiffDirectErrorDoesNotFallBack(t *testing.T) {
-	cow := cachedCOW(t, testCache(t, 1, 1, cacheHooks{}), 2, nil)
-	checkDiskActiveIO(t, cow.diff)
-	// Offset 1 is invalid on the verified disk DIO path. Do not retry buffered.
-	if _, err := cow.diff.bodyIO.WriteAt(cow.diff.direct.write.bytes[:cowBlockSize], 1); !errors.Is(err, unix.EINVAL) {
-		t.Fatalf("unaligned physical write: %v", err)
+	for _, encrypted := range []bool{false, true} {
+		for _, injected := range []error{unix.EINVAL, unix.EIO, unix.ENOSPC} {
+			name := fmt.Sprintf("encrypted=%t/%v", encrypted, injected)
+			t.Run(name, func(t *testing.T) {
+				var opts []BlockCOWOption
+				if encrypted {
+					opts = append(opts, WithDiffEncryption(testDiffKey(22), true))
+				}
+				cow := cachedCOW(t, testCache(t, 1, 1, cacheHooks{}), 2, nil, opts...)
+				checkDiskActiveIO(t, cow.diff)
+				before, err := os.ReadFile(cow.diff.f.Name())
+				if err != nil {
+					t.Fatal(err)
+				}
+				flags, err := unix.FcntlInt(cow.diff.f.Fd(), unix.F_GETFL, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				probe := &failingDirectBody{diffBodyIO: cow.diff.bodyIO, err: injected}
+				cow.diff.bodyIO = probe
+
+				if n, err := cow.diff.WriteAt(bytes.Repeat([]byte{0x5a}, cowBlockSize), 0); n != 0 || !errors.Is(err, injected) {
+					t.Fatalf("WriteAt = %d, %v; want 0, %v", n, err, injected)
+				}
+				if probe.writes != 1 || probe.readCalls != 0 {
+					t.Fatalf("failed write physical calls: reads=%d writes=%d", probe.readCalls, probe.writes)
+				}
+
+				output := bytes.Repeat([]byte{0xa5}, cowBlockSize)
+				if n, err := cow.diff.ReadAt(output, 0); n != 0 || !errors.Is(err, injected) {
+					t.Fatalf("ReadAt = %d, %v; want 0, %v", n, err, injected)
+				}
+				if probe.writes != 1 || probe.readCalls != 1 {
+					t.Fatalf("failed read physical calls: reads=%d writes=%d", probe.readCalls, probe.writes)
+				}
+				if !bytes.Equal(output, bytes.Repeat([]byte{0xa5}, cowBlockSize)) {
+					t.Fatal("failed read changed caller buffer")
+				}
+				after, err := os.ReadFile(cow.diff.f.Name())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(after, before) {
+					t.Fatal("failed physical I/O changed the diff")
+				}
+				afterFlags, err := unix.FcntlInt(cow.diff.f.Fd(), unix.F_GETFL, 0)
+				if err != nil || afterFlags != flags || afterFlags&unix.O_DIRECT == 0 {
+					t.Fatalf("flags after errors=%x, before=%x, err=%v", afterFlags, flags, err)
+				}
+			})
+		}
 	}
-	checkDiskActiveIO(t, cow.diff)
 }
 
 func TestDiffDirectAlignmentFromStatx(t *testing.T) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-# Active diff bodies require disk-backed storage; /tmp may be tmpfs.
+# Disk-specific DIO/residency tests need a disk fixture; runtime also supports tmpfs.
 export TMPDIR="${TMPDIR:-/var/tmp}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +22,8 @@ if [ -n "${CANDIDATE_REPOSITORY:-}" ]; then
         cd "$source_root"
         echo "==> sandboxer source unit and memory-controller race regressions"
         CGO_ENABLED=0 go test -count=1 ./...
+        bash scripts/test-vhost-tmpfs-runner.sh
+        ./scripts/test-vhost-tmpfs-enospc.sh
         CGO_ENABLED=1 go test -race -count=1 ./pkg/resctl ./pkg/ctl ./pkg/usagereader ./pkg/sandbox
         CGO_ENABLED=0 go vet ./...
     )
