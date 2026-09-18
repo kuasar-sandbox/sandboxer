@@ -227,8 +227,13 @@ errors. Dedicated real-tmpfs tests verify the fixture descriptor type and the
 same O_DIRECT request, plaintext/encrypted I/O, bounded staging and copyout,
 template seeding,
 sparse holes, shared mixed-filesystem quotas/backpressure, dirty/writeback capture,
-Drain/Close and reopen. A small private tmpfs mount tests real ENOSPC when isolated
-user/mount namespaces are available; it never exhausts or remounts a shared mount.
+Drain/Close and reopen. `scripts/test-vhost-tmpfs-enospc.sh` explicitly runs the
+plain and encrypted real-ENOSPC cases as root in a new mount namespace. The test
+uses a 32 KiB private tmpfs and never exhausts or remounts a shared mount; ordinary
+`go test` runs skip only this capability-requiring case rather than attempting
+implicit privilege escalation. The runner requires successful plaintext and encrypted
+case markers (not a Skip/no-tests result), bounds execution, and removes its own
+temporary files even after failure.
 DIO/mincore benchmarks retain disk-backed fixtures. Tmpfs functional tests are
 not evidence of disk cache bypass. Run targeted tests, race, vet, build, broader
 tests and real CH/KVM tmpfs guest cold-start/read-write

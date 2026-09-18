@@ -5,51 +5,70 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"syscall"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// Only the child mounts tmpfs, after entering new user and mount namespaces.
+// The source E2E root runner enters a new mount namespace before enabling this
+// test. Ordinary unit-test invocations do not unexpectedly elevate privileges.
 // Nothing mounts, remounts or fills a shared /dev/shm. The file store is 32 KiB.
-func TestDiffTmpfsENOSPC(t *testing.T) {
-	const namespaceEnv = "SANDBOXER_TMPFS_TEST_PARENT_MNT"
-	parentNS := os.Getenv(namespaceEnv)
-	if parentNS == "" {
-		ns, err := os.Readlink("/proc/self/ns/mnt")
-		if err != nil {
-			t.Fatal(err)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDiffTmpfsENOSPC$", "-test.v")
-		cmd.Env = append(os.Environ(), namespaceEnv+"="+ns)
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Cloneflags:                 unix.CLONE_NEWUSER | unix.CLONE_NEWNS,
-			UidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
-			GidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
-			GidMappingsEnableSetgroups: false,
-		}
-		out, err := cmd.CombinedOutput()
-		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOSYS) {
-			t.Skipf("isolated user/mount namespaces unavailable: %v", err)
-		}
-		if err != nil {
-			t.Fatalf("isolated tmpfs child: %v\n%s", err, out)
-		}
-		t.Logf("isolated tmpfs child:\n%s", out)
-		return
+func validateTmpfsENOSPCLaunch(enabled, parentNS, currentNS string, euid int) (bool, error) {
+	if enabled == "" {
+		return false, nil
 	}
-	ns, err := os.Readlink("/proc/self/ns/mnt")
+	if enabled != "1" {
+		return true, errors.New("invalid privileged tmpfs test activation")
+	}
+	if euid != 0 {
+		return true, errors.New("privileged tmpfs test requires root")
+	}
+	if parentNS == "" {
+		return true, errors.New("privileged tmpfs test requires the parent mount namespace")
+	}
+	if currentNS == "" || currentNS == parentNS {
+		return true, errors.New("refusing to mount without a separate mount namespace")
+	}
+	return true, nil
+}
+
+func TestTmpfsENOSPCLaunchContract(t *testing.T) {
+	for _, tc := range []struct {
+		name, enabled, parent, current string
+		euid                           int
+		wantRun, wantErr               bool
+	}{
+		{name: "ordinary unit test", current: "mnt:[2]"},
+		{name: "invalid activation", enabled: "0", parent: "mnt:[1]", current: "mnt:[2]", wantRun: true, wantErr: true},
+		{name: "missing current", enabled: "1", parent: "mnt:[1]", wantRun: true, wantErr: true},
+		{name: "non-root", enabled: "1", parent: "mnt:[1]", current: "mnt:[2]", euid: 1000, wantRun: true, wantErr: true},
+		{name: "missing parent", enabled: "1", current: "mnt:[2]", wantRun: true, wantErr: true},
+		{name: "shared namespace", enabled: "1", parent: "mnt:[1]", current: "mnt:[1]", wantRun: true, wantErr: true},
+		{name: "isolated root", enabled: "1", parent: "mnt:[1]", current: "mnt:[2]", wantRun: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run, err := validateTmpfsENOSPCLaunch(tc.enabled, tc.parent, tc.current, tc.euid)
+			if run != tc.wantRun || (err != nil) != tc.wantErr {
+				t.Fatalf("launch validation = %t, %v; want run=%t error=%t", run, err, tc.wantRun, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestDiffTmpfsENOSPC(t *testing.T) {
+	const runEnv = "SANDBOXER_TMPFS_ENOSPC_ROOT"
+	const namespaceEnv = "SANDBOXER_TMPFS_TEST_PARENT_MNT"
+	currentNS, err := os.Readlink("/proc/self/ns/mnt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ns == parentNS {
-		t.Fatal("refusing to mount without a separate mount namespace")
+	run, err := validateTmpfsENOSPCLaunch(os.Getenv(runEnv), os.Getenv(namespaceEnv), currentNS, os.Geteuid())
+	if !run {
+		t.Skip("requires the explicit privileged tmpfs test runner")
+	}
+	if err != nil {
+		t.Fatalf("%s/%s launch contract: %v", runEnv, namespaceEnv, err)
 	}
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		t.Fatal(err)

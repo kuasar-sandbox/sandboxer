@@ -168,8 +168,11 @@ private heap/fork 风险。任意调用者切片和子页读取经过这些 buff
 template、明/密文重开，以及磁盘 fixture 上的 mincore 驻留。通用对齐测试覆盖正数、缺失、
 双零及无效约束、不可用查询和真实错误。独立真实 tmpfs 测试验证 fixture 描述符类型及相同的 O_DIRECT 请求、
 明/密文 I/O、有界工作区与 copyout、模板 seeding、稀疏 hole、混合文件系统共享额度/背压、
-dirty/writeback 捕获、Drain/Close 与重开。隔离 user/mount namespace 可用时，以小型私有
-挂载测试真实 ENOSPC，绝不耗尽或重挂共享挂载。DIO/mincore 基准保留磁盘 fixture。
+dirty/writeback 捕获、Drain/Close 与重开。`scripts/test-vhost-tmpfs-enospc.sh`
+明确以 root 身份在新 mount namespace 中运行明文和加密的真实 ENOSPC 用例。测试使用
+32 KiB 私有 tmpfs，绝不耗尽或重挂共享挂载；普通 `go test` 只跳过这个需要 capability
+的用例，而不会隐式提权。入口强制检查明文/加密用例均成功，拒绝 Skip 或没有执行用例的
+结果，限制运行时间，并在失败后清理本次临时文件。DIO/mincore 基准保留磁盘 fixture。
 Tmpfs 功能测试不能作为磁盘缓存绕过证据。
 执行 targeted tests、race、vet、build、broader tests，以及活动 diff 位于真实 tmpfs 的
 CH/KVM guest 冷启动/读写和 pause/export/restore；明确报告跳过与基础设施故障。
