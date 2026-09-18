@@ -24,12 +24,23 @@ release_native_material_label() {
 
 release_native_system_input() {
   local input="$1" payload="$2" query owner source_name version label copyright common
-  local source_id rpm_source sibling file count=0
+  local source_id rpm_source sibling file count=0 line query_owner query_path
   input="$(realpath -e "$input")" || fail "native link input is missing"
   label="$(release_native_material_label "$input")"
   if command -v dpkg-query >/dev/null 2>&1 \
     && query="$(dpkg-query -S "$input" 2>/dev/null)"; then
-    owner="${query%%: /*}"
+    owner=""
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      query_path="${line#*: }"
+      [ "$query_path" = "$input" ] || continue
+      query_owner="${line%%: *}"
+      if [ -n "$owner" ] && [ "$owner" != "$query_owner" ]; then
+        fail "ambiguous native package owner"
+      fi
+      owner="$query_owner"
+    done <<< "$query"
+    [ -n "$owner" ] || fail "native package owner does not exactly match input: $input"
     [[ "$owner" != *$'\n'* && "$owner" != *,* ]] || fail "ambiguous native package owner"
     query="$(dpkg-query -W -f '${source:Package}\t${source:Version}\n' "$owner")"
     IFS=$'\t' read -r source_name version <<< "$query"
@@ -87,26 +98,67 @@ release_native_system_input() {
 release_native_link_input_candidates() {
   local map="$1"
   awk '
-    function archive_path(owner,    marker, member) {
-      marker = index(owner, ".a(")
-      if (marker == 0 || substr(owner, length(owner), 1) != ")") {
-        return ""
+    function archive_path(owner,    offset, relative, marker, i, char, depth) {
+      offset = 1
+      while ((relative = index(substr(owner, offset), ".a(")) > 0) {
+        marker = offset + relative - 1
+        depth = 1
+        for (i = marker + 3; i <= length(owner); i++) {
+          char = substr(owner, i, 1)
+          if (char == "(") {
+            depth++
+          } else if (char == ")") {
+            depth--
+            if (depth == 0) {
+              # A real archive/member marker closes at the end of the owner.
+              # This rejects directory names such as cache.a(old)/libx.a(...)
+              # while permitting balanced parentheses inside the member name.
+              if (i == length(owner) && i > marker + 3) {
+                return substr(owner, 1, marker + 1)
+              }
+              break
+            }
+          }
+        }
+        offset = marker + 3
       }
-      member = substr(owner, marker + 3, length(owner) - marker - 3)
-      if (member == "") {
-        return ""
-      }
-      return substr(owner, 1, marker + 1)
+      return ""
     }
-    function valid_owner_delimiter(input,    offset, relative, pos, owner) {
+    function has_open_archive_member(owner,    offset, relative, marker, i, char, depth, closed) {
+      offset = 1
+      while ((relative = index(substr(owner, offset), ".a(")) > 0) {
+        marker = offset + relative - 1
+        depth = 1
+        closed = 0
+        for (i = marker + 3; i <= length(owner); i++) {
+          char = substr(owner, i, 1)
+          if (char == "(") {
+            depth++
+          } else if (char == ")") {
+            depth--
+            if (depth == 0) {
+              closed = 1
+              break
+            }
+          }
+        }
+        if (!closed) {
+          return 1
+        }
+        offset = marker + 3
+      }
+      return 0
+    }
+    function valid_owner_delimiter(input,    offset, relative, pos, owner, archive) {
       offset = 1
       while ((relative = index(substr(input, offset), ":(")) > 0) {
         pos = offset + relative - 1
         owner = substr(input, 1, pos - 1)
+        archive = archive_path(owner)
         # The first syntactically complete owner delimiter starts the section
-        # wrapper. Later `:(` text belongs to the section name. Archive member
-        # names themselves may contain parentheses; only require them non-empty.
-        if (owner ~ /\.o$/ || archive_path(owner) != "") {
+        # wrapper. A direct-object-looking delimiter inside an open archive
+        # member is not an owner boundary (for example foo.o:(bar).o).
+        if (archive != "" || (owner ~ /\.o$/ && !has_open_archive_member(owner))) {
           return pos
         }
         offset = pos + 2
@@ -119,8 +171,14 @@ release_native_link_input_candidates() {
       # `.old` with an object suffix.
       return input ~ /\.(a|o)($|[^[:alnum:]_.+-])/
     }
-    $1 == "LOAD" && $2 ~ /\.(a|o)$/ {
-      print $2
+    $1 == "LOAD" {
+      load = $0
+      sub(/^[ \t]*LOAD[ \t]+/, "", load)
+      if (load ~ /\.(a|o)$/) {
+        print load
+      } else if (looks_like_native_input(load)) {
+        exit 1
+      }
       next
     }
     {
@@ -164,7 +222,7 @@ release_native_link_input_candidates() {
       archive = archive_path(owner)
       if (archive != "") {
         print archive
-      } else if (owner ~ /\.o$/) {
+      } else if (owner ~ /\.o$/ && !has_open_archive_member(owner)) {
         print owner
       } else {
         exit 1

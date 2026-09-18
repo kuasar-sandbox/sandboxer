@@ -11,6 +11,7 @@ source "$ROOT/scripts/release-native-materials.sh"
 
 mkdir -p "$test_root/build" "$test_root/temporary" "$test_root/system"
 printf 'object\n' > "$test_root/system/fixture.o"
+printf 'spaced GNU object\n' > "$test_root/system/gnu space.o"
 [ "$(release_native_material_label /usr/lib/Scrt1.o)" = 'system/Scrt1.o' ] \
   || fail "changed the material label for an already-safe basename"
 encoded_label="$(release_native_material_label '/usr/lib/space object.o')"
@@ -19,12 +20,34 @@ release_materials_safe_relative "$encoded_label" \
 [[ "$encoded_label" == system/encoded/* && "$encoded_label" != *' '* ]] \
   || fail "unsafe native basename was not deterministically encoded"
 printf 'test-native-materials: safe and encoded native material labels PASS\n'
+
+# dpkg-query -S treats its operand as a pattern. A wildcard-bearing literal
+# input must not inherit provenance from a different pathname matched by it.
+printf 'literal wildcard object\n' > "$test_root/system/Scrt?.o"
+printf 'different object\n' > "$test_root/system/Scrt1.o"
+if (
+  DPKG_FALSE_MATCH="$test_root/system/Scrt1.o"
+  dpkg-query() {
+    [ "$1" = -S ] || return 97
+    printf 'fixture-dev: %s\n' "$DPKG_FALSE_MATCH"
+  }
+  release_native_system_input "$test_root/system/Scrt?.o" bin/cloud-hypervisor
+) > "$test_root/dpkg-pattern.log" 2>&1; then
+  fail "accepted a dpkg pattern match for a different native input"
+fi
+grep -Fq 'native package owner does not exactly match input' "$test_root/dpkg-pattern.log" \
+  || fail "dpkg wildcard mismatch was rejected for an unrelated reason"
+printf 'test-native-materials: dpkg ownership requires exact input pathname PASS\n'
+
 # Observe dispatch without requiring the test host's distribution package DB.
 release_native_system_input() { printf '%s\t%s\n' "$1" "$2" >> "$test_root/observed"; }
 printf 'LOAD %s\n' "$test_root/build/owned.o" "$test_root/temporary/already-removed.o" \
-  "$test_root/system/fixture.o" > "$test_root/link.map"
+  "$test_root/system/fixture.o" "$test_root/system/gnu space.o" > "$test_root/link.map"
 release_native_link_inputs "$test_root/link.map" "$test_root/build" "$test_root/temporary" bin/cloud-hypervisor
-printf '%s\t%s\n' "$test_root/system/fixture.o" bin/cloud-hypervisor > "$test_root/expected"
+printf '%s\t%s\n' \
+  "$test_root/system/fixture.o" bin/cloud-hypervisor \
+  "$test_root/system/gnu space.o" bin/cloud-hypervisor \
+  | LC_ALL=C sort > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/observed"
 for mutation in missing empty relative; do
   case "$mutation" in
@@ -42,8 +65,9 @@ printf 'test-native-materials: exact system/owned-input selection PASS\n'
 # rust-lld maps describe native inputs in structurally indented input-section
 # rows instead of GNU LOAD rows. Output and symbol rows must not be interpreted
 # as inputs, and the complete input remainder may contain whitespace.
-mkdir -p "$test_root/lld-system" "$test_root/lld system"
+mkdir -p "$test_root/lld-system" "$test_root/lld system" "$test_root/lld-system/cache.a(old)"
 printf 'archive\n' > "$test_root/lld-system/libfixture.a"
+printf 'nested archive\n' > "$test_root/lld-system/cache.a(old)/libnested.a"
 printf 'startup object\n' > "$test_root/lld-system/Scrt1.o"
 printf 'spaced object\n' > "$test_root/lld system/space object.o"
 printf 'owned object\n' > "$test_root/build/owned.o"
@@ -53,6 +77,8 @@ cat > "$test_root/lld.map" <<EOF
              238              238       1c     1 .text
              238              238       1c     1         $test_root/lld-system/libfixture.a(member.o):(.text)
              248              248       10     1         $test_root/lld-system/libfixture.a(a(b).o):(.rodata)
+             250              250        8     1         $test_root/lld-system/libfixture.a(foo.o:(bar).o):(.data)
+             252              252        8     1         $test_root/lld-system/cache.a(old)/libnested.a(member.o):(.data)
              254              254       20     4         $test_root/lld-system/Scrt1.o:(.foo)bar)
              258              258        4     4         $test_root/lld-system/Scrt1.o:(.foo.o:(bar))
              264              264       10     4         $test_root/lld system/space object.o:(.text)
@@ -65,6 +91,7 @@ release_native_link_inputs "$test_root/lld.map" "$test_root/build" "$test_root/t
 printf '%s\t%s\n' \
   "$test_root/lld-system/Scrt1.o" bin/cloud-hypervisor \
   "$test_root/lld-system/libfixture.a" bin/cloud-hypervisor \
+  "$test_root/lld-system/cache.a(old)/libnested.a" bin/cloud-hypervisor \
   "$test_root/lld system/space object.o" bin/cloud-hypervisor \
   | LC_ALL=C sort > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/observed"
