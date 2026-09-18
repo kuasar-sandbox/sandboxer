@@ -10,11 +10,23 @@ release_native_copy_file() {
   install -m 0644 "$source" "$destination"
 }
 
+release_native_material_label() {
+  local input="$1" name label digest
+  name="$(basename "$input")"
+  label="system/$name"
+  if release_materials_safe_relative "$label"; then
+    printf '%s\n' "$label"
+    return
+  fi
+  digest="$(printf '%s' "$name" | sha256sum | awk '{print $1}')"
+  printf 'system/encoded/%s\n' "$digest"
+}
+
 release_native_system_input() {
   local input="$1" payload="$2" query owner source_name version label copyright common
   local source_id rpm_source sibling file count=0
   input="$(realpath -e "$input")" || fail "native link input is missing"
-  label="system/$(basename "$input")"
+  label="$(release_native_material_label "$input")"
   if command -v dpkg-query >/dev/null 2>&1 \
     && query="$(dpkg-query -S "$input" 2>/dev/null)"; then
     owner="${query%%: /*}"
@@ -75,21 +87,37 @@ release_native_system_input() {
 release_native_link_input_candidates() {
   local map="$1"
   awk '
-    function valid_owner_delimiter(input,    offset, relative, pos, owner, valid) {
+    function archive_path(owner,    marker, member) {
+      marker = index(owner, ".a(")
+      if (marker == 0 || substr(owner, length(owner), 1) != ")") {
+        return ""
+      }
+      member = substr(owner, marker + 3, length(owner) - marker - 3)
+      if (member == "") {
+        return ""
+      }
+      return substr(owner, 1, marker + 1)
+    }
+    function valid_owner_delimiter(input,    offset, relative, pos, owner) {
       offset = 1
-      valid = 0
       while ((relative = index(substr(input, offset), ":(")) > 0) {
         pos = offset + relative - 1
         owner = substr(input, 1, pos - 1)
-        if (owner ~ /\.o$/ || owner ~ /\.a\([^()]+\)$/) {
-          valid = pos
+        # The first syntactically complete owner delimiter starts the section
+        # wrapper. Later `:(` text belongs to the section name. Archive member
+        # names themselves may contain parentheses; only require them non-empty.
+        if (owner ~ /\.o$/ || archive_path(owner) != "") {
+          return pos
         }
         offset = pos + 2
       }
-      return valid
+      return 0
     }
     function looks_like_native_input(input) {
-      return input ~ /\.a($|[(:])/ || input ~ /\.o($|[(:])/
+      # Fail closed for malformed object/archive-shaped input rows, including
+      # suffix punctuation such as `.o):(`. Do not confuse ordinary names like
+      # `.old` with an object suffix.
+      return input ~ /\.(a|o)($|[^[:alnum:]_.+-])/
     }
     $1 == "LOAD" && $2 ~ /\.(a|o)$/ {
       print $2
@@ -133,9 +161,9 @@ release_native_link_input_candidates() {
         next
       }
       owner = substr(input, 1, delimiter - 1)
-      if (owner ~ /\.a\([^()]+\)$/) {
-        sub(/\([^()]+\)$/, "", owner)
-        print owner
+      archive = archive_path(owner)
+      if (archive != "") {
+        print archive
       } else if (owner ~ /\.o$/) {
         print owner
       } else {

@@ -11,6 +11,14 @@ source "$ROOT/scripts/release-native-materials.sh"
 
 mkdir -p "$test_root/build" "$test_root/temporary" "$test_root/system"
 printf 'object\n' > "$test_root/system/fixture.o"
+[ "$(release_native_material_label /usr/lib/Scrt1.o)" = 'system/Scrt1.o' ] \
+  || fail "changed the material label for an already-safe basename"
+encoded_label="$(release_native_material_label '/usr/lib/space object.o')"
+release_materials_safe_relative "$encoded_label" \
+  || fail "whitespace-bearing native basename produced an unsafe material label"
+[[ "$encoded_label" == system/encoded/* && "$encoded_label" != *' '* ]] \
+  || fail "unsafe native basename was not deterministically encoded"
+printf 'test-native-materials: safe and encoded native material labels PASS\n'
 # Observe dispatch without requiring the test host's distribution package DB.
 release_native_system_input() { printf '%s\t%s\n' "$1" "$2" >> "$test_root/observed"; }
 printf 'LOAD %s\n' "$test_root/build/owned.o" "$test_root/temporary/already-removed.o" \
@@ -44,7 +52,9 @@ cat > "$test_root/lld.map" <<EOF
              VMA              LMA     Size Align Out     In      Symbol
              238              238       1c     1 .text
              238              238       1c     1         $test_root/lld-system/libfixture.a(member.o):(.text)
+             248              248       10     1         $test_root/lld-system/libfixture.a(a(b).o):(.rodata)
              254              254       20     4         $test_root/lld-system/Scrt1.o:(.foo)bar)
+             258              258        4     4         $test_root/lld-system/Scrt1.o:(.foo.o:(bar))
              264              264       10     4         $test_root/lld system/space object.o:(.text)
              264              264        0     1                 foo.o
              274              274       10     4         $test_root/build/owned.o:(.text)
@@ -60,12 +70,13 @@ printf '%s\t%s\n' \
 cmp "$test_root/expected" "$test_root/observed"
 printf 'test-native-materials: rust-lld structured archive/direct inputs and owned filtering PASS\n'
 
-for mutation in lld-relative lld-malformed lld-archive-no-member lld-archive-empty-member lld-owned-only; do
+for mutation in lld-relative lld-malformed lld-archive-no-member lld-archive-empty-member lld-object-bad-suffix lld-owned-only; do
   case "$mutation" in
     lld-relative) printf '0 0 0 1         foreign.o:(.text)\n' > "$test_root/$mutation.map" ;;
     lld-malformed) printf '0 0 0 1         %s(member.o)\n' "$test_root/lld-system/libfixture.a" > "$test_root/$mutation.map" ;;
     lld-archive-no-member) printf '0 0 0 1         %s:(.text)\n' "$test_root/lld-system/libfixture.a" > "$test_root/$mutation.map" ;;
     lld-archive-empty-member) printf '0 0 0 1         %s():(.text)\n' "$test_root/lld-system/libfixture.a" > "$test_root/$mutation.map" ;;
+    lld-object-bad-suffix) printf '0 0 0 1         %s):(.text)\n' "$test_root/lld-system/Scrt1.o" > "$test_root/$mutation.map" ;;
     lld-owned-only) printf '0 0 0 1         %s:(.text)\n' "$test_root/build/owned.o" > "$test_root/$mutation.map" ;;
   esac
   if (release_native_link_inputs "$test_root/$mutation.map" "$test_root/build" \
@@ -75,17 +86,23 @@ for mutation in lld-relative lld-malformed lld-archive-no-member lld-archive-emp
 done
 printf 'test-native-materials: rust-lld malformed/relative/owned-only rejection PASS\n'
 
-cat > "$test_root/lld-mixed-malformed.map" <<EOF
+for malformed in archive object-suffix; do
+  case "$malformed" in
+    archive) malformed_row="$test_root/lld-system/libfixture.a(member.o)" ;;
+    object-suffix) malformed_row="$test_root/lld-system/Scrt1.o):(.text)" ;;
+  esac
+  cat > "$test_root/lld-mixed-$malformed.map" <<EOF
 0 0 0 1         $test_root/lld-system/Scrt1.o:(.text)
-0 0 0 1         $test_root/lld-system/libfixture.a(member.o)
+0 0 0 1         $malformed_row
 EOF
-: > "$test_root/observed"
-if (release_native_link_inputs "$test_root/lld-mixed-malformed.map" "$test_root/build" \
-    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
-  fail "accepted a mixed valid/malformed rust-lld map"
-fi
-[ ! -s "$test_root/observed" ] \
-  || fail "processed a valid rust-lld input before rejecting a malformed row"
+  : > "$test_root/observed"
+  if (release_native_link_inputs "$test_root/lld-mixed-$malformed.map" "$test_root/build" \
+      "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+    fail "accepted a mixed valid/malformed rust-lld map: $malformed"
+  fi
+  [ ! -s "$test_root/observed" ] \
+    || fail "processed a valid rust-lld input before rejecting malformed $malformed row"
+done
 printf 'test-native-materials: mixed valid/malformed rust-lld rejection PASS\n'
 
 mkdir -p "$test_root/system-a" "$test_root/system-b"
