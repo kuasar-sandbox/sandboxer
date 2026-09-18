@@ -70,9 +70,11 @@ printf 'archive\n' > "$test_root/lld-system/libfixture.a"
 printf 'nested archive\n' > "$test_root/lld-system/cache.a(old)/libnested.a"
 printf 'startup object\n' > "$test_root/lld-system/Scrt1.o"
 printf 'delimiter object\n' > "$test_root/lld-system/foo.o:(bar).o"
+printf 'nested-marker archive\n' > "$test_root/lld-system/outer-missing.a(inner.a"
 printf 'non-native object\n' > "$test_root/lld-system/libfixture.rlib"
 printf 'spaced object\n' > "$test_root/lld system/space object.o"
 printf 'owned object\n' > "$test_root/build/owned.o"
+printf 'owned archive\n' > "$test_root/build/libowned.a"
 printf 'temporary object\n' > "$test_root/temporary/transient.o"
 cat > "$test_root/lld.map" <<EOF
              VMA              LMA     Size Align Out     In      Symbol
@@ -86,10 +88,12 @@ cat > "$test_root/lld.map" <<EOF
              254              254       20     4         $test_root/lld-system/Scrt1.o:(.foo)bar)
              258              258        4     4         $test_root/lld-system/Scrt1.o:(.foo.o:(bar))
              260              260        4     4         $test_root/lld-system/foo.o:(bar).o:(.text)
+             261              261        4     4         $test_root/lld-system/outer-missing.a(inner.a(member.o):(.text)
              262              262        4     4         $test_root/lld-system/libfixture.rlib:(.foo.o)
              264              264       10     4         $test_root/lld system/space object.o:(.text)
              264              264        0     1                 foo.o
              274              274       10     4         $test_root/build/owned.o:(.text)
+             275              275       10     4         $test_root/build/libowned.a(foo.o:(bar).o):(.text)
              284              284       10     4         $test_root/temporary/transient.o:(.text)
 EOF
 : > "$test_root/observed"
@@ -99,6 +103,7 @@ printf '%s\t%s\n' \
   "$test_root/lld-system/libfixture.a" bin/cloud-hypervisor \
   "$test_root/lld-system/cache.a(old)/libnested.a" bin/cloud-hypervisor \
   "$test_root/lld-system/foo.o:(bar).o" bin/cloud-hypervisor \
+  "$test_root/lld-system/outer-missing.a(inner.a" bin/cloud-hypervisor \
   "$test_root/lld system/space object.o" bin/cloud-hypervisor \
   | LC_ALL=C sort > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/observed"
@@ -151,6 +156,19 @@ if (release_native_link_inputs "$test_root/lld-ambiguous.map" "$test_root/build"
   fail "accepted an lld row with two existing owner interpretations"
 fi
 printf 'test-native-materials: ambiguous existing lld owners fail closed PASS\n'
+
+# Multiple `.a(` markers can also encode more than one archive interpretation
+# even when the row has only one `:(` section delimiter. Require the real
+# filesystem-backed archive owner to be unique.
+printf 'outer archive\n' > "$test_root/lld-system/outer.a"
+printf 'inner archive path\n' > "$test_root/lld-system/outer.a(inner.a"
+printf '0 0 0 1         %s(member.o):(.text)\n' \
+  "$test_root/lld-system/outer.a(inner.a" > "$test_root/lld-archive-ambiguous.map"
+if (release_native_link_inputs "$test_root/lld-archive-ambiguous.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted an lld row with two existing archive interpretations"
+fi
+printf 'test-native-materials: ambiguous existing lld archive markers fail closed PASS\n'
 
 mkdir -p "$test_root/system-a" "$test_root/system-b"
 printf 'first native input\n' > "$test_root/system-a/same.a"

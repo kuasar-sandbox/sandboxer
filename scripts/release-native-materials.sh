@@ -96,28 +96,17 @@ release_native_system_input() {
 }
 
 release_native_candidate_canonical() {
-  local candidate="$1" build_root="$2" temporary_root="$3" canonical
-  [[ "$candidate" == /* ]] || return 1
-  if [ -e "$candidate" ]; then
-    realpath -e "$candidate"
-    return
-  fi
-  canonical="$(realpath -m "$candidate")" || return 1
-  case "$canonical" in
-    "$build_root"/*|"$temporary_root"/*)
-      printf '%s\n' "$canonical"
-      return
-      ;;
-  esac
-  return 1
+  local candidate="$1"
+  [[ "$candidate" == /* && -e "$candidate" ]] || return 1
+  realpath -e "$candidate"
 }
 
 # Resolve only lld rows whose textual owner boundary is ambiguous. lld does not
 # escape `:(` or parentheses in file/member names, so syntax alone cannot
 # distinguish those bytes from the owner/section wrapper. In that rare case,
-# require one unique file/archive candidate that actually exists (or belongs to
-# the known build/temporary roots). Multiple plausible files fail closed rather
-# than allowing provenance to be attributed to the wrong path.
+# require one unique file/archive candidate that actually exists. Multiple
+# plausible files fail closed rather than allowing provenance to be attributed
+# to the wrong path.
 release_native_lld_ambiguous_candidate() {
   local input="$1" build_root="$2" temporary_root="$3"
   local rest="$input" prefix='' before owner body archive_rest archive_prefix archive_before member
@@ -269,6 +258,14 @@ release_native_link_input_candidates() {
       }
       return count
     }
+    function archive_marker_count(input,    rest, pos, count) {
+      rest = input
+      while ((pos = index(rest, ".a(")) > 0) {
+        count++
+        rest = substr(rest, pos + 3)
+      }
+      return count
+    }
     function looks_like_native_input(input) {
       return input ~ /\.(a|o)($|[^[:alnum:]_.+-])/
     }
@@ -304,10 +301,10 @@ release_native_link_input_candidates() {
       }
       input = substr(work, indent + 1)
 
-      # More than one textual delimiter is inherently ambiguous because lld
-      # leaves both file/member names and section names unescaped. Resolve that
-      # rare row against the actual link inputs outside awk.
-      if (delimiter_count(input) > 1) {
+      # Multiple textual owner delimiters or archive markers are inherently
+      # ambiguous because lld leaves file/member/section names unescaped. Resolve
+      # those rows against the actual existing link inputs outside awk.
+      if (delimiter_count(input) > 1 || archive_marker_count(input) > 1) {
         print "R\t" input
         next
       }
