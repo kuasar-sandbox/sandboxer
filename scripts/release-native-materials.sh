@@ -91,13 +91,15 @@ release_native_system_input() {
   else
     fail "native input has no package/source material: $input"
   fi
-  release_materials_record_source "$payload" "system:$(basename "$input")" "$version" \
+  local record_name
+  record_name="system:${label#system/}"
+  release_materials_record_source "$payload" "$record_name" "$version" \
     "$source_id" "sha256:$(sha256sum "$input" | awk '{print $1}');package:$source_name" "$label"
 }
 
 release_native_candidate_canonical() {
   local candidate="$1"
-  [[ "$candidate" == /* && -e "$candidate" ]] || return 1
+  [[ "$candidate" == /* && -f "$candidate" ]] || return 1
   realpath -e "$candidate"
 }
 
@@ -144,7 +146,7 @@ release_native_lld_ambiguous_candidate() {
       # a non-empty member wrapper. Its existence must not invalidate a later
       # direct-object owner whose filename itself contains `:(`.
       path=''
-    elif [ -e "$owner" ]; then
+    elif [ -f "$owner" ]; then
       canonical="$(realpath -e "$owner")" || return 1
       path="$canonical"
       kind=non-native
@@ -152,7 +154,8 @@ release_native_lld_ambiguous_candidate() {
       path=''
     fi
     if [ -n "$path" ]; then
-      if [ -n "$found_path" ] && [ "$found_path" != "$path" ]; then
+      if [ -n "$found_path" ] \
+        && { [ "$found_path" != "$path" ] || [ "$found_kind" != "$kind" ]; }; then
         return 1
       fi
       found_path="$path"
@@ -173,7 +176,8 @@ release_native_lld_ambiguous_candidate() {
         member="${archive_rest#*".a("}"
         if [ -n "$member" ]; then
           if canonical="$(release_native_candidate_canonical "$archive_prefix" "$build_root" "$temporary_root")"; then
-            if [ -n "$found_path" ] && [ "$found_path" != "$canonical" ]; then
+            if [ -n "$found_path" ] \
+              && { [ "$found_path" != "$canonical" ] || [ "$found_kind" != native ]; }; then
               return 1
             fi
             found_path="$canonical"
@@ -205,7 +209,8 @@ release_native_lld_ambiguous_candidate() {
         member="${rust_rest#*".rlib("}"
         if [ -n "$member" ]; then
           if canonical="$(release_native_candidate_canonical "$rust_prefix" "$build_root" "$temporary_root")"; then
-            if [ -n "$found_path" ] && [ "$found_path" != "$canonical" ]; then
+            if [ -n "$found_path" ] \
+              && { [ "$found_path" != "$canonical" ] || [ "$found_kind" != non-native ]; }; then
               return 1
             fi
             found_path="$canonical"

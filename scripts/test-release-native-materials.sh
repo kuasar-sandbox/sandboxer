@@ -21,6 +21,35 @@ release_materials_safe_relative "$encoded_label" \
   || fail "unsafe native basename was not deterministically encoded"
 printf 'test-native-materials: safe and encoded native material labels PASS\n'
 
+# The source-record name must use the same safe identity as the material label.
+# A tab is legal in a filesystem basename and is preserved by lld, but cannot be
+# written as a raw TSV field in the release source manifest.
+(
+  tab_input="$test_root/system/tab"$'\t'"object.o"
+  tab_license="$test_root/system/LICENSE-tab"
+  printf 'tab object\n' > "$tab_input"
+  printf 'license\n' > "$tab_license"
+  export RELEASE_MATERIALS_WORK="$test_root/tab-materials-work"
+  export RELEASE_MATERIALS_STAGE="$test_root/tab-materials-stage"
+  export RELEASE_MATERIALS_UNIT=sandboxer
+  mkdir -p "$RELEASE_MATERIALS_WORK" "$RELEASE_MATERIALS_STAGE"
+  dpkg-query() { return 1; }
+  rpm() {
+    case "$1" in
+      -qf) printf 'fixture-devel\t1.0-1\tfixture-1.0-1.src.rpm\n' ;;
+      -qa) printf 'fixture-devel.x86_64\tfixture-1.0-1.src.rpm\n' ;;
+      -ql) printf '%s\n' "$tab_license" ;;
+      *) return 97 ;;
+    esac
+  }
+  release_native_system_input "$tab_input" bin/cloud-hypervisor
+  tab_label="$(release_native_material_label "$tab_input")"
+  tab_record_name="$(awk -F '\t' 'NR == 1 { print $2 }' "$RELEASE_MATERIALS_WORK/sources")"
+  [ "$tab_record_name" = "system:${tab_label#system/}" ] \
+    || fail "tab-bearing native basename did not use the encoded source identity"
+)
+printf 'test-native-materials: encoded native source record identity PASS\n'
+
 # dpkg-query -S treats its operand as a pattern. A wildcard-bearing literal
 # input must not inherit provenance from a different pathname matched by it.
 printf 'literal wildcard object\n' > "$test_root/system/Scrt?.o"
@@ -146,6 +175,40 @@ fi
 [ ! -s "$test_root/observed" ] \
   || fail "processed a later valid input after ambiguous deleted unowned input"
 printf 'test-native-materials: ambiguous deleted unowned lld input rejection PASS\n'
+
+# A directory cannot be an lld-linked object/archive candidate. Do not let an
+# existing directory at a longer ambiguous prefix hide a missing system object.
+mkdir -p "$test_root/lld-system/deleted-dir.o:(.foo)"
+cat > "$test_root/lld-directory-candidate.map" <<EOF
+0 0 0 1         $test_root/lld-system/deleted-dir.o:(.foo):(.bar)
+0 0 0 1         $test_root/lld-system/Scrt1.o:(.text)
+EOF
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/lld-directory-candidate.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted an lld directory as an owner candidate"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a later valid input after an lld directory candidate"
+printf 'test-native-materials: lld directory owner candidate rejection PASS\n'
+
+# Native and Cargo-covered interpretations remain ambiguous even when symlink
+# names canonicalize to the same file. Provenance kind is part of the identity.
+printf 'shared archive\n' > "$test_root/lld-system/shared-kind-archive"
+ln -s "$test_root/lld-system/shared-kind-archive" "$test_root/lld-system/kind.rlib"
+ln -s "$test_root/lld-system/shared-kind-archive" "$test_root/lld-system/kind.rlib(member.a"
+cat > "$test_root/lld-kind-conflict.map" <<EOF
+0 0 0 1         $test_root/lld-system/kind.rlib(member.a(foo)):(.text)
+0 0 0 1         $test_root/lld-system/Scrt1.o:(.text)
+EOF
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/lld-kind-conflict.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted canonical lld owner candidates with conflicting provenance kinds"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a later valid input after conflicting lld provenance kinds"
+printf 'test-native-materials: canonical lld provenance-kind conflict rejection PASS\n'
 
 for mutation in lld-relative lld-malformed lld-archive-no-member lld-archive-empty-member lld-object-bad-suffix lld-owned-only; do
   case "$mutation" in
