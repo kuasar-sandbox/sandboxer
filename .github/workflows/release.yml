@@ -248,10 +248,14 @@ jobs:
         working-directory: src/sandboxer
         run: |
           set -euo pipefail
-          # Disk DIO tests need the workspace filesystem; tmpfs tests select /dev/shm.
+          # Keep disk DIO tests on the workspace filesystem and Unix socket paths short.
+          # The tmpfs tests select /dev/shm explicitly.
           test_tmp=$(mktemp -d "$GITHUB_WORKSPACE/.release-test.XXXXXX")
-          trap 'rm -rf "$test_tmp"' EXIT
-          export TMPDIR="$test_tmp"
+          test_link=
+          trap 'rm -rf "$test_tmp"; if [ -n "$test_link" ]; then rm -rf "$test_link"; fi' EXIT
+          test_link=$(mktemp -d /tmp/XXXXXX)
+          ln -s "$test_tmp" "$test_link/t"
+          export TMPDIR="$test_link/t"
           make test
           make vet
           make build
