@@ -93,6 +93,7 @@ cat > "$test_root/lld.map" <<EOF
              261              261        4     4         $test_root/lld-system/outer-missing.a(inner.a(member.o):(.text)
              262              262        4     4         $test_root/lld-system/libfixture.rlib:(.foo.o)
              263              263        4     4         $test_root/lld-system/libfixture.rlib(member.o):(.text)
+             263              263        4     4         $test_root/lld-system/libfixture.rlib(member.a(foo.o):(.text)
              264              264       10     4         $test_root/lld system/space object.o:(.text)
              265              265        4     4         $test_root/lld-system/direct-prefix.a:(x).o:(.text)
              264              264        0     1                 foo.o
@@ -128,6 +129,23 @@ release_native_link_inputs "$test_root/lld-removed-owned.map" "$test_root/build"
 printf '%s\t%s\n' "$test_root/lld-system/Scrt1.o" bin/cloud-hypervisor > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/observed"
 printf 'test-native-materials: removed ambiguous owned lld input filtering PASS\n'
+
+# A deleted ambiguous input is filterable only when every missing native
+# interpretation remains inside an owned build/temp root. A missing system-side
+# interpretation must keep the map fail-closed rather than being hidden by an
+# invented owned prefix.
+cat > "$test_root/lld-removed-mixed-root.map" <<EOF
+0 0 0 1         $test_root/build/prefix.o:(dir)/../../lld-system/removed-system.o:(.text)
+0 0 0 1         $test_root/lld-system/Scrt1.o:(.text)
+EOF
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/lld-removed-mixed-root.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted ambiguous deleted lld input with an unowned interpretation"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a later valid input after ambiguous deleted unowned input"
+printf 'test-native-materials: ambiguous deleted unowned lld input rejection PASS\n'
 
 for mutation in lld-relative lld-malformed lld-archive-no-member lld-archive-empty-member lld-object-bad-suffix lld-owned-only; do
   case "$mutation" in

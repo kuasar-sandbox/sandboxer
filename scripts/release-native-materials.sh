@@ -118,7 +118,8 @@ release_native_lld_ambiguous_candidate() {
   local input="$1" build_root="$2" temporary_root="$3"
   local rest="$input" prefix='' before owner body archive_rest archive_prefix archive_before member
   local rust_rest rust_prefix rust_before
-  local canonical path kind='' found_path='' found_kind='' invalid_native=false missing_owned_candidate=false
+  local canonical path kind='' found_path='' found_kind='' invalid_native=false
+  local missing_owned_candidate=false missing_unowned_native_candidate=false
 
   [[ "$input" == *')' ]] || return 1
   while [[ "$rest" == *':('* ]]; do
@@ -134,6 +135,8 @@ release_native_lld_ambiguous_candidate() {
         path=''
         if release_native_candidate_owned_root "$owner" "$build_root" "$temporary_root"; then
           missing_owned_candidate=true
+        else
+          missing_unowned_native_candidate=true
         fi
       fi
     elif [[ "$owner" == *.a ]]; then
@@ -177,6 +180,8 @@ release_native_lld_ambiguous_candidate() {
             found_kind=native
           elif release_native_candidate_owned_root "$archive_prefix" "$build_root" "$temporary_root"; then
             missing_owned_candidate=true
+          else
+            missing_unowned_native_candidate=true
           fi
         elif canonical="$(release_native_candidate_canonical "$archive_prefix" "$build_root" "$temporary_root")"; then
           # If the candidate archive itself is real, this is an empty member,
@@ -220,6 +225,7 @@ release_native_lld_ambiguous_candidate() {
 
   $invalid_native && return 1
   if [ -z "$found_path" ]; then
+    $missing_unowned_native_candidate && return 1
     $missing_owned_candidate && return 0
     return 1
   fi
@@ -346,7 +352,7 @@ release_native_link_input_candidates() {
       # Multiple textual owner delimiters or archive markers are inherently
       # ambiguous because lld leaves file/member/section names unescaped. Resolve
       # those rows against the actual existing link inputs outside awk.
-      if (delimiter_count(input) > 1 || archive_marker_count(input) > 1) {
+      if (delimiter_count(input) > 1 || archive_marker_count(input) > 1 || input ~ /\.rlib\(/) {
         print "R\t" input
         next
       }
