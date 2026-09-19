@@ -342,7 +342,7 @@ mkdir -p "$TMP/rust/bin" "$TMP/system"
 mkdir -p "$TMP/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib"
 printf 'fixture linked Rust standard library\n' > "$TMP/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-fixture.rlib"
 install -m 0755 "$TMP/release-build-bin/rustc" "$TMP/rust/bin/rustc"
-printf 'fixture static object\n' > "$TMP/system/fixture object.o"
+printf 'fixture static object\n' > "$TMP/system/fixture.o"
 printf 'fixture system license\n' > "$TMP/system/LICENSE"
 cat > "$TMP/release-build-bin/dpkg-query" <<'EOF'
 #!/usr/bin/env bash
@@ -377,7 +377,7 @@ printf '%s\n' \
   '{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#fixture@1.0.0","target":{"name":"cloud-hypervisor"},"executable":"/fixture/cloud-hypervisor"}' \
   '{"reason":"build-finished","success":true}' > "$TMP/ch-output/build-report.jsonl"
 printf '             238              238       1c     1         %s:(.text)\n' \
-  "$TMP/system/fixture object.o" > "$TMP/ch-output/link.map"
+  "$TMP/system/fixture.o" > "$TMP/ch-output/link.map"
 native_fixture_env=(
   RELEASE_BIN_DIR="$TMP/bin"
   RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR="$TMP/cloud-hypervisor"
