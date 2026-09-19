@@ -491,3 +491,6 @@ E2B memory=true
   -> Snapshot resume source
   -> sandbox-ctl run --restore
 ```
+
+
+S/E suffix geometry, deterministic ZIP encoding and sparse prefix/append views are implemented by `accelerator/pkg/tailzip`. This package supplies ordered role entries and size limits; the Sandbox/Snapshot modules retain their portable config, JSON/state and device-topology validation. Logical reference locations use `manifest.RefLocations`.
