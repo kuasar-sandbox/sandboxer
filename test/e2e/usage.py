@@ -357,7 +357,8 @@ def main():
                 if path.is_file() and path.suffix in (".json", ".log", ".usage"):
                     dest = evidence / path.relative_to(work)
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(path, dest)
+                    # The suite runs as root; do not preserve private source modes in CI evidence.
+                    shutil.copyfile(path, dest)
         atexit.register(collect_evidence)
     metadata = {"sandbox_ctl_build": run(GO, "version", "-m", BIN / "sandbox-ctl"),
                 "sandbox_init_build": run(GO, "version", "-m", BIN / "sandbox-init"),
