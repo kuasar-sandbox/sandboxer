@@ -103,6 +103,8 @@ printf 'bare archive prefix\n' > "$test_root/lld-system/direct-prefix.a"
 printf 'direct object after archive prefix\n' > "$test_root/lld-system/direct-prefix.a:(x).o"
 printf 'empty member archive prefix\n' > "$test_root/lld-system/empty-prefix.a"
 printf 'direct object after empty member prefix\n' > "$test_root/lld-system/empty-prefix.a():(foo).o"
+printf 'bare rlib filename prefix\n' > "$test_root/lld-system/direct-prefix.rlib"
+printf 'direct object after rlib filename prefix\n' > "$test_root/lld-system/direct-prefix.rlib:(x).o"
 printf 'nested-marker archive\n' > "$test_root/lld-system/outer-missing.a(inner.a"
 printf 'non-native object\n' > "$test_root/lld-system/libfixture.rlib"
 printf 'spaced object\n' > "$test_root/lld system/space object.o"
@@ -127,6 +129,7 @@ cat > "$test_root/lld.map" <<EOF
              264              264       10     4         $test_root/lld system/space object.o:(.text)
              265              265        4     4         $test_root/lld-system/direct-prefix.a:(x).o:(.text)
              266              266        4     4         $test_root/lld-system/empty-prefix.a():(foo).o:(.text)
+             267              267        4     4         $test_root/lld-system/direct-prefix.rlib:(x).o:(.text)
              264              264        0     1                 foo.o
              274              274       10     4         $test_root/build/owned.o:(.text)
              275              275       10     4         $test_root/build/libowned.a(foo.o:(bar).o):(.text)
@@ -142,6 +145,7 @@ printf '%s\t%s\n' \
   "$test_root/lld-system/outer-missing.a(inner.a" bin/cloud-hypervisor \
   "$test_root/lld-system/direct-prefix.a:(x).o" bin/cloud-hypervisor \
   "$test_root/lld-system/empty-prefix.a():(foo).o" bin/cloud-hypervisor \
+  "$test_root/lld-system/direct-prefix.rlib:(x).o" bin/cloud-hypervisor \
   "$test_root/lld system/space object.o" bin/cloud-hypervisor \
   | LC_ALL=C sort > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/observed"
@@ -245,6 +249,41 @@ fi
 [ ! -s "$test_root/observed" ] \
   || fail "processed a valid input before rejecting a newline-split lld row"
 printf 'test-native-materials: newline-split lld native input rejection PASS\n'
+
+# A newline continuation can itself begin with text that looks exactly like
+# lld's four numeric columns. The first input-column fragment is already
+# malformed because it lost its `:(section)` wrapper, so reject it before the
+# numeric-looking continuation can be mistaken for another map row.
+numeric_newline_input="$test_root/lld-system/numeric-newline"$'\n'"0 0 0 1 break.o"
+printf 'numeric newline object\n' > "$numeric_newline_input"
+{
+  printf '0 0 0 1         %s:(.text)\n' "$test_root/lld-system/Scrt1.o"
+  printf '0 0 0 1         %s:(.text)\n' "$numeric_newline_input"
+} > "$test_root/lld-numeric-newline-input.map"
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/lld-numeric-newline-input.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted a numeric-looking continuation of a newline-split lld input"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a valid input before rejecting a numeric-looking newline continuation"
+printf 'test-native-materials: numeric-looking newline continuation rejection PASS\n'
+
+# A standalone bare `.rlib:(section)` row is not the real Cargo-covered
+# `.rlib(member):(section)` form. It must fail closed instead of disappearing
+# when another valid native input keeps the map non-empty.
+cat > "$test_root/lld-standalone-bare-rlib.map" <<EOF
+0 0 0 1         $test_root/lld-system/libfixture.rlib:(.text)
+0 0 0 1         $test_root/lld-system/Scrt1.o:(.text)
+EOF
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/lld-standalone-bare-rlib.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted a standalone bare rlib lld owner row"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a later valid input after a standalone bare rlib row"
+printf 'test-native-materials: standalone bare rlib owner rejection PASS\n'
 
 # Native and Cargo-covered interpretations remain ambiguous even when symlink
 # names canonicalize to the same file. Provenance kind is part of the identity.

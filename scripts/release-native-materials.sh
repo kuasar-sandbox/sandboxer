@@ -367,10 +367,23 @@ release_native_link_input_candidates() {
       }
       input = substr(work, indent + 1)
 
+      # Every lld input-column row is an input-section row and therefore ends
+      # in the `:(section)` wrapper. A newline in a pathname can split the row
+      # before that wrapper; reject the first physical fragment itself so a
+      # continuation that happens to resemble four numeric columns cannot be
+      # reclassified and silently skipped.
+      if (input !~ /:\(/ || substr(input, length(input), 1) != ")") {
+        exit 1
+      }
+
       # Multiple textual owner delimiters or archive markers are inherently
       # ambiguous because lld leaves file/member/section names unescaped. Resolve
-      # those rows against the actual existing link inputs outside awk.
-      if (delimiter_count(input) > 1 || archive_marker_count(input) > 1 || input ~ /\.rlib\(/) {
+      # those rows against the actual existing link inputs outside awk. A bare
+      # `.rlib:(...)` prefix also goes through the resolver: it is not a valid
+      # Cargo-covered owner by itself, but those bytes may be part of a later
+      # valid direct-object filename such as `x.rlib:(foo).o`.
+      if (delimiter_count(input) > 1 || archive_marker_count(input) > 1 ||
+          input ~ /\.rlib\(/ || input ~ /\.rlib:\(/) {
         print "R\t" input
         next
       }
