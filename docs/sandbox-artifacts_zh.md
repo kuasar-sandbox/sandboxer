@@ -509,3 +509,9 @@ E2B memory=true
 
 
 S/E 后缀几何、确定性 ZIP 编码及 sparse prefix/append 视图由 `accelerator/pkg/tailzip` 实现。Sandbox/Snapshot 模块提供有序角色条目与大小上限，保留 portable config、JSON/state 和设备拓扑校验。逻辑引用位置共用 `manifest.RefLocations`。
+
+### 发布已有 Manifest 根
+
+`publish` 输入可以是本地/located 载体、Bundle selector 或 `manifest://` 根。打开后按 Sandbox E 或 Snapshot S 校验逻辑角色。`PublishSource` 同时支持已经组装完成的 Snapshot source，source 所有权由调用方保留。
+
+located tarstream 输出直接使用可用的载体身份。尚无可用身份的 Manifest 或组合 source 先流式计算身份，再以相同 source 和 codec 重读并写入最终内容寻址路径。仅创建最终文件。调用方保持 source 不变且可重复读取。已有目标继续完整校验，实际写入中内容变化时发布失败。

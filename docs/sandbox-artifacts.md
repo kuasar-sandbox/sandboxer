@@ -494,3 +494,9 @@ E2B memory=true
 
 
 S/E suffix geometry, deterministic ZIP encoding and sparse prefix/append views are implemented by `accelerator/pkg/tailzip`. This package supplies ordered role entries and size limits; the Sandbox/Snapshot modules retain their portable config, JSON/state and device-topology validation. Logical reference locations use `manifest.RefLocations`.
+
+### Publishing existing Manifest roots
+
+The `publish` input may be a local/located carrier, Bundle selector, or `manifest://` root. Its logical role is validated as Sandbox E or Snapshot S after opening. `PublishSource` also accepts an assembled Snapshot source and retains caller source ownership.
+
+Located tarstream output uses an available carrier identity directly. A Manifest or composed source without an available identity is streamed once to calculate it, then reread with the same source and codec to write the final content-addressed path. Only the final file is created. The caller keeps the source immutable and repeatable. Existing targets undergo complete validation, and changed content during writing fails publication.
