@@ -126,7 +126,7 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 func parseArchive(ctx context.Context, stream fetch.Stream) (uint64, map[string][]byte, error) {
 	names := []string{ConfigJSONName, StateJSONName, SnapshotCfgName}
 	limits := map[string]int{ConfigJSONName: MaxConfigJSONBytes, StateJSONName: MaxStateJSONBytes, SnapshotCfgName: MaxSnapshotCfgBytes}
-	base, bodies, err := tailzip.ReadCanonical(ctx, tailReadSource{stream}, names, limits)
+	base, bodies, err := tailzip.ReadCanonical(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size(), names, limits)
 	if err != nil {
 		return 0, nil, fmt.Errorf("snapshot ZIP: %w", err)
 	}
@@ -138,10 +138,18 @@ func parseArchive(ctx context.Context, stream fetch.Stream) (uint64, map[string]
 	return base, bodies, nil
 }
 
-type tailReadSource struct{ fetch.Stream }
+// The owning artifact stream guarantees random access; retain retry context
+// when adapting it to the common suffix reader's explicit io.ReaderAt contract.
+type tailReaderAt struct {
+	ctx    context.Context
+	stream fetch.Stream
+}
 
-func (s tailReadSource) ReadAt(ctx context.Context, b []byte, off uint64) (int, error) {
-	return readretry.ReadAt(ctx, len(b), func() (int, error) { return s.Stream.ReadAt(ctx, b, off) })
+func (r tailReaderAt) ReadAt(b []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, io.EOF
+	}
+	return readretry.ReadAt(r.ctx, len(b), func() (int, error) { return r.stream.ReadAt(r.ctx, b, uint64(off)) })
 }
 
 func entryLimit(name string) int {
@@ -156,7 +164,7 @@ func entryLimit(name string) int {
 }
 
 func parseEOCD(ctx context.Context, stream fetch.Stream) (base, centralStart, centralSize uint64, entries int, err error) {
-	footer, err := tailzip.ReadFooter(ctx, tailReadSource{stream})
+	footer, err := tailzip.ReadFooter(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size())
 	return footer.Base, footer.CentralStart, footer.CentralSize, footer.Count, err
 }
 

@@ -189,7 +189,7 @@ func PayloadIfSandbox(ctx context.Context, stream fetch.Stream, required bool) (
 }
 
 func claimsSandboxRuntimeConfig(ctx context.Context, stream fetch.Stream) (bool, error) {
-	names, _, err := tailzip.Names(ctx, tailReadSource{stream}, 64, 128<<10)
+	names, _, err := tailzip.Names(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size(), 64, 128<<10)
 	if err != nil {
 		return false, fmt.Errorf("sandbox payload ZIP metadata: %w", err)
 	}
@@ -405,7 +405,7 @@ func exactEntryOrder(entries map[string][]byte) ([]string, error) {
 }
 
 func parseStrictArchive(ctx context.Context, stream fetch.Stream) (*parsedArchive, error) {
-	footer, err := tailzip.ReadFooter(ctx, tailReadSource{stream})
+	footer, err := tailzip.ReadFooter(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size())
 	if err != nil {
 		return nil, fmt.Errorf("sandbox ZIP EOCD: %w", err)
 	}
@@ -417,7 +417,7 @@ func parseStrictArchive(ctx context.Context, stream fetch.Stream) (*parsedArchiv
 	default:
 		return nil, fmt.Errorf("sandbox ZIP has %d entries (want 1 or 2)", footer.Count)
 	}
-	base, bodies, err := tailzip.ReadCanonical(ctx, tailReadSource{stream}, names, map[string]int{ImageConfigName: MaxImageConfigBytes, config.SandboxRuntimeConfigName: config.MaxPortableConfigBytes})
+	base, bodies, err := tailzip.ReadCanonical(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size(), names, map[string]int{ImageConfigName: MaxImageConfigBytes, config.SandboxRuntimeConfigName: config.MaxPortableConfigBytes})
 	if err != nil {
 		return nil, fmt.Errorf("sandbox ZIP: %w", err)
 	}
@@ -428,13 +428,21 @@ func parseStrictArchive(ctx context.Context, stream fetch.Stream) (*parsedArchiv
 	return &parsedArchive{base: base, entries: entries, bodies: bodies}, nil
 }
 
-type tailReadSource struct{ fetch.Stream }
+// The owning artifact stream guarantees random access; retain retry context
+// when adapting it to the common suffix reader's explicit io.ReaderAt contract.
+type tailReaderAt struct {
+	ctx    context.Context
+	stream fetch.Stream
+}
 
-func (s tailReadSource) ReadAt(ctx context.Context, b []byte, off uint64) (int, error) {
-	return readretry.ReadAt(ctx, len(b), func() (int, error) { return s.Stream.ReadAt(ctx, b, off) })
+func (r tailReaderAt) ReadAt(b []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, io.EOF
+	}
+	return readretry.ReadAt(r.ctx, len(b), func() (int, error) { return r.stream.ReadAt(r.ctx, b, uint64(off)) })
 }
 func parseEOCD(ctx context.Context, stream fetch.Stream) (base, centralStart, centralSize uint64, entries int, err error) {
-	footer, err := tailzip.ReadFooter(ctx, tailReadSource{stream})
+	footer, err := tailzip.ReadFooter(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size())
 	return footer.Base, footer.CentralStart, footer.CentralSize, footer.Count, err
 }
 
