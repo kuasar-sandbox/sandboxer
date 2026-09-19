@@ -381,19 +381,36 @@ release_native_link_input_candidates() {
     # numeric-row classification so a continuation such as
     # `0 0 0 1 break.o:(.text)` cannot masquerade as an output row.
     pending_lld_owner {
-      if (!structured_row()) {
+      if ($1 == "LOAD") {
+        # A new GNU record proves the prior lld-looking line was a standalone
+        # output/symbol row rather than a pathname continuation. Process this
+        # LOAD normally below.
+        pending_lld_owner = 0
+      } else if (!structured_row()) {
         if (looks_like_native_input($0) && $0 ~ /:\(/) {
           exit 1
         }
-        pending_lld_owner = 0
+        # Path bytes may contain more than one newline. Keep the ambiguity
+        # until a definite new map record appears instead of trusting the
+        # first harmless continuation.
+        next
       } else {
         pending_work = after_four_columns($0)
         pending_indent = content_indent(pending_work)
         pending_value = pending_indent >= 0 ? substr(pending_work, pending_indent + 1) : ""
-        if (looks_like_native_input(pending_value) && pending_value ~ /:\(/) {
+        if (pending_indent != 9 && looks_like_native_input(pending_value) &&
+            pending_value ~ /:\(/) {
           exit 1
         }
-        pending_lld_owner = 0
+        if (pending_indent == 9) {
+          # A normal In-column row is a definite new record. Clear the
+          # tentative output/path-prefix state and process this row below.
+          pending_lld_owner = 0
+        } else {
+          # Output/symbol-looking physical rows can also be arbitrary pathname
+          # continuation bytes; retain the state until a definite record.
+          next
+        }
       }
     }
 
@@ -403,6 +420,7 @@ release_native_link_input_candidates() {
     # non-native input and clears the tentative state.
     pending_gnu_load {
       if ($1 == "LOAD") {
+        # A new LOAD is a definite record; process it normally below.
         pending_gnu_load = 0
       } else if (structured_row()) {
         pending_work = after_four_columns($0)
@@ -411,12 +429,20 @@ release_native_link_input_candidates() {
         if (pending_indent != 9 && looks_like_native_load(pending_value)) {
           exit 1
         }
-        pending_gnu_load = 0
+        if (pending_indent == 9) {
+          # A normal lld In-column row proves the tentative GNU prefix ended.
+          # Clear the state and let the lld parser consume this row.
+          pending_gnu_load = 0
+        } else {
+          # A GNU pathname can span multiple physical lines. Do not clear the
+          # pending state merely because one intermediate fragment is benign.
+          next
+        }
       } else {
         if (looks_like_native_load($0)) {
           exit 1
         }
-        pending_gnu_load = 0
+        next
       }
     }
 
@@ -501,13 +527,18 @@ release_native_link_input_candidates() {
         next
       }
       if (delimiter == 0) {
-        if (looks_like_native_input(input)) {
+        if ((input ~ /:\(/ || input ~ /\.a\(/ || input ~ /\.rlib\(/) &&
+            (looks_like_native_input(input) || input ~ /\.rlib/)) {
+          # Native/archive-shaped text with owner syntax but no valid delimiter
+          # remains malformed and must be resolved or rejected. A bare name
+          # alone is not enough evidence: an output section can legitimately
+          # be padded into the In column and end in `.o`/`.a`.
           print "R\t" input
         } else if (input ~ /^\//) {
           # This can be an output-section name padded into the In column or the
-          # first physical fragment of a newline-bearing owner. Defer only one
-          # line; a normal next In row clears the ambiguity, while a native
-          # continuation fails closed above.
+          # first physical fragment of a newline-bearing owner. Keep the
+          # ambiguity across harmless physical continuations until a definite
+          # map record appears.
           pending_lld_owner = 1
         }
         next

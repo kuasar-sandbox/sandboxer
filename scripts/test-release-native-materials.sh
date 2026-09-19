@@ -130,6 +130,24 @@ fi
   || fail "processed a valid GNU input before rejecting a numeric-looking LOAD continuation"
 printf 'test-native-materials: numeric-looking GNU LOAD continuation rejection PASS\n'
 
+# A GNU LOAD pathname can span more than two physical lines. An innocuous
+# middle fragment must not clear the pending-path state before a later native
+# numeric-looking continuation appears.
+gnu_multi_newline_input="$test_root/system/gnu-multi-newline"$'\n'"mid"$'\n'"0 0 0 1 break.o"
+printf 'GNU multi newline object\n' > "$gnu_multi_newline_input"
+{
+  printf 'LOAD %s\n' "$test_root/system/fixture.o"
+  printf 'LOAD %s\n' "$gnu_multi_newline_input"
+} > "$test_root/gnu-multi-newline.map"
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/gnu-multi-newline.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted a multi-line newline-split GNU LOAD native input"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a valid GNU input before rejecting a multi-line LOAD continuation"
+printf 'test-native-materials: multi-line GNU LOAD continuation rejection PASS\n'
+
 # rust-lld maps describe native inputs in structurally indented input-section
 # rows instead of GNU LOAD rows. Output and symbol rows must not be interpreted
 # as inputs, and the complete input remainder may contain whitespace.
@@ -154,6 +172,7 @@ cat > "$test_root/lld.map" <<EOF
              VMA              LMA     Size Align Out     In      Symbol
              238              238       1c     1 .text
 0 0 0 1         weird
+0 0 0 1         /not-owner.o
              238              238       1c     1         $test_root/lld-system/Scrt1.o:(newline
 section)
              238              238       1c     1         $test_root/lld-system/libfixture.a(member.o):(.text)
@@ -329,6 +348,24 @@ fi
 [ ! -s "$test_root/observed" ] \
   || fail "processed a valid input before rejecting a wrapped-prefix newline path"
 printf 'test-native-materials: wrapped-prefix newline path rejection PASS\n'
+
+# A split lld owner can also span more than two physical lines. Keep the
+# tentative owner state across a harmless middle fragment so a later
+# numeric-looking native continuation cannot disappear as an output row.
+multi_wrapped_newline_input="$test_root/lld-system/multi-wrapped:(bar)"$'\n'"mid"$'\n'"0 0 0 1 break.o"
+printf 'multi wrapped newline object\n' > "$multi_wrapped_newline_input"
+{
+  printf '0 0 0 1         %s:(.text)\n' "$test_root/lld-system/Scrt1.o"
+  printf '0 0 0 1         %s:(.text)\n' "$multi_wrapped_newline_input"
+} > "$test_root/lld-multi-wrapped-prefix-newline.map"
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/lld-multi-wrapped-prefix-newline.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted a multi-line newline-split lld owner"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a valid input before rejecting a multi-line lld owner continuation"
+printf 'test-native-materials: multi-line lld owner continuation rejection PASS\n'
 
 # A standalone bare `.rlib:(section)` row is not the real Cargo-covered
 # `.rlib(member):(section)` form. It must fail closed instead of disappearing
