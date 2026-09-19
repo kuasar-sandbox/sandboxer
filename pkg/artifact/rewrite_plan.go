@@ -448,9 +448,29 @@ func (p *publicationRewrite) chain(ctx context.Context, selector string, base *s
 	// after their dependency objects have been published.
 	if chain.reduced {
 		*lowers = nil
+	} else if err := chain.validateReferencePositions(); err != nil {
+		return nil, err
 	}
 
 	return chain, nil
+}
+
+// Validate the resulting reference positions while they are still a plan.
+// An embedded top is represented by self (or implicit memory), not by a ref
+// in the lower list. External tops and all lowers share the same uniqueness
+// constraint as their final native configuration fields.
+func (c *rewriteChain) validateReferencePositions() error {
+	seen := make(map[string]int, len(c.values))
+	for i, value := range c.values {
+		if i == 0 && c.embedded {
+			continue
+		}
+		if previous, exists := seen[value.raw]; exists {
+			return fmt.Errorf("rewritten layer %d duplicates layer %d reference %q", i, previous, value.raw)
+		}
+		seen[value.raw] = i
+	}
+	return nil
 }
 
 type rewriteSourceStream struct{ sparse.Source }
@@ -551,10 +571,16 @@ func compareRewriteValues(ctx context.Context, left, right *rewriteValue) error 
 // retaining all device and non-reference configuration fields.
 func omitReferenceSpelling(cfg *config.PortableSandboxConfig) {
 	omit := func(root *config.PortableRootConfig) {
-		root.Base = ""
+		// Keep chain presence at this exact device/overlay slot. Only the
+		// spelling and layer count may differ between equivalent graphs.
+		if root.Base != "" {
+			root.Base = "present"
+		}
 		root.BaseFromRefs = nil
 		if root.Overlay != nil {
-			root.Overlay.Base = ""
+			if root.Overlay.Base != "" {
+				root.Overlay.Base = "present"
+			}
 			root.Overlay.BaseFromRefs = nil
 		}
 	}
