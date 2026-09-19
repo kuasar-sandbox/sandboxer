@@ -11,22 +11,20 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"math"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/tailzip"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -88,20 +86,7 @@ func (i *FlattenedImage) Close() error {
 	return i.owner.Close()
 }
 
-type archiveEntry struct {
-	name             string
-	flags            uint16
-	method           uint16
-	modifiedTime     uint16
-	modifiedDate     uint16
-	crc              uint32
-	compressedSize   uint32
-	uncompressedSize uint32
-	localOffset      uint32
-	centralStart     uint64
-	localDataStart   uint64
-	localRecordEnd   uint64
-}
+type archiveEntry struct{ name string }
 
 type parsedArchive struct {
 	base    uint64
@@ -204,62 +189,14 @@ func PayloadIfSandbox(ctx context.Context, stream fetch.Stream, required bool) (
 }
 
 func claimsSandboxRuntimeConfig(ctx context.Context, stream fetch.Stream) (bool, error) {
-	const (
-		maxProbeEntries     = 64
-		maxProbeCentralSize = 128 << 10
-	)
-	if stream.Size() < eocdSize {
-		return false, nil
-	}
-	eocd, err := readStreamAt(ctx, stream, stream.Size()-eocdSize, eocdSize)
-	if err != nil {
-		return false, fmt.Errorf("sandbox payload probe: %w", err)
-	}
-	if binary.LittleEndian.Uint32(eocd[0:4]) != eocdSignature {
-		return false, nil
-	}
-	_, centralStart, centralSize, count, err := parseEOCD(ctx, stream)
+	names, _, err := tailzip.Names(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size(), 64, 128<<10)
 	if err != nil {
 		return false, fmt.Errorf("sandbox payload ZIP metadata: %w", err)
 	}
-	if count > maxProbeEntries || centralSize > maxProbeCentralSize {
-		return false, fmt.Errorf("sandbox payload ZIP metadata exceeds detection limits (%d entries, %d bytes)", count, centralSize)
-	}
-	position := centralStart
-	centralEnd := centralStart + centralSize
-	claimed := false
-	for index := 0; index < count; index++ {
-		if position > centralEnd || centralHeaderSize > centralEnd-position {
-			return false, fmt.Errorf("sandbox payload ZIP metadata: central entry %d is truncated", index)
+	for _, name := range names {
+		if name == config.SandboxRuntimeConfigName {
+			return true, nil
 		}
-		fixed, err := readStreamAt(ctx, stream, position, centralHeaderSize)
-		if err != nil {
-			return false, fmt.Errorf("sandbox payload ZIP metadata: central entry %d: %w", index, err)
-		}
-		if binary.LittleEndian.Uint32(fixed[0:4]) != centralHeaderSignature {
-			return false, fmt.Errorf("sandbox payload ZIP metadata: central entry %d has invalid signature", index)
-		}
-		nameLength := uint64(binary.LittleEndian.Uint16(fixed[28:30]))
-		extraLength := uint64(binary.LittleEndian.Uint16(fixed[30:32]))
-		commentLength := uint64(binary.LittleEndian.Uint16(fixed[32:34]))
-		variableLength := nameLength + extraLength + commentLength
-		if variableLength > centralEnd-position-centralHeaderSize {
-			return false, fmt.Errorf("sandbox payload ZIP metadata: central entry %d fields are truncated", index)
-		}
-		name, err := readStreamAt(ctx, stream, position+centralHeaderSize, nameLength)
-		if err != nil {
-			return false, fmt.Errorf("sandbox payload ZIP metadata: central entry %d name: %w", index, err)
-		}
-		if string(name) == config.SandboxRuntimeConfigName {
-			claimed = true
-		}
-		position += centralHeaderSize + variableLength
-	}
-	if position != centralEnd {
-		return false, errors.New("sandbox payload ZIP metadata: central directory size mismatch")
-	}
-	if claimed {
-		return true, nil
 	}
 	return false, nil
 }
@@ -330,8 +267,11 @@ func OpenEROFSArtifact(ctx context.Context, stream fetch.Stream) (*FlattenedImag
 		if erofsSize > math.MaxUint64-uint64(len(tail)) {
 			return nil, errors.Join(errors.New("flattened image logical size overflow"), owner.Close())
 		}
-		source := &appendedSource{payload: payload, tail: tail, size: erofsSize + uint64(len(tail))}
-		full = &appendedStream{appendedSource: source, owner: owner}
+		source, err := tailzip.Append(payload, tail, tailzip.Options{})
+		if err != nil {
+			return nil, errors.Join(err, owner.Close())
+		}
+		full = &appendedStream{Source: source, owner: owner}
 	}
 	return &FlattenedImage{
 		FullStream: full, Payload: payload, ImageConfig: append([]byte(nil), imageConfig...),
@@ -349,25 +289,7 @@ func buildFlattenedImageConfigZIP(imageConfig []byte) ([]byte, error) {
 	if !json.Valid(imageConfig) {
 		return nil, errors.New("flattened image config.json is not valid JSON")
 	}
-	var output bytes.Buffer
-	writer := zip.NewWriter(&output)
-	header := &zip.FileHeader{
-		Name: ImageConfigName, Method: zip.Store,
-		Modified: time.Date(1980, time.January, 1, 0, 0, 0, 0, time.UTC),
-	}
-	entry, err := writer.CreateHeader(header)
-	if err != nil {
-		_ = writer.Close()
-		return nil, fmt.Errorf("flattened image ZIP create config.json: %w", err)
-	}
-	if _, err := entry.Write(imageConfig); err != nil {
-		_ = writer.Close()
-		return nil, fmt.Errorf("flattened image ZIP write config.json: %w", err)
-	}
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("flattened image ZIP close: %w", err)
-	}
-	return output.Bytes(), nil
+	return tailzip.Encode([]tailzip.Entry{{Name: ImageConfigName, Body: imageConfig}})
 }
 
 // BuildSource appends the canonical strict ZIP using a background context.
@@ -434,7 +356,7 @@ func BuildSourceContext(ctx context.Context, payload sparse.Source, imageConfig,
 	if payload.Size() > math.MaxUint64-uint64(len(tail)) {
 		return nil, errors.New("sandbox build logical size overflow")
 	}
-	return &appendedSource{payload: payload, tail: tail, size: payload.Size() + uint64(len(tail))}, nil
+	return tailzip.Append(payload, tail, tailzip.Options{})
 }
 
 // BuildZIP returns the sole canonical Sandbox ZIP encoding.
@@ -443,38 +365,19 @@ func BuildZIP(entries map[string][]byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	var output bytes.Buffer
-	writer := zip.NewWriter(&output)
+	ordered := make([]tailzip.Entry, 0, len(names))
 	for _, name := range names {
-		body := entries[name]
 		limit := MaxImageConfigBytes
 		if name == config.SandboxRuntimeConfigName {
 			limit = config.MaxPortableConfigBytes
 		}
+		body := entries[name]
 		if len(body) == 0 || len(body) > limit {
-			return nil, fmt.Errorf("sandbox ZIP entry %s size %d is outside (0,%d]", name, len(body), limit)
+			return nil, fmt.Errorf("sandbox ZIP entry %s size is outside limits", name)
 		}
-		header := &zip.FileHeader{
-			Name: name, Method: zip.Store, Flags: 0,
-			CreatorVersion: 20, ReaderVersion: 20,
-			CRC32:            crc32.ChecksumIEEE(body),
-			CompressedSize64: uint64(len(body)), UncompressedSize64: uint64(len(body)),
-			ModifiedTime: zipEpochTime, ModifiedDate: zipEpochDate,
-		}
-		entry, err := writer.CreateRaw(header)
-		if err != nil {
-			_ = writer.Close()
-			return nil, fmt.Errorf("sandbox ZIP create %s: %w", name, err)
-		}
-		if _, err := entry.Write(body); err != nil {
-			_ = writer.Close()
-			return nil, fmt.Errorf("sandbox ZIP write %s: %w", name, err)
-		}
+		ordered = append(ordered, tailzip.Entry{Name: name, Body: body})
 	}
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("sandbox ZIP close: %w", err)
-	}
-	return output.Bytes(), nil
+	return tailzip.EncodeCanonical(ordered)
 }
 
 func exactEntryOrder(entries map[string][]byte) ([]string, error) {
@@ -502,202 +405,45 @@ func exactEntryOrder(entries map[string][]byte) ([]string, error) {
 }
 
 func parseStrictArchive(ctx context.Context, stream fetch.Stream) (*parsedArchive, error) {
-	base, centralStart, centralSize, count, err := parseEOCD(ctx, stream)
+	footer, err := tailzip.ReadFooter(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size())
 	if err != nil {
 		return nil, fmt.Errorf("sandbox ZIP EOCD: %w", err)
 	}
-	if count != 1 && count != 2 {
-		return nil, fmt.Errorf("sandbox ZIP has %d entries (want 1 or 2)", count)
+	names := []string{config.SandboxRuntimeConfigName}
+	switch footer.Count {
+	case 1:
+	case 2:
+		names = []string{ImageConfigName, config.SandboxRuntimeConfigName}
+	default:
+		return nil, fmt.Errorf("sandbox ZIP has %d entries (want 1 or 2)", footer.Count)
 	}
-	entries := make([]archiveEntry, 0, count)
-	position := centralStart
-	for index := 0; index < count; index++ {
-		fixed, err := readStreamAt(ctx, stream, position, centralHeaderSize)
-		if err != nil {
-			return nil, fmt.Errorf("sandbox ZIP central entry %d: %w", index, err)
-		}
-		if binary.LittleEndian.Uint32(fixed[0:4]) != centralHeaderSignature {
-			return nil, fmt.Errorf("sandbox ZIP central entry %d has invalid signature", index)
-		}
-		versionMade := binary.LittleEndian.Uint16(fixed[4:6])
-		versionNeeded := binary.LittleEndian.Uint16(fixed[6:8])
-		flags := binary.LittleEndian.Uint16(fixed[8:10])
-		method := binary.LittleEndian.Uint16(fixed[10:12])
-		modifiedTime := binary.LittleEndian.Uint16(fixed[12:14])
-		modifiedDate := binary.LittleEndian.Uint16(fixed[14:16])
-		crc := binary.LittleEndian.Uint32(fixed[16:20])
-		compressedSize := binary.LittleEndian.Uint32(fixed[20:24])
-		uncompressedSize := binary.LittleEndian.Uint32(fixed[24:28])
-		nameLength := binary.LittleEndian.Uint16(fixed[28:30])
-		extraLength := binary.LittleEndian.Uint16(fixed[30:32])
-		commentLength := binary.LittleEndian.Uint16(fixed[32:34])
-		diskStart := binary.LittleEndian.Uint16(fixed[34:36])
-		internalAttrs := binary.LittleEndian.Uint16(fixed[36:38])
-		externalAttrs := binary.LittleEndian.Uint32(fixed[38:42])
-		localOffset := binary.LittleEndian.Uint32(fixed[42:46])
-		if versionNeeded >= 45 || compressedSize == math.MaxUint32 || uncompressedSize == math.MaxUint32 || localOffset == math.MaxUint32 {
-			return nil, fmt.Errorf("sandbox ZIP entry %d uses ZIP64", index)
-		}
-		if versionMade != 20 || versionNeeded != 20 {
-			return nil, fmt.Errorf("sandbox ZIP entry %d has non-canonical version metadata", index)
-		}
-		if flags != 0 {
-			return nil, fmt.Errorf("sandbox ZIP entry %d has unsupported flags 0x%x", index, flags)
-		}
-		if method != zip.Store {
-			return nil, fmt.Errorf("sandbox ZIP entry %d method is %d (want Store)", index, method)
-		}
-		if modifiedTime != zipEpochTime || modifiedDate != zipEpochDate || internalAttrs != 0 || externalAttrs != 0 {
-			return nil, fmt.Errorf("sandbox ZIP entry %d has non-canonical metadata", index)
-		}
-		if diskStart != 0 {
-			return nil, fmt.Errorf("sandbox ZIP entry %d starts on disk %d", index, diskStart)
-		}
-		if extraLength != 0 || commentLength != 0 {
-			return nil, fmt.Errorf("sandbox ZIP entry %d has extra data or comment", index)
-		}
-		if compressedSize != uncompressedSize {
-			return nil, fmt.Errorf("sandbox ZIP entry %d Store sizes differ", index)
-		}
-		nameBytes, err := readStreamAt(ctx, stream, position+centralHeaderSize, uint64(nameLength))
-		if err != nil {
-			return nil, fmt.Errorf("sandbox ZIP central entry %d name: %w", index, err)
-		}
-		name := string(nameBytes)
-		if name != ImageConfigName && name != config.SandboxRuntimeConfigName {
-			return nil, fmt.Errorf("sandbox ZIP unknown entry %q", name)
-		}
-		limit := MaxImageConfigBytes
-		if name == config.SandboxRuntimeConfigName {
-			limit = config.MaxPortableConfigBytes
-		}
-		if uint64(uncompressedSize) > uint64(limit) {
-			return nil, fmt.Errorf("sandbox ZIP entry %s exceeds %d bytes", name, limit)
-		}
-		entries = append(entries, archiveEntry{
-			name: name, flags: flags, method: method, modifiedTime: modifiedTime,
-			modifiedDate: modifiedDate, crc: crc, compressedSize: compressedSize,
-			uncompressedSize: uncompressedSize, localOffset: localOffset, centralStart: position,
-		})
-		position += centralHeaderSize + uint64(nameLength)
+	base, bodies, err := tailzip.ReadCanonical(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size(), names, map[string]int{ImageConfigName: MaxImageConfigBytes, config.SandboxRuntimeConfigName: config.MaxPortableConfigBytes})
+	if err != nil {
+		return nil, fmt.Errorf("sandbox ZIP: %w", err)
 	}
-	if position != centralStart+centralSize {
-		return nil, errors.New("sandbox ZIP central directory size mismatch")
-	}
-	wantNames := []string{config.SandboxRuntimeConfigName}
-	if count == 2 {
-		wantNames = []string{ImageConfigName, config.SandboxRuntimeConfigName}
-	}
-	seen := make(map[string]struct{}, count)
-	for i := range entries {
-		if _, duplicate := seen[entries[i].name]; duplicate {
-			return nil, fmt.Errorf("sandbox ZIP duplicate entry %q", entries[i].name)
-		}
-		seen[entries[i].name] = struct{}{}
-	}
-	for i := range entries {
-		if entries[i].name != wantNames[i] {
-			return nil, fmt.Errorf("sandbox ZIP entry order is %q at index %d (want %q)", entries[i].name, i, wantNames[i])
-		}
-	}
-
-	bodies := make(map[string][]byte, count)
-	wantLocalOffset := uint64(0)
-	for i := range entries {
-		entry := &entries[i]
-		if uint64(entry.localOffset) != wantLocalOffset {
-			return nil, fmt.Errorf("sandbox ZIP local entry %s is not contiguous", entry.name)
-		}
-		localStart := base + uint64(entry.localOffset)
-		fixed, err := readStreamAt(ctx, stream, localStart, localHeaderSize)
-		if err != nil {
-			return nil, fmt.Errorf("sandbox ZIP local entry %s: %w", entry.name, err)
-		}
-		if binary.LittleEndian.Uint32(fixed[0:4]) != localHeaderSignature {
-			return nil, fmt.Errorf("sandbox ZIP local entry %s has invalid signature", entry.name)
-		}
-		if binary.LittleEndian.Uint16(fixed[4:6]) != 20 ||
-			binary.LittleEndian.Uint16(fixed[6:8]) != entry.flags ||
-			binary.LittleEndian.Uint16(fixed[8:10]) != entry.method ||
-			binary.LittleEndian.Uint16(fixed[10:12]) != entry.modifiedTime ||
-			binary.LittleEndian.Uint16(fixed[12:14]) != entry.modifiedDate ||
-			binary.LittleEndian.Uint32(fixed[14:18]) != entry.crc ||
-			binary.LittleEndian.Uint32(fixed[18:22]) != entry.compressedSize ||
-			binary.LittleEndian.Uint32(fixed[22:26]) != entry.uncompressedSize {
-			return nil, fmt.Errorf("sandbox ZIP local/central header mismatch for %s", entry.name)
-		}
-		nameLength := binary.LittleEndian.Uint16(fixed[26:28])
-		extraLength := binary.LittleEndian.Uint16(fixed[28:30])
-		if extraLength != 0 {
-			return nil, fmt.Errorf("sandbox ZIP local entry %s has extra data", entry.name)
-		}
-		name, err := readStreamAt(ctx, stream, localStart+localHeaderSize, uint64(nameLength))
-		if err != nil {
-			return nil, err
-		}
-		if string(name) != entry.name {
-			return nil, fmt.Errorf("sandbox ZIP local/central name mismatch for %s", entry.name)
-		}
-		entry.localDataStart = localStart + localHeaderSize + uint64(nameLength)
-		entry.localRecordEnd = entry.localDataStart + uint64(entry.compressedSize)
-		if entry.localRecordEnd > centralStart {
-			return nil, fmt.Errorf("sandbox ZIP entry %s overlaps central directory", entry.name)
-		}
-		body, err := readStreamAt(ctx, stream, entry.localDataStart, uint64(entry.uncompressedSize))
-		if err != nil {
-			return nil, fmt.Errorf("sandbox ZIP read %s: %w", entry.name, err)
-		}
-		if crc32.ChecksumIEEE(body) != entry.crc {
-			return nil, fmt.Errorf("sandbox ZIP CRC mismatch for %s", entry.name)
-		}
-		bodies[entry.name] = body
-		wantLocalOffset = entry.localRecordEnd - base
-	}
-	if base+wantLocalOffset != centralStart {
-		return nil, errors.New("sandbox ZIP has bytes between local entries and central directory")
+	entries := make([]archiveEntry, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, archiveEntry{name: name})
 	}
 	return &parsedArchive{base: base, entries: entries, bodies: bodies}, nil
 }
 
+// The owning artifact stream guarantees random access; retain retry context
+// when adapting it to the common suffix reader's explicit io.ReaderAt contract.
+type tailReaderAt struct {
+	ctx    context.Context
+	stream fetch.Stream
+}
+
+func (r tailReaderAt) ReadAt(b []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, io.EOF
+	}
+	return readretry.ReadAt(r.ctx, len(b), func() (int, error) { return r.stream.ReadAt(r.ctx, b, uint64(off)) })
+}
 func parseEOCD(ctx context.Context, stream fetch.Stream) (base, centralStart, centralSize uint64, entries int, err error) {
-	if stream.Size() < eocdSize {
-		return 0, 0, 0, 0, io.ErrUnexpectedEOF
-	}
-	eocdOffset := stream.Size() - eocdSize
-	eocd, err := readStreamAt(ctx, stream, eocdOffset, eocdSize)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-	if binary.LittleEndian.Uint32(eocd[0:4]) != eocdSignature {
-		return 0, 0, 0, 0, errors.New("EOCD is not at logical EOF")
-	}
-	disk := binary.LittleEndian.Uint16(eocd[4:6])
-	centralDisk := binary.LittleEndian.Uint16(eocd[6:8])
-	entriesDisk := binary.LittleEndian.Uint16(eocd[8:10])
-	entriesTotal := binary.LittleEndian.Uint16(eocd[10:12])
-	centralSize32 := binary.LittleEndian.Uint32(eocd[12:16])
-	centralOffset32 := binary.LittleEndian.Uint32(eocd[16:20])
-	commentLength := binary.LittleEndian.Uint16(eocd[20:22])
-	if commentLength != 0 {
-		return 0, 0, 0, 0, errors.New("EOCD comment is not empty")
-	}
-	if entriesTotal == math.MaxUint16 || centralSize32 == math.MaxUint32 || centralOffset32 == math.MaxUint32 {
-		return 0, 0, 0, 0, errors.New("ZIP64 is unsupported")
-	}
-	if disk != 0 || centralDisk != 0 || entriesDisk != entriesTotal {
-		return 0, 0, 0, 0, errors.New("multi-disk ZIP is unsupported")
-	}
-	centralSize = uint64(centralSize32)
-	centralOffset := uint64(centralOffset32)
-	if centralSize > eocdOffset || centralOffset > eocdOffset-centralSize {
-		return 0, 0, 0, 0, errors.New("central directory geometry is invalid")
-	}
-	base = eocdOffset - centralSize - centralOffset
-	centralStart = base + centralOffset
-	if centralStart+centralSize != eocdOffset {
-		return 0, 0, 0, 0, errors.New("central directory does not end at EOCD")
-	}
-	return base, centralStart, centralSize, int(entriesTotal), nil
+	footer, err := tailzip.ReadFooter(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size())
+	return footer.Base, footer.CentralStart, footer.CentralSize, footer.Count, err
 }
 
 func parseFlattenedImageArchive(ctx context.Context, stream fetch.Stream) (uint64, []byte, error) {
@@ -714,7 +460,7 @@ func parseFlattenedImageArchive(ctx context.Context, stream fetch.Stream) (uint6
 	// ZIP's internal ReadFull/ReadAll calls can discard a full read's error.
 	// Keep the source cause for this parse, including successful ZIP results.
 	source := &streamReaderAt{ctx: ctx, stream: stream}
-	reader, err := zip.NewReader(source, int64(stream.Size()))
+	reader, _, err := tailzip.Open(source, int64(stream.Size()), tailzip.Options{MaxEntries: 1, KnownEntries: []string{ImageConfigName}, RequireStored: true, MaxSize: MaxImageConfigBytes + 1024})
 	if source.err != nil {
 		return 0, nil, source.err
 	}
@@ -1054,200 +800,27 @@ func (s *sectionStream) PayloadCommitment() (uint64, [32]byte, bool) {
 }
 
 func (s *sectionStream) RunAt(offset, limit uint64) (sparse.Run, error) {
-	if offset >= s.size {
-		return nil, io.EOF
-	}
-	if limit == 0 {
-		return nil, readerr.Mark(errors.New("sandbox section RunAt limit is zero"), false)
-	}
-	end := offset + limit
-	if end < offset || end > s.size {
-		end = s.size
-	}
-	run, err := s.owner.stream.RunAt(s.base+offset, end-offset)
-	if err != nil {
-		return nil, err
-	}
-	wantOffset := s.base + offset
-	wantEnd := s.base + end
-	if run == nil || run.Offset() != wantOffset || run.End() <= wantOffset || run.End() > wantEnd {
-		return nil, readerr.Mark(errors.New("sandbox section source returned invalid run"), false)
-	}
-	// Sandbox payload is a prefix section (base == 0). Return the carrier Run
-	// unchanged so manifest-only capabilities such as fetch.ChunkRun survive
-	// through the logical Sandbox boundary. The strict wantEnd check above
-	// prevents the returned Run from exposing any byte in the ZIP tail.
-	if s.base == 0 {
-		return run, nil
-	}
-	runEnd := run.End() - s.base
-	if runEnd <= offset {
-		return nil, readerr.Mark(errors.New("sandbox section source returned invalid run"), false)
-	}
-	return sectionRun{inner: run, offset: offset, end: runEnd}, nil
+	return (tailzip.Section{Source: s.owner.stream, Base: s.base, Length: s.size}).RunAt(offset, limit)
 }
-
-func (s *sectionStream) ReadAt(ctx context.Context, buffer []byte, offset uint64) (int, error) {
-	if offset >= s.size {
-		return 0, io.EOF
-	}
-	length := len(buffer)
-	var eof error
-	if uint64(length) > s.size-offset {
-		length = int(s.size - offset)
-		eof = io.EOF
-	}
-	n, err := s.owner.stream.ReadAt(ctx, buffer[:length], s.base+offset)
-	if err != nil && (readretry.IsTerminal(err) || readerr.IsPermanent(err) || err != io.EOF) {
-		return n, err
-	}
-	if n != length {
-		return n, io.ErrUnexpectedEOF
-	}
-	return n, eof
-}
-
-type sectionRun struct {
-	inner  sparse.Run
-	offset uint64
-	end    uint64
-}
-
-func (r sectionRun) Offset() uint64       { return r.offset }
-func (r sectionRun) End() uint64          { return r.end }
-func (r sectionRun) Kind() sparse.RunKind { return r.inner.Kind() }
-
-func (r sectionRun) ReadAt(ctx context.Context, buffer []byte, innerOffset uint64) (int, error) {
-	if innerOffset > r.end-r.offset || uint64(len(buffer)) > r.end-r.offset-innerOffset {
-		return 0, readerr.Mark(errors.New("sandbox section run read is out of bounds"), false)
-	}
-	return r.inner.ReadAt(ctx, buffer, innerOffset)
-}
-
-type appendedSource struct {
-	payload sparse.Source
-	tail    []byte
-	size    uint64
+func (s *sectionStream) ReadAt(ctx context.Context, b []byte, offset uint64) (int, error) {
+	return (tailzip.Section{Source: s.owner.stream, Base: s.base, Length: s.size}).ReadAt(ctx, b, offset)
 }
 
 type appendedStream struct {
-	*appendedSource
+	sparse.Source
 	owner *streamOwner
 }
 
 func (s *appendedStream) Close() error { return s.owner.Close() }
-
-func (s *appendedSource) Size() uint64 { return s.size }
-
-func (s *appendedSource) PayloadCommitment() (uint64, [32]byte, bool) {
-	provider, ok := s.payload.(tarstream.IdentityProvider)
-	if !ok {
-		// A newly captured payload has no prior carrier commitment, but its
-		// authoritative boundary is still needed by WriteTo. The writer computes
-		// and records the commitment during this first encoding.
-		return s.payload.Size(), [32]byte{}, false
+func (s *appendedStream) PayloadCommitment() (uint64, [32]byte, bool) {
+	if provider, ok := s.Source.(tarstream.IdentityProvider); ok {
+		return provider.PayloadCommitment()
 	}
-	size, digest, ok := provider.PayloadCommitment()
-	if !ok || size != s.payload.Size() {
-		return s.payload.Size(), [32]byte{}, false
-	}
-	return size, digest, true
+	return s.Size(), [32]byte{}, false
 }
-
-func (s *appendedSource) TarStreamDigest(name string) ([32]byte, bool) {
-	provider, ok := s.payload.(tarstream.IdentityProvider)
-	if !ok {
-		return [32]byte{}, false
+func (s *appendedStream) TarStreamDigest(name string) ([32]byte, bool) {
+	if provider, ok := s.Source.(tarstream.IdentityProvider); ok {
+		return provider.TarStreamDigest(name)
 	}
-	size, digest, ok := provider.PayloadCommitment()
-	if !ok || size != s.payload.Size() {
-		return [32]byte{}, false
-	}
-	result, err := tarstream.ComposeDigest(name, s.size, size, digest, s.tail)
-	return result, err == nil
-}
-
-func (s *appendedSource) RunAt(offset, limit uint64) (sparse.Run, error) {
-	if offset >= s.size {
-		return nil, io.EOF
-	}
-	if limit == 0 {
-		return nil, errors.New("sandbox appended source RunAt limit is zero")
-	}
-	end := offset + limit
-	if end < offset || end > s.size {
-		end = s.size
-	}
-	if offset < s.payload.Size() {
-		payloadEnd := end
-		if payloadEnd > s.payload.Size() {
-			payloadEnd = s.payload.Size()
-		}
-		run, err := s.payload.RunAt(offset, payloadEnd-offset)
-		if err != nil {
-			return nil, err
-		}
-		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > payloadEnd {
-			return nil, errors.New("sandbox appended payload returned invalid run")
-		}
-		return appendedRun{source: s, offset: offset, end: run.End(), kind: run.Kind(), payloadRun: run}, nil
-	}
-	return appendedRun{source: s, offset: offset, end: end, kind: sparse.Data}, nil
-}
-
-func (s *appendedSource) ReadAt(ctx context.Context, buffer []byte, offset uint64) (int, error) {
-	if offset >= s.size {
-		return 0, io.EOF
-	}
-	length := len(buffer)
-	var eof error
-	if uint64(length) > s.size-offset {
-		length = int(s.size - offset)
-		eof = io.EOF
-	}
-	done := 0
-	if offset < s.payload.Size() {
-		part := length
-		if available := s.payload.Size() - offset; uint64(part) > available {
-			part = int(available)
-		}
-		n, err := s.payload.ReadAt(ctx, buffer[:part], offset)
-		if err != nil && (readretry.IsTerminal(err) || readerr.IsPermanent(err) || err != io.EOF) {
-			return n, err
-		}
-		if n != part {
-			return n, io.ErrUnexpectedEOF
-		}
-		done += part
-		offset += uint64(part)
-	}
-	if done < length {
-		if err := ctx.Err(); err != nil {
-			return done, err
-		}
-		copy(buffer[done:length], s.tail[offset-s.payload.Size():])
-	}
-	return length, eof
-}
-
-type appendedRun struct {
-	source     *appendedSource
-	offset     uint64
-	end        uint64
-	kind       sparse.RunKind
-	payloadRun sparse.Run
-}
-
-func (r appendedRun) Offset() uint64       { return r.offset }
-func (r appendedRun) End() uint64          { return r.end }
-func (r appendedRun) Kind() sparse.RunKind { return r.kind }
-
-func (r appendedRun) ReadAt(ctx context.Context, buffer []byte, innerOffset uint64) (int, error) {
-	if innerOffset > r.end-r.offset || uint64(len(buffer)) > r.end-r.offset-innerOffset {
-		return 0, errors.New("sandbox appended run read is out of bounds")
-	}
-	if r.payloadRun != nil {
-		return r.payloadRun.ReadAt(ctx, buffer, innerOffset)
-	}
-	return r.source.ReadAt(ctx, buffer, r.offset+innerOffset)
+	return [32]byte{}, false
 }
