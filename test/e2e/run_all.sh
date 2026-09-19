@@ -37,6 +37,20 @@ cases=("$SCRIPT_DIR"/e2e_*.sh)
 }
 
 for script in "${cases[@]}"; do
+    case "${SANDBOXER_E2E_GROUP:-all}:$(basename "$script")" in
+        defaults:e2e_usage.sh)
+            export SANDBOXER_USAGE_CASES=defaults
+            ;;
+        defaults:*)
+            continue
+            ;;
+        main:e2e_usage.sh)
+            export SANDBOXER_USAGE_CASES=off,overlay,single,balloon,balloon-no-oom,oom,multidisk,restore
+            ;;
+        *)
+            unset SANDBOXER_USAGE_CASES || true
+            ;;
+    esac
     echo
     echo "========================================="
     echo "  sandboxer/$(basename "$script")"
