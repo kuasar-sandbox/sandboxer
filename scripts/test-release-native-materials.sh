@@ -70,8 +70,11 @@ printf 'test-native-materials: dpkg ownership requires exact input pathname PASS
 
 # Observe dispatch without requiring the test host's distribution package DB.
 release_native_system_input() { printf '%s\t%s\n' "$1" "$2" >> "$test_root/observed"; }
+mkdir -p "$test_root/system/dir.o"
+printf 'shared library\n' > "$test_root/system/dir.o/libfixture.so"
 printf 'LOAD %s\n' "$test_root/build/owned.o" "$test_root/temporary/already-removed.o" \
-  "$test_root/system/fixture.o" "$test_root/system/gnu space.o" > "$test_root/link.map"
+  "$test_root/system/fixture.o" "$test_root/system/gnu space.o" \
+  "$test_root/system/dir.o/libfixture.so" > "$test_root/link.map"
 release_native_link_inputs "$test_root/link.map" "$test_root/build" "$test_root/temporary" bin/cloud-hypervisor
 printf '%s\t%s\n' \
   "$test_root/system/fixture.o" bin/cloud-hypervisor \
@@ -90,6 +93,42 @@ for mutation in missing empty relative; do
   fi
 done
 printf 'test-native-materials: exact system/owned-input selection PASS\n'
+
+# GNU ld writes LOAD path bytes verbatim too. A newline-bearing native pathname
+# must not disappear as an apparently non-native LOAD prefix plus a free-standing
+# continuation when another normal native input keeps the map non-empty.
+gnu_newline_input="$test_root/system/gnu-newline"$'\n'"break.o"
+printf 'GNU newline object\n' > "$gnu_newline_input"
+{
+  printf 'LOAD %s\n' "$test_root/system/fixture.o"
+  printf 'LOAD %s\n' "$gnu_newline_input"
+} > "$test_root/gnu-newline.map"
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/gnu-newline.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted a newline-split GNU LOAD native input"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a valid GNU input before rejecting a newline-split LOAD"
+printf 'test-native-materials: newline-split GNU LOAD rejection PASS\n'
+
+# The GNU LOAD continuation may itself begin with four numeric-looking fields.
+# It is still pathname bytes, not a new lld-style output row, and must fail
+# before the earlier valid LOAD is dispatched.
+gnu_numeric_newline_input="$test_root/system/gnu-numeric-newline"$'\n'"0 0 0 1 break.o"
+printf 'GNU numeric newline object\n' > "$gnu_numeric_newline_input"
+{
+  printf 'LOAD %s\n' "$test_root/system/fixture.o"
+  printf 'LOAD %s\n' "$gnu_numeric_newline_input"
+} > "$test_root/gnu-numeric-newline.map"
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/gnu-numeric-newline.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted a numeric-looking continuation of a newline-split GNU LOAD"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a valid GNU input before rejecting a numeric-looking LOAD continuation"
+printf 'test-native-materials: numeric-looking GNU LOAD continuation rejection PASS\n'
 
 # rust-lld maps describe native inputs in structurally indented input-section
 # rows instead of GNU LOAD rows. Output and symbol rows must not be interpreted
@@ -114,6 +153,9 @@ printf 'temporary object\n' > "$test_root/temporary/transient.o"
 cat > "$test_root/lld.map" <<EOF
              VMA              LMA     Size Align Out     In      Symbol
              238              238       1c     1 .text
+0 0 0 1         weird
+             238              238       1c     1         $test_root/lld-system/Scrt1.o:(newline
+section)
              238              238       1c     1         $test_root/lld-system/libfixture.a(member.o):(.text)
              248              248       10     1         $test_root/lld-system/libfixture.a(a(b).o):(.rodata)
              250              250        8     1         $test_root/lld-system/libfixture.a(foo.o:(bar).o):(.data)
@@ -268,6 +310,25 @@ fi
 [ ! -s "$test_root/observed" ] \
   || fail "processed a valid input before rejecting a numeric-looking newline continuation"
 printf 'test-native-materials: numeric-looking newline continuation rejection PASS\n'
+
+# The owner prefix before a pathname newline can itself end in bytes that look
+# like a complete `:(...)` wrapper. It is still not a native owner; remember the
+# ambiguous absolute prefix so a numeric-looking native continuation cannot be
+# reclassified as an output row and omitted.
+wrapped_prefix_newline_input="$test_root/lld-system/wrapped:(bar)"$'\n'"0 0 0 1 break.o"
+printf 'wrapped prefix newline object\n' > "$wrapped_prefix_newline_input"
+{
+  printf '0 0 0 1         %s:(.text)\n' "$test_root/lld-system/Scrt1.o"
+  printf '0 0 0 1         %s:(.text)\n' "$wrapped_prefix_newline_input"
+} > "$test_root/lld-wrapped-prefix-newline.map"
+: > "$test_root/observed"
+if (release_native_link_inputs "$test_root/lld-wrapped-prefix-newline.map" "$test_root/build" \
+    "$test_root/temporary" bin/cloud-hypervisor >/dev/null 2>&1); then
+  fail "accepted a newline-split lld path whose prefix mimics a complete row"
+fi
+[ ! -s "$test_root/observed" ] \
+  || fail "processed a valid input before rejecting a wrapped-prefix newline path"
+printf 'test-native-materials: wrapped-prefix newline path rejection PASS\n'
 
 # A standalone bare `.rlib:(section)` row is not the real Cargo-covered
 # `.rlib(member):(section)` form. It must fail closed instead of disappearing

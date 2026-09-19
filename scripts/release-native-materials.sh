@@ -328,29 +328,17 @@ release_native_link_input_candidates() {
     function looks_like_native_input(input) {
       return input ~ /\.(a|o)($|[^[:alnum:]_.+-])/
     }
-    $1 == "LOAD" {
-      load = $0
-      sub(/^[ \t]*LOAD[ \t]+/, "", load)
-      if (load ~ /\.(a|o)$/) {
-        print "P\t" load
-      } else if (looks_like_native_input(load)) {
-        exit 1
-      }
-      next
+    function looks_like_native_load(input,    base) {
+      base = input
+      sub(/^.*\//, "", base)
+      return base ~ /\.(a|o)($|[^[:alnum:]_.+-])/
     }
-    {
-      if (NF < 5 || $1 !~ /^[[:xdigit:]]+$/ || $2 !~ /^[[:xdigit:]]+$/ ||
-          $3 !~ /^[[:xdigit:]]+$/ || $4 !~ /^[[:digit:]]+$/) {
-        # lld writes input path bytes verbatim. A newline in a linked native
-        # pathname therefore splits one input-section row across physical map
-        # lines; the continuation loses the four numeric columns. Reject any
-        # such native-looking continuation instead of silently omitting it.
-        if (looks_like_native_input($0) && $0 ~ /:\(/) {
-          exit 1
-        }
-        next
-      }
-      work = $0
+    function structured_row() {
+      return NF >= 5 && $1 ~ /^[[:xdigit:]]+$/ && $2 ~ /^[[:xdigit:]]+$/ &&
+        $3 ~ /^[[:xdigit:]]+$/ && $4 ~ /^[[:digit:]]+$/
+    }
+    function after_four_columns(line,    work, i) {
+      work = line
       sub(/^[ \t]*/, "", work)
       for (i = 1; i <= 4; i++) {
         sub(/^[^ \t]+/, "", work)
@@ -358,22 +346,147 @@ release_native_link_input_candidates() {
           sub(/^[ \t]+/, "", work)
         }
       }
+      return work
+    }
+    function content_indent(work) {
       if (work !~ /^[ \t]*[^ \t]/) {
+        return -1
+      }
+      return match(work, /[^ \t]/) - 1
+    }
+
+    # Once a native owner was already complete before a physical newline, the
+    # following bytes belong to the section name, not to another map record.
+    # A normal LOAD or normal In-column row here is ambiguous with a truncated
+    # row, so fail closed instead of swallowing a real record.
+    section_continuation {
+      if ($1 == "LOAD") {
+        exit 1
+      }
+      if (structured_row()) {
+        continuation_work = after_four_columns($0)
+        if (content_indent(continuation_work) == 9) {
+          exit 1
+        }
+      }
+      if (substr($0, length($0), 1) == ")") {
+        section_continuation = 0
+      }
+      next
+    }
+
+    # A split lld pathname can leave an absolute-looking In-column prefix that
+    # is not itself a native owner. Inspect the immediately following physical
+    # line before forgetting that ambiguity. This runs before the ordinary
+    # numeric-row classification so a continuation such as
+    # `0 0 0 1 break.o:(.text)` cannot masquerade as an output row.
+    pending_lld_owner {
+      if (!structured_row()) {
+        if (looks_like_native_input($0) && $0 ~ /:\(/) {
+          exit 1
+        }
+        pending_lld_owner = 0
+      } else {
+        pending_work = after_four_columns($0)
+        pending_indent = content_indent(pending_work)
+        pending_value = pending_indent >= 0 ? substr(pending_work, pending_indent + 1) : ""
+        if (looks_like_native_input(pending_value) && pending_value ~ /:\(/) {
+          exit 1
+        }
+        pending_lld_owner = 0
+      }
+    }
+
+    # GNU ld also writes LOAD path bytes verbatim. If an absolute LOAD prefix
+    # is physically split, reject a following native-looking continuation.
+    # A new LOAD or a normal numeric map row proves the prior LOAD was merely a
+    # non-native input and clears the tentative state.
+    pending_gnu_load {
+      if ($1 == "LOAD") {
+        pending_gnu_load = 0
+      } else if (structured_row()) {
+        pending_work = after_four_columns($0)
+        pending_indent = content_indent(pending_work)
+        pending_value = pending_indent >= 0 ? substr(pending_work, pending_indent + 1) : ""
+        if (pending_indent != 9 && looks_like_native_load(pending_value)) {
+          exit 1
+        }
+        pending_gnu_load = 0
+      } else {
+        if (looks_like_native_load($0)) {
+          exit 1
+        }
+        pending_gnu_load = 0
+      }
+    }
+
+    $1 == "LOAD" {
+      load = $0
+      sub(/^[ \t]*LOAD[ \t]+/, "", load)
+      if (load ~ /\.(a|o)$/) {
+        print "P\t" load
+      } else if (looks_like_native_load(load)) {
+        exit 1
+      } else if (load ~ /^\//) {
+        pending_gnu_load = 1
+      }
+      next
+    }
+    {
+      if (!structured_row()) {
+        # lld writes input path bytes verbatim. A newline in a linked native
+        # pathname therefore splits one input-section row across physical map
+        # lines. Reject an unmistakable native-looking continuation instead of
+        # silently omitting it.
+        if (looks_like_native_input($0) && $0 ~ /:\(/) {
+          exit 1
+        }
         next
       }
-      indent = match(work, /[^ \t]/) - 1
+      work = after_four_columns($0)
+      indent = content_indent(work)
       if (indent != 9) {
         next
       }
       input = substr(work, indent + 1)
 
-      # Every lld input-column row is an input-section row and therefore ends
-      # in the `:(section)` wrapper. A newline in a pathname can split the row
-      # before that wrapper; reject the first physical fragment itself so a
-      # continuation that happens to resemble four numeric columns cannot be
-      # reclassified and silently skipped.
-      if (input !~ /:\(/ || substr(input, length(input), 1) != ")") {
-        exit 1
+      # A complete owner followed by an incomplete section wrapper means the
+      # newline is in section text. Record the already-known native owner and
+      # suppress physical continuation lines until that wrapper closes. If no
+      # native owner is complete yet, remember an absolute prefix for one line
+      # so a newline-split pathname cannot disappear as an output-looking row.
+      delimiter = valid_owner_delimiter(input)
+      if (substr(input, length(input), 1) != ")") {
+        if (delimiter != 0 &&
+            (delimiter_count(input) > 1 || archive_marker_count(input) > 1 ||
+             input ~ /\.rlib\(/ || input ~ /\.rlib:\(/)) {
+          # Without the final wrapper byte, an already textually ambiguous
+          # owner cannot be resolved safely from syntax alone. Fail closed
+          # rather than attributing a prefix while section text is multiline.
+          exit 1
+        }
+        if (delimiter != 0) {
+          owner = substr(input, 1, delimiter - 1)
+          archive = archive_path(owner)
+          if (archive != "") {
+            print "P\t" archive
+            section_continuation = 1
+            next
+          }
+          if (owner ~ /\.o$/ && !has_open_archive_member(owner)) {
+            print "P\t" owner
+            section_continuation = 1
+            next
+          }
+        }
+        if (input ~ /^\//) {
+          pending_lld_owner = 1
+          next
+        }
+        if (looks_like_native_input(input)) {
+          print "R\t" input
+        }
+        next
       }
 
       # Multiple textual owner delimiters or archive markers are inherently
@@ -387,10 +500,15 @@ release_native_link_input_candidates() {
         print "R\t" input
         next
       }
-      delimiter = valid_owner_delimiter(input)
-      if (delimiter == 0 || substr(input, length(input), 1) != ")") {
+      if (delimiter == 0) {
         if (looks_like_native_input(input)) {
           print "R\t" input
+        } else if (input ~ /^\//) {
+          # This can be an output-section name padded into the In column or the
+          # first physical fragment of a newline-bearing owner. Defer only one
+          # line; a normal next In row clears the ambiguity, while a native
+          # continuation fails closed above.
+          pending_lld_owner = 1
         }
         next
       }
@@ -402,6 +520,11 @@ release_native_link_input_candidates() {
         print "P\t" owner
       } else {
         print "R\t" input
+      }
+    }
+    END {
+      if (section_continuation) {
+        exit 1
       }
     }
   ' "$map")"; then
