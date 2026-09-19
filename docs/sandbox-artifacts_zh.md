@@ -406,20 +406,16 @@ Final path在write完成前会短暂可见. 正常consumer只能使用publisher�
 ```text
 logical source
   -> Manifest ingest with fixed write admission/customer key
-  -> Bundle root finalize + FullVerify in target-directory temporary file
+  -> deterministic identity pass to a streaming hash sink
+  -> replay the fixed source with the same key, admission and encoding options
   -> exclusive-create content-addressed <root>.bundle
   -> reopen/strict validate
   -> file://<root>.bundle@manifest:<root>#<location>
 ```
 
-该路径不生成 role tarstream，不上传 Manifest store，不创建
-`<root>.image`/`<root>.sandbox`，也不创建 BuildID/SandboxID semantic alias。Bundle
-只含这个 logical root 的 Manifest/chunks；root logical role由 typed调用点决定，reader
-仍以 strict image 或 Sandbox parser验证。existing same-key final必须与新生成 Bundle 的
-admission、root、crypto和exact bytes全部一致才可复用；并发writer使用与普通 named
-publication 相同的有限等待、exclusive-create和full validation
-协议收敛。失败或取消不返回 ref，并清理自身 target-directory temporary file与
-owned incomplete final。
+source 支持重复读取。第一遍保留根 Manifest key、完整 Bundle 的物理摘要及格式元数据，编码后的 Chunk 字节随处理释放。第二遍直接写入最终 `<root>.bundle`，并核对生成根与预计算身份一致。一次 publish 只解析一次客户密钥，两遍共用相同 admission 与编码参数。
+
+唯一创建的文件是最终 Bundle，包含这个 logical root 的 Manifest 和 Chunk。发布使用有界 Chunk 工作缓冲并保留 payload 稀疏性。typed 调用点提供逻辑角色；image 和 Sandbox reader 保持各自 schema 校验。复用已有目标时，验证 admission、根、认证内容与完整物理身份。并发 writer 通过有界等待、exclusive create 与完整校验收敛。取消、源变化、写入及关闭错误使发布失败，并仅清理本次拥有的不完整 final。路径被替换时保留替换者的 inode，返回所有权错误。
 
 Tarstream 与 Bundle 都是 physical carrier，不是 logical role。Tarstream 包含单一
 role-specific payload 与 sparse envelope，使用 `@digest`/`@hmac` identity；Bundle

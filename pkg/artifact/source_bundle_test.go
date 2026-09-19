@@ -348,57 +348,35 @@ func TestSingleRootBundleRejectsInvalidExistingFinals(t *testing.T) {
 	}
 }
 
-func TestSingleRootBundleCommitsPinnedVerifiedStagingInode(t *testing.T) {
+func TestSingleRootBundlePreservesReplacementFinalInode(t *testing.T) {
 	flattened, _ := sourceBundleFlattenedImage(t)
 	cfg, key := sourceBundleConfig(manifestcrypto.LocalOff)
 	directory := t.TempDir()
 	publisher := newSourceBundlePublisher(t, cfg, key, directory)
 	target := publisher.target.(*singleRootBundleTarget)
-	var verified []byte
 	var hookErr error
+	var final string
 	target.beforeCommit = func(path string) {
-		verified, hookErr = os.ReadFile(path)
+		final = path
+		hookErr = os.Remove(path)
 		if hookErr == nil {
-			hookErr = os.Remove(path)
-		}
-		if hookErr == nil {
-			hookErr = os.WriteFile(path, []byte("unverified replacement"), 0o644)
+			hookErr = os.WriteFile(path, []byte("replacement inode"), 0o644)
 		}
 	}
-
 	result, err := publisher.PublishSource(context.Background(), RoleImage, publishSource(t, flattened))
 	if hookErr != nil {
 		t.Fatal(hookErr)
 	}
-	if err == nil || result.Ref != "" || !strings.Contains(err.Error(), "temporary path changed") {
-		t.Fatalf("replaced staging result = %+v, err=%v", result, err)
+	if !errors.Is(err, errLocationFinalVanished) || result.Ref != "" {
+		t.Fatalf("replaced final result = %+v, err=%v", result, err)
+	}
+	data, err := os.ReadFile(final)
+	if err != nil || string(data) != "replacement inode" {
+		t.Fatalf("replacement removed or changed: %q, %v", data, err)
 	}
 	entries, err := os.ReadDir(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var final string
-	for _, entry := range entries {
-		if filepath.Ext(entry.Name()) == ".bundle" {
-			final = filepath.Join(directory, entry.Name())
-		}
-	}
-	if final == "" {
-		t.Fatalf("pinned verified staging inode was not committed: %v", entries)
-	}
-	committed, err := os.ReadFile(final)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(committed, verified) || bytes.Equal(committed, []byte("unverified replacement")) {
-		t.Fatal("final Bundle bytes did not come from the pinned verified inode")
-	}
-	reader, err := manifestbundle.Open(final)
-	if err != nil {
-		t.Fatalf("committed pinned Bundle is invalid: %v", err)
-	}
-	if err := reader.Close(); err != nil {
-		t.Fatal(err)
+	if err != nil || len(entries) != 1 || filepath.Ext(entries[0].Name()) != ".bundle" {
+		t.Fatalf("unexpected outputs: %v, %v", entries, err)
 	}
 }
 

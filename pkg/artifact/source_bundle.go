@@ -1,13 +1,16 @@
 package artifact
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
@@ -48,7 +51,9 @@ func ValidateSingleRootBundlePublication(cfg *config.ManifestConfig, keyFn inges
 // publisher for one named location. Each Publisher accepts exactly one root,
 // emits only <manifest-key>.bundle, and never creates an image/sandbox
 // tarstream or a semantic alias. admission must have been acquired by the
-// caller, normally with cfg.WriteAdmission before expensive build work.
+// caller, normally with cfg.WriteAdmission before expensive build work. The
+// source must support repeated reads: an identity pass precedes final-path
+// streaming, with no intermediate file or retained payload copy.
 func NewSingleRootBundlePublisher(
 	cfg *config.ManifestConfig,
 	keyFn ingest.CustomerKeyFunc,
@@ -79,7 +84,7 @@ func NewSingleRootBundlePublisher(
 	target := &singleRootBundleTarget{
 		cfg: cfg, keyFn: keyFn, admission: admission,
 		location: location, directory: filepath.Clean(directory), logf: logf,
-		retry: defaultLocationRetryPolicy,
+		retry: defaultLocationRetryPolicy, fs: osLocationFileSystem{},
 	}
 	return &Publisher{target: target, logf: logf}, nil
 }
@@ -92,6 +97,7 @@ type singleRootBundleTarget struct {
 	directory string
 	logf      func(string, ...any)
 	retry     locationRetryPolicy
+	fs        locationFileSystem
 	// beforeCommit is a deterministic pathname-race hook used only by tests.
 	beforeCommit func(string)
 
@@ -123,95 +129,117 @@ func (t *singleRootBundleTarget) Put(ctx context.Context, role LogicalRole, sour
 		return "", err
 	}
 
-	staged, err := os.CreateTemp(t.directory, ".manifest-bundle-*.partial")
+	// Resolve the key once for both deterministic encoding passes and validation.
+	key, err := t.keyFn()
 	if err != nil {
-		return "", fmt.Errorf("single-root Bundle temporary file: %w", err)
+		return "", fmt.Errorf("single-root Bundle customer key: %w", err)
 	}
-	stagedPath := staged.Name()
-	stagedInfo, err := staged.Stat()
-	if err != nil {
-		return "", errors.Join(
-			fmt.Errorf("single-root Bundle stat temporary file: %w", err),
-			staged.Close(), os.Remove(stagedPath),
-		)
-	}
-	stagedOpen := true
-	removeStaged := true
-	defer func() {
-		if stagedOpen {
-			retErr = errors.Join(retErr, staged.Close())
-		}
-		if removeStaged {
-			if err := removeOwnedSingleRootStaging(stagedPath, stagedInfo); err != nil {
-				retErr = errors.Join(retErr, err)
-			}
-		}
-		if retErr != nil {
-			refString = ""
-		}
-	}()
-	if err := staged.Chmod(0o644); err != nil {
-		return "", fmt.Errorf("single-root Bundle temporary permissions: %w", err)
-	}
-	writer, err := manifestbundle.NewWriter(staged, t.admission, manifestbundle.WriterOptions{})
+	defer clear(key[:])
+	keyFn := func() ([32]byte, error) { return key, nil }
+	cfg := *t.cfg
+	_, decryptor, err := manifestcrypto.New(cfg.Crypto)
 	if err != nil {
 		return "", err
 	}
-	ingester, err := t.cfg.NewIngesterWithWriter(t.keyFn, nil, writer)
+	encode := func(dst io.Writer) (*ingest.Result, error) {
+		writer, err := manifestbundle.NewWriter(dst, t.admission, manifestbundle.WriterOptions{})
+		if err != nil {
+			return nil, err
+		}
+		ingester, err := cfg.NewIngesterWithWriter(keyFn, nil, writer)
+		if err != nil {
+			return nil, err
+		}
+		result, err := ingester.Ingest(ctx, source, ingest.IngestOption{})
+		if err != nil {
+			return nil, err
+		}
+		if err := writer.Finalize(result.ManifestKey); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+	// Discard physical bytes as they are encoded; only bounded active chunks
+	// and the Bundle's format metadata survive this identity pass.
+	physicalIdentity := sha256.New()
+	planned, err := encode(physicalIdentity)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("single-root Bundle identify %s: %w", role, err)
 	}
-	result, err := ingester.Ingest(ctx, source, ingest.IngestOption{})
-	if err != nil {
-		return "", fmt.Errorf("single-root Bundle ingest %s: %w", role, err)
-	}
-	root := result.ManifestKey
-	if err := writer.Finalize(root); err != nil {
-		return "", fmt.Errorf("single-root Bundle finalize %s: %w", role, err)
-	}
-	if err := staged.Close(); err != nil {
-		return "", fmt.Errorf("single-root Bundle close staged file: %w", err)
-	}
-	stagedOpen = false
-
+	expectedPhysical := physicalIdentity.Sum(nil)
+	root := planned.ManifestKey
 	basename := manifest.HexKey(root) + ".bundle"
 	destination := filepath.Join(t.directory, basename)
-	pinned, err := pinLocationBundleFile(stagedPath, destination, root, true)
-	if err != nil {
-		return "", fmt.Errorf("single-root Bundle pin staged file: %w", err)
-	}
-	if !os.SameFile(stagedInfo, pinned.pinnedInfo) {
-		return "", errors.Join(
-			fmt.Errorf("single-root Bundle staged path changed before verification: %w", errLocationFinalVanished),
-			closePinnedBundleFiles([]locationBundleFile{pinned}),
-		)
-	}
-	pinnedOpen := true
-	defer func() {
-		if pinnedOpen {
-			retErr = errors.Join(retErr, closePinnedBundleFiles([]locationBundleFile{pinned}))
-		}
-	}()
-	if err := t.verifyStaged(ctx, pinned.pinnedReader, root); err != nil {
-		return "", fmt.Errorf("single-root Bundle verify staged file: %w", err)
-	}
-	if t.beforeCommit != nil {
-		t.beforeCommit(stagedPath)
-	}
 	commit := newLocationPublishTarget(t.location, t.directory, nil, false, t.logf)
 	commit.retry = t.retry
-	if err := commit.putBundleFile(ctx, pinned); err != nil {
-		return "", fmt.Errorf("single-root Bundle commit %s: %w", role, err)
+	if t.fs != nil {
+		commit.fs = t.fs
 	}
-	if err := closePinnedBundleFiles([]locationBundleFile{pinned}); err != nil {
-		return "", fmt.Errorf("single-root Bundle close pinned staged file: %w", err)
+	validate := func(file locationReadFile, info os.FileInfo) (retErr error) {
+		if !info.Mode().IsRegular() {
+			return errLocationFinalNonRegular
+		}
+		reader, err := manifestbundle.NewReader(file, info.Size())
+		if err != nil {
+			return classifyLocationContentError(err)
+		}
+		defer func() { retErr = errors.Join(retErr, reader.Close()) }()
+		if len(reader.Refs()) != 0 {
+			return fmt.Errorf("%w: single-root Bundle contains external refs", errLocationFinalMismatch)
+		}
+		if reader.Admission() != t.admission {
+			return fmt.Errorf("%w: recorded Bundle admission differs", errLocationFinalMismatch)
+		}
+		if err := reader.FullVerify(ctx, root, key, decryptor, manifestbundle.VerifyOptions{
+			ExpectedManifests: []store.ContentKey{root},
+		}); err != nil {
+			return classifyLocationContentError(err)
+		}
+		actual := sha256.New()
+		if _, err := copyLocationFile(ctx, actual, io.NewSectionReader(file, 0, info.Size())); err != nil {
+			return err
+		}
+		if !bytes.Equal(actual.Sum(nil), expectedPhysical) {
+			return fmt.Errorf("%w: physical Bundle bytes differ", errLocationFinalMismatch)
+		}
+		return nil
 	}
-	pinnedOpen = false
-	if err := removeOwnedSingleRootStaging(stagedPath, stagedInfo); err != nil {
-		return "", err
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		created, err := commit.fs.createExclusive(destination)
+		if os.IsExist(err) {
+			err = t.reuseFinal(ctx, commit, destination, validate)
+			if errors.Is(err, errLocationFinalVanished) {
+				continue
+			}
+			if err != nil {
+				return "", err
+			}
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("single-root Bundle create final: %w", err)
+		}
+		err = commit.commitFreshLocationFile(created, destination, func(dst locationWriteFile) error {
+			written, err := encode(dst)
+			if err != nil {
+				return fmt.Errorf("single-root Bundle write final: %w", err)
+			}
+			if written.ManifestKey != root {
+				return errors.New("single-root Bundle source changed between identity and publication")
+			}
+			if t.beforeCommit != nil {
+				t.beforeCommit(destination)
+			}
+			return ctx.Err()
+		}, validate)
+		if err != nil {
+			return "", fmt.Errorf("single-root Bundle commit %s: %w", role, err)
+		}
+		break
 	}
-	removeStaged = false
-
 	ref := manifest.Ref{
 		Scheme: manifest.RefSchemeFile, Path: basename,
 		DigestScheme: "manifest", Digest: manifest.HexKey(root), Location: t.location,
@@ -219,46 +247,71 @@ func (t *singleRootBundleTarget) Put(ctx context.Context, role LogicalRole, sour
 	if err := ref.Validate(); err != nil {
 		return "", err
 	}
-	t.logf("publish: %s -> %s (Bundle stored=%d dedup=%d)", role, ref.String(), result.StoredChunks, result.DedupChunks)
+	t.logf("publish: %s -> %s (Bundle stored=%d dedup=%d)", role, ref.String(), planned.StoredChunks, planned.DedupChunks)
 	return ref.String(), nil
 }
 
-func (t *singleRootBundleTarget) verifyStaged(ctx context.Context, reader *manifestbundle.Reader, root store.ContentKey) error {
-	if reader == nil {
-		return errors.New("staged Bundle reader is required")
-	}
-	if reader.Admission() != t.admission {
-		return errors.New("recorded admission differs")
-	}
-	key, err := t.keyFn()
-	if err != nil {
-		return err
-	}
-	defer clear(key[:])
-	_, decryptor, err := manifestcrypto.New(t.cfg.Crypto)
-	if err != nil {
-		return err
-	}
-	return reader.FullVerify(ctx, root, key, decryptor, manifestbundle.VerifyOptions{
-		ExpectedManifests: []store.ContentKey{root},
-	})
-}
-
-func removeOwnedSingleRootStaging(path string, owned os.FileInfo) error {
-	current, err := os.Lstat(path)
-	if os.IsNotExist(err) {
+// reuseFinal waits for a concurrent direct writer to finish. Every read pins
+// the opened inode; ownership is checked again after validating its content.
+func (t *singleRootBundleTarget) reuseFinal(
+	ctx context.Context, target *locationPublishTarget, path string,
+	validate func(locationReadFile, os.FileInfo) error,
+) error {
+	check := func() (retErr error) {
+		file, err := target.fs.openNoFollow(path)
+		if err != nil {
+			return err
+		}
+		defer func() { retErr = errors.Join(retErr, file.Close()) }()
+		info, err := file.Stat()
+		if err != nil {
+			return err
+		}
+		if err := validate(file, info); err != nil {
+			return err
+		}
+		current, err := target.fs.lstat(path)
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(info, current) {
+			return errLocationFinalVanished
+		}
 		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("stat single-root Bundle temporary file: %w", err)
+	started := time.Now()
+	delay := max(t.retry.initial, time.Millisecond)
+	maximum := max(t.retry.maximum, delay)
+	window := max(t.retry.window, delay)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := check()
+		if err == nil {
+			return nil
+		}
+		if os.IsNotExist(err) || errors.Is(err, errLocationFinalVanished) {
+			return errors.Join(errLocationFinalVanished, err)
+		}
+		if errors.Is(err, errLocationFinalNonRegular) || !isRetryableLocationMismatch(err) {
+			return fmt.Errorf("validate existing content-addressed final: %w", err)
+		}
+		remaining := window - time.Since(started)
+		if remaining <= 0 {
+			return stableInvalidLocationFinal(err)
+		}
+		timer := time.NewTimer(min(delay, remaining))
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+		delay = min(delay*2, maximum)
 	}
-	if owned == nil || !os.SameFile(owned, current) {
-		return fmt.Errorf("single-root Bundle temporary path changed; refusing cleanup: %w", errLocationFinalVanished)
-	}
-	if err := os.Remove(path); err != nil {
-		return fmt.Errorf("remove single-root Bundle temporary file: %w", err)
-	}
-	return nil
 }
 
 func (*singleRootBundleTarget) Close() error { return nil }

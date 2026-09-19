@@ -864,7 +864,7 @@ Quiesce等待in-flight block request退出并阻止新request. 所有data/root v
 
 - Sparse tarstream不spool logical stream到disk.
 - Manifest ingest只读取resident extents.
-- E/S 大 payload 不暂存到 per-run `/run` directory；CH 有界 config/state staging files 放在该处。调用者选择的 output directory 和 named-location temporary Bundle file 属于独立路径，并占用所选文件系统容量。
+- E/S 大 payload 不暂存到 per-run `/run` directory；CH 有界 config/state staging files 放在该处。调用者选择的 output directory 属于独立路径，并占用所选文件系统容量。named-location Bundle publication 通过流式预计算身份，仅写入最终内容寻址文件。
 - Bundle dependency plan在pause前执行remote I/O和admission.
 - V1 `--resume` 可以在sink写完整期间保持VM paused,换取SnapshotView稳定性.
 
