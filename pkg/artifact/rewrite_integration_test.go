@@ -755,3 +755,54 @@ func TestRewriteReduceSixtyFourMemoryLayers(t *testing.T) {
 		t.Fatalf("reduction is not idempotent: %v %v", repeated, err)
 	}
 }
+
+func TestRewriteReduceEROFSKeepsImmutableBaseSeparate(t *testing.T) {
+	ctx := context.Background()
+	input, output := t.TempDir(), t.TempDir()
+	sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
+	storage, err := NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	publisher := rewriteTarget(t, storage, output)
+	imagePayload := publishEROFSFixture()
+	imageRef, _, err := sink.AbsorbImageSource(ctx, publishSource(t, imagePayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bottom := bytes.Repeat([]byte{0x33}, 8192)
+	lower, _, err := sink.AbsorbOverlay(ctx, bytes.NewReader(bottom), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cfg := publishPortable(t, "")
+	cfg.Boot.Root = config.PortableRootConfig{Base: imageRef, Overlay: &config.PortableOverlayConfig{Base: "self", BaseFromRefs: []string{lower}}}
+	top := bytes.Repeat([]byte{0x44}, 8192)
+	ref := rewriteSaveE(t, sink, cfg, rewriteSparse(t, top, sparse.Extent{Offset: 4096, Size: 4096}))
+	parsed, _ := manifest.ParseRef(ref)
+	result, err := publisher.PublishWithOptions(ctx, filepath.Join(input, parsed.Path), RewriteOptions{ReduceAny: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := sandboxfile.Open(ctx, rewriteOpen(t, publisher, result.Ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if e.Portable.Boot.Root.Base == "self" || e.Portable.Boot.Root.Overlay == nil || e.Portable.Boot.Root.Overlay.Base != "self" || len(e.Portable.Boot.Root.Overlay.BaseFromRefs) != 0 {
+		t.Fatal("EROFS/upper topology changed")
+	}
+	want := append([]byte(nil), top...)
+	copy(want[4096:], bottom[4096:])
+	got, err := readPublishSource(ctx, e.Payload)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("upper merge: %v", err)
+	}
+	immutable := rewriteOpen(t, publisher, e.Portable.Boot.Root.Base)
+	defer immutable.Close()
+	got, err = readPublishSource(ctx, immutable)
+	if err != nil || !bytes.Equal(got, imagePayload) {
+		t.Fatalf("immutable base changed: %v", err)
+	}
+}
