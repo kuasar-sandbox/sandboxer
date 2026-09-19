@@ -32,8 +32,8 @@ func publishArtifactCmd(command string, args []string) int {
 	refLocations := config.RefLocations{}
 	fs.Var(refLocations, "ref-location", "trusted input ref location name=file:///absolute/path (repeatable)")
 	var replaceRefs, reduceRefs repeatedFlag
-	fs.Var(&replaceRefs, "replace-ref", "replace one reference OLD=NEW (repeatable)")
-	fs.Var(&reduceRefs, "reduce-ref", "reduce a complete reference chain A=X, A, or any (repeatable)")
+	fs.Var(&replaceRefs, "replace-ref", "replace one reference OLD=NEW (repeatable for disjoint references)")
+	fs.Var(&reduceRefs, "reduce-ref", "reduce a complete reference chain A=X, A, or any (disjoint from replacement rules)")
 	skipVerifyRef := fs.Bool("skip-verify-ref", false, "skip replacement equivalence proof (identity and I/O checks remain enabled)")
 	quiet := fs.Bool("quiet", false, "suppress progress logs on stderr")
 	if err := fs.Parse(args); err != nil {

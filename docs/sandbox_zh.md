@@ -226,7 +226,7 @@ sandbox-ctl publish \
   ./s1.sandbox
 ```
 
-发布入口从本地路径、located ref、Bundle selector 或 Manifest ref 识别 E/S 逻辑根。普通发布保留 portable 依赖；引用替换使用可重复的 `--replace-ref OLD=NEW`，整链归并使用 `--reduce-ref A=X`、`--reduce-ref A` 或 `--reduce-ref=any`。Snapshot 发布同时处理当前 E 的磁盘引用，并在 E 发布后更新 `sandbox_ref`。`--skip-verify-ref` 默认 false，优先采用可信可比身份，否则流式验证稀疏内容；skip 模式继续校验新输入身份和 schema。详细语义见[制品发布](sandbox-artifacts_zh.md#引用改写与整链归并)。
+发布入口从本地路径、located ref、Bundle selector 或 Manifest ref 识别 E/S 逻辑根。普通发布保留 portable 依赖；引用替换使用可重复的 `--replace-ref OLD=NEW`，整链归并使用 `--reduce-ref A=X`、`--reduce-ref A` 或 `--reduce-ref=any`。替换规则之间的源/目标集合、替换与归并的作用范围均须互不重叠，归并范围包含全部原始 lower 和目标；`any` 与替换规则互斥。Snapshot 发布同时处理当前 E 的磁盘引用，并在 E 发布后更新 `sandbox_ref`。`--skip-verify-ref` 默认 false，优先采用可信可比身份，否则流式验证稀疏内容；skip 模式继续校验新输入身份和 schema。详细语义见[制品发布](sandbox-artifacts_zh.md#引用改写与整链归并)。
 
 ### 2.9 `sandbox-ctl usage`
 

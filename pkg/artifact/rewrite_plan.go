@@ -375,6 +375,11 @@ func (p *publicationRewrite) chain(ctx context.Context, selector string, base *s
 	var target string
 	if apply {
 		target, chain.reduced = p.rules.reduction(selector, len(*lowers) > 0)
+		if chain.reduced {
+			if err := p.rules.validateReductionOverlap(selector, *lowers); err != nil {
+				return nil, err
+			}
+		}
 	}
 	// An explicitly supplied replacement chain can repair unavailable old
 	// refs when the caller owns the equivalence assertion. Embedded top size

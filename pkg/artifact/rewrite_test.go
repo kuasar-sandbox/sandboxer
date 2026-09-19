@@ -9,9 +9,10 @@ func rewriteTestRef(digit byte) string {
 	return "manifest://" + strings.Repeat(string(digit), 64)
 }
 
-func TestParseRewriteOptionsPreservesOnePassRules(t *testing.T) {
-	a, b, c := rewriteTestRef('a'), rewriteTestRef('b'), rewriteTestRef('c')
-	options, err := ParseRewriteOptions([]string{a + "=" + b, b + "=" + c}, []string{c + "=" + a}, true)
+func TestParseRewriteOptionsPreservesIndependentRules(t *testing.T) {
+	a, b, c, d := rewriteTestRef('a'), rewriteTestRef('b'), rewriteTestRef('c'), rewriteTestRef('d')
+	e, f := rewriteTestRef('e'), rewriteTestRef('f')
+	options, err := ParseRewriteOptions([]string{a + "=" + b, c + "=" + d}, []string{e + "=" + f}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -19,8 +20,8 @@ func TestParseRewriteOptionsPreservesOnePassRules(t *testing.T) {
 	if got := session.replace(a); got != b {
 		t.Fatalf("A replacement = %q, want B", got)
 	}
-	if got := session.replace(b); got != c {
-		t.Fatalf("B replacement = %q, want C", got)
+	if got := session.replace(c); got != d {
+		t.Fatalf("C replacement = %q, want D", got)
 	}
 	if !options.SkipVerify {
 		t.Fatal("skip verification was lost")

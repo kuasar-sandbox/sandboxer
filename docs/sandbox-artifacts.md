@@ -514,6 +514,19 @@ ordered layer positions. For Snapshot input, the current E's internal disk
 references are included: E is republished and the resulting ref is installed in
 `sandbox_ref` before the new S is published. Rules match original positions once.
 
+Each replacement rule exclusively owns both its OLD and NEW references. Rule
+pairs must have disjoint endpoints: repeated rules, shared sources or targets,
+chained replacements and cycles are overlap errors. A replacement and a
+reduction must also be disjoint across the reduction's original top, every
+lower and its explicit target. This includes automatically merged chains.
+`--reduce-ref=any` is used without replacement rules. Independent operations
+on disjoint references/devices may share one invocation.
+
+Canonical endpoint overlaps are rejected during argument validation. Chain
+membership is checked from the original S/E metadata before replacement reads,
+equivalence checks or writes. Both values of `--skip-verify-ref` use the same
+rule validity checks.
+
 A reduction selects a chain's top. `A=X` verifies that X represents the full
 `[A, lowers...]` view, installs X and clears the lower list. `A` generates that
 result automatically. `any` applies automatic reduction to the current memory

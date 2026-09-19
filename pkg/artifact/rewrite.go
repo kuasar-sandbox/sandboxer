@@ -109,7 +109,7 @@ type RefReduction struct {
 // conflicting assignments before a Publisher can create an output object.
 func ParseRewriteOptions(replacements, reductions []string, skipVerify bool) (RewriteOptions, error) {
 	options := RewriteOptions{SkipVerify: skipVerify}
-	replaceTargets := make(map[string]string)
+	replacementRefs := make(map[string]string)
 	for _, rule := range replacements {
 		old, replacement, ok := strings.Cut(rule, "=")
 		if !ok || old == "" || replacement == "" {
@@ -123,13 +123,15 @@ func ParseRewriteOptions(replacements, reductions []string, skipVerify bool) (Re
 		if err != nil {
 			return RewriteOptions{}, fmt.Errorf("invalid --replace-ref NEW %q: %w", replacement, err)
 		}
-		if previous, exists := replaceTargets[old]; exists {
-			if previous != replacement {
-				return RewriteOptions{}, fmt.Errorf("conflicting --replace-ref assignments for %q", old)
+		// Both endpoints belong exclusively to this rule, including repeated
+		// identical rules and source/target chains between distinct rules.
+		for _, ref := range []string{old, replacement} {
+			if previous, exists := replacementRefs[ref]; exists {
+				return RewriteOptions{}, fmt.Errorf("overlapping --replace-ref rules %q and %q share reference %q", previous, rule, ref)
 			}
-			continue
 		}
-		replaceTargets[old] = replacement
+		replacementRefs[old] = rule
+		replacementRefs[replacement] = rule
 		options.Replacements = append(options.Replacements, RefReplacement{Old: old, New: replacement})
 	}
 	reduceTargets := make(map[string]string)
@@ -163,9 +165,14 @@ func ParseRewriteOptions(replacements, reductions []string, skipVerify bool) (Re
 		options.Reductions = append(options.Reductions, RefReduction{Top: top, Target: target})
 	}
 	for _, reduction := range options.Reductions {
-		if replacement, exists := replaceTargets[reduction.Top]; exists && reduction.Target != "" && replacement != reduction.Target {
-			return RewriteOptions{}, fmt.Errorf("conflicting replacement and reduction targets for %q", reduction.Top)
+		for _, ref := range []string{reduction.Top, reduction.Target} {
+			if previous, exists := replacementRefs[ref]; exists {
+				return RewriteOptions{}, fmt.Errorf("overlapping --replace-ref %q and --reduce-ref %q share reference %q", previous, reduction.Top, ref)
+			}
 		}
+	}
+	if options.ReduceAny && len(options.Replacements) != 0 {
+		return RewriteOptions{}, errors.New("--reduce-ref=any overlaps every --replace-ref rule")
 	}
 	if options.ReduceAny && len(options.Reductions) != 0 {
 		return RewriteOptions{}, errors.New("--reduce-ref=any cannot be combined with explicit --reduce-ref selectors")
@@ -236,6 +243,30 @@ func (s *rewriteSession) unmatched() error {
 	for i, matched := range s.matchedReduction {
 		if !matched {
 			return fmt.Errorf("unmatched --reduce-ref selector %q", s.options.Reductions[i].Top)
+		}
+	}
+	return nil
+}
+
+// validateReductionOverlap checks original layer positions from native metadata
+// before opening replacements or entering the skip-verification shortcut.
+func (s *rewriteSession) validateReductionOverlap(top string, lowers []string) error {
+	if len(s.options.Replacements) == 0 {
+		return nil
+	}
+	refs := make(map[string]struct{}, len(lowers)+1)
+	for _, raw := range append([]string{top}, lowers...) {
+		canonical, err := canonicalRewriteRef(raw)
+		if err != nil {
+			return err
+		}
+		refs[canonical] = struct{}{}
+	}
+	for _, rule := range s.options.Replacements {
+		for _, ref := range []string{rule.Old, rule.New} {
+			if _, exists := refs[ref]; exists {
+				return fmt.Errorf("overlapping --replace-ref %q and --reduce-ref %q: reference %q belongs to the reduced chain", rule.Old+"="+rule.New, top, ref)
+			}
 		}
 	}
 	return nil
