@@ -37,6 +37,7 @@ printf 'test-native-materials: exact system/owned-input selection PASS\n'
 mkdir -p "$test_root/lld-system" "$test_root/lld system"
 printf 'archive\n' > "$test_root/lld-system/libfixture.a"
 printf 'startup object\n' > "$test_root/lld-system/Scrt1.o"
+printf 'delimiter object\n' > "$test_root/lld-system/x.o"
 printf 'spaced object\n' > "$test_root/lld system/space object.o"
 printf 'owned object\n' > "$test_root/build/owned.o"
 printf 'temporary object\n' > "$test_root/temporary/transient.o"
@@ -47,6 +48,7 @@ cat > "$test_root/lld.map" <<EOF
              238              238       1c     1         $test_root/lld-system/libfixture.a(member.o):(.text)
              248              248       10     1         $test_root/lld-system/libfixture.rlib(member.o):(.text)
              254              254       20     4         $test_root/lld-system/Scrt1.o:(.foo)bar)
+             25c              25c        8     4         $test_root/lld-system/x.o:(foo.o:(x))
              264              264       10     4         $test_root/lld system/space object.o:(.text)
              264              264        0     1                 foo.o
              274              274       10     4         $test_root/build/owned.o:(.text)
@@ -57,6 +59,7 @@ release_native_link_inputs "$test_root/lld.map" "$test_root/build" "$test_root/t
 printf '%s\t%s\n' \
   "$test_root/lld-system/Scrt1.o" bin/cloud-hypervisor \
   "$test_root/lld-system/libfixture.a" bin/cloud-hypervisor \
+  "$test_root/lld-system/x.o" bin/cloud-hypervisor \
   "$test_root/lld system/space object.o" bin/cloud-hypervisor \
   | LC_ALL=C sort > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/observed"

@@ -75,18 +75,17 @@ release_native_system_input() {
 release_native_link_input_candidates() {
   local map="$1"
   awk '
-    function valid_owner_delimiter(input,    offset, relative, pos, owner, valid) {
+    function valid_owner_delimiter(input,    offset, relative, pos, owner) {
       offset = 1
-      valid = 0
       while ((relative = index(substr(input, offset), ":(")) > 0) {
         pos = offset + relative - 1
         owner = substr(input, 1, pos - 1)
         if (owner ~ /\.o$/ || owner ~ /\.a\([^()]+\)$/) {
-          valid = pos
+          return pos
         }
         offset = pos + 2
       }
-      return valid
+      return 0
     }
     function looks_like_native_input(input) {
       return input ~ /\.a($|[(:])/ || input ~ /\.o($|[(:])/
