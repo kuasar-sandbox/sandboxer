@@ -210,7 +210,7 @@ sandbox-ctl publish \
   ./s1.sandbox
 ```
 
-The publisher strictly identifies local E/S carriers automatically. Already portable graph dependencies keep their original refs. A `manifest://` root is not materialized into a named location, and there is no Manifest tail rewrite. The publisher does not read `artifact.json` and has no artifact-kind registry.
+The publisher identifies E/S logical roots from local paths, located refs, Bundle selectors or Manifest refs. It preserves portable dependencies during ordinary publication. Reference rewriting uses repeatable `--replace-ref OLD=NEW`; whole-chain reduction uses `--reduce-ref A=X`, `--reduce-ref A` or `--reduce-ref=any`. Snapshot publication includes its current E's disk references and updates `sandbox_ref` after publishing E. `--skip-verify-ref` defaults to false; verification prefers trusted comparable identities, then streams sparse content. New input identity and schema checks remain active in skip mode. See [artifact publication](sandbox-artifacts.md#reference-rewriting-and-whole-chain-reduction) for scope, validation and zero-staging output contracts.
 
 ### 2.9 `sandbox-ctl usage`
 

@@ -226,9 +226,7 @@ sandbox-ctl publish \
   ./s1.sandbox
 ```
 
-Publisher 自动严格识别 local E/S carrier. 已经 portable 的 graph dependency 保持原 ref;
-`manifest://` root 本身不再 materialize 到 named location,也不存在 Manifest tail rewrite.
-它不读取 `artifact.json`,也不存在 artifact-kind registry.
+发布入口从本地路径、located ref、Bundle selector 或 Manifest ref 识别 E/S 逻辑根。普通发布保留 portable 依赖；引用替换使用可重复的 `--replace-ref OLD=NEW`，整链归并使用 `--reduce-ref A=X`、`--reduce-ref A` 或 `--reduce-ref=any`。Snapshot 发布同时处理当前 E 的磁盘引用，并在 E 发布后更新 `sandbox_ref`。`--skip-verify-ref` 默认 false，优先采用可信可比身份，否则流式验证稀疏内容；skip 模式继续校验新输入身份和 schema。详细语义见[制品发布](sandbox-artifacts_zh.md#引用改写与整链归并)。
 
 ### 2.9 `sandbox-ctl usage`
 

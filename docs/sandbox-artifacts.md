@@ -462,7 +462,7 @@ rewrite node-local sandbox_ref
 rebuild S -> publish S last
 ```
 
-A memory parent's historical `sandbox_ref` is not traversed recursively. The E graph referenced by the current S is current disk truth. `manifest://` and already located refs remain unchanged; there is no `Manifest -> named location` materialization or Manifest-tail rewriting. Bundle carriers use exact location copying or exact Store upload as a whole, bypassing these rebuilding flows.
+The current S defines the ordered memory list and selects the current E disk graph. A memory parent contributes its memory payload. Ordinary publication can retain portable dependencies and use the exact Bundle-copy/upload path. A requested reference rewrite constructs new logical S/E artifacts through the selected target; Bundle-scoped dependencies acquire valid output bindings.
 
 
 
@@ -495,8 +495,62 @@ E2B memory=true
 
 S/E suffix geometry, deterministic ZIP encoding and sparse prefix/append views are implemented by `accelerator/pkg/tailzip`. This package supplies ordered role entries and size limits; the Sandbox/Snapshot modules retain their portable config, JSON/state and device-topology validation. Logical reference locations use `manifest.RefLocations`.
 
-### Publishing existing Manifest roots
+### Reference rewriting and whole-chain reduction
 
-The `publish` input may be a local/located carrier, Bundle selector, or `manifest://` root. Its logical role is validated as Sandbox E or Snapshot S after opening. `PublishSource` also accepts an assembled Snapshot source and retains caller source ownership.
+`publish` accepts local paths, located tarstream refs, Bundle selectors and
+`manifest://` roots. The logical root is Sandbox E or Snapshot S. `PublishSource`
+also accepts an already assembled Snapshot while retaining caller ownership.
 
-Located tarstream output uses an available carrier identity directly. A Manifest or composed source without an available identity is streamed once to calculate it, then reread with the same source and codec to write the final content-addressed path. Only the final file is created. The caller keeps the source immutable and repeatable. Existing targets undergo complete validation, and changed content during writing fails publication.
+```text
+sandbox-ctl publish [existing storage/location options]
+  [--replace-ref OLD=NEW ...]
+  [--reduce-ref A=X | A | any ...]
+  [--skip-verify-ref=false|true]
+  SOURCE
+```
+
+`upload-snapshot` uses the same implementation. One-to-one replacement keeps
+ordered layer positions. For Snapshot input, the current E's internal disk
+references are included: E is republished and the resulting ref is installed in
+`sandbox_ref` before the new S is published. Rules match original positions once.
+
+A reduction selects a chain's top. `A=X` verifies that X represents the full
+`[A, lowers...]` view, installs X and clears the lower list. `A` generates that
+result automatically. `any` applies automatic reduction to the current memory
+and each device's complete explicit chain. A self-bound root uses the source E
+ref as its top selector and keeps its generated payload inside the new E, with
+`self` preserved. The source S ref selects its embedded memory; its existing
+execution state accompanies the new memory payload. EROFS and writable upper
+remain separate devices, as do individual data disks.
+
+The plan resolves scopes, validates configuration/roles/capacities, tracks all
+explicit matches and proves requested replacements before writing dependencies.
+Default equivalence first compares usable trusted payload commitments, then
+streams size, Hole/Present layout and present bytes when needed. Explicit Zero
+and stored zero bytes are equivalent; Hole retains transparent lower-layer
+semantics. `sandbox_ref` equivalence also checks non-reference configuration and
+each device's effective view. Different Manifest keys across encryption domains
+can represent equivalent content.
+
+`--skip-verify-ref` transfers the equivalence assertion to the caller. New input
+identity, authentication, schema and applicable capacity checks remain active.
+It permits a known replacement or explicit whole-chain target to repair
+unavailable old refs. Automatic reduction reads its input layers to build the
+result. Unmatched selectors and contradictory rules return errors before any
+output is created.
+
+```bash
+sandbox-ctl publish --replace-ref "$OLD_BASE=$NEW_BASE" "$SNAPSHOT_REF"
+sandbox-ctl publish --reduce-ref "$TOP_REF=$MERGED_REF" "$ROOT_REF"
+sandbox-ctl publish --reduce-ref=any \
+  --to-ref-location archive=file:///srv/artifacts "$SNAPSHOT_REF"
+```
+
+Located output uses an available carrier identity directly. A generated or
+Manifest source without one is streamed to compute identity, then reread with
+fixed source/codec settings directly into its final content-addressed path.
+Payload uses bounded working buffers; only bounded tails and format metadata
+are retained. Dependencies complete before the new root. Existing targets are
+fully validated, errors preserve old roots, and the operation reports all
+source/writer close errors. Published results have valid bindings independent
+of transient input-Bundle scope.
