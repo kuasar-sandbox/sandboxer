@@ -571,5 +571,121 @@ echo "    snap2 overlay dedup:  $(grep -oE 'overlay stored=[0-9]+ dedup=[0-9]+' 
 echo "    snap3 snapshot dedup: $(grep -oE 'snapshot stored=[0-9]+ dedup=[0-9]+' "$SNAP3_LOG" | head -1)"
 echo "    snap3 overlay dedup:  $(grep -oE 'overlay stored=[0-9]+ dedup=[0-9]+' "$SNAP3_LOG" | head -1)"
 
+
+# ---- reduced-root recovery with the historical manifests retired ----------
+echo "==> phase 6: publish the complete memory/disk chain and retire its old roots"
+REDUCED_DIR="$WORK/reduced-location"
+REDUCED_LOCATION="reduced-e2e"
+mkdir -p "$REDUCED_DIR"
+"$BIN/sandbox-ctl" info --json --manifest-config "$WORK/accelerator.yaml" \
+    "manifest://$SNAP3_MKEY" > "$WORK/reduction-original.json"
+REDUCED_REF=$("$BIN/sandbox-ctl" publish --quiet --reduce-ref=any \
+    --manifest-config "$WORK/accelerator.yaml" \
+    --to-ref-location "$REDUCED_LOCATION=file://$REDUCED_DIR" \
+    "manifest://$SNAP3_MKEY")
+"$BIN/sandbox-ctl" info --json --manifest-config "$WORK/accelerator.yaml" \
+    --ref-location "$REDUCED_LOCATION=file://$REDUCED_DIR" \
+    "$REDUCED_REF" > "$WORK/reduction-result.json"
+python3 - "$WORK/reduction-original.json" "$WORK/reduction-result.json" \
+    "$WORK/store-data/manifest" "$WORK/retired-manifests" "$SNAP3_MKEY" <<'PY'
+import json, pathlib, re, sys
+original, result = (json.load(open(path)) for path in sys.argv[1:3])
+refs = {"manifest://" + sys.argv[5]}
+def walk(value, original):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            field = key.lower().replace("_", "")
+            if field in ("fromrefs", "basefromrefs"):
+                if original:
+                    refs.update(item or [])
+                elif item:
+                    raise SystemExit("reduced result retains a lower-reference list")
+            if original and field == "sandboxref" and isinstance(item, str):
+                refs.add(item)
+            walk(item, original)
+    elif isinstance(value, list):
+        for item in value:
+            walk(item, original)
+walk(original, True)
+walk(result, False)
+root, retired = pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4])
+if root.name != "manifest" or not root.is_dir():
+    raise SystemExit("test Manifest partition is unavailable")
+retired.mkdir()
+moved = 0
+for ref in sorted(refs):
+    if not isinstance(ref, str) or not ref.startswith("manifest://"):
+        continue
+    key = ref.removeprefix("manifest://")
+    if not re.fullmatch(r"[0-9a-f]{64}", key):
+        raise SystemExit("invalid historical Manifest reference")
+    paths = list(root.glob(f"*/{key[:2]}/{key[2:4]}/{key}"))
+    if not paths:
+        raise SystemExit("historical Manifest fixture was not stored")
+    for path in paths:
+        if not path.is_file() or path.is_symlink():
+            raise SystemExit("unexpected test Manifest object type")
+        path.rename(retired / f"{key}-{moved}")
+        moved += 1
+print(f"==> retired {moved} historical Manifest objects; reduced lists are empty")
+PY
+# Read the retained immutable base directly from Store. Old roots cannot be
+# hidden by the test cache's previously warmed entries.
+cat > "$WORK/reduction-reader.yaml" <<EOF
+manifest:
+  key: "$KEY"
+store:
+  endpoint: 127.0.0.1:$STORE_PORT
+  pool: 4
+  timeout: 30s
+crypto:
+  chunk: aes
+  manifest: aes
+EOF
+REDUCED_TICK=$(grep -oE '^TICK [0-9]+' "$LOG3" | tail -1 | awk '{print $2}')
+REDUCED_NEXT_REF="$REDUCED_REF"
+for cycle in 1 2; do
+    REDUCED_DIFF="$WORK/runtime/reduced-$cycle.diff"
+    truncate -s 1G "$REDUCED_DIFF"
+    sed "s|$DIFF_RESTORE3|$REDUCED_DIFF|" "$WORK/host3.yaml" > "$WORK/reduced-host-$cycle.yaml"
+    REDUCED_ID="reduced-$cycle-$$"
+    REDUCED_LOG="$WORK/reduced-run-$cycle.log"
+    "$BIN/sandbox-ctl" run --restore "$REDUCED_NEXT_REF" \
+        --config "$WORK/reduced-host-$cycle.yaml" \
+        --manifest-config "$WORK/reduction-reader.yaml" \
+        --ref-location "$REDUCED_LOCATION=file://$REDUCED_DIR" \
+        --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" \
+        --sandbox-id "$REDUCED_ID" > "$REDUCED_LOG" 2>&1 &
+    REDUCED_PID=$!
+    PIDS+=("$REDUCED_PID")
+    REDUCED_WANT=$((REDUCED_TICK + 3))
+    for _ in $(seq 1 600); do
+        grep -qE "^TICK $REDUCED_WANT $BLK0_OK$" "$REDUCED_LOG" 2>/dev/null && break
+        if ! kill -0 "$REDUCED_PID" 2>/dev/null; then
+            echo "FAIL: reduced restore $cycle exited"; tail -50 "$REDUCED_LOG"; exit 1
+        fi
+        sleep 0.05
+    done
+    grep -qE "^TICK $REDUCED_WANT $BLK0_OK$" "$REDUCED_LOG" || {
+        echo "FAIL: reduced restore $cycle lost process/disk continuity"; tail -50 "$REDUCED_LOG"; exit 1;
+    }
+    if [ "$cycle" = 1 ]; then
+        grep -qE 'snapshot source: 1 memory layer\(s\)' "$REDUCED_LOG" || {
+            echo "FAIL: reduced Snapshot did not restore as one memory layer"; exit 1;
+        }
+        mkdir -p "$WORK/reduced-roundtrip"
+        "$BIN/sandbox-ctl" snapshot --sandbox-id "$REDUCED_ID" \
+            --output "$WORK/reduced-roundtrip" --run-root "$WORK/runtime" \
+            > "$WORK/reduced-resnapshot.log" 2>&1
+        wait "$REDUCED_PID" 2>/dev/null || true
+        REDUCED_TICK=$(grep -oE '^TICK [0-9]+' "$REDUCED_LOG" | tail -1 | awk '{print $2}')
+        REDUCED_NEXT_REF="$WORK/reduced-roundtrip/$REDUCED_ID.snapshot"
+    else
+        kill -TERM "$REDUCED_PID" 2>/dev/null
+        wait "$REDUCED_PID" 2>/dev/null || true
+    fi
+    echo "==> PASS: reduced restore $cycle kept process state and deepest disk data"
+done
+
 echo
 echo "==> e2e_sandbox_upload_restore: OK"

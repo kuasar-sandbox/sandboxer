@@ -11,6 +11,14 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
+type repeatedFlag []string
+
+func (f *repeatedFlag) String() string { return fmt.Sprint([]string(*f)) }
+func (f *repeatedFlag) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
+
 // publishCmd publishes either a strict Sandbox E or Snapshot S. The historical
 // upload-snapshot command calls the same implementation as a thin CLI alias.
 func publishCmd(args []string) int { return publishArtifactCmd("publish", args) }
@@ -23,13 +31,22 @@ func publishArtifactCmd(command string, args []string) int {
 	toRefLocation := fs.String("to-ref-location", "", "publish to name=file:///absolute/path instead of the manifest store")
 	refLocations := config.RefLocations{}
 	fs.Var(refLocations, "ref-location", "trusted input ref location name=file:///absolute/path (repeatable)")
+	var replaceRefs, reduceRefs repeatedFlag
+	fs.Var(&replaceRefs, "replace-ref", "replace one reference OLD=NEW (repeatable for disjoint references)")
+	fs.Var(&reduceRefs, "reduce-ref", "reduce a complete reference chain A=X, A, or any (disjoint from replacement rules)")
+	skipVerifyRef := fs.Bool("skip-verify-ref", false, "skip replacement equivalence proof (identity and I/O checks remain enabled)")
 	quiet := fs.Bool("quiet", false, "suppress progress logs on stderr")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	input := fs.Arg(0)
 	if input == "" || fs.NArg() != 1 {
-		fmt.Fprintf(os.Stderr, "usage: sandbox-ctl %s [--manifest-config <file>] [--to-ref-location name=file:///path] [--ref-location name=file:///path ...] [--quiet] <artifact>\n", command)
+		fmt.Fprintf(os.Stderr, "usage: sandbox-ctl %s [--manifest-config <file>] [--to-ref-location name=file:///path] [--ref-location name=file:///path ...] [--replace-ref OLD=NEW ...] [--reduce-ref A[=X] ...|--reduce-ref=any] [--skip-verify-ref] [--quiet] <artifact>\n", command)
+		return 2
+	}
+	rewrite, err := artifact.ParseRewriteOptions(replaceRefs, reduceRefs, *skipVerifyRef)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 	logf := func(format string, values ...any) { fmt.Fprintf(os.Stderr, format+"\n", values...) }
@@ -66,7 +83,6 @@ func publishArtifactCmd(command string, args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	defer storage.Close()
 	var publisher *artifact.Publisher
 	if targetName == "" {
 		publisher, err = artifact.NewManifestPublisher(storage, manifestCfg, refLocations, logf)
@@ -74,17 +90,20 @@ func publishArtifactCmd(command string, args []string) int {
 		publisher, err = artifact.NewLocationPublisher(storage, targetName, targetDirectory, refLocations, logf)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, errors.Join(err, storage.Close()))
 		return 1
 	}
 	ctx, stopSignals := commandContext()
 	defer stopSignals()
-	result, publishErr := publisher.Publish(ctx, input)
-	closeErr := publisher.Close()
+	result, publishErr := publisher.PublishWithOptions(ctx, input, rewrite)
+	closeErr := errors.Join(publisher.Close(), storage.Close())
 	if err := errors.Join(publishErr, closeErr); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Println(result.Ref)
+	if _, err := fmt.Fprintln(os.Stdout, result.Ref); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 	return 0
 }

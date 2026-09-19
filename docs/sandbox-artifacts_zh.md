@@ -477,7 +477,7 @@ rewrite node-local sandbox_ref
 rebuild S -> publish S last
 ```
 
-Memory parent的historical `sandbox_ref` 不递归;当前S引用的E graph是当前disk truth. `manifest://`和已located ref保持不变,不会产生`Manifest -> named location`或Manifest tail rewrite. Bundle carrier整体走exact location copy或exact Store upload,不进入上述重建流程.
+当前 S 定义有序内存列表，并选择当前 E 磁盘图。内存父层贡献自身 memory payload。普通发布可以保留 portable 依赖并采用 Bundle exact-copy/upload。请求引用改写时，根据选定目标重建逻辑 S/E，Bundle 范围内的依赖获得有效的输出绑定。
 
 
 
@@ -509,3 +509,60 @@ E2B memory=true
 
 
 S/E 后缀几何、确定性 ZIP 编码及 sparse prefix/append 视图由 `accelerator/pkg/tailzip` 实现。Sandbox/Snapshot 模块提供有序角色条目与大小上限，保留 portable config、JSON/state 和设备拓扑校验。逻辑引用位置共用 `manifest.RefLocations`。
+
+### 引用改写与整链归并
+
+`publish` 接受本地路径、located tarstream ref、Bundle selector 和 `manifest://`
+根，按 Sandbox E 或 Snapshot S 校验逻辑内容。`PublishSource` 也支持已经组装好的
+Snapshot，并保留调用方的 source 所有权。
+
+```text
+sandbox-ctl publish [原有存储/location 参数]
+  [--replace-ref OLD=NEW ...]
+  [--reduce-ref A=X | A | any ...]
+  [--skip-verify-ref=false|true]
+  SOURCE
+```
+
+`upload-snapshot` 共用同一实现。一对一替换保留有序层位置。输入为 Snapshot 时，
+匹配范围包括当前 E 内部的磁盘引用：发布 E 后将新 ref 写入 `sandbox_ref`，最后
+发布 S。每个原始引用位置只应用一次规则。
+
+每条替换规则独占 OLD 和 NEW 两个引用，规则间的源、目标集合必须互不相交。
+重复规则、共享源或目标、首尾相接和循环替换均属于重叠。替换规则与归并规则的
+作用范围也必须互不相交：归并范围包含原始 top、全部 lower 和显式目标，自动
+归并同样遵守此约束。`--reduce-ref=any` 单独于替换规则使用。引用和设备均独立
+的操作可以在同一次调用中执行。
+
+规范化引用端点的重叠在参数阶段拒绝；链内部重叠依据原始 S/E 元数据判定，发生
+在读取替换内容、等价性验证和输出写入之前。`--skip-verify-ref` 的两种取值采用
+完全相同的规则合法性检查。
+
+归并选择链的 top。`A=X` 验证 X 代表完整 `[A, lowers...]` 视图，再安装 X 并清空
+lower 列表；`A` 自动生成该结果；`any` 自动归并当前内存及每个设备的完整显式链。
+根盘的 self top 使用源 E ref 选择，生成的 payload 保留在新 E 内，配置继续使用
+`self`。源 S ref 选择其内嵌 memory，原顶层执行状态随新 memory 保留。EROFS 与
+可写 upper 保持独立设备，各数据盘分别处理。
+
+执行计划先解析来源上下文、检查配置/角色/容量、确认所有显式匹配，并验证请求的
+替换，随后写入依赖。默认验证优先采用可信且范围一致的 payload commitment，必要时
+流式比较尺寸、Hole/Present 布局和有效字节。显式 Zero 与存储的零字节等价；Hole
+保留向下透传语义。`sandbox_ref` 验证还比较非引用配置和各设备有效视图。不同加密
+派生域产生的 Manifest key 可以对应相同逻辑内容。
+
+`--skip-verify-ref` 将内容等价确认交给调用方；新输入身份、认证、schema 及适用的
+容量检查继续执行。已确认的单 ref 替换或整链目标可以修复不可访问的旧引用。自动
+归并实际读取源层以生成结果。未匹配的 selector 与矛盾规则在创建输出前返回错误。
+
+```bash
+sandbox-ctl publish --replace-ref "$OLD_BASE=$NEW_BASE" "$SNAPSHOT_REF"
+sandbox-ctl publish --reduce-ref "$TOP_REF=$MERGED_REF" "$ROOT_REF"
+sandbox-ctl publish --reduce-ref=any \
+  --to-ref-location archive=file:///srv/artifacts "$SNAPSHOT_REF"
+```
+
+located 输出直接使用可复用载体身份。尚无身份的 Manifest 或组合 source 先流式
+计算身份，再以固定 source/codec 重读并直接写最终内容寻址路径。payload 使用有界
+工作缓冲，内存仅保留有界 tail 与格式元数据。依赖完成后发布新根；已有目标完整
+校验，错误保持旧根有效，并报告 source/writer 的关闭错误。输出绑定独立于输入
+Bundle 的临时解析上下文。

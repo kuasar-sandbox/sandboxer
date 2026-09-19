@@ -670,7 +670,7 @@ func TestManifestPublisherUploadsBundleExactly(t *testing.T) {
 	}
 }
 
-func TestPublisherRejectsManifestRootInsteadOfMaterializingIt(t *testing.T) {
+func TestPublisherManifestRootRequiresConfiguredReader(t *testing.T) {
 	storage, err := NewProcessStorage(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -678,7 +678,7 @@ func TestPublisherRejectsManifestRootInsteadOfMaterializingIt(t *testing.T) {
 	defer storage.Close()
 	publisher := newPublisher(storage, nil, &recordingPublishTarget{}, nil)
 	_, err = publisher.Publish(context.Background(), "manifest://"+strings.Repeat("a", 64))
-	if err == nil || !strings.Contains(err.Error(), "already portable") {
+	if err == nil || !strings.Contains(err.Error(), "manifest configuration") {
 		t.Fatalf("manifest root error = %v", err)
 	}
 }

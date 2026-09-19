@@ -128,7 +128,19 @@ func (t *locationPublishTarget) Put(ctx context.Context, role LogicalRole, sourc
 		return "", err
 	}
 
-	scheme, digest, err := tarstream.CarrierDigest(payload, source, t.writeOptions()...)
+	// The caller keeps an immutable, repeatable source alive. Carrier-derived
+	// views retain the fast identity path; new Manifest/layered sources are
+	// streamed to a discard sink before their sole final-path write.
+	var scheme, digest string
+	known := false
+	if identity, ok := source.(tarstream.IdentityProvider); ok {
+		_, known = identity.TarStreamDigest(payload)
+	}
+	if known {
+		scheme, digest, err = tarstream.CarrierDigest(payload, source, t.writeOptions()...)
+	} else {
+		scheme, digest, err = tarstream.WriteTo(ctx, io.Discard, payload, source, t.writeOptions()...)
+	}
 	if err != nil {
 		return "", fmt.Errorf("publish location %s: carrier identity: %w", role, err)
 	}

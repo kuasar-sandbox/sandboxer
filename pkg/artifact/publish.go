@@ -309,7 +309,7 @@ type publishScope struct {
 	relativeDir string
 }
 
-// PublishSource publishes one already-assembled logical image or Sandbox
+// PublishSource publishes one already-assembled logical image, Sandbox or Snapshot
 // source directly to this Publisher's target. The caller retains ownership of
 // source and must keep it valid until PublishSource returns. Dependencies named
 // by a Sandbox source must already be portable; this method deliberately does
@@ -328,7 +328,7 @@ func (p *Publisher) PublishSource(ctx context.Context, role LogicalRole, source 
 		return PublishResult{}, errors.New("publish source: logical source is required")
 	}
 	switch role {
-	case RoleImage, RoleSandbox:
+	case RoleImage, RoleSandbox, RoleSnapshot:
 	default:
 		return PublishResult{}, fmt.Errorf("publish source: unsupported root role %q", role)
 	}
@@ -347,13 +347,6 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 	rootRef, scope, err := p.normalizeRoot(input)
 	if err != nil {
 		return PublishResult{}, err
-	}
-	parsedRoot, err := manifest.ParseRef(rootRef)
-	if err != nil {
-		return PublishResult{}, err
-	}
-	if parsedRoot.Scheme == manifest.RefSchemeManifest {
-		return PublishResult{}, errors.New("publish: manifest root is already portable and cannot be materialized")
 	}
 	stream, childScope, err := p.open(ctx, rootRef, scope)
 	if err != nil {

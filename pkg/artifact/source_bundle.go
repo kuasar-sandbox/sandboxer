@@ -115,7 +115,7 @@ func (t *singleRootBundleTarget) Put(ctx context.Context, role LogicalRole, sour
 	t.mu.Unlock()
 
 	switch role {
-	case RoleImage, RoleSandbox:
+	case RoleImage, RoleSandbox, RoleSnapshot:
 	default:
 		return "", fmt.Errorf("single-root Bundle: unsupported root role %q", role)
 	}
