@@ -398,13 +398,16 @@ The final path is briefly visible before writing finishes. Normal consumers must
 ```text
 logical source
   -> Manifest ingest with fixed write admission/customer key
-  -> Bundle root finalize + FullVerify in target-directory temporary file
+  -> deterministic identity pass to a streaming hash sink
+  -> replay the fixed source with the same key, admission and encoding options
   -> exclusive-create content-addressed <root>.bundle
   -> reopen/strict validate
   -> file://<root>.bundle@manifest:<root>#<location>
 ```
 
-This path creates no role tarstream, uploads nothing to Manifest store, creates neither `<root>.image` nor `<root>.sandbox`, and creates no BuildID/SandboxID semantic alias. The Bundle contains only this logical root's Manifest/chunks. The typed call site determines the root's logical role, and the reader still applies the strict image or Sandbox parser. An existing same-key final may be reused only if its admission, root, crypto, and exact bytes all match the newly generated Bundle. Concurrent writers converge through the same bounded waiting, exclusive-create, and full-validation protocol as ordinary named publication. Failure/cancellation returns no ref and removes the publisher's target-directory temporary file and owned incomplete final.
+The source supports repeated reads. The first pass retains the root Manifest key, a physical Bundle digest and format metadata while discarding encoded Chunk bytes. The second pass writes the final `<root>.bundle` directly and checks the generated root against the planned identity. The customer key is resolved once for the publication; both passes use the same admission and encoding settings.
+
+The only created file is the final Bundle, containing this logical root's Manifest and Chunks. Publication uses bounded Chunk buffers and preserves payload sparsity. The typed call site supplies the logical role; image and Sandbox readers retain their schema checks. Reuse requires matching admission, root, authenticated content and complete physical identity. Concurrent writers converge through bounded waiting, exclusive creation and full verification. Cancellation, changed source, write errors and close errors fail publication and remove only the publisher-owned incomplete final. A replaced pathname retains the replacement inode and returns an ownership error.
 
 Tarstream and Bundle are physical carriers, not logical roles. Tarstream contains a single role-specific payload and sparse envelope, with `@digest`/`@hmac` identity. Bundle contains Manifest/chunk records, write admission, and optional local encryption, with `@manifest` root identity. Single-root Bundle publication must not first build a tarstream; conversely, a Bundle root cannot be inferred just from an `.image`/`.sandbox` extension.
 

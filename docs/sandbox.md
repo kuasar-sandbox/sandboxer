@@ -830,7 +830,7 @@ Both modes strictly parse the logical artifact and canonical configuration befor
 
 - Sparse tarstream does not spool the logical stream to disk.
 - Manifest ingest reads resident extents rather than materializing holes.
-- Large E/S payloads are not staged in the per-run `/run` directory; CH's bounded config/state staging files go there. Caller-selected output directories and named-location temporary Bundle files remain separate and consume their selected filesystem's capacity.
+- Large E/S payloads are not staged in the per-run `/run` directory; CH's bounded config/state staging files go there. Caller-selected output directories remain separate and consume their selected filesystem's capacity. Named-location Bundle publication computes identity in a streaming pass and writes only its final content-addressed file.
 - Bundle dependency planning performs remote I/O and admission before pause.
 - V1 `--resume` may keep the VM paused until sink writes finish, preserving SnapshotView stability.
 
