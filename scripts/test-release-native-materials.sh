@@ -40,10 +40,12 @@ printf 'startup object\n' > "$test_root/lld-system/Scrt1.o"
 printf 'spaced object\n' > "$test_root/lld system/space object.o"
 printf 'owned object\n' > "$test_root/build/owned.o"
 printf 'temporary object\n' > "$test_root/temporary/transient.o"
+printf 'rust archive\n' > "$test_root/lld-system/libfixture.rlib"
 cat > "$test_root/lld.map" <<EOF
              VMA              LMA     Size Align Out     In      Symbol
              238              238       1c     1 .text
              238              238       1c     1         $test_root/lld-system/libfixture.a(member.o):(.text)
+             248              248       10     1         $test_root/lld-system/libfixture.rlib(member.o):(.text)
              254              254       20     4         $test_root/lld-system/Scrt1.o:(.foo)bar)
              264              264       10     4         $test_root/lld system/space object.o:(.text)
              264              264        0     1                 foo.o

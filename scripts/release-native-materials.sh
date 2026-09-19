@@ -122,6 +122,12 @@ release_native_link_input_candidates() {
       }
       input = substr(work, indent + 1)
 
+      # Rust rlib member rows are already covered by Cargo/toolchain provenance.
+      # They are normal rust-lld In rows but are not native system .a/.o inputs.
+      if (input ~ /^\/.*\.rlib\([^()]+\):\(/ && substr(input, length(input), 1) == ")") {
+        next
+      }
+
       # Find a section wrapper whose owner is a direct object or a non-empty
       # archive member. Choosing an owner-valid delimiter also permits `)` (and
       # even `:(`) inside the section name without confusing it with the owner.
