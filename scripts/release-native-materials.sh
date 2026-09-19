@@ -72,10 +72,92 @@ release_native_system_input() {
     "$source_id" "sha256:$(sha256sum "$input" | awk '{print $1}');package:$source_name" "$label"
 }
 
+release_native_link_input_candidates() {
+  local map="$1"
+  awk '
+    function valid_owner_delimiter(input,    offset, relative, pos, owner) {
+      offset = 1
+      while ((relative = index(substr(input, offset), ":(")) > 0) {
+        pos = offset + relative - 1
+        owner = substr(input, 1, pos - 1)
+        if (owner ~ /\.o$/ || owner ~ /\.a\([^()]+\)$/) {
+          return pos
+        }
+        offset = pos + 2
+      }
+      return 0
+    }
+    function looks_like_native_input(input) {
+      return input ~ /\.a($|[(:])/ || input ~ /\.o($|[(:])/
+    }
+    $1 == "LOAD" && $2 ~ /\.(a|o)$/ {
+      print $2
+      next
+    }
+    {
+      if (NF < 5 || $1 !~ /^[[:xdigit:]]+$/ || $2 !~ /^[[:xdigit:]]+$/ ||
+          $3 !~ /^[[:xdigit:]]+$/ || $4 !~ /^[[:digit:]]+$/) {
+        next
+      }
+
+      # lld map rows have four numeric columns followed by one space for an
+      # output row, nine spaces for an input-section row, and deeper
+      # indentation for symbol rows. Keep the input remainder byte-for-byte so
+      # whitespace in an absolute path is not lost through awk field splitting.
+      work = $0
+      sub(/^[ \t]*/, "", work)
+      for (i = 1; i <= 4; i++) {
+        sub(/^[^ \t]+/, "", work)
+        if (i < 4) {
+          sub(/^[ \t]+/, "", work)
+        }
+      }
+      if (work !~ /^[ \t]*[^ \t]/) {
+        next
+      }
+      indent = match(work, /[^ \t]/) - 1
+      if (indent != 9) {
+        next
+      }
+      input = substr(work, indent + 1)
+
+      # Rust rlib member rows are already covered by Cargo/toolchain provenance.
+      # They are normal rust-lld In rows but are not native system .a/.o inputs.
+      if (input ~ /^\/.*\.rlib\([^()]+\):\(/ && substr(input, length(input), 1) == ")") {
+        next
+      }
+
+      # Find a section wrapper whose owner is a direct object or a non-empty
+      # archive member. Choosing an owner-valid delimiter also permits `)` (and
+      # even `:(`) inside the section name without confusing it with the owner.
+      delimiter = valid_owner_delimiter(input)
+      if (delimiter == 0 || substr(input, length(input), 1) != ")") {
+        if (looks_like_native_input(input)) {
+          exit 1
+        }
+        next
+      }
+      owner = substr(input, 1, delimiter - 1)
+      if (owner ~ /\.a\([^()]+\)$/) {
+        sub(/\([^()]+\)$/, "", owner)
+        print owner
+      } else if (owner ~ /\.o$/) {
+        print owner
+      } else {
+        exit 1
+      }
+    }
+  ' "$map"
+}
+
 release_native_link_inputs() {
   local map="$1" build_root="$2" temporary_root="$3" payload="$4" input canonical name count=0
   local -A selected_inputs=()
+  local candidates
   [ -s "$map" ] || fail "fresh native linker map is missing"
+  if ! candidates="$(release_native_link_input_candidates "$map")"; then
+    fail "native linker map contains a malformed input"
+  fi
   build_root="$(realpath -e "$build_root")"
   temporary_root="$(realpath -e "$temporary_root")"
   while IFS= read -r input; do
@@ -92,6 +174,6 @@ release_native_link_inputs() {
     selected_inputs[$name]="$canonical"
     release_native_system_input "$canonical" "$payload"
     count=$((count + 1))
-  done < <(awk '$1 == "LOAD" && $2 ~ /\.(a|o)$/ {print $2}' "$map" | LC_ALL=C sort -u)
+  done < <(printf '%s\n' "$candidates" | LC_ALL=C sort -u)
   [ "$count" -gt 0 ] || fail "native linker map contains no system inputs"
 }

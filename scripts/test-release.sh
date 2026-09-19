@@ -376,7 +376,8 @@ printf '[workspace]\n' > "$TMP/cloud-hypervisor/Cargo.toml"
 printf '%s\n' \
   '{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#fixture@1.0.0","target":{"name":"cloud-hypervisor"},"executable":"/fixture/cloud-hypervisor"}' \
   '{"reason":"build-finished","success":true}' > "$TMP/ch-output/build-report.jsonl"
-printf 'LOAD %s\n' "$TMP/system/fixture.o" > "$TMP/ch-output/link.map"
+printf '             238              238       1c     1         %s:(.text)\n' \
+  "$TMP/system/fixture.o" > "$TMP/ch-output/link.map"
 native_fixture_env=(
   RELEASE_BIN_DIR="$TMP/bin"
   RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR="$TMP/cloud-hypervisor"
