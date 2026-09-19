@@ -72,6 +72,7 @@ cloud-hypervisor:
 	$(call link_bin,cloud-hypervisor)
 
 test:
+	python3 scripts/test_e2e_upload_restore_tick.py
 	CGO_ENABLED=0 $(GO) test ./...
 
 vet:

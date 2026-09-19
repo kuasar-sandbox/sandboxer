@@ -206,6 +206,23 @@ assert_cgroup_init() {
     echo "==> $label native exec joined pinned cgroup namespace at /init"
 }
 
+# Read only after the source process has exited and drained its final output.
+snapshot_tick() {
+    local tick
+    if ! tick=$(awk -v marker="$BLK0_OK" '
+        /^TICK([[:space:]]|$)/ { last = $0 }
+        END {
+            n = split(last, fields, " ")
+            if (n != 4 || fields[2] !~ /^[0-9]+$/ ||
+                last != "TICK " fields[2] " " marker) exit 1
+            print fields[2]
+        }' "$1"); then
+        echo "FAIL: missing or invalid final TICK/cold-disk record in $1" >&2
+        return 1
+    fi
+    printf '%s\n' "$tick"
+}
+
 # ---- run sandbox + first snapshot --upload --------------------------------
 
 echo
@@ -253,6 +270,7 @@ cat "$SNAP1_LOG" | sed 's/^/    /'
 
 # --resume=false (default) shuts CH down; sandbox-ctl run1 returns naturally.
 wait "$SBPID1" 2>/dev/null || true
+SNAP1_TICK=$(snapshot_tick "$LOG1")
 
 # ---- restore from manifest:// ------------------------------------------------
 
@@ -299,7 +317,7 @@ T_RES_BEG=$(date +%s%N)
 SBPID2=$!
 PIDS+=($SBPID2)
 
-WANT_TICK=$((PRE_SNAP_TICK + 3))
+WANT_TICK=$((SNAP1_TICK + 3))
 T_FIRST_TICK_NS=""
 for _ in $(seq 1 600); do
     if grep -qE "^TICK $WANT_TICK $BLK0_OK$" "$LOG2" 2>/dev/null; then
@@ -383,11 +401,9 @@ UP2_MS=$(( (T_UP2_END - T_UP2_BEG) / 1000000 ))
 echo "==> upload #2 OK in ${UP2_MS} ms; snapshot manifest key=$SNAP2_MKEY"
 cat "$SNAP2_LOG" | sed 's/^/    /'
 
-# Capture the tick frozen into snap#2 (last TICK before the vCPU paused).
-SNAP2_TICK=$(grep -oE "^TICK [0-9]+" "$LOG2" | tail -1 | awk '{print $2}')
-
-# --resume=false destroys sandbox; sandbox-ctl run2 returns.
+# --resume=false destroys sandbox; wait for the final source output first.
 wait "$SBPID2" 2>/dev/null || true
+SNAP2_TICK=$(snapshot_tick "$LOG2")
 uffd_performance_gate "manifest-restore-1-layer" "$RESTORE_MS" 3000 \
     "$WORK/stats2.json" buffered
 
@@ -473,10 +489,10 @@ SNAP3_MKEY=$("$BIN/sandbox-ctl" snapshot \
     --upload \
     --run-root "$WORK/runtime" 2>"$SNAP3_LOG")
 [ ${#SNAP3_MKEY} -eq 64 ] || { echo "FAIL: snapshot 3 manifest key length=${#SNAP3_MKEY}"; cat "$SNAP3_LOG"; exit 1; }
-SNAP3_TICK=$(grep -oE "^TICK [0-9]+" "$LOG3" | tail -1 | awk '{print $2}')
-echo "==> upload #3 OK; snap#3 key=$SNAP3_MKEY (frozen at TICK $SNAP3_TICK)"
 cat "$SNAP3_LOG" | sed 's/^/    /'
 wait "$SBPID3" 2>/dev/null || true  # snapshot --resume=false destroyed SID3
+SNAP3_TICK=$(snapshot_tick "$LOG3")
+echo "==> upload #3 OK; snap#3 key=$SNAP3_MKEY (frozen at TICK $SNAP3_TICK)"
 uffd_performance_gate "manifest-restore-2-layer" "$RESTORE2_MS" 3000 \
     "$WORK/stats3.json" buffered
 
@@ -540,7 +556,7 @@ uffd_performance_gate "manifest-restore-3-layer" "$RESTORE3_MS" 3000 \
 
 echo
 echo "==> perf summary"
-echo "    TICK at snapshot:                 $PRE_SNAP_TICK"
+echo "    TICK at snapshot:                 $SNAP1_TICK"
 echo "    TICK after restore:               $WANT_TICK (delta=+3, vCPU continuity confirmed)"
 echo "    snapshot --upload #1 wallclock:  ${UP1_MS} ms"
 echo "    restore manifest:// → first TICK: ${RESTORE_MS} ms"
