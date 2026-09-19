@@ -16,4 +16,8 @@ fi
 cd "$REPO_ROOT"
 export PYTHONPYCACHEPREFIX="$(mktemp -d /tmp/usage-e2e-pycache-XXXXXX)"
 python3 "$SCRIPT_DIR/usage_harness_test.py"
-python3 "$SCRIPT_DIR/usage.py" "$@"
+if [ -n "${SANDBOXER_USAGE_CASES:-}" ]; then
+    python3 "$SCRIPT_DIR/usage.py" --cases "$SANDBOXER_USAGE_CASES" "$@"
+else
+    python3 "$SCRIPT_DIR/usage.py" "$@"
+fi
