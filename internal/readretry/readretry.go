@@ -86,14 +86,33 @@ func Open[T io.Closer](ctx context.Context, open func() (T, error)) (T, error) {
 // There is no attempt or elapsed-time limit. The healthy path needs neither
 // a timer nor a goroutine; retries use one interruptible timer.
 func Do(ctx context.Context, read func() error) error {
-	const initial, maximum = 10 * time.Millisecond, time.Second
-	delay := initial
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
 			timer.Stop()
 		}
 	}()
+	wait := func(delay time.Duration) error {
+		if timer == nil {
+			timer = time.NewTimer(delay)
+		} else {
+			timer.Reset(delay)
+		}
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-timer.C:
+			return nil
+		}
+	}
+	return do(ctx, read, wait)
+}
+
+// do keeps retry policy deterministic in package tests while Do owns the real
+// interruptible timer used in production.
+func do(ctx context.Context, read func() error, wait func(time.Duration) error) error {
+	const initial, maximum = 10 * time.Millisecond, time.Second
+	delay := initial
 	for {
 		if err := context.Cause(ctx); err != nil {
 			return &terminal{err}
@@ -108,16 +127,9 @@ func Do(ctx context.Context, read func() error) error {
 		if IsTerminal(err) || readerr.IsPermanent(err) {
 			return &terminal{err}
 		}
-		wait := delay/2 + time.Duration(rand.Int64N(int64(delay-delay/2)+1))
-		if timer == nil {
-			timer = time.NewTimer(wait)
-		} else {
-			timer.Reset(wait)
-		}
-		select {
-		case <-ctx.Done():
-			return &terminal{context.Cause(ctx)}
-		case <-timer.C:
+		waitFor := delay/2 + time.Duration(rand.Int64N(int64(delay-delay/2)+1))
+		if err := wait(waitFor); err != nil {
+			return &terminal{err}
 		}
 		delay = min(delay*2, maximum)
 	}
