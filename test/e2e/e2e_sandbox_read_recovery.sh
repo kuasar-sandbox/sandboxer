@@ -102,7 +102,10 @@ with (w/'cow-data/payload').open('wb') as f:
  for i in range(512): f.write(bytes([i % 251]) * 4096)
 PY
 truncate -s 64M "$WORK/cow.raw"
-mkfs.ext4 -q -F -O ^has_journal -d "$WORK/cow-data" "$WORK/cow.raw"
+# Match the payload and host COW page geometry. With 1 KiB filesystem blocks,
+# Guest reads can consume the injected failure before the partial COW write.
+# Keep the 512-byte write and both backend latency assertions unchanged.
+mkfs.ext4 -q -F -O ^has_journal -b 4096 -d "$WORK/cow-data" "$WORK/cow.raw"
 "$BIN/flatten-ctl" tar stream -f "$WORK/cow.img" "$WORK/cow.raw"
 COW_ROOT=$("$BIN/manifest-ctl" store --manifest-config "$WORK/manifest.yaml" --no-progress "$WORK/cow.img")
 python3 - "$WORK" <<'PY'
