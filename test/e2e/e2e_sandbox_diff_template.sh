@@ -32,6 +32,7 @@ done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
+command -v dumpe2fs >/dev/null 2>&1 || skip "dumpe2fs not on PATH"
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
@@ -60,7 +61,13 @@ BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 # Pre-formatted ext4 template (sparse). diff is seeded from this; no mkfs at boot.
 TEMPLATE="$WORK/basic.ext4"
 truncate -s 512M "$TEMPLATE"
-mkfs.ext4 -q -F "$TEMPLATE"
+mkfs.ext4 -q -F -O ^has_journal "$TEMPLATE"
+# Check the actual filesystem, not only the formatter's command-line flags.
+FEATURES="$(LC_ALL=C dumpe2fs -h "$TEMPLATE" | sed -n 's/^Filesystem features: *//p')"
+if [ -z "$FEATURES" ] || [[ " $FEATURES " == *" has_journal "* ]]; then
+    echo "==> FAIL: expected a journal-free ext4 template; features: $FEATURES" >&2
+    exit 1
+fi
 
 mkdir -p "$WORK/run" "$WORK/base"
 

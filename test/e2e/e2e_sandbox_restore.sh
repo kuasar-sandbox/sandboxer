@@ -85,7 +85,7 @@ BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 mkdir -p "$WORK/runtime"
 DIFF_FILE="$WORK/runtime/blk1.diff"
 truncate -s 1G "$DIFF_FILE"
-mkfs.ext4 -q -F "$DIFF_FILE"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
 
 # Counter that prints TICK i on stdout — restored sandbox should
 # continue from the snapshotted i value.
@@ -181,7 +181,7 @@ SNAP_FILE="$OUT/$SID1.snapshot"
 # overlay base; new run gets a clean diff).
 DIFF_RESTORE="$WORK/runtime/blk1-restore.diff"
 truncate -s 1G "$DIFF_RESTORE"
-mkfs.ext4 -q -F "$DIFF_RESTORE"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF_RESTORE"
 
 # Restore host yaml supplies bindings and policy only. Snapshot S points to E;
 # E owns launch, mounts/files/init and the complete immutable disk graph.

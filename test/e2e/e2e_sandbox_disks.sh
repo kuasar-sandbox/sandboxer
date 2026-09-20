@@ -85,15 +85,15 @@ if [ -z "$BLK0_IMAGE" ]; then
     BLK0_IMAGE="$WORK/root.img"
     docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
 fi
-truncate -s 512M "$WORK/root-up.ext4"; mkfs.ext4 -q -F "$WORK/root-up.ext4"
-truncate -s 256M "$WORK/scratch.ext4"; mkfs.ext4 -q -F "$WORK/scratch.ext4"
+truncate -s 512M "$WORK/root-up.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/root-up.ext4"
+truncate -s 256M "$WORK/scratch.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/scratch.ext4"
 mkdir -p "$WORK/ds"; echo "DATASET-OK" > "$WORK/ds/DATASET-OK"
 # disk artifacts are tarstream envelopes: build via flatten-ctl (dir source)
 MKFS_EROFS_PATH="$BIN/mkfs.erofs" "$BIN/flatten-ctl" export --no-progress \
     --tmpdir "$WORK/tmp" --output "$WORK/dataset.img" "$WORK/ds"
 BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 DATASET_REF="$(plaintext_tarstream_ref "$WORK/dataset.img")"
-truncate -s 256M "$WORK/dataset-up.ext4"; mkfs.ext4 -q -F "$WORK/dataset-up.ext4"
+truncate -s 256M "$WORK/dataset-up.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/dataset-up.ext4"
 
 cat > "$WORK/cold.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
@@ -218,8 +218,8 @@ echo "==> PASS: Sandbox E captured root plus ordered scratch/dataset graph"
 # single-disk data disk. Export and then snapshot the same cold C0; neither
 # output may retain the source E or its old disk topology as provenance.
 mkdir -p "$WORK/replace-base"
-truncate -s 512M "$WORK/replace-root.ext4"; mkfs.ext4 -q -F "$WORK/replace-root.ext4"
-truncate -s 256M "$WORK/replace-fresh.ext4"; mkfs.ext4 -q -F "$WORK/replace-fresh.ext4"
+truncate -s 512M "$WORK/replace-root.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/replace-root.ext4"
+truncate -s 256M "$WORK/replace-fresh.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/replace-fresh.ext4"
 cat > "$WORK/replace.yaml" <<EOF
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-replace-boot }
 boot:
@@ -304,8 +304,8 @@ PY
 echo "==> PASS: replacement snapshot is S -> new E with no source E/memory parent"
 
 echo "==> [6] restore + verify persistence"
-truncate -s 512M "$WORK/root-r.ext4"; mkfs.ext4 -q -F "$WORK/root-r.ext4"
-truncate -s 256M "$WORK/dataset-r.ext4"; mkfs.ext4 -q -F "$WORK/dataset-r.ext4"
+truncate -s 512M "$WORK/root-r.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/root-r.ext4"
+truncate -s 256M "$WORK/dataset-r.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/dataset-r.ext4"
 cat > "$WORK/restore.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-disks-r }
@@ -416,8 +416,8 @@ echo "==> PASS: W memory self is independent (one local from_ref); root + two da
 
 # Restore W with fresh writable uppers. Its memory parent is already a sibling
 # in WOUT; disk state must come entirely from W's merged disk artifacts.
-truncate -s 512M "$WORK/root-w.ext4"; mkfs.ext4 -q -F "$WORK/root-w.ext4"
-truncate -s 256M "$WORK/dataset-w.ext4"; mkfs.ext4 -q -F "$WORK/dataset-w.ext4"
+truncate -s 512M "$WORK/root-w.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/root-w.ext4"
+truncate -s 256M "$WORK/dataset-w.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/dataset-w.ext4"
 cat > "$WORK/restore-w.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-disks-w }

@@ -133,7 +133,7 @@ new_cgroup() { # $1 = stable leaf label
 
 make_diff() { # $1 = path
     truncate -s 1G "$1"
-    mkfs.ext4 -q -F "$1"
+    mkfs.ext4 -q -F -O ^has_journal "$1"
 }
 
 BLK0_IMAGE="${BLK0_IMAGE:-}"

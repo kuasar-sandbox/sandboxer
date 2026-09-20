@@ -104,7 +104,7 @@ BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 mkdir -p "$WORK/runtime"
 DIFF_FILE="$WORK/runtime/blk1.diff"
 truncate -s 1G "$DIFF_FILE"
-mkfs.ext4 -q -F "$DIFF_FILE"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
 
 # Long-running app: print a counter every 250ms; first marker
 # "PYBOOT-OK" within ~1s confirms app is up.

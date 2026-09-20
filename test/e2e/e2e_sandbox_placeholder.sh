@@ -104,7 +104,7 @@ BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 # ---- blk1 overlay diff (fresh ext4 upper) ---------------------------------
 DIFF="$RUNROOT/blk1.diff"
 truncate -s 1G "$DIFF"
-mkfs.ext4 -q -F "$DIFF"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF"
 
 # ---- placeholder config ---------------------------------------------------
 cat > "$WORK/sandbox.yaml" <<EOF
