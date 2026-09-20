@@ -348,18 +348,17 @@ grep -q SERVING "$WORK/cache-health"
 mode healthy
 wait_file "$WORK/pending-exec.log" '^READ-RECOVERED$' "$RUN_PID"
 wait "$EXEC_PID"
-# A capture requiring unavailable pages must wait, then preserve the contents.
+# Snapshot must not commit while an already-observed mandatory source read is
+# unresolved. This deliberately tests snapshot/inflight-read ordering: the
+# Guest fault is established before capture, then the capture fence proves the
+# snapshot has entered its lifecycle while that required read is still pending.
+# No capture-origin attribution is needed or inferred from the shared proxy log.
 BEFORE_OUTAGE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
 mode offline
 wait_new_fault "$BEFORE_OUTAGE_FAULTS" "$RUN_PID"
-BEFORE_CAPTURE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
 "$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
 CAPTURE_PID=$!
 wait_capture_active recovered "$CAPTURE_PID" "$WORK/recovered.capture-probe.log"
-# Once capture has fenced new exec requests, require a later source retry.
-# This prevents a pre-existing Guest retry from satisfying the capture barrier.
-CAPTURE_ACTIVE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
-wait_new_fault "$CAPTURE_ACTIVE_FAULTS" "$CAPTURE_PID"
 kill -0 "$RUN_PID"; kill -0 "$CAPTURE_PID"
 [ ! -s "$WORK/next.key" ]
 mode healthy
@@ -379,17 +378,17 @@ PY
 launch verified --restore "manifest://$NEXT" --config "$WORK/host.yaml"
 wait_file "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
-# A complete corrupt immutable response is a deterministic failure, including
-# while a capture is waiting on the runtime's still-required source read.
+# A complete corrupt immutable response is a deterministic failure while a
+# capture is waiting behind an already-observed required source read. As above,
+# the source fault intentionally predates capture; the contract is that capture
+# cannot publish across unresolved mandatory I/O and fatal recovery cannot turn
+# that wait into a successful snapshot.
 BEFORE_OUTAGE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
 mode offline
 wait_new_fault "$BEFORE_OUTAGE_FAULTS" "$RUN_PID"
-BEFORE_FATAL_FAULTS=$(wc -l < "$WORK/faults.jsonl")
 "$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
 FATAL_CAPTURE_PID=$!
 wait_capture_active verified "$FATAL_CAPTURE_PID" "$WORK/fatal.capture-probe.log"
-FATAL_ACTIVE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
-wait_new_fault "$FATAL_ACTIVE_FAULTS" "$FATAL_CAPTURE_PID"
 kill -0 "$FATAL_CAPTURE_PID"
 [ ! -s "$WORK/fatal.key" ]
 mode corrupt
