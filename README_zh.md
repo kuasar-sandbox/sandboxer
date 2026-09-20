@@ -63,7 +63,7 @@ make test-e2e                   # component owner suite; requires the assembled 
 
 前置条件:
 
-- 源码构建使用 Go 1.24+;
+- 源码构建使用 Go 1.26.1+;
 - 真实 Runtime 操作需要 Linux 和 root 权限;
 - MicroVM E2E 需要 KVM 和相应 kernel interface;
 - 需要 `guest-runtime` 提供 `sandbox-runtime.bundle` 和 VMLinux;
