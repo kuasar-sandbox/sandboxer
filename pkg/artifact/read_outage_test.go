@@ -16,7 +16,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	cacheclient "github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/wire"
-	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
