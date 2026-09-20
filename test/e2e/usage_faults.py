@@ -65,7 +65,8 @@ def collect_and_unmount(mount, sb):
         if sb is not None:
             path = mount / "instance" / f"{sb.name}.usage"
             if path.exists():
-                shutil.copy2(path, sb.dir / "final.usage")
+                # Fault cases run as root; do not preserve private source modes.
+                shutil.copyfile(path, sb.dir / "final.usage")
     finally:
         run("umount", mount)
 
@@ -86,7 +87,8 @@ def main():
                 if path.is_file() and path.suffix in (".json", ".log", ".usage"):
                     dest = evidence / path.relative_to(work)
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(path, dest)
+                    # CI uploads run as the runner user after this root suite.
+                    shutil.copyfile(path, dest)
         atexit.register(collect)
     metadata = {"host_kernel": run("uname", "-a"), "build": run(GO, "version", "-m", BIN / "sandbox-ctl"),
                 "ch": run(BIN / "cloud-hypervisor", "--version"), "cases": cases,
