@@ -69,20 +69,6 @@ wait_connect_failures() {
     echo "cache connect failures did not reach $target records (started at $before)" >&2
     return 1
 }
-wait_capture_active() {
-    local sid=$1 capture_pid=$2 probe=$3
-    for _ in $(seq 1 200); do
-        : > "$probe"
-        if ! timeout 1 "$BIN/sandbox-ctl" exec --sandbox-id "$sid" --run-root "$WORK/run" -- /bin/true                 >/dev/null 2>"$probe"; then
-            grep -q 'unavailable during capture' "$probe" && return
-        fi
-        kill -0 "$capture_pid" 2>/dev/null || { cat "$probe" >&2; return 1; }
-        sleep .05
-    done
-    echo "capture never fenced new exec requests" >&2
-    cat "$probe" >&2
-    return 1
-}
 mode() { printf '%s\n' "$1" > "$WORK/mode.next"; mv "$WORK/mode.next" "$WORK/mode"; }
 STORE_PORT=$(free_port); CACHE_PORT=$(free_port); HEALTH_PORT=$(free_port)
 cat > "$WORK/store.yaml" <<YAML
@@ -326,14 +312,13 @@ wait_file "$WORK/recovered.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 # observed after the exec fence belongs to the capture lifecycle.
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'touch /recovery.idle'
 wait_file "$WORK/recovered.log" '^RECOVERY-IDLE$' "$RUN_PID"
+# The workload is now quiescent and no Guest source demand is running. Take the
+# baseline before starting snapshot; the first later source fault is therefore
+# caused by this capture, including faults in its pre-quiesce dependency work.
+CAPTURE_FAULT_BASE=$(fault_count)
 mode offline
 "$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
 CAPTURE_PID=$!
-wait_capture_active recovered "$CAPTURE_PID" "$WORK/recovered.capture-probe.log"
-# Fence probes can themselves fault before Forwarder.Pause takes effect. Reset
-# the baseline only after the fence is observed; the idle guest cannot generate
-# a later source request, so the next fault is capture-specific.
-CAPTURE_FAULT_BASE=$(fault_count)
 wait_new_fault "$CAPTURE_FAULT_BASE" "$CAPTURE_PID"
 kill -0 "$RUN_PID"; kill -0 "$CAPTURE_PID"
 [ ! -s "$WORK/next.key" ]
@@ -412,11 +397,10 @@ wait_file_count "$WORK/verified.log" '^RECOVERY-IDLE$' "$VERIFIED_IDLE_BASE" "$R
 # A complete corrupt immutable response is a deterministic failure while an
 # idle restored Guest is in capture. With the workload already at RECOVERY-IDLE,
 # a new post-fence source fault is capture-specific.
+FATAL_FAULT_BASE=$(fault_count)
 mode offline
 "$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
 FATAL_CAPTURE_PID=$!
-wait_capture_active verified "$FATAL_CAPTURE_PID" "$WORK/fatal.capture-probe.log"
-FATAL_FAULT_BASE=$(fault_count)
 wait_new_fault "$FATAL_FAULT_BASE" "$FATAL_CAPTURE_PID"
 kill -0 "$FATAL_CAPTURE_PID"
 [ ! -s "$WORK/fatal.key" ]
