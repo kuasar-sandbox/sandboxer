@@ -880,12 +880,21 @@ existing configuration and provision a filesystem source with the required
 capacity. New configuration output does not emit them. Unrelated fields and
 opaque metadata are unaffected.
 
+For new disposable ext4 work disks (overlay uppers, single roots and scratch
+or data-disk fixtures), format the sparse template with `mkfs.ext4 -O ^has_journal`.
+This avoids filesystem journal allocation and metadata journal writes; it does
+not disable journald or application logs. COW is not a replacement for a journal,
+and this default does not promise crash recovery of an interrupted work disk.
+Existing journaled templates, user-supplied images and snapshots remain compatible;
+guest sync/quiesce and snapshot/restore semantics are unchanged. Do not reformat
+an existing data disk to apply this recommendation.
+
 For a **new**, empty 512 MiB scratch filesystem, prepare a new template and
 select it without a size override:
 
 ```bash
 truncate -s 512M /tmp/scratch-512m.ext4
-mkfs.ext4 -F /tmp/scratch-512m.ext4
+mkfs.ext4 -F -O ^has_journal /tmp/scratch-512m.ext4
 ```
 
 ```yaml

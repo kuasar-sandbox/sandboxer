@@ -81,7 +81,7 @@ mkdir -p "$WORK/runtime"
 DIFF_FILE="$WORK/runtime/blk1.diff"
 truncate -s 1G "$DIFF_FILE"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
-mkfs.ext4 -q -F "$DIFF_FILE"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
 
 # Keep the guest alive ~4s so the 1Hz ping ticker fires several times.
 # A short python sleep+print is enough; restart=never means the VM

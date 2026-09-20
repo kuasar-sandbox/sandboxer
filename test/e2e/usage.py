@@ -67,7 +67,7 @@ def image_ref(path):
 def ext4(path, root=None):
     with path.open("wb") as f:
         f.truncate(256 * 1024 * 1024)
-    args = ["mkfs.ext4", "-q", "-F"]
+    args = ["mkfs.ext4", "-q", "-F", "-O", "^has_journal"]
     if root is not None:
         args += ["-d", str(root)]
     run(*args, path)

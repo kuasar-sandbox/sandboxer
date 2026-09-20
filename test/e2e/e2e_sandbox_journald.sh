@@ -79,7 +79,7 @@ RR="$WORK/run"
 BR="$WORK/base"
 mkdir -p "$RR" "$BR" "$WORK/snapshot"
 truncate -s 512M "$WORK/template.ext4"
-mkfs.ext4 -q -F "$WORK/template.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/template.ext4"
 cat > "$WORK/cold.yaml" <<YAML
 resources:
   capacity: {cpu: 1, memory: 512MiB}
@@ -167,7 +167,7 @@ wait_run_exit
 SNAP="$WORK/snapshot/$SID1.snapshot"
 [ -f "$SNAP" ] || fail 'snapshot root is missing'
 truncate -s 512M "$WORK/restored.ext4"
-mkfs.ext4 -q -F "$WORK/restored.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/restored.ext4"
 cat > "$WORK/restore.yaml" <<YAML
 resources:
   capacity: {cpu: 1, memory: 512MiB}

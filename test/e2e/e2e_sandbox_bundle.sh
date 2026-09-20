@@ -96,9 +96,9 @@ if [ -z "$BLK0_IMAGE" ]; then
 fi
 BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 truncate -s 512M "$WORK/root-upper.ext4"
-mkfs.ext4 -q -F "$WORK/root-upper.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/root-upper.ext4"
 truncate -s 256M "$WORK/scratch-template.ext4"
-mkfs.ext4 -q -F "$WORK/scratch-template.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/scratch-template.ext4"
 
 cat > "$WORK/cold.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
@@ -305,7 +305,7 @@ write_restore_yaml() {
     local output="$1" hostname="$2" root_diff="$3"
     rm -f "$root_diff"
     truncate -s 512M "$root_diff"
-    mkfs.ext4 -q -F "$root_diff"
+    mkfs.ext4 -q -F -O ^has_journal "$root_diff"
     cat > "$output" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: $hostname }

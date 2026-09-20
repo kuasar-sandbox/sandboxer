@@ -57,9 +57,9 @@ fi
 BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 
 truncate -s 512M "$WORK/root-template.ext4"
-mkfs.ext4 -q -F "$WORK/root-template.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/root-template.ext4"
 truncate -s 256M "$WORK/data-template.ext4"
-mkfs.ext4 -q -F "$WORK/data-template.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/data-template.ext4"
 
 RUN_ROOT="$WORK/run/build-01"
 BASE_ROOT="$WORK/base/build-01"

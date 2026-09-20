@@ -906,12 +906,19 @@ COW base 属于可写 ext4 upper，不是只读 EROFS 镜像。这些规则同�
 请从已有配置中删除这些键，并准备具有所需容量的文件系统来源。新生成的配置不再输出
 这些键；无关配置字段和不透明的 metadata 不受影响。
 
+对于新建的可丢弃 ext4 工作盘（overlay upper、单盘 root，以及 scratch 或数据盘测试
+文件），使用 `mkfs.ext4 -O ^has_journal` 格式化稀疏模板，避免文件系统 journal
+占用及元数据日志写入；这不影响 journald 或应用日志。COW 不能替代 journal，
+此默认约定不承诺中断后工作盘的崩溃恢复。已有带 journal 的模板、用户自带镜像和
+快照继续兼容；guest sync/quiesce 与快照/恢复语义保持不变。不要为应用此建议而
+重新格式化已有数据盘。
+
 对于一个**新建的**、空白的 512 MiB scratch 文件系统，可以准备新模板，使用时不再指定
 大小覆盖项：
 
 ```bash
 truncate -s 512M /tmp/scratch-512m.ext4
-mkfs.ext4 -F /tmp/scratch-512m.ext4
+mkfs.ext4 -F -O ^has_journal /tmp/scratch-512m.ext4
 ```
 
 ```yaml

@@ -110,7 +110,7 @@ BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 echo "==> blk0: $BLK0_IMAGE"
 
 GUEST_MAC="02:00:00:00:80:01"
-mkdiff() { truncate -s 1G "$1"; mkfs.ext4 -q -F "$1"; }
+mkdiff() { truncate -s 1G "$1"; mkfs.ext4 -q -F -O ^has_journal "$1"; }
 
 # write_yaml <out> <guest_ip> <diff> <host_cidr> <with_launch:0|1>
 write_yaml() {

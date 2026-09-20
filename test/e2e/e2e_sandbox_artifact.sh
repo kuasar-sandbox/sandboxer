@@ -69,7 +69,7 @@ mkdir -p "$RUN_ROOT" "$BASE_ROOT"
 
 SOURCE_DIFF="$WORK/source.diff"
 truncate -s 1G "$SOURCE_DIFF"
-mkfs.ext4 -q -F "$SOURCE_DIFF"
+mkfs.ext4 -q -F -O ^has_journal "$SOURCE_DIFF"
 
 cat > "$WORK/source.yaml" <<EOF
 resources:
@@ -231,7 +231,7 @@ run_from_export "$E2" E2 e2
 
 ASSEMBLY_TEMPLATE="$WORK/assembly-template.ext4"
 truncate -s 512M "$ASSEMBLY_TEMPLATE"
-mkfs.ext4 -q -F "$ASSEMBLY_TEMPLATE"
+mkfs.ext4 -q -F -O ^has_journal "$ASSEMBLY_TEMPLATE"
 cat > "$WORK/assembly.yaml" <<EOF
 resources:
   capacity:    { cpu: 1, memory: 512MiB }
