@@ -33,11 +33,14 @@ wait_file() {
     done
     echo "timed out: $pattern in $path" >&2; cat "$path" >&2; return 1
 }
+fault_count() {
+    if [ -f "$WORK/faults.jsonl" ]; then wc -l < "$WORK/faults.jsonl"; else printf '0\n'; fi
+}
 wait_fault_count() {
     local before=$1 count=$2 pid=$3
     local target=$((before + count))
     for _ in $(seq 1 400); do
-        [ "$(wc -l < "$WORK/faults.jsonl")" -ge "$target" ] && return
+        [ "$(fault_count)" -ge "$target" ] && return
         kill -0 "$pid" 2>/dev/null || return 1
         sleep .05
     done
@@ -264,7 +267,7 @@ PY
 launch cow --config "$WORK/cow.yaml"
 wait_file "$WORK/cow.log" '^COW-ARMED$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id cow --run-root "$WORK/run" -- /bin/true
-COW_FAULT_BASE=$(wc -l < "$WORK/faults.jsonl")
+COW_FAULT_BASE=$(fault_count)
 mode "cow:$(cat "$WORK/cow.keys")"
 "$BIN/sandbox-ctl" exec --sandbox-id cow --run-root "$WORK/run" -- touch /cow.begin
 wait_file "$WORK/cow.log" '^COW-BEGIN$' "$RUN_PID"
@@ -275,7 +278,7 @@ if grep -q '^COW-RECOVERED$' "$WORK/cow.log"; then
 fi
 mode healthy
 wait_file "$WORK/cow.log" '^DISK-READ-ARMED$' "$RUN_PID"
-DISK_FAULT_BASE=$(wc -l < "$WORK/faults.jsonl")
+DISK_FAULT_BASE=$(fault_count)
 mode "disk-read:$(cat "$WORK/cow.keys")"
 "$BIN/sandbox-ctl" exec --sandbox-id cow --run-root "$WORK/run" -- touch /disk-read.begin
 wait_file "$WORK/cow.log" '^DISK-READ-BEGIN$' "$RUN_PID"
@@ -323,7 +326,7 @@ exec 8<>"$WORK/read-recovery.gate"
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'echo EXEC-ARMED; IFS= read -r _; echo 3 > /proc/sys/vm/drop_caches; cat /recovery.data >/dev/null; echo READ-RECOVERED' <&8 > "$WORK/pending-exec.log" 2>&1 &
 EXEC_PID=$!; PIDS+=($EXEC_PID)
 wait_file "$WORK/pending-exec.log" '^EXEC-ARMED$' "$RUN_PID"
-BEFORE_EXEC_FAULTS=$(wc -l < "$WORK/faults.jsonl")
+BEFORE_EXEC_FAULTS=$(fault_count)
 mode offline
 printf 'go\n' >&8
 exec 8>&-
@@ -377,7 +380,7 @@ wait "$EXEC_PID"
 # pre-existing workload retry.
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'touch /recovery.idle'
 wait_file "$WORK/recovered.log" '^RECOVERY-IDLE$' "$RUN_PID"
-BEFORE_CAPTURE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
+BEFORE_CAPTURE_FAULTS=$(fault_count)
 mode offline
 "$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
 CAPTURE_PID=$!
@@ -426,7 +429,7 @@ wait_file_count "$WORK/verified.log" '^RECOVERY-IDLE$' "$VERIFIED_IDLE_BASE" "$R
 # A complete corrupt immutable response is a deterministic failure while an
 # idle restored Guest is in capture. With the workload already at RECOVERY-IDLE,
 # a new post-fence source fault is capture-specific.
-BEFORE_FATAL_FAULTS=$(wc -l < "$WORK/faults.jsonl")
+BEFORE_FATAL_FAULTS=$(fault_count)
 mode offline
 "$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
 FATAL_CAPTURE_PID=$!
