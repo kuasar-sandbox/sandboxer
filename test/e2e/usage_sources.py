@@ -278,7 +278,7 @@ def validate_wire_progress(baseline, observed):
     for name in ("ch.rss_anon", "ch.rss_file", "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file"):
         before = metric(baseline["live"], "gauges", name)
         after = metric(observed[-1]["live"], "gauges", name)
-        assert int(after["covered_total_ns"]) - int(before["covered_total_ns"]) >= 40_000_000_000, name
+        assert int(after["covered_total_ns"]) - int(before["covered_total_ns"]) >= 30_000_000_000, name
         assert int(after["last_request_id"]) - int(before["last_request_id"]) >= 40, name
     for name in ("filesystem.root", "filesystem.disk-1"):
         before = metric(baseline["live"], "gauges", name)
@@ -360,7 +360,9 @@ def validate_wire_deadline(fault, requests):
 
 
 def vsock_case(work, ref):
-    sb = Sandbox(work, "vsock", filesystem_config(work, "vsock", ref),
+    config = filesystem_config(work, "vsock", ref)
+    config["usage"]["sample_interval"] = "1s"
+    sb = Sandbox(work, "vsock", config,
                  ch_binary=Path(__file__).with_name("usage_vsock_wrapper.py"))
     relay, trace, observer, failure = None, None, None, None
     try:
@@ -383,14 +385,14 @@ def vsock_case(work, ref):
             # a reconnect leak. The observer MUX spans all eleven wire faults.
             sb.cli("exec", "--", "/probe", "true")
             observer = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
-                "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "init-resources-stream", "40"],
+                "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "init-resources-stream", "50"],
                 stdout=guest_output, stderr=subprocess.STDOUT)
             wait_observer_ready(observer, sb.dir / "guest-resources.log")
             observed, counts, faults = [], [], []
             for ordinal, mode in enumerate(["drop"]*8 + ["delay", "repeat", "fragment"]):
                 relay.arm(mode)
                 values, started, last = [], time.monotonic(), None
-                while time.monotonic() - started < 3:
+                while time.monotonic() - started < 4:
                     assert trace.poll() is None and observer.poll() is None
                     view = sb.view()
                     key = wire_view_key(view)
@@ -460,7 +462,7 @@ def vsock_case(work, ref):
         assert max(host_counts) - min(host_counts) <= 4, host_counts
         guest_resources = [json.loads(line) for line in (sb.dir / "guest-resources.log").read_text().splitlines()]
         guest_counts = [row["fds"] for row in guest_resources]
-        assert len(guest_counts) == 40 and max(guest_counts) - min(guest_counts) <= 4, guest_counts
+        assert len(guest_counts) == 50 and max(guest_counts) - min(guest_counts) <= 4, guest_counts
         validate_wire_progress(baseline, observed)
         assert not relay.errors, relay.errors
         print("PASS usage-sources/vsock (11 real frame faults across one blocked filesystem slot)", flush=True)

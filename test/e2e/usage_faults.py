@@ -150,7 +150,7 @@ def main():
             elif name == "write-error":
                 injection = inject(sb, "pwrite64", "error=EIO")
             elif name == "writer":
-                injection = inject(sb, "pwrite64", "delay_enter=3000000:when=1")
+                injection = inject(sb, "pwrite64", "delay_enter=6000000:when=1")
             elif name == "kill":
                 sb.cli("exec", "--", "/probe", "cpu", "1")
                 live = sb.view()
