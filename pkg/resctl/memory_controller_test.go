@@ -1386,11 +1386,11 @@ func TestMemoryControllerRestoreNormalizationSerializesConcurrentReport(t *testi
 		t.Fatal(err)
 	}
 	defer m.Stop()
+	if calls := reservation.seen(); len(calls) != 0 {
+		t.Fatalf("normalization/concurrent-report race touched node reservation: %+v", calls)
+	}
 	if !m.SubmitGuestReport(report) {
 		t.Fatal("same report was not accepted after normalization opened the barrier")
-	}
-	if calls := reservation.seen(); len(calls) != 0 {
-		t.Fatalf("normalization/report race touched node reservation: %+v", calls)
 	}
 }
 
