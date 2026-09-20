@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 type sampleLoopClock struct {
@@ -20,6 +22,46 @@ func (c *sampleLoopClock) Ticker(interval time.Duration) (<-chan time.Time, func
 		return c.samples, func() {}
 	}
 	return c.flushes, func() {}
+}
+
+func TestDefaultFlushTickPersists(t *testing.T) {
+	cfg, err := config.LoadConfigBytes([]byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sample, flush, err := cfg.Usage.Intervals()
+	if err != nil || sample != time.Second || flush != 5*time.Minute {
+		t.Fatalf("default usage intervals = %s/%s, err=%v; want 1s/5m", sample, flush, err)
+	}
+
+	s := samplerFixture(t)
+	c := &sampleLoopClock{testClock: testClock{now: s.start}, samples: make(chan time.Time), flushes: make(chan time.Time)}
+	s.clock, s.interval, s.flush = c, sample, flush
+	ctx, cancel := context.WithCancel(context.Background())
+	s.Start(ctx, 123)
+	defer func() {
+		cancel()
+		select {
+		case <-s.done:
+		case <-time.After(3 * time.Second):
+			t.Error("sampler loop did not finish")
+		}
+	}()
+
+	c.mu.Lock()
+	c.now = s.start.Add(flush)
+	now := c.now
+	c.mu.Unlock()
+	select {
+	case c.flushes <- now:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sampler did not receive the default flush tick")
+	}
+	awaitSave(t, s.m)
+	v := s.m.View()
+	if v.Saved == nil || v.Saved.SavedUTC != now.UnixNano() {
+		t.Fatalf("default flush tick did not persist a snapshot: %+v", v)
+	}
 }
 
 func TestMissingTicksRespectFinalFence(t *testing.T) {
