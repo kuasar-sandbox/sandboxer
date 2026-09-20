@@ -46,7 +46,8 @@ wait_fault_count() {
 wait_new_fault() { wait_fault_count "$1" 1 "$2"; }
 connect_failure_count() { grep -c '"event": "connect-failure"' "$WORK/faults.jsonl" 2>/dev/null || true; }
 wait_connect_failures() {
-    local before=$1 count=$2 pid=$3 target=$((before + count))
+    local before=$1 count=$2 pid=$3 target
+    target=$((before + count))
     for _ in $(seq 1 400); do
         [ "$(connect_failure_count)" -ge "$target" ] && return
         kill -0 "$pid" 2>/dev/null || return 1
@@ -216,7 +217,7 @@ buf=mmap.mmap(-1,4096)
 assert os.preadv(fd,[buf],0)==4096 and buf[:]==bytes(4096)
 buf[:512]=b'W'*512
 print('COW-ARMED',flush=True)
-time.sleep(7)
+while not os.path.exists('/cow.begin'): time.sleep(.01)
 print('COW-BEGIN',flush=True)
 assert os.pwritev(fd,[memoryview(buf)[:512]],512<<10)==512
 assert os.preadv(fd,[buf],512<<10)==4096
@@ -224,7 +225,7 @@ assert buf[:512]==b'W'*512 and buf[512:]==bytes([128])*3584
 os.fsync(fd)
 print('COW-RECOVERED',flush=True)
 print('DISK-READ-ARMED',flush=True)
-time.sleep(7)
+while not os.path.exists('/disk-read.begin'): time.sleep(.01)
 print('DISK-READ-BEGIN',flush=True)
 assert os.preadv(fd,[buf],1<<20)==4096 and buf[:]==bytes([5])*4096
 print('DISK-READ-RECOVERED',flush=True)
@@ -252,20 +253,22 @@ PY
 launch cow --config "$WORK/cow.yaml"
 wait_file "$WORK/cow.log" '^COW-ARMED$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id cow --run-root "$WORK/run" -- /bin/true
+COW_FAULT_BASE=$(wc -l < "$WORK/faults.jsonl")
 mode "cow:$(cat "$WORK/cow.keys")"
+"$BIN/sandbox-ctl" exec --sandbox-id cow --run-root "$WORK/run" -- touch /cow.begin
 wait_file "$WORK/cow.log" '^COW-BEGIN$' "$RUN_PID"
-wait_file "$WORK/faults.jsonl" '"mode": "cow"' "$RUN_PID"
-sleep 3
+wait_fault_count "$COW_FAULT_BASE" 4 "$RUN_PID"
 kill -0 "$RUN_PID"
 if grep -q '^COW-RECOVERED$' "$WORK/cow.log"; then
     echo "COW write completed while its base source was unavailable" >&2; exit 1
 fi
 mode healthy
 wait_file "$WORK/cow.log" '^DISK-READ-ARMED$' "$RUN_PID"
+DISK_FAULT_BASE=$(wc -l < "$WORK/faults.jsonl")
 mode "disk-read:$(cat "$WORK/cow.keys")"
+"$BIN/sandbox-ctl" exec --sandbox-id cow --run-root "$WORK/run" -- touch /disk-read.begin
 wait_file "$WORK/cow.log" '^DISK-READ-BEGIN$' "$RUN_PID"
-wait_file "$WORK/faults.jsonl" '"mode": "disk-read"' "$RUN_PID"
-sleep 3
+wait_fault_count "$DISK_FAULT_BASE" 4 "$RUN_PID"
 kill -0 "$RUN_PID"
 if grep -q '^DISK-READ-RECOVERED$' "$WORK/cow.log"; then
     echo "disk read completed while its source was unavailable" >&2; exit 1
@@ -304,11 +307,16 @@ YAML
 launch recovered --restore "manifest://$SNAP" --config "$WORK/host.yaml"
 wait_file "$WORK/recovered.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- /bin/true
-"$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'echo EXEC-ARMED; sleep 7; echo 3 > /proc/sys/vm/drop_caches; cat /recovery.data >/dev/null; echo READ-RECOVERED' > "$WORK/pending-exec.log" 2>&1 &
+mkfifo "$WORK/read-recovery.gate"
+exec 8<>"$WORK/read-recovery.gate"
+"$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'echo EXEC-ARMED; IFS= read -r _; echo 3 > /proc/sys/vm/drop_caches; cat /recovery.data >/dev/null; echo READ-RECOVERED' <&8 > "$WORK/pending-exec.log" 2>&1 &
 EXEC_PID=$!; PIDS+=($EXEC_PID)
 wait_file "$WORK/pending-exec.log" '^EXEC-ARMED$' "$RUN_PID"
+BEFORE_EXEC_FAULTS=$(wc -l < "$WORK/faults.jsonl")
 mode offline
-wait_file "$WORK/faults.jsonl" '"mode": "offline"' "$RUN_PID"
+printf 'go\n' >&8
+exec 8>&-
+wait_new_fault "$BEFORE_EXEC_FAULTS" "$RUN_PID"
 # Stop only our cache, retaining its data and original endpoint. Retry
 # longevity is proven deterministically in internal/readretry; this real-KVM
 # case proves the guest operation remains pending and recovers on the same endpoint.
