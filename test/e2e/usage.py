@@ -340,8 +340,10 @@ def oom_pressure(sb, relay):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cases", default="off,overlay,single,balloon,balloon-no-oom,oom,multidisk,restore,defaults")
+    parser.add_argument("--cases", default="off,overlay,single,balloon,balloon-no-oom,oom,multidisk,restore")
     parser.add_argument("--seconds", type=int, default=12)
+    # The production 5m default is covered by config/scheduler unit tests.
+    # Keep --cases defaults as an explicit soak/debug check, never a CI wall-clock wait.
     args = parser.parse_args()
     assert args.seconds >= 6
     work = Path(tempfile.mkdtemp(prefix="e2e-usage-"))

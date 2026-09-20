@@ -38,10 +38,22 @@ def record(mode, request):
                               "key": request[7:39].hex()}) + "\n")
 
 
+def record_connect_failure(mode):
+    with lock, open(evidence, "a", encoding="utf8") as out:
+        out.write(json.dumps({"mode": mode, "event": "connect-failure",
+                              "opcode": -1, "namespace": -1, "key": ""}) + "\n")
+
+
 def serve(client):
     backend = None
     try:
-        backend = socket.create_connection(("127.0.0.1", int(target)), timeout=10)
+        try:
+            backend = socket.create_connection(("127.0.0.1", int(target)), timeout=10)
+        except OSError:
+            mode, _, _ = pathlib.Path(control).read_text().strip().partition(":")
+            if mode == "offline":
+                record_connect_failure(mode)
+            return
         backend.settimeout(None)
         with lock:
             connections.add(backend)

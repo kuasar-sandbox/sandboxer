@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 type sampleLoopClock struct {
@@ -20,6 +22,63 @@ func (c *sampleLoopClock) Ticker(interval time.Duration) (<-chan time.Time, func
 		return c.samples, func() {}
 	}
 	return c.flushes, func() {}
+}
+
+func TestDefaultFlushTickPersists(t *testing.T) {
+	cfg, err := config.LoadConfigBytes([]byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sample, flush, err := cfg.Usage.Intervals()
+	if err != nil || sample != time.Second || flush != 5*time.Minute {
+		t.Fatalf("default usage intervals = %s/%s, err=%v; want 1s/5m", sample, flush, err)
+	}
+
+	start := time.Now()
+	c := &sampleLoopClock{testClock: testClock{now: start}, samples: make(chan time.Time), flushes: make(chan time.Time)}
+	m, err := Open(t.TempDir(), "default-flush", "epoch", start, sample, flush)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewSampler(m, 2, 1, nil, nil, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.interval != sample || s.flush != flush {
+		t.Fatalf("sampler intervals = %s/%s; want %s/%s", s.interval, s.flush, sample, flush)
+	}
+	s.Start(context.Background(), os.Getpid())
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		s.Stop(ctx)
+	}()
+
+	c.mu.Lock()
+	c.now = start.Add(flush)
+	now := c.now
+	c.mu.Unlock()
+	select {
+	case c.flushes <- now:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sampler did not receive the default flush tick")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		v := s.m.View()
+		if v.Saving || v.Saved != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("default flush did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	awaitSave(t, s.m)
+	v := s.m.View()
+	if v.Saved == nil || v.Saved.SavedUTC != now.UnixNano() {
+		t.Fatalf("default flush tick did not persist a snapshot: %+v", v)
+	}
 }
 
 func TestMissingTicksRespectFinalFence(t *testing.T) {

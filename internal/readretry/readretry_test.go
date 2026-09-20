@@ -123,3 +123,21 @@ func TestCompleteReadDoesNotSwallowMarkedOrJoinedEOF(t *testing.T) {
 		}
 	}
 }
+
+func TestRetryContinuesBeyondFormerBoundedWindow(t *testing.T) {
+	attempts := 0
+	waits := 0
+	err := do(context.Background(), func() error {
+		attempts++
+		if attempts <= 20 {
+			return errors.New("source unavailable")
+		}
+		return nil
+	}, func(time.Duration) error {
+		waits++
+		return nil
+	})
+	if err != nil || attempts != 21 || waits != 20 {
+		t.Fatalf("attempts=%d waits=%d err=%v; retry stopped before recovery", attempts, waits, err)
+	}
+}
