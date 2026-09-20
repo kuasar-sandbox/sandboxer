@@ -10,7 +10,19 @@ for command in strace mount umount mkfs.ext4 python3; do
     command -v "$command" >/dev/null || { echo "missing $command" >&2; exit 1; }
 done
 if [ "$(id -u)" -ne 0 ]; then
-    exec sudo -nE bash "$0" "$@"
+    selected_go=$(command -v "${KUASAR_E2E_GO:-${GOROOT:+$GOROOT/bin/}go}") || exit 1
+    selected_go="$(cd "$(dirname "$selected_go")" && pwd)/${selected_go##*/}"
+    # Resolve before sudo drops the PATH entries used by named/+path policies.
+    go_source="$(cd "$(dirname "$0")/../.." && pwd)"
+    selected_root=$(GOWORK=off "$selected_go" -C "$go_source" env GOROOT) || exit 1
+    bundled_root=$(GO111MODULE=off GOWORK=off GOTOOLCHAIN=local "$selected_go" env GOROOT) || exit 1
+    if [ "$selected_root" != "$bundled_root" ]; then
+        selected_version=$(GOWORK=off "$selected_go" -C "$go_source" env GOVERSION) || exit 1
+        selected_go=$(command -v "$selected_version" || printf '%s/bin/go\n' "$selected_root")
+        [ -f "$selected_go" ] && [ -x "$selected_go" ] || { echo "selected Go toolchain is unavailable" >&2; exit 1; }
+        selected_go="$(cd "$(dirname "$selected_go")" && pwd)/${selected_go##*/}"
+    fi
+    exec sudo -nE env KUASAR_E2E_GO="$selected_go" GOROOT="$selected_root" /bin/bash "$0" "$@"
 fi
 export PYTHONPYCACHEPREFIX="$(mktemp -d /tmp/usage-faults-pycache-XXXXXX)"
 python3 "$SCRIPT_DIR/usage_faults.py" "$@"

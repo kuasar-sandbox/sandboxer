@@ -71,7 +71,7 @@ class HarnessProcessTests(unittest.TestCase):
             other.parent.mkdir()
             other.write_text("#!/bin/sh\nprintf 'wrong-driver\\n' >&2\nexit 47\n")
             other.chmod(0o755)
-            with patch.dict(os.environ, {"GOROOT": str(selected.parent.parent), "PATH": str(other.parent)}):
+            with patch.dict(os.environ, {"GOROOT": str(selected.parent.parent), "PATH": str(other.parent), "KUASAR_E2E_GO": ""}):
                 selected_usage = runpy.run_path(usage.__file__)
                 self.assertEqual(selected_usage["GO"], str(selected))
                 self.assertEqual(selected_usage["run"](selected_usage["GO"], "version"), "selected-driver\n")
@@ -79,8 +79,13 @@ class HarnessProcessTests(unittest.TestCase):
                 with self.assertRaises(FileNotFoundError):
                     selected_usage["run"](selected_usage["GO"], "version")
 
+    def test_carried_go_entry_takes_precedence_after_sudo(self):
+        with patch.dict(os.environ, {"KUASAR_E2E_GO": "/environment/go", "GOROOT": "/other/root"}):
+            selected_usage = runpy.run_path(usage.__file__)
+            self.assertEqual(selected_usage["GO"], "/environment/go")
+
     def test_without_goroot_preserves_path_selection(self):
-        with patch.dict(os.environ, {"GOROOT": ""}):
+        with patch.dict(os.environ, {"GOROOT": "", "KUASAR_E2E_GO": ""}):
             selected_usage = runpy.run_path(usage.__file__)
             self.assertEqual(selected_usage["GO"], "go")
 
