@@ -25,13 +25,13 @@ func (p *Publisher) publishBundle(
 	rootRef string,
 	scope publishScope,
 	first *OpenedFile,
-) (PublishResult, error) {
+) (result PublishResult, retErr error) {
 	root, ok := first.RootManifestKey()
 	if !ok {
 		_ = first.Close()
 		return PublishResult{}, errors.New("publish Bundle: carrier has no root Manifest")
 	}
-	role, dependencies, err := p.inspectBundleRoot(ctx, rootRef, scope, first, root)
+	role, dependencies, sandboxRef, err := p.inspectBundleRoot(ctx, rootRef, scope, first, root)
 	if err != nil {
 		return PublishResult{}, err
 	}
@@ -49,7 +49,12 @@ func (p *Publisher) publishBundle(
 		_ = stream.Close()
 		return PublishResult{}, errors.New("publish Bundle: carrier format changed during publication")
 	}
-	defer opened.Close()
+	defer func() {
+		retErr = errors.Join(retErr, opened.Close())
+		if retErr != nil {
+			result = PublishResult{}
+		}
+	}()
 	currentRoot, ok := opened.RootManifestKey()
 	if !ok || currentRoot != root {
 		return PublishResult{}, errors.New("publish Bundle: root Manifest changed during publication")
@@ -88,7 +93,30 @@ func (p *Publisher) publishBundle(
 		remoteDependencies: remoteDependencies,
 		keyFn:              p.storage.CustomerKeyFunc(), decryptor: decryptor,
 	})
-	return PublishResult{Role: role, Ref: ref}, err
+	if err != nil {
+		return PublishResult{}, err
+	}
+	// Exact publication preserves logical keys, but changes their source binding.
+	// Selection metadata is already required by the transfer; reporting does not
+	// re-open any member or consult an unselected fallback.
+	for _, key := range dependencies {
+		raw := "manifest://" + manifest.HexKey(key)
+		before, after := raw, raw
+		if selected, bundled := selectedSources[key]; bundled {
+			carrier := selectedBundleCarrier(rootRef, selected)
+			before = bundleMemberRef(carrier, key)
+			if _, remote := p.target.(*manifestPublishTarget); !remote {
+				finalCarrier := selectedBundleCarrier(ref, selected)
+				after = bundleMemberRef(finalCarrier, key)
+			}
+		}
+		p.original(before, publishScope{relativeDir: filepath.Dir(sourcePath)})
+		p.retained(after, publishScope{})
+		if sandboxRef == raw {
+			sandboxRef = after
+		}
+	}
+	return p.result(role, ref, sandboxRef), nil
 }
 
 func selectExactBundleSources(
@@ -156,77 +184,82 @@ func (p *Publisher) inspectBundleRoot(
 	scope publishScope,
 	first *OpenedFile,
 	rootKey store.ContentKey,
-) (LogicalRole, []store.ContentKey, error) {
+) (role LogicalRole, dependencies []store.ContentKey, sandboxRef string, retErr error) {
 	if sandboxRoot, err := sandboxfile.Open(ctx, first); err == nil {
-		defer sandboxRoot.Close()
+		defer func() { retErr = errors.Join(retErr, sandboxRoot.Close()) }()
+		p.retainLocatedDisks(sandboxRoot.Portable)
 		dependencies, err := manifestDependenciesFromSandbox(sandboxRoot.Portable, rootKey)
-		return RoleSandbox, dependencies, err
+		return RoleSandbox, dependencies, "", err
 	} else if readretry.IsTerminal(err) || readerr.IsPermanent(err) {
-		return "", nil, err
+		return "", nil, "", err
 	}
 
 	stream, childScope, err := p.open(ctx, rootRef, scope)
 	if err != nil {
-		return "", nil, err
+		return "", nil, "", err
 	}
 	snapshotRoot, err := snapshotfile.Open(ctx, stream)
 	if err != nil {
-		return "", nil, fmt.Errorf("publish Bundle: root is neither a strict Sandbox nor Snapshot: %w", err)
+		return "", nil, "", fmt.Errorf("publish Bundle: root is neither a strict Sandbox nor Snapshot: %w", err)
 	}
-	defer snapshotRoot.Close()
+	defer func() { retErr = errors.Join(retErr, snapshotRoot.Close()) }()
 	cfg, err := snapshot.ParseConfig(snapshotRoot.SnapshotConfig)
 	if err != nil {
-		return "", nil, fmt.Errorf("publish Bundle: snapshot.cfg: %w", err)
+		return "", nil, "", fmt.Errorf("publish Bundle: snapshot.cfg: %w", err)
 	}
 	canonical, err := snapshot.MarshalConfig(cfg)
 	if err != nil || !bytes.Equal(canonical, snapshotRoot.SnapshotConfig) {
 		if err != nil {
-			return "", nil, err
+			return "", nil, "", err
 		}
-		return "", nil, errors.New("publish Bundle: snapshot.cfg is not canonically encoded")
+		return "", nil, "", errors.New("publish Bundle: snapshot.cfg is not canonically encoded")
 	}
 
+	for _, raw := range append(append([]string{}, cfg.FromRefs...), cfg.SandboxRef) {
+		p.retainLocated(raw)
+	}
 	seen := map[store.ContentKey]struct{}{rootKey: {}}
-	dependencies := make([]store.ContentKey, 0, len(cfg.FromRefs)+1)
+	dependencies = make([]store.ContentKey, 0, len(cfg.FromRefs)+1)
 	for index, raw := range cfg.FromRefs {
 		if err := appendManifestDependency(raw, fmt.Sprintf("snapshot from_refs[%d]", index), seen, &dependencies); err != nil {
-			return "", nil, err
+			return "", nil, "", err
 		}
 	}
-	sandboxRef, err := manifest.ParseRef(cfg.SandboxRef)
+	parsedE, err := manifest.ParseRef(cfg.SandboxRef)
 	if err != nil {
-		return "", nil, fmt.Errorf("publish Bundle: snapshot sandbox_ref: %w", err)
+		return "", nil, "", fmt.Errorf("publish Bundle: snapshot sandbox_ref: %w", err)
 	}
 	if err := appendManifestDependency(cfg.SandboxRef, "snapshot sandbox_ref", seen, &dependencies); err != nil {
-		return "", nil, err
+		return "", nil, "", err
 	}
-	if sandboxRef.Scheme == manifest.RefSchemeManifest {
+	if parsedE.Scheme == manifest.RefSchemeManifest {
 		if childScope.fetcher == nil {
-			return "", nil, errors.New("publish Bundle: snapshot sandbox_ref requires a Bundle fetcher")
+			return "", nil, "", errors.New("publish Bundle: snapshot sandbox_ref requires a Bundle fetcher")
 		}
-		key, err := manifest.ParseKeyRef(sandboxRef.Path)
+		key, err := manifest.ParseKeyRef(parsedE.Path)
 		if err != nil {
-			return "", nil, err
+			return "", nil, "", err
 		}
 		sandboxStream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return childScope.fetcher.OpenManifest(ctx, key) })
 		if err != nil {
-			return "", nil, fmt.Errorf("publish Bundle: open snapshot sandbox_ref: %w", err)
+			return "", nil, "", fmt.Errorf("publish Bundle: open snapshot sandbox_ref: %w", err)
 		}
 		sandboxRoot, err := sandboxfile.Open(ctx, sandboxStream)
 		if err != nil {
-			return "", nil, fmt.Errorf("publish Bundle: parse snapshot sandbox_ref: %w", err)
+			return "", nil, "", fmt.Errorf("publish Bundle: parse snapshot sandbox_ref: %w", err)
 		}
+		p.retainLocatedDisks(sandboxRoot.Portable)
 		for _, dependency := range portableDiskRefs(sandboxRoot.Portable) {
 			if err := appendManifestDependency(dependency.raw, "Sandbox disk dependency", seen, &dependencies); err != nil {
 				_ = sandboxRoot.Close()
-				return "", nil, err
+				return "", nil, "", err
 			}
 		}
 		if err := sandboxRoot.Close(); err != nil {
-			return "", nil, err
+			return "", nil, "", err
 		}
 	}
-	return RoleSnapshot, dependencies, nil
+	return RoleSnapshot, dependencies, cfg.SandboxRef, nil
 }
 
 func manifestDependenciesFromSandbox(cfg *config.PortableSandboxConfig, root store.ContentKey) ([]store.ContentKey, error) {
@@ -264,4 +297,39 @@ func appendManifestDependency(raw, label string, seen map[store.ContentKey]struc
 	seen[key] = struct{}{}
 	*dependencies = append(*dependencies, key)
 	return nil
+}
+
+func bundleMemberRef(carrier string, key store.ContentKey) string {
+	ref, _ := manifest.ParseRef(carrier)
+	ref.DigestScheme, ref.Digest = "manifest", manifest.HexKey(key)
+	return ref.String()
+}
+func (p *Publisher) retainLocated(raw string) {
+	ref, err := manifest.ParseRef(raw)
+	if err == nil && ref.Scheme == manifest.RefSchemeFile && ref.Location != "" {
+		p.original(raw, publishScope{})
+		p.retained(raw, publishScope{})
+	}
+}
+func (p *Publisher) retainLocatedDisks(cfg *config.PortableSandboxConfig) {
+	for _, dep := range portableDiskRefs(cfg) {
+		p.retainLocated(dep.raw)
+	}
+}
+
+// A relative Bundle source inherits the current carrier's already-known named
+// location. It remains a different physical carrier; selectors must name it.
+func selectedBundleCarrier(current, selected string) string {
+	if selected == "" {
+		return current
+	}
+	ref, err := manifest.ParseRef(selected)
+	if err != nil {
+		return selected
+	}
+	parent, err := manifest.ParseRef(current)
+	if err == nil && ref.Scheme == manifest.RefSchemeFile && ref.Location == "" && filepath.Base(ref.Path) == ref.Path {
+		ref.Location = parent.Location
+	}
+	return ref.String()
 }

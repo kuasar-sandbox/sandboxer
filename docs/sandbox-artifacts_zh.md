@@ -481,6 +481,67 @@ rebuild S -> publish S last
 
 
 
+### 发布结果报告
+
+`publish --json` 与 `upload-snapshot --json` 别名在发布、验证和资源关闭全部成功后，
+输出且只输出一个成功 JSON 对象。进度保留在 stderr；`--quiet` 仅抑制进度，不改变结果。
+未指定 `--json` 时，stdout 继续只输出最终根引用和换行。输出写入失败仍是命令失败。
+
+Sandbox E：
+
+```json
+{"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]}
+```
+
+Snapshot S：
+
+```json
+{"snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","file://old.snapshot"]}
+```
+
+Sandbox 仅有 `sandboxRef` 和 `removedRefs`；Snapshot 额外包含 `snapshotRef`。
+Snapshot 的 `sandboxRef` 是最终 S 实际引用的 E，包括复用的 E 或实际选中 Bundle 的
+selector。例如，最终 located Bundle 中的 E 为
+`file://<carrier>.bundle@manifest:<E-key>@location:<name>`；从远端选中的 E 仍为
+`manifest://<E-key>`。不同 carrier、location 或身份域中相同的内容 key 本身不代表
+同一个引用。空 `removedRefs` 必须为 `[]`，不能为 `null`。
+
+`removedRefs` 是本次操作已有解析边界内，原拓扑减去最终保留拓扑的差集，包含退出拓扑的
+旧根和已知本地/远端磁盘、内存引用。原配置字段和原生 lower 列表在修改前记录；最终采用、
+复用且未写入对象的引用同样属于新拓扑，仍被其他设备或输出链使用的引用不会误报。
+普通发布、替换、三种归并形式、portable 快路径、memo 复用和 Bundle exact 传输均采用
+同一套单次操作记账，重复调用 publisher 不继承上次旧引用。历史 S 作为内存层、历史 E
+作为磁盘层时保持既有的仅 payload 用途。`self` 属于 E，不是单独引用。未改变的不透明
+分支沿用已知边界，不扫描后代。
+
+启用 `--skip-verify-ref` 后，被替换的旧引用无论可读还是缺失，均按叶子处理；报告不会
+为了发现退出引用而打开旧 E 或其后代。显式原生配置
+`(base=A, base_from_refs=[B,C])` 仍已知 A/B/C 三个引用，显式 `--reduce-ref A=X`
+快路径也必须计入。默认验证模式可复用等价性证明已经解析的原配置。两种模式下，报告均
+不增加对象扫描、payload 读取、摘要计算或临时 payload 文件，只保存有界引用/绑定元数据。
+身份、认证、schema、容量检查和替换/归并范围互斥规则不变；自动归并仍读取构造结果所需数据。
+
+所有公开的无 location 文件引用都只有 basename，保留既有 `@digest`、`@hmac` 或
+`@manifest` 身份后缀。绝对/相对目录、挂载路径和 traversal 不会输出；报告不补造
+location，也不补算缺失身份。已具名 location 引用保留合法表示。先使用完整内部来源上下文
+比较，再投影为 basename，最后对公开引用排序、去重。调用方在外部提供 checkpoint 目录。
+JSON 不增加 path、context、identifier 或字段映射对象，成功结果绝不嵌入诊断 stderr。
+
+报告不删除对象，也不授予删除权限。一个 Bundle selector 退出拓扑不代表整个物理 Bundle
+已无人使用；其他 checkpoint、保留版本或 sandbox 仍可能引用它。源保留和垃圾回收仍由
+原有职责方负责。
+
+库保留 `PublishResult.Role`/`Ref`，增加 `SandboxRef`、`RemovedRefs`，通过
+`result.Report()` 生成安全的公开 `PublishReport`。仅发布镜像的
+`PublishSource(ctx, RoleImage, source)` 调用不变。对于已组装 Snapshot，调用方传入已知
+的最终 E：
+
+```go
+result, err := publisher.PublishSource(ctx, artifact.RoleSnapshot, source, cfg.SandboxRef)
+```
+
+纯创建路径没有原根，差集为空；不会重新扫描已组装 source，source 所有权继续属于调用方。
+
 ## 10. Atomicity 与 determinism
 
 Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local `FileSink`/`BundleSink`保持same-directory temp、完整写入/`Close()`检查和atomic no-replace rename,final commit是O(1);alias只在root commit后更新. artifact capture/publication只定义logical completion,不定义stable-storage durability;两条本地路径都不执行显式file/directory fsync,物理写回由文件系统或底层存储实现定义. Named ref-location采用独立的exclusive-create + checked-write/copy-once + reopen-full-verify协议;tarstream由carrier直接提供identity,Bundle保持exact bytes,两者都不进入local sink的capture/commit路径.
@@ -520,7 +581,7 @@ Snapshot，并保留调用方的 source 所有权。
 sandbox-ctl publish [原有存储/location 参数]
   [--replace-ref OLD=NEW ...]
   [--reduce-ref A=X | A | any ...]
-  [--skip-verify-ref=false|true]
+  [--skip-verify-ref=false|true] [--json] [--quiet]
   SOURCE
 ```
 

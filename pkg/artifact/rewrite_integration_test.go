@@ -124,6 +124,7 @@ func TestRewriteReduceAnyMaterializesMemoryAndAllDisks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertRemoved(t, result, "file://"+sourcePath, eRef, lowerRef, dTop, dLower, pRef)
 	// All source increment files may now leave the retained graph.
 	if err = os.RemoveAll(input); err != nil {
 		t.Fatal(err)
@@ -590,6 +591,9 @@ func TestRewriteBundleDependenciesSurviveRemovedSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	eKey, _ := manifest.ParseKeyRef(eref)
+	diskKey, _ := manifest.ParseKeyRef(disk)
+	assertRemoved(t, result, "file://"+path, bundleMemberRef("file://"+path, eKey), bundleMemberRef("file://"+path, diskKey))
 	if err = os.RemoveAll(input); err != nil {
 		t.Fatal(err)
 	}
@@ -601,6 +605,9 @@ func TestRewriteBundleDependenciesSurviveRemovedSource(t *testing.T) {
 	sconfig, err := snapshot.ParseConfig(s.SnapshotConfig)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if result.SandboxRef != sconfig.SandboxRef {
+		t.Fatal("wrong final E")
 	}
 	e, err := sandboxfile.Open(ctx, rewriteOpen(t, publisher, sconfig.SandboxRef))
 	if err != nil {

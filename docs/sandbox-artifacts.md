@@ -466,6 +466,83 @@ The current S defines the ordered memory list and selects the current E disk gra
 
 
 
+### Publication result report
+
+`publish --json` and the `upload-snapshot --json` alias emit exactly one success
+JSON object after publication, validation and resource closes succeed. Progress
+stays on stderr; `--quiet` suppresses progress and does not change the result.
+Without `--json`, stdout remains the single final root reference followed by a
+newline. An output write failure is a command failure.
+
+Sandbox E:
+
+```json
+{"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]}
+```
+
+Snapshot S:
+
+```json
+{"snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","file://old.snapshot"]}
+```
+
+Sandbox has only `sandboxRef` and `removedRefs`; Snapshot additionally has
+`snapshotRef`. Snapshot's `sandboxRef` is the E actually referenced by final S,
+including a reused E or the selector of its chosen Bundle carrier. For example,
+an E in the final located Bundle is `file://<carrier>.bundle@manifest:<E-key>@location:<name>`;
+an E chosen from remote storage remains `manifest://<E-key>`. Equal content keys
+in different carriers, locations or domains do not by themselves identify the
+same reference. Empty `removedRefs` is `[]`, never `null`.
+
+`removedRefs` is the original topology minus the retained final topology within
+the operation's existing parsing boundary. It includes old roots and known local
+or remote disk/memory refs that leave that topology. Original config fields and
+native lower lists are recorded before mutation. Final adopted and reused refs
+count even when no object is written; a ref still used by another device or
+output chain is excluded. Ordinary publication, replacement, all three reduction
+forms, portable shortcuts, memo reuse and exact Bundle transfer use this same
+operation-local accounting. Repeated publisher calls do not inherit old refs.
+Historical S used as memory and historical E used as disk retain their existing
+payload-only interpretation. `self` belongs to E and is not a separate ref.
+Unchanged opaque branches retain their known boundaries without descendant scans.
+
+With `--skip-verify-ref`, an old replaced ref is a leaf whether readable or
+missing. Reporting never opens old E or its descendants to discover removals.
+An explicit native `(base=A, base_from_refs=[B,C])` still knows all of A/B/C,
+including the explicit `--reduce-ref A=X` shortcut. Default verification may
+reuse the original config it already parsed for equivalence. Reporting adds no
+object scans, payload reads, digests or temporary payload files in either mode;
+it keeps only bounded ref/binding metadata. Identity/authentication/schema/size
+checks and disjoint replace/reduce legality are unchanged. Automatic reduction
+still reads the data required to construct its result.
+
+Every public unlocated file ref contains only its basename, preserving an
+existing `@digest`, `@hmac` or `@manifest` qualifier. Absolute/relative directory
+components, mount paths and traversal are never emitted, and reporting does not
+invent a location or compute a missing identity. Named-location refs retain
+their valid spelling. Comparison first uses the complete internal source scope;
+basename projection happens only afterward, followed by public sorting and
+deduplication. Callers supply the checkpoint directory externally. No path,
+context, identifier or field-mapping objects are added to JSON, and diagnostic
+stderr is never embedded in successful results.
+
+The report does not delete objects or grant deletion authority. A Bundle
+selector leaving the topology does not mean the physical Bundle is unreferenced;
+other checkpoints, retained versions or sandboxes can still use it. Source
+retention and garbage collection remain their owners' responsibilities.
+
+The library retains `PublishResult.Role`/`Ref` and adds `SandboxRef` and
+`RemovedRefs`; `result.Report()` produces the safe public `PublishReport`.
+Image-only `PublishSource(ctx, RoleImage, source)` callers are unchanged. For an
+already assembled Snapshot, the caller supplies its known final E:
+
+```go
+result, err := publisher.PublishSource(ctx, artifact.RoleSnapshot, source, cfg.SandboxRef)
+```
+
+This creation path owns no original root, so its removals are empty. It does not
+rescan the assembled source and leaves source ownership with the caller.
+
 ## 10. Atomicity and determinism
 
 Portable YAML and E/S ZIP use canonical order, fixed metadata, and bounded bytes. Local `FileSink`/`BundleSink` retain same-directory temporaries, complete writes/checked `Close()`, and atomic no-replace rename; final commit is O(1). The alias updates only after root commit. Artifact capture/publication defines logical completion, not stable-storage durability. Neither local artifact path explicitly fsyncs files/directories; the filesystem/storage implementation governs physical writeback. Named ref-locations use a separate exclusive-create, checked-write/copy-once, reopen-and-full-verify protocol. Tarstream carriers directly supply identity; Bundle copying preserves exact bytes. Neither uses the local sink's capture/commit path.
@@ -505,7 +582,7 @@ also accepts an already assembled Snapshot while retaining caller ownership.
 sandbox-ctl publish [existing storage/location options]
   [--replace-ref OLD=NEW ...]
   [--reduce-ref A=X | A | any ...]
-  [--skip-verify-ref=false|true]
+  [--skip-verify-ref=false|true] [--json] [--quiet]
   SOURCE
 ```
 

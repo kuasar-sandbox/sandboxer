@@ -212,6 +212,20 @@ sandbox-ctl publish \
 
 The publisher identifies E/S logical roots from local paths, located refs, Bundle selectors or Manifest refs. It preserves portable dependencies during ordinary publication. Reference rewriting uses repeatable `--replace-ref OLD=NEW`; whole-chain reduction uses `--reduce-ref A=X`, `--reduce-ref A` or `--reduce-ref=any`. Replacement endpoint sets and replacement/reduction scopes must be disjoint; reduction scope includes all original lowers and its target. `any` is exclusive of replacement rules. Snapshot publication includes its current E's disk references and updates `sandbox_ref` after publishing E. `--skip-verify-ref` defaults to false; verification prefers trusted comparable identities, then streams sparse content. New input identity and schema checks remain active in skip mode. See [artifact publication](sandbox-artifacts.md#reference-rewriting-and-whole-chain-reduction) for scope, validation and zero-staging output contracts.
 
+`--json` returns the final publication report: Sandbox has exactly `sandboxRef` and
+`removedRefs`; Snapshot additionally has `snapshotRef`, and its `sandboxRef` is the
+final E actually referenced by S (including Bundle binding). Empty removals are
+`[]`. The default remains one root line; the `upload-snapshot` alias and `--quiet`
+have the same output contract. Local refs are basenames with existing identity
+qualifiers; callers provide the checkpoint directory externally. Removals are the
+known original topology minus retained final refs, including local roots, and do
+not authorize deletion. See [publication result semantics](sandbox-artifacts.md#publication-result-report)
+for skip boundaries, shared refs, privacy and the no-extra-I/O contract.
+
+```bash
+sandbox-ctl publish --json --quiet --to-ref-location release=file:///srv/sandbox-artifacts ./s1.snapshot
+```
+
 ### 2.9 `sandbox-ctl usage`
 
 ```bash

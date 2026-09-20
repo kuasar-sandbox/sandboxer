@@ -37,6 +37,10 @@ const (
 type PublishResult struct {
 	Role LogicalRole
 	Ref  string
+	// SandboxRef is the final E, including its selected carrier binding.
+	SandboxRef string
+	// RemovedRefs retain full internal source scope. Use Report for public output.
+	RemovedRefs []string
 }
 
 // Publisher publishes logical image/E/S roots and their selected graphs. Input
@@ -48,9 +52,11 @@ type Publisher struct {
 	target    publishTarget
 	logf      func(string, ...any)
 
+	memoMu     *sync.Mutex
 	diskMemo   map[string]string
 	memoryMemo map[string]string
 	visiting   map[string]struct{}
+	report     *publicationReport
 }
 
 type publishTarget interface {
@@ -293,7 +299,7 @@ func newPublisher(storage *ProcessStorage, locations config.RefLocations, target
 	}
 	return &Publisher{
 		storage: storage, locations: locations, target: target, logf: logf,
-		diskMemo: make(map[string]string), memoryMemo: make(map[string]string), visiting: make(map[string]struct{}),
+		memoMu: &sync.Mutex{}, diskMemo: make(map[string]string), memoryMemo: make(map[string]string), visiting: make(map[string]struct{}),
 	}
 }
 
@@ -307,14 +313,18 @@ func (p *Publisher) Close() error {
 type publishScope struct {
 	fetcher     fetch.Fetcher
 	relativeDir string
+	carrier     string
+	bindings    map[string]string
+	current     *manifestbundle.Reader
 }
 
 // PublishSource publishes one already-assembled logical image, Sandbox or Snapshot
 // source directly to this Publisher's target. The caller retains ownership of
 // source and must keep it valid until PublishSource returns. Dependencies named
 // by a Sandbox source must already be portable; this method deliberately does
-// not infer a graph from filenames or extensions.
-func (p *Publisher) PublishSource(ctx context.Context, role LogicalRole, source sparse.Source) (PublishResult, error) {
+// not infer a graph from filenames or extensions. Snapshot callers must supply
+// their already-known portable sandbox_ref as the final argument; no scan is made.
+func (p *Publisher) PublishSource(ctx context.Context, role LogicalRole, source sparse.Source, sandboxRef ...string) (PublishResult, error) {
 	if p == nil || p.target == nil {
 		return PublishResult{}, errors.New("publish source: publisher is not initialized")
 	}
@@ -332,11 +342,27 @@ func (p *Publisher) PublishSource(ctx context.Context, role LogicalRole, source 
 	default:
 		return PublishResult{}, fmt.Errorf("publish source: unsupported root role %q", role)
 	}
+	var knownE string
+	if role == RoleSnapshot {
+		if len(sandboxRef) != 1 {
+			return PublishResult{}, errors.New("publish Snapshot source: known sandbox ref is required")
+		}
+		parsed, err := manifest.ParseRef(sandboxRef[0])
+		if err != nil || !parsed.Portable() {
+			return PublishResult{}, errors.New("publish Snapshot source: portable sandbox ref is required")
+		}
+		knownE = parsed.String()
+	} else if len(sandboxRef) != 0 {
+		return PublishResult{}, errors.New("publish source: sandbox ref metadata is only valid for Snapshot")
+	}
 	ref, err := p.target.Put(ctx, role, source)
 	if err != nil {
 		return PublishResult{}, err
 	}
-	return PublishResult{Role: role, Ref: ref}, nil
+	if role == RoleSandbox {
+		knownE = ref
+	}
+	return PublishResult{Role: role, Ref: ref, SandboxRef: knownE, RemovedRefs: []string{}}, nil
 }
 
 // Publish auto-detects exactly one strict logical root and publishes its graph.
@@ -344,10 +370,12 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 	if p == nil || p.storage == nil || p.target == nil {
 		return PublishResult{}, errors.New("publish: publisher is not initialized")
 	}
+	p = p.operation()
 	rootRef, scope, err := p.normalizeRoot(input)
 	if err != nil {
 		return PublishResult{}, err
 	}
+	p.original(rootRef, scope)
 	stream, childScope, err := p.open(ctx, rootRef, scope)
 	if err != nil {
 		return PublishResult{}, err
@@ -358,7 +386,7 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 	sandboxRoot, sandboxErr := sandboxfile.Open(ctx, stream)
 	if sandboxErr == nil {
 		ref, err := p.publishSandboxRoot(ctx, rootRef, childScope, sandboxRoot)
-		return PublishResult{Role: RoleSandbox, Ref: ref}, err
+		return p.result(RoleSandbox, ref, ref), err
 	}
 	if readretry.IsTerminal(sandboxErr) || readerr.IsPermanent(sandboxErr) {
 		return PublishResult{}, sandboxErr
@@ -371,13 +399,21 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 	if snapshotErr != nil {
 		return PublishResult{}, fmt.Errorf("publish: logical root is neither a strict .sandbox nor .snapshot: %w", errors.Join(sandboxErr, snapshotErr))
 	}
-	ref, err := p.publishSnapshotRoot(ctx, rootRef, childScope, snapshotRoot)
-	return PublishResult{Role: RoleSnapshot, Ref: ref}, err
+	ref, e, err := p.publishSnapshotRoot(ctx, rootRef, childScope, snapshotRoot)
+	return p.result(RoleSnapshot, ref, e), err
 }
 
-func (p *Publisher) publishSandboxRoot(ctx context.Context, identity string, scope publishScope, root *sandboxfile.Root) (string, error) {
-	defer root.Close()
+func (p *Publisher) publishSandboxRoot(ctx context.Context, identity string, scope publishScope, root *sandboxfile.Root) (ref string, retErr error) {
+	defer func() {
+		retErr = errors.Join(retErr, root.Close())
+		if retErr != nil {
+			ref = ""
+		}
+	}()
 	refs := portableDiskRefs(root.Portable)
+	for _, dependency := range refs {
+		p.original(dependency.raw, scope)
+	}
 	roles := make(map[string]bool, len(refs))
 	for _, dependency := range refs {
 		if rootImage, seen := roles[dependency.raw]; seen && rootImage != dependency.rootImage {
@@ -416,68 +452,93 @@ func (p *Publisher) publishSandboxRoot(ctx context.Context, identity string, sco
 	return p.target.Put(ctx, RoleSandbox, source)
 }
 
-func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, scope publishScope, root *snapshotfile.Root) (string, error) {
-	defer root.Close()
+func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, scope publishScope, root *snapshotfile.Root) (ref string, e string, retErr error) {
+	defer func() {
+		retErr = errors.Join(retErr, root.Close())
+		if retErr != nil {
+			ref, e = "", ""
+		}
+	}()
 	if err := p.enter("snapshot:" + identity); err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer p.leave("snapshot:" + identity)
 	cfg, err := snapshot.ParseConfig(root.SnapshotConfig)
 	if err != nil {
-		return "", fmt.Errorf("unsupported snapshot format/version: %w", err)
+		return "", "", fmt.Errorf("unsupported snapshot format/version: %w", err)
 	}
 	canonical, err := snapshot.MarshalConfig(cfg)
 	if err != nil || string(canonical) != string(root.SnapshotConfig) {
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
-		return "", errors.New("snapshot.cfg is not canonically encoded")
+		return "", "", errors.New("snapshot.cfg is not canonically encoded")
+	}
+	p.original(cfg.SandboxRef, scope)
+	for _, raw := range cfg.FromRefs {
+		p.original(raw, scope)
 	}
 	for i := len(cfg.FromRefs) - 1; i >= 0; i-- {
 		published, err := p.publishMemoryLayer(ctx, cfg.FromRefs[i], scope)
 		if err != nil {
-			return "", fmt.Errorf("publish Snapshot from_refs[%d]: %w", i, err)
+			return "", "", fmt.Errorf("publish Snapshot from_refs[%d]: %w", i, err)
 		}
 		cfg.FromRefs[i] = published
 	}
 	if portable, ok, err := portablePublishRef(cfg.SandboxRef); err != nil {
-		return "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
+		return "", "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
 	} else if ok {
 		cfg.SandboxRef = portable
+		p.retained(portable, scope)
 	} else {
 		sandboxStream, sandboxScope, err := p.open(ctx, cfg.SandboxRef, scope)
 		if err != nil {
-			return "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
+			return "", "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
 		}
 		sandboxRoot, err := sandboxfile.Open(ctx, sandboxStream)
 		if err != nil {
-			return "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
+			return "", "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
 		}
 		cfg.SandboxRef, err = p.publishSandboxRoot(ctx, cfg.SandboxRef, sandboxScope, sandboxRoot)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 	}
+	p.retained(cfg.SandboxRef, publishScope{})
 	newConfig, err := snapshot.MarshalConfig(cfg)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	source, err := snapshotfile.BuildSource(root.Memory, root.ConfigJSON, root.StateJSON, newConfig)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return p.target.Put(ctx, RoleSnapshot, source)
+	ref, err = p.target.Put(ctx, RoleSnapshot, source)
+	return ref, cfg.SandboxRef, err
 }
 
-func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishScope, rootImage bool) (string, error) {
+func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishScope, rootImage bool) (ref string, retErr error) {
+	p.original(raw, scope)
+	defer func() {
+		if retErr == nil {
+			if ref == raw {
+				p.retained(ref, scope)
+			} else {
+				p.retained(ref, publishScope{})
+			}
+		}
+	}()
 	if portable, ok, err := portablePublishRef(raw); err != nil {
 		return "", err
 	} else if ok {
 		return portable, nil
 	}
 	key := scopeKey(scope, fmt.Sprintf("%t\x00%s", rootImage, raw))
-	if ref := p.diskMemo[key]; ref != "" {
-		return ref, nil
+	p.memoMu.Lock()
+	cached := p.diskMemo[key]
+	p.memoMu.Unlock()
+	if cached != "" {
+		return cached, nil
 	}
 	stream, _, err := p.open(ctx, raw, scope)
 	if err != nil {
@@ -500,23 +561,39 @@ func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishSc
 		payload = image.FullStream
 		role = RoleImage
 	}
-	defer payload.Close()
-	ref, err := p.target.Put(ctx, role, payload)
-	if err == nil {
-		p.diskMemo[key] = ref
-	}
-	return ref, err
+	defer func() {
+		retErr = errors.Join(retErr, payload.Close())
+		if retErr == nil {
+			p.memoMu.Lock()
+			p.diskMemo[key] = ref
+			p.memoMu.Unlock()
+		}
+	}()
+	return p.target.Put(ctx, role, payload)
 }
 
-func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope publishScope) (string, error) {
+func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope publishScope) (ref string, retErr error) {
+	p.original(raw, scope)
+	defer func() {
+		if retErr == nil {
+			if ref == raw {
+				p.retained(ref, scope)
+			} else {
+				p.retained(ref, publishScope{})
+			}
+		}
+	}()
 	if portable, ok, err := portablePublishRef(raw); err != nil {
 		return "", err
 	} else if ok {
 		return portable, nil
 	}
 	key := scopeKey(scope, raw)
-	if ref := p.memoryMemo[key]; ref != "" {
-		return ref, nil
+	p.memoMu.Lock()
+	cached := p.memoryMemo[key]
+	p.memoMu.Unlock()
+	if cached != "" {
+		return cached, nil
 	}
 	stream, _, err := p.open(ctx, raw, scope)
 	if err != nil {
@@ -526,7 +603,14 @@ func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope pu
 	if err != nil {
 		return "", err
 	}
-	defer root.Close()
+	defer func() {
+		retErr = errors.Join(retErr, root.Close())
+		if retErr == nil {
+			p.memoMu.Lock()
+			p.memoryMemo[key] = ref
+			p.memoMu.Unlock()
+		}
+	}()
 	cfg, err := snapshot.ParseConfig(root.SnapshotConfig)
 	if err != nil {
 		return "", fmt.Errorf("unsupported snapshot format/version: %w", err)
@@ -538,11 +622,7 @@ func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope pu
 		}
 		return "", errors.New("memory Snapshot snapshot.cfg is not canonical")
 	}
-	ref, err := p.target.Put(ctx, RoleSnapshot, root.FullStream)
-	if err == nil {
-		p.memoryMemo[key] = ref
-	}
-	return ref, err
+	return p.target.Put(ctx, RoleSnapshot, root.FullStream)
 }
 
 func (p *Publisher) open(ctx context.Context, raw string, scope publishScope) (fetch.Stream, publishScope, error) {
@@ -563,7 +643,17 @@ func (p *Publisher) open(ctx context.Context, raw string, scope publishScope) (f
 		if err != nil {
 			return nil, scope, err
 		}
-		stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return fetcher.OpenManifest(ctx, key) })
+		stream, err := readretry.Open(ctx, func() (fetch.Stream, error) {
+			if local, ok := fetcher.(*manifestbundle.ManifestFetcher); ok {
+				selected, err := local.SelectManifest(ctx, key)
+				if err != nil {
+					return nil, err
+				}
+				scope.rememberSelection(raw, selected)
+				return selected.OpenManifest(ctx, key)
+			}
+			return fetcher.OpenManifest(ctx, key)
+		})
 		return stream, scope, err
 	case manifest.RefSchemeFile:
 		path, err := p.locations.ResolveFile(ref, scope.relativeDir)
@@ -580,9 +670,13 @@ func (p *Publisher) open(ctx context.Context, raw string, scope publishScope) (f
 		if err != nil {
 			return nil, scope, err
 		}
-		child := publishScope{fetcher: scope.fetcher, relativeDir: filepath.Dir(path)}
+		child := scope
+		child.relativeDir = filepath.Dir(path)
 		if _, bundle := opened.RootManifestKey(); bundle {
 			child.fetcher = opened.ScopedFetcher()
+			child.carrier = scopedRef(raw, scope)
+			child.current = opened.BundleReader()
+			child.bindings = make(map[string]string)
 		}
 		return opened, child, nil
 	default:
@@ -646,7 +740,9 @@ func (p *Publisher) enter(key string) error {
 
 func (p *Publisher) leave(key string) { delete(p.visiting, key) }
 
-func scopeKey(scope publishScope, raw string) string { return scope.relativeDir + "\x00" + raw }
+func scopeKey(scope publishScope, raw string) string {
+	return scope.relativeDir + "\x00" + scope.carrier + "\x00" + raw
+}
 
 func portablePublishRef(raw string) (string, bool, error) {
 	ref, err := manifest.ParseRef(raw)

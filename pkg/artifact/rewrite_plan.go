@@ -51,6 +51,7 @@ type rewriteChain struct {
 	role      LogicalRole
 }
 type sandboxRewrite struct {
+	scope   publishScope
 	root    *sandboxfile.Root
 	cfg     *config.PortableSandboxConfig
 	payload sparse.Source
@@ -102,9 +103,9 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 	if err != nil {
 		return result, err
 	}
-	operation := *p
+	operation := p.operation()
 	operation.storage = verifiedStorage
-	plan := &publicationRewrite{p: &operation, rules: newRewriteSession(checked), closes: []func() error{verifiedStorage.Close}}
+	plan := &publicationRewrite{p: operation, rules: newRewriteSession(checked), closes: []func() error{verifiedStorage.Close}}
 	defer func() {
 		for i := len(plan.closes) - 1; i >= 0; i-- {
 			retErr = errors.Join(retErr, plan.closes[i]())
@@ -117,6 +118,7 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 	if err != nil {
 		return result, err
 	}
+	plan.p.original(raw, scope)
 	stream, child, err := plan.open(ctx, raw, scope)
 	if err != nil {
 		return result, err
@@ -132,7 +134,7 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 			return result, err
 		}
 		ref, err := plan.emitSandbox(ctx, e)
-		return PublishResult{Role: RoleSandbox, Ref: ref}, err
+		return plan.p.result(RoleSandbox, ref, ref), err
 	}
 	if readretry.IsTerminal(eerr) || readerr.IsPermanent(eerr) {
 		return result, eerr
@@ -151,6 +153,10 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 		return result, err
 	}
 	oldE := scfg.SandboxRef
+	plan.p.original(oldE, child)
+	for _, raw := range scfg.FromRefs {
+		plan.p.original(raw, child)
+	}
 	newE := plan.rules.replace(oldE)
 	e, err := plan.openSandbox(ctx, newE, child, newE == oldE)
 	if err != nil {
@@ -160,6 +166,9 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 		original, err := plan.openSandbox(ctx, oldE, child, false)
 		if err != nil {
 			return result, err
+		}
+		for _, dep := range portableDiskRefs(original.root.Portable) {
+			plan.p.original(dep.raw, original.scope)
 		}
 		if err = compareSandboxRewrite(ctx, original, e); err != nil {
 			return result, fmt.Errorf("sandbox_ref equivalence: %w", err)
@@ -192,7 +201,7 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 		return result, err
 	}
 	ref, err := p.target.Put(ctx, RoleSnapshot, source)
-	return PublishResult{Role: RoleSnapshot, Ref: ref}, err
+	return plan.p.result(RoleSnapshot, ref, scfg.SandboxRef), err
 }
 
 func readRewriteSnapshot(root *snapshotfile.Root) (*snapshot.Config, error) {
@@ -226,7 +235,12 @@ func (p *publicationRewrite) sandbox(ctx context.Context, raw string, scope publ
 	if err != nil {
 		return nil, err
 	}
-	planned := &sandboxRewrite{root: root, cfg: cfg, payload: root.Payload}
+	planned := &sandboxRewrite{root: root, cfg: cfg, payload: root.Payload, scope: scope}
+	if apply {
+		for _, dep := range portableDiskRefs(root.Portable) {
+			p.p.original(dep.raw, scope)
+		}
+	}
 	add := func(base *string, lowers *[]string, use rewriteUse) error {
 		if *base == "" {
 			return nil
@@ -289,14 +303,15 @@ func (p *publicationRewrite) openValue(ctx context.Context, raw string, scope pu
 			if err != nil {
 				return nil, err
 			}
+			scope.rememberSelection(raw, selected)
 			force = selected.Reader != nil
 		}
 	}
-	stream, child, err := p.open(ctx, raw, scope)
+	stream, _, err := p.open(ctx, raw, scope)
 	if err != nil {
 		return nil, err
 	}
-	out := &rewriteValue{raw: raw, scope: child, use: use, forceWrite: force}
+	out := &rewriteValue{raw: raw, scope: scope, use: use, forceWrite: force}
 	if use == rewriteMemory {
 		root, err := snapshotfile.Open(ctx, stream)
 		if err != nil {
@@ -491,14 +506,24 @@ func layeredRewriteValues(values []*rewriteValue) sparse.Source {
 	}
 	return fetch.NewLayered(streams...)
 }
-func (p *publicationRewrite) emitValue(ctx context.Context, value *rewriteValue) (string, error) {
+func (p *publicationRewrite) emitValue(ctx context.Context, value *rewriteValue) (ref string, retErr error) {
+	defer func() {
+		if retErr == nil {
+			if ref == value.raw {
+				p.p.retained(ref, value.scope)
+			} else {
+				p.p.retained(ref, publishScope{})
+			}
+		}
+	}()
 	if value.published != "" {
 		return value.published, nil
 	}
 	if !value.forceWrite {
 		return value.raw, nil
 	}
-	ref, err := p.p.target.Put(ctx, value.role, value.source)
+	var err error
+	ref, err = p.p.target.Put(ctx, value.role, value.source)
 	if err == nil {
 		value.published = ref
 	}
@@ -520,6 +545,7 @@ func (p *publicationRewrite) emitChain(ctx context.Context, chain *rewriteChain)
 			ref, err = p.emitValue(ctx, chain.values[0])
 		}
 		if err == nil {
+			p.p.retained(ref, publishScope{})
 			*chain.base = ref
 		}
 		return err
@@ -554,7 +580,11 @@ func (p *publicationRewrite) emitSandbox(ctx context.Context, e *sandboxRewrite)
 	if err != nil {
 		return "", err
 	}
-	return p.p.target.Put(ctx, RoleSandbox, source)
+	ref, err := p.p.target.Put(ctx, RoleSandbox, source)
+	if err == nil {
+		p.p.retained(ref, publishScope{})
+	}
+	return ref, err
 }
 
 func equivalentJSON(left, right []byte) bool {

@@ -68,5 +68,6 @@ func (p *publicationRewrite) open(ctx context.Context, raw string, scope publish
 		return nil, scope, errors.Join(err, opened.Close(), reader.Close())
 	}
 	p.closes = append(p.closes, reader.Close)
-	return opened, publishScope{fetcher: scope.fetcher, relativeDir: filepath.Dir(path)}, nil
+	scope.relativeDir = filepath.Dir(path)
+	return opened, scope, nil
 }

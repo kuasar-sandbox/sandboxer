@@ -141,10 +141,10 @@ Usage:
                         [--history --cursor <offset> --limit <1..100>]
                         read lossless JSON; never triggers observation or saving
   sandbox-ctl publish   [--manifest-config <p> | --to-ref-location name=file:///path]
-                        [--ref-location name=file:///absolute/path ...] [--quiet] <artifact>
-                        publish an E/S graph and print its rewritten root ref
+                        [--ref-location name=file:///absolute/path ...] [--quiet] [--json] <artifact>
+                        publish E/S; print its final root or JSON roots and removedRefs
   sandbox-ctl upload-snapshot
-                        same options as publish; compatibility alias for Snapshot S
+                        same options and output as publish; historical alias
 
 Output TARGET is a file path or journald=TAG[,FIELD=VALUE...]. Each journal
 output owns its fields independently; values use one-time percent decoding.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -35,13 +36,14 @@ func publishArtifactCmd(command string, args []string) int {
 	fs.Var(&replaceRefs, "replace-ref", "replace one reference OLD=NEW (repeatable for disjoint references)")
 	fs.Var(&reduceRefs, "reduce-ref", "reduce a complete reference chain A=X, A, or any (disjoint from replacement rules)")
 	skipVerifyRef := fs.Bool("skip-verify-ref", false, "skip replacement equivalence proof (identity and I/O checks remain enabled)")
+	jsonOutput := fs.Bool("json", false, "print final root references and removedRefs as JSON")
 	quiet := fs.Bool("quiet", false, "suppress progress logs on stderr")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	input := fs.Arg(0)
 	if input == "" || fs.NArg() != 1 {
-		fmt.Fprintf(os.Stderr, "usage: sandbox-ctl %s [--manifest-config <file>] [--to-ref-location name=file:///path] [--ref-location name=file:///path ...] [--replace-ref OLD=NEW ...] [--reduce-ref A[=X] ...|--reduce-ref=any] [--skip-verify-ref] [--quiet] <artifact>\n", command)
+		fmt.Fprintf(os.Stderr, "usage: sandbox-ctl %s [--manifest-config <file>] [--to-ref-location name=file:///path] [--ref-location name=file:///path ...] [--replace-ref OLD=NEW ...] [--reduce-ref A[=X] ...|--reduce-ref=any] [--skip-verify-ref] [--quiet] [--json] <artifact>\n", command)
 		return 2
 	}
 	rewrite, err := artifact.ParseRewriteOptions(replaceRefs, reduceRefs, *skipVerifyRef)
@@ -100,6 +102,17 @@ func publishArtifactCmd(command string, args []string) int {
 	if err := errors.Join(publishErr, closeErr); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
+	}
+	if *jsonOutput {
+		report, err := result.Report()
+		if err == nil {
+			err = json.NewEncoder(os.Stdout).Encode(report)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
 	}
 	if _, err := fmt.Fprintln(os.Stdout, result.Ref); err != nil {
 		fmt.Fprintln(os.Stderr, err)

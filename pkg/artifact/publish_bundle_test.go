@@ -219,6 +219,18 @@ func TestLocationPublisherCopiesBundleExactly(t *testing.T) {
 	if info.Role != RoleSnapshot || info.Snapshot.SandboxRef == "" {
 		t.Fatalf("located Bundle root = %+v", info)
 	}
+	eKey, _ := manifest.ParseKeyRef(info.Snapshot.SandboxRef)
+	if result.SandboxRef != bundleMemberRef(result.Ref, eKey) {
+		t.Fatalf("final scoped E=%s", result.SandboxRef)
+	}
+	assertRemoved(t, result, "file://"+sourcePath, bundleMemberRef("file://"+sourcePath, eKey))
+	publisher.locations = config.RefLocations{"shared": targetDirectory}
+	noop, err := publisher.Publish(ctx, result.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRemoved(t, noop)
+
 	if fs.creates.Load() != 1 || fs.written.Load() != int64(len(sourceBytes)) {
 		t.Fatalf("shared target creates=%d write-bytes=%d, want one exact write of %d",
 			fs.creates.Load(), fs.written.Load(), len(sourceBytes))

@@ -42,7 +42,7 @@ func TestPublishManifestRootsToLocatedTarstream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	remoteS, err := remote.PublishSource(ctx, RoleSnapshot, s)
+	remoteS, err := remote.PublishSource(ctx, RoleSnapshot, s, remoteE.Ref)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,6 +60,10 @@ func TestPublishManifestRootsToLocatedTarstream(t *testing.T) {
 		}
 		if got.Role != want.Role {
 			t.Fatalf("role %s want %s", got.Role, want.Role)
+		}
+		assertRemoved(t, got, want.Ref)
+		if got.Role == RoleSnapshot && got.SandboxRef != remoteE.Ref {
+			t.Fatal("Manifest E was not retained")
 		}
 		ref, err := manifest.ParseRef(got.Ref)
 		if err != nil || ref.Location != "output" {
@@ -133,7 +137,7 @@ func TestPublishSnapshotSourceToSingleRootBundle(t *testing.T) {
 	}
 	directory := t.TempDir()
 	target := newSourceBundlePublisher(t, cfg, key, directory)
-	result, err := target.PublishSource(ctx, RoleSnapshot, s)
+	result, err := target.PublishSource(ctx, RoleSnapshot, s, e.Ref)
 	target.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -143,6 +147,12 @@ func TestPublishSnapshotSourceToSingleRootBundle(t *testing.T) {
 	if err != nil || info.Role != RoleSnapshot {
 		t.Fatalf("snapshot Bundle: %v %v", info, err)
 	}
+	knownE, err := storage.SnapshotSandboxRef(ctx, result.Ref, locations)
+	if err != nil || knownE != e.Ref || result.SandboxRef != e.Ref {
+		t.Fatalf("remote E binding=%q result=%+v err=%v", knownE, result, err)
+	}
+	assertRemoved(t, result)
+
 }
 
 func TestNewSourceLocatedIdentityCreatesOnlyFinal(t *testing.T) {
