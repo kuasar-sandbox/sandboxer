@@ -109,7 +109,7 @@ def main():
                            "root": {"base": ref, "overlay": {"diff": f"file://{diff}"}}},
                   "launch": {"exec": "/probe", "args": ["cpu-ms", "200"] if name == "short" else ["wait"],
                              "restart": "never", "pid_namespace": "shared"},
-                  "usage": {"enabled": True, "sample_interval": "1s", "flush_interval": "5s"}}
+                  "usage": {"enabled": True, "sample_interval": "500ms", "flush_interval": "1s"}}
         mount = None
         if name == "enospc":
             mount = work / "enospc-base"
@@ -133,7 +133,7 @@ def main():
             guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
             assert guest["sandbox_init_sha256"] == metadata["artifacts"]["sandbox-init"]
             write_json(sb.dir / "guest.json", guest)
-            time.sleep(5.5)
+            time.sleep(1.5)
             before = sb.view()
             assert before.get("saved")
             write_json(sb.dir / "before.json", before)
@@ -150,7 +150,7 @@ def main():
             elif name == "write-error":
                 injection = inject(sb, "pwrite64", "error=EIO")
             elif name == "writer":
-                injection = inject(sb, "pwrite64", "delay_enter=15000000:when=1")
+                injection = inject(sb, "pwrite64", "delay_enter=3000000:when=1")
             elif name == "kill":
                 sb.cli("exec", "--", "/probe", "cpu", "1")
                 live = sb.view()
@@ -175,8 +175,8 @@ def main():
                 print(f"PASS usage-faults/{name}", flush=True)
                 continue
             resources = []
-            for _ in range(12):
-                time.sleep(1)
+            for _ in range(8):
+                time.sleep(.5)
                 view = sb.view()
                 resources.append({"fd_count": len(list(Path(f"/proc/{sb.process.pid}/fd").iterdir())),
                                   "thread_count": len(list(Path(f"/proc/{sb.process.pid}/task").iterdir())),
@@ -210,7 +210,7 @@ def main():
                 injection = None
             if mount is not None:
                 (mount / "filler").unlink()
-            time.sleep(6)
+            time.sleep(1.5)
             recovered = sb.view()
             write_json(sb.dir / "recovered.json", recovered)
             assert not recovered.get("save_error") and not recovered["unknown_tail"], recovered

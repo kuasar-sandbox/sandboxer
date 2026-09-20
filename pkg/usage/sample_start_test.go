@@ -70,6 +70,9 @@ func TestNewSamplerSuccessRetainsOwnershipUntilStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if s.interval != time.Second || s.flush != 5*time.Minute {
+		t.Fatalf("sampler intervals = %s/%s, want 1s/5m", s.interval, s.flush)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	defer s.Stop(ctx)

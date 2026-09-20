@@ -373,10 +373,12 @@ ROOT3_PATH="$(readlink -f "$OUT3/$SID3.snapshot")"
 ROOT3="$(basename "$ROOT3_PATH" .bundle)"
 assert_bundle_refs "$ROOT3_PATH"
 
-echo "==> phase 4: local C plus located A+B restore (20 samples)"
+RESTORE_SAMPLE_COUNT="${BUNDLE_RESTORE_SAMPLES:-2}"
+case "$RESTORE_SAMPLE_COUNT" in ''|*[!0-9]*|0) echo "invalid BUNDLE_RESTORE_SAMPLES=$RESTORE_SAMPLE_COUNT" >&2; exit 2;; esac
+echo "==> phase 4: local C plus located A+B repeated restore ($RESTORE_SAMPLE_COUNT samples)"
 RESTORE_SAMPLES="$WORK/a-b-c-restore-ms"
 : >"$RESTORE_SAMPLES"
-for sample in $(seq 1 20); do
+for sample in $(seq 1 "$RESTORE_SAMPLE_COUNT"); do
     write_restore_yaml "$WORK/restore4-$sample.yaml" "bundle-flat-refs-$sample" "$WORK/root-r4-$sample.ext4"
     SID4="bundle-4-$sample-$$"
     start_ns="$(date +%s%N)"

@@ -22,20 +22,6 @@ for target in 'journald=app,MESSAGE=override' 'journald=app,A=1,A=2' 'journald=a
     }
 done
 
-SOURCE=""
-if command -v go >/dev/null 2>&1; then
-    SOURCE="$(GOPROXY=off GOSUMDB=off go list -m -f '{{.Dir}}' github.com/kuasar-sandbox/sandboxer 2>/dev/null || true)"
-fi
-if [[ -n "$SOURCE" && -f "$SOURCE/internal/journalio/writer_test.go" ]]; then
-    (
-        cd "$SOURCE"
-        echo "==> journal contract: full sandboxer source checks ($SOURCE)"
-        go version
-        go test -count=1 -timeout=5m ./...
-        CGO_ENABLED=1 go test -race -count=1 -timeout=5m ./...
-        go vet ./...
-    )
-else
-    echo "Source-only Go checks unavailable; shipped CLI contract checked (native lifecycle runs separately)."
-fi
+# Source-wide checks are scheduled once by run_all.sh; keep this case contract-focused.
+
 echo "==> e2e_journal_contract: OK"
