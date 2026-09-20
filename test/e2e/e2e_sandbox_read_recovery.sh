@@ -357,36 +357,7 @@ wait "$EXEC_PID"
 # fault after capture starts belongs to the capture lifecycle rather than a
 # pre-existing workload retry.
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'touch /recovery.idle'
-wait_file "$WORK/recovered.log" '^RECOVERY-IDLEpython3 - "$WORK/recovered.stats.json" "$WORK/recovered.log" <<'PY'
-import json,pathlib,re,sys
-d=json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert d['uffd']['source_read_calls']>0 and d['uffd']['tail_buffered_data']>0
-assert re.search(r'uffd .*inflight=[1-9]',pathlib.Path(sys.argv[2]).read_text())
-for b in d['backends']:
- for kind in ('read','write','flush'): assert b[kind]['err_count']==0,(b['name'],kind)
-print('PASS: real UFFD/Chunk window; no Guest I/O errors')
-PY
-launch verified --restore "manifest://$NEXT" --config "$WORK/host.yaml"
-wait_file "$WORK/verified.log" '^RECOVERY-IDLE[ ! -s "$WORK/fatal.key" ]
-mode corrupt
-wait_file "$WORK/faults.jsonl" '"mode": "corrupt"' "$RUN_PID"
-for _ in $(seq 1 200); do kill -0 "$RUN_PID" 2>/dev/null || break; sleep .05; done
-if kill -0 "$RUN_PID" 2>/dev/null; then echo "fatal did not stop sandbox" >&2; exit 1; fi
-if wait "$RUN_PID"; then echo "fatal returned success" >&2; exit 1; fi
-if wait "$FATAL_CAPTURE_PID"; then echo "fatal capture returned success" >&2; exit 1; fi
-[ ! -s "$WORK/fatal.key" ]
-if pgrep -s "$RUN_PID" -x cloud-hyperviso >/dev/null; then
-    echo "CH survived the sandbox's fatal exit" >&2; exit 1
-fi
-# The runtime owner must record the injected corruption, not only a timeout.
-# Either UFFD or COW can observe the failing immutable source first.
-grep -E 'sandbox fatal I/O:.*ciphertext hash mismatch' "$WORK/verified.log"
-if grep -qE 'Traceback|Input/output error' "$WORK/verified.log"; then
-    echo "fatal source failure reached the Guest as an I/O error" >&2; exit 1
-fi
-cat "$WORK/faults.jsonl"
-echo "PASS: real CH source recovery, recovered snapshot contents, and whole-VM fatal without a successful capture"
- "$RUN_PID"
+wait_file "$WORK/recovered.log" '^RECOVERY-IDLE$' "$RUN_PID"
 BEFORE_CAPTURE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
 mode offline
 "$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
@@ -410,40 +381,7 @@ for b in d['backends']:
 print('PASS: real UFFD/Chunk window; no Guest I/O errors')
 PY
 launch verified --restore "manifest://$NEXT" --config "$WORK/host.yaml"
-wait_file "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
-"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
-# A complete corrupt immutable response is a deterministic failure while a
-# capture is waiting behind an already-observed required source read. As above,
-# the source fault intentionally predates capture; the contract is that capture
-# cannot publish across unresolved mandatory I/O and fatal recovery cannot turn
-# that wait into a successful snapshot.
-BEFORE_OUTAGE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
-mode offline
-wait_new_fault "$BEFORE_OUTAGE_FAULTS" "$RUN_PID"
-"$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
-FATAL_CAPTURE_PID=$!
-wait_capture_active verified "$FATAL_CAPTURE_PID" "$WORK/fatal.capture-probe.log"
-kill -0 "$FATAL_CAPTURE_PID"
-[ ! -s "$WORK/fatal.key" ]
-mode corrupt
-wait_file "$WORK/faults.jsonl" '"mode": "corrupt"' "$RUN_PID"
-for _ in $(seq 1 200); do kill -0 "$RUN_PID" 2>/dev/null || break; sleep .05; done
-if kill -0 "$RUN_PID" 2>/dev/null; then echo "fatal did not stop sandbox" >&2; exit 1; fi
-if wait "$RUN_PID"; then echo "fatal returned success" >&2; exit 1; fi
-if wait "$FATAL_CAPTURE_PID"; then echo "fatal capture returned success" >&2; exit 1; fi
-[ ! -s "$WORK/fatal.key" ]
-if pgrep -s "$RUN_PID" -x cloud-hyperviso >/dev/null; then
-    echo "CH survived the sandbox's fatal exit" >&2; exit 1
-fi
-# The runtime owner must record the injected corruption, not only a timeout.
-# Either UFFD or COW can observe the failing immutable source first.
-grep -E 'sandbox fatal I/O:.*ciphertext hash mismatch' "$WORK/verified.log"
-if grep -qE 'Traceback|Input/output error' "$WORK/verified.log"; then
-    echo "fatal source failure reached the Guest as an I/O error" >&2; exit 1
-fi
-cat "$WORK/faults.jsonl"
-echo "PASS: real CH source recovery, recovered snapshot contents, and whole-VM fatal without a successful capture"
- "$RUN_PID"
+wait_file "$WORK/verified.log" '^RECOVERY-IDLE$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
 "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- python3 -c 'import os
 fd=os.open("/recovery.data", os.O_RDONLY)
@@ -466,63 +404,6 @@ mode offline
 FATAL_CAPTURE_PID=$!
 wait_capture_active verified "$FATAL_CAPTURE_PID" "$WORK/fatal.capture-probe.log"
 wait_new_fault "$BEFORE_FATAL_FAULTS" "$FATAL_CAPTURE_PID"
-kill -0 "$FATAL_CAPTURE_PID"
-[ ! -s "$WORK/fatal.key" ]
-mode corrupt
-wait_file "$WORK/faults.jsonl" '"mode": "corrupt"' "$RUN_PID"
-for _ in $(seq 1 200); do kill -0 "$RUN_PID" 2>/dev/null || break; sleep .05; done
-if kill -0 "$RUN_PID" 2>/dev/null; then echo "fatal did not stop sandbox" >&2; exit 1; fi
-if wait "$RUN_PID"; then echo "fatal returned success" >&2; exit 1; fi
-if wait "$FATAL_CAPTURE_PID"; then echo "fatal capture returned success" >&2; exit 1; fi
-[ ! -s "$WORK/fatal.key" ]
-if pgrep -s "$RUN_PID" -x cloud-hyperviso >/dev/null; then
-    echo "CH survived the sandbox's fatal exit" >&2; exit 1
-fi
-# The runtime owner must record the injected corruption, not only a timeout.
-# Either UFFD or COW can observe the failing immutable source first.
-grep -E 'sandbox fatal I/O:.*ciphertext hash mismatch' "$WORK/verified.log"
-if grep -qE 'Traceback|Input/output error' "$WORK/verified.log"; then
-    echo "fatal source failure reached the Guest as an I/O error" >&2; exit 1
-fi
-cat "$WORK/faults.jsonl"
-echo "PASS: real CH source recovery, recovered snapshot contents, and whole-VM fatal without a successful capture"
- "$RUN_PID"
-BEFORE_CAPTURE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
-mode offline
-"$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
-CAPTURE_PID=$!
-wait_capture_active recovered "$CAPTURE_PID" "$WORK/recovered.capture-probe.log"
-wait_new_fault "$BEFORE_CAPTURE_FAULTS" "$CAPTURE_PID"
-kill -0 "$RUN_PID"; kill -0 "$CAPTURE_PID"
-[ ! -s "$WORK/next.key" ]
-mode healthy
-wait "$CAPTURE_PID"
-NEXT=$(cat "$WORK/next.key")
-[ "${#NEXT}" -eq 64 ]; wait "$RUN_PID"
-SESSIONS=()
-python3 - "$WORK/recovered.stats.json" "$WORK/recovered.log" <<'PY'
-import json,pathlib,re,sys
-d=json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert d['uffd']['source_read_calls']>0 and d['uffd']['tail_buffered_data']>0
-assert re.search(r'uffd .*inflight=[1-9]',pathlib.Path(sys.argv[2]).read_text())
-for b in d['backends']:
- for kind in ('read','write','flush'): assert b[kind]['err_count']==0,(b['name'],kind)
-print('PASS: real UFFD/Chunk window; no Guest I/O errors')
-PY
-launch verified --restore "manifest://$NEXT" --config "$WORK/host.yaml"
-wait_file "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
-"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
-# A complete corrupt immutable response is a deterministic failure while a
-# capture is waiting behind an already-observed required source read. As above,
-# the source fault intentionally predates capture; the contract is that capture
-# cannot publish across unresolved mandatory I/O and fatal recovery cannot turn
-# that wait into a successful snapshot.
-BEFORE_OUTAGE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
-mode offline
-wait_new_fault "$BEFORE_OUTAGE_FAULTS" "$RUN_PID"
-"$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
-FATAL_CAPTURE_PID=$!
-wait_capture_active verified "$FATAL_CAPTURE_PID" "$WORK/fatal.capture-probe.log"
 kill -0 "$FATAL_CAPTURE_PID"
 [ ! -s "$WORK/fatal.key" ]
 mode corrupt
