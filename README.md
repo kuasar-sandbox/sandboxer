@@ -63,7 +63,7 @@ make test-e2e                   # component owner suite; requires the assembled 
 
 Requirements:
 
-- Go 1.24 or newer for source builds;
+- Go 1.26.1 or newer for source builds;
 - Linux and root privileges for real runtime operations;
 - KVM and the required kernel interfaces for MicroVM E2E;
 - `sandbox-runtime.bundle` and VMLinux from `guest-runtime`;
