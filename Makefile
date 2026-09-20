@@ -72,6 +72,9 @@ cloud-hypervisor:
 	$(call link_bin,cloud-hypervisor)
 
 test:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-go-privilege.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-rust.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	python3 scripts/test_e2e_upload_restore_tick.py
 	CGO_ENABLED=0 $(GO) test ./...
 
@@ -105,6 +108,7 @@ release: build
 		$(BUILD_DIR)/release-bundle
 
 test-release:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	bash scripts/test-release.sh
 
 help:

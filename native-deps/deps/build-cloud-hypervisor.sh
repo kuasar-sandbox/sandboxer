@@ -210,13 +210,8 @@ do_build() (
             cargo_env+=("$linker_var=${CROSS_PREFIX}gcc")
             log "cross-compile mode: --target=$RUST_TARGET linker=${CROSS_PREFIX}gcc"
 
-            # rustup target presence check — fail early with a clear message
-            # rather than letting cargo emit a wall of ld errors.
-            if command -v rustup >/dev/null 2>&1; then
-                if ! rustup target list --installed 2>/dev/null | grep -q "^${RUST_TARGET}\$"; then
-                    die "rust target $RUST_TARGET not installed. Run: rustup target add $RUST_TARGET"
-                fi
-            fi
+            # Cargo and the selected rustc validate target support. A separate
+            # rustup installation need not manage this environment's compiler.
         fi
     fi
 
