@@ -8,19 +8,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${BIN:?BIN must point to the assembled platform binary directory}"
 export BIN REQUIRE_KVM=1
 
-# Source integration CI has an exact multi-repository Go workspace. Exercise
-# the controller's deterministic fault/partial-progress cases before real KVM
-# tests. Published-asset suites have no source workspace and still run every
-# binary E2E below; a missing source checkout in source CI is an error.
-if [ -n "${CANDIDATE_REPOSITORY:-}" ]; then
-    source_root="$(go list -m -f '{{.Dir}}' github.com/kuasar-sandbox/sandboxer)"
-    [ -f "$source_root/go.mod" ] || {
-        echo "sandboxer source integration checkout is missing" >&2
-        exit 1
-    }
+# Source-wide checks run once at the owner-suite boundary. CI source mode
+# requires the exact module; documented local source runs discover it directly.
+source_root=""
+if command -v go >/dev/null 2>&1; then
+    source_root="$(GOPROXY=off GOSUMDB=off go list -m -f '{{.Dir}}' github.com/kuasar-sandbox/sandboxer 2>/dev/null || true)"
+fi
+if [ -n "${CANDIDATE_REPOSITORY:-}" ] && { [ -z "$source_root" ] || [ ! -f "$source_root/go.mod" ]; }; then
+    echo "sandboxer source integration checkout is missing" >&2
+    exit 1
+fi
+if [ -n "$source_root" ] && [ -f "$source_root/go.mod" ]; then
     (
         cd "$source_root"
-        echo "==> sandboxer source unit and memory-controller race regressions"
+        echo "==> sandboxer source unit, race and vet regressions"
         CGO_ENABLED=0 go test -count=1 ./...
         bash scripts/test-vhost-tmpfs-runner.sh
         ./scripts/test-vhost-tmpfs-enospc.sh
