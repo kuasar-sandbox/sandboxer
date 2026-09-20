@@ -65,7 +65,8 @@ check_go_binary() {
 
 validate_archive_contract() {
   local archive="$1"
-  GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GOOS='' GOARCH='' \
+  # This standard-library-only host parser is independent of the product module.
+  GO111MODULE=off GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GOOS='' GOARCH='' \
     GOAMD64=v1 CGO_ENABLED=0 GOEXPERIMENT='' go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
     || fail "$archive violates the exact entry contract"
 }

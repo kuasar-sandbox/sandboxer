@@ -68,7 +68,7 @@ write_yaml() {
     local out="$1"
     local diff="$2"
     truncate -s 1G "$diff"
-    mkfs.ext4 -q -F "$diff"
+    mkfs.ext4 -q -F -O ^has_journal "$diff"
     cat > "$out" <<EOF
 resources:
   capacity:    { cpu: 1, memory: 512MiB }

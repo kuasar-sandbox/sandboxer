@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
@@ -19,6 +20,7 @@ import (
 // See docs/sandbox.md §2.3.
 func snapshotCmd(args []string) int {
 	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
+	jsonOutput := fs.Bool("json", false, "emit the completed Snapshot S and Sandbox E references as JSON")
 	sandboxID := fs.String("sandbox-id", "", "target sandbox id (path fallback when --path-id is omitted)")
 	pathID := fs.String("path-id", "", "run-root directory leaf (takes precedence over --sandbox-id)")
 	outDir := fs.String("output", "", "local output dir; produces <sid>.snapshot + scheme-qualified content-addressed artifacts")
@@ -135,6 +137,9 @@ func snapshotCmd(args []string) int {
 	if warning := snapshotDropCachesWarning(*dropCaches, resp.DropCachesResult); warning != "" {
 		fmt.Fprintf(os.Stderr, "snapshot: warning: %s\n", warning)
 	}
+	if *jsonOutput {
+		return printCaptureJSON(resp, artifact.RoleSnapshot)
+	}
 	if *upload {
 		// Match `manifest-ctl store --put-manifest`: stdout = manifest key,
 		// human-readable details to stderr. Lets `MK=$(sandbox-ctl snapshot
@@ -151,6 +156,7 @@ func snapshotCmd(args []string) int {
 		return 0
 	}
 
+	resp = captureHumanResponse(resp)
 	fmt.Printf("snapshot done: memory_size=%d resident=%d pause_ms=%d dump_ms=%d\n",
 		resp.MemorySize, resp.MemoryResident, resp.WallclockPauseMs, resp.WallclockDumpMs)
 	if resp.SnapshotPath != "" {

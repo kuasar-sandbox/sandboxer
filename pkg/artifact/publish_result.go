@@ -75,6 +75,19 @@ func (r PublishResult) Report() (PublishReport, error) {
 // Validate checks the exact expected role, portable roots and public ref safety.
 // It intentionally does not open roots or verify payloads a second time.
 func (r PublishReport) Validate(role LogicalRole) error {
+	return r.validate(role, false)
+}
+
+// ValidateCapture accepts the same report from a runtime capture, including
+// content-identified local roots resolved in the caller's checkpoint directory.
+func (r PublishReport) ValidateCapture(role LogicalRole) error {
+	if len(r.RemovedRefs) != 0 {
+		return errors.New("capture report: unexpected removed references")
+	}
+	return r.validate(role, true)
+}
+
+func (r PublishReport) validate(role LogicalRole, local bool) error {
 	if r.RemovedRefs == nil {
 		return errors.New("publication report: removedRefs must be an array")
 	}
@@ -86,7 +99,7 @@ func (r PublishReport) Validate(role LogicalRole) error {
 	}
 	checkRoot := func(raw string, role LogicalRole) error {
 		ref, err := manifest.ParseRef(raw)
-		if err != nil || !ref.Portable() {
+		if err != nil || (!ref.Portable() && !(local && ref.Scheme == manifest.RefSchemeFile && ref.Digest != "")) {
 			return errors.New("publication report: missing or nonportable root")
 		}
 		if ref.Scheme == manifest.RefSchemeFile && !strings.HasSuffix(ref.Path, ".bundle") && !strings.HasSuffix(ref.Path, "."+string(role)) {
@@ -123,6 +136,15 @@ func (r PublishReport) Validate(role LogicalRole) error {
 
 // DecodePublishReport accepts exactly one JSON document with the public fields.
 func DecodePublishReport(data []byte, role LogicalRole) (PublishReport, error) {
+	return decodeReport(data, role, false)
+}
+
+// DecodeCaptureReport strictly decodes a complete runtime capture report.
+func DecodeCaptureReport(data []byte, role LogicalRole) (PublishReport, error) {
+	return decodeReport(data, role, true)
+}
+
+func decodeReport(data []byte, role LogicalRole, local bool) (PublishReport, error) {
 	var out PublishReport
 	dec := json.NewDecoder(bytes.NewReader(data))
 	token, err := dec.Token()
@@ -172,8 +194,11 @@ func DecodePublishReport(data []byte, role LogicalRole) (PublishReport, error) {
 	if err := json.Unmarshal(fields["removedRefs"], &out.RemovedRefs); err != nil {
 		return out, err
 	}
-	if err := out.Validate(role); err != nil {
+	if err := out.validate(role, local); err != nil {
 		return PublishReport{}, err
+	}
+	if local && len(out.RemovedRefs) != 0 {
+		return PublishReport{}, errors.New("capture report: unexpected removed references")
 	}
 	return out, nil
 }

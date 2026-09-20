@@ -162,7 +162,7 @@ BLK0_REF="$(plaintext_tarstream_ref "$BLK0_EROFS")"
 mkdir -p "$WORK/runtime"
 DIFF_FILE="$WORK/runtime/blk1.diff"
 truncate -s 1G "$DIFF_FILE"
-mkfs.ext4 -q -F "$DIFF_FILE"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
 
 # Long-running TICK counter that also exercises the disk overlay layer:
 # each tick writes a fresh 4 KiB block at offset i*4096 of /ticks.dat (on the

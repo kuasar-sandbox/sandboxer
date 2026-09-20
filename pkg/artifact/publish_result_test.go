@@ -340,10 +340,7 @@ func TestReportSeparateBundleECarrier(t *testing.T) {
 		t.Fatalf("E=%s want selected sibling %s", result.SandboxRef, finalCarrier.String())
 	}
 	assertRemoved(t, result, source, bundleMemberRef("file://"+filepath.Join(input, eCarrier.Path), eKey))
-	selected, err := storage.SnapshotSandboxRef(ctx, result.Ref, p.locations)
-	if err != nil || selected != result.SandboxRef {
-		t.Fatalf("portable E=%s want=%s err=%v", selected, result.SandboxRef, err)
-	}
+
 	noop, err := p.Publish(ctx, result.Ref)
 	if err != nil {
 		t.Fatal(err)

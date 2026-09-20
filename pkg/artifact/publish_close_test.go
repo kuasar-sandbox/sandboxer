@@ -11,8 +11,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
-	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
-	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
 
 type reportSpyStream struct {
@@ -40,29 +38,6 @@ func (f *reportSpyFetcher) OpenManifest(_ context.Context, key store.ContentKey)
 	}
 	f.opens++
 	return &reportSpyStream{Source: f.source, reads: &f.reads, closes: &f.closes, closeErr: f.closeErr}, nil
-}
-
-func TestSnapshotReferenceOnlyReadsRoot(t *testing.T) {
-	ctx := context.Background()
-	rootRef := "manifest://" + publishTestSHA
-	eRef := "manifest://" + manifest.HexKey(store.ContentKey{42})
-	// A very large sparse payload makes any accidental materialization visible.
-	memory := rewriteKindSource{kind: sparse.Hole, size: 1 << 40, err: errors.New("memory payload was read")}
-	cfg, _ := snapshot.MarshalConfig(&snapshot.Config{Version: 1, SandboxRef: eRef, FromRefs: []string{"manifest://" + manifest.HexKey(store.ContentKey{43})}})
-	source, err := snapshotfile.BuildSource(memory, []byte("{}"), []byte("{}"), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, _ := manifest.ParseKeyRef(rootRef)
-	spy := &reportSpyFetcher{source: source, key: key}
-	storage := &ProcessStorage{fetcher: &onDemandManifestFetcher{inner: spy}}
-	got, err := storage.SnapshotSandboxRef(ctx, rootRef, nil)
-	if err != nil || got != eRef {
-		t.Fatalf("E=%q err=%v", got, err)
-	}
-	if spy.opens != 1 || spy.closes != 1 || spy.reads > 16 {
-		t.Fatalf("metadata access: %+v", spy)
-	}
 }
 
 func TestReportCloseFailureDoesNotReturnRoot(t *testing.T) {

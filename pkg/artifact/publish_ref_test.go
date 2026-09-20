@@ -147,9 +147,8 @@ func TestPublishSnapshotSourceToSingleRootBundle(t *testing.T) {
 	if err != nil || info.Role != RoleSnapshot {
 		t.Fatalf("snapshot Bundle: %v %v", info, err)
 	}
-	knownE, err := storage.SnapshotSandboxRef(ctx, result.Ref, locations)
-	if err != nil || knownE != e.Ref || result.SandboxRef != e.Ref {
-		t.Fatalf("remote E binding=%q result=%+v err=%v", knownE, result, err)
+	if result.SandboxRef != e.Ref {
+		t.Fatalf("remote E binding: result=%+v want=%s", result, e.Ref)
 	}
 	assertRemoved(t, result)
 

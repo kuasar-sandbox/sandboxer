@@ -296,6 +296,14 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if err := sink.CommitSnapshot(ctx, out.SnapshotRef, out.SnapshotPath); err != nil {
 		return nil, fmt.Errorf("commit Snapshot S: %w", err)
 	}
+	out.SnapshotRef, out.SnapshotPath, err = CommittedArtifactRef(sink, out.SnapshotRef, out.SnapshotPath)
+	if err != nil {
+		return nil, err
+	}
+	out.SandboxRef, out.SandboxPath, err = CommittedArtifactRef(sink, out.SandboxRef, out.SandboxPath)
+	if err != nil {
+		return nil, err
+	}
 	closeErr := closeArtifactSink(sink)
 	sinkOpen = false
 	if closeErr != nil {

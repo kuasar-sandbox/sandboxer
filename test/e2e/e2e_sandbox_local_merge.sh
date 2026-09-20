@@ -106,7 +106,7 @@ BLK0_EROFS="$WORK/blk0.img"
 docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
 BLK0_REF="$(plaintext_tarstream_ref "$BLK0_EROFS")"
 mkdir -p "$WORK/runtime"; DIFF_FILE="$WORK/runtime/blk1.diff"
-truncate -s 1G "$DIFF_FILE"; mkfs.ext4 -q -F "$DIFF_FILE"
+truncate -s 1G "$DIFF_FILE"; mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
 
 PYTICK='import os,time
 print("PYBOOT-OK", flush=True)

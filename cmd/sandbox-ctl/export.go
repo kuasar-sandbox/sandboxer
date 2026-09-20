@@ -24,6 +24,7 @@ import (
 
 func exportCmd(args []string) int {
 	fs := flag.NewFlagSet("export", flag.ContinueOnError)
+	jsonOutput := fs.Bool("json", false, "emit the completed Sandbox E reference as JSON")
 	sandboxID := fs.String("sandbox-id", "", "live sandbox id; optional output alias for image assembly")
 	pathID := fs.String("path-id", "", "live run-root directory leaf (takes precedence over --sandbox-id)")
 	from := fs.String("from", "", "flattened EROFS reference for image-to-Sandbox-E assembly")
@@ -121,14 +122,14 @@ func exportCmd(args []string) int {
 			fmt.Fprintln(os.Stderr, "export: image assembly requires --config or SANDBOX_CONFIG")
 			return 2
 		}
-		return assembleSandboxEExport(*from, *configPath, *sandboxID, *outDir, *upload, *mode, *manifestPath, refLocations, *timeoutS)
+		return assembleSandboxEExport(*from, *configPath, *sandboxID, *outDir, *upload, *mode, *manifestPath, refLocations, *timeoutS, *jsonOutput)
 	}
 	targetPathID, err := resolveTargetPathID(*sandboxID, *pathID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: target path: %v\n", err)
 		return 2
 	}
-	return liveExport(targetPathID, *outDir, *upload, *mode, modeSet, *resume, *runRoot, *timeoutS)
+	return liveExport(targetPathID, *outDir, *upload, *mode, modeSet, *resume, *runRoot, *timeoutS, *jsonOutput)
 }
 
 func prepareArtifactOutputDir(path string) (string, error) {
@@ -156,7 +157,7 @@ func prepareArtifactOutputDir(path string) (string, error) {
 	return abs, nil
 }
 
-func liveExport(pathID, outDir string, upload bool, mode string, modeSet, resume bool, runRoot string, timeoutS int) int {
+func liveExport(pathID, outDir string, upload bool, mode string, modeSet, resume bool, runRoot string, timeoutS int, jsonOutput bool) int {
 	if runRoot == "" {
 		runRoot = os.Getenv("SANDBOX_RUN_ROOT")
 	}
@@ -190,10 +191,10 @@ func liveExport(pathID, outDir string, upload bool, mode string, modeSet, resume
 		fmt.Fprintf(os.Stderr, "export: error from sandbox: %s\n", resp.Msg)
 		return 1
 	}
-	return printExportResult(upload, resp)
+	return printExportResult(upload, resp, jsonOutput)
 }
 
-func assembleSandboxEExport(raw, configPaths, sandboxID, outDir string, upload bool, mode, manifestPath string, locations config.RefLocations, timeoutS int) (exitCode int) {
+func assembleSandboxEExport(raw, configPaths, sandboxID, outDir string, upload bool, mode, manifestPath string, locations config.RefLocations, timeoutS int, jsonOutput bool) (exitCode int) {
 	ctx, stopSignals := commandContext()
 	defer stopSignals()
 	if timeoutS > 0 {
@@ -311,11 +312,16 @@ func assembleSandboxEExport(raw, configPaths, sandboxID, outDir string, upload b
 		fmt.Fprintf(os.Stderr, "export: write Sandbox E: %v\n", err)
 		return 1
 	}
+	ref, path, err = snapshot.CommittedArtifactRef(sink, ref, path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "export: committed identity: %v\n", err)
+		return 1
+	}
 	resp := ctl.Response{Type: ctl.TypeExportDone, SandboxRef: ref, SandboxPath: path}
 	if parsed, err := manifest.ParseRef(ref); err == nil && parsed.Scheme == manifest.RefSchemeManifest {
 		resp.SandboxManifestKey = parsed.Path
 	}
-	return printExportResult(upload, resp)
+	return printExportResult(upload, resp, jsonOutput)
 }
 
 func newAssemblyArtifactSink(outDir, sandboxID string, upload bool, mode string, manifestCfg *config.ManifestConfig, storage *artifact.ProcessStorage, admission store.WriteAdmission, refs []string) (snapshot.ArtifactSink, error) {
@@ -336,12 +342,16 @@ func newAssemblyArtifactSink(outDir, sandboxID string, upload bool, mode string,
 	return snapshot.NewFileSink(outDir, sandboxID, storage.LocalCodec(), storage.LocalRequired(), nil), nil
 }
 
-func printExportResult(upload bool, resp ctl.Response) int {
+func printExportResult(upload bool, resp ctl.Response, jsonOutput bool) int {
+	if jsonOutput {
+		return printCaptureJSON(resp, artifact.RoleSandbox)
+	}
 	if upload {
 		fmt.Fprintf(os.Stderr, "export done: pause_ms=%d dump_ms=%d\n", resp.WallclockPauseMs, resp.WallclockDumpMs)
 		fmt.Println(resp.SandboxManifestKey)
 		return 0
 	}
+	resp = captureHumanResponse(resp)
 	fmt.Printf("export done: pause_ms=%d dump_ms=%d\n", resp.WallclockPauseMs, resp.WallclockDumpMs)
 	if resp.SandboxPath != "" {
 		fmt.Printf("  Sandbox E: %s\n", resp.SandboxPath)

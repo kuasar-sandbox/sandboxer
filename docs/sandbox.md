@@ -120,7 +120,27 @@ sandbox-ctl snapshot \
 
 A Snapshot always contains memory execution state. One operation produces E and S at the same freeze point, committing S last. On success, the default is to destroy the VM. `--resume` resumes the original VM without making the new E/S its live baseline.
 
-Human-readable local output lists both `Snapshot S` and `Sandbox E`. Upload stdout still contains only the S Manifest key for the existing orchestrator parser. `snapshot_done` returns both `snapshot_ref` and `sandbox_ref`; existing `memory_size`, `memory_resident`, pause/dump timing, and compatibility `overlay_*` response fields remain. `overlay_*` currently mirrors E's identity; only E contains the actual disk graph.
+Human-readable local output lists both `Snapshot S` and `Sandbox E`. Default upload stdout still contains only the S Manifest key for shell compatibility. `snapshot_done` returns both `snapshot_ref` and `sandbox_ref`; existing `memory_size`, `memory_resident`, pause/dump timing, and compatibility `overlay_*` response fields remain. `overlay_*` currently mirrors E's identity; only E contains the actual disk graph.
+
+`snapshot --json` emits exactly `{snapshotRef,sandboxRef,removedRefs}` and
+`export --json` emits exactly `{sandboxRef,removedRefs}`, with `removedRefs:[]`
+for capture. These identities come from the completed runtime response (or the
+assembly producer for `export --from`). The CLI does not reopen S or infer E
+from a filename. A single-root Bundle binds both selectors to the actual final
+Bundle file; upload returns both actual Manifest identities for Snapshot. Local
+refs expose only basenames and preserve `@digest`, `@hmac`, `@manifest` and any
+location. The output directory stays in the caller's execution context. Invalid
+or incomplete responses produce an error and no successful JSON. `--resume`
+uses the same identity contract; existing default human output and upload-key
+stdout remain available without `--json`.
+
+For paired RFC-142 deployment, upgrade sandboxer together with orchestrator.
+Operators must clear the old orchestrator local database before upgrading and
+recreate records; neither component migrates/backfills it or automatically
+removes user data. Snapshot migration tokens without E must be discarded and
+reissued from complete S/E records. Portable Export uses that recorded pair even
+when artifacts are unavailable; it never reads S to discover E.
+
 
 `--drop-caches` belongs only to memory snapshot and defaults to false. `--merge-ref` controls only local memory-parent merging and does not change disk provenance.
 
@@ -894,12 +914,21 @@ existing configuration and provision a filesystem source with the required
 capacity. New configuration output does not emit them. Unrelated fields and
 opaque metadata are unaffected.
 
+For new disposable ext4 work disks (overlay uppers, single roots and scratch
+or data-disk fixtures), format the sparse template with `mkfs.ext4 -O ^has_journal`.
+This avoids filesystem journal allocation and metadata journal writes; it does
+not disable journald or application logs. COW is not a replacement for a journal,
+and this default does not promise crash recovery of an interrupted work disk.
+Existing journaled templates, user-supplied images and snapshots remain compatible;
+guest sync/quiesce and snapshot/restore semantics are unchanged. Do not reformat
+an existing data disk to apply this recommendation.
+
 For a **new**, empty 512 MiB scratch filesystem, prepare a new template and
 select it without a size override:
 
 ```bash
 truncate -s 512M /tmp/scratch-512m.ext4
-mkfs.ext4 -F /tmp/scratch-512m.ext4
+mkfs.ext4 -F -O ^has_journal /tmp/scratch-512m.ext4
 ```
 
 ```yaml

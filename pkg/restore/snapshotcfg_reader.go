@@ -102,8 +102,11 @@ type SnapshotCfgReadOptions struct {
 // SnapshotCfgDocument carries the derived compatibility projection and the
 // original canonical new-schema snapshot.cfg bytes.
 type SnapshotCfgDocument struct {
-	Config *SnapshotCfg
-	Raw    []byte
+	// SandboxRef retains the actual E selection made by this read, including
+	// current/sibling Bundle selectors or a remote Manifest fallback.
+	SandboxRef string
+	Config     *SnapshotCfg
+	Raw        []byte
 }
 
 // SnapshotCfgReader owns process-local artifact storage for one or more
@@ -144,7 +147,7 @@ func (r *SnapshotCfgReader) Read(ctx context.Context, rootRef string, opts Snaps
 	}
 
 	projection, projectErr := projectSnapshotCfg(memoryCfg, sandboxSource.Root.Portable)
-	document := &SnapshotCfgDocument{Config: projection, Raw: append([]byte(nil), root.SnapshotConfig...)}
+	document := &SnapshotCfgDocument{SandboxRef: sandboxSource.SelectedRef, Config: projection, Raw: append([]byte(nil), root.SnapshotConfig...)}
 	closeErr := errors.Join(sandboxSource.Root.Close(), root.Close())
 	if projectErr != nil || closeErr != nil {
 		return nil, errors.Join(projectErr, closeErr)

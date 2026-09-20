@@ -310,6 +310,7 @@ type BundleSink struct {
 	overlayResults []*ingest.Result
 	sandboxResult  *ingest.Result
 	bundleResult   *ingest.Result
+	finalPath      string
 	finalized      bool
 	closed         bool
 }
@@ -554,9 +555,33 @@ func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, role s
 	if err := commitArtifactAlias(ctx, s.outDir, s.sandboxID, role, final); err != nil {
 		return fmt.Errorf("commit %s Bundle alias: %w", role, err)
 	}
+	s.finalPath = final
 	s.finalized = true
 	s.logf("artifact: %s.bundle written as %s root", HexKey(root)[:12], role)
 	return nil
+}
+
+// CommittedArtifactRef returns the identity in the carrier just committed by
+// the producer. Bundle members share one physical file and retain their own
+// Manifest selectors. It performs no artifact read.
+func CommittedArtifactRef(sink ArtifactSink, ref, path string) (string, string, error) {
+	bundle, ok := sink.(*BundleSink)
+	if !ok {
+		return ref, path, nil
+	}
+	parsed, err := manifest.ParseRef(ref)
+	if err != nil || parsed.Scheme != manifest.RefSchemeManifest || !bundle.finalized {
+		return "", "", fmt.Errorf("Bundle artifact is not committed")
+	}
+	key, err := manifest.ParseKeyRef(parsed.Path)
+	if err != nil {
+		return "", "", err
+	}
+	if _, exists := bundle.manifests[key]; !exists {
+		return "", "", fmt.Errorf("artifact is not a member of the committed Bundle")
+	}
+	return (manifest.Ref{Scheme: manifest.RefSchemeFile, Path: filepath.Base(bundle.finalPath),
+		DigestScheme: "manifest", Digest: parsed.Path}).String(), bundle.finalPath, nil
 }
 
 func (s *BundleSink) validateExisting(ctx context.Context, path string, root store.ContentKey) error {
