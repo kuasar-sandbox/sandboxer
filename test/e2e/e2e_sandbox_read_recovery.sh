@@ -374,7 +374,7 @@ python3 - "$WORK/recovered.stats.json" "$WORK/recovered.log" <<'PY'
 import json,pathlib,re,sys
 d=json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert d['uffd']['source_read_calls']>0 and d['uffd']['tail_buffered_data']>0
-assert re.search(r'uffd .*inflight=[1-9]',pathlib.Path(sys.argv[2]).read_text())
+assert d['uffd']['fault_inflight_hwm']>0
 for b in d['backends']:
  for kind in ('read','write','flush'): assert b[kind]['err_count']==0,(b['name'],kind)
 print('PASS: real UFFD/Chunk window; no Guest I/O errors')
