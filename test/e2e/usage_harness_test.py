@@ -1130,7 +1130,7 @@ class CleanupTests(unittest.TestCase):
         sb = unittest.mock.Mock()
         sb.name, sb.dir = "test", Path("destination")
         with patch.object(usage_faults.Path, "exists", return_value=True), \
-             patch.object(usage_faults.shutil, "copy2", side_effect=OSError(errno.ENOSPC, "evidence full")), \
+             patch.object(usage_faults.shutil, "copyfile", side_effect=OSError(errno.ENOSPC, "evidence full")), \
              patch.object(usage_faults, "run") as run:
             with self.assertRaises(OSError):
                 usage_faults.collect_and_unmount(Path("mounted"), sb)
