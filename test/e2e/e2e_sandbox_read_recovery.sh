@@ -33,14 +33,30 @@ wait_file() {
     done
     echo "timed out: $pattern in $path" >&2; cat "$path" >&2; return 1
 }
-wait_new_fault() {
-    local before=$1 pid=$2
-    for _ in $(seq 1 200); do
-        [ "$(wc -l < "$WORK/faults.jsonl")" -gt "$before" ] && return
-        kill -0 "$pid" || return 1
+wait_fault_count() {
+    local before=$1 count=$2 pid=$3
+    local target=$((before + count))
+    for _ in $(seq 1 400); do
+        [ "$(wc -l < "$WORK/faults.jsonl")" -ge "$target" ] && return
+        kill -0 "$pid" 2>/dev/null || return 1
         sleep .05
     done
-    echo "no new source failure after $before records" >&2; return 1
+    echo "source failures did not reach $target records (started at $before)" >&2; return 1
+}
+wait_new_fault() { wait_fault_count "$1" 1 "$2"; }
+wait_capture_active() {
+    local sid=$1 capture_pid=$2 probe=$3
+    for _ in $(seq 1 200); do
+        : > "$probe"
+        if ! timeout 1 "$BIN/sandbox-ctl" exec --sandbox-id "$sid" --run-root "$WORK/run" -- /bin/true                 >/dev/null 2>"$probe"; then
+            grep -q 'unavailable during capture' "$probe" && return
+        fi
+        kill -0 "$capture_pid" 2>/dev/null || { cat "$probe" >&2; return 1; }
+        sleep .05
+    done
+    echo "capture never fenced new exec requests" >&2
+    cat "$probe" >&2
+    return 1
 }
 mode() { printf '%s\n' "$1" > "$WORK/mode.next"; mv "$WORK/mode.next" "$WORK/mode"; }
 STORE_PORT=$(free_port); CACHE_PORT=$(free_port); HEALTH_PORT=$(free_port)
@@ -282,6 +298,7 @@ wait_file "$WORK/faults.jsonl" '"mode": "offline"' "$RUN_PID"
 # longevity is proven deterministically in internal/readretry; this real-KVM
 # case proves the guest operation remains pending and recovers on the same endpoint.
 kill -TERM "$CACHE_PID"; wait "$CACHE_PID"
+RETRY_BASE=$(wc -l < "$WORK/faults.jsonl")
 python3 - "$RUN_PID" "$PROXY_PID" "$WORK/resources.before.json" <<'PY'
 import json,pathlib,sys
 out={}
@@ -297,6 +314,9 @@ fi
 if grep -qE 'Traceback|Input/output error|mandatory source read' "$WORK/recovered.log"; then
     echo "transient source outage caused a Guest error or fatal exit" >&2; exit 1
 fi
+# Observe several real retries before comparing resources. Retry longevity is
+# proven deterministically in internal/readretry; this checks the VM/proxy stack.
+wait_fault_count "$RETRY_BASE" 4 "$RUN_PID"
 python3 - "$WORK/resources.before.json" "$WORK/resources.after.json" <<'PY'
 import json,pathlib,sys
 before=json.loads(pathlib.Path(sys.argv[1]).read_text());after={}
@@ -323,9 +343,11 @@ wait_new_fault "$BEFORE_OUTAGE_FAULTS" "$RUN_PID"
 BEFORE_CAPTURE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
 "$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
 CAPTURE_PID=$!
-wait_new_fault "$BEFORE_CAPTURE_FAULTS" "$CAPTURE_PID"
-# The observed source fault is the barrier: capture must still be pending,
-# without requiring a wall-clock delay or disabling its health policy.
+wait_capture_active recovered "$CAPTURE_PID" "$WORK/recovered.capture-probe.log"
+# Once capture has fenced new exec requests, require a later source retry.
+# This prevents a pre-existing Guest retry from satisfying the capture barrier.
+CAPTURE_ACTIVE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
+wait_new_fault "$CAPTURE_ACTIVE_FAULTS" "$CAPTURE_PID"
 kill -0 "$RUN_PID"; kill -0 "$CAPTURE_PID"
 [ ! -s "$WORK/next.key" ]
 mode healthy
@@ -353,7 +375,9 @@ wait_new_fault "$BEFORE_OUTAGE_FAULTS" "$RUN_PID"
 BEFORE_FATAL_FAULTS=$(wc -l < "$WORK/faults.jsonl")
 "$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
 FATAL_CAPTURE_PID=$!
-wait_new_fault "$BEFORE_FATAL_FAULTS" "$FATAL_CAPTURE_PID"
+wait_capture_active verified "$FATAL_CAPTURE_PID" "$WORK/fatal.capture-probe.log"
+FATAL_ACTIVE_FAULTS=$(wc -l < "$WORK/faults.jsonl")
+wait_new_fault "$FATAL_ACTIVE_FAULTS" "$FATAL_CAPTURE_PID"
 kill -0 "$FATAL_CAPTURE_PID"
 [ ! -s "$WORK/fatal.key" ]
 mode corrupt

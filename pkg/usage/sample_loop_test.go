@@ -34,22 +34,28 @@ func TestDefaultFlushTickPersists(t *testing.T) {
 		t.Fatalf("default usage intervals = %s/%s, err=%v; want 1s/5m", sample, flush, err)
 	}
 
-	s := samplerFixture(t)
-	c := &sampleLoopClock{testClock: testClock{now: s.start}, samples: make(chan time.Time), flushes: make(chan time.Time)}
-	s.clock, s.interval, s.flush = c, sample, flush
-	ctx, cancel := context.WithCancel(context.Background())
-	s.Start(ctx, 123)
+	start := time.Now()
+	c := &sampleLoopClock{testClock: testClock{now: start}, samples: make(chan time.Time), flushes: make(chan time.Time)}
+	m, err := Open(t.TempDir(), "default-flush", "epoch", start, sample, flush)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewSampler(m, 2, 1, nil, nil, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.interval != sample || s.flush != flush {
+		t.Fatalf("sampler intervals = %s/%s; want %s/%s", s.interval, s.flush, sample, flush)
+	}
+	s.Start(context.Background(), os.Getpid())
 	defer func() {
-		cancel()
-		select {
-		case <-s.done:
-		case <-time.After(3 * time.Second):
-			t.Error("sampler loop did not finish")
-		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		s.Stop(ctx)
 	}()
 
 	c.mu.Lock()
-	c.now = s.start.Add(flush)
+	c.now = start.Add(flush)
 	now := c.now
 	c.mu.Unlock()
 	select {

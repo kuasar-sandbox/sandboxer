@@ -138,7 +138,7 @@ func TestDirectEndpointOutageRecovery(t *testing.T) {
 	blob.Release()
 	client.Close()
 	stopRestored()
-	if dialFailures.Load() < 20 || payloadReads.Load() != 1 || maximum.Load() > 4 || active.Load() != 0 {
+	if attempts.Load() != 20 || dialFailures.Load() == 0 || payloadReads.Load() != 1 || maximum.Load() > 4 || active.Load() != 0 {
 		t.Fatalf("recovery contract: attempts=%d dial_failures=%d payload_reads=%d max_connections=%d active=%d", attempts.Load(), dialFailures.Load(), payloadReads.Load(), maximum.Load(), active.Load())
 	}
 	t.Logf("PASS attempts=%d direct_dial_failures=%d completion=1 max_connections=%d max_fd=%d max_goroutines=%d", attempts.Load(), dialFailures.Load(), maximum.Load(), maxFD, maxGo)
