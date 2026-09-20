@@ -53,6 +53,8 @@ Memory is faulted in by page; disk data is read by block. Data that is never tou
 
 ## Build and test
 
+Builds use environment-provided Go and inherit its `GOROOT` and `GOTOOLCHAIN` selection. Release automation requires a working `gh` with `api --slurp` support on `PATH`; the project does not install, replace, or authenticate these environment tools against fixed binary digests. Rust builds use the environment's `cargo`, `rustc`, and target linker, without requiring rustup management.
+
 ```bash
 make build                      # sandbox-ctl and sandbox-init
 make sandbox-ctl sandbox-init   # explicit binary targets

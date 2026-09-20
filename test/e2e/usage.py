@@ -24,7 +24,7 @@ REPO = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ["BIN"]).resolve()
 # sudo can replace PATH while preserving the caller's explicit Go distribution.
 # Keep its driver and compiler paired; an invalid root must fail, not fall back.
-GO = str(Path(os.environ["GOROOT"]) / "bin/go") if os.environ.get("GOROOT") else "go"
+GO = os.environ.get("KUASAR_E2E_GO") or (str(Path(os.environ["GOROOT"]) / "bin/go") if os.environ.get("GOROOT") else "go")
 
 
 def run(*args, timeout=60, **kw):

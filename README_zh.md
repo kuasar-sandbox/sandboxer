@@ -53,6 +53,8 @@ Memory 按 page fault-in,磁盘按 block 读取。未访问的数据无需在恢
 
 ## 构建与测试
 
+构建使用环境提供的 Go，并继承 `GOROOT`、`GOTOOLCHAIN` 等工具链选择；发布自动化需要环境在 `PATH` 中提供支持 `api --slurp` 的 `gh`。项目不下载、替换或按固定二进制摘要认证这些环境工具。 Rust 构建使用环境中的 `cargo`、`rustc` 和目标链接器，不要求由 rustup 管理。
+
 ```bash
 make build                      # sandbox-ctl and sandbox-init
 make sandbox-ctl sandbox-init   # explicit binary targets
