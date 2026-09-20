@@ -325,73 +325,7 @@ wait_file "$WORK/recovered.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 # capture outage. With no Guest UFFD/COW demand left running, a source fault
 # observed after the exec fence belongs to the capture lifecycle.
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'touch /recovery.idle'
-wait_file "$WORK/recovered.log" '^RECOVERY-IDLEwait "$CAPTURE_PID"
-NEXT=$(cat "$WORK/next.key")
-[ "${#NEXT}" -eq 64 ]; wait "$RUN_PID"
-SESSIONS=()
-python3 - "$WORK/recovered.stats.json" "$WORK/recovered.log" <<'PY'
-import json,pathlib,re,sys
-d=json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert d['uffd']['source_read_calls']>0 and d['uffd']['tail_buffered_data']>0
-assert re.search(r'uffd .*inflight=[1-9]',pathlib.Path(sys.argv[2]).read_text())
-for b in d['backends']:
- for kind in ('read','write','flush'): assert b[kind]['err_count']==0,(b['name'],kind)
-print('PASS: real UFFD/Chunk window; no Guest I/O errors')
-PY
-launch verified --restore "manifest://$NEXT" --config "$WORK/host.yaml"
-# The restored workload was captured inside the idle loop. Use the existing
-# exec readiness contract to remove the gate, then require the workload to
-# resume and execute another checked direct-I/O iteration. This preserves the
-# original post-restore content proof without assuming every 1 MiB page had
-# already been rewritten before capture.
-VERIFIED_READY=0
-for _ in $(seq 1 200); do
-    if "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- rm -f /recovery.idle > "$WORK/verified-ready.log" 2>&1; then
-        VERIFIED_READY=1
-        break
-    fi
-    kill -0 "$RUN_PID" 2>/dev/null || { cat "$WORK/verified.log" "$WORK/verified-ready.log" >&2; exit 1; }
-    sleep .05
-done
-[ "$VERIFIED_READY" = 1 ] || { echo "verified restore never became exec-ready" >&2; exit 1; }
-wait_file "$WORK/verified.log" '^RECOVERY-RESUMED$' "$RUN_PID"
-wait_file "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
-"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
-# Re-enter the same observable idle state so the fatal capture has no
-# concurrent Guest source demand.
-VERIFIED_IDLE_BASE=$(grep -cE '^RECOVERY-IDLE$' "$WORK/verified.log" 2>/dev/null || true)
-"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- touch /recovery.idle
-wait_file_count "$WORK/verified.log" '^RECOVERY-IDLE$' "$VERIFIED_IDLE_BASE" "$RUN_PID"
-# A complete corrupt immutable response is a deterministic failure while an
-# idle restored Guest is in capture. With the workload already at RECOVERY-IDLE,
-# a new post-fence source fault is capture-specific.
-mode offline
-"$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
-FATAL_CAPTURE_PID=$!
-wait_capture_active verified "$FATAL_CAPTURE_PID" "$WORK/fatal.capture-probe.log"
-FATAL_FAULT_BASE=$(fault_count)
-wait_new_fault "$FATAL_FAULT_BASE" "$FATAL_CAPTURE_PID"
-kill -0 "$FATAL_CAPTURE_PID"
-[ ! -s "$WORK/fatal.key" ]
-mode corrupt
-wait_file "$WORK/faults.jsonl" '"mode": "corrupt"' "$RUN_PID"
-for _ in $(seq 1 200); do kill -0 "$RUN_PID" 2>/dev/null || break; sleep .05; done
-if kill -0 "$RUN_PID" 2>/dev/null; then echo "fatal did not stop sandbox" >&2; exit 1; fi
-if wait "$RUN_PID"; then echo "fatal returned success" >&2; exit 1; fi
-if wait "$FATAL_CAPTURE_PID"; then echo "fatal capture returned success" >&2; exit 1; fi
-[ ! -s "$WORK/fatal.key" ]
-if pgrep -s "$RUN_PID" -x cloud-hyperviso >/dev/null; then
-    echo "CH survived the sandbox's fatal exit" >&2; exit 1
-fi
-# The runtime owner must record the injected corruption, not only a timeout.
-# Either UFFD or COW can observe the failing immutable source first.
-grep -E 'sandbox fatal I/O:.*ciphertext hash mismatch' "$WORK/verified.log"
-if grep -qE 'Traceback|Input/output error' "$WORK/verified.log"; then
-    echo "fatal source failure reached the Guest as an I/O error" >&2; exit 1
-fi
-cat "$WORK/faults.jsonl"
-echo "PASS: real CH source recovery, recovered snapshot contents, and whole-VM fatal without a successful capture"
- "$RUN_PID"
+wait_file "$WORK/recovered.log" '^RECOVERY-IDLE$' "$RUN_PID"
 mode offline
 "$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
 CAPTURE_PID=$!
@@ -478,12 +412,12 @@ wait_file_count "$WORK/verified.log" '^RECOVERY-IDLE$' "$VERIFIED_IDLE_BASE" "$R
 # A complete corrupt immutable response is a deterministic failure while an
 # idle restored Guest is in capture. With the workload already at RECOVERY-IDLE,
 # a new post-fence source fault is capture-specific.
-BEFORE_FATAL_FAULTS=$(fault_count)
 mode offline
 "$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
 FATAL_CAPTURE_PID=$!
 wait_capture_active verified "$FATAL_CAPTURE_PID" "$WORK/fatal.capture-probe.log"
-wait_new_fault "$BEFORE_FATAL_FAULTS" "$FATAL_CAPTURE_PID"
+FATAL_FAULT_BASE=$(fault_count)
+wait_new_fault "$FATAL_FAULT_BASE" "$FATAL_CAPTURE_PID"
 kill -0 "$FATAL_CAPTURE_PID"
 [ ! -s "$WORK/fatal.key" ]
 mode corrupt
