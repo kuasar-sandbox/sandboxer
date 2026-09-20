@@ -194,8 +194,13 @@ for _ in $(seq 1 100); do
     sleep 0.1
 done
 [ "$found" = 1 ] || fail 'restored application did not emit its marker'
+stop_status=0
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RR" -- \
-    /bin/sh -c 'echo stop > /journal-command' >"$WORK/stop.out" 2>"$WORK/stop.err"
+    /bin/sh -c 'echo stop > /journal-command' >"$WORK/stop.out" 2>"$WORK/stop.err" || stop_status=$?
+if [ "$stop_status" != 0 ] \
+    && ! grep -Fq 'connection lost before the command reported an exit status' "$WORK/stop.err"; then
+    fail "stop exec failed before the intentional guest shutdown (status=$stop_status)"
+fi
 wait_run_exit
 
 # Target-bound startup failures are native entries, not copied to stderr.
@@ -226,6 +231,8 @@ for phase, marker in [('cold', 'cold'), ('restore', 'restored')]:
     one(phase, 'stdout', 'APP-OUT-' + marker)
     one(phase, 'stderr', 'APP-ERR-' + marker)
     assert selected(phase, 'component'), ('missing component diagnostics', phase)
+one('restore', 'stdout', 'APP-OUT-stop')
+one('restore', 'stderr', 'APP-ERR-stop')
 assert selected('cold', 'console'), 'missing cold console output'
 one('exec', 'stdout', 'EXEC-OUT')
 for r in rows:
