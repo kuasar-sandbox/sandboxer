@@ -249,7 +249,7 @@ launch:
 	if err := os.Mkdir(outputDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if code := assembleSandboxEExport(imageRef, configPath, "cli", outputDir, false, ctl.SnapshotModeLocal, "", nil, 0); code != 0 {
+	if code := assembleSandboxEExport(imageRef, configPath, "cli", outputDir, false, ctl.SnapshotModeLocal, "", nil, 0, false); code != 0 {
 		t.Fatalf("assembleSandboxEExport exit = %d", code)
 	}
 

@@ -199,11 +199,20 @@ mkdir -p "$WORK/run" "$WORK/base"
 launch() {
     local sid=$1
     shift
-    readiness_exec_in_new_session "$BIN/sandbox-ctl" run "$@" \
+    local ready="$WORK/$sid.ready"
+    readiness_begin_capture "$ready"
+    local ready_reader=$READY_READER_PID
+    readiness_exec_in_new_session "$BIN/sandbox-ctl" run --ready-fd="$READY_WRITE_FD" "$@" \
         --manifest-config "$WORK/manifest.yaml" --ch-binary "$BIN/cloud-hypervisor" \
         --sandbox-id "$sid" --run-root "$WORK/run" --base-root "$WORK/base" \
         --stats-json "$WORK/$sid.stats.json" > "$WORK/$sid.log" 2>&1 &
     RUN_PID=$!; SESSIONS+=($RUN_PID)
+    readiness_close_parent_writer
+    # Restored stdout can contain buffered pre-snapshot TICKs. Only the
+    # one-shot readiness descriptor establishes completion of resume/quiesce.
+    readiness_wait_event "$ready" 1 control_ready "$RUN_PID" || return 1
+    readiness_wait_event "$ready" 2 ready "$RUN_PID" || return 1
+    readiness_assert_wire "$ready" "$ready_reader" $'control_ready\nready\n'
 }
 # Only the dedicated data disk's immutable chunks fail in this phase. Root
 # reads and UFFD remain available, so neither can delay the Guest before the

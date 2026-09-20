@@ -120,7 +120,27 @@ sandbox-ctl snapshot \
 
 A Snapshot always contains memory execution state. One operation produces E and S at the same freeze point, committing S last. On success, the default is to destroy the VM. `--resume` resumes the original VM without making the new E/S its live baseline.
 
-Human-readable local output lists both `Snapshot S` and `Sandbox E`. Upload stdout still contains only the S Manifest key for the existing orchestrator parser. `snapshot_done` returns both `snapshot_ref` and `sandbox_ref`; existing `memory_size`, `memory_resident`, pause/dump timing, and compatibility `overlay_*` response fields remain. `overlay_*` currently mirrors E's identity; only E contains the actual disk graph.
+Human-readable local output lists both `Snapshot S` and `Sandbox E`. Default upload stdout still contains only the S Manifest key for shell compatibility. `snapshot_done` returns both `snapshot_ref` and `sandbox_ref`; existing `memory_size`, `memory_resident`, pause/dump timing, and compatibility `overlay_*` response fields remain. `overlay_*` currently mirrors E's identity; only E contains the actual disk graph.
+
+`snapshot --json` emits exactly `{snapshotRef,sandboxRef,removedRefs}` and
+`export --json` emits exactly `{sandboxRef,removedRefs}`, with `removedRefs:[]`
+for capture. These identities come from the completed runtime response (or the
+assembly producer for `export --from`). The CLI does not reopen S or infer E
+from a filename. A single-root Bundle binds both selectors to the actual final
+Bundle file; upload returns both actual Manifest identities for Snapshot. Local
+refs expose only basenames and preserve `@digest`, `@hmac`, `@manifest` and any
+location. The output directory stays in the caller's execution context. Invalid
+or incomplete responses produce an error and no successful JSON. `--resume`
+uses the same identity contract; existing default human output and upload-key
+stdout remain available without `--json`.
+
+For paired RFC-142 deployment, upgrade sandboxer together with orchestrator.
+Operators must clear the old orchestrator local database before upgrading and
+recreate records; neither component migrates/backfills it or automatically
+removes user data. Snapshot migration tokens without E must be discarded and
+reissued from complete S/E records. Portable Export uses that recorded pair even
+when artifacts are unavailable; it never reads S to discover E.
+
 
 `--drop-caches` belongs only to memory snapshot and defaults to false. `--merge-ref` controls only local memory-parent merging and does not change disk provenance.
 
@@ -211,6 +231,20 @@ sandbox-ctl publish \
 ```
 
 The publisher identifies E/S logical roots from local paths, located refs, Bundle selectors or Manifest refs. It preserves portable dependencies during ordinary publication. Reference rewriting uses repeatable `--replace-ref OLD=NEW`; whole-chain reduction uses `--reduce-ref A=X`, `--reduce-ref A` or `--reduce-ref=any`. Replacement endpoint sets and replacement/reduction scopes must be disjoint; reduction scope includes all original lowers and its target. `any` is exclusive of replacement rules. Snapshot publication includes its current E's disk references and updates `sandbox_ref` after publishing E. `--skip-verify-ref` defaults to false; verification prefers trusted comparable identities, then streams sparse content. New input identity and schema checks remain active in skip mode. See [artifact publication](sandbox-artifacts.md#reference-rewriting-and-whole-chain-reduction) for scope, validation and zero-staging output contracts.
+
+`--json` returns the final publication report: Sandbox has exactly `sandboxRef` and
+`removedRefs`; Snapshot additionally has `snapshotRef`, and its `sandboxRef` is the
+final E actually referenced by S (including Bundle binding). Empty removals are
+`[]`. The default remains one root line; the `upload-snapshot` alias and `--quiet`
+have the same output contract. Local refs are basenames with existing identity
+qualifiers; callers provide the checkpoint directory externally. Removals are the
+known original topology minus retained final refs, including local roots, and do
+not authorize deletion. See [publication result semantics](sandbox-artifacts.md#publication-result-report)
+for skip boundaries, shared refs, privacy and the no-extra-I/O contract.
+
+```bash
+sandbox-ctl publish --json --quiet --to-ref-location release=file:///srv/sandbox-artifacts ./s1.snapshot
+```
 
 ### 2.9 `sandbox-ctl usage`
 

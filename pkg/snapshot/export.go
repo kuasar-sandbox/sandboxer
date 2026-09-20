@@ -303,6 +303,10 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 		if err := sink.CommitSandbox(ctx, out.SandboxRef, out.SandboxPath); err != nil {
 			return nil, fmt.Errorf("commit Sandbox E: %w", err)
 		}
+		out.SandboxRef, out.SandboxPath, err = CommittedArtifactRef(sink, out.SandboxRef, out.SandboxPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := checkDiskCapture(ctx, sources.Diffs); err != nil {
 		return nil, err

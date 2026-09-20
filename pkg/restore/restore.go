@@ -948,6 +948,7 @@ type openedRootSnapshot struct {
 }
 
 type openedSandboxSource struct {
+	SelectedRef   string // exact physical E chosen by the existing artifact read
 	Root          *sandboxfile.Root
 	PortableRef   string
 	RuntimeRef    string
@@ -993,11 +994,52 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 	if err != nil {
 		return nil, err
 	}
-	source := &openedSandboxSource{PortableRef: ref.String(), RuntimeRef: ref.String(), opts: opts}
+	source := &openedSandboxSource{PortableRef: ref.String(), RuntimeRef: ref.String(), SelectedRef: ref.String(), opts: opts}
 	var stream fetch.Stream
 	switch ref.Scheme {
 	case manifest.RefSchemeManifest:
-		stream, _, err = sandbox.OpenManifestStream(ctx, ref.Path, opts.Fetcher)
+		if scoped, ok := opts.Fetcher.(*manifestbundle.ManifestFetcher); ok {
+			key, parseErr := manifest.ParseKeyRef(ref.Path)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			var selected manifestbundle.ManifestSource
+			selectErr := readretry.Do(ctx, func() error {
+				var err error
+				selected, err = scoped.SelectManifest(ctx, key)
+				return err
+			})
+			if selectErr != nil {
+				return nil, selectErr
+			}
+			if selected.Reader != nil {
+				carrier := selected.Ref
+				if carrier == "" {
+					carrier = opts.SnapshotRef
+					if carrier == "" {
+						carrier = "file://" + opts.SnapshotPath
+					}
+				}
+				physical, parseErr := manifest.ParseRef(carrier)
+				if parseErr != nil {
+					return nil, parseErr
+				}
+				if physical.Location == "" {
+					if selected.Ref == "" {
+						physical.Path = opts.SnapshotPath
+					} else if !filepath.IsAbs(physical.Path) {
+						physical.Path = filepath.Join(filepath.Dir(opts.SnapshotPath), physical.Path)
+					}
+				}
+				physical.DigestScheme, physical.Digest = "manifest", ref.Path
+				source.SelectedRef = physical.String()
+			}
+			stream, err = readretry.Open(ctx, func() (fetch.Stream, error) {
+				return selected.OpenManifest(ctx, key)
+			})
+		} else {
+			stream, _, err = sandbox.OpenManifestStream(ctx, ref.Path, opts.Fetcher)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1056,6 +1098,7 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 		}
 		source.PortableRef = portable.String()
 		source.RuntimeRef = resolved.String()
+		source.SelectedRef = resolved.String()
 	default:
 		return nil, fmt.Errorf("unsupported Sandbox source scheme %q", ref.Scheme)
 	}

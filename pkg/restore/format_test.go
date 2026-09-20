@@ -192,7 +192,7 @@ func TestSeparateSandboxBundleRetainsSnapshotBundleMemoryScope(t *testing.T) {
 	}
 	eBundleRef := "file://" + manifest.HexKey(eKey) + ".bundle@manifest:" + manifest.HexKey(eKey)
 
-	sSink, err := snapshot.NewBundleSink(ctx, dir, "separate-s", manifestCfg, keyFn, nil)
+	sSink, err := snapshot.NewPlannedBundleSink(dir, "separate-s", manifestCfg, keyFn, eSink.Admission(), []string{"file://" + manifest.HexKey(eKey) + ".bundle"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,6 +258,21 @@ func TestSeparateSandboxBundleRetainsSnapshotBundleMemoryScope(t *testing.T) {
 	if sandboxSource.bundleSource == nil || sandboxSource.bundleSource.Reader != sandboxSource.bundleReader ||
 		sandboxSource.bundleSource.Fetcher != sandboxSource.bundleFetcher {
 		t.Fatal("Sandbox E Bundle provenance is not paired with its reader/fetcher")
+	}
+
+	// A manifest E absent from S is selected from the declared sibling, not
+	// rebound to the S carrier by preparation. The selection and its read are
+	// the same operation used for normal restore.
+	sibling, err := openReferencedSandbox(ctx, eRef, root.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantE := "file://" + filepath.Join(dir, manifest.HexKey(eKey)+".bundle") + "@manifest:" + manifest.HexKey(eKey)
+	if sibling.SelectedRef != wantE {
+		t.Fatalf("selected E=%s want=%s", sibling.SelectedRef, wantE)
+	}
+	if err := sibling.Root.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	// openReferencedSandbox deliberately nests its scoped fetcher over the

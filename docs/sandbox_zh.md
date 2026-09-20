@@ -228,6 +228,31 @@ sandbox-ctl publish \
 
 发布入口从本地路径、located ref、Bundle selector 或 Manifest ref 识别 E/S 逻辑根。普通发布保留 portable 依赖；引用替换使用可重复的 `--replace-ref OLD=NEW`，整链归并使用 `--reduce-ref A=X`、`--reduce-ref A` 或 `--reduce-ref=any`。替换规则之间的源/目标集合、替换与归并的作用范围均须互不重叠，归并范围包含全部原始 lower 和目标；`any` 与替换规则互斥。Snapshot 发布同时处理当前 E 的磁盘引用，并在 E 发布后更新 `sandbox_ref`。`--skip-verify-ref` 默认 false，优先采用可信可比身份，否则流式验证稀疏内容；skip 模式继续校验新输入身份和 schema。详细语义见[制品发布](sandbox-artifacts_zh.md#引用改写与整链归并)。
 
+Capture 的 `snapshot --json` 恰好返回 `{snapshotRef,sandboxRef,removedRefs}`，
+`export --json` 恰好返回 `{sandboxRef,removedRefs}`，capture 的 `removedRefs` 固定为
+`[]`。身份直接来自成功的 runtime 响应（`export --from` 则来自 assembly 生产者）。CLI
+不重新打开 S，也不根据扩展名推断 E。单根 Bundle 的两个 selector 都绑定实际最终
+Bundle 文件；upload Snapshot 返回两个实际 Manifest 身份。本地引用仅公开 basename，
+保留 `@digest`、`@hmac`、`@manifest` 及已有 location，输出目录留在调用方执行上下文。
+缺失或无效的响应返回错误，不输出成功 JSON。`--resume` 使用同一身份契约；不带
+`--json` 时继续保留原有人类可读输出和 upload key stdout。
+
+RFC-142 配对部署必须同时升级 sandboxer 与 orchestrator。操作员升级前须清空旧
+orchestrator 本地数据库并重新创建记录；两个组件均不迁移、不回填，也不自动删除用户
+数据。缺少必填 `resumeSandboxRef` 字段的旧迁移 token（包括缺少 E 的 Snapshot token）必须废弃，从完整 S/E 记录重新签发。portable
+Export 即使在工件不可用时也只使用已记录的对，绝不读取 S 来发现 E。
+
+`--json` 返回最终发布报告：Sandbox 恰好包含 `sandboxRef`、`removedRefs`；Snapshot
+额外包含 `snapshotRef`，其中 `sandboxRef` 是 S 实际引用的最终 E（含 Bundle 绑定）。
+空差集为 `[]`。默认输出仍是一行根引用；`upload-snapshot` 别名和 `--quiet` 共用此契约。
+本地引用只有 basename 并保留既有身份后缀，调用方在外部提供 checkpoint 目录。
+差集是已知原拓扑减去最终保留引用，包含本地旧根，但不授予删除权限。skip 边界、共享引用、
+路径隐私和零额外 I/O 约束见[发布结果报告](sandbox-artifacts_zh.md#发布结果报告)。
+
+```bash
+sandbox-ctl publish --json --quiet --to-ref-location release=file:///srv/sandbox-artifacts ./s1.snapshot
+```
+
 ### 2.9 `sandbox-ctl usage`
 
 ```bash
