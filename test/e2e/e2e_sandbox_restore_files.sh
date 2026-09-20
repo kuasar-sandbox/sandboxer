@@ -60,7 +60,7 @@ BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 
 mkdir -p "$WORK/runtime"
 DIFF_FILE="$WORK/runtime/blk1.diff"
-truncate -s 1G "$DIFF_FILE"; mkfs.ext4 -q -F "$DIFF_FILE"
+truncate -s 1G "$DIFF_FILE"; mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
 
 # App re-reads /etc/instance-id every tick so a file injected at restore
 # becomes visible in subsequent ticks.
@@ -115,7 +115,7 @@ wait "$SBPID1" 2>/dev/null || true
 SNAP_FILE="$OUT/$SID1.snapshot"
 [ -f "$SNAP_FILE" ] || { echo "FAIL: no snapshot"; exit 1; }
 
-DIFF_R="$WORK/runtime/blk1-restore.diff"; truncate -s 1G "$DIFF_R"; mkfs.ext4 -q -F "$DIFF_R"
+DIFF_R="$WORK/runtime/blk1-restore.diff"; truncate -s 1G "$DIFF_R"; mkfs.ext4 -q -F -O ^has_journal "$DIFF_R"
 
 # Restore must reject fields that claim to re-apply cold execution state.
 cat > "$WORK/host-bad.yaml" <<EOF

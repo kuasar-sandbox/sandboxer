@@ -127,7 +127,7 @@ DATASET_REF="$(key_bound_ref "$WORK/dataset.plain" "$WORK/dataset.encrypted")"
 
 make_ext4_template() { # $1=path $2=size
     truncate -s "$2" "$1"
-    mkfs.ext4 -q -F "$1"
+    mkfs.ext4 -q -F -O ^has_journal "$1"
 }
 make_ext4_template "$WORK/root-template.ext4" 512M
 make_ext4_template "$WORK/scratch-template.ext4" 256M

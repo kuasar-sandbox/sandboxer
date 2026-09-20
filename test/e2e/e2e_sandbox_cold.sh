@@ -120,7 +120,7 @@ truncate -s 1G "$DIFF_FILE"
 # mount returns EINVAL and sandbox-init aborts. Real production diffs
 # carry a snapshot's ext4 from the previous run; here we make a fresh one.
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH (apt install e2fsprogs)"
-mkfs.ext4 -q -F "$DIFF_FILE"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
 
 # Override only `launch.args`: image config supplies exec=python3 +
 # default Env (PATH for /usr/local/bin/python3 lookup). Args make the

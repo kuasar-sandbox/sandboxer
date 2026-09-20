@@ -113,7 +113,7 @@ run_case() {
 
     local diff="$case_dir/root.diff"
     truncate -s 1G "$diff"
-    mkfs.ext4 -q -F "$diff"
+    mkfs.ext4 -q -F -O ^has_journal "$diff"
 
     # probe.sh starts the stress children before doing any long-lived work.
     # With the old post-Start placement, one or more children could remain in

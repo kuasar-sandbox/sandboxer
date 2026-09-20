@@ -102,7 +102,7 @@ with (w/'cow-data/payload').open('wb') as f:
  for i in range(512): f.write(bytes([i % 251]) * 4096)
 PY
 truncate -s 64M "$WORK/cow.raw"
-mkfs.ext4 -q -F -d "$WORK/cow-data" "$WORK/cow.raw"
+mkfs.ext4 -q -F -O ^has_journal -d "$WORK/cow-data" "$WORK/cow.raw"
 "$BIN/flatten-ctl" tar stream -f "$WORK/cow.img" "$WORK/cow.raw"
 COW_ROOT=$("$BIN/manifest-ctl" store --manifest-config "$WORK/manifest.yaml" --no-progress "$WORK/cow.img")
 python3 - "$WORK" <<'PY'
@@ -140,7 +140,7 @@ while True:
 PY
 # Keep the workload in the existing launch specification captured by Sandbox E.
 truncate -s 1G "$WORK/seed.diff"
-mkfs.ext4 -q -F "$WORK/seed.diff"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/seed.diff"
 python3 - "$WORK" "$ROOT" "$BIN" <<'PY'
 import json,pathlib,sys
 w,root,binpath=sys.argv[1:]

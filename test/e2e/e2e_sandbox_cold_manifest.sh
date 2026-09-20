@@ -195,7 +195,7 @@ echo "    blk0 manifest key: $MKEY"
 mkdir -p "$WORK/runtime"
 DIFF_FILE="$WORK/runtime/blk1.diff"
 truncate -s 1G "$DIFF_FILE"
-mkfs.ext4 -q -F "$DIFF_FILE"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
 
 cat > "$WORK/sandbox.yaml" <<EOF
 resources:
