@@ -63,6 +63,17 @@ func TestDefaultFlushTickPersists(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("sampler did not receive the default flush tick")
 	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		v := s.m.View()
+		if v.Saving || v.Saved != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("default flush did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	awaitSave(t, s.m)
 	v := s.m.View()
 	if v.Saved == nil || v.Saved.SavedUTC != now.UnixNano() {

@@ -44,6 +44,17 @@ wait_fault_count() {
     echo "source failures did not reach $target records (started at $before)" >&2; return 1
 }
 wait_new_fault() { wait_fault_count "$1" 1 "$2"; }
+connect_failure_count() { grep -c '"event": "connect-failure"' "$WORK/faults.jsonl" 2>/dev/null || true; }
+wait_connect_failures() {
+    local before=$1 count=$2 pid=$3 target=$((before + count))
+    for _ in $(seq 1 400); do
+        [ "$(connect_failure_count)" -ge "$target" ] && return
+        kill -0 "$pid" 2>/dev/null || return 1
+        sleep .05
+    done
+    echo "cache connect failures did not reach $target records (started at $before)" >&2
+    return 1
+}
 wait_capture_active() {
     local sid=$1 capture_pid=$2 probe=$3
     for _ in $(seq 1 200); do
@@ -298,7 +309,7 @@ wait_file "$WORK/faults.jsonl" '"mode": "offline"' "$RUN_PID"
 # longevity is proven deterministically in internal/readretry; this real-KVM
 # case proves the guest operation remains pending and recovers on the same endpoint.
 kill -TERM "$CACHE_PID"; wait "$CACHE_PID"
-RETRY_BASE=$(wc -l < "$WORK/faults.jsonl")
+RETRY_BASE=$(connect_failure_count)
 python3 - "$RUN_PID" "$PROXY_PID" "$WORK/resources.before.json" <<'PY'
 import json,pathlib,sys
 out={}
@@ -314,9 +325,10 @@ fi
 if grep -qE 'Traceback|Input/output error|mandatory source read' "$WORK/recovered.log"; then
     echo "transient source outage caused a Guest error or fatal exit" >&2; exit 1
 fi
-# Observe several real retries before comparing resources. Retry longevity is
-# proven deterministically in internal/readretry; this checks the VM/proxy stack.
-wait_fault_count "$RETRY_BASE" 4 "$RUN_PID"
+# The proxy records upstream connection failures even before it can read a
+# request. Observe several real endpoint retries before comparing resources;
+# retry longevity itself remains deterministic in internal/readretry.
+wait_connect_failures "$RETRY_BASE" 4 "$RUN_PID"
 python3 - "$WORK/resources.before.json" "$WORK/resources.after.json" <<'PY'
 import json,pathlib,sys
 before=json.loads(pathlib.Path(sys.argv[1]).read_text());after={}
