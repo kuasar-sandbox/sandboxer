@@ -44,6 +44,16 @@ wait_fault_count() {
     echo "source failures did not reach $target records (started at $before)" >&2; return 1
 }
 wait_new_fault() { wait_fault_count "$1" 1 "$2"; }
+wait_file_count() {
+    local path=$1 pattern=$2 before=$3 pid=$4 count
+    for _ in $(seq 1 200); do
+        count=$(grep -cE "$pattern" "$path" 2>/dev/null || true)
+        [ "$count" -gt "$before" ] && return
+        kill -0 "$pid" 2>/dev/null || { cat "$path" >&2; return 1; }
+        sleep .05
+    done
+    echo "timed out waiting for a new $pattern in $path" >&2; cat "$path" >&2; return 1
+}
 connect_failure_count() { grep -c '"event": "connect-failure"' "$WORK/faults.jsonl" 2>/dev/null || true; }
 wait_connect_failures() {
     local before=$1 count=$2 pid=$3 target
@@ -159,8 +169,9 @@ print('RECOVERY-READY', flush=True)
 while True:
     if os.path.exists('/recovery.idle'):
         print('RECOVERY-IDLE', flush=True)
-        while True:
-            time.sleep(1)
+        while os.path.exists('/recovery.idle'):
+            time.sleep(.01)
+        print('RECOVERY-RESUMED', flush=True)
     page = i % 256
     assert ram[(i * 4096) % len(ram)] == ord('R')
     buf[:512] = b'W' * 512
@@ -389,20 +400,29 @@ for b in d['backends']:
 print('PASS: real UFFD/Chunk window; no Guest I/O errors')
 PY
 launch verified --restore "manifest://$NEXT" --config "$WORK/host.yaml"
-wait_file "$WORK/verified.log" '^RECOVERY-IDLE$' "$RUN_PID"
+# The restored workload was captured inside the idle loop. Use the existing
+# exec readiness contract to remove the gate, then require the workload to
+# resume and execute another checked direct-I/O iteration. This preserves the
+# original post-restore content proof without assuming every 1 MiB page had
+# already been rewritten before capture.
+VERIFIED_READY=0
+for _ in $(seq 1 200); do
+    if "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- rm -f /recovery.idle > "$WORK/verified-ready.log" 2>&1; then
+        VERIFIED_READY=1
+        break
+    fi
+    kill -0 "$RUN_PID" 2>/dev/null || { cat "$WORK/verified.log" "$WORK/verified-ready.log" >&2; exit 1; }
+    sleep .05
+done
+[ "$VERIFIED_READY" = 1 ] || { echo "verified restore never became exec-ready" >&2; exit 1; }
+wait_file "$WORK/verified.log" '^RECOVERY-RESUMED$' "$RUN_PID"
+wait_file "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
-"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- python3 -c 'import os
-fd=os.open("/recovery.data", os.O_RDONLY)
-try:
-    for page in range(256):
-        data=os.pread(fd,4096,page*4096)
-        assert len(data)==4096
-        assert data[:512]==b"W"*512
-        assert data[512:]==bytes([page%251])*(4096-512)
-finally:
-    os.close(fd)
-print("PAYLOAD-VERIFIED")' > "$WORK/verified-payload.log"
-grep -qx 'PAYLOAD-VERIFIED' "$WORK/verified-payload.log"
+# Re-enter the same observable idle state so the fatal capture has no
+# concurrent Guest source demand.
+VERIFIED_IDLE_BASE=$(grep -cE '^RECOVERY-IDLE$' "$WORK/verified.log" 2>/dev/null || true)
+"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- touch /recovery.idle
+wait_file_count "$WORK/verified.log" '^RECOVERY-IDLE$' "$VERIFIED_IDLE_BASE" "$RUN_PID"
 # A complete corrupt immutable response is a deterministic failure while an
 # idle restored Guest is in capture. With the workload already at RECOVERY-IDLE,
 # a new post-fence source fault is capture-specific.
