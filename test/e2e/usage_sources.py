@@ -109,7 +109,7 @@ def filesystem_config(work, name, ref):
               "boot": {"kernel": f"file://{BIN / 'vmlinux'}", "runtime": f"file://{BIN / 'sandbox-runtime.bundle'}",
                        "root": {"base": ref, "overlay": {"diff": f"file://{diff}"}}, "disks": []},
               "mounts": [], "launch": {"exec": "/probe", "args": ["wait"], "restart": "never", "pid_namespace": "shared"},
-              "usage": {"enabled": True, "sample_interval": "500ms", "flush_interval": "2s"}}
+              "usage": {"enabled": True, "sample_interval": "1s", "flush_interval": "5s"}}
     for ordinal, target in enumerate(("/data", "/other")):
         disk = work / f"{name}-data-{ordinal}.ext4"
         ext4(disk)
@@ -175,11 +175,11 @@ def filesystem_case(work, ref, seconds):
         assert guest["sandbox_init_sha256"] == digest(BIN / "sandbox-init"), "stale Guest runtime bundle"
         assert guest["balloon_proc_field"] == "false"
         assert "pagesets" in guest["zoneinfo"] and "count:" in guest["zoneinfo"]
-        time.sleep(1.5)
+        time.sleep(3)
         before = sb.view()
         for path in ("/data/payload", "/other/payload"):
             sb.cli("exec", "--", "/probe", "write", path, "8")
-        time.sleep(1.5)
+        time.sleep(3)
         grown = sb.view()
         write_json(sb.dir / "before.json", before)
         write_json(sb.dir / "grown.json", grown)
@@ -278,7 +278,7 @@ def validate_wire_progress(baseline, observed):
     for name in ("ch.rss_anon", "ch.rss_file", "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file"):
         before = metric(baseline["live"], "gauges", name)
         after = metric(observed[-1]["live"], "gauges", name)
-        assert int(after["covered_total_ns"]) - int(before["covered_total_ns"]) >= 30_000_000_000, name
+        assert int(after["covered_total_ns"]) - int(before["covered_total_ns"]) >= 40_000_000_000, name
         assert int(after["last_request_id"]) - int(before["last_request_id"]) >= 40, name
     for name in ("filesystem.root", "filesystem.disk-1"):
         before = metric(baseline["live"], "gauges", name)
@@ -360,9 +360,7 @@ def validate_wire_deadline(fault, requests):
 
 
 def vsock_case(work, ref):
-    config = filesystem_config(work, "vsock", ref)
-    config["usage"]["sample_interval"] = "1s"
-    sb = Sandbox(work, "vsock", config,
+    sb = Sandbox(work, "vsock", filesystem_config(work, "vsock", ref),
                  ch_binary=Path(__file__).with_name("usage_vsock_wrapper.py"))
     relay, trace, observer, failure = None, None, None, None
     try:
@@ -371,12 +369,12 @@ def vsock_case(work, ref):
         guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
         write_json(sb.dir / "guest.json", guest)
         assert guest["sandbox_init_sha256"] == digest(BIN / "sandbox-init")
-        time.sleep(1.5)
+        time.sleep(3)
         with (sb.dir / "guest-trace.log").open("w") as output, (sb.dir / "guest-resources.log").open("w") as guest_output:
             trace = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
                 "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "trace-fs", "/data", "85000"],
                 stdout=output, stderr=subprocess.STDOUT)
-            time.sleep(1.5)
+            time.sleep(3)
             baseline = sb.view()
             write_json(sb.dir / "baseline.json", baseline)
             assert metric(baseline["live"], "gauges", "filesystem.disk-0")["status"] == "busy"
@@ -385,14 +383,14 @@ def vsock_case(work, ref):
             # a reconnect leak. The observer MUX spans all eleven wire faults.
             sb.cli("exec", "--", "/probe", "true")
             observer = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
-                "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "init-resources-stream", "50"],
+                "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "init-resources-stream", "61"],
                 stdout=guest_output, stderr=subprocess.STDOUT)
             wait_observer_ready(observer, sb.dir / "guest-resources.log")
             observed, counts, faults = [], [], []
             for ordinal, mode in enumerate(["drop"]*8 + ["delay", "repeat", "fragment"]):
                 relay.arm(mode)
                 values, started, last = [], time.monotonic(), None
-                while time.monotonic() - started < 4:
+                while time.monotonic() - started < 5:
                     assert trace.poll() is None and observer.poll() is None
                     view = sb.view()
                     key = wire_view_key(view)
@@ -462,7 +460,7 @@ def vsock_case(work, ref):
         assert max(host_counts) - min(host_counts) <= 4, host_counts
         guest_resources = [json.loads(line) for line in (sb.dir / "guest-resources.log").read_text().splitlines()]
         guest_counts = [row["fds"] for row in guest_resources]
-        assert len(guest_counts) == 50 and max(guest_counts) - min(guest_counts) <= 4, guest_counts
+        assert len(guest_counts) == 61 and max(guest_counts) - min(guest_counts) <= 4, guest_counts
         validate_wire_progress(baseline, observed)
         assert not relay.errors, relay.errors
         print("PASS usage-sources/vsock (11 real frame faults across one blocked filesystem slot)", flush=True)
@@ -496,7 +494,7 @@ def validate_ch_missing(samples, baseline):
     for name in ("filesystem.root", "ch.rss_anon", "ch.rss_file", "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file"):
         first = metric(steady[0]["live"], "gauges", name)
         last = metric(steady[-1]["live"], "gauges", name)
-        assert int(last["covered_total_ns"]) - int(first["covered_total_ns"]) >= 3_000_000_000, name
+        assert int(last["covered_total_ns"]) - int(first["covered_total_ns"]) >= 6_000_000_000, name
 
 
 def finish_owned_trace(sb):
@@ -605,14 +603,14 @@ def restore_case(work, ref):
         assert guest["sandbox_init_sha256"] == digest(BIN / "sandbox-init")
         assert guest["balloon_proc_field"] == "false" and "pagesets" in guest["zoneinfo"] and "count:" in guest["zoneinfo"]
         sb.cli("exec", "--", "/probe", "write", "/data/payload", "8")
-        time.sleep(1.5)
+        time.sleep(3)
         # This bounded test owner alone joins the disposable Guest's root
         # cgroup. Ordinary execs are correctly killed by quiesce; neither
         # PID 1 nor application/exec-join processes are moved by this test.
         launched = True
         launch = json.loads(sb.cli("exec", "--", "/probe", "trace-launch", "/data", "80000"))
         write_json(sb.dir / "trace-launch.json", launch)
-        time.sleep(1.5)
+        time.sleep(3)
         state = json.loads(sb.cli("exec", "--", "/probe", "trace-state"))
         write_json(sb.dir / "trace-start.json", state)
         owner_identity = state["usage-owned-ready.json"]
@@ -631,7 +629,7 @@ def restore_case(work, ref):
         info = sb.ch_info()
         write_json(sb.dir / "post-failure-ch.json", info)
         assert info["state"] == "Running", info
-        time.sleep(1.5)
+        time.sleep(3)
         state = json.loads(sb.cli("exec", "--", "/probe", "trace-state"))
         write_json(sb.dir / "trace-after-failure.json", state)
         assert state["usage-owned-ready.json"] == owner_identity and "usage-owned-done" not in state
@@ -651,7 +649,7 @@ def restore_case(work, ref):
         snapshot = output / "restore-source.snapshot"
         snapshot_hash = digest(snapshot)
         sb.cli("exec", "--", "/probe", "true")
-        time.sleep(1.5)
+        time.sleep(3)
         resumed = sb.view()
         write_json(sb.dir / "resumed.json", resumed)
         assert resumed["live"]["run_epoch"] == before["live"]["run_epoch"]
@@ -674,7 +672,7 @@ def restore_case(work, ref):
         restored_guest = json.loads(child.cli("exec", "--", "/probe", "inspect"))
         write_json(child.dir / "guest.json", restored_guest)
         assert restored_guest["sandbox_init_sha256"] == guest["sandbox_init_sha256"]
-        time.sleep(1.5)
+        time.sleep(3)
         state = json.loads(child.cli("exec", "--", "/probe", "trace-state"))
         write_json(child.dir / "trace-restored.json", state)
         assert state["usage-owned-ready.json"] == owner_identity
@@ -757,7 +755,7 @@ def ch_case(work, ref, mode):
               "boot": {"kernel": f"file://{BIN / 'vmlinux'}", "runtime": f"file://{BIN / 'sandbox-runtime.bundle'}",
                        "root": {"base": ref, "overlay": {"diff": f"file://{diff}"}}},
               "launch": {"exec": "/probe", "args": ["wait"], "restart": "never", "pid_namespace": "shared"},
-              "usage": {"enabled": True, "sample_interval": "500ms", "flush_interval": "2s"}}
+              "usage": {"enabled": True, "sample_interval": "1s", "flush_interval": "5s"}}
     sb = Sandbox(work, f"ch-{mode}", config, ch_binary=Path(__file__).with_name("usage_ch_wrapper.py"))
     relay, pressure, failure = None, None, None
     try:
@@ -792,14 +790,14 @@ def ch_case(work, ref, mode):
         with (sb.dir / "pressure.log").open("w") as output:
             pressure_started = time.monotonic_ns()
             pressure = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
-                "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "memory", "320", "10"],
+                "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "memory", "320", "18"],
                 stdout=output, stderr=subprocess.STDOUT)
         assert relay.held.wait(timeout=15), "selected real CH reply was not reached"
         samples, counts = [], []
         for _ in range(12):
             samples.append(sb.view())
             counts.append(resources(sb))
-            time.sleep(.5)
+            time.sleep(1)
         write_json(sb.dir / "during.json", samples)
         write_json(sb.dir / "resources.json", counts)
         validate_ch_missing(samples, metric(before["live"], "gauges", "guest.memory"))
@@ -839,7 +837,7 @@ def ch_case(work, ref, mode):
             assert pressure.returncode == 0, "pressure workload failed"
             assert "MEMORY-READY 335544320" in (sb.dir / "pressure.log").read_text()
         assert not relay.errors, relay.errors
-        print(f"PASS usage-sources/ch-{mode} (real reply held across 12 sampling rounds)", flush=True)
+        print(f"PASS usage-sources/ch-{mode} (real reply held for 12s)", flush=True)
     except BaseException as error:
         failure = error
         raise
@@ -851,10 +849,10 @@ def ch_case(work, ref, mode):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seconds", type=int, default=15)
+    parser.add_argument("--seconds", type=int, default=30)
     parser.add_argument("--cases", default="filesystem,ch-info,ch-resize,vsock,restore")
     args = parser.parse_args()
-    assert 10 <= args.seconds <= 60
+    assert 20 <= args.seconds <= 60
     assert os.geteuid() == 0
     cases = args.cases.split(",")
     assert set(cases) <= {"filesystem", "ch-info", "ch-resize", "vsock", "restore"}
