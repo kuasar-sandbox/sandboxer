@@ -321,19 +321,93 @@ YAML
 launch recovered --restore "manifest://$SNAP" --config "$WORK/host.yaml"
 wait_file "$WORK/recovered.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- /bin/true
-mkfifo "$WORK/read-recovery.gate"
-exec 8<>"$WORK/read-recovery.gate"
-"$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'echo EXEC-ARMED; IFS= read -r _; echo 3 > /proc/sys/vm/drop_caches; cat /recovery.data >/dev/null; echo READ-RECOVERED' <&8 > "$WORK/pending-exec.log" 2>&1 &
-EXEC_PID=$!; PIDS+=($EXEC_PID)
-wait_file "$WORK/pending-exec.log" '^EXEC-ARMED$' "$RUN_PID"
-BEFORE_EXEC_FAULTS=$(fault_count)
+# Stop the restored workload at an observable application barrier before the
+# capture outage. With no Guest UFFD/COW demand left running, a source fault
+# observed after the exec fence belongs to the capture lifecycle.
+"$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'touch /recovery.idle'
+wait_file "$WORK/recovered.log" '^RECOVERY-IDLEwait "$CAPTURE_PID"
+NEXT=$(cat "$WORK/next.key")
+[ "${#NEXT}" -eq 64 ]; wait "$RUN_PID"
+SESSIONS=()
+python3 - "$WORK/recovered.stats.json" "$WORK/recovered.log" <<'PY'
+import json,pathlib,re,sys
+d=json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert d['uffd']['source_read_calls']>0 and d['uffd']['tail_buffered_data']>0
+assert re.search(r'uffd .*inflight=[1-9]',pathlib.Path(sys.argv[2]).read_text())
+for b in d['backends']:
+ for kind in ('read','write','flush'): assert b[kind]['err_count']==0,(b['name'],kind)
+print('PASS: real UFFD/Chunk window; no Guest I/O errors')
+PY
+launch verified --restore "manifest://$NEXT" --config "$WORK/host.yaml"
+# The restored workload was captured inside the idle loop. Use the existing
+# exec readiness contract to remove the gate, then require the workload to
+# resume and execute another checked direct-I/O iteration. This preserves the
+# original post-restore content proof without assuming every 1 MiB page had
+# already been rewritten before capture.
+VERIFIED_READY=0
+for _ in $(seq 1 200); do
+    if "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- rm -f /recovery.idle > "$WORK/verified-ready.log" 2>&1; then
+        VERIFIED_READY=1
+        break
+    fi
+    kill -0 "$RUN_PID" 2>/dev/null || { cat "$WORK/verified.log" "$WORK/verified-ready.log" >&2; exit 1; }
+    sleep .05
+done
+[ "$VERIFIED_READY" = 1 ] || { echo "verified restore never became exec-ready" >&2; exit 1; }
+wait_file "$WORK/verified.log" '^RECOVERY-RESUMED$' "$RUN_PID"
+wait_file "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
+"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
+# Re-enter the same observable idle state so the fatal capture has no
+# concurrent Guest source demand.
+VERIFIED_IDLE_BASE=$(grep -cE '^RECOVERY-IDLE$' "$WORK/verified.log" 2>/dev/null || true)
+"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- touch /recovery.idle
+wait_file_count "$WORK/verified.log" '^RECOVERY-IDLE$' "$VERIFIED_IDLE_BASE" "$RUN_PID"
+# A complete corrupt immutable response is a deterministic failure while an
+# idle restored Guest is in capture. With the workload already at RECOVERY-IDLE,
+# a new post-fence source fault is capture-specific.
 mode offline
-printf 'go\n' >&8
-exec 8>&-
-wait_new_fault "$BEFORE_EXEC_FAULTS" "$RUN_PID"
-# Stop only our cache, retaining its data and original endpoint. Retry
-# longevity is proven deterministically in internal/readretry; this real-KVM
-# case proves the guest operation remains pending and recovers on the same endpoint.
+"$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
+FATAL_CAPTURE_PID=$!
+wait_capture_active verified "$FATAL_CAPTURE_PID" "$WORK/fatal.capture-probe.log"
+FATAL_FAULT_BASE=$(fault_count)
+wait_new_fault "$FATAL_FAULT_BASE" "$FATAL_CAPTURE_PID"
+kill -0 "$FATAL_CAPTURE_PID"
+[ ! -s "$WORK/fatal.key" ]
+mode corrupt
+wait_file "$WORK/faults.jsonl" '"mode": "corrupt"' "$RUN_PID"
+for _ in $(seq 1 200); do kill -0 "$RUN_PID" 2>/dev/null || break; sleep .05; done
+if kill -0 "$RUN_PID" 2>/dev/null; then echo "fatal did not stop sandbox" >&2; exit 1; fi
+if wait "$RUN_PID"; then echo "fatal returned success" >&2; exit 1; fi
+if wait "$FATAL_CAPTURE_PID"; then echo "fatal capture returned success" >&2; exit 1; fi
+[ ! -s "$WORK/fatal.key" ]
+if pgrep -s "$RUN_PID" -x cloud-hyperviso >/dev/null; then
+    echo "CH survived the sandbox's fatal exit" >&2; exit 1
+fi
+# The runtime owner must record the injected corruption, not only a timeout.
+# Either UFFD or COW can observe the failing immutable source first.
+grep -E 'sandbox fatal I/O:.*ciphertext hash mismatch' "$WORK/verified.log"
+if grep -qE 'Traceback|Input/output error' "$WORK/verified.log"; then
+    echo "fatal source failure reached the Guest as an I/O error" >&2; exit 1
+fi
+cat "$WORK/faults.jsonl"
+echo "PASS: real CH source recovery, recovered snapshot contents, and whole-VM fatal without a successful capture"
+ "$RUN_PID"
+mode offline
+"$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
+CAPTURE_PID=$!
+wait_capture_active recovered "$CAPTURE_PID" "$WORK/recovered.capture-probe.log"
+# Fence probes can themselves fault before Forwarder.Pause takes effect. Reset
+# the baseline only after the fence is observed; the idle guest cannot generate
+# a later source request, so the next fault is capture-specific.
+CAPTURE_FAULT_BASE=$(fault_count)
+wait_new_fault "$CAPTURE_FAULT_BASE" "$CAPTURE_PID"
+kill -0 "$RUN_PID"; kill -0 "$CAPTURE_PID"
+[ ! -s "$WORK/next.key" ]
+
+# Reuse this same real capture to prove prolonged endpoint loss remains pending,
+# retries without leaking host resources, and recovers on the same endpoint.
+# Waiting for 12 failed reconnects exceeds the +8 FD/thread allowance, so a
+# one-resource-per-retry leak cannot hide inside the permitted baseline noise.
 kill -TERM "$CACHE_PID"; wait "$CACHE_PID"
 RETRY_BASE=$(connect_failure_count)
 python3 - "$RUN_PID" "$PROXY_PID" "$WORK/resources.before.json" <<'PY'
@@ -344,17 +418,9 @@ for pid in sys.argv[1:3]:
  out[pid]={'fds':len(list((p/'fd').iterdir())), 'threads':len(list((p/'task').iterdir())), 'rss':next(x for x in (p/'status').read_text().splitlines() if x.startswith('VmRSS:'))}
 pathlib.Path(sys.argv[3]).write_text(json.dumps(out))
 PY
-kill -0 "$RUN_PID"
-if grep -q '^READ-RECOVERED$' "$WORK/pending-exec.log"; then
-    echo "pending read completed before source recovery" >&2; exit 1
-fi
-if grep -qE 'Traceback|Input/output error|mandatory source read' "$WORK/recovered.log"; then
-    echo "transient source outage caused a Guest error or fatal exit" >&2; exit 1
-fi
-# The proxy records upstream connection failures even before it can read a
-# request. Observe several real endpoint retries before comparing resources;
-# retry longevity itself remains deterministic in internal/readretry.
-wait_connect_failures "$RETRY_BASE" 4 "$RUN_PID"
+wait_connect_failures "$RETRY_BASE" 12 "$CAPTURE_PID"
+kill -0 "$RUN_PID"; kill -0 "$CAPTURE_PID"
+[ ! -s "$WORK/next.key" ]
 python3 - "$WORK/resources.before.json" "$WORK/resources.after.json" <<'PY'
 import json,pathlib,sys
 before=json.loads(pathlib.Path(sys.argv[1]).read_text());after={}
@@ -371,23 +437,6 @@ for _ in $(seq 1 100); do
     sleep .1
 done
 grep -q SERVING "$WORK/cache-health"
-mode healthy
-wait_file "$WORK/pending-exec.log" '^READ-RECOVERED$' "$RUN_PID"
-wait "$EXEC_PID"
-# Stop the restored workload at an observable application barrier before the
-# capture outage. With no Guest UFFD/COW demand left running, the next source
-# fault after capture starts belongs to the capture lifecycle rather than a
-# pre-existing workload retry.
-"$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'touch /recovery.idle'
-wait_file "$WORK/recovered.log" '^RECOVERY-IDLE$' "$RUN_PID"
-BEFORE_CAPTURE_FAULTS=$(fault_count)
-mode offline
-"$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
-CAPTURE_PID=$!
-wait_capture_active recovered "$CAPTURE_PID" "$WORK/recovered.capture-probe.log"
-wait_new_fault "$BEFORE_CAPTURE_FAULTS" "$CAPTURE_PID"
-kill -0 "$RUN_PID"; kill -0 "$CAPTURE_PID"
-[ ! -s "$WORK/next.key" ]
 mode healthy
 wait "$CAPTURE_PID"
 NEXT=$(cat "$WORK/next.key")
