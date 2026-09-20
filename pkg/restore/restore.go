@@ -1003,7 +1003,12 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 			if parseErr != nil {
 				return nil, parseErr
 			}
-			selected, selectErr := scoped.SelectManifest(ctx, key)
+			var selected manifestbundle.ManifestSource
+			selectErr := readretry.Do(ctx, func() error {
+				var err error
+				selected, err = scoped.SelectManifest(ctx, key)
+				return err
+			})
 			if selectErr != nil {
 				return nil, selectErr
 			}
@@ -1029,7 +1034,9 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 				physical.DigestScheme, physical.Digest = "manifest", ref.Path
 				source.SelectedRef = physical.String()
 			}
-			stream, err = selected.OpenManifest(ctx, key)
+			stream, err = readretry.Open(ctx, func() (fetch.Stream, error) {
+				return selected.OpenManifest(ctx, key)
+			})
 		} else {
 			stream, _, err = sandbox.OpenManifestStream(ctx, ref.Path, opts.Fetcher)
 		}
