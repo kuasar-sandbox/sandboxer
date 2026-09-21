@@ -92,6 +92,7 @@ bench:
 	CGO_ENABLED=0 $(GO) test -bench=. -benchmem -run=^$$ ./...
 
 test-e2e:
+	bash scripts/ci-source-checks.sh
 	BIN="$(E2E_BIN)" bash test/e2e/run_all.sh
 
 VERSION ?= v0.1.0
