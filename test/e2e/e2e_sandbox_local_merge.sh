@@ -5,7 +5,7 @@
 #   1. store-ctl + cache-ctl tiered, a TICK guest that writes /ticks.dat
 #   2. cold-start → snapshot --output  → s1 (LOCAL file, from_refs=[])
 #   3. restore from s1 (LOCAL path) → snapshot --output → s2 (LOCAL): the local
-#      "replace the next-newest layer" MERGE — assert s2.snapshot.cfg from_refs
+#      same-owner checkpoint prefix MERGE — assert s2.snapshot.cfg from_refs
 #      is EMPTY (the parent s1 was MERGED into s2's top, NOT stacked) and that
 #      restoring s2 builds a SINGLE memory layer (not 2). Independently,E2's
 #      disk graph merges the E1 root payload;TICK continuity + /ticks.dat prove
@@ -165,10 +165,11 @@ run_until() { # $1=logfile $2=pidvar $3=want-tick-regex ; sets the pid into $2
 # ---- phase 1: cold-start → snapshot --output (s1, LOCAL) -----------------
 echo "==> phase 1: cold-start → snapshot --output (s1 local)"
 write_yaml "$WORK/sandbox.yaml" e2e-merge
-SNAPDIR="$WORK/snaps"; mkdir -p "$SNAPDIR"
-LOG1="$WORK/run1.log"; SID1="m1-$$"; mkdir -p "$WORK/runtime/$SID1"
+BASE_ROOT="$WORK/base"; SID1="merge-$$"
+SNAPDIR="$BASE_ROOT/$SID1/checkpoint"; mkdir -p "$SNAPDIR"
+LOG1="$WORK/run1.log"; mkdir -p "$WORK/runtime/$SID1"
 "$BIN/sandbox-ctl" run --config "$WORK/sandbox.yaml" --manifest-config "$WORK/accelerator.yaml" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --sandbox-id "$SID1" >"$LOG1" 2>&1 &
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --base-root "$BASE_ROOT" --sandbox-id "$SID1" >"$LOG1" 2>&1 &
 SBPID1=$!; PIDS+=($SBPID1)
 run_until "$LOG1" SBPID1 "^TICK 10 $BLK0_OK\$"
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID1" --output "$SNAPDIR" --run-root "$WORK/runtime" 2>"$WORK/snap1.log"
@@ -181,9 +182,9 @@ echo "    s1 from_refs: $("$BIN/sandbox-ctl" info --json "$S1" | python3 -c 'imp
 echo "==> phase 2: restore s1 (local) → snapshot --output (s2, merge replaces s1)"
 write_restore_yaml "$WORK/host2.yaml" e2e-merge2 "$WORK/runtime/blk1-r2.diff"
 truncate -s 1G "$WORK/runtime/blk1-r2.diff"
-LOG2="$WORK/run2.log"; SID2="m2-$$"; mkdir -p "$WORK/runtime/$SID2"
+LOG2="$WORK/run2.log"; SID2="$SID1"; mkdir -p "$WORK/runtime/$SID2"
 "$BIN/sandbox-ctl" run --restore "$S1" --config "$WORK/host2.yaml" --manifest-config "$WORK/accelerator.yaml" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --sandbox-id "$SID2" >"$LOG2" 2>&1 &
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --base-root "$BASE_ROOT" --sandbox-id "$SID2" >"$LOG2" 2>&1 &
 SBPID2=$!; PIDS+=($SBPID2)
 S1_TICK=$(grep -oE "^TICK [0-9]+" "$LOG1" | tail -1 | awk '{print $2}')
 run_until "$LOG2" SBPID2 "^TICK $((S1_TICK+3)) $BLK0_OK\$"
@@ -199,9 +200,9 @@ echo "    s2 from_refs: $S2_FROMREFS"
 echo "==> phase 3: restore s2 (local) — single layer (merged), blk0 fall-through intact"
 write_restore_yaml "$WORK/host3.yaml" e2e-merge3 "$WORK/runtime/blk1-r3.diff"
 truncate -s 1G "$WORK/runtime/blk1-r3.diff"
-LOG3="$WORK/run3.log"; SID3="m3-$$"; mkdir -p "$WORK/runtime/$SID3"
+LOG3="$WORK/run3.log"; SID3="$SID1"; mkdir -p "$WORK/runtime/$SID3"
 "$BIN/sandbox-ctl" run --restore "$S2" --config "$WORK/host3.yaml" --manifest-config "$WORK/accelerator.yaml" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --sandbox-id "$SID3" >"$LOG3" 2>&1 &
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --base-root "$BASE_ROOT" --sandbox-id "$SID3" >"$LOG3" 2>&1 &
 SBPID3=$!; PIDS+=($SBPID3)
 S2_TICK=$(grep -oE "^TICK [0-9]+" "$LOG2" | tail -1 | awk '{print $2}')
 run_until "$LOG3" SBPID3 "^TICK $((S2_TICK+3)) $BLK0_OK\$"
@@ -221,7 +222,7 @@ write_restore_yaml "$WORK/host4.yaml" e2e-merge4 "$WORK/runtime/blk1-r4.diff"
 truncate -s 1G "$WORK/runtime/blk1-r4.diff"
 LOG4="$WORK/run4.log"; SID4="m4-$$"; mkdir -p "$WORK/runtime/$SID4"
 "$BIN/sandbox-ctl" run --restore "manifest://$MKEY" --config "$WORK/host4.yaml" --manifest-config "$WORK/accelerator.yaml" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --sandbox-id "$SID4" >"$LOG4" 2>&1 &
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --base-root "$BASE_ROOT" --sandbox-id "$SID4" >"$LOG4" 2>&1 &
 SBPID4=$!; PIDS+=($SBPID4)
 run_until "$LOG4" SBPID4 "^TICK $((S2_TICK+3)) $BLK0_OK\$"
 echo "    PASS: restore from offline-uploaded manifest://$MKEY reached TICK $((S2_TICK+3)); blk0 intact"
