@@ -226,7 +226,7 @@ fi
 for input in accelerator_version connector_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
-  [ "$(grep -Fc "ref: \${{ needs.preflight.outputs.$input }}" "$WORKFLOW")" -eq 2 ] \
+  [ "$(grep -Fc "ref: \${{ needs.preflight.outputs.${input%_version}_sha }}" "$WORKFLOW")" -eq 2 ] \
     || fail "release workflow does not pin both $input checkouts"
 done
 grep -Fq "repos/kuasar-sandbox/\$repository/releases/tags/\$version" "$WORKFLOW" \
@@ -277,9 +277,13 @@ install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scri
 install -m 0644 "$ROOT/scripts/release-rust-materials.py" "$fixture_root/scripts/release-rust-materials.py"
 install -m 0644 "$ROOT/scripts/release-native-materials.sh" "$fixture_root/scripts/release-native-materials.sh"
 install -m 0644 "$ROOT/native-deps/Makefile" "$fixture_root/native-deps/Makefile"
-printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
+printf 'module github.com/kuasar-sandbox/sandboxer\n\ngo 1.24\n' > "$fixture_root/go.mod"
 printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
-fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE LICENSES NOTICE .gitignore scripts native-deps/Makefile go.mod main.go)"
+for binary in sandbox-ctl sandbox-init; do
+  mkdir -p "$fixture_root/cmd/$binary"
+  cp "$fixture_root/main.go" "$fixture_root/cmd/$binary/main.go"
+done
+fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE LICENSES NOTICE .gitignore scripts native-deps/Makefile go.mod main.go cmd)"
 (cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" .)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
 printf '// dirty fixture\n' >> "$fixture_root/main.go"
@@ -297,10 +301,10 @@ if (release_materials_require_go_revision "$TMP/unstamped-go-fixture" "$fixture_
   fail "release accepted a binary without source stamping"
 fi
 for binary in sandbox-ctl sandbox-init; do
-  install -m 0755 "$TMP/go-fixture" "$TMP/bin/$binary"
+  (cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/bin/$binary" "./cmd/$binary")
 done
-printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/cloud-hypervisor"
-chmod +x "$TMP/bin/cloud-hypervisor"
+# Native fixture is inspected, never executed.
+install -m 0755 /bin/true "$TMP/bin/cloud-hypervisor"
 printf 'fixture credits\n' > "$TMP/cloud-hypervisor/CREDITS.md"
 printf 'fixture Apache license\n' > "$TMP/cloud-hypervisor/LICENSES/Apache-2.0.txt"
 printf 'fixture BSD license\n' > "$TMP/cloud-hypervisor/LICENSES/BSD-3-Clause.txt"
@@ -513,9 +517,9 @@ if "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
   "$TMP/invalid-version" >/dev/null 2>&1; then
   fail "packager accepted an invalid version"
 fi
-if "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
+if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
   "$TMP/invalid-arch" >/dev/null 2>&1; then
-  fail "packager accepted an unvalidated release architecture"
+  fail "packager accepted x86_64 payloads as aarch64"
 fi
 
 # Standalone validation must not need source checkouts, module downloads or a build.

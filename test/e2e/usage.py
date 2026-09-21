@@ -40,6 +40,14 @@ def run(*args, timeout=60, **kw):
 
 
 def build_probe(output, source=None):
+    prepared = os.environ.get("USAGE_PROBE_BIN")
+    if prepared and source is None:
+        probe = Path(prepared)
+        assert probe.is_file() and os.access(probe, os.X_OK), "missing prepared usage probe"
+        shutil.copyfile(probe, output)
+        Path(output).chmod(0o755)
+        return ""
+    assert os.environ.get("KUASAR_ARTIFACT_E2E") != "1", "artifact E2E requires USAGE_PROBE_BIN"
     source = source or Path(__file__).parent / "usageprobe/main.go"
     return run(GO, "build", "-trimpath", "-o", output, source,
                env={**os.environ, "CGO_ENABLED": "0", "GOWORK": "off"})
@@ -62,6 +70,14 @@ def image_ref(path):
         names = [n for n in archive.getnames() if n.startswith(".kuasar.digest.")]
     assert len(names) == 1, names
     return f"file://{path}@digest:{names[0].removeprefix('.kuasar.digest.')}"
+
+
+def runtime_init_digest(standalone):
+    if os.environ.get("KUASAR_ARTIFACT_E2E") == "1":
+        expected = os.environ.get("KUASAR_EXPECTED_RUNTIME_INIT_SHA256", "")
+        assert re.fullmatch(r"[0-9a-f]{64}", expected), "missing validated runtime init identity"
+        return expected
+    return standalone
 
 
 def ext4(path, root=None):
@@ -349,8 +365,8 @@ def main():
     work = Path(tempfile.mkdtemp(prefix="e2e-usage-"))
     print(f"usage evidence: {work}", flush=True)
     # Only small evidence files enter the CI artifact, not disk/runtime images.
-    # The packaged suite has no Git checkout/go.mod; compile the stdlib-only
-    # probe by filename and record binary build identities in both layouts.
+    # Artifact E2E copies its already validated probe; developer source runs can
+    # compile the stdlib-only helper. Record binary identities in both layouts.
     if os.environ.get("KUASAR_CI_DIR"):
         evidence = Path(os.environ["KUASAR_CI_DIR"]) / "usage"
         def collect_evidence():
@@ -416,7 +432,7 @@ def main():
             sb.ready()
             inspect = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
             write_json(sb.dir / "guest.json", inspect)
-            assert inspect["sandbox_init_sha256"] == metadata["artifacts"]["sandbox-init"], "runtime bundle does not contain the selected sandbox-init"
+            assert inspect["sandbox_init_sha256"] == runtime_init_digest(metadata["artifacts"]["sandbox-init"]), "runtime bundle does not contain the selected sandbox-init"
             assert inspect["balloon_proc_field"] == "false", "this case requires the unpatched Balloon proc ABI"
             assert "pagesets" in inspect["zoneinfo"] and "count:" in inspect["zoneinfo"], "PCP source missing"
             time.sleep(2.2)

@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-from usage import BIN, Sandbox, build_probe, digest, ext4, image_ref, metric, run, write_json
+from usage import BIN, Sandbox, build_probe, digest, ext4, image_ref, metric, run, write_json, runtime_init_digest
 from usage_ch_relay import CHRelay
 from usage_vsock_relay import UsageRelay
 
@@ -172,7 +172,7 @@ def filesystem_case(work, ref, seconds):
         sb.ready()
         guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
         write_json(sb.dir / "guest.json", guest)
-        assert guest["sandbox_init_sha256"] == digest(BIN / "sandbox-init"), "stale Guest runtime bundle"
+        assert guest["sandbox_init_sha256"] == runtime_init_digest(digest(BIN / "sandbox-init")), "stale Guest runtime bundle"
         assert guest["balloon_proc_field"] == "false"
         assert "pagesets" in guest["zoneinfo"] and "count:" in guest["zoneinfo"]
         time.sleep(3)
@@ -368,7 +368,7 @@ def vsock_case(work, ref):
         sb.ready()
         guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
         write_json(sb.dir / "guest.json", guest)
-        assert guest["sandbox_init_sha256"] == digest(BIN / "sandbox-init")
+        assert guest["sandbox_init_sha256"] == runtime_init_digest(digest(BIN / "sandbox-init"))
         time.sleep(3)
         with (sb.dir / "guest-trace.log").open("w") as output, (sb.dir / "guest-resources.log").open("w") as guest_output:
             trace = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
@@ -600,7 +600,7 @@ def restore_case(work, ref):
         sb.ready()
         guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
         write_json(sb.dir / "guest.json", guest)
-        assert guest["sandbox_init_sha256"] == digest(BIN / "sandbox-init")
+        assert guest["sandbox_init_sha256"] == runtime_init_digest(digest(BIN / "sandbox-init"))
         assert guest["balloon_proc_field"] == "false" and "pagesets" in guest["zoneinfo"] and "count:" in guest["zoneinfo"]
         sb.cli("exec", "--", "/probe", "write", "/data/payload", "8")
         time.sleep(3)
@@ -763,7 +763,7 @@ def ch_case(work, ref, mode):
         sb.ready()
         guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
         write_json(sb.dir / "guest.json", guest)
-        assert guest["sandbox_init_sha256"] == digest(BIN / "sandbox-init")
+        assert guest["sandbox_init_sha256"] == runtime_init_digest(digest(BIN / "sandbox-init"))
         assert guest["balloon_proc_field"] == "false"
         # Wait for a real nonzero target with enough current memory for the
         # workload; do not race an assumed five-second controller phase.

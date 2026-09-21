@@ -10,21 +10,7 @@ CTL="$BIN/sandbox-ctl"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# The standard CI source workspace contains the candidate module. Do not
-# require a Go toolchain or source checkout for the assembled binary e2e suite.
-SOURCE=""
-if command -v go >/dev/null 2>&1; then
-  SOURCE="$(GOPROXY=off GOSUMDB=off go list -m -f '{{.Dir}}' github.com/kuasar-sandbox/sandboxer 2>/dev/null || true)"
-fi
-if [[ -n "$SOURCE" && -f "$SOURCE/pkg/config/disk_size_test.go" ]]; then
-  (
-    cd "$SOURCE"
-    go test -count=1 -timeout=2m ./pkg/config
-    go test -count=1 -timeout=2m ./pkg/sandbox -run '^Test(PrepareDiff|BuildLaunchSpec)'
-  )
-else
-  echo "Source-only Go regressions unavailable; running binary CLI coverage."
-fi
+# Configuration unit regressions run in scripts/ci-source-checks.sh.
 
 cases=0
 for shape in root root-overlay disk disk-overlay root-block root-overlay-block disk-block disk-overlay-block; do

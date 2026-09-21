@@ -82,5 +82,5 @@ for spec in 'pass 0 0' 'pass 1001 0' 'empty 0 1' 'skipped 0 1' 'missing-encrypte
     echo "PASS: isolated ENOSPC runner $spec"
 done
 # The full source suite must invoke the real runner, not just its offline tests.
-grep -Fq './scripts/test-vhost-tmpfs-enospc.sh' "$root/test/e2e/run_all.sh"
+grep -Fq './scripts/test-vhost-tmpfs-enospc.sh' "$root/scripts/ci-source-checks.sh"
 echo 'test-vhost-tmpfs-runner: 8 offline launch cases passed (real ENOSPC not exercised here)'

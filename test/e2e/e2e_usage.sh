@@ -27,5 +27,5 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 cd "$REPO_ROOT"
 export PYTHONPYCACHEPREFIX="$(mktemp -d /tmp/usage-e2e-pycache-XXXXXX)"
-python3 "$SCRIPT_DIR/usage_harness_test.py"
+# Compiler-dependent harness regressions run in scripts/ci-source-checks.sh.
 python3 "$SCRIPT_DIR/usage.py" "$@"
