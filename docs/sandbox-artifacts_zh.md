@@ -622,7 +622,7 @@ E2B memory=true
 ```
 
 
-S/E 后缀几何、确定性 ZIP 编码及 sparse prefix/append 视图由 `accelerator/pkg/tailzip` 实现。Sandbox/Snapshot 模块提供有序角色条目与大小上限，保留 portable config、JSON/state 和设备拓扑校验。逻辑引用位置共用 `manifest.RefLocations`。
+S/E 后缀几何、确定性 ZIP 编码、有序角色条目、大小上限及 sparse prefix/append 视图由 `accelerator/pkg/tailzip` 实现。Sandbox/Snapshot 模块保留 portable config、JSON/state 和设备拓扑校验。逻辑引用位置共用 `manifest.RefLocations`。
 
 ### 引用改写与整链归并
 
