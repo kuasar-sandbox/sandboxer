@@ -18,7 +18,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
-IMAGE="${IMAGE:-busybox:latest}"
+IMAGE="${KUASAR_BUSYBOX_IMAGE:-${IMAGE:-busybox:latest}}"
+if [ "${KUASAR_ARTIFACT_E2E:-0}" = 1 ]; then
+    : "${KUASAR_BUSYBOX_IMAGE:?prepared busybox fixture is required}"
+fi
 TAP_NAME="${TAP_NAME:-sb-xdiff0}"
 
 skip() {
