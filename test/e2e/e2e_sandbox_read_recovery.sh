@@ -57,6 +57,24 @@ wait_file_count() {
     done
     echo "timed out waiting for a new $pattern in $path" >&2; cat "$path" >&2; return 1
 }
+wait_cache_serving() {
+    local pid=$1
+    for _ in $(seq 1 1200); do
+        if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$HEALTH_PORT" > "$WORK/cache-health" 2>&1 \
+            && grep -q SERVING "$WORK/cache-health"; then
+            return
+        fi
+        kill -0 "$pid" 2>/dev/null || {
+            echo "cache-ctl exited before becoming SERVING" >&2
+            cat "$WORK/cache.log" >&2
+            return 1
+        }
+        sleep .05
+    done
+    echo "timed out waiting for cache-ctl to become SERVING" >&2
+    cat "$WORK/cache-health" "$WORK/cache.log" >&2
+    return 1
+}
 connect_failure_count() { grep -c '"event": "connect-failure"' "$WORK/faults.jsonl" 2>/dev/null || true; }
 wait_connect_failures() {
     local before=$1 count=$2 pid=$3 target
@@ -94,11 +112,7 @@ origin:
 YAML
 "$BIN/cache-ctl" serve --config "$WORK/cache.yaml" > "$WORK/cache.log" 2>&1 &
 CACHE_PID=$!; PIDS+=($CACHE_PID)
-for _ in $(seq 1 100); do
-    if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$HEALTH_PORT" > "$WORK/cache-health" 2>&1 && grep -q SERVING "$WORK/cache-health"; then break; fi
-    sleep .1
-done
-grep -q SERVING "$WORK/cache-health"
+wait_cache_serving "$CACHE_PID"
 mode healthy
 python3 "$SCRIPT_DIR/lib/read_fault_proxy.py" "$WORK/proxy.sock" "$CACHE_PORT" "$WORK/mode" "$WORK/faults.jsonl" > "$WORK/proxy.log" 2>&1 &
 PROXY_PID=$!; PIDS+=($PROXY_PID)
@@ -360,11 +374,7 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps(after))
 PY
 "$BIN/cache-ctl" serve --config "$WORK/cache.yaml" >> "$WORK/cache.log" 2>&1 &
 CACHE_PID=$!; PIDS+=($CACHE_PID)
-for _ in $(seq 1 100); do
-    if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$HEALTH_PORT" > "$WORK/cache-health" 2>&1 && grep -q SERVING "$WORK/cache-health"; then break; fi
-    sleep .1
-done
-grep -q SERVING "$WORK/cache-health"
+wait_cache_serving "$CACHE_PID"
 mode healthy
 wait "$CAPTURE_PID"
 NEXT=$(cat "$WORK/next.key")
