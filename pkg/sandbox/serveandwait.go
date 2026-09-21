@@ -581,6 +581,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	// ctl.sock server for snapshot requests. SnapshotHandler is the
 	// shared bundle both Run and restore.Run use.
 	snapHandler := &SnapshotHandler{
+		CheckpointDir:  filepath.Join(p.BaseDir, "checkpoint"),
 		Cfg:            p.SnapCfg,
 		PortableConfig: p.PortableConfig,
 		SourceBinding:  p.SourceBinding,

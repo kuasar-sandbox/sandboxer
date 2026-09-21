@@ -360,7 +360,81 @@ Memory provenance: MemorySourceBinding   -> S/from_refs
 
 These use separate schemas. Re-snapshot can merge disk layers and memory layers independently; an old `SnapshotConfig` cannot be used to modify both graphs together.
 
-Snapshot/export dependency planning materializes only node-local dependencies that lack portable provenance. Remote `manifest://` refs remain unchanged, as do already located file refs. If a logical Manifest comes from a located Bundle, its ref becomes that Bundle's canonical located `@manifest` selector. Consequently a Manifest-backed immutable root image is not duplicated as a new `.overlay` every time a snapshot is saved or published, and located parent chains are not copied into the new publication directory. Unlocated local tarstream/Bundle dependencies are still fully validated and materialized before freeze so the portable root does not depend on the calling node's private paths. Immutable root carriers materialize as `.image`; only root/data writable layers that must be retained as separate dependencies materialize as `.overlay`. The current writable root top is carried by Sandbox E's payload and does not produce another `.overlay`.
+Snapshot/export dependency planning materializes only node-local dependencies that lack portable provenance. Remote `manifest://` refs remain unchanged, as do already located file refs. If a logical Manifest comes from a located Bundle, its ref becomes that Bundle's canonical located `@manifest` selector. Consequently a Manifest-backed immutable root image is not duplicated as a new `.overlay` every time a snapshot is saved or published, and located parent chains are not copied into the new publication directory. Unlocated local tarstream/Bundle dependencies are validated before freeze and materialized when the destination does not already own them so the portable root does not depend on the calling node's private paths. Immutable root carriers materialize as `.image`; only root/data writable layers that must be retained as separate dependencies materialize as `.overlay`. The current writable root top is carried by Sandbox E's payload and does not produce another `.overlay`.
+
+### Managed checkpoint history and selective cleanup
+
+`merge_ref=false` records the current resident working set separately. Starting with
+`S1 -> S0`, the next capture streams a new immutable historical Snapshot
+`S1′ = S1(memory) over S0(memory)` and writes `S2(current working set) -> S1′`.
+Further local captures repeat this composition: at most one owned local memory
+lower remains beneath the newest S. `merge_ref=true` absorbs the current resident
+memory and the entire eligible local prefix; switching false → true → false has
+the same bound. Restore still accepts old multi-layer inputs. Only the newest S
+supplies execution state and `sandbox_ref`; historical S contributes memory only.
+
+The prefix belongs to the current sandbox's canonical `BaseDir/checkpoint`.
+Selection uses complete source bindings and physical Bundle membership before
+comparing paths. A named location or external template is a boundary even if its
+files are on this host, including a mapping to the same pathname. The boundary
+and remaining lower refs preserve their order. Local tarstream, Bundle, and mixed
+carriers follow the same rules. Writable disk chains always absorb their eligible
+same-device local prefix, independently of the memory flag; immutable EROFS bases
+remain separate from ext4 uppers. Data and opaque Zero override lower layers;
+Hole falls through. Historical reads use host artifact streams, never the guest
+memfd, and therefore do not enlarge the captured working set.
+
+History is composed before guest freeze and streamed into the final sink. It
+uses `fetch.NewLayered` and sparse runs without a full-image buffer or intermediate
+image copy. Local output reuses dependencies already owned by that checkpoint through their
+physical selectors. Bundle output keeps its existing member-copy publication path. New history has a new content
+identity; the old source remains valid through sink commit/close and database
+commit. Failed capture or database commit cannot authorize old-file deletion.
+
+After a managed Pause commits its exact S/E pair (or E-only root), the lifecycle
+owner fences the old runner and all readers/writers, then invokes selective
+cleanup. Generic FileSink output, arbitrary `--output`, independent
+`snapshot --resume`, and shared build inputs confer no cleanup rights. The
+sandboxer artifact library interprets the keep set; conductor supplies ownership,
+paths, the committed pair, and the existing lifecycle fences through the
+short-lived `node-ctl checkpoint-cleanup` tool. Portable Export continues to use
+its stored pair without reading artifacts. No token, public result, base format,
+or persistent cleanup schema changes.
+
+The keep set contains current S/E, memory-history carriers, and current disk,
+upper and immutable-base carriers, including reused files. A historical S's old
+E is not a disk dependency. Any needed Bundle member retains its whole physical
+carrier. Source/location binding precedes basename comparison. Selection reads
+only bounded current metadata and Bundle indexes, not old candidate payloads or
+full-image digests; Snapshot CPU/state bodies are not needed by this operation.
+Any keep-plan or reader-close error prevents all deletions. Kernel/runtime basename
+identities bind host-supplied boot files and are not checkpoint payload edges.
+
+Only direct entries in the verified exclusive checkpoint directory are eligible:
+64 lowercase hexadecimal digest/key names with `.snapshot`, `.sandbox`,
+`.overlay`, `.image`, or `.bundle` must be regular files; capture partials must
+exactly match `<producer-SandboxID>.<kind>.<uint32-decimal>.partial` (including
+`bundle`, no leading zeros except `0`); fixed `<sid>.snapshot`/`<sid>.sandbox`
+aliases and `.<sid>.<role>.<32-lowercase-hex>.tmp` must be symlinks with the
+producer's basename target convention. SandboxID is not PathID or StableID.
+Unknown names, other SIDs, prefix collisions, malformed lookalikes, directories,
+and unexpected symlinks remain untouched. Incomplete partial contents need no
+validation. A fixed alias is current only when it names the corresponding committed
+S or E carrier. An E-only root retires its old S alias even when E retains the
+same Bundle. Snapshot capture commits the S alias only; its E identity comes from
+the stored pair, without requiring an E alias. Cleanup unlinks recognized aliases themselves and never follows
+symlinks or recursively removes the directory; directory-fd operations keep
+unlink confined if paths race.
+
+A committed Pause remains successful if cleanup fails. The last durable RunDir
+ownership marker remains until checkpoint cleanup and ordinary paused cleanup
+succeed. The existing worker retries with a freshly loaded current source under
+the SID lifecycle lock, including after restart. Active or detached exports keep
+their read fence; cleanup never waits for an export while holding the lock it
+needs. Resume/Wake/Exec obey the existing pending-cleanup admission contract.
+Missing candidates count as finished; permission, I/O, and identity errors retain
+retry ownership. Ordinary Kill and terminal BuildBaseDir deletion retain their
+existing finalizers. Shared/external artifacts are never reclaimed by this step.
 
 ### 9.2 Local tarstream and crypto
 

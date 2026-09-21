@@ -498,7 +498,7 @@ func TestNormalizeLocalMemoryRefsEmitsSiblingBasenames(t *testing.T) {
 	}
 }
 
-func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
+func TestSnapshotMemoryRefsPreservesUnmergedExternalChain(t *testing.T) {
 	portable := "manifest://" + strings.Repeat("a", 64)
 	wDigest := strings.Repeat("b", 64)
 	bDigest := strings.Repeat("c", 64)
@@ -510,16 +510,7 @@ func TestSnapshotMemoryRefsThreeGenerationWorkingSetChain(t *testing.T) {
 		},
 	}
 
-	merged, err := memoryRefsForSnapshot(binding, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantMerged := []string{"file://b.snapshot@digest:" + bDigest, portable}
-	if strings.Join(merged, ",") != strings.Join(wantMerged, ",") {
-		t.Fatalf("merged memory refs = %v, want %v", merged, wantMerged)
-	}
-
-	workingSet, err := memoryRefsForSnapshot(binding, false)
+	workingSet, err := memoryRefsForSnapshot(binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,11 +537,12 @@ func TestSnapshotMemoryRefsRejectsProspectiveChainOverLimit(t *testing.T) {
 		binding.FromRefs[i] = fmt.Sprintf("file://%064x.snapshot@digest:%064x", i+1, i+1)
 	}
 
-	if _, err := memoryRefsForSnapshot(binding, false); err == nil || !strings.Contains(err.Error(), "exceeds 64 entries") {
+	if _, err := memoryRefsForSnapshot(binding); err == nil || !strings.Contains(err.Error(), "exceeds 64 entries") {
 		t.Fatalf("unmerged memory chain error = %v", err)
 	}
-	if refs, err := memoryRefsForSnapshot(binding, true); err != nil || len(refs) != snapshot.MaxMemoryFromRefs {
-		t.Fatalf("merged memory chain = %d refs, %v", len(refs), err)
+	binding.FromRefs = binding.FromRefs[:snapshot.MaxMemoryFromRefs-1]
+	if refs, err := memoryRefsForSnapshot(binding); err != nil || len(refs) != snapshot.MaxMemoryFromRefs {
+		t.Fatalf("boundary external chain = %d refs, %v", len(refs), err)
 	}
 }
 
@@ -1921,7 +1913,7 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 	defer mfd.Close()
 
 	_, err = handleSnapshotRequest(context.Background(), req, RunOptions{
-		Cfg: cfg, SandboxID: "test",
+		Cfg: cfg, SandboxID: "test", checkpointDir: dir,
 		PortableConfig: snapshotTestLivePortable(t),
 		SourceBinding: &RunSourceBinding{
 			SandboxRef: parentRef, RuntimeRef: parentRef, RelativeDir: dir,
@@ -1936,7 +1928,7 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 			},
 		}}, nil, filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"),
 		"", nil, nil, pinger, nil, func() error { return nil }, nil, discardLogf)
-	if err == nil || !strings.Contains(err.Error(), "disk 0 merge base") {
+	if err == nil || !strings.Contains(err.Error(), "checkpoint disks") {
 		t.Fatalf("disk merge preflight error = %v", err)
 	}
 	if viewCalled {

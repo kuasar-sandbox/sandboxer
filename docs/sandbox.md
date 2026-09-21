@@ -142,7 +142,7 @@ reissued from complete S/E records. Portable Export uses that recorded pair even
 when artifacts are unavailable; it never reads S to discover E.
 
 
-`--drop-caches` belongs only to memory snapshot and defaults to false. `--merge-ref` controls only local memory-parent merging and does not change disk provenance.
+`--drop-caches` belongs only to memory snapshot and defaults to false. `--merge-ref` selects current-plus-one-history working-set capture (`false`) or current-plus-local-history absorption (`true`). Both stop at the current checkpoint ownership boundary. Disk compaction is independent; see [checkpoint history](sandbox-artifacts.md#managed-checkpoint-history-and-selective-cleanup).
 
 A local `snapshot` needs either `--sandbox-id` or `--path-id`. When both are supplied, PathID only selects `RunRoot/PathID/ctl.sock`; no identity consistency check is performed. `--output` may reside on the BaseRoot filesystem, for example `BuildBaseDir/checkpoint`. The running process cleans its own RunDir/owned diffs and does not treat output as a runtime directory to delete.
 
@@ -498,6 +498,8 @@ disk dependencies -> Sandbox E -> Snapshot S
 ```
 
 The Snapshot Bundle's root Manifest is S; the Export Bundle's root is E. E, data/lower Manifests, and S's memory dependencies belong to one planned Bundle graph. Before emitting the metadata prefix, the writer must complete admission, ordered source selection, parent copying, and the ref-replacement plan.
+
+Managed checkpoints additionally precompute immutable historical memory before freeze. After sink commit and close, conductor atomically commits S/E, fences the old runtime and other users, and asks the sandboxer library to remove only obsolete recognized checkpoint files. A failed keep plan or unlink leaves the existing RunDir cleanup marker for retry; the committed Pause remains successful and Resume waits for the established cleanup contract. Standalone output and `snapshot --resume` do not delete history. See the full [history and cleanup contract](sandbox-artifacts.md#managed-checkpoint-history-and-selective-cleanup).
 
 ### 6.2 Freeze sequence and failure recovery
 

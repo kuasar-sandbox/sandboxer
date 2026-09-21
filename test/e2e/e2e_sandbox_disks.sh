@@ -55,7 +55,8 @@ if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 
 WORK=$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-disks-XXXXXX")
 RR=$WORK/runtime; mkdir -p "$RR"
-OUT=$WORK/out; mkdir -p "$OUT"
+BASE_ROOT="$WORK/base"; SID1=dk-1
+OUT="$BASE_ROOT/$SID1/checkpoint"; mkdir -p "$OUT"
 P1=""; P2=""; P3=""; P4=""; TAP_CREATED=0; HIDDEN_PARENT=""; PARENT_SIBLING=""
 cleanup() {
     set +e
@@ -114,10 +115,9 @@ mounts:
 launch: { exec: /bin/sleep, args: ["3600"] }
 EOF
 
-SID1=dk-1
 echo "==> [cold] boot multi-disk sandbox"
 timeout -k 10s 120 "$BIN/sandbox-ctl" run --config "$WORK/cold.yaml" --sandbox-id "$SID1" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RR" > "$WORK/run1.log" 2>&1 &
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RR" --base-root "$BASE_ROOT" > "$WORK/run1.log" 2>&1 &
 P1=$!
 ready() { # $1=sid
     for _ in $(seq 1 90); do
@@ -318,9 +318,9 @@ boot:
     - { name: scratch }
     - { name: dataset, overlay: { diff: file://$WORK/dataset-r.ext4 } }
 EOF
-SID2=dk-2
+SID2="$SID1"
 timeout -k 10s 120 "$BIN/sandbox-ctl" run --restore "$SNAP" --config "$WORK/restore.yaml" --sandbox-id "$SID2" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RR" > "$WORK/run2.log" 2>&1 &
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RR" --base-root "$BASE_ROOT" > "$WORK/run2.log" 2>&1 &
 P2=$!
 ready "$SID2" || { echo "FAIL: restore not ready"; tail -60 "$WORK/run2.log"; exit 1; }
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RR" -- /bin/sh -c 'cat /scratch/persist /data/persist /data/DATASET-OK' > "$WORK/post.out" 2>&1 || true
@@ -351,9 +351,9 @@ for marker in ROOT-W-OK SCRATCH-W-OK DATA-W-OK; do
     grep -q "$marker" "$WORK/w-write.out" \
         || { echo "FAIL: could not write $marker before W capture"; cat "$WORK/w-write.out"; exit 1; }
 done
-WOUT="$WORK/working-set"; mkdir -p "$WOUT"
+WOUT="$OUT"
 # A non-merged local memory parent is an explicit dependency. The unified sink
-# materializes it into the new output before S is committed.
+# reuses it in this sandbox's owned checkpoint before S is committed.
 PARENT_MEMORY_ARTIFACT="$(readlink -f "$SNAP")"
 [ -f "$PARENT_MEMORY_ARTIFACT" ] || { echo "FAIL: parent snapshot target is missing: $PARENT_MEMORY_ARTIFACT"; exit 1; }
 PARENT_MEMORY_BASENAME="$(basename "$PARENT_MEMORY_ARTIFACT")"
@@ -366,7 +366,7 @@ grep -Fq 'quiesce: guest acked (drop_caches=skipped' "$WORK/run2.log" \
     || { tail -60 "$WORK/run2.log"; echo "FAIL: W capture did not report drop_caches=skipped"; exit 1; }
 W="$WOUT/$SID2.snapshot"
 [ -f "$W" ] || { echo "FAIL: no working-set snapshot $W"; exit 1; }
-[ -f "$WOUT/$PARENT_MEMORY_BASENAME" ] || { echo "FAIL: memory parent was not materialized into W output"; exit 1; }
+[ -f "$WOUT/$PARENT_MEMORY_BASENAME" ] || { echo "FAIL: memory parent was not retained in W output"; exit 1; }
 "$BIN/sandbox-ctl" info --json "$W" >"$WORK/w-s-info.json"
 S1_E_REF=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["SandboxRef"])' "$WORK/s1-s-info.json")
 S1_E_BASENAME=$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/s1-s-info.json")
@@ -464,7 +464,7 @@ echo "==> PASS: missing local memory lower failed clearly before VMM start"
 
 SID3=dk-3
 timeout -k 10s 120 "$BIN/sandbox-ctl" run --restore "$W" --config "$WORK/restore-w.yaml" --sandbox-id "$SID3" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RR" > "$WORK/run3.log" 2>&1 &
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RR" --base-root "$BASE_ROOT" > "$WORK/run3.log" 2>&1 &
 P3=$!
 ready "$SID3" || { echo "FAIL: working-set restore not ready"; tail -60 "$WORK/run3.log"; exit 1; }
 guest_mincore_all "$SID3" "$WARM_PATH" >"$WORK/warm-after-restore.out" 2>&1 \

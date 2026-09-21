@@ -130,7 +130,7 @@ Snapshot 始终包含 memory execution state. 一次操作在同一 freeze point
 
 Local human output同时列出 `Snapshot S` 与 `Sandbox E`. Upload stdout 仍只输出 S Manifest key,便于当前 orchestrator parser 使用. `snapshot_done` 同时返回 `snapshot_ref` 与 `sandbox_ref`;既有 `memory_size`、`memory_resident`、pause/dump timing 和 compatibility `overlay_*` response 字段保留. `overlay_*` 当前镜像 E identity,真正 disk graph 只在 E 中.
 
-`--drop-caches` 只属于 memory snapshot,默认 false. `--merge-ref` 只控制 local memory parent merge,不改变 disk provenance.
+`--drop-caches` 只属于 memory snapshot,默认 false. `--merge-ref=false` 独立录制当前工作集并保留一个历史合并层；true 将当前内存与本沙箱 checkpoint 的本地历史前缀合并。两者均在外部归属处停止，磁盘合并不受该开关影响。完整规则见[checkpoint 历史与清理](sandbox-artifacts_zh.md#托管-checkpoint-历史合并与选择性清理)。
 
 local `snapshot` 只需 `--sandbox-id` 或 `--path-id` 之一。两者同时给出时
 PathID 只选择 `RunRoot/PathID/ctl.sock`，不做身份一致性校验。`--output` 可以位于
@@ -501,6 +501,8 @@ disk dependencies -> Sandbox E -> Snapshot S
 ```
 
 Snapshot Bundle root Manifest是 S;Export Bundle root Manifest是 E. E、data/lower Manifest和 S memory dependencies属于同一个 planned Bundle graph. Writer emit metadata prefix前必须完成 admission、ordered source、parent copy和ref replacement plan.
+
+托管 checkpoint 还会在 freeze 前准备不可变历史内存。sink commit 和 close 后，conductor 原子提交 S/E，fence 旧 runtime 与其他使用者，再调用 sandboxer 库仅清理已知且不再需要的 checkpoint 文件。keep plan 或 unlink 失败时，既有 RunDir 收尾标记保留供重试；已提交 Pause 仍成功，Resume 遵守原有 pending-cleanup 合同。独立 output 与 `snapshot --resume` 不删除历史。完整规则见[历史与清理合同](sandbox-artifacts_zh.md#托管-checkpoint-历史合并与选择性清理)。
 
 ### 6.2 Freeze sequence 与 failure recovery
 
