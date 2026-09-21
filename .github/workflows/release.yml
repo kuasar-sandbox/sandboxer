@@ -38,7 +38,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   preflight:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     outputs:
       accelerator_version: ${{ steps.request.outputs.accelerator_version }}
       connector_version: ${{ steps.request.outputs.connector_version }}
@@ -134,7 +134,7 @@ jobs:
     if: github.event.repository.visibility == 'public' && github.event.repository.full_name == github.repository
   build:
     needs: preflight
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
       contents: read
@@ -275,7 +275,7 @@ jobs:
     needs:
       - preflight
       - build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: write
@@ -337,7 +337,7 @@ jobs:
     needs:
       - preflight
       - publish
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       actions: write
