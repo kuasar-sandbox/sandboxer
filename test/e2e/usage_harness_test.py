@@ -60,6 +60,26 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
 
 
 class HarnessProcessTests(unittest.TestCase):
+    def test_artifact_probe_reuses_prepared_bytes_without_a_compiler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            probe, output = Path(directory) / "prepared", Path(directory) / "probe"
+            probe.write_bytes(b"prepared target probe")
+            probe.chmod(0o755)
+            with patch.dict(os.environ, {"KUASAR_ARTIFACT_E2E": "1", "USAGE_PROBE_BIN": str(probe)}), \
+                 patch.object(usage, "run", side_effect=AssertionError("compiler must not run")):
+                usage.build_probe(output)
+                self.assertEqual(output.read_bytes(), probe.read_bytes())
+                self.assertEqual(output.stat().st_mode & 0o777, 0o755)
+                probe.unlink()
+                with self.assertRaisesRegex(AssertionError, "missing prepared usage probe"):
+                    usage.build_probe(output)
+
+    def test_artifact_probe_cannot_fall_back_to_source(self):
+        with patch.dict(os.environ, {"KUASAR_ARTIFACT_E2E": "1", "USAGE_PROBE_BIN": ""}), \
+             patch.object(usage, "run", side_effect=AssertionError("compiler must not run")):
+            with self.assertRaisesRegex(AssertionError, "requires USAGE_PROBE_BIN"):
+                usage.build_probe(Path("unused"))
+
     def test_explicit_goroot_wins_over_reset_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

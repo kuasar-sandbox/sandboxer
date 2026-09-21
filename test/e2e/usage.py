@@ -40,6 +40,14 @@ def run(*args, timeout=60, **kw):
 
 
 def build_probe(output, source=None):
+    prepared = os.environ.get("USAGE_PROBE_BIN")
+    if prepared and source is None:
+        probe = Path(prepared)
+        assert probe.is_file() and os.access(probe, os.X_OK), "missing prepared usage probe"
+        shutil.copyfile(probe, output)
+        Path(output).chmod(0o755)
+        return ""
+    assert os.environ.get("KUASAR_ARTIFACT_E2E") != "1", "artifact E2E requires USAGE_PROBE_BIN"
     source = source or Path(__file__).parent / "usageprobe/main.go"
     return run(GO, "build", "-trimpath", "-o", output, source,
                env={**os.environ, "CGO_ENABLED": "0", "GOWORK": "off"})
@@ -349,8 +357,8 @@ def main():
     work = Path(tempfile.mkdtemp(prefix="e2e-usage-"))
     print(f"usage evidence: {work}", flush=True)
     # Only small evidence files enter the CI artifact, not disk/runtime images.
-    # The packaged suite has no Git checkout/go.mod; compile the stdlib-only
-    # probe by filename and record binary build identities in both layouts.
+    # Artifact E2E copies its already validated probe; developer source runs can
+    # compile the stdlib-only helper. Record binary identities in both layouts.
     if os.environ.get("KUASAR_CI_DIR"):
         evidence = Path(os.environ["KUASAR_CI_DIR"]) / "usage"
         def collect_evidence():

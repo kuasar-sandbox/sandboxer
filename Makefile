@@ -8,7 +8,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench test-e2e release test-release clean help
+.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench e2e-usage-probe test-e2e release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -37,6 +37,7 @@ GO_BUILD_FLAGS := -trimpath
 BINDIR         := bin/$(TARGET_ARCH)
 BUILD_DIR      := build/$(TARGET_ARCH)
 E2E_BIN        ?= $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
+E2E_FIXTURE_DIR ?= $(abspath build/e2e-tools/$(TARGET_ARCH))
 
 define link_bin
 @if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
@@ -91,9 +92,14 @@ clean:
 bench:
 	CGO_ENABLED=0 $(GO) test -bench=. -benchmem -run=^$$ ./...
 
-test-e2e:
+e2e-usage-probe:
+	@mkdir -p "$(E2E_FIXTURE_DIR)"
+	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
+		-o "$(E2E_FIXTURE_DIR)/usage-probe" test/e2e/usageprobe/main.go
+
+test-e2e: e2e-usage-probe
 	bash scripts/ci-source-checks.sh
-	BIN="$(E2E_BIN)" bash test/e2e/run_all.sh
+	BIN="$(E2E_BIN)" USAGE_PROBE_BIN="$(E2E_FIXTURE_DIR)/usage-probe" bash test/e2e/run_all.sh
 
 VERSION ?= v0.1.0
 ACCELERATOR_VERSION ?= v0.1.3
