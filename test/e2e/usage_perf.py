@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 
-from usage import BIN, GO, REPO, Sandbox, build_probe, digest, ext4, image_ref, run, write_json
+from usage import BIN, GO, REPO, Sandbox, build_probe, digest, ext4, image_ref, run, write_json, runtime_init_digest
 
 
 def percentile(values, q):
@@ -163,7 +163,7 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g, 
                 sandboxes.append(sb)
                 sb.ready()
                 guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
-                assert guest["sandbox_init_sha256"] == digest(BIN / "sandbox-init")
+                assert guest["sandbox_init_sha256"] == runtime_init_digest(digest(BIN / "sandbox-init"))
                 write_json(sb.dir / "guest.json", guest)
             time.sleep(3)
             hosts = [s.process.pid for s in sandboxes]

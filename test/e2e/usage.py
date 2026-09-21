@@ -72,6 +72,14 @@ def image_ref(path):
     return f"file://{path}@digest:{names[0].removeprefix('.kuasar.digest.')}"
 
 
+def runtime_init_digest(standalone):
+    if os.environ.get("KUASAR_ARTIFACT_E2E") == "1":
+        expected = os.environ.get("KUASAR_EXPECTED_RUNTIME_INIT_SHA256", "")
+        assert re.fullmatch(r"[0-9a-f]{64}", expected), "missing validated runtime init identity"
+        return expected
+    return standalone
+
+
 def ext4(path, root=None):
     with path.open("wb") as f:
         f.truncate(256 * 1024 * 1024)
@@ -424,7 +432,7 @@ def main():
             sb.ready()
             inspect = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
             write_json(sb.dir / "guest.json", inspect)
-            assert inspect["sandbox_init_sha256"] == metadata["artifacts"]["sandbox-init"], "runtime bundle does not contain the selected sandbox-init"
+            assert inspect["sandbox_init_sha256"] == runtime_init_digest(metadata["artifacts"]["sandbox-init"]), "runtime bundle does not contain the selected sandbox-init"
             assert inspect["balloon_proc_field"] == "false", "this case requires the unpatched Balloon proc ABI"
             assert "pagesets" in inspect["zoneinfo"] and "count:" in inspect["zoneinfo"], "PCP source missing"
             time.sleep(2.2)

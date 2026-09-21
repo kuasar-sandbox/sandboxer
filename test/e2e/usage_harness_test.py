@@ -60,6 +60,17 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
 
 
 class HarnessProcessTests(unittest.TestCase):
+    def test_artifact_guest_identity_uses_validated_runtime_payload(self):
+        standalone, embedded = "a" * 64, "b" * 64
+        with patch.dict(os.environ, {"KUASAR_ARTIFACT_E2E": "1", "KUASAR_EXPECTED_RUNTIME_INIT_SHA256": embedded}):
+            self.assertEqual(usage.runtime_init_digest(standalone), embedded)
+            for invalid in ("", "latest", "x" * 64):
+                with patch.dict(os.environ, {"KUASAR_EXPECTED_RUNTIME_INIT_SHA256": invalid}):
+                    with self.assertRaisesRegex(AssertionError, "missing validated runtime init"):
+                        usage.runtime_init_digest(standalone)
+        with patch.dict(os.environ, {"KUASAR_ARTIFACT_E2E": ""}):
+            self.assertEqual(usage.runtime_init_digest(standalone), standalone)
+
     def test_artifact_probe_reuses_prepared_bytes_without_a_compiler(self):
         with tempfile.TemporaryDirectory() as directory:
             probe, output = Path(directory) / "prepared", Path(directory) / "probe"

@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-from usage import BIN, GO, Sandbox, build_probe, digest, ext4, image_ref, kill_host_and_stop_ch, metric, run, write_json
+from usage import BIN, GO, Sandbox, build_probe, digest, ext4, image_ref, kill_host_and_stop_ch, metric, run, write_json, runtime_init_digest
 
 
 def inject(sb, syscall, action):
@@ -133,7 +133,7 @@ def main():
                 continue
             sb.ready()
             guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
-            assert guest["sandbox_init_sha256"] == metadata["artifacts"]["sandbox-init"]
+            assert guest["sandbox_init_sha256"] == runtime_init_digest(metadata["artifacts"]["sandbox-init"])
             write_json(sb.dir / "guest.json", guest)
             time.sleep(5.5)
             before = sb.view()
