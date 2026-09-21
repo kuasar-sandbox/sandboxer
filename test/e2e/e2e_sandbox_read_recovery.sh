@@ -20,6 +20,14 @@ cleanup() {
     for sid in "${SESSIONS[@]}"; do readiness_kill_session KILL "$sid"; done
     for pid in $(jobs -pr); do kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; done
     echo "read-recovery evidence: $WORK (exit=$result)"
+    if [ "$result" -ne 0 ]; then
+        for evidence in faults.jsonl recovered.log recovered.snapshot.log verified.log fatal.snapshot.log cache.log proxy.log; do
+            if [ -s "$WORK/$evidence" ]; then
+                echo "==> read-recovery failure evidence: $evidence" >&2
+                tail -80 "$WORK/$evidence" >&2 || true
+            fi
+        done
+    fi
     if [ "$result" -eq 0 ] && [ -z "${E2E_KEEP:-}" ]; then rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
@@ -317,25 +325,28 @@ launch recovered --restore "manifest://$SNAP" --config "$WORK/host.yaml"
 wait_file "$WORK/recovered.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- /bin/true
 # Stop the restored workload at an observable application barrier before the
-# capture outage. With no Guest UFFD/COW demand left running, a source fault
-# observed after the exec fence belongs to the capture lifecycle.
+# outage. The snapshot contract does not require every capture to fetch a
+# remote chunk: clean lower pages may remain referenced. Instead, deliberately
+# create one real restored-Guest source read first, then request snapshot while
+# that read is known to be retrying. This directly proves snapshot/inflight
+# ordering without depending on page residency or the source image layout.
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'touch /recovery.idle'
 wait_file "$WORK/recovered.log" '^RECOVERY-IDLE$' "$RUN_PID"
-# The workload is now quiescent and no Guest source demand is running. Take the
-# baseline before starting snapshot; the first later source fault is therefore
-# caused by this capture, including faults in its pre-quiesce dependency work.
 CAPTURE_FAULT_BASE=$(fault_count)
 mode offline
+"$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- rm -f /recovery.idle > "$WORK/recovered-resume.log" 2>&1 &
+RESUME_PID=$!
+wait_new_fault "$CAPTURE_FAULT_BASE" "$RUN_PID"
+kill -0 "$RUN_PID"
+
 "$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
 CAPTURE_PID=$!
-wait_new_fault "$CAPTURE_FAULT_BASE" "$CAPTURE_PID"
-kill -0 "$RUN_PID"; kill -0 "$CAPTURE_PID"
+kill -0 "$CAPTURE_PID"
 [ ! -s "$WORK/next.key" ]
 
-# Reuse this same real capture to prove prolonged endpoint loss remains pending,
-# retries without leaking host resources, and recovers on the same endpoint.
-# Waiting for 12 failed reconnects exceeds the +8 FD/thread allowance, so a
-# one-resource-per-retry leak cannot hide inside the permitted baseline noise.
+# Keep the real read pending across repeated reconnects. The snapshot request
+# must remain pending behind the same runtime boundary, and retry attempts must
+# not leak one host resource per retry.
 kill -TERM "$CACHE_PID"; wait "$CACHE_PID"
 RETRY_BASE=$(connect_failure_count)
 python3 - "$RUN_PID" "$PROXY_PID" "$WORK/resources.before.json" <<'PY'
@@ -366,6 +377,8 @@ for _ in $(seq 1 100); do
 done
 grep -q SERVING "$WORK/cache-health"
 mode healthy
+wait "$RESUME_PID"
+wait_file "$WORK/recovered.log" '^RECOVERY-RESUMED$' "$RUN_PID"
 wait "$CAPTURE_PID"
 NEXT=$(cat "$WORK/next.key")
 [ "${#NEXT}" -eq 64 ]; wait "$RUN_PID"
@@ -398,19 +411,22 @@ done
 wait_file "$WORK/verified.log" '^RECOVERY-RESUMED$' "$RUN_PID"
 wait_file "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
-# Re-enter the same observable idle state so the fatal capture has no
-# concurrent Guest source demand.
+# Re-enter the observable idle state, then create a real pending restored-Guest
+# source read before asking for the fatal capture. The corrupt response is thus
+# tied to an actual inflight read while snapshot is waiting, not to an
+# assumption that capture itself must fetch a lower page.
 VERIFIED_IDLE_BASE=$(grep -cE '^RECOVERY-IDLE$' "$WORK/verified.log" 2>/dev/null || true)
 "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- touch /recovery.idle
 wait_file_count "$WORK/verified.log" '^RECOVERY-IDLE$' "$VERIFIED_IDLE_BASE" "$RUN_PID"
-# A complete corrupt immutable response is a deterministic failure while an
-# idle restored Guest is in capture. With the workload already at RECOVERY-IDLE,
-# a new post-fence source fault is capture-specific.
 FATAL_FAULT_BASE=$(fault_count)
 mode offline
+"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- rm -f /recovery.idle > "$WORK/fatal-resume.log" 2>&1 &
+FATAL_RESUME_PID=$!
+wait_new_fault "$FATAL_FAULT_BASE" "$RUN_PID"
+kill -0 "$RUN_PID"
+
 "$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
 FATAL_CAPTURE_PID=$!
-wait_new_fault "$FATAL_FAULT_BASE" "$FATAL_CAPTURE_PID"
 kill -0 "$FATAL_CAPTURE_PID"
 [ ! -s "$WORK/fatal.key" ]
 mode corrupt
@@ -418,6 +434,7 @@ wait_file "$WORK/faults.jsonl" '"mode": "corrupt"' "$RUN_PID"
 for _ in $(seq 1 200); do kill -0 "$RUN_PID" 2>/dev/null || break; sleep .05; done
 if kill -0 "$RUN_PID" 2>/dev/null; then echo "fatal did not stop sandbox" >&2; exit 1; fi
 if wait "$RUN_PID"; then echo "fatal returned success" >&2; exit 1; fi
+wait "$FATAL_RESUME_PID" 2>/dev/null || true
 if wait "$FATAL_CAPTURE_PID"; then echo "fatal capture returned success" >&2; exit 1; fi
 [ ! -s "$WORK/fatal.key" ]
 if pgrep -s "$RUN_PID" -x cloud-hyperviso >/dev/null; then
