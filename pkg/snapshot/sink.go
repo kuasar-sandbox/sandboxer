@@ -163,7 +163,7 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 	if s.required && s.codec == nil {
 		return "", "", "", fmt.Errorf("pack %s: required policy has no codec", kind)
 	}
-	f, err := os.CreateTemp(s.outDir, s.sandboxID+"."+kind+".*.partial")
+	f, err := os.CreateTemp(s.outDir, artifactPartialPattern(s.sandboxID, kind))
 	if err != nil {
 		return "", "", "", err
 	}
@@ -350,7 +350,7 @@ func NewPlannedBundleSink(outDir, sandboxID string, cfg *manifest.Config, keyFn 
 	if err := validateArtifactAliasID(sandboxID); err != nil {
 		return nil, fmt.Errorf("snapshot Bundle: %w", err)
 	}
-	f, err := os.CreateTemp(outDir, sandboxID+".bundle.*.partial")
+	f, err := os.CreateTemp(outDir, artifactPartialPattern(sandboxID, "bundle"))
 	if err != nil {
 		return nil, fmt.Errorf("snapshot Bundle temporary file: %w", err)
 	}
@@ -702,11 +702,11 @@ func commitArtifactAlias(ctx context.Context, outDir, sandboxID, role, artifactP
 
 func createAliasSymlink(outDir, sandboxID, role, target string) (string, error) {
 	for attempt := 0; attempt < 16; attempt++ {
-		var suffix [16]byte
+		var suffix [artifactAliasRandomBytes]byte
 		if _, err := rand.Read(suffix[:]); err != nil {
 			return "", fmt.Errorf("create %s alias randomness: %w", role, err)
 		}
-		path := filepath.Join(outDir, "."+sandboxID+"."+role+"."+hex.EncodeToString(suffix[:])+".tmp")
+		path := filepath.Join(outDir, artifactAliasTempPrefix(sandboxID, role)+hex.EncodeToString(suffix[:])+".tmp")
 		if err := os.Symlink(target, path); err == nil {
 			return path, nil
 		} else if !os.IsExist(err) {

@@ -48,8 +48,9 @@ import (
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
-	usageSampler *usage.Sampler
-	Cfg          *config.SandboxConfig
+	checkpointDir string // runtime-owned checkpoint provenance; never serialized
+	usageSampler  *usage.Sampler
+	Cfg           *config.SandboxConfig
 	// PortableConfig is immutable C0. nil selects projection from an explicit
 	// cold config; non-nil selects a Sandbox source and requires SourceBinding.
 	PortableConfig *config.PortableSandboxConfig
@@ -1460,6 +1461,7 @@ func (q *allQuiescer) Resume() {
 // that owns the bundle holds references; the snapshot path consumes
 // them when a request arrives.
 type SnapshotHandler struct {
+	CheckpointDir  string // derived from the owning VM BaseDir
 	usageSampler   *usage.Sampler
 	Cfg            *config.SandboxConfig
 	PortableConfig *config.PortableSandboxConfig
@@ -1541,8 +1543,8 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 	}
 	defer func() { h.capture.finish((err == nil && !req.ResumeAfter) || isTerminalCaptureError(err)) }()
 	opts := RunOptions{
-		usageSampler: h.usageSampler,
-		Cfg:          h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
+		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir,
+		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
@@ -1567,8 +1569,8 @@ func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExi
 	}
 	defer func() { h.capture.finish((err == nil && !req.ResumeAfter) || isTerminalCaptureError(err)) }()
 	opts := RunOptions{
-		usageSampler: h.usageSampler,
-		Cfg:          h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
+		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir,
+		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
@@ -1662,39 +1664,9 @@ func handleExportRequest(
 		}
 	}
 
-	mergeBaseOpener := newDiskMergeBaseOpener(opts)
-	diffs := make([]snapshot.DiskDiff, len(disks))
-	diskMerged := make([]bool, len(disks))
-	for i, disk := range disks {
-		diff := snapshot.DiskDiff{Path: disk.DiffPath, Owned: disk.OwnedDiff, SnapshotView: disk.SnapshotView, CheckError: disk.CheckError}
-		parentRef, parentPath, parentErr := currentDiskParentBinding(opts, i)
-		if parentErr != nil {
-			return ctl.Response{}, fmt.Errorf("export: disk %d parent binding: %w", i, parentErr)
-		}
-		if parentRef != "" {
-			parsed, parseErr := manifest.ParseRef(parentRef)
-			if parseErr != nil {
-				return ctl.Response{}, fmt.Errorf("export: disk %d parent ref: %w", i, parseErr)
-			}
-			switch {
-			case parsed.Scheme == manifest.RefSchemeFile && parsed.DigestScheme != "manifest":
-				diff.MergeBase, err = resolvedLocalMergeRef(parentPath, parentRef)
-				diskMerged[i] = err == nil
-			case parsed.Scheme == manifest.RefSchemeManifest && activeBundleSource(opts) != nil:
-				diff.MergeBase, diskMerged[i], err = bundleManifestMergeRef(ctx, parentRef, opts)
-			}
-			if err != nil {
-				return ctl.Response{}, fmt.Errorf("export: disk %d merge base identity: %w", i, err)
-			}
-		}
-		if diskMerged[i] {
-			if err := snapshot.ValidateMergeBaseWithOpener(ctx, diff.MergeBase, disk.Size, opts.LocalCodec, opts.LocalRequired, mergeBaseOpener); err != nil {
-				return ctl.Response{}, fmt.Errorf("export: disk %d merge base: %w", i, err)
-			}
-		} else {
-			diff.MergeBase = ""
-		}
-		diffs[i] = diff
+	opts, diffs, diskMerged, mergeBaseOpener, err := prepareCheckpointDisks(ctx, opts, disks)
+	if err != nil {
+		return ctl.Response{}, fmt.Errorf("export: checkpoint disks: %w", err)
 	}
 	prospectiveParentRef := ""
 	if opts.SourceBinding != nil {
@@ -1969,23 +1941,6 @@ func handleSnapshotRequest(
 	if err != nil {
 		return ctl.Response{}, err
 	}
-	memoryBinding := opts.MemoryBinding
-	localParent := false
-	if memoryBinding != nil && memoryBinding.SnapshotRef != "" {
-		parentRef, parseErr := manifest.ParseRef(memoryBinding.SnapshotRef)
-		if parseErr != nil {
-			return ctl.Response{}, fmt.Errorf("parent snapshot ref: %w", parseErr)
-		}
-		localParent = parentRef.Scheme == manifest.RefSchemeFile && parentRef.DigestScheme != "manifest"
-		if memoryBinding.RuntimeRef != "" {
-			runtimeRef, runtimeErr := manifest.ParseRef(memoryBinding.RuntimeRef)
-			if runtimeErr != nil {
-				return ctl.Response{}, fmt.Errorf("parent snapshot runtime ref: %w", runtimeErr)
-			}
-			localParent = runtimeRef.Scheme == manifest.RefSchemeFile && runtimeRef.DigestScheme != "manifest"
-		}
-	}
-
 	// Finish every predictable request/artifact/directory check before pausing
 	// forwards or the pinger and, critically, before asking the guest to freeze.
 	if err := validateSandboxID(opts.SandboxID); err != nil {
@@ -2031,8 +1986,6 @@ func handleSnapshotRequest(
 		return ctl.Response{}, fmt.Errorf("snapshot: runtime disk count %d does not match configured disk count %d",
 			len(disks), 1+len(opts.Cfg.Boot.Disks))
 	}
-	mergeBaseOpener := newDiskMergeBaseOpener(opts)
-	memoryMergeBaseOpener := newMemoryMergeBaseOpener(opts)
 	var bundleSink *snapshot.BundleSink
 	var bundleAdmission store.WriteAdmission
 
@@ -2053,52 +2006,9 @@ func handleSnapshotRequest(
 		}
 	}
 
-	diffs := make([]snapshot.DiskDiff, len(disks))
-	diskMerged := make([]bool, len(disks))
-	for i, d := range disks {
-		dd := snapshot.DiskDiff{
-			Path:         d.DiffPath,
-			Owned:        d.OwnedDiff,
-			SnapshotView: d.SnapshotView,
-			CheckError:   d.CheckError,
-		}
-		if dd.SnapshotView == nil {
-			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q has no snapshot view", i, dd.Path)
-		}
-		if d.Size <= 0 {
-			return ctl.Response{}, fmt.Errorf("snapshot: disk %d diff %q has invalid logical size %d", i, dd.Path, d.Size)
-		}
-		diffSize := d.Size
-		parentDiskRef, parentDiskPath, parentErr := currentDiskParentBinding(opts, i)
-		if parentErr != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot: disk %d parent binding: %w", i, parentErr)
-		}
-		mergeDisk := false
-		if parentDiskRef != "" {
-			ref, parseErr := manifest.ParseRef(parentDiskRef)
-			if parseErr != nil {
-				return ctl.Response{}, fmt.Errorf("snapshot: disk %d parent ref: %w", i, parseErr)
-			}
-			switch {
-			case ref.Scheme == manifest.RefSchemeFile && ref.DigestScheme != "manifest":
-				dd.MergeBase, err = resolvedLocalMergeRef(parentDiskPath, parentDiskRef)
-				mergeDisk = err == nil
-			case mergeRef && ref.Scheme == manifest.RefSchemeManifest:
-				dd.MergeBase, mergeDisk, err = bundleManifestMergeRef(ctx, parentDiskRef, opts)
-			}
-			if err != nil {
-				return ctl.Response{}, fmt.Errorf("snapshot: disk %d merge base identity: %w", i, err)
-			}
-		}
-		if mergeDisk {
-			if err := snapshot.ValidateMergeBaseWithOpener(ctx, dd.MergeBase, diffSize, opts.LocalCodec, opts.LocalRequired, mergeBaseOpener); err != nil {
-				return ctl.Response{}, fmt.Errorf("snapshot: disk %d merge base: %w", i, err)
-			}
-			diskMerged[i] = true
-		} else {
-			dd.MergeBase = ""
-		}
-		diffs[i] = dd
+	opts, diffs, diskMerged, mergeBaseOpener, err := prepareCheckpointDisks(ctx, opts, disks)
+	if err != nil {
+		return ctl.Response{}, fmt.Errorf("snapshot: checkpoint disks: %w", err)
 	}
 	prospectiveParentRef := ""
 	if opts.SourceBinding != nil {
@@ -2108,34 +2018,16 @@ func handleSnapshotRequest(
 		return ctl.Response{}, fmt.Errorf("snapshot: prospective C1: %w", err)
 	}
 
-	mergeMemory := false
-	memoryMergeBase := ""
-	if localParent && mergeRef {
-		if memoryBinding == nil || memoryBinding.RuntimeRef == "" {
-			return ctl.Response{}, fmt.Errorf("snapshot: local parent lacks a memory merge path")
-		}
-		memoryMergeBase, err = resolvedBindingMergeRef(memoryBinding.RuntimeRef, memoryBinding.RelativeDir, opts.RefLocations)
-		if err != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot: memory merge base identity: %w", err)
-		}
-		if err := snapshot.ValidateMergeBaseWithOpener(ctx, memoryMergeBase, int64(mfd.Size()), opts.LocalCodec, opts.LocalRequired, memoryMergeBaseOpener); err != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot: memory merge base: %w", err)
-		}
-		mergeMemory = true
-	} else if mergeRef && memoryBinding != nil && memoryBinding.BundleSource != nil && memoryBinding.SnapshotRef != "" {
-		memoryMergeBase, mergeMemory, err = bundleMemoryManifestMergeRef(ctx, memoryBinding.SnapshotRef, opts)
-		if err != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot: Bundle memory merge base identity: %w", err)
-		}
-		if mergeMemory {
-			if err := snapshot.ValidateMergeBaseWithOpener(ctx, memoryMergeBase, int64(mfd.Size()), opts.LocalCodec, opts.LocalRequired, memoryMergeBaseOpener); err != nil {
-				return ctl.Response{}, fmt.Errorf("snapshot: Bundle memory merge base: %w", err)
-			}
-		}
-	}
-	resultMemoryRefs, err := memoryRefsForSnapshot(memoryBinding, mergeMemory)
+	history, err := prepareMemoryHistory(ctx, opts, mergeRef, uint64(mfd.Size()))
 	if err != nil {
-		return ctl.Response{}, err
+		return ctl.Response{}, fmt.Errorf("snapshot: memory history: %w", err)
+	}
+	defer func() { err = errors.Join(err, history.Close()) }()
+	resultMemoryRefs := history.refs
+	mergeMemory, memoryMergeBase := history.base != "", history.base
+	memoryMergeBaseOpener := newMemoryMergeBaseOpener(opts)
+	if mergeMemory {
+		memoryMergeBaseOpener = func(context.Context, string) (fetch.Stream, error) { return history.memory, nil }
 	}
 	var (
 		dependencyPlan        *snapshotBundlePlan
@@ -2209,6 +2101,14 @@ func handleSnapshotRequest(
 	}
 
 	cfg := opts.Cfg
+	var historicalRef string
+	if history.historical != nil {
+		var writeErr error
+		historicalRef, _, writeErr = sink.AbsorbSnapshot(ctx, history.historical)
+		if closeErr := history.Close(); writeErr != nil || closeErr != nil {
+			return ctl.Response{}, errors.Join(writeErr, closeErr)
+		}
+	}
 	captureC0 := opts.PortableConfig
 	captureMemoryRefs := append([]string(nil), resultMemoryRefs...)
 	captureParentSandboxRef := ""
@@ -2228,6 +2128,9 @@ func handleSnapshotRequest(
 				captureMemoryRefs[i] = replacement
 			}
 		}
+	}
+	if historicalRef != "" {
+		captureMemoryRefs = append([]string{historicalRef}, captureMemoryRefs...)
 	}
 	if err := validateProspectiveMemoryConfig(captureMemoryRefs); err != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: rewritten memory config: %w", err)
@@ -2965,6 +2868,9 @@ func prepareSnapshotDependencyPlan(
 			return nil, fmt.Errorf("prepare %s %q: %w", dependency.role, raw, err)
 		}
 		portable, retain, err := portableSnapshotDependencyRef(ctx, dependency, reader, opts)
+		if err == nil && !retain && !bundleTarget {
+			portable, retain, err = retainedCheckpointDependency(ctx, dependency, opts, outputDir)
+		}
 		if err != nil {
 			return nil, errors.Join(fmt.Errorf("retain %s %q: %w", dependency.role, raw, err), prepared.Close())
 		}
@@ -3480,16 +3386,13 @@ func resolveBundleArtifactPath(ref manifest.Ref, raw string, known map[string]st
 	return "", fmt.Errorf("snapshot Bundle cannot resolve unlocated local ref %q before pause", raw)
 }
 
-// memoryRefsForSnapshot returns the memory lowers retained by the next S. A
-// merge replaces only the direct parent S; its existing lowers remain in order.
-func memoryRefsForSnapshot(binding *MemorySourceBinding, mergeParent bool) ([]string, error) {
+// memoryRefsForSnapshot retains an unmerged chain (including external lowers).
+// Owned prefix composition is performed by prepareMemoryHistory before this.
+func memoryRefsForSnapshot(binding *MemorySourceBinding) ([]string, error) {
 	if binding == nil {
 		return nil, nil
 	}
 	refs := prependRef(binding.SnapshotRef, binding.FromRefs)
-	if mergeParent {
-		refs = append([]string(nil), binding.FromRefs...)
-	}
 	normalized, err := normalizeLocalMemoryRefs(refs)
 	if err != nil {
 		return nil, err

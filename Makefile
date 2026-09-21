@@ -77,6 +77,7 @@ test:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-rust.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	python3 scripts/test_e2e_upload_restore_tick.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_disks_restore.py
 	CGO_ENABLED=0 $(GO) test ./...
 
 vet:
