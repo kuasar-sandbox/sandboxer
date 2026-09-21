@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
@@ -330,5 +332,228 @@ func TestCheckpointDisksMergeContiguousPrefixAndPreserveEROFS(t *testing.T) {
 	_, _, merged, _, err = prepareCheckpointDisks(ctx, opts, []SnapDiskRef{disk})
 	if err != nil || merged[0] {
 		t.Fatalf("located disk parent absorbed: %v %v", merged, err)
+	}
+}
+
+// Map failures are deliberately invisible to Snapshot's tail reader. This
+// models the gap between opening S and validating its composed memory base.
+type checkpointMapStream struct {
+	sparse.Source
+	runAt    func(uint64, uint64) (sparse.Run, error)
+	maps     int
+	reads    int
+	closes   int
+	closeErr error
+}
+
+func (s *checkpointMapStream) RunAt(offset, limit uint64) (sparse.Run, error) {
+	s.maps++
+	var run sparse.Run
+	var err error
+	if s.runAt != nil {
+		run, err = s.runAt(offset, limit)
+	} else {
+		run, err = s.Source.RunAt(offset, limit)
+	}
+	if err != nil || run == nil {
+		return run, err
+	}
+	return checkpointMapRun{Run: run, owner: s}, nil
+}
+
+type checkpointMapRun struct {
+	sparse.Run
+	owner *checkpointMapStream
+}
+
+func (r checkpointMapRun) ReadAt(ctx context.Context, b []byte, offset uint64) (int, error) {
+	r.owner.reads++
+	if r.owner.closes != 0 {
+		return 0, fmt.Errorf("run read after close")
+	}
+	return r.Run.ReadAt(ctx, b, offset)
+}
+
+func (s *checkpointMapStream) ReadAt(ctx context.Context, b []byte, offset uint64) (int, error) {
+	s.reads++
+	if s.closes != 0 {
+		return 0, fmt.Errorf("read after close")
+	}
+	return s.Source.ReadAt(ctx, b, offset)
+}
+
+func (s *checkpointMapStream) Close() error {
+	s.closes++
+	return s.closeErr
+}
+
+type checkpointNonprogressRun struct{ sparse.Run }
+
+func (r checkpointNonprogressRun) End() uint64 { return r.Offset() }
+
+func TestCheckpointMemoryMergePreflight(t *testing.T) {
+	mapErr := errors.New("composed memory map failed")
+	closeErr := errors.New("memory close failed")
+	for _, tc := range []struct {
+		name    string
+		mode    string
+		lower   bool
+		want    error
+		invalid bool
+	}{
+		{name: "live reader"},
+		{name: "permanent top map", mode: "error", want: mapErr},
+		{name: "permanent lower map", mode: "error", lower: true, want: mapErr},
+		{name: "nil run", mode: "nil", invalid: true},
+		{name: "nonprogressing lower run", mode: "nonprogress", lower: true, invalid: true},
+		{name: "retry lower map", mode: "retry", lower: true},
+		{name: "canceled before map", mode: "precancel", want: context.Canceled},
+		{name: "canceled during retry", mode: "cancel", lower: true, want: context.Canceled},
+		{name: "size", mode: "size", invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			body := bytes.Repeat([]byte{0x35}, 4096)
+			stream := &checkpointMapStream{Source: sparse.Dense(bytes.NewReader(body), uint64(len(body))), closeErr: closeErr}
+			stream.runAt = func(offset, limit uint64) (sparse.Run, error) {
+				switch tc.mode {
+				case "error":
+					return nil, readerr.Mark(mapErr, false)
+				case "nil":
+					return nil, nil
+				case "nonprogress":
+					run, err := stream.Source.RunAt(offset, limit)
+					return checkpointNonprogressRun{run}, err
+				case "retry":
+					if stream.maps == 1 {
+						return nil, mapErr
+					}
+				case "cancel":
+					cancel()
+					return nil, mapErr
+				}
+				return stream.Source.RunAt(offset, limit)
+			}
+			cfg, err := snapshot.MarshalConfig(&snapshot.Config{Version: snapshot.SnapshotConfigVersion, SandboxRef: "manifest://" + strings.Repeat("a", 64)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			logical, err := snapshotfile.BuildSource(stream, []byte("{}"), []byte("{}"), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, err := snapshotfile.Open(ctx, &checkpointSourceStream{Source: logical, close: stream.Close})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stream.maps != 0 || stream.reads != 0 {
+				t.Fatal("opening the S tail inspected memory")
+			}
+			layers := []fetch.Stream{root.Memory}
+			if tc.mode == "nil" || tc.mode == "nonprogress" {
+				// Inject malformed runs at the composed memory boundary itself.
+				// Tail sections reject these earlier as ordinary retryable errors.
+				layers[0] = stream
+			}
+			if tc.lower {
+				hole, err := sparse.NewSource(bytes.NewReader(body), uint64(len(body)), []sparse.Extent{{Size: uint64(len(body))}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				layers = append([]fetch.Stream{&lifecycleArtifactStream{Source: hole}}, layers...)
+			}
+			h := &memoryHistory{base: "file://parent.snapshot", memory: &checkpointStream{Stream: fetch.NewLayered(layers...)}}
+			if tc.mode == "precancel" {
+				cancel()
+			}
+			size := uint64(len(body))
+			if tc.mode == "size" {
+				size++
+			}
+			err = h.validateMergeBase(ctx, size)
+			if tc.want != nil {
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("preflight = %v, want %v", err, tc.want)
+				}
+			} else if tc.invalid {
+				if err == nil {
+					t.Fatal("invalid memory map/size accepted")
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if stream.reads != 0 {
+				t.Fatal("preflight read memory payload")
+			}
+			if stream.closes != 0 {
+				t.Fatal("preflight closed the borrowed memory")
+			}
+			if tc.mode == "precancel" && stream.maps != 0 {
+				t.Fatal("map accessed after cancellation")
+			}
+			if tc.mode == "retry" && stream.maps != 2 {
+				t.Fatalf("map attempts = %d, want 2", stream.maps)
+			}
+			if err == nil {
+				got := make([]byte, len(body))
+				if n, err := h.memory.ReadAt(ctx, got, 0); err != nil || n != len(got) || !bytes.Equal(got, body) {
+					t.Fatalf("capture lost live reader: n=%d, err=%v", n, err)
+				}
+			}
+			for i := 0; i < 2; i++ {
+				if err := h.Close(); !errors.Is(err, closeErr) {
+					t.Fatalf("history close = %v", err)
+				}
+			}
+			if stream.closes != 1 {
+				t.Fatalf("owner closed %d times, want once", stream.closes)
+			}
+		})
+	}
+}
+
+type checkpointKindRun struct {
+	sparse.Run
+	kind sparse.RunKind
+}
+
+func (r checkpointKindRun) Kind() sparse.RunKind { return r.kind }
+
+func TestCheckpointMemoryMergePreflightPreservesSparseKinds(t *testing.T) {
+	const page = 4096
+	body := bytes.Repeat([]byte{0x35}, 3*page)
+	stream := &checkpointMapStream{Source: sparse.Dense(bytes.NewReader(body), uint64(len(body)))}
+	kinds := []sparse.RunKind{sparse.Data, sparse.Zero, sparse.Hole}
+	stream.runAt = func(offset, limit uint64) (sparse.Run, error) {
+		run, err := stream.Source.RunAt(offset, min(limit, page-offset%page))
+		return checkpointKindRun{Run: run, kind: kinds[offset/page]}, err
+	}
+	lower, err := sparse.NewSource(bytes.NewReader(body), uint64(len(body)), []sparse.Extent{{Offset: 2 * page, Size: page}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &memoryHistory{memory: &checkpointStream{Stream: fetch.NewLayered(stream, &lifecycleArtifactStream{Source: lower})}}
+	defer h.Close()
+	if err := h.validateMergeBase(context.Background(), uint64(len(body))); err != nil {
+		t.Fatal(err)
+	}
+	if stream.maps != 3 || stream.reads != 0 || stream.closes != 0 {
+		t.Fatalf("preflight maps=%d reads=%d closes=%d", stream.maps, stream.reads, stream.closes)
+	}
+	for i, want := range kinds {
+		run, err := h.memory.RunAt(uint64(i*page), page)
+		if err != nil || run.Kind() != want {
+			t.Fatalf("run %d = %v, %v, want %v", i, run, err, want)
+		}
+	}
+	got := make([]byte, len(body))
+	if n, err := h.memory.ReadAt(context.Background(), got, 0); err != nil || n != len(got) {
+		t.Fatalf("capture read = %d, %v", n, err)
+	}
+	want := make([]byte, len(body))
+	copy(want[:page], body[:page])
+	if !bytes.Equal(got, want) {
+		t.Fatal("Data/Hole/Zero composition changed")
 	}
 }

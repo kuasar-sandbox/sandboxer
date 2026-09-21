@@ -3067,3 +3067,54 @@ func init() {
 	// where errors is not referenced elsewhere.
 	_ = errors.New
 }
+
+func TestHandleSnapshotRequestValidatesMemoryHistoryBeforeQuiesce(t *testing.T) {
+	for _, badLower := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lower=%t", badLower), func(t *testing.T) {
+			dir := t.TempDir()
+			cfg, err := snapshot.MarshalConfig(&snapshot.Config{
+				Version: snapshot.SnapshotConfigVersion, SandboxRef: "manifest://" + strings.Repeat("a", 64),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			write := func(size int) string {
+				t.Helper()
+				ref, _, err := snapshot.NewFileSink(dir, "parent", nil, false, nil).
+					AbsorbSnapshot(context.Background(), lifecycleSnapshotSource(t, make([]byte, size), cfg))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return ref
+			}
+			bad := write(8192)
+			binding := &MemorySourceBinding{SnapshotRef: bad, RelativeDir: dir}
+			if badLower {
+				binding.SnapshotRef = write(4096)
+				binding.FromRefs = []string{bad}
+			}
+			mfd, err := memory.Create("memory-history-preflight", 4096)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mfd.Close()
+			merge := true
+			viewCalled, reattached := false, false
+			_, err = handleSnapshotRequest(context.Background(), ctl.Request{OutDir: dir, MergeRef: &merge}, RunOptions{
+				Cfg: &config.SandboxConfig{}, SandboxID: "test", checkpointDir: dir,
+				PortableConfig: snapshotTestLivePortable(t), MemoryBinding: binding,
+			}, mfd, []SnapDiskRef{{Size: 4096, SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				viewCalled = true
+				return bytes.NewReader(make([]byte, 4096)), nil, nil
+			}}}, nil, filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"), "", nil, nil,
+				&guestlink.Pinger{Client: &guestlink.HostClient{BasePath: filepath.Join(dir, "must-not-dial.sock")}}, nil,
+				func() error { reattached = true; return nil }, nil, discardLogf)
+			if err == nil || !strings.Contains(err.Error(), "snapshot: memory history: checkpoint memory layer size 8192, expected 4096") {
+				t.Fatalf("memory preflight = %v", err)
+			}
+			if viewCalled || reattached {
+				t.Fatalf("capture started before validation: view=%t reattach=%t", viewCalled, reattached)
+			}
+		})
+	}
+}

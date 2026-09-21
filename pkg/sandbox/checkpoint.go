@@ -169,6 +169,15 @@ func (h *memoryHistory) Close() error {
 	return nil
 }
 
+// validateMergeBase borrows the composed memory for map-only preflight. The
+// validator closes its view; history retains ownership for Take and cleanup.
+func (h *memoryHistory) validateMergeBase(ctx context.Context, size uint64) error {
+	return snapshot.ValidateMergeBaseWithOpener(ctx, h.base, int64(size), nil, false,
+		func(context.Context, string) (fetch.Stream, error) {
+			return &checkpointSourceStream{Source: h.memory, close: func() error { return nil }}, nil
+		})
+}
+
 // prepareMemoryHistory reads only immutable host artifacts. It never reads the
 // guest memfd, so forming historical memory cannot fault pages into this round's
 // working set. The returned source streams straight into the final sink before
@@ -222,6 +231,9 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 	h.memory = &checkpointStream{Stream: fetch.NewLayered(layers...)}
 	if merge {
 		h.base = prefix[0]
+		if err := h.validateMergeBase(ctx, size); err != nil {
+			return nil, err
+		}
 		return h, nil
 	}
 	cfg, err := snapshot.ParseConfig(top.SnapshotConfig)
