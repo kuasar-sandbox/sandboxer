@@ -304,8 +304,10 @@ PY
 echo "==> PASS: replacement snapshot is S -> new E with no source E/memory parent"
 
 echo "==> [6] restore + verify persistence"
-truncate -s 512M "$WORK/root-r.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/root-r.ext4"
-truncate -s 256M "$WORK/dataset-r.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/dataset-r.ext4"
+# Empty sparse uppers inherit filesystem metadata from the captured disks.
+# Formatting here would mask snapshot pages with an unrelated filesystem.
+truncate -s 512M "$WORK/root-r.ext4"
+truncate -s 256M "$WORK/dataset-r.ext4"
 cat > "$WORK/restore.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-disks-r }
@@ -416,8 +418,8 @@ echo "==> PASS: W memory self is independent (one local from_ref); root + two da
 
 # Restore W with fresh writable uppers. Its memory parent is already a sibling
 # in WOUT; disk state must come entirely from W's merged disk artifacts.
-truncate -s 512M "$WORK/root-w.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/root-w.ext4"
-truncate -s 256M "$WORK/dataset-w.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/dataset-w.ext4"
+truncate -s 512M "$WORK/root-w.ext4"
+truncate -s 256M "$WORK/dataset-w.ext4"
 cat > "$WORK/restore-w.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-disks-w }
