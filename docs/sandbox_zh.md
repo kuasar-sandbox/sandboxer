@@ -2395,7 +2395,7 @@ Benchmark分别覆盖local tarstream/Bundle create、Bundle read、sparse merge�
 
 健康路径的 retry helper 不分配 timer, 不启动 goroutine. 失败的同步读取持有一个复用 timer 及原有请求/buffer. 单次退避有上限, 但操作可以无限期保持挂起. 连接额度包含空闲、借出和拨号中的连接; 有界维护 worker 不随停机时长增长. 验证覆盖健康路径分配/时延对比和故障期资源检查，不构成独立性能认证。
 
-后端 marker 契约仍由 [Accelerator 读取错误](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/accelerator-read-recovery_zh.md) 维护；另见原始[提案与验收清单](https://github.com/kuasar-sandbox/sandboxer/issues/225)。
+后端 marker 契约仍由 [Accelerator 读取错误](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/file-artifacts_zh.md#4-读取错误随机访问与恢复) 维护；另见原始[提案与验收清单](https://github.com/kuasar-sandbox/sandboxer/issues/225)。
 
 #### 13.3.1 Fatal 所有权与捕获
 
