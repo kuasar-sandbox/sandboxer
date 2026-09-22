@@ -193,7 +193,7 @@ func (k *checkpointKeep) plan(ctx context.Context, c Checkpoint) (retErr error) 
 // opens a candidate payload. A pinned directory fd confines enumeration and
 // unlink even if an ancestor or the pathname is concurrently replaced.
 func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (retErr error) {
-	if s == nil || (c.SandboxID == "" || c.SandboxID == "." || c.SandboxID == "..") || filepath.Base(c.SandboxID) != c.SandboxID || strings.ContainsAny(c.SandboxID, `/\`) || c.SandboxRef == "" {
+	if s == nil || (c.SandboxID == "" || c.SandboxID == "." || c.SandboxID == "..") || filepath.Base(c.SandboxID) != c.SandboxID || strings.ContainsAny(c.SandboxID, `/\\`) || c.SandboxRef == "" {
 		return errors.New("checkpoint cleanup requires producer identity and committed source")
 	}
 	dir, err := filepath.Abs(c.Directory)

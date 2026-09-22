@@ -410,6 +410,17 @@ full-image digests; Snapshot CPU/state bodies are not needed by this operation.
 Any keep-plan or reader-close error prevents all deletions. Kernel/runtime basename
 identities bind host-supplied boot files and are not checkpoint payload edges.
 
+Bundle candidate locations are resolved only when the existing selector visits
+that source: current Bundle first, then ordered refs, then remote. A current hit
+does not require unused locations. Unavailable candidates may fall through;
+malformed candidates and failures in a selected source remain errors. Explicit
+current S/E bindings and a complete keep plan are still required before deletion.
+
+The checkpoint directory must resolve to itself without symbolic links in any
+path component, including its ancestors. Configure the sandbox base directory
+using its physical canonical path; rejecting links inside the directory is a
+separate protection and does not make a symlinked base path supported.
+
 Only direct entries in the verified exclusive checkpoint directory are eligible:
 64 lowercase hexadecimal digest/key names with `.snapshot`, `.sandbox`,
 `.overlay`, `.image`, or `.bundle` must be regular files; capture partials must
