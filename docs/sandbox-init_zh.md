@@ -1167,7 +1167,15 @@ Host 的 timeouts.* 项以 sandbox.yaml 配置为准，文档指明的默认是�
 Host 使用同一管理 listener 和带长度前缀的 JSON framing, 但连接专用且可复用.
 不改变普通短连接、ping、mem_report 或 MUX. `pkg/proto/usage.go` 定义原始
 payload, 单位、指标计算、输出及记录格式由
-[usage](usage_zh.md#4-指标单位和计算) 统一说明.
+[Host usage 指标](sandbox_zh.md#usage-metrics) 统一说明.
+
+Guest 读取 `/proc/zoneinfo`、`/proc/buddyinfo`, 匹配 node/zone identity 及
+各 CPU pageset, 返回 `PresentPages`、`BuddyFreePages`、`PCPFreePages`、
+`PageSize` 和 domain/status. 已填充的受支持 RAM zone 为 DMA、DMA32、Normal;
+排除 Device/PMEM. 其他已填充域为 unsupported, 不由 `spanned` 或 Host
+capacity 猜测.
+
+文件系统观测使用[磁盘组装](#31-阶段-1早期挂载--并发取-launch-spec--switch-root)保留的私有 CLOEXEC 句柄。switch-root 和恢复后的 mount 保持句柄有效，应用 exec 不继承它们。同盘 bind/empty volume 不另登记文件系统；不枚举任意 mount，不查询用户 NFS/FUSE，不运行 `du`。
 
 ```jsonc
 {
@@ -1352,7 +1360,7 @@ FileSpec 还支持 read_only，省略时 bind 可写。Tmpfs 注入避免直接�
 
 ## 7. See Also
 
-- [usage_zh.md](usage_zh.md) — Host-only 归并、单位、查询及保存.
+- [Host usage](sandbox_zh.md#usage-query) — Host-only 归并、单位、查询及保存.
 - [`sandbox_zh.md`](sandbox_zh.md) §2.2(`run` 的 `--tty` / `--console` / stdio 标志)、
   §5.2(CH 冷启动命令行)、§6.2 / §6.3(snapshot 时序 / ctl.sock 协议)、§7(恢复)
 - [guest kernel 文档](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux_zh.md) —— guest kernel 启用的 namespace /

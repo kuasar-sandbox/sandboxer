@@ -1418,8 +1418,16 @@ Other budgets are protocol constants or guest-side waits:
 The Host uses a dedicated reusable connection through the same management
 listener and length-prefixed JSON framing. This changes neither ordinary
 short connections, ping, mem_report nor MUX. `pkg/proto/usage.go` owns the
-raw payload types; [usage](usage.md#4-metrics-units-and-arithmetic) owns units,
+raw payload types; [Host usage metrics](sandbox.md#usage-metrics) owns units,
 metric calculations, output and record formats.
+
+Guest reads `/proc/zoneinfo` and `/proc/buddyinfo`, matching node/zone identities
+and per-CPU pagesets. It returns `PresentPages`, `BuddyFreePages`,
+`PCPFreePages`, `PageSize` and domain/status. Populated supported RAM zones
+are DMA, DMA32 and Normal; Device/PMEM are excluded. Other populated domains
+are unsupported, not guessed from `spanned` or host capacity.
+
+Filesystem observations use the private CLOEXEC handles retained during [disk assembly](#31-phase-1-early-mounts-concurrent-launch-spec-fetch-and-switch-root). Switch-root and restored mounts preserve these handles; application exec does not inherit them. Bind/empty volumes on the same disk do not add filesystem registrations. No arbitrary mount enumeration, NFS/FUSE query or `du` is performed.
 
 ```jsonc
 {
@@ -1664,7 +1672,7 @@ them until thaw (§3.3).
 
 ## 7. See Also
 
-- [usage.md](usage.md) — Host-only aggregation, units, query and persistence.
+- [Host usage](sandbox.md#usage-query) — Host-only aggregation, units, query and persistence.
 - [sandbox lifecycle](sandbox.md), §2.2 (run tty/console/stdio flags),
   §5.2 (CH cold-start command), §6.2 / §6.3 (capture ordering and ctl.sock),
   and §7 (restore).

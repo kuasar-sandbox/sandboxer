@@ -23,7 +23,7 @@
 //	--console off | default | file=PATH    (default: default)
 //
 // Output targets also accept journald=TAG[,FIELD=VALUE...], independently per
-// output. Values use percent encoding; see docs/journald.md.
+// output. Values use percent encoding; see docs/sandbox.md#journal-output-targets.
 package stdio
 
 import (

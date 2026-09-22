@@ -112,17 +112,11 @@ See the [project release documentation](https://github.com/kuasar-sandbox/kuasar
 
 ## Documentation
 
-- [Sandbox artifacts](docs/sandbox-artifacts.md) — portable E/S configuration, parent/reference graph, carriers, integrity and publication contracts.
+- [sandbox.md](docs/sandbox.md) — host control and the entire sandbox lifecycle: configuration, output targets, resource usage, COW, artifact formats/publication, capture, restore, read recovery and cleanup.
+- [sandbox-init.md](docs/sandbox-init.md) — Guest PID 1 ABI, initialization, vsock, raw usage observations, stdio and application lifecycle.
+- [cloud-hypervisor.md](docs/cloud-hypervisor.md) — VMM integration, patches, build and runtime boundaries.
 
-Full design and reference documents:
-
-- [`docs/usage.md`](docs/usage.md) — optional resource accounting, live/saved queries, units, persistence and loss boundaries;
-- [`docs/sandbox.md`](docs/sandbox.md) — host control plane, configuration, cold start, snapshot/export/restore sequencing, resource execution, and cleanup;
-- [`docs/journald.md`](docs/journald.md) — independent output targets, custom journal fields, component diagnostics, encoding, and fallback;
-- [`docs/sandbox-init.md`](docs/sandbox-init.md) — guest PID 1 ABI, staged initialization, vsock control, stdio multiplexing, and application contract;
-- [`docs/cloud-hypervisor.md`](docs/cloud-hypervisor.md) — patched Cloud Hypervisor source, build, and runtime contracts.
-
-The lifecycle, guest ABI and VMM guides provide complete English defaults and Chinese counterparts through their reciprocal language selectors. Native-build and license-scope documentation is also available in both languages.
+These three owner pairs provide complete English and Chinese contracts. Native-build and license-scope guides also have both editions. See the [documentation contribution policy](CONTRIBUTING.md#documentation) for section ownership and new-document requirements.
 
 ## Project boundaries
 
