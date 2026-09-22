@@ -13,6 +13,10 @@ Use --mode baseline (the default) for the ten-workload run, or --mode sg for
 the separate four-workload comparison. Start a fresh sandbox for each run.
 Write verification and its bounded expected-data metadata are outside timing;
 request stamps are prepared before each measured syscall.
+Full-range read checksums are prepared from the fixture oracle before timing.
+Read checksum validation is excluded from elapsed time and latency, but included
+in the explicitly labeled Guest CPU total. Initial pages have distinct headers
+so reordering middle SG vectors is observable.
 """
 
 import argparse
@@ -22,6 +26,7 @@ import os
 import resource
 import struct
 import time
+import zlib
 
 size = 64 << 20
 page = 4096
@@ -40,10 +45,6 @@ sg_view = memoryview(sg_buffer)
 # Touch intervening pages too, then use every other page. This makes SG an
 # explicit Guest workload instead of assuming contiguous virtual memory is SG.
 sg_vectors = [sg_view[i * 8192:i * 8192 + page] for i in range(256)]
-for fd in fds:
-    for off in range(0, size, len(buffer)):
-        assert os.pwritev(fd, [view], off) == len(buffer)
-
 works = [('seq-read', 1 << 20), ('seq-write', 1 << 20),
          ('random-read', page), ('random-write', page),
          ('partial-512', 512), ('hot-overwrite', page),
@@ -82,6 +83,25 @@ def stamp(vector, disk, off, i):
     struct.pack_into('<QQ', vector, 0, disk, off | (i << 32))
 
 
+for disk, fd in enumerate(fds):
+    for off in range(0, size, len(buffer)):
+        for block in range(0, len(buffer), page):
+            stamp(view[block:], disk, off + block, 0)
+            headers[disk, off + block] = bytes(view[block:block + 16])
+        assert os.pwritev(fd, [view], off) == len(buffer)
+
+
+def expected_checksum(disk, off, length):
+    # Reuse the existing contiguous workspace before the read overwrites it.
+    for relative in range(0, length, 512):
+        sector = off + relative
+        view[relative:relative + 512] = bytes([markers[disk][sector // 512]]) * 512
+        header = headers.get((disk, sector))
+        if header is not None:
+            view[relative:relative + 16] = header
+    return zlib.crc32(view[:length])
+
+
 for generation, (work, request) in enumerate(works):
     reads = work.endswith('read') or work == 'cache-hot'
     operations = size // (request if request > page else page)
@@ -89,13 +109,22 @@ for generation, (work, request) in enumerate(works):
         operations *= 2
     if work == 'cache-hot':
         for off in range(0, 4 << 20, len(buffer)):
+            expected = expected_checksum(1, off, len(buffer))
             assert os.preadv(fds[1], [view], off) == len(buffer)
+            assert zlib.crc32(view) == expected, ('warm-up verification', work, off)
+    checksums = {}
+    if reads:
+        for i in range(operations):
+            disk, off = target(work, request, i)
+            if (disk, off) not in checksums:
+                checksums[disk, off] = expected_checksum(disk, off, request)
     marker = 0x80 + generation
     if not reads:
         buffer[:] = bytes([marker]) * len(buffer)
         sg_buffer[:] = bytes([marker]) * len(sg_buffer)
     vectors = sg_vectors if work.startswith('sg-') else [view[:request]]
     latencies = []
+    verification_ns = 0
     before_cpu = resource.getrusage(resource.RUSAGE_SELF)
     start = time.perf_counter_ns()
     for i in range(operations):
@@ -111,10 +140,14 @@ for generation, (work, request) in enumerate(works):
         latencies.append(time.perf_counter_ns() - before)
         assert n == request, (work, i, n, request)
         if reads:
-            expected = headers.get((disk, off), bytes([markers[disk][off // 512]]) * 16)
-            assert vectors[0][:16] == expected
-            assert vectors[-1][-1] == markers[disk][(off + request - 1) // 512]
-    elapsed = (time.perf_counter_ns() - start) / 1e9
+            verify_start = time.perf_counter_ns()
+            checksum = 0
+            for vector in vectors:
+                checksum = zlib.crc32(vector, checksum)
+            assert checksum == checksums[disk, off], ('read verification', work, disk, off)
+            del vector
+            verification_ns += time.perf_counter_ns() - verify_start
+    elapsed = (time.perf_counter_ns() - start - verification_ns) / 1e9
     after_cpu = resource.getrusage(resource.RUSAGE_SELF)
     verified = 0
     if not reads:
@@ -136,6 +169,8 @@ for generation, (work, request) in enumerate(works):
                       'verified_write_ranges': verified,
                       'logical_bytes': operations * request,
                       'request_bytes': request, 'elapsed_s': elapsed,
+                      'read_verification_s': verification_ns / 1e9,
+                      'guest_cpu_includes_read_verification': reads,
                       'MiB/s': operations * request / (1 << 20) / elapsed,
                       'p50_us': latencies[len(latencies)//2] / 1000,
                       'p99_us': latencies[len(latencies)*99//100] / 1000,
