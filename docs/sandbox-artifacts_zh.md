@@ -404,6 +404,14 @@ source/location 绑定。选择只读取有界的当前小型元数据与 Bundle
 basename identity 绑定宿主提供的启动文件，不是 checkpoint payload 依赖。keep plan 或 reader Close 出错时
 不删除任何文件。
 
+Bundle 候选来源的 location 仅在既有选择器访问该来源时解析：先当前 Bundle，再按顺序
+查询 refs，最后查询远端。当前 Bundle 命中时不要求无用 location 可解析；不可用候选可继续
+查找，损坏候选和已选定来源的错误仍然失败。删除前仍必须确认显式当前 S/E 绑定及完整保留集合。
+
+checkpoint 目录及其祖先路径都必须不含符号链接，解析后的物理路径应与配置路径相同。
+沙箱 base 目录应配置为实际规范路径；拒绝目录内部的异常链接是另一项保护，不代表支持
+通过符号链接配置 base 路径。
+
 只处理已验证专属 checkpoint 的直接目录项：64 位小写十六进制 digest/key 加 `.snapshot`、
 `.sandbox`、`.overlay`、`.image`、`.bundle` 的成品必须是普通文件；捕获 partial 必须完整匹配
 `<producer-SandboxID>.<kind>.<uint32十进制>.partial`（包括 bundle，除 `0` 外不得有前导零）；
