@@ -122,6 +122,12 @@ func benchmarkCOWWorkingSet(b *testing.B, work string, encrypted bool, factory f
 	runtime.GC()
 	var admission, total time.Duration
 	beforeIO := workingSetProcessIO(b)
+	var cpuBefore, cpuAfter unix.Rusage
+	if err := unix.Getrusage(unix.RUSAGE_SELF, &cpuBefore); err != nil {
+		b.Fatal(err)
+	}
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
 	b.SetBytes(int64(operations * request))
 	b.ResetTimer()
 	for iter := 0; iter < b.N; iter++ {
@@ -164,6 +170,15 @@ func benchmarkCOWWorkingSet(b *testing.B, work string, encrypted bool, factory f
 		total += time.Since(start)
 	}
 	b.StopTimer()
+	if err := unix.Getrusage(unix.RUSAGE_SELF, &cpuAfter); err != nil {
+		b.Fatal(err)
+	}
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+	cpuNanos := cpuAfter.Utime.Nano() + cpuAfter.Stime.Nano() - cpuBefore.Utime.Nano() - cpuBefore.Stime.Nano()
+	b.ReportMetric(float64(cpuNanos)/1e9/float64(b.N), "cpu-s")
+	b.ReportMetric(float64(memAfter.Mallocs-memBefore.Mallocs)/float64(b.N*operations), "allocs/request")
+	b.ReportMetric(float64(memAfter.TotalAlloc-memBefore.TotalAlloc)/float64(b.N*operations), "allocated-B/request")
 	afterIO := workingSetProcessIO(b)
 	for _, key := range []string{"read_bytes", "write_bytes", "cancelled_write_bytes"} {
 		b.ReportMetric(float64(afterIO[key]-beforeIO[key])/float64(b.N), "proc-"+key+"-B")
@@ -188,6 +203,16 @@ func benchmarkCOWWorkingSet(b *testing.B, work string, encrypted bool, factory f
 	b.ReportMetric(float64(readsBytes)/float64(b.N), "body-read-B")
 	b.ReportMetric(float64(resident), "file-resident-B")
 	b.ReportMetric(float64(operations*request), "logical-B")
+	b.ReportMetric(float64(readsBytes)/float64(b.N*operations*request), "read-amplification")
+	b.ReportMetric(float64(writes)/float64(b.N*operations*request), "write-amplification")
+	if reads {
+		// These workloads issue aligned, full-page reads of previously written
+		// upper pages. Every body page is a demand miss; no readahead occurs.
+		misses := readsBytes / cowBlockSize
+		demands := uint64(b.N * operations * request / cowBlockSize)
+		b.ReportMetric(float64(misses)/float64(b.N), "cache-miss-pages")
+		b.ReportMetric(float64(demands-misses)/float64(b.N), "cache-hit-pages")
+	}
 	for key, value := range group.stats() {
 		b.ReportMetric(value, key)
 	}
