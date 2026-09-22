@@ -211,6 +211,29 @@ func (d *diffFile) directWriteAt(buf []byte, offset int64) (int, error) {
 	}
 	return done, nil
 }
+
+// writeCachePages stages one contiguous frozen cache batch. Active diffs always
+// own this workspace, including when O_DIRECT setup is unsupported. No page is
+// encrypted in place or exposed to a syscall; the cache retains every page and
+// its dirty charge until this call and any failure cleanup have completed.
+func (d *diffFile) writeCachePages(pages []*cachePage, offset int64) error {
+	if len(pages) == 0 || len(pages) > maxWritebackPages || offset < 0 || offset%cowBlockSize != 0 || offset > d.logicalSize || int64(len(pages)*cowBlockSize) > d.logicalSize-offset {
+		return fmt.Errorf("vhost: invalid bounded cache write")
+	}
+	d.direct.writeMu.Lock()
+	defer d.direct.writeMu.Unlock()
+	if d.direct.write.bytes == nil {
+		return os.ErrClosed
+	}
+	scratch := d.direct.write.bytes[:len(pages)*cowBlockSize]
+	defer clear(scratch)
+	for i, p := range pages {
+		copy(scratch[i*cowBlockSize:(i+1)*cowBlockSize], p.data[:])
+	}
+	d.cryptUnits(scratch, offset, true)
+	return writeFullAt(d.bodyIO, scratch, d.bodyOffset+offset)
+}
+
 func (d *diffFile) cryptUnits(buf []byte, start int64, encrypt bool) {
 	if !d.encrypted {
 		return

@@ -67,8 +67,8 @@ func (q *pageList) remove(p *cachePage) {
 
 // COWCache owns one sandbox's plaintext pages and one writeback worker. All
 // active root/data diffs must share this handle. Close the BlockCOWs before it.
-// Page payload and metadata are bounded by capacity; the worker has one extra
-// fixed 1 MiB batch copy. Each diff has independent bounded DIO workspaces.
+// Page payload and metadata are bounded by capacity. Writeback stages frozen
+// pages directly in each diff's existing bounded, owned DIO workspace.
 type COWCache struct {
 	mu                            sync.Mutex
 	capacity, maxDirty, dirtyUsed int
@@ -314,16 +314,24 @@ func (c *COWCache) readColdRunLocked(ctx context.Context, cow *BlockCOW, buf []b
 	c.mu.Unlock()
 	length := count * cowBlockSize
 	err := cow.diff.withDirectRead(length, offset, func(plain []byte) error {
+		// Loading entries are privately owned until publication: eviction,
+		// writes and discard cannot release or change them, and the COW's
+		// operation lifetime prevents detach. Fill from owned plaintext before
+		// taking the global lock to publish the completed pages.
+		for i, p := range reserved[:count] {
+			if p != nil {
+				copy(p.data[:], plain[i*cowBlockSize:(i+1)*cowBlockSize])
+			}
+		}
 		c.mu.Lock()
 		if err := c.checkLocked(ctx); err != nil {
 			c.mu.Unlock()
 			return err
 		}
-		for i, p := range reserved[:count] {
+		for _, p := range reserved[:count] {
 			if p == nil {
 				continue
 			}
-			copy(p.data[:], plain[i*cowBlockSize:(i+1)*cowBlockSize])
 			p.state = cacheClean
 			c.clean.push(p)
 		}
@@ -433,8 +441,6 @@ func (c *COWCache) write(ctx context.Context, cow *BlockCOW, buf []byte, offset,
 
 func (c *COWCache) run() {
 	defer close(c.done)
-	buffer := make([]byte, maxWritebackPages*cowBlockSize)
-	defer clear(buffer)
 	batch := make([]*cachePage, 0, maxWritebackPages)
 	aggregated := false
 	for {
@@ -499,15 +505,12 @@ func (c *COWCache) run() {
 		c.signalLocked()
 		c.mu.Unlock()
 		// Frozen pages remain readable; no writer may change or release them.
-		for i, p := range batch {
-			copy(buffer[i*cowBlockSize:], p.data[:])
-		}
 		var err error
 		if c.hooks.beforeWrite != nil {
 			err = c.hooks.beforeWrite(batch)
 		}
 		if err == nil {
-			err = writeFullAt(cow.diff, buffer[:len(batch)*cowBlockSize], off)
+			err = cow.diff.writeCachePages(batch, off)
 		}
 		if err != nil {
 			// A known failure must be visible before any potentially blocking
@@ -520,7 +523,6 @@ func (c *COWCache) run() {
 				report(fatal)
 			}
 		}
-		clear(buffer[:len(batch)*cowBlockSize])
 		var cleanupErr error
 		if err != nil {
 			if c.hooks.beforeCleanup != nil {

@@ -2142,8 +2142,8 @@ materialize the upper cache. Each cached page is indexed by active file and bloc
 At all times `dirty_used <= used <= cache_size` and
 `dirty_used <= max_dirty_size`. Submitting I/O does not release reservations.
 The page pool, index, clean LRU and dirty FIFO are bounded by capacity. Plaintext
-is cleared on release. Separate bounded overhead consists of one 1 MiB batch
-copy and at most 256 page pointers per sandbox, two independent 1 MiB MAP_SHARED
+is cleared on release. Separate bounded overhead consists of at most 256
+writeback page pointers per sandbox, two independent 1 MiB MAP_SHARED
 I/O workspaces per active file (each with less than 1 MiB alignment padding),
 and page metadata/index/Go allocator overhead proportional to page capacity.
 `cache_size` is not a cap on process RSS, guest memfd mappings, immutable-source
@@ -2177,9 +2177,12 @@ pages of the requested upper range enter a physical read (at most 1 MiB); cache
 hits and base/hole boundaries stop the run. Sorted stripe-range locks prevent
 concurrent writes/discard, while reserved Loading pages prevent eviction. With
 less cache capacity than the run, remaining cold pages bypass caching under the
-same stripes. Read/decrypt stays in the owned MAP_SHARED I/O workspace: clean
-pages are populated from that workspace before copying out to mutable caller or
-guest memory. No request-sized payload allocation or base prefetch is added.
+same stripes. Read/decrypt stays in the owned MAP_SHARED I/O workspace.
+Loading pages are filled from that workspace outside the cache mutex, then
+published as clean under the mutex before copying out to mutable caller or guest memory.
+Contiguous base blocks within the requested bounded range are passed together
+to `BlockReader`, which retains its own lower read boundaries. No request-sized
+payload allocation or base prefetch is added.
 
 Writes acquire total and dirty capacity together before constructing a new page.
 Clean promotion needs only dirty quota; rewriting an unselected dirty page needs
@@ -2205,9 +2208,11 @@ do not move a page to the tail. It may batch adjacent dirty pages of the same
 file up to 1 MiB, without filling holes or preallocating gaps. A fixed 1 ms
 aggregation window allows low-rate traffic to progress; quota pressure and
 internal Drain wake it immediately. Selected pages become frozen writeback:
-reads remain possible and same-page writes wait. The worker copies plaintext to
-a bounded batch workspace, encrypts the copy, and performs I/O without cache or
-global locks. Foreground reads have a separate workspace.
+reads remain possible and same-page writes wait. The worker copies frozen pages
+directly into the active diff's existing aligned MAP_SHARED write workspace,
+encrypts that copy, and performs I/O without cache or global locks. Cache page
+payloads stay plaintext and never become syscall buffers. Foreground reads have
+a separate workspace.
 
 The bounded page index supplies contiguous dirty neighbours from the same file,
 regardless of arrival order; unselected FIFO age is unchanged. Ordinary write
