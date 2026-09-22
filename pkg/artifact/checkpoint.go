@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -129,10 +130,7 @@ func (k *checkpointKeep) plan(ctx context.Context, c Checkpoint) (retErr error) 
 		if err := k.retainRoot(ctx, c.SnapshotRef, scope, c.SandboxID+".snapshot"); err != nil {
 			return err
 		}
-		if err := k.prepareCarrier(c.SnapshotRef, scope); err != nil {
-			return err
-		}
-		stream, child, err := k.p.open(ctx, c.SnapshotRef, scope)
+		stream, child, err := k.open(ctx, c.SnapshotRef, scope)
 		if err != nil {
 			return err
 		}
@@ -171,10 +169,7 @@ func (k *checkpointKeep) plan(ctx context.Context, c Checkpoint) (retErr error) 
 	if err := k.retainRoot(ctx, eRef, eScope, c.SandboxID+".sandbox"); err != nil {
 		return err
 	}
-	if err := k.prepareCarrier(eRef, eScope); err != nil {
-		return err
-	}
-	stream, child, err := k.p.open(ctx, eRef, eScope)
+	stream, child, err := k.open(ctx, eRef, eScope)
 	if err != nil {
 		return err
 	}
@@ -198,7 +193,7 @@ func (k *checkpointKeep) plan(ctx context.Context, c Checkpoint) (retErr error) 
 // opens a candidate payload. A pinned directory fd confines enumeration and
 // unlink even if an ancestor or the pathname is concurrently replaced.
 func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (retErr error) {
-	if s == nil || (c.SandboxID == "" || c.SandboxID == "." || c.SandboxID == "..") || filepath.Base(c.SandboxID) != c.SandboxID || strings.ContainsAny(c.SandboxID, `/\\`) || c.SandboxRef == "" {
+	if s == nil || (c.SandboxID == "" || c.SandboxID == "." || c.SandboxID == "..") || filepath.Base(c.SandboxID) != c.SandboxID || strings.ContainsAny(c.SandboxID, `/\`) || c.SandboxRef == "" {
 		return errors.New("checkpoint cleanup requires producer identity and committed source")
 	}
 	dir, err := filepath.Abs(c.Directory)
@@ -352,42 +347,40 @@ func (k *checkpointKeep) addLocation(ref manifest.Ref) error {
 	return nil
 }
 
-// Bundle refs are a capped, flat source list. Load only that carrier metadata
-// before using the existing ordered selector; never recurse referenced refs.
-func (k *checkpointKeep) prepareCarrier(raw string, scope publishScope) error {
-	ref, err := manifest.ParseRef(raw)
+// open preserves the existing current -> refs -> remote selection. Resolve a
+// candidate's location only when the selector visits that candidate, so an
+// unused or unavailable source cannot prevent a complete local keep plan.
+func (k *checkpointKeep) open(ctx context.Context, raw string, scope publishScope) (fetch.Stream, publishScope, error) {
+	stream, child, err := k.p.open(ctx, raw, scope)
 	if err != nil {
-		return err
+		return nil, child, err
 	}
-	if err := k.addLocation(ref); err != nil {
-		return err
+	opened, ok := stream.(*OpenedFile)
+	if !ok || opened.resolver == nil {
+		return stream, child, nil
 	}
-	if ref.Scheme != manifest.RefSchemeFile {
-		return nil
-	}
-	path, err := k.p.locations.ResolveFile(ref, scope.relativeDir)
+	current, err := opened.ManifestFetcher().SelectRoot(opened.rootKey)
 	if err != nil {
-		return err
+		return nil, child, errors.Join(err, stream.Close())
 	}
-	format, err := DetectFileFormat(path)
-	if err != nil {
-		return err
-	}
-	if format != FileFormatManifestBundle {
-		return nil
-	}
-	metadata, err := manifestbundle.OpenMetadata(path)
-	if err != nil {
-		return err
-	}
-	for _, raw := range metadata.Refs() {
+	resolver := manifestbundle.SourceResolverFunc(func(ctx context.Context, raw string) (manifestbundle.ManifestSource, error) {
+		if err := ctx.Err(); err != nil {
+			return manifestbundle.ManifestSource{}, err
+		}
 		ref, err := manifest.ParseRef(raw)
 		if err != nil {
-			return err
+			return manifestbundle.ManifestSource{}, err
 		}
 		if err := k.addLocation(ref); err != nil {
-			return err
+			if ctx.Err() != nil {
+				return manifestbundle.ManifestSource{}, ctx.Err()
+			}
+			return manifestbundle.ManifestSource{}, fmt.Errorf("%w: %s: %w", manifestbundle.ErrSourceUnavailable, raw, err)
 		}
-	}
-	return nil
+		return opened.resolver.ResolveBundle(ctx, raw)
+	})
+	// Reuse the opened carrier's authenticated fetcher and reader ownership.
+	// Its resolver retains the lazy cache and closes every consulted reader.
+	child.fetcher = manifestbundle.NewManifestFetcherWithResolver(opened.BundleReader(), current.Fetcher, resolver, k.p.storage.Fetcher())
+	return stream, child, nil
 }
