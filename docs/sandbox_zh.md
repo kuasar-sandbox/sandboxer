@@ -1791,6 +1791,24 @@ Restore不会:
 
 Host-only允许项包括 network provider/current identity、cgroup/controller、allocatable CPU/memory 与 resource enforcement、kernel/runtime actual path、active diff/template、restore prefetch和timeouts. Immutable disk graph、capacity identity、`deflate_on_oom`、network topology 由 E 拥有。Kernel 重哈希例外与 runtime-footer 比较见 [PortableSandboxConfig](sandbox_zh.md#portable-config)。
 
+Runtime 选择只发生在 restore 预检查中。首先检查传入的 `boot.runtime` 文件，
+沿用既有 bundle 封装校验，并将 **basename + 尾部声明的 digest** 与 E 比较。
+成功立即使用，不访问第二候选。若文件缺失、不可读、格式错误或 identity 不匹配，
+只尝试一个同目录文件：传入路径的父目录加 E 中已经验证的 runtime basename。
+不按默认文件软链接的目标改变查找目录，不扫描目录，也不重复检查相同候选。
+两个候选执行相同校验；均失败时保留两次原因。非法配置、取消以及后续磁盘、网络、
+VM 错误不触发 runtime 回退。未提供 runtime 绑定时，保留既有本地 E 来源目录默认绑定。
+不新增目录配置字段；image 冷启动与 `--from` 行为不变。
+
+无论哪个候选通过，都将选定的本机绝对路径同时用于本次 runtime 绑定和生成的
+`snap-state/config.json` 中的 `pmem[0].file`。捕获的 pmem 必须符合既有单 runtime
+设备结构，且 file 字段非空。只改变该 file 字段，设备 ID、可选 size 及其他属性、
+`state.json`、原始 S/E 和节点默认配置均不改变。旧绝对路径无需存在。
+不同版本的 runtime 文件须以不同文件名在同目录中保持不可变且可用；恢复不新增
+整份 EROFS 重哈希或 runtime 复制。既有 `e2e_sandbox_restore.sh` 验证 v2 名称默认文件
+回退到已迁移的 v1、捕获旧路径不可用、pmem 选定路径、源制品与 host 输入不变，
+以及 Guest ready 和执行继续。
+
 从 S0 restore后:
 
 ```text

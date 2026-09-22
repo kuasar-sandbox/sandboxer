@@ -5,7 +5,8 @@
 #   2. Wait until counter reaches a known value (e.g. TICK 10)
 #   3. snapshot the sandbox to Snapshot S plus its referenced Sandbox E
 #      (--resume=false default destroys sandbox after dump)
-#   4. Run --restore=<file> to resume; vCPU should resume the counter
+#   4. Relocate the captured v1 runtime, supply v2, and restore via the sibling
+#      fallback; vCPU should resume the counter despite the unavailable old path
 #   5. Confirm the restored process keeps counting from where it
 #      stopped (TICK 10+, increases over time)
 #
@@ -87,6 +88,14 @@ DIFF_FILE="$WORK/runtime/blk1.diff"
 truncate -s 1G "$DIFF_FILE"
 mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
 
+# Keep all runtime copies test-owned. The differently named v2 copy exercises
+# the existing basename+digest mismatch; it is not a separately built version.
+mkdir -p "$WORK/capture-runtime" "$WORK/deploy-runtime"
+CAPTURE_RUNTIME="$WORK/capture-runtime/runtime-v1.bundle"
+SELECTED_RUNTIME="$WORK/deploy-runtime/runtime-v1.bundle"
+DEFAULT_RUNTIME="$WORK/deploy-runtime/runtime-v2.bundle"
+cp --reflink=auto --sparse=always "$BIN/sandbox-runtime.bundle" "$CAPTURE_RUNTIME"
+
 # Counter that prints TICK i on stdout — restored sandbox should
 # continue from the snapshotted i value.
 cat > "$WORK/sandbox.yaml" <<EOF
@@ -100,7 +109,7 @@ network:
   hostname: e2e-restore
 boot:
   kernel: file://$VMLINUX
-  runtime: file://$BIN/sandbox-runtime.bundle
+  runtime: file://$CAPTURE_RUNTIME
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $BLK0_REF
@@ -177,6 +186,13 @@ uffd_performance_gate "cold-zero-ready" "$COLD_READY_MS" 2000 \
 SNAP_FILE="$OUT/$SID1.snapshot"
 [ -f "$SNAP_FILE" ] || { echo "FAIL: no $SID1.snapshot"; ls -la "$OUT"; exit 1; }
 
+# Neither the recorded old pmem path nor a fallback in the E directory exists.
+# Only the supplied runtime's directory can provide the required v1 basename.
+mv "$CAPTURE_RUNTIME" "$SELECTED_RUNTIME"
+cp --reflink=auto --sparse=always "$SELECTED_RUNTIME" "$DEFAULT_RUNTIME"
+[ ! -e "$CAPTURE_RUNTIME" ] || { echo "FAIL: captured runtime path still exists"; exit 1; }
+find "$OUT" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > "$WORK/source-artifacts.sha256"
+
 # Restore — needs a fresh blk1.diff (the snapshotted disk goes in as
 # overlay base; new run gets a clean diff).
 DIFF_RESTORE="$WORK/runtime/blk1-restore.diff"
@@ -196,11 +212,13 @@ network:
   hostname: e2e-restore
 boot:
   kernel: file://$VMLINUX
-  runtime: file://$BIN/sandbox-runtime.bundle
+  runtime: file://$DEFAULT_RUNTIME
   root:
     overlay:
       diff: file://$DIFF_RESTORE
 EOF
+
+sha256sum "$WORK/host.yaml" "$DEFAULT_RUNTIME" > "$WORK/host-inputs.sha256"
 
 LOG2="$WORK/run2.log"
 SID2="r2-$$"
@@ -234,6 +252,17 @@ grep -qE '^0::/init[[:space:]]*$' <<<"$CG_RESTORE" \
 readiness_assert_wire "$WORK/restore.ready" "$RESTORE_READER_PID" $'control_ready\nready\n' \
     || { echo "==> FAIL: restore readiness wire was not exact"; exit 1; }
 echo "==> PASS: restore exact readiness wire; ctl.sock and immediate exec succeeded"
+python3 - "$RUNTIME_ROOT/$SID2/snap-state/config.json" "$SELECTED_RUNTIME" <<'PY_PMEM'
+import json, sys
+with open(sys.argv[1]) as source:
+    config = json.load(source)
+assert len(config["pmem"]) == 1, config["pmem"]
+assert config["pmem"][0]["file"] == sys.argv[2], config["pmem"]
+PY_PMEM
+sha256sum --check --status "$WORK/source-artifacts.sha256"
+sha256sum --check --status "$WORK/host-inputs.sha256"
+echo "==> PASS: runtime fallback selected relocated v1; CH pmem rebound; source artifacts and host inputs unchanged"
+
 
 echo "==> waiting for restored TICK > $PRE_SNAP_TICK..."
 WANT_TICK=$((PRE_SNAP_TICK + 3))
