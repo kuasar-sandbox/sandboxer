@@ -354,12 +354,14 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// side effects. Only after every deterministic format/topology/capacity check
 	// succeeds do we create the run directory and persist immutable C0.
 	vsockSock := filepath.Join(runDir, "vsock.sock")
-	rewritten, err := rewriteConfigPaths(snapshotRoot.ConfigJSON, pathRewrite{
+	rewritten, netDevID, err := rewriteConfigPaths(snapshotRoot.ConfigJSON, pathRewrite{
 		UffdSocket:   uffdSock,
 		DiskSocks:    diskSocks,
 		DiskReadOnly: diskReadOnly,
 		APISock:      chSock,
 		VsockSock:    vsockSock,
+		TargetTap:    snapCfg.Network.TAP,
+		IsTapFD:      snapCfg.Network.TapFD != nil,
 	})
 	if err != nil {
 		return -1, fmt.Errorf("rewrite config.json: %w", err)
@@ -505,10 +507,10 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// side for this restore. tapfd mode re-runs
 	// the configured handoff (docs/tapfd.md §4, idempotent) for a fresh queue
 	// fd, passed to CH via --restore net_fds; tap-name mode lets CH reopen the
-	// named tap from the restored config. The merged metadata also yields the
-	// NetworkSpec the guest re-applies flush-and-replace (clone takes a fresh
-	// L3 identity; the MAC stays the snapshot's, so the provider must use a
-	// stable per-port MAC — see docs/tapfd.md §5).
+	// named tap rebound in the per-restore config.json (sandboxer#161). The merged
+	// metadata also yields the NetworkSpec the guest re-applies flush-and-replace
+	// (clone takes a fresh L3 identity; the MAC stays the snapshot's, so the
+	// provider must use a stable per-port MAC — see docs/tapfd.md §5).
 	var tapFile, netnsFile *os.File
 	var metaMAC, metaIP string
 	if snapCfg.Network.TapFD != nil {
@@ -599,11 +601,11 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			if e.TapFDNum > 0 {
 				// CH can't serialize fds, so the snapshot's net fd is dead;
 				// re-bind the fresh tap queue fd (CH fd 4) to the restored net
-				// device named _net0 at cold boot via net_fds.
+				// device via net_fds.
 				// net_fds is a CH Tuple<String,Vec<u64>>: the whole value is
 				// bracket-wrapped, each entry is <net-id>@<fd-list>. Single
-				// net _net0 with one fd → [_net0@[N]].
-				restoreArg += fmt.Sprintf(",net_fds=[_net0@[%d]]", e.TapFDNum)
+				// net with one fd → [<netDevID>@[N]].
+				restoreArg += fmt.Sprintf(",net_fds=[%s@[%d]]", netDevID, e.TapFDNum)
 			}
 			cmd.Args = append(cmd.Args, "--api-socket", e.CHSock, "--restore", restoreArg)
 			logf("spawning %s --api-socket %s --restore %s", opts.CHBinary, e.CHSock, restoreArg)
