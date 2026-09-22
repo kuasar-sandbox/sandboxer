@@ -213,10 +213,10 @@ func (c *BlockCOW) readRangeLocked(ctx context.Context, buf []byte, offset int64
 			bits = c.bitmap
 		}
 		upper := bitmapBlockDirty(bits, block)
-		if upper {
-			for runEnd < end && bitmapBlockDirty(bits, runEnd/cowBlockSize) {
-				runEnd = min(runEnd+cowBlockSize, end)
-			}
+		// Both upper and base runs stay within the requested, stripe-locked
+		// range. Let the immutable reader choose its own lower I/O boundaries.
+		for runEnd < end && bitmapBlockDirty(bits, runEnd/cowBlockSize) == upper {
+			runEnd = min(runEnd+cowBlockSize, end)
 		}
 		if bitmap == nil {
 			c.bitmapMu.RUnlock()
