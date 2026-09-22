@@ -1945,6 +1945,29 @@ Restore does not:
 
 Allowed host-only fields include the network provider/current identity, cgroup/controller, allocatable CPU/memory and resource enforcement, actual kernel/runtime paths, active diff/template, restore prefetch, and timeouts. E owns the immutable disk graph, capacity identity, `deflate_on_oom`, and network topology. The kernel re-hash exception and runtime-footer comparison are described in [PortableSandboxConfig](sandbox.md#portable-config).
 
+Runtime selection is a restore-only preflight. First inspect the supplied
+`boot.runtime` file using the existing bundle-envelope and **basename + declared
+footer digest** comparison against E. Success returns immediately without a
+second lookup. If that file is missing, unreadable, malformed or mismatched, try
+exactly one sibling: E's validated runtime basename in the supplied path's parent
+directory. Do not follow the default file's symlink target to select a different
+directory, scan directories, or retry an identical candidate. Both candidates use
+the same check; if neither passes, report both causes. Invalid configuration,
+cancellation, and later disk/network/VM errors do not trigger runtime fallback.
+The existing local-E-relative default applies when no runtime binding is supplied.
+No new directory field is required; image cold start and `--from` are unchanged.
+
+Whichever candidate passes, use its absolute local path both for this invocation's
+runtime binding and `pmem[0].file` in the generated `snap-state/config.json`. The
+captured pmem must be the existing single runtime device with a nonempty file
+field. Only that file field changes; device ID, optional size and other attributes,
+`state.json`, original S/E and node defaults remain unchanged. The old absolute
+path need not exist. Versioned runtime files must remain immutable and available
+under distinct names in the same directory; no full EROFS rehash or runtime copy
+is added to restore. The existing `e2e_sandbox_restore.sh` verifies relocated-v1
+fallback from a v2-named default, unavailable captured path, selected pmem path,
+unchanged source artifacts/host inputs, guest readiness and continued execution.
+
 After restoring S0:
 
 ```text
