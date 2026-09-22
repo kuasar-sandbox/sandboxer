@@ -123,13 +123,15 @@ func benchmarkCOWWorkingSet(b *testing.B, work string, encrypted bool, factory f
 	var admission, total time.Duration
 	beforeIO := workingSetProcessIO(b)
 	var cpuBefore, cpuAfter unix.Rusage
-	if err := unix.Getrusage(unix.RUSAGE_SELF, &cpuBefore); err != nil {
-		b.Fatal(err)
-	}
 	var memBefore runtime.MemStats
 	runtime.ReadMemStats(&memBefore)
 	b.SetBytes(int64(operations * request))
 	b.ResetTimer()
+	// Timer bookkeeping reads MemStats; exclude its stop-the-world work from
+	// the CPU interval, just as it is excluded from the benchmark timer.
+	if err := unix.Getrusage(unix.RUSAGE_SELF, &cpuBefore); err != nil {
+		b.Fatal(err)
+	}
 	for iter := 0; iter < b.N; iter++ {
 		start := time.Now()
 		for i := 0; i < operations; i++ {
@@ -169,10 +171,10 @@ func benchmarkCOWWorkingSet(b *testing.B, work string, encrypted bool, factory f
 		}
 		total += time.Since(start)
 	}
-	b.StopTimer()
 	if err := unix.Getrusage(unix.RUSAGE_SELF, &cpuAfter); err != nil {
 		b.Fatal(err)
 	}
+	b.StopTimer()
 	var memAfter runtime.MemStats
 	runtime.ReadMemStats(&memAfter)
 	cpuNanos := cpuAfter.Utime.Nano() + cpuAfter.Stime.Nano() - cpuBefore.Utime.Nano() - cpuBefore.Stime.Nano()

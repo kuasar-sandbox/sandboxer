@@ -9,20 +9,27 @@ this harness neither calls host Drain nor claims persistence.
 
 Buffers, latency samples, and Python overhead belong to the Guest benchmark,
 not the production COW cache. Compare the same harness and operation counts.
+Use --mode baseline (the default) for the ten-workload run, or --mode sg for
+the separate four-workload comparison. Start a fresh sandbox for each run.
+Write verification and its bounded expected-data metadata are outside timing;
+request stamps are prepared before each measured syscall.
 """
 
+import argparse
 import json
 import mmap
 import os
 import resource
-import sys
+import struct
 import time
 
 size = 64 << 20
 page = 4096
-if len(sys.argv) != 3:
-    raise SystemExit('usage: python3 cow_guest_io.py ROOT_FILE DATA_FILE')
-paths = sys.argv[1:]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--mode', choices=('baseline', 'sg'), default='baseline')
+parser.add_argument('paths', nargs=2, metavar='FILE')
+args = parser.parse_args()
+paths = args.paths
 fds = [os.open(p, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_DIRECT, 0o600) for p in paths]
 buffer = mmap.mmap(-1, 1 << 20)
 buffer[:] = b'\x6d' * len(buffer)
@@ -37,52 +44,96 @@ for fd in fds:
     for off in range(0, size, len(buffer)):
         assert os.pwritev(fd, [view], off) == len(buffer)
 
-works = [('seq-read', 1 << 20), ('sg-seq-read', 1 << 20),
-         ('seq-write', 1 << 20), ('sg-seq-write', 1 << 20),
+works = [('seq-read', 1 << 20), ('seq-write', 1 << 20),
          ('random-read', page), ('random-write', page),
          ('partial-512', 512), ('hot-overwrite', page),
          ('cache-hot', page), ('root-seq-read', 1 << 20),
          ('root-seq-write', 1 << 20), ('multi-disk', 1 << 20)]
-for work, request in works:
+if args.mode == 'sg':
+    works = [('seq-read', 1 << 20), ('sg-seq-read', 1 << 20),
+             ('seq-write', 1 << 20), ('sg-seq-write', 1 << 20)]
+
+# One byte per 512 B sector plus the last request headers, bounded by the fixed
+# fixture size. This oracle describes expected contents without another payload
+# copy of either file. It is updated and fully checked outside timed writes.
+markers = [bytearray([0x6d]) * (size // 512) for _ in fds]
+headers = {}
+
+
+def target(work, request, i):
+    disk, off = 1, i * request
+    if work.startswith('root-'):
+        disk = 0
+    if work in ('random-read', 'random-write', 'partial-512', 'hot-overwrite'):
+        block = (i * 40503) % (size // page)
+        if work == 'hot-overwrite' and i % 10:
+            block %= 1024
+        off = block * page
+    if work == 'partial-512':
+        off += 512
+    if work == 'cache-hot':
+        off = (i % 1024) * page
+    if work == 'multi-disk':
+        disk, off = i % 2, (i // 2) * request
+    return disk, off
+
+
+def stamp(vector, disk, off, i):
+    struct.pack_into('<QQ', vector, 0, disk, off | (i << 32))
+
+
+for generation, (work, request) in enumerate(works):
+    reads = work.endswith('read') or work == 'cache-hot'
     operations = size // (request if request > page else page)
     if work == 'multi-disk':
         operations *= 2
     if work == 'cache-hot':
         for off in range(0, 4 << 20, len(buffer)):
             assert os.preadv(fds[1], [view], off) == len(buffer)
+    marker = 0x80 + generation
+    if not reads:
+        buffer[:] = bytes([marker]) * len(buffer)
+        sg_buffer[:] = bytes([marker]) * len(sg_buffer)
+    vectors = sg_vectors if work.startswith('sg-') else [view[:request]]
     latencies = []
     before_cpu = resource.getrusage(resource.RUSAGE_SELF)
     start = time.perf_counter_ns()
     for i in range(operations):
-        fd = fds[1]
-        off = i * request
-        if work.startswith('root-'):
-            fd = fds[0]
-        if work in ('random-read', 'random-write', 'partial-512', 'hot-overwrite'):
-            block = (i * 40503) % (size // page)
-            if work == 'hot-overwrite' and i % 10:
-                block %= 1024
-            off = block * page
-        if work == 'partial-512':
-            off += 512
-        if work == 'cache-hot':
-            off = (i % 1024) * page
-        if work == 'multi-disk':
-            fd = fds[i % 2]
-            off = (i // 2) * request
+        disk, off = target(work, request, i)
+        fd = fds[disk]
+        if not reads:
+            stamp(vectors[0], disk, off, i)
         before = time.perf_counter_ns()
-        vectors = sg_vectors if work.startswith('sg-') else [view[:request]]
-        if work.endswith('read') or work == 'cache-hot':
+        if reads:
             n = os.preadv(fd, vectors, off)
         else:
             n = os.pwritev(fd, vectors, off)
         latencies.append(time.perf_counter_ns() - before)
         assert n == request, (work, i, n, request)
-        assert vectors[0][0] == 0x6d and vectors[-1][-1] == 0x6d
+        if reads:
+            expected = headers.get((disk, off), bytes([markers[disk][off // 512]]) * 16)
+            assert vectors[0][:16] == expected
+            assert vectors[-1][-1] == markers[disk][(off + request - 1) // 512]
     elapsed = (time.perf_counter_ns() - start) / 1e9
     after_cpu = resource.getrusage(resource.RUSAGE_SELF)
+    verified = 0
+    if not reads:
+        # Within each workload ranges are disjoint or exact overwrites. Check
+        # the latest contents of every written range, including both disks.
+        latest = {target(work, request, i): i for i in range(operations)}
+        buffer[:] = bytes([marker]) * len(buffer)
+        for (disk, off), i in latest.items():
+            stamp(view, disk, off, i)
+            assert os.preadv(fds[disk], [sg_view[:request]], off) == request
+            assert sg_view[:request] == view[:request], ('write verification', work, disk, off)
+            for sector in range(off // 512, (off + request) // 512):
+                markers[disk][sector] = marker
+                headers.pop((disk, sector * 512), None)
+            headers[disk, off] = bytes(view[:16])
+        verified = len(latest)
     latencies.sort()
-    print(json.dumps({'work': work, 'operations': operations,
+    print(json.dumps({'mode': args.mode, 'work': work, 'operations': operations,
+                      'verified_write_ranges': verified,
                       'logical_bytes': operations * request,
                       'request_bytes': request, 'elapsed_s': elapsed,
                       'MiB/s': operations * request / (1 << 20) / elapsed,

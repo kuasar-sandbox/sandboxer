@@ -35,29 +35,37 @@ func BenchmarkCOWContention(b *testing.B) {
 					if err := cache.Drain(context.Background()); err != nil {
 						b.Fatal(err)
 					}
-					var wg sync.WaitGroup
+					var wg, ready sync.WaitGroup
 					start := make(chan struct{})
 					samples := make([][1024]int64, callers)
+					counts := make([][2][2]int64, callers) // disk, read/write; caller-owned
+					ready.Add(callers)
 					for caller := 0; caller < callers; caller++ {
 						wg.Add(1)
 						go func() {
 							defer wg.Done()
 							buf := make([]byte, cowBlockSize)
-							cow := cows[caller%disks]
 							operations := (b.N + callers - 1 - caller) / callers
 							sampleCount := min(operations, len(samples[caller]))
 							sampleIndex, nextSample := 0, 0
+							ready.Done()
 							<-start
-							for i := caller; i < b.N; i += callers {
-								off := int64((caller*16 + (i/callers)%16) * cowBlockSize)
+							for op := 0; op < operations; op++ {
+								disk := (caller + op) % disks
+								cow := cows[disk]
+								off := int64((caller*16 + op%16) * cowBlockSize)
 								before := time.Now()
 								var err error
-								if mixed && i%4 == 0 {
+								// One write per four visits to each disk, including
+								// the single-caller, two-disk combination.
+								if mixed && (op/disks)%4 == 0 {
 									_, err = cow.WriteAt(buf, off)
+									counts[caller][disk][1]++
 								} else {
 									_, err = cow.ReadAt(buf, off)
+									counts[caller][disk][0]++
 								}
-								if i/callers == nextSample {
+								if op == nextSample {
 									samples[caller][sampleIndex] = time.Since(before).Nanoseconds()
 									sampleIndex++
 									nextSample = sampleIndex * operations / sampleCount
@@ -71,6 +79,7 @@ func BenchmarkCOWContention(b *testing.B) {
 					}
 					b.SetBytes(cowBlockSize)
 					b.ReportAllocs()
+					ready.Wait()
 					b.ResetTimer()
 					close(start)
 					wg.Wait()
@@ -78,6 +87,15 @@ func BenchmarkCOWContention(b *testing.B) {
 						b.Fatal(err)
 					}
 					b.StopTimer()
+					for disk := range cows {
+						var reads, writes int64
+						for _, count := range counts {
+							reads += count[disk][0]
+							writes += count[disk][1]
+						}
+						b.ReportMetric(float64(reads)/float64(b.N), fmt.Sprintf("disk%d-reads/op", disk))
+						b.ReportMetric(float64(writes)/float64(b.N), fmt.Sprintf("disk%d-writes/op", disk))
+					}
 					var all []int64
 					for _, s := range samples {
 						for _, ns := range s {
