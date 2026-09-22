@@ -1987,7 +1987,7 @@ tmpfs 与磁盘的情况。这实现了 [issue #230](https://github.com/kuasar-s
 
 始终满足 `dirty_used <= used <= cache_size` 且 `dirty_used <= max_dirty_size`。
 提交 I/O 不释放预留。页池、索引、clean LRU 与 dirty FIFO 都以容量为界。释放时清除明文。
-独立有界开销包括每沙箱一个 1 MiB 明文批工作区与最多 256 个页指针，每个活动文件两个独立
+独立有界开销包括每沙箱最多 256 个写回页指针, 每个活动文件两个独立
 1 MiB MAP_SHARED I/O 工作区（每个额外对齐 padding 小于 1 MiB），以及随页数线性有界的
 页元数据、索引和 Go 分配器开销。`cache_size` 不是进程 RSS、guest memfd 映射、
 immutable-source cache、tmpfs 文件存储或快照输出内存的上限。
@@ -2014,8 +2014,10 @@ Read loading 预留总容量；没有可用 clean 槽时，可以用有界前台
 一次物理读取（最多 1 MiB）；缓存命中、base 或 hole 边界会结束该区间。按 stripe
 编号排序的一次性范围读锁防止并发写入/Discard，Loading 预留防止淘汰。缓存容量小于
 区间时，剩余冷页在相同 stripe 保护下直接读取但不入缓存。读取/解密保持在自有 MAP_SHARED I/O
-工作区内，先从该工作区填充并发布 clean 页，再复制到可被调用者或 guest 修改的输出
-内存。不新增与请求长度成比例的 payload 分配或 base 预取。
+工作区内. Loading 页在 cache mutex 外从该工作区填充, 再持锁发布为 clean,
+之后才复制到可被调用者或 guest 修改的输出内存. 本次有界请求范围内的连续 base 块
+合并交给 `BlockReader`, 下层读取边界仍由该 reader 决定. 不新增与请求长度成比例的
+payload 分配或 base 预取.
 
 新写在构造前同时申请总量与脏额度。Clean 变脏只需脏额度；未被选中的 dirty 页重写不追加
 额度或队列节点。完整页覆盖不读旧数据。首次部分写从 base（或零）构造完整页，保留现有
@@ -2032,8 +2034,10 @@ goroutine 或无界 payload 队列。块条带锁序列化前台同块访问；w
 
 每沙箱一个 worker 以最老脏页作为每批的锚点。热点覆盖不移到队尾。可合并同文件相邻脏页，
 每批最多 1 MiB，不填 hole 或预分配间隙。固定 1 ms 聚合窗口保证低速流量推进；额度压力与
-内部 Drain 立即唤醒。选中的页成为冻结 writeback，仍可读取，同页写等待。Worker 将明文
-复制到有界批工作区并加密副本，在不持有 cache/global 锁时执行 I/O。前台读有独立工作区。
+内部 Drain 立即唤醒. 选中的页成为冻结 writeback, 仍可读取, 同页写等待. Worker 将冻结页
+直接复制到 active diff 已有的 aligned MAP_SHARED 写工作区, 在该副本上加密,
+然后在不持有 cache/global 锁时执行 I/O. Cache page payload 保持明文, 不直接作为
+syscall buffer. 前台读有独立工作区.
 
 Worker 通过有界页索引收集同文件连续脏邻居，不要求到达顺序相邻；未选中页的 FIFO
 年龄保持不变。普通写入通知既不提前结束，也不重启固定聚合截止时间。压力和 Drain
