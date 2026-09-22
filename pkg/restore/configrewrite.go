@@ -3,6 +3,7 @@ package restore
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 )
 
 // pathRewrite gathers the runtime paths that supersede the values
@@ -13,6 +14,7 @@ type pathRewrite struct {
 	DiskReadOnly []bool   // expected readonly role for every device slot
 	APISock      string
 	VsockSock    string
+	RuntimePath  string // validated absolute runtime pmem backing file
 }
 
 // rewriteConfigPaths takes a config.json blob, parses as a generic map,
@@ -76,6 +78,24 @@ func rewriteConfigPaths(in []byte, p pathRewrite) ([]byte, error) {
 		}
 		dm["vhost_socket"] = p.DiskSocks[i]
 	}
+
+	// The single runtime pmem keeps its captured device identity and mapping.
+	// Rebind only its host file, including when the primary candidate matched.
+	pmem, ok := cfg["pmem"].([]any)
+	if !ok || len(pmem) != 1 {
+		return nil, fmt.Errorf("rewriteConfigPaths: runtime pmem must contain exactly one device")
+	}
+	runtime, ok := pmem[0].(map[string]any)
+	if !ok || runtime == nil {
+		return nil, fmt.Errorf("rewriteConfigPaths: pmem[0] must be an object")
+	}
+	if file, ok := runtime["file"].(string); !ok || file == "" {
+		return nil, fmt.Errorf("rewriteConfigPaths: pmem[0].file must be a non-empty string")
+	}
+	if !filepath.IsAbs(p.RuntimePath) {
+		return nil, fmt.Errorf("rewriteConfigPaths: runtime path must be absolute")
+	}
+	runtime["file"] = p.RuntimePath
 
 	// vsock socket path. CH 51 stores it under "vsock.socket".
 	if vsock, ok := cfg["vsock"].(map[string]any); ok {
