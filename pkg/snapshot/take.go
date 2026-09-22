@@ -61,7 +61,7 @@ type Sources struct {
 	// scheme-qualified file ref (memory section = [0,MemfdSize)). When set, Take flattens
 	// this run's resident memory delta ONTO it and absorbs the merged result as
 	// the new top — replacing the next-newest local layer instead of stacking
-	// (docs/sandbox-artifacts.md §9.1). Per-disk overlay flattening is driven by
+	// (docs/sandbox.md#checkpoint-history §6.1.2). Per-disk overlay flattening is driven by
 	// DiskDiff.MergeBase.
 	// Empty ⇒ no merge (stack via the parent refs).
 	MergeBaseSnapshot string

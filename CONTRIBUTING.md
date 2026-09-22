@@ -58,6 +58,10 @@ Draft pull requests are welcome for early feedback, but they are not merge candi
 
 Follow the [project documentation policy](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/CONTRIBUTING.md#documentation-contributions). Maintain full English/Chinese pairs at `name.md` and `name_zh.md` with reciprocal selectors. Preserve requirements, identifiers, examples, diagrams, facts and links; record source-backed corrections. Existing complete English-only material may remain English-only. A summary or language-detector pass is not a complete translation.
 
+The current design owners are [sandbox](docs/sandbox.md) for host control and the entire sandbox lifecycle, [sandbox-init](docs/sandbox-init.md) for the Guest ABI, and [cloud-hypervisor](docs/cloud-hypervisor.md) for VMM integration and patches, each with a complete Chinese counterpart. Integrate configuration, CLI/output, resources, artifacts, reads/writes, reliability and validation into their semantic owner sections. Keep Guest raw observations in the Guest ABI and generic carrier bytes in accelerator.
+
+Technical detail, a separate package or flag, or calling a document an owner is not an independent responsibility. A new document must justify a genuinely independent responsibility in its PR; this is not a universal ban on future components. Preserve maintained contracts, tables and examples when consolidating, and update source and assembled section links in both languages. Historical evidence does not require a maintained one-off report; retain repeatable methods in owner validation sections and leave raw historical runs in their original Git/PR/Issue history.
+
 ## Licensing of contributions
 
 By submitting a contribution, you agree that it is licensed under the license

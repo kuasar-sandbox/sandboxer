@@ -103,17 +103,11 @@ Go-only 源码构建需要本仓以及兄弟目录中的 `accelerator` 和 `conn
 
 ## 文档
 
-- [Sandbox artifact](docs/sandbox-artifacts_zh.md) - 便携 E/S 配置、parent/reference graph、carrier、integrity 和 publication contract。
+- [sandbox_zh.md](docs/sandbox_zh.md) — Host 控制与完整 Sandbox 生命周期：配置、输出目标、资源用量、COW、制品格式/发布、捕获、恢复、读取恢复和清理。
+- [sandbox-init_zh.md](docs/sandbox-init_zh.md) — Guest PID 1 ABI、初始化、vsock、原始 usage 观测、stdio 和应用生命周期。
+- [cloud-hypervisor_zh.md](docs/cloud-hypervisor_zh.md) — VMM 集成、补丁、构建和运行边界。
 
-完整设计与参考文档:
-
-- [`docs/usage_zh.md`](docs/usage_zh.md) - 可选资源用量、live/saved 查询、单位、持久化及损失边界;
-- [`docs/sandbox_zh.md`](docs/sandbox_zh.md) - host 控制面、配置、cold start、snapshot/export/restore 顺序、资源执行和清理;
-- [`docs/journald_zh.md`](docs/journald_zh.md) - 独立输出目标、自定义 journal field、组件诊断、编码和 fallback;
-- [`docs/sandbox-init_zh.md`](docs/sandbox-init_zh.md) - guest PID 1 ABI、分阶段初始化、vsock 控制、stdio 多路复用和应用合同;
-- [`docs/cloud-hypervisor_zh.md`](docs/cloud-hypervisor_zh.md) - patched Cloud Hypervisor source、build 和 Runtime contract。
-
-生命周期、guest ABI 与 VMM 指南通过相互语言选择器提供完整英文默认文档和中文对应文档。Native build 与 license scope 文档也提供英中版本。
+这三组 owner 文档提供完整英中版本。Native build 和 license scope 指南也有双语版本。章节归属与新增文档要求见英文 [Documentation policy](CONTRIBUTING.md#documentation)。
 
 ## 项目边界
 
