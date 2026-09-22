@@ -314,16 +314,24 @@ func (c *COWCache) readColdRunLocked(ctx context.Context, cow *BlockCOW, buf []b
 	c.mu.Unlock()
 	length := count * cowBlockSize
 	err := cow.diff.withDirectRead(length, offset, func(plain []byte) error {
+		// Loading entries are privately owned until publication: eviction,
+		// writes and discard cannot release or change them, and the COW's
+		// operation lifetime prevents detach. Fill from owned plaintext before
+		// taking the global lock to publish the completed pages.
+		for i, p := range reserved[:count] {
+			if p != nil {
+				copy(p.data[:], plain[i*cowBlockSize:(i+1)*cowBlockSize])
+			}
+		}
 		c.mu.Lock()
 		if err := c.checkLocked(ctx); err != nil {
 			c.mu.Unlock()
 			return err
 		}
-		for i, p := range reserved[:count] {
+		for _, p := range reserved[:count] {
 			if p == nil {
 				continue
 			}
-			copy(p.data[:], plain[i*cowBlockSize:(i+1)*cowBlockSize])
 			p.state = cacheClean
 			c.clean.push(p)
 		}
