@@ -1,9 +1,11 @@
 package vhost
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -105,6 +107,10 @@ func BenchmarkCOWSegments(b *testing.B) {
 					for i := range data[:request] {
 						data[i] = 0x6d
 					}
+					for i := 0; i < request; i += cowBlockSize {
+						binary.LittleEndian.PutUint64(data[i:i+8], uint64(i))
+					}
+					expectedCRC := crc32.ChecksumIEEE(data[:request])
 					if work != "write" {
 						for off := int64(0); off < dataset; off += request {
 							if err := writeFullAt(cow.diff, data[:request], off); err != nil {
@@ -125,6 +131,7 @@ func BenchmarkCOWSegments(b *testing.B) {
 					var samples [4096]int64 // fixed-size diagnostic sample, no timed allocation
 					sampleCount := min(b.N, len(samples))
 					sampleIndex, nextSample := 0, 0
+					var verification time.Duration
 					b.SetBytes(request)
 					b.ReportAllocs()
 					runtime.GC()
@@ -135,6 +142,10 @@ func BenchmarkCOWSegments(b *testing.B) {
 							off = 0
 						}
 						binary.LittleEndian.PutUint64(hdr[8:16], uint64(off/SectorSize))
+						if kind == BlkTypeOut {
+							binary.LittleEndian.PutUint64(data[:8], uint64(off))
+							binary.LittleEndian.PutUint64(data[8:16], uint64(i))
+						}
 						start := time.Now()
 						n, err := s.processChain(q, 0)
 						if i == nextSample {
@@ -149,14 +160,24 @@ func BenchmarkCOWSegments(b *testing.B) {
 						if err != nil || n != want || data[request] != BlkStatusOK {
 							b.Fatalf("request: %d %v status=%d", n, err, data[request])
 						}
-						if kind == BlkTypeIn && (data[0] != 0x6d || data[request-1] != 0x6d) {
-							b.Fatal("payload mismatch")
+						if kind == BlkTypeIn {
+							verifyStart := time.Now()
+							if crc32.ChecksumIEEE(data[:request]) != expectedCRC {
+								b.Fatal("read payload mismatch")
+							}
+							verification += time.Since(verifyStart)
 						}
 					}
 					if err := cow.Drain(context.Background()); err != nil {
 						b.Fatal(err)
 					}
 					b.StopTimer()
+					// Full-payload validation is benchmark-only work. Avoid per-I/O
+					// StopTimer/StartTimer MemStats scans; subtract its wall time.
+					elapsed := b.Elapsed() - verification
+					b.ReportMetric(float64(elapsed.Nanoseconds())/float64(b.N), "ns/op")
+					b.ReportMetric(float64(b.N*request)/elapsed.Seconds()/1e6, "MB/s")
+					b.ReportMetric(float64(verification.Nanoseconds())/float64(b.N), "verification-ns/op")
 					reportSamples(b, samples[:sampleCount])
 					b.ReportMetric(float64(backend.reads+backend.writes)/float64(b.N), "cow-calls/op")
 					b.ReportMetric(float64(probe.readCalls.Load())/float64(b.N), "body-reads/op")
@@ -166,6 +187,23 @@ func BenchmarkCOWSegments(b *testing.B) {
 					stats := cow.cache.Stats()
 					b.ReportMetric(float64(stats.PeakUsed), "cache-peak-B")
 					b.ReportMetric(float64(stats.PeakDirty), "dirty-peak-B")
+					if kind == BlkTypeOut {
+						// Check the actual diff after Drain, bypassing the clean cache.
+						// Metrics above already captured only the timed workload I/O.
+						var check [cowBlockSize]byte
+						for rangeIndex := 0; rangeIndex < min(b.N, dataset/request); rangeIndex++ {
+							off := rangeIndex * request
+							last := rangeIndex + (b.N-1-rangeIndex)/(dataset/request)*(dataset/request)
+							binary.LittleEndian.PutUint64(data[:8], uint64(off))
+							binary.LittleEndian.PutUint64(data[8:16], uint64(last))
+							for block := 0; block < request; block += cowBlockSize {
+								n, err := cow.diff.ReadAt(check[:], int64(off+block))
+								if err != nil || n != len(check) || !bytes.Equal(check[:], data[block:block+cowBlockSize]) {
+									b.Fatalf("write payload mismatch at %d: n=%d err=%v", off+block, n, err)
+								}
+							}
+						}
+					}
 				})
 			}
 		}

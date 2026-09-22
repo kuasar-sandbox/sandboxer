@@ -9,6 +9,10 @@ test process, not to the sandboxer COW implementation.
 Start a new sandbox for every workload/repeat. Each run has the same prefill;
 it never inherits dirty/writeback pages from another measured workload. Prefill
 is not a host Drain, and Guest FLUSH is deliberately not used as a boundary.
+Every read checks the full known fixture. Verification is outside syscall
+latency and excluded from serial elapsed time. Concurrent throughput and Guest
+CPU include verification: overlapping threads cannot subtract that cost from
+shared wall time without also subtracting the other thread's useful I/O.
 """
 
 import argparse
@@ -19,6 +23,7 @@ import resource
 import struct
 import threading
 import time
+import zlib
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--workload', required=True, choices=(
@@ -31,6 +36,8 @@ fds = [os.open(p, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_DIRECT, 0o600)
 buffer = mmap.mmap(-1, 1 << 20)
 buffer[:] = b'\x6d' * len(buffer)
 view = memoryview(buffer)
+page_checksum = zlib.crc32(view[:4096])
+run_checksum = zlib.crc32(view)
 for fd, size in zip(fds, (4 << 20, 64 << 20)):
     for off in range(0, size, len(buffer)):
         assert os.pwritev(fd, [view], off) == len(buffer)
@@ -40,9 +47,11 @@ if args.workload != 'hot-concurrent-scan':
     for _ in range(2):
         for off in range(0, 4 << 20, len(buffer)):
             assert os.preadv(fds[0], [view], off) == len(buffer)
+            assert zlib.crc32(view) == run_checksum, 'warm-up verification'
     if work.endswith('write'):
         view[:4096] = b'\x97' * 4096
     latencies = []
+    verification_ns = 0
     cpu_start = resource.getrusage(resource.RUSAGE_SELF)
     start = time.perf_counter_ns()
     operations = 4096
@@ -50,6 +59,9 @@ if args.workload != 'hot-concurrent-scan':
         if work == 'hot-with-scan' and i % 16 == 0:
             off = ((i // 16) % 64) * len(buffer)
             assert os.preadv(fds[1], [view], off) == len(buffer)
+            verify_start = time.perf_counter_ns()
+            assert zlib.crc32(view) == run_checksum, 'scan verification'
+            verification_ns += time.perf_counter_ns() - verify_start
         off = 0 if work == 'same-page-write' else (i % 1024) * 4096
         if work.endswith('write'):
             struct.pack_into('<Q', view, 0, i)
@@ -61,8 +73,10 @@ if args.workload != 'hot-concurrent-scan':
         latencies.append(time.perf_counter_ns() - before)
         assert n == 4096
         if not work.endswith('write'):
-            assert view[0] == 0x6d and view[4095] == 0x6d
-    elapsed = (time.perf_counter_ns() - start) / 1e9
+            verify_start = time.perf_counter_ns()
+            assert zlib.crc32(view[:4096]) == page_checksum, 'hot read verification'
+            verification_ns += time.perf_counter_ns() - verify_start
+    elapsed = (time.perf_counter_ns() - start - verification_ns) / 1e9
     cpu_end = resource.getrusage(resource.RUSAGE_SELF)
     if work.endswith('write'):
         latest = {(0 if work == 'same-page-write' else (i % 1024) * 4096): i
@@ -77,6 +91,8 @@ if args.workload != 'hot-concurrent-scan':
         'work': work, 'operations': operations, 'hot_logical_bytes': operations * 4096,
         'scan_logical_bytes': (256 << 20) if work == 'hot-with-scan' else 0,
         'elapsed_s': elapsed, 'hot_MiB/s': operations * 4096 / (1 << 20) / (sum(latencies) / 1e9),
+        'read_verification_s': verification_ns / 1e9,
+        'guest_cpu_includes_verification': True,
         'p50_us': latencies[len(latencies) // 2] / 1000,
         'p99_us': latencies[len(latencies) * 99 // 100] / 1000,
         'guest_cpu_s': cpu_end.ru_utime + cpu_end.ru_stime - cpu_start.ru_utime - cpu_start.ru_stime,
@@ -87,6 +103,7 @@ if args.workload == 'hot-concurrent-scan':
     # sharing the same sandbox cache. Keep only the latest 1024 hot latency samples.
     for off in range(0, 4 << 20, len(buffer)):
         assert os.preadv(fds[0], [view], off) == len(buffer)
+        assert zlib.crc32(view) == run_checksum, 'warm-up verification'
     hot_buffer = mmap.mmap(-1, 4096)
     hot_view = memoryview(hot_buffer)
     done = threading.Event()
@@ -97,6 +114,7 @@ if args.workload == 'hot-concurrent-scan':
         try:
             for i in range(256):
                 assert os.preadv(fds[1], [view], (i % 64) * len(buffer)) == len(buffer)
+                assert zlib.crc32(view) == run_checksum, 'scan verification'
         except BaseException as err:
             errors.append(err)
         finally:
@@ -114,6 +132,7 @@ if args.workload == 'hot-concurrent-scan':
             before = time.perf_counter_ns()
             assert os.preadv(fds[0], [hot_view], (operations % 1024) * 4096) == 4096
             samples[operations % len(samples)] = time.perf_counter_ns() - before
+            assert zlib.crc32(hot_view) == page_checksum, 'hot read verification'
             operations += 1
     finally:
         scanner.join()
@@ -122,10 +141,12 @@ if args.workload == 'hot-concurrent-scan':
     elapsed = (time.perf_counter_ns() - start) / 1e9
     cpu_end = resource.getrusage(resource.RUSAGE_SELF)
     samples = sorted(samples[:min(operations, len(samples))])
-    assert samples and hot_view[0] == 0x6d and hot_view[-1] == 0x6d
+    assert samples
     print(json.dumps({
         'work': 'hot-concurrent-scan', 'operations': operations,
         'scan_logical_bytes': 256 << 20, 'elapsed_s': elapsed,
+        'throughput_includes_verification': True,
+        'guest_cpu_includes_verification': True,
         'hot_MiB/s': operations * 4096 / (1 << 20) / elapsed,
         'scan_MiB/s': 256 / elapsed,
         'recent_p50_us': samples[len(samples) // 2] / 1000,
