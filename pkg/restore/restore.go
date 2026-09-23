@@ -27,6 +27,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/internal/chmemory"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
+	"github.com/kuasar-sandbox/sandboxer/internal/runidentity"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -364,10 +365,15 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, fmt.Errorf("rewrite config.json: %w", err)
 	}
+	identity, err := runidentity.Acquire(runDir, opts.SandboxID)
+	if err != nil {
+		return -1, fmt.Errorf("restore runtime identity: %w", err)
+	}
+	defer identity.Close()
+	defer identity.RemoveRunDir()
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return -1, err
 	}
-	defer os.RemoveAll(runDir)
 	if _, err := config.WritePortableSandboxConfig(runDir, c0); err != nil {
 		return -1, fmt.Errorf("write immutable C0: %w", err)
 	}
