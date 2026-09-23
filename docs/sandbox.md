@@ -2623,7 +2623,7 @@ Lazy process Fetcher initialization, referenced Bundle resolution and Bundle Chu
 
 The healthy retry helper allocates no timer and starts no goroutine. A failed synchronous read owns one reusable timer and its existing request/buffer. Backoff is bounded per wait, while the operation may remain pending indefinitely. Connection capacity includes idle, borrowed and dialing connections; bounded maintenance workers cannot grow with outage duration. Validation covers healthy-path allocation/latency comparisons and outage resource checks; these do not constitute a separate performance certification.
 
-The backend marker contract remains in [Accelerator read errors](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/accelerator-read-recovery.md); see also the original [proposal and acceptance checklist](https://github.com/kuasar-sandbox/sandboxer/issues/225).
+The backend marker contract remains in [Accelerator read errors](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/file-artifacts.md#4-read-errors-random-access-and-recovery); see also the original [proposal and acceptance checklist](https://github.com/kuasar-sandbox/sandboxer/issues/225).
 
 #### 13.3.1 Fatal ownership and capture
 
