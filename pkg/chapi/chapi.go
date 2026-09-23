@@ -215,7 +215,9 @@ func WaitReady(ctx context.Context, sock string, deadline time.Duration) error {
 }
 
 func errorsIsSocketPending(err error) bool {
-	return errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)
+	var netErr net.Error
+	return errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) ||
+		(errors.As(err, &netErr) && netErr.Timeout())
 }
 
 func probePaused(ctx context.Context, conn net.Conn, end time.Time) (ready, pending bool, err error) {
