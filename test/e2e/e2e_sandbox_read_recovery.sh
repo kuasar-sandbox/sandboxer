@@ -159,8 +159,16 @@ PY
 # The Guest touches captured anonymous pages and partially updates captured
 # disk blocks. Direct I/O forces post-restore COW materialization from source.
 cat > "$WORK/workload.py" <<'PY'
-import mmap, os, time
+import mmap, os, signal, time
 ram = bytearray(b'R' * (32 << 20))
+release = {'requested': False}
+def release_handler(_signum, _frame):
+    release['requested'] = True
+signal.signal(signal.SIGUSR1, release_handler)
+with open('/recovery.workload.pid', 'w') as f:
+    f.write(str(os.getpid()))
+last_trigger = ''
+force_idle = False
 fd = os.open('/recovery.data', os.O_CREAT | os.O_RDWR, 0o600)
 for i in range(256): os.pwrite(fd, bytes([i % 251]) * 4096, i * 4096)
 os.fsync(fd)
@@ -170,11 +178,32 @@ buf = mmap.mmap(-1, 4096)
 i = 0
 print('RECOVERY-READY', flush=True)
 while True:
-    if os.path.exists('/recovery.idle'):
+    if os.path.exists('/recovery.idle') or force_idle:
+        force_idle = False
         print('RECOVERY-IDLE', flush=True)
-        while os.path.exists('/recovery.idle'):
+        trigger_pid = 0
+        trigger_token = ''
+        while True:
+            try:
+                raw_trigger = open('/recovery.trigger').read().strip()
+            except FileNotFoundError:
+                raw_trigger = ''
+            if raw_trigger and raw_trigger != last_trigger:
+                pid_text, trigger_token = raw_trigger.split(':', 1)
+                trigger_pid = int(pid_text)
+                last_trigger = raw_trigger
+                print('RECOVERY-TRIGGER-ARMED', trigger_token, flush=True)
+            if release['requested'] and trigger_pid:
+                break
             time.sleep(.01)
-        print('RECOVERY-RESUMED', flush=True)
+        release['requested'] = False
+        while os.path.exists(f'/proc/{trigger_pid}'):
+            time.sleep(.01)
+        # Snapshot while the following source-backed access is retrying. If it
+        # completes first, the next iteration still re-enters this observable
+        # barrier, so the captured state has a deterministic restore boundary.
+        force_idle = True
+        print('RECOVERY-RESUMED', trigger_token, flush=True)
     page = i % 256
     assert ram[(i * 4096) % len(ram)] == ord('R')
     buf[:512] = b'W' * 512
@@ -227,6 +256,38 @@ launch() {
     readiness_wait_event "$ready" 1 control_ready "$RUN_PID" || return 1
     readiness_wait_event "$ready" 2 ready "$RUN_PID" || return 1
     readiness_assert_wire "$ready" "$ready_reader" $'control_ready\nready\n'
+}
+TRIGGER_CLIENT_PID=
+TRIGGER_FD=
+TRIGGER_FIFO=
+start_recovery_trigger() {
+    local sid=$1 token=$2 log=$3 before
+    before=$(grep -cE "^RECOVERY-TRIGGER-ARMED ${token}\$" "$log" 2>/dev/null || true)
+    TRIGGER_FIFO="$WORK/${token}.trigger.stdin"
+    rm -f "$TRIGGER_FIFO"
+    mkfifo "$TRIGGER_FIFO"
+    "$BIN/sandbox-ctl" exec --stdin --sandbox-id "$sid" --run-root "$WORK/run" -- sh -c "
+        read -r target < /recovery.workload.pid
+        printf '%s:%s\\n' \"\$\$\" \"\$1\" > /recovery.trigger
+        rm -f /recovery.idle
+        kill -0 \"\$target\"
+        printf 'TRIGGER-READY\\n'
+        read -r _
+        kill -USR1 \"\$target\"
+    " _ "$token" < "$TRIGGER_FIFO" > "$WORK/${token}.trigger.log" 2>&1 &
+    TRIGGER_CLIENT_PID=$!
+    exec {TRIGGER_FD}>"$TRIGGER_FIFO"
+    wait_file_count "$log" "^RECOVERY-TRIGGER-ARMED ${token}\$" "$before" "$RUN_PID"
+    kill -0 "$TRIGGER_CLIENT_PID"
+}
+release_recovery_trigger() {
+    printf 'release\n' >&"$TRIGGER_FD"
+    exec {TRIGGER_FD}>&-
+    wait "$TRIGGER_CLIENT_PID"
+    rm -f "$TRIGGER_FIFO"
+    TRIGGER_CLIENT_PID=
+    TRIGGER_FD=
+    TRIGGER_FIFO=
 }
 # Only the dedicated data disk's immutable chunks fail in this phase. Root
 # reads and UFFD remain available, so neither can delay the Guest before the
@@ -330,19 +391,25 @@ YAML
 launch recovered --restore "manifest://$SNAP" --config "$WORK/host.yaml"
 wait_file "$WORK/recovered.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- /bin/true
-# Stop the restored workload at an observable application barrier before the
-# capture outage. With no Guest UFFD/COW demand left running, a source fault
-# observed after the exec fence belongs to the capture lifecycle.
+# Stop the restored workload at an observable application barrier. Admit a
+# long-lived management exec while the source is healthy; after it records its
+# exact guest PID, stdin releases it without starting another exec during the
+# outage. The workload waits for that PID to disappear before source-backed I/O.
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'touch /recovery.idle'
 wait_file "$WORK/recovered.log" '^RECOVERY-IDLE$' "$RUN_PID"
-# The workload is now quiescent and no Guest source demand is running. Take the
-# baseline before starting snapshot; the first later source fault is therefore
-# caused by this capture, including faults in its pre-quiesce dependency work.
-CAPTURE_FAULT_BASE=$(fault_count)
+start_recovery_trigger recovered capture "$WORK/recovered.log"
 mode offline
+release_recovery_trigger
+CAPTURE_FAULT_BASE=$(fault_count)
+wait_new_fault "$CAPTURE_FAULT_BASE" "$RUN_PID"
+kill -0 "$RUN_PID"
+
+CAPTURE_QUIESCE_BASE=$(grep -c 'reverse-channel: quiesce' "$WORK/recovered.log" 2>/dev/null || true)
 "$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
 CAPTURE_PID=$!
-wait_new_fault "$CAPTURE_FAULT_BASE" "$CAPTURE_PID"
+# A live local CLI is not proof that SnapshotHandler admitted the request. The
+# guest's quiesce event proves the runtime has entered the snapshot lifecycle.
+wait_file_count "$WORK/recovered.log" 'reverse-channel: quiesce' "$CAPTURE_QUIESCE_BASE" "$CAPTURE_PID"
 kill -0 "$RUN_PID"; kill -0 "$CAPTURE_PID"
 [ ! -s "$WORK/next.key" ]
 
@@ -390,37 +457,29 @@ for b in d['backends']:
 print('PASS: real UFFD/Chunk window; no Guest I/O errors')
 PY
 launch verified --restore "manifest://$NEXT" --config "$WORK/host.yaml"
-# The restored workload was captured inside the idle loop. Use the existing
-# exec readiness contract to remove the gate, then require the workload to
-# resume and execute another checked direct-I/O iteration. This preserves the
-# original post-restore content proof without assuming every 1 MiB page had
-# already been rewritten before capture.
-VERIFIED_READY=0
-for _ in $(seq 1 200); do
-    if "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- rm -f /recovery.idle > "$WORK/verified-ready.log" 2>&1; then
-        VERIFIED_READY=1
-        break
-    fi
-    kill -0 "$RUN_PID" 2>/dev/null || { cat "$WORK/verified.log" "$WORK/verified-ready.log" >&2; exit 1; }
-    sleep .05
-done
-[ "$VERIFIED_READY" = 1 ] || { echo "verified restore never became exec-ready" >&2; exit 1; }
-wait_file "$WORK/verified.log" '^RECOVERY-RESUMED$' "$RUN_PID"
-wait_file "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
+# The capture sets force_idle before the retrying source access. A fresh token
+# therefore proves this restored execution is actually parked at that barrier,
+# even if pre-snapshot log lines were already drained by the old host.
+VERIFIED_TICK_BASE=$(grep -cE '^RECOVERY-TICK [0-9]+$' "$WORK/verified.log" 2>/dev/null || true)
+start_recovery_trigger verified verify "$WORK/verified.log"
+release_recovery_trigger
+wait_file "$WORK/verified.log" '^RECOVERY-RESUMED verify$' "$RUN_PID"
+wait_file_count "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$VERIFIED_TICK_BASE" "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
-# Re-enter the same observable idle state so the fatal capture has no
-# concurrent Guest source demand.
-VERIFIED_IDLE_BASE=$(grep -cE '^RECOVERY-IDLE$' "$WORK/verified.log" 2>/dev/null || true)
-"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- touch /recovery.idle
-wait_file_count "$WORK/verified.log" '^RECOVERY-IDLE$' "$VERIFIED_IDLE_BASE" "$RUN_PID"
-# A complete corrupt immutable response is a deterministic failure while an
-# idle restored Guest is in capture. With the workload already at RECOVERY-IDLE,
-# a new post-fence source fault is capture-specific.
-FATAL_FAULT_BASE=$(fault_count)
+# Every triggered access sets force_idle before I/O, so the verified iteration
+# returns to the same barrier. Arm the fatal trigger while healthy, then release
+# its already-admitted exec only after the source endpoint is offline.
+start_recovery_trigger verified fatal "$WORK/verified.log"
 mode offline
+release_recovery_trigger
+FATAL_FAULT_BASE=$(fault_count)
+wait_new_fault "$FATAL_FAULT_BASE" "$RUN_PID"
+kill -0 "$RUN_PID"
+
+FATAL_QUIESCE_BASE=$(grep -c 'reverse-channel: quiesce' "$WORK/verified.log" 2>/dev/null || true)
 "$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
 FATAL_CAPTURE_PID=$!
-wait_new_fault "$FATAL_FAULT_BASE" "$FATAL_CAPTURE_PID"
+wait_file_count "$WORK/verified.log" 'reverse-channel: quiesce' "$FATAL_QUIESCE_BASE" "$FATAL_CAPTURE_PID"
 kill -0 "$FATAL_CAPTURE_PID"
 [ ! -s "$WORK/fatal.key" ]
 mode corrupt
