@@ -16,13 +16,14 @@ import (
 // cleanup before closing the guard. It must not reopen this file itself:
 // closing any descriptor for an inode releases this process's POSIX locks.
 type Guard struct {
-	mu   sync.Mutex
-	dir  string
-	path string
-	file *os.File
-	info os.FileInfo
-	once sync.Once
-	err  error
+	mu        sync.Mutex
+	dir       string
+	path      string
+	file      *os.File
+	directory *os.File
+	info      os.FileInfo
+	once      sync.Once
+	err       error
 }
 
 // Kernel record locks do not reject another acquisition by the same process.
@@ -65,8 +66,36 @@ func acquire(runDir, sandboxID string, afterOpen func()) (*Guard, error) {
 	path := filepath.Join(realDir, sandboxID+".pid")
 	owners.Lock()
 	defer owners.Unlock()
-	if owners.byPath[path] != nil {
+	if owners.byPath[realDir] != nil {
 		return nil, errors.New("runtime identity: already running in this process")
+	}
+	// Cleanup owns the entire RunDir, not just one logical SandboxID. Lock
+	// the existing directory inode so different IDs with the same PathID cannot
+	// install competing cleanup owners. This needs no additional lock file.
+	dirFD, err := syscall.Open(realDir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	directory := os.NewFile(uintptr(dirFD), realDir)
+	keepDirectory := false
+	defer func() {
+		if !keepDirectory {
+			_ = directory.Close()
+		}
+	}()
+	if err := syscall.Flock(int(directory.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return nil, fmt.Errorf("runtime identity: RunDir is already owned: %w", err)
+	}
+	openedDir, err := directory.Stat()
+	if err != nil {
+		return nil, err
+	}
+	namedDir, err := os.Lstat(realDir)
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(dirInfo, openedDir) || !os.SameFile(openedDir, namedDir) {
+		return nil, errors.New("runtime identity: RunDir changed while acquiring ownership")
 	}
 	// Never open a hard link to an inode already owned under another name.
 	// Such aliases are not valid runtime identity files.
@@ -110,8 +139,9 @@ func acquire(runDir, sandboxID string, afterOpen func()) (*Guard, error) {
 	if _, err := file.WriteAt([]byte(strconv.Itoa(os.Getpid())+"\n"), 0); err != nil {
 		return fail(err)
 	}
-	guard := &Guard{dir: realDir, path: path, file: file, info: info}
-	owners.byPath[path] = guard
+	guard := &Guard{dir: realDir, path: path, file: file, directory: directory, info: info}
+	owners.byPath[realDir] = guard
+	keepDirectory = true
 	return guard, nil
 }
 
@@ -129,7 +159,7 @@ func (g *Guard) removeRunDir(afterUnlink func()) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	owners.Lock()
-	current := owners.byPath[g.path] == g
+	current := owners.byPath[g.dir] == g
 	owners.Unlock()
 	if !current {
 		return nil
@@ -202,9 +232,9 @@ func (g *Guard) Close() error {
 	g.once.Do(func() {
 		owners.Lock()
 		defer owners.Unlock()
-		g.err = g.file.Close()
-		if owners.byPath[g.path] == g {
-			delete(owners.byPath, g.path)
+		g.err = errors.Join(g.file.Close(), g.directory.Close())
+		if owners.byPath[g.dir] == g {
+			delete(owners.byPath, g.dir)
 		}
 	})
 	return g.err
