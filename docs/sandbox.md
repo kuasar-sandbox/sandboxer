@@ -90,6 +90,8 @@ sandbox-ctl upload-snapshot
 
 ### 2.2 `sandbox-ctl run`
 
+The runtime owns `<RunRoot>/<PathID>/<SandboxID>.pid` and its process-associated POSIX lock. Cold, `--from` and restore paths acquire this identity before publishing runtime files or admitting resources; a competing launch must fail without truncating the owner PID file or deleting its RunDir. Directory cleanup completes while the identity is still held. This is execution identity, not a second resource reservation. The same-PID exec launcher remains supported; a resident task parent must not own the runtime PID file.
+
 The three input modes are strictly separate:
 
 ```bash

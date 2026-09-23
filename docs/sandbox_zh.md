@@ -91,6 +91,8 @@ sandbox-ctl upload-snapshot
 
 ### 2.2 `sandbox-ctl run`
 
+runtime 自己持有 `<RunRoot>/<PathID>/<SandboxID>.pid` 及其进程关联的 POSIX 锁。cold、`--from` 和 restore 在发布运行文件、资源准入之前取得该身份；竞争启动失败不得截断已有 PID 文件或删除存活实例的 RunDir。目录清理完成后才释放身份锁。这是执行身份，不是另一套资源预留。旧的同 PID exec 启动方式仍可使用；常驻任务父进程不能冒充 runtime PID 文件的所有者。
+
 三种输入模式严格分离:
 
 ```bash
