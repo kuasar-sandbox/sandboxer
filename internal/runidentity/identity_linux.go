@@ -4,6 +4,7 @@ package runidentity
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -117,6 +118,11 @@ func acquire(runDir, sandboxID string, afterOpen func()) (*Guard, error) {
 // RemoveRunDir only removes the directory while its PID entry still denotes
 // this guard. A replaced/missing entry cannot authorize deletion of a new run.
 func (g *Guard) RemoveRunDir() error {
+	return g.removeRunDir(nil)
+}
+
+// afterUnlink is a test-only interleaving at the final identity handoff.
+func (g *Guard) removeRunDir(afterUnlink func()) error {
 	if g == nil {
 		return nil
 	}
@@ -138,7 +144,53 @@ func (g *Guard) RemoveRunDir() error {
 	if !os.SameFile(g.info, named) {
 		return nil
 	}
-	return os.RemoveAll(g.dir)
+	// Keep the identity entry visible and locked until every other entry is
+	// gone. RemoveAll(dir) could unlink the PID first, allowing a successor to
+	// acquire a new inode while the old recursive deletion is still running.
+	directory, err := os.Open(g.dir)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	for {
+		entries, readErr := directory.ReadDir(128)
+		for _, entry := range entries {
+			if entry.Name() == filepath.Base(g.path) {
+				continue
+			}
+			if err := os.RemoveAll(filepath.Join(g.dir, entry.Name())); err != nil {
+				return err
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+	named, err = os.Lstat(g.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(g.info, named) {
+		return nil
+	}
+	if err := os.Remove(g.path); err != nil {
+		return err
+	}
+	if afterUnlink != nil {
+		afterUnlink()
+	}
+	// The PID entry is no longer visible. Never recursively delete from here:
+	// a successor may already have created its own PID or other runtime files.
+	if err := os.Remove(g.dir); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) {
+		return err
+	}
+	return nil
 }
 
 func (g *Guard) Close() error {
