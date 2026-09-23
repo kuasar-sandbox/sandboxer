@@ -20,14 +20,6 @@ cleanup() {
     for sid in "${SESSIONS[@]}"; do readiness_kill_session KILL "$sid"; done
     for pid in $(jobs -pr); do kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; done
     echo "read-recovery evidence: $WORK (exit=$result)"
-    if [ "$result" -ne 0 ]; then
-        for evidence in faults.jsonl recovered.log recovered.snapshot.log verified.log fatal.snapshot.log cache.log proxy.log; do
-            if [ -s "$WORK/$evidence" ]; then
-                echo "==> read-recovery failure evidence: $evidence" >&2
-                tail -80 "$WORK/$evidence" >&2 || true
-            fi
-        done
-    fi
     if [ "$result" -eq 0 ] && [ -z "${E2E_KEEP:-}" ]; then rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
@@ -64,6 +56,24 @@ wait_file_count() {
         sleep .05
     done
     echo "timed out waiting for a new $pattern in $path" >&2; cat "$path" >&2; return 1
+}
+wait_cache_serving() {
+    local pid=$1
+    for _ in $(seq 1 1200); do
+        if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$HEALTH_PORT" > "$WORK/cache-health" 2>&1 \
+            && grep -q SERVING "$WORK/cache-health"; then
+            return
+        fi
+        kill -0 "$pid" 2>/dev/null || {
+            echo "cache-ctl exited before becoming SERVING" >&2
+            cat "$WORK/cache.log" >&2
+            return 1
+        }
+        sleep .05
+    done
+    echo "timed out waiting for cache-ctl to become SERVING" >&2
+    cat "$WORK/cache-health" "$WORK/cache.log" >&2
+    return 1
 }
 connect_failure_count() { grep -c '"event": "connect-failure"' "$WORK/faults.jsonl" 2>/dev/null || true; }
 wait_connect_failures() {
@@ -102,11 +112,7 @@ origin:
 YAML
 "$BIN/cache-ctl" serve --config "$WORK/cache.yaml" > "$WORK/cache.log" 2>&1 &
 CACHE_PID=$!; PIDS+=($CACHE_PID)
-for _ in $(seq 1 100); do
-    if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$HEALTH_PORT" > "$WORK/cache-health" 2>&1 && grep -q SERVING "$WORK/cache-health"; then break; fi
-    sleep .1
-done
-grep -q SERVING "$WORK/cache-health"
+wait_cache_serving "$CACHE_PID"
 mode healthy
 python3 "$SCRIPT_DIR/lib/read_fault_proxy.py" "$WORK/proxy.sock" "$CACHE_PORT" "$WORK/mode" "$WORK/faults.jsonl" > "$WORK/proxy.log" 2>&1 &
 PROXY_PID=$!; PIDS+=($PROXY_PID)
@@ -153,8 +159,16 @@ PY
 # The Guest touches captured anonymous pages and partially updates captured
 # disk blocks. Direct I/O forces post-restore COW materialization from source.
 cat > "$WORK/workload.py" <<'PY'
-import mmap, os, time
+import mmap, os, signal, time
 ram = bytearray(b'R' * (32 << 20))
+release = {'requested': False}
+def release_handler(_signum, _frame):
+    release['requested'] = True
+signal.signal(signal.SIGUSR1, release_handler)
+with open('/recovery.workload.pid', 'w') as f:
+    f.write(str(os.getpid()))
+last_trigger = ''
+force_idle = False
 fd = os.open('/recovery.data', os.O_CREAT | os.O_RDWR, 0o600)
 for i in range(256): os.pwrite(fd, bytes([i % 251]) * 4096, i * 4096)
 os.fsync(fd)
@@ -164,11 +178,32 @@ buf = mmap.mmap(-1, 4096)
 i = 0
 print('RECOVERY-READY', flush=True)
 while True:
-    if os.path.exists('/recovery.idle'):
+    if os.path.exists('/recovery.idle') or force_idle:
+        force_idle = False
         print('RECOVERY-IDLE', flush=True)
-        while os.path.exists('/recovery.idle'):
+        trigger_pid = 0
+        trigger_token = ''
+        while True:
+            try:
+                raw_trigger = open('/recovery.trigger').read().strip()
+            except FileNotFoundError:
+                raw_trigger = ''
+            if raw_trigger and raw_trigger != last_trigger:
+                pid_text, trigger_token = raw_trigger.split(':', 1)
+                trigger_pid = int(pid_text)
+                last_trigger = raw_trigger
+                print('RECOVERY-TRIGGER-ARMED', trigger_token, flush=True)
+            if release['requested'] and trigger_pid:
+                break
             time.sleep(.01)
-        print('RECOVERY-RESUMED', flush=True)
+        release['requested'] = False
+        while os.path.exists(f'/proc/{trigger_pid}'):
+            time.sleep(.01)
+        # Snapshot while the following source-backed access is retrying. If it
+        # completes first, the next iteration still re-enters this observable
+        # barrier, so the captured state has a deterministic restore boundary.
+        force_idle = True
+        print('RECOVERY-RESUMED', trigger_token, flush=True)
     page = i % 256
     assert ram[(i * 4096) % len(ram)] == ord('R')
     buf[:512] = b'W' * 512
@@ -221,6 +256,38 @@ launch() {
     readiness_wait_event "$ready" 1 control_ready "$RUN_PID" || return 1
     readiness_wait_event "$ready" 2 ready "$RUN_PID" || return 1
     readiness_assert_wire "$ready" "$ready_reader" $'control_ready\nready\n'
+}
+TRIGGER_CLIENT_PID=
+TRIGGER_FD=
+TRIGGER_FIFO=
+start_recovery_trigger() {
+    local sid=$1 token=$2 log=$3 before
+    before=$(grep -cE "^RECOVERY-TRIGGER-ARMED ${token}\$" "$log" 2>/dev/null || true)
+    TRIGGER_FIFO="$WORK/${token}.trigger.stdin"
+    rm -f "$TRIGGER_FIFO"
+    mkfifo "$TRIGGER_FIFO"
+    "$BIN/sandbox-ctl" exec --stdin --sandbox-id "$sid" --run-root "$WORK/run" -- sh -c "
+        read -r target < /recovery.workload.pid
+        printf '%s:%s\\n' \"\$\$\" \"\$1\" > /recovery.trigger
+        rm -f /recovery.idle
+        kill -0 \"\$target\"
+        printf 'TRIGGER-READY\\n'
+        read -r _
+        kill -USR1 \"\$target\"
+    " _ "$token" < "$TRIGGER_FIFO" > "$WORK/${token}.trigger.log" 2>&1 &
+    TRIGGER_CLIENT_PID=$!
+    exec {TRIGGER_FD}>"$TRIGGER_FIFO"
+    wait_file_count "$log" "^RECOVERY-TRIGGER-ARMED ${token}\$" "$before" "$RUN_PID"
+    kill -0 "$TRIGGER_CLIENT_PID"
+}
+release_recovery_trigger() {
+    printf 'release\n' >&"$TRIGGER_FD"
+    exec {TRIGGER_FD}>&-
+    wait "$TRIGGER_CLIENT_PID"
+    rm -f "$TRIGGER_FIFO"
+    TRIGGER_CLIENT_PID=
+    TRIGGER_FD=
+    TRIGGER_FIFO=
 }
 # Only the dedicated data disk's immutable chunks fail in this phase. Root
 # reads and UFFD remain available, so neither can delay the Guest before the
@@ -324,29 +391,32 @@ YAML
 launch recovered --restore "manifest://$SNAP" --config "$WORK/host.yaml"
 wait_file "$WORK/recovered.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- /bin/true
-# Stop the restored workload at an observable application barrier before the
-# outage. The snapshot contract does not require every capture to fetch a
-# remote chunk: clean lower pages may remain referenced. Instead, deliberately
-# create one real restored-Guest source read first, then request snapshot while
-# that read is known to be retrying. This directly proves snapshot/inflight
-# ordering without depending on page residency or the source image layout.
+# Stop the restored workload at an observable application barrier. Admit a
+# long-lived management exec while the source is healthy; after it records its
+# exact guest PID, stdin releases it without starting another exec during the
+# outage. The workload waits for that PID to disappear before source-backed I/O.
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'touch /recovery.idle'
 wait_file "$WORK/recovered.log" '^RECOVERY-IDLE$' "$RUN_PID"
-CAPTURE_FAULT_BASE=$(fault_count)
+start_recovery_trigger recovered capture "$WORK/recovered.log"
 mode offline
-"$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- rm -f /recovery.idle > "$WORK/recovered-resume.log" 2>&1 &
-RESUME_PID=$!
+release_recovery_trigger
+CAPTURE_FAULT_BASE=$(fault_count)
 wait_new_fault "$CAPTURE_FAULT_BASE" "$RUN_PID"
 kill -0 "$RUN_PID"
 
+CAPTURE_QUIESCE_BASE=$(grep -c 'reverse-channel: quiesce' "$WORK/recovered.log" 2>/dev/null || true)
 "$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" > "$WORK/next.key" 2> "$WORK/recovered.snapshot.log" &
 CAPTURE_PID=$!
-kill -0 "$CAPTURE_PID"
+# A live local CLI is not proof that SnapshotHandler admitted the request. The
+# guest's quiesce event proves the runtime has entered the snapshot lifecycle.
+wait_file_count "$WORK/recovered.log" 'reverse-channel: quiesce' "$CAPTURE_QUIESCE_BASE" "$CAPTURE_PID"
+kill -0 "$RUN_PID"; kill -0 "$CAPTURE_PID"
 [ ! -s "$WORK/next.key" ]
 
-# Keep the real read pending across repeated reconnects. The snapshot request
-# must remain pending behind the same runtime boundary, and retry attempts must
-# not leak one host resource per retry.
+# Reuse this same real capture to prove prolonged endpoint loss remains pending,
+# retries without leaking host resources, and recovers on the same endpoint.
+# Waiting for 12 failed reconnects exceeds the +8 FD/thread allowance, so a
+# one-resource-per-retry leak cannot hide inside the permitted baseline noise.
 kill -TERM "$CACHE_PID"; wait "$CACHE_PID"
 RETRY_BASE=$(connect_failure_count)
 python3 - "$RUN_PID" "$PROXY_PID" "$WORK/resources.before.json" <<'PY'
@@ -371,14 +441,8 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps(after))
 PY
 "$BIN/cache-ctl" serve --config "$WORK/cache.yaml" >> "$WORK/cache.log" 2>&1 &
 CACHE_PID=$!; PIDS+=($CACHE_PID)
-for _ in $(seq 1 100); do
-    if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$HEALTH_PORT" > "$WORK/cache-health" 2>&1 && grep -q SERVING "$WORK/cache-health"; then break; fi
-    sleep .1
-done
-grep -q SERVING "$WORK/cache-health"
+wait_cache_serving "$CACHE_PID"
 mode healthy
-wait "$RESUME_PID"
-wait_file "$WORK/recovered.log" '^RECOVERY-RESUMED$' "$RUN_PID"
 wait "$CAPTURE_PID"
 NEXT=$(cat "$WORK/next.key")
 [ "${#NEXT}" -eq 64 ]; wait "$RUN_PID"
@@ -393,40 +457,29 @@ for b in d['backends']:
 print('PASS: real UFFD/Chunk window; no Guest I/O errors')
 PY
 launch verified --restore "manifest://$NEXT" --config "$WORK/host.yaml"
-# The restored workload was captured inside the idle loop. Use the existing
-# exec readiness contract to remove the gate, then require the workload to
-# resume and execute another checked direct-I/O iteration. This preserves the
-# original post-restore content proof without assuming every 1 MiB page had
-# already been rewritten before capture.
-VERIFIED_READY=0
-for _ in $(seq 1 200); do
-    if "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- rm -f /recovery.idle > "$WORK/verified-ready.log" 2>&1; then
-        VERIFIED_READY=1
-        break
-    fi
-    kill -0 "$RUN_PID" 2>/dev/null || { cat "$WORK/verified.log" "$WORK/verified-ready.log" >&2; exit 1; }
-    sleep .05
-done
-[ "$VERIFIED_READY" = 1 ] || { echo "verified restore never became exec-ready" >&2; exit 1; }
-wait_file "$WORK/verified.log" '^RECOVERY-RESUMED$' "$RUN_PID"
-wait_file "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
+# The capture sets force_idle before the retrying source access. A fresh token
+# therefore proves this restored execution is actually parked at that barrier,
+# even if pre-snapshot log lines were already drained by the old host.
+VERIFIED_TICK_BASE=$(grep -cE '^RECOVERY-TICK [0-9]+$' "$WORK/verified.log" 2>/dev/null || true)
+start_recovery_trigger verified verify "$WORK/verified.log"
+release_recovery_trigger
+wait_file "$WORK/verified.log" '^RECOVERY-RESUMED verify$' "$RUN_PID"
+wait_file_count "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$VERIFIED_TICK_BASE" "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
-# Re-enter the observable idle state, then create a real pending restored-Guest
-# source read before asking for the fatal capture. The corrupt response is thus
-# tied to an actual inflight read while snapshot is waiting, not to an
-# assumption that capture itself must fetch a lower page.
-VERIFIED_IDLE_BASE=$(grep -cE '^RECOVERY-IDLE$' "$WORK/verified.log" 2>/dev/null || true)
-"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- touch /recovery.idle
-wait_file_count "$WORK/verified.log" '^RECOVERY-IDLE$' "$VERIFIED_IDLE_BASE" "$RUN_PID"
-FATAL_FAULT_BASE=$(fault_count)
+# Every triggered access sets force_idle before I/O, so the verified iteration
+# returns to the same barrier. Arm the fatal trigger while healthy, then release
+# its already-admitted exec only after the source endpoint is offline.
+start_recovery_trigger verified fatal "$WORK/verified.log"
 mode offline
-"$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- rm -f /recovery.idle > "$WORK/fatal-resume.log" 2>&1 &
-FATAL_RESUME_PID=$!
+release_recovery_trigger
+FATAL_FAULT_BASE=$(fault_count)
 wait_new_fault "$FATAL_FAULT_BASE" "$RUN_PID"
 kill -0 "$RUN_PID"
 
+FATAL_QUIESCE_BASE=$(grep -c 'reverse-channel: quiesce' "$WORK/verified.log" 2>/dev/null || true)
 "$BIN/sandbox-ctl" snapshot --sandbox-id verified --upload --run-root "$WORK/run" > "$WORK/fatal.key" 2> "$WORK/fatal.snapshot.log" &
 FATAL_CAPTURE_PID=$!
+wait_file_count "$WORK/verified.log" 'reverse-channel: quiesce' "$FATAL_QUIESCE_BASE" "$FATAL_CAPTURE_PID"
 kill -0 "$FATAL_CAPTURE_PID"
 [ ! -s "$WORK/fatal.key" ]
 mode corrupt
@@ -434,7 +487,6 @@ wait_file "$WORK/faults.jsonl" '"mode": "corrupt"' "$RUN_PID"
 for _ in $(seq 1 200); do kill -0 "$RUN_PID" 2>/dev/null || break; sleep .05; done
 if kill -0 "$RUN_PID" 2>/dev/null; then echo "fatal did not stop sandbox" >&2; exit 1; fi
 if wait "$RUN_PID"; then echo "fatal returned success" >&2; exit 1; fi
-wait "$FATAL_RESUME_PID" 2>/dev/null || true
 if wait "$FATAL_CAPTURE_PID"; then echo "fatal capture returned success" >&2; exit 1; fi
 [ ! -s "$WORK/fatal.key" ]
 if pgrep -s "$RUN_PID" -x cloud-hyperviso >/dev/null; then
