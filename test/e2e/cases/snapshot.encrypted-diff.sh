@@ -78,9 +78,17 @@ EOF
 AUTO_CONFIG="$WORK/manifest-auto.yaml"
 REQUIRED_CONFIG="$WORK/manifest-required.yaml"
 WRONG_CONFIG="$WORK/manifest-wrong.yaml"
+MISSING_CONFIG="$WORK/manifest-missing.yaml"
 write_manifest_config "$AUTO_CONFIG" auto "$KEY"
 write_manifest_config "$REQUIRED_CONFIG" required "$KEY"
 write_manifest_config "$WRONG_CONFIG" required "$(openssl rand -hex 32)"
+cat >"$MISSING_CONFIG" <<EOF
+manifest: {}
+store: { endpoint: 127.0.0.1:$STORE_PORT, pool: 4, timeout: 30s }
+cache: { endpoint: "" }
+chunker: { mode: cdc }
+crypto: { chunk: aes, manifest: aes, local: required }
+EOF
 
 ROOT_PLAIN="$WORK/root.plain"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_PLAIN" --no-progress
@@ -215,6 +223,9 @@ if not refs or any("@hmac:" not in ref for ref in refs):
 PY
 if "$BIN/sandbox-ctl" info --json --manifest-config "$WRONG_CONFIG" "$SNAP" >"$OUT/wrong-key.out" 2>"$OUT/wrong-key.err"; then
     e2e_fail "encrypted local snapshot unexpectedly opened with a wrong customer key"
+fi
+if "$BIN/sandbox-ctl" info --json --manifest-config "$MISSING_CONFIG" "$SNAP" >"$OUT/missing-key.out" 2>"$OUT/missing-key.err"; then
+    e2e_fail "encrypted local snapshot unexpectedly opened without a customer key"
 fi
 
 write_restore_config() {
