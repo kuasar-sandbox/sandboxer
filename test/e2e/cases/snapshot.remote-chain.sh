@@ -3,7 +3,8 @@
 set -euo pipefail
 
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
-source "$E2E_LIB/tarstream.sh"
+SANDBOXER_LIB="$E2E_LIB/sandboxer"
+source "$SANDBOXER_LIB/tarstream.sh"
 
 : "${E2E_WORKSPACE:?E2E_WORKSPACE is required}"
 : "${WORK:?WORK is required}"
