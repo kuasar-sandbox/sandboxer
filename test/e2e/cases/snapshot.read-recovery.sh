@@ -3,7 +3,8 @@
 set -euo pipefail
 
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
-source "$E2E_LIB/readiness_helpers.sh"
+SANDBOXER_LIB="$E2E_LIB/sandboxer"
+source "$SANDBOXER_LIB/readiness_helpers.sh"
 
 : "${E2E_WORKSPACE:?E2E_WORKSPACE is required}"
 : "${WORK:?WORK is required}"
@@ -21,7 +22,7 @@ done
 for file in sandbox-runtime.bundle vmlinux; do
     [ -f "$BIN/$file" ] || e2e_fail "missing prepared product: $file"
 done
-[ -f "$E2E_LIB/read_fault_proxy.py" ] || e2e_fail "missing prepared read_fault_proxy.py"
+[ -f "$SANDBOXER_LIB/read_fault_proxy.py" ] || e2e_fail "missing prepared read_fault_proxy.py"
 docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || e2e_fail "prepared E2E_IMAGE is not loaded: $E2E_IMAGE"
 
 mkdir -p "$WORK" "$OUT" "$WORK/run" "$WORK/base"
@@ -139,7 +140,7 @@ YAML
 CACHE_PID=$!
 wait_cache_serving "$CACHE_PID"
 mode healthy
-python3 "$E2E_LIB/read_fault_proxy.py" "$WORK/proxy.sock" "$CACHE_PORT" "$WORK/mode" "$WORK/faults.jsonl" >"$WORK/proxy.log" 2>&1 &
+python3 "$SANDBOXER_LIB/read_fault_proxy.py" "$WORK/proxy.sock" "$CACHE_PORT" "$WORK/mode" "$WORK/faults.jsonl" >"$WORK/proxy.log" 2>&1 &
 PROXY_PID=$!
 for _ in $(seq 1 100); do [ -S "$WORK/proxy.sock" ] && break; sleep .05; done
 [ -S "$WORK/proxy.sock" ] || e2e_fail "read-fault proxy did not create its socket"
