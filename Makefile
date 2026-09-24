@@ -8,7 +8,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench e2e-usage-probe test-e2e release test-release clean help
+.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench e2e-usage-probe e2e-cgroup-fork-probe test-e2e release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -97,6 +97,16 @@ e2e-usage-probe:
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
 	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
 		-o "$(E2E_FIXTURE_DIR)/usage-probe" test/e2e/usageprobe/main.go
+
+# The cgroup-control E2E must fork before libc or a language runtime starts in
+# order to detect Start->cgroup.procs races. Build that tiny libc-free probe in
+# the source-build stage; product E2E only consumes the prepared binary.
+e2e-cgroup-fork-probe:
+	@test "$(TARGET_ARCH)" = "x86_64" || { echo "cgroup-fork-probe is x86_64-only" >&2; exit 1; }
+	@mkdir -p "$(E2E_FIXTURE_DIR)"
+	cc -nostdlib -static -fno-stack-protector -fno-builtin -ffreestanding \
+		-fno-pie -no-pie -Wl,--build-id=none \
+		-o "$(E2E_FIXTURE_DIR)/cgroup-fork-probe" test/fixtures/cgroup_fork_probe.c
 
 test-e2e: e2e-usage-probe
 	bash scripts/ci-source-checks.sh
