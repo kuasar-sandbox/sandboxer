@@ -155,8 +155,12 @@ func (s *Server) readAvailRing(q *virtq) (availSnapshot, error) {
 	if err != nil {
 		return availSnapshot{}, err
 	}
+	// Acquire the published index before reading entries or descriptors.
+	idx, err := loadAvailIdxAcquire(hdr, q.availAddr)
+	if err != nil {
+		return availSnapshot{}, err
+	}
 	flags := binary.LittleEndian.Uint16(hdr[0:2])
-	idx := binary.LittleEndian.Uint16(hdr[2:4])
 	ring := make([]uint16, q.num)
 	for i := uint32(0); i < q.num; i++ {
 		ring[i] = binary.LittleEndian.Uint16(hdr[4+i*2 : 4+i*2+2])
@@ -170,7 +174,11 @@ func (s *Server) publishUsed(q *virtq, descIdx uint16, length uint32) error {
 	if err != nil {
 		return err
 	}
-	usedIdx := binary.LittleEndian.Uint16(usedHeader[2:4])
+	header, err := loadUsedHeaderAcquire(usedHeader, q.usedAddr)
+	if err != nil {
+		return err
+	}
+	usedIdx := header.index()
 
 	entryAddr := q.usedAddr + 4 + uint64(usedIdx%uint16(q.num))*8
 	entry, err := s.memTable.TranslateUVA(entryAddr, 8)
@@ -180,7 +188,8 @@ func (s *Server) publishUsed(q *virtq, descIdx uint16, length uint32) error {
 	binary.LittleEndian.PutUint32(entry[0:4], uint32(descIdx))
 	binary.LittleEndian.PutUint32(entry[4:8], length)
 
-	binary.LittleEndian.PutUint16(usedHeader[2:4], usedIdx+1)
+	// Release publishes the entry and request data/status before the index.
+	header.publishNextRelease()
 	return nil
 }
 
