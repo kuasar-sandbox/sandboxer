@@ -1807,7 +1807,7 @@ VM 错误不触发 runtime 回退。未提供 runtime 绑定时，保留既有�
 设备结构，且 file 字段非空。只改变该 file 字段，设备 ID、可选 size 及其他属性、
 `state.json`、原始 S/E 和节点默认配置均不改变。旧绝对路径无需存在。
 不同版本的 runtime 文件须以不同文件名在同目录中保持不可变且可用；恢复不新增
-整份 EROFS 重哈希或 runtime 复制。既有 `e2e_sandbox_restore.sh` 验证 v2 名称默认文件
+整份 EROFS 重哈希或 runtime 复制。既有 `snapshot.restore.sh` 验证 v2 名称默认文件
 回退到已迁移的 v1、捕获旧路径不可用、pmem 选定路径、源制品与 host 输入不变，
 以及 Guest ready 和执行继续。
 
@@ -2221,8 +2221,8 @@ Direct-I/O 预填充分离 cache 读取和温热 kernel file cache 的影响。�
 来源字符串及 varint 数值, 1 KiB 不是实测常数. CPU/Gauge 归并及保存测试位于
 [pkg/usage](../pkg/usage), 协议及阻塞来源测试属于
 [guestlink](../pkg/guestlink) 和 [sandbox-init](../cmd/sandbox-init).
-组件自有 [usage E2E](../test/e2e/e2e_usage.sh) 由
-[run_all.sh](../test/e2e/run_all.sh) 发现, 必须使用真实 KVM, 并核验 Guest 内
+组件自有 [usage E2E](../test/e2e/cases/telemetry.usage.sh) 由
+平台预备工作区运行器 发现, 必须使用真实 KVM, 并核验 Guest 内
 运行的 init 哈希与所提供的新 runtime bundle 一致. 短保存周期案例验证集成.
 Restore/clone 检查采用一分钟采样周期, 要求第一次周期 tick 前已得到新的内存/
 文件系统观测, 不允许周期重试掩盖 ACK 后立即首轮漏采.
@@ -2238,14 +2238,14 @@ resize, 才计为自主 deflate. 重复报告、错误 ACK、过期边界及控�
 记录的起跑字节写入端点使用 Host 单调时钟, 不是 Guest 分配时间戳,
 也不是 Guest 调度延迟的测量.
 
-[存储故障 E2E](../test/e2e/e2e_usage_faults.sh) 使用私有有界 tmpfs 产生真实
+[存储故障 E2E](../test/e2e/cases/telemetry.usage-faults.sh) 使用私有有界 tmpfs 产生真实
 ENOSPC, 并用限定 usage 路径的 `strace` 注入写入 EIO 和延迟写入; 还覆盖
 SIGKILL 与亚秒级 Guest 运行. 注入不作用于业务可写盘的同步操作, 也不模拟
 物理掉电. Host 强杀案例在崩溃前固定并验证自己的 CH 子进程, 然后通过
 pidfd 确认该子进程在有界清理预算内退出, 不把清理留给 runner.
 需要 Linux/Python pidfd 支持、`strace`、mount 权限及普通 KVM E2E 前置条件.
 
-[慢来源 E2E](../test/e2e/e2e_usage_sources.sh) 按设备身份选择一个已登记的
+[慢来源 E2E](../test/e2e/cases/telemetry.source-faults.sh) 按设备身份选择一个已登记的
 数据文件系统句柄, 核对 CLOEXEC 后, 仅在可丢弃 Guest 内延迟该 `fstatfs`
 返回. 测试要求首次 timeout、同一个已占用槽后续返回 busy、内存及健康文件
 系统持续获得新覆盖, 且 trace 中只有一次该文件系统调用. 两块数据盘均执行
@@ -2297,10 +2297,18 @@ health exec 和 CH `Running` 状态. 此次捕获失败回滚必须保留已占�
 报告应注明实际观测窗口; 它们不是物理掉电实验.
 
 在没有其他并发测试负载时, 以 root 权限和已组装的 `BIN` 运行
-[off/on 测量脚本](../test/e2e/usage_perf.py):
+性能测量与产品 E2E 分开。在源码构建阶段准备探针，并用 `USAGE_PROBE_BIN`
+提供已经构建的可执行文件：
 
 ```bash
-python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3
+make e2e-usage-probe
+export USAGE_PROBE_BIN="$PWD/build/e2e-tools/$(uname -m)/usage-probe"
+```
+
+[off/on 测量脚本](../test/perf/usage_perf.py):
+
+```bash
+python3 test/perf/usage_perf.py --densities 1,4 --seconds 30 --repeat 3
 ```
 
 基线测量原生进程 CPU、RssAnon/RssFile、FD/thread、非 dead 的 Go G 数量、
@@ -2314,7 +2322,7 @@ guest_time 端点、读取窗口、boot identity 和 tick 尺度.
 可选诊断可以帮助分析基线, 不是独立的性能验收目标, 也不是本功能合入的前置条件:
 
 ```bash
-python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3 --trace
+python3 test/perf/usage_perf.py --densities 1,4 --seconds 30 --repeat 3 --trace
 ```
 
 此可选 Linux amd64 跟踪运行需要具备指令偏移支持的

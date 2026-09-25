@@ -20,12 +20,27 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+# Test the same helpers/case bodies shipped to the prepared workspace.
+ROOT = Path(__file__).resolve().parents[2]
+LIB = ROOT / "test/e2e/lib"
+sys.path[:0] = [str(LIB), str(ROOT / "test/perf")]
+
+def load_case(name, filename):
+    from types import ModuleType
+    path = ROOT / "test/e2e/cases" / filename
+    text = path.read_text().split("<<'PY'\n", 1)[1].rsplit("\nPY\n", 1)[0]
+    module = ModuleType(name)
+    module.__file__ = str(path)
+    with patch.object(sys, "argv", [str(path), str(LIB)]):
+        exec(compile(text, str(path), "exec"), module.__dict__)
+    return module
+
 from usage import Sandbox, autonomous_balloon_prefix
 import usage
 import usage_perf
 import usage_trace
-import usage_faults
-import usage_sources
+usage_faults = load_case("usage_faults", "telemetry.usage-faults.sh")
+usage_sources = load_case("usage_sources", "telemetry.source-faults.sh")
 from usage_ch_relay import CHRelay
 from usage_vsock_relay import UsageHandler, UsageRelay, exact, frame, line
 from usage_report_relay import ReportRelay
@@ -33,7 +48,7 @@ from usage_report_relay import ReportRelay
 
 class ReadRecoveryFatalCauseTests(unittest.TestCase):
     def test_runtime_owner_reports_corruption_from_either_read_path(self):
-        script = Path(__file__).with_name("e2e_sandbox_read_recovery.sh").read_text()
+        script = (ROOT / "test/e2e/cases/snapshot.read-recovery.sh").read_text()
         assertions = [line for line in script.splitlines()
                       if line.startswith("grep ") and '"$WORK/verified.log"' in line]
         self.assertEqual(len(assertions), 1)
@@ -53,7 +68,8 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
                 with self.subTest(name=name):
                     Path(directory, "verified.log").write_text(contents)
                     result = subprocess.run(
-                        ["bash", "-c", assertions[0]], text=True, capture_output=True,
+                        ["bash", "-c", "e2e_fail() { return 1; }; " + assertions[0]],
+                        text=True, capture_output=True,
                         env={**os.environ, "WORK": directory})
                     self.assertEqual(result.returncode, 0 if expected else 1,
                                      result.stdout + result.stderr)
@@ -103,7 +119,7 @@ class HarnessProcessTests(unittest.TestCase):
             other.write_text("#!/bin/sh\nprintf 'wrong-driver\\n' >&2\nexit 47\n")
             other.chmod(0o755)
             with patch.dict(os.environ, {"GOROOT": str(selected.parent.parent), "PATH": str(other.parent), "KUASAR_E2E_GO": ""}):
-                selected_usage = runpy.run_path(usage.__file__)
+                selected_usage = runpy.run_path(usage_perf.__file__)
                 self.assertEqual(selected_usage["GO"], str(selected))
                 self.assertEqual(selected_usage["run"](selected_usage["GO"], "version"), "selected-driver\n")
                 selected.unlink()
@@ -112,51 +128,40 @@ class HarnessProcessTests(unittest.TestCase):
 
     def test_carried_go_entry_takes_precedence_after_sudo(self):
         with patch.dict(os.environ, {"KUASAR_E2E_GO": "/environment/go", "GOROOT": "/other/root"}):
-            selected_usage = runpy.run_path(usage.__file__)
+            selected_usage = runpy.run_path(usage_perf.__file__)
             self.assertEqual(selected_usage["GO"], "/environment/go")
 
     def test_without_goroot_preserves_path_selection(self):
         with patch.dict(os.environ, {"GOROOT": "", "KUASAR_E2E_GO": ""}):
-            selected_usage = runpy.run_path(usage.__file__)
+            selected_usage = runpy.run_path(usage_perf.__file__)
             self.assertEqual(selected_usage["GO"], "go")
 
     def test_run_returns_only_successful_stdout(self):
         self.assertEqual(usage.run(sys.executable, "-c",
             "import sys; print('answer'); print('note', file=sys.stderr)"), "answer\n")
 
-    def test_run_emits_captured_compiler_failure_and_preserves_exception(self):
-        selected = shutil.which(usage.GO)
-        self.assertIsNotNone(selected)
+    def test_run_emits_tool_failure_and_preserves_exception(self):
         diagnostics = io.StringIO()
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "broken.go"
-            source.write_text("package main\nfunc main() { this is not Go }\n")
-            with patch.object(usage, "GO", selected), patch.object(usage.sys, "stderr", diagnostics), \
-                 self.assertRaises(subprocess.CalledProcessError) as caught:
-                usage.build_probe(Path(directory) / "probe", source)
-        self.assertNotEqual(caught.exception.returncode, 0)
-        self.assertTrue(caught.exception.stderr)
-        self.assertIn(caught.exception.stderr, diagnostics.getvalue())
-        self.assertRegex(diagnostics.getvalue(), r"(syntax error|unexpected name)")
+        with patch.object(usage.sys, "stderr", diagnostics), self.assertRaises(subprocess.CalledProcessError) as caught:
+            usage.run(sys.executable, "-c", "import sys; print('tool-failure', file=sys.stderr); sys.exit(47)")
+        self.assertEqual(caught.exception.returncode, 47)
+        self.assertIn("tool-failure", diagnostics.getvalue())
 
-    def test_selected_go_survives_path_reset_and_builds_without_go_mod(self):
-        selected = shutil.which(usage.GO)
-        self.assertIsNotNone(selected)
+    def test_custom_probe_source_cannot_compile(self):
+        with patch.object(usage, "run", side_effect=AssertionError("compiler must not run")):
+            with self.assertRaisesRegex(AssertionError, "cannot compile"):
+                usage.build_probe(Path("unused"), Path("custom.go"))
+
+    def test_prepared_probe_survives_reset_path(self):
         with tempfile.TemporaryDirectory() as directory:
-            work = Path(directory)
-            source = work / "assembled" / "usageprobe" / "main.go"
-            source.parent.mkdir(parents=True)
-            source.write_text("package main\nimport \"fmt\"\nfunc main() { fmt.Print(\"probe\") }\n")
-            output = work / "rootfs" / "probe"
-            output.parent.mkdir()
-            # Model sudo secure_path with a PATH that cannot resolve `go`.
-            with patch.object(usage, "GO", selected), patch.dict(os.environ, {"PATH": "/nonexistent"}):
-                usage.build_probe(output, source)
-                version = usage.run(selected, "version")
-            self.assertTrue(output.is_file())
-            self.assertIn("go version go", version)
-            self.assertFalse((work / "go.mod").exists())
-            self.assertFalse((work / "assembled" / "go.mod").exists())
+            probe = Path(directory) / "prepared"
+            probe.write_bytes(b"prepared target bytes")
+            probe.chmod(0o755)
+            output = Path(directory) / "probe"
+            with patch.dict(os.environ, {"PATH": "/nonexistent", "USAGE_PROBE_BIN": str(probe)}):
+                usage.build_probe(output)
+            self.assertEqual(output.read_bytes(), probe.read_bytes())
+            self.assertEqual(output.stat().st_mode & 0o777, 0o755)
 
 
 class SourceFaultTests(unittest.TestCase):
@@ -814,7 +819,7 @@ class RestoreWrapperTests(unittest.TestCase):
             with patch.object(os, "execv", side_effect=SystemExit) as execute, \
                  patch.dict(os.environ, {"USAGE_TEST_CH": "/test/ch"}), patch("sys.argv", args):
                 with self.assertRaises(SystemExit):
-                    runpy.run_path(str(Path(__file__).with_name("usage_vsock_wrapper.py")))
+                    runpy.run_path(str(LIB / "usage_vsock_wrapper.py"))
             self.assertEqual(snapshot.read_text(), original)
             changed = json.loads((state / "config.json").read_text())
             self.assertEqual(changed, {**value, "vsock": {**value["vsock"], "socket": value["vsock"]["socket"]+".real"}})
@@ -829,7 +834,7 @@ class RestoreWrapperTests(unittest.TestCase):
             args = ["wrapper", "--api-socket", str(Path(directory) / "run/ch.sock"), "--restore", "source_url=file://"+str(state)]
             with patch.object(os, "execv") as execute, patch("sys.argv", args):
                 with self.assertRaisesRegex(AssertionError, "disposable restore state"):
-                    runpy.run_path(str(Path(__file__).with_name("usage_vsock_wrapper.py")))
+                    runpy.run_path(str(LIB / "usage_vsock_wrapper.py"))
             execute.assert_not_called()
             self.assertEqual((state / "config.json").read_text(), "do not edit")
 
@@ -1106,7 +1111,7 @@ class CleanupTests(unittest.TestCase):
                 def run(*args, **kwargs):
                     if args[0] == "gdb":
                         return "$1 = 0x40\n"
-                    if args[0] == usage.GO:
+                    if args[0] == usage_perf.GO:
                         return "  source.go:1 0x1000 00 TESTQ AX, AX\n  source.go:2 0x1001 c3 RET\n"
                     if failure == "version":
                         raise RuntimeError("version failure")

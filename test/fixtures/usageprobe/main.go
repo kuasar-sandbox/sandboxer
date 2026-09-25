@@ -1,4 +1,4 @@
-// usageprobe is a static guest workload for e2e_usage.sh. It is not shipped.
+// usageprobe is a prepared static guest workload for the telemetry E2E cases.
 package main
 
 import (

@@ -257,10 +257,24 @@ expect_invalid_archive() {
   fi
 }
 
-for entrypoint in test/e2e/e2e_sandbox_*.sh test/e2e/run_all.sh; do
-  [ "$(git -C "$ROOT" ls-files -s -- "$entrypoint" | awk '{print $1}')" = 100755 ] \
-    || fail "$entrypoint is not executable in the Git index"
-done
+python3 - "$ROOT" <<'PYCASE'
+import pathlib, re, subprocess, sys
+root = pathlib.Path(sys.argv[1])
+files = subprocess.check_output(["git", "-C", str(root), "ls-files", "test/e2e"], text=True).splitlines()
+cases = [name for name in files if name.startswith("test/e2e/cases/")]
+assert cases, "sandboxer candidate E2E set is empty"
+for name in cases:
+    path = root / name
+    assert re.fullmatch(r"(?:basic|storage|image|network|sandbox|snapshot|orchestrator|builder|telemetry)\.[a-z0-9][a-z0-9._-]*\.sh", path.name), name
+    assert path.is_file() and not path.is_symlink(), name
+    assert ".." not in path.name, name
+for name in files:
+    path = pathlib.PurePosixPath(name)
+    assert not (path.parent == pathlib.PurePosixPath("test/e2e") and (path.name == "run_all.sh" or path.name.startswith("e2e_"))), name
+    assert path.parent != pathlib.PurePosixPath("test/e2e"), "source/helper/perf files belong outside the product case root: " + name
+for name in ("sandbox.memory-budget.sh", "telemetry.usage.sh", "telemetry.usage-faults.sh", "telemetry.source-faults.sh"):
+    assert "test/e2e/cases/" + name in cases, "incomplete sandboxer cutover: " + name
+PYCASE
 
 mkdir -p "$TMP/bin" "$TMP/src" "$TMP/cloud-hypervisor/LICENSES" \
   "$TMP/accelerator" "$TMP/connector"

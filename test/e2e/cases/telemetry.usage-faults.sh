@@ -1,10 +1,28 @@
+#!/usr/bin/env bash
+# Real usage-file ENOSPC, write failure/stall, abrupt exit and short-run accounting.
+set -euo pipefail
+source "${E2E_LIB:?E2E_LIB is required}/common.sh"
+SANDBOXER_LIB="$E2E_LIB/sandboxer"
+: "${E2E_WORKSPACE:?E2E_WORKSPACE is required}" "${WORK:?WORK is required}" "${OUT:?OUT is required}" "${USAGE_PROBE_BIN:?USAGE_PROBE_BIN is required}"
+require_root
+require_kvm
+for command in python3 strace mount umount mkfs.ext4; do require_command "$command"; done
+for binary in sandbox-ctl sandbox-init cloud-hypervisor flatten-ctl mkfs.erofs; do require_binary "$binary"; done
+for file in sandbox-runtime.bundle vmlinux; do [ -f "$BIN/$file" ] || e2e_fail "missing prepared product: $file"; done
+[ -x "$USAGE_PROBE_BIN" ] || e2e_fail "missing executable prepared usage probe"
+for file in usage.py usage_report_relay.py usage_vsock_relay.py usage_oom_wrapper.py; do [ -f "$SANDBOXER_LIB/$file" ] || e2e_fail "missing prepared helper: $file"; done
+export PYTHONDONTWRITEBYTECODE=1
+python3 - "$SANDBOXER_LIB" <<'PY'
+import sys
+from pathlib import Path
+LIB = Path(sys.argv[1])
+sys.path.insert(0, str(LIB))
 #!/usr/bin/env python3
 """Faults affect only disposable test VMs and their usage files.
 
 ENOSPC is real bounded tmpfs exhaustion. Write errors and blocked writes are
 explicit syscall injection, not hardware failure or a power-loss experiment.
 """
-import argparse
 import atexit
 import errno
 import json
@@ -14,10 +32,9 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 
-from usage import BIN, GO, Sandbox, build_probe, digest, ext4, image_ref, kill_host_and_stop_ch, metric, run, write_json, runtime_init_digest
+from usage import BIN, Sandbox, build_probe, digest, ext4, image_ref, kill_host_and_stop_ch, metric, run, write_json, runtime_init_digest
 
 
 def inject(sb, syscall, action):
@@ -72,17 +89,13 @@ def collect_and_unmount(mount, sb):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cases", default="enospc,write-error,writer,kill,short")
-    args = parser.parse_args()
-    assert os.geteuid() == 0
-    cases = args.cases.split(",")
-    assert set(cases) <= {"enospc", "write-error", "writer", "kill", "short"}
-    work = Path(tempfile.mkdtemp(prefix="e2e-usage-faults-"))
+    cases = ("enospc", "write-error", "writer", "kill", "short")
+    work = Path(os.environ["WORK"]) / "usage-faults"
+    work.mkdir(parents=True, exist_ok=True)
     print(f"usage fault evidence: {work}", flush=True)
-    if os.environ.get("KUASAR_CI_DIR"):
+    if os.environ["OUT"]:
         def collect():
-            evidence = Path(os.environ["KUASAR_CI_DIR"]) / "usage-faults"
+            evidence = Path(os.environ["OUT"]) / "usage-faults"
             for path in work.rglob("*"):
                 if path.is_file() and path.suffix in (".json", ".log", ".usage"):
                     dest = evidence / path.relative_to(work)
@@ -90,7 +103,7 @@ def main():
                     # CI uploads run as the runner user after this root suite.
                     shutil.copyfile(path, dest)
         atexit.register(collect)
-    metadata = {"host_kernel": run("uname", "-a"), "build": run(GO, "version", "-m", BIN / "sandbox-ctl"),
+    metadata = {"host_kernel": run("uname", "-a"),
                 "ch": run(BIN / "cloud-hypervisor", "--version"), "cases": cases,
                 "artifacts": {n: digest(BIN / n) for n in ("sandbox-ctl", "sandbox-init", "sandbox-runtime.bundle", "vmlinux", "cloud-hypervisor")}}
     write_json(work / "source-set.json", metadata)
@@ -236,3 +249,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+PY

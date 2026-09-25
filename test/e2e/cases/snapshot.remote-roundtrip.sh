@@ -108,7 +108,19 @@ wait_tick() {
     e2e_fail "timed out waiting for TICK $want"
 }
 last_tick() {
-    awk '/^TICK [0-9]+ DISK blk0=TICK00000000$/ { n=$2 } END { if (n=="") exit 1; print n }' "$1"
+    local tick
+    if ! tick=$(awk -v marker="DISK blk0=TICK00000000" '
+        /^TICK([[:space:]]|$)/ { last = $0 }
+        END {
+            n = split(last, fields, " ")
+            if (n != 4 || fields[2] !~ /^[0-9]+$/ ||
+                last != "TICK " fields[2] " " marker) exit 1
+            print fields[2]
+        }' "$1"); then
+        echo "FAIL: missing or invalid final TICK/cold-disk record in $1" >&2
+        return 1
+    fi
+    printf '%s\n' "$tick"
 }
 write_host_config() {
     local path=$1 diff=$2 hostname=$3

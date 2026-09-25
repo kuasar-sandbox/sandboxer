@@ -14,7 +14,10 @@ import subprocess
 import sys
 import time
 
-from usage import BIN, GO, run, write_json
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "e2e/lib"))
+REPO = Path(__file__).resolve().parents[2]
+GO = os.environ.get("KUASAR_E2E_GO") or (str(Path(os.environ["GOROOT"]) / "bin/go") if os.environ.get("GOROOT") else "go")
+from usage import BIN, run, write_json
 
 
 def check_pid_namespace(bpftrace):

@@ -203,17 +203,18 @@ For broader validation, run from the `sandboxer/` repository root:
 
 ```bash
 make test
-make test-e2e
+make test-e2e-scripts
 ```
 
-The component E2E target uses the assembled platform binaries selected by
-`E2E_BIN`. The complete platform build-and-test gate is
-`make -C ../kuasar-sandbox test-e2e` from the sandboxer repository root; the old
-`test-e2e-sandbox-cold` platform target does not exist.
+Product E2E runs separately from source-build checks. From a platform workspace
+prepared with these prebuilt binaries, run:
+
+```bash
+python3 "$PREPARED/test/e2e/e2e" run --workdir "$PREPARED" --suite sandbox --suite snapshot
+```
 
 Real E2E requires `/dev/kvm`, the guest runtime, `vmlinux`, and the network/TAP
-prerequisites of the selected cases. Some individual scripts can skip missing
-prerequisites when invoked directly, but `test/e2e/run_all.sh` exports
-`REQUIRE_KVM=1`: the component and release gates fail rather than treating those
-missing prerequisites as success. Run the full platform gate in a suitable KVM
-environment before release.
+prerequisites of the selected cases. Exact candidate cases run from the
+platform-prepared workspace and fail closed when selected prerequisites are
+missing. Run the full platform gate in a suitable KVM environment before
+release.

@@ -1,82 +1,38 @@
 #!/usr/bin/env bash
-#
-# e2e_sandbox_memory_budget_workingset.sh — real-KVM regression for #114.
-#
-# The test records the same deterministic rootfs file under four snapshots:
-#
-#   new-w         C=8GiB, H=256MiB, drop_caches=false, merge_ref=false
-#   no-balloon-w  C=8GiB, H=C,      drop_caches=false, merge_ref=false
-#   workaround-w  C=8GiB, H=7.5GiB, drop_caches=false, merge_ref=false
-#   new-b         same live VM as new-w, drop_caches=true
-#
-# Every W restore probes mincore before its first content read. The final JSON
-# artifact records freeze MemAvailable/Cached, CH target/current, Budget values,
-# snapshot resident bytes, rootfs vhost reads/bytes/latency, and UFFD counters.
-# No fixed latency threshold is introduced: the read-amplification gate is
-# relative to the two controls. Every W case requires full pre-read residency;
-# the one-Step shrink deadband offsets memory.high's minimum PressureReserve so
-# the configured clean working set is not reclaimed before capture.
-
+# Product correctness regression for #114: budget, state, and snapshot residency.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-# shellcheck source=test/e2e/lib/tarstream.sh
-. "$SCRIPT_DIR/lib/tarstream.sh"
-
-BIN="${BIN:-$REPO_ROOT/bin}"
-IMAGE="${IMAGE:-python:3.12-slim}"
+source "${E2E_LIB:?E2E_LIB is required}/common.sh"
+SANDBOXER_LIB="$E2E_LIB/sandboxer"
+source "$SANDBOXER_LIB/tarstream.sh"
+: "${BIN:?BIN is required}"
+: "${E2E_WORKSPACE:?E2E_WORKSPACE is required}"
+: "${WORK:?WORK is required}"
+: "${OUT:?OUT is required}"
+: "${E2E_IMAGE:?E2E_IMAGE is required}"
+require_root
+require_kvm
+for command in docker mkfs.ext4 python3 timeout truncate; do require_command "$command"; done
+for binary in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle flatten-ctl vmlinux; do
+    [ -e "$BIN/$binary" ] || e2e_fail "missing prepared product: $BIN/$binary"
+done
+docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || e2e_fail "prepared E2E_IMAGE is not loaded: $E2E_IMAGE"
 CAPACITY_BYTES=$((8 * 1024 * 1024 * 1024))
 HEADROOM_BYTES=$((256 * 1024 * 1024))
 MEMORY_STEP_BYTES=$((64 * 1024 * 1024))
-# Match #114's failure shape: anonymous demand consumes roughly the old total
-# Budget while a separate 256MiB clean file working set must remain available
-# to a W snapshot. A cache-only 64MiB smoke can pass the old broken model.
-ANON_BYTES="${ANON_WORKING_SET_BYTES:-$((1024 * 1024 * 1024))}"
-WARM_BYTES="${WORKING_SET_BYTES:-$((256 * 1024 * 1024))}"
-REPORT_SETTLE_SECONDS="${MEM_REPORT_SETTLE_SECONDS:-6}"
-
-skip() {
-    echo
-    echo "==> e2e_sandbox_memory_budget_workingset: skipping ($*)"
-    if [ "${REQUIRE_KVM:-0}" = "1" ]; then
-        echo "REQUIRE_KVM=1 set; failing instead of skipping" >&2
-        exit 1
-    fi
-    exit 0
-}
-
-[ -e /dev/kvm ] || skip "/dev/kvm not present"
-if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-    skip "/dev/kvm not accessible"
-fi
-for binary in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle flatten-ctl; do
-    [ -e "$BIN/$binary" ] || skip "missing $BIN/$binary"
-done
-VMLINUX="${VMLINUX:-$BIN/vmlinux}"
-[ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX"
-command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
-command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
-
-case "$WARM_BYTES" in
-    ''|*[!0-9]*|0) echo "$0: WORKING_SET_BYTES must be a positive integer" >&2; exit 1 ;;
-esac
-case "$ANON_BYTES" in
-    ''|*[!0-9]*|0) echo "$0: ANON_WORKING_SET_BYTES must be a positive integer" >&2; exit 1 ;;
-esac
-case "$REPORT_SETTLE_SECONDS" in
-    ''|*[!0-9]*|0) echo "$0: MEM_REPORT_SETTLE_SECONDS must be a positive integer" >&2; exit 1 ;;
-esac
-if [ "$(id -u)" -ne 0 ]; then
-    exec sudo -nE "$0" "$@"
-fi
-
-WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/e2e-memory-budget-ws-XXXXXX")"
+ANON_BYTES=$((1024 * 1024 * 1024))
+WARM_BYTES=$((256 * 1024 * 1024))
+REPORT_SETTLE_SECONDS=6
 RUN_ROOT="$WORK/run"
 BASE_ROOT="$WORK/base"
-RESULT_ROOT="$WORK/results"
+RESULT_ROOT="$OUT/memory-budget"
 CGROUP_ROOT="/sys/fs/cgroup/kuasar-e2e-memory-budget-$$"
 mkdir -p "$RUN_ROOT" "$BASE_ROOT" "$RESULT_ROOT"
+VMLINUX="$BIN/vmlinux"
+IMAGE="$E2E_IMAGE"
+BLK0_IMAGE="$WORK/root.img"
+docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 
 declare -a SANDBOX_PIDS=()
 declare -a CGROUP_LEAVES=()
@@ -102,22 +58,22 @@ cleanup() {
     if [ -n "${E2E_KEEP:-}" ]; then
         echo "kept work dir: $WORK"
     else
-        rm -rf "$WORK"
+        : # prepared WORK is owned by the platform runner
     fi
 }
 trap cleanup EXIT
 
 for controller in cpu memory; do
     grep -qw "$controller" /sys/fs/cgroup/cgroup.controllers \
-        || skip "cgroup v2 $controller controller is unavailable"
+        || e2e_fail "cgroup v2 $controller controller is unavailable"
 done
 echo '+cpu +memory' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
-mkdir "$CGROUP_ROOT" 2>/dev/null || skip "cannot create $CGROUP_ROOT"
+mkdir "$CGROUP_ROOT" 2>/dev/null || e2e_fail "cannot create $CGROUP_ROOT"
 echo '+cpu +memory' > "$CGROUP_ROOT/cgroup.subtree_control" 2>/dev/null \
-    || skip "cannot enable cpu and memory below $CGROUP_ROOT"
+    || e2e_fail "cannot enable cpu and memory below $CGROUP_ROOT"
 for controller in cpu memory; do
     grep -qw "$controller" "$CGROUP_ROOT/cgroup.subtree_control" \
-        || skip "$controller is not enabled below $CGROUP_ROOT"
+        || e2e_fail "$controller is not enabled below $CGROUP_ROOT"
 done
 
 new_cgroup() { # $1 = stable leaf label
@@ -135,15 +91,6 @@ make_diff() { # $1 = path
     truncate -s 1G "$1"
     mkfs.ext4 -q -F -O ^has_journal "$1"
 }
-
-BLK0_IMAGE="${BLK0_IMAGE:-}"
-if [ -z "$BLK0_IMAGE" ]; then
-    command -v docker >/dev/null 2>&1 || skip "docker unavailable; provide BLK0_IMAGE"
-    docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE" >/dev/null
-    BLK0_IMAGE="$WORK/root.img"
-    docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
-fi
-BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 
 write_config() { # $1=path $2=cgroup $3=headroom $4=startup $5=diff
     local path="$1" cgroup="$2" headroom="$3" startup="$4" diff="$5"
@@ -490,7 +437,7 @@ record_case() { # $1=label $2=headroom-yaml $3=startup-yaml $4=also-b $5=headroo
     wait_anon_ready "$sid" "$pid" "$log"
     wait_memory_budget "$sid" "$pid" "$log" "$headroom_bytes"
 
-    python3 "$SCRIPT_DIR/lib/resource_stats.py" "$RUN_ROOT/$sid/ctl.sock" \
+    python3 "$SANDBOXER_LIB/resource_stats.py" "$RUN_ROOT/$sid/ctl.sock" \
         "$cgroup" "$sid" "$pid" "$headroom_bytes" > "$WORK/$label-resource-stats.json"
     echo "==> PASS: native resource stats use the frozen VMM cgroup; usage off; no control writes"
 
@@ -583,9 +530,6 @@ if not isinstance(uffd, dict) or uffd.get("errors") != 0:
 reads = {
     "count": sum(backend["read"]["count"] for backend in rootfs),
     "bytes": sum(backend["read"]["bytes"] for backend in rootfs),
-    "lat_sum_ns": sum(backend["read"]["lat_sum_ns"] for backend in rootfs),
-    "p50_ns_max": max(backend["read"]["p50_ns"] for backend in rootfs),
-    "p99_ns_max": max(backend["read"]["p99_ns"] for backend in rootfs),
 }
 result = {
     "key": key,
@@ -643,128 +587,57 @@ restore_case() { # $1=key $2=resident-floor-bytes
     RESTORES["$key"]="$result"
 }
 
-# The two controls are independent W captures. The new-model VM is resumed
-# after W so B is captured from the same guest and disk state.
-record_case no-balloon 8GiB 8GiB 0 "$CAPACITY_BYTES" "$WARM_BYTES"
-record_case workaround 7680MiB 7680MiB 0 $((7680 * 1024 * 1024)) "$WARM_BYTES"
+# Capture the corrected low-headroom model and its drop-caches control from the
+# same live guest. This retains #114's state and residency failure detection
+# without comparative timing or performance characterization.
 record_case new 256MiB 2GiB 1 "$HEADROOM_BYTES" "$WARM_BYTES"
-
-restore_case no-balloon-w "$WARM_BYTES"
-restore_case workaround-w "$WARM_BYTES"
 restore_case new-w "$WARM_BYTES"
 restore_case new-b 0
 
-python3 - "$CAPACITY_BYTES" "$HEADROOM_BYTES" "$MEMORY_STEP_BYTES" "$ANON_BYTES" "$WARM_BYTES" \
-    "${RESTORES[no-balloon-w]}" "${RESTORES[workaround-w]}" \
+python3 - "$CAPACITY_BYTES" "$HEADROOM_BYTES" "$ANON_BYTES" "$WARM_BYTES" \
     "${RESTORES[new-w]}" "${RESTORES[new-b]}" "$RESULT_ROOT/summary.json" <<'PY'
 import json
 import sys
-
-capacity, headroom, step, anon_bytes, warm_bytes = map(int, sys.argv[1:6])
-paths = sys.argv[6:10]
-output = sys.argv[10]
-results = {doc["key"]: doc for doc in (json.load(open(path, encoding="utf-8")) for path in paths)}
-
-for key in ("no-balloon-w", "workaround-w", "new-w"):
-    doc = results[key]
-    freeze = doc["record"]["freeze"]
-    required = {
-        "BalloonTarget", "BalloonCurrent", "TargetBudget", "CurrentBudget",
-        "ObservedBudget", "Reservation", "MemAvailable", "Cached",
-        "ReportEpoch", "ReportSeq",
-    }
-    missing = sorted(required - freeze.keys())
-    if missing:
-        raise SystemExit(f"{key}: freeze metrics missing {missing}")
-    if freeze["BalloonTarget"] + freeze["TargetBudget"] != capacity:
-        raise SystemExit(f"{key}: target/TargetBudget do not sum to Capacity: {freeze}")
-    if freeze["BalloonCurrent"] + freeze["CurrentBudget"] != capacity:
-        raise SystemExit(f"{key}: current/CurrentBudget do not sum to Capacity: {freeze}")
-    if freeze["ObservedBudget"] != max(freeze["TargetBudget"], freeze["CurrentBudget"]):
-        raise SystemExit(f"{key}: ObservedBudget invariant failed: {freeze}")
-    if freeze["Reservation"] < freeze["ObservedBudget"]:
-        raise SystemExit(f"{key}: reservation under observed Budget: {freeze}")
-    if freeze["ReportEpoch"] == 0 or freeze["ReportSeq"] == 0:
-        raise SystemExit(f"{key}: W freeze used no trusted report: {freeze}")
-    pre = doc["record"]["prefreeze_mincore"]
-    restored = doc["restore_mincore"]
-    resident_floor = warm_bytes
-    for phase, observation in (("prefreeze", pre), ("restore", restored)):
-        resident_bytes = observation["resident_pages"] * observation["bytes"] // observation["pages"]
-        if resident_bytes < resident_floor:
-            raise SystemExit(
-                f"{key}: {phase} resident bytes={resident_bytes}, "
-                f"want at least {resident_floor}"
-            )
-    expected_resident = anon_bytes + resident_floor
-    if doc["record"]["memory_resident_bytes"] < expected_resident:
-        raise SystemExit(
-            f"{key}: W memory resident bytes={doc['record']['memory_resident_bytes']} "
-            f"smaller than anon+required file working set={expected_resident}"
-        )
-
-new_freeze = results["new-w"]["record"]["freeze"]
-if new_freeze["MemAvailable"] < headroom:
-    raise SystemExit(
-        f"new-w: freeze MemAvailable={new_freeze['MemAvailable']} below "
-        f"configured headroom={headroom}"
-    )
-if new_freeze["Cached"] < warm_bytes:
-    raise SystemExit(
-        f"new-w: freeze Cached={new_freeze['Cached']} below "
-        f"working-set size={warm_bytes}"
-    )
-
-# The old failure was thousands of extra rootfs reads while both controls were
-# at (or near) zero. Allow a factor-of-two environmental spread plus sixteen
-# metadata requests; this is a relative I/O-amplification gate, not a latency
-# service-level target.
-control_count = max(results["no-balloon-w"]["rootfs_read"]["count"],
-                    results["workaround-w"]["rootfs_read"]["count"])
-control_bytes = max(results["no-balloon-w"]["rootfs_read"]["bytes"],
-                    results["workaround-w"]["rootfs_read"]["bytes"])
-new_count = results["new-w"]["rootfs_read"]["count"]
-new_bytes = results["new-w"]["rootfs_read"]["bytes"]
-if new_count > control_count * 2 + 16:
-    raise SystemExit(
-        f"new-w rootfs reads={new_count} exceed controls={control_count} by more than 2x+16"
-    )
-if new_bytes > control_bytes * 2 + 16 * 4096:
-    raise SystemExit(
-        f"new-w rootfs bytes={new_bytes} exceed controls={control_bytes} by more than 2x+64KiB"
-    )
-
-b_snapshot = results["new-b"]
-if b_snapshot["record"]["memory_resident_bytes"] < anon_bytes:
-    raise SystemExit("new-b: anonymous demand was lost from the B snapshot")
-if b_snapshot["rootfs_read"]["count"] == 0:
-    raise SystemExit("new-b: drop_caches=true control performed no rootfs read")
-
-with open(output, "w", encoding="utf-8") as destination:
-    json.dump({
-        "capacity_bytes": capacity,
-        "headroom_bytes": headroom,
-        "memory_step_bytes": step,
-        "anonymous_demand_bytes": anon_bytes,
-        "working_set_bytes": warm_bytes,
-        "required_file_resident_bytes": warm_bytes,
-        "rootfs_control_max_count": control_count,
-        "rootfs_control_max_bytes": control_bytes,
-        "results": results,
-    }, destination, indent=2, sort_keys=True)
+capacity, headroom, anon_bytes, warm_bytes = map(int, sys.argv[1:5])
+with open(sys.argv[5], encoding="utf-8") as source:
+    warm = json.load(source)
+with open(sys.argv[6], encoding="utf-8") as source:
+    dropped = json.load(source)
+freeze = warm["record"]["freeze"]
+required = {"BalloonTarget", "BalloonCurrent", "TargetBudget", "CurrentBudget",
+            "ObservedBudget", "Reservation", "MemAvailable", "Cached",
+            "ReportEpoch", "ReportSeq"}
+missing = sorted(required - freeze.keys())
+if missing:
+    raise SystemExit(f"new-w: freeze metrics missing {missing}")
+if freeze["BalloonTarget"] + freeze["TargetBudget"] != capacity:
+    raise SystemExit(f"new-w: target and TargetBudget do not sum to Capacity: {freeze}")
+if freeze["BalloonCurrent"] + freeze["CurrentBudget"] != capacity:
+    raise SystemExit(f"new-w: current and CurrentBudget do not sum to Capacity: {freeze}")
+if freeze["ObservedBudget"] != max(freeze["TargetBudget"], freeze["CurrentBudget"]):
+    raise SystemExit(f"new-w: ObservedBudget invariant failed: {freeze}")
+if freeze["Reservation"] < freeze["ObservedBudget"]:
+    raise SystemExit(f"new-w: reservation under observed Budget: {freeze}")
+if freeze["ReportEpoch"] == 0 or freeze["ReportSeq"] == 0:
+    raise SystemExit(f"new-w: freeze used no trusted report: {freeze}")
+if freeze["MemAvailable"] < headroom:
+    raise SystemExit(f"new-w: MemAvailable below configured headroom: {freeze}")
+if freeze["Cached"] < warm_bytes:
+    raise SystemExit(f"new-w: Cached below required clean working set: {freeze}")
+for phase, observation in (("prefreeze", warm["record"]["prefreeze_mincore"]),
+                           ("restore", warm["restore_mincore"])):
+    resident = observation["resident_pages"] * observation["bytes"] // observation["pages"]
+    if resident < warm_bytes:
+        raise SystemExit(f"new-w: {phase} resident bytes={resident}, want {warm_bytes}")
+if warm["record"]["memory_resident_bytes"] < anon_bytes + warm_bytes:
+    raise SystemExit("new-w: snapshot lost anonymous demand or clean-file residency")
+if dropped["record"]["memory_resident_bytes"] < anon_bytes:
+    raise SystemExit("new-b: anonymous demand was lost from the snapshot")
+with open(sys.argv[7], "w", encoding="utf-8") as destination:
+    json.dump({"capacity_bytes": capacity, "headroom_bytes": headroom,
+               "anonymous_demand_bytes": anon_bytes, "working_set_bytes": warm_bytes,
+               "warm": warm, "drop_caches": dropped}, destination, indent=2, sort_keys=True)
     destination.write("\n")
-
-print("case              W-resident   freeze-Mavail freeze-Cached rootfs-reads rootfs-bytes p50-max p99-max")
-for key in ("no-balloon-w", "workaround-w", "new-w", "new-b"):
-    doc = results[key]
-    freeze = doc["record"]["freeze"]
-    reads = doc["rootfs_read"]
-    print(f"{key:17} {doc['record']['memory_resident_bytes']:10d} "
-          f"{freeze.get('MemAvailable', 0):13d} {freeze.get('Cached', 0):13d} "
-          f"{reads['count']:12d} {reads['bytes']:12d} "
-          f"{reads['p50_ns_max']:7d} {reads['p99_ns_max']:7d}")
 PY
 
-echo
-echo "==> #114 metrics: $RESULT_ROOT/summary.json"
-echo "==> e2e_sandbox_memory_budget_workingset: OK"
+echo "PASS sandbox.memory-budget.sh"

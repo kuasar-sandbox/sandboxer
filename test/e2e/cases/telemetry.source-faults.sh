@@ -1,3 +1,22 @@
+#!/usr/bin/env bash
+# Per-source timeout/isolation, recovery, restored request epochs and CH/vsock faults.
+set -euo pipefail
+source "${E2E_LIB:?E2E_LIB is required}/common.sh"
+SANDBOXER_LIB="$E2E_LIB/sandboxer"
+: "${E2E_WORKSPACE:?E2E_WORKSPACE is required}" "${WORK:?WORK is required}" "${OUT:?OUT is required}" "${USAGE_PROBE_BIN:?USAGE_PROBE_BIN is required}"
+require_root
+require_kvm
+for command in python3 strace ldd mount umount mkfs.ext4; do require_command "$command"; done
+for binary in sandbox-ctl sandbox-init cloud-hypervisor flatten-ctl mkfs.erofs; do require_binary "$binary"; done
+for file in sandbox-runtime.bundle vmlinux; do [ -f "$BIN/$file" ] || e2e_fail "missing prepared product: $file"; done
+[ -x "$USAGE_PROBE_BIN" ] || e2e_fail "missing executable prepared usage probe"
+for file in usage.py usage_ch_relay.py usage_vsock_relay.py usage_ch_wrapper.py usage_vsock_wrapper.py; do [ -f "$SANDBOXER_LIB/$file" ] || e2e_fail "missing prepared helper: $file"; done
+export PYTHONDONTWRITEBYTECODE=1
+python3 - "$SANDBOXER_LIB" <<'PY'
+import sys
+from pathlib import Path
+LIB = Path(sys.argv[1])
+sys.path.insert(0, str(LIB))
 #!/usr/bin/env python3
 """Real slow-source faults in disposable VMs, without product injection hooks.
 
@@ -5,7 +24,6 @@ Only the selected managed disk's fstatfs return is delayed. This is a syscall
 delay, not a claim that the underlying ext4 block device failed. The first
 completed raw value remains with its old request and must never be replayed.
 """
-import argparse
 import atexit
 import json
 import os
@@ -14,7 +32,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 from usage import BIN, Sandbox, build_probe, digest, ext4, image_ref, metric, run, write_json, runtime_init_digest
@@ -361,7 +378,7 @@ def validate_wire_deadline(fault, requests):
 
 def vsock_case(work, ref):
     sb = Sandbox(work, "vsock", filesystem_config(work, "vsock", ref),
-                 ch_binary=Path(__file__).with_name("usage_vsock_wrapper.py"))
+                 ch_binary=LIB.joinpath("usage_vsock_wrapper.py"))
     relay, trace, observer, failure = None, None, None, None
     try:
         relay = UsageRelay(sb.runroot / "instance/vsock.sock")
@@ -663,7 +680,7 @@ def restore_case(work, ref):
                 "boot": {"kernel": config["boot"]["kernel"], "runtime": config["boot"]["runtime"]},
                 "restore": {"prefetch": "off"}, "usage": config["usage"], "timeouts": {"restore": "30s"}}
         child = Sandbox(work, "restore-child", host, restore=snapshot, sandbox_id=sb.name,
-                        base_root=sb.baseroot, ch_binary=Path(__file__).with_name("usage_vsock_wrapper.py"))
+                        base_root=sb.baseroot, ch_binary=LIB.joinpath("usage_vsock_wrapper.py"))
         # CH restore reads the socket from private run-state config, not from
         # --vsock. The wrapper relays that socket without editing the snapshot.
         relay = UsageRelay(child.runroot / "instance/vsock.sock", old_epoch=old_epoch)
@@ -756,7 +773,7 @@ def ch_case(work, ref, mode):
                        "root": {"base": ref, "overlay": {"diff": f"file://{diff}"}}},
               "launch": {"exec": "/probe", "args": ["wait"], "restart": "never", "pid_namespace": "shared"},
               "usage": {"enabled": True, "sample_interval": "1s", "flush_interval": "5s"}}
-    sb = Sandbox(work, f"ch-{mode}", config, ch_binary=Path(__file__).with_name("usage_ch_wrapper.py"))
+    sb = Sandbox(work, f"ch-{mode}", config, ch_binary=LIB.joinpath("usage_ch_wrapper.py"))
     relay, pressure, failure = None, None, None
     try:
         relay = CHRelay(sb.runroot / "instance/ch.sock")
@@ -848,19 +865,14 @@ def ch_case(work, ref, mode):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seconds", type=int, default=30)
-    parser.add_argument("--cases", default="filesystem,ch-info,ch-resize,vsock,restore")
-    args = parser.parse_args()
-    assert 20 <= args.seconds <= 60
-    assert os.geteuid() == 0
-    cases = args.cases.split(",")
-    assert set(cases) <= {"filesystem", "ch-info", "ch-resize", "vsock", "restore"}
-    work = Path(tempfile.mkdtemp(prefix="e2e-usage-sources-"))
+    seconds = 30
+    cases = ("filesystem", "ch-info", "ch-resize", "vsock", "restore")
+    work = Path(os.environ["WORK"]) / "usage-sources"
+    work.mkdir(parents=True, exist_ok=True)
     print(f"usage source evidence: {work}", flush=True)
-    if os.environ.get("KUASAR_CI_DIR"):
+    if os.environ["OUT"]:
         def collect():
-            evidence = Path(os.environ["KUASAR_CI_DIR"]) / "usage-sources"
+            evidence = Path(os.environ["OUT"]) / "usage-sources"
             for path in work.rglob("*"):
                 if path.is_file() and path.suffix in (".json", ".log", ".usage"):
                     dest = evidence / path.relative_to(work)
@@ -872,7 +884,7 @@ def main():
     root.mkdir()
     for name in ("tmp", "proc", "sys", "dev", "data", "other"):
         (root / name).mkdir()
-    metadata = {"host_kernel": run("uname", "-a"), "seconds": args.seconds, "cases": cases,
+    metadata = {"host_kernel": run("uname", "-a"), "seconds": seconds, "cases": cases,
                 "artifacts": {name: digest(BIN / name) for name in ("sandbox-ctl", "sandbox-init", "sandbox-runtime.bundle", "vmlinux", "cloud-hypervisor")},
                 "tracer": install_tracer(root)}
     write_json(work / "source-set.json", metadata)
@@ -882,7 +894,7 @@ def main():
     ref = image_ref(image)
     for case in cases:
         if case == "filesystem":
-            filesystem_case(work, ref, args.seconds)
+            filesystem_case(work, ref, seconds)
         elif case == "vsock":
             vsock_case(work, ref)
         elif case == "restore":
@@ -893,3 +905,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+PY

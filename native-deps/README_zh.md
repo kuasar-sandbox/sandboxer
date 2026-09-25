@@ -169,12 +169,15 @@ make cloud-hypervisor
 
 ```bash
 make test
-make test-e2e
+make test-e2e-scripts
 ```
 
-组件 E2E 使用 `E2E_BIN` 指定的聚合二进制目录。完整平台构建与门禁是在 sandboxer
-根目录执行 `make -C ../kuasar-sandbox test-e2e`;旧的 `test-e2e-sandbox-cold` 目标不存在。
+产品 E2E 与源码构建检查分开执行。在已经包含这些预构建二进制的平台准备工作区中运行：
+
+```bash
+python3 "$PREPARED/test/e2e/e2e" run --workdir "$PREPARED" --suite sandbox --suite snapshot
+```
 
 真实 E2E 需要 `/dev/kvm`、guest runtime、vmlinux 和相关 TAP/network 前置条件。
-某些单项脚本直接运行时可以 skip,但 `test/e2e/run_all.sh` 设置 `REQUIRE_KVM=1`,
-组件及发布门禁遇到缺失条件会失败,不会把跳过计为成功。发布前应在具备 KVM 的环境运行完整平台门禁。
+平台预备工作区会运行精确的候选用例；选中用例缺少前置条件时会直接失败，不会把跳过计为成功。
+发布前应在具备 KVM 的环境运行完整平台门禁。

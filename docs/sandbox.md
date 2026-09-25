@@ -1966,7 +1966,7 @@ field. Only that file field changes; device ID, optional size and other attribut
 `state.json`, original S/E and node defaults remain unchanged. The old absolute
 path need not exist. Versioned runtime files must remain immutable and available
 under distinct names in the same directory; no full EROFS rehash or runtime copy
-is added to restore. The existing `e2e_sandbox_restore.sh` verifies relocated-v1
+is added to restore. The existing `snapshot.restore.sh` verifies relocated-v1
 fallback from a v2-named default, unavailable captured path, selected pmem path,
 unchanged source artifacts/host inputs, guest readiness and continued execution.
 
@@ -2410,8 +2410,8 @@ depends on vCPU/disk count, source strings and varint magnitudes; 1 KiB is not
 a measured constant. CPU/Gauge aggregation and persistence tests are in
 [`pkg/usage`](../pkg/usage); protocol and blocking-source tests live with
 [`guestlink`](../pkg/guestlink) and [`sandbox-init`](../cmd/sandbox-init).
-The component-owned [usage E2E](../test/e2e/e2e_usage.sh) is discovered by
-[`run_all.sh`](../test/e2e/run_all.sh), requires real KVM, and verifies the
+The component-owned [usage E2E](../test/e2e/cases/telemetry.usage.sh) is discovered by
+the platform prepared-workspace runner, requires real KVM, and verifies the
 running Guest init hash against the supplied freshly rebuilt runtime bundle.
 Its short-save cases exercise integration. Restore/clone checks use a one-minute
 sample interval and require fresh memory/filesystem observations before the
@@ -2433,7 +2433,7 @@ a control resize do not qualify; the normal control loop remains running.
 Recorded start-byte write endpoints use the Host monotonic clock; they are
 not Guest allocation timestamps or a measurement of Guest scheduling latency.
 
-The [storage-fault E2E](../test/e2e/e2e_usage_faults.sh) uses a private bounded
+The [storage-fault E2E](../test/e2e/cases/telemetry.usage-faults.sh) uses a private bounded
 tmpfs for real ENOSPC and path-restricted `strace` injection for usage write
 EIO and delayed writes. It also exercises SIGKILL and a sub-second Guest
 run. Injection never targets the business writable disk's sync operations;
@@ -2443,7 +2443,7 @@ termination through a pidfd; it does not leave cleanup to the runner.
 Linux/Python pidfd support, `strace`, mount privileges
 and the ordinary KVM E2E prerequisites are required.
 
-The [slow-source E2E](../test/e2e/e2e_usage_sources.sh) selects one registered
+The [slow-source E2E](../test/e2e/cases/telemetry.source-faults.sh) selects one registered
 data-filesystem handle by device identity and checks CLOEXEC before delaying
 only that `fstatfs` return inside the disposable Guest. It requires a first
 timeout, subsequent busy responses from the same occupied slot, fresh memory
@@ -2514,11 +2514,19 @@ Together with the repeated-operation and lifecycle regressions, these cases
 check source isolation, bounded ownership and failure cleanup. Report their
 actual observation windows; they are not physical power-loss experiments.
 
-Run the [off/on harness](../test/e2e/usage_perf.py) without concurrent test
+The performance harness is separate from product E2E. Prepare the test probe
+in the source-build stage and provide its executable path as `USAGE_PROBE_BIN`:
+
+```bash
+make e2e-usage-probe
+export USAGE_PROBE_BIN="$PWD/build/e2e-tools/$(uname -m)/usage-probe"
+```
+
+Run the [off/on harness](../test/perf/usage_perf.py) without concurrent test
 loads, supplying the assembled `BIN` and root privileges:
 
 ```bash
-python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3
+python3 test/perf/usage_perf.py --densities 1,4 --seconds 30 --repeat 3
 ```
 
 The baseline measures native process CPU, RssAnon/RssFile, FD/thread and
@@ -2535,7 +2543,7 @@ Optional diagnostics can help investigate the baseline; they are not a separate
 performance acceptance target or a prerequisite for merging this feature:
 
 ```bash
-python3 test/e2e/usage_perf.py --densities 1,4 --seconds 30 --repeat 3 --trace
+python3 test/perf/usage_perf.py --densities 1,4 --seconds 30 --repeat 3 --trace
 ```
 
 This optional Linux amd64 tracing run requires a `bpftrace` build

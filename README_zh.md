@@ -60,7 +60,17 @@ make build                      # sandbox-ctl and sandbox-init
 make sandbox-ctl sandbox-init   # explicit binary targets
 make build TARGET_ARCH=aarch64  # cross-compile; amd64/arm64 aliases are accepted
 make vet test                   # static checks and unit tests
-make test-e2e                   # component owner suite; requires the assembled project BIN
+make test-e2e-scripts           # 源码与测试辅助代码回归；不是产品 E2E
+```
+
+产品 E2E 使用发布/预构建制品准备的平台工作区；`PREPARED` 指向该工作区。
+手工和 CI 使用相同运行器；执行过程不需要兄弟仓源码或 Go/Rust 编译器。
+
+```bash
+python3 "$PREPARED/test/e2e/e2e" run --workdir "$PREPARED" \
+  --suite sandbox --suite snapshot --suite telemetry \
+  --include basic.sandbox-cli.sh --include image.manifest-boot.sh \
+  --include image.sandbox-assembly.sh --include network.tapfd.sh
 ```
 
 前置条件:

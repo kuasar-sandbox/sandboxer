@@ -19,7 +19,10 @@ import sys
 import tempfile
 import time
 
-from usage import BIN, GO, REPO, Sandbox, build_probe, digest, ext4, image_ref, run, write_json, runtime_init_digest
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "e2e/lib"))
+REPO = Path(__file__).resolve().parents[2]
+GO = os.environ.get("KUASAR_E2E_GO") or (str(Path(os.environ["GOROOT"]) / "bin/go") if os.environ.get("GOROOT") else "go")
+from usage import BIN, Sandbox, build_probe, digest, ext4, image_ref, run, write_json, runtime_init_digest
 
 
 def percentile(values, q):
@@ -286,8 +289,10 @@ def main():
                 "artifacts": {n: digest(BIN / n) for n in ("sandbox-ctl", "sandbox-init", "sandbox-runtime.bundle", "vmlinux", "cloud-hypervisor")},
                 "measurement": "descriptive local CH/KVM; common .2s resource/exec probes; trace flag identifies perturbed diagnostics; no production-density inference",
                 "not_measured_here": [] if args.trace else ["wakeups", "allocations", "management traffic", "CH API calls/lock wait", "per-save duration"]}
-    metadata["harness_sha256"] = {p.name: digest(p) for p in Path(__file__).parent.glob("usage*.py")}
-    metadata["harness_sha256"]["usageprobe/main.go"] = digest(Path(__file__).parent / "usageprobe/main.go")
+    metadata["harness_sha256"] = {str(p.relative_to(REPO)): digest(p)
+                                  for directory in (Path(__file__).parent, REPO / "test/e2e/lib")
+                                  for p in directory.glob("usage*.py")}
+    metadata["harness_sha256"]["usageprobe/main.go"] = digest(REPO / "test/fixtures/usageprobe/main.go")
     if (REPO / ".git").exists():
         metadata["source_revisions"] = {name: run("git", "rev-parse", "HEAD", cwd=REPO.parent / name).strip()
                                         for name in ("sandboxer", "accelerator", "connector", "guest-runtime")
