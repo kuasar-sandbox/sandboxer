@@ -104,7 +104,6 @@ grep -qE 'diff_template|mountable|formatted|upper' "$OUT/missing-upper.log" \
     || { cat "$OUT/missing-upper.log" >&2; e2e_fail "missing-upper error lacked field context"; }
 
 cat >"$WORK/host.yaml" <<EOF
-network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: assembly-run }
 boot:
   kernel: file://$BIN/vmlinux
   runtime: file://$BIN/sandbox-runtime.bundle
