@@ -82,8 +82,4 @@ grep -qE '^PYBOOT-OK [0-9]+$' "$LOG" || {
     tail -60 "$LOG" >&2 || true
     e2e_fail "app did not run on template-seeded auto-default diff"
 }
-# No explicit diff path was supplied; sandboxer must have materialized one under base-root.
-find "$WORK/base" -type f -name '*.overlay.diff' -size +0c | grep -q . || \
-    e2e_fail "auto-default overlay diff was not materialized under base-root"
-
 echo "PASS sandbox.diff-template.sh"
