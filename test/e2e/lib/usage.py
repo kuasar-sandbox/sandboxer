@@ -84,7 +84,7 @@ class Sandbox:
         self.dir = work / name
         self.dir.mkdir()
         self.name = sandbox_id or name
-        self.runroot = self.dir / "r"
+        self.runroot = work / {"restore-original": "ro", "restore-child": "rc"}.get(name, name) / "r"
         self.baseroot = base_root or self.dir / "base"
         self.config = self.dir / "config.yaml"
         write_json(self.config, config)  # JSON is a strict subset of YAML.
