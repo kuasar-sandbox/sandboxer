@@ -25,7 +25,7 @@ done
 [ -r "$SANDBOXER_LIB/tarstream.sh" ] || e2e_fail "missing prepared tarstream helpers"
 docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || e2e_fail "prepared E2E_IMAGE is not loaded: $E2E_IMAGE"
 
-mkdir -p "$WORK" "$OUT" "$WORK/runtime" "$WORK/base" "$WORK/checkpoint"
+mkdir -p "$WORK" "$OUT" "$WORK/runtime" "$WORK/base"
 TAP_NAME="mr$((BASHPID % 1000000))"
 TAP_CREATED=0
 PIDS=()
@@ -114,6 +114,8 @@ with open(path,"rb",buffering=0) as source:
  finally: mapping.close()'
 
 SID="memory-residency-$BASHPID"
+CHECKPOINT_DIR="$WORK/base/$SID/checkpoint"
+mkdir -p "$CHECKPOINT_DIR"
 LOG1="$OUT/cold.log"
 timeout -k 10s 120 "$BIN/sandbox-ctl" run --config "$WORK/cold.yaml" --sandbox-id "$SID" \
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --base-root "$WORK/base" >"$LOG1" 2>&1 &
@@ -139,9 +141,9 @@ WARM_SHA="$(grep -Eo '[0-9a-f]{64}' "$WORK/warm-create.out" | tail -1)"
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c \
     'echo ROOT-S-OK > /root-s; echo SCRATCH-S-OK > /scratch/persist; echo DATA-S-OK > /data/persist; sync'
 
-"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID" --output "$WORK/checkpoint" --run-root "$WORK/runtime" >"$OUT/s1.log" 2>&1
+"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR" --run-root "$WORK/runtime" >"$OUT/s1.log" 2>&1
 wait "$PID1" || true; PIDS=()
-S1="$WORK/checkpoint/$SID.snapshot"
+S1="$CHECKPOINT_DIR/$SID.snapshot"
 [ -f "$S1" ] || e2e_fail "parent snapshot is missing"
 PARENT_MEMORY_ARTIFACT="$(readlink -f "$S1")"
 [ -f "$PARENT_MEMORY_ARTIFACT" ] || e2e_fail "parent memory target is missing"
@@ -177,17 +179,17 @@ assert_contains "$WORK/warm-before.out" 'mincore resident='
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c \
     'echo ROOT-W-OK > /root-w; echo SCRATCH-W-OK > /scratch/working-set; echo DATA-W-OK > /data/working-set; sync'
 
-"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID" --output "$WORK/checkpoint" --run-root "$WORK/runtime" \
+"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR" --run-root "$WORK/runtime" \
     --drop-caches=false --merge-ref=false >"$OUT/w.log" 2>&1
 wait "$PID2" || true; PIDS=()
 grep -Fq 'quiesce: guest acked (drop_caches=skipped' "$LOG2" || e2e_fail "capture did not preserve guest page cache"
-W="$WORK/checkpoint/$SID.snapshot"
+W="$CHECKPOINT_DIR/$SID.snapshot"
 [ -f "$W" ] || e2e_fail "working snapshot is missing"
-[ -f "$WORK/checkpoint/$PARENT_MEMORY_BASENAME" ] || e2e_fail "non-merged local memory parent is not retained as a sibling"
+[ -f "$CHECKPOINT_DIR/$PARENT_MEMORY_BASENAME" ] || e2e_fail "non-merged local memory parent is not retained as a sibling"
 "$BIN/sandbox-ctl" info --json "$W" >"$WORK/w-s.json"
 W_E_BASENAME="$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/w-s.json")"
-"$BIN/sandbox-ctl" info --json "$WORK/checkpoint/$S1_E_BASENAME" >"$WORK/s1-e.json"
-"$BIN/sandbox-ctl" info --json "$WORK/checkpoint/$W_E_BASENAME" >"$WORK/w-e.json"
+"$BIN/sandbox-ctl" info --json "$CHECKPOINT_DIR/$S1_E_BASENAME" >"$WORK/s1-e.json"
+"$BIN/sandbox-ctl" info --json "$CHECKPOINT_DIR/$W_E_BASENAME" >"$WORK/w-e.json"
 python3 - "$WORK/s1-e.json" "$WORK/w-e.json" "$WORK/w-s.json" "$PARENT_MEMORY_BASENAME" "$S1_E_REF" <<'PY'
 import json,os,sys
 parent=json.load(open(sys.argv[1])); working=json.load(open(sys.argv[2])); snap=json.load(open(sys.argv[3]))
@@ -210,7 +212,7 @@ PY
 
 # The memory lower is mandatory. Hide it recoverably and prove the restore graph
 # fails before the VMM wrapper can execute.
-PARENT_SIBLING="$WORK/checkpoint/$PARENT_MEMORY_BASENAME"
+PARENT_SIBLING="$CHECKPOINT_DIR/$PARENT_MEMORY_BASENAME"
 HIDDEN_PARENT="$WORK/$PARENT_MEMORY_BASENAME.hidden"
 mv "$PARENT_SIBLING" "$HIDDEN_PARENT"
 VMM_MARKER="$WORK/vmm-started"
