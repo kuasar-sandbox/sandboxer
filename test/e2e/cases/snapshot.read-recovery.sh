@@ -57,7 +57,7 @@ fault_count() {
     if [ -f "$WORK/faults.jsonl" ]; then wc -l <"$WORK/faults.jsonl"; else printf '0\n'; fi
 }
 wait_fault_count() {
-    local before=$1 count=$2 pid=$3 target\n    target=$((before + count))
+    local before=$1 count=$2 pid=$3 target; target=$((before + count))
     for _ in $(seq 1 400); do
         [ "$(fault_count)" -ge "$target" ] && return
         kill -0 "$pid" 2>/dev/null || return 1
