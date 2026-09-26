@@ -8,7 +8,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench e2e-usage-probe test-e2e release test-release clean help
+.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench e2e-usage-probe e2e-cgroup-fork-probe test-e2e-scripts release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -36,7 +36,6 @@ GO             := go
 GO_BUILD_FLAGS := -trimpath
 BINDIR         := bin/$(TARGET_ARCH)
 BUILD_DIR      := build/$(TARGET_ARCH)
-E2E_BIN        ?= $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
 E2E_FIXTURE_DIR ?= $(abspath build/e2e-tools/$(TARGET_ARCH))
 
 define link_bin
@@ -72,12 +71,9 @@ cloud-hypervisor:
 	cp -f native-deps/bin/$(TARGET_ARCH)/cloud-hypervisor $(BINDIR)/cloud-hypervisor
 	$(call link_bin,cloud-hypervisor)
 
-test:
-	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-go-privilege.py
+test: test-e2e-scripts
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-rust.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
-	python3 scripts/test_e2e_upload_restore_tick.py
-	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_disks_restore.py
 	CGO_ENABLED=0 $(GO) test ./...
 
 vet:
@@ -96,11 +92,23 @@ bench:
 e2e-usage-probe:
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
 	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
-		-o "$(E2E_FIXTURE_DIR)/usage-probe" test/e2e/usageprobe/main.go
+		-o "$(E2E_FIXTURE_DIR)/usage-probe" test/fixtures/usageprobe/main.go
 
-test-e2e: e2e-usage-probe
-	bash scripts/ci-source-checks.sh
-	BIN="$(E2E_BIN)" USAGE_PROBE_BIN="$(E2E_FIXTURE_DIR)/usage-probe" bash test/e2e/run_all.sh
+# The cgroup-control E2E must fork before libc or a language runtime starts in
+# order to detect Start->cgroup.procs races. Build that tiny libc-free probe in
+# the source-build stage; product E2E only consumes the prepared binary.
+e2e-cgroup-fork-probe:
+	@test "$(TARGET_ARCH)" = "x86_64" || { echo "cgroup-fork-probe is x86_64-only" >&2; exit 1; }
+	@mkdir -p "$(E2E_FIXTURE_DIR)"
+	cc -nostdlib -static -fno-stack-protector -fno-builtin -ffreestanding \
+		-fno-pie -no-pie -Wl,--build-id=none \
+		-o "$(E2E_FIXTURE_DIR)/cgroup-fork-probe" test/fixtures/cgroup_fork_probe.c
+
+test-e2e-scripts:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-go-privilege.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_upload_restore_tick.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_disks_restore.py
+	BIN="$(abspath $(BINDIR))" PYTHONDONTWRITEBYTECODE=1 python3 test/source/usage_harness_test.py
 
 VERSION ?= v0.1.0
 ACCELERATOR_VERSION ?= v0.1.3
@@ -125,7 +133,7 @@ help:
 	@echo "  cloud-hypervisor   patched VMM consumed by sandbox-ctl"
 	@echo "  sandbox-ctl        host control plane"
 	@echo "  sandbox-init       guest PID 1 binary consumed by guest-runtime"
-	@echo "  test-e2e           run the sandboxer-owned E2E suite with E2E_BIN"
+	@echo "  test-e2e-scripts   source/helper regressions; product E2E uses the prepared platform runner"
 	@echo "  release            build a validated component release bundle"
 	@echo "  test-release       test component release packaging"
 	@echo "  test / vet / clean"
