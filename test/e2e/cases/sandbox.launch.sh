@@ -122,11 +122,11 @@ if [ "$rc" -ne 0 ]; then
     e2e_fail "launch-spec sandbox failed with status $rc"
 fi
 
-assert_contains "$LOG" '^LS-DONE$'
-assert_contains "$LOG" '^LS-WHOAMI 65534:65534$'
-assert_contains "$LOG" '^LS-RESOLV nameserver 169\.254\.169\.253$'
-assert_contains "$LOG" '^LS-TMPFS-OK$'
-assert_contains "$LOG" '^LS-VOLUME-OK$'
-assert_contains "$LOG" '^LS-INIT-OK provisioned$'
+grep -qE '^LS-DONE$' "$LOG" || e2e_fail "launch log missing LS-DONE"
+grep -qE '^LS-WHOAMI 65534:65534$' "$LOG" || e2e_fail "launch log missing LS-WHOAMI"
+grep -qE '^LS-RESOLV nameserver 169\.254\.169\.253$' "$LOG" || e2e_fail "launch log missing LS-RESOLV"
+grep -qE '^LS-TMPFS-OK$' "$LOG" || e2e_fail "launch log missing LS-TMPFS-OK"
+grep -qE '^LS-VOLUME-OK$' "$LOG" || e2e_fail "launch log missing LS-VOLUME-OK"
+grep -qE '^LS-INIT-OK provisioned$' "$LOG" || e2e_fail "launch log missing LS-INIT-OK"
 
 echo "PASS sandbox.launch.sh"
