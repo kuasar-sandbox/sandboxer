@@ -100,8 +100,8 @@ fi
 
 assert_contains "$LOG" 'PROTO-BOOT-OK'
 assert_contains "$LOG" 'PROTO-DONE'
-assert_contains "$LOG" 'guest reports user app pid=[0-9]+'
-assert_contains "$LOG" 'guest reports user app exited code=[0-9]+'
+grep -qE 'guest reports user app pid=[0-9]+' "$LOG" || e2e_fail "protocol log missing user app pid"
+grep -qE 'guest reports user app exited code=[0-9]+' "$LOG" || e2e_fail "protocol log missing user app exit code"
 [ -s "$STATS_JSON" ] || e2e_fail "stats-json output is missing"
 
 python3 - "$STATS_JSON" <<'PY'
