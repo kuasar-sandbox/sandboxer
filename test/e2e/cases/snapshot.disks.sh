@@ -128,12 +128,13 @@ with open(sys.argv[1], encoding='utf-8') as source:
     cfg = json.load(source)
 disks = cfg['Boot'].get('Disks') or []
 assert [disk.get('Name') for disk in disks] == ['scratch', 'dataset'], disks
-nodes = [cfg['Boot']['Root'], *disks]
-assert len(nodes) == 3
-for node in nodes:
-    overlay = node.get('Overlay')
-    assert overlay, node
-    assert overlay.get('Base'), node
+root = cfg['Boot']['Root']
+scratch, dataset = disks
+root_overlay = root.get('Overlay')
+dataset_overlay = dataset.get('Overlay')
+assert root_overlay and root_overlay.get('Base'), root
+assert scratch.get('Base') and not scratch.get('Overlay'), scratch
+assert dataset_overlay and dataset_overlay.get('Base'), dataset
 PY
 
 # Empty uppers inherit the captured filesystem metadata and content. Formatting
