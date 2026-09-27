@@ -65,6 +65,8 @@ make test-e2e-scripts           # 源码与测试辅助代码回归；不是产�
 
 产品 E2E 使用发布/预构建制品准备的平台工作区；`PREPARED` 指向该工作区。
 手工和 CI 使用相同运行器；执行过程不需要兄弟仓源码或 Go/Rust 编译器。
+请在 root shell 中执行以下命令，并将所需运行工具放在 `PATH` 中。统一运行器
+不会自动提权；已选运行时 case 缺少 root 权限或 KVM 时会失败。
 
 ```bash
 python3 "$PREPARED/test/e2e/e2e" run --workdir "$PREPARED" \
