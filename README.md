@@ -66,6 +66,9 @@ make test-e2e-scripts           # source/helper regressions; not product E2E
 Product E2E uses a platform workspace prepared from released/prebuilt artifacts.
 Set `PREPARED` to that workspace. Manual and CI execution use the same runner,
 without sibling source checkouts or Go/Rust compilers during execution.
+Run the following command from a root shell with the required runtime tools on
+`PATH`. The common runner does not elevate privileges; selected runtime cases
+fail when root or KVM is missing.
 
 ```bash
 python3 "$PREPARED/test/e2e/e2e" run --workdir "$PREPARED" \
