@@ -59,27 +59,29 @@ network_in_use() { # <cidr> <host_ip> <guest_ip>
 }
 
 # Allocate six disjoint free /31s: A B C D X Y (host ip = even, guest = odd).
+# Slots are picked independently (first-fit) so a partially used address space
+# does not defeat the allocation the way a consecutive-window scan would.
 CIDRS=(); HOSTIPS=(); GUESTIPS=()
 start=$(( BASHPID % 8192 ))
-for ((offset = 0; offset < 8000; offset++)); do
-    window_ok=1
-    for k in 0 1 2 3 4 5; do
-        slot=$(( (start + offset + k) % 8192 ))
+allocate_slot() {
+    for ((offset = 0; offset < 8192; offset++)); do
+        slot=$(( (start + offset) % 8192 ))
         block=$(( slot / 128 ))
         host_byte=$(( (slot % 128) * 2 ))
-        cidrs[k]="169.254.$((64 + block)).$host_byte"
-        guests[k]="169.254.$((64 + block)).$((host_byte + 1))"
-        network_in_use "${cidrs[k]}/31" "${cidrs[k]}" "${guests[k]}" || window_ok=0
+        host_ip="169.254.$((64 + block)).$host_byte"
+        guest_ip="169.254.$((64 + block)).$((host_byte + 1))"
+        if ! network_in_use "$host_ip/31" "$host_ip" "$guest_ip"; then
+            CIDRS+=("$host_ip/31"); HOSTIPS+=("$host_ip"); GUESTIPS+=("$guest_ip")
+            HOST_IPV4_ADDRESSES["$host_ip"]=1
+            HOST_IPV4_ADDRESSES["$guest_ip"]=1
+            return 0
+        fi
     done
-    if [ "$window_ok" = 1 ]; then
-        for k in 0 1 2 3 4 5; do
-            CIDRS+=("${cidrs[k]}/31"); HOSTIPS+=("${cidrs[k]}"); GUESTIPS+=("${guests[k]}")
-        done
-        break
-    fi
+    e2e_fail "no free /31 for the restore fanout"
+}
+for _ in 0 1 2 3 4 5; do
+    allocate_slot
 done
-[ "${#CIDRS[@]}" -eq 6 ] || e2e_fail "no free /31 window for the restore fanout"
-# A=0 B=1 C=2 D=3 X=4 Y=5
 
 TAPS=("$TAP_A" "$TAP_B" "$TAP_C" "$TAP_D")
 TAP_CREATED=()
