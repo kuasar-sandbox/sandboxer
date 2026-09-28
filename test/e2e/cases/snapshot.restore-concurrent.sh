@@ -238,7 +238,6 @@ boot:
   root:
     overlay:
       diff: file://$4
-      size: 1GiB
 EOF
 }
 
@@ -262,7 +261,6 @@ boot:
     base: $ROOT_REF
     overlay:
       diff: file://$WORK/blk1-a.diff
-      size: 1GiB
 launch:
   args: ["-c", "import sys,time\nprint('PYBOOT-OK', flush=True)\ni=0\nwhile True:\n    print('TICK', i, flush=True)\n    i+=1\n    time.sleep(0.25)"]
   restart: never
@@ -386,7 +384,6 @@ boot:
   root:
     overlay:
       diff: file://$WORK/blk1-x.diff
-      size: 1GiB
 EOF
 
 SID_X="scr-x-$BASHPID"
@@ -437,7 +434,6 @@ boot:
     base: $ROOT_REF
     overlay:
       diff: file://$WORK/blk1-y.diff
-      size: 1GiB
 launch:
   args: ["-c", "import time\nprint('NETUP', flush=True)\ni=0\nwhile True:\n    print('TICK', i, flush=True)\n    i+=1\n    time.sleep(0.25)"]
   restart: never
