@@ -437,6 +437,7 @@ boot:
 launch:
   args: ["-c", "import time\nprint('NETUP', flush=True)\ni=0\nwhile True:\n    print('TICK', i, flush=True)\n    i+=1\n    time.sleep(0.25)"]
   restart: never
+  cgroup_control: true
 EOF
 
 SID_Y="scr-y-$BASHPID"
