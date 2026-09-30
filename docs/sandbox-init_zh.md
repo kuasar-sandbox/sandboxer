@@ -762,8 +762,8 @@ vsock 端口固定 `5000`,**两个方向都复用同一端口号**,身份按方�
 | **mem 报告** | guest→host | `mem_report{mem_report:{epoch,seq,mem_*}}` → `mem_report_ack` | 关 | guest observation;host sandbox-local controller 验证 epoch/seq 后结合 CH `vm.info` |
 | **用量观测** | host→guest | `usage_request{usage_request}` → `usage_response{usage_response}` | 复用 | 只返回新的原始内存/文件系统观测, Host 唯一归并 (§4.11) |
 | **快照前** | host→guest | `quiesce{skip_drop_caches}` → `quiesced{drop_caches_result}` | 关 | guest 冻结应用进程树 + 跑 prep + 关闭 MUX(§3.4),host 还须控制连接 EOF 和自身 admitted-handler drain 才可 `/vm.pause` |
-| **恢复后** | host→guest | `restore{epoch, wallclock_ns, network?}` → `restore_ack{epoch,stdio,app_state}` | **升级 MUX** | 快照恢复 vCPU 起跑后 host 通知 guest;guest 先推进 mem-report epoch,再回 ACK、重连 MUX并最后 thaw。Host 在 ACK+MUX 前不启用 memory policy。clock/network 更新是 best-effort，失败也可能发 ACK；thaw 在 ACK 后，失败则 gate 保持关闭（§4.8）。`launch`/files/init/plugin 是 cold-only 配置,恢复时不重放。**RNG 重播种未实现** |
-| **MUX 重连** | host→guest | `attach{epoch}` → `attach_ack{epoch,stdio,app_state}` | **升级 MUX** | 有界尝试关闭/硬丢旧 MUX，接上新连接；guest 仍冻结时先 thaw 再重新开 gate，涵盖同进程 resume 和失败 capture recovery，未冻结则跳过。Attach 是 stdio 传输替换，与 VM resume 不同；冻结查询或 thaw 失败时 ACK 可能已发，但 gate 保持关闭。 |
+| **恢复后** | host→guest | `restore{epoch, wallclock_ns, network?}` → `restore_ack{epoch,stdio,app_state}` | **升级 MUX** | 快照恢复 vCPU 起跑后 host 通知 guest;guest 先推进 mem-report epoch,完成 thaw 并开放执行 gate 后回 ACK,然后重连 MUX并恢复报告。Host 在 ACK+MUX 前不启用 memory policy。clock/network 更新是 best-effort，失败也可能发 ACK；thaw 失败不发 ACK 且 gate 保持关闭（§4.8）。`launch`/files/init/plugin 是 cold-only 配置,恢复时不重放。**RNG 重播种未实现** |
+| **MUX 重连** | host→guest | `attach{epoch}` → `attach_ack{epoch,stdio,app_state}` | **升级 MUX** | 有界尝试关闭/硬丢旧 MUX，接上新连接；guest 仍冻结时先 thaw 再重新开 gate 并发 ACK，涵盖同进程 resume 和失败 capture recovery，未冻结则跳过。Attach 是 stdio 传输替换，与 VM resume 不同；冻结查询或 thaw 失败时不发 ACK，gate 保持关闭。 |
 | **执行命令** | host→guest | `exec{spec}` → `exec_ack{stdio}` | **升级 MUX(独立会话)** | guest 为这条 `exec` 起一个兄弟进程并准备其 stdio,回 `exec_ack`,该连接成为这次 exec 会话**独立**的 MUX;并发多条互不影响;命令结束 guest 在 MUX 上发 EXIT_STATUS 再走 §4.6 关闭。详见 §3.6 |
 | **端口转发** | host→guest | `connect{spec}` → `connect_ack` | **升级转发数据通道** | guest 为这条 `connect` 取得 `ConnectSpec.address` 上的目标连接——dial(默认)或 `Accept`(`spec.accept`,accept 模式可无限期阻塞,host 无 deadline park)——回 `connect_ack`,该连接成为这条转发的 fwd 帧数据通道(§4.7),保留 TCP 半关闭;并发多条互不影响;quiesce 时主动拆除(§3.4)。详见 §3.7 |
 | `error` | 任意 | (终止) | 关 | handler 显式拒绝时的人类可读原因；坏 framing/JSON 也可能直接关连接，不保证总发 error |
@@ -773,7 +773,11 @@ vsock 端口固定 `5000`,**两个方向都复用同一端口号**,身份按方�
 
 当前 guest restore/attach handler 回显 request epoch，并固定发送 `app_state:"running"`。
 Schema 定义了 exited 常量，但 handler 未据实时状态产生 exited，也没有 `exited{code,term_signal}` 结构。
-ACK 不证明应用健康或 thaw 成功，thaw 发生在 ACK 后，失败时 exec/forward/report 等 gate 保持关闭。
+ACK 在 thaw 成功并开放执行 gate 后发送，但不证明应用健康。Thaw 失败不发 ACK，exec/forward/report 等 gate 保持关闭。ACK 写出失败不会撤销已完成的 thaw 或执行准入，但不会恢复原本暂停的 report stream；host 仍将握手判为失败，并负责重试或终态清理。
+
+Thaw 由 PID 1 写 freezer 控制文件，不等待 app 或其 stdio。解冻的 app 可能因 console pump 尚未接通而阻塞在输出，但不会阻塞独立的 ACK。MUX 仅在 ACK 后启动，避免帧破坏握手；资源报告随后恢复。现有 exec session 排空和终止语义不变。
+
+这一更强的 ACK 屏障要求启动 Runtime 内包含更新后的 guest init。仅更新 host 不会替换已有内存 Snapshot 中的 PID 1。应从使用更新后 Runtime 启动的 guest 捕获替代快照；保留的旧快照仍采用原有 guest 行为，无需格式迁移且仍可读取。
 
 ### 4.4 管理消息 wire format 与字段
 
@@ -1019,13 +1023,13 @@ sandbox-ctl                                               sandbox-init
 capture resume/recovery 调 reattach                        旧 MUX 可能不存在或已坏
 dial <base> UDS；CONNECT 5000；读完 OK
 attach{epoch} ------------------------------------------> 有界优雅关闭/硬丢旧 MUX
+                                                          查冻结状态，仅仍冻结时 thaw
+                                                          开放 exec/forward/plugin/app-restart
                       <--- attach_ack{epoch,stdio,app_state}
 initial SET_WINSIZE =====================================> this conn -> MUX；恢复输出 pump
-                                                          查冻结状态，仅仍冻结时 thaw
-                                                          thaw 成功后再开 exec/forward/plugin/
-                                                          app-restart/report gate
+                                                          恢复 report gate
 恢复 MUX 流                                               恢复 MUX 流
-冻结状态查询或 thaw 失败时 ACK 可能已发；guest log，gate 仍关闭。
+冻结状态查询或 thaw 失败时不发 ACK；guest log，gate 仍关闭。
 ```
 
 **quiesce → snapshot**：
@@ -1063,13 +1067,12 @@ dial <base> UDS；CONNECT 5000
 restore{epoch,wallclock_ns,network?} --------------------> >0 时尽力 clock_settime
                                                           可选尽力 network replace
                                                           暂停的 mem_report 切新 epoch
+                                                          thaw app；开放执行 gate
                       <--- restore_ack{epoch,stdio,app_state}
 initial SET_WINSIZE =====================================> this conn -> MUX；恢复输出 pump
-                                                          最后 thaw app
-                                                          仅 thaw 成功才重新开 gate
 SafeTarget normalization；开放 observation epoch           barrier 后新 epoch/seq 恢复采样
 重启 ping ticker                                          listener 跨 capture 不变
-Clock/network 失败 log 并不阻止 ACK；ACK 先于 thaw，不证明应用健康或 thaw 成功。
+Clock/network 失败 log 并不阻止 ACK；ACK 在 thaw 成功并开放 gate 后发送，但不证明应用健康。
 ```
 
 **listener 跨快照保持打开**：quiesce 若关掉它，restore/attach 无人接收。
@@ -1124,7 +1127,7 @@ RTT 在完整 pong/guest-EOF exchange 后用 host time.Since(tSend) 计算，保
   pump 可等待显式 attach/restore。
 - Primary 终态路径在 POWER_OFF 前尝试 app_exited；通知失败或 ACK 未到不阻止 poweroff。
 - Exec 在 quiesce 中、空 argv 或启动失败时拒绝；会话丢失会杀与 namespace helper 通过父死信号绑定的命令（§3.6）。
-- Restore clock/network 失败 log 并继续；restore/attach thaw 失败时 gate 保持关闭，即使 ACK 已发（§4.3）。
+- Restore clock/network 失败 log 并继续；restore/attach thaw 失败时 gate 保持关闭且不发 ACK（§4.3）。
 
 **Host（sandbox-ctl）**：
 
@@ -1233,11 +1236,12 @@ Guest 拒绝重复/旧 ID 或不同 Host epoch. Host 核对 response 类型、ep
 
 Freeze/restore 前关闭 usage 准入、推进代次, 并有界 shutdown/join 旧连接.
 即使读取不可取消, 原 source slot 仍保留. 不捕获持锁等待旧 Host 的 worker,
-不声称网络 FD 关闭会取消 statfs/proc. Restore/attach 在 ACK 前重新开放原始
-usage 准入, 使 Host 立即首轮请求在应用 thaw 未完成时也能被接受. 同 VM attach
+不声称网络 FD 关闭会取消 statfs/proc. Restore/attach 在 thaw 与 ACK 前重新开放原始
+usage 准入. 独立的原始读取可在 thaw 期间执行, Host 在 ACK 后的首轮请求
+会看到已开放的 usage 服务. 同 VM attach
 保留 Host epoch; true restore 仅在 ACK 前清除一次旧 epoch/ID 边界, 接受新 ID
-后不再重置. Exec/plugin/app 和资源控制器 mem_report 准入仍仅在 thaw 成功后
-开放. ACK/thaw 失败时关闭该次新开放的 usage gate, 作废连接并有界 join;
+后不再重置. Exec/plugin/app 准入在 thaw 成功后、ACK 前开放;
+资源控制器 mem_report 准入等到 ACK/MUX 完成后才开放. ACK/thaw 失败时关闭该次新开放的 usage gate, 作废连接并有界 join;
 不会停止普通 MUX 重连前已经活动的 usage 流, 也不会回滚已成功的重试或后继代次.
 重试继承尚未完成的开放操作的收尾责任; 两次尝试都失败时仍关闭准入.
 Source slot 跨失败回滚保留. 该原始协议不改变业务文件系统同步或既有资源控制器.

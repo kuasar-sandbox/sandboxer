@@ -212,13 +212,9 @@ func TestUsageReattachAdmitsBeforeAckAndKeepsSourceSlots(t *testing.T) {
 					waitUsageDone(t, finished)
 					closeUsageTestMUX(t, bridge, host)
 				})
-				ack, err := proto.ReadMessage(usageIO{host, time.Now().Add(2 * time.Second)})
 				ackType, epoch, id := proto.TypeAttachAck, "old-host", uint64(101)
 				if newHost {
 					ackType, epoch, id = proto.TypeRestoreAck, "new-host", 1
-				}
-				if err != nil || ack.Type != ackType || ack.Epoch != 19 {
-					t.Fatalf("ACK: %+v, %v", ack, err)
 				}
 				waitUsageDone(t, thawStarted)
 				assertUsageLaunchGatesClosed(t, sup)
@@ -230,12 +226,16 @@ func TestUsageReattachAdmitsBeforeAckAndKeepsSourceSlots(t *testing.T) {
 				assertUsageLaunchGatesClosed(t, sup)
 				thawOnce.Do(func() { close(releaseThaw) })
 				waitUsageDone(t, finished)
-				if !handed || bridge.holder.peek() == nil {
-					t.Fatal("reattached MUX ownership lost")
-				}
 				if failThaw {
 					if !errors.Is(finishErr, wantErr) {
 						t.Fatalf("thaw error: %v", finishErr)
+					}
+					if handed || bridge.holder.peek() != nil {
+						t.Fatal("failed thaw published a MUX")
+					}
+					_ = guest.Close() // failed handshake remains caller-owned
+					if ack, err := proto.ReadMessage(usageIO{host, time.Now().Add(2 * time.Second)}); err == nil {
+						t.Fatalf("failed thaw published ACK: %+v", ack)
 					}
 					waitUsageDone(t, connDone)
 					assertUsageLaunchGatesClosed(t, sup)
@@ -246,6 +246,13 @@ func TestUsageReattachAdmitsBeforeAckAndKeepsSourceSlots(t *testing.T) {
 						t.Fatal("failed thaw left newly admitted usage running")
 					}
 				} else {
+					ack, err := proto.ReadMessage(usageIO{host, time.Now().Add(2 * time.Second)})
+					if err != nil || ack.Type != ackType || ack.Epoch != 19 {
+						t.Fatalf("ACK: %+v, %v", ack, err)
+					}
+					if !handed || bridge.holder.peek() == nil {
+						t.Fatal("reattached MUX ownership lost")
+					}
 					if finishErr != nil || sup.quiescing.Load() || guestMemReports.isPaused() {
 						t.Fatalf("successful thaw failed to resume: %v", finishErr)
 					}
@@ -270,6 +277,10 @@ func TestUsageReattachAckFailurePreservesPriorAdmission(t *testing.T) {
 			s, sup, bridge := usageReattachFixture(t)
 			var client *vsockConn
 			if live {
+				if err := resumeAfterThaw(sup, nil); err != nil {
+					t.Fatal(err)
+				}
+				guestMemReports.resumeEpoch()
 				_, generation := s.resume(false)
 				s.commitResume(generation)
 				client, _ = usageManagementConn(t, sup, bridge)
@@ -278,12 +289,16 @@ func TestUsageReattachAckFailurePreservesPriorAdmission(t *testing.T) {
 			guest, host := usageSocketPair(t)
 			_ = host.shutdown()
 			_ = host.Close()
+			thawed := false
 			handed, err := finishReattach(guest, sup, bridge, 19, !live, func() error {
-				t.Error("thaw called after failed ACK")
+				thawed = true
 				return nil
 			})
 			if handed || err == nil || bridge.holder.peek() != nil {
 				t.Fatalf("failed ACK changed connection ownership: %v, %v", handed, err)
+			}
+			if !thawed || sup.quiescing.Load() || guestMemReports.isPaused() == live {
+				t.Fatal("ACK failure must retain completed thaw without starting a paused report stream")
 			}
 			s.mu.Lock()
 			paused := s.paused
@@ -343,15 +358,11 @@ func testUsageOlderAttachFailureAfterRetry(t *testing.T, failRetry bool) {
 		once.Do(func() { close(release) })
 		waitUsageDone(t, finished)
 	})
-	ack, err := proto.ReadMessage(usageIO{firstHost, time.Now().Add(2 * time.Second)})
-	if err != nil || ack.Type != proto.TypeAttachAck {
-		t.Fatalf("first ACK: %+v, %v", ack, err)
-	}
 	waitUsageDone(t, started)
 	client, connDone := usageManagementConn(t, sup, bridge)
 	readUsageResponse(t, client, "old-host", 101)
-	// The Host retries an ambiguous ACK. Its next TypeAttach handler drains
-	// the first MUX while that handler's thaw/query has not yet returned.
+	// The Host retries a handshake whose thaw/query has not yet returned.
+	// No ACK or MUX may have been published by that unfinished handler.
 	closeUsageTestMUX(t, bridge, firstHost)
 	bridge.closeLiveMUX()
 	secondGuest, secondHost := usageSocketPair(t)
@@ -362,16 +373,20 @@ func testUsageOlderAttachFailureAfterRetry(t *testing.T, failRetry bool) {
 		return nil
 	})
 	t.Cleanup(func() { closeUsageTestMUX(t, bridge, secondHost) })
-	if !handed || (failRetry && !errors.Is(err, wantErr)) || (!failRetry && err != nil) {
+	if handed == failRetry || (failRetry && !errors.Is(err, wantErr)) || (!failRetry && err != nil) {
 		t.Fatalf("second attach: handed=%v, %v", handed, err)
 	}
-	ack, err = proto.ReadMessage(usageIO{secondHost, time.Now().Add(2 * time.Second)})
-	if err != nil || ack.Type != proto.TypeAttachAck {
-		t.Fatalf("second ACK: %+v, %v", ack, err)
-	}
 	if failRetry {
+		_ = secondGuest.Close()
+		if ack, err := proto.ReadMessage(usageIO{secondHost, time.Now().Add(2 * time.Second)}); err == nil {
+			t.Fatalf("failed retry published ACK: %+v", ack)
+		}
 		waitUsageDone(t, connDone)
 	} else {
+		ack, err := proto.ReadMessage(usageIO{secondHost, time.Now().Add(2 * time.Second)})
+		if err != nil || ack.Type != proto.TypeAttachAck {
+			t.Fatalf("second ACK: %+v, %v", ack, err)
+		}
 		readUsageResponse(t, client, "old-host", 102)
 	}
 	once.Do(func() { close(release) })

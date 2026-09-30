@@ -930,8 +930,8 @@ The last column describes whether the connection closes or upgrades.
 | Memory report | guest→host | `mem_report{mem_report:{epoch,seq,mem_*}}` → `mem_report_ack` | Close | Guest observation; host validates epoch/seq and combines it with CH vm.info in the sandbox-local controller. |
 | Usage observation | host→guest | `usage_request{usage_request}` → `usage_response{usage_response}` | Reuse | New raw memory/filesystem reads only; Host alone accumulates (§4.11). |
 | Before capture | host→guest | `quiesce{skip_drop_caches}` → `quiesced{drop_caches_result}` | Close | Freeze app, run prep and tear down sessions (§3.4); host then requires control EOF and its handler barriers before pause. |
-| After restore | host→guest | `restore{epoch,wallclock_ns,network?}` → `restore_ack{epoch,stdio,app_state}` | MUX | After vCPUs resume, guest advances the report epoch, replies, reconnects MUX and thaws last. Host enables memory policy only after ACK/MUX setup. Clock/network updates are best-effort (§4.8); launch/files/init/plugins are cold-only and not replayed. RNG reseeding is not implemented. |
-| MUX replacement | host→guest | `attach{epoch}` → `attach_ack{epoch,stdio,app_state}` | MUX | Close/drop old MUX and attach the new connection. If the guest is still frozen, thaw it before reopening gates, including same-process resume and failed-capture recovery; otherwise skip thaw. Attach and VM resume are distinct operations. |
+| After restore | host→guest | `restore{epoch,wallclock_ns,network?}` → `restore_ack{epoch,stdio,app_state}` | MUX | After vCPUs resume, guest advances the report epoch, thaws and reopens execution gates before ACK, then reconnects MUX and resumes reports. Host enables memory policy only after ACK/MUX setup. Clock/network updates are best-effort (§4.8); launch/files/init/plugins are cold-only and not replayed. RNG reseeding is not implemented. |
+| MUX replacement | host→guest | `attach{epoch}` → `attach_ack{epoch,stdio,app_state}` | MUX | Close/drop old MUX and attach the new connection. If the guest is still frozen, thaw it before reopening gates and sending ACK, including same-process resume and failed-capture recovery; otherwise skip thaw. Attach and VM resume are distinct operations. |
 | Execute command | host→guest | `exec{spec}` → `exec_ack{stdio}` | Independent MUX | Start a sibling command and wire its stdio; on completion send EXIT_STATUS then close (§3.6 / §4.6). Sessions can run concurrently. |
 | Port forward | host→guest | `connect{spec}` → `connect_ack` | Fwd relay | Dial the guest target, or Listen+Accept with spec.accept. Accept may park indefinitely without a host ACK deadline. Each forward is independent and is torn down for quiesce (§3.7 / §4.7). |
 | Error | Either | `error{msg}` | Close | Human-readable rejection where the handler sends one; malformed framing/JSON can instead terminate the connection. |
@@ -945,9 +945,23 @@ reconnect loop for every unexpected MUX error.
 The current guest echoes the request epoch in restore_ack/attach_ack and
 reports `app_state:"running"` in those handlers. The schema defines an exited
 state, but the handlers do not currently derive a live exited state or return
-structured `exited{code,term_signal}`. ACK is not an application-health or
-successful-thaw guarantee: thaw is attempted afterward and failure leaves the
-launch/forward/report gates closed.
+structured `exited{code,term_signal}`. ACK follows successful thaw and execution-gate reopening; it is not an
+application-health guarantee. Thaw failure sends no ACK and leaves the
+launch/forward/report gates closed. ACK write failure leaves the completed
+thaw and execution admission in place but does not resume a paused report
+stream. The host still fails the handshake and owns retry or terminal cleanup.
+
+Thaw writes the freezer control file from PID 1; it does not wait for the app
+or its stdio. A thawed app may block on output while console pumps remain
+parked, but cannot block the independent ACK. MUX starts only after ACK so its
+frames cannot corrupt the handshake; resource reports resume afterward. The
+existing exec-session drain and termination contract is unchanged.
+
+This stronger ACK barrier requires the updated guest init in the boot Runtime.
+A host-only update does not replace PID 1 in an existing memory Snapshot.
+Capture replacement snapshots from guests booted with the updated Runtime;
+retained older snapshots keep their original guest behavior and remain
+readable without a format migration.
 
 ### 4.4 Management wire format and fields
 
@@ -1243,14 +1257,13 @@ sandbox-ctl                                               sandbox-init
 capture resume/recovery invokes reattach                   old MUX may be absent or broken
 dial <base> UDS, CONNECT 5000, drain OK
 attach{epoch} ------------------------------------------> gracefully close/drop old MUX
+                                                          query frozen state; thaw only if frozen
+                                                          reopen exec/forward/plugin/app-restart
                       <--- attach_ack{epoch,stdio,app_state}
 initial SET_WINSIZE =====================================> this conn -> MUX; resume output pumps
-                                                          query frozen state; thaw only if frozen
-                                                          after successful thaw:
-                                                          reopen exec/forward/plugin/app-restart
-                                                          and report gates
+                                                          resume report gate
 normal MUX flow                                           normal MUX flow
-If frozen-state query or thaw fails, ACK may already have been sent;
+If frozen-state query or thaw fails, no ACK is sent;
 guest logs the failure and leaves those gates closed.
 ```
 
@@ -1289,14 +1302,13 @@ dial <base> UDS, CONNECT 5000
 restore{epoch,wallclock_ns,network?} --------------------> best-effort clock_settime if >0
                                                           optional best-effort network replacement
                                                           advance paused mem_report to new epoch
+                                                          thaw app; reopen execution gates
                       <--- restore_ack{epoch,stdio,app_state}
 initial SET_WINSIZE =====================================> this conn -> MUX; resume output pumps
-                                                          thaw app last
-                                                          reopen gates only after successful thaw
 SafeTarget normalization; open observation epoch           new report epoch/seq resumes after barrier
 (re)start ping ticker                                      listener unchanged across capture
 Clock/network failures are logged and do not prevent ACK;
-ACK precedes thaw and does not prove application health or successful thaw.
+ACK follows successful thaw and gate reopening, but does not prove application health.
 ```
 
 **The listener remains across capture.** Closing it during quiesce would leave
@@ -1367,7 +1379,7 @@ This is best-effort classification, not a typed network-error taxonomy.
   Mid-session transport loss kills the exec command tied to its namespace
   helper through the parent-death mechanism (§3.6).
 - Restore clock/network failures log and continue. Restore/attach thaw failure
-  leaves gates closed even though ACK may already have been sent (§4.3).
+  leaves gates closed and sends no ACK (§4.3).
 
 **Host, sandbox-ctl:**
 
@@ -1498,11 +1510,11 @@ the old connection is shut down and joined with a bounded budget. Source
 slots are retained even if reads cannot be canceled. No captured worker holds
 a mutex while waiting for the old Host, and closing a network FD is not
 claimed to cancel statfs/proc. Restore/attach reopens raw usage admission
-before ACK, making the Host's immediate first round eligible even while app
-thaw is pending. Same-VM attach keeps the Host epoch; true restore clears
+before thaw and ACK. Independent raw reads can run during thaw; the Host's
+first post-ACK round sees an already eligible usage service. Same-VM attach keeps the Host epoch; true restore clears
 the old epoch/ID boundary once, before ACK, never after accepting new IDs.
-Exec/plugin/app and resource-controller mem_report gates still reopen only
-after successful thaw. Failed ACK/thaw closes the usage gate it reopened
+Exec/plugin/app gates reopen after successful thaw and before ACK; the
+resource-controller mem_report gate waits until ACK/MUX setup. Failed ACK/thaw closes the usage gate it reopened
 and invalidates/joins its connection within a bounded budget; it neither
 stops an already-live usage stream on ordinary MUX reconnect nor rolls back
 a successful retry or later lifecycle generation. A retry inherits an

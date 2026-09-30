@@ -359,7 +359,8 @@ func SendQuiesceContext(ctx context.Context, client *HostClient, skipDropCaches 
 // connection together with the channel set the guest established. The
 // caller wraps the conn in a mux.Session and bridges those streams, then
 // (re)starts the ping ticker. The current guest echoes epoch; it does not
-// use it as a generic duplicate-request filter. ACK precedes guest thaw.
+// use it as a generic duplicate-request filter. Updated guests complete thaw
+// and reopen execution gates before ACK; memory reports resume after MUX setup.
 //
 // network (optional) asks the guest to attempt flush-and-replace before
 // thawing. Failure is logged without preventing ACK, which therefore does

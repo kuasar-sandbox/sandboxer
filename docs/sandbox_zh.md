@@ -240,7 +240,7 @@ local exec 可只给 `--path-id`；若同时给
 `RunRoot/a/ctl.sock`，请求本身不增加 SandboxID 或一致性检查。未给 PathID 时
 继续使用 `RunRoot/SandboxID/ctl.sock`。
 
-`exec` 通过当前 ctl/MUX 创建 sibling process. Export/snapshot 的 quiesce gate 原子阻止新 exec/forward 进入不稳定窗口,并关闭、join 已放行的 exec/forward session;在飞 exec 被终止且不会在 `--resume` 后自动重跑. Restore/attach 只有在新 MUX 建立且应用 cgroup 已 thaw 后才重新开放 exec、forward、plugin 和 app restart;ACK 与 thaw 之间抢先到达的请求会被 gate 拒绝,不会向 frozen cgroup fork. Guest `attach` 是幂等恢复操作;host 在 request/ACK 边界不明确时立即重试一次,且整个 dial/ACK 过程受 lifecycle context cancellation 控制.
+`exec` 通过当前 ctl/MUX 创建 sibling process. Export/snapshot 的 quiesce gate 原子阻止新 exec/forward 进入不稳定窗口,并关闭、join 已放行的 exec/forward session;在飞 exec 被终止且不会在 `--resume` 后自动重跑. Restore/attach 先 thaw 应用 cgroup 并重新开放 exec、forward、plugin 和 app restart,再发送 ACK. Host 在 ACK 与本端 MUX 建立后发布 ready,不会暴露仍处于 quiesce 的 exec gate. Guest mem_report 仅在 ACK 与 guest MUX 建立后恢复. Thaw 失败不发 ACK;ACK 失败不撤销已经完成的 thaw,仍由现有 host recovery/terminal-cleanup 路径负责. Guest `attach` 是幂等恢复操作;host 在 request/ACK 边界不明确时立即重试一次,且整个 dial/ACK 过程受 lifecycle context cancellation 控制.
 
 远程授权 exec 使用 `pkg/ctl.ServeExecTunnel(ctx, options)`,固定以下顺序:
 
