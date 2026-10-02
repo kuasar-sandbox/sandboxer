@@ -1035,7 +1035,7 @@ Snapshot ZIP 与 config 同样 strict、bounded、canonical。`config.json` 和 
 
 `resources.capacity` 是 guest-visible VM capacity,进入 Portable config. `resources.allocatable` 是 cold start 的 workload 默认值,也进入 Portable config;其中 `allocatable.cpu` 必须是有限数,且满足 `0 < allocatable.cpu <= capacity.cpu`. Restore 保持 E 中的 capacity 和已捕获的 `deflate_on_oom`,但可以从目标节点显式重新应用 allocatable CPU/memory;该运行时 policy 不改写 E 或 C0. `control`、`overhead`、`watermark_high` 和 `startup` 是 node policy,不进入 E.
 
-Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Host ping gate 会让已入场探测完成 `pong` + guest EOF transport barrier;该排空独立受 8 s quiesce budget 约束,即使普通 `timeouts.ping` 关闭强制超时也不会无限阻塞捕获. 到期时 host cancel并join该探测,捕获失败后走完整 recovery. Guest quiesce 还会排空并暂停周期 `mem_report`,防止 S 捕获持有 stream lock、仍等待旧 host vsock 的 reporter. Restore 在 ACK 前切换到新 observation epoch;`--resume`/失败 attach 恢复原 epoch,live attach只重开pause gate且不破坏已入场报告的计数. Recovery 在 VM、MUX、app 和 backend 恢复后释放 host barrier.
+Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Host ping gate 等待已入场探测完成 guest EOF transport barrier。在 CONNECT 和请求写入完成后，即使未收到 pong，响应流 EOF 也表示排空完成；该探测仍然是健康检查失败，计数器和连续失败致命阈值策略不变。CONNECT EOF、取消、截止时间以及其他协议错误仍令排空失败。之后捕获必须单独取得明确的 quiesce 确认才能暂停 VM。该排空独立受 8 s quiesce budget 约束,即使普通 `timeouts.ping` 关闭强制超时也不会无限阻塞捕获. 到期时 host cancel并join该探测,捕获失败后走完整 recovery. Guest quiesce 还会排空并暂停周期 `mem_report`,防止 S 捕获持有 stream lock、仍等待旧 host vsock 的 reporter. Restore 在 ACK 前切换到新 observation epoch;`--resume`/失败 attach 恢复原 epoch,live attach只重开pause gate且不破坏已入场报告的计数. Recovery 在 VM、MUX、app 和 backend 恢复后释放 host barrier.
 
 ### 4.2 Memory terms
 
@@ -2352,7 +2352,7 @@ CH/KVM 证据. PR 和证据产物保留实际测量的提交、环境和限制,
 
 ### 12.7 源读取恢复验证
 
-回归覆盖 ring/completion 不变量、COW materialization、EOF/EAGAIN 包装、后端取消、仅成功初始化缓存、队列/冻结关闭, 以及真实内核 REMOVE/COPY 的页内容. owner E2E 进一步使用匹配的组件二进制、runtime image 和 native 依赖验证 CH/KVM 行为. 前置条件缺失代表缺少验证, 不代表测试通过.
+回归覆盖 ring/completion 不变量、COW materialization、EOF/EAGAIN 包装、后端取消、仅成功初始化缓存、队列/冻结关闭, 以及真实内核 REMOVE/COPY 的页内容. owner E2E 进一步使用匹配的组件二进制、runtime image 和 native 依赖验证 CH/KVM 行为. 前置条件缺失代表缺少验证, 不代表测试通过. Pinger 回归将响应 EOF 严格安排在捕获开始等待已入场探测之后，验证健康检查失败仍被记录，并要求单独取得 quiesce 确认。反例覆盖 CONNECT EOF、取消、截断或无效响应，以及有界排空到期。读取恢复用例在失败时保留有界且隐藏密钥的运行时和错误日志尾部，以区分 quiesce 前的 ping 排空错误与 guest quiesce 失败。
 
 ## 13. Reliability、performance 与兼容边界
 

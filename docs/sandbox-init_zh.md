@@ -463,7 +463,10 @@ Listener 并发处理每个已 accept 的管理连接，exec/connect/mem_report 
    Usage admission is paused before the Host memory barrier; Guest invalidates
    its generation and closes/joins the connection. Blocked reads retain their
    original slots without locks waiting on the old Host.
-   等已入场 ping 完成 pong + guest EOF transport barrier。
+   等已入场 ping 完成 guest EOF transport barrier。未收到 pong 的响应 EOF
+   也能排空失败探测；健康检查计数和致命失败策略仍然适用。
+   CONNECT EOF 以及其他传输或协议失败不能证明排空完成。
+   /vm.pause 前仍必须单独取得明确的 quiesce 确认。
    排空独立受 8 s quiesce budget 约束，即使普通 ping timeout 不强制也一样。
    到期 cancel + join 并令捕获失败；不在 guest 确认前抢先拆能正常完成的 transport。
    guest 拒绝新 exec、SIGKILL 在飞 exec helper、关闭 lingered vsock，
@@ -1091,7 +1094,7 @@ CH 从保存的 local_port_last + 1 继续分配 host local port；
 |---|---|
 | host 写完 launch | start，立即发首个 probe |
 | restore ACK/MUX 设置成功 | start/restart |
-| capture admission 关闭 | pause；等待在途 pong + guest EOF，独立 8 s capture budget，超时 cancel/join 并令捕获失败 |
+| capture admission 关闭 | pause；等待在途 ping 的 guest EOF（无 pong 的响应 EOF 仍是健康检查失败），独立 8 s capture budget，超时 cancel/join 并令捕获失败 |
 | 同 VM recovery/resume 成功 | 必需 barrier 后恢复 |
 | CH 退出 | stop |
 

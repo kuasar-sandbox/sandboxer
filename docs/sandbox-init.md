@@ -574,7 +574,10 @@ EOF, and completing its own admitted-handler drains.
    Usage admission is already paused before the Host memory barrier;
    Guest invalidates the usage generation and closes/joins its connection.
    Blocked source reads keep their original slots, not locks waiting on Host.
-   Drain admitted ping through pong plus guest EOF transport barrier.
+   Drain admitted ping through the guest EOF transport barrier. Response EOF
+   without pong drains a failed probe; its health metrics/fatal policy still apply.
+   CONNECT EOF and other transport/protocol failures do not establish this drain.
+   Quiesce still requires its own positive acknowledgment before /vm.pause.
    This drain has an independent 8 s quiesce budget, even if ordinary ping
    timeout is disabled. Expiry cancels and joins the exchange and fails capture;
    it does not preempt a normally completing transport before guest confirmation.
@@ -1330,7 +1333,7 @@ It requires a bounded `timeouts.ping`.
 |---|---|
 | Host finishes writing launch | Start; first probe runs immediately |
 | Successful restore ACK/MUX setup | Start/restart |
-| Capture admission closes | Pause; drain admitted ping through pong and guest EOF within the independent 8 s capture budget; expiry cancels/joins and fails capture |
+| Capture admission closes | Pause; drain admitted ping through guest EOF (response EOF without pong remains a health failure) within the independent 8 s capture budget; expiry cancels/joins and fails capture |
 | Successful same-VM recovery/resume | Resume after the required barriers |
 | CH exits | Stop |
 

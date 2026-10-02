@@ -30,6 +30,30 @@ SESSIONS=()
 cleanup() {
     local status=$?
     set +e
+    if [ "$status" -ne 0 ]; then
+        python3 - "$WORK" <<'RECOVERY_DIAGNOSTICS'
+import pathlib, re, sys
+work = pathlib.Path(sys.argv[1])
+# Only bounded tails of owned runtime/error logs; never read config or key files.
+# Snapshot/source errors can contain manifest keys, so redact 256-bit hex values.
+for name in ('recovered.snapshot.log', 'recovered.log', 'verified.snapshot.log',
+             'verified.log', 'proxy.log'):
+    try:
+        with (work / name).open('rb') as source:
+            source.seek(0, 2)
+            size = source.tell()
+            offset = max(0, size - 4096)
+            source.seek(offset)
+            tail = source.read(4096).decode(errors='replace')
+        if offset:
+            tail = tail.partition('\n')[2]  # Discard a possibly partial key/line.
+        tail = re.sub(r'(?i)[0-9a-f]{64}', '<redacted>', tail)
+        print(f'read-recovery diagnostic {name} bytes={size}', file=sys.stderr)
+        print('\n'.join(tail.splitlines()[-12:]), file=sys.stderr)
+    except OSError:
+        print(f'read-recovery diagnostic {name}: unavailable', file=sys.stderr)
+RECOVERY_DIAGNOSTICS
+    fi
     for sid in "${SESSIONS[@]}"; do readiness_kill_session TERM "$sid"; done
     for pid in $(jobs -pr); do kill -TERM "$pid" 2>/dev/null || true; done
     sleep 1

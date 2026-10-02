@@ -7,12 +7,180 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
+
+// Deadline is queried when PauseContext installs its drain timeout, after it
+// has acquired the admitted tick's completion channel. This orders peer close
+// after the join without relying on ticker timing or a sleep.
+type pingDrainObservedContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (c *pingDrainObservedContext) Deadline() (time.Time, bool) {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Deadline()
+}
+
+func TestPingerPauseResponseEOFIsDrainedButUnhealthy(t *testing.T) {
+	for _, beforeOK := range []bool{false, true} {
+		name := "response_eof"
+		if beforeOK {
+			name = "connect_eof_is_not_guest_close"
+		}
+		t.Run(name, func(t *testing.T) {
+			base := filepath.Join(t.TempDir(), "vsock.sock")
+			admitted, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			closePeer := func() { releaseOnce.Do(func() { close(release) }) }
+			defer closePeer()
+			var requests atomic.Uint32
+			proxy := newFakeCHProxyWithBeforeOK(t, base, func(net.Conn) bool {
+				if beforeOK {
+					close(admitted)
+					<-release
+				}
+				return beforeOK
+			}, func(c net.Conn) {
+				req, err := proto.ReadMessage(c)
+				if err != nil {
+					t.Errorf("guest request: %v", err)
+					return
+				}
+				requests.Add(1)
+				if req.Type == proto.TypeQuiesce {
+					_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeQuiesced})
+					return
+				}
+				if req.Type != proto.TypePing {
+					t.Errorf("unexpected request %q", req.Type)
+				}
+				close(admitted)
+				<-release // Guest closes its ping stream without a pong.
+			})
+			defer proxy.close()
+			p := &Pinger{
+				Client: &HostClient{BasePath: base}, Stats: &PingStats{}, Logf: t.Logf,
+				Cfg: PingerConfig{Interval: time.Hour, Timeout: time.Hour, FatalThreshold: 1},
+			}
+			fatal := make(chan error, 1)
+			p.SetOnFatal(func(err error) { fatal <- err })
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			p.Start(ctx)
+			defer func() { closePeer(); p.Stop() }()
+			select {
+			case <-admitted:
+			case <-ctx.Done():
+				t.Fatal("ping was not admitted")
+			}
+			drainCtx := &pingDrainObservedContext{Context: ctx, observed: make(chan struct{})}
+			joined := make(chan error, 1)
+			go func() { joined <- p.PauseContext(drainCtx) }()
+			select {
+			case <-drainCtx.observed:
+			case <-ctx.Done():
+				t.Fatal("capture did not join the admitted ping")
+			}
+			closePeer()
+			err := <-joined
+			if beforeOK {
+				if !errors.Is(err, io.EOF) {
+					t.Fatalf("CONNECT drain = %v, want EOF failure", err)
+				}
+			} else if err != nil {
+				t.Fatalf("snapshot: drain pinger before quiesce: %v", err)
+			}
+			stats := p.Stats.Snapshot()
+			if stats.Attempts != 1 || stats.Success != 0 || stats.DialError != 1 || stats.Timeout != 0 {
+				t.Fatalf("failed probe was hidden or retried: %+v", stats)
+			}
+			select {
+			case err := <-fatal:
+				if !errors.Is(err, io.EOF) {
+					t.Fatalf("fatal health error = %v, want EOF", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("capture suppressed the fatal health policy")
+			}
+			if !beforeOK {
+				if _, err := SendQuiesceContext(ctx, p.Client, false); err != nil {
+					t.Fatalf("capture must obtain its own quiesce acknowledgement: %v", err)
+				}
+				if got := requests.Load(); got != 2 {
+					t.Fatalf("requests = %d, want one ping and one quiesce", got)
+				}
+			}
+		})
+	}
+}
+
+func TestPingerPauseCancellationWinsOverResponseEOF(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		_, _ = proto.ReadMessage(c) // Close without pong.
+	})
+	defer proxy.close()
+	logged, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	finishTick := func() { releaseOnce.Do(func() { close(release) }) }
+	defer finishTick()
+	p := &Pinger{
+		Client: &HostClient{BasePath: base}, Stats: &PingStats{},
+		Cfg: PingerConfig{Interval: time.Hour, Timeout: time.Hour},
+		Logf: func(format string, _ ...any) {
+			if strings.HasPrefix(format, "ping id=") {
+				close(logged)
+				<-release // Keep the EOF tick admitted until capture has joined it.
+			}
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	p.Start(ctx)
+	defer func() { finishTick(); p.Stop() }()
+	select {
+	case <-logged:
+	case <-ctx.Done():
+		t.Fatal("ping did not observe response EOF")
+	}
+	pauseParent, cancelPause := context.WithCancel(ctx)
+	defer cancelPause()
+	drainCtx := &pingDrainObservedContext{Context: pauseParent, observed: make(chan struct{})}
+	joined := make(chan error, 1)
+	go func() { joined <- p.PauseContext(drainCtx) }()
+	select {
+	case <-drainCtx.observed:
+	case <-ctx.Done():
+		t.Fatal("capture did not join the EOF tick")
+	}
+	cancelPause()
+	finishTick()
+	if err := <-joined; !errors.Is(err, context.Canceled) {
+		t.Fatalf("capture cancellation = %v, want context.Canceled", err)
+	}
+	if p.Stats.DialError.Load() != 1 || p.Stats.Success.Load() != 0 {
+		t.Fatal("EOF probe health failure was lost")
+	}
+}
+
+func TestSendQuiesceResponseEOFMustNotAcknowledge(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		_, _ = proto.ReadMessage(c)
+	})
+	defer proxy.close()
+	if _, err := SendQuiesce(&HostClient{BasePath: base}, false); !errors.Is(err, io.EOF) {
+		t.Fatalf("quiesce without positive acknowledgement = %v, want EOF failure", err)
+	}
+}
 
 // TestPinger_TickAndPause runs a fake guest behind a fakeCHProxy and verifies
 // Pause joins an in-flight probe through guest connection close before
