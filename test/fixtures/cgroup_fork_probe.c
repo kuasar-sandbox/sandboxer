@@ -5,13 +5,13 @@
  * parent then execs argv[1]. This test fixture is built during the source
  * build/prepare stage and is never compiled by product E2E execution.
  *
- * It is intentionally x86_64 and libc-free: sandboxer KVM product E2E is an
- * x86_64 lane today, and keeping the injected launch binary tiny preserves the
- * immediate-fork placement race exercised by the legacy test.
+ * Keep the x86_64 and aarch64 entries libc-free so both native architectures
+ * exercise the same immediate-fork placement race before any runtime startup.
  */
 
 typedef unsigned long usize;
 
+#if defined(__x86_64__)
 enum {
 	SYS_read = 0,
 	SYS_write = 1,
@@ -22,12 +22,25 @@ enum {
 	SYS_exit = 60,
 	SYS_wait4 = 61,
 	SYS_openat = 257,
+};
+#elif defined(__aarch64__)
+enum {
+	SYS_read = 63, SYS_write = 64, SYS_close = 57, SYS_getpid = 172,
+	SYS_clone = 220, SYS_execve = 221, SYS_exit = 93, SYS_wait4 = 260,
+	SYS_openat = 56,
+};
+#else
+#error unsupported cgroup probe architecture
+#endif
+
+enum {
 	AT_FDCWD = -100,
 	O_WRONLY = 1,
 	O_CREAT = 0100,
 	O_APPEND = 02000,
 };
 
+#if defined(__x86_64__)
 static long syscall0(long number)
 {
 	long result;
@@ -68,6 +81,45 @@ static long syscall4(long number, long a1, long a2, long a3, long a4)
 		: "rcx", "r11", "memory");
 	return result;
 }
+
+static long fork_process(void)
+{
+	return syscall0(SYS_fork);
+}
+#else
+/* Linux aarch64: x8 carries the number, x0..x4 the arguments, x0 the result. */
+static long syscall5(long number, long a1, long a2, long a3, long a4, long a5)
+{
+	register long x8 __asm__("x8") = number;
+	register long x0 __asm__("x0") = a1;
+	register long x1 __asm__("x1") = a2;
+	register long x2 __asm__("x2") = a3;
+	register long x3 __asm__("x3") = a4;
+	register long x4 __asm__("x4") = a5;
+	__asm__ volatile("svc #0"
+		: "+r"(x0)
+		: "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4)
+		: "memory", "cc");
+	return x0;
+}
+
+static long syscall0(long number) { return syscall5(number, 0, 0, 0, 0, 0); }
+static long syscall1(long number, long a1) { return syscall5(number, a1, 0, 0, 0, 0); }
+static long syscall3(long number, long a1, long a2, long a3)
+{
+	return syscall5(number, a1, a2, a3, 0, 0);
+}
+static long syscall4(long number, long a1, long a2, long a3, long a4)
+{
+	return syscall5(number, a1, a2, a3, a4, 0);
+}
+static long fork_process(void)
+{
+	/* No ARM64 fork syscall. SIGCHLD with no sharing flags and a null
+	 * child stack duplicates the process/address space like fork(). */
+	return syscall5(SYS_clone, 17, 0, 0, 0, 0);
+}
+#endif
 
 static usize append_string(char *out, usize offset, const char *value)
 {
@@ -191,7 +243,7 @@ __attribute__((used)) static long probe_main(long *initial_stack)
 		return 125;
 	envp = &argv[argc + 1];
 	for (i = 0; i < 128; i++) {
-		long pid = syscall0(SYS_fork);
+		long pid = fork_process();
 		if (pid == 0) {
 			record_child(argv[2], argv[5][0] == 't', argv[6][0] == '1');
 			syscall1(SYS_exit, 0);
@@ -204,13 +256,19 @@ __attribute__((used)) static long probe_main(long *initial_stack)
 		}
 	}
 	while (reaped < spawned) {
-		if (syscall4(SYS_wait4, -1, 0, 0, 0) > 0)
+		long waited = syscall4(SYS_wait4, -1, 0, 0, 0);
+		if (waited > 0)
 			reaped++;
+		else if (waited != -4) /* EINTR may be retried, other failures must terminate. */
+			return 126;
 	}
+	if (spawned != 128)
+		return 126;
 	syscall3(SYS_execve, (long)argv[1], (long)&argv[1], (long)envp);
 	return 127;
 }
 
+#if defined(__x86_64__)
 __asm__(
 	".global _start\n"
 	"_start:\n"
@@ -221,3 +279,16 @@ __asm__(
 	"mov $60, %rax\n"
 	"syscall\n"
 	"hlt\n");
+
+#else
+__asm__(
+	".text\n"
+	".global _start\n"
+	".type _start, %function\n"
+	"_start:\n"
+	"mov x0, sp\n"
+	"bl probe_main\n"
+	"mov x8, #93\n"
+	"svc #0\n"
+	"brk #0\n");
+#endif
