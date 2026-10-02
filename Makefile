@@ -38,6 +38,18 @@ BINDIR         := bin/$(TARGET_ARCH)
 BUILD_DIR      := build/$(TARGET_ARCH)
 E2E_FIXTURE_DIR ?= $(abspath build/e2e-tools/$(TARGET_ARCH))
 
+# Honor an explicitly provided compiler; otherwise choose the target toolchain.
+E2E_PROBE_CC := $(CC)
+ifeq ($(origin CC),default)
+  ifneq ($(HOST_ARCH),$(TARGET_ARCH))
+    ifeq ($(TARGET_ARCH),aarch64)
+      E2E_PROBE_CC := aarch64-linux-gnu-gcc
+    else
+      E2E_PROBE_CC := x86_64-linux-gnu-gcc
+    endif
+  endif
+endif
+
 define link_bin
 @if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
    mkdir -p bin && ln -sfn $(TARGET_ARCH)/$(1) bin/$(1); \
@@ -98,13 +110,14 @@ e2e-usage-probe:
 # order to detect Start->cgroup.procs races. Build that tiny libc-free probe in
 # the source-build stage; product E2E only consumes the prepared binary.
 e2e-cgroup-fork-probe:
-	@test "$(TARGET_ARCH)" = "x86_64" || { echo "cgroup-fork-probe is x86_64-only" >&2; exit 1; }
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
-	cc -nostdlib -static -fno-stack-protector -fno-builtin -ffreestanding \
+	$(E2E_PROBE_CC) -nostdlib -static -fno-stack-protector -fno-builtin -ffreestanding \
 		-fno-pie -no-pie -Wl,--build-id=none \
 		-o "$(E2E_FIXTURE_DIR)/cgroup-fork-probe" test/fixtures/cgroup_fork_probe.c
+	python3 -c 'import struct,sys; h=open(sys.argv[1],"rb").read(64); assert h[:7]==b"\x7fELF\x02\x01\x01" and struct.unpack_from("<H",h,18)[0]=={"x86_64":62,"aarch64":183}[sys.argv[2]], "cgroup probe compiler produced the wrong target architecture"' "$(E2E_FIXTURE_DIR)/cgroup-fork-probe" "$(TARGET_ARCH)"
 
 test-e2e-scripts:
+	PYTHONDONTWRITEBYTECODE=1 python3 test/source/cgroup_fork_probe_test.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-go-privilege.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_upload_restore_tick.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_disks_restore.py
