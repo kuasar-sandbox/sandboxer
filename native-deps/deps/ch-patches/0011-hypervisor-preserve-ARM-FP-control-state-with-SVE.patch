@@ -1,0 +1,201 @@
+From 270badade6a55f5aeb569008f8fbb87f6ba52bd0 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@localhost.localdomain>
+Date: Fri, 2 Oct 2026 09:52:08 +0800
+Subject: [PATCH] hypervisor: preserve ARM FP control state with SVE
+
+FPSR and FPCR remain core registers when SVE replaces vector register access. Save and restore them independently of the legacy vector path. Native KVM tests cover serialized SVE and non-SVE state with nonzero vectors, status and control values; the SVE test fails without this correction.
+---
+ hypervisor/src/kvm/mod.rs | 149 +++++++++++++++++++++++++++++---------
+ 1 file changed, 115 insertions(+), 34 deletions(-)
+
+diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
+index 221c609..d5ad053 100644
+--- a/hypervisor/src/kvm/mod.rs
++++ b/hypervisor/src/kvm/mod.rs
+@@ -1560,6 +1560,23 @@ impl cpu::Vcpu for KvmVcpu {
+             off += std::mem::size_of::<u64>();
+         }
+ 
++        // FPSR/FPCR remain core registers with SVE enabled.
++        // Floating-point Status Register
++        let off = offset_of!(kvm_regs, fp_regs.fpsr);
++        let mut bytes = [0_u8; 4];
++        self.fd
++            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)
++            .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
++        state.fp_regs.fpsr = u32::from_le_bytes(bytes);
++
++        // Floating-point Control Register
++        let off = offset_of!(kvm_regs, fp_regs.fpcr);
++        let mut bytes = [0_u8; 4];
++        self.fd
++            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)
++            .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
++        state.fp_regs.fpcr = u32::from_le_bytes(bytes);
++
+         Ok(state.into())
+     }
+ 
+@@ -1713,6 +1730,25 @@ impl cpu::Vcpu for KvmVcpu {
+             off += std::mem::size_of::<u64>();
+         }
+ 
++        // FPSR/FPCR remain core registers with SVE enabled.
++        // Floating-point Status Register
++        let off = offset_of!(kvm_regs, fp_regs.fpsr);
++        self.fd
++            .set_one_reg(
++                arm64_core_reg_id!(KVM_REG_SIZE_U32, off),
++                &kvm_regs_state.fp_regs.fpsr.to_le_bytes(),
++            )
++            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
++
++        // Floating-point Control Register
++        let off = offset_of!(kvm_regs, fp_regs.fpcr);
++        self.fd
++            .set_one_reg(
++                arm64_core_reg_id!(KVM_REG_SIZE_U32, off),
++                &kvm_regs_state.fp_regs.fpcr.to_le_bytes(),
++            )
++            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
++
+         Ok(())
+     }
+ 
+@@ -2974,22 +3010,6 @@ impl KvmVcpu {
+             off += mem::size_of::<u128>();
+         }
+ 
+-        // Floating-point Status Register
+-        let off = offset_of!(kvm_regs, fp_regs.fpsr);
+-        let mut bytes = [0_u8; 4];
+-        self.fd
+-            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)
+-            .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
+-        regs.fp_regs.fpsr = u32::from_le_bytes(bytes);
+-
+-        // Floating-point Control Register
+-        let off = offset_of!(kvm_regs, fp_regs.fpcr);
+-        let mut bytes = [0_u8; 4];
+-        self.fd
+-            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)
+-            .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
+-        regs.fp_regs.fpcr = u32::from_le_bytes(bytes);
+-
+         Ok(())
+     }
+ 
+@@ -3007,24 +3027,6 @@ impl KvmVcpu {
+             off += mem::size_of::<u128>();
+         }
+ 
+-        // Floating-point Status Register
+-        let off = offset_of!(kvm_regs, fp_regs.fpsr);
+-        self.fd
+-            .set_one_reg(
+-                arm64_core_reg_id!(KVM_REG_SIZE_U32, off),
+-                &regs.fp_regs.fpsr.to_le_bytes(),
+-            )
+-            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
+-
+-        // Floating-point Control Register
+-        let off = offset_of!(kvm_regs, fp_regs.fpcr);
+-        self.fd
+-            .set_one_reg(
+-                arm64_core_reg_id!(KVM_REG_SIZE_U32, off),
+-                &regs.fp_regs.fpcr.to_le_bytes(),
+-            )
+-            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
+-
+         Ok(())
+     }
+ }
+@@ -3178,6 +3180,85 @@ impl KvmVcpu {
+ 
+ #[cfg(test)]
+ mod unit_tests {
++    // Requires a native ARM KVM host; hosted artifact-only ARM runners lack /dev/kvm.
++    #[test]
++    #[cfg(target_arch = "aarch64")]
++    #[ignore = "requires native ARM KVM with SVE"]
++    fn test_arm_sve_snapshot_register_roundtrip() {
++        arm_snapshot_register_roundtrip(true);
++    }
++
++    #[test]
++    #[cfg(target_arch = "aarch64")]
++    #[ignore = "requires native ARM KVM"]
++    fn test_arm_fpsimd_snapshot_register_roundtrip() {
++        arm_snapshot_register_roundtrip(false);
++    }
++
++    #[cfg(target_arch = "aarch64")]
++    fn arm_snapshot_register_roundtrip(sve: bool) {
++        use super::*;
++        use crate::cpu::Vcpu;
++        use kvm_bindings::{KVM_ARM_VCPU_PSCI_0_2, KVM_ARM_VCPU_SVE};
++
++        let kvm = kvm_ioctls::Kvm::new().unwrap();
++        let vm = kvm.create_vm().unwrap();
++        let make_vcpu = |id| {
++            let fd = vm.create_vcpu(id).unwrap();
++            let mut init = kvm_bindings::kvm_vcpu_init::default();
++            vm.get_preferred_target(&mut init).unwrap();
++            init.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
++            if sve {
++                init.features[0] |= 1 << KVM_ARM_VCPU_SVE;
++            } else {
++                init.features[0] &= !(1 << KVM_ARM_VCPU_SVE);
++            }
++            fd.vcpu_init(&init).unwrap();
++            KvmVcpu { fd, vm_ops: None }
++        };
++        let source = make_vcpu(0);
++        if sve {
++            source.fd.vcpu_finalize(&(KVM_ARM_VCPU_SVE as i32)).unwrap();
++        }
++        let fpsr_off = offset_of!(kvm_regs, fp_regs.fpsr);
++        let fpcr_off = offset_of!(kvm_regs, fp_regs.fpcr);
++        let fpsr = arm64_core_reg_id!(KVM_REG_SIZE_U32, fpsr_off);
++        let fpcr = arm64_core_reg_id!(KVM_REG_SIZE_U32, fpcr_off);
++        source.fd.set_one_reg(fpsr, &0x08000001u32.to_le_bytes()).unwrap();
++        source.fd.set_one_reg(fpcr, &0x00400000u32.to_le_bytes()).unwrap();
++        let vector_id = if sve {
++            // KVM_REG_ARM64_SVE_ZREG(0, 0): one 2048-bit slice.
++            KVM_REG_ARM64 | kvm_bindings::KVM_REG_SIZE_U2048
++                | kvm_bindings::KVM_REG_ARM64_SVE as u64
++        } else {
++            let off = offset_of!(kvm_regs, fp_regs.vregs);
++            arm64_core_reg_id!(KVM_REG_SIZE_U128, off)
++        };
++        let mut vector = vec![0u8; if sve { 256 } else { 16 }];
++        vector[..16].fill(0x5a);
++        source.fd.set_one_reg(vector_id, &vector).unwrap();
++        let state = source.state().unwrap();
++        let captured: VcpuKvmState = state.clone().into();
++        assert_eq!(captured.core_regs.fp_regs.fpsr, 0x08000001);
++        assert_eq!(captured.core_regs.fp_regs.fpcr, 0x00400000);
++        assert_eq!(!captured.extended_regs.is_empty(), sve);
++        // Exercise the serialized snapshot boundary and pre-finalize restore order.
++        let state: CpuState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
++        let restored = make_vcpu(1);
++        restored.set_pre_finalize_regs(state.pre_finalize_regs()).unwrap();
++        if sve {
++            restored.fd.vcpu_finalize(&(KVM_ARM_VCPU_SVE as i32)).unwrap();
++        }
++        restored.set_state(&state).unwrap();
++        let mut actual = vec![0u8; vector.len()];
++        restored.fd.get_one_reg(vector_id, &mut actual).unwrap();
++        assert_eq!(actual, vector);
++        for (id, expected) in [(fpsr, 0x08000001u32), (fpcr, 0x00400000u32)] {
++            let mut actual = [0u8; 4];
++            restored.fd.get_one_reg(id, &mut actual).unwrap();
++            assert_eq!(u32::from_le_bytes(actual), expected);
++        }
++    }
+     #[test]
+     #[cfg(target_arch = "riscv64")]
+     fn test_get_and_set_regs() {
+-- 
+2.43.0
+

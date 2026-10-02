@@ -4,7 +4,8 @@
 
 The platform uses Cloud Hypervisor (CH) as its microVM monitor. Most paths use
 upstream behavior. Externally managed memory, restore-safe vsock, and reliable VM
-lifecycle barriers are supplied by seven patches maintained in this repository.
+lifecycle barriers are supplied by patches 0001–0007 maintained in this repository.
+Patches 0008–0011 add the ARM SVE snapshot compatibility backport described in §3.8.
 This document defines their scope, build procedure, and behavioral contracts.
 
 ## 1. Overview
@@ -58,13 +59,13 @@ not a permanent size or compatibility guarantee.
 | `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~550 | Consume kicks at lifecycle safe points, per-request ACKs/deadlines, and KVM ioctl allowlisting |
 | `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~280 | Publish/wake pause events and provide a two-way resume barrier, including custom workers |
 
-The seven patch files contain 1,665 insertions and 136 deletions in total and
-apply to Cloud Hypervisor `v51.1`.
+At that recorded revision, the seven patch files contained 1,665 insertions and
+136 deletions in total. The current series still applies to Cloud Hypervisor `v51.1`.
 
 ### 1.3 Maintenance strategy
 
 - The repository-relative patch directory is
-  `native-deps/deps/ch-patches/000{1,2,3,4,5,6,7}-*.patch`.
+  `native-deps/deps/ch-patches/*.patch`, applied in numeric order.
 - Run `make ch-patches-apply` from `sandboxer/native-deps`; it is also part of a
   fresh `make cloud-hypervisor` build. The development cycle and idempotency
   checks are described in [native-deps/README.md §3](../native-deps/README.md#3-patch-development-cycle).
@@ -368,6 +369,41 @@ The patch closes the lifecycle-barrier races through three related changes:
 This patch does not change sandbox configuration, the CH HTTP API, snapshot
 format, or resource protocol, and does not adjust `cpu.max` around lifecycle
 operations. Timeouts remain bounded failure protection, not the race fix.
+
+### 3.8 0008–0011 — ARM SVE snapshot registers
+
+On SVE-enabled ARM hosts, KVM exposes vector state through SVE Z/P/FFR
+registers. Accessing legacy FPSIMD V-register offsets returns `EINVAL`; a
+cold-booted VM can run successfully while snapshot capture fails.
+
+Patches 0008–0010 backport Ruben Hakobyan's merged
+[Cloud Hypervisor PR #8268](https://github.com/cloud-hypervisor/cloud-hypervisor/pull/8268),
+retaining authorship and sign-offs. The reviewed upstream commits are
+`083b41905ea59b335c4f211c4186312e30bbf022`,
+`e9d044730524d12e243737a1888767b3edf123c8`, and
+`4fc414cc8bc56a4c5275b3dd44610e5c75dfbbd1`; context is rebased onto v51.1
+and patches 0001–0007. They enumerate KVM registers, preserve SVE state and
+restore vector-length selection after vCPU initialization and before SVE
+finalization. The legacy vector path remains available without SVE.
+
+Patch 0011 additionally preserves FPSR/FPCR for both paths: those control and
+status registers remain accessible even when the vector register family changes.
+It includes explicit native KVM round-trip tests with nonzero register state:
+
+```sh
+cd native-deps/build/src/cloud-hypervisor
+cargo test --locked -p hypervisor --features kvm test_arm_ -- --ignored --nocapture
+```
+
+These tests require native ARM KVM (including SVE for the SVE case); their ignored
+marker does not constitute successful validation on hosted ARM runners without
+`/dev/kvm`. Final platform qualification also uses real cold start, guest exec,
+snapshot and restore with the selected released Cloud Hypervisor binary.
+
+Snapshot CPU state gains defaulted pre-finalize and extended-register arrays.
+This permits reading older non-SVE state; it does not promise cross-host CPU
+feature compatibility or backwards restore into an unpatched VMM. SVE remains
+enabled, and incompatible register state fails through the existing KVM errors.
 
 ## 4. Build workflow
 
