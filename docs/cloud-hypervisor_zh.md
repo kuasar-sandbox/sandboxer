@@ -4,7 +4,7 @@
 
 平台用 cloud-hypervisor(CH)作为 microVM 监视器。绝大多数路径跑 upstream
 行为,外部托管内存、restore-safe vsock 和可靠 VM lifecycle 通过本仓维护的
-7 个 patch 实现。
+0001–0007 补丁实现。0008–0011 补丁增加 §3.8 所述的 ARM SVE 快照兼容性回移。
 本文档定义 patch 范围、构建方式及对应行为契约。
 
 ## 1. 概述
@@ -52,11 +52,11 @@
 | `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~550 | lifecycle 安全点消费 kick、请求级 ACK/deadline、KVM ioctl allowlist |
 | `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~280 | pause event publish/wake + resume 双向 barrier,覆盖自定义 worker |
 
-7 个 patch 文件合计 1,665 insertions / 136 deletions,基于 cloud-hypervisor `v51.1`。
+该历史版本的 7 个 patch 文件合计 1,665 insertions / 136 deletions。当前补丁系列仍基于 cloud-hypervisor `v51.1`。
 
 ### 1.3 维护策略
 
-- 仓库相对 patch 路径:`native-deps/deps/ch-patches/000{1,2,3,4,5,6,7}-*.patch`
+- 仓库相对 patch 路径:`native-deps/deps/ch-patches/*.patch`,按编号顺序应用
 - 在 `sandboxer/native-deps` 中执行 `make ch-patches-apply`(全新 `make cloud-hypervisor` 构建也会执行);
   开发循环与幂等 sanity 语义见 [Native 构建 §3](../native-deps/README_zh.md#3-patch-开发循环)
 - 每次计划升级 upstream 时复核补丁,依据实际上游变化解决冲突;不假定固定发布周期或固定 rebase 工作量
@@ -306,6 +306,37 @@ patch 通过三组相互独立但同属 lifecycle barrier 的修复关闭该问�
 
 该 patch 不改变 sandbox 配置、CH HTTP API、snapshot 格式或资源协议,也不在
 lifecycle 前后修改 `cpu.max`。超时仍是最终有界失败保护,不是竞态修复方法。
+
+### 3.8 0008–0011 — ARM SVE 快照寄存器
+
+启用 SVE 的 ARM 主机通过 KVM 的 SVE Z/P/FFR 寄存器暴露向量状态。
+访问旧 FPSIMD V 寄存器偏移会返回 `EINVAL`;因此 VM 可以正常冷启动运行,
+但在捕获快照时失败。
+
+0008–0010 回移 Ruben Hakobyan 已合并的
+[Cloud Hypervisor PR #8268](https://github.com/cloud-hypervisor/cloud-hypervisor/pull/8268),
+保留原作者与签署。审阅的上游提交为
+`083b41905ea59b335c4f211c4186312e30bbf022`、
+`e9d044730524d12e243737a1888767b3edf123c8` 和
+`4fc414cc8bc56a4c5275b3dd44610e5c75dfbbd1`;上下文适配 v51.1 与 0001–0007。
+补丁枚举 KVM 寄存器、保存 SVE 状态,并在 vCPU 初始化之后、SVE finalization
+之前恢复向量长度选择。不启用 SVE 时仍使用原有向量路径。
+
+0011 额外为两条路径保留 FPSR/FPCR:向量寄存器族改变时,这些控制和状态寄存器
+仍然可访问。补丁包含设置非零寄存器状态的原生 KVM 往返测试:
+
+```sh
+cd native-deps/build/src/cloud-hypervisor
+cargo test --locked -p hypervisor --features kvm test_arm_ -- --ignored --nocapture
+```
+
+这些测试需要原生 ARM KVM(SVE 测试还需要 SVE);ignored 标记不代表在没有
+`/dev/kvm` 的托管 ARM runner 上验证成功。平台最终验收还使用所选已发布的
+Cloud Hypervisor 二进制执行真实冷启动、guest exec、快照与恢复。
+
+快照 CPU 状态新增带默认值的 pre-finalize 与 extended-register 数组,可读取旧的
+非 SVE 状态,但不承诺跨主机 CPU 特性兼容,也不承诺向未打补丁的 VMM 反向恢复。
+SVE 保持启用,不兼容寄存器状态通过已有 KVM 错误失败。
 
 ## 4. 构建工作流
 
