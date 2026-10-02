@@ -1,6 +1,9 @@
 package guestlink
 
 import (
+	"context"
+	"errors"
+	"io"
 	"net"
 	"path/filepath"
 	"sync"
@@ -9,6 +12,38 @@ import (
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
+
+func TestHostClientResponseEOFBarrierEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		bytes  []byte
+		closed bool
+	}{
+		{"no_frame", nil, true},
+		{"no_payload", []byte{2, 0, 0, 0}, true},
+		{"truncated_header", []byte{2, 0}, false},
+		{"truncated_payload", []byte{2, 0, 0, 0, '{'}, false},
+		{"malformed_payload", []byte{2, 0, 0, 0, 'x', 'x'}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := filepath.Join(t.TempDir(), "vsock.sock")
+			proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+				_, _ = proto.ReadMessage(c)
+				_, _ = c.Write(tc.bytes)
+			})
+			defer proxy.close()
+			client := &HostClient{BasePath: base}
+			_, err := client.roundTripUntilEOFContext(context.Background(), &proto.Message{Type: proto.TypePing}, time.Second)
+			var closed *responseEOFError
+			if err == nil || errors.As(err, &closed) != tc.closed {
+				t.Fatalf("response close evidence = %v, want closed=%v and a failed RPC", err, tc.closed)
+			}
+			if tc.closed && !errors.Is(err, io.EOF) {
+				t.Fatalf("lost original EOF: %v", err)
+			}
+		})
+	}
+}
 
 // fakeCHProxy stands in for cloud-hypervisor's hybrid vsock proxy on the
 // host side: listens on the base UDS, reads "CONNECT 5000\n" byte-by-byte

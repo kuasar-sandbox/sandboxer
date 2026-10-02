@@ -137,7 +137,8 @@ func (p *Pinger) Pause() { _ = p.PauseContext(context.Background()) }
 // PauseContext is the cancellable capture barrier form of Pause. An admitted
 // probe is allowed to finish through guest EOF, but can never hold the capture
 // barrier beyond the protocol quiesce budget even when timeouts.ping disables
-// its ordinary health-probe deadline.
+// its ordinary health-probe deadline. Response EOF also drains a failed probe;
+// its health counters and fatal policy remain independent of this barrier.
 func (p *Pinger) PauseContext(ctx context.Context) error {
 	return p.pauseContext(ctx, proto.DeadlineQuiesce)
 }
@@ -153,6 +154,9 @@ func (p *Pinger) pauseContext(ctx context.Context, drainTimeout time.Duration) e
 	p.tickMu.Unlock()
 	if done == nil {
 		return ctx.Err()
+	}
+	if p.Logf != nil {
+		p.Logf("ping: draining admitted probe before capture")
 	}
 	drainCtx, cancelDrain := context.WithTimeout(ctx, drainTimeout)
 	defer cancelDrain()
@@ -244,7 +248,10 @@ func (p *Pinger) tick(parent context.Context, timeout time.Duration) {
 		TSendNs: tSend.UnixNano(),
 	}, timeout)
 	if err != nil {
-		barrierErr = err
+		var closed *responseEOFError
+		if !errors.As(err, &closed) {
+			barrierErr = err
+		}
 		if tickCtx.Err() != nil {
 			return
 		}
@@ -359,7 +366,8 @@ func SendQuiesceContext(ctx context.Context, client *HostClient, skipDropCaches 
 // connection together with the channel set the guest established. The
 // caller wraps the conn in a mux.Session and bridges those streams, then
 // (re)starts the ping ticker. The current guest echoes epoch; it does not
-// use it as a generic duplicate-request filter. ACK precedes guest thaw.
+// use it as a generic duplicate-request filter. Updated guests complete thaw
+// and reopen execution gates before ACK; memory reports resume after MUX setup.
 //
 // network (optional) asks the guest to attempt flush-and-replace before
 // thawing. Failure is logged without preventing ACK, which therefore does

@@ -240,7 +240,7 @@ local exec 可只给 `--path-id`；若同时给
 `RunRoot/a/ctl.sock`，请求本身不增加 SandboxID 或一致性检查。未给 PathID 时
 继续使用 `RunRoot/SandboxID/ctl.sock`。
 
-`exec` 通过当前 ctl/MUX 创建 sibling process. Export/snapshot 的 quiesce gate 原子阻止新 exec/forward 进入不稳定窗口,并关闭、join 已放行的 exec/forward session;在飞 exec 被终止且不会在 `--resume` 后自动重跑. Restore/attach 只有在新 MUX 建立且应用 cgroup 已 thaw 后才重新开放 exec、forward、plugin 和 app restart;ACK 与 thaw 之间抢先到达的请求会被 gate 拒绝,不会向 frozen cgroup fork. Guest `attach` 是幂等恢复操作;host 在 request/ACK 边界不明确时立即重试一次,且整个 dial/ACK 过程受 lifecycle context cancellation 控制.
+`exec` 通过当前 ctl/MUX 创建 sibling process. Export/snapshot 的 quiesce gate 原子阻止新 exec/forward 进入不稳定窗口,并关闭、join 已放行的 exec/forward session;在飞 exec 被终止且不会在 `--resume` 后自动重跑. Restore/attach 先 thaw 应用 cgroup 并重新开放 exec、forward、plugin 和 app restart,再发送 ACK. Host 在 ACK 与本端 MUX 建立后发布 ready,不会暴露仍处于 quiesce 的 exec gate. Guest mem_report 仅在 ACK 与 guest MUX 建立后恢复. Thaw 失败不发 ACK;ACK 失败不撤销已经完成的 thaw,仍由现有 host recovery/terminal-cleanup 路径负责. Guest `attach` 是幂等恢复操作;host 在 request/ACK 边界不明确时立即重试一次,且整个 dial/ACK 过程受 lifecycle context cancellation 控制.
 
 远程授权 exec 使用 `pkg/ctl.ServeExecTunnel(ctx, options)`,固定以下顺序:
 
@@ -1035,7 +1035,7 @@ Snapshot ZIP 与 config 同样 strict、bounded、canonical。`config.json` 和 
 
 `resources.capacity` 是 guest-visible VM capacity,进入 Portable config. `resources.allocatable` 是 cold start 的 workload 默认值,也进入 Portable config;其中 `allocatable.cpu` 必须是有限数,且满足 `0 < allocatable.cpu <= capacity.cpu`. Restore 保持 E 中的 capacity 和已捕获的 `deflate_on_oom`,但可以从目标节点显式重新应用 allocatable CPU/memory;该运行时 policy 不改写 E 或 C0. `control`、`overhead`、`watermark_high` 和 `startup` 是 node policy,不进入 E.
 
-Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Host ping gate 会让已入场探测完成 `pong` + guest EOF transport barrier;该排空独立受 8 s quiesce budget 约束,即使普通 `timeouts.ping` 关闭强制超时也不会无限阻塞捕获. 到期时 host cancel并join该探测,捕获失败后走完整 recovery. Guest quiesce 还会排空并暂停周期 `mem_report`,防止 S 捕获持有 stream lock、仍等待旧 host vsock 的 reporter. Restore 在 ACK 前切换到新 observation epoch;`--resume`/失败 attach 恢复原 epoch,live attach只重开pause gate且不破坏已入场报告的计数. Recovery 在 VM、MUX、app 和 backend 恢复后释放 host barrier.
+Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Host ping gate 等待已入场探测完成 guest EOF transport barrier。在 CONNECT 和请求写入完成后，即使未收到 pong，响应流 EOF 也表示排空完成；该探测仍然是健康检查失败，计数器和连续失败致命阈值策略不变。CONNECT EOF、取消、截止时间以及其他协议错误仍令排空失败。之后捕获必须单独取得明确的 quiesce 确认才能暂停 VM。该排空独立受 8 s quiesce budget 约束,即使普通 `timeouts.ping` 关闭强制超时也不会无限阻塞捕获. 到期时 host cancel并join该探测,捕获失败后走完整 recovery. Guest quiesce 还会排空并暂停周期 `mem_report`,防止 S 捕获持有 stream lock、仍等待旧 host vsock 的 reporter. Restore 在 ACK 前切换到新 observation epoch;`--resume`/失败 attach 恢复原 epoch,live attach只重开pause gate且不破坏已入场报告的计数. Recovery 在 VM、MUX、app 和 backend 恢复后释放 host barrier.
 
 ### 4.2 Memory terms
 
@@ -2352,7 +2352,7 @@ CH/KVM 证据. PR 和证据产物保留实际测量的提交、环境和限制,
 
 ### 12.7 源读取恢复验证
 
-回归覆盖 ring/completion 不变量、COW materialization、EOF/EAGAIN 包装、后端取消、仅成功初始化缓存、队列/冻结关闭, 以及真实内核 REMOVE/COPY 的页内容. owner E2E 进一步使用匹配的组件二进制、runtime image 和 native 依赖验证 CH/KVM 行为. 前置条件缺失代表缺少验证, 不代表测试通过.
+回归覆盖 ring/completion 不变量、COW materialization、EOF/EAGAIN 包装、后端取消、仅成功初始化缓存、队列/冻结关闭, 以及真实内核 REMOVE/COPY 的页内容. owner E2E 进一步使用匹配的组件二进制、runtime image 和 native 依赖验证 CH/KVM 行为. 前置条件缺失代表缺少验证, 不代表测试通过. Pinger 回归将响应 EOF 严格安排在捕获开始等待已入场探测之后，验证健康检查失败仍被记录，并要求单独取得 quiesce 确认。反例覆盖 CONNECT EOF、取消、截断或无效响应，以及有界排空到期。读取恢复用例在失败时保留有界且隐藏密钥的运行时和错误日志尾部，以区分 quiesce 前的 ping 排空错误与 guest quiesce 失败。
 
 ## 13. Reliability、performance 与兼容边界
 

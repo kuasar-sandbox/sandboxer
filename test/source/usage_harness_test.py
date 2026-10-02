@@ -47,6 +47,27 @@ from usage_report_relay import ReportRelay
 
 
 class ReadRecoveryFatalCauseTests(unittest.TestCase):
+    def test_capture_failure_diagnostics_are_bounded_and_redact_keys(self):
+        script = (ROOT / "test/e2e/cases/snapshot.read-recovery.sh").read_text()
+        diagnostic = script.split("<<'RECOVERY_DIAGNOSTICS'\n", 1)[1].split(
+            "\nRECOVERY_DIAGNOSTICS", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            key = "abcdef0123456789" * 4
+            error = "snapshot: drain pinger before quiesce: launchclient: read response: EOF"
+            Path(directory, "recovered.snapshot.log").write_text(error + "\n")
+            Path(directory, "recovered.log").write_text(
+                "old log\n" * 10000 + "source manifest://" + key + "\n" + error + "\n")
+            Path(directory, "manifest.yaml").write_text("must-not-read-config")
+            result = subprocess.run([sys.executable, "-c", diagnostic, directory],
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(error, result.stderr)
+            self.assertIn("<redacted>", result.stderr)
+            self.assertNotIn(key, result.stderr)
+            self.assertNotIn("must-not-read-config", result.stderr)
+            self.assertIn("verified.log: unavailable", result.stderr)
+            self.assertLess(len(result.stderr), 22000)
+
     def test_runtime_owner_reports_corruption_from_either_read_path(self):
         script = (ROOT / "test/e2e/cases/snapshot.read-recovery.sh").read_text()
         assertions = [line for line in script.splitlines()

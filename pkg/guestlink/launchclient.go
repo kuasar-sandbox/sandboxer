@@ -59,6 +59,14 @@ func (c *HostClient) roundTripUntilEOFContext(ctx context.Context, req *proto.Me
 	return c.roundTripContext(ctx, req, deadline, true)
 }
 
+// responseEOFError records peer close after CONNECT and the complete request,
+// before a complete response frame. A failed health probe can therefore be drained
+// without being successful. EOF during CONNECT does not establish this barrier.
+// Request/response callers (including quiesce) still receive the original error.
+type responseEOFError struct{ error }
+
+func (e *responseEOFError) Unwrap() error { return e.error }
+
 func (c *HostClient) roundTripContext(ctx context.Context, req *proto.Message, deadline time.Duration, waitEOF bool) (*proto.Message, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -81,7 +89,11 @@ func (c *HostClient) roundTripContext(ctx context.Context, req *proto.Message, d
 	}
 	resp, err := proto.ReadMessage(conn)
 	if err != nil {
-		return nil, finish(fmt.Errorf("launchclient: read response: %w", err))
+		readErr := fmt.Errorf("launchclient: read response: %w", err)
+		if waitEOF && errors.Is(err, io.EOF) {
+			readErr = &responseEOFError{readErr}
+		}
+		return nil, finish(readErr)
 	}
 	if waitEOF {
 		var trailing [1]byte

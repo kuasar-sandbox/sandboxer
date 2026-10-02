@@ -402,7 +402,7 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 	}
 }
 
-// finishReattach is the ACK/MUX/thaw boundary. The narrow thaw seam also lets
+// finishReattach is the thaw/ACK/MUX boundary. The narrow thaw seam also lets
 // socket tests hold this boundary without freezing the test process's cgroup.
 func finishReattach(c *vsockConn, sup *supervisorState, bridge *consoleBridge, epoch uint32, newHost bool, thaw func() error) (_ bool, err error) {
 	ack, operation := proto.TypeAttachAck, "attach"
@@ -424,6 +424,14 @@ func finishReattach(c *vsockConn, sup *supervisorState, bridge *consoleBridge, e
 			}
 		}
 	}()
+	// ACK is the host's readiness barrier. Complete thaw and reopen launch
+	// gates before publishing it: the host may deliver exec immediately.
+	// Thaw only writes the freezer control file; it does not wait for the
+	// app or its output. Console pumps can stay parked until the ACK has
+	// been written and this connection can safely carry MUX frames.
+	if err := resumeAfterThaw(sup, thaw); err != nil {
+		return false, fmt.Errorf("%s thaw: %w", operation, err)
+	}
 	spec := bridge.protoSpec()
 	resp := &proto.Message{Type: ack, Epoch: epoch, Stdio: &spec, AppState: proto.AppStateRunning}
 	if err := proto.WriteMessage(c, resp); err != nil {
@@ -431,11 +439,9 @@ func finishReattach(c *vsockConn, sup *supervisorState, bridge *consoleBridge, e
 	}
 	_ = c.SetDeadline(time.Time{})
 	bridge.reattach(c)
-	// Rebuild MUX first and thaw the app LAST, before opening launch gates
-	// or resuming the resource controller's memory-report stream.
-	if err := resumeAfterThaw(sup, guestMemReports, thaw); err != nil {
-		return true, fmt.Errorf("%s thaw: %w", operation, err)
-	}
+	// Resource observations must still start after ACK/MUX establishment,
+	// even though execution is already eligible before the host sees ACK.
+	guestMemReports.resumeEpoch()
 	service.commitResume(generation)
 	return true, nil
 }
@@ -446,13 +452,12 @@ func finishReattach(c *vsockConn, sup *supervisorState, bridge *consoleBridge, e
 // exec before thaw lets clone3 block in the frozen cgroup while cgroupThaw's
 // os.WriteFile waits for the same ForkLock to open cgroup.freeze, producing a
 // permanent post-restore deadlock.
-func resumeAfterThaw(sup *supervisorState, reports *memReportStream, thaw func() error) error {
+func resumeAfterThaw(sup *supervisorState, thaw func() error) error {
 	if thaw != nil {
 		if err := thaw(); err != nil {
 			return err
 		}
 	}
-	reports.resumeEpoch()
 	sup.execReg.endQuiesce()
 	sup.connReg.endQuiesce()
 	sup.acceptLn.reopen()

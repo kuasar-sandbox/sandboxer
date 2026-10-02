@@ -68,14 +68,12 @@ func TestResumeAfterThawKeepsLaunchGatesClosed(t *testing.T) {
 	_ = sup.connReg.beginQuiesce()
 	sup.acceptLn.closeAll()
 	sup.pluginReg.beginQuiesce()
-	reports := &memReportStream{epoch: 1}
-	reports.pauseAndDrain()
 
 	thawStarted := make(chan struct{})
 	releaseThaw := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- resumeAfterThaw(sup, reports, func() error {
+		done <- resumeAfterThaw(sup, func() error {
 			close(thawStarted)
 			<-releaseThaw
 			return nil
@@ -116,9 +114,6 @@ func TestResumeAfterThawKeepsLaunchGatesClosed(t *testing.T) {
 	if sup.quiescing.Load() {
 		t.Fatal("application restart gate remained closed after cgroup thaw completed")
 	}
-	if reports.isPaused() {
-		t.Fatal("memory report stream remained paused after cgroup thaw completed")
-	}
 }
 
 func TestResumeAfterThawFailureKeepsLaunchGatesClosed(t *testing.T) {
@@ -133,11 +128,9 @@ func TestResumeAfterThawFailureKeepsLaunchGatesClosed(t *testing.T) {
 	_ = sup.connReg.beginQuiesce()
 	sup.acceptLn.closeAll()
 	sup.pluginReg.beginQuiesce()
-	reports := &memReportStream{epoch: 1}
-	reports.pauseAndDrain()
 
 	wantErr := errors.New("thaw failed")
-	if err := resumeAfterThaw(sup, reports, func() error { return wantErr }); !errors.Is(err, wantErr) {
+	if err := resumeAfterThaw(sup, func() error { return wantErr }); !errors.Is(err, wantErr) {
 		t.Fatalf("resumeAfterThaw() error = %v, want %v", err, wantErr)
 	}
 	if sup.execReg.beginSession(&vsockConn{fd: -1}) {
@@ -154,8 +147,5 @@ func TestResumeAfterThawFailureKeepsLaunchGatesClosed(t *testing.T) {
 	sup.pluginReg.mu.Unlock()
 	if !pluginQuiescing {
 		t.Fatal("plugin gate reopened after failed thaw")
-	}
-	if !reports.isPaused() {
-		t.Fatal("memory report stream resumed after failed thaw")
 	}
 }

@@ -683,7 +683,8 @@ func validateRestoreSandboxID(sandboxID string) error {
 
 // openAndEstablishRestoreMUX is the restore readiness barrier after CH API
 // readiness and /vm.resume: OpenMUXViaRestore returns only after restore_ack,
-// then the host MUX must be established before ready is emitted. The pinger,
+// which updated guests send only after thaw and execution-gate reopening.
+// The host MUX must also be established before ready is emitted. The pinger,
 // balloon, settled hook, heartbeat, and sensor deliberately remain outside.
 func openAndEstablishRestoreMUX(
 	open func() (net.Conn, proto.StdioSpec, error),
