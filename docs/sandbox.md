@@ -1692,6 +1692,8 @@ Failure semantics:
 - C0, active diffs, and the live lower graph remain unchanged.
 - Local capture uses same-directory temporary files and cleans failed partial output. Named-location publication has its separate ownership-checked cleanup rules in [Local tarstream and crypto](sandbox.md#artifact-publication).
 
+For successful destroy-mode snapshot/export, the ctl owner first completes the framed response write, then starts VMM shutdown; a fixed sleep is not a delivery barrier. Only that final write has a five-second bound. A disconnected or non-reading caller still releases the committed capture into normal teardown after the write fails; the CLI must report the transport error, not infer success from files. Capture itself has no new deadline. The in-process `Response.AfterWrite` continuation is not serialized; `ctl.Server` invokes it after write completion or failure, and direct handler callers own the same obligation. The continuation starts destruction at most once, retaining the Budget and `memory.high` lifecycle guards until the existing bounded CH-exit procedure completes. `--resume` and capture-error recovery keep their existing behavior.
+
 ### 6.3 `ctl.sock` protocol
 
 The socket is always `RunRoot/PathID/ctl.sock`; omitted PathID defaults to SandboxID. PathID is a host-side locator and does not enter the wire request.

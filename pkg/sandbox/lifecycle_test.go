@@ -2467,7 +2467,6 @@ func TestDestroyAfterSnapshotReleasesBarrierWhenExitNotificationNeverArrives(t *
 			chExited,
 			time.Second,
 			0,
-			0,
 			discardLogf,
 		)
 		close(done)

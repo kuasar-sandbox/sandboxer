@@ -94,6 +94,12 @@ type Response struct {
 
 	// type=error: human-readable reason.
 	Msg string `json:"msg,omitempty"`
+
+	// AfterWrite is an in-process lifecycle continuation. It is never encoded
+	// on ctl.sock. The response owner must invoke it after the framed write
+	// completes or fails, including a disconnected peer. Server does this; direct
+	// handler callers inherit the same obligation. It must not run before writing.
+	AfterWrite func() `json:"-"`
 }
 
 // DropCachesEnabled reports the per-snapshot cache policy. A missing field

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 )
 
 // Server runs the ctl.sock listener inside a sandbox-ctl run process.
@@ -150,12 +151,13 @@ func (s *Server) handle(conn *net.UnixConn) {
 		defer conn.Close()
 		resp, err := s.SnapshotHandler(req)
 		if err != nil {
-			_ = WriteMessage(conn, Response{Type: TypeError, Msg: err.Error()})
-			return
+			// A post-commit cleanup error still owns terminal teardown.
+			resp = Response{Type: TypeError, Msg: err.Error(), AfterWrite: resp.AfterWrite}
+		} else {
+			resp.Type = TypeSnapshotDone
 		}
-		resp.Type = TypeSnapshotDone
-		if err := WriteMessage(conn, resp); err != nil {
-			s.Logf("ctl.sock: write resp: %v", err)
+		if writeErr := writeCaptureResponse(conn, resp); writeErr != nil {
+			s.Logf("ctl.sock: write resp: %v", writeErr)
 		}
 		return
 
@@ -167,12 +169,13 @@ func (s *Server) handle(conn *net.UnixConn) {
 		}
 		resp, err := s.ExportHandler(req)
 		if err != nil {
-			_ = WriteMessage(conn, Response{Type: TypeError, Msg: err.Error()})
-			return
+			// A post-commit cleanup error still owns terminal teardown.
+			resp = Response{Type: TypeError, Msg: err.Error(), AfterWrite: resp.AfterWrite}
+		} else {
+			resp.Type = TypeExportDone
 		}
-		resp.Type = TypeExportDone
-		if err := WriteMessage(conn, resp); err != nil {
-			s.Logf("ctl.sock: write export resp: %v", err)
+		if writeErr := writeCaptureResponse(conn, resp); writeErr != nil {
+			s.Logf("ctl.sock: write export resp: %v", writeErr)
 		}
 		return
 
@@ -181,4 +184,18 @@ func (s *Server) handle(conn *net.UnixConn) {
 		_ = conn.Close()
 		return
 	}
+}
+
+// Limit only the final destroy-mode response write, never the capture itself.
+// A client that stops reading must not retain a committed, paused VM forever.
+const captureResponseWriteTimeout = 5 * time.Second
+
+func writeCaptureResponse(conn net.Conn, resp Response) error {
+	if resp.AfterWrite != nil {
+		defer resp.AfterWrite()
+		if err := conn.SetWriteDeadline(time.Now().Add(captureResponseWriteTimeout)); err != nil {
+			return err
+		}
+	}
+	return WriteMessage(conn, resp)
 }
