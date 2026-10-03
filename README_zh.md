@@ -2,6 +2,11 @@
 
 # sandboxer
 
+首次运行跨组件沙箱或 Demo，推荐从项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)
+使用匹配聚合版本的 [workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README_zh.md)。
+本组件仍可独立构建和部署，workbench 不是生产运行的强制依赖。预构建架构以所选
+发布版的实际资产为准；源码支持某架构不意味着所有历史版本都提供该架构制品。
+
 `sandboxer` 是 [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 的 **MicroVM 生命周期引擎**。它创建 Sandbox,捕获并恢复状态,控制 guest,提供块设备,按需加载内存和磁盘数据,并协调每个 Sandbox 的 cgroup、balloon 与 VMM 生命周期。
 
 本仓既是完整 Kuasar Sandbox 平台的组件,也可作为独立 Runtime 引擎使用。它提供窄 Go package 和 host-local 协议,不会把编排、存储服务或 eBPF 实现引入 Runtime 依赖闭包。
@@ -107,7 +112,7 @@ Go-only 源码构建需要本仓以及兄弟目录中的 `accelerator` 和 `conn
 包内来源记录只有在本地 Git Tag 与所选源码 commit 一致时才保留内部依赖的发行
 版本。未打 Tag 的源码构建记录 `git:<commit>`,不要求创建目标发行 Tag。
 
-`sandboxer` 独立发布 `vX.Y.Z` 组件版本。x86_64 archive 包含 `sandbox-ctl`、`sandbox-init` 和 patched `cloud-hypervisor` binary。组件文档与 E2E source 从选定 Tag 收集进项目 platform archive,不会在组件 archive 中重复交付。
+`sandboxer` 独立发布 `vX.Y.Z` 组件版本。已发布原生架构的 archive 包含 `sandbox-ctl`、`sandbox-init` 和 patched `cloud-hypervisor` binary。聚合 platform 包按显式文档/测试选择携带用户指南与规范 E2E 运行输入，内部设计文档和源码专用测试保留在源码仓。
 
 项目仓独立发布 `release-vX.Y.Z` 聚合版本,精确选择一个 `sandboxer` Tag 和其他各发行单元版本,并验证组合后的完整系统。
 

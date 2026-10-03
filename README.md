@@ -2,6 +2,14 @@
 
 # sandboxer
 
+For the first cross-component sandbox or Demo, follow the project
+[Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md)
+with the matching aggregate release and
+[workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md).
+This component can still be built/deployed independently; workbench is not a
+production runtime dependency. Published architectures are specific to the
+selected release; source support does not imply all historical assets exist.
+
 `sandboxer` is the **MicroVM lifecycle engine** for [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox). It creates sandboxes, captures and restores state, controls the guest, serves block devices, loads memory and disk data on demand, and coordinates each sandbox's cgroup, balloon, and VMM lifecycle.
 
 The repository is both a component of the complete Kuasar Sandbox platform and an independently usable runtime engine. It exposes narrow Go packages and host-local protocols instead of importing the orchestration, storage-server, or eBPF implementations into its runtime closure.
@@ -118,7 +126,7 @@ Package source records keep an internal dependency's release version only when
 its local Git tag matches the selected source commit. Untagged source builds
 record `git:<commit>`; this does not require creating target release tags.
 
-`sandboxer` publishes independent component versions named `vX.Y.Z`. The x86_64 archive contains `sandbox-ctl`, `sandbox-init`, and the patched `cloud-hypervisor` binary. Component documentation and E2E sources are collected from the selected tag into the project platform archive rather than duplicated in the component archive.
+`sandboxer` publishes independent component versions named `vX.Y.Z`. Each published native-architecture archive contains `sandbox-ctl`, `sandbox-init`, and the patched `cloud-hypervisor` binary. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Internal design documents and source-only tests remain in the source repositories.
 
 The project repository publishes an independently numbered aggregate `release-vX.Y.Z`, selecting an exact `sandboxer` tag together with exact versions of the other release units and validating the combined system.
 
