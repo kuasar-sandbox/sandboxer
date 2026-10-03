@@ -1534,6 +1534,8 @@ Failure semantics:
 - C0、active diff和live lower graph保持不变.
 - Local capture 使用 same-directory temp 并清理失败的 partial output；named-location publication 使用 [Local tarstream 与 crypto](sandbox_zh.md#artifact-publication) 的独立所有权检查与清理规则。
 
+销毁模式的 snapshot/export 成功提交后，ctl 所有者必须先完成带长度前缀的响应写入，再发起 VMM shutdown；固定 sleep 不能充当响应交付屏障。仅最终响应写入受五秒上限约束，不为捕获本身增加 deadline。调用方已断开或不读取时，写入失败后仍继续正常销毁已提交的捕获；CLI 必须报告传输错误，不能根据文件存在推断成功。进程内的 `Response.AfterWrite` 不进入序列化协议，`ctl.Server` 在写完或写失败后调用它；直接调用 handler 的代码承担相同责任。该延续最多发起一次销毁，并保持 Budget 与 `memory.high` 生命周期屏障，直到现有有界 CH 退出流程完成。`--resume` 与捕获失败恢复行为不变。
+
 ### 6.3 `ctl.sock` protocol
 
 socket 固定位于 `RunRoot/PathID/ctl.sock`；PathID 省略时等于 SandboxID。

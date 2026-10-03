@@ -1535,7 +1535,9 @@ func (g *captureGate) finish(terminal bool) {
 	g.mu.Unlock()
 }
 
-// Handle dispatches one ctl snapshot_request. Public for restore.Run.
+// Handle dispatches one ctl snapshot_request. A successful destroy-mode
+// response owns an AfterWrite continuation; ctl.Server invokes it after writing
+// the response, and direct callers must honor the same ordering.
 func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
 	return h.handle(req, "", nil)
 }
@@ -1544,7 +1546,9 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 	if err := h.capture.begin(); err != nil {
 		return ctl.Response{}, err
 	}
-	defer func() { h.capture.finish((err == nil && !req.ResumeAfter) || isTerminalCaptureError(err)) }()
+	defer func() {
+		h.capture.finish(resp.AfterWrite != nil || (err == nil && !req.ResumeAfter) || isTerminalCaptureError(err))
+	}()
 	opts := RunOptions{
 		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir,
 		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
@@ -1562,6 +1566,7 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 	return handleSnapshotRequest(h.Context, req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, chProcess, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
 }
 
+// HandleExport follows the same response-ownership contract as Handle.
 func (h *SnapshotHandler) HandleExport(req ctl.Request) (ctl.Response, error) {
 	return h.handleExport(req, "", nil)
 }
@@ -1570,7 +1575,9 @@ func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExi
 	if err := h.capture.begin(); err != nil {
 		return ctl.Response{}, err
 	}
-	defer func() { h.capture.finish((err == nil && !req.ResumeAfter) || isTerminalCaptureError(err)) }()
+	defer func() {
+		h.capture.finish(resp.AfterWrite != nil || (err == nil && !req.ResumeAfter) || isTerminalCaptureError(err))
+	}()
 	opts := RunOptions{
 		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir,
 		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
@@ -1809,11 +1816,6 @@ func handleExportRequest(
 			return ctl.Response{}, fmt.Errorf("export: drain VMM memory.high throttles: %w", err)
 		}
 	}
-	defer func() {
-		if err == nil && !req.ResumeAfter {
-			go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
-		}
-	}()
 	recoveryTerminated := false
 	forwarderNeedsAbort := false
 	if forwarder != nil {
@@ -1909,6 +1911,11 @@ func handleExportRequest(
 	}
 	if parsed, parseErr := manifest.ParseRef(out.SandboxRef); parseErr == nil && parsed.Scheme == manifest.RefSchemeManifest {
 		resp.SandboxManifestKey = parsed.Path
+	}
+	if !req.ResumeAfter {
+		resp.AfterWrite = sync.OnceFunc(func() {
+			go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
+		})
 	}
 	return resp, nil
 }
@@ -2248,11 +2255,6 @@ func handleSnapshotRequest(
 	// running app's stdio flows again. On the destroy path (resume_after=
 	// false) we instead tear the VMM down once this response has flushed —
 	// that is what makes `sandbox-ctl run` return (docs/sandbox.md §6.2).
-	defer func() {
-		if err == nil && !req.ResumeAfter {
-			go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
-		}
-	}()
 	// Gate new port-forward/exec work before asking the guest to quiesce, without
 	// perturbing admitted transports. The guest owns the authoritative
 	// reverse-channel close; after `quiesced`, Drain joins the host handlers so
@@ -2398,6 +2400,11 @@ func handleSnapshotRequest(
 		SandboxRef:       out.SandboxRef,
 		SandboxPath:      out.SandboxPath,
 	}
+	if !req.ResumeAfter {
+		resp.AfterWrite = sync.OnceFunc(func() {
+			go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
+		})
+	}
 	if err := context.Cause(ctx); err != nil {
 		return ctl.Response{}, err
 	}
@@ -2427,12 +2434,6 @@ func handleSnapshotRequest(
 	}
 	return resp, nil
 }
-
-// destroyAfterSnapshotDelay is how long destroyAfterSnapshot waits before
-// tearing the VMM down — long enough for the snapshot_done response to
-// flush over ctl.sock back to the `sandbox-ctl snapshot` CLI (a tiny JSON
-// over a local UDS; this margin is generous).
-const destroyAfterSnapshotDelay = 300 * time.Millisecond
 
 // terminateAfterCaptureRecoveryFailure is the fail-safe for a resumed
 // capture whose guest MUX cannot be reattached even after the idempotent
@@ -2500,8 +2501,8 @@ func terminateAfterCaptureRecoveryFailure(
 
 // destroyAfterSnapshot tears the VMM down (PUT /api/v1/vmm.shutdown) so
 // the `sandbox-ctl run` process owning this ctl.sock returns. Run on a
-// goroutine on the resume_after=false ("destroy") path: by the time the
-// delay elapses the snapshot_done response has been queued + sent. The
+// goroutine on the resume_after=false ("destroy") path only after the ctl
+// response write completes or fails. No timer substitutes for that boundary. The
 // memory.high lifecycle lock and balloon mutation barrier remain held until CH
 // exits, including when the shutdown request itself fails. Errors are only
 // logged — the sandbox is being torn down regardless.
@@ -2515,7 +2516,7 @@ func destroyAfterSnapshot(
 	logf func(string, ...any),
 ) {
 	destroyAfterSnapshotWithBounds(chSock, chProcess, memoryHighLock, releaseMemoryBarrier,
-		chExited, respDeadline, destroyAfterSnapshotDelay, chShutdownGrace, logf)
+		chExited, respDeadline, chShutdownGrace, logf)
 }
 
 func destroyAfterSnapshotWithBounds(
@@ -2524,7 +2525,7 @@ func destroyAfterSnapshotWithBounds(
 	memoryHighLock *os.File,
 	releaseMemoryBarrier func(),
 	chExited <-chan struct{},
-	respDeadline, responseDelay, exitGrace time.Duration,
+	respDeadline, exitGrace time.Duration,
 	logf func(string, ...any),
 ) {
 	if releaseMemoryBarrier != nil {
@@ -2536,9 +2537,6 @@ func destroyAfterSnapshotWithBounds(
 				logf("snapshot: destroy mode — release VMM memory.high lifecycle lock: %v", err)
 			}
 		}()
-	}
-	if responseDelay > 0 {
-		time.Sleep(responseDelay)
 	}
 	shutdownErr := (chapi.Client{Sock: chSock, RespDeadline: respDeadline}).ShutdownVMM()
 	if shutdownErr != nil {
