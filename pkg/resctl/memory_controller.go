@@ -136,7 +136,7 @@ type MemoryController struct {
 	lastDemandKnown           bool
 	shrinkReportFence         uint64
 	pressureFloor             uint64
-	pressureHoldUntil         time.Time
+	pressureLowSeq            uint64
 
 	reportMu       sync.Mutex
 	reportsOpen    bool
@@ -573,14 +573,23 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 			report.Epoch, report.Seq, latestSeq)
 		return nil
 	}
-	if !m.pressureHoldUntil.IsZero() {
-		if time.Now().Before(m.pressureHoldUntil) && budget.RequestedBudget < m.pressureFloor {
-			m.logf("memory: shrink deferred below active pressure floor Budget=%d requested=%d", m.pressureFloor, budget.RequestedBudget)
-			return nil
-		}
-		if !time.Now().Before(m.pressureHoldUntil) {
+	if m.pressureFloor != 0 {
+		if budget.RequestedBudget < m.pressureFloor {
+			if m.pressureLowSeq == 0 {
+				m.pressureLowSeq = report.Seq
+				m.logf("memory: shrink deferred below pressure floor Budget=%d requested=%d; awaiting one more fresh low-demand report", m.pressureFloor, budget.RequestedBudget)
+				return nil
+			}
+			// SubmitGuestReport already enforces a strictly increasing sequence.
+			// A second fresh low-demand observation with no intervening pressure
+			// event is positive evidence that the pressure episode has ended.
+			m.logf("memory: pressure floor Budget=%d cleared by consecutive low-demand reports seq=%d,%d", m.pressureFloor, m.pressureLowSeq, report.Seq)
 			m.pressureFloor = 0
-			m.pressureHoldUntil = time.Time{}
+			m.pressureLowSeq = 0
+		} else {
+			// A report that still needs the pressure budget is not evidence that
+			// pressure has ended; any later shrink must prove two fresh lows.
+			m.pressureLowSeq = 0
 		}
 	}
 	if budget.ObservedBudget > m.reservationNow() {
@@ -614,6 +623,9 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 }
 
 func (m *MemoryController) processPressureLocked(ctx context.Context, pressure pressureGrow) error {
+	// Any new pressure signal invalidates an in-progress low-demand confirmation.
+	// The floor itself is changed only after an actually accepted Budget grow.
+	m.pressureLowSeq = 0
 	// Restore normalization is the sole allowed target operation between
 	// restore ACK/MUX establishment and confirmation of SafeTarget. Sensor
 	// inputs are transient and will be sampled again after that barrier. Once
@@ -663,7 +675,6 @@ func (m *MemoryController) processPressureLocked(ctx context.Context, pressure p
 		if after > m.pressureFloor {
 			m.pressureFloor = after
 		}
-		m.pressureHoldUntil = time.Now().Add(1500 * time.Millisecond)
 	}
 	return nil
 }
