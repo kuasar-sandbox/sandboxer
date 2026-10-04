@@ -403,101 +403,94 @@ func TestMemoryControllerPressureGrowAllowedBeforeInitialReport(t *testing.T) {
 	}
 }
 
-func TestMemoryControllerPressureGrowRequiresTwoFreshLowReportsBeforeShrink(t *testing.T) {
+func TestMemoryControllerPressureFloorRequiresPostPressureReport(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	cgroup := newMemoryCgroup(t, "max", "1")
 	fakeCH := newFakeCHMemory(t, capacity)
-	fakeCH.configure(func(f *fakeCHMemory) {
-		f.acceptedTarget = 512 << 20
-		f.currentBudget = 512 << 20
-	})
+	fakeCH.configure(func(f *fakeCHMemory) { f.acceptedTarget = 512 << 20; f.currentBudget = 512 << 20 })
 	reservation := &fakeReservationAdapter{current: 512 << 20}
 	m := newMemoryControllerForTest(t, fakeCH, cgroup, 512<<20, reservation)
+	m.reportMu.Lock()
+	m.reportSeq = 1
+	m.reportMu.Unlock()
 
 	m.controlMu.Lock()
 	if err := m.processPressureLocked(context.Background(), pressureGrow{urgency: resource.UrgencyNormal, reason: "psi_some"}); err != nil {
 		m.controlMu.Unlock()
 		t.Fatal(err)
 	}
-	floor := m.pressureFloor
+	floor, fence := m.pressureFloor, m.pressureReportFence
 	m.controlMu.Unlock()
-	if floor != 576<<20 {
-		t.Fatalf("pressure floor = %d, want 576MiB", floor)
+	if floor != 576<<20 || fence != 1 {
+		t.Fatalf("pressure floor/fence = %d/%d, want 576MiB/1", floor, fence)
 	}
 
 	before := len(reservation.seen())
 	m.controlMu.Lock()
-	err := m.processReportLocked(context.Background(), proto.MemReport{
-		Epoch: 1, Seq: 1, MemTotalBytes: capacity, MemAvailableBytes: 512 << 20,
-	})
+	err := m.processReportLocked(context.Background(), proto.MemReport{Epoch: 1, Seq: 1, MemTotalBytes: capacity, MemAvailableBytes: 512 << 20})
 	m.controlMu.Unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := len(reservation.seen()); got != before {
-		t.Fatalf("first fresh low report reversed pressure grow: reservation calls %d -> %d", before, got)
+		t.Fatalf("pre-pressure queued report reversed grow: calls %d -> %d", before, got)
 	}
-	if got := m.pressureLowSeq; got != 1 {
-		t.Fatalf("first low confirmation seq = %d, want 1", got)
+	if m.pressureFloor != floor {
+		t.Fatalf("pre-pressure report cleared floor: %d", m.pressureFloor)
 	}
 
 	m.controlMu.Lock()
-	err = m.processReportLocked(context.Background(), proto.MemReport{
-		Epoch: 1, Seq: 2, MemTotalBytes: capacity, MemAvailableBytes: 512 << 20,
-	})
+	err = m.processReportLocked(context.Background(), proto.MemReport{Epoch: 1, Seq: 2, MemTotalBytes: capacity, MemAvailableBytes: 512 << 20})
 	m.controlMu.Unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.pressureFloor != 0 || m.pressureLowSeq != 0 {
-		t.Fatalf("pressure confirmation not cleared: floor=%d seq=%d", m.pressureFloor, m.pressureLowSeq)
+	if m.pressureFloor != 0 || m.pressureReportFence != 0 {
+		t.Fatalf("post-pressure report did not clear floor: floor=%d fence=%d", m.pressureFloor, m.pressureReportFence)
 	}
 	if got := m.reservationNow(); got >= 576<<20 {
-		t.Fatalf("second fresh low report did not permit shrink: reservation=%d", got)
+		t.Fatalf("post-pressure low report did not permit shrink: reservation=%d", got)
 	}
 }
 
-func TestMemoryControllerPressureEventResetsLowDemandConfirmation(t *testing.T) {
+func TestMemoryControllerNewPressureAdvancesReportFence(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	cgroup := newMemoryCgroup(t, "max", "1")
 	fakeCH := newFakeCHMemory(t, capacity)
-	fakeCH.configure(func(f *fakeCHMemory) {
-		f.acceptedTarget = 512 << 20
-		f.currentBudget = 512 << 20
-	})
+	fakeCH.configure(func(f *fakeCHMemory) { f.acceptedTarget = 512 << 20; f.currentBudget = 512 << 20 })
 	reservation := &fakeReservationAdapter{current: 512 << 20}
 	m := newMemoryControllerForTest(t, fakeCH, cgroup, 512<<20, reservation)
-
+	m.reportMu.Lock()
+	m.reportSeq = 1
+	m.reportMu.Unlock()
 	m.controlMu.Lock()
 	if err := m.processPressureLocked(context.Background(), pressureGrow{urgency: resource.UrgencyNormal, reason: "psi_some"}); err != nil {
 		m.controlMu.Unlock()
 		t.Fatal(err)
 	}
-	if err := m.processReportLocked(context.Background(), proto.MemReport{Epoch: 1, Seq: 1, MemTotalBytes: capacity, MemAvailableBytes: 512 << 20}); err != nil {
-		m.controlMu.Unlock()
-		t.Fatal(err)
-	}
-	if m.pressureLowSeq != 1 {
-		m.controlMu.Unlock()
-		t.Fatalf("first low seq=%d, want 1", m.pressureLowSeq)
-	}
+	m.controlMu.Unlock()
+	m.reportMu.Lock()
+	m.reportSeq = 2
+	m.reportMu.Unlock()
+	m.controlMu.Lock()
 	if err := m.processPressureLocked(context.Background(), pressureGrow{urgency: resource.UrgencyNormal, reason: "high_event_fallback"}); err != nil {
 		m.controlMu.Unlock()
 		t.Fatal(err)
 	}
-	if m.pressureLowSeq != 0 {
-		m.controlMu.Unlock()
-		t.Fatalf("pressure did not reset low confirmation: %d", m.pressureLowSeq)
+	floor, fence := m.pressureFloor, m.pressureReportFence
+	m.controlMu.Unlock()
+	if fence != 2 {
+		t.Fatalf("new pressure fence=%d, want 2", fence)
 	}
-	floor := m.pressureFloor
+	m.controlMu.Lock()
 	if err := m.processReportLocked(context.Background(), proto.MemReport{Epoch: 1, Seq: 2, MemTotalBytes: capacity, MemAvailableBytes: 512 << 20}); err != nil {
 		m.controlMu.Unlock()
 		t.Fatal(err)
 	}
-	gotSeq, gotFloor := m.pressureLowSeq, m.pressureFloor
+	gotFloor := m.pressureFloor
 	m.controlMu.Unlock()
-	if gotSeq != 2 || gotFloor != floor {
-		t.Fatalf("post-pressure low report must restart confirmation: floor=%d/%d seq=%d", gotFloor, floor, gotSeq)
+	if gotFloor != floor {
+		t.Fatalf("report at pressure fence cleared floor: got=%d want=%d", gotFloor, floor)
 	}
 }
 
