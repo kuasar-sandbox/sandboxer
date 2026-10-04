@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -182,7 +183,10 @@ func bindVsockListener(port uint32) (int, error) {
 // sup carries the exec registry (exec sessions register their children
 // for reaping + honour the quiesce gate) and is reserved for other
 // restore-side hooks.
-func serveReverseChannel(listenFD int, sup *supervisorState, bridge *consoleBridge) {
+// serveReverseChannelDynamic is the base-runtime dispatcher. It answers ping
+// before Launch while rejecting workload-only operations until a supervisor is
+// published. The listener itself is established before runtime_ready.
+func serveReverseChannelDynamic(listenFD int, sup *atomic.Pointer[supervisorState], bridge *consoleBridge) {
 	for {
 		nfd, _, err := unix.Accept(listenFD)
 		if err != nil {
@@ -195,7 +199,8 @@ func serveReverseChannel(listenFD int, sup *supervisorState, bridge *consoleBrid
 		}
 		go func(fd int) {
 			c := &vsockConn{fd: fd}
-			if handedToMUX := handleReverseConn(c, sup, bridge); !handedToMUX {
+			current := sup.Load()
+			if handed := handleReverseConn(c, current, bridge); !handed {
 				_ = c.Close()
 			}
 		}(nfd)
@@ -237,6 +242,10 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		return false
 
 	case proto.TypeExec:
+		if sup == nil {
+			_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: "workload not launched"})
+			return false
+		}
 		// Ad-hoc command inside the running sandbox. runExecSession owns
 		// c for the whole session (it closes it); never closed by the
 		// caller — hence handedToMUX=true.
@@ -244,6 +253,10 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		return true
 
 	case proto.TypeConnect:
+		if sup == nil {
+			_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: "workload not launched"})
+			return false
+		}
 		// Port-forward: splice this reverse-channel conn to a guest-side
 		// dial target. runConnectSession owns c for the whole session (the
 		// relay closes it); never closed by the caller — handedToMUX=true.
@@ -251,6 +264,10 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		return true
 
 	case proto.TypeRestore:
+		if sup == nil || bridge == nil {
+			_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: "workload not launched"})
+			return false
+		}
 		usageCtx, usageCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		usageErr := guestUsage.pause(usageCtx)
 		usageCancel()
@@ -310,6 +327,10 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		return true
 
 	case proto.TypeAttach:
+		if sup == nil || bridge == nil {
+			_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: "workload not launched"})
+			return false
+		}
 		logf("reverse-channel: attach epoch=%d — re-establishing stdio MUX", req.Epoch)
 		bridge.closeLiveMUX() // gracefully close the old session, then switch
 		// attach itself is only MUX-transport reconnect — NOT
@@ -339,6 +360,10 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		return true
 
 	case proto.TypeQuiesce:
+		if sup == nil || bridge == nil {
+			_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: "workload not launched"})
+			return false
+		}
 		usageCtx, usageCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		usageErr := guestUsage.pause(usageCtx)
 		usageCancel()

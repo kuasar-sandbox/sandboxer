@@ -8,6 +8,8 @@ type ReadinessEvent string
 const (
 	// ReadinessControlReady means this run's host-local ctl.sock is listening.
 	ReadinessControlReady ReadinessEvent = "control_ready"
+	// ReadinessRuntimeReady means the base Guest runtime can accept Launch.
+	ReadinessRuntimeReady ReadinessEvent = "runtime_ready"
 	// ReadinessReady means the run-specific cold or restore readiness barrier
 	// has completed.
 	ReadinessReady ReadinessEvent = "ready"
@@ -24,6 +26,7 @@ type readinessEmitter struct {
 	mu           sync.Mutex
 	notify       ReadinessNotify
 	controlReady bool
+	runtimeReady bool
 	ready        bool
 }
 
@@ -42,6 +45,21 @@ func (e *readinessEmitter) notifyControlReady() {
 	}
 	e.notify(ReadinessControlReady)
 	e.controlReady = true
+}
+
+func (e *readinessEmitter) notifyRuntimeReady() {
+	if e == nil || e.notify == nil {
+		return
+	}
+	e.mu.Lock()
+	if !e.controlReady || e.runtimeReady {
+		e.mu.Unlock()
+		return
+	}
+	e.runtimeReady = true
+	notify := e.notify
+	e.mu.Unlock()
+	notify(ReadinessRuntimeReady)
 }
 
 func (e *readinessEmitter) notifyReady() {

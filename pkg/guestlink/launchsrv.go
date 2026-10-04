@@ -36,7 +36,11 @@ import (
 type LaunchServer struct {
 	Path string
 	Spec *proto.LaunchSpec
-	Logf func(string, ...any)
+	// DeferLaunch keeps the guest hello connection parked until SetSpec publishes
+	// the one workload this runtime will execute. The hello itself is the
+	// runtime-ready barrier; the launch timeout starts only after publication.
+	DeferLaunch bool
+	Logf        func(string, ...any)
 
 	// StartTimeout bounds the wait for launch_ack after the launch spec is
 	// sent. The guest sends launch_ack only after applying the whole spec
@@ -86,22 +90,28 @@ type LaunchServer struct {
 	// connection is closed as before (used by tests).
 	OnMUXReady func(conn net.Conn, established proto.StdioSpec)
 
-	listener      *net.UnixListener
-	stopOnce      sync.Once
-	stopped       chan struct{}
-	helloDone     chan struct{}
-	helloOnce     sync.Once
-	helloSent     atomic.Bool
-	launchAckDone chan struct{}
-	launchAckOnce sync.Once
-	connsWG       sync.WaitGroup
+	listener       *net.UnixListener
+	stopOnce       sync.Once
+	stopped        chan struct{}
+	helloDone      chan struct{}
+	helloOnce      sync.Once
+	helloSent      atomic.Bool
+	runtimeReady   chan struct{}
+	runtimeOnce    sync.Once
+	launchReady    chan struct{}
+	launchMu       sync.RWMutex
+	launchAckDone  chan struct{}
+	appStartedDone chan struct{}
+	appStartedOnce sync.Once
+	launchAckOnce  sync.Once
+	connsWG        sync.WaitGroup
 }
 
 // Listen binds the UDS for the launch port. Must be called before CH
 // spawns; otherwise the guest's first connect attempt fails (it will
 // retry but warning will appear in logs).
 func (s *LaunchServer) Listen() error {
-	if s.Spec == nil {
+	if s.Spec == nil && !s.DeferLaunch {
 		return errors.New("launchsrv: Spec is nil")
 	}
 	if s.Logf == nil {
@@ -109,7 +119,13 @@ func (s *LaunchServer) Listen() error {
 	}
 	s.stopped = make(chan struct{})
 	s.helloDone = make(chan struct{})
+	s.runtimeReady = make(chan struct{})
+	s.launchReady = make(chan struct{})
 	s.launchAckDone = make(chan struct{})
+	s.appStartedDone = make(chan struct{})
+	if s.Spec != nil {
+		close(s.launchReady)
+	}
 
 	_ = os.Remove(s.Path)
 	addr, err := net.ResolveUnixAddr("unix", s.Path)
@@ -158,10 +174,39 @@ func (s *LaunchServer) Serve(ctx context.Context) error {
 	}
 }
 
-// HelloDone returns a channel that closes once the hello/launch
-// handshake has completed (LaunchSpec written, conn closed). Useful
-// for callers that want to gate "ping ticker start" on this event.
+// RuntimeReady closes when the guest has completed base initialization and
+// sent hello. In deferred mode this is deliberately before a LaunchSpec exists.
+func (s *LaunchServer) RuntimeReady() <-chan struct{} { return s.runtimeReady }
+
+// HelloDone closes after the LaunchSpec has actually been written. It retains
+// the historical cold-start meaning and is therefore later than RuntimeReady
+// when DeferLaunch is enabled.
 func (s *LaunchServer) HelloDone() <-chan struct{} { return s.helloDone }
+
+// SetSpec publishes the only LaunchSpec accepted by a deferred server. It does
+// not wait for guest application; LaunchAckDone/AppStarted remain later gates.
+func (s *LaunchServer) SetSpec(spec *proto.LaunchSpec) error {
+	if spec == nil {
+		return errors.New("launchsrv: Spec is nil")
+	}
+	s.launchMu.Lock()
+	defer s.launchMu.Unlock()
+	if s.Spec != nil {
+		return errors.New("launchsrv: launch spec already published")
+	}
+	s.Spec = spec
+	close(s.launchReady)
+	return nil
+}
+
+func (s *LaunchServer) launchSpec() *proto.LaunchSpec {
+	s.launchMu.RLock()
+	defer s.launchMu.RUnlock()
+	return s.Spec
+}
+
+// AppStartedDone closes after the guest app_started notification is acknowledged.
+func (s *LaunchServer) AppStartedDone() <-chan struct{} { return s.appStartedDone }
 
 // LaunchAckDone returns a channel that closes once the guest has
 // acknowledged that it has received the launch spec and applied
@@ -188,15 +233,33 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 
 	switch msg.Type {
 	case proto.TypeHello:
+		s.runtimeOnce.Do(func() { close(s.runtimeReady) })
 		if s.helloSent.Load() {
 			s.Logf("launch: duplicate hello rejected")
 			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "hello already served"})
 			return false
 		}
-		s.Logf("launch: hello received (phase=%q), sending launch spec", msg.Phase)
+		s.Logf("launch: hello received (phase=%q)", msg.Phase)
+		if s.DeferLaunch {
+			if s.AppNotifyDeadline > 0 {
+				_ = conn.SetDeadline(time.Time{})
+			}
+			select {
+			case <-s.launchReady:
+			case <-s.stopped:
+				return false
+			}
+		}
+		spec := s.launchSpec()
+		if spec == nil {
+			s.Logf("launch: no launch spec published")
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "launch unavailable"})
+			return false
+		}
+		s.Logf("launch: sending launch spec")
 		if err := proto.WriteMessage(conn, &proto.Message{
 			Type:   proto.TypeLaunch,
-			Launch: s.Spec,
+			Launch: spec,
 		}); err != nil {
 			s.Logf("launch: send launch: %v", err)
 			return false
@@ -275,6 +338,9 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 		}
 		if s.OnAppStarted != nil {
 			s.OnAppStarted(msg.PID)
+		}
+		if s.appStartedDone != nil {
+			s.appStartedOnce.Do(func() { close(s.appStartedDone) })
 		}
 		return false
 

@@ -106,60 +106,39 @@ func main() {
 		die("vsock listen: %v", err)
 	}
 
-	// Launch handshake (dial → hello → recv launch) runs in a goroutine
-	// concurrent with overlay assembly. It is pure-socket — it resolves no
-	// filesystem path — so it is safe alongside the mount chain and the
-	// later chroot (which runs single-threaded after the join). This hides
-	// the hello→launch round-trip under the disk/overlay setup. The spec
-	// drives the spec-dependent setup below; the conn is reused for
-	// launch_ack and then the stdio MUX.
-	hsCh := make(chan handshakeResult, 1)
-	go runHandshake(hsCh)
-
-	// Spec-independent root assembly (base mounts + overlay/single → sysroot).
-	if err := phase1aAssembleRoot(); err != nil {
-		die("phase 1a root assembly: %v", err)
+	// Base runtime startup is deliberately workload-independent. Only the
+	// sandbox-runtime root and management facilities are initialized here. The
+	// host may keep this RuntimeReady state alive before publishing a workload.
+	if err := phaseBaseRuntime(); err != nil {
+		die("base runtime: %v", err)
 	}
-
-	hr := <-hsCh
-	if hr.err != nil {
-		die("launch handshake: %v", hr.err)
-	}
-	spec, conn := hr.spec, hr.conn
-	logf("phase1: launch spec received; switching root")
-
-	// Volume (empty) mounts are set up BEFORE switch-root: their source is a
-	// fresh dir on the raw ext4 (/overlay/upper/volumes), bound onto the target
-	// inside /sysroot so the switch-root MS_MOVE carries them into /.
-	if err := applyVolumeMounts(spec.Mounts); err != nil {
-		die("apply volume mounts: %v", err)
-	}
-
-	// switch-root into the assembled overlay + post-switch base mounts.
-	if err := phase1bSwitchRoot(spec.CgroupControl); err != nil {
-		die("phase 1b switch-root: %v", err)
-	}
-
-	// Loopback reads /sys/class/net (sysfs), so it runs after switch-root.
-	// Config-independent; only the app cares about localhost, so bringing it
-	// up here (rather than before the handshake) is fine. Fatal: a guest that
-	// can't bring up lo is broken.
 	if err := bringUpLoopback(); err != nil {
 		die("bring up loopback: %v", err)
 	}
 
-	// Apply the spec on the post-switch rootfs and finish the handshake
-	// (launch_ack → MUX). applyNetwork needs /sys, available after chroot.
+	// Start the reverse management channel before runtime_ready. A base runtime
+	// must answer ping while it waits for Launch; exec/connect/quiesce remain
+	// unavailable until a workload supervisor is installed.
+	var supervisor atomic.Pointer[supervisorState]
+	go serveReverseChannelDynamic(revFD, &supervisor, nil)
+
+	// runtime_ready is the hello itself. The host may defer its launch reply for
+	// an arbitrary assignment interval; that interval is not launch execution.
+	spec, conn, err := waitForLaunch()
+	if err != nil {
+		die("launch handshake: %v", err)
+	}
+	logf("runtime ready: launch spec received; assembling workload root")
+
+	if err := phaseWorkloadRoot(spec); err != nil {
+		die("workload root: %v", err)
+	}
 	cs, bridge, err := phase2Apply(spec, conn)
 	if err != nil {
 		die("phase 2 apply: %v", err)
 	}
 	logf("phase2: network + stdio done")
 
-	// Register SIGCHLD before the first primary/plugin can exit. The buffered
-	// channel retains an edge until phase3 starts consuming it, so a plugin
-	// helper that fails setup during the initial synchronous launch pass is
-	// still reaped and retried according to plugin launch-failure semantics.
 	sigCh := make(chan os.Signal, 16)
 	signal.Notify(sigCh, syscall.SIGCHLD)
 
@@ -168,39 +147,25 @@ func main() {
 		die("phase 2 fork: %v", err)
 	}
 	logf("phase2: app forked pid=%d", appPid)
-
-	// Notify host before entering supervisor — best-effort short conn.
 	if err := notifyAppStarted(appPid); err != nil {
 		logf("warn: app_started notify failed (continuing): %v", err)
 	}
 
-	supervisor := &supervisorState{
+	sup := &supervisorState{
 		spec:       spec,
-		stopSignal: syscall.Signal(spec.StopSignal), // 0 → SIGTERM (handled in phase3)
+		stopSignal: syscall.Signal(spec.StopSignal),
 		stopGrace:  time.Duration(spec.StopGraceSec) * time.Second,
 		execReg:    newExecRegistry(),
 		connReg:    newConnRegistry(),
 		acceptLn:   newAcceptListeners(),
 		pluginReg:  newPluginRegistry(),
 	}
-	supervisor.appPid.Store(int64(appPid))
-	supervisor.appBackoff.onStart(time.Now()) // app start instant for restart backoff reset
-
-	// Launch companion plugins (launch.plugin[]) once the app is up + in its
-	// cgroup; each is supervised independently and never reboots the sandbox.
-	supervisor.pluginReg.start(spec.Plugins)
-
-	// Reverse-channel dispatch goroutine. Lives until reboot. It carries
-	// the consoleBridge so host-initiated restore / attach can swap a
-	// fresh MUX session under the still-running app's stdio pumps, and
-	// the supervisor so exec sessions can register their children.
-	go serveReverseChannel(revFD, supervisor, bridge)
-
-	// Memory reporter supplies guest demand observations to the host's local
-	// Budget controller. It never reports balloon current.
+	sup.appPid.Store(int64(appPid))
+	sup.appBackoff.onStart(time.Now())
+	sup.pluginReg.start(spec.Plugins)
+	supervisor.Store(sup)
 	go runMemReporter(memReportInterval)
-
-	phase3Supervise(supervisor, bridge, sigCh)
+	phase3Supervise(sup, bridge, sigCh)
 	// phase3Supervise does not return.
 }
 
@@ -227,20 +192,9 @@ func singleDiskFromCmdline() bool {
 	return false
 }
 
-// phase1aAssembleRoot mounts /proc /sys /dev, then assembles the container root
-// at /sysroot per disk mode (read from /proc/cmdline — the mode must be known
-// before the launch spec arrives, so it rides the kernel cmdline):
-//
-//   - overlay mode (default): wait vda+vdb, mount the erofs base (vda, ro) as
-//     the overlayfs lower over the ext4 upper (vdb, rw), overlay → /sysroot.
-//   - single-disk mode: wait vda only, mount it (ext4, rw) directly as /sysroot
-//     — no overlayfs, no vdb.
-//
-// Finally it binds the guest-side runtime payload (/opt/sandbox-runtime) into
-// /sysroot. Spec-independent, so it runs concurrently with the launch
-// handshake; the chroot is deferred to phase1bSwitchRoot (after the join),
-// where it can run single-threaded.
-func phase1aAssembleRoot() error {
+// phaseBaseRuntime mounts only sandbox-runtime facilities needed before a
+// workload exists. It deliberately does not probe, read, or mount /dev/vd*.
+func phaseBaseRuntime() error {
 	for _, m := range []struct {
 		source, target, fstype string
 		flags                  uintptr
@@ -258,6 +212,12 @@ func phase1aAssembleRoot() error {
 	}
 
 	singleDiskRoot = singleDiskFromCmdline() // /proc is mounted now
+	return nil
+}
+
+// phaseWorkloadRoot begins only after host storage commit. It is the first
+// phase that probes or mounts workload block devices.
+func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
 	if singleDiskRoot {
 		logf("phase1a: base mounts done; single-disk mode, waiting for vda")
 		if err := waitForDevice("/dev/vda", devicePollTimeout); err != nil {
@@ -324,6 +284,12 @@ func phase1aAssembleRoot() error {
 	}
 
 	logf("phase1a: /sysroot ready (runtime payload bound)")
+	if err := applyVolumeMounts(spec.Mounts); err != nil {
+		return fmt.Errorf("apply volume mounts: %w", err)
+	}
+	if err := phase1bSwitchRoot(spec.CgroupControl); err != nil {
+		return fmt.Errorf("switch root: %w", err)
+	}
 	return nil
 }
 
@@ -404,48 +370,31 @@ func mountRunDirs() error {
 	return nil
 }
 
-// handshakeResult carries the outcome of the concurrent launch handshake
-// back to main(). On success conn is the still-open vsock connection (reused
-// for launch_ack and then the stdio MUX); on error conn is already closed.
-type handshakeResult struct {
-	spec *proto.LaunchSpec
-	conn *vsockConn
-	err  error
-}
-
-// runHandshake dials the host launch server, sends hello, and receives the
-// launch spec, handing the still-open connection back via ch. It touches no
-// filesystem path (pure socket I/O), so it is safe to run concurrently with
-// overlay assembly and the subsequent chroot. On any error it closes the
-// connection and reports the error; the conn is never closed on success.
-func runHandshake(ch chan<- handshakeResult) {
+// waitForLaunch announces runtime_ready and blocks for the host's one launch.
+// The same connection later carries launch_ack and becomes the stdio MUX.
+func waitForLaunch() (*proto.LaunchSpec, *vsockConn, error) {
 	conn, err := dialVsock(proto.VsockHostCID, proto.LaunchPort)
 	if err != nil {
-		ch <- handshakeResult{err: fmt.Errorf("vsock dial host:%d: %w", proto.LaunchPort, err)}
-		return
+		return nil, nil, fmt.Errorf("vsock dial host:%d: %w", proto.LaunchPort, err)
 	}
-	fail := func(err error) {
+	fail := func(err error) (*proto.LaunchSpec, *vsockConn, error) {
 		_ = conn.Close()
-		ch <- handshakeResult{err: err}
+		return nil, nil, err
 	}
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "ready"}); err != nil {
-		fail(fmt.Errorf("send hello: %w", err))
-		return
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready"}); err != nil {
+		return fail(fmt.Errorf("send runtime_ready: %w", err))
 	}
 	msg, err := proto.ReadMessage(conn)
 	if err != nil {
-		fail(fmt.Errorf("read launch: %w", err))
-		return
+		return fail(fmt.Errorf("read launch: %w", err))
 	}
 	if msg.Type != proto.TypeLaunch || msg.Launch == nil {
-		fail(fmt.Errorf("expected launch message, got %q", msg.Type))
-		return
+		return fail(fmt.Errorf("expected launch message, got %q", msg.Type))
 	}
 	if msg.Launch.Exec == "" && !msg.Launch.Placeholder {
-		fail(errors.New("launch spec missing exec"))
-		return
+		return fail(errors.New("launch spec missing exec"))
 	}
-	ch <- handshakeResult{spec: msg.Launch, conn: conn}
+	return msg.Launch, conn, nil
 }
 
 // phase2Apply applies the launch spec on the (post-switch-root) rootfs, then

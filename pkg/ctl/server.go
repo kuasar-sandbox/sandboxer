@@ -40,8 +40,8 @@ type Server struct {
 
 // Listen binds the UDS.
 func (s *Server) Listen() error {
-	if s.SnapshotHandler == nil {
-		return errors.New("ctl: Server.SnapshotHandler is nil")
+	if s.SnapshotHandler == nil && s.ExportHandler == nil && s.UsageHandler == nil && s.ResourceStatsHandler == nil && s.ExecHandler == nil {
+		return errors.New("ctl: Server has no handlers")
 	}
 	if s.Logf == nil {
 		s.Logf = func(string, ...any) {}

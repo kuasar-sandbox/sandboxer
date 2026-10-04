@@ -408,3 +408,100 @@ func TestLaunchServer_NilSpecRejected(t *testing.T) {
 		t.Fatal("expected error when Spec is nil")
 	}
 }
+
+func TestLaunchServerDeferredRuntimeReadyAndLaunch(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "vsock.sock_5000")
+	srv := &LaunchServer{Path: sockPath, DeferLaunch: true, StartTimeout: time.Second, AppNotifyDeadline: 50 * time.Millisecond}
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-srv.RuntimeReady():
+	case <-time.After(time.Second):
+		t.Fatal("runtime readiness not observed")
+	}
+	if srv.helloSent.Load() {
+		t.Fatal("launch sent before publication")
+	}
+	// The server clears the short hello deadline while waiting for Launch. A
+	// host-side deadline would leave the socket in a timed-out state on some
+	// platforms, so assert publication state rather than consuming the stream.
+	time.Sleep(2 * srv.AppNotifyDeadline)
+	if srv.helloSent.Load() {
+		t.Fatal("launch sent while runtime remained unassigned")
+	}
+	spec := &proto.LaunchSpec{Exec: "/bin/true"}
+	if err := srv.SetSpec(spec); err != nil {
+		t.Fatal(err)
+	}
+	got, err := proto.ReadMessage(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != proto.TypeLaunch || !reflect.DeepEqual(got.Launch, spec) {
+		t.Fatalf("launch=%+v", got)
+	}
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeLaunchAck}); err != nil {
+		t.Fatal(err)
+	}
+	ack, err := proto.ReadMessage(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.Type != proto.TypeAck {
+		t.Fatalf("ack=%+v", ack)
+	}
+	if err := srv.SetSpec(&proto.LaunchSpec{Exec: "/bin/false"}); err == nil {
+		t.Fatal("second launch publication accepted")
+	}
+	srv.Stop()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop")
+	}
+}
+
+func TestLaunchServerDeferredStopUnblocksHello(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "vsock.sock_5000")
+	srv := &LaunchServer{Path: sockPath, DeferLaunch: true}
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-srv.RuntimeReady():
+	case <-time.After(time.Second):
+		t.Fatal("runtime readiness not observed")
+	}
+	srv.Stop()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("deferred hello stranded Serve shutdown")
+	}
+}

@@ -72,6 +72,11 @@ func (w *readinessFDWriter) Notify(event sandbox.ReadinessEvent) {
 		}
 		w.controlReady = true
 
+	case sandbox.ReadinessRuntimeReady:
+		// SDK-only milestone. Existing --ready-fd remains exactly
+		// control_ready/ready for node-ctl compatibility.
+		return
+
 	case sandbox.ReadinessReady:
 		if w.ready {
 			return
