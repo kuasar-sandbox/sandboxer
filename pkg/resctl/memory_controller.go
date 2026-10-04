@@ -135,6 +135,8 @@ type MemoryController struct {
 	lastDemand                uint64
 	lastDemandKnown           bool
 	shrinkReportFence         uint64
+	pressureFloor             uint64
+	pressureLowSeq            uint64
 
 	reportMu       sync.Mutex
 	reportsOpen    bool
@@ -571,6 +573,25 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 			report.Epoch, report.Seq, latestSeq)
 		return nil
 	}
+	if m.pressureFloor != 0 {
+		if budget.RequestedBudget < m.pressureFloor {
+			if m.pressureLowSeq == 0 {
+				m.pressureLowSeq = report.Seq
+				m.logf("memory: shrink deferred below pressure floor Budget=%d requested=%d; awaiting one more fresh low-demand report", m.pressureFloor, budget.RequestedBudget)
+				return nil
+			}
+			// SubmitGuestReport already enforces a strictly increasing sequence.
+			// A second fresh low-demand observation with no intervening pressure
+			// event is positive evidence that the pressure episode has ended.
+			m.logf("memory: pressure floor Budget=%d cleared by consecutive low-demand reports seq=%d,%d", m.pressureFloor, m.pressureLowSeq, report.Seq)
+			m.pressureFloor = 0
+			m.pressureLowSeq = 0
+		} else {
+			// A report that still needs the pressure budget is not evidence that
+			// pressure has ended; any later shrink must prove two fresh lows.
+			m.pressureLowSeq = 0
+		}
+	}
 	if budget.ObservedBudget > m.reservationNow() {
 		// Cold/emergency actual is not a node grant. Keep the existing high;
 		// normal demand/pressure grow remains the only way to obtain more.
@@ -602,6 +623,9 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 }
 
 func (m *MemoryController) processPressureLocked(ctx context.Context, pressure pressureGrow) error {
+	// Any new pressure signal invalidates an in-progress low-demand confirmation.
+	// The floor itself is changed only after an actually accepted Budget grow.
+	m.pressureLowSeq = 0
 	// Restore normalization is the sole allowed target operation between
 	// restore ACK/MUX establishment and confirmation of SafeTarget. Sensor
 	// inputs are transient and will be sampled again after that barrier. Once
@@ -635,7 +659,24 @@ func (m *MemoryController) processPressureLocked(ctx context.Context, pressure p
 	if m.lastDemandKnown {
 		demand = m.lastDemand
 	}
-	return m.startGrowLocked(ctx, want, demand, pressure.urgency, pressure.reason)
+	before := currentBudget
+	err := m.startGrowLocked(ctx, want, demand, pressure.urgency, pressure.reason)
+	if err != nil {
+		return err
+	}
+	after := m.state.TargetBudget
+	if m.balloon != nil {
+		state := m.balloon.State()
+		if state.AcceptedTargetKnown {
+			after = BudgetFromTarget(m.capacity, state.AcceptedTarget)
+		}
+	}
+	if after > before {
+		if after > m.pressureFloor {
+			m.pressureFloor = after
+		}
+	}
+	return nil
 }
 
 func (m *MemoryController) startGrowLocked(ctx context.Context, requestedBudget, demand uint64, urgency, reason string) error {
