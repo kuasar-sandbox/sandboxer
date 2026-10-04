@@ -403,6 +403,45 @@ func TestMemoryControllerPressureGrowAllowedBeforeInitialReport(t *testing.T) {
 	}
 }
 
+func TestMemoryControllerPressureGrowDefersImmediateShrink(t *testing.T) {
+	const capacity = uint64(1 << 30)
+	cgroup := newMemoryCgroup(t, "max", "1")
+	fakeCH := newFakeCHMemory(t, capacity)
+	fakeCH.configure(func(f *fakeCHMemory) {
+		f.acceptedTarget = 512 << 20
+		f.currentBudget = 512 << 20
+	})
+	reservation := &fakeReservationAdapter{current: 512 << 20}
+	m := newMemoryControllerForTest(t, fakeCH, cgroup, 512<<20, reservation)
+
+	m.controlMu.Lock()
+	if err := m.processPressureLocked(context.Background(), pressureGrow{urgency: resource.UrgencyNormal, reason: "psi_some"}); err != nil {
+		m.controlMu.Unlock()
+		t.Fatal(err)
+	}
+	floor, hold := m.pressureFloor, m.pressureHoldUntil
+	m.controlMu.Unlock()
+	if floor != 576<<20 || hold.IsZero() {
+		t.Fatalf("pressure hold = floor %d until %v, want 576MiB and active hold", floor, hold)
+	}
+
+	before := len(reservation.seen())
+	m.controlMu.Lock()
+	err := m.processReportLocked(context.Background(), proto.MemReport{
+		Epoch: 1, Seq: 1, MemTotalBytes: capacity, MemAvailableBytes: 512 << 20,
+	})
+	m.controlMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(reservation.seen()); got != before {
+		t.Fatalf("fresh report immediately reversed pressure grow: reservation calls %d -> %d", before, got)
+	}
+	if got := m.reservationNow(); got != 576<<20 {
+		t.Fatalf("reservation after deferred shrink = %d, want 576MiB", got)
+	}
+}
+
 func TestMemoryControllerAccumulatesPartialGrantBeforeDeflate(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	cgroup := newMemoryCgroup(t, "1", "1")

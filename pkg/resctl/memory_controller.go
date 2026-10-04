@@ -135,6 +135,8 @@ type MemoryController struct {
 	lastDemand                uint64
 	lastDemandKnown           bool
 	shrinkReportFence         uint64
+	pressureFloor             uint64
+	pressureHoldUntil         time.Time
 
 	reportMu       sync.Mutex
 	reportsOpen    bool
@@ -571,6 +573,16 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 			report.Epoch, report.Seq, latestSeq)
 		return nil
 	}
+	if !m.pressureHoldUntil.IsZero() {
+		if time.Now().Before(m.pressureHoldUntil) && budget.RequestedBudget < m.pressureFloor {
+			m.logf("memory: shrink deferred below active pressure floor Budget=%d requested=%d", m.pressureFloor, budget.RequestedBudget)
+			return nil
+		}
+		if !time.Now().Before(m.pressureHoldUntil) {
+			m.pressureFloor = 0
+			m.pressureHoldUntil = time.Time{}
+		}
+	}
 	if budget.ObservedBudget > m.reservationNow() {
 		// Cold/emergency actual is not a node grant. Keep the existing high;
 		// normal demand/pressure grow remains the only way to obtain more.
@@ -635,7 +647,25 @@ func (m *MemoryController) processPressureLocked(ctx context.Context, pressure p
 	if m.lastDemandKnown {
 		demand = m.lastDemand
 	}
-	return m.startGrowLocked(ctx, want, demand, pressure.urgency, pressure.reason)
+	before := currentBudget
+	err := m.startGrowLocked(ctx, want, demand, pressure.urgency, pressure.reason)
+	if err != nil {
+		return err
+	}
+	after := m.state.TargetBudget
+	if m.balloon != nil {
+		state := m.balloon.State()
+		if state.AcceptedTargetKnown {
+			after = BudgetFromTarget(m.capacity, state.AcceptedTarget)
+		}
+	}
+	if after > before {
+		if after > m.pressureFloor {
+			m.pressureFloor = after
+		}
+		m.pressureHoldUntil = time.Now().Add(1500 * time.Millisecond)
+	}
+	return nil
 }
 
 func (m *MemoryController) startGrowLocked(ctx context.Context, requestedBudget, demand uint64, urgency, reason string) error {

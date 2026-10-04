@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -43,10 +44,11 @@ const (
 //
 // Both modes funnel through the same dispatch() → local Budget transaction.
 type PressureSensor struct {
-	controller *MemoryController
-	cgroupPath string
-	logf       func(string, ...any)
-	runtime    sensorRuntime
+	controller      *MemoryController
+	cgroupPath      string
+	logf            func(string, ...any)
+	runtime         sensorRuntime
+	lastPSIDispatch atomic.Int64
 }
 
 type sensorRuntime struct {
@@ -190,15 +192,15 @@ func (s *PressureSensor) runPSI(ctx context.Context) error {
 			continue
 		}
 		lastDispatch = now
+		s.lastPSIDispatch.Store(now.UnixNano())
 		s.dispatch(resource.UrgencyNormal, "psi_some")
 	}
 }
 
-// runOOMSidecar polls memory.events.local at 1s for OOM transitions
-// (cgroup OOM events are not surfaced via PSI triggers). On dOOM > 0,
-// fires urgency=high. dHigh increases are logged-only — when PSI is
-// the primary path, high counter rising without a PSI wake means PSI
-// missed something (rare; useful for tuning the trigger threshold).
+// runOOMSidecar polls memory.events.local at 1s for OOM transitions and a
+// bounded PSI fallback. OOM remains urgency=high. If memory.high keeps
+// throttling while no PSI dispatch occurred during the last sidecar interval,
+// one normal grow preserves forward feedback without replacing the PSI path.
 func (s *PressureSensor) runOOMSidecar(ctx context.Context) {
 	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
@@ -222,15 +224,36 @@ func (s *PressureSensor) runOOMSidecar(ctx context.Context) {
 			first = false
 			continue
 		}
+		dOOM, dHigh := uint64(0), uint64(0)
 		if oom > lastOOM {
-			s.dispatch(resource.UrgencyHigh, "oom_event")
+			dOOM = oom - lastOOM
 		}
 		if high > lastHigh {
-			s.logf("sensor: memory.events.high counter rose by %d while PSI is primary "+
-				"(consider tightening psi_some_stall_us)", high-lastHigh)
+			dHigh = high - lastHigh
 		}
+		s.dispatchPSISidecar(dHigh, dOOM, time.Now())
 		lastOOM = oom
 		lastHigh = high
+	}
+}
+
+func (s *PressureSensor) dispatchPSISidecar(dHigh, dOOM uint64, now time.Time) {
+	if dOOM > 0 {
+		s.dispatch(resource.UrgencyHigh, "oom_event")
+	}
+	if dHigh == 0 {
+		return
+	}
+	lastPSI := s.lastPSIDispatch.Load()
+	if lastPSI != 0 && now.Sub(time.Unix(0, lastPSI)) < time.Second {
+		return
+	}
+	// memory.high is a kernel-confirmed throttle. If it keeps advancing while
+	// the PSI trigger has been quiet for a full sidecar interval, preserve PSI
+	// as the primary signal but supply the missed normal grow feedback.
+	s.logf("sensor: memory.events.high counter rose by %d without a recent PSI dispatch; requesting fallback grow", dHigh)
+	if dOOM == 0 {
+		s.dispatch(resource.UrgencyNormal, "high_event_fallback")
 	}
 }
 

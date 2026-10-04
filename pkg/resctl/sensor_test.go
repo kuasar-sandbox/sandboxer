@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
 func TestHostChargeAbove95PercentUsesExactIntegerComparison(t *testing.T) {
@@ -203,6 +204,50 @@ func TestRunEventsPoll_NoHigh_NoOOM_NoDispatch(t *testing.T) {
 	ctx, cancel := contextWithTimeout(t, 250*time.Millisecond)
 	defer cancel()
 	s.runEventsPoll(ctx) // returns when ctx done; no panic = pass
+}
+
+func TestPSISidecarHighFallbackDispatchesOnlyWhenPSIIsQuiet(t *testing.T) {
+	controller := &MemoryController{pressureEvents: make(chan pressureGrow, 8)}
+	s := &PressureSensor{controller: controller, logf: func(string, ...any) {}}
+	now := time.Unix(123, 0)
+
+	s.lastPSIDispatch.Store(now.Add(-500 * time.Millisecond).UnixNano())
+	s.dispatchPSISidecar(3, 0, now)
+	select {
+	case got := <-controller.pressureEvents:
+		t.Fatalf("recent PSI dispatch must suppress high fallback, got %+v", got)
+	default:
+	}
+
+	s.lastPSIDispatch.Store(now.Add(-2 * time.Second).UnixNano())
+	s.dispatchPSISidecar(4, 0, now)
+	select {
+	case got := <-controller.pressureEvents:
+		if got.urgency != resource.UrgencyNormal || got.reason != "high_event_fallback" {
+			t.Fatalf("fallback = %+v, want normal/high_event_fallback", got)
+		}
+	default:
+		t.Fatal("quiet PSI plus advancing memory.high did not dispatch fallback grow")
+	}
+}
+
+func TestPSISidecarOOMKeepsHighUrgencyWithoutDuplicateNormalGrow(t *testing.T) {
+	controller := &MemoryController{pressureEvents: make(chan pressureGrow, 8)}
+	s := &PressureSensor{controller: controller, logf: func(string, ...any) {}}
+	s.dispatchPSISidecar(7, 1, time.Unix(456, 0))
+	select {
+	case got := <-controller.pressureEvents:
+		if got.urgency != resource.UrgencyHigh || got.reason != "oom_event" {
+			t.Fatalf("OOM dispatch = %+v, want high/oom_event", got)
+		}
+	default:
+		t.Fatal("OOM did not dispatch high urgency grow")
+	}
+	select {
+	case got := <-controller.pressureEvents:
+		t.Fatalf("OOM+high must not enqueue duplicate normal grow, got %+v", got)
+	default:
+	}
 }
 
 func TestCgroupDiagnosticCountersRejectMalformedAndOverflow(t *testing.T) {
