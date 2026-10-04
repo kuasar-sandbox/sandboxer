@@ -183,20 +183,28 @@ func (b *CowBackend) writeAt(ctx context.Context, buf []byte, off int64) (int, e
 	return b.C.writeAt(ctx, buf, off)
 }
 func (s *Server) readAt(ctx context.Context, buf []byte, off int64) (int, error) {
-	if b, ok := s.backend.(interface {
+	return readBackendAt(ctx, s.backend, buf, off)
+}
+
+func readBackendAt(ctx context.Context, backend Backend, buf []byte, off int64) (int, error) {
+	if b, ok := backend.(interface {
 		readAt(context.Context, []byte, int64) (int, error)
 	}); ok {
 		return b.readAt(ctx, buf, off)
 	}
-	return s.backend.ReadAt(buf, off)
+	return backend.ReadAt(buf, off)
 }
 func (s *Server) writeAt(ctx context.Context, buf []byte, off int64) (int, error) {
-	if b, ok := s.backend.(interface {
+	return writeBackendAt(ctx, s.backend, buf, off)
+}
+
+func writeBackendAt(ctx context.Context, backend Backend, buf []byte, off int64) (int, error) {
+	if b, ok := backend.(interface {
 		writeAt(context.Context, []byte, int64) (int, error)
 	}); ok {
 		return b.writeAt(ctx, buf, off)
 	}
-	return s.backend.WriteAt(buf, off)
+	return backend.WriteAt(buf, off)
 }
 
 // EnableStats turns on per-request counters and coverage tracking,
