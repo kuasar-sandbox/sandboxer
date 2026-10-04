@@ -136,7 +136,7 @@ type MemoryController struct {
 	lastDemandKnown           bool
 	shrinkReportFence         uint64
 	pressureFloor             uint64
-	pressureReportFence       uint64
+	pressureLowSeq            uint64
 
 	reportMu       sync.Mutex
 	reportsOpen    bool
@@ -575,16 +575,21 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 	}
 	if m.pressureFloor != 0 {
 		if budget.RequestedBudget < m.pressureFloor {
-			if report.Seq <= m.pressureReportFence {
-				m.logf("memory: shrink deferred below pressure floor Budget=%d requested=%d; report seq=%d is not newer than pressure fence=%d", m.pressureFloor, budget.RequestedBudget, report.Seq, m.pressureReportFence)
+			if m.pressureLowSeq == 0 {
+				m.pressureLowSeq = report.Seq
+				m.logf("memory: shrink deferred below pressure floor Budget=%d requested=%d; awaiting one more fresh low-demand report", m.pressureFloor, budget.RequestedBudget)
 				return nil
 			}
-			// The report was accepted after the most recent pressure signal.
-			// It is therefore fresh evidence that demand has fallen, unlike a
-			// report already queued when the pressure grow was requested.
-			m.logf("memory: pressure floor Budget=%d cleared by post-pressure low-demand report seq=%d fence=%d", m.pressureFloor, report.Seq, m.pressureReportFence)
+			// SubmitGuestReport already enforces a strictly increasing sequence.
+			// A second fresh low-demand observation with no intervening pressure
+			// event is positive evidence that the pressure episode has ended.
+			m.logf("memory: pressure floor Budget=%d cleared by consecutive low-demand reports seq=%d,%d", m.pressureFloor, m.pressureLowSeq, report.Seq)
 			m.pressureFloor = 0
-			m.pressureReportFence = 0
+			m.pressureLowSeq = 0
+		} else {
+			// A report that still needs the pressure budget is not evidence that
+			// pressure has ended; any later shrink must prove two fresh lows.
+			m.pressureLowSeq = 0
 		}
 	}
 	if budget.ObservedBudget > m.reservationNow() {
@@ -618,12 +623,9 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 }
 
 func (m *MemoryController) processPressureLocked(ctx context.Context, pressure pressureGrow) error {
-	// A pressure signal invalidates every report accepted before it as evidence
-	// for shrinking a pressure-proven Budget. Snapshot the accepted sequence so
-	// only a later report can clear an existing/new floor.
-	m.reportMu.Lock()
-	m.pressureReportFence = m.reportSeq
-	m.reportMu.Unlock()
+	// Any new pressure signal invalidates an in-progress low-demand confirmation.
+	// The floor itself is changed only after an actually accepted Budget grow.
+	m.pressureLowSeq = 0
 	// Restore normalization is the sole allowed target operation between
 	// restore ACK/MUX establishment and confirmation of SafeTarget. Sensor
 	// inputs are transient and will be sampled again after that barrier. Once
