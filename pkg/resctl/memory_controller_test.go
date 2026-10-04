@@ -501,6 +501,195 @@ func TestMemoryControllerPressureEventResetsLowDemandConfirmation(t *testing.T) 
 	}
 }
 
+func TestMemoryControllerPressureFloorTracksOnlyAcceptedBudget(t *testing.T) {
+	const capacity = uint64(1 << 30)
+	cgroup := newMemoryCgroup(t, "max", "1")
+	fakeCH := newFakeCHMemory(t, capacity)
+	fakeCH.configure(func(f *fakeCHMemory) {
+		f.acceptedTarget = 512 << 20
+		f.currentBudget = 512 << 20
+	})
+	reservation := &fakeReservationAdapter{current: 512 << 20, grantMax: 32 << 20}
+	m := newMemoryControllerForTest(t, fakeCH, cgroup, 512<<20, reservation)
+
+	m.controlMu.Lock()
+	err := m.processPressureLocked(context.Background(), pressureGrow{urgency: resource.UrgencyNormal, reason: "psi_some"})
+	floor := m.pressureFloor
+	m.controlMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reservation.ReservationMemory(); got != 544<<20 {
+		t.Fatalf("partial reservation = %d, want 544MiB", got)
+	}
+	if floor != 0 {
+		t.Fatalf("partial reservation established pressure floor %d before CH accepted a larger Budget", floor)
+	}
+	if got := fakeCH.calls(); len(got) != 0 {
+		t.Fatalf("partial reservation caused CH resize: %v", got)
+	}
+}
+
+func TestMemoryControllerPressureFailuresDoNotEstablishFloor(t *testing.T) {
+	const capacity = uint64(1 << 30)
+	for _, tc := range []struct {
+		name             string
+		reservationFails int
+		resizeFails      int
+		wantReservation  uint64
+		wantResizeCalls  int
+	}{
+		{name: "reservation_failure", reservationFails: 1, wantReservation: 512 << 20},
+		{name: "resize_failure", resizeFails: 1, wantReservation: 576 << 20, wantResizeCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cgroup := newMemoryCgroup(t, "max", "1")
+			fakeCH := newFakeCHMemory(t, capacity)
+			fakeCH.configure(func(f *fakeCHMemory) {
+				f.acceptedTarget = 512 << 20
+				f.currentBudget = 512 << 20
+				f.resizeFailures = tc.resizeFails
+			})
+			reservation := &fakeReservationAdapter{current: 512 << 20, failures: tc.reservationFails}
+			m := newMemoryControllerForTest(t, fakeCH, cgroup, 512<<20, reservation)
+
+			m.controlMu.Lock()
+			err := m.processPressureLocked(context.Background(), pressureGrow{urgency: resource.UrgencyNormal, reason: "psi_some"})
+			floor := m.pressureFloor
+			m.controlMu.Unlock()
+			if err == nil {
+				t.Fatal("injected pressure grow failure unexpectedly succeeded")
+			}
+			if floor != 0 {
+				t.Fatalf("failed pressure grow established pressure floor %d", floor)
+			}
+			if got := reservation.ReservationMemory(); got != tc.wantReservation {
+				t.Fatalf("reservation after failed grow = %d, want %d", got, tc.wantReservation)
+			}
+			if got := len(fakeCH.calls()); got != tc.wantResizeCalls {
+				t.Fatalf("resize calls = %d, want %d", got, tc.wantResizeCalls)
+			}
+		})
+	}
+}
+
+func TestMemoryControllerPressureFloorDoesNotBlockHigherGuestDemand(t *testing.T) {
+	const capacity = uint64(1 << 30)
+	cgroup := newMemoryCgroup(t, "max", "1")
+	fakeCH := newFakeCHMemory(t, capacity)
+	fakeCH.configure(func(f *fakeCHMemory) {
+		f.acceptedTarget = 512 << 20
+		f.currentBudget = 512 << 20
+	})
+	reservation := &fakeReservationAdapter{current: 512 << 20}
+	m := newMemoryControllerForTest(t, fakeCH, cgroup, 512<<20, reservation)
+
+	m.controlMu.Lock()
+	if err := m.processPressureLocked(context.Background(), pressureGrow{urgency: resource.UrgencyNormal, reason: "psi_some"}); err != nil {
+		m.controlMu.Unlock()
+		t.Fatal(err)
+	}
+	floor := m.pressureFloor
+	if err := m.processReportLocked(context.Background(), proto.MemReport{
+		Epoch: 1, Seq: 1, MemTotalBytes: capacity, MemAvailableBytes: 0,
+	}); err != nil {
+		m.controlMu.Unlock()
+		t.Fatal(err)
+	}
+	m.controlMu.Unlock()
+	if floor != 576<<20 {
+		t.Fatalf("pressure floor = %d, want 576MiB", floor)
+	}
+	if got := reservation.ReservationMemory(); got <= floor {
+		t.Fatalf("higher guest demand was blocked by pressure floor: reservation=%d floor=%d", got, floor)
+	}
+}
+
+func TestMemoryControllerStaleReportCannotCompletePressureRelief(t *testing.T) {
+	const capacity = uint64(1 << 30)
+	cgroup := newMemoryCgroup(t, "max", "1")
+	fakeCH := newFakeCHMemory(t, capacity)
+	fakeCH.configure(func(f *fakeCHMemory) {
+		f.acceptedTarget = 512 << 20
+		f.currentBudget = 512 << 20
+	})
+	reservation := &fakeReservationAdapter{current: 512 << 20}
+	m := newMemoryControllerForTest(t, fakeCH, cgroup, 512<<20, reservation)
+
+	m.controlMu.Lock()
+	if err := m.processPressureLocked(context.Background(), pressureGrow{urgency: resource.UrgencyNormal, reason: "psi_some"}); err != nil {
+		m.controlMu.Unlock()
+		t.Fatal(err)
+	}
+	if err := m.processReportLocked(context.Background(), proto.MemReport{
+		Epoch: 7, Seq: 1, MemTotalBytes: capacity, MemAvailableBytes: 512 << 20,
+	}); err != nil {
+		m.controlMu.Unlock()
+		t.Fatal(err)
+	}
+	floor := m.pressureFloor
+	m.controlMu.Unlock()
+	if m.pressureLowSeq != 1 || floor == 0 {
+		t.Fatalf("first low observation did not establish confirmation: floor=%d seq=%d", floor, m.pressureLowSeq)
+	}
+
+	m.reportMu.Lock()
+	m.reportsOpen = true
+	m.reportEpoch = 7
+	m.reportSeq = 1
+	m.reportMu.Unlock()
+	duplicate := proto.MemReport{Epoch: 7, Seq: 1, MemTotalBytes: capacity, MemAvailableBytes: 512 << 20}
+	if !m.SubmitGuestReport(duplicate) {
+		t.Fatal("duplicate report should be ACKed while being ignored")
+	}
+	if got := len(m.reportEvents); got != 0 {
+		t.Fatalf("duplicate report entered policy queue: %d", got)
+	}
+	if m.pressureFloor != floor || m.pressureLowSeq != 1 {
+		t.Fatalf("duplicate report changed pressure relief state: floor=%d/%d seq=%d", m.pressureFloor, floor, m.pressureLowSeq)
+	}
+
+	fresh := proto.MemReport{Epoch: 7, Seq: 2, MemTotalBytes: capacity, MemAvailableBytes: 512 << 20}
+	if !m.SubmitGuestReport(fresh) {
+		t.Fatal("fresh report rejected")
+	}
+	select {
+	case got := <-m.reportEvents:
+		m.controlMu.Lock()
+		err := m.processReportLocked(context.Background(), got)
+		m.controlMu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("fresh report did not enter policy queue")
+	}
+	if m.pressureFloor != 0 || m.pressureLowSeq != 0 {
+		t.Fatalf("fresh second low did not clear pressure relief state: floor=%d seq=%d", m.pressureFloor, m.pressureLowSeq)
+	}
+}
+
+func TestMemoryControllerPressureReliefStateIsTransient(t *testing.T) {
+	const capacity = uint64(1 << 30)
+	newController := func(t *testing.T) *MemoryController {
+		cgroup := newMemoryCgroup(t, "max", "1")
+		fakeCH := newFakeCHMemory(t, capacity)
+		fakeCH.configure(func(f *fakeCHMemory) {
+			f.acceptedTarget = 512 << 20
+			f.currentBudget = 512 << 20
+		})
+		return newMemoryControllerForTest(t, fakeCH, cgroup, 512<<20, &fakeReservationAdapter{current: 512 << 20})
+	}
+	old := newController(t)
+	old.pressureFloor = 576 << 20
+	old.pressureLowSeq = 9
+
+	fresh := newController(t)
+	if fresh.pressureFloor != 0 || fresh.pressureLowSeq != 0 {
+		t.Fatalf("fresh controller restored transient pressure relief state: floor=%d seq=%d", fresh.pressureFloor, fresh.pressureLowSeq)
+	}
+}
+
 func TestMemoryControllerAccumulatesPartialGrantBeforeDeflate(t *testing.T) {
 	const capacity = uint64(1 << 30)
 	cgroup := newMemoryCgroup(t, "1", "1")
