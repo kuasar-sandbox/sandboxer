@@ -8,8 +8,10 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -19,7 +21,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
+	runtimesdk "github.com/kuasar-sandbox/sandboxer/pkg/runtime"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
@@ -236,6 +238,13 @@ func runCmd(args []string) int {
 
 	// Resolve --run-root / --base-root (flag > env > default) first — the
 	// config-socket pidfile lives under run-root.
+	if stdioMode.TTY {
+		winch := make(chan os.Signal, 1)
+		signal.Notify(winch, syscall.SIGWINCH)
+		defer signal.Stop(winch)
+		stdioMode.WindowChanges = winch
+	}
+
 	rd := *runRoot
 	if rd == "" {
 		rd = os.Getenv("SANDBOX_RUN_ROOT")
@@ -329,7 +338,10 @@ func runCmd(args []string) int {
 	// Register once before Admit. The resulting context cancels controller work,
 	// while the same buffered signal stream is consumed later by ServeAndWait for
 	// CH forwarding/escalation. This closes the Admit -> CH-start registration gap.
-	ctx, stopRunSignals := sandbox.NotifyRunContext(context.Background())
+	runSignals := make(chan os.Signal, 4)
+	signal.Notify(runSignals, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(runSignals)
+	ctx, stopRunSignals := sandbox.RunSignalContext(context.Background(), runSignals)
 	defer stopRunSignals()
 
 	// Restore mode dispatch.
@@ -411,7 +423,7 @@ func runCmd(args []string) int {
 	return exit
 }
 
-// runRestore parses the snapshot reference and dispatches to restore.Run.
+// runRestore parses the snapshot reference and waits on the SDK restore owner.
 func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.FieldPresence, manifestCfg *config.ManifestConfig,
 	ref string, sandboxID, pathID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
@@ -459,7 +471,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 		snapshotPath = ref
 	}
 
-	exit, err := restore.Run(ctx, restore.Options{
+	runtime, err := runtimesdk.Restore(ctx, runtimesdk.RestoreSpec{
 		SnapshotPath:        snapshotPath,
 		SnapshotManifestKey: snapshotKey,
 		SnapshotRef:         snapshotRef,
@@ -483,6 +495,11 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 		Forwards:            forwards,
 		NotifyReadiness:     notifyReadiness,
 	})
+	if err != nil {
+		fmt.Fprintln(diagnostics, err)
+		return 1
+	}
+	exit, err := sandbox.WaitRun(ctx, runtime)
 	if err != nil {
 		fmt.Fprintln(diagnostics, err)
 		return 1

@@ -827,7 +827,7 @@ func openLayeredDiskBase(ctx context.Context, refs []string, opener restoreDiskS
 			return nil, fmt.Errorf("layer[%d] size %d conflicts with top size %d", i, stream.Size(), logicalSize)
 		}
 	}
-	return vhost.NewStreamReader(ctx, fetch.NewLayered(streams...), int64(logicalSize)), nil
+	return vhost.NewStreamReader(sandbox.VMLifecycleContext(ctx), fetch.NewLayered(streams...), int64(logicalSize)), nil
 }
 
 // openEROFSBlockReader exposes only the EROFS prefix of a flattened image or
@@ -1287,7 +1287,7 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			streams = append(streams, stream)
 		}
 		layered := fetch.NewLayered(streams...)
-		return vhost.NewStreamReader(ctx, layered, int64(logicalSize)), nil
+		return vhost.NewStreamReader(sandbox.VMLifecycleContext(ctx), layered, int64(logicalSize)), nil
 	}
 	validateWritable := func(field string, root *config.RootConfig, diskKey string) (retErr error) {
 		top, lowers := root.Base, root.BaseFromRefs

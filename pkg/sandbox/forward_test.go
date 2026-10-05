@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -338,5 +339,45 @@ func TestForwarderAbortAndDrainCancelsAdmittedExecContext(t *testing.T) {
 	case <-handlerDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("abort did not cancel and join the admitted exec handler")
+	}
+}
+
+func TestForwarderBorrowsListenerDescriptor(t *testing.T) {
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(t.TempDir(), "borrow.sock"), Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	file, err := listener.File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	f := NewForwarder("unused", func(string, ...any) {})
+	duplicate, err := f.listen(ForwardSpec{ListenFD: int(file.Fd())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := duplicate.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Stat(); err != nil {
+		t.Fatalf("caller descriptor closed: %v", err)
+	}
+}
+
+func TestForwarderPreservesExistingPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "caller-data")
+	if err := os.WriteFile(path, []byte("owned by caller"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f := NewForwarder("unused", func(string, ...any) {})
+	if ln, err := f.listen(ForwardSpec{UDSPath: path}); err == nil {
+		ln.Close()
+		t.Fatal("replaced caller path")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil || string(body) != "owned by caller" {
+		t.Fatalf("caller path changed: %q/%v", body, err)
 	}
 }

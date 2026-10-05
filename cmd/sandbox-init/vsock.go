@@ -200,7 +200,11 @@ func serveReverseChannelDynamic(listenFD int, sup *atomic.Pointer[supervisorStat
 		go func(fd int) {
 			c := &vsockConn{fd: fd}
 			current := sup.Load()
-			if handed := handleReverseConn(c, current, bridge); !handed {
+			localBridge := bridge
+			if current != nil {
+				localBridge = current.bridge
+			}
+			if handed := handleReverseConn(c, current, localBridge); !handed {
 				_ = c.Close()
 			}
 		}(nfd)
@@ -211,7 +215,16 @@ func serveReverseChannelDynamic(listenFD int, sup *atomic.Pointer[supervisorStat
 // iff the connection was handed to a mux.Session (restore / attach) and
 // must therefore NOT be closed by the caller; false for management
 // short-conns (ping / quiesce / unknown), which the caller closes.
-func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge) (handedToMUX bool) {
+func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge) bool {
+	return handleReverseConnShutdown(c, sup, bridge, func() {
+		if sup == nil {
+			doReboot()
+		} else {
+			_ = unix.Kill(unix.Getpid(), unix.SIGTERM)
+		}
+	})
+}
+func handleReverseConnShutdown(c *vsockConn, sup *supervisorState, bridge *consoleBridge, shutdown func()) (handedToMUX bool) {
 	// Per-conn handshake deadline: tight enough that a stuck host can't
 	// pin a goroutine forever, generous enough for quiesce (drop_caches +
 	// the MUX-close round-trip can take a few seconds). Cleared before a
@@ -225,6 +238,11 @@ func handleReverseConn(c *vsockConn, sup *supervisorState, bridge *consoleBridge
 		return false
 	}
 	switch req.Type {
+	case proto.TypeShutdown:
+		if err := proto.WriteMessage(c, &proto.Message{Type: proto.TypeAck}); err == nil {
+			shutdown()
+		}
+		return false
 	case proto.TypeUsageRequest:
 		guestUsage.serve(c, req)
 		return false

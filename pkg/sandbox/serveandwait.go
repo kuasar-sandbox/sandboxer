@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -94,6 +93,7 @@ type PostSpawnCtx struct {
 // callers (sandbox.Run / restore.Run) keep their own thin front-half
 // (config resolution, cgroup, controller admit) and converge here.
 type VMParams struct {
+	owner              *Runtime
 	Ctx                context.Context
 	SandboxID          string
 	BaseDir            string
@@ -230,6 +230,9 @@ type SnapDiskRef struct {
 // parts — config resolution, the CH cmdline, the post-spawn settle
 // protocol — stay in the callers via VMParams.BuildCmd / PostSpawn.
 func ServeAndWait(p VMParams) (int, error) {
+	if p.owner == nil {
+		p.owner, _ = p.Ctx.Value(runtimeOwnerKey{}).(*Runtime)
+	}
 	if err := p.Ctx.Err(); err != nil {
 		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
 	}
@@ -247,10 +250,23 @@ func ServeAndWait(p VMParams) (int, error) {
 	var usageSampler *usage.Sampler
 	usageError := ""
 	notifyReady := func() {
+
 		readiness.mu.Lock()
 		if firstReadFatal != nil {
 			readiness.mu.Unlock()
 			return
+		}
+		if r := p.owner; r != nil && r.deviceSet != nil && !r.commitLaunch() {
+			readiness.mu.Unlock()
+			return
+		}
+		if r := p.owner; r != nil && r.readyDone != nil {
+			r.mu.Lock()
+			if r.state == runtimeStarting {
+				r.state = runtimeRunning
+				r.readyOnce.Do(func() { close(r.readyDone) })
+			}
+			r.mu.Unlock()
 		}
 		if usageSampler != nil {
 			usageSampler.Ready()
@@ -314,13 +330,16 @@ func ServeAndWait(p VMParams) (int, error) {
 	// launch → restore → attach. muxLink guards the pair so the snapshot
 	// handler can re-attach (snapshot --resume) without racing teardown.
 	var muxLink guestlink.MUXLink
+	var stdioMu sync.RWMutex
+	stdioMode := p.StdioMode
+	currentStdio := func() stdio.Mode { stdioMu.RLock(); defer stdioMu.RUnlock(); return stdioMode }
 	reattach := func() error {
-		return muxLink.Reattach(backendCtx, &guestlink.HostClient{BasePath: vsockBase, Logf: logf}, p.StdioMode)
+		return muxLink.Reattach(backendCtx, &guestlink.HostClient{BasePath: vsockBase, Logf: logf}, currentStdio())
 	}
 	establishMUX := func(conn net.Conn, spec proto.StdioSpec) error {
 		ss := stdio.StreamSetFor(spec)
 		sess := mux.NewSession(conn, ss, mux.Options{})
-		cleanup, err := p.StdioMode.Bridge(backendCtx, sess, ss)
+		cleanup, err := currentStdio().Bridge(backendCtx, sess, ss)
 		if err != nil {
 			_ = sess.Close()
 			return err
@@ -434,6 +453,15 @@ func ServeAndWait(p VMParams) (int, error) {
 			s.Stop()
 		}
 	}
+	if p.owner != nil && p.owner.deviceSet != nil {
+		for i, b := range p.owner.deviceSet.DeviceBackends() {
+			if err := addServer(filepath.Join(runDir, fmt.Sprintf("blk%d.sock", i)), b, fmt.Sprintf("blk%d", i), "unbound", b.ReadOnly()); err != nil {
+				stopServers()
+				return -1, err
+			}
+		}
+	}
+
 	for _, d := range p.Disks {
 		if d.Overlay {
 			i := len(devs)
@@ -469,6 +497,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	launch := &guestlink.LaunchServer{
 		Path:              launchSock,
 		Spec:              p.LaunchSpec,
+		DeferLaunch:       p.owner != nil && p.owner.deviceSet != nil,
 		StartTimeout:      p.StartTimeout,
 		AppNotifyDeadline: p.AppNotifyDeadline,
 		Logf:              logf,
@@ -486,6 +515,12 @@ func ServeAndWait(p VMParams) (int, error) {
 		OnLaunchAck: func() {
 			if p.Memory != nil {
 				p.Memory.StartCold(p.Ctx)
+				p.Memory.StartSensor(p.Ctx)
+			}
+			if p.owner != nil && p.Hooks != nil {
+				if err := p.Hooks.Settled(); err != nil {
+					logf("settled: %v", err)
+				}
 			}
 		},
 		OnMemReport: func(report proto.MemReport) bool {
@@ -495,10 +530,24 @@ func ServeAndWait(p VMParams) (int, error) {
 			return true
 		},
 	}
+	if r := p.owner; r != nil && r.deviceSet != nil {
+		launch.OnLaunchFailure = func(err error) {
+			r.mu.Lock()
+			if r.launchFailure == nil {
+				r.launchFailure = err
+			}
+			r.mu.Unlock()
+			r.requestClose()
+		}
+	}
+
 	if p.WireLaunchMUX {
 		launch.OnMUXReady = func(conn net.Conn, established proto.StdioSpec) {
 			if err := establishMUX(conn, established); err != nil {
 				logf("stdio MUX bridge: %v", err)
+				if launch.OnLaunchFailure != nil {
+					launch.OnLaunchFailure(err)
+				}
 				return
 			}
 			logf("stdio MUX established (tty=%v stdin=%v stdout=%v stderr=%v)",
@@ -538,7 +587,7 @@ func ServeAndWait(p VMParams) (int, error) {
 			usageManager, usageErr = usage.Open(p.BaseDir, p.SandboxID, fmt.Sprintf("%x", epoch), time.Now(), sampleInterval, flushInterval)
 		}
 		if usageErr == nil {
-			usageSampler, usageErr = usage.NewSampler(usageManager, p.SnapCfg.Resources.Capacity.CPU, len(p.Disks), pinger.Client, p.Balloon, nil)
+			usageSampler, usageErr = usage.NewSampler(usageManager, p.SnapCfg.Resources.Capacity.CPU, logicalDiskCount(p), pinger.Client, p.Balloon, nil)
 		}
 		if usageErr != nil {
 			// A failed sampler has released the freshly opened manager without
@@ -639,12 +688,29 @@ func ServeAndWait(p VMParams) (int, error) {
 			return ctl.Response{SandboxID: p.SandboxID, Usage: body}, err
 		},
 		SnapshotHandler: func(req ctl.Request) (ctl.Response, error) {
+			if p.owner != nil {
+				if err := p.owner.requireRunning(); err != nil {
+					return ctl.Response{}, err
+				}
+			}
 			return snapHandler.handle(req, cgroupPath, chExited)
 		},
 		ExportHandler: func(req ctl.Request) (ctl.Response, error) {
+			if p.owner != nil {
+				if err := p.owner.requireRunning(); err != nil {
+					return ctl.Response{}, err
+				}
+			}
 			return snapHandler.handleExport(req, cgroupPath, chExited)
 		},
 		ExecHandler: func(conn net.Conn, req ctl.Request) {
+			if p.owner != nil {
+				if err := p.owner.requireRunning(); err != nil {
+					defer conn.Close()
+					_ = ctl.WriteMessage(conn, ctl.Response{Type: ctl.TypeError, Msg: err.Error()})
+					return
+				}
+			}
 			execCtx, admitted := forwarder.beginExec(backendCtx, conn)
 			if !admitted {
 				defer conn.Close()
@@ -655,6 +721,98 @@ func ServeAndWait(p VMParams) (int, error) {
 			guestlink.ServeExecRequest(execCtx, conn, req, vsockBase, logf)
 		},
 	}
+	if r := p.owner; r != nil {
+		r.mu.Lock()
+		r.launch = launch
+		r.runDir = runDir
+		r.stats = func() (ctl.Response, error) { return ctlSrv.ResourceStatsHandler(ctl.Request{}) }
+		r.snapshot = func(ctx context.Context, req ctl.Request) (ctl.Response, error) {
+			op, cancel := context.WithCancel(ctx)
+			stop := context.AfterFunc(backendCtx, cancel)
+			defer cancel()
+			defer stop()
+			return snapHandler.handleContext(op, req, cgroupPath, chExited)
+		}
+		r.export = func(ctx context.Context, req ctl.Request) (ctl.Response, error) {
+			op, cancel := context.WithCancel(ctx)
+			stop := context.AfterFunc(backendCtx, cancel)
+			defer cancel()
+			defer stop()
+			return snapHandler.handleExportContext(op, req, cgroupPath, chExited)
+		}
+		r.execSession = func(ctx context.Context, spec *proto.ExecSpec) (net.Conn, proto.StdioSpec, error) {
+			client, relay := net.Pipe()
+			op, admitted := forwarder.beginExec(ctx, relay)
+			if !admitted {
+				client.Close()
+				relay.Close()
+				return nil, proto.StdioSpec{}, errors.New("exec unavailable during capture")
+			}
+			stop := context.AfterFunc(backendCtx, func() { relay.Close() })
+			conn, est, err := guestlink.OpenExec(op, pinger.Client, spec)
+			if err != nil {
+				stop()
+				client.Close()
+				relay.Close()
+				forwarder.endExec(relay)
+				return nil, proto.StdioSpec{}, err
+			}
+			go func() { defer stop(); defer forwarder.endExec(relay); guestlink.RelayExec(op, relay, conn) }()
+			return client, est, nil
+		}
+		r.installLaunch = func(cfg *config.SandboxConfig, c0 *config.PortableSandboxConfig, spec LaunchSpec, disks []DiskBackend, ls *proto.LaunchSpec) error {
+			var backends []vhost.Backend
+			var refs []SnapDiskRef
+			for _, d := range disks {
+				d.Cow.SetFatalHandler(reportReadFatal)
+				if err := d.Cow.Err(); err != nil {
+					return err
+				}
+				if d.Overlay {
+					backends = append(backends, &vhost.ReadOnlyBackend{R: d.Reader})
+				}
+				backends = append(backends, &vhost.CowBackend{C: d.Cow})
+				refs = append(refs, SnapDiskRef{DiffPath: d.DiffPath, OwnedDiff: d.OwnedDiff, Size: d.Cow.Size(), SnapshotView: d.Cow.SnapshotView, CheckError: d.Cow.Err})
+			}
+			snapHandler.Cfg = cfg
+			snapHandler.PortableConfig = c0
+			snapHandler.SourceBinding = spec.SourceBinding
+			snapHandler.ManifestCfg = spec.ManifestConfig
+			snapHandler.Fetcher = launchFetcher(spec)
+			snapHandler.BundleReader = spec.BundleReader
+			snapHandler.BundleFetcher = spec.BundleFetcher
+			snapHandler.RefLocations = spec.RefLocations
+			snapHandler.CustomerKeyFn = launchKey(spec)
+			snapHandler.LocalCodec = launchCodec(spec)
+			snapHandler.LocalRequired = launchRequired(spec)
+			snapHandler.Disks = refs
+			stdioMu.Lock()
+			stdioMode = spec.Stdio
+			r.consoleTTY.Store(spec.Stdio.TTY)
+			stdioMu.Unlock()
+			launch.StartTimeout = cfg.StartTimeoutDuration()
+			if err := forwarder.Start(backendCtx, spec.Forwards); err != nil {
+				return err
+			}
+			if err := r.deviceSet.Bind(backends); err != nil {
+				return err
+			}
+			index := 0
+			for _, d := range disks {
+				if d.Overlay {
+					servers[index].Stats().SetOrigin(d.BasePath)
+					index++
+				}
+				servers[index].Stats().SetOrigin(d.DiffPath)
+				index++
+			}
+			// Publish launch only after every backend and its capture provenance exists.
+			return launch.SetSpec(ls)
+		}
+		r.mu.Unlock()
+		// No cleanup may race launch resource construction or publication.
+	}
+
 	if err := ctlSrv.Listen(); err != nil {
 		stopServers()
 		return -1, fmt.Errorf("ctl.sock listen: %w", err)
@@ -755,15 +913,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	// sandbox-ctl registers this stream before Admit so an early shutdown cannot
 	// fall between admission and CH signal registration. Library callers without
 	// that context retain the original local registration behavior.
-	var sigCh <-chan os.Signal
-	if inherited := runSignalsFromContext(p.Ctx); inherited != nil {
-		sigCh = inherited
-	} else {
-		localSignals := make(chan os.Signal, 4)
-		signal.Notify(localSignals, syscall.SIGTERM, syscall.SIGINT)
-		defer signal.Stop(localSignals)
-		sigCh = localSignals
-	}
+	sigCh := runSignalsFromContext(p.Ctx)
 
 	// A shutdown received while BuildCmd or any preceding setup was in flight
 	// must not create a new VM. The retained signal is consumed below only when
@@ -796,7 +946,12 @@ func ServeAndWait(p VMParams) (int, error) {
 		var info unix.Siginfo
 		waitIDErr := observeCHExit(func() error {
 			return unix.Waitid(unix.P_PID, chPid, &info, unix.WEXITED|unix.WNOWAIT, nil)
-		}, func() { chExitObserved.Store(true) }, func(ctx context.Context) {
+		}, func() {
+			chExitObserved.Store(true)
+			if p.owner != nil {
+				p.owner.stopForExit()
+			}
+		}, func(ctx context.Context) {
 			if usageSampler != nil {
 				usageSampler.FinalCH(ctx)
 			}
@@ -805,11 +960,18 @@ func ServeAndWait(p VMParams) (int, error) {
 			logf("CH exit waitid: %v", waitIDErr)
 		}
 		waitErr := cmd.Wait()
+		if p.owner != nil {
+			p.owner.stopForExit()
+		}
 		cancelPostSpawn()
 		cancelBackends()
 		markCHExited()
 		doneCh <- waitErr
 	}()
+
+	if r := p.owner; r != nil {
+		defer func() { r.stopForExit(); r.workMu.Lock(); r.workMu.Unlock(); r.opsWG.Wait() }()
+	}
 
 	// PingFatalThreshold wiring: when the threshold is hit (opt-in),
 	// SIGTERM CH so cmd.Wait returns; waitForCHWithSignalEscalation then
@@ -925,4 +1087,11 @@ func startCH(cmd *exec.Cmd, netnsFile *os.File) error {
 		errCh <- cmd.Start()
 	}()
 	return <-errCh
+}
+
+func logicalDiskCount(p VMParams) int {
+	if p.owner != nil && p.owner.deviceSet != nil {
+		return len(p.owner.spec.Disks)
+	}
+	return len(p.Disks)
 }

@@ -76,6 +76,9 @@ func TestPrepareDiffPreservesTemplateAndExistingLogicalCapacity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if logical, err := vhost.DiffSourceCapacity(target, false, options(tc.encryptedTarget)...); err != nil || logical != size {
+				t.Fatalf("runtime capacity projection=%d/%v", logical, err)
+			}
 			if tc.encryptedTarget && info.Size() <= size {
 				t.Fatal("encrypted physical size did not include its header")
 			}

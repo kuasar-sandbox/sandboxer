@@ -2,7 +2,7 @@
 
 # sandbox — Sandbox control and artifact lifecycle
 
-`sandbox-ctl` is kuasar-sandbox's host control plane for one sandbox. It handles explicit cold starts, cold starts from Sandbox artifacts, memory restore, live export, image-to-Sandbox-E assembly without a VM, memory snapshots, artifact publication, and runtime `exec`/forwarding. The guest protocol is documented in [sandbox-init.md](sandbox-init.md).
+`pkg/runtime` is kuasar-sandbox's Go SDK for one sandbox; `sandbox-ctl` is its command-line adapter. It handles explicit cold starts, cold starts from Sandbox artifacts, memory restore, live export, image-to-Sandbox-E assembly without a VM, memory snapshots, artifact publication, and runtime `exec`/forwarding. The guest protocol is documented in [sandbox-init.md](sandbox-init.md).
 
 This document describes the current format and behavior. The current reader rejects the old `snapshot.cfg` disk-graph schema; it provides no dual reader, automatic migration, or cross-version compatibility guarantee. This format boundary does not mean that the project has never published releases.
 
@@ -953,7 +953,7 @@ S.sandbox_ref -> E.sandbox.runtime.cfg
   + allowed restore host bindings = C0 for run --restore
 ```
 
-C0 is written in the run directory before VM side effects and its bytes remain unchanged thereafter. The live runtime separately holds a nonserialized `RunSourceBinding`:
+C0 is written in the run directory once complete launch inputs are known, before workload consumption; its bytes remain unchanged thereafter. A base runtime has no incomplete placeholder C0. The live runtime separately holds a nonserialized `RunSourceBinding`:
 
 - The source E/root artifact corresponding to the current `self`.
 - Root payload and optional image configuration.
@@ -1451,24 +1451,104 @@ termination, not physical power loss.
 
 ## 5. Cold start and `run --from`
 
-### 5.1 Explicit cold start
+### 5.1 Runtime SDK and explicit cold start
 
-The ordinary `run --config` preparation and launch sequence is:
+The first-class Go API is [`pkg/runtime`](../pkg/runtime/runtime.go):
 
-```text
-T0 parse/merge/validate config and limits
-T1 open/check immutable refs and image defaults; derive kernel/runtime identities
-T2 project portable C0 and validate exactly one self
-T3 preflight active diff requirements and source binding
-T4 create run directory and atomically write sandbox.runtime.cfg once
-T5 acquire controller/cgroup resources; materialize active diffs and network binding
-T6 construct vhost block devices from payload-only streams
-T7 spawn/configure CH
-T8 launch sandbox-init spec and app
-T9 establish MUX/pinger/forward/resource lifecycle
+```go
+StartRuntime(ctx, RuntimeSpec) (*Runtime, error)
+(*Runtime).Launch(ctx, LaunchSpec) error
+Start(ctx, SandboxSpec) (*Runtime, error)
+Restore(ctx, RestoreSpec) (*Runtime, error)
 ```
 
-Predictable config/ref/format failures are intended to fail in preflight before controller/network/VM side effects. This does not promise that every later operation is side-effect-free: creating the run directory, writing C0, creating diffs, and acquiring resources are explicit subsequent steps that can fail and require cleanup. Kernel/runtime verification differs for an existing portable C0 as explained in [PortableSandboxConfig](sandbox.md#portable-config).
+`Start` uses `StartRuntime` followed by `Launch` and closes its internal owner if
+launch fails. `Restore` reconstructs snapshot memory, CPU/device state and the
+workload directly, returning the same live owner after the existing restore ACK
+and MUX barrier. It never cold-boots first or requires `runtime_ready` from an
+older snapshot. The CLI converts its existing config/`--from` inputs into this
+SDK; cross-process administrative commands retain the local control transport.
+
+`RuntimeSpec` contains kernel/Bundle bindings, CPU/memory and resource policy,
+host TAP/provider/namespace requirements, console/control settings and ordered
+`RuntimeDiskSpec` entries. Each logical disk fixes its name, single/overlay
+layout and logical capacities. Overlay expands to a read-only base followed by
+a writable upper; single expands to one writable device. The existing minimal
+virtio feature profile is fixed for all devices. No device hotplug is involved.
+
+`LaunchSpec` owns workload root/data artifact references and writable paths,
+guest IP/MTU/routes/hostname/interface, mounts, persistent and ephemeral files,
+init actions, complete process configuration (including plugins, user, restart,
+PID namespace and cgroup delegation), stdio, forwards and artifact access.
+`LaunchSpecFromConfig` preserves the complete configuration ABI.
+`Credentials` uses `ArtifactCredentials{Config, CustomerKey}` to create owned
+storage without consulting or changing environment variables. Alternatively,
+`Storage`, `Fetcher` and Bundle selectors are borrowed and must remain open and
+unchanged until `Wait` returns. SDK-created readers, storage and automatic diffs
+are released by the runtime. Caller-specified diff/template paths are not
+deleted; inherited cgroup and forwarding descriptors are borrowed or duplicated.
+Kernel/Bundle paths and artifact inputs must remain readable and immutable for
+their borrowed lifetime. TAP handoff descriptors received by the SDK are runtime-owned. A forwarding
+socket path must be unused; binding fails rather than removing an existing path.
+
+Base startup establishes unbound devices before CH boots. Their metadata is
+available, but data requests promptly complete IOERR. An unbound request never
+fabricates zeros, retries indefinitely or becomes a runtime-fatal storage error.
+Launch prepares and validates every backend before one atomic binding-set
+publication. Each segmented virtio request pins one binding view. Only after
+publication does the guest assemble the workload root and switch root. COW
+writeback fatal hooks, context-aware I/O, statistics and snapshot views continue
+through the bound backends.
+
+`Launch` accepts only one workload. Pure input/state validation may reject
+without consuming the opportunity. Once `launching` begins, failure or
+cancellation terminates the runtime; another workload cannot replace it. The
+acknowledged `app_started` transition commits launch success against Close,
+cancellation and CH exit. This retains existing startup readiness: it does not
+prove target execve success or application health. Waiting for assignment after
+`runtime_ready` is outside the launch execution timeout. Base runtimes retain
+resource reservations, controller heartbeat and resource stats, but do not
+report workload ready or Settled before launch.
+
+Operation contexts bound startup, launch, restore, live operations and individual
+waits. Canceling a successfully completed startup/launch context cannot kill the
+returned runtime or invalidate later lazy reads. `Wait(ctx)` cancellation only
+cancels that wait. Repeated waits observe one retained `ExitResult` after cleanup;
+concurrent, idempotent `Close` requests graceful VMM shutdown through one owner,
+keeping backends alive until CH exits and joining owned work before releasing
+storage. The SDK installs no OS signal handlers. The CLI registers SIGTERM and
+SIGINT and retains second-signal escalation. It also supplies SIGWINCH through
+`stdio.Mode.WindowChanges`; the SDK consumes that channel without registering
+signals. Cleanup cancels and joins idle input pumps without closing inherited
+stdin. An input descriptor has one consumer while bridged.
+
+Live `Exec`, `Snapshot`, `Export` and `Stats` call the owner directly. Exec returns
+a caller-owned guest MUX connection and its negotiated stdio spec. Capture uses
+the existing `ctl.Request` options and E/S output schema without CLI serialization.
+Exec and capture require a running workload; resource stats also work in the
+base state. No scheduling, placement or runtime pool policy is included.
+
+The normal CLI adapter preflights known workload inputs before starting the base
+runtime. A caller using the split API supplies them later:
+
+```text
+StartRuntime: validate shape and boot bindings
+  -> reserve resources and acquire host network
+  -> create memfd/UFFD, fixed unbound vhost devices and control servers
+  -> spawn CH -> guest base initialization -> runtime_ready
+Launch: resolve inputs and form complete immutable portable C0/provenance
+  -> prepare all storage -> validate all devices -> publish bindings
+  -> send launch -> assemble workload root -> switch root/configure
+  -> launch_ack/MUX -> app_started/ready
+Close or exit: reap CH -> drain owned services/work -> close retained resources
+```
+
+Predictable config/ref/format failures in the CLI preflight still fail before VM
+side effects. Split launch necessarily resolves workload artifacts after the base
+VM exists. C0 is written once when complete launch inputs are known, before the
+guest consumes the workload, and remains unchanged. Kernel/runtime verification
+for an existing portable C0 retains the rules in
+[PortableSandboxConfig](sandbox.md#portable-config).
 
 ### 5.2 CH command-line boundary
 
@@ -2303,6 +2383,44 @@ promise and no silent buffered retry.
 The original error is latched and the owner notified before cleanup I/O. While rollback runs, active-I/O ownership, frozen pages and their quotas remain held so Close cannot release the file or buffers early. Cleanup errors are joined afterward without masking the original failure.
 
 ## 12. Validation, errors, and security
+
+### 12.0 Runtime SDK lifecycle validation
+
+Run `go test ./...` and `go test -race ./...`. The SDK regressions in
+[`runtime_sdk_test.go`](../pkg/sandbox/runtime_sdk_test.go) use real child processes
+and Unix sockets to check ownership, base/launch gates, cancellation, concurrent
+Close, retained Wait, failed launch/stdio, late artifact reads, and disk payload
+boundaries. They do not boot a Guest kernel. The vhost binding tests exercise
+unbound IOERR, atomic publication and in-flight segmented requests; guest socket
+tests exercise base ping/shutdown and rejection of workload-only operations.
+
+Real VM acceptance requires a matching rebuilt sandbox-init/runtime Bundle,
+patched Cloud Hypervisor, kernel, root privileges, `/dev/kvm`, prepared binaries
+and E2E image. Run the prepared owner cases `sandbox.launch`, `sandbox.stdio`,
+`sandbox.disks`, `sandbox.diff-template`, `sandbox.encrypted-diff`,
+`sandbox.memory-budget`, `snapshot.capture`, `snapshot.restore`,
+`snapshot.restore-config`, `snapshot.disks`, `snapshot.encrypted-diff` and
+`snapshot.read-recovery`. Also exercise split SDK startup with a delayed Launch:
+base pings/stats must stay live, all disks must bind together, and workload mount,
+exec and capture must remain unavailable before Launch. Restore a snapshot created
+by the previous guest implementation to check that restore needs no cold hello.
+An absent KVM or prepared-product prerequisite is missing validation, not success.
+
+The opt-in [`TestKVMRuntimeLaunch`](../pkg/runtime/kvm_test.go) boots a real Guest,
+checks base ping/stats during delayed Launch, rejects base exec, and cancels each
+successful operation context before checking the live owner. Supply a local
+configuration with `launch.placeholder: true`, matching rebuilt boot artifacts
+and a private, already configured TAP if networking is enabled:
+
+```bash
+SANDBOX_SDK_KVM_CONFIG=/path/to/private-placeholder.yaml \
+SANDBOX_SDK_KVM_CH="$BIN/cloud-hypervisor" \
+go test ./pkg/runtime -run '^TestKVMRuntimeLaunch$' -v -count=1 -timeout=3m
+```
+
+Without these environment inputs the test explicitly skips; it does not replace
+the owner snapshot/restore, disk and stdio acceptance cases above.
+
 
 ### 12.1 Cold validation
 

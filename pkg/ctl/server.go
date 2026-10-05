@@ -33,6 +33,9 @@ type Server struct {
 
 	Logf func(string, ...any)
 
+	connsMu  sync.Mutex
+	conns    map[net.Conn]struct{}
+	connsWG  sync.WaitGroup
 	listener *net.UnixListener
 	stopOnce sync.Once
 	stopped  chan struct{}
@@ -47,6 +50,7 @@ func (s *Server) Listen() error {
 		s.Logf = func(string, ...any) {}
 	}
 	s.stopped = make(chan struct{})
+	s.conns = make(map[net.Conn]struct{})
 	_ = os.Remove(s.Path)
 	addr, err := net.ResolveUnixAddr("unix", s.Path)
 	if err != nil {
@@ -74,12 +78,28 @@ func (s *Server) Serve(ctx context.Context) error {
 		if err != nil {
 			select {
 			case <-s.stopped:
+				s.connsWG.Wait()
 				return nil
 			default:
 				return fmt.Errorf("ctl.sock accept: %w", err)
 			}
 		}
-		go s.handle(conn)
+		s.connsMu.Lock()
+		select {
+		case <-s.stopped:
+			s.connsMu.Unlock()
+			conn.Close()
+			continue
+		default:
+		}
+		s.conns[conn] = struct{}{}
+		s.connsWG.Add(1)
+		s.connsMu.Unlock()
+		go func() {
+			defer s.connsWG.Done()
+			defer func() { s.connsMu.Lock(); delete(s.conns, conn); s.connsMu.Unlock() }()
+			s.handle(conn)
+		}()
 	}
 }
 
@@ -87,6 +107,11 @@ func (s *Server) Serve(ctx context.Context) error {
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() {
 		close(s.stopped)
+		s.connsMu.Lock()
+		for conn := range s.conns {
+			_ = conn.Close()
+		}
+		s.connsMu.Unlock()
 		if s.listener != nil {
 			_ = s.listener.Close()
 		}

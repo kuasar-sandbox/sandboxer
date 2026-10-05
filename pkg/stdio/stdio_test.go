@@ -3,6 +3,8 @@ package stdio
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -216,5 +218,33 @@ func TestBridgePipeStdout(t *testing.T) {
 	}
 	if string(got) != payload {
 		t.Fatalf("got %q want %q", got, payload)
+	}
+}
+
+func TestBorrowedInputCancellationDoesNotCloseDescriptor(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+	defer write.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- copyInput(ctx, io.Discard, read) }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("idle input pump leaked")
+	}
+	if _, err := write.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	var got [1]byte
+	if _, err := read.Read(got[:]); err != nil || got[0] != 'x' {
+		t.Fatalf("borrowed descriptor changed: %q/%v", got, err)
 	}
 }

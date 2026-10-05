@@ -1027,3 +1027,26 @@ func releaseDiffScratch(scratch *diffScratch) {
 		diffScratchPool.Put(scratch)
 	}
 }
+
+// DiffSourceCapacity authenticates and reads logical capacity without opening
+// a writable backend or provisioning any files. Templates retain the existing plaintext-allowed provisioning policy.
+func DiffSourceCapacity(path string, template bool, rawOptions ...BlockCOWOption) (int64, error) {
+	options, err := parseBlockCOWOptions(rawOptions)
+	if err != nil {
+		return 0, err
+	}
+	if template {
+		source, err := openDiffTemplate(path, options.encryption)
+		if err != nil {
+			return 0, err
+		}
+		size := source.Size()
+		return int64(size), source.Close()
+	}
+	file, err := openExistingDiffFile(path, options.encryption, options.required, true)
+	if err != nil {
+		return 0, err
+	}
+	size := file.logicalSize
+	return size, file.Close()
+}

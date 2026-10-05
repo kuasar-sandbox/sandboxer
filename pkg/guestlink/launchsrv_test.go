@@ -490,7 +490,7 @@ func TestLaunchServerDeferredStopUnblocksHello(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready"}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -503,5 +503,62 @@ func TestLaunchServerDeferredStopUnblocksHello(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("deferred hello stranded Serve shutdown")
+	}
+}
+
+func TestDeferredRequiresExplicitRuntimeReady(t *testing.T) {
+	srv := &LaunchServer{Path: filepath.Join(t.TempDir(), "launch.sock"), DeferLaunch: true}
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+	defer func() { srv.Stop(); <-done }()
+	conn, err := net.Dial("unix", srv.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "ready"})
+	response, err := proto.ReadMessage(conn)
+	if err != nil || response.Type != proto.TypeError {
+		t.Fatalf("old hello=%+v/%v", response, err)
+	}
+	select {
+	case <-srv.RuntimeReady():
+		t.Fatal("old hello promised base readiness")
+	default:
+	}
+}
+
+func TestDeferredStopJoinsBlockedLaunchAck(t *testing.T) {
+	srv := &LaunchServer{Path: filepath.Join(t.TempDir(), "launch.sock"), DeferLaunch: true}
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+	conn, err := net.Dial("unix", srv.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready"})
+	<-srv.RuntimeReady()
+	if err := srv.SetSpec(&proto.LaunchSpec{Exec: "/app"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proto.ReadMessage(conn); err != nil {
+		t.Fatal(err)
+	}
+	srv.Stop()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("unbounded launch_ack read stranded cleanup")
 	}
 }

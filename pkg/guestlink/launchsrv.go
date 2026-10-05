@@ -39,8 +39,9 @@ type LaunchServer struct {
 	// DeferLaunch keeps the guest hello connection parked until SetSpec publishes
 	// the one workload this runtime will execute. The hello itself is the
 	// runtime-ready barrier; the launch timeout starts only after publication.
-	DeferLaunch bool
-	Logf        func(string, ...any)
+	DeferLaunch     bool
+	OnLaunchFailure func(error)
+	Logf            func(string, ...any)
 
 	// StartTimeout bounds the wait for launch_ack after the launch spec is
 	// sent. The guest sends launch_ack only after applying the whole spec
@@ -95,7 +96,9 @@ type LaunchServer struct {
 	stopped        chan struct{}
 	helloDone      chan struct{}
 	helloOnce      sync.Once
+	helloClaim     atomic.Bool
 	helloSent      atomic.Bool
+	muxReady       chan struct{}
 	runtimeReady   chan struct{}
 	runtimeOnce    sync.Once
 	launchReady    chan struct{}
@@ -104,6 +107,8 @@ type LaunchServer struct {
 	appStartedDone chan struct{}
 	appStartedOnce sync.Once
 	launchAckOnce  sync.Once
+	connsMu        sync.Mutex
+	conns          map[net.Conn]struct{}
 	connsWG        sync.WaitGroup
 }
 
@@ -118,8 +123,10 @@ func (s *LaunchServer) Listen() error {
 		s.Logf = func(string, ...any) {}
 	}
 	s.stopped = make(chan struct{})
+	s.conns = make(map[net.Conn]struct{})
 	s.helloDone = make(chan struct{})
 	s.runtimeReady = make(chan struct{})
+	s.muxReady = make(chan struct{})
 	s.launchReady = make(chan struct{})
 	s.launchAckDone = make(chan struct{})
 	s.appStartedDone = make(chan struct{})
@@ -164,9 +171,20 @@ func (s *LaunchServer) Serve(ctx context.Context) error {
 				return fmt.Errorf("launchsrv: accept: %w", err)
 			}
 		}
+		s.connsMu.Lock()
+		select {
+		case <-s.stopped:
+			s.connsMu.Unlock()
+			conn.Close()
+			continue
+		default:
+		}
+		s.conns[conn] = struct{}{}
 		s.connsWG.Add(1)
+		s.connsMu.Unlock()
 		go func() {
 			defer s.connsWG.Done()
+			defer func() { s.connsMu.Lock(); delete(s.conns, conn); s.connsMu.Unlock() }()
 			if keep := s.handleConn(conn); !keep {
 				_ = conn.Close()
 			}
@@ -233,6 +251,25 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 
 	switch msg.Type {
 	case proto.TypeHello:
+		if s.DeferLaunch && msg.Phase != "runtime_ready" {
+			err := errors.New("guest does not support runtime_ready")
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+			if s.OnLaunchFailure != nil {
+				s.OnLaunchFailure(err)
+			}
+			return false
+		}
+		if !s.helloClaim.CompareAndSwap(false, true) {
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "hello already in progress"})
+			return false
+		}
+		defer s.helloClaim.Store(false)
+		sent, completed := false, false
+		defer func() {
+			if s.DeferLaunch && sent && !completed && s.OnLaunchFailure != nil {
+				s.OnLaunchFailure(errors.New("guest launch handshake failed"))
+			}
+		}()
 		s.runtimeOnce.Do(func() { close(s.runtimeReady) })
 		if s.helloSent.Load() {
 			s.Logf("launch: duplicate hello rejected")
@@ -257,6 +294,7 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 			return false
 		}
 		s.Logf("launch: sending launch spec")
+		sent = true
 		if err := proto.WriteMessage(conn, &proto.Message{
 			Type:   proto.TypeLaunch,
 			Launch: spec,
@@ -302,6 +340,7 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 			s.Logf("launch: write ack: %v", err)
 			return false
 		}
+		completed = true
 		// Hand the connection off as the stdio MUX (docs/sandbox-runtime
 		// .md §4.5). Drop the handshake deadline first.
 		if s.OnMUXReady != nil {
@@ -309,15 +348,21 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 			var spec proto.StdioSpec
 			if ack.Stdio != nil {
 				spec = *ack.Stdio
-			} else if s.Spec != nil {
-				spec = s.Spec.Stdio
+			} else if launchSpec := s.launchSpec(); launchSpec != nil {
+				spec = launchSpec.Stdio
 			}
 			s.OnMUXReady(conn, spec)
+			close(s.muxReady)
 			return true
 		}
+		close(s.muxReady)
 		return false
 
 	case proto.TypeLaunchAck:
+		if s.DeferLaunch {
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "launch_ack requires launch connection"})
+			return false
+		}
 		// Legacy fresh-connection launch_ack (sandbox-init now always
 		// sends it on the hello conn). Kept as a defensive fallback.
 		s.Logf("launch: launch_ack received (standalone conn)")
@@ -331,6 +376,19 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 		return false
 
 	case proto.TypeAppStarted:
+		if s.DeferLaunch {
+			select {
+			case <-s.launchAckDone:
+				select {
+				case <-s.muxReady:
+				case <-s.stopped:
+					return false
+				}
+			default:
+				_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "workload has not launched"})
+				return false
+			}
+		}
 		s.Logf("launch: app_started pid=%d", msg.PID)
 		if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck}); err != nil {
 			s.Logf("launch: write app_started ack: %v", err)
@@ -381,6 +439,11 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 func (s *LaunchServer) Stop() {
 	s.stopOnce.Do(func() {
 		close(s.stopped)
+		s.connsMu.Lock()
+		for conn := range s.conns {
+			_ = conn.Close()
+		}
+		s.connsMu.Unlock()
 		if s.listener != nil {
 			_ = s.listener.Close()
 		}

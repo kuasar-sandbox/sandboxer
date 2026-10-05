@@ -147,11 +147,9 @@ func main() {
 		die("phase 2 fork: %v", err)
 	}
 	logf("phase2: app forked pid=%d", appPid)
-	if err := notifyAppStarted(appPid); err != nil {
-		logf("warn: app_started notify failed (continuing): %v", err)
-	}
 
 	sup := &supervisorState{
+		bridge:     bridge,
 		spec:       spec,
 		stopSignal: syscall.Signal(spec.StopSignal),
 		stopGrace:  time.Duration(spec.StopGraceSec) * time.Second,
@@ -164,6 +162,9 @@ func main() {
 	sup.appBackoff.onStart(time.Now())
 	sup.pluginReg.start(spec.Plugins)
 	supervisor.Store(sup)
+	if err := notifyAppStarted(appPid); err != nil {
+		logf("warn: app_started notify failed (continuing): %v", err)
+	}
 	go runMemReporter(memReportInterval)
 	phase3Supervise(sup, bridge, sigCh)
 	// phase3Supervise does not return.
@@ -584,6 +585,7 @@ func phase2ForkApp(spec *proto.LaunchSpec, cs childStdio, firstPrimary bool, onS
 // supervisorState is shared between the signal loop and the reverse
 // channel goroutine.
 type supervisorState struct {
+	bridge     *consoleBridge    // immutable when published to the base control dispatcher
 	appPid     atomic.Int64      // current app pid; updated on in-place restart
 	spec       *proto.LaunchSpec // app launch spec (incl. Restart) for re-fork on restart
 	appBackoff backoff           // app restart backoff (shared scheme, supervise.go)

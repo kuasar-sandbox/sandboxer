@@ -129,6 +129,13 @@ func execCmd(args []string) int {
 		return 2
 	}
 
+	if stdioMode.TTY {
+		winch := make(chan os.Signal, 1)
+		signal.Notify(winch, syscall.SIGWINCH)
+		defer signal.Stop(winch)
+		stdioMode.WindowChanges = winch
+	}
+
 	rd := *runRoot
 	if rd == "" {
 		rd = os.Getenv("SANDBOX_RUN_ROOT")

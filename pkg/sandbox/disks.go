@@ -48,7 +48,7 @@ func OpenBlockReaderWithOpener(ctx context.Context, uri string, fetcher fetch.Fe
 	if err != nil {
 		return nil, 0, err
 	}
-	return vhost.NewStreamReader(ctx, stream, size), size, nil
+	return vhost.NewStreamReader(VMLifecycleContext(ctx), stream, size), size, nil
 }
 
 // OpenRootImageBlockReaderWithOpener opens the read-only root EROFS image and
@@ -62,7 +62,7 @@ func OpenRootImageBlockReaderWithOpener(ctx context.Context, uri string, fetcher
 		return nil, 0, err
 	}
 	if provider, ok := stream.(interface{ ImageConfigBytes() []byte }); ok && provider.ImageConfigBytes() != nil {
-		return vhost.NewStreamReader(ctx, stream, size), size, nil
+		return vhost.NewStreamReader(VMLifecycleContext(ctx), stream, size), size, nil
 	}
 	image, err := sandboxfile.OpenEROFSArtifact(ctx, stream)
 	if err != nil {
@@ -73,7 +73,7 @@ func OpenRootImageBlockReaderWithOpener(ctx context.Context, uri string, fetcher
 		return nil, 0, errors.Join(errors.New("root container image is too large"), closeErr)
 	}
 	size = int64(image.Payload.Size())
-	return vhost.NewStreamReader(ctx, image.Payload, size), size, nil
+	return vhost.NewStreamReader(VMLifecycleContext(ctx), image.Payload, size), size, nil
 }
 
 // OpenDiskStream resolves a file:// or manifest:// disk URI into a fetch.Stream
@@ -200,7 +200,7 @@ func OpenLayeredBlockReaderWithOpener(ctx context.Context, refs []string, fetche
 	if len(streams) > 1 {
 		stream = fetch.NewLayered(streams...)
 	}
-	return vhost.NewStreamReader(ctx, stream, logicalSize), logicalSize, nil
+	return vhost.NewStreamReader(VMLifecycleContext(ctx), stream, logicalSize), logicalSize, nil
 }
 
 type localArtifactError struct {

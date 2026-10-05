@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"net"
 	"os"
 	"strconv"
@@ -199,10 +200,13 @@ func (f *Forwarder) Start(ctx context.Context, specs []ForwardSpec) error {
 
 func (f *Forwarder) listen(spec ForwardSpec) (net.Listener, error) {
 	if spec.ListenFD > 0 {
-		// Inherited, already-listening socket. FileListener dups the fd; we
-		// then close our File (the original inherited fd) so it neither leaks
-		// into CH on the next fork/exec nor is double-owned.
-		file := os.NewFile(uintptr(spec.ListenFD), fmt.Sprintf("connect-fd-%d", spec.ListenFD))
+		// Borrow the caller's descriptor. Both the temporary File and listener
+		// own duplicates, so Runtime.Close never closes a caller-owned FD.
+		fd, err := unix.FcntlInt(uintptr(spec.ListenFD), unix.F_DUPFD_CLOEXEC, 0)
+		if err != nil {
+			return nil, fmt.Errorf("dup fd=%d: %w", spec.ListenFD, err)
+		}
+		file := os.NewFile(uintptr(fd), fmt.Sprintf("connect-fd-%d", spec.ListenFD))
 		ln, err := net.FileListener(file)
 		_ = file.Close()
 		if err != nil {
@@ -210,10 +214,7 @@ func (f *Forwarder) listen(spec ForwardSpec) (net.Listener, error) {
 		}
 		return ln, nil
 	}
-	// UDS path: remove a stale node first (not for abstract "@name").
-	if !strings.HasPrefix(spec.UDSPath, "@") {
-		_ = os.Remove(spec.UDSPath)
-	}
+	// Existing paths are caller-owned. Let bind fail instead of unlinking them.
 	return net.Listen("unix", spec.UDSPath)
 }
 

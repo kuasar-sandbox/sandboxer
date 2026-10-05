@@ -78,32 +78,38 @@ Runtime 生产、host/target mkfs 区分和 Native 构建操作见 [Native 指�
 
 ## 3. sandbox-init 三阶段
 
-### 3.1 阶段 1:早期挂载 + 并发取 launch spec + switch-root
+### 3.1 阶段 1：基础 Runtime、等待 launch、工作负载 root 与 switch-root
 
-launch spec 携带 `mounts`(含 `empty` 卷)等"驱动 rootfs 组装"的字段,因此
-**hello/launch 握手与不依赖 spec 的挂载链并发进行**。握手 goroutine 只做 socket 操作，不访问文件系统；
-挂载链会解析原 root 下的路径。Go 线程共享 CLONE_FS，因此进程级 chroot 必须在 JOIN 之后、握手 goroutine 退出后执行。
+基础初始化不依赖工作负载，只挂载 proc/sysfs/devtmpfs，启动 loopback 和反向控制
+分发器，然后发送 `hello{phase:"runtime_ready"}`。等待期间分发器响应 ping 和 shutdown，
+拒绝仅适用于工作负载的 exec/connect/quiesce/attach/restore。单纯 socket listen 不代表
+该就绪屏障。`shutdown` 在终止前回复 `ack`。发布工作负载后，分发器使用 supervisor
+及其 stdio bridge 处理既有 live operation。
+
+Launch 请求驱动全部工作负载 root 组装。等待请求不计入 launch 执行期限；host 在
+发布 launch 后开始该超时。握手先于进程级 chroot 完成。Go 线程共享 CLONE_FS；
+切换 root 期间基础控制路径只用 socket，不访问工作负载路径。
 
 ```
-A. 先于一切(纯 socket,无 rootfs 依赖):
-   - raw netlink RTM_NEWLINK(lo, IFF_UP)   ← 拉起回环;内核自动补 127.0.0.1/8、::1/128,
-                                              无需 RTM_NEWADDR;失败即 die(lo 起不来 = guest 损坏)
-   - AF_VSOCK bind+listen :5000             ← 反向通道(host→guest)必须早于 hello 开门
-   - go handshake{ connect(CID=2:5000) → write hello → read launch }  ← spec, conn 经 channel 交回
-
-B. 与 handshake 并发(spec-independent 挂载链):
-   1. mount -t proc/sysfs/devtmpfs  /proc /sys /dev  (CONFIG_DEVTMPFS_MOUNT=y 时 /dev EBUSY,跳过)
-   2. wait /dev/vda、/dev/vdb 出现(轮询 stat,timeout 10s)
-   3. mount -t erofs -o ro /dev/vda /overlay/lower;mount -t ext4 /dev/vdb /overlay/upper
-   4. mkdir /overlay/upper/{upperdir,workdir} 若不存在
-   5. mount -t overlay overlay -o lowerdir=/overlay/lower,upperdir=/overlay/upper/upperdir,
-                                    workdir=/overlay/upper/workdir  /sysroot
-   6. mkdir -p /sysroot/opt/sandbox-runtime
-      mount --bind /opt/sandbox-runtime /sysroot/opt/sandbox-runtime  ← pmem 内发布件根投影进新 root;
-                                              源在 pmem(switch-root 后无路径可达),由 E 的 MS_MOVE
-                                              随子树带进新 /(与 D volume 同理);源 ro EROFS,bind 天然只读
-
-C. JOIN:spec, conn := <-handshake               ← 拿到 LaunchSpec(及复用至 launch_ack 的连接)
+A. 基础 Runtime:
+   - bind/listen AF_VSOCK :5000
+   - 在 /proc /sys /dev 挂载 proc/sysfs/devtmpfs
+     CONFIG_DEVTMPFS_MOUNT=y 已挂 /dev 时跳过 EBUSY。
+   - raw netlink RTM_NEWLINK(lo, IFF_UP)，失败即终止
+     内核提供 127.0.0.1/8 和 ::1/128，不发 RTM_NEWADDR。
+   - 启动反向管理分发器
+B. connect(CID=2:5000)，发送 hello{phase:"runtime_ready"}，等待 launch
+   A/B 不挂载或消费任何工作负载设备。
+C. 仅在收到 launch、host 已发布全部 block backend 后:
+   1. 等待 /dev/vda 和 /dev/vdb：轮询 stat，10 s 超时。
+   2. mount -t erofs -o ro /dev/vda /overlay/lower
+      mount -t ext4 /dev/vdb /overlay/upper
+   3. 不存在时创建 /overlay/upper/{upperdir,workdir}。
+   4. mount -t overlay overlay -o lowerdir=/overlay/lower,
+        upperdir=/overlay/upper/upperdir,workdir=/overlay/upper/workdir /sysroot
+   5. mkdir -p /sysroot/opt/sandbox-runtime
+      mount --bind /opt/sandbox-runtime /sysroot/opt/sandbox-runtime
+      只读 pmem payload bind 随新 root 子树一起搬运。
 
 D. spec-dependent、switch-root 之前(empty/volume 卷需 raw ext4 source):
    for each mounts[].type == empty:
@@ -114,7 +120,7 @@ D. spec-dependent、switch-root 之前(empty/volume 卷需 raw ext4 source):
 E. switch-root:
    MS_MOVE /proc /sys /dev → /sysroot/{proc,sys,dev}
    chdir(/sysroot) → MS_MOVE . / → chroot(.)      ← MS_MOVE 携带整个子树:proc/sys/dev、
-                                                    B6 的 /opt 与 D 的 volume binds 一并进入新 /
+                                                    C5 的 /opt 与 D 的 volume binds 一并进入新 /
 
 F. switch-root 之后的基础挂载:
    mount -t cgroup2 cgroup2 /sys/fs/cgroup;mkdir /sys/fs/cgroup/app   ← 应用 cgroup namespace/freezer 根
@@ -133,10 +139,10 @@ ext4)是写层。overlay 合并后 `/sysroot` 是 guest rootfs 的最终视图,s
 virtio-pmem 挂在 `/`(`root=/dev/pmem0 ... rootflags=dax=always`),阶段 1 把它让位给 overlay
 (其中 `/opt/sandbox-runtime` 经 bind 在让位时随子树保留进新 root)。
 
-**为何能并发**：bind+listen 必须在 host 写出 launch 前完成，因为 host 此时即启动 ping。
-握手 goroutine 只执行 socket 操作，不访问文件系统；挂载链会解析原 root 下的路径，并非 mount 不解析路径。
-真正的进程级 chroot 位于 JOIN 之后，此时握手 goroutine 已退出，不会与它并发使用文件系统。
-这一安排把 hello→launch 往返与 overlay 组装重叠。
+**就绪与 root 所有权：** Linux 在 boot 期间可以探测固定但未绑定的盘并收到 IOERR。
+基础初始化不挂载这些盘，第一次工作负载 mount 在 Launch 发布全部设备后进行。
+Host 从 `runtime_ready` 开始 ping；launch_ack/app_started 保持既有语义，app_started
+不证明 execve 成功或应用健康。已有内存快照使用 restore/attach，不走冷启动握手。
 
 **volume 卷的 source 与搬运**:`empty` 卷的 source 是 raw ext4 上 `/overlay/upper/volumes/<i>`
 (与 overlay 的 `upperdir/` 物理隔离,同在 vdb、一起进磁盘快照),bind 到 sysroot 内的
@@ -793,7 +799,7 @@ JSON 可读、调试友好，消息量少，无需 protobuf 工具链。
 ```jsonc
 {
   "type":     "<one of §4.3>",
-  "phase":    "ready",                 // hello: optional hint
+  "phase":    "runtime_ready",         // cold hello：显式基础就绪屏障
   "launch":   { ... LaunchSpec ... },  // launch (含 stdio 节,见 §5.1)
   "exec":     { "argv":[...], "env":{}, "cwd":"", "user":"", "stdio":{} },  // exec: ExecSpec(§3.6)
   "connect":  { "network":"tcp", "address":"127.0.0.1:49983", "accept":false },  // connect: ConnectSpec(§3.7; accept=true ⇒ guest Listen+Accept)
@@ -1004,10 +1010,11 @@ Host→guest 始终 dial CH base UDS 并完成 CONNECT/OK；不是 host dial CID
 sandbox-ctl                                               sandbox-init (guest)
 listen <base>_5000
 spawn CH -----------------------------------------------> kernel boot
-                                                          lo UP；bind/listen :5000
-                      <--- hello{ready} ------------------ dial CID=2:5000 [conn A]
-launch{spec,stdio} --------------------------------------> 并发组盘；join；switch-root
-launch 写完即起 ping ticker                                network/mounts/files/init；准备 stdio
+                                                          基础挂载；lo UP；控制分发器
+                      <--- hello{runtime_ready} ------------------ dial CID=2:5000 [conn A]
+启动 ping；等待 Launch                                    等待，不挂工作负载 root
+提交全部 backend；launch{spec,stdio} --------------------> 组装工作负载 root；switch-root
+开始 launch 超时                                         network/mounts/files/init；准备 stdio
                       <--- launch_ack{stdio} ------------- 环境就绪，尚未 final exec
 ack ----------------------------------------------------> conn A -> MUX
 initial SET_WINSIZE =====================================> tty；fork/exec primary
