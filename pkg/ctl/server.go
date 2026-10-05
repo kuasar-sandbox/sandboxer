@@ -174,6 +174,10 @@ func (s *Server) handle(conn *net.UnixConn) {
 
 	case TypeSnapshotRequest:
 		defer conn.Close()
+		if s.SnapshotHandler == nil {
+			_ = WriteMessage(conn, Response{Type: TypeError, Msg: "snapshot not supported"})
+			return
+		}
 		resp, err := s.SnapshotHandler(req)
 		if err != nil {
 			// A post-commit cleanup error still owns terminal teardown.

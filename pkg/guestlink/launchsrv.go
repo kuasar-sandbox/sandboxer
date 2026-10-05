@@ -330,16 +330,16 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 			return false
 		}
 		s.Logf("launch: launch_ack received")
-		s.launchAckOnce.Do(func() {
-			if s.OnLaunchAck != nil {
-				s.OnLaunchAck()
-			}
-			close(s.launchAckDone)
-		})
 		if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck}); err != nil {
 			s.Logf("launch: write ack: %v", err)
 			return false
 		}
+		s.launchAckOnce.Do(func() {
+			close(s.launchAckDone)
+			if s.OnLaunchAck != nil {
+				go s.OnLaunchAck()
+			}
+		})
 		completed = true
 		// Hand the connection off as the stdio MUX (docs/sandbox-runtime
 		// .md §4.5). Drop the handshake deadline first.
@@ -366,16 +366,19 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 		// Legacy fresh-connection launch_ack (sandbox-init now always
 		// sends it on the hello conn). Kept as a defensive fallback.
 		s.Logf("launch: launch_ack received (standalone conn)")
-		s.launchAckOnce.Do(func() {
-			if s.OnLaunchAck != nil {
-				s.OnLaunchAck()
-			}
-			close(s.launchAckDone)
-		})
 		_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck})
+		s.launchAckOnce.Do(func() {
+			close(s.launchAckDone)
+			if s.OnLaunchAck != nil {
+				go s.OnLaunchAck()
+			}
+		})
 		return false
 
 	case proto.TypeAppStarted:
+		if s.AppNotifyDeadline > 0 {
+			_ = conn.SetDeadline(time.Time{})
+		}
 		if s.DeferLaunch {
 			select {
 			case <-s.launchAckDone:

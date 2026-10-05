@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -417,6 +418,7 @@ func StartRuntime(ctx context.Context, spec RuntimeSpec) (_ *Runtime, retErr err
 				cleanup()
 				return nil, nil, err
 			}
+			r.logf("CH args: %s", strings.Join(args, " "))
 			if spec.Console.Kind == stdio.ConsoleStderr {
 				cmd.Stdout = runtimeConsoleWriter{owner: r, dst: cmd.Stdout}
 			}
@@ -568,7 +570,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		return fail(err)
 	}
 	opener := FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
-		return artifact.OpenFileWithLocations(ctx, path, ref, spec.ManifestConfig, launchKey(spec), launchFetcher(spec), spec.RefLocations, launchCodec(spec), launchRequired(spec))
+		return openLaunchFile(ctx, spec, path, ref, spec.RefLocations)
 	})
 	if err := canonicalizeConfiguredTarRefsWithOpener(ctx, cfg, spec.RefLocations, launchCodec(spec), launchRequired(spec), opener); err != nil {
 		return fail(err)
@@ -734,6 +736,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		if err != nil {
 			return fail(err)
 		}
+		r.logf("image config: cmd=%v entrypoint=%v workdir=%q env-keys=%d", imageCfg.Cmd, imageCfg.Entrypoint, imageCfg.WorkingDir, len(imageCfg.Env))
 	} else {
 		imageCfg = &ImageConfig{}
 	}
@@ -794,6 +797,17 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	return fail(errors.Join(errors.New("runtime launch did not complete"), ctx.Err()))
 
 }
+func openLaunchFile(ctx context.Context, s LaunchSpec, path string, ref manifest.Ref, locations config.RefLocations) (fetch.Stream, error) {
+	// A supplied ProcessStorage is an opaque artifact-access capability: it owns
+	// manifest configuration, customer key, codec, and lazy clients. Preserve
+	// that configuration instead of reconstructing it from public LaunchSpec
+	// fields when the caller did not explicitly override access.
+	if s.legacyAccess == nil && s.Storage != nil && s.ManifestConfig == nil && s.Fetcher == nil && s.Credentials == nil {
+		return s.Storage.OpenFileWithLocations(ctx, path, ref, locations)
+	}
+	return artifact.OpenFileWithLocations(ctx, path, ref, s.ManifestConfig, launchKey(s), launchFetcher(s), locations, launchCodec(s), launchRequired(s))
+}
+
 func launchFetcher(s LaunchSpec) fetch.Fetcher {
 	if s.legacyAccess != nil {
 		return s.legacyAccess.Fetcher
@@ -907,6 +921,11 @@ func (r *Runtime) cleanupResources() (retErr error) {
 			_ = os.Remove(d.diffPath)
 		}
 	}
+	// Automatic diffs are the only reason an otherwise-empty baseDir may have
+	// been created. Preserve retained files by using non-recursive Remove.
+	if r.baseDir != "" {
+		_ = os.Remove(r.baseDir)
+	}
 	if r.cache != nil {
 		retErr = errors.Join(retErr, r.cache.Close())
 	}
@@ -940,7 +959,7 @@ func deriveRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, launch La
 		return RuntimeSpec{}, errors.New("derive runtime spec: config and storage required")
 	}
 	opener := FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
-		return artifact.OpenFileWithLocations(ctx, path, ref, launch.ManifestConfig, launchKey(launch), launchFetcher(launch), locations, launchCodec(launch), launchRequired(launch))
+		return openLaunchFile(ctx, launch, path, ref, locations)
 	})
 
 	clone, err := cloneSDKConfig(cfg)

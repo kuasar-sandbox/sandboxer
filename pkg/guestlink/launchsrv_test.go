@@ -93,18 +93,15 @@ func TestLaunchServer_HelloLaunchHandshake(t *testing.T) {
 		message, err := proto.ReadMessage(conn)
 		ackDone <- ackResult{message: message, err: err}
 	}()
+	// The protocol ACK is the launch critical path. Lifecycle notification must
+	// not delay it: a slow controller Settled RPC runs independently.
+	result := <-ackDone
 	select {
 	case <-launchAckSeen:
 	case <-time.After(time.Second):
-		t.Fatal("OnLaunchAck not fired before ACK")
-	}
-	select {
-	case result := <-ackDone:
-		t.Fatalf("launch ACK completed before OnLaunchAck returned: %+v err=%v", result.message, result.err)
-	case <-time.After(20 * time.Millisecond):
+		t.Fatal("OnLaunchAck not fired after ACK")
 	}
 	close(allowLaunchACK)
-	result := <-ackDone
 	if result.err != nil {
 		t.Fatal(result.err)
 	}

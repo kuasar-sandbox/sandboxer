@@ -108,6 +108,7 @@ func nilBackend(b Backend) bool {
 
 type unboundBackend struct{ spec BlockDeviceSpec }
 
+func (*unboundBackend) suppressRequestStats() bool         { return true }
 func (b *unboundBackend) Size() int64                      { return b.spec.Capacity }
 func (b *unboundBackend) ReadOnly() bool                   { return b.spec.ReadOnly }
 func (*unboundBackend) ReadAt([]byte, int64) (int, error)  { return 0, ErrBackendUnbound }

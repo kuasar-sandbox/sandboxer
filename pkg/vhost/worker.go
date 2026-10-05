@@ -407,6 +407,10 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 	}
 
 	if s.stats != nil {
+		_, suppressStats := backend.(interface{ suppressRequestStats() bool })
+		if suppressStats {
+			return bytesIO + 1, nil
+		}
 		latNs := uint64(nowNs() - startNs)
 		s.stats.Record(hdr.Type, uint64(bytesIO), latNs, *status == BlkStatusOK)
 		if bytesIO > 0 {
