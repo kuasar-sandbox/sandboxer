@@ -518,9 +518,14 @@ func ServeAndWait(p VMParams) (int, error) {
 				p.Memory.StartSensor(p.Ctx)
 			}
 			if p.owner != nil && p.Hooks != nil {
-				if err := p.Hooks.Settled(); err != nil {
-					logf("settled: %v", err)
-				}
+				// Settled is node-control notification, not part of the Guest
+				// launch handshake. Keep the local memory observation barrier
+				// above synchronous, but never let a slow controller delay ACK.
+				go func() {
+					if err := p.Hooks.Settled(); err != nil {
+						logf("settled: %v", err)
+					}
+				}()
 			}
 		},
 		OnMemReport: func(report proto.MemReport) bool {
@@ -778,6 +783,9 @@ func ServeAndWait(p VMParams) (int, error) {
 			snapHandler.PortableConfig = c0
 			snapHandler.SourceBinding = spec.SourceBinding
 			snapHandler.ManifestCfg = spec.ManifestConfig
+			if snapHandler.ManifestCfg == nil && spec.Storage != nil {
+				snapHandler.ManifestCfg = spec.Storage.ManifestConfig()
+			}
 			snapHandler.Fetcher = launchFetcher(spec)
 			snapHandler.BundleReader = spec.BundleReader
 			snapHandler.BundleFetcher = spec.BundleFetcher

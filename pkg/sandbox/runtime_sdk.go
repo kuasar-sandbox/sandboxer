@@ -57,6 +57,7 @@ type RuntimeSpec struct {
 	StatsJSONPath                   string
 	StatsInterval                   time.Duration
 	NotifyReadiness                 ReadinessNotify
+	logf                            func(string, ...any) // executable adapter only; SDK defaults to sandbox-sdk
 }
 
 // NetworkDeviceSpec is host-only. Acquired TAP/namespace descriptors are owned
@@ -304,7 +305,11 @@ func StartRuntime(ctx context.Context, spec RuntimeSpec) (_ *Runtime, retErr err
 	life, cancel := context.WithCancelCause(context.Background())
 	signals := make(chan os.Signal, 4)
 	engineCtx, stopSignals := newRunSignalContext(life, signals, nil)
-	r := &Runtime{state: runtimeStarting, spec: spec, sandboxID: sid, pathID: pathID, runDir: runDir, baseDir: DefaultBaseDir(baseRoot, pathID), startUnixNs: time.Now().UnixNano(), lifeCtx: engineCtx, cancelLife: cancel, signals: signals, stopSignals: stopSignals, identity: identity, exitDone: make(chan struct{}), logf: func(f string, a ...any) { log.Printf("[sandbox-sdk] "+f, a...) }}
+	logf := spec.logf
+	if logf == nil {
+		logf = func(f string, a ...any) { log.Printf("[sandbox-sdk] "+f, a...) }
+	}
+	r := &Runtime{state: runtimeStarting, spec: spec, sandboxID: sid, pathID: pathID, runDir: runDir, baseDir: DefaultBaseDir(baseRoot, pathID), startUnixNs: time.Now().UnixNano(), lifeCtx: engineCtx, cancelLife: cancel, signals: signals, stopSignals: stopSignals, identity: identity, exitDone: make(chan struct{}), logf: logf}
 	stopOperation := context.AfterFunc(ctx, func() { signals <- syscall.SIGTERM })
 	defer stopOperation()
 	r.spec.CHBinary = chBinary
@@ -395,6 +400,7 @@ func StartRuntime(ctx context.Context, spec RuntimeSpec) (_ *Runtime, retErr err
 			return nil, e
 		}
 		r.tapFile, r.netnsFile, metaMAC, r.metaIP = f, nsf, meta.MAC, meta.IP
+		r.logf("tapfd: received tap fd (mac=%s ip=%s netns=%t)", meta.MAC, meta.IP, nsf != nil)
 	}
 	netMAC, _ := cfg.Network.Effective(metaMAC, "")
 	baseReady := make(chan struct{})
@@ -813,13 +819,16 @@ func openLaunchFile(ctx context.Context, s LaunchSpec, path string, ref manifest
 }
 
 func launchFetcher(s LaunchSpec) fetch.Fetcher {
-	if s.legacyAccess != nil {
+	if s.legacyAccess != nil && s.legacyAccess.Fetcher != nil {
 		return s.legacyAccess.Fetcher
 	}
 	if s.Fetcher != nil {
 		return s.Fetcher
 	}
-	return s.Storage.Fetcher()
+	if s.Storage != nil {
+		return s.Storage.Fetcher()
+	}
+	return nil
 }
 
 func Start(ctx context.Context, spec SandboxSpec) (*Runtime, error) {
@@ -984,7 +993,23 @@ func deriveRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, launch La
 		diffOpts = append(diffOpts, vhost.WithDiffEncryption(key, launchRequired(launch)))
 		clear(key[:])
 	}
-	capacity := func(diffURI, template string, baseSize int64) (int64, error) {
+	baseRoot, sandboxID, pathID := "", "", ""
+	if launch.legacyAccess != nil {
+		baseRoot, sandboxID, pathID = launch.legacyAccess.BaseRoot, launch.legacyAccess.SandboxID, launch.legacyAccess.PathID
+		if pathID == "" {
+			pathID = sandboxID
+		}
+	}
+	defaultBaseDir := DefaultBaseDir(baseRoot, pathID)
+	capacity := func(diffURI, defaultURI, template string, baseSize int64) (int64, error) {
+		if diffURI == "" && defaultURI != "" {
+			if _, p, ok := config.SchemeAndPath(defaultURI); ok {
+				if st, e := os.Stat(p); e == nil && st.Size() > 0 {
+					diffURI = defaultURI
+				}
+			}
+		}
+
 		if diffURI != "" {
 			_, p, ok := config.SchemeAndPath(diffURI)
 			if !ok {
@@ -1024,7 +1049,15 @@ func deriveRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, launch La
 				cowBaseSize = x.Size()
 				_ = x.Close()
 			}
-			d.WritableCapacity, err = capacity(root.Overlay.Diff, root.Overlay.DiffTemplate, cowBaseSize)
+			defaultURI := ""
+			if sandboxID != "" {
+				if name == "root" {
+					defaultURI = DefaultDiffURIForBaseDir(defaultBaseDir, sandboxID)
+				} else {
+					defaultURI = DefaultDiskDiffURI(defaultBaseDir, sandboxID, fmt.Sprintf("disk%d", len(shapes)-1))
+				}
+			}
+			d.WritableCapacity, err = capacity(root.Overlay.Diff, defaultURI, root.Overlay.DiffTemplate, cowBaseSize)
 		} else {
 			if root.Base != "" {
 				x, _, e := OpenLayeredBlockReaderWithOpener(ctx, append([]string{root.Base}, root.BaseFromRefs...), launchFetcher(launch), locations, launchCodec(launch), launchRequired(launch), opener)
@@ -1034,7 +1067,15 @@ func deriveRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, launch La
 				cowBaseSize = x.Size()
 				_ = x.Close()
 			}
-			d.WritableCapacity, err = capacity(root.Diff, root.DiffTemplate, cowBaseSize)
+			defaultURI := ""
+			if sandboxID != "" {
+				if name == "root" {
+					defaultURI = DefaultDiffURIForBaseDir(defaultBaseDir, sandboxID)
+				} else {
+					defaultURI = DefaultDiskDiffURI(defaultBaseDir, sandboxID, fmt.Sprintf("disk%d", len(shapes)-1))
+				}
+			}
+			d.WritableCapacity, err = capacity(root.Diff, defaultURI, root.DiffTemplate, cowBaseSize)
 		}
 		return d, err
 	}
@@ -1199,16 +1240,19 @@ func launchCodec(s LaunchSpec) tarstream.Codec {
 	return s.Storage.LocalCodec()
 }
 func launchKey(s LaunchSpec) ingest.CustomerKeyFunc {
-	if s.legacyAccess != nil {
+	if s.legacyAccess != nil && s.legacyAccess.CustomerKeyFn != nil {
 		return s.legacyAccess.CustomerKeyFn
 	}
-	return s.Storage.CustomerKeyFunc()
+	if s.Storage != nil {
+		return s.Storage.CustomerKeyFunc()
+	}
+	return nil
 }
 func launchRequired(s LaunchSpec) bool {
-	if s.legacyAccess != nil {
-		return s.legacyAccess.LocalRequired
+	if s.legacyAccess != nil && s.legacyAccess.LocalRequired {
+		return true
 	}
-	return s.Storage.LocalRequired()
+	return s.Storage != nil && s.Storage.LocalRequired()
 }
 
 func (r *Runtime) beginOperation() error {

@@ -31,15 +31,11 @@ func TestLaunchServer_HelloLaunchHandshake(t *testing.T) {
 		Restart: "never",
 	}
 	launchAckSeen := make(chan struct{})
-	allowLaunchACK := make(chan struct{})
 	srv := &LaunchServer{
-		Path: sockPath,
-		Spec: spec,
-		Logf: func(string, ...any) {},
-		OnLaunchAck: func() {
-			close(launchAckSeen)
-			<-allowLaunchACK
-		},
+		Path:        sockPath,
+		Spec:        spec,
+		Logf:        func(string, ...any) {},
+		OnLaunchAck: func() { close(launchAckSeen) },
 	}
 	if err := srv.Listen(); err != nil {
 		t.Fatal(err)
@@ -93,15 +89,13 @@ func TestLaunchServer_HelloLaunchHandshake(t *testing.T) {
 		message, err := proto.ReadMessage(conn)
 		ackDone <- ackResult{message: message, err: err}
 	}()
-	// The protocol ACK is the launch critical path. Lifecycle notification must
-	// not delay it: a slow controller Settled RPC runs independently.
+	// The local launch barrier must be open before the guest receives ACK.
 	result := <-ackDone
 	select {
 	case <-launchAckSeen:
-	case <-time.After(time.Second):
-		t.Fatal("OnLaunchAck not fired after ACK")
+	default:
+		t.Fatal("OnLaunchAck not fired before ACK")
 	}
-	close(allowLaunchACK)
 	if result.err != nil {
 		t.Fatal(result.err)
 	}

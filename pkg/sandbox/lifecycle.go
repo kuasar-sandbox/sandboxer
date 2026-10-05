@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -288,6 +289,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.StatsJSONPath = opts.StatsJSONPath
 	shape.StatsInterval = opts.StatsInterval
 	shape.NotifyReadiness = opts.NotifyReadiness
+	shape.logf = func(f string, a ...any) { log.Printf("[sandbox-ctl] "+f, a...) }
 	r, err := Start(ctx, SandboxSpec{Runtime: shape, Launch: launch})
 	if err != nil {
 		return -1, err
@@ -308,7 +310,9 @@ func WaitRun(ctx context.Context, r *Runtime) (int, error) {
 			r.signals <- sig
 		case <-done:
 			done = nil
-			if signals == nil {
+			// A retained OS signal is forwarded through signals. Plain parent
+			// cancellation has no such signal and must still request shutdown.
+			if signals == nil || !runShutdownRequested(ctx) {
 				r.signals <- syscall.SIGTERM
 			}
 		}

@@ -445,6 +445,9 @@ func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamS
 			src = io.NopCloser(strings.NewReader(""))
 		}
 		st := sess.Stream(mux.StreamStdin)
+		// A blocked MUX write waits for peer credit and cannot observe ctx.
+		// Reset first during cleanup so joining the input pump is bounded.
+		waits = append(waits, func() { _ = st.Reset() })
 		inputDone := make(chan struct{})
 		go func() {
 			defer close(inputDone)

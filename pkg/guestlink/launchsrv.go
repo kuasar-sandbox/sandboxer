@@ -107,6 +107,7 @@ type LaunchServer struct {
 	appStartedDone chan struct{}
 	appStartedOnce sync.Once
 	launchAckOnce  sync.Once
+	launchHookOnce sync.Once
 	connsMu        sync.Mutex
 	conns          map[net.Conn]struct{}
 	connsWG        sync.WaitGroup
@@ -330,16 +331,18 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 			return false
 		}
 		s.Logf("launch: launch_ack received")
+		// Open local observation barriers before the guest can continue. The
+		// callback itself must not perform blocking node-control RPCs.
+		s.launchHookOnce.Do(func() {
+			if s.OnLaunchAck != nil {
+				s.OnLaunchAck()
+			}
+		})
 		if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck}); err != nil {
 			s.Logf("launch: write ack: %v", err)
 			return false
 		}
-		s.launchAckOnce.Do(func() {
-			close(s.launchAckDone)
-			if s.OnLaunchAck != nil {
-				go s.OnLaunchAck()
-			}
-		})
+		s.launchAckOnce.Do(func() { close(s.launchAckDone) })
 		completed = true
 		// Hand the connection off as the stdio MUX (docs/sandbox-runtime
 		// .md §4.5). Drop the handshake deadline first.
@@ -366,13 +369,13 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 		// Legacy fresh-connection launch_ack (sandbox-init now always
 		// sends it on the hello conn). Kept as a defensive fallback.
 		s.Logf("launch: launch_ack received (standalone conn)")
-		_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck})
-		s.launchAckOnce.Do(func() {
-			close(s.launchAckDone)
+		s.launchHookOnce.Do(func() {
 			if s.OnLaunchAck != nil {
-				go s.OnLaunchAck()
+				s.OnLaunchAck()
 			}
 		})
+		_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck})
+		s.launchAckOnce.Do(func() { close(s.launchAckDone) })
 		return false
 
 	case proto.TypeAppStarted:
