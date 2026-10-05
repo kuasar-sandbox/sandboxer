@@ -544,7 +544,11 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		r.ownStorage = true
 	}
 	r.storage = spec.Storage
-	if spec.SourceBinding != nil {
+	// Legacy Run already materializes a --from portable graph before deriving
+	// the runtime shape. Keep SourceBinding as provenance, but do not bind the
+	// same graph a second time during the SDK Launch adapter. Native SDK callers
+	// still bind their portable graph exactly once here.
+	if spec.SourceBinding != nil && spec.legacyAccess == nil {
 		if err := config.BindPortableDiskGraph(cfg, spec.SourceBinding.RuntimeRef, spec.SourceBinding.RelativeDir); err != nil {
 			return fail(err)
 		}
