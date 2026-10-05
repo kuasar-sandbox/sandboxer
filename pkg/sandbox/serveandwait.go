@@ -957,7 +957,10 @@ func ServeAndWait(p VMParams) (int, error) {
 		}, func() {
 			chExitObserved.Store(true)
 			if p.owner != nil {
-				p.owner.stopForExit()
+				// WNOWAIT only observes the child. Do not cancel the CommandContext
+				// before cmd.Wait reaps it, or a normal CH exit is rewritten to
+				// context.Canceled. Mark the owner closing; stopForExit runs after Wait.
+				p.owner.markExiting()
 			}
 		}, func(ctx context.Context) {
 			if usageSampler != nil {

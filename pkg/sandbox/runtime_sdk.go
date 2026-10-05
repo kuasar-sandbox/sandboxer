@@ -859,6 +859,13 @@ func (r *Runtime) Wait(ctx context.Context) (ExitResult, error) {
 		return ExitResult{}, ctx.Err()
 	}
 }
+func (r *Runtime) markExiting() {
+	r.mu.Lock()
+	if r.state != runtimeClosed {
+		r.state = runtimeClosing
+	}
+	r.mu.Unlock()
+}
 func (r *Runtime) stopForExit() {
 	r.mu.Lock()
 	if r.state != runtimeClosed {
