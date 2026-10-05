@@ -792,8 +792,21 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	}
 	workHeld = false
 	r.workMu.Unlock()
+	// app_started is best-effort in the guest: a failed short notification is
+	// logged there and is not retried. Never leave Launch blocked forever when
+	// that notification is lost. Use the same configured app-notify budget,
+	// falling back to the protocol's guest-side bound when 0 means no socket
+	// deadline on the host listener.
+	appWait := cfg.AppNotifyDeadline()
+	if appWait <= 0 {
+		appWait = proto.DeadlineAppNotify
+	}
+	appTimer := time.NewTimer(appWait)
+	defer appTimer.Stop()
 	select {
 	case <-r.launch.AppStartedDone():
+	case <-appTimer.C:
+		return fail(fmt.Errorf("runtime launch app_started notification timed out after %s", appWait))
 	case <-ctx.Done():
 	case <-r.exitDone:
 	}
@@ -1156,10 +1169,39 @@ func RunLifecycle(ctx context.Context, run func(context.Context) (int, error)) (
 		}
 		return r, nil
 	case <-ctx.Done():
-		_ = r.Close()
+		closeRuntimeDuringStartup(ctx, r)
 		return nil, ctx.Err()
 	case <-r.exitDone:
 		return nil, errors.Join(errors.New("restore exited before readiness"), r.exit.Err)
+	}
+}
+
+func closeRuntimeDuringStartup(ctx context.Context, r *Runtime) {
+	if r == nil {
+		return
+	}
+	r.requestClose() // first shutdown request to the runtime's private stream
+	outer := runSignalsFromContext(ctx)
+	if outer == nil {
+		<-r.exitDone
+		return
+	}
+	// The signal which cancelled ctx is already represented by requestClose.
+	// Consume that retained first signal, then forward later signals so the
+	// private lifecycle preserves the normal second-signal SIGKILL escalation.
+	select {
+	case <-outer:
+	default:
+	}
+	for {
+		select {
+		case <-r.exitDone:
+			return
+		case sig := <-outer:
+			if sig != nil {
+				r.signals <- sig
+			}
+		}
 	}
 }
 
