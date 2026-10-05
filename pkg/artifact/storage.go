@@ -100,6 +100,17 @@ func verificationOptions(cfg *config.ManifestConfig) fetch.Options {
 	return fetch.Options{VerifyContent: cfg == nil || cfg.Manifest.VerifyContent == nil || *cfg.Manifest.VerifyContent}
 }
 
+// ManifestConfig returns the immutable manifest configuration captured by this
+// storage. Callers must treat the returned pointer as read-only. It lets live
+// capture reuse the same write policy/endpoint without duplicating credentials
+// in a LaunchSpec.
+func (s *ProcessStorage) ManifestConfig() *config.ManifestConfig {
+	if s == nil {
+		return nil
+	}
+	return s.cfg
+}
+
 // CustomerKeyFunc returns the process-fixed key resolver used by manifest
 // fetch and ingest operations. It is nil when no manifest config was supplied.
 func (s *ProcessStorage) CustomerKeyFunc() ingest.CustomerKeyFunc {
@@ -209,6 +220,7 @@ func newManifestFetcher(cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc
 		return nil, nil, readerr.Mark(err, false)
 	}
 	if cfg.Cache.Endpoint != "" {
+		log.Printf("manifest fetcher: store=%s cache=%s", cfg.Store.Endpoint, cfg.Cache.Endpoint)
 		timeout, err := optionalDuration(cfg.Cache.Timeout, "cache.timeout")
 		if err != nil {
 			return nil, nil, err
@@ -222,6 +234,7 @@ func newManifestFetcher(cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc
 	if cfg.Store.Endpoint == "" {
 		return nil, nil, readerr.Mark(fmt.Errorf("manifest: cache.endpoint or store.endpoint required for fetch"), false)
 	}
+	log.Printf("manifest fetcher: store=%s", cfg.Store.Endpoint)
 	timeout, err := optionalDuration(cfg.Store.Timeout, "store.timeout")
 	if err != nil {
 		return nil, nil, err

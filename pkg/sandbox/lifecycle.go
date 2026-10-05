@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -26,7 +25,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
-	"github.com/kuasar-sandbox/sandboxer/internal/runidentity"
 	"github.com/kuasar-sandbox/sandboxer/internal/runtimebundle"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
@@ -40,8 +38,6 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
-	"github.com/kuasar-sandbox/sandboxer/pkg/tapfd"
-	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
@@ -127,7 +123,6 @@ type BundleSourceBinding struct {
 // spawn CH, wait for exit, cleanup. Returns CH's exit code or an error
 // if setup failed.
 func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
-	startUnixNs := time.Now().UnixNano()
 	if opts.Cfg == nil {
 		return -1, fmt.Errorf("RunOptions.Cfg is nil")
 	}
@@ -263,431 +258,65 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		}
 	}
 
-	runDir := filepath.Join(opts.RuntimeRoot, pathID)
-	identity, err := runidentity.Acquire(runDir, opts.SandboxID)
-	if err != nil {
-		return -1, fmt.Errorf("runtime identity: %w", err)
-	}
-	defer identity.Close()
-	defer identity.RemoveRunDir()
-	if _, err := config.WritePortableSandboxConfig(runDir, c0); err != nil {
-		return -1, fmt.Errorf("write immutable C0: %w", err)
-	}
-
-	// chSock is needed here (front-half) because resctl.BalloonController is
-	// constructed before ServeAndWait; the remaining socket paths are
-	// owned by ServeAndWait, which derives them identically from runDir.
-	chSock := filepath.Join(runDir, "ch.sock")
-
-	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl] "+format, a...) }
-
-	// Resolve the exact memory domain before admission. The local controller,
-	// CH command line, and node reservation all use these same byte values.
-	capBytes, err := opts.Cfg.CapacityMemoryBytes()
+	storage, err := artifact.NewProcessStorageWithCustomerKey(opts.ManifestCfg, opts.CustomerKeyFn)
 	if err != nil {
 		return -1, err
 	}
-	if capBytes > uint64(^uint(0)>>1) {
-		return -1, fmt.Errorf("memory Capacity %d exceeds host addressable memory size", capBytes)
-	}
-	allocBytes, err := opts.Cfg.AllocatableMemoryBytes()
+	defer storage.Close()
+	launch := LaunchSpecFromConfig(opts.Cfg)
+	launch.legacyAccess = &opts
+	launch.Storage = storage
+	launch.ManifestConfig = opts.ManifestCfg
+	launch.Fetcher = opts.Fetcher
+	launch.BundleReader = opts.BundleReader
+	launch.BundleFetcher = opts.BundleFetcher
+	launch.RefLocations = opts.RefLocations
+	launch.SourceBinding = opts.SourceBinding
+	launch.PortableConfig = c0
+	launch.Stdio = opts.StdioMode
+	launch.Forwards = opts.Forwards
+	shape, err := deriveRuntimeSpec(ctx, opts.Cfg, launch)
 	if err != nil {
 		return -1, err
 	}
-	startupHeadroom, err := opts.Cfg.StartupBytes()
+	shape.SandboxID = opts.SandboxID
+	shape.PathID = opts.PathID
+	shape.CHBinary = opts.CHBinary
+	shape.RuntimeRoot = opts.RuntimeRoot
+	shape.BaseRoot = opts.BaseRoot
+	shape.Console = opts.StdioMode.Console
+	shape.PingFatalThreshold = opts.PingFatalThreshold
+	shape.StatsJSONPath = opts.StatsJSONPath
+	shape.StatsInterval = opts.StatsInterval
+	shape.NotifyReadiness = opts.NotifyReadiness
+	shape.logf = func(f string, a ...any) { log.Printf("[sandbox-ctl] "+f, a...) }
+	r, err := Start(ctx, SandboxSpec{Runtime: shape, Launch: launch})
 	if err != nil {
 		return -1, err
 	}
-	initialBudget := resctl.AlignedBudget(capBytes, startupHeadroom)
-	// Reject a CH-inexpressible memory domain before creating a lease or
-	// acquiring any node reservation. Validate both the cold command-line
-	// target and the farthest target the settled policy can request.
-	if err := resctl.ValidateBalloonSize(capBytes, resctl.TargetForBudget(capBytes, initialBudget)); err != nil {
-		return -1, fmt.Errorf("initial memory domain: %w", err)
-	}
-	if err := resctl.ValidateBalloonSize(capBytes, resctl.TargetForBudget(capBytes, allocBytes)); err != nil {
-		return -1, fmt.Errorf("settled memory domain: %w", err)
-	}
+	return WaitRun(ctx, r)
+}
 
-	// Create the CH executor whenever either cold or settled policy can use a
-	// balloon. InitialTarget=0 still emits --balloon size=0.
-	var balloonCtl *resctl.BalloonController
-	if allocBytes < capBytes || initialBudget < capBytes {
-		balloonCtl = resctl.NewBalloonController(chSock, capBytes, opts.Cfg.CHApiDeadline(), logf)
-	}
-	// Register cgroup cleanup before ControllerHooks.Release so LIFO shutdown
-	// stops every controller goroutine while its pinned cgroup FD is still live.
-	var cg *resctl.CgroupController
-	defer func() {
-		if cg != nil {
-			_ = cg.Cleanup()
-		}
-	}()
-
-	// Controller handshake (dynamic mode) happens before cgroup writes so a
-	// rejected admission leaves no local resource side effects. Admit carries
-	// the resolved host cgroup path from cfg; local I/O is pinned to the stable
-	// cgroup descriptor after SetupCgroup below.
-	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
-		SocketPath: opts.Cfg.Resources.Control.Controller,
-		SandboxID:  opts.SandboxID,
-		Context:    ControllerWorkContext(ctx),
-		Logf:       logf,
-	}, opts.Cfg)
-	if err != nil {
-		return -1, fmt.Errorf("controller dial: %w", err)
-	}
-	defer hooks.Release("normal")
-	grantedInitial, err := hooks.Admit(opts.SandboxID, 0)
-	if err != nil {
-		return -1, err
-	}
-	initialBudget = grantedInitial
-	logf("initial cold Budget reserved=%d", initialBudget)
-	if balloonCtl != nil {
-		if err := balloonCtl.SeedColdTarget(resctl.TargetForBudget(capBytes, initialBudget)); err != nil {
-			return -1, fmt.Errorf("seed cold balloon target: %w", err)
-		}
-	}
-
-	// CgroupPath empty → no-cgroup mode, no cgroup operations.
-	// CgroupPath set → join existing cgroup (must already exist; not
-	// created by sandbox-ctl). See docs/sandbox.md §4.1.
-	cgCfg, err := resctl.BuildCgroupConfig(opts.Cfg)
-	if err != nil {
-		return -1, err
-	}
-	// Defer memory.high write until a fresh post-launch guest/CH observation.
-	// Cold boot's uffd-driven page-fault burst can push the cgroup well past
-	// its eventual steady high; if memory.high is already in effect, every
-	// UFFDIO_ZEROPAGE/COPY syscall returns through
-	// mem_cgroup_handle_over_high reclaim, throttling the uffd handler
-	// against the very faults it's trying to resolve (Issue 4 root cause).
-	// memory.max remains the hard ceiling during boot. Settled is only the
-	// lifecycle barrier; MemoryController derives and writes the first high.
-	cgCfg.MemoryHighBytes = 0
-	cg, err = resctl.SetupCgroup(cgCfg)
-	if err != nil {
-		return -1, fmt.Errorf("cgroup: %w", err)
-	}
-	hooks.SetLocalCgroupPath(cg.LocalPath())
-	memoryCtl, err := resctl.NewMemoryController(resctl.MemoryControllerOptions{
-		Config: opts.Cfg, CgroupPath: cg.LocalPath(), Balloon: balloonCtl,
-		Reservation: hooks, InitialBudget: initialBudget, Logf: logf,
-	})
-	if err != nil {
-		return -1, fmt.Errorf("memory controller: %w", err)
-	}
-	if cg.Active() {
-		logf("cgroup limits set: %s memory.max=%d memory.high=max(deferred) cpu.max=%dus/100000us cpu.weight=%d (CH starts in cgroup; sandbox-ctl stays out)",
-			cg.Path, cgCfg.MemoryMaxBytes,
-			cgCfg.CPUMaxQuotaUs, cgCfg.CPUWeight)
-	} else {
-		logf("cgroup: no path configured, running without cgroup limits (no-cgroup mode)")
-	}
-
-	// Use the caller-owned read-side fetcher when a disk uses manifest://.
-	// The CLI wrapper creates cache/store clients only on its first actual
-	// OpenManifest; file-only configs never dial. snapshot --upload builds its
-	// own write-side Ingester at request time, so the two paths do not share a
-	// connection pool.
-	fetcher := opts.Fetcher
-	if needsManifest {
-		if opts.ManifestCfg != nil {
-			logf("manifest fetcher: store=%s cache=%s crypto=%s/%s",
-				opts.ManifestCfg.Store.Endpoint, opts.ManifestCfg.Cache.Endpoint,
-				opts.ManifestCfg.Crypto.Chunk, opts.ManifestCfg.Crypto.Manifest)
-		}
-	}
-
-	// Resolve the root disk(s) and image config by mode (docs/sandbox-runtime
-	// .md §3.1):
-	//   - overlay mode: blk0 is the read-only erofs image (boot.root.base);
-	//     the launch defaults (image config) are read from its appended ZIP.
-	//   - single-disk mode: blk0 is the writable ext4 CoW built below; there
-	//     is no erofs image and thus no image config, so launch.exec must be
-	//     set (enforced by config.validate). blk0Reader stays nil.
-	var blk0Reader vhost.BlockReader // overlay mode only (ro erofs base)
-	var imageCfg *ImageConfig
-	if opts.Cfg.SingleDisk() {
-		imageCfg = &ImageConfig{}
-	} else {
-		r, _, err := OpenRootImageBlockReaderWithOpener(ctx, opts.Cfg.Boot.Root.Base, fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired, fileOpener)
-		if err != nil {
-			return -1, fmt.Errorf("blk0 base: %w", err)
-		}
-		blk0Reader = r
-		defer blk0Reader.Close()
-		// Both file:// and manifest:// blk0 produce a vhost.BlockReader that is
-		// also a concurrent-safe io.ReaderAt; LoadImageConfigFrom does the
-		// ZIP-trailer scan over either source uniformly.
-		imageCfg, err = LoadImageConfigFrom(blk0Reader, blk0Reader.Size())
-		if err != nil {
-			return -1, fmt.Errorf("load rootfs image config: %w", err)
-		}
-		logf("image config: cmd=%v entrypoint=%v workdir=%q env-keys=%d",
-			imageCfg.Cmd, imageCfg.Entrypoint, imageCfg.WorkingDir, len(imageCfg.Env))
-	}
-	// Merge image config defaults with sandbox.yaml `launch:` overrides.
-	launchSpec, err := MergeLaunch(imageCfg, opts.Cfg.Launch)
-	if err != nil {
-		return -1, fmt.Errorf("launch spec: %w", err)
-	}
-
-	// Network acquisition. tapfd mode (docs/tapfd.md §3) receives a tap queue
-	// fd + metadata from either an exec helper or a persistent provider socket;
-	// tap-name mode was verified above and CH opens it. The handoff metadata
-	// overrides the static mac/ip attrs. The resolved spec travels
-	// through the launch handshake; nil → "no IP configuration" to sandbox-init.
-	var tapFile, netnsFile *os.File
-	var metaMAC, metaIP string
-	if opts.Cfg.Network.TapFD != nil {
-		f, nsf, meta, err := tapfd.AcquireConfig(ctx, opts.Cfg.Network.TapFD)
-		if err != nil {
-			return -1, fmt.Errorf("tapfd handoff: %w", err)
-		}
-		tapFile = f
-		defer tapFile.Close()
-		netnsFile = nsf // non-nil only if the provider's tap is netns-isolated
-		if netnsFile != nil {
-			defer netnsFile.Close()
-		}
-		metaMAC, metaIP = meta.MAC, meta.IP
-		logf("tapfd: received tap fd (mac=%s ip=%s netns=%t)", meta.MAC, meta.IP, netnsFile != nil)
-	}
-	netMAC, netSpec := opts.Cfg.Network.Effective(metaMAC, metaIP)
-	launchSpec.Network = netSpec
-
-	// Environment setup carried in the launch spec (applied guest-side
-	// before the app forks): mounts (incl. image Volumes → empty mounts),
-	// injected files, one-shot init, and the shutdown grace.
-	launchSpec.Mounts = effectiveMounts(opts.Cfg.Mounts, imageCfg.Volumes)
-	launchSpec.Files = opts.Cfg.ProtoFiles()
-	launchSpec.Init = toProtoInit(opts.Cfg.Init)
-	launchSpec.Plugins = toProtoPlugins(opts.Cfg.Launch.Plugin)
-	launchSpec.SharePID = opts.Cfg.Launch.PIDNamespace == "shared"
-	launchSpec.StopGraceSec = opts.Cfg.StopGraceSeconds()
-
-	// App stdio: tell sandbox-init what to wire (pty vs pipe channels);
-	// the launch-handshake connection becomes the stdio MUX after
-	// launch_ack (guestlink.LaunchServer.OnMUXReady below).
-	launchSpec.Stdio = opts.StdioMode.ProtoSpec()
-	if cols, rows, ok := opts.StdioMode.InitialWinsize(); ok {
-		launchSpec.Stdio.Winsize = &proto.Winsize{Cols: cols, Rows: rows}
-	}
-
-	// Build the writable CoW disk. In overlay mode it is blk1 (the ext4 upper
-	// over the erofs blk0); in single-disk mode it IS blk0 (the root disk).
-	// Either way: an optional read-only CoW base + a writable sparse diff.
-	var cowBase vhost.BlockReader
-	var diffURI, diffTemplate string
-	if opts.Cfg.SingleDisk() {
-		diffURI, diffTemplate = opts.Cfg.Boot.Root.Diff, opts.Cfg.Boot.Root.DiffTemplate
-		if opts.Cfg.Boot.Root.Base != "" {
-			refs := append([]string{opts.Cfg.Boot.Root.Base}, opts.Cfg.Boot.Root.BaseFromRefs...)
-			r, _, err := OpenLayeredBlockReaderWithOpener(ctx, refs, fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired, fileOpener)
-			if err != nil {
-				return -1, fmt.Errorf("single-disk root base: %w", err)
+// WaitRun adapts executable cancellation/signal policy to the SDK owner. It does
+// not register signal handlers. A second retained CLI signal still escalates.
+func WaitRun(ctx context.Context, r *Runtime) (int, error) {
+	signals := runSignalsFromContext(ctx)
+	done := ctx.Done()
+	for {
+		select {
+		case <-r.exitDone:
+			return r.exit.Code, r.exit.Err
+		case sig := <-signals:
+			r.signals <- sig
+		case <-done:
+			done = nil
+			// A retained OS signal is forwarded through signals. Plain parent
+			// cancellation has no such signal and must still request shutdown.
+			if signals == nil || !runShutdownRequested(ctx) {
+				r.signals <- syscall.SIGTERM
 			}
-			cowBase = r
-			defer cowBase.Close()
-		}
-	} else {
-		diffURI, diffTemplate = opts.Cfg.Boot.Root.Overlay.Diff, opts.Cfg.Boot.Root.Overlay.DiffTemplate
-		if opts.Cfg.Boot.Root.Overlay.Base != "" {
-			refs := append([]string{opts.Cfg.Boot.Root.Overlay.Base}, opts.Cfg.Boot.Root.Overlay.BaseFromRefs...)
-			r, _, err := OpenLayeredBlockReaderWithOpener(ctx, refs, fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired, fileOpener)
-			if err != nil {
-				return -1, fmt.Errorf("blk1 overlay base: %w", err)
-			}
-			cowBase = r
-			defer cowBase.Close()
 		}
 	}
-	// Resolve the diff path. Empty → auto-default to the on-disk base dir (NOT
-	// the tmpfs run dir — the writable layer must be on disk). An auto-defaulted
-	// diff is ours: removed when the sandbox ends.
-	ownedDiff := diffURI == ""
-	if ownedDiff {
-		if err := os.MkdirAll(baseDir, 0o755); err != nil {
-			return -1, fmt.Errorf("mkdir base dir %s: %w", baseDir, err)
-		}
-		diffURI = DefaultDiffURIForBaseDir(baseDir, opts.SandboxID)
-		defer func() {
-			_ = os.Remove(filepath.Join(baseDir, opts.SandboxID+".overlay.diff"))
-			_ = os.Remove(baseDir)
-		}()
-	}
-	_, diffPath, ok := config.SchemeAndPath(diffURI)
-	if !ok {
-		return -1, fmt.Errorf("boot.root diff invalid URI: %s", diffURI)
-	}
-	var baseSize int64
-	if cowBase != nil {
-		baseSize = cowBase.Size()
-	}
-	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize)
-	if err != nil {
-		return -1, fmt.Errorf("prepare diff: %w", err)
-	}
-	cacheSize, maxDirtySize, err := opts.Cfg.Resources.DiffCOW.Bytes()
-	if err != nil {
-		return -1, err
-	}
-	cowCache, err := vhost.NewCOWCache(cacheSize, maxDirtySize)
-	if err != nil {
-		return -1, err
-	}
-	defer func() {
-		retErr = errors.Join(retErr, cowCache.Close())
-		if retErr != nil {
-			code = -1
-		}
-	}()
-	cowOptions := []vhost.BlockCOWOption{vhost.WithCOWCache(cowCache)}
-	if opts.LocalCodec != nil {
-		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
-	}
-	cow, err := vhost.OpenBlockCOW(diffPath, cowBase, diffInit, cowOptions...)
-	if err != nil {
-		return -1, fmt.Errorf("root COW: %w", err)
-	}
-	defer func() {
-		retErr = errors.Join(retErr, cow.Close())
-		if retErr != nil {
-			code = -1
-		}
-	}()
-
-	// Root logical disk (Disks[0]): single → one writable Cow (blk0); overlay →
-	// ro erofs base (blk0) + writable Cow (blk1). Data disks (boot.disks[], in
-	// order) append their device(s) after the root.
-	disks := []DiskBackend{{
-		Overlay:   !opts.Cfg.SingleDisk(),
-		Reader:    blk0Reader, // nil in single-disk
-		Cow:       cow,
-		BasePath:  opts.Cfg.Boot.Root.Base, // overlay ro device stats path
-		DiffPath:  diffPath,
-		OwnedDiff: ownedDiff,
-	}}
-	for i := range opts.Cfg.Boot.Disks {
-		db, dcleanup, derr := prepColdDataDisk(ctx, &opts.Cfg.Boot.Disks[i], i, baseDir, opts.SandboxID, fetcher, opts.RefLocations, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener, cowCache)
-		if derr != nil {
-			return -1, derr
-		}
-		defer func() {
-			retErr = errors.Join(retErr, dcleanup())
-			if retErr != nil {
-				code = -1
-			}
-		}()
-		disks = append(disks, db)
-	}
-	// Resolve mounts[].type=disk → guest device paths (name→ordinal→/dev/vdX);
-	// clears the name (not sent to the guest).
-	resolveDiskMounts(launchSpec.Mounts, opts.Cfg.Boot.Disks, opts.Cfg.SingleDisk())
-
-	// The shared back-half (memfd, uffd va_report handler, vhost-blk
-	// backends, launch server, pinger, ctl.sock, signal escalation,
-	// stats) lives in ServeAndWait. Cold start supplies: ZeroSource
-	// faults, the merged launch spec whose conn becomes the stdio MUX
-	// (WireLaunchMUX), and a settle protocol gated on the guest's
-	// hello / launch_ack handshake.
-	params := VMParams{
-		BaseDir:            baseDir,
-		Balloon:            balloonCtl,
-		Ctx:                ctx,
-		SandboxID:          opts.SandboxID,
-		RunDir:             runDir,
-		Logf:               logf,
-		StdioMode:          opts.StdioMode,
-		PingFatalThreshold: opts.PingFatalThreshold,
-		StartUnixNs:        startUnixNs,
-		StatsJSONPath:      opts.StatsJSONPath,
-		StatsInterval:      opts.StatsInterval,
-
-		CapBytes:   int64(capBytes),
-		UffdSource: uffd.ZeroSource{},
-		Disks:      disks,
-
-		LaunchSpec:        launchSpec,
-		WireLaunchMUX:     true,
-		StartTimeout:      opts.Cfg.StartTimeoutDuration(),
-		VAReportDeadline:  opts.Cfg.VAReportDeadline(),
-		PingTimeout:       opts.Cfg.PingDeadline(),
-		AppNotifyDeadline: opts.Cfg.AppNotifyDeadline(),
-		Hooks:             hooks,
-		Memory:            memoryCtl,
-
-		TapFile:   tapFile, // nil in tap-name/no-network modes; non-nil tapfd is inherited at fd 4
-		NetMAC:    netMAC,
-		NetnsFile: netnsFile, // non-nil → launch CH inside the tap's netns
-
-		SnapCfg:           opts.Cfg,
-		PortableConfig:    c0,
-		SourceBinding:     opts.SourceBinding,
-		MemoryBinding:     opts.MemoryBinding,
-		ManifestCfg:       opts.ManifestCfg,
-		CustomerKeyFn:     opts.CustomerKeyFn,
-		LocalCodec:        opts.LocalCodec,
-		LocalRequired:     opts.LocalRequired,
-		Forwards:          opts.Forwards,
-		Cgroup:            cg,
-		NotifyReadiness:   opts.NotifyReadiness,
-		ReadyOnAppStarted: true,
-
-		BuildCmd: func(e CmdEnv) (*exec.Cmd, func(), error) {
-			_, kernelPath, _ := config.SchemeAndPath(opts.Cfg.Boot.Kernel)
-			_, runtimePath, _ := config.SchemeAndPath(opts.Cfg.Boot.Runtime)
-			// CH process stdio (docs/sandbox.md §5.2): stdin = /dev/null
-			// (so CH's `--console tty` never raw-izes a terminal), stderr
-			// = our stderr (CH WARN), stdout = the kernel-dmesg sink per
-			// --console. The returned consoleArg goes into the cmdline.
-			cmd := exec.Command(opts.CHBinary)
-			consoleArg, cleanup, err := opts.StdioMode.SetupCHStdio(cmd)
-			if err != nil {
-				return nil, nil, fmt.Errorf("stdio: %w", err)
-			}
-			args, err := CHCommandWithInitialBudget(opts.Cfg, initialBudget, e.Disks, e.CHSock, e.VsockBase, kernelPath, runtimePath, e.UffdSock, consoleArg, e.TapFDNum, e.NetMAC)
-			if err != nil {
-				cleanup()
-				return nil, nil, fmt.Errorf("CH cmdline: %w", err)
-			}
-			cmd.Args = append(cmd.Args, args...)
-			logf("CH args: %s", strings.Join(args, " "))
-			return cmd, cleanup, nil
-		},
-
-		// Cold-start settle: the command-line balloon target remains the sole
-		// target until launch_ack. The ACK opens the local report barrier;
-		// node Settled remains an independent lifecycle notification.
-		PostSpawn: func(pc PostSpawnCtx) error {
-			go func() {
-				select {
-				case <-pc.Launch.HelloDone():
-					pc.Pinger.Start(pc.Ctx)
-				case <-pc.Ctx.Done():
-					return
-				}
-				select {
-				case <-pc.Launch.LaunchAckDone():
-					if pc.Memory != nil {
-						pc.Memory.StartSensor(pc.Ctx)
-					}
-					if err := pc.Hooks.Settled(); err != nil {
-						pc.Logf("settled: %v", err)
-					}
-					if pc.Hooks.Enabled() {
-						pc.Hooks.StartHeartbeat(pc.Ctx, 5*time.Second)
-					}
-				case <-pc.Ctx.Done():
-				}
-			}()
-			return nil
-		},
-	}
-	applyRunCaptureSources(&params, opts)
-	return ServeAndWait(params)
 }
 
 // applyRunCaptureSources carries the logical and physical source resolvers into
@@ -1357,90 +986,6 @@ func resolveDiskMounts(mounts []proto.MountSpec, disks []config.DiskConfig, root
 	}
 }
 
-// prepColdDataDisk resolves one boot.disks[] data disk for cold start: opens its
-// optional ro base(s) and builds its writable CoW diff (same machinery as the
-// root). ordinal is its boot.disks[] index (used for the auto-default diff name).
-// The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func prepColdDataDisk(ctx context.Context, d *config.DiskConfig, ordinal int, baseDir, sandboxID string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, diffCustomerKey [32]byte, required bool, opener FileStreamOpener, cowCache *vhost.COWCache) (DiskBackend, func() error, error) {
-	var db DiskBackend
-	var closers []func() error
-	cleanup := func() error {
-		var err error
-		for i := len(closers) - 1; i >= 0; i-- {
-			err = errors.Join(err, closers[i]())
-		}
-		return err
-	}
-	fail := func(e error) (DiskBackend, func() error, error) { return DiskBackend{}, nil, errors.Join(e, cleanup()) }
-
-	single := d.RootConfig.Single()
-	db.Overlay = !single
-	field := fmt.Sprintf("boot.disks[%d]", ordinal)
-
-	var cowBaseURI, diffURI, diffTemplate string
-	if single {
-		cowBaseURI, diffURI, diffTemplate = d.Base, d.Diff, d.DiffTemplate
-	} else {
-		r, _, err := OpenRootImageBlockReaderWithOpener(ctx, d.Base, fetcher, locations, codec, required, opener)
-		if err != nil {
-			return fail(fmt.Errorf("%s erofs base: %w", field, err))
-		}
-		db.Reader, db.BasePath = r, d.Base
-		closers = append(closers, r.Close)
-		cowBaseURI, diffURI, diffTemplate = d.Overlay.Base, d.Overlay.Diff, d.Overlay.DiffTemplate
-	}
-
-	var cowBase vhost.BlockReader
-	if cowBaseURI != "" {
-		var fromRefs []string
-		if single {
-			fromRefs = d.BaseFromRefs
-		} else {
-			fromRefs = d.Overlay.BaseFromRefs
-		}
-		refs := append([]string{cowBaseURI}, fromRefs...)
-		r, _, err := OpenLayeredBlockReaderWithOpener(ctx, refs, fetcher, locations, codec, required, opener)
-		if err != nil {
-			return fail(fmt.Errorf("%s cow base: %w", field, err))
-		}
-		cowBase = r
-		closers = append(closers, r.Close)
-	}
-
-	if diffURI == "" { // auto-default a per-disk diff on the base dir; ours to remove
-		if err := os.MkdirAll(baseDir, 0o755); err != nil {
-			return fail(fmt.Errorf("%s mkdir base dir: %w", field, err))
-		}
-		diffURI = DefaultDiskDiffURI(baseDir, sandboxID, fmt.Sprintf("disk%d", ordinal))
-		_, p, _ := config.SchemeAndPath(diffURI)
-		db.OwnedDiff = true
-		closers = append(closers, func() error { _ = os.Remove(p); return nil })
-	}
-	_, diffPath, ok := config.SchemeAndPath(diffURI)
-	if !ok {
-		return fail(fmt.Errorf("%s diff invalid URI: %s", field, diffURI))
-	}
-	var baseSize int64
-	if cowBase != nil {
-		baseSize = cowBase.Size()
-	}
-	diffInit, err := PrepareDiff(diffPath, diffTemplate, baseSize)
-	if err != nil {
-		return fail(fmt.Errorf("%s prepare diff: %w", field, err))
-	}
-	cowOptions := []vhost.BlockCOWOption{vhost.WithCOWCache(cowCache)}
-	if codec != nil {
-		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, required))
-	}
-	cow, err := vhost.OpenBlockCOW(diffPath, cowBase, diffInit, cowOptions...)
-	if err != nil {
-		return fail(fmt.Errorf("%s COW: %w", field, err))
-	}
-	closers = append(closers, cow.Close)
-	db.Cow, db.DiffPath = cow, diffPath
-	return db, cleanup, nil
-}
-
 // allQuiescer drives Quiesce/Resume on every vhost backend together (root +
 // data-disk devices, in device order).
 type allQuiescer struct{ servers []*vhost.Server }
@@ -1542,7 +1087,10 @@ func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
 	return h.handle(req, "", nil)
 }
 
-func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
+func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (ctl.Response, error) {
+	return h.handleContext(h.Context, req, cgroupPath, chExited)
+}
+func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
 	if err := h.capture.begin(); err != nil {
 		return ctl.Response{}, err
 	}
@@ -1563,7 +1111,7 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 			return ctl.Response{}, errors.New("snapshot: Cloud Hypervisor process is not started")
 		}
 	}
-	return handleSnapshotRequest(h.Context, req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, chProcess, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
+	return handleSnapshotRequest(ctx, req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, chProcess, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
 }
 
 // HandleExport follows the same response-ownership contract as Handle.
@@ -1571,7 +1119,10 @@ func (h *SnapshotHandler) HandleExport(req ctl.Request) (ctl.Response, error) {
 	return h.handleExport(req, "", nil)
 }
 
-func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
+func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (ctl.Response, error) {
+	return h.handleExportContext(h.Context, req, cgroupPath, chExited)
+}
+func (h *SnapshotHandler) handleExportContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
 	if err := h.capture.begin(); err != nil {
 		return ctl.Response{}, err
 	}
@@ -1592,7 +1143,7 @@ func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExi
 			return ctl.Response{}, errors.New("export: Cloud Hypervisor process is not started")
 		}
 	}
-	return handleExportRequest(h.Context, req, opts, h.Disks, h.Servers, h.CHSock, h.RunDir,
+	return handleExportRequest(ctx, req, opts, h.Disks, h.Servers, h.CHSock, h.RunDir,
 		cgroupPath, chExited, chProcess, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
 }
 

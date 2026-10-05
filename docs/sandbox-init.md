@@ -84,43 +84,42 @@ See the [Native guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main
 
 ## 3. The three sandbox-init phases
 
-### 3.1 Phase 1: early mounts, concurrent launch-spec fetch and switch-root
+### 3.1 Phase 1: base runtime, wait for launch, workload root and switch-root
 
-The launch spec contains fields such as `mounts`, including `empty` volumes,
-that drive rootfs assembly. The **hello/launch handshake runs concurrently
-with the spec-independent mount chain**. Its goroutine performs only socket
-operations and no filesystem path lookup. The mount chain does resolve paths;
-the safety condition is that the handshake does not use those paths and
-finishes before the process-wide `chroot`. Go threads share `CLONE_FS`, so
-switch-root must follow the join.
+Base initialization is workload-independent. It mounts only proc/sysfs/devtmpfs,
+starts loopback and the reverse control dispatcher, then announces
+`hello{phase:"runtime_ready"}`. The dispatcher answers ping and shutdown while
+waiting; workload-only exec/connect/quiesce/attach/restore are rejected. A listening
+socket alone is not this readiness barrier. `shutdown` replies `ack` before
+termination. After workload publication, the dispatcher uses the supervisor and
+its stdio bridge for the existing live operations.
+
+The launch request drives all workload root assembly. Waiting for it has no
+launch execution deadline; the host starts that deadline after publishing launch.
+The handshake completes before process-wide chroot. Go threads share CLONE_FS;
+the base control path uses sockets and does not access workload paths while root
+switching occurs.
 
 ```
-A. Before everything else (sockets, no rootfs dependency):
-   - raw netlink RTM_NEWLINK(lo, IFF_UP)
-       Kernel supplies 127.0.0.1/8 and ::1/128; no RTM_NEWADDR.
-       Failure is fatal: a guest whose loopback cannot start is unusable.
-   - AF_VSOCK bind+listen :5000
-       The host-to-guest reverse listener must open before hello.
-   - go handshake{ connect(CID=2:5000) -> write hello -> read launch }
-       Return spec and conn through a channel.
-
-B. Concurrent spec-independent mount chain:
-   1. mount proc/sysfs/devtmpfs at /proc /sys /dev
-      Skip /dev EBUSY when CONFIG_DEVTMPFS_MOUNT=y already mounted it.
-   2. Wait for /dev/vda and /dev/vdb: stat polling, 10 s timeout.
-   3. mount -t erofs -o ro /dev/vda /overlay/lower
+A. Base runtime:
+   - bind/listen AF_VSOCK :5000
+   - mount proc/sysfs/devtmpfs on /proc /sys /dev
+     Skip /dev EBUSY when CONFIG_DEVTMPFS_MOUNT=y mounted it already.
+   - raw netlink RTM_NEWLINK(lo, IFF_UP); failure is fatal
+     Kernel supplies 127.0.0.1/8 and ::1/128; no RTM_NEWADDR.
+   - start reverse management dispatcher
+B. connect(CID=2:5000), send hello{phase:"runtime_ready"}, wait for launch
+   No workload device is mounted or consumed in A/B.
+C. Only after launch (and host publication of every block backend):
+   1. Wait for /dev/vda and /dev/vdb: stat polling, 10 s timeout.
+   2. mount -t erofs -o ro /dev/vda /overlay/lower
       mount -t ext4 /dev/vdb /overlay/upper
-   4. Create /overlay/upper/{upperdir,workdir} if absent.
-   5. mount -t overlay overlay -o lowerdir=/overlay/lower,
+   3. Create /overlay/upper/{upperdir,workdir} if absent.
+   4. mount -t overlay overlay -o lowerdir=/overlay/lower,
         upperdir=/overlay/upper/upperdir,workdir=/overlay/upper/workdir /sysroot
-   6. mkdir -p /sysroot/opt/sandbox-runtime
+   5. mkdir -p /sysroot/opt/sandbox-runtime
       mount --bind /opt/sandbox-runtime /sysroot/opt/sandbox-runtime
-      The pmem payload root is projected into the new root. Its source loses
-      pathname reachability after switch-root, but E's MS_MOVE carries this
-      bind with the subtree, like D's volume binds. Its EROFS source is read-only.
-
-C. JOIN: spec, conn := <-handshake
-   Obtain LaunchSpec and the connection reused through launch_ack.
+      The read-only pmem payload bind moves with the new root subtree.
 
 D. Spec-dependent work before switch-root (empty volumes need the raw ext4 source):
    for each mounts[].type == empty:
@@ -133,7 +132,7 @@ D. Spec-dependent work before switch-root (empty volumes need the raw ext4 sourc
 E. switch-root:
    MS_MOVE /proc /sys /dev -> /sysroot/{proc,sys,dev}
    chdir(/sysroot) -> MS_MOVE . / -> chroot(.)
-   MS_MOVE carries the whole subtree: proc/sys/dev, B6's payload bind,
+   MS_MOVE carries the whole subtree: proc/sys/dev, C5's payload bind,
    and D's volume binds all become part of the new /.
 
 F. Basic mounts after switch-root:
@@ -159,12 +158,12 @@ virtio-pmem at `/` using `root=/dev/pmem0 ... rootflags=dax=always`.
 Phase 1 replaces that view with the overlay, retaining
 `/opt/sandbox-runtime` through the bind carried into the new root.
 
-**Why concurrency is safe:** bind/listen must precede the host's launch write,
-which starts the ping ticker. Otherwise an early probe can miss the listener.
-The handshake does only socket work; the mount chain operates on the original
-root's paths. There is no concurrent filesystem use by the handshake goroutine.
-The process-wide chroot happens after JOIN, once that goroutine has exited.
-This overlaps the hello→launch round trip with overlay assembly.
+**Readiness and root ownership:** Linux may probe the fixed unbound disks during
+boot and receive IOERR. Base initialization never mounts them. The first workload
+mount follows Launch's all-device publication. The host starts pings at
+`runtime_ready`, and launch_ack/app_started retain their existing meanings;
+app_started does not prove execve success or application health. Existing memory
+snapshots use restore/attach, not this cold handshake.
 
 **Volume sources and relocation:** an `empty` volume's source is
 `/overlay/upper/volumes/<i>` on raw ext4, separate from `upperdir/` but on the
@@ -981,7 +980,7 @@ populates only fields relevant to its type. The complete types in
 ```jsonc
 {
   "type": "<one of §4.3>",
-  "phase": "ready",                    // hello: optional hint
+  "phase": "runtime_ready",            // cold hello: explicit base-ready barrier
   "launch": { ... LaunchSpec ... },    // launch, including stdio (§5.1)
   "exec": { "argv": [...], "env": {}, "cwd": "", "user": "", "stdio": {} },
   "connect": { "network": "tcp", "address": "127.0.0.1:49983", "accept": false },
@@ -1238,10 +1237,11 @@ not a host dial to guest CID 2; CID 2 denotes the host from inside the guest.
 sandbox-ctl                                               sandbox-init (guest)
 listen <base>_5000
 spawn CH -----------------------------------------------> kernel boot
-                                                          bring up lo; bind/listen :5000
-                      <--- hello{ready} ------------------ dial CID=2:5000 [conn A]
-launch{spec,stdio} --------------------------------------> concurrent mounts, join, switch-root
-start ping ticker after launch write                      apply network/mounts/files/init; stdio
+                                                          base mounts; lo UP; control dispatcher
+                      <--- hello{runtime_ready} ------------------ dial CID=2:5000 [conn A]
+start ping; wait for Launch                               wait (no workload root mounted)
+commit all backends; launch{spec,stdio} -----------------> assemble workload root; switch-root
+launch timeout starts                                    apply network/mounts/files/init; stdio
                       <--- launch_ack{stdio} ------------- prepared, before final app exec
 ack ----------------------------------------------------> conn A -> MUX
 initial SET_WINSIZE =====================================> tty mode; fork/exec primary app

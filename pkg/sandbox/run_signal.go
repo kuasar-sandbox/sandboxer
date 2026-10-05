@@ -3,9 +3,7 @@ package sandbox
 import (
 	"context"
 	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 )
 
 type runSignalContextKey struct{}
@@ -17,16 +15,11 @@ type runSignalStream struct {
 	vmContext         context.Context
 }
 
-// NotifyRunContext registers the sandbox lifecycle's signal source before
-// admission. The first SIGTERM/SIGINT cancels ctx and
-// ControllerWorkContext(ctx), aborting work which has not spawned CH yet. Once
-// CH exists, ServeAndWait keeps its backend services on VMLifecycleContext(ctx)
-// and consumes every retained signal through the existing graceful shutdown and
-// second-signal escalation protocol.
-func NotifyRunContext(parent context.Context) (context.Context, context.CancelFunc) {
-	source := make(chan os.Signal, 4)
-	signal.Notify(source, syscall.SIGTERM, syscall.SIGINT)
-	return newRunSignalContext(parent, source, func() { signal.Stop(source) })
+// RunSignalContext adapts a caller-owned signal stream to executable shutdown
+// policy. It never subscribes to OS signals. SDK lifecycle calls use a private
+// stream driven only by Close; the CLI registers SIGTERM/SIGINT itself.
+func RunSignalContext(parent context.Context, source <-chan os.Signal) (context.Context, context.CancelFunc) {
+	return newRunSignalContext(parent, source, nil)
 }
 
 func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSource func()) (context.Context, context.CancelFunc) {
@@ -76,7 +69,7 @@ func newRunSignalContext(parent context.Context, source <-chan os.Signal, stopSo
 
 // VMLifecycleContext returns the context used by services which must remain
 // alive while an already-spawned CH handles a retained shutdown signal. For
-// callers without NotifyRunContext it is the original context.
+// callers without RunSignalContext it is the original context.
 func VMLifecycleContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.Background()

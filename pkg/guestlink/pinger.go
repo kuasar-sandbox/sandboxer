@@ -161,11 +161,17 @@ func (p *Pinger) pauseContext(ctx context.Context, drainTimeout time.Duration) e
 	drainCtx, cancelDrain := context.WithTimeout(ctx, drainTimeout)
 	defer cancelDrain()
 	select {
-	case err := <-done:
+	case <-done:
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		return err
+		// done is the capture barrier: tick has returned, its deferred close
+		// has run, and no admitted ping transport can cross into quiesce. A
+		// failed ping is still recorded by tick/recordFailure (including fatal
+		// health policy), but it must not turn a completed drain into a capture
+		// failure. This matters after restore where CH may transiently close a
+		// CONNECT before OK while the next management connection is healthy.
+		return nil
 	case <-drainCtx.Done():
 		// Context cancellation is wired to the concrete short connection's
 		// deadline. Join after cancel so capture never continues while a stale

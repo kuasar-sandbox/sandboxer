@@ -2,6 +2,7 @@ package guestlink
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -89,3 +90,14 @@ func pipeConns(ctx context.Context, a, b net.Conn) {
 	}
 	closeBoth()
 }
+
+// OpenExec establishes a direct guest MUX without a CLI/control serialization.
+func OpenExec(ctx context.Context, hc *HostClient, spec *proto.ExecSpec) (net.Conn, proto.StdioSpec, error) {
+	if spec == nil || len(spec.Argv) == 0 {
+		return nil, proto.StdioSpec{}, fmt.Errorf("exec: empty argv")
+	}
+	return openMUXViaExecContext(ctx, hc, spec, proto.DeadlineExec)
+}
+
+// RelayExec joins a caller-owned stream to an established guest MUX.
+func RelayExec(ctx context.Context, a, b net.Conn) { pipeConns(ctx, a, b) }

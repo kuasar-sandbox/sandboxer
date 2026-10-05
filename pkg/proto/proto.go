@@ -426,6 +426,7 @@ const (
 	TypeLaunchAck    = "launch_ack"
 	TypeAppStarted   = "app_started"
 	TypeAppExited    = "app_exited"
+	TypeShutdown     = "shutdown" // base/runtime shutdown; reply ack precedes termination
 	TypePing         = "ping"
 	TypePong         = "pong"
 	TypeRestore      = "restore"

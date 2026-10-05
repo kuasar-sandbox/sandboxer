@@ -34,10 +34,8 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
 
 	"github.com/kuasar-sandbox/sandboxer/internal/journalio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
@@ -85,11 +83,14 @@ type Console struct {
 
 // Mode is the fully resolved stdio configuration for one run.
 type Mode struct {
-	TTY     bool // pty mode: app gets a real pty; sandbox-ctl's terminal goes raw
-	Stdin   Stream
-	Stdout  Stream
-	Stderr  Stream
-	Console Console
+	// WindowChanges is supplied by the executable; nil disables resize events.
+	// Bridge never installs process-wide signal handlers.
+	WindowChanges <-chan os.Signal
+	TTY           bool // pty mode: app gets a real pty; sandbox-ctl's terminal goes raw
+	Stdin         Stream
+	Stdout        Stream
+	Stderr        Stream
+	Console       Console
 }
 
 // Defaults: pipe mode, stdin off, stdout/stderr inherited, console→stderr.
@@ -330,22 +331,26 @@ func (m Mode) SetupCHStdio(cmd *exec.Cmd) (consoleArg string, cleanup func(), er
 // Bridge connects the resolved Mode's host-side endpoints to a live MUX
 // session's streams. streams is the negotiated set echoed in the *_ack
 // (use StreamSetFor). It returns a cleanup that, in tty mode, restores
-// the terminal and stops the SIGWINCH handler; in all modes it closes
+// the terminal and stops consuming caller-supplied resize events; in all modes it closes
 // any files it opened and waits for the guest→host pumps to drain
 // (which they do once the app exits / the session ends). ctx cancel or
 // session death also ends the pumps.
 func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamSet) (cleanup func(), err error) {
+	ctx, cancel := context.WithCancel(ctx)
 	var (
 		closers []io.Closer
 		waits   []func()
 		restore func()
 	)
 	cleanupAll := func() {
-		if restore != nil {
-			restore()
-		}
+		cancel()
 		for _, w := range waits {
 			w()
+		}
+		// Join input before restoring canonical terminal mode: a pending
+		// raw read must not become an uninterruptible canonical read.
+		if restore != nil {
+			restore()
 		}
 		for _, c := range closers {
 			_ = c.Close()
@@ -387,8 +392,7 @@ func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamS
 			_ = sess.SetWinsize(cols, rows)
 		}
 		// SIGWINCH → SET_WINSIZE
-		winch := make(chan os.Signal, 1)
-		signal.Notify(winch, syscall.SIGWINCH)
+		winch := m.WindowChanges
 		winchDone := make(chan struct{})
 		go func() {
 			defer close(winchDone)
@@ -398,22 +402,25 @@ func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamS
 					return
 				case <-sess.Done():
 					return
-				case <-winch:
+				case _, ok := <-winch:
+					if !ok {
+						return
+					}
 					if cols, rows, ok := getWinsize(fd); ok {
 						_ = sess.SetWinsize(cols, rows)
 					}
 				}
 			}
 		}()
-		// keystrokes → guest pty (leaked on exit: os.Stdin can't be
-		// unblocked; the process exits right after Bridge cleanup).
-		go func() { _, _ = io.Copy(pty, os.Stdin) }()
+		// keystrokes → guest pty; cancellation joins the borrowed stdin pump.
+		inputDone := make(chan struct{})
+		go func() { defer close(inputDone); _ = copyInput(ctx, pty, os.Stdin) }()
 		// guest pty output → terminal, verbatim
 		outDone := make(chan struct{})
 		go func() { defer close(outDone); _, _ = io.Copy(os.Stdout, pty) }()
 
 		waits = append(waits, func() {
-			signal.Stop(winch)
+			<-inputDone
 			<-winchDone
 			<-outDone
 		})
@@ -426,7 +433,7 @@ func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamS
 		var src io.ReadCloser
 		switch m.Stdin.Kind {
 		case StreamInherit:
-			src = io.NopCloser(os.Stdin)
+			src = os.Stdin
 		case StreamFile:
 			f, ferr := os.OpenFile(m.Stdin.Path, os.O_RDONLY, 0)
 			if ferr != nil {
@@ -438,10 +445,16 @@ func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamS
 			src = io.NopCloser(strings.NewReader(""))
 		}
 		st := sess.Stream(mux.StreamStdin)
+		// A blocked MUX write waits for peer credit and cannot observe ctx.
+		// Reset first during cleanup so joining the input pump is bounded.
+		waits = append(waits, func() { _ = st.Reset() })
+		inputDone := make(chan struct{})
 		go func() {
-			_, _ = io.Copy(st, src)
+			defer close(inputDone)
+			_ = copyInput(ctx, st, src)
 			_ = st.CloseWrite() // host stdin EOF → guest closes app's stdin
 		}()
+		waits = append(waits, func() { <-inputDone })
 	}
 	// stdout / stderr: guest → host
 	pipeOut := func(streamID uint8, s Stream, inherit *os.File) error {
@@ -527,4 +540,58 @@ func restoreTermios(fd int, t *unix.Termios) error {
 		return nil
 	}
 	return unix.IoctlSetTermios(fd, unix.TCSETS, t)
+}
+
+// copyInput borrows the file descriptor without changing flags or closing it.
+// Input has one consumer while bridged. Poll bounds idle stdin cancellation;
+// session teardown unblocks a pending MUX write before Bridge cleanup joins it.
+func copyInput(ctx context.Context, dst io.Writer, src io.Reader) error {
+	file, ok := src.(*os.File)
+	if !ok {
+		_, err := io.Copy(dst, src)
+		return err
+	}
+	fd := int(file.Fd())
+	buffer := make([]byte, 4096)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		n, err := unix.Poll(fds, 50)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if fds[0].Revents&unix.POLLNVAL != 0 {
+			return os.ErrClosed
+		}
+		n, err = unix.Read(fd, buffer)
+		if errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN) {
+			continue
+		}
+		if n > 0 {
+			written, writeErr := dst.Write(buffer[:n])
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+	}
 }

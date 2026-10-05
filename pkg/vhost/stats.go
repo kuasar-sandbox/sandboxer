@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -107,8 +108,9 @@ func (r *ReqStats) record(bytes uint64, latNs uint64, ok bool) {
 // Stats aggregates per-request counters plus coverage bitmaps for one
 // vhost-user-blk Server.
 type Stats struct {
-	name string
-	path string
+	originMu sync.RWMutex
+	name     string
+	path     string
 
 	read    ReqStats
 	write   ReqStats
@@ -327,9 +329,12 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	if s == nil {
 		return StatsSnapshot{}
 	}
+	s.originMu.RLock()
+	path := s.path
+	s.originMu.RUnlock()
 	snap := StatsSnapshot{
 		Name:        s.name,
-		Path:        s.path,
+		Path:        path,
 		BlockBytes:  s.blockBytes,
 		TotalBlocks: s.totalBlocks,
 		Read:        s.read.snapshot(),
@@ -427,3 +432,13 @@ func formatNs(ns uint64) string {
 // nowNs returns the current monotonic-clock nanoseconds. Used by the
 // processChain hot path; isolated as a helper so tests can stub it.
 var nowNs = func() int64 { return time.Now().UnixNano() }
+
+// SetOrigin updates binding provenance without resetting pre-launch counters.
+func (s *Stats) SetOrigin(path string) {
+	if s == nil {
+		return
+	}
+	s.originMu.Lock()
+	s.path = path
+	s.originMu.Unlock()
+}

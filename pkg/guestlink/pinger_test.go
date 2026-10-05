@@ -91,12 +91,8 @@ func TestPingerPauseResponseEOFIsDrainedButUnhealthy(t *testing.T) {
 			}
 			closePeer()
 			err := <-joined
-			if beforeOK {
-				if !errors.Is(err, io.EOF) {
-					t.Fatalf("CONNECT drain = %v, want EOF failure", err)
-				}
-			} else if err != nil {
-				t.Fatalf("snapshot: drain pinger before quiesce: %v", err)
+			if err != nil {
+				t.Fatalf("completed ping drain must not fail capture: %v", err)
 			}
 			stats := p.Stats.Snapshot()
 			if stats.Attempts != 1 || stats.Success != 0 || stats.DialError != 1 || stats.Timeout != 0 {

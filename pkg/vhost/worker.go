@@ -314,6 +314,8 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 	status := &statusSeg[len(statusSeg)-1]
 	statusValue := byte(BlkStatusOK)
 
+	// Pin the storage view once for all segments of this request.
+	backend := backendForRequest(s.backend)
 	bytesIO := 0
 	switch hdr.Type {
 	case BlkTypeIn:
@@ -324,7 +326,7 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 				// last segment may contain status byte at end; if it's only
 				// 1 byte, skip data here. Otherwise, use all but last byte.
 				if len(seg) > 1 {
-					n, err := s.readAt(q.readContext(), seg[:len(seg)-1], offset)
+					n, err := readBackendAt(q.readContext(), backend, seg[:len(seg)-1], offset)
 					if readretry.IsTerminal(err) {
 						return 0, err
 					}
@@ -340,7 +342,7 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 				}
 				continue
 			}
-			n, err := s.readAt(q.readContext(), seg, offset)
+			n, err := readBackendAt(q.readContext(), backend, seg, offset)
 			if readretry.IsTerminal(err) {
 				return 0, err
 			}
@@ -362,7 +364,7 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 			if i == 0 {
 				continue // header
 			}
-			n, err := s.writeAt(q.readContext(), seg, offset)
+			n, err := writeBackendAt(q.readContext(), backend, seg, offset)
 			if readretry.IsTerminal(err) {
 				return 0, err
 			}
@@ -382,7 +384,7 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 		}
 
 	case BlkTypeFlush:
-		if err := s.backend.Flush(); err != nil {
+		if err := backend.Flush(); err != nil {
 			statusValue = BlkStatusIOErr
 		}
 
@@ -405,6 +407,10 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 	}
 
 	if s.stats != nil {
+		_, suppressStats := backend.(interface{ suppressRequestStats() bool })
+		if suppressStats {
+			return bytesIO + 1, nil
+		}
 		latNs := uint64(nowNs() - startNs)
 		s.stats.Record(hdr.Type, uint64(bytesIO), latNs, *status == BlkStatusOK)
 		if bytesIO > 0 {

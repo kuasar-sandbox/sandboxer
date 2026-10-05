@@ -2,7 +2,7 @@
 
 # sandbox — 沙箱控制与制品生命周期
 
-`sandbox-ctl` 是 kuasar-sandbox 的单沙箱 host 控制面. 它负责显式冷启动、从 Sandbox 制品冷启动、内存恢复、live export、无 VM 的 image-to-Sandbox-E assembly、内存快照、制品发布以及运行期 `exec`/forward. Guest 侧协议见 [sandbox-init_zh.md](sandbox-init_zh.md)。
+`pkg/runtime` 是 kuasar-sandbox 的单沙箱 Go SDK；`sandbox-ctl` 是其命令行 adapter。 它负责显式冷启动、从 Sandbox 制品冷启动、内存恢复、live export、无 VM 的 image-to-Sandbox-E assembly、内存快照、制品发布以及运行期 `exec`/forward. Guest 侧协议见 [sandbox-init_zh.md](sandbox-init_zh.md)。
 
 本文只描述当前格式和行为。当前 reader 拒绝旧 `snapshot.cfg` 磁盘图 schema，不提供双读、自动迁移或跨版本兼容保证；这一格式边界不表示项目从未发布版本。
 
@@ -878,7 +878,7 @@ S.sandbox_ref -> E.sandbox.runtime.cfg
   + allowed restore host bindings = C0 for run --restore
 ```
 
-`C0` 在 VM side effect 前写入 run directory,之后字节不变. Live runtime 另持有不序列化的 `RunSourceBinding`:
+`C0` 在完整 launch 输入已知后、工作负载消费前写入 run directory，之后字节不变。基础 Runtime 不生成不完整的占位 C0。 Live runtime 另持有不序列化的 `RunSourceBinding`:
 
 - current `self` 对应的 source E/root artifact;
 - root payload 与 optional image config;
@@ -1311,24 +1311,87 @@ SIGKILL 测试覆盖进程终止, 不模拟物理掉电.
 
 ## 5. Cold start 与 `run --from`
 
-### 5.1 显式 cold start
+### 5.1 Runtime SDK 与显式冷启动
 
-普通 `run --config` 的准备与启动顺序：
+一等 Go API 位于 [`pkg/runtime`](../pkg/runtime/runtime.go)：
 
-```text
-T0 parse/merge/validate config and limits
-T1 open/check immutable refs and image defaults; derive kernel/runtime identities
-T2 project portable C0 and validate exactly one self
-T3 preflight active diff requirements and source binding
-T4 create run directory and atomically write sandbox.runtime.cfg once
-T5 acquire controller/cgroup resources; materialize active diffs and network binding
-T6 construct vhost block devices from payload-only streams
-T7 spawn/configure CH
-T8 launch sandbox-init spec and app
-T9 establish MUX/pinger/forward/resource lifecycle
+```go
+StartRuntime(ctx, RuntimeSpec) (*Runtime, error)
+(*Runtime).Launch(ctx, LaunchSpec) error
+Start(ctx, SandboxSpec) (*Runtime, error)
+Restore(ctx, RestoreSpec) (*Runtime, error)
 ```
 
-可预测的 config/ref/format 错误应在 preflight、controller/network/VM 副作用前失败。这不保证后续操作全部无副作用：创建 run directory、写 C0、创建 diff 和获取资源是可能失败并需要清理的后续步骤。已有 portable C0 的 kernel/runtime 验证差异见 [PortableSandboxConfig](sandbox_zh.md#portable-config)。
+`Start` 依次执行 `StartRuntime` 和 `Launch`；launch 失败时关闭内部创建的 owner。
+`Restore` 直接重建快照中的内存、CPU/设备状态和工作负载，在既有 restore ACK 与
+MUX 屏障后返回同一种 live owner。它不会先冷启动，也不要求旧快照发送
+`runtime_ready`。CLI 将既有 config/`--from` 输入转换为 SDK spec；跨进程管理命令
+继续使用本地控制传输。
+
+`RuntimeSpec` 包含 kernel/Bundle 绑定、CPU/内存及资源策略、宿主
+TAP/provider/namespace 要求、console/control 设置和有序的 `RuntimeDiskSpec`。
+每个逻辑盘固定名称、single/overlay 布局和逻辑容量。Overlay 展开为只读 base 加
+可写 upper，single 展开为一个可写设备。所有设备固定使用既有最小 virtio feature
+集合，不涉及设备热插拔。
+
+`LaunchSpec` 包含工作负载 root/data artifact 引用与可写路径、Guest
+IP/MTU/路由/hostname/interface、mounts、持久与临时 files、init、完整 process 配置
+（含 plugins、user、restart、PID namespace 和 cgroup delegation）、stdio、forwards
+及 artifact 访问上下文。`LaunchSpecFromConfig` 保留完整配置 ABI。
+`Credentials` 通过 `ArtifactCredentials{Config, CustomerKey}` 创建自有 storage，
+不读取或修改环境变量。也可借用 `Storage`、`Fetcher` 和 Bundle selector；调用方必须
+保持它们打开且不变直到 `Wait` 返回。Runtime 释放 SDK 创建的 reader、storage 和
+自动 diff，不删除调用方指定的 diff/template 路径。继承的 cgroup 和 forwarding FD
+采用借用或复制方式。Kernel/Bundle 路径及 artifact 输入在借用期间必须保持可读且不变；
+SDK 通过 TAP handoff 收到的 FD 归 Runtime 所有。Forwarding
+socket 路径必须尚未使用；已存在时 bind 失败，不删除原路径。
+
+基础启动在 CH boot 前建立未绑定设备。元数据可用，但数据请求立即以 IOERR 完成；
+未绑定请求不伪造零、不无限重试，也不成为 runtime-fatal storage error。
+Launch 先准备并验证全部 backend，再以一个原子发布点绑定整个集合。每个分段 virtio
+请求只使用同一个 binding view。发布后 Guest 才组装工作负载 root 并 switch root。
+绑定后的 backend 保留 COW writeback fatal hook、context-aware I/O、统计和 snapshot view。
+
+`Launch` 只接受一个工作负载。纯输入/状态校验失败可不消耗机会；进入 `launching`
+后失败或取消会终止 Runtime，不能替换为另一个工作负载。已确认的 `app_started`
+转换与 Close、取消和 CH exit 一起确定唯一 launch 成功结果。它保留既有启动就绪语义，
+不证明目标 execve 成功或应用健康。`runtime_ready` 后等待分配工作负载的时间不计入
+launch 执行超时。基础 Runtime 保持资源 reservation、controller heartbeat 和资源统计，
+但不会在 launch 前报告工作负载 ready 或 Settled。
+
+Operation context 限定 startup、launch、restore、live operation 和单次 wait。
+成功返回后取消 startup/launch context，不会杀死 Runtime 或使后续 lazy read 失效。
+取消 `Wait(ctx)` 只取消该次等待；清理后重复 Wait 观察同一份保留的 `ExitResult`。
+并发、幂等的 `Close` 由唯一 owner 请求优雅 VMM shutdown，在 CH exit 前保持 backend
+存活，等待自有工作退出后释放 storage。SDK 不安装 OS signal handler。CLI 注册
+SIGTERM/SIGINT，并保留第二次 signal 立即升级的行为。CLI 也通过
+`stdio.Mode.WindowChanges` 提供 SIGWINCH；SDK 只消费该 channel，不注册 signal。
+清理会取消并等待空闲 input pump，不关闭继承的 stdin。桥接期间每个输入 FD 只有一个消费者。
+
+Live `Exec`、`Snapshot`、`Export`、`Stats` 直接调用 owner。Exec 返回调用方负责关闭的
+Guest MUX connection 及协商后的 stdio spec。Capture 复用既有 `ctl.Request` 选项和
+E/S 输出 schema，不序列化为 CLI 命令。Exec 与 capture 要求工作负载已运行；资源统计
+也可在基础状态使用。SDK 不包含 scheduling、placement 或 runtime pool 策略。
+
+普通 CLI adapter 在启动基础 Runtime 前预检已知工作负载输入；使用拆分 API 的调用方
+可稍后提供这些输入：
+
+```text
+StartRuntime: 校验 shape 和 boot binding
+  -> 预留资源并获取宿主网络
+  -> 创建 memfd/UFFD、固定未绑定 vhost 设备及 control server
+  -> spawn CH -> Guest 基础初始化 -> runtime_ready
+Launch: 解析输入并形成完整、不可变的 portable C0/provenance
+  -> 准备全部 storage -> 校验全部设备 -> 发布 binding
+  -> 发送 launch -> 组装工作负载 root -> switch root/configure
+  -> launch_ack/MUX -> app_started/ready
+Close 或 exit: 回收 CH -> 等待自有服务/工作退出 -> 关闭保留的资源
+```
+
+CLI preflight 中可预测的 config/ref/format 错误仍在 VM 副作用前失败。拆分 launch
+必然在基础 VM 已存在后解析工作负载 artifact。C0 在完整 launch 输入已知时写入一次，
+早于 Guest 消费工作负载，之后保持不变。已有 portable C0 的 kernel/runtime 验证
+继续遵循 [PortableSandboxConfig](sandbox_zh.md#portable-config) 的规则。
 
 ### 5.2 CH command line boundary
 
@@ -2126,6 +2189,40 @@ Close 幂等，排空及关闭错误沿 run/restore 传播。销毁也必须等�
 必须先记录原始错误并通知 owner，再执行清理 I/O。回滚期间仍持有在途 I/O 所有权、冻结页及其额度，Close 不能提前释放文件或缓冲。清理错误在结束后追加，不掩盖原始失败。
 
 ## 12. Validation、错误与安全
+
+### 12.0 Runtime SDK 生命周期验证
+
+执行 `go test ./...` 和 `go test -race ./...`。
+[`runtime_sdk_test.go`](../pkg/sandbox/runtime_sdk_test.go) 使用真实子进程和 Unix socket
+验证资源所有权、base/launch 屏障、取消、并发 Close、保留的 Wait 结果、launch/stdio
+失败、后续 artifact read 及磁盘 payload 边界；这些测试不启动 Guest kernel。
+vhost binding 测试覆盖未绑定 IOERR、原子发布和在途分段请求；Guest socket 测试覆盖
+基础 ping/shutdown，以及拒绝仅适用于工作负载的操作。
+
+真实 VM 验收需要匹配且重新构建的 sandbox-init/runtime Bundle、patched Cloud
+Hypervisor、kernel、root 权限、`/dev/kvm`、prepared binaries 和 E2E image。
+执行 prepared owner cases：`sandbox.launch`、`sandbox.stdio`、`sandbox.disks`、
+`sandbox.diff-template`、`sandbox.encrypted-diff`、`sandbox.memory-budget`、
+`snapshot.capture`、`snapshot.restore`、`snapshot.restore-config`、`snapshot.disks`、
+`snapshot.encrypted-diff`、`snapshot.read-recovery`。还需使用拆分 SDK 延迟 Launch：
+基础 ping/stats 必须持续可用，全部磁盘必须一起绑定，Launch 前不得进行工作负载
+mount、exec 和 capture。恢复由旧 Guest 实现生成的快照，以确认 restore 不依赖
+cold hello。缺少 KVM 或 prepared product 前提表示未验证，不能记为成功。
+
+显式启用的 [`TestKVMRuntimeLaunch`](../pkg/runtime/kvm_test.go) 启动真实 Guest，
+在延迟 Launch 期间验证基础 ping/stats，拒绝基础阶段 exec，并在每次操作成功后
+取消其 context，再检查 live owner。输入必须是设置 `launch.placeholder: true`
+的本地配置，使用匹配且重新构建的启动 artifact；若启用网络，还须提供私有且已配置的 TAP：
+
+```bash
+SANDBOX_SDK_KVM_CONFIG=/path/to/private-placeholder.yaml \
+SANDBOX_SDK_KVM_CH="$BIN/cloud-hypervisor" \
+go test ./pkg/runtime -run '^TestKVMRuntimeLaunch$' -v -count=1 -timeout=3m
+```
+
+缺少这些环境输入时，测试会明确跳过；它不能替代上述 owner snapshot/restore、
+disk 和 stdio 验收用例。
+
 
 ### 12.1 Cold validation
 

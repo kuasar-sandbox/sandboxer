@@ -1020,7 +1020,7 @@ func (c *SandboxConfig) ValidateColdProjection() error {
 	return c.validateCold(false)
 }
 
-func (c *SandboxConfig) validateCold(requireCgroupCapability bool) error {
+func (c *SandboxConfig) validateRuntimeResources(requireCgroupCapability bool) error {
 	if _, _, err := c.Resources.DiffCOW.Bytes(); err != nil {
 		return err
 	}
@@ -1160,6 +1160,31 @@ func (c *SandboxConfig) validateCold(requireCgroupCapability bool) error {
 		if sb > capMem {
 			return fmt.Errorf("resources.startup.memory (%d) must be ≤ capacity.memory (%d)", sb, capMem)
 		}
+	}
+
+	return nil
+}
+
+// ValidateRuntime checks only base VM resources, boot artifacts, and host network.
+func (c *SandboxConfig) ValidateRuntime() error {
+	if err := c.validateRuntimeResources(true); err != nil {
+		return err
+	}
+	if err := requireFileAbs("boot.kernel", c.Boot.Kernel); err != nil {
+		return err
+	}
+	if err := requireRuntimeFileAbs("boot.runtime", c.Boot.Runtime); err != nil {
+		return err
+	}
+	if err := c.Network.validate(); err != nil {
+		return err
+	}
+	return c.Timeouts.validate()
+}
+
+func (c *SandboxConfig) validateCold(requireCgroupCapability bool) error {
+	if err := c.validateRuntimeResources(requireCgroupCapability); err != nil {
+		return err
 	}
 
 	if c.Boot.Kernel == "" {
