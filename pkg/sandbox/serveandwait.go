@@ -218,6 +218,7 @@ type SnapDiskRef struct {
 	OwnedDiff    bool
 	Size         int64
 	SnapshotView func() (io.ReadSeeker, []sparse.Extent, error)
+	WaitReady    func(context.Context) error
 	CheckError   func() error
 }
 
@@ -482,6 +483,7 @@ func ServeAndWait(p VMParams) (int, error) {
 			OwnedDiff:    d.OwnedDiff,
 			Size:         d.Cow.Size(),
 			SnapshotView: d.Cow.SnapshotView,
+			WaitReady:    d.Cow.WaitMaterialized,
 			CheckError:   d.Cow.Err,
 		})
 	}
@@ -777,7 +779,7 @@ func ServeAndWait(p VMParams) (int, error) {
 					backends = append(backends, &vhost.ReadOnlyBackend{R: d.Reader})
 				}
 				backends = append(backends, &vhost.CowBackend{C: d.Cow})
-				refs = append(refs, SnapDiskRef{DiffPath: d.DiffPath, OwnedDiff: d.OwnedDiff, Size: d.Cow.Size(), SnapshotView: d.Cow.SnapshotView, CheckError: d.Cow.Err})
+				refs = append(refs, SnapDiskRef{DiffPath: d.DiffPath, OwnedDiff: d.OwnedDiff, Size: d.Cow.Size(), SnapshotView: d.Cow.SnapshotView, WaitReady: d.Cow.WaitMaterialized, CheckError: d.Cow.Err})
 			}
 			snapHandler.Cfg = cfg
 			snapHandler.PortableConfig = c0

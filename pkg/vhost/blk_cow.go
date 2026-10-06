@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -37,6 +38,17 @@ type BlockCOW struct {
 	bitmap    []uint64 // each bit = one 4K block
 	blockMu   []sync.RWMutex
 	blockSize int64
+
+	materialMu       sync.Mutex
+	materialReaders  sync.WaitGroup
+	materialDone     chan struct{}
+	materialErr      error
+	materialTemplate diffTemplateSource
+	materialFresh    *freshDiffInit
+	materialCancel   context.CancelFunc
+	materialResolved []uint64
+	materialDiscard  bool
+	discardOnClose   bool
 }
 
 const (
@@ -53,28 +65,48 @@ func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions .
 	if err != nil {
 		return nil, err
 	}
-	diff, err := openBlockCOWDiff(diffPath, init, options)
-	if err != nil {
-		return nil, err
+
+	var diff *diffFile
+	var fresh *freshDiffInit
+	var bitmap []uint64
+	if !init.Existing && init.TemplatePath != "" {
+		fresh, err = createFreshDiffFile(diffPath, init, options.encryption)
+		if err != nil {
+			return nil, err
+		}
+		diff = fresh.diff
+		numBlocks := diff.logicalSize / cowBlockSize
+		bitmap = make([]uint64, int((numBlocks+63)/64))
+	} else {
+		diff, err = openBlockCOWDiff(diffPath, init, options)
+		if err != nil {
+			return nil, err
+		}
+		bitmap, err = diff.scanDirtyBlocks()
+		if err != nil {
+			_ = diff.Close()
+			return nil, fmt.Errorf("vhost: rebuild bitmap: %w", err)
+		}
 	}
+
 	size := diff.logicalSize
 	if base != nil && base.Size() > size {
-		_ = diff.Close()
+		if fresh != nil {
+			_ = fresh.abort()
+		} else {
+			_ = diff.Close()
+		}
 		return nil, fmt.Errorf("vhost: base size %d > diff size %d", base.Size(), size)
-	}
-	bitmap, err := diff.scanDirtyBlocks()
-	if err != nil {
-		_ = diff.Close()
-		return nil, fmt.Errorf("vhost: rebuild bitmap: %w", err)
 	}
 
 	cow := &BlockCOW{
-		base:      base,
-		diff:      diff,
-		size:      size,
-		bitmap:    bitmap,
-		blockMu:   make([]sync.RWMutex, cowLockStripes),
-		blockSize: cowBlockSize,
+		base:           base,
+		diff:           diff,
+		size:           size,
+		bitmap:         bitmap,
+		blockMu:        make([]sync.RWMutex, cowLockStripes),
+		blockSize:      cowBlockSize,
+		discardOnClose: options.discardOnClose,
 	}
 	cow.lifeCtx, cow.cancel = context.WithCancel(context.Background())
 	cow.cache = options.cache
@@ -82,6 +114,9 @@ func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions .
 		cow.cache, err = NewCOWCache(DefaultCOWCacheSize, DefaultCOWMaxDirtySize)
 		if err != nil {
 			cow.cancel()
+			if fresh != nil {
+				return nil, errors.Join(err, fresh.abort())
+			}
 			return nil, errors.Join(err, diff.Close())
 		}
 		cow.ownCache = true
@@ -91,7 +126,19 @@ func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions .
 		if cow.ownCache {
 			_ = cow.cache.Close()
 		}
+		if fresh != nil {
+			return nil, errors.Join(err, fresh.abort())
+		}
 		return nil, errors.Join(err, diff.Close())
+	}
+	if fresh != nil {
+		cow.materialDone = make(chan struct{})
+		cow.materialTemplate = fresh.template
+		cow.materialFresh = fresh
+		cow.materialResolved = make([]uint64, len(bitmap))
+		ctx, cancel := context.WithCancel(cow.lifeCtx)
+		cow.materialCancel = cancel
+		go cow.runMaterializer(ctx)
 	}
 	return cow, nil
 }
@@ -145,6 +192,20 @@ func (c *BlockCOW) markDirty(blk int64) {
 	c.bitmapMu.Lock()
 	defer c.bitmapMu.Unlock()
 	c.bitmap[blk/64] |= 1 << (uint64(blk) % 64)
+}
+
+func (c *BlockCOW) materialBlockResolved(blk int64) bool {
+	c.bitmapMu.RLock()
+	defer c.bitmapMu.RUnlock()
+	return len(c.materialResolved) != 0 && bitmapBlockDirty(c.materialResolved, blk)
+}
+
+func (c *BlockCOW) markMaterialResolved(blk int64) {
+	c.bitmapMu.Lock()
+	defer c.bitmapMu.Unlock()
+	if len(c.materialResolved) != 0 {
+		c.materialResolved[blk/64] |= 1 << (uint64(blk) % 64)
+	}
 }
 
 func (c *BlockCOW) blockLock(blk int64) *sync.RWMutex {
@@ -232,12 +293,25 @@ func (c *BlockCOW) readRangeLocked(ctx context.Context, buf []byte, offset int64
 			if err := ctx.Err(); err != nil {
 				return done, err
 			}
-			if bitmap == nil && c.base != nil && pos < c.base.Size() {
-				n, err := readBlock(ctx, c.base, chunk, pos)
-				if readretry.IsTerminal(err) || (err != nil && !errors.Is(err, io.EOF)) {
-					return done + n, err
+			if bitmap == nil {
+				c.materialMu.Lock()
+				materializing := c.materialTemplate != nil
+				c.materialMu.Unlock()
+				if materializing {
+					n, err := c.readLower(ctx, chunk, pos)
+					if err != nil {
+						return done + n, err
+					}
+					zeroSlice(chunk[n:])
+				} else if c.base != nil && pos < c.base.Size() {
+					n, err := readBlock(ctx, c.base, chunk, pos)
+					if readretry.IsTerminal(err) || (err != nil && !errors.Is(err, io.EOF)) {
+						return done + n, err
+					}
+					zeroSlice(chunk[n:])
+				} else {
+					zeroSlice(chunk)
 				}
-				zeroSlice(chunk[n:])
 			} else {
 				zeroSlice(chunk)
 			}
@@ -304,19 +378,203 @@ func (c *BlockCOW) writeBlockLocked(ctx context.Context, buf []byte, offset, blk
 		if upper {
 			return readFullAt(c.diff, page, start)
 		}
-		if c.base == nil || start >= c.base.Size() {
-			return nil
+		n, err := c.readLower(ctx, page, start)
+		if err != nil {
+			return fmt.Errorf("vhost: materialize block %d from lower: %w", blk, err)
 		}
-		readLen := min(c.blockSize, c.base.Size()-start)
-		n, err := readBlock(ctx, c.base, page[:readLen], start)
-		if readretry.IsTerminal(err) || (err != nil && !errors.Is(err, io.EOF)) {
-			return fmt.Errorf("vhost: materialize block %d from base: %w", blk, err)
-		}
-		if int64(n) != readLen {
-			return fmt.Errorf("vhost: materialize block %d from base: %w", blk, io.ErrUnexpectedEOF)
+		if n != len(page) {
+			return fmt.Errorf("vhost: materialize block %d from lower: %w", blk, io.ErrUnexpectedEOF)
 		}
 		return nil
 	})
+}
+
+func (c *BlockCOW) readLower(ctx context.Context, buf []byte, offset int64) (int, error) {
+	done := 0
+	c.materialMu.Lock()
+	template := c.materialTemplate
+	if template != nil {
+		c.materialReaders.Add(1)
+	}
+	c.materialMu.Unlock()
+	if template != nil {
+		defer c.materialReaders.Done()
+	}
+	for done < len(buf) {
+		pos := offset + int64(done)
+		length := min(len(buf)-done, int(c.blockSize-pos%c.blockSize))
+		chunk := buf[done : done+length]
+		usedTemplate := false
+		resolved := c.materialBlockResolved(pos / c.blockSize)
+		if template != nil && !resolved && pos < int64(template.Size()) {
+			run, err := template.RunAt(uint64(pos), uint64(length))
+			if err != nil && !errors.Is(err, io.EOF) {
+				return done, err
+			}
+			if err == nil && run.Kind() != sparse.Hole && run.Kind() != sparse.Zero {
+				n, readErr := template.ReadAt(ctx, chunk, uint64(pos))
+				done += n
+				if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(chunk)) {
+					return done, readErr
+				}
+				if n != len(chunk) {
+					return done, io.ErrUnexpectedEOF
+				}
+				usedTemplate = true
+			}
+		}
+		if usedTemplate {
+			continue
+		}
+		if c.base != nil && pos < c.base.Size() {
+			readLen := min(int64(length), c.base.Size()-pos)
+			n, err := readBlock(ctx, c.base, chunk[:readLen], pos)
+			if readretry.IsTerminal(err) || (err != nil && !errors.Is(err, io.EOF)) {
+				return done + n, err
+			}
+			zeroSlice(chunk[n:])
+		} else {
+			zeroSlice(chunk)
+		}
+		done += len(chunk)
+	}
+	return done, nil
+}
+
+func (c *BlockCOW) runMaterializer(ctx context.Context) {
+	err := c.materializeTemplate(ctx)
+	c.materialMu.Lock()
+	intentionalDiscard := c.materialDiscard && errors.Is(err, context.Canceled)
+	if intentionalDiscard {
+		err = nil
+	}
+	c.materialErr = err
+	template := c.materialTemplate
+	fresh := c.materialFresh
+	if err == nil {
+		c.materialTemplate = nil
+	}
+	done := c.materialDone
+	c.materialMu.Unlock()
+	if err == nil && template != nil {
+		c.materialReaders.Wait()
+		if intentionalDiscard && fresh != nil {
+			_ = fresh.failMaterialization()
+		} else {
+			_ = template.Close()
+		}
+	}
+	if err != nil && fresh != nil {
+		c.materialMu.Lock()
+		c.materialTemplate = nil
+		c.materialMu.Unlock()
+		c.materialReaders.Wait()
+		_ = fresh.failMaterialization()
+	}
+	c.bitmapMu.Lock()
+	c.materialResolved = nil
+	c.bitmapMu.Unlock()
+	if done != nil {
+		close(done)
+	}
+	if err != nil {
+		c.cache.mu.Lock()
+		report := c.cache.failLocked(fmt.Errorf("vhost: diff template materialization: %w", err))
+		c.cache.mu.Unlock()
+		if report != nil {
+			report(err)
+		}
+	}
+}
+
+func (c *BlockCOW) materializeTemplate(ctx context.Context) error {
+	c.materialMu.Lock()
+	template := c.materialTemplate
+	fresh := c.materialFresh
+	c.materialMu.Unlock()
+	if template == nil || fresh == nil {
+		return nil
+	}
+	block := make([]byte, cowBlockSize)
+	defer clear(block)
+	for offset := uint64(0); offset < template.Size(); {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		run, err := template.RunAt(offset, template.Size()-offset)
+		if err != nil {
+			return err
+		}
+		end := run.End()
+		if end <= offset || end > template.Size() {
+			return fmt.Errorf("invalid diff template sparse run")
+		}
+		if run.Kind() != sparse.Hole {
+			start := uint64(int64(offset) / cowBlockSize * cowBlockSize)
+			seedEnd := uint64(alignUp(int64(end), cowBlockSize))
+			for pos := start; pos < seedEnd; pos += cowBlockSize {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				blk := int64(pos) / cowBlockSize
+				lock := c.blockLock(blk)
+				lock.Lock()
+				if !c.blockDirty(blk) && !c.materialBlockResolved(blk) {
+					n, readErr := template.ReadAt(ctx, block, pos)
+					if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(block)) {
+						lock.Unlock()
+						return readErr
+					}
+					if n != len(block) {
+						lock.Unlock()
+						return io.ErrUnexpectedEOF
+					}
+					if _, writeErr := c.diff.WriteAt(block, int64(pos)); writeErr != nil {
+						lock.Unlock()
+						return writeErr
+					}
+					c.markDirty(blk)
+				}
+				lock.Unlock()
+			}
+		}
+		offset = end
+	}
+	if err := c.cache.drain(ctx, c); err != nil {
+		return err
+	}
+	if err := c.diff.Sync(); err != nil {
+		return fmt.Errorf("sync materialized diff: %w", err)
+	}
+	if err := commitFreshDiff(fresh.tmpPath, fresh.finalPath); err != nil {
+		return err
+	}
+	fresh.committed = true
+	if err := syncDirectory(filepath.Dir(fresh.finalPath)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *BlockCOW) WaitMaterialized(ctx context.Context) error {
+	c.materialMu.Lock()
+	done := c.materialDone
+	err := c.materialErr
+	c.materialMu.Unlock()
+	if done == nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-done:
+		c.materialMu.Lock()
+		defer c.materialMu.Unlock()
+		return c.materialErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Flush is the project's non-durable guest FLUSH: health check only, with no
@@ -366,6 +624,9 @@ func (c *BlockCOW) Discard(offset, length int64) error {
 		lock := c.blockLock(blk)
 		lock.Lock()
 		err := c.cache.discard(ctx, c, blk)
+		if err == nil {
+			c.markMaterialResolved(blk)
+		}
 		lock.Unlock()
 		if err != nil {
 			return err
@@ -382,6 +643,9 @@ func (c *BlockCOW) Discard(offset, length int64) error {
 // Snapshot orchestration calls this after quiescing every vhost backend, so the
 // dirty block contents stay stable for the view's lifetime.
 func (c *BlockCOW) SnapshotView() (io.ReadSeeker, []sparse.Extent, error) {
+	if err := c.WaitMaterialized(context.Background()); err != nil {
+		return nil, nil, err
+	}
 	_, endOp, err := c.begin(nil)
 	if err != nil {
 		return nil, nil, err
@@ -540,6 +804,15 @@ func (c *BlockCOW) end(cancel func()) {
 // real I/O before releasing plaintext and the FD. Base is closed by its owner.
 func (c *BlockCOW) Close() error {
 	c.closeOnce.Do(func() {
+		if c.materialCancel != nil {
+			if c.discardOnClose {
+				c.materialMu.Lock()
+				c.materialDiscard = true
+				c.materialMu.Unlock()
+				c.materialCancel()
+			}
+			_ = c.WaitMaterialized(context.Background())
+		}
 		c.cancel()
 		c.opMu.Lock()
 		c.opMu.Unlock() // canceled admission makes this a lifetime barrier only

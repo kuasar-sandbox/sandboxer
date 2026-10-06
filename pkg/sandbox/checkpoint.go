@@ -292,7 +292,7 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 		if d.SnapshotView == nil || d.Size <= 0 {
 			return opts, nil, nil, nil, fmt.Errorf("disk %d has invalid SnapshotView/size", i)
 		}
-		diffs[i] = snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff, SnapshotView: d.SnapshotView, CheckError: d.CheckError}
+		diffs[i] = snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff, SnapshotView: d.SnapshotView, WaitReady: d.WaitReady, CheckError: d.CheckError}
 		raw, _, err := currentDiskParentBinding(opts, i)
 		if err != nil {
 			return opts, nil, nil, nil, err

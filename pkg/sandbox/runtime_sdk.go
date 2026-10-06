@@ -726,6 +726,9 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			return DiskBackend{}, err
 		}
 		opts := []vhost.BlockCOWOption{vhost.WithCOWCache(cache)}
+		if owned {
+			opts = append(opts, vhost.WithDiscardOnClose())
+		}
 		if launchCodec(spec) != nil {
 			opts = append(opts, vhost.WithDiffEncryption(diffKey, launchRequired(spec)))
 		}

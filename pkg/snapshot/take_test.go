@@ -487,3 +487,44 @@ type recordingQuiescer struct {
 
 func (q *recordingQuiescer) Quiesce() { q.quiesce++ }
 func (q *recordingQuiescer) Resume()  { q.resume++ }
+
+func TestTakeWaitsForDiskInitializationBeforePause(t *testing.T) {
+	portable := exportTestPortable(t)
+	portable.Boot.Disks = nil
+	portable.Mounts = nil
+	q := &freezeTrackingQuiescer{}
+	mfd, err := memory.Create("wait-before-pause", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	sentinel := errors.New("stop-before-pause")
+	waited := false
+	_, err = Take(Sources{
+		Context: context.Background(), SandboxID: "wait-before-pause",
+		APISock: filepath.Join(t.TempDir(), "must-not-dial.sock"),
+		MemfdFD: mfd.FD(), MemfdSize: int64(mfd.Size()), StagingDir: t.TempDir(),
+		PortableConfig: portable, CHApiDeadline: time.Second, Quiescer: q,
+		Diffs: []DiskDiff{{
+			WaitReady: func(context.Context) error {
+				if q.frozen.Load() {
+					return errors.New("wait ran after quiesce")
+				}
+				waited = true
+				return sentinel
+			},
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				return bytes.NewReader(make([]byte, 4096)), nil, nil
+			},
+		}},
+	}, NewFileSink(t.TempDir(), "wait-before-pause", nil, false, nil), false)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Take error = %v, want %v", err, sentinel)
+	}
+	if !waited {
+		t.Fatal("disk initialization wait not called")
+	}
+	if q.quiesce.Load() != 0 {
+		t.Fatal("backend quiesced before initialization completed")
+	}
+}

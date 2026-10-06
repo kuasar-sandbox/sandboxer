@@ -607,6 +607,10 @@ func testDiffTemplateMatrixAndAtomicCommit(t *testing.T, dir string) {
 			_ = cow.Close()
 			t.Fatalf("seeded logical content mismatch for %s", name)
 		}
+		if err := cow.WaitMaterialized(context.Background()); err != nil {
+			_ = cow.Close()
+			t.Fatalf("wait materialized: %v", err)
+		}
 		if cow.DirtyCount() != 2 {
 			_ = cow.Close()
 			t.Fatalf("seeded dirty blocks=%d want=2", cow.DirtyCount())
@@ -1111,4 +1115,239 @@ func FuzzEncryptedDiffHeader(f *testing.F) {
 			_ = cow.Close()
 		}
 	})
+}
+
+func TestAsyncTemplatePublishesSelfContainedDiff(t *testing.T) {
+	const size = 8 * cowBlockSize
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "template.ext4")
+	finalPath := filepath.Join(dir, "active.diff")
+	want := patternedBytes(size)
+	writeSparseTemplate(t, templatePath, want, []sparse.Extent{{Offset: 0, Size: size}})
+
+	cow, err := OpenBlockCOW(finalPath, nil, DiffInit{TemplatePath: templatePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, size)
+	if _, err := cow.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("transient template fallback mismatch")
+	}
+	if err := cow.WaitMaterialized(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(finalPath); err != nil {
+		t.Fatalf("final diff not published: %v", err)
+	}
+	if err := cow.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(templatePath); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenBlockCOW(finalPath, nil, DiffInit{Existing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	clear(got)
+	if _, err := reopened.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("published diff depends on removed template")
+	}
+}
+
+func TestAsyncTemplateForegroundWriteWins(t *testing.T) {
+	const size = 32 * cowBlockSize
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "template.ext4")
+	finalPath := filepath.Join(dir, "active.diff")
+	want := bytes.Repeat([]byte{0x31}, size)
+	writeSparseTemplate(t, templatePath, want, []sparse.Extent{{Offset: 0, Size: size}})
+
+	cow, err := OpenBlockCOW(finalPath, nil, DiffInit{TemplatePath: templatePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	override := bytes.Repeat([]byte{0xa7}, cowBlockSize)
+	if _, err := cow.WriteAt(override, 7*cowBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := cow.WaitMaterialized(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, cowBlockSize)
+	if _, err := cow.ReadAt(got, 7*cowBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, override) {
+		t.Fatal("materializer overwrote foreground write")
+	}
+	if err := cow.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSnapshotViewWaitsForTemplateMaterialization(t *testing.T) {
+	const size = 16 * cowBlockSize
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "template.ext4")
+	finalPath := filepath.Join(dir, "active.diff")
+	want := patternedBytes(size)
+	writeSparseTemplate(t, templatePath, want, []sparse.Extent{{Offset: 0, Size: size}})
+
+	cow, err := OpenBlockCOW(finalPath, nil, DiffInit{TemplatePath: templatePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cow.Close()
+	view, holes, err := cow.SnapshotView()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holes) != 0 {
+		t.Fatalf("materialized full template has holes: %v", holes)
+	}
+	got, err := io.ReadAll(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("snapshot view mismatch")
+	}
+	if _, err := os.Stat(finalPath); err != nil {
+		t.Fatalf("snapshot returned before final publication: %v", err)
+	}
+}
+
+func TestAsyncTemplateMaterializationFailureIsFatalAndUnpublished(t *testing.T) {
+	const size = 4 * cowBlockSize
+	dir := t.TempDir()
+	finalPath := filepath.Join(dir, "active.diff")
+
+	fresh, err := createFreshDiffFile(finalPath, DiffInit{CreateSize: size}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh.template = failingDiffTemplate{size: size}
+	cow := &BlockCOW{
+		diff:             fresh.diff,
+		size:             size,
+		bitmap:           make([]uint64, 1),
+		blockMu:          make([]sync.RWMutex, cowLockStripes),
+		blockSize:        cowBlockSize,
+		materialDone:     make(chan struct{}),
+		materialTemplate: fresh.template,
+		materialFresh:    fresh,
+	}
+	cow.lifeCtx, cow.cancel = context.WithCancel(context.Background())
+	cow.cache, err = NewCOWCache(DefaultCOWCacheSize, DefaultCOWMaxDirtySize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cow.ownCache = true
+	if err := cow.cache.attach(cow); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(cow.lifeCtx)
+	cow.materialCancel = cancel
+	go cow.runMaterializer(ctx)
+
+	if err := cow.WaitMaterialized(context.Background()); err == nil {
+		t.Fatal("materialization failure was not reported")
+	}
+	if err := cow.Err(); err == nil {
+		t.Fatal("materialization failure was not latched into COW health")
+	}
+	if _, err := os.Stat(finalPath); !os.IsNotExist(err) {
+		t.Fatalf("failed materialization published final path: %v", err)
+	}
+	if partials, _ := filepath.Glob(filepath.Join(dir, ".active.diff.*.partial")); len(partials) != 0 {
+		t.Fatalf("failed materialization left temporary files: %v", partials)
+	}
+	_ = cow.Close()
+}
+
+func TestAsyncTemplateDiscardDoesNotReintroduceTemplateBlock(t *testing.T) {
+	const size = 64 * cowBlockSize
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "template.ext4")
+	finalPath := filepath.Join(dir, "active.diff")
+	template := bytes.Repeat([]byte{0x4d}, size)
+	writeSparseTemplate(t, templatePath, template, []sparse.Extent{{Offset: 0, Size: size}})
+	base := bytes.Repeat([]byte{0x2b}, size)
+
+	cow, err := OpenBlockCOW(finalPath, &fakeReader{data: base}, DiffInit{TemplatePath: templatePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const blk = int64(17)
+	if err := cow.Discard(blk*cowBlockSize, cowBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, cowBlockSize)
+	if _, err := cow.ReadAt(got, blk*cowBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, base[blk*cowBlockSize:(blk+1)*cowBlockSize]) {
+		t.Fatal("discarded block still fell through to template")
+	}
+	if err := cow.WaitMaterialized(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	clear(got)
+	if _, err := cow.ReadAt(got, blk*cowBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, base[blk*cowBlockSize:(blk+1)*cowBlockSize]) {
+		t.Fatal("materializer reintroduced discarded template block")
+	}
+	if err := cow.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAsyncTemplateEphemeralCloseCancelsWithoutFatal(t *testing.T) {
+	const size = 128 << 20
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "template.ext4")
+	finalPath := filepath.Join(dir, "active.diff")
+	f, err := os.OpenFile(templatePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	block := bytes.Repeat([]byte{0x33}, cowBlockSize)
+	for off := int64(0); off < size; off += 1 << 20 {
+		if _, err := f.WriteAt(block, off); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cow, err := OpenBlockCOW(finalPath, nil, DiffInit{TemplatePath: templatePath}, WithDiscardOnClose())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cow.Close(); err != nil {
+		t.Fatalf("ephemeral close: %v", err)
+	}
+	if _, err := os.Stat(finalPath); err == nil {
+		// Completion may race and legitimately publish before Close can cancel.
+		_ = os.Remove(finalPath)
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if partials, _ := filepath.Glob(filepath.Join(dir, ".active.diff.*.partial")); len(partials) != 0 {
+		t.Fatalf("ephemeral close left partials: %v", partials)
+	}
 }

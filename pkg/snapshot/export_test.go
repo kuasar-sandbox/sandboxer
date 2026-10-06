@@ -275,3 +275,38 @@ func exportTestPortable(t *testing.T) *config.PortableSandboxConfig {
 	}
 	return cfg
 }
+
+func TestExportWaitsForDiskInitializationBeforePause(t *testing.T) {
+	portable := exportTestPortable(t)
+	portable.Boot.Disks = nil
+	portable.Mounts = nil
+	q := &recordingQuiescer{}
+	sentinel := errors.New("stop-before-pause")
+	waited := false
+	_, err := Export(context.Background(), ExportSources{
+		SandboxID:        "wait-before-pause",
+		APISock:          filepath.Join(t.TempDir(), "must-not-dial.sock"),
+		CHApiDeadline:    time.Second,
+		PortableConfig:   portable,
+		ParentSandboxRef: "file://parent.sandbox@digest:" + strings.Repeat("a", 64),
+		Quiescer:         q,
+		Diffs: []DiskDiff{{
+			WaitReady: func(context.Context) error {
+				waited = true
+				return sentinel
+			},
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				return bytes.NewReader(make([]byte, 4096)), nil, nil
+			},
+		}},
+	}, &captureSink{}, false)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Export error = %v, want %v", err, sentinel)
+	}
+	if !waited {
+		t.Fatal("disk initialization wait not called")
+	}
+	if q.quiesce != 0 {
+		t.Fatal("backend quiesced before initialization completed")
+	}
+}

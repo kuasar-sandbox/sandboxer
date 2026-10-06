@@ -91,6 +91,8 @@ type DiskDiff struct {
 	Owned        bool
 	MergeBase    string
 	SnapshotView func() (io.ReadSeeker, []sparse.Extent, error)
+	// WaitReady resolves transient writable-diff initialization before the VM is paused.
+	WaitReady func(context.Context) error
 	// CheckError rechecks asynchronous COW failures, including after the last read.
 	CheckError func() error
 }
@@ -178,6 +180,13 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	for i := range s.Diffs {
+		if s.Diffs[i].WaitReady != nil {
+			if err := s.Diffs[i].WaitReady(ctx); err != nil {
+				return nil, fmt.Errorf("snapshot: disk %d initialization: %w", i, err)
+			}
+		}
 	}
 	out := &Outputs{MemorySize: uint64(s.MemfdSize)}
 	ch := chapi.Client{Sock: s.APISock, RespDeadline: s.CHApiDeadline}
