@@ -39,16 +39,18 @@ type BlockCOW struct {
 	blockMu   []sync.RWMutex
 	blockSize int64
 
-	materialMu       sync.Mutex
-	materialReaders  sync.WaitGroup
-	materialDone     chan struct{}
-	materialErr      error
-	materialTemplate diffTemplateSource
-	materialFresh    *freshDiffInit
-	materialCancel   context.CancelFunc
-	materialResolved []uint64
-	materialDiscard  bool
-	discardOnClose   bool
+	materialMu        sync.Mutex
+	materialReaders   sync.WaitGroup
+	materialReady     chan struct{}
+	materialReadyOnce sync.Once
+	materialDone      chan struct{}
+	materialErr       error
+	materialTemplate  diffTemplateSource
+	materialFresh     *freshDiffInit
+	materialCancel    context.CancelFunc
+	materialResolved  []uint64
+	materialDiscard   bool
+	discardOnClose    bool
 }
 
 const (
@@ -132,6 +134,7 @@ func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions .
 		return nil, errors.Join(err, diff.Close())
 	}
 	if fresh != nil {
+		cow.materialReady = make(chan struct{})
 		cow.materialDone = make(chan struct{})
 		cow.materialTemplate = fresh.template
 		cow.materialFresh = fresh
@@ -441,6 +444,35 @@ func (c *BlockCOW) readLower(ctx context.Context, buf []byte, offset int64) (int
 	return done, nil
 }
 
+func (c *BlockCOW) signalMaterialReady() {
+	c.materialReadyOnce.Do(func() {
+		if c.materialReady != nil {
+			close(c.materialReady)
+		}
+	})
+}
+
+func (c *BlockCOW) WaitMaterialReady(ctx context.Context) error {
+	c.materialMu.Lock()
+	ready := c.materialReady
+	err := c.materialErr
+	c.materialMu.Unlock()
+	if ready == nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ready:
+		c.materialMu.Lock()
+		defer c.materialMu.Unlock()
+		return c.materialErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (c *BlockCOW) runMaterializer(ctx context.Context) {
 	err := c.materializeTemplate(ctx)
 	c.materialMu.Lock()
@@ -449,20 +481,15 @@ func (c *BlockCOW) runMaterializer(ctx context.Context) {
 		err = nil
 	}
 	c.materialErr = err
-	template := c.materialTemplate
 	fresh := c.materialFresh
 	if err == nil {
 		c.materialTemplate = nil
 	}
 	done := c.materialDone
 	c.materialMu.Unlock()
-	if err == nil && template != nil {
+	if err == nil && intentionalDiscard && fresh != nil {
 		c.materialReaders.Wait()
-		if intentionalDiscard && fresh != nil {
-			_ = fresh.failMaterialization()
-		} else {
-			_ = template.Close()
-		}
+		_ = fresh.failMaterialization()
 	}
 	if err != nil && fresh != nil {
 		c.materialMu.Lock()
@@ -474,6 +501,7 @@ func (c *BlockCOW) runMaterializer(ctx context.Context) {
 	c.bitmapMu.Lock()
 	c.materialResolved = nil
 	c.bitmapMu.Unlock()
+	c.signalMaterialReady()
 	if done != nil {
 		close(done)
 	}
@@ -540,6 +568,22 @@ func (c *BlockCOW) materializeTemplate(ctx context.Context) error {
 		}
 		offset = end
 	}
+
+	// Every template block is now either persisted in D or owned by foreground
+	// upper state. Detach T before waiting for cache drain so snapshot admission
+	// can reach the VM/backend quiesce boundary even under continuous writes.
+	c.materialMu.Lock()
+	if c.materialTemplate == template {
+		c.materialTemplate = nil
+	}
+	c.materialMu.Unlock()
+	c.materialReaders.Wait()
+	if err := template.Close(); err != nil {
+		return fmt.Errorf("close materialized diff template: %w", err)
+	}
+	fresh.template = nil
+	c.signalMaterialReady()
+
 	if err := c.cache.drain(ctx, c); err != nil {
 		return err
 	}
@@ -550,6 +594,9 @@ func (c *BlockCOW) materializeTemplate(ctx context.Context) error {
 		return err
 	}
 	fresh.committed = true
+	if err := fresh.releaseClaim(); err != nil {
+		return err
+	}
 	if err := syncDirectory(filepath.Dir(fresh.finalPath)); err != nil {
 		return err
 	}

@@ -483,7 +483,7 @@ func ServeAndWait(p VMParams) (int, error) {
 			OwnedDiff:    d.OwnedDiff,
 			Size:         d.Cow.Size(),
 			SnapshotView: d.Cow.SnapshotView,
-			WaitReady:    d.Cow.WaitMaterialized,
+			WaitReady:    d.Cow.WaitMaterialReady,
 			CheckError:   d.Cow.Err,
 		})
 	}
@@ -779,7 +779,7 @@ func ServeAndWait(p VMParams) (int, error) {
 					backends = append(backends, &vhost.ReadOnlyBackend{R: d.Reader})
 				}
 				backends = append(backends, &vhost.CowBackend{C: d.Cow})
-				refs = append(refs, SnapDiskRef{DiffPath: d.DiffPath, OwnedDiff: d.OwnedDiff, Size: d.Cow.Size(), SnapshotView: d.Cow.SnapshotView, WaitReady: d.Cow.WaitMaterialized, CheckError: d.Cow.Err})
+				refs = append(refs, SnapDiskRef{DiffPath: d.DiffPath, OwnedDiff: d.OwnedDiff, Size: d.Cow.Size(), SnapshotView: d.Cow.SnapshotView, WaitReady: d.Cow.WaitMaterialReady, CheckError: d.Cow.Err})
 			}
 			snapHandler.Cfg = cfg
 			snapHandler.PortableConfig = c0

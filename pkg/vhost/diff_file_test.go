@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"golang.org/x/sys/unix"
@@ -1349,5 +1350,68 @@ func TestAsyncTemplateEphemeralCloseCancelsWithoutFatal(t *testing.T) {
 	}
 	if partials, _ := filepath.Glob(filepath.Join(dir, ".active.diff.*.partial")); len(partials) != 0 {
 		t.Fatalf("ephemeral close left partials: %v", partials)
+	}
+}
+
+func TestAsyncTemplateConcurrentFreshOpenClaimsDestination(t *testing.T) {
+	const size = 64 * cowBlockSize
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "template.ext4")
+	finalPath := filepath.Join(dir, "active.diff")
+	writeSparseTemplate(t, templatePath, bytes.Repeat([]byte{0x51}, size), []sparse.Extent{{Offset: 0, Size: size}})
+
+	first, err := OpenBlockCOW(finalPath, nil, DiffInit{TemplatePath: templatePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+
+	if _, err := OpenBlockCOW(finalPath, nil, DiffInit{TemplatePath: templatePath}); !errors.Is(err, unix.EEXIST) {
+		t.Fatalf("competing fresh open error=%v, want EEXIST", err)
+	}
+}
+
+func TestAsyncTemplateReadyDoesNotWaitForDirtyCacheDrain(t *testing.T) {
+	const size = 64 * cowBlockSize
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "template.ext4")
+	finalPath := filepath.Join(dir, "active.diff")
+	writeSparseTemplate(t, templatePath, bytes.Repeat([]byte{0x62}, size), []sparse.Extent{{Offset: 0, Size: size}})
+
+	gate := newWorkerGate()
+	cache := testCache(t, 8, 8, cacheHooks{beforeWrite: func([]*cachePage) error {
+		gate.wait()
+		return nil
+	}})
+	cow, err := OpenBlockCOW(finalPath, nil, DiffInit{TemplatePath: templatePath}, WithCOWCache(cache))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		gate.open()
+		_ = cow.Close()
+	}()
+
+	if _, err := cow.WriteAt(bytes.Repeat([]byte{0xa3}, cowBlockSize), 0); err != nil {
+		t.Fatal(err)
+	}
+	awaitSignal(t, gate.entered)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cow.WaitMaterialReady(ctx); err != nil {
+		t.Fatalf("template readiness waited for dirty cache drain: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cow.WaitMaterialized(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("full materialization completed before dirty writeback was released: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	gate.open()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

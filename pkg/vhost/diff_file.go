@@ -171,6 +171,9 @@ func openBlockCOWDiff(path string, init DiffInit, options blockCOWOptions) (*dif
 		return nil, err
 	}
 	fresh.committed = true
+	if err := fresh.releaseClaim(); err != nil {
+		return nil, err
+	}
 	if err := syncDirectory(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
@@ -325,6 +328,27 @@ func createFreshDiffFile(path string, init DiffInit, encryption *diffEncryption)
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("vhost: inspect fresh diff final path: %w", err)
 	}
+	claim, claimPath, err := acquireFreshDiffClaim(path)
+	if err != nil {
+		return nil, err
+	}
+	releaseClaim := true
+	defer func() {
+		if releaseClaim {
+			_ = os.Remove(claimPath)
+			_ = unix.Flock(int(claim.Fd()), unix.LOCK_UN)
+			_ = claim.Close()
+		}
+	}()
+	// Revalidate after claiming: another creator may have published between the
+	// optimistic path check above and acquiring this per-destination claim.
+	if info, err := os.Lstat(path); err == nil {
+		if !(info.Mode().IsRegular() && info.Size() == 0) {
+			return nil, unix.EEXIST
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("vhost: inspect claimed fresh diff final path: %w", err)
+	}
 	logicalSize := init.CreateSize
 	var template diffTemplateSource
 	if init.TemplatePath != "" {
@@ -354,7 +378,8 @@ func createFreshDiffFile(path string, init DiffInit, encryption *diffEncryption)
 		}
 		return nil, fmt.Errorf("vhost: create diff temporary file: %w", err)
 	}
-	fresh := &freshDiffInit{template: template, tmpPath: tmp.Name(), finalPath: path}
+	fresh := &freshDiffInit{template: template, tmpPath: tmp.Name(), finalPath: path, claim: claim, claimPath: claimPath}
+	releaseClaim = false
 	fail := func(err error) (*freshDiffInit, error) {
 		_ = tmp.Close()
 		fresh.diff = nil
@@ -411,6 +436,9 @@ func initializeFreshDiffFile(path string, logicalSize int64, encryption *diffEnc
 		return nil, err
 	}
 	fresh.committed = true
+	if err := fresh.releaseClaim(); err != nil {
+		return nil, err
+	}
 	if err := syncDirectory(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
@@ -711,7 +739,39 @@ type freshDiffInit struct {
 	template  diffTemplateSource
 	tmpPath   string
 	finalPath string
+	claim     *os.File
+	claimPath string
 	committed bool
+}
+
+func acquireFreshDiffClaim(path string) (*os.File, string, error) {
+	claimPath := filepath.Join(filepath.Dir(path), ".claim-"+filepath.Base(path))
+	claim, err := os.OpenFile(claimPath, os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, "", fmt.Errorf("vhost: open fresh diff claim: %w", err)
+	}
+	if err := unix.Flock(int(claim.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = claim.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, "", unix.EEXIST
+		}
+		return nil, "", fmt.Errorf("vhost: lock fresh diff claim: %w", err)
+	}
+	return claim, claimPath, nil
+}
+
+func (f *freshDiffInit) releaseClaim() error {
+	if f == nil || f.claim == nil {
+		return nil
+	}
+	var err error
+	if f.claimPath != "" {
+		err = errors.Join(err, os.Remove(f.claimPath))
+	}
+	err = errors.Join(err, unix.Flock(int(f.claim.Fd()), unix.LOCK_UN))
+	err = errors.Join(err, f.claim.Close())
+	f.claim = nil
+	return err
 }
 
 func (f *freshDiffInit) abort() error {
@@ -730,6 +790,7 @@ func (f *freshDiffInit) abort() error {
 	if !f.committed && f.tmpPath != "" {
 		err = errors.Join(err, os.Remove(f.tmpPath))
 	}
+	err = errors.Join(err, f.releaseClaim())
 	return err
 }
 
