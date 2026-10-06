@@ -1,7 +1,9 @@
 package vhost
 
 import (
+	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -260,4 +262,61 @@ func resetBenchmarkCOW(b *testing.B, cow *BlockCOW) {
 	if err := cow.Discard(0, cow.size); err != nil {
 		b.Fatal(err)
 	}
+}
+
+func BenchmarkFreshTemplateMaterialization(b *testing.B) {
+	const size = 256 << 20
+	templateDir := b.TempDir()
+	templatePath := filepath.Join(templateDir, "template.ext4")
+	f, err := os.OpenFile(templatePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := f.Truncate(size); err != nil {
+		b.Fatal(err)
+	}
+	block := make([]byte, cowBlockSize)
+	for off := int64(0); off < size; off += 1 << 20 {
+		block[0] = byte(off >> 20)
+		if _, err := f.WriteAt(block, off); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	b.Run("open", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			path := filepath.Join(b.TempDir(), "active.diff")
+			b.StartTimer()
+			cow, err := OpenBlockCOW(path, nil, DiffInit{TemplatePath: templatePath}, WithDiscardOnClose())
+			b.StopTimer()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := cow.Close(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("complete", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			path := filepath.Join(b.TempDir(), "active.diff")
+			cow, err := OpenBlockCOW(path, nil, DiffInit{TemplatePath: templatePath})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.StartTimer()
+			err = cow.WaitMaterialized(context.Background())
+			b.StopTimer()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := cow.Close(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

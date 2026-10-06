@@ -760,6 +760,9 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 		return fail(fmt.Errorf("%s: prepare diff: %w", diskKey, err))
 	}
 	cowOptions := []vhost.BlockCOWOption{vhost.WithCOWCache(cowCache)}
+	if db.OwnedDiff {
+		cowOptions = append(cowOptions, vhost.WithDiscardOnClose())
+	}
 	if opts.LocalCodec != nil {
 		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
 	}

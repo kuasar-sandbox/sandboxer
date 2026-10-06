@@ -61,6 +61,13 @@ func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resum
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	for i := range sources.Diffs {
+		if sources.Diffs[i].WaitReady != nil {
+			if err := sources.Diffs[i].WaitReady(ctx); err != nil {
+				return nil, fmt.Errorf("export: disk %d initialization: %w", i, err)
+			}
+		}
+	}
 	ch := chapi.Client{Sock: sources.APISock, RespDeadline: sources.CHApiDeadline}
 	pauseStart := time.Now()
 	if err := ch.Pause(); err != nil {

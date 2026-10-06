@@ -69,10 +69,11 @@ type BlockCOWOption interface {
 }
 
 type blockCOWOptions struct {
-	encryption    *diffEncryption
-	required      bool
-	encryptionSet bool
-	cache         *COWCache
+	encryption     *diffEncryption
+	required       bool
+	encryptionSet  bool
+	cache          *COWCache
+	discardOnClose bool
 }
 
 type diffEncryptionBlockCOWOption struct {
@@ -101,6 +102,16 @@ func WithDiffEncryption(customerKey [32]byte, required bool) BlockCOWOption {
 	return diffEncryptionBlockCOWOption{customerKey: customerKey, required: required}
 }
 
+type discardOnCloseBlockCOWOption struct{}
+
+func (discardOnCloseBlockCOWOption) applyBlockCOW(options *blockCOWOptions) error {
+	options.discardOnClose = true
+	return nil
+}
+
+// WithDiscardOnClose allows an auto-owned ephemeral diff to cancel unfinished
+// template materialization when its runtime is being destroyed.
+func WithDiscardOnClose() BlockCOWOption { return discardOnCloseBlockCOWOption{} }
 func parseBlockCOWOptions(raw []BlockCOWOption) (blockCOWOptions, error) {
 	var options blockCOWOptions
 	for _, option := range raw {
@@ -140,7 +151,33 @@ func openBlockCOWDiff(path string, init DiffInit, options blockCOWOptions) (*dif
 	if init.Existing {
 		return openExistingDiffFile(path, options.encryption, options.required, false)
 	}
-	return createFreshDiffFile(path, init, options.encryption)
+	if init.TemplatePath != "" {
+		return nil, fmt.Errorf("vhost: templated fresh diff must be opened through OpenBlockCOW")
+	}
+	fresh, err := createFreshDiffFile(path, init, options.encryption)
+	if err != nil {
+		return nil, err
+	}
+	defer fresh.abort()
+	if err := fresh.diff.Sync(); err != nil {
+		return nil, fmt.Errorf("vhost: sync fresh diff: %w", err)
+	}
+	if err := fresh.diff.Close(); err != nil {
+		fresh.diff = nil
+		return nil, fmt.Errorf("vhost: close fresh diff: %w", err)
+	}
+	fresh.diff = nil
+	if err := commitFreshDiff(fresh.tmpPath, path); err != nil {
+		return nil, err
+	}
+	fresh.committed = true
+	if err := fresh.releaseClaim(); err != nil {
+		return nil, err
+	}
+	if err := syncDirectory(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
+	return openExistingDiffFile(path, options.encryption, options.encryption != nil, false)
 }
 
 func openExistingDiffFile(path string, encryption *diffEncryption, required, readOnly bool) (*diffFile, error) {
@@ -283,80 +320,128 @@ func openEncryptedDiffFile(f *os.File, physicalSize int64, encryption *diffEncry
 	}, nil
 }
 
-func createFreshDiffFile(path string, init DiffInit, encryption *diffEncryption) (*diffFile, error) {
-	var template diffTemplateSource
+func createFreshDiffFile(path string, init DiffInit, encryption *diffEncryption) (*freshDiffInit, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if !(info.Mode().IsRegular() && info.Size() == 0) {
+			return nil, unix.EEXIST
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("vhost: inspect fresh diff final path: %w", err)
+	}
+	claim, claimPath, err := acquireFreshDiffClaim(path)
+	if err != nil {
+		return nil, err
+	}
+	releaseClaim := true
+	defer func() {
+		if releaseClaim {
+			_ = os.Remove(claimPath)
+			_ = unix.Flock(int(claim.Fd()), unix.LOCK_UN)
+			_ = claim.Close()
+		}
+	}()
+	// Revalidate after claiming: another creator may have published between the
+	// optimistic path check above and acquiring this per-destination claim.
+	if info, err := os.Lstat(path); err == nil {
+		if !(info.Mode().IsRegular() && info.Size() == 0) {
+			return nil, unix.EEXIST
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("vhost: inspect claimed fresh diff final path: %w", err)
+	}
 	logicalSize := init.CreateSize
+	var template diffTemplateSource
 	if init.TemplatePath != "" {
 		var err error
-		template, err = openDiffTemplate(init.TemplatePath, encryption)
+		template, err = openLazyDiffTemplate(init.TemplatePath, encryption)
 		if err != nil {
 			return nil, fmt.Errorf("vhost: open diff template: %w", err)
 		}
-		defer template.Close()
 		if template.Size() > uint64(^uint64(0)>>1) {
+			_ = template.Close()
 			return nil, fmt.Errorf("vhost: diff template size overflows int64")
 		}
 		logicalSize = int64(template.Size())
 	}
 	if err := validateDiffLogicalSize(logicalSize); err != nil {
+		if template != nil {
+			_ = template.Close()
+		}
 		return nil, fmt.Errorf("vhost: fresh diff: %w", err)
 	}
-	return initializeFreshDiffFile(path, logicalSize, encryption, template)
-}
 
-func initializeFreshDiffFile(path string, logicalSize int64, encryption *diffEncryption, template diffTemplateSource) (*diffFile, error) {
 	directory := filepath.Dir(path)
 	tmp, err := os.CreateTemp(directory, "."+filepath.Base(path)+".*.partial")
 	if err != nil {
+		if template != nil {
+			_ = template.Close()
+		}
 		return nil, fmt.Errorf("vhost: create diff temporary file: %w", err)
 	}
-	tmpPath := tmp.Name()
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tmp.Close()
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
+	fresh := &freshDiffInit{template: template, tmpPath: tmp.Name(), finalPath: path, claim: claim, claimPath: claimPath}
+	releaseClaim = false
+	fail := func(err error) (*freshDiffInit, error) {
+		_ = tmp.Close()
+		fresh.diff = nil
+		_ = fresh.abort()
+		return nil, err
+	}
 	var target *diffFile
 	if encryption == nil {
 		if err := tmp.Truncate(logicalSize); err != nil {
-			return nil, fmt.Errorf("vhost: size plaintext diff: %w", err)
+			return fail(fmt.Errorf("vhost: size plaintext diff: %w", err))
 		}
 		target = &diffFile{f: tmp, bodyIO: tmp, logicalSize: logicalSize}
 	} else {
 		target, err = createEncryptedDiffFile(tmp, logicalSize, encryption, cryptorand.Reader)
 		if err != nil {
-			return nil, err
+			return fail(err)
 		}
 		if err := target.validateFreshEncryptedBodySparse(); err != nil {
-			return nil, err
+			fresh.diff = target
+			return fail(err)
 		}
 	}
-	defer target.Close()
 	if err := target.enableDirect(); err != nil {
+		fresh.diff = target
+		return fail(err)
+	}
+	fresh.diff = target
+	return fresh, nil
+}
+
+// initializeFreshDiffFile preserves the historical synchronous helper used by
+// focused diff tests. OpenBlockCOW uses the asynchronous fresh path instead.
+func initializeFreshDiffFile(path string, logicalSize int64, encryption *diffEncryption, template diffTemplateSource) (*diffFile, error) {
+	init := DiffInit{CreateSize: logicalSize}
+	fresh, err := createFreshDiffFile(path, init, encryption)
+	if err != nil {
 		return nil, err
 	}
+	defer fresh.abort()
 	if template != nil {
-		if err := seedDiffTemplate(context.Background(), target, template); err != nil {
+		if err := seedDiffTemplate(context.Background(), fresh.diff, template); err != nil {
 			return nil, fmt.Errorf("vhost: seed diff template: %w", err)
 		}
 	}
-	if err := target.Sync(); err != nil {
+	if err := fresh.diff.Sync(); err != nil {
 		return nil, fmt.Errorf("vhost: sync fresh diff: %w", err)
 	}
-	if err := target.Close(); err != nil {
+	if err := fresh.diff.Close(); err != nil {
+		fresh.diff = nil
 		return nil, fmt.Errorf("vhost: close fresh diff: %w", err)
 	}
-	if err := commitFreshDiff(tmpPath, path); err != nil {
+	fresh.diff = nil
+	if err := commitFreshDiff(fresh.tmpPath, path); err != nil {
 		return nil, err
 	}
-	committed = true
-	if err := syncDirectory(directory); err != nil {
+	fresh.committed = true
+	if err := fresh.releaseClaim(); err != nil {
 		return nil, err
 	}
-	// An encryption-backed writer always produced encrypted v1, even in auto mode.
+	if err := syncDirectory(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
 	return openExistingDiffFile(path, encryption, encryption != nil, false)
 }
 
@@ -606,14 +691,16 @@ func (d *diffFile) validateFreshEncryptedBodySparse() error {
 	if err := d.Sync(); err != nil {
 		return fmt.Errorf("vhost: sync encrypted diff header: %w", err)
 	}
-	bitmap, err := d.scanDirtyBlocks()
+	bodyEnd := d.bodyOffset + d.logicalSize
+	dataOffset, err := unix.Seek(int(d.f.Fd()), d.bodyOffset, unix.SEEK_DATA)
 	if err != nil {
+		if errors.Is(err, unix.ENXIO) {
+			return nil
+		}
 		return fmt.Errorf("vhost: validate encrypted diff sparse body: %w", err)
 	}
-	for _, word := range bitmap {
-		if word != 0 {
-			return fmt.Errorf("vhost: filesystem does not preserve the encrypted diff's 4 KiB header/body sparse boundary")
-		}
+	if dataOffset < bodyEnd {
+		return fmt.Errorf("vhost: filesystem does not preserve the encrypted diff's 4 KiB header/body sparse boundary")
 	}
 	return nil
 }
@@ -647,10 +734,187 @@ type diffTemplateSource interface {
 	io.Closer
 }
 
+type freshDiffInit struct {
+	diff      *diffFile
+	template  diffTemplateSource
+	tmpPath   string
+	finalPath string
+	claim     *os.File
+	claimPath string
+	committed bool
+}
+
+func acquireFreshDiffClaim(path string) (*os.File, string, error) {
+	claimPath := filepath.Join(filepath.Dir(path), ".claim-"+filepath.Base(path))
+	claim, err := os.OpenFile(claimPath, os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, "", fmt.Errorf("vhost: open fresh diff claim: %w", err)
+	}
+	if err := unix.Flock(int(claim.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = claim.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, "", unix.EEXIST
+		}
+		return nil, "", fmt.Errorf("vhost: lock fresh diff claim: %w", err)
+	}
+	return claim, claimPath, nil
+}
+
+func (f *freshDiffInit) releaseClaim() error {
+	if f == nil || f.claim == nil {
+		return nil
+	}
+	var err error
+	if f.claimPath != "" {
+		err = errors.Join(err, os.Remove(f.claimPath))
+	}
+	err = errors.Join(err, unix.Flock(int(f.claim.Fd()), unix.LOCK_UN))
+	err = errors.Join(err, f.claim.Close())
+	f.claim = nil
+	return err
+}
+
+func (f *freshDiffInit) abort() error {
+	if f == nil {
+		return nil
+	}
+	var err error
+	if f.template != nil {
+		err = errors.Join(err, f.template.Close())
+		f.template = nil
+	}
+	if f.diff != nil {
+		err = errors.Join(err, f.diff.Close())
+		f.diff = nil
+	}
+	if !f.committed && f.tmpPath != "" {
+		err = errors.Join(err, os.Remove(f.tmpPath))
+	}
+	err = errors.Join(err, f.releaseClaim())
+	return err
+}
+
+func (f *freshDiffInit) failMaterialization() error {
+	if f == nil {
+		return nil
+	}
+	var err error
+	if f.template != nil {
+		err = errors.Join(err, f.template.Close())
+		f.template = nil
+	}
+	if !f.committed && f.tmpPath != "" {
+		err = errors.Join(err, os.Remove(f.tmpPath))
+	}
+	err = errors.Join(err, f.releaseClaim())
+	return err
+}
+
 type fileDiffTemplate struct {
 	diff   *diffFile
 	bitmap []uint64
 }
+
+type lazyDiffTemplate struct {
+	diff *diffFile
+}
+
+func openLazyDiffTemplate(path string, encryption *diffEncryption) (diffTemplateSource, error) {
+	diff, err := openExistingDiffFile(path, encryption, false, true)
+	if err != nil {
+		return nil, err
+	}
+	return &lazyDiffTemplate{diff: diff}, nil
+}
+
+func (s *lazyDiffTemplate) Size() uint64 { return uint64(s.diff.logicalSize) }
+
+func (s *lazyDiffTemplate) RunAt(offset, limit uint64) (sparse.Run, error) {
+	if offset >= s.Size() {
+		return nil, io.EOF
+	}
+	if limit == 0 {
+		return nil, fmt.Errorf("vhost: diff template RunAt limit is zero")
+	}
+	end := offset + limit
+	if end < offset || end > s.Size() {
+		end = s.Size()
+	}
+
+	body := s.diff.bodyOffset
+	blockStart := uint64(int64(offset) / cowBlockSize * cowBlockSize)
+	physicalStart := body + int64(blockStart)
+	bodyEnd := body + s.diff.logicalSize
+
+	data, err := unix.Seek(int(s.diff.f.Fd()), physicalStart, unix.SEEK_DATA)
+	if err != nil {
+		if errors.Is(err, unix.ENXIO) {
+			return lazyDiffTemplateRun{source: s, offset: offset, end: end, kind: sparse.Hole}, nil
+		}
+		return nil, fmt.Errorf("vhost: template SEEK_DATA at %d: %w", physicalStart, err)
+	}
+	if data >= bodyEnd {
+		return lazyDiffTemplateRun{source: s, offset: offset, end: end, kind: sparse.Hole}, nil
+	}
+
+	logicalData := uint64(data - body)
+	dataBlockStart := logicalData / cowBlockSize * cowBlockSize
+	if dataBlockStart > blockStart {
+		return lazyDiffTemplateRun{
+			source: s,
+			offset: offset,
+			end:    min(end, dataBlockStart),
+			kind:   sparse.Hole,
+		}, nil
+	}
+
+	hole, err := unix.Seek(int(s.diff.f.Fd()), data, unix.SEEK_HOLE)
+	if err != nil {
+		return nil, fmt.Errorf("vhost: template SEEK_HOLE at %d: %w", data, err)
+	}
+	if hole > bodyEnd {
+		hole = bodyEnd
+	}
+	logicalHole := hole - body
+	presentEnd := uint64(alignUp(logicalHole, cowBlockSize))
+	if presentEnd > s.Size() {
+		presentEnd = s.Size()
+	}
+	if presentEnd <= offset {
+		presentEnd = min(end, blockStart+uint64(cowBlockSize))
+	}
+	return lazyDiffTemplateRun{
+		source: s,
+		offset: offset,
+		end:    min(end, presentEnd),
+		kind:   sparse.Data,
+	}, nil
+}
+
+type lazyDiffTemplateRun struct {
+	source *lazyDiffTemplate
+	offset uint64
+	end    uint64
+	kind   sparse.RunKind
+}
+
+func (r lazyDiffTemplateRun) Offset() uint64       { return r.offset }
+func (r lazyDiffTemplateRun) End() uint64          { return r.end }
+func (r lazyDiffTemplateRun) Kind() sparse.RunKind { return r.kind }
+func (r lazyDiffTemplateRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	if r.kind == sparse.Hole || r.kind == sparse.Zero {
+		clear(buf)
+		return len(buf), nil
+	}
+	return r.source.ReadAt(ctx, buf, r.offset+innerOffset)
+}
+func (s *lazyDiffTemplate) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return s.diff.ReadAt(buf, int64(offset))
+}
+func (s *lazyDiffTemplate) Close() error { return s.diff.Close() }
 
 func openDiffTemplate(path string, encryption *diffEncryption) (diffTemplateSource, error) {
 	diff, err := openExistingDiffFile(path, encryption, false, true)
@@ -698,7 +962,7 @@ func ValidateDiffTemplateExt4(ctx context.Context, path string, base BlockReader
 	if err != nil {
 		return err
 	}
-	source, err := openDiffTemplate(path, options.encryption)
+	source, err := openLazyDiffTemplate(path, options.encryption)
 	if err != nil {
 		return err
 	}
