@@ -806,6 +806,7 @@ func (f *freshDiffInit) failMaterialization() error {
 	if !f.committed && f.tmpPath != "" {
 		err = errors.Join(err, os.Remove(f.tmpPath))
 	}
+	err = errors.Join(err, f.releaseClaim())
 	return err
 }
 

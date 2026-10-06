@@ -139,7 +139,10 @@ func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions .
 		cow.materialTemplate = fresh.template
 		cow.materialFresh = fresh
 		cow.materialResolved = make([]uint64, len(bitmap))
-		ctx, cancel := context.WithCancel(cow.lifeCtx)
+		// Materialization has its own lifetime. Closing frontend admission must
+		// not cancel retained-diff publication; ephemeral teardown explicitly
+		// cancels this context through materialCancel.
+		ctx, cancel := context.WithCancel(context.Background())
 		cow.materialCancel = cancel
 		go cow.runMaterializer(ctx)
 	}
@@ -851,6 +854,13 @@ func (c *BlockCOW) end(cancel func()) {
 // real I/O before releasing plaintext and the FD. Base is closed by its owner.
 func (c *BlockCOW) Close() error {
 	c.closeOnce.Do(func() {
+		// Stop frontend admission first. The materializer does not enter through
+		// begin(), so a retained diff can still finish drain/sync/publication
+		// after all accepted frontend operations have crossed this barrier.
+		c.cancel()
+		c.opMu.Lock()
+		c.opMu.Unlock()
+
 		if c.materialCancel != nil {
 			if c.discardOnClose {
 				c.materialMu.Lock()
@@ -858,12 +868,9 @@ func (c *BlockCOW) Close() error {
 				c.materialMu.Unlock()
 				c.materialCancel()
 			}
-			_ = c.WaitMaterialized(context.Background())
+			c.closeErr = errors.Join(c.closeErr, c.WaitMaterialized(context.Background()))
 		}
-		c.cancel()
-		c.opMu.Lock()
-		c.opMu.Unlock() // canceled admission makes this a lifetime barrier only
-		c.closeErr = c.cache.drain(context.Background(), c)
+		c.closeErr = errors.Join(c.closeErr, c.cache.drain(context.Background(), c))
 		c.cache.detach(c)
 		if c.ownCache {
 			c.closeErr = errors.Join(c.closeErr, c.cache.Close())

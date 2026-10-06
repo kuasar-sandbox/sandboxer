@@ -1415,3 +1415,103 @@ func TestAsyncTemplateReadyDoesNotWaitForDirtyCacheDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestAsyncTemplateFailureReleasesDestinationClaim(t *testing.T) {
+	const size = 4 * cowBlockSize
+	dir := t.TempDir()
+	finalPath := filepath.Join(dir, "active.diff")
+
+	fresh, err := createFreshDiffFile(finalPath, DiffInit{CreateSize: size}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh.template = failingDiffTemplate{size: size}
+	cow := &BlockCOW{
+		diff: fresh.diff, size: size, bitmap: make([]uint64, 1),
+		blockMu: make([]sync.RWMutex, cowLockStripes), blockSize: cowBlockSize,
+		materialReady: make(chan struct{}), materialDone: make(chan struct{}),
+		materialTemplate: fresh.template, materialFresh: fresh,
+	}
+	cow.lifeCtx, cow.cancel = context.WithCancel(context.Background())
+	cow.cache, err = NewCOWCache(DefaultCOWCacheSize, DefaultCOWMaxDirtySize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cow.ownCache = true
+	if err := cow.cache.attach(cow); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(cow.lifeCtx)
+	cow.materialCancel = cancel
+	go cow.runMaterializer(ctx)
+	if err := cow.WaitMaterialized(context.Background()); err == nil {
+		t.Fatal("materialization failure not reported")
+	}
+	_ = cow.Close()
+
+	retry, err := createFreshDiffFile(finalPath, DiffInit{CreateSize: size}, nil)
+	if err != nil {
+		t.Fatalf("destination claim remained after failure: %v", err)
+	}
+	if err := retry.abort(); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
+func TestAsyncTemplateRetainedCloseStopsAdmissionBeforePublishWait(t *testing.T) {
+	const size = 64 * cowBlockSize
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "template.ext4")
+	finalPath := filepath.Join(dir, "active.diff")
+	writeSparseTemplate(t, templatePath, bytes.Repeat([]byte{0x71}, size), []sparse.Extent{{Offset: 0, Size: size}})
+
+	cow, err := OpenBlockCOW(finalPath, nil, DiffInit{TemplatePath: templatePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold one accepted frontend operation across Close's admission barrier.
+	cow.opMu.RLock()
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- cow.Close() }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for cow.lifeCtx.Err() == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if cow.lifeCtx.Err() == nil {
+		t.Fatal("Close did not stop frontend admission")
+	}
+	beginDone := make(chan error, 1)
+	go func() {
+		_, end, err := cow.begin(context.Background())
+		if err == nil {
+			cow.end(end)
+		}
+		beginDone <- err
+	}()
+	select {
+	case err := <-beginDone:
+		if err == nil {
+			t.Fatal("new frontend operation admitted after Close started")
+		}
+	case <-time.After(20 * time.Millisecond):
+		// Close owns the pending writer slot; new readers are correctly blocked.
+	}
+	cow.opMu.RUnlock()
+	if err := <-beginDone; err == nil {
+		t.Fatal("new frontend operation admitted after Close barrier")
+	}
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("retained Close did not finish publication")
+	}
+	if _, err := os.Stat(finalPath); err != nil {
+		t.Fatalf("retained diff was not published: %v", err)
+	}
+}
