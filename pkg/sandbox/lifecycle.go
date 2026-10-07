@@ -179,6 +179,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		return opened, nil
 	})
 	var c0 *config.PortableSandboxConfig
+	legacyPortableBoot := opts.PortableConfig != nil
 	if opts.PortableConfig != nil {
 		if opts.SourceBinding == nil {
 			return -1, errors.New("portable run requires RunSourceBinding")
@@ -221,7 +222,9 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
-	if c0 == nil {
+	var hostIdentity preparedHostIdentity
+	hostIdentity.kernel, hostIdentity.bundle = opts.Cfg.Boot.Kernel, opts.Cfg.Boot.Runtime
+	if !legacyPortableBoot {
 		if err := MaterializeImageDefaults(opts.Cfg, imageDefaults); err != nil {
 			return -1, fmt.Errorf("materialize image defaults: %w", err)
 		}
@@ -237,17 +240,24 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		if err != nil {
 			return -1, err
 		}
+		hostIdentity.projection = identities
 		c0, err = config.ProjectPortableCold(opts.Cfg, identities)
 		if err != nil {
 			return -1, fmt.Errorf("project portable C0: %w", err)
 		}
 	} else {
-		// Only the runtime bundle identity is re-checked here: its digest
-		// marker lives in the ZIP footer and is read without scanning the
-		// artifact. The kernel gets the cheap artifact preflight only; the
-		// full SHA-256 re-hash is skipped (issue #158).
+		// Runtime footer and optional kernel sidecar identities are cheap
+		// deployment metadata. Missing kernel metadata keeps the historical
+		// cheap-binding-only policy; never hash portable boot under #158.
 		if err := VerifyKernelArtifact(opts.Cfg.Boot.Kernel); err != nil {
 			return -1, fmt.Errorf("boot.kernel identity: %w", err)
+		}
+		kernelRef, present, err := optionalKernelRef(opts.Cfg.Boot.Kernel)
+		if err != nil {
+			return -1, fmt.Errorf("boot.kernel identity: %w", err)
+		}
+		if present && c0.Boot.Kernel != kernelRef {
+			return -1, fmt.Errorf("boot.kernel identity mismatch: portable %s, host %s", c0.Boot.Kernel, kernelRef)
 		}
 		runtimeRef, err := ResolveRuntimeProjection(opts.Cfg)
 		if err != nil {
@@ -256,6 +266,8 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		if c0.Boot.Runtime != runtimeRef {
 			return -1, fmt.Errorf("boot.runtime identity mismatch: portable %s, host %s", c0.Boot.Runtime, runtimeRef)
 		}
+		hostIdentity.projection = config.PortableProjection{KernelRef: kernelRef, RuntimeRef: runtimeRef}
+		hostIdentity.unknownKernel = !present
 	}
 
 	storage, err := artifact.NewProcessStorageWithCustomerKey(opts.ManifestCfg, opts.CustomerKeyFn)
@@ -290,7 +302,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.StatsInterval = opts.StatsInterval
 	shape.NotifyReadiness = opts.NotifyReadiness
 	shape.logf = func(f string, a ...any) { log.Printf("[sandbox-ctl] "+f, a...) }
-	r, err := Start(ctx, SandboxSpec{Runtime: shape, Launch: launch})
+	r, err := start(ctx, SandboxSpec{Runtime: shape, Launch: launch}, &hostIdentity)
 	if err != nil {
 		return -1, err
 	}
@@ -331,8 +343,9 @@ func applyRunCaptureSources(params *VMParams, opts RunOptions) {
 	params.RefLocations = opts.RefLocations
 }
 
-// ResolvePortableProjection verifies host kernel/runtime artifacts and returns
-// their basename identities for C0. Image-to-Sandbox-E assembly shares this preflight.
+// ResolvePortableProjection resolves host kernel/runtime basename identities
+// for C0. The kernel uses trusted sidecar metadata or one full hash;
+// Image-to-Sandbox-E assembly shares this path.
 func ResolvePortableProjection(cfg *config.SandboxConfig) (config.PortableProjection, error) {
 	kernelRef, err := buildKernelRef(cfg.Boot.Kernel)
 	if err != nil {
@@ -347,9 +360,7 @@ func ResolvePortableProjection(cfg *config.SandboxConfig) (config.PortableProjec
 
 // ResolveRuntimeProjection verifies the host runtime bundle identity only.
 // It reads the digest marker at the bundle's ZIP footer and never scans the
-// artifact, so it stays on the restore and portable-config boot paths where
-// the full projection (whose kernel SHA-256 costs a fixed ~60ms) is skipped
-// per issue #158.
+// artifact. Restore and legacy portable boot retain this cheap footer check.
 func ResolveRuntimeProjection(cfg *config.SandboxConfig) (string, error) {
 	runtimeRef, err := buildRuntimeRef(cfg.Boot.Runtime)
 	if err != nil {
@@ -358,11 +369,81 @@ func ResolveRuntimeProjection(cfg *config.SandboxConfig) (string, error) {
 	return runtimeRef, nil
 }
 
+const kernelSidecarLimit = 4096
+
+// optionalKernelRef consumes trusted deployment metadata at the configured
+// binding's sibling path. The boolean is false only when that path itself is
+// absent; a dangling link or a bad present file is an error.
+func optionalKernelRef(uri string) (string, bool, error) {
+	ref, err := manifest.ParseRef(uri)
+	if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Location != "" || !filepath.IsAbs(ref.Path) {
+		return "", false, errors.New("expected absolute unlocated file:// binding")
+	}
+	if ref.Digest != "" {
+		return "", false, errors.New("host kernel binding must be a path without an artifact identity")
+	}
+	path := ref.Path + ".sha256"
+	if _, err := os.Lstat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("kernel checksum %s: %w", path, err)
+	}
+	// O_NONBLOCK prevents a replaced FIFO from hanging startup before f.Stat.
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return "", false, fmt.Errorf("kernel checksum %s: %w", path, err)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", false, fmt.Errorf("kernel checksum %s: %w", path, err)
+	}
+	if !st.Mode().IsRegular() {
+		return "", false, fmt.Errorf("kernel checksum %s: expected readable regular file", path)
+	}
+	if st.Size() > kernelSidecarLimit {
+		return "", false, fmt.Errorf("kernel checksum %s: exceeds %d bytes", path, kernelSidecarLimit)
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, kernelSidecarLimit+1))
+	if err != nil {
+		return "", false, fmt.Errorf("kernel checksum %s: %w", path, err)
+	}
+	if len(raw) > kernelSidecarLimit {
+		return "", false, fmt.Errorf("kernel checksum %s: exceeds %d bytes", path, kernelSidecarLimit)
+	}
+	digest, err := parseKernelChecksum(raw, filepath.Base(ref.Path))
+	if err != nil {
+		return "", false, fmt.Errorf("kernel checksum %s: %w", path, err)
+	}
+	return "file://" + filepath.Base(ref.Path) + "@digest:" + digest, true, nil
+}
+
+func parseKernelChecksum(raw []byte, basename string) (string, error) {
+	record := string(raw)
+	if strings.HasSuffix(record, "\n") {
+		record = strings.TrimSuffix(record, "\n")
+		record = strings.TrimSuffix(record, "\r")
+	}
+	if len(record) < 64 || strings.ContainsAny(record, "\r\n") {
+		return "", errors.New("expected one SHA-256 record")
+	}
+	digest := record[:64]
+	for _, c := range digest {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return "", errors.New("invalid SHA-256 digest")
+		}
+	}
+	if tail := record[64:]; tail != "" && tail != "  "+basename && tail != " *"+basename {
+		return "", errors.New("checksum filename does not match kernel basename or record is malformed")
+	}
+	return strings.ToLower(digest), nil
+}
+
 // VerifyKernelArtifact performs the cheap kernel preflight — the binding
 // shape, that the file exists and is a regular file — without the full
-// SHA-256 scan. It preserves buildKernelRef's fail-fast behavior on the
-// restore and portable-config boot paths, where the kernel re-hash is
-// skipped per issue #158.
+// SHA-256 scan or sidecar lookup. Restore retains this independent preflight.
 func VerifyKernelArtifact(uri string) error {
 	ref, err := manifest.ParseRef(uri)
 	if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Location != "" || !filepath.IsAbs(ref.Path) {
@@ -387,6 +468,14 @@ func VerifyKernelArtifact(uri string) error {
 }
 
 func buildKernelRef(uri string) (string, error) {
+	if err := VerifyKernelArtifact(uri); err != nil {
+		return "", err
+	}
+	if checksum, present, err := optionalKernelRef(uri); err != nil {
+		return "", err
+	} else if present {
+		return checksum, nil
+	}
 	ref, err := manifest.ParseRef(uri)
 	if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Location != "" || !filepath.IsAbs(ref.Path) {
 		return "", fmt.Errorf("expected absolute unlocated file:// binding")

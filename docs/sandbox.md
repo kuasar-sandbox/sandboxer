@@ -903,7 +903,7 @@ file://<digest>.overlay@hmac:<digest>
 file://<digest>.overlay@digest:<digest>
 ```
 
-The destination host binds these through actual paths, a source directory, or named ref-locations before controller, network, cgroup, VM, or run-directory side effects. Verification is specific to the input: explicit cold projection hashes the kernel; `run --from` and restore check its absolute file binding and regular-file existence but deliberately skip the full kernel re-hash. They compare the runtime Bundle footer identity with C0. Thus these paths do not independently prove the supplied kernel matches E's recorded digest; kernel deployment remains a trusted host responsibility. Carrier metadata and configured content verification retain their own checks. See [lifecycle.go](../pkg/sandbox/lifecycle.go) and [restore.go](../pkg/restore/restore.go).
+The destination host binds these through actual paths, a source directory, or named ref-locations before controller, network, cgroup, VM, or run-directory side effects. Explicit cold projection and public `StartRuntime` use the configured kernel's `.sha256` sidecar when present, or hash the raw kernel once before CH startup when absent. Legacy portable `run --from` checks the cheap kernel binding and compares a present sidecar with C0, but never hashes the kernel when the sidecar is absent. Restore keeps its cheap kernel binding check and ignores sidecars entirely. Both portable boot and restore compare the runtime Bundle footer identity with C0. Without a sidecar, portable boot does not independently prove that the host kernel matches E's recorded digest; kernel deployment remains a trusted host responsibility. Carrier metadata and configured content verification retain their own checks. See [lifecycle.go](../pkg/sandbox/lifecycle.go) and [restore.go](../pkg/restore/restore.go).
 
 <a id="strict-encoding"></a>
 
@@ -1476,6 +1476,23 @@ layout and logical capacities. Overlay expands to a read-only base followed by
 a writable upper; single expands to one writable device. The existing minimal
 virtio feature profile is fixed for all devices. No device hotplug is involved.
 
+Kernel identity is resolved before CH startup from exactly `<configured-kernel-path>.sha256`.
+The sidecar is an optional readable regular file of at most 4 KiB. It contains
+one 64-digit hexadecimal SHA-256 digest, or one untagged sha256sum record with
+the exact configured kernel basename (`<digest>  vmlinux` or
+`<digest> *vmlinux`). LF/CRLF and one final newline are accepted; extra records,
+fields, paths, and malformed content fail startup. A present invalid, unreadable,
+nonregular, or dangling sidecar is an error. Only its genuine absence permits a
+full kernel hash. For a prepared inactive deployment version, generate it from
+the final **raw** kernel, for example `sha256sum -- vmlinux > vmlinux.sha256`,
+and install the pair consistently. The sidecar is trusted deployment metadata:
+Sandboxer does not recompute its digest from bytes CH loads. The runtime Bundle
+identity still comes from its footer. Keep version-specific kernel and sidecar
+bindings stable through identity resolution and CH startup; switching a `current`
+symlink alone cannot pin all pathname lookups of an in-flight startup. Use a
+stable version path or coordinate the switch. No sidecar is generated or cached
+by startup; deployments without one retain the single pre-CH kernel scan.
+
 `LaunchSpec` owns workload root/data artifact references and writable paths,
 guest IP/MTU/routes/hostname/interface, mounts, persistent and ephemeral files,
 init actions, complete process configuration (including plugins, user, restart,
@@ -1532,11 +1549,11 @@ The normal CLI adapter preflights known workload inputs before starting the base
 runtime. A caller using the split API supplies them later:
 
 ```text
-StartRuntime: validate shape and boot bindings
+StartRuntime: validate shape and boot bindings; retain complete kernel and Bundle identities
   -> reserve resources and acquire host network
   -> create memfd/UFFD, fixed unbound vhost devices and control servers
   -> spawn CH -> guest base initialization -> runtime_ready
-Launch: resolve inputs and form complete immutable portable C0/provenance
+Launch: resolve workload inputs and form complete immutable portable C0/provenance from retained host identity
   -> prepare all storage -> validate all devices -> publish bindings
   -> send launch -> assemble workload root -> switch root/configure
   -> launch_ack/MUX -> app_started/ready
@@ -1546,9 +1563,20 @@ Close or exit: reap CH -> drain owned services/work -> close retained resources
 Predictable config/ref/format failures in the CLI preflight still fail before VM
 side effects. Split launch necessarily resolves workload artifacts after the base
 VM exists. C0 is written once when complete launch inputs are known, before the
-guest consumes the workload, and remains unchanged. Kernel/runtime verification
-for an existing portable C0 retains the rules in
-[PortableSandboxConfig](sandbox.md#portable-config).
+guest consumes the workload, and remains unchanged. Launch never repeats kernel,
+sidecar, or Bundle identity lookup after `runtime_ready`, even if their pathnames
+change. A new Runtime resolves its own identity. Public `Start`, including a
+supplied local or sourced `PortableConfig`, uses this complete `StartRuntime`
+identity and compares both canonical C0 refs, including basenames. Thus public
+portable `Start` without a sidecar now hashes the kernel once before CH startup
+and rejects a mismatching kernel C0 ref. Local `PortableConfig` without
+`SourceBinding` remains supported. The CLI's explicit cold `run` and
+`--replace-boot` reuse their preflight identity in private startup, avoiding a
+second scan. Legacy portable `run --from` without a sidecar retains its C0 kernel
+as ancestry only; with a sidecar, a kernel mismatch fails before CH startup.
+Restore neither reads sidecars nor requires a cold-start projection.
+This retained-identity rule does not permit rewriting the live runtime Bundle
+pmem backing contents; its existing lifetime requirements still apply.
 
 ### 5.2 CH command-line boundary
 

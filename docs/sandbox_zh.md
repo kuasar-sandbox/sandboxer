@@ -828,7 +828,7 @@ file://<digest>.overlay@hmac:<digest>
 file://<digest>.overlay@digest:<digest>
 ```
 
-目标 host 使用实际 path、source directory 或 named ref-location 在 controller、network、cgroup、VM 或 run directory 副作用前完成 binding。验证依输入而异：显式 cold projection 会计算 kernel hash；`run --from` 与 restore 只检查 kernel 的绝对 file binding、存在性和 regular-file 类型，刻意跳过完整内核重哈希，同时将 runtime Bundle footer identity 与 C0 比较。因此后两条路径不独立证明所给内核匹配 E 中记录的 digest，内核部署仍是受信 host 的责任。Carrier metadata 和按配置启用的内容验证保留各自检查。源码见 [lifecycle.go](../pkg/sandbox/lifecycle.go) 与 [restore.go](../pkg/restore/restore.go)。
+目标 host 使用实际 path、source directory 或 named ref-location 在 controller、network、cgroup、VM 或 run directory 副作用前完成 binding。显式 cold projection 和公开 `StartRuntime` 优先使用配置的 kernel 路径旁的 `.sha256` sidecar；没有 sidecar 时，在 CH 启动前对原始 kernel 完整计算一次 hash。旧式 portable `run --from` 执行廉价的 kernel binding 检查，并在 sidecar 存在时与 C0 比较；sidecar 不存在时绝不计算完整 kernel hash。Restore 保持廉价 kernel binding 检查，完全忽略 sidecar。portable boot 和 restore 都将 runtime Bundle footer identity 与 C0 比较。没有 sidecar 的 portable boot 不独立证明宿主 kernel 匹配 E 记录的 digest；kernel 部署仍是受信宿主的责任。Carrier metadata 和按配置启用的内容验证保留各自检查。源码见 [lifecycle.go](../pkg/sandbox/lifecycle.go) 与 [restore.go](../pkg/restore/restore.go)。
 
 <a id="strict-encoding"></a>
 
@@ -1334,6 +1334,20 @@ TAP/provider/namespace 要求、console/control 设置和有序的 `RuntimeDiskS
 可写 upper，single 展开为一个可写设备。所有设备固定使用既有最小 virtio feature
 集合，不涉及设备热插拔。
 
+CH 启动前，从 `<配置的 kernel 路径>.sha256` 精确解析 kernel identity。
+sidecar 是可选、可读的普通文件，上限为 4 KiB。内容只能是一条 64 位十六进制 SHA-256
+摘要，或使用配置的 kernel basename 的一条无标签 sha256sum 记录
+（`<digest>  vmlinux` 或 `<digest> *vmlinux`）。接受 LF/CRLF 和一个末尾换行；
+多条记录、多余字段、路径和格式错误均导致启动失败。存在但无效、不可读、非普通文件或
+指向不存在目标的 sidecar 都是错误；只有真正不存在时才完整计算 kernel hash。
+部署时可在尚未启用的版本目录中对最终**原始** kernel 执行
+`sha256sum -- vmlinux > vmlinux.sha256`，并一致地安装这一对文件。
+sidecar 是受信的部署元数据；Sandboxer 不会根据 CH 加载的字节重新计算摘要。
+runtime Bundle identity 仍取自 footer。版本专属的 kernel 与 sidecar binding
+必须从 identity 解析到 CH 实际启动使用期间保持稳定；只切换 `current` 符号链接
+不能固定进行中的启动所做的全部路径查找。应使用稳定版本路径或协调切换。
+启动既不生成也不缓存 sidecar；未部署 sidecar 时仍在 CH 启动前扫描 kernel 一次。
+
 `LaunchSpec` 包含工作负载 root/data artifact 引用与可写路径、Guest
 IP/MTU/路由/hostname/interface、mounts、持久与临时 files、init、完整 process 配置
 （含 plugins、user、restart、PID namespace 和 cgroup delegation）、stdio、forwards
@@ -1377,11 +1391,11 @@ E/S 输出 schema，不序列化为 CLI 命令。Exec 与 capture 要求工作�
 可稍后提供这些输入：
 
 ```text
-StartRuntime: 校验 shape 和 boot binding
+StartRuntime: 校验 shape 和 boot binding；保留完整的 kernel 与 Bundle identity
   -> 预留资源并获取宿主网络
   -> 创建 memfd/UFFD、固定未绑定 vhost 设备及 control server
   -> spawn CH -> Guest 基础初始化 -> runtime_ready
-Launch: 解析输入并形成完整、不可变的 portable C0/provenance
+Launch: 解析工作负载输入，并从已保留的宿主 identity 形成完整、不可变的 portable C0/provenance
   -> 准备全部 storage -> 校验全部设备 -> 发布 binding
   -> 发送 launch -> 组装工作负载 root -> switch root/configure
   -> launch_ack/MUX -> app_started/ready
@@ -1390,8 +1404,17 @@ Close 或 exit: 回收 CH -> 等待自有服务/工作退出 -> 关闭保留的�
 
 CLI preflight 中可预测的 config/ref/format 错误仍在 VM 副作用前失败。拆分 launch
 必然在基础 VM 已存在后解析工作负载 artifact。C0 在完整 launch 输入已知时写入一次，
-早于 Guest 消费工作负载，之后保持不变。已有 portable C0 的 kernel/runtime 验证
-继续遵循 [PortableSandboxConfig](sandbox_zh.md#portable-config) 的规则。
+早于 Guest 消费工作负载，之后保持不变。`runtime_ready` 后 Launch 不再查询
+kernel、sidecar 或 Bundle identity，即使这些路径名发生变化；新 Runtime 会重新解析。
+公开 `Start`（包括传入本地或来源 `PortableConfig`）使用完整的 `StartRuntime`
+identity，比较 C0 中两个完整规范 ref，含 basename。因此没有 sidecar 的公开
+portable `Start` 现在会在 CH 启动前计算一次 kernel hash，并拒绝不匹配的 kernel
+C0 ref；不带 `SourceBinding` 的本地 `PortableConfig` 仍受支持。CLI 显式 cold
+`run` 与 `--replace-boot` 将 preflight identity 私下传入 startup，避免二次扫描。
+旧式 portable `run --from` 没有 sidecar 时只把 C0 kernel 当作祖先记录；有 sidecar
+时，kernel 不匹配会在 CH 启动前失败。Restore 不读取 sidecar，也不要求 cold-start
+projection。这一身份保留规则不允许改写运行中 runtime Bundle 的 pmem 后端内容；
+Bundle 的既有生命周期要求仍然适用。
 
 ### 5.2 CH command line boundary
 
