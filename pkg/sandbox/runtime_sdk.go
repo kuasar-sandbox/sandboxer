@@ -162,6 +162,8 @@ type Runtime struct {
 	tapFile, netnsFile                 *os.File
 	metaIP                             string
 	identity                           *runidentity.Guard
+	hostProjection                     config.PortableProjection
+	legacyUnknownKernel                bool // only the validated legacy portable Run adapter
 	disks                              []runtimeOwnedDisk
 	cache                              *vhost.COWCache
 	storage                            *artifact.ProcessStorage
@@ -252,6 +254,18 @@ func validateRuntimeSpec(s RuntimeSpec) error {
 	return s.config().ValidateRuntime()
 }
 func StartRuntime(ctx context.Context, spec RuntimeSpec) (_ *Runtime, retErr error) {
+	return startRuntime(ctx, spec, nil)
+}
+
+// preparedHostIdentity belongs to one legacy Run operation. The exact host
+// bindings prevent a preparation from being consumed by a different startup.
+type preparedHostIdentity struct {
+	kernel, bundle string
+	projection     config.PortableProjection
+	unknownKernel  bool
+}
+
+func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostIdentity) (_ *Runtime, retErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -268,10 +282,24 @@ func StartRuntime(ctx context.Context, spec RuntimeSpec) (_ *Runtime, retErr err
 	}
 	spec.Resources = cfg.Resources
 	spec.Network.TapFD = cfg.Network.TapFD
-	if err := VerifyKernelArtifact(cfg.Boot.Kernel); err != nil {
-		return nil, err
+	var host config.PortableProjection
+	if prepared != nil {
+		if prepared.kernel != cfg.Boot.Kernel || prepared.bundle != cfg.Boot.Runtime {
+			return nil, errors.New("prepared host identity bindings differ from runtime spec")
+		}
+		host = prepared.projection
+	} else {
+		var err error
+		host, err = ResolvePortableProjection(cfg)
+		if err != nil {
+			return nil, err
+		}
 	}
-	if _, err := ResolveRuntimeProjection(cfg); err != nil {
+	if host.RuntimeRef == "" || (host.KernelRef == "" && (prepared == nil || !prepared.unknownKernel)) ||
+		(host.KernelRef != "" && prepared != nil && prepared.unknownKernel) {
+		return nil, errors.New("incomplete prepared host artifact identity")
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	sid := spec.SandboxID
@@ -309,7 +337,7 @@ func StartRuntime(ctx context.Context, spec RuntimeSpec) (_ *Runtime, retErr err
 	if logf == nil {
 		logf = func(f string, a ...any) { log.Printf("[sandbox-sdk] "+f, a...) }
 	}
-	r := &Runtime{state: runtimeStarting, spec: spec, sandboxID: sid, pathID: pathID, runDir: runDir, baseDir: DefaultBaseDir(baseRoot, pathID), startUnixNs: time.Now().UnixNano(), lifeCtx: engineCtx, cancelLife: cancel, signals: signals, stopSignals: stopSignals, identity: identity, exitDone: make(chan struct{}), logf: logf}
+	r := &Runtime{state: runtimeStarting, spec: spec, hostProjection: host, legacyUnknownKernel: prepared != nil && prepared.unknownKernel, sandboxID: sid, pathID: pathID, runDir: runDir, baseDir: DefaultBaseDir(baseRoot, pathID), startUnixNs: time.Now().UnixNano(), lifeCtx: engineCtx, cancelLife: cancel, signals: signals, stopSignals: stopSignals, identity: identity, exitDone: make(chan struct{}), logf: logf}
 	stopOperation := context.AfterFunc(ctx, func() { signals <- syscall.SIGTERM })
 	defer stopOperation()
 	r.spec.CHBinary = chBinary
@@ -617,20 +645,18 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		}
 		portable, err = spec.PortableConfig.Clone()
 		if err == nil {
-			ref, e := ResolveRuntimeProjection(cfg)
-			if e != nil {
-				return fail(e)
-			}
-			if portable.Boot.Runtime != ref {
+			if portable.Boot.Runtime != r.hostProjection.RuntimeRef {
 				return fail(errors.New("boot.runtime identity mismatch"))
+			}
+			if !r.legacyUnknownKernel && portable.Boot.Kernel != r.hostProjection.KernelRef {
+				return fail(errors.New("boot.kernel identity mismatch"))
 			}
 		}
 	} else {
-		var ids config.PortableProjection
-		ids, err = ResolvePortableProjection(cfg)
-		if err == nil {
-			portable, err = config.ProjectPortableCold(cfg, ids)
+		if r.hostProjection.KernelRef == "" || r.hostProjection.RuntimeRef == "" {
+			return fail(errors.New("ordinary launch requires complete host artifact identity"))
 		}
+		portable, err = config.ProjectPortableCold(cfg, r.hostProjection)
 	}
 	if err != nil {
 		return fail(err)
@@ -848,7 +874,23 @@ func launchFetcher(s LaunchSpec) fetch.Fetcher {
 }
 
 func Start(ctx context.Context, spec SandboxSpec) (*Runtime, error) {
-	r, err := StartRuntime(ctx, spec.Runtime)
+	return start(ctx, spec, nil)
+}
+
+func start(ctx context.Context, spec SandboxSpec, prepared *preparedHostIdentity) (*Runtime, error) {
+	if prepared != nil && prepared.unknownKernel {
+		if spec.Launch.legacyAccess == nil || spec.Launch.legacyAccess.PortableConfig == nil ||
+			spec.Launch.PortableConfig == nil || spec.Launch.SourceBinding == nil {
+			return nil, errors.New("unknown host kernel identity requires legacy portable boot")
+		}
+		if err := spec.Launch.PortableConfig.Validate(); err != nil {
+			return nil, fmt.Errorf("legacy portable boot: %w", err)
+		}
+		if spec.Launch.PortableConfig.Boot.Runtime != prepared.projection.RuntimeRef {
+			return nil, errors.New("legacy portable boot runtime identity mismatch")
+		}
+	}
+	r, err := startRuntime(ctx, spec.Runtime, prepared)
 	if err != nil {
 		return nil, err
 	}
