@@ -506,29 +506,57 @@ func (c *Client) OOMReport(oomCount uint64, killedPID int, killedRSS uint64) err
 	return nil
 }
 
-// Release notifies the controller of imminent sandbox exit and frees the
-// reservation. Best-effort: errors are not fatal because the controller
-// can also detect connection drop.
+// Release relinquishes only this client's existing reservation token. Cleanup
+// has its own bounded lifetime because normal run cancellation may already have
+// interrupted the control RPC and closed its socket.
 func (c *Client) Release(reason string) error {
-	c.mu.Lock()
-	tok := c.token
-	c.mu.Unlock()
+	return c.ReleaseContext(context.Background(), reason)
+}
+
+// ReleaseContext makes a bounded, token-only cleanup attempt. A fresh transport
+// does not Admit or StateSync: neither a dead run nor an obsolete token may
+// recreate a reservation or take ownership of a replacement run. Release is
+// idempotent at the controller, so a lost ACK may be retried once with the same
+// token. Both attempts share DeadlineRelease, including reconnect time.
+func (c *Client) ReleaseContext(ctx context.Context, reason string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, DeadlineRelease)
+	defer cancel()
+	tok := c.Token()
 	if tok == "" {
 		return nil
 	}
-	resp, err := c.roundTrip(&Message{
-		Type:   TypeRelease,
-		Token:  tok,
-		Reason: reason,
-	}, DeadlineRelease)
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !c.Connected() {
+			if err := c.ConnectContext(ctx); err != nil {
+				return fmt.Errorf("client: reconnect for release: %w", err)
+			}
+		}
+		resp, err := c.roundTripContext(ctx, &Message{
+			Type: TypeRelease, Token: tok, Reason: reason,
+		}, DeadlineRelease)
+		if err != nil {
+			lastErr = err
+			if !IsTransportError(err) {
+				return err
+			}
+			continue
+		}
+		if resp.Type != TypeAck {
+			return fmt.Errorf("client: release reply %q", resp.Type)
+		}
+		c.mu.Lock()
+		if c.token == tok {
+			c.token = ""
+		}
+		c.mu.Unlock()
+		return nil
 	}
-	if resp.Type != TypeAck {
-		return fmt.Errorf("client: release reply %q", resp.Type)
-	}
-	c.mu.Lock()
-	c.token = ""
-	c.mu.Unlock()
-	return nil
+	return lastErr
 }

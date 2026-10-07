@@ -493,7 +493,11 @@ func (h *ControllerHooks) reconnectLoop() {
 			err := h.client.ConnectContext(h.lifetimeCtx)
 			if err == nil {
 				hostCharge := readHostMemoryChargeBestEffort(h.opts.CgroupPath)
-				result, syncErr := h.client.StateSyncContext(h.lifetimeCtx, resource.StateSyncParams{
+				// StateSync can rotate the reservation token before its ACK arrives.
+				// Once sent, let the existing bounded RPC finish so Release can
+				// use the new token. Release joins this worker before cleanup;
+				// canceling here could lose the only token for the live charge.
+				result, syncErr := h.client.StateSyncContext(context.WithoutCancel(h.lifetimeCtx), resource.StateSyncParams{
 					SandboxID:                h.opts.SandboxID,
 					AppliedAllocatableMemory: state.reservation,
 					Settled:                  state.settled, CurrentRSS: hostCharge, PreviousToken: state.token,
@@ -568,10 +572,12 @@ func (h *ControllerHooks) Release(reason string) {
 	h.reconnectWG.Wait()
 	if h.Enabled() {
 		h.sessionMu.Lock()
-		if h.client.Connected() {
-			if err := h.client.Release(reason); err != nil && !resource.IsTransportError(err) {
-				h.opts.Logf("controller.Release: %v", err)
-			}
+		// Cancellation may have closed an in-flight control RPC's transport.
+		// Release uses the original token on a bounded cleanup connection; do
+		// not skip it merely because normal controller work has stopped. Keep
+		// the lease until this attempt ends, and retain node recovery on error.
+		if err := h.client.Release(reason); err != nil {
+			h.opts.Logf("controller.Release: %v; retaining node recovery", err)
 		}
 		_ = h.client.Close()
 		h.sessionMu.Unlock()
