@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -131,11 +132,26 @@ func TestSDKChild(t *testing.T) {
 		_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "injected launch failure"})
 		select {}
 	}
+	if delay := os.Getenv("SDK_TEST_LAUNCH_ACK_DELAY"); delay != "" {
+		d, err := time.ParseDuration(delay)
+		if err != nil {
+			os.Exit(28)
+		}
+		time.Sleep(d)
+	}
 	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeLaunchAck}); err != nil {
 		os.Exit(24)
 	}
 	if _, err := proto.ReadMessage(conn); err != nil {
 		os.Exit(25)
+	}
+	// Delay the application event independently of the per-message exchange.
+	if delay := os.Getenv("SDK_TEST_APP_STARTED_DELAY"); delay != "" {
+		d, err := time.ParseDuration(delay)
+		if err != nil {
+			os.Exit(27)
+		}
+		time.Sleep(d)
 	}
 	started, err := net.Dial("unix", sock+"_5000")
 	if err != nil {
@@ -479,4 +495,113 @@ func TestSDKLocalPortableC0DoesNotRequireSourceBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
+}
+
+// A launch may apply its workload for longer than one app-notify exchange.
+// Both the default and an explicit socket deadline must leave that preparation
+// to the operation context, while the eventual notification still uses the
+// normal acknowledged protocol.
+func TestSDKLaunchWaitIsNotAppNotifyDeadline(t *testing.T) {
+	for _, deadline := range []string{"", "200ms"} {
+		t.Run("app_notify="+deadline, func(t *testing.T) {
+			t.Setenv("SDK_TEST_LAUNCH_ACK_DELAY", "600ms")
+			shape, launch := sdkFixture(t)
+			shape.Timeouts.AppNotify = deadline
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			r, err := StartRuntime(ctx, shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			if err := r.Launch(ctx, launch); err != nil {
+				t.Fatalf("valid delayed app_started rejected: %v", err)
+			}
+			if r.State() != "running" {
+				t.Fatalf("state=%s", r.State())
+			}
+		})
+	}
+}
+
+func TestSDKLaunchContextBoundsGuestPreparation(t *testing.T) {
+	t.Setenv("SDK_TEST_LAUNCH_ACK_DELAY", "10s")
+	shape, launch := sdkFixture(t)
+	startCtx, cancelStart := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelStart()
+	r, err := StartRuntime(startCtx, shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	if err := r.Launch(ctx, launch); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("guest preparation did not honor operation deadline: %v", err)
+	}
+	if r.State() != "closed" {
+		t.Fatalf("failed Launch retained state=%s", r.State())
+	}
+}
+
+func TestSDKMissingAppStartedRemainsBounded(t *testing.T) {
+	t.Setenv("SDK_TEST_APP_STARTED_DELAY", "10s")
+	shape, launch := sdkFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r, err := StartRuntime(ctx, shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.Launch(ctx, launch); err == nil || !strings.Contains(err.Error(), "app_started notification timed out after 200ms") {
+		t.Fatalf("lost notification no longer bounded: %v", err)
+	}
+	if r.State() != "closed" {
+		t.Fatalf("state=%s", r.State())
+	}
+}
+func TestSDKColdBudgetLogUsesAdmittedReservation(t *testing.T) {
+	shape, _ := sdkFixture(t)
+	observed := make(chan string, 1)
+	shape.logf = func(f string, a ...any) {
+		if f == "initial cold Budget reserved=%d" {
+			observed <- fmt.Sprintf(f, a...)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r, err := StartRuntime(ctx, shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	select {
+	case got := <-observed:
+		if got != "initial cold Budget reserved=16777216" {
+			t.Fatal(got)
+		}
+	default:
+		t.Fatal("admitted cold Budget was not recorded")
+	}
+}
+
+func TestSDKLaunchStartTimeoutStillBoundsGuestPreparation(t *testing.T) {
+	t.Setenv("SDK_TEST_LAUNCH_ACK_DELAY", "10s")
+	shape, launch := sdkFixture(t)
+	launch.Process.StartTimeout = "100ms"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r, err := StartRuntime(ctx, shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	err = r.Launch(ctx, launch)
+	if err == nil || ctx.Err() != nil {
+		t.Fatalf("launch.start_timeout did not fail before operation deadline: %v, context=%v", err, ctx.Err())
+	}
+	if r.State() != "closed" {
+		t.Fatalf("state=%s", r.State())
+	}
 }
