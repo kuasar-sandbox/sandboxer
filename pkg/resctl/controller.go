@@ -493,6 +493,12 @@ func (h *ControllerHooks) reconnectLoop() {
 			err := h.client.ConnectContext(h.lifetimeCtx)
 			if err == nil {
 				hostCharge := readHostMemoryChargeBestEffort(h.opts.CgroupPath)
+				// Do not begin a new StateSync after shutdown has started.
+				// Only an already-started RPC may drain without cancellation.
+				if err = h.lifetimeCtx.Err(); err != nil {
+					h.sessionMu.Unlock()
+					return
+				}
 				// StateSync can rotate the reservation token before its ACK arrives.
 				// Once sent, let the existing bounded RPC finish so Release can
 				// use the new token. Release joins this worker before cleanup;

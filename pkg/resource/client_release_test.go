@@ -160,3 +160,53 @@ func TestClientReleaseWithoutTokenDoesNotDial(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Release must not wait behind a concurrent, silent RPC beyond its own deadline.
+func TestClientReleaseDeadlineWhileStateSyncHoldsRPCMutex(t *testing.T) {
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	defer close(unblock)
+	client := releaseTestClient(t, func(req *Message) (*Message, bool) {
+		if req.Type != TypeStateSync {
+			t.Errorf("unexpected concurrent request: %s", req.Type)
+		}
+		close(entered)
+		<-unblock
+		return &Message{Type: TypeAck}, false
+	})
+	if err := client.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	rpcDone := make(chan error, 1)
+	go func() {
+		_, err := client.roundTripContext(context.Background(), &Message{Type: TypeStateSync}, time.Second)
+		rpcDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("StateSync did not reach controller")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := client.ReleaseContext(ctx, "normal")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("release should time out on client lock, got %v", err)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatal("release waited beyond context deadline")
+	}
+	unblock <- struct{}{}
+	select {
+	case err := <-rpcDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("StateSync did not finish")
+	}
+	if got := client.Token(); got != "original-token" {
+		t.Fatalf("timed-out release must retain token, got %q", got)
+	}
+}

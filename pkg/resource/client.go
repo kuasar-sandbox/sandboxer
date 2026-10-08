@@ -51,6 +51,10 @@ func (c *Client) ConnectContext(ctx context.Context) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.connectContextLocked(ctx)
+}
+
+func (c *Client) connectContextLocked(ctx context.Context) error {
 	if c.conn != nil {
 		_ = c.conn.Close()
 		c.conn = nil
@@ -100,6 +104,13 @@ func (c *Client) roundTripContext(ctx context.Context, req *Message, deadline ti
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.roundTripContextLocked(ctx, req, deadline)
+}
+
+func (c *Client) roundTripContextLocked(ctx context.Context, req *Message, deadline time.Duration) (*Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.conn == nil {
 		return nil, errors.New("client: not connected")
 	}
@@ -506,6 +517,29 @@ func (c *Client) OOMReport(oomCount uint64, killedPID int, killedRSS uint64) err
 	return nil
 }
 
+// lockContext bounds the wait for an in-flight serialized RPC.
+func (c *Client) lockContext(ctx context.Context) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if c.mu.TryLock() {
+			if err := ctx.Err(); err != nil {
+				c.mu.Unlock()
+				return err
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // Release relinquishes only this client's existing reservation token. Cleanup
 // has its own bounded lifetime because normal run cancellation may already have
 // interrupted the control RPC and closed its socket.
@@ -524,7 +558,11 @@ func (c *Client) ReleaseContext(ctx context.Context, reason string) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, DeadlineRelease)
 	defer cancel()
-	tok := c.Token()
+	if err := c.lockContext(ctx); err != nil {
+		return err
+	}
+	defer c.mu.Unlock()
+	tok := c.token
 	if tok == "" {
 		return nil
 	}
@@ -533,12 +571,12 @@ func (c *Client) ReleaseContext(ctx context.Context, reason string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if !c.Connected() {
-			if err := c.ConnectContext(ctx); err != nil {
+		if c.conn == nil {
+			if err := c.connectContextLocked(ctx); err != nil {
 				return fmt.Errorf("client: reconnect for release: %w", err)
 			}
 		}
-		resp, err := c.roundTripContext(ctx, &Message{
+		resp, err := c.roundTripContextLocked(ctx, &Message{
 			Type: TypeRelease, Token: tok, Reason: reason,
 		}, DeadlineRelease)
 		if err != nil {
@@ -551,11 +589,9 @@ func (c *Client) ReleaseContext(ctx context.Context, reason string) error {
 		if resp.Type != TypeAck {
 			return fmt.Errorf("client: release reply %q", resp.Type)
 		}
-		c.mu.Lock()
 		if c.token == tok {
 			c.token = ""
 		}
-		c.mu.Unlock()
 		return nil
 	}
 	return lastErr
