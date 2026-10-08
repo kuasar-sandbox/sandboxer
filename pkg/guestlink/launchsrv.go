@@ -103,6 +103,7 @@ type LaunchServer struct {
 	runtimeOnce    sync.Once
 	launchReady    chan struct{}
 	launchMu       sync.RWMutex
+	launchAckMu    sync.Mutex // orders final ACK publication with app_started admission
 	launchAckDone  chan struct{}
 	appStartedDone chan struct{}
 	appStartedOnce sync.Once
@@ -338,11 +339,20 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 				s.OnLaunchAck()
 			}
 		})
-		if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck}); err != nil {
-			s.Logf("launch: write ack: %v", err)
+		// A peer may receive the ACK before WriteMessage returns. Keep
+		// app_started admission behind the same boundary so that a valid
+		// one-shot notification cannot observe an unpublished ACK. Failed
+		// writes leave the barrier closed; release the gate before MUX setup.
+		s.launchAckMu.Lock()
+		ackErr := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck})
+		if ackErr == nil {
+			s.launchAckOnce.Do(func() { close(s.launchAckDone) })
+		}
+		s.launchAckMu.Unlock()
+		if ackErr != nil {
+			s.Logf("launch: write ack: %v", ackErr)
 			return false
 		}
-		s.launchAckOnce.Do(func() { close(s.launchAckDone) })
 		completed = true
 		// Hand the connection off as the stdio MUX (docs/sandbox-runtime
 		// .md §4.5). Drop the handshake deadline first.
@@ -383,15 +393,21 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 			_ = conn.SetDeadline(time.Time{})
 		}
 		if s.DeferLaunch {
+			s.launchAckMu.Lock()
+			acked := false
 			select {
 			case <-s.launchAckDone:
-				select {
-				case <-s.muxReady:
-				case <-s.stopped:
-					return false
-				}
+				acked = true
 			default:
+			}
+			s.launchAckMu.Unlock()
+			if !acked {
 				_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "workload has not launched"})
+				return false
+			}
+			select {
+			case <-s.muxReady:
+			case <-s.stopped:
 				return false
 			}
 		}
