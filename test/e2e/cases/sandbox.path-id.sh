@@ -85,6 +85,22 @@ wait_exec_path() {
     return 1
 }
 
+# Launch readiness does not wait for asynchronous diff-template publication.
+# Keep the exact PathID/SandboxID assertions below, but first wait for both
+# final files while the sandbox is alive; partial files are not publication.
+wait_diff_paths() {
+    local path_id=$1 sandbox_id=$2
+    for _ in $(seq 1 90); do
+        kill -0 "$RUN_PID" 2>/dev/null || return 1
+        if [ -f "$BASE_ROOT/$path_id/$sandbox_id.overlay.diff" ] &&
+           [ -f "$BASE_ROOT/$path_id/$sandbox_id.disk0.diff" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 SID_A="logical-phase-a-$BASHPID"
 timeout -k 10s 150 "$BIN/sandbox-ctl" run \
     --config "$WORK/cold.yaml" --sandbox-id "$SID_A" --path-id a \
@@ -98,6 +114,7 @@ wait_exec_path a || {
 
 [ -S "$RUN_ROOT/a/ctl.sock" ] || e2e_fail "missing PathID ctl.sock"
 [ ! -e "$RUN_ROOT/$SID_A" ] || e2e_fail "logical SandboxID incorrectly became RunDir"
+wait_diff_paths a "$SID_A" || e2e_fail "cold logical diffs were not published in PathID BaseDir"
 [ -f "$BASE_ROOT/a/$SID_A.overlay.diff" ] || e2e_fail "missing logical root diff in PathID BaseDir"
 [ -f "$BASE_ROOT/a/$SID_A.disk0.diff" ] || e2e_fail "missing logical data diff in PathID BaseDir"
 [ ! -e "$BASE_ROOT/a/a.overlay.diff" ] || e2e_fail "PathID incorrectly became diff identity"
@@ -155,6 +172,7 @@ wait_exec_path c || {
 
 "$BIN/sandbox-ctl" exec --sandbox-id not-the-directory --path-id c \
     --run-root "$RUN_ROOT" -- /bin/sh -c 'grep -q PATH-ID-OK /scratch/path-id-marker'
+wait_diff_paths c "$SID_C" || e2e_fail "restored logical diffs were not published in PathID BaseDir"
 [ -f "$BASE_ROOT/c/$SID_C.overlay.diff" ] || e2e_fail "restore root diff lost logical SandboxID"
 [ -f "$BASE_ROOT/c/$SID_C.disk0.diff" ] || e2e_fail "restore data diff lost logical SandboxID"
 
