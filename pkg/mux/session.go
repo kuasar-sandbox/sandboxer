@@ -269,6 +269,12 @@ func (s *Session) readLoop() {
 			_ = s.conn.Close()
 			return
 		}
+		// dispatch has acknowledged MUX_CLOSE and closed the responder's
+		// transport. Do not read it again: a raw fd can already belong to a
+		// newly accepted connection.
+		if f.Type == FrameMuxClose {
+			return
+		}
 		// MUX_CLOSE_ACK is the final frame for the initiator. The caller
 		// closes the connection after InitMuxClose returns, so the read loop
 		// must stop here rather than issue one more Read against a concurrently
@@ -350,9 +356,8 @@ func (s *Session) dispatch(f Frame) error {
 		// socket actually removed — not left in virtio-vsock's 8s deferred
 		// window where a snapshot would capture it as a half-closed
 		// remnant (which a later restore's reused muxer local port
-		// collides with). The next readLoop ReadFrame fails on the closed
-		// conn; respClosed marks that error expected (clean teardown, not
-		// a session fault).
+		// collides with). readLoop returns after this terminal frame without
+		// touching the closed transport again.
 		_ = s.conn.Close()
 	case FrameMuxCloseAck:
 		if f.Stream != StreamControl {

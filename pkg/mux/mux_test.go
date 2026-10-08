@@ -332,3 +332,71 @@ func TestSessionProtocolViolation(t *testing.T) {
 		t.Fatal("guest did not tear down on protocol violation")
 	}
 }
+
+type reusedCloseConn struct {
+	initial         *bytes.Reader
+	replacement     *bytes.Reader
+	written         bytes.Buffer
+	closed          bool
+	closeCalls      int
+	readsAfterClose int
+}
+
+func (c *reusedCloseConn) Read(p []byte) (int, error) {
+	if c.closed {
+		c.readsAfterClose++
+		return c.replacement.Read(p)
+	}
+	return c.initial.Read(p)
+}
+
+func (c *reusedCloseConn) Write(p []byte) (int, error) {
+	return c.written.Write(p)
+}
+
+func (c *reusedCloseConn) Close() error {
+	c.closed = true
+	c.closeCalls++
+	return nil
+}
+
+func TestSessionMuxCloseStopsResponderReadLoop(t *testing.T) {
+	var input, replacement bytes.Buffer
+	if err := WriteFrame(&input, Frame{Stream: StreamControl, Type: FrameMuxClose}); err != nil {
+		t.Fatal(err)
+	}
+	// Model a raw descriptor being reused as soon as dispatch closes it.
+	// Reading again would steal bytes belonging to the next connection.
+	if err := WriteFrame(&replacement, Frame{Stream: StreamStdout, Type: FrameData, Payload: []byte("next connection")}); err != nil {
+		t.Fatal(err)
+	}
+	replacementSize := replacement.Len()
+	conn := &reusedCloseConn{
+		initial:     bytes.NewReader(input.Bytes()),
+		replacement: bytes.NewReader(replacement.Bytes()),
+	}
+	responder := NewSession(conn, PipeStreams(true, true, true), Options{})
+	select {
+	case <-responder.Done():
+	case <-time.After(time.Second):
+		t.Fatal("responder read loop continued after MUX_CLOSE")
+	}
+	if conn.readsAfterClose != 0 || conn.replacement.Len() != replacementSize {
+		t.Fatalf("responder read reused connection: reads=%d remaining=%d want=%d", conn.readsAfterClose, conn.replacement.Len(), replacementSize)
+	}
+	if conn.closeCalls != 1 {
+		t.Fatalf("transport close calls=%d, want 1", conn.closeCalls)
+	}
+	ack, err := ReadFrame(&conn.written)
+	if err != nil || ack.Stream != StreamControl || ack.Type != FrameMuxCloseAck || conn.written.Len() != 0 {
+		t.Fatalf("close ACK: frame=%+v err=%v remaining=%d", ack, err, conn.written.Len())
+	}
+	select {
+	case <-responder.PeerClosed():
+	default:
+		t.Fatal("peer close was not signalled")
+	}
+	if err := responder.Err(); err != nil {
+		t.Fatalf("responder Err after MUX_CLOSE: %v", err)
+	}
+}
