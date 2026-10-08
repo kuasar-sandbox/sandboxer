@@ -39,7 +39,7 @@ type ControllerHooks struct {
 	// sessionMu covers one complete reservation RPC and connection
 	// replacement. It prevents an old response from racing StateSync.
 	sessionMu   sync.Mutex
-	syncStartMu sync.Mutex // synchronizes StateSync startup with Release
+	syncStartMu sync.Mutex // orders StateSync writes with all lifetime cancellation
 	mu          sync.Mutex
 	client      *resource.Client
 	lease       *resource.LeaseHandle
@@ -73,10 +73,26 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 	if opts.Context == nil {
 		opts.Context = context.Background()
 	}
-	lifetimeCtx, cancel := context.WithCancel(opts.Context)
+	// Parent cancellation must use the same gate as explicit Release. Direct
+	// propagation would cancel lifetimeCtx in the check-to-write interval even
+	// while the StateSync writer owns syncStartMu.
+	lifetimeCtx, cancel := context.WithCancel(context.WithoutCancel(opts.Context))
 	h := &ControllerHooks{
 		opts: opts, cfg: cfg, lifetimeCtx: lifetimeCtx, cancelLifetime: cancel,
 		reconnectWake: make(chan struct{}, 1),
+	}
+	cancelLocal := cancel
+	stopParent := context.AfterFunc(opts.Context, func() {
+		h.syncStartMu.Lock()
+		cancelLocal()
+		h.syncStartMu.Unlock()
+	})
+	// Constructor failures and Release also unregister the parent callback.
+	// stopParent does not wait for a callback already waiting on syncStartMu.
+	cancel = func() { stopParent(); cancelLocal() }
+	h.cancelLifetime = cancel
+	if opts.Context.Err() != nil {
+		cancel() // no worker exists yet; preserve already-canceled construction
 	}
 	if opts.SocketPath == "" {
 		return h, nil
@@ -495,6 +511,13 @@ func (h *ControllerHooks) reconnectLoop() {
 			if err == nil {
 				hostCharge := readHostMemoryChargeBestEffort(h.opts.CgroupPath)
 				h.syncStartMu.Lock()
+				// Observe an already-canceled parent even if its AfterFunc has not
+				// run yet. A cancellation racing after this point is ordered after
+				// the write: its callback cannot cancel lifetimeCtx until onWrite
+				// releases this gate. Thus the check-to-write window is protected.
+				if h.opts.Context.Err() != nil {
+					h.cancelLifetime()
+				}
 				// Do not begin a new StateSync after shutdown has started.
 				// Only an already-started RPC may drain without cancellation.
 				if err = h.lifetimeCtx.Err(); err != nil {

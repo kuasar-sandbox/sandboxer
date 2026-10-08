@@ -175,3 +175,88 @@ func TestControllerHooksReleaseDrainsStateSyncTokenRotation(t *testing.T) {
 		})
 	}
 }
+
+// The writer holds this gate from its startup check through the successful
+// WriteMessage callback. Parent cancellation must not bypass that ownership.
+func TestControllerHooksParentCancellationWaitsForStateSyncWriteGate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := startReservationServer(t, func(req resource.Message) (*resource.Message, bool) {
+		return &resource.Message{Type: resource.TypeAck}, false
+	})
+	cfg := testControllerConfig(t, server.sock)
+	h, err := NewControllerHooks(ControllerHookOptions{SocketPath: server.sock, SandboxID: "sandbox-1", Context: ctx}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Release("test")
+
+	h.syncStartMu.Lock()
+	before := h.lifetimeCtx.Err()
+	cancel() // exactly between the startup check and the wire-write callback
+	duringWrite := h.lifetimeCtx.Err()
+	h.syncStartMu.Unlock()
+	if before != nil {
+		t.Fatalf("lifetime already canceled: %v", before)
+	}
+	if duringWrite != nil {
+		t.Fatalf("parent cancellation bypassed StateSync write gate: %v", duringWrite)
+	}
+	select {
+	case <-h.lifetimeCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("parent cancellation did not propagate after the write gate opened")
+	}
+}
+
+func TestControllerHooksCanceledParentCannotStartQueuedStateSync(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var syncs, releases atomic.Int32
+	server := startReservationServer(t, func(req resource.Message) (*resource.Message, bool) {
+		switch req.Type {
+		case resource.TypeAdmit:
+			return &resource.Message{Type: resource.TypeAdmitResponse, Status: resource.StatusAdmitted, Token: "original-token", GrantedInitialAlloc: 128 << 20}, false
+		case resource.TypeRequestBudget:
+			return nil, true
+		case resource.TypeStateSync:
+			syncs.Add(1)
+			return &resource.Message{Type: resource.TypeAck, Token: "unexpected-token", NewAllocatable: 128 << 20}, false
+		case resource.TypeRelease:
+			if req.Token != "original-token" {
+				t.Errorf("cleanup changed token after parent cancellation: %q", req.Token)
+			}
+			releases.Add(1)
+			return &resource.Message{Type: resource.TypeAck}, false
+		default:
+			return &resource.Message{Type: resource.TypeAck}, false
+		}
+	})
+	cfg := testControllerConfig(t, server.sock)
+	h, err := NewControllerHooks(ControllerHookOptions{SocketPath: server.sock, SandboxID: "sandbox-1", Context: ctx}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Release("test")
+	if _, err := h.Admit("sandbox-1", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	h.syncStartMu.Lock()
+	_, _, _, budgetErr := h.RequestBudget(128<<20, 0, resource.UrgencyNormal, "test")
+	cancel()
+	h.syncStartMu.Unlock()
+	if budgetErr == nil {
+		t.Fatal("missing injected transport failure")
+	}
+	done := make(chan struct{})
+	go func() { h.Release("normal"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown waited on a StateSync that had not started")
+	}
+	if syncs.Load() != 0 || releases.Load() != 1 {
+		t.Fatalf("StateSync=%d Release=%d, want 0 and 1", syncs.Load(), releases.Load())
+	}
+}
