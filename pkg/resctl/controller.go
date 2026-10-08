@@ -38,10 +38,11 @@ type ControllerHooks struct {
 
 	// sessionMu covers one complete reservation RPC and connection
 	// replacement. It prevents an old response from racing StateSync.
-	sessionMu sync.Mutex
-	mu        sync.Mutex
-	client    *resource.Client
-	lease     *resource.LeaseHandle
+	sessionMu   sync.Mutex
+	syncStartMu sync.Mutex // synchronizes StateSync startup with Release
+	mu          sync.Mutex
+	client      *resource.Client
+	lease       *resource.LeaseHandle
 
 	controllerCgroupPath     string
 	controllerSocketIdentity string
@@ -493,21 +494,26 @@ func (h *ControllerHooks) reconnectLoop() {
 			err := h.client.ConnectContext(h.lifetimeCtx)
 			if err == nil {
 				hostCharge := readHostMemoryChargeBestEffort(h.opts.CgroupPath)
+				h.syncStartMu.Lock()
 				// Do not begin a new StateSync after shutdown has started.
 				// Only an already-started RPC may drain without cancellation.
 				if err = h.lifetimeCtx.Err(); err != nil {
+					h.syncStartMu.Unlock()
 					h.sessionMu.Unlock()
 					return
 				}
+				var startOnce sync.Once
+				unlockStart := func() { startOnce.Do(h.syncStartMu.Unlock) }
 				// StateSync can rotate the reservation token before its ACK arrives.
 				// Once sent, let the existing bounded RPC finish so Release can
 				// use the new token. Release joins this worker before cleanup;
 				// canceling here could lose the only token for the live charge.
-				result, syncErr := h.client.StateSyncContext(context.WithoutCancel(h.lifetimeCtx), resource.StateSyncParams{
+				result, syncErr := h.client.StateSyncContextOnWrite(context.WithoutCancel(h.lifetimeCtx), resource.StateSyncParams{
 					SandboxID:                h.opts.SandboxID,
 					AppliedAllocatableMemory: state.reservation,
 					Settled:                  state.settled, CurrentRSS: hostCharge, PreviousToken: state.token,
-				})
+				}, unlockStart)
+				unlockStart()
 				if syncErr == nil && result.NewAllocatable != state.reservation {
 					syncErr = fmt.Errorf("state_sync reservation mismatch: node=%d local=%d", result.NewAllocatable, state.reservation)
 				}
@@ -562,9 +568,11 @@ func (h *ControllerHooks) Release(reason string) {
 	if h == nil {
 		return
 	}
+	h.syncStartMu.Lock()
 	h.mu.Lock()
 	if h.released {
 		h.mu.Unlock()
+		h.syncStartMu.Unlock()
 		return
 	}
 	h.released = true
@@ -574,6 +582,7 @@ func (h *ControllerHooks) Release(reason string) {
 		cancelBg()
 	}
 	h.cancelLifetime()
+	h.syncStartMu.Unlock()
 	h.bgWG.Wait()
 	h.reconnectWG.Wait()
 	if h.Enabled() {

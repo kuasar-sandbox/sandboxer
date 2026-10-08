@@ -210,3 +210,57 @@ func TestClientReleaseDeadlineWhileStateSyncHoldsRPCMutex(t *testing.T) {
 		t.Fatalf("timed-out release must retain token, got %q", got)
 	}
 }
+
+func TestClientStateSyncWriteBarrierPrecedesACK(t *testing.T) {
+	received := make(chan struct{})
+	allowACK := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(allowACK) }) }
+	defer unblock()
+	client := releaseTestClient(t, func(req *Message) (*Message, bool) {
+		if req.Type != TypeStateSync {
+			t.Errorf("unexpected request: %s", req.Type)
+		}
+		close(received)
+		<-allowACK
+		return &Message{Type: TypeAck, Token: "rotated-token"}, false
+	})
+	if err := client.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	written := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		_, err := client.StateSyncContextOnWrite(context.Background(),
+			StateSyncParams{SandboxID: "sandbox-1", PreviousToken: "original-token"},
+			func() { close(written) })
+		finished <- err
+	}()
+	select {
+	case <-written:
+	case <-time.After(time.Second):
+		t.Fatal("write barrier not signaled")
+	}
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		t.Fatal("no StateSync")
+	}
+	select {
+	case <-finished:
+		t.Fatal("finished before ACK")
+	default:
+	}
+	unblock()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no StateSync reply")
+	}
+	if client.Token() != "rotated-token" {
+		t.Fatal("token not rotated")
+	}
+}

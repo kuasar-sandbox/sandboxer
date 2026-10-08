@@ -107,7 +107,17 @@ func (c *Client) roundTripContext(ctx context.Context, req *Message, deadline ti
 	return c.roundTripContextLocked(ctx, req, deadline)
 }
 
-func (c *Client) roundTripContextLocked(ctx context.Context, req *Message, deadline time.Duration) (*Message, error) {
+// roundTripContextOnWrite runs a callback after writing the request.
+func (c *Client) roundTripContextOnWrite(ctx context.Context, req *Message, deadline time.Duration, onWrite func()) (*Message, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.roundTripContextLocked(ctx, req, deadline, onWrite)
+}
+
+func (c *Client) roundTripContextLocked(ctx context.Context, req *Message, deadline time.Duration, onWrite ...func()) (*Message, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -157,6 +167,9 @@ func (c *Client) roundTripContextLocked(ctx context.Context, req *Message, deadl
 			return nil, ctxErr
 		}
 		return nil, &TransportError{Err: err}
+	}
+	if len(onWrite) > 0 && onWrite[0] != nil {
+		onWrite[0]()
 	}
 	resp, err := ReadMessage(conn)
 	if err != nil {
@@ -279,14 +292,19 @@ func (c *Client) StateSync(p StateSyncParams) (*StateSyncResult, error) {
 }
 
 func (c *Client) StateSyncContext(ctx context.Context, p StateSyncParams) (*StateSyncResult, error) {
-	resp, err := c.roundTripContext(ctx, &Message{
+	return c.StateSyncContextOnWrite(ctx, p, nil)
+}
+
+// StateSyncContextOnWrite calls onWrite after the request is fully written.
+func (c *Client) StateSyncContextOnWrite(ctx context.Context, p StateSyncParams, onWrite func()) (*StateSyncResult, error) {
+	resp, err := c.roundTripContextOnWrite(ctx, &Message{
 		Type:                     TypeStateSync,
 		SandboxID:                p.SandboxID,
 		AppliedAllocatableMemory: p.AppliedAllocatableMemory,
 		Settled:                  p.Settled,
 		CurrentRSS:               p.CurrentRSS,
 		PreviousToken:            p.PreviousToken,
-	}, DeadlineAdmit)
+	}, DeadlineAdmit, onWrite)
 	if err != nil {
 		return nil, err
 	}
