@@ -117,6 +117,7 @@ e2e-cgroup-fork-probe:
 	python3 -c 'import struct,sys; h=open(sys.argv[1],"rb").read(64); assert h[:7]==b"\x7fELF\x02\x01\x01" and struct.unpack_from("<H",h,18)[0]=={"x86_64":62,"aarch64":183}[sys.argv[2]], "cgroup probe compiler produced the wrong target architecture"' "$(E2E_FIXTURE_DIR)/cgroup-fork-probe" "$(TARGET_ARCH)"
 
 test-e2e-scripts:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_path_id.py
 	PYTHONDONTWRITEBYTECODE=1 python3 test/source/cgroup_fork_probe_test.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-go-privilege.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_upload_restore_tick.py
