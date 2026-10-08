@@ -51,6 +51,10 @@ func (c *Client) ConnectContext(ctx context.Context) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.connectContextLocked(ctx)
+}
+
+func (c *Client) connectContextLocked(ctx context.Context) error {
 	if c.conn != nil {
 		_ = c.conn.Close()
 		c.conn = nil
@@ -100,6 +104,28 @@ func (c *Client) roundTripContext(ctx context.Context, req *Message, deadline ti
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.roundTripContextLocked(ctx, req, deadline)
+}
+
+// roundTripContextOnWrite runs a callback after writing the request.
+func (c *Client) roundTripContextOnWrite(ctx context.Context, req *Message, deadline time.Duration, onWrite func(), startGuard context.Context) (*Message, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.roundTripContextLocked(ctx, req, deadline, roundTripWriteOptions{onWrite: onWrite, startGuard: startGuard})
+}
+
+type roundTripWriteOptions struct {
+	onWrite func()
+	startGuard context.Context
+}
+
+func (c *Client) roundTripContextLocked(ctx context.Context, req *Message, deadline time.Duration, hooks ...roundTripWriteOptions) (*Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.conn == nil {
 		return nil, errors.New("client: not connected")
 	}
@@ -139,6 +165,15 @@ func (c *Client) roundTripContext(ctx context.Context, req *Message, deadline ti
 	}
 	defer stopContextWatch()
 
+	// This check is the startup boundary. A request started before cancellation
+	// must drain its reply because the controller may already rotate the token.
+	if len(hooks) != 0 && hooks[0].startGuard != nil {
+		if err := hooks[0].startGuard.Err(); err != nil {
+			stopContextWatch()
+			_ = conn.SetDeadline(time.Time{})
+			return nil, err
+		}
+	}
 	if err := WriteMessage(conn, req); err != nil {
 		_ = conn.Close()
 		c.conn = nil
@@ -146,6 +181,9 @@ func (c *Client) roundTripContext(ctx context.Context, req *Message, deadline ti
 			return nil, ctxErr
 		}
 		return nil, &TransportError{Err: err}
+	}
+	if len(hooks) > 0 && hooks[0].onWrite != nil {
+		hooks[0].onWrite()
 	}
 	resp, err := ReadMessage(conn)
 	if err != nil {
@@ -268,14 +306,23 @@ func (c *Client) StateSync(p StateSyncParams) (*StateSyncResult, error) {
 }
 
 func (c *Client) StateSyncContext(ctx context.Context, p StateSyncParams) (*StateSyncResult, error) {
-	resp, err := c.roundTripContext(ctx, &Message{
+	return c.StateSyncContextOnWrite(ctx, p, nil)
+}
+
+// StateSyncContextOnWrite calls onWrite after the request is fully written.
+func (c *Client) StateSyncContextOnWrite(ctx context.Context, p StateSyncParams, onWrite func(), startGuard ...context.Context) (*StateSyncResult, error) {
+	var guard context.Context
+	if len(startGuard) > 0 {
+		guard = startGuard[0]
+	}
+	resp, err := c.roundTripContextOnWrite(ctx, &Message{
 		Type:                     TypeStateSync,
 		SandboxID:                p.SandboxID,
 		AppliedAllocatableMemory: p.AppliedAllocatableMemory,
 		Settled:                  p.Settled,
 		CurrentRSS:               p.CurrentRSS,
 		PreviousToken:            p.PreviousToken,
-	}, DeadlineAdmit)
+	}, DeadlineAdmit, onWrite, guard)
 	if err != nil {
 		return nil, err
 	}
@@ -506,29 +553,82 @@ func (c *Client) OOMReport(oomCount uint64, killedPID int, killedRSS uint64) err
 	return nil
 }
 
-// Release notifies the controller of imminent sandbox exit and frees the
-// reservation. Best-effort: errors are not fatal because the controller
-// can also detect connection drop.
+// lockContext bounds the wait for an in-flight serialized RPC.
+func (c *Client) lockContext(ctx context.Context) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if c.mu.TryLock() {
+			if err := ctx.Err(); err != nil {
+				c.mu.Unlock()
+				return err
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// Release relinquishes only this client's existing reservation token. Cleanup
+// has its own bounded lifetime because normal run cancellation may already have
+// interrupted the control RPC and closed its socket.
 func (c *Client) Release(reason string) error {
-	c.mu.Lock()
+	return c.ReleaseContext(context.Background(), reason)
+}
+
+// ReleaseContext makes a bounded, token-only cleanup attempt. A fresh transport
+// does not Admit or StateSync: neither a dead run nor an obsolete token may
+// recreate a reservation or take ownership of a replacement run. Release is
+// idempotent at the controller, so a lost ACK may be retried once with the same
+// token. Both attempts share DeadlineRelease, including reconnect time.
+func (c *Client) ReleaseContext(ctx context.Context, reason string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, DeadlineRelease)
+	defer cancel()
+	if err := c.lockContext(ctx); err != nil {
+		return err
+	}
+	defer c.mu.Unlock()
 	tok := c.token
-	c.mu.Unlock()
 	if tok == "" {
 		return nil
 	}
-	resp, err := c.roundTrip(&Message{
-		Type:   TypeRelease,
-		Token:  tok,
-		Reason: reason,
-	}, DeadlineRelease)
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if c.conn == nil {
+			if err := c.connectContextLocked(ctx); err != nil {
+				return fmt.Errorf("client: reconnect for release: %w", err)
+			}
+		}
+		resp, err := c.roundTripContextLocked(ctx, &Message{
+			Type: TypeRelease, Token: tok, Reason: reason,
+		}, DeadlineRelease)
+		if err != nil {
+			lastErr = err
+			if !IsTransportError(err) {
+				return err
+			}
+			continue
+		}
+		if resp.Type != TypeAck {
+			return fmt.Errorf("client: release reply %q", resp.Type)
+		}
+		if c.token == tok {
+			c.token = ""
+		}
+		return nil
 	}
-	if resp.Type != TypeAck {
-		return fmt.Errorf("client: release reply %q", resp.Type)
-	}
-	c.mu.Lock()
-	c.token = ""
-	c.mu.Unlock()
-	return nil
+	return lastErr
 }

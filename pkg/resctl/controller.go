@@ -38,10 +38,11 @@ type ControllerHooks struct {
 
 	// sessionMu covers one complete reservation RPC and connection
 	// replacement. It prevents an old response from racing StateSync.
-	sessionMu sync.Mutex
-	mu        sync.Mutex
-	client    *resource.Client
-	lease     *resource.LeaseHandle
+	sessionMu   sync.Mutex
+	syncStartMu sync.Mutex // orders StateSync writes with all lifetime cancellation
+	mu          sync.Mutex
+	client      *resource.Client
+	lease       *resource.LeaseHandle
 
 	controllerCgroupPath     string
 	controllerSocketIdentity string
@@ -72,10 +73,26 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 	if opts.Context == nil {
 		opts.Context = context.Background()
 	}
-	lifetimeCtx, cancel := context.WithCancel(opts.Context)
+	// Parent cancellation must use the same gate as explicit Release. Direct
+	// propagation would cancel lifetimeCtx in the check-to-write interval even
+	// while the StateSync writer owns syncStartMu.
+	lifetimeCtx, cancel := context.WithCancel(context.WithoutCancel(opts.Context))
 	h := &ControllerHooks{
 		opts: opts, cfg: cfg, lifetimeCtx: lifetimeCtx, cancelLifetime: cancel,
 		reconnectWake: make(chan struct{}, 1),
+	}
+	cancelLocal := cancel
+	stopParent := context.AfterFunc(opts.Context, func() {
+		h.syncStartMu.Lock()
+		cancelLocal()
+		h.syncStartMu.Unlock()
+	})
+	// Constructor failures and Release also unregister the parent callback.
+	// stopParent does not wait for a callback already waiting on syncStartMu.
+	cancel = func() { stopParent(); cancelLocal() }
+	h.cancelLifetime = cancel
+	if opts.Context.Err() != nil {
+		cancel() // no worker exists yet; preserve already-canceled construction
 	}
 	if opts.SocketPath == "" {
 		return h, nil
@@ -493,11 +510,33 @@ func (h *ControllerHooks) reconnectLoop() {
 			err := h.client.ConnectContext(h.lifetimeCtx)
 			if err == nil {
 				hostCharge := readHostMemoryChargeBestEffort(h.opts.CgroupPath)
-				result, syncErr := h.client.StateSyncContext(h.lifetimeCtx, resource.StateSyncParams{
+				h.syncStartMu.Lock()
+				// Observe an already-canceled parent even if its AfterFunc has not
+				// run yet. A cancellation racing after this point is ordered after
+				// the write: its callback cannot cancel lifetimeCtx until onWrite
+				// releases this gate. Thus the check-to-write window is protected.
+				if h.opts.Context.Err() != nil {
+					h.cancelLifetime()
+				}
+				// Do not begin a new StateSync after shutdown has started.
+				// Only an already-started RPC may drain without cancellation.
+				if err = h.lifetimeCtx.Err(); err != nil {
+					h.syncStartMu.Unlock()
+					h.sessionMu.Unlock()
+					return
+				}
+				var startOnce sync.Once
+				unlockStart := func() { startOnce.Do(h.syncStartMu.Unlock) }
+				// StateSync can rotate the reservation token before its ACK arrives.
+				// Once sent, let the existing bounded RPC finish so Release can
+				// use the new token. Release joins this worker before cleanup;
+				// canceling here could lose the only token for the live charge.
+				result, syncErr := h.client.StateSyncContextOnWrite(context.WithoutCancel(h.lifetimeCtx), resource.StateSyncParams{
 					SandboxID:                h.opts.SandboxID,
 					AppliedAllocatableMemory: state.reservation,
 					Settled:                  state.settled, CurrentRSS: hostCharge, PreviousToken: state.token,
-				})
+				}, unlockStart, h.lifetimeCtx)
+				unlockStart()
 				if syncErr == nil && result.NewAllocatable != state.reservation {
 					syncErr = fmt.Errorf("state_sync reservation mismatch: node=%d local=%d", result.NewAllocatable, state.reservation)
 				}
@@ -552,9 +591,11 @@ func (h *ControllerHooks) Release(reason string) {
 	if h == nil {
 		return
 	}
+	h.syncStartMu.Lock()
 	h.mu.Lock()
 	if h.released {
 		h.mu.Unlock()
+		h.syncStartMu.Unlock()
 		return
 	}
 	h.released = true
@@ -564,14 +605,17 @@ func (h *ControllerHooks) Release(reason string) {
 		cancelBg()
 	}
 	h.cancelLifetime()
+	h.syncStartMu.Unlock()
 	h.bgWG.Wait()
 	h.reconnectWG.Wait()
 	if h.Enabled() {
 		h.sessionMu.Lock()
-		if h.client.Connected() {
-			if err := h.client.Release(reason); err != nil && !resource.IsTransportError(err) {
-				h.opts.Logf("controller.Release: %v", err)
-			}
+		// Cancellation may have closed an in-flight control RPC's transport.
+		// Release uses the original token on a bounded cleanup connection; do
+		// not skip it merely because normal controller work has stopped. Keep
+		// the lease until this attempt ends, and retain node recovery on error.
+		if err := h.client.Release(reason); err != nil {
+			h.opts.Logf("controller.Release: %v; retaining node recovery", err)
 		}
 		_ = h.client.Close()
 		h.sessionMu.Unlock()
