@@ -512,7 +512,7 @@ func (h *ControllerHooks) reconnectLoop() {
 					SandboxID:                h.opts.SandboxID,
 					AppliedAllocatableMemory: state.reservation,
 					Settled:                  state.settled, CurrentRSS: hostCharge, PreviousToken: state.token,
-				}, unlockStart)
+				}, unlockStart, h.lifetimeCtx)
 				unlockStart()
 				if syncErr == nil && result.NewAllocatable != state.reservation {
 					syncErr = fmt.Errorf("state_sync reservation mismatch: node=%d local=%d", result.NewAllocatable, state.reservation)

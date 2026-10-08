@@ -228,12 +228,14 @@ func TestClientStateSyncWriteBarrierPrecedesACK(t *testing.T) {
 	if err := client.Connect(); err != nil {
 		t.Fatal(err)
 	}
+	guard, cancelGuard := context.WithCancel(context.Background())
+	defer cancelGuard()
 	written := make(chan struct{})
 	finished := make(chan error, 1)
 	go func() {
 		_, err := client.StateSyncContextOnWrite(context.Background(),
 			StateSyncParams{SandboxID: "sandbox-1", PreviousToken: "original-token"},
-			func() { close(written) })
+			func() { close(written) }, guard)
 		finished <- err
 	}()
 	select {
@@ -251,6 +253,7 @@ func TestClientStateSyncWriteBarrierPrecedesACK(t *testing.T) {
 		t.Fatal("finished before ACK")
 	default:
 	}
+	cancelGuard() // A request already written must still drain its ACK.
 	unblock()
 	select {
 	case err := <-finished:
@@ -262,5 +265,46 @@ func TestClientStateSyncWriteBarrierPrecedesACK(t *testing.T) {
 	}
 	if client.Token() != "rotated-token" {
 		t.Fatal("token not rotated")
+	}
+}
+
+// A parent cancellation between the outer reconnect guard and the serialized
+// wire write must not create a new StateSync or rotate the reservation token.
+func TestClientStateSyncStartGuardCanceledBeforeWrite(t *testing.T) {
+	var received atomic.Int32
+	client := releaseTestClient(t, func(req *Message) (*Message, bool) {
+		if req.Type == TypeStateSync {
+			received.Add(1)
+		}
+		return &Message{Type: TypeAck, Token: "unexpected-rotation"}, false
+	})
+	if err := client.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	startCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client.mu.Lock() // Stall between reconnect's guard and the actual wire write.
+	ready := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		close(ready)
+		_, err := client.StateSyncContextOnWrite(context.Background(),
+			StateSyncParams{SandboxID: "sandbox-1", PreviousToken: "original-token"},
+			nil, startCtx)
+		finished <- err
+	}()
+	<-ready
+	cancel()
+	client.mu.Unlock()
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("want canceled before wire write, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled StateSync did not return")
+	}
+	if received.Load() != 0 || client.Token() != "original-token" {
+		t.Fatalf("unexpected StateSync after cancellation: received=%d token=%q", received.Load(), client.Token())
 	}
 }

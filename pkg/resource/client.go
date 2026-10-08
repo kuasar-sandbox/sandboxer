@@ -108,16 +108,21 @@ func (c *Client) roundTripContext(ctx context.Context, req *Message, deadline ti
 }
 
 // roundTripContextOnWrite runs a callback after writing the request.
-func (c *Client) roundTripContextOnWrite(ctx context.Context, req *Message, deadline time.Duration, onWrite func()) (*Message, error) {
+func (c *Client) roundTripContextOnWrite(ctx context.Context, req *Message, deadline time.Duration, onWrite func(), startGuard context.Context) (*Message, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.roundTripContextLocked(ctx, req, deadline, onWrite)
+	return c.roundTripContextLocked(ctx, req, deadline, roundTripWriteOptions{onWrite: onWrite, startGuard: startGuard})
 }
 
-func (c *Client) roundTripContextLocked(ctx context.Context, req *Message, deadline time.Duration, onWrite ...func()) (*Message, error) {
+type roundTripWriteOptions struct {
+	onWrite func()
+	startGuard context.Context
+}
+
+func (c *Client) roundTripContextLocked(ctx context.Context, req *Message, deadline time.Duration, hooks ...roundTripWriteOptions) (*Message, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -160,6 +165,15 @@ func (c *Client) roundTripContextLocked(ctx context.Context, req *Message, deadl
 	}
 	defer stopContextWatch()
 
+	// This check is the startup boundary. A request started before cancellation
+	// must drain its reply because the controller may already rotate the token.
+	if len(hooks) != 0 && hooks[0].startGuard != nil {
+		if err := hooks[0].startGuard.Err(); err != nil {
+			stopContextWatch()
+			_ = conn.SetDeadline(time.Time{})
+			return nil, err
+		}
+	}
 	if err := WriteMessage(conn, req); err != nil {
 		_ = conn.Close()
 		c.conn = nil
@@ -168,8 +182,8 @@ func (c *Client) roundTripContextLocked(ctx context.Context, req *Message, deadl
 		}
 		return nil, &TransportError{Err: err}
 	}
-	if len(onWrite) > 0 && onWrite[0] != nil {
-		onWrite[0]()
+	if len(hooks) > 0 && hooks[0].onWrite != nil {
+		hooks[0].onWrite()
 	}
 	resp, err := ReadMessage(conn)
 	if err != nil {
@@ -296,7 +310,11 @@ func (c *Client) StateSyncContext(ctx context.Context, p StateSyncParams) (*Stat
 }
 
 // StateSyncContextOnWrite calls onWrite after the request is fully written.
-func (c *Client) StateSyncContextOnWrite(ctx context.Context, p StateSyncParams, onWrite func()) (*StateSyncResult, error) {
+func (c *Client) StateSyncContextOnWrite(ctx context.Context, p StateSyncParams, onWrite func(), startGuard ...context.Context) (*StateSyncResult, error) {
+	var guard context.Context
+	if len(startGuard) > 0 {
+		guard = startGuard[0]
+	}
 	resp, err := c.roundTripContextOnWrite(ctx, &Message{
 		Type:                     TypeStateSync,
 		SandboxID:                p.SandboxID,
@@ -304,7 +322,7 @@ func (c *Client) StateSyncContextOnWrite(ctx context.Context, p StateSyncParams,
 		Settled:                  p.Settled,
 		CurrentRSS:               p.CurrentRSS,
 		PreviousToken:            p.PreviousToken,
-	}, DeadlineAdmit, onWrite)
+	}, DeadlineAdmit, onWrite, guard)
 	if err != nil {
 		return nil, err
 	}
