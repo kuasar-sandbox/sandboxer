@@ -396,6 +396,7 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 	if err != nil {
 		return nil, err
 	}
+	r.logf("initial cold Budget reserved=%d", initial)
 	if r.balloon != nil {
 		if err := r.balloon.SeedColdTarget(resctl.TargetForBudget(capBytes, initial)); err != nil {
 			return nil, err
@@ -821,6 +822,16 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	}
 	workHeld = false
 	r.workMu.Unlock()
+	// Applying the workload (including guest init) is governed by
+	// launch.start_timeout and the operation context, not the short
+	// app_started notification budget. Start that budget only after ACK.
+	select {
+	case <-r.launch.LaunchAckDone():
+	case <-ctx.Done():
+		return fail(errors.Join(errors.New("runtime launch interrupted before launch_ack"), ctx.Err()))
+	case <-r.exitDone:
+		return fail(errors.New("runtime exited before launch_ack"))
+	}
 	// app_started is best-effort in the guest: a failed short notification is
 	// logged there and is not retried. Never leave Launch blocked forever when
 	// that notification is lost. Use the same configured app-notify budget,
