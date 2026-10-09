@@ -90,7 +90,7 @@ func TestDeferredRunReadCanceledReleasesTail(t *testing.T) {
 	h.tailWG.Add(1)
 	go h.runTailWorker()
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 12}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	receiveSignal(t, tailReadStarted)
 	h.closing.Store(true)
 	h.tailSubmit.Lock()
@@ -119,7 +119,7 @@ func TestDeferredRunReadFailureIsBestEffort(t *testing.T) {
 	h.ops = newFakeIoctls().ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 12}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 	if h.tailBusy.Load() {
 		t.Fatal("failed deferred read left tailBusy set")
@@ -175,7 +175,7 @@ func TestChunkReservationReleasedOnEveryUrgentExit(t *testing.T) {
 			}
 			h.ops = ioctls.ops()
 
-			h.handleFault(faultEvent{address: unitCHVA, uffdFD: 13}, make([]byte, PageSize))
+			h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 			if h.tailBusy.Load() || len(h.tailQ) != 0 {
 				t.Fatalf("exit left reservation: busy=%v queued=%d", h.tailBusy.Load(), len(h.tailQ))
 			}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"runtime"
 	"syscall"
@@ -151,7 +152,7 @@ func (s *Server) readAvailRing(q *virtq) (availSnapshot, error) {
 	// Ring base addresses come from SET_VRING_ADDR, which delivers them
 	// as master-process user virtual addresses (per vhost-user spec) —
 	// translate via UserspaceAddr, not GuestPhysAddr.
-	hdr, err := s.memTable.TranslateUVA(q.availAddr, 4+uint64(q.num)*2)
+	hdr, err := s.memTable.TranslateUVA(q.readContext(), q.availAddr, 4+uint64(q.num)*2)
 	if err != nil {
 		return availSnapshot{}, err
 	}
@@ -166,14 +167,18 @@ func (s *Server) readAvailRing(q *virtq) (availSnapshot, error) {
 
 // publishUsed appends one entry to the used ring and bumps used.idx.
 func (s *Server) publishUsed(q *virtq, descIdx uint16, length uint32) error {
-	usedHeader, err := s.memTable.TranslateUVA(q.usedAddr, 4)
+	usedHeader, err := s.memTable.TranslateUVA(q.readContext(), q.usedAddr, 4)
 	if err != nil {
 		return err
 	}
 	usedIdx := binary.LittleEndian.Uint16(usedHeader[2:4])
 
-	entryAddr := q.usedAddr + 4 + uint64(usedIdx%uint16(q.num))*8
-	entry, err := s.memTable.TranslateUVA(entryAddr, 8)
+	entryOffset := uint64(4) + uint64(usedIdx%uint16(q.num))*8
+	if entryOffset > ^uint64(0)-q.usedAddr {
+		return readretry.Terminal(fmt.Errorf("vhost: used address overflow"))
+	}
+	entryAddr := q.usedAddr + entryOffset
+	entry, err := s.memTable.TranslateUVA(q.readContext(), entryAddr, 8)
 	if err != nil {
 		return err
 	}
@@ -209,8 +214,11 @@ const (
 // q.descAddr is master UVA (from SET_VRING_ADDR); the descriptor's own
 // .Addr field is GPA per virtio spec (translated separately in appendSeg).
 func (s *Server) readDesc(q *virtq, idx uint16) (vringDesc, error) {
+	if uint64(idx)*16 > ^uint64(0)-q.descAddr {
+		return vringDesc{}, readretry.Terminal(fmt.Errorf("vhost: descriptor address overflow"))
+	}
 	addr := q.descAddr + uint64(idx)*16
-	b, err := s.memTable.TranslateUVA(addr, 16)
+	b, err := s.memTable.TranslateUVA(q.readContext(), addr, 16)
 	if err != nil {
 		return vringDesc{}, err
 	}
@@ -242,7 +250,7 @@ func (s *Server) walkChain(q *virtq, headIdx uint16) (*chain, error) {
 		if d.Flags&descFlagIndirect != 0 {
 			// Indirect: d.Addr points to a small array of vringDesc.
 			n := int(d.Len) / 16
-			arr, err := s.memTable.TranslateGPA(d.Addr, uint64(n*16))
+			arr, err := s.memTable.TranslateGPA(q.readContext(), d.Addr, uint64(n*16))
 			if err != nil {
 				return nil, err
 			}
@@ -252,12 +260,12 @@ func (s *Server) walkChain(q *virtq, headIdx uint16) (*chain, error) {
 					Len:   binary.LittleEndian.Uint32(arr[i*16+8 : i*16+12]),
 					Flags: binary.LittleEndian.Uint16(arr[i*16+12 : i*16+14]),
 				}
-				if err := s.appendSeg(c, inner); err != nil {
+				if err := s.appendSeg(q, c, inner); err != nil {
 					return nil, err
 				}
 			}
 		} else {
-			if err := s.appendSeg(c, d); err != nil {
+			if err := s.appendSeg(q, c, d); err != nil {
 				return nil, err
 			}
 		}
@@ -269,11 +277,11 @@ func (s *Server) walkChain(q *virtq, headIdx uint16) (*chain, error) {
 	return c, nil
 }
 
-func (s *Server) appendSeg(c *chain, d vringDesc) error {
+func (s *Server) appendSeg(q *virtq, c *chain, d vringDesc) error {
 	if d.Len == 0 {
 		return nil
 	}
-	hva, err := s.memTable.TranslateGPA(d.Addr, uint64(d.Len))
+	hva, err := s.memTable.TranslateGPA(q.readContext(), d.Addr, uint64(d.Len))
 	if err != nil {
 		return err
 	}

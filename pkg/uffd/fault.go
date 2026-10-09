@@ -433,8 +433,12 @@ func (h *Handler) readRequiredRun(run sparse.Run, buf []byte, innerOffset uint64
 }
 
 func (h *Handler) readRun(run sparse.Run, buf []byte, innerOffset uint64) error {
+	return h.readRunContext(h.ctx, run, buf, innerOffset)
+}
+
+func (h *Handler) readRunContext(ctx context.Context, run sparse.Run, buf []byte, innerOffset uint64) error {
 	started := time.Now()
-	n, err := run.ReadAt(h.ctx, buf, innerOffset)
+	n, err := run.ReadAt(ctx, buf, innerOffset)
 	elapsed := uint64(time.Since(started).Nanoseconds())
 	h.stats.sourceReadCalls.Add(1)
 	if n > 0 {
@@ -455,15 +459,22 @@ func (h *Handler) readRun(run sparse.Run, buf []byte, innerOffset uint64) error 
 }
 
 func (h *Handler) urgentCopy(fd int, dst uint64, pageIdx uint64, expected PageState, page []byte) (urgentOutcome, error) {
+	h.installMu.Lock()
+	defer h.installMu.Unlock()
 	if err := h.ctx.Err(); err != nil {
 		return urgentOutcome{}, err
 	}
-	// A synchronous source retry may outlive an observed REMOVE or another
-	// installation. Its old bytes no longer describe a Released page. Apply
-	// the same zero/EEXIST convergence as a fresh fault in that state, and do
-	// not schedule a tail from the obsolete read plan.
+	if !h.addrMap.owns(fd, dst, pageIdx*PageSize, PageSize) {
+		return urgentOutcome{}, fmt.Errorf("uffd: COPY registration lost")
+	}
 	if state := h.state.Get(pageIdx); state != expected {
-		_, err := h.urgentZero(fd, dst, pageIdx, state)
+		// A stale snapshot read may not install old data after REMOVE. A winner
+		// that is already Loaded is merely woken, never synthesized as MISSING.
+		if state == StateLoaded {
+			h.wake(fd, dst, PageSize)
+			return urgentOutcome{}, nil
+		}
+		_, err := h.urgentZeroLocked(fd, dst, pageIdx, state)
 		return urgentOutcome{}, err
 	}
 	started := time.Now()
@@ -475,16 +486,44 @@ func (h *Handler) urgentCopy(fd int, dst uint64, pageIdx uint64, expected PageSt
 }
 
 func (h *Handler) urgentZero(fd int, dst uint64, pageIdx uint64, expected PageState) (urgentOutcome, error) {
+	h.installMu.Lock()
+	defer h.installMu.Unlock()
 	if err := h.ctx.Err(); err != nil {
 		return urgentOutcome{}, err
 	}
+	if !h.addrMap.owns(fd, dst, pageIdx*PageSize, PageSize) {
+		return urgentOutcome{}, fmt.Errorf("uffd: zero registration lost")
+	}
+	if current := h.state.Get(pageIdx); current != expected {
+		if current == StateLoaded {
+			h.wake(fd, dst, PageSize)
+			return urgentOutcome{}, nil
+		}
+		_, err := h.urgentZeroLocked(fd, dst, pageIdx, current)
+		return urgentOutcome{}, err
+	}
+	return h.urgentZeroLocked(fd, dst, pageIdx, expected)
+}
+
+func (h *Handler) urgentZeroLocked(fd int, dst uint64, pageIdx uint64, expected PageState) (urgentOutcome, error) {
 	started := time.Now()
 	completed, err := h.ops.zeropage(fd, dst, PageSize)
+	zero := true
+	// Shmem does not implement ZEROPAGE on all supported kernels. A bounded
+	// shared zero buffer is only read by COPY and never aliases guest memory.
+	if completed == 0 && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP)) {
+		completed, err = h.ops.copy(fd, dst, zeroScratch[:PageSize])
+		zero = false
+		h.stats.copies.Add(1)
+	}
 	h.stats.urgentZeroNs.Add(uint64(time.Since(started).Nanoseconds()))
 	h.stats.urgentZeroCalls.Add(1)
 	h.stats.zeropages.Add(1)
-	return h.finishUrgent(fd, dst, pageIdx, expected, completed, err, true)
+	return h.finishUrgent(fd, dst, pageIdx, expected, completed, err, zero)
 }
+
+// Bounded to the existing zero-tail policy, independent of guest RAM size.
+var zeroScratch [zeroFaultFillBytes]byte
 
 func (h *Handler) finishUrgent(fd int, dst, pageIdx uint64, expected PageState, completed int64, ioctlErr error, zero bool) (urgentOutcome, error) {
 	done, err := checkedCompletion(completed, PageSize)
@@ -795,11 +834,34 @@ func (h *Handler) bufferedTailData(bufferStart, start, end uint64) ([]byte, bool
 }
 
 func (h *Handler) executeTailIO(task tailTask, data []byte, length uint64) (uint64, bool) {
+	h.installMu.Lock()
+	defer h.installMu.Unlock()
+	if h.ctx.Err() != nil || !h.addrMap.owns(task.uffdFD, task.dstVA, task.pageIdx*PageSize, length) {
+		return 0, false
+	}
+	// Revalidate under the same gate as event read/publication, including for
+	// buffered chunk tails whose source read happened on another worker.
+	valid := h.state.RunLength(task.pageIdx, length/PageSize, task.expected) * PageSize
+	if valid == 0 {
+		h.stats.tailConflicts.Add(1)
+		return 0, false
+	}
+	shortened := valid < length
+	length = valid
+	if data != nil {
+		data = data[:length]
+	}
 	started := time.Now()
 	var completed int64
 	var err error
+	zero := task.kind == tailZero
 	if task.kind == tailZero {
 		completed, err = h.ops.zeropage(task.uffdFD, task.dstVA, length)
+		if completed == 0 && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP)) {
+			completed, err = h.ops.copy(task.uffdFD, task.dstVA, zeroScratch[:length])
+			zero = false
+			h.stats.copies.Add(1)
+		}
 		h.stats.tailZeroNs.Add(uint64(time.Since(started).Nanoseconds()))
 		h.stats.zeropages.Add(1)
 	} else {
@@ -819,7 +881,7 @@ func (h *Handler) executeTailIO(task tailTask, data []byte, length uint64) (uint
 	}
 	if pages > 0 {
 		changed := h.state.SetRangeIf(task.pageIdx, task.pageIdx+pages, task.expected, StateLoaded)
-		if task.kind == tailZero {
+		if zero {
 			h.stats.pagesZeroed.Add(pages)
 		} else {
 			h.stats.pagesCopied.Add(pages)
@@ -838,7 +900,7 @@ func (h *Handler) executeTailIO(task tailTask, data []byte, length uint64) (uint
 		}
 		return done, false
 	}
-	return done, done == length
+	return done, done == length && !shortened
 }
 
 func recordAtomicMax(dst *atomic.Uint64, value uint64) {

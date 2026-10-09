@@ -187,6 +187,57 @@ sandbox-ctl mm 的 VMA,不能 register CH mm 的 chVA。所以 uffd 必须在 CH
 事件。fd 表是进程级的,但 uffd ctx 的事件路由按创建者 mm 的 VA 解析,
 sandbox-ctl 收到 fd 后读出来的事件 va 就是 CH 视角的 chVA。
 
+**惰性恢复中的后端首次访问。** 后端 mmap 有意不注册 UFFD。普通 shmem
+访问可能直接创建零页，而未读取快照字节，因此读取或只写一个状态字节也必须先准备
+内存。所有 vhost GPA/UVA 地址转换都在返回切片前调用带上下文的
+`EnsureLoaded(ctx, memfdOffset, length)` 屏障，覆盖描述符、间接描述符表、
+avail/used ring、请求头、两个方向的数据和状态。缺少回调、范围无效或填充失败都
+使队列终止，不能发布 used-ring 完成记录。所有磁盘通过统一的服务器创建路径绑定
+该回调，CLI 与 SDK 的冷启动和恢复均使用此路径。队列重置取消待完成加载，等待
+worker 退出后才替换内存表。
+
+屏障检查所有相交页，包括部分访问之外的原有字节。Loaded 范围批量检查状态，
+保留实时内容而不读取快照。Absent 页由现有 fault worker 使用其私有 4 KiB
+缓冲区读取权威来源。Released 页永不读取历史快照内容。整页安装使用所属 CH
+注册的 `UFFDIO_COPY`，shmem 需要时也通过零缓冲区 COPY。`EEXIST` 保留已经
+存在的页并唤醒等待者；它**不证明**此前无保护的后端访问曾恢复快照。必须校验
+实际完成字节数。`EAGAIN` 在 worker 外可取消地重试，使事件读取和 CPU fault
+队列能够推进；`ENOENT` 或无效注册使请求失败。真正的 CPU MISSING fault
+遇到 Loaded 页仍走独立的已回收页处理路径。
+
+`va_report` 的线格式不变。已计算的 memfd 偏移通过内部回调传递，并与实际 CH
+VA 区间及持有的 UFFD fd 关联。只有成功接管后，新注册才可用于加载；接管失败
+回滚暂存的地址映射，由回调调用方清理 fd。加载可取消地等待注册就绪，并在区域
+边界拆分。UNMAP 使对应注册区间失效；REMOVE 释放页内容但保留注册。
+
+安装互斥锁协调 CPU urgent、后端 mandatory、speculative tail 的 ioctl 与
+非阻塞内核事件读取和 REMOVE/UNMAP 状态发布。来源读取后、实际安装前再次校验，
+防止在观察到释放后安装过期快照缓冲区。来源读取、重试等待、注册等待和可能阻塞的
+队列发送均不持有此锁。保留普通数据和 chunk 的有界 tail 批量填充。
+锁顺序审查参考 [Linux 5.10 的 UFFD 事件与 COPY 路径](https://github.com/torvalds/linux/blob/v5.10/fs/userfaultfd.c)：
+REMOVE 在等待用户态前释放 mmap 读锁，映射变化期间 COPY 可以返回 `EAGAIN`。
+此锁**不是 DMA pin**：要求 guest 正常持有未完成描述符的缓冲区；屏障返回后任意
+并发 balloon/discard 不在此保证范围内。
+
+Close 同步关闭准入和取消操作，等待调用者及所有 worker 退出，并通过有界 epoll
+轮询停止 reader，之后才关闭 UFFD fd。来源和后端映射必须存活至上述等待完成。
+启动早期失败也会取消就绪与握手等待。此方案不增加第二套 UFFD，不使用
+MINOR/CONTINUE，不预先填充整块 RAM，不提高内核最低版本，也不改变资源策略。
+
+可重复验证包括 `pkg/vhost` 中的
+`TestRealMissingShmemRestoredUsedRingPreservesUntouchedBytes`：两个共享 memfd
+别名、真实的 CH 侧 MISSING_SHMEM 注册及实际 `publishUsed` 路径，在 CPU-first
+和 backend-first 两种顺序下都必须保留周围字节，并把保存的索引从 7 推进至 8。
+UFFD 和地址转换测试覆盖范围、取消、注册、释放及并发失败。现有
+`snapshot.restore.sh` E2E 还在快照/恢复之间保留 O_DIRECT 文件描述符和 32 个
+匿名缓冲区。在页内偏移 512 处读取 512 字节后，其余 3,584 字节必须保持原值。
+该用例包含冷启动对照、DMA 前用户态未访问的十六个候选页，以及恢复后显式通过
+CPU 预热的十六个对照页；`dio-before.json`/`dio-after.json` 保留完整性结果。
+guest 的 pinning/prefetch 可能填充候选页，因此 E2E 本身不能证明 backend-first
+顺序；真实 used-ring 测试提供确定的访问顺序。应遵守既有准备来源/产物契约，
+结合现有 KVM 内存压力覆盖执行两类测试，并验证 Linux 5.10 最低版本。
+这些是验证要求，不代表尚未执行的测试已经通过。
+
 ### 3.4 0004 — balloon release 跳过 user-managed zone 的空洞 run
 
 主题:**virtio-devices: balloon — skip PUNCH_HOLE/MADV_DONTNEED on already-sparse

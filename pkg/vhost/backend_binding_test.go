@@ -206,6 +206,7 @@ func bindingQueue(backend Backend, kind uint32) (*Server, *virtq, []byte) {
 	s := NewServer("unused", backend, nil)
 	mem := make([]byte, 4096)
 	const uva = uint64(0x1000)
+	s.SetMemoryLoader(initializedTestMemory)
 	s.memTable.SetRegions([]MemRegion{{GuestPhysAddr: 0, UserspaceAddr: uva, MemorySize: uint64(len(mem)), mmapBytes: mem}})
 	q := &virtq{num: 8, descAddr: uva, kickFd: -1, callFd: -1, ctx: context.Background(), stop: make(chan struct{})}
 	desc := func(i int, addr uint64, n uint32, flags, next uint16) {

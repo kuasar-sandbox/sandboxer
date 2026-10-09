@@ -48,6 +48,7 @@ func recoveryQueue(t *testing.T, stream fetch.Stream, write bool) (*Server, *vir
 	s := NewServer("unused", backend, nil)
 	mem := make([]byte, 4096)
 	const uva = uint64(0x1000)
+	s.SetMemoryLoader(initializedTestMemory)
 	s.memTable.SetRegions([]MemRegion{{GuestPhysAddr: 0, UserspaceAddr: uva, MemorySize: uint64(len(mem)), mmapBytes: mem}})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -361,3 +362,6 @@ func TestGetVringBaseAndStopJoinSameWorker(t *testing.T) {
 		<-readDone
 	}
 }
+
+// Heap-backed fixtures contain their authoritative bytes before translation.
+func initializedTestMemory(ctx context.Context, _, _ uint64) error { return ctx.Err() }

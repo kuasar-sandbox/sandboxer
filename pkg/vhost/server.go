@@ -629,6 +629,11 @@ func (s *Server) handleGetConfig(conn *net.UnixConn, m *Message) error {
 	return SendReply(conn, m.Header.Request, out)
 }
 
+// SetMemoryLoader binds the shared-memory barrier before Serve starts.
+func (s *Server) SetMemoryLoader(load func(context.Context, uint64, uint64) error) {
+	s.memTable.EnsureLoaded = load
+}
+
 func (s *Server) handleSetMemTable(_ *net.UnixConn, m *Message) error {
 	regs, err := ParseSetMemTable(m.Payload, m.Fds)
 	if err != nil {
@@ -648,8 +653,58 @@ func (s *Server) handleSetMemTable(_ *net.UnixConn, m *Message) error {
 	closeFds(m.Fds)
 
 	s.mu.Lock()
+	var queues []*virtq
+	if len(s.memTable.regions) != 0 {
+		queues = s.queues
+	}
+	implicitEnable := s.features&bitVhostProtocolFeatures == 0
+	s.mu.Unlock()
+	// SET_MEM_TABLE replaces translations, not SET_VRING state. Keep the
+	// queues attached so Stop can still find them, and serialize worker
+	// cancellation/reinitialization with shutdown via drainMu. Never join
+	// a worker under s.mu, and do not replace translations until all join.
+	restart := make([]bool, len(queues))
+	for idx, q := range queues {
+		if q == nil {
+			continue
+		}
+		q.drainMu.Lock()
+		if q.stop != nil {
+			restart[idx] = q.enabled || implicitEnable
+			q.stopReading()
+			_, _ = syscall.Write(q.kickFd, []byte{1, 0, 0, 0, 0, 0, 0, 0})
+			<-q.done
+		}
+	}
+	s.mu.Lock()
 	s.memTable.SetRegions(regs)
 	s.mu.Unlock()
+	for idx, q := range queues {
+		if q == nil {
+			continue
+		}
+		select {
+		case <-s.stop:
+			restart[idx] = false
+		default:
+			q.stop = nil
+			q.done = nil
+			q.ctx = nil
+			q.cancel = nil
+			q.stopOnce = sync.Once{}
+			if restart[idx] {
+				// The old worker may have consumed a kick before cancellation.
+				// Rescan pending descriptors using the new translations.
+				_, _ = syscall.Write(q.kickFd, []byte{1, 0, 0, 0, 0, 0, 0, 0})
+			}
+		}
+		q.drainMu.Unlock()
+	}
+	for idx, start := range restart {
+		if start {
+			s.maybeStartWorker(idx)
+		}
+	}
 	s.logf("vhost: SET_MEM_TABLE accepted %d regions (inode-match)", len(regs))
 	return nil
 }

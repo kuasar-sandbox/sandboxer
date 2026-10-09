@@ -212,6 +212,72 @@ file descriptor with `SCM_RIGHTS` so sandbox-ctl can consume its events. Descrip
 tables are process-local, but the context still routes events using the creator's
 virtual addresses; the event addresses received by sandbox-ctl are CH's chVA.
 
+**Backend first-touch during lazy restore.** The backend mmap is deliberately
+not UFFD-registered. Ordinary shmem access can create a zero folio without
+fetching snapshot bytes, so even a read or a one-byte status write must prepare
+memory first. Every vhost GPA/UVA translation calls the context-aware
+`EnsureLoaded(ctx, memfdOffset, length)` barrier before returning a slice. This
+includes descriptors and indirect tables, avail/used rings, headers, both data
+directions and status. Missing callback wiring, invalid ranges and population
+failures are terminal for the queue; they cannot publish a used-ring completion.
+The central server constructor path binds the barrier for every disk, for both
+CLI and SDK cold/restore runs. Queue reset cancels pending loads and drains
+workers before replacing the memory table.
+
+The barrier checks intersecting pages, including the untouched part of a partial
+access. Loaded ranges are scanned in batches and preserve live bytes without
+reading the snapshot. Absent pages read the authoritative source into an existing
+fault worker's private 4 KiB buffer. Released pages never read historical source
+bytes. Full-page installation uses the owning CH `UFFDIO_COPY`, including a zero
+scratch page when necessary for shmem. `EEXIST` preserves the winning folio and
+wakes its waiters; it does **not** establish that an earlier unguarded backend
+access restored the snapshot. Completed byte counts are validated. `EAGAIN`
+retries cancelably outside the worker, permitting the event reader and CPU fault
+queues to progress; `ENOENT`/invalid registration fails the request. A genuine
+CPU MISSING fault on a Loaded page remains a separate reclaimed-page path.
+
+`va_report` retains its wire format. Its computed memfd offset is passed through
+the internal callbacks and associated with the actual CH VA interval and owned
+UFFD descriptor. New registrations become usable only after successful adoption;
+failed adoption rolls back the staged map and leaves fd cleanup to the sender of
+the callback. Loads wait cancelably for registration readiness and split at
+region boundaries. UNMAP invalidates the affected registration interval; REMOVE
+releases page contents while retaining registration.
+
+An installation mutex coordinates CPU urgent, backend mandatory and speculative
+tail ioctls with the nonblocking kernel event read and publication of
+REMOVE/UNMAP state. Revalidation occurs after source reads and immediately before
+installation, so stale snapshot buffers cannot be installed after an observed
+release. Source reads, retry waits, registration waits and blocking queue sends
+are outside this mutex. Bounded ordinary/chunk tail batching is retained. The
+lock review relies on the [Linux 5.10 UFFD event and COPY paths](https://github.com/torvalds/linux/blob/v5.10/fs/userfaultfd.c):
+REMOVE drops the mmap read lock before waiting for userspace, and COPY can return
+`EAGAIN` while mappings change. This mutex is **not a DMA pin**: normal guest
+ownership of outstanding descriptor buffers is required, and arbitrary concurrent
+balloon/discard after the barrier returns is outside this guarantee.
+
+Close synchronizes admission with cancellation, drains callers and all workers,
+and stops the reader through its bounded epoll poll before closing UFFD fds.
+The source and backend mapping outlive that drain. Readiness/handshake waits also
+unwind on early startup errors. No second UFFD, MINOR/CONTINUE, eager whole-RAM
+population, kernel-floor increase or resource-policy change is involved.
+
+Repeatable validation uses `TestRealMissingShmemRestoredUsedRingPreservesUntouchedBytes`
+in `pkg/vhost`: two shared memfd aliases, a real CH-only MISSING_SHMEM
+registration, and the actual `publishUsed` path must preserve all surrounding
+bytes and advance saved index 7 to 8 for both CPU-first and backend-first orders.
+UFFD/translation tests cover range, cancellation, registration, release and
+concurrency failures. The existing `snapshot.restore.sh` E2E additionally retains
+an O_DIRECT file descriptor and 32 anonymous buffers across snapshot/restore. A
+512-byte read at page offset 512 must preserve the other 3,584 bytes; it includes
+a cold control, sixteen candidates untouched by userspace before DMA and sixteen
+explicitly CPU-warmed restored controls. `dio-before.json`/`dio-after.json` retain
+the integrity results. Candidate pinning/prefetch can populate pages, so the E2E
+alone does not prove backend-first ordering; the real used-ring test supplies
+that deterministic ordering. Run both with the prepared source/artifact contracts
+and the existing KVM pressure coverage, including the Linux 5.10 floor. These are
+validation requirements, not a claim that an unexecuted run passed.
+
 ### 3.4 0004 — skip hole-only runs during balloon release
 
 Subject: **virtio-devices: balloon — skip PUNCH_HOLE/MADV_DONTNEED on already-sparse

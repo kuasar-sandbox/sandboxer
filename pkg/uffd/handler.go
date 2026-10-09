@@ -59,7 +59,7 @@ type Config struct {
 	// to clear sandbox-ctl's own PTE/RSS share of pages CH reclaimed
 	// at the inode via fallocate(PUNCH_HOLE) in its balloon path.
 	// Backend first-touch (vhost-blk DMA, snapshot copy) goes through
-	// plain shmem fileops with no uffd round-trip.
+	// EnsureLoaded before plain shmem access.
 	BackendVA uintptr
 	Size      int
 
@@ -88,26 +88,9 @@ type Config struct {
 //
 // Multiple CH regions (for example around the x86 PCI hole) join the same
 // handler through AddUffd. There is no second UFFD on the backend mapping.
-// Correctness rests on EEXIST + UFFDIO_WAKE recovery, not on a vhost-side
-// touch-before-publish invariant:
-//
-//   - vhost-blk write path: Linux virtio_blk routinely places newly
-//     allocated, never-touched page-cache pages into the request's
-//     writable descriptors. Their GPAs translate to backendVA pages
-//     that are still in state Absent; the backend memcpy creates a
-//     folio on the shared shmem inode through plain shmem fileops.
-//
-//   - vCPU read on the same page later faults via uffdC. handleFault
-//     attempts UFFDIO_ZEROPAGE / UFFDIO_COPY; the kernel returns
-//     EEXIST because the folio already exists. The handler issues
-//     UFFDIO_WAKE; on retry the kernel installs the chVA PTE pointing
-//     at the backend-written folio (MISSING-only registration, the
-//     folio-found path bypasses uffd). Guest sees the disk data.
-//
-//   - Page state is conditionally set to Loaded after the EEXIST → WAKE
-//     recovery so subsequent faults short-circuit. pages_copied/pages_zeroed
-//     still count only bytes explicitly reported complete by the ioctl; the
-//     pre-existing backend folio is not attributed to either counter.
+// Vhost must call EnsureLoaded before exposing any backend slice. COPY/EEXIST
+// preserves the winning folio; it cannot recover snapshot bytes after an
+// unguarded backend first-touch has instantiated a zero shmem folio.
 //
 // Fault workers resolve exactly one urgent page. EAGAIN/ENOENT wake that page
 // without marking an uncompleted page Loaded, allowing the next fault to retry.
@@ -118,6 +101,15 @@ type Config struct {
 // 5.10+ kernel compatible — no MINOR_SHMEM / UFFDIO_CONTINUE required.
 type Handler struct {
 	cfg Config
+
+	// Lock order: admission (uffdsMu), installMu, AddressMap, PageState.
+	// installMu covers nonblocking event read + release publication and each
+	// ioctl + state commit. Never hold it during source I/O, queue submission,
+	// registration waits or joins. It is not a guest DMA/discard pin.
+	installMu           sync.Mutex
+	users               sync.WaitGroup
+	registrationChanged chan struct{}
+	started             bool
 
 	// uffds holds the CH-mm uffd fds; on x86_64 a zone larger than
 	// 3 GiB is split into low + high regions and CH sends one uffd
@@ -172,9 +164,8 @@ type Handler struct {
 	stats handlerStats
 }
 
-// removeReq carries a coalesce-able EVENT_REMOVE notification. The
-// flusher sorts by memfd offset and merges contiguous ranges before
-// calling fallocate(PUNCH_HOLE).
+// removeReq carries a coalescible EVENT_REMOVE notification. The flusher
+// merges ranges before backend madvise(DONTNEED); CH owns hole punching.
 type removeReq struct {
 	memfdOffset uint64
 	length      uint64
@@ -224,27 +215,31 @@ type handlerStats struct {
 }
 
 type faultEvent struct {
-	address uint64
-	flags   uint64
-	uffdFD  int // which uffd this came from — determines ioctl target fd
-	queued  time.Time
+	address   uint64
+	flags     uint64
+	uffdFD    int // which uffd this came from — determines ioctl target fd
+	queued    time.Time
+	mandatory *loadRequest
 }
 
 // NewWithBackendUffd constructs the single-uffd handler. The CH-side
 // uffd (uffdCFromCH) is provided by the va_report OnReady callback;
 // only this fd is registered MISSING on chVA. The backendVA mmap that
 // sandbox-ctl holds for the same memfd has no uffd attached — see the
-// Handler comment block above for the protocol-level safety argument.
+// Handler comment block above for the mandatory first-touch barrier.
 //
 // Steps:
 //  1. epoll_create1 → add uffdC
 //  2. AddressMap registers ProcessCH (caller did before calling us);
 //     ProcessBackend is registered separately by the caller for the
-//     mmap whose VA range AssertLoaded validates against.
+//     mmap used by the remove flusher.
 //  3. Page state initialized to all-Absent
 //
 // Start the goroutines via Start(); stop via Close().
 func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Handler, error) {
+	if cfg.Context != nil && cfg.Context.Err() != nil {
+		return nil, cfg.Context.Err()
+	}
 	if uffdCFromCH <= 0 {
 		return nil, fmt.Errorf("uffd: uffdCFromCH invalid")
 	}
@@ -257,14 +252,18 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 	if cfg.Source == nil {
 		return nil, fmt.Errorf("uffd: Source is nil")
 	}
-	if addrMap == nil {
-		return nil, fmt.Errorf("uffd: AddressMap is nil")
+	if addrMap == nil || addrMap.memfdLen != uint64(cfg.Size) {
+		return nil, fmt.Errorf("uffd: AddressMap missing or RAM size mismatch")
 	}
 
 	cfg.NumWorkers = workerCount(cfg.NumWorkers)
 	logf := cfg.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
+	}
+
+	if err := unix.SetNonblock(uffdCFromCH, true); err != nil {
+		return nil, fmt.Errorf("uffd: nonblocking fd: %w", err)
 	}
 
 	// epoll for the single uffd (uffdC, owned by CH, sent over SCM_RIGHTS).
@@ -276,6 +275,11 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, uffdCFromCH, &ev); err != nil {
 		_ = unix.Close(epfd)
 		return nil, fmt.Errorf("epoll_ctl ADD uffdC fd=%d: %w", uffdCFromCH, err)
+	}
+
+	if err := addrMap.bindInitial(uffdCFromCH); err != nil {
+		_ = unix.Close(epfd)
+		return nil, err
 	}
 
 	numPages := cfg.Size / PageSize
@@ -305,22 +309,23 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		tailBuf = make([]byte, bufferBytes)
 	}
 	h := &Handler{
-		cfg:        cfg,
-		uffds:      []*os.File{os.NewFile(uintptr(uffdCFromCH), "uffd_C_chVA_region0")},
-		addrMap:    addrMap,
-		state:      state,
-		epfd:       epfd,
-		removeQ:    make(chan removeReq, 4096),
-		logf:       logf,
-		stop:       make(chan struct{}),
-		readerDone: make(chan struct{}),
-		queue:      queues,
-		ctx:        ctx,
-		cancel:     cancel,
-		tailQ:      make(chan tailTask, 1),
-		tailBuf:    tailBuf,
-		tailIdle:   make(chan struct{}, 1),
-		ops:        realUffdOps,
+		cfg:                 cfg,
+		registrationChanged: make(chan struct{}),
+		uffds:               []*os.File{os.NewFile(uintptr(uffdCFromCH), "uffd_C_chVA_region0")},
+		addrMap:             addrMap,
+		state:               state,
+		epfd:                epfd,
+		removeQ:             make(chan removeReq, 4096),
+		logf:                logf,
+		stop:                make(chan struct{}),
+		readerDone:          make(chan struct{}),
+		queue:               queues,
+		ctx:                 ctx,
+		cancel:              cancel,
+		tailQ:               make(chan tailTask, 1),
+		tailBuf:             tailBuf,
+		tailIdle:            make(chan struct{}, 1),
+		ops:                 realUffdOps,
 	}
 	return h, nil
 }
@@ -344,23 +349,42 @@ func workerCount(numWorkers int) int {
 // Safe to call concurrently with the reader goroutine — the new fd is
 // added to the same epoll set, and runReader picks events off any
 // ready fd without caring how many fds exist.
-func (h *Handler) AddUffd(uffdFD int) error {
+func (h *Handler) AddUffd(uffdFD int, va, size, offset uint64) error {
 	if uffdFD <= 0 {
-		return fmt.Errorf("uffd: AddUffd fd=%d invalid", uffdFD)
+		return fmt.Errorf("uffd: invalid fd")
 	}
 	h.uffdsMu.Lock()
 	defer h.uffdsMu.Unlock()
 	if h.closing.Load() || h.ctx.Err() != nil {
 		return errors.New("uffd: handler is closed")
 	}
-	idx := len(h.uffds)
+	h.installMu.Lock()
+	defer h.installMu.Unlock()
+	// Stage under the installation gate, then commit ownership only after epoll.
+	if err := h.addrMap.RegisterVMA(ProcessCH, va, size, offset); err != nil {
+		return err
+	}
+	if err := unix.SetNonblock(uffdFD, true); err != nil {
+		h.addrMap.removeStaged(va, size, offset)
+		return err
+	}
 	ev := unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(uffdFD)}
 	if err := unix.EpollCtl(h.epfd, unix.EPOLL_CTL_ADD, uffdFD, &ev); err != nil {
-		return fmt.Errorf("uffd: epoll_ctl ADD fd=%d: %w", uffdFD, err)
+		h.addrMap.removeStaged(va, size, offset)
+		return fmt.Errorf("uffd: epoll ADD: %w", err)
 	}
-	name := fmt.Sprintf("uffd_C_chVA_region%d", idx)
-	h.uffds = append(h.uffds, os.NewFile(uintptr(uffdFD), name))
-	h.logf("uffd: attached additional region uffd fd=%d (region #%d)", uffdFD, idx)
+	h.addrMap.mu.Lock()
+	for i := range h.addrMap.vmas {
+		v := &h.addrMap.vmas[i]
+		if v.process == ProcessCH && v.start == va && v.memfdOffset == offset && v.uffdFD == 0 {
+			v.uffdFD = uffdFD
+			break
+		}
+	}
+	h.addrMap.mu.Unlock()
+	h.uffds = append(h.uffds, os.NewFile(uintptr(uffdFD), "uffd_CH_region"))
+	close(h.registrationChanged)
+	h.registrationChanged = make(chan struct{})
 	return nil
 }
 
@@ -371,6 +395,12 @@ func (h *Handler) AddressMap() *AddressMap { return h.addrMap }
 
 // Start spawns the reader and worker goroutines.
 func (h *Handler) Start() {
+	h.uffdsMu.Lock()
+	defer h.uffdsMu.Unlock()
+	if h.started || h.closing.Load() {
+		return
+	}
+	h.started = true
 	h.tailWG.Add(1)
 	go h.runTailWorker()
 	h.wg.Add(1)
@@ -383,65 +413,35 @@ func (h *Handler) Start() {
 	go h.runRemoveFlusher()
 }
 
-// Close stops the reader+workers+flusher and closes all uffd fds +
-// epfd. Idempotent.
-//
-// Ordering matters for the flusher's stop-time drain pass: we want
-// the flusher to see all in-flight EVENT_REMOVE pushes from the
-// reader before it drains-and-exits, otherwise residual events
-// stranded in removeQ would never be madvise'd.
-//
-//  1. reject tail reservations, cancel Run.ReadAt, wait for the unique
-//     reserved/queued/running tail task, and join the tail worker.
-//  2. close uffds + epfd → epoll_wait in reader returns or observes
-//     readerStop, then runs deferred close(readerDone). Reader cannot push
-//     more events after this.
-//  3. wait on readerDone — guarantees reader exited and flushed any
-//     final EVENT_REMOVE into removeQ.
-//  4. close(stop) → flusher's <-h.stop case fires, drains everything
-//     remaining in removeQ, issues final madvise, exits. Workers
-//     also unblock and exit.
-//  5. wg.Wait — collect reader+workers+flusher.
-//  6. close worker queues — safe now that workers have exited.
+// Close rejects admission, cancels all callers, and drains workers before fd
+// close/reuse. The reader exits through its bounded epoll poll, not fd closure.
 func (h *Handler) Close() error {
 	h.closeOnce.Do(func() {
-		// 1. Reject new reservations and cancel all Run.ReadAt calls. The
-		// submit mutex closes the enqueue-vs-cancel race.
+		h.uffdsMu.Lock()
 		h.closing.Store(true)
-		h.tailSubmit.Lock()
 		h.cancel()
+		started := h.started
+		h.uffdsMu.Unlock()
+		h.readerStop.Store(true)
+		if started {
+			<-h.readerDone
+		}
+		h.tailSubmit.Lock()
 		h.tailSubmit.Unlock()
 		h.waitTailIdle()
 		h.tailWG.Wait()
-
-		// 2. break reader out of epoll_wait
-		h.readerStop.Store(true)
+		close(h.stop)
+		h.wg.Wait()
+		h.users.Wait()
 		h.uffdsMu.Lock()
+		defer h.uffdsMu.Unlock()
 		for _, f := range h.uffds {
-			if f != nil {
-				_ = f.Close()
-			}
+			_ = f.Close()
 		}
 		h.uffds = nil
-		epfd := h.epfd
 		if h.epfd >= 0 {
-			_ = unix.Close(epfd)
-		}
-		h.uffdsMu.Unlock()
-		// 3. wait until reader has exited (no more pushes to removeQ)
-		<-h.readerDone
-		h.uffdsMu.Lock()
-		if h.epfd == epfd {
+			_ = unix.Close(h.epfd)
 			h.epfd = -1
-		}
-		h.uffdsMu.Unlock()
-		// 4. signal flusher + workers to exit; flusher drains removeQ
-		close(h.stop)
-		// 5. all goroutines should be finishing up now
-		h.wg.Wait()
-		// 6. close worker queues (workers already exited)
-		for _, q := range h.queue {
-			close(q)
 		}
 	})
 	return nil
@@ -493,7 +493,23 @@ func (h *Handler) runReader() {
 
 func (h *Handler) drain(fd int, buf []byte, msgSize int) {
 	for {
+		if h.readerStop.Load() {
+			return
+		}
+		h.installMu.Lock()
 		n, err := unix.Read(fd, buf)
+		if err == nil && n%msgSize == 0 {
+			// Publish every release acknowledged by this bounded batch before any
+			// installer can proceed. Pagefault dispatch may block and is deferred
+			// until after the gate opens.
+			for off := 0; off < n; off += msgSize {
+				msg := (*uffdMsg)(unsafe.Pointer(&buf[off]))
+				if msg.Event == uffdEventRemove || msg.Event == uffdEventUnmap {
+					h.dispatchRelease(msg, fd)
+				}
+			}
+		}
+		h.installMu.Unlock()
 		if err != nil {
 			if errors.Is(err, unix.EAGAIN) {
 				return
@@ -515,7 +531,9 @@ func (h *Handler) drain(fd int, buf []byte, msgSize int) {
 		}
 		for off := 0; off < n; off += msgSize {
 			msg := (*uffdMsg)(unsafe.Pointer(&buf[off]))
-			h.dispatch(msg, fd)
+			if msg.Event != uffdEventRemove && msg.Event != uffdEventUnmap {
+				h.dispatch(msg, fd)
+			}
 		}
 	}
 }
@@ -540,12 +558,23 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 		case <-h.ctx.Done():
 		}
 	case uffdEventRemove, uffdEventUnmap:
-		rm := (*uffdMsgRemove)(unsafe.Pointer(&msg.Arg[0]))
-		h.handleRemove(rm.Start, rm.End, fromFD)
-		h.stats.removeEvents.Add(1)
+		h.installMu.Lock()
+		h.dispatchRelease(msg, fromFD)
+		h.installMu.Unlock()
 	default:
 		h.logf("uffd: unexpected event 0x%x on fd=%d", msg.Event, fromFD)
 	}
+}
+
+// dispatchRelease runs with installMu held, including across the kernel read
+// that acknowledges a non-pagefault event and allows CH to resume.
+func (h *Handler) dispatchRelease(msg *uffdMsg, fd int) {
+	rm := (*uffdMsgRemove)(unsafe.Pointer(&msg.Arg[0]))
+	h.handleRemoveLocked(rm.Start, rm.End, fd)
+	if msg.Event == uffdEventUnmap {
+		h.addrMap.invalidate(fd, rm.Start, rm.End)
+	}
+	h.stats.removeEvents.Add(1)
 }
 
 // handleRemove records a single EVENT_REMOVE: marks pages Released in
@@ -563,23 +592,41 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 // Queue full (rare; coalescer falls behind the reader): synchronously
 // madvise as a fallback so we don't lose the reclaim signal.
 func (h *Handler) handleRemove(startVA, endVA uint64, fromFD int) {
-	_ = fromFD
-	startOff, ok := h.addrMap.Locate(startVA)
-	if !ok {
-		h.logf("uffd: EVENT_REMOVE start 0x%x unknown", startVA)
+	h.installMu.Lock()
+	defer h.installMu.Unlock()
+	h.handleRemoveLocked(startVA, endVA, fromFD)
+}
+
+func (h *Handler) handleRemoveLocked(startVA, endVA uint64, fromFD int) {
+	if endVA <= startVA || startVA%PageSize != 0 || endVA%PageSize != 0 {
 		return
 	}
-	length := endVA - startVA
-	endOff := startOff + length
-	startPage := startOff / PageSize
-	endPage := (endOff + PageSize - 1) / PageSize
-	h.state.SetRange(startPage, endPage, StateReleased)
-
-	select {
-	case h.removeQ <- removeReq{memfdOffset: startOff, length: length}:
-	default:
-		h.stats.removeQDropped.Add(1)
-		h.madviseBackend(startOff, length)
+	// Walk intersections without retaining AddressMap's lock across reclaim.
+	// installMu keeps registration topology stable throughout this event.
+	for cursor := startVA; cursor < endVA; {
+		var startOff, length, next uint64
+		h.addrMap.mu.RLock()
+		for _, v := range h.addrMap.vmas {
+			if v.process != ProcessCH || v.uffdFD != fromFD || v.invalid || cursor >= v.end || v.start >= endVA {
+				continue
+			}
+			lo, hi := max(cursor, v.start), min(endVA, v.end)
+			if next == 0 || lo < next-length {
+				startOff, length, next = v.memfdOffset+(lo-v.start), hi-lo, hi
+			}
+		}
+		h.addrMap.mu.RUnlock()
+		if next == 0 {
+			break
+		}
+		h.state.SetRange(startOff/PageSize, (startOff+length)/PageSize, StateReleased)
+		select {
+		case h.removeQ <- removeReq{memfdOffset: startOff, length: length}:
+		default:
+			h.stats.removeQDropped.Add(1)
+			h.madviseBackend(startOff, length)
+		}
+		cursor = next
 	}
 }
 
@@ -741,7 +788,14 @@ func (h *Handler) runWorker(idx int) {
 			if !ev.queued.IsZero() {
 				h.stats.faultQueueWait.record(uint64(time.Since(ev.queued).Nanoseconds()))
 			}
-			h.handleFault(ev, pageBuf)
+			if ev.mandatory != nil {
+				inflight := h.stats.inflight.Add(1)
+				recordAtomicMax(&h.stats.inflightHWM, uint64(inflight))
+				ev.mandatory.done <- h.loadPage(ev.mandatory.ctx, ev.mandatory.offset, pageBuf)
+				h.stats.inflight.Add(-1)
+			} else {
+				h.handleFault(ev, pageBuf)
+			}
 		}
 	}
 }
