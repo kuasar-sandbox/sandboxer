@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -148,23 +149,21 @@ class MaterialsTests(unittest.TestCase):
 
     @staticmethod
     def vhost_response(url, original):
-        response = io.BytesIO(original if url.endswith("vhost/Cargo.toml") else b"fixture upstream license\n")
-        response.geturl = lambda: url
-        return response
+        return original if url.endswith("vhost/Cargo.toml") else b"fixture upstream license\n"
 
     def test_vhost_workspace_licenses_match_the_published_manifest(self):
         package, archive, destination, original = self.vhost_fixture()
-        with patch.object(materials, "urlopen", side_effect=lambda url, timeout: self.vhost_response(url, original)):
+        with patch.object(materials, "_request_vhost_material", side_effect=lambda url, timeout: self.vhost_response(url, original)):
             identity = materials.vhost_workspace_materials(package, archive, destination, self.home)
         self.assertEqual(identity, ";license-source-git:" + "1" * 40)
         self.assertTrue((destination / "upstream/LICENSE-BSD-3-Clause").is_file())
-        with patch.object(materials, "urlopen", side_effect=lambda url, timeout: self.vhost_response(url, b"different manifest")):
+        with patch.object(materials, "_request_vhost_material", side_effect=lambda url, timeout: self.vhost_response(url, b"different manifest")):
             with self.assertRaisesRegex(ValueError, "differs"):
                 materials.vhost_workspace_materials(package, archive, destination, self.root / "fresh-cargo")
 
     def test_vhost_warm_cache_works_offline_in_a_fresh_material_directory(self):
         package, archive, destination, original = self.vhost_fixture()
-        with patch.object(materials, "urlopen", side_effect=lambda url, timeout: self.vhost_response(url, original)) as request:
+        with patch.object(materials, "_request_vhost_material", side_effect=lambda url, timeout: self.vhost_response(url, original)) as request:
             identity = materials.vhost_workspace_materials(package, archive, destination, self.home)
         self.assertEqual(request.call_count, 3)
         fresh = self.root / "fresh-job"
@@ -174,7 +173,7 @@ class MaterialsTests(unittest.TestCase):
         restored_archive = fresh / archive.name
         shutil.copyfile(archive, restored_archive)
         archive.unlink()
-        with patch.object(materials, "urlopen", side_effect=AssertionError("offline: network forbidden")):
+        with patch.object(materials, "_request_vhost_material", side_effect=AssertionError("offline: network forbidden")):
             restored = fresh / "materials"
             self.assertEqual(materials.vhost_workspace_materials(package, restored_archive, restored, restored_home), identity)
         for name in ("LICENSE", "LICENSE-BSD-3-Clause"):
@@ -182,7 +181,7 @@ class MaterialsTests(unittest.TestCase):
 
     def test_vhost_corrupt_or_wrong_source_cache_is_rejected_without_network(self):
         package, archive, destination, original = self.vhost_fixture()
-        with patch.object(materials, "urlopen", side_effect=lambda url, timeout: self.vhost_response(url, original)):
+        with patch.object(materials, "_request_vhost_material", side_effect=lambda url, timeout: self.vhost_response(url, original)):
             materials.vhost_workspace_materials(package, archive, destination, self.home)
         cache, = (self.home / "release-materials/vhost").glob("*/*.json")
         valid = json.loads(cache.read_bytes())
@@ -203,7 +202,7 @@ class MaterialsTests(unittest.TestCase):
                     del record["files"]["LICENSE-BSD-3-Clause"]
                 cache.write_text("{" if failure == "json" else json.dumps(record))
                 before = cache.read_bytes()
-                with patch.object(materials, "urlopen", side_effect=AssertionError("invalid cache must fail closed")):
+                with patch.object(materials, "_request_vhost_material", side_effect=AssertionError("invalid cache must fail closed")):
                     with self.assertRaisesRegex(ValueError, "invalid vhost material cache"):
                         materials.vhost_workspace_materials(package, archive, self.root / "rejected", self.home)
                 self.assertEqual(cache.read_bytes(), before)
@@ -211,7 +210,7 @@ class MaterialsTests(unittest.TestCase):
 
     def test_vhost_wrong_repository_or_non_exact_commit_never_downloads(self):
         package, archive, destination, _ = self.vhost_fixture(commit="main")
-        with patch.object(materials, "urlopen", side_effect=AssertionError("no download for unbound source")):
+        with patch.object(materials, "_request_vhost_material", side_effect=AssertionError("no download for unbound source")):
             with self.assertRaisesRegex(ValueError, "unverifiable"):
                 materials.vhost_workspace_materials(package, archive, destination, self.home)
             with self.assertRaisesRegex(ValueError, "no license"):
@@ -224,7 +223,7 @@ class MaterialsTests(unittest.TestCase):
             if url.endswith("LICENSE-BSD-3-Clause"):
                 raise HTTPError(url, 404, "not found", {}, None)
             return self.vhost_response(url, original)
-        with patch.object(materials, "urlopen", side_effect=request) as request_mock:
+        with patch.object(materials, "_request_vhost_material", side_effect=request) as request_mock:
             with self.assertRaisesRegex(ValueError, "LICENSE-BSD-3-Clause.*404"):
                 materials.vhost_workspace_materials(package, archive, destination, self.home)
         self.assertEqual(request_mock.call_count, 3)  # A permanent 404 is not retried.
@@ -234,25 +233,35 @@ class MaterialsTests(unittest.TestCase):
     def test_vhost_transient_failure_and_finite_attempts_have_request_diagnostics(self):
         url = "https://raw.githubusercontent.com/rust-vmm/vhost/" + "1" * 40 + "/LICENSE"
         log = io.StringIO()
-        with patch.object(materials, "urlopen", side_effect=[URLError("temporary DNS failure"), self.vhost_response(url, b"")]) as request, \
+        with patch.object(materials, "_request_vhost_material", side_effect=[URLError("temporary DNS failure"), self.vhost_response(url, b"")]) as request, \
                 patch.object(materials.time, "sleep"), redirect_stderr(log):
             self.assertEqual(materials.download_vhost_material(url, time.monotonic() + 10), b"fixture upstream license\n")
         self.assertEqual(request.call_count, 2)
         self.assertIn(url, log.getvalue())
         self.assertIn("attempt=1", log.getvalue())
         self.assertIn("temporary DNS failure", log.getvalue())
-        with patch.object(materials, "urlopen", side_effect=URLError("still unavailable")) as request, \
+        with patch.object(materials, "_request_vhost_material", side_effect=URLError("still unavailable")) as request, \
                 patch.object(materials.time, "sleep"):
             with self.assertRaisesRegex(ValueError, "after 3 attempt"):
                 materials.download_vhost_material(url, time.monotonic() + 10)
         self.assertEqual(request.call_count, 3)
 
     def test_vhost_redirect_is_not_relabelled_as_the_selected_source(self):
-        url = "https://raw.githubusercontent.com/rust-vmm/vhost/" + "1" * 40 + "/LICENSE"
-        with patch.object(materials, "urlopen", return_value=self.vhost_response("https://example.invalid/LICENSE", b"")) as request:
+        attempts = []
+        def respond(handler):
+            attempts.append(handler.path)
+            if handler.path == "/LICENSE":
+                handler.send_response(302)
+                handler.send_header("Location", "/different-source")
+                handler.end_headers()
+            else:
+                handler.send_response(200)
+                handler.end_headers()
+                handler.wfile.write(b"wrong-source license")
+        with self.vhost_http_server(respond) as url:
             with self.assertRaisesRegex(ValueError, "redirected from exact source"):
-                materials.download_vhost_material(url, time.monotonic() + 10)
-        self.assertEqual(request.call_count, 1)
+                materials.download_vhost_material(url, time.monotonic() + 2)
+        self.assertEqual(attempts, ["/LICENSE", "/different-source"])
 
     @contextmanager
     def vhost_http_server(self, responder):
@@ -287,7 +296,9 @@ class MaterialsTests(unittest.TestCase):
     def test_vhost_real_slow_body_cannot_exceed_total_budget(self):
         # Bytes arrive within the socket inactivity timeout, but the complete
         # request must still stop at the remaining material-download budget.
+        requested = threading.Event()
         def respond(handler):
+            requested.set()
             handler.send_response(200)
             handler.send_header("Content-Length", "100")
             handler.end_headers()
@@ -301,8 +312,55 @@ class MaterialsTests(unittest.TestCase):
         with self.vhost_http_server(respond) as url, patch.object(materials, "VHOST_REQUEST_TIMEOUT", 1):
             started = time.monotonic()
             with self.assertRaisesRegex(ValueError, "budget exhausted"):
-                materials.download_vhost_material(url, started + 0.15)
-            self.assertLess(time.monotonic() - started, 0.75)
+                materials.download_vhost_material(url, started + 0.4)
+            self.assertLess(time.monotonic() - started, 1.25)
+            self.assertTrue(requested.is_set(), "request must enter the slow HTTP body fixture")
+
+    def test_vhost_stuck_resolver_process_is_killed_and_reaped_at_budget(self):
+        # Patch only the child's resolver. The real worker still enters urlopen,
+        # while the real parent must kill and wait for this owned OS process.
+        marker = self.root / "resolver-pid"
+        real_popen = subprocess.Popen
+        requests = []
+        block_resolver = """import os,signal,socket,sys,time
+def blocked_resolver(*args, **kwargs):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(sys.argv[4], "w") as output:
+        output.write(str(os.getpid()))
+    while True:
+        time.sleep(60)
+socket.getaddrinfo = blocked_resolver
+"""
+        def spawn(command, **kwargs):
+            self.assertEqual(command[:4], [sys.executable, "-I", "-B", "-c"])
+            self.assertNotIn("GH_TOKEN", kwargs["env"])
+            self.assertNotIn("GITHUB_TOKEN", kwargs["env"])
+            child = real_popen([*command[:4], block_resolver + command[4], *command[5:], str(marker)], **kwargs)
+            requests.append(child)
+            return child
+        def cleanup():
+            for child in requests:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+        self.addCleanup(cleanup)
+        url = "https://raw.githubusercontent.com/rust-vmm/vhost/" + "1" * 40 + "/LICENSE"
+        log = io.StringIO()
+        started = time.monotonic()
+        with patch.object(materials.subprocess, "Popen", side_effect=spawn), \
+                patch.dict(os.environ, {"GH_TOKEN": "fixture-do-not-forward", "GITHUB_TOKEN": "fixture-do-not-forward"}), \
+                redirect_stderr(log):
+            with self.assertRaisesRegex(ValueError, "budget exhausted.*request process reaped"):
+                materials.download_vhost_material(url, started + 0.6)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(int(marker.read_text()), requests[0].pid)
+        self.assertEqual(requests[0].returncode, -signal.SIGKILL)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(requests[0].pid, os.WNOHANG)
+        self.assertIn(url, log.getvalue())
+        self.assertIn("attempt=1", log.getvalue())
+        self.assertIn("remaining=0.000s", log.getvalue())
 
     def test_vhost_real_partial_http_body_is_rejected(self):
         attempts = []

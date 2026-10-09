@@ -15,7 +15,6 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tarfile
@@ -59,6 +58,65 @@ def put_material(destination, relative, contents):
     target.chmod(0o644)
 
 
+def _vhost_request_worker(url, timeout):
+    """One public material request; the parent owns its wall-clock deadline."""
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            require(response.geturl() == url, "vhost material redirected from exact source: " + url)
+            contents = response.read()
+        record = {"contents": base64.b64encode(contents).decode("ascii")}
+        status = 0
+    except (HTTPError, URLError, OSError, IncompleteRead, ValueError) as error:
+        record = {"error": type(error).__name__, "message": str(error)}
+        if isinstance(error, HTTPError):
+            record["code"] = error.code
+        status = 1
+    print(json.dumps(record, sort_keys=True))
+    return status
+
+
+def _request_vhost_material(url, timeout):
+    # A Python signal cannot interrupt every blocking C resolver call. Keep the
+    # actual urlopen in one owned process, so its DNS/connect/body work can all
+    # be killed and reaped when the remaining request budget expires.
+    started = time.monotonic()
+    worker = ('import runpy,sys; '
+              'module=runpy.run_path(sys.argv[1]); '
+              'raise SystemExit(module["_vhost_request_worker"](sys.argv[2],float(sys.argv[3])))')
+    # Public URLs need neither publishing credentials nor user Python hooks.
+    environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR")
+                   if key in os.environ}
+    with subprocess.Popen([sys.executable, "-I", "-B", "-c", worker,
+                           str(Path(__file__).resolve()), url, str(timeout)],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, env=environment) as request:
+        try:
+            stdout, stderr = request.communicate(timeout=max(0, timeout - (time.monotonic() - started)))
+        except subprocess.TimeoutExpired as error:
+            request.kill()
+            request.communicate()
+            raise TimeoutError(f"request deadline exceeded ({timeout:.3f}s); request process reaped") from error
+        except BaseException:
+            request.kill()
+            request.communicate()
+            raise
+    try:
+        record = json.loads(stdout)
+    except (ValueError, UnicodeError) as error:
+        raise OSError(f"vhost request process exited {request.returncode}: "
+                      + stderr.decode("utf-8", errors="replace").strip()) from error
+    require(isinstance(record, dict), "invalid vhost request process result")
+    if record.get("error") == "HTTPError":
+        raise HTTPError(url, record["code"], record["message"], {}, None)
+    if record.get("error") == "ValueError":
+        raise ValueError(record["message"])
+    if record.get("error"):
+        raise OSError(record["error"] + ": " + record["message"])
+    require(request.returncode == 0 and isinstance(record.get("contents"), str),
+            "invalid vhost request process result")
+    return base64.b64decode(record["contents"], validate=True)
+
+
 def download_vhost_material(url, deadline):
     started = time.monotonic()
     for attempt in range(1, VHOST_DOWNLOAD_ATTEMPTS + 1):
@@ -68,21 +126,8 @@ def download_vhost_material(url, deadline):
         print(f"release Rust materials: GET {url} attempt={attempt}/{VHOST_DOWNLOAD_ATTEMPTS} "
               f"remaining={remaining:.3f}s timeout={timeout:.3f}s", file=sys.stderr, flush=True)
 
-        def expired(_signal, _frame):
-            raise TimeoutError(f"request deadline exceeded ({timeout:.3f}s)")
-
-        # urlopen's timeout limits socket inactivity, not the entire request.
-        # The Linux packager also bounds DNS, redirects and a slowly read body.
-        handler = signal.signal(signal.SIGALRM, expired)
-        signal.setitimer(signal.ITIMER_REAL, timeout)
         try:
-            try:
-                with urlopen(url, timeout=timeout) as response:
-                    require(response.geturl() == url, "vhost material redirected from exact source: " + url)
-                    contents = response.read()
-            finally:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-                signal.signal(signal.SIGALRM, handler)
+            contents = _request_vhost_material(url, timeout)
         except (OSError, URLError, IncompleteRead) as error:
             remaining = deadline - time.monotonic()
             retryable = not isinstance(error, HTTPError) or error.code in (408, 429) or 500 <= error.code < 600
