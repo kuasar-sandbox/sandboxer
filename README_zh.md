@@ -60,11 +60,12 @@ Memory 按 page fault-in,磁盘按 block 读取。未访问的数据无需在恢
 
 构建使用环境提供的 Go，并继承 `GOROOT`、`GOTOOLCHAIN` 等工具链选择；发布自动化需要环境在 `PATH` 中提供支持 `api --slurp` 的 `gh`。项目不下载、替换或按固定二进制摘要认证这些环境工具。 Rust 构建使用环境中的 `cargo`、`rustc` 和目标链接器，不要求由 rustup 管理。
 
-CI 构建、普通源码测试和发行打包使用现有 Workbench,每次运行只为各原生架构
-选择一次通过验证的不可变镜像. 发行矩阵使用原生 x86_64 和 aarch64 Runner.
-`scripts/ci-source-checks.sh --ordinary` 在 build 模式运行普通测试、race 与 vet;
-`--privileged` 在 system 模式保留真实 mount namespace ENOSPC 检查. 不传参数
-仍执行两者. `KUASAR_BUILD_JOBS` 限制构建并发,源码、临时目录、Cargo 与 native
+CI 在一次运行中为各原生架构选择已通过验证的不可变 Workbench 镜像.
+发布构建、普通测试和打包使用 build 模式, 在原生 x86_64 和 aarch64 Runner 上
+以 ordinary UID 执行. 完整的 `bash scripts/ci-source-checks.sh` 门禁在 Workbench
+system 模式运行, 保留源码测试、race、vet 及真实 mount namespace ENOSPC 检查.
+门禁需要这些测试实际使用的 namespace 和 mount 能力.
+`KUASAR_BUILD_JOBS` 限制构建并发,源码、临时目录、Cargo 与 native
 cache 均属于本次任务. 产品 E2E 仍使用精确预构建制品. 发布凭据只用于 Actions
 编排步骤;publisher 通过 `RELEASE_ARCHIVE_VALIDATOR` 执行由 Workbench 编译的
 受信 workflow revision 对应的归档解析器.
