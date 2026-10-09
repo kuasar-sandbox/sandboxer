@@ -316,6 +316,7 @@ jobs:
       - name: Compile the trusted archive parser without publish credentials
         uses: ./trusted/platform/.github/actions/workbench
         with:
+          cache: 'false'
           selection: workbench-selection/workbench.json
           sources: validator-src
           arch: x86_64

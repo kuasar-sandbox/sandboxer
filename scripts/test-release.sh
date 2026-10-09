@@ -216,6 +216,7 @@ for job in (build, publish):
     assert not re.search(r"GH_TOKEN|github.token|secrets\.", action_run), "publish credentials entered the build command"
 assert "ref: ${{ github.workflow_sha }}" in publish, "trusted parser source is not workflow-bound"
 assert "RELEASE_ARCHIVE_VALIDATOR:" in publish, "publisher must use the trusted precompiled parser"
+assert "cache: 'false'" in publish, "trusted publisher parser must not consume candidate build caches"
 assert "go build -p \"$KUASAR_BUILD_JOBS\"" in publish, "parser compilation must honor the task budget"
 PYWORKBENCH
 grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }}]' \
