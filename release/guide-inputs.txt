@@ -1,0 +1,10 @@
+# Owner-maintained user documentation inputs, relative to this repository.
+# The platform reads this file from the selected source revision.
+# Entries may be Markdown files, directories, or glob patterns; each must match.
+# Keep source/developer-only documentation outside the selected inputs.
+README.md
+README_zh.md
+docs/sandbox.md
+docs/sandbox_zh.md
+docs/sandbox-init.md
+docs/sandbox-init_zh.md
