@@ -124,6 +124,17 @@ files come from the exact Git commit in its checksum-verified Cargo VCS record,
 after comparing the upstream package manifest with that crate's
 `Cargo.toml.orig`. A moving branch does not select those files.
 
+Those three vhost HTTP requests share a 120-second budget. Each request has a
+30-second deadline and at most three attempts for transient network or HTTP
+failures. Request diagnostics identify the exact URL, attempt, elapsed time and
+remaining budget. A complete set is cached under
+`$CARGO_HOME/release-materials/vhost/<crate-sha256>/<git-commit>.json`.
+Offline reuse verifies the repository, commit, crate checksum, exact file URLs,
+material checksums and original manifest again. A damaged or mismatched entry
+fails packaging without silently downloading a replacement; incomplete downloads
+do not publish a cache entry or supplemental licenses. Cargo's own dependency
+downloads retain their separate Cargo retry settings.
+
 Crate material directories include a digest of the complete Cargo source
 identity, preventing same-name/version packages from different registries or Git
 commits from overwriting each other's notices. Rust copyright and license texts

@@ -101,6 +101,15 @@ Git crate 材料包含 manifest 显式声明的 `license-file`,即使文件名�
 验证的 Cargo VCS 记录所指的精确 Git commit,且先将上游 package manifest 与
 该 crate 的 `Cargo.toml.orig` 比较,不由移动分支选择材料。
 
+这 3 个 vhost HTTP 请求共享 120 秒总预算. 每个请求最多执行 3 次,每次请求
+限时 30 秒,仅对瞬态网络或 HTTP 失败重试. 请求诊断记录精确 URL、尝试次数、
+已耗时与剩余预算. 完整材料缓存于
+`$CARGO_HOME/release-materials/vhost/<crate-sha256>/<git-commit>.json`.
+断网复用时重新校验仓库、完整 commit、crate checksum、各文件精确 URL、材料
+checksum 和原始 manifest. 损坏或来源不符的条目使打包失败,不会静默重新下载;
+部分下载不会发布缓存条目或补充许可证. Cargo 依赖下载仍使用独立的 Cargo
+网络重试设置.
+
 Crate 材料目录包含完整 Cargo 来源身份的摘要,不同 registry 或 Git commit 中
 同名、同版本的包不能相互覆盖声明。Rust 版权及许可正文取自所选安装的
 `share/doc/rust/COPYRIGHT-library.html`、`licenses/`,或对应的 Debian/RPM
