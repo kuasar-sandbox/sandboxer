@@ -207,7 +207,7 @@ func (c usageIO) io(op fdIOFunc, b []byte) (int, error) {
 		if err := c.conn.SetDeadline(c.end); err != nil {
 			return 0, err
 		}
-		n, err := op(c.conn.fd, b)
+		n, err := c.conn.rawIO(op, b)
 		if n > 0 {
 			return n, err
 		}

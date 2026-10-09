@@ -1142,6 +1142,13 @@ in the calling flow. It must not issue another read after ACK: a raw vsock fd
 can be reused by a newly accepted connection, and a stale reader could steal
 the new connection's 4-byte proto length or MUX header.
 
+MUX_CLOSE/ACK also seals the serialized writer: retained stream handles cannot
+send later DATA, EOF, RESET, window updates or control frames. Buffered received
+data remains drainable. Forced close interrupts transport I/O before joining
+writers. Raw vsock Close rejects new I/O and socket-option changes, shuts down
+in-flight reads/writes, then joins their fd ownership before releasing the
+descriptor; usage I/O and EINTR retries share this ownership rule.
+
 **Why both close and linger matter:** a guest-only virtio-vsock close can leave
 an 8 s deferred-removal state waiting for peer reset or timeout. Host close
 after ACK supplies the peer teardown; guest SO_LINGER waits up to its configured

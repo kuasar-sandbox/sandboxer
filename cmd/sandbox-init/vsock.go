@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -33,6 +34,7 @@ type vsockConn struct {
 	closeErr  error
 	fdMu      sync.Mutex
 	closed    bool
+	ioWG      sync.WaitGroup // admitted syscalls; Add is serialized with Close by fdMu
 }
 
 type fdIOFunc func(int, []byte) (int, error)
@@ -51,17 +53,42 @@ func retryInterruptedIO(op fdIOFunc, fd int, b []byte) (int, error) {
 	}
 }
 
+// rawIO pins the descriptor for one syscall. Never hold fdMu across blocking
+// I/O: Close must be able to shutdown the socket before waiting for its users.
+func (c *vsockConn) rawIO(op fdIOFunc, b []byte) (int, error) {
+	c.fdMu.Lock()
+	if c.closed {
+		c.fdMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	c.ioWG.Add(1)
+	c.fdMu.Unlock()
+	defer c.ioWG.Done()
+	return op(c.fd, b)
+}
+
+func (c *vsockConn) io(op fdIOFunc, b []byte) (int, error) {
+	return retryInterruptedIO(func(_ int, b []byte) (int, error) {
+		return c.rawIO(op, b) // recheck ownership on every EINTR retry
+	}, c.fd, b)
+}
+
 func (c *vsockConn) Read(b []byte) (int, error) {
-	return retryInterruptedIO(syscall.Read, c.fd, b)
+	return c.io(syscall.Read, b)
 }
 
 func (c *vsockConn) Write(b []byte) (int, error) {
-	return retryInterruptedIO(syscall.Write, c.fd, b)
+	return c.io(syscall.Write, b)
 }
 func (c *vsockConn) Close() error {
-	c.fdMu.Lock()
-	defer c.fdMu.Unlock()
-	c.closeOnce.Do(func() { c.closed = true; c.closeErr = syscall.Close(c.fd) })
+	c.closeOnce.Do(func() {
+		c.fdMu.Lock()
+		c.closed = true
+		_ = unix.Shutdown(c.fd, unix.SHUT_RDWR)
+		c.fdMu.Unlock()
+		c.ioWG.Wait()
+		c.closeErr = syscall.Close(c.fd)
+	})
 	return c.closeErr
 }
 
@@ -81,6 +108,11 @@ func (c *vsockConn) shutdown() error {
 // mux.Session, which relies on the conn closing (not a deadline) to
 // unblock its read loop.
 func (c *vsockConn) SetDeadline(t time.Time) error {
+	c.fdMu.Lock()
+	defer c.fdMu.Unlock()
+	if c.closed {
+		return net.ErrClosed
+	}
 	var tv unix.Timeval // {0,0} = no timeout
 	if !t.IsZero() {
 		d := time.Until(t)
@@ -107,6 +139,11 @@ func (c *vsockConn) SetDeadline(t time.Time) error {
 // socket (virtio_transport_wait_close), so the MUX teardown is confirmed
 // complete before quiesce acks (deterministic steady state, §3.4).
 func (c *vsockConn) SetLinger(sec int) error {
+	c.fdMu.Lock()
+	defer c.fdMu.Unlock()
+	if c.closed {
+		return net.ErrClosed
+	}
 	return unix.SetsockoptLinger(c.fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: int32(sec)})
 }
 
@@ -580,7 +617,7 @@ func exchangeMemReport(conn interface {
 		// AF_VSOCK connection first; Close remains the portable fallback for
 		// tests and prevents any later operation after the budget expires.
 		if c, ok := conn.(*vsockConn); ok {
-			_ = unix.Shutdown(c.fd, unix.SHUT_RDWR)
+			_ = c.shutdown()
 		}
 		_ = conn.Close()
 	})

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 )
 
 // StreamSet is the set of active data streams on a MUX connection,
@@ -56,7 +57,9 @@ type Session struct {
 	conn   io.ReadWriteCloser
 	window int
 
-	wmu sync.Mutex // serializes frame writes to conn
+	wmu     sync.Mutex  // serializes frame writes and the graceful terminal barrier
+	sealed  bool        // guarded by wmu; no ordinary frames after MUX_CLOSE/ACK
+	retired atomic.Bool // forced close must interrupt conn before waiting for wmu
 
 	mu      sync.Mutex
 	streams map[uint8]*Stream
@@ -137,6 +140,12 @@ func (s *Session) InitMuxClose() error {
 	}
 	s.closeInitiated = true
 	s.mu.Unlock()
+	// Wake credit waiters without holding mu (stream code may acquire mu).
+	for _, st := range s.streams {
+		st.mu.Lock()
+		st.cond.Broadcast()
+		st.mu.Unlock()
+	}
 	if err := s.writeFrame(Frame{Stream: StreamControl, Type: FrameMuxClose}); err != nil {
 		return err
 	}
@@ -192,7 +201,13 @@ func (s *Session) Err() error {
 
 // Close closes the underlying connection, which unblocks the read loop
 // and any blocked Stream Reads/Writes.
-func (s *Session) Close() error { return s.conn.Close() }
+func (s *Session) Close() error {
+	s.retired.Store(true)
+	err := s.conn.Close() // interrupt an in-flight Write before joining it
+	s.wmu.Lock()
+	s.wmu.Unlock()
+	return err
+}
 
 // --- internal -------------------------------------------------------
 
@@ -210,6 +225,15 @@ func (s *Session) setErr(err error) {
 func (s *Session) writeFrame(f Frame) error {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
+	if s.retired.Load() || (s.sealed && f.Type != FrameMuxCloseAck) {
+		return ErrClosed
+	}
+	if f.Type == FrameData && s.refuseWrites() {
+		return ErrClosed
+	}
+	if f.Type == FrameMuxClose || f.Type == FrameMuxCloseAck {
+		s.sealed = true
+	}
 	return WriteFrame(s.conn, f)
 }
 
@@ -241,12 +265,16 @@ func (s *Session) writeData(st *Stream, b []byte) (int, error) {
 func (s *Session) readLoop() {
 	defer close(s.doneCh)
 	defer func() {
-		// Wake everyone blocked on a stream.
-		s.mu.Lock()
+		// Publish retirement under the writer barrier before Done is visible.
+		s.retired.Store(true)
+		s.wmu.Lock()
+		s.wmu.Unlock()
+		// Wake everyone blocked on a stream without reversing stream->mu order.
 		for _, st := range s.streams {
 			st.shutdown()
 		}
 		// Wake InitMuxClose waiters if still pending.
+		s.mu.Lock()
 		if !s.closeAcked {
 			s.closeAcked = true
 			close(s.closeAckedCh)
@@ -259,6 +287,7 @@ func (s *Session) readLoop() {
 			s.mu.Lock()
 			respClosed := s.respClosed
 			s.mu.Unlock()
+			_ = s.Close()
 			if err != io.EOF && !respClosed {
 				s.setErr(err)
 			}
@@ -266,7 +295,7 @@ func (s *Session) readLoop() {
 		}
 		if err := s.dispatch(f); err != nil {
 			s.setErr(err)
-			_ = s.conn.Close()
+			_ = s.Close()
 			return
 		}
 		// dispatch has acknowledged MUX_CLOSE and closed the responder's
@@ -358,7 +387,7 @@ func (s *Session) dispatch(f Frame) error {
 		// remnant (which a later restore's reused muxer local port
 		// collides with). readLoop returns after this terminal frame without
 		// touching the closed transport again.
-		_ = s.conn.Close()
+		_ = s.Close()
 	case FrameMuxCloseAck:
 		if f.Stream != StreamControl {
 			return ErrProtocol
