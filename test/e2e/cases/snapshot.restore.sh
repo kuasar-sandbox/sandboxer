@@ -70,6 +70,14 @@ SELECTED_RUNTIME="$WORK/deploy-runtime/runtime-v1.bundle"
 DEFAULT_RUNTIME="$WORK/deploy-runtime/runtime-v2.bundle"
 cp --reflink=auto --sparse=always "$BIN/sandbox-runtime.bundle" "$CAPTURE_RUNTIME"
 
+# Retain the primary's mappings and open O_DIRECT descriptor across snapshot.
+# JSON is valid YAML and preserves the workload's exact newlines/quoting.
+DIO_LAUNCH_ARGS="$(python3 - "$SANDBOXER_LIB/restore_dio_workload.py" <<'PY_DIO'
+import json, pathlib, sys
+print(json.dumps(["-c", pathlib.Path(sys.argv[1]).read_text()]))
+PY_DIO
+)"
+
 cat >"$WORK/cold.yaml" <<EOF
 resources:
   capacity: { cpu: 1, memory: 512MiB }
@@ -83,7 +91,7 @@ boot:
     base: $ROOT_REF
     overlay: { diff: file://$DIFF }
 launch:
-  args: ["-c", "import time\nprint('PYBOOT-OK', flush=True)\ni=0\nwhile True:\n print('TICK', i, flush=True); i+=1; time.sleep(0.25)"]
+  args: $DIO_LAUNCH_ARGS
   restart: never
   cgroup_control: true
 EOF
@@ -112,6 +120,12 @@ for _ in $(seq 1 600); do
     sleep 0.05
 done
 grep -qE '^TICK 10[[:space:]]*$' "$LOG1" || e2e_fail "cold run never reached TICK 10"
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$WORK/runtime" -- cat /tmp/dio-state.json >"$OUT/dio-before.json"
+python3 - "$OUT/dio-before.json" <<'PY_DIO'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r['phase'] == 'armed' and r['cold_control_mismatches'] == 0 and r['regions'] == 32, r
+PY_DIO
 PRE_SNAP_TICK="$(grep -oE '^TICK [0-9]+' "$LOG1" | tail -1 | awk '{print $2}')"
 
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID1" --output "$WORK/snapshot" --run-root "$WORK/runtime" \
@@ -170,6 +184,22 @@ assert config["pmem"][0]["file"] == sys.argv[2], config["pmem"]
 PY
 sha256sum --check --status "$WORK/source.sha256" || e2e_fail "restore modified source snapshot artifacts"
 sha256sum --check --status "$WORK/host-inputs.sha256" || e2e_fail "restore modified host inputs"
+
+# A separate native exec triggers the retained primary only after restore.
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$WORK/runtime" -- touch /tmp/dio-trigger
+for _ in $(seq 1 600); do
+    grep -qE '^DIO-COMPLETE[[:space:]]*$' "$LOG2" 2>/dev/null && break
+    kill -0 "$SBPID2" 2>/dev/null || e2e_fail "restored O_DIRECT workload exited"
+    sleep 0.05
+done
+grep -qE '^DIO-COMPLETE[[:space:]]*$' "$LOG2" || e2e_fail "restored O_DIRECT integrity check did not complete"
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$WORK/runtime" -- cat /tmp/dio-state.json >"$OUT/dio-after.json"
+python3 - "$OUT/dio-after.json" <<'PY_DIO'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r['phase'] == 'complete' and r['cold_control_mismatches'] == 0, r
+assert r['mismatches'] == [0] * 16 and r['warm_mismatches'] == [0] * 16 and r['corrupt_regions'] == 0, r
+PY_DIO
 
 WANT_TICK=$((PRE_SNAP_TICK + 3))
 for _ in $(seq 1 600); do

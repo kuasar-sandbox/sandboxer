@@ -41,15 +41,17 @@ type VAReportServer struct {
 	// handler should adopt the uffd fd (the server passes ownership)
 	// and start its goroutines. Returning an error causes the
 	// va_report to be NAK'd and the fd closed.
-	OnReady func(uffdFD int, vaStart, size uint64) error
+	OnReady func(uffdFD int, vaStart, size, memfdOffset uint64) error
 
 	// OnRegister is invoked synchronously on each SUBSEQUENT va_report.
 	// The handler should adopt the new uffd fd (also passed by
 	// ownership) and add it to its epoll set. Returning an error NAKs.
 	// May be left nil; in that case any second va_report is rejected
 	// (single-region mode).
-	OnRegister func(uffdFD int, vaStart, size uint64) error
+	OnRegister func(uffdFD int, vaStart, size, memfdOffset uint64) error
 
+	connMu            sync.Mutex
+	activeConn        *net.UnixConn
 	listener          *net.UnixListener
 	mu                sync.Mutex
 	regionsRegistered int    // count of va_report messages handled successfully
@@ -88,8 +90,11 @@ func (s *VAReportServer) Serve(ctx context.Context) error {
 		return errors.New("vareport: Listen not called")
 	}
 	go func() {
-		<-ctx.Done()
-		s.Stop()
+		select {
+		case <-ctx.Done():
+			s.Stop()
+		case <-s.stopped:
+		}
 	}()
 	for {
 		conn, err := s.listener.AcceptUnix()
@@ -101,7 +106,20 @@ func (s *VAReportServer) Serve(ctx context.Context) error {
 				return fmt.Errorf("vareport: accept: %w", err)
 			}
 		}
+		s.connMu.Lock()
+		select {
+		case <-s.stopped:
+			s.connMu.Unlock()
+			_ = conn.Close()
+			return nil
+		default:
+		}
+		s.activeConn = conn
+		s.connMu.Unlock()
 		s.handle(conn)
+		s.connMu.Lock()
+		s.activeConn = nil
+		s.connMu.Unlock()
 	}
 }
 
@@ -109,6 +127,11 @@ func (s *VAReportServer) Serve(ctx context.Context) error {
 func (s *VAReportServer) Stop() {
 	s.stopOnce.Do(func() {
 		close(s.stopped)
+		s.connMu.Lock()
+		if s.activeConn != nil {
+			_ = s.activeConn.Close()
+		}
+		s.connMu.Unlock()
 		if s.listener != nil {
 			_ = s.listener.Close()
 		}
@@ -171,29 +194,30 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 		_ = writeLPJSON(conn, ackMsg{Type: "error", Msg: "multi-region not supported by handler"})
 		return
 	}
-	if err := s.AddrMap.RegisterVMA(ProcessCH, req.VAStart, req.Size, memfdOffset); err != nil {
-		s.mu.Unlock()
-		s.Logf("vareport: register vma failed: %v", err)
-		_ = writeLPJSON(conn, ackMsg{Type: "error", Msg: err.Error()})
-		return
-	}
 	uffdFD := fds[0]
+	var adoptErr error
 	if regionIdx == 0 {
-		if s.OnReady != nil {
-			if err := s.OnReady(uffdFD, req.VAStart, req.Size); err != nil {
-				s.mu.Unlock()
-				s.Logf("vareport: OnReady failed: %v", err)
-				_ = writeLPJSON(conn, ackMsg{Type: "error", Msg: err.Error()})
-				return
+		if s.OnReady == nil {
+			adoptErr = errors.New("vareport: missing OnReady callback")
+		} else {
+			adoptErr = s.AddrMap.RegisterVMA(ProcessCH, req.VAStart, req.Size, memfdOffset)
+			if adoptErr == nil {
+				adoptErr = s.OnReady(uffdFD, req.VAStart, req.Size, memfdOffset)
+				if adoptErr != nil {
+					s.AddrMap.removeStaged(req.VAStart, req.Size, memfdOffset)
+				}
 			}
 		}
 	} else {
-		if err := s.OnRegister(uffdFD, req.VAStart, req.Size); err != nil {
-			s.mu.Unlock()
-			s.Logf("vareport: OnRegister failed: %v", err)
-			_ = writeLPJSON(conn, ackMsg{Type: "error", Msg: err.Error()})
-			return
-		}
+		// Handler stages the interval and atomically commits fd adoption with
+		// installation visibility. A failed epoll add leaves neither published.
+		adoptErr = s.OnRegister(uffdFD, req.VAStart, req.Size, memfdOffset)
+	}
+	if adoptErr != nil {
+		s.mu.Unlock()
+		s.Logf("vareport: adoption failed: %v", adoptErr)
+		_ = writeLPJSON(conn, ackMsg{Type: "error", Msg: adoptErr.Error()})
+		return
 	}
 	// Callback took ownership of uffdFD; remove from fds slice so
 	// the deferred closeAll doesn't double-close.

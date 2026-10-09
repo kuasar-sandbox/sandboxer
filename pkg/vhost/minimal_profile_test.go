@@ -284,6 +284,7 @@ func TestMinimalProfileBlockCommands(t *testing.T) {
 			mem := make([]byte, 2048)
 			const uva = uint64(0x1000)
 			const chainHead = 3
+			srv.SetMemoryLoader(initializedTestMemory)
 			srv.memTable.SetRegions([]MemRegion{{GuestPhysAddr: 0, UserspaceAddr: uva, MemorySize: uint64(len(mem)), mmapBytes: mem}})
 			q := &virtq{num: 8, descAddr: uva, usedAddr: uva + 128, kickFd: -1, callFd: -1}
 			putDesc := func(idx int, addr uint64, length uint32, flags, next uint16) {

@@ -44,7 +44,7 @@ func TestChunkRunBufferedTail(t *testing.T) {
 	h.ops = ioctls.ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 9}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 
 	if got := getter.chunkCalls.Load(); got != 1 {
@@ -98,7 +98,7 @@ func TestChunkRunBusyReadsOnlyUrgentPage(t *testing.T) {
 	h.ops = ioctls.ops()
 	h.tailBusy.Store(true)
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 9}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	h.tailBusy.Store(false)
 
 	if got := getter.chunkCalls.Load(); got != 1 {
@@ -145,7 +145,7 @@ func TestChunkRunFillsWholeVisibleChunkAroundFault(t *testing.T) {
 	startUnitTail(t, h)
 
 	const faultPage = uint64(128)
-	h.handleFault(faultEvent{address: unitCHVA + faultPage*PageSize, uffdFD: 9}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA + faultPage*PageSize, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 
 	if got := getter.chunkCalls.Load(); got != 1 {
@@ -199,7 +199,7 @@ func TestChunkRunStopsAtStateAndCHRegionBoundaries(t *testing.T) {
 			name: "page state",
 			configure: func(t *testing.T, h *Handler) {
 				t.Helper()
-				if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA, chunkFaultFillBytes, 0); err != nil {
+				if err := registerUnitRegion(h, ProcessCH, unitCHVA, chunkFaultFillBytes, 0); err != nil {
 					t.Fatal(err)
 				}
 				h.state.Set(boundaryPages, StateLoaded)
@@ -211,10 +211,10 @@ func TestChunkRunStopsAtStateAndCHRegionBoundaries(t *testing.T) {
 			configure: func(t *testing.T, h *Handler) {
 				t.Helper()
 				firstBytes := boundaryPages * PageSize
-				if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA, firstBytes, 0); err != nil {
+				if err := registerUnitRegion(h, ProcessCH, unitCHVA, firstBytes, 0); err != nil {
 					t.Fatal(err)
 				}
-				if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA+0x20_0000, chunkFaultFillBytes-firstBytes, firstBytes); err != nil {
+				if err := registerUnitRegion(h, ProcessCH, unitCHVA+0x20_0000, chunkFaultFillBytes-firstBytes, firstBytes); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -242,7 +242,7 @@ func TestChunkRunStopsAtStateAndCHRegionBoundaries(t *testing.T) {
 			h.ops = ioctls.ops()
 			startUnitTail(t, h)
 
-			h.handleFault(faultEvent{address: unitCHVA, uffdFD: 9}, make([]byte, PageSize))
+			h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 			waitUnitTail(t, h)
 
 			if got := getter.chunkCalls.Load(); got != 1 {
@@ -287,7 +287,7 @@ func TestChunkRunBidirectionalTailStopsAtBothBoundaries(t *testing.T) {
 			name: "page state",
 			configure: func(t *testing.T, h *Handler) uint64 {
 				t.Helper()
-				if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA, chunkFaultFillBytes, 0); err != nil {
+				if err := registerUnitRegion(h, ProcessCH, unitCHVA, chunkFaultFillBytes, 0); err != nil {
 					t.Fatal(err)
 				}
 				h.state.Set(leftPage, StateReleased)
@@ -303,7 +303,7 @@ func TestChunkRunBidirectionalTailStopsAtBothBoundaries(t *testing.T) {
 			name: "CH region",
 			configure: func(t *testing.T, h *Handler) uint64 {
 				t.Helper()
-				if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA, (rightPage-leftPage)*PageSize, leftPage*PageSize); err != nil {
+				if err := registerUnitRegion(h, ProcessCH, unitCHVA, (rightPage-leftPage)*PageSize, leftPage*PageSize); err != nil {
 					t.Fatal(err)
 				}
 				return unitCHVA + (faultPage-leftPage)*PageSize
@@ -334,7 +334,7 @@ func TestChunkRunBidirectionalTailStopsAtBothBoundaries(t *testing.T) {
 			h.ops = ioctls.ops()
 			startUnitTail(t, h)
 
-			h.handleFault(faultEvent{address: faultVA, uffdFD: 9}, make([]byte, PageSize))
+			h.handleFault(faultEvent{address: faultVA, uffdFD: unitFD}, make([]byte, PageSize))
 			waitUnitTail(t, h)
 
 			if got := getter.chunkCalls.Load(); got != 1 {
@@ -411,7 +411,7 @@ func TestChunkRunBidirectionalWindowRespectsLayeredVisibility(t *testing.T) {
 	h.ops = ioctls.ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA + faultPage*PageSize, uffdFD: 9}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA + faultPage*PageSize, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 
 	if got := getter.chunkCalls.Load(); got != 1 {
@@ -469,7 +469,7 @@ func TestChunkRunBidirectionalWindowPopulatesOnlyFullPages(t *testing.T) {
 	h.ops = ioctls.ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA + faultPage*PageSize, uffdFD: 9}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA + faultPage*PageSize, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 
 	if got := getter.chunkCalls.Load(); got != 1 {
@@ -518,7 +518,7 @@ func TestChunkRunSuffixFailureAbandonsPrefix(t *testing.T) {
 	h.ops = ioctls.ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA + faultPage*PageSize, uffdFD: 9}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA + faultPage*PageSize, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 
 	if calls := ioctls.snapshot(); len(calls) != 2 {
@@ -567,7 +567,7 @@ func TestChunkRunPrefixStateConflictKeepsAdjacentPages(t *testing.T) {
 	h.ops = ioctls.ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA + faultPage*PageSize, uffdFD: 9}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA + faultPage*PageSize, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 
 	calls := ioctls.snapshot()
@@ -593,7 +593,7 @@ func TestOrdinaryDataFaultUsesOnePlusFifteenPages(t *testing.T) {
 	ioctls := newFakeIoctls()
 	h.ops = ioctls.ops()
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 7}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	if got := source.readLengths(); !equalUint64s(got, []uint64{PageSize}) {
 		t.Fatalf("foreground Run.ReadAt lengths = %v, want [4096]", got)
 	}
@@ -629,7 +629,7 @@ func TestZeroTailStopsAtStateBoundary(t *testing.T) {
 	ioctls := newFakeIoctls()
 	h.ops = ioctls.ops()
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 5}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	startUnitTail(t, h)
 	waitUnitTail(t, h)
 
@@ -664,7 +664,7 @@ func TestZeroAndReleasedFaultsUseSerialZeroTail(t *testing.T) {
 			ioctls := newFakeIoctls()
 			h.ops = ioctls.ops()
 
-			h.handleFault(faultEvent{address: unitCHVA, uffdFD: 5}, make([]byte, PageSize))
+			h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 			calls := ioctls.snapshot()
 			if len(calls) != 1 || calls[0].kind != "zero" || calls[0].length != PageSize {
 				t.Fatalf("urgent calls = %+v", calls)
@@ -700,7 +700,7 @@ func TestResolvedHoleAndZeroRunsUseOnePlusFifteenPages(t *testing.T) {
 			h.ops = ioctls.ops()
 			startUnitTail(t, h)
 
-			h.handleFault(faultEvent{address: unitCHVA, uffdFD: 5}, make([]byte, PageSize))
+			h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 			waitUnitTail(t, h)
 
 			calls := ioctls.snapshot()
@@ -748,7 +748,7 @@ func TestConcurrentFaultsKeepSingleTailReservation(t *testing.T) {
 		wg.Add(1)
 		go func(page uint64) {
 			defer wg.Done()
-			h.handleFault(faultEvent{address: unitCHVA + page*PageSize, uffdFD: 3}, make([]byte, PageSize))
+			h.handleFault(faultEvent{address: unitCHVA + page*PageSize, uffdFD: unitFD}, make([]byte, PageSize))
 		}(page)
 	}
 	receiveN(t, entered, 2)
@@ -793,7 +793,7 @@ func TestFaultQueueWaitDepthAndInflightMetrics(t *testing.T) {
 	msg.Event = uffdEventPagefault
 	binary.LittleEndian.PutUint64(msg.Arg[8:16], unitCHVA)
 	for range 3 {
-		h.dispatch(&msg, 21)
+		h.dispatch(&msg, unitFD)
 	}
 	if got := h.Stats()["fault_queue_depth_hwm"]; got != 3 {
 		t.Fatalf("queue depth HWM before worker = %d, want 3", got)
@@ -829,7 +829,7 @@ func TestUrgentConflictConvergence(t *testing.T) {
 			ioctls := newFakeIoctls()
 			ioctls.copyHook = func(int, uint64, []byte) (int64, error) { return 0, tt.err }
 			h.ops = ioctls.ops()
-			h.handleFault(faultEvent{address: unitCHVA, uffdFD: 4}, make([]byte, PageSize))
+			h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 			if got := h.state.Get(0); got != tt.wantState {
 				t.Fatalf("state = %v, want %v", got, tt.wantState)
 			}
@@ -853,7 +853,7 @@ func TestStaleAbsentFaultConvergesWithoutError(t *testing.T) {
 	// handleAbsentFault is entered only after handleFault observed Absent.
 	// Model a tail completion changing the page before stateHardEnd scans it.
 	h.state.Set(0, StateLoaded)
-	h.handleAbsentFault(7, unitCHVA, 0, 0, make([]byte, PageSize))
+	h.handleAbsentFault(unitFD, unitCHVA, 0, 0, make([]byte, PageSize))
 
 	stats := h.Stats()
 	if stats["errors"] != 0 || stats["wakes"] != 1 {
@@ -884,7 +884,7 @@ func TestTailNoCompletionLeavesNeighborAbsent(t *testing.T) {
 	h.ops = ioctls.ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 6}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 	if h.state.Get(0) != StateLoaded || h.state.Get(1) != StateAbsent || h.state.Get(2) != StateAbsent {
 		t.Fatalf("states = %v/%v/%v, want Loaded/Absent/Absent", h.state.Get(0), h.state.Get(1), h.state.Get(2))
@@ -907,7 +907,7 @@ func TestZeroTailNoCompletionLeavesNeighborAbsent(t *testing.T) {
 	h.ops = ioctls.ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 6}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 	if h.state.Get(0) != StateLoaded || h.state.Get(1) != StateAbsent || h.state.Get(2) != StateAbsent {
 		t.Fatalf("zero states = %v/%v/%v, want Loaded/Absent/Absent", h.state.Get(0), h.state.Get(1), h.state.Get(2))
@@ -932,7 +932,7 @@ func TestDataTailCommitsPositivePartialPrefix(t *testing.T) {
 	h.ops = ioctls.ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 6}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 
 	calls := ioctls.snapshot()
@@ -966,7 +966,7 @@ func TestZeroTailCommitsPositivePartialPrefix(t *testing.T) {
 	h.ops = ioctls.ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 6}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 
 	calls := ioctls.snapshot()
@@ -1004,7 +1004,7 @@ func TestFaultAndTailAddNoAllocationsAboveSource(t *testing.T) {
 
 			allocs := testing.AllocsPerRun(100, func() {
 				h.state.SetRange(0, pages, StateAbsent)
-				h.handleFault(faultEvent{address: unitCHVA, uffdFD: 6}, pageBuf)
+				h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, pageBuf)
 				if h.tailBusy.Load() {
 					task := <-h.tailQ
 					h.processTail(task)
@@ -1028,7 +1028,7 @@ func TestBufferedChunkTailAddsNoAllocations(t *testing.T) {
 	h.ops = noAllocUffdOps()
 	task := tailTask{
 		kind:        tailBufferedData,
-		uffdFD:      6,
+		uffdFD:      unitFD,
 		dstVA:       unitCHVA + (faultPage+1)*PageSize,
 		pageIdx:     faultPage + 1,
 		start:       (faultPage + 1) * PageSize,
@@ -1055,7 +1055,7 @@ func TestUrgentRejectsInvalidIoctlCompletion(t *testing.T) {
 			ioctls := newFakeIoctls()
 			ioctls.copyHook = func(int, uint64, []byte) (int64, error) { return completed, nil }
 			h.ops = ioctls.ops()
-			h.handleFault(faultEvent{address: unitCHVA, uffdFD: 17}, make([]byte, PageSize))
+			h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 			if got := h.state.Get(0); got != StateAbsent {
 				t.Fatalf("invalid completion changed state to %v", got)
 			}
@@ -1066,26 +1066,28 @@ func TestUrgentRejectsInvalidIoctlCompletion(t *testing.T) {
 	}
 }
 
-func TestEventRemoveWinsTailConditionalCommit(t *testing.T) {
+func TestEventRemoveDiscardsTailBeforeInstallation(t *testing.T) {
 	source := newRecordingSnapshot(4*PageSize, sparse.Data, 0x77)
 	h := newUnitHandler(t, 4*PageSize, source)
 	ioctls := newFakeIoctls()
-	ioctls.copyHook = func(_ int, dst uint64, data []byte) (int64, error) {
-		length := uint64(len(data))
-		if dst == unitCHVA+PageSize {
-			h.state.SetRange(1, 4, StateReleased)
+	source.readHook = func(_ context.Context, off uint64, _ []byte) error {
+		if off == PageSize {
+			h.handleRemove(unitCHVA+PageSize, unitCHVA+4*PageSize, unitFD)
 		}
-		return int64(length), nil
+		return nil
 	}
 	h.ops = ioctls.ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 6}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 	for page := uint64(1); page < 4; page++ {
 		if got := h.state.Get(page); got != StateReleased {
 			t.Fatalf("stale tail changed page %d to %v", page, got)
 		}
+	}
+	if calls := ioctls.snapshot(); len(calls) != 1 || calls[0].length != PageSize {
+		t.Fatalf("released tail installed stale bytes: %+v", calls)
 	}
 	if h.Stats()["tail_conflicts"] == 0 {
 		t.Fatal("EVENT_REMOVE race did not record tail conflict")
@@ -1100,21 +1102,19 @@ func TestUrgentWinsRunningTail(t *testing.T) {
 	releaseTail := make(chan struct{})
 	var tailBlocked atomic.Bool
 	ioctls := newFakeIoctls()
-	ioctls.copyHook = func(_ int, dst uint64, data []byte) (int64, error) {
-		length := uint64(len(data))
-		if dst == unitCHVA+PageSize && tailBlocked.CompareAndSwap(false, true) {
+	source.readHook = func(_ context.Context, off uint64, _ []byte) error {
+		if off == PageSize && tailBlocked.CompareAndSwap(false, true) {
 			close(tailEntered)
 			<-releaseTail
-			return 0, unix.EEXIST
 		}
-		return int64(length), nil
+		return nil
 	}
 	h.ops = ioctls.ops()
 	startUnitTail(t, h)
 
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 8}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	receiveSignal(t, tailEntered)
-	h.handleFault(faultEvent{address: unitCHVA + PageSize, uffdFD: 8}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA + PageSize, uffdFD: unitFD}, make([]byte, PageSize))
 	close(releaseTail)
 	waitUnitTail(t, h)
 	if h.state.Get(1) != StateLoaded {
@@ -1132,16 +1132,16 @@ func TestFaultRunBoundStopsAtCHRegion(t *testing.T) {
 			const pages = 4
 			source := newRecordingSnapshot(pages*PageSize, kind, 0x63)
 			h := newUnitHandlerWithoutMap(t, pages*PageSize, source)
-			if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA, 2*PageSize, 0); err != nil {
+			if err := registerUnitRegion(h, ProcessCH, unitCHVA, 2*PageSize, 0); err != nil {
 				t.Fatal(err)
 			}
-			if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA+0x10_0000, 2*PageSize, 2*PageSize); err != nil {
+			if err := registerUnitRegion(h, ProcessCH, unitCHVA+0x10_0000, 2*PageSize, 2*PageSize); err != nil {
 				t.Fatal(err)
 			}
 			ioctls := newFakeIoctls()
 			h.ops = ioctls.ops()
 
-			h.handleFault(faultEvent{address: unitCHVA + PageSize, uffdFD: 11}, make([]byte, PageSize))
+			h.handleFault(faultEvent{address: unitCHVA + PageSize, uffdFD: unitFD}, make([]byte, PageSize))
 			if got := source.runLimits(); !equalUint64s(got, []uint64{PageSize}) {
 				t.Fatalf("RunAt limits = %v, want one page at split", got)
 			}
@@ -1391,7 +1391,7 @@ func (f *fakeIoctls) snapshot() []fakeIoctlCall {
 func newUnitHandler(t testing.TB, size uint64, source SnapshotReader) *Handler {
 	t.Helper()
 	h := newUnitHandlerWithoutMap(t, size, source)
-	if err := h.addrMap.RegisterVMA(ProcessCH, unitCHVA, size, 0); err != nil {
+	if err := registerUnitRegion(h, ProcessCH, unitCHVA, size, 0); err != nil {
 		t.Fatal(err)
 	}
 	return h
@@ -1477,4 +1477,16 @@ func equalUint64s(left, right []uint64) bool {
 		}
 	}
 	return true
+}
+
+const unitFD = 123
+
+func registerUnitRegion(h *Handler, process ProcessKind, va, size, off uint64) error {
+	if err := h.addrMap.RegisterVMA(process, va, size, off); err != nil {
+		return err
+	}
+	h.addrMap.mu.Lock()
+	h.addrMap.vmas[len(h.addrMap.vmas)-1].uffdFD = unitFD
+	h.addrMap.mu.Unlock()
+	return nil
 }

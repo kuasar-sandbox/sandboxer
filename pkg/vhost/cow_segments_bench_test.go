@@ -41,6 +41,7 @@ func segmentQueue(backend Backend, kind uint32, sizes []int) (*Server, *virtq, [
 	mem := make([]byte, dataStart+total+1)
 	s := NewServer("unused", backend, nil)
 	const uva = 0x1000
+	s.SetMemoryLoader(initializedTestMemory)
 	s.memTable.SetRegions([]MemRegion{{GuestPhysAddr: 0, UserspaceAddr: uva, MemorySize: uint64(len(mem)), mmapBytes: mem}})
 	q := &virtq{num: uint32(num), descAddr: uva}
 	put := func(i, addr, length int, flags uint16) {

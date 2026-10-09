@@ -370,6 +370,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	// reach it after ctx cancellation.
 	var uffdHandler *uffd.Handler
 	var uffdHandlerMu sync.Mutex
+	uffdReady := make(chan struct{})
 	defer func() {
 		uffdHandlerMu.Lock()
 		h := uffdHandler
@@ -384,7 +385,7 @@ func ServeAndWait(p VMParams) (int, error) {
 		AddrMap:           addrMap,
 		Logf:              logf,
 		HandshakeDeadline: p.VAReportDeadline,
-		OnReady: func(uffdFD int, vaStart, size uint64) error {
+		OnReady: func(uffdFD int, vaStart, size, memfdOffset uint64) error {
 			numWorkers := 0
 			if p.SnapCfg != nil && p.SnapCfg.Resources.Capacity.CPU > 0 {
 				numWorkers = int(p.SnapCfg.Resources.Capacity.CPU)
@@ -405,18 +406,19 @@ func ServeAndWait(p VMParams) (int, error) {
 			h.Start()
 			uffdHandlerMu.Lock()
 			uffdHandler = h
+			close(uffdReady)
 			uffdHandlerMu.Unlock()
 			logf("uffd handler: adopted CH uffd region #0 fd=%d size=%d", uffdFD, size)
 			return nil
 		},
-		OnRegister: func(uffdFD int, vaStart, size uint64) error {
+		OnRegister: func(uffdFD int, vaStart, size, memfdOffset uint64) error {
 			uffdHandlerMu.Lock()
 			h := uffdHandler
 			uffdHandlerMu.Unlock()
 			if h == nil {
 				return fmt.Errorf("OnRegister called before OnReady (no handler yet)")
 			}
-			if err := h.AddUffd(uffdFD); err != nil {
+			if err := h.AddUffd(uffdFD, vaStart, size, memfdOffset); err != nil {
 				return err
 			}
 			logf("uffd handler: attached additional region fd=%d size=%d", uffdFD, size)
@@ -440,6 +442,19 @@ func ServeAndWait(p VMParams) (int, error) {
 	addServer := func(sock string, backend vhost.Backend, label, path string, ro bool) error {
 		s := vhost.NewServer(sock, backend, logf)
 		s.SetReadFatal(reportReadFatal)
+		s.SetMemoryLoader(func(ctx context.Context, off, length uint64) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-backendCtx.Done():
+				return context.Cause(backendCtx)
+			case <-uffdReady:
+			}
+			uffdHandlerMu.Lock()
+			h := uffdHandler
+			uffdHandlerMu.Unlock()
+			return h.EnsureLoaded(ctx, off, length)
+		})
 		s.EnableStats(label, path)
 		s.SetMemfd(memfd.Inode(), memfd.Bytes())
 		if err := s.Listen(); err != nil {
@@ -454,6 +469,9 @@ func ServeAndWait(p VMParams) (int, error) {
 			s.Stop()
 		}
 	}
+	// Early errors must cancel readiness/source waits before draining queues,
+	// and drain all backends before deferred handler/memfd destruction.
+	defer func() { cancelBackends(); stopServers() }()
 	if p.owner != nil && p.owner.deviceSet != nil {
 		for i, b := range p.owner.deviceSet.DeviceBackends() {
 			if err := addServer(filepath.Join(runDir, fmt.Sprintf("blk%d.sock", i)), b, fmt.Sprintf("blk%d", i), "unbound", b.ReadOnly()); err != nil {
@@ -838,6 +856,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	defer muxLink.Teardown()
 
 	var backendWG sync.WaitGroup
+	defer func() { cancelBackends(); backendWG.Wait() }()
 	backendWG.Add(len(servers) + 3) // N vhost servers + launch + vaReport + ctl
 	for _, s := range servers {
 		go func() { defer backendWG.Done(); _ = s.Serve(backendCtx) }()

@@ -29,6 +29,8 @@ type vma struct {
 	start       uint64
 	end         uint64
 	memfdOffset uint64
+	uffdFD      int  // positive only after handler adoption; zero is pending
+	invalid     bool // UNMAP permanently invalidates this interval
 }
 
 // AddressMap translates a CH userfaultfd event VA into the memfd-relative
@@ -58,8 +60,11 @@ func NewAddressMap(memfdLen uint64) *AddressMap {
 // previously-registered range owned by the same process (catches
 // duplicate-region registration mistakes early).
 func (m *AddressMap) RegisterVMA(p ProcessKind, vaStart, size, memfdOffset uint64) error {
-	if size == 0 {
-		return fmt.Errorf("uffd: AddressMap RegisterVMA size=0")
+	if p != ProcessCH && p != ProcessBackend {
+		return fmt.Errorf("uffd: unknown VMA owner %d", p)
+	}
+	if size == 0 || vaStart > ^uint64(0)-size || vaStart%PageSize != 0 || size%PageSize != 0 || memfdOffset%PageSize != 0 {
+		return fmt.Errorf("uffd: invalid or unaligned VMA range")
 	}
 	if memfdOffset+size > m.memfdLen || memfdOffset+size < memfdOffset {
 		return fmt.Errorf("uffd: AddressMap RegisterVMA range [0x%x,+0x%x) exceeds memfdLen 0x%x",
@@ -71,6 +76,9 @@ func (m *AddressMap) RegisterVMA(p ProcessKind, vaStart, size, memfdOffset uint6
 		v := &m.vmas[i]
 		if v.process != p {
 			continue
+		}
+		if vaStart < v.end && v.start < vaStart+size {
+			return fmt.Errorf("uffd: overlapping virtual address intervals")
 		}
 		newEnd := memfdOffset + size
 		oldEnd := v.memfdOffset + (v.end - v.start)
@@ -188,4 +196,88 @@ func (m *AddressMap) BackendVAFor(memfdOffset, reqLen uint64) (uint64, uint64, b
 		}
 	}
 	return 0, 0, false
+}
+
+// bindInitial adopts the sole staged CH region. No handler is published yet.
+func (m *AddressMap) bindInitial(fd int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	found := -1
+	for i, v := range m.vmas {
+		if v.process == ProcessCH {
+			if found >= 0 || v.uffdFD != 0 || v.invalid {
+				return fmt.Errorf("uffd: initial registration must be one unowned CH region")
+			}
+			found = i
+		}
+	}
+	if found < 0 {
+		return fmt.Errorf("uffd: missing initial CH registration")
+	}
+	m.vmas[found].uffdFD = fd
+	return nil
+}
+
+// removeStaged rolls back a rejected first va_report; active maps are untouched.
+func (m *AddressMap) removeStaged(va, size, off uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, v := range m.vmas {
+		if v.process == ProcessCH && v.start == va && v.end-va == size && v.memfdOffset == off && v.uffdFD == 0 {
+			m.vmas = append(m.vmas[:i], m.vmas[i+1:]...)
+			return
+		}
+	}
+}
+
+// registration returns pending (fd=0) separately from an invalidated interval.
+func (m *AddressMap) registration(off, length uint64) (va uint64, fd int, covered uint64, err error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, v := range m.vmas {
+		if v.process != ProcessCH || off < v.memfdOffset || off-v.memfdOffset >= v.end-v.start {
+			continue
+		}
+		if v.invalid {
+			return 0, 0, 0, fmt.Errorf("uffd: unmapped registration at offset 0x%x", off)
+		}
+		return v.start + (off - v.memfdOffset), v.uffdFD, min(length, v.end-v.start-(off-v.memfdOffset)), nil
+	}
+	return 0, 0, 0, nil
+}
+
+func (m *AddressMap) owns(fd int, va, off, length uint64) bool {
+	actualVA, actualFD, covered, err := m.registration(off, length)
+	return err == nil && actualFD == fd && fd > 0 && actualVA == va && covered == length
+}
+
+// invalidate keeps a tombstone: a mandatory load must fail, never wait forever
+// or adopt a different fd for memory whose CH mapping was removed.
+func (m *AddressMap) invalidate(fd int, start, end uint64) {
+	if end <= start || start%PageSize != 0 || end%PageSize != 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := 0; i < len(m.vmas); i++ {
+		v := m.vmas[i]
+		if v.process != ProcessCH || v.uffdFD != fd || v.invalid || start >= v.end || v.start >= end {
+			continue
+		}
+		lo, hi := max(start, v.start), min(end, v.end)
+		if v.start < lo {
+			prefix := v
+			prefix.end = lo
+			m.vmas = append(m.vmas, prefix)
+		}
+		if hi < v.end {
+			suffix := v
+			suffix.start = hi
+			suffix.memfdOffset += hi - v.start
+			m.vmas = append(m.vmas, suffix)
+		}
+		v.memfdOffset += lo - v.start
+		v.start, v.end, v.invalid = lo, hi, true
+		m.vmas[i] = v
+	}
 }

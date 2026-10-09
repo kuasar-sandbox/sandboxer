@@ -1,8 +1,10 @@
 package vhost
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -32,6 +34,8 @@ type MemRegion struct {
 // shared memfd slab; this table never owns/unmaps them.
 type MemTable struct {
 	regions []MemRegion
+	// EnsureLoaded must be bound before serving, including cold start.
+	EnsureLoaded func(context.Context, uint64, uint64) error
 }
 
 // SetRegions replaces the memory table atomically. The previous regions'
@@ -49,39 +53,55 @@ func (m *MemTable) SetRegions(regs []MemRegion) {
 // guest memory. The slice is valid until the next SetRegions call replaces
 // the underlying mmap (which only happens at SET_MEM_TABLE — well outside
 // any in-flight request).
-func (m *MemTable) TranslateGPA(gpa uint64, length uint64) ([]byte, error) {
-	for i := range m.regions {
-		r := &m.regions[i]
-		if gpa >= r.GuestPhysAddr && gpa+length <= r.GuestPhysAddr+r.MemorySize {
-			off := gpa - r.GuestPhysAddr
-			return r.mmapBytes[off : off+length], nil
-		}
-	}
-	return nil, fmt.Errorf("vhost: GPA 0x%x len %d not in any region", gpa, length)
+func (m *MemTable) TranslateGPA(ctx context.Context, gpa, length uint64) ([]byte, error) {
+	return m.translate(ctx, gpa, length, false)
 }
 
-// TranslateUVA converts a master-process user virtual address + length
-// into a backend HVA pointing at the same bytes. Used for ring base
-// addresses (SET_VRING_ADDR delivers master UVAs per vhost-user spec:
-// desc_user_addr / used_user_addr / avail_user_addr). The translation
-// uses the region's UserspaceAddr (master's HVA at the region's start)
-// to compute the offset, which is independent of whether master and
-// slave mmap'd the fd at the same address.
-func (m *MemTable) TranslateUVA(uva uint64, length uint64) ([]byte, error) {
-	for i := range m.regions {
-		r := &m.regions[i]
-		if uva >= r.UserspaceAddr && uva+length <= r.UserspaceAddr+r.MemorySize {
-			off := uva - r.UserspaceAddr
-			return r.mmapBytes[off : off+length], nil
-		}
-	}
-	return nil, fmt.Errorf("vhost: UVA 0x%x len %d not in any region", uva, length)
+// TranslateUVA translates ring addresses in the master's address space.
+func (m *MemTable) TranslateUVA(ctx context.Context, uva, length uint64) ([]byte, error) {
+	return m.translate(ctx, uva, length, true)
 }
 
-// TranslateGPAsingleByte returns the HVA for a single byte at gpa.
-// Convenience for very small reads (status byte).
-func (m *MemTable) TranslateGPAsingleByte(gpa uint64) (*byte, error) {
-	b, err := m.TranslateGPA(gpa, 1)
+func (m *MemTable) translate(ctx context.Context, addr, length uint64, uva bool) ([]byte, error) {
+	fail := func(err error) ([]byte, error) { return nil, readretry.Terminal(err) }
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	if m.EnsureLoaded == nil {
+		return fail(fmt.Errorf("vhost: memory population callback is not bound"))
+	}
+	if length > ^uint64(0)-addr {
+		return fail(fmt.Errorf("vhost: address range overflow"))
+	}
+	for i := range m.regions {
+		r := &m.regions[i]
+		base := r.GuestPhysAddr
+		if uva {
+			base = r.UserspaceAddr
+		}
+		if addr < base {
+			continue
+		}
+		off := addr - base
+		if off > r.MemorySize || length > r.MemorySize-off {
+			continue
+		}
+		if off > uint64(len(r.mmapBytes)) || length > uint64(len(r.mmapBytes))-off || off > ^uint64(0)-r.MmapOffset || length > ^uint64(0)-(r.MmapOffset+off) {
+			return fail(fmt.Errorf("vhost: invalid memory region coverage"))
+		}
+		if err := m.EnsureLoaded(ctx, r.MmapOffset+off, length); err != nil {
+			return fail(fmt.Errorf("vhost: prepare memory: %w", err))
+		}
+		if err := ctx.Err(); err != nil {
+			return fail(err)
+		}
+		return r.mmapBytes[off : off+length], nil
+	}
+	return fail(fmt.Errorf("vhost: address 0x%x len %d not in any region", addr, length))
+}
+
+func (m *MemTable) TranslateGPAsingleByte(ctx context.Context, gpa uint64) (*byte, error) {
+	b, err := m.TranslateGPA(ctx, gpa, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -147,6 +167,9 @@ func ParseSetMemTable(payload []byte, fds []int) ([]MemRegion, error) {
 // The backend never opens its own mmap — the kernel page cache shares
 // pages between sandbox-ctl's mapping and CH's mapping naturally.
 func BindRegions(regs []MemRegion, fds []int, expectedInode uint64, slab []byte) error {
+	if len(fds) != len(regs) {
+		return fmt.Errorf("vhost: region/fd count mismatch")
+	}
 	if len(slab) == 0 {
 		return fmt.Errorf("vhost: BindRegions called with empty memfd slab")
 	}
@@ -162,7 +185,7 @@ func BindRegions(regs []MemRegion, fds []int, expectedInode uint64, slab []byte)
 		off := regs[i].MmapOffset
 		size := regs[i].MemorySize
 		end := off + size
-		if end > uint64(len(slab)) {
+		if off > uint64(len(slab)) || size > uint64(len(slab))-off || size > ^uint64(0)-regs[i].GuestPhysAddr || size > ^uint64(0)-regs[i].UserspaceAddr {
 			return fmt.Errorf("vhost: region %d mmap_offset=0x%x size=0x%x exceeds slab len=0x%x",
 				i, off, size, len(slab))
 		}

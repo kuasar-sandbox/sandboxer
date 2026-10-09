@@ -161,7 +161,7 @@ func TestRequiredChunkWindowRecoveryOwnsTailBuffer(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				h.handleFault(faultEvent{address: unitCHVA, uffdFD: 9}, make([]byte, PageSize))
+				h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 			}()
 			receiveSignal(t, window.entered)
 			if !h.tailBusy.Load() || len(ops.snapshot()) != 0 {
@@ -212,7 +212,7 @@ func TestRequiredFaultRetriesButTailRemainsBestEffort(t *testing.T) {
 	ops := newFakeIoctls()
 	h.ops = ops.ops()
 	startUnitTail(t, h)
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 12}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	waitUnitTail(t, h)
 	if urgent.Load() != 4 || tail.Load() != 1 || h.state.Get(0) != StateLoaded || h.state.Get(1) != StateAbsent || h.Stats()["errors"] != 0 {
 		t.Fatalf("urgent=%d tail=%d states=%v/%v", urgent.Load(), tail.Load(), h.state.Get(0), h.state.Get(1))
@@ -226,7 +226,7 @@ func TestRequiredFaultPermanentEOFDoesNotInstallOrWake(t *testing.T) {
 	h.ops = ops.ops()
 	var fatal error
 	h.cfg.ReadFatal = func(err error) { fatal = err }
-	h.handleFault(faultEvent{address: unitCHVA, uffdFD: 12}, make([]byte, PageSize))
+	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
 	if fatal == nil || !errors.Is(fatal, io.EOF) || h.state.Get(0) != StateAbsent || h.stats.copies.Load() != 0 || h.stats.wakes.Load() != 0 {
 		t.Fatalf("fatal=%v stats=%v", fatal, h.Stats())
 	}
@@ -241,6 +241,9 @@ func TestRealUffdRemoveDuringReadRecovery(t *testing.T) {
 	}
 	defer unix.Munmap(mem)
 	fd, err := createUffd(unix.O_CLOEXEC | unix.O_NONBLOCK | 1)
+	if err == unix.EINVAL {
+		fd, err = createUffd(unix.O_CLOEXEC | unix.O_NONBLOCK)
+	}
 	if err != nil {
 		t.Fatalf("real userfaultfd required: %v", err)
 	}
@@ -272,6 +275,9 @@ func TestRealUffdRemoveDuringReadRecovery(t *testing.T) {
 	if err = h.addrMap.RegisterVMA(ProcessCH, va, PageSize, 0); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.addrMap.bindInitial(fd); err != nil {
+		t.Fatal(err)
+	}
 	h.ops = realUffdOps
 	done := make(chan struct{})
 	go func() { defer close(done); h.handleFault(faultEvent{address: va, uffdFD: fd}, make([]byte, PageSize)) }()
@@ -282,7 +288,15 @@ func TestRealUffdRemoveDuringReadRecovery(t *testing.T) {
 	var event [32]byte
 	deadline := time.Now().Add(time.Second)
 	for {
+		h.installMu.Lock()
 		n, err := unix.Read(fd, event[:])
+		if n == 32 {
+			msg := (*uffdMsg)(unsafe.Pointer(&event[0]))
+			if msg.Event == uffdEventRemove {
+				h.dispatchRelease(msg, fd)
+			}
+		}
+		h.installMu.Unlock()
 		if n == 32 {
 			break
 		}
@@ -298,8 +312,7 @@ func TestRealUffdRemoveDuringReadRecovery(t *testing.T) {
 	if msg.Event != uffdEventRemove {
 		t.Fatalf("event=%x", msg.Event)
 	}
-	remove := (*uffdMsgRemove)(unsafe.Pointer(&msg.Arg[0]))
-	h.state.SetRange((remove.Start-va)/PageSize, (remove.End-va)/PageSize, StateReleased)
+
 	close(release)
 	receiveSignal(t, done)
 	if !bytes.Equal(mem, make([]byte, PageSize)) {

@@ -60,3 +60,26 @@ func TestAddressMapCHRegionBounds(t *testing.T) {
 		t.Fatal("CHRegionBounds found an offset outside every CH region")
 	}
 }
+
+func TestAddressMapRejectsInvalidRegistrationRanges(t *testing.T) {
+	for _, r := range [][3]uint64{
+		{0x1000, 0, 0}, {0x1001, PageSize, 0}, {0x1000, PageSize - 1, 0},
+		{0x1000, PageSize, 1}, {^uint64(0) - PageSize + 1, PageSize, 0},
+		{0x1000, 2 * PageSize, PageSize}, {0x1000, PageSize, ^uint64(0) - PageSize + 1},
+	} {
+		m := NewAddressMap(2 * PageSize)
+		if err := m.RegisterVMA(ProcessCH, r[0], r[1], r[2]); err == nil {
+			t.Fatalf("accepted invalid registration: %v", r)
+		}
+		if len(m.vmas) != 0 {
+			t.Fatal("failed validation published a map")
+		}
+	}
+	m := NewAddressMap(2 * PageSize)
+	if err := m.RegisterVMA(ProcessCH, 0x1000, PageSize, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RegisterVMA(ProcessCH, 0x1000, PageSize, PageSize); err == nil {
+		t.Fatal("overlapping CH VA with distinct memfd offsets accepted")
+	}
+}
