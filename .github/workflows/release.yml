@@ -246,6 +246,7 @@ jobs:
         with:
           selection: workbench-selection/workbench.json
           sources: src
+          cache-coverage: release-sandboxer
           outputs: sandboxer/release-bundle
           arch: ${{ matrix.arch }}
           cpus: '2'
