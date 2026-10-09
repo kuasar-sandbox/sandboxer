@@ -241,7 +241,39 @@ jobs:
           ref: ${{ needs.preflight.outputs.connector_sha }}
           path: src/connector
           persist-credentials: false
-      - name: Build, test and package in native Workbench
+      - name: Test exact sandboxer source with real UFFD
+        if: matrix.arch == 'x86_64'
+        run: |
+          set -euo pipefail
+          python3 -B trusted/platform/ci/hosted/workbench.py start --mode system \
+            --selection workbench-selection/workbench.json --sources src \
+            --root "$RUNNER_TEMP/sandboxer-release-tests" --arch x86_64 --cpus 2 --memory-gib 8
+          test_script=$(cat <<'WORKBENCH_TEST'
+          cd /src
+          go work init ./accelerator ./connector ./sandboxer
+          cd sandboxer
+          [ "$(git rev-parse HEAD)" = '${{ needs.preflight.outputs.source_sha }}' ]
+          make test
+          WORKBENCH_TEST
+          )
+          python3 -B trusted/platform/ci/hosted/workbench.py exec \
+            --root "$RUNNER_TEMP/sandboxer-release-tests" --timeout 3600 -- \
+            bash -euo pipefail -c "$test_script"
+      - name: Stop the owned release test instance and retain diagnostics
+        if: always() && matrix.arch == 'x86_64'
+        run: |
+          python3 -B trusted/platform/ci/hosted/workbench.py finish \
+            --root "$RUNNER_TEMP/sandboxer-release-tests" \
+            --evidence "$RUNNER_TEMP/sandboxer-release-test-evidence"
+      - name: Upload release source test diagnostics
+        if: always() && matrix.arch == 'x86_64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: sandboxer-release-source-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sandboxer-release-test-evidence
+          if-no-files-found: error
+          retention-days: 7
+      - name: Build vet and package in native Workbench
         uses: ./trusted/platform/.github/actions/workbench
         with:
           selection: workbench-selection/workbench.json
@@ -259,7 +291,7 @@ jobs:
             go work init ./accelerator ./connector ./sandboxer
             cd sandboxer
             [ "$(git rev-parse HEAD)" = '${{ needs.preflight.outputs.source_sha }}' ]
-            if [ "$TARGET_ARCH" = x86_64 ]; then make test; make vet; fi
+            if [ "$TARGET_ARCH" = x86_64 ]; then make vet; fi
             bash /inputs/release/ci/native-cache/native-cache.sh restore-or-build cloud-hypervisor
             make build
             export SOURCE_DATE_EPOCH

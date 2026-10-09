@@ -208,7 +208,9 @@ assert "runs-on: ${{ matrix.runner }}" in build
 assert "artifact-cross" not in build and "bootstrap.sh" not in build, "component builds may not install host toolchains"
 assert "uses: ./trusted/platform/.github/actions/workbench" in build
 assert "native-cache.sh restore-or-build cloud-hypervisor" in build
-assert "if [ \"$TARGET_ARCH\" = x86_64 ]; then make test; make vet; fi" in build, "existing source-test coverage changed"
+assert "start --mode system" in build and "make test" in build, "real UFFD tests require system mode"
+assert 'if [ "$TARGET_ARCH" = x86_64 ]; then make vet; fi' in build, "ordinary vet coverage changed"
+assert build.index("Test exact sandboxer source with real UFFD") < build.index("Build vet and package in native Workbench"), "tests must use the fresh admitted source copy"
 for job in (build, publish):
     assert "ref: ${{ needs.preflight.outputs.framework_sha }}" in job, "framework checkout must match the frozen selection"
     assert "selection: workbench-selection/workbench.json" in job
