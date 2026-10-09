@@ -244,22 +244,21 @@ do_build() (
     # exclusive target directory, rather than changing every crate fingerprint
     # on retries or identical builds because of an mktemp suffix.
     pending_map="$CH_BUILD_OUT/link.map.pending"
-    cleanup_build() {
-        local status=$?
-        rm -f "$pending_report" "$pending_map"
-        if [ "$status" -ne 0 ]; then
-            # Cargo can have completed before publication failed. Removing its
-            # exact executable forces the retry to relink and regenerate the
-            # deleted map, without changing the stable compiler arguments.
-            rm -f "$CH_BUILD_OUT/$artifact_subdir/cloud-hypervisor"
-        fi
-        return "$status"
-    }
-    trap cleanup_build EXIT
+    trap 'rm -f "$pending_report" "$pending_map"' EXIT
     rm -f "$pending_map"
     # A failed or interrupted attempt must not make an old binary reusable with
     # new observations. The existing report is published last, after all outputs.
     : > "$report"
+    if [ -d "$CH_BUILD_OUT/$artifact_subdir" ]; then
+        # A fresh Cargo executable does not recreate a missing linker map. The
+        # complete binary/record set returned above; an incomplete local set
+        # must relink this package. Keep all dependency artifacts and use Cargo's
+        # package-specific cleanup instead of its internal fingerprint layout.
+        log "incomplete Cloud Hypervisor materials: relink this package only"
+        env "${cargo_env[@]}" CARGO_TARGET_DIR="$CH_BUILD_OUT" TMPDIR="$CH_BUILD_OUT" \
+            cargo clean --release --locked "${cargo_target_args[@]}" \
+            --manifest-path "$CH_SRC/Cargo.toml" --package cloud-hypervisor
+    fi
     env "${cargo_env[@]}" CARGO_TARGET_DIR="$CH_BUILD_OUT" TMPDIR="$CH_BUILD_OUT" \
         cargo rustc --release --locked "${cargo_target_args[@]}" \
         --message-format=json-render-diagnostics \

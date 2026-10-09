@@ -119,12 +119,18 @@ CH_TEST_REAL_CHMOD="$(command -v chmod)"
 cat > "$ch_test_tools/cargo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "$1" = clean ]; then
+  [ "$*" = "clean --release --locked --manifest-path $CH_SRC/Cargo.toml --package cloud-hypervisor" ]
+  printf 'clean\n' >> "$CH_TEST_CLEANS"
+  rm -f "$CARGO_TARGET_DIR/release/cloud-hypervisor"
+  exit 0
+fi
 printf 'build\n' >> "$CH_TEST_CALLS"
 map="${!#}"
 map="${map#link-arg=-Wl,-Map,}"
 printf '%s\n' "$map" >> "$CH_TEST_MAPS"
 # Cargo does not relink a fresh binary just because the side-effect map was
-# deleted. A failed publication must invalidate its exact executable too.
+# deleted. A failed publication must invalidate this package through Cargo.
 if [ -f "$CARGO_TARGET_DIR/release/cloud-hypervisor" ]; then
   printf '%s\n' '{"reason":"build-finished","success":true}'
   exit 0
@@ -160,7 +166,8 @@ for failure in copy cargo mode; do
   ch_test_env=(PATH="$ch_test_tools:$PATH" STAGE=build RUST_TARGET=''
     CH_SRC="$run/source" CH_BUILD_OUT="$run/out" BINDIR="$run/bin"
     CH_BUILD_REPORT="$run/out/build-report.jsonl" CH_LINK_MAP="$run/out/link.map"
-    CARGO_HOME="$run/cargo-home" CH_TEST_CALLS="$run/calls" CH_TEST_MAPS="$run/maps")
+    CARGO_HOME="$run/cargo-home" CH_TEST_CALLS="$run/calls" CH_TEST_MAPS="$run/maps"
+    CH_TEST_CLEANS="$run/cleans")
   if env "${ch_test_env[@]}" CH_TEST_FAIL="$failure" bash \
       "$ROOT/native-deps/deps/build-cloud-hypervisor.sh" > "$run/failure.log" 2>&1; then
     fail "normal CH build accepted $failure failure"
@@ -169,8 +176,6 @@ for failure in copy cargo mode; do
     || fail "failed CH $failure left a reusable report beside an incomplete output set"
   [ ! -e "$run/out/link.map.pending" ] \
     || fail "failed CH $failure retained a pending map"
-  [ ! -e "$run/out/release/cloud-hypervisor" ] \
-    || fail "failed CH $failure left a fresh Cargo output without its map"
   env "${ch_test_env[@]}" CH_TEST_FAIL='' bash \
     "$ROOT/native-deps/deps/build-cloud-hypervisor.sh" > "$run/retry.log" 2>&1
   [ "$(wc -l < "$run/calls")" -eq 2 ] || fail "CH retry skipped an incomplete prior build"
@@ -181,9 +186,11 @@ for failure in copy cargo mode; do
   cmp "$run/expected-maps" "$run/maps" \
     || fail "CH retry changed the actual linker map argument"
   [ ! -e "$run/out/link.map.pending" ] || fail "successful CH build retained a pending map"
+  [ "$(wc -l < "$run/cleans")" -eq 1 ] || fail "CH retry did not invalidate only its package once"
   env "${ch_test_env[@]}" CH_TEST_FAIL='' bash \
     "$ROOT/native-deps/deps/build-cloud-hypervisor.sh" > "$run/reuse.log" 2>&1
   [ "$(wc -l < "$run/calls")" -eq 2 ] || fail "CH did not reuse a completed binary/record set"
+  [ "$(wc -l < "$run/cleans")" -eq 1 ] || fail "CH reuse invalidated completed materials"
 done
 printf 'test-native-materials: CH failed-build rejection, retry and completed-set reuse PASS\n'
 )
