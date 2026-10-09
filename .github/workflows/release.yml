@@ -131,17 +131,27 @@ jobs:
           release=$(gh api "repos/$repository/releases/tags/$version")
           jq -e --arg tag "$version" --arg sha "$sha" '.tag_name == $tag and .target_commitish == $sha and .draft == false' <<< "$release" >/dev/null
           echo "connector_sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Select verified Workbench images once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 trusted/platform/ci/hosted/workbench.py select \
+            --framework-sha '${{ steps.framework.outputs.sha }}' --output workbench.json
+      - name: Share the immutable Workbench selection
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: workbench-selection-${{ github.run_id }}
+          path: workbench.json
+          if-no-files-found: error
+          retention-days: 1
     if: github.event.repository.visibility == 'public' && github.event.repository.full_name == github.repository
   build:
     needs: preflight
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     permissions:
       contents: read
     env:
-      TARGET_ARCH: ${{ matrix.arch }}
-      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
       ACCELERATOR_VERSION: ${{ needs.preflight.outputs.accelerator_version }}
       CONNECTOR_VERSION: ${{ needs.preflight.outputs.connector_version }}
     steps:
@@ -152,11 +162,11 @@ jobs:
           ref: ${{ needs.preflight.outputs.framework_sha }}
           path: trusted/platform
           persist-credentials: false
-      - name: Bootstrap native or cross build
-        run: |
-          profile=artifact-build
-          if [ "$TARGET_ARCH" = aarch64 ]; then profile=artifact-cross; fi
-          bash trusted/platform/ci/hosted/bootstrap.sh --profile "$profile"
+      - name: Download the immutable Workbench selection
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: workbench-selection-${{ github.run_id }}
+          path: workbench-selection
       - name: Verify dependency releases
         env:
           GH_TOKEN: ${{ github.token }}
@@ -231,32 +241,31 @@ jobs:
           ref: ${{ needs.preflight.outputs.connector_sha }}
           path: src/connector
           persist-credentials: false
-      - name: Assemble source workspace
-        run: |
-          set -euo pipefail
-          rm -f go.work go.work.sum
-          go work init ./src/accelerator ./src/connector ./src/sandboxer
-          mkdir -p src/sandboxer/native-deps/build
-          ln -sfn "$KUASAR_TARBALL_CACHE" src/sandboxer/native-deps/build/tarball
-      - name: Build and test sandboxer
-        working-directory: src/sandboxer
-        run: |
-          taskset -pc "$KUASAR_BUILD_CPUS" "$$" >/dev/null
-          set -euo pipefail
-          # /tmp is tmpfs on the runner; Go tests need a short, real disk-backed path.
-          export TMPDIR=/var/tmp
-          if [ "$TARGET_ARCH" = x86_64 ]; then make test; make vet; fi
-          make build
-      - name: Package the component release
-        working-directory: src/sandboxer
-        env:
-          VERSION: ${{ needs.preflight.outputs.version }}
-        run: |
-          set -euo pipefail
-          [ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]
-          export SOURCE_DATE_EPOCH
-          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${{ needs.preflight.outputs.source_sha }}")
-          bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle
+      - name: Build, test and package in native Workbench
+        uses: ./trusted/platform/.github/actions/workbench
+        with:
+          selection: workbench-selection/workbench.json
+          sources: src
+          cache-coverage: release-sandboxer
+          outputs: sandboxer/release-bundle
+          arch: ${{ matrix.arch }}
+          cpus: '2'
+          memory-gib: '8'
+          run: |
+            set -euo pipefail
+            export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse CARGO_NET_GIT_FETCH_WITH_CLI=true
+            export ACCELERATOR_VERSION='${{ needs.preflight.outputs.accelerator_version }}'
+            export CONNECTOR_VERSION='${{ needs.preflight.outputs.connector_version }}'
+            go work init ./accelerator ./connector ./sandboxer
+            cd sandboxer
+            [ "$(git rev-parse HEAD)" = '${{ needs.preflight.outputs.source_sha }}' ]
+            if [ "$TARGET_ARCH" = x86_64 ]; then make test; make vet; fi
+            bash /inputs/release/ci/native-cache/native-cache.sh restore-or-build cloud-hypervisor
+            make build
+            export SOURCE_DATE_EPOCH
+            SOURCE_DATE_EPOCH=$(git show -s --format=%ct '${{ needs.preflight.outputs.source_sha }}')
+            bash scripts/release.sh package '${{ needs.preflight.outputs.version }}' "$TARGET_ARCH" release-bundle
+            bash scripts/release.sh validate '${{ needs.preflight.outputs.version }}' "$TARGET_ARCH" release-bundle
       - name: Upload validated release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -268,17 +277,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch:
-          - x86_64
-          - aarch64
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
   publish:
     needs:
       - preflight
       - build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: write
+    env:
+      RELEASE_ARCHIVE_VALIDATOR: ${{ github.workspace }}/validator-src/sandboxer/build/release-archive-validator
     steps:
       - name: Check out trusted publish tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -291,6 +304,33 @@ jobs:
           ref: ${{ needs.preflight.outputs.framework_sha }}
           path: trusted/platform
           persist-credentials: false
+      - name: Download the immutable Workbench selection
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: workbench-selection-${{ github.run_id }}
+          path: workbench-selection
+      - name: Check out the exact trusted archive parser source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: validator-src/sandboxer
+          persist-credentials: false
+      - name: Compile the trusted archive parser without publish credentials
+        uses: ./trusted/platform/.github/actions/workbench
+        with:
+          cache: 'false'
+          selection: workbench-selection/workbench.json
+          sources: validator-src
+          outputs: sandboxer/build/release-archive-validator
+          arch: x86_64
+          cpus: '2'
+          memory-gib: '8'
+          run: |
+            set -euo pipefail
+            mkdir -p /src/sandboxer/build
+            GO111MODULE=off GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GOOS='' GOARCH='' \
+              GOAMD64=v1 CGO_ENABLED=0 GOEXPERIMENT='' go build -p "$KUASAR_BUILD_JOBS" \
+              -o /src/sandboxer/build/release-archive-validator /src/sandboxer/scripts/release-archive-validator.go
       - name: Bootstrap standard runner
         run: |
           bash trusted/platform/ci/hosted/bootstrap.sh --profile release-control

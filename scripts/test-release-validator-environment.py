@@ -12,6 +12,38 @@ FUNCTION = re.search(r"(?ms)^validate_archive_contract\(\) \{\n.*?^\}", (ROOT / 
 
 
 class ValidatorEnvironment(unittest.TestCase):
+    def test_precompiled_parser_keeps_validation_without_invoking_go(self):
+        with tempfile.TemporaryDirectory(prefix="archive-precompiled-parser-") as temporary:
+            work = Path(temporary)
+            validator = work / "release-archive-validator"
+            environment = dict(os.environ, GO111MODULE="off", GOENV="off", GOFLAGS="", GOWORK="off",
+                               GOTOOLCHAIN="local", GOOS="", GOARCH="", GOAMD64="v1", CGO_ENABLED="0", GOEXPERIMENT="")
+            subprocess.run(["go", "build", "-o", str(validator), str(ROOT / "scripts/release-archive-validator.go")],
+                           env=environment, capture_output=True, text=True, timeout=90, check=True)
+            archive = work / "empty.tar.gz"
+            with tarfile.open(archive, "w:gz"):
+                pass
+            tools = work / "tools"
+            tools.mkdir()
+            marker = work / "compiler-invoked"
+            compiler = tools / "go"
+            compiler.write_text('#!/bin/sh\ntouch "$COMPILER_MARKER"\nexit 91\n')
+            compiler.chmod(0o755)
+            command = 'set -euo pipefail\nROOT=$1\nfail() { echo "$*" >&2; exit 1; }\n' + FUNCTION + '\nvalidate_archive_contract "$2"\n'
+            env = {**environment, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                   "COMPILER_MARKER": str(marker), "RELEASE_ARCHIVE_VALIDATOR": str(validator)}
+            result = subprocess.run(["bash", "-c", command, "_", str(ROOT), str(archive)],
+                                    cwd=work, env=env, text=True, capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("release archive: missing member", result.stderr)
+            self.assertFalse(marker.exists())
+            validator.unlink()
+            result = subprocess.run(["bash", "-c", command, "_", str(ROOT), str(archive)],
+                                    cwd=work, env=env, text=True, capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("prebuilt release archive validator is not executable", result.stderr)
+            self.assertFalse(marker.exists(), "missing precompiled helper must not invoke a host compiler")
+
     def test_host_parser_ignores_persistent_and_ambient_build_settings(self):
         with tempfile.TemporaryDirectory(prefix="archive-parser-environment-") as temporary:
             work = Path(temporary)

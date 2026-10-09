@@ -63,6 +63,18 @@ Memory is faulted in by page; disk data is read by block. Data that is never tou
 
 Builds use environment-provided Go and inherit its `GOROOT` and `GOTOOLCHAIN` selection. Release automation requires a working `gh` with `api --slurp` support on `PATH`; the project does not install, replace, or authenticate these environment tools against fixed binary digests. Rust builds use the environment's `cargo`, `rustc`, and target linker, without requiring rustup management.
 
+CI selects a verified immutable Workbench image once for each native architecture.
+Release builds, ordinary tests and packaging use build mode with an ordinary UID
+on native x86_64 and aarch64 runners. The complete
+`bash scripts/ci-source-checks.sh` gate runs in Workbench system mode, retaining
+the source tests, race detector, vet and real mount-namespace ENOSPC checks.
+The gate requires the actual namespace and mount capabilities used by those tests.
+`KUASAR_BUILD_JOBS` bounds build concurrency; source, scratch, Cargo and native
+cache directories belong to the invocation. Product E2E still consumes exact
+prebuilt artifacts. Publishing credentials stay in the Actions orchestration
+steps; the publisher executes the trusted workflow revision's archive parser
+compiled in Workbench through `RELEASE_ARCHIVE_VALIDATOR`.
+
 ```bash
 make build                      # sandbox-ctl and sandbox-init
 make sandbox-ctl sandbox-init   # explicit binary targets

@@ -6,8 +6,10 @@ an editable extracted Cargo cache. Git dependencies must match the lock commit.
 The caller supplies the normal Cargo build report and matching source/cache.
 """
 import argparse
+import base64
 import fnmatch
 import hashlib
+from http.client import IncompleteRead
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -16,9 +18,16 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
+import time
 import tomllib
-from urllib.parse import urlsplit
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
+
+
+VHOST_REQUEST_TIMEOUT = 30
+VHOST_DOWNLOAD_BUDGET = 120
+VHOST_DOWNLOAD_ATTEMPTS = 3
 
 
 def require(condition, message):
@@ -49,7 +58,96 @@ def put_material(destination, relative, contents):
     target.chmod(0o644)
 
 
-def vhost_workspace_materials(package, archive, destination):
+def _vhost_request_worker(url, timeout):
+    """One public material request; the parent owns its wall-clock deadline."""
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            require(response.geturl() == url, "vhost material redirected from exact source: " + url)
+            contents = response.read()
+        record = {"contents": base64.b64encode(contents).decode("ascii")}
+        status = 0
+    except (HTTPError, URLError, OSError, IncompleteRead, ValueError) as error:
+        record = {"error": type(error).__name__, "message": str(error)}
+        if isinstance(error, HTTPError):
+            record["code"] = error.code
+        status = 1
+    print(json.dumps(record, sort_keys=True))
+    return status
+
+
+def _request_vhost_material(url, timeout):
+    # A Python signal cannot interrupt every blocking C resolver call. Keep the
+    # actual urlopen in one owned process, so its DNS/connect/body work can all
+    # be killed and reaped when the remaining request budget expires.
+    started = time.monotonic()
+    worker = ('import runpy,sys; '
+              'module=runpy.run_path(sys.argv[1]); '
+              'raise SystemExit(module["_vhost_request_worker"](sys.argv[2],float(sys.argv[3])))')
+    # Keep urllib's explicit network/CA settings while excluding publishing
+    # credentials and user Python hooks from this public-material request.
+    environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                   "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy")
+                   if key in os.environ}
+    with subprocess.Popen([sys.executable, "-I", "-B", "-c", worker,
+                           str(Path(__file__).resolve()), url, str(timeout)],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, env=environment) as request:
+        try:
+            stdout, stderr = request.communicate(timeout=max(0, timeout - (time.monotonic() - started)))
+        except subprocess.TimeoutExpired as error:
+            request.kill()
+            request.communicate()
+            raise TimeoutError(f"request deadline exceeded ({timeout:.3f}s); request process reaped") from error
+        except BaseException:
+            request.kill()
+            request.communicate()
+            raise
+    try:
+        record = json.loads(stdout)
+    except (ValueError, UnicodeError) as error:
+        raise OSError(f"vhost request process exited {request.returncode}: "
+                      + stderr.decode("utf-8", errors="replace").strip()) from error
+    require(isinstance(record, dict), "invalid vhost request process result")
+    if record.get("error") == "HTTPError":
+        raise HTTPError(url, record["code"], record["message"], {}, None)
+    if record.get("error") == "ValueError":
+        raise ValueError(record["message"])
+    if record.get("error"):
+        raise OSError(record["error"] + ": " + record["message"])
+    require(request.returncode == 0 and isinstance(record.get("contents"), str),
+            "invalid vhost request process result")
+    return base64.b64decode(record["contents"], validate=True)
+
+
+def download_vhost_material(url, deadline):
+    started = time.monotonic()
+    for attempt in range(1, VHOST_DOWNLOAD_ATTEMPTS + 1):
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "vhost material download budget exhausted: " + url)
+        timeout = min(VHOST_REQUEST_TIMEOUT, remaining)
+        print(f"release Rust materials: GET {url} attempt={attempt}/{VHOST_DOWNLOAD_ATTEMPTS} "
+              f"remaining={remaining:.3f}s timeout={timeout:.3f}s", file=sys.stderr, flush=True)
+
+        try:
+            contents = _request_vhost_material(url, timeout)
+        except (OSError, URLError, IncompleteRead) as error:
+            remaining = deadline - time.monotonic()
+            retryable = not isinstance(error, HTTPError) or error.code in (408, 429) or 500 <= error.code < 600
+            print(f"release Rust materials: GET {url} attempt={attempt} "
+                  f"elapsed={time.monotonic() - started:.3f}s remaining={max(0, remaining):.3f}s "
+                  f"error={type(error).__name__}: {error}", file=sys.stderr, flush=True)
+            if not retryable or attempt == VHOST_DOWNLOAD_ATTEMPTS or remaining <= 0:
+                reason = "budget exhausted" if remaining <= 0 else "request failed"
+                raise ValueError(f"vhost material {reason}: {url} after {attempt} attempt(s): {error}") from error
+            time.sleep(min(2 ** (attempt - 1), remaining))
+            continue
+        require(contents, "empty vhost material: " + url)
+        print(f"release Rust materials: GET {url} attempt={attempt} bytes={len(contents)} "
+              f"elapsed={time.monotonic() - started:.3f}s", file=sys.stderr, flush=True)
+        return contents
+
+
+def vhost_workspace_materials(package, archive, destination, cargo_home):
     # The published vhost crate omits the workspace-root license files.
     # Its checksum-bound Cargo VCS record selects the exact upstream revision;
     # also compare the original manifest before collecting those root files.
@@ -67,12 +165,54 @@ def vhost_workspace_materials(package, archive, destination):
     require(re.fullmatch(r"[0-9a-f]{40}", commit) and not vcs.get("git", {}).get("dirty", False)
             and vcs.get("path_in_vcs") == "vhost", "unverifiable vhost workspace source")
     base = "https://raw.githubusercontent.com/rust-vmm/vhost/" + commit + "/"
-    def download(name):
-        with urlopen(base + name, timeout=30) as response:
-            return response.read()
-    require(download("vhost/Cargo.toml") == original_manifest, "vhost workspace manifest differs from crate")
+    checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+    cache = cargo_home / "release-materials" / "vhost" / checksum / (commit + ".json")
+    names = ("vhost/Cargo.toml", "LICENSE", "LICENSE-BSD-3-Clause")
+    identity = {"repository": package["repository"], "commit": commit, "crate_sha256": checksum}
+    if cache.exists() or cache.is_symlink():
+        try:
+            require(cache.is_file() and not cache.is_symlink(), "not a regular cache file")
+            record = json.loads(cache.read_bytes())
+            require(isinstance(record, dict) and record.get("identity") == identity, "source identity mismatch")
+            entries = record.get("files")
+            require(isinstance(entries, dict) and set(entries) == set(names), "incomplete material set")
+            contents = {}
+            for name in names:
+                entry = entries[name]
+                require(isinstance(entry, dict) and entry.get("url") == base + name, "source URL mismatch: " + name)
+                value = base64.b64decode(entry["contents"], validate=True)
+                require(value and hashlib.sha256(value).hexdigest() == entry.get("sha256"),
+                        "material checksum mismatch: " + name)
+                contents[name] = value
+            require(contents["vhost/Cargo.toml"] == original_manifest, "vhost workspace manifest differs from crate")
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            raise ValueError(f"invalid vhost material cache {cache}: {error}") from error
+        print(f"release Rust materials: verified vhost cache commit={commit} crate_sha256={checksum}",
+              file=sys.stderr, flush=True)
+    else:
+        deadline = time.monotonic() + VHOST_DOWNLOAD_BUDGET
+        contents = {names[0]: download_vhost_material(base + names[0], deadline)}
+        require(contents[names[0]] == original_manifest, "vhost workspace manifest differs from crate")
+        for name in names[1:]:
+            contents[name] = download_vhost_material(base + name, deadline)
+        record = {"identity": identity, "files": {
+            name: {"url": base + name, "sha256": hashlib.sha256(value).hexdigest(),
+                   "contents": base64.b64encode(value).decode("ascii")}
+            for name, value in contents.items()}}
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        pending = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=cache.parent, prefix=".pending-", delete=False) as output:
+                pending = Path(output.name)
+                json.dump(record, output, sort_keys=True)
+                output.write("\n")
+            os.replace(pending, cache)
+        finally:
+            if pending is not None:
+                pending.unlink(missing_ok=True)
+    # Do not emit partial license material or publish an incomplete cache entry.
     for name in ("LICENSE", "LICENSE-BSD-3-Clause"):
-        put_material(destination, "upstream/" + name, download(name))
+        put_material(destination, "upstream/" + name, contents[name])
     return ";license-source-git:" + commit
 
 
@@ -106,7 +246,7 @@ def registry_materials(package, locked, cargo_home, destination):
             require(safe_relative(relative) and member.isfile(), "unsafe Rust license archive member")
             put_material(destination, relative, source.extractfile(member).read())
             count += 1
-    supplemental = "" if count else vhost_workspace_materials(package, archive, destination)
+    supplemental = "" if count else vhost_workspace_materials(package, archive, destination, cargo_home)
     return f"https://static.crates.io/crates/{name}/{name}-{version}.crate", "sha256:" + checksum + supplemental
 
 

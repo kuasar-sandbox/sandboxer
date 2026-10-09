@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """Private fixtures for native source-material validation; not MicroVM tests."""
 import copy
+from contextlib import contextmanager, redirect_stderr
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
 spec = importlib.util.spec_from_file_location("materials", Path(__file__).with_name("release-rust-materials.py"))
 materials = importlib.util.module_from_spec(spec)
@@ -127,10 +134,10 @@ class MaterialsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsafe"):
             self.collect()
 
-    def test_vhost_workspace_licenses_match_the_published_manifest(self):
+    def vhost_fixture(self, commit="1" * 40):
         archive = self.root / "vhost-0.14.0.crate"
         original = b'[package]\nname="vhost"\nversion="0.14.0"\n'
-        vcs = json.dumps({"git": {"sha1": "1" * 40}, "path_in_vcs": "vhost"}).encode()
+        vcs = json.dumps({"git": {"sha1": commit}, "path_in_vcs": "vhost"}).encode()
         with tarfile.open(archive, "w:gz") as output:
             for name, value in ((".cargo_vcs_info.json", vcs), ("Cargo.toml.orig", original)):
                 member = tarfile.TarInfo("vhost-0.14.0/" + name)
@@ -138,14 +145,315 @@ class MaterialsTests(unittest.TestCase):
                 output.addfile(member, io.BytesIO(value))
         package = {"name": "vhost", "version": "0.14.0", "repository": "https://github.com/rust-vmm/vhost"}
         destination = self.root / "vhost-material"
-        with patch.object(materials, "urlopen", side_effect=lambda url, timeout: io.BytesIO(
-                original if url.endswith("vhost/Cargo.toml") else b"fixture upstream license\n")):
-            identity = materials.vhost_workspace_materials(package, archive, destination)
+        return package, archive, destination, original
+
+    @staticmethod
+    def vhost_response(url, original):
+        return original if url.endswith("vhost/Cargo.toml") else b"fixture upstream license\n"
+
+    def test_vhost_workspace_licenses_match_the_published_manifest(self):
+        package, archive, destination, original = self.vhost_fixture()
+        with patch.object(materials, "_request_vhost_material", side_effect=lambda url, timeout: self.vhost_response(url, original)):
+            identity = materials.vhost_workspace_materials(package, archive, destination, self.home)
         self.assertEqual(identity, ";license-source-git:" + "1" * 40)
         self.assertTrue((destination / "upstream/LICENSE-BSD-3-Clause").is_file())
-        with patch.object(materials, "urlopen", return_value=io.BytesIO(b"different manifest")):
+        with patch.object(materials, "_request_vhost_material", side_effect=lambda url, timeout: self.vhost_response(url, b"different manifest")):
             with self.assertRaisesRegex(ValueError, "differs"):
-                materials.vhost_workspace_materials(package, archive, destination)
+                materials.vhost_workspace_materials(package, archive, destination, self.root / "fresh-cargo")
+
+    def test_vhost_warm_cache_works_offline_in_a_fresh_material_directory(self):
+        package, archive, destination, original = self.vhost_fixture()
+        with patch.object(materials, "_request_vhost_material", side_effect=lambda url, timeout: self.vhost_response(url, original)) as request:
+            identity = materials.vhost_workspace_materials(package, archive, destination, self.home)
+        self.assertEqual(request.call_count, 3)
+        fresh = self.root / "fresh-job"
+        fresh.mkdir()
+        restored_home = fresh / "cargo"
+        shutil.copytree(self.home, restored_home)
+        restored_archive = fresh / archive.name
+        shutil.copyfile(archive, restored_archive)
+        archive.unlink()
+        with patch.object(materials, "_request_vhost_material", side_effect=AssertionError("offline: network forbidden")):
+            restored = fresh / "materials"
+            self.assertEqual(materials.vhost_workspace_materials(package, restored_archive, restored, restored_home), identity)
+        for name in ("LICENSE", "LICENSE-BSD-3-Clause"):
+            self.assertEqual((restored / "upstream" / name).read_bytes(), (destination / "upstream" / name).read_bytes())
+
+    def test_vhost_corrupt_or_wrong_source_cache_is_rejected_without_network(self):
+        package, archive, destination, original = self.vhost_fixture()
+        with patch.object(materials, "_request_vhost_material", side_effect=lambda url, timeout: self.vhost_response(url, original)):
+            materials.vhost_workspace_materials(package, archive, destination, self.home)
+        cache, = (self.home / "release-materials/vhost").glob("*/*.json")
+        valid = json.loads(cache.read_bytes())
+        for failure in ("json", "repository", "commit", "crate_sha256", "url", "checksum", "manifest", "partial"):
+            with self.subTest(failure=failure):
+                record = copy.deepcopy(valid)
+                if failure in ("repository", "commit", "crate_sha256"):
+                    record["identity"][failure] = "wrong-source"
+                elif failure == "url":
+                    record["files"]["LICENSE"]["url"] = "https://example.invalid/LICENSE"
+                elif failure == "checksum":
+                    record["files"]["LICENSE"]["sha256"] = "0" * 64
+                elif failure == "manifest":
+                    value = b"different manifest"
+                    record["files"]["vhost/Cargo.toml"]["contents"] = materials.base64.b64encode(value).decode("ascii")
+                    record["files"]["vhost/Cargo.toml"]["sha256"] = hashlib.sha256(value).hexdigest()
+                elif failure == "partial":
+                    del record["files"]["LICENSE-BSD-3-Clause"]
+                cache.write_text("{" if failure == "json" else json.dumps(record))
+                before = cache.read_bytes()
+                with patch.object(materials, "_request_vhost_material", side_effect=AssertionError("invalid cache must fail closed")):
+                    with self.assertRaisesRegex(ValueError, "invalid vhost material cache"):
+                        materials.vhost_workspace_materials(package, archive, self.root / "rejected", self.home)
+                self.assertEqual(cache.read_bytes(), before)
+                self.assertFalse((self.root / "rejected").exists())
+
+    def test_vhost_wrong_repository_or_non_exact_commit_never_downloads(self):
+        package, archive, destination, _ = self.vhost_fixture(commit="main")
+        with patch.object(materials, "_request_vhost_material", side_effect=AssertionError("no download for unbound source")):
+            with self.assertRaisesRegex(ValueError, "unverifiable"):
+                materials.vhost_workspace_materials(package, archive, destination, self.home)
+            with self.assertRaisesRegex(ValueError, "no license"):
+                materials.vhost_workspace_materials({**package, "repository": "https://example.invalid/vhost"},
+                                                     archive, destination, self.home)
+
+    def test_vhost_partial_download_does_not_publish_cache_or_licenses(self):
+        package, archive, destination, original = self.vhost_fixture()
+        def request(url, timeout):
+            if url.endswith("LICENSE-BSD-3-Clause"):
+                raise HTTPError(url, 404, "not found", {}, None)
+            return self.vhost_response(url, original)
+        with patch.object(materials, "_request_vhost_material", side_effect=request) as request_mock:
+            with self.assertRaisesRegex(ValueError, "LICENSE-BSD-3-Clause.*404"):
+                materials.vhost_workspace_materials(package, archive, destination, self.home)
+        self.assertEqual(request_mock.call_count, 3)  # A permanent 404 is not retried.
+        self.assertFalse(destination.exists())
+        self.assertFalse(list((self.home / "release-materials").rglob("*")))
+
+    def test_vhost_transient_failure_and_finite_attempts_have_request_diagnostics(self):
+        url = "https://raw.githubusercontent.com/rust-vmm/vhost/" + "1" * 40 + "/LICENSE"
+        log = io.StringIO()
+        with patch.object(materials, "_request_vhost_material", side_effect=[URLError("temporary DNS failure"), self.vhost_response(url, b"")]) as request, \
+                patch.object(materials.time, "sleep"), redirect_stderr(log):
+            self.assertEqual(materials.download_vhost_material(url, time.monotonic() + 10), b"fixture upstream license\n")
+        self.assertEqual(request.call_count, 2)
+        self.assertIn(url, log.getvalue())
+        self.assertIn("attempt=1", log.getvalue())
+        self.assertIn("temporary DNS failure", log.getvalue())
+        with patch.object(materials, "_request_vhost_material", side_effect=URLError("still unavailable")) as request, \
+                patch.object(materials.time, "sleep"):
+            with self.assertRaisesRegex(ValueError, "after 3 attempt"):
+                materials.download_vhost_material(url, time.monotonic() + 10)
+        self.assertEqual(request.call_count, 3)
+
+    def test_vhost_redirect_is_not_relabelled_as_the_selected_source(self):
+        attempts = []
+        def respond(handler):
+            attempts.append(handler.path)
+            if handler.path == "/LICENSE":
+                handler.send_response(302)
+                handler.send_header("Location", "/different-source")
+                handler.end_headers()
+            else:
+                handler.send_response(200)
+                handler.end_headers()
+                handler.wfile.write(b"wrong-source license")
+        with self.vhost_http_server(respond) as url:
+            with self.assertRaisesRegex(ValueError, "redirected from exact source"):
+                materials.download_vhost_material(url, time.monotonic() + 2)
+        self.assertEqual(attempts, ["/LICENSE", "/different-source"])
+
+    @contextmanager
+    def vhost_http_server(self, responder):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                responder(self)
+
+            def do_CONNECT(self):
+                responder(self)
+
+            def log_message(self, *_args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        worker.start()
+        try:
+            # Keep local HTTP fixtures independent of the caller's proxy.
+            # Proxy-specific tests override these explicit bypasses below.
+            with patch.dict(os.environ, {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}):
+                yield "http://127.0.0.1:" + str(server.server_port) + "/LICENSE"
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+
+    def test_vhost_real_http_proxy_preserves_transport_without_forwarding_credentials(self):
+        requests, environments = [], []
+        def respond(handler):
+            requests.append((handler.path, dict(handler.headers)))
+            handler.send_response(200)
+            handler.end_headers()
+            handler.wfile.write(b"proxied license")
+        real_popen = subprocess.Popen
+        def spawn(command, **kwargs):
+            environments.append(kwargs["env"])
+            return real_popen(command, **kwargs)
+        target = "http://127.0.0.1:0/LICENSE"
+        secrets = {name: "fixture-do-not-forward" for name in (
+            "GH_TOKEN", "GITHUB_TOKEN", "CALLER_TOKEN", "ACTIONS_RUNTIME_TOKEN", "KUASAR_CI_APP_PRIVATE_KEY",
+            "PYTHONPATH", "PYTHONSTARTUP")}
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(OSError):
+                materials._request_vhost_material(target, 2)
+        with self.vhost_http_server(respond) as proxy:
+            for http_key, https_key in (("HTTP_PROXY", "HTTPS_PROXY"), ("http_proxy", "https_proxy")):
+                with self.subTest(http=http_key), patch.dict(os.environ, {
+                        **secrets, http_key: proxy, https_key: proxy}, clear=True), \
+                        patch.object(materials.subprocess, "Popen", side_effect=spawn):
+                    self.assertEqual(materials.download_vhost_material(target, time.monotonic() + 2), b"proxied license")
+                self.assertEqual(environments[-1][http_key], proxy)
+                self.assertEqual(environments[-1][https_key], proxy)
+                self.assertFalse(set(environments[-1]) & set(secrets))
+        self.assertEqual([path for path, _ in requests], [target, target])
+        self.assertTrue(all("Authorization" not in headers and "Proxy-Authorization" not in headers
+                            for _, headers in requests))
+
+    def test_vhost_real_https_proxy_uses_connect_without_changing_tls_validation(self):
+        requests = []
+        def respond(handler):
+            requests.append((handler.command, handler.path))
+            handler.send_error(502, "fixture tunnel refusal")
+        with self.vhost_http_server(respond) as proxy:
+            for key in ("HTTPS_PROXY", "https_proxy"):
+                with self.subTest(proxy=key), patch.dict(os.environ, {key: proxy}, clear=True):
+                    with self.assertRaisesRegex(OSError, "Tunnel connection failed: 502"):
+                        materials._request_vhost_material("https://vhost-proxy-fixture.invalid/LICENSE", 2)
+        self.assertEqual(requests, [("CONNECT", "vhost-proxy-fixture.invalid:443")] * 2)
+
+    def test_vhost_real_no_proxy_bypasses_configured_proxy(self):
+        proxied = []
+        def origin(handler):
+            handler.send_response(200)
+            handler.end_headers()
+            handler.wfile.write(b"direct license")
+        def proxy(handler):
+            proxied.append(handler.path)
+            handler.send_error(502, "request should have bypassed this proxy")
+        with self.vhost_http_server(origin) as url, self.vhost_http_server(proxy) as proxy_url:
+            for http_key, bypass_key in (("HTTP_PROXY", "NO_PROXY"), ("http_proxy", "no_proxy")):
+                with self.subTest(bypass=bypass_key), patch.dict(os.environ, {
+                        http_key: proxy_url, bypass_key: "127.0.0.1"}, clear=True):
+                    self.assertEqual(materials._request_vhost_material(url, 2), b"direct license")
+        self.assertEqual(proxied, [])
+
+    def test_vhost_real_http_transient_error_recovers(self):
+        attempts = []
+        def respond(handler):
+            attempts.append(handler.path)
+            handler.send_response(503 if len(attempts) == 1 else 200)
+            handler.end_headers()
+            handler.wfile.write(b"real HTTP fixture license")
+        with self.vhost_http_server(respond) as url, patch.object(materials.time, "sleep"):
+            self.assertEqual(materials.download_vhost_material(url, time.monotonic() + 2), b"real HTTP fixture license")
+        self.assertEqual(attempts, ["/LICENSE", "/LICENSE"])
+
+    def test_vhost_real_slow_body_cannot_exceed_total_budget(self):
+        # Bytes arrive within the socket inactivity timeout, but the complete
+        # request must still stop at the remaining material-download budget.
+        requested = threading.Event()
+        def respond(handler):
+            requested.set()
+            handler.send_response(200)
+            handler.send_header("Content-Length", "100")
+            handler.end_headers()
+            try:
+                for _ in range(100):
+                    handler.wfile.write(b"x")
+                    handler.wfile.flush()
+                    threading.Event().wait(0.02)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        with self.vhost_http_server(respond) as url, patch.object(materials, "VHOST_REQUEST_TIMEOUT", 1):
+            started = time.monotonic()
+            with self.assertRaisesRegex(ValueError, "budget exhausted"):
+                materials.download_vhost_material(url, started + 0.4)
+            self.assertLess(time.monotonic() - started, 1.25)
+            self.assertTrue(requested.is_set(), "request must enter the slow HTTP body fixture")
+
+    def test_vhost_stuck_resolver_process_is_killed_and_reaped_at_budget(self):
+        # Patch only the child's resolver. The real worker still enters urlopen,
+        # while the real parent must kill and wait for this owned OS process.
+        marker = self.root / "resolver-pid"
+        real_popen = subprocess.Popen
+        requests = []
+        block_resolver = """import os,signal,socket,sys,time
+def blocked_resolver(*args, **kwargs):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(sys.argv[4], "w") as output:
+        output.write(str(os.getpid()))
+    while True:
+        time.sleep(60)
+socket.getaddrinfo = blocked_resolver
+"""
+        def spawn(command, **kwargs):
+            self.assertEqual(command[:4], [sys.executable, "-I", "-B", "-c"])
+            self.assertNotIn("GH_TOKEN", kwargs["env"])
+            self.assertNotIn("GITHUB_TOKEN", kwargs["env"])
+            child = real_popen([*command[:4], block_resolver + command[4], *command[5:], str(marker)], **kwargs)
+            requests.append(child)
+            return child
+        def cleanup():
+            for child in requests:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+        self.addCleanup(cleanup)
+        url = "https://raw.githubusercontent.com/rust-vmm/vhost/" + "1" * 40 + "/LICENSE"
+        log = io.StringIO()
+        started = time.monotonic()
+        with patch.object(materials.subprocess, "Popen", side_effect=spawn), \
+                patch.dict(os.environ, {"GH_TOKEN": "fixture-do-not-forward", "GITHUB_TOKEN": "fixture-do-not-forward"}), \
+                redirect_stderr(log):
+            with self.assertRaisesRegex(ValueError, "budget exhausted.*request process reaped"):
+                materials.download_vhost_material(url, started + 0.6)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(int(marker.read_text()), requests[0].pid)
+        self.assertEqual(requests[0].returncode, -signal.SIGKILL)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(requests[0].pid, os.WNOHANG)
+        self.assertIn(url, log.getvalue())
+        self.assertIn("attempt=1", log.getvalue())
+        self.assertIn("remaining=0.000s", log.getvalue())
+
+    def test_vhost_real_partial_http_body_is_rejected(self):
+        attempts = []
+        def respond(handler):
+            attempts.append(handler.path)
+            handler.send_response(200)
+            handler.send_header("Content-Length", "100")
+            handler.end_headers()
+            handler.wfile.write(b"partial")
+        with self.vhost_http_server(respond) as url, patch.object(materials.time, "sleep"):
+            with self.assertRaisesRegex(ValueError, "after 3 attempt.*bytes read"):
+                materials.download_vhost_material(url, time.monotonic() + 2)
+        self.assertEqual(attempts, ["/LICENSE"] * 3)
+
+    def test_vhost_material_requests_share_one_total_budget(self):
+        package, archive, destination, original = self.vhost_fixture()
+        deadlines = []
+        def download(url, deadline):
+            deadlines.append(deadline)
+            if len(deadlines) == 3:
+                raise ValueError("vhost material download budget exhausted: " + url)
+            return original if url.endswith("vhost/Cargo.toml") else b"fixture license"
+        with patch.object(materials, "download_vhost_material", side_effect=download):
+            with self.assertRaisesRegex(ValueError, "budget exhausted.*LICENSE-BSD-3-Clause"):
+                materials.vhost_workspace_materials(package, archive, destination, self.home)
+        self.assertEqual(len(deadlines), 3)
+        self.assertEqual(len(set(deadlines)), 1)
+        self.assertFalse(destination.exists())
 
     def test_failed_build_and_missing_package_rejected(self):
         messages = copy.deepcopy(self.messages)
