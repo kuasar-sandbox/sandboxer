@@ -249,6 +249,8 @@ jobs:
             --selection workbench-selection/workbench.json --sources src \
             --root "$RUNNER_TEMP/sandboxer-release-tests" --arch x86_64 --cpus 2 --memory-gib 8
           test_script=$(cat <<'WORKBENCH_TEST'
+          # Match the system executor owner on this private container copy.
+          chown -hR 0:0 /src
           cd /src
           go work init ./accelerator ./connector ./sandboxer
           cd sandboxer
