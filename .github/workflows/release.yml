@@ -246,6 +246,7 @@ jobs:
         with:
           selection: workbench-selection/workbench.json
           sources: src
+          outputs: sandboxer/release-bundle
           arch: ${{ matrix.arch }}
           cpus: '2'
           memory-gib: '8'
@@ -319,6 +320,7 @@ jobs:
           cache: 'false'
           selection: workbench-selection/workbench.json
           sources: validator-src
+          outputs: sandboxer/build/release-archive-validator
           arch: x86_64
           cpus: '2'
           memory-gib: '8'

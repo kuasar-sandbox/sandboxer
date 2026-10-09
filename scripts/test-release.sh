@@ -217,6 +217,8 @@ for job in (build, publish):
 assert "ref: ${{ github.workflow_sha }}" in publish, "trusted parser source is not workflow-bound"
 assert "RELEASE_ARCHIVE_VALIDATOR:" in publish, "publisher must use the trusted precompiled parser"
 assert "cache: 'false'" in publish, "trusted publisher parser must not consume candidate build caches"
+assert "outputs: sandboxer/release-bundle" in build, "candidate bundle needs a checked host-output boundary"
+assert "outputs: sandboxer/build/release-archive-validator" in publish, "trusted parser needs a checked host-output boundary"
 assert "go build -p \"$KUASAR_BUILD_JOBS\"" in publish, "parser compilation must honor the task budget"
 PYWORKBENCH
 grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }}]' \
