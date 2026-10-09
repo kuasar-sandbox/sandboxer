@@ -194,6 +194,30 @@ fi
 bash -n "$ROOT/scripts/delete-preview.sh" "$ROOT/scripts/validate-release-source.sh"
 
 WORKFLOW="$ROOT/.github/workflows/release.yml"
+python3 - "$WORKFLOW" <<'PYWORKBENCH'
+from pathlib import Path
+import re
+import sys
+text = Path(sys.argv[1]).read_text()
+build = text.split("\n  build:\n", 1)[1].split("\n  publish:\n", 1)[0]
+publish = text.split("\n  publish:\n", 1)[1].split("\n  cleanup:\n", 1)[0]
+assert text.count("workbench.py select") == 1, "image selection must happen once before the matrix"
+assert all(re.search(r"(?m)^ +runner: " + re.escape(runner) + "$", build)
+           for runner in ("ubuntu-24.04", "ubuntu-24.04-arm")), "release runners must be native"
+assert "runs-on: ${{ matrix.runner }}" in build
+assert "artifact-cross" not in build and "bootstrap.sh" not in build, "component builds may not install host toolchains"
+assert "uses: ./trusted/platform/.github/actions/workbench" in build
+assert "native-cache.sh restore-or-build cloud-hypervisor" in build
+assert "if [ \"$TARGET_ARCH\" = x86_64 ]; then make test; make vet; fi" in build, "existing source-test coverage changed"
+for job in (build, publish):
+    assert "ref: ${{ needs.preflight.outputs.framework_sha }}" in job, "framework checkout must match the frozen selection"
+    assert "selection: workbench-selection/workbench.json" in job
+    action_run = job.split("uses: ./trusted/platform/.github/actions/workbench", 1)[1].split("      - name:", 1)[0]
+    assert not re.search(r"GH_TOKEN|github.token|secrets\.", action_run), "publish credentials entered the build command"
+assert "ref: ${{ github.workflow_sha }}" in publish, "trusted parser source is not workflow-bound"
+assert "RELEASE_ARCHIVE_VALIDATOR:" in publish, "publisher must use the trusted precompiled parser"
+assert "go build -p \"$KUASAR_BUILD_JOBS\"" in publish, "parser compilation must honor the task budget"
+PYWORKBENCH
 grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }}]' \
   "$WORKFLOW" || fail "release run identity does not pin source and dependencies"
 grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }}' \

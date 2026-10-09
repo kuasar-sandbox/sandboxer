@@ -12,7 +12,7 @@ SCRIPT = ROOT / "native-deps/deps/build-cloud-hypervisor.sh"
 
 
 class RustEnvironment(unittest.TestCase):
-    def run_build(self, rustup=False, cargo_failure=False):
+    def run_build(self, rustup=False, cargo_failure=False, jobs=None):
         with tempfile.TemporaryDirectory(prefix="rust-environment-") as directory:
             root = Path(directory)
             tools = root / "tools"
@@ -33,6 +33,8 @@ if os.environ.get('FAIL_CARGO') == '1':
     print('selected compiler rejected target', file=sys.stderr)
     sys.exit(42)
 args = sys.argv[1:]
+if os.environ.get('EXPECT_CARGO_JOBS'):
+    assert os.environ['CARGO_BUILD_JOBS'] == os.environ['EXPECT_CARGO_JOBS']
 assert '--target' in args and args[args.index('--target') + 1] == 'aarch64-unknown-linux-gnu'
 assert os.environ['CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER'] == 'aarch64-linux-gnu-gcc'
 link = next(arg for arg in args if arg.startswith('link-arg=-Wl,-Map,')).split(',', 2)[2]
@@ -51,10 +53,16 @@ print('{"reason":"compiler-artifact"}')
                        CH_BUILD_OUT=str(root / "build"), BINDIR=str(root / "output"),
                        RUST_TARGET="aarch64-unknown-linux-gnu", CROSS_PREFIX="aarch64-linux-gnu-",
                        FAIL_CARGO="1" if cargo_failure else "0", RUSTUP_PROBE=str(root / "rustup-called"))
+            if jobs is not None:
+                env.update(KUASAR_BUILD_JOBS=jobs, CARGO_BUILD_JOBS="160", EXPECT_CARGO_JOBS=jobs)
             result = subprocess.run([shutil.which("bash"), str(SCRIPT)], env=env,
                                     text=True, capture_output=True, timeout=10)
             self.assertFalse((root / "rustup-called").exists(), result.stdout + result.stderr)
-            if cargo_failure:
+            if jobs is not None and (not jobs.isdecimal() or jobs == "0"):
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("KUASAR_BUILD_JOBS must be a positive integer", result.stderr)
+                self.assertFalse((root / "output/cloud-hypervisor").exists())
+            elif cargo_failure:
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("selected compiler rejected target", result.stderr)
                 self.assertFalse((root / "output/cloud-hypervisor").exists())
@@ -70,6 +78,14 @@ print('{"reason":"compiler-artifact"}')
 
     def test_actual_target_failure_is_not_hidden(self):
         self.run_build(rustup=True, cargo_failure=True)
+
+    def test_task_budget_reaches_the_actual_cargo_invocation(self):
+        self.run_build(jobs="2")
+
+    def test_invalid_task_budget_does_not_build(self):
+        for jobs in ("0", "-1", "auto"):
+            with self.subTest(jobs=jobs):
+                self.run_build(jobs=jobs)
 
 
 if __name__ == "__main__":

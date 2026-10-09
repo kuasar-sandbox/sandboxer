@@ -175,6 +175,10 @@ do_patches_format() {
 }
 
 do_build() (
+    if [ -n "${KUASAR_BUILD_JOBS:-}" ]; then
+        [[ "$KUASAR_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || die 'KUASAR_BUILD_JOBS must be a positive integer'
+        export CARGO_BUILD_JOBS="$KUASAR_BUILD_JOBS"
+    fi
     local out_bin="$BINDIR/cloud-hypervisor"
     local report="${CH_BUILD_REPORT:-$CH_BUILD_OUT/build-report.jsonl}"
     local link_map="${CH_LINK_MAP:-$CH_BUILD_OUT/link.map}"
