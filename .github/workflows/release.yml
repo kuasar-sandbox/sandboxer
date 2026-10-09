@@ -293,7 +293,14 @@ jobs:
             go work init ./accelerator ./connector ./sandboxer
             cd sandboxer
             [ "$(git rev-parse HEAD)" = '${{ needs.preflight.outputs.source_sha }}' ]
-            if [ "$TARGET_ARCH" = x86_64 ]; then make vet; fi
+            if [ "$TARGET_ARCH" = x86_64 ]; then
+              # Mode-000 read failures must run as the ordinary build owner.
+              [ "$(id -u)" -ne 0 ]
+              CGO_ENABLED=0 go test -count=1 -v \
+                -run '^(TestKernelChecksumRejectsPresentBadInputs|TestResolveRestoreRuntimeCandidates)$' \
+                ./pkg/sandbox ./pkg/restore
+              make vet
+            fi
             bash /inputs/release/ci/native-cache/native-cache.sh restore-or-build cloud-hypervisor
             make build
             export SOURCE_DATE_EPOCH

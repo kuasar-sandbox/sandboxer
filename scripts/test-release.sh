@@ -210,7 +210,13 @@ assert "uses: ./trusted/platform/.github/actions/workbench" in build
 assert "native-cache.sh restore-or-build cloud-hypervisor" in build
 assert "start --mode system" in build and "make test" in build, "real UFFD tests require system mode"
 assert build.index("chown -hR 0:0 /src") < build.index("git rev-parse HEAD"), "the private system copy must be owned by its executor"
-assert 'if [ "$TARGET_ARCH" = x86_64 ]; then make vet; fi' in build, "ordinary vet coverage changed"
+ordinary = build.split("      - name: Build vet and package in native Workbench", 1)[1].split("      - name:", 1)[0]
+ordinary_x86 = ordinary.split('if [ "$TARGET_ARCH" = x86_64 ]; then', 1)[1].split("            fi", 1)[0]
+assert 'make vet' in ordinary_x86, "ordinary vet coverage changed"
+assert '[ "$(id -u)" -ne 0 ]' in ordinary_x86, "unreadable-file checks must reject root execution"
+assert 'CGO_ENABLED=0 go test -count=1 -v' in ordinary_x86
+assert "-run '^(TestKernelChecksumRejectsPresentBadInputs|TestResolveRestoreRuntimeCandidates)$'" in ordinary_x86
+assert './pkg/sandbox ./pkg/restore' in ordinary_x86, "ordinary unreadable-file assertions were lost"
 assert build.index("Test exact sandboxer source with real UFFD") < build.index("Build vet and package in native Workbench"), "tests must use the fresh admitted source copy"
 for job in (build, publish):
     assert "ref: ${{ needs.preflight.outputs.framework_sha }}" in job, "framework checkout must match the frozen selection"
