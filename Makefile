@@ -85,6 +85,7 @@ cloud-hypervisor:
 
 test: test-e2e-scripts
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-rust.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-cloud-hypervisor-retry.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	CGO_ENABLED=0 $(GO) test ./...
 
