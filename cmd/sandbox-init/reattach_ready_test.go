@@ -96,6 +96,10 @@ func TestReattachAckDoesNotWaitForConsoleDrain(t *testing.T) {
 			t.Cleanup(func() {
 				shutdownBridge(bridge)
 				bridge.holder.shutdown()
+				_ = guest.Close() // cancel a pump blocked in a transport write
+				_ = pr.Close()
+				_ = pw.Close()
+				waitOutputPumps(t, bridge)
 			})
 			payload := bytes.Repeat([]byte("backpressured console\n"), 1<<17)
 			written := make(chan error, 1)

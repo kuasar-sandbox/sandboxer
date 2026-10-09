@@ -930,6 +930,12 @@ guest 发起端收到 `MUX_CLOSE_ACK` 后将该帧作为 MUX read loop 的终态
 可能复用相同 fd 号,旧会话若残留一次读取就会抢走新连接的 4-byte proto 长度头或首个
 4-byte MUX frame header。
 
+MUX_CLOSE/ACK 同时封住串行写入端：保留的 stream 句柄不能再发送 DATA、EOF、
+RESET、window update 或其他控制帧；已接收的缓冲数据仍可读完。强制关闭先中断
+transport I/O，再等待 writer 退出。原始 vsock Close 拒绝新的 I/O 和 socket
+选项修改，shutdown 正在进行的读写，等待其 fd 所有权释放后才关闭描述符；
+usage I/O 和 EINTR 重试也遵守同一所有权规则。
+
 **为什么两端 close 与 linger 都重要**：guest 单方 virtio-vsock close 可能保留 8 s deferred-removal，等待 peer reset 或超时。
 Host 回 ACK 后 close 提供 peer teardown；guest SO_LINGER 最多等 2 s，设置失败会 log。
 Primary MUX ACK 最多等 5 s，失败/超时强制关；exec MUX 使用同样有界机制，完整 session drain 在 quiesced 前完成。
