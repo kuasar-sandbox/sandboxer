@@ -63,7 +63,10 @@ do_fetch() {
     log "git init + tag $CH_BASE_TAG at $CH_SRC"
     git -C "$CH_SRC" init -q
     git -C "$CH_SRC" -c user.name=deps -c user.email=deps@local add -A
-    git -C "$CH_SRC" -c user.name=deps -c user.email=deps@local commit -q -m "import $tarball"
+    GIT_AUTHOR_DATE="${GIT_AUTHOR_DATE:-@${SOURCE_DATE_EPOCH:-0} +0000}" \
+        GIT_COMMITTER_DATE="${GIT_COMMITTER_DATE:-@${SOURCE_DATE_EPOCH:-0} +0000}" \
+        git -C "$CH_SRC" -c user.name=deps -c user.email=deps@local \
+        commit -q -m "import ${tarball##*/}"
     git -C "$CH_SRC" tag "$CH_BASE_TAG"
 }
 
@@ -91,7 +94,10 @@ do_patches_apply() {
 
     if [ "$base" = "$head" ]; then
         log "applying ${#patches[@]} patch(es) from $PATCHES_DIR"
-        git -C "$CH_SRC" -c user.name=deps -c user.email=deps@local am "${patches[@]}"
+        # Preserve each patch's author/date while making the synthetic imported
+        # tree reproducible in a fresh task directory. This only affects am.
+        GIT_COMMITTER_DATE="${GIT_COMMITTER_DATE:-@${SOURCE_DATE_EPOCH:-0} +0000}" \
+            git -C "$CH_SRC" -c user.name=deps -c user.email=deps@local am "${patches[@]}"
         return 0
     fi
 
@@ -234,9 +240,23 @@ do_build() (
     # Packaging consumes these records without a fresh checkout or cache reset.
     local pending_report pending_map
     pending_report="$(mktemp "$report.pending.XXXXXX")"
-    pending_map="$(mktemp "$link_map.pending.XXXXXX")" \
-        || { rm -f "$pending_report"; exit 1; }
-    trap 'rm -f "$pending_report" "$pending_map"' EXIT
+    # The linker path is a Cargo input. Keep it stable inside this task's
+    # exclusive target directory, rather than changing every crate fingerprint
+    # on retries or identical builds because of an mktemp suffix.
+    pending_map="$CH_BUILD_OUT/link.map.pending"
+    cleanup_build() {
+        local status=$?
+        rm -f "$pending_report" "$pending_map"
+        if [ "$status" -ne 0 ]; then
+            # Cargo can have completed before publication failed. Removing its
+            # exact executable forces the retry to relink and regenerate the
+            # deleted map, without changing the stable compiler arguments.
+            rm -f "$CH_BUILD_OUT/$artifact_subdir/cloud-hypervisor"
+        fi
+        return "$status"
+    }
+    trap cleanup_build EXIT
+    rm -f "$pending_map"
     # A failed or interrupted attempt must not make an old binary reusable with
     # new observations. The existing report is published last, after all outputs.
     : > "$report"
