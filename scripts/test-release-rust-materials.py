@@ -269,18 +269,83 @@ class MaterialsTests(unittest.TestCase):
             def do_GET(self):
                 responder(self)
 
+            def do_CONNECT(self):
+                responder(self)
+
             def log_message(self, *_args):
                 pass
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         worker.start()
         try:
-            yield "http://127.0.0.1:" + str(server.server_port) + "/LICENSE"
+            # Keep local HTTP fixtures independent of the caller's proxy.
+            # Proxy-specific tests override these explicit bypasses below.
+            with patch.dict(os.environ, {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}):
+                yield "http://127.0.0.1:" + str(server.server_port) + "/LICENSE"
         finally:
             server.shutdown()
             server.server_close()
             worker.join(timeout=2)
             self.assertFalse(worker.is_alive())
+
+    def test_vhost_real_http_proxy_preserves_transport_without_forwarding_credentials(self):
+        requests, environments = [], []
+        def respond(handler):
+            requests.append((handler.path, dict(handler.headers)))
+            handler.send_response(200)
+            handler.end_headers()
+            handler.wfile.write(b"proxied license")
+        real_popen = subprocess.Popen
+        def spawn(command, **kwargs):
+            environments.append(kwargs["env"])
+            return real_popen(command, **kwargs)
+        target = "http://127.0.0.1:0/LICENSE"
+        secrets = {name: "fixture-do-not-forward" for name in (
+            "GH_TOKEN", "GITHUB_TOKEN", "CALLER_TOKEN", "ACTIONS_RUNTIME_TOKEN", "KUASAR_CI_APP_PRIVATE_KEY",
+            "PYTHONPATH", "PYTHONSTARTUP")}
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(OSError):
+                materials._request_vhost_material(target, 2)
+        with self.vhost_http_server(respond) as proxy:
+            for http_key, https_key in (("HTTP_PROXY", "HTTPS_PROXY"), ("http_proxy", "https_proxy")):
+                with self.subTest(http=http_key), patch.dict(os.environ, {
+                        **secrets, http_key: proxy, https_key: proxy}, clear=True), \
+                        patch.object(materials.subprocess, "Popen", side_effect=spawn):
+                    self.assertEqual(materials.download_vhost_material(target, time.monotonic() + 2), b"proxied license")
+                self.assertEqual(environments[-1][http_key], proxy)
+                self.assertEqual(environments[-1][https_key], proxy)
+                self.assertFalse(set(environments[-1]) & set(secrets))
+        self.assertEqual([path for path, _ in requests], [target, target])
+        self.assertTrue(all("Authorization" not in headers and "Proxy-Authorization" not in headers
+                            for _, headers in requests))
+
+    def test_vhost_real_https_proxy_uses_connect_without_changing_tls_validation(self):
+        requests = []
+        def respond(handler):
+            requests.append((handler.command, handler.path))
+            handler.send_error(502, "fixture tunnel refusal")
+        with self.vhost_http_server(respond) as proxy:
+            for key in ("HTTPS_PROXY", "https_proxy"):
+                with self.subTest(proxy=key), patch.dict(os.environ, {key: proxy}, clear=True):
+                    with self.assertRaisesRegex(OSError, "Tunnel connection failed: 502"):
+                        materials._request_vhost_material("https://vhost-proxy-fixture.invalid/LICENSE", 2)
+        self.assertEqual(requests, [("CONNECT", "vhost-proxy-fixture.invalid:443")] * 2)
+
+    def test_vhost_real_no_proxy_bypasses_configured_proxy(self):
+        proxied = []
+        def origin(handler):
+            handler.send_response(200)
+            handler.end_headers()
+            handler.wfile.write(b"direct license")
+        def proxy(handler):
+            proxied.append(handler.path)
+            handler.send_error(502, "request should have bypassed this proxy")
+        with self.vhost_http_server(origin) as url, self.vhost_http_server(proxy) as proxy_url:
+            for http_key, bypass_key in (("HTTP_PROXY", "NO_PROXY"), ("http_proxy", "no_proxy")):
+                with self.subTest(bypass=bypass_key), patch.dict(os.environ, {
+                        http_key: proxy_url, bypass_key: "127.0.0.1"}, clear=True):
+                    self.assertEqual(materials._request_vhost_material(url, 2), b"direct license")
+        self.assertEqual(proxied, [])
 
     def test_vhost_real_http_transient_error_recovers(self):
         attempts = []

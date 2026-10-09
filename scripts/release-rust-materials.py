@@ -83,8 +83,10 @@ def _request_vhost_material(url, timeout):
     worker = ('import runpy,sys; '
               'module=runpy.run_path(sys.argv[1]); '
               'raise SystemExit(module["_vhost_request_worker"](sys.argv[2],float(sys.argv[3])))')
-    # Public URLs need neither publishing credentials nor user Python hooks.
-    environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR")
+    # Keep urllib's explicit network/CA settings while excluding publishing
+    # credentials and user Python hooks from this public-material request.
+    environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                   "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy")
                    if key in os.environ}
     with subprocess.Popen([sys.executable, "-I", "-B", "-c", worker,
                            str(Path(__file__).resolve()), url, str(timeout)],
