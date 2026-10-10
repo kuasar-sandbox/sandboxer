@@ -262,8 +262,11 @@ fi
 for input in accelerator_version connector_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
-  [ "$(grep -Fc "ref: \${{ needs.preflight.outputs.${input%_version}_sha }}" "$WORKFLOW")" -eq 2 ] \
-    || fail "release workflow does not pin both $input checkouts"
+  grep -Fq -- "--dependency ${input%_version} \"\${{ needs.preflight.outputs.$input }}\" \"\${{ needs.preflight.outputs.${input%_version}_sha }}\"" "$WORKFLOW" \
+    || fail "release restore does not bind $input tag and SHA to trusted preflight outputs"
+  if grep -Fq "ref: \${{ needs.preflight.outputs.${input%_version}_sha }}" "$WORKFLOW"; then
+    fail "release workflow refetches a dependency by bare SHA"
+  fi
 done
 grep -Fq "repos/kuasar-sandbox/\$repository/releases/tags/\$version" "$WORKFLOW" \
   || fail "release workflow does not verify dependency releases"
