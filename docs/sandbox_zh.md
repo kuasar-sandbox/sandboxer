@@ -2536,7 +2536,7 @@ worker 在释放 inflight 所有权前报告必需读取 fatal; 后发生的 que
 
 快照和 export 保留冻结、排空和一致性条件. 重试可以延长排空, 不减少 inflight 来通过冻结. 捕获在提交前和成功返回前检查操作是否结束; 无法满足捕获条件时失败. 队列停止先取消读取及快照 gate 等待, 再 join; 旧 worker 不能向替换后的 master memory table 写入. UFFD 队列投递也观察取消. 关闭仍先结束 reader, 再让 remove flusher 最终 drain, 最后回收资源.
 
-### 持续源故障的运维诊断
+#### 持续源故障的运维诊断
 
 [管理超时示例](../examples/timeouts-production.yaml) 不设置 lazy read 的整体重试
 期限。先检查 operation context 是否仍存活，并关联后端诊断与 owner 取消/健康
