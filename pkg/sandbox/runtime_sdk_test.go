@@ -554,7 +554,7 @@ func TestSDKMissingAppStartedRemainsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	if err := r.Launch(ctx, launch); err == nil || !strings.Contains(err.Error(), "app_started notification timed out after 200ms") {
+	if err := r.Launch(ctx, launch); err == nil || !strings.Contains(err.Error(), "app_started notification timed out after 2s") {
 		t.Fatalf("lost notification no longer bounded: %v", err)
 	}
 	if r.State() != "closed" {

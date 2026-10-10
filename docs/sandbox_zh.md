@@ -1373,6 +1373,13 @@ Launch 先准备并验证全部 backend，再以一个原子发布点绑定整�
 launch 执行超时。基础 Runtime 保持资源 reservation、controller heartbeat 和资源统计，
 但不会在 launch 前报告工作负载 ready 或 Settled。
 
+SDK 冷启动在 `launch.start_timeout` 和操作 context 的约束下等待 `launch_ack`。
+ACK 后由 `timeouts.app_start` 限制 Guest 进程引导及 `app_started` 通知到达的时间，
+默认 `2s`，显式值必须为正数。它与单条消息的 socket 读取期限
+`timeouts.app_notify` 独立；通知丢失或操作取消仍会关闭 runtime。
+
+启动已经提交成功后，readiness 回调阻塞不会再将该成功转为应用启动超时。
+
 Operation context 限定 startup、launch、restore、live operation 和单次 wait。
 成功返回后取消 startup/launch context，不会杀死 Runtime 或使后续 lazy read 失效。
 取消 `Wait(ctx)` 只取消该次等待；清理后重复 Wait 观察同一份保留的 `ExitResult`。
@@ -2218,7 +2225,10 @@ Close 幂等，排空及关闭错误沿 run/restore 传播。销毁也必须等�
 执行 `go test ./...` 和 `go test -race ./...`。
 [`runtime_sdk_test.go`](../pkg/sandbox/runtime_sdk_test.go) 使用真实子进程和 Unix socket
 验证资源所有权、base/launch 屏障、取消、并发 Close、保留的 Wait 结果、launch/stdio
-失败、后续 artifact read 及磁盘 payload 边界；这些测试不启动 Guest kernel。
+失败、后续 artifact read 及磁盘 payload 边界。
+[`runtime_app_start_test.go`](../pkg/sandbox/runtime_app_start_test.go) 验证 ACK 后的延迟
+通知与 socket 期限相互独立，并覆盖应用启动预算、操作取消及失败 launch 的清理。
+这些测试不启动 Guest kernel。
 vhost binding 测试覆盖未绑定 IOERR、原子发布和在途分段请求；Guest socket 测试覆盖
 基础 ping/shutdown，以及拒绝仅适用于工作负载的操作。
 
