@@ -471,6 +471,25 @@ This permits reading older non-SVE state; it does not promise cross-host CPU
 feature compatibility or backwards restore into an unpatched VMM. SVE remains
 enabled, and incompatible register state fails through the existing KVM errors.
 
+### 3.9 0012 — restore the KVM clock before vCPUs
+
+Patch 0012 backports upstream [commit ff20f183647c602bf5e5028d99959e5547a7dd84](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/ff20f183647c602bf5e5028d99959e5547a7dd84),
+preserving CMGS's authorship and sign-off. In the pinned v51.1 resume path,
+vCPUs could execute before the saved x86 KVM clock was restored. The backport
+restores that clock first, resumes devices, and then resumes vCPUs. The clock
+operation remains x86-specific; the device-before-vCPU ordering also applies
+on ARM. It changes no snapshot schema, Guest ABI or pinned upstream version.
+
+Apply the complete numbered series and rebuild the native VMM before validating
+this ordering. Patch content participates in the native build/cache identity;
+an existing binary without that identity is not validation of the backport.
+Run repeated single-vCPU `sandbox.memory-budget` restores, pause/wake, and
+`snapshot.restore` with its current direct-I/O integrity assertions, followed
+by the ordinary full E2E selection. Retain the native architecture and product
+provenance; cross-compilation alone does not exercise KVM resume. A successful
+small sample does not establish a failure rate or diagnose unrelated restore
+errors.
+
 ## 4. Build workflow
 
 `sandboxer/native-deps` builds the artifact from the pinned v51.1 tarball,
