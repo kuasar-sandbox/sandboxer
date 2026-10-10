@@ -117,8 +117,35 @@ class Sandbox:
                 time.sleep(.1)
         raise AssertionError(f"guest not ready; complete log: {self.dir / 'run.log'}")
 
-    def view(self):
-        return json.loads(self.cli("usage", "--base-root", self.baseroot))
+    def view(self, timeout=15):
+        return json.loads(self.cli("usage", "--base-root", self.baseroot, timeout=timeout))
+
+    def record_timing(self, stage, started, **fields):
+        with (self.dir / "wait-timings.log").open("a") as output:
+            output.write(json.dumps(dict(stage=stage, seconds=time.monotonic()-started,
+                                         **fields)) + "\n")
+
+    def wait_view(self, stage, predicate, timeout=12, interval=.2):
+        """Observe fresh usage until all conditions hold; never retry assertions."""
+        started = time.monotonic()
+        deadline = started + timeout
+        attempts, latest, outcome = 0, None, "failed"
+        try:
+            while True:
+                assert self.process.poll() is None, f"usage Host exited during {stage}"
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(f"usage wait timed out: {stage}; last view: {latest}")
+                latest = self.view(timeout=min(15, remaining))
+                attempts += 1
+                if predicate(latest):
+                    outcome = "ready"
+                    return latest
+                time.sleep(min(interval, max(0, deadline-time.monotonic())))
+        finally:
+            self.record_timing(stage, started, polls=attempts, outcome=outcome)
+            if outcome != "ready" and latest is not None:
+                write_json(self.dir / f"wait-{stage}-failed.json", latest)
 
     def ch_info(self):
         connection = http.client.HTTPConnection("localhost", timeout=2)

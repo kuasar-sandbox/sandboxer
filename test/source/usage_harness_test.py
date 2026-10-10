@@ -1542,5 +1542,152 @@ class ProcEvidenceTests(unittest.TestCase):
                 self.assertEqual("ch" in row, phase == "business")
 
 
+usage_case = load_case("usage_case", "telemetry.usage.sh")
+
+
+class UsageReadinessWaitTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.sb = object.__new__(Sandbox)
+        self.sb.dir = Path(self.temporary.name)
+        self.sb.process = unittest.mock.Mock()
+        self.sb.process.poll.return_value = None
+        self.now = 0.0
+        self.start_patch(patch.object(usage.time, "monotonic", side_effect=lambda: self.now))
+        self.start_patch(patch.object(usage.time, "sleep", side_effect=self.advance))
+
+    def start_patch(self, patcher):
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def advance(self, duration):
+        self.now += duration
+
+    def test_ready_returns_the_fresh_view_and_records_poll_count(self):
+        self.sb.view = unittest.mock.Mock(side_effect=[{'ready': False}, {'ready': True}])
+        result = self.sb.wait_view('ready', lambda value: value['ready'], timeout=1)
+        self.assertEqual(result, {'ready': True})
+        self.assertEqual([call.kwargs['timeout'] for call in self.sb.view.call_args_list], [1, .8])
+        timing = json.loads((self.sb.dir / 'wait-timings.log').read_text())
+        self.assertEqual((timing['outcome'], timing['polls'], timing['seconds']), ('ready', 2, .2))
+
+    def test_deadline_bounds_every_query_and_retains_last_view(self):
+        self.sb.view = unittest.mock.Mock(return_value={'ready': False})
+        with self.assertRaisesRegex(AssertionError, 'usage wait timed out'):
+            self.sb.wait_view('never', lambda value: value['ready'], timeout=.5)
+        self.assertEqual(self.now, .5)
+        limits = [call.kwargs['timeout'] for call in self.sb.view.call_args_list]
+        self.assertEqual(len(limits), 3)
+        for actual, expected in zip(limits, [.5, .3, .1]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(json.loads((self.sb.dir / 'wait-never-failed.json').read_text()), {'ready': False})
+        self.assertEqual(json.loads((self.sb.dir / 'wait-timings.log').read_text())['outcome'], 'failed')
+
+    def test_query_errors_and_predicate_assertions_are_not_retried(self):
+        for original in (subprocess.CalledProcessError(47, 'usage'), subprocess.TimeoutExpired('usage', 1),
+                         json.JSONDecodeError('bad response', '', 0)):
+            with self.subTest(error=type(original).__name__):
+                self.sb.view = unittest.mock.Mock(side_effect=original)
+                with self.assertRaises(type(original)) as caught:
+                    self.sb.wait_view('query', lambda value: True)
+                self.assertIs(caught.exception, original)
+                self.sb.view.assert_called_once()
+        self.sb.view = unittest.mock.Mock(return_value={'invalid': True})
+        def invalid(value):
+            raise AssertionError('invalid identity')
+        with self.assertRaisesRegex(AssertionError, 'invalid identity'):
+            self.sb.wait_view('predicate', invalid)
+        self.sb.view.assert_called_once()
+
+    def test_process_exit_fails_before_another_query(self):
+        self.sb.process.poll.return_value = 1
+        self.sb.view = unittest.mock.Mock()
+        with self.assertRaisesRegex(AssertionError, 'Host exited'):
+            self.sb.wait_view('exit', lambda value: True)
+        self.sb.view.assert_not_called()
+
+    def test_query_limit_never_exceeds_original_fifteen_seconds(self):
+        self.sb.view = unittest.mock.Mock(return_value={})
+        self.sb.wait_view('limit', lambda value: True, timeout=30)
+        self.sb.view.assert_called_once_with(timeout=15)
+
+    def test_workload_overrun_retains_one_query_allowance(self):
+        self.now = 20
+        self.assertEqual(usage_case.observation_budget(0, 12), 15)
+        self.now = 5
+        self.assertEqual(usage_case.observation_budget(0, 12), 22)
+
+
+class UsageReadinessPredicateTests(unittest.TestCase):
+    def before(self):
+        live = {'sandbox_id': 'single', 'run_epoch': 'epoch',
+                'counters': [{'name': 'guest.cpu', 'source_known': True, 'status': 'ok', 'known_total_ns': '1000000000'}],
+                'gauges': [{'name': field, 'status': 'ok', 'covered_total_ns': '1000000000', 'last_value_bytes': '0'}
+                           for field in usage_case.FIELDS]}
+        return {'enabled': True, 'live': live, 'saved_end': '1',
+                'saved': {'sequence': '1', 'snapshot': copy.deepcopy(live)}}
+
+    def after(self, before):
+        result = copy.deepcopy(before)
+        result['saved']['sequence'] = '2'
+        for snapshot in (result['live'], result['saved']['snapshot']):
+            snapshot['counters'][0]['known_total_ns'] = '3000000000'
+            for gauge in snapshot['gauges']:
+                gauge['covered_total_ns'] = '2000000000'
+                if gauge['name'] == 'filesystem.root':
+                    gauge['last_value_bytes'] = str(16*1024*1024)
+        return result
+
+    def test_baseline_requires_all_sources(self):
+        self.assertTrue(usage_case.baseline_ready(self.before(), 'single'))
+        for index in range(len(usage_case.FIELDS)):
+            value = self.before()
+            value['live']['gauges'][index]['covered_total_ns'] = '0'
+            self.assertFalse(usage_case.baseline_ready(value, 'single'))
+
+    def test_live_and_saved_must_each_observe_the_workload(self):
+        before = self.before()
+        self.assertTrue(usage_case.workload_ready(self.after(before), before, 'single'))
+        for side in ('live', 'saved'):
+            with self.subTest(side=side, field='cpu'):
+                value = self.after(before)
+                row = value['live'] if side == 'live' else value['saved']['snapshot']
+                row['counters'][0]['known_total_ns'] = '1000000000'
+                self.assertFalse(usage_case.workload_ready(value, before, 'single'))
+            for index in range(len(usage_case.FIELDS)):
+                with self.subTest(side=side, field=usage_case.FIELDS[index]):
+                    value = self.after(before)
+                    row = value['live'] if side == 'live' else value['saved']['snapshot']
+                    row['gauges'][index]['covered_total_ns'] = '1000000000'
+                    self.assertFalse(usage_case.workload_ready(value, before, 'single'))
+            value = self.after(before)
+            row = value['live'] if side == 'live' else value['saved']['snapshot']
+            next(g for g in row['gauges'] if g['name'] == 'filesystem.root')['last_value_bytes'] = '0'
+            self.assertFalse(usage_case.workload_ready(value, before, 'single'))
+
+    def test_stale_saved_sequence_cannot_satisfy_ready(self):
+        before = self.before()
+        value = self.after(before)
+        value['saved']['sequence'] = '1'
+        self.assertFalse(usage_case.workload_ready(value, before, 'single'))
+        value['saved'] = None
+        self.assertFalse(usage_case.workload_ready(value, before, 'single'))
+
+    def test_wrong_identity_or_cpu_regression_fails_immediately(self):
+        before = self.before()
+        for side in ('live', 'saved'):
+            for field in ('sandbox_id', 'run_epoch', 'cpu'):
+                with self.subTest(side=side, field=field):
+                    value = self.after(before)
+                    row = value['live'] if side == 'live' else value['saved']['snapshot']
+                    if field == 'cpu':
+                        row['counters'][0]['known_total_ns'] = '0'
+                    else:
+                        row[field] = 'wrong'
+                    with self.assertRaises(AssertionError):
+                        usage_case.workload_ready(value, before, 'single')
+
+
 if __name__ == "__main__":
     unittest.main()

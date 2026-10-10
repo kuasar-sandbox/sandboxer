@@ -148,8 +148,7 @@ def main():
             guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
             assert guest["sandbox_init_sha256"] == runtime_init_digest(metadata["artifacts"]["sandbox-init"])
             write_json(sb.dir / "guest.json", guest)
-            time.sleep(5.5)
-            before = sb.view()
+            before = sb.wait_view("initial-saved", lambda v: bool(v.get("saved")), timeout=5.5+15)
             assert before.get("saved")
             write_json(sb.dir / "before.json", before)
             if name == "enospc":
@@ -225,8 +224,9 @@ def main():
                 injection = None
             if mount is not None:
                 (mount / "filler").unlink()
-            time.sleep(6)
-            recovered = sb.view()
+            recovered = sb.wait_view("save-recovered", lambda v:
+                not v.get("save_error") and not v["unknown_tail"] and
+                int(v["saved"]["sequence"]) > int(before["saved"]["sequence"]), timeout=6+15)
             write_json(sb.dir / "recovered.json", recovered)
             assert not recovered.get("save_error") and not recovered["unknown_tail"], recovered
             assert int(recovered["saved"]["sequence"]) > int(before["saved"]["sequence"])
