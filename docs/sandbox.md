@@ -2074,8 +2074,9 @@ runtime binding and `pmem[0].file` in the generated `snap-state/config.json`. Th
 captured pmem must be the existing single runtime device with a nonempty file
 field. Only that file field changes; device ID, optional size and other attributes,
 `state.json`, original S/E and node defaults remain unchanged. The old absolute
-path need not exist. Versioned runtime files must remain immutable and available
-under distinct names in the same directory; no full EROFS rehash or runtime copy
+path need not exist. For sibling fallback, versioned runtime files must remain immutable and available
+under distinct names in the same directory. An explicit matching old-file binding
+can instead use a separate version directory; see the [v1/v2 upgrade example](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime.md#61-node-upgrades). No full EROFS rehash or runtime copy
 is added to restore. The existing `snapshot.restore.sh` verifies relocated-v1
 fallback from a v2-named default, unavailable captured path, selected pmem path,
 unchanged source artifacts/host inputs, guest readiness and continued execution.
@@ -2782,6 +2783,32 @@ Lazy process Fetcher initialization, referenced Bundle resolution and Bundle Chu
 The healthy retry helper allocates no timer and starts no goroutine. A failed synchronous read owns one reusable timer and its existing request/buffer. Backoff is bounded per wait, while the operation may remain pending indefinitely. Connection capacity includes idle, borrowed and dialing connections; bounded maintenance workers cannot grow with outage duration. Validation covers healthy-path allocation/latency comparisons and outage resource checks; these do not constitute a separate performance certification.
 
 The backend marker contract remains in [Accelerator read errors](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/file-artifacts.md#4-read-errors-random-access-and-recovery); see also the original [proposal and acceptance checklist](https://github.com/kuasar-sandbox/sandboxer/issues/225).
+
+#### Operational diagnosis during a sustained source outage
+
+The [management timeout example](../examples/timeouts-production.yaml) does not
+set an overall lazy-read retry budget. Check the first preserved read cause and
+whether the operation context is still live; distinguish a source attempt timeout
+from `restore`/capture cancellation or a fatal health decision. A pending request
+still owns its buffer and inflight slot, so a blocked guest or snapshot drain is
+not evidence that data has been replaced with zeros or capture has succeeded.
+
+1. Record the affected source/ref and first cause without logging customer keys.
+   Check the selected cache/store listener, origin accessibility, generation read
+   list and credentials from the same node. A selected cache is not automatically
+   bypassed after a data error. Diagnose missing immutable objects or failed
+   authentication/integrity separately from temporary transport failure.
+2. Restore the original source service/access while preserving artifacts and
+   keys; observe completion of the original request and guest progress. Do not
+   replay publication writes, delete parents or restart a shared store blindly.
+3. If service cannot be recovered within your operational SLO, stop new admission
+   and use the runtime owner's supported cancellation/stop path. Confirm CH and
+   inflight work have terminated before replacement. Capture may fail while
+   draining; a failed pause is not a durable checkpoint.
+4. Resume only from a previously successful, complete artifact on an eligible
+   node, then check application state and reads beyond the warm working set.
+   Clean up failed-run resources through their owner; retain source artifacts and
+   logs until recovery is verified. These steps do not recover uncaptured memory.
 
 #### 13.3.1 Fatal ownership and capture
 

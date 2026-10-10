@@ -1894,7 +1894,8 @@ VM 错误不触发 runtime 回退。未提供 runtime 绑定时，保留既有�
 `snap-state/config.json` 中的 `pmem[0].file`。捕获的 pmem 必须符合既有单 runtime
 设备结构，且 file 字段非空。只改变该 file 字段，设备 ID、可选 size 及其他属性、
 `state.json`、原始 S/E 和节点默认配置均不改变。旧绝对路径无需存在。
-不同版本的 runtime 文件须以不同文件名在同目录中保持不可变且可用；恢复不新增
+同目录自动回退要求不同版本 runtime 以不同文件名保持不可变且可用；显式匹配的
+旧文件绑定也可使用独立版本目录，见 [v1/v2 升级示例](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime_zh.md)。恢复不新增
 整份 EROFS 重哈希或 runtime 复制。既有 `snapshot.restore.sh` 验证 v2 名称默认文件
 回退到已迁移的 v1、捕获旧路径不可用、pmem 选定路径、源制品与 host 输入不变，
 以及 Guest ready 和执行继续。
@@ -2534,6 +2535,25 @@ Benchmark分别覆盖local tarstream/Bundle create、Bundle read、sparse merge�
 worker 在释放 inflight 所有权前报告必需读取 fatal; 后发生的 queue stop 不能遮蔽后端已经返回的永久原因. `ServeAndWait` 记录首因, 取消相关等待和 PostSpawn/握手工作, 然后直接杀死 CH. 现有唯一 `cmd.Wait` 负责回收和输出排空. worker 不同步等待自己的清理. Ready 提交和 fatal 登记共用一把锁, 已登记 fatal 会阻止新的 Ready 状态转换. 已提交 Ready 事件的通知在锁外交付; 通知回调阻塞不会延迟 fatal 取消或 CH 终止.
 
 快照和 export 保留冻结、排空和一致性条件. 重试可以延长排空, 不减少 inflight 来通过冻结. 捕获在提交前和成功返回前检查操作是否结束; 无法满足捕获条件时失败. 队列停止先取消读取及快照 gate 等待, 再 join; 旧 worker 不能向替换后的 master memory table 写入. UFFD 队列投递也观察取消. 关闭仍先结束 reader, 再让 remove flusher 最终 drain, 最后回收资源.
+
+### 持续源故障的运维诊断
+
+[管理超时示例](../examples/timeouts-production.yaml) 不设置 lazy read 的整体重试
+期限。先检查保留的首个读取原因与 operation context，区分单次源超时、restore/
+捕获取消及健康策略终止。挂起请求仍拥有 buffer 和 inflight；Guest 卡住或快照
+排空受阻，不代表已补零或捕获成功。
+
+1. 记录源/ref 与首因，不输出客户密钥。从同一节点检查所选 cache/store listener、
+   源站可达性、generation 读取列表和凭据。所选 cache 的数据失败不会自动绕过；
+   不可变对象缺失、认证或完整性失败应与暂时传输故障区分。
+2. 保留工件和密钥，修复原有源服务/访问，观察原请求完成及 Guest 进展。不要重放
+   发布写入、删除父链或盲目重启共享 Store。
+3. 若无法在运维 SLO 内恢复，停止新增准入，通过 runtime owner 支持的取消/停止
+   路径终止；确认 CH 和 inflight 结束后才替换。捕获可能在排空时失败，失败的
+   pause 不构成持久 checkpoint。
+4. 仅从此前成功提交的完整工件在合格节点恢复，检查应用状态以及热工作集之外的
+   读取。由 owner 清理失败运行资源；恢复核验前保留源工件和日志。这不能恢复
+   未捕获的内存。
 
 <a id="artifact-compatibility"></a>
 
