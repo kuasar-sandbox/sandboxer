@@ -2539,11 +2539,13 @@ worker 在释放 inflight 所有权前报告必需读取 fatal; 后发生的 que
 ### 持续源故障的运维诊断
 
 [管理超时示例](../examples/timeouts-production.yaml) 不设置 lazy read 的整体重试
-期限。先检查保留的首个读取原因与 operation context，区分单次源超时、restore/
-捕获取消及健康策略终止。挂起请求仍拥有 buffer 和 inflight；Guest 卡住或快照
+期限。先检查 operation context 是否仍存活，并关联后端诊断与 owner 取消/健康
+事件。重试 helper 不保留可重试的单次错误：取消返回 context 原因，而非此前的
+超时。单独报告的永久读取原因可用于定位 fatal read；仅凭取消不能推断源故障。挂起请求仍拥有 buffer 和 inflight；Guest 卡住或快照
 排空受阻，不代表已补零或捕获成功。
 
-1. 记录源/ref 与首因，不输出客户密钥。从同一节点检查所选 cache/store listener、
+1. 记录源/ref、时间范围、可用的后端错误及单独报告的永久原因，不输出客户密钥。
+   从同一节点检查所选 cache/store listener、
    源站可达性、generation 读取列表和凭据。所选 cache 的数据失败不会自动绕过；
    不可变对象缺失、认证或完整性失败应与暂时传输故障区分。
 2. 保留工件和密钥，修复原有源服务/访问，观察原请求完成及 Guest 进展。不要重放

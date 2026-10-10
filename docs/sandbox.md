@@ -2787,13 +2787,17 @@ The backend marker contract remains in [Accelerator read errors](https://github.
 #### Operational diagnosis during a sustained source outage
 
 The [management timeout example](../examples/timeouts-production.yaml) does not
-set an overall lazy-read retry budget. Check the first preserved read cause and
-whether the operation context is still live; distinguish a source attempt timeout
-from `restore`/capture cancellation or a fatal health decision. A pending request
+set an overall lazy-read retry budget. Check whether the operation context is
+still live and correlate backend diagnostics with owner cancellation/health events.
+Retryable attempt errors are not retained by the retry helper: cancellation
+returns the context cause, not the preceding timeout. A separately reported
+permanent read cause can identify a fatal read; cancellation alone cannot identify
+the source failure. A pending request
 still owns its buffer and inflight slot, so a blocked guest or snapshot drain is
 not evidence that data has been replaced with zeros or capture has succeeded.
 
-1. Record the affected source/ref and first cause without logging customer keys.
+1. Record the affected source/ref, time window, available backend errors and any
+   separately reported permanent cause without logging customer keys.
    Check the selected cache/store listener, origin accessibility, generation read
    list and credentials from the same node. A selected cache is not automatically
    bypassed after a data error. Diagnose missing immutable objects or failed
