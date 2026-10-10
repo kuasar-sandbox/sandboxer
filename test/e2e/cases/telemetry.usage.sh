@@ -37,7 +37,7 @@ import time
 
 from usage_report_relay import ReportRelay
 
-from usage import (BIN, Sandbox, build_probe, digest, ext4, image_ref, metric, run, write_json, runtime_init_digest, oom_pressure)
+from usage import (BIN, Sandbox, build_probe, digest, ext4, image_ref, metric, metrics_ready, run, write_json, runtime_init_digest, oom_pressure)
 
 FIELDS = ("guest.memory", "filesystem.root", "ch.rss_anon", "ch.rss_file",
           "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file")
@@ -55,11 +55,7 @@ def baseline_ready(view, name):
     if not live:
         return False
     assert live["sandbox_id"] == name and live["run_epoch"], live
-    cpu = metric(live, "counters", "guest.cpu")
-    return (cpu["source_known"] and cpu["status"] == "ok" and
-            all(metric(live, "gauges", field)["status"] == "ok" and
-                int(metric(live, "gauges", field)["covered_total_ns"]) >= 1_000_000_000
-                for field in FIELDS))
+    return metrics_ready(live, FIELDS)
 
 
 def workload_ready(view, before, name):
@@ -75,6 +71,8 @@ def workload_ready(view, before, name):
         return False
     # Require the workload in both live and durable data, not an old saved frame.
     for snapshot in (live, persisted):
+        if not metrics_ready(snapshot, FIELDS):
+            return False
         cpu = int(metric(snapshot, "counters", "guest.cpu")["known_total_ns"])
         initial_cpu = int(metric(before["live"], "counters", "guest.cpu")["known_total_ns"])
         assert cpu >= initial_cpu, "guest CPU counter regressed"

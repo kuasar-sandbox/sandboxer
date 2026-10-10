@@ -1639,6 +1639,49 @@ class UsageReadinessPredicateTests(unittest.TestCase):
                     gauge['last_value_bytes'] = str(16*1024*1024)
         return result
 
+    def test_partial_baseline_metrics_wait_for_the_first_complete_round(self):
+        for group in ('counters', 'gauges'):
+            for index in range(len(self.before()['live'][group])):
+                value = self.before()
+                value['live'][group].pop(index)
+                self.assertFalse(usage_case.baseline_ready(value, 'single'))
+
+    def test_partial_live_or_saved_workload_observations_are_not_ready(self):
+        before = self.before()
+        for side in ('live', 'saved'):
+            for group in ('counters', 'gauges'):
+                for index in range(len(before['live'][group])):
+                    value = self.after(before)
+                    snapshot = value['live'] if side == 'live' else value['saved']['snapshot']
+                    snapshot[group].pop(index)
+                    self.assertFalse(usage_case.workload_ready(value, before, 'single'))
+
+    def test_fault_injection_waits_for_live_and_durable_guest_metrics(self):
+        self.assertTrue(usage_faults.fault_baseline_ready(self.before(), 'single'))
+        for side in ('live', 'saved'):
+            for group, name in [('gauges', 'guest.memory'), ('gauges', 'filesystem.root'), ('counters', 'guest.cpu')]:
+                value = self.before()
+                snapshot = value['live'] if side == 'live' else value['saved']['snapshot']
+                snapshot[group] = [row for row in snapshot[group] if row['name'] != name]
+                self.assertFalse(usage_faults.fault_baseline_ready(value, 'single'))
+        for key in ('live', 'saved'):
+            value = self.before()
+            value[key] = None
+            self.assertFalse(usage_faults.fault_baseline_ready(value, 'single'))
+
+    def test_fault_baseline_rejects_wrong_identity_and_malformed_metrics(self):
+        for side in ('live', 'saved'):
+            value = self.before()
+            snapshot = value['live'] if side == 'live' else value['saved']['snapshot']
+            snapshot['run_epoch'] = 'wrong' if side == 'saved' else ''
+            with self.assertRaises(AssertionError):
+                usage_faults.fault_baseline_ready(value, 'single')
+            value = self.before()
+            snapshot = value['live'] if side == 'live' else value['saved']['snapshot']
+            snapshot['gauges'][0]['covered_total_ns'] = 'invalid'
+            with self.assertRaises(ValueError):
+                usage_faults.fault_baseline_ready(value, 'single')
+
     def test_baseline_requires_all_sources(self):
         self.assertTrue(usage_case.baseline_ready(self.before(), 'single'))
         for index in range(len(usage_case.FIELDS)):

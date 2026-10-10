@@ -34,7 +34,21 @@ import subprocess
 import sys
 import time
 
-from usage import BIN, Sandbox, build_probe, digest, ext4, image_ref, kill_host_and_stop_ch, metric, run, write_json, runtime_init_digest
+from usage import BIN, Sandbox, build_probe, digest, ext4, image_ref, kill_host_and_stop_ch, metric, metrics_ready, run, write_json, runtime_init_digest
+
+
+def fault_baseline_ready(view, name):
+    assert view["enabled"], "usage unexpectedly disabled"
+    live, saved = view.get("live"), view.get("saved")
+    if not live or not saved:
+        return False
+    assert live["sandbox_id"] == name and live["run_epoch"], live
+    persisted = saved["snapshot"]
+    assert (persisted["sandbox_id"], persisted["run_epoch"]) == (name, live["run_epoch"]), saved
+    fields = ("guest.memory", "filesystem.root", "ch.rss_anon", "sandbox_ctl.rss_anon")
+    # A pre-Ready process-only flush is insufficient, including for kill's
+    # later comparison of the persisted and live guest CPU counters.
+    return metrics_ready(live, fields) and metrics_ready(persisted, fields)
 
 
 def inject(sb, syscall, action):
@@ -148,7 +162,7 @@ def main():
             guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
             assert guest["sandbox_init_sha256"] == runtime_init_digest(metadata["artifacts"]["sandbox-init"])
             write_json(sb.dir / "guest.json", guest)
-            before = sb.wait_view("initial-saved", lambda v: bool(v.get("saved")), timeout=5.5+15)
+            before = sb.wait_view("initial-saved", lambda v: fault_baseline_ready(v, name), timeout=5.5+15)
             assert before.get("saved")
             write_json(sb.dir / "before.json", before)
             if name == "enospc":

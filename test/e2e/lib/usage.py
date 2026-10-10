@@ -251,6 +251,19 @@ def kill_host_and_stop_ch(sb):
     return result
 
 
+def metrics_ready(snapshot, fields):
+    """Missing initial rows are pending; malformed present rows still raise."""
+    counters = {row["name"]: row for row in (snapshot.get("counters") or [])}
+    gauges = {row["name"]: row for row in (snapshot.get("gauges") or [])}
+    if "guest.cpu" not in counters or any(field not in gauges for field in fields):
+        return False
+    cpu = counters["guest.cpu"]
+    return (cpu["source_known"] and cpu["status"] == "ok" and
+            all(gauges[field]["status"] == "ok" and
+                int(gauges[field]["covered_total_ns"]) >= 1_000_000_000
+                for field in fields))
+
+
 def metric(snapshot, group, name):
     return next(m for m in snapshot[group] if m["name"] == name)
 
