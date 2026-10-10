@@ -161,7 +161,7 @@ def main():
             assert inspect["sandbox_init_sha256"] == runtime_init_digest(metadata["artifacts"]["sandbox-init"]), "runtime bundle does not contain the selected sandbox-init"
             assert inspect["balloon_proc_field"] == "false", "this case requires the unpatched Balloon proc ABI"
             assert "pagesets" in inspect["zoneinfo"] and "count:" in inspect["zoneinfo"], "PCP source missing"
-            if name in ("off", "oom"):
+            if name == "off" or balloon:
                 time.sleep(2.2)
                 before = sb.view()
             else:
@@ -173,9 +173,9 @@ def main():
             if name == "multidisk":
                 sb.cli("exec", "--", "/probe", "write", "/data/cache/usage-data", "16")
             sb.record_timing("cpu-and-disk-workload", started)
-            if name in ("off", "oom"):
-                # Keep the absence window and OOM controller warmup. A saved
-                # usage frame does not prove asynchronous balloon control settled.
+            if name == "off" or balloon:
+                # Keep the absence window and every balloon controller warmup.
+                # A saved usage frame does not prove asynchronous CH resize settled.
                 time.sleep(max(0, seconds - (time.monotonic() - started)))
                 after = sb.view()
             else:

@@ -1,3 +1,4 @@
+import ast
 import copy
 import errno
 import http.client
@@ -1681,6 +1682,36 @@ class UsageReadinessPredicateTests(unittest.TestCase):
             snapshot['gauges'][0]['covered_total_ns'] = 'invalid'
             with self.assertRaises(ValueError):
                 usage_faults.fault_baseline_ready(value, 'single')
+
+    def test_balloon_and_negative_branches_keep_original_observation_windows(self):
+        # Execute the case's actual branches against an immediately available
+        # usage view. Usage durability cannot establish asynchronous CH resize.
+        path = ROOT / "test/e2e/cases/telemetry.usage.sh"
+        body = path.read_text().split("<<'PY'\n", 1)[1].rsplit("\nPY\n", 1)[0]
+        tree = ast.parse(body)
+        for target, seconds in (("before", 2.2), ("after", 12)):
+            branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+                          and any(isinstance(child, ast.Assign) and
+                                  any(isinstance(value, ast.Name) and value.id == target for value in child.targets)
+                                  for child in node.body)
+                          and any(isinstance(child, ast.Assign) and
+                                  any(isinstance(value, ast.Name) and value.id == target for value in child.targets)
+                                  for child in node.orelse))
+            code = compile(ast.fix_missing_locations(ast.Module(body=[branch], type_ignores=[])), str(path), "exec")
+            for name in ("off", "balloon", "balloon-no-oom", "oom", "single", "overlay", "multidisk", "restore"):
+                with self.subTest(stage=target, case=name):
+                    sb = unittest.mock.Mock()
+                    scope = dict(usage_case.__dict__, name=name, balloon=name in ("balloon", "balloon-no-oom", "oom"),
+                                 seconds=12, started=0, sb=sb, before={})
+                    with patch.object(usage_case.time, "monotonic", return_value=0), patch.object(usage_case.time, "sleep") as sleep:
+                        exec(code, scope)
+                    if name in ("off", "balloon", "balloon-no-oom", "oom"):
+                        sleep.assert_called_once_with(seconds)
+                        sb.view.assert_called_once_with()
+                        sb.wait_view.assert_not_called()
+                    else:
+                        sleep.assert_not_called()
+                        sb.wait_view.assert_called_once()
 
     def test_baseline_requires_all_sources(self):
         self.assertTrue(usage_case.baseline_ready(self.before(), 'single'))
