@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Archive fixtures target x86_64 even when this gate runs on an ARM host.
+# Validators run natively; payload fixtures are inspected, never executed.
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -337,10 +340,10 @@ for binary in sandbox-ctl sandbox-init; do
   cp "$fixture_root/main.go" "$fixture_root/cmd/$binary/main.go"
 done
 fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE LICENSES NOTICE .gitignore scripts native-deps/Makefile go.mod main.go cmd)"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" .)
+(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/go-fixture" .)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
 printf '// dirty fixture\n' >> "$fixture_root/main.go"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/dirty-go-fixture" .)
+(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/dirty-go-fixture" .)
 if (release_materials_require_go_revision "$TMP/dirty-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
   fail "release accepted a binary built from dirty source"
 fi
@@ -357,7 +360,7 @@ for binary in sandbox-ctl sandbox-init; do
   (cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/bin/$binary" "./cmd/$binary")
 done
 # Native fixture is inspected, never executed.
-install -m 0755 /bin/true "$TMP/bin/cloud-hypervisor"
+install -m 0755 "$TMP/go-fixture" "$TMP/bin/cloud-hypervisor"
 printf 'fixture credits\n' > "$TMP/cloud-hypervisor/CREDITS.md"
 printf 'fixture Apache license\n' > "$TMP/cloud-hypervisor/LICENSES/Apache-2.0.txt"
 printf 'fixture BSD license\n' > "$TMP/cloud-hypervisor/LICENSES/BSD-3-Clause.txt"
