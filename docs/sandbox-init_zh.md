@@ -1194,7 +1194,7 @@ Guest 读取 `/proc/zoneinfo`、`/proc/buddyinfo`, 匹配 node/zone identity 及
 排除 Device/PMEM. 其他已填充域为 unsupported, 不由 `spanned` 或 Host
 capacity 猜测.
 
-文件系统观测使用[磁盘组装](#31-阶段-1早期挂载--并发取-launch-spec--switch-root)保留的私有 CLOEXEC 句柄。switch-root 和恢复后的 mount 保持句柄有效，应用 exec 不继承它们。同盘 bind/empty volume 不另登记文件系统；不枚举任意 mount，不查询用户 NFS/FUSE，不运行 `du`。
+文件系统观测使用[磁盘组装](#31-阶段-1基础-runtime等待-launch工作负载-root-与-switch-root)保留的私有 CLOEXEC 句柄。switch-root 和恢复后的 mount 保持句柄有效，应用 exec 不继承它们。同盘 bind/empty volume 不另登记文件系统；不枚举任意 mount，不查询用户 NFS/FUSE，不运行 `du`。
 
 ```jsonc
 {

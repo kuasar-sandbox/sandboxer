@@ -1449,7 +1449,7 @@ and per-CPU pagesets. It returns `PresentPages`, `BuddyFreePages`,
 are DMA, DMA32 and Normal; Device/PMEM are excluded. Other populated domains
 are unsupported, not guessed from `spanned` or host capacity.
 
-Filesystem observations use the private CLOEXEC handles retained during [disk assembly](#31-phase-1-early-mounts-concurrent-launch-spec-fetch-and-switch-root). Switch-root and restored mounts preserve these handles; application exec does not inherit them. Bind/empty volumes on the same disk do not add filesystem registrations. No arbitrary mount enumeration, NFS/FUSE query or `du` is performed.
+Filesystem observations use the private CLOEXEC handles retained during [disk assembly](#31-phase-1-base-runtime-wait-for-launch-workload-root-and-switch-root). Switch-root and restored mounts preserve these handles; application exec does not inherit them. Bind/empty volumes on the same disk do not add filesystem registrations. No arbitrary mount enumeration, NFS/FUSE query or `du` is performed.
 
 ```jsonc
 {
