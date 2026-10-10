@@ -1,5 +1,6 @@
-# timeouts-production.yaml — recommended host-side deadline profile for
-# PRODUCTION (fail-fast). Merge this fragment into your sandbox.yaml, e.g.
+# timeouts-production.yaml — example host-side deadline profile for
+# production management operations. Validate these values for your workload.
+# Merge this fragment into your sandbox.yaml, e.g.
 #
 #   sandbox-ctl run --config base.yaml:examples/timeouts-production.yaml ...
 #
@@ -10,14 +11,18 @@
 # environments, where a stalled remote-store or cache (or a paused debugger)
 # should NOT abort a restore that is still making healthy progress.
 #
-# In production you usually want the opposite: a wedged restore should fail
-# fast so the orchestrator can retry or reschedule. The values below are a
-# conservative starting point — tune to your store/cache p99 + a safety margin.
+# These are example management deadlines, not an end-to-end recovery SLO.
+# Tune against measured cold/resume latency and your failure policy. A failed
+# restore does not itself prove that another node is eligible to restore it.
 #
 # NOTE: these bound only the host-side management/handshake path. The lazy-load
-# FETCH path (uffd page faults, vhost block reads) is bounded separately by the
-# accelerator client (`cache.timeout` / `store.timeout` in the manifest config);
-# set those there. The `snapshot` subcommand has its own `--timeout`.
+# FETCH path (uffd page faults, vhost block reads) uses source read recovery.
+# `cache.timeout` / `store.timeout` bound one backend attempt, NOT total retry
+# duration. Retryable reads retain their request/buffer until success, operation
+# cancellation or a permanent error; independent fatal health policy can end
+# the runtime. There is no cumulative read-retry deadline or attempt limit.
+# See docs/sandbox.md#read-recovery for diagnosis and shutdown boundaries.
+# The `snapshot` subcommand has its own `--timeout`.
 
 timeouts:
   # Host wait for the guest's restore_ack after /vm.resume. Must exceed the
