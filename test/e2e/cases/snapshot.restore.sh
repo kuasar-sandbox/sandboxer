@@ -135,7 +135,7 @@ readiness_stop_watchdog
 # Capture preparation can advance the guest counter. Sample only after the
 # source runner exits and its output is complete; restore must progress from
 # that captured state, not from an earlier pre-capture observation.
-PRE_SNAP_TICK="$(awk '/^TICK / { last=$0 } END { print last }' "$LOG1")"
+PRE_SNAP_TICK="$(awk '/^TICK([[:space:]]|$)/ { last=$0 } END { print last }' "$LOG1")"
 [[ "$PRE_SNAP_TICK" =~ ^TICK\ ([0-9]+)[[:space:]]*$ ]] || e2e_fail "missing or invalid final cold TICK: $PRE_SNAP_TICK"
 PRE_SNAP_TICK="${BASH_REMATCH[1]}"
 printf 'Captured cold counter: %s\n' "$PRE_SNAP_TICK"

@@ -128,7 +128,8 @@ SBPID2=$$
         self.assertIn('Captured cold counter: 22', result.stdout)
 
     def test_missing_or_malformed_final_sample_fails(self):
-        for record in ('', 'TICK nope\n', 'TICK 22suffix\n', 'TICK 21\nTICK nope\n'):
+        for record in ('', 'TICK nope\n', 'TICK 22suffix\n', 'TICK 21\nTICK nope\n',
+                       'TICK 21\nTICK\n', 'TICK 21\nTICK\t22\n'):
             with self.subTest(record=record):
                 result = self.exercise(record, 'TICK 25\n')
                 self.assertNotEqual(result.returncode, 0)
