@@ -838,10 +838,14 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	appWait := cfg.AppStartDeadline()
 	appTimer := time.NewTimer(appWait)
 	defer appTimer.Stop()
+	var appTimeout error
 	select {
 	case <-r.launch.AppStartedDone():
 	case <-appTimer.C:
-		return fail(fmt.Errorf("runtime launch app_started notification timed out after %s", appWait))
+		// commitLaunch runs before the user readiness callback, which may
+		// still be blocking AppStartedDone. Preserve that committed success
+		// just as the operation-cancellation and runtime-exit paths do.
+		appTimeout = fmt.Errorf("runtime launch app_started notification timed out after %s", appWait)
 	case <-ctx.Done():
 	case <-r.exitDone:
 	}
@@ -851,6 +855,9 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if succeeded {
 		launched = true
 		return nil
+	}
+	if appTimeout != nil {
+		return fail(appTimeout)
 	}
 	return fail(errors.Join(errors.New("runtime launch did not complete"), ctx.Err()))
 

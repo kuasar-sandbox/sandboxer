@@ -83,3 +83,48 @@ func TestSDKAppStartDeadlineAndCancellationCloseRuntime(t *testing.T) {
 		})
 	}
 }
+
+func TestSDKAppStartDoesNotTimeoutCommittedReadinessCallback(t *testing.T) {
+	for _, startupBudget := range []string{"", "100ms"} {
+		t.Run("app_start="+startupBudget, func(t *testing.T) {
+			shape, launch := sdkFixture(t)
+			shape.Timeouts.AppNotify = "5s"
+			shape.Timeouts.AppStart = startupBudget
+			entered, release := make(chan struct{}), make(chan struct{})
+			shape.NotifyReadiness = func(event ReadinessEvent) {
+				if event == ReadinessReady {
+					close(entered)
+					<-release
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			r, err := StartRuntime(ctx, shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			// Release the callback before joining runtime cleanup, including on
+			// a failed assertion. Launch must succeed while it is still blocked.
+			defer close(release)
+			result := make(chan error, 1)
+			go func() { result <- r.Launch(ctx, launch) }()
+			select {
+			case <-entered:
+			case <-ctx.Done():
+				t.Fatal("readiness callback was not entered")
+			}
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Fatalf("committed launch rejected for a blocked callback: %v", err)
+				}
+			case <-time.After(4 * time.Second):
+				t.Fatalf("committed launch waited for callback: state=%s", r.State())
+			}
+			if r.State() != "running" {
+				t.Fatalf("committed launch state=%s", r.State())
+			}
+		})
+	}
+}

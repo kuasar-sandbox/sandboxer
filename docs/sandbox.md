@@ -1533,6 +1533,9 @@ bootstrap and receipt of `app_started` (default `2s`; explicit values must be
 positive). It is independent of `timeouts.app_notify`, the socket read deadline
 for one message. A missing event or canceled operation closes the runtime.
 
+A readiness callback that remains blocked after launch has committed does not
+turn that success into an application-start timeout.
+
 Operation contexts bound startup, launch, restore, live operations and individual
 waits. Canceling a successfully completed startup/launch context cannot kill the
 returned runtime or invalidate later lazy reads. `Wait(ctx)` cancellation only

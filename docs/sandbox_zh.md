@@ -1378,6 +1378,8 @@ ACK 后由 `timeouts.app_start` 限制 Guest 进程引导及 `app_started` 通�
 默认 `2s`，显式值必须为正数。它与单条消息的 socket 读取期限
 `timeouts.app_notify` 独立；通知丢失或操作取消仍会关闭 runtime。
 
+启动已经提交成功后，readiness 回调阻塞不会再将该成功转为应用启动超时。
+
 Operation context 限定 startup、launch、restore、live operation 和单次 wait。
 成功返回后取消 startup/launch context，不会杀死 Runtime 或使后续 lazy read 失效。
 取消 `Wait(ctx)` 只取消该次等待；清理后重复 Wait 观察同一份保留的 `ExitResult`。
