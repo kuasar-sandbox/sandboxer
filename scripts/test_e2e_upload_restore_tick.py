@@ -82,5 +82,63 @@ wait_tick() { [[ "$2" == 25 ]]; }
                     self.assertIn("missing or invalid final TICK", result.stderr)
 
 
+class LocalRestoreTickTests(unittest.TestCase):
+    def exercise(self, final_record, restored_log):
+        source = (CASES / "snapshot.restore.sh").read_text()
+        # Execute the real capture/sample and restored-progress sequences.
+        start = source.index("PY_DIO\n", source.index('"$OUT/dio-before.json" <<')) + len("PY_DIO\n")
+        sequence = source[start:source.index('\nmv "$CAPTURE_RUNTIME"', start)]
+        start = source.index('WANT_TICK=')
+        progress = source[start:source.index('\nkill -TERM "$SBPID2"', start)]
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / 'restore.log').write_text(restored_log)
+            binary = work / 'sandbox-ctl'
+            binary.write_text('#!/bin/bash\nprintf "TICK 17\\n" >> "$TEST_LOG"\ntouch "$TEST_SNAPSHOT"\n')
+            binary.chmod(0o755)
+            setup = r'''
+WORK=$TEST_WORK; BIN=$WORK; OUT=$WORK; SID1=source
+mkdir "$WORK/snapshot"
+LOG1=$WORK/source.log; LOG2=$WORK/restore.log
+export TEST_LOG=$LOG1 TEST_SNAPSHOT=$WORK/snapshot/source.snapshot
+printf 'TICK 10\n' > "$LOG1"
+mkfifo "$WORK/drain"
+( read -r _ < "$WORK/drain"; printf '%s' "$FINAL_RECORD" > "$LOG1" ) &
+SBPID1=$!
+source_pid=$SBPID1
+trap 'kill "$source_pid" 2>/dev/null || :; builtin wait "$source_pid" 2>/dev/null || :' EXIT
+source_shell=$BASHPID
+wait() {
+    [[ $BASHPID == "$source_shell" ]] || return 1
+    printf 'drain\n' > "$WORK/drain"
+    builtin wait "$@"
+}
+readiness_stop_watchdog() { :; }
+e2e_fail() { echo "$*" >&2; exit 1; }
+sleep() { :; }
+SBPID2=$$
+'''
+            return subprocess.run(['bash', '-euo', 'pipefail', '-c', setup + sequence + '\n' + progress],
+                                  env={**ENV, 'TEST_WORK': directory, 'FINAL_RECORD': final_record},
+                                  capture_output=True, text=True, timeout=10)
+
+    def test_capture_preparation_and_output_drain_advance_the_counter(self):
+        result = self.exercise('TICK 10\nTICK 17\nTICK 22\n', 'TICK 23\nTICK 24\nTICK 25\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Captured cold counter: 22', result.stdout)
+
+    def test_missing_or_malformed_final_sample_fails(self):
+        for record in ('', 'TICK nope\n', 'TICK 22suffix\n', 'TICK 21\nTICK nope\n'):
+            with self.subTest(record=record):
+                result = self.exercise(record, 'TICK 25\n')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('missing or invalid final cold TICK', result.stderr)
+
+    def test_restore_without_required_progress_fails(self):
+        result = self.exercise('TICK 22\n', 'TICK 23\nTICK 24\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('restored counter did not continue past captured state', result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
