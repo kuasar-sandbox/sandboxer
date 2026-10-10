@@ -832,21 +832,20 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	case <-r.exitDone:
 		return fail(errors.New("runtime exited before launch_ack"))
 	}
-	// app_started is best-effort in the guest: a failed short notification is
-	// logged there and is not retried. Never leave Launch blocked forever when
-	// that notification is lost. Use the same configured app-notify budget,
-	// falling back to the protocol's guest-side bound when 0 means no socket
-	// deadline on the host listener.
-	appWait := cfg.AppNotifyDeadline()
-	if appWait <= 0 {
-		appWait = proto.DeadlineAppNotify
-	}
+	// ACK precedes process/cgroup/namespace bootstrap in the guest. Bound that
+	// lifecycle phase independently of the per-message app-notify socket I/O.
+	// app_started is best-effort, so a lost notification still fails closed.
+	appWait := cfg.AppStartDeadline()
 	appTimer := time.NewTimer(appWait)
 	defer appTimer.Stop()
+	var appTimeout error
 	select {
 	case <-r.launch.AppStartedDone():
 	case <-appTimer.C:
-		return fail(fmt.Errorf("runtime launch app_started notification timed out after %s", appWait))
+		// commitLaunch runs before the user readiness callback, which may
+		// still be blocking AppStartedDone. Preserve that committed success
+		// just as the operation-cancellation and runtime-exit paths do.
+		appTimeout = fmt.Errorf("runtime launch app_started notification timed out after %s", appWait)
 	case <-ctx.Done():
 	case <-r.exitDone:
 	}
@@ -856,6 +855,9 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if succeeded {
 		launched = true
 		return nil
+	}
+	if appTimeout != nil {
+		return fail(appTimeout)
 	}
 	return fail(errors.Join(errors.New("runtime launch did not complete"), ctx.Err()))
 

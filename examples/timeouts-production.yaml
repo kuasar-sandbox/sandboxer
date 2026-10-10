@@ -50,3 +50,7 @@ timeouts:
   # app_exited / mem_report). 200ms is tight; raise it if your guests send
   # mem_report while a slow page-in still blocks the vCPU.
   app_notify: 200ms
+
+  # SDK post-ACK process bootstrap + app_started receipt; independent of
+  # app_notify. Default 2s; explicit values must be positive.
+  app_start: 2s

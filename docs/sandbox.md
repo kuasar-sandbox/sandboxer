@@ -1527,6 +1527,15 @@ prove target execve success or application health. Waiting for assignment after
 resource reservations, controller heartbeat and resource stats, but do not
 report workload ready or Settled before launch.
 
+The SDK cold-launch path waits for `launch_ack` under `launch.start_timeout`
+and the operation context. After ACK, `timeouts.app_start` bounds guest process
+bootstrap and receipt of `app_started` (default `2s`; explicit values must be
+positive). It is independent of `timeouts.app_notify`, the socket read deadline
+for one message. A missing event or canceled operation closes the runtime.
+
+A readiness callback that remains blocked after launch has committed does not
+turn that success into an application-start timeout.
+
 Operation contexts bound startup, launch, restore, live operations and individual
 waits. Canceling a successfully completed startup/launch context cannot kill the
 returned runtime or invalidate later lazy reads. `Wait(ctx)` cancellation only
@@ -2419,7 +2428,10 @@ Run `go test ./...` and `go test -race ./...`. The SDK regressions in
 [`runtime_sdk_test.go`](../pkg/sandbox/runtime_sdk_test.go) use real child processes
 and Unix sockets to check ownership, base/launch gates, cancellation, concurrent
 Close, retained Wait, failed launch/stdio, late artifact reads, and disk payload
-boundaries. They do not boot a Guest kernel. The vhost binding tests exercise
+boundaries. [`runtime_app_start_test.go`](../pkg/sandbox/runtime_app_start_test.go)
+checks delayed post-ACK notifications independently of socket deadlines, the
+application-start budget, operation cancellation, and failed-launch cleanup.
+These tests do not boot a Guest kernel. The vhost binding tests exercise
 unbound IOERR, atomic publication and in-flight segmented requests; guest socket
 tests exercise base ping/shutdown and rejection of workload-only operations.
 

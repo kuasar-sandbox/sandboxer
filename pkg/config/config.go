@@ -836,6 +836,8 @@ func (c *SandboxConfig) StartTimeoutDuration() time.Duration {
 // This default eases deployment in slow or degraded environments (a stalled
 // remote/cache or a paused debugger never aborts a restore); set positive
 // values (examples/timeouts-production.yaml) to fail fast in production.
+// AppStart is an exception: a missing best-effort notification must always
+// fail closed, so this lifecycle budget has a positive default.
 type TimeoutsConfig struct {
 	Restore  string `yaml:"restore,omitempty"`   // wait for guest restore_ack after /vm.resume
 	CHApi    string `yaml:"ch_api,omitempty"`    // CH HTTP API response (e.g. /vm.resume); dial stays bounded
@@ -853,6 +855,10 @@ type TimeoutsConfig struct {
 	// mem_report). Default no-forced so a slow guest (faulting in pages)
 	// doesn't get its mem_report connection dropped mid-restore.
 	AppNotify string `yaml:"app_notify,omitempty"`
+	// AppStart bounds SDK Launch after launch_ack, including process/cgroup
+	// bootstrap and receipt of app_started. Empty uses DefaultAppStartDeadline;
+	// an explicit value must be positive. It never changes socket deadlines.
+	AppStart string `yaml:"app_start,omitempty"`
 }
 
 // NoForcedTimeout is the effective-infinity used where an underlying call needs
@@ -881,6 +887,17 @@ func parseTimeout(s string) time.Duration {
 // limit. Set timeouts.ch_api to override, or to "0" for no forced timeout.
 const DefaultCHApiDeadline = 60 * time.Second
 
+// DefaultAppStartDeadline bounds a lost best-effort app_started event while
+// allowing guest process bootstrap to exceed a single 200ms socket exchange.
+const DefaultAppStartDeadline = 2 * time.Second
+
+func (c *SandboxConfig) AppStartDeadline() time.Duration {
+	if d := parseTimeout(c.Timeouts.AppStart); d > 0 {
+		return d
+	}
+	return DefaultAppStartDeadline
+}
+
 // RestoreDeadline / APIReadyDeadline / VAReportDeadline / PingDeadline /
 // AppNotifyDeadline resolve the corresponding timeouts.* field; 0 = no forced
 // timeout. CHApiDeadline is the exception: unset → DefaultCHApiDeadline (see above).
@@ -896,8 +913,14 @@ func (c *SandboxConfig) VAReportDeadline() time.Duration  { return parseTimeout(
 func (c *SandboxConfig) PingDeadline() time.Duration      { return parseTimeout(c.Timeouts.Ping) }
 func (c *SandboxConfig) AppNotifyDeadline() time.Duration { return parseTimeout(c.Timeouts.AppNotify) }
 
-// validate rejects malformed (non-empty, unparseable) timeouts.* durations.
+// validate rejects malformed durations and non-positive app_start budgets.
 func (t TimeoutsConfig) validate() error {
+	if t.AppStart != "" {
+		d, err := time.ParseDuration(t.AppStart)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("timeouts.app_start must be a positive duration")
+		}
+	}
 	for _, f := range []struct{ name, val string }{
 		{"timeouts.restore", t.Restore},
 		{"timeouts.ch_api", t.CHApi},
