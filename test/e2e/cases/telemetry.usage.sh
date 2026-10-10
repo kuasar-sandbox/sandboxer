@@ -37,7 +37,59 @@ import time
 
 from usage_report_relay import ReportRelay
 
-from usage import (BIN, Sandbox, build_probe, digest, ext4, image_ref, metric, run, write_json, runtime_init_digest, oom_pressure)
+from usage import (BIN, Sandbox, build_probe, digest, ext4, image_ref, metric, metrics_ready, run, write_json, runtime_init_digest, oom_pressure)
+
+FIELDS = ("guest.memory", "filesystem.root", "ch.rss_anon", "ch.rss_file",
+          "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file")
+
+
+def observation_budget(started, window):
+    # The original fixed window was followed by a usage query with a 15s
+    # timeout. Keep its allowance even when the workload outlasts the window.
+    return max(0, window-(time.monotonic()-started)) + 15
+
+
+def baseline_ready(view, name):
+    assert view["enabled"], "usage unexpectedly disabled"
+    live = view.get("live")
+    if not live:
+        return False
+    assert live["sandbox_id"] == name and live["run_epoch"], live
+    return metrics_ready(live, FIELDS)
+
+
+def workload_ready(view, before, name):
+    assert view["enabled"], "usage unexpectedly disabled"
+    live = view["live"]
+    assert (live["sandbox_id"], live["run_epoch"]) == (name, before["live"]["run_epoch"]), live
+    saved = view.get("saved")
+    if not saved or int(view["saved_end"]) <= 0:
+        return False
+    persisted = saved["snapshot"]
+    assert (persisted["sandbox_id"], persisted["run_epoch"]) == (name, live["run_epoch"]), saved
+    if int(saved["sequence"]) <= int((before.get("saved") or {}).get("sequence", 0)):
+        return False
+    # Require the workload in both live and durable data, not an old saved frame.
+    for snapshot in (live, persisted):
+        if not metrics_ready(snapshot, FIELDS):
+            return False
+        cpu = int(metric(snapshot, "counters", "guest.cpu")["known_total_ns"])
+        initial_cpu = int(metric(before["live"], "counters", "guest.cpu")["known_total_ns"])
+        assert cpu >= initial_cpu, "guest CPU counter regressed"
+        if cpu-initial_cpu <= 1_000_000_000:
+            return False
+        for field in FIELDS:
+            current = metric(snapshot, "gauges", field)
+            previous = metric(before["live"], "gauges", field)
+            if current["status"] != "ok" or int(current["covered_total_ns"]) <= int(previous["covered_total_ns"]):
+                return False
+        filesystem = metric(snapshot, "gauges", "filesystem.root")
+        initial_fs = metric(before["live"], "gauges", "filesystem.root")
+        if int(filesystem["last_value_bytes"])-int(initial_fs["last_value_bytes"]) < 16*1024*1024:
+            return False
+        assert sum(g["name"].startswith("filesystem.") for g in snapshot["gauges"]) == (3 if name == "multidisk" else 1)
+    return True
+
 
 def main():
     seconds = 12
@@ -109,16 +161,26 @@ def main():
             assert inspect["sandbox_init_sha256"] == runtime_init_digest(metadata["artifacts"]["sandbox-init"]), "runtime bundle does not contain the selected sandbox-init"
             assert inspect["balloon_proc_field"] == "false", "this case requires the unpatched Balloon proc ABI"
             assert "pagesets" in inspect["zoneinfo"] and "count:" in inspect["zoneinfo"], "PCP source missing"
-            time.sleep(2.2)
-            before = sb.view()
+            if name == "off" or balloon:
+                time.sleep(2.2)
+                before = sb.view()
+            else:
+                before = sb.wait_view("baseline", lambda v: baseline_ready(v, name), timeout=2.2+15)
             write_json(sb.dir / "before.json", before)
             started = time.monotonic()
             sb.cli("exec", "--", "/probe", "cpu", "2")
             sb.cli("exec", "--", "/probe", "write", "/tmp/usage-data", "16")
             if name == "multidisk":
                 sb.cli("exec", "--", "/probe", "write", "/data/cache/usage-data", "16")
-            time.sleep(max(0, seconds - (time.monotonic() - started)))
-            after = sb.view()
+            sb.record_timing("cpu-and-disk-workload", started)
+            if name == "off" or balloon:
+                # Keep the absence window and every balloon controller warmup.
+                # A saved usage frame does not prove asynchronous CH resize settled.
+                time.sleep(max(0, seconds - (time.monotonic() - started)))
+                after = sb.view()
+            else:
+                after = sb.wait_view("workload-live-and-saved", lambda v: workload_ready(v, before, name),
+                                     timeout=observation_budget(started, seconds))
             write_json(sb.dir / "after.json", after)
             if name == "off":
                 assert not after["enabled"] and "live" not in after
