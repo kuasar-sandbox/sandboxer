@@ -126,13 +126,19 @@ import json, sys
 r = json.load(open(sys.argv[1]))
 assert r['phase'] == 'armed' and r['cold_control_mismatches'] == 0 and r['regions'] == 32, r
 PY_DIO
-PRE_SNAP_TICK="$(grep -oE '^TICK [0-9]+' "$LOG1" | tail -1 | awk '{print $2}')"
 
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID1" --output "$WORK/snapshot" --run-root "$WORK/runtime" \
     >"$OUT/snapshot.log" 2>&1
 wait "$SBPID1" || true
 SBPID1=""
 readiness_stop_watchdog
+# Capture preparation can advance the guest counter. Sample only after the
+# source runner exits and its output is complete; restore must progress from
+# that captured state, not from an earlier pre-capture observation.
+PRE_SNAP_TICK="$(awk '/^TICK([[:space:]]|$)/ { last=$0 } END { print last }' "$LOG1")"
+[[ "$PRE_SNAP_TICK" =~ ^TICK\ ([0-9]+)[[:space:]]*$ ]] || e2e_fail "missing or invalid final cold TICK: $PRE_SNAP_TICK"
+PRE_SNAP_TICK="${BASH_REMATCH[1]}"
+printf 'Captured cold counter: %s\n' "$PRE_SNAP_TICK"
 SNAPSHOT="$WORK/snapshot/$SID1.snapshot"
 [ -f "$SNAPSHOT" ] || e2e_fail "snapshot is missing"
 

@@ -389,6 +389,20 @@ Cloud Hypervisor 二进制执行真实冷启动、guest exec、快照与恢复�
 非 SVE 状态,但不承诺跨主机 CPU 特性兼容,也不承诺向未打补丁的 VMM 反向恢复。
 SVE 保持启用,不兼容寄存器状态通过已有 KVM 错误失败。
 
+### 3.9 0012 — 在 vCPU 前恢复 KVM 时钟
+
+补丁 0012 回移上游 [commit ff20f183647c602bf5e5028d99959e5547a7dd84](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/ff20f183647c602bf5e5028d99959e5547a7dd84)，
+保留 CMGS 的作者归属和 sign-off。固定的 v51.1 恢复路径可能在还原已保存的 x86
+KVM 时钟前执行 vCPU。回移后先还原时钟，再恢复设备，最后恢复 vCPU。时钟操作仍仅
+适用于 x86；设备先于 vCPU 的顺序也适用于 ARM。快照 schema、Guest ABI 和固定的
+上游版本均不变。
+
+验证前应应用完整编号补丁序列并重建原生 VMM。补丁内容参与 native build/cache
+identity；不具备对应身份的既有二进制不能用于验证回移。重复执行单 vCPU 的
+`sandbox.memory-budget` 恢复、pause/wake，以及保留当前 direct-I/O 完整性断言的
+`snapshot.restore`，之后执行普通全量 E2E。记录原生架构和产品来源；仅交叉编译不会
+执行真实 KVM resume。小样本成功不能确定故障率，也不能据此诊断其他恢复错误。
+
 ## 4. 构建工作流
 
 `sandboxer/native-deps` 从固定 v51.1 tarball 构建,应用
