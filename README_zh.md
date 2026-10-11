@@ -119,6 +119,8 @@ Go-only 源码构建需要本仓以及兄弟目录中的 `accelerator` 和 `conn
 
 ## Release 模型
 
+所选 owner 源码在 `release/helper-inputs.json` 声明完整的编译型 E2E helper 清单。配方 `scripts/build-e2e-helpers.sh` 接收目标架构和全新的输出目录，仅在源码构建阶段使用已准入的依赖工作区执行；打包 prepare 和用例执行消费经校验的二进制。内部构建目标和包路径由本仓维护。
+
 包内来源记录只有在本地 Git Tag 与所选源码 commit 一致时才保留内部依赖的发行
 版本。未打 Tag 的源码构建记录 `git:<commit>`,不要求创建目标发行 Tag。
 

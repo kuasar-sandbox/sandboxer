@@ -134,6 +134,8 @@ separate native/runtime prerequisites, not dependencies of every Go-only check.
 
 ## Release model
 
+The selected owner source declares its complete compiled E2E helper inventory in `release/helper-inputs.json`. Its recipe, `scripts/build-e2e-helpers.sh`, accepts the target architecture and a fresh output directory. It runs only during the source-build stage with the admitted dependency workspace; package preparation and case execution consume its verified binaries. Internal build targets and package paths remain owned here.
+
 Package source records keep an internal dependency's release version only when
 its local Git tag matches the selected source commit. Untagged source builds
 record `git:<commit>`; this does not require creating target release tags.

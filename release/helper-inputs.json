@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "recipe": "scripts/build-e2e-helpers.sh",
+  "dependencies": [],
+  "helpers": [
+    {
+      "name": "usage-probe",
+      "env": "USAGE_PROBE_BIN",
+      "cases": [
+        "sandbox.*.sh",
+        "snapshot.*.sh",
+        "network.tapfd.sh",
+        "image.manifest-boot.sh",
+        "image.sandbox-assembly.sh",
+        "telemetry.usage.sh",
+        "telemetry.usage-faults.sh",
+        "telemetry.source-faults.sh"
+      ]
+    },
+    {
+      "name": "cgroup-fork-probe",
+      "env": "CGROUP_FORK_PROBE_BIN",
+      "cases": [
+        "sandbox.cgroup.sh"
+      ]
+    }
+  ]
+}
