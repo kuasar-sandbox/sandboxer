@@ -36,8 +36,8 @@ import pathlib, re, sys
 work = pathlib.Path(sys.argv[1])
 # Only bounded tails of owned runtime/error logs; never read config or key files.
 # Snapshot/source errors can contain manifest keys, so redact 256-bit hex values.
-for name in ('recovered.snapshot.log', 'recovered.log', 'verified.snapshot.log',
-             'verified.log', 'proxy.log'):
+for name in ('seed.snapshot.log', 'seed.log', 'recovered.snapshot.log',
+             'recovered.log', 'verified.snapshot.log', 'verified.log', 'proxy.log'):
     try:
         with (work / name).open('rb') as source:
             source.seek(0, 2)

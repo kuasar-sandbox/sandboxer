@@ -55,6 +55,8 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             key = "abcdef0123456789" * 4
             error = "snapshot: drain pinger before quiesce: launchclient: read response: EOF"
+            Path(directory, "seed.snapshot.log").write_text("snapshot: seed capture failed\n")
+            Path(directory, "seed.log").write_text("seed capture reached\n")
             Path(directory, "recovered.snapshot.log").write_text(error + "\n")
             Path(directory, "recovered.log").write_text(
                 "old log\n" * 10000 + "source manifest://" + key + "\n" + error + "\n")
@@ -63,6 +65,8 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
                                     text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(error, result.stderr)
+            self.assertIn("snapshot: seed capture failed", result.stderr)
+            self.assertIn("seed capture reached", result.stderr)
             self.assertIn("<redacted>", result.stderr)
             self.assertNotIn(key, result.stderr)
             self.assertNotIn("must-not-read-config", result.stderr)
@@ -433,6 +437,26 @@ class SourceFaultTests(unittest.TestCase):
 
 
 class SourceCleanupTests(unittest.TestCase):
+    def test_restore_failure_diagnostics_are_bounded_and_redacted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = "abcdef0123456789" * 4
+            (root / "run.log").write_text("old log\n" * 10000 + "manifest://" + key + "\nexec stalled\n")
+            (root / "trace-start.json").write_text('{"owner_pid": 42}\n')
+            (root / "config.yaml").write_text("must-not-read-config")
+            output = io.StringIO()
+            with patch.object(usage_sources.sys, "stderr", output):
+                usage_sources.dump_restore_failure("source-trace-detach", SimpleNamespace(dir=root), None)
+            text = output.getvalue()
+            self.assertIn("phase=source-trace-detach", text)
+            self.assertIn("exec stalled", text)
+            self.assertIn('"owner_pid": 42', text)
+            self.assertIn("<redacted>", text)
+            self.assertNotIn(key, text)
+            self.assertNotIn("must-not-read-config", text)
+            self.assertIn("trace-done.json: unavailable", text)
+            self.assertLess(len(text), 26000)
+
     def test_capture_unmounts_and_preserves_primary_failure(self):
         for fault in (RuntimeError("capture failed"), subprocess.TimeoutExpired("snapshot", 60)):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
