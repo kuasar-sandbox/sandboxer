@@ -634,6 +634,25 @@ def dump_restore_failure(phase, *sandboxes):
                 print(f"usage restore diagnostic {sb.dir.name}/{name}: unavailable", file=sys.stderr)
 
 
+def cleanup_restore_sources(sb, child, release, relay, failure, launched):
+    """Retain evidence when cleanup, rather than the case body, first fails."""
+    try:
+        if child is not None:
+            cleanup_sources(child, processes=(release,), relay=relay, failure=failure, owned_trace=True)
+    except BaseException as error:
+        if failure is None:
+            failure = error
+            dump_restore_failure("child-cleanup", sb, child)
+        raise
+    finally:
+        try:
+            cleanup_sources(sb, failure=failure, owned_trace=launched)
+        except BaseException:
+            if failure is None:
+                dump_restore_failure("source-cleanup", sb, child)
+            raise
+
+
 def restore_case(work, ref):
     config = filesystem_config(work, "restore-source", ref)
     sb = Sandbox(work, "restore-original", config, sandbox_id="restore-source")
@@ -767,15 +786,7 @@ def restore_case(work, ref):
         dump_restore_failure(phase, sb, child)
         raise
     finally:
-        try:
-            if child is not None:
-                cleanup_sources(child, processes=(release,), relay=relay, failure=failure, owned_trace=True)
-        except BaseException as error:
-            if failure is None:
-                failure = error
-            raise
-        finally:
-            cleanup_sources(sb, failure=failure, owned_trace=launched)
+        cleanup_restore_sources(sb, child, release, relay, failure, launched)
 
 
 def validate_ch_recovery(samples, baseline):
