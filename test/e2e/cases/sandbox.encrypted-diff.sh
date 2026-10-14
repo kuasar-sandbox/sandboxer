@@ -14,7 +14,7 @@ require_kvm
 for command in docker ip mkfs.ext4 od openssl python3 sha256sum stat tar timeout truncate; do
     require_command "$command"
 done
-for binary in sandbox-ctl flatten-ctl cloud-hypervisor manifest-ctl store-ctl mkfs.erofs; do
+for binary in sandbox-ctl flatten-ctl cloud-hypervisor manifest-ctl store-ctl; do
     require_binary "$binary"
 done
 for file in sandbox-init sandbox-runtime.bundle vmlinux; do
@@ -82,7 +82,7 @@ ROOT_PLAIN="$WORK/root.plain"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_PLAIN" --no-progress
 mkdir -p "$WORK/dataset-source"
 printf 'DATASET-BASE-OK\n' >"$WORK/dataset-source/DATASET-BASE-OK"
-MKFS_EROFS_PATH="$BIN/mkfs.erofs" "$BIN/flatten-ctl" export --no-progress \
+"$BIN/flatten-ctl" export --no-progress \
     --tmpdir "$WORK/flatten-tmp" --output "$WORK/dataset.plain" "$WORK/dataset-source"
 
 key_bound_ref() {

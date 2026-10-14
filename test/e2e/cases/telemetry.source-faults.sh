@@ -7,7 +7,7 @@ SANDBOXER_LIB="$E2E_LIB/sandboxer"
 require_root
 require_kvm
 for command in python3 strace ldd mount umount mkfs.ext4; do require_command "$command"; done
-for binary in sandbox-ctl sandbox-init cloud-hypervisor flatten-ctl mkfs.erofs; do require_binary "$binary"; done
+for binary in sandbox-ctl sandbox-init cloud-hypervisor flatten-ctl; do require_binary "$binary"; done
 for file in sandbox-runtime.bundle vmlinux; do [ -f "$BIN/$file" ] || e2e_fail "missing prepared product: $file"; done
 [ -x "$USAGE_PROBE_BIN" ] || e2e_fail "missing executable prepared usage probe"
 for file in usage.py usage_ch_relay.py usage_vsock_relay.py usage_ch_wrapper.py usage_vsock_wrapper.py; do [ -f "$SANDBOXER_LIB/$file" ] || e2e_fail "missing prepared helper: $file"; done

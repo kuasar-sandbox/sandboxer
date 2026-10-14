@@ -16,7 +16,7 @@ require_kvm
 for command in docker ip mkfs.ext4 python3 timeout truncate; do
     require_command "$command"
 done
-for binary in sandbox-ctl flatten-ctl cloud-hypervisor mkfs.erofs; do
+for binary in sandbox-ctl flatten-ctl cloud-hypervisor; do
     require_binary "$binary"
 done
 for file in sandbox-init sandbox-runtime.bundle vmlinux; do
@@ -51,7 +51,7 @@ docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no
 [ -s "$ROOT_IMAGE" ] || e2e_fail "flatten produced an empty root artifact"
 mkdir -p "$WORK/dataset-source"
 printf 'DATASET-OK\n' >"$WORK/dataset-source/DATASET-OK"
-MKFS_EROFS_PATH="$BIN/mkfs.erofs" "$BIN/flatten-ctl" export --no-progress \
+"$BIN/flatten-ctl" export --no-progress \
     --tmpdir "$WORK/tmp" --output "$WORK/dataset.img" "$WORK/dataset-source"
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 DATASET_REF="$(plaintext_tarstream_ref "$WORK/dataset.img")"

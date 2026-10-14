@@ -16,7 +16,7 @@ require_kvm
 for command in docker ip mkfs.ext4 timeout truncate; do
     require_command "$command"
 done
-for binary in sandbox-ctl flatten-ctl cloud-hypervisor mkfs.erofs; do
+for binary in sandbox-ctl flatten-ctl cloud-hypervisor; do
     require_binary "$binary"
 done
 for file in sandbox-init sandbox-runtime.bundle vmlinux; do
@@ -53,7 +53,7 @@ truncate -s 256M "$WORK/scratch.ext4"
 mkfs.ext4 -q -F -O ^has_journal "$WORK/scratch.ext4"
 mkdir -p "$WORK/dataset-source"
 printf 'DATASET-OK\n' >"$WORK/dataset-source/DATASET-OK"
-MKFS_EROFS_PATH="$BIN/mkfs.erofs" "$BIN/flatten-ctl" export --no-progress \
+"$BIN/flatten-ctl" export --no-progress \
     --tmpdir "$WORK/tmp" --output "$WORK/dataset.img" "$WORK/dataset-source"
 [ -s "$WORK/dataset.img" ] || e2e_fail "dataset flatten produced an empty artifact"
 truncate -s 256M "$WORK/dataset-up.ext4"
