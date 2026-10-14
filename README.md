@@ -171,3 +171,5 @@ Do not report vulnerabilities in a public issue. Use the [Kuasar Sandbox Securit
 ## License
 
 Original project content is licensed under the [Apache License 2.0](LICENSE). The Cloud Hypervisor and other third-party boundaries are documented in [`LICENSE_SCOPE.md`](LICENSE_SCOPE.md). Preserve upstream copyright, attribution, NOTICE, and SPDX declarations.
+
+<!-- Temporary RFC 245 docs-only Actions acceptance; this branch is not a merge candidate. -->
