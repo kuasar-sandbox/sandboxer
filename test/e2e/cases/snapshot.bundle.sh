@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # Portable Bundle A -> B -> C snapshot chain, exact upload, and remote restore.
 set -euo pipefail
 shopt -s nullglob

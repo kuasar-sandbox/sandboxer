@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","userfaultfd"]
 # Remote read recovery through real CH/KVM, memory/UFFD, COW, and snapshot capture.
 set -euo pipefail
 

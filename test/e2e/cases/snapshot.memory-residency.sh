@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # Non-merged memory parents remain explicit while local disks merge; restored page cache stays resident.
 set -euo pipefail
 

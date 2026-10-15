@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["kvm"]
 # Real usage-file ENOSPC, write failure/stall, abrupt exit and short-run accounting.
 set -euo pipefail
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"

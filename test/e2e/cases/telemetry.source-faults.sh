@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["kvm","userfaultfd"]
 # Per-source timeout/isolation, recovery, restored request epochs and CH/vsock faults.
 set -euo pipefail
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"

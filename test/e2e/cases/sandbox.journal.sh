@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","journald","kvm","tun","userfaultfd"]
 # Independent journald targets across cold, exec, snapshot/restore and startup failure.
 set -euo pipefail
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm"]
 # cgroup_control topology and immediate-fork placement race using a prepared probe.
 set -euo pipefail
 

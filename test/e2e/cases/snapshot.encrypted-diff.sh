@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # Encrypted local and remote snapshots preserve state and key-bound references.
 set -euo pipefail
 

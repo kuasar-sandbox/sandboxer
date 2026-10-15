@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # Remote A -> B -> C snapshot chains preserve process/disk state and reduction.
 set -euo pipefail
 

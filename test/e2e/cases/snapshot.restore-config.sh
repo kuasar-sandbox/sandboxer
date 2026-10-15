@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # Memory restore rejects cold-only host fields and resumes original process state unchanged.
 set -euo pipefail
 

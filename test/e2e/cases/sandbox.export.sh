@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun"]
 # Live export creates immutable Sandbox E disk points with cold-start semantics.
 set -euo pipefail
 

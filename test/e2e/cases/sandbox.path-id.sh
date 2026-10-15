@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","userfaultfd"]
 # Logical SandboxID vs filesystem PathID contract using prepared products only.
 set -euo pipefail
 

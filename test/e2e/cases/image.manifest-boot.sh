@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun"]
 # A manifest-backed image cold-boots through the prepared store/cache path and preserves image config.
 set -euo pipefail
 

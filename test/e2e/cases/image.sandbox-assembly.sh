@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm"]
 # Image-to-Sandbox-E assembly produces direct EROFS artifacts without a VM.
 set -euo pipefail
 

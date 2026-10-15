@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # Local same-owner snapshot chains merge to depth one and can be promoted remotely.
 set -euo pipefail
 

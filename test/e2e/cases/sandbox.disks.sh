@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun"]
 # Live multi-disk semantics: device order, mounts, base content and writes.
 set -euo pipefail
 

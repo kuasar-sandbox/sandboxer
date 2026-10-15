@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm"]
 # Placeholder/no-network anchor contract using prepared products only.
 set -euo pipefail
 

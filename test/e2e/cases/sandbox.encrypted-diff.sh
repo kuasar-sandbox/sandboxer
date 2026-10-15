@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun"]
 # Active encrypted root/data diffs remain sparse and guest-transparent.
 set -euo pipefail
 

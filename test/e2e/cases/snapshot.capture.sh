@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun"]
 # One freeze point produces an inspectable Snapshot S and runnable Sandbox E graph.
 set -euo pipefail
 

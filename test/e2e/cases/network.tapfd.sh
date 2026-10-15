@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # tapfd handoff and restore-network contract using prepared platform products.
 set -euo pipefail
 

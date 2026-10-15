@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # Snapshot/restore captures root plus ordered writable data-disk state.
 set -euo pipefail
 

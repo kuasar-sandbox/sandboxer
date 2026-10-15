@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun"]
 # Launch-spec contract using only prepared products and the prepared image.
 set -euo pipefail
 

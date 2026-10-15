@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["cgroup-v2","docker","kvm","userfaultfd"]
 # Product correctness regression for #114: budget, state, and snapshot residency.
 set -euo pipefail
 

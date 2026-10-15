@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["kvm","userfaultfd"]
 # Live/saved usage, disk accounting, balloon/OOM and restored epoch contracts.
 set -euo pipefail
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"

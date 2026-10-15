@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # Snapshot restore resumes guest state and resolves the captured runtime by sibling fallback.
 set -euo pipefail
 

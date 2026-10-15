@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun"]
 # Bidirectional launch-protocol contract using only prepared products.
 set -euo pipefail
 

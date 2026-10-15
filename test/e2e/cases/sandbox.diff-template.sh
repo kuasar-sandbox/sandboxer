@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun"]
 # Auto-default overlay diff seeded from a prepared ext4 template.
 set -euo pipefail
 

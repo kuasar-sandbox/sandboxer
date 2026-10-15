@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # Remote snapshot upload/restore preserves vCPU and disk state and portable refs.
 set -euo pipefail
 
