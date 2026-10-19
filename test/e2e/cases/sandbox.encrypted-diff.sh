@@ -158,6 +158,36 @@ timeout -k 2s 6 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/ru
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/run" -- /bin/sh -c \
     'set -e; grep -qx DATASET-BASE-OK /data/DATASET-BASE-OK; echo ROOT-ACTIVE-OK > /root-active; echo SCRATCH-ACTIVE-OK > /scratch/persist; echo DATA-ACTIVE-OK > /data/persist; sync'
 
+# Guest exec/sync can complete while the host still materializes a template.
+# Wait for atomic publication of every exact destination; guest FLUSH deliberately
+# does not drain the host cache or establish host-disk durability.
+wait_active_diffs() {
+    local budget=$1 deadline path pending
+    shift
+    deadline=$((SECONDS + budget))
+    while :; do
+        kill -0 "$RUN_PID" 2>/dev/null || {
+            tail -80 "$LOG" >&2 || true
+            e2e_fail "encrypted sandbox exited before active diffs were published"
+        }
+        pending=()
+        for path in "$@"; do
+            if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+                e2e_fail "active diff is not a regular file: $path"
+            fi
+            [ -f "$path" ] || pending+=("$path")
+        done
+        [ "${#pending[@]}" -eq 0 ] && return
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            tail -80 "$LOG" >&2 || true
+            printf 'unpublished active diff: %s\n' "${pending[@]}" >&2
+            e2e_fail "active diffs were not published within ${budget}s"
+        fi
+        sleep 1
+    done
+}
+wait_active_diffs 120 "$ROOT_DIFF" "$SCRATCH_DIFF" "$DATASET_DIFF"
+
 assert_diff() {
     local path=$1 logical=$2 magic physical blocks block_size allocated
     [ -f "$path" ] || e2e_fail "missing active diff: $path"

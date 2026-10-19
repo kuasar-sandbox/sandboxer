@@ -123,6 +123,7 @@ test-e2e-scripts:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-go-privilege.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_upload_restore_tick.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_disks_restore.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_encrypted_diff.py
 	BIN="$(abspath $(BINDIR))" PYTHONDONTWRITEBYTECODE=1 python3 test/source/usage_harness_test.py
 
 VERSION ?= v0.1.0
