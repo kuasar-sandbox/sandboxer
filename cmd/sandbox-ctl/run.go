@@ -19,7 +19,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
-	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	runtimesdk "github.com/kuasar-sandbox/sandboxer/pkg/runtime"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
@@ -273,8 +272,10 @@ func runCmd(args []string) int {
 
 	// Load the sandbox + manifest config from --config / --manifest-config (files
 	// + env). The orchestrator delivers per-sandbox config by writing these files;
-	// the secret manifest key rides in the MANIFEST_KEY env (resolved by
-	// pkg/manifest). orchestrator-ctl run-task sets both up before exec'ing here.
+	// the secret manifest key arrives in MANIFEST_KEY. ProcessStorage captures
+	// it before newRunProcessStorage removes it from the Go environment and
+	// the original environment block. orchestrator-ctl run-task sets both up
+	// before exec'ing here.
 	if *configPath == "" && *fromRef == "" {
 		fmt.Fprintln(diagnostics, "sandbox-ctl run: --config or SANDBOX_CONFIG required")
 		return 2
@@ -308,9 +309,9 @@ func runCmd(args []string) int {
 		}
 		manifestCfg = nil
 	}
-	processStorage, err := artifact.NewProcessStorage(manifestCfg)
+	processStorage, err := newRunProcessStorage(manifestCfg)
 	if err != nil {
-		fmt.Fprintf(diagnostics, "[sandbox-ctl] local crypto: %v\n", err)
+		fmt.Fprintf(diagnostics, "[sandbox-ctl] process storage: %v\n", err)
 		return 1
 	}
 	defer processStorage.Close()
