@@ -436,6 +436,176 @@ class SourceFaultTests(unittest.TestCase):
                 usage_sources.validate_old_epoch(changed, "old", "new")
 
 
+class CHRecoveryObservationTests(unittest.TestCase):
+    """Drive the shipped ch_case with a virtual clock, never a VM or subprocess."""
+
+    def run_case(self, work, mode="info", delay=2.0, fault=None):
+        state = SimpleNamespace(now=0.0, held=False, written=False, release_at=None,
+                                records={}, fresh_read=False, anchor_reads=0)
+        clock = SimpleNamespace(
+            monotonic=lambda: state.now,
+            monotonic_ns=lambda: int(state.now * 1_000_000_000),
+            sleep=lambda seconds: setattr(state, "now", state.now + seconds))
+        prior_info = {"config": {"balloon": {"size": 128 * 1024 * 1024}},
+                      "memory_actual_size": 384 * 1024 * 1024}
+        requests = [{"method": "GET", "path": "/api/v1/vm.info", "status": 200,
+                     "start_ns": -1, "response_body": json.dumps(prior_info)}]
+
+        def release():
+            if state.release_at is None:
+                state.release_at = state.now
+
+        relay = SimpleNamespace(
+            requests=requests, errors=[], arm=lambda *args, **kwargs: None,
+            held=SimpleNamespace(wait=lambda timeout: True),
+            release=SimpleNamespace(set=release, is_set=lambda: state.release_at is not None))
+        case_dir = work / ("ch-" + mode)
+        case_dir.mkdir()
+        process = SimpleNamespace(returncode=1 if fault == "pressure" else 0,
+                                  wait=lambda timeout: None)
+
+        def popen(*args, stdout, **kwargs):
+            state.held = True
+            put = {"method": "PUT", "path": "/api/v1/vm.resize", "status": 200,
+                   "start_ns": clock.monotonic_ns(), "received_ns": clock.monotonic_ns() + 1,
+                   "request_body": json.dumps({"desired_balloon": 64 * 1024 * 1024}),
+                   "held": mode == "resize"}
+            requests.append(put)
+            if mode == "info":
+                requests.append({"method": "GET", "path": "/api/v1/vm.info", "status": 200,
+                                 "start_ns": clock.monotonic_ns() + 2,
+                                 "received_ns": clock.monotonic_ns() + 3, "held": True})
+            stdout.write("MEMORY-READY 335544320\n")
+            return process
+
+        def cli(*args):
+            if args[-1] == "inspect":
+                return json.dumps({"sandbox_init_sha256": "digest", "balloon_proc_field": "false"})
+            if "write" in args:
+                # Model synchronous guest work after the last one-second held sample.
+                state.now += delay
+                state.written = True
+                return ""
+            raise AssertionError(("unexpected CLI call", args))
+
+        def view():
+            request_id = 100 + int(state.now + 1e-7)
+            memory = dict(name="guest.memory", last_request_id=str(request_id),
+                          covered_total_ns="100", integral_total_byte_ns="200",
+                          last_value_bytes="64", status="missing" if state.held else "ok",
+                          continuous=not state.held)
+            epoch = "run-1"
+            if state.release_at is None and state.written:
+                state.anchor_reads += 1
+                if fault in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
+                    memory[fault] = str(int(memory[fault]) + 1)
+                elif fault == "anchor_ok":
+                    memory["status"] = "ok"
+                elif fault == "anchor_continuous":
+                    memory["continuous"] = True
+                elif fault == "anchor_regression":
+                    memory["last_request_id"] = "99"
+                elif fault == "anchor_epoch":
+                    epoch = "run-2"
+            if state.release_at is not None:
+                step = int(state.now + 1e-7) - int(state.release_at + 1e-7)
+                if step >= 1:
+                    if fault != "no_fresh_read" and not state.fresh_read:
+                        requests.append({"method": "GET", "path": "/api/v1/vm.info",
+                                         "status": 200, "start_ns": clock.monotonic_ns()})
+                        state.fresh_read = True
+                    if fault != "never_recovers":
+                        memory["status"] = "ok"
+                        memory["continuous"] = step > 1
+                        memory["covered_total_ns"] = str(100 + (step - 1) * 1_000_000_000)
+                        memory["integral_total_byte_ns"] = str(200 + (step - 1) * 64_000_000_000)
+                        if fault == "integrates_gap" and step == 1:
+                            memory["covered_total_ns"] = "101"
+                    if fault == "post_release_gap":
+                        memory["last_request_id"] = str(request_id + 1)
+            others = [dict(name=name, status="ok",
+                           covered_total_ns=str(1 + int(state.now * 1_000_000_000)))
+                      for name in ("filesystem.root", "ch.rss_anon", "ch.rss_file",
+                                   "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file")]
+            return {"live": {"run_epoch": epoch, "gauges": [memory, *others]}}
+
+        sandbox = SimpleNamespace(dir=case_dir, runroot=case_dir / "run", name="sample",
+                                  ready=lambda: None, cli=cli, view=view)
+        with patch.object(usage_sources, "Sandbox", return_value=sandbox), \
+             patch.object(usage_sources, "CHRelay", return_value=relay), \
+             patch.object(usage_sources, "ext4"), \
+             patch.object(usage_sources, "digest", return_value="digest"), \
+             patch.object(usage_sources, "runtime_init_digest", return_value="digest"), \
+             patch.object(usage_sources, "resources", return_value={"fds": 5}), \
+             patch.object(usage_sources, "subprocess", SimpleNamespace(Popen=popen, STDOUT=subprocess.STDOUT)), \
+             patch.object(usage_sources, "time", clock), \
+             patch.object(usage_sources, "cleanup_sources"), \
+             patch.object(usage_sources, "write_json",
+                          side_effect=lambda path, value: state.records.__setitem__(
+                              path.name, copy.deepcopy(value))), \
+             patch.object(sys, "stdout", io.StringIO()):
+            usage_sources.ch_case(work, "ref", mode)
+        return state
+
+    def test_held_rounds_before_release_are_reanchored(self):
+        for mode in ("info", "resize"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                state = self.run_case(Path(directory), mode=mode)
+                previous = usage.metric(state.records["during.json"][-1]["live"], "gauges", "guest.memory")
+                anchor = usage.metric(state.records["recovery-baseline.json"]["live"], "gauges", "guest.memory")
+                self.assertGreater(int(anchor["last_request_id"]), int(previous["last_request_id"]) + 1)
+                self.assertEqual(state.anchor_reads, 1)
+                self.assertLessEqual(state.now - state.release_at, 5.100001)
+
+    def test_no_extra_guest_delay_still_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.run_case(Path(directory), delay=0.0)
+
+    def test_held_anchor_rejects_accounting_or_value_change(self):
+        for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(AssertionError, "held CH recovery baseline changed"):
+                    self.run_case(Path(directory), fault=field)
+
+    def test_held_anchor_must_stay_missing_and_noncontinuous(self):
+        for fault in ("anchor_ok", "anchor_continuous"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(AssertionError, "CH recovery baseline is not held"):
+                    self.run_case(Path(directory), fault=fault)
+
+    def test_held_anchor_rejects_request_regression_and_epoch_change(self):
+        for fault, message in (("anchor_regression", "CH recovery request regressed"),
+                               ("anchor_epoch", "CH recovery epoch changed")):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(AssertionError, message):
+                    self.run_case(Path(directory), fault=fault)
+
+    def test_post_release_gap_remains_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(AssertionError, "unobserved CH recovery round"):
+                self.run_case(Path(directory), fault="post_release_gap")
+
+    def test_first_valid_sample_cannot_integrate_gap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(AssertionError, "CH gap was integrated"):
+                self.run_case(Path(directory), fault="integrates_gap")
+
+    def test_missing_recovery_still_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(AssertionError):
+                self.run_case(Path(directory), fault="never_recovers")
+
+    def test_recovery_requires_fresh_actual_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(AssertionError, "no new successful CH actual read"):
+                self.run_case(Path(directory), fault="no_fresh_read")
+
+    def test_pressure_failure_still_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(AssertionError, "pressure workload failed"):
+                self.run_case(Path(directory), fault="pressure")
+
+
 class SourceCleanupTests(unittest.TestCase):
     def test_restore_failure_diagnostics_are_bounded_and_redacted(self):
         with tempfile.TemporaryDirectory() as directory:

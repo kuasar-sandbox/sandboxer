@@ -875,14 +875,24 @@ def ch_case(work, ref, mode):
             resize = previous
         assert resize["start_ns"] >= pressure_started
         assert 0 <= json.loads(resize["request_body"])["desired_balloon"] < prior_target, "held resize was not a pressure-driven deflate"
-        held_end = time.monotonic_ns()
-        assert not [row for row in relay.requests if held[0]["received_ns"] < row["start_ns"] < held_end], "CH reads piled up behind the held transaction"
         fd_counts = [row["fds"] for row in counts]
         assert max(fd_counts) - min(fd_counts) <= 4, fd_counts
         sb.cli("exec", "--", "/probe", "write", "/tmp/during-ch-hold", "1")
+        # Synchronous checks can span more held rounds after the final sample.
+        # Re-anchor while still held, then observe recovery without that gap.
+        recovery_view = sb.view()
+        recovery_baseline = metric(recovery_view["live"], "gauges", "guest.memory")
+        previous = metric(samples[-1]["live"], "gauges", "guest.memory")
+        assert recovery_view["live"]["run_epoch"] == samples[-1]["live"]["run_epoch"], "CH recovery epoch changed"
+        assert recovery_baseline["status"] == "missing" and not recovery_baseline["continuous"], "CH recovery baseline is not held"
+        assert int(recovery_baseline["last_request_id"]) >= int(previous["last_request_id"]), "CH recovery request regressed"
+        for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
+            assert recovery_baseline[field] == previous[field], "held CH recovery baseline changed"
+        held_end = time.monotonic_ns()
+        assert not [row for row in relay.requests if held[0]["received_ns"] < row["start_ns"] < held_end], "CH reads piled up behind the held transaction"
         relay.release.set()
         recovered, end = [], time.monotonic() + 5
-        last = int(metric(samples[-1]["live"], "gauges", "guest.memory")["last_request_id"])
+        last = int(recovery_baseline["last_request_id"])
         while time.monotonic() < end:
             view = sb.view()
             request = int(metric(view["live"], "gauges", "guest.memory")["last_request_id"])
@@ -890,8 +900,9 @@ def ch_case(work, ref, mode):
                 recovered.append(view)
                 last = request
             time.sleep(.1)
+        write_json(sb.dir / "recovery-baseline.json", recovery_view)
         write_json(sb.dir / "recovered.json", recovered)
-        validate_ch_recovery(recovered, metric(samples[-1]["live"], "gauges", "guest.memory"))
+        validate_ch_recovery(recovered, recovery_baseline)
         assert any(row["path"] == "/api/v1/vm.info" and row["start_ns"] > held_end and row.get("status") == 200 for row in relay.requests), "no new successful CH actual read after release"
         if pressure is not None:
             pressure.wait(timeout=10)
