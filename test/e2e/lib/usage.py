@@ -10,6 +10,7 @@ import select
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -79,6 +80,47 @@ def ext4(path, root=None):
     run(*args, path)
 
 
+def startup_failure_summary(path, returncode, elapsed):
+    """Summarize only fixed startup markers; never expose raw log text."""
+    result = {"child_returncode": returncode, "elapsed_seconds": round(elapsed, 3),
+              "deadline_seconds": 45}
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as log:
+            info = os.fstat(log.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                result["log_unavailable"] = True
+                return result
+            log.seek(max(0, info.st_size - 65536))
+            tail = log.read(65536)
+        result.update(log_bytes=info.st_size, scanned_tail_bytes=len(tail),
+                      tail_truncated=info.st_size > len(tail))
+    except OSError:
+        result["log_unavailable"] = True
+        return result
+    markers = (
+        b"runtime exited during startup", b"runtime exited before runtime_ready",
+        b"runtime exited before launch_ack", b"runtime launch interrupted before launch_ack",
+        b"runtime launch app_started notification timed out", b"runtime launch did not complete",
+        b"launch interrupted", b"sandbox start cancelled", b"spawn CH:", b"build CH cmd:",
+        b"cgroup: configure CH process:", b"fatal sandbox I/O:", b"CH wait:",
+        b"Kernel panic - not syncing:", b"Out of memory:", b"oom-kill:",
+        b"permission denied", b"operation not permitted", b"address already in use",
+        b"cannot allocate memory", b"no space left on device", b"no such file or directory",
+        b"exec format error", b"too many open files", b"context deadline exceeded",
+        b"context canceled", b"connection refused", b"connection reset by peer", b"broken pipe",
+    )
+    lowered = tail.lower()
+    result["marker_counts"] = {marker.decode("ascii"): lowered.count(marker.lower())
+                               for marker in markers if marker.lower() in lowered}
+    for field, prefix in (("ch_exit_codes", rb"CH exited"),
+                          ("guest_exit_codes", rb"guest reports user app exited")):
+        values = re.findall(rb"\[sandbox-ctl\] " + prefix + rb" code=(-?[0-9]{1,3})\r?$",
+                            tail, re.MULTILINE)
+        result[field] = [int(value) for value in values[-8:] if -128 <= int(value) <= 255]
+    return result
+
+
 class Sandbox:
     def __init__(self, work, name, config, restore=None, sandbox_id=None, base_root=None, ch_binary=None):
         self.dir = work / name
@@ -115,6 +157,12 @@ class Sandbox:
                 return
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 time.sleep(.1)
+        try:
+            summary = startup_failure_summary(self.dir / "run.log", self.process.returncode,
+                                              45 + time.monotonic() - end)
+            print("usage guest startup: " + json.dumps(summary, sort_keys=True), file=sys.stderr)
+        except Exception:
+            pass  # A diagnostic failure must not replace the original readiness failure.
         raise AssertionError(f"guest not ready; complete log: {self.dir / 'run.log'}")
 
     def view(self, timeout=15):
