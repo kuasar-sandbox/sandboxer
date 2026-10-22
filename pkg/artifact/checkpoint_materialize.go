@@ -59,7 +59,7 @@ func DiffCheckpointBaseID(root config.PortableRootConfig) string {
 // materializeCheckpointRoot consumes each pinned version once into private
 // ordinary artifacts. Later publication/rewrite may read those artifacts more
 // than once without strengthening the fixed-version sequential export API.
-func (p *Publisher) materializeCheckpointRoot(ctx context.Context, scope publishScope, root *sandboxfile.Root) (_ *sandboxfile.Root, cleanup func() error, retErr error) {
+func (p *Publisher) materializeCheckpointRoot(ctx context.Context, scope publishScope, root *sandboxfile.Root) (_ *sandboxfile.Root, _ func() error, retErr error) {
 	if root.Checkpoint == nil {
 		return root, func() error { return nil }, nil
 	}
@@ -103,7 +103,7 @@ func (p *Publisher) materializeCheckpointRoot(ctx context.Context, scope publish
 	if err != nil {
 		return nil, nil, err
 	}
-	cleanup = func() error { return os.RemoveAll(directory) }
+	cleanup := func() error { return os.RemoveAll(directory) }
 	defer func() {
 		if retErr != nil {
 			retErr = errors.Join(retErr, cleanup())
