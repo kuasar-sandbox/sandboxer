@@ -73,6 +73,9 @@ func (s *Store) mutateOnce(ctx context.Context, fn func(*transaction) error) err
 		return s.fail(err)
 	}
 	defer ofd(s.lock, unix.F_UNLCK, metadataByte, false)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	t := &transaction{store: s, ctrl: s.ctrl, pages: make(map[uint64][]byte), fresh: make(map[uint64]bool), nodes: make(map[uint64]node)}
 	if err := fn(t); err != nil {
 		// Missing IDs and cancellation are ordinary request failures. Corruption,
@@ -83,7 +86,13 @@ func (s *Store) mutateOnce(ctx context.Context, fn func(*transaction) error) err
 		}
 		return s.fail(err)
 	}
-	err := t.commit(ctx)
+	// Preparation has not published this transaction's allocations or mappings.
+	// Cancel here so commit errors retain their storage-error classification,
+	// including the private-overwrite path that needs no metadata transaction.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := t.commit()
 	if err != nil {
 		// Before publishing redo, all allocated slots remain unreachable. Once the
 		// commit write is attempted its result is uncertain: retain them for replay.
@@ -248,7 +257,9 @@ func (t *transaction) retire(slot uint64) error {
 	return t.setDesc(slot, d)
 }
 
-func (t *transaction) commit(ctx context.Context) error {
+// commit finishes the current transaction without consulting caller cancellation.
+// The caller checks cancellation before entry; later batches check it again.
+func (t *transaction) commit() error {
 	s := t.store
 	for slot, n := range t.nodes {
 		t.pages[slotPage(slot)] = encodeNode(n)
@@ -274,9 +285,6 @@ func (t *transaction) commit(ctx context.Context) error {
 	// transaction may be split to fit the bounded redo area.
 	if len(existing) > maxLogPages {
 		return fmt.Errorf("diffstore: transaction exceeds redo budget (%d)", len(existing))
-	}
-	if err = ctx.Err(); err != nil {
-		return err
 	}
 	sort.Slice(newPages, func(i, j int) bool { return newPages[i].page < newPages[j].page })
 	sort.Slice(existing, func(i, j int) bool { return existing[i].page < existing[j].page })

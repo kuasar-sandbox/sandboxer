@@ -6,4 +6,8 @@
 //
 // Store and its constructors expose v2 offline import/administration separately
 // from the live Disk boundary. Do not open a second Store owner for a live Disk.
+// Versioned mutations check cancellation before entering each transaction's
+// commit phase. Once commit starts, it completes and returns its actual result
+// even if the request context is canceled. Later batches may observe cancellation;
+// a completed batch is not rolled back and is not reported as canceled.
 package diffstore
