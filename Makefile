@@ -8,7 +8,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench e2e-usage-probe e2e-cgroup-fork-probe test-e2e-scripts release test-release clean help
+.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench e2e-usage-probe e2e-cgroup-fork-probe e2e-artifact-ref test-e2e-scripts release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -106,6 +106,11 @@ e2e-usage-probe:
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
 	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
 		-o "$(E2E_FIXTURE_DIR)/usage-probe" test/fixtures/usageprobe/main.go
+
+e2e-artifact-ref:
+	@mkdir -p "$(E2E_FIXTURE_DIR)"
+	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
+		-o "$(E2E_FIXTURE_DIR)/artifact-ref" ./test/fixtures/artifactref
 
 # The cgroup-control E2E must fork before libc or a language runtime starts in
 # order to detect Start->cgroup.procs races. Build that tiny libc-free probe in

@@ -3047,11 +3047,13 @@ check source isolation, bounded ownership and failure cleanup. Report their
 actual observation windows; they are not physical power-loss experiments.
 
 The performance harness is separate from product E2E. Prepare the test probe
-in the source-build stage and provide its executable path as `USAGE_PROBE_BIN`:
+and canonical artifact-identity reader in the source-build stage and provide
+their executable paths:
 
 ```bash
-make e2e-usage-probe
+make e2e-usage-probe e2e-artifact-ref
 export USAGE_PROBE_BIN="$PWD/build/e2e-tools/$(uname -m)/usage-probe"
+export ARTIFACT_REF_BIN="$PWD/build/e2e-tools/$(uname -m)/artifact-ref"
 ```
 
 Run the [off/on harness](../test/perf/usage_perf.py) without concurrent test

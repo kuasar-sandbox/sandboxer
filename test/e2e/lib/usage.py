@@ -13,7 +13,6 @@ import socket
 import stat
 import subprocess
 import sys
-import tarfile
 import time
 
 from usage_report_relay import ReportRelay
@@ -57,10 +56,16 @@ def digest(path):
 
 
 def image_ref(path):
-    with tarfile.open(path) as archive:
-        names = [n for n in archive.getnames() if n.startswith(".kuasar.digest.")]
-    assert len(names) == 1, names
-    return f"file://{path}@digest:{names[0].removeprefix('.kuasar.digest.')}"
+    prepared = os.environ.get("ARTIFACT_REF_BIN", "")
+    assert prepared, "product E2E requires ARTIFACT_REF_BIN"
+    helper = Path(prepared)
+    assert helper.is_file() and os.access(helper, os.X_OK), "missing prepared artifact-ref helper"
+    # SourceAt validates the complete canonical metadata/marker shape, including
+    # GNU sparse presence carriers. This is identity discovery, not a claim of
+    # full payload verification; product readers retain their integrity checks.
+    ref = run(helper, path)
+    assert re.fullmatch(r"digest:[0-9a-f]{64}\n", ref), "invalid prepared artifact identity"
+    return f"file://{path}@{ref.rstrip()}"
 
 
 def runtime_init_digest(standalone):

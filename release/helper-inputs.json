@@ -1,8 +1,17 @@
 {
   "schema": 1,
   "recipe": "scripts/build-e2e-helpers.sh",
-  "dependencies": [],
+  "dependencies": ["accelerator"],
   "helpers": [
+    {
+      "name": "artifact-ref",
+      "env": "ARTIFACT_REF_BIN",
+      "cases": [
+        "telemetry.usage.sh",
+        "telemetry.usage-faults.sh",
+        "telemetry.source-faults.sh"
+      ]
+    },
     {
       "name": "usage-probe",
       "env": "USAGE_PROBE_BIN",

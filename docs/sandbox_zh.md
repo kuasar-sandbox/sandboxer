@@ -2705,12 +2705,13 @@ health exec 和 CH `Running` 状态. 此次捕获失败回滚必须保留已占�
 报告应注明实际观测窗口; 它们不是物理掉电实验.
 
 在没有其他并发测试负载时, 以 root 权限和已组装的 `BIN` 运行
-性能测量与产品 E2E 分开。在源码构建阶段准备探针，并用 `USAGE_PROBE_BIN`
-提供已经构建的可执行文件：
+性能测量与产品 E2E 分开。在源码构建阶段准备探针与规范制品身份读取器，
+并提供已经构建的可执行文件路径：
 
 ```bash
-make e2e-usage-probe
+make e2e-usage-probe e2e-artifact-ref
 export USAGE_PROBE_BIN="$PWD/build/e2e-tools/$(uname -m)/usage-probe"
+export ARTIFACT_REF_BIN="$PWD/build/e2e-tools/$(uname -m)/artifact-ref"
 ```
 
 [off/on 测量脚本](../test/perf/usage_perf.py):

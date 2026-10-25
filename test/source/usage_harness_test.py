@@ -71,6 +71,32 @@ class RawTemplateTests(unittest.TestCase):
                         self.assertEqual(result.stdout, "raw provisioning template\n")
 
 
+class ArtifactReferenceTests(unittest.TestCase):
+    def test_requires_prepared_helper_without_local_fallback(self):
+        with patch.dict(os.environ, {"ARTIFACT_REF_BIN": ""}), patch.object(usage, "run") as run:
+            with self.assertRaisesRegex(AssertionError, "requires ARTIFACT_REF_BIN"):
+                usage.image_ref(Path("artifact"))
+            run.assert_not_called()
+
+    def test_exact_identity_and_argument_boundaries(self):
+        path = Path("artifact with spaces.img")
+        with patch.dict(os.environ, {"ARTIFACT_REF_BIN": sys.executable}), \
+             patch.object(usage, "run", return_value="digest:" + "a" * 64 + "\n") as run:
+            self.assertEqual(usage.image_ref(path), f"file://{path}@digest:" + "a" * 64)
+            run.assert_called_once_with(Path(sys.executable), path)
+
+    def test_helper_failure_and_invalid_output_are_not_accepted(self):
+        with patch.dict(os.environ, {"ARTIFACT_REF_BIN": sys.executable}):
+            for output in ("", "digest:bad\n", "digest:" + "A" * 64 + "\n",
+                           "hmac:" + "a" * 64 + "\n", "digest:" + "a" * 64 + "\nextra\n"):
+                with self.subTest(output=output), patch.object(usage, "run", return_value=output):
+                    with self.assertRaisesRegex(AssertionError, "invalid prepared"):
+                        usage.image_ref(Path("artifact"))
+            with patch.object(usage, "run", side_effect=subprocess.CalledProcessError(1, ["artifact-ref"])):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    usage.image_ref(Path("artifact"))
+
+
 class ReadRecoveryFatalCauseTests(unittest.TestCase):
     def test_capture_failure_diagnostics_are_bounded_and_redact_keys(self):
         script = (ROOT / "test/e2e/cases/snapshot.read-recovery.sh").read_text()
