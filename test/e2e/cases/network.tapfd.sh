@@ -155,12 +155,15 @@ mkdiff "$DIFF0"
 write_config "$WORK/cold.yaml" "$COLD_GUEST_IP" "$DIFF0" "$COLD_HOST_CIDR" 1
 SID="tapfd-cold-$BASHPID"
 COLD_LOG="$OUT/cold.log"
+COLD_READY="$OUT/cold.ready"
+: >"$COLD_READY"
 mkdir -p "$WORK/runtime"
 timeout -k 10s 120 "$BIN/sandbox-ctl" run \
     --config "$WORK/cold.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
-    --sandbox-id "$SID" >"$COLD_LOG" 2>&1 &
+    --sandbox-id "$SID" --ready-fd 3 \
+    3>"$COLD_READY" >"$COLD_LOG" 2>&1 &
 RUNPID=$!
 wait_marker '^NETUP$' "$COLD_LOG" "$RUNPID" || {
     tail -60 "$COLD_LOG" >&2 || true
@@ -172,11 +175,29 @@ grep -qE "net fd=[0-9]+,mac=$GUEST_MAC,id=_net0" "$COLD_LOG" || \
 assert_contains "$COLD_LOG" 'MTU=1400'
 ping_guest "$COLD_GUEST_IP" || e2e_fail "host could not ping cold guest through handed-off tap fd"
 
+# Guest stdout can precede the host's app_started acknowledgement. Snapshot
+# requires the host running state, which is committed before this ready event.
+wait_marker '^ready$' "$COLD_READY" "$RUNPID" || {
+    tail -60 "$COLD_READY" "$COLD_LOG" >&2 || true
+    e2e_fail "cold sandbox did not reach host running readiness"
+}
+
 SNAP_DIR="$WORK/snapshot"
 mkdir -p "$SNAP_DIR"
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID" --output "$SNAP_DIR" \
-    --run-root "$WORK/runtime" >"$OUT/snapshot.log" 2>&1
-wait "$RUNPID"
+    --run-root "$WORK/runtime" >"$OUT/snapshot.log" 2>&1 || {
+    snapshot_status=$?
+    printf 'snapshot failed: exit=%s\n' "$snapshot_status" >&2 || true
+    tail -60 "$OUT/snapshot.log" "$COLD_LOG" >&2 || true
+    exit "$snapshot_status"
+}
+wait "$RUNPID" || {
+    run_status=$?
+    RUNPID=""
+    printf 'cold run failed after snapshot: exit=%s\n' "$run_status" >&2 || true
+    tail -60 "$OUT/snapshot.log" "$COLD_LOG" >&2 || true
+    exit "$run_status"
+}
 RUNPID=""
 SNAPSHOT="$SNAP_DIR/$SID.snapshot"
 [ -f "$SNAPSHOT" ] || e2e_fail "snapshot output is missing"
