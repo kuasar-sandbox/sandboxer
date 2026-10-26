@@ -75,9 +75,16 @@ func OpenDisk(diffPath string, base BlockReader, init DiffInit, rawOptions ...Di
 		if err != nil {
 			return nil, err
 		}
-		bitmap, err = diff.scanDirtyBlocks()
-		if err != nil {
-			return nil, errors.Join(err, diff.Close())
+		if init.Existing {
+			bitmap, err = diff.scanDirtyBlocks()
+			if err != nil {
+				return nil, errors.Join(err, diff.Close())
+			}
+		} else {
+			// Fresh stores have no upper blocks. Keep frontend presence separate
+			// from committed backend presence without copying known-zero bytes.
+			// Templates determine capacity and start materializing below.
+			bitmap = make([]uint64, (diff.Size()/cowBlockSize+63)/64)
 		}
 	} else if !init.Existing && init.TemplatePath != "" {
 		fresh, err = createFreshDiffFile(diffPath, init, options.encryption)

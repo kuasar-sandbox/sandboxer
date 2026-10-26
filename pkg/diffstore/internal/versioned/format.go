@@ -339,10 +339,8 @@ func Create(path string, o Options) (*Store, error) {
 	if err = unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_KEEP_SIZE, int64(presenceAreaPage)*PageSize, int64(presence.Pages(o.LogicalSize))*PageSize); err != nil {
 		return fail(err)
 	}
-	for i := 0; i < presence.Pages(o.LogicalSize); i++ {
-		if err = writeFull(f, presence.Encode(bitmap, o.LogicalSize, i), presenceAreaPage+uint64(i)); err != nil {
-			return fail(err)
-		}
+	if err = writeInitialPresence(f, bitmap, o.LogicalSize); err != nil {
+		return fail(err)
 	}
 	info, _, _ := parseHeader(h, nil, true)
 	s := &Store{presence: bitmap, file: f, lock: lock, lockPath: lockPath, info: info, cipher: xc, ctrl: ctrl, cache: newCache(cachePages)}

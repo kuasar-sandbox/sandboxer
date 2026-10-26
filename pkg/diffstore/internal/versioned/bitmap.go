@@ -3,6 +3,7 @@ package versioned
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 )
@@ -10,6 +11,17 @@ import (
 // The 259-page maximum bitmap fits between the existing redo area and record
 // area. Only the pages required by this capacity are valid replay targets.
 const presenceAreaPage = uint64(1600)
+
+func writeInitialPresence(f *os.File, bitmap []byte, size int64) error {
+	pages := presence.Pages(size)
+	// Validated capacities are at most 32 GiB: all 259 encoded pages fit in
+	// 1 MiB + 12 KiB, below the existing 8 MiB direct-I/O buffer limit.
+	buf := make([]byte, pages*PageSize)
+	for i := 0; i < pages; i++ {
+		copy(buf[i*PageSize:], presence.Encode(bitmap, size, i))
+	}
+	return writeFull(f, buf, presenceAreaPage)
+}
 
 func presencePage(page uint64, size int64) bool {
 	return page >= presenceAreaPage && page-presenceAreaPage < uint64(presence.Pages(size))

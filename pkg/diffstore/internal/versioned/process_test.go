@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 	"golang.org/x/sys/unix"
 )
 
@@ -138,6 +139,32 @@ func TestProcessHelper(t *testing.T) {
 			t.Fatalf("short-write byte count: %d", st.Size())
 		}
 		fmt.Println("SHORT_WITHOUT_RETRY")
+	case "short-initial-presence", "short-initial-presence-tail":
+		f, err := openData(path, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		var limits unix.Rlimit
+		if err = unix.Getrlimit(unix.RLIMIT_FSIZE, &limits); err != nil {
+			t.Fatal(err)
+		}
+		limits.Cur = presenceAreaPage*PageSize + PageSize + 512
+		if mode == "short-initial-presence-tail" {
+			limits.Cur = (presenceAreaPage+uint64(presence.Pages(presence.MaxSize))-1)*PageSize + 512
+		}
+		if err = unix.Setrlimit(unix.RLIMIT_FSIZE, &limits); err != nil {
+			t.Fatal(err)
+		}
+		err = writeInitialPresence(f, make([]byte, presence.Bytes(presence.MaxSize)), presence.MaxSize)
+		if !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("expected actual short initialization write, got %v", err)
+		}
+		info, err := f.Stat()
+		if err != nil || uint64(info.Size()) != limits.Cur {
+			t.Fatalf("unexpected short write extent: %v %v", info, err)
+		}
+		fmt.Println("PRESENCE_SHORT_WITHOUT_RETRY")
 	case "short-engine-write":
 		s, err := Open(path, Options{})
 		if err != nil {
