@@ -70,6 +70,16 @@ wait_marker() {
     return 1
 }
 
+wait_runtime_ready() {
+    local ready_log=$1 pid=$2
+    for _ in $(seq 1 1200); do
+        grep -qxF 'ready' "$ready_log" 2>/dev/null && return 0
+        kill -0 "$pid" 2>/dev/null || return 1
+        sleep 0.05
+    done
+    return 1
+}
+
 run_case() {
     local control=$1 pid_mode=$2
     local expected=/
@@ -84,6 +94,8 @@ run_case() {
     local run_root="$case_dir/runtime"
     local sid="cg-${name}-$BASHPID"
     local log="$OUT/$name.log"
+    local ready_log="$OUT/$name.ready"
+    : >"$ready_log"
     mkdir -p "$case_dir" "$run_root"
 
     local diff="$case_dir/root.diff"
@@ -203,7 +215,8 @@ launch:
 EOF
 
     "$BIN/sandbox-ctl" run --config "$case_dir/sandbox.yaml" --ch-binary "$BIN/cloud-hypervisor" \
-        --run-root "$run_root" --sandbox-id "$sid" >"$log" 2>&1 &
+        --run-root "$run_root" --sandbox-id "$sid" --ready-fd 3 \
+        3>"$ready_log" >"$log" 2>&1 &
     local run_pid=$!
     PIDS+=("$run_pid")
 
@@ -215,9 +228,22 @@ EOF
     # runInit aborts launch if its exact root-cgroup assertion fails. Do not
     # reconstruct this value from two writes to the interleaved guest console.
 
+    # Guest output (including a restart) can precede the host's app_started
+    # acknowledgement. Exec requires the committed host running state; the
+    # earlier control_ready event does not establish that state.
+    wait_runtime_ready "$ready_log" "$run_pid" || {
+        tail -100 "$ready_log" "$log" >&2 || true
+        e2e_fail "$name sandbox did not reach host running readiness"
+    }
+
     local exec_log="$OUT/$name-exec.log"
     "$BIN/sandbox-ctl" exec --sandbox-id "$sid" --run-root "$run_root" -- \
-        /cgroup-fork-probe /probe.sh exec "$expected" "$pid_mode" "$control" "$real_check" >"$exec_log" 2>&1
+        /cgroup-fork-probe /probe.sh exec "$expected" "$pid_mode" "$control" "$real_check" >"$exec_log" 2>&1 || {
+        local exec_status=$?
+        printf '%s exec failed: exit=%s\n' "$name" "$exec_status" >&2 || true
+        cat "$exec_log" >&2 || true
+        exit "$exec_status"
+    }
     grep -qF "CG-exec-GEN-1-SELF $expected" "$exec_log" || e2e_fail "$name exec cgroup mismatch"
     grep -qF 'CG-exec-GEN-1-FORK-OK 128' "$exec_log" || e2e_fail "$name exec immediate-fork placement failed"
     [ "$pid_mode" != private ] || grep -qF 'CG-exec-PID-private-OK' "$exec_log" || e2e_fail "$name exec missed private primary PID namespace"
