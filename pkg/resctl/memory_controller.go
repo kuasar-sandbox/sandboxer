@@ -62,6 +62,15 @@ type pressureGrow struct {
 	reason  string
 }
 
+// balloonStall is one eligible fresh-report sample, not a retained target
+// intent. A second unchanged sample may retry the already authorized target.
+type balloonStall struct {
+	epoch  uint64
+	seq    uint64
+	target uint64
+	actual uint64
+}
+
 type reservationAdapter interface {
 	Enabled() bool
 	ReservationMemory() uint64
@@ -137,6 +146,7 @@ type MemoryController struct {
 	shrinkReportFence         uint64
 	pressureFloor             uint64
 	pressureLowSeq            uint64
+	balloonStall              *balloonStall
 
 	reportMu       sync.Mutex
 	reportsOpen    bool
@@ -443,6 +453,8 @@ func (m *MemoryController) advanceNormalizationLocked(ctx context.Context) error
 }
 
 func (m *MemoryController) processReportLocked(ctx context.Context, report proto.MemReport) error {
+	previousStall := m.balloonStall
+	m.balloonStall = nil
 	if m.normalizationPending {
 		return nil
 	}
@@ -595,9 +607,11 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 	if budget.ObservedBudget > m.reservationNow() {
 		// Cold/emergency actual is not a node grant. Keep the existing high;
 		// normal demand/pressure grow remains the only way to obtain more.
+		// Retrying an already authorized target adds no Budget or new reclaim
+		// intent, and can recover an idle guest worker after autonomous deflate.
 		m.logf("memory: observed Budget=%d exceeds reservation=%d; settlement and new inflate deferred",
 			budget.ObservedBudget, m.reservationNow())
-		return nil
+		return m.retryStalledBalloonLocked(ctx, report, state, budget, previousStall)
 	}
 
 	nextTarget, shrink := NextShrinkTarget(m.capacity, state.AcceptedTarget,
@@ -619,10 +633,60 @@ func (m *MemoryController) processReportLocked(ctx context.Context, report proto
 		targetBudget: targetBudget, demand: budget.DemandMemory, resizeAccepted: true,
 		reportSeq: report.Seq,
 	}
-	return m.advanceTransactionLocked(ctx)
+	if err := m.advanceTransactionLocked(ctx); err != nil {
+		return err
+	}
+	// Covered actual may also plateau below the accepted target. Preserve
+	// partial settlement before considering a retry of that same target.
+	return m.retryStalledBalloonLocked(ctx, report, state, budget, previousStall)
+}
+
+func (m *MemoryController) retryStalledBalloonLocked(ctx context.Context, report proto.MemReport,
+	state BalloonState, budget MemoryBudget, previous *balloonStall) error {
+	if m.balloon == nil || !state.AcceptedTargetKnown || !state.BalloonCurrentKnown ||
+		state.DesiredTarget != state.AcceptedTarget || state.BalloonCurrent >= state.AcceptedTarget ||
+		budget.RequestedBudget > budget.TargetBudget ||
+		m.state.BalloonTarget != state.AcceptedTarget || m.state.BalloonCurrent != state.BalloonCurrent {
+		return nil
+	}
+	// Recheck this after waiting for the snapshot/API locks as well. A queued
+	// pressure event is already evidence against reclaim, even before the
+	// worker processes it and establishes a pressure floor or grow transaction.
+	stillCurrent := func() bool {
+		if m.normalizationPending || m.txn != nil || m.pressureFloor != 0 ||
+			len(m.pressureEvents) != 0 || budget.TargetBudget > m.reservationNow() ||
+			report.Seq <= m.shrinkReportFence {
+			return false
+		}
+		m.reportMu.Lock()
+		defer m.reportMu.Unlock()
+		return m.reportsOpen && m.reportEpoch == report.Epoch && m.reportSeq == report.Seq
+	}
+	if !stillCurrent() {
+		return nil
+	}
+	if previous == nil || previous.epoch != report.Epoch || previous.seq >= report.Seq ||
+		previous.target != state.AcceptedTarget || previous.actual != state.BalloonCurrent {
+		m.balloonStall = &balloonStall{
+			epoch: report.Epoch, seq: report.Seq,
+			target: state.AcceptedTarget, actual: state.BalloonCurrent,
+		}
+		return nil
+	}
+	// Each attempt consumes its two-report evidence, including a cancelled or
+	// ambiguous attempt. Ticker retries never drive this path.
+	release, err := m.acquireMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	state, err = m.balloon.retryAcceptedTargetHeld(ctx, state, stillCurrent)
+	m.recordBalloonStateLocked(state)
+	return err
 }
 
 func (m *MemoryController) processPressureLocked(ctx context.Context, pressure pressureGrow) error {
+	m.balloonStall = nil
 	// Any new pressure signal invalidates an in-progress low-demand confirmation.
 	// The floor itself is changed only after an actually accepted Budget grow.
 	m.pressureLowSeq = 0

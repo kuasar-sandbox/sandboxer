@@ -261,6 +261,38 @@ func (b *BalloonController) applyShrinkDesiredHeld(ctx context.Context, observed
 	return b.applyDesiredHeldMode(ctx, &observed)
 }
 
+// retryAcceptedTargetHeld requires mutationGate to be held. It only wakes an
+// unchanged, still-stalled target authorized by MemoryController; it neither
+// creates a new target nor substitutes for ordinary Apply confirmation.
+func (b *BalloonController) retryAcceptedTargetHeld(ctx context.Context, observed BalloonState, stillCurrent func() bool) (BalloonState, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.apiMu.Lock()
+	defer b.apiMu.Unlock()
+
+	pre, err := b.readMemoryObservation(ctx)
+	if err != nil {
+		return b.State(), fmt.Errorf("balloon target retry deferred: vm.info: %w", err)
+	}
+	state := b.commitObservation(pre)
+	if !observed.AcceptedTargetKnown || !observed.BalloonCurrentKnown ||
+		state.DesiredTarget != state.AcceptedTarget || state.AcceptedTarget != observed.AcceptedTarget ||
+		state.BalloonCurrent != observed.BalloonCurrent || state.BalloonCurrent >= state.AcceptedTarget ||
+		!stillCurrent() {
+		return state, nil
+	}
+	if err := b.callResize(ctx, state.AcceptedTarget); err != nil {
+		// The target was equal before this call, so another equal vm.info
+		// cannot confirm delivery after a lost ACK. A later fresh report must
+		// establish progress or authorize another bounded retry.
+		return state, fmt.Errorf("retry accepted balloon target=%d: %w", state.AcceptedTarget, err)
+	}
+	b.Logf("balloon: requested notification for stalled accepted target=%d current=%d", state.AcceptedTarget, state.BalloonCurrent)
+	// HTTP success requests a notification; it is not an actual observation.
+	return state, nil
+}
+
 func (b *BalloonController) applyDesiredHeldMode(ctx context.Context, shrinkObservation *BalloonState) (BalloonState, error) {
 	if ctx == nil {
 		ctx = context.Background()

@@ -2205,6 +2205,8 @@ Guest 诊断字段与 host `memory.current` 不决定 Budget；host `memory.curr
 
 收缩要求 fresh、未被更新报告取代的观测以及已知的 CH target/current。每份报告最多允许一个 64 MiB inflate step，并保留一步 deadband。新 target 必须大于 accepted target，且同时不超过 desired target、capacity、`AcceptedTarget + 64 MiB` 与 `BalloonCurrent + 64 MiB`，计算采用 checked 或 saturating 算术。Resize 前须在 mutation gate 内重新检查 CH 和这些边界；actual 反向变化或 accepted target 改变会使候选失效。Target 操作确认后，`B < Reservation` 时按 B 降低 `memory.high` 并把 B 作为绝对 reservation baseline 提交；`B == Reservation` 不重复提交；`B > Reservation` 时既不返还，也不把 actual 移动当作 node grant，而是交给既有 demand/pressure grow 路径。因而部分观测进展无需 target 相等即可结束本轮，后续报告继续处理进展。更新的已接收报告、不可用的 CH 状态以及 high/reservation 失败都会阻止过早返还。未完成 grow 保留其 reservation；部分提交后的 grow 从最新 baseline 请求差额。Shrink 响应丢失时，无论 node 是否已提交，已发送的较小 baseline 都是保守恢复值。Mutation gate 覆盖 CH 与 `memory.high` 变更，但不覆盖随后的纯 node commit RPC。Guest 应急 deflate 不能绕过这些条件。
 
+短暂分配突发可能触发 Guest 应急 deflate，并在两份报告之间结束。如果随后 inflate 停在 accepted target 以下，controller 可在同一 epoch 内两份新鲜报告确认 target 和 actual 均未变化后，重新通知同一个 target。新鲜报告的 RequestedBudget 必须不超过 TargetBudget，且现有 reservation 仍须覆盖 TargetBudget。正常的有界新 target 和部分结算优先执行。未完成的 grow、restore normalization、pressure、已被取代的报告，以及任何 actual 或 target 变化，都会使重试候选失效。操作仍通过 mutation gate 与 snapshot/export 串行，并在写入前重新检查 CH 状态及报告资格。这次重试不申请额外 reservation，不降低 `memory.high`，也不返还 reservation；后续 actual 观测沿用正常结算路径。每次尝试都会消耗两份报告的确认，因此 reconcile ticker 不会反复 resize 停滞的 Guest。响应丢失后，仅凭 accepted target 未变不能确认该次通知送达，HTTP 成功也不能替代实际进展观测。
+
 源码见 [memory.go](../pkg/resctl/memory.go)、[memory_controller.go](../pkg/resctl/memory_controller.go) 和 [balloon.go](../pkg/resctl/balloon.go)。稀疏 `PUNCH_HOLE`/`MADV_DONTNEED` 与 hole-only skipping 仍由 [VMM patch 0004](cloud-hypervisor_zh.md#34-0004--balloon-release-跳过-user-managed-zone-的空洞-run) 定义。
 
 ## 10. Resource protocol
