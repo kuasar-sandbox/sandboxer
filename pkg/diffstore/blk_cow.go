@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -740,20 +741,20 @@ func (c *Disk) unlockBlockRange(first, last int64) {
 // Snapshot orchestration calls this after quiescing every vhost backend, so the
 // dirty block contents stay stable for the view's lifetime.
 func (c *Disk) SnapshotView() (io.ReadSeeker, []sparse.Extent, error) {
-	view, holes, err := c.activeView(context.Background())
+	view, err := c.activeView(context.Background())
 	if err != nil {
 		return nil, nil, err
 	}
-	return io.NewSectionReader(view, 0, c.size), holes, nil
+	return io.NewSectionReader(view, 0, c.size), snapshotHoles(view.bitmap, c.size), nil
 }
 
-func (c *Disk) activeView(ctx context.Context) (*cowSnapshotReaderAt, []sparse.Extent, error) {
+func (c *Disk) activeView(ctx context.Context) (*cowSnapshotReaderAt, error) {
 	if err := c.WaitMaterialized(ctx); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	ctx, endOp, err := c.begin(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer c.end(endOp)
 
@@ -761,8 +762,7 @@ func (c *Disk) activeView(ctx context.Context) (*cowSnapshotReaderAt, []sparse.E
 	bitmap := append([]uint64(nil), c.bitmap...)
 	c.bitmapMu.RUnlock()
 
-	view := &cowSnapshotReaderAt{cow: c, bitmap: bitmap}
-	return view, snapshotHoles(bitmap, c.size), nil
+	return &cowSnapshotReaderAt{cow: c, bitmap: bitmap}, nil
 }
 
 type cowSnapshotReaderAt struct {
@@ -859,22 +859,36 @@ func bitmapBlockDirty(bitmap []uint64, blk int64) bool {
 	return bitmap[blk/64]&(1<<(uint64(blk)%64)) != 0
 }
 
+// bitmapRunEnd finds a change of presence in [block, limit). The caller supplies
+// a nonempty range within the bitmap's logical capacity; padding bits are ignored.
+func bitmapRunEnd(bitmap []uint64, block, limit uint64) uint64 {
+	var invert uint64
+	if bitmapBlockDirty(bitmap, int64(block)) {
+		invert = ^uint64(0)
+	}
+	for block < limit {
+		base := block &^ 63
+		changed := (bitmap[block/64] ^ invert) & (^uint64(0) << (block % 64))
+		if changed != 0 {
+			return min(limit, base+uint64(bits.TrailingZeros64(changed)))
+		}
+		block = base + 64
+	}
+	return limit
+}
+
 func snapshotHoles(bitmap []uint64, size int64) []sparse.Extent {
-	numBlocks := size / cowBlockSize
+	numBlocks := uint64(size / cowBlockSize)
 	var holes []sparse.Extent
-	for blk := int64(0); blk < numBlocks; {
-		if bitmapBlockDirty(bitmap, blk) {
-			blk++
-			continue
+	for block := uint64(0); block < numBlocks; {
+		end := bitmapRunEnd(bitmap, block, numBlocks)
+		if !bitmapBlockDirty(bitmap, int64(block)) {
+			holes = append(holes, sparse.Extent{
+				Offset: block * cowBlockSize,
+				Size:   (end - block) * cowBlockSize,
+			})
 		}
-		start := blk
-		for blk < numBlocks && !bitmapBlockDirty(bitmap, blk) {
-			blk++
-		}
-		holes = append(holes, sparse.Extent{
-			Offset: uint64(start * cowBlockSize),
-			Size:   uint64((blk - start) * cowBlockSize),
-		})
+		block = end
 	}
 	return holes
 }

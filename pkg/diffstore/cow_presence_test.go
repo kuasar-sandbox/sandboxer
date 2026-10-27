@@ -188,8 +188,8 @@ func TestCheckpointBitmapPresenceCanceledExport(t *testing.T) {
 	cow, _ := reopenPresenceCOW(t, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if view, holes, err := cow.activeView(ctx); view != nil || holes != nil || !errors.Is(err, context.Canceled) {
-		t.Fatal(view, holes, err)
+	if view, err := cow.activeView(ctx); view != nil || !errors.Is(err, context.Canceled) {
+		t.Fatal(view, err)
 	}
 	if cow.Err() != nil || cow.DirtyCount() != 5 || cow.BackendStats()["diff_presence_complete"] != true {
 		t.Fatal("cancellation changed presence", cow.Err(), cow.BackendStats())

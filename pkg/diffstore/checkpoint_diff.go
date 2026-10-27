@@ -360,7 +360,7 @@ func (c *Disk) Export(ctx context.Context, id CheckpointID) (ExportView, error) 
 		ctx = context.Background()
 	}
 	if id == ActiveDiff {
-		reader, _, err := c.activeView(ctx)
+		reader, err := c.activeView(ctx)
 		if err != nil {
 			return nil, err
 		}

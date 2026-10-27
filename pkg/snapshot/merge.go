@@ -87,16 +87,10 @@ func openMergeBaseStream(ctx context.Context, raw string, codec tarstream.Codec,
 }
 
 func prepareMergeBase(ctx context.Context, stream fetch.Stream, size int64) (*tarLayer, []sparse.Extent, error) {
-	fail := func(err error) (*tarLayer, []sparse.Extent, error) {
+	holes, err := inspectMergeBase(ctx, stream, size, true)
+	if err != nil {
 		_ = stream.Close()
 		return nil, nil, err
-	}
-	if size < 0 || stream.Size() < uint64(size) {
-		return fail(fmt.Errorf("merge base: entry size %d < expected layer size %d", stream.Size(), size))
-	}
-	holes, err := mergeStreamHoles(ctx, stream, uint64(size))
-	if err != nil {
-		return fail(fmt.Errorf("merge base: hole map: %w", err))
 	}
 	reader := retryMergeReader{ctx: ctx, stream: stream}
 	return &tarLayer{stream: stream, ReadSeeker: io.NewSectionReader(reader, 0, size)}, holes, nil
@@ -133,33 +127,42 @@ func ValidateMergeBase(path string, size int64, codec tarstream.Codec, required 
 }
 
 func ValidateMergeBaseWithOpener(ctx context.Context, path string, size int64, codec tarstream.Codec, required bool, opener MergeBaseOpener) error {
-	base, _, err := openMergeBaseWithOpener(ctx, path, size, codec, required, opener)
+	stream, err := openMergeBaseStream(ctx, path, codec, required, opener)
 	if err != nil {
 		return err
 	}
-	return base.Close()
+	if _, err := inspectMergeBase(ctx, stream, size, false); err != nil {
+		_ = stream.Close()
+		return err
+	}
+	return stream.Close()
 }
 
-func mergeStreamHoles(ctx context.Context, stream fetch.Stream, size uint64) ([]sparse.Extent, error) {
+// inspectMergeBase shares the complete metadata validation between preflight and
+// the legacy merge reader. Only the latter needs an expanded Hole array.
+func inspectMergeBase(ctx context.Context, stream fetch.Stream, size int64, collectHoles bool) ([]sparse.Extent, error) {
+	if size < 0 || stream.Size() < uint64(size) {
+		return nil, fmt.Errorf("merge base: entry size %d < expected layer size %d", stream.Size(), size)
+	}
 	var holes []sparse.Extent
-	for offset := uint64(0); offset < size; {
+	for offset := uint64(0); offset < uint64(size); {
 		var run sparse.Run
 		err := readretry.Do(ctx, func() error {
 			var err error
-			run, err = stream.RunAt(offset, size-offset)
+			run, err = stream.RunAt(offset, uint64(size)-offset)
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return readerr.Mark(err, false)
 			}
 			return err
 		})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("merge base: hole map: %w", err)
 		}
-		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > size {
-			return nil, readerr.Mark(fmt.Errorf("invalid run at offset %d", offset), false)
+		if run == nil || run.Offset() != offset || run.End() <= offset || run.End() > uint64(size) {
+			return nil, fmt.Errorf("merge base: hole map: %w", readerr.Mark(fmt.Errorf("invalid run at offset %d", offset), false))
 		}
 		kind, end := run.Kind(), run.End()
-		if kind == sparse.Hole {
+		if collectHoles && kind == sparse.Hole {
 			holes = append(holes, sparse.Extent{Offset: offset, Size: end - offset})
 		}
 		offset = end

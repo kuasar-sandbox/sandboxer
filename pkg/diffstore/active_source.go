@@ -42,12 +42,8 @@ func (s *activeSource) RunAt(off, limit uint64) (sparse.Run, error) {
 	if present {
 		end = min(end, (first+maxWritebackPages)*cowBlockSize)
 	}
-	for b := first + 1; b*cowBlockSize < end; b++ {
-		if bitmapBlockDirty(s.reader.bitmap, int64(b)) != present {
-			end = b * cowBlockSize
-			break
-		}
-	}
+	runEnd := bitmapRunEnd(s.reader.bitmap, first, (end+cowBlockSize-1)/cowBlockSize)
+	end = min(end, runEnd*cowBlockSize)
 	kind := sparse.Hole
 	if present {
 		count := (end+cowBlockSize-1)/cowBlockSize - first
