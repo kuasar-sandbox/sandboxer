@@ -358,9 +358,7 @@ func (d *diffFile) scanPayload() ([]uint64, error) {
 		}
 		startBlock := (dataOffset - d.bodyOffset) / cowBlockSize
 		endBlock := alignUp(holeOffset-d.bodyOffset, cowBlockSize) / cowBlockSize
-		for block := startBlock; block < endBlock; block++ {
-			bitmap[block/64] |= 1 << (uint64(block) % 64)
-		}
+		setBitmapRange(bitmap, uint64(startBlock), uint64(endBlock))
 		physical = holeOffset
 	}
 	return bitmap, nil
@@ -779,4 +777,23 @@ func DiffSourceCapacity(path string, template bool, rawOptions ...DiskOption) (i
 	}
 	size := file.logicalSize
 	return size, file.Close()
+}
+
+// setBitmapRange marks a validated half-open range without visiting every page.
+func setBitmapRange(bitmap []uint64, start, end uint64) {
+	if start >= end {
+		return
+	}
+	first, last := start/64, (end-1)/64
+	left := ^uint64(0) << (start % 64)
+	right := ^uint64(0) >> (63 - (end-1)%64)
+	if first == last {
+		bitmap[first] |= left & right
+		return
+	}
+	bitmap[first] |= left
+	for i := first + 1; i < last; i++ {
+		bitmap[i] = ^uint64(0)
+	}
+	bitmap[last] |= right
 }

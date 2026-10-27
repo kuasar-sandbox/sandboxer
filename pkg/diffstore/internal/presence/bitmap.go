@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"math/bits"
 )
 
 const (
@@ -36,33 +37,53 @@ func Set(bitmap []byte, block uint64) {
 
 // End returns the exclusive end of the logical-presence run starting at block.
 // It does not describe whether the run has physical payload.
-func End(bitmap []byte, block, limit uint64) uint64 {
-	present := Has(bitmap, block)
-	fill := byte(0)
-	if present {
-		fill = 255
-	}
-	block++
-	for block < limit {
-		if block%8 == 0 && limit-block >= 8 && bitmap[block/8] == fill {
-			block += 8
-			continue
+func End(p []byte, page, pages uint64) uint64 {
+	set := Has(p, page)
+	page++
+	for page < pages {
+		start := (page / 64) * 8
+		if start+8 <= uint64(len(p)) {
+			w := binary.LittleEndian.Uint64(p[start : start+8])
+			if set {
+				w = ^w
+			}
+			shift := page % 64
+			w >>= shift
+			if w != 0 {
+				return min(pages, page+uint64(bits.TrailingZeros64(w)))
+			}
+			page += 64 - shift
+		} else {
+			w := p[page/8]
+			if set {
+				w = ^w
+			}
+			shift := page % 8
+			w >>= shift
+			if w != 0 {
+				return min(pages, page+uint64(bits.TrailingZeros8(w)))
+			}
+			page += 8 - shift
 		}
-		if Has(bitmap, block) != present {
-			break
-		}
-		block++
 	}
-	return block
+	return pages
 }
 
 // Encode copies one bounded bitmap page. The full logical length, ordinal and
 // page count are repeated so a page cannot silently move within a bitmap.
 func Encode(bitmap []byte, size int64, index int) []byte {
-	if len(bitmap) != Bytes(size) || index < 0 || index >= Pages(size) {
+	b := make([]byte, PageSize)
+	EncodeInto(b, bitmap, size, index)
+	return b
+}
+
+// EncodeInto replaces one complete page, including padding, in caller-owned
+// scratch. The destination must not overlap bitmap.
+func EncodeInto(b, bitmap []byte, size int64, index int) {
+	if len(b) != PageSize || len(bitmap) != Bytes(size) || index < 0 || index >= Pages(size) {
 		panic("diffstore: invalid presence page")
 	}
-	b := make([]byte, PageSize)
+	clear(b)
 	copy(b, magic[:])
 	le.PutUint32(b[8:], uint32(index))
 	le.PutUint32(b[12:], uint32(Pages(size)))
@@ -70,7 +91,6 @@ func Encode(bitmap []byte, size int64, index int) []byte {
 	start := index * PayloadSize
 	copy(b[HeaderSize:PageSize-4], bitmap[start:min(start+PayloadSize, len(bitmap))])
 	le.PutUint32(b[PageSize-4:], crc32.ChecksumIEEE(b[:PageSize-4]))
-	return b
 }
 
 // Decode validates before returning the useful bytes. The caller copies them

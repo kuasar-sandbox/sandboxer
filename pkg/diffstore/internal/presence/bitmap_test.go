@@ -1,8 +1,10 @@
 package presence
 
 import (
+	"bytes"
 	"encoding/binary"
 	"hash/crc32"
+	"math/rand"
 	"testing"
 )
 
@@ -41,5 +43,62 @@ func TestBitmapBoundariesAndCorruption(t *testing.T) {
 	}
 	if Bytes(MaxSize) != 32<<20 || Pages(MaxSize) != 8265 {
 		t.Fatal("maximum bitmap layout changed")
+	}
+}
+
+func TestEndMatchesScalar(t *testing.T) {
+	rng := rand.New(rand.NewSource(37))
+	for _, pages := range []uint64{1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 513} {
+		for pattern := 0; pattern < 5; pattern++ {
+			bitmap := make([]byte, (pages+7)/8)
+			for i := range bitmap {
+				switch pattern {
+				case 1:
+					bitmap[i] = 255
+				case 2:
+					bitmap[i] = 0x55
+				case 3:
+					bitmap[i] = 0xaa
+				case 4:
+					bitmap[i] = byte(rng.Intn(256))
+				}
+			}
+			for start := uint64(0); start < pages; start++ {
+				for limit := start + 1; limit <= pages; limit++ {
+					want := start + 1
+					for want < limit && Has(bitmap, want) == Has(bitmap, start) {
+						want++
+					}
+					if got := End(bitmap, start, limit); got != want {
+						t.Fatalf("pattern=%d start=%d limit=%d got=%d want=%d", pattern, start, limit, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestEncodeIntoCanonicalReuse(t *testing.T) {
+	for _, size := range []int64{PageSize, 9 * PageSize, int64(PayloadSize)*8*PageSize + PageSize} {
+		bitmap := make([]byte, Bytes(size))
+		Set(bitmap, 0)
+		Set(bitmap, uint64(size/PageSize-1))
+		scratch := bytes.Repeat([]byte{0xff}, PageSize)
+		for i := 0; i < Pages(size); i++ {
+			// Independent scalar layout oracle, including reserved and trailing zeros.
+			want := make([]byte, PageSize)
+			copy(want, []byte("KDPRES1\n"))
+			binary.LittleEndian.PutUint32(want[8:], uint32(i))
+			binary.LittleEndian.PutUint32(want[12:], uint32(Pages(size)))
+			binary.LittleEndian.PutUint64(want[16:], uint64(size))
+			for j := 0; j < PayloadSize && i*PayloadSize+j < len(bitmap); j++ {
+				want[HeaderSize+j] = bitmap[i*PayloadSize+j]
+			}
+			binary.LittleEndian.PutUint32(want[PageSize-4:], crc32.ChecksumIEEE(want[:PageSize-4]))
+			EncodeInto(scratch, bitmap, size, i)
+			if !bytes.Equal(scratch, want) {
+				t.Fatalf("size=%d page=%d encoding changed", size, i)
+			}
+		}
 	}
 }

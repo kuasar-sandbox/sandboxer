@@ -72,11 +72,10 @@ func createDiffFile(f *os.File, size int64, encryption *diffEncryption, random i
 		return nil, err
 	}
 	bitmap := make([]byte, presence.Bytes(size))
-	for i := 0; i < presence.Pages(size); i++ {
-		if err := writeFullAt(f, presence.Encode(bitmap, size, i), diffHeaderRegionSize+int64(i)*cowBlockSize); err != nil {
-			return nil, err
-		}
+	if err := writeSingleBitmap(f, bitmap, size); err != nil {
+		return nil, err
 	}
+
 	return &diffFile{f: f, bodyIO: f, logicalSize: size, bodyOffset: singleBodyOffset(size),
 		encrypted: encryption != nil, xts: xc, bitmap: bitmap, payload: make([]uint64, (size/cowBlockSize+63)/64)}, nil
 }
@@ -144,21 +143,55 @@ func readSingleHeader(f *os.File, physical int64, encryption *diffEncryption, re
 		}
 	}
 	d := &diffFile{f: f, bodyIO: f, encrypted: flags == 1, logicalSize: size, bodyOffset: singleBodyOffset(size), xts: xc, bitmap: make([]byte, presence.Bytes(size))}
-	for i := 0; i < presence.Pages(size); i++ {
-		b := make([]byte, cowBlockSize)
-		if err := readFullAt(f, b, diffHeaderRegionSize+int64(i)*cowBlockSize); err != nil {
-			return nil, err
-		}
-		part, err := presence.Decode(b, size, i)
-		if err != nil {
-			return nil, err
-		}
-		copy(d.bitmap[i*presence.PayloadSize:], part)
+	if err := readSingleBitmap(f, d.bitmap, size); err != nil {
+		return nil, err
 	}
+
 	var err error
 	d.payload, err = d.scanPayload()
 	if err != nil {
 		return nil, err
 	}
 	return d, nil
+}
+
+// Creation and reopen use buffered metadata I/O before the direct workspace is
+// attached. Keep per-page encoding/validation, but bound scratch and syscalls.
+const singleBitmapBatchPages = (256 << 10) / cowBlockSize
+
+func writeSingleBitmap(w io.WriterAt, bitmap []byte, size int64) error {
+	pages := presence.Pages(size)
+	buf := make([]byte, min(singleBitmapBatchPages, pages)*cowBlockSize)
+	for i := 0; i < pages; {
+		n := min(singleBitmapBatchPages, pages-i)
+		for j := 0; j < n; j++ {
+			presence.EncodeInto(buf[j*cowBlockSize:(j+1)*cowBlockSize], bitmap, size, i+j)
+		}
+		if err := writeFullAt(w, buf[:n*cowBlockSize], diffHeaderRegionSize+int64(i)*cowBlockSize); err != nil {
+			return err
+		}
+		i += n
+	}
+	return nil
+}
+
+// The caller owns bitmap privately until every page and payload scan succeeds.
+func readSingleBitmap(r io.ReaderAt, bitmap []byte, size int64) error {
+	pages := presence.Pages(size)
+	buf := make([]byte, min(singleBitmapBatchPages, pages)*cowBlockSize)
+	for i := 0; i < pages; {
+		n := min(singleBitmapBatchPages, pages-i)
+		if err := readFullAt(r, buf[:n*cowBlockSize], diffHeaderRegionSize+int64(i)*cowBlockSize); err != nil {
+			return err
+		}
+		for j := 0; j < n; j++ {
+			part, err := presence.Decode(buf[j*cowBlockSize:(j+1)*cowBlockSize], size, i+j)
+			if err != nil {
+				return err
+			}
+			copy(bitmap[(i+j)*presence.PayloadSize:], part)
+		}
+		i += n
+	}
+	return nil
 }

@@ -68,8 +68,12 @@ func (d *diffFile) scanDirtyBlocks() ([]uint64, error) {
 	d.stateMu.RLock()
 	defer d.stateMu.RUnlock()
 	bitmap := make([]uint64, (d.logicalSize/cowBlockSize+63)/64)
-	for i, v := range d.bitmap {
-		bitmap[i/8] |= uint64(v) << (8 * (i % 8))
+	full := len(d.bitmap) / 8
+	for i := 0; i < full; i++ {
+		bitmap[i] = binary.LittleEndian.Uint64(d.bitmap[i*8 : i*8+8])
+	}
+	for i := full * 8; i < len(d.bitmap); i++ {
+		bitmap[i/8] |= uint64(d.bitmap[i]) << (8 * (i % 8))
 	}
 	return bitmap, nil
 }
