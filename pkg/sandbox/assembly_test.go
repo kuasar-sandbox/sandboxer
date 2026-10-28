@@ -232,7 +232,8 @@ func TestOpenAndAssembleSandboxEFromEveryImageCarrier(t *testing.T) {
 		locations config.RefLocations
 		wantZero  bool
 	}{
-		{name: "local digest-qualified file", ref: localRef},
+		// New local tarstreams preserve full-page Zero through presence metadata.
+		{name: "local digest-qualified file", ref: localRef, wantZero: true},
 		{name: "manifest", ref: manifestResult.Ref, wantZero: true},
 		{name: "located Bundle", ref: bundleResult.Ref, locations: config.RefLocations{"images": bundleDir}, wantZero: true},
 	} {
@@ -259,6 +260,14 @@ func TestOpenAndAssembleSandboxEFromEveryImageCarrier(t *testing.T) {
 			if err != nil || (test.wantZero && zero.Kind() != sparse.Zero) || (!test.wantZero && zero.Kind() != sparse.Data) {
 				_ = image.Close()
 				t.Fatalf("zero-valued run = %v, wantZero=%t, err=%v", zero, test.wantZero, err)
+			}
+			zeroBytes := make([]byte, 4096)
+			for i := range zeroBytes {
+				zeroBytes[i] = 0xff
+			}
+			if n, err := zero.ReadAt(ctx, zeroBytes, 0); err != nil || n != len(zeroBytes) || !bytes.Equal(zeroBytes, make([]byte, len(zeroBytes))) {
+				_ = image.Close()
+				t.Fatalf("zero-valued run content: n=%d, err=%v", n, err)
 			}
 			root, err := sandboxfile.Open(ctx, &assemblyStream{Source: assembly})
 			if err != nil {
