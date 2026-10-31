@@ -132,6 +132,8 @@ type BundleSourceBinding struct {
 // Run executes one sandbox lifecycle: prepare backends + launch server,
 // spawn CH, wait for exit, cleanup. Returns CH's exit code or an error
 // if setup failed.
+// Workload preflight still precedes VM startup. Start/Launch reuse its sealed
+// metadata only for the same inputs and validate the live backends on open.
 func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	if opts.Cfg == nil {
 		return -1, fmt.Errorf("RunOptions.Cfg is nil")
@@ -268,28 +270,12 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 			return -1, fmt.Errorf("project portable C0: %w", err)
 		}
 	} else {
-		// Runtime footer and optional kernel sidecar identities are cheap
-		// deployment metadata. Missing kernel metadata keeps the historical
-		// cheap-binding-only policy; never hash portable boot under #158.
-		if err := VerifyKernelArtifact(opts.Cfg.Boot.Kernel); err != nil {
-			return -1, fmt.Errorf("boot.kernel identity: %w", err)
-		}
-		kernelRef, present, err := optionalKernelRef(opts.Cfg.Boot.Kernel)
-		if err != nil {
-			return -1, fmt.Errorf("boot.kernel identity: %w", err)
-		}
-		if present && c0.Boot.Kernel != kernelRef {
-			return -1, fmt.Errorf("boot.kernel identity mismatch: portable %s, host %s", c0.Boot.Kernel, kernelRef)
-		}
-		runtimeRef, err := ResolveRuntimeProjection(opts.Cfg)
+		hostIdentity, err = preparePortableHostIdentity(opts.Cfg, config.PortableProjection{
+			KernelRef: c0.Boot.Kernel, RuntimeRef: c0.Boot.Runtime,
+		})
 		if err != nil {
 			return -1, err
 		}
-		if c0.Boot.Runtime != runtimeRef {
-			return -1, fmt.Errorf("boot.runtime identity mismatch: portable %s, host %s", c0.Boot.Runtime, runtimeRef)
-		}
-		hostIdentity.projection = config.PortableProjection{KernelRef: kernelRef, RuntimeRef: runtimeRef}
-		hostIdentity.unknownKernel = !present
 	}
 
 	storage, err := artifact.NewProcessStorageWithCustomerKey(opts.ManifestCfg, opts.CustomerKeyFn)
@@ -309,7 +295,13 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	launch.PortableConfig = c0
 	launch.Stdio = opts.StdioMode
 	launch.Forwards = opts.Forwards
-	shape, err := deriveRuntimeSpec(ctx, opts.Cfg, launch)
+	shapeCfg, err := cloneSDKConfig(opts.Cfg)
+	if err != nil {
+		return -1, err
+	}
+	shape, err := deriveBoundRuntimeSpec(ctx, shapeCfg, DeriveRuntimeOptions{
+		Launch: launch, EnableCheckpoint: opts.EnableCheckpoint, BaseRoot: opts.BaseRoot, SandboxID: opts.SandboxID, PathID: opts.PathID,
+	}, nil)
 	if err != nil {
 		return -1, err
 	}
@@ -328,7 +320,11 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.StatsInterval = opts.StatsInterval
 	shape.NotifyReadiness = opts.NotifyReadiness
 	shape.logf = func(f string, a ...any) { log.Printf("[sandbox-ctl] "+f, a...) }
-	r, err := start(ctx, SandboxSpec{Runtime: shape, Launch: launch}, &hostIdentity)
+	shape.preparedHost = &hostIdentity
+	if err := preparation.seal(shape, &launch); err != nil {
+		return -1, fmt.Errorf("seal cold preparation: %w", err)
+	}
+	r, err := Start(ctx, SandboxSpec{Runtime: shape, Launch: launch})
 	if err != nil {
 		return -1, err
 	}

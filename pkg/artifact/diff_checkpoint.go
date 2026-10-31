@@ -310,9 +310,11 @@ func deletePublishedDiffSource(ctx context.Context, source checkpointPublication
 	return deleteDirectoryDiffCheckpoints(ctx, pinnedPath, source.refs)
 }
 
-// ReopenIDs must be called with the target directory owner held. It rechecks
-// the live epoch after ownership transfer; the earlier pinned Info alone is
-// insufficient if a former owner wrote before exiting.
+// ReopenIDs checks which pinned source writers still match the live epoch.
+// Without the target directory owner this is only a read-only candidate query:
+// it provides no stability guarantee. A caller acquiring writers must repeat
+// the check with the owner held after ownership transfer; an earlier result or
+// pinned Info alone is insufficient if a former owner wrote before exiting.
 func (p *PinnedDiffCheckpoints) ReopenIDs(directory string, cfg *config.PortableSandboxConfig) ([]string, error) {
 	if p == nil || cfg == nil || !cfg.IsCheckpoint() {
 		return nil, errors.New("checkpoint reopen requires pinned source and checkpoint graph")

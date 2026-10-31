@@ -1083,7 +1083,7 @@ file://<digest>.overlay@hmac:<digest>
 file://<digest>.overlay@digest:<digest>
 ```
 
-The destination host binds these through actual paths, a source directory, or named ref-locations before controller, network, cgroup, VM, or run-directory side effects. Explicit cold projection and public `StartRuntime` use the configured kernel's `.sha256` sidecar when present, or hash the raw kernel once before CH startup when absent. Legacy portable `run --from` checks the cheap kernel binding and compares a present sidecar with C0, but never hashes the kernel when the sidecar is absent. Restore keeps its cheap kernel binding check and ignores sidecars entirely. Both portable boot and restore compare the runtime Bundle footer identity with C0. Without a sidecar, portable boot does not independently prove that the host kernel matches E's recorded digest; kernel deployment remains a trusted host responsibility. Carrier metadata and configured content verification retain their own checks. See [lifecycle.go](../pkg/sandbox/lifecycle.go) and [restore.go](../pkg/restore/restore.go).
+The destination host binds these through actual paths, a source directory, or named ref-locations before controller, network, cgroup, VM, or run-directory side effects. Explicit cold projection and manually constructed `RuntimeSpec` use the configured kernel's `.sha256` sidecar when present, or hash the raw kernel once before CH startup when absent. Portable `run --from` and the SDK chain `OpenRunSource → Apply → DeriveRuntimeSpecWithOptions → StartRuntime/Launch` share the portable identity policy: check the readable kernel binding and compare a present sidecar with C0, without hashing the kernel when the sidecar is absent. Restore keeps its cheap kernel binding check and ignores sidecars entirely. Both portable boot and restore compare the runtime Bundle footer identity with C0. Without a sidecar, portable boot does not independently prove that the host kernel matches E's recorded digest; kernel deployment remains a trusted host responsibility. Carrier metadata and configured content verification retain their own checks. See [source_identity.go](../pkg/sandbox/source_identity.go) and [restore.go](../pkg/restore/restore.go).
 
 <a id="strict-encoding"></a>
 
@@ -1678,6 +1678,33 @@ and MUX barrier. It never cold-boots first or requires `runtime_ready` from an
 older snapshot. The CLI converts its existing config/`--from` inputs into this
 SDK; cross-process administrative commands retain the local control transport.
 
+For cold starts from a Sandbox artifact, use
+[`sandbox.OpenRunSource`](../pkg/sandbox/run_source.go)(ctx, ref, storage, locations)
+and `source.Apply(host, presence, config.ApplyFromOptions{...})`. Apply returns
+the effective configuration and a `LaunchSpec` with the portable C0, checkpoint
+provenance and paired Bundle selectors. It shares the CLI's source resolution,
+default boot binding and presence-aware override rules without modifying host
+configuration or binding the disk graph twice. Keep the source and its borrowed
+storage open until `Wait` reports the runtime's exit result or `Close` completes; canceling `Wait` does
+not end this borrowing. With `ReplaceBoot`,
+the result keeps no source provenance or scoped selectors, so the source may be
+closed immediately after Apply; the returned storage remains borrowed. These
+helpers neither start a VM nor acquire checkpoint writers. Set runtime host
+options, stdio and forwards separately before starting.
+
+Pass that complete `LaunchSpec` to
+`sandbox.DeriveRuntimeSpecWithOptions(ctx, cfg, sandbox.DeriveRuntimeOptions{Launch: launch, ...})`,
+then use the returned shape and the same launch value with `Start`, or with
+`StartRuntime` followed by `Launch`. Derivation reads disk capacities and freezes
+the opened source identity, C0 boot refs and selected host boot paths; it does not
+open host kernel/runtime files. `StartRuntime` checks their current metadata and
+uses the same portable identity policy as `run --from`. Changing source provenance
+or C0 boot refs after Apply, or host boot paths after derivation, is rejected.
+Copying the returned value preserves this binding; reconstructing public fields
+with `LaunchSpecFromConfig` does not. A manually constructed shape or source
+binding retains the strict identity policy, as does `ReplaceBoot`. The retained
+source record owns no additional readers, storage or checkpoint pins.
+
 `RuntimeSpec` contains kernel/Bundle bindings, CPU/memory and resource policy,
 host TAP/provider/namespace requirements, console/control settings and ordered
 `RuntimeDiskSpec` entries. Each logical disk fixes its name, single/overlay
@@ -1691,8 +1718,10 @@ one 64-digit hexadecimal SHA-256 digest, or one untagged sha256sum record with
 the exact configured kernel basename (`<digest>  vmlinux` or
 `<digest> *vmlinux`). LF/CRLF and one final newline are accepted; extra records,
 fields, paths, and malformed content fail startup. A present invalid, unreadable,
-nonregular, or dangling sidecar is an error. Only its genuine absence permits a
-full kernel hash. For a prepared inactive deployment version, generate it from
+nonregular, or dangling sidecar is an error. When genuinely absent, explicit cold
+projection and a shape without a prepared source hash the raw kernel once;
+source-derived portable startup keeps C0's kernel ref as ancestry without a hash.
+For a prepared inactive deployment version, generate the sidecar from
 the final **raw** kernel, for example `sha256sum -- vmlinux > vmlinux.sha256`,
 and install the pair consistently. The sidecar is trusted deployment metadata:
 Sandboxer does not recompute its digest from bytes CH loads. The runtime Bundle
@@ -1700,7 +1729,7 @@ identity still comes from its footer. Keep version-specific kernel and sidecar
 bindings stable through identity resolution and CH startup; switching a `current`
 symlink alone cannot pin all pathname lookups of an in-flight startup. Use a
 stable version path or coordinate the switch. No sidecar is generated or cached
-by startup; deployments without one retain the single pre-CH kernel scan.
+by startup. Portable startup compares a present sidecar with C0 before CH starts.
 
 `LaunchSpec` owns workload root/data artifact references and writable paths,
 guest IP/MTU/routes/hostname/interface, mounts, persistent and ephemeral files,
@@ -1710,7 +1739,8 @@ PID namespace and cgroup delegation), stdio, forwards and artifact access.
 `Credentials` uses `ArtifactCredentials{Config, CustomerKey}` to create owned
 storage without consulting or changing environment variables. Alternatively,
 `Storage`, `Fetcher` and Bundle selectors are borrowed and must remain open and
-unchanged until `Wait` returns. SDK-created readers, storage and automatic diffs
+unchanged until `Wait` returns the exit result or `Close` completes; canceling a
+single `Wait` does not end the borrowing. SDK-created readers, storage and automatic diffs
 are released by the runtime. Caller-specified diff/template paths are not
 deleted; inherited cgroup and forwarding descriptors are borrowed or duplicated.
 Kernel/Bundle paths and artifact inputs must remain readable and immutable for
@@ -1804,7 +1834,7 @@ The normal CLI adapter preflights known workload inputs before starting the base
 runtime. A caller using the split API supplies them later:
 
 ```text
-StartRuntime: validate shape and boot bindings; retain complete kernel and Bundle identities
+StartRuntime: validate shape and boot bindings; retain host identity facts and source ancestry
   -> reserve resources and acquire host network
   -> create memfd/UFFD, fixed unbound vhost devices and control servers
   -> spawn CH -> guest base initialization -> runtime_ready
@@ -1820,16 +1850,19 @@ side effects. Split launch necessarily resolves workload artifacts after the bas
 VM exists. C0 is written once when complete launch inputs are known, before the
 guest consumes the workload, and remains unchanged. Launch never repeats kernel,
 sidecar, or Bundle identity lookup after `runtime_ready`, even if their pathnames
-change. A new Runtime resolves its own identity. Public `Start`, including a
-supplied local or sourced `PortableConfig`, uses this complete `StartRuntime`
-identity and compares both canonical C0 refs, including basenames. Thus public
-portable `Start` without a sidecar now hashes the kernel once before CH startup
-and rejects a mismatching kernel C0 ref. Local `PortableConfig` without
-`SourceBinding` remains supported. The CLI's explicit cold `run` and
-`--replace-boot` reuse their preflight identity in private startup, avoiding a
-second scan. Legacy portable `run --from` without a sidecar retains its C0 kernel
-as ancestry only; with a sidecar, a kernel mismatch fails before CH startup.
-Restore neither reads sidecars nor requires a cold-start projection.
+change. A new Runtime resolves its own identity. For a source-derived shape,
+`Start` validates the matching source/C0 before creating the VM; split `Launch`
+validates the same binding before checkpoint materialization can legitimately
+replace the disk graph and provenance. Rejected source inputs leave a ready base
+available for a corrected `Launch`. With no sidecar, C0's kernel ref remains
+ancestry and is never reported as a verified host digest. With a sidecar, a
+mismatch fails before CH startup. A manual shape, including one with only a
+hand-written `SourceBinding` or `PortableConfig`, still resolves a complete host
+identity and compares both canonical C0 refs, including basenames; missing
+sidecars cause one kernel hash. Local `PortableConfig` without `SourceBinding`
+remains supported. The CLI's explicit cold `run` and `--replace-boot` reuse their
+preflight identity through `Start`, avoiding a second scan. Restore neither reads
+sidecars nor requires a cold-start projection.
 This retained-identity rule does not permit rewriting the live runtime Bundle
 pmem backing contents; its existing lifetime requirements still apply.
 
