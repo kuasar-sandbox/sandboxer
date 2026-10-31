@@ -309,7 +309,13 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	launch.PortableConfig = c0
 	launch.Stdio = opts.StdioMode
 	launch.Forwards = opts.Forwards
-	shape, err := deriveRuntimeSpec(ctx, opts.Cfg, launch)
+	shapeCfg, err := cloneSDKConfig(opts.Cfg)
+	if err != nil {
+		return -1, err
+	}
+	shape, err := deriveBoundRuntimeSpec(ctx, shapeCfg, DeriveRuntimeOptions{
+		Launch: launch, EnableCheckpoint: opts.EnableCheckpoint, BaseRoot: opts.BaseRoot, SandboxID: opts.SandboxID, PathID: opts.PathID,
+	}, nil)
 	if err != nil {
 		return -1, err
 	}

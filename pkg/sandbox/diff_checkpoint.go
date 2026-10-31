@@ -45,25 +45,8 @@ func PrepareCheckpointDiskPlan(cfg *config.SandboxConfig, bases *config.Portable
 		if root.Overlay != nil {
 			target = &root.Overlay.Diff
 		}
-		if *target != "" {
-			scheme, path, ok := config.SchemeAndPath(*target)
-			if !ok || scheme != "file" {
-				return nil, errors.New("checkpoint requires a local writable DIFF")
-			}
-			abs, err := filepath.Abs(path)
-			if err != nil {
-				return nil, err
-			}
-			if filepath.Dir(abs) != filepath.Join(directory, "diffs") {
-				return nil, fmt.Errorf("checkpoint writable DIFF %q is outside its derived directory", path)
-			}
-			if len(reopen) == 0 {
-				if _, err := os.Lstat(abs); err == nil {
-					return nil, errors.New("checkpoint refuses implicit writable DIFF takeover; import it as a template")
-				} else if !os.IsNotExist(err) {
-					return nil, err
-				}
-			}
+		if err := validateCheckpointDiffTarget(*target, directory, len(reopen) != 0); err != nil {
+			return nil, err
 		}
 		id := ""
 		if len(reopen) > 0 {
@@ -88,6 +71,34 @@ func PrepareCheckpointDiskPlan(cfg *config.SandboxConfig, bases *config.Portable
 		}
 	}
 	return plan, nil
+}
+
+// validateCheckpointDiffTarget is shared by the read-only shape projection and
+// the writer plan. A caller-specified path constrains the target directory; it
+// does not authorize taking over an existing DIFF without a checked reopen set.
+func validateCheckpointDiffTarget(raw, directory string, reopening bool) error {
+	if raw == "" {
+		return nil
+	}
+	scheme, path, ok := config.SchemeAndPath(raw)
+	if !ok || scheme != "file" {
+		return errors.New("checkpoint requires a local writable DIFF")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if filepath.Dir(abs) != filepath.Join(directory, "diffs") {
+		return fmt.Errorf("checkpoint writable DIFF %q is outside its derived directory", path)
+	}
+	if !reopening {
+		if _, err := os.Lstat(abs); err == nil {
+			return errors.New("checkpoint refuses implicit writable DIFF takeover; import it as a template")
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *CheckpointDiskPlan) Bind(bases *config.PortableSandboxConfig) error {
