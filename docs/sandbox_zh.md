@@ -1719,8 +1719,11 @@ Hole+Absent 继承父层，Hole+Released 或 Loaded 表示显式 Zero。Loaded �
 重置 handler 状态。Zero 在本地合并、tarstream、Bundle/ingest、发布和恢复中保持
 不透明。不需要全 RAM 物化、新 ZIP 条目或累计 dirty 日志。参见[释放修复 #378](https://github.com/kuasar-sandbox/sandboxer/issues/378)。
 
-对本地磁盘 Checkpoint E，keep plan 还记录它精确引用的 DIFF 版本。只有当前 E
-贡献磁盘版本：为内存保留历史 S 不会顺带保留其旧磁盘 Checkpoint。清理先取得目录
+对本地磁盘 Checkpoint E，keep plan 还记录它精确引用的 DIFF 版本。当前 E 和显式保留的 E
+共同贡献磁盘版本. 调用方可通过 `artifact.Checkpoint.Retain` 提供额外的不可变 E 或 S/E 对,
+清理取这些来源与当前来源的文件和 DIFF 版本依赖并集. 删除前先规范化并校验全部来源.
+固定 `.sandbox` 和 `.snapshot` 别名仍只跟随当前来源. 仅为内存保留历史 S 不会顺带
+保留其旧磁盘 Checkpoint. 清理先取得目录
 owner，验证完整保留集，再通过 metadata backend 分批删除无用版本、retire 不再
 需要的 DIFF。已有 read pin 延后物理回收。此过程不打开活动 Disk，也不解密
 guest 页；保留集或目录身份检查失败时不会开始修改。
@@ -1769,7 +1772,7 @@ selector；Bundle 输出继续使用既有成员复制发布路径。历史合�
 lifecycle fence。portable Export 继续只使用已存储的来源对，不读取制品。token、公开结果、
 base 格式和持久化 cleanup schema 均不改变。
 
-保留集合包含当前 S/E、历史内存载体、当前磁盘/upper/不可变 base 载体及复用文件。历史 S
+保留集合包含当前及显式保留的 S/E、历史内存载体、对应磁盘/upper/不可变 base 载体及复用文件。历史 S
 的旧 E 不是磁盘依赖。Bundle 任一成员仍被使用就保留整个物理载体。比较 basename 前先解析
 source/location 绑定。选择只读取有界的当前小型元数据与 Bundle 索引，不读取旧候选 payload，
 不计算整镜像摘要；此操作无需 Snapshot 的 CPU/state body。kernel/runtime 的
