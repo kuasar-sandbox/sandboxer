@@ -47,6 +47,7 @@ type RuntimeDiskSpec struct {
 // RuntimeSpec fixes the base VM shape. It contains no workload or credentials.
 type RuntimeSpec struct {
 	EnableCheckpoint                bool
+	preparedHost                    *preparedHostIdentity
 	checkpointPlan                  *CheckpointDiskPlan
 	checkpointOwner                 *diffstore.DirectoryOwner
 	checkpointReleaseSources        func() error
@@ -85,6 +86,7 @@ type GuestNetworkSpec struct {
 // Caller-specified diff paths are never removed by Runtime.
 type LaunchSpec struct {
 	legacyAccess          *RunOptions
+	coldPreparation       *coldPreparation
 	Root                  config.RootConfig
 	Disks                 []config.DiskConfig
 	Network               GuestNetworkSpec
@@ -270,7 +272,7 @@ func validateRuntimeSpec(s RuntimeSpec) error {
 	return s.config().ValidateRuntime()
 }
 func StartRuntime(ctx context.Context, spec RuntimeSpec) (_ *Runtime, retErr error) {
-	return startRuntime(ctx, spec, nil)
+	return startRuntime(ctx, spec, spec.preparedHost)
 }
 
 // preparedHostIdentity belongs to one legacy Run operation. The exact host
@@ -605,7 +607,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	r.storage = spec.Storage
 	if spec.legacyAccess == nil && (r.spec.EnableCheckpoint || (spec.SourceBinding != nil && spec.SourceBinding.Checkpoint != nil)) {
 		checkpointStorage := opaqueLaunchStorage(spec)
-		prepared, release, err := prepareColdCheckpoint(ctx, RunOptions{checkpointStorage: checkpointStorage, EnableCheckpoint: r.spec.EnableCheckpoint, Cfg: cfg, PortableConfig: spec.PortableConfig, SourceBinding: spec.SourceBinding, ManifestCfg: spec.ManifestConfig, Fetcher: launchFetcher(spec), BundleReader: spec.BundleReader, BundleFetcher: spec.BundleFetcher, RefLocations: spec.RefLocations, CustomerKeyFn: launchKey(spec), LocalCodec: launchCodec(spec), LocalRequired: launchRequired(spec), SandboxID: r.sandboxID, PathID: r.pathID, BaseRoot: r.spec.BaseRoot})
+		prepared, release, err := prepareColdCheckpoint(ctx, RunOptions{checkpointStorage: checkpointStorage, EnableCheckpoint: r.spec.EnableCheckpoint, Cfg: cfg, PortableConfig: spec.PortableConfig, SourceBinding: spec.SourceBinding, ManifestCfg: launchManifestConfig(spec), Fetcher: launchFetcher(spec), BundleReader: spec.BundleReader, BundleFetcher: spec.BundleFetcher, RefLocations: spec.RefLocations, CustomerKeyFn: launchKey(spec), LocalCodec: launchCodec(spec), LocalRequired: launchRequired(spec), SandboxID: r.sandboxID, PathID: r.pathID, BaseRoot: r.spec.BaseRoot})
 		if err != nil {
 			return fail(err)
 		}
@@ -656,8 +658,12 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	opener := FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
 		return openLaunchFile(ctx, spec, path, ref, spec.RefLocations)
 	})
-	if err := canonicalizeConfiguredTarRefsWithOpener(ctx, cfg, spec.RefLocations, launchCodec(spec), launchRequired(spec), opener); err != nil {
-		return fail(err)
+	preparation := spec.coldPreparation
+	reusedPreparation := preparation.reuse(r, spec, cfg)
+	if !reusedPreparation {
+		if err := canonicalizeConfiguredTarRefsWithOpener(ctx, cfg, spec.RefLocations, launchCodec(spec), launchRequired(spec), opener); err != nil {
+			return fail(err)
+		}
 	}
 	var diffKey [32]byte
 	defer clear(diffKey[:])
@@ -687,9 +693,11 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			}
 		}
 	}
-	preparation, err := preflightColdArtifacts(ctx, cfg, launchFetcher(spec), spec.RefLocations, r.baseDir, r.sandboxID, launchCodec(spec), diffKey, launchRequired(spec), opener, r.spec.checkpointPlan)
-	if err != nil {
-		return fail(err)
+	if !reusedPreparation {
+		preparation, err = preflightColdArtifacts(ctx, cfg, launchFetcher(spec), spec.RefLocations, r.baseDir, r.sandboxID, launchCodec(spec), diffKey, launchRequired(spec), opener, r.spec.checkpointPlan)
+		if err != nil {
+			return fail(err)
+		}
 	}
 	if err := MaterializeImageDefaults(cfg, preparation.imageDefaults); err != nil {
 		return fail(err)
@@ -841,6 +849,13 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		if err != nil {
 			return DiskBackend{}, err
 		}
+		if reusedPreparation {
+			// Reuse metadata, never a prior pathname's filesystem verdict. This
+			// is the actual combined view that will be bound to the runtime.
+			if err := validateExt4BlockReader(ctx, cow); err != nil {
+				return DiskBackend{}, errors.Join(fmt.Errorf("launch disk %d writable filesystem: %w", index, err), cow.Close())
+			}
+		}
 		r.disks = append(r.disks, runtimeOwnedDisk{reader: ro, base: base, cow: cow, diffPath: diffPath, ownedDiff: owned})
 		return DiskBackend{Overlay: root.Overlay != nil, Reader: ro, Cow: cow, BasePath: root.Base, DiffPath: diffPath, OwnedDiff: owned}, nil
 	}
@@ -988,7 +1003,17 @@ func openLaunchFile(ctx context.Context, s LaunchSpec, path string, ref manifest
 	if storage := opaqueLaunchStorage(s); storage != nil {
 		return storage.OpenFileWithLocations(ctx, path, ref, locations)
 	}
-	return artifact.OpenFileWithLocations(ctx, path, ref, s.ManifestConfig, launchKey(s), launchFetcher(s), locations, launchCodec(s), launchRequired(s))
+	return artifact.OpenFileWithLocations(ctx, path, ref, launchManifestConfig(s), launchKey(s), launchFetcher(s), locations, launchCodec(s), launchRequired(s))
+}
+
+func launchManifestConfig(s LaunchSpec) *config.ManifestConfig {
+	if s.legacyAccess != nil && s.legacyAccess.ManifestCfg != nil {
+		return s.legacyAccess.ManifestCfg
+	}
+	if s.ManifestConfig != nil {
+		return s.ManifestConfig
+	}
+	return s.Storage.ManifestConfig()
 }
 
 func opaqueLaunchStorage(s LaunchSpec) *artifact.ProcessStorage {
@@ -1012,10 +1037,7 @@ func launchFetcher(s LaunchSpec) fetch.Fetcher {
 }
 
 func Start(ctx context.Context, spec SandboxSpec) (*Runtime, error) {
-	return start(ctx, spec, nil)
-}
-
-func start(ctx context.Context, spec SandboxSpec, prepared *preparedHostIdentity) (*Runtime, error) {
+	prepared := spec.Runtime.preparedHost
 	if prepared != nil && prepared.unknownKernel {
 		if spec.Launch.legacyAccess == nil || spec.Launch.legacyAccess.PortableConfig == nil ||
 			spec.Launch.PortableConfig == nil || spec.Launch.SourceBinding == nil {
@@ -1028,7 +1050,7 @@ func start(ctx context.Context, spec SandboxSpec, prepared *preparedHostIdentity
 			return nil, errors.New("legacy portable boot runtime identity mismatch")
 		}
 	}
-	r, err := startRuntime(ctx, spec.Runtime, prepared)
+	r, err := StartRuntime(ctx, spec.Runtime)
 	if err != nil {
 		return nil, err
 	}
@@ -1037,6 +1059,13 @@ func start(ctx context.Context, spec SandboxSpec, prepared *preparedHostIdentity
 		return nil, err
 	}
 	return r, nil
+}
+
+// start retains the private identity-handoff test adapter. Production Run uses
+// the same public Start -> StartRuntime -> Launch path as other callers.
+func start(ctx context.Context, spec SandboxSpec, prepared *preparedHostIdentity) (*Runtime, error) {
+	spec.Runtime.preparedHost = prepared
+	return Start(ctx, spec)
 }
 func (r *Runtime) State() string { r.mu.Lock(); defer r.mu.Unlock(); return r.state.String() }
 func (r *Runtime) Wait(ctx context.Context) (ExitResult, error) {
@@ -1171,146 +1200,6 @@ func (r *Runtime) cleanupResources() (retErr error) {
 		retErr = errors.Join(retErr, r.identity.RemoveRunDir(), r.identity.Close())
 	}
 	return retErr
-}
-
-func DeriveRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, storage *artifact.ProcessStorage, locations config.RefLocations) (RuntimeSpec, error) {
-	return deriveRuntimeSpec(ctx, cfg, LaunchSpec{Storage: storage, RefLocations: locations})
-}
-func deriveRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, launch LaunchSpec) (RuntimeSpec, error) {
-	storage, locations := launch.Storage, launch.RefLocations
-	if cfg == nil || storage == nil {
-		return RuntimeSpec{}, errors.New("derive runtime spec: config and storage required")
-	}
-	opener := FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
-		return openLaunchFile(ctx, launch, path, ref, locations)
-	})
-
-	clone, err := cloneSDKConfig(cfg)
-	if err != nil {
-		return RuntimeSpec{}, err
-	}
-	var shapes []RuntimeDiskSpec
-	var diffOpts []diffstore.DiskOption
-	if launchCodec(launch) != nil {
-		keyFn := launchKey(launch)
-		if keyFn == nil {
-			return RuntimeSpec{}, errors.New("diff encryption requires customer key")
-		}
-		key, e := keyFn()
-		if e != nil {
-			return RuntimeSpec{}, e
-		}
-		diffOpts = append(diffOpts, diffstore.WithDiffEncryption(key, launchRequired(launch)))
-		clear(key[:])
-	}
-	baseRoot, sandboxID, pathID := "", "", ""
-	if launch.legacyAccess != nil {
-		baseRoot, sandboxID, pathID = launch.legacyAccess.BaseRoot, launch.legacyAccess.SandboxID, launch.legacyAccess.PathID
-		if pathID == "" {
-			pathID = sandboxID
-		}
-	}
-	defaultBaseDir := DefaultBaseDir(baseRoot, pathID)
-	capacity := func(diffURI, defaultURI, template string, baseSize int64) (int64, error) {
-		if diffURI == "" && defaultURI != "" {
-			if _, p, ok := config.SchemeAndPath(defaultURI); ok {
-				if st, e := os.Stat(p); e == nil && st.Size() > 0 {
-					diffURI = defaultURI
-				}
-			}
-		}
-
-		if diffURI != "" {
-			_, p, ok := config.SchemeAndPath(diffURI)
-			if !ok {
-				return 0, fmt.Errorf("invalid diff URI %q", diffURI)
-			}
-			if st, e := os.Stat(p); e == nil && st.Size() > 0 {
-				return diffstore.DiffSourceCapacity(p, false, diffOpts...)
-			}
-		}
-		if template != "" {
-			scheme, p, ok := config.SchemeAndPath(template)
-			if !ok || scheme != "file" {
-				return 0, fmt.Errorf("invalid diff template %q", template)
-			}
-			return diffstore.DiffSourceCapacity(p, true, diffOpts...)
-		}
-		if baseSize > 0 {
-			return baseSize, nil
-		}
-		return 0, errors.New("no source for writable disk capacity")
-	}
-	derive := func(root *config.RootConfig, name string) (RuntimeDiskSpec, error) {
-		d := RuntimeDiskSpec{Name: name, Overlay: root.Overlay != nil}
-		var cowBaseSize int64
-		if root.Overlay != nil {
-			ro, _, e := OpenRootImageBlockReaderWithOpener(ctx, root.Base, launchFetcher(launch), locations, launchCodec(launch), launchRequired(launch), opener)
-			if e != nil {
-				return d, e
-			}
-			d.BaseCapacity = ro.Size()
-			_ = ro.Close()
-			if root.Overlay.Base != "" {
-				x, _, e := OpenLayeredBlockReaderWithOpener(ctx, append([]string{root.Overlay.Base}, root.Overlay.BaseFromRefs...), launchFetcher(launch), locations, launchCodec(launch), launchRequired(launch), opener)
-				if e != nil {
-					return d, e
-				}
-				cowBaseSize = x.Size()
-				_ = x.Close()
-			}
-			defaultURI := ""
-			if sandboxID != "" {
-				if name == "root" {
-					defaultURI = DefaultDiffURIForBaseDir(defaultBaseDir, sandboxID)
-				} else {
-					defaultURI = DefaultDiskDiffURI(defaultBaseDir, sandboxID, fmt.Sprintf("disk%d", len(shapes)-1))
-				}
-			}
-			d.WritableCapacity, err = capacity(root.Overlay.Diff, defaultURI, root.Overlay.DiffTemplate, cowBaseSize)
-		} else {
-			if root.Base != "" {
-				x, _, e := OpenLayeredBlockReaderWithOpener(ctx, append([]string{root.Base}, root.BaseFromRefs...), launchFetcher(launch), locations, launchCodec(launch), launchRequired(launch), opener)
-				if e != nil {
-					return d, e
-				}
-				cowBaseSize = x.Size()
-				_ = x.Close()
-			}
-			defaultURI := ""
-			if sandboxID != "" {
-				if name == "root" {
-					defaultURI = DefaultDiffURIForBaseDir(defaultBaseDir, sandboxID)
-				} else {
-					defaultURI = DefaultDiskDiffURI(defaultBaseDir, sandboxID, fmt.Sprintf("disk%d", len(shapes)-1))
-				}
-			}
-			d.WritableCapacity, err = capacity(root.Diff, defaultURI, root.DiffTemplate, cowBaseSize)
-		}
-		return d, err
-	}
-	root, err := derive(&cfg.Boot.Root, "root")
-	if err != nil {
-		return RuntimeSpec{}, err
-	}
-	shapes = append(shapes, root)
-	for i := range cfg.Boot.Disks {
-		d, e := derive(&cfg.Boot.Disks[i].RootConfig, cfg.Boot.Disks[i].Name)
-		if e != nil {
-			return RuntimeSpec{}, e
-		}
-		shapes = append(shapes, d)
-	}
-	clone.Boot.Root = config.RootConfig{}
-	if root.Overlay {
-		clone.Boot.Root.Overlay = &config.OverlayConfig{}
-	}
-	clone.Boot.Disks = nil
-	clone.Mounts = nil
-	clone.Files = nil
-	clone.Init = nil
-	clone.Launch = config.LaunchConfig{}
-	return runtimeSpecFromConfig(clone, shapes), nil
 }
 
 func runtimeSpecFromConfig(c *config.SandboxConfig, disks []RuntimeDiskSpec) RuntimeSpec {

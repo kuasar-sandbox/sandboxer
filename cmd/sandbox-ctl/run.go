@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
-	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -352,28 +351,17 @@ func runCmd(args []string) int {
 			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics, *enableCheckpoint)
 	}
 
-	var (
-		portableConfig *config.PortableSandboxConfig
-		sourceBinding  *sandbox.RunSourceBinding
-		bundleReader   = (*manifestbundle.Reader)(nil)
-		bundleFetcher  = (*manifestbundle.ManifestFetcher)(nil)
-	)
+	var sourceLaunch sandbox.LaunchSpec
 	if *fromRef != "" {
-		source, openErr := openSandboxRunSource(ctx, *fromRef, processStorage, refLocations)
+		source, openErr := sandbox.OpenRunSource(ctx, *fromRef, processStorage, refLocations)
 		if openErr != nil {
 			fmt.Fprintf(diagnostics, "sandbox-ctl run --from: %v\n", openErr)
 			return 1
 		}
-		if !*replaceBoot {
-			defer source.Close()
-			applyDefaultArtifactBindings(cfg, source.Root.Portable, source.RelativeDir)
-		}
+		defer source.Close()
 		var applyErr error
-		cfg, portableConfig, applyErr = config.ApplyFromRules(source.Root.Portable, cfg, presence, config.ApplyFromOptions{ReplaceBoot: *replaceBoot})
+		cfg, sourceLaunch, applyErr = source.Apply(cfg, presence, config.ApplyFromOptions{ReplaceBoot: *replaceBoot})
 		if applyErr != nil {
-			if *replaceBoot {
-				_ = source.Close()
-			}
 			fmt.Fprintf(diagnostics, "sandbox-ctl run --from: %v\n", applyErr)
 			return 1
 		}
@@ -382,27 +370,21 @@ func runCmd(args []string) int {
 				fmt.Fprintf(diagnostics, "sandbox-ctl run --from: close source: %v\n", closeErr)
 				return 1
 			}
-		} else {
-			sourceBinding = &sandbox.RunSourceBinding{
-				Checkpoint: source.Root.Checkpoint,
-				SandboxRef: source.PortableRef, RuntimeRef: source.RuntimeRef, RelativeDir: source.RelativeDir,
-				BundleSource: source.BundleSource,
-			}
-			manifestFetcher = source.Fetcher
-			bundleReader = source.BundleReader
-			bundleFetcher = source.BundleFetcher
+		}
+		if sourceLaunch.Fetcher != nil {
+			manifestFetcher = sourceLaunch.Fetcher
 		}
 	}
 
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
 		EnableCheckpoint:   *enableCheckpoint,
 		Cfg:                cfg,
-		PortableConfig:     portableConfig,
-		SourceBinding:      sourceBinding,
+		PortableConfig:     sourceLaunch.PortableConfig,
+		SourceBinding:      sourceLaunch.SourceBinding,
 		ManifestCfg:        manifestCfg,
 		Fetcher:            manifestFetcher,
-		BundleReader:       bundleReader,
-		BundleFetcher:      bundleFetcher,
+		BundleReader:       sourceLaunch.BundleReader,
+		BundleFetcher:      sourceLaunch.BundleFetcher,
 		CustomerKeyFn:      keyFn,
 		LocalCodec:         localCodec,
 		LocalRequired:      localRequired,
