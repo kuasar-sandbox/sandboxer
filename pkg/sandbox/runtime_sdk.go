@@ -687,11 +687,11 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			}
 		}
 	}
-	defaults, err := preflightColdArtifacts(ctx, cfg, launchFetcher(spec), spec.RefLocations, r.baseDir, r.sandboxID, launchCodec(spec), diffKey, launchRequired(spec), opener, r.spec.checkpointPlan)
+	preparation, err := preflightColdArtifacts(ctx, cfg, launchFetcher(spec), spec.RefLocations, r.baseDir, r.sandboxID, launchCodec(spec), diffKey, launchRequired(spec), opener, r.spec.checkpointPlan)
 	if err != nil {
 		return fail(err)
 	}
-	if err := MaterializeImageDefaults(cfg, defaults); err != nil {
+	if err := MaterializeImageDefaults(cfg, preparation.imageDefaults); err != nil {
 		return fail(err)
 	}
 	var portable *config.PortableSandboxConfig
