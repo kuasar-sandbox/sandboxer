@@ -2013,14 +2013,18 @@ its stored pair without reading artifacts. No token, public result, base format,
 or persistent cleanup schema changes.
 
 For local disk Checkpoint E, the keep plan also records its exact DIFF versions.
-Only the current E contributes disk versions: retaining an ancestor S for memory
-does not retain that ancestor's disk Checkpoints. Cleanup obtains the directory
+The current E and each explicitly retained E contribute disk versions. The caller
+may pass additional immutable E or S/E pairs through `artifact.Checkpoint.Retain`;
+cleanup unions their file and DIFF-version dependencies with the current pair.
+All pairs are normalized and validated before any deletion. Fixed `.sandbox` and
+`.snapshot` aliases still follow only the current pair. Retaining an ancestor S
+for memory alone does not retain that ancestor's disk Checkpoints. Cleanup obtains the directory
 owner, validates the complete keep set, deletes unused versions in batches, and
 retires DIFFs not needed by that set through the metadata backend. Existing read
 pins defer physical reclamation. It does not open an active Disk or decrypt
 guest pages. A keep-plan or identity error prevents this mutation.
 
-The keep set contains current S/E, memory-history carriers, and current disk,
+The keep set contains current and explicitly retained S/E, memory-history carriers, and their disk,
 upper and immutable-base carriers, including reused files. A historical S's old
 E is not a disk dependency. Any needed Bundle member retains its whole physical
 carrier. Source/location binding precedes basename comparison. Selection reads
