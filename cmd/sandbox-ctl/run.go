@@ -21,6 +21,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/readiness"
 	runtimesdk "github.com/kuasar-sandbox/sandboxer/pkg/runtime"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
@@ -154,10 +155,10 @@ func runCmd(args []string) int {
 			readyFDSet = true
 		}
 	})
-	var readiness *readinessFDWriter
+	var readyWriter *readiness.Writer
 	if readyFDSet {
 		var err error
-		readiness, err = newReadinessFDWriter(*readyFD, func(format string, args ...any) {
+		readyWriter, err = newReadinessFDWriter(*readyFD, func(format string, args ...any) {
 			log.Printf("[sandbox-ctl] "+format, args...)
 		})
 		if err != nil {
@@ -166,11 +167,11 @@ func runCmd(args []string) int {
 		}
 		// Every subsequent return closes the descriptor, so startup failure is
 		// represented by EOF (possibly after control_ready).
-		defer readiness.Close()
+		defer readyWriter.Close()
 	}
 	var notifyReadiness sandbox.ReadinessNotify
-	if readiness != nil {
-		notifyReadiness = readiness.Notify
+	if readyWriter != nil {
+		notifyReadiness = readyWriter.Notify
 	}
 	// --ping-fatal-threshold precedence: flag > env > 0 (disabled).
 	pingFatalSet := false
