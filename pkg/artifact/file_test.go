@@ -86,6 +86,9 @@ func TestOpenFileManifestBundleSelectorAndScopedFetcher(t *testing.T) {
 	if opened.Format() != artifact.FileFormatManifestBundle {
 		t.Fatalf("format = %v, want Manifest Bundle", opened.Format())
 	}
+	if opened.ResolvedPath() != bundlePath {
+		t.Fatalf("physical Bundle path = %q, want %q", opened.ResolvedPath(), bundlePath)
+	}
 	rootKey, ok := opened.RootManifestKey()
 	if !ok || rootRef != "manifest://"+manifest.HexKey(rootKey) {
 		t.Fatalf("selected root = %s, want %s", manifest.HexKey(rootKey), rootRef)
@@ -190,6 +193,9 @@ func TestOpenFileLocatedAliasCannotEscapeLocationDirectory(t *testing.T) {
 	opened, err := storage.OpenFileWithLocations(ctx, insideAlias, insideRef, locations)
 	if err != nil {
 		t.Fatalf("same-directory located alias: %v", err)
+	}
+	if opened.ResolvedPath() != insidePath {
+		t.Fatalf("physical tarstream path = %q, want %q", opened.ResolvedPath(), insidePath)
 	}
 	if err := opened.Close(); err != nil {
 		t.Fatal(err)

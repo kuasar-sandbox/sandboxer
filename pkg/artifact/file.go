@@ -41,6 +41,7 @@ type OpenedFile struct {
 	fetch.Stream
 
 	format        FileFormat
+	resolvedPath  string
 	scopedFetcher fetch.Fetcher
 	manifestSet   *bundle.ManifestFetcher
 	resolver      *bundleSourceResolver
@@ -54,6 +55,11 @@ type OpenedFile struct {
 }
 
 func (f *OpenedFile) Format() FileFormat { return f.format }
+
+// ResolvedPath is the absolute physical carrier path selected for this open.
+// It is the path used to open the stream/Bundle, not a later resolution of its
+// input alias, and remains fixed if that alias is retargeted.
+func (f *OpenedFile) ResolvedPath() string { return f.resolvedPath }
 
 func (f *OpenedFile) ScopedFetcher() fetch.Fetcher { return f.scopedFetcher }
 
@@ -163,7 +169,7 @@ func openFileWithLocations(
 	if err := ref.Validate(); err != nil {
 		return nil, readerr.Mark(err, false)
 	}
-	path, err := resolveLocatedFileTarget(path, ref, locations)
+	path, err := resolveFileTarget(path, ref, locations)
 	if err != nil {
 		return nil, err
 	}
@@ -178,11 +184,26 @@ func openFileWithLocations(
 	return openTarstream(path, ref, localCodec, localRequired)
 }
 
-// validateLocatedFileTarget confines a named ref-location alias to the same
-// trusted directory as its resolved basename. Semantic aliases may point at a
-// sibling content-addressed file, but cannot escape the named location through
-// a symlink. Unlocated paths are explicit host input and retain existing
-// filesystem semantics.
+// resolveFileTarget selects the physical path used by both format detection and
+// opening. Named ref-location aliases must remain in the same trusted directory;
+// unlocated paths may resolve to any explicitly supplied host location.
+func resolveFileTarget(path string, ref manifest.Ref, locations config.RefLocations) (string, error) {
+	if ref.Location != "" {
+		return resolveLocatedFileTarget(path, ref, locations)
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("artifact: resolve file path: %w", err)
+	}
+	realTarget, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("artifact: resolve file target: %w", err)
+	}
+	return realTarget, nil
+}
+
+// resolveLocatedFileTarget confines named aliases to their trusted directory.
+// Unlocated paths are left to the caller's physical-file opening policy.
 func resolveLocatedFileTarget(path string, ref manifest.Ref, locations config.RefLocations) (string, error) {
 	if ref.Location == "" {
 		return path, nil
@@ -280,15 +301,9 @@ func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg 
 	if cfg == nil || keyFn == nil {
 		return nil, readerr.Mark(fmt.Errorf("manifest Bundle requires manifest configuration and customer key"), false)
 	}
-	resolvedPath, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return nil, fmt.Errorf("manifest Bundle resolve final path: %w", err)
-	}
-	resolvedPath, err = filepath.Abs(resolvedPath)
-	if err != nil {
-		return nil, fmt.Errorf("manifest Bundle resolve final path: %w", err)
-	}
-	reader, err := bundle.Open(resolvedPath)
+	// path was resolved and location-checked before format detection. Use that
+	// same path for the reader, identity, dependent refs, and returned provenance.
+	reader, err := bundle.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +315,7 @@ func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg 
 		_ = reader.Close()
 		return nil, err
 	}
-	root, err := BundleRootKey(resolvedPath, ref)
+	root, err := bundleRootKeyFromResolvedPath(path, ref)
 	if err != nil {
 		return fail(err)
 	}
@@ -317,7 +332,7 @@ func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg 
 		return fail(readerr.Mark(err, false))
 	}
 	if len(reader.Refs()) != 0 {
-		resolver = newBundleSourceResolver(filepath.Dir(resolvedPath), locations, customerKey, decryptor, verificationOptions(cfg))
+		resolver = newBundleSourceResolver(filepath.Dir(path), locations, customerKey, decryptor, verificationOptions(cfg))
 	}
 	local := fetch.NewFetcherWithOptions(customerKey, reader.Getter(), decryptor, verificationOptions(cfg))
 	clear(customerKey[:])
@@ -327,7 +342,7 @@ func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg 
 		return fail(fmt.Errorf("open manifest Bundle root %s: %w", manifest.HexKey(root), err))
 	}
 	return &OpenedFile{
-		Stream: stream, format: FileFormatManifestBundle, scopedFetcher: scoped, manifestSet: scoped,
+		Stream: stream, format: FileFormatManifestBundle, resolvedPath: path, scopedFetcher: scoped, manifestSet: scoped,
 		resolver: resolver, bundleReader: reader, rootKey: root,
 	}, nil
 }
@@ -336,17 +351,24 @@ func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg 
 // from the symlink-resolved <64hex>.bundle filename.
 func BundleRootKey(path string, ref manifest.Ref) (store.ContentKey, error) {
 	if ref.DigestScheme == "manifest" {
+		return bundleRootKeyFromResolvedPath(path, ref)
+	}
+	realPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return store.ContentKey{}, fmt.Errorf("manifest Bundle resolve final filename: %w", err)
+	}
+	return bundleRootKeyFromResolvedPath(realPath, ref)
+}
+
+func bundleRootKeyFromResolvedPath(path string, ref manifest.Ref) (store.ContentKey, error) {
+	if ref.DigestScheme == "manifest" {
 		key, err := manifest.ParseHexKey(ref.Digest)
 		if err != nil {
 			return key, readerr.Mark(fmt.Errorf("manifest Bundle selector: %w", err), false)
 		}
 		return key, nil
 	}
-	realPath, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return store.ContentKey{}, fmt.Errorf("manifest Bundle resolve final filename: %w", err)
-	}
-	base := filepath.Base(realPath)
+	base := filepath.Base(path)
 	if filepath.Ext(base) != ".bundle" {
 		return store.ContentKey{}, readerr.Mark(fmt.Errorf("manifest Bundle without @manifest selector requires <64hex>.bundle final filename"), false)
 	}
@@ -379,7 +401,7 @@ func openTarstream(path string, ref manifest.Ref, codec tarstream.Codec, require
 		return nil, readerr.Mark(fmt.Errorf("local tarstream has no declared digest"), false)
 	}
 	scheme, digest := digester.Digest()
-	return &OpenedFile{Stream: stream, format: FileFormatTarstream, digestScheme: scheme, digest: digest}, nil
+	return &OpenedFile{Stream: stream, format: FileFormatTarstream, resolvedPath: path, digestScheme: scheme, digest: digest}, nil
 }
 
 func tarReadOptions(ref manifest.Ref, codec tarstream.Codec, required bool) ([]tarstream.ReadOption, error) {
@@ -411,11 +433,7 @@ func validateTarIdentity(ref manifest.Ref, path string, stream fetch.Stream) err
 	if ref.Location == "" {
 		return nil
 	}
-	realPath := path
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		realPath = resolved
-	}
-	base := filepath.Base(realPath)
+	base := filepath.Base(path)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
 	if digestEqual(stem, digest) {
 		return nil
