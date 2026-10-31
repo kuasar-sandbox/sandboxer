@@ -1678,6 +1678,20 @@ and MUX barrier. It never cold-boots first or requires `runtime_ready` from an
 older snapshot. The CLI converts its existing config/`--from` inputs into this
 SDK; cross-process administrative commands retain the local control transport.
 
+For cold starts from a Sandbox artifact, use
+[`sandbox.OpenRunSource`](../pkg/sandbox/run_source.go)(ctx, ref, storage, locations)
+and `source.Apply(host, presence, config.ApplyFromOptions{...})`. Apply returns
+the effective configuration and a `LaunchSpec` with the portable C0, checkpoint
+provenance and paired Bundle selectors. It shares the CLI's source resolution,
+default boot binding and presence-aware override rules without modifying host
+configuration or binding the disk graph twice. Keep the source and its borrowed
+storage open until the runtime exits or `Close` completes; canceling `Wait` does
+not end this borrowing. With `ReplaceBoot`,
+the result keeps no source provenance or scoped selectors, so the source may be
+closed immediately after Apply; the returned storage remains borrowed. These
+helpers neither start a VM nor acquire checkpoint writers. Set runtime host
+options, stdio and forwards separately before starting.
+
 `RuntimeSpec` contains kernel/Bundle bindings, CPU/memory and resource policy,
 host TAP/provider/namespace requirements, console/control settings and ordered
 `RuntimeDiskSpec` entries. Each logical disk fixes its name, single/overlay

@@ -29,6 +29,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/internal/chmemory"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/internal/runidentity"
+	"github.com/kuasar-sandbox/sandboxer/internal/sourcebind"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -192,7 +193,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		}
 	}()
 	opts.ArtifactRelativeDir = sandboxSource.RelativeDir
-	applyDefaultRestoreArtifactBindings(opts.HostCfg, sandboxSource.Root.Portable, sandboxSource.RelativeDir)
+	sourcebind.ApplyDefaultBootBindings(opts.HostCfg, sandboxSource.Root.Portable, sandboxSource.RelativeDir)
 	merged, c0, err := config.ApplyRestoreRules(sandboxSource.Root.Portable, opts.HostCfg, opts.HostPresence)
 	if err != nil {
 		return -1, err
@@ -1280,24 +1281,6 @@ func resolveRestoreRuntime(ctx context.Context, configured, required string) (st
 	}
 	log.Printf("[sandbox-ctl run --restore] boot.runtime selected %s after %v", fallback, primaryErr)
 	return fallback, nil
-}
-
-func applyDefaultRestoreArtifactBindings(host *config.SandboxConfig, portable *config.PortableSandboxConfig, relativeDir string) {
-	if host == nil || portable == nil || relativeDir == "" {
-		return
-	}
-	bind := func(current *string, raw string) {
-		if *current != "" {
-			return
-		}
-		ref, err := manifest.ParseRef(raw)
-		if err != nil || ref.Scheme != manifest.RefSchemeFile {
-			return
-		}
-		*current = "file://" + filepath.Join(relativeDir, ref.Path)
-	}
-	bind(&host.Boot.Kernel, portable.Boot.Kernel)
-	bind(&host.Boot.Runtime, portable.Boot.Runtime)
 }
 
 func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, opts Options, relativeDir string, diffCustomerKey [32]byte) error {

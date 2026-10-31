@@ -1483,6 +1483,17 @@ MUX 屏障后返回同一种 live owner。它不会先冷启动，也不要求�
 `runtime_ready`。CLI 将既有 config/`--from` 输入转换为 SDK spec；跨进程管理命令
 继续使用本地控制传输。
 
+从 Sandbox 制品冷启动时，使用
+[`sandbox.OpenRunSource`](../pkg/sandbox/run_source.go)(ctx, ref, storage, locations)
+和 `source.Apply(host, presence, config.ApplyFromOptions{...})`。Apply 返回生效配置与
+携带 portable C0、checkpoint provenance 和成对 Bundle selector 的 `LaunchSpec`，
+复用 CLI 的来源解析、默认 boot 绑定与 presence-aware override 规则，不修改 host
+配置，也不提前重复绑定磁盘图。source 和借用的 storage 必须保持打开，直到 runtime
+退出或 `Close` 完成；取消 `Wait` 不结束借用。使用 `ReplaceBoot` 时，结果不保留 source provenance 或 scoped
+selector，Apply 后即可关闭 source；返回结果中的 storage 仍为借用。这些 helper
+不启动 VM，也不获取 checkpoint writer。启动前由调用方另外设置 runtime host
+选项、stdio 与 forwards。
+
 `RuntimeSpec` 包含 kernel/Bundle 绑定、CPU/内存及资源策略、宿主
 TAP/provider/namespace 要求、console/control 设置和有序的 `RuntimeDiskSpec`。
 每个逻辑盘固定名称、single/overlay 布局和逻辑容量。Overlay 展开为只读 base 加
