@@ -61,6 +61,8 @@ func (s *RunSource) Close() error {
 // keeps its source graph unbound; Run or Launch binds it during preparation.
 // The LaunchSpec carries the workload and complete source access, while stdio,
 // forwards and RuntimeSpec host settings remain the caller's responsibility.
+// Pass the returned LaunchSpec intact to DeriveRuntimeSpecWithOptions and
+// Start/Launch to retain the source-bound portable boot identity policy.
 // ReplaceBoot requires a complete host boot definition and retains neither
 // source provenance nor source-scoped selectors. Its Storage is still borrowed.
 func (s *RunSource) Apply(host *config.SandboxConfig, presence config.FieldPresence, options config.ApplyFromOptions) (*config.SandboxConfig, LaunchSpec, error) {
@@ -107,6 +109,7 @@ func (s *RunSource) Apply(host *config.SandboxConfig, presence config.FieldPrese
 		binding.Refs = append([]string(nil), binding.Refs...)
 		launch.SourceBinding.BundleSource = &binding
 	}
+	launch.sourceProof = newRunSourceIdentity(launch)
 	return cfg, launch, nil
 }
 

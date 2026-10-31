@@ -20,7 +20,9 @@ type ArtifactCredentials = sandbox.ArtifactCredentials
 type ExitResult = sandbox.ExitResult
 
 // RestoreSpec describes snapshot reconstruction, including explicit artifact
-// credentials and host bindings. Fetcher is borrowed until Runtime.Wait returns.
+// credentials and host bindings. Fetcher is borrowed until Runtime.Wait returns
+// an exit result or Runtime.Close completes. A canceled Wait does not end the
+// borrowing.
 type RestoreSpec restore.Options
 
 func StartRuntime(ctx context.Context, spec RuntimeSpec) (*Runtime, error) {

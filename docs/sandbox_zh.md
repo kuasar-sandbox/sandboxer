@@ -967,7 +967,7 @@ file://<digest>.overlay@hmac:<digest>
 file://<digest>.overlay@digest:<digest>
 ```
 
-目标 host 使用实际 path、source directory 或 named ref-location 在 controller、network、cgroup、VM 或 run directory 副作用前完成 binding。显式 cold projection 和公开 `StartRuntime` 优先使用配置的 kernel 路径旁的 `.sha256` sidecar；没有 sidecar 时，在 CH 启动前对原始 kernel 完整计算一次 hash。旧式 portable `run --from` 执行廉价的 kernel binding 检查，并在 sidecar 存在时与 C0 比较；sidecar 不存在时绝不计算完整 kernel hash。Restore 保持廉价 kernel binding 检查，完全忽略 sidecar。portable boot 和 restore 都将 runtime Bundle footer identity 与 C0 比较。没有 sidecar 的 portable boot 不独立证明宿主 kernel 匹配 E 记录的 digest；kernel 部署仍是受信宿主的责任。Carrier metadata 和按配置启用的内容验证保留各自检查。源码见 [lifecycle.go](../pkg/sandbox/lifecycle.go) 与 [restore.go](../pkg/restore/restore.go)。
+目标 host 使用实际 path、source directory 或 named ref-location 在 controller、network、cgroup、VM 或 run directory 副作用前完成 binding。显式 cold projection 和手工构造的 `RuntimeSpec` 优先使用配置的 kernel 路径旁的 `.sha256` sidecar；没有 sidecar 时，在 CH 启动前对原始 kernel 完整计算一次 hash。Portable `run --from` 与 SDK 的 `OpenRunSource → Apply → DeriveRuntimeSpecWithOptions → StartRuntime/Launch` 共用 portable identity 策略：检查 kernel binding 可读，并在 sidecar 存在时与 C0 比较；sidecar 不存在时不计算完整 kernel hash。Restore 保持廉价 kernel binding 检查，完全忽略 sidecar。portable boot 和 restore 都将 runtime Bundle footer identity 与 C0 比较。没有 sidecar 的 portable boot 不独立证明宿主 kernel 匹配 E 记录的 digest；kernel 部署仍是受信宿主的责任。Carrier metadata 和按配置启用的内容验证保留各自检查。源码见 [source_identity.go](../pkg/sandbox/source_identity.go) 与 [restore.go](../pkg/restore/restore.go)。
 
 <a id="strict-encoding"></a>
 
@@ -1489,10 +1489,21 @@ MUX 屏障后返回同一种 live owner。它不会先冷启动，也不要求�
 携带 portable C0、checkpoint provenance 和成对 Bundle selector 的 `LaunchSpec`，
 复用 CLI 的来源解析、默认 boot 绑定与 presence-aware override 规则，不修改 host
 配置，也不提前重复绑定磁盘图。source 和借用的 storage 必须保持打开，直到 runtime
-退出或 `Close` 完成；取消 `Wait` 不结束借用。使用 `ReplaceBoot` 时，结果不保留 source provenance 或 scoped
+退出且 `Wait` 报告退出结果，或 `Close` 完成；取消 `Wait` 不结束借用。使用 `ReplaceBoot` 时，结果不保留 source provenance 或 scoped
 selector，Apply 后即可关闭 source；返回结果中的 storage 仍为借用。这些 helper
 不启动 VM，也不获取 checkpoint writer。启动前由调用方另外设置 runtime host
 选项、stdio 与 forwards。
+
+把完整的 `LaunchSpec` 传入
+`sandbox.DeriveRuntimeSpecWithOptions(ctx, cfg, sandbox.DeriveRuntimeOptions{Launch: launch, ...})`，
+再将返回的 shape 和同一个 launch 值交给 `Start`，或依次调用 `StartRuntime`、
+`Launch`。Derive 读取磁盘容量，冻结已打开 source 的 identity、C0 boot refs 与选定的
+host boot 路径，不打开 host kernel/runtime 文件。`StartRuntime` 检查启动当时的
+元数据，采用与 `run --from` 相同的 portable identity 策略。Apply 后改变来源
+provenance 或 C0 boot refs、Derive 后改变 host boot 路径，都会被拒绝。
+复制返回值会保留绑定；用 `LaunchSpecFromConfig` 重建公开字段不会。
+手工构造的 shape/source binding 和 `ReplaceBoot` 继续采用严格 identity 策略。
+来源记录不额外持有 reader、storage 或 checkpoint pin。
 
 `RuntimeSpec` 包含 kernel/Bundle 绑定、CPU/内存及资源策略、宿主
 TAP/provider/namespace 要求、console/control 设置和有序的 `RuntimeDiskSpec`。
@@ -1505,14 +1516,16 @@ sidecar 是可选、可读的普通文件，上限为 4 KiB。内容只能是一
 摘要，或使用配置的 kernel basename 的一条无标签 sha256sum 记录
 （`<digest>  vmlinux` 或 `<digest> *vmlinux`）。接受 LF/CRLF 和一个末尾换行；
 多条记录、多余字段、路径和格式错误均导致启动失败。存在但无效、不可读、非普通文件或
-指向不存在目标的 sidecar 都是错误；只有真正不存在时才完整计算 kernel hash。
+指向不存在目标的 sidecar 都是错误。真正不存在时，显式 cold projection 或未绑定
+prepared source 的 shape 完整计算一次 kernel hash；source 派生的 portable startup
+仅把 C0 kernel ref 保留为祖先记录，不计算 hash。
 部署时可在尚未启用的版本目录中对最终**原始** kernel 执行
 `sha256sum -- vmlinux > vmlinux.sha256`，并一致地安装这一对文件。
 sidecar 是受信的部署元数据；Sandboxer 不会根据 CH 加载的字节重新计算摘要。
 runtime Bundle identity 仍取自 footer。版本专属的 kernel 与 sidecar binding
 必须从 identity 解析到 CH 实际启动使用期间保持稳定；只切换 `current` 符号链接
 不能固定进行中的启动所做的全部路径查找。应使用稳定版本路径或协调切换。
-启动既不生成也不缓存 sidecar；未部署 sidecar 时仍在 CH 启动前扫描 kernel 一次。
+启动既不生成也不缓存 sidecar；portable startup 在 CH 启动前将已有 sidecar 与 C0 比较。
 
 `LaunchSpec` 包含工作负载 root/data artifact 引用与可写路径、Guest
 IP/MTU/路由/hostname/interface、mounts、持久与临时 files、init、完整 process 配置
@@ -1520,7 +1533,8 @@ IP/MTU/路由/hostname/interface、mounts、持久与临时 files、init、完�
 及 artifact 访问上下文。`LaunchSpecFromConfig` 保留完整配置 ABI。
 `Credentials` 通过 `ArtifactCredentials{Config, CustomerKey}` 创建自有 storage，
 不读取或修改环境变量。也可借用 `Storage`、`Fetcher` 和 Bundle selector；调用方必须
-保持它们打开且不变直到 `Wait` 返回。Runtime 释放 SDK 创建的 reader、storage 和
+保持它们打开且不变，直到 `Wait` 返回退出结果或 `Close` 完成；取消一次 `Wait`
+不结束借用。Runtime 释放 SDK 创建的 reader、storage 和
 自动 diff，不删除调用方指定的 diff/template 路径。继承的 cgroup 和 forwarding FD
 采用借用或复制方式。Kernel/Bundle 路径及 artifact 输入在借用期间必须保持可读且不变；
 SDK 通过 TAP handoff 收到的 FD 归 Runtime 所有。Forwarding
@@ -1590,7 +1604,7 @@ E/S 输出 schema，不序列化为 CLI 命令。Exec 与 capture 要求工作�
 可稍后提供这些输入：
 
 ```text
-StartRuntime: 校验 shape 和 boot binding；保留完整的 kernel 与 Bundle identity
+StartRuntime: 校验 shape 和 boot binding；保留 host identity 事实与 source 祖先记录
   -> 预留资源并获取宿主网络
   -> 创建 memfd/UFFD、固定未绑定 vhost 设备及 control server
   -> spawn CH -> Guest 基础初始化 -> runtime_ready
@@ -1605,14 +1619,16 @@ CLI preflight 中可预测的 config/ref/format 错误仍在 VM 副作用前失�
 必然在基础 VM 已存在后解析工作负载 artifact。C0 在完整 launch 输入已知时写入一次，
 早于 Guest 消费工作负载，之后保持不变。`runtime_ready` 后 Launch 不再查询
 kernel、sidecar 或 Bundle identity，即使这些路径名发生变化；新 Runtime 会重新解析。
-公开 `Start`（包括传入本地或来源 `PortableConfig`）使用完整的 `StartRuntime`
-identity，比较 C0 中两个完整规范 ref，含 basename。因此没有 sidecar 的公开
-portable `Start` 现在会在 CH 启动前计算一次 kernel hash，并拒绝不匹配的 kernel
-C0 ref；不带 `SourceBinding` 的本地 `PortableConfig` 仍受支持。CLI 显式 cold
-`run` 与 `--replace-boot` 将 preflight identity 私下传入 startup，避免二次扫描。
-旧式 portable `run --from` 没有 sidecar 时只把 C0 kernel 当作祖先记录；有 sidecar
-时，kernel 不匹配会在 CH 启动前失败。Restore 不读取 sidecar，也不要求 cold-start
-projection。这一身份保留规则不允许改写运行中 runtime Bundle 的 pmem 后端内容；
+对 source 派生的 shape，`Start` 在创建 VM 前验证匹配的 source/C0；分阶段
+`Launch` 在 checkpoint 合法物化、改变磁盘图和 provenance 前检查同一绑定。
+来源输入被拒绝时，ready base 仍可接受修正后的 `Launch`。没有 sidecar 时，C0 kernel
+ref 仅作为祖先记录，不会被报告为已验证的 host digest；有 sidecar 时，不匹配会在
+CH 启动前失败。手工 shape（包括只手写 `SourceBinding` 或 `PortableConfig` 的情况）
+仍解析完整 host identity，比较 C0 中两个完整规范 ref，含 basename；没有 sidecar
+时计算一次 kernel hash。不带 `SourceBinding` 的本地 `PortableConfig` 仍受支持。
+CLI 显式 cold `run` 与 `--replace-boot` 经 `Start` 复用 preflight identity，避免二次
+扫描。Restore 不读取 sidecar，也不要求 cold-start projection。
+这一身份保留规则不允许改写运行中 runtime Bundle 的 pmem 后端内容；
 Bundle 的既有生命周期要求仍然适用。
 
 ### 5.2 CH command line boundary

@@ -44,8 +44,12 @@ func DeriveRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, storage *
 }
 
 // DeriveRuntimeSpecWithOptions reads the disk capacities needed by StartRuntime.
-// It clones cfg before binding self and relative source refs, so cfg can still
-// be used to construct LaunchSpec without binding the graph a second time.
+// It clones cfg before binding self and relative source refs, leaving cfg's
+// graph unbound for the eventual Launch.
+// With an ordinary RunSource.Apply result, it also binds the source/C0 identity
+// and selected host boot paths for StartRuntime's portable identity checks.
+// Keep that LaunchSpec intact for Start/Launch. Host kernel/runtime files are
+// not opened here; StartRuntime checks their current metadata before VM startup.
 //
 // Storage, Fetcher, and Bundle selectors are borrowed, as in Launch. When Storage
 // is absent, Credentials creates storage owned only by this call; without either
@@ -62,6 +66,10 @@ func DeriveRuntimeSpecWithOptions(ctx context.Context, cfg *config.SandboxConfig
 		return RuntimeSpec{}, err
 	}
 	clone, err := cloneSDKConfig(cfg)
+	if err != nil {
+		return RuntimeSpec{}, err
+	}
+	preparedHost, err := deriveSourceHostIdentity(clone, opts.Launch)
 	if err != nil {
 		return RuntimeSpec{}, err
 	}
@@ -112,7 +120,12 @@ func DeriveRuntimeSpecWithOptions(ctx context.Context, cfg *config.SandboxConfig
 			return RuntimeSpec{}, fmt.Errorf("derive checkpoint shape: %w", err)
 		}
 	}
-	return deriveBoundRuntimeSpec(ctx, clone, opts, checkpointSizes)
+	shape, err := deriveBoundRuntimeSpec(ctx, clone, opts, checkpointSizes)
+	if err != nil {
+		return RuntimeSpec{}, err
+	}
+	shape.preparedHost = preparedHost
+	return shape, nil
 }
 
 func normalizeDeriveRuntimeOptions(opts DeriveRuntimeOptions) (DeriveRuntimeOptions, error) {

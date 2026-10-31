@@ -270,28 +270,12 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 			return -1, fmt.Errorf("project portable C0: %w", err)
 		}
 	} else {
-		// Runtime footer and optional kernel sidecar identities are cheap
-		// deployment metadata. Missing kernel metadata keeps the historical
-		// cheap-binding-only policy; never hash portable boot under #158.
-		if err := VerifyKernelArtifact(opts.Cfg.Boot.Kernel); err != nil {
-			return -1, fmt.Errorf("boot.kernel identity: %w", err)
-		}
-		kernelRef, present, err := optionalKernelRef(opts.Cfg.Boot.Kernel)
-		if err != nil {
-			return -1, fmt.Errorf("boot.kernel identity: %w", err)
-		}
-		if present && c0.Boot.Kernel != kernelRef {
-			return -1, fmt.Errorf("boot.kernel identity mismatch: portable %s, host %s", c0.Boot.Kernel, kernelRef)
-		}
-		runtimeRef, err := ResolveRuntimeProjection(opts.Cfg)
+		hostIdentity, err = preparePortableHostIdentity(opts.Cfg, config.PortableProjection{
+			KernelRef: c0.Boot.Kernel, RuntimeRef: c0.Boot.Runtime,
+		})
 		if err != nil {
 			return -1, err
 		}
-		if c0.Boot.Runtime != runtimeRef {
-			return -1, fmt.Errorf("boot.runtime identity mismatch: portable %s, host %s", c0.Boot.Runtime, runtimeRef)
-		}
-		hostIdentity.projection = config.PortableProjection{KernelRef: kernelRef, RuntimeRef: runtimeRef}
-		hostIdentity.unknownKernel = !present
 	}
 
 	storage, err := artifact.NewProcessStorageWithCustomerKey(opts.ManifestCfg, opts.CustomerKeyFn)
