@@ -132,6 +132,8 @@ type BundleSourceBinding struct {
 // Run executes one sandbox lifecycle: prepare backends + launch server,
 // spawn CH, wait for exit, cleanup. Returns CH's exit code or an error
 // if setup failed.
+// Workload preflight still precedes VM startup. Start/Launch reuse its sealed
+// metadata only for the same inputs and validate the live backends on open.
 func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	if opts.Cfg == nil {
 		return -1, fmt.Errorf("RunOptions.Cfg is nil")
@@ -328,7 +330,11 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.StatsInterval = opts.StatsInterval
 	shape.NotifyReadiness = opts.NotifyReadiness
 	shape.logf = func(f string, a ...any) { log.Printf("[sandbox-ctl] "+f, a...) }
-	r, err := start(ctx, SandboxSpec{Runtime: shape, Launch: launch}, &hostIdentity)
+	shape.preparedHost = &hostIdentity
+	if err := preparation.seal(shape, &launch); err != nil {
+		return -1, fmt.Errorf("seal cold preparation: %w", err)
+	}
+	r, err := Start(ctx, SandboxSpec{Runtime: shape, Launch: launch})
 	if err != nil {
 		return -1, err
 	}
