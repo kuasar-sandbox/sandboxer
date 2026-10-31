@@ -11,63 +11,94 @@ import (
 	"time"
 )
 
-func TestNativeReadCancellationClosesConnectedSocket(t *testing.T) {
-	for _, resource := range []bool{false, true} {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		path := filepath.Join(t.TempDir(), "ctl.sock")
-		listener, err := net.Listen("unix", path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer listener.Close()
-		accepted, closed := make(chan struct{}), make(chan error, 1)
-		go func() {
-			conn, err := listener.Accept()
-			if err != nil {
-				closed <- err
-				return
+func TestClientCancellationClosesConnectedSocket(t *testing.T) {
+	for _, operation := range []struct {
+		name string
+		call func(context.Context, string) error
+	}{
+		{"usage", func(ctx context.Context, socket string) error {
+			_, connected, err := ReadUsage(ctx, socket, false, 0, 1)
+			if !connected {
+				return errors.New("lost connected owner after cancellation")
 			}
-			defer conn.Close()
-			var req Request
-			if err := ReadMessage(conn, &req); err != nil {
-				closed <- err
-				return
+			return err
+		}},
+		{"resource-stats", func(ctx context.Context, socket string) error {
+			_, err := ReadResourceStats(ctx, socket, "sid")
+			return err
+		}},
+		{"checkpoint-list", func(ctx context.Context, socket string) error {
+			refs, err := ListDiffCheckpoints(ctx, socket)
+			if refs != nil {
+				return errors.New("canceled list returned partial references")
 			}
-			close(accepted)
-			var b [1]byte
-			_, err = conn.Read(b[:])
-			closed <- err
-		}()
-		result := make(chan error, 1)
-		go func() {
-			if resource {
-				_, err := ReadResourceStats(ctx, path, "sid")
-				result <- err
-			} else {
-				_, connected, err := ReadUsage(ctx, path, false, 0, 1)
-				if !connected {
-					err = errors.New("lost connected owner after cancellation")
+			return err
+		}},
+		{"checkpoint-delete", func(ctx context.Context, socket string) error {
+			return DeleteDiffCheckpoints(ctx, socket, "owner", []DiffCheckpointRef{{DiffID: "disk", ID: "version"}})
+		}},
+	} {
+		for _, deadline := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/deadline=%t", operation.name, deadline), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				want := error(context.Canceled)
+				if deadline {
+					cancel()
+					ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+					want = context.DeadlineExceeded
 				}
-				result <- err
-			}
-		}()
-		select {
-		case <-accepted:
-		case <-time.After(3 * time.Second):
-			t.Fatal("native request did not reach owner")
-		}
-		cancel()
-		select {
-		case err := <-result:
-			if !errors.Is(err, context.Canceled) {
-				t.Fatal("cancellation lost", err)
-			}
-		case <-time.After(3 * time.Second):
-			t.Fatal("native read ignored cancellation without deadline")
-		}
-		if err := <-closed; err != io.EOF {
-			t.Fatal("canceled socket was not closed", err)
+				defer cancel()
+				path := filepath.Join(t.TempDir(), "ctl.sock")
+				listener, err := net.Listen("unix", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer listener.Close()
+				accepted, closed := make(chan struct{}), make(chan error, 1)
+				go func() {
+					conn, err := listener.Accept()
+					if err != nil {
+						closed <- err
+						return
+					}
+					defer conn.Close()
+					var req Request
+					if err := ReadMessage(conn, &req); err != nil {
+						closed <- err
+						return
+					}
+					close(accepted)
+					var b [1]byte
+					_, err = conn.Read(b[:])
+					closed <- err
+				}()
+				result := make(chan error, 1)
+				go func() { result <- operation.call(ctx, path) }()
+				select {
+				case <-accepted:
+				case <-time.After(3 * time.Second):
+					t.Fatal("request did not reach owner")
+				}
+				if !deadline {
+					cancel()
+				}
+				select {
+				case err := <-result:
+					if !errors.Is(err, want) {
+						t.Fatalf("cancellation lost: got %v, want %v", err, want)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("operation ignored cancellation")
+				}
+				select {
+				case err := <-closed:
+					if err != io.EOF {
+						t.Fatal("canceled socket was not closed", err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("canceled socket remained open")
+				}
+			})
 		}
 	}
 }
