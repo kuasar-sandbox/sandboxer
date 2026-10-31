@@ -27,7 +27,7 @@ func ReadResourceStats(ctx context.Context, socket, sandboxID string) (stats Res
 	if sandboxID == "" {
 		return ResourceStats{}, errors.New("ctl: resource stats requires sandbox identity")
 	}
-	conn, close, err := dialStats(ctx, socket)
+	conn, close, err := dialContext(ctx, socket)
 	if err != nil {
 		return ResourceStats{}, err
 	}

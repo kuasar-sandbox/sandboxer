@@ -81,17 +81,8 @@ func CaptureError(resp Response) error {
 	return errors.New(resp.Msg)
 }
 
-func checkpointConn(ctx context.Context, path string) (net.Conn, func(), error) {
-	c, err := (&net.Dialer{}).DialContext(ctx, "unix", path)
-	if err != nil {
-		return nil, nil, err
-	}
-	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
-	return c, func() { stop(); _ = c.Close() }, nil
-}
-
 func ListDiffCheckpoints(ctx context.Context, socketPath string) ([]DiffCheckpointRef, error) {
-	c, close, err := checkpointConn(ctx, socketPath)
+	c, close, err := dialContext(ctx, socketPath)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +99,7 @@ func DeleteDiffCheckpoints(ctx context.Context, socketPath, ownerID string, refs
 	refs = append([]DiffCheckpointRef(nil), refs...)
 	for start := 0; start < len(refs); start += 128 {
 		err := func() error {
-			c, close, err := checkpointConn(ctx, socketPath)
+			c, close, err := dialContext(ctx, socketPath)
 			if err != nil {
 				return err
 			}
