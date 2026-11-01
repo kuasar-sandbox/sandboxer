@@ -128,8 +128,8 @@ func TestSDKRetainsArtifactIdentityThroughLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	if r.hostProjection.KernelRef != testKernelRef("vmlinux", digest) || r.hostProjection.RuntimeRef == "" || r.legacyUnknownKernel {
-		t.Fatalf("startup identity = %+v, legacy=%v", r.hostProjection, r.legacyUnknownKernel)
+	if r.hostProjection.KernelRef != testKernelRef("vmlinux", digest) || r.hostProjection.RuntimeRef == "" || r.unknownHostKernel {
+		t.Fatalf("startup identity = %+v, legacy=%v", r.hostProjection, r.unknownHostKernel)
 	}
 	cfg, err := launch.config(shape.config())
 	if err != nil {
@@ -571,7 +571,7 @@ func TestSDKIdentityIOCompletesBeforeRuntimeReady(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer r.Close()
-			if r.hostProjection.KernelRef != expected || r.hostProjection.RuntimeRef == "" || r.legacyUnknownKernel {
+			if r.hostProjection.KernelRef != expected || r.hostProjection.RuntimeRef == "" || r.unknownHostKernel {
 				t.Fatalf("incomplete public startup identity: %+v", r.hostProjection)
 			}
 			want := 1
@@ -639,7 +639,7 @@ func TestSDKStartPortableKeepsPublicIdentityPolicy(t *testing.T) {
 	if n := watch.count(unix.IN_ACCESS); n != 1 {
 		t.Fatalf("public PortableConfig Start kernel scans=%d, want 1", n)
 	}
-	if r.legacyUnknownKernel || r.hostProjection != ids {
+	if r.unknownHostKernel || r.hostProjection != ids {
 		t.Fatalf("public Start used legacy policy: %+v", r.hostProjection)
 	}
 }

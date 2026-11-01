@@ -82,11 +82,13 @@ type GuestNetworkSpec struct {
 
 // LaunchSpec includes the entire workload, including ephemeral overrides.
 // Storage and Bundle selectors are borrowed: callers must keep them open until
-// Wait returns. Credentials creates runtime-owned storage using an explicit key.
+// Wait returns an exit result or Close completes. A canceled Wait does not end
+// the borrowing. Credentials creates runtime-owned storage using an explicit key.
 // Caller-specified diff paths are never removed by Runtime.
 type LaunchSpec struct {
 	legacyAccess          *RunOptions
 	coldPreparation       *coldPreparation
+	sourceProof           *runSourceIdentity
 	Root                  config.RootConfig
 	Disks                 []config.DiskConfig
 	Network               GuestNetworkSpec
@@ -181,7 +183,7 @@ type Runtime struct {
 	metaIP                             string
 	identity                           *runidentity.Guard
 	hostProjection                     config.PortableProjection
-	legacyUnknownKernel                bool // only the validated legacy portable Run adapter
+	unknownHostKernel                  bool // portable ancestry without a kernel sidecar; never a verified host digest
 	disks                              []runtimeOwnedDisk
 	cache                              *diffstore.Cache
 	storage                            *artifact.ProcessStorage
@@ -275,12 +277,14 @@ func StartRuntime(ctx context.Context, spec RuntimeSpec) (_ *Runtime, retErr err
 	return startRuntime(ctx, spec, spec.preparedHost)
 }
 
-// preparedHostIdentity belongs to one legacy Run operation. The exact host
+// preparedHostIdentity either carries Run's checked projection or binds a
+// source-derived shape to the host paths checked by StartRuntime. Exact host
 // bindings prevent a preparation from being consumed by a different startup.
 type preparedHostIdentity struct {
 	kernel, bundle string
 	projection     config.PortableProjection
 	unknownKernel  bool
+	sourceProof    *runSourceIdentity
 }
 
 func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostIdentity) (_ *Runtime, retErr error) {
@@ -300,11 +304,13 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 	}
 	spec.Resources = cfg.Resources
 	spec.Network.TapFD = cfg.Network.TapFD
+	prepared, err = resolvePreparedHostIdentity(cfg, prepared)
+	if err != nil {
+		return nil, err
+	}
+	spec.preparedHost = prepared
 	var host config.PortableProjection
 	if prepared != nil {
-		if prepared.kernel != cfg.Boot.Kernel || prepared.bundle != cfg.Boot.Runtime {
-			return nil, errors.New("prepared host identity bindings differ from runtime spec")
-		}
 		host = prepared.projection
 	} else {
 		var err error
@@ -355,7 +361,7 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 	if logf == nil {
 		logf = func(f string, a ...any) { log.Printf("[sandbox-sdk] "+f, a...) }
 	}
-	r := &Runtime{state: runtimeStarting, spec: spec, hostProjection: host, legacyUnknownKernel: prepared != nil && prepared.unknownKernel, sandboxID: sid, pathID: pathID, runDir: runDir, baseDir: DefaultBaseDir(baseRoot, pathID), startUnixNs: time.Now().UnixNano(), lifeCtx: engineCtx, cancelLife: cancel, signals: signals, stopSignals: stopSignals, identity: identity, exitDone: make(chan struct{}), logf: logf}
+	r := &Runtime{state: runtimeStarting, spec: spec, hostProjection: host, unknownHostKernel: prepared != nil && prepared.unknownKernel, sandboxID: sid, pathID: pathID, runDir: runDir, baseDir: DefaultBaseDir(baseRoot, pathID), startUnixNs: time.Now().UnixNano(), lifeCtx: engineCtx, cancelLife: cancel, signals: signals, stopSignals: stopSignals, identity: identity, exitDone: make(chan struct{}), logf: logf}
 	stopOperation := context.AfterFunc(ctx, func() { signals <- syscall.SIGTERM })
 	defer stopOperation()
 	r.spec.CHBinary = chBinary
@@ -549,6 +555,13 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if spec.Storage != nil && spec.Credentials != nil {
 		return errors.New("launch: Storage and Credentials are mutually exclusive")
 	}
+	if prepared := r.spec.preparedHost; prepared != nil && prepared.sourceProof != nil {
+		// Validate before checkpoint preparation rewrites the source/disk graph.
+		// A rejected source is an input error and leaves runtime_ready reusable.
+		if err := prepared.sourceProof.validate(spec); err != nil {
+			return err
+		}
+	}
 	cfg, err := spec.config(r.spec.config())
 	if err != nil {
 		return err
@@ -718,7 +731,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			if portable.Boot.Runtime != r.hostProjection.RuntimeRef {
 				return fail(errors.New("boot.runtime identity mismatch"))
 			}
-			if !r.legacyUnknownKernel && portable.Boot.Kernel != r.hostProjection.KernelRef {
+			if !r.unknownHostKernel && portable.Boot.Kernel != r.hostProjection.KernelRef {
 				return fail(errors.New("boot.kernel identity mismatch"))
 			}
 		}
@@ -1038,7 +1051,11 @@ func launchFetcher(s LaunchSpec) fetch.Fetcher {
 
 func Start(ctx context.Context, spec SandboxSpec) (*Runtime, error) {
 	prepared := spec.Runtime.preparedHost
-	if prepared != nil && prepared.unknownKernel {
+	if prepared != nil && prepared.sourceProof != nil {
+		if err := prepared.sourceProof.validate(spec.Launch); err != nil {
+			return nil, err
+		}
+	} else if prepared != nil && prepared.unknownKernel {
 		if spec.Launch.legacyAccess == nil || spec.Launch.legacyAccess.PortableConfig == nil ||
 			spec.Launch.PortableConfig == nil || spec.Launch.SourceBinding == nil {
 			return nil, errors.New("unknown host kernel identity requires legacy portable boot")
