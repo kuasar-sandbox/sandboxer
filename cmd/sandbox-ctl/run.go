@@ -47,6 +47,8 @@ func runCmd(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 
 	enableCheckpoint := fs.Bool("enable-checkpoint", false, "retain versioned writable disks in BaseRoot/PathID/checkpoint")
+	retainInstance := fs.String("retain-instance", "", "parent object instance owning the current disks (requires --run-id and --enable-checkpoint)")
+	currentRunID := fs.String("run-id", "", "exact run identity for retained current disks")
 	configPath := fs.String("config", "", "sandbox.yaml path(s), ':'-separated, merged front-to-back (or SANDBOX_CONFIG env)")
 	manifestPath := fs.String("manifest-config", "", "path to storage config YAML (overrides MANIFEST_CONFIG env; required for manifest:// or crypto.local=auto|required)")
 	sandboxID := fs.String("sandbox-id", "", "sandbox id (overrides sandbox.yaml)")
@@ -346,10 +348,18 @@ func runCmd(args []string) int {
 	defer stopRunSignals()
 
 	// Restore mode dispatch.
+	var currentRun *artifact.CurrentRun
+	if *retainInstance != "" || *currentRunID != "" {
+		currentRun = &artifact.CurrentRun{SandboxID: *sandboxID, InstanceID: *retainInstance, RunID: *currentRunID}
+		if err := currentRun.Validate(); err != nil || !*enableCheckpoint {
+			fmt.Fprintln(diagnostics, "current disk retention requires --sandbox-id, --retain-instance, --run-id and --enable-checkpoint")
+			return 2
+		}
+	}
 	if restoreR != "" {
 		return runRestore(ctx, cfg, presence, manifestCfg, restoreR,
 			*sandboxID, *pathID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
-			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics, *enableCheckpoint)
+			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics, runRetentionOptions{Checkpoint: *enableCheckpoint, CurrentRun: currentRun})
 	}
 
 	var sourceLaunch sandbox.LaunchSpec
@@ -379,6 +389,7 @@ func runCmd(args []string) int {
 
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
 		EnableCheckpoint:   *enableCheckpoint,
+		CurrentRun:         currentRun,
 		Cfg:                cfg,
 		PortableConfig:     sourceLaunch.PortableConfig,
 		SourceBinding:      sourceLaunch.SourceBinding,
@@ -409,12 +420,17 @@ func runCmd(args []string) int {
 	return exit
 }
 
+type runRetentionOptions struct {
+	Checkpoint bool
+	CurrentRun *artifact.CurrentRun
+}
+
 // runRestore parses the snapshot reference and waits on the SDK restore owner.
 func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.FieldPresence, manifestCfg *config.ManifestConfig,
 	ref string, sandboxID, pathID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
 	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
-	notifyReadiness sandbox.ReadinessNotify, diagnostics io.Writer, checkpointOptions ...bool,
+	notifyReadiness sandbox.ReadinessNotify, diagnostics io.Writer, checkpointOptions ...runRetentionOptions,
 ) int {
 	// Validate host-only restore policy before inspecting the remote reference or
 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
@@ -457,8 +473,13 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 		snapshotPath = ref
 	}
 
+	var retention runRetentionOptions
+	if len(checkpointOptions) > 0 {
+		retention = checkpointOptions[0]
+	}
 	runtime, err := runtimesdk.Restore(ctx, runtimesdk.RestoreSpec{
-		EnableCheckpoint:    len(checkpointOptions) > 0 && checkpointOptions[0],
+		EnableCheckpoint:    retention.Checkpoint,
+		CurrentRun:          retention.CurrentRun,
 		SnapshotPath:        snapshotPath,
 		SnapshotManifestKey: snapshotKey,
 		SnapshotRef:         snapshotRef,

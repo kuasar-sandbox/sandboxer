@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -274,6 +275,48 @@ func normalizeCheckpoint(c Checkpoint) (Checkpoint, string, error) {
 	return c, dir, nil
 }
 
+// CheckpointVersions reports all local DIFF versions needed by the source and
+// retained captures, using the same complete metadata plan as cleanup. The
+// caller fences source mutation; unlike cleanup this read may run alongside a
+// live writer. An online collector must exclude these versions before deleting.
+func (s *ProcessStorage) CheckpointVersions(ctx context.Context, c Checkpoint) ([]DiffCheckpointRef, error) {
+	if s == nil {
+		return nil, errors.New("checkpoint inspection requires storage")
+	}
+	c, dir, err := normalizeCheckpoint(c)
+	if err != nil {
+		return nil, err
+	}
+	if c.RefLocations == nil {
+		c.RefLocations = config.RefLocations{}
+	}
+	k := &checkpointKeep{p: newPublisher(s, c.RefLocations, nil, nil), directory: dir, files: map[string]bool{}, aliases: map[string]string{}, resolveLocation: c.ResolveLocation}
+	for _, source := range append([]CheckpointSource{{SnapshotRef: c.SnapshotRef, SandboxRef: c.SandboxRef}}, c.Retain...) {
+		root := c
+		root.SnapshotRef, root.SandboxRef, root.Retain = source.SnapshotRef, source.SandboxRef, nil
+		root, _, err = normalizeCheckpoint(root)
+		if err != nil {
+			return nil, err
+		}
+		if err = k.plan(ctx, root); err != nil {
+			return nil, err
+		}
+	}
+	refs := make([]DiffCheckpointRef, 0)
+	for diff, versions := range k.diffVersions {
+		for id := range versions {
+			refs = append(refs, DiffCheckpointRef{DiffID: diff, ID: id})
+		}
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].DiffID != refs[j].DiffID {
+			return refs[i].DiffID < refs[j].DiffID
+		}
+		return refs[i].ID < refs[j].ID
+	})
+	return refs, nil
+}
+
 // CleanupCheckpoint deletes only recognized obsolete direct entries after a
 // complete metadata-only keep plan succeeds (including reader Close). It never
 // opens a candidate payload. A pinned directory fd confines enumeration and
@@ -310,12 +353,14 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 		c.RefLocations = config.RefLocations{}
 	}
 	k := &checkpointKeep{p: newPublisher(s, c.RefLocations, nil, nil), directory: dir, files: map[string]bool{}, aliases: map[string]string{}, resolveLocation: c.ResolveLocation}
+	var currentOwner *diffstore.DirectoryOwner
 	if _, err := os.Stat(filepath.Join(dir, "diffs")); err == nil {
 		owner, err := diffstore.LockDirectory(dir)
 		if err != nil {
 			return err
 		}
 		defer func() { retErr = errors.Join(retErr, owner.Close()) }()
+		currentOwner = owner
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -328,6 +373,29 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	if err := k.plan(ctx, c); err != nil {
 		return fmt.Errorf("checkpoint keep plan: %w", err)
 	}
+	// Current disks are a separate parent-owned root, even when the last
+	// ResumeSource describes an older checkpoint. Retain their local lowers
+	// and active stores until a later complete run binding replaces this set.
+	active := map[string]bool{}
+	var currentSet CurrentDiskSet
+	if _, err := readCurrentJSON(filepath.Join(dir, currentDisksName), &currentSet); err == nil {
+		if _, err := currentSet.validate(); err != nil {
+			return err
+		}
+		if currentSet.Run.SandboxID != c.SandboxID || currentOwner == nil || currentSet.DirectoryID != currentOwner.Identity {
+			return errors.New("current disk parent differs from cleanup owner")
+		}
+		for _, dep := range currentSet.Dependencies {
+			if filepath.Dir(dep.Path) == dir {
+				k.files[filepath.Base(dep.Path)] = true
+			}
+		}
+		for _, disk := range currentSet.Disks {
+			active[disk.DiffID] = true
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	// Path-based reads above must still describe the same pinned directory.
 	current, err := os.Lstat(dir)
 	if err != nil {
@@ -337,7 +405,7 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	if err != nil || physical != dir || !os.SameFile(pinned, current) {
 		return errors.New("checkpoint directory identity changed")
 	}
-	if err := cleanupDiffVersionSet(ctx, dir, k.diffVersions); err != nil {
+	if err := cleanupDiffVersionSet(ctx, dir, k.diffVersions, active); err != nil {
 		return err
 	}
 	for {

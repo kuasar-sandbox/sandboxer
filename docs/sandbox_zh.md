@@ -727,6 +727,52 @@ Delete 可以先撤销名称可见性，真正的导出读者仍保护旧页。�
 扫描成本就低，按需状态管理反而可能增加首批负载的总耗时。启动即读取全盘或立即
 执行普通导出时仍需完整索引；Open 缩短本身不能证明端到端收益。
 
+#### 2.11.1 当前磁盘保留与离线 Reset
+
+受管理的父对象通过 `RuntimeSpec.CurrentRun`（或 `RunOptions.CurrentRun` /
+`restore.Options.CurrentRun`）显式启用当前磁盘保留，提供 `SandboxID`、唯一父对象
+`InstanceID` 和精确的 `RunID`。必须启用 Checkpoint 模式并使用匹配的 SandboxID。
+CLI 提供相同合同：
+
+```bash
+sandbox-ctl run --config sandbox.yaml --sandbox-id demo --enable-checkpoint \
+  --retain-instance INSTANCE_ID --run-id RUN_ID --base-root /var/lib/sandbox
+# 隔离并释放这一精确 runner 后：
+sandbox-ctl reset --checkpoint-dir /var/lib/sandbox/demo/checkpoint \
+  --sandbox-id demo --instance-id INSTANCE_ID --run-id RUN_ID \
+  --operation-id RESET_OPERATION_ID --json
+```
+
+共享的冷启动/image/E 与内存恢复路径在向 Guest 暴露可写磁盘前，保存规范 portable
+C0、完整根盘/具名数据盘图、DIFF 身份和容量、父对象/运行绑定、目录身份及必要的
+不可变依赖。描述位于父对象的 checkpoint 目录中，脱离 RunDir 存活；每轮运行均
+更新，包括复用同一组 DIFF 的情况。本地物化 lower 和 Bundle 载体保留其不可变
+身份，同文件系统收集优先使用硬链接。Close 和失败清理可以释放原临时路径。
+未设置 `CurrentRun` 的调用方保持原有临时数据语义。
+
+`artifact.ProcessStorage.ResetCurrentDisks` 是唯一离线实现，CLI 只是薄适配层。
+它取得目录所有权，校验精确父对象/运行及完整盘集/依赖，并打开已有且初始化完成
+的 DIFF。它不会创建缺失盘、等待已退出的初始化器，或回退到模板、旧运行和用户
+checkpoint。同一持久操作 ID 为每盘固定一个版本并生成不含内存的标准 E。
+它不启动 VM，不消费用户 checkpoint，历史版本保持不变。调用方仅在成功后将
+返回的 `sandbox_ref` 提交为 E-only 来源；SDK 不持有父对象生命周期数据库。
+
+CLI 退出码 75 表示操作中断或结果投递丢失，必须以同一持久操作 ID 重开，不可记为
+明确失败；包括已处理的 SIGTERM/SIGINT。普通校验失败返回 1，参数错误返回 2。
+
+调用方必须持久保存操作 ID，并从接纳开始直至最终提交或明确失败，持续隔离所有
+生命周期/来源写者，包括进程重启期间。目录锁覆盖每次 SDK 调用，不能替代两次
+重试之间的持久生命周期隔离。`CurrentCheckpoint` 不是通用的写入代次计数器。
+重复同一操作会校验其绑定描述和部分版本后续作，不能仅凭文件或版本存在判定
+成功。操作记录、部分版本、E 输出及依赖始终归父对象所有，由父对象完整删除
+回收。选择性 checkpoint 清理保留当前依赖和 active DIFF，同时仍校验请求保留
+的历史版本。沿用现有 Guest FLUSH/capture 合同，不新增宿主断电持久性保证。
+
+在线版本回收也必须在启动成功后保留原 ResumeSource。共享 SDK 的
+`ProcessStorage.CheckpointVersions` 复用清理的完整元数据遍历，返回该来源及
+`Retain` 捕获所需的精确本地 `DiffID`/版本集合。调用方在来源变更隔离下查询，
+并从删除候选排除全部返回项；遍历失败不会返回部分集合。
+
 ## 3. 配置与制品格式
 
 ### 3.1 `sandbox.yaml`

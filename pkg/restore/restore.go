@@ -58,6 +58,7 @@ import (
 // Fetcher is set. Parent .sandbox refs are always narrowed to their Payload.
 type Options struct {
 	EnableCheckpoint    bool // persistent multi-version writable disks
+	CurrentRun          *artifact.CurrentRun
 	checkpointPlan      *sandbox.CheckpointDiskPlan
 	checkpointReopen    []string
 	checkpointOwner     *diffstore.DirectoryOwner
@@ -506,6 +507,25 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			code = -1
 		}
 	}()
+	if opts.CurrentRun != nil {
+		if !opts.EnableCheckpoint || opts.CurrentRun.SandboxID != opts.SandboxID {
+			return -1, errors.New("current disk retention requires checkpoint mode and matching sandbox identity")
+		}
+		storage, err := artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired, opts.Fetcher)
+		if err != nil {
+			return -1, err
+		}
+		capacities := make([]int64, len(disks))
+		for i, disk := range disks {
+			capacities[i] = disk.Cow.Size()
+		}
+		provenance := sandbox.RunOptions{SourceBinding: &sandbox.RunSourceBinding{SandboxRef: sandboxSource.PortableRef, RuntimeRef: sandboxSource.RuntimeRef, RelativeDir: sandboxSource.RelativeDir, BundleSource: firstBundleSource(sandboxSource.bundleSource, bundleSource)}, BundleReader: firstBundleReader(sandboxSource.bundleReader, root.bundleReader), BundleFetcher: firstBundleFetcher(sandboxSource.bundleFetcher, root.bundleFetcher), Fetcher: opts.Fetcher}
+		err = sandbox.RetainCurrentDiskPlan(ctx, storage, opts.checkpointOwner, opts.CurrentRun, &snapCfg, c0, sandboxSource.PortableRef, opts.checkpointPlan, capacities, opts.RefLocations, provenance)
+		err = errors.Join(err, storage.Close())
+		if err != nil {
+			return -1, err
+		}
+	}
 
 	// Network: when the snapshot has a virtio-net device, re-acquire its host
 	// side for this restore. tapfd mode re-runs
