@@ -250,7 +250,10 @@ func (it *directoryIterator) next(ctx context.Context) (string, error) {
 		}
 		e := it.entries[it.at]
 		it.at++
-		if strings.HasSuffix(e.Name(), ".diff") {
+		// Initializer claims are sidecar locks, including after an interrupted
+		// process leaves one behind. They are never DIFFs and are not ours to
+		// unlink while enumerating a retained parent directory.
+		if strings.HasSuffix(e.Name(), ".diff") && !strings.HasPrefix(e.Name(), ".claim-") {
 			return strings.TrimSuffix(e.Name(), ".diff"), nil
 		}
 	}

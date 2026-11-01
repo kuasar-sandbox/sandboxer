@@ -9,6 +9,7 @@
 //	info      — inspect a Sandbox E or Snapshot S
 //	publish   — publish a complete E or S graph
 //	checkpoint — list or delete local disk versions
+//	reset     — prepare E from an exact retained run's current disks
 //
 // See docs/sandbox.md for the full design.
 package main
@@ -51,6 +52,8 @@ func main() {
 		os.Exit(runCmd(os.Args[2:]))
 	case "checkpoint":
 		os.Exit(checkpointCmd(os.Args[2:]))
+	case "reset":
+		os.Exit(resetCmd(os.Args[2:]))
 	case "snapshot":
 		os.Exit(snapshotCmd(os.Args[2:]))
 	case "export":
@@ -103,6 +106,7 @@ Usage:
   sandbox-ctl run       [--config host.yaml[:instance.yaml]] [--manifest-config <path>]
                         [--sandbox-id <sid>] [--path-id <leaf>] [--ch-binary <path>]
                         [--run-root <dir>] [--base-root <dir>] [--enable-checkpoint]
+                        [--retain-instance <instance-id> --run-id <run-id>]
                         [--from <sandbox-ref> [--replace-boot] | --restore <snapshot-ref>]
                         [--ref-location name=file:///absolute/path ...]
                         [--stdin] [--stdout=false] [--stderr=false]
@@ -111,6 +115,9 @@ Usage:
                         [--log-to default|journald=TAG[,FIELD=VALUE...]]
                         [--ping-fatal-threshold N] [--stats-interval <dur>]
                         [--ready-fd N]
+  sandbox-ctl reset     --checkpoint-dir <dir> --sandbox-id <sid>
+                        --instance-id <instance-id> --run-id <run-id>
+                        --operation-id <id> [--manifest-config <path>] [--json]
   sandbox-ctl export    [--sandbox-id <sid>] [--path-id <leaf>]
                         (--output <out_dir> | --upload | --checkpoint <ID>)
                         [--mode local|bundle] [--resume]

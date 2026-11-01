@@ -47,6 +47,7 @@ type RuntimeDiskSpec struct {
 // RuntimeSpec fixes the base VM shape. It contains no workload or credentials.
 type RuntimeSpec struct {
 	EnableCheckpoint                bool
+	CurrentRun                      *artifact.CurrentRun
 	preparedHost                    *preparedHostIdentity
 	checkpointPlan                  *CheckpointDiskPlan
 	checkpointOwner                 *diffstore.DirectoryOwner
@@ -274,6 +275,16 @@ func validateRuntimeSpec(s RuntimeSpec) error {
 	return s.config().ValidateRuntime()
 }
 func StartRuntime(ctx context.Context, spec RuntimeSpec) (_ *Runtime, retErr error) {
+	if spec.CurrentRun != nil {
+		if err := spec.CurrentRun.Validate(); err != nil {
+			return nil, err
+		}
+		if !spec.EnableCheckpoint || spec.SandboxID != spec.CurrentRun.SandboxID {
+			return nil, errors.New("current disk retention requires checkpoint mode and matching sandbox identity")
+		}
+		copy := *spec.CurrentRun
+		spec.CurrentRun = &copy
+	}
 	return startRuntime(ctx, spec, spec.preparedHost)
 }
 
@@ -755,6 +766,30 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		}
 		if e = r.spec.checkpointPlan.Bind(bases); e != nil {
 			return fail(e)
+		}
+	}
+	if r.spec.CurrentRun != nil {
+		capacities := make([]int64, len(r.spec.Disks))
+		for i, disk := range r.spec.Disks {
+			capacities[i] = disk.WritableCapacity
+		}
+		parent := ""
+		if spec.SourceBinding != nil {
+			parent = spec.SourceBinding.SandboxRef
+		}
+		storage := r.storage
+		if spec.legacyAccess != nil {
+			storage, err = artifact.NewProcessStorageWithLocalAccess(launchManifestConfig(spec), launchKey(spec), launchCodec(spec), launchRequired(spec), launchFetcher(spec))
+			if err != nil {
+				return fail(err)
+			}
+		}
+		err = RetainCurrentDiskPlan(ctx, storage, r.checkpointOwner, r.spec.CurrentRun, cfg, portable, parent, r.spec.checkpointPlan, capacities, spec.RefLocations, RunOptions{SourceBinding: spec.SourceBinding, BundleReader: spec.BundleReader, BundleFetcher: spec.BundleFetcher, Fetcher: launchFetcher(spec)})
+		if spec.legacyAccess != nil {
+			err = errors.Join(err, storage.Close())
+		}
+		if err != nil {
+			return fail(err)
 		}
 	}
 	cacheSize, dirtySize, err := cfg.Resources.DiffCOW.Bytes()

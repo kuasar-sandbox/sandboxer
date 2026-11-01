@@ -169,7 +169,7 @@ func listDirectoryDiffCheckpoints(ctx context.Context, directory string) ([]Diff
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if !strings.HasSuffix(entry.Name(), ".diff") {
+		if !strings.HasSuffix(entry.Name(), ".diff") || strings.HasPrefix(entry.Name(), ".claim-") {
 			continue
 		}
 		id := strings.TrimSuffix(entry.Name(), ".diff")
@@ -374,7 +374,7 @@ func (p *PinnedDiffCheckpoints) ReopenIDs(directory string, cfg *config.Portable
 	return ids, nil
 }
 
-func cleanupDiffVersionSet(ctx context.Context, directory string, keep map[string]map[string]bool) error {
+func cleanupDiffVersionSet(ctx context.Context, directory string, keep map[string]map[string]bool, active ...map[string]bool) error {
 	entries, err := os.ReadDir(filepath.Join(directory, "diffs"))
 	if os.IsNotExist(err) {
 		return nil
@@ -403,7 +403,8 @@ func cleanupDiffVersionSet(ctx context.Context, directory string, keep map[strin
 			return err
 		}
 		ids, listErr := meta.ListCheckpoints(ctx)
-		if errors.Is(listErr, diffstore.ErrRetired) && len(keep[id]) == 0 {
+		isActive := len(active) != 0 && active[0][id]
+		if errors.Is(listErr, diffstore.ErrRetired) && len(keep[id]) == 0 && !isActive {
 			listErr = nil
 		}
 		if meta.Info().DiffID != id {
@@ -427,11 +428,24 @@ func cleanupDiffVersionSet(ctx context.Context, directory string, keep map[strin
 			}
 		}
 		found[id] = true
+		// Validate identity and all retained versions even for active disks.
+		// Partial Reset versions remain parent-owned until exact online cleanup
+		// or parent deletion; unrelated source cleanup cannot discard them.
+		if isActive {
+			continue
+		}
 		plans = append(plans, plan)
 	}
 	for id := range keep {
 		if !found[id] {
 			return fmt.Errorf("checkpoint retained DIFF %s is missing", id)
+		}
+	}
+	if len(active) != 0 {
+		for id := range active[0] {
+			if !found[id] {
+				return fmt.Errorf("current DIFF %s is missing", id)
+			}
 		}
 	}
 	for _, plan := range plans {

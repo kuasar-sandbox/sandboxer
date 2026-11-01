@@ -830,6 +830,64 @@ to scan, so lazy bookkeeping can instead increase the first workload's total
 time. Full-disk startup reads or an immediate ordinary export still need the
 complete index; shorter Open alone does not establish an end-to-end improvement.
 
+#### 2.11.1 Retained current disks and offline Reset
+
+A managed parent opts into current-disk retention with `RuntimeSpec.CurrentRun`
+(or `RunOptions.CurrentRun` / `restore.Options.CurrentRun`): its `SandboxID`, unique
+parent `InstanceID`, and exact `RunID`. Checkpoint mode and a matching SandboxID
+are required. The CLI exposes the same contract:
+
+```bash
+sandbox-ctl run --config sandbox.yaml --sandbox-id demo --enable-checkpoint \
+  --retain-instance INSTANCE_ID --run-id RUN_ID --base-root /var/lib/sandbox
+# After fencing and releasing that exact runner:
+sandbox-ctl reset --checkpoint-dir /var/lib/sandbox/demo/checkpoint \
+  --sandbox-id demo --instance-id INSTANCE_ID --run-id RUN_ID \
+  --operation-id RESET_OPERATION_ID --json
+```
+
+The shared cold/image/E and memory-restore paths record canonical portable C0,
+the complete root/named-disk graph, DIFF identities and capacities, parent/run
+binding, directory identity, and necessary immutable dependencies before exposing
+writable disks to the guest. The description lives in the parent's checkpoint
+directory, outside RunDir, and is replaced for every run, including reuse of the
+same DIFFs. Local materialized lowers and Bundle carriers retain their immutable
+identities; same-filesystem collection uses hard links. Close and failure cleanup
+may release their temporary paths. Callers without `CurrentRun` retain the
+previous temporary-data semantics.
+
+`artifact.ProcessStorage.ResetCurrentDisks` is the single offline implementation;
+the CLI is a thin adapter. It acquires directory ownership, checks the exact
+parent/run and entire disk/dependency set, and opens existing initialized DIFFs.
+It never creates missing disks, waits for an exited initializer, or substitutes
+a template, an older run, or a user checkpoint. One durable operation ID fixes a
+version on every disk and creates standard E without memory state. It does not
+start a VM or consume a user checkpoint; historical versions remain unchanged.
+The caller commits the returned `sandbox_ref` as its E-only source after success;
+the SDK has no parent lifecycle database.
+
+CLI exit code 75 means an interrupted operation or lost result delivery. Reopen
+the same durable operation ID; do not record a definitive failure. This includes
+handled SIGTERM/SIGINT. Ordinary validation failures return 1; usage errors return 2.
+
+The caller must persist the operation ID and prevent all lifecycle/source writers
+from admission through final commit or explicit failure, including across process
+restart. The directory lock covers each SDK call; it does not replace that durable
+lifecycle fence between retries. `CurrentCheckpoint` is not a general write
+generation counter. Repeating the same operation checks its bound description
+and partial versions before continuing; an existing file or version alone is not
+success. Operation records, partial versions, E outputs and dependencies remain
+parent-owned and are reclaimed by full parent deletion. Selective checkpoint
+cleanup retains current dependencies and active DIFFs while still validating
+requested historical versions. The existing guest FLUSH/capture contract applies;
+this adds no host power-loss durability guarantee.
+
+Online version collectors must also retain the original ResumeSource after a
+successful launch. `ProcessStorage.CheckpointVersions` returns the exact local
+`DiffID`/version pairs for that source and its `Retain` captures, using the same
+complete metadata plan as cleanup. Call it under the source mutation fence and
+exclude every returned pair from deletion; a failed plan returns no partial set.
+
 ## 3. Configuration and artifact formats
 
 ### 3.1 `sandbox.yaml`

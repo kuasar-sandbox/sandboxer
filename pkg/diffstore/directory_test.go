@@ -9,7 +9,51 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
+
+func TestDirectoryMaintenanceIgnoresInitializerClaims(t *testing.T) {
+	owner, m := directoryManager(t, nil)
+	directoryFixture(t, owner.Directory, "disk", false)
+	claim := filepath.Join(owner.Directory, "diffs", ".claim-disk.diff")
+	f, err := os.OpenFile(claim, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, held := range []bool{true, false} {
+		op := unix.LOCK_UN
+		if held {
+			op = unix.LOCK_EX | unix.LOCK_NB
+		}
+		if err := unix.Flock(int(f.Fd()), op); err != nil {
+			t.Fatal(err)
+		}
+		count := 0
+		if err := m.ListCheckpoints(context.Background(), func(id string, ids []string) error {
+			count++
+			if id != "disk" || len(ids) != 1 || ids[0] != "old" {
+				t.Fatalf("claim mixed into versions: %s %v", id, ids)
+			}
+			return nil
+		}); err != nil || count != 1 {
+			t.Fatalf("claim held=%v list count=%d: %v", held, count, err)
+		}
+		if err := m.Sweep(context.Background(), nil); err != nil {
+			t.Fatalf("claim held=%v sweep: %v", held, err)
+		}
+		if _, err := os.Stat(claim); err != nil {
+			t.Fatal("enumeration removed initializer ownership", err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(owner.Directory, "diffs", "broken.diff"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ListCheckpoints(context.Background(), func(string, []string) error { return nil }); err == nil {
+		t.Fatal("a corrupt real DIFF was silently ignored")
+	}
+}
 
 func directoryFixture(t *testing.T, directory, id string, encrypted bool) *View {
 	t.Helper()

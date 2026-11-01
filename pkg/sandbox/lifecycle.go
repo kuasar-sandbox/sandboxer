@@ -49,6 +49,7 @@ type RunOptions struct {
 	memoryLogf               func(string, ...any)
 	captureMemory            func(context.Context) (*memory.CaptureView, error)
 	EnableCheckpoint         bool
+	CurrentRun               *artifact.CurrentRun
 	checkpointPlan           *CheckpointDiskPlan
 	checkpointStorage        *artifact.ProcessStorage
 	checkpointOwner          *diffstore.DirectoryOwner
@@ -311,6 +312,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.RuntimeRoot = opts.RuntimeRoot
 	shape.BaseRoot = opts.BaseRoot
 	shape.EnableCheckpoint = opts.EnableCheckpoint
+	shape.CurrentRun = opts.CurrentRun
 	shape.checkpointPlan = opts.checkpointPlan
 	shape.checkpointOwner = opts.checkpointOwner
 	shape.checkpointReleaseSources = opts.checkpointReleaseSources

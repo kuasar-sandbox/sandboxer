@@ -133,6 +133,12 @@ func copyCheckpointCarrier(ctx context.Context, source, destination, sandboxID s
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	// Immutable carriers on the same filesystem can share bytes with the
+	// parent's retained dependency. Cross-filesystem inputs use the established
+	// checked copy below; the active writable DIFF is never copied here.
+	if err := os.Link(source, destination); err == nil {
+		return nil
+	}
 	if err := validateSandboxID(sandboxID); err != nil {
 		return err
 	}
