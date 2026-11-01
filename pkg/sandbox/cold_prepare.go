@@ -2,15 +2,21 @@ package sandbox
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"reflect"
+	"sync/atomic"
 
+	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
@@ -21,6 +27,131 @@ import (
 // a portable source's C0 is never reprojected from those defaults.
 type coldPreparation struct {
 	imageDefaults *ImageConfig
+	sealed        *sealedColdPreparation
+}
+
+// sealedColdPreparation is a one-use proof for Run's already-canonicalized
+// launch. The fingerprint freezes values without retaining another copy of
+// credential/config payloads. Access handles remain borrowed, not transferable.
+type sealedColdPreparation struct {
+	inputs [sha256.Size]byte
+	access coldPreparationAccess
+	used   atomic.Bool
+}
+
+type coldPreparationAccess struct {
+	legacy        *RunOptions
+	storage       *artifact.ProcessStorage
+	fetcher       fetch.Fetcher
+	effective     fetch.Fetcher
+	codec         tarstream.Codec
+	bundleReader  *manifestbundle.Reader
+	bundleFetcher *manifestbundle.ManifestFetcher
+	sourceReader  *manifestbundle.Reader
+	sourceFetcher *manifestbundle.ManifestFetcher
+}
+
+func preparationAccess(spec LaunchSpec) coldPreparationAccess {
+	a := coldPreparationAccess{
+		legacy: spec.legacyAccess, storage: spec.Storage, fetcher: spec.Fetcher,
+		effective: launchFetcher(spec), codec: launchCodec(spec),
+		bundleReader: spec.BundleReader, bundleFetcher: spec.BundleFetcher,
+	}
+	if spec.SourceBinding != nil && spec.SourceBinding.BundleSource != nil {
+		a.sourceReader = spec.SourceBinding.BundleSource.Reader
+		a.sourceFetcher = spec.SourceBinding.BundleSource.Fetcher
+	}
+	return a
+}
+
+func (a coldPreparationAccess) matches(b coldPreparationAccess) bool {
+	return a.legacy == b.legacy && a.storage == b.storage &&
+		a.bundleReader == b.bundleReader && a.bundleFetcher == b.bundleFetcher &&
+		a.sourceReader == b.sourceReader && a.sourceFetcher == b.sourceFetcher &&
+		samePreparationHandle(a.fetcher, b.fetcher) && samePreparationHandle(a.effective, b.effective) &&
+		samePreparationHandle(a.codec, b.codec)
+}
+
+func samePreparationHandle(a, b any) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	x, y := reflect.ValueOf(a), reflect.ValueOf(b)
+	// Non-comparable value capabilities conservatively repeat preflight. Do
+	// not guess equality by inspecting mutable implementation state.
+	return x.Type() == y.Type() && x.Comparable() && y.Comparable() && a == b
+}
+
+func (p *coldPreparation) seal(shape RuntimeSpec, launch *LaunchSpec) error {
+	if p == nil || p.sealed != nil || launch == nil || launch.legacyAccess == nil || launch.Storage == nil || launch.Credentials != nil {
+		return errors.New("cold preparation requires one complete Run launch")
+	}
+	pathID, err := ResolvePathID(shape.SandboxID, shape.PathID)
+	if err != nil {
+		return err
+	}
+	cfg, err := launch.config(shape.config())
+	if err != nil {
+		return err
+	}
+	inputs, err := coldPreparationInputs(shape, *launch, cfg, shape.SandboxID, pathID, DefaultBaseDir(shape.BaseRoot, pathID))
+	if err != nil {
+		return err
+	}
+	// Detach the private access capsule from Run's options before sealing it.
+	// Function-valued key providers are bound by this capsule's identity, never
+	// by a function code address (which cannot distinguish closures).
+	access := *launch.legacyAccess
+	launch.legacyAccess = &access
+	p.sealed = &sealedColdPreparation{inputs: inputs, access: preparationAccess(*launch)}
+	launch.coldPreparation = p
+	return nil
+}
+
+func (p *coldPreparation) reuse(r *Runtime, spec LaunchSpec, cfg *config.SandboxConfig) bool {
+	if p == nil || p.sealed == nil || spec.Credentials != nil || !p.sealed.access.matches(preparationAccess(spec)) {
+		return false
+	}
+	inputs, err := coldPreparationInputs(r.spec, spec, cfg, r.sandboxID, r.pathID, r.baseDir)
+	return err == nil && inputs == p.sealed.inputs && p.sealed.used.CompareAndSwap(false, true)
+}
+
+func coldPreparationInputs(shape RuntimeSpec, spec LaunchSpec, cfg *config.SandboxConfig, sandboxID, pathID, baseDir string) ([sha256.Size]byte, error) {
+	var source *RunSourceBinding
+	if spec.SourceBinding != nil {
+		copy := *spec.SourceBinding
+		source = &copy
+		if source.BundleSource != nil {
+			bundle := *source.BundleSource
+			bundle.Reader, bundle.Fetcher = nil, nil
+			source.BundleSource = &bundle
+		}
+	}
+	raw, err := json.Marshal(struct {
+		Config                     *config.SandboxConfig
+		CgroupFD                   int
+		Portable                   *config.PortableSandboxConfig
+		Source                     *RunSourceBinding
+		Locations                  config.RefLocations
+		Manifest, StorageManifest  *config.ManifestConfig
+		Disks                      []RuntimeDiskSpec
+		SandboxID, PathID, BaseDir string
+		RuntimeRoot, BaseRoot      string
+		Checkpoint                 bool
+		CheckpointPlan             *CheckpointDiskPlan
+		LocalRequired              bool
+	}{
+		Config: cfg, CgroupFD: cfg.Resources.Control.CgroupFD, Portable: spec.PortableConfig,
+		Source: source, Locations: spec.RefLocations, Manifest: spec.ManifestConfig, StorageManifest: spec.Storage.ManifestConfig(),
+		Disks: shape.Disks, SandboxID: sandboxID, PathID: pathID, BaseDir: baseDir,
+		RuntimeRoot: shape.RuntimeRoot, BaseRoot: shape.BaseRoot,
+		Checkpoint: shape.EnableCheckpoint, CheckpointPlan: shape.checkpointPlan, LocalRequired: launchRequired(spec),
+	})
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	defer clear(raw)
+	return sha256.Sum256(raw), nil
 }
 
 func preflightColdArtifacts(
