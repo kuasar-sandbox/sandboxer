@@ -99,12 +99,17 @@ launch:
   args: ["-c", "echo ASSEMBLY-RUN-OK"]
   restart: never
 EOF
+# Keep app stdout separate from console/diagnostics, which can interleave writes.
+# File routing appends, so discard output from any earlier attempt first.
+APP_STDOUT="$OUT/assembly-run.stdout"
+: >"$APP_STDOUT"
 if ! timeout -k 10s 90 "$BIN/sandbox-ctl" run --from "$ASSEMBLY_E" --config "$WORK/host.yaml" --sandbox-id assembly-run \
-    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RUN_ROOT" --base-root "$BASE_ROOT" >"$OUT/assembly-run.log" 2>&1; then
-    tail -100 "$OUT/assembly-run.log" >&2 || true
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RUN_ROOT" --base-root "$BASE_ROOT" \
+    --stdout-to "$APP_STDOUT" >"$OUT/assembly-run.log" 2>&1; then
+    tail -n 100 "$APP_STDOUT" "$OUT/assembly-run.log" >&2 || true
     e2e_fail "direct EROFS run --from failed"
 fi
-grep -q '^ASSEMBLY-RUN-OK$' "$OUT/assembly-run.log" \
-    || { tail -100 "$OUT/assembly-run.log" >&2 || true; e2e_fail "assembled Sandbox E did not start its cold app"; }
+grep -qxF 'ASSEMBLY-RUN-OK' "$APP_STDOUT" \
+    || { tail -n 100 "$APP_STDOUT" "$OUT/assembly-run.log" >&2 || true; e2e_fail "assembled Sandbox E did not start its cold app"; }
 
 echo "PASS image.sandbox-assembly.sh"
