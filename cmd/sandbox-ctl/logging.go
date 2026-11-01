@@ -6,7 +6,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/kuasar-sandbox/sandboxer/internal/journalio"
+	"github.com/kuasar-sandbox/sandboxer/pkg/journalio"
 )
 
 // componentLog owns only the run command's diagnostics, not fd 2, guest stderr,
@@ -15,11 +15,7 @@ func componentLog(to string) (io.Writer, func(), error) {
 	if to == "" || to == "default" {
 		return os.Stderr, func() {}, nil
 	}
-	target, err := journalio.Parse(to)
-	if err != nil {
-		return nil, nil, err
-	}
-	writer, err := journalio.New(target, os.Stderr, "")
+	writer, err := journalio.Open(to, os.Stderr)
 	if err != nil {
 		return nil, nil, err
 	}
