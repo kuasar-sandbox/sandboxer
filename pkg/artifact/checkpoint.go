@@ -31,6 +31,15 @@ type Checkpoint struct {
 	SandboxRef      string
 	RefLocations    config.RefLocations
 	ResolveLocation func(string) (string, error) // optional trusted mapping policy; returns host directory
+	// Retain protects other immutable captures in this sandbox's directory.
+	// Only the primary source determines the current semantic aliases.
+	Retain []CheckpointSource
+}
+
+// CheckpointSource is an immutable E or S/E pair owned by the same sandbox.
+type CheckpointSource struct {
+	SnapshotRef string
+	SandboxRef  string
 }
 
 type checkpointKeep struct {
@@ -215,17 +224,13 @@ func (k *checkpointKeep) plan(ctx context.Context, c Checkpoint) (retErr error) 
 	return nil
 }
 
-// CleanupCheckpoint deletes only recognized obsolete direct entries after a
-// complete metadata-only keep plan succeeds (including reader Close). It never
-// opens a candidate payload. A pinned directory fd confines enumeration and
-// unlink even if an ancestor or the pathname is concurrently replaced.
-func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (retErr error) {
-	if s == nil || (c.SandboxID == "" || c.SandboxID == "." || c.SandboxID == "..") || filepath.Base(c.SandboxID) != c.SandboxID || strings.ContainsAny(c.SandboxID, `/\\`) || c.SandboxRef == "" {
-		return errors.New("checkpoint cleanup requires producer identity and committed source")
+func normalizeCheckpoint(c Checkpoint) (Checkpoint, string, error) {
+	if (c.SandboxID == "" || c.SandboxID == "." || c.SandboxID == "..") || filepath.Base(c.SandboxID) != c.SandboxID || strings.ContainsAny(c.SandboxID, `/\\`) || c.SandboxRef == "" {
+		return c, "", errors.New("checkpoint cleanup requires producer identity and committed source")
 	}
 	dir, err := filepath.Abs(c.Directory)
 	if err != nil || c.Directory == "" {
-		return errors.New("checkpoint directory is required")
+		return c, "", errors.New("checkpoint directory is required")
 	}
 	for _, raw := range []*string{&c.SnapshotRef, &c.SandboxRef} {
 		if *raw != "" && !strings.HasPrefix(*raw, "file://") && !strings.HasPrefix(*raw, "manifest://") {
@@ -242,29 +247,54 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	}
 	rootRef, err := manifest.ParseRef(primary)
 	if err != nil || rootRef.Scheme != manifest.RefSchemeFile || rootRef.Location != "" {
-		return errors.New("checkpoint cleanup requires a committed local root")
+		return c, "", errors.New("checkpoint cleanup requires a committed local root")
 	}
 	rootPath, err := c.RefLocations.ResolveFile(rootRef, dir)
 	if err != nil {
-		return err
+		return c, "", err
 	}
 	rootPath, err = filepath.Abs(rootPath)
 	if err != nil || filepath.Dir(rootPath) != dir {
-		return errors.New("committed root is outside checkpoint directory")
+		return c, "", errors.New("committed root is outside checkpoint directory")
 	}
 	physical, err := filepath.EvalSymlinks(dir)
 	if err != nil {
-		return err
+		return c, "", err
 	}
 	if physical != dir {
-		return errors.New("checkpoint directory must be canonical without symlinks")
+		return c, "", errors.New("checkpoint directory must be canonical without symlinks")
 	}
 	rootPhysical, err := filepath.EvalSymlinks(rootPath)
 	if err != nil {
-		return err
+		return c, "", err
 	}
 	if filepath.Dir(rootPhysical) != dir {
-		return errors.New("committed root target is outside checkpoint directory")
+		return c, "", errors.New("committed root target is outside checkpoint directory")
+	}
+	return c, dir, nil
+}
+
+// CleanupCheckpoint deletes only recognized obsolete direct entries after a
+// complete metadata-only keep plan succeeds (including reader Close). It never
+// opens a candidate payload. A pinned directory fd confines enumeration and
+// unlink even if an ancestor or the pathname is concurrently replaced.
+func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (retErr error) {
+	if s == nil {
+		return errors.New("checkpoint cleanup requires storage")
+	}
+	c, dir, err := normalizeCheckpoint(c)
+	if err != nil {
+		return err
+	}
+	retained := make([]Checkpoint, 0, len(c.Retain))
+	for _, source := range c.Retain {
+		keep := c
+		keep.SnapshotRef, keep.SandboxRef, keep.Retain = source.SnapshotRef, source.SandboxRef, nil
+		keep, _, err = normalizeCheckpoint(keep)
+		if err != nil {
+			return fmt.Errorf("retained checkpoint: %w", err)
+		}
+		retained = append(retained, keep)
 	}
 	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -289,6 +319,12 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	for _, keep := range retained {
+		if err := k.plan(ctx, keep); err != nil {
+			return fmt.Errorf("retained checkpoint keep plan: %w", err)
+		}
+	}
+	k.aliases = map[string]string{}
 	if err := k.plan(ctx, c); err != nil {
 		return fmt.Errorf("checkpoint keep plan: %w", err)
 	}
@@ -297,7 +333,7 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	if err != nil {
 		return err
 	}
-	physical, err = filepath.EvalSymlinks(dir)
+	physical, err := filepath.EvalSymlinks(dir)
 	if err != nil || physical != dir || !os.SameFile(pinned, current) {
 		return errors.New("checkpoint directory identity changed")
 	}

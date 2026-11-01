@@ -149,6 +149,63 @@ func TestCleanupCheckpointRolesNamesAndNoPayloadScans(t *testing.T) {
 	}
 }
 
+func TestCleanupCheckpointRetainedRootsAndPrimaryAliases(t *testing.T) {
+	dir := t.TempDir()
+	c, oldE, keep := checkpointFixture(t, dir)
+	c.Retain = []CheckpointSource{
+		{SnapshotRef: c.SnapshotRef, SandboxRef: c.SandboxRef},
+		{SandboxRef: "file://" + oldE + "@digest:" + strings.TrimSuffix(oldE, ".sandbox")},
+	}
+	c.SnapshotRef = "" // The current source is E-only; the retained source is S/E.
+	storage, err := NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	for range 2 {
+		if err := storage.CleanupCheckpoint(context.Background(), c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range append([]string{oldE}, keep[:4]...) {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("retained dependency %s: %v", name, err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "sid.snapshot")); !os.IsNotExist(err) {
+		t.Fatalf("retained source replaced current E-only alias: %v", err)
+	}
+	c.Retain = nil
+	if err := storage.CleanupCheckpoint(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{oldE, keep[1], keep[2]} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("released dependency %s remains: %v", name, err)
+		}
+	}
+}
+
+func TestCleanupCheckpointInvalidRetainedPairDeletesNothing(t *testing.T) {
+	dir := t.TempDir()
+	c, oldE, keep := checkpointFixture(t, dir)
+	c.Retain = []CheckpointSource{{SnapshotRef: c.SnapshotRef,
+		SandboxRef: "file://" + oldE + "@digest:" + strings.TrimSuffix(oldE, ".sandbox")}}
+	storage, err := NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	if err := storage.CleanupCheckpoint(context.Background(), c); err == nil {
+		t.Fatal("accepted mismatched retained S/E pair")
+	}
+	for _, name := range append(keep, oldE) {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("failed retained plan removed %s: %v", name, err)
+		}
+	}
+}
+
 func TestCleanupCheckpointPlanFailureAndCancellationDeleteNothing(t *testing.T) {
 	for _, variant := range []string{"missing-root", "mismatched-pair", "cancel", "symlink-directory", "external-root-alias"} {
 		t.Run(variant, func(t *testing.T) {
