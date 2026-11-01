@@ -2,11 +2,73 @@ package ctl
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"net"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 )
+
+func TestDeleteDiffCheckpointsKeepsExactBatches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ctl.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	refs := make([]DiffCheckpointRef, 129)
+	for i := range refs {
+		refs[i] = DiffCheckpointRef{DiffID: "disk", ID: fmt.Sprintf("v%d", i)}
+	}
+	want := append([]DiffCheckpointRef(nil), refs...)
+	done := make(chan error, 1)
+	go func() {
+		for batch := 0; batch < 2; batch++ {
+			conn, err := listener.Accept()
+			if err != nil {
+				done <- err
+				return
+			}
+			var req Request
+			err = ReadMessage(conn, &req)
+			if err == nil && (req.Type != TypeCheckpointDeleteRequest || req.CheckpointOwner != "owner" ||
+				!reflect.DeepEqual(req.CheckpointRefs, want[batch*128:min((batch+1)*128, len(want))])) {
+				err = fmt.Errorf("unexpected batch %d: %+v", batch, req)
+			}
+			if err == nil {
+				// The first request proves that the client has frozen the set.
+				// Changing the caller's final item must not alter the next batch.
+				refs[len(refs)-1].ID = "replacement"
+				err = WriteMessage(conn, Response{Type: TypeCheckpointDeleteDone})
+			}
+			_ = conn.Close()
+			if err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := DeleteDiffCheckpoints(ctx, path, "owner", refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeleteDiffCheckpointsEmptySetDoesNotConnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := DeleteDiffCheckpoints(ctx, "missing.sock", "owner", nil); err != nil {
+		t.Fatal("empty deletion stopped being a no-op", err)
+	}
+}
 
 func TestCheckpointListRequiresCompleteTerminator(t *testing.T) {
 	refs := make([]DiffCheckpointRef, 2000)
