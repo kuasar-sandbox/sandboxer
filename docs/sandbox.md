@@ -2383,6 +2383,8 @@ logical source
   -> file://<root>.bundle@manifest:<root>#<location>
 ```
 
+For assembled E/S sources with external named files, use `NewSingleRootBundlePublisherWithLocations` and pass the trusted input location map. These directories are used only to check the selected dependencies. The Bundle retains their portable refs and is written to the requested output location.
+
 The source supports repeated reads. The first pass retains the root Manifest key, a physical Bundle digest and format metadata while discarding encoded Chunk bytes. The second pass writes the final `<root>.bundle` directly and checks the generated root against the planned identity. The customer key is resolved once for the publication; both passes use the same admission and encoding settings.
 
 The only created file is the final Bundle, containing this logical root's Manifest and Chunks. Publication uses bounded Chunk buffers and preserves payload sparsity. The typed call site supplies the logical role; image and Sandbox readers retain their schema checks. Reuse requires matching admission, root, authenticated content and complete physical identity. Concurrent writers converge through bounded waiting, exclusive creation and full verification. Cancellation, changed source, write errors and close errors fail publication and remove only the publisher-owned incomplete final. A replaced pathname retains the replacement inode and returns an ownership error.

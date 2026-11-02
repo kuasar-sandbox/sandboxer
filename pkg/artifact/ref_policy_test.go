@@ -483,3 +483,60 @@ func TestDiffCheckpointUsesLocalTemporarySourcesAndRefOutput(t *testing.T) {
 		})
 	}
 }
+
+func TestSingleRootBundleUsesTrustedInputLocations(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	disk := testRefOverlay(t, base, "base", nil, bytes.Repeat([]byte{1}, 4096))
+	raw, _ := publishPortable(t, disk.String())
+	source, err := sandboxfile.BuildSource(publishSource(t, bytes.Repeat([]byte{2}, 4096)), nil, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, policy := range []crypto.LocalPolicy{crypto.LocalOff, crypto.LocalAuto, crypto.LocalRequired} {
+		t.Run(string(policy), func(t *testing.T) {
+			cfg, key := sourceBundleConfig(crypto.LocalOff)
+			cfg.Crypto.Ref = policy
+			admission, err := cfg.WriteAdmission(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			output := t.TempDir()
+			inputs := config.RefLocations{"base": base}
+			keyFn := func() ([32]byte, error) { return key, nil }
+			pub, err := NewSingleRootBundlePublisherWithLocations(cfg, keyFn, admission, "release", output, inputs, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pub.Close()
+			delete(inputs, "base")
+			result, err := pub.PublishSource(ctx, RoleSandbox, source)
+			if policy == crypto.LocalRequired {
+				if err == nil || result.Ref != "" {
+					t.Fatalf("required retained plaintext disk: %+v, %v", result, err)
+				}
+				files, err := os.ReadDir(output)
+				if err != nil || len(files) != 0 {
+					t.Fatalf("failed publication left files: %v, %v", files, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref, err := manifest.ParseRef(result.Ref)
+			if err != nil || ref.Location != "release" || ref.DigestScheme != "manifest" {
+				t.Fatalf("bundle: %s, %v", result.Ref, err)
+			}
+			storage, err := NewProcessStorageWithCustomerKey(cfg, keyFn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer storage.Close()
+			doc, err := storage.Inspect(ctx, result.Ref, config.RefLocations{"release": output, "base": base})
+			if err != nil || doc.Sandbox.Boot.Root.BaseFromRefs[0] != disk.String() {
+				t.Fatalf("external disk: %v, %v", doc, err)
+			}
+		})
+	}
+}

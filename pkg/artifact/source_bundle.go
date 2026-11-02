@@ -62,6 +62,20 @@ func NewSingleRootBundlePublisher(
 	directory string,
 	logf func(string, ...any),
 ) (*Publisher, error) {
+	return NewSingleRootBundlePublisherWithLocations(cfg, keyFn, admission, location, directory, nil, logf)
+}
+
+// NewSingleRootBundlePublisherWithLocations also binds trusted input locations
+// for external disk and memory dependencies. The publisher snapshots this map.
+func NewSingleRootBundlePublisherWithLocations(
+	cfg *config.ManifestConfig,
+	keyFn ingest.CustomerKeyFunc,
+	admission store.WriteAdmission,
+	location string,
+	directory string,
+	inputs config.RefLocations,
+	logf func(string, ...any),
+) (*Publisher, error) {
 	if err := ValidateSingleRootBundlePublication(cfg, keyFn, admission); err != nil {
 		return nil, err
 	}
@@ -75,6 +89,18 @@ func NewSingleRootBundlePublisher(
 	if !filepath.IsAbs(directory) {
 		return nil, fmt.Errorf("single-root Bundle directory must be absolute: %q", directory)
 	}
+	locations := make(config.RefLocations, len(inputs)+1)
+	for name, path := range inputs {
+		if !filepath.IsAbs(path) {
+			return nil, fmt.Errorf("single-root Bundle input location %q requires an absolute directory", name)
+		}
+		locations[name] = filepath.Clean(path)
+	}
+	directory = filepath.Clean(directory)
+	if previous, ok := locations[location]; ok && previous != directory {
+		return nil, fmt.Errorf("single-root Bundle output location %q conflicts with its input mapping", location)
+	}
+	locations[location] = directory
 	if err := ensurePublishDirectory(directory); err != nil {
 		return nil, err
 	}
@@ -87,10 +113,10 @@ func NewSingleRootBundlePublisher(
 	}
 	target := &singleRootBundleTarget{
 		cfg: cfg, keyFn: storage.CustomerKeyFunc(), admission: admission, storage: storage,
-		location: location, directory: filepath.Clean(directory), logf: logf,
+		location: location, directory: directory, logf: logf,
 		retry: defaultLocationRetryPolicy, fs: osLocationFileSystem{},
 	}
-	return newPublisher(nil, config.RefLocations{location: target.directory}, target, logf), nil
+	return newPublisher(nil, locations, target, logf), nil
 }
 
 type singleRootBundleTarget struct {

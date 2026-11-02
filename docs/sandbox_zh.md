@@ -2094,6 +2094,8 @@ logical source
   -> file://<root>.bundle@manifest:<root>#<location>
 ```
 
+发布含外部命名文件的已组装 E/S 时，用 `NewSingleRootBundlePublisherWithLocations` 传入受信的输入位置表。发布器用这些目录校验实际选中的依赖，保留原有 portable 引用，并将 Bundle 写入指定的输出位置。
+
 source 支持重复读取。第一遍保留根 Manifest key、完整 Bundle 的物理摘要及格式元数据，编码后的 Chunk 字节随处理释放。第二遍直接写入最终 `<root>.bundle`，并核对生成根与预计算身份一致。一次 publish 只解析一次客户密钥，两遍共用相同 admission 与编码参数。
 
 唯一创建的文件是最终 Bundle，包含这个 logical root 的 Manifest 和 Chunk。发布使用有界 Chunk 工作缓冲并保留 payload 稀疏性。typed 调用点提供逻辑角色；image 和 Sandbox reader 保持各自 schema 校验。复用已有目标时，验证 admission、根、认证内容与完整物理身份。并发 writer 通过有界等待、exclusive create 与完整校验收敛。取消、源变化、写入及关闭错误使发布失败，并仅清理本次拥有的不完整 final。路径被替换时保留替换者的 inode，返回所有权错误。
