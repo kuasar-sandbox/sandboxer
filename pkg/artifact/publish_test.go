@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -18,6 +19,11 @@ import (
 )
 
 const publishTestSHA = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+// Graph and report fixtures that intentionally publish plaintext without a key.
+func plaintextRefConfig() *config.ManifestConfig {
+	return &config.ManifestConfig{Crypto: crypto.Config{Ref: crypto.LocalOff}}
+}
 
 func publishEROFSFixture() []byte {
 	payload := make([]byte, 4096)
@@ -81,7 +87,7 @@ func TestLocationPublisherRewritesSandboxAndSnapshotGraphs(t *testing.T) {
 	ctx := context.Background()
 	inputDir := t.TempDir()
 	outputDir := t.TempDir()
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +230,7 @@ func TestLocationPublisherPublishesRootCarrierAsImage(t *testing.T) {
 	ctx := context.Background()
 	inputDir := t.TempDir()
 	outputDir := t.TempDir()
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

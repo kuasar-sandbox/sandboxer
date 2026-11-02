@@ -81,7 +81,7 @@ func DeriveRuntimeSpecWithOptions(ctx context.Context, cfg *config.SandboxConfig
 		return RuntimeSpec{}, errors.New("derive runtime spec: Storage and Credentials are mutually exclusive")
 	}
 	if opts.Launch.Storage == nil {
-		var credentials ArtifactCredentials
+		credentials := ArtifactCredentials{Config: opts.Launch.ManifestConfig}
 		if opts.Launch.Credentials != nil {
 			credentials = *opts.Launch.Credentials
 		}

@@ -86,7 +86,7 @@ func TestRewriteReduceAnyMaterializesMemoryAndAllDisks(t *testing.T) {
 	ctx := context.Background()
 	input, output := t.TempDir(), t.TempDir()
 	sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestRewriteRejectsUnmatchedBeforeOutput(t *testing.T) {
 	ctx := context.Background()
 	input, output := t.TempDir(), t.TempDir()
 	sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestRewriteSpecifiedDiskReduction(t *testing.T) {
 			ctx := context.Background()
 			input, output := t.TempDir(), t.TempDir()
 			sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-			storage, err := NewProcessStorage(nil)
+			storage, err := NewProcessStorage(plaintextRefConfig())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -330,7 +330,7 @@ func TestRewriteSnapshotUpdatesPortableSandboxInternals(t *testing.T) {
 			ctx := context.Background()
 			input, output := t.TempDir(), t.TempDir()
 			sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-			storage, err := NewProcessStorage(nil)
+			storage, err := NewProcessStorage(plaintextRefConfig())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -397,7 +397,7 @@ func TestRewriteReplacementPreservesUnreducedTop(t *testing.T) {
 	ctx := context.Background()
 	input, output := t.TempDir(), t.TempDir()
 	sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +444,7 @@ func TestRewriteSkipKeepsInputIdentityValidation(t *testing.T) {
 	ctx := context.Background()
 	input, output := t.TempDir(), t.TempDir()
 	sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -487,7 +487,7 @@ func TestRewriteExplicitMemoryReductionPreservesExecutionState(t *testing.T) {
 	ctx := context.Background()
 	input, output := t.TempDir(), t.TempDir()
 	sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -630,7 +630,7 @@ func TestRewriteExplicitReducedTargetRepairsMissingChain(t *testing.T) {
 	ctx := context.Background()
 	input, output := t.TempDir(), t.TempDir()
 	sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,7 +667,7 @@ func TestRewriteSandboxReferenceUsesSemanticDiskEquivalence(t *testing.T) {
 			ctx := context.Background()
 			input, output := t.TempDir(), t.TempDir()
 			sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-			storage, err := NewProcessStorage(nil)
+			storage, err := NewProcessStorage(plaintextRefConfig())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -730,7 +730,7 @@ func TestRewriteReduceSixtyFourMemoryLayers(t *testing.T) {
 	ctx := context.Background()
 	input, output := t.TempDir(), t.TempDir()
 	sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,7 +767,7 @@ func TestRewriteReduceEROFSKeepsImmutableBaseSeparate(t *testing.T) {
 	ctx := context.Background()
 	input, output := t.TempDir(), t.TempDir()
 	sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

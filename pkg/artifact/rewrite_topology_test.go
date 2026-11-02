@@ -15,7 +15,7 @@ func TestRewriteSandboxRefRejectsMovingDataToAnotherDevice(t *testing.T) {
 	ctx := context.Background()
 	input, output := t.TempDir(), t.TempDir()
 	sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

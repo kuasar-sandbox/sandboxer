@@ -17,8 +17,111 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
 
-func TestPublishJSONAliases(t *testing.T) {
+func usePlaintextRefConfig(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "manifest.yaml")
+	if err := os.WriteFile(path, []byte("crypto: {ref: off}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.ManifestConfigEnv, path)
+}
+
+func TestPublishDefaultRefAutoRequiresCLIKey(t *testing.T) {
 	t.Setenv(config.ManifestConfigEnv, "")
+	portable := testRunFromPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	raw, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.Repeat([]byte{7}, 8192)
+	source, err := sandboxfile.BuildSource(sparse.Dense(bytes.NewReader(body), uint64(len(body))), nil, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := snapshot.NewFileSink(t.TempDir(), "input", nil, false, nil)
+	defer sink.Close()
+	eRef, path, err := sink.AbsorbSandbox(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, key string
+		ok        bool
+	}{
+		{"missing", "", false}, {"invalid", "not-hex", false}, {"valid", strings.Repeat("1b", 32), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MANIFEST_KEY", tc.key)
+			out := t.TempDir()
+			rc, stdout, stderr := captureInfoOutput(t, func() int { return publishCmd([]string{"--json", "--to-ref-location", "out=file://" + out, path}) })
+			files, err := os.ReadDir(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.ok {
+				if rc == 0 || stdout != "" || len(files) != 0 {
+					t.Fatalf("failed publish: rc=%d stdout=%s files=%v", rc, stdout, files)
+				}
+				return
+			}
+			if rc != 0 || len(files) != 1 {
+				t.Fatalf("publish failed: %d, %s, %v", rc, stderr, files)
+			}
+			report, err := artifact.DecodePublishReport([]byte(stdout), artifact.RoleSandbox)
+			if err != nil || !strings.Contains(report.SandboxRef, "@hmac:") {
+				t.Fatalf("published JSON: %s, %v", stdout, err)
+			}
+			b, err := os.ReadFile(filepath.Join(out, files[0].Name()))
+			if err != nil || !bytes.HasPrefix(b, []byte("\x89KTSENC\n")) {
+				t.Fatalf("missing encrypted envelope: %v", err)
+			}
+			args := []string{"--json", "--ref-location", "out=file://" + out, report.SandboxRef}
+			rc, info, stderr := captureInfoOutput(t, func() int { return infoCmd(args) })
+			if rc != 0 || !json.Valid([]byte(info)) {
+				t.Fatalf("config-free E info: %s %s", info, stderr)
+			}
+
+			tail, err := snapshot.MarshalConfig(&snapshot.Config{Version: 1, SandboxRef: eRef})
+			if err != nil {
+				t.Fatal(err)
+			}
+			src, err := snapshotfile.BuildSource(sparse.Dense(bytes.NewReader(body), uint64(len(body))), []byte("{}"), []byte("{}"), tail)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, snap, err := sink.AbsorbSnapshot(context.Background(), src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rc, stdout, stderr = captureInfoOutput(t, func() int { return publishCmd([]string{"--json", "--to-ref-location", "out=file://" + out, snap}) })
+			if rc != 0 {
+				t.Fatal(stderr)
+			}
+			sReport, err := artifact.DecodePublishReport([]byte(stdout), artifact.RoleSnapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			args[len(args)-1] = sReport.SnapshotRef
+			rc, info, stderr = captureInfoOutput(t, func() int { return infoCmd(args) })
+			var projection struct{ SandboxRef string }
+			if rc != 0 || json.Unmarshal([]byte(info), &projection) != nil || projection.SandboxRef != sReport.SandboxRef {
+				t.Fatalf("config-free S info: %s %s", info, stderr)
+			}
+			for _, badKey := range []string{"", strings.Repeat("7a", 32)} {
+				t.Setenv("MANIFEST_KEY", badKey)
+				rc, info, _ = captureInfoOutput(t, func() int { return infoCmd(args) })
+				if rc == 0 || info != "" {
+					t.Fatal("opened ciphertext without the correct key")
+				}
+			}
+
+		})
+	}
+}
+
+func TestPublishJSONAliases(t *testing.T) {
+	usePlaintextRefConfig(t)
 	ctx := context.Background()
 	dir, output := t.TempDir(), t.TempDir()
 	cfg := testRunFromPortable(t)

@@ -17,6 +17,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
@@ -125,7 +126,7 @@ func OpenFile(
 }
 
 // OpenFileWithLocations is OpenFile with the trusted location map required by
-// ordered Bundle refs. Tarstream behavior is unchanged.
+// ordered Bundle and named tarstream refs.
 func OpenFileWithLocations(
 	ctx context.Context,
 	path string,
@@ -137,13 +138,28 @@ func OpenFileWithLocations(
 	localCodec tarstream.Codec,
 	localRequired bool,
 ) (*OpenedFile, error) {
-	return readretry.Open(ctx, func() (*OpenedFile, error) {
-		opened, err := openFileWithLocations(ctx, path, ref, manifestCfg, keyFn, remote, locations, localCodec, localRequired)
+	// Legacy package-level callers supply the same read capabilities separately.
+	// Keep their explicit resolver and borrowed fetcher, including with nil cfg.
+	s := &ProcessStorage{cfg: manifestCfg, keyFn: keyFn, borrowedFetcher: remote, localCodec: localCodec, localRequired: localRequired}
+	return s.openFile(ctx, path, ref, locations, false)
+}
+
+func (s *ProcessStorage) openFile(ctx context.Context, path string, ref manifest.Ref, locations config.RefLocations, transient bool) (*OpenedFile, error) {
+	if s == nil {
+		return nil, readerr.Mark(fmt.Errorf("artifact: process storage is required"), false)
+	}
+	codec, required, err := s.readCodec(ref.Location != "" && !transient)
+	if err != nil {
+		return nil, readerr.Mark(err, false)
+	}
+	opened, err := readretry.Open(ctx, func() (*OpenedFile, error) {
+		opened, err := openFileWithLocations(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), locations, codec, required)
 		if errors.Is(err, os.ErrNotExist) {
 			err = readerr.Mark(err, false)
 		}
 		return opened, err
 	})
+	return opened, protectProcessLocalReadError(s.localCodec, "open local artifact", err)
 }
 
 func openFileWithLocations(
@@ -178,10 +194,16 @@ func openFileWithLocations(
 	if err != nil {
 		return nil, err
 	}
+	var opened *OpenedFile
 	if format == FileFormatManifestBundle {
-		return openManifestBundle(ctx, path, ref, manifestCfg, keyFn, remote, locations)
+		opened, err = openManifestBundle(ctx, path, ref, manifestCfg, keyFn, remote, locations)
+	} else {
+		opened, err = openTarstream(path, ref, localCodec, localRequired)
 	}
-	return openTarstream(path, ref, localCodec, localRequired)
+	if ref.Location != "" {
+		err = protectProcessLocalReadError(localCodec, "open ref artifact", err)
+	}
+	return opened, err
 }
 
 // resolveFileTarget selects the physical path used by both format detection and
@@ -239,21 +261,13 @@ func resolveLocatedFileTarget(path string, ref manifest.Ref, locations config.Re
 
 // OpenFile uses the process-fixed customer key and lazy remote Fetcher.
 func (s *ProcessStorage) OpenFile(ctx context.Context, path string, ref manifest.Ref) (*OpenedFile, error) {
-	if s == nil {
-		return nil, readerr.Mark(fmt.Errorf("artifact: process storage is required"), false)
-	}
-	opened, err := OpenFile(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), s.localCodec, s.localRequired)
-	return opened, protectProcessLocalReadError(s.localCodec, "open local artifact", err)
+	return s.openFile(ctx, path, ref, nil, false)
 }
 
 // OpenFileWithLocations supplies ordered Bundle refs with trusted named
 // location resolution while retaining ProcessStorage ownership.
 func (s *ProcessStorage) OpenFileWithLocations(ctx context.Context, path string, ref manifest.Ref, locations config.RefLocations) (*OpenedFile, error) {
-	if s == nil {
-		return nil, readerr.Mark(fmt.Errorf("artifact: process storage is required"), false)
-	}
-	opened, err := OpenFileWithLocations(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), locations, s.localCodec, s.localRequired)
-	return opened, protectProcessLocalReadError(s.localCodec, "open local artifact", err)
+	return s.openFile(ctx, path, ref, locations, false)
 }
 
 type processLocalReadError struct {
@@ -418,7 +432,7 @@ func tarReadOptions(ref manifest.Ref, codec tarstream.Codec, required bool) ([]t
 	return options, nil
 }
 
-func validateTarIdentity(ref manifest.Ref, path string, stream fetch.Stream) error {
+func validateTarIdentity(ref manifest.Ref, path string, stream sparse.Source) error {
 	digester, ok := stream.(tarstream.Digester)
 	if !ok {
 		return readerr.Mark(fmt.Errorf("local tarstream: artifact has no declared digest"), false)

@@ -61,6 +61,7 @@ type Publisher struct {
 	report             *publicationReport
 	completion         *publishCompletion
 	transientLocations map[string]bool
+	checkedLocated     map[string]struct{}
 	checkpointPins     *PinnedDiffCheckpoints
 }
 
@@ -273,7 +274,7 @@ func NewManifestPublisher(storage *ProcessStorage, cfg *config.ManifestConfig, l
 }
 
 // NewLocationPublisher writes content-addressed tarstreams into one trusted
-// named location using the configured local crypto policy.
+// named location using the configured ref crypto policy.
 func NewLocationPublisher(storage *ProcessStorage, location, directory string, locations config.RefLocations, logf func(string, ...any)) (*Publisher, error) {
 	if storage == nil {
 		return nil, errors.New("publish: process storage is required")
@@ -288,11 +289,19 @@ func NewLocationPublisher(storage *ProcessStorage, location, directory string, l
 	if err := ensurePublishDirectory(directory); err != nil {
 		return nil, err
 	}
+	ref, err := storage.refAccess()
+	if err != nil {
+		return nil, err
+	}
+	codec, err := ref.resolve()
+	if err != nil {
+		return nil, err
+	}
 	target := newLocationPublishTarget(
 		location,
 		filepath.Clean(directory),
-		storage.LocalCodec(),
-		storage.LocalRequired(),
+		codec,
+		codec != nil,
 		logf,
 	)
 	return newPublisher(storage, locations, target, logf), nil
@@ -334,7 +343,8 @@ type publishScope struct {
 // source and must keep it valid until PublishSource returns. Dependencies named
 // by a Sandbox source must already be portable; this method deliberately does
 // not infer a graph from filenames or extensions. Snapshot callers must supply
-// their already-known portable sandbox_ref as the final argument; no scan is made.
+// their already-known portable sandbox_ref as the final argument. Publication
+// checks retained files using the logical configuration of the selected E/S.
 func (p *Publisher) PublishSource(ctx context.Context, role LogicalRole, source sparse.Source, sandboxRef ...string) (PublishResult, error) {
 	if p == nil || p.target == nil {
 		return PublishResult{}, errors.New("publish source: publisher is not initialized")
@@ -366,6 +376,17 @@ func (p *Publisher) PublishSource(ctx context.Context, role LogicalRole, source 
 	} else if len(sandboxRef) != 0 {
 		return PublishResult{}, errors.New("publish source: sandbox ref metadata is only valid for Snapshot")
 	}
+	if role != RoleImage {
+		op := p.operation()
+		if bundle, ok := p.target.(*singleRootBundleTarget); ok {
+			op.storage = bundle.storage
+		}
+		if op.storage != nil {
+			if err := op.checkSourceRefs(ctx, role, source, knownE); err != nil {
+				return PublishResult{}, err
+			}
+		}
+	}
 	ref, err := p.target.Put(ctx, role, source)
 	if err != nil {
 		return PublishResult{}, err
@@ -374,6 +395,46 @@ func (p *Publisher) PublishSource(ctx context.Context, role LogicalRole, source 
 		knownE = ref
 	}
 	return PublishResult{Role: role, Ref: ref, SandboxRef: knownE, RemovedRefs: []string{}}, nil
+}
+
+// Direct source publication has no input carrier to confer a Bundle scope.
+// Read only the selected root configs needed to check external files. Leave
+// disk and memory payloads opaque and retain caller ownership of source.
+func (p *Publisher) checkSourceRefs(ctx context.Context, role LogicalRole, source sparse.Source, knownE string) error {
+	scope := publishScope{fetcher: p.storage.Fetcher()}
+	stream := rewriteSourceStream{source}
+	if role == RoleSandbox {
+		root, err := sandboxfile.Open(ctx, stream)
+		if err != nil {
+			return err
+		}
+		return errors.Join(p.retainLocatedDisks(ctx, root.Portable, scope), root.Close())
+	}
+	root, err := snapshotfile.Open(ctx, stream)
+	if err != nil {
+		return err
+	}
+	cfg, err := snapshot.ParseConfig(root.SnapshotConfig)
+	if err = errors.Join(err, root.Close()); err != nil {
+		return err
+	}
+	if cfg.SandboxRef != knownE {
+		return errors.New("publish source: snapshot.cfg sandbox_ref does not match supplied ref")
+	}
+	for _, parent := range cfg.FromRefs {
+		if err := p.retainLocated(ctx, parent, scope); err != nil {
+			return err
+		}
+	}
+	e, child, err := p.open(ctx, knownE, scope)
+	if err != nil {
+		return err
+	}
+	sandboxRoot, err := sandboxfile.Open(ctx, e)
+	if err != nil {
+		return err
+	}
+	return errors.Join(p.retainLocatedDisks(ctx, sandboxRoot.Portable, child), sandboxRoot.Close())
 }
 
 // Publish auto-detects exactly one strict logical root and publishes its graph.
@@ -392,7 +453,7 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 		return PublishResult{}, err
 	}
 	if opened, ok := stream.(*OpenedFile); ok && opened.Format() == FileFormatManifestBundle {
-		return p.publishBundle(ctx, rootRef, scope, opened)
+		return p.publishBundle(ctx, rootRef, scope, childScope, opened)
 	}
 	sandboxRoot, sandboxErr := sandboxfile.Open(ctx, stream)
 	if sandboxErr == nil {
@@ -517,7 +578,7 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 		return "", "", errors.Join(err, sandboxRoot.Close())
 	}
 	if keep && sandboxRoot.Checkpoint == nil {
-		if err := sandboxRoot.Close(); err != nil {
+		if err := errors.Join(p.retainLocatedDisks(ctx, sandboxRoot.Portable, sandboxScope), sandboxRoot.Close()); err != nil {
 			return "", "", err
 		}
 		cfg.SandboxRef = portable
@@ -706,16 +767,17 @@ func (p *Publisher) open(ctx context.Context, raw string, scope publishScope) (f
 				return nil, scope, err
 			}
 		}
-		path, err = filepath.EvalSymlinks(path)
-		if err != nil {
-			return nil, scope, err
-		}
-		opened, err := p.storage.OpenFileWithLocations(ctx, path, ref, p.locations)
+		// The opener verifies the original mapped path before following aliases.
+		// Only files registered by this materialization use local policy.
+		opened, err := p.storage.openFile(ctx, path, ref, p.locations, p.transientLocations[ref.Location])
 		if err != nil {
 			return nil, scope, err
 		}
 		child := scope
-		child.relativeDir = filepath.Dir(path)
+		if ref.Location != "" && p.checkedLocated != nil {
+			p.checkedLocated[scopeKey(scope, raw)] = struct{}{}
+		}
+		child.relativeDir = filepath.Dir(opened.ResolvedPath())
 		if _, bundle := opened.RootManifestKey(); bundle {
 			child.fetcher = opened.ScopedFetcher()
 			child.carrier = scopedRef(raw, scope)

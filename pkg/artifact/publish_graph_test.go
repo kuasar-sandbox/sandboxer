@@ -603,7 +603,7 @@ func TestPublisherHonorsCanceledContextWithoutOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	storage, err := NewProcessStorage(nil)
+	storage, err := NewProcessStorage(plaintextRefConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

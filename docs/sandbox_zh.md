@@ -409,7 +409,7 @@ JSON 不增加 path、context、identifier 或字段映射对象，成功结果�
 result, err := publisher.PublishSource(ctx, artifact.RoleSnapshot, source, cfg.SandboxRef)
 ```
 
-纯创建路径没有原根，差集为空；不会重新扫描已组装 source，source 所有权继续属于调用方。
+纯创建路径没有原根，差集为空。发布器读取选中配置以校验保留的命名位置依赖，已组装 source 的所有权仍归调用方。
 
 ```bash
 sandbox-ctl publish --json --quiet --to-ref-location release=file:///srv/sandbox-artifacts ./s1.snapshot
@@ -2027,15 +2027,31 @@ resolver。`ProcessStorage` 至多求值一次并为其拥有的 fetch、ingest 
 
 <a id="artifact-publication"></a>
 
-### 6.5 Local tarstream 与 crypto
+### 6.5 本地与命名位置的 tarstream 加密
 
-Local immutable artifact支持 `crypto.local=off|auto|required`:
+两项策略共用同一把客户密钥，各自有独立的默认值。
 
-- `off`:plaintext tarstream,identity `digest`.
-- `auto`:自动识别plaintext或KDXTS encrypted tarstream;新输出按配置codec.
-- `required`:拒绝plaintext和未绑定key的identity;identity使用`hmac`.
+```yaml
+crypto:
+  local: off
+  ref: required
+```
 
-未配置 policy 时默认 `off`；`auto` 或 `required` 在 storage 构造阶段就解析 customer key，即使是 file-only operation。没有 Manifest config 就没有 local codec 或 lazy Manifest client；file-only 不表示已配置的 crypto 可以省略 key。源码见 [storage.go](../pkg/artifact/storage.go)。
+`crypto.local` 管理本地工作文件、活动 DIFF、checkpoint 和本地物化文件。默认 `off` 读写明文。设为 `auto` 时可以读取明文和认证通过的密文，新写入加密。设为 `required` 时还会拒绝本地明文输入。checkpoint 的内部临时物化文件在发布前始终属于本地域。
+
+`crypto.ref` 管理命名位置的 tarstream，包括发布时保留的磁盘和内存依赖。其默认值为 `auto`，与 `local` 的取值无关。
+
+| `crypto.ref` | 读取或保留明文 | 以正确密钥读取或保留密文 | 新 tarstream |
+| --- | --- | --- | --- |
+| `off` | 允许 | 拒绝 | 明文，`@digest` |
+| `auto` | 允许 | 允许 | 密文，`@hmac` |
+| `required` | 拒绝 | 允许 | 密文，`@hmac` |
+
+使用上例配置，VM 可以生成本地明文 checkpoint，发布密文 E/S，用同一把密钥恢复，再写出新的本地明文 DIFF。不提供配置文件时，`sandbox-ctl publish --to-ref-location` 使用 `ref: auto`，需要有效的 `MANIFEST_KEY`。无配置调用 `info`、`run --from` 或 `run --restore` 打开该命名引用时，传入同一把密钥。密钥缺失或错误、认证失败、身份不匹配都会报错。SDK 调用方通过 `NewProcessStorageWithCustomerKey` 显式传入密钥解析器。
+
+已有 `local: off` 的部署升级后，新发布到命名位置的 tarstream 需要密钥。要沿用升级前的发布策略，请将原 `local` 的值显式填入 `ref`。原先使用 `local: required` 且仍需拒绝明文依赖的部署，应明确配置 `ref: required`。请与支持该字段的 sandboxer 一起启用。旧 loader 可能接受这份 YAML 并忽略该字段。
+
+`auto` 可以保留已有明文 portable 引用，不会迁移整张历史依赖图。保留命名 tarstream 时，发布器打开实际选用的 carrier 并检查封装和预期身份，无需通读磁盘或内存 payload。新目标及目标碰撞复用仍要完整校验数据流。Manifest 和 Bundle 沿用原有编码、认证与精确复制语义，Bundle 实际选用的外部 tarstream 遵循 `crypto.ref`。
 
 Existing-file reuse 必须重新验证 role、logical size、content identity 和完整 stream。 Local output与named ref-location的commit策略刻意分离. Artifact capture/publication只定义logical completion,不定义stable-storage durability:local output依赖完整写入、`Close()`检查、内容寻址no-replace rename与alias atomic rename;named-location依赖`O_EXCL`写入、`Close()`检查、最终路径reopen/full verification与路径身份检查. 两种 artifact-publication 路径都不执行显式 file/directory flush，物理写回由文件系统或底层存储实现定义；这不同于 §3.6 中执行 fsync 的 run-directory C0 写入。
 
@@ -2077,6 +2093,8 @@ logical source
   -> reopen/strict validate
   -> file://<root>.bundle@manifest:<root>#<location>
 ```
+
+发布含外部命名文件的已组装 E/S 时，用 `NewSingleRootBundlePublisherWithLocations` 传入受信的输入位置表。发布器用这些目录校验实际选中的依赖，保留原有 portable 引用，并将 Bundle 写入指定的输出位置。
 
 source 支持重复读取。第一遍保留根 Manifest key、完整 Bundle 的物理摘要及格式元数据，编码后的 Chunk 字节随处理释放。第二遍直接写入最终 `<root>.bundle`，并核对生成根与预计算身份一致。一次 publish 只解析一次客户密钥，两遍共用相同 admission 与编码参数。
 

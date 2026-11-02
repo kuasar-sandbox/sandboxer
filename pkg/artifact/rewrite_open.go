@@ -3,10 +3,11 @@ package artifact
 import (
 	"context"
 	"errors"
+	"path/filepath"
+
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/transfer"
-	"path/filepath"
 )
 
 // open preserves Bundle source selection and gives local tarstreams the same
@@ -27,7 +28,7 @@ func (p *publicationRewrite) open(ctx context.Context, raw string, scope publish
 	if err != nil {
 		return nil, scope, err
 	}
-	path, err = resolveLocatedFileTarget(path, ref, p.p.locations)
+	path, err = resolveFileTarget(path, ref, p.p.locations)
 	if err != nil {
 		return nil, scope, err
 	}
@@ -38,36 +39,24 @@ func (p *publicationRewrite) open(ctx context.Context, raw string, scope publish
 	if format == FileFormatManifestBundle {
 		return p.p.open(ctx, raw, scope)
 	}
-	cfg := manifest.Config{}
-	if p.p.storage.cfg != nil {
-		cfg = *p.p.storage.cfg
-	}
-	verify := true
-	cfg.Manifest.VerifyContent = &verify
-	key := [32]byte{}
-	if keyFn := p.p.storage.CustomerKeyFunc(); keyFn != nil {
-		key, err = keyFn()
-		if err != nil {
-			return nil, scope, err
-		}
-	}
-	defer clear(key[:])
-	reader, err := transfer.NewReader(&cfg, key, p.p.locations)
+	codec, required, err := p.p.storage.readCodec(ref.Location != "" && !p.p.transientLocations[ref.Location])
 	if err != nil {
 		return nil, scope, err
 	}
-	local := ref
-	if local.Location == "" {
-		local.Path = path
-	}
-	opened, err := reader.Open(ctx, local.String())
+	options, err := tarReadOptions(ref, codec, required)
 	if err != nil {
-		return nil, scope, errors.Join(err, reader.Close())
+		return nil, scope, err
 	}
-	if err = opened.Verify(ctx); err != nil {
-		return nil, scope, errors.Join(err, opened.Close(), reader.Close())
+	opened, err := transfer.OpenTarstream(path, options...)
+	if err != nil {
+		return nil, scope, protectProcessLocalReadError(codec, "open rewrite tarstream", err)
 	}
-	p.closes = append(p.closes, reader.Close)
+	if err = validateTarIdentity(ref, path, opened.Source); err == nil {
+		err = opened.Verify(ctx)
+	}
+	if err != nil {
+		return nil, scope, errors.Join(protectProcessLocalReadError(codec, "verify rewrite tarstream", err), opened.Close())
+	}
 	scope.relativeDir = filepath.Dir(path)
 	return opened, scope, nil
 }

@@ -45,7 +45,7 @@ func TestReportExplicitChainAccess(t *testing.T) {
 			t.Run(fmt.Sprintf("skip=%t/missing=%t", skip, missing), func(t *testing.T) {
 				ctx := context.Background()
 				dir := t.TempDir()
-				storage, _ := NewProcessStorage(nil)
+				storage, _ := NewProcessStorage(plaintextRefConfig())
 				defer storage.Close()
 				sink := snapshot.NewFileSink(dir, "chain", nil, false, nil)
 				refs := make([]string, 3)
@@ -167,7 +167,7 @@ func TestReportOldSandboxAccessBoundary(t *testing.T) {
 		t.Run(fmt.Sprint(skip), func(t *testing.T) {
 			ctx := context.Background()
 			dir := t.TempDir()
-			storage, _ := NewProcessStorage(nil)
+			storage, _ := NewProcessStorage(plaintextRefConfig())
 			defer storage.Close()
 			sink := snapshot.NewFileSink(dir, "e-boundary", nil, false, nil)
 			body := bytes.Repeat([]byte{7}, 4096)

@@ -75,7 +75,7 @@ func TestReportScopesBeforeProjection(t *testing.T) {
 func TestReportOrdinaryRepeatAndNoop(t *testing.T) {
 	ctx := context.Background()
 	dir, output := t.TempDir(), t.TempDir()
-	storage, _ := NewProcessStorage(nil)
+	storage, _ := NewProcessStorage(plaintextRefConfig())
 	defer storage.Close()
 	sink := snapshot.NewFileSink(dir, "report", nil, false, nil)
 	body := bytes.Repeat([]byte{0x71}, 4096)
@@ -136,7 +136,7 @@ func TestReportReduceAndSharedRetained(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/skip=%t", mode, skip), func(t *testing.T) {
 				ctx := context.Background()
 				dir := t.TempDir()
-				storage, _ := NewProcessStorage(nil)
+				storage, _ := NewProcessStorage(plaintextRefConfig())
 				defer storage.Close()
 				sink := snapshot.NewFileSink(dir, "report", nil, false, nil)
 				body := bytes.Repeat([]byte{0x53}, 4096)
@@ -189,7 +189,7 @@ func TestReportSkipEReplacementBoundary(t *testing.T) {
 			t.Run(fmt.Sprintf("skip=%t/missing=%t", skip, missing), func(t *testing.T) {
 				ctx := context.Background()
 				dir := t.TempDir()
-				storage, _ := NewProcessStorage(nil)
+				storage, _ := NewProcessStorage(plaintextRefConfig())
 				defer storage.Close()
 				sink := snapshot.NewFileSink(dir, "report", nil, false, nil)
 				body := bytes.Repeat([]byte{0x31}, 4096)
@@ -242,7 +242,7 @@ func TestReportSkipEReplacementBoundary(t *testing.T) {
 func TestReportConcurrentOperations(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	storage, _ := NewProcessStorage(nil)
+	storage, _ := NewProcessStorage(plaintextRefConfig())
 	defer storage.Close()
 	sink := snapshot.NewFileSink(dir, "parallel", nil, false, nil)
 	body := bytes.Repeat([]byte{0x27}, 16384)

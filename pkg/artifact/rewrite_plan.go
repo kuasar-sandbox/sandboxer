@@ -99,9 +99,13 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 		copyConfig.Manifest.VerifyContent = &verify
 		storageConfig = &copyConfig
 	}
-	verifiedStorage, err := NewProcessStorageWithCustomerKey(storageConfig, p.storage.CustomerKeyFunc())
+	verifiedStorage, err := NewProcessStorageWithLocalAccess(storageConfig, p.storage.CustomerKeyFunc(), p.storage.LocalCodec(), p.storage.LocalRequired())
 	if err != nil {
 		return result, err
+	}
+	verifiedStorage.ref = p.storage.ref
+	if storageConfig == nil {
+		verifiedStorage.borrowedFetcher = p.storage.Fetcher()
 	}
 	operation := p.operation()
 	operation.storage = verifiedStorage

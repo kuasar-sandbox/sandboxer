@@ -81,7 +81,7 @@ func publishArtifactCmd(command string, args []string) int {
 		}
 		manifestCfg = nil
 	}
-	storage, err := artifact.NewProcessStorage(manifestCfg)
+	storage, err := newCLIStorage(manifestCfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1

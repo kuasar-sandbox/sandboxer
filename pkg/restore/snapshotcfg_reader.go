@@ -112,8 +112,7 @@ type SnapshotCfgDocument struct {
 // SnapshotCfgReader owns process-local artifact storage for one or more
 // sequential root reads. Callers must Close it.
 type SnapshotCfgReader struct {
-	storage     *artifact.ProcessStorage
-	manifestCfg *config.ManifestConfig
+	storage *artifact.ProcessStorage
 }
 
 // NewSnapshotCfgReader creates the reader used by current orchestrator task
@@ -123,7 +122,16 @@ func NewSnapshotCfgReader(manifestCfg *config.ManifestConfig) (*SnapshotCfgReade
 	if err != nil {
 		return nil, err
 	}
-	return &SnapshotCfgReader{storage: storage, manifestCfg: manifestCfg}, nil
+	return &SnapshotCfgReader{storage: storage}, nil
+}
+
+// NewSnapshotCfgReaderWithStorage borrows the existing key and reader
+// capabilities. The caller keeps storage open until the reader is released.
+func NewSnapshotCfgReaderWithStorage(storage *artifact.ProcessStorage) (*SnapshotCfgReader, error) {
+	if storage == nil {
+		return nil, errors.New("snapshot config reader requires artifact storage")
+	}
+	return &SnapshotCfgReader{storage: storage.Borrow()}, nil
 }
 
 func (r *SnapshotCfgReader) Close() error {
@@ -207,7 +215,8 @@ func (r *SnapshotCfgReader) openSnapshot(ctx context.Context, rootRef string, re
 
 func (r *SnapshotCfgReader) openOptions(rootRef string, readOpts SnapshotCfgReadOptions) (Options, error) {
 	opts := Options{
-		ManifestCfg:   r.manifestCfg,
+		storage:       r.storage,
+		ManifestCfg:   r.storage.ManifestConfig(),
 		Fetcher:       r.storage.Fetcher(),
 		CustomerKeyFn: r.storage.CustomerKeyFunc(),
 		LocalCodec:    r.storage.LocalCodec(),

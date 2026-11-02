@@ -166,6 +166,13 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		opts.CHBinary = "cloud-hypervisor"
 	}
 
+	storage, err := artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired, opts.Fetcher)
+	if err != nil {
+		return -1, err
+	}
+	defer storage.Close()
+	opts.CustomerKeyFn = storage.CustomerKeyFunc()
+	opts.checkpointStorage = storage
 	var checkpointRelease func() error
 	opts, checkpointRelease, err = prepareColdCheckpoint(ctx, opts)
 	if err != nil {
@@ -279,11 +286,6 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		}
 	}
 
-	storage, err := artifact.NewProcessStorageWithCustomerKey(opts.ManifestCfg, opts.CustomerKeyFn)
-	if err != nil {
-		return -1, err
-	}
-	defer storage.Close()
 	launch := LaunchSpecFromConfig(opts.Cfg)
 	launch.legacyAccess = &opts
 	launch.Storage = storage

@@ -33,6 +33,7 @@ type ProcessStorage struct {
 	keyFn           ingest.CustomerKeyFunc
 	localCodec      tarstream.Codec
 	localRequired   bool
+	ref             *refTarstreams
 	fetcher         *onDemandManifestFetcher
 	borrowedFetcher fetch.Fetcher
 }
@@ -51,7 +52,7 @@ func NewProcessStorage(cfg *config.ManifestConfig) (*ProcessStorage, error) {
 // with an explicit customer-key resolver. It is intended for embedding callers
 // whose authoritative key is task-scoped rather than process-global. The
 // resolver is evaluated at most once and its result is fixed for every fetch,
-// ingest, and local-codec operation owned by the returned storage.
+// ingest, local-codec and named-location operation owned by the returned storage.
 func NewProcessStorageWithCustomerKey(cfg *config.ManifestConfig, customerKey ingest.CustomerKeyFunc) (*ProcessStorage, error) {
 	s, err := newProcessStorage(cfg, customerKey)
 	if err != nil || cfg == nil {
@@ -105,31 +106,36 @@ func NewProcessStorageWithLocalAccess(cfg *config.ManifestConfig, customerKey in
 // ownership. Closing the result never closes the original storage or its client.
 // The caller must keep the original storage open until the borrower is released.
 func (s *ProcessStorage) Borrow() *ProcessStorage {
+	return s.BorrowWithFetcher(s.Fetcher())
+}
+
+// BorrowWithFetcher keeps both tarstream policies and the fixed key while
+// selecting the caller's Manifest source (for example an opened Bundle).
+// Closing this view never closes either the storage or the selected fetcher.
+func (s *ProcessStorage) BorrowWithFetcher(fetcher fetch.Fetcher) *ProcessStorage {
 	if s == nil {
 		return nil
 	}
-	return &ProcessStorage{cfg: s.cfg, keyFn: s.keyFn, localCodec: s.localCodec,
-		localRequired: s.localRequired, borrowedFetcher: s.Fetcher()}
+	return &ProcessStorage{cfg: s.cfg, keyFn: s.keyFn, localCodec: s.localCodec, ref: s.ref,
+		localRequired: s.localRequired, borrowedFetcher: fetcher}
 }
 
 func newProcessStorage(cfg *config.ManifestConfig, customerKey ingest.CustomerKeyFunc) (*ProcessStorage, error) {
 	s := &ProcessStorage{cfg: cfg}
-	if customerKey == nil {
-		if cfg != nil {
-			return nil, fmt.Errorf("artifact storage: customer key resolver is required")
-		}
-		return s, nil
+	if customerKey != nil {
+		s.keyFn = sync.OnceValues(customerKey)
+	} else if cfg != nil {
+		return nil, fmt.Errorf("artifact storage: customer key resolver is required")
 	}
-	var (
-		once   sync.Once
-		key    [32]byte
-		keyErr error
-	)
-	s.keyFn = func() ([32]byte, error) {
-		once.Do(func() { key, keyErr = customerKey() })
-		return key, keyErr
+	ref, err := newRefTarstreams(cfg, s.keyFn)
+	if err != nil {
+		return nil, err
 	}
+	s.ref = ref
 	if cfg != nil {
+		if _, err := cfg.Crypto.LocalPolicy(); err != nil {
+			return nil, err
+		}
 		s.fetcher = &onDemandManifestFetcher{cfg: cfg, keyFn: s.keyFn}
 		if !verificationOptions(cfg).VerifyContent {
 			warnVerificationDisabled.Do(func() {
@@ -141,6 +147,90 @@ func newProcessStorage(cfg *config.ManifestConfig, customerKey ingest.CustomerKe
 }
 
 var warnVerificationDisabled sync.Once
+
+// refTarstreams shares both successful and failed initialization across reads,
+// writes and borrowers. Plaintext reads in auto mode never resolve the key.
+type refTarstreams struct {
+	policy crypto.LocalPolicy
+	keyFn  ingest.CustomerKeyFunc
+	once   sync.Once
+	codec  tarstream.Codec
+	err    error
+}
+
+func newRefTarstreams(cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc) (*refTarstreams, error) {
+	var settings crypto.Config
+	if cfg != nil {
+		settings = cfg.Crypto
+	}
+	policy, err := settings.RefPolicy()
+	if err != nil {
+		return nil, err
+	}
+	return &refTarstreams{policy: policy, keyFn: keyFn}, nil
+}
+
+func (s *ProcessStorage) refAccess() (*refTarstreams, error) {
+	if s.ref != nil {
+		return s.ref, nil
+	}
+	return newRefTarstreams(s.cfg, s.keyFn)
+}
+
+func (s *ProcessStorage) readCodec(located bool) (tarstream.Codec, bool, error) {
+	if !located {
+		return s.localCodec, s.localRequired, nil
+	}
+	access, err := s.refAccess()
+	if err != nil {
+		return nil, false, err
+	}
+	codec, required := access.reader()
+	return codec, required, nil
+}
+
+func (r *refTarstreams) resolve() (tarstream.Codec, error) {
+	if r.policy == crypto.LocalOff {
+		return nil, nil
+	}
+	r.once.Do(func() {
+		if r.keyFn == nil {
+			r.err = fmt.Errorf("ref tarstream: customer key resolver required: %w", tarstream.ErrCodecRequired)
+			return
+		}
+		key, err := r.keyFn()
+		if err != nil {
+			r.err = readerr.Mark(fmt.Errorf("ref tarstream customer key: %w", err), false)
+			return
+		}
+		r.codec, r.err = crypto.NewTarStreamCodec(key)
+		clear(key[:])
+	})
+	return r.codec, r.err
+}
+
+func (r *refTarstreams) reader() (tarstream.Codec, bool) {
+	if r.policy == crypto.LocalOff {
+		return nil, false
+	}
+	return refReaderCodec{r}, r.policy == crypto.LocalRequired
+}
+
+// SourceAt/SourceFrom bind before asking for a keyed digest. Writers resolve
+// the real codec instead: CarrierDigest may need a digest without any bind.
+type refReaderCodec struct{ ref *refTarstreams }
+
+func (c refReaderCodec) BindArtifact(salt [32]byte) (tarstream.RecordCodec, error) {
+	codec, err := c.ref.resolve()
+	if err != nil {
+		return nil, err
+	}
+	return codec.BindArtifact(salt)
+}
+
+func (c refReaderCodec) KeyedDigest(plain [32]byte) [32]byte {
+	return c.ref.codec.KeyedDigest(plain)
+}
 
 func verificationOptions(cfg *config.ManifestConfig) fetch.Options {
 	return fetch.Options{VerifyContent: cfg == nil || cfg.Manifest.VerifyContent == nil || *cfg.Manifest.VerifyContent}
