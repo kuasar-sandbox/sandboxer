@@ -50,7 +50,7 @@ func runCmd(args []string) int {
 	retainInstance := fs.String("retain-instance", "", "parent object instance owning the current disks (requires --run-id and --enable-checkpoint)")
 	currentRunID := fs.String("run-id", "", "exact run identity for retained current disks")
 	configPath := fs.String("config", "", "sandbox.yaml path(s), ':'-separated, merged front-to-back (or SANDBOX_CONFIG env)")
-	manifestPath := fs.String("manifest-config", "", "path to storage config YAML (overrides MANIFEST_CONFIG env; required for manifest:// or crypto.local=auto|required)")
+	manifestPath := fs.String("manifest-config", "", "path to storage config YAML (overrides MANIFEST_CONFIG env; controls Manifest access and local/ref encryption policies)")
 	sandboxID := fs.String("sandbox-id", "", "sandbox id (overrides sandbox.yaml)")
 	pathID := fs.String("path-id", "", "run-root/base-root directory leaf (default: sandbox-id)")
 	chBinary := fs.String("ch-binary", "", "path to cloud-hypervisor binary (default: SANDBOX_CH_PATH env, exe-dir, or PATH)")

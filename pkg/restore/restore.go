@@ -57,6 +57,7 @@ import (
 // Disk refs in the referenced Sandbox E likewise support manifest:// when
 // Fetcher is set. Parent .sandbox refs are always narrowed to their Payload.
 type Options struct {
+	storage             *artifact.ProcessStorage
 	EnableCheckpoint    bool // persistent multi-version writable disks
 	CurrentRun          *artifact.CurrentRun
 	checkpointPlan      *sandbox.CheckpointDiskPlan
@@ -99,6 +100,20 @@ type Options struct {
 	checkpointReleaseSources func() error // temporary source pins; writers own the handoff
 }
 
+func (opts Options) borrowStorage() (*artifact.ProcessStorage, error) {
+	if opts.storage != nil {
+		return opts.storage.BorrowWithFetcher(opts.Fetcher), nil
+	}
+	return artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired, opts.Fetcher)
+}
+
+func (opts Options) openFile(ctx context.Context, path string, ref manifest.Ref) (*artifact.OpenedFile, error) {
+	if opts.storage != nil {
+		return opts.storage.BorrowWithFetcher(opts.Fetcher).OpenFileWithLocations(ctx, path, ref, opts.RefLocations)
+	}
+	return artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn, opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+}
+
 // Run executes restore. Returns the CH exit code.
 func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if opts.SnapshotPath == "" && opts.SnapshotManifestKey == "" {
@@ -122,6 +137,12 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err := opts.HostCfg.ValidateRestoreHostConfigWithPresence(opts.HostPresence); err != nil {
 		return -1, err
 	}
+	storage, err := opts.borrowStorage()
+	if err != nil {
+		return -1, err
+	}
+	defer storage.Close()
+	opts.storage, opts.CustomerKeyFn = storage, storage.CustomerKeyFunc()
 	var diffCustomerKey [32]byte
 	if opts.LocalCodec != nil {
 		var err error
@@ -511,7 +532,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		if !opts.EnableCheckpoint || opts.CurrentRun.SandboxID != opts.SandboxID {
 			return -1, errors.New("current disk retention requires checkpoint mode and matching sandbox identity")
 		}
-		storage, err := artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired, opts.Fetcher)
+		storage, err := opts.borrowStorage()
 		if err != nil {
 			return -1, err
 		}
@@ -938,8 +959,7 @@ func openLayeredDiskBase(ctx context.Context, refs []string, opener restoreDiskS
 // visible to a vhost block backend.
 func openEROFSBlockReader(ctx context.Context, raw string, opts Options) (diffstore.BlockReader, int64, error) {
 	opener := sandbox.FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
-		opened, err := artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
-			opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+		opened, err := opts.openFile(ctx, path, ref)
 		if err != nil {
 			return nil, err
 		}
@@ -954,8 +974,7 @@ func openEROFSBlockReader(ctx context.Context, raw string, opts Options) (diffst
 // runtime config is never adopted recursively.
 func openDiskRefStream(ctx context.Context, raw string, opts Options) (fetch.Stream, error) {
 	opener := sandbox.FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
-		opened, err := artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
-			opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+		opened, err := opts.openFile(ctx, path, ref)
 		if err != nil {
 			return nil, err
 		}
@@ -986,8 +1005,7 @@ func openMemorySnapshotRef(ctx context.Context, raw string, opts Options) (fetch
 		if err != nil {
 			return nil, err
 		}
-		opened, err := artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
-			opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+		opened, err := opts.openFile(ctx, path, ref)
 		if err != nil {
 			return nil, err
 		}
@@ -1185,8 +1203,7 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 		if err != nil {
 			return nil, err
 		}
-		opened, err := artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
-			opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+		opened, err := opts.openFile(ctx, path, ref)
 		if err != nil {
 			return nil, err
 		}
@@ -1535,8 +1552,7 @@ func openRootSnapshot(ctx context.Context, opts Options) (*openedRootSnapshot, e
 			}
 			ref = parsed
 		}
-		opened, err := artifact.OpenFileWithLocations(ctx, opts.SnapshotPath, ref, opts.ManifestCfg,
-			opts.CustomerKeyFn, opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
+		opened, err := opts.openFile(ctx, opts.SnapshotPath, ref)
 		if err != nil {
 			return nil, protectArtifactReadError(opts.LocalCodec, "open local snapshot", err)
 		}

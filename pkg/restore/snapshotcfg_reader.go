@@ -207,6 +207,7 @@ func (r *SnapshotCfgReader) openSnapshot(ctx context.Context, rootRef string, re
 
 func (r *SnapshotCfgReader) openOptions(rootRef string, readOpts SnapshotCfgReadOptions) (Options, error) {
 	opts := Options{
+		storage:       r.storage,
 		ManifestCfg:   r.manifestCfg,
 		Fetcher:       r.storage.Fetcher(),
 		CustomerKeyFn: r.storage.CustomerKeyFunc(),

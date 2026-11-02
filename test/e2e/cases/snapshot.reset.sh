@@ -113,7 +113,8 @@ check_data final C
 stop
 
 # Export the old named artifact through the standard path, then actually boot it.
-"$BIN/sandbox-ctl" publish --to-ref-location "history=file://$WORK/history" --json "file://$A" >"$OUT/export-A.json"
+printf 'crypto: {ref: off}\n' >"$WORK/plain-ref.yaml"
+"$BIN/sandbox-ctl" publish --manifest-config "$WORK/plain-ref.yaml" --to-ref-location "history=file://$WORK/history" --json "file://$A" >"$OUT/export-A.json"
 HIST="$(python3 - "$OUT/export-A.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1]))['sandboxRef'])

@@ -81,7 +81,11 @@ func publishArtifactCmd(command string, args []string) int {
 		}
 		manifestCfg = nil
 	}
-	storage, err := artifact.NewProcessStorage(manifestCfg)
+	keyConfig := manifestCfg
+	if keyConfig == nil {
+		keyConfig = &config.ManifestConfig{} // CLI-only MANIFEST_KEY binding for location publishing.
+	}
+	storage, err := artifact.NewProcessStorageWithCustomerKey(manifestCfg, keyConfig.CustomerKey)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1

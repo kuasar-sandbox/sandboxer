@@ -87,7 +87,7 @@ func (s *ProcessStorage) PinDiffCheckpoints(ctx context.Context, directory strin
 		}
 	}()
 	var key *[32]byte
-	if s.CustomerKeyFunc() != nil {
+	if s.LocalCodec() != nil {
 		k, err := s.CustomerKeyFunc()()
 		if err != nil {
 			return nil, err

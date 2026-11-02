@@ -617,7 +617,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		return err
 	}
 	if spec.Storage == nil {
-		var credentials ArtifactCredentials
+		credentials := ArtifactCredentials{Config: spec.ManifestConfig}
 		if spec.Credentials != nil {
 			credentials = *spec.Credentials
 		}
@@ -778,14 +778,14 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			parent = spec.SourceBinding.SandboxRef
 		}
 		storage := r.storage
-		if spec.legacyAccess != nil {
+		if spec.legacyAccess != nil && spec.legacyAccess.checkpointStorage != r.storage {
 			storage, err = artifact.NewProcessStorageWithLocalAccess(launchManifestConfig(spec), launchKey(spec), launchCodec(spec), launchRequired(spec), launchFetcher(spec))
 			if err != nil {
 				return fail(err)
 			}
 		}
 		err = RetainCurrentDiskPlan(ctx, storage, r.checkpointOwner, r.spec.CurrentRun, cfg, portable, parent, r.spec.checkpointPlan, capacities, spec.RefLocations, RunOptions{SourceBinding: spec.SourceBinding, BundleReader: spec.BundleReader, BundleFetcher: spec.BundleFetcher, Fetcher: launchFetcher(spec)})
-		if spec.legacyAccess != nil {
+		if storage != r.storage {
 			err = errors.Join(err, storage.Close())
 		}
 		if err != nil {
@@ -1050,6 +1050,10 @@ func openLaunchFile(ctx context.Context, s LaunchSpec, path string, ref manifest
 	// fields when the caller did not explicitly override access.
 	if storage := opaqueLaunchStorage(s); storage != nil {
 		return storage.OpenFileWithLocations(ctx, path, ref, locations)
+	}
+	if s.Storage != nil && launchManifestConfig(s) == s.Storage.ManifestConfig() &&
+		(s.legacyAccess == nil || s.legacyAccess.checkpointStorage == s.Storage) {
+		return s.Storage.BorrowWithFetcher(launchFetcher(s)).OpenFileWithLocations(ctx, path, ref, locations)
 	}
 	return artifact.OpenFileWithLocations(ctx, path, ref, launchManifestConfig(s), launchKey(s), launchFetcher(s), locations, launchCodec(s), launchRequired(s))
 }

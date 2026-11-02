@@ -16,7 +16,7 @@ func TestDirtyPublishAndRewrite(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			input := t.TempDir()
-			storage, err := NewProcessStorage(nil)
+			storage, err := NewProcessStorage(plaintextRefConfig())
 			if err != nil {
 				t.Fatal(err)
 			}

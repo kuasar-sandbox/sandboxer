@@ -25,7 +25,7 @@ var errBundleCheckpoint = errors.New("bundle contains local disk Checkpoint")
 func (p *Publisher) publishBundle(
 	ctx context.Context,
 	rootRef string,
-	scope publishScope,
+	scope, rootScope publishScope,
 	first *OpenedFile,
 ) (result PublishResult, retErr error) {
 	root, ok := first.RootManifestKey()
@@ -33,7 +33,7 @@ func (p *Publisher) publishBundle(
 		_ = first.Close()
 		return PublishResult{}, errors.New("publish Bundle: carrier has no root Manifest")
 	}
-	role, dependencies, sandboxRef, err := p.inspectBundleRoot(ctx, rootRef, scope, first, root)
+	role, dependencies, sandboxRef, err := p.inspectBundleRoot(ctx, rootRef, scope, rootScope, first, root)
 	if errors.Is(err, errBundleCheckpoint) {
 		return p.publishCheckpointBundle(ctx, rootRef, scope)
 	}
@@ -186,7 +186,7 @@ func selectExactBundleSources(
 func (p *Publisher) inspectBundleRoot(
 	ctx context.Context,
 	rootRef string,
-	scope publishScope,
+	scope, rootScope publishScope,
 	first *OpenedFile,
 	rootKey store.ContentKey,
 ) (role LogicalRole, dependencies []store.ContentKey, sandboxRef string, retErr error) {
@@ -195,7 +195,9 @@ func (p *Publisher) inspectBundleRoot(
 		if sandboxRoot.Checkpoint != nil {
 			return "", nil, "", errBundleCheckpoint
 		}
-		p.retainLocatedDisks(sandboxRoot.Portable)
+		if err := p.retainLocatedDisks(ctx, sandboxRoot.Portable, rootScope); err != nil {
+			return "", nil, "", err
+		}
 		dependencies, err := manifestDependenciesFromSandbox(sandboxRoot.Portable, rootKey)
 		return RoleSandbox, dependencies, "", err
 	} else if readretry.IsTerminal(err) || readerr.IsPermanent(err) {
@@ -223,8 +225,10 @@ func (p *Publisher) inspectBundleRoot(
 		return "", nil, "", errors.New("publish Bundle: snapshot.cfg is not canonically encoded")
 	}
 
-	for _, raw := range append(append([]string{}, cfg.FromRefs...), cfg.SandboxRef) {
-		p.retainLocated(raw)
+	for _, raw := range cfg.FromRefs {
+		if err := p.retainLocated(ctx, raw, childScope); err != nil {
+			return "", nil, "", err
+		}
 	}
 	seen := map[store.ContentKey]struct{}{rootKey: {}}
 	dependencies = make([]store.ContentKey, 0, len(cfg.FromRefs)+1)
@@ -235,7 +239,7 @@ func (p *Publisher) inspectBundleRoot(
 	}
 	// Inspect every selected E before the exact-copy shortcut, including a
 	// located file outside this Bundle. A Checkpoint must always materialize.
-	sandboxStream, _, err := p.open(ctx, cfg.SandboxRef, childScope)
+	sandboxStream, sandboxScope, err := p.open(ctx, cfg.SandboxRef, childScope)
 	if err != nil {
 		return "", nil, "", err
 	}
@@ -247,6 +251,12 @@ func (p *Publisher) inspectBundleRoot(
 	if sandboxRoot.Checkpoint != nil {
 		return "", nil, "", errBundleCheckpoint
 	}
+	if err := p.retainLocated(ctx, cfg.SandboxRef, childScope); err != nil {
+		return "", nil, "", err
+	}
+	if err := p.retainLocatedDisks(ctx, sandboxRoot.Portable, sandboxScope); err != nil {
+		return "", nil, "", err
+	}
 	if err := appendManifestDependency(cfg.SandboxRef, "snapshot sandbox_ref", seen, &dependencies); err != nil {
 		return "", nil, "", err
 	}
@@ -255,7 +265,6 @@ func (p *Publisher) inspectBundleRoot(
 		return "", nil, "", err
 	}
 	if parsedE.Scheme == manifest.RefSchemeManifest {
-		p.retainLocatedDisks(sandboxRoot.Portable)
 		for _, dependency := range portableDiskRefs(sandboxRoot.Portable) {
 			if err := appendManifestDependency(dependency.raw, "Sandbox disk dependency", seen, &dependencies); err != nil {
 				return "", nil, "", err
@@ -307,17 +316,46 @@ func bundleMemberRef(carrier string, key store.ContentKey) string {
 	ref.DigestScheme, ref.Digest = "manifest", manifest.HexKey(key)
 	return ref.String()
 }
-func (p *Publisher) retainLocated(raw string) {
-	ref, err := manifest.ParseRef(raw)
-	if err == nil && ref.Scheme == manifest.RefSchemeFile && ref.Location != "" {
-		p.original(raw, publishScope{})
-		p.retained(raw, publishScope{})
+
+// A located payload is opened through the same identity-checked reader as
+// restore. Logical parents are opaque here. Ordinary Manifest refs keep their
+// existing source selection and need no extra fetch for tarstream policy.
+func (p *Publisher) checkLocated(ctx context.Context, ref manifest.Ref, scope publishScope) error {
+	if ref.Scheme != manifest.RefSchemeFile || ref.Location == "" {
+		return nil
 	}
+	raw := ref.String()
+	if _, seen := p.checkedLocated[scopeKey(scope, raw)]; seen {
+		return nil
+	}
+	stream, _, err := p.open(ctx, raw, scope)
+	if err != nil {
+		return err
+	}
+	return stream.Close()
 }
-func (p *Publisher) retainLocatedDisks(cfg *config.PortableSandboxConfig) {
-	for _, dep := range portableDiskRefs(cfg) {
-		p.retainLocated(dep.raw)
+
+func (p *Publisher) retainLocated(ctx context.Context, raw string, scope publishScope) error {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return err
 	}
+	if ref.Scheme == manifest.RefSchemeFile && ref.Location != "" {
+		if err := p.checkLocated(ctx, ref, scope); err != nil {
+			return err
+		}
+		p.original(raw, scope)
+		p.retained(raw, scope)
+	}
+	return nil
+}
+func (p *Publisher) retainLocatedDisks(ctx context.Context, cfg *config.PortableSandboxConfig, scope publishScope) error {
+	for _, dep := range portableDiskRefs(cfg) {
+		if err := p.retainLocated(ctx, dep.raw, scope); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // A relative Bundle source inherits the current carrier's already-known named

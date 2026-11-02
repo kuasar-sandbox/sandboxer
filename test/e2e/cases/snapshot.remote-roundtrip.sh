@@ -176,7 +176,7 @@ fi
 LOCATED_REF=$("$BIN/sandbox-ctl" publish --quiet --manifest-config "$WORK/manifest.yaml" \
     --to-ref-location "$LOCATION_NAME=file://$PORTABLE_LOCATION" "$PORTABLE_SNAPSHOT")
 case "$LOCATED_REF" in
-    file://*.snapshot@digest:*@location:"$LOCATION_NAME") ;;
+    file://*.snapshot@hmac:*@location:"$LOCATION_NAME") ;;
     *) e2e_fail "non-canonical located snapshot ref: $LOCATED_REF" ;;
 esac
 if find "$PORTABLE_LOCATION" -maxdepth 1 -type f -name '*.overlay' -print -quit | grep -q .; then

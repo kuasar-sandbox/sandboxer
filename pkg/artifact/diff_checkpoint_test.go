@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
@@ -30,6 +31,10 @@ type diffCheckpointFixture struct {
 }
 
 func newDiffCheckpointFixture(t *testing.T, parent ...string) *diffCheckpointFixture {
+	return newDiffCheckpointFixtureWithKey(t, nil, parent...)
+}
+
+func newDiffCheckpointFixtureWithKey(t *testing.T, key *[32]byte, parent ...string) *diffCheckpointFixture {
 	t.Helper()
 	ctx := context.Background()
 	f := &diffCheckpointFixture{dir: t.TempDir()}
@@ -55,7 +60,7 @@ func newDiffCheckpointFixture(t *testing.T, parent ...string) *diffCheckpointFix
 	f.cp = &sandboxfile.Checkpoint{Version: 1, CheckpointID: "cp-001", Root: sandboxfile.CheckpointDisk{DiffID: "root-1"}, Disks: []sandboxfile.CheckpointNamedDisk{{Name: "data-a", DiffID: "data-1"}, {Name: "data-b", DiffID: "data-2"}}}
 	roots := []config.PortableRootConfig{f.cfg.Boot.Root, f.cfg.Boot.Disks[0].PortableRootConfig, f.cfg.Boot.Disks[1].PortableRootConfig}
 	for i, id := range []string{"root-1", "data-1", "data-2"} {
-		store, err := diffstore.Create(filepath.Join(f.dir, "diffs", id+".diff"), diffstore.Options{DiffID: id, BaseID: DiffCheckpointBaseID(roots[i]), LogicalSize: 8192})
+		store, err := diffstore.Create(filepath.Join(f.dir, "diffs", id+".diff"), diffstore.Options{DiffID: id, BaseID: DiffCheckpointBaseID(roots[i]), LogicalSize: 8192, Key: key})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -75,7 +80,14 @@ func newDiffCheckpointFixture(t *testing.T, parent ...string) *diffCheckpointFix
 	if err != nil {
 		t.Fatal(err)
 	}
-	sink := snapshot.NewFileSink(f.dir, "fixture", nil, false, nil)
+	var codec tarstream.Codec
+	if key != nil {
+		codec, err = manifestcrypto.NewTarStreamCodec(*key)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	sink := snapshot.NewFileSink(f.dir, "fixture", codec, key != nil, nil)
 	f.ref, f.path, err = sink.AbsorbSandbox(ctx, source)
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +101,7 @@ func newDiffCheckpointFixture(t *testing.T, parent ...string) *diffCheckpointFix
 func TestPublishCheckpointPreservesVersionsAndCleansExactSources(t *testing.T) {
 	ctx := context.Background()
 	f := newDiffCheckpointFixture(t)
-	storage, _ := NewProcessStorage(nil)
+	storage, _ := NewProcessStorage(plaintextRefConfig())
 	defer storage.Close()
 	before, err := os.ReadFile(f.path)
 	if err != nil {
@@ -244,7 +256,7 @@ func TestPinnedCheckpointReopenAndMaterializeAfterDelete(t *testing.T) {
 func TestCheckpointRewriteReduceMaterializes(t *testing.T) {
 	ctx := context.Background()
 	f := newDiffCheckpointFixture(t)
-	storage, _ := NewProcessStorage(nil)
+	storage, _ := NewProcessStorage(plaintextRefConfig())
 	defer storage.Close()
 	out := t.TempDir()
 	p, err := NewLocationPublisher(storage, "published", out, nil, nil)
@@ -291,7 +303,7 @@ func TestCheckpointReplacementUsesOriginalImmutableSelector(t *testing.T) {
 	}
 	replacement, _ := manifest.ParseRef(lower)
 	replacement.Location = "shared"
-	storage, _ := NewProcessStorage(nil)
+	storage, _ := NewProcessStorage(plaintextRefConfig())
 	defer storage.Close()
 	out := t.TempDir()
 	p, err := NewLocationPublisher(storage, "published", out, config.RefLocations{"shared": lowerDir}, nil)

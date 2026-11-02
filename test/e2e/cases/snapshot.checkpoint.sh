@@ -12,6 +12,7 @@ source "$E2E_LIB/sandboxer/tarstream.sh"
 : "${E2E_IMAGE:?E2E_IMAGE is required}"
 require_root
 require_kvm
+unset MANIFEST_KEY MANIFEST_CONFIG
 for command in cmp docker mkfs.ext4 python3 readlink sha256sum timeout truncate; do
     require_command "$command"
 done
@@ -345,12 +346,20 @@ finish_capture
 S_B="$(capture_path snapshot-b snapshot "$CP_DIR")"
 E_B="$(capture_path snapshot-b sandbox "$CP_DIR")"
 assert_checkpoint "$E_B" snapshot-b
+python3 - "$WORK" <<'PY'
+import pathlib, secrets, sys
+key = secrets.token_hex(32)
+for ref in ('required', 'auto'):
+    path = pathlib.Path(sys.argv[1], f'ref-{ref}.yaml')
+    path.write_text(f'manifest: {{key: "{key}"}}\ncrypto: {{chunk: aes, manifest: aes, local: off, ref: {ref}}}\n')
+    path.chmod(0o600)
+PY
 sha256sum "$E_A" "$E_B" "$S_B" >"$OUT/source-artifacts.hashes"
 disk_inodes >"$OUT/before-resume.inodes"
 [ "$(wc -l <"$OUT/before-resume.inodes")" -eq 3 ] || e2e_fail "expected exactly three DIFF files"
 
 # A standalone publisher may pin first, then the owner resumes the latest version.
-"$BIN/sandbox-ctl" publish --json --to-ref-location "portable=file://$WORK/published-b" "$S_B" >"$OUT/published-b.json" 2>"$OUT/published-b.log" &
+"$BIN/sandbox-ctl" publish --json --manifest-config "$WORK/ref-required.yaml" --to-ref-location "portable=file://$WORK/published-b" "$S_B" >"$OUT/published-b.json" 2>"$OUT/published-b.log" &
 PUB_B=$!
 PUBLISH_PIDS+=("$PUB_B")
 start resumed "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_B" --enable-checkpoint
@@ -368,7 +377,7 @@ fi
 
 # Reverse order: owner is live before publication pins; guest overwrites proceed.
 # Successful publish routes exact deletion back through the live owner's gate.
-"$BIN/sandbox-ctl" publish --json --delete-checkpoint \
+"$BIN/sandbox-ctl" publish --json --delete-checkpoint --manifest-config "$WORK/ref-required.yaml" \
     --to-ref-location "portable=file://$WORK/published-a" "$E_A" >"$OUT/published-a.json" 2>"$OUT/published-a.log" &
 PUB_A=$!
 PUBLISH_PIDS+=("$PUB_A")
@@ -376,6 +385,30 @@ guest /bin/sh -c 'set -e; for f in /checkpoint-payload /scratch/checkpoint-paylo
 wait "$PUB_B"
 wait "$PUB_A"
 PUBLISH_PIDS=()
+# Reuse the still-live snapshot-b checkpoint for a fresh auto-mode destination.
+"$BIN/sandbox-ctl" publish --json --manifest-config "$WORK/ref-auto.yaml" \
+    --to-ref-location "portable=file://$WORK/published-auto" "$S_B" >"$OUT/published-auto.json"
+for kind in a b auto; do
+    python3 - "$OUT/published-$kind.json" "$WORK/published-$kind" <<'PY'
+import json, pathlib, re, sys
+report = json.load(open(sys.argv[1]))
+directory = pathlib.Path(sys.argv[2])
+for raw in (report.get('sandboxRef'), report.get('snapshotRef')):
+    if raw:
+        match = re.fullmatch(r'file://([0-9a-f]{64})\.(sandbox|snapshot)@hmac:([0-9a-f]{64})@location:portable', raw)
+        assert match and match[1] == match[3], raw
+        assert (directory / (match[1] + '.' + match[2])).is_file()
+files = list(directory.iterdir())
+assert files, directory
+for path in files:
+    with path.open('rb') as f:
+        assert f.read(8) == b'\x89KTSENC\n', path
+print(directory.name, 'encrypted tarstreams:', len(files))
+PY
+done
+AUTO_REF="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshotRef"])' "$OUT/published-auto.json")"
+"$BIN/sandbox-ctl" info --json --manifest-config "$WORK/ref-auto.yaml" \
+    --ref-location "portable=file://$WORK/published-auto" "$AUTO_REF" >"$OUT/auto.info.json"
 assert_no_restore_pins "$CP_DIR"
 assert_list "$PATH_ID" snapshot-b
 # Retry the original exact set after publication has already tombstoned it.
@@ -464,6 +497,7 @@ PY
 )
     if [ "$kind" = a ]; then MODE=--from; else MODE=--restore; fi
     start "portable-$kind" "portable-$kind" --config "$WORK/restore.yaml" "$MODE" "$REF" \
+        --enable-checkpoint --manifest-config "$WORK/ref-required.yaml" \
         --ref-location "portable=file://$WORK/published-$kind" --stats-json "$OUT/portable-$kind.stats.json"
     check_hashes "portable-$kind"
     guest /bin/sh -ec 'for file in /cow-marker /scratch/cow-marker /data/cow-marker; do
@@ -475,8 +509,15 @@ PY
     done' sh "portable-$kind"
     stop_run
     # Each writable backend reports the same shared sandbox cache.
-    python3 - "$OUT/portable-$kind.stats.json" "$MODE" <<'PY'
-import json, sys
+    python3 - "$OUT/portable-$kind.stats.json" "$MODE" "$BASE_ROOT/portable-$kind/checkpoint/diffs" <<'PY'
+import json, pathlib, struct, sys
+disks = list(pathlib.Path(sys.argv[3]).glob('*.diff'))
+assert len(disks) == 3, disks
+for path in disks:
+    with path.open('rb') as f:
+        magic, version, prefix, flag = struct.unpack('>8sHHI', f.read(16))
+    assert (magic, version, prefix, flag) == (b'\x89KDXTS1\n', 4, 16, 0), (path, magic, version, prefix, flag)
+    print(sys.argv[2], path.name, 'local DIFF version', version, 'encryption flag', flag)
 with open(sys.argv[1]) as stream:
     backends = json.load(stream)['backends']
 writable = [b for b in backends if 'diff_cow_cache' in b.get('extra', {})]
@@ -574,7 +615,9 @@ PY
     capture snapshot "pins-after-delete-$policy"
     finish_capture
     PIN_S="$(capture_path "pins-after-delete-$policy" snapshot "$CP_DIR")"
-    "$BIN/sandbox-ctl" publish --json "${CRYPTO_ARGS[@]}" \
+    PUBLISH_ARGS=("${CRYPTO_ARGS[@]}")
+    if [ "$policy" = plain ]; then PUBLISH_ARGS=(--manifest-config "$WORK/ref-required.yaml"); fi
+    "$BIN/sandbox-ctl" publish --json "${PUBLISH_ARGS[@]}" \
         --to-ref-location "portable=file://$WORK/pins-published-$policy" "$PIN_S" >"$OUT/pins-published-$policy.json"
     PIN_REF="$(python3 - "$OUT/pins-published-$policy.json" <<'PY'
 import json, sys
@@ -582,7 +625,7 @@ print(json.load(open(sys.argv[1]))['snapshotRef'])
 PY
 )"
     start "pins-portable-$policy" "pins-portable-$policy" --config "$WORK/restore.yaml" --restore "$PIN_REF" \
-        --ref-location "portable=file://$WORK/pins-published-$policy" "${CRYPTO_ARGS[@]}"
+        --ref-location "portable=file://$WORK/pins-published-$policy" "${PUBLISH_ARGS[@]}"
     guest /bin/sh -c 'for f in /handoff /scratch/handoff /data/handoff; do grep -qx after-delete "$f" || exit 1; done'
     stop_run
     # Metadata-only reclamation of encrypted DIFFs needs no key/config.

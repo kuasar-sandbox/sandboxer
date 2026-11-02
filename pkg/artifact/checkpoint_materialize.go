@@ -183,6 +183,9 @@ func (p *Publisher) keepPortable(ctx context.Context, raw string, scope publishS
 	if p.transientLocations[ref.Location] {
 		return "", false, nil
 	}
+	if err := p.checkLocated(ctx, ref, scope); err != nil {
+		return "", false, err
+	}
 	if ref.Scheme == manifest.RefSchemeManifest {
 		if local, ok := scope.fetcher.(*manifestbundle.ManifestFetcher); ok {
 			key, err := manifest.ParseKeyRef(ref.Path)

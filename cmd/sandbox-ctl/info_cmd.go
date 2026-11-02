@@ -22,7 +22,7 @@ import (
 func infoCmd(args []string) int {
 	fs := flag.NewFlagSet("info", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "machine-readable JSON output")
-	manifestPath := fs.String("manifest-config", "", "storage config YAML (overrides MANIFEST_CONFIG env); required for manifest:// or crypto.local=auto|required")
+	manifestPath := fs.String("manifest-config", "", "storage config YAML (overrides MANIFEST_CONFIG env); controls Manifest access and local/ref encryption policies")
 	refLocations := config.RefLocations{}
 	fs.Var(refLocations, "ref-location", "trusted ref location name=file:///absolute/path (repeatable)")
 	if err := fs.Parse(args); err != nil {

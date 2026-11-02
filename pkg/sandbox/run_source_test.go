@@ -115,6 +115,59 @@ func TestOpenRunSourceEncryptedTarstream(t *testing.T) {
 	}
 }
 
+func TestNamedRunSourceAndLaunchUseRefPolicy(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{ local, ref manifestcrypto.LocalPolicy }{
+		{manifestcrypto.LocalOff, manifestcrypto.LocalRequired},
+		{manifestcrypto.LocalRequired, manifestcrypto.LocalOff},
+	} {
+		t.Run(string(tc.local)+"-"+string(tc.ref), func(t *testing.T) {
+			key := [32]byte{0x45}
+			cfg := runFromManifestConfig(key, "")
+			cfg.Crypto.Local, cfg.Crypto.Ref = tc.local, tc.ref
+			calls := 0
+			storage, err := artifact.NewProcessStorageWithCustomerKey(cfg, func() ([32]byte, error) {
+				calls++
+				return key, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer storage.Close()
+			dir := t.TempDir()
+			locations := config.RefLocations{"published": dir}
+			pub, err := artifact.NewLocationPublisher(storage, "published", dir, locations, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pub.Close()
+			root, err := pub.PublishSource(ctx, artifact.RoleSandbox, runFromLogical(t, runFromDirectPortable(t)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			source, err := OpenRunSource(ctx, root.Ref, storage.Borrow(), locations)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer source.Close()
+			if source.root.Portable.Boot.Root.Base != "self" {
+				t.Fatal("unexpected Sandbox root")
+			}
+			ref, err := manifest.ParseRef(root.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			file, err := openLaunchFile(ctx, LaunchSpec{Storage: storage, ManifestConfig: cfg}, filepath.Join(dir, ref.Path), ref, locations)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil || calls != 1 {
+				t.Fatalf("key calls=%d, close=%v", calls, err)
+			}
+		})
+	}
+}
+
 func TestOpenRunSourceManifestBundleDefaultAndExplicitRoot(t *testing.T) {
 	ctx := context.Background()
 	key := [32]byte{0x41, 0x42, 0x43}

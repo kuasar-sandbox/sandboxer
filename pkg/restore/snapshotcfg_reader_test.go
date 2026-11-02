@@ -3,11 +3,15 @@ package restore
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
@@ -15,6 +19,32 @@ import (
 )
 
 func TestSnapshotCfgReaderDerivesCompatibilityProjectionFromSandbox(t *testing.T) {
+	testSnapshotCfgProjection(t, nil, nil, false)
+}
+
+func TestSnapshotCfgReaderSelectsNamedSnapshotAndSandbox(t *testing.T) {
+	key := [32]byte{0x2d}
+	codec, err := crypto.NewTarStreamCodec(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		local, ref crypto.LocalPolicy
+		carrier    tarstream.Codec
+	}{
+		{crypto.LocalOff, crypto.LocalRequired, codec},
+		{crypto.LocalRequired, crypto.LocalOff, nil},
+	} {
+		t.Run(string(tc.local)+"-"+string(tc.ref), func(t *testing.T) {
+			cfg := &config.ManifestConfig{Crypto: crypto.Config{Local: tc.local, Ref: tc.ref}}
+			cfg.Manifest.Key = hex.EncodeToString(key[:])
+			testSnapshotCfgProjection(t, cfg, tc.carrier, true)
+		})
+	}
+}
+
+func testSnapshotCfgProjection(t *testing.T, manifestCfg *config.ManifestConfig, codec tarstream.Codec, named bool) {
+	t.Helper()
 	const (
 		sha    = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 		shaAlt = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
@@ -52,13 +82,27 @@ func TestSnapshotCfgReaderDerivesCompatibilityProjectionFromSandbox(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	eSink := snapshot.NewFileSink(dir, "reader-e", nil, false, nil)
+	eSink := snapshot.NewFileSink(dir, "reader-e", codec, codec != nil, nil)
+	defer eSink.Close()
 	eRef, ePath, err := eSink.AbsorbSandbox(ctx, eLogical)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := eSink.CommitSandbox(ctx, eRef, ePath); err != nil {
 		t.Fatal(err)
+	}
+	locate := func(raw string) string {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref.Path, ref.Location = filepath.Base(ref.Path), "refs"
+		return ref.String()
+	}
+	opts := SnapshotCfgReadOptions{RelativeDir: dir}
+	if named {
+		eRef = locate(eRef)
+		opts.RefLocations = config.RefLocations{"refs": dir}
 	}
 
 	memoryParent := "manifest://" + strings.Repeat("c", 64)
@@ -75,17 +119,23 @@ func TestSnapshotCfgReaderDerivesCompatibilityProjectionFromSandbox(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	sSink := snapshot.NewFileSink(dir, "reader-s", nil, false, nil)
-	_, sPath, err := sSink.AbsorbSnapshot(ctx, sLogical)
+	sSink := snapshot.NewFileSink(dir, "reader-s", codec, codec != nil, nil)
+	defer sSink.Close()
+	sRef, sPath, err := sSink.AbsorbSnapshot(ctx, sLogical)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	reader, err := NewSnapshotCfgReader(nil)
+	reader, err := NewSnapshotCfgReader(manifestCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	document, err := reader.Read(ctx, sPath, SnapshotCfgReadOptions{RelativeDir: dir})
+	input, rawInput := sPath, "file://"+filepath.Base(sPath)
+	if named {
+		input = locate(sRef)
+		rawInput = input
+	}
+	document, err := reader.Read(ctx, input, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +163,7 @@ func TestSnapshotCfgReaderDerivesCompatibilityProjectionFromSandbox(t *testing.T
 	if got := strings.Join(cfg.ArtifactRefs(), ","); got != wantArtifacts {
 		t.Fatalf("ArtifactRefs = %q, want %q", got, wantArtifacts)
 	}
-	raw, err := reader.ReadRaw(ctx, "file://"+filepath.Base(sPath), SnapshotCfgReadOptions{RelativeDir: dir})
+	raw, err := reader.ReadRaw(ctx, rawInput, opts)
 	if err != nil {
 		t.Fatal(err)
 	}

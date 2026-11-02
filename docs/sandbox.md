@@ -429,8 +429,9 @@ already assembled Snapshot, the caller supplies its known final E:
 result, err := publisher.PublishSource(ctx, artifact.RoleSnapshot, source, cfg.SandboxRef)
 ```
 
-This creation path owns no original root, so its removals are empty. It does not
-rescan the assembled source and leaves source ownership with the caller.
+This creation path owns no original root, so its removals are empty. It reads the
+selected configuration to check retained named-location dependencies. The caller
+keeps ownership of the assembled source.
 
 ```bash
 sandbox-ctl publish --json --quiet --to-ref-location release=file:///srv/sandbox-artifacts ./s1.snapshot
@@ -2316,15 +2317,31 @@ OpenFlattenedImage
 
 <a id="artifact-publication"></a>
 
-### 6.5 Local tarstream and crypto
+### 6.5 Local and named-location tarstream encryption
 
-Local immutable artifacts support `crypto.local=off|auto|required`:
+The two policies use the same customer key and have independent defaults.
 
-- `off`: plaintext tarstream, with `digest` identity.
-- `auto`: recognize plaintext or KDXTS-encrypted tarstreams; configured codec governs new output.
-- `required`: reject plaintext and identities not bound to the key; use `hmac` identity.
+```yaml
+crypto:
+  local: off
+  ref: required
+```
 
-The omitted policy defaults to `off`. With `auto` or `required`, storage construction resolves the customer key even for a file-only operation. No Manifest config means no local codec or lazy Manifest client; file-only operation does not by itself imply that configured crypto can omit its key. See [storage.go](../pkg/artifact/storage.go).
+`crypto.local` controls local working files, active DIFFs, checkpoints and local materialization. The default, `off`, reads and writes plaintext. `auto` reads plaintext or authenticated ciphertext and encrypts new local output. `required` also rejects plaintext local inputs. Private checkpoint materialization files stay in the local domain until published.
+
+`crypto.ref` controls tarstreams read from or written to named ref locations, including retained disk and memory dependencies. Its default is `auto` regardless of `local`.
+
+| `crypto.ref` | Read or retain plaintext | Read or retain ciphertext with the correct key | New tarstream |
+| --- | --- | --- | --- |
+| `off` | Allow | Reject | Plaintext, `@digest` |
+| `auto` | Allow | Allow | Encrypted, `@hmac` |
+| `required` | Reject | Allow | Encrypted, `@hmac` |
+
+With the example above, a VM can capture a plaintext local checkpoint, publish encrypted E/S tarstreams, restore them with the same key, and write new plaintext local DIFFs. Without a config file, `sandbox-ctl publish --to-ref-location` uses `ref: auto` and requires a valid `MANIFEST_KEY`. A missing or incorrect key, authentication failure or identity mismatch fails the operation. SDK callers supply their own resolver through `NewProcessStorageWithCustomerKey`.
+
+On upgrade, existing `local: off` installations need a key for new named-location publications. To keep the old publication policy, explicitly copy the former `local` value to `ref`. In particular, set `ref: required` to preserve rejection of plaintext dependencies after upgrading from `local: required`. Enable this field with a sandboxer version that implements it. Older loaders may accept the YAML and ignore the field.
+
+Auto mode may retain portable plaintext dependencies. It does not migrate the historical graph. When retaining a named tarstream, the publisher checks the selected physical carrier, envelope and expected identity without reading every disk or memory byte. New or colliding targets still undergo complete stream verification. Manifest and Bundle keep their existing encoding, authentication and exact-copy rules. External tarstreams actually selected by a Bundle follow `crypto.ref`.
 
 Reusing an existing file requires revalidation of its role, logical size, content identity, and complete stream. Local output and named ref-location commit strategies are deliberately separate. Artifact capture/publication defines logical completion, not stable-storage durability. Local output relies on complete writes, checked `Close()`, content-addressed no-replace rename, and atomic alias rename. Named locations rely on exclusive creation, checked `Close()`, final-path reopening/full verification, and path-identity checks. Neither artifact-publication path explicitly flushes files/directories; physical writeback depends on the filesystem/storage implementation. This differs from the fsynced run-directory C0 write in §3.6.
 

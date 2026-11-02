@@ -19,7 +19,7 @@ import (
 )
 
 func TestPublishCheckpointCleanupFailureReturns79WithUsableJSONArtifact(t *testing.T) {
-	t.Setenv(config.ManifestConfigEnv, "")
+	usePlaintextRefConfig(t)
 	ctx := context.Background()
 	directory, output := t.TempDir(), t.TempDir()
 	owner, err := diffstore.LockDirectory(directory)

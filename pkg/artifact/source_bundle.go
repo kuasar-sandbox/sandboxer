@@ -81,15 +81,20 @@ func NewSingleRootBundlePublisher(
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	storage, err := newProcessStorage(cfg, keyFn)
+	if err != nil {
+		return nil, err
+	}
 	target := &singleRootBundleTarget{
-		cfg: cfg, keyFn: keyFn, admission: admission,
+		cfg: cfg, keyFn: storage.CustomerKeyFunc(), admission: admission, storage: storage,
 		location: location, directory: filepath.Clean(directory), logf: logf,
 		retry: defaultLocationRetryPolicy, fs: osLocationFileSystem{},
 	}
-	return &Publisher{target: target, logf: logf}, nil
+	return newPublisher(nil, config.RefLocations{location: target.directory}, target, logf), nil
 }
 
 type singleRootBundleTarget struct {
+	storage   *ProcessStorage
 	cfg       *config.ManifestConfig
 	keyFn     ingest.CustomerKeyFunc
 	admission store.WriteAdmission
@@ -314,4 +319,4 @@ func (t *singleRootBundleTarget) reuseFinal(
 	}
 }
 
-func (*singleRootBundleTarget) Close() error { return nil }
+func (t *singleRootBundleTarget) Close() error { return t.storage.Close() }
