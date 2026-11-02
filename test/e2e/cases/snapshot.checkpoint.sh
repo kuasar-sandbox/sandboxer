@@ -68,7 +68,10 @@ mounts:
 launch: { exec: /bin/sleep, args: ["3600"], restart: never }
 EOF
 cat >"$WORK/restore.yaml" <<EOF
-resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
+resources:
+  capacity: { cpu: 1, memory: 512MiB }
+  allocatable: { cpu: 1, memory: 512MiB }
+  diff_cow: { cache_size: 64MiB }
 boot:
   kernel: file://$BIN/vmlinux
   runtime: file://$BIN/sandbox-runtime.bundle
@@ -461,9 +464,30 @@ PY
 )
     if [ "$kind" = a ]; then MODE=--from; else MODE=--restore; fi
     start "portable-$kind" "portable-$kind" --config "$WORK/restore.yaml" "$MODE" "$REF" \
-        --ref-location "portable=file://$WORK/published-$kind"
+        --ref-location "portable=file://$WORK/published-$kind" --stats-json "$OUT/portable-$kind.stats.json"
     check_hashes "portable-$kind"
+    guest /bin/sh -ec 'for file in /cow-marker /scratch/cow-marker /data/cow-marker; do
+        echo "$1" >"$file"
+    done
+    sync
+    for file in /cow-marker /scratch/cow-marker /data/cow-marker; do
+        test "$(cat "$file")" = "$1"
+    done' sh "portable-$kind"
     stop_run
+    # Each writable backend reports the same shared sandbox cache.
+    python3 - "$OUT/portable-$kind.stats.json" "$MODE" <<'PY'
+import json, sys
+with open(sys.argv[1]) as stream:
+    backends = json.load(stream)['backends']
+writable = [b for b in backends if 'diff_cow_cache' in b.get('extra', {})]
+assert len(writable) == len({b['name'] for b in writable}) == 3, backends
+for b in writable:
+    cache = b['extra']['diff_cow_cache']
+    assert (cache['Capacity'], cache['MaxDirty']) == (67108864, 33554432), (b['name'], cache)
+    assert b['write']['count'] > 0, b
+    print(sys.argv[2], b['name'], 'Capacity', cache['Capacity'], 'MaxDirty', cache['MaxDirty'],
+          'writes', b['write']['count'])
+PY
 done
 mv "$BASE_ROOT/source-hidden" "$BASE_ROOT/$PATH_ID"
 mv "$WORK/root.img.hidden" "$WORK/root.img"
