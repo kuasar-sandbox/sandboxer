@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/buildversion"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
@@ -157,6 +158,7 @@ func run() error {
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{"logical_bytes": full.Size(), "sha256": hex.EncodeToString(hash.Sum(nil)), "layers": stats, "identity_deduplicated_local_bytes": reachable, "complete_comparison": "equal"})
 }
 func main() {
+	buildversion.ExitIfRequested()
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

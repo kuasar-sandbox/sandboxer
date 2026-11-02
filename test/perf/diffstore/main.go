@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/internal/buildversion"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"golang.org/x/sys/unix"
 )
@@ -54,6 +55,7 @@ func emit(enc *json.Encoder, value sample) error {
 }
 
 func main() {
+	buildversion.ExitIfRequested()
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

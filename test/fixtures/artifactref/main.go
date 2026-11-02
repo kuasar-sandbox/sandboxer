@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/buildversion"
 )
 
 var hexDigest = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -56,6 +57,7 @@ func run(args []string, output io.Writer) error {
 }
 
 func main() {
+	buildversion.ExitIfRequested()
 	if err := run(os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

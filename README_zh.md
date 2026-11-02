@@ -35,6 +35,9 @@ Snapshot 复用由显式 parent/child 引用表示。从同一 template 创建�
 
 `sandbox-init` 在本仓构建,再由 [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime) 打包进 `sandbox-runtime.bundle`。
 
+
+使用 `sandbox-ctl --version` 或 `sandbox-init --version` 可查询二进制身份，无需 Go、Git 或 PID 1。平铺 JSON 字段和辅助工具覆盖范围见[版本查询说明](docs/version.md)。
+
 ## 公开集成 package
 
 | Package | 用途 |

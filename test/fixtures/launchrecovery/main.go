@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/buildversion"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
@@ -117,6 +118,7 @@ func pong(args []string) error {
 	return json.NewEncoder(os.Stdout).Encode(reply.InitialLaunchState)
 }
 func main() {
+	buildversion.ExitIfRequested()
 	var err error
 	if len(os.Args) > 1 && os.Args[1] == "guest" {
 		err = guest()

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/internal/buildversion"
 )
 
 func fail(err error) {
@@ -31,6 +33,7 @@ func number(s string) int {
 	return n
 }
 func main() {
+	buildversion.ExitIfRequested()
 	if len(os.Args) < 2 {
 		panic("usageprobe MODE [ARGS]")
 	}
