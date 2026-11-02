@@ -2337,7 +2337,7 @@ crypto:
 | `auto` | Allow | Allow | Encrypted, `@hmac` |
 | `required` | Reject | Allow | Encrypted, `@hmac` |
 
-With the example above, a VM can capture a plaintext local checkpoint, publish encrypted E/S tarstreams, restore them with the same key, and write new plaintext local DIFFs. Without a config file, `sandbox-ctl publish --to-ref-location` uses `ref: auto` and requires a valid `MANIFEST_KEY`. A missing or incorrect key, authentication failure or identity mismatch fails the operation. SDK callers supply their own resolver through `NewProcessStorageWithCustomerKey`.
+With the example above, a VM can capture a plaintext local checkpoint, publish encrypted E/S tarstreams, restore them with the same key, and write new plaintext local DIFFs. Without a config file, `sandbox-ctl publish --to-ref-location` uses `ref: auto` and requires a valid `MANIFEST_KEY`. Supply the same key to config-free `info` and `run --from` or `run --restore` when opening the named ref. A missing or incorrect key, authentication failure or identity mismatch fails the operation. SDK callers supply their own resolver through `NewProcessStorageWithCustomerKey`.
 
 On upgrade, existing `local: off` installations need a key for new named-location publications. To keep the old publication policy, explicitly copy the former `local` value to `ref`. In particular, set `ref: required` to preserve rejection of plaintext dependencies after upgrading from `local: required`. Enable this field with a sandboxer version that implements it. Older loaders may accept the YAML and ignore the field.
 

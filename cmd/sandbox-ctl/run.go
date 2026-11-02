@@ -311,7 +311,7 @@ func runCmd(args []string) int {
 		}
 		manifestCfg = nil
 	}
-	processStorage, err := artifact.NewProcessStorage(manifestCfg)
+	processStorage, err := newCLIStorage(manifestCfg)
 	if err != nil {
 		fmt.Fprintf(diagnostics, "[sandbox-ctl] local crypto: %v\n", err)
 		return 1

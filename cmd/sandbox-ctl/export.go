@@ -228,7 +228,7 @@ func assembleSandboxEExport(raw, configPaths, sandboxID, outDir string, upload b
 		}
 		manifestCfg = nil
 	}
-	storage, err := artifact.NewProcessStorage(manifestCfg)
+	storage, err := newCLIStorage(manifestCfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: local crypto: %v\n", err)
 		return 1

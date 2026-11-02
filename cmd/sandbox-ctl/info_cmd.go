@@ -8,7 +8,6 @@ import (
 	"os"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
-	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
@@ -44,7 +43,7 @@ func infoCmd(args []string) int {
 		}
 		manifestCfg = nil
 	}
-	storage, err := artifact.NewProcessStorage(manifestCfg)
+	storage, err := newCLIStorage(manifestCfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -63,7 +62,7 @@ func infoCmd(args []string) int {
 			// on-disk model atomically. The projection is derived from strict S
 			// and its referenced strict E; no disk provenance is read from or
 			// written back to snapshot.cfg.
-			reader, err := restore.NewSnapshotCfgReader(manifestCfg)
+			reader, err := restore.NewSnapshotCfgReaderWithStorage(storage)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				return 1

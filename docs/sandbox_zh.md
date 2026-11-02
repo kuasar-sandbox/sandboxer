@@ -2047,7 +2047,7 @@ crypto:
 | `auto` | 允许 | 允许 | 密文，`@hmac` |
 | `required` | 拒绝 | 允许 | 密文，`@hmac` |
 
-使用上例配置，VM 可以生成本地明文 checkpoint，发布密文 E/S，用同一把密钥恢复，再写出新的本地明文 DIFF。不提供配置文件时，`sandbox-ctl publish --to-ref-location` 使用 `ref: auto`，需要有效的 `MANIFEST_KEY`。密钥缺失或错误、认证失败、身份不匹配都会报错。SDK 调用方通过 `NewProcessStorageWithCustomerKey` 显式传入密钥解析器。
+使用上例配置，VM 可以生成本地明文 checkpoint，发布密文 E/S，用同一把密钥恢复，再写出新的本地明文 DIFF。不提供配置文件时，`sandbox-ctl publish --to-ref-location` 使用 `ref: auto`，需要有效的 `MANIFEST_KEY`。无配置调用 `info`、`run --from` 或 `run --restore` 打开该命名引用时，传入同一把密钥。密钥缺失或错误、认证失败、身份不匹配都会报错。SDK 调用方通过 `NewProcessStorageWithCustomerKey` 显式传入密钥解析器。
 
 已有 `local: off` 的部署升级后，新发布到命名位置的 tarstream 需要密钥。要沿用升级前的发布策略，请将原 `local` 的值显式填入 `ref`。原先使用 `local: required` 且仍需拒绝明文依赖的部署，应明确配置 `ref: required`。请与支持该字段的 sandboxer 一起启用。旧 loader 可能接受这份 YAML 并忽略该字段。
 

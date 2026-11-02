@@ -346,14 +346,15 @@ finish_capture
 S_B="$(capture_path snapshot-b snapshot "$CP_DIR")"
 E_B="$(capture_path snapshot-b sandbox "$CP_DIR")"
 assert_checkpoint "$E_B" snapshot-b
-python3 - "$WORK" <<'PY'
+REF_KEY="$(python3 - "$WORK/ref-required.yaml" <<'PY'
 import pathlib, secrets, sys
 key = secrets.token_hex(32)
-for ref in ('required', 'auto'):
-    path = pathlib.Path(sys.argv[1], f'ref-{ref}.yaml')
-    path.write_text(f'manifest: {{key: "{key}"}}\ncrypto: {{chunk: aes, manifest: aes, local: off, ref: {ref}}}\n')
-    path.chmod(0o600)
+path = pathlib.Path(sys.argv[1])
+path.write_text(f'manifest: {{key: "{key}"}}\ncrypto: {{chunk: aes, manifest: aes, local: off, ref: required}}\n')
+path.chmod(0o600)
+print(key)
 PY
+)"
 sha256sum "$E_A" "$E_B" "$S_B" >"$OUT/source-artifacts.hashes"
 disk_inodes >"$OUT/before-resume.inodes"
 [ "$(wc -l <"$OUT/before-resume.inodes")" -eq 3 ] || e2e_fail "expected exactly three DIFF files"
@@ -386,7 +387,7 @@ wait "$PUB_B"
 wait "$PUB_A"
 PUBLISH_PIDS=()
 # Reuse the still-live snapshot-b checkpoint for a fresh auto-mode destination.
-"$BIN/sandbox-ctl" publish --json --manifest-config "$WORK/ref-auto.yaml" \
+MANIFEST_KEY="$REF_KEY" "$BIN/sandbox-ctl" publish --json \
     --to-ref-location "portable=file://$WORK/published-auto" "$S_B" >"$OUT/published-auto.json"
 for kind in a b auto; do
     python3 - "$OUT/published-$kind.json" "$WORK/published-$kind" <<'PY'
@@ -407,7 +408,7 @@ print(directory.name, 'encrypted tarstreams:', len(files))
 PY
 done
 AUTO_REF="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshotRef"])' "$OUT/published-auto.json")"
-"$BIN/sandbox-ctl" info --json --manifest-config "$WORK/ref-auto.yaml" \
+MANIFEST_KEY="$REF_KEY" "$BIN/sandbox-ctl" info --json \
     --ref-location "portable=file://$WORK/published-auto" "$AUTO_REF" >"$OUT/auto.info.json"
 assert_no_restore_pins "$CP_DIR"
 assert_list "$PATH_ID" snapshot-b

@@ -41,7 +41,7 @@ func TestPublishDefaultRefAutoRequiresCLIKey(t *testing.T) {
 	}
 	sink := snapshot.NewFileSink(t.TempDir(), "input", nil, false, nil)
 	defer sink.Close()
-	_, path, err := sink.AbsorbSandbox(context.Background(), source)
+	eRef, path, err := sink.AbsorbSandbox(context.Background(), source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +76,46 @@ func TestPublishDefaultRefAutoRequiresCLIKey(t *testing.T) {
 			if err != nil || !bytes.HasPrefix(b, []byte("\x89KTSENC\n")) {
 				t.Fatalf("missing encrypted envelope: %v", err)
 			}
+			args := []string{"--json", "--ref-location", "out=file://" + out, report.SandboxRef}
+			rc, info, stderr := captureInfoOutput(t, func() int { return infoCmd(args) })
+			if rc != 0 || !json.Valid([]byte(info)) {
+				t.Fatalf("config-free E info: %s %s", info, stderr)
+			}
+
+			tail, err := snapshot.MarshalConfig(&snapshot.Config{Version: 1, SandboxRef: eRef})
+			if err != nil {
+				t.Fatal(err)
+			}
+			src, err := snapshotfile.BuildSource(sparse.Dense(bytes.NewReader(body), uint64(len(body))), []byte("{}"), []byte("{}"), tail)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, snap, err := sink.AbsorbSnapshot(context.Background(), src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rc, stdout, stderr = captureInfoOutput(t, func() int { return publishCmd([]string{"--json", "--to-ref-location", "out=file://" + out, snap}) })
+			if rc != 0 {
+				t.Fatal(stderr)
+			}
+			sReport, err := artifact.DecodePublishReport([]byte(stdout), artifact.RoleSnapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			args[len(args)-1] = sReport.SnapshotRef
+			rc, info, stderr = captureInfoOutput(t, func() int { return infoCmd(args) })
+			var projection struct{ SandboxRef string }
+			if rc != 0 || json.Unmarshal([]byte(info), &projection) != nil || projection.SandboxRef != sReport.SandboxRef {
+				t.Fatalf("config-free S info: %s %s", info, stderr)
+			}
+			for _, badKey := range []string{"", strings.Repeat("7a", 32)} {
+				t.Setenv("MANIFEST_KEY", badKey)
+				rc, info, _ = captureInfoOutput(t, func() int { return infoCmd(args) })
+				if rc == 0 || info != "" {
+					t.Fatal("opened ciphertext without the correct key")
+				}
+			}
+
 		})
 	}
 }
