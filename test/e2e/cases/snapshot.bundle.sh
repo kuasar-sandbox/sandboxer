@@ -298,7 +298,8 @@ ROOT2_PATH="$(readlink -f "$OUT2/$SID2.snapshot")"
 ROOT2="$(basename "$ROOT2_PATH" .bundle)"
 assert_bundle_refs "$ROOT2_PATH"
 LOCATION_B="$WORK/location-b"
-LOCATED_B="$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/manifest.yaml" --to-ref-location B=file://$LOCATION_B --quiet "$OUT2/$SID2.snapshot")"
+LOCATED_B="$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/manifest.yaml" \
+    --ref-location "A=file://$LOCATION_A" --to-ref-location "B=file://$LOCATION_B" --quiet "$OUT2/$SID2.snapshot")"
 assert_located_bundle "$LOCATED_B" B "$LOCATION_B" "$ROOT2" "$ROOT2_PATH"
 
 rm -rf "$OUT1" "$OUT2"
