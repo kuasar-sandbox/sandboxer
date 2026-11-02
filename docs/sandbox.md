@@ -1035,9 +1035,20 @@ resources:
 ```
 
 Both fields are positive multiples of 4 KiB, with
-`0 < max_dirty_size <= cache_size`. Omitted fields independently default to the
-values above, including old configs without `diff_cow`. A single supplied field
-must still satisfy the relationship after defaults. These are finite engineering
+`0 < max_dirty_size <= cache_size`. An omitted `cache_size` defaults to 32 MiB.
+An omitted `max_dirty_size` is derived from the final effective cache size: half
+the cache, rounded down to a 4 KiB multiple, with a minimum of 4 KiB
+(`max(4096, floor(cacheBytes / 2 / 4096) * 4096)`). With both omitted, including
+old configs without `diff_cow`, the effective defaults remain 32 MiB / 16 MiB.
+Setting only `cache_size: 64MiB` gives a 32 MiB dirty limit; cache sizes of 4 KiB
+and 12 KiB both give a 4 KiB dirty limit.
+
+Explicitly setting `max_dirty_size: 16MiB` keeps that value even after a later
+cache override. Omitted dirty limits are derived after all overrides; applying
+defaults or loading a config does not write the derived value into the source
+configuration. Explicit dirty limits are never clamped or recomputed, and the
+final pair must satisfy the relationship above (so a dirty-only 64 MiB config
+fails against the default 32 MiB cache). These are finite engineering
 defaults, not a production SLA or a claim of optimal performance. There is no
 zero/unlimited value, disable switch, failed-data-I/O buffered retry or
 configurable alternate write mode.

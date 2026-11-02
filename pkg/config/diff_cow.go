@@ -9,6 +9,7 @@ import (
 
 // DiffCOWConfig is host-only sandbox-ctl memory policy, shared across all active
 // writable disks. MaxDirtySize is a subset of CacheSize, not an extra pool.
+// An empty MaxDirtySize is derived from the final effective CacheSize.
 type DiffCOWConfig struct {
 	CacheSize    string `yaml:"cache_size,omitempty"`
 	MaxDirtySize string `yaml:"max_dirty_size,omitempty"`
@@ -18,10 +19,9 @@ func (c *DiffCOWConfig) defaults() {
 	if c.CacheSize == "" {
 		c.CacheSize = "32MiB"
 	}
-	if c.MaxDirtySize == "" {
-		c.MaxDirtySize = "16MiB"
-	}
+	// Keep an omitted dirty limit unset so later cache overrides can change it.
 }
+
 func diffCOWSize(field, value string) (uint64, error) {
 	n, err := util.ParseSize(value)
 	if err != nil || n == 0 || n%4096 != 0 || n > uint64(int(^uint(0)>>1)) {
@@ -29,17 +29,59 @@ func diffCOWSize(field, value string) (uint64, error) {
 	}
 	return n, nil
 }
-func (c DiffCOWConfig) Bytes() (uint64, uint64, error) {
+
+// ValidateExplicit validates supplied nonempty fields without applying defaults.
+// The dirty <= cache relationship is checked only when both fields are supplied.
+// Use Resolve or Bytes to validate a complete configuration before runtime use.
+func (c DiffCOWConfig) ValidateExplicit() error {
+	_, _, err := c.sizes(false)
+	return err
+}
+
+// Resolve returns a fully resolved copy for runtime use without changing c.
+// Explicit field strings are preserved; an omitted dirty limit becomes a decimal
+// byte count equal to half the final cache size, rounded down to a 4 KiB multiple
+// with a 4 KiB minimum.
+func (c DiffCOWConfig) Resolve() (DiffCOWConfig, error) {
+	_, dirty, err := c.sizes(true)
+	if err != nil {
+		return DiffCOWConfig{}, err
+	}
 	c.defaults()
-	total, err := diffCOWSize("cache_size", c.CacheSize)
-	if err != nil {
-		return 0, 0, err
+	if c.MaxDirtySize == "" {
+		c.MaxDirtySize = fmt.Sprintf("%d", dirty)
 	}
-	dirty, err := diffCOWSize("max_dirty_size", c.MaxDirtySize)
-	if err != nil {
-		return 0, 0, err
+	return c, nil
+}
+
+// Bytes returns the fully resolved cache and dirty limits without changing c.
+func (c DiffCOWConfig) Bytes() (uint64, uint64, error) {
+	return c.sizes(true)
+}
+
+// sizes shares validation and default calculation between partial validation
+// and final resolution. YAML decoding deliberately validates only each leaf.
+func (c DiffCOWConfig) sizes(resolve bool) (uint64, uint64, error) {
+	if resolve {
+		c.defaults()
 	}
-	if dirty > total {
+	var total, dirty uint64
+	var err error
+	if c.CacheSize != "" {
+		total, err = diffCOWSize("cache_size", c.CacheSize)
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	if c.MaxDirtySize != "" {
+		dirty, err = diffCOWSize("max_dirty_size", c.MaxDirtySize)
+		if err != nil {
+			return 0, 0, err
+		}
+	} else if resolve {
+		dirty = max(uint64(4096), total/2/4096*4096)
+	}
+	if total != 0 && dirty > total {
 		return 0, 0, fmt.Errorf("resources.diff_cow.max_dirty_size must be <= cache_size")
 	}
 	return total, dirty, nil
