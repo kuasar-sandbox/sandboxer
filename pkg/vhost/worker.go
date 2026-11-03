@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -251,7 +250,10 @@ type chain struct {
 func (s *Server) walkChain(q *virtq, headIdx uint16) (*chain, error) {
 	c := &chain{}
 	idx := headIdx
-	for {
+	for count := uint32(0); ; {
+		if count >= q.num || uint32(idx) >= q.num {
+			return nil, fmt.Errorf("vhost: invalid descriptor chain at index %d (ring size %d)", idx, q.num)
+		}
 		d, err := s.readDesc(q, idx)
 		if err != nil {
 			return nil, err
@@ -259,6 +261,10 @@ func (s *Server) walkChain(q *virtq, headIdx uint16) (*chain, error) {
 		if d.Flags&descFlagIndirect != 0 {
 			// Indirect: d.Addr points to a small array of vringDesc.
 			n := int(d.Len) / 16
+			if n == 0 || d.Len%16 != 0 || uint32(n) > q.num-count {
+				return nil, fmt.Errorf("vhost: invalid indirect descriptor table length %d", d.Len)
+			}
+			count += uint32(n)
 			arr, err := s.memTable.TranslateGPA(q.readContext(), d.Addr, uint64(n*16))
 			if err != nil {
 				return nil, err
@@ -274,6 +280,7 @@ func (s *Server) walkChain(q *virtq, headIdx uint16) (*chain, error) {
 				}
 			}
 		} else {
+			count++
 			if err := s.appendSeg(q, c, d); err != nil {
 				return nil, err
 			}
@@ -340,42 +347,19 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 	bytesIO := 0
 	switch hdr.Type {
 	case BlkTypeIn:
-		// device-writable segments (excluding status byte) are the data buffer.
-		offset := int64(hdr.Sector) * SectorSize
-		for i, seg := range c.writeSegs {
-			if i == len(c.writeSegs)-1 {
-				// last segment may contain status byte at end; if it's only
-				// 1 byte, skip data here. Otherwise, use all but last byte.
-				if len(seg) > 1 {
-					n, err := readBackendAt(q.readContext(), backend, seg[:len(seg)-1], offset)
-					if readretry.IsTerminal(err) {
-						return 0, err
-					}
-					if stopped := q.stopped(); stopped != nil {
-						return 0, stopped
-					}
-					bytesIO += n
-					offset += int64(n)
-					if err != nil && !errors.Is(err, syscall.EAGAIN) && !(errors.Is(err, io.EOF) && n == len(seg)-1) {
-						statusValue = BlkStatusIOErr
-						break
-					}
-				}
-				continue
-			}
-			n, err := readBackendAt(q.readContext(), backend, seg, offset)
-			if readretry.IsTerminal(err) {
-				return 0, err
-			}
-			if stopped := q.stopped(); stopped != nil {
-				return 0, stopped
-			}
-			bytesIO += n
-			offset += int64(n)
-			if err != nil && !errors.Is(err, syscall.EAGAIN) && !(errors.Is(err, io.EOF) && n == len(seg)) {
-				statusValue = BlkStatusIOErr
-				break
-			}
+		// walkChain omits zero-length descriptors. Remove the status byte
+		// even when it shares a descriptor with the last payload bytes.
+		last := len(c.writeSegs) - 1
+		c.writeSegs[last] = statusSeg[:len(statusSeg)-1]
+		if len(c.writeSegs[last]) == 0 {
+			c.writeSegs = c.writeSegs[:last]
+		}
+		bytesIO, err = q.readPayload(backend, hdr.Sector, c.writeSegs)
+		if readretry.IsTerminal(err) {
+			return 0, err
+		}
+		if err != nil {
+			statusValue = BlkStatusIOErr
 		}
 
 	case BlkTypeOut:
@@ -440,7 +424,7 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 	if s.stats != nil {
 		_, suppressStats := backend.(interface{ suppressRequestStats() bool })
 		if suppressStats {
-			return bytesIO + 1, nil
+			return ret, nil
 		}
 		latNs := uint64(nowNs() - startNs)
 		s.stats.Record(hdr.Type, uint64(bytesIO), latNs, *status == BlkStatusOK)

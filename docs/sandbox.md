@@ -1467,6 +1467,52 @@ device capacity is distinct from an encrypted file's physical length, host disk
 allocation, and the guest filesystem's available file-data space. This migration
 does not introduce arbitrary per-instance capacity selection from one template.
 
+#### Segmented reads over vhost-user-blk
+
+On cold boot each disk offers `VIRTIO_BLK_F_SEG_MAX` with 64 data segments.
+The pinned Cloud Hypervisor (CH) uses a 128-entry direct ring. Negotiating the
+bit requires room for 64 data descriptors, a header and a status byte. The
+configuration stays fixed throughout queue setup. A frontend can negotiate
+the older subset with a smaller ring. RO, FLUSH and conditional DISCARD keep
+their existing feature bits.
+
+A read pins the disk backend for the whole request. Vhost reads successive
+logical disk ranges of up to 1 MiB through the existing cache, alignment and
+encryption paths. A single descriptor or a run of descriptors covering adjacent bytes in one
+host mapping can receive a window directly. When the first descriptor already
+provides at least 256 KiB and at least another 256 KiB remain within the
+candidate window, vhost can read that descriptor directly. This avoids a
+copy and clear on large cache hits while keeping small tails together.
+A discontiguous window uses a private queue buffer, copies the
+valid prefix in descriptor order and clears the window before reuse. Guest
+addresses can decrease or have gaps. A request can span several windows, and a
+window can end inside a descriptor. For example, 64 discontiguous 4 KiB
+descriptors produce one 256 KiB backend call. A 512 B descriptor followed by
+a discontiguous 1 MiB descriptor produces 1 MiB and 512 B calls. Four
+discontiguous 256 KiB descriptors can use four direct calls. The last writable
+byte belongs to status.
+Each queue that first needs aggregation retains 1 MiB outside
+`diff_cow.cache_size`. Count each disk separately. Copying and clearing add
+CPU and memory traffic on fragmented reads, including cache hits. Cache and
+dirty limits keep their existing defaults. Increasing either budget does not
+change how the Guest forms requests on a cache miss.
+
+Full reads, including a full count with ordinary EOF/EAGAIN, complete normally.
+A short read now delivers the valid prefix and reports IOERR. The old loop
+could report success after a short count. Another ordinary error also reports
+IOERR, even at full count. The used length includes only delivered bytes and
+one status byte. Vhost never retries a failed window. A terminal read or
+observed cancellation leaves the request pending without status, used-ring
+publication or base advancement. A synchronous pread may still take time to
+return, and bytes already in guest memory can remain there. Guest FLUSH keeps
+its existing semantics. Foreground write completion and Guest FLUSH provide
+no additional host Drain or fsync guarantee.
+
+CH saves the negotiated feature set and device configuration in memory
+snapshots. Restoring an older snapshot preserves its original segment limit.
+A new cold boot can negotiate 64 and preserve that limit across restore.
+An older backend rejects a saved SEG_MAX bit that it cannot implement.
+
 <a id="usage-metrics"></a>
 
 ### 4.5 Usage metrics, units and arithmetic
@@ -3209,6 +3255,114 @@ delay. Compare the same current synchronous batched initializer/bitmap baseline,
 not the historical serial bitmap writer. Keep all tails and failures. Also
 measure actual Guest startup through first health/tool response under single and
 concurrent launches; backend open timing alone cannot establish startup benefit.
+
+#### 12.5.2 Guest measurements for segmented vhost reads (2026-11-03)
+
+A is main at `185f50b6`. Its `pkg/vhost` matches investigation commit `3fa03fc7`. These runs used main's effective cache configuration and local encryption policy. H is the final implementation. Each host and storage mode had two independent cold boots of each build. Guests used two vCPUs, 2 GiB, CH v51.1.0, Linux 6.1.169 and fio 3.39 with libaio, direct I/O and one job. The data disk used ext4 on a v3 DIFF with a 32 MiB cache and a 16 MiB dirty limit. Every boot checked the actual DIFF headers, CRCs and O_DIRECT file descriptors. Fragmented jobs verified descending PFNs and zero forward-adjacent pairs.
+
+Cells give **the two A runs → the two H runs** in MiB/s. 1M and 4K denote application I/O sizes in binary units. Q denotes application queue depth. Each tabulated job transferred 512 MiB except the 8 MiB warm-up. Hot reads repeatedly accessed that warmed 8 MiB set. The independent CRC32C pass wrote and verified a full 512 MiB. Its write phase is listed separately from the formal writes. Matched supplemental boots supply natural-layout formal writes missing from early baseline runs. All tabulated throughput was measured without tracing.
+
+| Job | WSL x86 / plain | WSL x86 / encrypted | Native x86 / plain |
+|:---|:---|:---|:---|
+| Prepare, 1M Q32 | 151.03/178.83 → 442.14/316.44 | 85.83/73.21 → 104.38/73.52 | 157.64/157.83 → 165.27/170.89 |
+| Precondition, 1M Q32 | 413.90/403.79 → 570.79/481.66 | 121.79/97.23 → 123.82/113.83 | 195.20/186.18 → 158.32/171.41 |
+| Natural read, 1M Q1 | 48.54/22.70 → 269.47/368.88 | 12.10/19.78 → 106.82/105.68 | 149.84/154.22 → 91.44/182.40 |
+| Natural read, 1M Q32 | 513.54/248.54 → 583.14/459.61 | 118.38/111.96 → 93.93/117.89 | 159.01/182.40 → 194.23/153.20 |
+| Fragmented read, 1M Q1 | 21.24/12.88 → 225.15/163.58 | 12.97/13.60 → 73.94/81.01 | 16.15/12.51 → 144.31/174.45 |
+| Fragmented read, 1M Q32 | 12.52/14.14 → 244.04/190.41 | 12.74/11.75 → 76.44/64.82 | 16.12/12.81 → 161.36/173.50 |
+| 4K read, Q1 | 6.13/5.39 → 6.28/6.59 | 5.84/5.75 → 5.07/6.23 | 14.81/11.99 → 12.01/12.37 |
+| 4K read, Q32 | 14.44/13.02 → 10.97/12.34 | 12.96/11.08 → 9.53/10.98 | 16.27/13.06 → 13.29/13.28 |
+| 2M application read, Q1 | 32.64/89.25 → 268.34/208.47 | 63.17/31.50 → 104.47/101.71 | 178.58/169.42 → 161.41/159.60 |
+| 8M warm-up, Q1 | 37.74/88.89 → 156.86/170.21 | 14.36/30.19 → 88.89/85.11 | 163.27/222.22 → 285.71/421.05 |
+| 8M hot set, 1M Q1 | 1387.53/224.66 → 521.92/881.24 | 281.32/251.35 → 1233.73/567.63 | 5019.61/2415.09 → 3261.15/3240.51 |
+| Natural write, 1M Q1 | 515.09/170.89 → 372.63/405.71 | 111.21/109.35 → 142.38/96.66 | 160.85/183.12 → 186.66/185.84 |
+| Natural write, 1M Q32 | 505.93/172.74 → 350.93/405.71 | 129.33/108.89 → 147.93/107.88 | 186.86/164.00 → 159.35/174.15 |
+| Fragmented write, 1M Q1 | 146.49/154.68 → 268.20/263.24 | 110.42/105.76 → 117.38/102.24 | 184.57/182.27 → 181.24/165.59 |
+| Fragmented write, 1M Q32 | 151.75/171.99 → 308.99/295.95 | 112.21/108.31 → 134.99/70.17 | 176.01/180.54 → 174.74/171.41 |
+| CRC32C pass (write phase) | 143.74/136.90 → 276.61/230.53 | 104.00/104.85 → 129.33/80.58 | 179.52/159.50 → 185.31/188.79 |
+
+| Job | ARM / plain | ARM / encrypted |
+|:---|:---|:---|
+| Prepare, 1M Q32 | 162.75/194.23 → 206.20/206.37 | 153.62/152.25 → 156.05/152.15 |
+| Precondition, 1M Q32 | 174.92/150.94 → 146.75/147.00 | 148.49/132.06 → 149.93/159.90 |
+| Natural read, 1M Q1 | 108.43/27.57 → 185.31/183.12 | 119.51/79.04 → 143.62/154.31 |
+| Natural read, 1M Q32 | 161.77/197.23 → 149.27/149.01 | 161.11/149.80 → 150.81/149.75 |
+| Fragmented read, 1M Q1 | 19.62/19.70 → 179.59/177.35 | 19.55/19.64 → 143.10/141.91 |
+| Fragmented read, 1M Q32 | 19.73/19.74 → 165.00/162.85 | 19.56/19.68 → 144.35/141.79 |
+| 4K read, Q1 | 19.63/19.55 → 19.58/19.48 | 19.61/19.60 → 18.22/19.07 |
+| 4K read, Q32 | 19.74/19.74 → 19.77/19.74 | 19.67/19.55 → 19.55/19.70 |
+| 2M application read, Q1 | 29.09/155.72 → 201.89/203.66 | 146.79/43.31 → 166.18/146.96 |
+| 8M warm-up, Q1 | 26.67/148.15 → 500.00/470.59 | 89.89/133.33 → 160.00/190.48 |
+| 8M hot set, 1M Q1 | 350.93/2473.43 → 3555.56/1450.42 | 2072.87/1896.30 → 3657.14/3605.63 |
+| Natural write, 1M Q1 | 185.78/177.65 → 205.46/164.10 | 163.47/162.39 → 164.47/153.80 |
+| Natural write, 1M Q32 | 148.88/152.29 → 188.03/196.39 | 153.57/153.71 → 153.34/164.95 |
+| Fragmented write, 1M Q1 | 158.61/159.06 → 177.59/154.17 | 153.66/164.31 → 153.34/164.21 |
+| Fragmented write, 1M Q32 | 158.22/159.20 → 161.26/213.33 | 153.98/165.75 → 153.85/164.16 |
+| CRC32C pass (write phase) | 183.97/185.10 → 188.37/149.27 | 153.16/163.16 → 164.47/153.20 |
+
+Mean total QD1 latency in µs, calculated from fio slat + clat. Each entry is the median across the two boots.
+
+| Host and DIFF | Natural 1M/Q1 | Fragmented 1M/Q1 | 4K/Q1 |
+|:---|---:|---:|---:|
+| wsl / off | 32318.4 → 3202.1 | 62361.7 → 5270.2 | 675.7 → 604.1 |
+| wsl / auto | 66584.6 → 9403.6 | 75306.0 → 12926.6 | 668.1 → 695.0 |
+| native / off | 6577.2 → 8208.0 | 70934.5 → 6329.0 | 294.2 → 319.8 |
+| arm / off | 22743.3 → 5427.3 | 50866.4 → 5601.4 | 199.0 → 199.6 |
+| arm / auto | 10507.8 → 6720.1 | 51023.0 → 7015.9 | 198.8 → 209.2 |
+
+Two additional builds on native x86 isolate the changes. B enables only multi-segment negotiation. C uses only the final read path. Each diagnostic issues 64 application reads of 1 MiB. Uprobes and strace were matched by the thread reading the data DIFF. The probe interval also includes a few auxiliary calls. File preads count complete returns after matching unfinished/resumed records by thread.
+
+| Build | Untraced 512 MiB reads, MiB/s | Chains / ReadAt calls in 64 MiB diagnostic | data.diff preads |
+|:---|---:|---:|:---|
+| A | 16.15 / 12.51 | 16,387 / 16,388 | 16,384 × 4 KiB |
+| B | 16.40 / 13.92 | 256 / 16,397 | 16,384 × 4 KiB |
+| C | 13.19 / 13.17 | 16,390 / 16,395 | 16,384 × 4 KiB |
+| H | 144.31 / 174.45 | 256 / 257 | 256 × 256 KiB |
+
+A separate PFN-controlled hot test used four discontiguous 256 KiB physical spans per 1 MiB read. Each boot alternated contiguous and four-span layouts after warming an 8 MiB set. Every repetition transferred 512 MiB. The two within-boot medians for four spans were 5100/4837 MiB/s on A, 3429/3414 when all discontiguous spans used scratch, and 5438/5708 on H. Full 512 MiB scans with the same layout gave 150/148, 161/163 and 161/160 MiB/s respectively. These measurements motivated keeping large direct spans. Natural hot throughput still varies with physical layout.
+
+A resident-memory backend on WSL isolates descriptor processing, copying and clearing. Six alternating pairs on one CPU yielded the following median µs/request on A → H. Single 4 KiB was 0.68 → 0.82, single 1 MiB was 86.71 → 80.82, reversed 64×4 KiB was 26.60 → 53.15, and reversed 4×256 KiB was 74.82 → 69.48. Small discontiguous segments still incur measurable memory traffic when storage latency is absent.
+
+Encrypted ARM 4 KiB/QD1 measured 19.61 → 18.65 MiB/s in the primary workload sequence. To isolate single-segment reads, both builds reopened the same prepared encrypted data DIFF. Each cold boot ran a full 4 KiB/QD32 preconditioning scan before two QD1 scans and one QD32 scan, each of 512 MiB. All boots verified the same file SHA-256. The matched-data runs follow. The primary table retains the original difference.
+
+| Independent boot | Two 4 KiB/QD1 reads, MiB/s | 4 KiB/QD32, MiB/s |
+|:---|---:|---:|
+| H1 | 19.61 / 19.54 | 19.69 |
+| A1 | 19.61 / 19.59 | 19.55 |
+| A2 | 19.63 / 19.58 | 19.55 |
+| H2 | 19.59 / 19.59 | 19.68 |
+
+An additional plaintext replay used the same data DIFF across four independent boots in A/H/H/A order and verified the same file SHA-256 each time. Values are MiB/s. Natural 1 MiB/QD32 and 2 MiB/QD1 are within-boot medians of two complete scans. WSL 4 KiB/QD32 transferred one full dataset per boot.
+
+| Matched plain DIFF / job | Two A boots | Two H boots |
+|:---|---:|---:|
+| wsl / 4 KiB Q32 | 17.12/13.31 | 11.12/13.00 |
+| wsl / 1 MiB Q32 | 297.93/303.68 | 490.47/369.48 |
+| wsl / 2 MiB Q1 | 34.93/110.51 | 310.60/234.97 |
+| native / 1 MiB Q32 | 172.47/171.33 | 155.51/184.17 |
+| native / 2 MiB Q1 | 38.48/141.68 | 183.19/152.21 |
+| arm / 1 MiB Q32 | 158.94/154.30 | 149.23/147.20 |
+| arm / 2 MiB Q1 | 54.70/31.16 | 181.92/187.63 |
+
+Reusing a DIFF still permits different natural Guest page layouts. Plaintext ARM QD32 remained lower in that sequence, with a smaller gap. In a separate sequence of three consecutive natural 1 MiB/QD32 scans of the same disk, the two within-boot medians were A 153.16/152.61 and H 151.48/148.71 MiB/s. Diagnostic builds using a 128 KiB direct-span threshold gave 157.06/147.55. Ending a small gathered prefix before a long span gave 147.42/151.93. Scan order and request shape affected these samples. They did not establish a consistently faster replacement rule for natural layouts. A separate native x86 write test measured fragmented 1 MiB/QD1 writes at A 156.81/180.85 and H 185.71/156.15 MiB/s.
+
+In WSL the primary 4 KiB/QD32 medians were about 15% lower in both storage modes. A subsequent four-build comparison on a common plaintext DIFF gave A 17.46/10.42, B 13.78/10.81, C 11.80/13.30 and H 13.81/10.61 MiB/s across two independent boots each. These single-segment reads do not use scratch. The lower WSL observations remain a performance boundary for this nested environment.
+
+The 1280 KiB raw-device preadv probe verifies every page by separate reads and requires the device to complete one read of 2560 sectors. Both final x86 and ARM runs produced a single request. An additional native x86 diagnostic placed one 4 KiB page before a long physical span and recorded 1 × 1024 KiB, 1 × 256 KiB data DIFF calls. The 2 MiB application workload alone cannot certify a multi-window vhost request. In actual WSL snapshots the writable disks saved masks `0x140002200` and `0x140002204`, seg_max 0 and 64, and ring size 128. Old-to-new and new-to-new restores verified guest segment limits and file content. Downgrade rejected unsupported bit `0x4`. A separate WSL guest completed three FLUSH and 32 DISCARD commands successfully and verified a retained file.
+
+fio counts application operations. Guest disk stat counts Linux block requests. blk2 rd/s and logical_backend count whole vhost requests. ReadAt dispatch and backing pread were measured separately. Across the 84 primary natural, fragmented, 4 KiB and 2 MiB read scans on the two native hosts, process storage-read bytes matched fio bytes in every scan. The WSL kernel lacked that counter for its 56 scans. Equality with fio bytes cannot establish an empty physical-media cache. Two independent boots per cell show sample variation. They cannot estimate how often production buffers fragment. These throughput results cover the listed CH, kernel, v3 DIFF and cache budget. ARM snapshot restore and v4 DIFF guest performance were not separately measured.
+
+Build the probes for the Guest ISA and libc. Supply root.ref, the ext4 root.template and data.template, and fio-runtime.tar containing the private run-fio loader. Use a fresh output directory per boot and run two independent boots for both off and auto.
+
+```bash
+cc -O2 -Wall -Wextra -Werror -fPIC -shared test/perf/fio_reverse_pfn.c -o /tmp/libgeometry.so
+cc -O2 -static test/perf/vhost_large_read.c -o /tmp/large-read
+sudo python3 test/perf/vhost_guest_fio.py --inputs "$FIXTURES" --output "$NEW_RUN" \
+  --ctl "$CTL" --ch "$CH" --kernel "$KERNEL" --runtime "$RUNTIME" \
+  --crypto auto --pfn-lib /tmp/libgeometry.so --large-probe /tmp/large-read --trace
+```
+
+The investigation prototype reported plaintext A/B/C/D medians of 16.82/15.68/13.18/168.62 MiB/s and encrypted A/D medians of 15.46/102.68 on x86. Its two repetitions shared a Guest. The tables above use fresh measurements of the production code. [#398](https://github.com/kuasar-sandbox/sandboxer/issues/398)
 
 <a id="usage-validation"></a>
 

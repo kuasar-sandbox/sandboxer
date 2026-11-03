@@ -89,6 +89,7 @@ type Server struct {
 	// negotiated state (modified by master)
 	mu               sync.Mutex
 	features         uint64
+	featuresSet      bool
 	protocolFeatures uint64
 	memTable         MemTable
 	queues           []*virtq
@@ -108,14 +109,16 @@ type Server struct {
 
 // virtq holds per-virtq state set up by SET_VRING_*.
 type virtq struct {
-	num       uint32
-	descAddr  uint64 // GPA
-	availAddr uint64 // GPA
-	usedAddr  uint64 // GPA
-	baseIdx   uint16
-	kickFd    int
-	callFd    int
-	enabled   bool
+	num         uint32
+	descAddr    uint64 // GPA
+	availAddr   uint64 // GPA
+	usedAddr    uint64 // GPA
+	baseIdx     uint16
+	kickFd      int
+	callFd      int
+	enabled     bool
+	kickArmed   bool   // GET_VRING_BASE disarms implicit start until the next KICK
+	readScratch []byte // private to the queue worker
 
 	stop     chan struct{}
 	done     chan struct{}
@@ -398,6 +401,7 @@ func (s *Server) resetConnectionState() {
 	queues := s.queues
 	s.queues = make([]*virtq, NumQueues)
 	s.features = 0
+	s.featuresSet = false
 	s.protocolFeatures = 0
 	s.mu.Unlock()
 	// Drain workers first (joins on q.done). No s.mu held — the workers
@@ -539,6 +543,8 @@ func (s *Server) handle(conn *net.UnixConn, m *Message) error {
 const (
 	bitVhostProtocolFeatures = uint64(1) << 30
 	bitVirtioVersion1        = uint64(1) << 32
+	bitVirtioBlkSegMax       = uint64(1) << 2
+	blkSegMax                = 64
 	bitVirtioBlkRO           = uint64(1) << 5
 	bitVirtioBlkFlush        = uint64(1) << 9
 	bitVirtioBlkDiscard      = uint64(1) << 13
@@ -554,7 +560,7 @@ const (
 // Existing snapshots may restore any supported subset. In particular, an old
 // GuestSnapshot keeps its saved features without gaining DISCARD on restore.
 func (s *Server) advertisedFeatures() uint64 {
-	feats := bitVirtioVersion1 | bitVhostProtocolFeatures | bitVirtioBlkFlush
+	feats := bitVirtioVersion1 | bitVhostProtocolFeatures | bitVirtioBlkFlush | bitVirtioBlkSegMax
 	if s.backend.ReadOnly() {
 		feats |= bitVirtioBlkRO
 	}
@@ -582,8 +588,20 @@ func (s *Server) handleSetFeatures(conn *net.UnixConn, m *Message) error {
 			v, supported, unsupported)
 	}
 	s.mu.Lock()
+	for _, q := range s.queues {
+		if q != nil {
+			if err := validateQueueSize(v, q.num); err != nil {
+				s.mu.Unlock()
+				return err
+			}
+		}
+	}
 	s.features = v
+	s.featuresSet = true
 	s.mu.Unlock()
+	for idx := 0; idx < NumQueues; idx++ {
+		s.maybeStartWorker(idx)
+	}
 	s.logf("vhost: SET_FEATURES = 0x%x", v)
 	return nil
 }
@@ -628,7 +646,7 @@ func (s *Server) handleGetConfig(conn *net.UnixConn, m *Message) error {
 
 	// The pinned CH frontend reads the full 60-byte wire layout.
 	// GET flags are echoed, including CH's normal WRITABLE request flag.
-	cfg := BlkConfig{Capacity: uint64(s.backend.Size()) / SectorSize}
+	cfg := BlkConfig{Capacity: uint64(s.backend.Size()) / SectorSize, SegMax: blkSegMax}
 	if s.discardSupported {
 		cfg.MaxDiscSec = maxDiscardSectors
 		cfg.MaxDiscSeg = 1
@@ -712,10 +730,8 @@ func (s *Server) handleSetMemTable(_ *net.UnixConn, m *Message) error {
 		}
 		q.drainMu.Unlock()
 	}
-	for idx, start := range restart {
-		if start {
-			s.maybeStartWorker(idx)
-		}
+	for idx := 0; idx < NumQueues; idx++ {
+		s.maybeStartWorker(idx)
 	}
 	s.logf("vhost: SET_MEM_TABLE accepted %d regions (inode-match)", len(regs))
 	return nil
@@ -741,6 +757,15 @@ func (s *Server) ensureQueue(idx int) *virtq {
 	return s.queues[idx]
 }
 
+// num is zero until the master supplies the ring geometry. A direct
+// chain needs separate descriptors for both the header and the status.
+func validateQueueSize(features uint64, num uint32) error {
+	if features&bitVirtioBlkSegMax != 0 && num != 0 && num < blkSegMax+2 {
+		return fmt.Errorf("vhost: vring size %d cannot hold %d data segments plus header and status", num, blkSegMax)
+	}
+	return nil
+}
+
 func (s *Server) handleSetVringNum(m *Message) error {
 	if len(m.Payload) < 8 {
 		return fmt.Errorf("SET_VRING_NUM payload too short")
@@ -750,10 +775,19 @@ func (s *Server) handleSetVringNum(m *Message) error {
 		return err
 	}
 	num := binary.LittleEndian.Uint32(m.Payload[4:8])
+	// Split ring indices are 16 bit and wrap at twice the largest queue.
+	if num == 0 || num > 32768 {
+		return fmt.Errorf("vhost: invalid direct vring size %d", num)
+	}
 	s.mu.Lock()
 	q := s.ensureQueue(idx)
+	if err := validateQueueSize(s.features, num); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	q.num = num
 	s.mu.Unlock()
+	s.maybeStartWorker(idx)
 	return nil
 }
 
@@ -775,6 +809,7 @@ func (s *Server) handleSetVringAddr(m *Message) error {
 	q.availAddr = avail
 	q.usedAddr = used
 	s.mu.Unlock()
+	s.maybeStartWorker(int(idx))
 	return nil
 }
 
@@ -820,6 +855,7 @@ func (s *Server) handleGetVringBase(conn *net.UnixConn, m *Message) error {
 	}
 	base := q.baseIdx
 	q.enabled = false
+	q.kickArmed = false
 	out := make([]byte, 8)
 	binary.LittleEndian.PutUint32(out[0:4], uint32(idx))
 	binary.LittleEndian.PutUint32(out[4:8], uint32(base))
@@ -856,6 +892,7 @@ func (s *Server) handleSetVringKick(m *Message) error {
 		_ = syscall.Close(q.kickFd)
 	}
 	q.kickFd = m.Fds[0]
+	q.kickArmed = true
 	q.drainMu.Unlock()
 	s.maybeStartWorker(idx)
 	return nil
@@ -889,6 +926,7 @@ func (s *Server) handleSetVringCall(m *Message) error {
 	}
 	q.callFd = m.Fds[0]
 	q.drainMu.Unlock()
+	s.maybeStartWorker(idx)
 	return nil
 }
 
@@ -916,8 +954,10 @@ func (s *Server) handleSetVringEnable(m *Message) error {
 func (s *Server) maybeStartWorker(idx int) {
 	s.mu.Lock()
 	q := s.queues[idx]
+	configured := s.featuresSet && len(s.memTable.regions) != 0 && q != nil && q.num != 0
+	implicit := s.features&bitVhostProtocolFeatures == 0
 	s.mu.Unlock()
-	if q == nil {
+	if !configured {
 		return
 	}
 	q.drainMu.Lock()
@@ -926,6 +966,9 @@ func (s *Server) maybeStartWorker(idx int) {
 	case <-s.stop:
 		return
 	default:
+	}
+	if !q.enabled && !(implicit && q.kickArmed) {
+		return
 	}
 	if q.kickFd < 0 || q.callFd < 0 || q.descAddr == 0 || q.stop != nil {
 		return
