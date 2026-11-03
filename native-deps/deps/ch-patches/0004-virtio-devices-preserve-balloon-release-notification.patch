@@ -1,24 +1,51 @@
-From fece49e2306b9b9ba8bf375f2cf226c68464d418 Mon Sep 17 00:00:00 2001
+From 6807847b17c61cf82bd260aeb3e03460fc859085 Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Mon, 18 May 2026 18:27:14 +0800
 Subject: [PATCH 04/11] virtio-devices: preserve balloon release notifications
  before sparse reclaim
 
-A physical hole in externally backed RAM may still inherit nonzero bytes from a lazy snapshot source. Always MADV_DONTNEED the complete valid release range before SEEK_DATA can skip redundant inode punching. Propagate advice and punch errors; include regression coverage for empty ranges and failed punching.
-
-This corrects original 0004, which treated absent inode pages as absent logical content. It restores REMOVE delivery and does not implement dirty tracking or snapshot encoding of released pages. Hole-only release again incurs synchronous REMOVE handling.
-
-The original release optimization, its correction and tests now share one functional owner.
+Notify logically released ranges before sparse reclaim and propagate errors. On 4 KiB hosts, sort and coalesce at most 8192 PFNs per chunk of a cold-created balloon inflate descriptor. Select from top-level VM creation provenance before extracting optional child snapshots. Preserve the per-PFN restore and partial-host-page paths.
 ---
- virtio-devices/src/balloon.rs         | 271 +++++++++++++++++++++++++-
+ fuzz/fuzz_targets/balloon.rs          |   1 +
+ virtio-devices/src/balloon.rs         | 428 ++++++++++++++++++++++++--
  virtio-devices/src/seccomp_filters.rs |   9 +-
- 2 files changed, 275 insertions(+), 5 deletions(-)
+ vmm/src/device_manager.rs             |   4 +
+ vmm/src/vm.rs                         |   3 +
+ 5 files changed, 416 insertions(+), 29 deletions(-)
 
+diff --git a/fuzz/fuzz_targets/balloon.rs b/fuzz/fuzz_targets/balloon.rs
+index b745cf6..d18178c 100644
+--- a/fuzz/fuzz_targets/balloon.rs
++++ b/fuzz/fuzz_targets/balloon.rs
+@@ -51,6 +51,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
+         true,
+         SeccompAction::Allow,
+         EventFd::new(EFD_NONBLOCK).unwrap(),
++        true,
+         None,
+     )
+     .unwrap();
 diff --git a/virtio-devices/src/balloon.rs b/virtio-devices/src/balloon.rs
-index 3db6832..2cfed19 100644
+index 3db6832..a60a68d 100644
 --- a/virtio-devices/src/balloon.rs
 +++ b/virtio-devices/src/balloon.rs
-@@ -199,14 +199,34 @@ impl BalloonEpollHandler {
+@@ -47,6 +47,7 @@ use crate::{
+ const QUEUE_SIZE: u16 = 128;
+ const REPORTING_QUEUE_SIZE: u16 = 32;
+ const MIN_NUM_QUEUES: usize = 2;
++const INFLATE_BATCH_PFNS: usize = 8192;
+ 
+ // Inflate virtio queue event.
+ const INFLATE_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
+@@ -159,6 +160,7 @@ struct BalloonEpollHandler {
+     reporting_queue_evt: Option<EventFd>,
+     kill_evt: EventFd,
+     pause_evt: EventFd,
++    coalesce_inflate: bool,
+     pbp: Option<PartiallyBalloonedPage>,
+ }
+ 
+@@ -199,14 +201,34 @@ impl BalloonEpollHandler {
          let region = memory.find_region(range_base).ok_or(Error::GuestMemory(
              GuestMemoryError::InvalidGuestAddress(range_base),
          ))?;
@@ -56,7 +83,7 @@ index 3db6832..2cfed19 100644
                      range_len as libc::off64_t,
                  )
              };
-@@ -216,7 +236,7 @@ impl BalloonEpollHandler {
+@@ -216,7 +238,7 @@ impl BalloonEpollHandler {
              }
          }
  
@@ -65,7 +92,166 @@ index 3db6832..2cfed19 100644
      }
  
      fn release_memory_range_4k(
-@@ -675,3 +695,246 @@ impl Snapshottable for Balloon {
+@@ -256,8 +278,48 @@ impl BalloonEpollHandler {
+         Ok(())
+     }
+ 
++    fn release_inflate_descriptor(
++        memory: &GuestMemoryMmap,
++        addr: GuestAddress,
++        num_pfns: usize,
++        pfns: &mut Vec<u32>,
++    ) -> result::Result<(), Error> {
++        pfns.reserve_exact(num_pfns.min(INFLATE_BATCH_PFNS));
++        for start in (0..num_pfns).step_by(INFLATE_BATCH_PFNS) {
++            for i in start..num_pfns.min(start + INFLATE_BATCH_PFNS) {
++                let offset = (i * size_of::<u32>()) as u64;
++                let addr = addr.checked_add(offset).ok_or(Error::InvalidRequest)?;
++                pfns.push(memory.read_obj(addr).map_err(Error::GuestMemory)?);
++            }
++            pfns.sort_unstable();
++            pfns.dedup();
++            let mut remaining = pfns.as_slice();
++            while let Some(&first) = remaining.first() {
++                let base = GuestAddress(u64::from(first) << VIRTIO_BALLOON_PFN_SHIFT);
++                let region = memory.find_region(base).ok_or(Error::GuestMemory(
++                    GuestMemoryError::InvalidGuestAddress(base),
++                ))?;
++                // A region has a linear backing offset. Even adjacent guest
++                // regions can refer to unrelated parts of a backing file.
++                let last_pfn = region.last_addr().0 >> VIRTIO_BALLOON_PFN_SHIFT;
++                let mut count = 1;
++                while count < remaining.len()
++                    && u64::from(remaining[count]) == u64::from(first) + count as u64
++                    && u64::from(remaining[count]) <= last_pfn
++                {
++                    count += 1;
++                }
++                Self::release_memory_range(memory, base, count << VIRTIO_BALLOON_PFN_SHIFT)?;
++                remaining = &remaining[count..];
++            }
++            pfns.clear();
++        }
++        Ok(())
++    }
++
+     fn process_queue(&mut self, queue_index: usize) -> result::Result<(), Error> {
+         let mut used_descs = false;
++        let mut inflate_pfns = Vec::new();
+         while let Some(mut desc_chain) =
+             self.queues[queue_index].pop_descriptor_chain(self.mem.memory())
+         {
+@@ -275,31 +337,40 @@ impl BalloonEpollHandler {
+                 return Err(Error::InvalidRequest);
+             }
+ 
+-            let mut offset = 0u64;
+-            while offset < desc.len() as u64 {
+-                let addr = desc.addr().checked_add(offset).unwrap();
+-                let pfn: u32 = desc_chain
+-                    .memory()
+-                    .read_obj(addr)
+-                    .map_err(Error::GuestMemory)?;
+-                offset += data_chunk_size as u64;
+-
+-                match queue_index {
+-                    0 => {
+-                        Self::release_memory_range_4k(&mut self.pbp, desc_chain.memory(), pfn)?;
+-                    }
+-                    1 => {
+-                        let page_size = get_page_size() as usize;
+-                        let rbase = align_page_size_down((pfn as u64) << VIRTIO_BALLOON_PFN_SHIFT);
+-
+-                        Self::advise_memory_range(
+-                            desc_chain.memory(),
+-                            vm_memory::GuestAddress(rbase),
+-                            page_size,
+-                            libc::MADV_WILLNEED,
+-                        )?;
++            if queue_index == 0 && self.coalesce_inflate {
++                Self::release_inflate_descriptor(
++                    desc_chain.memory(),
++                    desc.addr(),
++                    desc.len() as usize / data_chunk_size,
++                    &mut inflate_pfns,
++                )?;
++            } else {
++                let mut offset = 0u64;
++                while offset < desc.len() as u64 {
++                    let addr = desc.addr().checked_add(offset).unwrap();
++                    let pfn: u32 = desc_chain
++                        .memory()
++                        .read_obj(addr)
++                        .map_err(Error::GuestMemory)?;
++                    offset += data_chunk_size as u64;
++
++                    match queue_index {
++                        0 => {
++                            Self::release_memory_range_4k(&mut self.pbp, desc_chain.memory(), pfn)?;
++                        }
++                        1 => {
++                            let page_size = get_page_size() as usize;
++                            let rbase = align_page_size_down((pfn as u64) << VIRTIO_BALLOON_PFN_SHIFT);
++
++                            Self::advise_memory_range(
++                                desc_chain.memory(),
++                                vm_memory::GuestAddress(rbase),
++                                page_size,
++                                libc::MADV_WILLNEED,
++                            )?;
++                        }
++                        _ => return Err(Error::InvalidQueueIndex(queue_index)),
+                     }
+-                    _ => return Err(Error::InvalidQueueIndex(queue_index)),
+                 }
+             }
+ 
+@@ -428,6 +499,7 @@ pub struct BalloonState {
+ // Virtio device for exposing entropy to the guest OS through virtio.
+ pub struct Balloon {
+     common: VirtioCommon,
++    coalesce_inflate: bool,
+     id: String,
+     config: VirtioBalloonConfig,
+     seccomp_action: SeccompAction,
+@@ -437,6 +509,7 @@ pub struct Balloon {
+ 
+ impl Balloon {
+     // Create a new virtio-balloon.
++    #[allow(clippy::too_many_arguments)]
+     pub fn new(
+         id: String,
+         size: u64,
+@@ -444,8 +517,12 @@ impl Balloon {
+         free_page_reporting: bool,
+         seccomp_action: SeccompAction,
+         exit_evt: EventFd,
++        cold_boot: bool,
+         state: Option<BalloonState>,
+     ) -> io::Result<Self> {
++        let coalesce_inflate =
++            cold_boot && state.is_none() && get_page_size() == 1 << VIRTIO_BALLOON_PFN_SHIFT;
++        info!("Balloon {id}: coalesced inflate = {coalesce_inflate}");
+         let mut queue_sizes = vec![QUEUE_SIZE; MIN_NUM_QUEUES];
+ 
+         let (avail_features, acked_features, config, paused) = if let Some(state) = state {
+@@ -488,6 +565,7 @@ impl Balloon {
+                 paused: Arc::new(AtomicBool::new(paused)),
+                 ..Default::default()
+             },
++            coalesce_inflate,
+             id,
+             config,
+             seccomp_action,
+@@ -626,6 +704,7 @@ impl VirtioDevice for Balloon {
+             reporting_queue_evt,
+             kill_evt,
+             pause_evt,
++            coalesce_inflate: self.coalesce_inflate,
+             pbp: None,
+         };
+ 
+@@ -675,3 +754,296 @@ impl Snapshottable for Balloon {
  }
  impl Transportable for Balloon {}
  impl Migratable for Balloon {}
@@ -76,6 +262,49 @@ index 3db6832..2cfed19 100644
 +    use std::fs::File;
 +    use std::os::fd::FromRawFd;
 +    use vm_memory::FileOffset;
++
++    #[test]
++    fn inflate_descriptor_spans_batches_and_regions() {
++        if get_page_size() != 4096 {
++            return;
++        }
++        let page = 4096;
++        let desc = GuestAddress(16 * page);
++        // Adjacent guest regions may have distinct backing. PFN 4 must
++        // survive the gap even though both neighbors are released.
++        let mem = GuestMemoryMmap::from_ranges(&[
++            (GuestAddress(0), 2 * page as usize),
++            (GuestAddress(2 * page), 4 * page as usize),
++            (desc, (INFLATE_BATCH_PFNS + 1) * 4),
++        ])
++        .unwrap();
++        for i in 0..6 {
++            mem.write_obj(0xa5u8, GuestAddress(i * page)).unwrap();
++        }
++        let mut scratch = Vec::new();
++        BalloonEpollHandler::release_inflate_descriptor(&mem, desc, 0, &mut scratch).unwrap();
++        let mut input = vec![1_u32; INFLATE_BATCH_PFNS + 1];
++        input[..5].copy_from_slice(&[5, 2, 1, 0, 1]);
++        // A different page appears only in the tail of the descriptor.
++        input[INFLATE_BATCH_PFNS] = 3;
++        for (i, &pfn) in input.iter().enumerate() {
++            mem.write_obj(pfn, desc.unchecked_add((4 * i) as u64)).unwrap();
++        }
++        BalloonEpollHandler::release_inflate_descriptor(&mem, desc, input.len(), &mut scratch)
++            .unwrap();
++        let bytes: Vec<u8> = (0..6)
++            .map(|i| mem.read_obj(GuestAddress(i * page)).unwrap())
++            .collect();
++        assert_eq!(bytes, [0, 0, 0, 0, 0xa5, 0]);
++        assert!(scratch.is_empty());
++        // An invalid run must fail even if successive invalid PFNs are adjacent.
++        mem.write_obj(7u32, desc).unwrap();
++        mem.write_obj(8u32, desc.unchecked_add(4)).unwrap();
++        assert!(matches!(
++            BalloonEpollHandler::release_inflate_descriptor(&mem, desc, 2, &mut scratch),
++            Err(Error::GuestMemory(GuestMemoryError::InvalidGuestAddress(_)))
++        ));
++    }
 +
 +    #[test]
 +    fn test_release_empty_madvise_and_punch_error() {
@@ -110,6 +339,13 @@ index 3db6832..2cfed19 100644
 +            BalloonEpollHandler::release_memory_range(&mem, GuestAddress(page as u64), page),
 +            Err(Error::FallocateFail(_))
 +        ));
++        if page == 4096 {
++            mem.write_obj(1u32, GuestAddress(0)).unwrap();
++            assert!(matches!(
++                BalloonEpollHandler::release_inflate_descriptor(&mem, GuestAddress(0), 1, &mut Vec::new()),
++                Err(Error::FallocateFail(_))
++            ));
++        }
 +        assert_eq!(mem.read_obj::<u8>(GuestAddress(page as u64)).unwrap(), 0x5a);
 +    }
 +
@@ -332,6 +568,63 @@ index 5afd056..e846364 100644
  }
  
  fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+diff --git a/vmm/src/device_manager.rs b/vmm/src/device_manager.rs
+index a7d3254..0f8513e 100644
+--- a/vmm/src/device_manager.rs
++++ b/vmm/src/device_manager.rs
+@@ -1116,6 +1116,7 @@ pub struct DeviceManager {
+     // Addresses for ACPI platform devices e.g. ACPI PM timer, sleep/reset registers
+     acpi_platform_addresses: AcpiPlatformAddresses,
+ 
++    cold_boot: bool,
+     snapshot: Option<Snapshot>,
+ 
+     rate_limit_groups: HashMap<String, Arc<RateLimiterGroup>>,
+@@ -1175,6 +1176,7 @@ impl DeviceManager {
+         force_iommu: bool,
+         boot_id_list: BTreeSet<String>,
+         #[cfg(not(target_arch = "riscv64"))] timestamp: Instant,
++        cold_boot: bool,
+         snapshot: Option<&Snapshot>,
+         dynamic: bool,
+     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
+@@ -1388,6 +1390,7 @@ impl DeviceManager {
+             timestamp,
+             pending_activations: Arc::new(Mutex::new(Vec::default())),
+             acpi_platform_addresses: AcpiPlatformAddresses::default(),
++            cold_boot,
+             snapshot: snapshot.cloned(),
+             rate_limit_groups,
+             mmio_regions: Arc::new(Mutex::new(Vec::new())),
+@@ -3557,6 +3560,7 @@ impl DeviceManager {
+                     self.exit_evt
+                         .try_clone()
+                         .map_err(DeviceManagerError::EventFd)?,
++                    self.cold_boot,
+                     state_from_id(self.snapshot.as_ref(), id.as_str())
+                         .map_err(DeviceManagerError::RestoreGetState)?,
+                 )
+diff --git a/vmm/src/vm.rs b/vmm/src/vm.rs
+index db29072..012d740 100644
+--- a/vmm/src/vm.rs
++++ b/vmm/src/vm.rs
+@@ -805,6 +805,8 @@ impl Vm {
+         #[cfg(not(feature = "tdx"))]
+         let dynamic = true;
+ 
++        // A restore may lack the device-manager or balloon subtree.
++        let cold_boot = snapshot.is_none();
+         DeviceManager::new(
+             io_bus,
+             mmio_bus,
+@@ -821,6 +823,7 @@ impl Vm {
+             boot_id_list,
+             #[cfg(not(target_arch = "riscv64"))]
+             timestamp,
++            cold_boot,
+             snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID),
+             dynamic,
+         )
 -- 
 2.43.0
 
