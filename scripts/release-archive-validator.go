@@ -5,11 +5,14 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path"
+	"path/filepath"
+	"runtime/debug"
 	"strings"
 )
 
@@ -67,6 +70,9 @@ func materialContract(name string) (entryContract, bool) {
 }
 
 func main() {
+	if handleVersionQuery() {
+		return
+	}
 	if len(os.Args) != 2 {
 		fmt.Fprintln(os.Stderr, "usage: release-archive-validator <archive>")
 		os.Exit(2)
@@ -143,4 +149,44 @@ func matchesType(actual, expected byte) bool {
 		return actual == tar.TypeReg || actual == tar.TypeRegA
 	}
 	return actual == expected
+}
+
+// This parser is built with GO111MODULE=off and copied as one file by release
+// validation. Keep its query standalone rather than importing module packages.
+func handleVersionQuery() bool {
+	if len(os.Args) < 2 || (os.Args[1] != "version" && os.Args[1] != "--version") {
+		return false
+	}
+	asJSON := len(os.Args) == 3 && os.Args[2] == "--json"
+	if len(os.Args) != 2 && !asJSON {
+		fmt.Fprintln(os.Stderr, "usage: release-archive-validator version [--json]")
+		os.Exit(2)
+	}
+	var values map[string]string
+	if info, ok := debug.ReadBuildInfo(); ok {
+		values = map[string]string{"GoVersion": info.GoVersion}
+		names := map[string]string{"vcs.revision": "GitCommit", "vcs.time": "GitCommitTime", "vcs.modified": "GitModified", "GOOS": "GOOS", "GOARCH": "GOARCH"}
+		for _, setting := range info.Settings {
+			if name, ok := names[setting.Key]; ok {
+				values[name] = setting.Value
+			}
+		}
+	}
+	var err error
+	if asJSON {
+		err = json.NewEncoder(os.Stdout).Encode(values)
+	} else {
+		version := values["GitCommit"]
+		if version == "" {
+			version = "unknown"
+		} else if values["GitModified"] == "true" {
+			version += "-dirty"
+		}
+		_, err = fmt.Fprintln(os.Stdout, filepath.Base(os.Args[0])+" "+version)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	return true
 }

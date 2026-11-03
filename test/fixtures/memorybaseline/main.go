@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/buildversion"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
@@ -120,6 +121,7 @@ func run() error {
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{"identity": scheme + ":" + digest, "Data": memory.Size(), "Bitmap": 0, "ZIP": source.Size() - memory.Size(), "Physical": st.Size(), "tail_source": os.Args[2], "bytes_source": os.Args[3], "mode": os.Args[1]})
 }
 func main() {
+	buildversion.ExitIfRequested()
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

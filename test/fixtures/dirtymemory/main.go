@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"runtime/debug"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/internal/buildversion"
 )
 
 func publish(path string, data []byte) error {
@@ -21,6 +23,7 @@ func publish(path string, data []byte) error {
 }
 
 func main() {
+	buildversion.ExitIfRequested()
 	if len(os.Args) < 2 {
 		panic("expected serve, mutate, read, or check")
 	}

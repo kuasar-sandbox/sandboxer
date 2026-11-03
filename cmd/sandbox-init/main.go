@@ -38,6 +38,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/internal/buildversion"
 	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"golang.org/x/sys/unix"
@@ -65,6 +66,7 @@ const (
 )
 
 func main() {
+	buildversion.ExitIfRequested()
 	// Primary app helper. argv: [self, "exec-child", bootstrap|restart,
 	// isolated, cgroupControl, placeholder, cred, workdir, appPath, args...].
 	if len(os.Args) >= 9 && os.Args[1] == "exec-child" {

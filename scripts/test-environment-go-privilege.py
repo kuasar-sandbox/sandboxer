@@ -31,7 +31,7 @@ out=pathlib.Path(sys.argv[sys.argv.index("-o")+1]);out.write_bytes(b"source fixt
             record = json.loads((work / "driver.json").read_text())
             self.assertEqual(record["env"], {"GOROOT": env["GOROOT"], "GOTOOLCHAIN": env["GOTOOLCHAIN"],
                                             "GOOS": "linux", "GOARCH": "amd64", "GOWORK": "off", "CGO_ENABLED": "0"})
-            self.assertEqual(record["args"][-1], "test/fixtures/usageprobe/main.go")
+            self.assertEqual(record["args"][-1], "./test/fixtures/usageprobe")
             self.assertTrue((work / "out/usage-probe").is_file())
 
     def test_environment_path_driver_is_preserved_in_source_build(self):

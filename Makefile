@@ -34,6 +34,7 @@ endif
 # ---------------------------------------------------------------------------
 GO             := go
 GO_BUILD_FLAGS := -trimpath
+GO_BUILD := GO="$(GO)" bash scripts/build-go.sh
 BINDIR         := bin/$(TARGET_ARCH)
 BUILD_DIR      := build/$(TARGET_ARCH)
 E2E_FIXTURE_DIR ?= $(abspath build/e2e-tools/$(TARGET_ARCH))
@@ -65,13 +66,13 @@ build: sandbox-ctl sandbox-init cloud-hypervisor
 
 sandbox-ctl:
 	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/sandbox-ctl ./cmd/sandbox-ctl
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO_BUILD) $(GO_BUILD_FLAGS) -o $(BINDIR)/sandbox-ctl ./cmd/sandbox-ctl
 	$(call link_bin,sandbox-ctl)
 
 # guest PID 1: stripped (no libc inside the guest rootfs).
 sandbox-init:
 	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '-s -w' -o $(BINDIR)/sandbox-init ./cmd/sandbox-init
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 GO_LDFLAGS='-s -w' $(GO_BUILD) $(GO_BUILD_FLAGS) -o $(BINDIR)/sandbox-init ./cmd/sandbox-init
 	$(call link_bin,sandbox-init)
 
 native-deps:
@@ -84,6 +85,7 @@ cloud-hypervisor:
 	$(call link_bin,cloud-hypervisor)
 
 test: test-e2e-scripts
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-binary-version.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-rust.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-cloud-hypervisor-retry.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
@@ -104,24 +106,24 @@ bench:
 
 e2e-usage-probe:
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
-		-o "$(E2E_FIXTURE_DIR)/usage-probe" test/fixtures/usageprobe/main.go
+	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO_BUILD) $(GO_BUILD_FLAGS) \
+		-o "$(E2E_FIXTURE_DIR)/usage-probe" ./test/fixtures/usageprobe
 
 e2e-artifact-ref:
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
+	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO_BUILD) $(GO_BUILD_FLAGS) \
 		-o "$(E2E_FIXTURE_DIR)/artifact-ref" ./test/fixtures/artifactref
 
 e2e-launch-recovery:
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
+	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO_BUILD) $(GO_BUILD_FLAGS) \
 		-o "$(E2E_FIXTURE_DIR)/launch-recovery" ./test/fixtures/launchrecovery
 
 e2e-dirty-memory:
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/dirty-memory-guest" ./test/fixtures/dirtymemory
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/memorycompare" ./test/fixtures/memorycompare
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/memorybaseline" ./test/fixtures/memorybaseline
+	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO_BUILD) $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/dirty-memory-guest" ./test/fixtures/dirtymemory
+	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO_BUILD) $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/memorycompare" ./test/fixtures/memorycompare
+	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO_BUILD) $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/memorybaseline" ./test/fixtures/memorybaseline
 
 # The cgroup-control E2E must fork before libc or a language runtime starts in
 # order to detect Start->cgroup.procs races. Build that tiny libc-free probe in

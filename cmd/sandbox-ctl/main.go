@@ -10,6 +10,7 @@
 //	publish   — publish a complete E or S graph
 //	checkpoint — list or delete local disk versions
 //	reset     — prepare E from an exact retained run's current disks
+//	version   — print the executable Git description or native build-info JSON
 //
 // See docs/sandbox.md for the full design.
 package main
@@ -22,6 +23,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/kuasar-sandbox/sandboxer/internal/buildversion"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 )
 
@@ -43,6 +45,7 @@ func init() {
 }
 
 func main() {
+	buildversion.ExitIfRequested()
 	if len(os.Args) < 2 {
 		printUsage(os.Stderr)
 		os.Exit(2)
@@ -103,6 +106,8 @@ func printUsage(w *os.File) {
 	fmt.Fprintf(w, `sandbox-ctl — sandbox runtime control
 
 Usage:
+  sandbox-ctl version   [--json]
+  sandbox-ctl --version
   sandbox-ctl run       [--config host.yaml[:instance.yaml]] [--manifest-config <path>]
                         [--sandbox-id <sid>] [--path-id <leaf>] [--ch-binary <path>]
                         [--run-root <dir>] [--base-root <dir>] [--enable-checkpoint]

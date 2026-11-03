@@ -38,6 +38,8 @@ Snapshot reuse is represented by explicit parent and child references. Multiple 
 
 `sandbox-init` is built here and packaged into `sandbox-runtime.bundle` by [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime).
 
+Use `sandbox-ctl --version` or `sandbox-init --version` to inspect a copied binary without Go, Git, or PID 1. See [binary version queries](docs/version.md) for the flat JSON fields and helper coverage.
+
 ## Public integration packages
 
 | Package | Purpose |
