@@ -27,6 +27,9 @@ parser.add_argument("--adjacent-only", action="store_true", help="supplemental n
 parser.add_argument("--large-probe", type=Path, help="Guest binary built from vhost_large_read.c")
 parser.add_argument("--trace", action="store_true", help="append a separate traced diagnostic")
 args = parser.parse_args()
+# Use the same local binaries for fingerprinting and every process launch.
+args.ctl = args.ctl.resolve()
+args.ch = args.ch.resolve()
 inputs, out = args.inputs.resolve(), args.output.resolve()
 out.mkdir(exist_ok=False, parents=True)
 disk = out / "data.diff"
