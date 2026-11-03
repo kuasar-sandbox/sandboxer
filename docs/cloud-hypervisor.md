@@ -298,8 +298,8 @@ validation requirements, not a claim that an unexecuted run passed.
 
 ### 3.4 0004 — preserve logical release before sparse reclaim
 
-Changed files: `virtio-devices/src/balloon.rs` and
-`virtio-devices/src/seccomp_filters.rs`. Problem report: [#378](https://github.com/kuasar-sandbox/sandboxer/issues/378).
+The release implementation and seccomp policy live in `virtio-devices`.
+`vmm/src/vm.rs` and `device_manager.rs` pass VM creation provenance to the balloon. Problem report: [#378](https://github.com/kuasar-sandbox/sandboxer/issues/378).
 
 The original optimization skipped both `PUNCH_HOLE` and `MADV_DONTNEED` when
 `SEEK_DATA` proved the backing range was physically empty. It reduced synchronous
@@ -330,10 +330,18 @@ The actual file-backed predicate is `region.file_offset().is_some()`, not
 position is not used by the mapping/positioned-punch data path. Balloon seccomp
 continues to allow `lseek`; `fallocate` and common `madvise` were already allowed.
 
-Hole-only release again pays for synchronous REMOVE handling, potentially
-increasing cold-start balloon convergence time. Physical inode punching can still
-be skipped. This fixes correctness without promising a new speedup, suppressing
-events, introducing WP negotiation or raising the Host kernel baseline.
+On a 4 KiB host, ordinary cold VMs and cold Build producers sort and deduplicate
+up to 8192 PFNs at a time within each inflate descriptor. Adjacent PFNs in one
+memory region have consecutive backing offsets and share a release. The worker
+consumes every chunk, including the tail, before acknowledging the descriptor.
+The 32 KiB scratch limit bounds one chunk. A queue callback can process many
+chunks and descriptors.
+
+The VMM records whether the top-level VM snapshot was absent before looking up
+the device manager. The balloon also requires absent balloon state. This
+runtime choice lasts for that VM, including subsequent inflation. Every new
+restore instance uses per-PFN release even if either child snapshot is missing.
+Larger host pages retain partial-page ownership tracking.
 
 Run the ordinary error-path regression and the explicit native UFFD tests:
 
@@ -699,8 +707,8 @@ The rationale and replacement feedback loop are described in the
 [guest kernel specification §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md#55-why-free_page_reporting-is-not-negotiated-and-the-role-of-virtio_mem). The sandbox-local BalloonController instead pushes inflate targets through
 `/vm.resize`, with at most one 64 MiB steady-shrink step for each fresh report.
 Patch 0004 preserves REMOVE for empty cold-start ranges as well as resident
-runtime reclaim. Only redundant inode punching is skipped; synchronous event
-processing can increase cold-start convergence time.
+runtime reclaim. Cold-created VMs on 4 KiB hosts combine adjacent PFNs to reduce synchronous
+REMOVE processing (§3.4).
 `deflate_on_oom` is native to upstream v51.1 and needs no additional patch.
 
 ## 7. Known limitations

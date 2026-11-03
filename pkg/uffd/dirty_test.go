@@ -13,8 +13,24 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// dispatchFirstPageFault dispatches one event on the registered shmem mapping.
+// Tests that assert clean installation need to exclude independently queued
+// duplicate faults, whose EEXIST is intentionally tracked as dirty.
+func dispatchFirstPageFault(t *testing.T, h *Handler) {
+	t.Helper()
+	va, fd, covered, err := h.addrMap.registration(0, PageSize)
+	if err != nil || fd <= 0 || covered != PageSize {
+		t.Fatalf("invalid CH registration: fd=%d covered=%d err=%v", fd, covered, err)
+	}
+	h.handleFault(faultEvent{address: va, uffdFD: fd}, make([]byte, PageSize))
+	if h.state.Get(0) != StateLoaded {
+		t.Fatal("first page remains uninstalled")
+	}
+}
+
 func TestRealMissingCleanFillRecordedWriteAndReleaseCapture(t *testing.T) {
 	h, backend, cpu := realShmemHandler(t, 32, newRecordingSnapshot(32*PageSize, sparse.Data, 0x37))
+	dispatchFirstPageFault(t, h)
 	if cpu[0] != 0x37 {
 		t.Fatal("urgent fill content")
 	}
@@ -124,6 +140,7 @@ func TestRealMissingCleanFillRecordedWriteAndReleaseCapture(t *testing.T) {
 func TestRealMissingZeroAndTailDoNotInventDirtyWrites(t *testing.T) {
 	for _, source := range []SnapshotReader{ZeroSource{}, newRecordingSnapshot(32*PageSize, sparse.Zero, 0), newRecordingSnapshot(32*PageSize, sparse.Hole, 0)} {
 		h, backend, cpu := realShmemHandler(t, 32, source)
+		dispatchFirstPageFault(t, h)
 		if cpu[0] != 0 {
 			t.Fatal("zero content")
 		}
@@ -155,6 +172,36 @@ func TestRealMissingZeroAndTailDoNotInventDirtyWrites(t *testing.T) {
 		}
 	}
 }
+
+func TestRealMissingDuplicateFaultPreservesResidentWrite(t *testing.T) {
+	h, backend, cpu := realShmemHandler(t, 1, ZeroSource{})
+	// EnsureLoaded installs an actual folio before the stale event arrives.
+	if err := h.EnsureLoaded(context.Background(), 0, PageSize); err != nil {
+		t.Fatal(err)
+	}
+	backend[0] = 0x57
+	dispatchFirstPageFault(t, h)
+	v, err := h.CaptureView()
+	if err != nil || !bytes.Equal(v.Materialized, []byte{1}) ||
+		!bytes.Equal(v.Dirty, []byte{1}) || !bytes.Equal(v.Released, []byte{0}) || cpu[0] != 0x57 {
+		t.Fatalf("duplicate fault lost live data: view=%+v cpu=%x err=%v", v, cpu[0], err)
+	}
+	for _, working := range []bool{false, true} {
+		selected, _, err := snapshot.CaptureMemory(bytes.NewReader(backend), v, working)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := selected.RunAt(0, PageSize)
+		if err != nil || run.Kind() != sparse.Data {
+			t.Fatalf("missing Data: run=%v err=%v", run, err)
+		}
+		buf := make([]byte, PageSize)
+		if _, err := run.ReadAt(context.Background(), buf, 0); err != nil || !bytes.Equal(buf, backend) {
+			t.Fatalf("capture failed to preserve resident contents: %v", err)
+		}
+	}
+}
+
 func TestCaptureIncludesKnownLoadedHoleAsZero(t *testing.T) {
 	h, _, _ := realShmemHandler(t, 1, ZeroSource{})
 	h.installMu.Lock()

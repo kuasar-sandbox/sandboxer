@@ -252,7 +252,8 @@ guest 的 pinning/prefetch 可能填充候选页，因此 E2E 本身不能证明
 
 ### 3.4 0004 — 先保留逻辑释放通知，再稀疏回收
 
-修改 `virtio-devices/src/balloon.rs` 和 `virtio-devices/src/seccomp_filters.rs`。
+释放实现和 seccomp 策略位于 `virtio-devices`。
+`vmm/src/vm.rs` 和 `device_manager.rs` 将 VM 创建来源传给 balloon。
 问题报告：[ #378](https://github.com/kuasar-sandbox/sandboxer/issues/378)。
 
 原优化在 SEEK_DATA 证明物理范围为空时，同时跳过 PUNCH_HOLE 和 MADV_DONTNEED，
@@ -278,9 +279,14 @@ guest 的 pinning/prefetch 可能填充候选页，因此 E2E 本身不能证明
 advice。映射/显式偏移打洞不依赖共享 file position。balloon seccomp 继续允许
 lseek，fallocate 和公共 madvise 原本已允许。
 
-hole-only 释放重新承担同步 REMOVE 开销，冷启动 balloon 收敛可能变慢；仍可省略
-物理 inode 的冗余打洞。本修复不承诺额外加速，不抑制通知、不引入 WP 协商，也不
-提高 Host 内核基线。
+在 4 KiB Host 上，普通冷创建 VM 和冷 Build producer 对每个 inflate descriptor 分块，
+每块最多排序、去重 8192 个 PFN。同一内存 region 中相邻 PFN 的 backing offset 连续，
+可一次释放。worker 完整处理所有块和尾批后才 ACK。32 KiB 暂存上限针对单块，
+一次 queue callback 可以处理多个块和 descriptor。
+
+VMM 在提取 DeviceManager 子树前根据顶层 VM snapshot 是否存在记录创建来源。
+Balloon 还要求自身没有恢复状态。该运行时选择持续整个 VM 生命周期，包含后续充气。
+新恢复实例即便缺少任一子树也逐 PFN 释放。较大 Host 页继续跟踪局部页所有权。
 
 执行普通错误路径回归及显式原生 UFFD 测试：
 
@@ -580,8 +586,8 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 [Guest Kernel §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux_zh.md#55-为什么不启用-free_page_reporting以及-virtio_mem-的角色))。改由 sandbox-local BalloonController
 经 `/vm.resize` 推 inflate target;steady shrink 每份 fresh report 最多一个
 64MiB step。冷启动命令行 target
-覆盖的稀疏区间与运行时驻留回收都由 0004 保留 REMOVE，仅省略冗余 inode 打洞；
-同步事件处理可能增加冷启动收敛时间。
+覆盖的稀疏区间与运行时驻留回收都由 0004 保留 REMOVE，只跳过冗余打洞。4 KiB Host 上的冷创建 VM 合并连续 PFN，
+以减少同步 REMOVE 处理次数（§3.4）。
 `deflate_on_oom` 是 upstream v51.1 原生,无需新 patch。
 
 ## 7. 已知限制
