@@ -169,7 +169,7 @@ func TestServer_ResetClearsState(t *testing.T) {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	close(done)
-	srv.queues[0] = &virtq{stop: stop, done: done}
+	srv.queues[0] = &virtq{kickFd: -1, callFd: -1, stop: stop, done: done}
 	srv.mu.Unlock()
 
 	// Mark reset done via a goroutine.

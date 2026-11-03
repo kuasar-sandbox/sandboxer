@@ -230,3 +230,50 @@ func reportSamples(b *testing.B, samples []int64) {
 	b.ReportMetric(float64(samples[len(samples)/2])/1000, "p50-us")
 	b.ReportMetric(float64(samples[len(samples)*99/100])/1000, "p99-us")
 }
+
+// Use the same fixture on both revisions to isolate descriptor processing,
+// copying and clearing from host storage and Guest buffer allocation.
+func BenchmarkResidentReadSegments(b *testing.B) {
+	for _, tc := range []struct {
+		name  string
+		sizes []int
+	}{
+		{"single-4k", []int{4096}},
+		{"single-256k", []int{256 << 10}},
+		{"64x4k", segmentSizes(256<<10, "256x4k")},
+		{"64x4k-reverse", segmentSizes(256<<10, "256x4k")},
+		{"4x256k-reverse", segmentSizes(1<<20, "4x256k")},
+		{"single-1m", []int{1 << 20}},
+		{"4x256k", segmentSizes(1<<20, "4x256k")},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			length := 0
+			for _, size := range tc.sizes {
+				length += size
+			}
+			backend := &memBackend{data: bytes.Repeat([]byte{0x71}, length)}
+			s, q, _, data := segmentQueue(backend, BlkTypeIn, tc.sizes)
+			if tc.name == "64x4k-reverse" || tc.name == "4x256k-reverse" {
+				mem := s.memTable.regions[0].mmapBytes
+				end := len(mem) - 1
+				for i, size := range tc.sizes {
+					end -= size
+					binary.LittleEndian.PutUint64(mem[(i+1)*16:], uint64(end))
+				}
+			}
+			q.ctx, q.cancel = context.WithCancel(context.Background())
+			defer q.cancel()
+			b.SetBytes(int64(length))
+			b.ReportAllocs()
+			for b.Loop() {
+				n, err := s.processChain(q, 0)
+				if n != length+1 || err != nil || data[length] != BlkStatusOK {
+					b.Fatalf("n=%d status=%d err=%v", n, data[length], err)
+				}
+			}
+			if !bytes.Equal(data[:length], backend.data) {
+				b.Fatal("incorrect read")
+			}
+		})
+	}
+}

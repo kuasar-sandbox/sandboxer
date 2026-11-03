@@ -98,10 +98,10 @@ func minimalProfileU64(v uint64) []byte {
 func TestMinimalProfileFeatures(t *testing.T) {
 	for _, ro := range []bool{false, true} {
 		name := "rw"
-		want := uint64(0x0000000140002200)
+		want := uint64(0x0000000140002204)
 		if ro {
 			name = "ro"
-			want = 0x0000000140000220
+			want = 0x0000000140000224
 		}
 		t.Run(name, func(t *testing.T) {
 			b := &minimalProfileBackend{memBackend: &memBackend{data: make([]byte, 4096)}, readOnly: ro}
@@ -212,7 +212,7 @@ func TestMinimalProfileRejectReconnect(t *testing.T) {
 					c.Close()
 					c2 := dial()
 					reply := minimalProfileRequest(t, c2, MsgGetFeatures, nil)
-					if !bytes.Equal(reply.Payload, minimalProfileU64(0x140002200)) {
+					if !bytes.Equal(reply.Payload, minimalProfileU64(0x140002204)) {
 						t.Fatalf("reconnected profile=%x", reply.Payload)
 					}
 					srv.mu.Lock()
@@ -242,6 +242,7 @@ func TestMinimalProfileConfig(t *testing.T) {
 	c := dial()
 	want := make([]byte, BlkConfigSize)
 	binary.LittleEndian.PutUint64(want[:8], capacity)
+	binary.LittleEndian.PutUint32(want[12:16], 64)
 	binary.LittleEndian.PutUint32(want[36:40], 8192)
 	binary.LittleEndian.PutUint32(want[40:44], 1)
 	binary.LittleEndian.PutUint32(want[44:48], 8)
