@@ -123,15 +123,20 @@ The Go import surface is intentionally narrow:
 | `accelerator` | Manifest, cache/store clients, sparse/image helpers | Snapshot ingest/fetch, block reads, and flattened-image configuration |
 | `connector` | `pkg/tapfd` | Receive TAP and network-namespace file descriptors |
 
-Go-only source builds need this repository plus sibling `accelerator` and
-`connector` checkouts. The tracked local `replace` directives remain active with
-`GOWORK=off`. Internal `require` versions describe each component's target formal
-release (Daily Preview uses that target without the preview suffix); the target
-tag need not exist yet because builds use the sibling source. Record the actual
-source SHAs for validation rather than treating that version label as the compiled
-revision. Use the [project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox)
-for the complete system. Patched Cloud Hypervisor, Guest Runtime and Kernel are
-separate native/runtime prerequisites, not dependencies of every Go-only check.
+Standalone Go builds use the obtainable dependency versions committed in `go.mod`.
+For a coordinated Preview build, check out the selected `sandboxer`, `accelerator`
+and `connector` tags and generate a workspace containing exactly those three modules:
+
+```bash
+GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners sandboxer)" || exit 1
+export GOWORK
+make build
+```
+
+The workspace uses local modules without additional `replace` directives and leaves
+`go.mod`/`go.sum` unchanged. Helper builds inherit the same selection. Patched Cloud
+Hypervisor, Guest Runtime and Kernel remain separate native/runtime prerequisites.
+Use the [project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox) for the complete system.
 
 ## Release model
 

@@ -104,24 +104,24 @@ bench:
 
 e2e-usage-probe:
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
 		-o "$(E2E_FIXTURE_DIR)/usage-probe" test/fixtures/usageprobe/main.go
 
 e2e-artifact-ref:
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
 		-o "$(E2E_FIXTURE_DIR)/artifact-ref" ./test/fixtures/artifactref
 
 e2e-launch-recovery:
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
 		-o "$(E2E_FIXTURE_DIR)/launch-recovery" ./test/fixtures/launchrecovery
 
 e2e-dirty-memory:
 	@mkdir -p "$(E2E_FIXTURE_DIR)"
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/dirty-memory-guest" ./test/fixtures/dirtymemory
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/memorycompare" ./test/fixtures/memorycompare
-	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/memorybaseline" ./test/fixtures/memorybaseline
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/dirty-memory-guest" ./test/fixtures/dirtymemory
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/memorycompare" ./test/fixtures/memorycompare
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/memorybaseline" ./test/fixtures/memorybaseline
 
 # The cgroup-control E2E must fork before libc or a language runtime starts in
 # order to detect Start->cgroup.procs races. Build that tiny libc-free probe in

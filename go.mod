@@ -18,14 +18,9 @@ require (
 
 require (
 	github.com/coreos/go-systemd/v22 v22.5.0
-	github.com/kuasar-sandbox/accelerator v0.1.3
-	github.com/kuasar-sandbox/connector v0.1.2
+	github.com/kuasar-sandbox/accelerator v0.1.10
+	github.com/kuasar-sandbox/connector v0.1.6
 	golang.org/x/crypto v0.56.0
 	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0
-)
-
-replace (
-	github.com/kuasar-sandbox/accelerator => ../accelerator
-	github.com/kuasar-sandbox/connector => ../connector
 )

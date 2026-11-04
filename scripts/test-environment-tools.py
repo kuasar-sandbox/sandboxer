@@ -86,6 +86,23 @@ class EnvironmentTools(unittest.TestCase):
                 self.assertIn("must support api --slurp", result.stderr)
                 self.assertNotIn("REMOTE_OPERATION", result.stdout)
 
+    def test_workspace_failure_stops_before_building(self):
+        commands=[]
+        for workflow in (ROOT / '.github/workflows').glob('*.yml'):
+            lines=workflow.read_text().splitlines()
+            for index,line in enumerate(lines):
+                if 'GOWORK=' in line and 'go_workspace.py' in line:
+                    commands.append(line.strip()+'\n'+lines[index+1].strip())
+        self.assertTrue(commands)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);python=root/'python3'
+            python.write_text('#!/bin/sh\nexit 23\n');python.chmod(0o755)
+            for command in commands:
+                result=subprocess.run([shutil.which('bash'),'-e','-c',command+'\necho BUILD_WAS_RUN'],
+                    env=dict(os.environ,PATH=str(root)),text=True,capture_output=True)
+                self.assertEqual(result.returncode,23)
+                self.assertNotIn('BUILD_WAS_RUN',result.stdout)
+
     def test_release_jobs_do_not_pin_toolchain_policy_or_install_cli(self):
         for workflow in (ROOT / ".github/workflows").glob("*.yml"):
             source = workflow.read_text()
