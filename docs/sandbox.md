@@ -429,9 +429,9 @@ already assembled Snapshot, the caller supplies its known final E:
 result, err := publisher.PublishSource(ctx, artifact.RoleSnapshot, source, cfg.SandboxRef)
 ```
 
-This creation path owns no original root, so its removals are empty. It reads the
-selected configuration to check retained named-location dependencies. The caller
-keeps ownership of the assembled source.
+This creation path owns no original root, so its removals are empty. It uses the
+caller-supplied role and final E without scanning the assembled source or opening
+its published dependencies. The caller keeps ownership of the assembled source.
 
 ```bash
 sandbox-ctl publish --json --quiet --to-ref-location release=file:///srv/sandbox-artifacts ./s1.snapshot
@@ -2375,9 +2375,9 @@ crypto:
 
 `crypto.local` controls local working files, active DIFFs, checkpoints and local materialization. The default, `off`, reads and writes plaintext. `auto` reads plaintext or authenticated ciphertext and encrypts new local output. `required` also rejects plaintext local inputs. Private checkpoint materialization files stay in the local domain until published.
 
-`crypto.ref` controls tarstreams read from or written to named ref locations, including retained disk and memory dependencies. Its default is `auto` regardless of `local`.
+`crypto.ref` controls tarstreams actually read from or written to named ref locations. Its default is `auto` regardless of `local`. Keeping an already-published dependency reference unchanged is not a read and does not apply a new crypto policy to that parent.
 
-| `crypto.ref` | Read or retain plaintext | Read or retain ciphertext with the correct key | New tarstream |
+| `crypto.ref` | Read plaintext | Read ciphertext with the correct key | New tarstream |
 | --- | --- | --- | --- |
 | `off` | Allow | Reject | Plaintext, `@digest` |
 | `auto` | Allow | Allow | Encrypted, `@hmac` |
@@ -2385,11 +2385,11 @@ crypto:
 
 With the example above, a VM can capture a plaintext local checkpoint, publish encrypted E/S tarstreams, restore them with the same key, and write new plaintext local DIFFs. Without a config file, `sandbox-ctl publish --to-ref-location` uses `ref: auto` and requires a valid `MANIFEST_KEY`. Supply the same key to config-free `info` and `run --from` or `run --restore` when opening the named ref. A missing or incorrect key, authentication failure or identity mismatch fails the operation. SDK callers supply their own resolver through `NewProcessStorageWithCustomerKey`.
 
-On upgrade, existing `local: off` installations need a key for new named-location publications. To keep the old publication policy, explicitly copy the former `local` value to `ref`. In particular, set `ref: required` to preserve rejection of plaintext dependencies after upgrading from `local: required`. Enable this field with a sandboxer version that implements it. Older loaders may accept the YAML and ignore the field.
+On upgrade, existing `local: off` installations need a key for new named-location publications. To keep the old publication policy, explicitly copy the former `local` value to `ref`. In particular, set `ref: required` to reject plaintext when reading named-location files after upgrading from `local: required`. Enable this field with a sandboxer version that implements it. Older loaders may accept the YAML and ignore the field.
 
-Auto mode may retain portable plaintext dependencies. It does not migrate the historical graph. When retaining a named tarstream, the publisher checks the selected physical carrier, envelope and expected identity without reading every disk or memory byte. New or colliding targets still undergo complete stream verification. Manifest and Bundle keep their existing encoding, authentication and exact-copy rules. External tarstreams actually selected by a Bundle follow `crypto.ref`.
+Publication preserves already-published disk and memory parent references without opening or checking their files. This applies to ordinary E/S publication, Bundle publication and direct `PublishSource`; it does not require parent location mappings, parent availability or parent keys solely to keep those references. Publication does not validate or migrate the whole historical graph. Actual reads still enforce the configured crypto policy and expected identity, including reads needed to materialize a checkpoint, transform a source, or inspect the selected E for its checkpoint metadata. New or colliding targets still undergo complete stream verification. Manifest and Bundle keep their existing encoding, authentication and exact-copy rules; carrier reads required by their source selection and transfer remain necessary.
 
-Reusing an existing file requires revalidation of its role, logical size, content identity, and complete stream. Local output and named ref-location commit strategies are deliberately separate. Artifact capture/publication defines logical completion, not stable-storage durability. Local output relies on complete writes, checked `Close()`, content-addressed no-replace rename, and atomic alias rename. Named locations rely on exclusive creation, checked `Close()`, final-path reopening/full verification, and path-identity checks. Neither artifact-publication path explicitly flushes files/directories; physical writeback depends on the filesystem/storage implementation. This differs from the fsynced run-directory C0 write in §3.6.
+Reusing an existing output file at the publication target requires revalidation of its role, logical size, content identity, and complete stream. Local output and named ref-location commit strategies are deliberately separate. Artifact capture/publication defines logical completion, not stable-storage durability. Local output relies on complete writes, checked `Close()`, content-addressed no-replace rename, and atomic alias rename. Named locations rely on exclusive creation, checked `Close()`, final-path reopening/full verification, and path-identity checks. Neither artifact-publication path explicitly flushes files/directories; physical writeback depends on the filesystem/storage implementation. This differs from the fsynced run-directory C0 write in §3.6.
 
 <a id="local-output"></a>
 
@@ -2407,7 +2407,7 @@ For `snapshot/export --output`, `FileSink` writes a unique same-directory tempor
 
 Fresh finals have mode `0644`. During the sole write, `tarstream.WriteTo` checks source reads and destination writes, reproducing the carrier-provided scheme/digest. While the owned write fd is still open, `lstat` and `SameFile` confirm the canonical path still identifies the inode created by this invocation's `O_EXCL`. A metadata-only guard fd pins that inode across checked `Close`. The publisher then reopens with `O_RDONLY|O_NOFOLLOW` (also nonblocking so unexpected FIFOs cannot stall validation) and fully verifies regular-file type, role/payload name, logical size, canonical tarstream, marker, codec, crypto policy, digest scheme/digest, and the complete sequential stream. Path identity is checked again after validation. Existing finals undergo the same complete content validation; successful reuse does not change inode or bytes.
 
-Manifest Bundles do not enter the tarstream E/S rebuilding path. Their root Manifest key supplies `@manifest` identity. The location target first forces verification of the selected Manifest closure, recorded admission, physical keys, and crypto domain. It then performs ordered exact-byte copying of same-directory dependency Bundles and publishes the root `<key>.bundle` last. Each shared final is written once, reopened, validated as a canonical Bundle/root, and compared byte-for-byte with its source; the selected closure is strictly reverified through the target fd. This creates no `.snapshot`/`.sandbox` substitute and does not rewrite the Bundle's `snapshot.cfg`.
+Manifest Bundles do not enter the tarstream E/S rebuilding path. Their root Manifest key supplies `@manifest` identity. Source selection keeps the current-Bundle, ordered-refs, then remote precedence. A remote Manifest reference is retained without fetching its payload. A selected named Bundle remains at its original location: selection may read its member index, but location publication does not verify or copy its payload merely to retain that binding. The location target verifies the selected Manifests that it actually copies, including recorded admission, physical keys, and crypto domain. It performs ordered exact-byte copying of same-directory dependency Bundles and publishes the root `<key>.bundle` last. Each shared final is written once, reopened, validated as a canonical Bundle/root, and compared byte-for-byte with its source; the copied selection is strictly reverified through the target fd. Uploading a selected Bundle to a Manifest store still reads and verifies the physical objects it transfers. This creates no `.snapshot`/`.sandbox` substitute and does not rewrite the Bundle's `snapshot.cfg`.
 
 The final path is briefly visible before writing finishes. Normal consumers must use only a root ref returned successfully by the publisher, which continues to publish dependencies first and root last. A concurrent publisher encountering a partial final reopens and validates it with bounded, context-aware exponential backoff. If the writer completes within that window, the final is reused. A still-incomplete or invalid final after bounded retries fails closed with an explicit cleanup/repair requirement; the publisher does not delete another owner's path. Symlinks, directories, FIFOs, and other nonregular finals are also rejected and preserved. Cleanup removes only a failed write for which this publisher successfully acquired `O_EXCL` and whose path still identifies the recorded inode. Abandoned finals of unknown ownership need explicit cleanup or an owning retention/GC policy.
 
@@ -2429,7 +2429,7 @@ logical source
   -> file://<root>.bundle@manifest:<root>#<location>
 ```
 
-For assembled E/S sources with external named files, use `NewSingleRootBundlePublisherWithLocations` and pass the trusted input location map. These directories are used only to check the selected dependencies. The Bundle retains their portable refs and is written to the requested output location.
+Assembled E/S sources may contain already-published named references. `NewSingleRootBundlePublisher` preserves those references without input location maps or parent-file reads and writes only the new Bundle to the requested output location.
 
 The source supports repeated reads. The first pass retains the root Manifest key, a physical Bundle digest and format metadata while discarding encoded Chunk bytes. The second pass writes the final `<root>.bundle` directly and checks the generated root against the planned identity. The customer key is resolved once for the publication; both passes use the same admission and encoding settings.
 

@@ -122,43 +122,56 @@ func (t *reportMetadataTarget) Put(context.Context, LogicalRole, sparse.Source) 
 func (*reportMetadataTarget) Close() error { return nil }
 
 func TestPublishSourceReportUsesKnownMetadata(t *testing.T) {
-	target := &reportMetadataTarget{}
-	p := newPublisher(nil, nil, target, nil)
-	for _, role := range []LogicalRole{RoleImage, RoleSandbox, RoleSnapshot} {
-		var known []string
-		if role == RoleSnapshot {
-			known = []string{"manifest://" + fmt.Sprintf("%064x", 42)}
-		}
-		result, err := p.PublishSource(context.Background(), role, reportNoReadSource{}, known...)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(result.RemovedRefs) != 0 || result.RemovedRefs == nil {
-			t.Fatal("creation removals must be empty array")
-		}
-		if role == RoleSnapshot && result.SandboxRef != known[0] {
-			t.Fatal("known E lost")
-		}
-		if role != RoleImage {
-			report, err := result.Report()
-			if err != nil {
-				t.Fatal(err)
-			}
-			for range 3 {
-				if _, err := json.Marshal(report); err != nil {
+	for _, withStorage := range []bool{false, true} {
+		t.Run(fmt.Sprintf("storage=%t", withStorage), func(t *testing.T) {
+			var storage *ProcessStorage
+			if withStorage {
+				var err error
+				storage, err = NewProcessStorage(nil)
+				if err != nil {
 					t.Fatal(err)
 				}
+				defer storage.Close()
 			}
-		}
-	}
-	if target.calls != 3 {
-		t.Fatalf("Put calls=%d", target.calls)
-	}
-	if _, err := p.PublishSource(context.Background(), RoleSnapshot, reportNoReadSource{}); err == nil {
-		t.Fatal("missing known E accepted")
-	}
-	if target.calls != 3 {
-		t.Fatal("missing metadata wrote output")
+			target := &reportMetadataTarget{}
+			p := newPublisher(storage, nil, target, nil)
+			for _, role := range []LogicalRole{RoleImage, RoleSandbox, RoleSnapshot} {
+				var known []string
+				if role == RoleSnapshot {
+					known = []string{"manifest://" + fmt.Sprintf("%064x", 42)}
+				}
+				result, err := p.PublishSource(context.Background(), role, reportNoReadSource{}, known...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(result.RemovedRefs) != 0 || result.RemovedRefs == nil {
+					t.Fatal("creation removals must be empty array")
+				}
+				if role == RoleSnapshot && result.SandboxRef != known[0] {
+					t.Fatal("known E lost")
+				}
+				if role != RoleImage {
+					report, err := result.Report()
+					if err != nil {
+						t.Fatal(err)
+					}
+					for range 3 {
+						if _, err := json.Marshal(report); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+			if target.calls != 3 {
+				t.Fatalf("Put calls=%d", target.calls)
+			}
+			if _, err := p.PublishSource(context.Background(), RoleSnapshot, reportNoReadSource{}); err == nil {
+				t.Fatal("missing known E accepted")
+			}
+			if target.calls != 3 {
+				t.Fatal("missing metadata wrote output")
+			}
+		})
 	}
 }
 

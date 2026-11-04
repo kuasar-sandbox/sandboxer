@@ -10,7 +10,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
-	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
@@ -169,15 +168,8 @@ func selectExactBundleSources(
 			}
 			continue
 		}
-		stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return source.OpenManifest(ctx, key) })
-		if err != nil {
-			return manifestbundle.ExactManifest{}, nil, nil, nil, 0, fmt.Errorf("publish Bundle remote dependency %s: %w", manifest.HexKey(key), err)
-		}
-		consumeErr := consumeLocationSource(ctx, stream)
-		closeErr := stream.Close()
-		if err := errors.Join(consumeErr, closeErr); err != nil {
-			return manifestbundle.ExactManifest{}, nil, nil, nil, 0, fmt.Errorf("verify Bundle remote dependency %s: %w", manifest.HexKey(key), err)
-		}
+		// The remote Manifest remains a reference in either output. Its bytes
+		// are not copied, so source selection must not open or verify it.
 		remoteDependencies++
 	}
 	return exactRoot, exactDependencies, selectedSources, locatedExact, remoteDependencies, nil
@@ -195,7 +187,7 @@ func (p *Publisher) inspectBundleRoot(
 		if sandboxRoot.Checkpoint != nil {
 			return "", nil, "", errBundleCheckpoint
 		}
-		if err := p.retainLocatedDisks(ctx, sandboxRoot.Portable, rootScope); err != nil {
+		if err := p.retainLocatedDisks(sandboxRoot.Portable, rootScope); err != nil {
 			return "", nil, "", err
 		}
 		dependencies, err := manifestDependenciesFromSandbox(sandboxRoot.Portable, rootKey)
@@ -226,7 +218,7 @@ func (p *Publisher) inspectBundleRoot(
 	}
 
 	for _, raw := range cfg.FromRefs {
-		if err := p.retainLocated(ctx, raw, childScope); err != nil {
+		if err := p.retainLocated(raw, childScope); err != nil {
 			return "", nil, "", err
 		}
 	}
@@ -251,10 +243,10 @@ func (p *Publisher) inspectBundleRoot(
 	if sandboxRoot.Checkpoint != nil {
 		return "", nil, "", errBundleCheckpoint
 	}
-	if err := p.retainLocated(ctx, cfg.SandboxRef, childScope); err != nil {
+	if err := p.retainLocated(cfg.SandboxRef, childScope); err != nil {
 		return "", nil, "", err
 	}
-	if err := p.retainLocatedDisks(ctx, sandboxRoot.Portable, sandboxScope); err != nil {
+	if err := p.retainLocatedDisks(sandboxRoot.Portable, sandboxScope); err != nil {
 		return "", nil, "", err
 	}
 	if err := appendManifestDependency(cfg.SandboxRef, "snapshot sandbox_ref", seen, &dependencies); err != nil {
@@ -317,41 +309,22 @@ func bundleMemberRef(carrier string, key store.ContentKey) string {
 	return ref.String()
 }
 
-// A located payload is opened through the same identity-checked reader as
-// restore. Logical parents are opaque here. Ordinary Manifest refs keep their
-// existing source selection and need no extra fetch for tarstream policy.
-func (p *Publisher) checkLocated(ctx context.Context, ref manifest.Ref, scope publishScope) error {
-	if ref.Scheme != manifest.RefSchemeFile || ref.Location == "" {
-		return nil
-	}
-	raw := ref.String()
-	if _, seen := p.checkedLocated[scopeKey(scope, raw)]; seen {
-		return nil
-	}
-	stream, _, err := p.open(ctx, raw, scope)
-	if err != nil {
-		return err
-	}
-	return stream.Close()
-}
-
-func (p *Publisher) retainLocated(ctx context.Context, raw string, scope publishScope) error {
+// Recording an unchanged published dependency must not open it. Availability,
+// encryption and identity are checked when an operation actually reads it.
+func (p *Publisher) retainLocated(raw string, scope publishScope) error {
 	ref, err := manifest.ParseRef(raw)
 	if err != nil {
 		return err
 	}
 	if ref.Scheme == manifest.RefSchemeFile && ref.Location != "" {
-		if err := p.checkLocated(ctx, ref, scope); err != nil {
-			return err
-		}
 		p.original(raw, scope)
 		p.retained(raw, scope)
 	}
 	return nil
 }
-func (p *Publisher) retainLocatedDisks(ctx context.Context, cfg *config.PortableSandboxConfig, scope publishScope) error {
+func (p *Publisher) retainLocatedDisks(cfg *config.PortableSandboxConfig, scope publishScope) error {
 	for _, dep := range portableDiskRefs(cfg) {
-		if err := p.retainLocated(ctx, dep.raw, scope); err != nil {
+		if err := p.retainLocated(dep.raw, scope); err != nil {
 			return err
 		}
 	}

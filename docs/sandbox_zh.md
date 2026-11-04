@@ -409,7 +409,7 @@ JSON 不增加 path、context、identifier 或字段映射对象，成功结果�
 result, err := publisher.PublishSource(ctx, artifact.RoleSnapshot, source, cfg.SandboxRef)
 ```
 
-纯创建路径没有原根，差集为空。发布器读取选中配置以校验保留的命名位置依赖，已组装 source 的所有权仍归调用方。
+纯创建路径没有原根，差集为空。发布器使用调用方提供的 role 和最终 E，不扫描已组装 source，也不打开其中已经发布的依赖。已组装 source 的所有权仍归调用方。
 
 ```bash
 sandbox-ctl publish --json --quiet --to-ref-location release=file:///srv/sandbox-artifacts ./s1.snapshot
@@ -2068,9 +2068,9 @@ crypto:
 
 `crypto.local` 管理本地工作文件、活动 DIFF、checkpoint 和本地物化文件。默认 `off` 读写明文。设为 `auto` 时可以读取明文和认证通过的密文，新写入加密。设为 `required` 时还会拒绝本地明文输入。checkpoint 的内部临时物化文件在发布前始终属于本地域。
 
-`crypto.ref` 管理命名位置的 tarstream，包括发布时保留的磁盘和内存依赖。其默认值为 `auto`，与 `local` 的取值无关。
+`crypto.ref` 管理实际从命名位置读取或向其写出的 tarstream。其默认值为 `auto`，与 `local` 的取值无关。原样保留已发布依赖的引用不属于读取，也不会对该父层重新应用加密策略。
 
-| `crypto.ref` | 读取或保留明文 | 以正确密钥读取或保留密文 | 新 tarstream |
+| `crypto.ref` | 读取明文 | 以正确密钥读取密文 | 新 tarstream |
 | --- | --- | --- | --- |
 | `off` | 允许 | 拒绝 | 明文，`@digest` |
 | `auto` | 允许 | 允许 | 密文，`@hmac` |
@@ -2078,11 +2078,11 @@ crypto:
 
 使用上例配置，VM 可以生成本地明文 checkpoint，发布密文 E/S，用同一把密钥恢复，再写出新的本地明文 DIFF。不提供配置文件时，`sandbox-ctl publish --to-ref-location` 使用 `ref: auto`，需要有效的 `MANIFEST_KEY`。无配置调用 `info`、`run --from` 或 `run --restore` 打开该命名引用时，传入同一把密钥。密钥缺失或错误、认证失败、身份不匹配都会报错。SDK 调用方通过 `NewProcessStorageWithCustomerKey` 显式传入密钥解析器。
 
-已有 `local: off` 的部署升级后，新发布到命名位置的 tarstream 需要密钥。要沿用升级前的发布策略，请将原 `local` 的值显式填入 `ref`。原先使用 `local: required` 且仍需拒绝明文依赖的部署，应明确配置 `ref: required`。请与支持该字段的 sandboxer 一起启用。旧 loader 可能接受这份 YAML 并忽略该字段。
+已有 `local: off` 的部署升级后，新发布到命名位置的 tarstream 需要密钥。要沿用升级前的发布策略，请将原 `local` 的值显式填入 `ref`。原先使用 `local: required` 且仍需在读取命名位置文件时拒绝明文的部署，应明确配置 `ref: required`。请与支持该字段的 sandboxer 一起启用。旧 loader 可能接受这份 YAML 并忽略该字段。
 
-`auto` 可以保留已有明文 portable 引用，不会迁移整张历史依赖图。保留命名 tarstream 时，发布器打开实际选用的 carrier 并检查封装和预期身份，无需通读磁盘或内存 payload。新目标及目标碰撞复用仍要完整校验数据流。Manifest 和 Bundle 沿用原有编码、认证与精确复制语义，Bundle 实际选用的外部 tarstream 遵循 `crypto.ref`。
+发布时原样保留已发布的磁盘和内存父引用，不打开或校验对应文件。普通 E/S 发布、Bundle 发布和直接 `PublishSource` 都遵循此规则；不会仅为保留引用而要求父位置映射、父文件可用或父层密钥。发布不会验证或迁移整个历史引用图。真正发生的读取仍执行配置的加密策略和预期身份校验，包括物化 checkpoint、转换源，以及为确认 checkpoint 元数据而读取当前选中 E。新目标及目标碰撞复用仍要完整校验数据流。Manifest 和 Bundle 沿用原有编码、认证与精确复制语义；来源选择和传输实际需要的 carrier 读取仍然保留。
 
-Existing-file reuse 必须重新验证 role、logical size、content identity 和完整 stream。 Local output与named ref-location的commit策略刻意分离. Artifact capture/publication只定义logical completion,不定义stable-storage durability:local output依赖完整写入、`Close()`检查、内容寻址no-replace rename与alias atomic rename;named-location依赖`O_EXCL`写入、`Close()`检查、最终路径reopen/full verification与路径身份检查. 两种 artifact-publication 路径都不执行显式 file/directory flush，物理写回由文件系统或底层存储实现定义；这不同于 §3.6 中执行 fsync 的 run-directory C0 写入。
+复用发布目标位置已经存在的输出文件时，必须重新验证 role、logical size、content identity 和完整 stream。 Local output与named ref-location的commit策略刻意分离. Artifact capture/publication只定义logical completion,不定义stable-storage durability:local output依赖完整写入、`Close()`检查、内容寻址no-replace rename与alias atomic rename;named-location依赖`O_EXCL`写入、`Close()`检查、最终路径reopen/full verification与路径身份检查. 两种 artifact-publication 路径都不执行显式 file/directory flush，物理写回由文件系统或底层存储实现定义；这不同于 §3.6 中执行 fsync 的 run-directory C0 写入。
 
 <a id="local-output"></a>
 
@@ -2100,7 +2100,7 @@ Existing-file reuse 必须重新验证 role、logical size、content identity �
 
 Fresh final固定`0644`. `tarstream.WriteTo`在唯一一次写入过程中检查source read和destination write,并重新产生与carrier预先提供值一致的scheme/digest;在 owned write fd 仍打开时以 `lstat` + `SameFile` 确认 canonical path 仍指向本次 `O_EXCL` 创建的 inode；metadata-only guard fd 在 checked `Close` 前固定该 inode。Publisher 随后以 `O_RDONLY|O_NOFOLLOW`（另含 nonblocking，避免意外 FIFO 阻塞验证）重新打开并完整验证regular file、role/payload name、logical size、canonical tarstream、marker、codec、crypto policy、digest scheme/digest和完整 sequential stream；验证后还会再次核对 path identity。Existing final 走同一完整验证；验证成功后直接复用,inode和bytes不改变.
 
-Manifest Bundle不进入tarstream E/S重建路径. Carrier以root Manifest key提供`@manifest` identity;location target先强制验证所选Manifest closure、recorded admission、physical keys和crypto domain,再对same-directory依赖Bundle按顺序做exact byte copy,root `<key>.bundle`最后发布. 每个共享final仍只写一次,copy后重新打开、验证canonical Bundle/root并与source逐字节比较,最后在target fd上再次强制验证所选closure. 该路径不创建`.snapshot/.sandbox`替身,也不改写Bundle内的`snapshot.cfg`.
+Manifest Bundle 不进入 tarstream E/S 重建路径，以 root Manifest key 提供 `@manifest` 身份。来源选择保持当前 Bundle、按序 refs、最后 remote 的优先级。远端 Manifest 引用原样保留，不获取其 payload。选中的命名 Bundle 保留在原位置：来源选择可能读取成员索引，但 location 发布不会仅为保留该绑定而验证或复制其 payload。Location target 验证本次实际复制的所选 Manifest，包括 recorded admission、physical keys 和 crypto domain，再按顺序精确复制同目录依赖 Bundle，最后发布 root `<key>.bundle`。每个共享 final 仍只写一次；复制后重新打开，验证 canonical Bundle/root 并与 source 逐字节比较，最后通过 target fd 再次严格验证复制的所选内容。将选中的 Bundle 上传到 Manifest store 时，仍读取并验证实际传输的物理对象。该路径不创建 `.snapshot`/`.sandbox` 替身，也不改写 Bundle 内的 `snapshot.cfg`。
 
 Final path在write完成前会短暂可见. 正常consumer只能使用publisher成功返回的root ref;publisher仍按dependencies first、root last顺序发布. Concurrent publisher遇到partial final时重新打开并做有限、context-aware exponential-backoff验证;若writer在窗口内完成则复用. bounded retry后仍不完整或invalid时fail closed并提示显式cleanup/repair,不会删除unknown owner的path. Symlink、directory、FIFO和其他non-regular final同样拒绝且不删除. Publisher只在自身`O_EXCL`成功且path仍指向所记录inode时清理自己的失败写入;abandoned unknown final由显式cleanup/GC处理.
 
@@ -2123,7 +2123,7 @@ logical source
   -> file://<root>.bundle@manifest:<root>#<location>
 ```
 
-发布含外部命名文件的已组装 E/S 时，用 `NewSingleRootBundlePublisherWithLocations` 传入受信的输入位置表。发布器用这些目录校验实际选中的依赖，保留原有 portable 引用，并将 Bundle 写入指定的输出位置。
+已组装的 E/S 可以包含已经发布的命名引用。`NewSingleRootBundlePublisher` 原样保留这些引用，不需要输入位置映射，也不读取父文件，只把新的 Bundle 写入指定输出位置。
 
 source 支持重复读取。第一遍保留根 Manifest key、完整 Bundle 的物理摘要及格式元数据，编码后的 Chunk 字节随处理释放。第二遍直接写入最终 `<root>.bundle`，并核对生成根与预计算身份一致。一次 publish 只解析一次客户密钥，两遍共用相同 admission 与编码参数。
 
