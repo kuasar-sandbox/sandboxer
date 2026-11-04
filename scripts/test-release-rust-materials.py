@@ -58,7 +58,7 @@ class MaterialsTests(unittest.TestCase):
     def test_archive_license_and_namespace(self):
         rows = self.collect()
         self.assertEqual(rows[0][1], "rust-build-input:fixture")
-        label = "source-" + hashlib.sha256(self.registry.encode()).hexdigest()
+        label = "copy-1"
         path = self.root / "stage/share/licenses/sandboxer/rust/fixture@1.0.0" / label / "LICENSE"
         self.assertEqual(path.read_text(), "fixture license\n")
         self.assertEqual(path.stat().st_mode & 0o777, 0o644)

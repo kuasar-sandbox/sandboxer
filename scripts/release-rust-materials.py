@@ -389,6 +389,7 @@ def collect(metadata, build_report, lock, cargo_home, source_root, stage):
     require(observed <= packages.keys(), "Cargo metadata omits an observed build package")
     locked = {(p["name"], p["version"], p.get("source")): p for p in lock["package"]}
     rows = []
+    license_occurrences = {}
     for identifier in sorted(observed):
         package = packages[identifier]
         source = package.get("source")
@@ -400,8 +401,9 @@ def collect(metadata, build_report, lock, cargo_home, source_root, stage):
         require(key in locked, "observed Cargo package is absent from Cargo.lock")
         # Cargo permits a registry package and a Git fork with the same name
         # and version in one graph. Keep their notices in distinct namespaces.
-        source_digest = hashlib.sha256(source.encode()).hexdigest()
-        label = f"rust/{package['name']}@{package['version']}/source-{source_digest}"
+        label = f"rust/{package['name']}@{package['version']}"
+        license_occurrences[label] = license_occurrences.get(label, 0) + 1
+        label += f"/copy-{license_occurrences[label]}"
         require(safe_relative(label), "unsafe Cargo package identity")
         directory = stage / "share" / "licenses" / "sandboxer" / label
         if source == "registry+https://github.com/rust-lang/crates.io-index":
