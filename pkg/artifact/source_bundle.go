@@ -62,20 +62,6 @@ func NewSingleRootBundlePublisher(
 	directory string,
 	logf func(string, ...any),
 ) (*Publisher, error) {
-	return NewSingleRootBundlePublisherWithLocations(cfg, keyFn, admission, location, directory, nil, logf)
-}
-
-// NewSingleRootBundlePublisherWithLocations also binds trusted input locations
-// for external disk and memory dependencies. The publisher snapshots this map.
-func NewSingleRootBundlePublisherWithLocations(
-	cfg *config.ManifestConfig,
-	keyFn ingest.CustomerKeyFunc,
-	admission store.WriteAdmission,
-	location string,
-	directory string,
-	inputs config.RefLocations,
-	logf func(string, ...any),
-) (*Publisher, error) {
 	if err := ValidateSingleRootBundlePublication(cfg, keyFn, admission); err != nil {
 		return nil, err
 	}
@@ -89,30 +75,16 @@ func NewSingleRootBundlePublisherWithLocations(
 	if !filepath.IsAbs(directory) {
 		return nil, fmt.Errorf("single-root Bundle directory must be absolute: %q", directory)
 	}
-	locations := make(config.RefLocations, len(inputs)+1)
-	for name, path := range inputs {
-		if !filepath.IsAbs(path) {
-			return nil, fmt.Errorf("single-root Bundle input location %q requires an absolute directory", name)
-		}
-		locations[name] = filepath.Clean(path)
-	}
 	directory = filepath.Clean(directory)
-	if previous, ok := locations[location]; ok && previous != directory {
-		return nil, fmt.Errorf("single-root Bundle output location %q conflicts with its input mapping", location)
-	}
-	locations[location] = directory
+	locations := config.RefLocations{location: directory}
 	if err := ensurePublishDirectory(directory); err != nil {
 		return nil, err
 	}
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	storage, err := newProcessStorage(cfg, keyFn)
-	if err != nil {
-		return nil, err
-	}
 	target := &singleRootBundleTarget{
-		cfg: cfg, keyFn: storage.CustomerKeyFunc(), admission: admission, storage: storage,
+		cfg: cfg, keyFn: keyFn, admission: admission,
 		location: location, directory: directory, logf: logf,
 		retry: defaultLocationRetryPolicy, fs: osLocationFileSystem{},
 	}
@@ -120,7 +92,6 @@ func NewSingleRootBundlePublisherWithLocations(
 }
 
 type singleRootBundleTarget struct {
-	storage   *ProcessStorage
 	cfg       *config.ManifestConfig
 	keyFn     ingest.CustomerKeyFunc
 	admission store.WriteAdmission
@@ -345,4 +316,4 @@ func (t *singleRootBundleTarget) reuseFinal(
 	}
 }
 
-func (t *singleRootBundleTarget) Close() error { return t.storage.Close() }
+func (*singleRootBundleTarget) Close() error { return nil }

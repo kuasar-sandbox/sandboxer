@@ -151,28 +151,31 @@ func (t *locationPublishTarget) pinBundlePlan(plan bundlePublishPlan) ([]locatio
 
 	pinnedPlan := plan
 	pinnedPlan.exactRoot.Reader = rootFile.pinnedReader
-	pinnedPlan.exactDependencies = append([]manifestbundle.ExactManifest(nil), plan.exactDependencies...)
-	for index := range pinnedPlan.exactDependencies {
-		selected := &pinnedPlan.exactDependencies[index]
+	pinnedPlan.exactDependencies = make([]manifestbundle.ExactManifest, 0, len(plan.exactDependencies))
+	for _, selected := range plan.exactDependencies {
 		raw, ok := plan.selectedSources[selected.Key]
 		if !ok {
 			return fail(fmt.Errorf("publish Bundle: selected source for Manifest %s is unavailable", manifest.HexKey(selected.Key)))
 		}
 		if _, located := plan.locatedExact[selected.Key]; located {
+			// Named parents retain their original carrier and are not copied.
+			// Keep their selection metadata, but exclude their payloads from
+			// both source and destination verification for this publication.
 			continue
 		}
 		if raw == "" {
 			selected.Reader = rootFile.pinnedReader
-			continue
+		} else {
+			reader := readers[raw]
+			if reader == nil {
+				return fail(fmt.Errorf(
+					"publish Bundle: selected source %q for Manifest %s became unavailable",
+					raw, manifest.HexKey(selected.Key),
+				))
+			}
+			selected.Reader = reader
 		}
-		reader := readers[raw]
-		if reader == nil {
-			return fail(fmt.Errorf(
-				"publish Bundle: selected source %q for Manifest %s became unavailable",
-				raw, manifest.HexKey(selected.Key),
-			))
-		}
-		selected.Reader = reader
+		pinnedPlan.exactDependencies = append(pinnedPlan.exactDependencies, selected)
 	}
 	return files, unavailable, pinnedPlan, nil
 }
@@ -290,15 +293,11 @@ func (t *locationPublishTarget) verifyLocatedBundlePlan(
 	rootReader := opened[len(opened)-1].reader
 	exactRoot := manifestbundle.ExactManifest{Key: plan.root, Reader: rootReader}
 	exactDependencies := make([]manifestbundle.ExactManifest, 0, len(plan.exactDependencies))
+	// pinBundlePlan includes only dependencies copied to this location. Named
+	// parents are absent, so a shadowed local copy cannot become their verifier.
 	for _, selected := range plan.exactDependencies {
 		var reader *manifestbundle.Reader
-		if _, located := plan.locatedExact[selected.Key]; located {
-			// Preserve the source selected by current -> refs order. A later
-			// same-directory Bundle may contain the same Manifest, but it is
-			// shadowed by this earlier named-location source and must not change
-			// post-copy verification semantics.
-			reader = selected.Reader
-		} else if rootReader.HasManifest(selected.Key) {
+		if rootReader.HasManifest(selected.Key) {
 			reader = rootReader
 		} else {
 			for index := 0; index < len(opened)-1; index++ {

@@ -183,9 +183,9 @@ func (p *Publisher) keepPortable(ctx context.Context, raw string, scope publishS
 	if p.transientLocations[ref.Location] {
 		return "", false, nil
 	}
-	if err := p.checkLocated(ctx, ref, scope); err != nil {
-		return "", false, err
-	}
+	// A portable file ref is already published. Retaining its identity is not
+	// a storage read: the parent location, contents and key need not be
+	// available on this publishing node. Actual opens still enforce policy.
 	if ref.Scheme == manifest.RefSchemeManifest {
 		if local, ok := scope.fetcher.(*manifestbundle.ManifestFetcher); ok {
 			key, err := manifest.ParseKeyRef(ref.Path)

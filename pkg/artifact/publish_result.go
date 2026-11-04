@@ -226,7 +226,6 @@ func (p *Publisher) operation() *Publisher {
 		op.memoryMemo = make(map[string]string)
 	}
 	op.visiting = make(map[string]struct{})
-	op.checkedLocated = make(map[string]struct{})
 	op.report = &publicationReport{}
 	return &op
 }
