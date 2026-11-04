@@ -249,33 +249,14 @@ assert "go build -p \"$KUASAR_BUILD_JOBS\"" in publish, "parser compilation must
 PYWORKBENCH
 grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }}]' \
   "$WORKFLOW" || fail "release run identity does not pin source and dependencies"
-grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }}' \
-  "$WORKFLOW" || fail "Preview publisher does not receive dependency binding"
 workflow="$ROOT/.github/workflows/release.yml"
-grep -Fq 'kuasar-preview-binding' "$ROOT/scripts/publish-release.sh" \
-  || fail "Preview publisher does not record its build binding"
 for workflow in release.yml delete-preview.yml; do
   [ "$(grep -Fc 'group: component-mutation-${{ github.repository }}-${{ inputs.version }}' \
     "$ROOT/.github/workflows/$workflow")" -eq 1 ] \
     || fail "$workflow does not hold exactly one full-workflow mutation lock"
 done
-grep -Fq 'kuasar-release-source' "$ROOT/scripts/publish-release.sh" \
-  || fail "publisher does not record Stable source provenance"
-grep -Fq 'reconcile_main_latest' "$ROOT/scripts/publish-release.sh" \
-  || fail "publisher does not reconcile component main Latest by source commit"
-RECONCILE_WORKFLOW="$ROOT/.github/workflows/reconcile-latest.yml"
-grep -Fq 'group: component-latest-reconciliation-${{ github.repository }}' \
-  "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation is not serialized across component versions"
-grep -Fq 'workflow_run:' "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation is not triggered after release completion"
-grep -Fq 'schedule:' "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation has no automatic recovery schedule"
-grep -Fq 'publish-release.sh reconcile' "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation does not use the idempotent entrypoint"
-if grep -R -Fq 'queue: max' "$ROOT/.github/workflows"; then
-  fail "workflows use the unsupported concurrency queue key"
-fi
+[ ! -e "$ROOT/.github/workflows/reconcile-latest.yml" ] || fail "retired Latest writer remains"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-publisher.py"
 for input in accelerator_version connector_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
@@ -295,7 +276,6 @@ repack_bundle() {
   archive="$bundle/assets/$ARCHIVE_NAME"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@1700000000" \
     --pax-option=delete=atime,delete=ctime -czf "$archive" -C "$root" .
-  (cd "$bundle/assets" && sha256sum "$ARCHIVE_NAME" > SHA256SUMS)
 }
 
 repack_bundle_with_owner_names() {
@@ -303,7 +283,6 @@ repack_bundle_with_owner_names() {
   archive="$bundle/assets/$ARCHIVE_NAME"
   tar --sort=name --owner="$owner" --group="$group" --mtime="@1700000000" \
     --pax-option=delete=atime,delete=ctime -czf "$archive" -C "$root" .
-  (cd "$bundle/assets" && sha256sum "$ARCHIVE_NAME" > SHA256SUMS)
 }
 
 expect_invalid_archive() {
@@ -342,6 +321,7 @@ printf 'fixture project attribution\n' > "$fixture_root/NOTICE"
 printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
 install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
 install -m 0755 "$ROOT/scripts/publish-release.sh" "$fixture_root/scripts/publish-release.sh"
+install -m 0644 "$ROOT/scripts/release-publisher.py" "$fixture_root/scripts/release-publisher.py"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
 install -m 0644 "$ROOT/scripts/release-rust-materials.py" "$fixture_root/scripts/release-rust-materials.py"
@@ -471,7 +451,7 @@ env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 \
   RELEASE_CONNECTOR_SOURCE_DIR="$TMP/connector" \
   RELEASE_CONNECTOR_SOURCE_SHA="$connector_sha" \
   RELEASE_CONNECTOR_VERSION=v0.1.2 \
-  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
+  RELEASE_SOURCE_ROOT="$fixture_root" "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2 \
   "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
@@ -583,11 +563,11 @@ repack_bundle_with_owner_names \
 expect_invalid_archive "$TMP/numeric-owner-name-bundle" \
   "literal numeric owner names paired with root numeric IDs"
 
-if "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
+if RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
   "$TMP/invalid-version" >/dev/null 2>&1; then
   fail "packager accepted an invalid version"
 fi
-if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
+if RELEASE_BIN_DIR="$TMP/bin" RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
   "$TMP/invalid-arch" >/dev/null 2>&1; then
   fail "packager accepted x86_64 payloads as aarch64"
 fi
