@@ -64,23 +64,23 @@ all: build
 build: sandbox-ctl sandbox-init cloud-hypervisor
 
 sandbox-ctl:
-	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/sandbox-ctl ./cmd/sandbox-ctl
+	@mkdir -p "$(BINDIR)"
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/sandbox-ctl" ./cmd/sandbox-ctl
 	$(call link_bin,sandbox-ctl)
 
 # guest PID 1: stripped (no libc inside the guest rootfs).
 sandbox-init:
-	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '-s -w' -o $(BINDIR)/sandbox-init ./cmd/sandbox-init
+	@mkdir -p "$(BINDIR)"
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '-s -w' -o "$(BINDIR)/sandbox-init" ./cmd/sandbox-init
 	$(call link_bin,sandbox-init)
 
 native-deps:
 	$(MAKE) -C native-deps build TARGET_ARCH=$(TARGET_ARCH)
 
 cloud-hypervisor:
-	$(MAKE) -C native-deps cloud-hypervisor TARGET_ARCH=$(TARGET_ARCH)
-	@mkdir -p $(BINDIR)
-	cp -f native-deps/bin/$(TARGET_ARCH)/cloud-hypervisor $(BINDIR)/cloud-hypervisor
+	$(MAKE) -C native-deps cloud-hypervisor TARGET_ARCH=$(TARGET_ARCH) BINDIR="bin/$(TARGET_ARCH)"
+	@mkdir -p "$(BINDIR)"
+	cp -f native-deps/bin/$(TARGET_ARCH)/cloud-hypervisor "$(BINDIR)/cloud-hypervisor"
 	$(call link_bin,cloud-hypervisor)
 
 test: test-e2e-scripts
@@ -144,17 +144,23 @@ test-e2e-scripts:
 	BIN="$(abspath $(BINDIR))" PYTHONDONTWRITEBYTECODE=1 python3 test/source/usage_harness_test.py
 
 VERSION ?= v0.1.0
-ACCELERATOR_VERSION ?= v0.1.3
-CONNECTOR_VERSION ?= v0.1.2
+KUASAR_PLATFORM_DIR ?= ../kuasar-sandbox
+ACCELERATOR_VERSION ?= v0.1.10
+CONNECTOR_VERSION ?= v0.1.6
 
-release: build
-	@mkdir -p $(BUILD_DIR)
-	rm -rf $(BUILD_DIR)/release-bundle
+release:
+	@set -e; workspace="$$(python3 -B "$(KUASAR_PLATFORM_DIR)/ci/integration/go_workspace.py" \
+		--root .. --owners sandboxer --dependency-tag "accelerator=$(ACCELERATOR_VERSION)" --dependency-tag "connector=$(CONNECTOR_VERSION)")"; \
+	$(MAKE) build GOWORK="$$workspace" BINDIR="$(abspath $(BINDIR))"; \
+	rm -rf "$(BUILD_DIR)/release-bundle"; \
+	GOWORK="$$workspace" RELEASE_BIN_DIR="$(abspath $(BINDIR))" \
+	RELEASE_SOURCE_ROOT="$(CURDIR)" \
+	RELEASE_ACCELERATOR_SOURCE_DIR="$(abspath ../accelerator)" \
+	RELEASE_CONNECTOR_SOURCE_DIR="$(abspath ../connector)" \
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
 	RELEASE_ACCELERATOR_VERSION="$(ACCELERATOR_VERSION)" \
 	RELEASE_CONNECTOR_VERSION="$(CONNECTOR_VERSION)" \
-		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" \
-		$(BUILD_DIR)/release-bundle
+		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" "$(BUILD_DIR)/release-bundle"
 
 test-release:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py

@@ -132,8 +132,7 @@ Preview 清理忽略历史 `SHA256SUMS` 和正文记录。完整性按精确包�
 
 所选 owner 源码在 `release/helper-inputs.json` 声明完整的编译型 E2E helper 清单。配方 `scripts/build-e2e-helpers.sh` 接收目标架构和全新的输出目录，仅在源码构建阶段使用已准入的依赖工作区执行；打包 prepare 和用例执行消费经校验的二进制。内部构建目标和包路径由本仓维护。
 
-包内来源记录只有在本地 Git Tag 与所选源码 commit 一致时才保留内部依赖的发行
-版本。未打 Tag 的源码构建记录 `git:<commit>`,不要求创建目标发行 Tag。
+`make release` 先核对 `ACCELERATOR_VERSION`、`CONNECTOR_VERSION` 与干净的相邻源码 checkout，生成同一 Go workspace，再编译并打包本次输出。项目 checkout 不在 `../kuasar-sandbox` 时设置 `KUASAR_PLATFORM_DIR`。缺 Tag、缺模块或源码目录冲突会在编译前停止。包内保留许可证及运行文件，不携带来源或历史测试记录。
 
 `sandboxer` 独立发布 `vX.Y.Z` 组件版本。已发布原生架构的 archive 包含 `sandbox-ctl`、`sandbox-init` 和 patched `cloud-hypervisor` binary。聚合 platform 包按显式文档/测试选择携带用户指南与规范 E2E 运行输入，内部设计文档和源码专用测试保留在源码仓。
 

@@ -144,9 +144,7 @@ Preview cleanup ignores historical `SHA256SUMS` and body records. Completeness u
 
 The selected owner source declares its complete compiled E2E helper inventory in `release/helper-inputs.json`. Its recipe, `scripts/build-e2e-helpers.sh`, accepts the target architecture and a fresh output directory. It runs only during the source-build stage with the admitted dependency workspace; package preparation and case execution consume its verified binaries. Internal build targets and package paths remain owned here.
 
-Package source records keep an internal dependency's release version only when
-its local Git tag matches the selected source commit. Untagged source builds
-record `git:<commit>`; this does not require creating target release tags.
+`make release` verifies `ACCELERATOR_VERSION` and `CONNECTOR_VERSION` against clean sibling checkouts, generates the same Go workspace, then builds and packages those outputs. Set `KUASAR_PLATFORM_DIR` when the project checkout is not at `../kuasar-sandbox`. Missing tags, modules or conflicting source directories stop before compilation. Packages retain licenses and runtime files; they do not carry source or test records.
 
 `sandboxer` publishes independent component versions named `vX.Y.Z`. Each published native-architecture archive contains `sandbox-ctl`, `sandbox-init`, and the patched `cloud-hypervisor` binary. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Internal design documents and source-only tests remain in the source repositories.
 
