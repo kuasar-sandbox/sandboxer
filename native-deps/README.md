@@ -65,24 +65,7 @@ materials; an organization namespace alone does not exempt other modules.
 Unsupported third-party local replacements need versioned module inputs for
 the official package. Existing Kuasar local `replace` directives remain in use.
 
-Materials live under `share/licenses/<component>` and
-`share/sources/<component>`. The latter contains `SOURCES.tsv`,
-`GO-BUILD-INFO.tsv`, `GO-MODULES.tsv` and `MATERIALS.sha256`.
-Collection fails on missing notices, unreadable subtrees or partial traversals.
-Independent validation checks the shipped inventory, checksums, required files,
-source-record consistency, payload identities and archive paths/types/modes.
-It does not fetch source checkouts or Go modules, compare notices with remote
-source trees, or download/authenticate compiler distributions. Checksums and
-VCS records are consistency checks, not proof of an arbitrary producer's identity.
-
-The archive name identifies the requested release target. Project and internal
-dependency records use a release version when its local tag matches the selected
-commit, otherwise `git:<commit>`; packaging does not require creating future
-target tags. The publisher passes the selected project SHA to validation before
-Tag/Release writes, uses the bundle's `release-notes.md` body, and appends the
-existing source/Preview markers. Trusted source selection, build/publish permission
-separation and the refusal to replace published assets remain required.
-Producer-supplied notes may not contain the publisher's reserved source/Preview markers.
+Licenses and notices live under `share/licenses/<component>`. Collection fails on missing notices, unreadable subtrees or partial traversals. Package validation checks required files, payload identities and archive paths, types and modes. Downloads use native GitHub asset sizes and digests. New packages and Releases contain no source or historical test records, independent `SHA256SUMS`, or source/Preview markers. The publisher uses human release notes, checks the current build outputs, and refuses to replace existing assets with different bytes.
 
 The component package contains `sandbox-ctl`, `sandbox-init` and
 `cloud-hypervisor`. Select matching Accelerator/Connector sources with the
@@ -111,9 +94,7 @@ checksums; identical archives in multiple registry cache namespaces are allowed,
 and a matching archive is selected by that checksum. Git dependencies use the
 lockfile's full commits. Only observed inputs are
 listed, including build-time and procedural-macro dependencies; this is not a
-claim that every listed crate's code is shipped. The collected `Cargo.lock`
-and its source record must agree. Native pin changes require updating the
-recipe, source records and materials together.
+claim that every listed crate's code is shipped. `Cargo.lock` and build records remain local collection inputs; packages contain the resulting licenses and notices. Native pin changes require updating the recipe and license collection together.
 
 Git crate materials include the manifest's explicit `license-file`, even for a
 nonstandard name or workspace-root file above the crate. Its path must stay
@@ -140,24 +121,18 @@ identity, preventing same-name/version packages from different registries or Git
 commits from overwriting each other's notices. Rust copyright and license texts
 come from the selected installation's `share/doc/rust/COPYRIGHT-library.html`
 and `licenses/`, or the corresponding Debian/RPM source-package notices.
-Records include the actual Rust version and compiler-reported source commit.
+The collector uses the actual Rust installation to select its notices.
 An explicit bare `RUSTC` command is resolved through the caller's `PATH`.
 Missing notices produce an installation hint; collected files are regular files.
 
 The matching Cloud Hypervisor link map selects the system static libraries and
-startup objects actually used. Packaging records their file digests and installed
-source-package identities, and collects copyright/NOTICE and referenced license
-texts. Temporary objects from that build are covered by the CH/Rust source
-records. Distinct inputs cannot overwrite a shared material name. RPM collection
+startup objects actually used. Packaging uses their installed source-package identities to collect copyright/NOTICE and referenced license texts. Temporary objects use the matching CH/Rust notices. Distinct inputs cannot overwrite a shared material name. RPM collection
 checks the installed-package listing and every same-source sibling file listing;
 partial enumeration is an error even if another sibling supplied valid notices.
 Installed package ownership is used for source attribution, not byte-for-byte
 authentication against dpkg/RPM file digests or co-owner certification.
 
-Standalone validation reads the bundle's own records and notices; it needs no
-project/dependency checkout, Cargo download or native build. It retains the
-component payload/material namespace, source-record, permission and checksum
-checks. These materials support release review, not a legal certification or
+Standalone validation checks the bundle payloads, licenses, namespaces, paths and permissions; it needs no project/dependency checkout, Cargo download or native build. These materials support release review, not a legal certification or
 isolation of untrusted CI candidates.
 
 ## 3. Patch development cycle

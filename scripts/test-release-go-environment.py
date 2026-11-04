@@ -12,6 +12,41 @@ ALLOWED = ["sandboxer:bin/sandbox-ctl","sandboxer:bin/sandbox-init"]
 
 
 class GoSourceEnvironment(unittest.TestCase):
+    def test_workspace_gate_requires_explicit_platform_and_propagates_failure(self):
+        script = (ROOT / 'scripts/test-release.sh').read_text()
+        gate = script.split('# Cross-repository integration is opt-in;', 1)[1].split('\nfi', 1)[0] + '\nfi\n'
+        gate = gate[gate.index('if [['):]
+        marker = self.root / 'workspace-invoked'
+        python = self.bin / 'python3'
+        python.write_text('#!/bin/bash\nprintf "%s" "$*" > "$WORKSPACE_MARKER"\nexit 23\n')
+        python.chmod(0o755)
+        for selection in ({}, {'KUASAR_PLATFORM_ROOT': '/explicit platform'},
+                          {'KUASAR_PLATFORM_DIR': '/explicit platform'}):
+            with self.subTest(selection=selection):
+                marker.unlink(missing_ok=True)
+                result = subprocess.run(['bash', '-c', 'set -euo pipefail\nROOT="$1"\n' + gate, '_', str(ROOT)],
+                    env=dict(self.environment, WORKSPACE_MARKER=str(marker), **selection), text=True, capture_output=True)
+                self.assertEqual(result.returncode, 23 if selection else 0, result.stderr)
+                self.assertEqual(marker.exists(), bool(selection))
+                if selection:
+                    self.assertIn('scripts/test-release-workspace.py', marker.read_text())
+
+    def test_workspace_platform_aliases_resolve_before_fixture_chdir(self):
+        import runpy
+        from unittest.mock import patch
+        selections = ({'KUASAR_PLATFORM_ROOT': 'selected platform'},
+                      {'KUASAR_PLATFORM_DIR': 'selected platform'},
+                      {'KUASAR_PLATFORM_DIR': 'selected platform', 'KUASAR_PLATFORM_ROOT': './selected platform'})
+        for selection in selections:
+            with self.subTest(selection=selection), patch.dict(os.environ, selection, clear=True):
+                data = runpy.run_path(str(ROOT / 'scripts/test-release-workspace.py'))
+                self.assertEqual(data['PLATFORM'], Path('selected platform').resolve())
+                with self.assertRaisesRegex(RuntimeError, 'workspace tooling is missing'):
+                    data['ReleaseWorkspaceTests'].setUpClass()
+        with patch.dict(os.environ, {'KUASAR_PLATFORM_DIR': 'one', 'KUASAR_PLATFORM_ROOT': 'two'}, clear=True):
+            with self.assertRaisesRegex(SystemExit, 'different platforms'):
+                runpy.run_path(str(ROOT / 'scripts/test-release-workspace.py'))
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -58,7 +93,7 @@ class GoSourceEnvironment(unittest.TestCase):
             with self.subTest(ambient=ambient):
                 result = subprocess.run(["bash", "-c", 'set -euo pipefail\nTMP="$1"\n' + prelude
                                          + '\n[ "$GOENV" = off ]\ngo env -json ' + " ".join(expected), "_", str(self.root)],
-                                        env=environment, capture_output=True, text=True, timeout=15)
+                                        env=environment, cwd=self.root, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout), expected)
 

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import unittest
 
@@ -14,6 +15,11 @@ class PreparedProbeBoundary(unittest.TestCase):
     def check_source_build(self, explicit):
         with tempfile.TemporaryDirectory(prefix="probe-driver-") as directory:
             work = Path(directory)
+            # This tests compiler handoff, so isolate the synthetic recipe from
+            # any enclosing CI make/Go workspace drivers. Product builds keep them.
+            shutil.copyfile(ROOT / "Makefile", work / "Makefile")
+            make = shutil.which("make", path=os.defpath)
+            self.assertIsNotNone(make)
             driver = work / "go"
             driver.write_text('''#!/usr/bin/python3
 import json,os,pathlib,sys
@@ -21,12 +27,14 @@ pathlib.Path(os.environ["DRIVER_LOG"]).write_text(json.dumps({"args":sys.argv[1:
 out=pathlib.Path(sys.argv[sys.argv.index("-o")+1]);out.write_bytes(b"source fixture output");out.chmod(0o755)
 ''')
             driver.chmod(0o755)
-            env = {**os.environ, "PATH": str(work) + os.pathsep + os.environ["PATH"],
+            inherited = {key: value for key, value in os.environ.items()
+                         if key not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES")}
+            env = {**inherited, "GOWORK": "off", "PATH": str(work) + os.pathsep + os.environ["PATH"],
                    "GOROOT": str(work / "environment-root"), "GOTOOLCHAIN": "go1.99.1+path", "DRIVER_LOG": str(work / "driver.json")}
-            command = ["make", "--no-print-directory", "e2e-usage-probe", "TARGET_ARCH=x86_64", f"E2E_FIXTURE_DIR={work / 'out'}"]
+            command = [make, "--no-print-directory", "e2e-usage-probe", "TARGET_ARCH=x86_64", f"E2E_FIXTURE_DIR={work / 'out'}"]
             if explicit:
                 command.append(f"GO={driver}")
-            result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(command, cwd=work, env=env, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             record = json.loads((work / "driver.json").read_text())
             self.assertEqual(record["env"], {"GOROOT": env["GOROOT"], "GOTOOLCHAIN": env["GOTOOLCHAIN"],

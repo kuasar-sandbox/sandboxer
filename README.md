@@ -123,15 +123,20 @@ The Go import surface is intentionally narrow:
 | `accelerator` | Manifest, cache/store clients, sparse/image helpers | Snapshot ingest/fetch, block reads, and flattened-image configuration |
 | `connector` | `pkg/tapfd` | Receive TAP and network-namespace file descriptors |
 
-Go-only source builds need this repository plus sibling `accelerator` and
-`connector` checkouts. The tracked local `replace` directives remain active with
-`GOWORK=off`. Internal `require` versions describe each component's target formal
-release (Daily Preview uses that target without the preview suffix); the target
-tag need not exist yet because builds use the sibling source. Record the actual
-source SHAs for validation rather than treating that version label as the compiled
-revision. Use the [project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox)
-for the complete system. Patched Cloud Hypervisor, Guest Runtime and Kernel are
-separate native/runtime prerequisites, not dependencies of every Go-only check.
+Standalone Go builds use the obtainable dependency versions committed in `go.mod`.
+For a coordinated Preview build, check out the selected `sandboxer`, `accelerator`
+and `connector` tags and generate a workspace containing exactly those three modules:
+
+```bash
+GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners sandboxer)" || exit 1
+export GOWORK
+make build
+```
+
+The workspace uses local modules without additional `replace` directives and leaves
+`go.mod`/`go.sum` unchanged. Helper builds inherit the same selection. Patched Cloud
+Hypervisor, Guest Runtime and Kernel remain separate native/runtime prerequisites.
+Use the [project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox) for the complete system.
 
 ## Release model
 
@@ -139,9 +144,7 @@ Preview cleanup ignores historical `SHA256SUMS` and body records. Completeness u
 
 The selected owner source declares its complete compiled E2E helper inventory in `release/helper-inputs.json`. Its recipe, `scripts/build-e2e-helpers.sh`, accepts the target architecture and a fresh output directory. It runs only during the source-build stage with the admitted dependency workspace; package preparation and case execution consume its verified binaries. Internal build targets and package paths remain owned here.
 
-Package source records keep an internal dependency's release version only when
-its local Git tag matches the selected source commit. Untagged source builds
-record `git:<commit>`; this does not require creating target release tags.
+`make release` verifies `ACCELERATOR_VERSION` and `CONNECTOR_VERSION` against clean sibling checkouts, generates the same Go workspace, then builds and packages those outputs. Set `KUASAR_PLATFORM_DIR` when the project checkout is not at `../kuasar-sandbox`. Missing tags, modules or conflicting source directories stop before compilation. Packages retain licenses and runtime files; they do not carry source or test records.
 
 `sandboxer` publishes independent component versions named `vX.Y.Z`. Each published native-architecture archive contains `sandbox-ctl`, `sandbox-init`, and the patched `cloud-hypervisor` binary. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Internal design documents and source-only tests remain in the source repositories.
 

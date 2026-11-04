@@ -115,7 +115,16 @@ Go import surface 保持窄边界:
 | `accelerator` | Manifest、cache/store client、sparse/image helper | Snapshot ingest/fetch、block read 和 flattened-image 配置 |
 | `connector` | `pkg/tapfd` | 接收 TAP 与 network namespace file descriptor |
 
-Go-only 源码构建需要本仓以及兄弟目录中的 `accelerator` 和 `connector`。即使设置 `GOWORK=off`,已有本地 `replace` 仍会生效。内部 `require` 版本描述各组件目标正式 Release(Daily Preview 使用去掉 preview 后缀的同一目标);目标 Tag 可以尚不存在,因为实际构建使用兄弟目录源码。验证必须记录实际源码 SHA,不能把版本标签当作编译使用的 revision。完整系统使用[项目工作区](https://github.com/kuasar-sandbox/kuasar-sandbox)。Patched Cloud Hypervisor、Guest Runtime 和 Kernel 是独立 Native/Runtime 前置,不是所有 Go-only 检查的依赖。
+独立 Go 构建使用 `go.mod` 中真实可获取的依赖版本。协调 Preview 构建时，检出选定的 `sandboxer`、`accelerator`、`connector` Tag，并只为这三个模块生成工作区：
+
+```bash
+GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners sandboxer)" || exit 1
+export GOWORK
+make build
+```
+
+工作区通过 `use` 选择本地模块，不额外添加 `replace`，也不改写 `go.mod`/`go.sum`；helper 构建继承同一选择。Patched Cloud Hypervisor、Guest Runtime、Kernel 仍是独立的 Native/Runtime 前置。完整系统见[项目工作区](https://github.com/kuasar-sandbox/kuasar-sandbox)。
+
 
 ## Release 模型
 
@@ -123,8 +132,7 @@ Preview 清理忽略历史 `SHA256SUMS` 和正文记录。完整性按精确包�
 
 所选 owner 源码在 `release/helper-inputs.json` 声明完整的编译型 E2E helper 清单。配方 `scripts/build-e2e-helpers.sh` 接收目标架构和全新的输出目录，仅在源码构建阶段使用已准入的依赖工作区执行；打包 prepare 和用例执行消费经校验的二进制。内部构建目标和包路径由本仓维护。
 
-包内来源记录只有在本地 Git Tag 与所选源码 commit 一致时才保留内部依赖的发行
-版本。未打 Tag 的源码构建记录 `git:<commit>`,不要求创建目标发行 Tag。
+`make release` 先核对 `ACCELERATOR_VERSION`、`CONNECTOR_VERSION` 与干净的相邻源码 checkout，生成同一 Go workspace，再编译并打包本次输出。项目 checkout 不在 `../kuasar-sandbox` 时设置 `KUASAR_PLATFORM_DIR`。缺 Tag、缺模块或源码目录冲突会在编译前停止。包内保留许可证及运行文件，不携带来源或历史测试记录。
 
 `sandboxer` 独立发布 `vX.Y.Z` 组件版本。已发布原生架构的 archive 包含 `sandbox-ctl`、`sandbox-init` 和 patched `cloud-hypervisor` binary。聚合 platform 包按显式文档/测试选择携带用户指南与规范 E2E 运行输入，内部设计文档和源码专用测试保留在源码仓。
 
