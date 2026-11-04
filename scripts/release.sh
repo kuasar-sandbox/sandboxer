@@ -129,28 +129,11 @@ validate_bundle() {
   rm -rf "$extract"
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
-  local project_sha
-  project_sha="$(go version -m "$extract/bin/sandbox-ctl" | \
-    awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}')"
-  release_materials_require_project_source "$extract" "$NAME" 'bin/sandbox-ctl,bin/sandbox-init' "$version" \
-    bin/sandbox-ctl bin/sandbox-init
-  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor' "v51.1" \
-    'https://github.com/cloud-hypervisor/cloud-hypervisor/archive/refs/tags/v51.1.tar.gz' \
-    'sha256:a2393046c0230f6360792ed2ef1b60968aa4e04d12b6be419c86306774e2e4ef'
-  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-patches' "$version" \
-    "https://github.com/kuasar-sandbox/sandboxer/tree/$project_sha/native-deps/deps/ch-patches" "git:$project_sha"
-  local expected_cargo_sha
-  expected_cargo_sha="$(sha256sum "$extract/share/sources/$NAME/CLOUD-HYPERVISOR-Cargo.lock" | awk '{print $1}')"
-  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'cloud-hypervisor-cargo-lock' "v51.1" \
-    'https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/Cargo.lock' "sha256:$expected_cargo_sha"
-  release_materials_require_source "$extract" "$NAME" 'bin/cloud-hypervisor' 'Rust toolchain' ""
-  awk -F '\t' '$1 == "bin/cloud-hypervisor" && $2 ~ /^rust-build-input:/ {found=1} END {exit !found}' \
-    "$extract/share/sources/$NAME/SOURCES.tsv" || fail "Rust dependency materials are missing"
-  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'accelerator' ""
-  release_materials_require_source "$extract" "$NAME" 'bin/sandbox-ctl' 'connector' ""
   release_materials_validate "$extract" "$NAME"
-  release_materials_require_go_key "$extract" "$NAME" 'bin/sandbox-ctl'
-  release_materials_require_go_key "$extract" "$NAME" 'bin/sandbox-init'
+  release_materials_require_license "$extract" "$NAME" rust-toolchain
+  release_materials_require_license "$extract" "$NAME" rust
+  release_materials_validate_go "$extract" "$NAME" bin/sandbox-ctl
+  release_materials_validate_go "$extract" "$NAME" bin/sandbox-init
   local file
   for file in sandbox-ctl sandbox-init; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
@@ -226,8 +209,6 @@ package_release() {
     --source-root "$ch_source" --stage "$STAGE" --rustc "$rustc_path" \
     >> "$RELEASE_MATERIALS_WORK/sources"
   release_native_link_inputs "$ch_map" "$ch_output" "$ch_output" bin/cloud-hypervisor
-  install -m 0644 "$ch_source/Cargo.lock" \
-    "$STAGE/share/sources/$NAME/CLOUD-HYPERVISOR-Cargo.lock"
   release_materials_record_source 'bin/sandbox-ctl,bin/sandbox-init' sandboxer "$project_version" \
     "https://github.com/kuasar-sandbox/sandboxer/commit/$project_sha" \
     "git:$project_sha" project

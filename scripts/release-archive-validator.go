@@ -27,11 +27,6 @@ var archiveContract = map[string]entryContract{
 	"./share/licenses/sandboxer/project/LICENSE":                            {typeflag: tar.TypeReg, mode: 0o644},
 	"./share/licenses/sandboxer/cloud-hypervisor/LICENSES/Apache-2.0.txt":   {typeflag: tar.TypeReg, mode: 0o644},
 	"./share/licenses/sandboxer/cloud-hypervisor/LICENSES/BSD-3-Clause.txt": {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/sandboxer/CLOUD-HYPERVISOR-Cargo.lock":                 {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/sandboxer/GO-BUILD-INFO.tsv":                           {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/sandboxer/GO-MODULES.tsv":                              {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/sandboxer/MATERIALS.sha256":                            {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/sandboxer/SOURCES.tsv":                                 {typeflag: tar.TypeReg, mode: 0o644},
 }
 
 func materialContract(name string) (entryContract, bool) {
@@ -39,15 +34,12 @@ func materialContract(name string) (entryContract, bool) {
 		"./share/",
 		"./share/licenses/",
 		"./share/licenses/sandboxer/",
-		"./share/sources/",
-		"./share/sources/sandboxer/",
 	} {
 		if name == directory {
 			return entryContract{typeflag: tar.TypeDir, mode: 0o755}, true
 		}
 	}
-	if !strings.HasPrefix(name, "./share/licenses/sandboxer/") &&
-		!strings.HasPrefix(name, "./share/sources/sandboxer/") {
+	if !strings.HasPrefix(name, "./share/licenses/sandboxer/") {
 		return entryContract{}, false
 	}
 	clean := path.Clean(strings.TrimPrefix(name, "./"))
