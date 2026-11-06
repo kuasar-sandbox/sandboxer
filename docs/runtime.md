@@ -514,7 +514,7 @@ Before request admission succeeds, the caller must not dial the backend or trigg
 
 ## `sandbox-ctl snapshot`
 
-The following is command syntax; choose one output alternative and omit the square-bracket notation when executing:
+The following is ordinary disk-copy capture syntax, without `--checkpoint`; choose one output alternative and omit the square-bracket notation when executing:
 
 ```text
 sandbox-ctl snapshot \
@@ -526,6 +526,8 @@ sandbox-ctl snapshot \
   [--drop-caches=false] \
   [--merge-ref=true]
 ```
+
+For named local capture with `--checkpoint ID`, output defaults to the running owner’s checkpoint directory; an explicit `--output` must select that same directory. See [checkpoint prerequisites and commands](block-storage.md#checkpoints).
 
 A Snapshot always contains memory execution state. One operation produces E and S at the same freeze point, committing S last. On success, the default is to destroy the VM. `--resume` resumes the original VM without making the new E/S its live baseline.
 
@@ -551,7 +553,7 @@ Snapshot tokens without E, must be discarded and reissued from complete S/E reco
 when artifacts are unavailable; it never reads S to discover E.
 
 
-`--drop-caches` belongs only to memory snapshot and defaults to false. `--merge-ref` selects a full current working set with trimmed local history (`false`) or cumulative changes plus local history (`true`, default). Both stop at the current checkpoint ownership boundary. Disk compaction is independent; see [checkpoint history](artifacts.md#checkpoint-history).
+`--drop-caches` belongs only to memory snapshot and defaults to false. `--merge-ref=false` captures the complete current working set plus necessary explicit Zero and retains eligible local history in a separate compacted layer H. The default `true` merges cumulative changes with that eligible history. Both stop at the current checkpoint ownership boundary; neither discards required historical memory. Disk compaction is independent. See [checkpoint memory changes](memory.md#checkpoint-changes) and [checkpoint history](artifacts.md#checkpoint-history).
 
 A local `snapshot` needs either `--sandbox-id` or `--path-id`. When both are supplied, PathID only selects `RunRoot/PathID/ctl.sock`; no identity consistency check is performed. `--output` may reside on the BaseRoot filesystem, for example `BuildBaseDir/checkpoint`. The running process cleans its own RunDir/owned diffs and does not treat output as a runtime directory to delete.
 
@@ -559,7 +561,7 @@ A local `snapshot` needs either `--sandbox-id` or `--path-id`. When both are sup
 
 ## `sandbox-ctl export`
 
-Live export produces a cold-start Sandbox E from a running workload:
+Live export produces a cold-start Sandbox E from a running workload. Ordinary disk-copy capture uses:
 
 ```text
 sandbox-ctl export \
@@ -569,6 +571,8 @@ sandbox-ctl export \
   [--mode local|bundle] \
   [--resume]
 ```
+
+Named local capture instead uses `--checkpoint ID` with the owner-derived output rules and prerequisites in [Local disk Checkpoints](block-storage.md#checkpoints); it cannot combine with `--upload` or `--from`.
 
 Live mode rejects `--config` and reuses the running process's validated
 Manifest/ref-location/crypto bindings. Explicit `--manifest-config` and
@@ -825,7 +829,7 @@ Ordinary cold configuration validates at least:
 
 ## `run --from` and restore validation
 
-Both modes strictly parse the logical artifact and canonical configuration before checking host ownership. `--from` permits persistent-workload overrides; restore rejects all cold-only fields. Kernel binding preflight, runtime identity comparison, network topology/provider, disk count/names/topology, and active-diff binding checks precede external lifecycle side effects. This does not add a kernel-digest re-hash to these two modes; see [PortableSandboxConfig](artifacts.md#portable-config).
+Both modes strictly parse the logical artifact and canonical configuration before checking host ownership. `--from` permits persistent-workload overrides; restore rejects all cold-only fields. Kernel binding preflight, runtime identity comparison, network topology/provider, disk count/names/topology, and active-diff binding checks precede external lifecycle side effects. Source-preserving `--from` uses a present kernel sidecar or retains C0 ancestry without rehashing; restore neither reads that sidecar nor rehashes the kernel. By contrast, `--from --replace-boot` follows explicit cold-start identity rules: a valid sidecar or, when absent, one raw kernel hash. See the [kernel identity contract](#runtime-sdk) and [PortableSandboxConfig](artifacts.md#portable-config).
 
 <a id="cli-validation"></a>
 
@@ -833,7 +837,7 @@ Both modes strictly parse the logical artifact and canonical configuration befor
 
 - `run --from` and `--restore` are mutually exclusive.
 - `run --replace-boot` is allowed only with `--from`, requires host configuration, and rejects `--restore`.
-- Export/snapshot require exactly one of `--output` and `--upload`.
+- Ordinary export/snapshot without `--checkpoint` require exactly one of `--output` and `--upload`. Named checkpoint capture permits omitted output and rejects `--upload`; named export also rejects `--from`.
 - Explicit `--mode` and `--upload` are mutually exclusive.
 - Live export rejects `--config`; image-to-Sandbox-E assembly requires `--from` plus `--config` or `SANDBOX_CONFIG`, and rejects `--resume`.
 - Snapshot has no memory toggle.

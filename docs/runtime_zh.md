@@ -460,7 +460,7 @@ Request gate 通过前不得拨号 backend 或触发 Sandbox lifecycle. 首帧�
 
 ## `sandbox-ctl snapshot`
 
-以下为命令语法；实际执行时选择一种 output 方式，并省略方括号记法：
+以下为不带 `--checkpoint` 的普通磁盘复制 capture 语法；实际执行时选择一种 output 方式，并省略方括号记法：
 
 ```text
 sandbox-ctl snapshot \
@@ -473,9 +473,11 @@ sandbox-ctl snapshot \
   [--merge-ref=true]
 ```
 
+使用 `--checkpoint ID` 进行命名本地 capture 时，output 默认为运行中 owner 的 checkpoint 目录；显式 `--output` 必须选择同一目录。前置条件与命令见[本地磁盘 Checkpoint](block-storage_zh.md#checkpoints)。
+
 Snapshot 始终包含 memory execution state. 一次操作在同一 freeze point 产生 E 和 S,S 最后 commit. 默认成功后销毁 VM;`--resume` 恢复原 VM,但不把新 E/S 设为 live baseline.
 
-Local human output同时列出 `Snapshot S` 与 `Sandbox E`. Upload stdout 仍只输出 S Manifest key,便于当前 orchestrator parser 使用. `snapshot_done` 同时返回 `snapshot_ref` 与 `sandbox_ref`;既有 `memory_size`、`memory_resident`、pause/dump timing 和 compatibility `overlay_*` response 字段保留. `overlay_*` 当前镜像 E identity,真正 disk graph 只在 E 中. 既有字段名 `memory_resident` 统计显式逻辑内存覆盖量（Data 加 Zero），包括保留为 Zero 的释放页；它不表示物理驻留量或编码后的 payload 大小。
+Local human output同时列出 `Snapshot S` 与 `Sandbox E`. Upload stdout 仍只输出 S Manifest key,保持 shell 兼容性. `snapshot_done` 同时返回 `snapshot_ref` 与 `sandbox_ref`;既有 `memory_size`、`memory_resident`、pause/dump timing 和 compatibility `overlay_*` response 字段保留. `overlay_*` 当前镜像 E identity,真正 disk graph 只在 E 中. 既有字段名 `memory_resident` 统计显式逻辑内存覆盖量（Data 加 Zero），包括保留为 Zero 的释放页；它不表示物理驻留量或编码后的 payload 大小。
 
 Capture 的 `snapshot --json` 恰好返回 `{snapshotRef,sandboxRef,removedRefs}`，
 `export --json` 恰好返回 `{sandboxRef,removedRefs}`，capture 的 `removedRefs` 固定为
@@ -491,7 +493,7 @@ orchestrator 本地数据库并重新创建记录；两个组件均不迁移、�
 数据。缺少必填 `resumeSandboxRef` 字段的旧迁移 token（包括缺少 E 的 Snapshot token）必须废弃，从完整 S/E 记录重新签发。portable
 Export 即使在工件不可用时也只使用已记录的对，绝不读取 S 来发现 E。
 
-`--drop-caches` 只属于 memory snapshot,默认 false. `--merge-ref=false` 独立录制当前工作集并保留一个历史合并层；true（默认）将累计变化与本沙箱 checkpoint 的本地历史前缀合并。两者均在外部归属处停止，磁盘合并不受该开关影响。完整规则见[checkpoint 历史与清理](artifacts_zh.md#checkpoint-history)。
+`--drop-caches` 只属于 memory snapshot，默认 false。`--merge-ref=false` 录制完整当前工作集与必要的显式 Zero，将符合条件的本地历史保留在独立合并历史层 H 中。默认 `true` 将累计变化与这些历史合并。两者都在当前 checkpoint 归属边界停止，不丢弃恢复所需的历史内存。磁盘合并不受该开关影响。完整规则见[checkpoint 内存变化](memory_zh.md#checkpoint-changes)和[checkpoint 历史与清理](artifacts_zh.md#checkpoint-history)。
 
 local `snapshot` 只需 `--sandbox-id` 或 `--path-id` 之一。两者同时给出时
 PathID 只选择 `RunRoot/PathID/ctl.sock`，不做身份一致性校验。`--output` 可以位于
@@ -502,7 +504,7 @@ RunDir/owned diff，不会把 output 当作运行目录删除。
 
 ## `sandbox-ctl export`
 
-在线 export 从运行中工作负载生成可冷启动的 Sandbox E：
+在线 export 从运行中工作负载生成可冷启动的 Sandbox E。普通磁盘复制 capture 使用：
 
 ```text
 sandbox-ctl export \
@@ -512,6 +514,8 @@ sandbox-ctl export \
   [--mode local|bundle] \
   [--resume]
 ```
+
+命名本地 capture 改用 `--checkpoint ID`，遵循[本地磁盘 Checkpoint](block-storage_zh.md#checkpoints) 中由 owner 派生的 output 规则与前置条件，不能与 `--upload` 或 `--from` 同用。
 
 Live mode 拒绝 `--config`，复用当前 run 进程已验证的 Manifest/ref-location/crypto binding。
 显式 `--manifest-config` 和 `--ref-location` 属于[离线组装](artifacts_zh.md#assemble)。
@@ -738,7 +742,7 @@ disk 和 stdio 验收用例。
 
 ## `run --from` 与 restore validation
 
-两种模式都先严格parse logical artifact和canonical config,再验证host ownership. `--from`允许persistent workload override;restore拒绝所有cold-only字段. Kernel binding preflight、runtime identity comparison、network topology/provider、disk count/name/topology 和 active diff binding 检查在 external lifecycle side effect 前完成；这不增加两种模式的 kernel digest 重哈希，见 [PortableSandboxConfig](artifacts_zh.md#portable-config)。
+两种模式都先严格parse logical artifact和canonical config,再验证host ownership. `--from`允许persistent workload override;restore拒绝所有cold-only字段. Kernel binding preflight、runtime identity comparison、network topology/provider、disk count/name/topology 和 active diff binding 检查在 external lifecycle side effect 前完成；保留源 boot 定义的 `--from` 使用已有 kernel sidecar，缺失时保留 C0 ancestry 而不重哈希；restore 既不读该 sidecar，也不重哈希 kernel。`--from --replace-boot` 则遵循显式冷启动身份规则：使用有效 sidecar，缺失时对 raw kernel 完整哈希一次。见 [kernel 身份契约](#runtime-sdk) 与 [PortableSandboxConfig](artifacts_zh.md#portable-config)。
 
 <a id="cli-validation"></a>
 
@@ -746,7 +750,7 @@ disk 和 stdio 验收用例。
 
 - `run --from` 与 `--restore` 互斥.
 - `run --replace-boot` 仅允许与`--from`一起使用，要求host config，并拒绝`--restore`.
-- export/snapshot都要求`--output`与`--upload`二选一.
+- 不带 `--checkpoint` 的普通 export/snapshot 要求 `--output` 与 `--upload` 二选一。命名 checkpoint capture 可省略 output，拒绝 `--upload`；命名 export 还拒绝 `--from`。
 - Explicit `--mode` 与 `--upload`互斥.
 - Live export拒绝`--config`;image-to-Sandbox-E assembly 要求 `--from` 加 `--config` 或 `SANDBOX_CONFIG`，且拒绝 `--resume`。
 - Snapshot没有memory toggle.
