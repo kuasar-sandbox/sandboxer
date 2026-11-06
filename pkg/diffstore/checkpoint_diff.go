@@ -67,14 +67,33 @@ func (d *checkpointDiff) withDirectRead(length int, offset int64, consume func([
 }
 
 func (d *checkpointDiff) writePages(ctx context.Context, pages []pageWrite) error {
-	if len(pages) == 0 || len(pages) > maxWritebackPages {
+	if len(pages) == 0 || len(pages) > maxWritebackMutations {
 		return fmt.Errorf("diffstore: invalid checkpoint batch")
+	}
+	zero := pages[0].Zero
+	for _, p := range pages {
+		if p.Zero != zero {
+			return fmt.Errorf("diffstore: mixed checkpoint Data/Zero batch")
+		}
+	}
+	if zero {
+		var blocks [maxWritebackMutations]uint64
+		for i, p := range pages {
+			blocks[i] = p.Block
+		}
+		return d.store.DiscardPages(ctx, blocks[:len(pages)])
+	}
+	if len(pages) > maxWritebackPages {
+		return fmt.Errorf("diffstore: checkpoint batch exceeds data workspace")
 	}
 	var batch [maxWritebackPages]versioned.Page
 	for i, p := range pages {
+		if len(p.Data) != cowBlockSize {
+			return fmt.Errorf("diffstore: invalid checkpoint Data page")
+		}
 		batch[i] = versioned.Page{Block: p.Block, Data: p.Data}
 	}
-	return d.store.WritePages(ctx, batch[:len(pages)])
+	return d.store.WritePagesForCache(ctx, batch[:len(pages)])
 }
 
 func checkpointStoreOptions(options diskOptions, size int64, path string) versioned.Options {

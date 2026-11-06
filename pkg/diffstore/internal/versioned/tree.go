@@ -2,6 +2,7 @@ package versioned
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 	"hash/crc32"
@@ -11,6 +12,11 @@ import (
 
 const maxEntries = 255
 const maxDepth = 8
+
+// MaxDiscardPages matches the existing 4 MiB guest DISCARD request bound.
+// The metadata preflight may split a request further without changing the
+// independent WritePages and GC batch limits.
+const MaxDiscardPages = 1024
 
 type entry struct{ key, slot uint64 }
 type node struct {
@@ -293,105 +299,161 @@ func (t *transaction) set(key, value uint64) error {
 	t.ctrl.Root = root
 	return nil
 }
-func (t *transaction) remove(root, key uint64, depth int) ([]entry, error) {
+
+// removeRange visits each intersecting subtree once. Entries returned for an
+// unchanged subtree still borrow its original slot; all changed entry slices
+// are private to this transaction. Payload retirement is deferred until the
+// tree change is complete so descriptor pages can be updated together.
+func (t *transaction) removeRange(root, start, end uint64, depth int, payloads *[]uint64) ([]entry, bool, error) {
 	if root == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	if depth >= maxDepth {
-		return nil, fmt.Errorf("diffstore: B+ depth exceeded")
+		return nil, false, fmt.Errorf("diffstore: B+ depth exceeded")
 	}
-	n, err := readNode(t, root)
+	n, err := inspectNode(t, root)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	i := sort.Search(len(n.entries), func(i int) bool { return n.entries[i].key >= key })
-	if i == len(n.entries) || n.leaf && n.entries[i].key != key {
-		return []entry{{n.entries[len(n.entries)-1].key, root}}, nil
+	unchanged := func() ([]entry, bool, error) {
+		return []entry{{n.entries[len(n.entries)-1].key, root}}, false, nil
 	}
-	slot, err := t.writable(root, n)
-	if err != nil {
-		return nil, err
+	first := sort.Search(len(n.entries), func(i int) bool { return n.entries[i].key >= start })
+	if first == len(n.entries) {
+		return unchanged()
 	}
+	var entries []entry
 	if n.leaf {
-		n.entries = append(n.entries[:i], n.entries[i+1:]...)
-	} else {
-		children, err := t.remove(n.entries[i].slot, key, depth+1)
-		if err != nil {
-			return nil, err
+		last := sort.Search(len(n.entries), func(i int) bool { return n.entries[i].key >= end })
+		if first == last {
+			return unchanged()
 		}
-		repl := append([]entry(nil), n.entries[:i]...)
-		repl = append(repl, children...)
-		n.entries = append(repl, n.entries[i+1:]...)
-		// Merge only siblings that fit. Moving child pointers does not retire those
-		// child objects: only the disappearing sibling page itself is retired.
-		for j := max(0, i-1); j+1 < len(n.entries) && j <= i; j++ {
-			left, err := readNode(t, n.entries[j].slot)
-			if err != nil {
-				return nil, err
+		for _, e := range n.entries[first:last] {
+			*payloads = append(*payloads, e.slot)
+		}
+		entries = make([]entry, 0, len(n.entries)-(last-first))
+		entries = append(entries, n.entries[:first]...)
+		entries = append(entries, n.entries[last:]...)
+	} else {
+		entries = make([]entry, 0, len(n.entries))
+		entries = append(entries, n.entries[:first]...)
+		changed, next := false, first
+		for next < len(n.entries) {
+			// Each separator is its child's maximum key. A later child's
+			// lower bound is strictly greater than the preceding separator.
+			if next > 0 && n.entries[next-1].key >= end-1 {
+				break
 			}
-			right, err := readNode(t, n.entries[j+1].slot)
+			children, childChanged, err := t.removeRange(n.entries[next].slot, start, end, depth+1, payloads)
 			if err != nil {
-				return nil, err
+				return nil, false, err
+			}
+			entries = append(entries, children...)
+			changed = changed || childChanged
+			next++
+		}
+		if !changed {
+			return unchanged()
+		}
+		affectedEnd := len(entries)
+		entries = append(entries, n.entries[next:]...)
+		// Compact only the affected children and their two boundaries. As
+		// in single-key removal, moving child pointers never retires them.
+		for i := max(0, first-1); i+1 < len(entries) && i < affectedEnd; {
+			left, err := inspectNode(t, entries[i].slot)
+			if err != nil {
+				return nil, false, err
+			}
+			right, err := inspectNode(t, entries[i+1].slot)
+			if err != nil {
+				return nil, false, err
 			}
 			if left.leaf != right.leaf {
-				return nil, fmt.Errorf("diffstore: inconsistent B+ levels")
+				return nil, false, fmt.Errorf("diffstore: inconsistent B+ levels")
 			}
 			if len(left.entries)+len(right.entries) > maxEntries {
+				i++
 				continue
 			}
-			lslot, err := t.writable(n.entries[j].slot, left)
+			merged := node{leaf: left.leaf, entries: make([]entry, 0, len(left.entries)+len(right.entries))}
+			merged.entries = append(merged.entries, left.entries...)
+			merged.entries = append(merged.entries, right.entries...)
+			slot, err := t.writable(entries[i].slot, merged)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
-			if err = t.retire(n.entries[j+1].slot); err != nil {
-				return nil, err
+			if err := t.retire(entries[i+1].slot); err != nil {
+				return nil, false, err
 			}
-			left.entries = append(left.entries, right.entries...)
-			t.nodes[lslot] = left
-			n.entries[j] = entry{left.entries[len(left.entries)-1].key, lslot}
-			n.entries = append(n.entries[:j+1], n.entries[j+2:]...)
-			break
+			t.nodes[slot] = merged
+			entries[i] = entry{merged.entries[len(merged.entries)-1].key, slot}
+			entries = append(entries[:i+1], entries[i+2:]...)
+			affectedEnd--
 		}
 	}
-	if len(n.entries) == 0 {
-		delete(t.pages, slotPage(slot))
-		delete(t.nodes, slot)
-		if err = t.retire(slot); err != nil {
-			return nil, err
+	if len(entries) == 0 {
+		// A fully removed node needs no writable copy. Its old contents
+		// remain protected by the same epoch rule as any other retirement.
+		if err := t.retire(root); err != nil {
+			return nil, false, err
 		}
-		return nil, nil
+		return nil, true, nil
+	}
+	n.entries = entries
+	slot, err := t.writable(root, n)
+	if err != nil {
+		return nil, false, err
 	}
 	t.nodes[slot] = n
-	return []entry{{n.entries[len(n.entries)-1].key, slot}}, nil
+	return []entry{{entries[len(entries)-1].key, slot}}, true, nil
 }
-func (t *transaction) unset(key uint64) error {
-	children, err := t.remove(t.ctrl.Root, key, 0)
-	if err != nil {
+
+func (t *transaction) unsetRange(start, end uint64) error {
+	if start >= end {
+		return nil
+	}
+	var payloads []uint64
+	children, changed, err := t.removeRange(t.ctrl.Root, start, end, 0, &payloads)
+	if err != nil || !changed {
 		return err
 	}
 	if len(children) == 0 {
 		t.ctrl.Root = 0
-		return nil
+	} else {
+		t.ctrl.Root = children[0].slot
+		// A range can remove several levels at once. Only the root may
+		// collapse; internal single-child nodes keep their level.
+		for t.ctrl.Root != 0 {
+			n, err := inspectNode(t, t.ctrl.Root)
+			if err != nil {
+				return err
+			}
+			if n.leaf || len(n.entries) != 1 {
+				break
+			}
+			old := t.ctrl.Root
+			t.ctrl.Root = n.entries[0].slot
+			if err := t.retire(old); err != nil {
+				return err
+			}
+		}
 	}
-	t.ctrl.Root = children[0].slot
-	n, err := readNode(t, t.ctrl.Root)
-	if err != nil {
-		return err
-	}
-	if !n.leaf && len(n.entries) == 1 {
-		old := t.ctrl.Root
-		t.ctrl.Root = n.entries[0].slot
-		return t.retire(old)
-	}
-	return nil
+	return t.retirePayloads(payloads)
 }
 
 func (s *Store) WritePages(ctx context.Context, pages []Page) error {
+	return s.writePages(ctx, pages, false)
+}
+
+func (s *Store) writePages(ctx context.Context, pages []Page, deferSpaceFailure bool) error {
 	if err := WaitInitialized(s, ctx); err != nil {
 		return err
 	}
 	if len(pages) == 0 {
 		return ctx.Err()
+	}
+	if deferSpaceFailure && len(pages) > 4*MaxBatchPages {
+		return fmt.Errorf("diffstore: cache Data window exceeds 256 pages")
 	}
 	for _, p := range pages {
 		if len(p.Data) != PageSize || p.Block >= uint64(s.Size()/PageSize) {
@@ -420,7 +482,7 @@ func (s *Store) WritePages(ctx context.Context, pages []Page) error {
 				return err
 			}
 		}
-		err := s.mutate(ctx, func(t *transaction) error {
+		err := s.mutateWithReservationPolicy(ctx, func(t *transaction) error {
 			// Last write to a repeated block wins within this bounded batch.
 			unique := make(map[uint64][]byte, len(part))
 			order := make([]uint64, 0, len(part))
@@ -481,7 +543,10 @@ func (s *Store) WritePages(ctx context.Context, pages []Page) error {
 				}
 			}
 			return nil
-		})
+		}, 0, deferSpaceFailure)
+		if deferSpaceFailure && s.fatal == nil && spaceReservation(err) {
+			err = &SpacePressureError{Err: err}
+		}
 		s.mu.Unlock()
 		if err != nil {
 			return err
@@ -588,6 +653,15 @@ func (s *Store) Scan(ctx context.Context, visit func(uint64) error) error {
 // batches. The range must contain aligned complete pages. Retained versions
 // keep their protected records until independent deletion and GC can free them.
 func (s *Store) Discard(ctx context.Context, off, length int64) error {
+	return s.discardWithRedoBudget(ctx, off, length, maxLogPages)
+}
+
+// The budget argument lets deterministic tests exercise the same splitting
+// path with small fixtures; production always uses the on-disk redo capacity.
+func (s *Store) discardWithRedoBudget(ctx context.Context, off, length int64, redoBudget int) error {
+	if redoBudget <= 0 || redoBudget > maxLogPages {
+		return fmt.Errorf("diffstore: invalid discard redo budget")
+	}
 	if err := WaitInitialized(s, ctx); err != nil {
 		return err
 	}
@@ -600,8 +674,9 @@ func (s *Store) Discard(ctx context.Context, off, length int64) error {
 	if err := s.MarkModified(ctx); err != nil {
 		return err
 	}
-	for pos := off; pos < off+length; {
-		end := min(off+length, pos+MaxBatchPages*PageSize)
+	pos := off
+	end := min(off+length, pos+MaxDiscardPages*PageSize)
+	for pos < off+length {
 		s.mu.Lock()
 		if err := s.healthy(ctx); err != nil {
 			s.mu.Unlock()
@@ -611,7 +686,7 @@ func (s *Store) Discard(ctx context.Context, off, length int64) error {
 			s.mu.Unlock()
 			return fmt.Errorf("diffstore: metadata-only handle cannot discard payload")
 		}
-		err := s.mutate(ctx, func(t *transaction) error {
+		err := s.mutateWithRedoBudget(ctx, func(t *transaction) error {
 			// A concurrent direct caller may checkpoint after the optimistic
 			// MarkModified call. Publish invalidation with this mapping change.
 			t.ctrl.Current = 0
@@ -620,31 +695,23 @@ func (s *Store) Discard(ctx context.Context, off, length int64) error {
 			}
 			// mutate may retry after reservation pressure and foreground GC. Its
 			// closure must not advance the caller's range before a commit succeeds.
-			for current := pos; current < end; current += PageSize {
-				block := uint64(current / PageSize)
-				if err := t.setPresence(block); err != nil {
-					return err
-				}
-				slot, err := lookup(t, t.ctrl.Root, block)
-				if err != nil {
-					return err
-				}
-				if slot != 0 {
-					if err = t.retire(slot); err != nil {
-						return err
-					}
-					if err = t.unset(block); err != nil {
-						return err
-					}
-				}
-			}
-			return nil
-		})
+			t.setPresenceRange(uint64(pos/PageSize), uint64(end/PageSize))
+			return t.unsetRange(uint64(pos/PageSize), uint64(end/PageSize))
+		}, redoBudget)
 		s.mu.Unlock()
+		var budget *discardRedoBudget
+		if errors.As(err, &budget) && end-pos > PageSize {
+			// Discard the uncommitted preparation and retry from the same
+			// logical position. Reservation retries likewise rebuild it.
+			pages := (end - pos) / PageSize
+			end = pos + max(1, pages/2)*PageSize
+			continue
+		}
 		if err != nil {
 			return err
 		}
 		pos = end
+		end = min(off+length, pos+MaxDiscardPages*PageSize)
 	}
 	return nil
 }

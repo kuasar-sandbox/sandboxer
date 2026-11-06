@@ -210,9 +210,11 @@ disk, err := diffstore.OpenDisk(path, base, init,
 | Checkpoint 能力 | 不支持 | `CheckpointManager` |
 | 物理失败清理 | 仅 punch 新创建的 upper 页 | 事务/分配 engine 负责恢复；不得在混合物理文件按 Guest 偏移 punch |
 
-私有 batch 包含逻辑块号、借用的明文字节和 upper 页是否为新建，不暴露 `cachePage`。Cache
-冻结并计费这些页，直到写入及失败清理结束；清理可能阻塞前，先发布 sticky failure。单层 backend
-在现有工作区 staging；v4 执行其现有 mapping commit。缓冲池、请求 batch 上限及加密域沿用各自策略。
+私有 batch 描述逻辑块及其借用的明文 Data 和 fresh 标记，或不带 payload 的显式 Zero，
+不暴露 `cachePage`。Cache 冻结并计入这些页的额度，直到写入及失败清理结束；在 cache
+清理可能阻塞前先发布 sticky failure。单层 backend 在现有工作区暂存 Data；v4 经其
+mapping engine 提交 Data 或 Zero。Zero 分批和写入前有界空间压力恢复见
+[Discard](#discard-and-reclamation)。
 
 新建共享 claim/recheck/template/temp-file 流程；发布共享 file sync、原子 rename、claim 释放和
 directory sync。物化使用同一 dispatcher 以及相同 stripe/presence 冲突检查。v4 保留分批模板提交；
@@ -264,7 +266,7 @@ fatal callback 发布，晚注册 handler 的 replay 也遵守此顺序。返回
 - 未使用 `WithCache` 时，`Disk` 创建并关闭私有 cache。使用 `WithCache` 时，调用者拥有共享 cache，
   必须先关闭所有接入磁盘，再关闭 cache。一个 sandbox 的可写设备仍共享一个 budget 和一个 worker。
 - `ReadAtContext`/`WriteAtContext` 将队列取消传播跨过包边界；`ReadAt`/`WriteAt` 保持常规无 context 入口。
-- Guest `Flush` 仅检查 health，不承诺介质持久化。`Drain` 等待已接受的缓存写入完成；checkpoint
+- Guest `Flush` 仅检查 health，不承诺介质持久化。`Drain` 等待已接受的 Data 和 Zero 回写完成；checkpoint
   还执行版本化持久边界。请求被接受或 Drain 完成均不等于 durable checkpoint。
 - `Disk.Close` 排除新操作并 join 已准入工作后释放存储。`WithDiscardOnClose` 允许为可丢弃且由 runtime
   持有的磁盘取消未完成模板工作，不转移 base 所有权。
@@ -281,10 +283,10 @@ if supported {
 ```
 
 Manager 与磁盘共享生命周期，经在线准入/cache 边界执行操作。Checkpoint 先等待 template ready，
-暂停新前端操作、drain 已接受写入、等待 materialization publication，再提交命名版本。多盘仍需应用层
+暂停新前端操作、drain 已接受的 Data 和 Zero、等待 materialization publication，再提交命名版本。多盘仍需应用层
 协调。现有直接 `Disk` checkpoint 方法继续可用；`Checkpoints()` 让调用者显式判断格式能力，无需用错误试探。
 
-`OpenActiveView(ctx)` 返回**仅含 upper** 的稀疏视图，包含已接受的缓存写入。调用者须保持磁盘打开且
+`OpenActiveView(ctx)` 返回**仅含 upper** 的稀疏视图，包含已接受的 cache Data 和 Zero。调用者须保持磁盘打开且
 quiescent，直到视图关闭；它既不是持久 checkpoint，也不是与 base 组合后的完整磁盘镜像。
 `OpenCheckpoint(ctx, id)` 要求非空 ID，返回带独立 pin 的不可变 reader。后续写入或 owner close 不影响
 该视图；关闭视图才释放 pin。`Export(ctx, ActiveDiff)` 仍是 active view 的低层写法；
@@ -336,19 +338,63 @@ Checkpoint 在普通 allocator record 中原子保存 root 和独立完整 P 副
 
 ## Discard 与回收
 
-`Disk.Discard(offset, length)` 只修改完整覆盖的 4 KiB 页，保留部分边缘页内容。它移除 active payload
-并设置 P=1，返回 Zero 而不暴露 base 字节。公开 `Store.Discard(ctx, offset, length)` 提供同一完整操作，
-要求页对齐范围。PayloadPresence 为 false，不再存在 active Data mapping；保留的 Checkpoint 仍可能
-保护旧 record。Guest DISCARD 使用同一操作，不引入 WRITE_ZEROES 或零压缩。
+受管可写 ext4 默认以 `discard` 挂载，使文件系统释放块时自动通知后端；[挂载范围与生效
+边界](guest-abi_zh.md#guest-block-discard)由 Guest ABI 定义。这会减少过期的活动 payload
+及后续磁盘导出的 payload，但不会缩小不可变 parent 或已有快照，不会因 overlayfs 创建
+whiteout 而回收 EROFS lower，也不会自动 trim 启用选项前已经空闲的全部空间。文件删除、
+Zero 提交与宿主空间回收是不同边界。应分别测量实际分配块和 DIFF 文件逻辑长度，后者
+不保证缩小。
 
-每 batch 最多 64 个完整页，按数值顺序取得不同 stripe 锁，在一个 cache 锁下检查所有已有缓存页，
-随后一次性冻结它们。若有 loading 或 writeback，整个 batch 等待而不冻结任何部分。未缓存页不需要
-placeholder，不相关 dirty 页不必 drain。Backend I/O 在 cache 锁外执行并接收 context。取消可在冻结
-前停止 batch；冻结后必须发布整个 batch 或进入现有 sticky failure 路径并唤醒等待者。成功时为全部页
-发布 Zero，包括此前 absent 的页。普通 presence 位本身阻止 template Data/Zero backfill 覆盖前台内容，
-不另设 template-resolution bitmap。未改动的 template Hole 仍落到 base。不同 batch 之间不保证整个
-range 全有或全无。普通 presence 发布只置位；首次 payload 写入失败则在清理新分配 payload 后恢复旧的
-已提交 bitmap：Hole 保持 P=0，Zero 保持 P=1。
+`Disk.Discard(offset, length)` 为完整覆盖的 4 KiB 页发布 P=1 的逻辑 Zero，遮蔽包括非零
+内容在内的 base；部分边缘页保留原内容。对于 v4，完成通常与 `WriteAt` 一样表示已进入
+有界缓存，而非后端映射已经移除。单层路径仍同步完成。公开且要求页对齐的
+`Store.Discard(ctx, offset, length)` 也保持同步。缓存准入与后端分批均不保证整个范围
+原子性，取消或后续失败可以留下已接受或已提交的前缀。普通写零仍为 Data；不增加
+WRITE_ZEROES 或按内容扫描的压缩。
+
+每个待回写 v4 Zero 占用现有共享总量和脏额度各一页。替换未选中的 dirty 页会复用原
+预留和 FIFO 位置。必须先等待同页 loading、构造或冻结 writeback 完成；额度等待释放
+前台 stripe。缓存 Zero 与前台 presence 均在 ACK 前发布，旧 Data 回写不能使已丢弃页
+重新出现。Zero 没有 4 KiB payload。Data 转 Zero 时清零旧 buffer 并归还到有界 Data 池；
+后续部分写取得已清零 buffer，保留写入范围外为零，不读取旧后端、template 或 base。
+
+既有单 worker 每批只处理同盘、同种类的页：最多 256 个 Data 页进入 1 MiB 工作区，
+或最多 1024 个 Zero 页且不使用 payload 工作区。正常选批保留最老 eligible FIFO 锚点。
+`Store.DiscardPages` 校验有界且不重复的块集合，合并相邻范围，连同 presence 和
+retirement 更新一起移除映射。在预分配或 Data/redo 写入前精确检查已有元数据页的
+redo 镜像数量，超限窗口重建为较小事务，保留原 1536 页预算。此机制约束批次大小，
+不保证 Store 锁等待或碎片化范围的延迟上限。
+
+只有 `Store.WritePagesForCache` 可以把耗尽的 Data 预留 ENOSPC/EDQUOT 暂缓为
+`SpacePressureError`：失败槽清理必须成功，失败事务尚未写 Data/redo，且 Store 仍
+健康；此前 64 页事务可能已经提交。Worker 保持原 Data 窗口冻结，捕获同盘当前 dirty
+Zero，以每批最多 1024 页完成这个有限集合，再对原 Data 窗口重试恰好一次。后到 Zero
+不能延长恢复；全程保留 active I/O 所有权及未完成的额度。Zero 失败、Data 重试失败
+或独立出现的 cache fatal 均进入既有 sticky failure。普通 `Store.WritePages` 保留
+原校验、重复块行为及预留耗尽后的 sticky failure 契约。
+
+若任一额度阻止 cold/clean Zero 准入，且同盘没有已经计入额度、可以释放额度的 Zero，
+DISCARD 使用单页同步路径，不新增预留，也不先 kick 排队 Data。仍须等待同页
+loading、构造或 writeback。这避免额度死锁，不保证处理任意宿主空间耗尽，也不越过
+已经执行的 I/O。不新增 worker、无界请求队列或调参项。
+
+Zero 成功回写后移除缓存条目并归还两种额度，不进入 clean LRU；Data 保持普通 clean
+缓存行为。`Drain`、命名 Checkpoint 和普通 Close 等待已接受 Zero 的回写。在该边界
+仍为 Zero 的页没有活动 Data 映射，PayloadPresence=false。保留的 Checkpoint/reader
+仍可保护旧记录，只有后续 GC 能回收时宿主实际分配才会下降。首次发布后，[活动导出](#snapshot-view)
+无需额外 Drain，已能省略待回写 Zero 的旧 payload。新建磁盘仍需完成 `WaitMaterialized`，
+包括初始化排空。DISCARD 与 Guest FLUSH 均不增加稳定存储持久性保证。
+
+单层同步路径保持每批最多 64 个完整页。按数值顺序取得不同 stripe 锁，在同一 cache
+锁下检查全部已有缓存页后一次性冻结。若有 loading 或 writeback，整批等待而不冻结
+任何部分。未缓存页不需要 placeholder，不相关 dirty 页不必 drain。Backend I/O 在
+cache 锁外执行。取消可在冻结前停止批次；冻结后必须发布整个批次或进入 sticky
+failure 并唤醒等待者。成功时为全部页发布 Zero，包括此前 absent 的页。
+
+两条路径均以普通 presence 位阻止 template Data/Zero backfill 覆盖前台内容，不另设
+template-resolution bitmap。未改动的 template Hole 仍落到 base。普通 presence
+发布只置位；首次 payload 写失败则在清理新分配 payload 后恢复旧已提交 bitmap：
+Hole 保持 P=0，Zero 保持 P=1。
 
 `DeleteCheckpoints` 只撤销可见性，无 reader pin 时立即释放保护；既不执行也不等待 GC。
 `OpenMetadata` 与 List 同样不调度 GC。Active store 有独立 worker；metadata-only owner 须显式调度维护。
@@ -444,6 +490,9 @@ CH pause 且前台 quiesce 后，`SnapshotView` 复制逻辑 bitmap 并提供 up
 后台可继续搬运相同逻辑内容。只有文件成功完成后，最后一份缓存副本才能淘汰。捕获完成前
 保持前台 quiesce 且 COW 打开。捕获期间后台 fatal 必须使发布失败并到达 runtime owner，
 包括故障后没有新 guest 请求的情况。Export 不 rotate active diff 或改变 base。
+已接受的 v4 cache Data/Zero 在字节读取和稀疏区间分类中均覆盖较旧的后端 payload
+presence。普通全零 Data 仍分类为 Data。新建磁盘须先等待既有 `WaitMaterialized`
+发布边界，包括初次排空；发布后创建 active view 不再额外 Drain。
 
 <a id="disk-state"></a>
 
@@ -470,20 +519,29 @@ tmpfs 与磁盘的情况。这实现了 [issue #230](https://github.com/kuasar-s
 | --- | --- | --- |
 | Clean、dirty、writeback、read loading | 每页计一页 | 仅 dirty/writeback |
 | 新写入构造/预留 | 一页 | 一页 |
+| v4 缓存 Zero 准入 | 一页 | 一页 |
 | Clean 变 dirty | 不变 | 加一页 |
 | Dirty 覆盖或变为 writeback | 不变 | 不变 |
-| 回写成功变 clean | 不变 | 减一页 |
+| Data 回写成功变 clean | 不变 | 减一页 |
+| 显式 Zero 回写成功 | 减一页 | 减一页 |
 | 淘汰 clean | 减一页 | 不变 |
 
 始终满足 `dirty_used <= used <= cache_size` 且 `dirty_used <= max_dirty_size`。
-提交 I/O 不释放预留。页池、索引、clean LRU 与 dirty FIFO 都以容量为界。释放时清除明文。
-独立有界开销包括每沙箱最多 256 个写回页指针, 每个活动文件两个独立
-1 MiB MAP_SHARED I/O 工作区（每个额外对齐 padding 小于 1 MiB），以及随页数线性有界的
-页元数据、索引和 Go 分配器开销。`cache_size` 不是进程 RSS、guest memfd 映射、
+提交 I/O 不释放预留。元数据池、Data buffer 池、索引、clean LRU 与 dirty FIFO 均以容量
+为界。显式 Zero 只存元数据、没有 payload，但仍按完整逻辑页计额度。Data 独占独立
+4 KiB buffer，归还池前清除明文。强引用 Data 池在 cache close 前保留此前分配高水位，
+Data 转 Zero 不承诺回收 heap/RSS。冷 Zero-only 负载可避免这些 payload 分配；但
+Zero 转 Data 需要 buffer，池为空时可能新增分配。已提交 Zero 的缓存条目释放后，后续
+读取走普通 clean Data 读缓存，也可能分配 buffer。
+
+选批和操作数组各以 1024 项为界。空间压力恢复另捕获至多 `max_dirty_size / 4096`
+个现有 Zero 页指针，不复制 payload。其他有界开销包括每个活动文件两个独立
+1 MiB MAP_SHARED I/O 工作区（每个额外对齐 padding 小于 1 MiB），以及随页容量线性
+有界的页元数据、索引和 Go 分配器开销。`cache_size` 不是进程 RSS、guest memfd 映射、
 immutable-source cache、tmpfs 文件存储或快照输出内存的上限。
 
 Tmpfs 文件页是位于内存（也可能位于 swap）中的文件系统存储，与这份有界进程缓存分开。
-回写成功会释放脏额度，但不会释放已存入 tmpfs 的文件数据；淘汰 clean 缓存也不会删除它。
+Data 回写成功会释放脏额度，但不会释放已存入 tmpfs 的文件数据；淘汰 clean 缓存也不会删除它。
 `cache_size` 不限制这些字节，也不承诺 tmpfs 页零驻留。该存储由现有 tmpfs 挂载的大小、
 inode 限额和宿主内存控制约束。Sandboxer 不重挂 tmpfs、不改变 cgroup、不扩大缓存预算，
 也不新增持久化保证。参见 [Linux tmpfs 文档](https://www.kernel.org/doc/html/v6.1/filesystems/tmpfs.html)。
@@ -495,7 +553,8 @@ Bitmap 表示**逻辑 upper-present**，独立于 clean/dirty 状态。新页完
 
 ### 读写与背压
 
-读取优先从 clean、dirty 或冻结的 writeback 页复制。只有 miss 才读活动文件并解密。
+读取优先从 clean、dirty 或冻结的 writeback 页复制；显式 Zero 命中直接清零调用者请求
+的字节，不需要缓存 payload。只有 miss 才读活动文件并解密。
 Read loading 预留总容量；没有可用 clean 槽时，可以用有界前台工作区直接服务读取而不入缓存。
 绝不能绕过较新的缓存页。
 
@@ -521,9 +580,10 @@ goroutine 或无界 payload 队列。块条带锁序列化前台同块访问；w
 
 ### 回写与 FLUSH
 
-每沙箱一个 worker 以最老脏页作为每批的锚点。热点覆盖不移到队尾。可合并同文件相邻脏页，
-每批最多 1 MiB，不填 hole 或预分配间隙。固定 1 ms 聚合窗口保证低速流量推进；额度压力与
-内部 Drain 立即唤醒. 选中的页成为冻结 writeback, 仍可读取, 同页写等待. Worker 将冻结页
+每沙箱一个 worker，正常选批以最老 eligible 脏页为锚点。热点覆盖不移到队尾。每批限于
+同文件、同种类：最多 256 个 Data 页（1 MiB）或 1024 个 Zero 页，不填 hole 或预分配间隙。
+固定 1 ms 聚合窗口保证低速流量推进；额度压力与内部 Drain 立即唤醒。
+选中的页成为冻结 writeback，仍可读取，同页写等待。Worker 将冻结 Data 页
 直接复制到 active diff 已有的 aligned MAP_SHARED 写工作区, 在该副本上加密,
 然后在不持有 cache/global 锁时执行 I/O. Cache page payload 保持明文, 不直接作为
 syscall buffer. 前台读有独立工作区.
@@ -531,6 +591,12 @@ syscall buffer. 前台读有独立工作区.
 Worker 通过有界页索引收集同文件连续脏邻居，不要求到达顺序相邻；未选中页的 FIFO
 年龄保持不变。普通写入通知既不提前结束，也不重启固定聚合截止时间。压力和 Drain
 会中断等待。已聚合的积压立即推进，即使每批只有单页，也不会逐批再等待 1 ms。
+
+Zero 批次只写元数据，不复制或加密 payload；成功后归还两种额度，不占 clean LRU。
+待回写 Zero 仍占额度、可能淘汰不相关 clean Data，并增加同页写等待。
+`WrittenBytes` 只计已完成的逻辑 Data，不计 Zero 或有界[空间压力恢复](#discard-and-reclamation)
+中重放的前缀。后端元数据工作仍在 Store 内串行，不相关 cache miss 仍可能等待。
+缓存 ACK 不承诺宿主空间可立即复用。
 
 健康且合法的 guest **FLUSH 是 no-op**，不发起回写、不等待脏页、不调用 Drain、fsync 或
 fdatasync。请求顺序和 fatal 状态检查保留。为兼容 Cloud Hypervisor 快照，保留现有 wire
@@ -625,7 +691,8 @@ epoch 的槽属于活动版本私有；反复覆盖可原位写入，不改索�
 `MarkModified` 每个捕获周期先清除一次当前捕获标记；直接后端写入也执行相同屏障。
 仅比较根指针相等不能证明磁盘未变化。
 
-写入批次最多 64 页。元数据事务在任何数据或元数据落盘之前检查固定 redo 预算：
+物理 Data 事务保持最多 64 页；纯 Zero 事务在元数据预算允许时可包含最多 1024 页。
+元数据事务在任何数据或元数据落盘之前限制固定 redo 预算：
 最多 1,536 个已有元数据页镜像，由三页 redo home-address 索引寻址。先为新的不可达数据/索引槽
 预留空间并写入，再发布 redo；只有已有元数据页进入 redo 镜像。带校验的 commit
 descriptor 授权重放，随后更新 home metadata 并清除 descriptor。不能为了适应预算
@@ -671,16 +738,19 @@ Bundle checkpoint 可以引用相邻 tarstream，后续普通 publish 再生成�
 [Discard](#discard-and-reclamation)定义分批 Zero 变更。传输准入 quiesce 时仍须满足这些存储边界。
 [Runtime 磁盘捕获](runtime_zh.md#disk-capture)协调共同 VM 冻结及结果不确定的多盘根提交。
 
-内部 `Drain` 等待已接受写入完成，不 fsync。普通 Close 停止新前台工作、取消额度等待、
+内部 `Drain` 等待已接受的 Data 和 Zero 回写，不 fsync，也不等待全部 GC。
+映射移除后，保留版本与未完成的 GC 仍可能占用磁盘空间；命名 Checkpoint 和普通 Close
+也等待已接受 Zero。普通 Close 停止新前台工作、取消额度等待、
 排空健康已接受写入、join I/O、清除明文并关闭文件。前台取消不取消健康后台回写。
 Close 幂等，排空及关闭错误沿 run/restore 传播。销毁也必须等真实在途 syscall 结束，才能
 释放其 buffer。
 
-回写与短写错误具有粘性：失败页仍计脏额度，新写失败，唤醒所有等待者，以不 self-join 的
+除 [Discard](#discard-and-reclamation) 中的写入前预留恢复外，回写与短写错误具有粘性：
+失败页仍计脏额度，新写失败，唤醒所有等待者，以不 self-join 的
 非阻塞 fatal 通知报告 runtime。部分物理写可能已改变文件。清理首次物化块不能对同批
 原有 upper 页打洞。前端请求接受不等于整个请求的持久事务；v4 backend 保留其[已提交事务恢复契约](#versioned-format)，不静默 buffered 重试。
 
-必须先记录原始错误并通知 owner，再执行清理 I/O。回滚期间仍持有在途 I/O 所有权、冻结页及其额度，Close 不能提前释放文件或缓冲。清理错误在结束后追加，不掩盖原始失败。
+fatal 错误必须先记录并通知 owner，再执行 cache 层清理 I/O。回滚期间仍持有在途 I/O 所有权、冻结页及其额度，Close 不能提前释放文件或缓冲。清理错误在结束后追加，不掩盖原始失败。
 
 <a id="segmented-vhost-reads"></a>
 
@@ -733,6 +803,10 @@ Tmpfs 功能测试不能作为磁盘缓存绕过证据。
 CH/KVM guest 冷启动/读写和 pause/export/restore；明确报告跳过与基础设施故障。
 
 性能比较的数据集必须远大于缓存，分别报告前台 admission latency 与含 Drain 总耗时。
+DISCARD 还须区分缓存接受、后端映射移除和宿主回收；未启用 discard、同步 discard 与
+缓存 discard 应作为不同基线比较。Zero payload 表示须分别测量冷 Zero-only、Data
+预热缓存、Zero 转 Data 的分配及延迟、已提交 Zero 的再次读取。池复用与分配器/RSS
+行为不能归因为额外的磁盘或导出节省。
 覆盖顺序/随机 4 KiB、512 字节更新、热点覆盖、加密和多盘。报告尾延迟、逻辑/物理写量、
 稳定额度以及 file-cache/dirty/writeback 或 mincore 证据。Buffered 基线与候选使用同一
 存储。不得用 fsync/DONTNEED/drop_caches 人为制造低驻留；活动 diff 内存归因排除未改变的
@@ -903,7 +977,9 @@ sudo python3 test/perf/vhost_guest_fio.py --inputs "$FIXTURES" --output "$NEW_RU
 `snapshot.checkpoint.sh` 在 v3/v4、明文/XTS 配置下对非零不可变基底执行 Guest fstrim，
 验证可移植导出及冷恢复后的 Zero，并在 v4 下经过本地内存 Checkpoint 恢复。
 单元测试补充模板 Data/Zero 在导入前、导入中及导入后的可控交错，以及缓存回写、
-取消和首次载荷写入失败后的旧状态恢复。
+取消和首次载荷写入失败后的旧状态恢复。缓存 Zero 回归覆盖回写前读取/导出、冻结 Data
+顺序、有限空间压力恢复、已完成 Zero 的额度归还，以及不泄漏跨页或跨盘明文的 payload
+池复用。
 
 源码检查与预构建产物 E2E 分开执行。direct I/O 和空间回收检查应使用原生 Linux ext4
 scratch；Windows 挂载目录、仅 tmpfs 测试或跳过特权用例不能证明这些性质。
@@ -918,7 +994,7 @@ bash scripts/ci-source-checks.sh
 
 # 独占、可丢弃的 64 MiB ext4 文件系统；不要使用共享开发挂载点：
 DIFFSTORE_FULL_FS=/path/to/owned/finite-ext4 go test ./pkg/diffstore/internal/versioned \
-  -run '^TestRealFilesystemFullRecovery$' -count=1 -v
+  -run '^TestRealFilesystem(FullRecovery|CacheSpaceRecovery)$' -count=1 -v
 
 # root shell；PREPARED 包含准确构建的产物与平台 E2E runner：
 python3 "$PREPARED/test/e2e/e2e" run --workdir "$PREPARED" \
@@ -1007,7 +1083,7 @@ p50/p95/p99、包含最终 Drain 的吞吐、数据/索引/redo/GC 物理字节�
 并区分无版本、共享首写、已私有覆盖。这些命令提供复现方法，不代表
 性能门槛或全部特权测试已经通过。
 
-以下配套探针测量完整 Zero discard，并记录 trim 前、已删除
+以下配套探针分别报告 DISCARD 的 ACK 和含 Drain 的完成耗时，并记录 trim 前、已删除
 Checkpoint 仍被读者固定、读者释放并完成 GC 后，以及复用后的实际分配空间：
 
 ```bash
@@ -1015,7 +1091,12 @@ go test ./pkg/diffstore -run '^$' -bench '^BenchmarkCheckpointDiscard$' -benchti
 go test ./pkg/diffstore/internal/versioned -run '^$' -bench '^BenchmarkCheckpointZeroRetention$' -benchtime=3x
 ```
 
-Discard 记录进程 CPU、后端调用、位图/索引/redo 字节及结构提交数。版本化计数可能
+`BenchmarkCheckpointDiscard` 的 `ns/op` 包含 Discard 加 Drain，另以 `ack-ns/range`
+报告准入。v4 ACK 可以领先于映射移除；Drain 不证明读者保留的 payload 或全部 GC
+工作已经回收。不同 revision 必须使用相同完成边界。
+`backend-calls/range` 只计同步 `diffBackend.discard` 调用，不计经 `writePages` 执行的
+v4 缓存 Zero 回写，因此零值不表示后端没有工作。Discard 还记录进程 CPU、位图/索引/redo
+字节及结构提交数。版本化计数可能
 包含并发后台 GC。已有 Data 转为 Zero 时 P 保持为 1，无需重写位图。对同时提供两种
 模式的旧版本，应使用其 `BenchmarkCheckpointGuestDiscard` 比较相同的 Zero 语义；
 历史 Hole 结果不可直接比较。COW 首写基准在停止计时后关闭并重建同配置 DIFF，
@@ -1053,7 +1134,7 @@ reclamation 工作负载停止独立 GC worker，测量已提交的空闲位置�
 活动 worker 在可继续推进的批次之间留出可取消的 1 ms 间隔，以降低前台争抢；
 显式 GC 不增加间隔。这以峰值后台吞吐换取调度机会，不构成前台延迟保证。
 Discard 固定使用 4 MiB 范围和 1 MiB 缓存；
-后端调用数可以归因于 Discard，但 `total-commits/range` 包含并发 GC 提交。
+同步后端调用计数不包含缓存 Zero 回写，`total-commits/range` 则包含并发 GC 提交。
 专用 reclamation 和 Discard 用例会略过不支持的 shared/private 模式组合。
 各轮原始结果及准确的基线/候选身份保留在 PR 或 Issue；这些负载提供实测观察，
 不构成普遍加速倍数承诺。

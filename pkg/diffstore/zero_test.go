@@ -59,13 +59,9 @@ func TestPresenceZeroDiscardReopen(t *testing.T) {
 					t.Fatal(err)
 				}
 				kinds := []sparse.RunKind{sparse.Hole, sparse.Zero, sparse.Zero, sparse.Data, sparse.Zero, sparse.Data, sparse.Zero, sparse.Hole}
-				payload := make([]bool, len(kinds))
-				if err := d.diff.payloadPresence(context.Background(), 0, payload); err != nil {
-					t.Fatal(err)
-				}
 				for i, want := range kinds {
-					if d.blockDirty(int64(i)) != (want != sparse.Hole) || payload[i] != (want == sparse.Data) {
-						t.Fatalf("page %d logical/payload presence = %t/%t, want %v", i, d.blockDirty(int64(i)), payload[i], want)
+					if d.blockDirty(int64(i)) != (want != sparse.Hole) {
+						t.Fatalf("page %d logical presence = %t, want %v", i, d.blockDirty(int64(i)), want)
 					}
 					run, err := view.RunAt(uint64(i*cowBlockSize), cowBlockSize)
 					if err != nil || run.Kind() != want {
@@ -73,6 +69,20 @@ func TestPresenceZeroDiscardReopen(t *testing.T) {
 					}
 				}
 				_ = view.Close()
+				// v4 ACK publishes cached Zero; physical mapping removal is a
+				// completion property of Drain, not the acceptance boundary.
+				if err := d.Drain(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				payload := make([]bool, len(kinds))
+				if err := d.diff.payloadPresence(context.Background(), 0, payload); err != nil {
+					t.Fatal(err)
+				}
+				for i, want := range kinds {
+					if payload[i] != (want == sparse.Data) {
+						t.Fatalf("page %d completed payload = %t, want %v", i, payload[i], want)
+					}
+				}
 				if checkpoint {
 					if err := d.Checkpoint(context.Background(), "zero"); err != nil {
 						t.Fatal(err)
@@ -125,7 +135,10 @@ func TestActiveZeroExportIncludesAcceptedWrite(t *testing.T) {
 		t.Run(fmt.Sprint(checkpoint), func(t *testing.T) {
 			gate := make(chan struct{})
 			var once sync.Once
-			cache, err := newCache(4*cowBlockSize, 2*cowBlockSize, cacheHooks{beforeWrite: func([]*cachePage) error { <-gate; return nil }})
+			// Hold selection so v4 can convert accepted dirty Zero to Data
+			// before either state is frozen. A beforeWrite gate could otherwise
+			// freeze Zero first and make the partial writer wait on this test.
+			cache, err := newCache(4*cowBlockSize, 2*cowBlockSize, cacheHooks{beforeSelect: func() { <-gate }})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -519,6 +532,9 @@ func TestTemplatePresenceAloneCoordinatesDiscardAndWrites(t *testing.T) {
 								payload := []bool{true}
 								if !cow.blockDirty(1) {
 									t.Fatal("discard failed to take logical ownership")
+								}
+								if err := cow.Drain(context.Background()); err != nil {
+									t.Fatal(err)
 								}
 								if err := cow.diff.payloadPresence(context.Background(), 1, payload); err != nil || payload[0] {
 									t.Fatal("discard retained active payload", payload, err)

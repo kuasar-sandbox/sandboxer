@@ -200,12 +200,12 @@ func TestCheckpointPayloadCorruptionNeverMasqueradesAsZero(t *testing.T) {
 						}
 						return
 					}
-					// Full writes and partial writes into Hole may be accepted
-					// in the cache. Backend validation must fail before writing
-					// payload or publishing the replacement mapping/bitmap.
-					accepted := operation == "full-write" || operation == "partial-write" && hole
+					// Complete writes/discards and partial writes into Hole may
+					// be accepted in the cache. Completion must validate before
+					// writing payload or replacing/deleting mappings and bitmap.
+					accepted := operation == "discard" || operation == "full-write" || operation == "partial-write" && hole
 					if accepted {
-						if err != nil || n == 0 {
+						if err != nil || operation != "discard" && n == 0 {
 							t.Fatal("cache acceptance failed", n, err)
 						}
 						err = cow.Drain(context.Background())

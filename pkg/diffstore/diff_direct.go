@@ -212,7 +212,7 @@ func (d *diffFile) writePages(ctx context.Context, pages []pageWrite) error {
 		return fmt.Errorf("diffstore: invalid single-layer batch")
 	}
 	for _, p := range pages {
-		if len(p.Data) != cowBlockSize || p.Block >= uint64(d.logicalSize/cowBlockSize) {
+		if p.Zero || len(p.Data) != cowBlockSize || p.Block >= uint64(d.logicalSize/cowBlockSize) {
 			return fmt.Errorf("diffstore: invalid single-layer page")
 		}
 	}

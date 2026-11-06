@@ -288,7 +288,7 @@ B. connect(CID=2:5000), send hello{phase:"runtime_ready"}, wait for launch
 C. Only after launch (and host publication of every block backend):
    1. Wait for /dev/vda and /dev/vdb: stat polling, 10 s timeout.
    2. mount -t erofs -o ro /dev/vda /overlay/lower
-      mount -t ext4 /dev/vdb /overlay/upper
+      mount -t ext4 -o discard /dev/vdb /overlay/upper
    3. Create /overlay/upper/{upperdir,workdir} if absent.
    4. mount -t overlay overlay -o lowerdir=/overlay/lower,
         upperdir=/overlay/upper/upperdir,workdir=/overlay/upper/workdir /sysroot
@@ -407,7 +407,7 @@ passes one writable `--disk` for the root ext4 CoW device, and adds
 `sandbox.root.layout=single` to the kernel command line. Phase 1a reads
 `/proc/cmdline` after mounting proc. Since disk assembly runs before the launch
 spec arrives, the layout must come from cmdline, not the spec.
-This path waits only for `/dev/vda` and mounts it as ext4 directly at
+This path waits only for `/dev/vda` and mounts it as ext4 with `discard` directly at
 `/sysroot`: no lower/upper staging, overlayfs or vdb. Payload binding,
 switch-root and phase 1b's basic mounts remain the same. `empty` volume sources
 move to `/sysroot/.sandbox-volumes/<i>` on the writable root itself, then bind
@@ -441,10 +441,10 @@ mismatched runtime image or reduce the disk count.
 
 ```
 Single data disk N:
-  mount ext4 /dev/vdX -> /sysdisks/disk-N
+  mount ext4 -o discard /dev/vdX -> /sysdisks/disk-N
 Overlay data disk N:
   erofs ro -> /sysdisks/disk-N-lower
-  ext4 rw  -> /sysdisks/disk-N-upper
+  ext4 rw,discard -> /sysdisks/disk-N-upper
   overlayfs(lower, upper/upperdir, upper/workdir) -> /sysdisks/disk-N
 Both:
   bind /sysdisks/disk-N -> /sysroot<target>
@@ -473,6 +473,24 @@ read retains its original handle/slot until it finishes ([Raw usage observations
 
 #### Guest block DISCARD
 
+`sandbox-init` enables `discard` on all four managed writable ext4 mount paths:
+the single root, the overlay root's upper, single data disks and overlay data
+disks' uppers. Empty/bind volumes inherit their underlying filesystem; read-only
+EROFS mounts retain their existing options. Filesystem release can therefore
+notify the host without an application change or a separate trim for each
+deletion. Deletion can incur additional work, and filesystem release, host
+reclamation and disk-export savings need not happen when unlink returns; the
+[storage contract](block-storage.md#discard-and-reclamation) defines those
+boundaries and protects retained history.
+
+Adopting this default requires a runtime bundle containing the updated
+`sandbox-init` and selection of that bundle through the template's `boot.runtime`
+for cold boot. Replacing the host executable alone does not update the embedded
+init. Existing running instances and memory restores retain their established
+mounts; restore does not remount them. No disk or snapshot format migration is
+required. Enabling the option does not automatically trim all previously free
+space.
+
 New writable virtio-blk devices expose `VIRTIO_BLK_F_DISCARD`; read-only devices
 do not. The fixed configuration is `MaxDiscSeg=1`, `DiscSecAln=8` (4096 bytes),
 and `MaxDiscSec=8192` (4 MiB). Capabilities are fixed when the server is created;
@@ -483,16 +501,27 @@ The request contains exactly one 16-byte range, possibly split across readable
 descriptors. The host validates flags, original sector bounds and overflow before
 rounding inward to complete 4 KiB pages. Unsupported flags and WRITE_ZEROES return
 UNSUPP; malformed/beyond-capacity requests return IOERR. A successful DISCARD
-removes upper payload but retains logical presence: subsequent reads return zero,
-including over nonzero lower data. Uncovered edge pages retain their original
-contents. The host uses batches of at most 64 pages; completion is not a guarantee
-of atomicity across batches or stable-storage durability. Ordinary writes of zero
-bytes still allocate Data. Guest FLUSH keeps the existing non-durable contract.
+publishes logical Zero: subsequent reads return zero, including over nonzero
+lower data. Uncovered edge pages retain their original contents. With v4, ACK
+normally means Zero was accepted into the existing bounded dirty cache, like
+WriteAt; quota pressure can instead complete one page synchronously without a
+new reservation. Backend payload-mapping removal can follow during writeback.
+Internal Drain, named Checkpoint and normal Close wait for that writeback, not
+for all GC. After initial publication, active export can already emit pending
+Zero without another Drain; fresh disks still await `WaitMaterialized`, including
+its initial drain. Single-layer v3 retains synchronous removal in 64-page batches.
+Neither path promises whole-range atomicity or stable-storage durability.
+Ordinary writes of zero bytes still allocate Data. Guest FLUSH keeps the existing
+non-durable contract.
 
-Use `fstrim` on a mounted writable ext4 filesystem to exercise the real Guest
-path. Validation must retain nonzero lower bytes, check zero reads after discard,
-Checkpoint/export and restore, and verify that the corresponding upper ranges
-have no payload. A successful trim byte count alone does not prove these properties.
+Validate new runtime cold boots with both root/data topologies and inspect the
+actual ext4 mount options, without a manual remount. File deletion should reach
+Guest DISCARD; `fstrim` separately exercises already-free extents. Retain nonzero
+lower bytes, check zero reads after discard, Checkpoint/export and restore, and
+verify after Drain or Checkpoint that the corresponding upper ranges have no
+active payload. Before that boundary, use a paused-writeback test to verify both
+Zero reads and sparse-export Zero classification. A successful trim byte count
+alone does not prove these properties.
 
 <a id="apply-and-launch"></a>
 

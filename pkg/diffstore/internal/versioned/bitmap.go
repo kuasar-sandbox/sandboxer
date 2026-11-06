@@ -95,6 +95,38 @@ func (t *transaction) setPresence(block uint64) error {
 	return nil
 }
 
+// setPresenceRange preserves the committed bitmap and any changes already in
+// this transaction. Only pages with new logical ownership need an edit, and
+// each changed encoded page is sealed once for the complete range.
+func (t *transaction) setPresenceRange(start, end uint64) {
+	for start < end {
+		index := int(start/8) / presence.PayloadSize
+		base := uint64(index*presence.PayloadSize) * 8
+		limit := min(end, base+presence.PayloadSize*8)
+		page := presenceAreaPage + uint64(index)
+		b := t.pages[page]
+		changed := false
+		for block := start; block < limit; block++ {
+			if b == nil {
+				if presence.Has(t.store.presence, block) {
+					continue
+				}
+				b = presence.Encode(t.store.presence, t.store.Size(), index)
+				t.pages[page] = b
+			}
+			part := b[presence.HeaderSize : PageSize-4]
+			if !presence.Has(part, block-base) {
+				presence.Set(part, block-base)
+				changed = true
+			}
+		}
+		if changed {
+			sealPage(b)
+		}
+		start = limit
+	}
+}
+
 func (t *transaction) snapshotPresence() (uint64, error) {
 	var head, previous uint64
 	for i := 0; i < presence.Pages(t.store.Size()); i++ {

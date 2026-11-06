@@ -47,26 +47,35 @@ func (s *activeSource) RunAt(off, limit uint64) (sparse.Run, error) {
 	kind := sparse.Hole
 	if present {
 		count := (end+cowBlockSize-1)/cowBlockSize - first
-		var cached, payload [maxWritebackPages]bool
-		// Capture accepted writes BEFORE the backend query. A writeback can turn
-		// dirty into clean only after publishing its payload: either observation
-		// therefore proves Data, even if the worker completes between the two.
+		var cached, zero, payload [maxWritebackPages]bool
+		// Capture accepted mutations BEFORE querying the backend. Dirty/frozen
+		// Data or Zero overrides the older physical mapping. A page becomes clean
+		// only after that same mutation commits, so completion/eviction between
+		// the observations cannot change the quiesced logical view.
 		c.cache.mu.Lock()
 		for i := uint64(0); i < count; i++ {
 			p := c.cache.pages[cacheKey{c, int64(first + i)}]
 			cached[i] = p != nil && (p.state == cacheDirty || p.state == cacheWriteback)
+			if cached[i] {
+				zero[i] = p.zero
+			}
 		}
 		c.cache.mu.Unlock()
 		if err := c.diff.payloadPresence(ctx, first, payload[:count]); err != nil {
 			return nil, c.propagateBackendFailure(err)
 		}
-		data := cached[0] || payload[0]
+		for i := uint64(0); i < count; i++ {
+			if cached[i] {
+				payload[i] = !zero[i]
+			}
+		}
+		data := payload[0]
 		kind = sparse.Zero
 		if data {
 			kind = sparse.Data
 		}
 		for i := uint64(1); i < count; i++ {
-			if (cached[i] || payload[i]) != data {
+			if payload[i] != data {
 				end = (first + i) * cowBlockSize
 				break
 			}

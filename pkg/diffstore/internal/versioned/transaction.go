@@ -25,6 +25,17 @@ type dataWrite struct {
 
 var errReservation = errors.New("diffstore: space reservation failed")
 
+// discardRedoBudget is returned only by the preparation preflight, before
+// reserve or commit has performed any writes. It asks Discard to rebuild a
+// smaller logical range; storage failures retain their ordinary classification.
+type discardRedoBudget struct {
+	pages, limit int
+}
+
+func (e *discardRedoBudget) Error() string {
+	return fmt.Sprintf("diffstore: discard needs %d redo pages (budget %d)", e.pages, e.limit)
+}
+
 type transaction struct {
 	store          *Store
 	ctrl           control
@@ -39,13 +50,24 @@ type transaction struct {
 }
 
 func (s *Store) mutate(ctx context.Context, fn func(*transaction) error) error {
+	return s.mutateWithRedoBudget(ctx, fn, 0)
+}
+
+func (s *Store) mutateWithRedoBudget(ctx context.Context, fn func(*transaction) error, redoBudget int) error {
+	return s.mutateWithReservationPolicy(ctx, fn, redoBudget, false)
+}
+
+// The cache may defer only a successfully rolled-back space reservation. It
+// retains the complete frozen Data window while it commits a finite Zero
+// cohort, then retries that window. Ordinary callers keep sticky exhaustion.
+func (s *Store) mutateWithReservationPolicy(ctx context.Context, fn func(*transaction) error, redoBudget int, deferSpaceFailure bool) error {
 	for attempt := 0; ; attempt++ {
-		err := s.mutateOnce(ctx, fn)
-		if !errors.Is(err, errReservation) {
+		err := s.mutateOnceWithRedoBudget(ctx, fn, redoBudget)
+		if s.fatal != nil || !errors.Is(err, errReservation) {
 			return err
 		}
 		if attempt >= 2 {
-			return s.fail(err)
+			return s.reservationFailure(err, deferSpaceFailure)
 		}
 		// Reserved redo lets GC run even when new payload allocation fails.
 		// Bound foreground assistance; retained pages are never sacrificed.
@@ -61,11 +83,26 @@ func (s *Store) mutate(ctx context.Context, fn func(*transaction) error) error {
 			}
 		}
 		if freed == 0 {
-			return s.fail(err)
+			return s.reservationFailure(err, deferSpaceFailure)
 		}
 	}
 }
+
+func spaceReservation(err error) bool {
+	return errors.Is(err, errReservation) && (errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT))
+}
+
+func (s *Store) reservationFailure(err error, deferSpaceFailure bool) error {
+	if deferSpaceFailure && s.fatal == nil && spaceReservation(err) {
+		return err
+	}
+	return s.fail(err)
+}
 func (s *Store) mutateOnce(ctx context.Context, fn func(*transaction) error) error {
+	return s.mutateOnceWithRedoBudget(ctx, fn, 0)
+}
+
+func (s *Store) mutateOnceWithRedoBudget(ctx context.Context, fn func(*transaction) error, redoBudget int) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -76,6 +113,7 @@ func (s *Store) mutateOnce(ctx context.Context, fn func(*transaction) error) err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	allocatedBefore, reusedBefore := s.stats.Allocated, s.stats.Reused
 	t := &transaction{store: s, ctrl: s.ctrl, pages: make(map[uint64][]byte), fresh: make(map[uint64]bool), nodes: make(map[uint64]node)}
 	if err := fn(t); err != nil {
 		// Missing IDs and cancellation are ordinary request failures. Corruption,
@@ -92,14 +130,32 @@ func (s *Store) mutateOnce(ctx context.Context, fn func(*transaction) error) err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if redoBudget > 0 {
+		if pages := t.redoPages(); pages > redoBudget {
+			// Preparation only changed private transaction buffers and the
+			// metadata read cache. No reservation/cleanup or GC is needed.
+			s.stats.Allocated, s.stats.Reused = allocatedBefore, reusedBefore
+			return &discardRedoBudget{pages: pages, limit: redoBudget}
+		}
+	}
 	err := t.commit()
 	if err != nil {
 		// Before publishing redo, all allocated slots remain unreachable. Once the
 		// commit write is attempted its result is uncertain: retain them for replay.
 		if !t.committed {
+			var cleanupErr error
 			for _, slot := range t.allocated {
-				_ = punch(s.file, slot)
+				punchErr := s.hook("rollback-punch")
+				if punchErr == nil {
+					punchErr = punch(s.file, slot)
+				}
+				if punchErr != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("diffstore: rollback slot %d: %w", slot, punchErr))
+				}
 				s.cache.remove(slotPage(slot))
+			}
+			if cleanupErr != nil {
+				return s.fail(errors.Join(err, cleanupErr))
 			}
 		}
 		if errors.Is(err, errReservation) {
@@ -109,6 +165,29 @@ func (s *Store) mutateOnce(ctx context.Context, fn func(*transaction) error) err
 	}
 	return nil
 }
+
+// redoPages counts exactly the existing metadata images commit will publish.
+// Nodes may also have an encoded page in pages, and control replaces page 1;
+// neither may be counted twice. Fresh unreachable pages do not consume redo.
+func (t *transaction) redoPages() int {
+	if len(t.pages) == 0 && len(t.nodes) == 0 && t.ctrl == t.store.ctrl {
+		return 0
+	}
+	count := 1 // commit always encodes the new control page
+	for page := range t.pages {
+		if page != 1 && !t.fresh[page] {
+			count++
+		}
+	}
+	for slot := range t.nodes {
+		page := slotPage(slot)
+		if _, exists := t.pages[page]; !exists && !t.fresh[page] {
+			count++
+		}
+	}
+	return count
+}
+
 func (t *transaction) read(page uint64) ([]byte, error) {
 	if b, ok := t.pages[page]; ok {
 		return b, nil
@@ -255,6 +334,78 @@ func (t *transaction) retire(slot uint64) error {
 	}
 	d.Kind = kindGarbage
 	return t.setDesc(slot, d)
+}
+
+// retirePayloads applies the ordinary retirement ownership rule to a bounded
+// set of removed Data mappings. A descriptor page is checked and sealed once,
+// and the protected checkpoint is encoded once after all its links change.
+func (t *transaction) retirePayloads(slots []uint64) error {
+	if len(slots) == 0 {
+		return nil
+	}
+	sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
+	for i, slot := range slots {
+		if slot == 0 || slot >= t.ctrl.Next {
+			return fmt.Errorf("diffstore: slot %d out of bounds", slot)
+		}
+		if i != 0 && slots[i-1] == slot {
+			return fmt.Errorf("diffstore: double retirement of slot %d", slot)
+		}
+	}
+	epoch, err := t.protectedEpoch()
+	if err != nil {
+		return err
+	}
+	var cp checkpoint
+	cpChanged := false
+	for first := 0; first < len(slots); {
+		page := descriptorPage(slots[first])
+		last := first + 1
+		for last < len(slots) && descriptorPage(slots[last]) == page {
+			last++
+		}
+		b, err := t.edit(page)
+		if err != nil {
+			return err
+		}
+		if err := checkPage(b); err != nil {
+			return err
+		}
+		for _, slot := range slots[first:last] {
+			o := descriptorOffset(slot)
+			d := descriptor{le.Uint64(b[o:]), le.Uint64(b[o+8:]), le.Uint64(b[o+16:])}
+			if d.Kind == kindGarbage || d.Kind == kindFree {
+				return fmt.Errorf("diffstore: double retirement of slot %d", slot)
+			}
+			if d.Kind != kindData {
+				return fmt.Errorf("diffstore: non-data slot %d in payload mapping", slot)
+			}
+			if t.ctrl.Protected != 0 && d.Birth <= epoch {
+				if !cpChanged {
+					cp, err = t.store.readCheckpoint(t.ctrl.Protected, t)
+					if err != nil {
+						return err
+					}
+					cpChanged = true
+				}
+				d.Next = cp.Garbage
+				cp.Garbage = slot
+			} else {
+				d.Next = t.ctrl.Garbage
+				t.ctrl.Garbage = slot
+			}
+			d.Kind = kindGarbage
+			le.PutUint64(b[o:], d.Birth)
+			le.PutUint64(b[o+8:], d.Next)
+			le.PutUint64(b[o+16:], d.Kind)
+		}
+		sealPage(b)
+		first = last
+	}
+	if cpChanged {
+		return t.putCheckpoint(t.ctrl.Protected, cp)
+	}
+	return nil
 }
 
 // commit finishes the current transaction without consulting caller cancellation.
