@@ -206,9 +206,13 @@ reservation protocol and failure behavior are defined in [resources](resources.m
 `diff` and `diff_template` are absolute local file references. Immutable refs may
 use the supported local or Manifest carriers. A lower chain requires its base.
 Cold writable ext4 devices need a mountable base/template/existing diff; a blank
-file is not a filesystem. Automatic active diffs are runtime-owned and removed on
-exit; explicit paths remain caller-owned. Capacity comes from the selected disk
-source, not a quota or resize flag. See [capacity and migration](#disk-capacity).
+file is not a filesystem. In ordinary non-checkpoint mode, automatic active diffs
+are runtime-owned and removed on exit; explicit paths remain caller-owned.
+With `--enable-checkpoint`, writable files instead belong to the derived checkpoint
+directory and survive normal exit, including automatically selected paths. Follow
+[checkpoint ownership and cleanup](block-storage.md#checkpoints) for that mode.
+Capacity comes from the selected disk source, not a quota or resize flag.
+See [capacity and migration](#disk-capacity).
 
 ### Workload fields
 
