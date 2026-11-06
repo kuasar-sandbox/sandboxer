@@ -65,7 +65,7 @@ type benchmarkAccessPattern struct {
 // It isolates source and population work from a real userfaultfd syscall so it
 // runs in CI without KVM. End-to-end cold page-cache, NFS, vCPU wake latency,
 // CPU, and RSS measurements use the same names in the external restore matrix
-// documented in docs/sandbox.md. Set KUASAR_UFFD_BENCH_NFS_ARTIFACT to include
+// documented in docs/runtime.md. Set KUASAR_UFFD_BENCH_NFS_ARTIFACT to include
 // a canonical tarstream artifact stored on an NFS mount.
 func BenchmarkUFFDFaultStrategies(b *testing.B) {
 	fixtures := []benchmarkSnapshotFixture{

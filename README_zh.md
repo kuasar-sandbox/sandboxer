@@ -15,7 +15,7 @@
 
 - 从已展平 image 冷创建 Sandbox;
 - 从 snapshot template 创建相互独立的实例;
-- 对一个逻辑 Sandbox 执行 pause、snapshot、export、publish、restore 和 resume;
+- 捕获 snapshot、在线 export 和发布，并可选择恢复原 runtime 继续运行;
 - 通过外部 memfd/userfaultfd 路径按需加载 guest memory;
 - 为本地文件或 Manifest-backed 数据提供 vhost-user block backend,并维护实例独立的 copy-on-write diff;
 - 通过 vsock 和多路复用 stdio/port-forwarding 路径受控通信;
@@ -30,7 +30,7 @@ Snapshot 复用由显式 parent/child 引用表示。从同一 template 创建�
 
 | 二进制 | 用途 |
 | --- | --- |
-| `sandbox-ctl` | Host 控制面:run、snapshot、export、publish、restore、inspect、execute 和 render config |
+| `sandbox-ctl` | Host CLI：run/restore、exec、snapshot、export、reset、checkpoint 管理、usage、info、publish 与配置 |
 | `sandbox-init` | Guest PID 1:分阶段初始化、应用监督、vsock 控制、stdio 多路复用和 guest 生命周期响应 |
 
 `sandbox-init` 在本仓构建,再由 [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime) 打包进 `sandbox-runtime.bundle`。
@@ -39,14 +39,16 @@ Snapshot 复用由显式 parent/child 引用表示。从同一 template 创建�
 
 | Package | 用途 |
 | --- | --- |
+| `pkg/runtime` | 公开 Runtime SDK：`StartRuntime`、`Launch`、`Start`、`Restore`、在线操作与 owner 生命周期 |
 | `pkg/resource` | 节点资源控制 wire contract 与 client,由 `orchestrator` 使用 |
 | `pkg/ctl` | Host-local control socket 协议和 `ServeExecTunnel` policy callback;`ProxyExec` 仅 relay 已连接 backend |
 | `pkg/usage` | Host-only 累计资源用量、Snapshot、Record 及离线读取 |
 | `pkg/usagereader` | CLI 与本机 conductor adapter 共用的无损 live/saved/history 读取 |
-| `pkg/sandbox`、`pkg/restore`、`pkg/snapshot` | 生命周期、restore 和 snapshot 编排 |
+| `pkg/sandbox`、`pkg/restore`、`pkg/snapshot` | 公开 SDK 后的生命周期实现、源准备与捕获 helper |
 | `pkg/artifact` | 向 Manifest store 或 named-location Bundle 进行 typed publication |
 | `pkg/uffd`、`pkg/memory` | 按需 memory 加载与 memfd 所有权 |
-| `pkg/vhost` | vhost-user-blk backend 与 copy-on-write 数据路径 |
+| `pkg/vhost` | vhost-user-blk 传输、队列与 Guest 内存 |
+| `pkg/diffstore` | [可写磁盘、共享缓存、单层/checkpoint 存储](docs/block-storage_zh.md) |
 | `pkg/guestlink`、`pkg/mux`、`pkg/proto`、`pkg/fwd`、`pkg/stdio` | Host/guest 控制、多路复用和 forwarding |
 | `pkg/config`、`pkg/resctl`、`pkg/chapi`、`pkg/tapfd` | Runtime 配置、资源执行、Cloud Hypervisor API 和 TAP 交接 |
 
@@ -102,7 +104,7 @@ Unit/static 检查不能证明 privileged KVM、TAP、cgroup、vhost 或 restore
 
 ## Cloud Hypervisor 边界
 
-`sandboxer` 维护项目 Cloud Hypervisor patch set 和构建支持。Patch set 提供 Runtime 所需的 external-memory、userfaultfd、balloon 和生命周期合同。上游源码、精确 patch target、构建输入及许可证边界记录在 [`docs/cloud-hypervisor_zh.md`](docs/cloud-hypervisor_zh.md) 和 [`LICENSE_SCOPE_zh.md`](LICENSE_SCOPE_zh.md)。
+`sandboxer` 维护项目 Cloud Hypervisor patch set 和构建支持。Patch set 提供 Runtime 所需的 external-memory、userfaultfd、balloon 和生命周期合同。上游源码、精确 patch target、构建输入及许可证边界记录在 [`docs/vmm_zh.md`](docs/vmm_zh.md) 和 [`LICENSE_SCOPE_zh.md`](LICENSE_SCOPE_zh.md)。
 
 Cloud Hypervisor 仍是采用上游许可证的第三方软件。项目原创 Go code 不会重许可上游代码,也不会重许可保留上游 copyright 和 license 的 patch。
 
@@ -128,7 +130,7 @@ make build
 
 ## Release 模型
 
-Preview 清理忽略历史 `SHA256SUMS` 和正文记录。完整性按精确包名、原生资产 ID、大小、摘要与上传状态判断；历史单 x86_64 包和完整双架构包均受保护，缺失或歧义元数据保留并报错。删除前复核实际 Tag 与 Release，部分删除可重试；只有明确 404 视为不存在。保留范围与期限由项目发行清理规则决定。
+共享 Preview 保留、清理、资产完整性检查与 Latest 协调由[项目发行契约](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md)统一定义。以下保留本组件的构建输入、包内容与 helper 选择规则。
 
 所选 owner 源码在 `release/helper-inputs.json` 声明完整的编译型 E2E helper 清单。配方 `scripts/build-e2e-helpers.sh` 接收目标架构和全新的输出目录，仅在源码构建阶段使用已准入的依赖工作区执行；打包 prepare 和用例执行消费经校验的二进制。内部构建目标和包路径由本仓维护。
 
@@ -142,11 +144,23 @@ Preview 清理忽略历史 `SHA256SUMS` 和正文记录。完整性按精确包�
 
 ## 文档
 
-- [sandbox_zh.md](docs/sandbox_zh.md) — Host 控制与完整 Sandbox 生命周期：配置、输出目标、资源用量、COW、制品格式/发布、捕获、恢复、读取恢复和清理。
-- [sandbox-init_zh.md](docs/sandbox-init_zh.md) — Guest PID 1 ABI、初始化、vsock、原始 usage 观测、stdio 和应用生命周期。
-- [cloud-hypervisor_zh.md](docs/cloud-hypervisor_zh.md) — VMM 集成、补丁、构建和运行边界。
+独立使用从 [Runtime 完整流程](docs/runtime_zh.md#standalone-workflow)开始；组合多个组件的平台部署
+从[项目快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)开始。
+组件手册平铺于 `docs/`，每个主题同时保留理解一个状态 owner 或稳定边界所需的操作、精确契约和机制。
 
-这三组 owner 文档提供完整英中版本。Native build 和 license scope 指南也有双语版本。章节归属与新增文档要求见英文 [Documentation policy](CONTRIBUTING.md#documentation)。
+| 主题 | 适用任务 | 精确契约归属 |
+| --- | --- | --- |
+| [Runtime](docs/runtime_zh.md) | 启动、Launch、run、exec、snapshot、在线 export、恢复与关闭单个 VM | Runtime 状态、API/CLI 操作语义、context 与跨资源捕获 |
+| [配置](docs/configuration_zh.md) | 准备和检查 sandbox.yaml 或 Host overlay | 字段、默认值、校验、合并和输出目标 |
+| [制品](docs/artifacts_zh.md) | 组装 E、reset 保留状态、检查和发布 E/S | Portable schema、身份、依赖图、发布与保留 |
+| [内存](docs/memory_zh.md) | 理解按需恢复和 checkpoint 内存 | Memfd 所有权、UFFD、分层读取、释放页与 dirty history |
+| [块存储](docs/block-storage_zh.md) | 集成 Disk、操作磁盘 checkpoint 和诊断块 I/O | Vhost 传输、不可变 lower、cache、DIFF v3/v4 与回收 |
+| [资源](docs/resources_zh.md) | 配置资源策略并读取 Usage | Capacity/Budget、cgroup、balloon、资源协议与累计计量 |
+| [Guest ABI](docs/guest-abi_zh.md) | 准备工作负载或修改 Host/Guest 集成 | sandbox-init 阶段、进程、文件系统、vsock、MUX 与原始观测 |
+| [VMM](docs/vmm_zh.md) | 构建匹配 monitor 或维护补丁 | Cloud Hypervisor/KVM 集成、设备模型、交接与补丁契约 |
+
+八个主题均维护完整中英文版本；Native 构建与 license scope 也有双语指南。指南应与二进制使用相同源码或
+所选发行版。[贡献策略](CONTRIBUTING.md#documentation)规定主题归属，以及重组时如何保留维护中的契约。
 
 ## 项目边界
 

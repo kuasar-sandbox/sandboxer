@@ -76,13 +76,13 @@ type Server struct {
 	onReadFatal      func(error)
 	discardSupported bool // fixed at device construction, including pooled devices
 
-	// unified-memfd invariant (docs/cloud-hypervisor.md §3.1): SET_MEM_TABLE must arrive with
+	// unified-memfd invariant (docs/vmm.md#patch-0001): SET_MEM_TABLE must arrive with
 	// fds whose inode matches memfdInode; mmapBytes are sub-slices of
 	// memfdSlab (sandbox-ctl's mmap of the same memfd).
 	memfdInode uint64
 	memfdSlab  []byte
 
-	// Quiesce/Resume gate for snapshot pause window (docs/sandbox.md §11.5).
+	// Quiesce/Resume gate for snapshot pause window (docs/block-storage.md#quiesce-and-close).
 	pauseMu  pauseGate
 	inflight sync.WaitGroup
 
@@ -227,7 +227,7 @@ func (s *Server) EnableStats(name, path string) {
 
 // SetMemfd configures the unified-memfd backing slab. Must be called
 // before Serve when CH is patched to share its memfd via SET_MEM_TABLE
-// (docs/cloud-hypervisor.md §3.1 invariant). slab is sandbox-ctl's mmap of the memfd; the
+// (docs/vmm.md#patch-0001 invariant). slab is sandbox-ctl's mmap of the memfd; the
 // backend never opens its own mmap.
 func (s *Server) SetMemfd(inode uint64, slab []byte) {
 	s.memfdInode = inode

@@ -1768,7 +1768,7 @@ func handleSnapshotRequest(
 	dropCachesResult := proto.DropCachesUnknown
 	guestQuiesced := false
 
-	// Quiesce sequence (docs/sandbox.md §6.2, sandbox-init.md §3.4):
+	// Quiesce sequence (docs/runtime.md#capture-barrier, docs/guest-abi.md#quiesce):
 	// pause the ping ticker, then `quiesce` → the guest does sync +
 	// drop_caches, stops reading the app's stdout/stderr (pty), runs the
 	// graceful MUX_CLOSE handshake on the stdio MUX (the host's mux.Session
@@ -1782,7 +1782,7 @@ func handleSnapshotRequest(
 	// closed; reattachMUX (below, after Take) `attach`es a fresh one so the
 	// running app's stdio flows again. On the destroy path (resume_after=
 	// false) we instead tear the VMM down once this response has flushed —
-	// that is what makes `sandbox-ctl run` return (docs/sandbox.md §6.2).
+	// that is what makes `sandbox-ctl run` return (docs/runtime.md#capture-barrier).
 	// Gate new port-forward/exec work before asking the guest to quiesce, without
 	// perturbing admitted transports. The guest owns the authoritative
 	// reverse-channel close; after `quiesced`, Drain joins the host handlers so

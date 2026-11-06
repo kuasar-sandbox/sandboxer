@@ -15,7 +15,7 @@ import (
 )
 
 // PingerConfig tunes the host→guest ping ticker. Defaults match
-// docs/sandbox-init.md §4.5.
+// docs/guest-abi.md#mux-wire.
 type PingerConfig struct {
 	Interval time.Duration // default 1 s
 	Timeout  time.Duration // default proto.DeadlinePing (200 ms)
@@ -45,7 +45,7 @@ func (c *PingerConfig) withDefaults() PingerConfig {
 // reverse-channel listener. It owns a HostClient and a PingStats
 // counter aggregator.
 //
-// Lifecycle (docs/sandbox-init.md §4.9):
+// Lifecycle (docs/guest-abi.md#health):
 //
 //   - Created by sandbox.Run / restore.Run with the per-sandbox vsock
 //     base path.
@@ -372,8 +372,7 @@ func SendQuiesceContext(ctx context.Context, client *HostClient, skipDropCaches 
 }
 
 // OpenMUXViaRestore notifies the guest that a restore has completed and
-// turns that connection into the stdio MUX (docs/sandbox-init.md
-// §4.3 / §4.5): it sends `restore{epoch}`, reads `restore_ack{stdio,
+// turns that connection into the stdio MUX (docs/guest-abi.md#management-operations and docs/guest-abi.md#mux-wire): it sends `restore{epoch}`, reads `restore_ack{stdio,
 // app_state}`, clears the handshake deadline, and returns the live
 // connection together with the channel set the guest established. The
 // caller wraps the conn in a mux.Session and bridges those streams, then

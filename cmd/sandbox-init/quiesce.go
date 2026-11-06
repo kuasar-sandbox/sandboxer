@@ -9,7 +9,7 @@ import (
 )
 
 // runQuiesce executes the v1 pre-snapshot cleanup sequence
-// (docs/sandbox-init.md §3.4):
+// (docs/guest-abi.md#quiesce):
 //
 //  1. sync(2)                           — flush ext4 upperdir dirty
 //  2. optional drop_caches write        — drop page + dentry/inode cache
@@ -19,7 +19,7 @@ import (
 // Cache cleanup is a best-effort dedup aid, not a snapshot gate.
 //
 // The /tmp tmpfs reset and the application-level signal hook described
-// in docs/sandbox-init.md §3.4 (quiesce extension items) are not implemented here.
+// in docs/guest-abi.md#quiesce (quiesce extension items) are not implemented here.
 func runQuiesce(skipDropCaches bool) proto.DropCachesResult {
 	return runQuiesceWith(skipDropCaches, syscall.Sync, writeFile)
 }

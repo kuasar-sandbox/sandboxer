@@ -173,7 +173,7 @@ func inspectMergeBase(ctx context.Context, stream fetch.Stream, size int64, coll
 // mergeSparse flattens two adjacent sparse layers — top (this run's resident
 // delta) over base (the local parent snapshot this run was restored from) —
 // into a single layer, for the local "replace the next-newest layer" export
-// (docs/sandbox.md#checkpoint-history §6.1.2 and docs/sandbox.md §11.2). It is the SAVE-side dual of
+// (docs/artifacts.md#checkpoint-history and docs/block-storage.md#layered-reads). It is the SAVE-side dual of
 // fetch.Layered: at any
 // offset top's byte wins where top is resident; where top is a hole, base's
 // byte shows through; where BOTH are holes the position stays a (merged) hole

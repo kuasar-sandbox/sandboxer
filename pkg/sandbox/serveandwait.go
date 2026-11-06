@@ -61,7 +61,7 @@ type CmdEnv struct {
 	// TapFDNum is the CH-visible fd of the inherited tap queue (cmd.ExtraFiles
 	// after memfd → 4), or 0 when there is no fd-handoff network (tap-name or
 	// no network). NetMAC is the effective virtio-net MAC the cmd builder puts
-	// in CH's --net mac= (tapfd metadata override or config). See docs/sandbox.md.
+	// in CH's --net mac= (tapfd metadata override or config). See docs/runtime.md.
 	TapFDNum int
 	NetMAC   string
 }
@@ -152,7 +152,7 @@ type VMParams struct {
 	Cgroup *resctl.CgroupController
 
 	// NetnsFile, when non-nil, is the tap's network-namespace fd from the same
-	// handoff (docs/tapfd.md §2.5). ServeAndWait fork/execs CH on a thread that
+	// handoff (https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#optional-netns-descriptor). ServeAndWait fork/execs CH on a thread that
 	// setns()'d into it, so CH runs inside the tap's netns. CH does NOT inherit
 	// this fd (it's not an ExtraFile); the caller closes it after the run.
 	NetnsFile *os.File
@@ -172,8 +172,7 @@ type VMParams struct {
 
 	// Forwards are the parsed `--connect` port-forward directives. Each
 	// gets a host-local listener whose accepted connections are spliced to
-	// a guest-side target via a reverse channel (docs/sandbox-init.md
-	// §3.7). Empty → no port forwarding.
+	// a guest-side target via a reverse channel (docs/guest-abi.md#forward-sessions). Empty → no port forwarding.
 	Forwards []ForwardSpec
 
 	BuildCmd  func(CmdEnv) (cmd *exec.Cmd, cleanup func(), err error)
@@ -1227,7 +1226,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 }
 
 // startCH starts cmd. When netnsFile is non-nil the fork/exec runs on a thread
-// moved into that network namespace (docs/tapfd.md §2.5), so CH — and thus the
+// moved into that network namespace (https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#optional-netns-descriptor), so CH — and thus the
 // guest's virtio-net — lives inside the tap's netns; otherwise CH starts in the
 // host netns. cmd.Process is populated by the time this returns.
 func startCH(cmd *exec.Cmd, netnsFile *os.File) error {

@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "redirects": [
+    {
+      "from": "docs/cloud-hypervisor.md",
+      "to": "docs/vmm.md"
+    },
+    {
+      "from": "docs/cloud-hypervisor.md#34-0004--skip-hole-only-runs-during-balloon-release",
+      "to": "docs/vmm.md#patch-0004"
+    },
+    {
+      "from": "docs/cloud-hypervisor_zh.md",
+      "to": "docs/vmm_zh.md"
+    },
+    {
+      "from": "docs/cloud-hypervisor_zh.md#34-0004--balloon-release-跳过-user-managed-zone-的空洞-run",
+      "to": "docs/vmm_zh.md#patch-0004"
+    },
+    {
+      "from": "docs/sandbox-init.md",
+      "to": "docs/guest-abi.md"
+    },
+    {
+      "from": "docs/sandbox-init.md#321-application-cgroup-namespace-and-controller-topology",
+      "to": "docs/guest-abi.md#application-cgroups"
+    },
+    {
+      "from": "docs/sandbox-init_zh.md",
+      "to": "docs/guest-abi_zh.md"
+    },
+    {
+      "from": "docs/sandbox-init_zh.md#321-应用-cgroup-namespace-与-controller-拓扑",
+      "to": "docs/guest-abi_zh.md#application-cgroups"
+    },
+    {
+      "from": "docs/sandbox.md",
+      "to": "docs/runtime.md"
+    },
+    {
+      "from": "docs/sandbox.md#93-balloon",
+      "to": "docs/resources.md#balloon-controller"
+    },
+    {
+      "from": "docs/sandbox.md#artifact-compatibility",
+      "to": "docs/artifacts.md#compatibility"
+    },
+    {
+      "from": "docs/sandbox_zh.md",
+      "to": "docs/runtime_zh.md"
+    },
+    {
+      "from": "docs/sandbox_zh.md#93-balloon",
+      "to": "docs/resources_zh.md#balloon-controller"
+    },
+    {
+      "from": "docs/sandbox_zh.md#artifact-compatibility",
+      "to": "docs/artifacts_zh.md#compatibility"
+    }
+  ]
+}

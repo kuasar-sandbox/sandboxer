@@ -181,7 +181,7 @@ func (c *vsockConn) SetDeadline(t time.Time) error {
 // RST — which a snapshot taken in that window captures as a half-closed
 // remnant. With it, Close returns only once the peer RST has removed the
 // socket (virtio_transport_wait_close), so the MUX teardown is confirmed
-// complete before quiesce acks (deterministic steady state, §3.4).
+// complete before quiesce acks (deterministic steady state, docs/guest-abi.md#quiesce).
 func (c *vsockConn) SetLinger(sec int) error {
 	c.fdMu.Lock()
 	defer c.fdMu.Unlock()
@@ -258,7 +258,7 @@ func bindVsockListener(port uint32) (int, error) {
 // doesn't close the conn out from under the session.
 //
 // The listener fd lives for the entire sandbox lifetime and is **never
-// closed by quiesce** (docs/sandbox-init.md §3.4) — closing it would cut off the host's
+// closed by quiesce** (docs/guest-abi.md#quiesce) — closing it would cut off the host's
 // subsequent restore / attach.
 //
 // sup carries the exec registry (exec sessions register their children
@@ -440,7 +440,7 @@ func handleReverseConnShutdown(c *vsockConn, sup *supervisorState, bridge *conso
 		// still frozen, which only holds for the resume_after=true path
 		// (VM resumed in place; this attach is just its first
 		// post-resume contact). Plain reconnect → not frozen → skipped
-		// (docs/sandbox-init.md §4.3, sandbox.md §6.2 resume recovery).
+		// (docs/guest-abi.md#management-operations, docs/runtime.md#capture-barrier resume recovery).
 		thaw := func() error {
 			if frozen, err := cgroupFrozen(); err != nil {
 				return fmt.Errorf("cgroupFrozen: %w", err)
@@ -491,8 +491,7 @@ func handleReverseConnShutdown(c *vsockConn, sup *supervisorState, bridge *conso
 		// the app stopped. NOT best-effort — an unconfirmed freeze is a
 		// half-frozen snapshot, exactly the resume-vs-env race we
 		// eliminate — so on failure skip `quiesced`; the host deadline
-		// lapses and it abandons this snapshot (docs/sandbox-init.md
-		// §3.4 错误处理).
+		// lapses and it abandons this snapshot (docs/guest-abi.md#quiesce 错误处理).
 		if err := cgroupFreeze(); err != nil {
 			logf("reverse-channel: quiesce freeze failed, NOT sending quiesced: %v", err)
 			return false
@@ -501,7 +500,7 @@ func handleReverseConnShutdown(c *vsockConn, sup *supervisorState, bridge *conso
 		// Tear down port-forward relays the same way as the stdio MUX: a
 		// live forward left open would be captured as a half-open vsock
 		// remnant. Each vsock conn closes with SO_LINGER so the teardown is
-		// confirmed before `quiesced` (deterministic steady state, §3.4). Also
+		// confirmed before `quiesced` (deterministic steady state, docs/guest-abi.md#quiesce). Also
 		// closes the cached accept-mode listeners (unblocking parked accepts).
 		closeConnectSessions(sup.connReg, sup.acceptLn)
 		bridge.closeLiveMUX() // stop forwarding app output, then the MUX_CLOSE handshake
@@ -691,7 +690,7 @@ func exchangeMemReport(conn interface {
 // notifyAppExited dials the host launch UDS and sends a short-conn
 // app_exited notification. sig != 0 means the app was killed by that
 // signal (code is then 128+sig per the shell convention). Best-effort —
-// the guest reboots regardless of outcome (docs/sandbox-init.md §3.3).
+// the guest reboots regardless of outcome (docs/guest-abi.md#supervision).
 func notifyAppExited(code, sig int) {
 	initialLaunch.exited(code)
 	conn, err := dialVsock(proto.VsockHostCID, proto.LaunchPort)

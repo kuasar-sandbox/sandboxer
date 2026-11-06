@@ -1,18 +1,24 @@
-[English](cloud-hypervisor.md) | [简体中文](cloud-hypervisor_zh.md)
+[English](vmm.md) | [简体中文](vmm_zh.md)
 
-# cloud-hypervisor — VMM and platform patches
+# VMM integration and Cloud Hypervisor patches
 
-The platform uses Cloud Hypervisor (CH) as its microVM monitor. Most paths use
-upstream behavior. Externally managed memory, restore-safe vsock, and reliable VM
-lifecycle barriers are supplied by patches 0001–0008 maintained in this repository.
-Patch 0009 preserves ARM snapshot registers; 0010 and 0011 backport upstream
-restore-order and HTTP allocator seccomp fixes. The series remains on CH v51.1
-and the Host Linux 5.10 baseline.
-This document defines their scope, build procedure, and behavioral contracts.
+This page owns the host/VMM integration boundary and the maintained Cloud
+Hypervisor patch contract. Read the device/boot and behavioral sections to use a
+matching VMM; read activation and individual patches to change or port the
+integration. The build recipe and collected native materials remain in
+[native-deps](../native-deps/README.md).
 
-## 1. Overview
+The runtime supplies external RAM, coordinates pause/restore and controls devices;
+Cloud Hypervisor owns KVM/vCPU/device execution. [Memory](memory.md),
+[resources](resources.md) and [Runtime](runtime.md) define the respective Host
+policies. Patches implement the VMM side, including cumulative checkpoint change
+tracking; they do not promise arbitrary upstream-version snapshot compatibility.
 
-### 1.1 Why patches are required
+The current series targets Cloud Hypervisor **v51.1** and retains the Host Linux **5.10** baseline. Patches 0001–0008 supply external RAM/UFFD, vsock and lifecycle barriers; 0009 preserves ARM registers; 0010/0011 backport restore-order/seccomp fixes; 0012 adds cumulative checkpoint-memory changes. Most other VMM paths use upstream behavior.
+
+<a id="patch-purpose"></a>
+
+## Why patches are required
 
 The platform has four requirements beyond the pinned upstream VMM behavior:
 
@@ -39,9 +45,11 @@ second requirement is particularly important: the platform needs to own fault
 handling and delivery, not just supply data to an upstream external-listener
 model. This memory model requires logical release notification even for pages
 that have never been resident: their lazy source may contain nonzero bytes.
-Patch 0004 may skip redundant inode punching, never the required REMOVE (§3.4).
+Patch 0004 may skip redundant inode punching, never the required REMOVE ([0004 — preserve logical release before sparse reclaim](#patch-0004)).
 
-### 1.2 Patch scope and future evolution
+<a id="patch-scope"></a>
+
+## Patch scope and future evolution
 
 Each patch owns a complete intent, its corrections and its tests. Old numbers in
 this table refer to the original twelve-patch series restored by #377. This
@@ -70,7 +78,9 @@ Patch numbering is not a binary compatibility identifier. Record the upstream
 source, complete patch hashes and resulting build identity; the original legacy
 CH used by #374 remains a frozen, distinct artifact.
 
-### 1.3 Maintenance strategy
+<a id="maintenance"></a>
+
+## Maintenance strategy
 
 - Apply the series in order. Each prefix must build and must fully implement any
   capability it exposes; configuration is introduced with its actual consumer.
@@ -95,7 +105,110 @@ CH used by #374 remains a frozen, distinct artifact.
   equivalent upstream vCPU-kick or worker-barrier fix is available, prefer it
   when upgrading rather than indefinitely maintaining duplicate patch 0007/0008 logic.
 
-## 2. Activation and command line
+<a id="boot-protocols"></a>
+
+## Boot protocols by architecture
+
+CH selects the architecture-specific boot protocol; sandbox-ctl does not require
+a different command-line interface per architecture:
+
+| Architecture | Protocol | Kernel entry | Prepared by CH |
+| --- | --- | --- | --- |
+| x86_64 | PVH | ELF entry with a CH-populated zero page | E820 memory map, command line, and ACPI tables |
+| aarch64 | EFI stub + ACPI | PE Image entry; the EFI stub parses ACPI | UEFI memory map, ACPI tables, and GICv3 description |
+
+<a id="device-model"></a>
+
+### Device model used by the platform
+
+The cold-start device layout is:
+
+```text
+virtio-pmem    → sandbox-runtime.bundle (DAX, MAP_SHARED host page-cache sharing)
+virtio-blk × 2 → blk0 (read-only base) + blk1 (writable overlay COW), vhost-user backend
+virtio-net     → optional eth0 with host TAP backing; absent when no network source is configured
+virtio-console → hvc0 for kernel dmesg; --console tty writes to CH stdout, an anonymous
+                 pipe supplied by sandbox-ctl; --serial off disables the 8250 UART.
+                 CH stdin is /dev/null, so CH does not raw-mode a host terminal.
+                 Application stdio uses the vsock MUX, not this console.
+virtio-vsock   → CID=3; short control connections (launch / ping / app_started /
+                 app_exited / mem_report / quiesce / restore / attach), plus the
+                 application stdio MUX upgraded from launch/restore/attach handshakes
+virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on]; the sandbox-local
+                 BalloonController sets targets with /vm.resize and observes current
+                 memory_actual_size through vm.info; free_page_reporting is not enabled
+virtio-mem     → host-driven unplug supported by CH; not enabled in the fixed-Capacity
+                 Budget model used here
+```
+
+The two block devices above describe the root base/overlay pair; configured data
+disks add their corresponding device slots. See [Runtime](runtime.md) [Balloon](resources.md#balloon-controller)
+for balloon control and [Guest ABI](guest-abi.md) [Vsock control plane and console MUX protocol](guest-abi.md#control-and-mux) for the stdio MUX.
+
+Restore retains the topology from `config.json`; it cannot add or remove the
+virtio-net device. Before starting CH, sandboxer checks that the presence of a
+host network source matches NIC presence in the snapshot.
+
+`--restore source_url=<state.json dir>` restores the saved device topology, so
+`--kernel` and `--vsock` do not have to be repeated. Complete cold/restore data
+flows are described in [Runtime](runtime.md) [Cold start and `run --from`](runtime.md#runtime-sdk) and [Memory restore data flow](runtime.md#restore).
+
+<a id="vsock-proxy"></a>
+
+### Vsock hybrid proxy
+
+The host-side hybrid proxy maps vsock traffic to UDS endpoints:
+
+```text
+guest VM (CID=3) → host CID=2 → CH forwards to:
+  /run/sandbox/<sid>/vsock.sock_<port>       guest → host; host listens on this UDS
+  /run/sandbox/<sid>/vsock.sock + "CONNECT <port>\n"
+                                           host → guest; guest listens on the port
+```
+
+For host-to-guest traffic, the first write is ASCII `CONNECT <port>\n`. CH returns
+`OK <local_port>\n`, which the host must consume before reading subsequent
+payload, then proxies to the guest listener. Both directions are ordinary byte
+streams to CH. The `launch`, `restore`, and `attach` connections become framed
+stdio MUX streams only after the application handshake between sandbox-ctl and
+sandbox-init; CH does not interpret those frames. See [Runtime](runtime.md)
+[CH command-line boundary](#vmm-command-line) and [Guest ABI](guest-abi.md) [Channels and addressing](guest-abi.md#channels).
+
+<a id="behavior"></a>
+
+## Behavioral contract summary
+
+Platform code (`sandbox-ctl` and `node-ctl`) relies on the following pinned CH
+behavior, including the patches:
+
+| Behavior | Upstream | Patched |
+| --- | --- | --- |
+| Memory backing without `fd=` | Managed memfd/file backing | Same allocation path; not a statement that all other patches are disabled |
+| Explicit `fd=` | Not accepted by the unpatched parser | Map the inherited backing and mark the zone user-managed |
+| `fd=` plus `uffd_socket=` | Not available | Create uffd, send it with metadata, and wait for ACK |
+| `/vm.snapshot` of a user-managed zone | Not applicable | Omit the zone from memory-ranges and skip the RAM dump |
+| `/vm.restore` of a user-managed zone | Not applicable | Skip fill; the mapping faults into the external handler when configured |
+| Balloon release of a hole-only file-backed run | Ordinary release path | Always notify REMOVE; skip only redundant `PUNCH_HOLE` |
+| Balloon `deflate_on_oom=on` | Supported in v51.1 | Supported |
+| `vm.resize` `desired_balloon` | Supported | Used by the sandbox-local BalloonController |
+| virtio-mem `vm.resize` | Supported | Supported |
+| Vsock local-port cursor across restore | Not persisted by this upstream version | `VsockState.local_port_last` |
+| Matching backend/guest vsock transport epochs | Not provided by this upstream restore path | Reset event plus RX acknowledgement gate |
+
+The platform does not use `free_page_reporting`. In the unified memfd/external
+uffd model, its repeated `madvise(MADV_DONTNEED)` invalidations can create
+mmu_notifier/EPT and IPI-shootdown pressure and interfere with guest vsock progress.
+The rationale and replacement feedback loop are described in the
+[guest kernel specification §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md#why-free_page_reporting-is-not-negotiated-and-the-role-of-virtio_mem). The sandbox-local BalloonController instead pushes inflate targets through
+`/vm.resize`, with at most one 64 MiB steady-shrink step for each fresh report.
+Patch 0004 preserves REMOVE for empty cold-start ranges as well as resident
+runtime reclaim. Cold-created VMs on 4 KiB hosts combine adjacent PFNs to reduce synchronous
+REMOVE processing ([0004 — preserve logical release before sparse reclaim](#patch-0004)).
+`deflate_on_oom` is native to upstream v51.1 and needs no additional patch.
+
+<a id="activation"></a>
+
+## Activation and command line
 
 CH `--memory-zone` accepts two additional keys:
 
@@ -130,11 +243,17 @@ cloud-hypervisor \
 ```
 
 The zone `id` is required by the parser; the platform uses `ram0`. Complete cold
-start and restore commands are described in [sandbox.md](sandbox.md) §5.2 and §7.
+start and restore commands are described in [Runtime](runtime.md) [CH command-line boundary](#vmm-command-line) and [Memory restore data flow](runtime.md#restore).
 
-## 3. Patch organization
+<a id="patches"></a>
 
-### 3.1 0001 — externally allocated memfd-backed memory zone
+## Patch organization
+
+
+
+<a id="patch-0001"></a>
+
+### 0001 — externally allocated memfd-backed memory zone
 
 Subject: **memory: support externally allocated memfd-backed memory zone**.
 
@@ -162,7 +281,9 @@ Key points:
 `snapshot_memory_ranges`. They do not need separate patches: patch 0002 filters
 `memory_range_table`, affecting both snapshot and restore.
 
-### 3.2 0002 — snapshot skip user-managed memory zones
+<a id="patch-0002"></a>
+
+### 0002 — snapshot skip user-managed memory zones
 
 Subject: **snapshot: skip user-managed memory zones**.
 
@@ -184,7 +305,9 @@ region used in shared-storage migration. The external memfd is file-backed and
 shared but has no hard link (`st_nlink == 0`), so the project adds the explicit
 `user_managed` branch instead of reusing that hard-link test.
 
-### 3.3 0003 — external uffd handler via in-process create + SCM_RIGHTS
+<a id="patch-0003"></a>
+
+### 0003 — external uffd handler via in-process create + SCM_RIGHTS
 
 Subject: **memory: external uffd handler via in-process create + SCM_RIGHTS handoff**.
 
@@ -296,7 +419,9 @@ that deterministic ordering. Run both with the prepared source/artifact contract
 and the existing KVM pressure coverage, including the Linux 5.10 floor. These are
 validation requirements, not a claim that an unexecuted run passed.
 
-### 3.4 0004 — preserve logical release before sparse reclaim
+<a id="patch-0004"></a>
+
+### 0004 — preserve logical release before sparse reclaim
 
 The release implementation and seccomp policy live in `virtio-devices`.
 `vmm/src/vm.rs` and `device_manager.rs` pass VM creation provenance to the balloon. Problem report: [#378](https://github.com/kuasar-sandbox/sandboxer/issues/378).
@@ -366,7 +491,9 @@ the existing carriers preserve Zero through capture and restore without refault
 or full-RAM prefilling. This requires no memory.dirty entry, new dirty API or
 history trimming; those remain in #374.
 
-### 3.5 0005 — persist the vsock host local-port cursor
+<a id="patch-0005"></a>
+
+### 0005 — persist the vsock host local-port cursor
 
 Restore recreates CH's Unix vsock backend. Resetting its local-port allocator to
 `0x40000000` can make the first host-initiated connection reuse a tuple retained
@@ -375,7 +502,9 @@ in the guest snapshot and receive an RST. This patch stores `local_port_last` in
 snapshots preserve the cursor at each layer rather than relying on a process-local
 cursor that only covers one restore.
 
-### 3.6 0006 — stage a vsock transport reset before snapshot
+<a id="patch-0006"></a>
+
+### 0006 — stage a vsock transport reset before snapshot
 
 Avoiding port reuse alone is insufficient. CH does not serialize the backend
 connection map, while the guest snapshot retains sockets, credits, and closing
@@ -410,7 +539,9 @@ missing or invalid descriptor makes the source snapshot fail explicitly. Target
 restore activation must succeed without any new available descriptor because the
 reset already exists in the snapshot's used ring.
 
-### 3.7 0007 — vCPU lifecycle requests and acknowledgements
+<a id="patch-0007"></a>
+
+### 0007 — vCPU lifecycle requests and acknowledgements
 
 CH v51.1 uses a no-op `SIGRTMIN` handler to interrupt `KVM_RUN`. The control thread
 publishes pause/kill state, calls `pthread_kill` for each vCPU, and waits for loop
@@ -449,7 +580,10 @@ The patch closes the lifecycle-barrier races through two related changes:
    NMI completes ACK-clear cleanup even after a signal timeout. Both failure
    paths receive a separate fresh deadline. Non-KVM backends retain the 10 ms
    retry. All waits use a 1 s deadline with `CLOCK_MONOTONIC` semantics.
-### 3.8 0008 — virtio worker pause and resume handshakes
+
+<a id="patch-0008"></a>
+
+### 0008 — virtio worker pause and resume handshakes
 
 Runtime pause publishes the shared pause event before explicitly unparking
    ordinary and custom workers, closing the startup race between a zero-time
@@ -464,7 +598,9 @@ These lifecycle patches do not change sandbox configuration, the CH HTTP API, sn
 format, or resource protocol, and does not adjust `cpu.max` around lifecycle
 operations. Timeouts remain bounded failure protection, not the race fix.
 
-### 3.9 0009 — complete ARM CPU snapshot registers
+<a id="patch-0009"></a>
+
+### 0009 — complete ARM CPU snapshot registers
 
 On SVE-enabled ARM hosts, KVM exposes vector state through SVE Z/P/FFR
 registers. Accessing legacy FPSIMD V-register offsets returns `EINVAL`; a
@@ -505,7 +641,9 @@ This permits reading older non-SVE state; it does not promise cross-host CPU
 feature compatibility or backwards restore into an unpatched VMM. SVE remains
 enabled, and incompatible register state fails through the existing KVM errors.
 
-### 3.10 0010 — restore the KVM clock before vCPUs
+<a id="patch-0010"></a>
+
+### 0010 — restore the KVM clock before vCPUs
 
 Patch 0010 backports upstream [commit ff20f183647c602bf5e5028d99959e5547a7dd84](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/ff20f183647c602bf5e5028d99959e5547a7dd84),
 preserving CMGS's authorship and sign-off. In the pinned v51.1 resume path,
@@ -524,7 +662,9 @@ provenance; cross-compilation alone does not exercise KVM resume. A successful
 small sample does not establish a failure rate or diagnose unrelated restore
 errors.
 
-### 3.11 0011 — HTTP allocator seccomp compatibility
+<a id="patch-0011"></a>
+
+### 0011 — HTTP allocator seccomp compatibility
 
 Large HTTP allocations or frees can trigger glibc's lazy read of
 `/proc/sys/vm/overcommit_memory`, or mapping growth through `mremap`. The v51.1
@@ -549,7 +689,9 @@ This is an allocator compatibility backport, with no new dirty-memory API or
 response format. `mremap` is an upstream compatibility fix, not evidence that it
 was the syscall in every previously observed API EOF.
 
-### 3.12 0012 — cumulative checkpoint memory changes
+<a id="patch-0012"></a>
+
+### 0012 — cumulative checkpoint memory changes
 
 External RAM enables KVM logging during memory initialization and preserves
 software seed writes before any reset. CPU/KVM, CH AtomicBitmap and raw writers
@@ -601,7 +743,9 @@ checks legacy cold capture and four-entry native snapshots restored by that CH,
 including one-time capability discovery, release and reuse. The helper records
 its applied source tree, patch hashes and binary hash; it is not a product VMM.
 
-## 4. Build workflow
+<a id="build"></a>
+
+## Build workflow
 
 `sandboxer/native-deps` builds the artifact from the pinned v51.1 tarball,
 `git am deps/ch-patches/*.patch`, and `cargo build --release --locked`.
@@ -618,100 +762,9 @@ See [native-deps/README.md](../native-deps/README.md) for `ch-fetch`,
 `ch-patches-format`, idempotency checks, output synchronization, and ownership
 boundaries.
 
-## 5. Boot protocols by architecture
+<a id="limitations"></a>
 
-CH selects the architecture-specific boot protocol; sandbox-ctl does not require
-a different command-line interface per architecture:
-
-| Architecture | Protocol | Kernel entry | Prepared by CH |
-| --- | --- | --- | --- |
-| x86_64 | PVH | ELF entry with a CH-populated zero page | E820 memory map, command line, and ACPI tables |
-| aarch64 | EFI stub + ACPI | PE Image entry; the EFI stub parses ACPI | UEFI memory map, ACPI tables, and GICv3 description |
-
-### 5.1 Device model used by the platform
-
-The cold-start device layout is:
-
-```text
-virtio-pmem    → sandbox-runtime.bundle (DAX, MAP_SHARED host page-cache sharing)
-virtio-blk × 2 → blk0 (read-only base) + blk1 (writable overlay COW), vhost-user backend
-virtio-net     → optional eth0 with host TAP backing; absent when no network source is configured
-virtio-console → hvc0 for kernel dmesg; --console tty writes to CH stdout, an anonymous
-                 pipe supplied by sandbox-ctl; --serial off disables the 8250 UART.
-                 CH stdin is /dev/null, so CH does not raw-mode a host terminal.
-                 Application stdio uses the vsock MUX, not this console.
-virtio-vsock   → CID=3; short control connections (launch / ping / app_started /
-                 app_exited / mem_report / quiesce / restore / attach), plus the
-                 application stdio MUX upgraded from launch/restore/attach handshakes
-virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on]; the sandbox-local
-                 BalloonController sets targets with /vm.resize and observes current
-                 memory_actual_size through vm.info; free_page_reporting is not enabled
-virtio-mem     → host-driven unplug supported by CH; not enabled in the fixed-Capacity
-                 Budget model used here
-```
-
-The two block devices above describe the root base/overlay pair; configured data
-disks add their corresponding device slots. See [sandbox.md](sandbox.md) §9.3
-for balloon control and [sandbox-init.md](sandbox-init.md) §4 for the stdio MUX.
-
-Restore retains the topology from `config.json`; it cannot add or remove the
-virtio-net device. Before starting CH, sandboxer checks that the presence of a
-host network source matches NIC presence in the snapshot.
-
-`--restore source_url=<state.json dir>` restores the saved device topology, so
-`--kernel` and `--vsock` do not have to be repeated. Complete cold/restore data
-flows are described in [sandbox.md](sandbox.md) §5 and §7.
-
-### 5.2 Vsock hybrid proxy
-
-The host-side hybrid proxy maps vsock traffic to UDS endpoints:
-
-```text
-guest VM (CID=3) → host CID=2 → CH forwards to:
-  /run/sandbox/<sid>/vsock.sock_<port>       guest → host; host listens on this UDS
-  /run/sandbox/<sid>/vsock.sock + "CONNECT <port>\n"
-                                           host → guest; guest listens on the port
-```
-
-For host-to-guest traffic, the first write is ASCII `CONNECT <port>\n`. CH returns
-`OK <local_port>\n`, which the host must consume before reading subsequent
-payload, then proxies to the guest listener. Both directions are ordinary byte
-streams to CH. The `launch`, `restore`, and `attach` connections become framed
-stdio MUX streams only after the application handshake between sandbox-ctl and
-sandbox-init; CH does not interpret those frames. See [sandbox.md](sandbox.md)
-§5.2 and [sandbox-init.md](sandbox-init.md) §4.2.
-
-## 6. Behavioral contract summary
-
-Platform code (`sandbox-ctl` and `node-ctl`) relies on the following pinned CH
-behavior, including the patches:
-
-| Behavior | Upstream | Patched |
-| --- | --- | --- |
-| Memory backing without `fd=` | Managed memfd/file backing | Same allocation path; not a statement that all other patches are disabled |
-| Explicit `fd=` | Not accepted by the unpatched parser | Map the inherited backing and mark the zone user-managed |
-| `fd=` plus `uffd_socket=` | Not available | Create uffd, send it with metadata, and wait for ACK |
-| `/vm.snapshot` of a user-managed zone | Not applicable | Omit the zone from memory-ranges and skip the RAM dump |
-| `/vm.restore` of a user-managed zone | Not applicable | Skip fill; the mapping faults into the external handler when configured |
-| Balloon release of a hole-only file-backed run | Ordinary release path | Always notify REMOVE; skip only redundant `PUNCH_HOLE` |
-| Balloon `deflate_on_oom=on` | Supported in v51.1 | Supported |
-| `vm.resize` `desired_balloon` | Supported | Used by the sandbox-local BalloonController |
-| virtio-mem `vm.resize` | Supported | Supported |
-| Vsock local-port cursor across restore | Not persisted by this upstream version | `VsockState.local_port_last` |
-| Matching backend/guest vsock transport epochs | Not provided by this upstream restore path | Reset event plus RX acknowledgement gate |
-
-The platform does not use `free_page_reporting`. In the unified memfd/external
-uffd model, its repeated `madvise(MADV_DONTNEED)` invalidations can create
-mmu_notifier/EPT and IPI-shootdown pressure and interfere with guest vsock progress.
-The rationale and replacement feedback loop are described in the
-[guest kernel specification §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md#55-why-free_page_reporting-is-not-negotiated-and-the-role-of-virtio_mem). The sandbox-local BalloonController instead pushes inflate targets through
-`/vm.resize`, with at most one 64 MiB steady-shrink step for each fresh report.
-Patch 0004 preserves REMOVE for empty cold-start ranges as well as resident
-runtime reclaim. Cold-created VMs on 4 KiB hosts combine adjacent PFNs to reduce synchronous
-REMOVE processing (§3.4).
-`deflate_on_oom` is native to upstream v51.1 and needs no additional patch.
-
-## 7. Known limitations
+## Known limitations
 
 - **Upstream upgrades, including v52 and later**: inspect actual
   `vmm/src/memory_manager.rs` changes before rebasing 0001/0002. Patch 0003's uffd
@@ -729,11 +782,25 @@ REMOVE processing (§3.4).
   require corresponding per-zone handoffs in patch 0003 and address maps in
   sandbox-ctl; they are not implied by the current single-zone integration.
 
-## 8. See also
+<a id="vmm-command-line"></a>
 
-- [sandbox.md](sandbox.md) §5, §5.2, and §7 — cold start, CH commands, and restore.
-- [sandbox.md](sandbox.md) §8 — handling faults after receiving `uffd_C`.
-- [Guest kernel](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md)
-  — PVH/EFI-stub integration.
-- [Native build](../native-deps/README.md) — Cloud Hypervisor build and patch cycle.
-- [System overview §3.2](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md#32-component-responsibilities) — VMM and guest environment within the system.
+### CH command-line boundary
+
+Cold start constructs CH argv from host-bound kernel/runtime paths, memfd, vhost sockets, active diffs, and an optional network provider. Portable configuration never stores these absolute paths/fds.
+
+Block devices bind only logical Payload:
+
+- Container image or direct EROFS E: EROFS prefix only.
+- Parent E as an ext4 layer: its root payload only.
+- Current run-from E: `self` resolves only to the E payload section.
+- The ZIP tail is never exposed to vhost.
+
+CH stdin is fixed to `/dev/null`; sandbox-ctl bridges console output. The network provider is TAP or TapFD; portable topology records only NIC presence and interface name.
+
+<a id="related"></a>
+
+## Related documentation
+
+[Runtime: start, control, capture and restore](runtime.md) | [Sandbox configuration reference](configuration.md) | [Sandbox and Snapshot artifacts](artifacts.md) | [Guest memory and lazy restore](memory.md) | [Block storage: devices, writable state and checkpoints](block-storage.md) | [Resource control and usage accounting](resources.md) | [Guest ABI: boot, applications and host protocols](guest-abi.md)
+
+[Component entry](../README.md) · [Native builds and patch materials](../native-deps/README.md)

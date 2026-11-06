@@ -208,7 +208,7 @@ func mapDelete(m *yaml.Node, key string) {
 
 // skeletonCold is the cold-start authoring template (must pass --check=strict).
 const skeletonCold = `# sandbox.yaml — sandbox-ctl run --config <this>
-# Fill the placeholder paths/values. Schema reference: docs/sandbox.md §3.
+# Fill the placeholder paths/values. Schema reference: docs/configuration.md#sandbox-yaml.
 resources:
   # One sandbox-wide plaintext COW budget; dirty is a subset of total.
   diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB }

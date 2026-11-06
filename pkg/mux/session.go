@@ -125,7 +125,7 @@ func (s *Session) SetWinsize(cols, rows uint16) error {
 }
 
 // InitMuxClose performs the guest-initiated graceful close handshake
-// (docs/sandbox-init.md §4.6): send MUX_CLOSE, then block until the
+// (docs/guest-abi.md#mux-close): send MUX_CLOSE, then block until the
 // peer's MUX_CLOSE_ACK arrives (or the session ends). MUX_CLOSE_ACK is
 // terminal for the read loop, so after this call returns no further Read can
 // race the caller's Close. Data Writes are refused from initiation onward;

@@ -21,7 +21,7 @@
 # duration. Retryable reads retain their request/buffer until success, operation
 # cancellation or a permanent error; independent fatal health policy can end
 # the runtime. There is no cumulative read-retry deadline or attempt limit.
-# See docs/sandbox.md#read-recovery for diagnosis and shutdown boundaries.
+# See docs/runtime.md#read-recovery for diagnosis and shutdown boundaries.
 # The `snapshot` subcommand has its own `--timeout`.
 
 timeouts:

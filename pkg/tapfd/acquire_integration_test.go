@@ -78,7 +78,7 @@ func queueFlags(t *testing.T, f *os.File) uint16 {
 	return req.Flags
 }
 
-// TestHelperProcess is re-exec'd by TestAcquireHandoffIT as the §5 provider
+// TestHelperProcess is re-exec'd by TestAcquireHandoffIT as the provider described by https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#helper-responsibilities-provider-side
 // helper. Guarded by an env var so it is a no-op in the normal test run.
 // It mirrors a real provider: read TAPFD_SOCKET, open the tap with vnet_hdr,
 // and SCM_RIGHTS-send the queue fd + metadata, then exit 0.
@@ -138,7 +138,7 @@ func openTapVnetHdr(name string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), name), nil
 }
 
-// TestAcquireHandoffIT drives the full §5 exec-helper handoff against a real
+// TestAcquireHandoffIT drives the full exec-helper handoff (https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#dynamic-acquisition-contract-normative) against a real
 // subprocess: Acquire execs the helper, which hands over a vnet_hdr tap fd, and
 // Acquire returns it with parsed metadata. Verifies the fd carries IFF_VNET_HDR.
 func TestAcquireHandoffIT(t *testing.T) {

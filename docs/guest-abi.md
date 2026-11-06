@@ -1,21 +1,24 @@
-[English](sandbox-init.md) | [简体中文](sandbox-init_zh.md)
+[English](guest-abi.md) | [简体中文](guest-abi_zh.md)
 
-# sandbox-init — guest PID 1 ABI
+# Guest ABI: boot, applications and host protocols
 
-`sandbox-init` is PID 1 inside every sandbox guest. It is built from
-`sandboxer/cmd/sandbox-init` and packaged by `guest-runtime` into
-`sandbox-runtime.bundle`. This document defines its ABI with the host-side
-`sandbox-ctl`: boot-time rootfs assembly, the launch handshake, application
-startup and supervision, stdio/console forwarding, and exec/attach/quiesce control.
+`sandbox-init`, built in this repository, owns the Guest PID 1 implementation
+and the host/Guest ABI. Read the application contract first when preparing a
+workload; follow the boot phases when changing initialization; use the protocol
+sections when implementing a host peer. These are three views of the same Guest
+boundary, not separate independently maintained specifications.
 
-For image packaging, bundled guest payloads, versioning and builds, see
-[the runtime bundle guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime.md).
-This file defines the runtime contract of the image's `/sbin/init` and how
-`sandbox-ctl` communicates with it after starting the microVM.
+Guest-runtime packages this binary into the runtime Bundle; packaging does not
+transfer ownership of LaunchSpec, quiesce, vsock, MUX, forwarding or raw usage
+messages. Host workflows belong to [Runtime](runtime.md), host field defaults to
+[configuration](configuration.md), and interpreted usage/Budget to
+[resources](resources.md).
 
-## 1. Overview
+The binary is built from `cmd/sandbox-init` and installed as `/sbin/init` in the outer runtime. [Guest-runtime packaging](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/runtime-bundle.md) defines the image inventory, versions and builds.
 
-### 1.1 Design goals
+<a id="goals"></a>
+
+## Design goals
 
 | Goal | Implementation |
 |---|---|
@@ -23,39 +26,45 @@ This file defines the runtime contract of the image's `/sbin/init` and how
 | Verifiable startup state | A fixed sandbox-init version; explicit launch, quiesce, restore and attach handshakes and state barriers |
 | Sharing across sandboxes | virtio-pmem + DAX lets sandboxes share file-backed read-only pages through the host page cache |
 | One VM, one primary app | Default private PID mode uses clone(NEWPID\|NEWNS), making the app PID 1 in its namespace; shared PID mode is also available |
-| Observable lifecycle | Application start/exit notifications and explicit quiesce/restore exchanges use vsock; host VMM shutdown is a separate path (§5.4) |
+| Observable lifecycle | Application start/exit notifications and explicit quiesce/restore exchanges use vsock; host VMM shutdown is a separate path ([Signal handling](#signals)) |
 | Separate app I/O | Application stdin/stdout/stderr, or a pseudoterminal, is forwarded over vsock separately from kernel dmesg |
 
-### 1.2 Position in the system
+<a id="system-boundary"></a>
 
-```
-   HOST                                                      GUEST VM
-   ----                                                      --------
-   sandbox-ctl -- spawn CH --> cloud-hypervisor               kernel boot
-                                     |                           |
-                                     | virtio-pmem / DAX          | mount root, exec /sbin/init
-   sandbox-runtime.bundle <----------| (shared host file)         | = sandbox-init
-                                     |                           |   phase 1: mount + overlayfs + chroot
-        kernel dmesg <-- --console ---| <-- hvc0 (virtio-con) -----|   phase 2: apply launch spec
-        (host stderr/file capture)   |                           |             + wire app stdio
-                                     |                           |   phase 3: supervisor loop
-                                     |                           |
-                                     |------ conn: launch ------>|   fork/exec primary app
-                                     |       (conn -> MUX) <=====>|     app stdin/out/err <-> MUX
-                                     |------ conn: ping -------->|     app is PID 1 in private mode
-                                     |<----- conn: app_started --|
-                                     |                           |
-   /run/sandbox/<sid>/vsock.sock <----|<----- conn: app_exited ----|   app exits without restart
-                                     |                           |   reboot(POWER_OFF)
-                                     |<----- CH exits -----------|
+## Position in the system
+
+```mermaid
+flowchart TB
+    ctl["sandbox-ctl"] -->|spawn| ch["Cloud Hypervisor"]
+    bundle["Runtime Bundle"] -->|"virtio-pmem / DAX"| ch
+    ch -->|boot| kernel["Guest kernel"]
+    kernel -->|"exec /sbin/init"| init["sandbox-init"]
+    init -->|"root, launch, supervision"| app["Primary app"]
+    ctl <-->|"vsock management + MUX"| init
+    app <-->|stdio| init
+    kernel -->|hvc0| ch
+    ch -->|console| logs["Host stderr or file"]
 ```
 
-### 1.3 Non-goals
+The Runtime Bundle is a shared read-only host backing file. The Guest kernel
+mounts it and executes `/sbin/init`. Init assembles/switches the workload root,
+applies LaunchSpec and wires stdio, then supervises the primary process. The
+primary is PID 1 in its namespace in private mode.
+
+The host endpoint is `/run/sandbox/<sid>/vsock.sock`. Launch, ping and application
+started/exited notifications use the control paths defined below; the launch
+connection upgrades to MUX for application stdio. Kernel hvc0 output uses the
+separate CH console path. When an app exits without restart, init notifies the
+host and powers off; CH exits and its host owner observes that exit.
+
+<a id="non-goals"></a>
+
+## Non-goals
 
 - **No container runtime:** the platform manages sandbox lifecycles directly,
   without introducing runc / crun / podman.
 - **No Guest usage aggregation:** raw on-request usage observations have no
-  Guest ticker, totals, areas, peaks or historical replay (§4.11).
+  Guest ticker, totals, areas, peaks or historical replay ([Raw usage observations](#usage-observations)).
 - **No systemd / OpenRC:** sandbox-init implements process supervision.
 - **No busybox / util-linux dependency for init operations:** mounting, directory
   creation, chdir, chroot, reboot and openpty use Go syscall interfaces.
@@ -64,15 +73,17 @@ This file defines the runtime contract of the image's `/sbin/init` and how
   image supplies its `/etc`, `/usr` and other rootfs content. sandbox-runtime
   supplies init, staging mountpoints and `/opt/sandbox-runtime`.
 - **No stdio on ordinary management short connections:** each operation uses
-  its own connection (§4.3). Launch, restore, attach and exec upgrade their
-  connections to a long-lived MUX after the handshake (§4.5). At most one
+  its own connection ([Management operations](#management-operations)). Launch, restore, attach and exec upgrade their
+  connections to a long-lived MUX after the handshake ([MUX sub-protocol](#mux-wire)). At most one
   primary-app MUX exists at a time, created by launch and renewed by
   restore/attach. Each exec session has a separate, independently concurrent
-  MUX lasting for that command (§3.6).
+  MUX lasting for that command ([Exec sessions (`sandbox-ctl exec`)](#exec-sessions)).
 
-## 2. Runtime image consumption prerequisites
+<a id="runtime-prerequisites"></a>
 
-The [Runtime Bundle specification](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/sandbox-runtime.md) owns complete packaging, file inventory, versioning and build rules. PID 1 relies on these consumption boundaries:
+## Runtime image consumption prerequisites
+
+The [Runtime Bundle specification](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/runtime-bundle.md) owns complete packaging, file inventory, versioning and build rules. PID 1 relies on these consumption boundaries:
 
 - `/sbin/init` must be sandbox-init for the guest architecture; this repository builds it with `make sandbox-init`.
 - Runtime supplies the early-mount and data-disk staging directories. Phase 1a constructs the actual user rootfs below; the outer runtime is not a distribution `/etc`, `/usr` or shared-library environment.
@@ -81,10 +92,174 @@ The [Runtime Bundle specification](https://github.com/kuasar-sandbox/guest-runti
 
 See the [Native guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/README.md) for production of the bundle and host/target mkfs selection. This specification continues to define the complete host/guest handshake, mount ordering and ABI.
 
+<a id="application-contract"></a>
 
-## 3. The three sandbox-init phases
+## Application contract
 
-### 3.1 Phase 1: base runtime, wait for launch, workload root and switch-root
+
+
+<a id="launch-spec"></a>
+
+### Launch configuration (LaunchSpec)
+
+The host merges the OCI runtime config.json embedded in the ZIP trailer of
+boot.root.base with sandbox.yaml's launch section: YAML overrides take priority,
+with environment merging. It sends the resulting LaunchSpec over launch.
+Host run flags --tty / --stdin / --stdout / --stderr and their -from/-to
+variants determine stdio ([sandbox lifecycle](runtime.md)).
+A single ext4 root has no image config and needs an explicit executable or
+placeholder ([Phase 1: base runtime, wait for launch, workload root and switch-root](#base-and-root)).
+
+This is an annotated JSON example; comments are explanatory, not literal JSON:
+
+```jsonc
+{
+  "exec": "/usr/bin/foo",
+  "args": ["arg1", "arg2"],
+  "env": {"PATH": "...", "HOME": "/root"},
+  "workdir": "/",
+  "restart": "never",                    // never|on-failure|always; in-place restart with backoff
+  "cgroup_control": false,               // false: processes see /; true: empty delegated root, /init
+  "placeholder": false,                  // true: no external exec; host rejects explicit launch.exec,
+                                        // ignores image command and forces restart=always
+  "share_pid": false,                    // true: sandbox-init's PID namespace (pid_namespace=shared)
+  "user": "0:0",                         // uid:gid or name:group, guest /etc/passwd; empty -> root
+  "stop_signal": 15,                     // signal number, resolved host-side; 0 -> SIGTERM
+  "stop_grace_sec": 10,                  // guest PID 1's grace period; 0 -> default 10 s
+  "network": {
+    "interface": "eth0", "ip_cidr": "169.254.1.1/31",
+    "mtu": 1500, "nexthop": "", "hostname": "my-sandbox"
+  },
+  "mounts": [
+    {"target": "/tmp", "type": "tmpfs", "options": "nosuid,nodev,mode=1777"},
+    {"target": "/var/log", "type": "empty"}
+  ],
+  "files": [
+    {"path": "/etc/resolv.conf", "mode": "0644", "owner": "0:0", "content": "nameserver ..."}
+  ],
+  "init": [
+    {"exec": "/bin/sh", "args": ["-c", "..."], "env": {}, "workdir": "/", "user": "0:0", "timeout_ms": 0}
+  ],
+  "plugins": [
+    {"exec": "/usr/bin/sidecar", "args": [], "env": {}, "workdir": "/", "user": "0:0", "restart": "always"}
+  ],
+  "stdio": {
+    "tty": true,                         // true: PTY; false: pipe mode
+    "winsize": {"cols": 80, "rows": 24},  // initial PTY dimensions
+    "stdin": false,                      // pipe: enable stdin, otherwise app fd 0 uses /dev/null
+    "stdout": true,                      // pipe: enable stdout
+    "stderr": true                       // pipe: enable stderr
+  }
+}
+```
+
+See [Phase 2: apply the spec, wire stdio and start the app](#apply-and-launch) for mounts/files/init application. Empty volumes are established from
+their raw ext4 source before switch-root ([Phase 1: base runtime, wait for launch, workload root and switch-root](#base-and-root)). Disk mount specs additionally
+carry resolved disk_index/disk_overlay/disk_devs ([Phase 1: base runtime, wait for launch, workload root and switch-root](#base-and-root)).
+FileSpec also supports read_only; omission leaves its bind writable.
+These tmpfs-backed files avoid direct writable-disk injection, but processes
+can copy them to disk and their memory may be captured; see the lifecycle
+document's persistent/ephemeral disclosure boundaries.
+The wire NetworkSpec key is **ip_cidr**, not the host YAML key ip.
+`start_timeout` is absent from LaunchSpec because it controls only the
+host's launch_ack wait ([Failure semantics](#failures)).
+
+<a id="application-environment"></a>
+
+### The application environment
+
+- **PID 1:** in default pid_namespace=private, the app is PID 1 of its own
+  CLONE_NEWPID namespace. In shared mode it is not PID 1; sandbox-init reaps
+  its orphan descendants and remains visible as PID 1. Plugins always remain
+  in sandbox-init's PID namespace, though they share rootfs/cgroup/network;
+  a private-PID app cannot see them.
+- **Cgroup namespace:** real /sys/fs/cgroup/app is always namespace/freezer root.
+  With cgroup_control=false, primary/restarts/plugins/native exec live in
+  real /app and see 0::/. With true, real /app has no direct processes and
+  verified subtree delegation; those processes live in /app/init and see
+  0::/init. This /init is a long-lived cgroup, not top-level init commands.
+  Cgroup namespacing is a view/management scope, not an extra security boundary.
+- **Mount namespace:** private, initially based on init's root view (overlay
+  or single ext4), with its own proc mount in private PID mode.
+- **Network:** with a configured network source, eth0 is virtio-net with a host
+  TAP backend and cold-start IP configuration from init. Without a network
+  source, no virtio-net is attached; loopback and vsock control still work.
+  Restore network replacement is best-effort ([Management operations](#management-operations)).
+- **/dev:** devtmpfs supplies null/random/urandom and other device nodes;
+  /dev/pts uses devpts.
+- **/run and /run/shm:** automatically mounted tmpfs, without declarations.
+- **/opt/sandbox-runtime, reserved:** read-only bind of the runtime-bundled guest
+  payload, hiding image content at that path. Apps may execute tools such as
+  /opt/sandbox-runtime/bin/envd but should not store their own files there.
+- **Declared mounts/files:** tmpfs and empty volumes are installed, with empty
+  volumes hiding image content; injected files are bound at their targets
+  before app startup and are unwritable if read_only is set.
+- **Identity:** launch.user, default root; non-root execution has already
+  applied setgroups/setgid/setuid.
+- **Stdio:** in tty mode fd 0/1/2 share one PTY slave, isatty=true, with controlling
+  terminal, job control and SIGWINCH; stdout/stderr are merged. Pipe mode uses
+  the declared pipes, isatty=false, with /dev/null for absent stdin.
+  These are not /dev/console or /dev/hvc0; primary output and kernel logs remain
+  separate.
+- **Vsock:** CID 3 and port 5000 are reserved by platform convention.
+  This contract does not prohibit a privileged guest process from creating
+  AF_VSOCK sockets; do not treat the reservation as a security boundary.
+- **Balloon:** managed by the platform without an app protocol requirement. Memory availability, reclaim effects and timing can still be observable to applications. The current platform device model does not enable virtio-mem hotplug; see [VMM limitations](vmm.md#limitations).
+
+<a id="exit"></a>
+
+### Exit semantics
+
+- **restart: never:** app exit → bounded MUX drain → app_exited notification →
+  POWER_OFF → CH exit → sandbox-ctl exit and sandbox destruction.
+  The reported app exit status or fatal signal determines sandbox-ctl's exit
+  status when that notification is received; notification failure limits
+  propagation ([Failure semantics](#failures)).
+- **restart: always:** app exit triggers an in-place refork and rewireApp ([Phase 3: supervisor](#supervision)).
+  The VM stays alive and the same stdio MUX survives.
+- **restart: on-failure:** nonzero or signaled exit restarts in place; clean exit
+  follows never's notification/poweroff path.
+
+An in-place restart forks within the existing guest lifecycle rather than
+repeating the complete sandbox boot. Backoff is 10 ms→60 s, reset after 60 s
+uptime. Shutdown suppresses further restarts, while a quiesce window delays
+them until thaw ([Phase 3: supervisor](#supervision)).
+
+<a id="signals"></a>
+
+### Signal handling
+
+- sandbox-ctl sends quiesce / restore / attach / ping over vsock. These messages
+  do not directly signal the primary app.
+- **Host shutdown and guest-app shutdown are separate.** On host SIGTERM/SIGINT,
+  sandbox-ctl's lifecycle first cancels pre-spawn/controller work. With CH
+  running, its shutdown path attempts ordered `vmm.shutdown` through the CH
+  API after the memory.high preparation, falls back to SIGTERM to CH if needed,
+  and escalates to SIGKILL after a 5 s shutdown grace; a second signal escalates
+  immediately. This does not promise delivery of SIGTERM to guest PID 1 or
+  completion of the app's stop grace. See
+  [lifecycle shutdown](../pkg/sandbox/lifecycle.go) and
+  [run signal handling](../pkg/sandbox/run_signal.go).
+- **If guest PID 1 itself receives SIGTERM/SIGINT**, it sets shutdown,
+  forwards launch.stop_signal (default SIGTERM, resolved from image/YAML
+  policy) to the primary PID, waits launch.stop_grace_period (default 10 s),
+  kills on timeout and powers off. These settings govern that guest path;
+  they are not a guaranteed host VMM teardown handshake.
+- In tty mode the host terminal is raw. Keyboard Ctrl-C (0x03) travels as a byte
+  over the PTY stream, and the guest terminal line discipline turns it into
+  SIGINT for the application. Host sandbox termination or terminal escape uses
+  the separate lifecycle controls ([sandbox lifecycle](runtime.md)).
+- The proposed quiesce.signal hook ([Quiesce handling](#quiesce)) is not implemented.
+
+<a id="initialization"></a>
+
+## The three sandbox-init phases
+
+
+
+<a id="base-and-root"></a>
+
+### Phase 1: base runtime, wait for launch, workload root and switch-root
 
 Base initialization is workload-independent. It mounts only proc/sysfs/devtmpfs,
 starts loopback and the reverse control dispatcher, then announces
@@ -139,7 +314,7 @@ F. Basic mounts after switch-root:
    mount -t cgroup2 cgroup2 /sys/fs/cgroup
    mkdir /sys/fs/cgroup/app             # app cgroup namespace and freezer root
    With launch.cgroup_control=true, also create /sys/fs/cgroup/app/init
-     and strictly delegate advertised controllers (§3.2.1).
+     and strictly delegate advertised controllers (Application cgroup namespace and controller topology).
    mount -t devpts devpts /dev/pts -o newinstance,ptmxmode=0666
                                         # needed by tty-mode openpty
    mount -t tmpfs tmpfs /run -o nosuid,nodev
@@ -221,11 +396,11 @@ available in the app's private mount namespace, read-only. Because the payload
 is part of `sandbox-runtime.bundle`, changing it changes that artifact's
 identity. Restore checks the runtime footer identity against E/C0 and requires
 the corresponding runtime artifact to be remapped; this is not a full payload
-re-hash on every restore (see [sandbox lifecycle](sandbox.md)). With the trusted,
+re-hash on every restore (see [sandbox lifecycle](runtime.md)). With the trusted,
 matching artifact, restored sandboxes retain the same payload version.
 The payload shares the runtime artifact's lifecycle and cannot be independently
 hot-patched; an independently versioned payload would need a separate read-only
-EROFS device (§6).
+EROFS device ([Extension points](#extensions)).
 
 **Single-disk mode** omits `boot.root.overlay`. The host creates no blk1,
 passes one writable `--disk` for the root ext4 CoW device, and adds
@@ -292,7 +467,7 @@ CLOEXEC filesystem handle per writable disk, before switch-root hides staging
 paths. Single mode pins ext4 itself; overlay mode pins the raw upper, not the
 merged root. Bind/empty volumes do not add sources. Handles survive memory
 restore, never enter app exec, and close with init; an in-flight uncancelable
-read retains its original handle/slot until it finishes (§4.11).
+read retains its original handle/slot until it finishes ([Raw usage observations](#usage-observations)).
 
 <a id="guest-block-discard"></a>
 
@@ -319,11 +494,13 @@ path. Validation must retain nonzero lower bytes, check zero reads after discard
 Checkpoint/export and restore, and verify that the corresponding upper ranges
 have no payload. A successful trim byte count alone does not prove these properties.
 
-### 3.2 Phase 2: apply the spec, wire stdio and start the app
+<a id="apply-and-launch"></a>
+
+### Phase 2: apply the spec, wire stdio and start the app
 
 Phase 1's JOIN supplies LaunchSpec and the vsock connection that exchanged
 hello/launch. Phase 2 applies the spec and writes launch_ack on **that same
-connection**. It then remains open as the application's stdio MUX (§4.5).
+connection**. It then remains open as the application's stdio MUX ([MUX sub-protocol](#mux-wire)).
 
 `launch_ack` follows **all spec application, including init commands**.
 It means the environment and initialization are prepared and the app is about
@@ -338,7 +515,7 @@ after switch-root.
      - raw netlink RTM_NEWLINK(interface UP [+IFLA_MTU])
      - RTM_NEWADDR(IP/CIDR), optional RTM_NEWROUTE(nexthop)
    Cold-start failure is fatal. Restore with network uses best-effort
-   flush-and-replace instead (§4.3).
+   flush-and-replace instead (Management operations).
 2. applyFsMounts(spec.mounts where type==tmpfs)
    Empty volumes were installed before switch-root.
 3. applyFiles(spec.files)
@@ -349,7 +526,7 @@ after switch-root.
    Run one-shot commands sequentially, output to console.
    Per-command env/workdir/user and timeout are supported; timeout sends SIGKILL.
    Any nonzero exit or timeout is fatal (early initContainers-style setup).
-5. Prepare app stdio from spec.stdio (§3.5):
+5. Prepare app stdio from spec.stdio (Application stdio and console wiring):
    tty: openpty(), retain master/slave; initial winsize comes from the spec.
    pipe: pipe/socketpair per declared channel; undeclared stdin uses /dev/null.
 6. write launch_ack{stdio: actual enabled channels}
@@ -399,18 +576,20 @@ after switch-root.
     The placeholder is still supervised, in the app cgroup and snapshot
     freezer. The host forces restart=always, so killing it from exec restarts
     it in place. Guest PID 1's shutdown path sets shutdown before stopping it.
-    Host VMM teardown is a separate path (§5.4).
+    Host VMM teardown is a separate path (Signal handling).
 11. Parent PID 1 waits for EOF on the internal CLOEXEC socket to confirm the
     final execve, then:
-    - starts app-fd <-> MUX bridge goroutines (§3.5). App ends are replaceable
+    - starts app-fd <-> MUX bridge goroutines (Application stdio and console wiring). App ends are replaceable
       by generation; an in-place restart drains the old output generation
-      before installing new fds, with a bounded fallback (§3.3).
+      before installing new fds, with a bounded fallback (Phase 3: supervisor).
       The same MUX session and streams survive the restart;
     - short-conn dials host:5000, sends app_started{pid}, waits for ack, closes;
     - starts launch.plugin[] companions, then enters phase 3.
 ```
 
-#### 3.2.1 Application cgroup namespace and controller topology
+<a id="application-cgroups"></a>
+
+#### Application cgroup namespace and controller topology
 
 Real `/sys/fs/cgroup/app` is always both the **application cgroup namespace
 root** and the **recursive snapshot freezer root**. Capture freezes/thaws
@@ -517,9 +696,11 @@ plane are independent.
 **Cold-start failures are fatal:** network, mount, file or init setup failure
 must not silently launch an app with the wrong environment. The scheduler
 needs a failed startup it can reschedule. Restore's best-effort clock/network
-handling is a distinct contract (§4.3).
+handling is a distinct contract ([Management operations](#management-operations)).
 
-### 3.3 Phase 3: supervisor
+<a id="supervision"></a>
+
+### Phase 3: supervisor
 
 ```
 loop:
@@ -594,7 +775,7 @@ and reconnect vhost-user-blk backends, which accept only one connection for this
 single-VM lifecycle; failed reconnection makes CH exit unsuccessfully.
 
 **The reverse listener runs in a separate goroutine** alongside the supervisor,
-handling ping, restore, quiesce and attach, plus exec/connect sessions (§4.3–4.4).
+handling ping, restore, quiesce and attach, plus exec/connect sessions ([Management operations](#management-operations)–4.4).
 It remains across cold start, capture/restore and MUX replacement until init
 powers off.
 
@@ -616,13 +797,15 @@ with CH `vm.info` to compute the sandbox-local Budget.
 A failed send retains exactly the same epoch/seq/payload for the next ticker.
 Only a successful ACK clears pending and permits another sample. EAGAIN,
 timeout or a lost ACK does not permanently leave reporting in progress.
-See [sandbox lifecycle](sandbox.md), §4.2 / §9.3.
+See [sandbox lifecycle](runtime.md) [Memory terms](resources.md#memory-terms) / [Balloon](resources.md#balloon-controller).
 
 `mem_report` remains the existing resource-control exchange. Usage does not
 reuse its retained payload, cadence or ACK queue: the Host requests new raw
-usage observations over a separate connection (§4.11).
+usage observations over a separate connection ([Raw usage observations](#usage-observations)).
 
-### 3.4 Quiesce handling
+<a id="quiesce"></a>
+
+### Quiesce handling
 
 Quiesce is the last guest cleanup opportunity before host `/vm.pause`.
 It has two goals:
@@ -631,7 +814,7 @@ It has two goals:
    correspond to one consistent capture point.
 2. Tear down MUX and port-forward sessions before capture. A handshake or live
    connection whose peer is absent after restore must not be retained as a
-   usable session (§4.6 / §3.7). Registry drains, bounded close handling and
+   usable session ([MUX graceful-close handshake](#mux-close) / [Connect port-forward sessions (`sandbox-ctl run --connect`)](#forward-sessions)). Registry drains, bounded close handling and
    CH's restore transport reset cooperate to establish this boundary; an
    individual SO_LINGER return is not proof that all kernel socket state vanished.
 
@@ -653,7 +836,7 @@ EOF, and completing its own admitted-handler drains.
    timeout is disabled. Expiry cancels and joins the exchange and fails capture;
    it does not preempt a normally completing transport before guest confirmation.
    Guest rejects new exec, SIGKILLs in-flight exec helpers, closes their lingered
-   vsock sessions and joins complete session goroutines (§3.6).
+   vsock sessions and joins complete session goroutines (Exec sessions (sandbox-ctl exec)).
    This drain is bounded: failure means no freezer entry and no quiesced.
 0a. Guest drains the in-flight mem_report exchange and pauses reporting.
     The bounded exchange completes before S can retain a reporter lock or
@@ -670,7 +853,7 @@ EOF, and completing its own admitted-handler drains.
                                          // clean page cache plus dentry/inode cache
 3. Park app-output forwarding as the MUX is closed.
    The app is frozen and residual output is bounded.
-4. Tear down all connect forwards (§3.7):
+4. Tear down all connect forwards (Connect port-forward sessions (sandbox-ctl run --connect)):
    gate new connect; close each target and reverse-vsock connection.
    SO_LINGER is bounded (3 s, connectLingerSec) and best-effort; sessions close concurrently
    within the quiesce budget.
@@ -721,7 +904,7 @@ pressure or ballooning.
   through cgroup v2; it is not SIGTERM and does not rely on stdout backpressure
   to stop execution.
 - Do not reset the RNG/entropy pool here. Restore-time reseeding is not
-  implemented (§4.3).
+  implemented ([Management operations](#management-operations)).
 - Do not clean runtime logs such as /var/log; they are app-owned.
 
 **Errors and guarantees:** drop_caches open/write failures are logged and
@@ -734,21 +917,23 @@ If cgroup.events does not reach frozen 1 in time, the guest sends no quiesced.
 Exec/report drain failure likewise prevents it. Primary MUX close has a bounded
 ACK wait and hard-close fallback; SO_LINGER setup/close does not provide a
 separately verified, unbounded socket-removal guarantee. CH's transport reset
-handles residual connected-socket state (§4.6).
+handles residual connected-socket state ([MUX graceful-close handshake](#mux-close)).
 If quiesced is absent or cannot be written, capture fails. The host attempts
 same-VM recovery and reattach; it continues running only if that recovery
-succeeds, otherwise the host terminates the failed recovery. See §4.10 and
-[sandbox lifecycle §6.2](sandbox.md).
+succeeds, otherwise the host terminates the failed recovery. See [Failure semantics](#failures) and
+[sandbox lifecycle](runtime.md).
 
-### 3.5 Application stdio and console wiring
+<a id="stdio"></a>
+
+### Application stdio and console wiring
 
 sandbox-init creates the application's stdin/stdout/stderr or pseudoterminal
-inside the guest, then bridges it bidirectionally over MUX streams (§4.5).
+inside the guest, then bridges it bidirectionally over MUX streams ([MUX sub-protocol](#mux-wire)).
 The primary app does not inherit init's console fds, which point at
 `/dev/hvc0`; its output is separated from kernel dmesg in both directions.
 
 **The two modes are mutually exclusive**, selected by stdio in the launch
-protocol (§4.4 / §5.1):
+protocol ([Management wire format and fields](#management-wire) / [Launch configuration (LaunchSpec)](#launch-spec)):
 
 | Mode | Guest setup | App view | MUX streams |
 |---|---|---|---|
@@ -764,18 +949,20 @@ terminal, a blocked output destination or an absent MUX, credit is exhausted,
 the guest pump stops draining, kernel pipe/PTY buffers fill and app writes
 block. There is no intentional rolling-buffer/drop policy for normal output
 backpressure. This is not an end-to-end losslessness guarantee across transport
-failure, forced drain timeouts or the restart input gap (§3.3 / §4.5).
+failure, forced drain timeouts or the restart input gap ([Phase 3: supervisor](#supervision) / [MUX sub-protocol](#mux-wire)).
 
 **Kernel dmesg** travels separately through virtio-console `/dev/hvc0`.
 CH writes it to the stdout pipe provided by sandbox-ctl, which discards it,
 writes it to stderr or writes it to a file according to `--console`
-([sandbox lifecycle](sandbox.md), §2.2 / §5.2).
+([sandbox lifecycle](runtime.md) [`sandbox-ctl run`](runtime.md#run) / [CH command-line boundary](vmm.md#vmm-command-line)).
 `--serial off` disables the 8250 UART.
 
-### 3.6 Exec sessions (`sandbox-ctl exec`)
+<a id="exec-sessions"></a>
+
+### Exec sessions (`sandbox-ctl exec`)
 
 `sandbox-ctl exec`, whose host CLI and ctl.sock are specified in
-[sandbox lifecycle](sandbox.md), §2.5 / §6.3, starts a temporary command inside
+[sandbox lifecycle](runtime.md) [`sandbox-ctl exec`](runtime.md#exec) / [`ctl.sock` protocol](runtime.md#control-protocol), starts a temporary command inside
 an already running sandbox. It is a sibling of the app, without replacing it
 or restarting the VM. The host sends exec{spec} over the reverse channel.
 The guest prepares stdio, starts the command and replies exec_ack; that
@@ -811,9 +998,9 @@ There is no separate exec cgroup or later cgroup.procs placement.
 
 **Exit and reaping:** after command exit, the guest sends EOF on all session
 stdout/stderr/PTY streams, then EXIT_STATUS (exit code, or 128+signal), then
-the MUX_CLOSE handshake (§4.6). The host obtains the exit code from the explicit
+the MUX_CLOSE handshake ([MUX graceful-close handshake](#mux-close)). The host obtains the exit code from the explicit
 frame instead of relying on transport close. Exec completion never reboots
-the sandbox. Primary exit follows its own restart policy (§3.3).
+the sandbox. Primary exit follows its own restart policy ([Phase 3: supervisor](#supervision)).
 The sole reaper routes non-primary child exits to their exec session rather
 than treating them as primary exit.
 
@@ -829,16 +1016,18 @@ handlers. The guest then rejects new exec, kills in-flight exec helpers, closes
 lingered session sockets and waits for the full fork/MUX/session cleanup.
 Killing only the child is not a freeze barrier: unreleased process-wide fork
 state or half-closed vsock state could otherwise enter S.
-Resume/restore reopens admission only after thaw (§4.3).
+Resume/restore reopens admission only after thaw ([Management operations](#management-operations)).
 An exec interrupted by capture is not automatically rerun.
 
-### 3.7 Connect port-forward sessions (`sandbox-ctl run --connect`)
+<a id="forward-sessions"></a>
+
+### Connect port-forward sessions (`sandbox-ctl run --connect`)
 
 Repeatable `--connect` pairs a host-local endpoint LOCAL with a guest endpoint.
 **All four forms behave identically on the host:** listen on LOCAL, and for
 each accepted local connection send connect{ConnectSpec} over a new reverse
 connection. After connect_ack that connection becomes the forward's independent
-long-lived fwd channel (§4.7), preserving TCP half-close.
+long-lived fwd channel ([Connect forwarding frame sub-protocol (fwd)](#forward-wire)), preserving TCP half-close.
 The modes differ only in how the guest obtains its target connection:
 
 | Form | Guest target action | Use |
@@ -873,7 +1062,7 @@ Local client       sandbox-ctl run (host)        CH proxy       sandbox-init    
     |                  | connect{address:"127.0.0.1:49983"} ------->| net.Dial(tcp,address)
     |                  |                            |              |------------>| :49983
     |                  |<-------------- connect_ack (or error) ----|<------------|
-    |<================== fwd frames (§4.7), TCP half-close ======================>|
+    |<================== fwd frames (Connect forwarding frame sub-protocol (fwd)), TCP half-close ======================>|
 ```
 
 **Accept mode, `LOCAL::TARGET`:** the guest lazily listens on address, caching
@@ -894,7 +1083,7 @@ Local client       sandbox-ctl run (host)        CH proxy       sandbox-init    
     |                  | connect{accept:true,address:"/run/up.sock"} -> Accept <-| connect
     |                  | (park without deadline)                  | connB ready |
     |                  |<---------------- connect_ack (or error) --|             |
-    |<===================== fwd frames (§4.7), TCP half-close ==================>|
+    |<===================== fwd frames (Connect forwarding frame sub-protocol (fwd)), TCP half-close ==================>|
 ```
 
 **Host leads the first pairing:** an accept-mode listener is bound only when
@@ -914,7 +1103,7 @@ it is not a guarantee against transport errors. A forward has only one logical
 stream, so no stream IDs or application-level windows are needed; kernel vsock
 buffer backpressure supplies flow control.
 
-**Capture interaction:** forwards are torn down with the app MUX (§3.4 step 4),
+**Capture interaction:** forwards are torn down with the app MUX ([Quiesce handling](#quiesce) step 4),
 because a captured live forward has no peer after restore.
 The guest gates new connects and closes target/vsock pairs using bounded
 SO_LINGER for the latter. Accept mode also closes cached listeners, waking
@@ -927,34 +1116,40 @@ cache. Host forwarding listeners survive same-process quiesce; a separate
 restore process must recreate/take ownership through equivalent `--connect`
 arguments.
 
-## 4. Vsock control plane and console MUX protocol
+<a id="control-and-mux"></a>
 
-### 4.1 Connection classes
+## Vsock control plane and console MUX protocol
+
+
+
+<a id="connections"></a>
+
+### Connection classes
 
 ```
 (1) Management connection: a fresh connection for an operation's handshake.
     Ordinary operations finish request/response and close; no keepalive or multiplexing.
     hello/launch, app_started, app_exited, ping, mem_report, quiesce,
-    restore, attach, exec, connect                                  (§4.3 / §4.4)
+    restore, attach, exec, connect                                  (Management operations / Management wire format and fields)
     Wire: [4B LE length][JSON].
     Launch has its explicit four-message handshake; upgrade operations retain the conn.
 
 (2) MUX connection: one session's stdin/stdout/stderr, or a PTY.
     A launch / restore / attach / exec connection remains open after its ACK exchange
-    and switches to framed mode                                    (§4.5 / §4.6).
+    and switches to framed mode                                    (MUX sub-protocol / MUX graceful-close handshake).
     Primary app: at most one, created by launch and replaced by restore/attach.
-    Each exec: an independent command-lifetime MUX; 0..N concurrent (§3.6).
+    Each exec: an independent command-lifetime MUX; 0..N concurrent (Exec sessions (sandbox-ctl exec)).
     Wire: [stream:u8][type:u8][len:u16 BE][payload], per-stream flow control.
 
 (3) Forward connection: one local connection paired with a guest endpoint.
     A connect handshake dials, or accepts for LOCAL::TARGET, then retains the
-    connection after connect_ack as a fwd relay                     (§3.7 / §4.7).
+    connection after connect_ack as a fwd relay                     (Connect port-forward sessions (sandbox-ctl run --connect) / Connect forwarding frame sub-protocol (fwd)).
     One per accepted local --connect connection; 0..N concurrent.
     Wire: [type:u8][len:u16 BE][payload], half-close, no application window.
 
 (4) Usage connection: one reusable Host-initiated management connection.
     Sequential usage_request/usage_response only; one round in flight.
-    Wire: unchanged [4B LE length][JSON]; no MUX or history replay (§4.11).
+    Wire: unchanged [4B LE length][JSON]; no MUX or history replay (Raw usage observations).
 ```
 
 Management operations are not multiplexed over the primary MUX.
@@ -965,7 +1160,9 @@ concurrent with the primary and other exec sessions.
 Connect also upgrades its handshake connection, but uses the thinner,
 single-stream fwd protocol, with no application window.
 
-### 4.2 Channels and addressing
+<a id="channels"></a>
+
+### Channels and addressing
 
 Both directions use **port 5000**, with endpoints distinguished by direction:
 
@@ -989,7 +1186,9 @@ Example <vsock-base>:    /run/sandbox/<sid>/vsock.sock
 - The directions have independent addressing. Host→guest ping and
   guest→host app_started can run simultaneously on separate new connections.
 
-### 4.3 Management operations
+<a id="management-operations"></a>
+
+### Management operations
 
 Each operation has its own connection and explicit exchange. Ordinary operations
 have one request and response; cold launch has the four-message sequence below.
@@ -1000,14 +1199,14 @@ The last column describes whether the connection closes or upgrades.
 | Cold start | guest→host | `hello` → `launch{spec}` → `launch_ack{stdio}` → `ack` | MUX | Guest announces readiness; host supplies LaunchSpec; guest applies it and prepares stdio before launch_ack. |
 | App start notification | guest→host | `app_started{pid}` → `ack` | Close | The app fork/exec handshake succeeded. |
 | App exit notification | guest→host | `app_exited{code,term_signal}` → `ack` | Close | Terminal primary exit; guest waits for ACK up to its budget before powering off. Host uses this for its exit status. |
-| Health probe | host→guest | `ping{id,t_send_ns}` → `pong{id,t_send_ns}` | Close | Host measures RTT, timeouts and failures (§4.9). |
+| Health probe | host→guest | `ping{id,t_send_ns}` → `pong{id,t_send_ns}` | Close | Host measures RTT, timeouts and failures ([Ping health probes](#health)). |
 | Memory report | guest→host | `mem_report{mem_report:{epoch,seq,mem_*}}` → `mem_report_ack` | Close | Guest observation; host validates epoch/seq and combines it with CH vm.info in the sandbox-local controller. |
-| Usage observation | host→guest | `usage_request{usage_request}` → `usage_response{usage_response}` | Reuse | New raw memory/filesystem reads only; Host alone accumulates (§4.11). |
-| Before capture | host→guest | `quiesce{skip_drop_caches}` → `quiesced{drop_caches_result}` | Close | Freeze app, run prep and tear down sessions (§3.4); host then requires control EOF and its handler barriers before pause. |
-| After restore | host→guest | `restore{epoch,wallclock_ns,network?}` → `restore_ack{epoch,stdio,app_state}` | MUX | After vCPUs resume, guest advances the report epoch, thaws and reopens execution gates before ACK, then reconnects MUX and resumes reports. Host enables memory policy only after ACK/MUX setup. Clock/network updates are best-effort (§4.8); launch/files/init/plugins are cold-only and not replayed. RNG reseeding is not implemented. |
+| Usage observation | host→guest | `usage_request{usage_request}` → `usage_response{usage_response}` | Reuse | New raw memory/filesystem reads only; Host alone accumulates ([Raw usage observations](#usage-observations)). |
+| Before capture | host→guest | `quiesce{skip_drop_caches}` → `quiesced{drop_caches_result}` | Close | Freeze app, run prep and tear down sessions ([Quiesce handling](#quiesce)); host then requires control EOF and its handler barriers before pause. |
+| After restore | host→guest | `restore{epoch,wallclock_ns,network?}` → `restore_ack{epoch,stdio,app_state}` | MUX | After vCPUs resume, guest advances the report epoch, thaws and reopens execution gates before ACK, then reconnects MUX and resumes reports. Host enables memory policy only after ACK/MUX setup. Clock/network updates are best-effort ([Timelines](#timelines)); launch/files/init/plugins are cold-only and not replayed. RNG reseeding is not implemented. |
 | MUX replacement | host→guest | `attach{epoch}` → `attach_ack{epoch,stdio,app_state}` | MUX | Close/drop old MUX and attach the new connection. If the guest is still frozen, thaw it before reopening gates and sending ACK, including same-process resume and failed-capture recovery; otherwise skip thaw. Attach and VM resume are distinct operations. |
-| Execute command | host→guest | `exec{spec}` → `exec_ack{stdio}` | Independent MUX | Start a sibling command and wire its stdio; on completion send EXIT_STATUS then close (§3.6 / §4.6). Sessions can run concurrently. |
-| Port forward | host→guest | `connect{spec}` → `connect_ack` | Fwd relay | Dial the guest target, or Listen+Accept with spec.accept. Accept may park indefinitely without a host ACK deadline. Each forward is independent and is torn down for quiesce (§3.7 / §4.7). |
+| Execute command | host→guest | `exec{spec}` → `exec_ack{stdio}` | Independent MUX | Start a sibling command and wire its stdio; on completion send EXIT_STATUS then close ([Exec sessions (`sandbox-ctl exec`)](#exec-sessions) / [MUX graceful-close handshake](#mux-close)). Sessions can run concurrently. |
+| Port forward | host→guest | `connect{spec}` → `connect_ack` | Fwd relay | Dial the guest target, or Listen+Accept with spec.accept. Accept may park indefinitely without a host ACK deadline. Each forward is independent and is torn down for quiesce ([Connect port-forward sessions (`sandbox-ctl run --connect`)](#forward-sessions) / [Connect forwarding frame sub-protocol (fwd)](#forward-wire)). |
 | Error | Either | `error{msg}` | Close | Human-readable rejection where the handler sends one; malformed framing/JSON can instead terminate the connection. |
 
 Attach is an internal mechanism of the existing sandbox-ctl run lifecycle,
@@ -1037,12 +1236,14 @@ Capture replacement snapshots from guests booted with the updated Runtime;
 retained older snapshots keep their original guest behavior and remain
 readable without a format migration.
 
-### 4.4 Management wire format and fields
+<a id="management-wire"></a>
+
+### Management wire format and fields
 
 The format is **[4-byte little-endian uint32 length][JSON payload]**.
 `pkg/proto.MaxMessageBytes` is **1 MiB of JSON payload**, plus the 4-byte
 prefix. This is distinct from the host ctl.sock exec request's 64 KiB JSON
-limit ([sandbox lifecycle §6.3](sandbox.md)).
+limit ([sandbox lifecycle](runtime.md)).
 Low message volume makes readable JSON sufficient without protobuf tooling.
 
 The following is an annotated schema sketch, not executable JSON; each message
@@ -1051,9 +1252,9 @@ populates only fields relevant to its type. The complete types in
 
 ```jsonc
 {
-  "type": "<one of §4.3>",
+  "type": "<one of Management operations>",
   "phase": "runtime_ready",            // cold hello: explicit base-ready barrier
-  "launch": { ... LaunchSpec ... },    // launch, including stdio (§5.1)
+  "launch": { ... LaunchSpec ... },    // launch, including stdio (Launch configuration (LaunchSpec))
   "exec": { "argv": [...], "env": {}, "cwd": "", "user": "", "stdio": {} },
   "connect": { "network": "tcp", "address": "127.0.0.1:49983", "accept": false },
                                        // accept=true: guest Listen+Accept
@@ -1093,7 +1294,9 @@ pinger validates response type and its expected ID.
 The restore/attach request epoch is echoed, not an implemented generic
 duplicate-request filter; memory reporting has its own epoch/seq validation.
 
-### 4.5 MUX sub-protocol
+<a id="mux-wire"></a>
+
+### MUX sub-protocol
 
 **Upgrade:** launch / restore / attach / exec retain their connection after
 the specified ACK exchange and interpret following bytes as MUX frames.
@@ -1159,7 +1362,7 @@ and can survive memory capture until a new MUX drains them.
 Do not infer that a dead MUX's internal stream buffers are migrated or that
 bytes already written to a failed transport are replayed: transport failure
 has no end-to-end delivery ACK. Forced generation/shutdown drain timeouts can
-discard residual output, and stdin in a restart gap can be dropped (§3.3).
+discard residual output, and stdin in a restart gap can be dropped ([Phase 3: supervisor](#supervision)).
 The expected normal detached window is controlled and short; a caller that
 never reattaches can leave output blocked indefinitely.
 
@@ -1183,7 +1386,9 @@ The guest applies TIOCSWINSZ to the PTY master, causing a foreground-process-gro
 SIGWINCH. It matters only in PTY mode. The host sends initial size on entering
 MUX, including after restore/attach.
 
-### 4.6 MUX graceful-close handshake
+<a id="mux-close"></a>
+
+### MUX graceful-close handshake
 
 The orderly-close protocol is a small application-layer FIN/FIN-ACK exchange,
 followed by closing both sockets. **Guest initiates; host responds** in these
@@ -1261,11 +1466,11 @@ at snapshot. Restore activation reissues the IRQ; Linux resets connected
 sockets while CH gates backend RX until the guest event-queue kick acknowledges
 processing. Listeners survive. The first restore REQUEST enters only after
 that barrier. This removes reliance on sleeps for transport reset itself;
-the separate bounded pre-request CONNECT retry still exists (§4.10).
+the separate bounded pre-request CONNECT retry still exists ([Failure semantics](#failures)).
 
 **Three triggers use the same close handshake:**
 
-1. Quiesce closes the primary MUX near the end of guest cleanup (§3.4 step 5).
+1. Quiesce closes the primary MUX near the end of guest cleanup ([Quiesce handling](#quiesce) step 5).
 2. Exec completion sends EOF on all output/PTY streams, then EXIT_STATUS,
    then MUX_CLOSE. The host learns the exit code from EXIT_STATUS but continues
    to process MUX_CLOSE, sends ACK and closes locally before returning and
@@ -1281,9 +1486,11 @@ the separate bounded pre-request CONNECT retry still exists (§4.10).
 the old session and its pumps wait for another attach/restore, with the listener
 still active. The current host does not run a universal automatic reconnect loop;
 capture resume/recovery explicitly invokes reattach, while other callers must
-handle interrupted forwarding (§4.3 / §4.10).
+handle interrupted forwarding ([Management operations](#management-operations) / [Failure semantics](#failures)).
 
-### 4.7 Connect forwarding frame sub-protocol (fwd)
+<a id="forward-wire"></a>
+
+### Connect forwarding frame sub-protocol (fwd)
 
 After connect_ack, the connection switches to shared `pkg/fwd` framing and
 splices the local and guest-target connections in both directions.
@@ -1302,7 +1509,7 @@ EOF (1): sender finished writing; peer calls CloseWrite()/SHUT_WR on its plain
 RST (2): abort both directions.
 ```
 
-As in §3.7, CH does not translate SHUT_WR across its UDS↔vsock boundary.
+As in [Connect port-forward sessions (`sandbox-ctl run --connect`)](#forward-sessions), CH does not translate SHUT_WR across its UDS↔vsock boundary.
 The close event must therefore travel as in-band framed data.
 
 **Half-close relay**, symmetric on host and guest: framed always means vsock;
@@ -1320,9 +1527,11 @@ also half-closes. Clean completion, internal error and external quiesce converge
 through sync.Once, closing each underlying connection once. Double-closing a
 guest raw fd could otherwise close an unrelated connection that reused its
 number. Quiesce arms bounded SO_LINGER before guest vsock close; the wider
-transport-reset contract remains §4.6.
+transport-reset contract remains [MUX graceful-close handshake](#mux-close).
 
-### 4.8 Timelines
+<a id="timelines"></a>
+
+### Timelines
 
 In these diagrams, ordinary arrows are management exchanges and double arrows
 are MUX traffic. “This conn → MUX” marks the retained connection's upgrade.
@@ -1418,7 +1627,9 @@ closing bind/listen sockets. CH also resumes local port allocation from saved
 local_port_last + 1. Resetting the transport epoch and keeping port allocation
 continuous are separate responsibilities.
 
-### 4.9 Ping health probes
+<a id="health"></a>
+
+### Ping health probes
 
 Ping measures guest-agent liveness and response latency, **not application
 health**. The default fatal threshold is zero, so failures record statistics
@@ -1445,7 +1656,7 @@ It requires a bounded `timeouts.ping`.
 Ordinary probe timeout and capture drain budget are independent.
 An unbounded ordinary wait must not make export/snapshot's barrier unbounded.
 
-**Actual statistics surface:** sandbox-ctl stats JSON exposes a `ping` object
+**Actual statistics surface:** `sandbox-ctl run --stats-json <path>` shutdown JSON exposes a `ping` object
 with `attempts`, `success`, `timeout`, `dial_error`,
 `rtt_avg_ns`, `rtt_max_ns`, `rtt_p50_ns`, `rtt_p95_ns` and
 `rtt_p99_ns`, defined in
@@ -1462,7 +1673,9 @@ Errors containing deadline / i/o timeout / timed out are classified as timeout;
 other failures, including an unexpected pong type/ID, count as dial_error.
 This is best-effort classification, not a typed network-error taxonomy.
 
-### 4.10 Failure semantics
+<a id="failures"></a>
+
+### Failure semantics
 
 **Guest, sandbox-init:**
 
@@ -1478,9 +1691,9 @@ This is best-effort classification, not a typed network-error taxonomy.
   notification or missing ACK does not prevent poweroff.
 - Exec during quiesce, with empty argv, or with startup failure is rejected.
   Mid-session transport loss kills the exec command tied to its namespace
-  helper through the parent-death mechanism (§3.6).
+  helper through the parent-death mechanism ([Exec sessions (`sandbox-ctl exec`)](#exec-sessions)).
 - Restore clock/network failures log and continue. Restore/attach thaw failure
-  leaves gates closed and sends no ACK (§4.3).
+  leaves gates closed and sends no ACK ([Management operations](#management-operations)).
 
 **Host, sandbox-ctl:**
 
@@ -1505,7 +1718,7 @@ This is best-effort classification, not a typed network-error taxonomy.
 
 Host items managed by sandbox.yaml `timeouts.*` use their configured value,
 defaulting to no forced response deadline where documented; connection setup
-still has its own bounds ([sandbox lifecycle §3.1](sandbox.md)).
+still has its own bounds ([sandbox lifecycle](runtime.md)).
 The retry implementation is [guestlink/pinger.go](../pkg/guestlink/pinger.go);
 forward teardown uses [sandbox-init/connect.go](../cmd/sandbox-init/connect.go).
 Other budgets are protocol constants or guest-side waits:
@@ -1526,12 +1739,12 @@ Other budgets are protocol constants or guest-side waits:
 
 <a id="usage-observations"></a>
 
-### 4.11 Raw usage observations
+### Raw usage observations
 
 The Host uses a dedicated reusable connection through the same management
 listener and length-prefixed JSON framing. This changes neither ordinary
 short connections, ping, mem_report nor MUX. `pkg/proto/usage.go` owns the
-raw payload types; [Host usage metrics](sandbox.md#usage-metrics) owns units,
+raw payload types; [Host usage metrics](resources.md#usage-metrics) owns units,
 metric calculations, output and record formats.
 
 Guest reads `/proc/zoneinfo` and `/proc/buddyinfo`, matching node/zone identities
@@ -1540,7 +1753,7 @@ and per-CPU pagesets. It returns `PresentPages`, `BuddyFreePages`,
 are DMA, DMA32 and Normal; Device/PMEM are excluded. Other populated domains
 are unsupported, not guessed from `spanned` or host capacity.
 
-Filesystem observations use the private CLOEXEC handles retained during [disk assembly](#31-phase-1-base-runtime-wait-for-launch-workload-root-and-switch-root). Switch-root and restored mounts preserve these handles; application exec does not inherit them. Bind/empty volumes on the same disk do not add filesystem registrations. No arbitrary mount enumeration, NFS/FUSE query or `du` is performed.
+Filesystem observations use the private CLOEXEC handles retained during [disk assembly](#base-and-root). Switch-root and restored mounts preserve these handles; application exec does not inherit them. Bind/empty volumes on the same disk do not add filesystem registrations. No arbitrary mount enumeration, NFS/FUSE query or `du` is performed.
 
 ```jsonc
 {
@@ -1624,176 +1837,22 @@ admission still closes. Source slots survive this rollback. This raw
 protocol changes neither business filesystem synchronization nor the
 existing resource controller.
 
-## 5. Application contract
+<a id="extensions"></a>
 
-### 5.1 Launch configuration (LaunchSpec)
-
-The host merges the OCI runtime config.json embedded in the ZIP trailer of
-boot.root.base with sandbox.yaml's launch section: YAML overrides take priority,
-with environment merging. It sends the resulting LaunchSpec over launch.
-Host run flags --tty / --stdin / --stdout / --stderr and their -from/-to
-variants determine stdio ([sandbox lifecycle §2.2](sandbox.md)).
-A single ext4 root has no image config and needs an explicit executable or
-placeholder (§3.1).
-
-This is an annotated JSON example; comments are explanatory, not literal JSON:
-
-```jsonc
-{
-  "exec": "/usr/bin/foo",
-  "args": ["arg1", "arg2"],
-  "env": {"PATH": "...", "HOME": "/root"},
-  "workdir": "/",
-  "restart": "never",                    // never|on-failure|always; in-place restart with backoff
-  "cgroup_control": false,               // false: processes see /; true: empty delegated root, /init
-  "placeholder": false,                  // true: no external exec; host rejects explicit launch.exec,
-                                        // ignores image command and forces restart=always
-  "share_pid": false,                    // true: sandbox-init's PID namespace (pid_namespace=shared)
-  "user": "0:0",                         // uid:gid or name:group, guest /etc/passwd; empty -> root
-  "stop_signal": 15,                     // signal number, resolved host-side; 0 -> SIGTERM
-  "stop_grace_sec": 10,                  // guest PID 1's grace period; 0 -> default 10 s
-  "network": {
-    "interface": "eth0", "ip_cidr": "169.254.1.1/31",
-    "mtu": 1500, "nexthop": "", "hostname": "my-sandbox"
-  },
-  "mounts": [
-    {"target": "/tmp", "type": "tmpfs", "options": "nosuid,nodev,mode=1777"},
-    {"target": "/var/log", "type": "empty"}
-  ],
-  "files": [
-    {"path": "/etc/resolv.conf", "mode": "0644", "owner": "0:0", "content": "nameserver ..."}
-  ],
-  "init": [
-    {"exec": "/bin/sh", "args": ["-c", "..."], "env": {}, "workdir": "/", "user": "0:0", "timeout_ms": 0}
-  ],
-  "plugins": [
-    {"exec": "/usr/bin/sidecar", "args": [], "env": {}, "workdir": "/", "user": "0:0", "restart": "always"}
-  ],
-  "stdio": {
-    "tty": true,                         // true: PTY; false: pipe mode
-    "winsize": {"cols": 80, "rows": 24},  // initial PTY dimensions
-    "stdin": false,                      // pipe: enable stdin, otherwise app fd 0 uses /dev/null
-    "stdout": true,                      // pipe: enable stdout
-    "stderr": true                       // pipe: enable stderr
-  }
-}
-```
-
-See §3.2 for mounts/files/init application. Empty volumes are established from
-their raw ext4 source before switch-root (§3.1). Disk mount specs additionally
-carry resolved disk_index/disk_overlay/disk_devs (§3.1).
-FileSpec also supports read_only; omission leaves its bind writable.
-These tmpfs-backed files avoid direct writable-disk injection, but processes
-can copy them to disk and their memory may be captured; see the lifecycle
-document's persistent/ephemeral disclosure boundaries.
-The wire NetworkSpec key is **ip_cidr**, not the host YAML key ip.
-`start_timeout` is absent from LaunchSpec because it controls only the
-host's launch_ack wait (§4.10).
-
-### 5.2 The application environment
-
-- **PID 1:** in default pid_namespace=private, the app is PID 1 of its own
-  CLONE_NEWPID namespace. In shared mode it is not PID 1; sandbox-init reaps
-  its orphan descendants and remains visible as PID 1. Plugins always remain
-  in sandbox-init's PID namespace, though they share rootfs/cgroup/network;
-  a private-PID app cannot see them.
-- **Cgroup namespace:** real /sys/fs/cgroup/app is always namespace/freezer root.
-  With cgroup_control=false, primary/restarts/plugins/native exec live in
-  real /app and see 0::/. With true, real /app has no direct processes and
-  verified subtree delegation; those processes live in /app/init and see
-  0::/init. This /init is a long-lived cgroup, not top-level init commands.
-  Cgroup namespacing is a view/management scope, not an extra security boundary.
-- **Mount namespace:** private, initially based on init's root view (overlay
-  or single ext4), with its own proc mount in private PID mode.
-- **Network:** with a configured network source, eth0 is virtio-net with a host
-  TAP backend and cold-start IP configuration from init. Without a network
-  source, no virtio-net is attached; loopback and vsock control still work.
-  Restore network replacement is best-effort (§4.3).
-- **/dev:** devtmpfs supplies null/random/urandom and other device nodes;
-  /dev/pts uses devpts.
-- **/run and /run/shm:** automatically mounted tmpfs, without declarations.
-- **/opt/sandbox-runtime, reserved:** read-only bind of the runtime-bundled guest
-  payload, hiding image content at that path. Apps may execute tools such as
-  /opt/sandbox-runtime/bin/envd but should not store their own files there.
-- **Declared mounts/files:** tmpfs and empty volumes are installed, with empty
-  volumes hiding image content; injected files are bound at their targets
-  before app startup and are unwritable if read_only is set.
-- **Identity:** launch.user, default root; non-root execution has already
-  applied setgroups/setgid/setuid.
-- **Stdio:** in tty mode fd 0/1/2 share one PTY slave, isatty=true, with controlling
-  terminal, job control and SIGWINCH; stdout/stderr are merged. Pipe mode uses
-  the declared pipes, isatty=false, with /dev/null for absent stdin.
-  These are not /dev/console or /dev/hvc0; primary output and kernel logs remain
-  separate.
-- **Vsock:** CID 3 and port 5000 are reserved by platform convention.
-  This contract does not prohibit a privileged guest process from creating
-  AF_VSOCK sockets; do not treat the reservation as a security boundary.
-- **Balloon / memory hotplug:** managed by the platform without an app protocol
-  requirement. Memory availability, reclaim effects and timing can still be
-  observable to applications.
-
-### 5.3 Exit semantics
-
-- **restart: never:** app exit → bounded MUX drain → app_exited notification →
-  POWER_OFF → CH exit → sandbox-ctl exit and sandbox destruction.
-  The reported app exit status or fatal signal determines sandbox-ctl's exit
-  status when that notification is received; notification failure limits
-  propagation (§4.10).
-- **restart: always:** app exit triggers an in-place refork and rewireApp (§3.3).
-  The VM stays alive and the same stdio MUX survives.
-- **restart: on-failure:** nonzero or signaled exit restarts in place; clean exit
-  follows never's notification/poweroff path.
-
-An in-place restart forks within the existing guest lifecycle rather than
-repeating the complete sandbox boot. Backoff is 10 ms→60 s, reset after 60 s
-uptime. Shutdown suppresses further restarts, while a quiesce window delays
-them until thaw (§3.3).
-
-### 5.4 Signal handling
-
-- sandbox-ctl sends quiesce / restore / attach / ping over vsock. These messages
-  do not directly signal the primary app.
-- **Host shutdown and guest-app shutdown are separate.** On host SIGTERM/SIGINT,
-  sandbox-ctl's lifecycle first cancels pre-spawn/controller work. With CH
-  running, its shutdown path attempts ordered `vmm.shutdown` through the CH
-  API after the memory.high preparation, falls back to SIGTERM to CH if needed,
-  and escalates to SIGKILL after a 5 s shutdown grace; a second signal escalates
-  immediately. This does not promise delivery of SIGTERM to guest PID 1 or
-  completion of the app's stop grace. See
-  [lifecycle shutdown](../pkg/sandbox/lifecycle.go) and
-  [run signal handling](../pkg/sandbox/run_signal.go).
-- **If guest PID 1 itself receives SIGTERM/SIGINT**, it sets shutdown,
-  forwards launch.stop_signal (default SIGTERM, resolved from image/YAML
-  policy) to the primary PID, waits launch.stop_grace_period (default 10 s),
-  kills on timeout and powers off. These settings govern that guest path;
-  they are not a guaranteed host VMM teardown handshake.
-- In tty mode the host terminal is raw. Keyboard Ctrl-C (0x03) travels as a byte
-  over the PTY stream, and the guest terminal line discipline turns it into
-  SIGINT for the application. Host sandbox termination or terminal escape uses
-  the separate lifecycle controls ([sandbox lifecycle §2.2](sandbox.md)).
-- The proposed quiesce.signal hook (§3.4) is not implemented.
-
-## 6. Extension points
+## Extension points
 
 | Extension | When needed | Affected contract |
 |---|---|---|
-| App quiesce hook | Best-effort app preparation signal before freeze. The proposal lacks a completion ACK and cannot serve as a custom consistency barrier. | §3.4 extension table |
-| App stderr side channel | Pipe mode already separates stdout and stderr into distinct MUX streams and host sinks; no extra vsock channel is needed. PTY inherently merges them, so independent PTY stderr would require a different I/O contract. | §3.5 / §4.5 |
+| App quiesce hook | Best-effort app preparation signal before freeze. The proposal lacks a completion ACK and cannot serve as a custom consistency barrier. | [Quiesce handling](#quiesce) extension table |
+| App stderr side channel | Pipe mode already separates stdout and stderr into distinct MUX streams and host sinks; no extra vsock channel is needed. PTY inherently merges them, so independent PTY stderr would require a different I/O contract. | [Application stdio and console wiring](#stdio) / [MUX sub-protocol](#mux-wire) |
 | Custom vmlinux | Features absent from the platform kernel, such as particular nested userfaultfd or user/net namespace needs. The platform kernel already includes cgroup cpu/memory/io/pids, NFS v3/v4 and FUSE. | sandbox-ctl boot.kernel: file://...; verify the actual kernel feature/config contract |
 | Custom sandbox-runtime | Special PID 1 or supervisor requirements, uncommon. | Preserve the guest ABI, architecture and artifact-identity requirements. A compatible read-only custom runtime can still share DAX pages; customization does not inherently disable sharing. |
-| Independent payload device | Guest payloads such as envd need a release lifecycle independent of runtime. | Proposed §2 / §3.1 change: bind from a separate read-only EROFS device, adding a virtio disk and vhost backend. This is not current independent hot-patching support. |
+| Independent payload device | Guest payloads such as envd need a release lifecycle independent of runtime. | Proposed [Runtime image consumption prerequisites](#runtime-prerequisites) / [Phase 1: base runtime, wait for launch, workload root and switch-root](#base-and-root) change: bind from a separate read-only EROFS device, adding a virtio disk and vhost backend. This is not current independent hot-patching support. |
 
-## 7. See Also
+<a id="related"></a>
 
-- [Host usage](sandbox.md#usage-query) — Host-only aggregation, units, query and persistence.
-- [sandbox lifecycle](sandbox.md), §2.2 (run tty/console/stdio flags),
-  §5.2 (CH cold-start command), §6.2 / §6.3 (capture ordering and ctl.sock),
-  and §7 (restore).
-- [guest kernel guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md):
-  namespaces, filesystems, virtio-console and networking features.
-- [Cloud Hypervisor guide](cloud-hypervisor.md), §5.2: hybrid-vsock CONNECT
-  addressing and console/serial options.
-- [guest-runtime native build guide](https://github.com/kuasar-sandbox/guest-runtime/blob/main/native-deps/README.md),
-  §2.1: mkfs.erofs for make sandbox-runtime.
-- [project system design](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md),
-  §4: user-visible template instantiation, pause and restore semantics.
+## Related documentation
+
+[Runtime: start, control, capture and restore](runtime.md) | [Sandbox configuration reference](configuration.md) | [Sandbox and Snapshot artifacts](artifacts.md) | [Guest memory and lazy restore](memory.md) | [Block storage: devices, writable state and checkpoints](block-storage.md) | [Resource control and usage accounting](resources.md) | [VMM integration and Cloud Hypervisor patches](vmm.md)
+
+[Component entry](../README.md) · [Native builds and patch materials](../native-deps/README.md)

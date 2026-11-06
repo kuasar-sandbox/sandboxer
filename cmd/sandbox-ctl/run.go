@@ -30,7 +30,7 @@ import (
 // runCmd implements `sandbox-ctl run`. With --restore=<ref> it switches
 // to restore mode (snapshot bundle); without it goes cold-start.
 //
-// stdio model: see docs/sandbox.md §2.2. The app's stdin/stdout/stderr
+// stdio model: see docs/runtime.md#run. The app's stdin/stdout/stderr
 // (pipe mode) or a single pty (--tty) travel over the vsock stdio MUX.
 // --tty defaults to auto-detect (on iff stdin and stdout are both
 // terminals); pipe-mode --stdin/--stdout/--stderr and their -from/-to
