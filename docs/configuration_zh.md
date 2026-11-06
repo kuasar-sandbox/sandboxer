@@ -187,7 +187,9 @@ Size 是 `512MiB` 等字节大小字符串；duration 是 `30s` 等 Go duration 
 
 `diff` 与 `diff_template` 是本地绝对文件引用；不可变 ref 可用受支持的 local/Manifest carrier。
 Lower chain 要求 base。冷启动的可写 ext4 设备需要可挂载 base/template/已有 diff；空白文件不是文件系统。
-自动 active diff 归 runtime 所有并在退出时移除；显式路径归调用者所有。容量来自所选磁盘源，
+普通非 checkpoint 模式下，自动 active diff 归 runtime 所有并在退出时移除；显式路径归调用者所有。
+启用 `--enable-checkpoint` 后，可写文件归于派生的 checkpoint 目录，包括自动选择的路径，正常退出后也保留。
+该模式的[归属与清理规则](block-storage_zh.md#checkpoints)由块存储契约定义。容量来自所选磁盘源，
 不是 quota 或 resize flag，见[容量与迁移](#disk-capacity)。
 
 ### 工作负载字段
