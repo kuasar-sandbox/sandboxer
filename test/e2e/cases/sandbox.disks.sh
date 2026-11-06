@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e-requires: ["docker","kvm","tun"]
-# Live disk semantics and default discard on all four writable ext4 mount paths.
+# Live disk semantics and default/auto/manual discard on all four ext4 mount paths.
 set -euo pipefail
 
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
@@ -14,7 +14,7 @@ source "$SANDBOXER_LIB/tarstream.sh"
 
 require_root
 require_kvm
-for command in docker ip mkfs.ext4 tar timeout truncate; do
+for command in docker ip mkfs.ext4 tar timeout truncate tune2fs; do
     require_command "$command"
 done
 for binary in sandbox-ctl flatten-ctl cloud-hypervisor; do
@@ -24,6 +24,7 @@ for file in sandbox-init sandbox-runtime.bundle vmlinux; do
     [ -f "$BIN/$file" ] || e2e_fail "missing prepared product: $file"
 done
 [ -r "$SANDBOXER_LIB/tarstream.sh" ] || e2e_fail "missing prepared tarstream helpers"
+[ -r "$SANDBOXER_LIB/trim_probe.py" ] || e2e_fail "missing prepared trim probe"
 docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || e2e_fail "prepared E2E_IMAGE is not loaded: $E2E_IMAGE"
 
 mkdir -p "$WORK" "$OUT" "$WORK/runtime" "$WORK/base"
@@ -54,6 +55,8 @@ truncate -s 512M "$WORK/root-up.ext4.template"
 mkfs.ext4 -q -F -O ^has_journal "$WORK/root-up.ext4.template"
 truncate -s 256M "$WORK/scratch.ext4"
 mkfs.ext4 -q -F -O ^has_journal "$WORK/scratch.ext4"
+# Manual must override an image's default, not merely omit the mount option.
+tune2fs -o discard "$WORK/scratch.ext4"
 mkdir -p "$WORK/dataset-source"
 printf 'DATASET-OK\n' >"$WORK/dataset-source/DATASET-OK"
 "$BIN/flatten-ctl" export --no-progress \
@@ -63,25 +66,6 @@ truncate -s 256M "$WORK/dataset-up.ext4"
 mkfs.ext4 -q -F -O ^has_journal "$WORK/dataset-up.ext4"
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 DATASET_REF="$(plaintext_tarstream_ref "$WORK/dataset.img")"
-
-cat >"$WORK/sandbox.yaml" <<EOF
-resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
-network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-disks }
-boot:
-  kernel: file://$BIN/vmlinux
-  runtime: file://$BIN/sandbox-runtime.bundle
-  cmdline: "console=hvc0 printk.time=1"
-  root:
-    base: $ROOT_REF
-    overlay: { diff: file://$WORK/root-up.ext4, diff_template: file://$WORK/root-up.ext4.template }
-  disks:
-    - { name: scratch, diff_template: file://$WORK/scratch.ext4 }
-    - { name: dataset, base: $DATASET_REF, overlay: { diff_template: file://$WORK/dataset-up.ext4 } }
-mounts:
-  - { target: /scratch, type: disk, source: scratch }
-  - { target: /data, type: disk, source: dataset }
-launch: { exec: /bin/sleep, args: ["3600"], restart: never }
-EOF
 
 start_vm() {
     local config=$1
@@ -106,8 +90,14 @@ start_vm() {
     e2e_fail "$SID did not become executable"
 }
 
+stop_vm() {
+    kill -TERM "$RUNPID"
+    wait "$RUNPID" || true
+    RUNPID=""
+}
+
 check_discard_mounts() {
-    local topology=$1 evidence="$OUT/$1-discard.log"
+    local topology=$1 policy=$2 evidence="$OUT/$1-$2-discard.log"
     if ! timeout -k 2s 30 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c '
         set -eu
         cat /proc/mounts
@@ -122,13 +112,19 @@ check_discard_mounts() {
             targets=/
             grep -q " / ext4 " /proc/mounts
         fi
+        expected_option=discard
+        forbidden_option=nodiscard
+        if [ "$2" = manual ]; then
+            expected_option=nodiscard
+            forbidden_option=discard
+        fi
         for device in $devices; do
             options="/proc/fs/ext4/$device/options"
-            echo "Checking default discard on $device"
+            echo "Checking $2 policy ($expected_option) on $device"
             cat "$options"
-            grep -qx discard "$options"
-            if grep -qx nodiscard "$options"; then
-                echo "Unexpected nodiscard on $device" >&2
+            grep -qx "$expected_option" "$options"
+            if grep -qx "$forbidden_option" "$options"; then
+                echo "Unexpected $forbidden_option on $device" >&2
                 exit 1
             fi
             test "$(cat /sys/block/$device/queue/discard_max_bytes)" -gt 0
@@ -150,36 +146,12 @@ check_discard_mounts() {
             grep -qx S-OK /scratch/persist
             grep -qx D-OK /data/persist
         fi
-    ' discard-check "$topology" >"$evidence" 2>&1; then
+    ' discard-check "$topology" "$policy" >"$evidence" 2>&1; then
         cat "$evidence" >&2
         tail -60 "$LOG" >&2 || true
-        e2e_fail "$topology default discard or file I/O check failed"
+        e2e_fail "$topology $policy discard or file I/O check failed"
     fi
 }
-
-SID="disks-$BASHPID"
-LOG="$OUT/disks.log"
-start_vm "$WORK/sandbox.yaml"
-
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- \
-    /bin/sh -c 'ls -1 /dev/vd*' >"$WORK/devices.out"
-for device in vda vdb vdc vdd vde; do
-    grep -qx "/dev/$device" "$WORK/devices.out" || e2e_fail "missing /dev/$device"
-done
-
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c '
-    set -e
-    grep -qx DATASET-OK /data/DATASET-OK
-    echo S-OK > /scratch/persist
-    grep -qx S-OK /scratch/persist
-    echo D-OK > /data/persist
-    grep -qx D-OK /data/persist
-'
-check_discard_mounts multi
-
-kill -TERM "$RUNPID"
-wait "$RUNPID" || true
-RUNPID=""
 
 # A populated single ext4 root exercises the remaining sandbox-init mount path.
 # Export only the prepared image; remove only the container created here.
@@ -190,8 +162,59 @@ docker rm "$ROOT_CONTAINER" >/dev/null
 ROOT_CONTAINER=""
 truncate -s 1G "$WORK/single-root.ext4"
 mkfs.ext4 -q -F -O ^has_journal -b 4096 -d "$WORK/single-rootfs" "$WORK/single-root.ext4"
-cat >"$WORK/single-root.yaml" <<EOF
-resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
+
+for policy in default auto manual; do
+    policy_yaml=""
+    [ "$policy" = default ] || policy_yaml=", diff_cow: { discard: $policy }"
+    cat >"$WORK/multi-$policy.yaml" <<EOF
+resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB }$policy_yaml }
+network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-disks }
+boot:
+  kernel: file://$BIN/vmlinux
+  runtime: file://$BIN/sandbox-runtime.bundle
+  cmdline: "console=hvc0 printk.time=1"
+  root:
+    base: $ROOT_REF
+    overlay: { diff: file://$WORK/root-up-$policy.ext4, diff_template: file://$WORK/root-up.ext4.template }
+  disks:
+    - { name: scratch, diff_template: file://$WORK/scratch.ext4 }
+    - { name: dataset, base: $DATASET_REF, overlay: { diff_template: file://$WORK/dataset-up.ext4 } }
+mounts:
+  - { target: /scratch, type: disk, source: scratch }
+  - { target: /data, type: disk, source: dataset }
+launch: { exec: /bin/sleep, args: ["3600"], restart: never }
+EOF
+    SID="disks-$policy-$BASHPID"
+    LOG="$OUT/multi-$policy.log"
+    start_vm "$WORK/multi-$policy.yaml"
+
+    "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- \
+        /bin/sh -c 'ls -1 /dev/vd*' >"$WORK/devices-$policy.out"
+    for device in vda vdb vdc vdd vde; do
+        grep -qx "/dev/$device" "$WORK/devices-$policy.out" || e2e_fail "missing /dev/$device"
+    done
+    "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c '
+        set -e
+        grep -qx DATASET-OK /data/DATASET-OK
+        echo S-OK > /scratch/persist
+        grep -qx S-OK /scratch/persist
+        echo D-OK > /data/persist
+        grep -qx D-OK /data/persist
+    '
+    check_discard_mounts multi "$policy"
+    if [ "$policy" = manual ]; then
+        for probe in seed manual-trim; do
+            if ! timeout -k 2s 60 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- \
+                python3 -c "$(cat "$SANDBOXER_LIB/trim_probe.py")" "$probe" >"$OUT/manual-$probe.log" 2>&1; then
+                cat "$OUT/manual-$probe.log" >&2
+                e2e_fail "manual discard $probe failed"
+            fi
+        done
+    fi
+    stop_vm
+
+    cat >"$WORK/single-$policy.yaml" <<EOF
+resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB }$policy_yaml }
 boot:
   kernel: file://$BIN/vmlinux
   runtime: file://$BIN/sandbox-runtime.bundle
@@ -199,13 +222,11 @@ boot:
   root: { diff_template: file://$WORK/single-root.ext4 }
 launch: { exec: /bin/sleep, args: ["3600"], restart: never }
 EOF
-SID="disks-single-$BASHPID"
-LOG="$OUT/disks-single.log"
-start_vm "$WORK/single-root.yaml" --enable-checkpoint
-check_discard_mounts single
-
-kill -TERM "$RUNPID"
-wait "$RUNPID" || true
-RUNPID=""
+    SID="disks-single-$policy-$BASHPID"
+    LOG="$OUT/single-$policy.log"
+    start_vm "$WORK/single-$policy.yaml" --enable-checkpoint
+    check_discard_mounts single "$policy"
+    stop_vm
+done
 
 echo "PASS sandbox.disks.sh"

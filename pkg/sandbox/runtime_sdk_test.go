@@ -167,12 +167,15 @@ func TestSDKChild(t *testing.T) {
 	if err != nil {
 		os.Exit(21)
 	}
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: os.Getenv("SDK_TEST_OLD_GUEST") != "1"}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: os.Getenv("SDK_TEST_OLD_GUEST") != "1", Ext4DiscardV1: os.Getenv("SDK_TEST_EXT4_DISCARD_V1") == "1"}); err != nil {
 		os.Exit(22)
 	}
 	msg, err := proto.ReadMessage(conn)
 	if err != nil || msg.Type != proto.TypeLaunch {
 		os.Exit(23)
+	}
+	if expected := os.Getenv("SDK_TEST_EXPECT_DISCARD"); expected != "" && msg.Launch.Ext4Discard != expected {
+		os.Exit(32)
 	}
 	initial.Store(&proto.InitialLaunchState{Token: msg.Launch.InitialLaunchToken, State: proto.InitialLaunchPending})
 	if os.Getenv("SDK_TEST_REJECT") == "1" {
@@ -296,6 +299,52 @@ func TestSDKBaseLaunchCloseAndRetainedWait(t *testing.T) {
 	}
 	if _, err := os.Stat(strings.TrimPrefix(launch.Root.DiffTemplate, "file://")); err != nil {
 		t.Fatalf("caller template removed: %v", err)
+	}
+}
+
+func TestSDKExt4DiscardPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, expected string
+		supported            bool
+	}{
+		{"omitted-old-guest", "", proto.DiscardAuto, false},
+		{"auto-old-guest", proto.DiscardAuto, proto.DiscardAuto, false},
+		{"manual-new-guest", proto.DiscardManual, proto.DiscardManual, true},
+		{"manual-old-guest", proto.DiscardManual, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SDK_TEST_EXPECT_DISCARD", tc.expected)
+			if tc.supported {
+				t.Setenv("SDK_TEST_EXT4_DISCARD_V1", "1")
+			} else {
+				t.Setenv("SDK_TEST_EXT4_DISCARD_V1", "0")
+			}
+			shape, launch := sdkFixture(t)
+			shape.Resources.DiffCOW.Discard = tc.mode
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			r, err := StartRuntime(ctx, shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			err = r.Launch(ctx, launch)
+			if tc.mode == proto.DiscardManual && !tc.supported {
+				if err == nil || !strings.Contains(err.Error(), "ext4_discard_v1") {
+					t.Fatalf("manual old guest: %v", err)
+				}
+				if r.State() != "runtime_ready" || r.initialLaunchToken != "" || len(r.disks) != 0 || r.cache != nil {
+					t.Fatal("incompatible policy consumed or prepared workload")
+				}
+				if _, err := r.deviceSet.DeviceBackends()[0].ReadAt(make([]byte, 512), 0); !errors.Is(err, vhost.ErrBackendUnbound) {
+					t.Fatalf("incompatible policy bound workload storage: %v", err)
+				}
+				return
+			}
+			if err != nil || r.State() != "running" {
+				t.Fatalf("launch %s: %v, state=%s", tc.mode, err, r.State())
+			}
+		})
 	}
 }
 

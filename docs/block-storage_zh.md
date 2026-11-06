@@ -338,8 +338,10 @@ Checkpoint 在普通 allocator record 中原子保存 root 和独立完整 P 副
 
 ## Discard 与回收
 
-受管可写 ext4 默认以 `discard` 挂载，使文件系统释放块时自动通知后端；[挂载范围与生效
-边界](guest-abi_zh.md#guest-block-discard)由 Guest ABI 定义。这会减少过期的活动 payload
+受管可写 ext4 默认使用 `resources.diff_cow.discard=auto`，使文件系统释放块时自动通知
+后端。选择 `manual` 则使用 `nodiscard`，仍保留显式 trim 和既有后端 DISCARD 语义；
+参见[配置策略](configuration_zh.md#diff-cow-policy)及[挂载范围与生效边界](guest-abi_zh.md#guest-block-discard)。
+自动 discard 会减少过期的活动 payload
 及后续磁盘导出的 payload，但不会缩小不可变 parent 或已有快照，不会因 overlayfs 创建
 whiteout 而回收 EROFS lower，也不会自动 trim 启用选项前已经空闲的全部空间。文件删除、
 Zero 提交与宿主空间回收是不同边界。应分别测量实际分配块和 DIFF 文件逻辑长度，后者

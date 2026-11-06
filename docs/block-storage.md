@@ -441,9 +441,12 @@ pending until that copy is exhausted. It needs no payload decryption key.
 
 ## Discard and reclamation
 
-Managed writable ext4 mounts enable `discard` by default, so filesystem block
-release can notify the backend automatically; see the [mount scope and rollout
-boundary](guest-abi.md#guest-block-discard). This reduces obsolete active payload
+Managed writable ext4 mounts use `resources.diff_cow.discard=auto` by default,
+so filesystem block release can notify the backend automatically. Selecting
+`manual` uses `nodiscard` while retaining explicit trim and the same backend
+DISCARD semantics; see the [configuration policy](configuration.md#diff-cow-policy)
+and [mount scope and rollout boundary](guest-abi.md#guest-block-discard).
+Automatic discard reduces obsolete active payload
 and payload in subsequent disk exports. It does not shrink immutable parents or
 existing snapshots, reclaim an EROFS lower when overlayfs creates a whiteout, or
 automatically trim all space that was already free before enabling the option.

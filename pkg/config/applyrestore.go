@@ -78,7 +78,7 @@ func ApplyRestoreRules(artifact *PortableSandboxConfig, host *SandboxConfig, pre
 
 func rejectRestoreColdOnly(host *SandboxConfig, presence FieldPresence) error {
 	for _, field := range []string{
-		"boot.cmdline", "launch", "mounts", "files", "ephemeral_files", "init", "metadata",
+		"boot.cmdline", "resources.diff_cow.discard", "launch", "mounts", "files", "ephemeral_files", "init", "metadata",
 	} {
 		if presence.Any(field) {
 			return fmt.Errorf("run --restore: %s is cold-start-only and cannot be applied to restored execution state", field)
@@ -88,6 +88,9 @@ func rejectRestoreColdOnly(host *SandboxConfig, presence FieldPresence) error {
 	// values while tolerating ApplyDefaults' inert launch defaults.
 	if host.Boot.Cmdline != "" {
 		return errors.New("run --restore: boot.cmdline is cold-start-only")
+	}
+	if host.Resources.DiffCOW.Discard != "" {
+		return errors.New("run --restore: resources.diff_cow.discard is cold-start-only; restored filesystems retain their captured mount options")
 	}
 	if host.Launch.Exec != "" || len(host.Launch.Args) != 0 || len(host.Launch.Env) != 0 ||
 		len(host.Launch.EphemeralEnv) != 0 || host.Launch.Placeholder || len(host.Launch.Plugin) != 0 ||

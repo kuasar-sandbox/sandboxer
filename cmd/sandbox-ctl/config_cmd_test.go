@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func TestConfigDefaultPreservesColdOverlayBase(t *testing.T) {
@@ -13,6 +15,7 @@ func TestConfigDefaultPreservesColdOverlayBase(t *testing.T) {
   capacity: { cpu: 2, memory: 2GiB }
   allocatable: { cpu: 2, memory: 1GiB }
   startup: { memory: 2GiB }
+  diff_cow: { discard: manual }
 boot:
   kernel: file:///opt/vmlinux
   runtime: file:///opt/runtime.bundle
@@ -38,6 +41,7 @@ metadata: { owner: test }
 	for _, kept := range []string{
 		"cmdline: quiet", "base: file:///opt/root-upper.ext4", "startup:",
 		"launch:", "files:", "metadata:",
+		"discard: manual",
 	} {
 		if !strings.Contains(stdout, kept) {
 			t.Errorf("config default omitted %q; output:\n%s", kept, stdout)
@@ -47,7 +51,7 @@ metadata: { owner: test }
 
 func TestRestoreFilter(t *testing.T) {
 	in := `resources:
-  diff_cow: { cache_size: 8MiB, max_dirty_size: 4MiB }
+  diff_cow: { cache_size: 8MiB, max_dirty_size: 4MiB, discard: manual }
   capacity: { cpu: 2, memory: 8GiB }
   startup: { memory: 1GiB }
 network: { tap: tap0 }
@@ -78,7 +82,7 @@ restore:
 		t.Fatal(err)
 	}
 	got := string(out)
-	for _, dropped := range []string{"launch:", "mounts:", "files:", "ephemeral_files:", "init:", "metadata:", "cmdline:", "base:", "/snap.ext4"} {
+	for _, dropped := range []string{"launch:", "mounts:", "files:", "ephemeral_files:", "init:", "metadata:", "cmdline:", "base:", "/snap.ext4", "discard:"} {
 		if strings.Contains(got, dropped) {
 			t.Errorf("restore filter should have dropped %q; output:\n%s", dropped, got)
 		}
@@ -87,6 +91,30 @@ restore:
 		if !strings.Contains(got, kept) {
 			t.Errorf("restore filter should have kept %q; output:\n%s", kept, got)
 		}
+	}
+}
+
+func TestConfigRestoreProjectionDropsDiscardAndKeepsCache(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sandbox.yaml")
+	body := strings.Replace(skeletonCold, "discard: auto", "discard: manual", 1)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rc, stdout, stderr := captureInfoOutput(t, func() int {
+		return configCmd([]string{"--config", path, "--mode", "restore", "--check", "strict"})
+	})
+	if rc != 0 || stderr != "" {
+		t.Fatalf("config restore rc=%d stderr=%q", rc, stderr)
+	}
+	cfg, presence, err := config.LoadConfigBytesWithPresence([]byte(stdout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Resources.DiffCOW.Discard != "" || presence.Has("resources.diff_cow.discard") || cfg.Resources.DiffCOW.CacheSize != "32MiB" || cfg.Resources.DiffCOW.MaxDirtySize != "16MiB" {
+		t.Fatalf("restore projection changed cache or retained discard: %+v", cfg.Resources.DiffCOW)
+	}
+	if err := cfg.ValidateRestoreHostConfigWithPresence(presence); err != nil {
+		t.Fatalf("projected config cannot restore: %v", err)
 	}
 }
 

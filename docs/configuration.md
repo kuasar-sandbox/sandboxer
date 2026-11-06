@@ -29,7 +29,7 @@ resources:
   overhead: { memory: 128MiB }
   watermark_high: { ratio: 0.875 }
   startup: { memory: 512MiB }
-  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB }
+  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB, discard: auto }
 
 network:
   # Host provider and current identity:
@@ -102,7 +102,7 @@ sandbox-ctl config --config host.yaml:instance.yaml --check strict
 sandbox-ctl config --config restore.yaml --mode restore --check strict
 ```
 
-The template identifies portable, host-only, and ephemeral fields. Restore mode emits a host-only document, removing cold-only workload fields and immutable disk refs. It does not introduce a second restore schema.
+The template identifies portable, host-only, and ephemeral fields. Restore mode emits a host-only document, removing cold-only workload fields, `resources.diff_cow.discard` and immutable disk refs while retaining the cache budgets. It does not introduce a second restore schema.
 
 <a id="loading-and-overrides"></a>
 
@@ -131,8 +131,9 @@ artifact's disk graph.
 | Cold `run --from E` | E supplies portable defaults and a protected disk topology | [Presence-aware from rules](#from-rules); `--replace-boot` replaces the complete boot object explicitly |
 | `run --restore S` | S supplies execution state; its E supplies immutable workload and disk graph | Current host policy and bindings; no launch, init, files or mounts replay |
 
-Restore rejects explicitly supplied `boot.cmdline`, launch (including ephemeral
-environment and plugins), mounts, files/ephemeral_files, init and metadata.
+Restore rejects explicitly supplied `boot.cmdline`, `resources.diff_cow.discard`,
+launch (including ephemeral environment and plugins), mounts,
+files/ephemeral_files, init and metadata.
 Current host network identity/provider, resource execution, kernel/runtime local
 paths, active writable bindings, prefetch, usage and timeout policy may be supplied
 subject to the captured topology and identity checks. Startup policy may be
@@ -172,6 +173,7 @@ objects stay absent unless a consumer resolves a documented default.
 | `resources.startup.memory` | Size; capacity memory | Positive, at most capacity; independent of allocatable headroom |
 | `resources.diff_cow.cache_size` | Size; `32MiB` | Sandbox-wide cache, positive 4 KiB multiple |
 | `resources.diff_cow.max_dirty_size` | Size; derived from final cache | Positive 4 KiB multiple no larger than total; [derivation and overlays](#diff-cow-policy) |
+| `resources.diff_cow.discard` | `auto` or `manual`; `auto` | Cold-start policy for all managed writable ext4 mounts; explicit input is rejected on memory restore; [policy](#diff-cow-policy) |
 
 `CgroupFD` is an inherited Go/runtime capability, not a YAML field. The equations,
 reservation protocol and failure behavior are defined in [resources](resources.md).
@@ -323,7 +325,7 @@ Runtime semantics:
 - Plugins/apps restart with cold semantics.
 - `run --restore` does not rerun launch/files/init/plugin.
 
-If the restore host explicitly supplies `boot.cmdline`, persistent/ephemeral launch fields, mounts, files/ephemeral_files, init, or metadata, validation rejects them before side effects instead of silently ignoring them. `resources.startup` is host-only node policy and may be supplied on restore. It is included in the node reservation contract, but the Snapshot's captured `BudgetAtSnapshot` remains authoritative for the initial restore Budget.
+If the restore host explicitly supplies `boot.cmdline`, `resources.diff_cow.discard`, persistent/ephemeral launch fields, mounts, files/ephemeral_files, init, or metadata, validation rejects them before side effects instead of silently ignoring them. `resources.startup` is host-only node policy and may be supplied on restore. It is included in the node reservation contract, but the Snapshot's captured `BudgetAtSnapshot` remains authoritative for the initial restore Budget.
 
 <a id="usage-policy"></a>
 
@@ -358,16 +360,40 @@ not schedule reads.
 
 <a id="diff-cow-policy"></a>
 
-## `resources.diff_cow` and cache ownership
+## `resources.diff_cow`: cache ownership and mount policy
 
 ```yaml
 resources:
   diff_cow:
     cache_size: 32MiB
     max_dirty_size: 16MiB
+    discard: auto
 ```
 
-Both fields are positive multiples of 4 KiB, with
+`discard` accepts `auto` or `manual`; omission resolves to `auto` after the host
+overlays are merged. Ordinary cold start and `run --from` use the current host
+policy for all managed writable ext4 mounts:
+
+| Policy | Mount option | Effect |
+| --- | --- | --- |
+| `auto` (default) | `discard` | Filesystem block release can automatically notify the backend, reducing obsolete active payload and subsequent disk exports. |
+| `manual` | `nodiscard` | Automatic discard on filesystem block release is disabled; explicit Guest trim remains available. Reclamation and export savings depend on when trim is requested. |
+
+The policy does not disable virtio-blk DISCARD or change backend zero/read
+semantics. `manual` requires a Guest runtime advertising support; see the
+[mount scope and compatibility contract](guest-abi.md#guest-block-discard).
+The field is excluded from artifacts' Portable configuration. A cold boot from an
+exported Sandbox E therefore uses the destination host's selection. Snapshot S
+still captures Guest mount state. Memory restore retains
+the captured mounts and does not remount: explicitly supplying either `auto` or
+`manual` to `run --restore` is rejected; omit the field. `config --mode restore`
+removes this leaf while preserving `cache_size` and `max_dirty_size`.
+
+Go SDK callers select the policy through `RuntimeSpec.Resources.DiffCOW.Discard`
+before `StartRuntime`; the runtime uses that selection when the workload is
+launched, including after a live `runtime_ready` prewarm.
+
+The two cache budget fields are positive multiples of 4 KiB, with
 `0 < max_dirty_size <= cache_size`. An omitted `cache_size` defaults to 32 MiB.
 An omitted `max_dirty_size` is derived from the final effective cache size: half
 the cache, rounded down to a 4 KiB multiple, with a minimum of 4 KiB
@@ -383,7 +409,7 @@ configuration. Explicit dirty limits are never clamped or recomputed, and the
 final pair must satisfy the relationship above (so a dirty-only 64 MiB config
 fails against the default 32 MiB cache). These are finite engineering
 defaults, not a production SLA or a claim of optimal performance. There is no
-zero/unlimited value, disable switch, failed-data-I/O buffered retry or
+zero/unlimited cache value, cache disable switch, failed-data-I/O buffered retry or
 configurable alternate write mode.
 
 `max_dirty_size` is a subset of `cache_size`, never an additional pool or a
@@ -392,9 +418,9 @@ pages. Adding a disk does not multiply either limit. These host process resource
 are independent of guest capacity, allocatable/startup headroom and VMM overhead:
 `sandbox-ctl` is outside the VMM cgroup. No resource-controller changes are needed.
 
-Cold start, `run --from`, and restore resolve host resources for this instance.
-Runtime configuration retains the policy for that sandbox's lifecycle; a new
-restored instance uses its current host configuration. Portable C0/E/S never
+Cold start, `run --from`, and restore resolve cache budgets for this instance.
+Runtime configuration retains those budgets for that sandbox's lifecycle; a new
+restored instance uses its current host cache configuration. Portable C0/E/S never
 contains cache policy, pages, queues or LRU state. Strict restore validation,
 config merging and host projection preserve this boundary.
 

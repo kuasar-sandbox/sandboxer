@@ -103,6 +103,7 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
   "workdir": "/",
   "restart": "never",                    // never|on-failure|always(in-place 重启 + 退避)
   "cgroup_control": false,                // 默认 false:进程见 /;true:空根下放 controller,进程见 /init
+  "ext4_discard": "auto",                // auto（或省略）：discard；manual：nodiscard
   "placeholder": false,                  // true → 不 exec 外部程序,占位锚点等待停机;exec 互斥;host 强制 restart=always
   "share_pid": false,                    // true → 应用进 sandbox-init 的 PID ns(pid_namespace=shared)
   "user":    "0:0",                      // uid:gid 或 name:group(guest 侧 /etc/passwd 解析);空 → root
@@ -126,6 +127,8 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
 
 `mounts` / `files` / `init` 的应用见 [阶段 2:spec 应用 + stdio 接线 + 应用拉起](#apply-and-launch);`mounts[].type==empty` 的卷在 switch-root
 前以 raw ext4 source 建立([阶段 1：基础 Runtime、等待 launch、工作负载 root 与 switch-root](#base-and-root))。Disk MountSpec 另携带解析后的 disk_index/disk_overlay/disk_devs（[阶段 1：基础 Runtime、等待 launch、工作负载 root 与 switch-root](#base-and-root)）。
+`ext4_discard` 由 Host `resources.diff_cow.discard` 解析，不属于 YAML `launch` 对象；
+其[能力与挂载契约](#guest-block-discard)在 root 和数据盘组装之前生效。
 FileSpec 还支持 read_only，省略时 bind 可写。Tmpfs 注入避免直接写盘，但进程可复制到磁盘、内容也可进入 memory snapshot，
 参见 sandbox 生命周期的 persistent/ephemeral 暴露边界。Wire NetworkSpec 使用 **ip_cidr**，不是 host YAML 的 ip。
 `start_timeout` 不在 LaunchSpec——它只约束 host 侧
@@ -230,7 +233,7 @@ B. connect(CID=2:5000)，发送 hello{phase:"runtime_ready"}，等待 launch
 C. 仅在收到 launch、host 已发布全部 block backend 后:
    1. 等待 /dev/vda 和 /dev/vdb：轮询 stat，10 s 超时。
    2. mount -t erofs -o ro /dev/vda /overlay/lower
-      mount -t ext4 -o discard /dev/vdb /overlay/upper
+      mount -t ext4 -o discard /dev/vdb /overlay/upper  # auto；manual 使用 nodiscard
    3. 不存在时创建 /overlay/upper/{upperdir,workdir}。
    4. mount -t overlay overlay -o lowerdir=/overlay/lower,
         upperdir=/overlay/upper/upperdir,workdir=/overlay/upper/workdir /sysroot
@@ -316,9 +319,9 @@ payload 与 runtime 同生命周期，不能独立热补丁；若需独立版本
 
 **单磁盘模式**(`boot.root.overlay` 省略时)。host 不建 blk1、只发一个可写 `--disk`(blk0=
 root 盘的 ext4 CoW),并在 cmdline 加 `sandbox.root.layout=single`。phase1a 读 `/proc/cmdline`
-(/proc 已在最前挂好)判定模式——因组盘与 launch 握手并发、早于 launch spec 到达,模式只能走
-cmdline,不能走 spec。单盘路径:只 wait `/dev/vda`,`mount -t ext4 -o discard /dev/vda /sysroot` 直接挂为
-可写根(无 `/overlay/lower`、`/overlay/upper`、无 overlayfs、无 vdb),其余(`/opt/sandbox-runtime`
+（/proc 已在最前挂好），在基础初始化阶段记录布局。设备组装等待 launch spec 到达后再应用
+其中的 ext4 discard 策略。单盘路径只 wait `/dev/vda`，使用所选选项（默认 `discard`）将 ext4
+直接挂到 `/sysroot` 作为可写根(无 `/overlay/lower`、`/overlay/upper`、无 overlayfs、无 vdb),其余(`/opt/sandbox-runtime`
 bind、switch-root、phase1b 基础挂载)不变。`empty` 卷的 source 改落在写根自身的
 `/sysroot/.sandbox-volumes/<i>`(无独立 ext4 upper),仍 bind 遮蔽 target、随 switch-root 子树搬运。
 单盘根盘恒为可写 ext4,无 erofs 镜像 ⇒ 无内嵌 config.json ⇒ launch.exec 必填(host 侧 validate 强制;
@@ -339,6 +342,8 @@ name 不过线。盘的设备位由它在 boot.disks[] 的下标决定,与 mount
 到 `/sysroot<target>` → switch-root 的 MS_MOVE 携带」)。组装挂点 **预先 bake 进 runtime erofs**
 (`/sysdisks/disk-{0..7}{,-lower,-upper}`,24 个空目录;数量须与 `config.MaxDataDisks` 一致),
 缺失即 die(erofs 版本不符,重建或减盘):
+
+以下挂载示例采用默认 `auto` 策略；`manual` 将可写 ext4 的 `discard` 替换为 `nodiscard`。
 
 ```
 单盘数据盘 N:  mount ext4 -o discard /dev/vdX → /sysdisks/disk-N
@@ -365,17 +370,31 @@ Usage 在上述受控 root/data 组装处保留每个可写盘的私有 CLOEXEC 
 
 #### Guest 块设备 DISCARD
 
-`sandbox-init` 在四条受管可写 ext4 挂载路径默认启用 `discard`：单盘根、overlay 根的
-upper、单盘数据盘及 overlay 数据盘的 upper。Empty/bind 卷继承底层文件系统行为；
-只读 EROFS 保持原挂载选项。文件系统释放块时即可通知 Host，应用无需改造，也不必
-在每次删除后单独执行 trim。删除会增加额外处理；文件系统释放、宿主回收和磁盘导出
-缩小不保证在 unlink 返回时完成。[存储契约](block-storage_zh.md#discard-and-reclamation)
-定义这些边界并保护保留历史。
+`LaunchSpec.ext4_discard` 为四条受管可写 ext4 路径选择挂载选项：单盘根、overlay 根的
+upper、单盘数据盘及 overlay 数据盘的 upper。省略或 `auto` 使用 `discard`，`manual`
+显式使用 `nodiscard`。Host 从
+[`resources.diff_cow.discard`](configuration_zh.md#diff-cow-policy) 解析该值。Empty/bind
+卷继承底层文件系统行为；只读 EROFS 保持原挂载选项。
 
-采用此默认值须使用包含新版 `sandbox-init` 的 runtime bundle，并在模板的
-`boot.runtime` 选择该 bundle 后冷启动。仅替换 Host 可执行文件不会更新内嵌 init。
-已有运行实例和内存恢复保持原挂载，restore 不会重新挂载。无需磁盘或快照格式迁移。
-启用选项也不会自动 trim 此前已经空闲的全部空间。
+新版 Guest runtime 声明 `hello.ext4_discard_v1=true`。Host 在发送 manual launch 之前
+要求具备该能力，避免旧 Guest 静默忽略关闭自动 discard 的请求。Auto 模式仍兼容旧
+Guest，并沿用对应 runtime 的默认挂载行为；新版 Guest 将省略的 wire 字段视为 auto。
+对仍存活的 `runtime_ready` 预热实例执行 Launch 时同样应用所选策略，因为工作负载盘
+尚未挂载。
+
+Auto 模式下，文件系统释放块时即可通知 Host，应用无需改造，也不必在每次删除后
+单独执行 trim。Manual 关闭这些自动请求，仍保留显式 trim 和 virtio-blk DISCARD；
+可回收的已删除数据可能保留到执行 trim。FITRIM 作用于底层 ext4，不能用 overlayfs
+视图替代已隐藏 upper 的 trim 目标。Auto 删除或 manual trim 都会增加额外处理；
+文件系统释放、宿主回收和磁盘导出缩小不保证在 unlink 返回时完成。
+[存储契约](block-storage_zh.md#discard-and-reclamation)定义这些边界并保护保留历史。
+
+使用 manual 须通过 `boot.runtime` 选择包含新版 `sandbox-init` 的 runtime bundle 后
+冷启动。仅替换 Host 可执行文件不会更新内嵌 init。普通冷启动和 `run --from` 应用本次
+Host 选择。已有运行实例和内存恢复保持原挂载；restore 不会重新挂载，并拒绝任何
+显式 `resources.diff_cow.discard` 输入。恢复时应省略该字段；Host projection
+`config --mode restore` 会删除它，同时保留缓存预算。无需磁盘或快照格式迁移。
+启用 auto 也不会自动 trim 此前已经空闲的全部空间。
 
 新建可写 virtio-blk 设备公布 `VIRTIO_BLK_F_DISCARD`，只读设备不公布。固定配置为
 `MaxDiscSeg=1`、`DiscSecAln=8`（4096 字节）、`MaxDiscSec=8192`（4 MiB）。
@@ -393,8 +412,11 @@ Close 等待该回写，但不等待全部 GC。首次发布后，活动导出�
 最多 64 页的同步移除。两条路径均不保证整个范围原子性或稳定存储持久性。普通写零
 仍分配 Data；Guest FLUSH 保持既有非持久化契约。
 
-新版 runtime 的冷启动验证须覆盖 root/data 两种拓扑，直接检查实际 ext4 挂载选项，
-不手动 remount。文件删除应到达 Guest DISCARD；`fstrim` 另行覆盖已空闲范围。
+新版 runtime 的冷启动验证须覆盖 root/data 两种拓扑，以及省略、显式 auto 和 manual
+策略。直接检查实际 ext4 挂载选项，不手动 remount，并验证所有模式都保留设备 DISCARD
+能力。Auto 模式的文件系统释放应到达 Guest DISCARD；manual 删除和同步之后，原始
+非零 extent 应保持原内容，直至显式 `fstrim` 后变为零。内存恢复省略策略时应保留捕获
+的 manual 挂载。
 保留非零 lower 内容，检查 discard 后、Checkpoint/导出及恢复后的零读取，并在 Drain
 或 Checkpoint 后确认相应 upper 范围没有活动 payload。在此边界之前，使用暂停回写
 的测试，同时验证 Zero 读取和稀疏导出的 Zero 分类。仅 trim 返回的字节数不足以证明
@@ -1028,6 +1050,7 @@ JSON 可读、调试友好，消息量少，无需 protobuf 工具链。
 {
   "type":     "<one of 管理操作集>",
   "phase":    "runtime_ready",         // cold hello：显式基础就绪屏障
+  "ext4_discard_v1": true,             // hello：支持可写 ext4 的 auto/manual 策略
   "launch":   { ... LaunchSpec ... },  // launch (含 stdio 节,见 launch 配置(LaunchSpec))
   "exec":     { "argv":[...], "env":{}, "cwd":"", "user":"", "stdio":{} },  // exec: ExecSpec(exec 会话(sandbox-ctl exec))
   "connect":  { "network":"tcp", "address":"127.0.0.1:49983", "accept":false },  // connect: ConnectSpec(connect 端口转发会话(sandbox-ctl run --connect); accept=true ⇒ guest Listen+Accept)

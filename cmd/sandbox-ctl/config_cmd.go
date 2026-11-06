@@ -16,7 +16,7 @@ import (
 //	--config a.yaml[:b.yaml...]   read + deep-merge front-to-back, re-emit
 //	  (or SANDBOX_CONFIG)          (later files override; nested maps merge)
 //	--template                    emit a commented skeleton instead
-//	--mode default|restore        restore drops fields a restore ignores
+//	--mode default|restore        restore drops cold-start-only fields
 //	--check skip|strict           strict = validate, error if invalid
 //	-o <file>                     write to file (default stdout)
 //
@@ -26,7 +26,7 @@ func configCmd(args []string) int {
 	fs := flag.NewFlagSet("config", flag.ContinueOnError)
 	configPath := fs.String("config", "", "input sandbox.yaml path(s), ':'-separated, merged front-to-back (overrides SANDBOX_CONFIG)")
 	template := fs.Bool("template", false, "emit a commented skeleton config instead of reading --config")
-	mode := fs.String("mode", "default", "default | restore (restore drops fields a snapshot-restore ignores)")
+	mode := fs.String("mode", "default", "default | restore (restore drops cold-start-only fields)")
 	check := fs.String("check", "skip", "skip (emit as-is) | strict (validate; error + non-zero exit if invalid)")
 	out := fs.String("o", "", "write output to this file instead of stdout")
 	if err := fs.Parse(args); err != nil {
@@ -144,7 +144,8 @@ func strictCheckBytes(b []byte, mode string) int {
 // restoreFilter turns a cold authoring config into host-only restore input.
 // Snapshot S points to Sandbox E, so workload state and every immutable disk
 // ref are removed instead of being silently ignored. Kernel/runtime paths,
-// active diff bindings, network provider/identity, and host policy remain.
+// active diff bindings, network provider/identity, and host process policy
+// remain. The cold-only ext4 discard mount policy is removed.
 func restoreFilter(in []byte) ([]byte, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(in, &doc); err != nil {
@@ -157,6 +158,7 @@ func restoreFilter(in []byte) ([]byte, error) {
 	for _, k := range []string{"launch", "mounts", "files", "ephemeral_files", "init", "metadata"} {
 		mapDelete(root, k)
 	}
+	mapDelete(mapGet(mapGet(root, "resources"), "diff_cow"), "discard")
 	stripImmutableDisk := func(disk *yaml.Node) {
 		if disk == nil {
 			return
@@ -211,7 +213,8 @@ const skeletonCold = `# sandbox.yaml — sandbox-ctl run --config <this>
 # Fill the placeholder paths/values. Schema reference: docs/configuration.md#sandbox-yaml.
 resources:
   # One sandbox-wide plaintext COW budget; dirty is a subset of total.
-  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB }
+  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB, discard: auto }
+  # discard: auto (default) mounts writable ext4 with discard; manual uses nodiscard.
   capacity:    { cpu: 2, memory: 8GiB }   # vCPU / memory the guest sees
   allocatable: { cpu: 2, memory: 8GiB }   # <= capacity (no cgroup ⇒ cpu == capacity.cpu)
 network:
@@ -267,7 +270,7 @@ launch:
 // skeletonRestore is the host-only restore template. Workload state and the
 // immutable disk graph come from Snapshot S -> Sandbox E and are not repeated.
 const skeletonRestore = `# restore host yaml — sandbox-ctl run --restore <ref> --config <this>
-# Cold-only fields (launch, mounts, files, init, plugin, metadata) are rejected.
+# Cold-only fields (launch, mounts, files, init, plugin, metadata, resources.diff_cow.discard) are rejected.
 restore:
   prefetch: off                            # off (default) | memory (current memory self)
 resources:

@@ -25,7 +25,7 @@ resources:
   overhead: { memory: 128MiB }
   watermark_high: { ratio: 0.875 }
   startup: { memory: 512MiB }
-  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB }
+  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB, discard: auto }
 
 network:
   # Host provider and current identity:
@@ -98,7 +98,7 @@ sandbox-ctl config --config host.yaml:instance.yaml --check strict
 sandbox-ctl config --config restore.yaml --mode restore --check strict
 ```
 
-Template 同时标明 portable、host-only 和 ephemeral 字段. Restore mode 输出 host-only 文档并删除 cold-only workload 与 immutable disk refs;它不会生成第二套 restore schema.
+Template 同时标明 portable、host-only 和 ephemeral 字段。Restore mode 输出 host-only 文档，删除 cold-only workload、`resources.diff_cow.discard` 与 immutable disk refs，同时保留缓存预算；它不会生成第二套 restore schema。
 
 <a id="loading-and-overrides"></a>
 
@@ -120,8 +120,8 @@ Template 同时标明 portable、host-only 和 ephemeral 字段. Restore mode �
 | 冷启动 `run --from E` | E 提供可移植默认值和受保护磁盘拓扑 | [基于存在性的 from 规则](#from-rules)；`--replace-boot` 显式替换完整 boot 对象 |
 | `run --restore S` | S 提供执行状态，引用的 E 提供不可变工作负载和磁盘图 | 当前 Host 策略/绑定；不重放 launch、init、files 或 mounts |
 
-Restore 拒绝显式提供 `boot.cmdline`、launch（包括 ephemeral environment 和 plugin）、mounts、
-files/ephemeral_files、init、metadata。可以提供当前 Host 网络身份/provider、资源执行、kernel/runtime
+Restore 拒绝显式提供 `boot.cmdline`、`resources.diff_cow.discard`、launch（包括 ephemeral
+environment 和 plugin）、mounts、files/ephemeral_files、init、metadata。可以提供当前 Host 网络身份/provider、资源执行、kernel/runtime
 本地路径、active writable binding、prefetch、usage 和 timeout 策略，但仍须满足捕获拓扑和身份检查。
 Startup 策略可记录，初始恢复预留仍由捕获的 `BudgetAtSnapshot` 决定。`config --mode restore` 生成
 Host projection，不创建第二套 portable schema。实现见 [`FieldPresence`](../pkg/config/presence.go)、[from 配置应用](../pkg/config/applyfrom.go)和[restore 配置应用](../pkg/config/applyrestore.go)，
@@ -156,6 +156,7 @@ Size 是 `512MiB` 等字节大小字符串；duration 是 `30s` 等 Go duration 
 | `resources.startup.memory` | Size；capacity memory | 正值、不超过 capacity；与 allocatable headroom 独立 |
 | `resources.diff_cow.cache_size` | Size；`32MiB` | 全 sandbox 共享 cache；正的 4 KiB 整数倍 |
 | `resources.diff_cow.max_dirty_size` | Size；从最终 cache 推导 | 正的 4 KiB 整数倍且不超过总额；见[推导和覆盖](#diff-cow-policy) |
+| `resources.diff_cow.discard` | `auto` 或 `manual`；`auto` | 所有受管可写 ext4 的冷启动挂载策略；内存恢复拒绝显式输入；见[策略说明](#diff-cow-policy) |
 
 `CgroupFD` 是继承的 Go/runtime capability，不是 YAML 字段。方程、预留协议和失败行为见[资源](resources_zh.md)。
 
@@ -301,7 +302,7 @@ Runtime semantics:
 - plugin/app 按 cold semantics 重新启动.
 - `run --restore` 不重跑 launch/files/init/plugin.
 
-Restore host若显式提供 `boot.cmdline`、launch persistent/ephemeral fields、mounts、files/ephemeral_files、init 或 metadata,会在副作用前拒绝,而不是静默忽略. `resources.startup` 是 host-only node policy,可在 restore 时提供;它写入 node reservation contract,但 Snapshot 捕获的 `BudgetAtSnapshot` 仍是 restore initial Budget 的权威值.
+Restore host若显式提供 `boot.cmdline`、`resources.diff_cow.discard`、launch persistent/ephemeral fields、mounts、files/ephemeral_files、init 或 metadata,会在副作用前拒绝,而不是静默忽略. `resources.startup` 是 host-only node policy,可在 restore 时提供;它写入 node reservation contract,但 Snapshot 捕获的 `BudgetAtSnapshot` 仍是 restore initial Budget 的权威值.
 
 <a id="usage-policy"></a>
 
@@ -331,16 +332,37 @@ Usage 在普通 cold、`run --from` 和 `run --restore` 中都是 host policy,
 
 <a id="diff-cow-policy"></a>
 
-## `resources.diff_cow` 与缓存所有权
+## `resources.diff_cow`：缓存所有权与挂载策略
 
 ```yaml
 resources:
   diff_cow:
     cache_size: 32MiB
     max_dirty_size: 16MiB
+    discard: auto
 ```
 
-两个字段都必须是正数且为 4 KiB 的整数倍，满足 `0 < max_dirty_size <= cache_size`。
+`discard` 只接受 `auto` 或 `manual`；合并 Host 覆盖后，省略时取 `auto`。普通冷启动和
+`run --from` 使用本次 Host 策略控制所有受管可写 ext4 挂载：
+
+| 策略 | 挂载选项 | 效果 |
+| --- | --- | --- |
+| `auto`（默认） | `discard` | 文件系统释放块时可自动通知后端，减少过期的活动 payload 及后续磁盘导出大小。 |
+| `manual` | `nodiscard` | 关闭文件系统释放块时的自动 discard，仍可在 Guest 中显式 trim；回收和导出收益取决于执行 trim 的时间。 |
+
+该策略不关闭 virtio-blk DISCARD，也不改变后端 Zero 与读取语义。`manual` 要求 Guest
+runtime 声明支持；参见[挂载范围与兼容性契约](guest-abi_zh.md#guest-block-discard)。
+该字段不写入制品的 Portable 配置，因此从导出的 Sandbox E 冷启动时采用目标 Host
+的选择。Snapshot S 仍捕获 Guest 挂载状态。内存恢复保留捕获时的挂载，不重新挂载：
+`run --restore` 显式提供 `auto` 或
+`manual` 均会被拒绝，应省略此字段。`config --mode restore` 删除此叶字段，保留
+`cache_size` 与 `max_dirty_size`。
+
+Go SDK 调用方应在 `StartRuntime` 之前通过 `RuntimeSpec.Resources.DiffCOW.Discard`
+选择策略；runtime 在工作负载 Launch 时使用该选择，包括对仍存活的 `runtime_ready`
+预热实例执行 Launch。
+
+两个缓存预算字段都必须是正数且为 4 KiB 的整数倍，满足 `0 < max_dirty_size <= cache_size`。
 省略 `cache_size` 时默认为 32 MiB。省略 `max_dirty_size` 时，根据最终生效的缓存大小推导：
 取缓存的一半，向下取整到 4 KiB 的整数倍，最小为 4 KiB
 （`max(4096, floor(cacheBytes / 2 / 4096) * 4096)`）。两个字段均省略时，包括没有
@@ -351,15 +373,15 @@ resources:
 省略的脏缓存上限在所有覆盖完成后推导；应用默认值或加载配置不会将推导值写入源配置。
 显式脏缓存上限不会被截断或重新计算，最终两个值必须满足上述大小关系（因此只设置
 64 MiB 脏缓存上限时，会因默认缓存仅为 32 MiB 而校验失败）。这些是有限的工程初值，
-不是生产 SLA 或最优性能声明。没有零值/无限制、
+不是生产 SLA 或最优性能声明。缓存没有零值/无限制、
 关闭开关、数据 I/O 失败后触发的 buffered 重试或可配置的其他写入模式。
 
 `max_dirty_size` 是 `cache_size` 的子集，不是额外池或预留分区。没有脏页时 clean 可以使用
 全部缓存。添加磁盘不会乘以预算。这些 host 进程资源独立于 guest capacity、allocatable/startup
 headroom 和 VMM overhead：`sandbox-ctl` 不在 VMM cgroup 中，无需改资源控制器。
 
-冷启动、`run --from` 与 restore 为当前实例解析 host resources。运行配置保留该沙箱生命周期的
-策略；新恢复实例使用本次 host 配置。Portable C0/E/S 不包含缓存策略、页、队列或 LRU 状态。
+冷启动、`run --from` 与 restore 为当前实例解析缓存预算。运行配置保留该沙箱生命周期的
+预算；新恢复实例使用本次 Host 缓存配置。Portable C0/E/S 不包含缓存策略、页、队列或 LRU 状态。
 严格 restore 校验、配置合并与 host projection 都保持此边界。
 
 Go 调用者可通过 `diffstore.WithCache` 向多个 `diffstore.OpenDisk` 传入同一 `diffstore.Cache`。先关闭 COW，

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e-requires: ["docker","kvm","tun","userfaultfd"]
-# Snapshot/restore captures root plus ordered writable data-disk state.
+# Snapshot/restore retains ordered disk state and captured manual-discard mounts.
 set -euo pipefail
 
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
@@ -65,7 +65,7 @@ truncate -s 256M "$WORK/dataset.ext4"
 mkfs.ext4 -q -F -O ^has_journal "$WORK/dataset.ext4"
 
 cat >"$WORK/cold.yaml" <<EOF
-resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
+resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB }, diff_cow: { discard: manual } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: snapshot-disks }
 boot:
   kernel: file://$BIN/vmlinux
@@ -95,6 +95,27 @@ wait_exec() {
     return 1
 }
 
+check_manual_discard() {
+    local phase=$1 evidence="$OUT/$1-mounts.log"
+    if ! timeout -k 2s 15 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c '
+        set -eu
+        for device in vdb vdc vde; do
+            options="/proc/fs/ext4/$device/options"
+            echo "Checking retained manual policy on $device"
+            cat "$options"
+            grep -qx nodiscard "$options"
+            if grep -qx discard "$options"; then
+                echo "Unexpected automatic discard on $device" >&2
+                exit 1
+            fi
+            test "$(cat /sys/block/$device/queue/discard_max_bytes)" -gt 0
+        done
+    ' >"$evidence" 2>&1; then
+        cat "$evidence" >&2
+        e2e_fail "$phase did not retain manual discard mounts"
+    fi
+}
+
 SID="snapshot-disks-$BASHPID"
 LOG1="$OUT/cold.log"
 timeout -k 10s 120 "$BIN/sandbox-ctl" run --config "$WORK/cold.yaml" --sandbox-id "$SID" \
@@ -105,6 +126,7 @@ wait_exec "$SID" "$PID1" || {
     tail -80 "$LOG1" >&2 || true
     e2e_fail "multi-disk source sandbox did not become executable"
 }
+check_manual_discard cold
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c \
     'set -e; grep -qx DATASET-OK /data/DATASET-OK; echo ROOT-S-OK > /root-s; echo SCRATCH-S-OK > /scratch/persist; echo DATA-S-OK > /data/persist; sync'
 
@@ -139,6 +161,7 @@ assert dataset_overlay and dataset_overlay.get('Base'), dataset
 PY
 
 # Restore creates active DIFFs from the captured filesystem and capacity.
+# Omit the cold-only discard field: memory restore retains the captured mounts.
 test ! -e "$WORK/root-restore.ext4"
 test ! -e "$WORK/dataset-restore.ext4"
 cat >"$WORK/restore.yaml" <<EOF
@@ -163,6 +186,7 @@ wait_exec "$SID" "$PID2" || {
     tail -80 "$LOG2" >&2 || true
     e2e_fail "multi-disk restore did not become executable"
 }
+check_manual_discard restored
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c \
     'set -e; grep -qx ROOT-S-OK /root-s; grep -qx SCRATCH-S-OK /scratch/persist; grep -qx DATA-S-OK /data/persist; grep -qx DATASET-OK /data/DATASET-OK'
 
