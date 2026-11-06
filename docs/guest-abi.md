@@ -120,6 +120,7 @@ This is an annotated JSON example; comments are explanatory, not literal JSON:
   "workdir": "/",
   "restart": "never",                    // never|on-failure|always; in-place restart with backoff
   "cgroup_control": false,               // false: processes see /; true: empty delegated root, /init
+  "ext4_discard": "auto",                // auto (or omitted): discard; manual: nodiscard
   "placeholder": false,                  // true: no external exec; host rejects explicit launch.exec,
                                         // ignores image command and forces restart=always
   "share_pid": false,                    // true: sandbox-init's PID namespace (pid_namespace=shared)
@@ -156,6 +157,9 @@ This is an annotated JSON example; comments are explanatory, not literal JSON:
 See [Phase 2: apply the spec, wire stdio and start the app](#apply-and-launch) for mounts/files/init application. Empty volumes are established from
 their raw ext4 source before switch-root ([Phase 1: base runtime, wait for launch, workload root and switch-root](#base-and-root)). Disk mount specs additionally
 carry resolved disk_index/disk_overlay/disk_devs ([Phase 1: base runtime, wait for launch, workload root and switch-root](#base-and-root)).
+`ext4_discard` is resolved from host `resources.diff_cow.discard`, not from the
+YAML `launch` object; its [capability and mount contract](#guest-block-discard)
+applies before root and data-disk assembly.
 FileSpec also supports read_only; omission leaves its bind writable.
 These tmpfs-backed files avoid direct writable-disk injection, but processes
 can copy them to disk and their memory may be captured; see the lifecycle
@@ -288,7 +292,7 @@ B. connect(CID=2:5000), send hello{phase:"runtime_ready"}, wait for launch
 C. Only after launch (and host publication of every block backend):
    1. Wait for /dev/vda and /dev/vdb: stat polling, 10 s timeout.
    2. mount -t erofs -o ro /dev/vda /overlay/lower
-      mount -t ext4 -o discard /dev/vdb /overlay/upper
+      mount -t ext4 -o discard /dev/vdb /overlay/upper  # auto; manual uses nodiscard
    3. Create /overlay/upper/{upperdir,workdir} if absent.
    4. mount -t overlay overlay -o lowerdir=/overlay/lower,
         upperdir=/overlay/upper/upperdir,workdir=/overlay/upper/workdir /sysroot
@@ -405,9 +409,10 @@ EROFS device ([Extension points](#extensions)).
 **Single-disk mode** omits `boot.root.overlay`. The host creates no blk1,
 passes one writable `--disk` for the root ext4 CoW device, and adds
 `sandbox.root.layout=single` to the kernel command line. Phase 1a reads
-`/proc/cmdline` after mounting proc. Since disk assembly runs before the launch
-spec arrives, the layout must come from cmdline, not the spec.
-This path waits only for `/dev/vda` and mounts it as ext4 with `discard` directly at
+`/proc/cmdline` after mounting proc to record the layout during base initialization.
+Device assembly waits for the launch spec and uses its ext4 discard policy.
+This path waits only for `/dev/vda` and mounts it as ext4 with the selected option
+(`discard` by default) directly at
 `/sysroot`: no lower/upper staging, overlayfs or vdb. Payload binding,
 switch-root and phase 1b's basic mounts remain the same. `empty` volume sources
 move to `/sysroot/.sandbox-volumes/<i>` on the writable root itself, then bind
@@ -438,6 +443,9 @@ volumes. Staging mountpoints are prebuilt into the runtime EROFS image:
 `/sysdisks/disk-{0..7}{,-lower,-upper}`, 24 empty directories whose count must
 match `config.MaxDataDisks`. Missing directories are fatal; rebuild the
 mismatched runtime image or reduce the disk count.
+
+The following mount examples use the default `auto` policy; `manual` replaces
+`discard` with `nodiscard` on the writable ext4 mounts.
 
 ```
 Single data disk N:
@@ -473,23 +481,40 @@ read retains its original handle/slot until it finishes ([Raw usage observations
 
 #### Guest block DISCARD
 
-`sandbox-init` enables `discard` on all four managed writable ext4 mount paths:
-the single root, the overlay root's upper, single data disks and overlay data
-disks' uppers. Empty/bind volumes inherit their underlying filesystem; read-only
-EROFS mounts retain their existing options. Filesystem release can therefore
-notify the host without an application change or a separate trim for each
-deletion. Deletion can incur additional work, and filesystem release, host
-reclamation and disk-export savings need not happen when unlink returns; the
-[storage contract](block-storage.md#discard-and-reclamation) defines those
+`LaunchSpec.ext4_discard` selects the mount option on all four managed writable
+ext4 paths: the single root, the overlay root's upper, single data disks and
+overlay data disks' uppers. Omission or `auto` selects `discard`; `manual` selects
+explicit `nodiscard`. The host derives this value from
+[`resources.diff_cow.discard`](configuration.md#diff-cow-policy). Empty/bind
+volumes inherit their underlying filesystem; read-only EROFS mounts retain
+their existing options.
+
+Updated Guest runtimes advertise `hello.ext4_discard_v1=true`. The host requires
+that capability before sending a manual-mode launch, so an older Guest cannot
+silently ignore an opt-out. Auto mode remains compatible with older Guests and
+retains their runtime's mount defaults; an updated Guest defaults an omitted
+wire field to auto. The selected policy also applies when Launch follows a live
+`runtime_ready` prewarm: workload disks have not been mounted yet.
+
+With auto, filesystem release can notify the host without an application change
+or a separate trim for each deletion. Manual disables those automatic requests
+while keeping explicit trim and virtio-blk DISCARD available; reclaimable deleted
+data can remain until trim is requested. Underlying ext4 filesystems perform
+FITRIM; an overlayfs view is not a substitute trim target for its hidden upper.
+Auto deletion or manual trim can incur additional work, and filesystem release,
+host reclamation and disk-export savings need not happen when unlink returns;
+the [storage contract](block-storage.md#discard-and-reclamation) defines those
 boundaries and protects retained history.
 
-Adopting this default requires a runtime bundle containing the updated
-`sandbox-init` and selection of that bundle through the template's `boot.runtime`
-for cold boot. Replacing the host executable alone does not update the embedded
-init. Existing running instances and memory restores retain their established
-mounts; restore does not remount them. No disk or snapshot format migration is
-required. Enabling the option does not automatically trim all previously free
-space.
+Selecting manual requires a runtime bundle containing the updated `sandbox-init`
+through `boot.runtime`, followed by cold boot. Replacing the host executable
+alone does not update the embedded init. Ordinary cold start and `run --from`
+apply the current host selection. Existing running instances and memory restores
+retain their established mounts; restore does not remount them and rejects any
+explicit `resources.diff_cow.discard` input. Omit that field on restore; the host
+projection `config --mode restore` removes it while retaining cache budgets.
+No disk or snapshot format migration is required. Enabling auto does not
+automatically trim all previously free space.
 
 New writable virtio-blk devices expose `VIRTIO_BLK_F_DISCARD`; read-only devices
 do not. The fixed configuration is `MaxDiscSeg=1`, `DiscSecAln=8` (4096 bytes),
@@ -514,9 +539,12 @@ Neither path promises whole-range atomicity or stable-storage durability.
 Ordinary writes of zero bytes still allocate Data. Guest FLUSH keeps the existing
 non-durable contract.
 
-Validate new runtime cold boots with both root/data topologies and inspect the
-actual ext4 mount options, without a manual remount. File deletion should reach
-Guest DISCARD; `fstrim` separately exercises already-free extents. Retain nonzero
+Validate new runtime cold boots with both root/data topologies for omitted,
+explicit auto and manual policy. Inspect actual ext4 mount options without a
+manual remount, and verify device DISCARD remains advertised in every mode.
+Auto filesystem release should reach Guest DISCARD; manual deletion must leave
+a synchronized nonzero raw extent intact until explicit `fstrim` zeros it.
+Memory restore with omitted policy must retain captured manual mounts. Retain nonzero
 lower bytes, check zero reads after discard, Checkpoint/export and restore, and
 verify after Drain or Checkpoint that the corresponding upper ranges have no
 active payload. Before that boundary, use a paused-writeback test to verify both
@@ -1283,6 +1311,7 @@ populates only fields relevant to its type. The complete types in
 {
   "type": "<one of Management operations>",
   "phase": "runtime_ready",            // cold hello: explicit base-ready barrier
+  "ext4_discard_v1": true,             // hello: supports auto/manual writable ext4 policy
   "launch": { ... LaunchSpec ... },    // launch, including stdio (Launch configuration (LaunchSpec))
   "exec": { "argv": [...], "env": {}, "cwd": "", "user": "", "stdio": {} },
   "connect": { "network": "tcp", "address": "127.0.0.1:49983", "accept": false },

@@ -80,6 +80,13 @@ var HostConnectLine = []byte(fmt.Sprintf("CONNECT %d\n", LaunchPort))
 
 // --- LaunchSpec ------------------------------------------------------
 
+// DiscardAuto and DiscardManual select automatic discard on managed writable
+// ext4 mounts. Manual retains block-device DISCARD support for explicit trim.
+const (
+	DiscardAuto   = "auto"
+	DiscardManual = "manual"
+)
+
 // LaunchSpec is the payload sandbox-ctl pushes to sandbox-init telling
 // it how to start the user application after rootfs is assembled.
 //
@@ -94,6 +101,11 @@ type LaunchSpec struct {
 	// InitialLaunchToken binds the one initial launch to its Guest facts. It is
 	// host operation identity, never portable artifact policy.
 	InitialLaunchToken string `json:"initial_launch_token,omitempty"`
+
+	// Ext4Discard is host cold-start policy for all managed writable ext4
+	// mounts: empty/auto mounts with discard; manual mounts with nodiscard.
+	// It does not change a memory-restored guest's existing mount state.
+	Ext4Discard string `json:"ext4_discard,omitempty"`
 
 	Exec    string            `json:"exec"`
 	Args    []string          `json:"args,omitempty"`
@@ -342,6 +354,8 @@ type Message struct {
 	// InitialLaunchStateV1 is advertised in hello before Launch apply.
 	InitialLaunchStateV1 bool                `json:"initial_launch_state_v1,omitempty"`
 	InitialLaunchState   *InitialLaunchState `json:"initial_launch_state,omitempty"`
+	// Ext4DiscardV1 advertises LaunchSpec.Ext4Discard support in hello.
+	Ext4DiscardV1 bool `json:"ext4_discard_v1,omitempty"`
 
 	Type          string         `json:"type"`
 	UsageRequest  *UsageRequest  `json:"usage_request,omitempty"`

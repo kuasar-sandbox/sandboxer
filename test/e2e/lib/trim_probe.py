@@ -49,10 +49,12 @@ def run():
         assert raw_page(position) == b'\x5c' * PAGE
     else:
         position = json.loads(POSITION.read_text())
-        if mode == 'trim':
+        if mode in ('trim', 'manual-trim'):
             assert raw_page(position) == b'\x5c' * PAGE, 'nonzero lower payload was not retained'
             PATH.unlink()
             os.sync()
+            if mode == 'manual-trim':
+                assert raw_page(position) == b'\x5c' * PAGE, 'manual mount discarded on unlink'
             subprocess.run(['fstrim', '-v', '/scratch'], check=True)
         else:
             assert mode == 'check'

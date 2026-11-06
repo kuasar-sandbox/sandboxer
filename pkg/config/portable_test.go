@@ -194,6 +194,7 @@ func TestProjectPortableColdExcludesHostAndEphemeralFields(t *testing.T) {
 			Allocatable: AllocatableConfig{CPU: 1, Memory: "512MiB"},
 			Control:     ControlConfig{CgroupPath: "/sys/fs/cgroup/task", Controller: "/run/controller.sock"},
 			Overhead:    &OverheadConfig{Memory: "64MiB"},
+			DiffCOW:     DiffCOWConfig{Discard: "manual"},
 		},
 		Network: NetworkConfig{TAP: "tap0", IP: "192.0.2.2/24", MAC: "02:00:00:00:00:01", Hostname: "instance", Interface: "eth0"},
 		Boot: BootConfig{
@@ -235,6 +236,7 @@ func TestProjectPortableColdExcludesHostAndEphemeralFields(t *testing.T) {
 	for _, forbidden := range []string{
 		"/node/", "/var/lib/", "active.diff", "diff_template", "cgroup_path", "controller.sock",
 		"192.0.2.2", "02:00:00", "instance", "prefetch", "start_timeout", "SECRET", "not-saved",
+		"diff_cow", "discard",
 	} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("portable config leaked %q:\n%s", forbidden, text)

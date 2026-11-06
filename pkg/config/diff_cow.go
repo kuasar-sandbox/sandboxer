@@ -3,16 +3,20 @@ package config
 import (
 	"fmt"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
 	"gopkg.in/yaml.v3"
 )
 
-// DiffCOWConfig is host-only sandbox-ctl memory policy, shared across all active
-// writable disks. MaxDirtySize is a subset of CacheSize, not an extra pool.
-// An empty MaxDirtySize is derived from the final effective CacheSize.
+// DiffCOWConfig is host-selected policy for the sandbox's writable disks.
+// MaxDirtySize is a subset of the shared CacheSize, not an extra pool, and an
+// empty MaxDirtySize is derived from the final effective CacheSize. Discard
+// selects the cold-launch ext4 mount policy; it cannot reconfigure restored
+// mounts. None of these fields is included in portable Sandbox configuration.
 type DiffCOWConfig struct {
 	CacheSize    string `yaml:"cache_size,omitempty"`
 	MaxDirtySize string `yaml:"max_dirty_size,omitempty"`
+	Discard      string `yaml:"discard,omitempty"`
 }
 
 func (c *DiffCOWConfig) defaults() {
@@ -20,6 +24,21 @@ func (c *DiffCOWConfig) defaults() {
 		c.CacheSize = "32MiB"
 	}
 	// Keep an omitted dirty limit unset so later cache overrides can change it.
+	// Preserve omitted Discard too: restore must distinguish no mount-policy
+	// request from an explicit cold-only setting. DiscardMode resolves it.
+}
+
+// DiscardMode returns the cold-launch mount policy without changing c. An
+// omitted Go value means auto; explicit empty YAML is rejected during decoding.
+func (c DiffCOWConfig) DiscardMode() (string, error) {
+	switch c.Discard {
+	case "", proto.DiscardAuto:
+		return proto.DiscardAuto, nil
+	case proto.DiscardManual:
+		return proto.DiscardManual, nil
+	default:
+		return "", fmt.Errorf("resources.diff_cow.discard must be auto or manual (got %q)", c.Discard)
+	}
 }
 
 func diffCOWSize(field, value string) (uint64, error) {
@@ -38,10 +57,11 @@ func (c DiffCOWConfig) ValidateExplicit() error {
 	return err
 }
 
-// Resolve returns a fully resolved copy for runtime use without changing c.
-// Explicit field strings are preserved; an omitted dirty limit becomes a decimal
-// byte count equal to half the final cache size, rounded down to a 4 KiB multiple
-// with a 4 KiB minimum.
+// Resolve validates the complete policy and resolves its cache limits without
+// changing c. Explicit field strings are preserved; an omitted dirty limit
+// becomes a decimal byte count equal to half the final cache size, rounded down
+// to a 4 KiB multiple with a 4 KiB minimum. Discard keeps its explicit/omitted
+// representation; use DiscardMode when preparing a cold launch.
 func (c DiffCOWConfig) Resolve() (DiffCOWConfig, error) {
 	_, dirty, err := c.sizes(true)
 	if err != nil {
@@ -62,6 +82,9 @@ func (c DiffCOWConfig) Bytes() (uint64, uint64, error) {
 // sizes shares validation and default calculation between partial validation
 // and final resolution. YAML decoding deliberately validates only each leaf.
 func (c DiffCOWConfig) sizes(resolve bool) (uint64, uint64, error) {
+	if _, err := c.DiscardMode(); err != nil {
+		return 0, 0, err
+	}
 	if resolve {
 		c.defaults()
 	}
@@ -96,13 +119,23 @@ func (c *DiffCOWConfig) UnmarshalYAML(node *yaml.Node) error {
 	seen := make(map[string]bool)
 	for i := 0; i < len(node.Content); i += 2 {
 		key, val := node.Content[i].Value, node.Content[i+1]
-		if key != "cache_size" && key != "max_dirty_size" {
+		if key != "cache_size" && key != "max_dirty_size" && key != "discard" {
 			return fmt.Errorf("field %s not found in type config.DiffCOWConfig", key)
 		}
 		if seen[key] {
 			return fmt.Errorf("resources.diff_cow.%s duplicated", key)
 		}
 		seen[key] = true
+		if key == "discard" {
+			if val.Kind != yaml.ScalarNode || val.Tag != "!!str" || val.Value == "" {
+				return fmt.Errorf("resources.diff_cow.discard must be auto or manual")
+			}
+			if _, err := (DiffCOWConfig{Discard: val.Value}).DiscardMode(); err != nil {
+				return err
+			}
+			c.Discard = val.Value
+			continue
+		}
 		if val.Kind != yaml.ScalarNode || val.Tag == "!!null" {
 			return fmt.Errorf("resources.diff_cow.%s must be a size", key)
 		}

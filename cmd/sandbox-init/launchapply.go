@@ -28,7 +28,7 @@ const fileInjectStage = "/run/.inject"
 //     sibling to the overlay upperdir.
 //   - single-disk mode: /sysroot/.sandbox-volumes/<i> on the single writable
 //     root disk itself (no separate upper exists).
-func applyVolumeMounts(mounts []proto.MountSpec) error {
+func applyVolumeMounts(mounts []proto.MountSpec, ext4Options string) error {
 	srcRoot := "/overlay/upper/volumes"
 	if singleDiskRoot {
 		srcRoot = "/sysroot/.sandbox-volumes"
@@ -50,7 +50,7 @@ func applyVolumeMounts(mounts []proto.MountSpec) error {
 				return fmt.Errorf("bind volume -> %s: %w", m.Target, err)
 			}
 		case "disk":
-			if err := assembleDataDisk(m); err != nil {
+			if err := assembleDataDisk(m, ext4Options); err != nil {
 				return err
 			}
 		}
@@ -67,7 +67,7 @@ func applyVolumeMounts(mounts []proto.MountSpec) error {
 // base + rw ext4 upper into an overlayfs. The /sysdisks subtree is hidden after
 // switch-root but held alive by the bind (and overlayfs refs) — same as the
 // root overlay's /overlay/lower+upper and the /opt/sandbox-runtime bind.
-func assembleDataDisk(m proto.MountSpec) error {
+func assembleDataDisk(m proto.MountSpec, ext4Options string) error {
 	asm := fmt.Sprintf("/sysdisks/disk-%d", m.DiskIndex)
 	needed := []string{asm}
 	if m.DiskOverlay {
@@ -85,7 +85,7 @@ func assembleDataDisk(m proto.MountSpec) error {
 	}
 	if !m.DiskOverlay {
 		// single: the writable ext4 mounted directly at the assembled point.
-		if err := unix.Mount(m.DiskDevs[0], asm, "ext4", 0, "discard"); err != nil {
+		if err := unix.Mount(m.DiskDevs[0], asm, "ext4", 0, ext4Options); err != nil {
 			return fmt.Errorf("disk %d mount ext4 on %s: %w", m.DiskIndex, asm, err)
 		}
 	} else {
@@ -94,7 +94,7 @@ func assembleDataDisk(m proto.MountSpec) error {
 		if err := unix.Mount(m.DiskDevs[0], lower, "erofs", unix.MS_RDONLY, ""); err != nil {
 			return fmt.Errorf("disk %d mount erofs lower: %w", m.DiskIndex, err)
 		}
-		if err := unix.Mount(m.DiskDevs[1], upper, "ext4", 0, "discard"); err != nil {
+		if err := unix.Mount(m.DiskDevs[1], upper, "ext4", 0, ext4Options); err != nil {
 			return fmt.Errorf("disk %d mount ext4 upper: %w", m.DiskIndex, err)
 		}
 		if err := os.MkdirAll(upper+"/upperdir", 0o755); err != nil {

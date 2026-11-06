@@ -103,6 +103,7 @@ type LaunchServer struct {
 	helloClaim     atomic.Bool
 	helloSent      atomic.Bool
 	initialStateV1 atomic.Bool
+	ext4DiscardV1  atomic.Bool
 	muxReady       chan struct{}
 	runtimeReady   chan struct{}
 	runtimeOnce    sync.Once
@@ -214,6 +215,9 @@ func (s *LaunchServer) RuntimeReady() <-chan struct{} { return s.runtimeReady }
 // InitialLaunchStateSupported is fixed by the accepted runtime-ready hello.
 func (s *LaunchServer) InitialLaunchStateSupported() bool { return s.initialStateV1.Load() }
 
+// Ext4DiscardSupported is fixed by the accepted runtime-ready hello.
+func (s *LaunchServer) Ext4DiscardSupported() bool { return s.ext4DiscardV1.Load() }
+
 // MUXReady closes after the final launch ACK and the MUX handoff.
 func (s *LaunchServer) MUXReady() <-chan struct{} { return s.muxReady }
 
@@ -312,7 +316,10 @@ func (s *LaunchServer) handleConnAfter(conn net.Conn, afterClose *func()) (hande
 			}
 		}()
 		s.initialStateV1.Store(msg.InitialLaunchStateV1)
-		s.runtimeOnce.Do(func() { close(s.runtimeReady) })
+		s.runtimeOnce.Do(func() {
+			s.ext4DiscardV1.Store(msg.Ext4DiscardV1)
+			close(s.runtimeReady)
+		})
 		if s.helloSent.Load() {
 			s.Logf("launch: duplicate hello rejected")
 			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "hello already served"})
@@ -333,6 +340,14 @@ func (s *LaunchServer) handleConnAfter(conn net.Conn, afterClose *func()) (hande
 		if spec == nil {
 			s.Logf("launch: no launch spec published")
 			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "launch unavailable"})
+			return false
+		}
+		if spec.Ext4Discard == proto.DiscardManual && !msg.Ext4DiscardV1 {
+			err := errors.New("guest incompatible: ext4_discard_v1 is required for resources.diff_cow.discard=manual; update boot.runtime")
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+			if s.OnLaunchFailure != nil {
+				s.OnLaunchFailure(err)
+			}
 			return false
 		}
 		s.Logf("launch: sending launch spec")

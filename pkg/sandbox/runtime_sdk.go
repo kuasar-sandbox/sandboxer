@@ -580,6 +580,10 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if err := cfg.ValidateCold(); err != nil && spec.SourceBinding == nil {
 		return err
 	}
+	discardMode, err := cfg.Resources.DiffCOW.DiscardMode()
+	if err != nil {
+		return err
+	}
 	r.mu.Lock()
 	if r.state != runtimeReady {
 		state := r.state.String()
@@ -589,6 +593,10 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if r.launch == nil || !r.launch.InitialLaunchStateSupported() {
 		r.mu.Unlock()
 		return errors.New("guest incompatible: initial_launch_state_v1 is required for Launch")
+	}
+	if discardMode == proto.DiscardManual && !r.launch.Ext4DiscardSupported() {
+		r.mu.Unlock()
+		return errors.New("guest incompatible: ext4_discard_v1 is required for resources.diff_cow.discard=manual; update boot.runtime")
 	}
 	r.initialLaunchToken = rand.Text()
 	r.initialLaunchState = proto.InitialLaunchState{Token: r.initialLaunchToken, State: proto.InitialLaunchPending}
@@ -944,6 +952,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	}
 	_, netSpec := cfg.Network.Effective("", r.metaIP)
 	ls.InitialLaunchToken = r.initialLaunchToken
+	ls.Ext4Discard = discardMode
 	ls.Network = netSpec
 	ls.Mounts = effectiveMounts(cfg.Mounts, imageCfg.Volumes)
 	ls.Files = cfg.ProtoFiles()

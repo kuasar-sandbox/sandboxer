@@ -221,13 +221,17 @@ func phaseBaseRuntime() error {
 // phaseWorkloadRoot begins only after host storage commit. It is the first
 // phase that probes or mounts workload block devices.
 func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
+	ext4Options, err := ext4MountOptions(spec.Ext4Discard)
+	if err != nil {
+		return err
+	}
 	if singleDiskRoot {
 		logf("phase1a: base mounts done; single-disk mode, waiting for vda")
 		if err := waitForDevice("/dev/vda", devicePollTimeout); err != nil {
 			return fmt.Errorf("wait /dev/vda: %w", err)
 		}
 		// The single root disk is a writable ext4 CoW; mount it directly.
-		if err := unix.Mount("/dev/vda", "/sysroot", "ext4", 0, "discard"); err != nil {
+		if err := unix.Mount("/dev/vda", "/sysroot", "ext4", 0, ext4Options); err != nil {
 			return fmt.Errorf("mount blk0 (ext4 rw) on /sysroot: %w", err)
 		}
 		logf("phase1a: single-disk root mounted at /sysroot")
@@ -244,7 +248,7 @@ func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
 		if err := unix.Mount("/dev/vda", "/overlay/lower", "erofs", unix.MS_RDONLY, ""); err != nil {
 			return fmt.Errorf("mount blk0 (erofs ro) on /overlay/lower: %w", err)
 		}
-		if err := unix.Mount("/dev/vdb", "/overlay/upper", "ext4", 0, "discard"); err != nil {
+		if err := unix.Mount("/dev/vdb", "/overlay/upper", "ext4", 0, ext4Options); err != nil {
 			return fmt.Errorf("mount blk1 (ext4 rw) on /overlay/upper: %w", err)
 		}
 		if err := os.MkdirAll("/overlay/upper/upperdir", 0o755); err != nil {
@@ -287,7 +291,7 @@ func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
 	}
 
 	logf("phase1a: /sysroot ready (runtime payload bound)")
-	if err := applyVolumeMounts(spec.Mounts); err != nil {
+	if err := applyVolumeMounts(spec.Mounts, ext4Options); err != nil {
 		return fmt.Errorf("apply volume mounts: %w", err)
 	}
 	if err := phase1bSwitchRoot(spec.CgroupControl); err != nil {
@@ -384,7 +388,7 @@ func waitForLaunch() (*proto.LaunchSpec, *vsockConn, error) {
 		_ = conn.Close()
 		return nil, nil, err
 	}
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: true}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: true, Ext4DiscardV1: true}); err != nil {
 		return fail(fmt.Errorf("send runtime_ready: %w", err))
 	}
 	msg, err := proto.ReadMessage(conn)
