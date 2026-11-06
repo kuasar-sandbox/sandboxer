@@ -263,12 +263,13 @@ provisioning template remains allowed when the new active file must be encrypted
 | Checkpoint capability | Unavailable | `CheckpointManager` |
 | Physical failure cleanup | Hole-punch only newly created upper pages | Transaction/allocation engine owns recovery; never punch guest offsets in the mixed physical file |
 
-The private batch consists of logical block number, borrowed plaintext bytes and
-whether the upper page was fresh. It exposes no `cachePage`. The cache freezes and
-charges pages until write and failure cleanup finish, and publishes sticky failure
-before cleanup can block. The single-layer backend stages into its existing
-workspace; v4 performs its existing mapping commit. Buffer pools, request batching
-limits and encryption domains retain their existing policies.
+The private batch describes a logical block and either borrowed plaintext Data
+plus its fresh-page flag, or an explicit Zero with no payload. It exposes no
+`cachePage`. The cache freezes and charges pages until write and failure cleanup
+finish, and publishes sticky failure before cache cleanup can block. The
+single-layer backend stages Data into its existing workspace; v4 commits Data or
+Zero through its mapping engine. See [Discard](#discard-and-reclamation) for
+Zero batching and the bounded pre-write space-pressure recovery.
 
 Fresh creation shares the claim/recheck/template/temp-file flow, and publication
 shares file sync, atomic rename, claim release and directory sync. Materialization
@@ -344,7 +345,7 @@ open, first useful I/O, Ready, publication and Close timings.
 - `ReadAtContext`/`WriteAtContext` carry queue cancellation across the package
   boundary. `ReadAt`/`WriteAt` remain conventional context-free entry points.
 - Guest `Flush` checks health; it does not promise media persistence. `Drain`
-  waits for accepted cache writes to finish. A checkpoint additionally performs
+  waits for accepted Data and Zero writeback to finish. A checkpoint additionally performs
   the versioned persistence boundary. Do not equate request acceptance or Drain
   with a durable checkpoint.
 - `Disk.Close` excludes new operations and joins admitted work before releasing
@@ -364,13 +365,13 @@ if supported {
 
 The manager shares the disk's lifetime and routes operations through the live
 admission/cache boundary. A checkpoint waits for template readiness, pauses new
-frontend operations, drains accepted writes, waits for materialization publication,
+frontend operations, drains accepted Data and Zero, waits for materialization publication,
 and commits the named version. Multiple disks still require application-level
 coordination. Existing direct `Disk` checkpoint methods remain available, but
 `Checkpoints()` makes format capability explicit without probing via errors.
 
 `OpenActiveView(ctx)` returns an **upper-only** sparse view that includes accepted
-cache writes. The caller must keep the disk open and quiescent until the view is
+cache Data and Zero. The caller must keep the disk open and quiescent until the view is
 closed; this is neither a persistent checkpoint nor a base-composed disk image.
 `OpenCheckpoint(ctx, id)` requires a nonempty ID and returns an immutable reader
 with an independent pin. It survives subsequent writes and owner close; close the
@@ -440,27 +441,90 @@ pending until that copy is exhausted. It needs no payload decryption key.
 
 ## Discard and reclamation
 
-`Disk.Discard(offset, length)` changes only fully covered 4 KiB pages;
-partial edge pages retain their contents. It removes active payload and sets P=1,
-returning Zero without revealing base bytes. The public
-`Store.Discard(ctx, offset, length)` has the same complete operation, requiring
-page-aligned ranges. PayloadPresence is false and no active Data mapping remains;
-retained Checkpoints may still protect old records. Guest DISCARD uses this same
-operation. This does not add WRITE_ZEROES or zero compression.
-Each batch covers at most 64 full pages. It takes distinct stripe locks in numeric
-order, checks all existing cache pages under one cache lock, and only then freezes
-them together. Loading or writeback makes the whole batch wait without freezing
-any part. Uncached pages require no placeholder and unrelated dirty pages need no
-drain. Backend I/O runs without the cache lock and receives a context. Cancellation
-can stop a batch before freezing; afterward it must publish the whole batch or
-enter the existing sticky failure path and wake waiters. Success publishes the
-Zero for every page, including previously absent pages. The normal presence bit
-alone prevents template Data or Zero backfill from overwriting foreground content;
-there is no separate template-resolution bitmap. Unmodified template Holes still
-fall through to the base. Separate batches do not provide an all-or-nothing range
-transaction. Normal presence publication only sets bits. Failed first-payload
-writes instead restore the old committed bitmap: Hole retains P=0 and Zero
-retains P=1, after cleanup of newly allocated payload.
+Managed writable ext4 mounts enable `discard` by default, so filesystem block
+release can notify the backend automatically; see the [mount scope and rollout
+boundary](guest-abi.md#guest-block-discard). This reduces obsolete active payload
+and payload in subsequent disk exports. It does not shrink immutable parents or
+existing snapshots, reclaim an EROFS lower when overlayfs creates a whiteout, or
+automatically trim all space that was already free before enabling the option.
+Deleting a file, committing Zero and reclaiming host allocation are separate
+boundaries. Measure allocated blocks separately from the DIFF file's logical
+length, which need not shrink.
+
+`Disk.Discard(offset, length)` publishes logical Zero with P=1 for fully covered
+4 KiB pages, masking even nonzero base data; partial edge pages retain their
+contents. With v4, completion normally means admission into the bounded cache,
+like `WriteAt`, rather than completed backend mapping removal. The single-layer
+path remains synchronous. The public, page-aligned
+`Store.Discard(ctx, offset, length)` also remains synchronous. Neither cache
+admission nor backend batching makes the whole range atomic; cancellation or a
+later failure can leave an accepted or committed prefix. Ordinary writes of zero
+bytes remain Data; this adds neither WRITE_ZEROES nor content-based compression.
+
+Each pending v4 Zero consumes one logical page of the existing shared total and
+dirty quotas. Replacing an unselected dirty page reuses its reservation and FIFO
+position. Same-page loading, construction or frozen writeback must finish first;
+quota waits release the frontend stripe. The cache publishes Zero and frontend
+presence before ACK, so older Data writeback cannot resurrect a discarded page.
+Zero has no 4 KiB payload. Data-to-Zero clears and returns the old buffer to the
+bounded Data pool; a later partial write acquires a zeroed buffer and preserves
+zero outside the written span without reading the old backend, template or base.
+
+The existing single worker batches one disk and one kind at a time: at most 256
+Data pages in the 1 MiB workspace, or 1024 Zero pages without a payload workspace.
+Normal selection retains the oldest eligible FIFO anchor. `Store.DiscardPages`
+validates a bounded set of distinct blocks, combines adjacent ranges and removes
+their mappings with presence and retirement updates. Its exact existing-page
+redo-image count is checked before preallocation or data/redo writes; an oversized
+window is rebuilt as smaller transactions within the unchanged 1536-page budget.
+This bounds batch size, not Store-lock wait time or the latency of a fragmented
+range.
+
+Only `Store.WritePagesForCache` can defer exhausted Data-reservation
+ENOSPC/EDQUOT as `SpacePressureError`: failed-slot cleanup must have succeeded,
+the failing transaction must have written no Data/redo, and the Store must remain
+healthy. Earlier 64-page transactions may already have committed. The worker
+keeps the original Data window frozen, captures the same disk's currently dirty
+Zero pages, completes that finite cohort in batches of at most 1024, then retries
+the original Data window exactly once. New Zero arrivals cannot extend this
+recovery. Active-I/O ownership and unfinished quotas remain held throughout;
+Zero failure, retry failure or an independently fatal cache stops progress through
+the existing sticky-failure path. Ordinary `Store.WritePages` retains its original
+validation, duplicate-block behavior and sticky reservation-failure contract.
+
+When either quota blocks admission of a cold/clean Zero and no already charged
+Zero on that disk can release quota, DISCARD uses the synchronous single-page
+path without a new reservation or first kicking queued Data. It still waits for
+same-page loading/construction/writeback. This avoids a quota deadlock; it does
+not guarantee recovery from arbitrary host-space exhaustion or supersede I/O
+already in progress. No extra worker, unbounded request queue or tuning option is
+introduced.
+
+Successful Zero writeback removes the cache entry and releases both quotas; it
+does not enter the clean LRU. Data retains its normal clean-cache behavior.
+`Drain`, named Checkpoint and normal Close wait for accepted Zero writeback. Pages
+that remain Zero at that boundary have no active Data mapping and report
+PayloadPresence=false. Retained Checkpoints/readers can still protect old records,
+and actual host allocation falls only when GC can reclaim them. After initial
+publication, [active export](#snapshot-view) can already omit pending Zero's old
+payload without another Drain. Fresh disks still require `WaitMaterialized`,
+including its initialization drain. DISCARD and Guest FLUSH add no stable-storage
+durability guarantee.
+
+The synchronous single-layer path retains batches of at most 64 full pages. It
+takes distinct stripe locks in numeric order, checks all existing cache pages
+under one cache lock, and only then freezes them together. Loading or writeback
+makes the whole batch wait without freezing any part. Uncached pages require no
+placeholder and unrelated dirty pages need no drain. Backend I/O runs outside
+the cache lock. Cancellation can stop a batch before freezing; afterward it must
+publish the whole batch or enter sticky failure and wake waiters. Success
+publishes Zero for every page, including previously absent pages.
+
+Both paths use the normal presence bit to prevent template Data/Zero backfill
+from overwriting foreground content, without a separate template-resolution
+bitmap. Unmodified template Holes still fall through to the base. Normal presence
+publication only sets bits. Failed first-payload writes restore the old committed
+bitmap after cleanup of newly allocated payload: Hole retains P=0 and Zero P=1.
 
 `DeleteCheckpoints` only withdraws visibility and immediately releases protection
 when no reader pins the version. It never runs or waits for GC. `OpenMetadata`
@@ -590,6 +654,11 @@ evictable only after successful file completion. Keep frontend requests quiesced
 and the COW open until capture finishes. Background fatal errors during capture
 must fail publication and reach the runtime owner, including when no guest request
 follows the failure. Export does not rotate the active diff or change its base.
+Accepted v4 cache Data/Zero overrides older backend payload presence for both
+bytes and sparse-run classification. Ordinary all-zero Data is still classified
+as Data. Fresh disks await the existing `WaitMaterialized` publication boundary,
+including its initial drain; creating an active view after publication adds no
+Drain.
 
 <a id="disk-state"></a>
 
@@ -619,23 +688,35 @@ materialize the upper cache. Each cached page is indexed by active file and bloc
 | --- | --- | --- |
 | Clean, dirty, writeback, read loading | One page each | Dirty/writeback only |
 | New write construction/reservation | One page | One page |
+| v4 cached Zero admission | One page | One page |
 | Clean becomes dirty | Unchanged | Add one page |
 | Dirty overwrite or dirty becomes writeback | Unchanged | Unchanged |
-| Successful writeback becomes clean | Unchanged | Remove one page |
+| Successful Data writeback becomes clean | Unchanged | Remove one page |
+| Successful explicit Zero writeback | Remove one page | Remove one page |
 | Evict clean | Remove one page | Unchanged |
 
 At all times `dirty_used <= used <= cache_size` and
 `dirty_used <= max_dirty_size`. Submitting I/O does not release reservations.
-The page pool, index, clean LRU and dirty FIFO are bounded by capacity. Plaintext
-is cleared on release. Separate bounded overhead consists of at most 256
-writeback page pointers per sandbox, two independent 1 MiB MAP_SHARED
-I/O workspaces per active file (each with less than 1 MiB alignment padding),
-and page metadata/index/Go allocator overhead proportional to page capacity.
+The metadata pool, Data-buffer pool, index, clean LRU and dirty FIFO are bounded
+by capacity. Explicit Zero stores metadata with no payload, but is charged as a
+full logical page. Data owns a separate 4 KiB buffer, cleared before pooling.
+The strong Data pool retains its previous high-water allocation until cache
+close; Data-to-Zero does not promise heap/RSS reclamation. A cold Zero-only
+workload avoids those payload allocations, but Zero-to-Data needs a buffer and
+may allocate if the pool is empty. Reading a committed Zero after its cache entry
+was released uses the normal clean-Data read cache and can allocate a buffer too.
+
+Selection and operation arrays are each bounded by 1024 entries. Space-pressure
+recovery additionally captures at most `max_dirty_size / 4096` existing Zero-page
+pointers, without copying payload. Other bounded overhead includes two independent
+1 MiB MAP_SHARED I/O workspaces per active file (each with less than 1 MiB
+alignment padding), and page metadata/index/Go allocator overhead proportional
+to page capacity.
 `cache_size` is not a cap on process RSS, guest memfd mappings, immutable-source
 caches, tmpfs file storage or snapshot output memory.
 
 Tmpfs file pages are filesystem storage in memory (and potentially swap), separate
-from this bounded process cache. Successful writeback releases dirty quota but
+from this bounded process cache. Successful Data writeback releases dirty quota but
 does not release stored tmpfs data; clean-cache eviction does not remove it either.
 `cache_size` does not bound those bytes or promise zero tmpfs page residency.
 Existing tmpfs mount size/inode limits and host memory controls govern that
@@ -652,7 +733,8 @@ The cache keeps latest plaintext ahead of physical file state.
 
 ### Reads, writes and backpressure
 
-Reads copy from clean, dirty or frozen writeback pages first. Only a cache miss
+Reads copy from clean, dirty or frozen writeback pages first; explicit Zero hits
+clear the caller's requested bytes without a cached payload. Only a cache miss
 may read/decrypt the active file. Read loading reserves total capacity; if no
 clean slot is available, a bounded foreground workspace can service the read
 without insertion. It never bypasses a newer cached page.
@@ -688,12 +770,13 @@ not acquire these locks.
 
 ### Writeback and FLUSH
 
-One sandbox worker anchors each batch on the oldest dirty page. Hot overwrites
-do not move a page to the tail. It may batch adjacent dirty pages of the same
-file up to 1 MiB, without filling holes or preallocating gaps. A fixed 1 ms
+One sandbox worker normally anchors each batch on the oldest eligible dirty page.
+Hot overwrites do not move a page to the tail. It batches one file and one kind:
+up to 256 Data pages (1 MiB) or 1024 Zero pages, without filling holes or
+preallocating gaps. A fixed 1 ms
 aggregation window allows low-rate traffic to progress; quota pressure and
 internal Drain wake it immediately. Selected pages become frozen writeback:
-reads remain possible and same-page writes wait. The worker copies frozen pages
+reads remain possible and same-page writes wait. The worker copies frozen Data pages
 directly into the active diff's existing aligned MAP_SHARED write workspace,
 encrypts that copy, and performs I/O without cache or global locks. Cache page
 payloads stay plaintext and never become syscall buffers. Foreground reads have
@@ -704,6 +787,15 @@ regardless of arrival order; unselected FIFO age is unchanged. Ordinary write
 notifications neither end nor restart the fixed aggregation deadline. Pressure
 and Drain interrupt it. An already aggregated backlog proceeds without a new
 1 ms wait per batch, including batches that contain only one page.
+
+Zero batches write metadata without copying or encrypting payload, and successful
+Zero entries release both quotas rather than occupying the clean LRU. Pending
+Zero still consumes quota, can evict unrelated clean Data and can increase
+same-page write waits. `WrittenBytes` counts completed logical Data only, excluding
+Zero and replayed prefixes during the bounded [space-pressure recovery](#discard-and-reclamation).
+Backend metadata work remains serialized inside the Store, so unrelated cache
+misses can still wait. A cached ACK does not promise immediately reusable host
+space.
 
 A healthy, valid guest **FLUSH is a no-op**. It neither initiates writeback,
 waits for dirty pages nor invokes Drain, fsync or fdatasync. Request ordering and
@@ -825,7 +917,8 @@ Before a guest write can dirty the plaintext COW cache, `MarkModified` clears th
 current-capture marker once per capture cycle. The same fence applies to direct
 backend writes: root-pointer equality alone never proves an unchanged disk.
 
-Writes use bounded batches of up to 64 pages. Metadata transactions preflight a
+Physical Data transactions retain a limit of 64 pages; a pure Zero transaction
+can contain up to 1024 pages when its metadata fits. Metadata transactions enforce a
 fixed redo budget of 1,536 existing metadata page images, addressed by three
 redo home-address pages,
 before any data/metadata write. New reserved, unreachable data/index slots are
@@ -889,20 +982,25 @@ defines the batched Zero transition. These storage boundaries remain in force
 when transport admission is quiesced. [Runtime disk capture](runtime.md#disk-capture)
 coordinates the common VM freeze and uncertain multi-disk root commit.
 
-Internal `Drain` waits for accepted writes to finish without fsync. Normal Close
+Internal `Drain` waits for accepted Data and Zero writeback without fsync or
+waiting for all GC. Retained versions and unfinished GC can still occupy disk
+space after mapping removal; named Checkpoint and normal Close also wait for
+accepted Zero. Normal Close
 stops new frontend work, cancels quota waits, drains accepted healthy writes,
 joins I/O, clears plaintext and closes the file. Frontend cancellation does not
 cancel healthy writeback. Close is idempotent and drain/close errors propagate
 through run/restore. Destruction must also wait for actual in-flight syscalls
 before freeing their buffers.
 
-Writeback and short-write failures are sticky: failed pages remain dirty-accounted,
+Apart from the pre-write reservation recovery described under
+[Discard](#discard-and-reclamation), writeback and short-write failures are sticky:
+failed pages remain dirty-accounted,
 new writes fail, all waiters wake, and the runtime receives a non-blocking fatal
 notification without self-joining. A partial physical write may already have changed
 the file. Cleanup of newly materialized blocks cannot punch previously existing
 upper pages in the same batch. Frontend request acceptance is not a durable whole-request transaction. The v4 backend retains its [committed-transaction recovery contract](#versioned-format); there is no silent buffered retry.
 
-The original error is latched and the owner notified before cleanup I/O. While rollback runs, active-I/O ownership, frozen pages and their quotas remain held so Close cannot release the file or buffers early. Cleanup errors are joined afterward without masking the original failure.
+Fatal errors are latched and the owner notified before cache-layer cleanup I/O. While rollback runs, active-I/O ownership, frozen pages and their quotas remain held so Close cannot release the file or buffers early. Cleanup errors are joined afterward without masking the original failure.
 
 <a id="segmented-vhost-reads"></a>
 
@@ -980,7 +1078,13 @@ tests and real CH/KVM tmpfs guest cold-start/read-write
 and pause/export/restore; report skips and infrastructure failures explicitly.
 
 Performance comparisons need datasets much larger than the cache and separate
-frontend admission latency from total elapsed time including Drain. Cover
+frontend admission latency from total elapsed time including Drain. For DISCARD,
+also distinguish cache acceptance, backend mapping removal and host reclamation;
+compare no-discard, synchronous discard and cached discard as separate baselines.
+For Zero payload representation, measure cold Zero-only and Data-warmed caches,
+Zero-to-Data allocations and latency, and committed-Zero readback separately.
+Pool reuse and allocator/RSS behavior must not be reported as additional disk or
+export savings. Cover
 sequential/random 4 KiB, 512-byte updates, hot overwrites, encryption and multiple
 disks. Report tail latency, logical/physical write volume, stable quota usage and
 file-cache/dirty/writeback or mincore evidence. Compare buffered baseline and
@@ -1157,6 +1261,9 @@ v3/v4 and plaintext/XTS configurations, verifies Zero after portable export and
 cold restore, and crosses a local memory Checkpoint restore for v4. Unit tests
 add controlled template Data/Zero interleavings before, during and after import,
 as well as cached writeback, cancellation and failed first-payload restoration.
+Cached-Zero regressions cover reads/export before writeback, frozen Data ordering,
+finite space-pressure recovery, completed-Zero quota release and payload-pool
+reuse without cross-page or cross-disk plaintext exposure.
 
 Run source checks separately from prebuilt-product E2E. Use a native Linux ext4
 scratch directory for direct I/O and space-reclamation checks; a Windows-mounted
@@ -1172,7 +1279,7 @@ bash scripts/ci-source-checks.sh
 
 # Dedicated, disposable 64 MiB ext4 filesystem; never a shared developer mount:
 DIFFSTORE_FULL_FS=/path/to/owned/finite-ext4 go test ./pkg/diffstore/internal/versioned \
-  -run '^TestRealFilesystemFullRecovery$' -count=1 -v
+  -run '^TestRealFilesystem(FullRecovery|CacheSpaceRecovery)$' -count=1 -v
 
 # Root shell; PREPARED contains exact built artifacts and the platform E2E runner:
 python3 "$PREPARED/test/e2e/e2e" run --workdir "$PREPARED" \
@@ -1275,8 +1382,8 @@ versus checkpoint plaintext and XTS separately, including no-version, protected 
 write and already-private overwrite. These commands describe reproducible checks;
 they do not claim that performance targets or every privileged test passed.
 
-The following companion probes measure complete Zero discard and report actual
-allocation before trim, while a deleted checkpoint is
+The following companion probes separate DISCARD ACK from completion including
+Drain, and report actual allocation before trim, while a deleted checkpoint is
 reader-pinned, after reader release/GC, and after reuse:
 
 ```bash
@@ -1284,7 +1391,13 @@ go test ./pkg/diffstore -run '^$' -bench '^BenchmarkCheckpointDiscard$' -benchti
 go test ./pkg/diffstore/internal/versioned -run '^$' -bench '^BenchmarkCheckpointZeroRetention$' -benchtime=3x
 ```
 
-Discard reports process CPU, backend calls, bitmap/index/redo bytes and structure
+`BenchmarkCheckpointDiscard` includes Discard plus Drain in `ns/op`, and reports
+admission separately as `ack-ns/range`. v4 ACK can precede mapping removal; Drain
+does not prove that reader-retained payload or all GC work has been reclaimed.
+Use the same completion boundary across revisions.
+`backend-calls/range` counts synchronous `diffBackend.discard` calls; it excludes
+cached v4 Zero writeback through `writePages`, so zero does not mean no backend
+work. Discard also reports process CPU, bitmap/index/redo bytes and structure
 commits. Background GC may contribute to versioned counters. Zero over existing
 Data leaves P set and needs no bitmap rewrite. For an older revision that offers
 both modes, use its `BenchmarkCheckpointGuestDiscard` for the same Zero semantics;
@@ -1334,8 +1447,8 @@ reduce foreground contention; explicit GC remains unpaced. The gap trades peak
 background throughput for scheduling opportunities, not a foreground latency guarantee.
 `gc-write` keeps four recent versions while writing with normal background GC and
 reports frontend tail latency and index/redo amplification. Discard uses a fixed
-4 MiB range and 1 MiB cache; its backend-call count is attributable to Discard,
-but `total-commits/range` also includes concurrent GC. Unsupported shared/private
+4 MiB range and 1 MiB cache; its synchronous backend-call counter excludes cached
+Zero writeback, while `total-commits/range` also includes concurrent GC. Unsupported shared/private
 mode combinations are omitted for the dedicated reclamation and Discard cases.
 Keep raw per-round results and exact baseline/candidate identities in the PR or
 Issue; these workloads establish observations, not a universal speedup claim.

@@ -69,7 +69,7 @@ func BenchmarkCheckpointDiscard(b *testing.B) {
 			cow.diff = observer
 			chunk := bytes.Repeat([]byte{0x45}, 1<<20)
 			var commits, indexBytes, redoBytes, bitmapWrites uint64
-			var userNS, systemNS int64
+			var userNS, systemNS, ackNS int64
 			if single, ok := observer.diffBackend.(*diffFile); ok {
 				single.beforePresenceWrite = func(int) error { bitmapWrites++; return nil }
 			}
@@ -96,7 +96,12 @@ func BenchmarkCheckpointDiscard(b *testing.B) {
 				}
 				bitmapBefore := bitmapWrites
 				b.StartTimer()
+				ackStart := time.Now()
 				if err := cow.Discard(0, size); err != nil {
+					b.Fatal(err)
+				}
+				ackNS += time.Since(ackStart).Nanoseconds()
+				if err := cow.Drain(context.Background()); err != nil {
 					b.Fatal(err)
 				}
 				b.StopTimer()
@@ -119,6 +124,7 @@ func BenchmarkCheckpointDiscard(b *testing.B) {
 			b.ReportMetric(float64(redoBytes)/float64(b.N), "redo-B/range")
 			b.ReportMetric(float64(discardBitmapWrites*cowBlockSize)/float64(b.N), "presence-B/range")
 			b.ReportMetric(float64(userNS)/float64(b.N), "cpu-user-ns/range")
+			b.ReportMetric(float64(ackNS)/float64(b.N), "ack-ns/range")
 			b.ReportMetric(float64(systemNS)/float64(b.N), "cpu-system-ns/range")
 			b.ReportMetric(float64(size), "range-B")
 			b.ReportMetric(float64(cacheSize), "cache-B")

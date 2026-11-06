@@ -230,7 +230,7 @@ B. connect(CID=2:5000)，发送 hello{phase:"runtime_ready"}，等待 launch
 C. 仅在收到 launch、host 已发布全部 block backend 后:
    1. 等待 /dev/vda 和 /dev/vdb：轮询 stat，10 s 超时。
    2. mount -t erofs -o ro /dev/vda /overlay/lower
-      mount -t ext4 /dev/vdb /overlay/upper
+      mount -t ext4 -o discard /dev/vdb /overlay/upper
    3. 不存在时创建 /overlay/upper/{upperdir,workdir}。
    4. mount -t overlay overlay -o lowerdir=/overlay/lower,
         upperdir=/overlay/upper/upperdir,workdir=/overlay/upper/workdir /sysroot
@@ -317,7 +317,7 @@ payload 与 runtime 同生命周期，不能独立热补丁；若需独立版本
 **单磁盘模式**(`boot.root.overlay` 省略时)。host 不建 blk1、只发一个可写 `--disk`(blk0=
 root 盘的 ext4 CoW),并在 cmdline 加 `sandbox.root.layout=single`。phase1a 读 `/proc/cmdline`
 (/proc 已在最前挂好)判定模式——因组盘与 launch 握手并发、早于 launch spec 到达,模式只能走
-cmdline,不能走 spec。单盘路径:只 wait `/dev/vda`,`mount -t ext4 /dev/vda /sysroot` 直接挂为
+cmdline,不能走 spec。单盘路径:只 wait `/dev/vda`,`mount -t ext4 -o discard /dev/vda /sysroot` 直接挂为
 可写根(无 `/overlay/lower`、`/overlay/upper`、无 overlayfs、无 vdb),其余(`/opt/sandbox-runtime`
 bind、switch-root、phase1b 基础挂载)不变。`empty` 卷的 source 改落在写根自身的
 `/sysroot/.sandbox-volumes/<i>`(无独立 ext4 upper),仍 bind 遮蔽 target、随 switch-root 子树搬运。
@@ -341,8 +341,8 @@ name 不过线。盘的设备位由它在 boot.disks[] 的下标决定,与 mount
 缺失即 die(erofs 版本不符,重建或减盘):
 
 ```
-单盘数据盘 N:  mount ext4 /dev/vdX → /sysdisks/disk-N
-overlay 数据盘 N: erofs ro → /sysdisks/disk-N-lower;ext4 rw → /sysdisks/disk-N-upper;
+单盘数据盘 N:  mount ext4 -o discard /dev/vdX → /sysdisks/disk-N
+overlay 数据盘 N: erofs ro → /sysdisks/disk-N-lower;ext4 rw,discard → /sysdisks/disk-N-upper;
                  overlayfs(lower, upper/upperdir, upper/workdir) → /sysdisks/disk-N
 两者收尾:bind /sysdisks/disk-N → /sysroot<target>
 ```
@@ -365,6 +365,18 @@ Usage 在上述受控 root/data 组装处保留每个可写盘的私有 CLOEXEC 
 
 #### Guest 块设备 DISCARD
 
+`sandbox-init` 在四条受管可写 ext4 挂载路径默认启用 `discard`：单盘根、overlay 根的
+upper、单盘数据盘及 overlay 数据盘的 upper。Empty/bind 卷继承底层文件系统行为；
+只读 EROFS 保持原挂载选项。文件系统释放块时即可通知 Host，应用无需改造，也不必
+在每次删除后单独执行 trim。删除会增加额外处理；文件系统释放、宿主回收和磁盘导出
+缩小不保证在 unlink 返回时完成。[存储契约](block-storage_zh.md#discard-and-reclamation)
+定义这些边界并保护保留历史。
+
+采用此默认值须使用包含新版 `sandbox-init` 的 runtime bundle，并在模板的
+`boot.runtime` 选择该 bundle 后冷启动。仅替换 Host 可执行文件不会更新内嵌 init。
+已有运行实例和内存恢复保持原挂载，restore 不会重新挂载。无需磁盘或快照格式迁移。
+启用选项也不会自动 trim 此前已经空闲的全部空间。
+
 新建可写 virtio-blk 设备公布 `VIRTIO_BLK_F_DISCARD`，只读设备不公布。固定配置为
 `MaxDiscSeg=1`、`DiscSecAln=8`（4096 字节）、`MaxDiscSec=8192`（4 MiB）。
 能力在 server 创建时确定，池化 backend 绑定必须匹配。恢复设备沿用捕获时的 feature
@@ -372,14 +384,21 @@ Usage 在上述受控 root/data 组装处保留每个可写盘的私有 CLOEXEC 
 
 请求只包含一个 16 字节范围，可以跨多个可读 descriptor。Host 先校验 flags、原始扇区
 范围及溢出，再向内取整到完整 4 KiB 页。不支持的 flags 和 WRITE_ZEROES 返回 UNSUPP；
-畸形或越过容量的请求返回 IOERR。成功 DISCARD 移除上层 payload，但保留逻辑 presence，
-因此即使 lower 含非零内容，后续读取也返回零。未完整覆盖的边缘页保留原内容。
-Host 每批最多处理 64 页；完成不保证跨批原子性或稳定存储持久性。普通写零仍分配
-Data；Guest FLUSH 保持既有非持久化契约。
+畸形或越过容量的请求返回 IOERR。成功 DISCARD 发布逻辑 Zero，即使 lower 含非零
+内容，后续读取也返回零。未完整覆盖的边缘页保留原内容。对于 v4，ACK 通常与 WriteAt
+一样表示 Zero 已进入现有有界脏页缓存；额度压力下可改为单页同步完成，不另申请
+预留。后端 payload 映射可以在后续回写时移除。内部 Drain、命名 Checkpoint 和普通
+Close 等待该回写，但不等待全部 GC。首次发布后，活动导出无需额外 Drain，已能导出
+待回写 Zero；新建磁盘仍须等待 `WaitMaterialized`，包括初次排空。单层 v3 保持每批
+最多 64 页的同步移除。两条路径均不保证整个范围原子性或稳定存储持久性。普通写零
+仍分配 Data；Guest FLUSH 保持既有非持久化契约。
 
-在已挂载的可写 ext4 文件系统上执行 `fstrim` 验证真实 Guest 路径。验证须保留非零
-lower 内容，检查 discard 后、Checkpoint/导出及恢复后的零读取，并确认相应 upper
-范围没有 payload。仅 trim 返回的字节数不足以证明这些性质。
+新版 runtime 的冷启动验证须覆盖 root/data 两种拓扑，直接检查实际 ext4 挂载选项，
+不手动 remount。文件删除应到达 Guest DISCARD；`fstrim` 另行覆盖已空闲范围。
+保留非零 lower 内容，检查 discard 后、Checkpoint/导出及恢复后的零读取，并在 Drain
+或 Checkpoint 后确认相应 upper 范围没有活动 payload。在此边界之前，使用暂停回写
+的测试，同时验证 Zero 读取和稀疏导出的 Zero 分类。仅 trim 返回的字节数不足以证明
+这些性质。
 
 <a id="apply-and-launch"></a>
 

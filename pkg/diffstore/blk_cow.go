@@ -668,9 +668,12 @@ func (c *Disk) SetFatalHandler(report func(error)) { c.cache.SetFatalHandler(rep
 // Drain is an internal completion boundary, not a guest durability operation.
 func (c *Disk) Drain(ctx context.Context) error { return c.cache.drain(ctx, c) }
 
-// Discard releases active payload for fully covered pages and publishes Zero,
-// masking the lower layer. Retained versions keep their protected payload.
-// Partial edge pages retain their original contents.
+// Discard publishes Zero for fully covered pages, masking the lower layer.
+// On v4, completion normally accepts Zero into the bounded cache like WriteAt;
+// quota pressure can use synchronous single-page removal. Drain, Checkpoint
+// and Close wait for physical mapping removal. Other formats remove
+// active payload before returning. Retained versions keep protected payload,
+// and partial edge pages retain their original contents.
 func (c *Disk) Discard(offset, length int64) error {
 	ctx, endOp, err := c.begin(nil)
 	if err != nil {
@@ -700,6 +703,27 @@ func (c *Disk) Discard(offset, length int64) error {
 
 	if err := c.markModified(ctx); err != nil {
 		return err
+	}
+	if c.versions != nil {
+		for block := startBlk; block < endBlk; {
+			lock := c.blockLock(block)
+			lock.Lock()
+			err := c.cache.stageZero(ctx, c, block)
+			lock.Unlock()
+			if retry, ok := err.(*cacheRetry); ok {
+				select {
+				case <-retry.wake:
+					continue
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			if err != nil {
+				return c.propagateBackendFailure(err)
+			}
+			block++
+		}
+		return nil
 	}
 	for first := startBlk; first < endBlk; first += maxDiscardPages {
 		last := min(first+maxDiscardPages, endBlk) - 1

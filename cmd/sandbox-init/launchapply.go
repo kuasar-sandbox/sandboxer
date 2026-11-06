@@ -85,7 +85,7 @@ func assembleDataDisk(m proto.MountSpec) error {
 	}
 	if !m.DiskOverlay {
 		// single: the writable ext4 mounted directly at the assembled point.
-		if err := unix.Mount(m.DiskDevs[0], asm, "ext4", 0, ""); err != nil {
+		if err := unix.Mount(m.DiskDevs[0], asm, "ext4", 0, "discard"); err != nil {
 			return fmt.Errorf("disk %d mount ext4 on %s: %w", m.DiskIndex, asm, err)
 		}
 	} else {
@@ -94,7 +94,7 @@ func assembleDataDisk(m proto.MountSpec) error {
 		if err := unix.Mount(m.DiskDevs[0], lower, "erofs", unix.MS_RDONLY, ""); err != nil {
 			return fmt.Errorf("disk %d mount erofs lower: %w", m.DiskIndex, err)
 		}
-		if err := unix.Mount(m.DiskDevs[1], upper, "ext4", 0, ""); err != nil {
+		if err := unix.Mount(m.DiskDevs[1], upper, "ext4", 0, "discard"); err != nil {
 			return fmt.Errorf("disk %d mount ext4 upper: %w", m.DiskIndex, err)
 		}
 		if err := os.MkdirAll(upper+"/upperdir", 0o755); err != nil {

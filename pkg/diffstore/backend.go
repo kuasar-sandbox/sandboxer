@@ -7,13 +7,15 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/versioned"
 )
 
-// pageWrite borrows a complete plaintext page. Before starting I/O the single
+// A Data pageWrite borrows a complete plaintext page; an explicit Zero needs
+// only its block number and has no Data payload. Before starting I/O the single
 // layer backend updates Fresh from effective payload existence for failure
 // cleanup: logical presence alone cannot distinguish Data from Zero.
 type pageWrite struct {
 	Block uint64
 	Data  []byte
 	Fresh bool
+	Zero  bool // explicit logical Zero; ordinary all-zero Data remains Data
 }
 type batchPolicy struct {
 	materialPages int
@@ -63,6 +65,12 @@ func backendWritable(d diffBackend) bool {
 		}
 	}
 	return d.waitInitialized(context.Background()) == nil
+}
+
+// Only the v4 cache write API may defer a safely rolled-back reservation
+// failure. Other backend failures retain the ordinary sticky-fatal behavior.
+func isWritebackSpacePressure(cow *Disk, err error) bool {
+	return cow.versions != nil && versioned.IsSpacePressure(err)
 }
 func (d *diffFile) policy() batchPolicy {
 	// Reuse writeback batching for template materialization. Cap each staging

@@ -394,7 +394,12 @@ func TestCOWCacheLoadingReservationAndCloseCancellation(t *testing.T) {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	for _, p := range cache.free {
-		if !allZero(p.data[:]) {
+		if p.data != nil {
+			t.Fatal("released metadata retains a payload")
+		}
+	}
+	for _, data := range cache.freeData {
+		if !allZero(data[:]) {
 			t.Fatal("released plaintext retained")
 		}
 	}
@@ -659,17 +664,25 @@ func TestCOWDiscardBoundedBatchesAcrossFormatsAndEdges(t *testing.T) {
 			}
 			observer := &discardObserver{diffBackend: cow.diff}
 			cow.diff = observer
-			// Preserve edge pages 0 and 131; discard 130 complete pages in 3 calls.
+			// Preserve edge pages 0 and 131. Single-layer storage completes in
+			// three calls; v4 stages bounded Zero pages for mixed writeback.
 			if err := cow.Discard(17, blocks*cowBlockSize-34); err != nil {
 				t.Fatal(err)
 			}
-			if len(observer.calls) != 3 {
+			wantCalls := 3
+			if cow.versions != nil {
+				wantCalls = 0
+			}
+			if len(observer.calls) != wantCalls {
 				t.Fatalf("backend calls %v", observer.calls)
 			}
 			for _, call := range observer.calls {
 				if call[1] > 64*cowBlockSize || call[0]%cowBlockSize != 0 {
 					t.Fatal(call)
 				}
+			}
+			if err := cow.Drain(context.Background()); err != nil {
+				t.Fatal(err)
 			}
 			for i := range blocks {
 				value := byte(0)

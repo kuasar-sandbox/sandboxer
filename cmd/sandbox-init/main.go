@@ -227,7 +227,7 @@ func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
 			return fmt.Errorf("wait /dev/vda: %w", err)
 		}
 		// The single root disk is a writable ext4 CoW; mount it directly.
-		if err := unix.Mount("/dev/vda", "/sysroot", "ext4", 0, ""); err != nil {
+		if err := unix.Mount("/dev/vda", "/sysroot", "ext4", 0, "discard"); err != nil {
 			return fmt.Errorf("mount blk0 (ext4 rw) on /sysroot: %w", err)
 		}
 		logf("phase1a: single-disk root mounted at /sysroot")
@@ -244,7 +244,7 @@ func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
 		if err := unix.Mount("/dev/vda", "/overlay/lower", "erofs", unix.MS_RDONLY, ""); err != nil {
 			return fmt.Errorf("mount blk0 (erofs ro) on /overlay/lower: %w", err)
 		}
-		if err := unix.Mount("/dev/vdb", "/overlay/upper", "ext4", 0, ""); err != nil {
+		if err := unix.Mount("/dev/vdb", "/overlay/upper", "ext4", 0, "discard"); err != nil {
 			return fmt.Errorf("mount blk1 (ext4 rw) on /overlay/upper: %w", err)
 		}
 		if err := os.MkdirAll("/overlay/upper/upperdir", 0o755); err != nil {
