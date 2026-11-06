@@ -69,7 +69,7 @@ type SandboxConfig struct {
 	Restore RestoreConfig `yaml:"restore,omitempty"`
 
 	// Mounts / Files / Init drive guest environment setup (applied before
-	// the app is forked). See docs/sandbox.md §3.2.
+	// the app is forked). See docs/configuration.md#files-and-environment.
 	Mounts []MountConfig `yaml:"mounts,omitempty"`
 	Files  []FileConfig  `yaml:"files,omitempty"`
 	// EphemeralFiles are injected only for this cold-start invocation. They
@@ -183,7 +183,7 @@ func (c RestoreConfig) validate() error {
 // ResourcesConfig separates immutable VM capacity from the settled guest
 // headroom maintained by the local memory-Budget controller.
 //
-// See docs/sandbox.md §4.1 for the three deployment modes driven by
+// See docs/resources.md#deployment-modes for the three deployment modes driven by
 // Control.CgroupPath / Control.Controller presence.
 type ResourcesConfig struct {
 	DiffCOW     DiffCOWConfig     `yaml:"diff_cow,omitempty"`
@@ -321,7 +321,7 @@ type StartupConfig struct {
 // SensorRuntime returns the resolved sensor parameters, applying defaults
 // for any unset fields. Mode defaults to "psi"; trigger defaults to 10ms
 // of "some" stall accumulated within a 1s window (density-perf empirical
-// sweet spot — see docs/sandbox.md §10.3 tuning notes); debounce defaults
+// sweet spot — see docs/resources.md#pressure-sensor tuning notes); debounce defaults
 // to 100ms between RequestBudget calls.
 func (c *SandboxConfig) SensorRuntime() (mode string, stallUs, windowUs uint64, minInterval time.Duration) {
 	mode = "psi"
@@ -356,7 +356,7 @@ func (c *SandboxConfig) SensorRuntime() (mode string, stallUs, windowUs uint64, 
 // Source modes (at most one, see ValidateCold):
 //   - None: no virtio-net device; all guest-side network fields must be empty.
 //   - TAP: a pre-existing host tap; CH opens it by name (dev/e2e, no provider).
-//   - TapFD: tapfd handoff (docs/tapfd.md §3) — sandbox-ctl execs a helper that
+//   - TapFD: tapfd handoff (https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#dynamic-acquisition-contract-normative) — sandbox-ctl execs a helper that
 //     hands over a tap queue fd (with virtio-net header) + metadata.
 //
 // In TapFD mode the handoff metadata OVERRIDES the static identity attributes:
@@ -364,7 +364,7 @@ func (c *SandboxConfig) SensorRuntime() (mode string, stallUs, windowUs uint64, 
 // MTU stays a sandbox/node configuration value.
 type NetworkConfig struct {
 	TAP   string       `yaml:"tap,omitempty"`   // host tap name; CH opens it (attach, don't create)
-	TapFD *TapFDConfig `yaml:"tapfd,omitempty"` // tapfd handoff helper (docs/tapfd.md §3)
+	TapFD *TapFDConfig `yaml:"tapfd,omitempty"` // tapfd handoff helper (https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#dynamic-acquisition-contract-normative)
 
 	MAC       string `yaml:"mac,omitempty"`       // virtio-net MAC (CH --net mac=); empty + TAP mode → CH auto-assigns
 	IP        string `yaml:"ip,omitempty"`        // guest CIDR (IPv4/IPv6), e.g. "169.254.1.1/31". Empty → no IP config.
@@ -374,7 +374,7 @@ type NetworkConfig struct {
 	Interface string `yaml:"interface,omitempty"` // guest iface name; source set + empty → "eth0"
 }
 
-// TapFDConfig configures tapfd-handoff acquisition (docs/tapfd.md §3).
+// TapFDConfig configures tapfd-handoff acquisition (https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#dynamic-acquisition-contract-normative).
 // Exec mode spawns a provider helper with TAPFD_SOCKET pointing at an
 // inherited socketpair end. Socket mode dials a long-running provider and sends
 // Request as the OPEN request fields. Exactly one of Exec or Socket is set.
@@ -620,7 +620,7 @@ type OverlayConfig struct {
 	BaseFromRefs []string `yaml:"base_from_refs,omitempty"`
 	// Diff is the local sparse ext4 file collecting writes since boot.
 	// file:// only. Optional: empty → auto-default to
-	// file://<base-dir>/<sid>.overlay.diff (on disk, see docs/sandbox.md §3.1).
+	// file://<base-dir>/<sid>.overlay.diff (on disk, see docs/configuration.md#sandbox-yaml).
 	// An auto-defaulted diff is removed when the sandbox ends; an explicitly
 	// set diff is never removed.
 	Diff string `yaml:"diff"`
@@ -1021,7 +1021,7 @@ func (c *SandboxConfig) CPUWeight() uint64 {
 
 // ValidateCold checks invariants required for the cold-start path.
 //
-// Resource-control gating rules (see docs/sandbox.md §12):
+// Resource-control gating rules (see docs/runtime.md#sdk-validation):
 //   - Controller requires CgroupPath
 //   - Overhead / WatermarkHigh require CgroupPath
 //   - allocatable.cpu == capacity.cpu when CgroupPath is empty (no

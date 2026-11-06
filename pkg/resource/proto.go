@@ -23,7 +23,7 @@ const MaxMessageBytes = 64 * 1024
 // the encoded frame below MaxMessageBytes.
 const DefaultAdminListPageSize = 128
 
-// Message types. See docs/node.md §5.2.
+// Message types. See docs/resources.md#resource-protocol.
 const (
 	TypeAdmit          = "admit"
 	TypeAdmitResponse  = "admit_response"

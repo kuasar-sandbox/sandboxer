@@ -1,12 +1,22 @@
 # Owner-maintained user documentation inputs, relative to this repository.
 # The platform reads this file from the selected source revision.
 # Entries may be Markdown files, directories, or glob patterns; each must match.
-# Keep source/developer-only documentation outside the selected inputs.
+# These complete capability guides keep operator steps and their exact contracts.
 README.md
 README_zh.md
-docs/sandbox.md
-docs/sandbox_zh.md
-docs/sandbox-init.md
-docs/sandbox-init_zh.md
-docs/cloud-hypervisor.md
-docs/cloud-hypervisor_zh.md
+docs/runtime.md
+docs/runtime_zh.md
+docs/configuration.md
+docs/configuration_zh.md
+docs/artifacts.md
+docs/artifacts_zh.md
+docs/memory.md
+docs/memory_zh.md
+docs/block-storage.md
+docs/block-storage_zh.md
+docs/resources.md
+docs/resources_zh.md
+docs/guest-abi.md
+docs/guest-abi_zh.md
+docs/vmm.md
+docs/vmm_zh.md

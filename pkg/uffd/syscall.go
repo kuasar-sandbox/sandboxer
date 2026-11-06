@@ -9,7 +9,7 @@
 // every Absent fault becomes ZEROPAGE) and restore mode (snapshotReader
 // = StreamSnapshotSource, Absent → COPY from snapshot bytes).
 //
-// See sandbox.md §8 for the full contract.
+// See docs/memory.md#uffd for the full contract.
 package uffd
 
 import (

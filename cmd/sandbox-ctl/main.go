@@ -11,7 +11,7 @@
 //	checkpoint — list or delete local disk versions
 //	reset     — prepare E from an exact retained run's current disks
 //
-// See docs/sandbox.md for the full design.
+// See docs/runtime.md for the full design.
 package main
 
 import (
@@ -164,7 +164,7 @@ Output TARGET is a file path or journald=TAG[,FIELD=VALUE...]. Each journal
 output owns its fields independently; values use one-time percent decoding.
 No fields are inherited from other outputs or discovered from the environment.
 run --log-to selects only component diagnostics and defaults to stderr; it does
-not change guest stderr, TTY selection, or process descriptors. See docs/sandbox.md#journal-output-targets.
+not change guest stderr, TTY selection, or process descriptors. See docs/configuration.md#journal-output-targets.
 
 --manifest-config (or MANIFEST_CONFIG env) supplies the shared storage
 configuration. It is required for any manifest:// resource and for local
@@ -212,6 +212,6 @@ does not carry either identity.
 With --proxy it sends HTTP CONNECT directly to that endpoint and adds
 each repeatable --proxy-header without interpreting route/auth values.
 
-See docs/sandbox.md for the full design.
+See docs/runtime.md for the full design.
 `)
 }

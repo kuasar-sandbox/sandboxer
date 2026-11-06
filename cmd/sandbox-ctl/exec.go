@@ -40,7 +40,7 @@ func (e *envFlag) Set(v string) error {
 // pipes its stdio MUX back here. Exit status mirrors the guest process
 // (128+signo if it was signalled).
 //
-// Stdio model: docs/sandbox.md §2.2.
+// Stdio model: docs/runtime.md#run.
 func execCmd(args []string) int {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	sandboxID := fs.String("sandbox-id", "", "target sandbox id (local path fallback when --path-id is omitted)")
@@ -55,7 +55,7 @@ func execCmd(args []string) int {
 	var env envFlag
 	fs.Var(&env, "env", "environment variable KEY=VALUE (repeatable)")
 
-	// Same stdio model as `run` (docs/sandbox.md §2.2). No --console:
+	// Same stdio model as `run` (docs/runtime.md#run). No --console:
 	// the guest kernel dmesg belongs to the run process, not exec.
 	stdinFlag := fs.Bool("stdin", false, "pipe mode: connect command stdin to exec's stdin (default off → /dev/null)")
 	stdoutFlag := fs.Bool("stdout", true, "pipe mode: command stdout → exec stdout (default on; --stdout=false discards)")

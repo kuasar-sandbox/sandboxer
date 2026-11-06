@@ -18,7 +18,7 @@ import (
 // are strictly mutually exclusive (one required); --resume defaults to
 // false (post-snapshot the sandbox is destroyed via /vm.shutdown).
 //
-// See docs/sandbox.md §2.3.
+// See docs/runtime.md#snapshot.
 func snapshotCmd(args []string) int {
 	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
 	checkpoint := fs.String("checkpoint", "", "create a named local disk checkpoint")
@@ -73,7 +73,7 @@ func snapshotCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "snapshot: --checkpoint and --upload are mutually exclusive")
 		return 2
 	}
-	// Strict mutual exclusion (docs/sandbox.md §12.3).
+	// Strict mutual exclusion (docs/runtime.md#cli-validation).
 	if *upload && *outDir != "" {
 		fmt.Fprintln(os.Stderr, "snapshot: --output and --upload are mutually exclusive")
 		return 2

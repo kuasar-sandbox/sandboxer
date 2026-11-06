@@ -18,7 +18,7 @@ The repository is both a component of the complete Kuasar Sandbox platform and a
 
 - cold creation from a flattened image;
 - creation of independent instances from a snapshot template;
-- pause, snapshot, export, publish, restore, and resume of one logical sandbox;
+- snapshot, live export and publication, with optional resume of the original runtime;
 - on-demand guest-memory loading through an external memfd/userfaultfd path;
 - a vhost-user block backend for local files or Manifest-backed data, with an instance-specific copy-on-write diff;
 - controlled host/guest communication over vsock and a multiplexed stdio/port-forwarding path;
@@ -33,7 +33,7 @@ Snapshot reuse is represented by explicit parent and child references. Multiple 
 
 | Binary | Purpose |
 | --- | --- |
-| `sandbox-ctl` | Host control plane: run, snapshot, export, publish, restore, inspect, execute, and render configuration |
+| `sandbox-ctl` | Host CLI: run/restore, exec, snapshot, export, reset, checkpoint administration, usage, info, publish and configuration |
 | `sandbox-init` | Guest PID 1: staged initialization, application supervision, vsock control, stdio multiplexing, and guest lifecycle responses |
 
 `sandbox-init` is built here and packaged into `sandbox-runtime.bundle` by [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime).
@@ -42,15 +42,16 @@ Snapshot reuse is represented by explicit parent and child references. Multiple 
 
 | Package | Purpose |
 | --- | --- |
+| `pkg/runtime` | Public Runtime SDK: `StartRuntime`, `Launch`, `Start`, `Restore`, live operations and owner lifetime |
 | `pkg/resource` | Node resource-control wire contract and client, consumed by `orchestrator` |
 | `pkg/ctl` | Host-local control-socket protocol and policy callbacks for `ServeExecTunnel`; `ProxyExec` relays an already connected backend |
 | `pkg/usage` | Host-only cumulative resource usage, snapshots, records and offline readers |
 | `pkg/usagereader` | Shared lossless live/saved/history reads for the CLI and local conductor adapters |
-| `pkg/sandbox`, `pkg/restore`, `pkg/snapshot` | Lifecycle, restore, and snapshot orchestration |
+| `pkg/sandbox`, `pkg/restore`, `pkg/snapshot` | Lifecycle implementation, source preparation and capture helpers behind the public SDK |
 | `pkg/artifact` | Typed publication to a Manifest store or a named-location Bundle |
 | `pkg/uffd`, `pkg/memory` | On-demand memory loading and memfd ownership |
 | `pkg/vhost` | vhost-user-blk transport, queues and guest memory |
-| `pkg/diffstore` | [Writable disks, shared cache and single-layer/checkpoint storage](docs/diffstore.md) |
+| `pkg/diffstore` | [Writable disks, shared cache and single-layer/checkpoint storage](docs/block-storage.md) |
 | `pkg/guestlink`, `pkg/mux`, `pkg/proto`, `pkg/fwd`, `pkg/stdio` | Host/guest control, multiplexing, and forwarding |
 | `pkg/config`, `pkg/resctl`, `pkg/chapi`, `pkg/tapfd` | Runtime configuration, resource execution, Cloud Hypervisor API, and TAP handoff |
 
@@ -110,7 +111,7 @@ Unit and static checks do not prove that privileged KVM, TAP, cgroup, vhost, or 
 
 ## Cloud Hypervisor boundary
 
-`sandboxer` carries the project patch set and build support for Cloud Hypervisor. The patch set enables the external-memory, userfaultfd, balloon, and lifecycle contracts required by the runtime. Upstream source, the exact patch target, build inputs, and license boundary are documented in [`docs/cloud-hypervisor.md`](docs/cloud-hypervisor.md) and [`LICENSE_SCOPE.md`](LICENSE_SCOPE.md).
+`sandboxer` carries the project patch set and build support for Cloud Hypervisor. The patch set enables the external-memory, userfaultfd, balloon, and lifecycle contracts required by the runtime. Upstream source, the exact patch target, build inputs, and license boundary are documented in [`docs/vmm.md`](docs/vmm.md) and [`LICENSE_SCOPE.md`](LICENSE_SCOPE.md).
 
 Cloud Hypervisor remains third-party software under its upstream license. Project-original Go code is not used to relicense upstream code or patches that retain upstream copyright and licensing.
 
@@ -140,7 +141,7 @@ Use the [project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox) fo
 
 ## Release model
 
-Preview cleanup ignores historical `SHA256SUMS` and body records. Completeness uses exact package names and native asset IDs, sizes, digests and upload states; historical x86_64-only and complete dual-architecture packages are protected. Missing or ambiguous metadata is retained and reported. Cleanup rechecks the actual tag and Release before deletion, supports partial retries and treats only confirmed 404 as absence. The project release policy continues to define scope and retention.
+Shared Preview retention, cleanup, asset-completeness checks and Latest reconciliation are defined by the [project release contract](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md). The component-specific build inputs, package contents and helper selection follow below.
 
 The selected owner source declares its complete compiled E2E helper inventory in `release/helper-inputs.json`. Its recipe, `scripts/build-e2e-helpers.sh`, accepts the target architecture and a fresh output directory. It runs only during the source-build stage with the admitted dependency workspace; package preparation and case execution consume its verified binaries. Internal build targets and package paths remain owned here.
 
@@ -154,11 +155,27 @@ See the [project release documentation](https://github.com/kuasar-sandbox/kuasar
 
 ## Documentation
 
-- [sandbox.md](docs/sandbox.md) — host control and the entire sandbox lifecycle: configuration, output targets, resource usage, COW, artifact formats/publication, capture, restore, read recovery and cleanup.
-- [sandbox-init.md](docs/sandbox-init.md) — Guest PID 1 ABI, initialization, vsock, raw usage observations, stdio and application lifecycle.
-- [cloud-hypervisor.md](docs/cloud-hypervisor.md) — VMM integration, patches, build and runtime boundaries.
+Start with the [standalone Runtime workflow](docs/runtime.md#standalone-workflow).
+Use the [project Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md)
+for a platform deployment that combines components. The component handbook stays
+flat under `docs/`; each topic keeps the operation, stable contract and mechanism
+needed to understand one state owner or boundary.
 
-These three owner pairs provide complete English and Chinese contracts. Native-build and license-scope guides also have both editions. See the [documentation contribution policy](CONTRIBUTING.md#documentation) for section ownership and new-document requirements.
+| Topic | Use it for | Owns the exact contract |
+| --- | --- | --- |
+| [Runtime](docs/runtime.md) | Start, Launch, run, exec, snapshot, live export, restore and close one VM | Runtime state, API/CLI operation semantics, contexts and cross-resource capture |
+| [Configuration](docs/configuration.md) | Prepare and inspect sandbox.yaml or host overlays | Fields, defaults, validation, merges and output destinations |
+| [Artifacts](docs/artifacts.md) | Assemble E, reset retained state, inspect and publish E/S | Portable schemas, identity, dependency graphs, publication and retention |
+| [Memory](docs/memory.md) | Understand lazy restore and checkpoint memory | Memfd ownership, UFFD, layered reads, released pages and dirty history |
+| [Block storage](docs/block-storage.md) | Integrate Disk, operate disk checkpoints and diagnose block I/O | Vhost transport, immutable lowers, cache, DIFF v3/v4 and reclamation |
+| [Resources](docs/resources.md) | Set resource policy and read usage | Capacity/Budget, cgroups, balloon, resource protocol and cumulative accounting |
+| [Guest ABI](docs/guest-abi.md) | Prepare workloads or change host/Guest integration | sandbox-init phases, processes, filesystem, vsock, MUX and raw observations |
+| [VMM](docs/vmm.md) | Build a compatible monitor or maintain patches | Cloud Hypervisor/KVM integration, device model, handoffs and patch contracts |
+
+All eight topics have complete English and Chinese editions. Native-build and
+license-scope guides also have both editions. Use the guides from the same source
+or selected release as the binaries. The [contribution policy](CONTRIBUTING.md#documentation)
+defines ownership and how to preserve maintained contracts when reorganizing.
 
 ## Project boundaries
 

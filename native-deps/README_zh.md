@@ -3,8 +3,10 @@
 # sandboxer/native-deps
 
 本目录构建 `sandboxer` 运行期直接消费、但不属于 Go module 的原生产物。
-当前包含 patched `cloud-hypervisor`。`vmlinux`、`mkfs.erofs`、`fsck.erofs`
-和 `envd` 属于 `guest-runtime/native-deps`;`librocksdb` 属于 `accelerator`。
+当前包含 patched `cloud-hypervisor`。`vmlinux`、`envd` 属于
+`guest-runtime/native-deps`；`librocksdb` 属于 `accelerator`。
+
+Host 安装的 `erofs-utils` 提供 `mkfs.erofs` 及验证工具 `fsck.erofs`、`dump.erofs`；它们不是项目自行构建的 guest-runtime native 制品。
 
 ## 1. 产物
 
@@ -54,7 +56,7 @@ make cloud-hypervisor TARGET_ARCH=aarch64
 编译器安装和匹配的 module 源码,保留嵌套路径。模块解析沿用正常 Go 缓存与路由,
 下载模块的校验和须匹配二进制记录。只有明确单独采集的内部兄弟组件使用其自身
 源码材料;组织命名空间本身不豁免其他模块。官方包中不受支持的第三方本地替换
-需要改用带版本的 module 输入。现有 Kuasar 本地 `replace` 继续使用。
+需要改用带版本的 module 输入。独立构建使用 `go.mod` 的已发布版本；协同构建通过生成 Go workspace 的 `use` 条目选择已准入 sibling 模块，不修改 `go.mod`/`go.sum`。见[workspace 流程](../README_zh.md#跨仓依赖)。
 
 许可证和声明放在 `share/licenses/<component>`。声明缺失、目录不可读或遍历不完整时收集失败。包验证检查必需文件、载荷身份及归档路径、类型和权限。下载使用 GitHub 原生资产大小和摘要。新包和 Release 不携带来源或历史测试记录、独立 `SHA256SUMS`、来源/Preview 标记。发布者使用人类说明，检查本次构建输出，并拒绝覆盖同名不同内容资产。
 
@@ -139,15 +141,16 @@ make cloud-hypervisor
 - `build/src/cloud-hypervisor` 是 patch 工作区;不要在未 format patch 前
   清理该目录。
 
-patch 语义和设备模型详见 [cloud-hypervisor 文档](../docs/cloud-hypervisor_zh.md)。
+patch 语义和设备模型详见 [cloud-hypervisor 文档](../docs/vmm_zh.md)。
 
 ## 4. 与其他 native-deps 的边界
 
-```
-guest-runtime/native-deps ──► vmlinux / mkfs.erofs / fsck.erofs / envd
-sandboxer/native-deps     ──► cloud-hypervisor
-accelerator               ──► librocksdb
-```
+| 所属方 | 原生制品或工具 |
+| --- | --- |
+| `guest-runtime/native-deps` | `vmlinux`、`envd` |
+| Host 安装的 `erofs-utils` | `mkfs.erofs`、`fsck.erofs`、`dump.erofs` |
+| `sandboxer/native-deps` | Patched `cloud-hypervisor` |
+| `accelerator` | `librocksdb` |
 
 `cloud-hypervisor` 不进入 guest runtime 镜像;它是 host 侧 VMM 子进程。
 `vmlinux` 也不在本目录构建;它由 `guest-runtime` 独立发布,供 `sandbox-ctl`

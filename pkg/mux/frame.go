@@ -1,6 +1,6 @@
 // Package mux implements the stdio MUX sub-protocol that runs over the
 // vsock connection born from a launch / restore / attach / exec management
-// operation (docs/sandbox-init.md §4.5 / §4.6).
+// operation (docs/guest-abi.md#mux-wire and docs/guest-abi.md#mux-close).
 //
 // One MUX connection carries the user application's stdin/stdout/stderr
 // (pipe mode) or a single pty (tty mode), each as a logical stream,

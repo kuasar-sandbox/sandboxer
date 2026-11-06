@@ -6,7 +6,7 @@
 // from `sandbox-ctl snapshot` to the run process lives in
 // pkg/ctl (shared with the exec path).
 //
-// See sandbox.md §6 for the file format and timing.
+// See docs/runtime.md#capture-barrier for the file format and timing.
 package snapshot
 
 import (
@@ -71,7 +71,7 @@ type Sources struct {
 	// scheme-qualified file ref (memory section = [0,MemfdSize)). When set, Take flattens
 	// this run's resident memory delta ONTO it and absorbs the merged result as
 	// the new top — replacing the next-newest local layer instead of stacking
-	// (docs/sandbox.md#checkpoint-history §6.1.2). Per-disk overlay flattening is driven by
+	// (docs/artifacts.md#checkpoint-history). Per-disk overlay flattening is driven by
 	// DiskDiff.MergeBase.
 	// Empty ⇒ no merge (stack via the parent refs).
 	MergeBaseSnapshot string

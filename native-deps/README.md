@@ -4,8 +4,10 @@
 
 This directory builds native artifacts consumed directly by `sandboxer` at
 runtime but not included in its Go module. It currently contains patched
-`cloud-hypervisor`. `vmlinux`, `mkfs.erofs`, `fsck.erofs`, and `envd` belong to
-`guest-runtime/native-deps`; `librocksdb` belongs to `accelerator`.
+`cloud-hypervisor`. `vmlinux` and `envd` belong to
+`guest-runtime/native-deps`; `librocksdb` belongs to `accelerator`. Host-installed
+`erofs-utils` supplies `mkfs.erofs` and validation tools such as `fsck.erofs`
+and `dump.erofs`; they are not project-built guest-runtime native artifacts.
 
 ## 1. Artifact
 
@@ -63,7 +65,10 @@ normal Go cache and routing; downloaded module checksums must match the binaries
 Only explicitly collected internal sibling dependencies use their own source
 materials; an organization namespace alone does not exempt other modules.
 Unsupported third-party local replacements need versioned module inputs for
-the official package. Existing Kuasar local `replace` directives remain in use.
+the official package. Standalone builds use the published versions in `go.mod`. Coordinated builds
+select the admitted sibling modules through a generated Go workspace with `use`
+entries, leaving `go.mod` and `go.sum` unchanged; see the
+[workspace workflow](../README.md#cross-repository-dependencies).
 
 Licenses and notices live under `share/licenses/<component>`. Collection fails on missing notices, unreadable subtrees or partial traversals. Package validation checks required files, payload identities and archive paths, types and modes. Downloads use native GitHub asset sizes and digests. New packages and Releases contain no source or historical test records, independent `SHA256SUMS`, or source/Preview markers. The publisher uses human release notes, checks the current build outputs, and refuses to replace existing assets with different bytes.
 
@@ -163,15 +168,16 @@ Conventions:
   exporting local patch work with `ch-patches-format`.
 
 Patch semantics and the device model are specified in
-[cloud-hypervisor.md](../docs/cloud-hypervisor.md).
+[vmm.md](../docs/vmm.md).
 
 ## 4. Boundaries with other native dependencies
 
-```text
-guest-runtime/native-deps ──► vmlinux / mkfs.erofs / fsck.erofs / envd
-sandboxer/native-deps     ──► cloud-hypervisor
-accelerator               ──► librocksdb
-```
+| Owner | Native artifact or tool |
+| --- | --- |
+| `guest-runtime/native-deps` | `vmlinux`, `envd` |
+| Host `erofs-utils` installation | `mkfs.erofs`, `fsck.erofs`, `dump.erofs` |
+| `sandboxer/native-deps` | Patched `cloud-hypervisor` |
+| `accelerator` | `librocksdb` |
 
 `cloud-hypervisor` is a host VMM subprocess, not part of the guest runtime image.
 `vmlinux` is not built here either: `guest-runtime` releases it independently and

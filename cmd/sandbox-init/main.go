@@ -1,6 +1,6 @@
 // sandbox-init is the guest PID 1 binary inside the sandbox VM.
 //
-// It runs three phases (docs/sandbox-init.md §3):
+// It runs three phases (docs/guest-abi.md#initialization):
 //  1. Bring up loopback + bind AF_VSOCK :5000 (socket-only, before hello;
 //     the host→guest reverse channel must exist before the host's ping
 //     ticker fires). Then run the launch handshake (dial CID 2:5000 → hello
@@ -339,7 +339,7 @@ func phase1bSwitchRoot(cgroupControl bool) error {
 	}
 
 	// cgroup v2: the freeze domain for the user-app process tree
-	// (snapshot freeze/thaw, §3.4) + resource-controller delegation so
+	// (snapshot freeze/thaw, docs/guest-abi.md#quiesce) + resource-controller delegation so
 	// envd's in-guest cgroups get cpu/memory/io/pids (cgroup.go).
 	// Mounted post-chroot so the path is stable.
 	if err := cgroupMount(cgroupControl); err != nil {
@@ -483,7 +483,7 @@ func phase2ForkApp(spec *proto.LaunchSpec, cs childStdio, firstPrimary bool, onS
 	// never leaks its own (e.g. /proc) back. Cold-start mounts/files are
 	// already in place and become shared peers in the copy. Without this,
 	// a restore-time bind stays invisible to the already-running app
-	// (docs/sandbox-init.md §4.3).
+	// (docs/guest-abi.md#management-operations).
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_SHARED, ""); err != nil {
 		closeChildStdio(cs)
 		return 0, fmt.Errorf("make-rshared /: %w", err)

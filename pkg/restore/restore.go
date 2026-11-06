@@ -485,7 +485,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, fmt.Errorf("memory controller: %w", err)
 	}
-	// Build the layered memory source: [self bundle] ++ from_refs (§3.5). A
+	// Build the layered memory source: [self bundle] ++ from_refs (docs/memory.md#uffd). A
 	// non-resident page (hole) in an upper layer falls through to a lower
 	// layer; a page hole in every layer (merged hole) → ZEROPAGE. Single layer
 	// (no from_refs) degenerates to today's behaviour. Parent streams were
@@ -550,12 +550,12 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 
 	// Network: when the snapshot has a virtio-net device, re-acquire its host
 	// side for this restore. tapfd mode re-runs
-	// the configured handoff (docs/tapfd.md §4, idempotent) for a fresh queue
+	// the configured handoff (https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#persistent-provider-socket-normative, idempotent) for a fresh queue
 	// fd, passed to CH via --restore net_fds; tap-name mode lets CH reopen the
 	// named tap from the restored config. The merged metadata also yields the
 	// NetworkSpec the guest re-applies flush-and-replace (clone takes a fresh
 	// L3 identity; the MAC stays the snapshot's, so the provider must use a
-	// stable per-port MAC — see docs/tapfd.md §5).
+	// stable per-port MAC — see https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#lifetime-and-idempotency).
 	var tapFile, netnsFile *os.File
 	var metaMAC, metaIP string
 	if snapCfg.Network.TapFD != nil {
@@ -659,7 +659,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			return cmd, cleanup, nil
 		},
 
-		// Restore settle (docs/sandbox.md §7 T11-T15): wait until vm.info
+		// Restore settle (docs/runtime.md#restore T11-T15): wait until vm.info
 		// proves VmRestore completed in Paused state, then use /vm.resume
 		// to release the vCPUs from the snapshot point,
 		// then notify the guest (restore{epoch=1}) and turn that
@@ -806,7 +806,7 @@ func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cf
 }
 
 // reconstructDisk rebuilds one logical disk for restore: the read-only base is
-// [captured top] ++ chain (§3.5) layered into a Stream; a FRESH writable CoW is
+// [captured top] ++ chain (docs/block-storage.md#layered-reads) layered into a Stream; a FRESH writable CoW is
 // built on top (single mode: this IS the disk; overlay mode: the ext4 upper).
 // In overlay mode the erofs base (erofsBaseURI) is opened as the ro device.
 // capturedTop/chain come from Sandbox E's portable disk graph;

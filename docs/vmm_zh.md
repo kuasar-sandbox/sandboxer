@@ -1,16 +1,20 @@
-[English](cloud-hypervisor.md) | [简体中文](cloud-hypervisor_zh.md)
+[English](vmm.md) | [简体中文](vmm_zh.md)
 
-# cloud-hypervisor — VMM 与平台 patches
+# VMM 集成与 Cloud Hypervisor 补丁
 
-平台用 cloud-hypervisor(CH)作为 microVM 监视器。绝大多数路径跑 upstream
-行为,外部托管内存、restore-safe vsock 和可靠 VM lifecycle 通过本仓维护的
-0001–0008 补丁实现。0009 保留 ARM 快照寄存器，0010 和 0011 回移上游恢复顺序及
-HTTP allocator seccomp 修复。继续使用 CH v51.1 和 Host Linux 5.10 基线。
-本文档定义 patch 范围、构建方式及对应行为契约。
+本页定义 Host/VMM 集成边界及维护中的 Cloud Hypervisor 补丁契约。使用匹配 VMM 时先读设备/启动
+和行为章节，修改或移植集成时再读启用条件与各补丁。构建配方和原生材料采集仍见
+[native-deps](../native-deps/README_zh.md)。
 
-## 1. 概述
+Runtime 提供外部 RAM、协调暂停/恢复并控制设备；Cloud Hypervisor 负责 KVM/vCPU/设备执行。
+[内存](memory_zh.md)、[资源](resources_zh.md)和 [Runtime](runtime_zh.md)分别定义 Host 策略。
+补丁实现 VMM 一侧的契约，包括 checkpoint 内存变化累计记录，并不保证任意上游版本的快照互通。
 
-### 1.1 为什么需要 patch
+当前补丁系列以 Cloud Hypervisor **v51.1** 为目标，保留 Host Linux **5.10** 基线。0001–0008 提供外部 RAM/UFFD、vsock 与生命周期屏障，0009 保存 ARM 寄存器，0010/0011 回移 restore-order/seccomp 修复，0012 增加 checkpoint 内存变化累计记录。多数其他 VMM 路径沿用上游行为。
+
+<a id="patch-purpose"></a>
+
+## 为什么需要 patch
 
 平台对 VMM 有四条非 upstream 的诉求:
 
@@ -33,9 +37,11 @@ HTTP allocator seccomp 修复。继续使用 CH v51.1 和 Host Linux 5.10 基线
 是 CH 调外部 socket,handler 提供数据,但平台需要 handler 接管 fault 投递
 路由,upstream 的 listener 模型不够。此外这一模型带来一条派生修复:balloon
 释放路径对从未驻留的空洞也必须通知 REMOVE，因为惰性源仍可能含非零内容。
-0004 仅省略冗余 inode 打洞，不能省略必要释放通知（§3.4）。
+0004 仅省略冗余 inode 打洞，不能省略必要释放通知（[0004 — 先保留逻辑释放通知，再稀疏回收](#patch-0004)）。
 
-### 1.2 补丁范围与未来演进
+<a id="patch-scope"></a>
+
+## 补丁范围与未来演进
 
 每项补丁包含完整意图、对应修正及测试。下表旧编号指 #377 恢复的原十二项补丁。
 前十一项继续保持 #379 的维护范围。0012 独立维护完整累计内存日志；UFFD 接管继续使用原 ACK。
@@ -60,7 +66,9 @@ HTTP allocator seccomp 修复。继续使用 CH v51.1 和 Host Linux 5.10 基线
 表中的计划提交不表示上游已经接受。编号不是二进制兼容标识；应记录上游源码、完整
 补丁哈希和构建身份。#374 所指的原始旧 CH 仍是冻结、独立的制品。
 
-### 1.3 维护策略
+<a id="maintenance"></a>
+
+## 维护策略
 
 - 按顺序应用，每个前缀须可构建且完整实现已经声明的能力；配置随实际消费者引入。
 - 后续修复和回归测试并入功能所属补丁，不累积 fixup。保留原作者、上游链接及
@@ -77,7 +85,103 @@ HTTP allocator seccomp 修复。继续使用 CH v51.1 和 Host Linux 5.10 基线
   patch;vCPU kick 与 worker barrier 若有 upstream 等价修复,升级时应优先替换
   `0007`,不长期维护重复实现
 
-## 2. 启用条件与命令行
+<a id="boot-protocols"></a>
+
+## 启动协议(per-arch)
+
+CH 自适应启动协议,sandbox-ctl 命令行不区分 arch:
+
+| arch | 协议 | kernel 入口 | CH 准备 |
+|------|------|-------------|---------|
+| x86_64 | PVH | ELF entry,zero page 由 CH 填 | memmap(E820) + cmdline + ACPI 表 |
+| aarch64 | EFI stub + ACPI | PE Image start,EFI stub 解析 ACPI | UEFI memmap + ACPI 表 + GICv3 节点 |
+
+<a id="device-model"></a>
+
+### 设备模型(平台用法)
+
+CH 暴露给 guest 的设备清单(冷启动):
+
+```
+virtio-pmem    → sandbox-runtime.bundle (DAX, MAP_SHARED 共享 host page cache)
+virtio-blk × 2 → blk0 (base, ro) + blk1 (overlay COW, rw),vhost-user backend
+virtio-net     → 可选;配置网络源时为 eth0,host TAP 后端;无源时不创建设备
+virtio-console → hvc0,内核 dmesg;--console tty(写到 CH 进程的 stdout = sandbox-ctl
+                 给的匿名管道),--serial off(无 8250 UART)。CH 进程的 stdin=/dev/null
+                 故 CH 不 raw 化任何宿主终端。应用 stdio 不走此设备(走 vsock MUX)
+virtio-vsock   → CID=3。控制面短连接(launch / ping / app_started / app_exited /
+                 mem_report / quiesce / restore / attach)+ launch/restore/attach 那条
+                 连接握手后升级而成的应用 stdio MUX(详见 vsock 控制面 + console MUX 协议)
+virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on];sandbox-local
+                 BalloonController 通过 /vm.resize 推 target,并以 vm.info 的
+                 memory_actual_size 观察 current(见 Runtime Balloon);free_page_reporting
+                 不启用(mmu_notifier 广播压力可能影响 guest vsock 进展)
+virtio-mem     → host-driven 主动 unplug(CH 能力;当前固定 Capacity Budget 模型不启用)
+```
+
+上面的两块 virtio-blk 描述 root base/overlay 对;配置数据盘时还会增加对应设备槽位。
+
+restore 沿用 `config.json` 中的设备拓扑,不能新增或删除 virtio-net.sandboxer 在
+启动 CH 前要求 host restore 配置是否提供网络源与快照中的 NIC 是否存在一致.
+
+恢复路径设备拓扑通过 `--restore source_url=<state.json dir>` 从 snapshot
+state 还原,不需要重新指定 `--kernel` / `--vsock`。
+
+详细命令行示例与冷启动/恢复差异见 Runtime 的[冷启动 SDK](runtime_zh.md#runtime-sdk)
+与[恢复流程](runtime_zh.md#restore)。
+
+<a id="vsock-proxy"></a>
+
+### vsock hybrid 代理
+
+vsock 在 host 端通过 hybrid 代理映射到 UDS:
+
+```
+guest VM (CID=3) → CID=2 (host) → CH 把流量转发到
+  /run/sandbox/<sid>/vsock.sock_<port>     guest → host 方向(host 在该 UDS 上 listen)
+  /run/sandbox/<sid>/vsock.sock + "CONNECT <port>\n" 行    host → guest 方向(guest 在 port 上 listen)
+```
+
+host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回一行
+`OK <local_port>\n`(host 须先排空再读后续 payload),之后 CH 把流量代理到 guest
+对应 port 的 listener。两个方向的连接对 CH 而言都是普通字节流——`launch` /
+`restore` / `attach` 这三种连接在应用层握手后由 sandbox-ctl / sandbox-init 自行
+转入帧收发态(stdio MUX),CH 不感知。详细见 [Runtime](runtime_zh.md) [CH command line boundary](#vmm-command-line) 与
+[Guest ABI](guest-abi_zh.md) [通道与寻址](guest-abi_zh.md#channels)。
+
+<a id="behavior"></a>
+
+## 行为契约总结
+
+平台代码(sandbox-ctl + node-ctl)依赖的 CH 行为(包含 patch):
+
+| 行为 | upstream | patched |
+|------|----------|---------|
+| 不写 `fd=` 时的内存 backing | upstream memfd/file 路径 | 同一分配路径;不表示其他补丁禁用 |
+| 命令行写 `fd=` | ✗(parse 错误) | ✓(用 fd mmap,标记 user_managed)|
+| 命令行写 `fd=` + `uffd_socket=` | ✗ | ✓(创建 uffd + sendmsg + 等 ack)|
+| `/vm.snapshot` 对 user_managed zone | (不适用) | 跳过 dump,memory-ranges 表无此 zone |
+| `/vm.restore` 对 user_managed zone | (不适用) | 跳过 fill;配置 uffd 时由映射缺页触发外部 handler |
+| balloon release 对 file-backed region 的空洞 run | 原 release 路径 | 始终通知 REMOVE；仅省略冗余 `PUNCH_HOLE` |
+| balloon `deflate_on_oom=on` | ✓(v51.1 已就绪) | ✓ |
+| `vm.resize` `desired_balloon` | ✓ | ✓(sandbox-local BalloonController 调用)|
+| virtio-mem `vm.resize` | ✓ | ✓ |
+| vsock local-port cursor 跨 restore | ✗ | ✓(`VsockState.local_port_last`) |
+| vsock backend/guest transport epoch 对齐 | ✗ | ✓(reset event + RX acknowledgement gate) |
+
+平台**不**使用 `free_page_reporting`。在统一 memfd / 外部 uffd 模型下,持续
+`madvise(MADV_DONTNEED)` 可能产生 mmu_notifier/EPT 与 IPI shootdown 压力,
+影响 guest vsock 进展(机理与替代反馈环见
+[Guest Kernel §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux_zh.md#为什么不启用-free_page_reporting以及-virtio_mem-的角色))。改由 sandbox-local BalloonController
+经 `/vm.resize` 推 inflate target;steady shrink 每份 fresh report 最多一个
+64MiB step。冷启动命令行 target
+覆盖的稀疏区间与运行时驻留回收都由 0004 保留 REMOVE，只跳过冗余打洞。4 KiB Host 上的冷创建 VM 合并连续 PFN，
+以减少同步 REMOVE 处理次数（[0004 — 先保留逻辑释放通知，再稀疏回收](#patch-0004)）。
+`deflate_on_oom` 是 upstream v51.1 原生,无需新 patch。
+
+<a id="activation"></a>
+
+## 启用条件与命令行
 
 CH `--memory-zone` 增加两个 key:
 
@@ -106,11 +210,18 @@ cloud-hypervisor \
 # fd=3 ← memfd from sandbox-ctl via cmd.ExtraFiles[0]
 ```
 
-解析器要求 zone `id`;平台使用 `ram0`。详细命令行(冷启动 / 恢复)见 [sandbox_zh.md](sandbox_zh.md) §5.2 与 §7。
+解析器要求 zone `id`，平台使用 `ram0`。详细命令行见 [CH 参数边界](#vmm-command-line)，
+恢复顺序见 [Runtime 恢复流程](runtime_zh.md#restore)。
 
-## 3. patch 提交结构
+<a id="patches"></a>
 
-### 3.1 0001 — externally allocated memfd-backed memory zone
+## patch 提交结构
+
+
+
+<a id="patch-0001"></a>
+
+### 0001 — externally allocated memfd-backed memory zone
 
 主题:**memory: support externally allocated memfd-backed memory zone**
 
@@ -133,7 +244,9 @@ cloud-hypervisor \
 表,**这两处不需要单独 patch**——靠 commit 0002 在 `memory_range_table` 处过滤
 即可同时影响快照和恢复路径。
 
-### 3.2 0002 — snapshot skip user-managed memory zones
+<a id="patch-0002"></a>
+
+### 0002 — snapshot skip user-managed memory zones
 
 主题:**snapshot: skip user-managed memory zones**
 
@@ -154,7 +267,9 @@ share-storage live migration 场景)。我们的 user_managed zone 满足"file-b
 + MAP_SHARED",但 memfd 没有 hardlink(`st_nlink == 0`),所以不能复用现有
 分支——添加平行分支识别 `user_managed` 标志。
 
-### 3.3 0003 — external uffd handler via in-process create + SCM_RIGHTS
+<a id="patch-0003"></a>
+
+### 0003 — external uffd handler via in-process create + SCM_RIGHTS
 
 主题:**memory: external uffd handler via in-process create + SCM_RIGHTS handoff**
 
@@ -250,7 +365,9 @@ guest 的 pinning/prefetch 可能填充候选页，因此 E2E 本身不能证明
 结合现有 KVM 内存压力覆盖执行两类测试，并验证 Linux 5.10 最低版本。
 这些是验证要求，不代表尚未执行的测试已经通过。
 
-### 3.4 0004 — 先保留逻辑释放通知，再稀疏回收
+<a id="patch-0004"></a>
+
+### 0004 — 先保留逻辑释放通知，再稀疏回收
 
 释放实现和 seccomp 策略位于 `virtio-devices`。
 `vmm/src/vm.rs` 和 `device_manager.rs` 将 VM 创建来源传给 balloon。
@@ -306,14 +423,18 @@ E2E。普通测试覆盖对齐错误和真实打洞失败。保留旧实现失�
 均不重置状态。既有层叠与载体保留 Zero，保证无需 refault 或预填全部 RAM 即可
 正确捕获、恢复。不增加 memory.dirty、新 dirty API 或历史裁剪；这些仍留在 #374。
 
-### 3.5 0005 — 持久化 vsock host local-port 游标
+<a id="patch-0005"></a>
+
+### 0005 — 持久化 vsock host local-port 游标
 
 CH 的 Unix vsock backend 在 restore 时重新创建。若 host local-port 分配器回到
 `0x40000000`,首个 host-init 连接可能复用 guest 快照里仍存在的四元组并收到 RST。
 patch 把 `local_port_last` 纳入 `VsockState`,恢复 backend 后从下一端口继续分配。
 该状态在嵌套快照中逐层保存,不是只覆盖一次 restore 的进程内游标。
 
-### 3.6 0006 — snapshot 时预发布 vsock transport reset
+<a id="patch-0006"></a>
+
+### 0006 — snapshot 时预发布 vsock transport reset
 
 仅避免端口复用仍不完整:CH 不序列化 backend connection map,而 guest 内核会把
 连接 socket、credit 与关闭状态一并带入快照。restore 后两端因此处于不同 transport
@@ -341,7 +462,9 @@ snapshot staging 会先排空 reset 之前已经到达的 eventfd kick。设备�
 阶段若 descriptor 缺失或非法会明确失败;目标 restore activation 即使没有任何新
 available descriptor 也必须成功,因为 reset 已经存在于快照的 used ring 中。
 
-### 3.7 0007 — vCPU 生命周期请求与确认
+<a id="patch-0007"></a>
+
+### 0007 — vCPU 生命周期请求与确认
 
 CH v51.1 用 no-op `SIGRTMIN` handler 中断 `KVM_RUN`:控制线程先发布 pause/kill
 状态,再 `pthread_kill` 每个 vCPU,等待 vCPU loop 写入 acknowledgement。若 signal
@@ -371,7 +494,10 @@ patch 通过两组 vCPU lifecycle barrier 修复关闭该问题:
    unpark 并等待已参与 vCPU 恢复;NMI 即使 signal 超时也会完成 ACK-clear cleanup,
    两条错误路径都使用独立的新 deadline。非 KVM backend 保留 10 ms retry。所有等待
    统一使用 `CLOCK_MONOTONIC` 语义的 1 s deadline。
-### 3.8 0008 — virtio worker 暂停与恢复握手
+
+<a id="patch-0008"></a>
+
+### 0008 — virtio worker 暂停与恢复握手
 
 runtime pause 先发布共享 pause event,再显式 unpark 所有普通与自定义 worker,
    关闭 worker 的 zero-time epoll poll 到 `thread::park` 之间的启动竞态。resume 先
@@ -383,7 +509,9 @@ runtime pause 先发布共享 pause event,再显式 unpark 所有普通与自定
 这些生命周期 patch 不改变 sandbox 配置、CH HTTP API、snapshot 格式或资源协议,也不在
 lifecycle 前后修改 `cpu.max`。超时仍是最终有界失败保护,不是竞态修复方法。
 
-### 3.9 0009 — 完整 ARM CPU 快照寄存器
+<a id="patch-0009"></a>
+
+### 0009 — 完整 ARM CPU 快照寄存器
 
 启用 SVE 的 ARM 主机通过 KVM 的 SVE Z/P/FFR 寄存器暴露向量状态。
 访问旧 FPSIMD V 寄存器偏移会返回 `EINVAL`;因此 VM 可以正常冷启动运行,
@@ -419,7 +547,9 @@ Cloud Hypervisor 二进制执行真实冷启动、guest exec、快照与恢复�
 非 SVE 状态,但不承诺跨主机 CPU 特性兼容,也不承诺向未打补丁的 VMM 反向恢复。
 SVE 保持启用,不兼容寄存器状态通过已有 KVM 错误失败。
 
-### 3.10 0010 — 在 vCPU 前恢复 KVM 时钟
+<a id="patch-0010"></a>
+
+### 0010 — 在 vCPU 前恢复 KVM 时钟
 
 补丁 0010 回移上游 [commit ff20f183647c602bf5e5028d99959e5547a7dd84](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/ff20f183647c602bf5e5028d99959e5547a7dd84)，
 保留 CMGS 的作者归属和 sign-off。固定的 v51.1 恢复路径可能在还原已保存的 x86
@@ -433,7 +563,9 @@ identity；不具备对应身份的既有二进制不能用于验证回移。重
 `snapshot.restore`，之后执行普通全量 E2E。记录原生架构和产品来源；仅交叉编译不会
 执行真实 KVM resume。小样本成功不能确定故障率，也不能据此诊断其他恢复错误。
 
-### 3.11 0011 — HTTP allocator seccomp 兼容
+<a id="patch-0011"></a>
+
+### 0011 — HTTP allocator seccomp 兼容
 
 大 HTTP 分配或释放可能触发 glibc 惰性读取 `/proc/sys/vm/overcommit_memory`，
 也可能通过 mremap 扩展映射。即使 API 操作有效，v51.1 的 HTTP filter 仍可能使
@@ -454,7 +586,9 @@ cargo test --locked -p vmm --no-default-features --features kvm --lib seccomp_fi
 这是 allocator 兼容回补，不新增脏页 API 或响应格式。mremap 是上游兼容修复，
 并不能证明它是此前每次 API EOF 所触发的系统调用。
 
-### 3.12 0012 — checkpoint 内存变化累计记录
+<a id="patch-0012"></a>
+
+### 0012 — checkpoint 内存变化累计记录
 
 外部 RAM 在内存初始化阶段启用 KVM 日志，并在任何清理前保存软件 seed 写入。
 CPU/KVM、CH AtomicBitmap 和原始写入（net RX、vsock buffer、快照 reset/event/used ring）
@@ -490,7 +624,9 @@ d1719ac8，相比 ad5f3eea 仅新增无关的迁移超时处理；继续固定 C
 测试的 CH。两种原生架构均验证旧 CH 冷捕获和新四条目快照由旧 CH 恢复，包括一次性
 能力识别、释放与重用。helper 记录应用后源码 tree、补丁及二进制哈希，不作为产品 VMM。
 
-## 4. 构建工作流
+<a id="build"></a>
+
+## 构建工作流
 
 `sandboxer/native-deps` 从固定 v51.1 tarball 构建,应用
 `git am deps/ch-patches/*.patch`,再执行 `cargo build --release --locked`。
@@ -504,93 +640,9 @@ d1719ac8，相比 ad5f3eea 仅新增无关的迁移超时处理；继续固定 C
 `ch-fetch` / `ch-patches-format`、幂等检查、产物同步与边界见
 [Native Build 文档](../native-deps/README_zh.md)。
 
-## 5. 启动协议(per-arch)
+<a id="limitations"></a>
 
-CH 自适应启动协议,sandbox-ctl 命令行不区分 arch:
-
-| arch | 协议 | kernel 入口 | CH 准备 |
-|------|------|-------------|---------|
-| x86_64 | PVH | ELF entry,zero page 由 CH 填 | memmap(E820) + cmdline + ACPI 表 |
-| aarch64 | EFI stub + ACPI | PE Image start,EFI stub 解析 ACPI | UEFI memmap + ACPI 表 + GICv3 节点 |
-
-### 5.1 设备模型(平台用法)
-
-CH 暴露给 guest 的设备清单(冷启动):
-
-```
-virtio-pmem    → sandbox-runtime.bundle (DAX, MAP_SHARED 共享 host page cache)
-virtio-blk × 2 → blk0 (base, ro) + blk1 (overlay COW, rw),vhost-user backend
-virtio-net     → 可选;配置网络源时为 eth0,host TAP 后端;无源时不创建设备
-virtio-console → hvc0,内核 dmesg;--console tty(写到 CH 进程的 stdout = sandbox-ctl
-                 给的匿名管道),--serial off(无 8250 UART)。CH 进程的 stdin=/dev/null
-                 故 CH 不 raw 化任何宿主终端。应用 stdio 不走此设备(走 vsock MUX)
-virtio-vsock   → CID=3。控制面短连接(launch / ping / app_started / app_exited /
-                 mem_report / quiesce / restore / attach)+ launch/restore/attach 那条
-                 连接握手后升级而成的应用 stdio MUX(详见 sandbox-init_zh.md §4)
-virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on];sandbox-local
-                 BalloonController 通过 /vm.resize 推 target,并以 vm.info 的
-                 memory_actual_size 观察 current(见 [sandbox_zh.md](sandbox_zh.md) §9.3);free_page_reporting
-                 不启用(mmu_notifier 广播压力可能影响 guest vsock 进展)
-virtio-mem     → host-driven 主动 unplug(CH 能力;当前固定 Capacity Budget 模型不启用)
-```
-
-上面的两块 virtio-blk 描述 root base/overlay 对;配置数据盘时还会增加对应设备槽位。
-
-restore 沿用 `config.json` 中的设备拓扑,不能新增或删除 virtio-net.sandboxer 在
-启动 CH 前要求 host restore 配置是否提供网络源与快照中的 NIC 是否存在一致.
-
-恢复路径设备拓扑通过 `--restore source_url=<state.json dir>` 从 snapshot
-state 还原,不需要重新指定 `--kernel` / `--vsock`。
-
-详细命令行示例与冷启动/恢复差异见 [sandbox_zh.md](sandbox_zh.md) §5(冷启动
-数据流)与 §7(恢复数据流)。
-
-### 5.2 vsock hybrid 代理
-
-vsock 在 host 端通过 hybrid 代理映射到 UDS:
-
-```
-guest VM (CID=3) → CID=2 (host) → CH 把流量转发到
-  /run/sandbox/<sid>/vsock.sock_<port>     guest → host 方向(host 在该 UDS 上 listen)
-  /run/sandbox/<sid>/vsock.sock + "CONNECT <port>\n" 行    host → guest 方向(guest 在 port 上 listen)
-```
-
-host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回一行
-`OK <local_port>\n`(host 须先排空再读后续 payload),之后 CH 把流量代理到 guest
-对应 port 的 listener。两个方向的连接对 CH 而言都是普通字节流——`launch` /
-`restore` / `attach` 这三种连接在应用层握手后由 sandbox-ctl / sandbox-init 自行
-转入帧收发态(stdio MUX),CH 不感知。详细见 [sandbox_zh.md](sandbox_zh.md) §5.2 与
-[sandbox-init_zh.md](sandbox-init_zh.md) §4.2。
-
-## 6. 行为契约总结
-
-平台代码(sandbox-ctl + node-ctl)依赖的 CH 行为(包含 patch):
-
-| 行为 | upstream | patched |
-|------|----------|---------|
-| 不写 `fd=` 时的内存 backing | upstream memfd/file 路径 | 同一分配路径;不表示其他补丁禁用 |
-| 命令行写 `fd=` | ✗(parse 错误) | ✓(用 fd mmap,标记 user_managed)|
-| 命令行写 `fd=` + `uffd_socket=` | ✗ | ✓(创建 uffd + sendmsg + 等 ack)|
-| `/vm.snapshot` 对 user_managed zone | (不适用) | 跳过 dump,memory-ranges 表无此 zone |
-| `/vm.restore` 对 user_managed zone | (不适用) | 跳过 fill;配置 uffd 时由映射缺页触发外部 handler |
-| balloon release 对 file-backed region 的空洞 run | 原 release 路径 | 始终通知 REMOVE；仅省略冗余 `PUNCH_HOLE` |
-| balloon `deflate_on_oom=on` | ✓(v51.1 已就绪) | ✓ |
-| `vm.resize` `desired_balloon` | ✓ | ✓(sandbox-local BalloonController 调用)|
-| virtio-mem `vm.resize` | ✓ | ✓ |
-| vsock local-port cursor 跨 restore | ✗ | ✓(`VsockState.local_port_last`) |
-| vsock backend/guest transport epoch 对齐 | ✗ | ✓(reset event + RX acknowledgement gate) |
-
-平台**不**使用 `free_page_reporting`。在统一 memfd / 外部 uffd 模型下,持续
-`madvise(MADV_DONTNEED)` 可能产生 mmu_notifier/EPT 与 IPI shootdown 压力,
-影响 guest vsock 进展(机理与替代反馈环见
-[Guest Kernel §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux_zh.md#55-为什么不启用-free_page_reporting以及-virtio_mem-的角色))。改由 sandbox-local BalloonController
-经 `/vm.resize` 推 inflate target;steady shrink 每份 fresh report 最多一个
-64MiB step。冷启动命令行 target
-覆盖的稀疏区间与运行时驻留回收都由 0004 保留 REMOVE，只跳过冗余打洞。4 KiB Host 上的冷创建 VM 合并连续 PFN，
-以减少同步 REMOVE 处理次数（§3.4）。
-`deflate_on_oom` 是 upstream v51.1 原生,无需新 patch。
-
-## 7. 已知限制
+## 已知限制
 
 - **包括 v52 及之后的 upstream 升级**:依据实际 `vmm/src/memory_manager.rs` 变化
   复核 0001/0002;0003 的 uffd ioctl 需要重点检查。0004 同时修改 balloon release
@@ -604,14 +656,25 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
   zone(NUMA / virtio-mem 横向扩展)需要在 patch 0003 处对每 zone 各自 sendmsg
   一次,sandbox-ctl 端各自维护 addrMap
 
-## 8. See Also
+<a id="vmm-command-line"></a>
 
-- [sandbox_zh.md](sandbox_zh.md) §5(冷启动数据流,§5.2 CH 命令行)/ §7(恢复
-  数据流)—— sandbox-ctl 怎么用 patched CH 跑沙箱;命令行示例
-- [sandbox_zh.md](sandbox_zh.md) §8(uffd handler)—— sandbox-ctl 接收到 uffd_C
-  之后如何处理 fault 事件
-- [Guest Kernel](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux_zh.md) —— guest kernel 如何配合 CH 启动
-  协议(PVH / EFI stub)
-- [Native 构建](../native-deps/README_zh.md) —— `make cloud-hypervisor` 工作流与 patch
-  开发循环
-- [系统总览 §3.2](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md#32-组件职责) —— VMM 与 Guest 环境在系统中的位置
+### CH command line boundary
+
+Cold start 用 host-bound kernel/runtime paths、memfd、vhost sockets、active diffs 和 optional net provider构建 CH argv. Portable config从不保存这些绝对 path/fd.
+
+Block devices只绑定 logical Payload:
+
+- Container image或 direct EROFS E:EROFS prefix only.
+- Parent E作为 ext4 layer:E root payload only.
+- Current run-from E:self resolves to E payload section only.
+- ZIP tail永不暴露给 vhost.
+
+CH stdin固定 `/dev/null`;console output由 sandbox-ctl bridge. Net provider为 TAP 或 TapFD,而 portable topology只说明 NIC是否存在和 interface name.
+
+<a id="related"></a>
+
+## 相关文档
+
+[Runtime：启动、控制、捕获与恢复](runtime_zh.md) | [Sandbox 配置参考](configuration_zh.md) | [Sandbox 与 Snapshot 制品](artifacts_zh.md) | [Guest 内存与按需恢复](memory_zh.md) | [块存储：设备、可写状态与 Checkpoint](block-storage_zh.md) | [资源控制与 Usage 计量](resources_zh.md) | [Guest ABI：启动、应用与 Host 协议](guest-abi_zh.md)
+
+[组件入口](../README_zh.md) · [构建与补丁材料](../native-deps/README_zh.md)

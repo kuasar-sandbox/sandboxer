@@ -30,7 +30,7 @@ import (
 // orchestrator, systemd unit, or operator script). sandbox-ctl never
 // creates the directory and never rmdir on exit — ownership is
 // external. Empty Path means "no cgroup operations" (no-cgroup mode in
-// docs/sandbox.md §4.1).
+// docs/resources.md#deployment-modes).
 //
 // MemoryMaxBytes is written verbatim to memory.max. A zero MemoryHighBytes is
 // the cold/restore deferred sentinel and writes "max" explicitly, so an
@@ -49,7 +49,7 @@ import (
 // the floor enforcement under contention.
 //
 // CPUWeight is clamp(round(allocatable.cpu * 100), 1, 10000); see
-// docs/sandbox.md §9.2.
+// docs/resources.md#cpu-enforcement.
 type CgroupConfig struct {
 	Path            string
 	FD              int

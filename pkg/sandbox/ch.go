@@ -30,8 +30,7 @@ func CHCommand(cfg *config.SandboxConfig, disks []DiskArg, chSock, vsockSock, ke
 // vsock kthread — see resctl/balloon.go); the sandbox-local MemoryController
 // combines guest reports with CH target/current observations before resize.
 //
-// uffdSock is the path of the va_report UDS server (cloud-hypervisor.md
-// §3.3). Patched CH connects to it during create_ram_region.
+// uffdSock is the path of the va_report UDS server (docs/vmm.md#patch-0003). Patched CH connects to it during create_ram_region.
 //
 // The memfd fd and uffd fd are inherited via cmd.ExtraFiles; CH sees
 // them at fd=3 and fd=4 respectively, referenced in --memory-zone.
@@ -43,7 +42,7 @@ func CHCommand(cfg *config.SandboxConfig, disks []DiskArg, chSock, vsockSock, ke
 // so `--console tty` never raw-izes a controlling terminal. `--serial
 // off` — no 8250 UART; cmdline pins `console=hvc0`. The application's
 // stdin/stdout/stderr do NOT travel via the console — they go over the
-// vsock stdio MUX (pkg/mux). See docs/sandbox.md §5.2.
+// vsock stdio MUX (pkg/mux). See docs/vmm.md#vmm-command-line.
 func CHCommandWithInitialBudget(cfg *config.SandboxConfig, initialBudget uint64, disks []DiskArg, chSock, vsockSock, kernelPath, runtimePath, uffdSock, consoleArg string, tapFDNum int, netMAC string) ([]string, error) {
 	capBytes, err := cfg.CapacityMemoryBytes()
 	if err != nil {
@@ -137,10 +136,10 @@ func CHCommandWithInitialBudget(cfg *config.SandboxConfig, initialBudget uint64,
 
 // chNetArg builds CH's --net value. tapfd handoff (tapFDNum>0) drives
 // virtio-net off a pre-opened tap queue fd inherited by CH (vnet_hdr framing,
-// docs/tapfd.md §2.6); a non-empty tapName selects a named host tap; with
+// https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#tun-flags-on-transferred-descriptors); a non-empty tapName selects a named host tap; with
 // neither source it returns empty so CH creates no network device. A non-empty
 // mac is mirrored onto virtio-net so the provider's data plane accepts the guest
-// (docs/tapfd.md §5); empty → CH auto-assigns. id=_net0 names the device so
+// (https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#lifetime-and-idempotency); empty → CH auto-assigns. id=_net0 names the device so
 // restore can re-bind a fresh fd via --restore net_fds (see restore path).
 func chNetArg(tapName string, tapFDNum int, mac string) string {
 	macPart := ""

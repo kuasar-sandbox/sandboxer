@@ -1,6 +1,6 @@
 // Package fwd implements the per-connection frame sub-protocol that
 // carries `sandbox-ctl run --connect` port-forward traffic over a
-// reverse-channel vsock connection (docs/sandbox-init.md §3.7 / §4).
+// reverse-channel vsock connection (docs/guest-abi.md#forward-sessions and docs/guest-abi.md#control-and-mux).
 //
 // Unlike the stdio MUX (pkg/mux), which multiplexes several
 // fixed streams over one connection and therefore needs per-stream
