@@ -45,7 +45,8 @@ flowchart TB
 Runtime Bundle 是共享只读 Host backing file。Guest 内核挂载它并执行 `/sbin/init`；Init 组装并切换
 工作负载 root、应用 LaunchSpec、接好 stdio，然后监督主进程。Private 模式中主进程是自身 namespace 的 PID 1。
 
-Host endpoint 为 `/run/sandbox/<sid>/vsock.sock`。Launch、ping、应用 started/exited 通知使用下文
+Host endpoint 为 `RunRoot/PathID/vsock.sock`。`RunRoot` 默认 `/run/sandbox`；
+`PathID` 默认 `SandboxID`，也可独立指定（[Host 路径](runtime_zh.md#run)）。Launch、ping、应用 started/exited 通知使用下文
 控制路径；launch 连接升级为承载应用 stdio 的 MUX。内核 hvc0 输出走独立 CH console 路径。
 应用无 restart 地退出时，Init 通知 Host 并 power off；CH 随后退出，Host owner 观测该退出结果。
 
@@ -1003,10 +1004,10 @@ vsock 端口固定 `5000`,**两个方向都复用同一端口号**,身份按方�
                       │ sandbox-ctl (host)         │                    │ sandbox-init (guest)    │
                       │                            │                    │                         │
   guest → host  ────► │ listen UDS                 │ ◄──── CH proxy ─── │ AF_VSOCK dial CID=2:5000│
-                      │ /run/sandbox/<sid>/vsock.sock_5000 │                    │                         │
+                      │ /run/sandbox/<path-id>/vsock.sock_5000 │                    │                         │
                       │                            │                    │                         │
   host → guest  ────► │ dial UDS                   │ ───── CH proxy ──► │ AF_VSOCK listen :5000   │
-                      │ /run/sandbox/<sid>/vsock.sock      │ + "CONNECT 5000\n" │                         │
+                      │ /run/sandbox/<path-id>/vsock.sock      │ + "CONNECT 5000\n" │                         │
                       └────────────────────────────┘                    └─────────────────────────┘
 ```
 
