@@ -114,6 +114,7 @@ This is an annotated JSON example; comments are explanatory, not literal JSON:
 
 ```jsonc
 {
+  "initial_launch_token": "<host-launch-token>", // operation identity, not portable policy
   "exec": "/usr/bin/foo",
   "args": ["arg1", "arg2"],
   "env": {"PATH": "...", "HOME": "/root"},
@@ -246,7 +247,8 @@ them until thaw ([Phase 3: supervisor](#supervision)).
   [run signal handling](../pkg/sandbox/run_signal.go).
 - **If guest PID 1 itself receives SIGTERM/SIGINT**, it sets shutdown,
   forwards launch.stop_signal (default SIGTERM, resolved from image/YAML
-  policy) to the primary PID, waits launch.stop_grace_period (default 10 s),
+  policy) to the primary PID, waits the wire `stop_grace_sec` (default 10 s,
+  derived from host YAML `launch.stop_grace_period`),
   kills on timeout and powers off. These settings govern that guest path;
   they are not a guaranteed host VMM teardown handshake.
 - In tty mode the host terminal is raw. Keyboard Ctrl-C (0x03) travels as a byte
@@ -392,7 +394,7 @@ After switch-root hides `/overlay/upper`, the bind retains an ext4 inode
 reference, leaving volume content accessible at its target without exposing
 the raw ext4 layout.
 
-**Payload relocation and version pinning:** B6 binds the pmem payload root
+**Payload relocation and version pinning:** C5 binds the pmem payload root
 under sysroot before switch-root. E carries it into `/`; the bind's pmem inode
 reference keeps it alive after the old mount loses pathname reachability.
 Before phase 2 forks the app, recursive shared propagation makes the mount
@@ -589,6 +591,8 @@ after switch-root.
 6. write launch_ack{stdio: actual enabled channels}
    This connection is retained for MUX traffic.
 7. read ack: host confirms the transition to MUX.
+   Attach the MUX session and start app-fd <-> MUX bridge goroutines before
+   forking the primary helper.
 8. Start the first primary helper through exec.Cmd:
    SysProcAttr.Cloneflags = CLONE_NEWNS [| CLONE_NEWPID in default private mode]
      private: the app is PID 1 in its own PID namespace.
@@ -607,9 +611,12 @@ after switch-root.
          or "-" for no credential drop.
    placeholder: identical helper setup, but finally waits for signals instead
                 of executing an external program.
-   env: spec.Env, adding default PATH if absent.
+   env: spec.Env; only an entirely empty map receives the default PATH.
+        A nonempty map without PATH does not receive one.
 9. The helper waits at the internal SOCK_STREAM start gate until the parent
-   registers its PID. In its private mount namespace it marks / recursively
+   releases setup. Restart paths register the PID before releasing this gate;
+   the first primary is recorded after helper completion, before the reaper runs.
+   In its private mount namespace the helper marks / recursively
    slave to prevent reverse propagation, unmounts inherited guest-global
    cgroup2 and remounts cgroup2 at /sys/fs/cgroup. The new cgroup namespace
    scopes real /app as /.
@@ -634,15 +641,31 @@ after switch-root.
     freezer. The host forces restart=always, so killing it from exec restarts
     it in place. Guest PID 1's shutdown path sets shutdown before stopping it.
     Host VMM teardown is a separate path (Signal handling).
-11. Parent PID 1 waits for EOF on the internal CLOEXEC socket to confirm the
-    final execve, then:
-    - starts app-fd <-> MUX bridge goroutines (Application stdio and console wiring). App ends are replaceable
-      by generation; an in-place restart drains the old output generation
-      before installing new fds, with a bounded fallback (Phase 3: supervisor).
-      The same MUX session and streams survive the restart;
-    - short-conn dials host:5000, sends app_started{pid}, waits for ack, closes;
-    - starts launch.plugin[] companions, then enters phase 3.
+11. After the setup/ready/go exchange, parent PID 1 accepts an empty EOF on
+    the internal socket as helper completion; an explicit helper error fails
+    startup. Normal exec closes that fd through CLOEXEC; placeholder closes
+    it explicitly without exec.
+    - register the primary PID and start launch.plugin[] supervision;
+    - publish the supervisor and initial_launch_state=started;
+    - short-conn dial host:5000, send app_started{pid}, wait for ack, close;
+    - start mem_report and enter phase 3.
 ```
+
+The helper error channel reports setup/exec errors, but an empty EOF can also
+result from an abrupt helper death. `app_started` and the initial started state
+therefore describe the implemented publication boundary, not independent proof
+of execve success or application health. The placeholder intentionally has no
+external exec. See [`child.go`](../cmd/sandbox-init/child.go) and
+[`main.go`](../cmd/sandbox-init/main.go).
+
+Primary and one-shot `init` commands use the empty-map-only PATH default above.
+Plugins and native exec use a different environment builder: they start with a
+default PATH and overlay supplied entries, including an explicitly empty PATH.
+Do not rely on a primary's nonempty environment automatically gaining PATH.
+
+The bridge's app-side fds are replaceable by generation. An in-place restart
+drains the old output generation before installing new fds, with the bounded
+fallback in [Phase 3](#supervision); the MUX session and streams survive.
 
 <a id="application-cgroups"></a>
 
@@ -777,7 +800,7 @@ loop:
     sigterm/sigint:                                 // signals received by guest PID 1
       shutting_down = true                         // prevent pending restart forks
       send spec.stop_signal to app_pid             // default SIGTERM
-      wait spec.stop_grace_period (default 10 s); SIGKILL on timeout
+      wait spec.stop_grace_sec (default 10 s); SIGKILL on timeout
       app_exit_then_reboot(status)
 
 restartApp(backoff):
@@ -1187,7 +1210,7 @@ arguments.
 (1) Management connection: a fresh connection for an operation's handshake.
     Ordinary operations finish request/response and close; no keepalive or multiplexing.
     hello/launch, app_started, app_exited, ping, mem_report, quiesce,
-    restore, attach, exec, connect                                  (Management operations / Management wire format and fields)
+    restore, attach, exec, connect, shutdown                        (Management operations / Management wire format and fields)
     Wire: [4B LE length][JSON].
     Launch has its explicit four-message handshake; upgrade operations retain the conn.
 
@@ -1239,7 +1262,7 @@ Example <vsock-base>:    /run/sandbox/<sid>/vsock.sock
   `CONNECT 5000\n`, the CH hybrid-vsock preamble. CH returns
   `OK <port>\n`; the host must drain that line before reading protocol payload.
   CH proxies remaining bytes to the guest port-5000 listener. Carries ping,
-  quiesce, restore/attach, per-command exec MUX and connect fwd sessions.
+  quiesce, shutdown, restore/attach, per-command exec MUX and connect fwd sessions.
 - The directions have independent addressing. Host→guest ping and
   guest→host app_started can run simultaneously on separate new connections.
 
@@ -1254,8 +1277,9 @@ The last column describes whether the connection closes or upgrades.
 | Operation | Dial direction | Sequence | After ACK | Purpose |
 |---|---|---|---|---|
 | Cold start | guest→host | `hello` → `launch{spec}` → `launch_ack{stdio}` → `ack` | MUX | Guest announces readiness; host supplies LaunchSpec; guest applies it and prepares stdio before launch_ack. |
-| App start notification | guest→host | `app_started{pid}` → `ack` | Close | The app fork/exec handshake succeeded. |
+| App start notification | guest→host | `app_started{pid}` → `ack` | Close | The primary passed the helper handshake and reached the startup publication boundary; this is not independent proof of execve success or application health. |
 | App exit notification | guest→host | `app_exited{code,term_signal}` → `ack` | Close | Terminal primary exit; guest waits for ACK up to its budget before powering off. Host uses this for its exit status. |
+| Shutdown request | host→guest | `shutdown` → `ack` | Close | Only a successful ACK write triggers termination: before workload publication, POWER_OFF; with a supervisor, SIGTERM to guest PID 1. ACK does not confirm completed shutdown. |
 | Health probe | host→guest | `ping{id,t_send_ns}` → `pong{id,t_send_ns}` | Close | Host measures RTT, timeouts and failures ([Ping health probes](#health)). |
 | Memory report | guest→host | `mem_report{mem_report:{epoch,seq,mem_*}}` → `mem_report_ack` | Close | Guest observation; host validates epoch/seq and combines it with CH vm.info in the sandbox-local controller. |
 | Usage observation | host→guest | `usage_request{usage_request}` → `usage_response{usage_response}` | Reuse | New raw memory/filesystem reads only; Host alone accumulates ([Raw usage observations](#usage-observations)). |
@@ -1265,6 +1289,10 @@ The last column describes whether the connection closes or upgrades.
 | Execute command | host→guest | `exec{spec}` → `exec_ack{stdio}` | Independent MUX | Start a sibling command and wire its stdio; on completion send EXIT_STATUS then close ([Exec sessions (`sandbox-ctl exec`)](#exec-sessions) / [MUX graceful-close handshake](#mux-close)). Sessions can run concurrently. |
 | Port forward | host→guest | `connect{spec}` → `connect_ack` | Fwd relay | Dial the guest target, or Listen+Accept with spec.accept. Accept may park indefinitely without a host ACK deadline. Each forward is independent and is torn down for quiesce ([Connect port-forward sessions (`sandbox-ctl run --connect`)](#forward-sessions) / [Connect forwarding frame sub-protocol (fwd)](#forward-wire)). |
 | Error | Either | `error{msg}` | Close | Human-readable rejection where the handler sends one; malformed framing/JSON can instead terminate the connection. |
+
+The guest implements `shutdown`, but the current host lifecycle uses the CH
+shutdown path described in [Signal handling](#signals), not this guest message.
+Do not infer delivery of the guest stop signal from host VMM teardown.
 
 Attach is an internal mechanism of the existing sandbox-ctl run lifecycle,
 not an interface for another process to take over a session. The current
@@ -1311,6 +1339,12 @@ populates only fields relevant to its type. The complete types in
 {
   "type": "<one of Management operations>",
   "phase": "runtime_ready",            // cold hello: explicit base-ready barrier
+  "initial_launch_state_v1": true,     // hello: supports token-bound startup facts
+  "initial_launch_state": {           // pong/app_started/app_exited: initial state, not current PID
+    "token": "<host-launch-token>",
+    "state": "started",               // pending|started|failed|exited; error/code when applicable
+    "pid": 4711
+  },
   "ext4_discard_v1": true,             // hello: supports auto/manual writable ext4 policy
   "launch": { ... LaunchSpec ... },    // launch, including stdio (Launch configuration (LaunchSpec))
   "exec": { "argv": [...], "env": {}, "cwd": "", "user": "", "stdio": {} },
@@ -1526,7 +1560,7 @@ processing. Listeners survive. The first restore REQUEST enters only after
 that barrier. This removes reliance on sleeps for transport reset itself;
 the separate bounded pre-request CONNECT retry still exists ([Failure semantics](#failures)).
 
-**Three triggers use the same close handshake:**
+**Four triggers use the same close handshake:**
 
 1. Quiesce closes the primary MUX near the end of guest cleanup ([Quiesce handling](#quiesce) step 5).
 2. Exec completion sends EOF on all output/PTY streams, then EXIT_STATUS,
@@ -1539,6 +1573,10 @@ the separate bounded pre-request CONNECT retry still exists ([Failure semantics]
    and is hard-dropped. The new MUX uses fresh default per-stream windows
    (there is no separate window negotiation field), initial winsize is resent,
    pumps resume and retained unwritten app output can flow.
+4. Terminal primary exit drains output and closes its MUX before app_exited and
+   POWER_OFF. Drain, close ACK and transport cleanup share one 2 s budget;
+   timeout forces closure. An in-place primary restart keeps the MUX open
+   ([Phase 3](#supervision)).
 
 **Unexpected transport loss** has no graceful exchange. The guest invalidates
 the old session and its pumps wait for another attach/restore, with the listener
@@ -1698,7 +1736,7 @@ It requires a bounded `timeouts.ping`.
 
 | Event | Ticker state |
 |---|---|
-| Host finishes writing launch | Start; first probe runs immediately |
+| Host observes runtime_ready | Start; first probe runs immediately, including while the host waits to assign or prepare Launch |
 | Successful restore ACK/MUX setup | Start/restart |
 | Capture admission closes | Pause; drain admitted ping through guest EOF (response EOF without pong remains a health failure) within the independent 8 s capture budget; expiry cancels/joins and fails capture |
 | Successful same-VM recovery/resume | Resume after the required barriers |

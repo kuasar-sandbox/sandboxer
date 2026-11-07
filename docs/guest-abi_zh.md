@@ -97,6 +97,7 @@ sandbox.yaml `launch:` 节(yaml override 优先,Env merge),host sandbox-ctl 合�
 
 ```jsonc
 {
+  "initial_launch_token": "<host-launch-token>", // 操作 identity，不是 portable 策略
   "exec":    "/usr/bin/foo",
   "args":    ["arg1", "arg2"],
   "env":     {"PATH": "...", "HOME": "/root"},
@@ -193,7 +194,8 @@ FileSpec 还支持 read_only，省略时 bind 可写。Tmpfs 注入避免直接�
   请求后 5 s 未退升级 SIGKILL，第二次信号立即升级。这不保证向 guest PID 1 送达 SIGTERM 或完成 app stop grace。
   见 [lifecycle shutdown](../pkg/sandbox/lifecycle.go) 与 [run signal handling](../pkg/sandbox/run_signal.go)。
 - **Guest PID 1 自身收到 SIGTERM/SIGINT 时**，置 shutdown，向 primary PID 转发 launch.stop_signal
-  （默认 SIGTERM，来自已解析的 image/YAML 策略），等待 launch.stop_grace_period（默认 10 s），
+  （默认 SIGTERM，来自已解析的 image/YAML 策略），等待 wire `stop_grace_sec`
+  （默认 10 s，来自 host YAML `launch.stop_grace_period`），
   超时 kill，随后 poweroff。这些配置约束 guest 路径，不是 host VMM teardown 的已实现握手保证。
 - tty 模式 host 终端 raw 时，Ctrl-C（0x03）按字节经 MUX PTY 送入 guest，
   由 guest line discipline 转成应用 SIGINT。Host 停 sandbox 或 terminal escape 是另一路径
@@ -309,7 +311,7 @@ target;switch-root 的 `MS_MOVE /sysroot → /` 会把该 bind 随整棵子树�
 `/overlay/upper` 路径被埋,但 bind 持有 ext4 inode 引用使卷内容在 target 处存活,且应用
 看不到 raw ext4 内部结构。
 
-**`/opt/sandbox-runtime` 的搬运与版本钉住**:同一通道——B6 在 switch-root 前把 pmem 内的
+**`/opt/sandbox-runtime` 的搬运与版本钉住**：C5 在 switch-root 前把 pmem 内的
 发布件根 bind 进 `/sysroot/opt/sandbox-runtime`,由 E 的 `MS_MOVE /sysroot → /` 随子树带进
 新 `/`,bind 持有 pmem inode 引用使其在原挂载被遮蔽后仍存活;phase2 fork 前的 `MS_REC|MS_SHARED`
 令其作为对等挂载传播进应用私有 mount ns(应用以只读看到)。因 payload 驻留 pmem，改它会改变 sandbox-runtime.bundle 的工件 identity。
@@ -454,6 +456,7 @@ switch-root 之后单线程执行。
      - pipe 模式:为每个声明通道建 pipe / socketpair;未声明 stdin → fd 0 接 /dev/null
 6. write  launch_ack{stdio: 实际启用的 channel 集合}  ← 此后连接进入 MUX 帧收发态,不再关闭
 7. read   ack                            ← host 确认进入 MUX 态
+   在 fork primary helper 前挂接 MUX session，启动 app fd ↔ MUX 桥接 goroutine。
 
 8. 通过 exec.Cmd 拉起首次 primary helper:
      SysProcAttr.Cloneflags = CLONE_NEWNS [ | CLONE_NEWPID 当 pid_namespace=private(默认) ]
@@ -470,9 +473,11 @@ switch-root 之后单线程执行。
             placeholder, cred, workdir, exec, args...]
        cred = "uid:gid:sg1,sg2"(由 spec.user 在 guest 侧 /etc/passwd 解析)或 "-"(不降权)
        placeholder 时同一 helper 末步等待信号,不 exec 外部程序
-     env:  spec.Env(默认补 PATH)
+     env:  spec.Env；仅整个 map 为空时加入默认 PATH。
+           非空 map 若不含 PATH，不会自动补上。
 
-9. helper 先阻塞在内部 SOCK_STREAM 握手的 start gate;父进程完成 pid 登记后才放行。
+9. helper 先等待内部 SOCK_STREAM start gate，由父进程放行 setup。
+   restart 路径先登记 PID 再放行；首次 primary 在 helper 完成后、reaper 开始前登记。
    helper 在已有 private mount ns 内先把 / 标为 rslave(禁止反向传播),再卸载继承的
    guest-global cgroup2 mount并重新 mount cgroup2 /sys/fs/cgroup。新 mount 受刚创建的
    cgroup namespace 限定,真实 /app 在 helper 视图中成为 /。仅 cgroup_control=true 时,
@@ -494,13 +499,26 @@ switch-root 之后单线程执行。
        stop 时收信号退出。host 侧强制 restart=always ⇒ 从 exec 会话 kill 占位会原地
        重拉(非 reboot);guest PID 1 收到停机信号时先置 shutdown 再停止占位；host VMM teardown 是独立路径（信号处理）。
 
-11. 父进程(sandbox-init pid=1)等内部 CLOEXEC socket 以 EOF 确认最终 execve 成功,然后:
-     - 启动 stdio 桥接 goroutine:app 端 fd ↔ MUX 流(应用 stdio / console 接线)。桥的 app 侧 fd 按"代"
-       可换;in-place 重启先等旧代 stdout/stderr 或 PTY pump 读到 EOF 并把尾部写入
-       MUX,再安装新 fd。MUX 会话和 stream 不变 → 重启不断 host 链路
-     - 短连接 dial host:5000 发 app_started{pid} → 等 ack → close
-     - 拉起 launch.plugin[] 伴生进程(见下),再进入阶段 3 supervisor
+11. setup/ready/go 交换之后，父进程 PID 1 将内部 socket 无错误文本的 EOF
+    视为 helper 完成；显式 helper 错误使启动失败。普通 exec 通过 CLOEXEC 关闭 fd，
+    placeholder 不执行 exec，而是主动关闭它。
+     - 登记 primary PID，启动 launch.plugin[] supervision；
+     - 发布 supervisor 和 initial_launch_state=started；
+     - 短连接 dial host:5000，发 app_started{pid} → 等 ack → close；
+     - 启动 mem_report，进入阶段 3。
 ```
+
+Helper 错误通道会报告 setup/exec 错误，但 helper 突然死亡也可能产生无错误文本的 EOF。
+因此 `app_started` 和初始 started 状态描述的是实现的启动发布边界，不是 execve 成功或
+应用健康的独立证明。Placeholder 本来就不执行外部程序。参见
+[`child.go`](../cmd/sandbox-init/child.go) 和 [`main.go`](../cmd/sandbox-init/main.go)。
+
+Primary 与一次性 `init` 命令采用上述“仅整个 map 为空时补 PATH”的规则。
+Plugin 和 native exec 使用另一套环境构造器：先设置默认 PATH，再用传入条目覆盖，
+显式空 PATH 也会覆盖。不要假定 primary 的非空环境会自动获得 PATH。
+
+桥接器的 app 侧 fd 按代替换；原地重启先排空旧代输出，再安装新 fd，并保留
+[阶段 3](#supervision) 的有界兜底。MUX session 和 stream 跨原地重启保持不变。
 
 <a id="application-cgroups"></a>
 
@@ -615,7 +633,7 @@ loop:
     sigterm/sigint:
       shutting_down = true                           // 阻止在飞的 restart 再 fork
       send spec.stop_signal to app_pid               // 默认 SIGTERM;覆盖镜像 StopSignal
-      wait up to spec.stop_grace_period (默认 10s);超时 SIGKILL
+      wait up to spec.stop_grace_sec (默认 10s);超时 SIGKILL
       app_exit_then_reboot(status)
 
 restartApp(backoff):                                  // app 原地重启,launch.restart=always/on-failure
@@ -944,7 +962,7 @@ Forwarder 在发送 quiesce 前暂停新建,并收拢、等待活跃中继**与 
 ```
   (1) management handshake — one new conn per operation; ordinary request/response closes
         │  ops:  hello/launch · app_started · app_exited · ping · mem_report ·
-        │        quiesce · restore · attach · exec · connect          (管理操作集 / 管理消息 wire format 与字段)
+        │        quiesce · restore · attach · exec · connect · shutdown (管理操作集 / 管理消息 wire format 与字段)
         │  wire: [4B LE len][JSON]; launch has four messages; upgrade operations retain conn
 
   (2) MUX long-conn          — carries one session's stdin/stdout/stderr (or a pty)
@@ -998,7 +1016,7 @@ vsock 端口固定 `5000`,**两个方向都复用同一端口号**,身份按方�
 - **host → guest**:host `connect(<vsock-base>)`,**第一笔写入**为 ASCII
   `CONNECT 5000\n`(CH hybrid vsock 协议头;CH 回一行 `OK <port>\n`,host 须先排空
   再读后续 payload),CH 把其余字节代理到 guest port 5000 listener。承载:`ping` /
-  `quiesce` / `restore`(其连接升级 MUX)/ `attach`(其连接升级 MUX)/ `exec`
+  `quiesce` / `shutdown` / `restore`(其连接升级 MUX)/ `attach`(其连接升级 MUX)/ `exec`
   (其连接升级为该 exec 会话的独立 MUX)/ `connect`(其连接升级为该转发的 fwd 数据
   通道,[connect 端口转发会话(`sandbox-ctl run --connect`)](#forward-sessions))
 - 两个方向独立寻址,互不干扰——同一时刻 host→guest `ping` 与 guest→host
@@ -1013,8 +1031,9 @@ vsock 端口固定 `5000`,**两个方向都复用同一端口号**,身份按方�
 | 操作 | 拨号 | 序列 | ACK 后 | 用途 |
 |---|---|---|---|---|
 | **冷启动** | guest→host | `hello` → `launch{spec}` → `launch_ack{stdio}` → `ack` | **升级 MUX** | guest 报 ready,host 回 LaunchSpec;guest 准备好 app stdio 后回 launch_ack,该连接成为 MUX |
-| **应用启动通知** | guest→host | `app_started{pid}` → `ack` | 关 | guest 已 fork/exec 用户进程 |
+| **应用启动通知** | guest→host | `app_started{pid}` → `ack` | 关 | primary 通过 helper 握手并到达启动发布边界；不是 execve 成功或应用健康的独立证明 |
 | **应用退出通知** | guest→host | `app_exited{code, term_signal}` → `ack` | 关 | primary 终态退出；guest 在预算内等 ACK，超时仍 POWER_OFF；host 收到通知后用作退出码 |
+| **关闭请求** | host→guest | `shutdown` → `ack` | 关 | 仅 ACK 写出成功才触发终止：workload 尚未发布时 POWER_OFF；已有 supervisor 时向 guest PID 1 发 SIGTERM。ACK 不表示停机已完成。 |
 | **健康探测** | host→guest | `ping{id, t_send_ns}` → `pong{id, t_send_ns}` | 关 | host 计 RTT / 超时 / 失败数([ping 健康探测](#health)) |
 | **mem 报告** | guest→host | `mem_report{mem_report:{epoch,seq,mem_*}}` → `mem_report_ack` | 关 | guest observation;host sandbox-local controller 验证 epoch/seq 后结合 CH `vm.info` |
 | **用量观测** | host→guest | `usage_request{usage_request}` → `usage_response{usage_response}` | 复用 | 只返回新的原始内存/文件系统观测, Host 唯一归并 ([原始 Usage 观测](#usage-observations)) |
@@ -1024,6 +1043,9 @@ vsock 端口固定 `5000`,**两个方向都复用同一端口号**,身份按方�
 | **执行命令** | host→guest | `exec{spec}` → `exec_ack{stdio}` | **升级 MUX(独立会话)** | guest 为这条 `exec` 起一个兄弟进程并准备其 stdio,回 `exec_ack`,该连接成为这次 exec 会话**独立**的 MUX;并发多条互不影响;命令结束 guest 在 MUX 上发 EXIT_STATUS 再走 [MUX 优雅关闭握手](#mux-close) 关闭。详见 [exec 会话(`sandbox-ctl exec`)](#exec-sessions) |
 | **端口转发** | host→guest | `connect{spec}` → `connect_ack` | **升级转发数据通道** | guest 为这条 `connect` 取得 `ConnectSpec.address` 上的目标连接——dial(默认)或 `Accept`(`spec.accept`,accept 模式可无限期阻塞,host 无 deadline park)——回 `connect_ack`,该连接成为这条转发的 fwd 帧数据通道([connect 转发帧子协议(fwd)](#forward-wire)),保留 TCP 半关闭;并发多条互不影响;quiesce 时主动拆除([quiesce 处理](#quiesce))。详见 [connect 端口转发会话(`sandbox-ctl run --connect`)](#forward-sessions) |
 | `error` | 任意 | (终止) | 关 | handler 显式拒绝时的人类可读原因；坏 framing/JSON 也可能直接关连接，不保证总发 error |
+
+Guest 实现了 `shutdown`，但当前 host 生命周期使用[信号处理](#signals)中的 CH shutdown
+路径，不使用这条 guest 消息。不能由 host VMM teardown 推断 guest 收到了 stop signal。
 
 `ATTACH` 是已有 sandbox-ctl run 生命周期的内部机制，不是其他进程接管会话的接口。
 当前集成由 capture resume/recovery 显式调用 reattach；协议可以替换坏 MUX，但没有覆盖所有异常断链的自主后台重连 loop。
@@ -1050,6 +1072,12 @@ JSON 可读、调试友好，消息量少，无需 protobuf 工具链。
 {
   "type":     "<one of 管理操作集>",
   "phase":    "runtime_ready",         // cold hello：显式基础就绪屏障
+  "initial_launch_state_v1": true,     // hello：支持绑定 token 的启动事实
+  "initial_launch_state": {           // pong/app_started/app_exited：初始状态，不是当前 PID
+    "token": "<host-launch-token>",
+    "state": "started",               // pending|started|failed|exited；按需包含 error/code
+    "pid": 4711
+  },
   "ext4_discard_v1": true,             // hello：支持可写 ext4 的 auto/manual 策略
   "launch":   { ... LaunchSpec ... },  // launch (含 stdio 节,见 launch 配置(LaunchSpec))
   "exec":     { "argv":[...], "env":{}, "cwd":"", "user":"", "stdio":{} },  // exec: ExecSpec(exec 会话(sandbox-ctl exec))
@@ -1220,7 +1248,7 @@ restore activation 只重发 IRQ,让 Linux 清理全部 connected sockets,同时
 event-queue kick 确认前 gate backend RX。listener 不受 reset 影响。首个 restore
 REQUEST 只能在清理确认后进入 guest，不依赖 sleep 等待 transport reset；[失败语义](#failures) 的独立、有限 pre-request CONNECT retry 仍存在。
 
-**三个触发点**(同一握手):
+**四个触发点**（同一握手）：
 
 1. **quiesce 流程**([quiesce 处理](#quiesce) 第 5 步)——guest 在 quiesce 流程靠后一步关闭 MUX。
 2. **exec 会话结束**([exec 会话(`sandbox-ctl exec`)](#exec-sessions))——exec 命令退出后,guest 在该会话 MUX 上**先把
@@ -1235,6 +1263,9 @@ REQUEST 只能在清理确认后进入 guest，不依赖 sleep 等待 transport 
    发 `MUX_CLOSE` 直接报错 → guest **降级为硬丢弃**旧连接,不阻塞 attach。统一逻辑:
    收到 `attach` → 尝试优雅关旧 MUX、失败或有界超时后硬丢 → 新连接 attach_ack → 新 MUX 采用默认 stream window
    （没有另一个 window 协商字段）、重发 winsize、恢复 pump 与尚未写出的 app output。
+4. **Primary 终态退出**：先排空输出并关闭 MUX，再发 app_exited 和 POWER_OFF。
+   排空、关闭 ACK 和 transport cleanup 共用一个 2 s 预算，超时强制关闭。
+   Primary 原地重启仍保留 MUX（[阶段 3](#supervision)）。
 
 **MUX 因 vsock 异常突然断**：没有优雅握手，guest 失效旧 session，pump 等显式 attach/restore，listener 仍在。
 当前 host 不存在覆盖全部意外断链的自动重连 loop；capture resume/recovery 显式 reattach，其他调用者须处理转发中断（[管理操作集](#management-operations) / [失败语义](#failures)）。
@@ -1380,7 +1411,7 @@ CH 从保存的 local_port_last + 1 继续分配 host local port；
 
 | 事件 | ticker 状态 |
 |---|---|
-| host 写完 launch | start，立即发首个 probe |
+| host 观察到 runtime_ready | start，立即发首个 probe；等待分配或准备 Launch 期间也继续探测 |
 | restore ACK/MUX 设置成功 | start/restart |
 | capture admission 关闭 | pause；等待在途 ping 的 guest EOF（无 pong 的响应 EOF 仍是健康检查失败），独立 8 s capture budget，超时 cancel/join 并令捕获失败 |
 | 同 VM recovery/resume 成功 | 必需 barrier 后恢复 |
