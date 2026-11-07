@@ -22,7 +22,7 @@ page state and fault handling.
 |---|---|---|---|
 | No cgroup | Empty | Empty | No cgroup writes; allocatable CPU must equal capacity CPU, and allocatable memory must remain within capacity |
 | Static cgroup | Set | Empty | Configure local CPU/memory limits and optionally run the local sensor |
-| Dynamic | Set | Set | Use resource-protocol admission/leases/Budget and run the local sensor |
+| Dynamic | Set | Set | Use resource-protocol admission/leases/Budget and run the local sensor when configured |
 
 `resources.capacity` is guest-visible VM capacity and enters Portable configuration. `resources.allocatable` is the cold-start workload default and also enters Portable configuration. `allocatable.cpu` must be finite and satisfy `0 < allocatable.cpu <= capacity.cpu`. Restore retains capacity and the captured `deflate_on_oom` from E, but can explicitly reapply the destination node's allocatable CPU/memory. This runtime policy does not rewrite E or C0. `control`, `overhead`, `watermark_high`, `startup`, and `diff_cow` are node policy and do not enter E.
 
@@ -40,7 +40,7 @@ Budget              = admitted/locally enforced working allowance
 VMM memory.max      = CapacityMemory + host overhead
 ```
 
-Memory S capture records CH configuration/state and sparse memfd content. Resource policy is not written to `snapshot.cfg`. Restore obtains capacity identity from E, and any explicitly supplied host capacity must match. Allocatable CPU/memory, `startup`, `overhead`, `watermark_high`, and resource-controller bindings come from the current host. `deflate_on_oom` must remain consistent with captured VMM state. The Snapshot's `BudgetAtSnapshot` remains authoritative for the initial restore Budget.
+Memory S capture records CH configuration/state and sparse memfd content. Resource policy is not written to `snapshot.cfg`. Restore obtains capacity identity from E, and any explicitly supplied host capacity must match. Allocatable CPU/memory start from E and are replaced only for fields explicitly supplied by the current host. `startup`, `overhead`, `watermark_high`, and resource-controller bindings come from the current host. `deflate_on_oom` must remain consistent with captured VMM state. The Snapshot's `BudgetAtSnapshot` remains authoritative for the initial restore Budget.
 
 <a id="cpu-and-balloon"></a>
 
@@ -52,7 +52,15 @@ Capacity CPU determines vCPU topology. In cgroup mode, allocatable CPU maps to `
 
 ## Cgroups and balloon
 
-
+The VMM cgroup must already exist and have the required controllers delegated.
+Its directory is owned by the operator/orchestrator, not sandboxer. Setup pins a
+stable directory descriptor and writes limits through it; CH is created directly
+in that cgroup with `CLONE_INTO_CGROUP`. Cleanup closes the descriptor without
+removing the directory or restoring old limits. Setup is not transactional:
+a later failure does not undo earlier successful writes. The owner must inspect
+and restore the intended limits before reusing a failed setup. Setting
+`memory.swap.max=0` is best-effort and logs failures; it is not a guarantee that
+swap was disabled. See [cgroup.go](../pkg/resctl/cgroup.go).
 
 <a id="memory-enforcement"></a>
 
@@ -83,7 +91,7 @@ DesiredTarget = align_down(Capacity - RawRequested, 64 MiB)
 RequestedBudget = Capacity - DesiredTarget
 ```
 
-Diagnostic Guest fields and host `memory.current` do not determine Budget. Host `memory.current` is only a lower bound when choosing `memory.high`.
+Diagnostic Guest fields and host `memory.current` are not inputs to the demand formula above. Host `memory.current` supplies a safety lower bound for `memory.high`; the pressure sensor can also use it as a growth signal as described below.
 
 Growth reserves Budget first, raises the required `memory.high` allowance, then lowers the balloon target through `PUT /api/v1/vm.resize` and confirms acceptance with `vm.info`. Partial node grants accumulate until a representable Budget fits within the reservation; rounding must never create unreserved memory. Safety growth can proceed after the lifecycle barrier even while target/current are unstable. Reservation, high or ambiguous-resize failures retain the forward growth objective for retry; a later smaller report does not implicitly roll it back.
 
@@ -133,13 +141,26 @@ Controller leases, heartbeats, and recovery inventory manage only host resource 
 
 ### Capture barrier
 
-Before snapshot/export, new Budget mutations and balloon transitions are blocked. Already running mutations must complete before freeze. Recovery releases the barrier only when the guest/app can continue; otherwise a liveness bug would permanently prevent resource updates after resume.
+Before snapshot/export, the mutation gate blocks new CH balloon and
+`memory.high` writes and waits for already admitted writes to complete. It does
+not freeze all node reservation traffic: dynamic growth can reserve before
+acquiring this gate, and dynamic shrink releases it before the node-only commit
+RPC. Static settlement remains under the gate. Recovery releases the barrier
+only when the guest/app can continue, so later local mutations can resume.
 
 <a id="pressure-sensor"></a>
 
 ### Pressure sensor
 
-Static/dynamic modes can use PSI or `memory.events.local` polling. Host configuration determines the PSI trigger and debounce; they are not written to E. The sensor stops initiating growth during the capture gate and establishes a new observation epoch after restore.
+Static/dynamic modes can use PSI or `memory.events.local` polling, or disable
+the sensor with `resources.control.sensor.mode: none`. Host configuration
+determines the PSI trigger and debounce; they are not written to E. The sensor
+only submits coalesced pressure signals to the local controller and can continue
+doing so while the capture gate is held. The gate serializes the resulting CH
+and `memory.high` writes. In `events_poll` mode, a rising host charge above 95%
+of a finite `memory.high` can request low-urgency predictive growth; this is a
+pressure signal, not substitution of RSS for Guest demand. Guest-report
+epoch/admission belongs to the controller and Guest lifecycle, not the sensor.
 
 <a id="usage-cli"></a>
 
@@ -534,9 +555,10 @@ running Guest init hash against the supplied freshly rebuilt runtime bundle.
 Its short-save cases exercise integration. Restore/clone checks use a one-minute
 sample interval and require fresh memory/filesystem observations before the
 first periodic tick, so retries cannot conceal a missed immediate ACK round.
-A separate `defaults` case waits
-for the actual default five-minute save. Neither is a production-density
-performance measurement.
+The current E2E has no separate `defaults` case that waits for the default
+five-minute save. Short-save integration and the immediate restore checks do
+not establish that cadence was exercised, and are not production-density
+performance measurements.
 
 The OOM case pre-establishes an exec/MUX whose test probe waits for one stdin
 byte before allocating pressure memory. A bounded test-only LaunchPort relay
@@ -570,8 +592,10 @@ Both data disks receive real writes. Bytes written after the delayed read
 distinguish a new observation from a replayed old buffer after release.
 A single long-lived test exec records all Guest FDs, identities, threads and
 RSS; it does not create an exec per observation or label threads as goroutines.
-The filesystem case's default fault lasts 30 seconds; `--seconds 60` extends it.
-It is a syscall-return delay, not a physical-device failure or power-loss test.
+The filesystem case currently uses a fixed 30-second observation window and
+a longer injected return delay; the script has no `--seconds` option. The
+observation window is not the exact fault duration. This is a syscall-return
+delay, not a physical-device failure or power-loss test.
 The installed native `strace`, its `ldd`-resolved loader and libraries are
 copied into the disposable application image only, never the product runtime.
 Its `ch-info` and `ch-resize` cases place a test-only Unix HTTP relay before

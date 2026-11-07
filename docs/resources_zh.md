@@ -18,9 +18,9 @@ cgroup 与 balloon 控制、节点资源协议、观测、持久化和 `usage` �
 |---|---|---|---|
 | No cgroup | empty | empty | 不写 cgroup；allocatable CPU 必须等于 capacity CPU，allocatable memory 必须处于 capacity 范围内 |
 | Static cgroup | set | empty | 本地设置 CPU/memory limit,可运行 local sensor |
-| Dynamic | set | set | 通过 resource protocol admission/lease/Budget,并运行 local sensor |
+| Dynamic | set | set | 通过 resource protocol admission/lease/Budget，并按配置运行 local sensor |
 
-`resources.capacity` 是 guest-visible VM capacity,进入 Portable config. `resources.allocatable` 是 cold start 的 workload 默认值,也进入 Portable config;其中 `allocatable.cpu` 必须是有限数,且满足 `0 < allocatable.cpu <= capacity.cpu`. Restore 保持 E 中的 capacity 和已捕获的 `deflate_on_oom`,但可以从目标节点显式重新应用 allocatable CPU/memory;该运行时 policy 不改写 E 或 C0. `control`、`overhead`、`watermark_high` 和 `startup` 是 node policy,不进入 E.
+`resources.capacity` 是 guest-visible VM capacity,进入 Portable config. `resources.allocatable` 是 cold start 的 workload 默认值,也进入 Portable config;其中 `allocatable.cpu` 必须是有限数,且满足 `0 < allocatable.cpu <= capacity.cpu`. Restore 保持 E 中的 capacity 和已捕获的 `deflate_on_oom`,但可以从目标节点显式重新应用 allocatable CPU/memory;该运行时 policy 不改写 E 或 C0. `control`、`overhead`、`watermark_high`、`startup` 和 `diff_cow` 是 node policy,不进入 E.
 
 Export/snapshot 获取 MemoryController mutation barrier,并在 freeze 前 lift/drain 可能与 CH pause 竞争的 `memory.high`. Host ping gate 等待已入场探测完成 guest EOF transport barrier。在 CONNECT 和请求写入完成后，即使未收到 pong，响应流 EOF 也表示排空完成；该探测仍然是健康检查失败，计数器和连续失败致命阈值策略不变。CONNECT EOF、取消、截止时间以及其他协议错误仍令排空失败。之后捕获必须单独取得明确的 quiesce 确认才能暂停 VM。该排空独立受 8 s quiesce budget 约束,即使普通 `timeouts.ping` 关闭强制超时也不会无限阻塞捕获. 到期时 host cancel并join该探测,捕获失败后走完整 recovery. Guest quiesce 还会排空并暂停周期 `mem_report`,防止 S 捕获持有 stream lock、仍等待旧 host vsock 的 reporter. Restore 在 ACK 前切换到新 observation epoch;`--resume`/失败 attach 恢复原 epoch,live attach只重开pause gate且不破坏已入场报告的计数. Recovery 在 VM、MUX、app 和 backend 恢复后释放 host barrier.
 
@@ -36,7 +36,7 @@ Budget              = admitted/locally enforced working allowance
 VMM memory.max      = CapacityMemory + host overhead
 ```
 
-Memory S capture记录 CH config/state 和 memfd sparse content;资源 policy 不写入 `snapshot.cfg`. Restore capacity identity来自 E,host若显式给出必须一致. Allocatable CPU/memory、`startup`、`overhead`、`watermark_high` 和 resource controller binding来自当前 host;`deflate_on_oom` 保持与已捕获 VMM state 一致;Snapshot 中的 `BudgetAtSnapshot` 仍是 restore initial Budget 的权威值.
+Memory S capture记录 CH config/state 和 memfd sparse content;资源 policy 不写入 `snapshot.cfg`. Restore capacity identity来自 E,host若显式给出必须一致. Allocatable CPU/memory 先取 E 中的值，仅由当前 host 显式给出的对应字段覆盖。`startup`、`overhead`、`watermark_high` 和 resource controller binding 来自当前 host;`deflate_on_oom` 保持与已捕获 VMM state 一致;Snapshot 中的 `BudgetAtSnapshot` 仍是 restore initial Budget 的权威值.
 
 <a id="cpu-and-balloon"></a>
 
@@ -48,7 +48,12 @@ Capacity CPU 决定 vCPU topology. Allocatable CPU 在 cgroup 模式映射为 `c
 
 ## cgroup 与 balloon
 
-
+VMM cgroup 必须预先存在，并委派所需 controller。目录由 operator/orchestrator 管理，
+不归 sandboxer 所有。Setup 固定目录 descriptor，并通过它写限制；CH 通过
+`CLONE_INTO_CGROUP` 直接创建在该 cgroup 中。Cleanup 只关闭 descriptor，不删除目录，
+也不恢复旧限制。Setup 不具备事务性：后续步骤失败不会撤销之前成功的写入。
+所有者在复用失败的 setup 前，应检查并恢复预期限制。写入 `memory.swap.max=0`
+属于 best-effort，失败时记录日志，不能保证 swap 已禁用。见 [cgroup.go](../pkg/resctl/cgroup.go)。
 
 <a id="memory-enforcement"></a>
 
@@ -79,7 +84,7 @@ DesiredTarget = align_down(Capacity - RawRequested, 64 MiB)
 RequestedBudget = Capacity - DesiredTarget
 ```
 
-Guest 诊断字段与 host `memory.current` 不决定 Budget；host `memory.current` 仅作为 `memory.high` 的安全下界。
+Guest 诊断字段与 host `memory.current` 不进入上述 demand 公式。Host `memory.current` 为 `memory.high` 提供安全下界；pressure sensor 也可将其用作下文所述的增长信号。
 
 增长先预留 Budget，再提高所需 `memory.high` 额度，随后通过 `PUT /api/v1/vm.resize` 降低 balloon target，并以 `vm.info` 确认接受。Node 的 partial grant 必须累积到可表示且不超过 reservation 的 Budget，不能取整产生未预留的内存。通过 lifecycle barrier 后，即使 target/current 尚不稳定，安全增长仍可执行。Reservation、high 或不明确的 resize 失败保留向前增长目标并重试，后续较小报告不会隐式回滚它。
 
@@ -124,13 +129,22 @@ Controller lease、heartbeat和recovery inventory只管理host resource ownershi
 
 ### Capture barrier
 
-Snapshot/export开始前阻止新的Budget mutation和balloon transition. 已在进行的mutation完成后才能freeze. Recovery必须在guest/app可继续运行后释放barrier,否则会出现resume后永久失去resource updates的liveness bug.
+Snapshot/export 前，mutation gate 阻止新的 CH balloon 和 `memory.high` 写入，
+并等待已入场的写入完成。它不冻结全部 node reservation 通信：动态 grow 可在取得
+该 gate 前预留资源，动态 shrink 则在 node-only commit RPC 前释放 gate；静态
+settlement 仍在 gate 内。Recovery 在 guest/app 能继续后释放 barrier，使后续本地变更恢复。
 
 <a id="pressure-sensor"></a>
 
 ### Pressure sensor
 
-Static/dynamic模式可使用PSI或`memory.events.local` polling. PSI默认trigger与debounce由host config决定,不写入E. Sensor在capture gate期间停止发起growth,restore后建立new observation epoch.
+Static/dynamic 模式可用 PSI 或 `memory.events.local` polling，也可用
+`resources.control.sensor.mode: none` 禁用。PSI trigger/debounce 来自 Host config，
+不写入 E。Sensor 只向本地 controller 提交合并的 pressure signal，在 capture gate
+持有期间仍可继续提交；gate 串行化最终的 CH 和 `memory.high` 写入。
+`events_poll` 模式下，host charge 上升且超过有限 `memory.high` 的 95% 时，可请求
+low-urgency 预测增长；这是 pressure signal，不是用 RSS 替代 Guest demand。
+Guest report 的 epoch/admission 由 controller 与 Guest lifecycle 管理，不由 sensor 管理。
 
 <a id="usage-cli"></a>
 
@@ -449,7 +463,8 @@ Cold 和 restore 使用当前 [Host usage 配置](configuration_zh.md#usage-poli
 运行的 init 哈希与所提供的新 runtime bundle 一致. 短保存周期案例验证集成.
 Restore/clone 检查采用一分钟采样周期, 要求第一次周期 tick 前已得到新的内存/
 文件系统观测, 不允许周期重试掩盖 ACK 后立即首轮漏采.
-独立的 `defaults` 案例等待实际默认五分钟保存. 两者都不是生产密度性能测量.
+当前 E2E 没有等待默认五分钟保存的独立 `defaults` 案例。短周期保存集成和 restore
+立即首轮检查不证明已实跑该默认保存周期，也不是生产密度性能测量。
 
 OOM 案例先建立 exec/MUX, 测试 probe 在分配压力内存前等待 stdin 的一个字节.
 有界的测试专用 LaunchPort 中继原样转发普通 hello/MUX 流及 report/ACK 帧.
@@ -474,8 +489,9 @@ pidfd 确认该子进程在有界清理预算内退出, 不把清理留给 runne
 系统持续获得新覆盖, 且 trace 中只有一次该文件系统调用. 两块数据盘均执行
 真实写入; 延迟读取后新增的字节用于区分释放后的新观测与旧 buffer 重放.
 单个长存测试 exec 记录 Guest 全部 FD、身份、线程和 RSS, 不为每次观测创建
-exec, 也不把线程数称为 goroutine 数. 文件系统案例默认故障持续 30 秒,
-`--seconds 60` 可延长验证. 这是系统调用返回延迟, 不是物理设备故障或掉电测试.
+exec, 也不把线程数称为 goroutine 数。文件系统案例当前使用固定 30 秒观测窗口，
+注入的返回延迟比它更长；脚本不提供 `--seconds` 选项。观测窗口不等于精确故障时长。
+这是系统调用返回延迟，不是物理设备故障或掉电测试。
 已安装的原生 `strace` 及 `ldd` 解析的 loader、依赖库仅复制到可丢弃应用镜像,
 不进入产品 runtime.
 其中 `ch-info` 和 `ch-resize` 案例在真实 CH 可执行文件前放置仅用于测试的
@@ -519,7 +535,6 @@ health exec 和 CH `Running` 状态. 此次捕获失败回滚必须保留已占�
 这些案例结合重复操作和生命周期回归, 验证来源隔离、有界所有权及失败收尾.
 报告应注明实际观测窗口; 它们不是物理掉电实验.
 
-在没有其他并发测试负载时, 以 root 权限和已组装的 `BIN` 运行
 性能测量与产品 E2E 分开。在源码构建阶段准备探针与规范制品身份读取器，
 并提供已经构建的可执行文件路径：
 
@@ -529,7 +544,8 @@ export USAGE_PROBE_BIN="$PWD/build/e2e-tools/$(uname -m)/usage-probe"
 export ARTIFACT_REF_BIN="$PWD/build/e2e-tools/$(uname -m)/artifact-ref"
 ```
 
-[off/on 测量脚本](../test/perf/usage_perf.py):
+在没有其他并发测试负载时，以 root 权限和已组装的 `BIN` 运行
+[off/on 测量脚本](../test/perf/usage_perf.py)：
 
 ```bash
 python3 test/perf/usage_perf.py --densities 1,4 --seconds 30 --repeat 3
