@@ -537,10 +537,17 @@ Zero 转 Data 需要 buffer，池为空时可能新增分配。已提交 Zero �
 读取走普通 clean Data 读缓存，也可能分配 buffer。
 
 选批和操作数组各以 1024 项为界。空间压力恢复另捕获至多 `max_dirty_size / 4096`
-个现有 Zero 页指针，不复制 payload。其他有界开销包括每个活动文件两个独立
-1 MiB MAP_SHARED I/O 工作区（每个额外对齐 padding 小于 1 MiB），以及随页容量线性
-有界的页元数据、索引和 Go 分配器开销。`cache_size` 不是进程 RSS、guest memfd 映射、
-immutable-source cache、tmpfs 文件存储或快照输出内存的上限。
+个现有 Zero 页指针，不复制 payload。其他开销依赖后端：
+
+- v3 为每个活动文件持有两个独立的 1 MiB MAP_SHARED I/O 工作区，
+  每个额外对齐 padding 小于 1 MiB。
+- v4 的活动 `checkpointDiff` 持有一个 1 MiB Go heap 读暂存区。版本化引擎共用
+  进程级 direct-I/O 池，含四个 8 MiB MAP_SHARED buffer，不随磁盘数或保留版本数增加。
+  有界事务 buffer 和元数据、索引副本还会使用 heap。
+- 缓存页元数据、索引和 Go 分配器开销随页容量增长。
+
+`cache_size` 不是进程 RSS、guest memfd 映射、immutable-source cache、tmpfs 文件存储
+或快照输出内存的上限。
 
 Tmpfs 文件页是位于内存（也可能位于 swap）中的文件系统存储，与这份有界进程缓存分开。
 Data 回写成功会释放脏额度，但不会释放已存入 tmpfs 的文件数据；淘汰 clean 缓存也不会删除它。
@@ -561,13 +568,15 @@ Read loading 预留总容量；没有可用 clean 槽时，可以用有界前台
 绝不能绕过较新的缓存页。
 
 运行读取与快照读取共用有界 upper 连续区间批处理。仅本次请求的连续冷 upper 页合并为
-一次物理读取（最多 1 MiB）；缓存命中、base 或 hole 边界会结束该区间。按 stripe
-编号排序的一次性范围读锁防止并发写入/Discard，Loading 预留防止淘汰。缓存容量小于
-区间时，剩余冷页在相同 stripe 保护下直接读取但不入缓存。读取/解密保持在自有 MAP_SHARED I/O
-工作区内. Loading 页在 cache mutex 外从该工作区填充, 再持锁发布为 clean,
-之后才复制到可被调用者或 guest 修改的输出内存. 本次有界请求范围内的连续 base 块
-合并交给 `BlockReader`, 下层读取边界仍由该 reader 决定. 不新增与请求长度成比例的
-payload 分配或 base 预取.
+一次有界后端读取（最多 1 MiB）；缓存命中、base 或 hole 边界会结束该区间。v4 在物理映射
+不连续、Zero 或 hole 边界处可能把该逻辑区间拆成多次物理读取。按 stripe 编号排序的
+一次性范围读锁防止并发写入/Discard，Loading 预留防止淘汰。缓存容量小于区间时，
+剩余冷页在相同 stripe 保护下直接读取但不入缓存。v3 在每文件 MAP_SHARED 工作区中
+读取和解密；v4 在共用 direct-I/O 池中读取、解密物理连续区间，再复制到每文件 heap 暂存区。
+Loading 页在 cache mutex 外从后端自有明文填充，再持锁发布为 clean，之后才复制到
+可被调用者或 guest 修改的输出内存。本次有界请求范围内的连续 base 块合并交给
+`BlockReader`，下层读取边界仍由该 reader 决定。不新增与请求长度成比例的 payload
+分配或 base 预取。
 
 新写在构造前同时申请总量与脏额度。Clean 变脏只需脏额度；未被选中的 dirty 页重写不追加
 额度或队列节点。完整页覆盖不读旧数据。首次部分写从 base（或零）构造完整页，保留现有
@@ -585,10 +594,11 @@ goroutine 或无界 payload 队列。块条带锁序列化前台同块访问；w
 每沙箱一个 worker，正常选批以最老 eligible 脏页为锚点。热点覆盖不移到队尾。每批限于
 同文件、同种类：最多 256 个 Data 页（1 MiB）或 1024 个 Zero 页，不填 hole 或预分配间隙。
 固定 1 ms 聚合窗口保证低速流量推进；额度压力与内部 Drain 立即唤醒。
-选中的页成为冻结 writeback，仍可读取，同页写等待。Worker 将冻结 Data 页
-直接复制到 active diff 已有的 aligned MAP_SHARED 写工作区, 在该副本上加密,
-然后在不持有 cache/global 锁时执行 I/O. Cache page payload 保持明文, 不直接作为
-syscall buffer. 前台读有独立工作区.
+选中的页成为冻结 writeback，仍可读取，同页写等待。v3 将冻结 Data 页直接复制到
+每文件 aligned MAP_SHARED 写工作区，在该副本上加密。v4 先将每个物理连续区间复制到
+有界 heap 事务 buffer 并加密，再复制到共用 direct-I/O 池的 buffer 中执行 syscall。
+两者都不持有 cache/global 锁执行 I/O。Cache page payload 保持明文，不直接作为
+syscall buffer。前台读暂存与写暂存分开；v4 读写共用进程级 I/O 池。
 
 Worker 通过有界页索引收集同文件连续脏邻居，不要求到达顺序相邻；未选中页的 FIFO
 年龄保持不变。普通写入通知既不提前结束，也不重启固定聚合截止时间。压力和 Drain
@@ -615,16 +625,16 @@ Direct I/O 本身也不是持久化屏障。
 
 ### 活动文件 I/O 契约
 
-每个活动 body 都在其已打开的描述符上尝试 O_DIRECT，并始终使用相同的有界对齐工作区。
+两个后端的 O_DIRECT 初始化路径不同。
+
+**单层 v3** 在已打开的描述符上尝试 O_DIRECT，并始终使用相同的有界对齐工作区。
 如果该 F_SETFL 请求返回 EINVAL 或 EOPNOTSUPP/ENOTSUP，描述符保持普通定位 I/O，
 应用缓冲和缓存不变。这只是在初始化时处理操作是否受支持，不识别文件系统，也不是数据 I/O 失败后的重试。
 新目标在 **seeding 前**完成上述初始化；已有活动文件校验、运行与快照读取使用同一路径。
 运行时代码不检查文件系统类型、名称、挂载策略或文件系统专有 inode flags。
 Header/格式探测在并发 body I/O 前有界完成；template/base 保留 buffered/read-only 行为。
-明文与密文分别采用单层 v3 或多版本 v4 格式，均含固定 4 KiB header 及带校验的 P 页。
-本地加密 off/auto/required 策略和 512 字节逻辑 XTS 数据单元编号不变。
 
-对已打开 fd 查询 `STATX_DIOALIGN`，区分 buffer 地址与 offset/length 约束。
+v3 对已打开 fd 查询 `STATX_DIOALIGN`，区分 buffer 地址与 offset/length 约束。
 报告的正数约束必须满足工作区上限与 4 KiB COW 几何要求；偏移对齐必须整除 4096，
 且 body 边界和大小满足要求。缺少 mask、查询返回不可用的 ENOSYS/EINVAL/EOPNOTSUPP，
 或两个对齐字段同时为零时，选择保守的 4096 字节对齐。这仅是对齐选择，不证明缓存绕过。
@@ -632,13 +642,25 @@ Header/格式探测在并发 body I/O 前有界完成；template/base 保留 buf
 其他设置标志错误及实际 I/O 失败仍然报错。应用层不会用 buffered 重试掩盖 EIO、ENOSPC、
 对齐错误或短 I/O。参见 [statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html)。
 
+**多版本 v4** 打开数据文件及固定版本 view 描述符时直接设置 O_DIRECT，不提供 F_SETFL
+能力回退，也不查询 STATX_DIOALIGN。共用 syscall buffer 固定采用 4096 字节地址对齐，
+I/O offset 和 length 也必须按页对齐。不支持的 open 或实际 I/O 失败直接返回错误，
+不以 buffered I/O 重试。参见
+[`format.go`](../pkg/diffstore/internal/versioned/format.go)、
+[`view.go`](../pkg/diffstore/internal/versioned/view.go) 和
+[`direct_linux.go`](../pkg/diffstore/internal/versioned/direct_linux.go)。
+
+v3 和 v4 都支持明文与加密存储，均含固定 4 KiB header 及带校验的 P 页。
+本地加密 off/auto/required 策略和 512 字节逻辑 XTS 数据单元编号不变。
+
 内核及底层实现决定如何满足 O_DIRECT 请求。成功设置标志并完成对齐 I/O 证明操作可用，
 不证明所有底层存储都会绕过物理磁盘缓存。Tmpfs 文件页仍是 `cache_size` 之外的内存/swap
 存储。没有文件系统白名单、专用 tmpfs 后端、新配置模式或数据 I/O 失败后的回退。
 参见 [open(2)](https://man7.org/linux/man-pages/man2/open.2.html)。
 
-I/O 使用有界、对齐的匿名 `MAP_SHARED` 工作区，其 lifetime 覆盖 syscall 完成，避免
-private heap/fork 风险。任意调用者切片和子页读取经过这些 buffer，大操作分块。
+两个后端均将有界、对齐的匿名 `MAP_SHARED` buffer 传给数据 I/O syscall，持有到调用完成，
+避免 private heap/fork 风险。v4 的 heap 暂存区不直接传给这些 syscall。任意调用者切片和
+子页读取经过这些 buffer，大操作分块。
 缓存整页回写避免读改写。短写报错，不重试未对齐余下切片；参见
 [write(2)](https://man7.org/linux/man-pages/man2/write.2.html)。
 
