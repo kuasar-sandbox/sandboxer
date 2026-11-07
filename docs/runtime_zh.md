@@ -139,7 +139,7 @@ MUX 屏障后返回同一种 live owner。它不会先冷启动，也不要求�
 从 Sandbox 制品冷启动时，使用
 [`sandbox.OpenRunSource`](../pkg/sandbox/run_source.go)(ctx, ref, storage, locations)
 和 `source.Apply(host, presence, config.ApplyFromOptions{...})`。Apply 返回生效配置与
-携带 portable C0、checkpoint provenance 和成对 Bundle selector 的 `LaunchSpec`，
+携带 portable source baseline、checkpoint provenance 和成对 Bundle selector 的 `LaunchSpec`，
 复用 CLI 的来源解析、默认 boot 绑定与 presence-aware override 规则，不修改 host
 配置，也不提前重复绑定磁盘图。source 和借用的 storage 必须保持打开，直到 runtime
 退出且 `Wait` 报告退出结果，或 `Close` 完成；取消 `Wait` 不结束借用。使用 `ReplaceBoot` 时，结果不保留 source provenance 或 scoped
@@ -150,12 +150,14 @@ selector，Apply 后即可关闭 source；返回结果中的 storage 仍为借�
 把完整的 `LaunchSpec` 传入
 `sandbox.DeriveRuntimeSpecWithOptions(ctx, cfg, sandbox.DeriveRuntimeOptions{Launch: launch, ...})`，
 再将返回的 shape 和同一个 launch 值交给 `Start`，或依次调用 `StartRuntime`、
-`Launch`。Derive 读取磁盘容量，冻结已打开 source 的 identity、C0 boot refs 与选定的
-host boot 路径，不打开 host kernel/runtime 文件。`StartRuntime` 检查启动当时的
-元数据，采用与 `run --from` 相同的 portable identity 策略。Apply 后改变来源
-provenance 或 C0 boot refs、Derive 后改变 host boot 路径，都会被拒绝。
+`Launch`。Derive 读取磁盘容量，冻结已打开 source 的 identity、输入的 portable boot refs
+与选定的 host boot 路径，不打开 host kernel/runtime 文件。`StartRuntime` 解析目标
+组件，`Launch` 使用这些组件的 identity 派生新 C0，同时保留 source 工作负载和磁盘图。
+Apply 后改变来源 provenance 或输入 boot refs、Derive 后改变 host boot 路径，都会被拒绝。
 复制返回值会保留绑定；用 `LaunchSpecFromConfig` 重建公开字段不会。
-手工构造的 shape/source binding 和 `ReplaceBoot` 继续采用严格 identity 策略。
+完整的 Apply 结果也可以在并非由该 source 派生 shape 的基础 Runtime 上启动。
+没有 Apply receipt 的手写 `PortableConfig` 或 `SourceBinding` 仍要求匹配 host identity。
+`ReplaceBoot` 使用完整的显式 cold boot graph，并据此派生 C0。
 来源记录不额外持有 reader、storage 或 checkpoint pin。
 
 `RuntimeSpec` 包含 kernel/Bundle 绑定、CPU/内存及资源策略、宿主
@@ -164,21 +166,21 @@ TAP/provider/namespace 要求、console/control 设置和有序的 `RuntimeDiskS
 可写 upper，single 展开为一个可写设备。所有设备固定使用既有最小 virtio feature
 集合，不涉及设备热插拔。
 
-CH 启动前，从 `<配置的 kernel 路径>.sha256` 精确解析 kernel identity。
+冷启动首先从精确路径 `<配置的 kernel 路径>.sha256` 查找 kernel identity。
 sidecar 是可选、可读的普通文件，上限为 4 KiB。内容只能是一条 64 位十六进制 SHA-256
 摘要，或使用配置的 kernel basename 的一条无标签 sha256sum 记录
 （`<digest>  vmlinux` 或 `<digest> *vmlinux`）。接受 LF/CRLF 和一个末尾换行；
 多条记录、多余字段、路径和格式错误均导致启动失败。存在但无效、不可读、非普通文件或
-指向不存在目标的 sidecar 都是错误。真正不存在时，显式 cold projection 或未绑定
-prepared source 的 shape 完整计算一次 kernel hash；source 派生的 portable startup
-仅把 C0 kernel ref 保留为祖先记录，不计算 hash。
+指向不存在目标的 sidecar 都是错误。真正不存在时，所有冷启动路径都会对目标 raw kernel
+完整哈希一次，包括 `run --from` 与 source 派生的 SDK 路径。目标 kernel identity
+写入新 run 的 C0；E 的旧 kernel identity 不约束冷启动。
 部署时可在尚未启用的版本目录中对最终**原始** kernel 执行
 `sha256sum -- vmlinux > vmlinux.sha256`，并一致地安装这一对文件。
 sidecar 是受信的部署元数据；Sandboxer 不会根据 CH 加载的字节重新计算摘要。
 runtime Bundle identity 仍取自 footer。版本专属的 kernel 与 sidecar binding
 必须从 identity 解析到 CH 实际启动使用期间保持稳定；只切换 `current` 符号链接
 不能固定进行中的启动所做的全部路径查找。应使用稳定版本路径或协调切换。
-启动既不生成也不缓存 sidecar；portable startup 在 CH 启动前将已有 sidecar 与 C0 比较。
+启动既不生成也不缓存 sidecar。内存恢复保留原始 C0，既不打开外部 kernel，也不读取其 sidecar。
 
 `LaunchSpec` 包含工作负载 root/data artifact 引用与可写路径、Guest
 IP/MTU/路由/hostname/interface、mounts、持久与临时 files、init、完整 process 配置
@@ -274,13 +276,13 @@ CLI preflight 中可预测的 config/ref/format 错误仍在 VM 副作用前失�
 kernel、sidecar 或 Bundle identity，即使这些路径名发生变化；新 Runtime 会重新解析。
 对 source 派生的 shape，`Start` 在创建 VM 前验证匹配的 source/C0；分阶段
 `Launch` 在 checkpoint 合法物化、改变磁盘图和 provenance 前检查同一绑定。
-来源输入被拒绝时，ready base 仍可接受修正后的 `Launch`。没有 sidecar 时，C0 kernel
-ref 仅作为祖先记录，不会被报告为已验证的 host digest；有 sidecar 时，不匹配会在
-CH 启动前失败。手工 shape（包括只手写 `SourceBinding` 或 `PortableConfig` 的情况）
-仍解析完整 host identity，比较 C0 中两个完整规范 ref，含 basename；没有 sidecar
-时计算一次 kernel hash。不带 `SourceBinding` 的本地 `PortableConfig` 仍受支持。
-CLI 显式 cold `run` 与 `--replace-boot` 经 `Start` 复用 preflight identity，避免二次
-扫描。Restore 不读取 sidecar，也不要求 cold-start projection。
+来源输入被拒绝时，ready base 仍可接受修正后的 `Launch`。Source 冷启动使用目标
+kernel/runtime identity 派生 C0，并保留生效的 source 磁盘图和 provenance。
+没有 Apply receipt 的手写 `PortableConfig` 仍采用严格匹配：kernel ref 必须与保留的
+host kernel ref 一致，runtime 必须匹配保留的 digest scheme 和 digest；runtime basename
+只是查找提示。不带 `SourceBinding` 的本地 `PortableConfig` 仍受支持。
+CLI 显式 cold `run`、`--from` 与 `--replace-boot` 经 `Start` 复用 preflight identity，
+避免二次扫描。内存恢复保留原始 C0，不要求外部 kernel 文件、sidecar 或 cold-start projection。
 这一身份保留规则不允许改写运行中 runtime Bundle 的 pmem 后端内容；
 Bundle 的既有生命周期要求仍然适用。
 
@@ -368,7 +370,7 @@ T1 open carrier and strict-parse S
 T2 parse canonical snapshot.cfg
 T3 open S.sandbox_ref and strict-parse E
 T4 apply restore host-only rules to E config -> immutable lifecycle C0
-T5 preflight kernel binding, compare runtime identity, and check disk sources
+T5 select a matching runtime binding and check disk sources
 T6 atomically write run-dir C0
 T7 bind self and reconstruct root/data disks from E
 T8 create memfd and layer S.memory over S.from_refs
@@ -398,26 +400,36 @@ Restore不会:
 - 把 E的 `config.json` 当成新的 process launch request;
 - 更新 memory parent或C0作为 re-snapshot side effect.
 
-Host-only允许项包括 network provider/current identity、cgroup/controller、allocatable CPU/memory 与 resource enforcement、kernel/runtime actual path、active diff/template、restore prefetch和timeouts. Immutable disk graph、capacity identity、`deflate_on_oom`、network topology 由 E 拥有。Kernel 重哈希例外与 runtime-footer 比较见 [PortableSandboxConfig](artifacts_zh.md#portable-config)。
+Host-only 允许项包括 network provider/current identity、cgroup/controller、allocatable
+CPU/memory 与 resource enforcement、runtime actual path、active diff/template、restore
+prefetch 和 timeouts。旧版 `boot.kernel` 字段仍被接受但会忽略：运行中的 kernel 已捕获在 S
+中，不需要外部 kernel 文件或 sidecar。E 的原始 C0 保留 kernel/runtime identity、immutable
+disk graph、capacity identity、`deflate_on_oom` 和 network topology。
+见 [PortableSandboxConfig](artifacts_zh.md#portable-config)。
 
-Runtime 选择只发生在 restore 预检查中。首先检查传入的 `boot.runtime` 文件，
-沿用既有 bundle 封装校验，并将 **basename + 尾部声明的 digest** 与 E 比较。
-成功立即使用，不访问第二候选。若文件缺失、不可读、格式错误或 identity 不匹配，
-只尝试一个同目录文件：传入路径的父目录加 E 中已经验证的 runtime basename。
-不按默认文件软链接的目标改变查找目录，不扫描目录，也不重复检查相同候选。
-两个候选执行相同校验；均失败时保留两次原因。非法配置、取消以及后续磁盘、网络、
-VM 错误不触发 runtime 回退。未提供 runtime 绑定时，保留既有本地 E 来源目录默认绑定。
-不新增目录配置字段；image 冷启动与 `--from` 行为不变。
+内存恢复预检查也通过
+[`restore.ResolveRuntimeBinding`](../pkg/restore/runtime.go) 公开。首先检查传入的
+`boot.runtime` 文件，沿用既有 bundle 封装校验，并将 **digest scheme + 尾部声明的 digest**
+与 E 比较。basename 只是查找提示，因此同一声明 identity 使用不同文件名也会立即成功，
+不访问第二候选。若文件缺失、不可读、格式错误或 identity 不匹配，只尝试一个同目录文件：
+传入路径的父目录加 E 中已经验证的 runtime basename。查找目录不取自默认文件的软链接
+目标或 Snapshot S 的位置；不扫描目录、不下载，也不重复检查相同候选。
+两个候选执行相同校验；均失败时保留遇到的原因。只有所有候选都缺失或 content identity
+不同时，错误才匹配 `restore.ErrRuntimeIncompatible`；格式、I/O 和取消失败保留自身错误。
+非法 ref 配置、取消以及后续磁盘、网络、VM 错误不触发 runtime 回退。
+未提供 runtime 绑定时，保留既有本地 E 来源目录默认绑定。
+这一双候选规则属于内存恢复；冷启动使用选定的 host boot bindings。
 
 无论哪个候选通过，都将选定的本机绝对路径同时用于本次 runtime 绑定和生成的
 `snap-state/config.json` 中的 `pmem[0].file`。捕获的 pmem 必须符合既有单 runtime
 设备结构，且 file 字段非空。只改变该 file 字段，设备 ID、可选 size 及其他属性、
 `state.json`、原始 S/E 和节点默认配置均不改变。旧绝对路径无需存在。
 同目录自动回退要求不同版本 runtime 以不同文件名保持不可变且可用；显式匹配的
-旧文件绑定也可使用独立版本目录，见 [v1/v2 升级示例](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/runtime-bundle_zh.md)。恢复不新增
-整份 EROFS 重哈希或 runtime 复制。既有 `snapshot.restore.sh` 验证 v2 名称默认文件
-回退到已迁移的 v1、捕获旧路径不可用、pmem 选定路径、源制品与 host 输入不变，
-以及 Guest ready 和执行继续。
+旧文件绑定也可使用独立版本目录，见 [v1/v2 升级示例](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/using-guest-runtime_zh.md#节点升级)。恢复不新增
+整份 EROFS 重哈希或 runtime 复制。既有 `snapshot.restore.sh` 验证：即使 WORK 所有的
+捕获 runtime 和 kernel 文件都已删除，且不存在同目录回退文件，配置的不同 basename
+runtime 仍会因 identity 相同而被选中。它还检查 pmem 选定路径、源制品与 host 输入不变，
+以及 Guest ready 和执行继续。Resolver 单元测试覆盖主候选 identity 不同时的同目录回退。
 
 从 S0 restore后:
 
@@ -742,7 +754,16 @@ disk 和 stdio 验收用例。
 
 ## `run --from` 与 restore validation
 
-两种模式都先严格parse logical artifact和canonical config,再验证host ownership. `--from`允许persistent workload override;restore拒绝所有cold-only字段. Kernel binding preflight、runtime identity comparison、network topology/provider、disk count/name/topology 和 active diff binding 检查在 external lifecycle side effect 前完成；保留源 boot 定义的 `--from` 使用已有 kernel sidecar，缺失时保留 C0 ancestry 而不重哈希；restore 既不读该 sidecar，也不重哈希 kernel。`--from --replace-boot` 则遵循显式冷启动身份规则：使用有效 sidecar，缺失时对 raw kernel 完整哈希一次。见 [kernel 身份契约](#runtime-sdk) 与 [PortableSandboxConfig](artifacts_zh.md#portable-config)。
+两种模式都先严格解析 logical artifact 和 canonical config，再验证 host ownership。
+`--from` 允许 persistent-workload override；restore 拒绝所有 cold-only 字段。
+CLI 按所选模式，在 external lifecycle side effect 前检查 boot bindings、network
+topology/provider、disk count/name/topology 和 active diff bindings。
+
+Cold `--from` 使用目标 kernel/runtime 创建新 C0，同时保留 source 磁盘图。
+所有冷启动路径（包括 `--replace-boot`）都使用有效的目标 kernel sidecar，缺失时对目标
+raw kernel 完整哈希一次；runtime identity 取自目标 Bundle footer。内存恢复保留原始 C0，
+不要求或检查外部 kernel，并选择 digest scheme 和 digest 与 C0 匹配的 runtime。
+见 [kernel 身份契约](#runtime-sdk) 与 [PortableSandboxConfig](artifacts_zh.md#portable-config)。
 
 <a id="cli-validation"></a>
 
