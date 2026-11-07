@@ -459,7 +459,13 @@ The destination host resolves disk refs through actual paths, a source directory
 - Cold `run --from` and the SDK `RunSource.Apply` path derive a new C0 with those target identities while retaining the source workload, disk graph and ancestry. The source E is unchanged; its old boot identities do not constrain a new cold boot.
 - Memory restore preserves the original C0 and resumes the captured kernel. It does not require, open, or hash an external kernel or read a kernel sidecar. Its external runtime must match C0 by **digest scheme and digest**; the serialized basename is only a lookup hint, so the configured file may have a different name.
 
-For memory restore, runtime selection checks the explicit host path first, then at most the original runtime basename in that configured path's directory. It does not add a lookup in Snapshot S's directory or scan other directories. The existing reference encoding and artifact schema remain unchanged. Runtime footer inspection validates the envelope and declared identity without scanning the EROFS payload; carrier metadata and configured content verification retain their own checks. See [source_identity.go](../pkg/sandbox/source_identity.go), [runtime.go](../pkg/restore/runtime.go), and the [runtime binding policy](runtime.md#restore).
+The source-cold reprojection requires the original `LaunchSpec` returned by
+`RunSource.Apply`; manually rebuilding its public fields does not recreate that
+source proof. A manually supplied `PortableConfig` without that proof must still
+match the target kernel's complete canonical ref and the runtime's content identity.
+See [runtime_sdk.go](../pkg/sandbox/runtime_sdk.go).
+
+For memory restore, runtime selection checks the explicit host path first. If preflight fails (including a missing, unreadable, malformed or identity-mismatched file), it tries at most the original runtime basename in that configured path's lexical directory, without following a symlink to choose that directory. Invalid references and cancellation do not trigger fallback. If all permitted candidates fail, only an all-missing/mismatched set yields `ErrRuntimeIncompatible`; malformed metadata and I/O errors remain errors rather than compatibility decisions. It does not add a lookup in Snapshot S's directory, scan other directories or download a runtime. The existing reference encoding and artifact schema remain unchanged. Runtime footer inspection validates the envelope and declared identity without scanning the EROFS payload; carrier metadata and configured content verification retain their own checks. See [source_identity.go](../pkg/sandbox/source_identity.go), [runtime.go](../pkg/restore/runtime.go), and the [runtime binding policy](runtime.md#restore).
 
 <a id="encoding-limits"></a>
 
@@ -898,9 +904,9 @@ The final path is briefly visible before writing finishes. Normal consumers must
 
 <a id="single-root-bundle"></a>
 
-### Single-root image/Sandbox Manifest Bundle
+### Single-root image/Sandbox/Snapshot Manifest Bundle
 
-`NewSingleRootBundlePublisher` is a typed named-location sink for an already assembled `RoleImage` or `RoleSandbox` `sparse.Source`:
+`NewSingleRootBundlePublisher` is a typed named-location sink for an already assembled `RoleImage`, `RoleSandbox` or `RoleSnapshot` `sparse.Source`:
 
 ```text
 logical source
@@ -909,14 +915,14 @@ logical source
   -> replay the fixed source with the same key, admission and encoding options
   -> exclusive-create content-addressed <root>.bundle
   -> reopen/strict validate
-  -> file://<root>.bundle@manifest:<root>#<location>
+  -> file://<root>.bundle@manifest:<root>@location:<name>
 ```
 
-Assembled E/S sources may contain already-published named references. `NewSingleRootBundlePublisher` preserves those references without input location maps or parent-file reads and writes only the new Bundle to the requested output location.
+Assembled E/S sources may contain already-published named references. `NewSingleRootBundlePublisher` preserves those references without input location maps or parent-file reads and writes only the new Bundle to the requested output location. For `RoleSnapshot`, `PublishSource` also requires the known portable `sandbox_ref`, as shown in the [publication result report](#publication-report).
 
 The source supports repeated reads. The first pass retains the root Manifest key, a physical Bundle digest and format metadata while discarding encoded Chunk bytes. The second pass writes the final `<root>.bundle` directly and checks the generated root against the planned identity. The customer key is resolved once for the publication; both passes use the same admission and encoding settings.
 
-The only created file is the final Bundle, containing this logical root's Manifest and Chunks. Publication uses bounded Chunk buffers and preserves payload sparsity. The typed call site supplies the logical role; image and Sandbox readers retain their schema checks. Reuse requires matching admission, root, authenticated content and complete physical identity. Concurrent writers converge through bounded waiting, exclusive creation and full verification. Cancellation, changed source, write errors and close errors fail publication and remove only the publisher-owned incomplete final. A replaced pathname retains the replacement inode and returns an ownership error.
+The only created file is the final Bundle, containing this logical root's Manifest and Chunks. Publication uses bounded Chunk buffers and preserves payload sparsity. The typed call site supplies the logical role; image, Sandbox and Snapshot readers retain their schema checks. Reuse requires matching admission, root, authenticated content and complete physical identity. Concurrent writers converge through bounded waiting, exclusive creation and full verification. Cancellation, changed source, write errors and close errors fail publication and remove only the publisher-owned incomplete final. A replaced pathname retains the replacement inode and returns an ownership error.
 
 Tarstream and Bundle are physical carriers, not logical roles. Tarstream contains a single role-specific payload and sparse envelope, with `@digest`/`@hmac` identity. Bundle contains Manifest/chunk records, write admission, and optional local encryption, with `@manifest` root identity. Single-root Bundle publication must not first build a tarstream; conversely, a Bundle root cannot be inferred just from an `.image`/`.sandbox` extension.
 
@@ -1017,7 +1023,7 @@ E2B memory=true
   -> sandbox-ctl run --restore
 ```
 
-S/E suffix geometry, deterministic ZIP encoding and sparse prefix/append views are implemented by `accelerator/pkg/tailzip`. This package supplies ordered role entries and size limits; the Sandbox/Snapshot modules retain their portable config, JSON/state and device-topology validation. Logical reference locations use `manifest.RefLocations`.
+S/E suffix geometry, deterministic ZIP encoding and sparse prefix/append views are implemented by `accelerator/pkg/tailzip`. Sandboxer supplies ordered role entries and size limits; the Sandbox/Snapshot modules retain their portable config, JSON/state and device-topology validation. Logical reference locations use `manifest.RefLocations`.
 
 <a id="related"></a>
 
