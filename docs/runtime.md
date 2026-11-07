@@ -156,8 +156,8 @@ SDK; cross-process administrative commands retain the local control transport.
 For cold starts from a Sandbox artifact, use
 [`sandbox.OpenRunSource`](../pkg/sandbox/run_source.go)(ctx, ref, storage, locations)
 and `source.Apply(host, presence, config.ApplyFromOptions{...})`. Apply returns
-the effective configuration and a `LaunchSpec` with the portable C0, checkpoint
-provenance and paired Bundle selectors. It shares the CLI's source resolution,
+the effective configuration and a `LaunchSpec` with a portable source baseline,
+checkpoint provenance and paired Bundle selectors. It shares the CLI's source resolution,
 default boot binding and presence-aware override rules without modifying host
 configuration or binding the disk graph twice. Keep the source and its borrowed
 storage open until `Wait` reports the runtime's exit result or `Close` completes; canceling `Wait` does
@@ -171,14 +171,18 @@ Pass that complete `LaunchSpec` to
 `sandbox.DeriveRuntimeSpecWithOptions(ctx, cfg, sandbox.DeriveRuntimeOptions{Launch: launch, ...})`,
 then use the returned shape and the same launch value with `Start`, or with
 `StartRuntime` followed by `Launch`. Derivation reads disk capacities and freezes
-the opened source identity, C0 boot refs and selected host boot paths; it does not
-open host kernel/runtime files. `StartRuntime` checks their current metadata and
-uses the same portable identity policy as `run --from`. Changing source provenance
-or C0 boot refs after Apply, or host boot paths after derivation, is rejected.
-Copying the returned value preserves this binding; reconstructing public fields
-with `LaunchSpecFromConfig` does not. A manually constructed shape or source
-binding retains the strict identity policy, as does `ReplaceBoot`. The retained
-source record owns no additional readers, storage or checkpoint pins.
+the opened source identity, input portable boot refs and selected host boot paths;
+it does not open host kernel/runtime files. `StartRuntime` resolves the target
+components, and `Launch` derives a new C0 with their identities while preserving
+the source workload and disk graph. Changing source provenance or input boot refs
+after Apply, or host boot paths after derivation, is rejected. Copying the returned
+value preserves this binding; reconstructing public fields with
+`LaunchSpecFromConfig` does not. An intact Apply result can also launch on a base
+Runtime whose shape was not derived from that source. A hand-written
+`PortableConfig` or `SourceBinding` without the Apply receipt still requires
+matching host identities. `ReplaceBoot` uses a complete explicit cold boot graph
+and derives C0 from it. The retained source record owns no additional readers,
+storage or checkpoint pins.
 
 `RuntimeSpec` contains kernel/Bundle bindings, CPU/memory and resource policy,
 host TAP/provider/namespace requirements, console/control settings and ordered
@@ -187,15 +191,16 @@ layout and logical capacities. Overlay expands to a read-only base followed by
 a writable upper; single expands to one writable device. The existing minimal
 virtio feature profile is fixed for all devices. No device hotplug is involved.
 
-Kernel identity is resolved before CH startup from exactly `<configured-kernel-path>.sha256`.
+Cold startup first looks for kernel identity in exactly `<configured-kernel-path>.sha256`.
 The sidecar is an optional readable regular file of at most 4 KiB. It contains
 one 64-digit hexadecimal SHA-256 digest, or one untagged sha256sum record with
 the exact configured kernel basename (`<digest>  vmlinux` or
 `<digest> *vmlinux`). LF/CRLF and one final newline are accepted; extra records,
 fields, paths, and malformed content fail startup. A present invalid, unreadable,
-nonregular, or dangling sidecar is an error. When genuinely absent, explicit cold
-projection and a shape without a prepared source hash the raw kernel once;
-source-derived portable startup keeps C0's kernel ref as ancestry without a hash.
+nonregular, or dangling sidecar is an error. When absent, every cold startup hashes
+the raw target kernel once, including `run --from` and the source-derived SDK
+path. The resulting target kernel identity is recorded in the new run's C0;
+E's old kernel identity does not constrain a cold boot.
 For a prepared inactive deployment version, generate the sidecar from
 the final **raw** kernel, for example `sha256sum -- vmlinux > vmlinux.sha256`,
 and install the pair consistently. The sidecar is trusted deployment metadata:
@@ -204,7 +209,8 @@ identity still comes from its footer. Keep version-specific kernel and sidecar
 bindings stable through identity resolution and CH startup; switching a `current`
 symlink alone cannot pin all pathname lookups of an in-flight startup. Use a
 stable version path or coordinate the switch. No sidecar is generated or cached
-by startup. Portable startup compares a present sidecar with C0 before CH starts.
+by startup. Memory restore keeps the original C0 and neither opens the external
+kernel nor reads its sidecar.
 
 `LaunchSpec` owns workload root/data artifact references and writable paths,
 guest IP/MTU/routes/hostname/interface, mounts, persistent and ephemeral files,
@@ -329,15 +335,15 @@ change. A new Runtime resolves its own identity. For a source-derived shape,
 `Start` validates the matching source/C0 before creating the VM; split `Launch`
 validates the same binding before checkpoint materialization can legitimately
 replace the disk graph and provenance. Rejected source inputs leave a ready base
-available for a corrected `Launch`. With no sidecar, C0's kernel ref remains
-ancestry and is never reported as a verified host digest. With a sidecar, a
-mismatch fails before CH startup. A manual shape, including one with only a
-hand-written `SourceBinding` or `PortableConfig`, still resolves a complete host
-identity and compares both canonical C0 refs, including basenames; missing
-sidecars cause one kernel hash. Local `PortableConfig` without `SourceBinding`
-remains supported. The CLI's explicit cold `run` and `--replace-boot` reuse their
-preflight identity through `Start`, avoiding a second scan. Restore neither reads
-sidecars nor requires a cold-start projection.
+available for a corrected `Launch`. Source cold derives C0 with the target
+kernel/runtime identities and retains the effective source disk graph and
+provenance. A hand-written `PortableConfig` without the Apply receipt remains
+strict: its kernel ref must match the retained host kernel ref, and its runtime
+must match the retained digest scheme and digest. The runtime basename is only a
+lookup hint. Local `PortableConfig` without `SourceBinding` remains supported.
+The CLI's explicit cold `run`, `--from`, and `--replace-boot` reuse their preflight
+identity through `Start`, avoiding a second scan. Memory restore preserves the
+original C0 and needs no external kernel file, sidecar, or cold-start projection.
 This retained-identity rule does not permit rewriting the live runtime Bundle
 pmem backing contents; its existing lifetime requirements still apply.
 
@@ -417,7 +423,7 @@ T1 open carrier and strict-parse S
 T2 parse canonical snapshot.cfg
 T3 open S.sandbox_ref and strict-parse E
 T4 apply restore host-only rules to E config -> immutable lifecycle C0
-T5 preflight kernel binding, compare runtime identity, and check disk sources
+T5 select a matching runtime binding and check disk sources
 T6 atomically write run-dir C0
 T7 bind self and reconstruct root/data disks from E
 T8 create memfd and layer S.memory over S.from_refs
@@ -450,19 +456,25 @@ Restore does not:
 - Treat E's `config.json` as a new process-launch request.
 - Update memory parents or C0 as a re-snapshot side effect.
 
-Allowed host-only fields include the network provider/current identity, cgroup/controller, allocatable CPU/memory and resource enforcement, actual kernel/runtime paths, active diff/template, restore prefetch, and timeouts. E owns the immutable disk graph, capacity identity, `deflate_on_oom`, and network topology. The kernel re-hash exception and runtime-footer comparison are described in [PortableSandboxConfig](artifacts.md#portable-config).
+Allowed host-only fields include the network provider/current identity, cgroup/controller, allocatable CPU/memory and resource enforcement, the actual runtime path, active diff/template, restore prefetch, and timeouts. A legacy `boot.kernel` field is accepted but ignored: the running kernel is already captured in S, so no external kernel file or sidecar is required. E's original C0 retains its kernel/runtime identities, immutable disk graph, capacity identity, `deflate_on_oom`, and network topology. See [PortableSandboxConfig](artifacts.md#portable-config).
 
-Runtime selection is a restore-only preflight. First inspect the supplied
-`boot.runtime` file using the existing bundle-envelope and **basename + declared
-footer digest** comparison against E. Success returns immediately without a
-second lookup. If that file is missing, unreadable, malformed or mismatched, try
+The memory-restore preflight is also exposed as
+[`restore.ResolveRuntimeBinding`](../pkg/restore/runtime.go). First inspect the
+supplied `boot.runtime` file using the existing bundle-envelope checks and compare
+its **digest scheme + declared footer digest** with E. The basename is a lookup
+hint, so the same declared identity under a different name succeeds immediately
+without a second lookup. If that file is missing, unreadable, malformed or mismatched, try
 exactly one sibling: E's validated runtime basename in the supplied path's parent
-directory. Do not follow the default file's symlink target to select a different
-directory, scan directories, or retry an identical candidate. Both candidates use
-the same check; if neither passes, report both causes. Invalid configuration,
+directory. The directory is not selected from the default file's symlink target
+or Snapshot S's location. No directory scan, download, or identical-candidate
+retry is performed. Both candidates use the same check; if neither passes, retain
+the encountered causes. Only when every candidate is absent or has a different
+content identity does the error match `restore.ErrRuntimeIncompatible`; format,
+I/O, and cancellation failures retain their own errors. Invalid ref configuration,
 cancellation, and later disk/network/VM errors do not trigger runtime fallback.
 The existing local-E-relative default applies when no runtime binding is supplied.
-No new directory field is required; image cold start and `--from` are unchanged.
+This two-candidate rule belongs to memory restore; cold startup uses its selected
+host boot bindings.
 
 Whichever candidate passes, use its absolute local path both for this invocation's
 runtime binding and `pmem[0].file` in the generated `snap-state/config.json`. The
@@ -472,9 +484,12 @@ field. Only that file field changes; device ID, optional size and other attribut
 path need not exist. For sibling fallback, versioned runtime files must remain immutable and available
 under distinct names in the same directory. An explicit matching old-file binding
 can instead use a separate version directory; see the [v1/v2 upgrade example](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/using-guest-runtime.md#node-upgrades). No full EROFS rehash or runtime copy
-is added to restore. The existing `snapshot.restore.sh` verifies relocated-v1
-fallback from a v2-named default, unavailable captured path, selected pmem path,
-unchanged source artifacts/host inputs, guest readiness and continued execution.
+is added to restore. The existing `snapshot.restore.sh` verifies that the configured
+runtime is selected with the same identity under a different basename, even after
+the WORK-owned captured runtime and kernel files are removed and no sibling
+fallback exists. It also checks the selected pmem path, unchanged source artifacts
+and host inputs, guest readiness and continued execution. Resolver unit tests
+cover sibling fallback with a different primary identity.
 
 After restoring S0:
 
@@ -829,7 +844,9 @@ Ordinary cold configuration validates at least:
 
 ## `run --from` and restore validation
 
-Both modes strictly parse the logical artifact and canonical configuration before checking host ownership. `--from` permits persistent-workload overrides; restore rejects all cold-only fields. Kernel binding preflight, runtime identity comparison, network topology/provider, disk count/names/topology, and active-diff binding checks precede external lifecycle side effects. Source-preserving `--from` uses a present kernel sidecar or retains C0 ancestry without rehashing; restore neither reads that sidecar nor rehashes the kernel. By contrast, `--from --replace-boot` follows explicit cold-start identity rules: a valid sidecar or, when absent, one raw kernel hash. See the [kernel identity contract](#runtime-sdk) and [PortableSandboxConfig](artifacts.md#portable-config).
+Both modes strictly parse the logical artifact and canonical configuration before checking host ownership. `--from` permits persistent-workload overrides; restore rejects all cold-only fields. The CLI validates boot bindings, network topology/provider, disk count/names/topology, and active-diff bindings before external lifecycle side effects, according to the selected mode.
+
+Cold `--from` uses the target kernel/runtime and creates a new C0 while preserving the source disk graph. All cold paths, including `--replace-boot`, use a valid target kernel sidecar or, when absent, one raw kernel hash; runtime identity comes from the target Bundle footer. Memory restore keeps the original C0, does not require or inspect an external kernel, and selects a runtime whose digest scheme and digest match C0. See the [kernel identity contract](#runtime-sdk) and [PortableSandboxConfig](artifacts.md#portable-config).
 
 <a id="cli-validation"></a>
 

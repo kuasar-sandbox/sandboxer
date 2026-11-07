@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -221,15 +220,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		return -1, err
 	}
 	snapCfg := *merged
-	// Only the kernel identity re-hash is skipped (issue #158): SHA-256 over
-	// the whole vmlinux costs a fixed ~60ms on every restore while production
-	// nodes deploy kernel artifacts under central control. The runtime bundle
-	// check is kept: its digest marker sits in the ZIP footer and is read
-	// without scanning the artifact.
-	if err := sandbox.VerifyKernelArtifact(snapCfg.Boot.Kernel); err != nil {
-		return -1, fmt.Errorf("boot.kernel identity: %w", err)
-	}
-	runtimePath, err := resolveRestoreRuntime(ctx, snapCfg.Boot.Runtime, c0.Boot.Runtime)
+	// The running guest kernel is already captured in Snapshot S. Only the
+	// external runtime PMEM backing must be rebound to matching local content.
+	runtimePath, err := ResolveRuntimeBinding(ctx, snapCfg.Boot.Runtime, c0.Boot.Runtime)
 	if err != nil {
 		return -1, err
 	}
@@ -1252,72 +1245,6 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 	}
 	source.Root = root
 	return source, nil
-}
-
-// resolveRestoreRuntime preserves the explicit binding as the first candidate.
-// Only a failed runtime preflight tries E's basename beside that binding; this
-// never retries VM restore, searches other directories, or changes E's identity.
-func resolveRestoreRuntime(ctx context.Context, configured, required string) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	want, err := manifest.ParseRef(required)
-	if err != nil {
-		return "", fmt.Errorf("boot.runtime portable identity: %w", err)
-	}
-	if want.Scheme != manifest.RefSchemeFile || want.Location != "" || want.Digest == "" ||
-		want.Path == "." || want.Path == ".." || strings.ContainsAny(want.Path, `/\\`) {
-		return "", errors.New("boot.runtime portable identity must be an unlocated file basename with digest")
-	}
-	host, err := manifest.ParseRef(configured)
-	if err != nil {
-		return "", fmt.Errorf("boot.runtime host binding: %w", err)
-	}
-	if host.Scheme != manifest.RefSchemeFile || host.Location != "" || host.Digest != "" || strings.ContainsRune(host.Path, 0) {
-		return "", errors.New("boot.runtime host binding must be an unqualified local file:// path")
-	}
-	primary, err := filepath.Abs(host.Path)
-	if err != nil {
-		return "", fmt.Errorf("boot.runtime host path: %w", err)
-	}
-	check := func(path string) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		candidate := config.SandboxConfig{Boot: config.BootConfig{Runtime: "file://" + path}}
-		actual, err := sandbox.ResolveRuntimeProjection(&candidate)
-		if cancelled := ctx.Err(); cancelled != nil {
-			return cancelled
-		}
-		if err != nil {
-			return err
-		}
-		if actual != required {
-			return fmt.Errorf("identity mismatch: portable %s, host %s", required, actual)
-		}
-		return nil
-	}
-	primaryErr := check(primary)
-	if primaryErr == nil {
-		return primary, nil
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	primaryErr = fmt.Errorf("boot.runtime primary %s: %w", primary, primaryErr)
-	// Use the supplied path's directory, not the target of a default symlink.
-	fallback := filepath.Join(filepath.Dir(primary), want.Path)
-	if fallback == primary {
-		return "", primaryErr
-	}
-	if err := check(fallback); err != nil {
-		if cancelled := ctx.Err(); cancelled != nil {
-			return "", cancelled
-		}
-		return "", errors.Join(primaryErr, fmt.Errorf("boot.runtime fallback %s: %w", fallback, err))
-	}
-	log.Printf("[sandbox-ctl run --restore] boot.runtime selected %s after %v", fallback, primaryErr)
-	return fallback, nil
 }
 
 func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, opts Options, relativeDir string, diffCustomerKey [32]byte) error {

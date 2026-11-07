@@ -3,6 +3,8 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -125,23 +127,54 @@ func assertNoIdentityStartup(t *testing.T, shape RuntimeSpec) {
 	}
 }
 
-func TestRunSourceIdentitySharedByRunStartAndSplit(t *testing.T) {
-	for _, entry := range []string{"run", "start", "split"} {
+func TestRunSourceColdUsesTargetBootForRunStartAndSplit(t *testing.T) {
+	for _, entry := range []string{"run", "start", "split", "unbound"} {
 		for _, sidecar := range []bool{false, true} {
 			t.Run(entry+"/"+fmtBool(sidecar), func(t *testing.T) {
 				shape, host, source := sourceIdentityFixture(t)
-				cfg, launch := applyIdentitySource(t, source, host, false)
-				want := launch.PortableConfig.Boot
-				kernel := strings.TrimPrefix(shape.Kernel, "file://")
-				if err := os.WriteFile(kernel, []byte("different deployed bytes"), 0600); err != nil {
+				sourceBefore, err := config.MarshalPortableSandboxConfig(source.root.Portable)
+				if err != nil {
 					t.Fatal(err)
 				}
+				kernelBytes := []byte("different deployed target kernel")
+				kernel := strings.TrimPrefix(shape.Kernel, "file://")
+				if err := os.WriteFile(kernel, kernelBytes, 0600); err != nil {
+					t.Fatal(err)
+				}
+				kernelSum := sha256.Sum256(kernelBytes)
+				kernelDigest := hex.EncodeToString(kernelSum[:])
 				if sidecar {
-					digest := strings.Split(want.Kernel, "@digest:")[1]
-					if err := os.WriteFile(kernel+".sha256", []byte(digest), 0600); err != nil {
+					if err := os.WriteFile(kernel+".sha256", []byte(kernelDigest), 0600); err != nil {
 						t.Fatal(err)
 					}
 				}
+				oldRuntime := strings.TrimPrefix(shape.Bundle, "file://")
+				raw, err := os.ReadFile(oldRuntime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				runtimeDigest := strings.Repeat("b", 64)
+				raw = bytes.ReplaceAll(raw, []byte(strings.Repeat("a", 64)), []byte(runtimeDigest))
+				targetRuntime := filepath.Join(filepath.Dir(oldRuntime), "target-runtime.bundle")
+				if err := os.WriteFile(targetRuntime, raw, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(oldRuntime); err != nil {
+					t.Fatal(err)
+				}
+				shape.Bundle = "file://" + targetRuntime
+				host.Boot.Runtime = shape.Bundle
+				cfg, launch := applyIdentitySource(t, source, host, false)
+				inputBefore, err := config.MarshalPortableSandboxConfig(launch.PortableConfig)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want, err := launch.PortableConfig.Clone()
+				if err != nil {
+					t.Fatal(err)
+				}
+				want.Boot.Kernel = testKernelRef(filepath.Base(kernel), kernelDigest)
+				want.Boot.Runtime = testKernelRef(filepath.Base(targetRuntime), runtimeDigest)
 				watch := watchArtifactAccess(t, kernel)
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
@@ -163,33 +196,52 @@ func TestRunSourceIdentitySharedByRunStartAndSplit(t *testing.T) {
 						t.Fatalf("Run did not reach ready with valid C0: run=%v read=%v", err, readErr)
 					}
 				} else {
-					shape = deriveIdentityShape(t, shape, cfg, launch)
-					var r *Runtime
+					if entry != "unbound" {
+						shape = deriveIdentityShape(t, shape, cfg, launch)
+					}
+					var runtime *Runtime
 					var err error
-					if entry == "split" {
-						r, err = StartRuntime(ctx, shape)
+					if entry == "split" || entry == "unbound" {
+						runtime, err = StartRuntime(ctx, shape)
 						if err == nil {
-							err = r.Launch(ctx, launch)
+							err = runtime.Launch(ctx, launch)
 						}
 					} else {
-						r, err = Start(ctx, SandboxSpec{Runtime: shape, Launch: launch})
+						runtime, err = Start(ctx, SandboxSpec{Runtime: shape, Launch: launch})
 					}
-					if r != nil {
-						defer r.Close()
+					if runtime != nil {
+						defer runtime.Close()
 					}
 					if err != nil {
 						t.Fatal(err)
 					}
-					if r.unknownHostKernel == sidecar || (r.hostProjection.KernelRef == "") == sidecar {
-						t.Fatalf("host identity incorrectly claimed or discarded: %+v unknown=%v", r.hostProjection, r.unknownHostKernel)
+					if runtime.hostProjection.KernelRef != want.Boot.Kernel || runtime.hostProjection.RuntimeRef != want.Boot.Runtime {
+						t.Fatalf("target identity = %+v, want %+v", runtime.hostProjection, want.Boot)
 					}
 					got = sourceIdentityRuntimeConfig(t, shape, false)
 				}
-				if got.Boot.Kernel != want.Kernel || got.Boot.Runtime != want.Runtime {
-					t.Fatalf("source boot ancestry changed: %+v, want %+v", got.Boot, want)
+				gotRaw, err := config.MarshalPortableSandboxConfig(got)
+				if err != nil {
+					t.Fatal(err)
 				}
-				if reads := watch.count(unix.IN_ACCESS); reads != 0 {
-					t.Fatalf("portable %s read kernel payload %d times", entry, reads)
+				wantRaw, err := config.MarshalPortableSandboxConfig(want)
+				if err != nil || !bytes.Equal(gotRaw, wantRaw) {
+					t.Fatalf("derived C0 changed more than target boot identities: %s, want %s (error %v)", gotRaw, wantRaw, err)
+				}
+				inputAfter, err := config.MarshalPortableSandboxConfig(launch.PortableConfig)
+				if err != nil || !bytes.Equal(inputBefore, inputAfter) {
+					t.Fatal("cold derivation changed caller source baseline", err)
+				}
+				sourceAfter, err := config.MarshalPortableSandboxConfig(source.root.Portable)
+				if err != nil || !bytes.Equal(sourceBefore, sourceAfter) {
+					t.Fatal("cold derivation changed source E", err)
+				}
+				wantReads := 1
+				if sidecar {
+					wantReads = 0
+				}
+				if reads := watch.count(unix.IN_ACCESS); reads != wantReads {
+					t.Fatalf("source cold %s kernel payload reads=%d, want %d", entry, reads, wantReads)
 				}
 			})
 		}
@@ -197,7 +249,7 @@ func TestRunSourceIdentitySharedByRunStartAndSplit(t *testing.T) {
 }
 
 func TestRunSourceIdentityHostChecksAtStart(t *testing.T) {
-	for _, mode := range []string{"missing-kernel", "missing-runtime", "bad-sidecar", "mismatched-sidecar", "changed-runtime"} {
+	for _, mode := range []string{"missing-kernel", "missing-runtime", "bad-sidecar", "bad-runtime"} {
 		t.Run(mode, func(t *testing.T) {
 			shape, host, source := sourceIdentityFixture(t)
 			cfg, launch := applyIdentitySource(t, source, host, false)
@@ -217,22 +269,13 @@ func TestRunSourceIdentityHostChecksAtStart(t *testing.T) {
 				t.Fatal("Derive inspected host identity instead of freezing bindings")
 			}
 			switch mode {
-			case "bad-sidecar", "mismatched-sidecar":
-				body := "invalid"
-				if mode == "mismatched-sidecar" {
-					body = strings.Repeat("f", 64)
-				}
+			case "bad-sidecar":
 				// Added after Derive: StartRuntime must observe current metadata.
-				if err := os.WriteFile(kernel+".sha256", []byte(body), 0600); err != nil {
+				if err := os.WriteFile(kernel+".sha256", []byte("invalid"), 0600); err != nil {
 					t.Fatal(err)
 				}
-			case "changed-runtime":
-				raw, err := os.ReadFile(bundle)
-				if err != nil {
-					t.Fatal(err)
-				}
-				raw = bytes.ReplaceAll(raw, []byte(strings.Repeat("a", 64)), []byte(strings.Repeat("b", 64)))
-				if err := os.WriteFile(bundle, raw, 0600); err != nil {
+			case "bad-runtime":
+				if err := os.WriteFile(bundle, []byte("not a runtime bundle"), 0600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -326,6 +369,41 @@ func TestRunSourceIdentityLaunchRequiresOriginalReceipt(t *testing.T) {
 	}
 }
 
+func TestRunSourceColdUnboundRuntimeValidatesReceipt(t *testing.T) {
+	for _, entry := range []string{"start", "split"} {
+		t.Run(entry, func(t *testing.T) {
+			shape, host, source := sourceIdentityFixture(t)
+			_, launch := applyIdentitySource(t, source, host, false)
+			original := launch.PortableConfig.Boot.Runtime
+			launch.PortableConfig.Boot.Runtime = testKernelRef("changed.bundle", strings.Repeat("b", 64))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if entry == "start" {
+				if runtime, err := Start(ctx, SandboxSpec{Runtime: shape, Launch: launch}); err == nil || runtime != nil {
+					if runtime != nil {
+						runtime.Close()
+					}
+					t.Fatal("Start accepted changed source without derivation", err)
+				}
+				assertNoIdentityStartup(t, shape)
+				return
+			}
+			runtime, err := StartRuntime(ctx, shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer runtime.Close()
+			if err := runtime.Launch(ctx, launch); err == nil || runtime.State() != "runtime_ready" {
+				t.Fatal("unbound Launch accepted changed source or consumed ready runtime", err)
+			}
+			launch.PortableConfig.Boot.Runtime = original
+			if err := runtime.Launch(ctx, launch); err != nil {
+				t.Fatal("valid source did not launch after rejected receipt", err)
+			}
+		})
+	}
+}
+
 func TestRunSourceIdentityManualAndReplaceBootStayStrict(t *testing.T) {
 	for _, replace := range []bool{false, true} {
 		t.Run(map[bool]string{false: "manual-source", true: "replace-boot"}[replace], func(t *testing.T) {
@@ -390,8 +468,9 @@ func TestRunSourceIdentityCheckpointMaterialization(t *testing.T) {
 			}
 			defer r.Close()
 			got := sourceIdentityRuntimeConfig(t, shape, mode == "reopen")
-			if got.Boot.Kernel != initial.PortableConfig.Boot.Kernel || got.Boot.Runtime != initial.PortableConfig.Boot.Runtime {
-				t.Fatal("checkpoint preparation changed boot ancestry")
+			kernelSum := sha256.Sum256([]byte("different deployed bytes"))
+			if got.Boot.Kernel != testKernelRef(filepath.Base(kernel), hex.EncodeToString(kernelSum[:])) || got.Boot.Runtime != initial.PortableConfig.Boot.Runtime {
+				t.Fatal("checkpoint preparation did not retain target boot identities")
 			}
 			if !launch.PortableConfig.IsCheckpoint() || launch.SourceBinding.Checkpoint == nil {
 				t.Fatal("checkpoint preparation mutated caller source metadata")
@@ -405,8 +484,8 @@ func TestRunSourceIdentityCheckpointMaterialization(t *testing.T) {
 					t.Fatalf("checkpoint disk %d changed during %s: %v", i, mode, err)
 				}
 			}
-			if reads := watch.count(unix.IN_ACCESS); reads != 0 {
-				t.Fatalf("checkpoint source kernel reads=%d", reads)
+			if reads := watch.count(unix.IN_ACCESS); reads != 1 {
+				t.Fatalf("checkpoint source kernel reads=%d, want one target hash", reads)
 			}
 		})
 	}

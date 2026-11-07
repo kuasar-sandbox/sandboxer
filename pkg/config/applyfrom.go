@@ -15,9 +15,12 @@ type ApplyFromOptions struct {
 }
 
 // ApplyFromRules applies one presence-aware host/instance document to a
-// Sandbox artifact. Normal inheritance returns the runtime config and immutable
-// source-derived C0. ReplaceBoot returns a fully materialized explicit-cold
-// config and a nil C0; artifact boot fields are never partially merged.
+// Sandbox artifact. Normal inheritance returns the runtime config and a
+// source-derived portable baseline. Cold startup resolves the target kernel and
+// runtime identities; Launch clones this baseline into the new run's C0 while
+// preserving its disk graph. ReplaceBoot returns a fully materialized
+// explicit-cold config and a nil baseline; artifact boot fields are never
+// partially merged in that mode.
 func ApplyFromRules(artifact *PortableSandboxConfig, host *SandboxConfig, presence FieldPresence, options ApplyFromOptions) (*SandboxConfig, *PortableSandboxConfig, error) {
 	if artifact == nil {
 		return nil, nil, errors.New("run --from: missing Sandbox portable config")

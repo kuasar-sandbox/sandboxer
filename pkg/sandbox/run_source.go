@@ -62,7 +62,9 @@ func (s *RunSource) Close() error {
 // The LaunchSpec carries the workload and complete source access, while stdio,
 // forwards and RuntimeSpec host settings remain the caller's responsibility.
 // Pass the returned LaunchSpec intact to DeriveRuntimeSpecWithOptions and
-// Start/Launch to retain the source-bound portable boot identity policy.
+// Start/Launch to retain the source baseline and disk provenance. Cold startup
+// resolves the target boot identities and Launch derives a new C0 from this
+// baseline without changing the opened E or the caller's LaunchSpec.
 // ReplaceBoot requires a complete host boot definition and retains neither
 // source provenance nor source-scoped selectors. Its Storage is still borrowed.
 func (s *RunSource) Apply(host *config.SandboxConfig, presence config.FieldPresence, options config.ApplyFromOptions) (*config.SandboxConfig, LaunchSpec, error) {

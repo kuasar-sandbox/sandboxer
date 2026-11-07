@@ -128,8 +128,8 @@ func TestSDKRetainsArtifactIdentityThroughLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	if r.hostProjection.KernelRef != testKernelRef("vmlinux", digest) || r.hostProjection.RuntimeRef == "" || r.unknownHostKernel {
-		t.Fatalf("startup identity = %+v, legacy=%v", r.hostProjection, r.unknownHostKernel)
+	if r.hostProjection.KernelRef != testKernelRef("vmlinux", digest) || r.hostProjection.RuntimeRef == "" {
+		t.Fatalf("startup identity = %+v", r.hostProjection)
 	}
 	cfg, err := launch.config(shape.config())
 	if err != nil {
@@ -160,7 +160,7 @@ func TestSDKRetainsArtifactIdentityThroughLaunch(t *testing.T) {
 }
 
 func TestSDKPortableIdentityComparison(t *testing.T) {
-	for _, kind := range []string{"matching", "kernel", "runtime", "basename"} {
+	for _, kind := range []string{"matching", "kernel", "runtime", "basename", "runtime-basename"} {
 		t.Run(kind, func(t *testing.T) {
 			shape, launch := sdkFixture(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -185,6 +185,8 @@ func TestSDKPortableIdentityComparison(t *testing.T) {
 				portable.Boot.Runtime = testKernelRef("runtime.bundle", strings.Repeat("b", 64))
 			case "basename":
 				portable.Boot.Kernel = strings.Replace(portable.Boot.Kernel, "file://vmlinux@", "file://other@", 1)
+			case "runtime-basename":
+				portable.Boot.Runtime = strings.Replace(portable.Boot.Runtime, "file://runtime.bundle@", "file://other.bundle@", 1)
 			}
 			original, err := json.Marshal(portable)
 			if err != nil {
@@ -192,14 +194,15 @@ func TestSDKPortableIdentityComparison(t *testing.T) {
 			}
 			launch.PortableConfig = portable
 			err = r.Launch(ctx, launch)
-			if kind == "matching" && err != nil || kind != "matching" && err == nil {
+			matching := kind == "matching" || kind == "runtime-basename"
+			if matching && err != nil || !matching && err == nil {
 				t.Fatalf("Launch(%s) = %v", kind, err)
 			}
 			after, marshalErr := json.Marshal(portable)
 			if marshalErr != nil || !bytes.Equal(after, original) {
 				t.Fatal("caller C0 mutated")
 			}
-			if kind != "matching" && r.State() != "closed" {
+			if !matching && r.State() != "closed" {
 				t.Fatalf("failure lifecycle = %s", r.State())
 			}
 		})
@@ -266,8 +269,8 @@ func TestLegacyRunColdAndPortableIdentityHandoff(t *testing.T) {
 				}
 				portable.Boot.Root.Base = "self"
 				cfg.Boot.Root.Base = "self"
-				// The existing C0 is ancestry. With no sidecar, portable Run does
-				// not promote its expected digest into a verified host fact.
+				// The source baseline stays unchanged; source cold records the
+				// target kernel in the new C0, hashing once without a sidecar.
 				if err := os.WriteFile(kernel, []byte("changed host kernel"), 0600); err != nil {
 					t.Fatal(err)
 				}
@@ -280,7 +283,7 @@ func TestLegacyRunColdAndPortableIdentityHandoff(t *testing.T) {
 			watch := watchArtifactAccess(t, kernel)
 			got := testLegacyRunAtReady(t, shape, cfg, portable, sourceRef)
 			wantReads := 0
-			if mode == "cold-fallback" {
+			if mode == "cold-fallback" || mode == "portable-absent" {
 				wantReads = 1
 			}
 			if gotReads := watch.count(unix.IN_ACCESS); gotReads != wantReads {
@@ -289,8 +292,11 @@ func TestLegacyRunColdAndPortableIdentityHandoff(t *testing.T) {
 			if mode == "cold-sidecar" && got.Boot.Kernel != testKernelRef("vmlinux", strings.Repeat("b", 64)) {
 				t.Fatalf("cold Run ignored sidecar: %s", got.Boot.Kernel)
 			}
-			if portable != nil && got.Boot.Kernel != portable.Boot.Kernel {
-				t.Fatalf("portable Run changed ancestry: %s vs %s", got.Boot.Kernel, portable.Boot.Kernel)
+			if portable != nil {
+				sum := sha256.Sum256([]byte("changed host kernel"))
+				if got.Boot.Kernel != testKernelRef("vmlinux", hex.EncodeToString(sum[:])) || got.Boot.Kernel == portable.Boot.Kernel {
+					t.Fatalf("portable Run did not derive target kernel identity: %s vs source %s", got.Boot.Kernel, portable.Boot.Kernel)
+				}
 			}
 		})
 	}
@@ -315,7 +321,7 @@ func TestLegacyPortableRunChecksPresentMetadataBeforeVM(t *testing.T) {
 	path, scheme, digest := writeDiskArtifact(t, t.TempDir(), "image", lifecycleEROFSFixture(), nil)
 	sourceRef := fileRef(path, scheme, digest)
 	kernel := strings.TrimPrefix(shape.Kernel, "file://")
-	for _, body := range []string{strings.Repeat("b", 64), "invalid"} {
+	for _, body := range []string{"invalid"} {
 		if err := os.WriteFile(kernel+".sha256", []byte(body), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -386,7 +392,7 @@ func TestSDKNewRuntimeResolvesChangedMetadata(t *testing.T) {
 	}
 }
 
-func TestPreparedStartupRejectsDifferentBindingsAndUnknownOrdinary(t *testing.T) {
+func TestPreparedStartupRejectsDifferentBindingsAndIncompleteIdentity(t *testing.T) {
 	shape, launch := sdkFixture(t)
 	ids, err := ResolvePortableProjection(shape.config())
 	if err != nil {
@@ -400,8 +406,7 @@ func TestPreparedStartupRejectsDifferentBindingsAndUnknownOrdinary(t *testing.T)
 	}
 	unknown := *prepared
 	unknown.projection.KernelRef = ""
-	unknown.unknownKernel = true
-	if _, err := start(context.Background(), SandboxSpec{Runtime: shape, Launch: launch}, &unknown); err == nil || !strings.Contains(err.Error(), "legacy portable boot") {
+	if _, err := start(context.Background(), SandboxSpec{Runtime: shape, Launch: launch}, &unknown); err == nil || !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("unknown kernel entered ordinary Launch: %v", err)
 	}
 	if _, err := startRuntime(context.Background(), shape, &preparedHostIdentity{kernel: shape.Kernel, bundle: shape.Bundle}); err == nil || !strings.Contains(err.Error(), "incomplete") {
@@ -571,7 +576,7 @@ func TestSDKIdentityIOCompletesBeforeRuntimeReady(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer r.Close()
-			if r.hostProjection.KernelRef != expected || r.hostProjection.RuntimeRef == "" || r.unknownHostKernel {
+			if r.hostProjection.KernelRef != expected || r.hostProjection.RuntimeRef == "" {
 				t.Fatalf("incomplete public startup identity: %+v", r.hostProjection)
 			}
 			want := 1
@@ -639,7 +644,7 @@ func TestSDKStartPortableKeepsPublicIdentityPolicy(t *testing.T) {
 	if n := watch.count(unix.IN_ACCESS); n != 1 {
 		t.Fatalf("public PortableConfig Start kernel scans=%d, want 1", n)
 	}
-	if r.unknownHostKernel || r.hostProjection != ids {
+	if r.hostProjection != ids {
 		t.Fatalf("public Start used legacy policy: %+v", r.hostProjection)
 	}
 }
@@ -681,42 +686,37 @@ func TestSDKIdentityFailureBeforeStartup(t *testing.T) {
 	}
 }
 
-func TestPreparedIdentityCannotChangeBindingsOrEscapeLegacy(t *testing.T) {
+func TestPreparedIdentityRequiresCompleteHostFacts(t *testing.T) {
 	shape, launch := sdkFixture(t)
 	ids, err := ResolvePortableProjection(shape.config())
 	if err != nil {
 		t.Fatal(err)
 	}
 	prepared := preparedHostIdentity{kernel: shape.Kernel, bundle: shape.Bundle, projection: ids}
-	for _, kind := range []string{"kernel", "bundle", "incomplete", "invalid-unknown"} {
+	for _, kind := range []string{"kernel-path", "runtime-path", "kernel-identity", "runtime-identity"} {
 		t.Run(kind, func(t *testing.T) {
 			p := prepared
 			switch kind {
-			case "kernel":
+			case "kernel-path":
 				p.kernel += ".other"
-			case "bundle":
+			case "runtime-path":
 				p.bundle += ".other"
-			case "incomplete":
+			case "kernel-identity":
 				p.projection.KernelRef = ""
-			case "invalid-unknown":
-				p.unknownKernel = true
+			case "runtime-identity":
+				p.projection.RuntimeRef = ""
 			}
-			r, e := startRuntime(context.Background(), shape, &p)
+			r, err := startRuntime(context.Background(), shape, &p)
 			if r != nil {
 				r.Close()
 			}
-			if e == nil {
+			if err == nil {
 				t.Fatal("invalid preparation accepted")
 			}
 		})
 	}
-	unknown := prepared
-	unknown.projection.KernelRef = ""
-	unknown.unknownKernel = true
-	if r, err := start(context.Background(), SandboxSpec{Runtime: shape, Launch: launch}, &unknown); err == nil {
-		r.Close()
-		t.Fatal("ordinary launch accepted legacy unknown identity")
-	}
+	missing := prepared
+	missing.projection.KernelRef = ""
 	cfg, err := launch.config(shape.config())
 	if err != nil {
 		t.Fatal(err)
@@ -725,21 +725,14 @@ func TestPreparedIdentityCannotChangeBindingsOrEscapeLegacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	launch.SourceBinding = &RunSourceBinding{SandboxRef: testKernelRef("source.sandbox", strings.Repeat("a", 64))}
-	if r, err := start(context.Background(), SandboxSpec{Runtime: shape, Launch: launch}, &unknown); err == nil {
-		r.Close()
-		t.Fatal("nonlegacy portable input accepted unknown host identity")
-	}
-	// Even the private legacy state cannot generate a fresh C0 after startup.
-	r, err := startRuntime(context.Background(), shape, &unknown)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-	launch.PortableConfig = nil
-	launch.SourceBinding = nil
-	if err := r.Launch(context.Background(), launch); err == nil {
-		t.Fatal("incomplete state generated ordinary C0")
+	for _, source := range []bool{false, true} {
+		if source {
+			launch.SourceBinding = &RunSourceBinding{SandboxRef: testKernelRef("source.sandbox", strings.Repeat("a", 64))}
+		}
+		if runtime, err := start(context.Background(), SandboxSpec{Runtime: shape, Launch: launch}, &missing); err == nil {
+			runtime.Close()
+			t.Fatal("portable input accepted missing target kernel identity")
+		}
 	}
 }
 

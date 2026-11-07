@@ -41,9 +41,9 @@ func writeRestoreRuntime(t *testing.T, path, digest string) {
 	}
 }
 
-func TestResolveRestoreRuntimeCandidates(t *testing.T) {
+func TestResolveRuntimeBindingCandidates(t *testing.T) {
 	good, bad := strings.Repeat("a", 64), strings.Repeat("b", 64)
-	for _, kind := range []string{"missing", "unreadable", "malformed", "digest mismatch", "basename mismatch"} {
+	for _, kind := range []string{"missing", "unreadable", "malformed", "digest mismatch", "renamed identical"} {
 		t.Run(kind, func(t *testing.T) {
 			dir := t.TempDir()
 			primary, fallback := filepath.Join(dir, "runtime-v2.bundle"), filepath.Join(dir, "runtime-v1.bundle")
@@ -63,18 +63,22 @@ func TestResolveRestoreRuntimeCandidates(t *testing.T) {
 				}
 			case "digest mismatch":
 				writeRestoreRuntime(t, primary, bad)
-			case "basename mismatch":
+			case "renamed identical":
 				writeRestoreRuntime(t, primary, good)
 			}
-			got, err := resolveRestoreRuntime(context.Background(), "file://"+primary, "file://runtime-v1.bundle@digest:"+good)
-			if err != nil || got != fallback {
-				t.Fatalf("selected %q, %v; want %q", got, err, fallback)
+			got, err := ResolveRuntimeBinding(context.Background(), "file://"+primary, "file://runtime-v1.bundle@digest:"+good)
+			wantPath := fallback
+			if kind == "renamed identical" {
+				wantPath = primary
+			}
+			if err != nil || got != wantPath {
+				t.Fatalf("selected %q, %v; want %q", got, err, wantPath)
 			}
 		})
 	}
 }
 
-func TestResolveRestoreRuntimeSingleOpen(t *testing.T) {
+func TestResolveRuntimeBindingSingleOpen(t *testing.T) {
 	for _, valid := range []bool{true, false} {
 		t.Run(map[bool]string{true: "primary success", false: "same failed path"}[valid], func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "runtime-v1.bundle")
@@ -92,7 +96,7 @@ func TestResolveRestoreRuntimeSingleOpen(t *testing.T) {
 			if !valid {
 				digest = strings.Repeat("b", 64)
 			}
-			got, err := resolveRestoreRuntime(context.Background(), "file://"+path, "file://runtime-v1.bundle@digest:"+digest)
+			got, err := ResolveRuntimeBinding(context.Background(), "file://"+path, "file://runtime-v1.bundle@digest:"+digest)
 			if valid && (err != nil || got != path) {
 				t.Fatalf("primary selection = %q, %v", got, err)
 			}
@@ -119,7 +123,7 @@ func TestResolveRestoreRuntimeSingleOpen(t *testing.T) {
 	}
 }
 
-func TestResolveRestoreRuntimeRetainsBothErrors(t *testing.T) {
+func TestResolveRuntimeBindingRetainsBothErrors(t *testing.T) {
 	for _, fallbackKind := range []string{"missing", "malformed", "mismatch"} {
 		t.Run(fallbackKind, func(t *testing.T) {
 			dir := t.TempDir()
@@ -134,9 +138,14 @@ func TestResolveRestoreRuntimeRetainsBothErrors(t *testing.T) {
 			case "mismatch":
 				writeRestoreRuntime(t, fallback, bad)
 			}
-			_, err := resolveRestoreRuntime(context.Background(), "file://"+primary, "file://runtime-v1.bundle@digest:"+good)
+			_, err := ResolveRuntimeBinding(context.Background(), "file://"+primary, "file://runtime-v1.bundle@digest:"+good)
 			if err == nil || !strings.Contains(err.Error(), "primary "+primary) || !strings.Contains(err.Error(), "fallback "+fallback) || !strings.Contains(err.Error(), "identity mismatch") {
 				t.Fatalf("lost candidate failures: %v", err)
+			}
+			wantIncompatible := fallbackKind != "malformed"
+			var incompatible *RuntimeIncompatibleError
+			if errors.Is(err, ErrRuntimeIncompatible) != wantIncompatible || errors.As(err, &incompatible) != wantIncompatible {
+				t.Fatalf("incorrect compatibility classification: %v", err)
 			}
 			if fallbackKind == "missing" && !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("lost wrapped missing-file error: %v", err)
@@ -145,10 +154,10 @@ func TestResolveRestoreRuntimeRetainsBothErrors(t *testing.T) {
 	}
 }
 
-func TestResolveRestoreRuntimeRelativeAndSymlinkDirectory(t *testing.T) {
+func TestResolveRuntimeBindingRelativeAndSymlinkDirectory(t *testing.T) {
 	dir, targetDir := t.TempDir(), t.TempDir()
 	good := strings.Repeat("a", 64)
-	writeRestoreRuntime(t, filepath.Join(targetDir, "runtime-v2.bundle"), good)
+	writeRestoreRuntime(t, filepath.Join(targetDir, "runtime-v2.bundle"), strings.Repeat("b", 64))
 	primary := filepath.Join(dir, "runtime-v2.bundle")
 	if err := os.Symlink(filepath.Join(targetDir, "runtime-v2.bundle"), primary); err != nil {
 		t.Fatal(err)
@@ -158,13 +167,13 @@ func TestResolveRestoreRuntimeRelativeAndSymlinkDirectory(t *testing.T) {
 	// No runtime-v1 exists beside the symlink target. The caller's directory
 	// is the authority even when the configured default is a symlink.
 	t.Chdir(dir)
-	got, err := resolveRestoreRuntime(context.Background(), "file://./runtime-v2.bundle", "file://runtime-v1.bundle@digest:"+good)
+	got, err := ResolveRuntimeBinding(context.Background(), "file://./runtime-v2.bundle", "file://runtime-v1.bundle@digest:"+good)
 	if err != nil || got != fallback || !filepath.IsAbs(got) {
 		t.Fatalf("symlink/relative selection = %q, %v; want %q", got, err, fallback)
 	}
 }
 
-func TestResolveRestoreRuntimeRejectsInvalidInputsAndCancellation(t *testing.T) {
+func TestResolveRuntimeBindingRejectsInvalidInputsAndCancellation(t *testing.T) {
 	digest := strings.Repeat("a", 64)
 	path := filepath.Join(t.TempDir(), "runtime-v1.bundle")
 	want := "file://runtime-v1.bundle@digest:" + digest
@@ -178,15 +187,61 @@ func TestResolveRestoreRuntimeRejectsInvalidInputsAndCancellation(t *testing.T) 
 		{"file://" + path, "file://runtime-v1.bundle@digest:invalid"},
 		{"file://" + path, "file://runtime-v1.bundle@digest:" + digest + "@location:runtime"},
 	} {
-		_, err := resolveRestoreRuntime(context.Background(), tc.host, tc.required)
-		if err == nil || strings.Contains(err.Error(), "primary") || strings.Contains(err.Error(), "fallback") {
+		_, err := ResolveRuntimeBinding(context.Background(), tc.host, tc.required)
+		if err == nil || errors.Is(err, ErrRuntimeIncompatible) || strings.Contains(err.Error(), "primary") || strings.Contains(err.Error(), "fallback") {
 			t.Fatalf("invalid input entered candidate lookup: %q, %q: %v", tc.host, tc.required, err)
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := resolveRestoreRuntime(ctx, "file://"+path, want)
-	if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "primary") {
+	_, err := ResolveRuntimeBinding(ctx, "file://"+path, want)
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrRuntimeIncompatible) || strings.Contains(err.Error(), "primary") {
 		t.Fatalf("canceled lookup = %v", err)
+	}
+}
+
+func TestResolveRuntimeBindingDistinguishesDigestScheme(t *testing.T) {
+	dir := t.TempDir()
+	digest := strings.Repeat("a", 64)
+	primary, fallback := filepath.Join(dir, "renamed.bundle"), filepath.Join(dir, "runtime-v1.bundle")
+	writeRestoreRuntime(t, primary, digest)
+	writeRestoreRuntime(t, fallback, digest)
+	_, err := ResolveRuntimeBinding(context.Background(), "file://"+primary, "file://runtime-v1.bundle@manifest:"+digest)
+	if !errors.Is(err, ErrRuntimeIncompatible) || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("different digest schemes were not rejected as incompatible: %v", err)
+	}
+}
+
+func TestResolveRuntimeBindingDoesNotHideInspectionErrors(t *testing.T) {
+	for _, kind := range []string{"both missing", "malformed primary", "unreadable primary"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			primary := filepath.Join(dir, "runtime-current.bundle")
+			digest := strings.Repeat("a", 64)
+			switch kind {
+			case "malformed primary":
+				if err := os.WriteFile(primary, []byte("bad"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "unreadable primary":
+				if os.Geteuid() == 0 {
+					t.Skip("root can read mode-000 files")
+				}
+				writeRestoreRuntime(t, primary, digest)
+				if err := os.Chmod(primary, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := ResolveRuntimeBinding(context.Background(), "file://"+primary, "file://runtime-v1.bundle@digest:"+digest)
+			if err == nil || !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("missing fallback cause was lost: %v", err)
+			}
+			if got, want := errors.Is(err, ErrRuntimeIncompatible), kind == "both missing"; got != want {
+				t.Fatalf("compatibility classification = %t, want %t: %v", got, want, err)
+			}
+			if kind == "unreadable primary" && !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("permission failure was lost: %v", err)
+			}
+		})
 	}
 }

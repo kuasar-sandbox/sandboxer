@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e-requires: ["docker","kvm","tun","userfaultfd"]
-# Snapshot restore resumes guest state and resolves the captured runtime by sibling fallback.
+# Snapshot restore resumes guest state with a renamed runtime and no external kernel.
 set -euo pipefail
 
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
@@ -16,7 +16,7 @@ source "$SANDBOXER_LIB/tarstream.sh"
 
 require_root
 require_kvm
-for command in cp docker ip mkfs.ext4 python3 sha256sum timeout truncate; do
+for command in cp docker ip mkfs.ext4 mv python3 rm sha256sum timeout truncate; do
     require_command "$command"
 done
 for binary in sandbox-ctl flatten-ctl cloud-hypervisor; do
@@ -108,11 +108,12 @@ DIFF="$WORK/root.diff"
 truncate -s 1G "$DIFF.template"
 mkfs.ext4 -q -F -O ^has_journal "$DIFF.template"
 
-# Capture from v1. On restore, the recorded path is deliberately removed; the
-# supplied v2 path must fail digest/basename validation and the sibling v1 must win.
+# Capture with WORK-owned boot files. Restore uses the same runtime content
+# under a different basename after both captured paths have been removed.
+CAPTURE_KERNEL="$WORK/capture-runtime/vmlinux-v1"
 CAPTURE_RUNTIME="$WORK/capture-runtime/runtime-v1.bundle"
-SELECTED_RUNTIME="$WORK/deploy-runtime/runtime-v1.bundle"
-DEFAULT_RUNTIME="$WORK/deploy-runtime/runtime-v2.bundle"
+DEFAULT_RUNTIME="$WORK/deploy-runtime/runtime-renamed.bundle"
+cp --reflink=auto --sparse=always "$BIN/vmlinux" "$CAPTURE_KERNEL"
 cp --reflink=auto --sparse=always "$BIN/sandbox-runtime.bundle" "$CAPTURE_RUNTIME"
 
 # Retain the primary's mappings and open O_DIRECT descriptor across snapshot.
@@ -129,7 +130,7 @@ resources:
   allocatable: { cpu: 1, memory: 512MiB }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-restore }
 boot:
-  kernel: file://$BIN/vmlinux
+  kernel: file://$CAPTURE_KERNEL
   runtime: file://$CAPTURE_RUNTIME
   cmdline: "console=hvc0 printk.time=1"
   root:
@@ -189,11 +190,14 @@ printf 'Captured cold counter: %s\n' "$PRE_SNAP_TICK"
 SNAPSHOT="$WORK/snapshot/$SID1.snapshot"
 [ -f "$SNAPSHOT" ] || e2e_fail "snapshot is missing"
 
-mv "$CAPTURE_RUNTIME" "$SELECTED_RUNTIME"
-cp --reflink=auto --sparse=always "$SELECTED_RUNTIME" "$DEFAULT_RUNTIME"
+mv "$CAPTURE_RUNTIME" "$DEFAULT_RUNTIME"
+rm -- "$CAPTURE_KERNEL"
 [ ! -e "$CAPTURE_RUNTIME" ] || e2e_fail "captured runtime path still exists"
+[ ! -e "$CAPTURE_KERNEL" ] || e2e_fail "captured kernel path still exists"
+[ ! -e "$WORK/deploy-runtime/runtime-v1.bundle" ] || e2e_fail "runtime fallback unexpectedly exists"
 find "$WORK/snapshot" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum >"$WORK/source.sha256"
 
+# Keep the legacy kernel binding in YAML; its WORK-owned file no longer exists.
 RESTORE_DIFF="$WORK/restore.diff"
 cat >"$WORK/restore.yaml" <<EOF
 resources:
@@ -201,7 +205,7 @@ resources:
   allocatable: { cpu: 1, memory: 512MiB }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-restore }
 boot:
-  kernel: file://$BIN/vmlinux
+  kernel: file://$CAPTURE_KERNEL
   runtime: file://$DEFAULT_RUNTIME
   root:
     overlay: { diff: file://$RESTORE_DIFF }
@@ -227,7 +231,7 @@ CG_RESTORE="$("$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$WORK/run
 grep -qE '^0::/init[[:space:]]*$' <<<"$CG_RESTORE" || e2e_fail "restored exec is not pinned to /init"
 readiness_assert_wire "$WORK/restore.ready" "$RESTORE_READER_PID" $'control_ready\nready\n' || e2e_fail "restore readiness wire is not exact"
 
-python3 - "$WORK/runtime/$SID2/snap-state/config.json" "$SELECTED_RUNTIME" <<'PY'
+python3 - "$WORK/runtime/$SID2/snap-state/config.json" "$DEFAULT_RUNTIME" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as source:
     config = json.load(source)

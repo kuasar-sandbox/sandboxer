@@ -453,7 +453,13 @@ file://<digest>.overlay@hmac:<digest>
 file://<digest>.overlay@digest:<digest>
 ```
 
-The destination host binds these through actual paths, a source directory, or named ref-locations before controller, network, cgroup, VM, or run-directory side effects. Explicit cold projection and manually constructed `RuntimeSpec` use the configured kernel's `.sha256` sidecar when present, or hash the raw kernel once before CH startup when absent. Portable `run --from` and the SDK chain `OpenRunSource → Apply → DeriveRuntimeSpecWithOptions → StartRuntime/Launch` share the portable identity policy: check the readable kernel binding and compare a present sidecar with C0, without hashing the kernel when the sidecar is absent. Restore keeps its cheap kernel binding check and ignores sidecars entirely. Both portable boot and restore compare the runtime Bundle footer identity with C0. Without a sidecar, portable boot does not independently prove that the host kernel matches E's recorded digest; kernel deployment remains a trusted host responsibility. Carrier metadata and configured content verification retain their own checks. See [source_identity.go](../pkg/sandbox/source_identity.go) and [restore.go](../pkg/restore/restore.go).
+The destination host resolves disk refs through actual paths, a source directory, or named ref-locations. Boot component policy depends on how the sandbox starts:
+
+- Every cold startup uses the selected target kernel/runtime. A valid `<configured-kernel-path>.sha256` sidecar supplies kernel identity; when absent, the raw kernel is hashed once before CH starts. The runtime Bundle supplies its declared footer identity.
+- Cold `run --from` and the SDK `RunSource.Apply` path derive a new C0 with those target identities while retaining the source workload, disk graph and ancestry. The source E is unchanged; its old boot identities do not constrain a new cold boot.
+- Memory restore preserves the original C0 and resumes the captured kernel. It does not require, open, or hash an external kernel or read a kernel sidecar. Its external runtime must match C0 by **digest scheme and digest**; the serialized basename is only a lookup hint, so the configured file may have a different name.
+
+For memory restore, runtime selection checks the explicit host path first, then at most the original runtime basename in that configured path's directory. It does not add a lookup in Snapshot S's directory or scan other directories. The existing reference encoding and artifact schema remain unchanged. Runtime footer inspection validates the envelope and declared identity without scanning the EROFS payload; carrier metadata and configured content verification retain their own checks. See [source_identity.go](../pkg/sandbox/source_identity.go), [runtime.go](../pkg/restore/runtime.go), and the [runtime binding policy](runtime.md#restore).
 
 <a id="encoding-limits"></a>
 
@@ -494,13 +500,13 @@ explicit cold config + persistent fields + canonical identities
   - host-only - ephemeral = C0
 
 E.sandbox.runtime.cfg + allowed persistent overrides
-  + canonical host bindings - ephemeral = C0 for run --from
+  + target kernel/runtime identities - ephemeral = new C0 for run --from
 
 E.sandbox.runtime.cfg non-boot defaults + allowed persistent overrides
   + complete replacement boot - ephemeral = a new explicit-cold C0
 
-S.sandbox_ref -> E.sandbox.runtime.cfg
-  + allowed restore host bindings = C0 for run --restore
+S.sandbox_ref -> E.sandbox.runtime.cfg = unchanged C0 for run --restore
+  (allowed restore host bindings apply only to the runtime configuration)
 ```
 
 C0 is written in the run directory once complete launch inputs are known, before workload consumption; its bytes remain unchanged thereafter. A base runtime has no incomplete placeholder C0. The live runtime separately holds a nonserialized `RunSourceBinding`:
@@ -548,7 +554,7 @@ root:
   base_from_refs: []
 ```
 
-`run --from` binds `self` to the current E payload through source binding. When exporting C1, it first materializes C0's old `self` as the original source ref, then sets the new root payload position to `self`. This avoids a self-referential E digest cycle.
+`run --from` binds `self` to the current E payload through source binding. Selecting target kernel/runtime identities for the new C0 preserves this disk ancestry. When exporting C1, it first materializes C0's old `self` as the original source ref, then sets the new root payload position to `self`. This avoids a self-referential E digest cycle.
 
 `run --from --replace-boot` creates no source binding. After reading non-boot defaults, the source E no longer participates in the run. The new active writable root layer occupies the sole `self` through ordinary explicit-cold projection. Later export/snapshot therefore does not treat the source E as a disk parent or dependency.
 

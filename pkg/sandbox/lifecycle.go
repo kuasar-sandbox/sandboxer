@@ -58,8 +58,9 @@ type RunOptions struct {
 	checkpointDir            string // runtime-owned checkpoint provenance; never serialized
 	usageSampler             *usage.Sampler
 	Cfg                      *config.SandboxConfig
-	// PortableConfig is immutable C0. nil selects projection from an explicit
-	// cold config; non-nil selects a Sandbox source and requires SourceBinding.
+	// PortableConfig is the source baseline for cold derivation. nil selects
+	// projection from an explicit cold config; non-nil requires SourceBinding.
+	// Launch clones a source baseline into C0 with the target boot identities.
 	PortableConfig *config.PortableSandboxConfig
 	SourceBinding  *RunSourceBinding
 	MemoryBinding  *MemorySourceBinding
@@ -254,8 +255,6 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
-	var hostIdentity preparedHostIdentity
-	hostIdentity.kernel, hostIdentity.bundle = opts.Cfg.Boot.Kernel, opts.Cfg.Boot.Runtime
 	if !legacyPortableBoot {
 		if err := MaterializeImageDefaults(opts.Cfg, preparation.imageDefaults); err != nil {
 			return -1, fmt.Errorf("materialize image defaults: %w", err)
@@ -263,26 +262,18 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		if err := opts.Cfg.ValidateCold(); err != nil {
 			return -1, fmt.Errorf("materialized config: %w", err)
 		}
-		// The identity projection is only needed to record the digest into
-		// the portable config (the format requires a content identity).
-		// Resuming from an existing portable config deliberately skips the
-		// re-hash (issue #158): it costs a fixed ~60ms per boot for a check
-		// that centrally-managed deployments do not need.
-		identities, err := ResolvePortableProjection(opts.Cfg)
-		if err != nil {
-			return -1, err
-		}
-		hostIdentity.projection = identities
-		c0, err = config.ProjectPortableCold(opts.Cfg, identities)
+	}
+	// Resolve the target components once before VM startup. Source cold keeps
+	// its disk/workload baseline; Launch derives C0 with these host identities.
+	hostIdentity, err := prepareColdHostIdentity(opts.Cfg)
+	if err != nil {
+		return -1, err
+	}
+	hostIdentity.sourceCold = legacyPortableBoot
+	if !legacyPortableBoot {
+		c0, err = config.ProjectPortableCold(opts.Cfg, hostIdentity.projection)
 		if err != nil {
 			return -1, fmt.Errorf("project portable C0: %w", err)
-		}
-	} else {
-		hostIdentity, err = preparePortableHostIdentity(opts.Cfg, config.PortableProjection{
-			KernelRef: c0.Boot.Kernel, RuntimeRef: c0.Boot.Runtime,
-		})
-		if err != nil {
-			return -1, err
 		}
 	}
 
@@ -386,7 +377,7 @@ func ResolvePortableProjection(cfg *config.SandboxConfig) (config.PortableProjec
 
 // ResolveRuntimeProjection verifies the host runtime bundle identity only.
 // It reads the digest marker at the bundle's ZIP footer and never scans the
-// artifact. Restore and legacy portable boot retain this cheap footer check.
+// artifact. Cold boot and restore retain this cheap footer check.
 func ResolveRuntimeProjection(cfg *config.SandboxConfig) (string, error) {
 	runtimeRef, err := buildRuntimeRef(cfg.Boot.Runtime)
 	if err != nil {
@@ -469,7 +460,8 @@ func parseKernelChecksum(raw []byte, basename string) (string, error) {
 
 // VerifyKernelArtifact performs the cheap kernel preflight — the binding
 // shape, that the file exists and is a regular file — without the full
-// SHA-256 scan or sidecar lookup. Restore retains this independent preflight.
+// SHA-256 scan or sidecar lookup. Cold identity resolution performs this
+// preflight before trusting a sidecar or hashing the payload.
 func VerifyKernelArtifact(uri string) error {
 	ref, err := manifest.ParseRef(uri)
 	if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Location != "" || !filepath.IsAbs(ref.Path) {

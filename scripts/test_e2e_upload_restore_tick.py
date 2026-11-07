@@ -146,6 +146,67 @@ SBPID2=$$
         self.assertIn('restored counter did not continue past captured state', result.stderr)
 
 
+class LocalRestoreBindingTests(unittest.TestCase):
+    def test_renamed_primary_without_captured_boot_files_preserves_shared_inputs(self):
+        source = (CASES / 'snapshot.restore.sh').read_text()
+        begin = source.index('CAPTURE_KERNEL=')
+        prepare = source[begin:source.index('\n# Retain the primary', begin)]
+        begin = source.index('cat >"$WORK/cold.yaml"')
+        cold_config = source[begin:source.index('\nEOF', begin) + len('\nEOF')]
+        begin = source.index('mv "$CAPTURE_RUNTIME"')
+        relocate = source[begin:source.index('\nSID2=', begin)]
+        begin = source.index('python3 - "$WORK/runtime/$SID2/snap-state/config.json"')
+        check_pmem = source[begin:source.index('\nPY\n', begin) + len('\nPY\n')]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, shared = root / 'work', root / 'shared-bin'
+            shared.mkdir()
+            fixtures = {'vmlinux': b'shared kernel', 'sandbox-runtime.bundle': b'shared runtime'}
+            for name, content in fixtures.items():
+                (shared / name).write_bytes(content)
+            (work / 'snapshot').mkdir(parents=True)
+            (work / 'snapshot/source.snapshot').write_bytes(b'source snapshot')
+            setup = r'''
+WORK=$TEST_WORK; BIN=$TEST_BIN; TAP_NAME=restore-test
+ROOT_REF=file:///fixture/root; DIFF=$WORK/root.diff
+DIO_LAUNCH_ARGS='["-c","pass"]'
+mkdir -p "$WORK/capture-runtime" "$WORK/deploy-runtime"
+e2e_fail() { echo "$*" >&2; exit 1; }
+'''
+            result = subprocess.run(['bash', '-euo', 'pipefail', '-c',
+                                     setup + prepare + '\n' + cold_config + '\n' + relocate],
+                                    env={**ENV, 'TEST_WORK': str(work), 'TEST_BIN': str(shared)},
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            cold = (work / 'cold.yaml').read_text()
+            restored = (work / 'restore.yaml').read_text()
+            cold_kernel = Path(re.search(r'(?m)^  kernel: file://(.+)$', cold)[1])
+            old_runtime = Path(re.search(r'(?m)^  runtime: file://(.+)$', cold)[1])
+            restore_kernel = Path(re.search(r'(?m)^  kernel: file://(.+)$', restored)[1])
+            primary = Path(re.search(r'(?m)^  runtime: file://(.+)$', restored)[1])
+            self.assertTrue(cold_kernel.is_relative_to(work))
+            self.assertEqual(restore_kernel, cold_kernel)
+            self.assertFalse(cold_kernel.exists())
+            self.assertFalse(old_runtime.exists())
+            self.assertNotEqual(primary.name, old_runtime.name)
+            self.assertEqual(primary.read_bytes(), fixtures['sandbox-runtime.bundle'])
+            fallback = primary.parent / old_runtime.name
+            self.assertFalse(fallback.exists())
+            for name, content in fixtures.items():
+                self.assertEqual((shared / name).read_bytes(), content)
+            state = work / 'runtime/restored/snap-state/config.json'
+            state.parent.mkdir(parents=True)
+            # Exercise the real e2e assertion, including rejection of the old expectation.
+            for selected, expected_status in ((primary, 0), (fallback, 1)):
+                with self.subTest(selected=selected.name):
+                    state.write_text(json.dumps({'pmem': [{'file': str(selected)}]}))
+                    result = subprocess.run(['bash', '-euo', 'pipefail', '-c', check_pmem],
+                                            env={**ENV, 'WORK': str(work), 'SID2': 'restored',
+                                                 'DEFAULT_RUNTIME': str(primary)},
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
+
+
 class StartupFailureDiagnosticsTests(unittest.TestCase):
     def invoke(self, path, live=False, broken_diagnostic=False):
         helper = function((CASES / 'snapshot.restore.sh').read_text(), 'startup_failure')
