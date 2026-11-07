@@ -176,12 +176,15 @@ flows are described in [Runtime](runtime.md) [Cold start and `run --from`](runti
 
 ### Vsock hybrid proxy
 
-The host-side hybrid proxy maps vsock traffic to UDS endpoints:
+The host-side hybrid proxy maps vsock traffic to UDS endpoints under
+`RunRoot/PathID`. `RunRoot` defaults to `/run/sandbox`; `PathID` defaults to
+`SandboxID` but can be selected independently ([host paths](runtime.md#run)).
+The examples below use the default `RunRoot`:
 
 ```text
 guest VM (CID=3) → host CID=2 → CH forwards to:
-  /run/sandbox/<sid>/vsock.sock_<port>       guest → host; host listens on this UDS
-  /run/sandbox/<sid>/vsock.sock + "CONNECT <port>\n"
+  /run/sandbox/<path-id>/vsock.sock_<port>       guest → host; host listens on this UDS
+  /run/sandbox/<path-id>/vsock.sock + "CONNECT <port>\n"
                                            host → guest; guest listens on the port
 ```
 
@@ -257,7 +260,7 @@ and restore, but the argv is different. Cold start includes:
 ```text
 cloud-hypervisor \
   --memory size=0,shared=on \
-  --memory-zone id=ram0,size=8G,shared=on,fd=3,uffd_socket=/run/sandbox/<sid>/uffd.sock \
+  --memory-zone id=ram0,size=8G,shared=on,fd=3,uffd_socket=/run/sandbox/<path-id>/uffd.sock \
   ...
 # fd=3 is the memfd inherited through sandbox-ctl cmd.ExtraFiles[0].
 ```
