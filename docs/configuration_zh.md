@@ -121,8 +121,9 @@ Template 同时标明 portable、host-only 和 ephemeral 字段。Restore mode �
 | `run --restore S` | S 提供执行状态，引用的 E 提供不可变工作负载和磁盘图 | 当前 Host 策略/绑定；不重放 launch、init、files 或 mounts |
 
 Restore 拒绝显式提供 `boot.cmdline`、`resources.diff_cow.discard`、launch（包括 ephemeral
-environment 和 plugin）、mounts、files/ephemeral_files、init、metadata。可以提供当前 Host 网络身份/provider、资源执行、kernel/runtime
-本地路径、active writable binding、prefetch、usage 和 timeout 策略，但仍须满足捕获拓扑和身份检查。
+environment 和 plugin）、mounts、files/ephemeral_files、init、metadata。可以提供当前 Host 网络身份/provider、资源执行、runtime
+本地绑定、active writable binding、prefetch、usage 和 timeout 策略，但仍须满足捕获拓扑和身份检查。
+旧版 `boot.kernel` 字段被接受但忽略，不检查外部 kernel 身份。
 Startup 策略可记录，初始恢复预留仍由捕获的 `BudgetAtSnapshot` 决定。`config --mode restore` 生成
 Host projection，不创建第二套 portable schema。实现见 [`FieldPresence`](../pkg/config/presence.go)、[from 配置应用](../pkg/config/applyfrom.go)和[restore 配置应用](../pkg/config/applyrestore.go)，
 操作顺序见[恢复](runtime_zh.md#restore)。
@@ -175,8 +176,8 @@ Size 是 `512MiB` 等字节大小字符串；duration 是 `30s` 等 Go duration 
 | `network.nexthop` | IP string；空 | 可选默认路由 |
 | `network.hostname` | String；空 | Guest hostname |
 | `network.interface` | String；有 source 时 `eth0` | 无网络 source 时所有 Guest 网络字段必须为空 |
-| `boot.kernel` | 本地绝对 `file://` 引用 | Kernel binding；冷启动身份和可选 sidecar 规则见 [Runtime](runtime_zh.md#runtime-sdk) |
-| `boot.runtime` | 本地绝对 `file://` 引用 | Runtime Bundle binding；恢复检查捕获的 basename/footer identity |
+| `boot.kernel` | 本地绝对 `file://` 引用 | 冷启动 kernel binding；内存恢复接受但忽略此字段，不依赖外部 kernel。冷启动身份/sidecar 规则见 [Runtime](runtime_zh.md#runtime-sdk) |
+| `boot.runtime` | 本地绝对 `file://` 引用 | Runtime Bundle binding；恢复匹配捕获的 digest scheme 和 footer 声明摘要，不比较 basename。原 basename 仅用于同目录候选查找；见[选择规则](runtime_zh.md#restore) |
 | `boot.cmdline` | String；空 | 与自动启动参数合并的额外参数；仅供冷启动 Host 输入 |
 | `boot.root.base` | Artifact ref；single-disk 模式可省略 | Overlay 模式必须的 EROFS lower；single-disk 模式可选 ext4 lower |
 | `boot.root.overlay` | Object；省略选择 single disk | 存在时选择独立只读 lower 和可写 ext4 upper |
@@ -262,7 +263,7 @@ portable interface       == explicitly supplied host interface
 
 Direct EROFS E只有 read-only image. 目标 host必须提供 pre-formatted `diff_template`,或已格式化的 explicit diff. 缺少可挂载 upper时在 controller/network/CH side effect 前失败.
 
-最终调用普通 `sandbox.Run`;`run --from` 不进入 `restore.Run`.
+最终调用普通 `sandbox.Run`;`run --from` 不进入 `restore.Run`. 从来源派生的冷启动解析目标 kernel/runtime 身份，并将其写入新 C0，同时保留生效的来源工作负载与磁盘图。来源 boot 身份不要求冷启动继续使用旧 kernel/runtime，也不放宽上面的受保护字段。内存恢复则保留捕获的 C0，需要兼容的本地 runtime 绑定，但不依赖外部 kernel。
 
 默认 `run --from` 继续执行上述强 ownership rules. `--replace-boot` 只选择另一条显式、原子的 cold derivation:
 
