@@ -626,7 +626,8 @@ Contract tests cover both formats with plaintext/XTS, partial writes over a base
 shared-cache ownership, cancellation, active sparse exports, named-view pins and
 unsupported checkpoint capability. Existing format, corruption, recovery,
 short-I/O, failure cleanup, concurrency and transport tests remain at their owning
-layer. Performance methods and interpretation remain in [sandbox validation](runtime.md).
+layer. Performance methods and interpretation remain in [repeatable COW measurement](#cow-measurement)
+and [Checkpoint validation](#checkpoint-validation).
 <a id="payload-boundary"></a>
 
 ## Payload boundary
@@ -668,7 +669,7 @@ Drain.
 ## Disk state and I/O
 
 The public storage API is in [`pkg/diffstore`](../pkg/diffstore); see the
-[package architecture and migration guide](block-storage.md). `pkg/vhost` owns transport only.
+[package layers, ownership and migration guide](#storage-layers). `pkg/vhost` owns transport only.
 
 Active writable diffs request O_DIRECT through one common positioned-I/O API,
 including on tmpfs. Runtime policy does not identify the backing filesystem.
