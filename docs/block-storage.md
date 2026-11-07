@@ -711,10 +711,16 @@ was released uses the normal clean-Data read cache and can allocate a buffer too
 
 Selection and operation arrays are each bounded by 1024 entries. Space-pressure
 recovery additionally captures at most `max_dirty_size / 4096` existing Zero-page
-pointers, without copying payload. Other bounded overhead includes two independent
-1 MiB MAP_SHARED I/O workspaces per active file (each with less than 1 MiB
-alignment padding), and page metadata/index/Go allocator overhead proportional
-to page capacity.
+pointers, without copying payload. Other overhead depends on the backend:
+
+- v3 owns two independent 1 MiB MAP_SHARED I/O workspaces per active file,
+  each with less than 1 MiB alignment padding.
+- v4's active `checkpointDiff` owns a 1 MiB Go-heap read staging buffer. Its
+  versioned engine shares a process-wide pool of four 8 MiB MAP_SHARED direct-I/O
+  buffers, independent of the number of disks and retained versions. Bounded
+  transaction buffers and metadata/index copies add heap usage.
+- Cache page metadata, indexes and Go allocator overhead scale with page capacity.
+
 `cache_size` is not a cap on process RSS, guest memfd mappings, immutable-source
 caches, tmpfs file storage or snapshot output memory.
 
@@ -743,13 +749,17 @@ clean slot is available, a bounded foreground workspace can service the read
 without insertion. It never bypasses a newer cached page.
 
 Live and snapshot reads share bounded upper-run batching. Only contiguous cold
-pages of the requested upper range enter a physical read (at most 1 MiB); cache
-hits and base/hole boundaries stop the run. Sorted stripe-range locks prevent
-concurrent writes/discard, while reserved Loading pages prevent eviction. With
+pages of the requested upper range enter one bounded backend read (at most
+1 MiB); cache hits and base/hole boundaries stop the run. v4 can split that logical
+range into several physical reads at noncontiguous mappings, Zero or hole
+boundaries. Sorted stripe-range locks prevent concurrent writes/discard, while
+reserved Loading pages prevent eviction. With
 less cache capacity than the run, remaining cold pages bypass caching under the
-same stripes. Read/decrypt stays in the owned MAP_SHARED I/O workspace.
-Loading pages are filled from that workspace outside the cache mutex, then
-published as clean under the mutex before copying out to mutable caller or guest memory.
+same stripes. v3 reads/decrypts in its per-file MAP_SHARED workspace. v4
+reads/decrypts physical runs in the shared direct-I/O pool, then copies into its
+per-file heap staging buffer. Loading pages are filled from the backend-owned
+plaintext outside the cache mutex, then published as clean under the mutex before
+copying out to mutable caller or guest memory.
 Contiguous base blocks within the requested bounded range are passed together
 to `BlockReader`, which retains its own lower read boundaries. No request-sized
 payload allocation or base prefetch is added.
@@ -779,11 +789,13 @@ up to 256 Data pages (1 MiB) or 1024 Zero pages, without filling holes or
 preallocating gaps. A fixed 1 ms
 aggregation window allows low-rate traffic to progress; quota pressure and
 internal Drain wake it immediately. Selected pages become frozen writeback:
-reads remain possible and same-page writes wait. The worker copies frozen Data pages
-directly into the active diff's existing aligned MAP_SHARED write workspace,
-encrypts that copy, and performs I/O without cache or global locks. Cache page
-payloads stay plaintext and never become syscall buffers. Foreground reads have
-a separate workspace.
+reads remain possible and same-page writes wait. v3 copies frozen Data pages
+directly into its per-file aligned MAP_SHARED write workspace and encrypts that
+copy. v4 first copies/encrypts each contiguous physical run in a bounded heap
+transaction buffer, then copies it into a shared direct-I/O pool buffer for the
+syscall. Both perform I/O without cache or global locks. Cache page payloads stay
+plaintext and never become syscall buffers. Foreground read staging is separate
+from write staging; v4 reads and writes borrow from the same process-wide I/O pool.
 
 The bounded page index supplies contiguous dirty neighbours from the same file,
 regardless of arrival order; unselected FIFO age is unchanged. Ordinary write
@@ -819,20 +831,19 @@ Direct I/O alone is not a durability barrier either.
 
 ### Active-file I/O contract
 
-Every active body attempts O_DIRECT on its opened descriptor and always uses the
-same bounded aligned workspaces. If that F_SETFL request returns EINVAL or
+The two backends use different O_DIRECT setup paths.
+
+**Single-layer v3** attempts O_DIRECT on its opened descriptor and always uses
+the same bounded aligned workspaces. If that F_SETFL request returns EINVAL or
 EOPNOTSUPP/ENOTSUP, the descriptor keeps ordinary positioned I/O; the application
 buffer and cache are unchanged. This initialization-only capability decision
 does not inspect the filesystem and is not a retry after failed data I/O. Fresh targets complete this setup **before seeding**; existing
 active validation and runtime/snapshot reads use the same path. Runtime code does
 not inspect filesystem types, names, mount policies or filesystem-specific inode
 flags. Header and format probing are bounded before concurrent body I/O;
-templates and base remain buffered/read-only. Plaintext and encrypted file
-formats are now single-layer v3 and versioned v4. Both have a fixed 4 KiB
-header plus checksummed P pages. Local encryption off/auto/required policy and
-512-byte logical XTS data-unit numbering remain unchanged.
+templates and base remain buffered/read-only.
 
-`STATX_DIOALIGN` on the open fd supplies separate address and offset/length
+For v3, `STATX_DIOALIGN` on the open fd supplies separate address and offset/length
 constraints. Positive reported constraints must fit the workspace bound and
 4 KiB COW geometry; offset alignment must divide 4096 and fit body boundary and
 size. A missing mask, query-unavailable ENOSYS/EINVAL/EOPNOTSUPP, or both-zero
@@ -842,6 +853,19 @@ other invalid constraints, genuine statx/descriptor errors, other flag-setup err
 actual I/O failures remain errors. No application-side buffered retry hides EIO,
 ENOSPC, alignment errors or short I/O. See [statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html).
 
+**Versioned v4** opens its data and fixed-version view descriptors with O_DIRECT
+already set. It has no F_SETFL capability fallback and does not query
+STATX_DIOALIGN. Its shared syscall buffers use fixed 4096-byte address alignment;
+I/O offsets and lengths must also be page-aligned. Unsupported opens or actual
+I/O failures are returned, not retried with buffered I/O. See
+[`format.go`](../pkg/diffstore/internal/versioned/format.go),
+[`view.go`](../pkg/diffstore/internal/versioned/view.go) and
+[`direct_linux.go`](../pkg/diffstore/internal/versioned/direct_linux.go).
+
+Both v3 and v4 support plaintext and encrypted storage, with a fixed 4 KiB
+header plus checksummed P pages. Local encryption off/auto/required policy and
+512-byte logical XTS data-unit numbering remain unchanged.
+
 The kernel and backing implementation determine how an O_DIRECT request is
 fulfilled. Successful flag setup and aligned I/O establish usable operations,
 not universal physical disk-cache bypass. Tmpfs file pages remain memory/swap
@@ -849,8 +873,9 @@ storage outside `cache_size`. There is no filesystem allowlist, special tmpfs
 backend, new configuration mode or fallback after failed data I/O. See
 [open(2)](https://man7.org/linux/man-pages/man2/open.2.html).
 
-I/O uses bounded, aligned anonymous `MAP_SHARED` workspaces with lifetime through
-syscall completion, avoiding the private-heap/fork hazard. Arbitrary caller slices
+Both backends pass bounded, aligned anonymous `MAP_SHARED` buffers to data-I/O
+syscalls and retain them through completion, avoiding the private-heap/fork hazard.
+Heap staging in v4 is not passed directly to those syscalls. Arbitrary caller slices
 and subpage reads are copied through these buffers; large operations are chunked.
 Full-page cache writeback avoids read/modify/write. Short writes fail rather than
 retrying an unaligned remainder; see [write(2)](https://man7.org/linux/man-pages/man2/write.2.html).
