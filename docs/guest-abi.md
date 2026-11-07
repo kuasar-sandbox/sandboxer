@@ -51,7 +51,9 @@ mounts it and executes `/sbin/init`. Init assembles/switches the workload root,
 applies LaunchSpec and wires stdio, then supervises the primary process. The
 primary is PID 1 in its namespace in private mode.
 
-The host endpoint is `/run/sandbox/<sid>/vsock.sock`. Launch, ping and application
+The host endpoint is `RunRoot/PathID/vsock.sock`. `RunRoot` defaults to
+`/run/sandbox`; `PathID` defaults to `SandboxID` but can be selected independently
+([host paths](runtime.md#run)). Launch, ping and application
 started/exited notifications use the control paths defined below; the launch
 connection upgrades to MUX for application stdio. Kernel hvc0 output uses the
 separate CH console path. When an app exits without restart, init notifies the
@@ -855,7 +857,7 @@ and reconnect vhost-user-blk backends, which accept only one connection for this
 single-VM lifecycle; failed reconnection makes CH exit unsuccessfully.
 
 **The reverse listener runs in a separate goroutine** alongside the supervisor,
-handling ping, restore, quiesce and attach, plus exec/connect sessions ([Management operations](#management-operations)–4.4).
+handling ping, restore, quiesce and attach, plus exec/connect sessions ([Management operations](#management-operations)).
 It remains across cold start, capture/restore and MUX replacement until init
 powers off.
 
@@ -1252,7 +1254,7 @@ guest -> host:           listen <vsock-base>_5000 UDS  <- CH <-   AF_VSOCK dial 
 host -> guest:           dial <vsock-base> UDS         -> CH ->   AF_VSOCK listen :5000
                          write "CONNECT 5000\n"
                          drain "OK <port>\n"
-Example <vsock-base>:    /run/sandbox/<sid>/vsock.sock
+Example <vsock-base>:    /run/sandbox/<path-id>/vsock.sock
 ```
 
 - **Guest→host:** guest connect(SockaddrVM{CID=2, Port=5000}); host accepts on
