@@ -83,7 +83,7 @@ Runtime 提供外部 RAM、协调暂停/恢复并控制设备；Cloud Hypervisor
 - 外部 RAM/UFFD patch 的设计选择(SCM_RIGHTS in-process +
   `create_ram_region` 里跑 ioctl)与 upstream 风格偏差明显,本项目维持自有
   patch;vCPU kick 与 worker barrier 若有 upstream 等价修复,升级时应优先替换
-  `0007`,不长期维护重复实现
+  `0007`/`0008`，不长期维护重复实现
 
 <a id="boot-protocols"></a>
 
@@ -93,38 +93,58 @@ CH 自适应启动协议,sandbox-ctl 命令行不区分 arch:
 
 | arch | 协议 | kernel 入口 | CH 准备 |
 |------|------|-------------|---------|
-| x86_64 | PVH | ELF entry,zero page 由 CH 填 | memmap(E820) + cmdline + ACPI 表 |
-| aarch64 | EFI stub + ACPI | PE Image start,EFI stub 解析 ACPI | UEFI memmap + ACPI 表 + GICv3 节点 |
+| x86_64 | PVH 直接启动 | ELF note 中的 PVH entry；`%rbx` 指向 `hvm_start_info` | PVH memory map、cmdline 和 ACPI RSDP 引用 |
+| aarch64 | 通过 CH PE loader 直接启动 Linux Image | Boot CPU PC 指向载入的 Image；X0 指向 FDT | 描述内存、CPU、cmdline 和设备（含 GIC）的 FDT |
+
+这是固定 v51.1 的直接内核启动路径。x86 zero page 属于独立的 bzImage 路径，不属于 PVH。
+ARM Image 即使包含 EFI stub，也不代表 CH 进入该 stub 或提供 UEFI memory map。
+ARM 直接内核路径构造 FDT，与回退的 UEFI firmware 路径不同。参见
+[CH 内核加载](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/vmm/src/vm.rs#L1425-L1543)、
+[PVH 初始化](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/arch/src/x86_64/mod.rs#L1079-L1178)、
+[ARM FDT 初始化](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/arch/src/aarch64/mod.rs#L123-L159)
+和 [ARM 入口寄存器](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/hypervisor/src/kvm/mod.rs#L2234-L2265)。
 
 <a id="device-model"></a>
 
 ### 设备模型(平台用法)
 
-CH 暴露给 guest 的设备清单(冷启动):
+冷启动设备清单取决于 root 拓扑和 host 策略：
 
 ```
-virtio-pmem    → sandbox-runtime.bundle (DAX, MAP_SHARED 共享 host page cache)
-virtio-blk × 2 → blk0 (base, ro) + blk1 (overlay COW, rw),vhost-user backend
+virtio-pmem    → sandbox-runtime.bundle（DAX；discard_writes=on、MAP_PRIVATE backing）
+virtio-blk     → vhost-user backend；single root：一个可写 ext4 COW 设备；
+                 overlay root：只读 base + 可写 ext4 COW upper；
+                 配置的数据盘跟在 root 之后，采用相同的一/双设备布局
 virtio-net     → 可选;配置网络源时为 eth0,host TAP 后端;无源时不创建设备
-virtio-console → hvc0,内核 dmesg;--console tty(写到 CH 进程的 stdout = sandbox-ctl
-                 给的匿名管道),--serial off(无 8250 UART)。CH 进程的 stdin=/dev/null
-                 故 CH 不 raw 化任何宿主终端。应用 stdio 不走此设备(走 vsock MUX)
+virtio-console → 启用时由 hvc0 输出内核 dmesg；--console tty 写到 CH stdout。
+                 stderr/journald sink 使用匿名管道，file sink 使用指定文件。
+                 Console off 选择 --console off；--serial off 禁用 8250 UART。
+                 CH stdin=/dev/null；应用 stdio 使用 vsock MUX，不走此 console。
 virtio-vsock   → CID=3。控制面短连接(launch / ping / app_started / app_exited /
                  mem_report / quiesce / restore / attach)+ launch/restore/attach 那条
                  连接握手后升级而成的应用 stdio MUX(详见 vsock 控制面 + console MUX 协议)
-virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on];sandbox-local
+virtio-balloon → 仅 memory control 启用时：size=<cold InitialTarget>
+                 [+ deflate_on_oom=on]；sandbox-local
                  BalloonController 通过 /vm.resize 推 target,并以 vm.info 的
                  memory_actual_size 观察 current(见 Runtime Balloon);free_page_reporting
                  不启用(mmu_notifier 广播压力可能影响 guest vsock 进展)
 virtio-mem     → host-driven 主动 unplug(CH 能力;当前固定 Capacity Budget 模型不启用)
 ```
 
-上面的两块 virtio-blk 描述 root base/overlay 对;配置数据盘时还会增加对应设备槽位。
+Sandboxer 设置 `discard_writes=on`，因此 runtime backing file 只读打开并采用 MAP_PRIVATE
+映射。未修改的 file-backed 页仍可共享 host page cache；私有写入不会修改 backing artifact。
+Guest 将 runtime 作为只读 EROFS 使用。这与可写 Guest RAM 使用的 shared memfd 不同。
+参见 [CH pmem 映射](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/vmm/src/device_manager.rs#L3246-L3306)。
+
+只有 `Headroom < Capacity` 或冷启动 `InitialTarget > 0` 时，sandboxer 才添加 balloon；
+初始 target 为零也可能因后续控制而需要此设备。参见 [`ch.go`](../pkg/sandbox/ch.go)、
+[Balloon 控制](resources_zh.md#balloon-controller)、[console 接线](../pkg/stdio/stdio.go)
+和 [Guest stdio MUX](guest-abi_zh.md#control-and-mux)。
 
 restore 沿用 `config.json` 中的设备拓扑,不能新增或删除 virtio-net.sandboxer 在
 启动 CH 前要求 host restore 配置是否提供网络源与快照中的 NIC 是否存在一致.
 
-恢复路径设备拓扑通过 `--restore source_url=<state.json dir>` 从 snapshot
+恢复路径设备拓扑通过 `--restore source_url=file://<snapshot-directory>` 从 snapshot
 state 还原,不需要重新指定 `--kernel` / `--vsock`。
 
 详细命令行示例与冷启动/恢复差异见 Runtime 的[冷启动 SDK](runtime_zh.md#runtime-sdk)
@@ -201,14 +221,23 @@ CH `--memory-zone` 增加两个 key:
   → `sendmsg(va_report; SCM_RIGHTS=uffd_fd)` → 等 ack。ack 之前 vCPU 不允许
   跑
 
-平台 sandbox-ctl 调用形式(冷启动 + 恢复完全相同):
+冷启动与恢复采用相同的 backing/handler 组合，但 argv 不同。冷启动包括：
 
 ```
 cloud-hypervisor \
+  --memory size=0,shared=on \
   --memory-zone id=ram0,size=8G,shared=on,fd=3,uffd_socket=/run/sandbox/<sid>/uffd.sock \
   ...
 # fd=3 ← memfd from sandbox-ctl via cmd.ExtraFiles[0]
 ```
+
+Restore 使用 `--restore source_url=file://<snapshot-directory>`，不重复传 `--memory-zone`。
+Sandboxer 重写捕获配置中 zone 的 `uffd_socket`，并将继承的 memfd 传给新的 CH 进程。
+序列化的 fd 数字本身不是有效描述符。参见 [`restore.go`](../pkg/restore/restore.go)
+和 [`configrewrite.go`](../pkg/restore/configrewrite.go)。
+
+完整补丁系列对外部 fd-owned RAM 要求 **4 KiB Host 页**：0012 在初始化 checkpoint ledger
+时拒绝其他 Host 页大小，冷启动和恢复均如此。这与 4 KiB Guest 页大小是不同约束。
 
 解析器要求 zone `id`，平台使用 `ram0`。详细命令行见 [CH 参数边界](#vmm-command-line)，
 恢复顺序见 [Runtime 恢复流程](runtime_zh.md#restore)。
@@ -273,7 +302,7 @@ share-storage live migration 场景)。我们的 user_managed zone 满足"file-b
 
 主题:**memory: external uffd handler via in-process create + SCM_RIGHTS handoff**
 
-改动文件:`memory_manager.rs` / `seccomp_filters.rs`
+改动文件：`memory_manager.rs` / `vm_config.rs` / `config.rs` / `seccomp_filters.rs`
 
 要点:
 
@@ -403,7 +432,8 @@ lseek，fallocate 和公共 madvise 原本已允许。
 
 VMM 在提取 DeviceManager 子树前根据顶层 VM snapshot 是否存在记录创建来源。
 Balloon 还要求自身没有恢复状态。该运行时选择持续整个 VM 生命周期，包含后续充气。
-新恢复实例即便缺少任一子树也逐 PFN 释放。较大 Host 页继续跟踪局部页所有权。
+新恢复实例即便缺少任一子树也逐 PFN 释放。0004 自身对较大 Host 页保留局部页所有权跟踪，
+但完整平台的外部 RAM 配置受 0012 限制，只支持 4 KiB Host 页（[启用条件](#activation)）。
 
 执行普通错误路径回归及显式原生 UFFD 测试：
 

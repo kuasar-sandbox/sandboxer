@@ -52,7 +52,7 @@ Patch 0004 may skip redundant inode punching, never the required REMOVE ([0004 �
 ## Patch scope and future evolution
 
 Each patch owns a complete intent, its corrections and its tests. Old numbers in
-this table refer to the original twelve-patch series restored by #377. This
+this table refer to the original twelve-patch series restored by #377. The
 first eleven patches retain the #379 maintenance scope. Patch 0012 owns the
 complete cumulative memory log; UFFD adoption retains the original ACK.
 
@@ -114,42 +114,61 @@ a different command-line interface per architecture:
 
 | Architecture | Protocol | Kernel entry | Prepared by CH |
 | --- | --- | --- | --- |
-| x86_64 | PVH | ELF entry with a CH-populated zero page | E820 memory map, command line, and ACPI tables |
-| aarch64 | EFI stub + ACPI | PE Image entry; the EFI stub parses ACPI | UEFI memory map, ACPI tables, and GICv3 description |
+| x86_64 | PVH direct boot | PVH entry from the ELF note; `%rbx` points to `hvm_start_info` | PVH memory map, command line and ACPI RSDP reference |
+| aarch64 | Linux Image direct boot through CH's PE loader | Boot CPU PC points to the loaded Image; X0 points to the FDT | FDT describing memory, CPUs, command line and devices, including GIC |
+
+These are the pinned v51.1 direct-kernel paths. The x86 zero page belongs to
+CH's separate bzImage path, not PVH. An ARM Image can contain an EFI stub without
+CH entering that stub or supplying a UEFI memory map. The ARM direct-kernel path
+constructs an FDT; it is distinct from the fallback UEFI firmware path. See
+[CH kernel loading](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/vmm/src/vm.rs#L1425-L1543),
+[PVH setup](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/arch/src/x86_64/mod.rs#L1079-L1178),
+[ARM FDT setup](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/arch/src/aarch64/mod.rs#L123-L159)
+and [ARM entry registers](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/hypervisor/src/kvm/mod.rs#L2234-L2265).
 
 <a id="device-model"></a>
 
 ### Device model used by the platform
 
-The cold-start device layout is:
+The cold-start device layout depends on root topology and host policy:
 
 ```text
-virtio-pmem    → sandbox-runtime.bundle (DAX, MAP_SHARED host page-cache sharing)
-virtio-blk × 2 → blk0 (read-only base) + blk1 (writable overlay COW), vhost-user backend
+virtio-pmem    → sandbox-runtime.bundle (DAX; discard_writes=on, MAP_PRIVATE backing)
+virtio-blk     → vhost-user backends; single root: one writable ext4 COW device;
+                 overlay root: read-only base + writable ext4 COW upper;
+                 configured data disks follow, using the same one/two-device layouts
 virtio-net     → optional eth0 with host TAP backing; absent when no network source is configured
-virtio-console → hvc0 for kernel dmesg; --console tty writes to CH stdout, an anonymous
-                 pipe supplied by sandbox-ctl; --serial off disables the 8250 UART.
-                 CH stdin is /dev/null, so CH does not raw-mode a host terminal.
-                 Application stdio uses the vsock MUX, not this console.
+virtio-console → hvc0 for kernel dmesg when enabled; --console tty writes to CH stdout.
+                 stderr/journald sinks use an anonymous pipe; file sinks use that file.
+                 Console off selects --console off; --serial off disables the 8250 UART.
+                 CH stdin is /dev/null. Application stdio uses vsock MUX, not this console.
 virtio-vsock   → CID=3; short control connections (launch / ping / app_started /
                  app_exited / mem_report / quiesce / restore / attach), plus the
                  application stdio MUX upgraded from launch/restore/attach handshakes
-virtio-balloon → size=<cold InitialTarget> [+ deflate_on_oom=on]; the sandbox-local
+virtio-balloon → when memory control is enabled: size=<cold InitialTarget>
+                 [+ deflate_on_oom=on]; the sandbox-local
                  BalloonController sets targets with /vm.resize and observes current
                  memory_actual_size through vm.info; free_page_reporting is not enabled
 virtio-mem     → host-driven unplug supported by CH; not enabled in the fixed-Capacity
                  Budget model used here
 ```
 
-The two block devices above describe the root base/overlay pair; configured data
-disks add their corresponding device slots. See [Runtime](runtime.md) [Balloon](resources.md#balloon-controller)
-for balloon control and [Guest ABI](guest-abi.md) [Vsock control plane and console MUX protocol](guest-abi.md#control-and-mux) for the stdio MUX.
+The runtime backing file is opened read-only and mapped with MAP_PRIVATE because
+sandboxer sets `discard_writes=on`. Unmodified file-backed pages can still share
+the host page cache; a private write does not update the backing artifact. The
+Guest consumes the runtime as read-only EROFS. This is distinct from the shared
+memfd used for writable Guest RAM. See [CH pmem mapping](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v51.1/vmm/src/device_manager.rs#L3246-L3306).
+
+Sandboxer adds the balloon only when `Headroom < Capacity` or the cold
+`InitialTarget > 0`; an initial zero target can still require a device for later
+control. See [`ch.go`](../pkg/sandbox/ch.go), [Balloon control](resources.md#balloon-controller),
+[console wiring](../pkg/stdio/stdio.go) and the [Guest stdio MUX](guest-abi.md#control-and-mux).
 
 Restore retains the topology from `config.json`; it cannot add or remove the
 virtio-net device. Before starting CH, sandboxer checks that the presence of a
 host network source matches NIC presence in the snapshot.
 
-`--restore source_url=<state.json dir>` restores the saved device topology, so
+`--restore source_url=file://<snapshot-directory>` restores the saved device topology, so
 `--kernel` and `--vsock` do not have to be repeated. Complete cold/restore data
 flows are described in [Runtime](runtime.md) [Cold start and `run --from`](runtime.md#runtime-sdk) and [Memory restore data flow](runtime.md#restore).
 
@@ -233,14 +252,25 @@ The memory-backing and external-fault-handler contracts are:
   vCPUs must not run before the acknowledgement.
 
 The backing/handler combination used by sandbox-ctl is the same for cold start
-and restore:
+and restore, but the argv is different. Cold start includes:
 
 ```text
 cloud-hypervisor \
+  --memory size=0,shared=on \
   --memory-zone id=ram0,size=8G,shared=on,fd=3,uffd_socket=/run/sandbox/<sid>/uffd.sock \
   ...
 # fd=3 is the memfd inherited through sandbox-ctl cmd.ExtraFiles[0].
 ```
+
+Restore uses `--restore source_url=file://<snapshot-directory>` instead of
+repeating `--memory-zone`. Sandboxer rewrites the captured zone's `uffd_socket`
+and supplies the inherited memfd to the new CH process. The serialized fd number
+alone is not a live descriptor. See [`restore.go`](../pkg/restore/restore.go) and
+[`configrewrite.go`](../pkg/restore/configrewrite.go).
+
+The complete series requires **4 KiB Host pages** for external fd-owned RAM:
+0012 rejects another Host page size while initializing its checkpoint ledger,
+on both cold start and restore. This is separate from the 4 KiB Guest page size.
 
 The zone `id` is required by the parser; the platform uses `ram0`. Complete cold
 start and restore commands are described in [Runtime](runtime.md) [CH command-line boundary](#vmm-command-line) and [Memory restore data flow](runtime.md#restore).
@@ -466,7 +496,9 @@ The VMM records whether the top-level VM snapshot was absent before looking up
 the device manager. The balloon also requires absent balloon state. This
 runtime choice lasts for that VM, including subsequent inflation. Every new
 restore instance uses per-PFN release even if either child snapshot is missing.
-Larger host pages retain partial-page ownership tracking.
+Patch 0004 itself retains partial-page ownership tracking for larger Host pages;
+the complete external-RAM platform configuration is limited to 4 KiB Host pages
+by 0012 ([Activation](#activation)).
 
 Run the ordinary error-path regression and the explicit native UFFD tests:
 
@@ -595,7 +627,7 @@ Runtime pause publishes the shared pause event before explicitly unparking
    not wait for a nonexistent ACK.
 
 These lifecycle patches do not change sandbox configuration, the CH HTTP API, snapshot
-format, or resource protocol, and does not adjust `cpu.max` around lifecycle
+format, or resource protocol, and do not adjust `cpu.max` around lifecycle
 operations. Timeouts remain bounded failure protection, not the race fix.
 
 <a id="patch-0009"></a>
