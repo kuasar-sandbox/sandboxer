@@ -858,7 +858,7 @@ Cold `--from` uses the target kernel/runtime and creates a new C0 while preservi
 - Explicit `--mode` and `--upload` are mutually exclusive.
 - Live export rejects `--config`; image-to-Sandbox-E assembly requires `--from` plus `--config` or `SANDBOX_CONFIG`, and rejects `--resume`.
 - Snapshot has no memory toggle.
-- The exec command must follow `--`; local and proxy target rules are mutually exclusive.
+- For `exec`, use `--` to separate host flags from the guest command. `--proxy` selects remote mode, which ignores `--sandbox-id`, `--path-id` and `--run-root`; without it, `--sandbox-id` or `--path-id` is required. `--proxy-header` requires `--proxy`.
 
 <a id="failures"></a>
 
