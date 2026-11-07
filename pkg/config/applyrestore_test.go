@@ -40,7 +40,7 @@ func TestApplyRestoreRulesUsesReferencedSandboxAsImmutableC0(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runtime.Boot.Kernel != host.Boot.Kernel || runtime.Boot.Runtime != host.Boot.Runtime {
+	if runtime.Boot.Kernel != "" || runtime.Boot.Runtime != host.Boot.Runtime {
 		t.Fatalf("host bindings were not applied: %+v", runtime.Boot)
 	}
 	if runtime.Boot.Root.DiffTemplate != host.Boot.Root.DiffTemplate {
@@ -226,4 +226,41 @@ func TestApplyRestoreRulesRejectsResourceDiskAndNetworkConflicts(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 	})
+}
+
+func TestApplyRestoreRulesIgnoresHostKernelAndPreservesC0(t *testing.T) {
+	for _, hostKernel := range []string{"", "file:///missing/legacy-vmlinux"} {
+		t.Run(map[bool]string{true: "omitted", false: "missing legacy path"}[hostKernel == ""], func(t *testing.T) {
+			artifact := validPortableConfig()
+			before, err := MarshalPortableSandboxConfig(artifact)
+			if err != nil {
+				t.Fatal(err)
+			}
+			host := restoreHostConfig()
+			host.Boot.Kernel = hostKernel
+			presence := FieldPresence{}
+			if hostKernel != "" {
+				presence = restorePresence("boot.kernel")
+			}
+			runtime, c0, err := ApplyRestoreRules(artifact, host, presence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.Boot.Kernel != "" {
+				t.Fatalf("memory restore retained a host kernel dependency: %q", runtime.Boot.Kernel)
+			}
+			if host.Boot.Kernel != hostKernel {
+				t.Fatalf("restore rules mutated the caller's kernel binding: %q", host.Boot.Kernel)
+			}
+			for name, cfg := range map[string]*PortableSandboxConfig{"source": artifact, "C0": c0} {
+				after, err := MarshalPortableSandboxConfig(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(before, after) {
+					t.Fatalf("%s changed during memory restore: %s", name, after)
+				}
+			}
+		})
+	}
 }

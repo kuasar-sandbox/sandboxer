@@ -35,11 +35,11 @@ func ApplyRestoreRules(artifact *PortableSandboxConfig, host *SandboxConfig, pre
 		return nil, nil, err
 	}
 	runtime := sandboxConfigFromPortable(c0)
-	runtime.Boot.Kernel = host.Boot.Kernel
+	// Memory restore resumes the captured kernel. Accept legacy host kernel
+	// fields without turning them into a runtime dependency; immutable C0
+	// retains the original kernel identity for later snapshots.
+	runtime.Boot.Kernel = ""
 	runtime.Boot.Runtime = host.Boot.Runtime
-	if runtime.Boot.Kernel == "" {
-		return nil, nil, errors.New("run --restore: host boot.kernel binding is required")
-	}
 	if runtime.Boot.Runtime == "" {
 		return nil, nil, errors.New("run --restore: host boot.runtime binding is required")
 	}

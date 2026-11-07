@@ -111,7 +111,7 @@ func TestRewriteConfigPathsUsesSelectedRuntime(t *testing.T) {
 				if primary != selected {
 					writeRestoreRuntime(t, primary, strings.Repeat("b", 64))
 				}
-				path, err := resolveRestoreRuntime(context.Background(), "file://"+primary, "file://runtime-v1.bundle@digest:"+digest)
+				path, err := ResolveRuntimeBinding(context.Background(), "file://"+primary, "file://runtime-v1.bundle@digest:"+digest)
 				if err != nil {
 					t.Fatal(err)
 				}
