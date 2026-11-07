@@ -775,7 +775,7 @@ raw kernel 完整哈希一次；runtime identity 取自目标 Bundle footer。�
 - Explicit `--mode` 与 `--upload`互斥.
 - Live export拒绝`--config`;image-to-Sandbox-E assembly 要求 `--from` 加 `--config` 或 `SANDBOX_CONFIG`，且拒绝 `--resume`。
 - Snapshot没有memory toggle.
-- `exec` command必须位于`--`之后;local与proxy target rules互斥.
+- `exec` 使用 `--` 分隔 Host flags 与 Guest 命令。`--proxy` 选择 remote mode，此时忽略 `--sandbox-id`、`--path-id` 和 `--run-root`；未指定它时，必须提供 `--sandbox-id` 或 `--path-id`。`--proxy-header` 要求 `--proxy`。
 
 <a id="failures"></a>
 
