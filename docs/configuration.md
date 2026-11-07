@@ -134,10 +134,11 @@ artifact's disk graph.
 Restore rejects explicitly supplied `boot.cmdline`, `resources.diff_cow.discard`,
 launch (including ephemeral environment and plugins), mounts,
 files/ephemeral_files, init and metadata.
-Current host network identity/provider, resource execution, kernel/runtime local
-paths, active writable bindings, prefetch, usage and timeout policy may be supplied
-subject to the captured topology and identity checks. Startup policy may be
-recorded, but captured `BudgetAtSnapshot` controls initial restore reservation.
+Current host network identity/provider, resource execution, runtime local binding,
+active writable bindings, prefetch, usage and timeout policy may be supplied
+subject to the captured topology and identity checks. A legacy `boot.kernel`
+field is accepted but ignored, without an external-kernel identity check.
+Startup policy may be recorded, but captured `BudgetAtSnapshot` controls initial restore reservation.
 `config --mode restore` produces a host projection; it does not create a second
 portable schema. See [`FieldPresence`](../pkg/config/presence.go), [from application](../pkg/config/applyfrom.go) and [restore application](../pkg/config/applyrestore.go)
 and the [restore operation](runtime.md#restore).
@@ -193,8 +194,8 @@ reservation protocol and failure behavior are defined in [resources](resources.m
 | `network.nexthop` | IP string; empty | Optional default route |
 | `network.hostname` | String; empty | Guest hostname |
 | `network.interface` | String; `eth0` when a source exists | Without a network source all guest network fields must be empty |
-| `boot.kernel` | Local absolute `file://` reference | Kernel binding; cold identity and optional sidecar rules are in [Runtime](runtime.md#runtime-sdk) |
-| `boot.runtime` | Local absolute `file://` reference | Runtime Bundle binding; restore validates its captured basename/footer identity |
+| `boot.kernel` | Local absolute `file://` reference | Cold-start kernel binding; accepted but ignored on memory restore, which needs no external kernel. Cold identity/sidecar rules: [Runtime](runtime.md#runtime-sdk) |
+| `boot.runtime` | Local absolute `file://` reference | Runtime Bundle binding; restore matches the captured digest scheme and declared footer digest, not the basename. The original basename is a sibling-lookup hint; [selection](runtime.md#restore) |
 | `boot.cmdline` | String; empty | Extra arguments merged with automatic boot arguments; cold-only host input |
 | `boot.root.base` | Artifact reference; optional in single-disk mode | Required EROFS lower in overlay mode; optional ext4 lower in single-disk mode |
 | `boot.root.overlay` | Object; omitted selects single disk | Presence selects separate read-only lower and writable ext4 upper |
@@ -287,7 +288,7 @@ portable interface       == explicitly supplied host interface
 
 A direct EROFS E contains only a read-only image. The destination host must supply a preformatted `diff_template` or an explicitly bound, already formatted diff. A missing mountable upper fails before controller/network/CH side effects.
 
-The final call is ordinary `sandbox.Run`; `run --from` does not enter `restore.Run`.
+The final call is ordinary `sandbox.Run`; `run --from` does not enter `restore.Run`. The source-derived cold path resolves the target kernel/runtime identities and records them in a new C0 while preserving the effective source workload and disk graph. Source boot identities do not require an old kernel/runtime for cold startup; this does not relax the protected fields above. Memory restore instead preserves the captured C0 and requires a compatible local runtime binding, without an external kernel.
 
 Default `run --from` continues to enforce these strong ownership rules. `--replace-boot` selects a separate, explicit, atomic cold derivation:
 
