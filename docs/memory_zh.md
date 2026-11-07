@@ -50,15 +50,16 @@ Memory restore 使用一个共享 memfd，以及接收 CH-side userfaultfd 的 h
 
 UFFD使用`fault 1 page + best-effort serial tail`两阶段填充. Fault worker先保证
 fault页完成,只有该页实际提交为`Loaded`后才能提交tail;每个handler最多保留一个tail
-reservation,并发fault在reservation busy时只处理fault页. Fault页不等待tail worker或
-tail ioctl,同时限制并发source I/O、共享buffer和guest population. `ChunkRun`为复用
+reservation,并发fault在reservation busy时只处理fault页. Fault 页不等待 tail reservation
+或 tail 任务完成；安装仍与 tail 共用 `installMu`，可能等待正在执行的 tail ioctl 释放锁。
+同时限制并发 source I/O、共享 buffer 和 guest population. `ChunkRun`为复用
 一次物理解码结果,会在urgent copy前完成下述buffered source read.
 
 填充上限按最终可见Run类型确定:
 
 | Run类型 | fault阶段 | tail阶段 | 单次fault总上限 |
 |---|---|---|---:|
-| `Hole`、`Zero`、`Released` | 1页`UFFDIO_ZEROPAGE` | 最多15页 | 16页/64 KiB |
+| `Hole`、`Zero`、`Released` | 1 页补零，通常使用 `UFFDIO_ZEROPAGE` | 最多15页 | 16页/64 KiB |
 | ordinary `Data` | 读取并`UFFDIO_COPY` 1页 | deferred读取并填充最多15页 | 16页/64 KiB |
 | manifest `ChunkRun` | 一次读取包含fault页的最终可见chunk窗口,先单独填充fault页 | 先填fault后的suffix,成功后再填fault前的prefix | 1个当前可见window，最多1 MiB/256页 |
 | reclaimed `Loaded` | 只恢复当前页 | 无 | 1页 |
@@ -71,7 +72,9 @@ capability调用`fetch.ResolveChunkWindow`,以最终组合Stream的元数据把a
 直接使用绕过overlay的物理chunk边界.
 
 Tail reservation在窗口解析及payload读取前取得. Busy时只按原anchor读取并填充当前
-4 KiB fault页; 取得 reservation 后, handler 同步将不大于 1 MiB 的窗口读入已有 buffer.
+4 KiB fault 页。即使取得 reservation，population 候选无效或被截断到仅 fault 页时，
+也会释放 reservation，按原 anchor 只读取 urgent 页。其余情况下，handler 同步将
+不大于 1 MiB 的窗口读入已有 buffer。
 必需源读取暂时失败时, 重新尝试整个窗口.
 对完整可见chunk,这是一次精确的whole-chunk读取;若overlay截断可见性,source仍在
 内部按 chunk 完成必要的解密、解压及配置启用的验证，handler 只接收可安全填充的连续窗口。 Fault
@@ -91,14 +94,21 @@ accelerator内部继续执行metadata `Stream.RunAt`. Ordinary Data和zero-like 
 fault两侧连续`PageState`、RAM末端及当前CH UFFD region;这些guest population边界不
 缩短已经获准的whole-chunk source read. 默认 CDC chunk 的最大值是 1 MiB，但 Manifest 配置可以在 decoded-format limit 内使用更大 chunk；UFFD buffer/window cap 仍为 1 MiB。扩展 window 不可用、无效或超限时保留原来的安全 forward anchor；buffered window 放不下时，只推进 urgent page，不分配更大 buffer，也不引入超大 chunk 专用 population 路径。源码见 [fault.go](../pkg/uffd/fault.go) 和 accelerator [chunker 配置](https://github.com/kuasar-sandbox/accelerator/blob/main/pkg/manifest/chunker/chunker.go)。
 
-Tail对其连续有效范围只发出一次multi-page `UFFDIO_COPY`或
+不触发补零回退的常规路径中，tail 对其连续有效范围只发出一次 multi-page `UFFDIO_COPY` 或
 `UFFDIO_ZEROPAGE`;`ChunkRun`的suffix和prefix各自最多一次. Kernel按页处理并可能
 返回已完成的page-aligned prefix;handler只把该prefix条件提交为`Loaded`,第一次冲突
 或错误后放弃剩余tail且不重试. 因此batch保留内核已完成的成功前缀,同时把普通
-16页策略的tail降为1次ioctl、完整可见 256 页 window 的 255 页 tail 降为最多 2 次 ioctl。
+16 页策略的常规 tail 降为 1 次 ioctl、完整可见 256 页 window 的 255 页 tail 降为最多 2 次 ioctl。
+
+补零存在兼容回退：`UFFDIO_ZEROPAGE` 返回零进度且错误为 `EINVAL` 或 `EOPNOTSUPP` 时，
+handler 使用固定的包级全零 scratch buffer 执行 `UFFDIO_COPY`。这会增加一次 ioctl 尝试，
+不会扩大填充窗口或增加逐 fault 的 payload 分配；补零的 16 页上限不变。见 [dirty.go](../pkg/uffd/dirty.go)。
 
 `EVENT_REMOVE`使已丢弃范围重新成为missing,tail提交使用条件状态更新,不能覆盖并发
-产生的`Released`. Context cancellation停止worker并关闭fd/stream owner.
+产生的 `Released`。`Handler.Close` 拒绝新接入、取消工作、显式停止 event reader，并在
+join worker/caller 后关闭接收的 UFFD 和 epoll fd；仅取消 context 不会完成这些清理。
+Handler 借用 source，绝不自行关闭它。Runtime 先停止 VMM、排空 backend/handler 工作，
+再释放 memfd；restore 先取消并 join prefetch，再由所有者关闭 snapshot 和 parent stream。
 
 UFFD 直接重试必需的 `Run.ReadAt`. urgent 页及包含它的 Chunk window 属于必需读取. 纯 speculative tail 只执行一次最佳努力尝试. 保留现有 `ChunkRun` 能力、buffer、tail 预留和 ioctl 部分进展/EEXIST/EAGAIN 收敛. 所有 vhost GPA/UVA 访问首先通过所属 CH UFFD 等待确认填充；内存准备失败在发布 used-ring 完成记录前终止请求。CPU urgent、后端 mandatory 和 speculative tail 安装与内核 REMOVE/UNMAP 事件读取及状态发布共用同一把锁。延迟读取的来源数据在锁内重新校验；观察到释放后丢弃历史字节，不再安排过期 tail。UNMAP 还会唤醒原 UFFD 范围上的等待者，使内核 GUP/KVM 缺页请求重新检查已删除的 VMA 并退出；它不会安装替代字节，也不会在 runner 停止前 detach 资源。注册、取消、所有权边界与真实共享 memfd/O_DIRECT 回归见 [VMM 集成](vmm_zh.md#patch-0003)。
 
@@ -117,13 +127,16 @@ UFFD 直接重试必需的 `Run.ReadAt`. urgent 页及包含它的 Chunk window 
 当前内存层必须保留尚未再次缺页的释放内容。CH/设备 pause、backend quiesce 后，
 捕获在安装锁下联合采样 memfd Hole 与现有 UFFD 页状态：驻留 Data 优先，
 Hole+Absent 继承父层，Hole+Released 或 Loaded 表示显式 Zero。Loaded 情况覆盖
-补零后又被 CH 最终打洞的页。释放锁后流式读取固定布局；捕获成功或失败都不消费、
+补零后又被 CH 最终打洞的页。这是捕获的逻辑状态；驻留 Data 是否实际输出，还取决于
+下述捕获模式及 dirty 选择。释放锁后流式读取固定布局；捕获成功或失败都不消费、
 重置 handler 状态。Zero 在本地合并、tarstream、Bundle/ingest、发布和恢复中保持
 不透明。不需要全 RAM 物化、新 ZIP 条目或累计 dirty 日志。参见[释放修复 #378](https://github.com/kuasar-sandbox/sandboxer/issues/378)。
 
 CH 具备累计日志时，默认 `merge_ref=true` 捕获相对实例固定运行基线 B 的变化，并吸收
-可合并本地历史。`merge_ref=false` 保留完整当前工作集和必要显式 Zero，把本地历史裁剪成
-独立 H。单本地父与多父遵守相同裁剪规则。捕获成功、失败和模式切换均不清空
+可合并本地历史。`merge_ref=false` 保留完整当前工作集和必要显式 Zero，把可合并本地历史
+裁剪成独立 H。带 dirty 元数据的单本地父与多父遵守相同裁剪规则；没有该元数据的
+单个 legacy/all-dirty 父可直接复用为 H。没有可合并本地前缀时保留原 memory refs，不新建 H。
+捕获成功、失败和模式切换均不清空
 CPU/CH/Go/释放累计记录，也不推进 B。没有新 CH API 时，两种模式均保留完整当前工作集；
 历史仍利用父层已有元数据裁剪。
 
