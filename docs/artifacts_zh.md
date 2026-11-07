@@ -409,7 +409,18 @@ file://<digest>.overlay@hmac:<digest>
 file://<digest>.overlay@digest:<digest>
 ```
 
-目标 host 使用实际 path、source directory 或 named ref-location 在 controller、network、cgroup、VM 或 run directory 副作用前完成 binding。显式 cold projection 和手工构造的 `RuntimeSpec` 优先使用配置的 kernel 路径旁的 `.sha256` sidecar；没有 sidecar 时，在 CH 启动前对原始 kernel 完整计算一次 hash。Portable `run --from` 与 SDK 的 `OpenRunSource → Apply → DeriveRuntimeSpecWithOptions → StartRuntime/Launch` 共用 portable identity 策略：检查 kernel binding 可读，并在 sidecar 存在时与 C0 比较；sidecar 不存在时不计算完整 kernel hash。Restore 保持廉价 kernel binding 检查，完全忽略 sidecar。portable boot 和 restore 都将 runtime Bundle footer identity 与 C0 比较。没有 sidecar 的 portable boot 不独立证明宿主 kernel 匹配 E 记录的 digest；kernel 部署仍是受信宿主的责任。Carrier metadata 和按配置启用的内容验证保留各自检查。源码见 [source_identity.go](../pkg/sandbox/source_identity.go) 与 [restore.go](../pkg/restore/restore.go)。
+目标 host 通过实际 path、source directory 或 named ref-location 解析磁盘引用。启动组件策略取决于启动方式：
+
+- 所有冷启动都使用目标 host 选定的 kernel/runtime。有效的 `<configured-kernel-path>.sha256` sidecar 提供 kernel identity；sidecar 缺失时，在 CH 启动前对原始 kernel 完整计算一次 hash。runtime Bundle 提供其声明的 footer identity。
+- 冷启动 `run --from` 与 SDK 的 `RunSource.Apply` 路径使用目标身份派生新的 C0，同时保留来源 workload、磁盘图与 ancestry。源 E 不变；其旧 boot identity 不约束新冷启动。
+- 内存 restore 保持原 C0，并恢复捕获的 kernel；不要求、打开或 hash 外部 kernel，也不读取 kernel sidecar。外部 runtime 必须按 **digest scheme 和 digest** 匹配 C0；序列化的 basename 只是查找提示，配置的文件可以改名。
+
+源 E 冷启动的身份重投影要求保留 `RunSource.Apply` 返回的原始 `LaunchSpec`；
+手工重建公开字段不能重建内部来源凭据。没有该凭据而手工提供的 `PortableConfig`
+仍须匹配目标 kernel 的完整 canonical ref，以及 runtime 的内容身份。
+源码见 [runtime_sdk.go](../pkg/sandbox/runtime_sdk.go)。
+
+内存 restore 先检查显式 host path。预检失败（包括文件缺失、不可读、格式损坏或身份不匹配）后，至多在该配置路径的词法目录内尝试原 runtime basename，不跟随符号链接来选择目录。非法引用与取消不触发回退。全部允许的候选失败时，只有全为缺失或身份不匹配才返回 `ErrRuntimeIncompatible`；损坏元数据和 I/O 错误仍是错误，不是兼容性结论。不会额外查找 Snapshot S 所在目录、扫描其他目录或下载 runtime。既有引用编码和制品 schema 不变。runtime footer 检查验证 envelope 和声明身份，不扫描 EROFS payload；carrier metadata 与配置的内容验证保持各自检查。源码见 [source_identity.go](../pkg/sandbox/source_identity.go)、[runtime.go](../pkg/restore/runtime.go) 和 [runtime binding 策略](runtime_zh.md#restore)。
 
 <a id="encoding-limits"></a>
 
@@ -450,13 +461,13 @@ explicit cold config + persistent fields + canonical identities
   - host-only - ephemeral = C0
 
 E.sandbox.runtime.cfg + allowed persistent overrides
-  + canonical host bindings - ephemeral = C0 for run --from
+  + target kernel/runtime identities - ephemeral = new C0 for run --from
 
 E.sandbox.runtime.cfg non-boot defaults + allowed persistent overrides
   + complete replacement boot - ephemeral = a new explicit-cold C0
 
-S.sandbox_ref -> E.sandbox.runtime.cfg
-  + allowed restore host bindings = C0 for run --restore
+S.sandbox_ref -> E.sandbox.runtime.cfg = unchanged C0 for run --restore
+  (allowed restore host bindings apply only to the runtime configuration)
 ```
 
 `C0` 在完整 launch 输入已知后、工作负载消费前写入 run directory，之后字节不变。基础 Runtime 不生成不完整的占位 C0。 Live runtime 另持有不序列化的 `RunSourceBinding`:
@@ -504,7 +515,7 @@ root:
   base_from_refs: []
 ```
 
-`run --from` 通过 source binding 把 `self` 绑定到当前 E payload. Export C1 先把 C0 的旧 `self` 物化为原 source ref,再把新 root payload 位置设为 `self`;这避免 E digest 自引用循环.
+`run --from` 通过 source binding 把 `self` 绑定到当前 E payload。为新 C0 选择目标 kernel/runtime 身份时保留这份磁盘 ancestry。Export C1 先把 C0 的旧 `self` 物化为原 source ref,再把新 root payload 位置设为 `self`;这避免 E digest 自引用循环.
 
 `run --from --replace-boot` 不建立 source binding. 来源 E 在读取 non-boot defaults 后即不再参与 run；新的 root active writable layer 经普通 explicit-cold projection 占据唯一 `self`. 后续 export/snapshot 因此不会把来源 E 当作 disk parent 或 dependency.
 
@@ -812,9 +823,9 @@ Final path在write完成前会短暂可见. 正常consumer只能使用publisher�
 
 <a id="single-root-bundle"></a>
 
-### Single-root image/Sandbox Manifest Bundle
+### Single-root image/Sandbox/Snapshot Manifest Bundle
 
-`NewSingleRootBundlePublisher` 是已经组装好的 `RoleImage` 或 `RoleSandbox`
+`NewSingleRootBundlePublisher` 是已经组装好的 `RoleImage`、`RoleSandbox` 或 `RoleSnapshot`
 `sparse.Source` 的 typed named-location sink。数据流是：
 
 ```text
@@ -824,14 +835,14 @@ logical source
   -> replay the fixed source with the same key, admission and encoding options
   -> exclusive-create content-addressed <root>.bundle
   -> reopen/strict validate
-  -> file://<root>.bundle@manifest:<root>#<location>
+  -> file://<root>.bundle@manifest:<root>@location:<name>
 ```
 
-已组装的 E/S 可以包含已经发布的命名引用。`NewSingleRootBundlePublisher` 原样保留这些引用，不需要输入位置映射，也不读取父文件，只把新的 Bundle 写入指定输出位置。
+已组装的 E/S 可以包含已经发布的命名引用。`NewSingleRootBundlePublisher` 原样保留这些引用，不需要输入位置映射，也不读取父文件，只把新的 Bundle 写入指定输出位置。`RoleSnapshot` 的 `PublishSource` 还要求传入已知的 portable `sandbox_ref`，见[发布结果报告](#publication-report)。
 
 source 支持重复读取。第一遍保留根 Manifest key、完整 Bundle 的物理摘要及格式元数据，编码后的 Chunk 字节随处理释放。第二遍直接写入最终 `<root>.bundle`，并核对生成根与预计算身份一致。一次 publish 只解析一次客户密钥，两遍共用相同 admission 与编码参数。
 
-唯一创建的文件是最终 Bundle，包含这个 logical root 的 Manifest 和 Chunk。发布使用有界 Chunk 工作缓冲并保留 payload 稀疏性。typed 调用点提供逻辑角色；image 和 Sandbox reader 保持各自 schema 校验。复用已有目标时，验证 admission、根、认证内容与完整物理身份。并发 writer 通过有界等待、exclusive create 与完整校验收敛。取消、源变化、写入及关闭错误使发布失败，并仅清理本次拥有的不完整 final。路径被替换时保留替换者的 inode，返回所有权错误。
+唯一创建的文件是最终 Bundle，包含这个 logical root 的 Manifest 和 Chunk。发布使用有界 Chunk 工作缓冲并保留 payload 稀疏性。typed 调用点提供逻辑角色；image、Sandbox 和 Snapshot reader 保持各自 schema 校验。复用已有目标时，验证 admission、根、认证内容与完整物理身份。并发 writer 通过有界等待、exclusive create 与完整校验收敛。取消、源变化、写入及关闭错误使发布失败，并仅清理本次拥有的不完整 final。路径被替换时保留替换者的 inode，返回所有权错误。
 
 Tarstream 与 Bundle 都是 physical carrier，不是 logical role。Tarstream 包含单一
 role-specific payload 与 sparse envelope，使用 `@digest`/`@hmac` identity；Bundle
@@ -939,7 +950,7 @@ E2B memory=true
   -> sandbox-ctl run --restore
 ```
 
-S/E 后缀几何、确定性 ZIP 编码、有序角色条目、大小上限及 sparse prefix/append 视图由 `accelerator/pkg/tailzip` 实现。Sandbox/Snapshot 模块保留 portable config、JSON/state 和设备拓扑校验。逻辑引用位置共用 `manifest.RefLocations`。
+S/E 后缀几何、确定性 ZIP 编码及 sparse prefix/append 视图由 `accelerator/pkg/tailzip` 实现。Sandboxer 提供有序角色条目与大小上限；Sandbox/Snapshot 模块保留 portable config、JSON/state 和设备拓扑校验。逻辑引用位置共用 `manifest.RefLocations`。
 
 <a id="related"></a>
 
