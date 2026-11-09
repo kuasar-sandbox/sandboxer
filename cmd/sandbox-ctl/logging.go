@@ -15,7 +15,7 @@ func componentLog(to string) (io.Writer, func(), error) {
 	if to == "" || to == "default" {
 		return os.Stderr, func() {}, nil
 	}
-	writer, err := journalio.Open(to, os.Stderr)
+	writer, err := journalio.OpenDiagnostic(to)
 	if err != nil {
 		return nil, nil, err
 	}

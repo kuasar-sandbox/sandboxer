@@ -14,7 +14,8 @@ import (
 // not inherit process environment or another output's identity.
 //
 // Writes and Close are serialized. Complete lines are sent synchronously in
-// bounded frames; Close flushes any remaining partial line. Native send failures
+// bounded frames, retaining backpressure while the journal queue is full;
+// Close flushes any remaining partial line. Native send failures
 // use fallback on a best-effort basis. A nil fallback discards failed sends.
 // The caller retains ownership of fallback: closing the result never closes it.
 // Open does not install or change the process's default logger.
@@ -28,4 +29,21 @@ func Open(target string, fallback io.Writer) (io.WriteCloser, error) {
 		return nil, err
 	}
 	return writer, nil
+}
+
+// OpenDiagnostic opens best-effort component diagnostics for an explicit journal
+// target. Unlike Open, it never waits for the journal to consume a queued record.
+// Congestion or an unavailable journal drops the affected message, without a
+// synchronous stderr fallback. Later messages can be sent when the journal
+// recovers. Each output owns its send connection independently of user streams.
+//
+// Writes and Close are serialized; Close attempts a final partial line and
+// releases the connection. Use Open for user output that requires backpressure.
+// OpenDiagnostic does not install or change the process's default logger.
+func OpenDiagnostic(target string) (io.WriteCloser, error) {
+	parsed, err := internaljournal.Parse(target)
+	if err != nil {
+		return nil, err
+	}
+	return internaljournal.NewDiagnostic(parsed)
 }

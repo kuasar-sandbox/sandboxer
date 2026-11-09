@@ -581,6 +581,12 @@ not require journal-connected stderr or any particular identity field.
 Invalid flag syntax and invalid `--log-to` values can still be reported on the
 original stderr before a usable target exists.
 
+Explicit journal component diagnostics are best-effort and never wait for journal
+queue space. Congestion or an unavailable journal drops the affected message,
+without a synchronous stderr fallback that could block the same control path.
+Later diagnostics can be sent when the journal recovers. This policy applies to
+`--log-to journald=...`, not to Guest stdout/stderr or console streams.
+
 `--stderr-to` remains the guest application's stderr destination. `--log-to`
 does not take over process descriptors, change TTY/pipe selection, redirect
 Cloud Hypervisor's own stderr, or capture runtime panic/system events. Existing
@@ -600,13 +606,21 @@ carriage returns from the middle of a line. A final partial line is flushed on
 Close. Producers are drained before their writer is closed; Close is idempotent,
 and writes after Close return `io.ErrClosedPipe`.
 
-A successful native send is not duplicated to stderr. A failed send is followed
-by a best-effort write to the original fallback sink. Guest/console fallback
-retains its `[tag]` prefix; component fallback does not add another prefix to
-existing diagnostic text. Neither a native-send error nor a fallback-write
-error terminates the sandbox. Fallback text does not retain structured fields.
-Native journal I/O is synchronous: this is not an asynchronous queue or a
-promise of nonblocking, lossless, exactly-once durable storage.
+A successful native send is not duplicated to stderr. Guest/console streams
+retain backpressure while the journal queue is full, without busy retrying.
+A native-send error is followed by a best-effort write to the original fallback
+sink, with the existing `[tag]` prefix. Neither a native-send error nor a
+fallback-write error terminates the sandbox. Fallback text does not retain
+structured fields. Component diagnostics use the nonblocking policy above and
+do not call a fallback.
+
+Each journal output owns its sending connection; a backpressured Guest stream
+does not block the component diagnostic sender. Close releases that connection
+after flushing its partial line under the selected output policy. SDK callers
+use `journalio.Open(target, fallback)` for streams and
+`journalio.OpenDiagnostic(target)` for best-effort component diagnostics.
+These APIs do not provide an asynchronous queue or promise lossless,
+exactly-once durable storage.
 
 Use `journalctl WORKLOAD_ID=worker-42 -o json` to inspect the fields in the
 journals available to that command. Cross-node history requires a separate
