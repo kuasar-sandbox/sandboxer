@@ -513,6 +513,12 @@ journald=app,NOTE=a%2Cb,EXPR=x=y,PERCENT=100%25,PLUS=a+b,ONCE=%252C
 journal，也不要求存在任何特定身份字段。
 
 在可用目标建立之前，非法 flag 语法和非法 `--log-to` 值仍可写到原始 stderr。
+
+显式 journal 组件诊断采用尽力发送，不等待 journal 队列空间。journal 拥塞或不可用时，
+丢弃受影响的消息，不同步回退到 stderr，以免再次阻塞同一控制路径。journal 恢复后，
+后续诊断可以继续发送。此策略适用于 `--log-to journald=...`，不适用于 Guest
+stdout/stderr 或 console 输出流。
+
 `--stderr-to` 始终是 guest 应用的 stderr 目标。`--log-to` 不接管进程描述符，不改变
 TTY/pipe 选择，不重定向 Cloud Hypervisor 自身的 stderr，也不捕获 runtime panic 或
 系统事件。既有消息文本和日志时间精度保持不变。`exec` 自身的诊断 stderr 及错误捕获
@@ -527,10 +533,16 @@ TTY/pipe 选择，不重定向 Cloud Hypervisor 自身的 stderr，也不捕获 
 强制长度分段不会删除行中间的回车字节。Close 会刷新最后的半行。生产者必须先排空，
 再关闭其 writer；Close 幂等，关闭后写入返回 `io.ErrClosedPipe`。
 
-native 发送成功时不再复制到 stderr。发送失败时，尽力写入原始 fallback 目标。
-guest/console fallback 保留 `[tag]` 前缀；组件 fallback 不在既有诊断文本外再加一层
+native 发送成功时不再复制到 stderr。journal 队列满时，Guest/console 流保留背压，
+不进行忙重试。native 发送出错后，尽力写入原始 fallback 目标，并保留既有 `[tag]`
 前缀。native 发送或 fallback 写入错误均不会终止沙箱。fallback 文本不保留结构化字段。
-native journal I/O 是同步的；这里不是异步队列，也不承诺非阻塞、无损或恰好一次持久化。
+组件诊断采用上述非阻塞策略，不调用 fallback。
+
+每个 journal 输出独立拥有发送连接；Guest 流的背压不会阻塞组件诊断发送端。
+Close 按所选输出策略刷新最后半行后释放该连接。SDK 调用方对流输出使用
+`journalio.Open(target, fallback)`，对尽力发送的组件诊断使用
+`journalio.OpenDiagnostic(target)`。这些 API 不提供异步队列，也不承诺无损或恰好一次
+持久化。
 
 可以用 `journalctl WORKLOAD_ID=worker-42 -o json` 检查该命令可访问的 journal 字段。
 跨节点历史需要单独的采集器或访问其他节点的 journal；本功能不增加 exporter。

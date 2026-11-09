@@ -47,6 +47,32 @@ func TestOpenRequiresExplicitJournalTarget(t *testing.T) {
 	}
 }
 
+func TestOpenDiagnosticOwnsOnlyItsOutput(t *testing.T) {
+	previous := log.Writer()
+	writer, err := journalio.OpenDiagnostic("journald=runtime,WORKLOAD_ID=w-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if log.Writer() != previous {
+		t.Fatal("OpenDiagnostic changed the process logger")
+	}
+	// Construction and an empty Close do not need a running journal.
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("after close")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatal("closed diagnostic output accepted bytes", err)
+	}
+	for _, target := range []string{"", "default", "file=diagnostics.log", "journald=ctl,MESSAGE=x"} {
+		if writer, err := journalio.OpenDiagnostic(target); err == nil || writer != nil {
+			t.Fatalf("OpenDiagnostic(%q) = %v, %v; want invalid target", target, writer, err)
+		}
+	}
+}
+
 type fallbackSink struct {
 	bytes.Buffer
 	closed bool

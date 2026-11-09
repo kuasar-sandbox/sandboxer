@@ -18,13 +18,14 @@ type sendFunc func(string, map[string]string) error
 // Send/fallback errors are best-effort and never fail a runtime data pump.
 // Native journal I/O is synchronous; this is not a nonblocking logging queue.
 type Writer struct {
-	mu       sync.Mutex
-	fields   map[string]string
-	send     sendFunc
-	fallback io.Writer
-	prefix   string
-	buf      []byte
-	closed   bool
+	mu        sync.Mutex
+	fields    map[string]string
+	send      sendFunc
+	closeSend func() error
+	fallback  io.Writer
+	prefix    string
+	buf       []byte
+	closed    bool
 }
 
 func newWriter(t Target, fallback io.Writer, prefix string, send sendFunc) (*Writer, error) {
@@ -119,6 +120,9 @@ func (w *Writer) Close() error {
 		w.emit(w.buf, false)
 		w.buf = nil
 		w.closed = true
+		if w.closeSend != nil {
+			return w.closeSend()
+		}
 	}
 	return nil
 }
