@@ -145,8 +145,8 @@ test-e2e-scripts:
 
 VERSION ?= v0.1.0
 KUASAR_PLATFORM_DIR ?= ../kuasar-sandbox
-ACCELERATOR_VERSION ?= v0.1.10
-CONNECTOR_VERSION ?= v0.1.6
+ACCELERATOR_VERSION ?= v0.1.12
+CONNECTOR_VERSION ?= v0.1.8
 
 release:
 	@set -e; workspace="$$(python3 -B "$(KUASAR_PLATFORM_DIR)/ci/integration/go_workspace.py" \
