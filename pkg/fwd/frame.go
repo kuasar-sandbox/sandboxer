@@ -14,7 +14,7 @@
 // UDS↔vsock boundary — the same reason the stdio MUX uses FrameEOF rather
 // than relying on the conn closing).
 //
-// stdlib-only: the guest sandbox-init binary imports this package.
+// Uses the standard library plus internal/wireio; imported by sandbox-init.
 package fwd
 
 import (
@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/kuasar-sandbox/sandboxer/internal/wireio"
 )
 
 // Wire format of one frame:
@@ -71,11 +73,11 @@ func WriteFrame(w io.Writer, f Frame) error {
 	var hdr [FrameHeaderLen]byte
 	hdr[0] = f.Type
 	binary.BigEndian.PutUint16(hdr[1:3], uint16(len(f.Payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
+	if err := wireio.WriteAll(w, hdr[:]); err != nil {
 		return fmt.Errorf("fwd: write header: %w", err)
 	}
 	if len(f.Payload) > 0 {
-		if _, err := w.Write(f.Payload); err != nil {
+		if err := wireio.WriteAll(w, f.Payload); err != nil {
 			return fmt.Errorf("fwd: write payload: %w", err)
 		}
 	}
