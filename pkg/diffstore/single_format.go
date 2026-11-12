@@ -9,9 +9,9 @@ import (
 	"io"
 	"os"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/directio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 	"golang.org/x/crypto/xts"
-	"golang.org/x/sys/unix"
 )
 
 // Single-layer v3 has a 4 KiB header, a capacity-sized presence area and a
@@ -65,7 +65,7 @@ func createDiffFile(f *os.File, size int64, encryption *diffEncryption, random i
 	if err := f.Truncate(singleBodyOffset(size) + size); err != nil {
 		return nil, err
 	}
-	if err := unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_KEEP_SIZE, 0, singleBodyOffset(size)); err != nil {
+	if err := directio.Reserve(int(f.Fd()), 0, singleBodyOffset(size)); err != nil {
 		return nil, err
 	}
 	if err := writeFullAt(f, region, 0); err != nil {

@@ -377,3 +377,22 @@ func TestActiveReadProtectsSlotsAcrossMutationAndGC(t *testing.T) {
 		t.Fatalf("deleted pinned version changed: %d %v", n, err)
 	}
 }
+
+func TestActiveReadRetriesInterruptedSyscall(t *testing.T) {
+	s, want := denseReadFixture(t, 2, nil)
+	calls := 0
+	s.mu.Lock()
+	s.preadData = func(fd int, b []byte, off int64) (int, error) {
+		calls++
+		if calls == 1 {
+			return -1, unix.EINTR
+		}
+		return unix.Pread(fd, b, off)
+	}
+	s.mu.Unlock()
+	got := make([]byte, len(want))
+	n, err := s.ReadAt(got, 0)
+	if err != nil || n != len(want) || !bytes.Equal(got, want) || calls != 2 {
+		t.Fatalf("interrupted read: n=%d err=%v calls=%d equal=%v", n, err, calls, bytes.Equal(got, want))
+	}
+}

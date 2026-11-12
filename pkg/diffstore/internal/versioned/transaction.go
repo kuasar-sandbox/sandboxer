@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/directio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/sectorcrypt"
 	"golang.org/x/sys/unix"
@@ -552,7 +553,7 @@ func (t *transaction) reserve(newPages []record) error {
 		if err := t.store.hook("reserve"); err != nil {
 			return errors.Join(errReservation, err)
 		}
-		err := unix.Fallocate(int(t.store.file.Fd()), unix.FALLOC_FL_KEEP_SIZE, int64(pages[start])*PageSize, int64(last-pages[start]+1)*PageSize)
+		err := directio.Reserve(int(t.store.file.Fd()), int64(pages[start])*PageSize, int64(last-pages[start]+1)*PageSize)
 		if err != nil {
 			if errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT) {
 				return errors.Join(errReservation, err)

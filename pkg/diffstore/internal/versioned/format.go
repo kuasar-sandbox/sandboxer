@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/directio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 	"golang.org/x/crypto/xts"
 	"golang.org/x/sys/unix"
@@ -375,7 +376,7 @@ func (s *Store) initialize(h []byte) error {
 	if err := s.hook("initialize-reserve"); err != nil {
 		return err
 	}
-	if err := unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_KEEP_SIZE, 0, (logImagesPage+maxLogPages)*PageSize); err != nil {
+	if err := directio.Reserve(int(f.Fd()), 0, (logImagesPage+maxLogPages)*PageSize); err != nil {
 		return err
 	}
 	if err := writeFull(f, h, 0); err != nil {
@@ -388,7 +389,7 @@ func (s *Store) initialize(h []byte) error {
 	if err := writeFull(f, make([]byte, PageSize), logCommitPage); err != nil {
 		return err
 	}
-	if err := unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_KEEP_SIZE, int64(presenceAreaPage)*PageSize, int64(presence.Pages(s.Size()))*PageSize); err != nil {
+	if err := directio.Reserve(int(f.Fd()), int64(presenceAreaPage)*PageSize, int64(presence.Pages(s.Size()))*PageSize); err != nil {
 		return err
 	}
 	if err := s.hook("initialize-presence"); err != nil {
@@ -517,7 +518,7 @@ func (s *Store) readCheckpoint(slot uint64, t *transaction) (checkpoint, error) 
 }
 
 func punch(f *os.File, slot uint64) error {
-	return unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, int64(slotPage(slot))*PageSize, PageSize)
+	return directio.PunchHole(int(f.Fd()), int64(slotPage(slot))*PageSize, PageSize)
 }
 func isZero(b []byte) bool {
 	for _, v := range b {

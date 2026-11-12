@@ -9,8 +9,8 @@ import (
 	"sort"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/directio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
-	"golang.org/x/sys/unix"
 )
 
 func sealSinglePresence(b []byte) {
@@ -51,7 +51,7 @@ func (d *diffFile) cleanupWritesLocked(pages []pageWrite) error {
 		if !p.Fresh {
 			continue
 		}
-		err := unix.Fallocate(int(d.f.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, d.bodyOffset+int64(p.Block)*cowBlockSize, cowBlockSize)
+		err := directio.PunchHole(int(d.f.Fd()), d.bodyOffset+int64(p.Block)*cowBlockSize, cowBlockSize)
 		result = errors.Join(result, err)
 		if err == nil {
 			blocks = append(blocks, p.Block)
@@ -184,7 +184,7 @@ func (d *diffFile) discard(ctx context.Context, offset, length int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := unix.Fallocate(int(d.f.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, d.bodyOffset+offset, length); err != nil {
+	if err := directio.PunchHole(int(d.f.Fd()), d.bodyOffset+offset, length); err != nil {
 		return err
 	}
 	blocks := make([]uint64, length/cowBlockSize)
