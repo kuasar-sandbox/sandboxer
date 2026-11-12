@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/internal/wireio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"golang.org/x/sys/unix"
 )
@@ -114,13 +116,34 @@ func (c *vsockConn) waitMemoryRetry(delay time.Duration) error {
 	}
 }
 
+// Each adapter owns its syscall retry and deadline policy. Re-enter it for the
+// unwritten suffix so Close and the usage request's deadline still take effect.
+func writeSocket(b []byte, doIO func(fdIOFunc, []byte) (int, error)) (int, error) {
+	if len(b) == 0 {
+		// Even an empty write checks the descriptor and the request deadline.
+		_, err := doIO(syscall.Write, b)
+		return 0, err
+	}
+	return wireio.WriteFull(func(p []byte) (int, error) { return doIO(syscall.Write, p) }, b)
+}
+
+func readSocket(b []byte, doIO func(fdIOFunc, []byte) (int, error)) (int, error) {
+	n, err := doIO(syscall.Read, b)
+	if n == 0 && err == nil && len(b) != 0 {
+		return 0, io.EOF
+	}
+	// Linux reports -1 on syscall errors. io.Reader reports bytes consumed.
+	return max(n, 0), err
+}
+
 func (c *vsockConn) Read(b []byte) (int, error) {
-	return c.io(syscall.Read, b)
+	return readSocket(b, c.io)
 }
 
 func (c *vsockConn) Write(b []byte) (int, error) {
-	return c.io(syscall.Write, b)
+	return writeSocket(b, c.io)
 }
+
 func (c *vsockConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.fdMu.Lock()

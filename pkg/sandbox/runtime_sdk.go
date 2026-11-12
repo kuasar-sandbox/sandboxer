@@ -488,7 +488,7 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 			}
 			r.logf("CH args: %s", strings.Join(args, " "))
 			if spec.Console.Kind == stdio.ConsoleStderr {
-				cmd.Stdout = runtimeConsoleWriter{owner: r, dst: cmd.Stdout}
+				cmd.Stdout = runtimeConsoleWriter{owner: r, dst: cmd.Stdout, tty: stdio.CRLF(cmd.Stdout)}
 			}
 			cmd.Args = append(cmd.Args, args...)
 			return cmd, cleanup, nil
@@ -1535,11 +1535,12 @@ func (r *Runtime) observeInitialLaunch(fact proto.InitialLaunchState) {
 type runtimeConsoleWriter struct {
 	owner *Runtime
 	dst   io.Writer
+	tty   io.Writer
 }
 
 func (w runtimeConsoleWriter) Write(p []byte) (int, error) {
 	if w.owner.consoleTTY.Load() {
-		return stdio.CRLF(w.dst).Write(p)
+		return w.tty.Write(p)
 	}
 	return w.dst.Write(p)
 }

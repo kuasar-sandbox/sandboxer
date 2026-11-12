@@ -61,3 +61,22 @@ func TestReadMessage_EOF(t *testing.T) {
 		t.Fatal("expected EOF")
 	}
 }
+
+// chunkWriter accepts at most two bytes per call, including the frame header.
+type chunkWriter struct{ bytes.Buffer }
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	return w.Buffer.Write(p[:min(len(p), 2)])
+}
+
+func TestWriteMessageShortWrites(t *testing.T) {
+	var w chunkWriter
+	want := &Message{Type: TypeHeartbeat, Token: "reservation-token"}
+	if err := WriteMessage(&w, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadMessage(&w)
+	if err != nil || got.Type != want.Type || got.Token != want.Token {
+		t.Fatalf("decoded message = %+v, error = %v", got, err)
+	}
+}

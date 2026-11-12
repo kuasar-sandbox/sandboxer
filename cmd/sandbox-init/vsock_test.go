@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"syscall"
@@ -216,6 +218,51 @@ func TestVsockCloseInterruptsRawIO(t *testing.T) {
 				case <-time.After(2 * time.Second):
 					t.Fatal("Close failed to interrupt raw I/O")
 				}
+			}
+		})
+	}
+}
+
+func TestSocketAdaptersOnStream(t *testing.T) {
+	for _, adapter := range []string{"vsock", "usage"} {
+		t.Run(adapter, func(t *testing.T) {
+			fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn := &vsockConn{fd: fds[0]}
+			defer conn.Close()
+			defer unix.Close(fds[1])
+			var stream io.ReadWriter = conn
+			if adapter == "usage" {
+				stream = usageIO{conn: conn, end: time.Now().Add(time.Second)}
+			}
+			if err := unix.SetsockoptInt(conn.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
+				t.Fatal(err)
+			}
+			payload := bytes.Repeat([]byte("abcd"), 8192)
+			n, err := stream.Write(payload)
+			if n <= 0 || n >= len(payload) {
+				t.Fatalf("expected a partial write, got (%d,%v)", n, err)
+			}
+			if !errors.Is(err, unix.EAGAIN) {
+				t.Errorf("Write with full send buffer = (%d,%v)", n, err)
+			}
+			received := make([]byte, len(payload))
+			if got, err := unix.Read(fds[1], received); got != n || err != nil || !bytes.Equal(received[:n], payload[:n]) {
+				t.Fatalf("peer received %d bytes, err=%v; Write reported %d", got, err, n)
+			}
+			if n, err := stream.Read(received); n != 0 || !errors.Is(err, unix.EAGAIN) {
+				t.Errorf("Read with empty receive buffer = (%d,%v)", n, err)
+			}
+			if err := unix.Shutdown(fds[1], unix.SHUT_WR); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := stream.Read(nil); n != 0 || err != nil {
+				t.Errorf("zero-length Read = (%d,%v)", n, err)
+			}
+			if n, err := stream.Read(received); n != 0 || err != io.EOF {
+				t.Fatalf("Read after peer shutdown = (%d,%v)", n, err)
 			}
 		})
 	}
