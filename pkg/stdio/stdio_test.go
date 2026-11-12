@@ -248,3 +248,56 @@ func TestBorrowedInputCancellationDoesNotCloseDescriptor(t *testing.T) {
 		t.Fatalf("borrowed descriptor changed: %q/%v", got, err)
 	}
 }
+
+type shortConsoleSink struct {
+	bytes.Buffer
+	limit int
+	err   error
+}
+
+func (s *shortConsoleSink) Write(p []byte) (int, error) {
+	n, _ := s.Buffer.Write(p[:min(s.limit, len(p))])
+	return n, s.err
+}
+
+func TestCRLFShortWrites(t *testing.T) {
+	for _, input := range []string{"ordinary text", "a\n\nb"} {
+		sink := &shortConsoleSink{limit: 1}
+		n, err := CRLF(sink).Write([]byte(input))
+		want := bytes.ReplaceAll([]byte(input), []byte("\n"), []byte("\r\n"))
+		if n != len(input) || err != nil || !bytes.Equal(sink.Bytes(), want) {
+			t.Fatalf("Write(%q) = (%d, %v), output %q, want %q", input, n, err, sink.Bytes(), want)
+		}
+	}
+}
+
+// Fail at each wire byte boundary, including both halves of consecutive
+// newlines. Retrying the unconsumed input must produce the original encoding.
+func TestCRLFPartialWriteAndRetry(t *testing.T) {
+	input := []byte("a\n\nb")
+	wantOutput := "a\r\n\r\nb"
+	wantErr := errors.New("console write failed")
+	for limit, consumed := range []int{0, 1, 1, 2, 2, 3, 4} {
+		sink := &shortConsoleSink{limit: limit, err: wantErr}
+		w := CRLF(sink)
+		n, err := w.Write(input)
+		if n != consumed || !errors.Is(err, wantErr) || sink.String() != wantOutput[:limit] {
+			t.Fatalf("limit %d: Write = (%d, %v), output %q; want (%d, %v), output %q", limit, n, err, sink.String(), consumed, wantErr, wantOutput[:limit])
+		}
+		if n, err := w.Write(nil); n != 0 || !errors.Is(err, wantErr) {
+			t.Fatalf("empty write = (%d, %v), want (0, %v)", n, err, wantErr)
+		}
+		sink.limit = 0
+		sink.err = nil
+		if n < len(input) {
+			if n2, err := w.Write(input[n:]); n2 != 0 || !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("limit %d: no progress = (%d, %v)", limit, n2, err)
+			}
+		}
+		sink.limit = 1
+		n2, err := w.Write(input[n:])
+		if n+n2 != len(input) || err != nil || sink.String() != wantOutput {
+			t.Fatalf("limit %d: retry = (%d, %v), output %q; want %q", limit, n2, err, sink.String(), wantOutput)
+		}
+	}
+}

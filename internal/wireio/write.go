@@ -1,4 +1,4 @@
-// Package wireio contains I/O primitives shared by the repository's framed protocols.
+// Package wireio contains shared primitives for writing complete buffers.
 package wireio
 
 import "io"
@@ -6,18 +6,29 @@ import "io"
 // WriteAll writes every byte in p. It returns io.ErrShortWrite when the
 // writer reports success without making progress.
 func WriteAll(w io.Writer, p []byte) error {
-	for len(p) > 0 {
-		n, err := w.Write(p)
+	if len(p) == 0 {
+		return nil
+	}
+	_, err := WriteFull(w.Write, p)
+	return err
+}
+
+// WriteFull retries short writes to consume p, reporting the total bytes written
+// even if a later write fails. A write that makes no progress must report an error.
+func WriteFull(write func([]byte) (int, error), p []byte) (int, error) {
+	written := 0
+	for written < len(p) {
+		n, err := write(p[written:])
+		if n <= 0 || n > len(p)-written {
+			if err == nil {
+				err = io.ErrShortWrite
+			}
+			return written, err
+		}
+		written += n
 		if err != nil {
-			return err
-		}
-		if n < 0 || n > len(p) {
-			return io.ErrShortWrite
-		}
-		p = p[n:]
-		if n == 0 {
-			return io.ErrShortWrite
+			return written, err
 		}
 	}
-	return nil
+	return written, nil
 }
