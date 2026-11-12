@@ -32,7 +32,8 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.owner = self.root/OWNER
-        self.env = dict(os.environ, GOWORK='off', GOPROXY='off', GOSUMDB='off', PYTHONDONTWRITEBYTECODE='1')
+        self.env = dict(os.environ, GOENV='off', GOWORK='off', GOPROXY='off',
+                        GONOPROXY='none', GOSUMDB='off', PYTHONDONTWRITEBYTECODE='1')
         for key in list(self.env):
             if key.startswith(('RELEASE_', 'MAKE')) or key in ('MFLAGS', 'KUASAR_E2E_GO'):
                 self.env.pop(key)
