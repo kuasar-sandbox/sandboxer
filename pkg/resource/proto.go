@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/internal/wireio"
 )
 
 // DefaultSocket is the canonical UDS path the controller listens on.
@@ -209,10 +211,10 @@ func WriteMessage(w io.Writer, m *Message) error {
 	}
 	var hdr [4]byte
 	binary.LittleEndian.PutUint32(hdr[:], uint32(len(payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
+	if err := wireio.WriteAll(w, hdr[:]); err != nil {
 		return fmt.Errorf("nodectl: write header: %w", err)
 	}
-	if _, err := w.Write(payload); err != nil {
+	if err := wireio.WriteAll(w, payload); err != nil {
 		return fmt.Errorf("nodectl: write payload: %w", err)
 	}
 	return nil
