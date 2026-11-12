@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"sync"
 	"syscall"
@@ -236,14 +235,14 @@ func (c usageIO) interruptedIO(op fdIOFunc, b []byte) (int, error) {
 		return n, err
 	}
 }
+
 func (c usageIO) Read(b []byte) (int, error) {
-	n, err := c.io(syscall.Read, b)
-	if n == 0 && err == nil {
-		err = io.EOF
-	}
-	return n, err
+	return readSocket(b, c.io)
 }
-func (c usageIO) Write(b []byte) (int, error) { return c.io(syscall.Write, b) }
+
+func (c usageIO) Write(b []byte) (int, error) {
+	return writeSocket(b, c.io)
+}
 
 func (s *usageService) serve(c *vsockConn, first *proto.Message) {
 	s.mu.Lock()

@@ -74,15 +74,11 @@ func SparseCopy(dst *os.File, srcFD int, size int64) (int64, error) {
 					errors.Is(err, unix.EOPNOTSUPP) ||
 					errors.Is(err, unix.EINVAL) ||
 					errors.Is(err, unix.ENOSYS) {
-					// Fallback path
-					if err := preadPwriteCopy(srcFD, dstFD,
-						srcCopyOff, dstCopyOff, remaining); err != nil {
+					n, err := preadPwriteCopy(srcFD, dstFD, srcCopyOff, dstCopyOff, remaining)
+					copied += n
+					if err != nil {
 						return copied, err
 					}
-					copied += remaining
-					srcCopyOff += remaining
-					dstCopyOff += remaining
-					remaining = 0
 					break
 				}
 				return copied, fmt.Errorf("copy_file_range off=%d len=%d: %w",
@@ -99,26 +95,29 @@ func SparseCopy(dst *os.File, srcFD int, size int64) (int64, error) {
 	return copied, nil
 }
 
-func preadPwriteCopy(srcFD, dstFD int, srcOff, dstOff, length int64) error {
+func preadPwriteCopy(srcFD, dstFD int, srcOff, dstOff, length int64) (int64, error) {
 	buf := make([]byte, 1<<20) // 1 MiB chunks
-	for length > 0 {
-		toRead := int64(len(buf))
-		if toRead > length {
-			toRead = length
-		}
-		n, err := unix.Pread(srcFD, buf[:toRead], srcOff)
+	var copied int64
+	for copied < length {
+		toRead := min(int64(len(buf)), length-copied)
+		n, err := unix.Pread(srcFD, buf[:toRead], srcOff+copied)
 		if err != nil {
-			return fmt.Errorf("pread off=%d: %w", srcOff, err)
+			return copied, fmt.Errorf("pread off=%d: %w", srcOff+copied, err)
 		}
 		if n == 0 {
-			return io.ErrUnexpectedEOF
+			return copied, io.ErrUnexpectedEOF
 		}
-		if _, err := unix.Pwrite(dstFD, buf[:n], dstOff); err != nil {
-			return fmt.Errorf("pwrite off=%d: %w", dstOff, err)
+		for data := buf[:n]; len(data) > 0; {
+			written, err := unix.Pwrite(dstFD, data, dstOff+copied)
+			if err != nil {
+				return copied, fmt.Errorf("pwrite off=%d: %w", dstOff+copied, err)
+			}
+			if written == 0 {
+				return copied, io.ErrShortWrite
+			}
+			copied += int64(written)
+			data = data[written:]
 		}
-		srcOff += int64(n)
-		dstOff += int64(n)
-		length -= int64(n)
 	}
-	return nil
+	return copied, nil
 }
