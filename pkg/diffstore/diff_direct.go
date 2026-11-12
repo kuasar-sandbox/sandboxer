@@ -27,12 +27,12 @@ type directWorkspace struct {
 	memoryAlign, offsetAlign int
 }
 
-// directBody deliberately makes one syscall. os.File.WriteAt retries a short
-// write using the remaining slice, which need not satisfy DIO alignment.
+// directBody returns short transfers to its caller. os.File.WriteAt retries a
+// short write using the remaining slice, which need not satisfy DIO alignment.
 type directBody struct{ f *os.File }
 
 func (b directBody) ReadAt(p []byte, off int64) (int, error) {
-	n, err := unix.Pread(int(b.f.Fd()), p, off)
+	n, err := directio.RetryInterruptedIO(unix.Pread, int(b.f.Fd()), p, off)
 	if n < 0 {
 		n = 0
 	}
@@ -42,7 +42,7 @@ func (b directBody) ReadAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 func (b directBody) WriteAt(p []byte, off int64) (int, error) {
-	n, err := unix.Pwrite(int(b.f.Fd()), p, off)
+	n, err := directio.RetryInterruptedIO(unix.Pwrite, int(b.f.Fd()), p, off)
 	if n < 0 {
 		n = 0
 	}

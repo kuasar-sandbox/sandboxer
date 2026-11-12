@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/directio"
 	"golang.org/x/sys/unix"
 )
 
@@ -133,7 +134,7 @@ func (s *Store) gcRelease(ctx context.Context, budget int) (uint64, error) {
 				return err
 			}
 			length := int64(end-start) * PageSize
-			if err := unix.Fallocate(int(s.file.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
+			if err := directio.PunchHole(int(s.file.Fd()),
 				int64(slotPage(slots[start]))*PageSize, length); err != nil {
 				return err
 			}

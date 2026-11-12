@@ -54,7 +54,7 @@ func directRead(f *os.File, n int, off int64) ([]byte, error) {
 	}
 	var result []byte
 	err := withDirectBuffer(n, func(b []byte) error {
-		m, err := unix.Pread(int(f.Fd()), b, off)
+		m, err := directio.RetryInterruptedIO(unix.Pread, int(f.Fd()), b, off)
 		if err != nil {
 			return err
 		}
@@ -72,7 +72,7 @@ func directWrite(f *os.File, p []byte, off int64) error {
 	}
 	return withDirectBuffer(len(p), func(b []byte) error {
 		copy(b, p)
-		n, err := unix.Pwrite(int(f.Fd()), b, off)
+		n, err := directio.RetryInterruptedIO(unix.Pwrite, int(f.Fd()), b, off)
 		if err != nil {
 			return err
 		}
@@ -92,7 +92,7 @@ func (s *Store) readData(p []byte, page, block uint64, pages, inner int) (done i
 		if s.preadData != nil {
 			read = s.preadData
 		}
-		n, readErr := read(int(s.file.Fd()), b, int64(page)*PageSize)
+		n, readErr := directio.RetryInterruptedIO(read, int(s.file.Fd()), b, int64(page)*PageSize)
 		// Preserve the page-at-a-time contract on short I/O: only complete
 		// data pages can be decrypted and delivered; a partial page is invalid.
 		complete := max(0, n) / PageSize
