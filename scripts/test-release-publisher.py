@@ -270,7 +270,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn('RELEASE_DEPENDENCIES:',job)
             build=text.split('\n  build:\n',1)[1].split('\n  publish:\n',1)[0]
             self.assertNotIn('bash scripts/release.sh',build)
-            self.assertIn('ref: ${{ github.workflow_sha }}\n          path: trusted/'+root.name,build)
+            self.assertIn("ref: ${{ needs.preflight.outputs.runtime_version && github.workflow_sha || 'b6516e9a9b354d9c43266ae06760e948c0ea260b' }}\n          path: trusted/"+root.name,build)
             self.assertIn('git -C trusted/',build)
             self.assertIn('archive --format=tar HEAD scripts',build)
             self.assertIn('RELEASE_SOURCE_ROOT="$PWD" bash /inputs/release/.ci/component-packaging/scripts/release.sh package',build)

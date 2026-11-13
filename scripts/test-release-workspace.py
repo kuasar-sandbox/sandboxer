@@ -40,23 +40,24 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         goroot = subprocess.check_output(['go', 'env', 'GOROOT'], cwd=self.root, env=self.env, text=True).strip()
         self.env['PATH'] = str(Path(goroot)/'bin') + os.pathsep + os.defpath
         self.make = shutil.which('make', path=os.defpath)
-        self.deps = ['accelerator'] + (['connector'] if OWNER != 'guest-runtime' else []) + (['sandboxer'] if OWNER == 'orchestrator' else [])
+        self.deps = ['accelerator', 'connector', 'guest-runtime']
         for name in set([OWNER, 'sandboxer', *self.deps]):
             p=self.root/name; p.mkdir()
             (p/'go.mod').write_text('module github.com/kuasar-sandbox/'+name+'\n\ngo 1.26.1\n')
             (p/'.gitignore').write_text('bin/\nbuild/\npackage.json\n')
         (self.root/'accelerator/selected.go').write_text('package accelerator\nconst Selected = "selected-local"\n')
         with (self.owner/'go.mod').open('a') as f:
-            f.write('require github.com/kuasar-sandbox/accelerator v0.1.10\n')
-        (self.owner/'main.go').write_text('package main\nimport ("fmt"; "github.com/kuasar-sandbox/accelerator")\nfunc main(){fmt.Print(accelerator.Selected)}\n')
+            f.write('require github.com/kuasar-sandbox/accelerator v0.1.10\nrequire github.com/kuasar-sandbox/guest-runtime v0.1.10\n')
+        (self.root/'guest-runtime/selected.go').write_text('package guestabi\nconst Selected = ""\n')
+        (self.owner/'main.go').write_text('package main\nimport ("fmt"; "github.com/kuasar-sandbox/accelerator"; guestabi "github.com/kuasar-sandbox/guest-runtime")\nfunc main(){fmt.Print(accelerator.Selected + guestabi.Selected)}\n')
         self.target = 'release-runtime' if OWNER == 'guest-runtime' else 'release'
         original=(ROOT/'Makefile').read_text()
         recursive=original[original.index('release_make ='):].split('\n\n',1)[0]
         recipe=original.split(self.target+':\n',1)[1].split('\n\n',1)[0]
-        variables = 'SHELL := /bin/bash\nBINDIR := bin/x86_64\nBUILD_DIR := build/x86_64\nTARGET_ARCH := x86_64\nSANDBOXER_DIR := ../sandboxer\nENVD := native-deps/bin/x86_64/envd\nVERSION := v0.1.99\nRUNTIME_VERSION := runtime-v0.1.99\n'
+        variables = 'SHELL := /bin/bash\nBINDIR := bin/x86_64\nBUILD_DIR := build/x86_64\nTARGET_ARCH := x86_64\nSANDBOXER_DIR := ../sandboxer\nENVD := native-deps/bin/x86_64/envd\nVERSION := v0.1.99\n'
         requirement=original[original.index('go_requirement ='):].split('\nACCELERATOR_VERSION',1)[0]
-        variables += 'GO := go\n'+recursive+'\n'+requirement+'\nACCELERATOR_VERSION ?= $(call go_requirement,accelerator)\n'
-        variables += ''.join(name.upper()+'_VERSION := v0.1.10\n' for name in set(self.deps+['sandboxer'])-{'accelerator'})
+        variables += 'GO := go\n'+recursive+'\n'+requirement+'\nACCELERATOR_VERSION ?= $(call go_requirement,accelerator)\nRUNTIME_VERSION ?= runtime-$(call go_requirement,guest-runtime)\n'
+        variables += ''.join(name.upper()+'_VERSION := v0.1.10\n' for name in set(self.deps+['sandboxer'])-{'accelerator', 'guest-runtime'})
         build = '\n.PHONY: release release-runtime build flatten-ctl sandbox-runtime\nbuild flatten-ctl:\n\t@mkdir -p "$(BINDIR)"\n\tgo build -o "$(BINDIR)/flatten-ctl" .\n'
         build += 'sandbox-runtime:\n\t@test "$(FLATTEN_CTL)" = "$(BINDIR)/flatten-ctl"\n\t@test "$$("$(FLATTEN_CTL)")" = selected-local\n\t@cp "$(FLATTEN_CTL)" "$(BINDIR)/sandbox-runtime.bundle"\n'
         # The release recipe is copied verbatim; only costly build/package boundaries are fixtures.
@@ -87,6 +88,7 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         for p in repositories:
             for args in (['init','-q'], ['add','.'], ['-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','fixture'], ['tag','v0.1.10']):
                 subprocess.run(['git','-C',str(p),*args], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.root/'guest-runtime'), 'tag', 'runtime-v0.1.10'], check=True)
         self.before = {p: p.read_bytes() for repo in repositories for p in (repo/'go.mod', repo/'go.sum')
                        if p.exists()}
 
@@ -120,6 +122,9 @@ class ReleaseWorkspaceTests(unittest.TestCase):
                 info = subprocess.check_output(['go', 'version', '-m', str(output/'flatten-ctl')],
                                                env=self.env, text=True)
                 self.assertIn('dep\tgithub.com/kuasar-sandbox/accelerator\tv0.1.10\t', info)
+                self.assertIn('dep\tgithub.com/kuasar-sandbox/guest-runtime\tv0.1.10\t', info)
+                self.assertEqual(package['RELEASE_GUEST_RUNTIME_VERSION'], 'runtime-v0.1.10')
+                self.assertEqual(package['RELEASE_GUEST_RUNTIME_SOURCE_DIR'], str(self.root/'guest-runtime'))
                 if OWNER=='guest-runtime':
                     self.assertEqual((output/'flatten-ctl').read_bytes(),(output/'sandbox-runtime.bundle').read_bytes())
                     self.assertEqual(Path(package['RELEASE_SANDBOX_INIT_BIN']).read_text(),'selected-published-init')
@@ -145,6 +150,21 @@ class ReleaseWorkspaceTests(unittest.TestCase):
                                             (workspace.parent / entry['New']['Path']).resolve())
                     for entry in document.get('Replace') or []}
         self.assertEqual(bindings, {'github.com/kuasar-sandbox/accelerator': ('v0.1.11', accelerator)})
+
+    def test_runtime_preview_binds_owner_to_prefixed_release_unit_tag(self):
+        preview = 'runtime-v0.1.11-preview.20261112'
+        runtime = self.root / 'guest-runtime'
+        subprocess.run(['git', '-C', str(runtime), 'tag', preview], check=True)
+        module = self.owner / 'go.mod'
+        module.write_text(module.read_text().replace('guest-runtime v0.1.10', 'guest-runtime v0.1.11'))
+        self.before[module] = module.read_bytes()
+        package = self.run_release('VERSION=v0.1.99-preview.20261112', 'RUNTIME_VERSION=' + preview)
+        self.assertEqual(package['RELEASE_GUEST_RUNTIME_VERSION'], preview)
+        workspace = Path(package['GOWORK'])
+        document = json.loads(subprocess.check_output(['go', 'work', 'edit', '-json', workspace], env=self.env))
+        bindings = {entry['Old']['Path']: (entry['Old'].get('Version'),
+                    (workspace.parent / entry['New']['Path']).resolve()) for entry in document.get('Replace') or []}
+        self.assertEqual(bindings, {'github.com/kuasar-sandbox/guest-runtime': ('v0.1.11', runtime)})
 
     @unittest.skipIf(OWNER == 'orchestrator', 'no native sub-build')
     def test_actual_native_recipe_does_not_inherit_product_output_directory(self):
@@ -195,7 +215,7 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         self.assertIn('uncommitted',self.run_release(success=False))
 
     def test_license_source_overrides_stop_before_build(self):
-        for name in ('RELEASE_SOURCE_ROOT','RELEASE_ACCELERATOR_SOURCE_DIR'):
+        for name in ('RELEASE_SOURCE_ROOT','RELEASE_ACCELERATOR_SOURCE_DIR','RELEASE_GUEST_RUNTIME_SOURCE_DIR'):
             with self.subTest(name=name):
                 self.assertIn('source directory',self.run_release(name+'='+str(self.root/'elsewhere'),success=False))
 

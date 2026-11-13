@@ -60,9 +60,9 @@ make cloud-hypervisor TARGET_ARCH=aarch64
 
 许可证和声明放在 `share/licenses/<component>`。声明缺失、目录不可读或遍历不完整时收集失败。包验证检查必需文件、载荷身份及归档路径、类型和权限。下载使用 GitHub 原生资产大小和摘要。新包和 Release 不携带来源或历史测试记录、独立 `SHA256SUMS`、来源/Preview 标记。发布者使用人类说明，检查本次构建输出，并拒绝覆盖同名不同内容资产。
 
-组件包包含 `sandbox-ctl`、`sandbox-init` 和 `cloud-hypervisor`。使用已有的
+组件包包含 `sandbox-ctl` 和 `cloud-hypervisor`；guest PID 1 由 `guest-runtime` 交付。使用已有的
 `RELEASE_*_SOURCE_DIR`、`RELEASE_*_SOURCE_SHA` 与 `RELEASE_*_VERSION`
-选择匹配的 Accelerator/Connector 源码。普通本地替换构建不要求远端目标 Tag。
+选择匹配的 Accelerator/Connector/Guest Runtime 源码；`RELEASE_GUEST_RUNTIME_VERSION` 使用 `runtime-v...` artifact Tag。普通本地替换构建不要求远端目标 Tag。
 Go VCS 记录必须匹配所选 sandboxer commit。
 
 Cloud Hypervisor 打包使用所选预构建二进制及其源码树,默认源码位置为

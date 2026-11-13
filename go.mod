@@ -3,7 +3,6 @@ module github.com/kuasar-sandbox/sandboxer
 go 1.26.1
 
 require (
-	github.com/moby/sys/user v0.4.0
 	google.golang.org/grpc v1.83.2
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -19,6 +18,7 @@ require (
 require (
 	github.com/kuasar-sandbox/accelerator v0.1.12
 	github.com/kuasar-sandbox/connector v0.1.8
+	github.com/kuasar-sandbox/guest-runtime v0.2.0
 	golang.org/x/crypto v0.56.0
 	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0

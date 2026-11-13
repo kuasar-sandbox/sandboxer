@@ -23,7 +23,6 @@ var archiveContract = map[string]entryContract{
 	"./bin/":                 {typeflag: tar.TypeDir, mode: 0o755},
 	"./bin/cloud-hypervisor": {typeflag: tar.TypeReg, mode: 0o755},
 	"./bin/sandbox-ctl":      {typeflag: tar.TypeReg, mode: 0o755},
-	"./bin/sandbox-init":     {typeflag: tar.TypeReg, mode: 0o755},
 	"./share/licenses/sandboxer/project/LICENSE":                            {typeflag: tar.TypeReg, mode: 0o644},
 	"./share/licenses/sandboxer/cloud-hypervisor/LICENSES/Apache-2.0.txt":   {typeflag: tar.TypeReg, mode: 0o644},
 	"./share/licenses/sandboxer/cloud-hypervisor/LICENSES/BSD-3-Clause.txt": {typeflag: tar.TypeReg, mode: 0o644},
@@ -94,6 +93,10 @@ func validateArchive(path string) error {
 		}
 
 		contract, ok := archiveContract[header.Name]
+		// Read historical sandboxer archives without requiring PID 1 in new ones.
+		if header.Name == "./bin/sandbox-init" {
+			contract, ok = entryContract{typeflag: tar.TypeReg, mode: 0o755}, true
+		}
 		if !ok {
 			contract, ok = materialContract(header.Name)
 			if !ok {
