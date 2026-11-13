@@ -178,7 +178,10 @@ assert "outputs: sandboxer/release-bundle" in build, "candidate bundle needs a c
 assert "outputs: sandboxer/build/release-archive-validator" in publish, "trusted parser needs a checked host-output boundary"
 assert "go build -p \"$KUASAR_BUILD_JOBS\"" in publish, "parser compilation must honor the task budget"
 PYWORKBENCH
-grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},runtime=${{ inputs.runtime_version }}]' \
+grep -Fqx "$(cat <<'TITLE'
+run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }}${{ inputs.runtime_version && format(',runtime={0}', inputs.runtime_version) || '' }}]
+TITLE
+)" \
   "$WORKFLOW" || fail "release run identity does not pin source and dependencies"
 workflow="$ROOT/.github/workflows/release.yml"
 for workflow in release.yml delete-preview.yml; do
@@ -188,6 +191,7 @@ for workflow in release.yml delete-preview.yml; do
 done
 [ ! -e "$ROOT/.github/workflows/reconcile-latest.yml" ] || fail "retired Latest writer remains"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-publisher.py"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-producer.py"
 for input in accelerator_version connector_version runtime_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
