@@ -83,15 +83,15 @@ func NewSingleRootBundlePublisher(
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	target := &singleRootBundleTarget{
+	writer := &bundleSourceWriter{
 		cfg: cfg, keyFn: keyFn, admission: admission,
 		location: location, directory: directory, logf: logf,
 		retry: defaultLocationRetryPolicy, fs: osLocationFileSystem{},
 	}
-	return newPublisher(nil, locations, target, logf), nil
+	return newPublisher(nil, locations, &singleRootBundleTarget{bundleSourceWriter: writer}, logf), nil
 }
 
-type singleRootBundleTarget struct {
+type bundleSourceWriter struct {
 	cfg       *config.ManifestConfig
 	keyFn     ingest.CustomerKeyFunc
 	admission store.WriteAdmission
@@ -102,7 +102,10 @@ type singleRootBundleTarget struct {
 	fs        locationFileSystem
 	// beforeCommit is a deterministic pathname-race hook used only by tests.
 	beforeCommit func(string)
+}
 
+type singleRootBundleTarget struct {
+	*bundleSourceWriter
 	mu   sync.Mutex
 	used bool
 }
@@ -115,9 +118,14 @@ func (t *singleRootBundleTarget) Put(ctx context.Context, role LogicalRole, sour
 	}
 	t.used = true
 	t.mu.Unlock()
+	return t.bundleSourceWriter.Put(ctx, role, source)
+}
 
+// Each logical object gets one fully verified, single-root Bundle. A graph
+// publisher can reuse the writer for dependencies and finally the root.
+func (t *bundleSourceWriter) Put(ctx context.Context, role LogicalRole, source sparse.Source) (string, error) {
 	switch role {
-	case RoleImage, RoleSandbox, RoleSnapshot:
+	case RoleImage, RoleOverlay, RoleSandbox, RoleSnapshot:
 	default:
 		return "", fmt.Errorf("single-root Bundle: unsupported root role %q", role)
 	}
@@ -255,7 +263,7 @@ func (t *singleRootBundleTarget) Put(ctx context.Context, role LogicalRole, sour
 
 // reuseFinal waits for a concurrent direct writer to finish. Every read pins
 // the opened inode; ownership is checked again after validating its content.
-func (t *singleRootBundleTarget) reuseFinal(
+func (t *bundleSourceWriter) reuseFinal(
 	ctx context.Context, target *locationPublishTarget, path string,
 	validate func(locationReadFile, os.FileInfo) error,
 ) error {
@@ -316,4 +324,4 @@ func (t *singleRootBundleTarget) reuseFinal(
 	}
 }
 
-func (*singleRootBundleTarget) Close() error { return nil }
+func (*bundleSourceWriter) Close() error { return nil }

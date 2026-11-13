@@ -6,9 +6,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -20,8 +23,17 @@ func TestCheckpointBundleSnapshotPublishesOrdinaryArtifacts(t *testing.T) {
 	for _, external := range []bool{false, true} {
 		t.Run(map[bool]string{false: "contained", true: "external"}[external], func(t *testing.T) {
 			ctx := context.Background()
-			f := newDiffCheckpointFixture(t)
-			cfg, storage := manifestPublisherFixture(t)
+			cfg, customerKey := sourceBundleConfig(manifestcrypto.LocalOff)
+			storage, err := NewProcessStorageWithCustomerKey(cfg, func() ([32]byte, error) { return customerKey, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = storage.Close() })
+			baseDir := t.TempDir()
+			_, basePath := overlayBundleFixture(t, cfg, storage, baseDir)
+			baseName := filepath.Base(basePath)
+			parent := "file://" + baseName + "@manifest:" + strings.TrimSuffix(baseName, ".bundle") + "@location:base"
+			f := newDiffCheckpointFixture(t, parent)
 			admission, err := cfg.WriteAdmission(ctx)
 			if err != nil {
 				t.Fatal(err)
@@ -42,6 +54,7 @@ func TestCheckpointBundleSnapshotPublishesOrdinaryArtifacts(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			capturedE := e
 			if external {
 				ref, _ := manifest.ParseRef(f.ref)
 				ref.Location = "source"
@@ -79,9 +92,21 @@ func TestCheckpointBundleSnapshotPublishesOrdinaryArtifacts(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			openBundle := func(out, raw string) *OpenedFile {
+				t.Helper()
+				ref, err := manifest.ParseRef(raw)
+				if err != nil || ref.Location != "published" || ref.DigestScheme != "manifest" || ref.Path != ref.Digest+".bundle" {
+					t.Fatalf("expected published Manifest Bundle, got %q: %v", raw, err)
+				}
+				stream, err := storage.OpenFileWithLocations(ctx, filepath.Join(out, ref.Path), ref, config.RefLocations{"published": out})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return stream
+			}
 			for _, rewrite := range []bool{false, true} {
 				out := t.TempDir()
-				p, err := NewLocationPublisher(storage, "published", out, config.RefLocations{"source": f.dir}, nil)
+				p, err := NewLocationPublisher(storage, "published", out, config.RefLocations{"source": f.dir, "base": baseDir}, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -94,8 +119,56 @@ func TestCheckpointBundleSnapshotPublishesOrdinaryArtifacts(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				if !rewrite {
+					// A subsequent tarstream input on the very same publisher
+					// still selects the original named tarstream target.
+					plain, err := p.Publish(ctx, f.path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					tarRef, err := manifest.ParseRef(plain.Ref)
+					if err != nil || filepath.Ext(tarRef.Path) != ".sandbox" || tarRef.DigestScheme != "hmac" {
+						t.Fatalf("publishing a Bundle changed later tarstream output: %s (%v)", plain.Ref, err)
+					}
+				}
 				if err := p.Close(); err != nil {
 					t.Fatal(err)
+				}
+				if !rewrite {
+					s, err := snapshotfile.Open(ctx, openBundle(out, result.Ref))
+					if err != nil {
+						t.Fatal(err)
+					}
+					sconfig, err := snapshot.ParseConfig(s.SnapshotConfig)
+					if err != nil || sconfig.SandboxRef != result.SandboxRef {
+						t.Fatalf("published Snapshot disagrees with reported Sandbox: %v, %v", sconfig, err)
+					}
+					memory := make([]byte, 8192)
+					if _, err := s.Memory.ReadAt(ctx, memory, 0); err != nil || !bytes.Equal(memory, bytes.Repeat([]byte{0x77}, len(memory))) {
+						t.Fatalf("published Snapshot lost captured memory: %v", err)
+					}
+					if err := s.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if !external {
+						// Select E directly, as a disk-only export does. The result must
+						// also agree with the E linked from the materialized Snapshot.
+						eKey, err := manifest.ParseKeyRef(capturedE)
+						if err != nil {
+							t.Fatal(err)
+						}
+						ePub, err := NewLocationPublisher(storage, "published", out, nil, nil)
+						if err != nil {
+							t.Fatal(err)
+						}
+						disk, err := ePub.Publish(ctx, "file://"+path+"@manifest:"+manifest.HexKey(eKey))
+						if err := errors.Join(err, ePub.Close()); err != nil {
+							t.Fatal(err)
+						}
+						if disk.Role != RoleSandbox || disk.Ref != result.SandboxRef || disk.SandboxRef != disk.Ref {
+							t.Fatalf("disk-only publication returned %+v, expected %s", disk, result.SandboxRef)
+						}
+					}
 				}
 				ref, err := manifest.ParseRef(result.SandboxRef)
 				if err != nil {
@@ -118,6 +191,18 @@ func TestCheckpointBundleSnapshotPublishesOrdinaryArtifacts(t *testing.T) {
 				}
 				if !bytes.Equal(buf, bytes.Repeat([]byte{1}, 4096)) {
 					t.Fatal("Bundle publication lost pinned data")
+				}
+				if !rewrite {
+					if !slices.Contains(root.Portable.Boot.Root.BaseFromRefs, parent) {
+						t.Fatal("materialization dropped the immutable base's located selector")
+					}
+					for i, disk := range root.Portable.Boot.Disks {
+						data := openBundle(out, disk.Base)
+						_, readErr := data.ReadAt(ctx, buf, 0)
+						if err := errors.Join(readErr, data.Close()); err != nil || !bytes.Equal(buf, bytes.Repeat([]byte{byte(i + 2)}, len(buf))) {
+							t.Fatalf("materialization lost data disk %d: %v", i, err)
+						}
+					}
 				}
 				if err := root.Close(); err != nil {
 					t.Fatal(err)
