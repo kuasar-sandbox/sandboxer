@@ -349,6 +349,31 @@ func selectedBundleCarrier(current, selected string) string {
 }
 
 func (p *Publisher) publishCheckpointBundle(ctx context.Context, raw string, scope publishScope) (PublishResult, error) {
+	// Materializing pinned DIFF versions changes E's logical contents. The
+	// snapshot must then reference that new E. Re-encode the graph in the
+	// input Bundle format when publishing to a named directory.
+	if location, ok := p.target.(*locationPublishTarget); ok && location.location != "" {
+		if p.storage.cfg == nil {
+			return PublishResult{}, errors.New("publish checkpoint Bundle: manifest configuration is required")
+		}
+		admission, err := p.storage.cfg.WriteAdmission(ctx)
+		if err != nil {
+			return PublishResult{}, err
+		}
+		key := p.storage.CustomerKeyFunc()
+		if err := ValidateSingleRootBundlePublication(p.storage.cfg, key, admission); err != nil {
+			return PublishResult{}, err
+		}
+		p.target = &bundleSourceWriter{
+			cfg: p.storage.cfg, keyFn: key, admission: admission,
+			location: location.location, directory: location.directory, logf: location.logf,
+			retry: location.retry, fs: location.fs,
+		}
+		// The same Publisher can also publish tarstream inputs. Cached
+		// references from that format must not enter this Bundle graph.
+		p.diskMemo = make(map[string]string)
+		p.memoryMemo = make(map[string]string)
+	}
 	stream, child, err := p.open(ctx, raw, scope)
 	if err != nil {
 		return PublishResult{}, err
