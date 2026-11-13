@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"golang.org/x/sys/unix"
 )
 
@@ -80,7 +81,7 @@ func Open(baseDir, sandboxID, epoch string, start time.Time, sample, flush time.
 	}
 	// The current run must fit the existing Guest usage_request contract;
 	// persisted strings and metric/source identities retain their codec limit.
-	if epoch == "" || len(epoch) > 128 || !validText(epoch) {
+	if epoch == "" || len(epoch) > proto.MaxUsageRunEpochBytes || !validText(epoch) {
 		return nil, errors.New("usage: invalid run epoch")
 	}
 	dirFD, err := unix.Open(baseDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)

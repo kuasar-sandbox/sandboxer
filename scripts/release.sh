@@ -133,12 +133,13 @@ validate_bundle() {
   release_materials_require_license "$extract" "$NAME" rust-toolchain
   release_materials_require_license "$extract" "$NAME" rust
   release_materials_validate_go "$extract" "$NAME" bin/sandbox-ctl
-  release_materials_validate_go "$extract" "$NAME" bin/sandbox-init
-  local file
-  for file in sandbox-ctl sandbox-init; do
-    [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
-    check_go_binary "$extract/bin/$file" "$arch"
-  done
+  check_go_binary "$extract/bin/sandbox-ctl" "$arch"
+  # Historical sandboxer releases owned PID 1. Keep validating their payload
+  # and notices, while new packages below produce host artifacts only.
+  if [ -f "$extract/bin/sandbox-init" ]; then
+    release_materials_validate_go "$extract" "$NAME" bin/sandbox-init
+    check_go_binary "$extract/bin/sandbox-init" "$arch"
+  fi
   [ -x "$extract/bin/cloud-hypervisor" ] \
     || fail "$archive is missing executable bin/cloud-hypervisor"
   check_target_binary "$extract/bin/cloud-hypervisor" "$arch"
@@ -148,6 +149,7 @@ package_release() {
   [ "$#" -eq 3 ] || fail "usage: release.sh package <version> <arch> <output-dir>"
   local version="$1" arch output="$3" archive epoch bin_dir ch_source project_sha cargo_sha
   local accelerator_source connector_source accelerator_version connector_version accelerator_sha connector_sha
+  local guest_runtime_source guest_runtime_version guest_runtime_sha
   arch="$(normalize_arch "$2")"
   archive="$(archive_name "$version" "$arch")"
   if [ -z "$output" ] || [ "$output" = / ] || [ "$output" = . ]; then
@@ -164,12 +166,16 @@ package_release() {
 
   accelerator_source="${RELEASE_ACCELERATOR_SOURCE_DIR:-$ROOT/../accelerator}"
   connector_source="${RELEASE_CONNECTOR_SOURCE_DIR:-$ROOT/../connector}"
+  guest_runtime_source="${RELEASE_GUEST_RUNTIME_SOURCE_DIR:-$ROOT/../guest-runtime}"
   accelerator_version="${RELEASE_ACCELERATOR_VERSION:-${ACCELERATOR_VERSION:-}}"
   connector_version="${RELEASE_CONNECTOR_VERSION:-${CONNECTOR_VERSION:-}}"
+  guest_runtime_version="${RELEASE_GUEST_RUNTIME_VERSION:-${RUNTIME_VERSION:-}}"
   [[ "$accelerator_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
     || fail "RELEASE_ACCELERATOR_VERSION must identify the selected accelerator release"
   [[ "$connector_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
     || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
+  [[ "$guest_runtime_version" =~ ^runtime-v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
+    || fail "RELEASE_GUEST_RUNTIME_VERSION must identify the selected runtime release"
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" sandboxer)"
   local project_version
   project_version="$(release_materials_git_version "$ROOT" "$version" "$project_sha")"
@@ -177,12 +183,11 @@ package_release() {
     "${RELEASE_ACCELERATOR_SOURCE_SHA:-}" accelerator)"
   connector_sha="$(release_materials_resolve_git_source "$connector_source" \
     "${RELEASE_CONNECTOR_SOURCE_SHA:-}" connector)"
+  guest_runtime_sha="$(release_materials_resolve_git_source "$guest_runtime_source" \
+    "${RELEASE_GUEST_RUNTIME_SOURCE_SHA:-}" guest-runtime)"
   copy_executable "$bin_dir/sandbox-ctl" bin/sandbox-ctl
-  copy_executable "$bin_dir/sandbox-init" bin/sandbox-init
   check_go_binary "$STAGE/bin/sandbox-ctl" "$arch"
-  check_go_binary "$STAGE/bin/sandbox-init" "$arch"
   release_materials_require_go_revision "$STAGE/bin/sandbox-ctl" "$project_sha"
-  release_materials_require_go_revision "$STAGE/bin/sandbox-init" "$project_sha"
   copy_executable "$bin_dir/cloud-hypervisor" bin/cloud-hypervisor
   check_target_binary "$STAGE/bin/cloud-hypervisor" "$arch"
   ch_source="${RELEASE_CLOUD_HYPERVISOR_SOURCE_DIR:-${CLOUD_HYPERVISOR_SRC:-$ROOT/native-deps/build/src/cloud-hypervisor}}"
@@ -198,18 +203,20 @@ package_release() {
   cargo_sha="$(sha256sum "$ch_source/Cargo.lock" | awk '{print $1}')"
   accelerator_version="$(release_materials_git_version "$accelerator_source" "$accelerator_version" "$accelerator_sha")"
   connector_version="$(release_materials_git_version "$connector_source" "$connector_version" "$connector_sha")"
+  guest_runtime_version="$(release_materials_git_version "$guest_runtime_source" "$guest_runtime_version" "$guest_runtime_sha")"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"
   release_materials_copy_licenses "$ROOT" project
   release_materials_copy_licenses "$ch_source" cloud-hypervisor
   release_materials_copy_licenses "$accelerator_source" accelerator
   release_materials_copy_licenses "$connector_source" connector
+  release_materials_copy_licenses "$guest_runtime_source" guest-runtime
   python3 "${TOOL_ROOT:-$ROOT}/scripts/release-rust-materials.py" \
     --metadata "$WORK/ch-metadata.json" --build-report "$ch_report" \
     --lock "$ch_source/Cargo.lock" --cargo-home "$cargo_home" \
     --source-root "$ch_source" --stage "$STAGE" --rustc "$rustc_path" \
     >> "$RELEASE_MATERIALS_WORK/sources"
   release_native_link_inputs "$ch_map" "$ch_output" "$ch_output" bin/cloud-hypervisor
-  release_materials_record_source 'bin/sandbox-ctl,bin/sandbox-init' sandboxer "$project_version" \
+  release_materials_record_source bin/sandbox-ctl sandboxer "$project_version" \
     "https://github.com/kuasar-sandbox/sandboxer/commit/$project_sha" \
     "git:$project_sha" project
   release_materials_record_source bin/cloud-hypervisor cloud-hypervisor v51.1 \
@@ -227,8 +234,10 @@ package_release() {
   release_materials_record_source bin/sandbox-ctl connector "$connector_version" \
     "https://github.com/kuasar-sandbox/connector/commit/$connector_sha" \
     "git:$connector_sha" connector
+  release_materials_record_source bin/sandbox-ctl guest-runtime "$guest_runtime_version" \
+    "https://github.com/kuasar-sandbox/guest-runtime/commit/$guest_runtime_sha" \
+    "git:$guest_runtime_sha" guest-runtime
   release_materials_add_go_binary "$STAGE/bin/sandbox-ctl" bin/sandbox-ctl
-  release_materials_add_go_binary "$STAGE/bin/sandbox-init" bin/sandbox-init
   release_materials_finish
 
   mkdir -p "$output/assets"

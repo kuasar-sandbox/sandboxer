@@ -457,7 +457,7 @@ Cold 和 restore 使用当前 [Host usage 配置](configuration_zh.md#usage-poli
 磁盘按累计 checkpoint 增长, 不按秒级样本增长. 记录大小取决于 vCPU/磁盘数、
 来源字符串及 varint 数值, 1 KiB 不是实测常数. CPU/Gauge 归并及保存测试位于
 [pkg/usage](../pkg/usage), 协议及阻塞来源测试属于
-[guestlink](../pkg/guestlink) 和 [sandbox-init](../cmd/sandbox-init).
+[guestlink](../pkg/guestlink) 和 [sandbox-init](https://github.com/kuasar-sandbox/guest-runtime/tree/main/cmd/sandbox-init).
 组件自有 [usage E2E](../test/e2e/cases/telemetry.usage.sh) 由
 平台预备工作区运行器 发现, 必须使用真实 KVM, 并核验 Guest 内
 运行的 init 哈希与所提供的新 runtime bundle 一致. 短保存周期案例验证集成.

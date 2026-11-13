@@ -2,7 +2,8 @@
   "schema": 1,
   "recipe": "scripts/build-e2e-helpers.sh",
   "dependencies": [
-    "accelerator"
+    "accelerator",
+    "guest-runtime"
   ],
   "helpers": [
     {

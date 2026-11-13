@@ -183,6 +183,29 @@ if (WORK="$TMP/validation" release_materials_validate_go "$altered" fixture bin/
   fail "validator accepted original-module notices instead of the effective replacement"
 fi
 
+# The selected runtime ABI is a supported sibling dependency, including a
+# Preview workspace replacement. Its notices use the source-bound owner label.
+mkdir -p "$TMP/guest-runtime" "$TMP/runtime-consumer"
+printf 'module github.com/kuasar-sandbox/guest-runtime\n\ngo 1.24\n' > "$TMP/guest-runtime/go.mod"
+printf 'package guestabi\nfunc Value() int { return 1 }\n' > "$TMP/guest-runtime/abi.go"
+printf 'fixture runtime ABI license\n' > "$TMP/guest-runtime/LICENSE"
+printf 'module github.com/kuasar-sandbox/sandboxer\n\ngo 1.24\nrequire github.com/kuasar-sandbox/guest-runtime v0.2.0\nreplace github.com/kuasar-sandbox/guest-runtime => ../guest-runtime\n' > "$TMP/runtime-consumer/go.mod"
+printf 'package main\nimport abi "github.com/kuasar-sandbox/guest-runtime"\nfunc main() { println(abi.Value()) }\n' > "$TMP/runtime-consumer/main.go"
+(cd "$TMP/runtime-consumer" && go build -o "$TMP/runtime-abi-tool" .)
+release_materials_init "$TMP/runtime-stage" "$TMP/runtime-work" sandboxer
+release_materials_add_go_binary "$TMP/runtime-abi-tool" bin/sandbox-ctl
+release_materials_finish
+mkdir -p "$TMP/runtime-stage/share/licenses/sandboxer/guest-runtime" "$TMP/runtime-stage/bin"
+install -m 0644 "$TMP/guest-runtime/LICENSE" "$TMP/runtime-stage/share/licenses/sandboxer/guest-runtime/LICENSE"
+install -m 0755 "$TMP/runtime-abi-tool" "$TMP/runtime-stage/bin/sandbox-ctl"
+WORK="$TMP/validation" release_materials_validate_go "$TMP/runtime-stage" sandboxer bin/sandbox-ctl
+rm "$TMP/runtime-stage/share/licenses/sandboxer/guest-runtime/LICENSE"
+if (WORK="$TMP/validation" release_materials_validate_go "$TMP/runtime-stage" sandboxer bin/sandbox-ctl > "$TMP/runtime-notices.log" 2>&1); then
+  fail "validator accepted missing selected runtime ABI notices"
+fi
+grep -Fq 'license material is missing or empty: guest-runtime' "$TMP/runtime-notices.log" \
+  || fail "runtime ABI notices failed for an unrelated reason"
+
 (cd "$TMP/consumer" && GOEXPERIMENT=arenas go build -o "$TMP/experimental-tool" .)
 release_materials_init "$TMP/experiment-stage" "$TMP/experiment-work" fixture
 release_materials_add_go_binary "$TMP/experimental-tool" bin/tool

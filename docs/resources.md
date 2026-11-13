@@ -548,7 +548,7 @@ Storage grows by cumulative checkpoints, not per-second samples. Record size
 depends on vCPU/disk count, source strings and varint magnitudes; 1 KiB is not
 a measured constant. CPU/Gauge aggregation and persistence tests are in
 [`pkg/usage`](../pkg/usage); protocol and blocking-source tests live with
-[`guestlink`](../pkg/guestlink) and [`sandbox-init`](../cmd/sandbox-init).
+[`guestlink`](../pkg/guestlink) and [`sandbox-init`](https://github.com/kuasar-sandbox/guest-runtime/tree/main/cmd/sandbox-init).
 The component-owned [usage E2E](../test/e2e/cases/telemetry.usage.sh) is discovered by
 the platform prepared-workspace runner, requires real KVM, and verifies the
 running Guest init hash against the supplied freshly rebuilt runtime bundle.
