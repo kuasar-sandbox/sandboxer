@@ -34,9 +34,9 @@ Snapshot reuse is represented by explicit parent and child references. Multiple 
 | Binary | Purpose |
 | --- | --- |
 | `sandbox-ctl` | Host CLI: run/restore, exec, snapshot, export, reset, checkpoint administration, usage, info, publish and configuration |
-| `sandbox-init` | Guest PID 1: staged initialization, application supervision, vsock control, stdio multiplexing, and guest lifecycle responses |
+| `cloud-hypervisor` | Patched host VMM for external memory, UFFD, balloon and lifecycle operations |
 
-`sandbox-init` is built here and packaged into `sandbox-runtime.bundle` by [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime).
+[`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime) owns and builds `sandbox-init`, publishes it in its `runtime-v...` archive, and embeds the same binary as `/sbin/init` in `sandbox-runtime.bundle`. This repository consumes its public guest ABI as a Go module dependency.
 
 ## Public integration packages
 
@@ -52,8 +52,11 @@ Snapshot reuse is represented by explicit parent and child references. Multiple 
 | `pkg/uffd`, `pkg/memory` | On-demand memory loading and memfd ownership |
 | `pkg/vhost` | vhost-user-blk transport, queues and guest memory |
 | `pkg/diffstore` | [Writable disks, shared cache and single-layer/checkpoint storage](docs/block-storage.md) |
-| `pkg/guestlink`, `pkg/mux`, `pkg/proto`, `pkg/fwd`, `pkg/stdio` | Host/guest control, multiplexing, and forwarding |
+| `pkg/guestlink`, `pkg/stdio` | Host-side guest control and stdio integration |
+| `pkg/mux`, `pkg/proto`, `pkg/fwd` | Source-compatible aliases/forwarders to `guest-runtime/pkg/guestabi/{mux,proto,fwd}` |
 | `pkg/config`, `pkg/resctl`, `pkg/chapi`, `pkg/tapfd` | Runtime configuration, resource execution, Cloud Hypervisor API, and TAP handoff |
+
+Upstream Go consumers (including `orchestrator`) retain the existing sandboxer SDK and compatibility import paths. Their source workspace and selected release dependency closure must also include `guest-runtime`; guest code depends only on its own ABI packages, never on the host SDK.
 
 ## Data paths
 
@@ -78,8 +81,8 @@ steps; the publisher executes the trusted workflow revision's archive parser
 compiled in Workbench through `RELEASE_ARCHIVE_VALIDATOR`.
 
 ```bash
-make build                      # sandbox-ctl and sandbox-init
-make sandbox-ctl sandbox-init   # explicit binary targets
+make build                      # sandbox-ctl and patched cloud-hypervisor
+make sandbox-ctl                 # Go host binary only
 make build TARGET_ARCH=aarch64  # cross-compile; amd64/arm64 aliases are accepted
 make vet test                   # static checks and unit tests
 make test-e2e-scripts           # source/helper regressions; not product E2E
@@ -123,10 +126,11 @@ The Go import surface is intentionally narrow:
 | --- | --- | --- |
 | `accelerator` | Manifest, cache/store clients, sparse/image helpers | Snapshot ingest/fetch, block reads, and flattened-image configuration |
 | `connector` | `pkg/tapfd` | Receive TAP and network-namespace file descriptors |
+| `guest-runtime` | `pkg/guestabi/{proto,mux,fwd}` | Guest control protocol, multiplexing and forwarding; no host lifecycle dependency in the guest |
 
 Standalone Go builds use the obtainable dependency versions committed in `go.mod`.
-For a coordinated Preview build, check out the selected `sandboxer`, `accelerator`
-and `connector` tags and generate a workspace containing exactly those three modules:
+For a coordinated Preview build, check out the selected `sandboxer`, `accelerator`,
+`connector` and `guest-runtime` tags and generate their dependency workspace:
 
 ```bash
 GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners sandboxer)" || exit 1
@@ -145,9 +149,9 @@ Shared Preview retention, cleanup, asset-completeness checks and Latest reconcil
 
 The selected owner source declares its complete compiled E2E helper inventory in `release/helper-inputs.json`. Its recipe, `scripts/build-e2e-helpers.sh`, accepts the target architecture and a fresh output directory. It runs only during the source-build stage with the admitted dependency workspace; package preparation and case execution consume its verified binaries. Internal build targets and package paths remain owned here.
 
-`make release` verifies `ACCELERATOR_VERSION` and `CONNECTOR_VERSION` against clean sibling checkouts, generates the same Go workspace, then builds and packages those outputs. Set `KUASAR_PLATFORM_DIR` when the project checkout is not at `../kuasar-sandbox`. Missing tags, modules or conflicting source directories stop before compilation. Packages retain licenses and runtime files; they do not carry source or test records.
+`make release` verifies `ACCELERATOR_VERSION`, `CONNECTOR_VERSION` and `RUNTIME_VERSION` against clean sibling checkouts, binds the selected dependencies, then builds and packages those outputs. `RUNTIME_VERSION` is the artifact tag `runtime-vX.Y.Z` (or its Preview); the root `guest-runtime` Go module requirement is `vX.Y.Z`. Stable builds use committed `go.mod`/`go.sum` with `GOWORK=off`; Preview builds bind selected upstream Preview sources without downloading an unpublished future core. Set `KUASAR_PLATFORM_DIR` when the project checkout is not at `../kuasar-sandbox`. Missing tags, modules or conflicting source directories stop before compilation. Packages retain licenses and runtime files; they do not carry source or test records.
 
-`sandboxer` publishes independent component versions named `vX.Y.Z`. Each published native-architecture archive contains `sandbox-ctl`, `sandbox-init`, and the patched `cloud-hypervisor` binary. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Internal design documents and source-only tests remain in the source repositories.
+`sandboxer` publishes independent component versions named `vX.Y.Z`. New native-architecture archives contain only `sandbox-ctl` and the patched `cloud-hypervisor` binary, plus their notices. Historical sandboxer archives that contain `sandbox-init` remain readable and validated; new assembly obtains PID 1 from the selected runtime archive. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Internal design documents and source-only tests remain in the source repositories.
 
 The project repository publishes an independently numbered aggregate `release-vX.Y.Z`, selecting an exact `sandboxer` tag together with exact versions of the other release units and validating the combined system.
 
@@ -169,7 +173,7 @@ needed to understand one state owner or boundary.
 | [Memory](docs/memory.md) | Understand lazy restore and checkpoint memory | Memfd ownership, UFFD, layered reads, released pages and dirty history |
 | [Block storage](docs/block-storage.md) | Integrate Disk, operate disk checkpoints and diagnose block I/O | Vhost transport, immutable lowers, cache, DIFF v3/v4 and reclamation |
 | [Resources](docs/resources.md) | Set resource policy and read usage | Capacity/Budget, cgroups, balloon, resource protocol and cumulative accounting |
-| [Guest ABI](docs/guest-abi.md) | Prepare workloads or change host/Guest integration | sandbox-init phases, processes, filesystem, vsock, MUX and raw observations |
+| [Guest ABI](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/guest-abi.md) | Prepare workloads or change host/Guest integration | sandbox-init phases, processes, filesystem, vsock, MUX and raw observations |
 | [VMM](docs/vmm.md) | Build a compatible monitor or maintain patches | Cloud Hypervisor/KVM integration, device model, handoffs and patch contracts |
 
 All eight topics have complete English and Chinese editions. Native-build and
@@ -182,7 +186,7 @@ defines ownership and how to preserve maintained contracts when reorganizing.
 - node and cluster orchestration belongs to [`orchestrator`](https://github.com/kuasar-sandbox/orchestrator);
 - data access, storage, encryption, and caching belong to [`accelerator`](https://github.com/kuasar-sandbox/accelerator);
 - MicroVM networking belongs to [`connector`](https://github.com/kuasar-sandbox/connector);
-- guest runtime image and kernel artifacts belong to [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime);
+- guest PID 1, guest ABI, runtime image and kernel artifacts belong to [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime);
 - system-level design, shared integration tests, and aggregate releases belong to [`kuasar-sandbox/kuasar-sandbox`](https://github.com/kuasar-sandbox/kuasar-sandbox).
 
 ## Contributing and security

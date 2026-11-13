@@ -31,9 +31,9 @@ Snapshot 复用由显式 parent/child 引用表示。从同一 template 创建�
 | 二进制 | 用途 |
 | --- | --- |
 | `sandbox-ctl` | Host CLI：run/restore、exec、snapshot、export、reset、checkpoint 管理、usage、info、publish 与配置 |
-| `sandbox-init` | Guest PID 1:分阶段初始化、应用监督、vsock 控制、stdio 多路复用和 guest 生命周期响应 |
+| `cloud-hypervisor` | 支持 external memory、UFFD、balloon 与生命周期操作的 patched host VMM |
 
-`sandbox-init` 在本仓构建,再由 [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime) 打包进 `sandbox-runtime.bundle`。
+[`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime) 维护并构建 `sandbox-init`，在 `runtime-v...` archive 中发布，并把同一二进制内嵌为 `sandbox-runtime.bundle` 的 `/sbin/init`。本仓通过 Go 模块依赖消费其公共 guest ABI。
 
 ## 公开集成 package
 
@@ -49,8 +49,11 @@ Snapshot 复用由显式 parent/child 引用表示。从同一 template 创建�
 | `pkg/uffd`、`pkg/memory` | 按需 memory 加载与 memfd 所有权 |
 | `pkg/vhost` | vhost-user-blk 传输、队列与 Guest 内存 |
 | `pkg/diffstore` | [可写磁盘、共享缓存、单层/checkpoint 存储](docs/block-storage_zh.md) |
-| `pkg/guestlink`、`pkg/mux`、`pkg/proto`、`pkg/fwd`、`pkg/stdio` | Host/guest 控制、多路复用和 forwarding |
+| `pkg/guestlink`、`pkg/stdio` | Host 侧 guest 控制与 stdio 集成 |
+| `pkg/mux`、`pkg/proto`、`pkg/fwd` | 到 `guest-runtime/pkg/guestabi/{mux,proto,fwd}` 的兼容别名与转发 |
 | `pkg/config`、`pkg/resctl`、`pkg/chapi`、`pkg/tapfd` | Runtime 配置、资源执行、Cloud Hypervisor API 和 TAP 交接 |
+
+上层 Go consumer（包括 `orchestrator`）继续使用既有 sandboxer SDK 与兼容 import 路径；其源码工作区和选定的发行依赖闭包也需包含 `guest-runtime`。Guest 代码仅依赖自身 ABI 包，不反向依赖 host SDK。
 
 ## 数据路径
 
@@ -73,8 +76,8 @@ cache 均属于本次任务. 产品 E2E 仍使用精确预构建制品. 发布�
 受信 workflow revision 对应的归档解析器.
 
 ```bash
-make build                      # sandbox-ctl and sandbox-init
-make sandbox-ctl sandbox-init   # explicit binary targets
+make build                      # sandbox-ctl and patched cloud-hypervisor
+make sandbox-ctl                 # Go host binary only
 make build TARGET_ARCH=aarch64  # cross-compile; amd64/arm64 aliases are accepted
 make vet test                   # static checks and unit tests
 make test-e2e-scripts           # 源码与测试辅助代码回归；不是产品 E2E
@@ -116,8 +119,9 @@ Go import surface 保持窄边界:
 | --- | --- | --- |
 | `accelerator` | Manifest、cache/store client、sparse/image helper | Snapshot ingest/fetch、block read 和 flattened-image 配置 |
 | `connector` | `pkg/tapfd` | 接收 TAP 与 network namespace file descriptor |
+| `guest-runtime` | `pkg/guestabi/{proto,mux,fwd}` | Guest 控制协议、多路复用与转发；guest 不依赖 host 生命周期实现 |
 
-独立 Go 构建使用 `go.mod` 中真实可获取的依赖版本。协调 Preview 构建时，检出选定的 `sandboxer`、`accelerator`、`connector` Tag，并只为这三个模块生成工作区：
+独立 Go 构建使用 `go.mod` 中真实可获取的依赖版本。协调 Preview 构建时，检出选定的 `sandboxer`、`accelerator`、`connector` 和 `guest-runtime` Tag，并生成其依赖工作区：
 
 ```bash
 GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners sandboxer)" || exit 1
@@ -134,9 +138,9 @@ make build
 
 所选 owner 源码在 `release/helper-inputs.json` 声明完整的编译型 E2E helper 清单。配方 `scripts/build-e2e-helpers.sh` 接收目标架构和全新的输出目录，仅在源码构建阶段使用已准入的依赖工作区执行；打包 prepare 和用例执行消费经校验的二进制。内部构建目标和包路径由本仓维护。
 
-`make release` 先核对 `ACCELERATOR_VERSION`、`CONNECTOR_VERSION` 与干净的相邻源码 checkout，生成同一 Go workspace，再编译并打包本次输出。项目 checkout 不在 `../kuasar-sandbox` 时设置 `KUASAR_PLATFORM_DIR`。缺 Tag、缺模块或源码目录冲突会在编译前停止。包内保留许可证及运行文件，不携带来源或历史测试记录。
+`make release` 先核对 `ACCELERATOR_VERSION`、`CONNECTOR_VERSION`、`RUNTIME_VERSION` 与干净的相邻源码 checkout，绑定选定依赖，再编译并打包本次输出。`RUNTIME_VERSION` 使用 artifact Tag `runtime-vX.Y.Z`（或 Preview），根 `guest-runtime` Go 模块依赖使用 `vX.Y.Z`。Stable 在 `GOWORK=off` 下使用已提交的 `go.mod`/`go.sum`；Preview 绑定选定的上游 Preview 源码，不下载尚未发布的未来 core。项目 checkout 不在 `../kuasar-sandbox` 时设置 `KUASAR_PLATFORM_DIR`。缺 Tag、缺模块或源码目录冲突会在编译前停止。包内保留许可证及运行文件，不携带来源或历史测试记录。
 
-`sandboxer` 独立发布 `vX.Y.Z` 组件版本。已发布原生架构的 archive 包含 `sandbox-ctl`、`sandbox-init` 和 patched `cloud-hypervisor` binary。聚合 platform 包按显式文档/测试选择携带用户指南与规范 E2E 运行输入，内部设计文档和源码专用测试保留在源码仓。
+`sandboxer` 独立发布 `vX.Y.Z` 组件版本。新的原生架构 archive 仅包含 `sandbox-ctl`、patched `cloud-hypervisor` 及其 notices。历史包含 `sandbox-init` 的 sandboxer archive 仍可读取和校验；新组合从选定 runtime archive 获取 PID 1。聚合 platform 包按显式文档/测试选择携带用户指南与规范 E2E 运行输入，内部设计文档和源码专用测试保留在源码仓。
 
 项目仓独立发布 `release-vX.Y.Z` 聚合版本,精确选择一个 `sandboxer` Tag 和其他各发行单元版本,并验证组合后的完整系统。
 
@@ -156,7 +160,7 @@ make build
 | [内存](docs/memory_zh.md) | 理解按需恢复和 checkpoint 内存 | Memfd 所有权、UFFD、分层读取、释放页与 dirty history |
 | [块存储](docs/block-storage_zh.md) | 集成 Disk、操作磁盘 checkpoint 和诊断块 I/O | Vhost 传输、不可变 lower、cache、DIFF v3/v4 与回收 |
 | [资源](docs/resources_zh.md) | 配置资源策略并读取 Usage | Capacity/Budget、cgroup、balloon、资源协议与累计计量 |
-| [Guest ABI](docs/guest-abi_zh.md) | 准备工作负载或修改 Host/Guest 集成 | sandbox-init 阶段、进程、文件系统、vsock、MUX 与原始观测 |
+| [Guest ABI](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/guest-abi_zh.md) | 准备工作负载或修改 Host/Guest 集成 | sandbox-init 阶段、进程、文件系统、vsock、MUX 与原始观测 |
 | [VMM](docs/vmm_zh.md) | 构建匹配 monitor 或维护补丁 | Cloud Hypervisor/KVM 集成、设备模型、交接与补丁契约 |
 
 八个主题均维护完整中英文版本；Native 构建与 license scope 也有双语指南。指南应与二进制使用相同源码或

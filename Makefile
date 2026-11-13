@@ -1,14 +1,14 @@
 # sandboxer — microVM sandbox lifecycle engine.
 #
 #   sandbox-ctl     host control plane (run / snapshot / exec / config / info)
-#   sandbox-init    guest PID 1 source/binary (packed by guest-runtime)
+#   cloud-hypervisor patched host VMM
 #
-# `make build` produces the two sandboxer binaries. The guest-runtime repo
-# consumes sandbox-init to produce sandbox-runtime.bundle.
+# `make build` produces host binaries. Guest PID 1 and the guest ABI are
+# maintained and delivered by guest-runtime.
 
 SHELL := /bin/bash
 
-.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench e2e-usage-probe e2e-cgroup-fork-probe e2e-artifact-ref e2e-launch-recovery e2e-dirty-memory test-e2e-scripts release test-release clean help
+.PHONY: all build sandbox-ctl cloud-hypervisor native-deps test vet bench e2e-usage-probe e2e-cgroup-fork-probe e2e-artifact-ref e2e-launch-recovery e2e-dirty-memory test-e2e-scripts release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -61,18 +61,12 @@ endef
 # ---------------------------------------------------------------------------
 all: build
 
-build: sandbox-ctl sandbox-init cloud-hypervisor
+build: sandbox-ctl cloud-hypervisor
 
 sandbox-ctl:
 	@mkdir -p "$(BINDIR)"
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/sandbox-ctl" ./cmd/sandbox-ctl
 	$(call link_bin,sandbox-ctl)
-
-# guest PID 1: stripped (no libc inside the guest rootfs).
-sandbox-init:
-	@mkdir -p "$(BINDIR)"
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '-s -w' -o "$(BINDIR)/sandbox-init" ./cmd/sandbox-init
-	$(call link_bin,sandbox-init)
 
 native-deps:
 	$(MAKE) -C native-deps build TARGET_ARCH=$(TARGET_ARCH)
@@ -151,6 +145,8 @@ go_requirement = $$(GOWORK=off $(GO) mod edit -json | \
 	jq -er --arg path "github.com/kuasar-sandbox/$(1)" '.Require[] | select(.Path == $$path) | .Version')
 ACCELERATOR_VERSION ?= $(call go_requirement,accelerator)
 CONNECTOR_VERSION ?= $(call go_requirement,connector)
+# Artifact tag includes runtime-; the root Go module requirement does not.
+RUNTIME_VERSION ?= runtime-$(call go_requirement,guest-runtime)
 
 # Mixed release recipes run sub-makes with the jobserver on real builds. GNU
 # Make executes recipes that directly reference $(MAKE) even under --dry-run.
@@ -159,18 +155,20 @@ release_recursive = $(if $(findstring n,$(filter-out -% %=%,$(firstword $(MAKEFL
 
 release:
 	$(release_recursive)@set -e; accelerator_tag="$(ACCELERATOR_VERSION)"; \
-	connector_tag="$(CONNECTOR_VERSION)"; \
+	connector_tag="$(CONNECTOR_VERSION)"; runtime_tag="$(RUNTIME_VERSION)"; \
 	workspace="$$(python3 -B "$(KUASAR_PLATFORM_DIR)/ci/integration/go_workspace.py" \
-		--root .. --owners sandboxer --version "$(VERSION)" --dependency-tag "accelerator=$$accelerator_tag" --dependency-tag "connector=$$connector_tag")"; \
+		--root .. --owners sandboxer --version "$(VERSION)" --dependency-tag "accelerator=$$accelerator_tag" --dependency-tag "connector=$$connector_tag" --dependency-tag "guest-runtime=$$runtime_tag")"; \
 	$(release_make) build GOWORK="$$workspace" BINDIR="$(abspath $(BINDIR))"; \
 	rm -rf "$(BUILD_DIR)/release-bundle"; \
 	GOWORK="$$workspace" RELEASE_BIN_DIR="$(abspath $(BINDIR))" \
 	RELEASE_SOURCE_ROOT="$(CURDIR)" \
 	RELEASE_ACCELERATOR_SOURCE_DIR="$(abspath ../accelerator)" \
 	RELEASE_CONNECTOR_SOURCE_DIR="$(abspath ../connector)" \
+	RELEASE_GUEST_RUNTIME_SOURCE_DIR="$(abspath ../guest-runtime)" \
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
 	RELEASE_ACCELERATOR_VERSION="$$accelerator_tag" \
 	RELEASE_CONNECTOR_VERSION="$$connector_tag" \
+	RELEASE_GUEST_RUNTIME_VERSION="$$runtime_tag" \
 		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" "$(BUILD_DIR)/release-bundle"
 
 test-release:
@@ -179,10 +177,9 @@ test-release:
 
 help:
 	@echo "sandboxer. Targets:"
-	@echo "  build              sandbox-ctl + sandbox-init"
+	@echo "  build              sandbox-ctl + cloud-hypervisor"
 	@echo "  cloud-hypervisor   patched VMM consumed by sandbox-ctl"
 	@echo "  sandbox-ctl        host control plane"
-	@echo "  sandbox-init       guest PID 1 binary consumed by guest-runtime"
 	@echo "  test-e2e-scripts   source/helper regressions; product E2E uses the prepared platform runner"
 	@echo "  release            build a validated component release bundle"
 	@echo "  test-release       test component release packaging"

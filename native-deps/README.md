@@ -72,10 +72,10 @@ entries, leaving `go.mod` and `go.sum` unchanged; see the
 
 Licenses and notices live under `share/licenses/<component>`. Collection fails on missing notices, unreadable subtrees or partial traversals. Package validation checks required files, payload identities and archive paths, types and modes. Downloads use native GitHub asset sizes and digests. New packages and Releases contain no source or historical test records, independent `SHA256SUMS`, or source/Preview markers. The publisher uses human release notes, checks the current build outputs, and refuses to replace existing assets with different bytes.
 
-The component package contains `sandbox-ctl`, `sandbox-init` and
-`cloud-hypervisor`. Select matching Accelerator/Connector sources with the
+The component package contains `sandbox-ctl` and `cloud-hypervisor`; guest PID 1
+is delivered by `guest-runtime`. Select matching Accelerator/Connector/Guest Runtime sources with the
 existing `RELEASE_*_SOURCE_DIR`, `RELEASE_*_SOURCE_SHA` and
-`RELEASE_*_VERSION` inputs. Ordinary local replacement builds do not require
+`RELEASE_*_VERSION` inputs (`RELEASE_GUEST_RUNTIME_VERSION` uses the `runtime-v...` artifact tag). Ordinary local replacement builds do not require
 remote target tags. Go VCS records must match the selected sandboxer commit.
 
 Cloud Hypervisor packaging uses the selected prebuilt binary and its source

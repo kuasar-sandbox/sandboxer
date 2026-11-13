@@ -178,7 +178,10 @@ assert "outputs: sandboxer/release-bundle" in build, "candidate bundle needs a c
 assert "outputs: sandboxer/build/release-archive-validator" in publish, "trusted parser needs a checked host-output boundary"
 assert "go build -p \"$KUASAR_BUILD_JOBS\"" in publish, "parser compilation must honor the task budget"
 PYWORKBENCH
-grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }}]' \
+grep -Fqx "$(cat <<'TITLE'
+run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }}${{ inputs.runtime_version && format(',runtime={0}', inputs.runtime_version) || '' }}]
+TITLE
+)" \
   "$WORKFLOW" || fail "release run identity does not pin source and dependencies"
 workflow="$ROOT/.github/workflows/release.yml"
 for workflow in release.yml delete-preview.yml; do
@@ -188,7 +191,8 @@ for workflow in release.yml delete-preview.yml; do
 done
 [ ! -e "$ROOT/.github/workflows/reconcile-latest.yml" ] || fail "retired Latest writer remains"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-publisher.py"
-for input in accelerator_version connector_version; do
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-producer.py"
+for input in accelerator_version connector_version runtime_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
   grep -Fq -- "--dependency ${input%_version} \"\${{ needs.preflight.outputs.$input }}\" \"\${{ needs.preflight.outputs.${input%_version}_sha }}\"" "$WORKFLOW" \
@@ -243,7 +247,7 @@ for name in ("sandbox.memory-budget.sh", "telemetry.usage.sh", "telemetry.usage-
 PYCASE
 
 mkdir -p "$TMP/bin" "$TMP/src" "$TMP/cloud-hypervisor/LICENSES" \
-  "$TMP/accelerator" "$TMP/connector"
+  "$TMP/accelerator" "$TMP/connector" "$TMP/guest-runtime"
 fixture_root="$TMP/project"
 mkdir -p "$fixture_root/scripts" "$fixture_root/native-deps" "$fixture_root/LICENSES"
 install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
@@ -292,10 +296,13 @@ printf 'fixture BSD license\n' > "$TMP/cloud-hypervisor/LICENSES/BSD-3-Clause.tx
 printf 'version = 3\n' > "$TMP/cloud-hypervisor/Cargo.lock"
 printf 'fixture accelerator license\n' > "$TMP/accelerator/LICENSE"
 printf 'fixture connector license\n' > "$TMP/connector/LICENSE"
+printf 'fixture guest-runtime license\n' > "$TMP/guest-runtime/LICENSE"
 accelerator_sha="$(init_fixture_repo "$TMP/accelerator" LICENSE)"
 connector_sha="$(init_fixture_repo "$TMP/connector" LICENSE)"
+guest_runtime_sha="$(init_fixture_repo "$TMP/guest-runtime" LICENSE)"
 git -C "$TMP/accelerator" tag v0.1.3 "$accelerator_sha"
 git -C "$TMP/connector" tag v0.1.2 "$connector_sha"
+git -C "$TMP/guest-runtime" tag runtime-v0.1.4 "$guest_runtime_sha"
 
 mkdir -p "$TMP/release-build-bin" "$TMP/crate/fixture-1.0.0" "$TMP/rust/share/doc/rust/licenses"
 printf 'fixture Rust crate license\n' > "$TMP/crate/fixture-1.0.0/LICENSE"
@@ -382,6 +389,9 @@ env "${native_fixture_env[@]}" SOURCE_DATE_EPOCH=1700000000 \
   RELEASE_CONNECTOR_SOURCE_DIR="$TMP/connector" \
   RELEASE_CONNECTOR_SOURCE_SHA="$connector_sha" \
   RELEASE_CONNECTOR_VERSION=v0.1.2 \
+  RELEASE_GUEST_RUNTIME_SOURCE_DIR="$TMP/guest-runtime" \
+  RELEASE_GUEST_RUNTIME_SOURCE_SHA="$guest_runtime_sha" \
+  RELEASE_GUEST_RUNTIME_VERSION=runtime-v0.1.4 \
   RELEASE_SOURCE_ROOT="$fixture_root" "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 # A current publication may bind its own binaries to its selected commit;
@@ -416,6 +426,17 @@ fi
 
 mkdir -p "$TMP/archive-root"
 tar --same-permissions -xzf "$archive" -C "$TMP/archive-root"
+[ ! -e "$TMP/archive-root/bin/sandbox-init" ] \
+  || fail "new host package included a stale sandbox-init from RELEASE_BIN_DIR"
+[ -s "$TMP/archive-root/share/licenses/sandboxer/guest-runtime/LICENSE" ] \
+  || fail "host package omitted guest-runtime notices"
+# Historical archives still carry the old sandboxer main-package identity.
+cp -a "$TMP/archive-root" "$TMP/legacy-root"
+install -m 0755 "$TMP/bin/sandbox-init" "$TMP/legacy-root/bin/sandbox-init"
+cp -a "$TMP/bundle" "$TMP/legacy-bundle"
+repack_bundle "$TMP/legacy-bundle" "$TMP/legacy-root"
+"$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/legacy-bundle"
+echo "test-release: host-only package and legacy PID 1 archive PASS"
 
 cp -a "$TMP/archive-root" "$TMP/extra-file-root"
 printf 'unexpected\n' > "$TMP/extra-file-root/bin/unexpected"
@@ -424,8 +445,8 @@ repack_bundle "$TMP/extra-file-bundle" "$TMP/extra-file-root"
 expect_invalid_archive "$TMP/extra-file-bundle" "an unexpected regular file"
 
 cp -a "$TMP/archive-root" "$TMP/linked-binary-root"
-rm "$TMP/linked-binary-root/bin/sandbox-init"
-ln -s sandbox-ctl "$TMP/linked-binary-root/bin/sandbox-init"
+rm "$TMP/linked-binary-root/bin/sandbox-ctl"
+ln -s cloud-hypervisor "$TMP/linked-binary-root/bin/sandbox-ctl"
 cp -a "$TMP/bundle" "$TMP/linked-binary-bundle"
 repack_bundle "$TMP/linked-binary-bundle" "$TMP/linked-binary-root"
 expect_invalid_archive "$TMP/linked-binary-bundle" "a symlink in place of a binary"
