@@ -199,7 +199,7 @@ func TestCheckpointBundleSnapshotPublishesOrdinaryArtifacts(t *testing.T) {
 					for i, disk := range root.Portable.Boot.Disks {
 						data := openBundle(out, disk.Base)
 						_, readErr := data.ReadAt(ctx, buf, 0)
-						if err := errors.Join(readErr, data.Close()); err != nil || !bytes.Equal(buf, bytes.Repeat([]byte{byte(i+2)}, len(buf))) {
+						if err := errors.Join(readErr, data.Close()); err != nil || !bytes.Equal(buf, bytes.Repeat([]byte{byte(i + 2)}, len(buf))) {
 							t.Fatalf("materialization lost data disk %d: %v", i, err)
 						}
 					}
