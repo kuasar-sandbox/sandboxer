@@ -29,6 +29,30 @@ done
 [ -r "$SANDBOXER_LIB/tarstream.sh" ] || e2e_fail "missing prepared tarstream helpers"
 docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || e2e_fail "prepared E2E_IMAGE is not loaded: $E2E_IMAGE"
 
+# A source cutover can supply the already admitted release as a separately
+# sealed fixture. Keep the same-version scenario and replay it with a real
+# pre-migration capture. The candidate Host always owns the restore side.
+CAPTURE_BIN="$BIN"
+released="$E2E_WORKSPACE/fixtures/released-snapshot-capture"
+case "${1:-}" in
+    "")
+        if [ -d "$released" ]; then
+            script="$(realpath "${BASH_SOURCE[0]}")"
+            WORK="$WORK/n" OUT="$OUT/current" bash "$script" current
+            WORK="$WORK/o" OUT="$OUT/from-release" bash "$script" from-release
+            exit 0
+        fi
+        ;;
+    current) ;;
+    from-release)
+        CAPTURE_BIN="$released"
+        (cd "$released" && sha256sum --check --strict SHA256SUMS)
+        printf 'Capturing with published aggregate %s, restoring with selected Host:\n' "$(cat "$released/aggregate")"
+        sha256sum "$CAPTURE_BIN/sandbox-ctl" "$BIN/sandbox-ctl"
+        ;;
+    *) e2e_fail "unknown snapshot restore scenario: $1" ;;
+esac
+
 mkdir -p "$WORK" "$OUT" "$WORK/runtime" "$WORK/capture-runtime" "$WORK/deploy-runtime" "$WORK/snapshot"
 TAP_NAME="rs$((BASHPID % 1000000))"
 TAP_CREATED=0
@@ -113,8 +137,8 @@ mkfs.ext4 -q -F -O ^has_journal "$DIFF.template"
 CAPTURE_KERNEL="$WORK/capture-runtime/vmlinux-v1"
 CAPTURE_RUNTIME="$WORK/capture-runtime/runtime-v1.bundle"
 DEFAULT_RUNTIME="$WORK/deploy-runtime/runtime-renamed.bundle"
-cp --reflink=auto --sparse=always "$BIN/vmlinux" "$CAPTURE_KERNEL"
-cp --reflink=auto --sparse=always "$BIN/sandbox-runtime.bundle" "$CAPTURE_RUNTIME"
+cp --reflink=auto --sparse=always "$CAPTURE_BIN/vmlinux" "$CAPTURE_KERNEL"
+cp --reflink=auto --sparse=always "$CAPTURE_BIN/sandbox-runtime.bundle" "$CAPTURE_RUNTIME"
 
 # Retain the primary's mappings and open O_DIRECT descriptor across snapshot.
 # JSON is valid YAML and preserves the workload's exact newlines/quoting.
@@ -147,9 +171,9 @@ LOG1="$OUT/cold.log"
 readiness_begin_capture "$WORK/cold.ready"
 COLD_READER_PID=$READY_READER_PID
 STARTUP_STARTED=$SECONDS
-readiness_exec_in_new_session "$BIN/sandbox-ctl" run \
+readiness_exec_in_new_session "$CAPTURE_BIN/sandbox-ctl" run \
     --ready-fd="$READY_WRITE_FD" --config "$WORK/cold.yaml" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --sandbox-id "$SID1" \
+    --ch-binary "$CAPTURE_BIN/cloud-hypervisor" --run-root "$WORK/runtime" --sandbox-id "$SID1" \
     >"$LOG1" 2>&1 &
 SBPID1=$!
 readiness_close_parent_writer
@@ -157,7 +181,7 @@ readiness_start_watchdog "$SBPID1" 120 10
 readiness_wait_event "$WORK/cold.ready" 1 control_ready "$SBPID1" || startup_failure "$LOG1" "$SBPID1" cold-control "$STARTUP_STARTED"
 readiness_connect_ctl "$WORK/runtime/$SID1/ctl.sock" || e2e_fail "cold ctl.sock unavailable at control_ready"
 readiness_wait_event "$WORK/cold.ready" 2 ready "$SBPID1" || startup_failure "$LOG1" "$SBPID1" cold-ready "$STARTUP_STARTED"
-CG_COLD="$("$BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$WORK/runtime" -- cat /proc/self/cgroup)"
+CG_COLD="$("$CAPTURE_BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$WORK/runtime" -- cat /proc/self/cgroup)"
 grep -qE '^0::/init[[:space:]]*$' <<<"$CG_COLD" || e2e_fail "cold exec is not pinned to /init"
 readiness_assert_wire "$WORK/cold.ready" "$COLD_READER_PID" $'control_ready\nready\n' || e2e_fail "cold readiness wire is not exact"
 
@@ -167,7 +191,7 @@ for _ in $(seq 1 600); do
     sleep 0.05
 done
 grep -qE '^TICK 10[[:space:]]*$' "$LOG1" || e2e_fail "cold run never reached TICK 10"
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$WORK/runtime" -- cat /tmp/dio-state.json >"$OUT/dio-before.json"
+"$CAPTURE_BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$WORK/runtime" -- cat /tmp/dio-state.json >"$OUT/dio-before.json"
 python3 - "$OUT/dio-before.json" <<'PY_DIO'
 import json, sys
 r = json.load(open(sys.argv[1]))
@@ -175,7 +199,7 @@ assert r['phase'] == 'armed' and r['cold_control_mismatches'] == 0 and r['region
 PY_DIO
 
 "$LAUNCH_RECOVERY_BIN" pong "$WORK/runtime/$SID1/vsock.sock" >"$OUT/initial-before.json"
-"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID1" --output "$WORK/snapshot" --run-root "$WORK/runtime" \
+"$CAPTURE_BIN/sandbox-ctl" snapshot --sandbox-id "$SID1" --output "$WORK/snapshot" --run-root "$WORK/runtime" \
     >"$OUT/snapshot.log" 2>&1
 wait "$SBPID1" || true
 SBPID1=""
