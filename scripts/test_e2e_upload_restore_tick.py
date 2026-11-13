@@ -101,7 +101,7 @@ class LocalRestoreTickTests(unittest.TestCase):
             probe.write_text('#!/bin/bash\nprintf \'%s\\n\' \'{"token":"fixture","state":"started"}\'\n')
             probe.chmod(0o755)
             setup = r'''
-WORK=$TEST_WORK; BIN=$WORK; OUT=$WORK; SID1=source
+WORK=$TEST_WORK; BIN=$WORK; CAPTURE_BIN=$BIN; OUT=$WORK; SID1=source
 LAUNCH_RECOVERY_BIN=$WORK/initial-probe
 mkdir "$WORK/snapshot"
 LOG1=$WORK/source.log; LOG2=$WORK/restore.log
@@ -167,7 +167,7 @@ class LocalRestoreBindingTests(unittest.TestCase):
             (work / 'snapshot').mkdir(parents=True)
             (work / 'snapshot/source.snapshot').write_bytes(b'source snapshot')
             setup = r'''
-WORK=$TEST_WORK; BIN=$TEST_BIN; TAP_NAME=restore-test
+WORK=$TEST_WORK; BIN=$TEST_BIN; CAPTURE_BIN=$BIN; TAP_NAME=restore-test
 ROOT_REF=file:///fixture/root; DIFF=$WORK/root.diff
 DIO_LAUNCH_ARGS='["-c","pass"]'
 mkdir -p "$WORK/capture-runtime" "$WORK/deploy-runtime"
