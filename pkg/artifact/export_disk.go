@@ -41,6 +41,23 @@ type savedDiskLayer struct {
 	portable string
 }
 
+// A borrowed fetcher may serve a manifest from a local Bundle or another
+// Store. Only a direct read from this storage's own client proves that the
+// upload target already has the layer.
+func (p *Publisher) storedDiskRef(ref manifest.Ref, scope publishScope) string {
+	if ref.Scheme != manifest.RefSchemeManifest || p.storage.fetcher == nil {
+		return ""
+	}
+	source := scope.fetcher
+	if source == nil {
+		source = p.storage.Fetcher()
+	}
+	if source == p.storage.fetcher {
+		return ref.String()
+	}
+	return ""
+}
+
 // ExportDisk publishes one named data disk at a committed E or paired S/E
 // point. It never takes an online checkpoint or consumes an existing one.
 func (s *ProcessStorage) ExportDisk(ctx context.Context, req ExportDiskRequest) (out DiskV1, retErr error) {
@@ -66,6 +83,76 @@ func (s *ProcessStorage) ExportDisk(ctx context.Context, req ExportDiskRequest) 
 		return DiskV1{}, err
 	}
 	return out, nil
+}
+
+// DiskDestination selects one delivery target. A directory receives a
+// content-addressed, self-contained Bundle; Upload writes to Manifest Store.
+type DiskDestination struct {
+	OutputDir string
+	Upload    bool
+}
+
+// PublishDisk freezes a complete provisioning definition without starting a VM.
+// A diff_template contributes its sparse logical upper, including explicit
+// zeros. Returned references can be used after the seed has been removed.
+func (s *ProcessStorage) PublishDisk(ctx context.Context, disk DiskV1, locations config.RefLocations, dest DiskDestination) (out DiskV1, retErr error) {
+	if err := disk.Validate(); err != nil {
+		return out, err
+	}
+	if s.ManifestConfig() == nil || dest.Upload == (dest.OutputDir != "") {
+		return out, errors.New("disk publication requires manifest configuration and one destination")
+	}
+	var layers []savedDiskLayer
+	defer func() { retErr = errors.Join(retErr, closeDiskLayers(layers)) }()
+	if disk.DiffTemplate != "" {
+		ref, _ := manifest.ParseRef(disk.DiffTemplate)
+		path, err := ResolveDiskTemplate(ref, locations)
+		if err != nil {
+			return out, err
+		}
+		var opts []diffstore.DiskOption
+		if s.LocalCodec() != nil {
+			keyFn := s.CustomerKeyFunc()
+			if keyFn == nil {
+				return out, errors.New("disk template needs a customer key")
+			}
+			key, err := keyFn()
+			if err != nil {
+				return out, err
+			}
+			opts = append(opts, diffstore.WithDiffEncryption(key, s.LocalRequired()))
+			clear(key[:])
+		}
+		view, err := diffstore.OpenProvisioningTemplate(path, opts...)
+		if err != nil {
+			return out, err
+		}
+		layers = append(layers, savedDiskLayer{Stream: view})
+	}
+	p := newPublisher(s, locations, nil, nil)
+	if disk.Base != "" {
+		var baseSize uint64
+		for i, raw := range append([]string{disk.Base}, disk.BaseFromRefs...) {
+			st, _, err := p.open(ctx, raw, publishScope{})
+			if err != nil {
+				return out, err
+			}
+			ref, _ := manifest.ParseRef(raw)
+			layers = append(layers, savedDiskLayer{Stream: st, portable: p.storedDiskRef(ref, publishScope{})})
+			if i == 0 {
+				baseSize = st.Size()
+			}
+			if st.Size() > baseSize {
+				return out, errors.New("disk parent exceeds base capacity")
+			}
+		}
+	}
+	if disk.Size != nil && uint64(*disk.Size) != layers[0].Size() {
+		return out, errors.New("disk size assertion differs from source")
+	}
+	owned := layers
+	layers = nil
+	return s.publishSavedDisk(ctx, ExportDiskRequest{RefLocations: locations, OutputDir: dest.OutputDir, Upload: dest.Upload}, owned)
 }
 
 func (p *Publisher) withDiskTable(ctx context.Context, req ExportDiskRequest, read func(*config.PortableSandboxConfig, *sandboxfile.Checkpoint, publishScope) error) (retErr error) {
@@ -177,18 +264,16 @@ func (p *Publisher) openSavedDisk(ctx context.Context, cfg *config.PortableSandb
 				return layers, e
 			}
 			ref, _ := manifest.ParseRef(raw)
-			layer := savedDiskLayer{Stream: st}
+			layer := savedDiskLayer{Stream: st, portable: p.storedDiskRef(ref, scope)}
 			if !disk.PureBlock {
 				payload, wrapped, e := sandboxfile.PayloadIfSandbox(ctx, st, ref.Scheme == manifest.RefSchemeFile && filepath.Ext(ref.Path) == ".sandbox")
 				if e != nil {
 					return layers, e
 				}
 				layer.Stream = payload
-				if !wrapped && scope.current == nil && ref.Scheme == manifest.RefSchemeManifest {
-					layer.portable = raw
+				if wrapped {
+					layer.portable = ""
 				}
-			} else if scope.current == nil && ref.Scheme == manifest.RefSchemeManifest {
-				layer.portable = raw
 			}
 			layers = append(layers, layer)
 		}

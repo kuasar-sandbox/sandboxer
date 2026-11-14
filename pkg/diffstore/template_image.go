@@ -24,6 +24,17 @@ type templateImage struct {
 	xts        *xts.Cipher
 }
 
+// OpenProvisioningTemplate opens the same immutable sparse input used when
+// creating a private writer. The returned view preserves holes and explicit
+// zeros and must be closed by the caller.
+func OpenProvisioningTemplate(path string, opts ...DiskOption) (ExportView, error) {
+	options, err := parseDiskOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	return openProvisioningTemplate(path, options.encryption)
+}
+
 func openProvisioningTemplate(path string, encryption *diffEncryption) (diffTemplateSource, error) {
 	f, err := os.Open(path)
 	if err != nil {
