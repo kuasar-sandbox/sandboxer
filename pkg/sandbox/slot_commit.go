@@ -19,7 +19,7 @@ type slotBindPlan struct {
 	Abort                    func()
 }
 
-func (r *Runtime) planSlotBind(index int, source config.DiskV1, id string, size int64, loc config.RefLocations) (*slotBindPlan, error) {
+func (r *Runtime) planSlotBind(index int, source config.DiskV1, sourceID, id string, size int64, loc config.RefLocations) (*slotBindPlan, error) {
 	h := r.diskSnapshot
 	if h == nil || h.Cfg == nil || h.PortableConfig == nil || index < 0 || index >= len(h.Cfg.Boot.Disks) || index >= len(h.PortableConfig.Boot.Disks) {
 		return nil, errors.New("slot has no current capture topology")
@@ -36,7 +36,7 @@ func (r *Runtime) planSlotBind(index int, source config.DiskV1, id string, size 
 	if !d.Unbound() {
 		return nil, errors.New("slot already contains a disk")
 	}
-	d.Binding = &config.SlotBinding{ID: id, SourceID: source.Identity(), SizeBytes: size}
+	d.Binding = &config.SlotBinding{ID: id, SourceID: sourceID, SizeBytes: size}
 	d.PureBlock = true
 	d.Base, d.BaseFromRefs = source.Base, append([]string(nil), source.BaseFromRefs...)
 	graph, err := config.ProjectDiskGraph(d.RootConfig)

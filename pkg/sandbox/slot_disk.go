@@ -318,7 +318,8 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 			cancel()
 		}
 	}()
-	base, size, template, err := OpenDiskV1Source(readCtx, source, r.diskStorage, locations, opts...)
+	var resolved config.DiskV1
+	base, size, template, err := openDiskV1Source(readCtx, source, r.diskStorage, locations, &resolved, opts...)
 	if err != nil {
 		return entry, err
 	}
@@ -331,7 +332,7 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 		return entry, fmt.Errorf("slot %s requires %d bytes, source has %d", entry.Name, *entry.SizeBytes, size)
 	}
 	id := rand.Text()
-	plan, err := r.planSlotBind(entry.Ordinal, source, id, size, locations)
+	plan, err := r.planSlotBind(entry.Ordinal, resolved, source.Identity(), id, size, locations)
 	if err != nil {
 		return entry, err
 	}

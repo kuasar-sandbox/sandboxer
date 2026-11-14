@@ -901,7 +901,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			r.diskStorage = p.DiskStorage
 			r.diskCache = p.DiskCache
 			r.diskBackends = restoreSet
-			r.diskLaunch = LaunchSpec{Storage: p.DiskStorage, ManifestConfig: p.ManifestCfg, RefLocations: p.RefLocations, SourceBinding: p.SourceBinding}
+			r.diskLaunch = LaunchSpec{Storage: p.DiskStorage, ManifestConfig: p.ManifestCfg, Fetcher: p.Fetcher, BundleReader: p.BundleReader, BundleFetcher: p.BundleFetcher, RefLocations: p.RefLocations, SourceBinding: p.SourceBinding}
 			r.initDiskInventory(p.SnapCfg, p.Disks)
 		}
 		ctlSrv.DiskBindHandler = func(req ctl.BindDiskRequest) error { return r.BindDisk(backendCtx, req) }
@@ -970,7 +970,6 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 				backends = appendDiskBackend(backends, d)
 				refs = append(refs, snapshotDiskRef(d))
 			}
-			r.diskStorage = r.storage
 			r.diskCache = r.cache
 			r.diskBackends = r.deviceSet
 			r.diskLaunch = spec

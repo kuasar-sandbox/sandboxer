@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"gopkg.in/yaml.v3"
+	"testing"
+)
 
 func TestSlotTopologyRoundTripAndBothCaptureLayouts(t *testing.T) {
 	p := validPortableConfig()
@@ -69,6 +72,19 @@ func TestSlotTopologyRejectsReplacedOrOverlappingProjections(t *testing.T) {
 		}
 		if err := validateFromDiskMountTopology(base, got); err == nil {
 			t.Fatal("restored", bad)
+		}
+	}
+}
+
+func TestSlotAndInlineGraphStrictInHostYAML(t *testing.T) {
+	for _, input := range []string{
+		"slot: {capacity: 8GiB}", "slot: {size: 0}", "slot: {size: null}",
+		"disk: {kind: disk, version: 1, diff_template: file:///seed, siez: 4096}",
+		"disk: {kind: disk, version: 1, diff_template: file:///seed, size: null}",
+	} {
+		var disk DiskConfig
+		if err := yaml.Unmarshal([]byte(input), &disk); err == nil {
+			t.Fatalf("accepted %s", input)
 		}
 	}
 }

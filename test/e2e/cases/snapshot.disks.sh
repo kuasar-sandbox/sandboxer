@@ -77,9 +77,12 @@ boot:
   disks:
     - { name: scratch, diff_template: file://$WORK/scratch.ext4 }
     - { name: dataset, base: $DATASET_REF, overlay: { diff_template: file://$WORK/dataset.ext4 } }
+    - { name: deferred, slot: {} }
 mounts:
   - { target: /scratch, type: disk, source: scratch }
   - { target: /data, type: disk, source: dataset }
+  - { target: /incoming, type: disk, source: deferred, subpath: data }
+  - { target: /results, type: disk, source: deferred, subpath: out }
 launch: { exec: /bin/sleep, args: ["3600"], restart: never }
 EOF
 
@@ -150,9 +153,10 @@ import json, sys
 with open(sys.argv[1], encoding='utf-8') as source:
     cfg = json.load(source)
 disks = cfg['Boot'].get('Disks') or []
-assert [disk.get('Name') for disk in disks] == ['scratch', 'dataset'], disks
+assert [disk.get('Name') for disk in disks] == ['scratch', 'dataset', 'deferred'], disks
 root = cfg['Boot']['Root']
-scratch, dataset = disks
+scratch, dataset, deferred = disks
+assert deferred.get("Slot") is not None and not deferred.get("Base"), deferred
 root_overlay = root.get('Overlay')
 dataset_overlay = dataset.get('Overlay')
 assert root_overlay and root_overlay.get('Base'), root
@@ -175,6 +179,7 @@ boot:
   disks:
     - { name: scratch }
     - { name: dataset, overlay: { diff: file://$WORK/dataset-restore.ext4 } }
+    - { name: deferred, slot: {} }
 EOF
 
 LOG2="$OUT/restore.log"
@@ -189,6 +194,26 @@ wait_exec "$SID" "$PID2" || {
 check_manual_discard restored
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c \
     'set -e; grep -qx ROOT-S-OK /root-s; grep -qx SCRATCH-S-OK /scratch/persist; grep -qx DATA-S-OK /data/persist; grep -qx DATASET-OK /data/DATASET-OK'
+
+# The trigger and its two projections survive memory restore without a writer.
+disk_state() {
+    "$BIN/sandbox-ctl" disk list --path-id "$SID" --run-root "$WORK/runtime" |
+        python3 -c 'import json,sys; print(next(d["state"] for d in json.load(sys.stdin)["disks"] if d["name"]=="deferred"))'
+}
+[ "$(disk_state)" = unbound ] || e2e_fail "saved empty slot is not unbound after restore"
+if "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/cat /incoming/seed; then
+    e2e_fail "unbound slot returned file data"
+fi
+mkdir -p "$WORK/seed-tree/data" "$WORK/seed-tree/out"
+printf 'BEFORE-BIND\n' > "$WORK/seed-tree/data/seed"
+truncate -s 32M "$WORK/slot.template"
+mkfs.ext4 -q -F -d "$WORK/seed-tree" "$WORK/slot.template"
+python3 -c 'import json,sys; json.dump({"kind":"disk","version":1,"diff_template":"file://"+sys.argv[1]},sys.stdout)' \
+    "$WORK/slot.template" > "$WORK/disk.json"
+"$BIN/sandbox-ctl" disk bind --path-id "$SID" --run-root "$WORK/runtime" --disk deferred --disk-spec "$WORK/disk.json"
+[ "$(disk_state)" = ready ] || e2e_fail "bound slot did not reach ready"
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/sh -c \
+    'set -e; grep -qx BEFORE-BIND /incoming/seed; echo written > /results/only-here; test ! -e /incoming/only-here; sync'
 
 kill -TERM "$PID2"
 wait "$PID2" || true

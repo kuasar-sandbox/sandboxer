@@ -83,3 +83,31 @@ func TestDiskV1SourceShortParentAndNamedSeed(t *testing.T) {
 		t.Fatal("ignored capacity assertion")
 	}
 }
+
+func TestDiskV1PinsUnqualifiedFileFromLiveStream(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path, scheme, digest := writeDiskArtifact(t, dir, "seed", make([]byte, 8192), nil)
+	storage, err := artifact.NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	spec := config.DiskV1{Kind: "disk", Version: 1, Base: "file://" + path, BaseFromRefs: []string{"file://" + filepath.Base(path) + "@location:here"}}
+	locations := config.RefLocations{"here": dir}
+	var result config.DiskV1
+	reader, _, _, err := openDiskV1Source(ctx, spec, storage, locations, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	for _, raw := range []string{result.Base, result.BaseFromRefs[0]} {
+		ref, e := manifest.ParseRef(raw)
+		if e != nil || ref.DigestScheme != scheme || ref.Digest != digest {
+			t.Fatalf("unqualified file was not pinned: %s (%v)", raw, e)
+		}
+	}
+	if result.Identity() == spec.Identity() || spec.BaseFromRefs[0] == result.BaseFromRefs[0] {
+		t.Fatal("content resolution overwrote the idempotency selector")
+	}
+}

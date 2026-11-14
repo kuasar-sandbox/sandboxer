@@ -7,11 +7,33 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
+	"gopkg.in/yaml.v3"
 )
 
 // DiskSlotConfig reserves one virtio block device; nil Size adopts the bound disk's geometry.
 type DiskSlotConfig struct {
 	Size *string `yaml:"size,omitempty" json:"size,omitempty"`
+}
+
+// Keep slot geometry strict even when the enclosing legacy host YAML permits
+// unknown fields. A misspelled size must not silently select dynamic geometry.
+func (s *DiskSlotConfig) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return errors.New("slot must be a mapping")
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		if node.Content[i].Value != "size" || node.Content[i+1].Tag == "!!null" {
+			return fmt.Errorf("invalid slot field %q", node.Content[i].Value)
+		}
+	}
+	type wire DiskSlotConfig
+	var slot wire
+	if err := node.Decode(&slot); err != nil {
+		return err
+	}
+	*s = DiskSlotConfig(slot)
+	_, err := s.Capacity()
+	return err
 }
 
 func (s *DiskSlotConfig) Capacity() (int64, error) {
@@ -114,6 +136,9 @@ func pathsOverlap(a, b string) bool {
 
 func validateSlotArtifact(d PortableDiskConfig) error {
 	if d.Slot == nil {
+		if d.PureBlock && d.Overlay != nil {
+			return errors.New("pure block disk cannot be an overlay")
+		}
 		if d.Binding != nil {
 			return errors.New("disk binding requires a slot")
 		}
@@ -127,7 +152,7 @@ func validateSlotArtifact(d PortableDiskConfig) error {
 		return errors.New("slot cannot be an overlay")
 	}
 	if b := d.Binding; b != nil {
-		if b.ID == "" || b.SourceID == "" || b.SizeBytes <= 0 || b.SizeBytes%4096 != 0 || n != 0 && n != b.SizeBytes {
+		if !d.PureBlock || b.ID == "" || b.SourceID == "" || b.SizeBytes <= 0 || b.SizeBytes > 1<<40 || b.SizeBytes%4096 != 0 || n != 0 && n != b.SizeBytes {
 			return errors.New("invalid saved slot identity or capacity")
 		}
 	} else if d.Base != "" || len(d.BaseFromRefs) != 0 || d.PureBlock {

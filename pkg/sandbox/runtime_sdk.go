@@ -709,6 +709,10 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if err := cfg.ValidateCold(); err != nil {
 		return fail(err)
 	}
+	r.diskStorage, err = borrowLaunchDiskStorage(spec)
+	if err != nil {
+		return fail(err)
+	}
 	opener := FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
 		return openLaunchFile(ctx, spec, path, ref, spec.RefLocations)
 	})
@@ -748,7 +752,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		}
 	}
 	if !reusedPreparation {
-		preparation, err = preflightColdArtifacts(ctx, cfg, launchFetcher(spec), spec.RefLocations, r.baseDir, r.sandboxID, launchCodec(spec), diffKey, launchRequired(spec), opener, spec.Storage, r.spec.checkpointPlan)
+		preparation, err = preflightColdArtifacts(ctx, cfg, launchFetcher(spec), spec.RefLocations, r.baseDir, r.sandboxID, launchCodec(spec), diffKey, launchRequired(spec), opener, r.diskStorage, r.spec.checkpointPlan)
 		if err != nil {
 			return fail(err)
 		}
@@ -887,7 +891,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			if launchCodec(spec) != nil {
 				opts = append(opts, diffstore.WithDiffEncryption(diffKey, launchRequired(spec)))
 			}
-			base, _, diffTemplate, e = OpenDiskV1Source(readCtx, *pure, r.storage, spec.RefLocations, opts...)
+			base, _, diffTemplate, e = OpenDiskV1Source(readCtx, *pure, r.diskStorage, spec.RefLocations, opts...)
 			if e != nil {
 				return DiskBackend{}, e
 			}
@@ -1123,6 +1127,18 @@ wait:
 	return fail(waitErr)
 
 }
+
+// Keep pure disk reads and subsequent binds in the same artifact scope as the
+// launch that owns them. In particular an E Bundle may be the only holder of
+// its manifest layers, even when the process also has access to a Store.
+func borrowLaunchDiskStorage(s LaunchSpec) (*artifact.ProcessStorage, error) {
+	if s.Storage != nil && launchManifestConfig(s) == s.Storage.ManifestConfig() &&
+		(s.legacyAccess == nil || s.legacyAccess.checkpointStorage == s.Storage) {
+		return s.Storage.BorrowWithFetcher(launchFetcher(s)), nil
+	}
+	return artifact.NewProcessStorageWithLocalAccess(launchManifestConfig(s), launchKey(s), launchCodec(s), launchRequired(s), launchFetcher(s))
+}
+
 func openLaunchFile(ctx context.Context, s LaunchSpec, path string, ref manifest.Ref, locations config.RefLocations) (fetch.Stream, error) {
 	// A supplied ProcessStorage is an opaque artifact-access capability: it owns
 	// manifest configuration, customer key, codec, and lazy clients. Preserve
@@ -1309,6 +1325,9 @@ func (r *Runtime) cleanupResources() (retErr error) {
 	}
 	if r.cache != nil {
 		retErr = errors.Join(retErr, r.cache.Close())
+	}
+	if r.diskStorage != nil {
+		retErr = errors.Join(retErr, r.diskStorage.Close())
 	}
 	if r.ownStorage {
 		retErr = errors.Join(retErr, r.storage.Close())

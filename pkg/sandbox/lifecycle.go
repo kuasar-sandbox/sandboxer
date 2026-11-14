@@ -252,7 +252,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		}
 	}
 	preparation, err := preflightColdArtifacts(ctx, opts.Cfg, opts.Fetcher, opts.RefLocations,
-		baseDir, opts.SandboxID, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener, storage, opts.checkpointPlan)
+		baseDir, opts.SandboxID, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener, storage.BorrowWithFetcher(opts.Fetcher), opts.checkpointPlan)
 	if err != nil {
 		return -1, err
 	}

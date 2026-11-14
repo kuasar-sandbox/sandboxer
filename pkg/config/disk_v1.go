@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"unicode/utf8"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 )
 
@@ -94,6 +96,34 @@ func (d DiskV1) Identity() string {
 	b, _ := json.Marshal(graph)
 	id := sha256.Sum256(b)
 	return hex.EncodeToString(id[:])
+}
+
+// UnmarshalYAML enforces the same field and source contract on ordinary
+// boot.disks[].disk as on the JSON bind request.
+func (d *DiskV1) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return errors.New("disk: expected a mapping")
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		switch key := node.Content[i].Value; key {
+		case "kind", "version", "size", "base", "base_from_refs", "diff_template":
+			if node.Content[i+1].Tag == "!!null" {
+				return fmt.Errorf("disk: %s may not be null", key)
+			}
+		default:
+			return fmt.Errorf("disk: unknown field %q", key)
+		}
+	}
+	type wire DiskV1
+	var spec wire
+	if err := node.Decode(&spec); err != nil {
+		return err
+	}
+	if err := DiskV1(spec).Validate(); err != nil {
+		return err
+	}
+	*d = DiskV1(spec)
+	return nil
 }
 
 // UnmarshalJSON rejects ambiguous fields, including duplicates, nulls, and

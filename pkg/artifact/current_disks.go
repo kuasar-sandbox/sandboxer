@@ -180,6 +180,9 @@ func (c *CurrentDiskSet) validate() (*config.PortableSandboxConfig, error) {
 			if disk.Slot != nil && c.Version < 2 {
 				return nil, errors.New("current slot requires version 2")
 			}
+			if disk.Binding != nil && d.Capacity != disk.Binding.SizeBytes {
+				return nil, errors.New("retained writer capacity differs from saved slot")
+			}
 			if disk.Unbound() {
 				size, err := disk.Slot.Capacity()
 				if err != nil || d.DiffID != "" || d.BaseID != "" || name != d.Name || d.Capacity != size {

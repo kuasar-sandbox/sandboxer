@@ -106,6 +106,14 @@ func (opts Options) borrowStorage() (*artifact.ProcessStorage, error) {
 	return artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired, opts.Fetcher)
 }
 
+// Scope the disk opener at the same instant as the manifest fetcher. A
+// sibling E Bundle can add another layer of resolution over the S Bundle.
+func (opts Options) withBundleFetcher(f fetch.Fetcher) Options {
+	opts.Fetcher = f
+	opts.storage = opts.storage.BorrowWithFetcher(f)
+	return opts
+}
+
 func (opts Options) openFile(ctx context.Context, path string, ref manifest.Ref) (*artifact.OpenedFile, error) {
 	if opts.storage != nil {
 		return opts.storage.BorrowWithFetcher(opts.Fetcher).OpenFileWithLocations(ctx, path, ref, opts.RefLocations)
@@ -1233,7 +1241,7 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 			resolved.DigestScheme, resolved.Digest = "manifest", manifest.HexKey(key)
 			portable.Path = filepath.Base(path)
 			portable.DigestScheme, portable.Digest = "manifest", manifest.HexKey(key)
-			source.opts.Fetcher = opened.ScopedFetcher()
+			source.opts = opts.withBundleFetcher(opened.ScopedFetcher())
 			source.bundleReader = opened.BundleReader()
 			source.bundleFetcher = opened.ManifestFetcher()
 			physicalRef, physicalPath, sourceErr := fileBundleSource(path, ref.String())
@@ -1525,7 +1533,7 @@ func openRootSnapshot(ctx context.Context, opts Options) (*openedRootSnapshot, e
 		root := &openedRootSnapshot{stream: opened, size: int64(opened.Size()), opts: opts}
 		if key, ok := opened.RootManifestKey(); ok {
 			root.bundleRoot = manifest.HexKey(key)
-			root.opts.Fetcher = opened.ScopedFetcher()
+			root.opts = opts.withBundleFetcher(opened.ScopedFetcher())
 			root.bundleReader = opened.BundleReader()
 			root.bundleFetcher = opened.ManifestFetcher()
 			root.selfRef, err = fileBundleRef(opts.SnapshotPath, opts.SnapshotRef, key)

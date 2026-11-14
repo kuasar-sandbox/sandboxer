@@ -116,6 +116,9 @@ func TestDeriveRuntimeSpecWithOptionsPreservesScopedBundleAccess(t *testing.T) {
 	}
 	portable := snapshotTestLivePortable(t)
 	portable.Boot.Root.BaseFromRefs = []string{lower}
+	portable.Version = 2
+	portable.Mounts = []config.MountConfig{{Type: "disk", Source: "data", Target: "/data"}}
+	portable.Boot.Disks = []config.PortableDiskConfig{{Name: "data", PureBlock: true, PortableRootConfig: config.PortableRootConfig{Base: lower}}}
 	rootRef, _, err := sink.AbsorbSandbox(ctx, runtimeShapeSandboxSource(t, portable, 8192))
 	if err != nil {
 		t.Fatal(err)
@@ -143,20 +146,39 @@ func TestDeriveRuntimeSpecWithOptionsPreservesScopedBundleAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer opened.Close()
-	cfg := &config.SandboxConfig{Boot: config.BootConfig{Root: config.RootConfig{Base: "self", BaseFromRefs: []string{lower}}}}
+	cfg := &config.SandboxConfig{Boot: config.BootConfig{Root: config.RootConfig{Base: "self", BaseFromRefs: []string{lower}},
+		Disks: []config.DiskConfig{{Name: "data", PureBlock: true, RootConfig: config.RootConfig{Base: lower}}}}}
 	launch := LaunchSpec{Storage: storage, Fetcher: opened.ScopedFetcher(), ManifestConfig: manifestCfg,
 		BundleReader: opened.BundleReader(), BundleFetcher: opened.ManifestFetcher(), PortableConfig: portable,
 		SourceBinding: &RunSourceBinding{SandboxRef: rootRef, RuntimeRef: rootRef, RelativeDir: dir,
 			BundleSource: &BundleSourceBinding{RootPath: path, Reader: opened.BundleReader(), Fetcher: opened.ManifestFetcher()}},
 	}
 	got, err := DeriveRuntimeSpecWithOptions(ctx, cfg, DeriveRuntimeOptions{Launch: launch})
-	if err != nil || got.Disks[0].WritableCapacity != 8192 {
+	if err != nil || len(got.Disks) != 2 || got.Disks[0].WritableCapacity != 8192 || got.Disks[1].WritableCapacity != 8192 {
 		t.Fatalf("scoped Bundle shape = %+v, %v", got.Disks, err)
+	}
+	// An explicit manifest on a file Bundle selects that member, whereas an
+	// unqualified canonical Bundle path selects its root. Both identities must
+	// be retained on bind for later re-open and capture.
+	member := selector
+	member.Digest = strings.TrimPrefix(lower, "manifest://")
+	for _, tc := range []struct{ ref, want string }{{"file://" + path, selector.String()}, {member.String(), member.String()}} {
+		input, e := manifest.ParseRef(tc.ref)
+		if e != nil {
+			t.Fatal(e)
+		}
+		rd, resolved, e := openPureLayer(ctx, input, storage, nil, true)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = rd.Close(); e != nil || resolved.String() != tc.want {
+			t.Fatalf("pinned %s => %s want %s (%v)", tc.ref, resolved.String(), tc.want, e)
+		}
 	}
 	launch.ManifestConfig = nil
 	launch.SourceBinding.RuntimeRef = selector.String()
 	got, err = DeriveRuntimeSpecWithOptions(ctx, cfg, DeriveRuntimeOptions{Launch: launch})
-	if err != nil || got.Disks[0].WritableCapacity != 8192 {
+	if err != nil || len(got.Disks) != 2 || got.Disks[0].WritableCapacity != 8192 || got.Disks[1].WritableCapacity != 8192 {
 		t.Fatalf("scoped file Bundle with storage-owned configuration = %+v, %v", got.Disks, err)
 	}
 	// A file selector must also retain the opaque storage's manifest crypto

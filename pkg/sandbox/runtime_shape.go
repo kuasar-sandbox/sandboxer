@@ -214,6 +214,11 @@ func deriveBoundRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, opts
 		return RuntimeSpec{}, err
 	}
 	launch := opts.Launch
+	diskStorage, err := borrowLaunchDiskStorage(launch)
+	if err != nil {
+		return RuntimeSpec{}, err
+	}
+	defer diskStorage.Close()
 	opener := FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
 		return openLaunchFile(ctx, launch, path, ref, launch.RefLocations)
 	})
@@ -298,7 +303,7 @@ func deriveBoundRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, opts
 					size, err = runtimeWritableCapacity(disk.Diff, "", 0, diffOpts)
 				} else {
 					var reader diffstore.BlockReader
-					reader, size, _, err = OpenDiskV1Source(ctx, source, launch.Storage, launch.RefLocations, diffOpts...)
+					reader, size, _, err = OpenDiskV1Source(ctx, source, diskStorage, launch.RefLocations, diffOpts...)
 					if reader != nil {
 						err = errors.Join(err, reader.Close())
 					}
