@@ -68,6 +68,80 @@ func (s *ProcessStorage) ExportDisk(ctx context.Context, req ExportDiskRequest) 
 	return out, nil
 }
 
+// DiskDestination selects one delivery target. A directory receives a
+// content-addressed, self-contained Bundle; Upload writes to Manifest Store.
+type DiskDestination struct {
+	OutputDir string
+	Upload    bool
+}
+
+// PublishDisk freezes a complete provisioning definition without starting a VM.
+// A diff_template contributes its sparse logical upper, including explicit
+// zeros. Returned references can be used after the seed has been removed.
+func (s *ProcessStorage) PublishDisk(ctx context.Context, disk DiskV1, locations config.RefLocations, dest DiskDestination) (out DiskV1, retErr error) {
+	if err := disk.Validate(); err != nil {
+		return out, err
+	}
+	if s.ManifestConfig() == nil || dest.Upload == (dest.OutputDir != "") {
+		return out, errors.New("disk publication requires manifest configuration and one destination")
+	}
+	var layers []savedDiskLayer
+	defer func() { retErr = errors.Join(retErr, closeDiskLayers(layers)) }()
+	if disk.DiffTemplate != "" {
+		ref, _ := manifest.ParseRef(disk.DiffTemplate)
+		path, err := ResolveDiskTemplate(ref, locations)
+		if err != nil {
+			return out, err
+		}
+		var opts []diffstore.DiskOption
+		if s.LocalCodec() != nil {
+			keyFn := s.CustomerKeyFunc()
+			if keyFn == nil {
+				return out, errors.New("disk template needs a customer key")
+			}
+			key, err := keyFn()
+			if err != nil {
+				return out, err
+			}
+			opts = append(opts, diffstore.WithDiffEncryption(key, s.LocalRequired()))
+			clear(key[:])
+		}
+		view, err := diffstore.OpenProvisioningTemplate(path, opts...)
+		if err != nil {
+			return out, err
+		}
+		layers = append(layers, savedDiskLayer{Stream: view})
+	}
+	p := newPublisher(s, locations, nil, nil)
+	if disk.Base != "" {
+		var baseSize uint64
+		for i, raw := range append([]string{disk.Base}, disk.BaseFromRefs...) {
+			st, _, err := p.open(ctx, raw, publishScope{})
+			if err != nil {
+				return out, err
+			}
+			layer := savedDiskLayer{Stream: st}
+			ref, _ := manifest.ParseRef(raw)
+			if ref.Scheme == manifest.RefSchemeManifest {
+				layer.portable = raw
+			}
+			layers = append(layers, layer)
+			if i == 0 {
+				baseSize = st.Size()
+			}
+			if st.Size() > baseSize {
+				return out, errors.New("disk parent exceeds base capacity")
+			}
+		}
+	}
+	if disk.Size != nil && uint64(*disk.Size) != layers[0].Size() {
+		return out, errors.New("disk size assertion differs from source")
+	}
+	owned := layers
+	layers = nil
+	return s.publishSavedDisk(ctx, ExportDiskRequest{RefLocations: locations, OutputDir: dest.OutputDir, Upload: dest.Upload}, owned)
+}
+
 func (p *Publisher) withDiskTable(ctx context.Context, req ExportDiskRequest, read func(*config.PortableSandboxConfig, *sandboxfile.Checkpoint, publishScope) error) (retErr error) {
 	if !strings.Contains(req.SourceRef, "://") && !filepath.IsAbs(req.SourceRef) {
 		return errors.New("source path must be absolute; use a file reference with source directory for relative artifacts")

@@ -157,3 +157,53 @@ func TestExportDiskCheckpointPinsOnlyNamedVersion(t *testing.T) {
 	requireDiskIO(t, err)
 	requireDiskIO(t, pins.Close())
 }
+
+func TestPublishDiskFreezesSparseSeedAndParents(t *testing.T) {
+	const page = 4096
+	for _, destination := range []string{"bundle", "store"} {
+		t.Run(destination, func(t *testing.T) {
+			ctx := context.Background()
+			var storage *ProcessStorage
+			dest := DiskDestination{Upload: destination == "store"}
+			if dest.Upload {
+				_, storage = manifestPublisherFixture(t)
+			} else {
+				cfg, key := sourceBundleConfig(manifestcrypto.LocalOff)
+				var err error
+				storage, err = NewProcessStorageWithCustomerKey(cfg, func() ([32]byte, error) { return key, nil })
+				requireDiskIO(t, err)
+				defer storage.Close()
+				dest.OutputDir = t.TempDir()
+			}
+			src := t.TempDir()
+			sink := snapshot.NewFileSink(src, "disk", nil, false, nil)
+			_, file, err := sink.AbsorbOverlay(ctx, bytes.NewReader(bytes.Repeat([]byte{'B'}, 2*page)), nil)
+			requireDiskIO(t, err)
+			requireDiskIO(t, sink.Close())
+			seed := filepath.Join(src, "seed.raw")
+			f, err := os.Create(seed)
+			requireDiskIO(t, err)
+			requireDiskIO(t, f.Truncate(3*page))
+			_, err = f.WriteAt(make([]byte, page), page)
+			requireDiskIO(t, err)
+			_, err = f.WriteAt(bytes.Repeat([]byte{'T'}, page), 2*page)
+			requireDiskIO(t, err)
+			requireDiskIO(t, f.Close())
+			disk := DiskV1{Kind: "disk", Version: 1, Base: "file://" + file, DiffTemplate: "file://" + seed}
+			out, err := storage.PublishDisk(ctx, disk, nil, dest)
+			requireDiskIO(t, err)
+			bad := int64(page)
+			disk.Size = &bad
+			if _, err = storage.PublishDisk(ctx, disk, nil, dest); err == nil {
+				t.Fatal("accepted size mismatch")
+			}
+			requireDiskIO(t, os.RemoveAll(src))
+			got := readExportedDisk(t, storage, out)
+			want := append(bytes.Repeat([]byte{'B'}, page), make([]byte, page)...)
+			want = append(want, bytes.Repeat([]byte{'T'}, page)...)
+			if out.DiffTemplate != "" || *out.Size != 3*page || !bytes.Equal(got, want) {
+				t.Fatal("workspace seed or lower lost during publication")
+			}
+		})
+	}
+}
