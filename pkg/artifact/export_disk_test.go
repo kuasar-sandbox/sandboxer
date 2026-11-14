@@ -10,6 +10,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -205,5 +206,20 @@ func TestPublishDiskFreezesSparseSeedAndParents(t *testing.T) {
 				t.Fatal("workspace seed or lower lost during publication")
 			}
 		})
+	}
+}
+func TestPublishDiskUploadsBundleBackedManifest(t *testing.T) {
+	ctx := context.Background()
+	cfg, storage := manifestPublisherFixture(t)
+	dir := t.TempDir()
+	base, path := overlayBundleFixture(t, cfg, storage, dir)
+	carrier, err := storage.OpenFile(ctx, path, manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path})
+	requireDiskIO(t, err)
+	source := storage.BorrowWithFetcher(carrier.ScopedFetcher())
+	published, err := source.PublishDisk(ctx, DiskV1{Kind: "disk", Version: 1, Base: base}, nil, DiskDestination{Upload: true})
+	requireDiskIO(t, errors.Join(err, carrier.Close()))
+	requireDiskIO(t, os.Remove(path))
+	if got := readExportedDisk(t, storage, published); !bytes.Equal(got, bytes.Repeat([]byte{0x39}, 8192)) {
+		t.Fatal("Store did not retain the Bundle layer")
 	}
 }

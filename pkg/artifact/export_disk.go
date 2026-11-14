@@ -41,6 +41,23 @@ type savedDiskLayer struct {
 	portable string
 }
 
+// A borrowed fetcher may serve a manifest from a local Bundle or another
+// Store. Only a direct read from this storage's own client proves that the
+// upload target already has the layer.
+func (p *Publisher) storedDiskRef(ref manifest.Ref, scope publishScope) string {
+	if ref.Scheme != manifest.RefSchemeManifest || p.storage.fetcher == nil {
+		return ""
+	}
+	source := scope.fetcher
+	if source == nil {
+		source = p.storage.Fetcher()
+	}
+	if source == p.storage.fetcher {
+		return ref.String()
+	}
+	return ""
+}
+
 // ExportDisk publishes one named data disk at a committed E or paired S/E
 // point. It never takes an online checkpoint or consumes an existing one.
 func (s *ProcessStorage) ExportDisk(ctx context.Context, req ExportDiskRequest) (out DiskV1, retErr error) {
@@ -120,12 +137,8 @@ func (s *ProcessStorage) PublishDisk(ctx context.Context, disk DiskV1, locations
 			if err != nil {
 				return out, err
 			}
-			layer := savedDiskLayer{Stream: st}
 			ref, _ := manifest.ParseRef(raw)
-			if ref.Scheme == manifest.RefSchemeManifest {
-				layer.portable = raw
-			}
-			layers = append(layers, layer)
+			layers = append(layers, savedDiskLayer{Stream: st, portable: p.storedDiskRef(ref, publishScope{})})
 			if i == 0 {
 				baseSize = st.Size()
 			}
@@ -251,18 +264,16 @@ func (p *Publisher) openSavedDisk(ctx context.Context, cfg *config.PortableSandb
 				return layers, e
 			}
 			ref, _ := manifest.ParseRef(raw)
-			layer := savedDiskLayer{Stream: st}
+			layer := savedDiskLayer{Stream: st, portable: p.storedDiskRef(ref, scope)}
 			if !disk.PureBlock {
 				payload, wrapped, e := sandboxfile.PayloadIfSandbox(ctx, st, ref.Scheme == manifest.RefSchemeFile && filepath.Ext(ref.Path) == ".sandbox")
 				if e != nil {
 					return layers, e
 				}
 				layer.Stream = payload
-				if !wrapped && scope.current == nil && ref.Scheme == manifest.RefSchemeManifest {
-					layer.portable = raw
+				if wrapped {
+					layer.portable = ""
 				}
-			} else if scope.current == nil && ref.Scheme == manifest.RefSchemeManifest {
-				layer.portable = raw
 			}
 			layers = append(layers, layer)
 		}
