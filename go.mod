@@ -16,8 +16,8 @@ require (
 )
 
 require (
-	github.com/kuasar-sandbox/accelerator v0.1.12
-	github.com/kuasar-sandbox/connector v0.1.8
+	github.com/kuasar-sandbox/accelerator v0.2.0
+	github.com/kuasar-sandbox/connector v0.2.0
 	github.com/kuasar-sandbox/guest-runtime v0.2.0
 	golang.org/x/crypto v0.56.0
 	golang.org/x/net v0.58.0
