@@ -1,31 +1,31 @@
-From 4b34b063926953699cb5a068700d663792bff6dd Mon Sep 17 00:00:00 2001
+From 1773108392a9420b732b87a74fd6e663e63fd7f1 Mon Sep 17 00:00:00 2001
 From: Kuasar Sandbox <codex@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 02:54:04 -0500
 Subject: [PATCH] virtio-devices: notify reserved block capacity changes
 
 ---
- virtio-devices/src/device.rs                  |  6 +++
+ virtio-devices/src/device.rs                  |  6 ++
  .../src/transport/pci_common_config.rs        |  5 +-
- virtio-devices/src/vhost_user/blk.rs          | 53 ++++++++++++++++---
- 3 files changed, 56 insertions(+), 8 deletions(-)
+ virtio-devices/src/vhost_user/blk.rs          | 73 +++++++++++++++++--
+ 3 files changed, 76 insertions(+), 8 deletions(-)
 
 diff --git a/virtio-devices/src/device.rs b/virtio-devices/src/device.rs
-index 438ecc3..ddeb4c6 100644
+index 438ecc3..07b485b 100644
 --- a/virtio-devices/src/device.rs
 +++ b/virtio-devices/src/device.rs
-@@ -78,6 +78,12 @@ pub trait VirtioDevice: Send {
+@@ -77,6 +77,12 @@ pub trait VirtioDevice: Send {
+         let _ = value;
      }
  
-     /// Reads this device configuration space at `offset`.
 +    /// Device-owned generation changes when a multi-part configuration read
 +    /// must be retried. Fixed-configuration devices always return zero.
 +    fn config_generation(&self) -> u8 {
 +        0
 +    }
 +
+     /// Reads this device configuration space at `offset`.
      fn read_config(&self, _offset: u64, _data: &mut [u8]) {
          warn!(
-             "No readable configuration fields for {}",
 diff --git a/virtio-devices/src/transport/pci_common_config.rs b/virtio-devices/src/transport/pci_common_config.rs
 index 5a7b5f5..5e6753f 100644
 --- a/virtio-devices/src/transport/pci_common_config.rs
@@ -43,7 +43,7 @@ index 5a7b5f5..5e6753f 100644
              }
              2 => {
 diff --git a/virtio-devices/src/vhost_user/blk.rs b/virtio-devices/src/vhost_user/blk.rs
-index 1be1807..9d3d8ef 100644
+index 1be1807..0c7553d 100644
 --- a/virtio-devices/src/vhost_user/blk.rs
 +++ b/virtio-devices/src/vhost_user/blk.rs
 @@ -1,7 +1,7 @@
@@ -55,7 +55,7 @@ index 1be1807..9d3d8ef 100644
  use std::sync::{Arc, Barrier, Mutex};
  use std::{mem, result, thread};
  
-@@ -44,14 +44,30 @@ pub struct State {
+@@ -44,14 +44,37 @@ pub struct State {
      pub vu_num_queues: usize,
  }
  
@@ -66,12 +66,19 @@ index 1be1807..9d3d8ef 100644
 +    sectors: Arc<AtomicU64>,
 +    irq: Arc<dyn VirtioInterrupt>,
 +}
++
 +impl VhostUserFrontendReqHandler for BackendReqHandler {
 +    fn handle_config_change(&self) -> std::io::Result<u64> {
 +        let size = mem::size_of::<VirtioBlockConfig>();
-+        let (_, data) = self.vu.lock().unwrap().socket_handle().get_config(0, size as u32,
-+            VhostUserConfigFlags::WRITABLE, &vec![0u8; size]).map_err(std::io::Error::other)?;
-+        let cfg = VirtioBlockConfig::from_slice(&data).ok_or_else(|| std::io::Error::other("bad blk config"))?;
++        let (_, data) = self
++            .vu
++            .lock()
++            .unwrap()
++            .socket_handle()
++            .get_config(0, size as u32, VhostUserConfigFlags::WRITABLE, &vec![0; size])
++            .map_err(std::io::Error::other)?;
++        let cfg = VirtioBlockConfig::from_slice(&data)
++            .ok_or_else(|| std::io::Error::other("invalid vhost-user block configuration"))?;
 +        let sectors = cfg.capacity;
 +        self.sectors.store(sectors, Ordering::Release);
 +        self.irq.trigger(crate::VirtioInterruptType::Config)?;
@@ -88,16 +95,17 @@ index 1be1807..9d3d8ef 100644
      guest_memory: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
      epoll_thread: Option<thread::JoinHandle<()>>,
      seccomp_action: SeccompAction,
-@@ -115,7 +131,7 @@ impl Blk {
+@@ -115,7 +138,8 @@ impl Blk {
                  avail_features |= 1 << VIRTIO_BLK_F_MQ;
              }
  
 -            let avail_protocol_features = VhostUserProtocolFeatures::CONFIG
-+            let avail_protocol_features = VhostUserProtocolFeatures::BACKEND_REQ | VhostUserProtocolFeatures::CONFIG
++            let avail_protocol_features = VhostUserProtocolFeatures::BACKEND_REQ
++                | VhostUserProtocolFeatures::CONFIG
                  | VhostUserProtocolFeatures::MQ
                  | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
                  | VhostUserProtocolFeatures::REPLY_ACK
-@@ -191,6 +207,7 @@ impl Blk {
+@@ -191,6 +215,7 @@ impl Blk {
                  ..Default::default()
              },
              id,
@@ -105,10 +113,14 @@ index 1be1807..9d3d8ef 100644
              config,
              guest_memory: None,
              epoll_thread: None,
-@@ -200,11 +217,17 @@ impl Blk {
+@@ -200,11 +225,21 @@ impl Blk {
          })
      }
  
++    fn has_backend_requests(&self) -> bool {
++        self.vu_common.acked_protocol_features & VhostUserProtocolFeatures::BACKEND_REQ.bits() != 0
++    }
++
 +    fn current_config(&self) -> VirtioBlockConfig {
 +        let mut cfg = self.config;
 +        cfg.capacity = self.sectors.load(Ordering::Acquire);
@@ -124,7 +136,7 @@ index 1be1807..9d3d8ef 100644
              acked_protocol_features: self.vu_common.acked_protocol_features,
              vu_num_queues: self.vu_common.vu_num_queues,
          }
-@@ -248,8 +271,19 @@ impl VirtioDevice for Blk {
+@@ -248,8 +283,19 @@ impl VirtioDevice for Blk {
          self.common.ack_features(value);
      }
  
@@ -132,7 +144,7 @@ index 1be1807..9d3d8ef 100644
 +    // the same atomic as read_config so a split capacity read can never
 +    // observe a new generation with the old capacity, or vice versa.
 +    fn config_generation(&self) -> u8 {
-+        if self.vu_common.acked_protocol_features & VhostUserProtocolFeatures::BACKEND_REQ.bits() != 0 {
++        if self.has_backend_requests() {
 +            u8::from(self.sectors.load(Ordering::Acquire) != 0)
 +        } else {
 +            0
@@ -145,17 +157,25 @@ index 1be1807..9d3d8ef 100644
      }
  
      fn write_config(&mut self, offset: u64, data: &[u8]) {
-@@ -288,7 +322,12 @@ impl VirtioDevice for Blk {
+@@ -288,7 +334,20 @@ impl VirtioDevice for Blk {
          self.common.activate(&queues, interrupt_cb.clone())?;
          self.guest_memory = Some(mem.clone());
  
 -        let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
-+        let backend_req_handler = if self.vu_common.acked_protocol_features & VhostUserProtocolFeatures::BACKEND_REQ.bits() != 0 {
-+            Some(FrontendReqHandler::new(Arc::new(BackendReqHandler {
++        let backend_req_handler = if self.has_backend_requests() {
++            let handler = BackendReqHandler {
 +                vu: self.vu_common.vu.as_ref().unwrap().clone(),
-+                sectors: self.sectors.clone(), irq: interrupt_cb.clone(),
-+            })).map_err(|_| crate::ActivateError::BadActivate)?)
-+        } else { None };
++                sectors: self.sectors.clone(),
++                irq: interrupt_cb.clone(),
++            };
++            Some(
++                FrontendReqHandler::new(Arc::new(handler))
++                    .map_err(Error::FrontendReqHandlerCreation)
++                    .map_err(crate::ActivateError::VhostUserSetup)?,
++            )
++        } else {
++            None
++        };
  
          // Run a dedicated thread for handling potential reconnections with
          // the backend.

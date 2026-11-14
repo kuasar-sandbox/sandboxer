@@ -76,7 +76,7 @@ func MaterializeImageDefaults(cfg *config.SandboxConfig, image *ImageConfig) err
 	for i := range mounts {
 		cfg.Mounts[i] = config.MountConfig{
 			Target: mounts[i].Target, Type: mounts[i].Type,
-			Source: mounts[i].Source, Options: mounts[i].Options,
+			Source: mounts[i].Source, Subpath: mounts[i].Subpath, Options: mounts[i].Options,
 		}
 	}
 	return nil

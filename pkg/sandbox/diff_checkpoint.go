@@ -28,6 +28,9 @@ type CheckpointDiskPlan struct {
 // bases may be bound after cold C0 projection, without changing any paths.
 // reopen is populated only after pinning and checking every source version.
 func PrepareCheckpointDiskPlan(cfg *config.SandboxConfig, bases *config.PortableSandboxConfig, directory string, reopen []string) (*CheckpointDiskPlan, error) {
+	if err := cfg.PrepareInlineDiskGraphs(); err != nil {
+		return nil, err
+	}
 	directory, err := filepath.Abs(directory)
 	if err != nil {
 		return nil, err

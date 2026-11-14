@@ -84,7 +84,12 @@ func (r *Runtime) planSlotBind(index int, source config.DiskV1, id string, size 
 			if err = errors.Join(f.Sync(), f.Close()); err != nil {
 				return err
 			}
-			if err = r.retainSlotTopology(ctx, cfg, c0, candidate, index, size, loc); err != nil {
+			if err = syncDiskDirectory(filepath.Dir(plan.DiffPath)); err != nil {
+				return err
+			}
+			// Rename publishes the metadata before its directory sync. Preserve
+			// this writer on either outcome; Bind retries the sync before ACK.
+			if err = r.retainSlotTopology(ctx, cfg, c0, candidate, index, size, loc); err != nil && !errors.Is(err, artifact.ErrCurrentMetadataPublished) {
 				return err
 			}
 		}
@@ -120,4 +125,13 @@ func (r *Runtime) retainSlotTopology(ctx context.Context, cfg *config.SandboxCon
 	return RetainCurrentDiskPlan(ctx, r.diskStorage, r.checkpointOwner, r.spec.CurrentRun, cfg, c0, parent, plan, caps, locations, RunOptions{
 		SourceBinding: h.SourceBinding, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, Fetcher: h.Fetcher,
 	})
+}
+
+func syncDiskDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }

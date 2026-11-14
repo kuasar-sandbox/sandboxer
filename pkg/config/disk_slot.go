@@ -60,6 +60,23 @@ func (d *DiskConfig) validateSource(field string, cold bool) error {
 	return err
 }
 
+// PrepareInlineDiskGraphs validates configuration before checkpoint planning
+// assigns private writer paths, then exposes the effective immutable graph to
+// capture and dependency retention. The DiskV1 still owns the template.
+func (c *SandboxConfig) PrepareInlineDiskGraphs() error {
+	for i := range c.Boot.Disks {
+		d := &c.Boot.Disks[i]
+		if d.Disk == nil {
+			continue
+		}
+		if err := d.validateSource(fmt.Sprintf("boot.disks[%d]", i), true); err != nil {
+			return err
+		}
+		d.Base, d.BaseFromRefs, d.PureBlock = d.Disk.Base, append([]string(nil), d.Disk.BaseFromRefs...), true
+	}
+	return nil
+}
+
 // ValidateMountProjections checks source overlap per disk and all targets that can mask a disk.
 // Path comparisons are component based and independent of the host filesystem.
 func ValidateMountProjections(mounts []MountConfig) error {
@@ -120,6 +137,9 @@ func validateSlotArtifact(d PortableDiskConfig) error {
 }
 
 func checkHostDiskSelection(host *DiskConfig, saved *PortableDiskConfig) error {
+	if saved.Slot != nil && (host.Diff != "" || host.DiffTemplate != "") {
+		return fmt.Errorf("slot %q writer belongs to the captured artifact", host.Name)
+	}
 	if host.Disk != nil {
 		return fmt.Errorf("immutable source of disk %q belongs to the captured artifact", host.Name)
 	}

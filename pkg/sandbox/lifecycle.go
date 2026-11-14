@@ -921,7 +921,9 @@ func resolveDiskMounts(mounts []proto.MountSpec, disks []config.DiskConfig, root
 		}
 		i := ord[m.Source] // validated to exist by config.validateDisks
 		d := &disks[i]
-		m.DiskSlot = d.Slot != nil
+		// A fresh guest has no cached state for an already-bound disk. Mount it
+		// during Launch. Memory Restore retains the original autofs state.
+		m.DiskSlot = d.Unbound()
 		m.DiskIndex = i
 		m.Source = ""
 		if d.RootConfig.Single() {
@@ -3183,7 +3185,42 @@ func canonicalizeConfiguredTarRefsWithOpener(ctx context.Context, cfg *config.Sa
 		return err
 	}
 	for i := range cfg.Boot.Disks {
-		if err := normalizeRoot(fmt.Sprintf("boot.disks[%d]", i), &cfg.Boot.Disks[i].RootConfig); err != nil {
+		disk := &cfg.Boot.Disks[i]
+		field := fmt.Sprintf("boot.disks[%d]", i)
+		if disk.Disk != nil {
+			// Inline DiskV1 supplies the immutable graph. Capture and CurrentRun
+			// consume the same host-resolved graph as the cold data path.
+			src := *disk.Disk
+			src.BaseFromRefs = append([]string(nil), src.BaseFromRefs...)
+			qualify := func(raw *string) error {
+				if *raw == "" {
+					return nil
+				}
+				ref, err := manifest.ParseRef(*raw)
+				if err != nil {
+					return err
+				}
+				if ref.Scheme != manifest.RefSchemeFile || ref.DigestScheme != "" {
+					return nil
+				}
+				return normalize(field+".disk", raw)
+			}
+			if err := qualify(&src.Base); err != nil {
+				return err
+			}
+			for j := range src.BaseFromRefs {
+				if err := qualify(&src.BaseFromRefs[j]); err != nil {
+					return err
+				}
+			}
+			disk.Disk = &src
+			disk.Base, disk.BaseFromRefs, disk.PureBlock = src.Base, src.BaseFromRefs, true
+			continue
+		}
+		if disk.PureBlock {
+			continue
+		} // graph from a content-identified artifact
+		if err := normalizeRoot(field, &disk.RootConfig); err != nil {
 			return err
 		}
 	}

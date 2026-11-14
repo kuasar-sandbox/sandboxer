@@ -108,3 +108,18 @@ func TestSlotOwnerAckLossPreservesWriterAndProtectsCapture(t *testing.T) {
 		t.Fatalf("merge on retry: %v", err)
 	}
 }
+
+func TestColdLaunchOnlyInstallsAutofsForUnboundSlot(t *testing.T) {
+	disks := []config.DiskConfig{
+		{Name: "restored", Slot: &config.DiskSlotConfig{}, Binding: &config.SlotBinding{ID: "saved", SizeBytes: 8192}},
+		{Name: "unbound", Slot: &config.DiskSlotConfig{}},
+		{Name: "ordinary"},
+	}
+	mounts := []proto.MountSpec{{Type: "disk", Source: "restored", Subpath: "data"}, {Type: "disk", Source: "unbound", Subpath: "output"}, {Type: "disk", Source: "ordinary"}}
+	resolveDiskMounts(mounts, disks, true)
+	for i, m := range mounts {
+		if m.DiskSlot != (i == 1) || m.DiskIndex != i || len(m.DiskDevs) != 1 || m.DiskDevs[0] != guestDevPath(i+1) {
+			t.Fatalf("mount %d: %+v", i, m)
+		}
+	}
+}

@@ -84,7 +84,7 @@ func TestMaterializeImageDefaultsMakesPortableWorkloadSelfContained(t *testing.T
 			Args: []string{"override"}, Env: map[string]string{"B": "host"},
 			EphemeralEnv: map[string]string{"SECRET": "once"},
 		},
-		Mounts: []config.MountConfig{{Target: "/explicit", Type: "tmpfs"}},
+		Mounts: []config.MountConfig{{Target: "/explicit", Type: "disk", Source: "work", Subpath: "data"}},
 	}
 	imageCfg := &ImageConfig{
 		Entrypoint: []string{"/entry", "fixed"}, Cmd: []string{"default"},
@@ -108,7 +108,7 @@ func TestMaterializeImageDefaultsMakesPortableWorkloadSelfContained(t *testing.T
 		t.Fatalf("materialized launch = %#v", cfg.Launch)
 	}
 	wantMounts := []config.MountConfig{
-		{Target: "/explicit", Type: "tmpfs"},
+		{Target: "/explicit", Type: "disk", Source: "work", Subpath: "data"},
 		{Target: "/volume", Type: "empty"},
 	}
 	if !reflect.DeepEqual(cfg.Mounts, wantMounts) {

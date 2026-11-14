@@ -77,6 +77,15 @@ func restoredDiskBackends(disks []DiskBackend, cfg *config.SandboxConfig) (*vhos
 				return nil, nil, err
 			}
 			shape.WritableCapacity = capacity
+			if d.Cow != nil {
+				binding := cfg.Boot.Disks[i-1].Binding
+				if binding == nil || binding.SizeBytes != d.Cow.Size() || (capacity != 0 && capacity != binding.SizeBytes) {
+					return nil, nil, errors.New("restore slot writer differs from saved capacity")
+				}
+				shape.WritableCapacity = binding.SizeBytes
+			} else if cfg.Boot.Disks[i-1].Binding != nil {
+				return nil, nil, errors.New("restore bound slot has no writer")
+			}
 		} else if d.Cow != nil {
 			shape.WritableCapacity = d.Cow.Size()
 		} else {
@@ -255,6 +264,11 @@ func (r *Runtime) BindDisk(ctx context.Context, req BindDiskRequest) error {
 	}
 	if entry.State == diskReady {
 		return nil
+	}
+	if r.spec.CurrentRun != nil {
+		if err := syncDiskDirectory(r.checkpointOwner.Directory); err != nil {
+			return fmt.Errorf("disk published, current-run directory sync pending: %w", err)
+		}
 	}
 	if entry.dynamic {
 		if err := h.Servers[entry.deviceIndex].NotifyCapacity(); err != nil {

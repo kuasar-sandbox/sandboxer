@@ -125,6 +125,8 @@ Usage:
                         [--mode local|bundle] [--resume]
                         [--run-root <dir>] [--timeout <sec>]
   # With --checkpoint, optional --output must be the owner's checkpoint directory.
+  sandbox-ctl export    --source-ref <saved-E-or-S> --disk <name> (--output <dir> | --upload)
+                        [--source-dir <dir>] [--manifest-config <file>] [--ref-location name=file:///path]
   sandbox-ctl disk bind --path-id <leaf> --disk <name> --disk-spec <file|->
                         [--ref-location name=file:///path] [--expected-run <run-id>]
   sandbox-ctl disk list --path-id <leaf> [--expected-run <run-id>]

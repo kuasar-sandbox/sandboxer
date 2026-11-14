@@ -184,7 +184,9 @@ Size 是 `512MiB` 等字节大小字符串；duration 是 `30s` 等 Go duration 
 | `boot.root.diff`、`boot.root.diff_template`、`boot.root.base_from_refs` | Local ref、local ref、有序 ref list | 仅 single-disk 的可写绑定、provisioning template 和 lower chain；与 overlay 互斥 |
 | `boot.root.overlay.base`、`.base_from_refs`、`.diff`、`.diff_template` | Ref、ref list、local ref、local ref | 可写 upper 的不可变源链及 active binding；与 single-disk 同类字段规则相同 |
 | `boot.disks[].name` | 唯一非空 String | 最多八个 data disk，按稳定 array 顺序排列 |
-| `boot.disks[].base`、`.overlay`、`.diff`、`.diff_template`、`.base_from_refs` | 与 root 相同的 disk shape | 每个 data disk 遵循相同 single/overlay 源规则；冷启动恰好一个 `mounts[].type: disk` 消费它 |
+| `boot.disks[].base`、`.overlay`、`.diff`、`.diff_template`、`.base_from_refs` | 与 root 相同的 disk shape | 每个 data disk 遵循相同 single/overlay 源规则；每块盘在冷启动时至少有一个 `type: disk` 挂载目标 |
+| `boot.disks[].slot` | `{}` 或 `{size: 8GiB}` | 运行期绑定的单设备盘位 |
+| `boot.disks[].disk` | 完整的 DiskV1 | 从相同盘定义冷启动，使用本实例的私有可写层 |
 
 `diff` 与 `diff_template` 是本地绝对文件引用；不可变 ref 可用受支持的 local/Manifest carrier。
 Lower chain 要求 base。冷启动的可写 ext4 设备需要可挂载 base/template/已有 diff；空白文件不是文件系统。
@@ -192,6 +194,28 @@ Lower chain 要求 base。冷启动的可写 ext4 设备需要可挂载 base/tem
 启用 `--enable-checkpoint` 后，可写文件归于派生的 checkpoint 目录，包括自动选择的路径，正常退出后也保留。
 该模式的[归属与清理规则](block-storage_zh.md#checkpoints)由块存储契约定义。容量来自所选磁盘源，
 不是 quota 或 resize flag，见[容量与迁移](#disk-capacity)。
+
+### 延迟绑定与子目录挂载
+
+以下配置为 `input` 保留一个 virtio-blk 设备。Guest 在启动时建立 autofs 挂载点。绑定前访问目录返回可重试错误，绑定后第一次访问时挂载 ext4 并投影对应子目录。普通 single/overlay 数据盘也使用同一组 `mounts`。不同目标路径之间，以及同一盘的源子目录之间，均须互不重叠。
+```yaml
+boot:
+  disks:
+    - name: input
+      slot: {}
+mounts:
+  - {type: disk, source: input, subpath: data, target: /data}
+  - {type: disk, source: input, subpath: results, target: /out}
+```
+
+省略 `slot.size` 时，盘位在绑定后采用来源容量。指定时，容量必须与来源完全匹配。列出目标实例的盘位后，可以导出已保存 E 或 S 中的一块盘，将完整 JSON 交给另一个实例。整机 checkpoint 也支持此导出命令。
+```bash
+sandbox-ctl disk list --path-id receiver
+sandbox-ctl export --source-ref "$PAUSED_E" --disk work --output "$OUT" > work.disk.json
+sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
+```
+
+本地输出为包含所需块层的 Bundle。跨宿主交付可用 `--upload` 发布内容，并向两端提供相应的 Manifest 配置。初始化新盘时，`--disk-spec` 也可读取含 `kind: disk`、`version: 1` 及 `diff_template` 的 JSON。绑定可以通过 `--ref-location NAME=file:///dir` 提供命名位置。
 
 ### 工作负载字段
 
@@ -252,7 +276,7 @@ Capture 命令的 `--timeout` 由 [Runtime 操作](runtime_zh.md#snapshot)单独
 | Persistent override allowed | resources workload defaults, launch, mounts, files, init, metadata |
 | Instance-only | IP/MAC/hostname, ephemeral files/env, stdio/forward |
 
-受保护字段有冲突时明确报出 field context. Host不能通过省略或 YAML merge静默改变 disk graph. Persistent `mounts` 可以修改普通 tmpfs/empty mount 的声明,但 data-disk mount 的 source、target、name 和 order 必须保持 artifact topology,不能借 mount override移动磁盘.
+受保护字段有冲突时明确报出 field context. Host不能通过省略或 YAML merge静默改变 disk graph. Persistent `mounts` 可以修改普通 tmpfs/empty mount 的声明,但 data-disk mount 的 source、target、subpath 和顺序 必须保持 artifact topology,不能借 mount override移动磁盘.
 
 Network必须满足:
 
@@ -275,7 +299,7 @@ source E 的 non-boot portable defaults
   -> ordinary ValidateCold / artifact preflight / ProjectPortableCold
 ```
 
-完整 replacement 同时覆盖 `boot.kernel`、`boot.runtime`、`boot.cmdline`、`boot.root` 和整个 `boot.disks[]`;不存在 root-only 或 leaf-level graph merge. Host config 没有写 `boot.disks` 就表示零个 data disk，而不是继承来源 disks. 若来源 mounts 仍引用已移除或改名的 disk，调用方必须同时替换 mounts；普通 cold disk/mount 1:1 validation 会在 controller、cgroup、run directory、network 或 VM side effect 前拒绝不一致结果.
+完整 replacement 同时覆盖 `boot.kernel`、`boot.runtime`、`boot.cmdline`、`boot.root` 和整个 `boot.disks[]`;不存在 root-only 或 leaf-level graph merge. Host config 没有写 `boot.disks` 就表示零个 data disk，而不是继承来源 disks. 若来源 mounts 仍引用已移除或改名的 disk，调用方必须同时替换 mounts；普通 cold disk mount topology validation 会在 controller、cgroup、run directory、network 或 VM side effect 前拒绝不一致结果.
 
 Replacement 不复用来源 E 的 kernel/runtime 默认 binding、`self`、`RunSourceBinding` 或 Bundle reader/fetcher. Host boot refs仍通过普通 cold canonicalization、local crypto、Manifest/Bundle lookup和preflight. 生成的新 C0及后续 E/S disk closure只依赖replacement boot. `--replace-boot` 必须与`--from`和显式`--config`（或`SANDBOX_CONFIG`）一起使用，且永远不能与`--restore`一起使用.
 

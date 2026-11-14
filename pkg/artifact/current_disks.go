@@ -235,6 +235,10 @@ func readCurrentJSON(path string, v any) ([]byte, error) {
 	return b, nil
 }
 
+// ErrCurrentMetadataPublished means the replacement has become visible, but
+// persisting the directory entry failed. Its referenced writers must be kept.
+var ErrCurrentMetadataPublished = errors.New("current metadata published with pending directory sync")
+
 func writeCurrentJSON(path string, v any) (retErr error) {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -251,14 +255,18 @@ func writeCurrentJSON(path string, v any) (retErr error) {
 	if err := errors.Join(f.Sync(), f.Close()); err != nil {
 		return err
 	}
-	if err := os.Rename(f.Name(), path); err != nil {
-		return err
-	}
 	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
-	return errors.Join(dir.Sync(), dir.Close())
+	defer dir.Close()
+	if err := os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		return errors.Join(ErrCurrentMetadataPublished, err)
+	}
+	return nil
 }
 
 type resetDiskOperation struct {

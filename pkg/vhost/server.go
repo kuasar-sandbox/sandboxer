@@ -1015,8 +1015,6 @@ func (s *Server) supportedProtocolFeatures() uint64 {
 	return bitProtocolConfig
 }
 
-// CanNotifyCapacity is checked before the first backend publication so a VMM
-// lacking the required protocol cannot acquire a disk that it cannot expose.
 func (s *Server) SetSlotOrigin(path string, size int64) {
 	if s.stats != nil {
 		if s.capacityNotify {
@@ -1026,6 +1024,8 @@ func (s *Server) SetSlotOrigin(path string, size int64) {
 	}
 }
 
+// CanNotifyCapacity is checked before the first backend publication so a VMM
+// lacking the required protocol cannot acquire a disk that it cannot expose.
 func (s *Server) CanNotifyCapacity() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1043,7 +1043,8 @@ func (s *Server) NotifyCapacity() error {
 	var header [12]byte
 	binary.LittleEndian.PutUint32(header[:], 2) // VHOST_USER_BACKEND_CONFIG_CHANGE_MSG
 	binary.LittleEndian.PutUint32(header[4:], FlagVersion1)
-	n, err := s.frontendReq.Write(header[:])
+	// A stalled VMM must not hold the owner capture gate or prevent teardown.
+	n, err := syscall.SendmsgN(int(s.frontendReq.Fd()), header[:], nil, nil, syscall.MSG_DONTWAIT|syscall.MSG_NOSIGNAL)
 	if err == nil && n != len(header) {
 		return io.ErrShortWrite
 	}

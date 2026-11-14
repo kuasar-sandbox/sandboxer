@@ -1594,7 +1594,7 @@ func (c *SandboxConfig) validateDisks(cold bool) error {
 			return err
 		}
 	}
-	// 1:1 with mounts[].type=disk — COLD only. On restore the guest resumes
+	// Every disk needs at least one projection on cold start. On restore the guest resumes
 	// with the data disks already mounted (in the memory image); the restore
 	// host yaml lists boot.disks[] for device order + erofs bases but does not
 	// re-mount, so it need not carry the mounts[].
