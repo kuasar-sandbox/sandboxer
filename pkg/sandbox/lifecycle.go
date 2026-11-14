@@ -3223,7 +3223,27 @@ func canonicalizeConfiguredTarRefsWithOpener(ctx context.Context, cfg *config.Sa
 				if ref.Scheme != manifest.RefSchemeFile || ref.DigestScheme != "" {
 					return nil
 				}
-				return normalize(field+".disk", raw)
+				// A pure layer may end in valid ZIP bytes or use a .sandbox
+				// filename. Its identity comes from the outer transport.
+				path, err := locations.ResolveFile(ref, "")
+				if err != nil {
+					return err
+				}
+				var stream fetch.Stream
+				if opener != nil {
+					stream, err = opener(ctx, path, ref)
+				} else {
+					stream, _, err = openLocalDiskStream(path, ref, codec, required)
+				}
+				if err != nil {
+					return err
+				}
+				pinned, err := pureFileIdentity(ref, stream)
+				if err = errors.Join(err, stream.Close()); err != nil {
+					return err
+				}
+				*raw = pinned.String()
+				return nil
 			}
 			if err := qualify(&src.Base); err != nil {
 				return err

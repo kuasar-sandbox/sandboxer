@@ -111,3 +111,23 @@ func TestDiskV1PinsUnqualifiedFileFromLiveStream(t *testing.T) {
 		t.Fatal("content resolution overwrote the idempotency selector")
 	}
 }
+
+func TestColdDiskV1IdentityNeverProbesGuestZIPOrFilename(t *testing.T) {
+	dir := t.TempDir()
+	// An ordinary disk may use an E-like filename. A generic E probe would
+	// fail this fixture even though the backing tarstream is valid.
+	path, scheme, digest := writeDiskArtifact(t, dir, "overlay", make([]byte, 8192), nil)
+	renamed := filepath.Join(dir, "user.sandbox")
+	if err := os.Rename(path, renamed); err != nil {
+		t.Fatal(err)
+	}
+	base := "file://" + renamed
+	cfg := &config.SandboxConfig{Boot: config.BootConfig{Disks: []config.DiskConfig{{Name: "data", Disk: &config.DiskV1{Kind: "disk", Version: 1, Base: base}}}}}
+	if err := canonicalizeConfiguredTarRefs(cfg, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := manifest.ParseRef(cfg.Boot.Disks[0].Base)
+	if err != nil || resolved.DigestScheme != scheme || resolved.Digest != digest || cfg.Boot.Disks[0].Disk.Base != resolved.String() {
+		t.Fatalf("cold disk reference: %v, %v", cfg.Boot.Disks[0], err)
+	}
+}

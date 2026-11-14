@@ -8,6 +8,8 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
@@ -138,14 +140,30 @@ func openPureLayer(ctx context.Context, ref manifest.Ref, storage *artifact.Proc
 		return nil, ref, err
 	}
 	if pin && ref.DigestScheme == "" {
-		if key, bundle := file.RootManifestKey(); bundle {
-			ref.DigestScheme, ref.Digest = "manifest", manifest.HexKey(key)
-		} else {
-			ref.DigestScheme, ref.Digest = file.Digest()
-		}
-		if ref.DigestScheme == "" || ref.Digest == "" {
-			return nil, ref, errors.Join(errors.New("disk layer has no content identity"), file.Close())
+		ref, err = pureFileIdentity(ref, file)
+		if err != nil {
+			return nil, ref, errors.Join(err, file.Close())
 		}
 	}
+
 	return file, ref, nil
+}
+
+// Inspect the selector chosen by this open, without interpreting any guest bytes.
+func pureFileIdentity(ref manifest.Ref, stream fetch.Stream) (manifest.Ref, error) {
+	if selected, ok := stream.(interface {
+		RootManifestKey() (store.ContentKey, bool)
+	}); ok {
+		if key, bundle := selected.RootManifestKey(); bundle {
+			ref.DigestScheme, ref.Digest = "manifest", manifest.HexKey(key)
+			return ref, ref.Validate()
+		}
+	}
+	if d, ok := stream.(tarstream.Digester); ok {
+		ref.DigestScheme, ref.Digest = d.Digest()
+	}
+	if ref.DigestScheme == "" || ref.Digest == "" {
+		return ref, errors.New("disk layer has no content identity")
+	}
+	return ref, ref.Validate()
 }
