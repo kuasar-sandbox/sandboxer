@@ -53,13 +53,12 @@ func DefaultDiskDiffURI(baseDir, sandboxID, diskKey string) string {
 // baseSize is the COW base's logical size, or 0 without a base;
 // templateURI is "" when unset. No filesystem resize or quota is performed.
 func PrepareDiff(diffPath, templateURI string, baseSize int64) (diffstore.DiffInit, error) {
-	if st, err := os.Stat(diffPath); err == nil {
-		if st.Size() > 0 {
-			return diffstore.DiffInit{Existing: true}, nil
-		}
-		return diffstore.DiffInit{}, fmt.Errorf("existing diff %s is empty; remove it or provide a formatted diff", diffPath)
-	} else if !os.IsNotExist(err) {
-		return diffstore.DiffInit{}, fmt.Errorf("stat diff %s: %w", diffPath, err)
+	exists, err := existingDiff(diffPath)
+	if err != nil {
+		return diffstore.DiffInit{}, err
+	}
+	if exists {
+		return diffstore.DiffInit{Existing: true}, nil
 	}
 
 	switch {
@@ -77,4 +76,18 @@ func PrepareDiff(diffPath, templateURI string, baseSize int64) (diffstore.DiffIn
 	default:
 		return diffstore.DiffInit{}, fmt.Errorf("no ext4 source for a fresh overlay diff: set boot.root.overlay.diff_template or boot.root.overlay.base, or pre-format the diff at %s", diffPath)
 	}
+}
+
+func existingDiff(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("stat diff %s: %w", path, err)
+	}
+	if info.Size() == 0 {
+		return false, fmt.Errorf("existing diff %s is empty; remove it or provide a formatted diff", path)
+	}
+	return true, nil
 }

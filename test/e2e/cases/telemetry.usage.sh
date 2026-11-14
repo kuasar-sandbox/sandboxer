@@ -150,7 +150,8 @@ def main():
                 ext4(disk)
                 config["boot"]["disks"].append({"name": f"data{ordinal}", "diff_template": f"file://{disk}"})
                 config["mounts"].append({"type": "disk", "source": f"data{ordinal}", "target": target})
-            config["mounts"].append({"type": "empty", "target": "/data/cache"})
+            # Exercise an empty volume alongside the two non-overlapping disk roots.
+            config["mounts"].append({"type": "empty", "target": "/scratch-cache"})
         sb = Sandbox(work, name, config, ch_binary=LIB.joinpath("usage_oom_wrapper.py") if name == "oom" else None)
         relay, failure = None, None
         try:
@@ -172,7 +173,8 @@ def main():
             sb.cli("exec", "--", "/probe", "cpu", "2")
             sb.cli("exec", "--", "/probe", "write", "/tmp/usage-data", "16")
             if name == "multidisk":
-                sb.cli("exec", "--", "/probe", "write", "/data/cache/usage-data", "16")
+                sb.cli("exec", "--", "/probe", "write", "/scratch-cache/usage-data", "16")
+                sb.cli("exec", "--", "/probe", "write", "/data/usage-data", "4")
             sb.record_timing("cpu-and-disk-workload", started)
             if name == "off" or balloon:
                 # Keep the absence window and every balloon controller warmup.

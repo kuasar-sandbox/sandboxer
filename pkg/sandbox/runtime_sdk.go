@@ -903,12 +903,11 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			}
 		}()
 		var diffURI, diffTemplate string
-		var pure *config.DiskV1
+		var pure *config.DiskConfig
 		if !isRoot {
-			disk := cfg.Boot.Disks[index-1]
-			pure = disk.Disk
-			if pure == nil && disk.PureBlock && root.Base != "" {
-				pure = &config.DiskV1{Kind: "disk", Version: 1, Base: root.Base, BaseFromRefs: root.BaseFromRefs}
+			disk := &cfg.Boot.Disks[index-1]
+			if disk.Disk != nil || disk.PureBlock {
+				pure = disk
 			}
 		}
 		if pure != nil {
@@ -917,7 +916,11 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			if launchCodec(spec) != nil {
 				opts = append(opts, diffstore.WithDiffEncryption(diffKey, launchRequired(spec)))
 			}
-			base, _, diffTemplate, e = OpenDiskV1Source(readCtx, *pure, r.diskStorage, spec.RefLocations, opts...)
+			writer := root.Diff
+			if writer == "" && !r.spec.EnableCheckpoint {
+				writer = DefaultDiskDiffURI(r.baseDir, r.sandboxID, fmt.Sprintf("disk%d", index-1))
+			}
+			base, _, diffTemplate, e = openColdDiskSource(readCtx, *pure, writer, r.diskStorage, spec.RefLocations, opts...)
 			if e != nil {
 				return DiskBackend{}, e
 			}
@@ -1065,6 +1068,9 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if cols, rows, ok := spec.Stdio.InitialWinsize(); ok {
 		ls.Stdio.Winsize = &proto.Winsize{Cols: cols, Rows: rows}
 	}
+	// The new host has validated the effective projections, including OCI
+	// volumes. Ask the guest to enforce the same rules after resolving aliases.
+	ls.DiskMountProjectionV1 = len(cfg.Boot.Disks) != 0
 	resolveDiskMounts(ls.Mounts, cfg.Boot.Disks, cfg.SingleDisk())
 	if _, err := config.WritePortableSandboxConfig(r.runDir, portable); err != nil {
 		return fail(err)

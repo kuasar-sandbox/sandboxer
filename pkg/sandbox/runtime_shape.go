@@ -298,15 +298,24 @@ func deriveBoundRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, opts
 			case checkpointSizes != nil:
 				size = checkpointSizes[i+1]
 			default:
-				source := disk.SourceDefinition()
-				if source.Base == "" && source.DiffTemplate == "" && disk.Diff != "" {
-					size, err = runtimeWritableCapacity(disk.Diff, "", 0, diffOpts)
-				} else {
-					var reader diffstore.BlockReader
-					reader, size, _, err = OpenDiskV1Source(ctx, source, diskStorage, launch.RefLocations, diffOpts...)
-					if reader != nil {
-						err = errors.Join(err, reader.Close())
+				writer := disk.Diff
+				if writer == "" && opts.SandboxID != "" && !opts.EnableCheckpoint {
+					writer = DefaultDiskDiffURI(defaultBaseDir, opts.SandboxID, fmt.Sprintf("disk%d", i))
+				}
+				var reader diffstore.BlockReader
+				reader, size, _, err = openColdDiskSource(ctx, disk, writer, diskStorage, launch.RefLocations, diffOpts...)
+				if reader != nil {
+					err = errors.Join(err, reader.Close())
+				}
+				if err == nil {
+					// The opener already computed fresh template/base capacity. Read
+					// writer metadata only when this target actually exists.
+					var actual int64
+					actual, err = runtimeWritableCapacity(writer, "", size, diffOpts)
+					if err == nil && actual < size {
+						err = fmt.Errorf("existing writer capacity %d smaller than disk source %d", actual, size)
 					}
+					size = actual
 				}
 			}
 			if err != nil {

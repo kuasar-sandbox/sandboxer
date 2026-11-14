@@ -23,6 +23,32 @@ func OpenDiskV1Source(ctx context.Context, spec config.DiskV1, storage *artifact
 	return openDiskV1Source(ctx, spec, storage, locations, nil, opts...)
 }
 
+// A private writer consumes its provisioning template only once. Keep
+// immutable parents readable on reopen, even after the seed has been removed.
+func openColdDiskSource(ctx context.Context, disk config.DiskConfig, writerURI string, storage *artifact.ProcessStorage, locations config.RefLocations, opts ...diffstore.DiskOption) (diffstore.BlockReader, int64, string, error) {
+	source := disk.SourceDefinition()
+	if source.DiffTemplate != "" && writerURI != "" {
+		scheme, path, ok := config.SchemeAndPath(writerURI)
+		if !ok || scheme != "file" {
+			return nil, 0, "", fmt.Errorf("invalid diff URI %q", writerURI)
+		}
+		exists, err := existingDiff(path)
+		if err != nil {
+			return nil, 0, "", err
+		}
+		if exists {
+			// The optional assertion refers to the complete seed, which may be
+			// larger than its immutable base. It does not describe that base alone.
+			source.DiffTemplate = ""
+			source.Size = nil
+		}
+	}
+	if source.Base == "" && source.DiffTemplate == "" {
+		return nil, 0, "", nil
+	}
+	return OpenDiskV1Source(ctx, source, storage, locations, opts...)
+}
+
 // When resolved is supplied, record immutable identities from the very file
 // handles backing the live reader, including a selected non-root Bundle member.
 func openDiskV1Source(ctx context.Context, spec config.DiskV1, storage *artifact.ProcessStorage, locations config.RefLocations, resolved *config.DiskV1, opts ...diffstore.DiskOption) (base diffstore.BlockReader, size int64, template string, err error) {

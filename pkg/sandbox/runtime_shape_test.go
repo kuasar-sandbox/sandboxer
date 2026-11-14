@@ -677,3 +677,78 @@ func runtimeShapeJSON(t *testing.T, value any) []byte {
 	}
 	return raw
 }
+
+func TestColdPureDiskWriterAndTemplatePrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		seed, writer  int
+		defaultWriter bool
+	}{
+		{"equal-template", 8192, 0, false}, {"larger-template", 12288, 0, false},
+		{"existing-explicit", 4096, 16384, false}, {"existing-default", 4096, 20480, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shape, launch := sdkFixture(t)
+			dir := shape.BaseRoot
+			baseBytes := make([]byte, 8192)
+			baseBytes[1024+56], baseBytes[1024+57] = 0x53, 0xef
+			baseBytes[0] = 'B'
+			path, scheme, digest := writeDiskArtifact(t, dir, "overlay", baseBytes, nil)
+			seed := filepath.Join(dir, "data-seed")
+			// Portable E contributes only the immutable graph. ApplyFromRules carries
+			// the host's writable fields alongside it in the effective configuration.
+			disk := config.DiskConfig{Name: "data", PureBlock: true, RootConfig: config.RootConfig{Base: fileRef(path, scheme, digest), DiffTemplate: "file://" + seed}}
+			want := byte('T')
+			capacity := tc.seed
+			if tc.writer > 0 {
+				capacity = tc.writer
+				want = 'W'
+				writer := filepath.Join(dir, "existing.diff")
+				if tc.defaultWriter {
+					writer = filepath.Join(DefaultBaseDir(dir, shape.SandboxID), shape.SandboxID+".disk0.diff")
+					if err := os.MkdirAll(filepath.Dir(writer), 0700); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					disk.Diff = "file://" + writer
+				}
+				body := make([]byte, tc.writer)
+				copy(body, baseBytes)
+				body[0] = want
+				writeTestDiff(t, writer, body)
+				// Leave the original provisioning seed unavailable.
+			} else {
+				body := make([]byte, tc.seed)
+				copy(body, baseBytes)
+				body[0] = want
+				writeTestDiff(t, seed, body)
+			}
+			launch.Disks = []config.DiskConfig{disk}
+			launch.Mounts = []config.MountConfig{{Type: "disk", Source: "data", Target: "/data"}}
+			cfg, err := launch.config(shape.config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			derived, err := DeriveRuntimeSpecWithOptions(context.Background(), cfg, DeriveRuntimeOptions{Launch: launch, SandboxID: shape.SandboxID, BaseRoot: shape.BaseRoot})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(derived.Disks) != 2 || derived.Disks[1].WritableCapacity != int64(capacity) {
+				t.Fatalf("disk shape = %+v, want capacity %d", derived.Disks, capacity)
+			}
+			shape.Disks = derived.Disks
+			rt, err := StartRuntime(context.Background(), shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rt.Close()
+			if err = rt.Launch(context.Background(), launch); err != nil {
+				t.Fatal(err)
+			}
+			var first [1]byte
+			if _, err = rt.deviceSet.DeviceBackends()[1].ReadAt(first[:], 0); err != nil || first[0] != want {
+				t.Fatalf("live device byte = %q, want %q: %v", first, want, err)
+			}
+		})
+	}
+}

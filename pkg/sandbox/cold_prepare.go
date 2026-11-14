@@ -212,13 +212,18 @@ func preflightColdArtifacts(
 				if codec != nil {
 					opts = append(opts, diffstore.WithDiffEncryption(diffCustomerKey, required))
 				}
-				base, _, template, err := OpenDiskV1Source(ctx, source, storage, locations, opts...)
+				defaultURI := DefaultDiskDiffURI(baseDir, sandboxID, fmt.Sprintf("disk%d", i))
+				writer := entry.Diff
+				if writer == "" {
+					writer = defaultURI
+				}
+				base, _, template, err := openColdDiskSource(ctx, *entry, writer, storage, locations, opts...)
 				if err != nil {
 					return nil, fmt.Errorf("preflight %q: %w", entry.Name, err)
 				}
 				root := entry.RootConfig
 				root.DiffTemplate = template
-				err = preflightExt4WithBase(ctx, base, &root, fmt.Sprintf("boot.disks[%d]", i), DefaultDiskDiffURI(baseDir, sandboxID, fmt.Sprintf("disk%d", i)), codec, diffCustomerKey, required, binding(i+1))
+				err = preflightExt4WithBase(ctx, base, &root, fmt.Sprintf("boot.disks[%d]", i), defaultURI, codec, diffCustomerKey, required, binding(i+1))
 				if base != nil {
 					err = errors.Join(err, base.Close())
 				}
