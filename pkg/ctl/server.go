@@ -16,6 +16,8 @@ import (
 // handlers. Each accepted connection is serviced in its own goroutine,
 // so concurrent snapshot/exec requests don't block each other.
 type Server struct {
+	DiskBindHandler         func(BindDiskRequest) error
+	DiskListHandler         func(string) (DiskStateReport, error)
 	Path                    string
 	CheckpointListHandler   func(Request) ([]DiffCheckpointRef, error)
 	CheckpointDeleteHandler func(Request) error
@@ -45,7 +47,7 @@ type Server struct {
 
 // Listen binds the UDS.
 func (s *Server) Listen() error {
-	if s.SnapshotHandler == nil && s.ExportHandler == nil && s.UsageHandler == nil && s.ResourceStatsHandler == nil && s.ExecHandler == nil && s.CheckpointListHandler == nil && s.CheckpointDeleteHandler == nil {
+	if s.SnapshotHandler == nil && s.ExportHandler == nil && s.UsageHandler == nil && s.ResourceStatsHandler == nil && s.ExecHandler == nil && s.DiskBindHandler == nil && s.DiskListHandler == nil && s.CheckpointListHandler == nil && s.CheckpointDeleteHandler == nil {
 		return errors.New("ctl: Server has no handlers")
 	}
 	if s.Logf == nil {
@@ -136,6 +138,12 @@ func (s *Server) handle(conn *net.UnixConn) {
 		return
 	}
 	switch req.Type {
+	case TypeDiskBind, TypeDiskList:
+		defer conn.Close()
+		if err := s.serveDisk(conn, req); err != nil {
+			_ = WriteMessage(conn, diskWireError(err))
+		}
+		return
 	case TypeCheckpointListRequest:
 		defer conn.Close()
 		if s.CheckpointListHandler == nil {

@@ -14,8 +14,10 @@ import (
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
@@ -185,6 +187,11 @@ func TestSeparateSandboxBundleRetainsSnapshotBundleMemoryScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	diskBytes := bytes.Repeat([]byte{0x7a}, 8192)
+	diskRef, _, err := eSink.AbsorbOverlay(ctx, bytes.NewReader(diskBytes), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	eRef, _, err := eSink.AbsorbSandbox(ctx, eLogical)
 	if err != nil {
 		t.Fatal(err)
@@ -251,8 +258,13 @@ func TestSeparateSandboxBundleRetainsSnapshotBundleMemoryScope(t *testing.T) {
 	}
 	sPath := filepath.Join(dir, manifest.HexKey(sKey)+".bundle")
 
+	storage, err := artifact.NewProcessStorageWithLocalAccess(manifestCfg, keyFn, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
 	root, err := openRootSnapshot(ctx, Options{
-		SnapshotPath: sPath, SnapshotRef: "file://" + filepath.Base(sPath) + "@manifest:" + manifest.HexKey(sKey),
+		storage: storage, SnapshotPath: sPath, SnapshotRef: "file://" + filepath.Base(sPath) + "@manifest:" + manifest.HexKey(sKey),
 		ManifestCfg: manifestCfg, CustomerKeyFn: keyFn,
 	})
 	if err != nil {
@@ -264,6 +276,15 @@ func TestSeparateSandboxBundleRetainsSnapshotBundleMemoryScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sandboxSource.Root.Close()
+	disk, size, _, err := sandbox.OpenDiskV1Source(ctx, config.DiskV1{Kind: "disk", Version: 1, Base: diskRef}, sandboxSource.opts.storage, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disk.Close()
+	buf := make([]byte, size)
+	if _, err = disk.ReadAt(buf, 0); err != nil || !bytes.Equal(buf, diskBytes) {
+		t.Fatalf("pure disk outside nested E/S scope: %v", err)
+	}
 	if sandboxSource.bundleSource == nil || sandboxSource.bundleSource.Reader != sandboxSource.bundleReader ||
 		sandboxSource.bundleSource.Fetcher != sandboxSource.bundleFetcher {
 		t.Fatal("Sandbox E Bundle provenance is not paired with its reader/fetcher")

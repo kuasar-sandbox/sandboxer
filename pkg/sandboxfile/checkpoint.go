@@ -54,7 +54,7 @@ func validDiffID(id string) bool {
 }
 
 func (c *Checkpoint) Validate(p *config.PortableSandboxConfig) error {
-	if c == nil || c.Version != 1 {
+	if c == nil || (c.Version != 1 && c.Version != 2) {
 		return errors.New("sandbox Checkpoint version is unsupported")
 	}
 	if err := ValidateCheckpointID(c.CheckpointID); err != nil {
@@ -73,9 +73,20 @@ func (c *Checkpoint) Validate(p *config.PortableSandboxConfig) error {
 		return errors.New("sandbox Checkpoint disk topology mismatch")
 	}
 	seen := map[string]bool{c.Root.DiffID: true}
+	empty := map[string]bool{}
+	for _, d := range p.Boot.Disks {
+		if d.Slot != nil && c.Version < 2 {
+			return errors.New("checkpoint slot requires version 2")
+		}
+		empty[d.Name] = d.Unbound()
+	}
 	names := make(map[string]bool, len(c.Disks))
 	for _, d := range c.Disks {
-		if !validDiffID(d.DiffID) || seen[d.DiffID] || names[d.Name] {
+		if empty[d.Name] && !names[d.Name] && d.DiffID == "" {
+			names[d.Name] = true
+			continue
+		}
+		if empty[d.Name] || !validDiffID(d.DiffID) || seen[d.DiffID] || names[d.Name] {
 			return errors.New("sandbox Checkpoint duplicate or invalid disk identity")
 		}
 		seen[d.DiffID], names[d.Name] = true, true

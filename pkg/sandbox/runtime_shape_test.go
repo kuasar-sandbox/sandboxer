@@ -116,6 +116,9 @@ func TestDeriveRuntimeSpecWithOptionsPreservesScopedBundleAccess(t *testing.T) {
 	}
 	portable := snapshotTestLivePortable(t)
 	portable.Boot.Root.BaseFromRefs = []string{lower}
+	portable.Version = 2
+	portable.Mounts = []config.MountConfig{{Type: "disk", Source: "data", Target: "/data"}}
+	portable.Boot.Disks = []config.PortableDiskConfig{{Name: "data", PureBlock: true, PortableRootConfig: config.PortableRootConfig{Base: lower}}}
 	rootRef, _, err := sink.AbsorbSandbox(ctx, runtimeShapeSandboxSource(t, portable, 8192))
 	if err != nil {
 		t.Fatal(err)
@@ -143,20 +146,39 @@ func TestDeriveRuntimeSpecWithOptionsPreservesScopedBundleAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer opened.Close()
-	cfg := &config.SandboxConfig{Boot: config.BootConfig{Root: config.RootConfig{Base: "self", BaseFromRefs: []string{lower}}}}
+	cfg := &config.SandboxConfig{Boot: config.BootConfig{Root: config.RootConfig{Base: "self", BaseFromRefs: []string{lower}},
+		Disks: []config.DiskConfig{{Name: "data", PureBlock: true, RootConfig: config.RootConfig{Base: lower}}}}}
 	launch := LaunchSpec{Storage: storage, Fetcher: opened.ScopedFetcher(), ManifestConfig: manifestCfg,
 		BundleReader: opened.BundleReader(), BundleFetcher: opened.ManifestFetcher(), PortableConfig: portable,
 		SourceBinding: &RunSourceBinding{SandboxRef: rootRef, RuntimeRef: rootRef, RelativeDir: dir,
 			BundleSource: &BundleSourceBinding{RootPath: path, Reader: opened.BundleReader(), Fetcher: opened.ManifestFetcher()}},
 	}
 	got, err := DeriveRuntimeSpecWithOptions(ctx, cfg, DeriveRuntimeOptions{Launch: launch})
-	if err != nil || got.Disks[0].WritableCapacity != 8192 {
+	if err != nil || len(got.Disks) != 2 || got.Disks[0].WritableCapacity != 8192 || got.Disks[1].WritableCapacity != 8192 {
 		t.Fatalf("scoped Bundle shape = %+v, %v", got.Disks, err)
+	}
+	// An explicit manifest on a file Bundle selects that member, whereas an
+	// unqualified canonical Bundle path selects its root. Both identities must
+	// be retained on bind for later re-open and capture.
+	member := selector
+	member.Digest = strings.TrimPrefix(lower, "manifest://")
+	for _, tc := range []struct{ ref, want string }{{"file://" + path, selector.String()}, {member.String(), member.String()}} {
+		input, e := manifest.ParseRef(tc.ref)
+		if e != nil {
+			t.Fatal(e)
+		}
+		rd, resolved, e := openPureLayer(ctx, input, storage, nil, true)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = rd.Close(); e != nil || resolved.String() != tc.want {
+			t.Fatalf("pinned %s => %s want %s (%v)", tc.ref, resolved.String(), tc.want, e)
+		}
 	}
 	launch.ManifestConfig = nil
 	launch.SourceBinding.RuntimeRef = selector.String()
 	got, err = DeriveRuntimeSpecWithOptions(ctx, cfg, DeriveRuntimeOptions{Launch: launch})
-	if err != nil || got.Disks[0].WritableCapacity != 8192 {
+	if err != nil || len(got.Disks) != 2 || got.Disks[0].WritableCapacity != 8192 || got.Disks[1].WritableCapacity != 8192 {
 		t.Fatalf("scoped file Bundle with storage-owned configuration = %+v, %v", got.Disks, err)
 	}
 	// A file selector must also retain the opaque storage's manifest crypto
@@ -654,4 +676,79 @@ func runtimeShapeJSON(t *testing.T, value any) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func TestColdPureDiskWriterAndTemplatePrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		seed, writer  int
+		defaultWriter bool
+	}{
+		{"equal-template", 8192, 0, false}, {"larger-template", 12288, 0, false},
+		{"existing-explicit", 4096, 16384, false}, {"existing-default", 4096, 20480, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shape, launch := sdkFixture(t)
+			dir := shape.BaseRoot
+			baseBytes := make([]byte, 8192)
+			baseBytes[1024+56], baseBytes[1024+57] = 0x53, 0xef
+			baseBytes[0] = 'B'
+			path, scheme, digest := writeDiskArtifact(t, dir, "overlay", baseBytes, nil)
+			seed := filepath.Join(dir, "data-seed")
+			// Portable E contributes only the immutable graph. ApplyFromRules carries
+			// the host's writable fields alongside it in the effective configuration.
+			disk := config.DiskConfig{Name: "data", PureBlock: true, RootConfig: config.RootConfig{Base: fileRef(path, scheme, digest), DiffTemplate: "file://" + seed}}
+			want := byte('T')
+			capacity := tc.seed
+			if tc.writer > 0 {
+				capacity = tc.writer
+				want = 'W'
+				writer := filepath.Join(dir, "existing.diff")
+				if tc.defaultWriter {
+					writer = filepath.Join(DefaultBaseDir(dir, shape.SandboxID), shape.SandboxID+".disk0.diff")
+					if err := os.MkdirAll(filepath.Dir(writer), 0700); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					disk.Diff = "file://" + writer
+				}
+				body := make([]byte, tc.writer)
+				copy(body, baseBytes)
+				body[0] = want
+				writeTestDiff(t, writer, body)
+				// Leave the original provisioning seed unavailable.
+			} else {
+				body := make([]byte, tc.seed)
+				copy(body, baseBytes)
+				body[0] = want
+				writeTestDiff(t, seed, body)
+			}
+			launch.Disks = []config.DiskConfig{disk}
+			launch.Mounts = []config.MountConfig{{Type: "disk", Source: "data", Target: "/data"}}
+			cfg, err := launch.config(shape.config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			derived, err := DeriveRuntimeSpecWithOptions(context.Background(), cfg, DeriveRuntimeOptions{Launch: launch, SandboxID: shape.SandboxID, BaseRoot: shape.BaseRoot})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(derived.Disks) != 2 || derived.Disks[1].WritableCapacity != int64(capacity) {
+				t.Fatalf("disk shape = %+v, want capacity %d", derived.Disks, capacity)
+			}
+			shape.Disks = derived.Disks
+			rt, err := StartRuntime(context.Background(), shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rt.Close()
+			if err = rt.Launch(context.Background(), launch); err != nil {
+				t.Fatal(err)
+			}
+			var first [1]byte
+			if _, err = rt.deviceSet.DeviceBackends()[1].ReadAt(first[:], 0); err != nil || first[0] != want {
+				t.Fatalf("live device byte = %q, want %q: %v", first, want, err)
+			}
+		})
+	}
 }

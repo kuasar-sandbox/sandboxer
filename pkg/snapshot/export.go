@@ -151,6 +151,12 @@ func validateExportSources(sources ExportSources, sink ArtifactSink) error {
 		return fmt.Errorf("export: runtime disk count %d does not match C0 disk count %d", len(sources.Diffs), 1+len(sources.PortableConfig.Boot.Disks))
 	}
 	for i := range sources.Diffs {
+		if i > 0 && sources.PortableConfig.Boot.Disks[i-1].Unbound() {
+			if sources.Diffs[i].SnapshotView != nil {
+				return errors.New("unbound slot has an active writer")
+			}
+			continue
+		}
 		if sources.Diffs[i].SnapshotView == nil {
 			return fmt.Errorf("export: disk %d has no SnapshotView", i)
 		}
@@ -218,6 +224,9 @@ func ValidateExportGraph(portable *config.PortableSandboxConfig, parentSandboxRe
 
 	dataRefs := make([]string, len(portable.Boot.Disks))
 	for i := range dataRefs {
+		if portable.Boot.Disks[i].Unbound() {
+			continue
+		}
 		for salt := 0; ; salt++ {
 			digest := sha256.Sum256([]byte(fmt.Sprintf("sandboxer prospective C1 data disk %d salt %d", i, salt)))
 			digestHex := fmt.Sprintf("%x", digest[:])
@@ -257,6 +266,9 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 		DataPaths: make([]string, max(0, len(sources.Diffs)-1)),
 	}
 	for i := 1; i < len(sources.Diffs); i++ {
+		if sources.PortableConfig.Boot.Disks[i-1].Unbound() {
+			continue
+		}
 		view, cleanup, err := prepareDiskSource(ctx, sources.Diffs[i], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
 		if err != nil {
 			return nil, fmt.Errorf("export data disk %d SnapshotView: %w", i-1, err)

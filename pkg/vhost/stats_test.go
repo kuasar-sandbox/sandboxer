@@ -110,8 +110,8 @@ func TestStats_PercentileClampedToMax(t *testing.T) {
 func TestStats_MarkRead_Coverage(t *testing.T) {
 	// 16 KiB backend = 4 blocks of 4 KiB.
 	s := NewStats("x", "", 16*1024)
-	if s.totalBlocks != 4 {
-		t.Fatalf("totalBlocks = %d, want 4", s.totalBlocks)
+	if s.Snapshot().TotalBlocks != 4 {
+		t.Fatalf("totalBlocks = %d, want 4", s.Snapshot().TotalBlocks)
 	}
 
 	// Read first 2 blocks (8 KiB at offset 0).

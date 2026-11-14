@@ -68,6 +68,11 @@ var ErrReadOnly = fmt.Errorf("vhost: backend is read-only")
 // hypervisor master connects exactly once; on disconnect, the server
 // reaps virtq workers and stops.
 type Server struct {
+	capacityChanged     chan struct{} // wakes negotiation waiters; guarded by mu
+	protocolFeaturesSet bool
+
+	capacityNotify   bool     // advertise CONFIG_CHANGE_MSG for dynamic slots
+	frontendReq      *os.File // guarded by mu
 	socketPath       string
 	backend          Backend
 	logf             func(format string, args ...any)
@@ -403,6 +408,12 @@ func (s *Server) resetConnectionState() {
 	s.features = 0
 	s.featuresSet = false
 	s.protocolFeatures = 0
+	s.protocolFeaturesSet = false
+	s.signalCapacityChange()
+	if s.frontendReq != nil {
+		_ = s.frontendReq.Close()
+		s.frontendReq = nil
+	}
 	s.mu.Unlock()
 	// Drain workers first (joins on q.done). No s.mu held — the workers
 	// don't need it to exit, and holding it across the join could
@@ -522,6 +533,18 @@ func (s *Server) handle(conn *net.UnixConn, m *Message) error {
 		return s.handleSetVringCall(m)
 	case MsgSetVringEnable:
 		return s.handleSetVringEnable(m)
+	case MsgSetBackendReqFd:
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.protocolFeatures&bitBackendRequest == 0 || len(m.Payload) != 0 || len(m.Fds) != 1 {
+			return errors.New("vhost: invalid or unnegotiated SET_BACKEND_REQ_FD")
+		}
+		if s.frontendReq != nil {
+			_ = s.frontendReq.Close()
+		}
+		s.frontendReq = os.NewFile(uintptr(m.Fds[0]), "vhost-user frontend request")
+		s.signalCapacityChange()
+		return nil
 	case MsgGetMaxMemSlots:
 		return SendU64Reply(conn, m.Header.Request, MaxFds)
 	default:
@@ -553,6 +576,7 @@ const (
 // VHOST_USER_PROTOCOL_F_MQ        = 0
 // VHOST_USER_PROTOCOL_F_CONFIG    = 9
 const (
+	bitBackendRequest = uint64(1) << 5
 	bitProtocolMq     = uint64(1) << 0
 	bitProtocolConfig = uint64(1) << 9
 )
@@ -598,6 +622,7 @@ func (s *Server) handleSetFeatures(conn *net.UnixConn, m *Message) error {
 	}
 	s.features = v
 	s.featuresSet = true
+	s.signalCapacityChange()
 	s.mu.Unlock()
 	for idx := 0; idx < NumQueues; idx++ {
 		s.maybeStartWorker(idx)
@@ -607,7 +632,7 @@ func (s *Server) handleSetFeatures(conn *net.UnixConn, m *Message) error {
 }
 
 func (s *Server) handleGetProtocolFeatures(conn *net.UnixConn, m *Message) error {
-	return SendU64Reply(conn, m.Header.Request, bitProtocolConfig)
+	return SendU64Reply(conn, m.Header.Request, s.supportedProtocolFeatures())
 }
 
 func (s *Server) handleSetProtocolFeatures(conn *net.UnixConn, m *Message) error {
@@ -618,12 +643,14 @@ func (s *Server) handleSetProtocolFeatures(conn *net.UnixConn, m *Message) error
 	if err != nil {
 		return err
 	}
-	if unsupported := v &^ bitProtocolConfig; unsupported != 0 {
+	if unsupported := v &^ s.supportedProtocolFeatures(); unsupported != 0 {
 		return fmt.Errorf("vhost: unsupported protocol features: requested=%#x supported=%#x unsupported=%#x",
-			v, bitProtocolConfig, unsupported)
+			v, s.supportedProtocolFeatures(), unsupported)
 	}
 	s.mu.Lock()
 	s.protocolFeatures = v
+	s.protocolFeaturesSet = true
+	s.signalCapacityChange()
 	s.mu.Unlock()
 	return nil
 }
@@ -986,3 +1013,89 @@ func (s *Server) maybeStartWorker(idx int) {
 
 // SetDirtyTracker binds the instance accumulator before serving guest memory.
 func (s *Server) SetDirtyTracker(mark func(uint64, uint64) error) { s.memTable.MarkDirty = mark }
+
+// EnableCapacityChange must be called before serving a zero-geometry slot.
+func (s *Server) EnableCapacityChange() {
+	s.capacityNotify = true
+	s.capacityChanged = make(chan struct{})
+}
+
+func (s *Server) signalCapacityChange() {
+	if s.capacityChanged != nil {
+		close(s.capacityChanged)
+		s.capacityChanged = make(chan struct{})
+	}
+}
+
+// WaitCapacityChange waits for this connection's protocol selection AND its
+// reverse request fd. CH writes the fd after queue activation, without waiting
+// for a reply. A queued SET_BACKEND_REQ_FD must not look like a legacy VMM.
+func (s *Server) WaitCapacityChange(ctx context.Context) error {
+	if !s.capacityNotify {
+		return nil
+	}
+	for {
+		s.mu.Lock()
+		ready := s.frontendReq != nil
+		missing := s.protocolFeaturesSet && s.protocolFeatures&bitBackendRequest == 0 ||
+			s.featuresSet && s.features&bitVhostProtocolFeatures == 0
+		changed := s.capacityChanged
+		s.mu.Unlock()
+		if missing {
+			return errors.New("VMM did not negotiate dynamic disk capacity")
+		}
+		if ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("VMM capacity change channel unavailable: %w", ctx.Err())
+		case <-s.stop:
+			return errors.New("vhost server stopped during capacity negotiation")
+		case <-changed:
+		}
+	}
+}
+
+func (s *Server) supportedProtocolFeatures() uint64 {
+	if s.capacityNotify {
+		return bitProtocolConfig | bitBackendRequest
+	}
+	return bitProtocolConfig
+}
+
+func (s *Server) SetSlotOrigin(path string, size int64) {
+	if s.stats != nil {
+		if s.capacityNotify {
+			s.stats.setCapacity(size)
+		}
+		s.stats.SetOrigin(path)
+	}
+}
+
+// CanNotifyCapacity is checked before the first backend publication so a VMM
+// lacking the required protocol cannot acquire a disk that it cannot expose.
+func (s *Server) CanNotifyCapacity() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.frontendReq != nil
+}
+
+// NotifyCapacity requests a new GET_CONFIG followed by a guest configuration
+// interrupt. Retrying after a reconnect is safe. Only the Guest confirms size.
+func (s *Server) NotifyCapacity() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.frontendReq == nil {
+		return errors.New("vhost: VMM capacity change unavailable")
+	}
+	var header [12]byte
+	binary.LittleEndian.PutUint32(header[:], 2) // VHOST_USER_BACKEND_CONFIG_CHANGE_MSG
+	binary.LittleEndian.PutUint32(header[4:], FlagVersion1)
+	// A stalled VMM must not hold the owner capture gate or prevent teardown.
+	n, err := syscall.SendmsgN(int(s.frontendReq.Fd()), header[:], nil, nil, syscall.MSG_DONTWAIT|syscall.MSG_NOSIGNAL)
+	if err == nil && n != len(header) {
+		return io.ErrShortWrite
+	}
+	return err
+}

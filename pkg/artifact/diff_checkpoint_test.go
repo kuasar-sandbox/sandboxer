@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
@@ -539,5 +540,73 @@ func TestPublishedCheckpointRouteRetriesPinnedDirectory(t *testing.T) {
 	}
 	if err := <-served; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMaterializeCheckpointOnMaximumDepthPureDisk(t *testing.T) {
+	ctx := context.Background()
+	f := newDiffCheckpointFixture(t)
+	storage, err := NewProcessStorage(nil)
+	requireDiskIO(t, err)
+	defer storage.Close()
+	sink := snapshot.NewFileSink(f.dir, "depth", nil, false, nil)
+	defer sink.Close()
+	// Each newly written top overrides block 0 and inherits block 1 from
+	// the oldest immutable layer. All parents have distinct identities.
+	refs := make([]string, config.MaxPortableLayerRefs+1)
+	for i := range refs {
+		data := make([]byte, 8192)
+		data[0] = byte(i + 1)
+		var holes []sparse.Extent
+		if i == len(refs)-1 {
+			data[4096] = 'B'
+		} else {
+			holes = []sparse.Extent{{Offset: 4096, Size: 4096}}
+		}
+		refs[i], _, err = sink.AbsorbOverlay(ctx, bytes.NewReader(data), holes)
+		requireDiskIO(t, err)
+	}
+	d := &f.cfg.Boot.Disks[0]
+	d.Base, d.BaseFromRefs, d.PureBlock = refs[0], refs[1:], true
+	f.cfg.Version = 2
+	err = f.cfg.Validate()
+	requireDiskIO(t, err)
+	const id = "deep-writer"
+	writer, err := diffstore.Create(filepath.Join(f.dir, "diffs", id+".diff"), diffstore.Options{DiffID: id, BaseID: DiffCheckpointBaseID(d.PortableRootConfig), LogicalSize: 8192})
+	requireDiskIO(t, err)
+	_, err = writer.WriteAt(bytes.Repeat([]byte{'T'}, 4096), 0)
+	requireDiskIO(t, err)
+	requireDiskIO(t, writer.Checkpoint(ctx, f.cp.CheckpointID))
+	requireDiskIO(t, writer.Close())
+	f.cp.Disks[0].DiffID = id
+	saved, err := sandboxfile.BuildCheckpointSource(ctx, f.cfg, f.cp)
+	requireDiskIO(t, err)
+	raw, path, err := sink.AbsorbSandbox(ctx, saved)
+	requireDiskIO(t, err)
+	ref, err := manifest.ParseRef(raw)
+	requireDiskIO(t, err)
+	file, err := storage.OpenFile(ctx, path, ref)
+	requireDiskIO(t, err)
+	root, err := sandboxfile.Open(ctx, file)
+	requireDiskIO(t, err)
+	defer root.Close()
+	p := newPublisher(storage, nil, nil, nil)
+	scope := publishScope{relativeDir: f.dir}
+	result, clean, err := p.materializeCheckpointRoot(ctx, scope, root)
+	requireDiskIO(t, err)
+	defer clean()
+	defer result.Close()
+	out := result.Portable.Boot.Disks[0]
+	if out.Base == "" || len(out.BaseFromRefs) != 0 || !out.PureBlock {
+		t.Fatalf("materialized graph: %+v", out)
+	}
+	view, _, err := p.open(ctx, out.Base, scope)
+	requireDiskIO(t, err)
+	defer view.Close()
+	buf := make([]byte, 8192)
+	_, err = view.ReadAt(ctx, buf, 0)
+	requireDiskIO(t, err)
+	if buf[0] != 'T' || buf[4096] != 'B' {
+		t.Fatal("lost written or inherited blocks")
 	}
 }

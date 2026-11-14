@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -251,7 +252,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		}
 	}
 	preparation, err := preflightColdArtifacts(ctx, opts.Cfg, opts.Fetcher, opts.RefLocations,
-		baseDir, opts.SandboxID, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener, opts.checkpointPlan)
+		baseDir, opts.SandboxID, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener, storage.BorrowWithFetcher(opts.Fetcher), opts.checkpointPlan)
 	if err != nil {
 		return -1, err
 	}
@@ -920,6 +921,9 @@ func resolveDiskMounts(mounts []proto.MountSpec, disks []config.DiskConfig, root
 		}
 		i := ord[m.Source] // validated to exist by config.validateDisks
 		d := &disks[i]
+		// A fresh guest has no cached state for an already-bound disk. Mount it
+		// during Launch. Memory Restore retains the original autofs state.
+		m.DiskSlot = d.Unbound()
 		m.DiskIndex = i
 		m.Source = ""
 		if d.RootConfig.Single() {
@@ -987,7 +991,9 @@ type SnapshotHandler struct {
 	Context               context.Context
 	Logf                  func(string, ...any)
 
-	capture captureGate
+	diskRefsMu        sync.RWMutex // protects copies of the active disk list during online checkpoint listing
+	slotConfirmations atomic.Int32
+	capture           captureGate
 }
 
 // captureGate serializes export and snapshot for one live VM. A successful
@@ -1041,7 +1047,7 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 	return h.handleContext(h.Context, req, cgroupPath, chExited)
 }
 func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
-	if err := h.capture.begin(); err != nil {
+	if err := h.beginCapture(); err != nil {
 		return ctl.Response{}, err
 	}
 	defer func() {
@@ -1075,7 +1081,7 @@ func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExi
 	return h.handleExportContext(h.Context, req, cgroupPath, chExited)
 }
 func (h *SnapshotHandler) handleExportContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
-	if err := h.capture.begin(); err != nil {
+	if err := h.beginCapture(); err != nil {
 		return ctl.Response{}, err
 	}
 	defer func() {
@@ -1178,6 +1184,9 @@ func handleExportRequest(
 		}
 	}
 	for i := range disks {
+		if i > 0 && opts.PortableConfig != nil && i <= len(opts.PortableConfig.Boot.Disks) && opts.PortableConfig.Boot.Disks[i-1].Unbound() && disks[i].Slot && disks[i].SnapshotView == nil {
+			continue
+		}
 		if disks[i].SnapshotView == nil || disks[i].Size <= 0 {
 			return ctl.Response{}, fmt.Errorf("export: disk %d has invalid SnapshotView/size", i)
 		}
@@ -2151,12 +2160,15 @@ const (
 	dependencyDiskLayer artifactDependencyRole = iota
 	dependencyRootImage
 	dependencyMemorySnapshot
+	dependencyPureBlock
 )
 
 func (r artifactDependencyRole) String() string {
 	switch r {
 	case dependencyDiskLayer:
 		return "disk layer"
+	case dependencyPureBlock:
+		return "pure block layer"
 	case dependencyRootImage:
 		return "root image"
 	case dependencyMemorySnapshot:
@@ -2295,7 +2307,7 @@ func (p *snapshotBundlePlan) emit(ctx context.Context, sink snapshot.ArtifactSin
 		switch item.role {
 		case dependencyMemorySnapshot:
 			ref, _, absorbErr = sink.AbsorbSnapshot(ctx, item.stream)
-		case dependencyDiskLayer:
+		case dependencyDiskLayer, dependencyPureBlock:
 			ref, _, absorbErr = sink.AbsorbOverlaySource(ctx, item.stream)
 		case dependencyRootImage:
 			ref, _, absorbErr = sink.AbsorbImageSource(ctx, item.stream)
@@ -2379,10 +2391,19 @@ func prepareSnapshotDependencyPlan(
 		}
 	}()
 	knownPaths := bundleKnownRefPaths(opts)
+	pureRefs := make(map[string]bool)
+	for _, d := range logicalRefs {
+		if d.role == dependencyPureBlock {
+			pureRefs[d.raw] = true
+		}
+	}
 	seenLogical := make(map[string]artifactDependencyRole, len(logicalRefs))
 	for index := len(logicalRefs) - 1; index >= 0; index-- {
 		dependency := logicalRefs[index]
 		raw := dependency.raw
+		if dependency.role == dependencyDiskLayer && pureRefs[raw] {
+			dependency.role = dependencyPureBlock
+		}
 		if previous, seen := seenLogical[raw]; seen {
 			if previous != dependency.role {
 				return nil, fmt.Errorf("artifact dependency %q is used as both %s and %s", raw, previous, dependency.role)
@@ -2563,6 +2584,9 @@ func prepareSnapshotDependencyStream(ctx context.Context, stream fetch.Stream, r
 			return nil, false, errors.Join(err, root.Close())
 		}
 		return root.FullStream, false, nil
+	case dependencyPureBlock:
+		// Every byte, including a ZIP-shaped tail, belongs to the filesystem.
+		return stream, false, nil
 	case dependencyDiskLayer, dependencyRootImage:
 		payload, sandboxLayer, err := sandboxfile.PayloadIfSandbox(ctx, stream, false)
 		if err != nil {
@@ -2601,13 +2625,13 @@ func snapshotLayerDependencies(opts RunOptions, memoryFromRefs []string, diskMer
 			dependencies = append(dependencies, artifactDependency{raw: raw, role: role})
 		}
 	}
-	appendRoot := func(root *config.PortableRootConfig, merged bool) {
+	appendRoot := func(root *config.PortableRootConfig, merged bool, role artifactDependencyRole) {
 		if root.Overlay == nil {
 			if !merged {
-				appendRef(root.Base, dependencyDiskLayer)
+				appendRef(root.Base, role)
 			}
 			for _, raw := range root.BaseFromRefs {
-				appendRef(raw, dependencyDiskLayer)
+				appendRef(raw, role)
 			}
 			return
 		}
@@ -2616,10 +2640,10 @@ func snapshotLayerDependencies(opts RunOptions, memoryFromRefs []string, diskMer
 			appendRef(root.Overlay.Base, dependencyDiskLayer)
 		}
 		for _, raw := range root.Overlay.BaseFromRefs {
-			appendRef(raw, dependencyDiskLayer)
+			appendRef(raw, role)
 		}
 	}
-	appendRoot(&opts.PortableConfig.Boot.Root, diskMerged[0])
+	appendRoot(&opts.PortableConfig.Boot.Root, diskMerged[0], dependencyDiskLayer)
 	if opts.SourceBinding != nil && !opts.PortableConfig.IsCheckpoint() && !diskMerged[0] {
 		role := dependencyDiskLayer
 		root := &opts.PortableConfig.Boot.Root
@@ -2629,7 +2653,12 @@ func snapshotLayerDependencies(opts RunOptions, memoryFromRefs []string, diskMer
 		appendRef(opts.SourceBinding.SandboxRef, role)
 	}
 	for i := range opts.PortableConfig.Boot.Disks {
-		appendRoot(&opts.PortableConfig.Boot.Disks[i].PortableRootConfig, diskMerged[i+1])
+		disk := &opts.PortableConfig.Boot.Disks[i]
+		role := dependencyDiskLayer
+		if disk.PureBlock {
+			role = dependencyPureBlock
+		}
+		appendRoot(&disk.PortableRootConfig, diskMerged[i+1], role)
 	}
 	return dependencies, nil
 }
@@ -3176,7 +3205,62 @@ func canonicalizeConfiguredTarRefsWithOpener(ctx context.Context, cfg *config.Sa
 		return err
 	}
 	for i := range cfg.Boot.Disks {
-		if err := normalizeRoot(fmt.Sprintf("boot.disks[%d]", i), &cfg.Boot.Disks[i].RootConfig); err != nil {
+		disk := &cfg.Boot.Disks[i]
+		field := fmt.Sprintf("boot.disks[%d]", i)
+		if disk.Disk != nil {
+			// Inline DiskV1 supplies the immutable graph. Capture and CurrentRun
+			// consume the same host-resolved graph as the cold data path.
+			src := *disk.Disk
+			src.BaseFromRefs = append([]string(nil), src.BaseFromRefs...)
+			qualify := func(raw *string) error {
+				if *raw == "" {
+					return nil
+				}
+				ref, err := manifest.ParseRef(*raw)
+				if err != nil {
+					return err
+				}
+				if ref.Scheme != manifest.RefSchemeFile || ref.DigestScheme != "" {
+					return nil
+				}
+				// A pure layer may end in valid ZIP bytes or use a .sandbox
+				// filename. Its identity comes from the outer transport.
+				path, err := locations.ResolveFile(ref, "")
+				if err != nil {
+					return err
+				}
+				var stream fetch.Stream
+				if opener != nil {
+					stream, err = opener(ctx, path, ref)
+				} else {
+					stream, _, err = openLocalDiskStream(path, ref, codec, required)
+				}
+				if err != nil {
+					return err
+				}
+				pinned, err := pureFileIdentity(ref, stream)
+				if err = errors.Join(err, stream.Close()); err != nil {
+					return err
+				}
+				*raw = pinned.String()
+				return nil
+			}
+			if err := qualify(&src.Base); err != nil {
+				return err
+			}
+			for j := range src.BaseFromRefs {
+				if err := qualify(&src.BaseFromRefs[j]); err != nil {
+					return err
+				}
+			}
+			disk.Disk = &src
+			disk.Base, disk.BaseFromRefs, disk.PureBlock = src.Base, src.BaseFromRefs, true
+			continue
+		}
+		if disk.PureBlock {
+			continue
+		} // graph from a content-identified artifact
+		if err := normalizeRoot(field, &disk.RootConfig); err != nil {
 			return err
 		}
 	}
@@ -3322,6 +3406,17 @@ func generateSandboxID() string {
 func validateSandboxID(sandboxID string) error {
 	if err := ValidatePathID(sandboxID); err != nil {
 		return fmt.Errorf("sandbox id %q must be one non-empty path component", sandboxID)
+	}
+	return nil
+}
+
+func (h *SnapshotHandler) beginCapture() error {
+	if err := h.capture.begin(); err != nil {
+		return err
+	}
+	if h.slotConfirmations.Load() != 0 {
+		h.capture.finish(false)
+		return errors.New("disk binding is awaiting guest confirmation")
 	}
 	return nil
 }

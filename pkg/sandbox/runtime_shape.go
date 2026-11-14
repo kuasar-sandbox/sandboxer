@@ -182,6 +182,9 @@ func deriveCheckpointTargets(cfg *config.SandboxConfig, opts DeriveRuntimeOption
 		roots = append(roots, &cfg.Boot.Disks[i].RootConfig)
 	}
 	for i, root := range roots {
+		if i > 0 && cfg.Boot.Disks[i-1].Unbound() {
+			continue
+		}
 		target := &root.Diff
 		if root.Overlay != nil {
 			target = &root.Overlay.Diff
@@ -211,6 +214,11 @@ func deriveBoundRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, opts
 		return RuntimeSpec{}, err
 	}
 	launch := opts.Launch
+	diskStorage, err := borrowLaunchDiskStorage(launch)
+	if err != nil {
+		return RuntimeSpec{}, err
+	}
+	defer diskStorage.Close()
 	opener := FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
 		return openLaunchFile(ctx, launch, path, ref, launch.RefLocations)
 	})
@@ -281,6 +289,41 @@ func deriveBoundRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, opts
 	}
 	shapes := []RuntimeDiskSpec{root}
 	for i, disk := range cfg.Boot.Disks {
+		if disk.Slot != nil || disk.PureBlock || disk.Disk != nil {
+			var size int64
+			var err error
+			switch {
+			case disk.Unbound():
+				size, err = disk.Slot.Capacity()
+			case checkpointSizes != nil:
+				size = checkpointSizes[i+1]
+			default:
+				writer := disk.Diff
+				if writer == "" && opts.SandboxID != "" && !opts.EnableCheckpoint {
+					writer = DefaultDiskDiffURI(defaultBaseDir, opts.SandboxID, fmt.Sprintf("disk%d", i))
+				}
+				var reader diffstore.BlockReader
+				reader, size, _, err = openColdDiskSource(ctx, disk, writer, diskStorage, launch.RefLocations, diffOpts...)
+				if reader != nil {
+					err = errors.Join(err, reader.Close())
+				}
+				if err == nil {
+					// The opener already computed fresh template/base capacity. Read
+					// writer metadata only when this target actually exists.
+					var actual int64
+					actual, err = runtimeWritableCapacity(writer, "", size, diffOpts)
+					if err == nil && actual < size {
+						err = fmt.Errorf("existing writer capacity %d smaller than disk source %d", actual, size)
+					}
+					size = actual
+				}
+			}
+			if err != nil {
+				return RuntimeSpec{}, fmt.Errorf("derive disk %q shape: %w", disk.Name, err)
+			}
+			shapes = append(shapes, RuntimeDiskSpec{Name: disk.Name, Slot: disk.Slot != nil, capacityChange: disk.Slot != nil && disk.Slot.Size == nil && size != 0, WritableCapacity: size})
+			continue
+		}
 		shape, err := derive(&disk.RootConfig, disk.Name, i+1)
 		if err != nil {
 			return RuntimeSpec{}, fmt.Errorf("derive disk %q shape: %w", disk.Name, err)
@@ -340,6 +383,14 @@ func runtimeCheckpointSizes(cfg *config.SandboxConfig, portable *config.Portable
 		base := portable.Boot.Disks[i]
 		if disk.Name != base.Name {
 			return nil, errors.New("derive checkpoint shape: disk topology mismatch")
+		}
+		if base.Unbound() {
+			n, err := base.Slot.Capacity()
+			if err != nil {
+				return nil, err
+			}
+			sizes = append(sizes, n)
+			continue
 		}
 		view := pins.Disks[disk.Name]
 		if view == nil || view.Info().BaseID != artifact.DiffCheckpointBaseID(base.PortableRootConfig) {

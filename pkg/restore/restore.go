@@ -106,6 +106,14 @@ func (opts Options) borrowStorage() (*artifact.ProcessStorage, error) {
 	return artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired, opts.Fetcher)
 }
 
+// Scope the disk opener at the same instant as the manifest fetcher. A
+// sibling E Bundle can add another layer of resolution over the S Bundle.
+func (opts Options) withBundleFetcher(f fetch.Fetcher) Options {
+	opts.Fetcher = f
+	opts.storage = opts.storage.BorrowWithFetcher(f)
+	return opts
+}
+
 func (opts Options) openFile(ctx context.Context, path string, ref manifest.Ref) (*artifact.OpenedFile, error) {
 	if opts.storage != nil {
 		return opts.storage.BorrowWithFetcher(opts.Fetcher).OpenFileWithLocations(ctx, path, ref, opts.RefLocations)
@@ -217,6 +225,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	sourcebind.ApplyDefaultBootBindings(opts.HostCfg, sandboxSource.Root.Portable, sandboxSource.RelativeDir)
 	merged, c0, err := config.ApplyRestoreRules(sandboxSource.Root.Portable, opts.HostCfg, opts.HostPresence)
 	if err != nil {
+		return -1, err
+	}
+	if err := c0.ValidateCapturedDiskCapabilities(); err != nil {
 		return -1, err
 	}
 	snapCfg := *merged
@@ -531,6 +542,13 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		}
 		capacities := make([]int64, len(disks))
 		for i, disk := range disks {
+			if disk.Cow == nil && i > 0 && snapCfg.Boot.Disks[i-1].Unbound() {
+				capacities[i], err = snapCfg.Boot.Disks[i-1].Slot.Capacity()
+				if err != nil {
+					return -1, err
+				}
+				continue
+			}
 			capacities[i] = disk.Cow.Size()
 		}
 		provenance := sandbox.RunOptions{SourceBinding: &sandbox.RunSourceBinding{SandboxRef: sandboxSource.PortableRef, RuntimeRef: sandboxSource.RuntimeRef, RelativeDir: sandboxSource.RelativeDir, BundleSource: firstBundleSource(sandboxSource.bundleSource, bundleSource)}, BundleReader: firstBundleReader(sandboxSource.bundleReader, root.bundleReader), BundleFetcher: firstBundleFetcher(sandboxSource.bundleFetcher, root.bundleFetcher), Fetcher: opts.Fetcher}
@@ -577,7 +595,8 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// by PostSpawn over the reverse channel), and a settle protocol of
 	// waitAPI → /vm.resume → restore{epoch} → local restore normalization.
 	return sandbox.ServeAndWait(sandbox.VMParams{
-		BaseDir:            sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID),
+		BaseDir:     sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID),
+		DiskStorage: opts.storage, DiskCache: cowCache, DiskCurrentRun: opts.CurrentRun, DiskPlan: opts.checkpointPlan,
 		EnableCheckpoint:   opts.EnableCheckpoint,
 		CheckpointOwner:    opts.checkpointOwner,
 		Balloon:            balloonCtl,
@@ -662,6 +681,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		PostSpawn: func(pc sandbox.PostSpawnCtx) error {
 			if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
+			}
+			if err := pc.CheckDiskCapabilities(); err != nil {
+				return err
 			}
 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).ResumeContext(pc.Ctx); err != nil {
 				return fmt.Errorf("vm.resume: %w", err)
@@ -780,7 +802,13 @@ func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cf
 		if i != 0 {
 			diskKey = fmt.Sprintf("disk%d", i-1)
 		}
-		disk, closeDisk, err := reconstructDisk(ctx, opts, key, single, top, chain, root.Base, diffURI, diffTemplate, diskKey, logf, cache)
+		if i > 0 && cfg.Boot.Disks[i-1].Unbound() {
+			disks = append(disks, sandbox.DiskBackend{Slot: true})
+			continue
+		}
+		pure := i > 0 && cfg.Boot.Disks[i-1].PureBlock
+		disk, closeDisk, err := reconstructDisk(ctx, opts, key, single, top, chain, root.Base, diffURI, diffTemplate, diskKey, logf, cache, pure)
+		disk.Slot = i > 0 && cfg.Boot.Disks[i-1].Slot != nil
 		if err != nil {
 			return nil, cleanup, err
 		}
@@ -806,7 +834,7 @@ func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cf
 // diffURI/diffTemplate come from the restore host binding (or the auto-default
 // <sid>.<diskKey>.diff).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate, diskKey string, logf func(string, ...any), cowCache *diffstore.Cache) (sandbox.DiskBackend, func() error, error) {
+func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate, diskKey string, logf func(string, ...any), cowCache *diffstore.Cache, pure ...bool) (sandbox.DiskBackend, func() error, error) {
 	var db sandbox.DiskBackend
 	var closers []func() error
 	cleanup := func() error {
@@ -827,7 +855,15 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	var baseReader diffstore.BlockReader
 	var err error
 	if capturedTop != "" {
-		baseReader, err = openLayeredDiskBase(ctx, refs, func(ctx context.Context, raw string) (fetch.Stream, error) { return openDiskRefStream(ctx, raw, opts) })
+		if len(pure) > 0 && pure[0] {
+			if opts.storage == nil {
+				return fail(errors.New("pure disk restore requires process storage"))
+			}
+			source := config.DiskV1{Kind: "disk", Version: 1, Base: capturedTop, BaseFromRefs: chain}
+			baseReader, _, _, err = sandbox.OpenDiskV1Source(ctx, source, opts.storage, opts.RefLocations)
+		} else {
+			baseReader, err = openLayeredDiskBase(ctx, refs, func(ctx context.Context, raw string) (fetch.Stream, error) { return openDiskRefStream(ctx, raw, opts) })
+		}
 		if err != nil {
 			return fail(fmt.Errorf("%s: open base: %w", diskKey, err))
 		}
@@ -1211,7 +1247,7 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 			resolved.DigestScheme, resolved.Digest = "manifest", manifest.HexKey(key)
 			portable.Path = filepath.Base(path)
 			portable.DigestScheme, portable.Digest = "manifest", manifest.HexKey(key)
-			source.opts.Fetcher = opened.ScopedFetcher()
+			source.opts = opts.withBundleFetcher(opened.ScopedFetcher())
 			source.bundleReader = opened.BundleReader()
 			source.bundleFetcher = opened.ManifestFetcher()
 			physicalRef, physicalPath, sourceErr := fileBundleSource(path, ref.String())
@@ -1341,14 +1377,21 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		layered := fetch.NewLayered(streams...)
 		return diffstore.NewStreamReader(sandbox.VMLifecycleContext(ctx), layered, int64(logicalSize)), nil
 	}
-	validateWritable := func(field string, root *config.RootConfig, diskKey string) (retErr error) {
+	validateWritable := func(field string, root *config.RootConfig, diskKey string, pure bool) (retErr error) {
 		top, lowers := root.Base, root.BaseFromRefs
 		diffURI, templateURI := root.Diff, root.DiffTemplate
 		if root.Overlay != nil {
 			top, lowers = root.Overlay.Base, root.Overlay.BaseFromRefs
 			diffURI, templateURI = root.Overlay.Diff, root.Overlay.DiffTemplate
 		}
-		base, err := openLayers(field, top, lowers)
+		var base diffstore.BlockReader
+		var err error
+		if pure && top != "" {
+			source := config.DiskV1{Kind: "disk", Version: 1, Base: top, BaseFromRefs: lowers}
+			base, _, _, err = sandbox.OpenDiskV1Source(ctx, source, opts.storage, opts.RefLocations)
+		} else {
+			base, err = openLayers(field, top, lowers)
+		}
 		if err != nil {
 			return err
 		}
@@ -1418,14 +1461,20 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 	if err := checkRoot("boot.root", &cfg.Boot.Root); err != nil {
 		return err
 	}
-	if err := validateWritable("boot.root", &cfg.Boot.Root, "overlay"); err != nil {
+	if err := validateWritable("boot.root", &cfg.Boot.Root, "overlay", false); err != nil {
 		return err
 	}
 	for i := range cfg.Boot.Disks {
-		if err := checkRoot(fmt.Sprintf("boot.disks[%d]", i), &cfg.Boot.Disks[i].RootConfig); err != nil {
-			return err
+		disk := &cfg.Boot.Disks[i]
+		if disk.Unbound() {
+			continue
 		}
-		if err := validateWritable(fmt.Sprintf("boot.disks[%d]", i), &cfg.Boot.Disks[i].RootConfig, fmt.Sprintf("disk%d", i)); err != nil {
+		if !disk.PureBlock {
+			if err := checkRoot(fmt.Sprintf("boot.disks[%d]", i), &disk.RootConfig); err != nil {
+				return err
+			}
+		}
+		if err := validateWritable(fmt.Sprintf("boot.disks[%d]", i), &cfg.Boot.Disks[i].RootConfig, fmt.Sprintf("disk%d", i), disk.PureBlock); err != nil {
 			return err
 		}
 	}
@@ -1490,7 +1539,7 @@ func openRootSnapshot(ctx context.Context, opts Options) (*openedRootSnapshot, e
 		root := &openedRootSnapshot{stream: opened, size: int64(opened.Size()), opts: opts}
 		if key, ok := opened.RootManifestKey(); ok {
 			root.bundleRoot = manifest.HexKey(key)
-			root.opts.Fetcher = opened.ScopedFetcher()
+			root.opts = opts.withBundleFetcher(opened.ScopedFetcher())
 			root.bundleReader = opened.BundleReader()
 			root.bundleFetcher = opened.ManifestFetcher()
 			root.selfRef, err = fileBundleRef(opts.SnapshotPath, opts.SnapshotRef, key)

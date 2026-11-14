@@ -745,7 +745,7 @@ disk 和 stdio 验收用例。
 - capacity/allocatable和resource mode一致;
 - kernel/runtime为absolute unlocated file binding;
 - network provider唯一且identity字段有provider;
-- root/data topology合法,数据盘name/order和mount 1:1;
+- root/data topology合法,数据盘名称和顺序稳定，每个盘的挂载投影互不重叠;
 - active diff/template/size组合可生成mountable filesystem;
 - local/Manifest/Bundle ref与crypto policy一致;
 - launch/files/init/plugin/metadata limits.

@@ -26,6 +26,8 @@ const (
 	DropCachesSkipped     = abi.DropCachesSkipped
 	DropCachesSucceeded   = abi.DropCachesSucceeded
 	DropCachesFailed      = abi.DropCachesFailed
+	TypeDiskBind          = abi.TypeDiskBind
+	TypeDiskBindAck       = abi.TypeDiskBindAck
 	TypeHello             = abi.TypeHello
 	TypeLaunch            = abi.TypeLaunch
 	TypeLaunchAck         = abi.TypeLaunchAck
@@ -67,6 +69,7 @@ const (
 )
 
 type (
+	DiskBinding        = abi.DiskBinding
 	LaunchSpec         = abi.LaunchSpec
 	MountSpec          = abi.MountSpec
 	FileSpec           = abi.FileSpec

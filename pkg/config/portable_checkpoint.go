@@ -68,6 +68,12 @@ func (p *PortableSandboxConfig) MaterializedCheckpoint(dataRefs []string) (*Port
 	}
 	set(&clone.Boot.Root, "self")
 	for i, raw := range dataRefs {
+		if clone.Boot.Disks[i].Unbound() {
+			if raw != "" {
+				return nil, errors.New("unbound slot has captured data")
+			}
+			continue
+		}
 		ref, err := portableArtifactRef(raw)
 		if err != nil || ref == "" || ref == "self" {
 			return nil, fmt.Errorf("materialize: invalid disk %d reference", i)
@@ -79,4 +85,27 @@ func (p *PortableSandboxConfig) MaterializedCheckpoint(dataRefs []string) (*Port
 		return nil, err
 	}
 	return clone, nil
+}
+
+// WithMaterializedDisks inherits a materialized ordinary E's immutable graph
+// while keeping this checkpoint launch's effective settings.
+func (p *PortableSandboxConfig) WithMaterializedDisks(graph *PortableSandboxConfig) (*PortableSandboxConfig, error) {
+	if !p.IsCheckpoint() || graph == nil || graph.IsCheckpoint() || len(graph.Boot.Disks) != len(p.Boot.Disks) {
+		return nil, errors.New("invalid materialized checkpoint topology")
+	}
+	clone, err := p.Clone()
+	if err != nil {
+		return nil, err
+	}
+	disks, err := graph.Clone()
+	if err != nil {
+		return nil, err
+	}
+	for i, disk := range p.Boot.Disks {
+		if disk.Name != disks.Boot.Disks[i].Name || disk.Unbound() != disks.Boot.Disks[i].Unbound() {
+			return nil, errors.New("materialized checkpoint disk mismatch")
+		}
+	}
+	clone.Boot.Root, clone.Boot.Disks, clone.checkpointLayout = disks.Boot.Root, disks.Boot.Disks, false
+	return clone, clone.Validate()
 }

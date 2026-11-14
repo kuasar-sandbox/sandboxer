@@ -450,3 +450,40 @@ func TestEffectivePersistentAndEphemeralOverrides(t *testing.T) {
 		t.Fatal("effective merge mutated persistent input")
 	}
 }
+
+func TestMemoryRestoreRequiresCapturedDiskCapabilities(t *testing.T) {
+	p := validPortableConfig()
+	p.Boot.Disks = []PortableDiskConfig{{Name: "data", Slot: &DiskSlotConfig{}}}
+	p.Mounts = []MountConfig{{Type: "disk", Source: "data", Target: "/data", Subpath: "input"}}
+	want := DiskCapabilities{SlotV1: true, ProjectionV1: true, CapacityChange: true}
+	if got := p.RequiredDiskCapabilities(); got != want {
+		t.Fatal(got)
+	}
+	for _, actual := range []*DiskCapabilities{nil, {SlotV1: true, CapacityChange: true}, {ProjectionV1: true, CapacityChange: true}, {SlotV1: true, ProjectionV1: true}} {
+		p.Boot.DiskCapabilities = actual
+		if err := p.ValidateCapturedDiskCapabilities(); err == nil {
+			t.Fatalf("missing capability accepted: %+v", actual)
+		}
+	}
+	p.Version = 2
+	p.Boot.DiskCapabilities = &want
+	copy, err := p.Clone()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := copy.ValidateCapturedDiskCapabilities(); err != nil {
+		t.Fatal(err)
+	}
+	fixed := "4GiB"
+	p.Boot.Disks[0].Slot.Size = &fixed
+	p.Boot.DiskCapabilities.CapacityChange = false
+	if err := p.ValidateCapturedDiskCapabilities(); err != nil {
+		t.Fatal(err)
+	}
+	p.Boot.Disks = nil
+	p.Mounts = nil
+	p.Boot.DiskCapabilities = nil
+	if err := p.ValidateCapturedDiskCapabilities(); err != nil {
+		t.Fatal(err)
+	}
+}

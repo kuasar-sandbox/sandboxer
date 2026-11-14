@@ -24,6 +24,7 @@ const directoryGCHandles = 2
 // file's GC to finish. Request senders queue without an unbounded internal list.
 type DirectoryMaintenance struct {
 	owner            *DirectoryOwner
+	activeMu         sync.RWMutex
 	active           map[string]bool
 	requests         chan directoryRequest
 	stop, done       chan struct{}
@@ -130,7 +131,7 @@ func (m *DirectoryMaintenance) open(id string) (*Store, error) {
 	if !validDiffID(id) {
 		return nil, fmt.Errorf("diffstore: invalid DiffID %q", id)
 	}
-	if m.active[id] {
+	if m.isActive(id) {
 		return nil, fmt.Errorf("diffstore: active DIFF %s belongs to its Disk", id)
 	}
 	path := filepath.Join(m.owner.Directory, "diffs", id+".diff")
@@ -198,7 +199,7 @@ func (m *DirectoryMaintenance) ListCheckpoints(ctx context.Context, visit func(s
 		if err != nil {
 			return err
 		}
-		if m.active[id] {
+		if m.isActive(id) {
 			continue
 		}
 		var ids []string
@@ -306,7 +307,7 @@ func (m *DirectoryMaintenance) Sweep(ctx context.Context, report func(DirectoryG
 			if e != nil {
 				return errors.Join(firstError, e)
 			}
-			if !m.active[id] {
+			if !m.isActive(id) {
 				pending = append(pending, DirectoryGCResult{DiffID: id})
 			}
 		}
@@ -422,4 +423,29 @@ func (m *DirectoryMaintenance) Close() error {
 		}
 	})
 	return m.closeErr
+}
+
+// ReserveActive prevents directory maintenance from opening a newly allocated live diff.
+// The owner calls it before creating the writer and releases it if publication fails.
+func (m *DirectoryMaintenance) ReserveActive(id string) error {
+	if !validDiffID(id) {
+		return fmt.Errorf("invalid active DiffID %q", id)
+	}
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	if m.active[id] {
+		return fmt.Errorf("active DiffID %q already reserved", id)
+	}
+	m.active[id] = true
+	return nil
+}
+func (m *DirectoryMaintenance) ReleaseActive(id string) {
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	delete(m.active, id)
+}
+func (m *DirectoryMaintenance) isActive(id string) bool {
+	m.activeMu.RLock()
+	defer m.activeMu.RUnlock()
+	return m.active[id]
 }

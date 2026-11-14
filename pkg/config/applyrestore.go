@@ -19,6 +19,17 @@ func ApplyRestoreRules(artifact *PortableSandboxConfig, host *SandboxConfig, pre
 	if err := artifact.Validate(); err != nil {
 		return nil, nil, fmt.Errorf("run --restore Sandbox config: %w", err)
 	}
+	if presence.Has("mounts") || len(host.Mounts) > 0 {
+		// Only identical restatements of disk mount topology are meaningful on memory restore.
+		for _, m := range host.Mounts {
+			if m.Type != "disk" {
+				return nil, nil, errors.New("run --restore: mounts are cold-start-only")
+			}
+		}
+		if err := validateFromDiskMountTopology(artifact.Mounts, host.Mounts); err != nil {
+			return nil, nil, err
+		}
+	}
 	if err := rejectRestoreColdOnly(host, presence); err != nil {
 		return nil, nil, err
 	}
@@ -78,7 +89,7 @@ func ApplyRestoreRules(artifact *PortableSandboxConfig, host *SandboxConfig, pre
 
 func rejectRestoreColdOnly(host *SandboxConfig, presence FieldPresence) error {
 	for _, field := range []string{
-		"boot.cmdline", "resources.diff_cow.discard", "launch", "mounts", "files", "ephemeral_files", "init", "metadata",
+		"boot.cmdline", "resources.diff_cow.discard", "launch", "files", "ephemeral_files", "init", "metadata",
 	} {
 		if presence.Any(field) {
 			return fmt.Errorf("run --restore: %s is cold-start-only and cannot be applied to restored execution state", field)
@@ -100,7 +111,7 @@ func rejectRestoreColdOnly(host *SandboxConfig, presence FieldPresence) error {
 		(host.Launch.Restart != "" && host.Launch.Restart != "never") {
 		return errors.New("run --restore: non-empty launch configuration is cold-start-only")
 	}
-	if len(host.Mounts) != 0 || len(host.Files) != 0 || len(host.EphemeralFiles) != 0 || len(host.Init) != 0 || len(host.Metadata) != 0 {
+	if len(host.Files) != 0 || len(host.EphemeralFiles) != 0 || len(host.Init) != 0 || len(host.Metadata) != 0 {
 		return errors.New("run --restore: mounts/files/init/metadata are cold-start-only")
 	}
 	return nil
@@ -172,6 +183,9 @@ func validateRestoreDiskBindings(artifact *PortableSandboxConfig, host *SandboxC
 		artifactDisk := &artifact.Boot.Disks[i]
 		if hostDisk.Name != artifactDisk.Name {
 			return fmt.Errorf("run --restore: host boot.disks[%d].name %q conflicts with Sandbox name %q", i, hostDisk.Name, artifactDisk.Name)
+		}
+		if err := checkHostDiskSelection(hostDisk, artifactDisk); err != nil {
+			return err
 		}
 		if hostDisk.Base != "" || len(hostDisk.BaseFromRefs) != 0 {
 			return fmt.Errorf("run --restore: boot.disks[%d] immutable graph is owned by the referenced Sandbox", i)

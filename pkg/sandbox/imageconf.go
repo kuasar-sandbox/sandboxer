@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"sort"
 	"strconv"
 	"time"
@@ -75,7 +76,7 @@ func MaterializeImageDefaults(cfg *config.SandboxConfig, image *ImageConfig) err
 	for i := range mounts {
 		cfg.Mounts[i] = config.MountConfig{
 			Target: mounts[i].Target, Type: mounts[i].Type,
-			Source: mounts[i].Source, Options: mounts[i].Options,
+			Source: mounts[i].Source, Subpath: mounts[i].Subpath, Options: mounts[i].Options,
 		}
 	}
 	return nil
@@ -321,13 +322,13 @@ func effectiveMounts(mounts []config.MountConfig, volumes map[string]struct{}) [
 		if t == "" {
 			t = "empty"
 		}
-		out = append(out, proto.MountSpec{Target: m.Target, Type: t, Source: m.Source, Options: m.Options})
-		seen[m.Target] = struct{}{}
+		out = append(out, proto.MountSpec{Target: m.Target, Type: t, Source: m.Source, Subpath: m.Subpath, Options: m.Options})
+		seen[path.Clean(m.Target)] = struct{}{}
 	}
 	// Deterministic order for image Volumes.
 	vols := make([]string, 0, len(volumes))
 	for v := range volumes {
-		if _, ok := seen[v]; ok {
+		if _, ok := seen[path.Clean(v)]; ok {
 			continue
 		}
 		vols = append(vols, v)

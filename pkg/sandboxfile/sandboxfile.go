@@ -104,58 +104,19 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 	fail := func(err error) (*Root, error) {
 		return nil, errors.Join(err, stream.Close())
 	}
-	archive, err := parseStrictArchive(ctx, stream)
+	archive, portable, checkpoint, err := readMetadata(ctx, stream)
 	if err != nil {
 		return fail(err)
 	}
 	runtimeBytes := archive.bodies[config.SandboxRuntimeConfigName]
-	checkpointBytes, hasCheckpoint := archive.bodies[CheckpointName]
-	parseConfig := config.ParsePortableSandboxConfig
-	if hasCheckpoint {
-		parseConfig = config.ParseCheckpointSandboxConfig
-	}
-	portable, err := parseConfig(runtimeBytes)
-	if err != nil {
-		return fail(fmt.Errorf("sandbox %s: %w", config.SandboxRuntimeConfigName, err))
-	}
-	canonical, err := config.MarshalPortableSandboxConfig(portable)
-	if err != nil {
-		return fail(err)
-	}
-	if !bytes.Equal(canonical, runtimeBytes) {
-		return fail(fmt.Errorf("sandbox %s is not canonically encoded", config.SandboxRuntimeConfigName))
-	}
-	var checkpoint *Checkpoint
-	if hasCheckpoint {
-		checkpoint, err = ParseCheckpoint(checkpointBytes, portable)
-		if err != nil {
-			return fail(err)
-		}
-		if archive.base != 0 {
-			return fail(errors.New("sandbox Checkpoint layout must not contain a root payload"))
-		}
-	}
 	imageConfig, hasImage := archive.bodies[ImageConfigName]
 	if hasImage {
-		if !json.Valid(imageConfig) {
-			return fail(errors.New("sandbox config.json is not valid JSON"))
-		}
-		if portable.Boot.Root.Base != "self" || portable.Boot.Root.Overlay == nil || portable.Boot.Root.Overlay.Base != "" {
-			return fail(errors.New("sandbox EROFS layout requires boot.root.base=self and an empty overlay graph"))
-		}
 		erofsSize, err := image.ReadEROFSSize(&streamReaderAt{ctx: ctx, stream: stream})
 		if err != nil {
 			return fail(fmt.Errorf("sandbox EROFS payload: %w", err))
 		}
 		if erofsSize != archive.base {
 			return fail(fmt.Errorf("sandbox EROFS payload size %d does not equal ZIP archive base %d", erofsSize, archive.base))
-		}
-	} else if !hasCheckpoint {
-		if portable.Boot.Root.Base == "self" && portable.Boot.Root.Overlay != nil && portable.Boot.Root.Overlay.Base == "" {
-			return fail(errors.New("sandbox direct EROFS graph is missing config.json"))
-		}
-		if archive.base == 0 {
-			return fail(errors.New("sandbox live root payload is empty"))
 		}
 	}
 
@@ -170,6 +131,70 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 		RuntimeConfig: append([]byte(nil), runtimeBytes...), Portable: portable,
 		ArchiveBase: archive.base, Checkpoint: checkpoint, owner: owner,
 	}, nil
+}
+
+// ReadDiskTable validates the artifact directory and portable topology without
+// probing the boot filesystem or touching other disk payloads. The caller
+// retains ownership of stream, including any Bundle-scoped dependencies.
+func ReadDiskTable(ctx context.Context, stream fetch.Stream) (*config.PortableSandboxConfig, *Checkpoint, error) {
+	if stream == nil {
+		return nil, nil, errors.New("sandbox: nil logical stream")
+	}
+	_, cfg, cp, err := readMetadata(ctx, stream)
+	return cfg, cp, err
+}
+
+func readMetadata(ctx context.Context, stream fetch.Stream) (*parsedArchive, *config.PortableSandboxConfig, *Checkpoint, error) {
+	archive, err := parseStrictArchive(ctx, stream)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	runtimeBytes := archive.bodies[config.SandboxRuntimeConfigName]
+	checkpointBytes, hasCheckpoint := archive.bodies[CheckpointName]
+	parseConfig := config.ParsePortableSandboxConfig
+	if hasCheckpoint {
+		parseConfig = config.ParseCheckpointSandboxConfig
+	}
+	portable, err := parseConfig(runtimeBytes)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("sandbox %s: %w", config.SandboxRuntimeConfigName, err)
+	}
+	canonical, err := config.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if !bytes.Equal(canonical, runtimeBytes) {
+		return nil, nil, nil, fmt.Errorf("sandbox %s is not canonically encoded", config.SandboxRuntimeConfigName)
+	}
+	var checkpoint *Checkpoint
+	if hasCheckpoint {
+		checkpoint, err = ParseCheckpoint(checkpointBytes, portable)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if archive.base != 0 {
+			return nil, nil, nil, errors.New("sandbox Checkpoint layout must not contain a root payload")
+		}
+	}
+	imageConfig, hasImage := archive.bodies[ImageConfigName]
+	if hasImage {
+		if !json.Valid(imageConfig) {
+			return nil, nil, nil, errors.New("sandbox config.json is not valid JSON")
+		}
+		if portable.Boot.Root.Base != "self" || portable.Boot.Root.Overlay == nil || portable.Boot.Root.Overlay.Base != "" {
+			return nil, nil, nil, errors.New("sandbox EROFS layout requires boot.root.base=self and an empty overlay graph")
+		}
+
+	} else if !hasCheckpoint {
+		if portable.Boot.Root.Base == "self" && portable.Boot.Root.Overlay != nil && portable.Boot.Root.Overlay.Base == "" {
+			return nil, nil, nil, errors.New("sandbox direct EROFS graph is missing config.json")
+		}
+		if archive.base == 0 {
+			return nil, nil, nil, errors.New("sandbox live root payload is empty")
+		}
+	}
+
+	return archive, portable, checkpoint, nil
 }
 
 // PayloadIfSandbox narrows a logical Sandbox stream to its root payload. A

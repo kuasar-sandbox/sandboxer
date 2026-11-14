@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"path"
 )
 
 // ApplyFromOptions selects the explicit run-from derivation contract.
@@ -229,6 +230,9 @@ func validateFromProtectedFields(artifact *PortableSandboxConfig, host *SandboxC
 		if hostDisk.Name != artifactDisk.Name {
 			return fmt.Errorf("run --from: host boot.disks[%d].name %q conflicts with artifact name %q", i, hostDisk.Name, artifactDisk.Name)
 		}
+		if err := checkHostDiskSelection(hostDisk, artifactDisk); err != nil {
+			return err
+		}
 		if hostDisk.Base != "" || len(hostDisk.BaseFromRefs) != 0 {
 			return fmt.Errorf("run --from: boot.disks[%d] immutable graph is owned by the Sandbox artifact", i)
 		}
@@ -249,15 +253,19 @@ func validateFromProtectedFields(artifact *PortableSandboxConfig, host *SandboxC
 }
 
 func validateFromDiskMountTopology(artifactMounts, hostMounts []MountConfig) error {
+	if err := ValidateMountProjections(hostMounts); err != nil {
+		return fmt.Errorf("artifact-owned data-disk mount topology: %w", err)
+	}
 	type diskMount struct {
-		source string
-		target string
+		source  string
+		target  string
+		subpath string
 	}
 	topology := func(mounts []MountConfig) []diskMount {
 		result := make([]diskMount, 0, len(mounts))
 		for _, mount := range mounts {
 			if mount.Type == "disk" {
-				result = append(result, diskMount{source: mount.Source, target: mount.Target})
+				result = append(result, diskMount{source: mount.Source, target: path.Clean(mount.Target), subpath: path.Clean(mount.Subpath)})
 			}
 		}
 		return result
@@ -302,7 +310,8 @@ func sandboxConfigFromPortable(portable *PortableSandboxConfig) *SandboxConfig {
 	cfg.Boot.Disks = make([]DiskConfig, len(portable.Boot.Disks))
 	for i := range portable.Boot.Disks {
 		cfg.Boot.Disks[i] = DiskConfig{
-			Name:       portable.Boot.Disks[i].Name,
+			Name: portable.Boot.Disks[i].Name,
+			Slot: portable.Boot.Disks[i].Slot, Binding: portable.Boot.Disks[i].Binding, PureBlock: portable.Boot.Disks[i].PureBlock,
 			RootConfig: rootConfigFromPortable(&portable.Boot.Disks[i].PortableRootConfig),
 		}
 	}

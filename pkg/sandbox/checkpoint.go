@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
@@ -311,8 +313,12 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 	diffs := make([]snapshot.DiskDiff, len(disks))
 	merged := make([]bool, len(disks))
 	parents := make(map[string][]string)
+	pureGroups := make(map[string]func(context.Context) (fetch.Stream, error))
 	baseOpen := newDiskMergeBaseOpener(opts)
 	opener := func(ctx context.Context, raw string) (fetch.Stream, error) {
+		if group, ok := pureGroups[raw]; ok {
+			return group(ctx)
+		}
 		refs, ok := parents[raw]
 		if !ok {
 			return baseOpen(ctx, raw)
@@ -331,16 +337,15 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 		return fetch.NewLayered(layers...), nil
 	}
 	for i, d := range disks {
+		if i > 0 && c0.Boot.Disks[i-1].Unbound() && d.Slot && d.SnapshotView == nil {
+			continue
+		}
 		if d.SnapshotView == nil || d.Size <= 0 {
 			return opts, nil, nil, nil, fmt.Errorf("disk %d has invalid SnapshotView/size", i)
 		}
 		diffs[i] = snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff, SnapshotView: d.SnapshotView, WaitReady: d.WaitReady, CheckError: d.CheckError, DiffID: d.DiffID, Checkpoint: d.Checkpoint, DeleteCheckpoint: d.DeleteCheckpoint, WaitMaterialized: d.WaitMaterialized, Export: d.Export}
-		if opts.namedCheckpoint || c0.IsCheckpoint() {
+		if opts.namedCheckpoint || c0.IsCheckpoint() && (i == 0 || !c0.Boot.Disks[i-1].PureBlock) {
 			continue
-		}
-		raw, _, err := currentDiskParentBinding(opts, i)
-		if err != nil {
-			return opts, nil, nil, nil, err
 		}
 		root := &c0.Boot.Root
 		if i > 0 {
@@ -349,6 +354,73 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 		lowers := &root.BaseFromRefs
 		if root.Overlay != nil {
 			lowers = &root.Overlay.BaseFromRefs
+		}
+		relativeDir := ""
+		if opts.SourceBinding != nil {
+			relativeDir = opts.SourceBinding.RelativeDir
+		}
+		// Pure disk layers have an explicit block type. Never probe the tail as
+		// a Sandbox artifact, even when the guest happens to write ZIP bytes there.
+		if i > 0 && c0.Boot.Disks[i-1].PureBlock {
+			if len(*lowers) < config.MaxPortableLayerRefs {
+				continue
+			}
+			actual := opts.Cfg.Boot.Disks[i-1].SourceDefinition()
+			key := fmt.Sprintf("pure-disk-%d", i)
+			pureGroups[key] = func(ctx context.Context) (fetch.Stream, error) {
+				access, err := artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired, opts.Fetcher)
+				if err != nil {
+					return nil, err
+				}
+				var streams []fetch.Stream
+				fail := func(e error) (fetch.Stream, error) {
+					for _, s := range streams {
+						e = errors.Join(e, s.Close())
+					}
+					return nil, errors.Join(e, access.Close())
+				}
+				for _, layer := range append([]string{actual.Base}, actual.BaseFromRefs...) {
+					ref, err := manifest.ParseRef(layer)
+					if err != nil {
+						return fail(err)
+					}
+					var stream fetch.Stream
+					if ref.Scheme == manifest.RefSchemeManifest {
+						stream, _, err = OpenManifestStream(ctx, ref.Path, access.Fetcher())
+					} else {
+						var path string
+						path, err = opts.RefLocations.ResolveFile(ref, relativeDir)
+						if err == nil {
+							stream, err = access.OpenFileWithLocations(ctx, path, ref, opts.RefLocations)
+						}
+					}
+					if err != nil {
+						return fail(err)
+					}
+					streams = append(streams, stream)
+				}
+				size := uint64(d.Size)
+				holes, err := sparse.NewSource(bytes.NewReader(nil), size, []sparse.Extent{{Size: size}})
+				if err != nil {
+					return fail(err)
+				}
+				streams = append(streams, &checkpointSourceStream{Source: holes, close: func() error { return nil }})
+				combined := fetch.NewLayered(streams...)
+				return &checkpointSourceStream{Source: combined, close: func() error { return errors.Join(combined.Close(), access.Close()) }}, nil
+			}
+			diffs[i].MergeBase = key
+			merged[i] = true
+			*lowers = nil
+			// Materialization adds the captured top to this base graph. Its
+			// compacted payload already contains all original parents.
+			if c0.IsCheckpoint() {
+				root.Base = ""
+			}
+			continue
+		}
+		raw, _, err := currentDiskParentBinding(opts, i)
+		if err != nil {
+			return opts, nil, nil, nil, err
 		}
 		if raw == "" {
 			continue
@@ -364,10 +436,6 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 			}
 		}
 		refs := append([]string{logical}, (*lowers)...)
-		relativeDir := ""
-		if opts.SourceBinding != nil {
-			relativeDir = opts.SourceBinding.RelativeDir
-		}
 		prefix, err := checkpointPrefix(ctx, refs, raw, relativeDir, opts, false)
 		if err != nil {
 			return opts, nil, nil, nil, err

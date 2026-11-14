@@ -202,7 +202,9 @@ reservation protocol and failure behavior are defined in [resources](resources.m
 | `boot.root.diff`, `boot.root.diff_template`, `boot.root.base_from_refs` | Local reference, local reference, ordered ref list | Single-disk-only writable binding, provisioning template and lower chain; mutually exclusive with overlay |
 | `boot.root.overlay.base`, `.base_from_refs`, `.diff`, `.diff_template` | Ref, ref list, local ref, local ref | Writable upper's immutable source chain and active binding; same rules as the single-disk fields |
 | `boot.disks[].name` | Unique nonempty string | At most eight data disks, in stable array order |
-| `boot.disks[].base`, `.overlay`, `.diff`, `.diff_template`, `.base_from_refs` | Same disk shape as root | Each data disk uses the same single/overlay source rules and has exactly one `mounts[].type: disk` consumer on cold start |
+| `boot.disks[].base`, `.overlay`, `.diff`, `.diff_template`, `.base_from_refs` | Same disk shape as root | Each data disk uses the same single/overlay source rules and has one or more disjoint `type: disk` mount projections on cold start |
+| `boot.disks[].slot` | `{}` or `{size: 8GiB}` | Single-device slot bound at runtime |
+| `boot.disks[].disk` | Complete DiskV1 | Cold launch from the same disk definition with an instance-private writer |
 
 `diff` and `diff_template` are absolute local file references. Immutable refs may
 use the supported local or Manifest carriers. A lower chain requires its base.
@@ -214,6 +216,28 @@ directory and survive normal exit, including automatically selected paths. Follo
 [checkpoint ownership and cleanup](block-storage.md#checkpoints) for that mode.
 Capacity comes from the selected disk source, not a quota or resize flag.
 See [capacity and migration](#disk-capacity).
+
+### Late binding and directory projections
+
+This configuration reserves a virtio-blk device named `input`. The guest installs autofs triggers at launch. Access before binding returns a retryable error. First access after binding mounts ext4 and projects the requested directory. Ordinary single-device and overlay data disks use the same mount syntax. Targets must be disjoint, as must source subdirectories of the same disk.
+```yaml
+boot:
+  disks:
+    - name: input
+      slot: {}
+mounts:
+  - {type: disk, source: input, subpath: data, target: /data}
+  - {type: disk, source: input, subpath: results, target: /out}
+```
+
+A slot with omitted `size` adopts the source capacity at bind time. A declared size must match the source exactly. List the receiver’s disks, export a complete disk definition from a committed E or S, then bind it on the receiver. The same export command accepts a saved whole-machine checkpoint.
+```bash
+sandbox-ctl disk list --path-id receiver
+sandbox-ctl export --source-ref "$PAUSED_E" --disk work --output "$OUT" > work.disk.json
+sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
+```
+
+Local delivery creates a Bundle containing the required block layers. For delivery across hosts, use `--upload` with the appropriate Manifest configuration on both ends. To initialize a new disk, supply a JSON object with `kind: disk`, `version: 1`, and a `diff_template` reference. Bind can register named locations with `--ref-location NAME=file:///dir`.
 
 ### Workload fields
 
@@ -300,7 +324,7 @@ source E's non-boot portable defaults
   -> ordinary ValidateCold / artifact preflight / ProjectPortableCold
 ```
 
-Complete replacement covers `boot.kernel`, `boot.runtime`, `boot.cmdline`, `boot.root`, and the entire `boot.disks[]` together. There is no root-only or leaf-level graph merge. An omitted host `boot.disks` means zero data disks, not inheritance of the source disks. If inherited mounts still reference removed/renamed disks, the caller must also replace mounts. Ordinary cold disk/mount 1:1 validation rejects an inconsistent result before controller, cgroup, run-directory, network, or VM side effects.
+Complete replacement covers `boot.kernel`, `boot.runtime`, `boot.cmdline`, `boot.root`, and the entire `boot.disks[]` together. There is no root-only or leaf-level graph merge. An omitted host `boot.disks` means zero data disks, not inheritance of the source disks. If inherited mounts still reference removed/renamed disks, the caller must also replace mounts. Ordinary cold disk mount topology validation rejects an inconsistent result before controller, cgroup, run-directory, network, or VM side effects.
 
 Replacement does not reuse the source E's default kernel/runtime bindings, `self`, `RunSourceBinding`, or Bundle reader/fetcher. Host boot refs still undergo ordinary cold canonicalization, local crypto, Manifest/Bundle lookup, and preflight. The new C0 and subsequent E/S disk closure depend only on replacement boot. `--replace-boot` requires both `--from` and explicit `--config` (or `SANDBOX_CONFIG`) and can never be combined with `--restore`.
 

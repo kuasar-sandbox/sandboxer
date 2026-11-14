@@ -85,7 +85,14 @@ func (s *ProcessStorage) RetainCurrentDisks(ctx context.Context, owner *diffstor
 	if err != nil {
 		return err
 	}
-	set := CurrentDiskSet{Version: 1, Run: run, DirectoryID: owner.Identity, Config: string(raw), Disks: disks, Locations: locations}
+	version := 1
+	for _, disk := range cfg.Boot.Disks {
+		if disk.Slot != nil {
+			version = 2
+			break
+		}
+	}
+	set := CurrentDiskSet{Version: version, Run: run, DirectoryID: owner.Identity, Config: string(raw), Disks: disks, Locations: locations}
 	if _, err := set.validate(); err != nil {
 		return err
 	}
@@ -151,7 +158,7 @@ func (s *ProcessStorage) RetainCurrentDisks(ctx context.Context, owner *diffstor
 }
 
 func (c *CurrentDiskSet) validate() (*config.PortableSandboxConfig, error) {
-	if c.Version != 1 || c.DirectoryID == "" {
+	if (c.Version != 1 && c.Version != 2) || c.DirectoryID == "" {
 		return nil, errors.New("unsupported current disk description")
 	}
 	if err := c.Run.Validate(); err != nil {
@@ -168,7 +175,21 @@ func (c *CurrentDiskSet) validate() (*config.PortableSandboxConfig, error) {
 	for i, d := range c.Disks {
 		root, name := p.Boot.Root, ""
 		if i > 0 {
-			root, name = p.Boot.Disks[i-1].PortableRootConfig, p.Boot.Disks[i-1].Name
+			disk := p.Boot.Disks[i-1]
+			root, name = disk.PortableRootConfig, disk.Name
+			if disk.Slot != nil && c.Version < 2 {
+				return nil, errors.New("current slot requires version 2")
+			}
+			if disk.Binding != nil && d.Capacity != disk.Binding.SizeBytes {
+				return nil, errors.New("retained writer capacity differs from saved slot")
+			}
+			if disk.Unbound() {
+				size, err := disk.Slot.Capacity()
+				if err != nil || d.DiffID != "" || d.BaseID != "" || name != d.Name || d.Capacity != size {
+					return nil, errors.New("invalid unbound current disk")
+				}
+				continue
+			}
 		}
 		if d.DiffID == "" || strings.ContainsAny(d.DiffID, "/\\.") || ids[d.DiffID] || d.Name != name || d.BaseID != DiffCheckpointBaseID(root) || d.Capacity <= 0 {
 			return nil, errors.New("current disk identity, capacity or base graph mismatch")
@@ -217,6 +238,10 @@ func readCurrentJSON(path string, v any) ([]byte, error) {
 	return b, nil
 }
 
+// ErrCurrentMetadataPublished means the replacement has become visible, but
+// persisting the directory entry failed. Its referenced writers must be kept.
+var ErrCurrentMetadataPublished = errors.New("current metadata published with pending directory sync")
+
 func writeCurrentJSON(path string, v any) (retErr error) {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -230,10 +255,21 @@ func writeCurrentJSON(path string, v any) (retErr error) {
 	if _, err := f.Write(b); err != nil {
 		return errors.Join(err, f.Close())
 	}
-	if err := f.Close(); err != nil {
+	if err := errors.Join(f.Sync(), f.Close()); err != nil {
 		return err
 	}
-	return os.Rename(f.Name(), path)
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	if err := os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		return errors.Join(ErrCurrentMetadataPublished, err)
+	}
+	return nil
 }
 
 type resetDiskOperation struct {
@@ -343,20 +379,25 @@ func (s *ProcessStorage) resetCurrentDisks(ctx context.Context, directory string
 		defer clear(k[:])
 		key = &k
 	}
-	stores := make([]*diffstore.Store, 0, len(set.Disks))
+	stores := make([]*diffstore.Store, len(set.Disks))
 	defer func() {
 		for i := len(stores) - 1; i >= 0; i-- {
-			retErr = errors.Join(retErr, stores[i].Close())
+			if stores[i] != nil {
+				retErr = errors.Join(retErr, stores[i].Close())
+			}
 		}
 	}()
 	before := make([]string, len(set.Disks))
 	for i, d := range set.Disks {
+		if i > 0 && d.DiffID == "" {
+			continue
+		}
 		path := filepath.Join(owner.Directory, "diffs", d.DiffID+".diff")
 		st, err := diffstore.Open(path, diffstore.Options{DiffID: d.DiffID, BaseID: d.BaseID, LogicalSize: d.Capacity, Key: key, RequireEncryption: s.localRequired})
 		if err != nil {
 			return "", fmt.Errorf("current disk %q unavailable: %w", d.Name, err)
 		}
-		stores = append(stores, st)
+		stores[i] = st
 		before[i] = st.Info().CurrentCheckpoint
 	}
 	digest := sha256.Sum256(raw)
@@ -371,6 +412,9 @@ func (s *ProcessStorage) resetCurrentDisks(ctx context.Context, directory string
 		op = existing
 	} else if os.IsNotExist(err) {
 		for _, st := range stores {
+			if st == nil {
+				continue
+			}
 			ids, err := st.ListCheckpoints(ctx)
 			if err != nil {
 				return "", err
@@ -392,8 +436,12 @@ func (s *ProcessStorage) resetCurrentDisks(ctx context.Context, directory string
 			return "", err
 		}
 	}
-	cp := &sandboxfile.Checkpoint{Version: 1, CheckpointID: operationID, Root: sandboxfile.CheckpointDisk{DiffID: set.Disks[0].DiffID}}
+	cp := &sandboxfile.Checkpoint{Version: set.Version, CheckpointID: operationID, Root: sandboxfile.CheckpointDisk{DiffID: set.Disks[0].DiffID}}
 	for i, st := range stores {
+		if st == nil {
+			cp.Disks = append(cp.Disks, sandboxfile.CheckpointNamedDisk{Name: set.Disks[i].Name})
+			continue
+		}
 		ids, err := st.ListCheckpoints(ctx)
 		if err != nil {
 			return "", err

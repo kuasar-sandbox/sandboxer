@@ -86,32 +86,12 @@ func (s *ProcessStorage) PinDiffCheckpoints(ctx context.Context, directory strin
 			retErr = errors.Join(retErr, p.Close())
 		}
 	}()
-	var key *[32]byte
-	if s.LocalCodec() != nil {
-		k, err := s.CustomerKeyFunc()()
-		if err != nil {
-			return nil, err
-		}
-		key = &k
-		defer clear(k[:])
-	}
 	open := func(id string) (*diffstore.View, error) {
-		path, err := checkpointDiffPath(dir, id)
-		if err != nil {
-			return nil, err
+		v, err := s.openCheckpointVersion(ctx, dir, cp.CheckpointID, id)
+		if err == nil {
+			p.Refs = append(p.Refs, DiffCheckpointRef{DiffID: id, ID: cp.CheckpointID})
 		}
-		view, err := diffstore.OpenExport(ctx, path, cp.CheckpointID, key)
-		if err != nil {
-			return nil, err
-		}
-		if view.Info().DiffID != id {
-			return nil, errors.Join(errors.New("checkpoint DiffID does not match its carrier"), view.Close())
-		}
-		if s.LocalRequired() && !view.Info().Encrypted {
-			return nil, errors.Join(diffstore.ErrPlaintextForbidden, view.Close())
-		}
-		p.Refs = append(p.Refs, DiffCheckpointRef{DiffID: id, ID: cp.CheckpointID})
-		return view, nil
+		return v, err
 	}
 	p.Root, err = open(cp.Root.DiffID)
 	if err != nil {
@@ -121,6 +101,9 @@ func (s *ProcessStorage) PinDiffCheckpoints(ctx context.Context, directory strin
 		if _, exists := p.Disks[disk.Name]; exists {
 			return nil, errors.New("checkpoint duplicate disk name")
 		}
+		if cp.Version == 2 && disk.DiffID == "" {
+			continue
+		}
 		view, err := open(disk.DiffID)
 		if err != nil {
 			return nil, err
@@ -128,6 +111,33 @@ func (s *ProcessStorage) PinDiffCheckpoints(ctx context.Context, directory strin
 		p.Disks[disk.Name] = view
 	}
 	return p, nil
+}
+
+func (s *ProcessStorage) openCheckpointVersion(ctx context.Context, directory, checkpointID, id string) (*diffstore.View, error) {
+	var key *[32]byte
+	if s.LocalCodec() != nil {
+		k, err := s.CustomerKeyFunc()()
+		if err != nil {
+			return nil, err
+		}
+		key = &k
+		defer clear(k[:])
+	}
+	path, err := checkpointDiffPath(directory, id)
+	if err != nil {
+		return nil, err
+	}
+	view, err := diffstore.OpenExport(ctx, path, checkpointID, key)
+	if err != nil {
+		return nil, err
+	}
+	if view.Info().DiffID != id {
+		return nil, errors.Join(errors.New("checkpoint DiffID does not match its carrier"), view.Close())
+	}
+	if s.LocalRequired() && !view.Info().Encrypted {
+		return nil, errors.Join(diffstore.ErrPlaintextForbidden, view.Close())
+	}
+	return view, nil
 }
 
 func checkpointDiffPath(directory, id string) (string, error) {
@@ -338,6 +348,10 @@ func (p *PinnedDiffCheckpoints) ReopenIDs(directory string, cfg *config.Portable
 	}
 	ids := []string{p.Root.Info().DiffID}
 	for _, disk := range cfg.Boot.Disks {
+		if disk.Unbound() {
+			ids = append(ids, "")
+			continue
+		}
 		view := p.Disks[disk.Name]
 		if view == nil {
 			return nil, errors.New("checkpoint pinned disk missing")
@@ -346,6 +360,9 @@ func (p *PinnedDiffCheckpoints) ReopenIDs(directory string, cfg *config.Portable
 	}
 	unchanged := true
 	for i, id := range ids {
+		if id == "" {
+			continue
+		}
 		path, err := checkpointDiffPath(directory, id)
 		if err != nil {
 			return nil, err

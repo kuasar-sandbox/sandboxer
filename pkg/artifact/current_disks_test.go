@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"golang.org/x/sys/unix"
@@ -53,6 +54,11 @@ func TestRetainedDiskListIgnoresInitializerClaims(t *testing.T) {
 
 func retainedCurrentFixture(t *testing.T) (*diffCheckpointFixture, *ProcessStorage, CurrentRun) {
 	t.Helper()
+	return retainedCurrentFixtureWithSlot(t, false)
+}
+
+func retainedCurrentFixtureWithSlot(t *testing.T, slot bool) (*diffCheckpointFixture, *ProcessStorage, CurrentRun) {
+	t.Helper()
 	f := newDiffCheckpointFixture(t)
 	s, err := NewProcessStorage(nil)
 	if err != nil {
@@ -71,6 +77,12 @@ func retainedCurrentFixture(t *testing.T) (*diffCheckpointFixture, *ProcessStora
 		if _, err := st.WriteAt(bytes.Repeat([]byte{byte(10 + i)}, 4096), 0); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if slot {
+		f.cfg.Version = 2
+		f.cfg.Boot.Disks = append(f.cfg.Boot.Disks[:1:1], append([]config.PortableDiskConfig{{Name: "unused", Slot: &config.DiskSlotConfig{}}}, f.cfg.Boot.Disks[1:]...)...)
+		f.cfg.Mounts = append(f.cfg.Mounts, config.MountConfig{Type: "disk", Source: "unused", Target: "/unused"})
+		disks = append(disks[:2:2], append([]CurrentDisk{{Name: "unused"}}, disks[2:]...)...)
 	}
 	if err := s.RetainCurrentDisks(context.Background(), f.owner, run, f.cfg, disks, nil); err != nil {
 		t.Fatal(err)
@@ -352,5 +364,39 @@ func TestCurrentDisksCleanupStillValidatesActiveIdentityAndVersions(t *testing.T
 				t.Fatal("cleanup mutated an unvalidated set", ids, err)
 			}
 		})
+	}
+}
+
+func TestResetCurrentDisksPreservesMiddleUnboundSlot(t *testing.T) {
+	f, s, run := retainedCurrentFixtureWithSlot(t, true)
+	ctx := context.Background()
+	ref, err := s.ResetCurrentDisks(ctx, f.dir, run, "middle-slot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := manifest.ParseRef(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := s.OpenFile(ctx, filepath.Join(f.dir, parsed.Path), parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := sandboxfile.Open(ctx, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	d := e.Checkpoint.Disks
+	if e.Checkpoint.Version != 2 || len(d) != 3 || d[0].DiffID != "data-1" || d[1].Name != "unused" || d[1].DiffID != "" || d[2].DiffID != "data-2" {
+		t.Fatalf("reset topology: %+v", d)
+	}
+	versions, err := s.CheckpointVersions(ctx, Checkpoint{Directory: f.dir, SandboxID: run.SandboxID, SandboxRef: ref})
+	if err != nil || len(versions) != 3 {
+		t.Fatalf("pinned versions: %v %v", versions, err)
+	}
+	replay, err := s.ResetCurrentDisks(ctx, f.dir, run, "middle-slot")
+	if err != nil || replay != ref {
+		t.Fatalf("reset retry %q, %v", replay, err)
 	}
 }

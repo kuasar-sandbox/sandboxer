@@ -74,6 +74,14 @@ func RetainCurrentDiskPlan(ctx context.Context, storage *artifact.ProcessStorage
 		if i > 0 {
 			p, actual, name = bases.Boot.Disks[i-1].PortableRootConfig, cfg.Boot.Disks[i-1].RootConfig, cfg.Boot.Disks[i-1].Name
 		}
+		if i > 0 && cfg.Boot.Disks[i-1].Unbound() {
+			size, err := cfg.Boot.Disks[i-1].Slot.Capacity()
+			if err != nil {
+				return err
+			}
+			disks[i] = artifact.CurrentDisk{Name: name, Capacity: size}
+			continue
+		}
 		if err := bind(p, actual); err != nil {
 			return err
 		}

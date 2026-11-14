@@ -53,8 +53,10 @@ func TestLaunchServer_HelloLaunchHandshake(t *testing.T) {
 	defer conn.Close()
 
 	if err := proto.WriteMessage(conn, &proto.Message{
-		Type:  proto.TypeHello,
-		Phase: "ready",
+		Type:                  proto.TypeHello,
+		Phase:                 "ready",
+		DiskSlotV1:            true,
+		DiskMountProjectionV1: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +67,9 @@ func TestLaunchServer_HelloLaunchHandshake(t *testing.T) {
 	}
 	if got.Type != proto.TypeLaunch || got.Launch == nil {
 		t.Fatalf("expected launch message, got %+v", got)
+	}
+	if slot, projection := srv.DiskCapabilities(); !slot || !projection {
+		t.Fatalf("lost Guest Hello disk capabilities slot=%t projection=%t", slot, projection)
 	}
 	if !reflect.DeepEqual(got.Launch, spec) {
 		t.Errorf("launch spec mismatch:\n got=%+v\nwant=%+v", got.Launch, spec)

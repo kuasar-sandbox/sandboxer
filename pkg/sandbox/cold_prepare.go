@@ -164,7 +164,7 @@ func preflightColdArtifacts(
 	diffCustomerKey [32]byte,
 	required bool,
 	opener FileStreamOpener,
-	checkpointPlans ...*CheckpointDiskPlan,
+	storage *artifact.ProcessStorage, checkpointPlans ...*CheckpointDiskPlan,
 ) (*coldPreparation, error) {
 	var plan *CheckpointDiskPlan
 	if len(checkpointPlans) > 0 {
@@ -201,7 +201,39 @@ func preflightColdArtifacts(
 		return nil, err
 	}
 	for i := range cfg.Boot.Disks {
-		disk := &cfg.Boot.Disks[i].RootConfig
+		entry := &cfg.Boot.Disks[i]
+		if entry.Unbound() {
+			continue
+		}
+		if entry.Disk != nil || entry.PureBlock {
+			source := entry.SourceDefinition()
+			if source.Base != "" || source.DiffTemplate != "" {
+				var opts []diffstore.DiskOption
+				if codec != nil {
+					opts = append(opts, diffstore.WithDiffEncryption(diffCustomerKey, required))
+				}
+				defaultURI := DefaultDiskDiffURI(baseDir, sandboxID, fmt.Sprintf("disk%d", i))
+				writer := entry.Diff
+				if writer == "" {
+					writer = defaultURI
+				}
+				base, _, template, err := openColdDiskSource(ctx, *entry, writer, storage, locations, opts...)
+				if err != nil {
+					return nil, fmt.Errorf("preflight %q: %w", entry.Name, err)
+				}
+				root := entry.RootConfig
+				root.DiffTemplate = template
+				err = preflightExt4WithBase(ctx, base, &root, fmt.Sprintf("boot.disks[%d]", i), defaultURI, codec, diffCustomerKey, required, binding(i+1))
+				if base != nil {
+					err = errors.Join(err, base.Close())
+				}
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+		}
+		disk := &entry.RootConfig
 		if !disk.Single() {
 			reader, _, err := OpenRootImageBlockReaderWithOpener(ctx, disk.Base, fetcher, locations, codec, required, opener)
 			if err != nil {
@@ -263,6 +295,15 @@ func preflightWritableExt4(
 			retErr = errors.Join(retErr, base.Close())
 		}()
 	}
+
+	view := *root
+	view.Diff = diffURI
+	view.DiffTemplate = templateURI
+	return preflightExt4WithBase(ctx, base, &view, field, defaultDiffURI, codec, diffCustomerKey, required, checkpointBindings...)
+}
+
+func preflightExt4WithBase(ctx context.Context, base diffstore.BlockReader, root *config.RootConfig, field, defaultDiffURI string, codec tarstream.Codec, diffCustomerKey [32]byte, required bool, checkpointBindings ...*CheckpointDiskBinding) error {
+	diffURI, templateURI := root.Diff, root.DiffTemplate
 
 	if diffURI == "" {
 		diffURI = defaultDiffURI

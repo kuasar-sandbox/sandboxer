@@ -835,7 +835,7 @@ Ordinary cold configuration validates at least:
 - Capacity/allocatable consistency with resource mode.
 - Absolute, unlocated file bindings for kernel/runtime.
 - A unique network provider, and a provider for any identity fields.
-- Valid root/data topology, disk names/order, and a 1:1 disk-to-mount relationship.
+- Valid root/data topology, disk names/order, and one or more disjoint mount projections per data disk.
 - Active diff/template/size combinations capable of yielding a mountable filesystem.
 - Consistent local/Manifest/Bundle refs and crypto policy.
 - Launch/files/init/plugin/metadata limits.
