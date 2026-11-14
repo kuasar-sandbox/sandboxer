@@ -15,9 +15,10 @@ import (
 // Devices use the existing minimal virtio feature profile; slice order fixes
 // device order. A zero-capacity slot adopts its source geometry exactly once.
 type BlockDeviceSpec struct {
-	Capacity int64 // bytes, sector aligned
-	Slot     bool  // independently bound writable device
-	ReadOnly bool
+	CapacityChange bool  // preserve the original dynamic protocol for a bound restore
+	Capacity       int64 // bytes, sector aligned
+	Slot           bool  // independently bound writable device
+	ReadOnly       bool
 }
 
 // ErrBackendUnbound is a normal device I/O failure, not a fatal storage error
@@ -223,5 +224,5 @@ func backendForRequest(b Backend) Backend {
 // capacity after publication, including across a reconnect or restore.
 func DynamicSlot(b Backend) bool {
 	s, ok := b.(*backendSlot)
-	return ok && s.unbound.spec.Slot && s.unbound.spec.Capacity == 0
+	return ok && s.unbound.spec.Slot && (s.unbound.spec.Capacity == 0 || s.unbound.spec.CapacityChange)
 }

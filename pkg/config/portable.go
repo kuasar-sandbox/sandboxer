@@ -68,11 +68,12 @@ type PortableNetworkConfig struct {
 }
 
 type PortableBootConfig struct {
-	Kernel  string               `yaml:"kernel"`
-	Cmdline string               `yaml:"cmdline,omitempty"`
-	Runtime string               `yaml:"runtime"`
-	Root    PortableRootConfig   `yaml:"root"`
-	Disks   []PortableDiskConfig `yaml:"disks,omitempty"`
+	DiskCapabilities *DiskCapabilities    `yaml:"disk_capabilities,omitempty"`
+	Kernel           string               `yaml:"kernel"`
+	Cmdline          string               `yaml:"cmdline,omitempty"`
+	Runtime          string               `yaml:"runtime"`
+	Root             PortableRootConfig   `yaml:"root"`
+	Disks            []PortableDiskConfig `yaml:"disks,omitempty"`
 }
 
 type PortableDiskConfig struct {
@@ -1049,6 +1050,9 @@ func WritePortableSandboxConfig(runDir string, cfg *PortableSandboxConfig) ([]by
 }
 
 func (p *PortableSandboxConfig) requiresDiskV2() bool {
+	if p.Boot.DiskCapabilities != nil {
+		return true
+	}
 	for _, d := range p.Boot.Disks {
 		if d.Slot != nil || d.PureBlock || d.Binding != nil {
 			return true
@@ -1060,4 +1064,52 @@ func (p *PortableSandboxConfig) requiresDiskV2() bool {
 		}
 	}
 	return false
+}
+
+// DiskCapabilities records the negotiated features a captured Guest depends on.
+type DiskCapabilities struct {
+	SlotV1         bool `yaml:"disk_slot_v1,omitempty"`
+	ProjectionV1   bool `yaml:"disk_mount_projection_v1,omitempty"`
+	CapacityChange bool `yaml:"vhost_capacity_change,omitempty"`
+}
+
+func (p *PortableSandboxConfig) RequiredDiskCapabilities() (required DiskCapabilities) {
+	for _, d := range p.Boot.Disks {
+		if d.Slot != nil {
+			required.SlotV1 = true
+			required.CapacityChange = required.CapacityChange || d.Slot.Size == nil
+		}
+	}
+	seen := make(map[string]bool)
+	for _, m := range p.Mounts {
+		if m.Type == "disk" {
+			required.ProjectionV1 = required.ProjectionV1 || m.Subpath != "" || seen[m.Source]
+			seen[m.Source] = true
+		}
+	}
+	return required
+}
+
+func (required DiskCapabilities) CheckGuest(slot, projection bool) error {
+	switch {
+	case required.SlotV1 && !slot:
+		return errors.New("guest does not support disk_slot_v1")
+	case required.ProjectionV1 && !projection:
+		return errors.New("guest does not support disk_mount_projection_v1")
+	}
+	return nil
+}
+
+// ValidateCapturedDiskCapabilities pairs S with the evidence recorded in E.
+// Cold launch can use an offline-produced E and negotiates its own features.
+func (p *PortableSandboxConfig) ValidateCapturedDiskCapabilities() error {
+	required := p.RequiredDiskCapabilities()
+	if required == (DiskCapabilities{}) {
+		return nil
+	}
+	actual := p.Boot.DiskCapabilities
+	if actual == nil || required.CapacityChange && !actual.CapacityChange {
+		return errors.New("snapshot lacks captured disk capabilities for its topology")
+	}
+	return required.CheckGuest(actual.SlotV1, actual.ProjectionV1)
 }

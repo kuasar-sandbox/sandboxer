@@ -80,6 +80,8 @@ type CmdEnv struct {
 //     continues into the normal graceful CH shutdown/escalation path while
 //     backend services remain on their separate VM lifecycle context.
 type PostSpawnCtx struct {
+	CheckDiskCapabilities func() error
+
 	Ctx          context.Context
 	Cmd          *exec.Cmd
 	Pinger       *guestlink.Pinger
@@ -1209,17 +1211,32 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 	})
 
+	// Once Guest Hello or CH's restored Paused state confirms initialization,
+	// all queue setup commands have been issued. Give the backend time to
+	// consume the last one; older restore frontends can replay protocol bits
+	// from a newer S without ever installing the reverse request channel.
+	checkDiskCapabilities := func() error {
+		ctx, cancel := context.WithTimeout(postSpawnCtx, 2*time.Second)
+		defer cancel()
+		for i, server := range servers {
+			if err := server.WaitCapacityChange(ctx); err != nil {
+				return fmt.Errorf("disk device %d: %w", i, err)
+			}
+		}
+		return nil
+	}
 	if err := p.PostSpawn(PostSpawnCtx{
-		Ctx:          postSpawnCtx,
-		Cmd:          cmd,
-		Pinger:       pinger,
-		Launch:       launch,
-		EstablishMUX: establishMUX,
-		Hooks:        p.Hooks,
-		Memory:       p.Memory,
-		CHSock:       chSock,
-		Logf:         logf,
-		NotifyReady:  notifyReady,
+		CheckDiskCapabilities: checkDiskCapabilities,
+		Ctx:                   postSpawnCtx,
+		Cmd:                   cmd,
+		Pinger:                pinger,
+		Launch:                launch,
+		EstablishMUX:          establishMUX,
+		Hooks:                 p.Hooks,
+		Memory:                p.Memory,
+		CHSock:                chSock,
+		Logf:                  logf,
+		NotifyReady:           notifyReady,
 	}); err != nil {
 		if readFatal() != nil || !runShutdownRequested(p.Ctx) {
 			_ = cmd.Process.Kill()

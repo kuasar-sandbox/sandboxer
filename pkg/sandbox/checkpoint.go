@@ -344,7 +344,7 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 			return opts, nil, nil, nil, fmt.Errorf("disk %d has invalid SnapshotView/size", i)
 		}
 		diffs[i] = snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff, SnapshotView: d.SnapshotView, WaitReady: d.WaitReady, CheckError: d.CheckError, DiffID: d.DiffID, Checkpoint: d.Checkpoint, DeleteCheckpoint: d.DeleteCheckpoint, WaitMaterialized: d.WaitMaterialized, Export: d.Export}
-		if opts.namedCheckpoint || c0.IsCheckpoint() {
+		if opts.namedCheckpoint || c0.IsCheckpoint() && (i == 0 || !c0.Boot.Disks[i-1].PureBlock) {
 			continue
 		}
 		raw, _, err := currentDiskParentBinding(opts, i)
@@ -429,6 +429,11 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 			diffs[i].MergeBase = key
 			merged[i] = true
 			*lowers = nil
+			// Materialization adds the captured top to this base graph. Its
+			// compacted payload already contains all original parents.
+			if c0.IsCheckpoint() {
+				root.Base = ""
+			}
 			continue
 		}
 		prefix, err := checkpointPrefix(ctx, refs, raw, relativeDir, opts, false)

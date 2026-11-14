@@ -2160,12 +2160,15 @@ const (
 	dependencyDiskLayer artifactDependencyRole = iota
 	dependencyRootImage
 	dependencyMemorySnapshot
+	dependencyPureBlock
 )
 
 func (r artifactDependencyRole) String() string {
 	switch r {
 	case dependencyDiskLayer:
 		return "disk layer"
+	case dependencyPureBlock:
+		return "pure block layer"
 	case dependencyRootImage:
 		return "root image"
 	case dependencyMemorySnapshot:
@@ -2304,7 +2307,7 @@ func (p *snapshotBundlePlan) emit(ctx context.Context, sink snapshot.ArtifactSin
 		switch item.role {
 		case dependencyMemorySnapshot:
 			ref, _, absorbErr = sink.AbsorbSnapshot(ctx, item.stream)
-		case dependencyDiskLayer:
+		case dependencyDiskLayer, dependencyPureBlock:
 			ref, _, absorbErr = sink.AbsorbOverlaySource(ctx, item.stream)
 		case dependencyRootImage:
 			ref, _, absorbErr = sink.AbsorbImageSource(ctx, item.stream)
@@ -2388,10 +2391,19 @@ func prepareSnapshotDependencyPlan(
 		}
 	}()
 	knownPaths := bundleKnownRefPaths(opts)
+	pureRefs := make(map[string]bool)
+	for _, d := range logicalRefs {
+		if d.role == dependencyPureBlock {
+			pureRefs[d.raw] = true
+		}
+	}
 	seenLogical := make(map[string]artifactDependencyRole, len(logicalRefs))
 	for index := len(logicalRefs) - 1; index >= 0; index-- {
 		dependency := logicalRefs[index]
 		raw := dependency.raw
+		if dependency.role == dependencyDiskLayer && pureRefs[raw] {
+			dependency.role = dependencyPureBlock
+		}
 		if previous, seen := seenLogical[raw]; seen {
 			if previous != dependency.role {
 				return nil, fmt.Errorf("artifact dependency %q is used as both %s and %s", raw, previous, dependency.role)
@@ -2572,6 +2584,9 @@ func prepareSnapshotDependencyStream(ctx context.Context, stream fetch.Stream, r
 			return nil, false, errors.Join(err, root.Close())
 		}
 		return root.FullStream, false, nil
+	case dependencyPureBlock:
+		// Every byte, including a ZIP-shaped tail, belongs to the filesystem.
+		return stream, false, nil
 	case dependencyDiskLayer, dependencyRootImage:
 		payload, sandboxLayer, err := sandboxfile.PayloadIfSandbox(ctx, stream, false)
 		if err != nil {
@@ -2610,13 +2625,13 @@ func snapshotLayerDependencies(opts RunOptions, memoryFromRefs []string, diskMer
 			dependencies = append(dependencies, artifactDependency{raw: raw, role: role})
 		}
 	}
-	appendRoot := func(root *config.PortableRootConfig, merged bool) {
+	appendRoot := func(root *config.PortableRootConfig, merged bool, role artifactDependencyRole) {
 		if root.Overlay == nil {
 			if !merged {
-				appendRef(root.Base, dependencyDiskLayer)
+				appendRef(root.Base, role)
 			}
 			for _, raw := range root.BaseFromRefs {
-				appendRef(raw, dependencyDiskLayer)
+				appendRef(raw, role)
 			}
 			return
 		}
@@ -2625,10 +2640,10 @@ func snapshotLayerDependencies(opts RunOptions, memoryFromRefs []string, diskMer
 			appendRef(root.Overlay.Base, dependencyDiskLayer)
 		}
 		for _, raw := range root.Overlay.BaseFromRefs {
-			appendRef(raw, dependencyDiskLayer)
+			appendRef(raw, role)
 		}
 	}
-	appendRoot(&opts.PortableConfig.Boot.Root, diskMerged[0])
+	appendRoot(&opts.PortableConfig.Boot.Root, diskMerged[0], dependencyDiskLayer)
 	if opts.SourceBinding != nil && !opts.PortableConfig.IsCheckpoint() && !diskMerged[0] {
 		role := dependencyDiskLayer
 		root := &opts.PortableConfig.Boot.Root
@@ -2638,7 +2653,12 @@ func snapshotLayerDependencies(opts RunOptions, memoryFromRefs []string, diskMer
 		appendRef(opts.SourceBinding.SandboxRef, role)
 	}
 	for i := range opts.PortableConfig.Boot.Disks {
-		appendRoot(&opts.PortableConfig.Boot.Disks[i].PortableRootConfig, diskMerged[i+1])
+		disk := &opts.PortableConfig.Boot.Disks[i]
+		role := dependencyDiskLayer
+		if disk.PureBlock {
+			role = dependencyPureBlock
+		}
+		appendRoot(&disk.PortableRootConfig, diskMerged[i+1], role)
 	}
 	return dependencies, nil
 }

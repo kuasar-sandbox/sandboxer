@@ -1,13 +1,13 @@
-From 1773108392a9420b732b87a74fd6e663e63fd7f1 Mon Sep 17 00:00:00 2001
+From e40fc41b3114cdb20489c1dcc59180ae29c4ccbe Mon Sep 17 00:00:00 2001
 From: Kuasar Sandbox <codex@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 02:54:04 -0500
 Subject: [PATCH] virtio-devices: notify reserved block capacity changes
 
 ---
- virtio-devices/src/device.rs                  |  6 ++
- .../src/transport/pci_common_config.rs        |  5 +-
- virtio-devices/src/vhost_user/blk.rs          | 73 +++++++++++++++++--
- 3 files changed, 76 insertions(+), 8 deletions(-)
+ virtio-devices/src/device.rs                  |   6 +
+ .../src/transport/pci_common_config.rs        |   5 +-
+ virtio-devices/src/vhost_user/blk.rs          | 107 +++++++++++++++++-
+ 3 files changed, 111 insertions(+), 7 deletions(-)
 
 diff --git a/virtio-devices/src/device.rs b/virtio-devices/src/device.rs
 index 438ecc3..07b485b 100644
@@ -43,27 +43,36 @@ index 5a7b5f5..5e6753f 100644
              }
              2 => {
 diff --git a/virtio-devices/src/vhost_user/blk.rs b/virtio-devices/src/vhost_user/blk.rs
-index 1be1807..0c7553d 100644
+index 1be1807..895fa2f 100644
 --- a/virtio-devices/src/vhost_user/blk.rs
 +++ b/virtio-devices/src/vhost_user/blk.rs
-@@ -1,7 +1,7 @@
- // Copyright 2019 Intel Corporation. All Rights Reserved.
- // SPDX-License-Identifier: Apache-2.0
- 
--use std::sync::atomic::AtomicBool;
-+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
- use std::sync::{Arc, Barrier, Mutex};
- use std::{mem, result, thread};
- 
-@@ -44,14 +44,37 @@ pub struct State {
+@@ -42,16 +42,54 @@ pub struct State {
+     pub config: VirtioBlockConfig,
+     pub acked_protocol_features: u64,
      pub vu_num_queues: usize,
++    #[serde(default)]
++    pub capacity_generation: u8,
  }
  
 -struct BackendReqHandler {}
 -impl VhostUserFrontendReqHandler for BackendReqHandler {}
++struct Capacity {
++    sectors: u64,
++    generation: u8,
++}
++
++impl Capacity {
++    fn update(&mut self, sectors: u64) {
++        if self.sectors != sectors {
++            self.sectors = sectors;
++            self.generation = self.generation.wrapping_add(1);
++        }
++    }
++}
++
 +struct BackendReqHandler {
 +    vu: Arc<Mutex<VhostUserHandle>>,
-+    sectors: Arc<AtomicU64>,
++    capacity: Arc<Mutex<Capacity>>,
 +    irq: Arc<dyn VirtioInterrupt>,
 +}
 +
@@ -79,8 +88,7 @@ index 1be1807..0c7553d 100644
 +            .map_err(std::io::Error::other)?;
 +        let cfg = VirtioBlockConfig::from_slice(&data)
 +            .ok_or_else(|| std::io::Error::other("invalid vhost-user block configuration"))?;
-+        let sectors = cfg.capacity;
-+        self.sectors.store(sectors, Ordering::Release);
++        self.capacity.lock().unwrap().update(cfg.capacity);
 +        self.irq.trigger(crate::VirtioInterruptType::Config)?;
 +        Ok(0)
 +    }
@@ -91,11 +99,19 @@ index 1be1807..0c7553d 100644
      vu_common: VhostUserCommon,
      id: String,
      config: VirtioBlockConfig,
-+    sectors: Arc<AtomicU64>,
++    capacity: Arc<Mutex<Capacity>>,
      guest_memory: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
      epoll_thread: Option<thread::JoinHandle<()>>,
      seccomp_action: SeccompAction,
-@@ -115,7 +138,8 @@ impl Blk {
+@@ -74,6 +112,7 @@ impl Blk {
+         let mut vu =
+             VhostUserHandle::connect_vhost_user(false, &vu_cfg.socket, num_queues as u64, false)?;
+ 
++        let capacity_generation = state.as_ref().map_or(0, |s| s.capacity_generation);
+         let (
+             avail_features,
+             acked_features,
+@@ -115,7 +154,8 @@ impl Blk {
                  avail_features |= 1 << VIRTIO_BLK_F_MQ;
              }
  
@@ -105,15 +121,18 @@ index 1be1807..0c7553d 100644
                  | VhostUserProtocolFeatures::MQ
                  | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
                  | VhostUserProtocolFeatures::REPLY_ACK
-@@ -191,6 +215,7 @@ impl Blk {
+@@ -191,6 +231,10 @@ impl Blk {
                  ..Default::default()
              },
              id,
-+            sectors: Arc::new(AtomicU64::new(config.capacity)),
++            capacity: Arc::new(Mutex::new(Capacity {
++                sectors: config.capacity,
++                generation: capacity_generation,
++            })),
              config,
              guest_memory: None,
              epoll_thread: None,
-@@ -200,11 +225,21 @@ impl Blk {
+@@ -200,11 +244,24 @@ impl Blk {
          })
      }
  
@@ -121,43 +140,41 @@ index 1be1807..0c7553d 100644
 +        self.vu_common.acked_protocol_features & VhostUserProtocolFeatures::BACKEND_REQ.bits() != 0
 +    }
 +
-+    fn current_config(&self) -> VirtioBlockConfig {
++    fn current_config(&self) -> (VirtioBlockConfig, u8) {
 +        let mut cfg = self.config;
-+        cfg.capacity = self.sectors.load(Ordering::Acquire);
-+        cfg
++        let capacity = self.capacity.lock().unwrap();
++        cfg.capacity = capacity.sectors;
++        (cfg, capacity.generation)
 +    }
 +
      fn state(&self) -> State {
++        let (config, capacity_generation) = self.current_config();
          State {
              avail_features: self.common.avail_features,
              acked_features: self.common.acked_features,
 -            config: self.config,
-+            config: self.current_config(),
++            config,
++            capacity_generation,
              acked_protocol_features: self.vu_common.acked_protocol_features,
              vu_num_queues: self.vu_common.vu_num_queues,
          }
-@@ -248,8 +283,19 @@ impl VirtioDevice for Blk {
+@@ -248,8 +305,14 @@ impl VirtioDevice for Blk {
          self.common.ack_features(value);
      }
  
-+    // A reserved disk transitions once from zero to its final capacity. Read
-+    // the same atomic as read_config so a split capacity read can never
-+    // observe a new generation with the old capacity, or vice versa.
++    // The guest brackets a multi-part configuration read with generation reads.
++    // Publish capacity and generation together, including after memory restore.
 +    fn config_generation(&self) -> u8 {
-+        if self.has_backend_requests() {
-+            u8::from(self.sectors.load(Ordering::Acquire) != 0)
-+        } else {
-+            0
-+        }
++        self.capacity.lock().unwrap().generation
 +    }
 +
      fn read_config(&self, offset: u64, data: &mut [u8]) {
 -        self.read_config_from_slice(self.config.as_slice(), offset, data);
-+        self.read_config_from_slice(self.current_config().as_slice(), offset, data);
++        self.read_config_from_slice(self.current_config().0.as_slice(), offset, data);
      }
  
      fn write_config(&mut self, offset: u64, data: &[u8]) {
-@@ -288,7 +334,20 @@ impl VirtioDevice for Blk {
+@@ -288,7 +351,20 @@ impl VirtioDevice for Blk {
          self.common.activate(&queues, interrupt_cb.clone())?;
          self.guest_memory = Some(mem.clone());
  
@@ -165,7 +182,7 @@ index 1be1807..0c7553d 100644
 +        let backend_req_handler = if self.has_backend_requests() {
 +            let handler = BackendReqHandler {
 +                vu: self.vu_common.vu.as_ref().unwrap().clone(),
-+                sectors: self.sectors.clone(),
++                capacity: self.capacity.clone(),
 +                irq: interrupt_cb.clone(),
 +            };
 +            Some(
@@ -179,6 +196,29 @@ index 1be1807..0c7553d 100644
  
          // Run a dedicated thread for handling potential reconnections with
          // the backend.
+@@ -414,3 +490,22 @@ impl Migratable for Blk {
+             .complete_migration(self.common.kill_evt.take())
+     }
+ }
++
++#[cfg(test)]
++mod capacity_tests {
++    use super::Capacity;
++
++    #[test]
++    fn generations_track_capacity_changes_and_tolerate_duplicate_notifications() {
++        let mut capacity = Capacity {
++            sectors: 0,
++            generation: 254,
++        };
++        capacity.update(512);
++        assert_eq!(capacity.generation, 255);
++        capacity.update(512);
++        assert_eq!(capacity.generation, 255);
++        capacity.update(1024);
++        assert_eq!((capacity.sectors, capacity.generation), (1024, 0));
++    }
++}
 -- 
 2.52.0
 

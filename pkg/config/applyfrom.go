@@ -254,7 +254,7 @@ func validateFromProtectedFields(artifact *PortableSandboxConfig, host *SandboxC
 
 func validateFromDiskMountTopology(artifactMounts, hostMounts []MountConfig) error {
 	if err := ValidateMountProjections(hostMounts); err != nil {
-		return err
+		return fmt.Errorf("artifact-owned data-disk mount topology: %w", err)
 	}
 	type diskMount struct {
 		source  string

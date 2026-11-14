@@ -312,7 +312,7 @@ func deriveBoundRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, opts
 			if err != nil {
 				return RuntimeSpec{}, fmt.Errorf("derive disk %q shape: %w", disk.Name, err)
 			}
-			shapes = append(shapes, RuntimeDiskSpec{Name: disk.Name, Slot: disk.Slot != nil, WritableCapacity: size})
+			shapes = append(shapes, RuntimeDiskSpec{Name: disk.Name, Slot: disk.Slot != nil, capacityChange: disk.Slot != nil && disk.Slot.Size == nil && size != 0, WritableCapacity: size})
 			continue
 		}
 		shape, err := derive(&disk.RootConfig, disk.Name, i+1)

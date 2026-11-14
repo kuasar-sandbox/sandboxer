@@ -1,8 +1,11 @@
 package vhost
 
 import (
+	"context"
 	"errors"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestSlotPublicationIsAtomicAndLeavesOtherDevicesAlone(t *testing.T) {
@@ -32,5 +35,58 @@ func TestSlotPublicationIsAtomicAndLeavesOtherDevicesAlone(t *testing.T) {
 	}
 	if err := set.BindSlot(1, source, nil); err == nil {
 		t.Fatal("bound twice")
+	}
+}
+
+func TestCapacityHandshakeWaitsForReverseRequestFD(t *testing.T) {
+	server := NewServer("", &memBackend{}, nil)
+	server.EnableCapacityChange()
+	done := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() { done <- server.WaitCapacityChange(ctx) }()
+	set := func(features uint64) {
+		t.Helper()
+		if err := server.handleSetProtocolFeatures(nil, &Message{Payload: minimalProfileU64(features)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set(bitBackendRequest | bitProtocolConfig)
+	select {
+	case err := <-done:
+		t.Fatalf("completed before reverse fd arrived: %v", err)
+	default:
+	}
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	msg := &Message{Header: Header{Request: MsgSetBackendReqFd}, Fds: []int{fds[1]}}
+	if err := server.handle(nil, msg); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	server.resetConnectionState()
+	set(bitProtocolConfig)
+	if err := server.WaitCapacityChange(ctx); err == nil {
+		t.Fatal("accepted legacy VMM")
+	}
+	server.resetConnectionState()
+	set(bitProtocolConfig | bitBackendRequest)
+	expired, stop := context.WithCancel(context.Background())
+	stop()
+	if err := server.WaitCapacityChange(expired); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}
+
+func TestBoundRestorePreservesAdvertisedCapacityFeatures(t *testing.T) {
+	set := bindingSetForTest(t, BlockDeviceSpec{Slot: true, Capacity: 4096, CapacityChange: true}, BlockDeviceSpec{Slot: true, Capacity: 4096})
+	devices := set.DeviceBackends()
+	if !DynamicSlot(devices[0]) || DynamicSlot(devices[1]) || devices[0].Size() != 4096 {
+		t.Fatal("dynamic protocol or visible device capacity changed")
 	}
 }

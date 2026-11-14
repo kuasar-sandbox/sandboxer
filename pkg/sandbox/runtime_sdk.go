@@ -38,6 +38,8 @@ import (
 )
 
 type RuntimeDiskSpec struct {
+	// Preserve a bound dynamic slot's negotiated VMM features at its saved nonzero geometry.
+	capacityChange   bool
 	Slot             bool
 	Name             string
 	Overlay          bool
@@ -276,7 +278,7 @@ func runtimeDeviceSpecs(disks []RuntimeDiskSpec) ([]vhost.BlockDeviceSpec, error
 		} else if d.BaseCapacity != 0 {
 			return nil, fmt.Errorf("runtime disk %d: single disk cannot expose separate base capacity", i)
 		}
-		out = append(out, vhost.BlockDeviceSpec{Capacity: d.WritableCapacity, Slot: d.Slot})
+		out = append(out, vhost.BlockDeviceSpec{Capacity: d.WritableCapacity, Slot: d.Slot, CapacityChange: d.capacityChange})
 	}
 	return out, nil
 }
@@ -515,6 +517,9 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 			case <-pc.Ctx.Done():
 				return pc.Ctx.Err()
 			}
+			if err := pc.CheckDiskCapabilities(); err != nil {
+				return err
+			}
 			pc.Pinger.Start(pc.Ctx)
 			if hooks.Enabled() {
 				hooks.StartHeartbeat(pc.Ctx, 5*time.Second)
@@ -702,6 +707,17 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		if i > 0 && (cfg.Boot.Disks[i-1].Slot != nil) != shape.Slot {
 			return fail(fmt.Errorf("launch disk %d slot mismatch", i))
 		}
+		if i > 0 && shape.Slot {
+			d := cfg.Boot.Disks[i-1]
+			declared, err := d.Slot.Capacity()
+			if err != nil {
+				return fail(err)
+			}
+			change := shape.WritableCapacity == 0 || shape.capacityChange
+			if (declared == 0) != change || d.Unbound() && declared != shape.WritableCapacity {
+				return fail(fmt.Errorf("launch disk %d slot capacity mode mismatch", i))
+			}
+		}
 		if overlay != shape.Overlay {
 			return fail(fmt.Errorf("launch disk %d layout mismatch", i))
 		}
@@ -805,6 +821,16 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	}
 	if err != nil {
 		return fail(err)
+	}
+	// Retain only guarantees actually required and verified for this launch.
+	// Old single-mount E artifacts stay byte-compatible.
+	required := portable.RequiredDiskCapabilities()
+	portable.Boot.DiskCapabilities = nil
+	if required != (config.DiskCapabilities{}) {
+		if err := required.CheckGuest(r.launch.DiskCapabilities()); err != nil {
+			return fail(err)
+		}
+		portable.Boot.DiskCapabilities = &required
 	}
 	if r.spec.EnableCheckpoint {
 		parent := ""

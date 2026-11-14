@@ -140,27 +140,12 @@ func bindRuntimeDiskGraph(cfg *config.SandboxConfig, portable *config.PortableSa
 // Materialization changes only immutable disk bindings. The effective C0 and
 // runtime already contain the caller's persistent and instance-only overrides.
 func materializedColdGraph(runtime *config.SandboxConfig, effective, materialized *config.PortableSandboxConfig) (*config.PortableSandboxConfig, error) {
-	data := make([]string, len(materialized.Boot.Disks))
-	for i, d := range materialized.Boot.Disks {
-		data[i] = d.Base
-		if d.Overlay != nil {
-			data[i] = d.Overlay.Base
-		}
-	}
-	c0, err := effective.MaterializedCheckpoint(data)
+	c0, err := effective.WithMaterializedDisks(materialized)
 	if err != nil {
 		return nil, err
 	}
-	graph, err := materialized.Clone()
-	if err != nil {
-		return nil, err
-	}
-	if len(runtime.Boot.Disks) != len(graph.Boot.Disks) {
+	if len(runtime.Boot.Disks) != len(c0.Boot.Disks) {
 		return nil, errors.New("materialized cold disk topology mismatch")
-	}
-	c0.Boot.Root, c0.Boot.Disks = graph.Boot.Root, graph.Boot.Disks
-	if err := c0.Validate(); err != nil {
-		return nil, err
 	}
 	bind := func(dst *config.RootConfig, src config.PortableRootConfig) {
 		dst.Base, dst.BaseFromRefs = src.Base, append([]string(nil), src.BaseFromRefs...)
@@ -171,8 +156,8 @@ func materializedColdGraph(runtime *config.SandboxConfig, effective, materialize
 			dst.Overlay.Base, dst.Overlay.BaseFromRefs = src.Overlay.Base, append([]string(nil), src.Overlay.BaseFromRefs...)
 		}
 	}
-	bind(&runtime.Boot.Root, graph.Boot.Root)
-	for i, d := range graph.Boot.Disks {
+	bind(&runtime.Boot.Root, c0.Boot.Root)
+	for i, d := range c0.Boot.Disks {
 		bind(&runtime.Boot.Disks[i].RootConfig, d.PortableRootConfig)
 	}
 	return c0, nil

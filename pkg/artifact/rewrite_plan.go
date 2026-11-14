@@ -26,7 +26,15 @@ const (
 	rewriteDisk rewriteUse = iota
 	rewriteImage
 	rewriteMemory
+	rewritePureDisk
 )
+
+func diskLayerUse(pure bool) rewriteUse {
+	if pure {
+		return rewritePureDisk
+	}
+	return rewriteDisk
+}
 
 type rewriteValue struct {
 	raw         string
@@ -279,8 +287,7 @@ func (p *publicationRewrite) sandbox(ctx context.Context, raw string, scope publ
 		}
 		return nil
 	}
-	addDisk := func(root *config.PortableRootConfig) error {
-		use := rewriteDisk
+	addDisk := func(root *config.PortableRootConfig, use rewriteUse) error {
 		if root.Overlay != nil {
 			use = rewriteImage
 		}
@@ -292,11 +299,11 @@ func (p *publicationRewrite) sandbox(ctx context.Context, raw string, scope publ
 		}
 		return nil
 	}
-	if err = addDisk(&cfg.Boot.Root); err != nil {
+	if err = addDisk(&cfg.Boot.Root, rewriteDisk); err != nil {
 		return nil, fmt.Errorf("root disk: %w", err)
 	}
 	for i := range cfg.Boot.Disks {
-		if err = addDisk(&cfg.Boot.Disks[i].PortableRootConfig); err != nil {
+		if err = addDisk(&cfg.Boot.Disks[i].PortableRootConfig, diskLayerUse(cfg.Boot.Disks[i].PureBlock)); err != nil {
 			return nil, fmt.Errorf("disk %s: %w", cfg.Boot.Disks[i].Name, err)
 		}
 	}
@@ -340,6 +347,11 @@ func (p *publicationRewrite) openValue(ctx context.Context, raw string, scope pu
 			return nil, err
 		}
 		out.payload, out.source, out.role = root.Memory, root.FullStream, RoleSnapshot
+		return out, nil
+	}
+	if use == rewritePureDisk {
+		out.payload, out.source, out.role = stream, stream, RoleOverlay
+		p.closes = append(p.closes, stream.Close)
 		return out, nil
 	}
 	required := ref.Scheme == manifest.RefSchemeFile && filepath.Ext(ref.Path) == ".sandbox"
@@ -451,7 +463,7 @@ func (p *publicationRewrite) chain(ctx context.Context, selector string, base *s
 		if err != nil {
 			return nil, err
 		}
-		if value.payload.Size() != top.payload.Size() {
+		if value.payload.Size() > top.payload.Size() || use != rewritePureDisk && value.payload.Size() != top.payload.Size() {
 			return nil, fmt.Errorf("layer capacity differs for %s: %d != %d", raw, value.payload.Size(), top.payload.Size())
 		}
 		chain.values = append(chain.values, value)

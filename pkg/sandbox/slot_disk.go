@@ -83,6 +83,7 @@ func restoredDiskBackends(disks []DiskBackend, cfg *config.SandboxConfig) (*vhos
 					return nil, nil, errors.New("restore slot writer differs from saved capacity")
 				}
 				shape.WritableCapacity = binding.SizeBytes
+				shape.capacityChange = capacity == 0
 			} else if cfg.Boot.Disks[i-1].Binding != nil {
 				return nil, nil, errors.New("restore bound slot has no writer")
 			}
@@ -241,13 +242,16 @@ func (r *Runtime) BindDisk(ctx context.Context, req BindDiskRequest) error {
 	if err != nil {
 		return err
 	}
-	sourceID := req.Disk.Identity()
 	if entry.State == diskUnbound {
 		entry, err = r.publishDiskSlot(ctx, entry, req.Disk, locations)
 		if err != nil {
 			return err
 		}
 	} else {
+		sourceID, err := diskRetryIdentity(ctx, req.Disk, r.diskStorage, locations)
+		if err != nil {
+			return err
+		}
 		if entry.sourceID != sourceID {
 			return fmt.Errorf("disk %s is bound to a different source", entry.Name)
 		}
@@ -332,7 +336,8 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 		return entry, fmt.Errorf("slot %s requires %d bytes, source has %d", entry.Name, *entry.SizeBytes, size)
 	}
 	id := rand.Text()
-	plan, err := r.planSlotBind(entry.Ordinal, resolved, source.Identity(), id, size, locations)
+	sourceID := resolved.Identity()
+	plan, err := r.planSlotBind(entry.Ordinal, resolved, sourceID, id, size, locations)
 	if err != nil {
 		return entry, err
 	}
@@ -383,7 +388,7 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 	ref := bindCheckpointDisks([]SnapDiskRef{snapshotDiskRef(d)}, []DiskBackend{d})[0]
 	entry.State = diskPending
 	entry.bindingID = id
-	entry.sourceID = source.Identity()
+	entry.sourceID = sourceID
 	entry.SizeBytes = &size
 	err = r.diskBackends.BindSlot(entry.deviceIndex, &vhost.CowBackend{C: cow}, func() error {
 		if err := plan.Commit(ctx, cow); err != nil {

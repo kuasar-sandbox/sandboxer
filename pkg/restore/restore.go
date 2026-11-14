@@ -227,6 +227,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
+	if err := c0.ValidateCapturedDiskCapabilities(); err != nil {
+		return -1, err
+	}
 	snapCfg := *merged
 	// The running guest kernel is already captured in Snapshot S. Only the
 	// external runtime PMEM backing must be rebound to matching local content.
@@ -678,6 +681,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		PostSpawn: func(pc sandbox.PostSpawnCtx) error {
 			if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
+			}
+			if err := pc.CheckDiskCapabilities(); err != nil {
+				return err
 			}
 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).ResumeContext(pc.Ctx); err != nil {
 				return fmt.Errorf("vm.resume: %w", err)

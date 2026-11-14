@@ -441,12 +441,16 @@ func (p *Publisher) publishSandboxRoot(ctx context.Context, identity string, sco
 	for _, dependency := range refs {
 		p.original(dependency.raw, scope)
 	}
-	roles := make(map[string]bool, len(refs))
+	roles := make(map[string]rewriteUse, len(refs))
 	for _, dependency := range refs {
-		if rootImage, seen := roles[dependency.raw]; seen && rootImage != dependency.rootImage {
+		if previous, seen := roles[dependency.raw]; seen && (previous == rewriteImage) != (dependency.use == rewriteImage) {
 			return "", fmt.Errorf("publish Sandbox dependency %q is used as both root image and disk layer", dependency.raw)
 		}
-		roles[dependency.raw] = dependency.rootImage
+		// Both legacy and pure readers can consume an intact layer. A legacy
+		// reader unwraps an E itself, while the pure reader needs every byte.
+		if roles[dependency.raw] != rewritePureDisk {
+			roles[dependency.raw] = dependency.use
+		}
 	}
 	if err := p.enter("sandbox:" + identity); err != nil {
 		return "", err
@@ -458,7 +462,7 @@ func (p *Publisher) publishSandboxRoot(ctx context.Context, identity string, sco
 		if _, done := replacements[raw]; done {
 			continue
 		}
-		published, err := p.publishDisk(ctx, raw, scope, refs[i].rootImage)
+		published, err := p.publishDisk(ctx, raw, scope, roles[raw])
 		if err != nil {
 			return "", fmt.Errorf("publish Sandbox dependency %q: %w", raw, err)
 		}
@@ -549,7 +553,7 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 	return ref, cfg.SandboxRef, err
 }
 
-func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishScope, rootImage bool) (ref string, retErr error) {
+func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishScope, use rewriteUse) (ref string, retErr error) {
 	p.original(raw, scope)
 	defer func() {
 		if retErr == nil {
@@ -565,7 +569,7 @@ func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishSc
 	} else if ok {
 		return portable, nil
 	}
-	key := scopeKey(scope, fmt.Sprintf("%t\x00%s", rootImage, raw))
+	key := scopeKey(scope, fmt.Sprintf("%d\x00%s", use, raw))
 	p.memoMu.Lock()
 	cached := p.diskMemo[key]
 	p.memoMu.Unlock()
@@ -576,14 +580,17 @@ func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishSc
 	if err != nil {
 		return "", err
 	}
-	parsed, parseErr := manifest.ParseRef(raw)
-	requireSandbox := parseErr == nil && parsed.Scheme == manifest.RefSchemeFile && filepath.Ext(parsed.Path) == ".sandbox"
-	payload, _, err := sandboxfile.PayloadIfSandbox(ctx, stream, requireSandbox)
-	if err != nil {
-		return "", err
+	payload := stream
+	if use != rewritePureDisk {
+		parsed, parseErr := manifest.ParseRef(raw)
+		requireSandbox := parseErr == nil && parsed.Scheme == manifest.RefSchemeFile && filepath.Ext(parsed.Path) == ".sandbox"
+		payload, _, err = sandboxfile.PayloadIfSandbox(ctx, stream, requireSandbox)
+		if err != nil {
+			return "", err
+		}
 	}
 	role := RoleOverlay
-	if rootImage {
+	if use == rewriteImage {
 		image, imageErr := sandboxfile.OpenEROFSArtifact(ctx, payload)
 		if imageErr != nil {
 			return "", imageErr
@@ -750,32 +757,37 @@ func (p *Publisher) normalizeRoot(input string) (string, publishScope, error) {
 }
 
 type portableDiskDependency struct {
-	raw       string
-	rootImage bool
+	raw string
+	use rewriteUse
 }
 
 func portableDiskRefs(cfg *config.PortableSandboxConfig) []portableDiskDependency {
 	var refs []portableDiskDependency
-	appendOne := func(raw string, rootImage bool) {
+	appendOne := func(raw string, use rewriteUse) {
 		if raw != "" && raw != "self" {
-			refs = append(refs, portableDiskDependency{raw: raw, rootImage: rootImage})
+			refs = append(refs, portableDiskDependency{raw: raw, use: use})
 		}
 	}
-	appendRoot := func(root *config.PortableRootConfig) {
-		appendOne(root.Base, root.Overlay != nil)
+	appendRoot := func(root *config.PortableRootConfig, use rewriteUse) {
+		baseUse := use
+		if root.Overlay != nil {
+			baseUse = rewriteImage
+		}
+		appendOne(root.Base, baseUse)
 		for _, raw := range root.BaseFromRefs {
-			appendOne(raw, false)
+			appendOne(raw, use)
 		}
 		if root.Overlay != nil {
-			appendOne(root.Overlay.Base, false)
+			appendOne(root.Overlay.Base, use)
 			for _, raw := range root.Overlay.BaseFromRefs {
-				appendOne(raw, false)
+				appendOne(raw, use)
 			}
 		}
 	}
-	appendRoot(&cfg.Boot.Root)
+	appendRoot(&cfg.Boot.Root, rewriteDisk)
 	for i := range cfg.Boot.Disks {
-		appendRoot(&cfg.Boot.Disks[i].PortableRootConfig)
+		disk := &cfg.Boot.Disks[i]
+		appendRoot(&disk.PortableRootConfig, diskLayerUse(disk.PureBlock))
 	}
 	return refs
 }

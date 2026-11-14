@@ -95,13 +95,16 @@ type LaunchServer struct {
 	// connection is closed as before (used by tests).
 	OnMUXReady func(conn net.Conn, established proto.StdioSpec)
 
-	listener       *net.UnixListener
-	stopOnce       sync.Once
-	stopped        chan struct{}
-	helloDone      chan struct{}
-	helloOnce      sync.Once
-	helloClaim     atomic.Bool
-	helloSent      atomic.Bool
+	listener         *net.UnixListener
+	stopOnce         sync.Once
+	stopped          chan struct{}
+	helloDone        chan struct{}
+	helloOnce        sync.Once
+	helloClaim       atomic.Bool
+	helloSent        atomic.Bool
+	diskSlotV1       atomic.Bool
+	diskProjectionV1 atomic.Bool
+
 	initialStateV1 atomic.Bool
 	ext4DiscardV1  atomic.Bool
 	muxReady       chan struct{}
@@ -218,6 +221,11 @@ func (s *LaunchServer) InitialLaunchStateSupported() bool { return s.initialStat
 // Ext4DiscardSupported is fixed by the accepted runtime-ready hello.
 func (s *LaunchServer) Ext4DiscardSupported() bool { return s.ext4DiscardV1.Load() }
 
+// DiskCapabilities reports the accepted runtime-ready Guest Hello.
+func (s *LaunchServer) DiskCapabilities() (slot, projection bool) {
+	return s.diskSlotV1.Load(), s.diskProjectionV1.Load()
+}
+
 // MUXReady closes after the final launch ACK and the MUX handoff.
 func (s *LaunchServer) MUXReady() <-chan struct{} { return s.muxReady }
 
@@ -318,6 +326,8 @@ func (s *LaunchServer) handleConnAfter(conn net.Conn, afterClose *func()) (hande
 		s.initialStateV1.Store(msg.InitialLaunchStateV1)
 		s.runtimeOnce.Do(func() {
 			s.ext4DiscardV1.Store(msg.Ext4DiscardV1)
+			s.diskSlotV1.Store(msg.DiskSlotV1)
+			s.diskProjectionV1.Store(msg.DiskMountProjectionV1)
 			close(s.runtimeReady)
 		})
 		if s.helloSent.Load() {

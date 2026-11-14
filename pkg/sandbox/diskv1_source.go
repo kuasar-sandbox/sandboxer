@@ -92,6 +92,38 @@ func openDiskV1Source(ctx context.Context, spec config.DiskV1, storage *artifact
 	return
 }
 
+// A retry may use a renamed file carrier without an identity selector. Read
+// only its immutable layer identity. Provisioning templates are one-time inputs.
+func diskRetryIdentity(ctx context.Context, spec config.DiskV1, storage *artifact.ProcessStorage, locations config.RefLocations) (string, error) {
+	pin := func(raw string) (string, error) {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return "", err
+		}
+		if ref.Scheme != manifest.RefSchemeFile || ref.DigestScheme != "" {
+			return raw, nil
+		}
+		stream, actual, err := openPureLayer(ctx, ref, storage, locations, true)
+		if err != nil {
+			return "", err
+		}
+		return actual.String(), stream.Close()
+	}
+	if spec.Base != "" {
+		var err error
+		if spec.Base, err = pin(spec.Base); err != nil {
+			return "", err
+		}
+		spec.BaseFromRefs = slices.Clone(spec.BaseFromRefs)
+		for i, raw := range spec.BaseFromRefs {
+			if spec.BaseFromRefs[i], err = pin(raw); err != nil {
+				return "", err
+			}
+		}
+	}
+	return spec.Identity(), nil
+}
+
 func openPureLayer(ctx context.Context, ref manifest.Ref, storage *artifact.ProcessStorage, locations config.RefLocations, pin bool) (fetch.Stream, manifest.Ref, error) {
 	if ref.Scheme == manifest.RefSchemeManifest {
 		stream, _, err := OpenManifestStream(ctx, ref.Path, storage.Fetcher())

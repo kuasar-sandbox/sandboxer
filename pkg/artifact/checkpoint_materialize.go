@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -130,12 +131,22 @@ func (p *Publisher) materializeCheckpointRoot(ctx context.Context, scope publish
 	p.transientLocations[tempLocation] = true
 	sink := snapshot.NewFileSink(directory, "checkpoint-materialize", p.storage.LocalCodec(), p.storage.LocalRequired(), p.logf)
 	defer func() { retErr = errors.Join(retErr, sink.Close()) }()
-	refs := make([]string, len(root.Portable.Boot.Disks))
-	for i, disk := range root.Portable.Boot.Disks {
+	graph, err := root.Portable.Clone()
+	if err != nil {
+		return nil, nil, err
+	}
+	refs := make([]string, len(graph.Boot.Disks))
+	for i, disk := range graph.Boot.Disks {
 		if disk.Unbound() {
 			continue
 		}
-		raw, _, err := sink.AbsorbOverlaySource(ctx, pins.Disks[disk.Name])
+		var raw string
+		if disk.PureBlock && len(disk.BaseFromRefs) == config.MaxPortableLayerRefs {
+			raw, err = p.materializeFullDisk(ctx, sink, scope, disk, pins.Disks[disk.Name])
+			graph.Boot.Disks[i].PortableRootConfig = config.PortableRootConfig{}
+		} else {
+			raw, _, err = sink.AbsorbOverlaySource(ctx, pins.Disks[disk.Name])
+		}
 		if err != nil {
 			return nil, nil, err
 		}
@@ -146,7 +157,7 @@ func (p *Publisher) materializeCheckpointRoot(ctx context.Context, scope publish
 		ref.Location = tempLocation
 		refs[i] = ref.String()
 	}
-	cfg, err := root.Portable.MaterializedCheckpoint(refs)
+	cfg, err := graph.MaterializedCheckpoint(refs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -178,6 +189,29 @@ func (p *Publisher) materializeCheckpointRoot(ctx context.Context, scope publish
 		p.report.checkpoints = append(p.report.checkpoints, checkpointPublication{directory: pins.Directory, identity: pins.identity, refs: append([]DiffCheckpointRef(nil), pins.Refs...)})
 	}
 	return materialized, cleanup, nil
+}
+
+// A checkpoint on a maximum-depth pure block graph must materialize the
+// complete view. The checkpoint owner retains the pinned top stream.
+func (p *Publisher) materializeFullDisk(ctx context.Context, sink *snapshot.FileSink, scope publishScope, disk config.PortableDiskConfig, top fetch.Stream) (_ string, retErr error) {
+	streams := []fetch.Stream{top}
+	defer func() {
+		for _, stream := range streams[1:] {
+			retErr = errors.Join(retErr, stream.Close())
+		}
+	}()
+	for _, raw := range append([]string{disk.Base}, disk.BaseFromRefs...) {
+		stream, _, err := p.open(ctx, raw, scope)
+		if err != nil {
+			return "", err
+		}
+		streams = append(streams, stream)
+		if stream.Size() > top.Size() {
+			return "", errors.New("checkpoint immutable layer exceeds writable capacity")
+		}
+	}
+	ref, _, err := sink.AbsorbOverlaySource(ctx, fetch.NewLayered(streams...))
+	return ref, err
 }
 
 func (p *Publisher) keepPortable(ctx context.Context, raw string, scope publishScope) (string, bool, error) {
