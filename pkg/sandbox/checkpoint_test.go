@@ -557,3 +557,38 @@ func TestCheckpointMemoryMergePreflightPreservesSparseKinds(t *testing.T) {
 		t.Fatal("Data/Hole/Zero composition changed")
 	}
 }
+
+func TestColdPureDiskCompactsWithoutMachineSource(t *testing.T) {
+	p := testRunFromPortable(t)
+	p.Version = 2
+	refs := make([]string, config.MaxPortableLayerRefs+1)
+	for i := range refs {
+		refs[i] = fmt.Sprintf("manifest://%064x", i+1)
+	}
+	src := config.DiskV1{Kind: "disk", Version: 1, Base: refs[0], BaseFromRefs: refs[1:]}
+	p.Boot.Disks = []config.PortableDiskConfig{{Name: "work", PureBlock: true, PortableRootConfig: config.PortableRootConfig{Base: src.Base, BaseFromRefs: src.BaseFromRefs}}}
+	p.Mounts = []config.MountConfig{{Type: "disk", Source: "work", Target: "/data"}}
+	ctx := context.Background()
+	view := SnapDiskRef{Size: 8192, SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) { return nil, nil, nil }}
+	for _, bound := range []bool{false, true} {
+		disk := config.DiskConfig{Name: "work", Disk: &src, PureBlock: true}
+		if bound {
+			disk.Disk = nil
+			disk.Slot = &config.DiskSlotConfig{}
+			disk.Binding = &config.SlotBinding{ID: "bound", SizeBytes: 8192, SourceID: src.Identity()}
+			disk.Base, disk.BaseFromRefs = src.Base, src.BaseFromRefs
+			p.Boot.Disks[0].Slot, p.Boot.Disks[0].Binding = disk.Slot, disk.Binding
+		}
+		cfg := &config.SandboxConfig{Boot: config.BootConfig{Disks: []config.DiskConfig{disk}}}
+		res, diffs, merged, _, err := prepareCheckpointDisks(ctx, RunOptions{Cfg: cfg, PortableConfig: p}, []SnapDiskRef{view, view})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !merged[1] || diffs[1].MergeBase == "" || len(res.PortableConfig.Boot.Disks[0].BaseFromRefs) > 0 {
+			t.Fatalf("cold capture skipped compaction, bound=%t", bound)
+		}
+		if _, err = res.PortableConfig.Exported("", []string{fmt.Sprintf("manifest://%064x", 999)}, merged); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

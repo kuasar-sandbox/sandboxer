@@ -42,14 +42,14 @@ type DiskStateReport struct {
 
 func (req BindDiskRequest) MarshalBounded() ([]byte, error) {
 	if req.SlotName == "" {
-		return nil, errors.New("bind requires slot_name")
+		return nil, fmt.Errorf("%w: bind requires slot_name", ErrDiskInvalid)
 	}
 	if err := req.Disk.Validate(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrDiskInvalid, err)
 	}
 	b, err := json.Marshal(req)
 	if err == nil && len(b) > config.MaxPortableConfigBytes {
-		err = errors.New("disk bind request exceeds message limit")
+		err = fmt.Errorf("%w: disk bind request exceeds message limit", ErrDiskInvalid)
 	}
 	return b, err
 }
@@ -60,7 +60,7 @@ func diskResponse(conn net.Conn, want string) (Response, error) {
 		return resp, err
 	}
 	if resp.Type == TypeError {
-		return resp, errors.New(resp.Msg)
+		return resp, diskRemoteError(resp)
 	}
 	if resp.Type != want {
 		return resp, fmt.Errorf("ctl: got %q, expected %q", resp.Type, want)
@@ -114,7 +114,7 @@ func (s *Server) serveDisk(conn net.Conn, req Request) error {
 	switch req.Type {
 	case TypeDiskList:
 		if s.DiskListHandler == nil {
-			return errors.New("disk list unavailable")
+			return fmt.Errorf("%w: disk list unavailable", ErrDiskUnsupported)
 		}
 		report, err := s.DiskListHandler(req.ExpectedRun)
 		if err != nil {
@@ -123,10 +123,10 @@ func (s *Server) serveDisk(conn net.Conn, req Request) error {
 		return WriteMessage(conn, Response{Type: TypeDiskListDone, DiskState: &report})
 	default:
 		if s.DiskBindHandler == nil {
-			return errors.New("disk bind unavailable")
+			return fmt.Errorf("%w: disk bind unavailable", ErrDiskUnsupported)
 		}
 		if req.BodyBytes <= 0 || req.BodyBytes > config.MaxPortableConfigBytes {
-			return errors.New("invalid disk bind body length")
+			return fmt.Errorf("%w: invalid disk bind body length", ErrDiskInvalid)
 		}
 		if err := WriteMessage(conn, Response{Type: TypeDiskBindReady}); err != nil {
 			return err
@@ -139,10 +139,10 @@ func (s *Server) serveDisk(conn net.Conn, req Request) error {
 		d := json.NewDecoder(bytes.NewReader(data))
 		d.DisallowUnknownFields()
 		if err := d.Decode(&bind); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrDiskInvalid, err)
 		}
 		if d.Decode(new(any)) != io.EOF {
-			return errors.New("trailing disk bind data")
+			return fmt.Errorf("%w: trailing disk bind data", ErrDiskInvalid)
 		}
 		if err := s.DiskBindHandler(bind); err != nil {
 			return err

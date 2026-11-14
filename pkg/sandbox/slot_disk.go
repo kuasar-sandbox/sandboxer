@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"net/url"
 	"os"
@@ -172,7 +173,7 @@ func (r *Runtime) listDataDisks(ctx context.Context, expected string) (DiskState
 	r.diskStateMu.RLock()
 	defer r.diskStateMu.RUnlock()
 	if r.diskRunID == "" || expected != "" && expected != r.diskRunID {
-		return DiskStateReport{}, errors.New("disk inventory owner mismatch")
+		return DiskStateReport{}, fmt.Errorf("%w: disk inventory owner mismatch", ctl.ErrDiskConflict)
 	}
 	out := DiskStateReport{RunID: r.diskRunID, Disks: make([]ctl.DiskState, len(r.diskInventory))}
 	for i, entry := range r.diskInventory {
@@ -193,18 +194,24 @@ func mergeDiskLocations(current, extra config.RefLocations) (config.RefLocations
 	for name, path := range extra {
 		add := config.RefLocations{}
 		if err := add.Set(name + "=" + (&url.URL{Scheme: "file", Path: path}).String()); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", ctl.ErrDiskInvalid, err)
 		}
 		clean := add[name]
 		if existing, ok := out[name]; ok && filepath.Clean(existing) != clean {
-			return nil, fmt.Errorf("disk location %q conflicts with current mapping", name)
+			return nil, fmt.Errorf("%w: disk location %q conflicts with current mapping", ctl.ErrDiskConflict, name)
 		}
 		out[name] = clean
 	}
 	return out, nil
 }
 
-func (r *Runtime) BindDisk(ctx context.Context, req BindDiskRequest) error {
+func (r *Runtime) BindDisk(ctx context.Context, req BindDiskRequest) (err error) {
+	defer func() {
+		var classified ctl.DiskErrorCode
+		if errors.Is(err, fs.ErrPermission) && !errors.As(err, &classified) {
+			err = fmt.Errorf("%w: %w", ctl.ErrDiskPermission, err)
+		}
+	}()
 	if _, err := req.MarshalBounded(); err != nil {
 		return err
 	}
@@ -221,22 +228,22 @@ func (r *Runtime) BindDisk(ctx context.Context, req BindDiskRequest) error {
 	}
 	h := r.diskSnapshot
 	if h == nil || r.diskBackends == nil || r.diskBindGuest == nil {
-		return errors.New("owner does not support disk binding")
+		return fmt.Errorf("%w: owner does not support disk binding", ctl.ErrDiskUnsupported)
 	}
 	if err := h.capture.begin(); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ctl.ErrDiskBusy, err)
 	}
 	defer h.capture.finish(false)
 	if req.ExpectedRun != "" && req.ExpectedRun != r.diskRunID {
-		return errors.New("disk bind owner mismatch")
+		return fmt.Errorf("%w: disk bind owner mismatch", ctl.ErrDiskConflict)
 	}
 	ordinal := slices.IndexFunc(r.diskInventory, func(d diskEntry) bool { return d.Name == req.SlotName })
 	if ordinal < 0 {
-		return fmt.Errorf("unknown disk %q", req.SlotName)
+		return fmt.Errorf("%w: unknown disk %q", ctl.ErrDiskNotFound, req.SlotName)
 	}
 	entry := r.diskInventory[ordinal]
 	if !entry.reserved {
-		return fmt.Errorf("disk %s is not a slot", entry.Name)
+		return fmt.Errorf("%w: disk %s is not a slot", ctl.ErrDiskUnsupported, entry.Name)
 	}
 	locations, err := mergeDiskLocations(r.diskLaunch.RefLocations, req.RefLocations)
 	if err != nil {
@@ -253,10 +260,10 @@ func (r *Runtime) BindDisk(ctx context.Context, req BindDiskRequest) error {
 			return err
 		}
 		if entry.sourceID != sourceID {
-			return fmt.Errorf("disk %s is bound to a different source", entry.Name)
+			return fmt.Errorf("%w: disk %s is bound to a different source", ctl.ErrDiskConflict, entry.Name)
 		}
 		if req.Disk.Size != nil && *req.Disk.Size != *entry.SizeBytes {
-			return errors.New("disk source capacity mismatch")
+			return fmt.Errorf("%w: disk source capacity mismatch", ctl.ErrDiskCapacity)
 		}
 		if !maps.Equal(r.diskLaunch.RefLocations, locations) {
 			if err := r.retainSlotLocations(ctx, locations); err != nil {
@@ -271,17 +278,17 @@ func (r *Runtime) BindDisk(ctx context.Context, req BindDiskRequest) error {
 	}
 	if r.spec.CurrentRun != nil {
 		if err := syncDiskDirectory(r.checkpointOwner.Directory); err != nil {
-			return fmt.Errorf("disk published, current-run directory sync pending: %w", err)
+			return fmt.Errorf("%w: disk published, current-run directory sync pending: %w", ctl.ErrDiskPending, err)
 		}
 	}
 	if entry.dynamic {
 		if err := h.Servers[entry.deviceIndex].NotifyCapacity(); err != nil {
-			return fmt.Errorf("disk published, capacity notification pending: %w", err)
+			return fmt.Errorf("%w: disk published, capacity notification pending: %w", ctl.ErrDiskPending, err)
 		}
 	}
 	bind := proto.DiskBinding{DiskIndex: entry.Ordinal, BindingID: entry.bindingID, SizeBytes: uint64(*entry.SizeBytes)}
 	if err := r.diskBindGuest(ctx, bind); err != nil {
-		return fmt.Errorf("disk published, guest confirmation pending: %w", err)
+		return fmt.Errorf("%w: disk published, guest confirmation pending: %w", ctl.ErrDiskPending, err)
 	}
 	r.diskStateMu.Lock()
 	r.diskInventory[ordinal].State = diskReady
@@ -296,7 +303,7 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 		return entry, errors.New("slot storage is unavailable")
 	}
 	if entry.dynamic && !h.Servers[entry.deviceIndex].CanNotifyCapacity() {
-		return entry, errors.New("VMM did not negotiate dynamic disk capacity")
+		return entry, fmt.Errorf("%w: VMM did not negotiate dynamic disk capacity", ctl.ErrDiskUnsupported)
 	}
 	opts := []diffstore.DiskOption{diffstore.WithCache(r.diskCache)}
 	if r.diskStorage.LocalCodec() != nil {
@@ -333,7 +340,7 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 		}
 	}()
 	if entry.SizeBytes != nil && size != *entry.SizeBytes {
-		return entry, fmt.Errorf("slot %s requires %d bytes, source has %d", entry.Name, *entry.SizeBytes, size)
+		return entry, fmt.Errorf("%w: slot %s requires %d bytes, source has %d", ctl.ErrDiskCapacity, entry.Name, *entry.SizeBytes, size)
 	}
 	id := rand.Text()
 	sourceID := resolved.Identity()

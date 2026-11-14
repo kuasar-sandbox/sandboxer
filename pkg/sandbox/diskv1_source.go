@@ -12,6 +12,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
@@ -62,7 +63,7 @@ func openDiskV1Source(ctx context.Context, spec config.DiskV1, storage *artifact
 				size = int64(s.Size())
 			}
 			if s.Size() > uint64(size) || size <= 0 {
-				return nil, 0, "", errors.New("disk layer exceeds top logical capacity")
+				return nil, 0, "", fmt.Errorf("%w: disk layer exceeds top logical capacity", ctl.ErrDiskCapacity)
 			}
 		}
 	}
@@ -77,16 +78,16 @@ func openDiskV1Source(ctx context.Context, spec config.DiskV1, storage *artifact
 			return nil, 0, "", e
 		}
 		if capacity < size {
-			return nil, 0, "", errors.New("disk: template smaller than base")
+			return nil, 0, "", fmt.Errorf("%w: disk: template smaller than base", ctl.ErrDiskCapacity)
 		}
 		size = capacity
 		template = "file://" + path
 	}
 	if err = diffstore.ValidateWritableSize(size); err != nil {
-		return nil, 0, "", err
+		return nil, 0, "", fmt.Errorf("%w: %w", ctl.ErrDiskCapacity, err)
 	}
 	if spec.Size != nil && size != *spec.Size {
-		return nil, 0, "", fmt.Errorf("disk: source capacity %d differs from requested size %d", size, *spec.Size)
+		return nil, 0, "", fmt.Errorf("%w: source capacity %d differs from requested size %d", ctl.ErrDiskCapacity, size, *spec.Size)
 	}
 	if len(streams) > 0 {
 		base = diffstore.NewStreamReader(ctx, fetch.NewLayered(streams...), int64(streams[0].Size()))

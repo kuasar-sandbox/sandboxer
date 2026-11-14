@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
@@ -62,11 +63,11 @@ func TestSlotOwnerAckLossPreservesWriterAndProtectsCapture(t *testing.T) {
 	layer, _, _ := writeDiskArtifact(t, root, "immutable", seed, nil)
 	req := BindDiskRequest{SlotName: "data", Disk: config.DiskV1{Kind: "disk", Version: 1, Base: "file://" + layer, DiffTemplate: "file://seed@location:seeds"}, RefLocations: config.RefLocations{"seeds": root}, ExpectedRun: "other"}
 	rt.diskBindGuest = func(context.Context, proto.DiskBinding) error { return errors.New("response lost") }
-	if err = rt.BindDisk(ctx, req); err == nil || len(rt.diskOwned) != 0 {
+	if err = rt.BindDisk(ctx, req); !errors.Is(err, ctl.ErrDiskConflict) || len(rt.diskOwned) != 0 {
 		t.Fatal("mismatching generation published disk")
 	}
 	req.ExpectedRun = "first"
-	if err = rt.BindDisk(ctx, req); err == nil || len(rt.diskOwned) != 1 {
+	if err = rt.BindDisk(ctx, req); !errors.Is(err, ctl.ErrDiskPending) || len(rt.diskOwned) != 1 {
 		t.Fatalf("first bind: %v, writers=%d", err, len(rt.diskOwned))
 	}
 	state, err := rt.ListDataDisks(ctx)

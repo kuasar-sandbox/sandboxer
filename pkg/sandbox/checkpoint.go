@@ -347,10 +347,6 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 		if opts.namedCheckpoint || c0.IsCheckpoint() && (i == 0 || !c0.Boot.Disks[i-1].PureBlock) {
 			continue
 		}
-		raw, _, err := currentDiskParentBinding(opts, i)
-		if err != nil {
-			return opts, nil, nil, nil, err
-		}
 		root := &c0.Boot.Root
 		if i > 0 {
 			root = &c0.Boot.Disks[i-1].PortableRootConfig
@@ -359,20 +355,6 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 		if root.Overlay != nil {
 			lowers = &root.Overlay.BaseFromRefs
 		}
-		if raw == "" {
-			continue
-		}
-		logical := raw
-		if i == 0 && opts.SourceBinding != nil {
-			logical = opts.SourceBinding.SandboxRef
-		}
-		if i > 0 {
-			logical = root.Base
-			if root.Overlay != nil {
-				logical = root.Overlay.Base
-			}
-		}
-		refs := append([]string{logical}, (*lowers)...)
 		relativeDir := ""
 		if opts.SourceBinding != nil {
 			relativeDir = opts.SourceBinding.RelativeDir
@@ -436,6 +418,24 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 			}
 			continue
 		}
+		raw, _, err := currentDiskParentBinding(opts, i)
+		if err != nil {
+			return opts, nil, nil, nil, err
+		}
+		if raw == "" {
+			continue
+		}
+		logical := raw
+		if i == 0 && opts.SourceBinding != nil {
+			logical = opts.SourceBinding.SandboxRef
+		}
+		if i > 0 {
+			logical = root.Base
+			if root.Overlay != nil {
+				logical = root.Overlay.Base
+			}
+		}
+		refs := append([]string{logical}, (*lowers)...)
 		prefix, err := checkpointPrefix(ctx, refs, raw, relativeDir, opts, false)
 		if err != nil {
 			return opts, nil, nil, nil, err

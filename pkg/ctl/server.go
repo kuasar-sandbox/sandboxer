@@ -141,7 +141,7 @@ func (s *Server) handle(conn *net.UnixConn) {
 	case TypeDiskBind, TypeDiskList:
 		defer conn.Close()
 		if err := s.serveDisk(conn, req); err != nil {
-			_ = WriteMessage(conn, Response{Type: TypeError, Msg: err.Error()})
+			_ = WriteMessage(conn, diskWireError(err))
 		}
 		return
 	case TypeCheckpointListRequest:

@@ -2,6 +2,9 @@ package ctl
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
 	"net"
 	"strings"
 	"testing"
@@ -57,5 +60,34 @@ func TestDiskInventoryPreservesDynamicUnknownCapacity(t *testing.T) {
 	b, err := json.Marshal(DiskState{State: "unbound"})
 	if err != nil || strings.Contains(string(b), "size_bytes") {
 		t.Fatal(string(b), err)
+	}
+}
+
+func TestDiskErrorCodeRoundTrip(t *testing.T) {
+	for _, cause := range []error{
+		ErrDiskInvalid, ErrDiskNotFound, ErrDiskUnsupported, ErrDiskConflict,
+		ErrDiskCapacity, ErrDiskPending, ErrDiskBusy, fs.ErrPermission,
+	} {
+		client, server := net.Pipe()
+		err := fmt.Errorf("bind work: %w", cause)
+		done := make(chan error, 1)
+		go func() {
+			defer server.Close()
+			done <- WriteMessage(server, diskWireError(err))
+		}()
+		_, received := diskResponse(client, TypeDiskBindDone)
+		client.Close()
+		if writeErr := <-done; writeErr != nil {
+			t.Fatal(writeErr)
+		}
+		if !errors.Is(received, cause) || !strings.Contains(received.Error(), "bind work") {
+			t.Fatalf("disk error %v: received %v", err, received)
+		}
+		if errors.Is(cause, fs.ErrPermission) && !errors.Is(received, ErrDiskPermission) {
+			t.Fatalf("permission code lost: %v", received)
+		}
+	}
+	if got := diskRemoteError(Response{Type: TypeError, Msg: "old peer"}); got.Error() != "old peer" {
+		t.Fatal(got)
 	}
 }
