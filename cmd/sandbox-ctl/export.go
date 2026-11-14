@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,6 +26,9 @@ import (
 func exportCmd(args []string) int {
 	fs := flag.NewFlagSet("export", flag.ContinueOnError)
 	checkpoint := fs.String("checkpoint", "", "create a named local disk checkpoint")
+	sourceRef := fs.String("source-ref", "", "offline saved Sandbox E or Snapshot S")
+	sourceDir := fs.String("source-dir", "", "root for relative saved source refs")
+	diskName := fs.String("disk", "", "export only this saved data disk")
 	jsonOutput := fs.Bool("json", false, "emit the completed Sandbox E reference as JSON")
 	sandboxID := fs.String("sandbox-id", "", "live sandbox id; optional output alias for image assembly")
 	pathID := fs.String("path-id", "", "live run-root directory leaf (takes precedence over --sandbox-id)")
@@ -45,6 +49,44 @@ func exportCmd(args []string) int {
 	if fs.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "export: unexpected positional arguments")
 		return 2
+	}
+	if *sourceRef != "" || *sourceDir != "" || *diskName != "" {
+		allowed := map[string]bool{"source-ref": true, "source-dir": true, "disk": true, "upload": true, "output": true, "manifest-config": true, "json": true, "ref-location": true, "timeout": true}
+		var incompatible string
+		fs.Visit(func(f *flag.Flag) {
+			if !allowed[f.Name] {
+				incompatible = f.Name
+			}
+		})
+		if incompatible != "" || *diskName == "" || *sourceRef == "" || *upload == (*outDir != "") || *timeoutS < 0 {
+			fmt.Fprintln(os.Stderr, "export: offline disk export requires --source-ref REF --disk NAME and one of --output DIR or --upload; incompatible option:", incompatible)
+			return 2
+		}
+		cfg, err := config.LoadManifestConfig(*manifestPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "export: %v\n", err)
+			return 1
+		}
+		storage, err := artifact.NewProcessStorage(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "export: %v\n", err)
+			return 1
+		}
+		ctx := context.Background()
+		if *timeoutS != 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, time.Duration(*timeoutS)*time.Second)
+			defer cancel()
+		}
+		result, err := storage.ExportDisk(ctx, artifact.ExportDiskRequest{SourceRef: *sourceRef, SourceDir: *sourceDir, DiskName: *diskName, OutputDir: *outDir, Upload: *upload, RefLocations: refLocations})
+		if err = errors.Join(err, storage.Close()); err == nil {
+			err = json.NewEncoder(os.Stdout).Encode(result)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "export: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	modeSet := false
 	manifestSet := false

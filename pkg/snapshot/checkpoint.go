@@ -47,6 +47,9 @@ func validateCheckpointCapture(id string, portable *config.PortableSandboxConfig
 		return err
 	}
 	for i, d := range disks {
+		if portable != nil && i > 0 && i <= len(portable.Boot.Disks) && portable.Boot.Disks[i-1].Unbound() && d.DiffID == "" {
+			continue
+		}
 		if d.DiffID == "" || d.Checkpoint == nil || d.DeleteCheckpoint == nil || d.WaitMaterialized == nil {
 			return fmt.Errorf("%w: disk %d", ctl.ErrCheckpointUnsupported, i)
 		}
@@ -64,6 +67,13 @@ func captureCheckpointAtFreeze(ctx context.Context, s ExportSources, sink Artifa
 	}
 	refs := &sandboxfile.Checkpoint{Version: 1, CheckpointID: s.CheckpointID, Disks: make([]sandboxfile.CheckpointNamedDisk, 0, len(s.Diffs)-1)}
 	for i, d := range s.Diffs {
+		if i > 0 && s.PortableConfig.Boot.Disks[i-1].Slot != nil {
+			refs.Version = 2
+		}
+		if i > 0 && s.PortableConfig.Boot.Disks[i-1].Unbound() {
+			refs.Disks = append(refs.Disks, sandboxfile.CheckpointNamedDisk{Name: s.PortableConfig.Boot.Disks[i-1].Name})
+			continue
+		}
 		// Backend freeze has stopped guest writes. Checkpoint drains admitted
 		// writes and joins the template's final Sync/rename before registering.
 		if err := d.Checkpoint(ctx, s.CheckpointID); err != nil {

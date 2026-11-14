@@ -6,15 +6,17 @@ import (
 	"fmt"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"syscall"
 )
 
 // BlockDeviceSpec fixes the Guest-visible shape of a vhost block device.
 // Devices use the existing minimal virtio feature profile; slice order fixes
-// device order. Neither capacity nor read-only capability changes at binding.
+// device order. A zero-capacity slot adopts its source geometry exactly once.
 type BlockDeviceSpec struct {
-	Capacity int64 // bytes, positive and a multiple of SectorSize
+	Capacity int64 // bytes, sector aligned
+	Slot     bool  // independently bound writable device
 	ReadOnly bool
 }
 
@@ -35,6 +37,7 @@ type backendBinding struct {
 // have drained. A failed Bind never transfers ownership or closes an input.
 // BackendSet must not be copied after construction.
 type BackendSet struct {
+	slotMu  sync.Mutex
 	specs   []BlockDeviceSpec
 	devices []Backend
 	binding atomic.Pointer[backendBinding]
@@ -44,10 +47,13 @@ func NewBackendSet(specs []BlockDeviceSpec) (*BackendSet, error) {
 	s := &BackendSet{specs: append([]BlockDeviceSpec(nil), specs...)}
 	s.devices = make([]Backend, len(specs))
 	for i, spec := range s.specs {
-		if spec.Capacity <= 0 || spec.Capacity%SectorSize != 0 {
+		if spec.Slot && spec.ReadOnly {
+			return nil, fmt.Errorf("vhost: device %d read-only slot", i)
+		}
+		if spec.Capacity < 0 || (spec.Capacity == 0 && !spec.Slot) || spec.Capacity%SectorSize != 0 {
 			return nil, fmt.Errorf("vhost: device %d capacity %d must be positive and sector-aligned", i, spec.Capacity)
 		}
-		if !spec.ReadOnly {
+		if !spec.ReadOnly && spec.Capacity != 0 {
 			if err := diffstore.ValidateWritableSize(spec.Capacity); err != nil {
 				return nil, fmt.Errorf("vhost: device %d: %w", i, err)
 			}
@@ -78,25 +84,64 @@ func (s *BackendSet) Bind(backends []Backend) error {
 	}
 	next := &backendBinding{backends: append([]Backend(nil), backends...)}
 	for i, b := range next.backends {
-		if nilBackend(b) {
-			return fmt.Errorf("vhost: device %d backend is nil", i)
+		if s.specs[i].Slot && b == nil {
+			continue
 		}
-		if _, frontend := b.(*backendSlot); frontend {
-			return fmt.Errorf("vhost: device %d cannot bind another device frontend", i)
-		}
-		spec := s.specs[i]
-		if size := b.Size(); size != spec.Capacity {
-			return fmt.Errorf("vhost: device %d backend size %d does not match capacity %d", i, size, spec.Capacity)
-		}
-		if b.ReadOnly() != spec.ReadOnly {
-			return fmt.Errorf("vhost: device %d backend read-only capability does not match device", i)
-		}
-		if b.SupportsDiscard() != !spec.ReadOnly {
-			return fmt.Errorf("vhost: device %d backend DISCARD capability does not match device", i)
+		if err := s.validateBackend(i, b); err != nil {
+			return err
 		}
 	}
 	if !s.binding.CompareAndSwap(nil, next) {
 		return ErrBackendSetBound
+	}
+	return nil
+}
+
+// BindSlot publishes one writable backend after its durable commit. Failing
+// validation or commit leaves the old device table intact. All potentially
+// failing work completes before the replacement becomes visible to queues.
+func (s *BackendSet) BindSlot(index int, backend Backend, commit func() error) error {
+	if index < 0 || index >= len(s.specs) || !s.specs[index].Slot {
+		return fmt.Errorf("vhost: device %d is not a reserved slot", index)
+	}
+	if err := s.validateBackend(index, backend); err != nil {
+		return err
+	}
+	s.slotMu.Lock()
+	defer s.slotMu.Unlock()
+	old := s.binding.Load()
+	if old == nil || old.backends[index] != nil {
+		return fmt.Errorf("vhost: device %d is unavailable for binding", index)
+	}
+	next := &backendBinding{backends: append([]Backend(nil), old.backends...)}
+	next.backends[index] = backend
+	if commit != nil {
+		if err := commit(); err != nil {
+			return err
+		}
+	}
+	s.binding.Store(next)
+	return nil
+}
+
+func (s *BackendSet) validateBackend(i int, b Backend) error {
+	if nilBackend(b) {
+		return fmt.Errorf("vhost: device %d backend is nil", i)
+	}
+	if _, frontend := b.(*backendSlot); frontend {
+		return fmt.Errorf("vhost: device %d cannot bind another device frontend", i)
+	}
+	spec := s.specs[i]
+	size := b.Size()
+	if spec.Slot && spec.Capacity == 0 {
+		if err := diffstore.ValidateWritableSize(size); err != nil {
+			return fmt.Errorf("vhost: device %d: %w", i, err)
+		}
+	} else if size != spec.Capacity {
+		return fmt.Errorf("vhost: device %d backend size %d does not match capacity %d", i, size, spec.Capacity)
+	}
+	if b.ReadOnly() != spec.ReadOnly || b.SupportsDiscard() != !spec.ReadOnly {
+		return fmt.Errorf("vhost: device %d read-only or DISCARD capability mismatch", i)
 	}
 	return nil
 }
@@ -132,7 +177,7 @@ type backendSlot struct {
 	unbound unboundBackend
 }
 
-func (b *backendSlot) Size() int64           { return b.unbound.Size() }
+func (b *backendSlot) Size() int64           { return b.requestBackend().Size() }
 func (b *backendSlot) ReadOnly() bool        { return b.unbound.ReadOnly() }
 func (b *backendSlot) SupportsDiscard() bool { return b.unbound.SupportsDiscard() }
 
@@ -140,7 +185,7 @@ func (b *backendSlot) SupportsDiscard() bool { return b.unbound.SupportsDiscard(
 // not one view per data segment. A request selected before commit may finish
 // with IOERR; a request selected after commit sees the real backend throughout.
 func (b *backendSlot) requestBackend() Backend {
-	if binding := b.set.binding.Load(); binding != nil {
+	if binding := b.set.binding.Load(); binding != nil && binding.backends[b.index] != nil {
 		return binding.backends[b.index]
 	}
 	return &b.unbound
@@ -172,4 +217,11 @@ func backendForRequest(b Backend) Backend {
 		return selector.requestBackend()
 	}
 	return b
+}
+
+// DynamicSlot reports whether the parent VMM must re-read this frontend's
+// capacity after publication, including across a reconnect or restore.
+func DynamicSlot(b Backend) bool {
+	s, ok := b.(*backendSlot)
+	return ok && s.unbound.spec.Slot && s.unbound.spec.Capacity == 0
 }

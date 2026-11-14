@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -251,7 +252,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		}
 	}
 	preparation, err := preflightColdArtifacts(ctx, opts.Cfg, opts.Fetcher, opts.RefLocations,
-		baseDir, opts.SandboxID, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener, opts.checkpointPlan)
+		baseDir, opts.SandboxID, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener, storage, opts.checkpointPlan)
 	if err != nil {
 		return -1, err
 	}
@@ -920,6 +921,7 @@ func resolveDiskMounts(mounts []proto.MountSpec, disks []config.DiskConfig, root
 		}
 		i := ord[m.Source] // validated to exist by config.validateDisks
 		d := &disks[i]
+		m.DiskSlot = d.Slot != nil
 		m.DiskIndex = i
 		m.Source = ""
 		if d.RootConfig.Single() {
@@ -987,7 +989,9 @@ type SnapshotHandler struct {
 	Context               context.Context
 	Logf                  func(string, ...any)
 
-	capture captureGate
+	diskRefsMu        sync.RWMutex // protects copies of the active disk list during online checkpoint listing
+	slotConfirmations atomic.Int32
+	capture           captureGate
 }
 
 // captureGate serializes export and snapshot for one live VM. A successful
@@ -1041,7 +1045,7 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 	return h.handleContext(h.Context, req, cgroupPath, chExited)
 }
 func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
-	if err := h.capture.begin(); err != nil {
+	if err := h.beginCapture(); err != nil {
 		return ctl.Response{}, err
 	}
 	defer func() {
@@ -1075,7 +1079,7 @@ func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExi
 	return h.handleExportContext(h.Context, req, cgroupPath, chExited)
 }
 func (h *SnapshotHandler) handleExportContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
-	if err := h.capture.begin(); err != nil {
+	if err := h.beginCapture(); err != nil {
 		return ctl.Response{}, err
 	}
 	defer func() {
@@ -1178,6 +1182,9 @@ func handleExportRequest(
 		}
 	}
 	for i := range disks {
+		if i > 0 && opts.PortableConfig != nil && i <= len(opts.PortableConfig.Boot.Disks) && opts.PortableConfig.Boot.Disks[i-1].Unbound() && disks[i].Slot && disks[i].SnapshotView == nil {
+			continue
+		}
 		if disks[i].SnapshotView == nil || disks[i].Size <= 0 {
 			return ctl.Response{}, fmt.Errorf("export: disk %d has invalid SnapshotView/size", i)
 		}
@@ -3322,6 +3329,17 @@ func generateSandboxID() string {
 func validateSandboxID(sandboxID string) error {
 	if err := ValidatePathID(sandboxID); err != nil {
 		return fmt.Errorf("sandbox id %q must be one non-empty path component", sandboxID)
+	}
+	return nil
+}
+
+func (h *SnapshotHandler) beginCapture() error {
+	if err := h.capture.begin(); err != nil {
+		return err
+	}
+	if h.slotConfirmations.Load() != 0 {
+		h.capture.finish(false)
+		return errors.New("disk binding is awaiting guest confirmation")
 	}
 	return nil
 }

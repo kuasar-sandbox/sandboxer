@@ -173,6 +173,12 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		return nil, fmt.Errorf("snapshot: runtime disk count %d does not match C0 disk count %d", len(s.Diffs), 1+len(s.PortableConfig.Boot.Disks))
 	}
 	for i := range s.Diffs {
+		if i > 0 && s.PortableConfig.Boot.Disks[i-1].Unbound() {
+			if s.Diffs[i].SnapshotView != nil {
+				return nil, errors.New("unbound slot has an active writer")
+			}
+			continue
+		}
 		if s.Diffs[i].SnapshotView == nil {
 			return nil, fmt.Errorf("snapshot: disk %d has no SnapshotView", i)
 		}

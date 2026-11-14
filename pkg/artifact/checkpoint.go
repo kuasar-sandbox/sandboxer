@@ -211,7 +211,9 @@ func (k *checkpointKeep) plan(ctx context.Context, c Checkpoint) (retErr error) 
 			}
 			add(root.Checkpoint.Root.DiffID)
 			for _, disk := range root.Checkpoint.Disks {
-				add(disk.DiffID)
+				if disk.DiffID != "" {
+					add(disk.DiffID)
+				}
 			}
 		}
 	}
@@ -391,7 +393,9 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 			}
 		}
 		for _, disk := range currentSet.Disks {
-			active[disk.DiffID] = true
+			if disk.DiffID != "" {
+				active[disk.DiffID] = true
+			}
 		}
 	} else if !os.IsNotExist(err) {
 		return err

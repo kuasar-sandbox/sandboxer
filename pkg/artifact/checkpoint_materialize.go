@@ -86,6 +86,9 @@ func (p *Publisher) materializeCheckpointRoot(ctx context.Context, scope publish
 			return nil, nil, errors.New("checkpoint pinned source identity mismatch")
 		}
 		for _, disk := range root.Checkpoint.Disks {
+			if disk.DiffID == "" && root.Checkpoint.Version == 2 && pins.Disks[disk.Name] == nil {
+				continue
+			}
 			if pins.Disks[disk.Name] == nil || pins.Disks[disk.Name].Info().DiffID != disk.DiffID {
 				return nil, nil, errors.New("checkpoint pinned disk topology mismatch")
 			}
@@ -95,7 +98,10 @@ func (p *Publisher) materializeCheckpointRoot(ctx context.Context, scope publish
 		return nil, nil, errors.New("checkpoint root base binding mismatch")
 	}
 	for _, disk := range root.Portable.Boot.Disks {
-		if pins.Disks[disk.Name].Info().BaseID != DiffCheckpointBaseID(disk.PortableRootConfig) {
+		if disk.Unbound() {
+			continue
+		}
+		if pins.Disks[disk.Name] == nil || pins.Disks[disk.Name].Info().BaseID != DiffCheckpointBaseID(disk.PortableRootConfig) {
 			return nil, nil, fmt.Errorf("checkpoint disk %s base binding mismatch", disk.Name)
 		}
 	}
@@ -126,6 +132,9 @@ func (p *Publisher) materializeCheckpointRoot(ctx context.Context, scope publish
 	defer func() { retErr = errors.Join(retErr, sink.Close()) }()
 	refs := make([]string, len(root.Portable.Boot.Disks))
 	for i, disk := range root.Portable.Boot.Disks {
+		if disk.Unbound() {
+			continue
+		}
 		raw, _, err := sink.AbsorbOverlaySource(ctx, pins.Disks[disk.Name])
 		if err != nil {
 			return nil, nil, err

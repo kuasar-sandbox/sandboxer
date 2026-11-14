@@ -41,6 +41,9 @@ func PrepareCheckpointDiskPlan(cfg *config.SandboxConfig, bases *config.Portable
 	}
 	plan := &CheckpointDiskPlan{Directory: directory, Disks: make([]CheckpointDiskBinding, len(roots))}
 	for i, root := range roots {
+		if i > 0 && cfg.Boot.Disks[i-1].Unbound() {
+			continue
+		}
 		target := &root.Diff
 		if root.Overlay != nil {
 			target = &root.Overlay.Diff
@@ -107,6 +110,9 @@ func (p *CheckpointDiskPlan) Bind(bases *config.PortableSandboxConfig) error {
 	}
 	p.Disks[0].BaseID = artifact.DiffCheckpointBaseID(bases.Boot.Root)
 	for i, d := range bases.Boot.Disks {
+		if d.Unbound() {
+			continue
+		}
 		p.Disks[i+1].BaseID = artifact.DiffCheckpointBaseID(d.PortableRootConfig)
 	}
 	return nil
@@ -129,6 +135,9 @@ func prepareNamedCapture(req ctl.Request, opts RunOptions, disks []SnapDiskRef) 
 		return req, errors.New("checkpoint cannot be combined with upload")
 	}
 	for _, d := range disks {
+		if d.Slot && d.SnapshotView == nil {
+			continue
+		}
 		if d.DiffID == "" || d.Checkpoint == nil {
 			return req, ctl.ErrCheckpointUnsupported
 		}
@@ -171,6 +180,9 @@ func (h *SnapshotHandler) startCheckpointMaintenance(ctx context.Context, owner 
 	}
 	active := make([]string, 0, len(h.Disks))
 	for _, d := range h.Disks {
+		if d.Slot && d.SnapshotView == nil {
+			continue
+		}
 		if d.DiffID == "" {
 			return errors.New("checkpoint maintenance requires all active DiffIDs")
 		}
@@ -205,7 +217,13 @@ func (h *SnapshotHandler) listDiffCheckpoints(ctx context.Context) ([]artifact.D
 		}
 		return nil
 	}
-	for _, d := range h.Disks {
+	h.diskRefsMu.RLock()
+	disks := append([]SnapDiskRef(nil), h.Disks...)
+	h.diskRefsMu.RUnlock()
+	for _, d := range disks {
+		if d.Slot && d.SnapshotView == nil {
+			continue
+		}
 		if d.ListCheckpoints == nil {
 			return nil, ctl.ErrCheckpointUnsupported
 		}

@@ -37,6 +37,8 @@ import (
 // Request is a control request on ctl.sock. Type selects which fields
 // are populated.
 type Request struct {
+	BodyBytes       int                 `json:"body_bytes,omitempty"`
+	ExpectedRun     string              `json:"expected_run,omitempty"`
 	UsageHistory    bool                `json:"usage_history,omitempty"`
 	UsageCursor     int64               `json:"usage_cursor,omitempty,string"`
 	UsageLimit      int                 `json:"usage_limit,omitempty"`
@@ -67,6 +69,7 @@ type Request struct {
 
 // Response is the run-process reply.
 type Response struct {
+	DiskState *DiskStateReport `json:"disk_state,omitempty"`
 	// SandboxID identifies the usage owner even when live/saved/history is empty.
 	SandboxID     string          `json:"sandbox_id,omitempty"`
 	ResourceStats *ResourceStats  `json:"resource_stats,omitempty"`

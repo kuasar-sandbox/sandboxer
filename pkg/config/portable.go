@@ -76,7 +76,10 @@ type PortableBootConfig struct {
 }
 
 type PortableDiskConfig struct {
-	Name               string `yaml:"name"`
+	Slot               *DiskSlotConfig `yaml:"slot,omitempty"`
+	Binding            *SlotBinding    `yaml:"binding,omitempty"`
+	PureBlock          bool            `yaml:"pure_block,omitempty"`
+	Name               string          `yaml:"name"`
 	PortableRootConfig `yaml:",inline"`
 }
 
@@ -155,11 +158,20 @@ func ProjectPortableCold(cfg *SandboxConfig, identities PortableProjection) (*Po
 	p.Boot.Root = root
 	p.Boot.Disks = make([]PortableDiskConfig, len(cfg.Boot.Disks))
 	for i := range cfg.Boot.Disks {
-		root, err := projectColdRoot(&cfg.Boot.Disks[i].RootConfig, false)
+		disk := cfg.Boot.Disks[i]
+		source := disk.RootConfig
+		if disk.Disk != nil {
+			source.Base = disk.Disk.Base
+			source.BaseFromRefs = disk.Disk.BaseFromRefs
+		}
+		root, err := projectColdRoot(&source, false)
 		if err != nil {
 			return nil, fmt.Errorf("portable boot.disks[%d]: %w", i, err)
 		}
-		p.Boot.Disks[i] = PortableDiskConfig{Name: cfg.Boot.Disks[i].Name, PortableRootConfig: root}
+		p.Boot.Disks[i] = PortableDiskConfig{Name: disk.Name, Slot: disk.Slot, Binding: disk.Binding, PureBlock: disk.Disk != nil || disk.PureBlock, PortableRootConfig: root}
+	}
+	if p.requiresDiskV2() {
+		p.Version = 2
 	}
 	if err := p.Validate(); err != nil {
 		return nil, err
@@ -273,6 +285,12 @@ func (p *PortableSandboxConfig) Exported(parentSandboxRef string, dataRefs []str
 	}
 
 	for i := range clone.Boot.Disks {
+		if clone.Boot.Disks[i].Unbound() {
+			if dataRefs[i] != "" || merged[i+1] {
+				return nil, fmt.Errorf("unbound disk %q has captured content", clone.Boot.Disks[i].Name)
+			}
+			continue
+		}
 		captured, err := portableArtifactRef(dataRefs[i])
 		if err != nil {
 			return nil, fmt.Errorf("portable export data disk %d: %w", i, err)
@@ -595,7 +613,7 @@ func (p *PortableSandboxConfig) Validate() error {
 	if p == nil {
 		return errors.New("portable config: nil value")
 	}
-	if p.Version != PortableSandboxConfigVersion {
+	if p.Version != 1 && p.Version != 2 || p.Version == 1 && p.requiresDiskV2() {
 		return fmt.Errorf("portable config: unsupported version %d", p.Version)
 	}
 	if p.Resources.Capacity.CPU <= 0 {
@@ -644,6 +662,9 @@ func (p *PortableSandboxConfig) Validate() error {
 			return fmt.Errorf("portable boot.disks[%d].name duplicates boot.disks[%d]", i, previous)
 		}
 		names[disk.Name] = i
+		if err := validateSlotArtifact(*disk); err != nil {
+			return fmt.Errorf("boot.disks[%d]: %w", i, err)
+		}
 		if err := validatePortableRoot(fmt.Sprintf("boot.disks[%d]", i), &disk.PortableRootConfig, false); err != nil {
 			return err
 		}
@@ -875,6 +896,9 @@ func validatePortableRefList(field string, refs []string) error {
 }
 
 func validatePortableMounts(mounts []MountConfig, names map[string]int) error {
+	if err := ValidateMountProjections(mounts); err != nil {
+		return err
+	}
 	mounted := make(map[string]int, len(names))
 	for i, mount := range mounts {
 		if !filepath.IsAbs(mount.Target) {
@@ -888,9 +912,6 @@ func validatePortableMounts(mounts []MountConfig, names map[string]int) error {
 		case "disk":
 			if _, exists := names[mount.Source]; !exists {
 				return fmt.Errorf("portable mounts[%d].source %q names no data disk", i, mount.Source)
-			}
-			if previous, duplicate := mounted[mount.Source]; duplicate {
-				return fmt.Errorf("portable mounts[%d] duplicates disk mount mounts[%d]", i, previous)
 			}
 			mounted[mount.Source] = i
 		default:
@@ -1025,4 +1046,18 @@ func WritePortableSandboxConfig(runDir string, cfg *PortableSandboxConfig) ([]by
 		return nil, errors.Join(syncErr, closeErr)
 	}
 	return raw, nil
+}
+
+func (p *PortableSandboxConfig) requiresDiskV2() bool {
+	for _, d := range p.Boot.Disks {
+		if d.Slot != nil || d.PureBlock || d.Binding != nil {
+			return true
+		}
+	}
+	for _, m := range p.Mounts {
+		if m.Subpath != "" {
+			return true
+		}
+	}
+	return false
 }

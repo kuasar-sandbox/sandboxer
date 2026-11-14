@@ -68,6 +68,12 @@ func (p *PortableSandboxConfig) MaterializedCheckpoint(dataRefs []string) (*Port
 	}
 	set(&clone.Boot.Root, "self")
 	for i, raw := range dataRefs {
+		if clone.Boot.Disks[i].Unbound() {
+			if raw != "" {
+				return nil, errors.New("unbound slot has captured data")
+			}
+			continue
+		}
 		ref, err := portableArtifactRef(raw)
 		if err != nil || ref == "" || ref == "self" {
 			return nil, fmt.Errorf("materialize: invalid disk %d reference", i)

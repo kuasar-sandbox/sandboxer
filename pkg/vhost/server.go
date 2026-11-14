@@ -68,6 +68,8 @@ var ErrReadOnly = fmt.Errorf("vhost: backend is read-only")
 // hypervisor master connects exactly once; on disconnect, the server
 // reaps virtq workers and stops.
 type Server struct {
+	capacityNotify   bool     // advertise CONFIG_CHANGE_MSG for dynamic slots
+	frontendReq      *os.File // guarded by mu
 	socketPath       string
 	backend          Backend
 	logf             func(format string, args ...any)
@@ -403,6 +405,10 @@ func (s *Server) resetConnectionState() {
 	s.features = 0
 	s.featuresSet = false
 	s.protocolFeatures = 0
+	if s.frontendReq != nil {
+		_ = s.frontendReq.Close()
+		s.frontendReq = nil
+	}
 	s.mu.Unlock()
 	// Drain workers first (joins on q.done). No s.mu held — the workers
 	// don't need it to exit, and holding it across the join could
@@ -522,6 +528,17 @@ func (s *Server) handle(conn *net.UnixConn, m *Message) error {
 		return s.handleSetVringCall(m)
 	case MsgSetVringEnable:
 		return s.handleSetVringEnable(m)
+	case MsgSetBackendReqFd:
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.protocolFeatures&bitBackendRequest == 0 || len(m.Payload) != 0 || len(m.Fds) != 1 {
+			return errors.New("vhost: invalid or unnegotiated SET_BACKEND_REQ_FD")
+		}
+		if s.frontendReq != nil {
+			_ = s.frontendReq.Close()
+		}
+		s.frontendReq = os.NewFile(uintptr(m.Fds[0]), "vhost-user frontend request")
+		return nil
 	case MsgGetMaxMemSlots:
 		return SendU64Reply(conn, m.Header.Request, MaxFds)
 	default:
@@ -553,6 +570,7 @@ const (
 // VHOST_USER_PROTOCOL_F_MQ        = 0
 // VHOST_USER_PROTOCOL_F_CONFIG    = 9
 const (
+	bitBackendRequest = uint64(1) << 5
 	bitProtocolMq     = uint64(1) << 0
 	bitProtocolConfig = uint64(1) << 9
 )
@@ -607,7 +625,7 @@ func (s *Server) handleSetFeatures(conn *net.UnixConn, m *Message) error {
 }
 
 func (s *Server) handleGetProtocolFeatures(conn *net.UnixConn, m *Message) error {
-	return SendU64Reply(conn, m.Header.Request, bitProtocolConfig)
+	return SendU64Reply(conn, m.Header.Request, s.supportedProtocolFeatures())
 }
 
 func (s *Server) handleSetProtocolFeatures(conn *net.UnixConn, m *Message) error {
@@ -618,9 +636,9 @@ func (s *Server) handleSetProtocolFeatures(conn *net.UnixConn, m *Message) error
 	if err != nil {
 		return err
 	}
-	if unsupported := v &^ bitProtocolConfig; unsupported != 0 {
+	if unsupported := v &^ s.supportedProtocolFeatures(); unsupported != 0 {
 		return fmt.Errorf("vhost: unsupported protocol features: requested=%#x supported=%#x unsupported=%#x",
-			v, bitProtocolConfig, unsupported)
+			v, s.supportedProtocolFeatures(), unsupported)
 	}
 	s.mu.Lock()
 	s.protocolFeatures = v
@@ -986,3 +1004,48 @@ func (s *Server) maybeStartWorker(idx int) {
 
 // SetDirtyTracker binds the instance accumulator before serving guest memory.
 func (s *Server) SetDirtyTracker(mark func(uint64, uint64) error) { s.memTable.MarkDirty = mark }
+
+// EnableCapacityChange must be called before serving a zero-geometry slot.
+func (s *Server) EnableCapacityChange() { s.capacityNotify = true }
+
+func (s *Server) supportedProtocolFeatures() uint64 {
+	if s.capacityNotify {
+		return bitProtocolConfig | bitBackendRequest
+	}
+	return bitProtocolConfig
+}
+
+// CanNotifyCapacity is checked before the first backend publication so a VMM
+// lacking the required protocol cannot acquire a disk that it cannot expose.
+func (s *Server) SetSlotOrigin(path string, size int64) {
+	if s.stats != nil {
+		if s.capacityNotify {
+			s.stats.setCapacity(size)
+		}
+		s.stats.SetOrigin(path)
+	}
+}
+
+func (s *Server) CanNotifyCapacity() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.frontendReq != nil
+}
+
+// NotifyCapacity requests a new GET_CONFIG followed by a guest configuration
+// interrupt. Retrying after a reconnect is safe. Only the Guest confirms size.
+func (s *Server) NotifyCapacity() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.frontendReq == nil {
+		return errors.New("vhost: VMM capacity change unavailable")
+	}
+	var header [12]byte
+	binary.LittleEndian.PutUint32(header[:], 2) // VHOST_USER_BACKEND_CONFIG_CHANGE_MSG
+	binary.LittleEndian.PutUint32(header[4:], FlagVersion1)
+	n, err := s.frontendReq.Write(header[:])
+	if err == nil && n != len(header) {
+		return io.ErrShortWrite
+	}
+	return err
+}

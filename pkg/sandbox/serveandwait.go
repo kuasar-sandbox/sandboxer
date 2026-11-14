@@ -97,6 +97,10 @@ type PostSpawnCtx struct {
 // callers (sandbox.Run / restore.Run) keep their own thin front-half
 // (config resolution, cgroup, controller admit) and converge here.
 type VMParams struct {
+	DiskStorage        *artifact.ProcessStorage
+	DiskCache          *diffstore.Cache
+	DiskCurrentRun     *artifact.CurrentRun
+	DiskPlan           *CheckpointDiskPlan
 	EnableCheckpoint   bool
 	CheckpointOwner    *diffstore.DirectoryOwner // borrowed target owner, separate from source export pins
 	owner              *Runtime
@@ -192,6 +196,7 @@ type VMParams struct {
 // describe the Cow's writable diff for diagnostics and lifecycle cleanup;
 // snapshot data comes from Cow.SnapshotView.
 type DiskBackend struct {
+	Slot      bool
 	Overlay   bool
 	Reader    diffstore.BlockReader // overlay only (ro base); nil in single-disk
 	Cow       *diffstore.Disk       // the writable ext4 (always present)
@@ -219,6 +224,7 @@ type DiskArg struct {
 // upper-only logical view; Size supports predictable preflight checks without
 // constructing that view, and DiffPath remains for diagnostics and cleanup.
 type SnapDiskRef struct {
+	Slot              bool
 	DiffID            string
 	Checkpoint        func(context.Context, string) error
 	DeleteCheckpoint  func(context.Context, string) error
@@ -249,6 +255,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	if err := p.Ctx.Err(); err != nil {
 		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
 	}
+	var directDiskOwner *Runtime
 	readiness := newReadinessEmitter(p.NotifyReadiness)
 	var firstReadFatal error
 	readFatal := func() error {
@@ -272,6 +279,11 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		if r := p.owner; r != nil && r.deviceSet != nil && !r.commitLaunch() {
 			readiness.mu.Unlock()
 			return
+		}
+		if directDiskOwner != nil {
+			directDiskOwner.mu.Lock()
+			directDiskOwner.state = runtimeRunning
+			directDiskOwner.mu.Unlock()
 		}
 		if r := p.owner; r != nil && r.readyDone != nil {
 			r.mu.Lock()
@@ -458,6 +470,9 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	var snapDisks []SnapDiskRef // per logical disk: writable diff for snapshot
 	addServer := func(sock string, backend vhost.Backend, label, path string, ro bool) error {
 		s := vhost.NewServer(sock, backend, logf)
+		if vhost.DynamicSlot(backend) {
+			s.EnableCapacityChange()
+		}
 		s.SetReadFatal(reportReadFatal)
 		s.SetDirtyTracker(dirty.Mark)
 		s.SetMemoryLoader(func(ctx context.Context, off, length uint64) error {
@@ -499,29 +514,26 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		}
 	}
 
-	for _, d := range p.Disks {
-		if d.Overlay {
-			i := len(devs)
-			sock := filepath.Join(runDir, fmt.Sprintf("blk%d.sock", i))
-			if err := addServer(sock, &vhost.ReadOnlyBackend{R: d.Reader}, fmt.Sprintf("blk%d", i), d.BasePath, true); err != nil {
-				stopServers()
+	restoreSet, restoredShapes, err := restoredDiskBackends(p.Disks, p.SnapCfg)
+	if err != nil {
+		return -1, err
+	}
+	if restoreSet != nil {
+		devIndex := 0
+		backends := restoreSet.DeviceBackends()
+		for _, d := range p.Disks {
+			if d.Overlay {
+				if err := addServer(filepath.Join(runDir, fmt.Sprintf("blk%d.sock", devIndex)), backends[devIndex], fmt.Sprintf("blk%d", devIndex), d.BasePath, true); err != nil {
+					return -1, err
+				}
+				devIndex++
+			}
+			if err := addServer(filepath.Join(runDir, fmt.Sprintf("blk%d.sock", devIndex)), backends[devIndex], fmt.Sprintf("blk%d", devIndex), d.DiffPath, false); err != nil {
 				return -1, err
 			}
+			devIndex++
+			snapDisks = append(snapDisks, snapshotDiskRef(d))
 		}
-		i := len(devs)
-		sock := filepath.Join(runDir, fmt.Sprintf("blk%d.sock", i))
-		if err := addServer(sock, &vhost.CowBackend{C: d.Cow}, fmt.Sprintf("blk%d", i), d.DiffPath, false); err != nil {
-			stopServers()
-			return -1, err
-		}
-		snapDisks = append(snapDisks, SnapDiskRef{
-			DiffPath:     d.DiffPath,
-			OwnedDiff:    d.OwnedDiff,
-			Size:         d.Cow.Size(),
-			SnapshotView: d.Cow.SnapshotView,
-			WaitReady:    d.Cow.WaitMaterialReady,
-			CheckError:   d.Cow.Err,
-		})
 	}
 
 	// guestlink.LaunchServer: guest→host management short-conns on
@@ -853,6 +865,55 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			guestlink.ServeExecRequest(execCtx, conn, req, vsockBase, logf)
 		},
 	}
+	diskOwner := p.owner
+	if diskOwner == nil && restoreSet != nil {
+		// Direct restore.Run still owns the public ctl socket. It does not
+		// expose a Runtime handle, but uses the same disk controller.
+		diskOwner = &Runtime{lifeCtx: backendCtx, state: runtimeStarting}
+		directDiskOwner = diskOwner
+	}
+	if diskOwner != nil {
+		r := diskOwner
+		r.diskSnapshot = snapHandler
+		r.diskFatal = reportReadFatal
+		r.diskBindGuest = func(ctx context.Context, bind proto.DiskBinding) error {
+			m, err := pinger.Client.RoundTripContext(ctx, &proto.Message{Type: proto.TypeDiskBind, DiskBind: &bind}, pingTO)
+			if err != nil {
+				return err
+			}
+			if m.Type == proto.TypeError {
+				return errors.New(m.Msg)
+			}
+			if m.Type != proto.TypeDiskBindAck || m.DiskBind == nil || *m.DiskBind != bind {
+				return errors.New("invalid guest disk bind ACK")
+			}
+			return nil
+		}
+		if restoreSet != nil {
+			r.spec.Disks = restoredShapes
+			r.spec.CurrentRun = p.DiskCurrentRun
+			r.spec.EnableCheckpoint = p.EnableCheckpoint
+			r.spec.checkpointPlan = p.DiskPlan
+			r.checkpointOwner = p.CheckpointOwner
+			defer func() { r.checkpointOwner = nil }()
+			r.sandboxID = p.SandboxID
+			r.baseDir = p.BaseDir
+			r.diskStorage = p.DiskStorage
+			r.diskCache = p.DiskCache
+			r.diskBackends = restoreSet
+			r.diskLaunch = LaunchSpec{Storage: p.DiskStorage, ManifestConfig: p.ManifestCfg, RefLocations: p.RefLocations, SourceBinding: p.SourceBinding}
+			r.initDiskInventory(p.SnapCfg, p.Disks)
+		}
+		ctlSrv.DiskBindHandler = func(req ctl.BindDiskRequest) error { return r.BindDisk(backendCtx, req) }
+		ctlSrv.DiskListHandler = func(expected string) (ctl.DiskStateReport, error) { return r.listDataDisks(backendCtx, expected) }
+		defer func() {
+			cancelBackends()
+			r.markExiting()
+			r.opsWG.Wait()
+			stopServers()
+			retErr = errors.Join(retErr, r.closeBoundDisks())
+		}()
+	}
 	if r := p.owner; r != nil {
 		r.mu.Lock()
 		r.launch = launch
@@ -900,16 +961,20 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			var backends []vhost.Backend
 			var refs []SnapDiskRef
 			for _, d := range disks {
-				d.Cow.SetFatalHandler(reportReadFatal)
-				if err := d.Cow.Err(); err != nil {
-					return err
+				if d.Cow != nil {
+					d.Cow.SetFatalHandler(reportReadFatal)
+					if err := d.Cow.Err(); err != nil {
+						return err
+					}
 				}
-				if d.Overlay {
-					backends = append(backends, &vhost.ReadOnlyBackend{R: d.Reader})
-				}
-				backends = append(backends, &vhost.CowBackend{C: d.Cow})
-				refs = append(refs, SnapDiskRef{DiffPath: d.DiffPath, OwnedDiff: d.OwnedDiff, Size: d.Cow.Size(), SnapshotView: d.Cow.SnapshotView, WaitReady: d.Cow.WaitMaterialReady, CheckError: d.Cow.Err})
+				backends = appendDiskBackend(backends, d)
+				refs = append(refs, snapshotDiskRef(d))
 			}
+			r.diskStorage = r.storage
+			r.diskCache = r.cache
+			r.diskBackends = r.deviceSet
+			r.diskLaunch = spec
+			r.initDiskInventory(cfg, disks)
 			snapHandler.Cfg = cfg
 			snapHandler.PortableConfig = c0
 			snapHandler.SourceBinding = spec.SourceBinding

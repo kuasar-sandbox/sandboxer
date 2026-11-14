@@ -50,6 +50,8 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		os.Exit(runCmd(os.Args[2:]))
+	case "disk":
+		os.Exit(diskCmd(os.Args[2:]))
 	case "checkpoint":
 		os.Exit(checkpointCmd(os.Args[2:]))
 	case "reset":
@@ -123,6 +125,9 @@ Usage:
                         [--mode local|bundle] [--resume]
                         [--run-root <dir>] [--timeout <sec>]
   # With --checkpoint, optional --output must be the owner's checkpoint directory.
+  sandbox-ctl disk bind --path-id <leaf> --disk <name> --disk-spec <file|->
+                        [--ref-location name=file:///path] [--expected-run <run-id>]
+  sandbox-ctl disk list --path-id <leaf> [--expected-run <run-id>]
   sandbox-ctl checkpoint list|delete (--sandbox-id <sid> | --checkpoint-dir <dir>)
   sandbox-ctl checkpoint gc --checkpoint-dir <dir> [--json]
                         [--path-id <leaf>] [--checkpoint <ID>] [--diff-id <ID> ...] [--json]

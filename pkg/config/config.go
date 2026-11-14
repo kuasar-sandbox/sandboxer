@@ -538,8 +538,7 @@ type BootConfig struct {
 
 	// Disks are additional data disks (beyond the root). Each follows the same
 	// rules as Root (single-disk diff or two-disk overlay) plus a Name, and
-	// MUST be mounted by exactly one mounts[].type=disk entry (validate enforces
-	// 1:1). Device order is root first, then Disks in array order; each disk's
+	// must be mapped by one or more mounts[].type=disk entries. Device order is root first, then Disks in array order; each disk's
 	// ordinal (its index here) is its identity on the guest (the name is config
 	// convenience only). At most MaxDataDisks (the count baked into the runtime
 	// erofs as /sysdisks/disk-<N>).
@@ -557,7 +556,12 @@ const MaxDataDisks = 8
 // wire mounts[].source → this disk at config time; internally the disk is
 // addressed by its ordinal (index in boot.disks[]).
 type DiskConfig struct {
-	Name       string `yaml:"name"`
+	Slot *DiskSlotConfig `yaml:"slot,omitempty"`
+	Disk *DiskV1         `yaml:"disk,omitempty"`
+	// These fields are supplied only by an authenticated artifact or the active owner.
+	Binding    *SlotBinding `yaml:"-"`
+	PureBlock  bool         `yaml:"-"`
+	Name       string       `yaml:"name"`
 	RootConfig `yaml:",inline"`
 }
 
@@ -697,9 +701,9 @@ type FileConfig struct {
 
 // MountConfig declares a guest mount. Type is tmpfs|empty|disk (empty default
 // → empty). For type=disk, Source names a boot.disks[] entry (the disk is
-// assembled and bound onto Target); each data disk must be mounted exactly once
-// (validate enforces 1:1).
+// assembled and bound onto Target); each data disk has at least one projection.
 type MountConfig struct {
+	Subpath string `yaml:"subpath,omitempty"`
 	Target  string `yaml:"target"`
 	Type    string `yaml:"type,omitempty"`
 	Source  string `yaml:"source,omitempty"`
@@ -1586,7 +1590,7 @@ func (c *SandboxConfig) validateDisks(cold bool) error {
 			return fmt.Errorf("boot.disks[%d].name %q duplicated", i, d.Name)
 		}
 		names[d.Name] = i
-		if err := validateDiskSource(&d.RootConfig, fmt.Sprintf("boot.disks[%d]", i), cold); err != nil {
+		if err := d.validateSource(fmt.Sprintf("boot.disks[%d]", i), cold); err != nil {
 			return err
 		}
 	}
@@ -1594,6 +1598,9 @@ func (c *SandboxConfig) validateDisks(cold bool) error {
 	// with the data disks already mounted (in the memory image); the restore
 	// host yaml lists boot.disks[] for device order + erofs bases but does not
 	// re-mount, so it need not carry the mounts[].
+	if err := ValidateMountProjections(c.Mounts); err != nil {
+		return err
+	}
 	if !cold {
 		return nil
 	}
@@ -1611,9 +1618,6 @@ func (c *SandboxConfig) validateDisks(cold bool) error {
 		}
 		if _, ok := names[m.Source]; !ok {
 			return fmt.Errorf("mounts[%d] (type=disk): source %q names no boot.disks[] entry", i, m.Source)
-		}
-		if mounted[m.Source] {
-			return fmt.Errorf("mounts[%d] (type=disk): disk %q already mounted (each disk mounts once)", i, m.Source)
 		}
 		mounted[m.Source] = true
 	}

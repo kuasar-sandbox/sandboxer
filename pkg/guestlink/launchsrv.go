@@ -342,6 +342,13 @@ func (s *LaunchServer) handleConnAfter(conn net.Conn, afterClose *func()) (hande
 			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "launch unavailable"})
 			return false
 		}
+		if err := checkDiskMountSupport(msg, spec); err != nil {
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+			if s.OnLaunchFailure != nil {
+				s.OnLaunchFailure(err)
+			}
+			return false
+		}
 		if spec.Ext4Discard == proto.DiscardManual && !msg.Ext4DiscardV1 {
 			err := errors.New("guest incompatible: ext4_discard_v1 is required for resources.diff_cow.discard=manual; update boot.runtime")
 			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
@@ -545,4 +552,21 @@ func (s *LaunchServer) Stop() {
 
 func (s *LaunchServer) cleanup() {
 	_ = os.Remove(s.Path)
+}
+
+func checkDiskMountSupport(hello *proto.Message, spec *proto.LaunchSpec) error {
+	seen := map[int]bool{}
+	for _, m := range spec.Mounts {
+		if m.Type != "disk" {
+			continue
+		}
+		if m.DiskSlot && !hello.DiskSlotV1 {
+			return errors.New("guest does not support disk_slot_v1")
+		}
+		if (seen[m.DiskIndex] || m.Subpath != "") && !hello.DiskMountProjectionV1 {
+			return errors.New("guest does not support disk_mount_projection_v1")
+		}
+		seen[m.DiskIndex] = true
+	}
+	return nil
 }

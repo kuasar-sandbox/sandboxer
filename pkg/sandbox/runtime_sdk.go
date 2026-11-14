@@ -38,6 +38,7 @@ import (
 )
 
 type RuntimeDiskSpec struct {
+	Slot             bool
 	Name             string
 	Overlay          bool
 	BaseCapacity     int64
@@ -150,6 +151,18 @@ type runtimeOwnedDisk struct {
 // Runtime owns one VM and its service goroutines. Wait observes cleanup;
 // Close requests graceful shutdown and waits for the same retained result.
 type Runtime struct {
+	diskSnapshot  *SnapshotHandler
+	diskLaunch    LaunchSpec
+	diskRunID     string
+	diskInventory []diskEntry
+	diskStateMu   sync.RWMutex
+	diskBackends  *vhost.BackendSet // includes restored devices
+	diskCache     *diffstore.Cache  // may be borrowed on restore
+	diskStorage   *artifact.ProcessStorage
+	diskBindGuest func(context.Context, proto.DiskBinding) error
+	diskFatal     func(error)
+	diskOwned     []runtimeOwnedDisk // writers created by BindDisk
+
 	checkpointCleanup                  func() error
 	checkpointOwner                    *diffstore.DirectoryOwner
 	checkpointMaintenance              *diffstore.DirectoryMaintenance
@@ -246,10 +259,13 @@ func runtimeDeviceSpecs(disks []RuntimeDiskSpec) ([]vhost.BlockDeviceSpec, error
 			}
 			names[d.Name] = true
 		}
+		if d.Slot && (i == 0 || d.Overlay || d.BaseCapacity != 0) {
+			return nil, errors.New("runtime slot must be a single writable data disk")
+		}
 		if d.BaseCapacity%vhost.SectorSize != 0 || d.WritableCapacity%vhost.SectorSize != 0 {
 			return nil, fmt.Errorf("runtime disk %d capacity is not sector-aligned", i)
 		}
-		if err := diffstore.ValidateWritableSize(d.WritableCapacity); err != nil {
+		if err := diffstore.ValidateWritableSize(d.WritableCapacity); err != nil && !(d.Slot && d.WritableCapacity == 0) {
 			return nil, fmt.Errorf("runtime disk %d: %w", i, err)
 		}
 		if d.Overlay {
@@ -260,7 +276,7 @@ func runtimeDeviceSpecs(disks []RuntimeDiskSpec) ([]vhost.BlockDeviceSpec, error
 		} else if d.BaseCapacity != 0 {
 			return nil, fmt.Errorf("runtime disk %d: single disk cannot expose separate base capacity", i)
 		}
-		out = append(out, vhost.BlockDeviceSpec{Capacity: d.WritableCapacity})
+		out = append(out, vhost.BlockDeviceSpec{Capacity: d.WritableCapacity, Slot: d.Slot})
 	}
 	return out, nil
 }
@@ -683,6 +699,9 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		} else {
 			overlay = cfg.Boot.Disks[i-1].Overlay != nil
 		}
+		if i > 0 && (cfg.Boot.Disks[i-1].Slot != nil) != shape.Slot {
+			return fail(fmt.Errorf("launch disk %d slot mismatch", i))
+		}
 		if overlay != shape.Overlay {
 			return fail(fmt.Errorf("launch disk %d layout mismatch", i))
 		}
@@ -729,7 +748,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		}
 	}
 	if !reusedPreparation {
-		preparation, err = preflightColdArtifacts(ctx, cfg, launchFetcher(spec), spec.RefLocations, r.baseDir, r.sandboxID, launchCodec(spec), diffKey, launchRequired(spec), opener, r.spec.checkpointPlan)
+		preparation, err = preflightColdArtifacts(ctx, cfg, launchFetcher(spec), spec.RefLocations, r.baseDir, r.sandboxID, launchCodec(spec), diffKey, launchRequired(spec), opener, spec.Storage, r.spec.checkpointPlan)
 		if err != nil {
 			return fail(err)
 		}
@@ -854,7 +873,26 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			}
 		}()
 		var diffURI, diffTemplate string
-		if root.Overlay != nil {
+		var pure *config.DiskV1
+		if !isRoot {
+			disk := cfg.Boot.Disks[index-1]
+			pure = disk.Disk
+			if pure == nil && disk.PureBlock && root.Base != "" {
+				pure = &config.DiskV1{Kind: "disk", Version: 1, Base: root.Base, BaseFromRefs: root.BaseFromRefs}
+			}
+		}
+		if pure != nil {
+			var e error
+			var opts []diffstore.DiskOption
+			if launchCodec(spec) != nil {
+				opts = append(opts, diffstore.WithDiffEncryption(diffKey, launchRequired(spec)))
+			}
+			base, _, diffTemplate, e = OpenDiskV1Source(readCtx, *pure, r.storage, spec.RefLocations, opts...)
+			if e != nil {
+				return DiskBackend{}, e
+			}
+			diffURI = root.Diff
+		} else if root.Overlay != nil {
 			x, _, e := OpenRootImageBlockReaderWithOpener(readCtx, root.Base, launchFetcher(spec), spec.RefLocations, launchCodec(spec), launchRequired(spec), opener)
 			if e != nil {
 				return DiskBackend{}, e
@@ -950,7 +988,13 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		imageCfg = &ImageConfig{}
 	}
 	for i := range cfg.Boot.Disks {
-		d, e := prepare(&cfg.Boot.Disks[i].RootConfig, i+1, false)
+		disk := &cfg.Boot.Disks[i]
+		if disk.Slot != nil && disk.Binding == nil {
+			logical = append(logical, DiskBackend{Slot: true})
+			continue
+		}
+		d, e := prepare(&disk.RootConfig, i+1, false)
+		d.Slot = disk.Slot != nil
 		if e != nil {
 			return fail(e)
 		}
@@ -975,6 +1019,13 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	ls.Ext4Discard = discardMode
 	ls.Network = netSpec
 	ls.Mounts = effectiveMounts(cfg.Mounts, imageCfg.Volumes)
+	projections := make([]config.MountConfig, len(ls.Mounts))
+	for i, m := range ls.Mounts {
+		projections[i] = config.MountConfig{Type: m.Type, Target: m.Target, Source: m.Source, Subpath: m.Subpath}
+	}
+	if err := config.ValidateMountProjections(projections); err != nil {
+		return fail(err)
+	}
 	ls.Files = cfg.ProtoFiles()
 	ls.Init = toProtoInit(cfg.Init)
 	ls.Plugins = toProtoPlugins(cfg.Launch.Plugin)

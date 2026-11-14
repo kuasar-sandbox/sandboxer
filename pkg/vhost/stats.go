@@ -118,6 +118,10 @@ type Stats struct {
 	flush   ReqStats
 	discard ReqStats
 
+	coverage atomic.Pointer[coverageMaps]
+}
+
+type coverageMaps struct {
 	blockBytes  uint64
 	totalBlocks uint64
 	readMap     []atomic.Uint64
@@ -128,20 +132,24 @@ type Stats struct {
 // name is a short label for printing (e.g. "blk0"); path is best-effort
 // origin (file path or URI).
 func NewStats(name, path string, totalBytes int64) *Stats {
+	s := &Stats{name: name, path: path}
+	s.setCapacity(totalBytes)
+	return s
+}
+
+func (s *Stats) setCapacity(totalBytes int64) {
 	if totalBytes < 0 {
 		totalBytes = 0
 	}
 	blockBytes := uint64(CoverageBlockBytes)
 	totalBlocks := (uint64(totalBytes) + blockBytes - 1) / blockBytes
 	words := (totalBlocks + 63) / 64
-	return &Stats{
-		name:        name,
-		path:        path,
+	s.coverage.Store(&coverageMaps{
 		blockBytes:  blockBytes,
 		totalBlocks: totalBlocks,
 		readMap:     make([]atomic.Uint64, words),
 		writeMap:    make([]atomic.Uint64, words),
-	}
+	})
 }
 
 // Record updates the counters for one completed request.
@@ -166,7 +174,10 @@ func (s *Stats) MarkRead(offset int64, length int) {
 	if s == nil {
 		return
 	}
-	s.markCoverage(s.readMap, offset, length)
+	c := s.coverage.Load()
+	if c != nil {
+		c.markCoverage(c.readMap, offset, length)
+	}
 }
 
 // MarkWrite sets write-coverage bits for [offset, offset+length).
@@ -174,10 +185,13 @@ func (s *Stats) MarkWrite(offset int64, length int) {
 	if s == nil {
 		return
 	}
-	s.markCoverage(s.writeMap, offset, length)
+	c := s.coverage.Load()
+	if c != nil {
+		c.markCoverage(c.writeMap, offset, length)
+	}
 }
 
-func (s *Stats) markCoverage(bitmap []atomic.Uint64, offset int64, length int) {
+func (s *coverageMaps) markCoverage(bitmap []atomic.Uint64, offset int64, length int) {
 	if length <= 0 || offset < 0 || s.totalBlocks == 0 {
 		return
 	}
@@ -333,21 +347,25 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	s.originMu.RLock()
 	path := s.path
 	s.originMu.RUnlock()
+	c := s.coverage.Load()
+	if c == nil {
+		c = &coverageMaps{}
+	}
 	snap := StatsSnapshot{
 		Name:        s.name,
 		Path:        path,
-		BlockBytes:  s.blockBytes,
-		TotalBlocks: s.totalBlocks,
+		BlockBytes:  c.blockBytes,
+		TotalBlocks: c.totalBlocks,
 		Read:        s.read.snapshot(),
 		Write:       s.write.snapshot(),
 		Flush:       s.flush.snapshot(),
 		Discard:     s.discard.snapshot(),
 	}
-	for i := range s.readMap {
-		snap.LoadedBlocks += uint64(bits.OnesCount64(s.readMap[i].Load()))
+	for i := range c.readMap {
+		snap.LoadedBlocks += uint64(bits.OnesCount64(c.readMap[i].Load()))
 	}
-	for i := range s.writeMap {
-		snap.WrittenBlocks += uint64(bits.OnesCount64(s.writeMap[i].Load()))
+	for i := range c.writeMap {
+		snap.WrittenBlocks += uint64(bits.OnesCount64(c.writeMap[i].Load()))
 	}
 	return snap
 }

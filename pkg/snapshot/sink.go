@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -463,6 +464,39 @@ func (s *BundleSink) CommitSnapshot(ctx context.Context, ref, _ string) error {
 	return s.commitRoot(ctx, ref, "snapshot")
 }
 
+// CommitDisk publishes an independent Bundle of ordered pure block layers.
+// Its basename includes every dependency: two disks can share the same top
+// sparse layer while inheriting completely different data.
+func (s *BundleSink) CommitDisk(ctx context.Context, refs []string) (string, error) {
+	if len(refs) == 0 {
+		return "", errors.New("disk Bundle requires at least one layer")
+	}
+	graph := sha256.New()
+	var root store.ContentKey
+	for i, raw := range refs {
+		r, err := manifest.ParseRef(raw)
+		if err != nil || r.Scheme != manifest.RefSchemeManifest {
+			return "", fmt.Errorf("disk Bundle: invalid layer %d", i)
+		}
+		k, err := manifest.ParseKeyRef(r.Path)
+		if err != nil {
+			return "", err
+		}
+		if _, ok := s.manifests[k]; !ok {
+			return "", fmt.Errorf("disk Bundle: layer %d is not present", i)
+		}
+		if i == 0 {
+			root = k
+		}
+		graph.Write(k[:])
+	}
+	name := "disk-" + hex.EncodeToString(graph.Sum(nil)) + ".bundle"
+	if err := s.finalize(ctx, root, name, ""); err != nil {
+		return "", err
+	}
+	return s.finalPath, nil
+}
+
 func (s *BundleSink) commitRoot(ctx context.Context, ref, role string) error {
 	parsed, err := manifest.ParseRef(ref)
 	if err != nil || parsed.Scheme != manifest.RefSchemeManifest {
@@ -472,7 +506,7 @@ func (s *BundleSink) commitRoot(ctx context.Context, ref, role string) error {
 	if err != nil {
 		return fmt.Errorf("commit Bundle %s root: %w", role, err)
 	}
-	return s.finalize(ctx, key, role)
+	return s.finalize(ctx, key, HexKey(key)+".bundle", role)
 }
 
 // IngestStream collects one already-decoded local parent or immutable
@@ -536,7 +570,7 @@ func (s *BundleSink) ingestSource(ctx context.Context, source sparse.Source, hol
 	return result, nil
 }
 
-func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, role string) error {
+func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, basename, role string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -547,7 +581,7 @@ func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, role s
 		return fmt.Errorf("close snapshot Bundle: %w", err)
 	}
 	s.closed = true
-	final := filepath.Join(s.outDir, HexKey(root)+".bundle")
+	final := filepath.Join(s.outDir, basename)
 	err := unix.Renameat2(unix.AT_FDCWD, s.tmpPath, unix.AT_FDCWD, final, unix.RENAME_NOREPLACE)
 	if err == unix.EEXIST {
 		if err := s.validateExisting(ctx, final, root); err != nil {
@@ -560,8 +594,10 @@ func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, role s
 		return fmt.Errorf("commit snapshot Bundle without replacement: %w", err)
 	}
 	s.tmpPath = ""
-	if err := commitArtifactAlias(ctx, s.outDir, s.sandboxID, role, final); err != nil {
-		return fmt.Errorf("commit %s Bundle alias: %w", role, err)
+	if role != "" {
+		if err := commitArtifactAlias(ctx, s.outDir, s.sandboxID, role, final); err != nil {
+			return fmt.Errorf("commit %s Bundle alias: %w", role, err)
+		}
 	}
 	s.finalPath = final
 	s.finalized = true
