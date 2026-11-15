@@ -88,7 +88,7 @@ func (r *Runtime) planSlotBind(index int, source config.DiskV1, sourceID, id str
 				return err
 			}
 			// Rename publishes the metadata before its directory sync. Preserve
-			// this writer on either outcome; Bind retries the sync before ACK.
+			// this writer on either outcome. Bind retries the sync before returning.
 			if err = r.retainSlotTopology(ctx, cfg, c0, candidate, index, size, loc); err != nil && !errors.Is(err, artifact.ErrCurrentMetadataPublished) {
 				return err
 			}

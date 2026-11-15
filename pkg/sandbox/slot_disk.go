@@ -12,10 +12,10 @@ import (
 	"path/filepath"
 	"slices"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
-	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
 
@@ -24,16 +24,15 @@ type DiskStateReport = ctl.DiskStateReport
 
 const (
 	diskUnbound = "unbound"
-	diskPending = "published_pending_guest"
 	diskReady   = "ready"
 )
 
 type diskEntry struct {
 	ctl.DiskState
-	deviceIndex         int
-	reserved            bool
-	dynamic             bool
-	sourceID, bindingID string
+	deviceIndex int
+	reserved    bool
+	dynamic     bool
+	sourceID    string
 }
 
 func appendDiskBackend(out []vhost.Backend, d DiskBackend) []vhost.Backend {
@@ -116,13 +115,24 @@ func restoredDiskBackends(disks []DiskBackend, cfg *config.SandboxConfig) (*vhos
 	return set, shapes, nil
 }
 
+// An older snapshot reader requires this bit for dynamic slots. Record it only
+// when all dynamic devices have a negotiated reverse channel at this point.
+func (r *Runtime) capturedCapacityChange() bool {
+	hasDynamic := false
+	for i, backend := range r.deviceSet.DeviceBackends() {
+		if vhost.DynamicSlot(backend) {
+			if !r.diskSnapshot.Servers[i].CanNotifyCapacity() {
+				return false
+			}
+			hasDynamic = true
+		}
+	}
+	return hasDynamic
+}
+
 func (r *Runtime) initDiskInventory(cfg *config.SandboxConfig, disks []DiskBackend) {
 	r.diskStateMu.Lock()
 	defer r.diskStateMu.Unlock()
-	r.diskRunID = rand.Text()
-	if r.spec.CurrentRun != nil {
-		r.diskRunID = r.spec.CurrentRun.RunID
-	}
 	if cfg == nil {
 		return
 	}
@@ -147,7 +157,6 @@ func (r *Runtime) initDiskInventory(cfg *config.SandboxConfig, disks []DiskBacke
 					entry.SizeBytes = &capacity
 				}
 			} else {
-				entry.bindingID = definition.Binding.ID
 				entry.sourceID = definition.Binding.SourceID
 			}
 		}
@@ -160,9 +169,6 @@ func (r *Runtime) initDiskInventory(cfg *config.SandboxConfig, disks []DiskBacke
 }
 
 func (r *Runtime) ListDataDisks(ctx context.Context) (DiskStateReport, error) {
-	return r.listDataDisks(ctx, "")
-}
-func (r *Runtime) listDataDisks(ctx context.Context, expected string) (DiskStateReport, error) {
 	if err := r.beginOperation(); err != nil {
 		return DiskStateReport{}, err
 	}
@@ -172,10 +178,7 @@ func (r *Runtime) listDataDisks(ctx context.Context, expected string) (DiskState
 	}
 	r.diskStateMu.RLock()
 	defer r.diskStateMu.RUnlock()
-	if r.diskRunID == "" || expected != "" && expected != r.diskRunID {
-		return DiskStateReport{}, fmt.Errorf("%w: disk inventory owner mismatch", ctl.ErrDiskConflict)
-	}
-	out := DiskStateReport{RunID: r.diskRunID, Disks: make([]ctl.DiskState, len(r.diskInventory))}
+	out := DiskStateReport{Disks: make([]ctl.DiskState, len(r.diskInventory))}
 	for i, entry := range r.diskInventory {
 		out.Disks[i] = entry.DiskState
 		if entry.SizeBytes != nil {
@@ -227,16 +230,13 @@ func (r *Runtime) BindDisk(ctx context.Context, req BindDiskRequest) (err error)
 		return err
 	}
 	h := r.diskSnapshot
-	if h == nil || r.diskBackends == nil || r.diskBindGuest == nil {
+	if h == nil || r.diskBackends == nil {
 		return fmt.Errorf("%w: owner does not support disk binding", ctl.ErrDiskUnsupported)
 	}
 	if err := h.capture.begin(); err != nil {
 		return fmt.Errorf("%w: %w", ctl.ErrDiskBusy, err)
 	}
 	defer h.capture.finish(false)
-	if req.ExpectedRun != "" && req.ExpectedRun != r.diskRunID {
-		return fmt.Errorf("%w: disk bind owner mismatch", ctl.ErrDiskConflict)
-	}
 	ordinal := slices.IndexFunc(r.diskInventory, func(d diskEntry) bool { return d.Name == req.SlotName })
 	if ordinal < 0 {
 		return fmt.Errorf("%w: unknown disk %q", ctl.ErrDiskNotFound, req.SlotName)
@@ -250,8 +250,7 @@ func (r *Runtime) BindDisk(ctx context.Context, req BindDiskRequest) (err error)
 		return err
 	}
 	if entry.State == diskUnbound {
-		entry, err = r.publishDiskSlot(ctx, entry, req.Disk, locations)
-		if err != nil {
+		if err := r.publishDiskSlot(ctx, entry, req.Disk, locations); err != nil {
 			return err
 		}
 	} else {
@@ -266,54 +265,38 @@ func (r *Runtime) BindDisk(ctx context.Context, req BindDiskRequest) (err error)
 			return fmt.Errorf("%w: disk source capacity mismatch", ctl.ErrDiskCapacity)
 		}
 		if !maps.Equal(r.diskLaunch.RefLocations, locations) {
-			if err := r.retainSlotLocations(ctx, locations); err != nil {
+			if err := r.retainSlotLocations(ctx, locations); err != nil && !errors.Is(err, artifact.ErrCurrentMetadataPublished) {
 				return err
 			}
 			r.diskLaunch.RefLocations = locations
 			h.RefLocations = locations
 		}
 	}
-	if entry.State == diskReady {
-		return nil
-	}
+	// A rename can publish current-disks.json before its directory sync
+	// succeeds. Keep the committed writer; a same-source retry finishes
+	// durability even after the original request lost its response.
 	if r.spec.CurrentRun != nil {
 		if err := syncDiskDirectory(r.checkpointOwner.Directory); err != nil {
 			return fmt.Errorf("%w: disk published, current-run directory sync pending: %w", ctl.ErrDiskPending, err)
 		}
 	}
-	if entry.dynamic {
-		if err := h.Servers[entry.deviceIndex].NotifyCapacity(); err != nil {
-			return fmt.Errorf("%w: disk published, capacity notification pending: %w", ctl.ErrDiskPending, err)
-		}
-	}
-	bind := proto.DiskBinding{DiskIndex: entry.Ordinal, BindingID: entry.bindingID, SizeBytes: uint64(*entry.SizeBytes)}
-	if err := r.diskBindGuest(ctx, bind); err != nil {
-		return fmt.Errorf("%w: disk published, guest confirmation pending: %w", ctl.ErrDiskPending, err)
-	}
-	r.diskStateMu.Lock()
-	r.diskInventory[ordinal].State = diskReady
-	r.diskStateMu.Unlock()
-	h.slotConfirmations.Add(-1)
 	return nil
 }
 
-func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source config.DiskV1, locations config.RefLocations) (_ diskEntry, retErr error) {
+func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source config.DiskV1, locations config.RefLocations) (retErr error) {
 	h := r.diskSnapshot
 	if r.diskStorage == nil || r.diskCache == nil {
-		return entry, errors.New("slot storage is unavailable")
-	}
-	if entry.dynamic && !h.Servers[entry.deviceIndex].CanNotifyCapacity() {
-		return entry, fmt.Errorf("%w: VMM did not negotiate dynamic disk capacity", ctl.ErrDiskUnsupported)
+		return errors.New("slot storage is unavailable")
 	}
 	opts := []diffstore.DiskOption{diffstore.WithCache(r.diskCache)}
 	if r.diskStorage.LocalCodec() != nil {
 		keyFn := r.diskStorage.CustomerKeyFunc()
 		if keyFn == nil {
-			return entry, errors.New("encrypted disk source needs a key")
+			return errors.New("encrypted disk source needs a key")
 		}
 		key, err := keyFn()
 		if err != nil {
-			return entry, err
+			return err
 		}
 		defer clear(key[:])
 		opts = append(opts, diffstore.WithDiffEncryption(key, r.diskStorage.LocalRequired()))
@@ -332,7 +315,7 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 	var resolved config.DiskV1
 	base, size, template, err := openDiskV1Source(readCtx, source, r.diskStorage, locations, &resolved, opts...)
 	if err != nil {
-		return entry, err
+		return err
 	}
 	defer func() {
 		if retErr != nil && base != nil {
@@ -340,24 +323,24 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 		}
 	}()
 	if entry.SizeBytes != nil && size != *entry.SizeBytes {
-		return entry, fmt.Errorf("%w: slot %s requires %d bytes, source has %d", ctl.ErrDiskCapacity, entry.Name, *entry.SizeBytes, size)
+		return fmt.Errorf("%w: slot %s requires %d bytes, source has %d", ctl.ErrDiskCapacity, entry.Name, *entry.SizeBytes, size)
 	}
 	id := rand.Text()
 	sourceID := resolved.Identity()
 	plan, err := r.planSlotBind(entry.Ordinal, resolved, sourceID, id, size, locations)
 	if err != nil {
-		return entry, err
+		return err
 	}
 	defer func() { plan.Abort() }()
 	if err := os.MkdirAll(filepath.Dir(plan.DiffPath), 0755); err != nil {
-		return entry, err
+		return err
 	}
 	init, err := PrepareDiff(plan.DiffPath, template, size)
 	if err != nil {
-		return entry, err
+		return err
 	}
 	if init.Existing {
-		return entry, errors.New("new slot writer path already exists")
+		return errors.New("new slot writer path already exists")
 	}
 	if plan.DiffID != "" {
 		opts = append(opts, diffstore.WithCheckpoint(plan.DiffID, plan.BaseID))
@@ -368,7 +351,7 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 	}
 	cow, err := diffstore.OpenDisk(plan.DiffPath, base, init, opts...)
 	if err != nil {
-		return entry, err
+		return err
 	}
 	defer func() {
 		if retErr != nil {
@@ -377,24 +360,23 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 		}
 	}()
 	if err = ctx.Err(); err != nil {
-		return entry, err
+		return err
 	}
 
 	// Detach the reader before the irreversible publication. A cancellation
 	// that won the race must not leave a permanently canceled backend installed.
 	if !stopCancel() {
-		return entry, ctx.Err()
+		return ctx.Err()
 	}
 	if cause := readCtx.Err(); cause != nil {
-		return entry, cause
+		return cause
 	}
 	if err = cow.Err(); err != nil {
-		return entry, err
+		return err
 	}
 	d := DiskBackend{Slot: true, Cow: cow, DiffPath: plan.DiffPath, OwnedDiff: owned}
 	ref := bindCheckpointDisks([]SnapDiskRef{snapshotDiskRef(d)}, []DiskBackend{d})[0]
-	entry.State = diskPending
-	entry.bindingID = id
+	entry.State = diskReady
 	entry.sourceID = sourceID
 	entry.SizeBytes = &size
 	err = r.diskBackends.BindSlot(entry.deviceIndex, &vhost.CowBackend{C: cow}, func() error {
@@ -405,22 +387,26 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 		return nil
 	})
 	if err != nil {
-		return entry, err
+		return err
 	}
-	r.diskStateMu.Lock()
-	r.diskInventory[entry.Ordinal] = entry
-	r.diskStateMu.Unlock()
 	r.diskOwned = append(r.diskOwned, runtimeOwnedDisk{base: base, cow: cow, diffPath: plan.DiffPath, ownedDiff: owned})
 	h.diskRefsMu.Lock()
 	h.Disks[entry.Ordinal+1] = ref
 	h.diskRefsMu.Unlock()
 	h.RefLocations = locations
 	r.diskLaunch.RefLocations = locations
-	h.slotConfirmations.Add(1)
+	r.diskStateMu.Lock()
+	r.diskInventory[entry.Ordinal] = entry
+	r.diskStateMu.Unlock()
+	if entry.dynamic {
+		if err := h.Servers[entry.deviceIndex].NotifyCapacity(); err != nil && r.logf != nil {
+			r.logf("disk %s capacity notification: %v", entry.Name, err)
+		}
+	}
 	if r.diskFatal != nil {
 		cow.SetFatalHandler(r.diskFatal)
 	}
-	return entry, nil
+	return nil
 }
 
 func (r *Runtime) closeBoundDisks() error {

@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -222,6 +221,11 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		}
 		if err := bindRuntimeDiskGraph(opts.Cfg, c0, opts.SourceBinding); err != nil {
 			return -1, fmt.Errorf("Sandbox source binding: %w", err)
+		}
+	}
+	if opts.SourceBinding == nil && opts.PortableConfig == nil {
+		if err := config.ValidateMountPaths(opts.Cfg.Mounts); err != nil {
+			return -1, err
 		}
 	}
 	if err := opts.Cfg.ValidateCold(); err != nil {
@@ -924,6 +928,7 @@ func resolveDiskMounts(mounts []proto.MountSpec, disks []config.DiskConfig, root
 		// A fresh guest has no cached state for an already-bound disk. Mount it
 		// during Launch. Memory Restore retains the original autofs state.
 		m.DiskSlot = d.Unbound()
+		m.DiskSlotDeclared = d.Slot != nil
 		m.DiskIndex = i
 		m.Source = ""
 		if d.RootConfig.Single() {
@@ -991,9 +996,8 @@ type SnapshotHandler struct {
 	Context               context.Context
 	Logf                  func(string, ...any)
 
-	diskRefsMu        sync.RWMutex // protects copies of the active disk list during online checkpoint listing
-	slotConfirmations atomic.Int32
-	capture           captureGate
+	diskRefsMu sync.RWMutex // protects copies of the active disk list during online checkpoint listing
+	capture    captureGate
 }
 
 // captureGate serializes export and snapshot for one live VM. A successful
@@ -1047,7 +1051,7 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 	return h.handleContext(h.Context, req, cgroupPath, chExited)
 }
 func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
-	if err := h.beginCapture(); err != nil {
+	if err := h.capture.begin(); err != nil {
 		return ctl.Response{}, err
 	}
 	defer func() {
@@ -1081,7 +1085,7 @@ func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExi
 	return h.handleExportContext(h.Context, req, cgroupPath, chExited)
 }
 func (h *SnapshotHandler) handleExportContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
-	if err := h.beginCapture(); err != nil {
+	if err := h.capture.begin(); err != nil {
 		return ctl.Response{}, err
 	}
 	defer func() {
@@ -3406,17 +3410,6 @@ func generateSandboxID() string {
 func validateSandboxID(sandboxID string) error {
 	if err := ValidatePathID(sandboxID); err != nil {
 		return fmt.Errorf("sandbox id %q must be one non-empty path component", sandboxID)
-	}
-	return nil
-}
-
-func (h *SnapshotHandler) beginCapture() error {
-	if err := h.capture.begin(); err != nil {
-		return err
-	}
-	if h.slotConfirmations.Load() != 0 {
-		h.capture.finish(false)
-		return errors.New("disk binding is awaiting guest confirmation")
 	}
 	return nil
 }

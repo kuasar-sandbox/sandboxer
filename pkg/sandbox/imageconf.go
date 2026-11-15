@@ -10,6 +10,7 @@ import (
 	"path"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
@@ -71,7 +72,7 @@ func MaterializeImageDefaults(cfg *config.SandboxConfig, image *ImageConfig) err
 	}
 	cfg.Launch.EphemeralEnv = eph
 
-	mounts := effectiveMounts(cfg.Mounts, imageVolumes(image))
+	mounts := effectiveMounts(cfg.Mounts, imageVolumes(image), cfg.Boot.Disks)
 	cfg.Mounts = make([]config.MountConfig, len(mounts))
 	for i := range mounts {
 		cfg.Mounts[i] = config.MountConfig{
@@ -314,21 +315,30 @@ func MergeLaunch(image *ImageConfig, override config.LaunchConfig) (*proto.Launc
 
 // effectiveMounts converts config mounts and merges image Volumes as
 // implicit empty mounts (explicit config wins on the same target).
-func effectiveMounts(mounts []config.MountConfig, volumes map[string]struct{}) []proto.MountSpec {
+func effectiveMounts(mounts []config.MountConfig, volumes map[string]struct{}, disks []config.DiskConfig) []proto.MountSpec {
 	out := make([]proto.MountSpec, 0, len(mounts)+len(volumes))
-	seen := make(map[string]struct{}, len(mounts))
+	ordinaryTargets := make(map[string]bool)
+	slotTargets := make(map[string]bool)
+	slots := make(map[string]bool)
+	for _, disk := range disks {
+		slots[disk.Name] = disk.Slot != nil
+	}
 	for _, m := range mounts {
 		t := m.Type
 		if t == "" {
 			t = "empty"
 		}
 		out = append(out, proto.MountSpec{Target: m.Target, Type: t, Source: m.Source, Subpath: m.Subpath, Options: m.Options})
-		seen[path.Clean(m.Target)] = struct{}{}
+		if m.Type == "disk" && slots[m.Source] {
+			slotTargets[slotVolumeTarget(m.Target)] = true
+		} else {
+			ordinaryTargets[path.Clean(m.Target)] = true
+		}
 	}
 	// Deterministic order for image Volumes.
 	vols := make([]string, 0, len(volumes))
 	for v := range volumes {
-		if _, ok := seen[path.Clean(v)]; ok {
+		if ordinaryTargets[path.Clean(v)] || slotTargets[slotVolumeTarget(v)] {
 			continue
 		}
 		vols = append(vols, v)
@@ -341,6 +351,15 @@ func effectiveMounts(mounts []config.MountConfig, volumes map[string]struct{}) [
 		return nil
 	}
 	return out
+}
+
+// A parent component in a saved mount or image VOLUME can traverse an image
+// symlink. For slots only the Guest can resolve it; exact spellings still match.
+func slotVolumeTarget(target string) string {
+	if strings.Contains("/"+target+"/", "/../") {
+		return target
+	}
+	return path.Clean(target)
 }
 
 // toProtoInit converts config init slices to proto slices.

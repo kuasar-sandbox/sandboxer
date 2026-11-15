@@ -75,6 +75,9 @@ func LoadMergedWithPresence(paths []string) (*SandboxConfig, FieldPresence, erro
 		}
 		combined.merge(presence)
 	}
+	if err := ValidateMountPaths(cfg.Mounts); err != nil {
+		return nil, FieldPresence{}, err
+	}
 	cfg.ApplyDefaults()
 	return &cfg, combined, nil
 }
@@ -87,6 +90,9 @@ func LoadConfigBytesWithPresence(raw []byte) (*SandboxConfig, FieldPresence, err
 	var cfg SandboxConfig
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, FieldPresence{}, fmt.Errorf("sandbox: parse config bytes: %w", err)
+	}
+	if err := ValidateMountPaths(cfg.Mounts); err != nil {
+		return nil, FieldPresence{}, err
 	}
 	cfg.ApplyDefaults()
 	return &cfg, presence, nil

@@ -682,9 +682,6 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
 			}
-			if err := pc.CheckDiskCapabilities(); err != nil {
-				return err
-			}
 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).ResumeContext(pc.Ctx); err != nil {
 				return fmt.Errorf("vm.resume: %w", err)
 			}

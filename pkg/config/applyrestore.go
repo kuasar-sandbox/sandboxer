@@ -26,7 +26,7 @@ func ApplyRestoreRules(artifact *PortableSandboxConfig, host *SandboxConfig, pre
 				return nil, nil, errors.New("run --restore: mounts are cold-start-only")
 			}
 		}
-		if err := validateFromDiskMountTopology(artifact.Mounts, host.Mounts); err != nil {
+		if err := validateFromDiskMountTopology(artifact.Mounts, host.Mounts, artifact.slotNames()); err != nil {
 			return nil, nil, err
 		}
 	}

@@ -17,11 +17,16 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
 
-func TestSlotOwnerAckLossPreservesWriterAndProtectsCapture(t *testing.T) {
+func TestHostSlotBindCommitsCaptureAndPreservesPrivateWriter(t *testing.T) {
+	size := "8KiB"
+	t.Run("fixed", func(t *testing.T) { testHostSlotBind(t, &size, 8192) })
+	t.Run("dynamic without capacity notifications", func(t *testing.T) { testHostSlotBind(t, nil, 0) })
+}
+
+func testHostSlotBind(t *testing.T, size *string, initialCapacity int64) {
 	ctx := context.Background()
 	root := t.TempDir()
-	size := "8KiB"
-	slot := &config.DiskSlotConfig{Size: &size}
+	slot := &config.DiskSlotConfig{Size: size}
 	cfg := &config.SandboxConfig{Boot: config.BootConfig{Disks: []config.DiskConfig{{Name: "data", Slot: slot}}}}
 	c0 := testRunFromPortable(t)
 	c0.Version = 2
@@ -40,7 +45,7 @@ func TestSlotOwnerAckLossPreservesWriterAndProtectsCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cache.Close()
-	set, err := vhost.NewBackendSet([]vhost.BlockDeviceSpec{{Slot: true, Capacity: 8192}})
+	set, err := vhost.NewBackendSet([]vhost.BlockDeviceSpec{{Slot: true, Capacity: initialCapacity}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,54 +54,51 @@ func TestSlotOwnerAckLossPreservesWriterAndProtectsCapture(t *testing.T) {
 	}
 	srv := vhost.NewServer("", set.DeviceBackends()[0], func(string, ...any) {})
 	snapshot := &SnapshotHandler{Cfg: cfg, PortableConfig: c0, Disks: []SnapDiskRef{{Size: 8192}, {Slot: true}}, Servers: []*vhost.Server{srv}}
-	rt := &Runtime{state: runtimeRunning, lifeCtx: ctx, baseDir: root, diskStorage: store, diskCache: cache, diskBackends: set, diskSnapshot: snapshot, diskRunID: "first", diskInventory: []diskEntry{{reserved: true}}}
+	rt := &Runtime{state: runtimeRunning, lifeCtx: ctx, baseDir: root, diskStorage: store, diskCache: cache, diskBackends: set, diskSnapshot: snapshot, diskInventory: []diskEntry{{reserved: true, dynamic: size == nil}}}
 	defer rt.closeBoundDisks()
 	entry := &rt.diskInventory[0]
 	entry.Name = "data"
 	entry.State = diskUnbound
-	geometry := int64(8192)
-	entry.SizeBytes = &geometry
+	if size != nil {
+		entry.SizeBytes = &initialCapacity
+	}
 	seed := bytes.Repeat([]byte{'A'}, 8192)
 	if err := os.WriteFile(filepath.Join(root, "seed"), seed, 0600); err != nil {
 		t.Fatal(err)
 	}
 	layer, _, _ := writeDiskArtifact(t, root, "immutable", seed, nil)
-	req := BindDiskRequest{SlotName: "data", Disk: config.DiskV1{Kind: "disk", Version: 1, Base: "file://" + layer, DiffTemplate: "file://seed@location:seeds"}, RefLocations: config.RefLocations{"seeds": root}, ExpectedRun: "other"}
-	rt.diskBindGuest = func(context.Context, proto.DiskBinding) error { return errors.New("response lost") }
-	if err = rt.BindDisk(ctx, req); !errors.Is(err, ctl.ErrDiskConflict) || len(rt.diskOwned) != 0 {
-		t.Fatal("mismatching generation published disk")
+	req := BindDiskRequest{SlotName: "data", Disk: config.DiskV1{Kind: "disk", Version: 1, Base: "file://" + layer, DiffTemplate: "file://seed@location:seeds"}, RefLocations: config.RefLocations{"seeds": root}}
+	// Hold the same gate as a real capture. A competing bind must leave the
+	// saved device unbound and must not allocate a writer.
+	if err := snapshot.capture.begin(); err != nil {
+		t.Fatal(err)
 	}
-	req.ExpectedRun = "first"
-	if err = rt.BindDisk(ctx, req); !errors.Is(err, ctl.ErrDiskPending) || len(rt.diskOwned) != 1 {
-		t.Fatalf("first bind: %v, writers=%d", err, len(rt.diskOwned))
+	if err := rt.BindDisk(ctx, req); !errors.Is(err, ctl.ErrDiskBusy) || len(rt.diskOwned) != 0 {
+		t.Fatalf("bind during capture: %v, writers=%d", err, len(rt.diskOwned))
+	}
+	snapshot.capture.finish(false)
+	if err := rt.BindDisk(ctx, req); err != nil || len(rt.diskOwned) != 1 {
+		t.Fatalf("host bind: %v, writers=%d", err, len(rt.diskOwned))
 	}
 	state, err := rt.ListDataDisks(ctx)
-	if err != nil || state.Disks[0].State != diskPending {
-		t.Fatalf("list pending: %#v %v", state, err)
+	if err != nil || state.Disks[0].State != diskReady || state.Disks[0].SizeBytes == nil || *state.Disks[0].SizeBytes != 8192 {
+		t.Fatalf("published disk inventory: %#v %v", state, err)
 	}
-	if err = snapshot.beginCapture(); err == nil {
-		t.Fatal("capture crossed pending ACK")
+	if err := snapshot.capture.begin(); err != nil {
+		t.Fatal(err)
 	}
+	saved := snapshot.PortableConfig.Boot.Disks[0]
+	if saved.Binding == nil || saved.Binding.ID == "" || saved.Binding.SizeBytes != 8192 || snapshot.Disks[1].Size != 8192 {
+		t.Fatalf("incomplete capture topology after bind: %+v disk=%+v", saved, snapshot.Disks[1])
+	}
+	snapshot.capture.finish(false)
 	if _, err = set.DeviceBackends()[0].WriteAt([]byte("new"), 0); err != nil {
 		t.Fatal(err)
 	}
-	id := rt.diskInventory[0].bindingID
-	rt.diskBindGuest = func(_ context.Context, b proto.DiskBinding) error {
-		if b.BindingID != id || b.SizeBytes != 8192 {
-			t.Fatalf("mismatching guest request: %#v", b)
-		}
-		return nil
+	// Repeating the call after a lost response must keep the same writer.
+	if err = rt.BindDisk(ctx, req); err != nil || len(rt.diskOwned) != 1 || snapshot.PortableConfig.Boot.Disks[0].Binding.ID != saved.Binding.ID {
+		t.Fatalf("retry changed committed binding: %v", err)
 	}
-	if err = rt.BindDisk(ctx, req); err != nil {
-		t.Fatal(err)
-	}
-	if err = rt.BindDisk(ctx, req); err != nil || len(rt.diskOwned) != 1 {
-		t.Fatal(err)
-	}
-	if err = snapshot.beginCapture(); err != nil {
-		t.Fatal(err)
-	}
-	snapshot.capture.finish(false)
 	var b [4]byte
 	if _, err = set.DeviceBackends()[0].ReadAt(b[:], 0); err != nil || string(b[:]) != "newA" {
 		t.Fatalf("%q %v", b[:], err)
@@ -138,7 +140,7 @@ func TestColdLaunchOnlyInstallsAutofsForUnboundSlot(t *testing.T) {
 	mounts := []proto.MountSpec{{Type: "disk", Source: "restored", Subpath: "data"}, {Type: "disk", Source: "unbound", Subpath: "output"}, {Type: "disk", Source: "ordinary"}}
 	resolveDiskMounts(mounts, disks, true)
 	for i, m := range mounts {
-		if m.DiskSlot != (i == 1) || m.DiskIndex != i || len(m.DiskDevs) != 1 || m.DiskDevs[0] != guestDevPath(i+1) {
+		if m.DiskSlotDeclared != (i < 2) || m.DiskSlot != (i == 1) || m.DiskIndex != i || len(m.DiskDevs) != 1 || m.DiskDevs[0] != guestDevPath(i+1) {
 			t.Fatalf("mount %d: %+v", i, m)
 		}
 	}

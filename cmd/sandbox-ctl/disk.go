@@ -28,7 +28,6 @@ func runDisk(args []string) error {
 	fs := flag.NewFlagSet("disk "+args[0], flag.ContinueOnError)
 	id := fs.String("path-id", "", "running sandbox path identity")
 	root := fs.String("run-root", os.Getenv("SANDBOX_RUN_ROOT"), "control socket root")
-	expected := fs.String("expected-run", "", "require this running owner")
 	var name, source string
 	loc := config.RefLocations{}
 	if args[0] == "bind" {
@@ -52,7 +51,7 @@ func runDisk(args []string) error {
 	ctx, cancel := commandContext()
 	defer cancel()
 	if args[0] == "list" {
-		report, err := ctl.ListDataDisks(ctx, path, *expected)
+		report, err := ctl.ListDataDisks(ctx, path)
 		if err != nil {
 			return err
 		}
@@ -81,5 +80,5 @@ func runDisk(args []string) error {
 	if err := json.Unmarshal(b, &disk); err != nil {
 		return err
 	}
-	return ctl.BindDisk(ctx, path, ctl.BindDiskRequest{SlotName: name, Disk: disk, RefLocations: loc, ExpectedRun: *expected})
+	return ctl.BindDisk(ctx, path, ctl.BindDiskRequest{SlotName: name, Disk: disk, RefLocations: loc})
 }

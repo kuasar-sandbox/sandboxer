@@ -1,0 +1,98 @@
+From 6d2a6094c22c87ba61c6a031b4a100c4f881c746 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 15 Nov 2026 04:56:36 -0500
+Subject: [PATCH] virtio-devices: refresh empty block capacity on config read
+ and capture
+
+---
+ virtio-devices/src/vhost_user/blk.rs | 51 ++++++++++++++++++++++------
+ 1 file changed, 40 insertions(+), 11 deletions(-)
+
+diff --git a/virtio-devices/src/vhost_user/blk.rs b/virtio-devices/src/vhost_user/blk.rs
+index 895fa2f..c6b40cc 100644
+--- a/virtio-devices/src/vhost_user/blk.rs
++++ b/virtio-devices/src/vhost_user/blk.rs
+@@ -66,19 +66,27 @@ struct BackendReqHandler {
+     irq: Arc<dyn VirtioInterrupt>,
+ }
+ 
++// Keep GET_CONFIG and the cache update ordered across configuration interrupts
++// and guest-initiated reads. Both paths use the same vhost-user connection.
++fn refresh_capacity(
++    vu: &Mutex<VhostUserHandle>,
++    capacity: &Mutex<Capacity>,
++) -> std::io::Result<()> {
++    let mut vu = vu.lock().unwrap();
++    let size = mem::size_of::<VirtioBlockConfig>();
++    let (_, data) = vu
++        .socket_handle()
++        .get_config(0, size as u32, VhostUserConfigFlags::WRITABLE, &vec![0; size])
++        .map_err(std::io::Error::other)?;
++    let cfg = VirtioBlockConfig::from_slice(&data)
++        .ok_or_else(|| std::io::Error::other("invalid vhost-user block configuration"))?;
++    capacity.lock().unwrap().update(cfg.capacity);
++    Ok(())
++}
++
+ impl VhostUserFrontendReqHandler for BackendReqHandler {
+     fn handle_config_change(&self) -> std::io::Result<u64> {
+-        let size = mem::size_of::<VirtioBlockConfig>();
+-        let (_, data) = self
+-            .vu
+-            .lock()
+-            .unwrap()
+-            .socket_handle()
+-            .get_config(0, size as u32, VhostUserConfigFlags::WRITABLE, &vec![0; size])
+-            .map_err(std::io::Error::other)?;
+-        let cfg = VirtioBlockConfig::from_slice(&data)
+-            .ok_or_else(|| std::io::Error::other("invalid vhost-user block configuration"))?;
+-        self.capacity.lock().unwrap().update(cfg.capacity);
++        refresh_capacity(&self.vu, &self.capacity)?;
+         self.irq.trigger(crate::VirtioInterruptType::Config)?;
+         Ok(0)
+     }
+@@ -248,6 +256,20 @@ impl Blk {
+         self.vu_common.acked_protocol_features & VhostUserProtocolFeatures::BACKEND_REQ.bits() != 0
+     }
+ 
++    // A zero-capacity disk may have gained media since the last notification,
++    // including when the reverse request channel was never negotiated.
++    fn refresh_empty_capacity(&self) -> std::io::Result<()> {
++        if self.capacity.lock().unwrap().sectors == 0 {
++            let vu = self
++                .vu_common
++                .vu
++                .as_ref()
++                .ok_or_else(|| std::io::Error::other("missing vhost-user block connection"))?;
++            refresh_capacity(vu, &self.capacity)?;
++        }
++        Ok(())
++    }
++
+     fn current_config(&self) -> (VirtioBlockConfig, u8) {
+         let mut cfg = self.config;
+         let capacity = self.capacity.lock().unwrap();
+@@ -312,6 +334,11 @@ impl VirtioDevice for Blk {
+     }
+ 
+     fn read_config(&self, offset: u64, data: &mut [u8]) {
++        if offset < mem::size_of::<u64>() as u64
++            && let Err(e) = self.refresh_empty_capacity()
++        {
++            error!("Failed reading vhost-user block capacity: {e}");
++        }
+         self.read_config_from_slice(self.current_config().0.as_slice(), offset, data);
+     }
+ 
+@@ -463,6 +490,8 @@ impl Snapshottable for Blk {
+     }
+ 
+     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
++        self.refresh_empty_capacity()
++            .map_err(|e| MigratableError::Snapshot(e.into()))?;
+         self.vu_common.snapshot(&self.state())
+     }
+ }
+-- 
+2.52.0
+

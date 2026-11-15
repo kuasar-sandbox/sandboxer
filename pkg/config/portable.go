@@ -686,7 +686,7 @@ func (p *PortableSandboxConfig) Validate() error {
 	if len(p.Mounts) > MaxPortableMounts {
 		return fmt.Errorf("portable mounts exceeds %d entries", MaxPortableMounts)
 	}
-	if err := validatePortableMounts(p.Mounts, names); err != nil {
+	if err := validatePortableMounts(p.Mounts, names, p.slotNames()); err != nil {
 		return err
 	}
 	if len(p.Files) > MaxPortableFiles {
@@ -896,8 +896,8 @@ func validatePortableRefList(field string, refs []string) error {
 	return nil
 }
 
-func validatePortableMounts(mounts []MountConfig, names map[string]int) error {
-	if err := ValidateMountProjections(mounts); err != nil {
+func validatePortableMounts(mounts []MountConfig, names map[string]int, slots map[string]bool) error {
+	if err := validateMountProjections(mounts, slots); err != nil {
 		return err
 	}
 	mounted := make(map[string]int, len(names))
@@ -1066,18 +1066,17 @@ func (p *PortableSandboxConfig) requiresDiskV2() bool {
 	return false
 }
 
-// DiskCapabilities records the negotiated features a captured Guest depends on.
+// DiskCapabilities records captured Guest features and optional VMM notification support.
 type DiskCapabilities struct {
 	SlotV1         bool `yaml:"disk_slot_v1,omitempty"`
 	ProjectionV1   bool `yaml:"disk_mount_projection_v1,omitempty"`
-	CapacityChange bool `yaml:"vhost_capacity_change,omitempty"`
+	CapacityChange bool `yaml:"vhost_capacity_change,omitempty"` // all dynamic devices negotiated a reverse channel
 }
 
 func (p *PortableSandboxConfig) RequiredDiskCapabilities() (required DiskCapabilities) {
 	for _, d := range p.Boot.Disks {
 		if d.Slot != nil {
 			required.SlotV1 = true
-			required.CapacityChange = required.CapacityChange || d.Slot.Size == nil
 		}
 	}
 	seen := make(map[string]bool)
@@ -1108,7 +1107,7 @@ func (p *PortableSandboxConfig) ValidateCapturedDiskCapabilities() error {
 		return nil
 	}
 	actual := p.Boot.DiskCapabilities
-	if actual == nil || required.CapacityChange && !actual.CapacityChange {
+	if actual == nil {
 		return errors.New("snapshot lacks captured disk capabilities for its topology")
 	}
 	return required.CheckGuest(actual.SlotV1, actual.ProjectionV1)

@@ -1,8 +1,10 @@
 package vhost
 
 import (
-	"context"
+	"encoding/binary"
 	"errors"
+	"net"
+	"os"
 	"syscall"
 	"testing"
 	"time"
@@ -38,49 +40,90 @@ func TestSlotPublicationIsAtomicAndLeavesOtherDevicesAlone(t *testing.T) {
 	}
 }
 
-func TestCapacityHandshakeWaitsForReverseRequestFD(t *testing.T) {
-	server := NewServer("", &memBackend{}, nil)
-	server.EnableCapacityChange()
-	done := make(chan error, 1)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	go func() { done <- server.WaitCapacityChange(ctx) }()
-	set := func(features uint64) {
-		t.Helper()
-		if err := server.handleSetProtocolFeatures(nil, &Message{Payload: minimalProfileU64(features)}); err != nil {
-			t.Fatal(err)
-		}
+func TestSlotGetConfigWithoutCapacityNotifications(t *testing.T) {
+	set := bindingSetForTest(t, BlockDeviceSpec{Slot: true})
+	if err := set.Bind([]Backend{nil}); err != nil {
+		t.Fatal(err)
 	}
-	set(bitBackendRequest | bitProtocolConfig)
-	select {
-	case err := <-done:
-		t.Fatalf("completed before reverse fd arrived: %v", err)
-	default:
+	server := NewServer("", set.DeviceBackends()[0], nil)
+	server.EnableCapacityChange()
+	if err := server.handleSetProtocolFeatures(nil, &Message{Payload: minimalProfileU64(bitProtocolConfig)}); err != nil {
+		t.Fatal(err)
 	}
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer syscall.Close(fds[0])
-	msg := &Message{Header: Header{Request: MsgSetBackendReqFd}, Fds: []int{fds[1]}}
-	if err := server.handle(nil, msg); err != nil {
+	peer := slotTestConn(t, fds[0])
+	conn := slotTestConn(t, fds[1])
+	checkCapacity := func(want uint64) {
+		t.Helper()
+		msg := &Message{Header: Header{Request: MsgGetConfig}, Payload: minimalProfileConfigRequest(0, 8, 0, 8)}
+		if err := server.handle(conn, msg); err != nil {
+			t.Fatal(err)
+		}
+		reply, err := ReadMessage(peer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reply.IsReply() || reply.Header.Request != MsgGetConfig || len(reply.Payload) != 20 {
+			t.Fatalf("unexpected config reply: %+v", reply)
+		}
+		if got := binary.LittleEndian.Uint64(reply.Payload[12:]); got != want {
+			t.Fatalf("GET_CONFIG returned %d sectors, want %d", got, want)
+		}
+	}
+	checkCapacity(0)
+	source := &memBackend{data: make([]byte, 8192)}
+	if err := set.BindSlot(0, source, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-done; err != nil {
+	if err := server.NotifyCapacity(); err != nil {
 		t.Fatal(err)
 	}
-	server.resetConnectionState()
-	set(bitProtocolConfig)
-	if err := server.WaitCapacityChange(ctx); err == nil {
-		t.Fatal("accepted legacy VMM")
-	}
-	server.resetConnectionState()
-	set(bitProtocolConfig | bitBackendRequest)
-	expired, stop := context.WithCancel(context.Background())
-	stop()
-	if err := server.WaitCapacityChange(expired); !errors.Is(err, context.Canceled) {
+	checkCapacity(uint64(source.Size()) / SectorSize)
+}
+
+func TestCapacityNotificationWhenNegotiated(t *testing.T) {
+	server := NewServer("", &memBackend{}, nil)
+	server.EnableCapacityChange()
+	if err := server.handleSetProtocolFeatures(nil, &Message{Payload: minimalProfileU64(bitProtocolConfig | bitBackendRequest)}); err != nil {
 		t.Fatal(err)
 	}
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := slotTestConn(t, fds[0])
+	if err := server.handle(nil, &Message{Header: Header{Request: MsgSetBackendReqFd}, Fds: []int{fds[1]}}); err != nil {
+		t.Fatal(err)
+	}
+	defer server.resetConnectionState()
+	if err := server.NotifyCapacity(); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := ReadMessage(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Header.Request != 2 || msg.Header.Flags != FlagVersion1 || msg.Header.Size != 0 {
+		t.Fatalf("unexpected CONFIG_CHANGE_MSG header: %+v", msg.Header)
+	}
+}
+
+func slotTestConn(t *testing.T, fd int) *net.UnixConn {
+	t.Helper()
+	file := os.NewFile(uintptr(fd), "vhost socketpair")
+	conn, err := net.FileConn(file)
+	file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	return conn.(*net.UnixConn)
 }
 
 func TestBoundRestorePreservesAdvertisedCapacityFeatures(t *testing.T) {

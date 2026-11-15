@@ -455,11 +455,11 @@ func TestMemoryRestoreRequiresCapturedDiskCapabilities(t *testing.T) {
 	p := validPortableConfig()
 	p.Boot.Disks = []PortableDiskConfig{{Name: "data", Slot: &DiskSlotConfig{}}}
 	p.Mounts = []MountConfig{{Type: "disk", Source: "data", Target: "/data", Subpath: "input"}}
-	want := DiskCapabilities{SlotV1: true, ProjectionV1: true, CapacityChange: true}
+	want := DiskCapabilities{SlotV1: true, ProjectionV1: true}
 	if got := p.RequiredDiskCapabilities(); got != want {
 		t.Fatal(got)
 	}
-	for _, actual := range []*DiskCapabilities{nil, {SlotV1: true, CapacityChange: true}, {ProjectionV1: true, CapacityChange: true}, {SlotV1: true, ProjectionV1: true}} {
+	for _, actual := range []*DiskCapabilities{nil, {SlotV1: true, CapacityChange: true}, {ProjectionV1: true, CapacityChange: true}} {
 		p.Boot.DiskCapabilities = actual
 		if err := p.ValidateCapturedDiskCapabilities(); err == nil {
 			t.Fatalf("missing capability accepted: %+v", actual)
@@ -472,6 +472,11 @@ func TestMemoryRestoreRequiresCapturedDiskCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := copy.ValidateCapturedDiskCapabilities(); err != nil {
+		t.Fatal(err)
+	}
+	// Older snapshots may record the optional reverse channel.
+	p.Boot.DiskCapabilities.CapacityChange = true
+	if err := p.ValidateCapturedDiskCapabilities(); err != nil {
 		t.Fatal(err)
 	}
 	fixed := "4GiB"

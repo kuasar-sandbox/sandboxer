@@ -10,6 +10,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -57,6 +58,79 @@ func TestExportDiskIndependentBundleEAndS(t *testing.T) {
 func TestExportDiskStoreEAndS(t *testing.T) {
 	_, st := manifestPublisherFixture(t)
 	compareExportedDisks(t, st, true)
+}
+
+func borrowedDiskBundle(t *testing.T, storage *ProcessStorage) (*ProcessStorage, string, string) {
+	t.Helper()
+	ctx := context.Background()
+	cfg := storage.ManifestConfig()
+	sourceDir := t.TempDir()
+	sink, err := snapshot.NewBundleSink(ctx, sourceDir, "source", cfg, storage.CustomerKeyFunc(), nil)
+	requireDiskIO(t, err)
+	defer sink.Close()
+	const page = 4096
+	parent := bytes.Repeat([]byte{'P'}, 2*page)
+	parentRef, _, err := sink.AbsorbOverlay(ctx, bytes.NewReader(parent), nil)
+	requireDiskIO(t, err)
+	top := bytes.Repeat([]byte{'T'}, 2*page)
+	topRef, _, err := sink.AbsorbOverlay(ctx, bytes.NewReader(top), []sparse.Extent{{Offset: 0, Size: page}})
+	requireDiskIO(t, err)
+	_, portable := publishPortable(t, "")
+	portable.Boot.Disks = []config.PortableDiskConfig{{
+		Name: "work", PortableRootConfig: config.PortableRootConfig{Base: topRef, BaseFromRefs: []string{parentRef}},
+	}}
+	portable.Mounts = append(portable.Mounts, config.MountConfig{Type: "disk", Source: "work", Target: "/work"})
+	body, err := config.MarshalPortableSandboxConfig(portable)
+	requireDiskIO(t, err)
+	source, err := sandboxfile.BuildSource(publishSource(t, make([]byte, page)), nil, body)
+	requireDiskIO(t, err)
+	rootRef, _, err := sink.AbsorbSandbox(ctx, source)
+	requireDiskIO(t, err)
+	requireDiskIO(t, sink.CommitSandbox(ctx, rootRef, ""))
+	requireDiskIO(t, sink.Close())
+
+	rootKey, err := manifest.ParseKeyRef(rootRef)
+	requireDiskIO(t, err)
+	path := filepath.Join(sourceDir, manifest.HexKey(rootKey)+".bundle")
+	bundle, err := storage.OpenFile(ctx, path, manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path})
+	requireDiskIO(t, err)
+	t.Cleanup(func() { requireDiskIO(t, bundle.Close()) })
+	reader := storage.BorrowWithFetcher(bundle.ScopedFetcher())
+	t.Cleanup(func() { requireDiskIO(t, reader.Close()) })
+	return reader, rootRef, sourceDir
+}
+
+func TestExportDiskBorrowedLayersRequireUpload(t *testing.T) {
+	ctx := context.Background()
+	cfg, key := sourceBundleConfig(manifestcrypto.LocalOff)
+	storage, err := NewProcessStorageWithCustomerKey(cfg, func() ([32]byte, error) { return key, nil })
+	requireDiskIO(t, err)
+	defer storage.Close()
+	reader, rootRef, _ := borrowedDiskBundle(t, storage)
+	publisher := newPublisher(reader, nil, nil, nil)
+	err = publisher.withDiskTable(ctx, ExportDiskRequest{SourceRef: rootRef}, func(cfg *config.PortableSandboxConfig, cp *sandboxfile.Checkpoint, scope publishScope) error {
+		layers, err := publisher.openSavedDisk(ctx, cfg, cp, scope, "work")
+		requireDiskIO(t, err)
+		defer closeDiskLayers(layers)
+		if len(layers) != 2 || layers[0].portable != "" || layers[1].portable != "" {
+			t.Fatal("source Bundle layer was marked present in destination Store")
+		}
+		return nil
+	})
+	requireDiskIO(t, err)
+}
+
+func TestExportDiskUploadsLayersFromBorrowedBundle(t *testing.T) {
+	_, storage := manifestPublisherFixture(t)
+	reader, rootRef, sourceDir := borrowedDiskBundle(t, storage)
+	disk, err := reader.ExportDisk(context.Background(), ExportDiskRequest{SourceRef: rootRef, DiskName: "work", Upload: true})
+	requireDiskIO(t, err)
+	requireDiskIO(t, os.RemoveAll(sourceDir))
+	const page = 4096
+	got := readExportedDisk(t, storage, disk)
+	if !bytes.Equal(got[:page], bytes.Repeat([]byte{'P'}, page)) || !bytes.Equal(got[page:], bytes.Repeat([]byte{'T'}, page)) {
+		t.Fatal("exported disk lost its inherited or written page")
+	}
 }
 
 func compareExportedDisks(t *testing.T, st *ProcessStorage, upload bool) {

@@ -113,6 +113,9 @@ func PrepareSandboxEConfig(
 	if cfg == nil {
 		return nil, errors.New("Sandbox E assembly config is nil")
 	}
+	if err := config.ValidateMountPaths(cfg.Mounts); err != nil {
+		return nil, err
+	}
 	imageDefaults, err := LoadImageConfigBytes(imageConfig)
 	if err != nil {
 		return nil, fmt.Errorf("Sandbox E config.json: %w", err)

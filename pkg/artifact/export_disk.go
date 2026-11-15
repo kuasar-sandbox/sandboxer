@@ -178,17 +178,20 @@ func (p *Publisher) openSavedDisk(ctx context.Context, cfg *config.PortableSandb
 			}
 			ref, _ := manifest.ParseRef(raw)
 			layer := savedDiskLayer{Stream: st}
+			// A manifest name may resolve through a borrowed Bundle, even
+			// when the root was opened by manifest ID rather than file path.
+			if ref.Scheme == manifest.RefSchemeManifest && p.storage.fetcher != nil && scope.fetcher == p.storage.fetcher {
+				layer.portable = raw
+			}
 			if !disk.PureBlock {
 				payload, wrapped, e := sandboxfile.PayloadIfSandbox(ctx, st, ref.Scheme == manifest.RefSchemeFile && filepath.Ext(ref.Path) == ".sandbox")
 				if e != nil {
 					return layers, e
 				}
 				layer.Stream = payload
-				if !wrapped && scope.current == nil && ref.Scheme == manifest.RefSchemeManifest {
-					layer.portable = raw
+				if wrapped {
+					layer.portable = ""
 				}
-			} else if scope.current == nil && ref.Scheme == manifest.RefSchemeManifest {
-				layer.portable = raw
 			}
 			layers = append(layers, layer)
 		}

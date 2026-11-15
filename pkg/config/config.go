@@ -758,6 +758,9 @@ func LoadMerged(paths []string) (*SandboxConfig, error) {
 			return nil, fmt.Errorf("sandbox: parse %s: %w", p, err)
 		}
 	}
+	if err := ValidateMountPaths(cfg.Mounts); err != nil {
+		return nil, err
+	}
 	cfg.ApplyDefaults()
 	return &cfg, nil
 }
@@ -769,6 +772,9 @@ func LoadConfigBytes(data []byte) (*SandboxConfig, error) {
 	var cfg SandboxConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("sandbox: parse config bytes: %w", err)
+	}
+	if err := ValidateMountPaths(cfg.Mounts); err != nil {
+		return nil, err
 	}
 	cfg.ApplyDefaults()
 	return &cfg, nil
@@ -1598,7 +1604,7 @@ func (c *SandboxConfig) validateDisks(cold bool) error {
 	// with the data disks already mounted (in the memory image); the restore
 	// host yaml lists boot.disks[] for device order + erofs bases but does not
 	// re-mount, so it need not carry the mounts[].
-	if err := ValidateMountProjections(c.Mounts); err != nil {
+	if err := c.ValidateMountTopology(c.Mounts); err != nil {
 		return err
 	}
 	if !cold {
