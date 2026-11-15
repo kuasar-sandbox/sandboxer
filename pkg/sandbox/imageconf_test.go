@@ -126,12 +126,36 @@ func TestMaterializeImageDefaultsMakesPortableWorkloadSelfContained(t *testing.T
 	}
 }
 
-func TestEffectiveMountsRetainImageVolumeSemantics(t *testing.T) {
-	explicit := []config.MountConfig{{Type: "empty", Target: "/cache/."}, {Type: "disk", Source: "work", Target: "/work"}}
-	volumes := map[string]struct{}{"/cache": {}, "/work/.": {}, "/work/cache": {}}
-	disks := []config.DiskConfig{{Name: "work", Slot: &config.DiskSlotConfig{}}}
-	mounts := effectiveMounts(explicit, volumes, disks)
-	if len(mounts) != 4 || mounts[2].Target != "/cache" || mounts[3].Target != "/work/cache" {
-		t.Fatalf("expected original non-slot comparison and slot precedence: %+v", mounts)
+func TestEffectiveMountsPreserveExplicitVolumePrecedence(t *testing.T) {
+	disks := []config.DiskConfig{{Name: "ordinary"}, {Name: "slot", Slot: &config.DiskSlotConfig{}}}
+	for _, tc := range []struct {
+		name, mountType, source, target, volume string
+		keepVolume                              bool
+	}{
+		{"ordinary disk trailing slash", "disk", "ordinary", "/data/", "/data", false},
+		{"ordinary disk repeated slash", "disk", "ordinary", "/work//data", "/work/data//", false},
+		{"ordinary tmpfs dot spelling", "tmpfs", "", "/cache/.", "/cache", false},
+		{"ordinary empty with parent in image volume", "empty", "", "/data", "/link/../data", false},
+		{"ordinary saved target with parent", "disk", "ordinary", "/link/../data", "/data", false},
+		{"slot redundant separators", "disk", "slot", "/work//disk", "/work/disk/.", false},
+		{"slot ancestor is not the same volume", "disk", "slot", "/data", "/data/cache", true},
+		{"slot parent in image volume needs guest resolution", "disk", "slot", "/data", "/link/../data", true},
+		{"slot precedes same original spelling", "disk", "slot", "/link/../data", "/link/../data", false},
+		{"slot saved target with parent needs guest resolution", "disk", "slot", "/link/../data", "/data", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			explicit := config.MountConfig{Type: tc.mountType, Source: tc.source, Target: tc.target}
+			got := effectiveMounts([]config.MountConfig{explicit}, map[string]struct{}{tc.volume: {}}, disks)
+			if len(got) == 0 || got[0].Type != tc.mountType || got[0].Target != tc.target || got[0].Source != tc.source {
+				t.Fatalf("explicit mount was lost or rewritten: %+v", got)
+			}
+			if tc.keepVolume {
+				if len(got) != 2 || got[1].Type != "empty" || got[1].Target != tc.volume {
+					t.Fatalf("image volume should remain: %+v", got)
+				}
+			} else if len(got) != 1 {
+				t.Fatalf("image volume should yield to the explicit mount: %+v", got)
+			}
+		})
 	}
 }
