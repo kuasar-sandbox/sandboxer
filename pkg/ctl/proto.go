@@ -38,7 +38,6 @@ import (
 // are populated.
 type Request struct {
 	BodyBytes       int                 `json:"body_bytes,omitempty"`
-	ExpectedRun     string              `json:"expected_run,omitempty"`
 	UsageHistory    bool                `json:"usage_history,omitempty"`
 	UsageCursor     int64               `json:"usage_cursor,omitempty,string"`
 	UsageLimit      int                 `json:"usage_limit,omitempty"`

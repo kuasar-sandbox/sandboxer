@@ -25,7 +25,6 @@ type BindDiskRequest struct {
 	SlotName     string              `json:"slot_name"`
 	Disk         config.DiskV1       `json:"disk"`
 	RefLocations config.RefLocations `json:"ref_locations,omitempty"`
-	ExpectedRun  string              `json:"expected_run,omitempty"`
 }
 
 type DiskState struct {
@@ -36,7 +35,6 @@ type DiskState struct {
 }
 
 type DiskStateReport struct {
-	RunID string      `json:"run_id"`
 	Disks []DiskState `json:"disks"`
 }
 
@@ -91,21 +89,21 @@ func BindDisk(ctx context.Context, path string, req BindDiskRequest) error {
 	return err
 }
 
-func ListDataDisks(ctx context.Context, path, expectedRun string) (DiskStateReport, error) {
+func ListDataDisks(ctx context.Context, path string) (DiskStateReport, error) {
 	conn, close, err := dialContext(ctx, path)
 	if err != nil {
 		return DiskStateReport{}, err
 	}
 	defer close()
-	if err := WriteMessage(conn, Request{Type: TypeDiskList, ExpectedRun: expectedRun}); err != nil {
+	if err := WriteMessage(conn, Request{Type: TypeDiskList}); err != nil {
 		return DiskStateReport{}, err
 	}
 	resp, err := diskResponse(conn, TypeDiskListDone)
 	if err != nil {
 		return DiskStateReport{}, err
 	}
-	if resp.DiskState == nil || resp.DiskState.RunID == "" || expectedRun != "" && resp.DiskState.RunID != expectedRun {
-		return DiskStateReport{}, errors.New("ctl: invalid disk state or owner mismatch")
+	if resp.DiskState == nil {
+		return DiskStateReport{}, errors.New("ctl: missing disk state")
 	}
 	return *resp.DiskState, nil
 }
@@ -116,7 +114,7 @@ func (s *Server) serveDisk(conn net.Conn, req Request) error {
 		if s.DiskListHandler == nil {
 			return fmt.Errorf("%w: disk list unavailable", ErrDiskUnsupported)
 		}
-		report, err := s.DiskListHandler(req.ExpectedRun)
+		report, err := s.DiskListHandler()
 		if err != nil {
 			return err
 		}

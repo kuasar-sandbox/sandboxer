@@ -570,7 +570,7 @@ func checkDiskMountSupport(hello *proto.Message, spec *proto.LaunchSpec) error {
 		if m.Type != "disk" {
 			continue
 		}
-		if m.DiskSlot && !hello.DiskSlotV1 {
+		if (m.DiskSlot || m.DiskSlotDeclared) && !hello.DiskSlotV1 {
 			return errors.New("guest does not support disk_slot_v1")
 		}
 		if (seen[m.DiskIndex] || m.Subpath != "") && !hello.DiskMountProjectionV1 {

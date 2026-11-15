@@ -558,3 +558,17 @@ func TestDeferredStopJoinsBlockedLaunchAck(t *testing.T) {
 		t.Fatal("unbounded launch_ack read stranded cleanup")
 	}
 }
+
+func TestBoundSlotRequiresGuestSupportBeforeColdLaunch(t *testing.T) {
+	spec := &proto.LaunchSpec{Mounts: []proto.MountSpec{{Type: "disk", DiskSlotDeclared: true}}}
+	if err := checkDiskMountSupport(&proto.Message{}, spec); err == nil {
+		t.Fatal("legacy guest cannot check a bound slot target")
+	}
+	if err := checkDiskMountSupport(&proto.Message{DiskSlotV1: true}, spec); err != nil {
+		t.Fatal(err)
+	}
+	spec.Mounts[0].DiskSlotDeclared = false
+	if err := checkDiskMountSupport(&proto.Message{}, spec); err != nil {
+		t.Fatalf("ordinary whole disk: %v", err)
+	}
+}

@@ -125,3 +125,13 @@ func TestMaterializeImageDefaultsMakesPortableWorkloadSelfContained(t *testing.T
 		t.Fatalf("materialization is not idempotent: launch=%#v mounts=%#v", cfg.Launch, cfg.Mounts)
 	}
 }
+
+func TestEffectiveMountsRetainImageVolumeSemantics(t *testing.T) {
+	explicit := []config.MountConfig{{Type: "empty", Target: "/cache/."}, {Type: "disk", Source: "work", Target: "/work"}}
+	volumes := map[string]struct{}{"/cache": {}, "/work/.": {}, "/work/cache": {}}
+	disks := []config.DiskConfig{{Name: "work", Slot: &config.DiskSlotConfig{}}}
+	mounts := effectiveMounts(explicit, volumes, disks)
+	if len(mounts) != 4 || mounts[2].Target != "/cache" || mounts[3].Target != "/work/cache" {
+		t.Fatalf("expected original non-slot comparison and slot precedence: %+v", mounts)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"path"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
@@ -71,7 +72,7 @@ func MaterializeImageDefaults(cfg *config.SandboxConfig, image *ImageConfig) err
 	}
 	cfg.Launch.EphemeralEnv = eph
 
-	mounts := effectiveMounts(cfg.Mounts, imageVolumes(image))
+	mounts := effectiveMounts(cfg.Mounts, imageVolumes(image), cfg.Boot.Disks)
 	cfg.Mounts = make([]config.MountConfig, len(mounts))
 	for i := range mounts {
 		cfg.Mounts[i] = config.MountConfig{
@@ -314,21 +315,29 @@ func MergeLaunch(image *ImageConfig, override config.LaunchConfig) (*proto.Launc
 
 // effectiveMounts converts config mounts and merges image Volumes as
 // implicit empty mounts (explicit config wins on the same target).
-func effectiveMounts(mounts []config.MountConfig, volumes map[string]struct{}) []proto.MountSpec {
+func effectiveMounts(mounts []config.MountConfig, volumes map[string]struct{}, disks []config.DiskConfig) []proto.MountSpec {
 	out := make([]proto.MountSpec, 0, len(mounts)+len(volumes))
 	seen := make(map[string]struct{}, len(mounts))
+	slotTargets := make(map[string]bool)
+	slots := make(map[string]bool)
+	for _, disk := range disks {
+		slots[disk.Name] = disk.Slot != nil
+	}
 	for _, m := range mounts {
 		t := m.Type
 		if t == "" {
 			t = "empty"
 		}
 		out = append(out, proto.MountSpec{Target: m.Target, Type: t, Source: m.Source, Subpath: m.Subpath, Options: m.Options})
-		seen[path.Clean(m.Target)] = struct{}{}
+		seen[m.Target] = struct{}{}
+		if m.Type == "disk" && slots[m.Source] && !strings.Contains("/"+m.Target+"/", "/../") {
+			slotTargets[path.Clean(m.Target)] = true
+		}
 	}
 	// Deterministic order for image Volumes.
 	vols := make([]string, 0, len(volumes))
 	for v := range volumes {
-		if _, ok := seen[path.Clean(v)]; ok {
+		if _, ok := seen[v]; ok || !strings.Contains("/"+v+"/", "/../") && slotTargets[path.Clean(v)] {
 			continue
 		}
 		vols = append(vols, v)

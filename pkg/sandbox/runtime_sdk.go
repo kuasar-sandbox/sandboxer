@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -155,13 +156,11 @@ type runtimeOwnedDisk struct {
 type Runtime struct {
 	diskSnapshot  *SnapshotHandler
 	diskLaunch    LaunchSpec
-	diskRunID     string
 	diskInventory []diskEntry
 	diskStateMu   sync.RWMutex
 	diskBackends  *vhost.BackendSet // includes restored devices
 	diskCache     *diffstore.Cache  // may be borrowed on restore
 	diskStorage   *artifact.ProcessStorage
-	diskBindGuest func(context.Context, proto.DiskBinding) error
 	diskFatal     func(error)
 	diskOwned     []runtimeOwnedDisk // writers created by BindDisk
 
@@ -517,9 +516,6 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 			case <-pc.Ctx.Done():
 				return pc.Ctx.Err()
 			}
-			if err := pc.CheckDiskCapabilities(); err != nil {
-				return err
-			}
 			pc.Pinger.Start(pc.Ctx)
 			if hooks.Enabled() {
 				hooks.StartHeartbeat(pc.Ctx, 5*time.Second)
@@ -600,6 +596,11 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	cfg, err := spec.config(r.spec.config())
 	if err != nil {
 		return err
+	}
+	if spec.SourceBinding == nil && spec.PortableConfig == nil {
+		if err := config.ValidateMountPaths(cfg.Mounts); err != nil {
+			return err
+		}
 	}
 	if err := cfg.ValidateCold(); err != nil && spec.SourceBinding == nil {
 		return err
@@ -822,13 +823,16 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if err != nil {
 		return fail(err)
 	}
-	// Retain only guarantees actually required and verified for this launch.
+	// Record the verified Guest features and the current VMM negotiation.
 	// Old single-mount E artifacts stay byte-compatible.
 	required := portable.RequiredDiskCapabilities()
 	portable.Boot.DiskCapabilities = nil
 	if required != (config.DiskCapabilities{}) {
 		if err := required.CheckGuest(r.launch.DiskCapabilities()); err != nil {
 			return fail(err)
+		}
+		if required.SlotV1 {
+			required.CapacityChange = r.capturedCapacityChange()
 		}
 		portable.Boot.DiskCapabilities = &required
 	}
@@ -1051,12 +1055,12 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	ls.InitialLaunchToken = r.initialLaunchToken
 	ls.Ext4Discard = discardMode
 	ls.Network = netSpec
-	ls.Mounts = effectiveMounts(cfg.Mounts, imageCfg.Volumes)
+	ls.Mounts = effectiveMounts(cfg.Mounts, imageCfg.Volumes, cfg.Boot.Disks)
 	projections := make([]config.MountConfig, len(ls.Mounts))
 	for i, m := range ls.Mounts {
 		projections[i] = config.MountConfig{Type: m.Type, Target: m.Target, Source: m.Source, Subpath: m.Subpath}
 	}
-	if err := config.ValidateMountProjections(projections); err != nil {
+	if err := cfg.ValidateMountTopology(projections); err != nil {
 		return fail(err)
 	}
 	ls.Files = cfg.ProtoFiles()
@@ -1070,7 +1074,9 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	}
 	// The new host has validated the effective projections, including OCI
 	// volumes. Ask the guest to enforce the same rules after resolving aliases.
-	ls.DiskMountProjectionV1 = len(cfg.Boot.Disks) != 0
+	// Reserve the old strict flag for guests that cannot distinguish a
+	// previously bound slot from an ordinary disk.
+	ls.DiskMountProjectionV1 = slices.ContainsFunc(cfg.Boot.Disks, func(d config.DiskConfig) bool { return d.Slot != nil && d.Binding != nil })
 	resolveDiskMounts(ls.Mounts, cfg.Boot.Disks, cfg.SingleDisk())
 	if _, err := config.WritePortableSandboxConfig(r.runDir, portable); err != nil {
 		return fail(err)

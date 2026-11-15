@@ -197,7 +197,7 @@ Lower chain 要求 base。冷启动的可写 ext4 设备需要可挂载 base/tem
 
 ### 延迟绑定与子目录挂载
 
-以下配置为 `input` 保留一个 virtio-blk 设备。Guest 在启动时建立 autofs 挂载点。绑定前访问目录返回可重试错误，绑定后第一次访问时挂载 ext4 并投影对应子目录。普通 single/overlay 数据盘也使用同一组 `mounts`。不同目标路径之间，以及同一盘的源子目录之间，均须互不重叠。
+以下配置为 `input` 保留一个 virtio-blk 设备。Guest 在启动时建立 autofs 挂载点。绑定前访问目录返回可重试错误，绑定后第一次访问时挂载 ext4 并投影对应子目录。普通 single/overlay 数据盘也使用同一组 `mounts`。slot 的目标与其他有效挂载不能重叠，同一 slot 投影的源目录也不能重叠。其余挂载沿用既有顺序。新挂载声明中的 `target` 和 `subpath` 遇到 `.` 或 `..` 路径分量会报错，省略 `subpath` 或使用空串表示整盘根。
 ```yaml
 boot:
   disks:
@@ -208,7 +208,7 @@ mounts:
   - {type: disk, source: input, subpath: results, target: /out}
 ```
 
-省略 `slot.size` 时，盘位在绑定后采用来源容量。指定时，容量必须与来源完全匹配。列出目标实例的盘位后，可以导出已保存 E 或 S 中的一块盘，将完整 JSON 交给另一个实例。整机 checkpoint 也支持此导出命令。
+省略 `slot.size` 时，盘位在绑定后采用来源容量。指定时，容量必须与来源完全匹配。Host 接入块后端并提交盘记录时，绑定完成。随后捕获的快照包含已绑定的盘。Guest 在首次访问时挂载文件系统。列出目标实例的盘位后，可以导出已保存 E 或 S 中的一块盘，将完整 JSON 交给另一个实例。整机 checkpoint 也支持此导出命令。
 ```bash
 sandbox-ctl disk list --path-id receiver
 sandbox-ctl export --source-ref "$PAUSED_E" --disk work --output "$OUT" > work.disk.json

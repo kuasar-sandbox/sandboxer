@@ -32,6 +32,11 @@ func ApplyFromRules(artifact *PortableSandboxConfig, host *SandboxConfig, presen
 	if err := artifact.Validate(); err != nil {
 		return nil, nil, err
 	}
+	if options.ReplaceBoot && presence.Has("mounts") {
+		if err := ValidateMountPaths(host.Mounts); err != nil {
+			return nil, nil, err
+		}
+	}
 	if !options.ReplaceBoot {
 		if err := validateFromProtectedFields(artifact, host, presence); err != nil {
 			return nil, nil, err
@@ -198,7 +203,7 @@ func validateFromProtectedFields(artifact *PortableSandboxConfig, host *SandboxC
 		return errors.New("run --from: boot.cmdline is owned by the Sandbox artifact")
 	}
 	if presence.Has("mounts") {
-		if err := validateFromDiskMountTopology(artifact.Mounts, host.Mounts); err != nil {
+		if err := validateFromDiskMountTopology(artifact.Mounts, host.Mounts, artifact.slotNames()); err != nil {
 			return err
 		}
 	}
@@ -252,8 +257,11 @@ func validateFromProtectedFields(artifact *PortableSandboxConfig, host *SandboxC
 	return nil
 }
 
-func validateFromDiskMountTopology(artifactMounts, hostMounts []MountConfig) error {
-	if err := ValidateMountProjections(hostMounts); err != nil {
+func validateFromDiskMountTopology(artifactMounts, hostMounts []MountConfig, slots map[string]bool) error {
+	if err := ValidateMountPaths(hostMounts); err != nil {
+		return err
+	}
+	if err := validateMountProjections(hostMounts, slots); err != nil {
 		return fmt.Errorf("artifact-owned data-disk mount topology: %w", err)
 	}
 	type diskMount struct {
@@ -265,7 +273,11 @@ func validateFromDiskMountTopology(artifactMounts, hostMounts []MountConfig) err
 		result := make([]diskMount, 0, len(mounts))
 		for _, mount := range mounts {
 			if mount.Type == "disk" {
-				result = append(result, diskMount{source: mount.Source, target: path.Clean(mount.Target), subpath: path.Clean(mount.Subpath)})
+				target := mount.Target
+				if !hasParentComponent(target) {
+					target = path.Clean(target)
+				}
+				result = append(result, diskMount{source: mount.Source, target: target, subpath: path.Clean(mount.Subpath)})
 			}
 		}
 		return result

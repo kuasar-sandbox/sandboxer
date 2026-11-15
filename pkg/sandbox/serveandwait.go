@@ -80,8 +80,6 @@ type CmdEnv struct {
 //     continues into the normal graceful CH shutdown/escalation path while
 //     backend services remain on their separate VM lifecycle context.
 type PostSpawnCtx struct {
-	CheckDiskCapabilities func() error
-
 	Ctx          context.Context
 	Cmd          *exec.Cmd
 	Pinger       *guestlink.Pinger
@@ -878,19 +876,6 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		r := diskOwner
 		r.diskSnapshot = snapHandler
 		r.diskFatal = reportReadFatal
-		r.diskBindGuest = func(ctx context.Context, bind proto.DiskBinding) error {
-			m, err := pinger.Client.RoundTripContext(ctx, &proto.Message{Type: proto.TypeDiskBind, DiskBind: &bind}, pingTO)
-			if err != nil {
-				return err
-			}
-			if m.Type == proto.TypeError {
-				return errors.New(m.Msg)
-			}
-			if m.Type != proto.TypeDiskBindAck || m.DiskBind == nil || *m.DiskBind != bind {
-				return errors.New("invalid guest disk bind ACK")
-			}
-			return nil
-		}
 		if restoreSet != nil {
 			r.spec.Disks = restoredShapes
 			r.spec.CurrentRun = p.DiskCurrentRun
@@ -907,7 +892,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			r.initDiskInventory(p.SnapCfg, p.Disks)
 		}
 		ctlSrv.DiskBindHandler = func(req ctl.BindDiskRequest) error { return r.BindDisk(backendCtx, req) }
-		ctlSrv.DiskListHandler = func(expected string) (ctl.DiskStateReport, error) { return r.listDataDisks(backendCtx, expected) }
+		ctlSrv.DiskListHandler = func() (ctl.DiskStateReport, error) { return r.ListDataDisks(backendCtx) }
 		defer func() {
 			cancelBackends()
 			r.markExiting()
@@ -1211,32 +1196,17 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 	})
 
-	// Once Guest Hello or CH's restored Paused state confirms initialization,
-	// all queue setup commands have been issued. Give the backend time to
-	// consume the last one; older restore frontends can replay protocol bits
-	// from a newer S without ever installing the reverse request channel.
-	checkDiskCapabilities := func() error {
-		ctx, cancel := context.WithTimeout(postSpawnCtx, 2*time.Second)
-		defer cancel()
-		for i, server := range servers {
-			if err := server.WaitCapacityChange(ctx); err != nil {
-				return fmt.Errorf("disk device %d: %w", i, err)
-			}
-		}
-		return nil
-	}
 	if err := p.PostSpawn(PostSpawnCtx{
-		CheckDiskCapabilities: checkDiskCapabilities,
-		Ctx:                   postSpawnCtx,
-		Cmd:                   cmd,
-		Pinger:                pinger,
-		Launch:                launch,
-		EstablishMUX:          establishMUX,
-		Hooks:                 p.Hooks,
-		Memory:                p.Memory,
-		CHSock:                chSock,
-		Logf:                  logf,
-		NotifyReady:           notifyReady,
+		Ctx:          postSpawnCtx,
+		Cmd:          cmd,
+		Pinger:       pinger,
+		Launch:       launch,
+		EstablishMUX: establishMUX,
+		Hooks:        p.Hooks,
+		Memory:       p.Memory,
+		CHSock:       chSock,
+		Logf:         logf,
+		NotifyReady:  notifyReady,
 	}); err != nil {
 		if readFatal() != nil || !runShutdownRequested(p.Ctx) {
 			_ = cmd.Process.Kill()

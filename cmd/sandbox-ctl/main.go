@@ -128,8 +128,8 @@ Usage:
   sandbox-ctl export    --source-ref <saved-E-or-S> --disk <name> (--output <dir> | --upload)
                         [--source-dir <dir>] [--manifest-config <file>] [--ref-location name=file:///path]
   sandbox-ctl disk bind --path-id <leaf> --disk <name> --disk-spec <file|->
-                        [--ref-location name=file:///path] [--expected-run <run-id>]
-  sandbox-ctl disk list --path-id <leaf> [--expected-run <run-id>]
+                        [--ref-location name=file:///path]
+  sandbox-ctl disk list --path-id <leaf>
   sandbox-ctl checkpoint list|delete (--sandbox-id <sid> | --checkpoint-dir <dir>)
   sandbox-ctl checkpoint gc --checkpoint-dir <dir> [--json]
                         [--path-id <leaf>] [--checkpoint <ID>] [--diff-id <ID> ...] [--json]

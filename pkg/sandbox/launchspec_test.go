@@ -86,7 +86,7 @@ func TestEffectiveMounts_VolumesMerge(t *testing.T) {
 		{Target: "/data", Type: ""}, // default → empty
 	}
 	vols := map[string]struct{}{"/var/log": {}, "/data": {}} // /data dup with explicit
-	got := effectiveMounts(mounts, vols)
+	got := effectiveMounts(mounts, vols, nil)
 
 	byTarget := map[string]MountSpecView{}
 	for _, m := range got {

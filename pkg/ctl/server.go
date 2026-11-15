@@ -17,7 +17,7 @@ import (
 // so concurrent snapshot/exec requests don't block each other.
 type Server struct {
 	DiskBindHandler         func(BindDiskRequest) error
-	DiskListHandler         func(string) (DiskStateReport, error)
+	DiskListHandler         func() (DiskStateReport, error)
 	Path                    string
 	CheckpointListHandler   func(Request) ([]DiffCheckpointRef, error)
 	CheckpointDeleteHandler func(Request) error
