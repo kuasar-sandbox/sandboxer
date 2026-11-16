@@ -828,3 +828,80 @@ func TestCOWCacheRejectsInvalidOwnershipAndSizes(t *testing.T) {
 		t.Fatalf("closed cache attach: %v", err)
 	}
 }
+
+// The logical cache budget can change without replacing the shared worker or
+// dropping clean data that remains inside the new budget.
+func TestCOWCacheElasticCapacityGrowAndShrink(t *testing.T) {
+	cache, err := NewElasticCache(4*cowBlockSize, 4*cowBlockSize, 2*cowBlockSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cache.Close() })
+	cow := cachedCOW(t, cache, 6, nil)
+	if got := cache.Stats(); got.Capacity != 2*cowBlockSize || got.MaxDirty != 2*cowBlockSize {
+		t.Fatalf("initial budget: %+v", got)
+	}
+	writePage(t, cow, 0, 0x11)
+	writePage(t, cow, 1, 0x22)
+	if err := cow.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := cache.TryResizeCapacity(4 * cowBlockSize); err != nil || !ok {
+		t.Fatalf("grow: %v, %v", ok, err)
+	}
+	writePage(t, cow, 2, 0x33)
+	writePage(t, cow, 3, 0x44)
+	if err := cow.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	checkRead(t, cow, 0, bytes.Repeat([]byte{0x11}, cowBlockSize))
+	if ok, err := cache.TryResizeCapacity(2 * cowBlockSize); err != nil || !ok {
+		t.Fatalf("shrink clean: %v, %v", ok, err)
+	}
+	if got := cache.Stats(); got.Capacity != 2*cowBlockSize || got.MaxDirty != 2*cowBlockSize || got.Used > 2*cowBlockSize {
+		t.Fatalf("shrunk budget: %+v", got)
+	}
+	for i, value := range []byte{0x11, 0x22, 0x33, 0x44} {
+		checkRead(t, cow, i, bytes.Repeat([]byte{value}, cowBlockSize))
+	}
+	for _, n := range []uint64{0, 1, 5 * cowBlockSize, 4097} {
+		if ok, err := cache.TryResizeCapacity(n); err == nil || ok {
+			t.Fatalf("accepted invalid capacity %d: %v, %v", n, ok, err)
+		}
+	}
+}
+
+func TestCOWCacheElasticCapacityRefusesBusyShrink(t *testing.T) {
+	gate := newWorkerGate()
+	defer gate.open()
+	// Freeze the writer so dirty and writeback pages cannot be evicted.
+	cache, err := newCache(4*cowBlockSize, 4*cowBlockSize, cacheHooks{beforeWrite: func([]*cachePage) error {
+		gate.wait()
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cache.Close() })
+	cow := cachedCOW(t, cache, 4, nil)
+	writePage(t, cow, 0, 0x51)
+	awaitSignal(t, gate.entered)
+	writePage(t, cow, 1, 0x52)
+	writePage(t, cow, 2, 0x53)
+	if ok, err := cache.TryResizeCapacity(2 * cowBlockSize); err != nil || ok {
+		t.Fatalf("shrink must wait for frozen/dirty pages: %v, %v", ok, err)
+	}
+	if got := cache.Stats(); got.Capacity != 4*cowBlockSize || got.Used != 3*cowBlockSize {
+		t.Fatalf("failed shrink changed quota or dropped dirty pages: %+v", got)
+	}
+	gate.open()
+	if err := cow.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := cache.TryResizeCapacity(2 * cowBlockSize); err != nil || !ok {
+		t.Fatalf("shrink after writeback: %v, %v", ok, err)
+	}
+	for i, value := range []byte{0x51, 0x52, 0x53} {
+		checkRead(t, cow, i, bytes.Repeat([]byte{value}, cowBlockSize))
+	}
+}
