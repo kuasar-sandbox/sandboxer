@@ -210,7 +210,7 @@ mounts:
 
 省略 `slot.size` 时，盘位在绑定后采用来源容量。指定时，容量必须与来源完全匹配。Host 接入块后端并提交盘记录时，绑定完成。随后捕获的快照包含已绑定的盘。
 
-动态盘位（`slot: {}`）的初始容量为零。若 VMM 没有主动通知容量变化，它必须在查询时返回已绑定盘的实际容量，Guest 内核也必须在打开块设备时刷新容量。项目提供的 Guest 内核已包含对应的 virtio-blk 补丁。缺少等效的刷新能力时，`disk bind` 可以成功，但首次访问目录可能失败。若自定义内核缺少这项能力或无法确认，建议使用 `slot: {size: 8GiB}` 等固定容量盘位，并接入等大的盘。[Guest 内核补丁](https://github.com/kuasar-sandbox/guest-runtime/pull/134)
+动态盘位（`slot: {}`）的初始容量为零。若 VMM 没有主动通知容量变化，它必须在查询时返回已绑定盘的实际容量，Guest 内核也必须在打开块设备时刷新容量。实际运行的 Guest `vmlinux` 须包含 guest-runtime #134 的 virtio-blk 补丁或具备等效能力。缺少这项能力时，`disk bind` 可以成功，但首次访问目录可能失败。使用项目旧版内核、平台提供的内核、自编译内核，或无法确认内核是否支持时，建议使用 `slot: {size: 8GiB}` 等固定容量盘位，并接入等大的盘。[Guest 内核补丁](https://github.com/kuasar-sandbox/guest-runtime/pull/134)
 
 列出目标实例的盘位后，可以导出已保存 E 或 S 中的一块盘，将完整 JSON 交给另一个实例。整机 checkpoint 也支持此导出命令。
 ```bash
