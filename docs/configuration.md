@@ -219,7 +219,7 @@ See [capacity and migration](#disk-capacity).
 
 ### Late binding and directory projections
 
-This configuration reserves a virtio-blk device named `input`. The guest installs autofs triggers at launch. Access before binding returns a retryable error. First access after binding mounts ext4 and projects the requested directory. Ordinary single-device and overlay data disks use the same mount syntax. A slot target must be disjoint from every other effective mount. Source directories projected from the same slot must also be disjoint. Other mounts retain their existing ordering. New mount declarations reject `.` and `..` path components in `target` and `subpath`. Omit `subpath` or use an empty string to project the whole disk.
+This configuration reserves a virtio-blk device named `input`. Both fixed and dynamic unbound slots require autofs in the guest kernel for first-access mounting. A guest without autofs cannot use these slots. Access before binding returns a retryable error. First access after binding mounts ext4 and projects the requested directory. Ordinary single-device and overlay data disks use the same mount syntax. A slot target must be disjoint from every other effective mount. Source directories projected from the same slot must also be disjoint. Other mounts retain their existing ordering. New mount declarations reject `.` and `..` path components in `target` and `subpath`. Omit `subpath` or use an empty string to project the whole disk.
 ```yaml
 boot:
   disks:
@@ -230,7 +230,11 @@ mounts:
   - {type: disk, source: input, subpath: results, target: /out}
 ```
 
-A slot with omitted `size` adopts the source capacity at bind time. A declared size must match the source exactly. The host completes a bind when it has committed the backend and its disk record. A subsequent capture includes the bound medium. The guest handles filesystem mounting on first access. List the receiver’s disks, export a complete disk definition from a committed E or S, then bind it on the receiver. The same export command accepts a saved whole-machine checkpoint.
+A slot with omitted `size` adopts the source capacity at bind time. A declared size must match the source exactly. The host completes a bind when it has committed the backend and its disk record. A subsequent capture includes the bound medium.
+
+A dynamic slot (`slot: {}`) initially reports zero capacity. If the VMM sends no capacity-change notification, it must report the bound disk’s capacity on request, and the guest kernel must refresh capacity when the disk opens. The project guest kernel includes the virtio-blk patch for this. Without an equivalent refresh, `disk bind` can succeed while first access to the directory fails. With a custom kernel whose support is absent or unknown, use a fixed slot such as `slot: {size: 8GiB}` and a disk of the same size. [Guest kernel patch](https://github.com/kuasar-sandbox/guest-runtime/pull/134)
+
+List the receiver’s disks, export a complete disk definition from a committed E or S, then bind it on the receiver. The same export command accepts a saved whole-machine checkpoint.
 ```bash
 sandbox-ctl disk list --path-id receiver
 sandbox-ctl export --source-ref "$PAUSED_E" --disk work --output "$OUT" > work.disk.json

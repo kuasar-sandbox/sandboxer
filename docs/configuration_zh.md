@@ -197,7 +197,7 @@ Lower chain 要求 base。冷启动的可写 ext4 设备需要可挂载 base/tem
 
 ### 延迟绑定与子目录挂载
 
-以下配置为 `input` 保留一个 virtio-blk 设备。Guest 在启动时建立 autofs 挂载点。绑定前访问目录返回可重试错误，绑定后第一次访问时挂载 ext4 并投影对应子目录。普通 single/overlay 数据盘也使用同一组 `mounts`。slot 的目标与其他有效挂载不能重叠，同一 slot 投影的源目录也不能重叠。其余挂载沿用既有顺序。新挂载声明中的 `target` 和 `subpath` 遇到 `.` 或 `..` 路径分量会报错，省略 `subpath` 或使用空串表示整盘根。
+以下配置为 `input` 保留一个 virtio-blk 设备。固定容量和动态容量的未绑定盘位都依赖 Guest 内核的 autofs 在首次访问时挂载目录。缺少 autofs 的 Guest 无法使用这些盘位。绑定前访问目录返回可重试错误，绑定后第一次访问时挂载 ext4 并投影对应子目录。普通 single/overlay 数据盘也使用同一组 `mounts`。slot 的目标与其他有效挂载不能重叠，同一 slot 投影的源目录也不能重叠。其余挂载沿用既有顺序。新挂载声明中的 `target` 和 `subpath` 遇到 `.` 或 `..` 路径分量会报错，省略 `subpath` 或使用空串表示整盘根。
 ```yaml
 boot:
   disks:
@@ -208,7 +208,11 @@ mounts:
   - {type: disk, source: input, subpath: results, target: /out}
 ```
 
-省略 `slot.size` 时，盘位在绑定后采用来源容量。指定时，容量必须与来源完全匹配。Host 接入块后端并提交盘记录时，绑定完成。随后捕获的快照包含已绑定的盘。Guest 在首次访问时挂载文件系统。列出目标实例的盘位后，可以导出已保存 E 或 S 中的一块盘，将完整 JSON 交给另一个实例。整机 checkpoint 也支持此导出命令。
+省略 `slot.size` 时，盘位在绑定后采用来源容量。指定时，容量必须与来源完全匹配。Host 接入块后端并提交盘记录时，绑定完成。随后捕获的快照包含已绑定的盘。
+
+动态盘位（`slot: {}`）的初始容量为零。若 VMM 没有主动通知容量变化，它必须在查询时返回已绑定盘的实际容量，Guest 内核也必须在打开块设备时刷新容量。项目提供的 Guest 内核已包含对应的 virtio-blk 补丁。缺少等效的刷新能力时，`disk bind` 可以成功，但首次访问目录可能失败。若自定义内核缺少这项能力或无法确认，建议使用 `slot: {size: 8GiB}` 等固定容量盘位，并接入等大的盘。[Guest 内核补丁](https://github.com/kuasar-sandbox/guest-runtime/pull/134)
+
+列出目标实例的盘位后，可以导出已保存 E 或 S 中的一块盘，将完整 JSON 交给另一个实例。整机 checkpoint 也支持此导出命令。
 ```bash
 sandbox-ctl disk list --path-id receiver
 sandbox-ctl export --source-ref "$PAUSED_E" --disk work --output "$OUT" > work.disk.json
