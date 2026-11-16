@@ -74,6 +74,7 @@ func (q *pageList) remove(p *cachePage) {
 type Cache struct {
 	mu                            sync.Mutex
 	capacity, maxDirty, dirtyUsed int
+	maxCapacity, maxDirtyLimit    int
 	pages                         map[cacheKey]*cachePage
 	free                          []*cachePage          // metadata only; all data pointers are nil
 	freeData                      []*[cowBlockSize]byte // cleared, exclusively owned payloads
@@ -111,9 +112,67 @@ func newCache(size, dirty uint64, hooks cacheHooks) (*Cache, error) {
 	if size == 0 || dirty == 0 || dirty > size || size%cowBlockSize != 0 || dirty%cowBlockSize != 0 || size > uint64(int(^uint(0)>>1)) {
 		return nil, fmt.Errorf("diffstore: COW cache sizes must be positive 4 KiB multiples with max_dirty_size <= cache_size")
 	}
-	c := &Cache{capacity: int(size / cowBlockSize), maxDirty: int(dirty / cowBlockSize), pages: make(map[cacheKey]*cachePage), clients: make(map[*Disk]int), kick: make(chan struct{}, 1), done: make(chan struct{}), hooks: hooks}
+	c := &Cache{capacity: int(size / cowBlockSize), maxCapacity: int(size / cowBlockSize), maxDirty: int(dirty / cowBlockSize), maxDirtyLimit: int(dirty / cowBlockSize), pages: make(map[cacheKey]*cachePage), clients: make(map[*Disk]int), kick: make(chan struct{}, 1), done: make(chan struct{}), hooks: hooks}
 	go c.run()
 	return c, nil
+}
+
+// NewElasticCache keeps the configured cache size as an absolute maximum while
+// starting with a smaller effective capacity. The current capacity can then be
+// adjusted without replacing the shared cache or its writeback worker.
+func NewElasticCache(maxCacheSize, maxDirtySize, initialSize uint64) (*Cache, error) {
+	if initialSize == 0 || initialSize > maxCacheSize || initialSize%cowBlockSize != 0 {
+		return nil, fmt.Errorf("diffstore: initial cache size must be a positive 4 KiB multiple <= maximum")
+	}
+	c, err := NewCache(maxCacheSize, maxDirtySize)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.capacity = int(initialSize / cowBlockSize)
+	c.maxDirty = min(c.maxDirtyLimit, c.capacity)
+	c.mu.Unlock()
+	return c, nil
+}
+
+// TryResizeCapacity changes the effective logical capacity. On shrink it
+// evicts only clean pages and leaves in-flight or dirty pages untouched. A
+// false result means the target could not be reached and the original capacity
+// remains in force. This method does NOT reclaim the retained freeData backing
+// memory; a node budget must not be returned based on this result alone.
+func (c *Cache) TryResizeCapacity(size uint64) (bool, error) {
+	if size == 0 || size%cowBlockSize != 0 || size/cowBlockSize > uint64(c.maxCapacity) {
+		return false, fmt.Errorf("diffstore: effective cache size outside configured bounds")
+	}
+	target := int(size / cowBlockSize)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.checkLocked(context.Background()); err != nil {
+		return false, err
+	}
+	if target == c.capacity {
+		return true, nil
+	}
+	if target < c.capacity {
+		// Preflight so a blocked shrink does not discard any clean page.
+		excess := len(c.pages) - target
+		if excess > 0 {
+			clean := 0
+			for p := c.clean.first; p != nil && clean < excess; p = p.next {
+				clean++
+			}
+			if clean < excess {
+				return false, nil
+			}
+			for len(c.pages) > target {
+				c.releaseLocked(c.clean.first)
+			}
+		}
+	}
+	c.capacity = target
+	c.maxDirty = min(c.maxDirtyLimit, target)
+	c.signalLocked()
+	return true, nil
 }
 
 type cacheDiskOption struct{ cache *Cache }
