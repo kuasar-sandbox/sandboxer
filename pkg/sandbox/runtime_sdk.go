@@ -200,6 +200,7 @@ type Runtime struct {
 	hostProjection                     config.PortableProjection
 	disks                              []runtimeOwnedDisk
 	cache                              *diffstore.Cache
+	cacheStop                          func()
 	storage                            *artifact.ProcessStorage
 	ownStorage                         bool
 	exitDone                           chan struct{}
@@ -877,11 +878,12 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if err != nil {
 		return fail(err)
 	}
-	cache, err := diffstore.NewCache(cacheSize, dirtySize)
+	cache, stopCache, err := resctl.NewCacheWithBudget(r.lifeCtx, r.hooks, cacheSize, dirtySize)
 	if err != nil {
 		return fail(err)
 	}
 	r.cache = cache
+	r.cacheStop = stopCache
 	// Retained readers must survive successful Launch's operation context.
 	readCtx, cancelReads := context.WithCancel(VMLifecycleContext(r.lifeCtx))
 	stopReadCancel := context.AfterFunc(ctx, cancelReads)
@@ -1360,6 +1362,10 @@ func (r *Runtime) cleanupResources() (retErr error) {
 	// been created. Preserve retained files by using non-recursive Remove.
 	if r.baseDir != "" {
 		_ = os.Remove(r.baseDir)
+	}
+	if r.cacheStop != nil {
+		r.cacheStop()
+		r.cacheStop = nil
 	}
 	if r.cache != nil {
 		retErr = errors.Join(retErr, r.cache.Close())

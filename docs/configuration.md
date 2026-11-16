@@ -447,9 +447,16 @@ configurable alternate write mode.
 
 `max_dirty_size` is a subset of `cache_size`, never an additional pool or a
 reserved partition. Clean pages may use the entire cache when there are no dirty
-pages. Adding a disk does not multiply either limit. These host process resources
-are independent of guest capacity, allocatable/startup headroom and VMM overhead:
-`sandbox-ctl` is outside the VMM cgroup. No resource-controller changes are needed.
+pages. Adding a disk does not multiply either limit. With a node controller that
+negotiates cache grants, `cache_size` is the sandbox maximum: admission grants
+only a small initial cache budget, and the current budget grows with I/O demand.
+The effective dirty limit is `min(current budget, max_dirty_size)`. Idle clean
+cache is evicted and its physical pages returned before the node regrants it.
+The payload remains charged to `sandbox-ctl` in the existing `ctl/` cgroup;
+Guest balloon, Guest reservation and `vmm/` controls are unchanged.
+With no controller or an older controller, the original fixed-capacity cache
+behavior is retained. The default maximum is still 32 MiB; configure
+`cache_size: 1GiB` explicitly for 500 MiB–1 GiB peak working sets.
 
 Cold start, `run --from`, and restore resolve cache budgets for this instance.
 Runtime configuration retains those budgets for that sandbox's lifecycle; a new

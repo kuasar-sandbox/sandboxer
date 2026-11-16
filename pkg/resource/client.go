@@ -216,6 +216,8 @@ type AdmitParams struct {
 	AllocatableAtSnapshot uint64 // wire name for BudgetAtSnapshot; 0 for cold
 	CgroupPath            string
 	ClientFeatures        []string
+	CacheMaximum          uint64
+	CacheInitial          uint64
 }
 
 // AdmitResult captures the response from an Admit call.
@@ -238,7 +240,9 @@ type AdmitResult struct {
 
 	// QueuedETAMs is retained for wire-format BC; never populated by the
 	// modern controller (which never returns StatusQueued).
-	QueuedETAMs int64
+	CacheSupported      bool
+	GrantedInitialCache uint64
+	QueuedETAMs         int64
 }
 
 // Admit performs the initial handshake. The sandbox-ctl caller continues
@@ -262,6 +266,8 @@ func (c *Client) AdmitContext(ctx context.Context, p AdmitParams) (*AdmitResult,
 		AllocatableAtSnapshot: p.AllocatableAtSnapshot,
 		CgroupPath:            p.CgroupPath,
 		ClientFeatures:        append([]string(nil), p.ClientFeatures...),
+		CacheMaximum:          p.CacheMaximum,
+		CacheInitial:          p.CacheInitial,
 	}, DeadlineAdmit)
 	if err != nil {
 		return nil, err
@@ -278,6 +284,8 @@ func (c *Client) AdmitContext(ctx context.Context, p AdmitParams) (*AdmitResult,
 		GrantedInitialAlloc: resp.GrantedInitialAlloc,
 		Reason:              resp.Reason,
 		Msg:                 resp.Msg,
+		CacheSupported:      HasFeature(resp.ClientFeatures, FeatureCacheBudgetV1),
+		GrantedInitialCache: resp.GrantedInitialCache,
 		QueuedForMs:         resp.QueuedForMs,
 		QueuePosAtIn:        resp.QueuePosAtIn,
 		QueuedETAMs:         resp.QueuedETAMs,
@@ -291,14 +299,18 @@ func (c *Client) AdmitContext(ctx context.Context, p AdmitParams) (*AdmitResult,
 type StateSyncParams struct {
 	SandboxID                string
 	AppliedAllocatableMemory uint64
+	AppliedCacheReservation  uint64
+	AppliedCacheMaximum      uint64
 	Settled                  bool
 	CurrentRSS               uint64
 	PreviousToken            string
 }
 
 type StateSyncResult struct {
-	Token          string
-	NewAllocatable uint64 // echoed/reconciled node reservation
+	Token              string
+	CacheReservation   uint64
+	CacheReclaimTarget uint64
+	NewAllocatable     uint64 // echoed/reconciled node reservation
 }
 
 func (c *Client) StateSync(p StateSyncParams) (*StateSyncResult, error) {
@@ -319,6 +331,8 @@ func (c *Client) StateSyncContextOnWrite(ctx context.Context, p StateSyncParams,
 		Type:                     TypeStateSync,
 		SandboxID:                p.SandboxID,
 		AppliedAllocatableMemory: p.AppliedAllocatableMemory,
+		AppliedCacheReservation:  p.AppliedCacheReservation,
+		AppliedCacheMaximum:      p.AppliedCacheMaximum,
 		Settled:                  p.Settled,
 		CurrentRSS:               p.CurrentRSS,
 		PreviousToken:            p.PreviousToken,
@@ -332,7 +346,7 @@ func (c *Client) StateSyncContextOnWrite(ctx context.Context, p StateSyncParams,
 	c.mu.Lock()
 	c.token = resp.Token
 	c.mu.Unlock()
-	return &StateSyncResult{Token: resp.Token, NewAllocatable: resp.NewAllocatable}, nil
+	return &StateSyncResult{Token: resp.Token, NewAllocatable: resp.NewAllocatable, CacheReservation: resp.CacheReservation, CacheReclaimTarget: resp.CacheReclaimTarget}, nil
 }
 
 // Settled marks the per-sandbox state machine's startup → settled
@@ -400,7 +414,9 @@ func (c *Client) RequestBudgetContext(ctx context.Context, currentAlloc, request
 // HeartbeatResult holds the controller's reservation echo. A mismatch asks
 // the reservation adapter to StateSync; it never commands local enforcement.
 type HeartbeatResult struct {
-	NewAllocatable uint64
+	NewAllocatable     uint64
+	CacheReservation   uint64
+	CacheReclaimTarget uint64
 }
 
 // Heartbeat sends host-charge diagnostics and returns the node's current
@@ -430,7 +446,7 @@ func (c *Client) HeartbeatContext(ctx context.Context, rss, cpuUsec, recentHigh,
 	if resp.Type != TypeAck {
 		return nil, fmt.Errorf("client: heartbeat reply %q", resp.Type)
 	}
-	return &HeartbeatResult{NewAllocatable: resp.NewAllocatable}, nil
+	return &HeartbeatResult{NewAllocatable: resp.NewAllocatable, CacheReservation: resp.CacheReservation, CacheReclaimTarget: resp.CacheReclaimTarget}, nil
 }
 
 // AdminDrain toggles drain mode on the controller.
@@ -631,4 +647,36 @@ func (c *Client) ReleaseContext(ctx context.Context, reason string) error {
 		return nil
 	}
 	return lastErr
+}
+
+// CacheBudgetResult is the controller's absolute cache grant and optional
+// reclaim target. Neither is a Guest balloon command.
+type CacheBudgetResult struct {
+	Granted       uint64
+	Reservation   uint64
+	ReclaimTarget uint64
+	CooldownMs    int64
+}
+
+func (c *Client) RequestCacheBudgetContext(ctx context.Context, current, delta, maximum uint64) (CacheBudgetResult, error) {
+	c.mu.Lock()
+	token := c.token
+	c.mu.Unlock()
+	if token == "" {
+		return CacheBudgetResult{}, errors.New("client: no token")
+	}
+	resp, err := c.roundTripContext(ctx, &Message{
+		Type: TypeRequestCacheBudget, Token: token,
+		CacheCurrent: current, CacheRequested: delta, CacheMaximum: maximum,
+	}, DeadlineRequestBudget)
+	if err != nil {
+		return CacheBudgetResult{}, err
+	}
+	if resp.Type != TypeCacheBudgetResponse {
+		return CacheBudgetResult{}, fmt.Errorf("client: cache budget reply %q", resp.Type)
+	}
+	return CacheBudgetResult{
+		Granted: resp.CacheGranted, Reservation: resp.CacheReservation,
+		ReclaimTarget: resp.CacheReclaimTarget, CooldownMs: resp.CooldownMs,
+	}, nil
 }

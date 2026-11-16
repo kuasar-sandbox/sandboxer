@@ -512,7 +512,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
-	cowCache, err := diffstore.NewCache(cacheSize, maxDirtySize)
+	cowCache, stopCache, err := resctl.NewCacheWithBudget(ctx, hooks, cacheSize, maxDirtySize)
 	if err != nil {
 		return -1, err
 	}
@@ -522,6 +522,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			code = -1
 		}
 	}()
+	defer stopCache()
 	disks, cleanupDisks, err := reconstructRestoreDisks(ctx, opts, diffCustomerKey, &snapCfg, logf, cowCache)
 	if err != nil {
 		return -1, err

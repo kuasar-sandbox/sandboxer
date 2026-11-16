@@ -125,6 +125,18 @@ is restore BudgetAtSnapshot; these must not be interpreted as interchangeable
 RSS measurements. Unknown advertised client features are ignored for peer
 compatibility. Portable E/S does not store this host ownership protocol.
 
+When both sides advertise `cache_budget_v1`, Admit atomically grants
+`cache_initial` together with the Guest initial reservation and records
+`cache_maximum` as an immutable per-run limit. Subsequent
+`request_cache_budget` exchanges carry a safe absolute `cache_current`,
+`cache_requested` delta and controller `cache_reservation` result. Heartbeat
+may return `cache_reclaim_target`; it is a request to release clean cache,
+not an already completed release. `state_sync` reports the safely owned
+cache reservation after a lost reply or controller restart. Cache growth
+allocates physical pages only after an accepted grant; shrink returns quota
+only after physical pages have been reclaimed. Guest Budget, balloon and
+`memory.high` remain independent.
+
 <a id="resource-states"></a>
 
 ### Lifecycle states

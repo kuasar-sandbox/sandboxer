@@ -408,8 +408,14 @@ Go SDK 调用方应在 `StartRuntime` 之前通过 `RuntimeSpec.Resources.DiffCO
 关闭开关、数据 I/O 失败后触发的 buffered 重试或可配置的其他写入模式。
 
 `max_dirty_size` 是 `cache_size` 的子集，不是额外池或预留分区。没有脏页时 clean 可以使用
-全部缓存。添加磁盘不会乘以预算。这些 host 进程资源独立于 guest capacity、allocatable/startup
-headroom 和 VMM overhead：`sandbox-ctl` 不在 VMM cgroup 中，无需改资源控制器。
+全部缓存。添加磁盘不会乘以预算。在支持缓存预算协议的节点上，`cache_size` 是单沙箱上限，
+启动准入只授予最小缓存预算，随后根据 I/O 按需增长；脏页上限始终为
+`min(当前预算, max_dirty_size)`。空闲 clean 页批量淘汰并真正还页后，才向同一节点
+资源池返还额度。缓存物理页留在 `sandbox-ctl` 所属的 `ctl/` cgroup，
+不修改 Guest 内存预算、balloon 或 `vmm/` 控制。
+未提供节点控制器或对端未协商该协议时，保持原有固定缓存行为。
+默认 `cache_size` 仍为 32 MiB；需要 500 MiB–1 GiB 高峰工作集时，应显式设置
+`cache_size: 1GiB`，由节点资源池决定实际可获准的当前额度。
 
 冷启动、`run --from` 与 restore 为当前实例解析缓存预算。运行配置保留该沙箱生命周期的
 预算；新恢复实例使用本次 Host 缓存配置。Portable C0/E/S 不包含缓存策略、页、队列或 LRU 状态。

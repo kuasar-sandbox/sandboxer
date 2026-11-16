@@ -39,6 +39,8 @@ type cachePage struct {
 	chargedDirty, fresh bool
 	zero                bool // a DISCARD mutation, independent of cache state
 	prev, next          *cachePage
+	lastTouch           int64
+	expired             bool
 }
 
 // Intrusive lists reuse page metadata across arbitrarily many overwrites.
@@ -73,13 +75,19 @@ func (q *pageList) remove(p *cachePage) {
 // pages directly in each diff's existing bounded, owned DIO workspace.
 type Cache struct {
 	mu                            sync.Mutex
+	resizeMu                      sync.Mutex
 	capacity, maxDirty, dirtyUsed int
 	maxCapacity, maxDirtyLimit    int
 	pages                         map[cacheKey]*cachePage
 	free                          []*cachePage          // metadata only; all data pointers are nil
 	freeData                      []*[cowBlockSize]byte // cleared, exclusively owned payloads
-	clients                       map[*Disk]int         // dirty reservations, including construction and I/O
-	clean, dirty                  pageList
+	backing                       *elasticBacking
+	budgetWake                    chan<- struct{}
+	budgetThreshold               int
+	clients                       map[*Disk]int // dirty reservations, including construction and I/O
+	clean, expired, dirty         pageList
+	started                       time.Time
+	expiredPages                  int
 	changed                       chan struct{}
 	kick                          chan struct{}
 	done                          chan struct{}
@@ -91,6 +99,51 @@ type Cache struct {
 	hooks                         cacheHooks
 	writeBytes, writeBatches      uint64
 	peakUsed, peakDirty           int
+}
+
+// BudgetSnapshot is constant-time and does not traverse cached pages. It is
+// the input to the async cache capacity controller, never an RPC hot path.
+type BudgetSnapshot struct {
+	Capacity uint64
+	Maximum  uint64
+	Used     uint64
+	Dirty    uint64
+	Expired  uint64
+	Resident uint64
+}
+
+func (c *Cache) BudgetSnapshot() BudgetSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := BudgetSnapshot{
+		Capacity: uint64(c.capacity) * cowBlockSize,
+		Maximum:  uint64(c.maxCapacity) * cowBlockSize,
+		Used:     uint64(len(c.pages)) * cowBlockSize,
+		Dirty:    uint64(c.dirtyUsed) * cowBlockSize,
+		Expired:  uint64(c.expiredPages) * cowBlockSize,
+	}
+	if c.backing != nil {
+		result.Resident = uint64(c.backing.resident) * cowBlockSize
+	}
+	return result
+}
+
+// SetBudgetNotifier is called only at initialization and after a completed
+// budget grant. A buffered wakeup is posted without launching an I/O goroutine.
+func (c *Cache) SetBudgetNotifier(wake chan<- struct{}, threshold uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.budgetWake = wake
+	c.budgetThreshold = int(threshold / cowBlockSize)
+	if c.budgetThreshold <= 0 {
+		c.budgetThreshold = 1
+	}
+	if len(c.pages) >= c.budgetThreshold && c.budgetWake != nil {
+		select {
+		case c.budgetWake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // Hooks are installed before starting the worker, only by deterministic tests.
@@ -112,7 +165,7 @@ func newCache(size, dirty uint64, hooks cacheHooks) (*Cache, error) {
 	if size == 0 || dirty == 0 || dirty > size || size%cowBlockSize != 0 || dirty%cowBlockSize != 0 || size > uint64(int(^uint(0)>>1)) {
 		return nil, fmt.Errorf("diffstore: COW cache sizes must be positive 4 KiB multiples with max_dirty_size <= cache_size")
 	}
-	c := &Cache{capacity: int(size / cowBlockSize), maxCapacity: int(size / cowBlockSize), maxDirty: int(dirty / cowBlockSize), maxDirtyLimit: int(dirty / cowBlockSize), pages: make(map[cacheKey]*cachePage), clients: make(map[*Disk]int), kick: make(chan struct{}, 1), done: make(chan struct{}), hooks: hooks}
+	c := &Cache{capacity: int(size / cowBlockSize), maxCapacity: int(size / cowBlockSize), maxDirty: int(dirty / cowBlockSize), maxDirtyLimit: int(dirty / cowBlockSize), pages: make(map[cacheKey]*cachePage), clients: make(map[*Disk]int), kick: make(chan struct{}, 1), done: make(chan struct{}), started: time.Now(), hooks: hooks}
 	go c.run()
 	return c, nil
 }
@@ -129,9 +182,17 @@ func NewElasticCache(maxCacheSize, maxDirtySize, initialSize uint64) (*Cache, er
 		return nil, err
 	}
 	c.mu.Lock()
-	c.capacity = int(initialSize / cowBlockSize)
-	c.maxDirty = min(c.maxDirtyLimit, c.capacity)
+	c.backing = &elasticBacking{}
+	err = c.backing.prepare(int(initialSize / cowBlockSize))
+	if err == nil {
+		c.capacity = int(initialSize / cowBlockSize)
+		c.maxDirty = min(c.maxDirtyLimit, c.capacity)
+	}
 	c.mu.Unlock()
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -145,19 +206,61 @@ func (c *Cache) TryResizeCapacity(size uint64) (bool, error) {
 		return false, fmt.Errorf("diffstore: effective cache size outside configured bounds")
 	}
 	target := int(size / cowBlockSize)
+	// Serializes backing ownership and unmap without blocking foreground
+	// cache accesses during an ordinary capacity grow.
+	c.resizeMu.Lock()
+	defer c.resizeMu.Unlock()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if err := c.checkLocked(context.Background()); err != nil {
+		c.mu.Unlock()
 		return false, err
 	}
 	if target == c.capacity {
+		c.mu.Unlock()
 		return true, nil
 	}
+	if target > c.capacity && c.backing != nil {
+		old := c.capacity
+		backing := c.backing
+		c.mu.Unlock()
+		// Kernel page faults happen outside c.mu.
+		prepared, err := backing.stagePrepare(target - old)
+		if err != nil {
+			var rollback *cacheBackingRollbackFailure
+			if errors.As(err, &rollback) {
+				c.mu.Lock()
+				report := c.failLocked(fmt.Errorf("diffstore: unrecoverable cache backing error: %w", err))
+				fatal := c.err
+				c.mu.Unlock()
+				if report != nil {
+					report(fatal)
+				}
+			}
+			return false, err
+		}
+		c.mu.Lock()
+		// resizeMu also fences Close, so the backing remains live.
+		if err := c.checkLocked(context.Background()); err != nil {
+			c.mu.Unlock()
+			_ = prepared.abort()
+			return false, err
+		}
+		backing.installPrepared(prepared)
+		c.capacity = target
+		c.maxDirty = min(c.maxDirtyLimit, target)
+		c.signalLocked()
+		c.mu.Unlock()
+		return true, nil
+	}
+	defer c.mu.Unlock()
 	if target < c.capacity {
 		// Preflight so a blocked shrink does not discard any clean page.
 		excess := len(c.pages) - target
 		if excess > 0 {
 			clean := 0
+			for p := c.expired.first; p != nil && clean < excess; p = p.next {
+				clean++
+			}
 			for p := c.clean.first; p != nil && clean < excess; p = p.next {
 				clean++
 			}
@@ -165,9 +268,39 @@ func (c *Cache) TryResizeCapacity(size uint64) (bool, error) {
 				return false, nil
 			}
 			for len(c.pages) > target {
-				c.releaseLocked(c.clean.first)
+				c.releaseLocked(c.oldestCleanLocked())
 			}
 		}
+	}
+	if c.backing != nil {
+		var err error
+		if target > c.capacity {
+			err = c.backing.prepare(target)
+		} else {
+			err = c.backing.reclaim(target)
+		}
+		if err != nil {
+			// madvise and mmap can fail after some pages were returned or
+			// faulted. Restore the old physical quota before letting I/O
+			// use this cache again. If rollback itself fails, terminate
+			// through the normal sticky cache failure path, never panic
+			// on a missing payload or return a fictitious node grant.
+			var rollbackErr error
+			if c.backing.resident > c.capacity {
+				rollbackErr = c.backing.reclaim(c.capacity)
+			} else if c.backing.resident < c.capacity {
+				rollbackErr = c.backing.prepare(c.capacity)
+			}
+			if rollbackErr != nil {
+				c.failLocked(fmt.Errorf("diffstore: cache physical resize rollback failed: %w", rollbackErr))
+				return false, fmt.Errorf("diffstore: resize failed: %w (rollback: %v)", err, rollbackErr)
+			}
+			return false, err
+		}
+	}
+	if target < c.capacity && len(c.free) > target {
+		clear(c.free[target:])
+		c.free = c.free[:target]
 	}
 	c.capacity = target
 	c.maxDirty = min(c.maxDirtyLimit, target)
@@ -196,6 +329,52 @@ func (c *Cache) attach(cow *Disk) error {
 	}
 	c.clients[cow] = 0
 	return nil
+}
+
+// clean LRU is split into fresh and expired prefixes, retaining global LRU
+// order without scanning expired entries on each age tick.
+func (c *Cache) oldestCleanLocked() *cachePage {
+	if c.expired.first != nil {
+		return c.expired.first
+	}
+	return c.clean.first
+}
+func (c *Cache) removeCleanLocked(p *cachePage) {
+	if p.expired {
+		c.expired.remove(p)
+		c.expiredPages--
+		p.expired = false
+	} else {
+		c.clean.remove(p)
+	}
+}
+func (c *Cache) touchCleanLocked(p *cachePage) {
+	c.removeCleanLocked(p)
+	c.pushCleanLocked(p)
+}
+func (c *Cache) pushCleanLocked(p *cachePage) {
+	p.lastTouch = time.Since(c.started).Nanoseconds()
+	p.expired = false
+	c.clean.push(p)
+}
+
+// AgeClean only marks old clean pages as reclaimable. It deliberately does
+// not free pages or invoke system calls: reclaim happens in budget-sized batches.
+func (c *Cache) AgeClean(olderThan time.Duration) uint64 {
+	if olderThan <= 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cutoff := time.Since(c.started).Nanoseconds() - int64(olderThan)
+	for marked := 0; marked < 8192 && c.clean.first != nil && c.clean.first.lastTouch <= cutoff; marked++ {
+		p := c.clean.first
+		c.clean.remove(p)
+		p.expired = true
+		c.expired.push(p)
+		c.expiredPages++
+	}
+	return uint64(c.expiredPages) * cowBlockSize
 }
 
 // Allocate a broadcast generation only when someone actually waits. Hot page
@@ -243,10 +422,10 @@ func (c *Cache) waitLocked(ctx context.Context) error {
 }
 func (c *Cache) reserveLocked(key cacheKey, dirty bool) *cachePage {
 	if len(c.pages) == c.capacity {
-		if c.clean.first == nil {
+		if c.oldestCleanLocked() == nil {
 			return nil
 		}
-		c.releaseLocked(c.clean.first)
+		c.releaseLocked(c.oldestCleanLocked())
 	}
 	var p *cachePage
 	if n := len(c.free); n > 0 {
@@ -264,6 +443,12 @@ func (c *Cache) reserveLocked(key cacheKey, dirty bool) *cachePage {
 		c.clients[key.cow]++
 	}
 	c.pages[key] = p
+	if c.budgetWake != nil && len(c.pages) >= c.budgetThreshold {
+		select {
+		case c.budgetWake <- struct{}{}:
+		default:
+		}
+	}
 	c.peakUsed = max(c.peakUsed, len(c.pages))
 	c.peakDirty = max(c.peakDirty, c.dirtyUsed)
 	return p
@@ -276,6 +461,10 @@ func (c *Cache) reserveLocked(key cacheKey, dirty bool) *cachePage {
 // Data became Zero. The caller holds mu and owns the page's mutable state.
 func (c *Cache) acquireDataLocked(p *cachePage) {
 	if p.data != nil {
+		return
+	}
+	if c.backing != nil {
+		p.data = c.backing.take()
 		return
 	}
 	if n := len(c.freeData); n > 0 {
@@ -292,8 +481,12 @@ func (c *Cache) acquireDataLocked(p *cachePage) {
 // itself has no payload to clear or retain.
 func (c *Cache) releaseDataLocked(p *cachePage) {
 	if p.data != nil {
-		clear(p.data[:])
-		c.freeData = append(c.freeData, p.data)
+		if c.backing != nil {
+			c.backing.put(p.data)
+		} else {
+			clear(p.data[:])
+			c.freeData = append(c.freeData, p.data)
+		}
 		p.data = nil
 	}
 }
@@ -301,7 +494,7 @@ func (c *Cache) releaseDataLocked(p *cachePage) {
 func (c *Cache) releaseLocked(p *cachePage) {
 	switch p.state {
 	case cacheClean:
-		c.clean.remove(p)
+		c.removeCleanLocked(p)
 	case cacheDirty:
 		c.dirty.remove(p)
 	}
@@ -317,6 +510,8 @@ func (c *Cache) releaseLocked(p *cachePage) {
 	p.zero = false
 	p.prev = nil
 	p.next = nil
+	p.lastTouch = 0
+	p.expired = false
 	c.free = append(c.free, p)
 }
 
@@ -348,8 +543,7 @@ func (c *Cache) read(ctx context.Context, cow *Disk, buf []byte, offset int64) (
 				copy(buf[done:done+length], p.data[pos%cowBlockSize:])
 			}
 			if p.state == cacheClean {
-				c.clean.remove(p)
-				c.clean.push(p)
+				c.touchCleanLocked(p)
 			}
 			c.mu.Unlock()
 			done += length
@@ -386,7 +580,7 @@ func (c *Cache) read(ctx context.Context, cow *Disk, buf []byte, offset int64) (
 			c.releaseLocked(p)
 		} else {
 			p.state = cacheClean
-			c.clean.push(p)
+			c.pushCleanLocked(p)
 			copy(buf[done:done+length], p.data[pos%cowBlockSize:])
 		}
 		c.signalLocked()
@@ -438,7 +632,7 @@ func (c *Cache) readColdRunLocked(ctx context.Context, cow *Disk, buf []byte, of
 				continue
 			}
 			p.state = cacheClean
-			c.clean.push(p)
+			c.pushCleanLocked(p)
 		}
 		c.signalLocked()
 		c.mu.Unlock()
@@ -508,7 +702,7 @@ func (c *Cache) write(ctx context.Context, cow *Disk, buf []byte, offset, block 
 		return 0, c.retryLocked()
 	}
 	if p != nil {
-		c.clean.remove(p)
+		c.removeCleanLocked(p)
 		p.state = cacheDirty
 		p.chargedDirty = true
 		c.dirtyUsed++
@@ -575,7 +769,7 @@ func (c *Cache) stageZero(ctx context.Context, cow *Disk, block int64) error {
 	}
 	alreadyDirty := p != nil && p.state == cacheDirty
 	if !alreadyDirty {
-		blockedTotal := p == nil && len(c.pages) == c.capacity && c.clean.first == nil
+		blockedTotal := p == nil && len(c.pages) == c.capacity && c.oldestCleanLocked() == nil
 		if c.dirtyUsed == c.maxDirty || blockedTotal {
 			pendingZero := false
 			for _, q := range c.pages {
@@ -601,7 +795,7 @@ func (c *Cache) stageZero(ctx context.Context, cow *Disk, block int64) error {
 				return c.retryLocked()
 			}
 		} else {
-			c.clean.remove(p)
+			c.removeCleanLocked(p)
 			p.chargedDirty = true
 			c.dirtyUsed++
 			c.clients[cow]++
@@ -800,7 +994,7 @@ func (c *Cache) completeWritebackLocked(batch []*cachePage) {
 		p.chargedDirty = false
 		c.dirtyUsed--
 		c.clients[p.key.cow]--
-		c.clean.push(p)
+		c.pushCleanLocked(p)
 	}
 }
 
@@ -971,6 +1165,8 @@ func (c *Cache) detach(cow *Disk) {
 	c.mu.Unlock()
 }
 func (c *Cache) Close() error {
+	c.resizeMu.Lock()
+	defer c.resizeMu.Unlock()
 	c.mu.Lock()
 	if len(c.clients) != 0 {
 		c.mu.Unlock()
@@ -988,6 +1184,12 @@ func (c *Cache) Close() error {
 	}
 	c.freeData = nil
 	c.free = nil
+	if c.backing != nil {
+		if err := c.backing.close(); err != nil && c.err == nil {
+			c.err = err
+		}
+		c.backing = nil
+	}
 	return c.err
 }
 
@@ -1022,7 +1224,7 @@ func (c *Cache) discard(ctx context.Context, cow *Disk, first, last int64) error
 		// Waiting with a partially frozen batch could prevent writeback progress.
 		for _, p := range pages[:count] {
 			if p.state == cacheClean {
-				c.clean.remove(p)
+				c.removeCleanLocked(p)
 			} else {
 				c.dirty.remove(p)
 			}
@@ -1064,12 +1266,18 @@ type CacheStats struct {
 	Used, DirtyUsed, Clean, Loading, Writeback uint64
 	Capacity, MaxDirty, PeakUsed, PeakDirty    uint64
 	WrittenBytes, WriteBatches                 uint64
+	// ElasticCache payload: backing pages charged to this process's cgroup.
+	ResidentPayload, ExpiredClean uint64
 }
 
 func (c *Cache) Stats() CacheStats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := CacheStats{Used: uint64(len(c.pages)) * cowBlockSize, DirtyUsed: uint64(c.dirtyUsed) * cowBlockSize, Capacity: uint64(c.capacity) * cowBlockSize, MaxDirty: uint64(c.maxDirty) * cowBlockSize, PeakUsed: uint64(c.peakUsed) * cowBlockSize, PeakDirty: uint64(c.peakDirty) * cowBlockSize, WrittenBytes: c.writeBytes, WriteBatches: c.writeBatches}
+	if c.backing != nil {
+		s.ResidentPayload = uint64(c.backing.resident) * cowBlockSize
+	}
+	s.ExpiredClean = uint64(c.expiredPages) * cowBlockSize
 	for _, p := range c.pages {
 		switch p.state {
 		case cacheClean:

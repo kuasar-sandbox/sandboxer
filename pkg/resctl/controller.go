@@ -47,12 +47,17 @@ type ControllerHooks struct {
 	controllerCgroupPath     string
 	controllerSocketIdentity string
 
-	admitted         bool
-	settled          bool
-	connected        bool
-	reservationBytes uint64
-	previousToken    string
-	released         bool
+	admitted           bool
+	settled            bool
+	connected          bool
+	reservationBytes   uint64
+	cacheMaximum       uint64
+	cacheReservation   uint64
+	cacheSupported     bool
+	cacheReclaimTarget uint64
+	cacheWake          chan struct{}
+	previousToken      string
+	released           bool
 
 	lifetimeCtx    context.Context
 	cancelLifetime context.CancelFunc
@@ -79,7 +84,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 	lifetimeCtx, cancel := context.WithCancel(context.WithoutCancel(opts.Context))
 	h := &ControllerHooks{
 		opts: opts, cfg: cfg, lifetimeCtx: lifetimeCtx, cancelLifetime: cancel,
-		reconnectWake: make(chan struct{}, 1),
+		reconnectWake: make(chan struct{}, 1), cacheWake: make(chan struct{}, 1),
 	}
 	cancelLocal := cancel
 	stopParent := context.AfterFunc(opts.Context, func() {
@@ -130,6 +135,12 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		cancel()
 		return nil, err
 	}
+	cacheMax, _, err := cfg.Resources.DiffCOW.Bytes()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	h.cacheMaximum = cacheMax
 	lease, err := resource.CreateLease(resource.Lease{
 		Version: resource.LeaseVersion, SandboxID: opts.SandboxID, PID: os.Getpid(),
 		ControllerSocket: controllerSocketIdentity, CgroupPath: h.controllerCgroupPath,
@@ -137,7 +148,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		FloorMemory: headroom, FloorCPUMilli: cpuMilliCeil(cfg.Resources.Allocatable.CPU),
 		// The immutable lease mirrors configured startup headroom. Only the
 		// existing Admit field carries its aligned InitialBudget representation.
-		StartupMemory: startupHeadroom, ClientFeatures: []string{resource.FeatureStateSyncV1},
+		StartupMemory: startupHeadroom, ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(cacheMax)},
 	})
 	if err != nil {
 		cancel()
@@ -197,6 +208,10 @@ func (h *ControllerHooks) ReservationMemory() uint64 {
 type localControllerState struct {
 	admitted, settled, connected, released bool
 	reservation                            uint64
+	cacheReservation                       uint64
+	cacheMaximum                           uint64
+	cacheSupported                         bool
+	cacheTarget                            uint64
 	token                                  string
 }
 
@@ -206,6 +221,7 @@ func (h *ControllerHooks) localState() localControllerState {
 	return localControllerState{
 		admitted: h.admitted, settled: h.settled, connected: h.connected,
 		released: h.released, reservation: h.reservationBytes,
+		cacheReservation: h.cacheReservation, cacheMaximum: h.cacheMaximum, cacheSupported: h.cacheSupported, cacheTarget: h.cacheReclaimTarget,
 		token: h.previousToken,
 	}
 }
@@ -266,7 +282,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 			CapacityCPU:      h.cfg.Resources.Capacity.CPU,
 			FloorMemoryBytes: headroom, FloorCPU: h.cfg.Resources.Allocatable.CPU,
 			StartupBudgetMemory: startupBudget, AllocatableAtSnapshot: budgetAtSnapshot,
-			CgroupPath: h.controllerCgroupPath, ClientFeatures: []string{resource.FeatureStateSyncV1},
+			CgroupPath: h.controllerCgroupPath, ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(h.cacheMaximum)}, CacheMaximum: h.cacheMaximum, CacheInitial: min(h.cacheMaximum, uint64(8<<20)),
 		})
 		if resource.IsTransportError(err) {
 			h.setConnected(false)
@@ -291,9 +307,19 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 		if res.GrantedInitialAlloc != initialBudget {
 			return 0, fmt.Errorf("admit granted partial/incorrect initial reservation %d, require exactly %d", res.GrantedInitialAlloc, initialBudget)
 		}
+		if res.CacheSupported {
+			expectedCache := min(h.cacheMaximum, uint64(8<<20))
+			if res.GrantedInitialCache != expectedCache {
+				return 0, fmt.Errorf("admit cache initial grant %d differs from %d", res.GrantedInitialCache, expectedCache)
+			}
+		}
 		h.mu.Lock()
 		h.admitted, h.connected = true, true
 		h.reservationBytes = initialBudget
+		h.cacheSupported = res.CacheSupported
+		if res.CacheSupported {
+			h.cacheReservation = res.GrantedInitialCache
+		}
 		h.previousToken = res.Token
 		h.mu.Unlock()
 		if res.QueuedForMs > 0 {
@@ -444,6 +470,13 @@ func (h *ControllerHooks) heartbeatOnce() {
 		h.markDisconnectedLocked(err)
 		return
 	}
+	if res != nil && state.cacheSupported {
+		if res.CacheReservation != state.cacheReservation {
+			h.markDisconnectedLocked(fmt.Errorf("heartbeat cache reservation mismatch node=%d local=%d", res.CacheReservation, state.cacheReservation))
+			return
+		}
+		h.setCacheTarget(res.CacheReclaimTarget)
+	}
 	if res == nil || res.NewAllocatable != state.reservation {
 		got := uint64(0)
 		if res != nil {
@@ -534,15 +567,24 @@ func (h *ControllerHooks) reconnectLoop() {
 				result, syncErr := h.client.StateSyncContextOnWrite(context.WithoutCancel(h.lifetimeCtx), resource.StateSyncParams{
 					SandboxID:                h.opts.SandboxID,
 					AppliedAllocatableMemory: state.reservation,
-					Settled:                  state.settled, CurrentRSS: hostCharge, PreviousToken: state.token,
+					AppliedCacheReservation:  state.cacheReservation, AppliedCacheMaximum: state.cacheMaximum,
+					Settled: state.settled, CurrentRSS: hostCharge, PreviousToken: state.token,
 				}, unlockStart, h.lifetimeCtx)
 				unlockStart()
+				if syncErr == nil && state.cacheSupported && result.CacheReservation != state.cacheReservation {
+					syncErr = fmt.Errorf("cache state_sync mismatch node=%d local=%d", result.CacheReservation, state.cacheReservation)
+				}
 				if syncErr == nil && result.NewAllocatable != state.reservation {
 					syncErr = fmt.Errorf("state_sync reservation mismatch: node=%d local=%d", result.NewAllocatable, state.reservation)
 				}
 				if syncErr == nil {
 					h.mu.Lock()
 					h.connected, h.previousToken = true, result.Token
+					h.cacheReclaimTarget = result.CacheReclaimTarget
+					select {
+					case h.cacheWake <- struct{}{}:
+					default:
+					}
 					h.mu.Unlock()
 					h.sessionMu.Unlock()
 					h.opts.Logf("controller state sync restored token=%s reservation=%d settled=%v",
