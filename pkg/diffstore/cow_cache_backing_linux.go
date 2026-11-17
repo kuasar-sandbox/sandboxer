@@ -2,6 +2,7 @@ package diffstore
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"unsafe"
 
@@ -21,7 +22,22 @@ type elasticBacking struct {
 
 const elasticSegmentBytes = 2 << 20
 
+// ElasticCacheSupported prevents 4KiB COW slots from being reclaimed through
+// a larger host page. MADV_DONTNEED on a 16/64KiB host would otherwise drop
+// live adjacent slots. Existing fixed-size cache remains usable on such hosts.
+func ElasticCacheSupported() bool { return safeElasticHostPageSize(os.Getpagesize()) == nil }
+
+func safeElasticHostPageSize(size int) error {
+	if size != cowBlockSize {
+		return fmt.Errorf("diffstore: elastic cache currently requires 4KiB host pages (host page size %d)", size)
+	}
+	return nil
+}
+
 func (e *elasticBacking) prepare(target int) error {
+	if err := safeElasticHostPageSize(os.Getpagesize()); err != nil {
+		return err
+	}
 	for e.resident < target {
 		if len(e.retired) == 0 {
 			m, err := unix.Mmap(-1, 0, elasticSegmentBytes, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
@@ -66,6 +82,9 @@ func (e *elasticBacking) put(p *[cowBlockSize]byte) {
 // bound MADV_DONTNEED calls rather than issuing a syscall for every 4KiB slot.
 // A failure leaves unprocessed pages charged and reusable.
 func (e *elasticBacking) reclaim(target int) error {
+	if err := safeElasticHostPageSize(os.Getpagesize()); err != nil {
+		return err
+	}
 	drop := e.resident - target
 	if drop <= 0 {
 		return nil
@@ -129,6 +148,9 @@ type elasticPrepared struct {
 // cache's I/O mutex is not held. Concurrent resizes / Close are serialized by
 // the cache resizeMu; ordinary I/O does not touch the retired slot slice.
 func (e *elasticBacking) stagePrepare(count int) (_ *elasticPrepared, retErr error) {
+	if err := safeElasticHostPageSize(os.Getpagesize()); err != nil {
+		return nil, err
+	}
 	if count <= 0 {
 		return &elasticPrepared{}, nil
 	}
@@ -178,6 +200,9 @@ func (e *elasticBacking) installPrepared(p *elasticPrepared) {
 // madvisePages coalesces adjacent complete 4KiB pages before MADV_DONTNEED.
 // Only pointers known to be exclusively free may be passed.
 func madvisePages(pages []*[cowBlockSize]byte) error {
+	if err := safeElasticHostPageSize(os.Getpagesize()); err != nil {
+		return err
+	}
 	sort.Slice(pages, func(i, j int) bool {
 		return uintptr(unsafe.Pointer(pages[i])) < uintptr(unsafe.Pointer(pages[j]))
 	})

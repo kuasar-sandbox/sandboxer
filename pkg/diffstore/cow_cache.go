@@ -174,6 +174,9 @@ func newCache(size, dirty uint64, hooks cacheHooks) (*Cache, error) {
 // starting with a smaller effective capacity. The current capacity can then be
 // adjusted without replacing the shared cache or its writeback worker.
 func NewElasticCache(maxCacheSize, maxDirtySize, initialSize uint64) (*Cache, error) {
+	if err := safeElasticHostPageSize(os.Getpagesize()); err != nil {
+		return nil, err
+	}
 	if initialSize == 0 || initialSize > maxCacheSize || initialSize%cowBlockSize != 0 {
 		return nil, fmt.Errorf("diffstore: initial cache size must be a positive 4 KiB multiple <= maximum")
 	}
@@ -199,8 +202,8 @@ func NewElasticCache(maxCacheSize, maxDirtySize, initialSize uint64) (*Cache, er
 // TryResizeCapacity changes the effective logical capacity. On shrink it
 // evicts only clean pages and leaves in-flight or dirty pages untouched. A
 // false result means the target could not be reached and the original capacity
-// remains in force. This method does NOT reclaim the retained freeData backing
-// memory; a node budget must not be returned based on this result alone.
+// remains in force. Elastic caches also reclaim physical backing pages
+// before reporting a successful shrink to the resource controller.
 func (c *Cache) TryResizeCapacity(size uint64) (bool, error) {
 	if size == 0 || size%cowBlockSize != 0 || size/cowBlockSize > uint64(c.maxCapacity) {
 		return false, fmt.Errorf("diffstore: effective cache size outside configured bounds")

@@ -74,18 +74,22 @@ func (h *ControllerHooks) RequestCacheBudget(current, requested uint64) (uint64,
 		requested > state.cacheMaximum-current {
 		return 0, state.cacheReservation, state.cacheTarget, 0, fmt.Errorf("invalid cache request baseline")
 	}
+	// The caller has already released physical pages when it reports a
+	// smaller absolute baseline. Remember this even if the transport is
+	// currently disconnected, so StateSync does not resurrect stale charge.
+	// Increases are still accepted only after a successful node reply.
+	if current < state.cacheReservation {
+		h.mu.Lock()
+		h.cacheReservation = current
+		h.mu.Unlock()
+	}
 	if !state.connected {
 		h.notifyReconnect()
-		return 0, state.cacheReservation, state.cacheTarget, 0,
+		return 0, current, state.cacheTarget, 0,
 			&resource.TransportError{Err: errors.New("cache budget controller disconnected")}
 	}
 	result, err := h.client.RequestCacheBudgetContext(h.lifetimeCtx, current, requested, state.cacheMaximum)
 	if err != nil {
-		if requested == 0 && current < state.cacheReservation {
-			h.mu.Lock()
-			h.cacheReservation = current
-			h.mu.Unlock()
-		}
 		h.markDisconnectedLocked(err)
 		return 0, current, state.cacheTarget, 0, err
 	}

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
@@ -141,6 +142,14 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		return nil, err
 	}
 	h.cacheMaximum = cacheMax
+	cacheFeatures := []string{resource.FeatureStateSyncV1}
+	if !diffstore.ElasticCacheSupported() {
+		// Keep the original fixed-capacity cache on larger host pages.
+		// 4KiB MADV_DONTNEED would otherwise corrupt adjacent live slots.
+		h.cacheMaximum = 0
+	} else {
+		cacheFeatures = append(cacheFeatures, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(cacheMax))
+	}
 	lease, err := resource.CreateLease(resource.Lease{
 		Version: resource.LeaseVersion, SandboxID: opts.SandboxID, PID: os.Getpid(),
 		ControllerSocket: controllerSocketIdentity, CgroupPath: h.controllerCgroupPath,
@@ -148,7 +157,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		FloorMemory: headroom, FloorCPUMilli: cpuMilliCeil(cfg.Resources.Allocatable.CPU),
 		// The immutable lease mirrors configured startup headroom. Only the
 		// existing Admit field carries its aligned InitialBudget representation.
-		StartupMemory: startupHeadroom, ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(cacheMax)},
+		StartupMemory: startupHeadroom, ClientFeatures: cacheFeatures,
 	})
 	if err != nil {
 		cancel()
@@ -277,12 +286,16 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 				continue
 			}
 		}
+		cacheFeatures := []string{resource.FeatureStateSyncV1}
+		if h.cacheMaximum > 0 {
+			cacheFeatures = append(cacheFeatures, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(h.cacheMaximum))
+		}
 		res, err := h.client.AdmitContext(h.lifetimeCtx, resource.AdmitParams{
 			SandboxID: sid, CapacityMemoryBytes: capacity,
 			CapacityCPU:      h.cfg.Resources.Capacity.CPU,
 			FloorMemoryBytes: headroom, FloorCPU: h.cfg.Resources.Allocatable.CPU,
 			StartupBudgetMemory: startupBudget, AllocatableAtSnapshot: budgetAtSnapshot,
-			CgroupPath: h.controllerCgroupPath, ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(h.cacheMaximum)}, CacheMaximum: h.cacheMaximum, CacheInitial: min(h.cacheMaximum, uint64(8<<20)),
+			CgroupPath: h.controllerCgroupPath, ClientFeatures: cacheFeatures, CacheMaximum: h.cacheMaximum, CacheInitial: min(h.cacheMaximum, uint64(8<<20)),
 		})
 		if resource.IsTransportError(err) {
 			h.setConnected(false)

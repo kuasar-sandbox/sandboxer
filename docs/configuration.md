@@ -454,8 +454,10 @@ The effective dirty limit is `min(current budget, max_dirty_size)`. Idle clean
 cache is evicted and its physical pages returned before the node regrants it.
 The payload remains charged to `sandbox-ctl` in the existing `ctl/` cgroup;
 Guest balloon, Guest reservation and `vmm/` controls are unchanged.
-With no controller or an older controller, the original fixed-capacity cache
-behavior is retained. The default maximum is still 32 MiB; configure
+With no controller, an older controller, or a host page size other than 4 KiB,
+the original fixed-capacity cache behavior is retained. The current elastic
+physical reclaim supports 4 KiB host pages only; 16/64 KiB hosts never run
+4 KiB granular MADV_DONTNEED on live cache backing. The default maximum is still 32 MiB; configure
 `cache_size: 1GiB` explicitly for 500 MiB–1 GiB peak working sets.
 
 Cold start, `run --from`, and restore resolve cache budgets for this instance.
