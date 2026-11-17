@@ -57,6 +57,35 @@ func safeElasticHostPageSize(size int) error {
 	return nil
 }
 
+// The kernel accepts adjacent VMAs in one madvise call. Pass the address and
+// extent directly so that no Go slice spans independently owned mmaps. All
+// slots remain mapped for the duration of the serialized resize.
+func populateCachePages(first *[cowBlockSize]byte, count int) error {
+	_, _, errno := unix.Syscall(unix.SYS_MADVISE, uintptr(unsafe.Pointer(first)), uintptr(count)*cowBlockSize, unix.MADV_POPULATE_WRITE)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// Fault only the funded slots. A failed MADV_POPULATE_WRITE can leave a prefix
+// resident. Touching every slot in that run completes it on both partially
+// successful and older kernels. Runs of one use a single ordinary fault.
+func prefaultCacheSlots(slots []*[cowBlockSize]byte, populate func(*[cowBlockSize]byte, int) error) {
+	for i := 0; i < len(slots); {
+		j := i + 1
+		for j < len(slots) && uintptr(unsafe.Pointer(slots[j])) == uintptr(unsafe.Pointer(slots[j-1]))+cowBlockSize {
+			j++
+		}
+		if j-i == 1 || populate(slots[i], j-i) != nil {
+			for _, slot := range slots[i:j] {
+				slot[0] = 0
+			}
+		}
+		i = j
+	}
+}
+
 func (e *elasticBacking) prepare(target int) error {
 	if err := safeElasticHostPageSize(os.Getpagesize()); err != nil {
 		return err
@@ -72,15 +101,15 @@ func (e *elasticBacking) prepare(target int) error {
 				e.retired = append(e.retired, (*[cowBlockSize]byte)(unsafe.Pointer(&m[i])))
 			}
 		}
-		last := len(e.retired) - 1
-		p := e.retired[last]
-		e.retired[last] = nil
-		e.retired = e.retired[:last]
-		// A write faults the page into the caller's cgroup, preventing a later
-		// cache hit from consuming memory outside the already granted budget.
-		p[0] = 0
-		e.available = append(e.available, p)
-		e.resident++
+		add := min(target-e.resident, len(e.retired))
+		slots := e.retired[len(e.retired)-add:]
+		prefaultCacheSlots(slots, populateCachePages)
+		for i := len(slots) - 1; i >= 0; i-- {
+			e.available = append(e.available, slots[i])
+		}
+		clear(slots)
+		e.retired = e.retired[:len(e.retired)-add]
+		e.resident += add
 	}
 	return nil
 }
@@ -186,9 +215,9 @@ func (e *elasticBacking) stagePrepare(count int) (_ *elasticPrepared, retErr err
 		}
 	}()
 	p.reused = min(count, len(e.retired))
+	prefaultCacheSlots(e.retired[len(e.retired)-p.reused:], populateCachePages)
 	for i := 0; i < p.reused; i++ {
 		slot := e.retired[len(e.retired)-1-i]
-		slot[0] = 0
 		p.ready = append(p.ready, slot)
 	}
 	remaining := count - p.reused
@@ -198,16 +227,17 @@ func (e *elasticBacking) stagePrepare(count int) (_ *elasticPrepared, retErr err
 			return nil, fmt.Errorf("diffstore: grow cache backing: %w", err)
 		}
 		p.mappings = append(p.mappings, m)
+		first := len(p.ready)
 		for i := 0; i < len(m); i += cowBlockSize {
 			slot := (*[cowBlockSize]byte)(unsafe.Pointer(&m[i]))
 			if remaining > 0 {
-				slot[0] = 0
 				p.ready = append(p.ready, slot)
 				remaining--
 			} else {
 				p.extra = append(p.extra, slot)
 			}
 		}
+		prefaultCacheSlots(p.ready[first:], populateCachePages)
 	}
 	// take pops from the end. Sequential I/O should consume adjacent freshly
 	// faulted slots in increasing address order. Keep reused slots in their
