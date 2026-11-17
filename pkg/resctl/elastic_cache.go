@@ -170,10 +170,12 @@ func (c *elasticCacheController) adjust(tick bool) {
 	if time.Now().Before(c.growAfter) || s.Capacity >= s.Maximum || c.hooks.CacheTarget() != 0 {
 		return
 	}
-	// Failed grants never consume emergency memory or force Guest memory
-	// growth. Capacity exhausted by clean churn is also a growth signal.
+	// Expired clean pages are still cache hits but no longer active demand.
+	// They must not trigger growth again after an idle shrink. A fresh hit
+	// revives the page in the existing LRU and re-establishes demand.
+	// Sustained LRU churn keeps recently accessed pages nonexpired.
 	margin := min(s.Capacity/2, max(uint64(4096), c.growth/2))
-	if s.Used < s.Capacity-margin {
+	if !cacheHasGrowthDemand(s, margin) {
 		return
 	}
 	request := min(s.Maximum-s.Capacity, min(cacheMaxBatch, max(cacheBudgetUnit, c.growth*2)))
@@ -215,6 +217,15 @@ func (c *elasticCacheController) adjust(tick bool) {
 	c.growth = delta
 	c.setWatermark(delta)
 	c.shrinkAfter = time.Now().Add(2 * cacheAge)
+}
+
+func cacheHasGrowthDemand(s diffstore.BudgetSnapshot, margin uint64) bool {
+	if s.Capacity == 0 {
+		return false
+	}
+	active := s.Used - min(s.Used, s.Expired)
+	threshold := s.Capacity - min(s.Capacity, margin)
+	return active >= threshold
 }
 
 func (c *elasticCacheController) shrinkTo(target, prior uint64) bool {
