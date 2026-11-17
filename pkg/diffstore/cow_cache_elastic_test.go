@@ -109,6 +109,35 @@ func TestCOWCacheAgeOnlyMarksAndHitRevives(t *testing.T) {
 	checkRead(t, disk, 0, bytes.Repeat([]byte{0x40}, cowBlockSize))
 }
 
+func TestCOWCacheAgeObservesEntireIdlePrefix(t *testing.T) {
+	const pageCount = cleanAgeBatchPages + 1
+	// Populate Clean metadata with a known last-access time, without a
+	// wall-clock sleep or writing 32 MiB of unrelated fixture data.
+	disk := &Disk{}
+	cache := &Cache{started: time.Now().Add(-time.Minute), pages: make(map[cacheKey]*cachePage, pageCount)}
+	for block := range int64(pageCount) {
+		key := cacheKey{disk, block}
+		p := &cachePage{key: key, state: cacheClean, zero: true}
+		cache.pages[key] = p
+		cache.clean.push(p)
+	}
+	last := cache.clean.last
+	last.zero = false
+	last.data = &[cowBlockSize]byte{0x67}
+
+	if idle := cache.AgeClean(time.Second); idle != pageCount*cowBlockSize {
+		t.Fatalf("first observation accounted for %d of %d bytes", idle, pageCount*cowBlockSize)
+	}
+	var buf [1]byte
+	n, err := cache.read(context.Background(), disk, buf[:], last.key.block*cowBlockSize)
+	if err != nil || n != len(buf) || buf[0] != 0x67 {
+		t.Fatalf("idle page hit: n=%d byte=%x err=%v", n, buf[0], err)
+	}
+	if s := cache.BudgetSnapshot(); s.Expired != (pageCount-1)*cowBlockSize || s.Used != pageCount*cowBlockSize {
+		t.Fatalf("reading a marked page changed the wrong counters: %+v", s)
+	}
+}
+
 // Concurrent I/O must never observe an unmapped or unprepared page while
 // physical capacity is growing or shrinking in the background.
 func TestElasticCacheConcurrentResizeIO(t *testing.T) {

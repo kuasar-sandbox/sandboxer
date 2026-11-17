@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -13,6 +14,7 @@ import (
 const (
 	DefaultCacheSize      = 32 << 20
 	DefaultMaxDirtySize   = 16 << 20
+	cleanAgeBatchPages    = 8192
 	maxWritebackPages     = (1 << 20) / cowBlockSize
 	maxWritebackMutations = (4 << 20) / cowBlockSize
 )
@@ -364,23 +366,30 @@ func (c *Cache) pushCleanLocked(p *cachePage) {
 	c.clean.push(p)
 }
 
-// AgeClean only marks old clean pages as reclaimable. It deliberately does
-// not free pages or invoke system calls: reclaim happens in budget-sized batches.
+// AgeClean counts Clean pages idle at one observation time. It does not evict
+// them. A large observation releases the I/O lock between metadata batches.
 func (c *Cache) AgeClean(olderThan time.Duration) uint64 {
 	if olderThan <= 0 {
 		return 0
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	cutoff := time.Since(c.started).Nanoseconds() - int64(olderThan)
-	for marked := 0; marked < 8192 && c.clean.first != nil && c.clean.first.lastTouch <= cutoff; marked++ {
-		p := c.clean.first
-		c.clean.remove(p)
-		p.expired = true
-		c.expired.push(p)
-		c.expiredPages++
+	for {
+		c.mu.Lock()
+		for marked := 0; marked < cleanAgeBatchPages; marked++ {
+			p := c.clean.first
+			if p == nil || p.lastTouch > cutoff {
+				idle := uint64(c.expiredPages) * cowBlockSize
+				c.mu.Unlock()
+				return idle
+			}
+			c.clean.remove(p)
+			p.expired = true
+			c.expired.push(p)
+			c.expiredPages++
+		}
+		c.mu.Unlock()
+		runtime.Gosched()
 	}
-	return uint64(c.expiredPages) * cowBlockSize
 }
 
 // Allocate a broadcast generation only when someone actually waits. Hot page
