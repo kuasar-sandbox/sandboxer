@@ -174,6 +174,7 @@ objects stay absent unless a consumer resolves a documented default.
 | `resources.startup.memory` | Size; capacity memory | Positive, at most capacity; independent of allocatable headroom |
 | `resources.diff_cow.cache_size` | Size; `32MiB` | Sandbox-wide cache, positive 4 KiB multiple |
 | `resources.diff_cow.max_dirty_size` | Size; derived from final cache | Positive 4 KiB multiple no larger than total; [derivation and overlays](#diff-cow-policy) |
+| `resources.diff_cow.cache_idle_after` | Positive duration; `10s` | Time since the last Clean-page access before it counts as idle; does not invalidate or immediately reclaim pages |
 | `resources.diff_cow.discard` | `auto` or `manual`; `auto` | Cold-start policy for all managed writable ext4 mounts; explicit input is rejected on memory restore; [policy](#diff-cow-policy) |
 
 `CgroupFD` is an inherited Go/runtime capability, not a YAML field. The equations,
@@ -400,6 +401,7 @@ resources:
   diff_cow:
     cache_size: 32MiB
     max_dirty_size: 16MiB
+    cache_idle_after: 10s
     discard: auto
 ```
 
@@ -447,9 +449,30 @@ configurable alternate write mode.
 
 `max_dirty_size` is a subset of `cache_size`, never an additional pool or a
 reserved partition. Clean pages may use the entire cache when there are no dirty
-pages. Adding a disk does not multiply either limit. These host process resources
-are independent of guest capacity, allocatable/startup headroom and VMM overhead:
-`sandbox-ctl` is outside the VMM cgroup. No resource-controller changes are needed.
+pages. Adding a disk does not multiply either limit. With a node controller that
+negotiates cache grants, `cache_size` is the sandbox maximum: admission grants
+only a small initial cache budget, and the current budget grows with I/O demand.
+The effective dirty limit is `min(current budget, max_dirty_size)`. Idle clean
+cache is evicted and its physical pages returned before the node regrants it.
+The payload remains charged to `sandbox-ctl` in the existing `ctl/` cgroup;
+Guest balloon, Guest reservation and `vmm/` controls are unchanged.
+
+
+`cache_idle_after` controls only the Clean-page idle statistic. Clean
+pages remain valid and may be read or touched again without a forced cache miss.
+When observed idle Clean memory reaches one 4 MiB internal unit, the sandbox
+starts the same gentle asynchronous reclaim worker used for node requests.
+The worker first returns unused physical buffers, then uses Clean LRU without
+checking idle age again. A node reclaim amount is advisory: the sandbox may
+return fewer bytes or none, reports attempt completion, and the node only
+credits physically released bytes. Both initial and runtime cache grants use
+a 4 MiB internal unit, with valid smaller configured tails supported.
+
+Elastic backing requires 4 KiB host pages and disables transparent huge pages
+on its own mappings so each fault and return respects the grant. A host that
+cannot provide this granularity, or a controller connection that does not
+negotiate cache grants, uses the fixed-capacity cache. The default maximum is
+32 MiB. Configure `cache_size: 1GiB` explicitly for 500 MiB–1 GiB peak working sets.
 
 Cold start, `run --from`, and restore resolve cache budgets for this instance.
 Runtime configuration retains those budgets for that sandbox's lifecycle; a new

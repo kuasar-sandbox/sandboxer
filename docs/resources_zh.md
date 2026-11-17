@@ -113,6 +113,15 @@ Wire 名保留兼容含义：`floor_memory_bytes` 是稳定期 headroom，`start
 InitialBudget，`allocatable_at_snapshot` 是恢复 BudgetAtSnapshot，不能把它们都解释为 RSS 观测。
 未知的已声明 client feature 为 peer compatibility 而忽略。Portable E/S 不保存这套 Host 所有权协议。
 
+双方协商 `cache_budget_v1` 后，Admit 同时核准 Guest 初始预算和最小
+`cache_initial` 缓存预算，并固定本轮 `cache_maximum` 上限。运行中的
+`request_cache_budget` 携带安全的绝对 `cache_current`、申请增量
+`cache_requested` 和节点回复的 `cache_reservation`。
+heartbeat 返回的 `cache_reclaim_target` 是待执行目标，不代表已回收；
+`state_sync` 在应答丢失或节点重启后重新核对已保留额度。
+缓存先获得授权再分配物理页，真正归还物理页后才允许节点转授；
+Guest Budget、balloon 与 `memory.high` 保持原机制。
+
 <a id="resource-states"></a>
 
 ### Lifecycle states

@@ -157,6 +157,7 @@ Size 是 `512MiB` 等字节大小字符串；duration 是 `30s` 等 Go duration 
 | `resources.startup.memory` | Size；capacity memory | 正值、不超过 capacity；与 allocatable headroom 独立 |
 | `resources.diff_cow.cache_size` | Size；`32MiB` | 全 sandbox 共享 cache；正的 4 KiB 整数倍 |
 | `resources.diff_cow.max_dirty_size` | Size；从最终 cache 推导 | 正的 4 KiB 整数倍且不超过总额；见[推导和覆盖](#diff-cow-policy) |
+| `resources.diff_cow.cache_idle_after` | 正时长；默认 `10s` | Clean 页多久未访问后计入闲置缓存统计；不失效、不立即回收 |
 | `resources.diff_cow.discard` | `auto` 或 `manual`；`auto` | 所有受管可写 ext4 的冷启动挂载策略；内存恢复拒绝显式输入；见[策略说明](#diff-cow-policy) |
 
 `CgroupFD` 是继承的 Go/runtime capability，不是 YAML 字段。方程、预留协议和失败行为见[资源](resources_zh.md)。
@@ -370,6 +371,7 @@ resources:
   diff_cow:
     cache_size: 32MiB
     max_dirty_size: 16MiB
+    cache_idle_after: 10s
     discard: auto
 ```
 
@@ -408,8 +410,26 @@ Go SDK 调用方应在 `StartRuntime` 之前通过 `RuntimeSpec.Resources.DiffCO
 关闭开关、数据 I/O 失败后触发的 buffered 重试或可配置的其他写入模式。
 
 `max_dirty_size` 是 `cache_size` 的子集，不是额外池或预留分区。没有脏页时 clean 可以使用
-全部缓存。添加磁盘不会乘以预算。这些 host 进程资源独立于 guest capacity、allocatable/startup
-headroom 和 VMM overhead：`sandbox-ctl` 不在 VMM cgroup 中，无需改资源控制器。
+全部缓存。添加磁盘不会乘以预算。在支持缓存预算协议的节点上，`cache_size` 是单沙箱上限，
+启动准入只授予最小缓存预算，随后根据 I/O 按需增长；脏页上限始终为
+`min(当前预算, max_dirty_size)`。空闲 clean 页批量淘汰并真正还页后，才向同一节点
+资源池返还额度。缓存物理页留在 `sandbox-ctl` 所属的 `ctl/` cgroup，
+不修改 Guest 内存预算、balloon 或 `vmm/` 控制。
+
+
+`cache_idle_after` 仅控制 Clean 页闲置状态的统计时间，允许按业务复用周期调优。
+超过时长仍保持页可读、可命中；再次访问即撤销闲置标记。闲置容量累计达到一个
+4 MiB 内部单位时，沙箱才启动温和的异步回收；优先归还空闲缓冲，必要时
+直接按 Clean LRU 淘汰，不再检查该页的闲置时长。
+节点遇到内存竞争时也仅提出建议回收额度，使用同一回收流程；实际可以不足额
+甚至归还 0 字节，回收尝试完成后通知节点。只有物理内存真正释放后才扣减授额。
+首次和运行期均使用 4 MiB 的内部授额单位，允许合法的更小缓存尾部。
+
+弹性缓存要求宿主页大小为 4 KiB，并在自己的内存映射上禁用透明大页，
+使每次分配和归还都能按授额计量。宿主无法提供该粒度、未配置控制器或对端
+未协商缓存授额时，使用固定容量缓存。
+默认 `cache_size` 仍为 32 MiB；需要 500 MiB–1 GiB 高峰工作集时，应显式设置
+`cache_size: 1GiB`，由节点资源池决定实际可获准的当前额度。
 
 冷启动、`run --from` 与 restore 为当前实例解析缓存预算。运行配置保留该沙箱生命周期的
 预算；新恢复实例使用本次 Host 缓存配置。Portable C0/E/S 不包含缓存策略、页、队列或 LRU 状态。

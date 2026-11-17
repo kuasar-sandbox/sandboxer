@@ -27,17 +27,19 @@ const DefaultAdminListPageSize = 128
 
 // Message types. See docs/resources.md#resource-protocol.
 const (
-	TypeAdmit          = "admit"
-	TypeAdmitResponse  = "admit_response"
-	TypeSettled        = "settled"
-	TypeRequestBudget  = "request_budget"
-	TypeBudgetResponse = "budget_response"
-	TypeOOMReport      = "oom_report"
-	TypeHeartbeat      = "heartbeat"
-	TypeRelease        = "release"
-	TypeAck            = "ack"
-	TypeStateSync      = "state_sync"
-	TypeError          = "error"
+	TypeAdmit               = "admit"
+	TypeAdmitResponse       = "admit_response"
+	TypeSettled             = "settled"
+	TypeRequestBudget       = "request_budget"
+	TypeBudgetResponse      = "budget_response"
+	TypeRequestCacheBudget  = "request_cache_budget"
+	TypeCacheBudgetResponse = "cache_budget_response"
+	TypeOOMReport           = "oom_report"
+	TypeHeartbeat           = "heartbeat"
+	TypeRelease             = "release"
+	TypeAck                 = "ack"
+	TypeStateSync           = "state_sync"
+	TypeError               = "error"
 
 	TypeAdminDrain  = "admin_drain"
 	TypeAdminStatus = "admin_status"
@@ -88,6 +90,7 @@ type Message struct {
 	FloorMemoryBytes      uint64   `json:"floor_memory_bytes,omitempty"`
 	FloorCPU              float64  `json:"floor_cpu,omitempty"`
 	StartupBudgetMemory   uint64   `json:"startup_budget_memory,omitempty"`
+	CacheInitial          uint64   `json:"cache_initial,omitempty"`
 	AllocatableAtSnapshot uint64   `json:"allocatable_at_snapshot,omitempty"`
 	CgroupPath            string   `json:"cgroup_path,omitempty"`
 	ClientFeatures        []string `json:"client_features,omitempty"`
@@ -97,6 +100,7 @@ type Message struct {
 	// holds the connection on short-term block instead of returning queued).
 	Status              string `json:"status,omitempty"`
 	GrantedInitialAlloc uint64 `json:"granted_initial_alloc,omitempty"`
+	GrantedInitialCache uint64 `json:"granted_initial_cache,omitempty"`
 	// QueuedETAMs is deprecated (server no longer surfaces Queued status);
 	// retained to preserve wire-format BC with older clients.
 	QueuedETAMs int64 `json:"queued_eta_ms,omitempty"`
@@ -118,6 +122,8 @@ type Message struct {
 	// baseline. PreviousToken is diagnostic context only; the server
 	// authenticates the request from the lease lock and SO_PEERCRED.
 	AppliedAllocatableMemory uint64 `json:"applied_allocatable_memory,omitempty"`
+	AppliedCacheReservation  uint64 `json:"applied_cache_reservation,omitempty"`
+	AppliedCacheMaximum      uint64 `json:"applied_cache_maximum,omitempty"`
 	Settled                  bool   `json:"settled,omitempty"`
 	PreviousToken            string `json:"previous_token,omitempty"`
 
@@ -129,6 +135,18 @@ type Message struct {
 	GrantedDelta   uint64 `json:"granted_delta,omitempty"`
 	NewAllocatable uint64 `json:"new_allocatable,omitempty"` // resulting/echoed reservation
 	CooldownMs     int64  `json:"cooldown_ms,omitempty"`
+
+	// Cache is a separate host-memory reservation sharing the node memory
+	// pool with Guest Budget. CacheCurrent is a safe, physically completed
+	// baseline; returning it to the node never assumes reclaim from RSS alone.
+	CacheCurrent       uint64 `json:"cache_current,omitempty"`
+	CacheRequested     uint64 `json:"cache_requested,omitempty"`
+	CacheMaximum       uint64 `json:"cache_maximum,omitempty"`
+	CacheGranted       uint64 `json:"cache_granted,omitempty"`
+	CacheReservation   uint64 `json:"cache_reservation,omitempty"`
+	CacheReclaimTarget uint64 `json:"cache_reclaim_target,omitempty"`
+	CacheReclaimSeq    uint64 `json:"cache_reclaim_seq,omitempty"`
+	CacheReclaimDone   uint64 `json:"cache_reclaim_done,omitempty"`
 
 	// OOMReport.
 	OOMCount  uint64 `json:"oom_count,omitempty"`
