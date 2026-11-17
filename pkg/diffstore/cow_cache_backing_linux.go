@@ -22,10 +22,33 @@ type elasticBacking struct {
 
 const elasticSegmentBytes = 2 << 20
 
-// ElasticCacheSupported prevents 4KiB COW slots from being reclaimed through
-// a larger host page. MADV_DONTNEED on a 16/64KiB host would otherwise drop
-// live adjacent slots. Existing fixed-size cache remains usable on such hosts.
-func ElasticCacheSupported() bool { return safeElasticHostPageSize(os.Getpagesize()) == nil }
+// ElasticCacheSupported checks that a grant can be faulted and discarded at
+// 4 KiB granularity before advertising cache budget support to the node.
+func ElasticCacheSupported() bool {
+	if safeElasticHostPageSize(os.Getpagesize()) != nil {
+		return false
+	}
+	m, err := mapElasticSegment()
+	if err != nil {
+		return false
+	}
+	return unix.Munmap(m) == nil
+}
+
+// Each elastic slot is charged and returned independently. A transparent
+// huge page can fault in an entire segment for one slot, or refill holes in
+// a partially reclaimed segment. Keep these mappings on ordinary pages.
+func mapElasticSegment() ([]byte, error) {
+	m, err := unix.Mmap(-1, 0, elasticSegmentBytes, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Madvise(m, unix.MADV_NOHUGEPAGE); err != nil {
+		_ = unix.Munmap(m)
+		return nil, fmt.Errorf("disable transparent huge pages: %w", err)
+	}
+	return m, nil
+}
 
 func safeElasticHostPageSize(size int) error {
 	if size != cowBlockSize {
@@ -40,7 +63,7 @@ func (e *elasticBacking) prepare(target int) error {
 	}
 	for e.resident < target {
 		if len(e.retired) == 0 {
-			m, err := unix.Mmap(-1, 0, elasticSegmentBytes, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
+			m, err := mapElasticSegment()
 			if err != nil {
 				return fmt.Errorf("diffstore: allocate cache virtual segment: %w", err)
 			}
@@ -170,7 +193,7 @@ func (e *elasticBacking) stagePrepare(count int) (_ *elasticPrepared, retErr err
 	}
 	remaining := count - p.reused
 	for remaining > 0 {
-		m, err := unix.Mmap(-1, 0, elasticSegmentBytes, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
+		m, err := mapElasticSegment()
 		if err != nil {
 			return nil, fmt.Errorf("diffstore: grow cache backing: %w", err)
 		}

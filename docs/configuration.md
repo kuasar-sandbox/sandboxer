@@ -468,11 +468,11 @@ return fewer bytes or none, reports attempt completion, and the node only
 credits physically released bytes. Both initial and runtime cache grants use
 a 4 MiB internal unit, with valid smaller configured tails supported.
 
-With no controller, an older controller, or a host page size other than 4 KiB,
-the original fixed-capacity cache behavior is retained. The current elastic
-physical reclaim supports 4 KiB host pages only; 16/64 KiB hosts never run
-4 KiB granular MADV_DONTNEED on live cache backing. The default maximum is still 32 MiB; configure
-`cache_size: 1GiB` explicitly for 500 MiB–1 GiB peak working sets.
+Elastic backing requires 4 KiB host pages and disables transparent huge pages
+on its own mappings so each fault and return respects the grant. A host that
+cannot provide this granularity, or a controller connection that does not
+negotiate cache grants, uses the fixed-capacity cache. The default maximum is
+32 MiB. Configure `cache_size: 1GiB` explicitly for 500 MiB–1 GiB peak working sets.
 
 Cold start, `run --from`, and restore resolve cache budgets for this instance.
 Runtime configuration retains those budgets for that sandbox's lifecycle; a new

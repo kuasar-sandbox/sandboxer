@@ -145,8 +145,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 	h.cacheMaximum = cacheMax
 	cacheFeatures := []string{resource.FeatureStateSyncV1}
 	if !diffstore.ElasticCacheSupported() {
-		// Keep the original fixed-capacity cache on larger host pages.
-		// 4KiB MADV_DONTNEED would otherwise corrupt adjacent live slots.
+		// Keep the fixed cache if payload pages cannot be charged and returned individually.
 		h.cacheMaximum = 0
 	} else {
 		cacheFeatures = append(cacheFeatures, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(cacheMax))

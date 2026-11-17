@@ -216,8 +216,15 @@ func (c *Cache) TryResizeCapacity(size uint64) (bool, error) {
 	target := int(size / cowBlockSize)
 	// Serializes backing ownership and unmap without blocking foreground
 	// cache accesses during an ordinary capacity grow.
+	var report func(error)
+	var fatal error
 	c.resizeMu.Lock()
-	defer c.resizeMu.Unlock()
+	defer func() {
+		c.resizeMu.Unlock()
+		if report != nil {
+			report(fatal)
+		}
+	}()
 	c.mu.Lock()
 	if err := c.checkLocked(context.Background()); err != nil {
 		c.mu.Unlock()
@@ -237,12 +244,9 @@ func (c *Cache) TryResizeCapacity(size uint64) (bool, error) {
 			var rollback *cacheBackingRollbackFailure
 			if errors.As(err, &rollback) {
 				c.mu.Lock()
-				report := c.failLocked(fmt.Errorf("diffstore: unrecoverable cache backing error: %w", err))
-				fatal := c.err
+				fatal = fmt.Errorf("diffstore: unrecoverable cache backing error: %w", err)
+				report = c.failLocked(fatal)
 				c.mu.Unlock()
-				if report != nil {
-					report(fatal)
-				}
 			}
 			return false, err
 		}
@@ -250,8 +254,7 @@ func (c *Cache) TryResizeCapacity(size uint64) (bool, error) {
 		// resizeMu also fences Close, so the backing remains live.
 		if err := c.checkLocked(context.Background()); err != nil {
 			c.mu.Unlock()
-			_ = prepared.abort()
-			return false, err
+			return false, errors.Join(err, prepared.abort())
 		}
 		backing.installPrepared(prepared)
 		c.capacity = target
@@ -300,8 +303,9 @@ func (c *Cache) TryResizeCapacity(size uint64) (bool, error) {
 				rollbackErr = c.backing.prepare(c.capacity)
 			}
 			if rollbackErr != nil {
-				c.failLocked(fmt.Errorf("diffstore: cache physical resize rollback failed: %w", rollbackErr))
-				return false, fmt.Errorf("diffstore: resize failed: %w (rollback: %v)", err, rollbackErr)
+				fatal = fmt.Errorf("diffstore: cache physical resize failed: %w (rollback: %w)", err, rollbackErr)
+				report = c.failLocked(fatal)
+				return false, fatal
 			}
 			return false, err
 		}

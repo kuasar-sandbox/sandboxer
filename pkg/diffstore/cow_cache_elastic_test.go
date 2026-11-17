@@ -235,3 +235,68 @@ func TestElasticCacheMultipleDisksShareCapacity(t *testing.T) {
 	checkRead(t, root, 12, bytes.Repeat([]byte{0x62}, cowBlockSize))
 	checkRead(t, data, 12, bytes.Repeat([]byte{0x91}, cowBlockSize))
 }
+
+func TestElasticCacheSubsegmentPhysicalBudget(t *testing.T) {
+	if !ElasticCacheSupported() {
+		t.Skip("elastic cache requires independently chargeable 4 KiB pages")
+	}
+	const first = cowBlockSize
+	const larger = elasticSegmentBytes + cowBlockSize
+	cache, err := NewElasticCache(larger, first, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+	// Neither the untouched part of a new segment nor the retired slots of
+	// an existing segment may become resident outside the granted budget.
+	for _, size := range []uint64{first, larger, first, larger} {
+		if ok, err := cache.TryResizeCapacity(size); !ok || err != nil {
+			t.Fatalf("resize to %d: ok=%v err=%v", size, ok, err)
+		}
+		var pages int
+		for _, m := range cache.backing.mappings {
+			pages += mappedResidentPages(t, m)
+		}
+		if got := uint64(pages) * cowBlockSize; got != size {
+			t.Fatalf("budget %d, kernel reports %d resident bytes", size, got)
+		}
+	}
+}
+
+func TestResizeRollbackReportsFatalOutsideLocks(t *testing.T) {
+	if !ElasticCacheSupported() {
+		t.Skip("elastic cache requires independently chargeable 4 KiB pages")
+	}
+	cache, err := NewElasticCache(4*cowBlockSize, cowBlockSize, 4*cowBlockSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Inject a backing count that both the requested shrink and its rollback
+	// cannot restore from available pages. Neither operation touches memory.
+	cache.backing.resident += len(cache.backing.available) + 1
+	reported := make(chan error, 1)
+	cache.SetFatalHandler(func(fatal error) {
+		if got := cache.Close(); got != fatal {
+			t.Errorf("close error %v, expected sticky error %v", got, fatal)
+		}
+		reported <- fatal
+	})
+	resized := make(chan error, 1)
+	go func() {
+		_, err := cache.TryResizeCapacity(cowBlockSize)
+		resized <- err
+	}()
+	select {
+	case got := <-resized:
+		select {
+		case fatal := <-reported:
+			if got == nil || got != fatal {
+				t.Fatalf("resize error %v, reported %v", got, fatal)
+			}
+		default:
+			t.Fatal("fatal handler did not run")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("fatal handler could not close cache after rollback")
+	}
+}
