@@ -161,17 +161,35 @@ func TestElasticCacheQueuedIOWakePreservesGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer disk.Close()
-	if _, err = disk.WriteAt(make([]byte, cacheBudgetUnit/2), 0); err != nil {
-		t.Fatal(err)
-	}
 	c := &elasticCacheController{
 		cache: cache, hooks: h, ctx: ctx, wake: make(chan struct{}, 1),
 		growth: cacheBudgetUnit, idleAfter: time.Hour,
 	}
+	c.setWatermark(c.growth)
+	const miB = 1 << 20
+	if _, err = disk.WriteAt(make([]byte, miB-4096), 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.wake) != 0 {
+		t.Fatal("growth signaled before a quarter of the initial grant was used")
+	}
+	if _, err = disk.WriteAt(make([]byte, 4096), miB-4096); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c.wake:
+	default:
+		t.Fatal("one MiB of demand did not wake the controller")
+	}
+	// Fill the initial grant before handling the wake. After the first
+	// growth these same four MiB still exceed the new watermark.
+	if _, err = disk.WriteAt(make([]byte, 3*miB), miB); err != nil {
+		t.Fatal(err)
+	}
 	c.adjust(false)
 	grant := cache.BudgetSnapshot().Capacity
-	if grant <= cacheBudgetUnit || grant != h.CacheReservation() {
-		t.Fatalf("initial growth: capacity=%d reservation=%d", grant, h.CacheReservation())
+	if grant != 12*miB || grant != h.CacheReservation() {
+		t.Fatalf("first runtime grant: capacity=%d reservation=%d", grant, h.CacheReservation())
 	}
 	c.adjust(false)
 	if got := cache.BudgetSnapshot().Capacity; got != grant {

@@ -106,9 +106,16 @@ type elasticCacheController struct {
 	idleAfter       time.Duration
 }
 
+// Start preparing the next grant while existing slots can still serve a burst.
+// Require at least a quarter of the current capacity to be active, and allow
+// at most one maximum grant of headroom before signaling growth.
+func cacheGrowthMargin(capacity, lastGrant uint64) uint64 {
+	return min(capacity-capacity/4, cacheMaxBatch, max(uint64(4096), lastGrant*2))
+}
+
 func (c *elasticCacheController) setWatermark(step uint64) {
 	capacity := c.cache.BudgetSnapshot().Capacity
-	margin := min(capacity/2, max(uint64(4096), step/2))
+	margin := cacheGrowthMargin(capacity, step)
 	c.cache.SetBudgetNotifier(c.wake, max(uint64(4096), capacity-margin))
 }
 
@@ -185,7 +192,7 @@ func (c *elasticCacheController) adjust(tick bool) {
 		c.lastDemand = s.Demand
 		return
 	}
-	margin := min(s.Capacity/2, max(uint64(4096), c.growth/2))
+	margin := cacheGrowthMargin(s.Capacity, c.growth)
 	if !cacheHasGrowthDemand(s, margin) {
 		c.pendingGrowth = false
 		return

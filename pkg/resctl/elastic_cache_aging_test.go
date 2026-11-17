@@ -27,3 +27,22 @@ func TestElasticCacheExpiredCleanCannotTriggerIdleRegrowth(t *testing.T) {
 		t.Fatal("full active cache lost growth demand")
 	}
 }
+
+func TestCacheGrowthMarginIsBoundedByOneGrant(t *testing.T) {
+	const miB = uint64(1 << 20)
+	for _, tc := range []struct {
+		capacity, previousGrant, margin uint64
+	}{
+		{4, 4, 3},
+		{12, 8, 9},
+		{28, 16, 21},
+		{60, 32, 32},
+		{512, 32, 32},
+		{512, 4, 8},
+	} {
+		if got := cacheGrowthMargin(tc.capacity*miB, tc.previousGrant*miB); got != tc.margin*miB {
+			t.Errorf("capacity %d MiB, previous grant %d MiB: margin %d, want %d",
+				tc.capacity, tc.previousGrant, got, tc.margin*miB)
+		}
+	}
+}
