@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/util"
@@ -14,9 +15,22 @@ import (
 // selects the cold-launch ext4 mount policy; it cannot reconfigure restored
 // mounts. None of these fields is included in portable Sandbox configuration.
 type DiffCOWConfig struct {
-	CacheSize    string `yaml:"cache_size,omitempty"`
-	MaxDirtySize string `yaml:"max_dirty_size,omitempty"`
-	Discard      string `yaml:"discard,omitempty"`
+	CacheSize      string `yaml:"cache_size,omitempty"`
+	CacheIdleAfter string `yaml:"cache_idle_after,omitempty"`
+	MaxDirtySize   string `yaml:"max_dirty_size,omitempty"`
+	Discard        string `yaml:"discard,omitempty"`
+}
+
+// CacheIdleDuration is a Clean-page inactivity observation interval. It does not expire data.
+func (c DiffCOWConfig) CacheIdleDuration() (time.Duration, error) {
+	if c.CacheIdleAfter == "" {
+		return 10 * time.Second, nil
+	}
+	d, err := time.ParseDuration(c.CacheIdleAfter)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("resources.diff_cow.cache_idle_after must be a positive duration (got %q)", c.CacheIdleAfter)
+	}
+	return d, nil
 }
 
 func (c *DiffCOWConfig) defaults() {
@@ -82,6 +96,9 @@ func (c DiffCOWConfig) Bytes() (uint64, uint64, error) {
 // sizes shares validation and default calculation between partial validation
 // and final resolution. YAML decoding deliberately validates only each leaf.
 func (c DiffCOWConfig) sizes(resolve bool) (uint64, uint64, error) {
+	if _, err := c.CacheIdleDuration(); err != nil {
+		return 0, 0, err
+	}
 	if _, err := c.DiscardMode(); err != nil {
 		return 0, 0, err
 	}
@@ -119,13 +136,23 @@ func (c *DiffCOWConfig) UnmarshalYAML(node *yaml.Node) error {
 	seen := make(map[string]bool)
 	for i := 0; i < len(node.Content); i += 2 {
 		key, val := node.Content[i].Value, node.Content[i+1]
-		if key != "cache_size" && key != "max_dirty_size" && key != "discard" {
+		if key != "cache_size" && key != "max_dirty_size" && key != "discard" && key != "cache_idle_after" {
 			return fmt.Errorf("field %s not found in type config.DiffCOWConfig", key)
 		}
 		if seen[key] {
 			return fmt.Errorf("resources.diff_cow.%s duplicated", key)
 		}
 		seen[key] = true
+		if key == "cache_idle_after" {
+			if val.Kind != yaml.ScalarNode || val.Tag != "!!str" || val.Value == "" {
+				return fmt.Errorf("resources.diff_cow.cache_idle_after must be a positive duration string")
+			}
+			if _, err := (DiffCOWConfig{CacheIdleAfter: val.Value}).CacheIdleDuration(); err != nil {
+				return err
+			}
+			c.CacheIdleAfter = val.Value
+			continue
+		}
 		if key == "discard" {
 			if val.Kind != yaml.ScalarNode || val.Tag != "!!str" || val.Value == "" {
 				return fmt.Errorf("resources.diff_cow.discard must be auto or manual")

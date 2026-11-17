@@ -56,6 +56,7 @@ type ControllerHooks struct {
 	cacheReservation   uint64
 	cacheSupported     bool
 	cacheReclaimTarget uint64
+	cacheReclaimSeq    uint64
 	cacheWake          chan struct{}
 	previousToken      string
 	released           bool
@@ -295,7 +296,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 			CapacityCPU:      h.cfg.Resources.Capacity.CPU,
 			FloorMemoryBytes: headroom, FloorCPU: h.cfg.Resources.Allocatable.CPU,
 			StartupBudgetMemory: startupBudget, AllocatableAtSnapshot: budgetAtSnapshot,
-			CgroupPath: h.controllerCgroupPath, ClientFeatures: cacheFeatures, CacheMaximum: h.cacheMaximum, CacheInitial: min(h.cacheMaximum, uint64(8<<20)),
+			CgroupPath: h.controllerCgroupPath, ClientFeatures: cacheFeatures, CacheMaximum: h.cacheMaximum, CacheInitial: min(h.cacheMaximum, cacheBudgetUnit),
 		})
 		if resource.IsTransportError(err) {
 			h.setConnected(false)
@@ -321,7 +322,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 			return 0, fmt.Errorf("admit granted partial/incorrect initial reservation %d, require exactly %d", res.GrantedInitialAlloc, initialBudget)
 		}
 		if res.CacheSupported {
-			expectedCache := min(h.cacheMaximum, uint64(8<<20))
+			expectedCache := min(h.cacheMaximum, cacheBudgetUnit)
 			if res.GrantedInitialCache != expectedCache {
 				return 0, fmt.Errorf("admit cache initial grant %d differs from %d", res.GrantedInitialCache, expectedCache)
 			}
@@ -488,7 +489,7 @@ func (h *ControllerHooks) heartbeatOnce() {
 			h.markDisconnectedLocked(fmt.Errorf("heartbeat cache reservation mismatch node=%d local=%d", res.CacheReservation, state.cacheReservation))
 			return
 		}
-		h.setCacheTarget(res.CacheReclaimTarget)
+		h.setCacheTarget(res.CacheReclaimTarget, res.CacheReclaimSeq)
 	}
 	if res == nil || res.NewAllocatable != state.reservation {
 		got := uint64(0)
@@ -594,6 +595,7 @@ func (h *ControllerHooks) reconnectLoop() {
 					h.mu.Lock()
 					h.connected, h.previousToken = true, result.Token
 					h.cacheReclaimTarget = result.CacheReclaimTarget
+					h.cacheReclaimSeq = result.CacheReclaimSeq
 					select {
 					case h.cacheWake <- struct{}{}:
 					default:

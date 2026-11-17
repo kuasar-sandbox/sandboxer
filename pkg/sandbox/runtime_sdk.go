@@ -878,7 +878,11 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if err != nil {
 		return fail(err)
 	}
-	cache, stopCache, err := resctl.NewCacheWithBudget(r.lifeCtx, r.hooks, cacheSize, dirtySize)
+	idleAfter, err := cfg.Resources.DiffCOW.CacheIdleDuration()
+	if err != nil {
+		return fail(err)
+	}
+	cache, stopCache, err := resctl.NewCacheWithBudget(r.lifeCtx, r.hooks, cacheSize, dirtySize, idleAfter)
 	if err != nil {
 		return fail(err)
 	}

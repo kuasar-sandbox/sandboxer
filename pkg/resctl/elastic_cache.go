@@ -11,27 +11,30 @@ import (
 )
 
 const (
-	cacheBudgetUnit           = uint64(8 << 20)
+	cacheBudgetUnit           = uint64(4 << 20)
 	cacheMaxBatch             = uint64(32 << 20)
 	cachePhysicalBatch        = uint64(1 << 20)
 	cachePhysicalReclaimBatch = uint64(256 << 10)
-	cacheAge                  = 10 * time.Second
+	defaultCacheIdleAfter     = 10 * time.Second
 	cacheIdleTick             = time.Second
 	cacheRetryWait            = 250 * time.Millisecond
-	// Reclaim in 8MiB physical batches so foreground cache I/O can run
-	// between batches rather than blocking under one large LRU scan.
-	cacheActiveReclaimBatches = 32
-	cacheIdleReclaimBatches   = 4
 )
 
 // NewCacheWithBudget returns the existing fixed cache when the controller is
 // absent or predates cache grants. On negotiated nodes it acquires the initial
 // host memory grant before touching a single payload page, and returns a
 // lifetime-bound stop function for the autonomous cache budget loop.
-func NewCacheWithBudget(ctx context.Context, hooks *ControllerHooks, maximum, maxDirty uint64) (*diffstore.Cache, func(), error) {
+func NewCacheWithBudget(ctx context.Context, hooks *ControllerHooks, maximum, maxDirty uint64, idleAfter ...time.Duration) (*diffstore.Cache, func(), error) {
 	if hooks == nil || !hooks.CacheSupported() {
 		cache, err := diffstore.NewCache(maximum, maxDirty)
 		return cache, func() {}, err
+	}
+	cleanIdleAfter := defaultCacheIdleAfter
+	if len(idleAfter) > 0 {
+		cleanIdleAfter = idleAfter[0]
+	}
+	if cleanIdleAfter <= 0 {
+		return nil, nil, fmt.Errorf("cache_idle_after must be positive")
 	}
 	first := min(maximum, cacheBudgetUnit)
 	if first == 0 {
@@ -77,7 +80,7 @@ func NewCacheWithBudget(ctx context.Context, hooks *ControllerHooks, maximum, ma
 	done := make(chan struct{})
 	controller := &elasticCacheController{
 		cache: cache, hooks: hooks, ctx: life,
-		wake: make(chan struct{}, 1), growth: first,
+		wake: make(chan struct{}, 1), growth: first, idleAfter: cleanIdleAfter,
 	}
 	controller.setWatermark(first)
 	go func() { defer close(done); controller.run() }()
@@ -90,13 +93,17 @@ func NewCacheWithBudget(ctx context.Context, hooks *ControllerHooks, maximum, ma
 }
 
 type elasticCacheController struct {
-	cache       *diffstore.Cache
-	hooks       *ControllerHooks
-	ctx         context.Context
-	wake        chan struct{}
-	growth      uint64
-	growAfter   time.Time
-	shrinkAfter time.Time
+	cache           *diffstore.Cache
+	hooks           *ControllerHooks
+	ctx             context.Context
+	wake            chan struct{}
+	growth          uint64
+	growAfter       time.Time
+	lastDemand      uint64
+	pendingGrowth   bool
+	moreIdleReclaim bool
+	pendingAck      uint64
+	idleAfter       time.Duration
 }
 
 func (c *elasticCacheController) setWatermark(step uint64) {
@@ -122,60 +129,68 @@ func (c *elasticCacheController) run() {
 	}
 }
 
+// adjust is the only controller worker: idle-threshold and node-directed
+// requests both use the same bounded, asynchronous physical reclaim path.
 func (c *elasticCacheController) adjust(tick bool) {
 	if c.ctx.Err() != nil {
 		return
 	}
 	s := c.cache.BudgetSnapshot()
 	if tick {
-		_ = c.cache.AgeClean(cacheAge)
+		_ = c.cache.AgeClean(c.idleAfter)
 		s = c.cache.BudgetSnapshot()
 	}
 	minimum := min(s.Maximum, cacheBudgetUnit)
-	// Reclaim is a target, not a signal that the node has already obtained
-	// those bytes. The active cache keeps ownership until physical release
-	// succeeds and the node acknowledges the new baseline.
-	if wanted := c.hooks.CacheTarget(); wanted > 0 {
-		target := max(minimum, wanted)
-		for step := 0; step < cacheActiveReclaimBatches && s.Capacity > target; step++ {
-			if !c.shrinkTo(target, s.Capacity) {
-				break
-			}
-			s = c.cache.BudgetSnapshot()
+	target, seq := c.hooks.CacheRequest()
+	if target > 0 {
+		var released uint64
+		if (seq == 0 || seq != c.pendingAck) && s.Capacity > max(minimum, target) {
+			released = c.reclaimBudget(s.Capacity - max(minimum, target))
 		}
-		// Node-directed reclaimed cache should not immediately regrow.
+		// A lost acknowledgement may be retried without evicting more pages.
+		// StateSync can cancel this request or replace it with a new sequence.
+		if released > 0 || seq != 0 {
+			c.pendingAck = seq
+			if c.reportReclaim(seq) == nil {
+				c.pendingAck = 0
+			}
+		}
 		return
 	}
-	// Idle shrink can reuse a just expired entry until a whole unit can be
-	// returned. Keep one unit of headroom around nonexpired hot data.
-	if tick && time.Now().After(c.shrinkAfter) && s.Capacity > minimum {
-		shrank := false
-		for step := 0; step < cacheIdleReclaimBatches && s.Capacity > minimum; step++ {
-			reclaimable := s.Capacity - min(s.Capacity, s.Used-s.Expired)
-			if reclaimable < cacheBudgetUnit {
-				break
+	c.pendingAck = 0
+
+	// Observe unused grant headroom on maintenance ticks. A queued I/O wake
+	// from before a grant must not immediately return the newly granted pages.
+	if tick || c.moreIdleReclaim {
+		c.moreIdleReclaim = false
+		free := s.Capacity - s.Used
+		idle := free + s.Expired
+		if s.Capacity > minimum && idle >= cacheBudgetUnit {
+			wanted := min(s.Capacity-minimum, idle/cacheBudgetUnit*cacheBudgetUnit)
+			if released := c.reclaimBudget(wanted); released > 0 {
+				_ = c.reportReclaim(0)
+				if released == cacheMaxBatch && wanted > released {
+					c.moreIdleReclaim = true
+					c.notify()
+				}
+				return
 			}
-			next := s.Capacity - min(cacheBudgetUnit, s.Capacity-minimum)
-			if s.Used-s.Expired+min(cacheBudgetUnit/2, next/2) > next ||
-				!c.shrinkTo(next, s.Capacity) {
-				break
-			}
-			shrank = true
-			s = c.cache.BudgetSnapshot()
-		}
-		if shrank {
-			return
 		}
 	}
-	if time.Now().Before(c.growAfter) || s.Capacity >= s.Maximum || c.hooks.CacheTarget() != 0 {
+	if s.Demand > c.lastDemand {
+		c.pendingGrowth = true
+	}
+	if s.Capacity >= s.Maximum {
+		c.pendingGrowth = false
+		c.lastDemand = s.Demand
 		return
 	}
-	// Expired clean pages are still cache hits but no longer active demand.
-	// They must not trigger growth again after an idle shrink. A fresh hit
-	// revives the page in the existing LRU and re-establishes demand.
-	// Sustained LRU churn keeps recently accessed pages nonexpired.
 	margin := min(s.Capacity/2, max(uint64(4096), c.growth/2))
 	if !cacheHasGrowthDemand(s, margin) {
+		c.pendingGrowth = false
+		return
+	}
+	if !c.pendingGrowth || time.Now().Before(c.growAfter) {
 		return
 	}
 	request := min(s.Maximum-s.Capacity, min(cacheMaxBatch, max(cacheBudgetUnit, c.growth*2)))
@@ -192,8 +207,6 @@ func (c *elasticCacheController) adjust(tick bool) {
 		c.growAfter = time.Now().Add(cacheRetryWait)
 		return
 	}
-	// Grant in large batches, prepare physical pages in small batches to
-	// minimize lock hold times on foreground I/O.
 	applied := s.Capacity
 	for applied < newBudget && c.ctx.Err() == nil {
 		next := min(newBudget, applied+cachePhysicalBatch)
@@ -205,18 +218,25 @@ func (c *elasticCacheController) adjust(tick bool) {
 		runtime.Gosched()
 	}
 	if applied < newBudget {
-		// Never return physical capacity already used by a foreground writer.
 		if c.cache.Err() == nil && c.cache.BudgetSnapshot().Resident <= applied {
 			_, _, _, _, _ = c.hooks.RequestCacheBudget(applied, 0)
 		}
 		c.growth = max(cachePhysicalBatch, applied-s.Capacity)
 		c.setWatermark(c.growth)
-		c.growAfter = time.Now().Add(time.Second)
+		c.growAfter = time.Now().Add(cacheRetryWait)
 		return
 	}
+	c.lastDemand = s.Demand
+	c.pendingGrowth = false
 	c.growth = delta
 	c.setWatermark(delta)
-	c.shrinkAfter = time.Now().Add(2 * cacheAge)
+}
+
+func (c *elasticCacheController) notify() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
 }
 
 func cacheHasGrowthDemand(s diffstore.BudgetSnapshot, margin uint64) bool {
@@ -228,37 +248,52 @@ func cacheHasGrowthDemand(s diffstore.BudgetSnapshot, margin uint64) bool {
 	return active >= threshold
 }
 
-func (c *elasticCacheController) shrinkTo(target, prior uint64) bool {
-	if target >= prior || c.ctx.Err() != nil {
-		return false
+// reclaimBudget releases at most one bounded request per invocation. The caller
+// never requires the requested amount to be returned.
+func (c *elasticCacheController) reclaimBudget(request uint64) uint64 {
+	s := c.cache.BudgetSnapshot()
+	minimum := min(s.Maximum, cacheBudgetUnit)
+	if s.Capacity <= minimum || request == 0 || c.ctx.Err() != nil {
+		return 0
 	}
-	// Keep the lock-free I/O path alive and bound the amount of cache-list
-	// work done per invocation.
-	next := max(target, prior-cacheBudgetUnit)
-	applied := prior
+	size := min(request, min(cacheMaxBatch, s.Capacity-minimum))
+	beforeDemand := s.Demand
+	next := max(minimum, s.Capacity-size)
+	applied := s.Capacity
+	var reclaimedInBurst uint64
 	for applied > next && c.ctx.Err() == nil {
 		step := max(next, applied-cachePhysicalReclaimBatch)
 		ok, err := c.cache.TryResizeCapacity(step)
 		if err != nil || !ok {
 			break
 		}
+		reclaimedInBurst += applied - step
 		applied = step
-		runtime.Gosched()
+		if reclaimedInBurst >= (1 << 20) {
+			// The same gentle pacing applies to local and node-directed reclaim.
+			time.Sleep(time.Millisecond)
+			reclaimedInBurst = 0
+		} else {
+			runtime.Gosched()
+		}
 	}
-	if applied != next {
-		// A partly reclaimed cache remains charged at its previous node
-		// grant until a later successful complete batch.
-		return false
+	if applied < s.Capacity {
+		c.growth = cacheBudgetUnit
+		c.setWatermark(cacheBudgetUnit)
+		c.lastDemand = beforeDemand
+		c.pendingGrowth = false
 	}
-	if s := c.cache.BudgetSnapshot(); s.Resident > next {
-		return false
+	return s.Capacity - applied
+}
+
+// Physical pages are already returned when the node sees a lower baseline.
+// Keep the last confirmed charge if the backing hit a fatal rollback error.
+func (c *elasticCacheController) reportReclaim(seq uint64) error {
+	s := c.cache.BudgetSnapshot()
+	current := s.Capacity
+	if s.Resident > current {
+		current = c.hooks.CacheReservation()
 	}
-	// A failed / lost ACK retains the smaller safe local baseline in
-	// ControllerHooks; StateSync later reconciles node overcharge.
-	_, _, _, _, _ = c.hooks.RequestCacheBudget(next, 0)
-	c.growth = cacheBudgetUnit
-	c.setWatermark(cacheBudgetUnit)
-	c.growAfter = time.Now().Add(2 * time.Second)
-	c.shrinkAfter = time.Now().Add(cacheIdleTick)
-	return true
+	_, _, _, _, err := c.hooks.requestCacheBudget(current, 0, seq)
+	return err
 }

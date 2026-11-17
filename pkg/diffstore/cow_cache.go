@@ -99,6 +99,7 @@ type Cache struct {
 	hooks                         cacheHooks
 	writeBytes, writeBatches      uint64
 	peakUsed, peakDirty           int
+	policyDemandSeq               uint64
 }
 
 // BudgetSnapshot is constant-time and does not traverse cached pages. It is
@@ -110,6 +111,7 @@ type BudgetSnapshot struct {
 	Dirty    uint64
 	Expired  uint64
 	Resident uint64
+	Demand   uint64
 }
 
 func (c *Cache) BudgetSnapshot() BudgetSnapshot {
@@ -121,6 +123,7 @@ func (c *Cache) BudgetSnapshot() BudgetSnapshot {
 		Used:     uint64(len(c.pages)) * cowBlockSize,
 		Dirty:    uint64(c.dirtyUsed) * cowBlockSize,
 		Expired:  uint64(c.expiredPages) * cowBlockSize,
+		Demand:   c.policyDemandSeq,
 	}
 	if c.backing != nil {
 		result.Resident = uint64(c.backing.resident) * cowBlockSize
@@ -446,6 +449,7 @@ func (c *Cache) reserveLocked(key cacheKey, dirty bool) *cachePage {
 		c.clients[key.cow]++
 	}
 	c.pages[key] = p
+	c.policyDemandSeq++
 	if c.budgetWake != nil && len(c.pages) >= c.budgetThreshold {
 		select {
 		case c.budgetWake <- struct{}{}:

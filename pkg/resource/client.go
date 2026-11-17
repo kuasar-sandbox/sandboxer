@@ -310,6 +310,7 @@ type StateSyncResult struct {
 	Token              string
 	CacheReservation   uint64
 	CacheReclaimTarget uint64
+	CacheReclaimSeq    uint64
 	NewAllocatable     uint64 // echoed/reconciled node reservation
 }
 
@@ -346,7 +347,7 @@ func (c *Client) StateSyncContextOnWrite(ctx context.Context, p StateSyncParams,
 	c.mu.Lock()
 	c.token = resp.Token
 	c.mu.Unlock()
-	return &StateSyncResult{Token: resp.Token, NewAllocatable: resp.NewAllocatable, CacheReservation: resp.CacheReservation, CacheReclaimTarget: resp.CacheReclaimTarget}, nil
+	return &StateSyncResult{Token: resp.Token, NewAllocatable: resp.NewAllocatable, CacheReservation: resp.CacheReservation, CacheReclaimTarget: resp.CacheReclaimTarget, CacheReclaimSeq: resp.CacheReclaimSeq}, nil
 }
 
 // Settled marks the per-sandbox state machine's startup → settled
@@ -417,6 +418,7 @@ type HeartbeatResult struct {
 	NewAllocatable     uint64
 	CacheReservation   uint64
 	CacheReclaimTarget uint64
+	CacheReclaimSeq    uint64
 }
 
 // Heartbeat sends host-charge diagnostics and returns the node's current
@@ -446,7 +448,7 @@ func (c *Client) HeartbeatContext(ctx context.Context, rss, cpuUsec, recentHigh,
 	if resp.Type != TypeAck {
 		return nil, fmt.Errorf("client: heartbeat reply %q", resp.Type)
 	}
-	return &HeartbeatResult{NewAllocatable: resp.NewAllocatable, CacheReservation: resp.CacheReservation, CacheReclaimTarget: resp.CacheReclaimTarget}, nil
+	return &HeartbeatResult{NewAllocatable: resp.NewAllocatable, CacheReservation: resp.CacheReservation, CacheReclaimTarget: resp.CacheReclaimTarget, CacheReclaimSeq: resp.CacheReclaimSeq}, nil
 }
 
 // AdminDrain toggles drain mode on the controller.
@@ -655,10 +657,17 @@ type CacheBudgetResult struct {
 	Granted       uint64
 	Reservation   uint64
 	ReclaimTarget uint64
+	ReclaimSeq    uint64
 	CooldownMs    int64
 }
 
 func (c *Client) RequestCacheBudgetContext(ctx context.Context, current, delta, maximum uint64) (CacheBudgetResult, error) {
+	return c.RequestCacheBudgetWithAckContext(ctx, current, delta, maximum, 0)
+}
+
+// RequestCacheBudgetWithAckContext optionally marks one node reclaim request
+// complete. A zero actual release is a valid completion.
+func (c *Client) RequestCacheBudgetWithAckContext(ctx context.Context, current, delta, maximum, doneSeq uint64) (CacheBudgetResult, error) {
 	c.mu.Lock()
 	token := c.token
 	c.mu.Unlock()
@@ -667,7 +676,7 @@ func (c *Client) RequestCacheBudgetContext(ctx context.Context, current, delta, 
 	}
 	resp, err := c.roundTripContext(ctx, &Message{
 		Type: TypeRequestCacheBudget, Token: token,
-		CacheCurrent: current, CacheRequested: delta, CacheMaximum: maximum,
+		CacheCurrent: current, CacheRequested: delta, CacheMaximum: maximum, CacheReclaimDone: doneSeq,
 	}, DeadlineRequestBudget)
 	if err != nil {
 		return CacheBudgetResult{}, err
@@ -677,6 +686,6 @@ func (c *Client) RequestCacheBudgetContext(ctx context.Context, current, delta, 
 	}
 	return CacheBudgetResult{
 		Granted: resp.CacheGranted, Reservation: resp.CacheReservation,
-		ReclaimTarget: resp.CacheReclaimTarget, CooldownMs: resp.CooldownMs,
+		ReclaimTarget: resp.CacheReclaimTarget, ReclaimSeq: resp.CacheReclaimSeq, CooldownMs: resp.CooldownMs,
 	}, nil
 }

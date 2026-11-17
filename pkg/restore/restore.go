@@ -512,7 +512,11 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
-	cowCache, stopCache, err := resctl.NewCacheWithBudget(ctx, hooks, cacheSize, maxDirtySize)
+	idleAfter, err := snapCfg.Resources.DiffCOW.CacheIdleDuration()
+	if err != nil {
+		return -1, err
+	}
+	cowCache, stopCache, err := resctl.NewCacheWithBudget(ctx, hooks, cacheSize, maxDirtySize, idleAfter)
 	if err != nil {
 		return -1, err
 	}

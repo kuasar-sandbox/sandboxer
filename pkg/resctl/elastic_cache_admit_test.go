@@ -14,7 +14,7 @@ func TestElasticCacheInitialGrantIsPartOfAdmit(t *testing.T) {
 	server := startReservationServer(t, func(req resource.Message) (*resource.Message, bool) {
 		switch req.Type {
 		case resource.TypeAdmit:
-			if req.CacheInitial != 8*miB || req.CacheMaximum != 64*miB ||
+			if req.CacheInitial != 4*miB || req.CacheMaximum != 64*miB ||
 				!resource.HasFeature(req.ClientFeatures, resource.FeatureCacheBudgetV1) {
 				return &resource.Message{Type: resource.TypeError,
 					Msg: fmt.Sprintf("unexpected cache admission contract: %+v", req)}, false
@@ -36,7 +36,7 @@ func TestElasticCacheInitialGrantIsPartOfAdmit(t *testing.T) {
 	cfg := testControllerConfig(t, server.sock)
 	cfg.Resources.DiffCOW.CacheSize = "64MiB"
 	h := newAdmittedHooks(t, server, cfg, 0)
-	if !h.CacheSupported() || h.CacheReservation() != 8*miB {
+	if !h.CacheSupported() || h.CacheReservation() != 4*miB {
 		t.Fatalf("cache not atomically granted at Admit: supported=%v reserved=%d",
 			h.CacheSupported(), h.CacheReservation())
 	}
@@ -45,7 +45,7 @@ func TestElasticCacheInitialGrantIsPartOfAdmit(t *testing.T) {
 		t.Fatal(err)
 	}
 	stop()
-	if got := cache.BudgetSnapshot().Resident; got != 8*miB {
+	if got := cache.BudgetSnapshot().Resident; got != 4*miB {
 		t.Fatalf("cache did not prepare initially granted pages: %d", got)
 	}
 	if err := cache.Close(); err != nil {

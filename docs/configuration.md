@@ -174,6 +174,7 @@ objects stay absent unless a consumer resolves a documented default.
 | `resources.startup.memory` | Size; capacity memory | Positive, at most capacity; independent of allocatable headroom |
 | `resources.diff_cow.cache_size` | Size; `32MiB` | Sandbox-wide cache, positive 4 KiB multiple |
 | `resources.diff_cow.max_dirty_size` | Size; derived from final cache | Positive 4 KiB multiple no larger than total; [derivation and overlays](#diff-cow-policy) |
+| `resources.diff_cow.cache_idle_after` | Positive duration; `10s` | Time since the last Clean-page access before it counts as idle; does not invalidate or immediately reclaim pages |
 | `resources.diff_cow.discard` | `auto` or `manual`; `auto` | Cold-start policy for all managed writable ext4 mounts; explicit input is rejected on memory restore; [policy](#diff-cow-policy) |
 
 `CgroupFD` is an inherited Go/runtime capability, not a YAML field. The equations,
@@ -400,6 +401,7 @@ resources:
   diff_cow:
     cache_size: 32MiB
     max_dirty_size: 16MiB
+    cache_idle_after: 10s
     discard: auto
 ```
 
@@ -454,6 +456,18 @@ The effective dirty limit is `min(current budget, max_dirty_size)`. Idle clean
 cache is evicted and its physical pages returned before the node regrants it.
 The payload remains charged to `sandbox-ctl` in the existing `ctl/` cgroup;
 Guest balloon, Guest reservation and `vmm/` controls are unchanged.
+
+
+`cache_idle_after` controls only the Clean-page idle statistic. Clean
+pages remain valid and may be read or touched again without a forced cache miss.
+When observed idle Clean memory reaches one 4 MiB internal unit, the sandbox
+starts the same gentle asynchronous reclaim worker used for node requests.
+The worker first returns unused physical buffers, then uses Clean LRU without
+checking idle age again. A node reclaim amount is advisory: the sandbox may
+return fewer bytes or none, reports attempt completion, and the node only
+credits physically released bytes. Both initial and runtime cache grants use
+a 4 MiB internal unit, with valid smaller configured tails supported.
+
 With no controller, an older controller, or a host page size other than 4 KiB,
 the original fixed-capacity cache behavior is retained. The current elastic
 physical reclaim supports 4 KiB host pages only; 16/64 KiB hosts never run

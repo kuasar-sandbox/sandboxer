@@ -119,15 +119,12 @@ func TestElasticCacheBurst768(t *testing.T) {
 	if err := disk.Drain(ctx); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(15 * time.Second)
-	for cache.BudgetSnapshot().Capacity < total && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-	}
-	if s := cache.BudgetSnapshot(); s.Capacity < total {
-		t.Fatalf("cache did not grow to meet 768MiB workload: %+v", s)
+	t.Logf("burst write completed, cache (before sequential reads): %+v", cache.BudgetSnapshot())
+	if snap := cache.BudgetSnapshot(); snap.Capacity != snap.Resident || snap.Used > snap.Capacity {
+		t.Fatalf("invalid physical/cache accounting after burst: %+v", snap)
 	}
 	start = time.Now()
-	for pass := 0; pass < 2; pass++ {
+	for pass := 0; pass < 8; pass++ {
 		for i := 0; i < 768; i++ {
 			if _, err := disk.ReadAt(buffer, int64(i*mib)); err != nil {
 				t.Fatal(err)
@@ -136,7 +133,11 @@ func TestElasticCacheBurst768(t *testing.T) {
 				t.Fatalf("corrupted data pass=%d block=%d", pass, i)
 			}
 		}
-		t.Logf("read pass %d: %v", pass, time.Since(start))
+		snap := cache.BudgetSnapshot()
+		t.Logf("read pass %d: %v, cache resident=%dMiB used=%dMiB", pass, time.Since(start), snap.Resident/mib, snap.Used/mib)
+		if snap.Capacity >= total && snap.Used >= total {
+			break
+		}
 		start = time.Now()
 	}
 	s := cache.BudgetSnapshot()
@@ -146,8 +147,8 @@ func TestElasticCacheBurst768(t *testing.T) {
 	mu.Unlock()
 	t.Logf("write+drain elapsed %v, logical use=%d MiB, cap=%d MiB, physical=%d MiB, node grant=%d MiB, rpc=%d",
 		writeElapsed, s.Used/mib, s.Capacity/mib, s.Resident/mib, finalGranted/mib, n)
-	if s.Used < total || s.Resident < total {
-		t.Fatalf("cache did not retain complete hot working set: %+v", s)
+	if s.Capacity < total || s.Used < total || s.Resident < total {
+		t.Fatalf("repeated hot reads failed to grow/retain the 768MiB working set: %+v", s)
 	}
 	if n > 200 {
 		t.Fatalf("too many node grant RPCs: %d", n)

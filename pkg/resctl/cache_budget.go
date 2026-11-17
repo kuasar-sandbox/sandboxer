@@ -35,10 +35,24 @@ func (h *ControllerHooks) CacheTarget() uint64 {
 	return h.cacheReclaimTarget
 }
 
-func (h *ControllerHooks) setCacheTarget(target uint64) {
+func (h *ControllerHooks) CacheRequest() (uint64, uint64) {
+	if h == nil {
+		return 0, 0
+	}
 	h.mu.Lock()
-	if target != h.cacheReclaimTarget {
+	defer h.mu.Unlock()
+	return h.cacheReclaimTarget, h.cacheReclaimSeq
+}
+
+func (h *ControllerHooks) setCacheTarget(target uint64, seq ...uint64) {
+	generation := uint64(0)
+	if len(seq) > 0 {
+		generation = seq[0]
+	}
+	h.mu.Lock()
+	if target != h.cacheReclaimTarget || generation != h.cacheReclaimSeq {
 		h.cacheReclaimTarget = target
+		h.cacheReclaimSeq = generation
 		select {
 		case h.cacheWake <- struct{}{}:
 		default:
@@ -61,6 +75,10 @@ func (h *ControllerHooks) CacheReservation() uint64 {
 // ambiguous shrink, the caller has already discarded those host pages, so the
 // smaller baseline remains safe at reconnect.
 func (h *ControllerHooks) RequestCacheBudget(current, requested uint64) (uint64, uint64, uint64, time.Duration, error) {
+	return h.requestCacheBudget(current, requested, 0)
+}
+
+func (h *ControllerHooks) requestCacheBudget(current, requested, doneSeq uint64) (uint64, uint64, uint64, time.Duration, error) {
 	if h == nil || !h.Enabled() || !h.CacheSupported() {
 		return 0, 0, 0, 0, errors.New("elastic cache budget unsupported")
 	}
@@ -88,7 +106,7 @@ func (h *ControllerHooks) RequestCacheBudget(current, requested uint64) (uint64,
 		return 0, current, state.cacheTarget, 0,
 			&resource.TransportError{Err: errors.New("cache budget controller disconnected")}
 	}
-	result, err := h.client.RequestCacheBudgetContext(h.lifetimeCtx, current, requested, state.cacheMaximum)
+	result, err := h.client.RequestCacheBudgetWithAckContext(h.lifetimeCtx, current, requested, state.cacheMaximum, doneSeq)
 	if err != nil {
 		h.markDisconnectedLocked(err)
 		return 0, current, state.cacheTarget, 0, err
@@ -103,7 +121,7 @@ func (h *ControllerHooks) RequestCacheBudget(current, requested uint64) (uint64,
 	h.mu.Lock()
 	h.cacheReservation = result.Reservation
 	h.mu.Unlock()
-	h.setCacheTarget(result.ReclaimTarget)
+	h.setCacheTarget(result.ReclaimTarget, result.ReclaimSeq)
 	return result.Granted, result.Reservation, result.ReclaimTarget,
 		time.Duration(result.CooldownMs) * time.Millisecond, nil
 }

@@ -145,6 +145,8 @@ type Message struct {
 	CacheGranted       uint64 `json:"cache_granted,omitempty"`
 	CacheReservation   uint64 `json:"cache_reservation,omitempty"`
 	CacheReclaimTarget uint64 `json:"cache_reclaim_target,omitempty"`
+	CacheReclaimSeq    uint64 `json:"cache_reclaim_seq,omitempty"`
+	CacheReclaimDone   uint64 `json:"cache_reclaim_done,omitempty"`
 
 	// OOMReport.
 	OOMCount  uint64 `json:"oom_count,omitempty"`
