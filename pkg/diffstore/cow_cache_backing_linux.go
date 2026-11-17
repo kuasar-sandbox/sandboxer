@@ -186,6 +186,14 @@ func (e *elasticBacking) stagePrepare(count int) (_ *elasticPrepared, retErr err
 			}
 		}
 	}
+	// take pops from the end. Sequential I/O should consume adjacent freshly
+	// faulted slots in increasing address order. Keep reused slots in their
+	// own prefix so abort can discard them independently of new mappings.
+	for _, slots := range [][]*[cowBlockSize]byte{p.ready[:p.reused], p.ready[p.reused:]} {
+		sort.Slice(slots, func(i, j int) bool {
+			return uintptr(unsafe.Pointer(slots[i])) > uintptr(unsafe.Pointer(slots[j]))
+		})
+	}
 	return p, nil
 }
 
