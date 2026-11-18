@@ -52,7 +52,9 @@ func lazyStatsTicker(ctx context.Context, base time.Duration, getUffd func() *uf
 		anyDiskRead := false
 		var diskSeg strings.Builder
 		for i, s := range servers {
-			cur[i] = s.SnapshotStats()
+			// Periodic logs only need request counters. Backend extras may scan
+			// the shared cache while holding its lock.
+			cur[i] = s.Stats().Snapshot()
 			d := cur[i].Read.Count - prev[i].Read.Count
 			b := cur[i].Read.Bytes - prev[i].Read.Bytes
 			w := cur[i].Read.Sub(prev[i].Read)
