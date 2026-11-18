@@ -27,6 +27,44 @@ mkdir -p "$WORK" "$OUT" "$WORK/run" "$WORK/base"
 TAP_NAME="xm$((BASHPID % 1000000))"
 TAP_CREATED=0
 PIDS=()
+manifest_ready_diagnostics() {
+    local phase=$1 name pid status
+    printf 'manifest boot readiness: phase=%s store_port=%s cache_port=%s cache_health_port=%s cache_ping_exit=%s\n' \
+        "$phase" "$STORE_PORT" "$CACHE_PORT" "$CACHE_HEALTH_PORT" "${CACHE_PING_RC:-not-run}" >&2
+    for name in STORE CACHE; do
+        if [ "$name" = STORE ]; then pid=${STORE_PID:-}; else pid=${CACHE_PID:-}; fi
+        if [ -z "$pid" ]; then
+            printf 'manifest boot readiness: %s not-started\n' "$name" >&2
+        elif kill -0 "$pid" 2>/dev/null; then
+            printf 'manifest boot readiness: %s pid=%s alive\n' "$name" "$pid" >&2
+        else
+            if wait "$pid" 2>/dev/null; then status=0; else status=$?; fi
+            printf 'manifest boot readiness: %s pid=%s exited status=%s\n' "$name" "$pid" "$status" >&2
+        fi
+    done
+    # Read only known readiness logs, never configuration or the manifest key.
+    python3 - "$OUT" <<'PY' >&2
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+for name in ("store.log", "cache.log", "cache-ping.stdout", "cache-ping.stderr"):
+    print(f"manifest boot readiness: {name} tail (at most 8192 bytes / 80 lines)")
+    try:
+        fd = os.open(Path(sys.argv[1]) / name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError("not a regular log")
+            source.seek(max(0, info.st_size - 8192))
+            tail = source.read(8192).decode(errors="replace")
+        print(re.sub(r"(?i)[0-9a-f]{64}", "<redacted>", "\n".join(tail.splitlines()[-80:])))
+    except OSError:
+        print("unavailable")
+PY
+}
 cleanup() {
     local status=$?
     set +e
@@ -68,7 +106,10 @@ for _ in $(seq 1 100); do
     (echo >/dev/tcp/127.0.0.1/"$STORE_PORT") 2>/dev/null && break
     sleep 0.05
 done
-(echo >/dev/tcp/127.0.0.1/"$STORE_PORT") 2>/dev/null || e2e_fail "store did not become ready"
+(echo >/dev/tcp/127.0.0.1/"$STORE_PORT") 2>/dev/null || {
+    manifest_ready_diagnostics store || true
+    e2e_fail "store did not become ready"
+}
 
 cat >"$WORK/cache.yaml" <<EOF
 mode: tiered
@@ -99,13 +140,22 @@ CACHE_PID=$!
 PIDS+=("$CACHE_PID")
 CACHE_READY=0
 for _ in $(seq 1 100); do
-    if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>/dev/null | grep -qx 'SERVING'; then
+    if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" \
+        >"$OUT/cache-ping.stdout" 2>"$OUT/cache-ping.stderr"; then
+        CACHE_PING_RC=0
+    else
+        CACHE_PING_RC=$?
+    fi
+    if [ "$CACHE_PING_RC" -eq 0 ] && grep -qx 'SERVING' "$OUT/cache-ping.stdout"; then
         CACHE_READY=1
         break
     fi
     sleep 0.05
 done
-[ "$CACHE_READY" = 1 ] || e2e_fail "cache did not become SERVING"
+[ "$CACHE_READY" = 1 ] || {
+    manifest_ready_diagnostics cache || true
+    e2e_fail "cache did not become SERVING"
+}
 
 cat >"$WORK/manifest.yaml" <<EOF
 manifest:
