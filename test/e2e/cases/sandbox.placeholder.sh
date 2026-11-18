@@ -136,7 +136,14 @@ done
 
 # The placeholder remains the supplied runtime executable, without execing
 # the image command. Its private helper arguments are not a consumer ABI.
-INIT_HASH="$(sha256sum "$BIN/sandbox-init" | cut -d' ' -f1)"
+# Artifact plans identify the init embedded in the selected runtime bundle.
+INIT_HASH="$(python3 -B - "$SANDBOXER_LIB" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from usage import BIN, digest, runtime_init_digest
+print(runtime_init_digest(digest(BIN / "sandbox-init")))
+PY
+)"
 exec1 -- sha256sum /proc/1/exe >"$WORK/pid1.hash"
 [ "$(cut -d' ' -f1 <"$WORK/pid1.hash")" = "$INIT_HASH" ] || \
     e2e_fail "private PID 1 is not the prepared runtime's placeholder executable"
