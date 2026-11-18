@@ -112,9 +112,11 @@ class UsageRelay(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             identity = {key: value[key] for key in ("disk", "incarnation") if key in value}
             value.clear()
             value.update(identity, status=status)
-            row["source_fault"] = {"disk": fault["disk"], "status": status}
             row["source_forwarded"] = forwarded
             row["forwarded"] = forwarded
+            # Publish the marker last: evidence readers may inspect this row
+            # while the handler is still preparing the forwarded response.
+            row["source_fault"] = {"disk": fault["disk"], "status": status}
             payload = json.dumps(forwarded).encode()
             return struct.pack("<I", len(payload)) + payload
 

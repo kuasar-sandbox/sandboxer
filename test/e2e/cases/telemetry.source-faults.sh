@@ -600,11 +600,14 @@ def validate_old_epoch(requests, old_epoch, new_epoch):
     assert all(b > a for a, b in zip(ids, ids[1:])), "restore reconnect reset request identity"
     for row in requests:
         assert row["request"]["run_epoch"] == new_epoch
-        if row.get("response", {}).get("type") == "usage_response":
+        # A request may have received its raw frame while the relay is still
+        # preparing injection. Only completed sends have complete evidence.
+        if row.get("sent_ns") and row.get("response", {}).get("type") == "usage_response":
             response = row["response"]["usage_response"]
             assert response["memory"]["status"] == "ok"
             disk = next(fs for fs in response["filesystems"] if fs["disk"] == "disk-0")
             assert disk["status"] == "ok", "real Guest source failed during restore"
+            assert "source_forwarded" in row, "sent response has no source-injection evidence"
             injected = next(fs for fs in row["source_forwarded"]["usage_response"]["filesystems"] if fs["disk"] == "disk-0")
             assert injected["status"] == "busy", "Host source-status injection was lost across reconnect"
 

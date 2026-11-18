@@ -627,10 +627,15 @@ class SourceFaultTests(unittest.TestCase):
                  "source_forwarded": {"usage_response": injected, "type": "usage_response"},
                  "forwarded": {"usage_response": {**injected, "run_epoch": "old"}},
                  "sent_ns": 10, "client_closed_ns": 11},
-                {"mode": None, "connection": 2, "request": {"request_id": "3", "run_epoch": "new"},
+                {"mode": None, "connection": 2, "sent_ns": 12, "request": {"request_id": "3", "run_epoch": "new"},
                  "response": {"usage_response": {**raw, "request_id": "3"}, "type": "usage_response"},
                  "source_forwarded": {"usage_response": {**injected, "request_id": "3"}, "type": "usage_response"}}]
         usage_sources.validate_old_epoch(rows, "old", "new")
+        in_flight = {"mode": None, "connection": 2, "request": {"request_id": "4", "run_epoch": "new"},
+                     "response": {"usage_response": {**raw, "request_id": "4"}, "type": "usage_response"}}
+        usage_sources.validate_old_epoch(rows+[in_flight], "old", "new")
+        with self.assertRaisesRegex(AssertionError, "no source-injection evidence"):
+            usage_sources.validate_old_epoch(rows+[{**in_flight, "sent_ns": 13}], "old", "new")
         mutations = [lambda r: r[0].pop("client_closed_ns"),
                      lambda r: r[1].update(connection=1),
                      lambda r: r[1]["request"].update(request_id="2"),
