@@ -161,7 +161,7 @@ class UsageRelay(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
 class UsageHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        row, operation = None, "connect"
+        row, operation = None, "client_preface"
         upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         upstream.settimeout(3)
         self.request.settimeout(3)
@@ -169,18 +169,15 @@ class UsageHandler(socketserver.BaseRequestHandler):
             self.server.next_connection += 1
             number = self.server.next_connection
         try:
-            end = time.monotonic() + 3
-            while True:
-                try:
-                    upstream.connect(self.server.real)
-                    break
-                except (FileNotFoundError, ConnectionRefusedError):
-                    if time.monotonic() >= end:
-                        raise
-                    time.sleep(.01)
             preface = line(self.request)
+            operation = "connect"
+            if not self.connect_upstream(upstream):
+                return
+            operation = "backend_preface"
             upstream.sendall(preface)
-            self.request.sendall(line(upstream))
+            acknowledgement = line(upstream)
+            operation = "client_preface_ack"
+            self.request.sendall(acknowledgement)
             if preface != b"CONNECT 5000\n":
                 self.raw(upstream)
                 return
@@ -251,12 +248,38 @@ class UsageHandler(socketserver.BaseRequestHandler):
             elif row is not None and operation in ("guest_read", "guest_send"):
                 row["guest_closed_ns"] = time.monotonic_ns()
         except OSError as error:
-            if not self.server.stopping.is_set():
-                self.server.errors.append(str(error))
+            # connect_upstream returns for owner stop or a cancelled peer. A
+            # deadline it actually raises is a real failure, even if stop()
+            # begins before this handler gets scheduled again.
+            if operation == "connect" or not self.server.stopping.is_set():
+                self.server.errors.append(
+                    f"connection={number} phase={operation} errno={error.errno}: {error}")
         except BaseException as error:
-            self.server.errors.append(str(error))
+            self.server.errors.append(f"connection={number} phase={operation}: {error}")
         finally:
             upstream.close()
+
+    def connect_upstream(self, upstream):
+        # A Host connection can outlive the backend pathname during normal VM
+        # shutdown. Stop retrying only if that client has completely closed.
+        # POLLHUP remains visible with buffered request bytes; MSG_PEEK would
+        # hide EOF behind those bytes. SHUT_WR yields POLLRDHUP, not POLLHUP:
+        # such a client can still be waiting for its response and must retain
+        # the same backend deadline as every other live client.
+        closed = select.poll()
+        closed.register(self.request, select.POLLHUP)
+        end = time.monotonic() + 3
+        while not self.server.stopping.is_set():
+            if any(events & select.POLLHUP for _, events in closed.poll(0)):
+                return False
+            try:
+                upstream.connect(self.server.real)
+                return True
+            except (FileNotFoundError, ConnectionRefusedError):
+                if time.monotonic() >= end:
+                    raise
+                self.server.stopping.wait(.01)
+        return False
 
     def wait_fault(self, seconds, row):
         # Witness peer EOF while the reply is still held, rather than dating

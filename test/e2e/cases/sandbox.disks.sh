@@ -5,6 +5,7 @@ set -euo pipefail
 
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
 SANDBOXER_LIB="$E2E_LIB/sandboxer"
+source "$SANDBOXER_LIB/readiness_helpers.sh"
 source "$SANDBOXER_LIB/tarstream.sh"
 
 : "${E2E_WORKSPACE:?E2E_WORKSPACE is required}"
@@ -14,7 +15,7 @@ source "$SANDBOXER_LIB/tarstream.sh"
 
 require_root
 require_kvm
-for command in docker ip mkfs.ext4 tar timeout truncate tune2fs; do
+for command in docker ip mkfs.ext4 pkill python3 sed tar timeout truncate tune2fs; do
     require_command "$command"
 done
 for binary in sandbox-ctl flatten-ctl cloud-hypervisor; do
@@ -23,6 +24,7 @@ done
 for file in sandbox-init sandbox-runtime.bundle vmlinux; do
     [ -f "$BIN/$file" ] || e2e_fail "missing prepared product: $file"
 done
+[ -r "$SANDBOXER_LIB/readiness_helpers.sh" ] || e2e_fail "missing prepared readiness helpers"
 [ -r "$SANDBOXER_LIB/tarstream.sh" ] || e2e_fail "missing prepared tarstream helpers"
 [ -r "$SANDBOXER_LIB/trim_probe.py" ] || e2e_fail "missing prepared trim probe"
 docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || e2e_fail "prepared E2E_IMAGE is not loaded: $E2E_IMAGE"
@@ -31,17 +33,34 @@ mkdir -p "$WORK" "$OUT" "$WORK/runtime" "$WORK/base"
 TAP_NAME="dk$((BASHPID % 1000000))"
 TAP_CREATED=0
 RUNPID=""
+READINESS_WATCHDOG_PID=""
 ROOT_CONTAINER=""
+
+stop_vm() {
+    readiness_stop_watchdog
+    if [ -n "$RUNPID" ]; then
+        kill -TERM "$RUNPID" 2>/dev/null || true
+        for _ in $(seq 1 100); do
+            kill -0 "$RUNPID" 2>/dev/null || break
+            sleep 0.1
+        done
+        readiness_kill_session KILL "$RUNPID"
+        wait "$RUNPID" 2>/dev/null || true
+        RUNPID=""
+    fi
+}
+
 cleanup() {
     local status=$?
     set +e
-    [ -n "$RUNPID" ] && kill -0 "$RUNPID" 2>/dev/null && kill -TERM "$RUNPID" 2>/dev/null
-    [ -n "$RUNPID" ] && wait "$RUNPID" 2>/dev/null
+    stop_vm
     [ -n "$ROOT_CONTAINER" ] && docker rm -f "$ROOT_CONTAINER" >/dev/null 2>&1
     [ "$TAP_CREATED" = 1 ] && ip link del "$TAP_NAME" 2>/dev/null
     exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 ip tuntap add dev "$TAP_NAME" mode tap
 TAP_CREATED=1
@@ -68,32 +87,27 @@ ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 DATASET_REF="$(plaintext_tarstream_ref "$WORK/dataset.img")"
 
 start_vm() {
-    local config=$1
+    local config=$1 ready_file="$WORK/$SID.ready" reader_pid
     shift
-    timeout -k 10s 120 "$BIN/sandbox-ctl" run \
-        --config "$config" --sandbox-id "$SID" "$@" \
+    readiness_begin_capture "$ready_file"
+    reader_pid=$READY_READER_PID
+    readiness_exec_in_new_session "$BIN/sandbox-ctl" run \
+        --ready-fd="$READY_WRITE_FD" --config "$config" --sandbox-id "$SID" "$@" \
         --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --base-root "$WORK/base" \
         >"$LOG" 2>&1 &
     RUNPID=$!
-    for _ in $(seq 1 90); do
-        if timeout -k 2s 6 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" \
-            -- /bin/true >/dev/null 2>&1; then
-            return
-        fi
-        kill -0 "$RUNPID" 2>/dev/null || {
-            tail -60 "$LOG" >&2 || true
-            e2e_fail "$SID exited before becoming executable"
-        }
-        sleep 1
-    done
-    tail -60 "$LOG" >&2 || true
-    e2e_fail "$SID did not become executable"
-}
-
-stop_vm() {
-    kill -TERM "$RUNPID"
-    wait "$RUNPID" || true
-    RUNPID=""
+    readiness_close_parent_writer
+    readiness_start_watchdog "$RUNPID" 120 10
+    readiness_wait_event "$ready_file" 1 control_ready "$RUNPID" || {
+        tail -60 "$LOG" >&2 || true
+        e2e_fail "$SID never emitted control_ready"
+    }
+    readiness_wait_event "$ready_file" 2 ready "$RUNPID" || {
+        tail -60 "$LOG" >&2 || true
+        e2e_fail "$SID never emitted ready"
+    }
+    readiness_assert_wire "$ready_file" "$reader_pid" $'control_ready\nready\n' || \
+        e2e_fail "$SID readiness wire was not exact or did not reach EOF"
 }
 
 check_discard_mounts() {

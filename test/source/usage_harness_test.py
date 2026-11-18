@@ -1309,6 +1309,116 @@ class CHRelayTests(unittest.TestCase):
 
 
 class UsageRelayTests(unittest.TestCase):
+    def wait_handlers(self, relay, *, timeout=2):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with relay.lock:
+                if relay.next_connection and not relay.connections:
+                    return
+            time.sleep(.01)
+        self.fail("relay handler did not finish within its budget")
+
+    def test_closed_client_does_not_wait_for_missing_backend(self):
+        for buffered_request in (False, True):
+            with self.subTest(buffered_request=buffered_request), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "vsock.sock"
+                relay = UsageRelay(path)
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    client.connect(str(path))
+                    data = b"CONNECT 5000\n"
+                    if buffered_request:
+                        data += self.wire("usage_request", 1)
+                    client.sendall(data)
+                    client.close()
+                    # Wait for the accepted handler, not an initially empty
+                    # connections set. Cancellation must beat the 3s backend
+                    # deadline even when unread request bytes precede EOF.
+                    self.wait_handlers(relay)
+                    self.assertFalse(relay.errors)
+                    self.assertFalse(relay.requests)
+                finally:
+                    client.close()
+                    relay.stop()
+                self.assertFalse(relay.errors)
+
+    def test_live_client_missing_backend_is_still_an_error_after_stop(self):
+        for half_closed in (False, True):
+            with self.subTest(half_closed=half_closed), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "vsock.sock"
+                relay = UsageRelay(path)
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    client.connect(str(path))
+                    client.sendall(b"CONNECT 5000\n" + self.wire("usage_request", 1))
+                    if half_closed:
+                        client.shutdown(socket.SHUT_WR)
+                    started = time.monotonic()
+                    self.wait_handlers(relay, timeout=5)
+                    self.assertGreaterEqual(time.monotonic() - started, 2.8)
+                    self.assertEqual(len(relay.errors), 1)
+                    self.assertIn("connection=1 phase=connect errno=2", relay.errors[0])
+                    recorded = list(relay.errors)
+                    relay.stop()
+                    self.assertEqual(relay.errors, recorded)
+                finally:
+                    client.close()
+                    relay.stop()
+                self.assertEqual(relay.errors, recorded)
+
+    def test_delayed_backend_serves_live_and_write_half_closed_clients(self):
+        owner = self
+        backend_errors = []
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.settimeout(2)
+                try:
+                    owner.assertEqual(line(self.request), b"CONNECT 5000\n")
+                    self.request.sendall(b"OK 1\n")
+                    owner.assertEqual(frame(self.request)[0], owner.wire("usage_request", 1))
+                    self.request.sendall(owner.wire("usage_response", 1))
+                except BaseException as error:
+                    backend_errors.append(error)
+
+        for half_closed in (False, True):
+            with self.subTest(half_closed=half_closed), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "vsock.sock"
+                relay = UsageRelay(path)
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.settimeout(3)
+                native = thread = None
+                try:
+                    client.connect(str(path))
+                    client.sendall(b"CONNECT 5000\n" + self.wire("usage_request", 1))
+                    if half_closed:
+                        client.shutdown(socket.SHUT_WR)
+                    deadline = time.monotonic() + 2
+                    while not relay.next_connection:
+                        self.assertLess(time.monotonic(), deadline, "relay did not accept the client")
+                        time.sleep(.01)
+                    time.sleep(.05)  # Exercise missing-path retries before the listener exists.
+                    native = socketserver.UnixStreamServer(str(vsock_backend_path(path)), Handler)
+                    thread = threading.Thread(target=native.serve_forever, kwargs={"poll_interval": .01})
+                    thread.start()
+                    self.assertEqual(line(client), b"OK 1\n")
+                    self.assertEqual(frame(client)[0], self.wire("usage_response", 1))
+                    client.close()
+                    self.wait_handlers(relay)
+                    self.assertFalse(relay.errors)
+                    self.assertFalse(backend_errors)
+                    self.assertEqual(len(relay.requests), 1)
+                    self.assertIn("sent_ns", relay.requests[0])
+                finally:
+                    client.close()
+                    relay.stop()
+                    if native is not None:
+                        native.shutdown()
+                        native.server_close()
+                    if thread is not None:
+                        thread.join(timeout=2)
+                        self.assertFalse(thread.is_alive())
+
     def test_fault_wait_witnesses_eof_without_ending_delay(self):
         left, right = socket.socketpair()
         handler = UsageHandler.__new__(UsageHandler)
