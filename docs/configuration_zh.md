@@ -230,9 +230,9 @@ sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
 | `launch.env`、`launch.ephemeral_env` | String map | 持久环境与当前调用覆盖；见[合并规则](#files-and-environment) |
 | `launch.workdir` | String；普通加载后 `/` | 应用工作目录；image/source projection 服从相应 launch merge 规则 |
 | `launch.restart` | `never`、`on-failure`、`always`；`never` | 主进程监督 |
-| `launch.cgroup_control` | Boolean；`false` | 启用应用 cgroup delegation；见 [Guest 拓扑](guest-abi_zh.md#application-cgroups) |
+| `launch.cgroup_control` | Boolean；`false` | true 在用户可见 cgroup 根下放 controllers，将直接管理的进程放入 `/init` 叶组；false 直接使用 scoped 根。全局层级由 Guest Runtime 决定。见 [Guest 拓扑](guest-abi_zh.md#application-cgroups)。 |
 | `launch.placeholder` | Boolean；`false` | 无 exec anchor；与 exec 互斥并始终 restart |
-| `launch.pid_namespace` | `private`、`shared`；`private` | Private 使应用成为 namespace PID 1；shared 使用 sandbox-init reaper |
+| `launch.pid_namespace` | `private`、`shared`；`private` | Private 使应用成为 namespace PID 1；shared 暴露负责回收孤儿的 Runtime PID 1 |
 | `launch.user` | 身份 String；镜像 user，否则 root | `uid:gid` 或 `name:group` |
 | `launch.stop_signal` | 信号名/数字；镜像值，否则 `SIGTERM` | 停止信号 |
 | `launch.stop_grace_period` | Duration；`10s` | SIGKILL 前宽限期，以整秒传给 Guest |

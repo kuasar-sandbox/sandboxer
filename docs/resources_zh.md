@@ -492,57 +492,63 @@ SIGKILL 与亚秒级 Guest 运行. 注入不作用于业务可写盘的同步操
 pidfd 确认该子进程在有界清理预算内退出, 不把清理留给 runner.
 需要 Linux/Python pidfd 支持、`strace`、mount 权限及普通 KVM E2E 前置条件.
 
-[慢来源 E2E](../test/e2e/cases/telemetry.source-faults.sh) 按设备身份选择一个已登记的
-数据文件系统句柄, 核对 CLOEXEC 后, 仅在可丢弃 Guest 内延迟该 `fstatfs`
-返回. 测试要求首次 timeout、同一个已占用槽后续返回 busy、内存及健康文件
-系统持续获得新覆盖, 且 trace 中只有一次该文件系统调用. 两块数据盘均执行
-真实写入; 延迟读取后新增的字节用于区分释放后的新观测与旧 buffer 重放.
-单个长存测试 exec 记录 Guest 全部 FD、身份、线程和 RSS, 不为每次观测创建
-exec, 也不把线程数称为 goroutine 数。文件系统案例当前使用固定 30 秒观测窗口，
-注入的返回延迟比它更长；脚本不提供 `--seconds` 选项。观测窗口不等于精确故障时长。
-这是系统调用返回延迟，不是物理设备故障或掉电测试。
-已安装的原生 `strace` 及 `ldd` 解析的 loader、依赖库仅复制到可丢弃应用镜像,
-不进入产品 runtime.
-其中 `ch-info` 和 `ch-resize` 案例在真实 CH 可执行文件前放置仅用于测试的
-Unix HTTP 中继, 原样转发响应正文并暂扣一次实际响应 12 秒. Resize 由真实
-Guest 分配触发, 不是测试直接调用 resize; 暂扣其响应覆盖既有 mutation gate/
-API 锁控制事务. 选择时要求 target 低于先前真实 target, 暂扣的是 PUT 响应
-或紧随其后的确认 GET. 旧观测过期后, Guest 内存必须缺测, 文件系统/RSS 覆盖继续
-增长, 且不能堆积更多 CH 请求. 恢复必须经过新的成功 `vm.info` 读取.
-这些有界功能故障不测量无测试中继时的 API 时延或生产密度开销, 也不声称
-已逐一确定所有 info 读取的调用者.
-`vsock` 案例中继真实的专用 usage 帧并保持普通管理/MUX 流量. 在一个受管理
-文件系统调用仍被占用时, 执行八次断连、一次迟到响应、已捕获的旧响应重放,
-以及超过原始整轮 deadline 的慢分段传输. 跨新连接的 Guest 原始响应必须
-继续报告同一个 busy 槽. 请求失败断开 Gauge 覆盖, 不补零; 原生 CPU Counter
-仍是独立来源. 一个观察 exec 跨全部十一项故障持续传送资源诊断,
-注入前以第一份完整输出确认 MUX 已建立. 额外的健康检查/停止 exec 位于
-全部 FD 的观测窗口之外, 此时文件系统仍阻塞; 不丢弃任何 FD 样本.
-中继在仍暂扣迟到/分段响应时观察 peer EOF, 以 Host 关闭连接而非下一请求
-起点验证读取 deadline. 原 Host 读取或 Guest 准入槽退出期间, 中间一个 tick
-可以按设计继续缺测; 新连接恢复另行验证. Live 查询证据保留每项指标 request ID 的变化,
-并分别对应各自的原始请求, 不假定整轮归并为原子发布.
-未注入故障的 root/第二文件系统必须独立返回正常原始数据, 且各自的 request
-身份和覆盖时间继续推进; 两端同为失败或保留旧成功值都不能通过.
-`restore` 案例让同一个已占用文件系统槽跨同进程 quiesce/thaw, 再以相同
-SandboxID/usage 文件执行 lazy 内存恢复. 有界的测试专用 tracer owner 在
-启动 `strace` 前仅将自己加入可丢弃 Guest 的 root cgroup; 不移动 PID 1、
-应用或 exec-join 进程. Guest reaper 负责被收养的 helper, helper 是其 tracer
-的唯一 wait 所有者. 这样不会受到普通 exec 在 quiesce 时按设计被终止的影响.
-测试专用 CH wrapper 只改私有恢复运行状态中的 vsock 路径, 不改不可变业务
-快照. 中继在首份恢复后响应中仅将 epoch 替换为真实上一运行代次, 保留新
-request ID 和观测值. 这是明确的身份字段破坏, 不是原样重放历史帧.
-必须通过 Host 关闭连接以及另一连接上的新请求证明拒绝; 原始响应仍须报告
-原来的 busy 槽, 同时内存及健康文件系统可用. 原始读取之后及恢复之后的写入
-用于区分新观测与迟到旧 buffer, 首个新值不能积分缺测区间. 原实例和恢复实例
-的 tracer owner 都必须脱离; 失败清理仍停止自有 VM 并回收 Host 测试子进程.
-成功捕获前, 同一案例在不可变依赖预检查完成后耗尽测试自有快照输出 tmpfs.
-测试要求 Guest quiesce/CH pause 之后的数据盘捕获 ENOSPC、MUX 重连、真实
-health exec 和 CH `Running` 状态. 此次捕获失败回滚必须保留已占用槽及其
-已知用量, 同时健康来源继续推进. 输出限制不影响用量文件目录; 更早的依赖
-错误不能算作回滚证据. 成功和失败路径都会卸载临时挂载.
-这些案例结合重复操作和生命周期回归, 验证来源隔离、有界所有权及失败收尾.
-报告应注明实际观测窗口; 它们不是物理掉电实验.
+[来源故障 E2E](../test/e2e/cases/telemetry.source-faults.sh) 使用真实 Guest usage
+响应验证 Host 消费者。测试专用 vsock 中继仅把一个选定文件系统的成功结果
+改为首次 `timeout`、后续 `busy`，保留来源身份并移除该结果的数值字段。
+原始 Guest 响应、来源状态注入后的响应及最终传输故障后的响应分别记录。
+其他来源、request ID 和 epoch 必须保持不变。这是明确的协议故障注入，
+不延迟 Guest 系统调用，也不证明某个 Guest worker 一直被占用。
+
+文件系统案例采用固定 30 秒观测窗口，要求最后已知用量保持不变、缺测区间
+不被积分，内存、根文件系统及另一数据盘持续产生新覆盖。两块数据盘均有
+真实写入；释放故障后必须消费它们当前的真实数据。一个长存观察 exec 记录
+用户可见 init 的 FD 身份、线程和 RSS。使用内层执行器的 runtime 中，这些
+数据属于内层执行器，不代表外层 usage producer；Host 资源计数单独记录。
+脚本不提供 `--seconds` 选项，不向 Guest 镜像或 runtime bundle 安装 tracer。
+
+Guest producer 的相应保证在 guest-runtime 的
+[来源边界测试](https://github.com/kuasar-sandbox/guest-runtime/blob/main/cmd/sandbox-init/usage_source_boundary_test.go)、
+[worker 测试](https://github.com/kuasar-sandbox/guest-runtime/blob/main/cmd/sandbox-init/usage_test.go)及
+[reattach 测试](https://github.com/kuasar-sandbox/guest-runtime/blob/main/cmd/sandbox-init/usage_restore_test.go)
+中验证：用可控阻塞读取检查先 timeout 后 busy、跨 reconnect 和 attach/restore
+转换始终只占用一个 worker，以及旧读取结果不被后续 request ID 和 epoch
+复用。对实际登记的目录句柄检查 CLOEXEC、exec 后不泄漏，以及在途读取
+结束后由唯一所有者恰好关闭一次。这些是 producer 单元/进程测试，不声称
+内核中阻塞的系统调用已经跨真实 VM 内存快照验证。用户环境不需要访问
+外层 producer 的 PID、FD 或 cgroup。
+
+`ch-info` 和 `ch-resize` 案例在真实 CH 可执行文件前放置测试专用 Unix HTTP
+中继，原样转发响应正文并暂扣一次实际响应 12 秒。Resize 由真实 Guest 分配
+触发。选择时要求 target 低于先前真实 target；暂扣 PUT 响应或紧随其后的
+确认 GET，覆盖既有 mutation gate/API 锁事务。旧观测过期后，Guest 内存
+必须缺测，文件系统/RSS 覆盖继续增长，不能堆积更多 CH 请求。恢复必须经过
+新的成功 `vm.info` 读取。这些有界功能故障不测量无中继时的 API 时延或生产
+密度下的开销。
+
+`vsock` 案例保持普通管理/MUX 流量，并执行八次断连、一次迟到响应、已捕获
+旧响应重放及超过原始整轮 deadline 的慢分段传输。中继跨新连接保持选定的
+来源状态故障，真实 Guest 原始结果仍有独立证据。失败请求断开 Gauge 覆盖，
+不补零。一个观察 exec 覆盖全部十一项故障，注入前用第一份完整输出确认
+MUX 已建立；健康检查 exec 位于 FD 观测窗口之外。中继仍暂扣迟到/分段响应
+时观察 peer EOF，以 Host 关闭连接验证 deadline。原 Host 读取或 Guest 准入
+槽退出期间，中间一个 tick 可继续缺测。Live 查询按每项指标自己的转发请求
+进行核对，不假定整轮原子发布。未注入故障的 root 和第二文件系统必须独立
+返回正常真实数据，并持续推进自己的请求身份与覆盖时间。
+
+`restore` 案例以相同 SandboxID/usage 文件执行真实 quiesce/thaw、捕获失败
+回滚及 lazy 内存恢复。来源状态故障属于 Host 测试中继，在恢复实例上会明确
+重新建立，不声称快照恢复了一个已占用 Guest worker。Wrapper 只修改私有
+恢复运行状态中的 vsock 路径，不改业务快照。首份恢复后响应还会被替换成
+真实上一运行代次的 epoch；必须由 Host 关闭连接及另一连接上的新请求证明
+拒绝。释放故障后必须消费当前真实文件系统用量，首个新值不能积分缺测区间。
+
+成功捕获前，同一案例在不可变依赖预检查完成后耗尽测试自有快照输出 tmpfs。
+必须出现 Guest quiesce/CH pause 之后的数据盘捕获 ENOSPC、MUX 重连、真实
+health exec 和 CH `Running` 状态。此次回滚必须保留已知用量，健康来源继续
+推进。更早的依赖错误不能算作回滚证据，输出限制不影响 usage 文件目录。
+成功和失败路径都会卸载临时文件系统、停止自有 VM/中继并回收测试子进程。
+报告应区分 Host E2E 与 producer 所有权测试，并记录实际观测窗口；两者都不
+复现物理设备故障或掉电。
 
 性能测量与产品 E2E 分开。在源码构建阶段准备探针与规范制品身份读取器，
 并提供已经构建的可执行文件路径：

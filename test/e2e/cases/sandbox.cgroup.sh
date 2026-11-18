@@ -85,11 +85,9 @@ run_case() {
     local control=$1 pid_mode=$2
     local expected=/
     [ "$control" = true ] && expected=/init
-    local real_check=0
-    [ "$pid_mode" = shared ] && real_check=1
-    # Plugins always share sandbox-init's PID namespace and can inspect the
-    # guest-global cgroup mount through /proc/1 even when primary is private.
-    local plugin_real_check=1
+    # Check namespace-relative membership in every mode. The Guest runtime
+    # owns the global cgroup path and the implementation of its visible PID 1.
+    local membership_check=1
     local name="${control}-${pid_mode}"
     local case_dir="$WORK/$name"
     local run_root="$case_dir/runtime"
@@ -123,7 +121,7 @@ files:
     content: |
       #!/bin/sh
       set -eu
-      role="\$1"; expected="\$2"; pid_mode="\$3"; control="\$4"; real_check="\$5"
+      role="\$1"; expected="\$2"; pid_mode="\$3"; control="\$4"
       generation_file="/tmp/cg-\${role}.generation"
       generation=0
       [ ! -f "\$generation_file" ] || generation="\$(cat "\$generation_file")"
@@ -132,11 +130,10 @@ files:
 
       self_path="\$(awk -F: '\$1 == "0" { print \$3 }' /proc/self/cgroup)"
       [ "\$self_path" = "\$expected" ] || { echo "CG-FAIL \$role generation=\$generation self=\$self_path expected=\$expected"; exit 70; }
-      [ ! -e /sys/fs/cgroup/app ] || { echo "CG-FAIL \$role inherited-guest-global-cgroupfs"; exit 68; }
       for fd_path in /proc/self/fd/*; do
         fd_target="\$(readlink "\$fd_path" 2>/dev/null || true)"
         case "\$fd_target" in
-          cgroup:\[*|mnt:\[*|/sys/fs/cgroup/app*) echo "CG-FAIL \$role leaked-fd=\$fd_path target=\$fd_target"; exit 69 ;;
+          cgroup:\[*|mnt:\[*|/sys/fs/cgroup|/sys/fs/cgroup/*) echo "CG-FAIL \$role leaked-fd=\$fd_path target=\$fd_target"; exit 69 ;;
         esac
       done
       echo "CG-\$role-GEN-\$generation-SELF \$self_path"
@@ -154,8 +151,9 @@ files:
         if [ "\$pid_mode" = private ]; then
           [ "\$\$" = 1 ] || { echo "CG-FAIL primary private pid=\$\$"; exit 72; }
         else
-          [ "\$\$" != 1 ] && tr '\0' ' ' </proc/1/cmdline | grep -q '/sbin/init' || {
-            echo "CG-FAIL primary shared cannot-see-sandbox-init-pid1"; exit 73;
+          parent_pid="\$(awk '\$1 == "PPid:" { print \$2 }' /proc/\$\$/status)"
+          [ "\$\$" != 1 ] && [ "\$parent_pid" = 1 ] || {
+            echo "CG-FAIL primary shared pid=\$\$ parent=\$parent_pid expected-pid1-parent"; exit 73;
           }
         fi
         echo "CG-\$role-GEN-\$generation-PID-\$pid_mode-OK"
@@ -176,16 +174,14 @@ files:
         echo "CG-\$role-GEN-\$generation-CONTROLLERS-OK"
       fi
 
-      if [ "\$real_check" = 1 ]; then
-        real_root=/proc/1/root/sys/fs/cgroup/app
-        if [ "\$control" = true ]; then
-          [ ! -s "\$real_root/cgroup.procs" ] || { echo "CG-FAIL \$role real-app-root-not-empty"; cat "\$real_root/cgroup.procs"; exit 75; }
-          grep -qx "\$\$" "\$real_root/init/cgroup.procs" || { echo "CG-FAIL \$role pid=\$\$ missing-real-app-init"; exit 76; }
-        else
-          grep -qx "\$\$" "\$real_root/cgroup.procs" || { echo "CG-FAIL \$role pid=\$\$ missing-real-app"; exit 79; }
-        fi
-        echo "CG-\$role-GEN-\$generation-REAL-OK"
+      if [ "\$control" = true ]; then
+        root_members="\$(cat /sys/fs/cgroup/cgroup.procs)"
+        [ -z "\$root_members" ] || { echo "CG-FAIL \$role delegated-root-not-empty: \$root_members"; exit 75; }
+        grep -qx "\$\$" /sys/fs/cgroup/init/cgroup.procs || { echo "CG-FAIL \$role pid=\$\$ missing-init-membership"; exit 76; }
+      else
+        grep -qx "\$\$" /sys/fs/cgroup/cgroup.procs || { echo "CG-FAIL \$role pid=\$\$ missing-root-membership"; exit 79; }
       fi
+      echo "CG-\$role-GEN-\$generation-MEMBERSHIP-OK"
 
       touch "/tmp/cg-\${role}.\${generation}.ready"
       case "\$role:\$generation" in
@@ -202,16 +198,16 @@ init:
     args:
       - -c
       - |
-        top_cgroup=\$(cat /proc/self/cgroup) && [ "\$top_cgroup" = "0::/" ]
+        init_cgroup=\$(cat /proc/self/cgroup) && pid1_cgroup=\$(cat /proc/1/cgroup) && [ "\$init_cgroup" = "\$pid1_cgroup" ] && case "\$init_cgroup" in 0::/) : ;; 0::/init) [ "$control" = true ] ;; *) exit 1 ;; esac
 launch:
   exec: /cgroup-fork-probe
-  args: [/probe.sh, primary, "$expected", "$pid_mode", "$control", "$real_check"]
+  args: [/probe.sh, primary, "$expected", "$pid_mode", "$control", "$membership_check"]
   restart: always
   cgroup_control: $control
   pid_namespace: $pid_mode
   plugin:
     - exec: /cgroup-fork-probe
-      args: [/probe.sh, plugin, "$expected", "$pid_mode", "$control", "$plugin_real_check"]
+      args: [/probe.sh, plugin, "$expected", "$pid_mode", "$control", "$membership_check"]
       restart: always
 EOF
 
@@ -231,8 +227,9 @@ EOF
     wait_marker "CG-plugin-GEN-2-SELF $expected" "$log" "$run_pid" || e2e_fail "$name plugin did not restart in expected cgroup"
     wait_marker "CG-plugin-GEN-2-FORK-OK 128" "$log" "$run_pid" || e2e_fail "$name plugin immediate-fork placement failed"
     wait_marker "CG-primary-GEN-2-PID-$pid_mode-OK" "$log" "$run_pid" || e2e_fail "$name PID namespace contract failed"
-    # runInit aborts launch if its exact root-cgroup assertion fails. Do not
-    # reconstruct this value from two writes to the interleaved guest console.
+    # Init must share its visible PID 1's cgroup. The runtime may place both
+    # at / or, with delegation, /init; this consumer need not know its topology.
+    # A failed assertion aborts launch, independently of interleaved console I/O.
 
     # Guest output (including a restart) can precede the host's app_started
     # acknowledgement. Exec requires the committed host running state; the
@@ -252,7 +249,7 @@ PY_INITIAL
     [ "$(grep -c '^ready$' "$ready_log")" = 1 ] || e2e_fail "$name restart repeated readiness"
     local exec_log="$OUT/$name-exec.log"
     "$BIN/sandbox-ctl" exec --sandbox-id "$sid" --run-root "$run_root" -- \
-        /cgroup-fork-probe /probe.sh exec "$expected" "$pid_mode" "$control" "$real_check" >"$exec_log" 2>&1 || {
+        /cgroup-fork-probe /probe.sh exec "$expected" "$pid_mode" "$control" "$membership_check" >"$exec_log" 2>&1 || {
         local exec_status=$?
         printf '%s exec failed: exit=%s\n' "$name" "$exec_status" >&2 || true
         cat "$exec_log" >&2 || true
@@ -261,11 +258,9 @@ PY_INITIAL
     grep -qF "CG-exec-GEN-1-SELF $expected" "$exec_log" || e2e_fail "$name exec cgroup mismatch"
     grep -qF 'CG-exec-GEN-1-FORK-OK 128' "$exec_log" || e2e_fail "$name exec immediate-fork placement failed"
     [ "$pid_mode" != private ] || grep -qF 'CG-exec-PID-private-OK' "$exec_log" || e2e_fail "$name exec missed private primary PID namespace"
-    if [ "$real_check" = 1 ]; then
-        grep -qF 'CG-primary-GEN-2-REAL-OK' "$log" || e2e_fail "$name primary real membership missing"
-        grep -qF 'CG-exec-GEN-1-REAL-OK' "$exec_log" || e2e_fail "$name exec real membership missing"
-    fi
-    grep -qF 'CG-plugin-GEN-2-REAL-OK' "$log" || e2e_fail "$name plugin real membership missing"
+    grep -qF 'CG-primary-GEN-2-MEMBERSHIP-OK' "$log" || e2e_fail "$name primary scoped membership missing"
+    grep -qF 'CG-exec-GEN-1-MEMBERSHIP-OK' "$exec_log" || e2e_fail "$name exec scoped membership missing"
+    grep -qF 'CG-plugin-GEN-2-MEMBERSHIP-OK' "$log" || e2e_fail "$name plugin scoped membership missing"
     if [ "$control" = true ]; then
         grep -qF 'CG-primary-GEN-2-CONTROLLERS-OK' "$log" || e2e_fail "$name primary controllers missing"
         grep -qF 'CG-plugin-GEN-2-CONTROLLERS-OK' "$log" || e2e_fail "$name plugin controllers missing"

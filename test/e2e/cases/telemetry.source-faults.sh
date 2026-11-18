@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # e2e-requires: ["kvm","userfaultfd"]
-# Per-source timeout/isolation, recovery, restored request epochs and CH/vsock faults.
+# Host source-status isolation, recovery, restored epochs and CH/vsock faults.
 set -euo pipefail
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
 SANDBOXER_LIB="$E2E_LIB/sandboxer"
 : "${E2E_WORKSPACE:?E2E_WORKSPACE is required}" "${WORK:?WORK is required}" "${OUT:?OUT is required}" "${USAGE_PROBE_BIN:?USAGE_PROBE_BIN is required}"
 require_root
 require_kvm
-for command in python3 strace ldd mount umount mkfs.ext4; do require_command "$command"; done
+for command in python3 mount umount mkfs.ext4; do require_command "$command"; done
 for binary in sandbox-ctl sandbox-init cloud-hypervisor flatten-ctl; do require_binary "$binary"; done
 for file in sandbox-runtime.bundle vmlinux; do [ -f "$BIN/$file" ] || e2e_fail "missing prepared product: $file"; done
 [ -x "$USAGE_PROBE_BIN" ] || e2e_fail "missing executable prepared usage probe"
@@ -19,11 +19,10 @@ from pathlib import Path
 LIB = Path(sys.argv[1])
 sys.path.insert(0, str(LIB))
 #!/usr/bin/env python3
-"""Real slow-source faults in disposable VMs, without product injection hooks.
+"""Host source-status and transport faults on real Guest responses.
 
-Only the selected managed disk's fstatfs return is delayed. This is a syscall
-delay, not a claim that the underlying ext4 block device failed. The first
-completed raw value remains with its old request and must never be replayed.
+The relay changes one selected source status; it never blocks a Guest syscall.
+Producer worker ownership and late completion are covered in guest-runtime.
 """
 import atexit
 import json
@@ -40,31 +39,30 @@ from usage_ch_relay import CHRelay
 from usage_vsock_relay import UsageRelay
 
 
-def tracer_dependencies(output):
-    if "not found" in output:
-        raise ValueError("strace has an unresolved shared library")
-    paths = set(re.findall(r"(?:=>\s+)?(/\S+)", output))
-    if not paths and "not a dynamic executable" not in output and "statically linked" not in output:
-        raise ValueError("cannot identify the strace loader and libraries")
-    return sorted(paths)
-
-
-def install_tracer(root):
-    tracer = Path(shutil.which("strace")).resolve()
-    # Only inspect the already installed, trusted native test executable.
-    result = subprocess.run(["ldd", str(tracer)], text=True, capture_output=True, timeout=10)
-    output = result.stdout + result.stderr
-    paths = tracer_dependencies(output)
-    assert result.returncode == 0 or not paths, output
-    shutil.copy2(tracer, root / "strace")
-    copies = {"strace": digest(tracer)}
-    for name in paths:
-        source = Path(name)
-        dest = root / source.relative_to("/")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, dest)  # Dereference links at their guest-visible path.
-        copies[name] = digest(source)
-    return {"version": run(tracer, "-V"), "ldd": output, "sha256": copies}
+def validate_source_injection(requests):
+    """Prove the relay changes only one source in each actual Guest response."""
+    faults = [row for row in requests if "source_fault" in row]
+    assert faults, "no source-status fault was delivered"
+    for row in faults:
+        raw = row["response"]
+        forwarded = row["source_forwarded"]
+        selected = row["source_fault"]
+        assert raw["type"] == forwarded["type"] == "usage_response"
+        assert selected["status"] in ("timeout", "busy")
+        response = raw["usage_response"]
+        assert response["request_id"] == row["request"]["request_id"]
+        assert response["run_epoch"] == row["request"]["run_epoch"]
+        # Rebuild exactly the permitted change from the untouched Guest frame.
+        expected = json.loads(json.dumps(raw))
+        matches = [fs for fs in expected["usage_response"]["filesystems"] if fs["disk"] == selected["disk"]]
+        assert len(matches) == 1
+        source = matches[0]
+        assert source["status"] == "ok", "injection concealed a real Guest source failure"
+        assert "blocks" in source and "bfree" in source, "no actual Guest filesystem values"
+        identity = {key: source[key] for key in ("disk", "incarnation") if key in source}
+        source.clear()
+        source.update(identity, status=selected["status"])
+        assert forwarded == expected, "source injection changed another source or request identity"
 
 
 def resources(sb):
@@ -111,7 +109,7 @@ def validate_recovery(samples, last, baseline, expected):
         last += 1
         assert disk["status"] in ("busy", "ok"), disk
         if disk["status"] == "ok":
-            assert int(disk["last_value_bytes"]) == expected, "late raw buffer was replayed"
+            assert int(disk["last_value_bytes"]) == expected, "fresh filesystem value was not consumed"
             if valid == 0:
                 for field in ("covered_total_ns", "integral_total_byte_ns"):
                     assert disk[field] == baseline[field], "missing interval was integrated"
@@ -151,26 +149,16 @@ def reap_source_process(process):
                 process.wait(timeout=5)
 
 
-def cleanup_sources(sb, trace=None, processes=(), relay=None, failure=None, owned_trace=False):
-    # Fixed test-owned processes, not an unbounded cleanup queue. Preserve the
-    # case's explicit failure; an unrelated enclosing except is not that failure.
+def cleanup_sources(sb, processes=(), relay=None, failure=None):
+    # Every auxiliary process and relay belongs to this disposable case.
     errors = []
-
     def attempt(action):
         try:
             action()
         except BaseException as error:
             errors.append(error)
-
-    if owned_trace and sb.process.poll() is None:
-        attempt(lambda: finish_owned_trace(sb))
-    if trace is not None and trace.poll() is None:
-        def detach():
-            sb.cli("exec", "--", "/probe", "trace-stop")
-            trace.wait(timeout=10)
-        attempt(detach)
-    for process in (trace, *processes):
-        attempt(lambda: reap_source_process(process))
+    for process in processes:
+        attempt(lambda process=process: reap_source_process(process))
     attempt(sb.stop)
     if relay is not None:
         attempt(relay.stop)
@@ -184,9 +172,11 @@ def cleanup_sources(sb, trace=None, processes=(), relay=None, failure=None, owne
 
 def filesystem_case(work, ref, seconds):
     config = filesystem_config(work, "filesystem", ref)
-    sb, trace, observer, release = Sandbox(work, "filesystem", config), None, None, None
-    samples, observed_resources, failure = [], [], None
+    sb = Sandbox(work, "filesystem", config, ch_binary=LIB.joinpath("usage_vsock_wrapper.py"))
+    relay, observer, failure = None, None, None
+    samples, observed_resources = [], []
     try:
+        relay = UsageRelay(sb.runroot / "instance/vsock.sock")
         sb.ready()
         guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
         write_json(sb.dir / "guest.json", guest)
@@ -203,13 +193,11 @@ def filesystem_case(work, ref, seconds):
         write_json(sb.dir / "grown.json", grown)
         for disk in ("filesystem.disk-0", "filesystem.disk-1"):
             assert int(metric(grown["live"], "gauges", disk)["last_value_bytes"]) - int(metric(before["live"], "gauges", disk)["last_value_bytes"]) >= 8 * 1024 * 1024
-        with (sb.dir / "guest-trace.log").open("w") as output, (sb.dir / "guest-resources.log").open("w") as guest_output:
-            trace = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
-                "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "trace-fs", "/data", str((seconds+15)*1000)],
-                stdout=output, stderr=subprocess.STDOUT)
+        relay.block_source()
+        with (sb.dir / "guest-resources.log").open("w") as guest_output:
             started, last, changed = time.monotonic(), 0, False
             while time.monotonic() - started < seconds:
-                assert trace.poll() is None, f"Guest tracer exited {trace.returncode}"
+                assert not relay.errors, relay.errors
                 view = sb.view()
                 disk = metric(view["live"], "gauges", "filesystem.disk-0")
                 request = int(disk["last_request_id"])
@@ -217,13 +205,9 @@ def filesystem_case(work, ref, seconds):
                     last = request
                     samples.append(view)
                     if disk["status"] == "busy" and not changed:
-                        # The delayed syscall already contains the old value.
-                        # New bytes distinguish a fresh post-fault read from
-                        # replay of that old request's completed raw buffer.
                         sb.cli("exec", "--", "/probe", "write", "/data/after-read", "8")
                         sb.cli("exec", "--", "/probe", "write", "/other/during-fault", "8")
-                        # A single exec observer avoids creating a new Go
-                        # Process/pidfd for each measurement. Count all FDs.
+                        # This observes the user executor, not outer producer FDs.
                         observer = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
                             "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "init-resources-stream", str(seconds-5)],
                             stdout=guest_output, stderr=subprocess.STDOUT)
@@ -235,61 +219,47 @@ def filesystem_case(work, ref, seconds):
             write_json(sb.dir / "during.json", samples)
             write_json(sb.dir / "resources.json", observed_resources)
             faults = validate_blocked(samples, metric(grown["live"], "gauges", "filesystem.disk-0"))
-            # The observer ends before the next ordinary exec opens transient
-            # stdio/handshake FDs. Keep every recorded FD and the original bound.
             assert observer.poll() == 0, "resource observer outlived its fault-only window"
             raw = json.loads(sb.cli("exec", "--", "/probe", "statfs", "/data"))
             expected = (raw["Blocks"] - raw["Bfree"]) * (raw["Frsize"] or raw["Bsize"])
             write_json(sb.dir / "current-statfs.json", raw)
             assert expected > int(metric(faults[-1]["live"], "gauges", "filesystem.disk-0")["last_value_bytes"])
-            # Keep sampling while the stop request and tracer detach run.
-            # Waiting for either first would miss a transient replayed round.
-            with (sb.dir / "release.log").open("w") as release_output:
-                # The synchronous statfs/checks can span more blocked rounds.
-                # Re-anchor before detach; every subsequent round must still
-                # be observed so a transient replay cannot escape validation.
-                recovery_view = sb.view()
-                recovery_baseline = metric(recovery_view["live"], "gauges", "filesystem.disk-0")
-                previous = metric(faults[-1]["live"], "gauges", "filesystem.disk-0")
-                assert trace.poll() is None, "Guest tracer exited before recovery baseline"
-                assert recovery_view["live"]["run_epoch"] == faults[-1]["live"]["run_epoch"], "filesystem recovery epoch changed"
-                assert recovery_baseline["status"] == "busy" and not recovery_baseline["continuous"], "filesystem recovery baseline is not blocked"
-                assert int(recovery_baseline["last_request_id"]) >= int(previous["last_request_id"]), "filesystem recovery request regressed"
-                for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
-                    assert recovery_baseline[field] == previous[field], "blocked filesystem recovery baseline changed"
-                recovery_start = last = int(recovery_baseline["last_request_id"])
-                release = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
-                    "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "trace-stop"],
-                    stdout=release_output, stderr=subprocess.STDOUT)
-                recovered, end = [], time.monotonic() + 5
-                while time.monotonic() < end:
-                    view = sb.view()
-                    disk = metric(view["live"], "gauges", "filesystem.disk-0")
-                    if int(disk["last_request_id"]) > last:
-                        last = int(disk["last_request_id"])
-                        recovered.append(view)
-                    time.sleep(.1)
-                release.wait(timeout=5)
-                assert release.returncode == 0
-            trace.wait(timeout=5)
-            assert trace.returncode == 0
-        trace_text = (sb.dir / "guest-trace.log").read_text()
-        assert len(re.findall(r"fstatfs\(\d+<", trace_text)) == 1, trace_text
+            assert not relay.errors, relay.errors
+            recovery_view = sb.view()
+            recovery_baseline = metric(recovery_view["live"], "gauges", "filesystem.disk-0")
+            previous = metric(faults[-1]["live"], "gauges", "filesystem.disk-0")
+            assert recovery_view["live"]["run_epoch"] == faults[-1]["live"]["run_epoch"], "filesystem recovery epoch changed"
+            assert recovery_baseline["status"] == "busy" and not recovery_baseline["continuous"], "filesystem recovery baseline is not blocked"
+            for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
+                assert recovery_baseline[field] == previous[field], "blocked filesystem recovery baseline changed"
+            recovery_start = last = int(recovery_baseline["last_request_id"])
+            assert recovery_start >= int(previous["last_request_id"]), "filesystem recovery request regressed"
+            relay.release_source()
+            recovered, end = [], time.monotonic() + 5
+            while time.monotonic() < end:
+                view = sb.view()
+                disk = metric(view["live"], "gauges", "filesystem.disk-0")
+                if int(disk["last_request_id"]) > last:
+                    last = int(disk["last_request_id"])
+                    recovered.append(view)
+                time.sleep(.1)
         write_json(sb.dir / "recovery-baseline.json", recovery_view)
         write_json(sb.dir / "recovered.json", recovered)
         validate_recovery(recovered, recovery_start, recovery_baseline, expected)
         observer.wait(timeout=10)
         assert observer.returncode == 0
         guest_resources = [json.loads(line) for line in (sb.dir / "guest-resources.log").read_text().splitlines()]
-        for owner, rows in (("host", observed_resources), ("guest", guest_resources)):
+        for owner, rows in (("host", observed_resources), ("user-executor", guest_resources)):
             counts = [row["fds"] for row in rows]
             assert len(counts) >= 3 and max(counts) - min(counts) <= 4, (owner, counts)
-        print(f"PASS usage-sources/filesystem ({len(faults)} timeout/busy rounds)", flush=True)
+        validate_source_injection(relay.requests)
+        assert not relay.errors, relay.errors
+        print(f"PASS usage-sources/filesystem ({len(faults)} injected timeout/busy consumer rounds)", flush=True)
     except BaseException as error:
         failure = error
         raise
     finally:
-        cleanup_sources(sb, trace, (release, observer), failure=failure)
+        cleanup_sources(sb, processes=(observer,), relay=relay, failure=failure)
 
 
 def validate_wire_progress(baseline, observed):
@@ -361,7 +331,7 @@ def validate_wire_views(values, requests):
             expected = "missing"
             if row is not None and not row["mode"]:
                 assert row.get("sent_ns"), "unforwarded response became visible"
-                response = row["response"]
+                response = row.get("forwarded", row["response"])
                 if response["type"] == "usage_response":
                     raw = response["usage_response"]
                     if name == "guest.memory":
@@ -393,7 +363,7 @@ def validate_wire_deadline(fault, requests):
 def vsock_case(work, ref):
     sb = Sandbox(work, "vsock", filesystem_config(work, "vsock", ref),
                  ch_binary=LIB.joinpath("usage_vsock_wrapper.py"))
-    relay, trace, observer, failure = None, None, None, None
+    relay, observer, failure = None, None, None
     try:
         relay = UsageRelay(sb.runroot / "instance/vsock.sock")
         sb.ready()
@@ -401,10 +371,8 @@ def vsock_case(work, ref):
         write_json(sb.dir / "guest.json", guest)
         assert guest["sandbox_init_sha256"] == runtime_init_digest(digest(BIN / "sandbox-init"))
         time.sleep(3)
-        with (sb.dir / "guest-trace.log").open("w") as output, (sb.dir / "guest-resources.log").open("w") as guest_output:
-            trace = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
-                "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "trace-fs", "/data", "85000"],
-                stdout=output, stderr=subprocess.STDOUT)
+        with (sb.dir / "guest-resources.log").open("w") as guest_output:
+            relay.block_source()
             time.sleep(3)
             baseline = sb.view()
             write_json(sb.dir / "baseline.json", baseline)
@@ -422,7 +390,7 @@ def vsock_case(work, ref):
                 relay.arm(mode)
                 values, started, last = [], time.monotonic(), None
                 while time.monotonic() - started < 5:
-                    assert trace.poll() is None and observer.poll() is None
+                    assert observer.poll() is None and not relay.errors
                     view = sb.view()
                     key = wire_view_key(view)
                     if key != last:
@@ -455,7 +423,7 @@ def vsock_case(work, ref):
                 assert metric(values[-1]["live"], "gauges", "guest.memory")["status"] == "ok", "connection did not recover with new data"
                 for view in values:
                     disk = metric(view["live"], "gauges", "filesystem.disk-0")
-                    assert disk["status"] in ("busy", "missing"), "reconnect replaced the blocked source"
+                    assert disk["status"] in ("busy", "missing"), "Host lost the injected source fault across reconnect"
                     for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
                         assert disk[field] == metric(baseline["live"], "gauges", "filesystem.disk-0")[field]
                     for name in ("ch.rss_anon", "ch.rss_file", "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file"):
@@ -468,25 +436,19 @@ def vsock_case(work, ref):
             assert observer.returncode == 0
             assert metric(sb.view()["live"], "gauges", "filesystem.disk-0")["status"] == "busy"
             sb.cli("exec", "--", "/probe", "true")
-            release_started = time.monotonic_ns()
-            sb.cli("exec", "--", "/probe", "trace-stop")
-            trace.wait(timeout=10)
-            assert trace.returncode == 0
-        text = (sb.dir / "guest-trace.log").read_text()
-        assert len(re.findall(r"fstatfs\(\d+<", text)) == 1, text
+            relay.release_source()
         with relay.lock:
             requests = list(relay.requests)
         ids = [int(row["request"]["request_id"]) for row in requests]
         assert all(b > a for a, b in zip(ids, ids[1:])), ids
         assert len({row["request"]["run_epoch"] for row in requests}) == 1
         assert len({row["connection"] for row in requests}) >= len(faults)+1
-        # Verify raw Guest slot state across all connections, not merely Host
-        # missing statuses when a deliberately dropped response hides it.
-        raw_disks = [next(fs for fs in row["response"]["usage_response"]["filesystems"] if fs["disk"] == "disk-0")
-                     for row in requests if row.get("response", {}).get("type") == "usage_response" and
-                     row["received_ns"] < release_started]
-        first_timeout = next(i for i, fs in enumerate(raw_disks) if fs["status"] == "timeout")
-        assert all(fs["status"] == "busy" for fs in raw_disks[first_timeout+1:]), "Guest replaced a busy worker on reconnect"
+        # Verify source-status injection persisted across all connections,
+        # including responses subsequently dropped by a transport fault.
+        injected_disks = [next(fs for fs in row["source_forwarded"]["usage_response"]["filesystems"] if fs["disk"] == "disk-0")
+                          for row in requests if "source_fault" in row]
+        assert injected_disks[0]["status"] == "timeout"
+        assert all(fs["status"] == "busy" for fs in injected_disks[1:]), "source-status injection changed across reconnect"
         host_counts = [row["fds"] for row in counts]
         assert max(host_counts) - min(host_counts) <= 4, host_counts
         guest_resources = [json.loads(line) for line in (sb.dir / "guest-resources.log").read_text().splitlines()]
@@ -494,12 +456,13 @@ def vsock_case(work, ref):
         assert len(guest_counts) == 61 and max(guest_counts) - min(guest_counts) <= 4, guest_counts
         validate_wire_progress(baseline, observed)
         assert not relay.errors, relay.errors
-        print("PASS usage-sources/vsock (11 real frame faults across one blocked filesystem slot)", flush=True)
+        validate_source_injection(requests)
+        print("PASS usage-sources/vsock (11 real frame faults with explicit source-status injection)", flush=True)
     except BaseException as error:
         failure = error
         raise
     finally:
-        cleanup_sources(sb, trace, (observer,), relay, failure)
+        cleanup_sources(sb, processes=(observer,), relay=relay, failure=failure)
 
 
 def observe_ch_hold(sb, relay, before):
@@ -557,22 +520,13 @@ def validate_ch_missing(samples, baseline, observed=None):
         assert int(last["covered_total_ns"]) - int(first["covered_total_ns"]) >= 6_000_000_000, name
 
 
-def finish_owned_trace(sb):
-    sb.cli("exec", "--", "/probe", "trace-stop", timeout=3)
-    end = time.monotonic() + 5
-    while time.monotonic() < end:
-        state = json.loads(sb.cli("exec", "--", "/probe", "trace-state", timeout=2))
-        if state.get("usage-owned-done") == "detached":
-            return state
-        time.sleep(.1)
-    raise AssertionError("snapshot-owned Guest tracer did not detach")
 
 
 def validate_preserved_slot(baseline, view):
     disk = metric(view["live"], "gauges", "filesystem.disk-0")
-    assert disk["status"] == "busy" and not disk["continuous"], "lifecycle replaced the occupied slot"
+    assert disk["status"] == "busy" and not disk["continuous"], "lifecycle lost the injected busy source"
     for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
-        assert disk[field] == baseline[field], "lifecycle filled or extended the blocked source"
+        assert disk[field] == baseline[field], "lifecycle filled or extended the unavailable source"
     for name in ("guest.memory", "filesystem.root", "filesystem.disk-1", "ch.rss_anon", "ch.rss_file", "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file"):
         assert metric(view["live"], "gauges", name)["status"] == "ok", name
 
@@ -594,7 +548,7 @@ def capture_enospc(sb, work):
     output.mkdir()
     # The immutable root image is emitted before quiesce. Allow its actual
     # carrier plus bounded slack, but not the 16 MiB written to disk-0. This
-    # derives the allowance for the installed architecture's probe/strace.
+    # derives the allowance for the installed architecture's probe.
     image_bytes = (work / "root.img").stat().st_size
     assert image_bytes <= 64 * 1024 * 1024, "unexpectedly large test root image"
     limit = ((image_bytes + 4095) // 4096) * 4096 + 4 * 1024 * 1024
@@ -636,7 +590,8 @@ def validate_old_epoch(requests, old_epoch, new_epoch):
     raw = fault["response"]["usage_response"]
     forwarded = fault["forwarded"]["usage_response"]
     assert old_epoch != new_epoch and raw["run_epoch"] == new_epoch
-    assert forwarded == {**raw, "run_epoch": old_epoch}, "fault changed more than the old run identity"
+    source = fault["source_forwarded"]["usage_response"]
+    assert forwarded == {**source, "run_epoch": old_epoch}, "epoch fault changed more than the old run identity"
     assert raw["request_id"] == fault["request"]["request_id"]
     assert fault.get("sent_ns") and fault.get("client_closed_ns"), "Host did not reject the old-epoch connection"
     later = [row for row in requests if int(row["request"]["request_id"]) > int(raw["request_id"])]
@@ -645,11 +600,16 @@ def validate_old_epoch(requests, old_epoch, new_epoch):
     assert all(b > a for a, b in zip(ids, ids[1:])), "restore reconnect reset request identity"
     for row in requests:
         assert row["request"]["run_epoch"] == new_epoch
-        if row.get("response", {}).get("type") == "usage_response":
+        # A request may have received its raw frame while the relay is still
+        # preparing injection. Only completed sends have complete evidence.
+        if row.get("sent_ns") and row.get("response", {}).get("type") == "usage_response":
             response = row["response"]["usage_response"]
             assert response["memory"]["status"] == "ok"
             disk = next(fs for fs in response["filesystems"] if fs["disk"] == "disk-0")
-            assert disk["status"] == "busy", "restore or reconnect created a replacement worker"
+            assert disk["status"] == "ok", "real Guest source failed during restore"
+            assert "source_forwarded" in row, "sent response has no source-injection evidence"
+            injected = next(fs for fs in row["source_forwarded"]["usage_response"]["filesystems"] if fs["disk"] == "disk-0")
+            assert injected["status"] == "busy", "Host source-status injection was lost across reconnect"
 
 
 def dump_restore_failure(phase, *sandboxes):
@@ -659,7 +619,7 @@ def dump_restore_failure(phase, *sandboxes):
         if sb is None:
             continue
         for name in ("run.log", "capture-failure.log", "snapshot.log",
-                     "trace-start.json", "trace-after-failure.json", "trace-done.json"):
+                     "relay.json", "before.json", "restored.json"):
             path = sb.dir / name
             try:
                 with path.open("rb") as source:
@@ -677,11 +637,11 @@ def dump_restore_failure(phase, *sandboxes):
                 print(f"usage restore diagnostic {sb.dir.name}/{name}: unavailable", file=sys.stderr)
 
 
-def cleanup_restore_sources(sb, child, release, relay, failure, launched):
+def cleanup_restore_sources(sb, child, source_relay, relay, failure):
     """Retain evidence when cleanup, rather than the case body, first fails."""
     try:
         if child is not None:
-            cleanup_sources(child, processes=(release,), relay=relay, failure=failure, owned_trace=True)
+            cleanup_sources(child, relay=relay, failure=failure)
     except BaseException as error:
         if failure is None:
             failure = error
@@ -689,7 +649,7 @@ def cleanup_restore_sources(sb, child, release, relay, failure, launched):
         raise
     finally:
         try:
-            cleanup_sources(sb, failure=failure, owned_trace=launched)
+            cleanup_sources(sb, relay=source_relay, failure=failure)
         except BaseException:
             if failure is None:
                 dump_restore_failure("source-cleanup", sb, child)
@@ -698,10 +658,12 @@ def cleanup_restore_sources(sb, child, release, relay, failure, launched):
 
 def restore_case(work, ref):
     config = filesystem_config(work, "restore-source", ref)
-    sb = Sandbox(work, "restore-original", config, sandbox_id="restore-source")
-    child, relay, release, failure, launched = None, None, None, None, False
+    sb = Sandbox(work, "restore-original", config, sandbox_id="restore-source",
+                 ch_binary=LIB.joinpath("usage_vsock_wrapper.py"))
+    child, source_relay, relay, failure = None, None, None, None
     phase = "source-ready"
     try:
+        source_relay = UsageRelay(sb.runroot / "instance/vsock.sock")
         sb.ready()
         guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
         write_json(sb.dir / "guest.json", guest)
@@ -709,18 +671,8 @@ def restore_case(work, ref):
         assert guest["balloon_proc_field"] == "false" and "pagesets" in guest["zoneinfo"] and "count:" in guest["zoneinfo"]
         sb.cli("exec", "--", "/probe", "write", "/data/payload", "8")
         time.sleep(3)
-        # This bounded test owner alone joins the disposable Guest's root
-        # cgroup. Ordinary execs are correctly killed by quiesce; neither
-        # PID 1 nor application/exec-join processes are moved by this test.
-        launched = True
-        launch = json.loads(sb.cli("exec", "--", "/probe", "trace-launch", "/data", "80000"))
-        write_json(sb.dir / "trace-launch.json", launch)
+        source_relay.block_source()
         time.sleep(3)
-        state = json.loads(sb.cli("exec", "--", "/probe", "trace-state"))
-        write_json(sb.dir / "trace-start.json", state)
-        owner_identity = state["usage-owned-ready.json"]
-        assert json.loads(state["usage-owned-ready.json"])["owner_pid"] == launch["owner_pid"]
-        assert "usage-owned-done" not in state
         before = sb.view()
         write_json(sb.dir / "before.json", before)
         baseline = metric(before["live"], "gauges", "filesystem.disk-0")
@@ -728,26 +680,18 @@ def restore_case(work, ref):
         sb.cli("exec", "--", "/probe", "write", "/data/after-read", "8")
         phase = "capture-rollback"
         capture_enospc(sb, work)
-        # Recovery must reopen the Guest and retain the occupied source, not
-        # recreate a worker after the failed capture. The usage path is on a
-        # different filesystem and is unaffected by the limited output mount.
         sb.cli("exec", "--", "/probe", "true")
         info = sb.ch_info()
         write_json(sb.dir / "post-failure-ch.json", info)
         assert info["state"] == "Running", info
         time.sleep(3)
-        state = json.loads(sb.cli("exec", "--", "/probe", "trace-state"))
-        write_json(sb.dir / "trace-after-failure.json", state)
-        assert state["usage-owned-ready.json"] == owner_identity and "usage-owned-done" not in state
         rolled_back = sb.view()
         write_json(sb.dir / "rolled-back.json", rolled_back)
         assert rolled_back["live"]["run_epoch"] == before["live"]["run_epoch"]
         validate_preserved_slot(baseline, rolled_back)
         assert int(metric(rolled_back["live"], "gauges", "filesystem.disk-0")["last_request_id"]) > int(baseline["last_request_id"])
         for name in ("guest.memory", "filesystem.root", "filesystem.disk-1"):
-            first = metric(before["live"], "gauges", name)
-            latest = metric(rolled_back["live"], "gauges", name)
-            assert int(latest["covered_total_ns"]) > int(first["covered_total_ns"]), name
+            assert int(metric(rolled_back["live"], "gauges", name)["covered_total_ns"]) > int(metric(before["live"], "gauges", name)["covered_total_ns"]), name
         output = sb.dir / "snapshot"
         output.mkdir()
         phase = "source-snapshot"
@@ -761,8 +705,6 @@ def restore_case(work, ref):
         write_json(sb.dir / "resumed.json", resumed)
         assert resumed["live"]["run_epoch"] == before["live"]["run_epoch"]
         validate_preserved_slot(baseline, resumed)
-        phase = "source-trace-detach"
-        write_json(sb.dir / "trace-done.json", finish_owned_trace(sb))
         sb.stop()
         parent = sb.view()
         write_json(sb.dir / "stopped.json", parent)
@@ -772,9 +714,10 @@ def restore_case(work, ref):
                 "restore": {"prefetch": "off"}, "usage": config["usage"], "timeouts": {"restore": "30s"}}
         child = Sandbox(work, "restore-child", host, restore=snapshot, sandbox_id=sb.name,
                         base_root=sb.baseroot, ch_binary=LIB.joinpath("usage_vsock_wrapper.py"))
-        # CH restore reads the socket from private run-state config, not from
-        # --vsock. The wrapper relays that socket without editing the snapshot.
         relay = UsageRelay(child.runroot / "instance/vsock.sock", old_epoch=old_epoch)
+        # This fault state belongs to the Host test relay. It is deliberately
+        # re-established, not claimed to be a Guest worker saved in memory.
+        relay.block_source(first_status="busy")
         phase = "child-restore"
         child.ready()
         assert digest(snapshot) == snapshot_hash
@@ -782,10 +725,6 @@ def restore_case(work, ref):
         write_json(child.dir / "guest.json", restored_guest)
         assert restored_guest["sandbox_init_sha256"] == guest["sandbox_init_sha256"]
         time.sleep(3)
-        state = json.loads(child.cli("exec", "--", "/probe", "trace-state"))
-        write_json(child.dir / "trace-restored.json", state)
-        assert state["usage-owned-ready.json"] == owner_identity
-        assert "usage-owned-done" not in state, "snapshot lost its blocked tracer"
         restored = child.view()
         write_json(child.dir / "restored.json", restored)
         new_epoch = restored["live"]["run_epoch"]
@@ -801,35 +740,28 @@ def restore_case(work, ref):
         baseline = metric(child.view()["live"], "gauges", "filesystem.disk-0")
         assert baseline["status"] == "busy" and expected > int(baseline["last_value_bytes"])
         start_id = last = int(baseline["last_request_id"])
-        phase = "child-trace-detach"
-        with (child.dir / "release.log").open("w") as log:
-            release = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", child.name,
-                "--path-id", "instance", "--run-root", str(child.runroot), "--", "/probe", "trace-stop"],
-                stdout=log, stderr=subprocess.STDOUT)
-            recovered, end = [], time.monotonic() + 5
-            while time.monotonic() < end:
-                view = child.view()
-                request = int(metric(view["live"], "gauges", "filesystem.disk-0")["last_request_id"])
-                if request > last:
-                    recovered.append(view)
-                    last = request
-                time.sleep(.1)
-            release.wait(timeout=5)
-            assert release.returncode == 0
+        phase = "child-source-recovery"
+        relay.release_source()
+        recovered, end = [], time.monotonic() + 5
+        while time.monotonic() < end:
+            view = child.view()
+            request = int(metric(view["live"], "gauges", "filesystem.disk-0")["last_request_id"])
+            if request > last:
+                recovered.append(view)
+                last = request
+            time.sleep(.1)
         write_json(child.dir / "recovered.json", recovered)
         validate_recovery(recovered, start_id, baseline, expected)
-        state = json.loads(child.cli("exec", "--", "/probe", "trace-state"))
-        write_json(child.dir / "trace-done.json", state)
-        assert state.get("usage-owned-done") == "detached"
-        assert len(re.findall(r"fstatfs\(\d+<", state["usage-owned-trace.log"])) == 1
-        assert not relay.errors, relay.errors
-        print("PASS usage-sources/restore (occupied slot across failed capture rollback/quiesce/lazy restore; old epoch rejected; fresh recovery)", flush=True)
+        validate_source_injection(source_relay.requests)
+        validate_source_injection(relay.requests)
+        assert not relay.errors and not source_relay.errors, (relay.errors, source_relay.errors)
+        print("PASS usage-sources/restore (consumer gap across capture rollback/lazy restore; old epoch rejected; fresh raw recovery)", flush=True)
     except BaseException as error:
         failure = error
         dump_restore_failure(phase, sb, child)
         raise
     finally:
-        cleanup_restore_sources(sb, child, release, relay, failure, launched)
+        cleanup_restore_sources(sb, child, source_relay, relay, failure)
 
 
 def validate_ch_recovery(samples, baseline):
@@ -979,7 +911,7 @@ def main():
         (root / name).mkdir()
     metadata = {"host_kernel": run("uname", "-a"), "seconds": seconds, "cases": cases,
                 "artifacts": {name: digest(BIN / name) for name in ("sandbox-ctl", "sandbox-init", "sandbox-runtime.bundle", "vmlinux", "cloud-hypervisor")},
-                "tracer": install_tracer(root)}
+                "fault_boundary": "Host relay source-status injection; Guest producer tested in guest-runtime"}
     write_json(work / "source-set.json", metadata)
     build_probe(root / "probe")
     image = work / "root.img"

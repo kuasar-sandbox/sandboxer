@@ -595,78 +595,82 @@ termination through a pidfd; it does not leave cleanup to the runner.
 Linux/Python pidfd support, `strace`, mount privileges
 and the ordinary KVM E2E prerequisites are required.
 
-The [slow-source E2E](../test/e2e/cases/telemetry.source-faults.sh) selects one registered
-data-filesystem handle by device identity and checks CLOEXEC before delaying
-only that `fstatfs` return inside the disposable Guest. It requires a first
-timeout, subsequent busy responses from the same occupied slot, fresh memory
-and healthy-filesystem coverage, and exactly one traced filesystem call.
-Both data disks receive real writes. Bytes written after the delayed read
-distinguish a new observation from a replayed old buffer after release.
-A single long-lived test exec records all Guest FDs, identities, threads and
-RSS; it does not create an exec per observation or label threads as goroutines.
-The filesystem case currently uses a fixed 30-second observation window and
-a longer injected return delay; the script has no `--seconds` option. The
-observation window is not the exact fault duration. This is a syscall-return
-delay, not a physical-device failure or power-loss test.
-The installed native `strace`, its `ldd`-resolved loader and libraries are
-copied into the disposable application image only, never the product runtime.
-Its `ch-info` and `ch-resize` cases place a test-only Unix HTTP relay before
-the real CH executable. The relay forwards unchanged response bodies and
-holds one actual reply for 12 seconds. The resize is driven by a real Guest
-allocation, not by a test-issued resize. Selection requires a target lower
-than the preceding real target; the held PUT reply or its immediate confirming
-GET exercises the existing mutation-gate/API-lock transaction. Once the old observation expires, Guest
-memory must be missing while filesystem/RSS coverage advances, without more
-CH requests piling up. Recovery requires a new successful `vm.info` read.
-These bounded functional faults do not measure uninstrumented API latency or
-production-density overhead, nor identify which caller owns every info read.
-The `vsock` case relays the real dedicated usage frames and preserves ordinary
-management/MUX traffic. It exercises eight disconnects, one late reply, a
-captured old response and slow fragments beyond the original round deadline,
-while one managed filesystem syscall remains occupied. Raw Guest responses
-must continue to report the same busy slot across new connections. Failed
-rounds break Gauge coverage rather than filling zero; native CPU counters
-remain a separate source. One observer exec streams resource diagnostics
-across all eleven faults. Its first complete output establishes MUX readiness
-before injection. Additional health/stop execs run outside the all-FD observation
-window while the filesystem is still blocked; no FD samples are discarded.
-The relay observes peer EOF while a late or fragmented reply is still held,
-so the read-deadline witness is Host closure, not the next request's start.
-One intervening tick may correctly remain missing while the original Host
-read or Guest admission slot exits. New-connection recovery is checked separately.
-Live-query evidence
-retains changes to every metric's request ID and compares each metric with
-its own raw request; it does not assume atomic publication of a whole round.
-The uninjected root/second filesystem must independently return healthy raw
-data and advance its own request identity and covered time; agreement between
-two failed statuses or retention of an old successful value cannot pass.
-The `restore` case keeps one occupied filesystem slot across same-process
-quiesce/thaw and then lazy memory restore with the same SandboxID/usage file.
-A bounded, test-only tracer owner joins the disposable Guest's root cgroup
-before spawning `strace`; PID 1, the application and exec-join processes are
-not moved. The Guest reaper owns the adopted helper, which alone waits for
-its tracer. This avoids ordinary exec's intentional termination at quiesce.
-The test-only CH wrapper relocates the vsock socket in private restore run
-state, not in the immutable business snapshot. On the first restored response,
-the relay replaces only the epoch with the real previous run's identity,
-retaining the new request ID and values. This is explicit identity corruption,
-not an unmodified historical frame. Host closure and a new request on another
-connection must demonstrate rejection. Raw replies must still report the
-original busy slot, while memory and healthy filesystems remain available.
-Writes after the original read and after restore distinguish fresh recovery
-from a late old buffer; the first new value cannot integrate the missing gap.
-Both original and restored tracer owners must detach, and failure cleanup
-still stops the owned VMs and reaps Host-side test subprocesses.
+The [source-fault E2E](../test/e2e/cases/telemetry.source-faults.sh) checks the
+Host consumer using real Guest usage responses. A test-only vsock relay changes
+one selected filesystem's successful result into a first `timeout`, followed by
+`busy`, removing that result's value fields while preserving its identity. It
+records the original Guest response, the result after source-status injection,
+and any final transport mutation separately. All other sources, request IDs and
+epochs must remain unchanged. This is explicit protocol fault injection; it does
+not delay a Guest syscall or establish that a Guest worker remains occupied.
+
+The filesystem case uses a fixed 30-second observation window and requires
+unchanged last-known usage, no integration through missing intervals, and fresh
+coverage from memory, the root filesystem and the other data disk. Both data
+disks receive real writes; release of the fault must expose their current real
+values. A single observer exec records the user-visible init's FD identities,
+threads and RSS. On runtimes with an inner executor, these describe that
+executor, not the outer usage producer. Host resource counts are recorded
+separately. The script has no `--seconds` option and installs no tracer in the
+Guest image or runtime bundle.
+
+The corresponding Guest producer guarantees are exercised in guest-runtime's
+[usage source boundary tests](https://github.com/kuasar-sandbox/guest-runtime/blob/main/cmd/sandbox-init/usage_source_boundary_test.go),
+[worker tests](https://github.com/kuasar-sandbox/guest-runtime/blob/main/cmd/sandbox-init/usage_test.go)
+and [reattach tests](https://github.com/kuasar-sandbox/guest-runtime/blob/main/cmd/sandbox-init/usage_restore_test.go).
+A controlled blocking read verifies timeout followed by busy, one occupied
+worker across reconnect and attach/restore transitions, and rejection of an old
+completion by later request IDs and epochs. Actual registered directory handles
+are checked for CLOEXEC, absence after exec, and exactly-once closure by their
+owner after an in-flight read finishes. These are producer unit/process tests;
+they do not claim a kernel-stalled syscall survived a real VM memory snapshot.
+The user environment need not reach the outer producer's PID, FDs or cgroups.
+
+The `ch-info` and `ch-resize` cases place a test-only Unix HTTP relay before the
+real CH executable. It forwards unchanged response bodies and holds one actual
+reply for 12 seconds. A real Guest allocation drives resize. Selection requires
+a target lower than the preceding real target; the held PUT reply or its
+immediate confirming GET exercises the existing mutation-gate/API-lock
+transaction. Once the old observation expires, Guest memory must be missing
+while filesystem/RSS coverage advances, without more CH requests piling up.
+Recovery requires a new successful `vm.info` read. These bounded functional
+faults do not measure uninstrumented API latency or production-density overhead.
+
+The `vsock` case preserves ordinary management/MUX traffic and applies eight
+disconnects, one late reply, a captured old response and slow fragments beyond
+the original round deadline. The relay maintains the selected source-status
+fault across new connections; the raw Guest result remains independently
+observable. Failed rounds break Gauge coverage rather than filling zero. One
+observer exec spans all eleven faults, with its first complete output proving
+MUX readiness before injection. Health execs occur outside this FD observation
+window. The relay witnesses peer EOF while holding a delayed or fragmented
+reply, so Host closure establishes the deadline. One intervening tick may remain
+missing while the original Host read or Guest admission slot exits.
+Live-query assertions compare each metric with its own forwarded request,
+without assuming an entire round is published atomically. Uninjected root and
+second-filesystem sources must independently return healthy real data and
+advance their request identity and covered time.
+
+The `restore` case performs real quiesce/thaw, capture rollback and lazy memory
+restore using the same SandboxID/usage file. Source-status faults belong to the
+Host test relay and are explicitly re-established for the restored instance;
+the test does not claim to restore an occupied Guest worker. The wrapper changes
+only the vsock path in private restore run state, leaving the business snapshot
+unchanged. On the first restored reply, the relay also replaces the new epoch
+with the actual previous epoch. Host closure and a new request on another
+connection must prove rejection. Release must expose current real filesystem
+usage, and the first new value must not integrate the missing gap.
+
 Before successful capture, the same case exhausts a test-owned snapshot-output
-tmpfs after the immutable dependency preflight. The test requires a data-disk
-capture ENOSPC after Guest quiesce/CH pause, MUX reattachment, a real health
-exec and CH `Running` state. The occupied slot and its known usage must survive
-this failed-capture rollback while healthy sources advance. The output limit
-does not affect the usage-file directory; an earlier dependency error cannot
-pass as rollback evidence. The temporary mount is unmounted on both paths.
-Together with the repeated-operation and lifecycle regressions, these cases
-check source isolation, bounded ownership and failure cleanup. Report their
-actual observation windows; they are not physical power-loss experiments.
+tmpfs after immutable dependency preflight. It requires data-disk capture ENOSPC
+after Guest quiesce/CH pause, MUX reattachment, a real health exec and CH `Running`
+state. Known usage must survive this failed-capture rollback while healthy
+sources advance. An earlier dependency error cannot pass as rollback evidence;
+the output limit does not affect the usage-file directory. Cleanup unmounts the
+temporary filesystem, stops owned VMs/relays and reaps test subprocesses on both
+success and failure. Report these Host E2E results separately from producer
+ownership tests, including the actual observation windows. Neither reproduces
+physical device failure or power loss.
 
 The performance harness is separate from product E2E. Prepare the test probe
 and canonical artifact-identity reader in the source-build stage and provide

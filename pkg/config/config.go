@@ -650,9 +650,10 @@ type LaunchConfig struct {
 
 	// CgroupControl delegates the application cgroup namespace root to the
 	// application. false (default) runs application processes directly in the
-	// /app namespace root. true keeps /app empty, enables its subtree
-	// controllers, and runs sandbox-init-managed application processes in
-	// /app/init so in-guest managers can create controlled child cgroups.
+	// scoped root. true keeps that root empty, enables its subtree controllers,
+	// and places directly managed processes in the default /init leaf so
+	// in-guest managers can create controlled child cgroups. The Guest runtime
+	// owns the global hierarchy and process-supervision implementation.
 	CgroupControl bool `yaml:"cgroup_control,omitempty"`
 
 	// Placeholder, when true, starts an empty "anchor" app that runs no
