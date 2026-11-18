@@ -12,7 +12,7 @@ class ReportRelay(UsageRelay):
     def __init__(self, path):
         self.report_condition = threading.Condition()
         self.latest_report = None
-        super().__init__(path)
+        super().__init__(path, upstream=str(path) + ".real")
 
     def finish_request(self, request, client_address):
         ReportHandler(request, client_address, self)

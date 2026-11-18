@@ -1,11 +1,28 @@
 """Bounded test relay for faults on real usage frames; other traffic is raw."""
 import json
+import os
+from pathlib import Path
 import select
 import socket
 import socketserver
 import struct
 import threading
 import time
+
+
+def vsock_backend_path(path):
+    """Keep the private CH endpoint within the original vsock path budget.
+
+    CH appends _5000 for Guest-to-Host connections. Appending .real to the
+    original basename can overflow sun_path even when the Host listener fits.
+    Both independent endpoints stay in the case-owned runtime directory.
+    """
+    path = Path(path)
+    assert path.is_absolute() and path.name == "vsock.sock", "unexpected test vsock path"
+    backend = path.with_name("vsock.real")
+    for endpoint in (path, backend):
+        assert len(os.fsencode(str(endpoint) + "_5000")) <= 107, "test vsock pathname exceeds AF_UNIX budget"
+    return backend
 
 
 def exact(connection, length):
@@ -39,8 +56,8 @@ class UsageRelay(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
     block_on_close = False
 
-    def __init__(self, path, old_epoch=None):
-        self.real = str(path) + ".real"
+    def __init__(self, path, old_epoch=None, *, upstream=None):
+        self.real = str(vsock_backend_path(path) if upstream is None else upstream)
         self.lock = threading.Lock()
         self.stopping = threading.Event()
         self.connections = set()

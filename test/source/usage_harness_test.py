@@ -43,7 +43,7 @@ import usage_trace
 usage_faults = load_case("usage_faults", "telemetry.usage-faults.sh")
 usage_sources = load_case("usage_sources", "telemetry.source-faults.sh")
 from usage_ch_relay import CHRelay
-from usage_vsock_relay import UsageHandler, UsageRelay, exact, frame, line
+from usage_vsock_relay import UsageHandler, UsageRelay, exact, frame, line, vsock_backend_path
 from usage_report_relay import ReportRelay
 
 
@@ -1386,7 +1386,7 @@ class UsageRelayTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "vsock.sock"
-            native = socketserver.UnixStreamServer(str(path)+".real", Handler)
+            native = socketserver.UnixStreamServer(str(vsock_backend_path(path)), Handler)
             thread = threading.Thread(target=native.serve_forever, kwargs={"poll_interval": .05})
             thread.start()
             relay = UsageRelay(path, old_epoch="previous")
@@ -1440,7 +1440,7 @@ class UsageRelayTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "vsock.sock"
-            native = Native(str(path)+".real", Handler)
+            native = Native(str(vsock_backend_path(path)), Handler)
             thread = threading.Thread(target=native.serve_forever, kwargs={"poll_interval": .05})
             thread.start()
             relay = UsageRelay(path)
@@ -1517,7 +1517,7 @@ class UsageRelayTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "vsock.sock"
-            native = Native(str(path)+".real", Handler)
+            native = Native(str(vsock_backend_path(path)), Handler)
             thread = threading.Thread(target=native.serve_forever, kwargs={"poll_interval": .05})
             thread.start()
             relay = UsageRelay(path)
@@ -1587,15 +1587,23 @@ class RestoreWrapperTests(unittest.TestCase):
             snapshot.write_text(original)
             (state / "config.json").write_text(original)
             args = ["wrapper", "--api-socket", str(root / "run/ch.sock"), "--restore", "source_url=file://"+str(state)]
-            with patch.object(os, "execv", side_effect=SystemExit) as execute, \
+            backend = vsock_backend_path(value["vsock"]["socket"])
+
+            def execute(binary, argv):
+                self.assertEqual(binary, "/test/ch")
+                self.assertEqual(argv, ["/test/ch", *args[1:]])
+                changed = json.loads((state / "config.json").read_text())
+                self.assertEqual(changed, {**value, "vsock": {**value["vsock"], "socket": str(backend)}})
+                self.assertEqual(os.readlink(str(backend)+"_5000"), str(root / "run/vsock.sock_5000"))
+                raise SystemExit()
+
+            with patch.object(os, "execv", side_effect=execute), \
                  patch.dict(os.environ, {"USAGE_TEST_CH": "/test/ch"}), patch("sys.argv", args):
                 with self.assertRaises(SystemExit):
                     runpy.run_path(str(LIB / "usage_vsock_wrapper.py"))
             self.assertEqual(snapshot.read_text(), original)
-            changed = json.loads((state / "config.json").read_text())
-            self.assertEqual(changed, {**value, "vsock": {**value["vsock"], "socket": value["vsock"]["socket"]+".real"}})
-            self.assertEqual(os.readlink(root / "run/vsock.sock.real_5000"), str(root / "run/vsock.sock_5000"))
-            execute.assert_called_once_with("/test/ch", ["/test/ch", *args[1:]])
+            self.assertEqual((state / "config.json").read_text(), original)
+            self.assertFalse(os.path.lexists(str(backend)+"_5000"))
 
     def test_non_private_restore_path_is_not_written(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1608,6 +1616,139 @@ class RestoreWrapperTests(unittest.TestCase):
                     runpy.run_path(str(LIB / "usage_vsock_wrapper.py"))
             execute.assert_not_called()
             self.assertEqual((state / "config.json").read_text(), "do not edit")
+
+
+class VsockWrapperPathTests(unittest.TestCase):
+    def arguments(self, original, mode):
+        if mode == "cold":
+            return ["wrapper", "--vsock", "cid=3,socket="+str(original)]
+        state = original.parent / "snap-state"
+        state.mkdir()
+        (state / "config.json").write_text(json.dumps({"vsock": {"socket": str(original), "cid": 3}}))
+        return ["wrapper", "--api-socket", str(original.parent / "ch.sock"),
+                "--restore", "source_url=file://"+str(state)]
+
+    def invoke(self, args, execute):
+        with patch.object(os, "execv", side_effect=execute), \
+             patch.dict(os.environ, {"USAGE_TEST_CH": "/test/ch"}), patch("sys.argv", args):
+            runpy.run_path(str(LIB / "usage_vsock_wrapper.py"))
+
+    def test_real_connections_at_ci_and_unix_path_boundaries(self):
+        # CI's original base is 100 bytes: its Host listener is legal (105),
+        # but the former .real_5000 alias was 110. Also test the exact limit.
+        for base_bytes in (100, 102):
+            for mode in ("cold", "restore"):
+                with self.subTest(base_bytes=base_bytes, mode=mode), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    padding = base_bytes - len(os.fsencode(str(root))) - len("//vsock.sock")
+                    parent = root / ("x" * padding)
+                    parent.mkdir()
+                    original = parent / "vsock.sock"
+                    self.assertEqual(len(os.fsencode(original)), base_bytes)
+                    backend = vsock_backend_path(original)
+                    self.assertEqual(len(os.fsencode(backend)), base_bytes)
+                    alias = Path(str(backend)+"_5000")
+                    host_path = str(original)+"_5000"
+                    args = self.arguments(original, mode)
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as host:
+                        host.settimeout(2)
+                        host.bind(host_path)
+                        host.listen(2)
+                        too_long = str(original)+".real_5000"
+                        os.symlink(host_path, too_long)
+                        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                            with self.assertRaisesRegex(OSError, "AF_UNIX path too long"):
+                                client.connect(too_long)
+
+                        def execute(binary, argv):
+                            if mode == "cold":
+                                routed = next(part.removeprefix("socket=") for part in argv[-1].split(",") if part.startswith("socket="))
+                            else:
+                                routed = json.loads((parent / "snap-state/config.json").read_text())["vsock"]["socket"]
+                            self.assertEqual(routed, str(backend))
+                            self.assertEqual(os.readlink(alias), host_path)
+                            self.assertLessEqual(len(os.fsencode(str(alias))), 107)
+                            # Reuse the existing reverse alias; attach/resume must
+                            # not recreate it or collide with its current owner.
+                            for payload in (b"hello", b"attach"):
+                                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                                    client.settimeout(2)
+                                    client.connect(str(alias))
+                                    accepted, _ = host.accept()
+                                    with accepted:
+                                        client.sendall(payload)
+                                        self.assertEqual(exact(accepted, len(payload)), payload)
+                            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as upstream:
+                                upstream.settimeout(2)
+                                upstream.bind(routed)
+                                upstream.listen(1)
+                                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                                    client.settimeout(2)
+                                    client.connect(routed)
+                                    accepted, _ = upstream.accept()
+                                    with accepted:
+                                        client.sendall(b"management")
+                                        self.assertEqual(exact(accepted, 10), b"management")
+                            raise SystemExit()
+
+                        with self.assertRaises(SystemExit):
+                            self.invoke(args, execute)
+                    self.assertFalse(os.path.lexists(alias), "failed exec retained its owned reverse alias")
+
+    def test_path_budget_counts_encoded_bytes(self):
+        path = Path("/tmp") / ("é" * 48) / "vsock.sock"
+        self.assertLess(len(str(path)+"_5000"), 107)
+        self.assertGreater(len(os.fsencode(str(path)+"_5000")), 107)
+        with self.assertRaisesRegex(AssertionError, "AF_UNIX budget"):
+            vsock_backend_path(path)
+
+    def test_existing_backend_or_alias_is_not_replaced(self):
+        for mode in ("cold", "restore"):
+            for collision in ("backend", "alias"):
+                with self.subTest(mode=mode, collision=collision), tempfile.TemporaryDirectory() as directory:
+                    original = Path(directory) / "vsock.sock"
+                    backend = vsock_backend_path(original)
+                    target = backend if collision == "backend" else Path(str(backend)+"_5000")
+                    os.symlink("foreign-owner", target)
+                    identity = target.lstat()
+                    args = self.arguments(original, mode)
+                    execute = unittest.mock.Mock()
+                    with self.assertRaises(FileExistsError):
+                        self.invoke(args, execute)
+                    execute.assert_not_called()
+                    self.assertEqual(os.readlink(target), "foreign-owner")
+                    current = target.lstat()
+                    self.assertEqual((current.st_dev, current.st_ino), (identity.st_dev, identity.st_ino))
+
+    def test_exec_failure_cleans_its_alias_and_allows_retry(self):
+        for mode in ("cold", "restore"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                original = Path(directory) / "vsock.sock"
+                alias = Path(str(vsock_backend_path(original))+"_5000")
+                args = self.arguments(original, mode)
+                for _ in range(2):
+                    error = OSError(errno.ENOENT, "test CH executable absent")
+                    with self.assertRaises(OSError) as caught:
+                        self.invoke(args, error)
+                    self.assertIs(caught.exception, error)
+                    self.assertFalse(os.path.lexists(alias))
+
+    def test_exec_failure_does_not_remove_replaced_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(directory) / "vsock.sock"
+            alias = Path(str(vsock_backend_path(original))+"_5000")
+            args = self.arguments(original, "cold")
+
+            def replace(binary, argv):
+                # Renaming the original keeps its inode allocated, so the new
+                # symlink cannot accidentally reuse the same identity.
+                alias.rename(alias.with_name("prior-alias"))
+                os.symlink("replacement-owner", alias)
+                raise OSError(errno.EIO, "injected exec failure")
+
+            with self.assertRaises(OSError):
+                self.invoke(args, replace)
+            self.assertEqual(os.readlink(alias), "replacement-owner")
 
 
 class ReportRelayTests(unittest.TestCase):
