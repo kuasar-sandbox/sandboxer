@@ -134,11 +134,12 @@ for ((i = 1; i <= 256; i++)); do
         e2e_fail "consecutive stdin exec $i changed payload"
 done
 
-exec1 -- cat /proc/1/cmdline >"$WORK/pid1"
-mapfile -d '' -t PID1_ARGV <"$WORK/pid1"
-if [ "${#PID1_ARGV[@]}" -lt 6 ] || [ "${PID1_ARGV[1]}" != exec-child ] || [ "${PID1_ARGV[5]}" != 1 ]; then
-    e2e_fail "PID 1 is not the placeholder anchor: $(tr '\0' ' ' <"$WORK/pid1")"
-fi
+# The placeholder remains the supplied runtime executable, without execing
+# the image command. Its private helper arguments are not a consumer ABI.
+INIT_HASH="$(sha256sum "$BIN/sandbox-init" | cut -d' ' -f1)"
+exec1 -- sha256sum /proc/1/exe >"$WORK/pid1.hash"
+[ "$(cut -d' ' -f1 <"$WORK/pid1.hash")" = "$INIT_HASH" ] || \
+    e2e_fail "private PID 1 is not the prepared runtime's placeholder executable"
 
 # Killing PID 1 must restart the anchor in place, not reboot the VM.
 exec1 -- /bin/sh -c 'kill -TERM 1' >/dev/null 2>&1 || true

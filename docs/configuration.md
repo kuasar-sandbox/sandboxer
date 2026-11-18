@@ -252,9 +252,9 @@ Local delivery creates a Bundle containing the required block layers. For delive
 | `launch.env`, `launch.ephemeral_env` | String maps | Persistent environment and current-invocation override; [merge rules](#files-and-environment) |
 | `launch.workdir` | String; `/` after ordinary loading | Application working directory; image/source projection follows the corresponding launch merge rules |
 | `launch.restart` | `never`, `on-failure`, `always`; `never` | Primary process supervision |
-| `launch.cgroup_control` | Boolean; `false` | Enable application cgroup delegation; [Guest topology](guest-abi.md#application-cgroups) |
+| `launch.cgroup_control` | Boolean; `false` | When true, delegate controllers at the user-visible cgroup root and place directly managed processes in its `/init` leaf; false uses the scoped root directly. The Guest Runtime owns the global hierarchy. See [Guest topology](guest-abi.md#application-cgroups). |
 | `launch.placeholder` | Boolean; `false` | No-exec anchor; excludes exec and always restarts |
-| `launch.pid_namespace` | `private`, `shared`; `private` | Private makes the application namespace PID 1; shared uses sandbox-init's reaper |
+| `launch.pid_namespace` | `private`, `shared`; `private` | Private makes the application namespace PID 1; shared exposes a Runtime PID 1 that reaps orphaned processes |
 | `launch.user` | Identity string; image user, otherwise root | `uid:gid` or `name:group` |
 | `launch.stop_signal` | Signal name/number; image value, otherwise `SIGTERM` | Shutdown signal |
 | `launch.stop_grace_period` | Duration; `10s` | Grace before SIGKILL, represented as whole seconds to the Guest |

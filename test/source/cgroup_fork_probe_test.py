@@ -13,29 +13,44 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class InitCgroupAssertionTests(unittest.TestCase):
-    def test_exact_root_and_read_failure_are_independent_of_console_output(self):
+    def test_init_shares_visible_pid1_group_without_runtime_topology_assumptions(self):
         source = (ROOT / 'test/e2e/cases/sandbox.cgroup.sh').read_text()
         # The unquoted YAML heredoc removes these dollar escapes before the
         # guest shell sees the command. Execute the shipped command itself.
         command = next(line.strip() for line in source.splitlines()
-                       if line.strip().startswith('top_cgroup=')).replace('\\$', '$')
+                       if line.strip().startswith('init_cgroup=')).replace('\\$', '$')
         with tempfile.TemporaryDirectory() as directory:
             cat = Path(directory, 'cat')
             cat.write_text('#!/bin/sh\n'
-                           '[ "$1" = /proc/self/cgroup ] || exit 99\n'
-                           'printf "CG-TOP-INIT 0::/ console-noise\\n" >&2\n'
-                           'printf "%s" "$TEST_CGROUP"\n'
-                           'exit "$TEST_READ_STATUS"\n')
+                           'printf "CG-INIT console-noise\\n" >&2\n'
+                           'case "$1" in\n'
+                           '  /proc/self/cgroup) printf "%s" "$TEST_CGROUP"; exit "$TEST_READ_STATUS" ;;\n'
+                           '  /proc/1/cgroup) printf "%s" "$TEST_PID1_CGROUP"; exit "$TEST_PID1_READ_STATUS" ;;\n'
+                           '  *) exit 99 ;;\n'
+                           'esac\n')
             cat.chmod(0o755)
-            for value, status, valid in [('0::/\n', 0, True), ('0::/init\n', 0, False),
-                                         ('0::/app\n', 0, False), ('', 0, False),
-                                         ('0::/\n1::/other\n', 0, False),
-                                         ('0::/\n', 7, False)]:
-                with self.subTest(value=value, read_status=status):
+            cases = [
+                ('false', '0::/\n', '0::/\n', 0, 0, True),
+                ('true', '0::/\n', '0::/\n', 0, 0, True),
+                ('true', '0::/init\n', '0::/init\n', 0, 0, True),
+                ('false', '0::/init\n', '0::/init\n', 0, 0, False),
+                ('true', '0::/init\n', '0::/\n', 0, 0, False),
+                ('true', '0::/\n', '0::/init\n', 0, 0, False),
+                ('true', '0::/unexpected\n', '0::/unexpected\n', 0, 0, False),
+                ('true', '', '', 0, 0, False),
+                ('true', '0::/\n1::/other\n', '0::/\n1::/other\n', 0, 0, False),
+                ('true', '0::/\n', '0::/\n', 7, 0, False),
+                ('true', '0::/\n', '0::/\n', 0, 7, False),
+            ]
+            for control, value, owner, status, owner_status, valid in cases:
+                with self.subTest(control=control, value=value, owner=owner,
+                                  read_status=status, owner_read_status=owner_status):
                     result = subprocess.run(['sh', '-c', command], capture_output=True,
                         env={**os.environ, 'PATH': directory + ':' + os.environ['PATH'],
-                             'TEST_CGROUP': value, 'TEST_READ_STATUS': str(status)}, timeout=5)
-                    self.assertEqual(result.returncode == 0, valid)
+                             'control': control, 'TEST_CGROUP': value,
+                             'TEST_READ_STATUS': str(status), 'TEST_PID1_CGROUP': owner,
+                             'TEST_PID1_READ_STATUS': str(owner_status)}, timeout=5)
+                    self.assertEqual(result.returncode == 0, valid, result.stderr)
 
 
 class NativeForkProbeTests(unittest.TestCase):

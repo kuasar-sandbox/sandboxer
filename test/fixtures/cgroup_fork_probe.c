@@ -1,7 +1,7 @@
 /*
  * Fork immediately at ELF entry, before libc or a language runtime can run.
- * Each child records its cgroup view and, in shared-PID cases, verifies its
- * real membership through sandbox-init's guest-global cgroupfs mount. The
+ * Each child records its cgroup view and verifies membership through its
+ * scoped cgroupfs mount, independently of the runtime's global path. The
  * parent then execs argv[1]. This test fixture is built during the source
  * build/prepare stage and is never compiled by product E2E execution.
  *
@@ -193,13 +193,13 @@ static void append_result(const char *role, const char *body, usize length)
 	syscall1(SYS_close, fd);
 }
 
-static void record_child(const char *role, int control, int real_check)
+static void record_child(const char *role, int control, int check_membership)
 {
 	static const char cgroup_path[] = "/proc/self/cgroup";
-	static const char real_root[] = "/proc/1/root/sys/fs/cgroup/app/cgroup.procs";
-	static const char real_init[] = "/proc/1/root/sys/fs/cgroup/app/init/cgroup.procs";
+	static const char scoped_root[] = "/sys/fs/cgroup/cgroup.procs";
+	static const char scoped_init[] = "/sys/fs/cgroup/init/cgroup.procs";
 	static const char read_failure[] = "READ-FAIL\n";
-	static const char membership_failure[] = "REAL-MISS\n";
+	static const char membership_failure[] = "MEMBERSHIP-MISS\n";
 	char body[256];
 	long count;
 	usize start;
@@ -222,7 +222,7 @@ static void record_child(const char *role, int control, int real_check)
 		;
 	if (end < sizeof(body))
 		body[end++] = '\n';
-	if (real_check && !pid_is_listed(control ? real_init : real_root,
+	if (check_membership && !pid_is_listed(control ? scoped_init : scoped_root,
 			syscall0(SYS_getpid))) {
 		append_result(role, membership_failure, sizeof(membership_failure) - 1);
 		return;

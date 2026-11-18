@@ -47,6 +47,7 @@ class UsageRelay(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.slots = threading.BoundedSemaphore(8)
         self.requests, self.errors = [], []
         self.next_connection, self.mode, self.first_response = 0, None, None
+        self.source_fault = None
         self.old_epoch = old_epoch
         if old_epoch is not None:
             self.mode = "old-epoch"
@@ -77,6 +78,45 @@ class UsageRelay(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         with self.lock:
             assert self.mode is None, "previous fault has not been consumed"
             self.mode = mode
+
+    def block_source(self, disk="disk-0", first_status="timeout"):
+        """Inject source status into real replies, without blocking Guest reads.
+
+        Original Guest frames remain in row.response; the exact altered frame
+        before transport faults is recorded as row.source_forwarded; row.forwarded
+        records any final wire mutation. This exercises the Host consumer only.
+        Guest worker ownership is tested in guest-runtime's producer tests.
+        """
+        assert first_status in ("timeout", "busy")
+        with self.lock:
+            assert self.source_fault is None, "source fault already armed"
+            self.source_fault = {"disk": disk, "next": first_status}
+
+    def release_source(self):
+        with self.lock:
+            self.source_fault = None
+
+    def source_response(self, row, response):
+        with self.lock:
+            fault = self.source_fault
+            if fault is None or row["response"].get("type") != "usage_response":
+                return response
+            forwarded = json.loads(response[4:])
+            filesystems = forwarded["usage_response"]["filesystems"]
+            selected = [value for value in filesystems if value["disk"] == fault["disk"]]
+            assert len(selected) == 1, "selected source absent or duplicated"
+            value = selected[0]
+            assert value["status"] == "ok", "source injection requires a healthy real Guest read"
+            status = fault["next"]
+            fault["next"] = "busy"
+            identity = {key: value[key] for key in ("disk", "incarnation") if key in value}
+            value.clear()
+            value.update(identity, status=status)
+            row["source_fault"] = {"disk": fault["disk"], "status": status}
+            row["source_forwarded"] = forwarded
+            row["forwarded"] = forwarded
+            payload = json.dumps(forwarded).encode()
+            return struct.pack("<I", len(payload)) + payload
 
     def stop(self):
         self.stopping.set()
@@ -141,6 +181,7 @@ class UsageHandler(socketserver.BaseRequestHandler):
                 operation = "guest_read"
                 response, raw_message = frame(upstream)
                 row.update(response=raw_message, received_ns=time.monotonic_ns())
+                response = self.server.source_response(row, response)
                 with self.server.lock:
                     if self.server.first_response is None and raw_message.get("type") == "usage_response":
                         self.server.first_response = response

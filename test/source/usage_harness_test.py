@@ -450,13 +450,30 @@ class SourceFaultTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 usage_sources.validate_blocked(samples, self.baseline())
 
-    def test_tracer_dependencies_include_loader(self):
-        self.assertEqual(usage_sources.tracer_dependencies("libc.so.6 => /lib/libc.so.6 (0x123)\n/lib64/ld.so (0x456)\n"),
-                         ["/lib/libc.so.6", "/lib64/ld.so"])
-        self.assertEqual(usage_sources.tracer_dependencies("statically linked"), [])
-        for invalid in ("libc => not found", "unexpected ldd output"):
-            with self.assertRaises(ValueError):
-                usage_sources.tracer_dependencies(invalid)
+    def test_source_injection_requires_real_raw_values_and_preserves_other_sources(self):
+        raw = {"type": "usage_response", "usage_response": {
+            "run_epoch": "run", "request_id": "2", "memory": {"status": "ok", "page_size": "4096"},
+            "filesystems": [{"disk": "disk-0", "incarnation": "v1", "status": "ok", "blocks": "42", "bfree": "10"},
+                            {"disk": "root", "status": "ok", "blocks": "99", "bfree": "20"}]}}
+        injected = copy.deepcopy(raw)
+        injected["usage_response"]["filesystems"][0] = {"disk": "disk-0", "incarnation": "v1", "status": "timeout"}
+        row = {"request": {"run_epoch": "run", "request_id": "2"}, "response": raw,
+               "source_forwarded": injected, "source_fault": {"disk": "disk-0", "status": "timeout"}}
+        usage_sources.validate_source_injection([row])
+        mutations = [lambda r: r["response"]["usage_response"]["filesystems"][0].update(status="error"),
+                     lambda r: r["response"]["usage_response"]["filesystems"][0].pop("blocks"),
+                     lambda r: r["source_forwarded"]["usage_response"].update(request_id="1"),
+                     lambda r: r["source_forwarded"]["usage_response"]["memory"].update(status="busy"),
+                     lambda r: r["source_forwarded"]["usage_response"]["filesystems"][1].update(status="busy"),
+                     lambda r: r["source_forwarded"]["usage_response"]["filesystems"][0].update(blocks="42"),
+                     lambda r: r["source_forwarded"]["usage_response"]["filesystems"][0].update(incarnation="changed")]
+        for mutate in mutations:
+            changed = copy.deepcopy(row)
+            mutate(changed)
+            with self.assertRaises(AssertionError):
+                usage_sources.validate_source_injection([changed])
+        with self.assertRaises(AssertionError):
+            usage_sources.validate_source_injection([])
 
     def test_slow_ch_does_not_mask_other_sources_or_extend_old_memory(self):
         rows = self.samples()
@@ -569,7 +586,7 @@ class SourceFaultTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 usage_sources.validate_wire_deadline(fault, [fault, {**later, key: value}])
 
-    def test_restore_preserves_busy_slot_and_independent_sources(self):
+    def test_restore_preserves_busy_metric_and_independent_sources(self):
         view = self.samples()[1]
         baseline = copy.deepcopy(view["live"]["gauges"][0])
         usage_sources.validate_preserved_slot(baseline, view)
@@ -603,19 +620,23 @@ class SourceFaultTests(unittest.TestCase):
 
     def test_old_epoch_requires_real_response_host_close_and_new_connection(self):
         raw = {"request_id": "2", "run_epoch": "new", "memory": {"status": "ok"},
-               "filesystems": [{"disk": "disk-0", "status": "busy"}]}
+               "filesystems": [{"disk": "disk-0", "status": "ok", "blocks": "42", "bfree": "10"}]}
+        injected = {**raw, "filesystems": [{"disk": "disk-0", "status": "busy"}]}
         rows = [{"mode": "old-epoch", "connection": 1, "request": {"request_id": "2", "run_epoch": "new"},
                  "response": {"usage_response": raw, "type": "usage_response"},
-                 "forwarded": {"usage_response": {**raw, "run_epoch": "old"}},
+                 "source_forwarded": {"usage_response": injected, "type": "usage_response"},
+                 "forwarded": {"usage_response": {**injected, "run_epoch": "old"}},
                  "sent_ns": 10, "client_closed_ns": 11},
                 {"mode": None, "connection": 2, "request": {"request_id": "3", "run_epoch": "new"},
-                 "response": {"usage_response": {**raw, "request_id": "3"}, "type": "usage_response"}}]
+                 "response": {"usage_response": {**raw, "request_id": "3"}, "type": "usage_response"},
+                 "source_forwarded": {"usage_response": {**injected, "request_id": "3"}, "type": "usage_response"}}]
         usage_sources.validate_old_epoch(rows, "old", "new")
         mutations = [lambda r: r[0].pop("client_closed_ns"),
                      lambda r: r[1].update(connection=1),
                      lambda r: r[1]["request"].update(request_id="2"),
                      lambda r: r[0]["forwarded"]["usage_response"].update(request_id="1"),
-                     lambda r: r[1]["response"]["usage_response"]["filesystems"][0].update(status="ok"),
+                     lambda r: r[1]["source_forwarded"]["usage_response"]["filesystems"][0].update(status="ok"),
+                     lambda r: r[1]["response"]["usage_response"]["filesystems"][0].update(status="busy"),
                      lambda r: r[1]["request"].update(run_epoch="old")]
         for mutate in mutations:
             changed = copy.deepcopy(rows)
@@ -638,24 +659,25 @@ class SourceFaultFilesystemRecoveryBoundaryTests(unittest.TestCase):
         case_dir.mkdir()
         finished = SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda timeout: None)
 
-        def trace_poll():
-            if fault == "tracer_exited" and state.statfs_done:
-                return 1
-            return None if state.release_at is None else 0
+        def block_source():
+            state.held_at, state.held_value = state.now, state.used
 
-        trace = SimpleNamespace(returncode=0, poll=trace_poll, wait=lambda timeout: None)
+        class Relay:
+            requests = []
+            @property
+            def errors(self):
+                return ["source relay failed"] if fault == "relay_error" and state.statfs_done else []
+            def block_source(self):
+                block_source()
+            def release_source(self):
+                state.release_at = state.now
+
+        relay = Relay()
 
         def popen(command, stdout, **kwargs):
-            if "trace-fs" in command:
-                state.held_at, state.held_value = state.now, state.used
-                stdout.write("fstatfs(3</data>, ...) = 0\n")
-                return trace
             if "init-resources-stream" in command:
                 for _ in range(3):
                     stdout.write('{"fds": 5}\n')
-                return finished
-            if "trace-stop" in command:
-                state.release_at = state.now
                 return finished
             raise AssertionError(("unexpected process", command))
 
@@ -732,6 +754,8 @@ class SourceFaultFilesystemRecoveryBoundaryTests(unittest.TestCase):
                                   ready=lambda: None, cli=cli, view=view)
         with patch.object(usage_sources, "Sandbox", return_value=sandbox), \
              patch.object(usage_sources, "filesystem_config", return_value={}), \
+             patch.object(usage_sources, "UsageRelay", return_value=relay), \
+             patch.object(usage_sources, "validate_source_injection"), \
              patch.object(usage_sources, "digest", return_value="digest"), \
              patch.object(usage_sources, "runtime_init_digest", return_value="digest"), \
              patch.object(usage_sources, "resources", return_value={"fds": 5}), \
@@ -759,8 +783,8 @@ class SourceFaultFilesystemRecoveryBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.run_case(Path(directory), delay=0.0)
 
-    def test_anchor_requires_live_tracer_and_blocked_noncontinuous_sample(self):
-        for fault, message in (("tracer_exited", "Guest tracer exited before recovery baseline"),
+    def test_anchor_requires_healthy_relay_and_blocked_noncontinuous_sample(self):
+        for fault, message in (("relay_error", "source relay failed"),
                                ("anchor_ok", "filesystem recovery baseline is not blocked"),
                                ("anchor_continuous", "filesystem recovery baseline is not blocked")):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
@@ -782,7 +806,7 @@ class SourceFaultFilesystemRecoveryBoundaryTests(unittest.TestCase):
 
     def test_released_rounds_still_require_complete_fresh_recovery(self):
         for fault, message in (("post_release_gap", "unobserved recovery round"),
-                               ("late_raw", "late raw buffer was replayed"),
+                               ("late_raw", "fresh filesystem value was not consumed"),
                                ("integrates_gap", "missing interval was integrated"),
                                ("integrates_area", "missing interval was integrated"),
                                ("never_recovers", "fresh sampling did not resume")):
@@ -1026,25 +1050,25 @@ class SourceCleanupTests(unittest.TestCase):
             root = Path(directory)
             key = "abcdef0123456789" * 4
             (root / "run.log").write_text("old log\n" * 10000 + "manifest://" + key + "\nexec stalled\n")
-            (root / "trace-start.json").write_text('{"owner_pid": 42}\n')
+            (root / "relay.json").write_text('{"requests": [{"connection": 42}]}\n')
             (root / "config.yaml").write_text("must-not-read-config")
             output = io.StringIO()
             with patch.object(usage_sources.sys, "stderr", output):
-                usage_sources.dump_restore_failure("source-trace-detach", SimpleNamespace(dir=root), None)
+                usage_sources.dump_restore_failure("child-source-recovery", SimpleNamespace(dir=root), None)
             text = output.getvalue()
-            self.assertIn("phase=source-trace-detach", text)
+            self.assertIn("phase=child-source-recovery", text)
             self.assertIn("exec stalled", text)
-            self.assertIn('"owner_pid": 42', text)
+            self.assertIn('"connection": 42', text)
             self.assertIn("<redacted>", text)
             self.assertNotIn(key, text)
             self.assertNotIn("must-not-read-config", text)
-            self.assertIn("trace-done.json: unavailable", text)
+            self.assertIn("restored.json: unavailable", text)
             self.assertLess(len(text), 26000)
 
     def test_restore_cleanup_failure_keeps_evidence_and_cleans_both_owners(self):
         for origin in ("child", "source"):
             with self.subTest(origin=origin):
-                sb, child, release, relay = (unittest.mock.Mock() for _ in range(4))
+                sb, child, source_relay, relay = (unittest.mock.Mock() for _ in range(4))
                 fault = RuntimeError(origin + " cleanup failed")
 
                 def cleanup(owner, **kwargs):
@@ -1054,26 +1078,28 @@ class SourceCleanupTests(unittest.TestCase):
                 with patch.object(usage_sources, "cleanup_sources", side_effect=cleanup) as cleanup_call, \
                      patch.object(usage_sources, "dump_restore_failure") as diagnostic:
                     with self.assertRaises(RuntimeError) as caught:
-                        usage_sources.cleanup_restore_sources(sb, child, release, relay, None, True)
+                        usage_sources.cleanup_restore_sources(sb, child, source_relay, relay, None)
                 self.assertIs(caught.exception, fault)
                 diagnostic.assert_called_once_with(origin + "-cleanup", sb, child)
                 self.assertEqual(cleanup_call.call_count, 2)
                 self.assertIs(cleanup_call.call_args_list[0].args[0], child)
                 self.assertIs(cleanup_call.call_args_list[1].args[0], sb)
                 self.assertIs(cleanup_call.call_args_list[1].kwargs["failure"], fault if origin == "child" else None)
-                self.assertTrue(cleanup_call.call_args_list[1].kwargs["owned_trace"])
+                self.assertIs(cleanup_call.call_args_list[0].kwargs["relay"], relay)
+                self.assertIs(cleanup_call.call_args_list[1].kwargs["relay"], source_relay)
 
     def test_restore_cleanup_preserves_existing_failure_without_duplicate_diagnostics(self):
         for failure in (None, RuntimeError("case body failed")):
             with self.subTest(failure=failure):
-                sb, child, release, relay = (unittest.mock.Mock() for _ in range(4))
+                sb, child, source_relay, relay = (unittest.mock.Mock() for _ in range(4))
                 with patch.object(usage_sources, "cleanup_sources") as cleanup, \
                      patch.object(usage_sources, "dump_restore_failure") as diagnostic:
-                    usage_sources.cleanup_restore_sources(sb, child, release, relay, failure, False)
+                    usage_sources.cleanup_restore_sources(sb, child, source_relay, relay, failure)
                 self.assertEqual(cleanup.call_count, 2)
                 for call in cleanup.call_args_list:
                     self.assertIs(call.kwargs["failure"], failure)
-                self.assertFalse(cleanup.call_args.kwargs["owned_trace"])
+                self.assertIs(cleanup.call_args_list[0].kwargs["relay"], relay)
+                self.assertIs(cleanup.call_args_list[1].kwargs["relay"], source_relay)
                 diagnostic.assert_not_called()
 
     def test_restore_source_cleanup_failure_before_child_exists_keeps_evidence(self):
@@ -1081,9 +1107,9 @@ class SourceCleanupTests(unittest.TestCase):
         with patch.object(usage_sources, "cleanup_sources", side_effect=fault) as cleanup, \
              patch.object(usage_sources, "dump_restore_failure") as diagnostic:
             with self.assertRaises(RuntimeError) as caught:
-                usage_sources.cleanup_restore_sources(sb, None, None, None, None, False)
+                usage_sources.cleanup_restore_sources(sb, None, None, None, None)
         self.assertIs(caught.exception, fault)
-        cleanup.assert_called_once_with(sb, failure=None, owned_trace=False)
+        cleanup.assert_called_once_with(sb, relay=None, failure=None)
         diagnostic.assert_called_once_with("source-cleanup", sb, None)
 
     def test_capture_unmounts_and_preserves_primary_failure(self):
@@ -1137,21 +1163,23 @@ class SourceCleanupTests(unittest.TestCase):
             self.assertEqual(command.call_count, 2)
             self.assertEqual((sb.dir / "capture-failure.log").read_text(), "")
 
-    def test_owned_detach_failure_still_reaps_release_and_stops_both_owners(self):
+    def test_relay_stop_failure_still_reaps_observer_and_records_evidence(self):
         sb, process, relay = (unittest.mock.Mock() for _ in range(3))
-        sb.process.poll.return_value = None
+        sb.dir = Path("unused")
         process.poll.return_value = None
-        process.wait.side_effect = [subprocess.TimeoutExpired("release", 5), 0]
+        process.wait.side_effect = [subprocess.TimeoutExpired("observer", 5), 0]
         relay.requests, relay.errors = [], []
+        relay.stop.side_effect = RuntimeError("relay stop failed")
         original = RuntimeError("restore assertion failed")
-        with patch.object(usage_sources, "finish_owned_trace", side_effect=RuntimeError("detach failed")), \
-             patch.object(usage_sources, "write_json"), patch.object(usage_sources.sys, "stderr", io.StringIO()):
-            usage_sources.cleanup_sources(sb, processes=(process,), relay=relay, failure=original, owned_trace=True)
+        with patch.object(usage_sources, "write_json") as write, patch.object(usage_sources.sys, "stderr", io.StringIO()) as errors:
+            usage_sources.cleanup_sources(sb, processes=(process,), relay=relay, failure=original)
         process.terminate.assert_called_once()
         process.kill.assert_called_once()
         self.assertEqual(process.wait.call_count, 2)
         sb.stop.assert_called_once()
         relay.stop.assert_called_once()
+        write.assert_called_once_with(sb.dir / "relay.json", {"requests": [], "errors": []})
+        self.assertIn("relay stop failed", errors.getvalue())
 
     def test_observer_ready_requires_first_complete_frame_before_deadline(self):
         observer, path = unittest.mock.Mock(), unittest.mock.Mock()
@@ -1168,37 +1196,25 @@ class SourceCleanupTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "exited before ready"):
             usage_sources.wait_observer_ready(observer, path)
 
-    def test_each_trace_entry_escalates_without_masking_sampling_failure(self):
+    def test_each_relay_entry_cleans_up_without_masking_sampling_failure(self):
         for case in ("filesystem", "vsock"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
-                sb, trace, relay = unittest.mock.Mock(), unittest.mock.Mock(), unittest.mock.Mock()
+                sb, relay = unittest.mock.Mock(), unittest.mock.Mock()
                 sb.dir, sb.name, sb.runroot = Path(directory), "case", Path(directory)
                 original = RuntimeError("original sampling failure")
-                cleanup_error = RuntimeError("Guest trace-stop failed")
                 guest = {"sandbox_init_sha256": "hash", "balloon_proc_field": "false", "zoneinfo": "pagesets count:"}
-
-                def cli(*args, **kwargs):
-                    if args[-1] == "trace-stop":
-                        raise cleanup_error
-                    return json.dumps(guest)
-
-                sb.cli.side_effect = cli
-                sb.stop.side_effect = RuntimeError("sandbox stop also failed")
-                trace.poll.return_value = None
-                trace.wait.side_effect = [subprocess.TimeoutExpired("owned trace", 5), 0]
+                sb.cli.return_value = json.dumps(guest)
+                sb.stop.side_effect = RuntimeError("sandbox stop failed")
+                relay.stop.side_effect = RuntimeError("relay stop failed")
                 relay.requests, relay.errors = [], []
-                views = [{"live": {"gauges": [{"name": name, "last_value_bytes": str(value)}
-                         for name in ("filesystem.disk-0", "filesystem.disk-1")]}}
-                         for value in (0, 8*1024*1024)]
-                sb.view.side_effect = views if case == "filesystem" else original
+                sb.view.side_effect = original
                 with patch.object(usage_sources, "filesystem_config", return_value={}), \
                      patch.object(usage_sources, "Sandbox", return_value=sb), \
                      patch.object(usage_sources, "UsageRelay", return_value=relay), \
                      patch.object(usage_sources, "digest", return_value="hash"), \
+                     patch.object(usage_sources, "runtime_init_digest", return_value="hash"), \
                      patch.object(usage_sources, "write_json"), \
-                     patch.object(usage_sources.subprocess, "Popen", return_value=trace), \
                      patch.object(usage_sources.time, "sleep"), \
-                     patch.object(usage_sources.time, "monotonic", side_effect=original), \
                      patch.object(usage_sources.sys, "stderr", io.StringIO()) as errors:
                     with self.assertRaises(RuntimeError) as caught:
                         if case == "filesystem":
@@ -1206,14 +1222,10 @@ class SourceCleanupTests(unittest.TestCase):
                         else:
                             usage_sources.vsock_case(Path(directory), "ref")
                 self.assertIs(caught.exception, original)
-                trace.terminate.assert_called_once()
-                trace.kill.assert_called_once()
-                self.assertEqual(trace.wait.call_args_list, [unittest.mock.call(timeout=5)]*2)
                 sb.stop.assert_called_once()
-                if case == "vsock":
-                    relay.stop.assert_called_once()
-                self.assertIn("Guest trace-stop failed", errors.getvalue())
-                self.assertIn("sandbox stop also failed", errors.getvalue())
+                relay.stop.assert_called_once()
+                self.assertIn("relay stop failed", errors.getvalue())
+                self.assertIn("sandbox stop failed", errors.getvalue())
 
     def test_cleanup_only_error_is_not_hidden_by_enclosing_except(self):
         sb = unittest.mock.Mock()
@@ -1395,6 +1407,85 @@ class UsageRelayTests(unittest.TestCase):
             self.assertFalse(relay.errors)
             self.assertEqual(relay.requests[0]["response"]["usage_response"], {"request_id": "2", "run_epoch": "run"})
             self.assertEqual(relay.requests[0]["connection"], relay.requests[1]["connection"])
+
+    def test_source_status_fault_preserves_real_reply_identity_and_other_sources(self):
+        owner = self
+
+        def response(number):
+            return {"type": "usage_response", "usage_response": {
+                "request_id": str(number), "run_epoch": "run", "memory": {"status": "ok", "page_size": "4096"},
+                "filesystems": [{"disk": name, "incarnation": name+"/1", "status": "ok", "blocks": str(number+100), "bfree": "10"}
+                                for name in ("root", "disk-0", "disk-1")]}}
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.settimeout(2)
+                try:
+                    owner.assertEqual(line(self.request), b"CONNECT 5000\n")
+                    self.request.sendall(b"OK 1\n")
+                    while True:
+                        _, message = frame(self.request)
+                        payload = json.dumps(response(int(message["usage_request"]["request_id"]))).encode()
+                        self.request.sendall(struct.pack("<I", len(payload)) + payload)
+                except EOFError:
+                    pass
+
+        class Native(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vsock.sock"
+            native = Native(str(path)+".real", Handler)
+            thread = threading.Thread(target=native.serve_forever, kwargs={"poll_interval": .05})
+            thread.start()
+            relay = UsageRelay(path)
+            clients = []
+
+            def connect():
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                clients.append(client)
+                client.settimeout(2)
+                client.connect(str(path))
+                client.sendall(b"CONNECT 5000\n")
+                owner.assertEqual(line(client), b"OK 1\n")
+                return client
+
+            def read(client, number):
+                client.sendall(self.wire("usage_request", number))
+                return frame(client)[1]
+
+            def selected(message):
+                return message["usage_response"]["filesystems"][1]
+
+            try:
+                first = connect()
+                self.assertEqual(read(first, 1), response(1))
+                relay.block_source()
+                self.assertEqual(selected(read(first, 2)), {"disk": "disk-0", "incarnation": "disk-0/1", "status": "timeout"})
+                self.assertEqual(selected(read(first, 3))["status"], "busy")
+                first.close()
+                second = connect()
+                self.assertEqual(selected(read(second, 4))["status"], "busy")
+                relay.arm("repeat")
+                self.assertEqual(read(second, 5), response(1))
+                relay.release_source()
+                self.assertEqual(read(second, 6), response(6))
+            finally:
+                for client in clients:
+                    client.close()
+                relay.stop()
+                native.shutdown()
+                native.server_close()
+                thread.join(timeout=2)
+            self.assertFalse(relay.errors)
+            usage_sources.validate_source_injection(relay.requests)
+            self.assertEqual([row["response"] for row in relay.requests], [response(i) for i in range(1, 7)])
+            self.assertNotEqual(relay.requests[2]["connection"], relay.requests[3]["connection"])
+            repeated = relay.requests[4]
+            self.assertEqual(selected(repeated["source_forwarded"])["status"], "busy")
+            self.assertEqual(repeated["source_forwarded"]["usage_response"]["request_id"], "5")
+            self.assertEqual(repeated["forwarded"], response(1))
+            self.assertNotIn("source_fault", relay.requests[-1])
 
     def test_only_usage_is_replayed_and_new_connection_reads_new_frame(self):
         owner = self
