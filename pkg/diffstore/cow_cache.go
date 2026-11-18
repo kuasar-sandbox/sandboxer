@@ -87,6 +87,7 @@ type Cache struct {
 	budgetWake                    chan<- struct{}
 	budgetThreshold               int
 	clients                       map[*Disk]int // dirty reservations, including construction and I/O
+	chargedZeros                  map[*Disk]int // charged Zero pages, including frozen I/O
 	clean, expired, dirty         pageList
 	started                       time.Time
 	expiredPages                  int
@@ -170,7 +171,7 @@ func newCache(size, dirty uint64, hooks cacheHooks) (*Cache, error) {
 	if size == 0 || dirty == 0 || dirty > size || size%cowBlockSize != 0 || dirty%cowBlockSize != 0 || size > uint64(int(^uint(0)>>1)) {
 		return nil, fmt.Errorf("diffstore: COW cache sizes must be positive 4 KiB multiples with max_dirty_size <= cache_size")
 	}
-	c := &Cache{capacity: int(size / cowBlockSize), maxCapacity: int(size / cowBlockSize), maxDirty: int(dirty / cowBlockSize), maxDirtyLimit: int(dirty / cowBlockSize), pages: make(map[cacheKey]*cachePage), clients: make(map[*Disk]int), kick: make(chan struct{}, 1), done: make(chan struct{}), started: time.Now(), hooks: hooks}
+	c := &Cache{capacity: int(size / cowBlockSize), maxCapacity: int(size / cowBlockSize), maxDirty: int(dirty / cowBlockSize), maxDirtyLimit: int(dirty / cowBlockSize), pages: make(map[cacheKey]*cachePage), clients: make(map[*Disk]int), chargedZeros: make(map[*Disk]int), kick: make(chan struct{}, 1), done: make(chan struct{}), started: time.Now(), hooks: hooks}
 	go c.run()
 	return c, nil
 }
@@ -520,6 +521,9 @@ func (c *Cache) releaseLocked(p *cachePage) {
 	}
 	delete(c.pages, p.key)
 	if p.chargedDirty {
+		if p.zero {
+			c.chargedZeros[p.key.cow]--
+		}
 		c.dirtyUsed--
 		c.clients[p.key.cow]--
 	}
@@ -708,6 +712,7 @@ func (c *Cache) write(ctx context.Context, cow *Disk, buf []byte, offset, block 
 	}
 	if p != nil && p.state == cacheDirty {
 		if p.zero {
+			c.chargedZeros[cow]--
 			// A partial write must preserve logical zero outside its range,
 			// never stale bytes from the backend or a recycled Data buffer.
 			c.acquireDataLocked(p)
@@ -791,14 +796,7 @@ func (c *Cache) stageZero(ctx context.Context, cow *Disk, block int64) error {
 	if !alreadyDirty {
 		blockedTotal := p == nil && len(c.pages) == c.capacity && c.oldestCleanLocked() == nil
 		if c.dirtyUsed == c.maxDirty || blockedTotal {
-			pendingZero := false
-			for _, q := range c.pages {
-				if q.key.cow == cow && q.chargedDirty && q.zero {
-					pendingZero = true
-					break
-				}
-			}
-			if !pendingZero {
+			if c.chargedZeros[cow] == 0 {
 				// Still holding the foreground stripe. Do not kick a queued
 				// Data allocation before this space-releasing mutation; the
 				// old synchronous path rechecks page state and owns completion.
@@ -823,6 +821,9 @@ func (c *Cache) stageZero(ctx context.Context, cow *Disk, block int64) error {
 		}
 	}
 	c.releaseDataLocked(p)
+	if !p.zero {
+		c.chargedZeros[cow]++
+	}
 	p.zero, p.fresh, p.state = true, false, cacheDirty
 	if !alreadyDirty {
 		c.dirty.push(p)
@@ -1181,6 +1182,7 @@ func (c *Cache) detach(cow *Disk) {
 		}
 	}
 	delete(c.clients, cow)
+	delete(c.chargedZeros, cow)
 	c.signalLocked()
 	c.mu.Unlock()
 }
