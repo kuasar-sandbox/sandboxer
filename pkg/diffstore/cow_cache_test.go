@@ -73,6 +73,7 @@ func checkBudget(t *testing.T, c *Cache, used, dirty, wb int) {
 	if s.Used != uint64(used*cowBlockSize) || s.DirtyUsed != uint64(dirty*cowBlockSize) || s.Writeback != uint64(wb*cowBlockSize) || s.DirtyUsed > s.Used || s.Used > s.Capacity || s.DirtyUsed > s.MaxDirty {
 		t.Fatalf("budget=%+v, want used/dirty/wb=%d/%d/%d pages", s, used, dirty, wb)
 	}
+	checkChargedZeros(t, c)
 }
 func checkRead(t *testing.T, c *Disk, block int, want []byte) {
 	t.Helper()
