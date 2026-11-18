@@ -21,10 +21,10 @@ type lazyStatsBackend struct {
 }
 
 func (*lazyStatsBackend) WriteAt([]byte, int64) (int, error) { return 0, vhost.ErrReadOnly }
-func (*lazyStatsBackend) Flush() error                     { return nil }
-func (*lazyStatsBackend) Discard(int64, int64) error        { return nil }
-func (*lazyStatsBackend) SupportsDiscard() bool            { return false }
-func (*lazyStatsBackend) ReadOnly() bool                    { return true }
+func (*lazyStatsBackend) Flush() error                       { return nil }
+func (*lazyStatsBackend) Discard(int64, int64) error         { return nil }
+func (*lazyStatsBackend) SupportsDiscard() bool              { return false }
+func (*lazyStatsBackend) ReadOnly() bool                     { return true }
 func (b *lazyStatsBackend) BackendStats() map[string]any {
 	b.extraCalls++
 	return map[string]any{"test_extra": "kept"}
