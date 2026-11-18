@@ -705,7 +705,14 @@ def restore_case(work, ref):
         write_json(sb.dir / "resumed.json", resumed)
         assert resumed["live"]["run_epoch"] == before["live"]["run_epoch"]
         validate_preserved_slot(baseline, resumed)
+        phase = "source-stop"
         sb.stop()
+        # The source observer belongs to this VM, not to the later restore.
+        # Join its handlers and retain all prior errors before checking the
+        # child's independent relay and epoch.
+        source_relay.stop()
+        write_json(sb.dir / "relay.json", {"requests": source_relay.requests, "errors": source_relay.errors})
+        assert not source_relay.errors, source_relay.errors
         parent = sb.view()
         write_json(sb.dir / "stopped.json", parent)
         old_epoch = parent["saved"]["snapshot"]["run_epoch"]
