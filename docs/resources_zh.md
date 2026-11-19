@@ -116,11 +116,35 @@ InitialBudget，`allocatable_at_snapshot` 是恢复 BudgetAtSnapshot，不能把
 双方协商 `cache_budget_v1` 后，Admit 同时核准 Guest 初始预算和最小
 `cache_initial` 缓存预算，并固定本轮 `cache_maximum` 上限。运行中的
 `request_cache_budget` 携带安全的绝对 `cache_current`、申请增量
-`cache_requested` 和节点回复的 `cache_reservation`。
-heartbeat 返回的 `cache_reclaim_target` 是待执行目标，不代表已回收；
-`state_sync` 在应答丢失或节点重启后重新核对已保留额度。
-缓存先获得授权再分配物理页，真正归还物理页后才允许节点转授；
-Guest Budget、balloon 与 `memory.high` 保持原机制。
+`cache_requested` 和节点回复的 `cache_reservation`。资源池缓存额度与 Guest
+内存预算独立：未配置池级 `cache_capacity` 表示不限池级缓存额度，单沙箱
+`cache_maximum` 仍然生效。缓存先获得授权再分配物理页，真正归还物理页后
+才允许节点转授；Guest Budget、balloon 与 `memory.high` 保持原机制。
+
+Admit 同时确认 `cache_reclaim_v1` 后，闲置缓存只通过独立的
+`cache_reclaim_update` 报告有限主动意图，获得节点许可后才执行物理回收。
+节点使用同一个有限后台执行路径协调主动回收与缓存不足时的补充让渡；
+当前可调度主动供给优先，已发任务不会因目标清零或超时而自动取消。
+资源池可显式配置 `cache_low_watermark`，在缓存已分配量不高于该阈值且
+本池没有真实缓存额度缺口时暂缓新增主动许可。省略阈值时不启用该暂缓，
+也不继承 Guest 内存水位。
+
+每份任务携带稳定的运行身份、序号、来源和不可变最大字节数。部分归还和
+零归还都结束本次有限尝试；完成消息同时上报物理释放后的绝对容量与后续
+主动机会（或明确暂无），保留到节点显式回复对应 `cache_reclaim_ack`。
+重复响应不会重复执行任务，未决任务或完成消息确认前不继续增长缓存。
+零结果仅在观察到有意义的新可退状态后恢复主动供给；必要的低频重新验证
+也需取得有限许可，不能只刷新时间或意图序号反复尝试。
+
+`state_sync` 除最新缓存容量外，还携带已接受任务或未确认完成结果。
+其中回收状态的 `current` 单独确认已完成物理分配的容量；仅收到增长授额
+不代表物理分配已经完成，节点不会据此提前发出新的回收任务。
+运行身份编码在既有不可变 lease 的 feature 列表中，不向 lease 增加动态
+回收状态。已进入协调模式的运行在重连时必须再次获得能力确认，不能因
+节点缺少能力而静默恢复本地自主回收。节点恢复期间保留未知执行权，直到
+参与者完成同步或确认退出。旧节点和既有 legacy 运行保留原本地闲置回收及
+建议目标行为；完整的节点限速与来源互斥保证，要求参与实例全部支持并
+协商新模式。
 
 <a id="resource-states"></a>
 

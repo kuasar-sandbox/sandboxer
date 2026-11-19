@@ -2,6 +2,8 @@ package resctl
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -55,6 +57,9 @@ type ControllerHooks struct {
 	cacheMaximum       uint64
 	cacheReservation   uint64
 	cacheSupported     bool
+	cacheCoordinated   bool
+	cacheReclaim       resource.CacheReclaimState
+	cacheReclaimAck    uint64
 	cacheReclaimTarget uint64
 	cacheReclaimSeq    uint64
 	cacheWake          chan struct{}
@@ -148,7 +153,14 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		// Keep the fixed cache if payload pages cannot be charged and returned individually.
 		h.cacheMaximum = 0
 	} else {
-		cacheFeatures = append(cacheFeatures, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(cacheMax))
+		var run [16]byte
+		if _, err := cryptorand.Read(run[:]); err != nil {
+			cancel()
+			return nil, fmt.Errorf("cache reclaim run identity: %w", err)
+		}
+		h.cacheReclaim.RunID = hex.EncodeToString(run[:])
+		cacheFeatures = append(cacheFeatures, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(cacheMax),
+			resource.FeatureCacheReclaimV1, resource.CacheReclaimRunFeature(h.cacheReclaim.RunID))
 	}
 	lease, err := resource.CreateLease(resource.Lease{
 		Version: resource.LeaseVersion, SandboxID: opts.SandboxID, PID: os.Getpid(),
@@ -220,6 +232,8 @@ type localControllerState struct {
 	cacheReservation                       uint64
 	cacheMaximum                           uint64
 	cacheSupported                         bool
+	cacheCoordinated                       bool
+	cacheReclaim                           *resource.CacheReclaimState
 	cacheTarget                            uint64
 	token                                  string
 }
@@ -227,12 +241,17 @@ type localControllerState struct {
 func (h *ControllerHooks) localState() localControllerState {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return localControllerState{
+	out := localControllerState{
 		admitted: h.admitted, settled: h.settled, connected: h.connected,
 		released: h.released, reservation: h.reservationBytes,
 		cacheReservation: h.cacheReservation, cacheMaximum: h.cacheMaximum, cacheSupported: h.cacheSupported, cacheTarget: h.cacheReclaimTarget,
 		token: h.previousToken,
 	}
+	out.cacheCoordinated = h.cacheCoordinated
+	if h.cacheCoordinated {
+		out.cacheReclaim = resource.CloneCacheReclaimState(&h.cacheReclaim)
+	}
+	return out
 }
 
 // Admit obtains the exact initial reservation. budgetAtSnapshot is zero
@@ -289,6 +308,14 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 		cacheFeatures := []string{resource.FeatureStateSyncV1}
 		if h.cacheMaximum > 0 {
 			cacheFeatures = append(cacheFeatures, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(h.cacheMaximum))
+			if h.cacheReclaim.RunID != "" {
+				cacheFeatures = append(cacheFeatures, resource.FeatureCacheReclaimV1, resource.CacheReclaimRunFeature(h.cacheReclaim.RunID))
+			}
+		}
+		var reclaim *resource.CacheReclaimState
+		if h.cacheReclaim.RunID != "" {
+			reclaim = resource.CloneCacheReclaimState(&h.cacheReclaim)
+			reclaim.Current = min(h.cacheMaximum, cacheBudgetUnit)
 		}
 		res, err := h.client.AdmitContext(h.lifetimeCtx, resource.AdmitParams{
 			SandboxID: sid, CapacityMemoryBytes: capacity,
@@ -296,6 +323,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 			FloorMemoryBytes: headroom, FloorCPU: h.cfg.Resources.Allocatable.CPU,
 			StartupBudgetMemory: startupBudget, AllocatableAtSnapshot: budgetAtSnapshot,
 			CgroupPath: h.controllerCgroupPath, ClientFeatures: cacheFeatures, CacheMaximum: h.cacheMaximum, CacheInitial: min(h.cacheMaximum, cacheBudgetUnit),
+			CacheReclaim: reclaim,
 		})
 		if resource.IsTransportError(err) {
 			h.setConnected(false)
@@ -326,12 +354,17 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 				return 0, fmt.Errorf("admit cache initial grant %d differs from %d", res.GrantedInitialCache, expectedCache)
 			}
 		}
+		if res.CacheCoordinated && (!res.CacheSupported || reclaim == nil) {
+			return 0, fmt.Errorf("admit confirmed unrequested cache coordination")
+		}
 		h.mu.Lock()
 		h.admitted, h.connected = true, true
 		h.reservationBytes = initialBudget
 		h.cacheSupported = res.CacheSupported
+		h.cacheCoordinated = res.CacheCoordinated
 		if res.CacheSupported {
 			h.cacheReservation = res.GrantedInitialCache
+			h.cacheReclaim.Current = res.GrantedInitialCache
 		}
 		h.previousToken = res.Token
 		h.mu.Unlock()
@@ -484,11 +517,20 @@ func (h *ControllerHooks) heartbeatOnce() {
 		return
 	}
 	if res != nil && state.cacheSupported {
-		if res.CacheReservation != state.cacheReservation {
+		pendingReturn := state.cacheCoordinated && state.cacheReclaim.Done != nil &&
+			res.CacheReservation >= state.cacheReservation && res.CacheReservation <= state.cacheMaximum
+		if res.CacheReservation != state.cacheReservation && !pendingReturn {
 			h.markDisconnectedLocked(fmt.Errorf("heartbeat cache reservation mismatch node=%d local=%d", res.CacheReservation, state.cacheReservation))
 			return
 		}
-		h.setCacheTarget(res.CacheReclaimTarget, res.CacheReclaimSeq)
+		if state.cacheCoordinated {
+			if err := h.acceptCacheReclaimResponse(res.CacheReclaimTask, res.CacheReclaimAck); err != nil {
+				h.markDisconnectedLocked(err)
+				return
+			}
+		} else {
+			h.setCacheTarget(res.CacheReclaimTarget, res.CacheReclaimSeq)
+		}
 	}
 	if res == nil || res.NewAllocatable != state.reservation {
 		got := uint64(0)
@@ -582,6 +624,7 @@ func (h *ControllerHooks) reconnectLoop() {
 					AppliedAllocatableMemory: state.reservation,
 					AppliedCacheReservation:  state.cacheReservation, AppliedCacheMaximum: state.cacheMaximum,
 					Settled: state.settled, CurrentRSS: hostCharge, PreviousToken: state.token,
+					CacheReclaim: state.cacheReclaim,
 				}, unlockStart, h.lifetimeCtx)
 				unlockStart()
 				if syncErr == nil && state.cacheSupported && result.CacheReservation != state.cacheReservation {
@@ -590,11 +633,21 @@ func (h *ControllerHooks) reconnectLoop() {
 				if syncErr == nil && result.NewAllocatable != state.reservation {
 					syncErr = fmt.Errorf("state_sync reservation mismatch: node=%d local=%d", result.NewAllocatable, state.reservation)
 				}
+				if syncErr == nil && state.cacheCoordinated {
+					if !resource.HasFeature(result.ClientFeatures, resource.FeatureCacheReclaimV1) ||
+						!resource.HasFeature(result.ClientFeatures, resource.FeatureCacheBudgetV1) {
+						syncErr = fmt.Errorf("state_sync did not confirm cache coordination")
+					} else {
+						syncErr = h.acceptCacheReclaimResponse(result.CacheReclaimTask, result.CacheReclaimAck)
+					}
+				}
 				if syncErr == nil {
 					h.mu.Lock()
 					h.connected, h.previousToken = true, result.Token
-					h.cacheReclaimTarget = result.CacheReclaimTarget
-					h.cacheReclaimSeq = result.CacheReclaimSeq
+					if !state.cacheCoordinated {
+						h.cacheReclaimTarget = result.CacheReclaimTarget
+						h.cacheReclaimSeq = result.CacheReclaimSeq
+					}
 					select {
 					case h.cacheWake <- struct{}{}:
 					default:
