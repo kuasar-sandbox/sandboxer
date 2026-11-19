@@ -250,9 +250,54 @@ disk, err := diffstore.OpenDisk(path, base, init,
 ```
 
 Check `err` before using a disk. `DiffInit{Existing: true}` opens an existing file;
-`CreateSize` or `TemplatePath` provisions a fresh file. v4 opens authenticate and
+`CreateSize` or `Template` provisions a fresh file. v4 opens authenticate and
 check the expected identity/base and never adopt older files. A plaintext raw
 provisioning template remains allowed when the new active file must be encrypted.
+
+`Template` is a lazy `TemplateFactory` returning a `sparse.Source + io.Closer`
+with arbitrary, repeated and concurrent reads. diffstore does not interpret URIs,
+carriers, source keys or Store configuration; the artifact layer selects raw,
+tarstream, Bundle, Store or built-in ext4 through the
+[template reference](configuration.md#disk-capacity). The factory runs once only
+after the creation claim and a second absence check. It cleans resources on
+failure; successful return transfers unique source ownership to the disk.
+Existing writers, empty existing files and claim losers never call it. Publication
+uses a no-replacement rename, including when a competing empty file appears.
+The original caller continues to own the base and shared storage clients.
+
+An optional `TemplateVerifier.Verify(ctx)` is a required completion barrier even
+when foreground writes superseded every template page. After copying, the worker
+verifies the source, detaches it from the frontend, waits for admitted source
+readers, clears its ownership and closes it exactly once before opening Ready.
+Verification or Close failure becomes a storage fault and prevents publication.
+`ValidateDiffTemplateExt4` only borrows source/base to check the effective view;
+it neither closes them nor establishes full identity. Generic pure-block binding
+does not acquire a filesystem-format restriction; ext4 mount paths retain their
+separate startup preflight.
+
+An owner abandoning an uncommitted new writer before deleting its path uses
+`CloseDiscarding`: it cancels unfinished template work and performs the same
+reader join and resource release. It neither removes the path nor closes the
+borrowed base. Committed retained writers continue to use ordinary `Close`.
+
+`sandbox.PrepareDiffWithStorage` accepts the caller's context, actual base,
+`ProcessStorage` and named locations for every template kind. The older
+`PrepareDiff(path, rawURI, baseSize)` remains a local raw-only compatibility
+entry; it does not acquire keys or a Store. `OpenDiskV1Source` still returns an
+expanded absolute URI for raw files. Identified sources retain their reference
+qualifiers. `RunOptions.Storage` preserves the caller-owned access capability
+when `Fetcher` separately selects a Bundle's base graph.
+
+An embedding caller supplying a borrowed Manifest Fetcher as the template Store
+must implement artifact's public `VerifiedManifestFetcher` capability, ensuring
+ContentKey verification of the selected Manifest and every read Chunk. An opaque
+ordinary Fetcher fails template opening rather than implying that guarantee;
+ordinary base reads keep their existing interface. ProcessStorage's owned lazy
+client provides a strict template view independent of ordinary
+`verify_content=false`. BorrowWithFetcher may select a Bundle scope for captured
+bases without changing the initializer's Store source or transferring ownership
+of shared clients.
+
 
 | Property | Single layer (v3) | Versioned (v4) |
 | --- | --- | --- |
@@ -294,7 +339,7 @@ No file format or configuration switch is added.
 | --- | --- |
 | `OpenDisk` returns | Validated ownership and logical view; absent upper pages read template/base/zero and cached writes may proceed. The final path may not exist yet. |
 | Internal initialization completion | Truncation, fixed reservation and the existing header/control/redo/batched bitmap writes completed, or one terminal error was recorded. Backend I/O and GC wait for success. |
-| `WaitMaterialReady` succeeds | Initialization completed and the view no longer depends on the template. This precedes cache drain so checkpoint can quiesce writers. |
+| `WaitMaterialReady` succeeds | Initialization and full template identity verification completed; admitted source readers ended, the source was released, and the view no longer depends on it. This precedes cache drain so checkpoint can quiesce writers. |
 | `WaitMaterialized` succeeds | Initialization, optional template import, required writeback, file sync, rename, claim release and directory sync completed. This does not synchronize subsequent writes. |
 
 An empty `Drain` does not wait for initialization. Physical path handoff/reopen,

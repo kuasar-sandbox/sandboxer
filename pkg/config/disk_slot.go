@@ -80,7 +80,12 @@ func (d *DiskConfig) validateSource(field string, cold bool) error {
 		return fmt.Errorf("%s: disk or slot cannot be combined with legacy disk sources", field)
 	}
 	if d.Disk != nil {
-		return d.Disk.Validate()
+		normalized, err := d.Disk.NormalizeCreate()
+		if err != nil {
+			return err
+		}
+		*d.Disk = normalized
+		return nil
 	}
 	_, err := d.Slot.Capacity()
 	return err

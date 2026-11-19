@@ -18,7 +18,8 @@ import (
 
 // OpenDiskV1Source prepares the identical read-only source for cold launch
 // and for a running slot. The caller owns the returned base reader; template
-// is a resolved file URI accepted by PrepareDiff.
+// is a canonical initialization URI accepted by PrepareDiffWithStorage. Raw file templates retain the historical
+// expanded absolute file URI; identified sources retain their lookup qualifiers.
 func OpenDiskV1Source(ctx context.Context, spec config.DiskV1, storage *artifact.ProcessStorage, locations config.RefLocations, opts ...diffstore.DiskOption) (base diffstore.BlockReader, size int64, template string, err error) {
 	return openDiskV1Source(ctx, spec, storage, locations, nil, opts...)
 }
@@ -27,7 +28,7 @@ func OpenDiskV1Source(ctx context.Context, spec config.DiskV1, storage *artifact
 // immutable parents readable on reopen, even after the seed has been removed.
 func openColdDiskSource(ctx context.Context, disk config.DiskConfig, writerURI string, storage *artifact.ProcessStorage, locations config.RefLocations, opts ...diffstore.DiskOption) (diffstore.BlockReader, int64, string, error) {
 	source := disk.SourceDefinition()
-	if source.DiffTemplate != "" && writerURI != "" {
+	if writerURI != "" {
 		scheme, path, ok := config.SchemeAndPath(writerURI)
 		if !ok || scheme != "file" {
 			return nil, 0, "", fmt.Errorf("invalid diff URI %q", writerURI)
@@ -37,10 +38,29 @@ func openColdDiskSource(ctx context.Context, disk config.DiskConfig, writerURI s
 			return nil, 0, "", err
 		}
 		if exists {
+			capacity, err := diffstore.ExistingDiffCapacity(path, opts...)
+			if err != nil {
+				return nil, 0, "", err
+			}
+			if source.Size != nil && capacity != *source.Size {
+				return nil, 0, "", fmt.Errorf("%w: existing writer capacity %d differs from requested size %d", ctl.ErrDiskCapacity, capacity, *source.Size)
+			}
 			// The optional assertion refers to the complete seed, which may be
 			// larger than its immutable base. It does not describe that base alone.
 			source.DiffTemplate = ""
 			source.Size = nil
+			if source.Base == "" {
+				return nil, capacity, "", nil
+			}
+			base, baseSize, _, err := OpenDiskV1Source(ctx, source, storage, locations, opts...)
+			if err == nil && baseSize > capacity {
+				err = fmt.Errorf("%w: existing writer is smaller than base", ctl.ErrDiskCapacity)
+				if base != nil {
+					err = errors.Join(err, base.Close())
+					base = nil
+				}
+			}
+			return base, capacity, "", err
 		}
 	}
 	if source.Base == "" && source.DiffTemplate == "" {
@@ -52,7 +72,7 @@ func openColdDiskSource(ctx context.Context, disk config.DiskConfig, writerURI s
 // When resolved is supplied, record immutable identities from the very file
 // handles backing the live reader, including a selected non-root Bundle member.
 func openDiskV1Source(ctx context.Context, spec config.DiskV1, storage *artifact.ProcessStorage, locations config.RefLocations, resolved *config.DiskV1, opts ...diffstore.DiskOption) (base diffstore.BlockReader, size int64, template string, err error) {
-	if err = spec.Validate(); err != nil {
+	if spec, err = spec.NormalizeCreate(); err != nil {
 		return
 	}
 	if storage == nil {
@@ -94,12 +114,11 @@ func openDiskV1Source(ctx context.Context, spec config.DiskV1, storage *artifact
 		}
 	}
 	if spec.DiffTemplate != "" {
-		ref, _ := manifest.ParseRef(spec.DiffTemplate)
-		path, e := artifact.ResolveDiskTemplate(ref, locations)
-		if e != nil {
-			return nil, 0, "", e
+		ref, _ := config.ParseDiffTemplate(spec.DiffTemplate)
+		if ref.Kind == config.DiffTemplateMkfs && len(streams) != 0 {
+			return nil, 0, "", errors.New("mkfs template requires a writable device without a COW base")
 		}
-		capacity, e := diffstore.DiffSourceCapacity(path, true, opts...)
+		capacity, e := TemplateCapacity(ctx, spec.DiffTemplate, storage, locations)
 		if e != nil {
 			return nil, 0, "", e
 		}
@@ -107,7 +126,14 @@ func openDiskV1Source(ctx context.Context, spec config.DiskV1, storage *artifact
 			return nil, 0, "", fmt.Errorf("%w: disk: template smaller than base", ctl.ErrDiskCapacity)
 		}
 		size = capacity
-		template = "file://" + path
+		template = spec.DiffTemplate
+		if ref.Kind == config.DiffTemplateRaw {
+			path, e := artifact.ResolveDiskTemplate(ref.Ref, locations)
+			if e != nil {
+				return nil, 0, "", e
+			}
+			template = (manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path}).String()
+		}
 	}
 	if err = diffstore.ValidateWritableSize(size); err != nil {
 		return nil, 0, "", fmt.Errorf("%w: %w", ctl.ErrDiskCapacity, err)

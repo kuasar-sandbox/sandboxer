@@ -985,10 +985,6 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		if !ok {
 			return DiskBackend{}, fmt.Errorf("invalid diff URI %q", diffURI)
 		}
-		baseSize := int64(0)
-		if base != nil {
-			baseSize = base.Size()
-		}
 		if owned {
 			defer func() {
 				if retErr != nil {
@@ -996,7 +992,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 				}
 			}()
 		}
-		init, err := PrepareDiff(diffPath, diffTemplate, baseSize)
+		init, err := PrepareDiffWithStorage(readCtx, diffPath, diffTemplate, base, r.diskStorage, spec.RefLocations)
 		if err != nil {
 			return DiskBackend{}, err
 		}

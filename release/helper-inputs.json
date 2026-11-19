@@ -12,7 +12,8 @@
       "cases": [
         "telemetry.usage.sh",
         "telemetry.usage-faults.sh",
-        "telemetry.source-faults.sh"
+        "telemetry.source-faults.sh",
+        "sandbox.diff-template.sh"
       ]
     },
     {

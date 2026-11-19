@@ -400,7 +400,7 @@ func (c *Disk) Export(ctx context.Context, id CheckpointID) (ExportView, error) 
 
 // openCheckpointPreflight authenticates metadata and reads a quiescent active
 // view without acquiring write ownership or replaying metadata in place.
-func openCheckpointPreflight(ctx context.Context, path string, options diskOptions) (diffTemplateSource, error) {
+func openCheckpointPreflight(ctx context.Context, path string, options diskOptions) (TemplateSource, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -420,7 +420,7 @@ func openCheckpointPreflight(ctx context.Context, path string, options diskOptio
 // Template writes use bounded metadata batches too. Read template bytes before
 // taking stripes, then recheck presence under the same locks as frontend writes.
 // The cache worker does not take stripes, so metadata completion can progress.
-func (c *Disk) materializeRange(ctx context.Context, template diffTemplateSource, start, end uint64, staging []byte) error {
+func (c *Disk) materializeRange(ctx context.Context, template TemplateSource, start, end uint64, staging []byte) error {
 	var records [maxWritebackPages]pageWrite
 	for offset := start; offset < end; {
 		if err := ctx.Err(); err != nil {
@@ -428,8 +428,8 @@ func (c *Disk) materializeRange(ctx context.Context, template diffTemplateSource
 		}
 		next := min(end, offset+uint64(len(staging)))
 		length := int(next - offset)
-		n, err := template.ReadAt(ctx, staging[:length], offset)
-		if err != nil && !(errors.Is(err, io.EOF) && n == length) {
+		n, err := readTemplateBase(ctx, template, c.base, staging[:length], offset)
+		if err != nil {
 			return err
 		}
 		if n != length {

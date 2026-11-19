@@ -213,7 +213,7 @@ func TestDeriveRuntimeSpecWithOptionsUsesActualDefaultDiffPaths(t *testing.T) {
 	writeTestDiff(t, rootPath, make([]byte, 20480))
 	writeTestDiff(t, dataPath, make([]byte, 12288))
 	template := filepath.Join(base, "template.diff")
-	writeTestDiff(t, template, make([]byte, 4096))
+	writeRawTestTemplate(t, template, make([]byte, 4096))
 	imagePath, scheme, digest := writeDiskArtifact(t, base, "image", lifecycleEROFSFixture(), nil)
 	cfg := &config.SandboxConfig{Boot: config.BootConfig{
 		Root: config.RootConfig{DiffTemplate: "file://" + template},
@@ -279,7 +279,7 @@ func TestDeriveRuntimeSpecWithOptionsLocalCrypto(t *testing.T) {
 				root.Diff = "file://" + diffPath
 			} else if mode == "plaintext-template" {
 				template := filepath.Join(dir, "template.diff")
-				writeTestDiff(t, template, make([]byte, 12288))
+				writeRawTestTemplate(t, template, make([]byte, 12288))
 				root.Diff, root.DiffTemplate = "file://"+diffPath, "file://"+template
 			}
 			calls := 0
@@ -467,8 +467,8 @@ func TestDeriveRuntimeSpecWithOptionsCheckpointWriterSelection(t *testing.T) {
 			if mode != "new-source-capacity" {
 				templateDir := t.TempDir()
 				rootTemplate, dataTemplate := filepath.Join(templateDir, "root.diff"), filepath.Join(templateDir, "data.diff")
-				writeTestDiff(t, rootTemplate, make([]byte, 24576))
-				writeTestDiff(t, dataTemplate, make([]byte, 28672))
+				writeRawTestTemplate(t, rootTemplate, make([]byte, 24576))
+				writeRawTestTemplate(t, dataTemplate, make([]byte, 28672))
 				cfg.Boot.Root.Overlay.DiffTemplate, cfg.Boot.Disks[0].DiffTemplate = "file://"+rootTemplate, "file://"+dataTemplate
 				if !current {
 					wantRoot, wantData = 24576, 28672
@@ -721,7 +721,7 @@ func TestColdPureDiskWriterAndTemplatePrecedence(t *testing.T) {
 				body := make([]byte, tc.seed)
 				copy(body, baseBytes)
 				body[0] = want
-				writeTestDiff(t, seed, body)
+				writeRawTestTemplate(t, seed, body)
 			}
 			launch.Disks = []config.DiskConfig{disk}
 			launch.Mounts = []config.MountConfig{{Type: "disk", Source: "data", Target: "/data"}}

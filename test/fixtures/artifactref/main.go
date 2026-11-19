@@ -44,6 +44,9 @@ func reference(path string) (string, error) {
 }
 
 func run(args []string, output io.Writer) error {
+	if len(args) == 3 && args[0] == "template-carriers" {
+		return templateCarriers(args[1], args[2], output)
+	}
 	if len(args) != 1 {
 		return fmt.Errorf("usage: artifact-ref ARTIFACT")
 	}

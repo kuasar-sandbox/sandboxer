@@ -67,7 +67,7 @@ func (b *delayedInitBackend) Close() error {
 	return errors.Join(b.failure, b.diffBackend.Close())
 }
 
-func pendingFresh(t *testing.T, size int64, template diffTemplateSource, failure error) (*freshDiffInit, *delayedInitBackend, diskOptions) {
+func pendingFresh(t *testing.T, size int64, template TemplateSource, failure error) (*freshDiffInit, *delayedInitBackend, diskOptions) {
 	t.Helper()
 	options, err := parseDiskOptions([]DiskOption{WithCheckpoint("pending", "base")})
 	if err != nil {
@@ -320,7 +320,7 @@ func TestPendingCloseRetainedAndDisposable(t *testing.T) {
 }
 
 type admittedTemplate struct {
-	diffTemplateSource
+	TemplateSource
 	entered, release chan struct{}
 	once             sync.Once
 }
@@ -328,18 +328,18 @@ type admittedTemplate struct {
 func (s *admittedTemplate) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) {
 	s.once.Do(func() { close(s.entered) })
 	<-s.release
-	return s.diffTemplateSource.ReadAt(ctx, p, off)
+	return s.TemplateSource.ReadAt(ctx, p, off)
 }
 
 func TestInitializationFailureRetainsAdmittedTemplateReader(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "template.raw")
 	want := bytes.Repeat([]byte{0x51}, 4*cowBlockSize)
 	writeSparseTemplate(t, path, want, []sparse.Extent{{Size: uint64(len(want))}})
-	source, err := openLazyDiffTemplate(path, nil)
+	source, err := openTestRawTemplate(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	template := &admittedTemplate{diffTemplateSource: source, entered: make(chan struct{}), release: make(chan struct{})}
+	template := &admittedTemplate{TemplateSource: source, entered: make(chan struct{}), release: make(chan struct{})}
 	fresh, backend, options := pendingFresh(t, int64(len(want)), template, io.ErrShortWrite)
 	cow := attachPending(t, fresh, backend, &fakeReader{data: bytes.Repeat([]byte{0x12}, len(want))}, options)
 	read := make(chan error, 1)
@@ -645,7 +645,7 @@ func TestCheckpointOversizedCapacityCleansFreshResources(t *testing.T) {
 				if err := f.Close(); err != nil {
 					t.Fatal(err)
 				}
-				init = DiffInit{TemplatePath: templatePath}
+				init = DiffInit{Template: rawTemplateFactory(templatePath)}
 			}
 			dir := t.TempDir()
 			path := filepath.Join(dir, "active.diff")

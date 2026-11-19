@@ -128,7 +128,7 @@ func TestCheckpointCOWReopenPresenceCapacityAndIdentity(t *testing.T) {
 	if err := cow.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if capacity, err := DiffSourceCapacity(path, false); err != nil || capacity != size {
+	if capacity, err := ExistingDiffCapacity(path); err != nil || capacity != size {
 		t.Fatalf("logical capacity: %d %v", capacity, err)
 	}
 	if _, err := OpenDisk(path, nil, DiffInit{Existing: true}, WithCheckpoint("wrong-disk", "immutable-base")); err == nil {
@@ -328,7 +328,7 @@ func TestCheckpointCOWTemplateCaptureProgressesUnderWrites(t *testing.T) {
 	path := filepath.Join(dir, "active.diff")
 	want := bytes.Repeat([]byte{0x63}, size)
 	writeSparseTemplate(t, template, want, []sparse.Extent{{Size: uint64(len(want))}})
-	cow, err := OpenDisk(path, nil, DiffInit{TemplatePath: template}, WithCheckpoint("templated", "base"))
+	cow, err := OpenDisk(path, nil, DiffInit{Template: rawTemplateFactory(template)}, WithCheckpoint("templated", "base"))
 	if err != nil {
 		t.Fatal(err)
 	}

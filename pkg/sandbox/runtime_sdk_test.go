@@ -95,7 +95,7 @@ func sdkFixture(t *testing.T) (RuntimeSpec, LaunchSpec) {
 	data := make([]byte, 4096)
 	data[1024+56] = 0x53
 	data[1024+57] = 0xef
-	writeTestDiff(t, template, data)
+	writeRawTestTemplate(t, template, data)
 	script := filepath.Join(dir, "test-ch")
 	// All fixture paths are generated locally and quoted as shell literals.
 	body := "#!/bin/sh\nfor arg do\n case \"$arg\" in cid=3,socket=*) export SDK_TEST_VSOCK=\"${arg#cid=3,socket=}\";; esac\ndone\nexec '" + strings.ReplaceAll(os.Args[0], "'", "'\\''") + "' -test.run='^TestSDKChild$'\n"
@@ -112,6 +112,13 @@ func sdkFixture(t *testing.T) (RuntimeSpec, LaunchSpec) {
 		Disks: []RuntimeDiskSpec{{Name: "root", WritableCapacity: 4096}}, CHBinary: script, RuntimeRoot: dir, BaseRoot: dir, SandboxID: "owner"}
 	launch := LaunchSpec{Root: config.RootConfig{DiffTemplate: "file://" + template}, Process: config.LaunchConfig{Exec: "/bin/true", Restart: "never"}}
 	return shape, launch
+}
+
+func writeRawTestTemplate(t testing.TB, path string, data []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func writeTestDiff(t testing.TB, path string, data []byte) {

@@ -303,7 +303,7 @@ func BenchmarkFreshTemplateMaterialization(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			path := filepath.Join(b.TempDir(), "active.diff")
 			b.StartTimer()
-			cow, err := OpenDisk(path, nil, DiffInit{TemplatePath: templatePath}, WithDiscardOnClose())
+			cow, err := OpenDisk(path, nil, DiffInit{Template: rawTemplateFactory(templatePath)}, WithDiscardOnClose())
 			b.StopTimer()
 			if err != nil {
 				b.Fatal(err)
@@ -317,7 +317,7 @@ func BenchmarkFreshTemplateMaterialization(b *testing.B) {
 	b.Run("complete", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			path := filepath.Join(b.TempDir(), "active.diff")
-			cow, err := OpenDisk(path, nil, DiffInit{TemplatePath: templatePath})
+			cow, err := OpenDisk(path, nil, DiffInit{Template: rawTemplateFactory(templatePath)})
 			if err != nil {
 				b.Fatal(err)
 			}

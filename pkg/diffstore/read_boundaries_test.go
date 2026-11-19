@@ -36,7 +36,7 @@ func TestReadBoundaryDiffExt4FullTerminal(t *testing.T) {
 	for _, cause := range []error{io.EOF, syscall.EAGAIN} {
 		t.Run(cause.Error(), func(t *testing.T) {
 			base := NewStreamReader(context.Background(), boundaryExt4Stream{cause: readerr.Mark(cause, false)}, 4096)
-			err := validateDiffSourceExt4(context.Background(), &boundaryHoleTemplate{Source: src}, base)
+			err := ValidateDiffTemplateExt4(context.Background(), &boundaryHoleTemplate{Source: src}, base)
 			if !readretry.IsTerminal(err) || !readerr.IsPermanent(err) || !errors.Is(err, cause) {
 				t.Fatalf("diff ext4 accepted/lost terminal: %v", err)
 			}
@@ -50,7 +50,7 @@ func TestDiffExt4FullOrdinaryEOFRemainsValid(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := NewStreamReader(context.Background(), boundaryExt4Stream{cause: io.EOF}, 4096)
-	if err := validateDiffSourceExt4(context.Background(), &boundaryHoleTemplate{Source: src}, base); err != nil {
+	if err := ValidateDiffTemplateExt4(context.Background(), &boundaryHoleTemplate{Source: src}, base); err != nil {
 		t.Fatal(err)
 	}
 }

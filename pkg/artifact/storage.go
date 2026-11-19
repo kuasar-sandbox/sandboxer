@@ -6,6 +6,7 @@ package artifact
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -36,6 +37,9 @@ type ProcessStorage struct {
 	ref             *refTarstreams
 	fetcher         *onDemandManifestFetcher
 	borrowedFetcher fetch.Fetcher
+	// templateFetcher preserves Store identity separately from a Bundle-scoped
+	// base graph. Borrowers never own its clients or change its source policy.
+	templateFetcher fetch.Fetcher
 }
 
 // NewProcessStorage initializes process-local artifact access from cfg and the
@@ -98,6 +102,9 @@ func NewProcessStorageWithLocalAccess(cfg *config.ManifestConfig, customerKey in
 	s.localCodec, s.localRequired = codec, required
 	if len(borrowed) == 1 {
 		s.borrowedFetcher = borrowed[0]
+		if borrowed[0] != nil {
+			s.templateFetcher = borrowed[0]
+		}
 	}
 	return s, nil
 }
@@ -117,7 +124,7 @@ func (s *ProcessStorage) BorrowWithFetcher(fetcher fetch.Fetcher) *ProcessStorag
 		return nil
 	}
 	return &ProcessStorage{cfg: s.cfg, keyFn: s.keyFn, localCodec: s.localCodec, ref: s.ref,
-		localRequired: s.localRequired, borrowedFetcher: fetcher}
+		localRequired: s.localRequired, borrowedFetcher: fetcher, templateFetcher: s.templateFetcher}
 }
 
 func newProcessStorage(cfg *config.ManifestConfig, customerKey ingest.CustomerKeyFunc) (*ProcessStorage, error) {
@@ -137,6 +144,7 @@ func newProcessStorage(cfg *config.ManifestConfig, customerKey ingest.CustomerKe
 			return nil, err
 		}
 		s.fetcher = &onDemandManifestFetcher{cfg: cfg, keyFn: s.keyFn}
+		s.templateFetcher = s.fetcher
 		if !verificationOptions(cfg).VerifyContent {
 			warnVerificationDisabled.Do(func() {
 				log.Printf("WARNING: manifest.verify_content=false; ordinary remote and Bundle Manifest/Chunk SHA-256 verification is disabled")
@@ -293,15 +301,28 @@ func (s *ProcessStorage) Close() error {
 }
 
 type onDemandManifestFetcher struct {
-	mu     sync.Mutex
-	cfg    *config.ManifestConfig
-	keyFn  ingest.CustomerKeyFunc
-	closed bool
-	inner  fetch.Fetcher
-	closer io.Closer
+	mu           sync.Mutex
+	cfg          *config.ManifestConfig
+	keyFn        ingest.CustomerKeyFunc
+	closed       bool
+	inner        fetch.Fetcher
+	closer       io.Closer
+	strictInner  fetch.Fetcher
+	strictCloser io.Closer
 }
 
 func (f *onDemandManifestFetcher) OpenManifest(ctx context.Context, key store.ContentKey) (fetch.Stream, error) {
+	return f.open(ctx, key, false)
+}
+
+// OpenVerifiedManifest keeps template identity assertions independent of the
+// ordinary-read policy. Both views have the same process-fixed customer key
+// and configured Store/cache; all their clients remain process-owned.
+func (f *onDemandManifestFetcher) OpenVerifiedManifest(ctx context.Context, key store.ContentKey) (fetch.Stream, error) {
+	return f.open(ctx, key, true)
+}
+
+func (f *onDemandManifestFetcher) open(ctx context.Context, key store.ContentKey, verified bool) (fetch.Stream, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -310,23 +331,32 @@ func (f *onDemandManifestFetcher) OpenManifest(ctx context.Context, key store.Co
 		f.mu.Unlock()
 		return nil, readerr.Mark(fmt.Errorf("manifest fetcher is closed"), false)
 	}
-	if f.inner == nil {
-		inner, closer, err := newManifestFetcher(f.cfg, f.keyFn)
+	inner, closer := &f.inner, &f.closer
+	cfg := f.cfg
+	if verified && !verificationOptions(cfg).VerifyContent {
+		strict := *cfg
+		verify := true
+		strict.Manifest.VerifyContent = &verify
+		cfg = &strict
+		inner, closer = &f.strictInner, &f.strictCloser
+	}
+	if *inner == nil {
+		opened, owned, err := newManifestFetcher(cfg, f.keyFn)
 		if err == nil {
 			err = ctx.Err()
 		}
 		if err != nil {
-			if closer != nil {
-				_ = closer.Close()
+			if owned != nil {
+				_ = owned.Close()
 			}
 			f.mu.Unlock()
 			return nil, err
 		}
-		f.inner, f.closer = inner, closer
+		*inner, *closer = opened, owned
 	}
-	inner := f.inner
+	selected := *inner
 	f.mu.Unlock()
-	return inner.OpenManifest(ctx, key)
+	return selected.OpenManifest(ctx, key)
 }
 
 func (f *onDemandManifestFetcher) Close() error {
@@ -337,12 +367,18 @@ func (f *onDemandManifestFetcher) Close() error {
 	}
 	f.closed = true
 	closer := f.closer
+	strictCloser := f.strictCloser
 	f.closer = nil
+	f.strictCloser = nil
 	f.mu.Unlock()
-	if closer == nil {
-		return nil
+	var err error
+	if closer != nil {
+		err = closer.Close()
 	}
-	return closer.Close()
+	if strictCloser != nil {
+		err = errors.Join(err, strictCloser.Close())
+	}
+	return err
 }
 
 func newManifestFetcher(cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc) (fetch.Fetcher, io.Closer, error) {

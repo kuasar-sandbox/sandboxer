@@ -393,6 +393,7 @@ func runCmd(args []string) int {
 		Cfg:                cfg,
 		PortableConfig:     sourceLaunch.PortableConfig,
 		SourceBinding:      sourceLaunch.SourceBinding,
+		Storage:            processStorage,
 		ManifestCfg:        manifestCfg,
 		Fetcher:            manifestFetcher,
 		BundleReader:       sourceLaunch.BundleReader,

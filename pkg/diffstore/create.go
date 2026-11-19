@@ -14,18 +14,15 @@ import (
 // createFreshDiff owns claim/template/temp resources from acquisition through
 // atomic publication. Only format initialization differs between backends.
 func createFreshDiff(path string, init DiffInit, options diskOptions) (*freshDiffInit, error) {
-	if init.TemplatePath == "" {
+	if init.Template == nil {
 		if err := validateDiffLogicalSize(init.CreateSize); err != nil {
 			return nil, err
 		}
 	}
 	check := func() error {
-		info, err := os.Lstat(path)
+		_, err := os.Lstat(path)
 		if err == nil {
-			if !info.Mode().IsRegular() || info.Size() != 0 {
-				return unix.EEXIST
-			}
-			return nil
+			return unix.EEXIST
 		}
 		if os.IsNotExist(err) {
 			return nil
@@ -45,10 +42,13 @@ func createFreshDiff(path string, init DiffInit, options diskOptions) (*freshDif
 		return fail(err)
 	}
 	size := init.CreateSize
-	if init.TemplatePath != "" {
-		template, err := openLazyDiffTemplate(init.TemplatePath, options.encryption)
+	if init.Template != nil {
+		template, err := init.Template()
 		if err != nil {
 			return fail(err)
+		}
+		if template == nil {
+			return fail(fmt.Errorf("diffstore: template factory returned a nil source"))
 		}
 		fresh.template = template
 		if template.Size() > uint64(^uint64(0)>>1) {

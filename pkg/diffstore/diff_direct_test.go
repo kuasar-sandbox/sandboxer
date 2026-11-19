@@ -140,7 +140,7 @@ func TestDiffDirectBodyDoesNotPopulatePageCache(t *testing.T) {
 }
 
 type directSeedProbe struct {
-	diffTemplateSource
+	TemplateSource
 	check func() error
 }
 
@@ -148,7 +148,7 @@ func (p directSeedProbe) ReadAt(ctx context.Context, buf []byte, off uint64) (in
 	if err := p.check(); err != nil {
 		return 0, err
 	}
-	return p.diffTemplateSource.ReadAt(ctx, buf, off)
+	return p.TemplateSource.ReadAt(ctx, buf, off)
 }
 func TestDiffDirectEnabledBeforeTemplateSeed(t *testing.T) {
 	testDiffIOBeforeTemplateSeed(t, t.TempDir(), false)
@@ -161,12 +161,12 @@ func TestDiffTmpfsPreparedBeforeTemplateSeed(t *testing.T) {
 func testDiffIOBeforeTemplateSeed(t *testing.T, dir string, tmpfs bool) {
 	srcPath := filepath.Join(dir, "template")
 	writeSparseTemplate(t, srcPath, patternedBytes(2*cowBlockSize), []sparse.Extent{{Size: 2 * cowBlockSize}})
-	src, err := openDiffTemplate(srcPath, nil)
+	src, err := openTestRawTemplate(srcPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer src.Close()
-	if _, ok := src.(*templateImage); !ok {
+	if _, ok := src.(*testFileTemplate); !ok {
 		t.Fatal("raw provisioning template was opened as an active DIFF")
 	}
 	probeDir, err := filepath.EvalSymlinks(dir)

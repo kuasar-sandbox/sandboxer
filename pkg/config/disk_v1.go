@@ -14,10 +14,12 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/sandboxer/pkg/emptyext4"
 )
 
 // DiskV1 describes a complete disk, including each immutable dependency in
-// newest-to-oldest order. Size, when supplied, asserts logical capacity.
+// newest-to-oldest order. Size asserts logical capacity for an explicit source;
+// with no source or parents it creates an empty ext4 disk of that capacity.
 type DiskV1 struct {
 	Kind         string   `json:"kind" yaml:"kind"`
 	Version      int      `json:"version" yaml:"version"`
@@ -28,6 +30,33 @@ type DiskV1 struct {
 }
 
 func (d DiskV1) Validate() error {
+	_, err := d.NormalizeCreate()
+	return err
+}
+
+// NormalizeCreate expands a size-only creation request and canonicalizes mkfs
+// aliases before validation or source identity comparison. It does not change
+// captured/restored disk graphs, infer a slot's capacity, or repair a bad source.
+func (d DiskV1) NormalizeCreate() (DiskV1, error) {
+	if d.DiffTemplate != "" {
+		normalized, err := NormalizeDiffTemplate(d.DiffTemplate)
+		if err != nil {
+			return DiskV1{}, fmt.Errorf("diff_template: %w", err)
+		}
+		d.DiffTemplate = normalized
+	} else if d.Base == "" && len(d.BaseFromRefs) == 0 && d.Size != nil {
+		if err := emptyext4.ValidateSize(*d.Size); err != nil {
+			return DiskV1{}, fmt.Errorf("disk size-only creation: %w", err)
+		}
+		d.DiffTemplate = (DiffTemplateRef{Kind: DiffTemplateMkfs, Size: *d.Size}).String()
+	}
+	if err := d.validateNormalized(); err != nil {
+		return DiskV1{}, err
+	}
+	return d, nil
+}
+
+func (d DiskV1) validateNormalized() error {
 	if d.Kind != "disk" || d.Version != 1 {
 		return errors.New("disk: expected kind disk and version 1")
 	}
@@ -40,7 +69,7 @@ func (d DiskV1) Validate() error {
 	if len(d.BaseFromRefs) > MaxPortableLayerRefs {
 		return fmt.Errorf("disk: at most %d parent layers", MaxPortableLayerRefs)
 	}
-	check := func(raw string, template bool) error {
+	check := func(raw string) error {
 		r, err := manifest.ParseRef(raw)
 		if err != nil {
 			return err
@@ -51,23 +80,20 @@ func (d DiskV1) Validate() error {
 		if r.Scheme == manifest.RefSchemeFile && r.Location == "" && !filepath.IsAbs(r.Path) {
 			return errors.New("disk: unlocated file reference requires an absolute path")
 		}
-		if template && (r.Scheme != manifest.RefSchemeFile || r.DigestScheme != "") {
-			return errors.New("disk: diff_template requires a file path, optionally with a location")
-		}
 		return nil
 	}
 	if d.Base != "" {
-		if err := check(d.Base, false); err != nil {
+		if err := check(d.Base); err != nil {
 			return fmt.Errorf("base: %w", err)
 		}
 	}
 	for i, raw := range d.BaseFromRefs {
-		if err := check(raw, false); err != nil {
+		if err := check(raw); err != nil {
 			return fmt.Errorf("base_from_refs[%d]: %w", i, err)
 		}
 	}
 	if d.DiffTemplate != "" {
-		if err := check(d.DiffTemplate, true); err != nil {
+		if _, err := ParseDiffTemplate(d.DiffTemplate); err != nil {
 			return fmt.Errorf("diff_template: %w", err)
 		}
 	}
@@ -77,6 +103,9 @@ func (d DiskV1) Validate() error {
 // Identity fingerprints the source of a validated request independently of its
 // optional capacity assertion. Qualified immutable refs survive relocation.
 func (d DiskV1) Identity() string {
+	if normalized, err := d.NormalizeCreate(); err == nil {
+		d = normalized
+	}
 	layerID := func(raw string) string {
 		r, err := manifest.ParseRef(raw)
 		if err == nil {
@@ -89,7 +118,11 @@ func (d DiskV1) Identity() string {
 		}
 		return raw
 	}
-	graph := []string{d.DiffTemplate, layerID(d.Base)}
+	templateID := d.DiffTemplate
+	if r, err := ParseDiffTemplate(d.DiffTemplate); err == nil {
+		templateID = r.Identity()
+	}
+	graph := []string{templateID, layerID(d.Base)}
 	for _, r := range d.BaseFromRefs {
 		graph = append(graph, layerID(r))
 	}
@@ -119,10 +152,11 @@ func (d *DiskV1) UnmarshalYAML(node *yaml.Node) error {
 	if err := node.Decode(&spec); err != nil {
 		return err
 	}
-	if err := DiskV1(spec).Validate(); err != nil {
+	normalized, err := DiskV1(spec).NormalizeCreate()
+	if err != nil {
 		return err
 	}
-	*d = DiskV1(spec)
+	*d = normalized
 	return nil
 }
 
@@ -167,9 +201,10 @@ func (d *DiskV1) UnmarshalJSON(raw []byte) error {
 	if _, err = dec.Token(); err != io.EOF {
 		return errors.New("disk: trailing JSON")
 	}
-	if err = out.Validate(); err != nil {
+	normalized, err := out.NormalizeCreate()
+	if err != nil {
 		return err
 	}
-	*d = out
+	*d = normalized
 	return nil
 }

@@ -2,6 +2,12 @@ package sandbox
 
 import (
 	"bytes"
+	"context"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,16 +39,33 @@ func TestPrepareDiffPreservesTemplateAndExistingLogicalCapacity(t *testing.T) {
 			}
 			dir := t.TempDir()
 			template, target := filepath.Join(dir, "template.diff"), filepath.Join(dir, "active.diff")
-			seed, err := diffstore.OpenDisk(template, nil, diffstore.DiffInit{CreateSize: size}, options(tc.encryptedTemplate)...)
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = seed.Close() })
 			payload := bytes.Repeat([]byte{0x5a}, 4096)
-			if _, err := seed.WriteAt(payload, size-4096); err != nil {
-				t.Fatal(err)
-			}
-			if err := seed.Close(); err != nil {
+			body := make([]byte, size)
+			copy(body[1024+0x38:], []byte{0x53, 0xef})
+			copy(body[size-4096:], payload)
+			templateURI := "file://" + template
+			var storage *artifact.ProcessStorage
+			if tc.encryptedTemplate {
+				codec, err := crypto.NewTarStreamCodec(key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				storage, err = artifact.NewProcessStorageWithLocalAccess(nil, func() ([32]byte, error) { return key, nil }, codec, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = storage.Close() })
+				file, err := os.Create(template)
+				if err != nil {
+					t.Fatal(err)
+				}
+				scheme, digest, err := tarstream.WriteTo(context.Background(), file, "image", sparse.Dense(bytes.NewReader(body), uint64(size)), tarstream.WithCodec(codec, true))
+				closeErr := file.Close()
+				if err != nil || closeErr != nil {
+					t.Fatalf("encode template: %v %v", err, closeErr)
+				}
+				templateURI += "@" + scheme + ":" + digest
+			} else if err := os.WriteFile(template, body, 0600); err != nil {
 				t.Fatal(err)
 			}
 			before, err := os.ReadFile(template)
@@ -50,7 +73,7 @@ func TestPrepareDiffPreservesTemplateAndExistingLogicalCapacity(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			plan, err := PrepareDiff(target, "file://"+template, size/2)
+			plan, err := PrepareDiffWithStorage(context.Background(), target, templateURI, nil, storage, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -76,7 +99,7 @@ func TestPrepareDiffPreservesTemplateAndExistingLogicalCapacity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if logical, err := diffstore.DiffSourceCapacity(target, false, options(tc.encryptedTarget)...); err != nil || logical != size {
+			if logical, err := diffstore.ExistingDiffCapacity(target, options(tc.encryptedTarget)...); err != nil || logical != size {
 				t.Fatalf("runtime capacity projection=%d/%v", logical, err)
 			}
 			if tc.encryptedTarget && info.Size() <= size {
@@ -84,7 +107,7 @@ func TestPrepareDiffPreservesTemplateAndExistingLogicalCapacity(t *testing.T) {
 			}
 
 			// Existing data wins even with an unavailable template and a different base size.
-			plan, err = PrepareDiff(target, "file:///unused-template", 2*size)
+			plan, err = PrepareDiffWithStorage(context.Background(), target, "file:///unused-template", nil, nil, nil)
 			if err != nil || !plan.Existing {
 				t.Fatalf("existing plan=%+v err=%v", plan, err)
 			}
@@ -117,7 +140,7 @@ func TestPrepareDiffInheritsBaseLogicalCapacity(t *testing.T) {
 			payload := bytes.Repeat([]byte{0x35}, 4*4096)
 			base := capacityBase{bytes.NewReader(payload)}
 			path := filepath.Join(t.TempDir(), "active.diff")
-			plan, err := PrepareDiff(path, "", base.Size())
+			plan, err := PrepareDiffWithStorage(context.Background(), path, "", base, nil, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

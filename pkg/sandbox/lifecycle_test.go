@@ -413,7 +413,7 @@ func TestPreflightWritableExt4RejectsUnformattedExplicitDiff(t *testing.T) {
 		},
 	}
 	err := preflightWritableExt4(context.Background(), root, "boot.root", "",
-		nil, nil, nil, [32]byte{}, false, nil)
+		nil, nil, nil, [32]byte{}, false, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "formatted ext4") {
 		t.Fatalf("unformatted active diff error = %v", err)
 	}

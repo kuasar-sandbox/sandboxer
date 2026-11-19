@@ -32,10 +32,11 @@ func TestCheckpointFreshPresenceAndReopen(t *testing.T) {
 				}
 				init := DiffInit{CreateSize: test.size}
 				if test.template {
-					init.TemplatePath = filepath.Join(dir, "template.raw")
+					templatePath := filepath.Join(dir, "template.raw")
+					init.Template = rawTemplateFactory(templatePath)
 					// The template, rather than CreateSize, determines capacity.
 					init.CreateSize = cowBlockSize
-					writeSparseTemplate(t, init.TemplatePath, bytes.Repeat([]byte{0x72}, int(test.size)),
+					writeSparseTemplate(t, templatePath, bytes.Repeat([]byte{0x72}, int(test.size)),
 						[]sparse.Extent{{Size: 3 * cowBlockSize}})
 				}
 				cow, err := OpenDisk(path, base, init, options...)
