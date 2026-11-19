@@ -58,9 +58,9 @@ func TestWritebackFailureVisibleBeforeCleanup(t *testing.T) {
 			}
 			checkBudget(t, cache, 1, 1, 1)
 			cache.mu.Lock()
-			active := cache.active
+			active := cache.active[cow]
 			cache.mu.Unlock()
-			if active != cow {
+			if !active {
 				t.Fatal("I/O owner cleared before cleanup finished")
 			}
 			closed := make(chan error, 1)

@@ -4,14 +4,17 @@ import "golang.org/x/sys/unix"
 
 // RetryInterruptedIO repeats a positional I/O syscall at the original offset
 // only if a signal interrupted it before any bytes transferred. A short
-// transfer must reach the caller intact: its remainder may be unaligned.
+// transfer must reach the caller intact: its remainder may be unaligned. The
+// complete retry loop shares one best-effort thread I/O priority scope.
 func RetryInterruptedIO(op func(int, []byte, int64) (int, error), fd int, p []byte, off int64) (int, error) {
-	for {
-		n, err := op(fd, p, off)
-		if n > 0 || err != unix.EINTR {
-			return n, err
+	return withIOPriority(func() (int, error) {
+		for {
+			n, err := op(fd, p, off)
+			if n > 0 || err != unix.EINTR {
+				return n, err
+			}
 		}
-	}
+	})
 }
 
 // Reserve allocates the range without changing the file size.

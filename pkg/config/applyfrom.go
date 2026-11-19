@@ -67,7 +67,7 @@ func ApplyFromRules(artifact *PortableSandboxConfig, host *SandboxConfig, presen
 	}
 
 	// Host-owned resource and protocol policy.
-	runtime.Resources.DiffCOW = host.Resources.DiffCOW
+	runtime.Resources.DiffCOW = host.Resources.DiffCOW.Clone()
 	runtime.Resources.Control = host.Resources.Control
 	runtime.Resources.Overhead = host.Resources.Overhead
 	runtime.Resources.WatermarkHigh = host.Resources.WatermarkHigh

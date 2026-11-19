@@ -110,7 +110,7 @@ func TestConfigRestoreProjectionDropsDiscardAndKeepsCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Resources.DiffCOW.Discard != "" || presence.Has("resources.diff_cow.discard") || cfg.Resources.DiffCOW.CacheSize != "32MiB" || cfg.Resources.DiffCOW.MaxDirtySize != "16MiB" {
+	if cfg.Resources.DiffCOW.Discard != "" || presence.Has("resources.diff_cow.discard") || cfg.Resources.DiffCOW.CacheSize != "32MiB" || cfg.Resources.DiffCOW.MaxDirtySize != "0" {
 		t.Fatalf("restore projection changed cache or retained discard: %+v", cfg.Resources.DiffCOW)
 	}
 	if err := cfg.ValidateRestoreHostConfigWithPresence(presence); err != nil {

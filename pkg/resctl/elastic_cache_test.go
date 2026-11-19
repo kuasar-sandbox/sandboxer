@@ -92,7 +92,7 @@ func TestElasticCacheControllerGrowReclaimAndReadback(t *testing.T) {
 		cacheSupported: true, cacheMaximum: 64 * mib, cacheWake: make(chan struct{}, 1),
 		reconnectWake: make(chan struct{}, 1),
 	}
-	cache, stop, err := NewCacheWithBudget(ctx, hooks, 64*mib, 32*mib)
+	cache, stop, err := NewCacheWithBudget(ctx, hooks, 64*mib, 32*mib, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

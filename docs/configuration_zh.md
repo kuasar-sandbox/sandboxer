@@ -25,7 +25,7 @@ resources:
   overhead: { memory: 128MiB }
   watermark_high: { ratio: 0.875 }
   startup: { memory: 512MiB }
-  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB, discard: auto }
+  diff_cow: { cache_size: 32MiB, max_dirty_size: 0, discard: auto }
 
 network:
   # Host provider and current identity:
@@ -156,7 +156,12 @@ Size 是 `512MiB` 等字节大小字符串；duration 是 `30s` 等 Go duration 
 | `resources.watermark_high.ratio` | 数值；`0.875` | 严格位于零和一之间；显式对象要求 cgroup |
 | `resources.startup.memory` | Size；capacity memory | 正值、不超过 capacity；与 allocatable headroom 独立 |
 | `resources.diff_cow.cache_size` | Size；`32MiB` | 全 sandbox 共享 cache；正的 4 KiB 整数倍 |
-| `resources.diff_cow.max_dirty_size` | Size；从最终 cache 推导 | 正的 4 KiB 整数倍且不超过总额；见[推导和覆盖](#diff-cow-policy) |
+| `resources.diff_cow.max_dirty_size` | Size；`0` | 整体脏页额度；0 不额外限制，正值为 4 KiB 整数倍且不超过 `cache_size` |
+| `resources.diff_cow.max_dirty_size_per_disk` | Size；`0` | 统一的单盘脏页额度；正值为 4 KiB 整数倍 |
+| `resources.diff_cow.read_bandwidth`、`write_bandwidth` | Size/秒；`0` | 整体读/写入口 payload 字节率 |
+| `resources.diff_cow.read_iops`、`write_iops` | 非负整数；`0` | 整体完整读/写请求次数/秒 |
+| `resources.diff_cow.read_bandwidth_per_disk`、`write_bandwidth_per_disk` | Size/秒；`0` | 每块逻辑盘独立使用的统一带宽上限 |
+| `resources.diff_cow.read_iops_per_disk`、`write_iops_per_disk` | 非负整数；`0` | 每块逻辑盘独立使用的统一请求速率上限 |
 | `resources.diff_cow.cache_idle_after` | 正时长；默认 `10s` | Clean 页多久未访问后计入闲置缓存统计；不失效、不立即回收 |
 | `resources.diff_cow.discard` | `auto` 或 `manual`；`auto` | 所有受管可写 ext4 的冷启动挂载策略；内存恢复拒绝显式输入；见[策略说明](#diff-cow-policy) |
 
@@ -364,15 +369,24 @@ Usage 在普通 cold、`run --from` 和 `run --restore` 中都是 host policy,
 
 <a id="diff-cow-policy"></a>
 
-## `resources.diff_cow`：缓存所有权与挂载策略
+## `resources.diff_cow`：缓存、磁盘 QoS 与挂载策略
 
 ```yaml
 resources:
   diff_cow:
     cache_size: 32MiB
-    max_dirty_size: 16MiB
     cache_idle_after: 10s
     discard: auto
+    max_dirty_size: 0
+    read_bandwidth: 0
+    write_bandwidth: 0
+    read_iops: 0
+    write_iops: 0
+    max_dirty_size_per_disk: 0
+    read_bandwidth_per_disk: 0
+    write_bandwidth_per_disk: 0
+    read_iops_per_disk: 0
+    write_iops_per_disk: 0
 ```
 
 `discard` 只接受 `auto` 或 `manual`；合并 Host 覆盖后，省略时取 `auto`。普通冷启动和
@@ -389,32 +403,50 @@ runtime 声明支持；参见[挂载范围与兼容性契约](guest-abi_zh.md#gu
 的选择。Snapshot S 仍捕获 Guest 挂载状态。内存恢复保留捕获时的挂载，不重新挂载：
 `run --restore` 显式提供 `auto` 或
 `manual` 均会被拒绝，应省略此字段。`config --mode restore` 删除此叶字段，保留
-`cache_size` 与 `max_dirty_size`。
+所有缓存及 QoS 配置。
 
 Go SDK 调用方应在 `StartRuntime` 之前通过 `RuntimeSpec.Resources.DiffCOW.Discard`
 选择策略；runtime 在工作负载 Launch 时使用该选择，包括对仍存活的 `runtime_ready`
 预热实例执行 Launch。
 
-两个缓存预算字段都必须是正数且为 4 KiB 的整数倍，满足 `0 < max_dirty_size <= cache_size`。
-省略 `cache_size` 时默认为 32 MiB。省略 `max_dirty_size` 时，根据最终生效的缓存大小推导：
-取缓存的一半，向下取整到 4 KiB 的整数倍，最小为 4 KiB
-（`max(4096, floor(cacheBytes / 2 / 4096) * 4096)`）。两个字段均省略时，包括没有
-`diff_cow` 的旧配置，实际默认值仍为 32 MiB / 16 MiB。只设置 `cache_size: 64MiB` 时，
-脏缓存上限为 32 MiB；缓存大小为 4 KiB 或 12 KiB 时，脏缓存上限均为 4 KiB。
+`cache_size` 必须是正的 4 KiB 整数倍，默认为 32 MiB。十个限制字段最终默认值均为
+`0`，表示不对该维度增加限制。分层配置中，省略某个叶字段会保留前层值，显式 0 会清除
+该叶字段继承的限制；所有 Host 覆盖完成后才解析最终默认值。IOPS 必须是非负整数；带宽
+沿用 size 单位，隐含“每秒”。`50M`、`50MB` 和 `50MiB` 均表示每秒 50 × 1024² 字节，
+不要求按 4 KiB 对齐，但必须能表示为整数个字节。
 
-显式设置 `max_dirty_size: 16MiB` 后，即使后续覆盖缓存大小，该值也保持不变。
-省略的脏缓存上限在所有覆盖完成后推导；应用默认值或加载配置不会将推导值写入源配置。
-显式脏缓存上限不会被截断或重新计算，最终两个值必须满足上述大小关系（因此只设置
-64 MiB 脏缓存上限时，会因默认缓存仅为 32 MiB 而校验失败）。这些是有限的工程初值，
-不是生产 SLA 或最优性能声明。缓存没有零值/无限制、
-关闭开关、数据 I/O 失败后触发的 buffered 重试或可配置的其他写入模式。
+正值 `max_dirty_size` 必须按 4 KiB 对齐且不大于 `cache_size`。正值
+`max_dirty_size_per_disk` 只要求按 4 KiB 对齐并能由 Host 地址空间表示，允许大于整体
+脏页额度或缓存大小；实际使用仍受更小的适用额度限制。脏页额度不创建独立池、不预留
+容量，Clean 页仍共用缓存。在支持节点缓存授额的环境中，实际占用还受当前授额约束，
+增加磁盘不会成倍增加整体预算。脏页额度包含正在构造的预留以及回写中的冻结页，提交
+I/O 不释放额度；覆盖已脏页以及 Data/Zero 转换不重复计费。每个活动可写盘有独立的
+异步回写 worker，共享缓存及全局 fatal 错误语义保持一致。
 
-`max_dirty_size` 是 `cache_size` 的子集，不是额外池或预留分区。没有脏页时 clean 可以使用
-全部缓存。添加磁盘不会乘以预算。在支持缓存预算协议的节点上，`cache_size` 是单沙箱上限，
-启动准入只授予最小缓存预算，随后根据 I/O 按需增长；脏页上限始终为
-`min(当前预算, max_dirty_size)`。空闲 clean 页批量淘汰并真正还页后，才向同一节点
-资源池返还额度。缓存物理页留在 `sandbox-ctl` 所属的 `ctl/` cgroup，
-不修改 Guest 内存预算、balloon 或 `vmm/` 控制。
+读写请求在进入存储前，必须同时满足整体与所属逻辑盘的带宽、IOPS 条件。每个完整
+请求按全部 payload 计费一次，包括缓存命中及远程 base 读取。Overlay root 的 lower
+与 upper 共用一份逻辑盘额度；内部回写、远程重试、FLUSH 与 DISCARD 不再扣除一份
+读写入口额度。它限制的是进入后续链路的需求，不等同于物理盘实测速率，不承诺每盘
+最小份额，也不为其他磁盘预留缓存。
+
+入口允许一个完整请求的初始突发，之后按其完整成本控制后续请求准入；空闲不会积累
+突发额度。超过一秒带宽额度的大请求允许执行，其完整成本会推迟下一个请求。排队中的
+额度等待可被 stop、queue disable 与 snapshot quiesce 打断，恢复后无需 Guest 再次
+kick 即可重试尚未开始的请求；已开始的 I/O 仍须完成排空。策略在创建 runtime 时固定，
+预热实例 Launch 与磁盘 slot 绑定不会重置额度；内存恢复使用目标 Host 合并后的 QoS
+策略，制品不携带该策略。
+
+**升级注意：** 旧版省略脏页额度时取最终缓存的一半，本轮改为不增加额外限制，实际
+脏页内存仍受缓存授额约束。旧版规范化配置中已写出的显式正值继续生效；重新生成配置
+或覆盖 `max_dirty_size: 0` 才会采用新默认。应先升级 `sandbox-ctl` / Sandboxer SDK，
+再使用新 Orchestrator 默认配置：旧版既拒绝新增字段，也拒绝显式的 0 脏页额度，而新版
+默认 Host YAML 会包含这个 0。缓存本身没有无限制大小、关闭开关或 DIO 数据操作失败
+后的 buffered 重试。上述控制是 Host policy，不进入 Sandbox E 与 Snapshot S 的
+portable 身份。
+
+缓存物理页仍计入 `sandbox-ctl` 所属 `ctl/` cgroup，不修改 Guest 内存预算、balloon
+或 `vmm/` 控制。共享物理盘的 runner/builder unit 配置与有条件生效的 DIO 优先级见
+[磁盘 QoS 部署指南](disk-qos-linux_zh.md)。
 
 
 `cache_idle_after` 仅控制 Clean 页闲置状态的统计时间，允许按业务复用周期调优。

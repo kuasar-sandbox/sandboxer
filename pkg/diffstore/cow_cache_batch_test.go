@@ -13,7 +13,7 @@ import (
 
 func TestCOWCacheAggregationDeadlineAndBacklog(t *testing.T) {
 	deadline := make(chan time.Time, 1)
-	waiting := make(chan struct{}, 32)
+	waiting := make(chan struct{}, 256)
 	writes := make(chan struct{}, 32)
 	var timers atomic.Int32
 	cache := testCache(t, 16, 16, cacheHooks{
@@ -44,12 +44,12 @@ func TestCOWCacheAggregationDeadlineAndBacklog(t *testing.T) {
 		t.Fatal("write before deadline")
 	default:
 	}
-	deadline <- time.Time{}
+	close(deadline)
 	// Do not call Drain here: that would mask a fresh wait per singleton.
 	for i := 0; i < 8; i++ {
 		awaitSignal(t, writes)
 	}
-	if timers.Load() != 1 {
+	if timers.Load() != 8 {
 		t.Fatalf("backlog started %d aggregation windows", timers.Load())
 	}
 	if err := cache.Drain(context.Background()); err != nil {
@@ -111,13 +111,14 @@ func TestCOWCacheSpatialNeighboursKeepOldestAndUnselectedAge(t *testing.T) {
 	if err := cache.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	expected := []record{{a, 3, 7}, {b, 4, 1}}
-	for _, want := range expected {
+	expected := map[record]bool{{a, 3, 7}: true, {b, 4, 1}: true}
+	for range 2 {
 		select {
 		case got := <-records:
-			if got != want {
-				t.Fatalf("batch %+v, want %+v", got, want)
+			if !expected[got] {
+				t.Fatalf("unexpected batch %+v", got)
 			}
+			delete(expected, got)
 		default:
 			t.Fatal("missing batch")
 		}
