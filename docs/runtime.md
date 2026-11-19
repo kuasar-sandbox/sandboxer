@@ -516,6 +516,16 @@ Local exec may use only `--path-id`. Supplying both `--sandbox-id build-01-phase
 
 Exec creates a sibling process through the current ctl/MUX. The export/snapshot quiesce gate atomically prevents new exec/forward sessions from entering the unstable window, and closes and joins already admitted sessions. In-flight execs are terminated and do not automatically rerun after `--resume`. Restore/attach first thaws the application cgroup and reopens exec, forwarding, plugins, and app restart, then sends ACK. The host can publish readiness after ACK and its MUX setup without exposing a still-quiescing exec gate. Guest memory reports resume only after ACK and guest MUX setup. Failed thaw sends no ACK; failed ACK does not undo an already completed thaw, and the existing host recovery/terminal-cleanup path remains responsible. Guest `attach` is an idempotent recovery operation. The host immediately retries once when the request/ACK boundary is ambiguous; lifecycle-context cancellation controls the entire dial/ACK sequence.
 
+Exec output reaches EOF before the guest sends `EXIT_STATUS`; there is no fixed
+post-exit drain timeout. A descendant that still owns stdout/stderr can keep exec
+pending after its direct child exits, until EOF or client cancellation. The host
+waits for MUX completion and drains buffered output before returning. An output
+copy error, an owned output file's Close error, or a MUX transport/protocol error
+is reported and prevents exit 0; an already nonzero command exit code is
+preserved. Normal stdin cancellation/reset during cleanup is not an output
+failure. This completion contract applies to exec; the primary application's
+run/attach lifecycle retains its existing cleanup policy.
+
 Remote authorized exec uses `pkg/ctl.ServeExecTunnel(ctx, options)` in this fixed order:
 
 ```text
