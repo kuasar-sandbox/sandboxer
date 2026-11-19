@@ -124,8 +124,9 @@ type Handler struct {
 	uffds   []*os.File
 	uffdsMu sync.Mutex
 
-	addrMap *AddressMap
-	state   *PageStateMap
+	addrMap   *AddressMap
+	state     *PageStateMap
+	pageTrace *pageTrace
 
 	epfd int
 
@@ -326,6 +327,7 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		registrationChanged: make(chan struct{}),
 		addrMap:             addrMap,
 		state:               state,
+		pageTrace:           newPageTrace(os.Getenv(pageTraceEnv), uint64(cfg.Size)),
 		epfd:                epfd,
 		removeQ:             make(chan removeReq, 4096),
 		logf:                logf,
@@ -458,6 +460,9 @@ func (h *Handler) Close() error {
 		close(h.stop)
 		h.wg.Wait()
 		h.users.Wait()
+		if h.pageTrace != nil {
+			h.pageTrace.emit(h.logf)
+		}
 		h.uffdsMu.Lock()
 		defer h.uffdsMu.Unlock()
 		for _, f := range h.uffds {
@@ -669,6 +674,9 @@ func (h *Handler) handleRemoveLocked(startVA, endVA uint64, fromFD int) {
 		}
 		if h.cfg.Dirty != nil {
 			_ = h.cfg.Dirty.Mark(startOff, length)
+		}
+		if h.pageTrace != nil {
+			h.pageTrace.record("remove", startOff, length, h.state.Get(h.pageTrace.page/PageSize), nil)
 		}
 		h.state.SetRange(startOff/PageSize, (startOff+length)/PageSize, StateReleased)
 		select {

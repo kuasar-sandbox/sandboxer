@@ -75,6 +75,9 @@ func (h *Handler) EnsureLoaded(caller context.Context, offset, length uint64) er
 			}
 		}
 		if loaded > 0 {
+			if h.pageTrace != nil {
+				h.pageTrace.record("load-hit", off, loaded*PageSize, StateLoaded, nil)
+			}
 			off += loaded * PageSize
 			continue
 		}
@@ -131,6 +134,9 @@ func (h *Handler) loadPage(ctx context.Context, off uint64, page []byte) error {
 			return fmt.Errorf("uffd: no owning registration at 0x%x", off)
 		}
 		if state == StateLoaded {
+			if h.pageTrace != nil {
+				h.pageTrace.record("load-hit", off, PageSize, state, nil)
+			}
 			return nil
 		}
 		clear(page)
@@ -153,6 +159,9 @@ func (h *Handler) loadPage(ctx context.Context, off uint64, page []byte) error {
 				}
 				if run.End() != off+PageSize {
 					return readerr.Mark(fmt.Errorf("uffd: source does not cover full page"), false)
+				}
+				if h.pageTrace != nil && off == h.pageTrace.page {
+					h.traceSource(run)
 				}
 				if run.Kind() != sparse.Data {
 					clear(page)

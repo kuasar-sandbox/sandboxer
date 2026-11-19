@@ -41,6 +41,9 @@ func (h *Handler) seedRegion(fd int) error {
 			if err := h.cfg.Dirty.Mark(uint64(data), min(uint64(hole), end)-uint64(data)); err != nil {
 				return err
 			}
+			if h.pageTrace != nil {
+				h.pageTrace.record("seed", uint64(data), min(uint64(hole), end)-uint64(data), h.state.Get(h.pageTrace.page/PageSize), nil)
+			}
 			off = uint64(hole)
 		}
 	}
@@ -63,6 +66,9 @@ func (h *Handler) copyCleanLocked(fd int, dst uint64, data []byte) (int64, error
 	// Ordinary installation restores the fixed baseline, not a new write.
 	// CPU, CH and Go writers supply D; released pages remain covered by R.
 	n, err := h.ops.copy(fd, dst, data)
+	if h.pageTrace != nil {
+		h.traceIO("copy", dst, uint64(len(data)), data, n, err)
+	}
 	if errors.Is(err, unix.EEXIST) {
 		if markErr := h.markInstall(fd, dst, uint64(len(data))); markErr != nil {
 			return n, markErr
@@ -72,6 +78,9 @@ func (h *Handler) copyCleanLocked(fd int, dst uint64, data []byte) (int64, error
 }
 func (h *Handler) zeroCleanLocked(fd int, dst, length uint64) (int64, error, bool) {
 	n, err := h.ops.zeropage(fd, dst, length)
+	if h.pageTrace != nil {
+		h.traceIO("zero", dst, length, nil, n, err)
+	}
 	if n == 0 && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP)) {
 		n, err = h.copyCleanLocked(fd, dst, zeroScratch[:length])
 		h.stats.copies.Add(1)
