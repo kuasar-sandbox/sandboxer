@@ -275,6 +275,11 @@ it neither closes them nor establishes full identity. Generic pure-block binding
 does not acquire a filesystem-format restriction; ext4 mount paths retain their
 separate startup preflight.
 
+An owner abandoning an uncommitted new writer before deleting its path uses
+`CloseDiscarding`: it cancels unfinished template work and performs the same
+reader join and resource release. It neither removes the path nor closes the
+borrowed base. Committed retained writers continue to use ordinary `Close`.
+
 `sandbox.PrepareDiffWithStorage` accepts the caller's context, actual base,
 `ProcessStorage` and named locations for every template kind. The older
 `PrepareDiff(path, rawURI, baseSize)` remains a local raw-only compatibility

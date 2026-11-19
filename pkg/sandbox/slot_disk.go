@@ -359,7 +359,9 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 	}
 	defer func() {
 		if retErr != nil {
-			_ = cow.Close()
+			// This new writer was never committed to the slot. Cancel unfinished
+			// template work before removing it, even for checkpoint storage.
+			_ = cow.CloseDiscarding()
 			_ = os.Remove(plan.DiffPath)
 		}
 	}()

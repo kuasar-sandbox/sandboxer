@@ -215,6 +215,10 @@ disk, err := diffstore.OpenDisk(path, base, init,
 `ValidateDiffTemplateExt4` 只借用 source 与 base 检查有效视图，既不关闭也不承诺完整身份。
 通用纯块盘绑定不因模板接入而增加文件系统格式要求；挂载 ext4 的启动路径继续单独预检。
 
+owner 决定弃置未提交的新 writer 并删除其路径前，使用 `CloseDiscarding`：取消未完成的
+模板工作，并执行相同的 reader join 和资源释放。它不删除路径，也不关闭借用的 base。
+已经提交且需要保留的 writer 继续使用普通 `Close`。
+
 `sandbox.PrepareDiffWithStorage` 接收调用者的 context、实际 base、`ProcessStorage`
 及命名位置，支持所有模板类型。旧 `PrepareDiff(path, rawURI, baseSize)` 保留为仅支持
 本地 raw 的兼容入口，不获取密钥或 Store。`OpenDiskV1Source` 对 raw 文件继续返回展开的

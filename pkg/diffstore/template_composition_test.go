@@ -364,3 +364,41 @@ func TestTemplateReadRetryDisposableClose(t *testing.T) {
 		})
 	}
 }
+
+func TestTemplateRetainedReadRetryExplicitDiscardClose(t *testing.T) {
+	for _, checkpoint := range []bool{false, true} {
+		t.Run(fmt.Sprint(checkpoint), func(t *testing.T) {
+			reads := &retryReadTemplate{TemplateSource: newMemoryTemplate(t, cowBlockSize), alwaysFail: true, started: make(chan struct{})}
+			source := &observedTemplate{TemplateSource: reads}
+			dir := t.TempDir()
+			// This writer would normally finish materialization on Close. Its
+			// owner can still abandon a transaction before publishing the bind.
+			disk, err := OpenDisk(filepath.Join(dir, "active"), nil, DiffInit{Template: func() (TemplateSource, error) { return source, nil }}, templateOptions(checkpoint)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			awaitSignal(t, reads.started)
+			closed := make(chan error, 1)
+			go func() { closed <- disk.CloseDiscarding() }()
+			select {
+			case err := <-closed:
+				if err != nil {
+					t.Fatalf("explicit discard failed: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				// Let a broken retained-close implementation release its worker
+				// before failing this regression.
+				disk.materialCancel()
+				<-closed
+				t.Fatal("explicit discard waited for the abandoned template to recover")
+			}
+			if err := disk.Close(); err != nil {
+				t.Fatalf("ordinary Close did not reuse completed shutdown: %v", err)
+			}
+			if source.closes.Load() != 1 || source.verifies.Load() != 0 {
+				t.Fatalf("closes=%d verifies=%d", source.closes.Load(), source.verifies.Load())
+			}
+			assertNoFreshResources(t, dir)
+		})
+	}
+}

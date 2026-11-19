@@ -916,11 +916,26 @@ func (c *Disk) end(cancel func()) {
 // and drains accepted writes before releasing plaintext and the FD. Already
 // published disks get no additional fsync. Base is closed by its owner.
 func (c *Disk) Close() error {
+	return c.close(false)
+}
+
+// CloseDiscarding closes a writer that its owner has decided to abandon. It
+// cancels unfinished template materialization, joins format initialization and
+// admitted operations, and otherwise releases resources in the same order as
+// Close. It still drains accepted writes and does not remove an already
+// published file; the owner remains responsible for removing its abandoned
+// writer. Close and CloseDiscarding share one shutdown: the first call chooses
+// its disposition.
+func (c *Disk) CloseDiscarding() error {
+	return c.close(true)
+}
+
+func (c *Disk) close(discard bool) error {
 	c.closeOnce.Do(func() {
 		// Stop frontend admission first. The materializer does not enter through
 		// begin(), so a retained diff can still finish drain/sync/publication
 		// after all accepted frontend operations have crossed this barrier.
-		if c.materialCancel != nil && c.discardOnClose {
+		if c.materialCancel != nil && (discard || c.discardOnClose) {
 			c.materialMu.Lock()
 			c.materialDiscard = true
 			c.materialCancel()
