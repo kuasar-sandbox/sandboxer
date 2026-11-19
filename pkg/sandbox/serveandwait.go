@@ -24,6 +24,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/shmemtrace"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -382,6 +383,10 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		return -1, fmt.Errorf("memfd create: %w", err)
 	}
 	defer memfd.Close()
+	allocationTrace := shmemtrace.ArmShmemAllocationTraceFromEnv(memfd.FD(), memfd.Size(), logf)
+	// The opt-in allocation observer never touches RAM or changes its VMAs.
+	// It schedules closure after 30 seconds; early exit drains it before memfd close.
+	defer allocationTrace.Close()
 	backendGuard := uffd.ArmBackendPageGuardFromEnv(memfd.FD(), memfd.Addr(), memfd.Size(), logf)
 	// Later defers drain every backend consumer before the guard is removed;
 	// the earlier memfd defer then unmaps the guarded address last.
