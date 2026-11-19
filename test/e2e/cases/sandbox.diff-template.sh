@@ -92,7 +92,7 @@ REFS[manifest]="manifest://$MANIFEST_KEY_HEX"
 REFS[mkfs]="mkfs://ext4?size=512MiB"
 run_source() {
     local mode=$1 phase=$2
-    cat >"$WORK/$mode.yaml" <<EOF
+    cat >"$WORK/guest-$mode.yaml" <<EOF
 resources:
   capacity: { cpu: 1, memory: 512MiB }
   allocatable: { cpu: 1, memory: 512MiB }
@@ -120,7 +120,7 @@ EOF
     echo "Running template source $mode/$phase" >&2
     local status=0
     timeout -k 10s 90 "$BIN/sandbox-ctl" run \
-        --config "$WORK/$mode.yaml" --manifest-config "$WORK/manifest.yaml" \
+        --config "$WORK/guest-$mode.yaml" --manifest-config "$WORK/manifest.yaml" \
         --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/run" \
         --base-root "$WORK/base" --stdout-to "$stdout" >"$log" 2>&1 || status=$?
     if [ "$status" -ne 0 ]; then
