@@ -147,6 +147,10 @@ func (s *Server) processQueue(q *virtq) error {
 			}
 			return err
 		}
+		var notifyErr *ioAdmissionNotifyError
+		if errors.As(err, &notifyErr) {
+			return notifyErr.err
+		}
 		if readretry.IsTerminal(err) {
 			return err
 		}
@@ -159,6 +163,7 @@ func (s *Server) processQueue(q *virtq) error {
 		if err := s.publishUsed(q, descIdx, uint32(written)); err != nil {
 			return err
 		}
+		q.notifyPending = true
 		q.baseIdx++
 	}
 
@@ -231,6 +236,9 @@ func (s *Server) publishUsed(q *virtq, descIdx uint16, length uint32) error {
 func (s *Server) notifyCall(q *virtq) error {
 	val := uint64(1)
 	_, err := syscall.Write(q.callFd, (*[8]byte)(unsafe.Pointer(&val))[:])
+	if err == nil {
+		q.notifyPending = false
+	}
 	return err
 }
 
@@ -387,7 +395,8 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 			}
 		}
 		if err := s.admitIO(q, hdr.Type == BlkTypeOut, size); err != nil {
-			if errors.Is(err, errIOAdmissionYield) {
+			var notifyErr *ioAdmissionNotifyError
+			if errors.Is(err, errIOAdmissionYield) || errors.As(err, &notifyErr) {
 				return 0, err
 			}
 			return 0, readretry.Terminal(err)

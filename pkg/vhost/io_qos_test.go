@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
+	"golang.org/x/sys/unix"
 )
 
 func fakeIOClock(c *IOController) (*atomic.Int64, time.Time) {
@@ -352,5 +353,104 @@ func TestQoSCanceledAdmissionDoesNotSpendQuota(t *testing.T) {
 	}
 	if c.global[0][1].debt != 0 || d.disk[0][1].debt != 0 {
 		t.Fatal("canceled request spent quota")
+	}
+}
+
+func appendQoSReadChain(f *windowFixture) *byte {
+	mem := f.server.memTable.regions[0].mmapBytes
+	const header, payload, status = 3600, 3700, 4212
+	le := binary.LittleEndian
+	le.PutUint32(mem[header:], BlkTypeIn)
+	le.PutUint64(mem[header+8:], readSector)
+	mem[status] = sentinel
+	le.PutUint64(mem[10*16:], header)
+	le.PutUint32(mem[10*16+8:], 16)
+	le.PutUint16(mem[10*16+12:], descFlagNext)
+	le.PutUint16(mem[10*16+14:], 11)
+	le.PutUint64(mem[11*16:], payload)
+	le.PutUint32(mem[11*16+8:], 513) // 512-byte payload followed by status
+	le.PutUint16(mem[11*16+12:], descFlagWrite)
+	le.PutUint16(mem[128*16+2:], 2)
+	le.PutUint16(mem[128*16+6:], 10)
+	return &mem[status]
+}
+
+func TestQoSNotifiesCompletedRequestsBeforeWaiting(t *testing.T) {
+	f := newWindowFixture(t, []int{4096}, true)
+	secondStatus := appendQoSReadChain(f)
+	if err := unix.SetNonblock(f.queue.callFd, true); err != nil {
+		t.Fatal(err)
+	}
+	c := NewIOController(IOLimits{ReadIOPS: 1}, IOLimits{})
+	ns, _ := fakeIOClock(c)
+	f.server.SetIOBudget(c.NewDisk())
+	waiting := make(chan struct{})
+	var once sync.Once
+	c.waiting = func() { once.Do(func() { close(waiting) }) }
+	done := make(chan error, 1)
+	go func() { done <- f.server.runPending(f.queue) }()
+	awaitSignal(t, waiting, "second request did not wait")
+	// Check before any pause/yield: those paths also notify completed entries
+	// and would otherwise hide a notification delayed by the rate wait.
+	var event [8]byte
+	if n, err := unix.Read(f.queue.callFd, event[:]); err != nil || n != 8 || binary.LittleEndian.Uint64(event[:]) != 1 {
+		t.Fatalf("completed first request was not notified: n=%d err=%v event=%v", n, err, event)
+	}
+	f.check(t, BlkStatusOK, 4096, false)
+	if *secondStatus != sentinel || len(f.backend.calls) != 1 {
+		t.Fatal("waiting second request started or completed early")
+	}
+	f.server.Quiesce()
+	ns.Store(int64(time.Second))
+	f.server.Resume()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second request did not resume")
+	}
+	if f.queue.baseIdx != 2 || binary.LittleEndian.Uint16(f.used[2:]) != 2 || *secondStatus != BlkStatusOK || len(f.backend.calls) != 2 {
+		t.Fatal("second request did not complete exactly once")
+	}
+}
+
+func TestQoSAdmissionRetainsBatchNotificationsWhenReady(t *testing.T) {
+	f := newWindowFixture(t, []int{4096}, true)
+	appendQoSReadChain(f)
+	c := NewIOController(IOLimits{ReadIOPS: 1}, IOLimits{})
+	ns, _ := fakeIOClock(c)
+	f.server.SetIOBudget(c.NewDisk())
+	f.backend.fault = func(p []byte, off int64) (int, error) {
+		ns.Add(int64(time.Second))
+		return f.backend.memBackend.ReadAt(p, off)
+	}
+	if err := f.server.processQueue(f.queue); err != nil {
+		t.Fatal(err)
+	}
+	var event [8]byte
+	if n, err := unix.Read(f.queue.callFd, event[:]); err != nil || n != 8 || binary.LittleEndian.Uint64(event[:]) != 1 {
+		t.Fatalf("ready requests lost batch notification: n=%d err=%v event=%v", n, err, event)
+	}
+}
+
+func TestQoSNotifyFailureDoesNotAckWaitingRequestOrBecomeStorageFatal(t *testing.T) {
+	f := newWindowFixture(t, []int{4096}, true)
+	secondStatus := appendQoSReadChain(f)
+	_ = unix.Close(f.queue.callFd)
+	f.queue.callFd = -1
+	c := NewIOController(IOLimits{ReadIOPS: 1}, IOLimits{})
+	fakeIOClock(c)
+	f.server.SetIOBudget(c.NewDisk())
+	fatal := false
+	f.server.SetReadFatal(func(error) { fatal = true })
+	err := f.server.runPending(f.queue)
+	if !errors.Is(err, unix.EBADF) || readretry.IsTerminal(err) || fatal {
+		t.Fatalf("notification failure changed storage semantics: %v fatal=%t", err, fatal)
+	}
+	f.check(t, BlkStatusOK, 4096, false)
+	if *secondStatus != sentinel || len(f.backend.calls) != 1 || c.global[0][1].debt != 1 {
+		t.Fatal("notification failure acknowledged or charged the waiting request")
 	}
 }

@@ -11,6 +11,13 @@ import (
 
 var errIOAdmissionYield = errors.New("vhost: retry unstarted request after admission interruption")
 
+// A failed completion notification must leave the waiting request unstarted,
+// but is not a terminal storage error or a reason to ACK that request.
+type ioAdmissionNotifyError struct{ err error }
+
+func (e *ioAdmissionNotifyError) Error() string { return e.err.Error() }
+func (e *ioAdmissionNotifyError) Unwrap() error { return e.err }
+
 // IOLimits bounds admitted logical requests. Bandwidth is in bytes/second;
 // IOPS counts complete read or write requests. Zero leaves a limit disabled.
 type IOLimits struct {
@@ -138,11 +145,17 @@ func (d *DiskIOBudget) try(ctx context.Context, write bool, size uint64, a, b <-
 	return 0, nil
 }
 
-func (d *DiskIOBudget) wait(ctx context.Context, write bool, size uint64, a, b <-chan struct{}) error {
+func (d *DiskIOBudget) wait(ctx context.Context, write bool, size uint64, a, b <-chan struct{}, beforeWait func() error) error {
 	for {
 		delay, err := d.try(ctx, write, size, a, b)
 		if err != nil || delay == 0 {
 			return err
+		}
+		if beforeWait != nil {
+			if err := beforeWait(); err != nil {
+				return err
+			}
+			beforeWait = nil
 		}
 		if d.owner.waiting != nil {
 			d.owner.waiting()
@@ -218,5 +231,15 @@ func (s *Server) admitIO(q *virtq, write bool, size uint64) error {
 	if paused || disabled {
 		return errIOAdmissionYield
 	}
-	return s.ioBudget.wait(q.readContext(), write, size, a, b)
+	return s.ioBudget.wait(q.readContext(), write, size, a, b, func() error {
+		// Rate waits may last arbitrarily longer than a normal batch. Tell
+		// the guest about completed earlier chains before waiting, without
+		// turning every admitted request into a separate interrupt.
+		if q.notifyPending {
+			if err := s.notifyCall(q); err != nil {
+				return &ioAdmissionNotifyError{err}
+			}
+		}
+		return nil
+	})
 }

@@ -113,16 +113,17 @@ type Server struct {
 
 // virtq holds per-virtq state set up by SET_VRING_*.
 type virtq struct {
-	num         uint32
-	descAddr    uint64 // GPA
-	availAddr   uint64 // GPA
-	usedAddr    uint64 // GPA
-	baseIdx     uint16
-	kickFd      int
-	callFd      int
-	enabled     bool
-	kickArmed   bool   // GET_VRING_BASE disarms implicit start until the next KICK
-	readScratch []byte // private to the queue worker
+	num           uint32
+	descAddr      uint64 // GPA
+	availAddr     uint64 // GPA
+	usedAddr      uint64 // GPA
+	baseIdx       uint16
+	kickFd        int
+	callFd        int
+	enabled       bool
+	kickArmed     bool   // GET_VRING_BASE disarms implicit start until the next KICK
+	readScratch   []byte // private to the queue worker
+	notifyPending bool   // used entries published since the last successful call notification
 
 	stop       chan struct{}
 	done       chan struct{}
