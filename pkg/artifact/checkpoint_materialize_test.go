@@ -363,7 +363,7 @@ func TestCleanupRetiredDIFFKeepsRetryUntilExistingReaderCloses(t *testing.T) {
 	storage, _ := NewProcessStorage(nil)
 	defer storage.Close()
 	current := Checkpoint{Directory: f.dir, SandboxID: "fixture", SandboxRef: f.ref}
-	if err := storage.CleanupCheckpoint(ctx, current); !errors.Is(err, diffstore.ErrBusy) {
+	if err := storage.CleanupCheckpoint(ctx, current); !errors.Is(err, diffstore.ErrBusy) || errors.Is(err, ErrCheckpointMemoryReadersBusy) {
 		t.Fatalf("retire lost retry ownership: %v", err)
 	}
 	b := make([]byte, 4096)

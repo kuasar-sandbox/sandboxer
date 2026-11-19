@@ -870,15 +870,25 @@ the stored pair, without requiring an E alias. Cleanup unlinks recognized aliase
 symlinks or recursively removes the directory; directory-fd operations keep
 unlink confined if paths race.
 
-A committed Pause remains successful if cleanup fails. The last durable RunDir
-ownership marker remains until checkpoint cleanup and ordinary paused cleanup
-succeed. The existing worker retries with a freshly loaded current source under
-the SID lifecycle lock, including after restart. Active or detached exports keep
+A committed Pause remains successful if cleanup fails. If a memory reader pin
+prevents the exclusive collection lock, `CleanupCheckpoint` returns
+`artifact.ErrCheckpointMemoryReadersBusy` before changing aliases or deleting
+anything. The managed owner may defer this collection and finish ordinary paused
+runtime cleanup without waiting for the memory save. The holder-retirement worker
+retries collection after memory release and runner fencing while the sandbox is
+paused, including when its RunDir ownership has already been cleared.
+
+For other cleanup failures, the last durable RunDir ownership marker remains until
+checkpoint cleanup and ordinary paused cleanup succeed. The existing worker
+retries with a freshly loaded current source under the SID lifecycle lock,
+including after restart. Active or detached exports keep
 their read fence; cleanup never waits for an export while holding the lock it
 needs. Resume/Wake/Exec obey the existing pending-cleanup admission contract.
 Missing candidates count as finished; permission, I/O, and identity errors retain
-retry ownership. Ordinary Kill and terminal BuildBaseDir deletion retain their
-existing finalizers. Shared/external artifacts are never reclaimed by this step.
+retry ownership. The deferred-collection result does not authorize hard deletion
+or release of a memory holder. Ordinary Kill and terminal BuildBaseDir deletion
+retain their existing finalizers. Shared/external artifacts are never reclaimed
+by this step.
 
 <a id="artifact-publication"></a>
 

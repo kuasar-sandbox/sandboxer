@@ -279,7 +279,7 @@ func TestMemoryCheckpointKeepGraphAndReaderPin(t *testing.T) {
 	if err := os.WriteFile(garbage, []byte("obsolete"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.storage.CleanupCheckpoint(context.Background(), c); !errors.Is(err, unix.EWOULDBLOCK) {
+	if err := fixture.storage.CleanupCheckpoint(context.Background(), c); !errors.Is(err, ErrCheckpointMemoryReadersBusy) || !errors.Is(err, unix.EWOULDBLOCK) {
 		t.Fatalf("cleanup while memory reader is pinned: %v", err)
 	}
 	if _, err := os.Stat(garbage); err != nil {

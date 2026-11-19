@@ -525,6 +525,8 @@ RunDir/owned diff，不会把 output 当作运行目录删除。
 RAM FD，再确认释放。新 VM 始终使用自己的可写 memfd。临时 socket 位于
 `RunDir/memory-holders/<memoryID>/<epoch>/m.sock`，checkpoint 中的可变记录定位
 准确的生产者。正常运行目录清理保留这一独立命名空间。
+内存读者仍持有 checkpoint pin 时，管理端延期垃圾回收并完成普通运行资源清理，
+不等待保存，也不放宽读者保护；详见[选择性清理](artifacts_zh.md#checkpoint-history)。
 
 恢复后的 Runtime 按 SandboxID 继承上一轮保存义务，包括从较早 checkpoint 恢复的
 情况。再次命名 pause 默认在入口等待，等待期间不冻结、不离开 running。CLI 可用

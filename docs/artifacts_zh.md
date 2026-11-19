@@ -785,12 +785,19 @@ E-only 也会删除旧 S 别名。Snapshot 捕获只提交 S 别名，E 身份�
 存在 E 别名。清理只 unlink 可识别别名本身，不跟随链接，不递归删除目录；dirfd 操作保证路径发生竞态时
 unlink 仍被限制在原目录内。
 
-新来源已提交后，即使清理失败，Pause 仍成功。最后一个持久 RunDir ownership 标记保留到
-checkpoint 清理和既有 paused 收尾均成功。既有 worker 在 SID lifecycle lock 下重新读取当前
-来源重试，重启后也如此。active 或 detached export 的读取 fence 在其完成前持续有效；清理
+新来源已提交后，即使清理失败，Pause 仍成功。内存读者持有 pin、无法取得回收独占锁时，
+`CleanupCheckpoint` 在修改别名或删除任何内容之前返回
+`artifact.ErrCheckpointMemoryReadersBusy`。管理端可延期这次回收，继续完成普通 paused
+运行资源清理，无需等待内存保存。holder 退役 worker 在内存释放、runner fence 完成且
+沙箱仍为 paused 时重试回收，包括 RunDir ownership 已清空的情况。
+
+其他清理失败仍保留最后一个持久 RunDir ownership 标记，直到 checkpoint 清理和既有
+paused 收尾均成功。既有 worker 在 SID lifecycle lock 下重新读取当前来源重试，重启后
+也如此。active 或 detached export 的读取 fence 在其完成前持续有效；清理
 不会持锁等待需要同一锁完成的 export。Resume/Wake/Exec 遵守既有 pending-cleanup admission
-合同。候选已不存在视为完成；权限、I/O 和身份错误继续保留重试责任。普通 Kill 和 BuildBaseDir
-终态删除仍由原 finalizer 负责；此步骤不回收任何共享或外部制品。
+合同。候选已不存在视为完成；权限、I/O 和身份错误继续保留重试责任。延期回收不授权
+硬删除或释放内存 holder。普通 Kill 和 BuildBaseDir 终态删除仍由原 finalizer 负责；
+此步骤不回收任何共享或外部制品。
 
 <a id="artifact-publication"></a>
 

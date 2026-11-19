@@ -590,6 +590,9 @@ its RAM descriptor before acknowledging release. The new VM always has its own
 writable memfd. The socket lives under
 `RunDir/memory-holders/<memoryID>/<epoch>/m.sock`; a mutable checkpoint record
 locates that exact producer. Normal runtime cleanup preserves this namespace.
+If memory readers still pin the checkpoint, managed cleanup defers its garbage
+collection and completes ordinary runtime cleanup. This does not wait for the
+save or weaken reader protection; see [selective cleanup](artifacts.md#checkpoint-history).
 
 A resumed runtime inherits the previous save obligation by SandboxID, even when
 restoring an older checkpoint. Another named pause waits for that obligation by

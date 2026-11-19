@@ -14,7 +14,43 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
+	"golang.org/x/sys/unix"
 )
+
+func TestCleanupCheckpointMemoryLockFailureDoesNotDefer(t *testing.T) {
+	dir := t.TempDir()
+	c, obsolete, _ := checkpointFixture(t, dir)
+	if err := os.Symlink(filepath.Join(t.TempDir(), "lock"), filepath.Join(dir, ".memory-readers.lock")); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	err = storage.CleanupCheckpoint(context.Background(), c)
+	if !errors.Is(err, unix.ELOOP) || errors.Is(err, ErrCheckpointMemoryReadersBusy) {
+		t.Fatalf("unsafe lock file was classified as deferred collection: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, obsolete)); err != nil {
+		t.Fatalf("failed lock deleted an artifact: %v", err)
+	}
+}
+
+func TestCheckpointCleanupBusyDoesNotHideCloseFailure(t *testing.T) {
+	busy := errors.Join(ErrCheckpointMemoryReadersBusy, unix.EWOULDBLOCK)
+	if err := checkpointCleanupCloseResult(busy, nil); !errors.Is(err, ErrCheckpointMemoryReadersBusy) || !errors.Is(err, unix.EWOULDBLOCK) {
+		t.Fatalf("pure lock conflict lost its classification: %v", err)
+	}
+	closeErr := errors.New("injected close failure")
+	err := checkpointCleanupCloseResult(busy, closeErr)
+	if errors.Is(err, ErrCheckpointMemoryReadersBusy) || !errors.Is(err, closeErr) {
+		t.Fatalf("close failure was classified as deferred collection: %v", err)
+	}
+	if !strings.Contains(err.Error(), ErrCheckpointMemoryReadersBusy.Error()) {
+		t.Fatalf("close failure lost lock-conflict context: %v", err)
+	}
+}
 
 func checkpointFixture(t *testing.T, dir string) (Checkpoint, string, []string) {
 	t.Helper()
