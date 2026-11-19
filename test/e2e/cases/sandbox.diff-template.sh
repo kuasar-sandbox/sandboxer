@@ -117,10 +117,18 @@ launch:
 EOF
     local log="$OUT/$mode-$phase.log" stdout="$OUT/$mode-$phase.stdout"
     : >"$stdout"
+    echo "Running template source $mode/$phase" >&2
+    local status=0
     timeout -k 10s 90 "$BIN/sandbox-ctl" run \
         --config "$WORK/$mode.yaml" --manifest-config "$WORK/manifest.yaml" \
         --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/run" \
-        --base-root "$WORK/base" --stdout-to "$stdout" >"$log" 2>&1
+        --base-root "$WORK/base" --stdout-to "$stdout" >"$log" 2>&1 || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "Guest template source $mode/$phase exited with status $status" >&2
+        tail -60 "$stdout" >&2 || true
+        tail -120 "$log" >&2 || true
+        return "$status"
+    fi
     grep -qx "PYBOOT-OK $mode $phase" "$stdout" || {
         cat "$stdout" >&2 || true
         tail -60 "$log" >&2 || true
