@@ -461,6 +461,7 @@ func (h *Handler) Close() error {
 		h.wg.Wait()
 		h.users.Wait()
 		if h.pageTrace != nil {
+			h.traceBacking("close")
 			h.pageTrace.emit(h.logf)
 		}
 		h.uffdsMu.Lock()
@@ -609,7 +610,11 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 // that acknowledges a non-pagefault event and allows CH to resume.
 func (h *Handler) dispatchRelease(msg *uffdMsg, fd int) {
 	rm := (*uffdMsgRemove)(unsafe.Pointer(&msg.Arg[0]))
-	h.handleRemoveLocked(rm.Start, rm.End, fd)
+	kernelEvent := "remove"
+	if msg.Event == uffdEventUnmap {
+		kernelEvent = "unmap"
+	}
+	h.handleReleaseLocked(rm.Start, rm.End, fd, kernelEvent)
 	if msg.Event == uffdEventUnmap {
 		h.captureError = fmt.Errorf("uffd: UNMAP invalidated capture registration")
 		h.addrMap.invalidate(fd, rm.Start, rm.End)
@@ -646,6 +651,10 @@ func (h *Handler) handleRemove(startVA, endVA uint64, fromFD int) {
 }
 
 func (h *Handler) handleRemoveLocked(startVA, endVA uint64, fromFD int) {
+	h.handleReleaseLocked(startVA, endVA, fromFD, "remove")
+}
+
+func (h *Handler) handleReleaseLocked(startVA, endVA uint64, fromFD int, kernelEvent string) {
 	if endVA <= startVA || startVA%PageSize != 0 || endVA%PageSize != 0 {
 		h.captureError = fmt.Errorf("uffd: invalid release range")
 		return
@@ -676,7 +685,9 @@ func (h *Handler) handleRemoveLocked(startVA, endVA uint64, fromFD int) {
 			_ = h.cfg.Dirty.Mark(startOff, length)
 		}
 		if h.pageTrace != nil {
-			h.pageTrace.record("remove", startOff, length, h.state.Get(h.pageTrace.page/PageSize), nil)
+			h.pageTrace.record("remove", startOff, length, h.state.Get(h.pageTrace.page/PageSize), func(r *pageTraceRecord) {
+				r.KernelEvent = kernelEvent
+			})
 		}
 		h.state.SetRange(startOff/PageSize, (startOff+length)/PageSize, StateReleased)
 		select {

@@ -5,8 +5,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"golang.org/x/sys/unix"
@@ -21,28 +24,66 @@ const pageTraceLimit = 32
 const pageTracePrefix = "uffd-page-trace "
 
 type pageTraceRecord struct {
-	Version  int     `json:"v"`
-	Page     uint64  `json:"page"`
-	Sequence uint64  `json:"seq"`
-	Event    string  `json:"event"`
-	Start    *uint64 `json:"start,omitempty"`
-	Length   *uint64 `json:"length,omitempty"`
-	State    string  `json:"state,omitempty"`
-	Kind     string  `json:"kind,omitempty"`
-	SHA256   string  `json:"sha256,omitempty"`
-	NonFF    *int    `json:"non_ff,omitempty"`
-	Done     *int64  `json:"done,omitempty"`
-	Errno    *int    `json:"errno,omitempty"`
-	Recorded *int    `json:"recorded,omitempty"`
-	Dropped  *uint64 `json:"dropped,omitempty"`
+	Version     int     `json:"v"`
+	Page        uint64  `json:"page"`
+	Sequence    uint64  `json:"seq"`
+	Event       string  `json:"event"`
+	Elapsed     uint64  `json:"elapsed_ns"`
+	PID         int     `json:"pid"`
+	Handler     uint64  `json:"handler"`
+	Start       *uint64 `json:"start,omitempty"`
+	Length      *uint64 `json:"length,omitempty"`
+	State       string  `json:"state,omitempty"`
+	Kind        string  `json:"kind,omitempty"`
+	SHA256      string  `json:"sha256,omitempty"`
+	NonFF       *int    `json:"non_ff,omitempty"`
+	Done        *int64  `json:"done,omitempty"`
+	Errno       *int    `json:"errno,omitempty"`
+	Recorded    *int    `json:"recorded,omitempty"`
+	Dropped     *uint64 `json:"dropped,omitempty"`
+	KernelEvent string  `json:"kernel_event,omitempty"`
+
+	UffdFD        *int    `json:"uffd_fd,omitempty"`
+	BackendVA     *uint64 `json:"backend_va,omitempty"`
+	MemfdFD       *int    `json:"memfd_fd,omitempty"`
+	MemfdDev      *uint64 `json:"memfd_dev,omitempty"`
+	MemfdIno      *uint64 `json:"memfd_ino,omitempty"`
+	MemfdSize     *uint64 `json:"memfd_size,omitempty"`
+	KernelRelease *string `json:"kernel_release,omitempty"`
+	CHVA          *uint64 `json:"ch_va,omitempty"`
+	CHPID         *int    `json:"ch_pid,omitempty"`
+	PeerErrno     *int    `json:"peer_errno,omitempty"`
+	MemfdErrno    *int    `json:"memfd_errno,omitempty"`
+	KernelErrno   *int    `json:"kernel_errno,omitempty"`
+	MapsErrno     *int    `json:"maps_errno,omitempty"`
+	MapsVA        *uint64 `json:"maps_va,omitempty"`
+	MapsSize      *uint64 `json:"maps_size,omitempty"`
+	MapsOffset    *uint64 `json:"maps_offset,omitempty"`
+	MapsDev       *uint64 `json:"maps_dev,omitempty"`
+	MapsIno       *uint64 `json:"maps_ino,omitempty"`
+	MapsMatch     *bool   `json:"maps_match,omitempty"`
+
+	Phase          string `json:"phase,omitempty"`
+	Resident       *bool  `json:"resident,omitempty"`
+	MincoreErrno   *int   `json:"mincore_errno,omitempty"`
+	ExtentData     *bool  `json:"extent_data,omitempty"`
+	SeekDataOffset *int64 `json:"seek_data_offset,omitempty"`
+	SeekHoleOffset *int64 `json:"seek_hole_offset,omitempty"`
+	SeekDataErrno  *int   `json:"seek_data_errno,omitempty"`
+	SeekHoleErrno  *int   `json:"seek_hole_errno,omitempty"`
 }
 
 type pageTrace struct {
 	page    uint64
+	started time.Time
+	pid     int
+	id      uint64
 	mu      sync.Mutex
 	records []pageTraceRecord
 	dropped uint64
 }
+
+var nextPageTraceID atomic.Uint64
 
 func newPageTrace(value string, size uint64) *pageTrace {
 	// Parse decimal or explicit hexadecimal only. In particular, do not accept
@@ -67,7 +108,7 @@ func newPageTrace(value string, size uint64) *pageTrace {
 	if err != nil || page%PageSize != 0 || page > size || PageSize > size-page {
 		return nil
 	}
-	return &pageTrace{page: page, records: make([]pageTraceRecord, 0, pageTraceLimit)}
+	return &pageTrace{page: page, started: time.Now(), pid: os.Getpid(), id: nextPageTraceID.Add(1), records: make([]pageTraceRecord, 0, pageTraceLimit)}
 }
 
 func (t *pageTrace) covers(start, length uint64) bool {
@@ -96,8 +137,9 @@ func (t *pageTrace) record(event string, start, length uint64, state PageState, 
 		return
 	}
 	r := pageTraceRecord{
-		Version: 1, Page: t.page, Sequence: uint64(len(t.records)) + 1,
+		Version: 2, Page: t.page, Sequence: uint64(len(t.records)) + 1,
 		Event: event, Start: &start, Length: &length, State: pageTraceState(state),
+		Elapsed: uint64(time.Since(t.started)), PID: t.pid, Handler: t.id,
 	}
 	if fill != nil {
 		fill(&r)
@@ -160,8 +202,9 @@ func (t *pageTrace) emit(logf func(string, ...any)) {
 	recorded, dropped := len(records), t.dropped
 	t.mu.Unlock()
 	records = append(records, pageTraceRecord{
-		Version: 1, Page: t.page, Sequence: uint64(recorded) + dropped + 1,
+		Version: 2, Page: t.page, Sequence: uint64(recorded) + dropped + 1,
 		Event: "summary", Recorded: &recorded, Dropped: &dropped,
+		Elapsed: uint64(time.Since(t.started)), PID: t.pid, Handler: t.id,
 	})
 	for _, record := range records {
 		body, err := json.Marshal(record)

@@ -7,12 +7,105 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestVAReportDiagnosticCallbackBeforeACK(t *testing.T) {
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connections := make([]*net.UnixConn, 0, 2)
+	for _, fd := range pair {
+		file := os.NewFile(uintptr(fd), "va-diagnostic-socketpair")
+		conn, err := net.FileConn(file)
+		_ = file.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		unixConn := conn.(*net.UnixConn)
+		connections = append(connections, unixConn)
+		t.Cleanup(func() { unixConn.Close() })
+	}
+	serverConn, client := connections[0], connections[1]
+	_ = client.SetDeadline(time.Now().Add(3 * time.Second))
+	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	adoptedFD := -1
+	srv := &VAReportServer{AddrMap: NewAddressMap(PageSize), Logf: func(string, ...any) {}}
+	srv.OnReady = func(fd int, va, size, offset uint64) error {
+		adoptedFD = fd
+		return nil
+	}
+	srv.OnAdopted = func(d AdoptionDiagnostic) {
+		if d.UffdFD != adoptedFD || d.PeerErr != nil || d.PeerPID != os.Getpid() || d.VAStart != unitCHVA || d.Size != PageSize || d.MemfdOffset != 0 {
+			t.Errorf("adoption diagnostic=%+v", d)
+		}
+		if !srv.mu.TryLock() {
+			t.Error("diagnostic callback held the server lock")
+		} else {
+			srv.mu.Unlock()
+		}
+		close(entered)
+		<-release
+	}
+	go func() { srv.handle(serverConn); close(done) }()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		_ = serverConn.Close()
+		receiveSignal(t, done)
+		if adoptedFD >= 0 {
+			_ = unix.Close(adoptedFD)
+		}
+	}()
+	pipe := loadPipe(t)
+	defer unix.Close(pipe[0])
+	body, err := json.Marshal(vaReportMsg{Type: "va_report", VAStart: unitCHVA, Size: PageSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := make([]byte, 4+len(body))
+	binary.LittleEndian.PutUint32(frame, uint32(len(body)))
+	copy(frame[4:], body)
+	if _, _, err := client.WriteMsgUnix(frame, unix.UnixRights(pipe[0]), nil); err != nil {
+		t.Fatal(err)
+	}
+	receiveSignal(t, entered)
+	// The accepted fd is owned, but ACK cannot be published while its
+	// diagnostic callback is still running. A nonblocking peek avoids sleeps.
+	raw, err := client.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var peekErr error
+	if err := raw.Control(func(fd uintptr) {
+		var b [4]byte
+		_, _, peekErr = unix.Recvfrom(int(fd), b[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
+	}); err != nil || !errors.Is(peekErr, unix.EAGAIN) {
+		t.Fatalf("ACK escaped before callback return: control=%v receive=%v", err, peekErr)
+	}
+	close(release)
+	var prefix [4]byte
+	if _, err := io.ReadFull(client, prefix[:]); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, binary.LittleEndian.Uint32(prefix[:]))
+	if _, err := io.ReadFull(client, response); err != nil {
+		t.Fatal(err)
+	}
+	var ack ackMsg
+	if err := json.Unmarshal(response, &ack); err != nil || ack.Type != "ack" {
+		t.Fatalf("ACK=%+v err=%v", ack, err)
+	}
+}
 
 func sendTestVAReport(t *testing.T, path string, fd int, va, size uint64) ackMsg {
 	t.Helper()

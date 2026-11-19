@@ -409,7 +409,8 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		}
 	}()
 
-	vaReportSrv := &uffd.VAReportServer{
+	var vaReportSrv *uffd.VAReportServer
+	vaReportSrv = &uffd.VAReportServer{
 		Path:              uffdSockPath,
 		AddrMap:           addrMap,
 		Logf:              logf,
@@ -434,6 +435,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 				return err
 			}
 			h.Start()
+			vaReportSrv.OnAdopted = h.PageTraceAdoptionObserver()
 			uffdHandlerMu.Lock()
 			uffdHandler = h
 			close(uffdReady)

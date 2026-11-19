@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"golang.org/x/sys/unix"
@@ -67,8 +69,11 @@ func pageTraceRecords(t *testing.T, log *pageTraceLog) []pageTraceRecord {
 		if err := decoder.Decode(&record); err != nil {
 			t.Fatal(err)
 		}
-		if record.Version != 1 {
+		if record.Version != 2 || record.PID <= 0 || record.Handler == 0 {
 			t.Fatalf("trace version=%d", record.Version)
+		}
+		if len(result) > 0 && record.Elapsed < result[len(result)-1].Elapsed {
+			t.Fatal("trace elapsed time moved backwards")
 		}
 		result = append(result, record)
 	}
@@ -88,6 +93,11 @@ func newPageTraceHandler(t *testing.T, pages int, source SnapshotReader, ops uff
 	if err := unix.Ftruncate(memfd, int64(pages*PageSize)); err != nil {
 		t.Fatal(err)
 	}
+	backing, err := unix.Mmap(memfd, 0, pages*PageSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { unix.Munmap(backing) })
 	if seedPage >= 0 {
 		if n, err := unix.Pwrite(memfd, bytes.Repeat([]byte{0xff}, PageSize), int64(seedPage*PageSize)); err != nil || n != PageSize {
 			t.Fatalf("seed write=%d, %v", n, err)
@@ -97,7 +107,7 @@ func newPageTraceHandler(t *testing.T, pages int, source SnapshotReader, ops uff
 	if err := m.RegisterVMA(ProcessCH, unitCHVA, uint64(pages*PageSize), 0); err != nil {
 		t.Fatal(err)
 	}
-	h, err := NewWithBackendUffd(fds[0], m, Config{MemfdFD: memfd, Size: pages * PageSize, Source: source, NumWorkers: 2, Logf: logf})
+	h, err := NewWithBackendUffd(fds[0], m, Config{MemfdFD: memfd, BackendVA: uintptr(unsafe.Pointer(&backing[0])), Size: pages * PageSize, Source: source, NumWorkers: 2, Logf: logf})
 	if err != nil {
 		unix.Close(fds[0])
 		t.Fatal(err)
@@ -117,6 +127,9 @@ func TestPageTraceDisabledDoesNotRecordOrChangeLoad(t *testing.T) {
 			h := newPageTraceHandler(t, 1, newRecordingSnapshot(PageSize, sparse.Data, 0xff), ops.ops(), log.logf, -1)
 			if h.pageTrace != nil {
 				t.Fatal("disabled/invalid setting allocated a trace")
+			}
+			if h.PageTraceAdoptionObserver() != nil {
+				t.Fatal("disabled/invalid setting enabled diagnostic peer lookup")
 			}
 			if err := h.EnsureLoaded(context.Background(), 0, PageSize); err != nil {
 				t.Fatal(err)
@@ -160,7 +173,7 @@ func TestPageTraceCopyReleaseAndZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	records := pageTraceRecords(t, &log)
-	wantEvents := []string{"fault", "source", "copy", "load-hit", "remove", "fault", "zero", "summary"}
+	wantEvents := []string{"fault", "source", "copy", "load-hit", "remove", "fault", "zero", "observe", "summary"}
 	if len(records) != len(wantEvents) {
 		t.Fatalf("events=%+v", records)
 	}
@@ -175,10 +188,10 @@ func TestPageTraceCopyReleaseAndZero(t *testing.T) {
 	if records[1].Kind != "data" || copy.State != "absent" || copy.SHA256 != hex.EncodeToString(ffHash[:]) || *copy.NonFF != 0 || *copy.Done != PageSize || *copy.Errno != 0 {
 		t.Fatalf("FF COPY evidence=%+v", copy)
 	}
-	if removed.State != "loaded" || zero.State != "released" || zero.SHA256 != hex.EncodeToString(zeroHash[:]) || *zero.NonFF != PageSize || *zero.Done != PageSize || *zero.Errno != 0 {
+	if removed.KernelEvent != "remove" || removed.State != "loaded" || zero.State != "released" || zero.SHA256 != hex.EncodeToString(zeroHash[:]) || *zero.NonFF != PageSize || *zero.Done != PageSize || *zero.Errno != 0 {
 		t.Fatalf("release/zero evidence=%+v/%+v", removed, zero)
 	}
-	if h.state.Get(target/PageSize) != StateLoaded || *records[7].Recorded != 7 || *records[7].Dropped != 0 {
+	if h.state.Get(target/PageSize) != StateLoaded || records[7].Phase != "close" || *records[8].Recorded != 8 || *records[8].Dropped != 0 {
 		t.Fatal("trace changed the state transition or summary")
 	}
 }
@@ -302,7 +315,7 @@ func TestPageTraceSeedExistingFolio(t *testing.T) {
 		t.Fatal(err)
 	}
 	records := pageTraceRecords(t, &log)
-	if len(records) != 2 || records[0].Event != "seed" || records[0].State != "absent" || records[0].SHA256 != "" {
+	if len(records) != 3 || records[0].Event != "seed" || records[0].State != "absent" || records[0].SHA256 != "" {
 		t.Fatalf("seed must report existence without reading contents: %+v", records)
 	}
 }
@@ -353,6 +366,11 @@ func TestPageTraceCloseEmitsAfterWorkersAndUsers(t *testing.T) {
 		t.Error("trace emitted during blocked user")
 	}
 	h.pageTrace.record("load-hit", 0, PageSize, StateLoaded, nil)
+	// The final metadata observation must also wait for users, not only the
+	// logger. This real memfd write becomes visible before the user's join.
+	if _, err := unix.Pwrite(h.cfg.MemfdFD, []byte{0x7e}, 0); err != nil {
+		t.Fatal(err)
+	}
 	userFinished.Store(true)
 	h.users.Done()
 	select {
@@ -364,7 +382,149 @@ func TestPageTraceCloseEmitsAfterWorkersAndUsers(t *testing.T) {
 		t.Fatal("Close did not finish after worker and user release")
 	}
 	records := pageTraceRecords(t, &log)
-	if len(records) != 4 || records[2].Event != "load-hit" || records[3].Event != "summary" || *records[3].Recorded != 3 {
+	if len(records) != 5 || records[2].Event != "load-hit" || records[3].Phase != "close" || records[3].ExtentData == nil || !*records[3].ExtentData || records[4].Event != "summary" || *records[4].Recorded != 4 {
 		t.Fatalf("joined final record missing: %+v", records)
+	}
+}
+
+func TestPageTraceRealMemfdBackingAndRegistration(t *testing.T) {
+	t.Setenv(pageTraceEnv, "4096")
+	var log pageTraceLog
+	h := newPageTraceHandler(t, 2, ZeroSource{}, newFakeIoctls().ops(), log.logf, -1)
+	if _, err := unix.Seek(h.cfg.MemfdFD, 123, unix.SEEK_SET); err != nil {
+		t.Fatal(err)
+	}
+	// SO_PEERCRED in production supplies this PID. Use our actual mmap here
+	// to verify /proc/maps identity without requiring a real UFFD or socket.
+	observer := h.PageTraceAdoptionObserver()
+	observer(AdoptionDiagnostic{UffdFD: unitFD, VAStart: uint64(h.cfg.BackendVA), Size: 2 * PageSize, PeerPID: os.Getpid()})
+	if n, err := unix.Pwrite(h.cfg.MemfdFD, []byte{0xff}, PageSize); err != nil || n != 1 {
+		t.Fatalf("Pwrite=%d, %v", n, err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	records := pageTraceRecords(t, &log)
+	if len(records) != 4 || records[0].Event != "register" || records[1].Phase != "before-ack" || records[2].Phase != "close" {
+		t.Fatalf("events=%+v", records)
+	}
+	registration := records[0]
+	if *registration.MemfdErrno != 0 || *registration.KernelErrno != 0 || *registration.PeerErrno != 0 || *registration.MapsErrno != 0 || registration.MapsMatch == nil || !*registration.MapsMatch || *registration.KernelRelease == "" || *registration.MemfdSize != 2*PageSize || *registration.CHPID != os.Getpid() {
+		t.Fatalf("registration=%+v", registration)
+	}
+	before, after := records[1], records[2]
+	if before.Resident == nil || *before.Resident || before.ExtentData == nil || *before.ExtentData || *before.SeekDataErrno != int(unix.ENXIO) || *before.SeekDataOffset != -1 || *before.MincoreErrno != 0 {
+		t.Fatalf("fresh memfd was materialized by observation: %+v", before)
+	}
+	if after.Resident == nil || !*after.Resident || after.ExtentData == nil || !*after.ExtentData || *after.SeekDataErrno != 0 || *after.SeekDataOffset != PageSize || *after.MincoreErrno != 0 {
+		t.Fatalf("allocated memfd metadata missing: %+v", after)
+	}
+	if h.state.Get(1) != StateAbsent || before.SHA256 != "" || after.SHA256 != "" {
+		t.Fatal("metadata observation touched the source protocol")
+	}
+	if offset, err := unix.Seek(h.cfg.MemfdFD, 0, unix.SEEK_CUR); err != nil || offset != 123 {
+		t.Fatalf("observation changed shared file position: %d, %v", offset, err)
+	}
+}
+
+func TestPageTraceAdoptionObservationJoinsClose(t *testing.T) {
+	t.Setenv(pageTraceEnv, "0")
+	var log pageTraceLog
+	var finished atomic.Bool
+	h := newPageTraceHandler(t, 1, ZeroSource{}, newFakeIoctls().ops(), func(format string, args ...any) {
+		if !finished.Load() {
+			t.Error("Close emitted before the admitted metadata observation joined")
+		}
+		log.logf(format, args...)
+	}, -1)
+	entered, release, observed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		h.withPageTraceUser(func() {
+			close(entered)
+			<-release
+			if !h.installMu.TryLock() {
+				t.Error("metadata observation held installMu")
+			} else {
+				h.installMu.Unlock()
+			}
+			h.traceBacking("before-ack")
+			finished.Store(true)
+		})
+		close(observed)
+	}()
+	receiveSignal(t, entered)
+	closed := make(chan error, 1)
+	go func() { closed <- h.Close() }()
+	<-h.ctx.Done()
+	receiveSignal(t, h.readerDone)
+	workersDone := make(chan struct{})
+	go func() { h.wg.Wait(); close(workersDone) }()
+	receiveSignal(t, workersDone)
+	select {
+	case err := <-closed:
+		t.Fatalf("Close passed active metadata observer: %v", err)
+	default:
+	}
+	close(release)
+	receiveSignal(t, observed)
+	if err := loadResult(t, closed); err != nil {
+		t.Fatal(err)
+	}
+	h.withPageTraceUser(func() { t.Error("metadata observer admitted after Close") })
+	records := pageTraceRecords(t, &log)
+	if len(records) != 3 || records[0].Phase != "before-ack" || records[1].Phase != "close" || records[2].Event != "summary" {
+		t.Fatalf("observation ordering=%+v", records)
+	}
+}
+
+func TestPageTraceReleaseKeepsKernelEvent(t *testing.T) {
+	for _, event := range []struct {
+		wire uint8
+		name string
+	}{{uffdEventRemove, "remove"}, {uffdEventUnmap, "unmap"}} {
+		t.Run(event.name, func(t *testing.T) {
+			h := newUnitHandler(t, PageSize, ZeroSource{})
+			defer h.cancel()
+			h.pageTrace = newPageTrace("0", PageSize)
+			h.removeQ = make(chan removeReq, 1)
+			h.ops = newFakeIoctls().ops()
+			msg := uffdMsg{Event: event.wire}
+			rangeArg := (*uffdMsgRemove)(unsafe.Pointer(&msg.Arg[0]))
+			rangeArg.Start, rangeArg.End = unitCHVA, unitCHVA+PageSize
+			h.dispatch(&msg, unitFD)
+			var log pageTraceLog
+			h.pageTrace.emit(log.logf)
+			records := pageTraceRecords(t, &log)
+			if len(records) != 2 || records[0].KernelEvent != event.name || records[0].State != "absent" || h.state.Get(0) != StateReleased {
+				t.Fatalf("release=%+v", records)
+			}
+		})
+	}
+}
+
+func TestPageTraceMapsBoundedAndErrorsAreDiagnostic(t *testing.T) {
+	valid := "1000-3000 rw-s 00002000 00:01 123 /not-output\n"
+	mapping, err := readPageTraceMapping(strings.NewReader(valid), 0x2000)
+	if err != nil || mapping.va != 0x1000 || mapping.offset != 0x2000 || mapping.ino != 123 || mapping.size != 0x2000 {
+		t.Fatalf("map=%+v err=%v", mapping, err)
+	}
+	for _, input := range []string{"invalid\n", "2000-1000 rw-s 0 00:01 123\n", strings.Repeat("1000-2000 rw-s 0 00:01 1\n", 60000)} {
+		if _, err := readPageTraceMapping(strings.NewReader(input), 0x8000); err == nil {
+			t.Fatal("accepted invalid, missing, or over-budget mapping")
+		}
+	}
+	t.Setenv(pageTraceEnv, "0")
+	var log pageTraceLog
+	h := newPageTraceHandler(t, 1, ZeroSource{}, newFakeIoctls().ops(), log.logf, -1)
+	h.PageTraceAdoptionObserver()(AdoptionDiagnostic{UffdFD: unitFD, VAStart: unitCHVA, Size: PageSize, PeerErr: unix.EACCES})
+	if err := h.EnsureLoaded(context.Background(), 0, PageSize); err != nil {
+		t.Fatalf("diagnostic failure changed load: %v", err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	records := pageTraceRecords(t, &log)
+	if records[0].MapsMatch != nil || *records[0].PeerErrno != int(unix.EACCES) || *records[0].MapsErrno != int(unix.EACCES) {
+		t.Fatalf("unavailable peer/maps identity=%+v", records[0])
 	}
 }

@@ -51,6 +51,11 @@ type VAReportServer struct {
 	// (single-region mode).
 	OnRegister func(uffdFD int, vaStart, size, memfdOffset uint64) error
 
+	// OnAdopted is an optional, read-only diagnostic after successful adoption
+	// and before ACK. It runs without server locks and cannot reject adoption.
+	// A nil callback performs no peer-credential lookup.
+	OnAdopted func(AdoptionDiagnostic)
+
 	connMu            sync.Mutex
 	activeConn        *net.UnixConn
 	listener          *net.UnixListener
@@ -59,6 +64,15 @@ type VAReportServer struct {
 	nextMemfdOffset   uint64 // accumulator: each new region's memfd offset
 	stopOnce          sync.Once
 	stopped           chan struct{}
+}
+
+// AdoptionDiagnostic identifies the accepted CH registration. PeerErr is
+// diagnostic only; the received uffd has already been adopted successfully.
+type AdoptionDiagnostic struct {
+	UffdFD                     int
+	VAStart, Size, MemfdOffset uint64
+	PeerPID                    int
+	PeerErr                    error
 }
 
 // Listen binds the UDS socket. Must be called before CH spawns; CH's
@@ -241,12 +255,34 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 	s.regionsRegistered++
 	s.nextMemfdOffset += req.Size
 	s.mu.Unlock()
+	if s.OnAdopted != nil {
+		pid, peerErr := vaReportPeerPID(conn)
+		s.OnAdopted(AdoptionDiagnostic{UffdFD: uffdFD, VAStart: req.VAStart, Size: req.Size, MemfdOffset: memfdOffset, PeerPID: pid, PeerErr: peerErr})
+	}
 
 	s.Logf("vareport: accepted region #%d zone=%s va=0x%x size=%d memfd_off=0x%x uffd_fd=%d",
 		regionIdx, req.ZoneID, req.VAStart, req.Size, memfdOffset, uffdFD)
 	if err := writeLPJSON(conn, ackMsg{Type: "ack"}); err != nil {
 		s.Logf("vareport: write ack: %v", err)
 	}
+}
+
+func vaReportPeerPID(conn *net.UnixConn) (int, error) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var cred *unix.Ucred
+	var socketErr error
+	if err := raw.Control(func(fd uintptr) {
+		cred, socketErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	}); err != nil {
+		return 0, err
+	}
+	if socketErr != nil {
+		return 0, socketErr
+	}
+	return int(cred.Pid), nil
 }
 
 // readLPJSONWithFDs reads u32 LE length + JSON body, possibly with
