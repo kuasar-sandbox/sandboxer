@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"reflect"
 	"sync/atomic"
 
@@ -197,7 +196,7 @@ func preflightColdArtifacts(
 		imageDefaults = imageCfg
 	}
 	if err := preflightWritableExt4(ctx, root, "boot.root", DefaultDiffURIForBaseDir(baseDir, sandboxID),
-		fetcher, locations, codec, diffCustomerKey, required, opener, binding(0)); err != nil {
+		fetcher, locations, codec, diffCustomerKey, required, opener, storage, binding(0)); err != nil {
 		return nil, err
 	}
 	for i := range cfg.Boot.Disks {
@@ -223,7 +222,7 @@ func preflightColdArtifacts(
 				}
 				root := entry.RootConfig
 				root.DiffTemplate = template
-				err = preflightExt4WithBase(ctx, base, &root, fmt.Sprintf("boot.disks[%d]", i), defaultURI, codec, diffCustomerKey, required, binding(i+1))
+				err = preflightExt4WithBase(ctx, base, &root, fmt.Sprintf("boot.disks[%d]", i), defaultURI, codec, diffCustomerKey, required, storage, locations, binding(i+1))
 				if base != nil {
 					err = errors.Join(err, base.Close())
 				}
@@ -245,7 +244,7 @@ func preflightColdArtifacts(
 		}
 		defaultDiff := DefaultDiskDiffURI(baseDir, sandboxID, fmt.Sprintf("disk%d", i))
 		if err := preflightWritableExt4(ctx, disk, fmt.Sprintf("boot.disks[%d]", i), defaultDiff,
-			fetcher, locations, codec, diffCustomerKey, required, opener, binding(i+1)); err != nil {
+			fetcher, locations, codec, diffCustomerKey, required, opener, storage, binding(i+1)); err != nil {
 			return nil, err
 		}
 	}
@@ -269,6 +268,7 @@ func preflightWritableExt4(
 	diffCustomerKey [32]byte,
 	required bool,
 	opener FileStreamOpener,
+	storage *artifact.ProcessStorage,
 	checkpointBindings ...*CheckpointDiskBinding,
 ) (retErr error) {
 	var baseRefs []string
@@ -299,10 +299,10 @@ func preflightWritableExt4(
 	view := *root
 	view.Diff = diffURI
 	view.DiffTemplate = templateURI
-	return preflightExt4WithBase(ctx, base, &view, field, defaultDiffURI, codec, diffCustomerKey, required, checkpointBindings...)
+	return preflightExt4WithBase(ctx, base, &view, field, defaultDiffURI, codec, diffCustomerKey, required, storage, locations, checkpointBindings...)
 }
 
-func preflightExt4WithBase(ctx context.Context, base diffstore.BlockReader, root *config.RootConfig, field, defaultDiffURI string, codec tarstream.Codec, diffCustomerKey [32]byte, required bool, checkpointBindings ...*CheckpointDiskBinding) error {
+func preflightExt4WithBase(ctx context.Context, base diffstore.BlockReader, root *config.RootConfig, field, defaultDiffURI string, codec tarstream.Codec, diffCustomerKey [32]byte, required bool, storage *artifact.ProcessStorage, locations config.RefLocations, checkpointBindings ...*CheckpointDiskBinding) error {
 	diffURI, templateURI := root.Diff, root.DiffTemplate
 
 	if diffURI == "" {
@@ -320,24 +320,17 @@ func preflightExt4WithBase(ctx context.Context, base diffstore.BlockReader, root
 	if codec != nil {
 		cowOptions = append(cowOptions, diffstore.WithDiffEncryption(diffCustomerKey, required))
 	}
-	info, statErr := os.Stat(diffPath)
+	exists, statErr := existingDiff(diffPath)
 	switch {
-	case statErr == nil:
-		if info.Size() == 0 {
-			return fmt.Errorf("preflight %s writable diff %s is empty; provide a formatted ext4 diff", field, diffPath)
-		}
+	case statErr != nil:
+		return fmt.Errorf("preflight %s writable diff stat: %w", field, statErr)
+	case exists:
 		if err := diffstore.ValidateExistingDiffExt4(ctx, diffPath, base, cowOptions...); err != nil {
 			return fmt.Errorf("preflight %s writable diff: %w", field, err)
 		}
 		return nil
-	case !os.IsNotExist(statErr):
-		return fmt.Errorf("preflight %s writable diff stat: %w", field, statErr)
 	case templateURI != "":
-		templateScheme, templatePath, templateOK := config.SchemeAndPath(templateURI)
-		if !templateOK || templateScheme != "file" {
-			return fmt.Errorf("preflight %s diff_template invalid URI: %s", field, templateURI)
-		}
-		if err := diffstore.ValidateDiffTemplateExt4(ctx, templatePath, base, cowOptions...); err != nil {
+		if err := ValidateDiffTemplate(ctx, templateURI, base, storage, locations); err != nil {
 			return fmt.Errorf("preflight %s diff_template: %w", field, err)
 		}
 		return nil

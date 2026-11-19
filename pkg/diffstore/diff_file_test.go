@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"golang.org/x/sys/unix"
 )
@@ -600,7 +601,7 @@ func testDiffTemplateMatrixAndAtomicCommit(t *testing.T, dir string) {
 		if name != "plain.diff" {
 			options = append(options, WithDiffEncryption(key, required))
 		}
-		cow, err := OpenDisk(path, nil, DiffInit{TemplatePath: templatePath}, options...)
+		cow, err := OpenDisk(path, nil, DiffInit{Template: rawTemplateFactory(templatePath)}, options...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -651,7 +652,7 @@ func testDiffTemplateMatrixAndAtomicCommit(t *testing.T, dir string) {
 
 	baseData := patternedBytes(size)
 	layered, err := OpenDisk(filepath.Join(dir, "layered.diff"), &fakeReader{data: baseData},
-		DiffInit{TemplatePath: templatePath}, WithDiffEncryption(key, true))
+		DiffInit{Template: rawTemplateFactory(templatePath)}, WithDiffEncryption(key, true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -671,30 +672,8 @@ func testDiffTemplateMatrixAndAtomicCommit(t *testing.T, dir string) {
 		t.Fatal(err)
 	}
 
-	if _, err := OpenDisk(filepath.Join(dir, "off-from-encrypted.diff"), nil,
-		DiffInit{TemplatePath: encryptedPath}); !errors.Is(err, ErrDiffEncryptionRequired) {
-		t.Fatalf("off encrypted template error=%v", err)
-	}
-	reencryptedPath := filepath.Join(dir, "reencrypted.diff")
-	reencrypted, err := OpenDisk(reencryptedPath, nil,
-		DiffInit{TemplatePath: encryptedPath}, WithDiffEncryption(key, true))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := reencrypted.Close(); err != nil {
-		t.Fatal(err)
-	}
-	sourceBytes, _ := os.ReadFile(encryptedPath)
-	targetBytes, _ := os.ReadFile(reencryptedPath)
-	if bytes.Equal(sourceBytes[:diffHeaderRegionSize], targetBytes[:diffHeaderRegionSize]) {
-		t.Fatal("encrypted template target reused the wrapped XTS key")
-	}
-	if bytes.Equal(sourceBytes[diffHeaderRegionSize:], targetBytes[diffHeaderRegionSize:]) {
-		t.Fatal("encrypted template was raw-copied instead of re-encrypted")
-	}
-
 	existing, err := OpenDisk(plainPath, nil,
-		DiffInit{Existing: true, TemplatePath: filepath.Join(dir, "missing-template")})
+		DiffInit{Existing: true, Template: rawTemplateFactory(filepath.Join(dir, "missing-template"))})
 	if err != nil {
 		t.Fatalf("existing target did not ignore template: %v", err)
 	}
@@ -704,7 +683,7 @@ func testDiffTemplateMatrixAndAtomicCommit(t *testing.T, dir string) {
 	if err := os.WriteFile(collision, []byte("sentinel"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenDisk(collision, nil, DiffInit{TemplatePath: templatePath}, WithDiffEncryption(key, false)); err == nil {
+	if _, err := OpenDisk(collision, nil, DiffInit{Template: rawTemplateFactory(templatePath)}, WithDiffEncryption(key, false)); err == nil {
 		t.Fatal("fresh initialization replaced an existing final")
 	}
 	if body, err := os.ReadFile(collision); err != nil || string(body) != "sentinel" {
@@ -718,13 +697,14 @@ func testDiffTemplateMatrixAndAtomicCommit(t *testing.T, dir string) {
 	if err := os.WriteFile(empty, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	fromEmpty, err := OpenDisk(empty, nil, DiffInit{TemplatePath: templatePath}, WithDiffEncryption(key, false))
-	if err != nil {
-		t.Fatal(err)
+	if cow, err := OpenDisk(empty, nil, DiffInit{Template: rawTemplateFactory(templatePath)}, WithDiffEncryption(key, false)); !errors.Is(err, unix.EEXIST) {
+		if cow != nil {
+			_ = cow.Close()
+		}
+		t.Fatalf("existing empty target accepted: %v", err)
 	}
-	_ = fromEmpty.Close()
-	if info, err := os.Stat(empty); err != nil || info.Size() != singleBodyOffset(size)+size {
-		t.Fatalf("empty placeholder final size=%v err=%v", info, err)
+	if info, err := os.Stat(empty); err != nil || info.Size() != 0 {
+		t.Fatalf("existing empty target changed: %v %v", info, err)
 	}
 
 	seedFailure := filepath.Join(dir, "seed-failure.diff")
@@ -755,7 +735,7 @@ func testValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t *testing.T, dir s
 	plainPath := filepath.Join(dir, "plain.ext4")
 	writeSparseTemplate(t, plainPath, ext4, []sparse.Extent{{Offset: 1024, Size: 1024}})
 
-	if err := ValidateDiffTemplateExt4(ctx, plainPath, nil); err != nil {
+	if err := validateTestRawTemplateExt4(ctx, plainPath, nil); err != nil {
 		t.Fatalf("validate plaintext template: %v", err)
 	}
 	activePlain := filepath.Join(dir, "plain-active.diff")
@@ -768,7 +748,7 @@ func testValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t *testing.T, dir s
 	key := testDiffKey(0x82)
 	encryptedPath := filepath.Join(dir, "encrypted.diff")
 	cow, err := OpenDisk(encryptedPath, nil,
-		DiffInit{TemplatePath: plainPath}, WithDiffEncryption(key, true))
+		DiffInit{Template: rawTemplateFactory(plainPath)}, WithDiffEncryption(key, true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -785,7 +765,7 @@ func testValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t *testing.T, dir s
 	upper[cowBlockSize] = 0x7a
 	writeSparseTemplate(t, holeTemplate, upper,
 		[]sparse.Extent{{Offset: cowBlockSize, Size: 1}})
-	if err := ValidateDiffTemplateExt4(ctx, holeTemplate, &fakeReader{data: ext4}); err != nil {
+	if err := validateTestRawTemplateExt4(ctx, holeTemplate, &fakeReader{data: ext4}); err != nil {
 		t.Fatalf("validate template with base fallback: %v", err)
 	}
 
@@ -797,16 +777,13 @@ func testValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t *testing.T, dir s
 	}
 }
 
-func TestEmptyPlaceholderConcurrentInitializationDoesNotReplaceWinner(t *testing.T) {
+func TestConcurrentInitializationDoesNotReplaceWinner(t *testing.T) {
 	const size = 2 * cowBlockSize
 	dir := t.TempDir()
 	path := filepath.Join(dir, "active.diff")
 	template := filepath.Join(dir, "template.ext4")
 	want := patternedBytes(size)
 	writeSparseTemplate(t, template, want, []sparse.Extent{{Offset: 0, Size: size}})
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	key := testDiffKey(0x62)
 
 	const creators = 16
@@ -818,7 +795,7 @@ func TestEmptyPlaceholderConcurrentInitializationDoesNotReplaceWinner(t *testing
 		go func() {
 			defer wait.Done()
 			<-start
-			cow, err := OpenDisk(path, nil, DiffInit{TemplatePath: template}, WithDiffEncryption(key, true))
+			cow, err := OpenDisk(path, nil, DiffInit{Template: rawTemplateFactory(template)}, WithDiffEncryption(key, true))
 			if cow != nil {
 				err = errors.Join(err, cow.Close())
 			}
@@ -915,7 +892,7 @@ func (s failingDiffTemplate) RunAt(offset, limit uint64) (sparse.Run, error) {
 	return failingDiffRun{source: s, offset: offset, end: end}, nil
 }
 func (failingDiffTemplate) ReadAt(context.Context, []byte, uint64) (int, error) {
-	return 0, errors.New("injected template read failure")
+	return 0, readerr.Mark(errors.New("injected template read failure"), false)
 }
 func (failingDiffTemplate) Close() error { return nil }
 
@@ -1159,7 +1136,7 @@ func TestAsyncTemplatePublishesSelfContainedDiff(t *testing.T) {
 	want := patternedBytes(size)
 	writeSparseTemplate(t, templatePath, want, []sparse.Extent{{Offset: 0, Size: size}})
 
-	cow, err := OpenDisk(finalPath, nil, DiffInit{TemplatePath: templatePath})
+	cow, err := OpenDisk(finalPath, nil, DiffInit{Template: rawTemplateFactory(templatePath)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1204,7 +1181,7 @@ func TestAsyncTemplateForegroundWriteWins(t *testing.T) {
 	want := bytes.Repeat([]byte{0x31}, size)
 	writeSparseTemplate(t, templatePath, want, []sparse.Extent{{Offset: 0, Size: size}})
 
-	cow, err := OpenDisk(finalPath, nil, DiffInit{TemplatePath: templatePath})
+	cow, err := OpenDisk(finalPath, nil, DiffInit{Template: rawTemplateFactory(templatePath)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1235,7 +1212,7 @@ func TestSnapshotViewWaitsForTemplateMaterialization(t *testing.T) {
 	want := patternedBytes(size)
 	writeSparseTemplate(t, templatePath, want, []sparse.Extent{{Offset: 0, Size: size}})
 
-	cow, err := OpenDisk(finalPath, nil, DiffInit{TemplatePath: templatePath})
+	cow, err := OpenDisk(finalPath, nil, DiffInit{Template: rawTemplateFactory(templatePath)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1337,7 +1314,7 @@ func TestAsyncTemplateDiscardDoesNotReintroduceTemplateBlock(t *testing.T) {
 	writeSparseTemplate(t, templatePath, template, []sparse.Extent{{Offset: 0, Size: size}})
 	base := bytes.Repeat([]byte{0x2b}, size)
 
-	cow, err := OpenDisk(finalPath, &fakeReader{data: base}, DiffInit{TemplatePath: templatePath})
+	cow, err := OpenDisk(finalPath, &fakeReader{data: base}, DiffInit{Template: rawTemplateFactory(templatePath)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1387,7 +1364,7 @@ func TestAsyncTemplateEphemeralCloseCancelsWithoutFatal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cow, err := OpenDisk(finalPath, nil, DiffInit{TemplatePath: templatePath}, WithDiscardOnClose())
+	cow, err := OpenDisk(finalPath, nil, DiffInit{Template: rawTemplateFactory(templatePath)}, WithDiscardOnClose())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1412,13 +1389,13 @@ func TestAsyncTemplateConcurrentFreshOpenClaimsDestination(t *testing.T) {
 	finalPath := filepath.Join(dir, "active.diff")
 	writeSparseTemplate(t, templatePath, bytes.Repeat([]byte{0x51}, size), []sparse.Extent{{Offset: 0, Size: size}})
 
-	first, err := OpenDisk(finalPath, nil, DiffInit{TemplatePath: templatePath})
+	first, err := OpenDisk(finalPath, nil, DiffInit{Template: rawTemplateFactory(templatePath)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
 
-	if _, err := OpenDisk(finalPath, nil, DiffInit{TemplatePath: templatePath}); !errors.Is(err, unix.EEXIST) {
+	if _, err := OpenDisk(finalPath, nil, DiffInit{Template: rawTemplateFactory(templatePath)}); !errors.Is(err, unix.EEXIST) {
 		t.Fatalf("competing fresh open error=%v, want EEXIST", err)
 	}
 }
@@ -1426,13 +1403,13 @@ func TestAsyncTemplateConcurrentFreshOpenClaimsDestination(t *testing.T) {
 // gatedMaterialRun establishes a test-owned barrier before template copying
 // takes frontend stripes. It does not change the production materializer.
 type gatedMaterialRun struct {
-	diffTemplateSource
+	TemplateSource
 	gate *workerGate
 }
 
 func (s *gatedMaterialRun) RunAt(off, limit uint64) (sparse.Run, error) {
 	s.gate.wait()
-	return s.diffTemplateSource.RunAt(off, limit)
+	return s.TemplateSource.RunAt(off, limit)
 }
 
 func TestAsyncTemplateReadyDoesNotWaitForDirtyCacheDrain(t *testing.T) {
@@ -1450,12 +1427,12 @@ func TestAsyncTemplateReadyDoesNotWaitForDirtyCacheDrain(t *testing.T) {
 	// OpenDisk may legally publish the small template before our first write.
 	// Construct the same fresh disk with a test-only source barrier, so dirty
 	// writeback is definitely pending when template materialization completes.
-	fresh, err := createFreshDiffFile(finalPath, DiffInit{TemplatePath: templatePath}, nil)
+	fresh, err := createFreshDiffFile(finalPath, DiffInit{Template: rawTemplateFactory(templatePath)}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	materialGate := newWorkerGate()
-	fresh.template = &gatedMaterialRun{diffTemplateSource: fresh.template, gate: materialGate}
+	fresh.template = &gatedMaterialRun{TemplateSource: fresh.template, gate: materialGate}
 	cow, err := attachDisk(fresh.diff, fresh, make([]uint64, (size/cowBlockSize+63)/64), nil, diskOptions{cache: cache})
 	if err != nil {
 		t.Fatal(err)
@@ -1541,7 +1518,7 @@ func TestAsyncTemplateRetainedCloseStopsAdmissionBeforePublishWait(t *testing.T)
 	finalPath := filepath.Join(dir, "active.diff")
 	writeSparseTemplate(t, templatePath, bytes.Repeat([]byte{0x71}, size), []sparse.Extent{{Offset: 0, Size: size}})
 
-	cow, err := OpenDisk(finalPath, nil, DiffInit{TemplatePath: templatePath})
+	cow, err := OpenDisk(finalPath, nil, DiffInit{Template: rawTemplateFactory(templatePath)})
 	if err != nil {
 		t.Fatal(err)
 	}

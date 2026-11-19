@@ -44,7 +44,7 @@ type Disk struct {
 	materialReadyOnce sync.Once
 	materialDone      chan struct{}
 	materialErr       error
-	materialTemplate  diffTemplateSource
+	materialTemplate  TemplateSource
 	materialFresh     *freshDiffInit
 	materialCancel    context.CancelFunc
 	materialDiscard   bool
@@ -88,7 +88,7 @@ func OpenDisk(diffPath string, base BlockReader, init DiffInit, rawOptions ...Di
 			// Templates determine capacity and start materializing below.
 			bitmap = make([]uint64, (diff.Size()/cowBlockSize+63)/64)
 		}
-	} else if !init.Existing && init.TemplatePath != "" {
+	} else if !init.Existing && init.Template != nil {
 		fresh, err = createFreshDiffFile(diffPath, init, options.encryption)
 		if err != nil {
 			return nil, err
@@ -423,7 +423,6 @@ func (c *Disk) writeBlockLocked(ctx context.Context, buf []byte, offset, blk int
 }
 
 func (c *Disk) readLower(ctx context.Context, buf []byte, offset int64) (int, error) {
-	done := 0
 	c.materialMu.Lock()
 	template := c.materialTemplate
 	if template != nil {
@@ -433,56 +432,7 @@ func (c *Disk) readLower(ctx context.Context, buf []byte, offset int64) (int, er
 	if template != nil {
 		defer c.materialReaders.Done()
 	}
-	for done < len(buf) {
-		pos := offset + int64(done)
-		length := min(len(buf)-done, int(c.blockSize-pos%c.blockSize))
-		chunk := buf[done : done+length]
-		usedTemplate := false
-		if template != nil && pos < int64(template.Size()) {
-			run, err := template.RunAt(uint64(pos), uint64(length))
-			if err != nil && !errors.Is(err, io.EOF) {
-				return done, err
-			}
-			if err == nil {
-				if run.End() <= uint64(pos) || run.End() > uint64(pos)+uint64(length) {
-					return done, fmt.Errorf("diffstore: invalid template run boundary")
-				}
-				length = int(run.End() - uint64(pos))
-				chunk = chunk[:length]
-				if run.Kind() == sparse.Zero {
-					clear(chunk)
-					done += length
-					continue
-				}
-			}
-			if err == nil && run.Kind() != sparse.Hole {
-				n, readErr := template.ReadAt(ctx, chunk, uint64(pos))
-				done += n
-				if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(chunk)) {
-					return done, readErr
-				}
-				if n != len(chunk) {
-					return done, io.ErrUnexpectedEOF
-				}
-				usedTemplate = true
-			}
-		}
-		if usedTemplate {
-			continue
-		}
-		if c.base != nil && pos < c.base.Size() {
-			readLen := min(int64(length), c.base.Size()-pos)
-			n, err := readBlock(ctx, c.base, chunk[:readLen], pos)
-			if readretry.IsTerminal(err) || (err != nil && !errors.Is(err, io.EOF)) {
-				return done + n, err
-			}
-			zeroSlice(chunk[n:])
-		} else {
-			zeroSlice(chunk)
-		}
-		done += len(chunk)
-	}
-	return done, nil
+	return readTemplateBase(ctx, template, c.base, buf, uint64(offset))
 }
 
 func (c *Disk) signalMaterialReady() {
@@ -493,6 +443,10 @@ func (c *Disk) signalMaterialReady() {
 	})
 }
 
+// WaitMaterialReady waits for all template content and required identity
+// verification, joins borrowed source reads and releases the template. Success
+// means the writable view no longer depends on its provisioning source; cache
+// drain and durable publication may still be in progress.
 func (c *Disk) WaitMaterialReady(ctx context.Context) error {
 	c.materialMu.Lock()
 	ready := c.materialReady
@@ -568,16 +522,24 @@ func (c *Disk) materializeTemplate(ctx context.Context) error {
 			}
 			return err
 		}
+		if verifier, ok := template.(TemplateVerifier); ok {
+			if err := verifier.Verify(ctx); err != nil {
+				if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+					return errMaterialDiscard
+				}
+				return fmt.Errorf("verify diff template: %w", err)
+			}
+		}
 		// Detach only after every template page is owned by committed or
 		// cached upper state. Existing readers retain their borrowed source.
 		c.materialMu.Lock()
 		c.materialTemplate = nil
 		c.materialMu.Unlock()
 		c.materialReaders.Wait()
+		fresh.template = nil
 		if err := template.Close(); err != nil {
 			return fmt.Errorf("close materialized diff template: %w", err)
 		}
-		fresh.template = nil
 	}
 	c.signalMaterialReady()
 	if err := c.cache.drain(ctx, c); err != nil {
@@ -597,7 +559,7 @@ func (c *Disk) materializeTemplate(ctx context.Context) error {
 	return fresh.publish()
 }
 
-func (c *Disk) materializeContents(ctx context.Context, template diffTemplateSource) error {
+func (c *Disk) materializeContents(ctx context.Context, template TemplateSource) error {
 	staging := make([]byte, c.diff.policy().materialPages*cowBlockSize)
 	defer clear(staging)
 	for offset := uint64(0); offset < template.Size(); {
@@ -608,10 +570,10 @@ func (c *Disk) materializeContents(ctx context.Context, template diffTemplateSou
 		if err != nil {
 			return err
 		}
-		end := run.End()
-		if end <= offset || end > template.Size() {
-			return fmt.Errorf("invalid diff template sparse run")
+		if err := validateTemplateRun(run, offset, template.Size()); err != nil {
+			return err
 		}
+		end := run.End()
 		if run.Kind() != sparse.Hole {
 			start := uint64(int64(offset) / cowBlockSize * cowBlockSize)
 			seedEnd := uint64(alignUp(int64(end), cowBlockSize))
@@ -630,6 +592,9 @@ func (c *Disk) materializeContents(ctx context.Context, template diffTemplateSou
 	return nil
 }
 
+// WaitMaterialized includes readiness, accepted-write drain, target sync and
+// atomic publication of a newly created diff. Its final path is safe to reopen
+// only after this boundary succeeds.
 func (c *Disk) WaitMaterialized(ctx context.Context) error {
 	c.materialMu.Lock()
 	done := c.materialDone
@@ -951,11 +916,26 @@ func (c *Disk) end(cancel func()) {
 // and drains accepted writes before releasing plaintext and the FD. Already
 // published disks get no additional fsync. Base is closed by its owner.
 func (c *Disk) Close() error {
+	return c.close(false)
+}
+
+// CloseDiscarding closes a writer that its owner has decided to abandon. It
+// cancels unfinished template materialization, joins format initialization and
+// admitted operations, and otherwise releases resources in the same order as
+// Close. It still drains accepted writes and does not remove an already
+// published file; the owner remains responsible for removing its abandoned
+// writer. Close and CloseDiscarding share one shutdown: the first call chooses
+// its disposition.
+func (c *Disk) CloseDiscarding() error {
+	return c.close(true)
+}
+
+func (c *Disk) close(discard bool) error {
 	c.closeOnce.Do(func() {
 		// Stop frontend admission first. The materializer does not enter through
 		// begin(), so a retained diff can still finish drain/sync/publication
 		// after all accepted frontend operations have crossed this barrier.
-		if c.materialCancel != nil && c.discardOnClose {
+		if c.materialCancel != nil && (discard || c.discardOnClose) {
 			c.materialMu.Lock()
 			c.materialDiscard = true
 			c.materialCancel()
