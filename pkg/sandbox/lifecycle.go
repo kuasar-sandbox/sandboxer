@@ -64,22 +64,26 @@ type RunOptions struct {
 	PortableConfig *config.PortableSandboxConfig
 	SourceBinding  *RunSourceBinding
 	MemoryBinding  *MemorySourceBinding
-	ManifestCfg    *config.ManifestConfig // for manifest:// resolution; may be nil if all file://
-	Fetcher        fetch.Fetcher          // lazily network-backed; caller owns its lifetime
-	BundleReader   *manifestbundle.Reader // non-nil while restoring a local root Bundle
-	BundleFetcher  *manifestbundle.ManifestFetcher
-	RefLocations   config.RefLocations    // trusted logical location -> host directory mappings
-	SandboxID      string                 // generated if empty
-	PathID         string                 // run/base-root directory leaf; defaults to SandboxID
-	CHBinary       string                 // path to bin/cloud-hypervisor
-	RuntimeRoot    string                 // tmpfs run root (sockets / snap staging); "/run/sandbox" by default
-	BaseRoot       string                 // on-disk base root (overlay diff); "/var/lib/sandbox" by default
-	StatsJSONPath  string                 // if set, write vhost stats as JSON to this path on shutdown
-	StatsInterval  time.Duration          // if > 0, periodically log lazy-load stats; 0 = off
-	StdioMode      stdio.Mode             // CH process stdio wiring; see pkg/stdio
-	CustomerKeyFn  ingest.CustomerKeyFunc // process-fixed customer key resolver
-	LocalCodec     tarstream.Codec        // nil when crypto.local=off
-	LocalRequired  bool                   // reject plaintext local artifacts and active diffs
+	// Storage is an optional caller-owned artifact capability. When supplied it
+	// owns manifest configuration, keys and local crypto policy. Fetcher may
+	// still scope the base graph to a Bundle without replacing the template Store.
+	Storage       *artifact.ProcessStorage
+	ManifestCfg   *config.ManifestConfig // for manifest:// resolution; may be nil if all file://
+	Fetcher       fetch.Fetcher          // lazily network-backed; caller owns its lifetime
+	BundleReader  *manifestbundle.Reader // non-nil while restoring a local root Bundle
+	BundleFetcher *manifestbundle.ManifestFetcher
+	RefLocations  config.RefLocations    // trusted logical location -> host directory mappings
+	SandboxID     string                 // generated if empty
+	PathID        string                 // run/base-root directory leaf; defaults to SandboxID
+	CHBinary      string                 // path to bin/cloud-hypervisor
+	RuntimeRoot   string                 // tmpfs run root (sockets / snap staging); "/run/sandbox" by default
+	BaseRoot      string                 // on-disk base root (overlay diff); "/var/lib/sandbox" by default
+	StatsJSONPath string                 // if set, write vhost stats as JSON to this path on shutdown
+	StatsInterval time.Duration          // if > 0, periodically log lazy-load stats; 0 = off
+	StdioMode     stdio.Mode             // CH process stdio wiring; see pkg/stdio
+	CustomerKeyFn ingest.CustomerKeyFunc // process-fixed customer key resolver
+	LocalCodec    tarstream.Codec        // nil when crypto.local=off
+	LocalRequired bool                   // reject plaintext local artifacts and active diffs
 
 	// PingFatalThreshold: after this many consecutive ping failures
 	// the host SIGTERMs CH so cmd.Wait() returns. 0 = disabled
@@ -140,6 +144,12 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	if opts.Cfg == nil {
 		return -1, fmt.Errorf("RunOptions.Cfg is nil")
 	}
+	if opts.Storage != nil {
+		opts.ManifestCfg = opts.Storage.ManifestConfig()
+		opts.CustomerKeyFn = opts.Storage.CustomerKeyFunc()
+		opts.LocalCodec = opts.Storage.LocalCodec()
+		opts.LocalRequired = opts.Storage.LocalRequired()
+	}
 	if opts.LocalRequired && opts.LocalCodec == nil {
 		return -1, fmt.Errorf("RunOptions.LocalRequired requires LocalCodec")
 	}
@@ -167,11 +177,14 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		opts.CHBinary = "cloud-hypervisor"
 	}
 
-	storage, err := artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired, opts.Fetcher)
+	storage, err := borrowRunStorage(opts)
 	if err != nil {
 		return -1, err
 	}
 	defer storage.Close()
+	if opts.Fetcher == nil {
+		opts.Fetcher = storage.Fetcher()
+	}
 	opts.CustomerKeyFn = storage.CustomerKeyFunc()
 	opts.checkpointStorage = storage
 	var checkpointRelease func() error
@@ -329,6 +342,19 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		return -1, err
 	}
 	return WaitRun(ctx, r)
+}
+
+// Preserve the original Store capability while a --from Bundle supplies the
+// launch's ordinary Manifest graph. Closing this view does not close its owner.
+func borrowRunStorage(opts RunOptions) (*artifact.ProcessStorage, error) {
+	if opts.Storage != nil {
+		selected := opts.Fetcher
+		if selected == nil {
+			selected = opts.Storage.Fetcher()
+		}
+		return opts.Storage.BorrowWithFetcher(selected), nil
+	}
+	return artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired, opts.Fetcher)
 }
 
 // WaitRun adapts executable cancellation/signal policy to the SDK owner. It does

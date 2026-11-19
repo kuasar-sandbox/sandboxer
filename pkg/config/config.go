@@ -594,10 +594,11 @@ type RootConfig struct {
 	// file://<base-dir>/<sid>.overlay.diff; an auto-defaulted diff is removed
 	// when the sandbox ends, an explicitly set one is never removed.
 	Diff string `yaml:"diff"`
-	// DiffTemplate (file:// only) is the logical initialization source for a
+	// DiffTemplate is the immutable logical initialization source for a
 	// freshly-created Diff. Its sparse plaintext view is encoded according to
 	// crypto.local, so a single-disk cold boot gets a mountable rw root without
-	// mkfs. Ignored if Diff already exists.
+	// a guest mkfs. Raw, canonical tarstream, Bundle, Store and built-in ext4
+	// references share this field. Ignored if Diff already exists.
 	DiffTemplate string `yaml:"diff_template"`
 	// BaseFromRefs is the single-disk immutable layer chain below Base. Exported
 	// Sandbox E owns this graph; Snapshot S never duplicates it.
@@ -628,10 +629,11 @@ type OverlayConfig struct {
 	// An auto-defaulted diff is removed when the sandbox ends; an explicitly
 	// set diff is never removed.
 	Diff string `yaml:"diff"`
-	// DiffTemplate, when set (file:// only), is the logical initialization
+	// DiffTemplate, when set, is the immutable logical initialization
 	// source for a freshly-created diff. Its sparse plaintext view is encoded
 	// according to crypto.local, so cold boot gets a mountable upper layer
-	// without mkfs. Ignored if the diff already exists.
+	// without a guest mkfs. See ParseDiffTemplate for supported references.
+	// Ignored if the diff already exists.
 	DiffTemplate string `yaml:"diff_template"`
 }
 
@@ -1523,9 +1525,11 @@ func validateDiskSource(r *RootConfig, prefix string, cold bool) error {
 			}
 		}
 		if ov.DiffTemplate != "" {
-			if err := requireFileAbs(prefix+".overlay.diff_template", ov.DiffTemplate); err != nil {
-				return err
+			normalized, err := NormalizeDiffTemplate(ov.DiffTemplate)
+			if err != nil {
+				return fmt.Errorf("%s.overlay.diff_template: %w", prefix, err)
 			}
+			ov.DiffTemplate = normalized
 		}
 		// Cold boot needs a mountable ext4 source for the upper layer — a
 		// fresh blank diff is not a valid filesystem.
@@ -1542,9 +1546,11 @@ func validateDiskSource(r *RootConfig, prefix string, cold bool) error {
 		}
 	}
 	if r.DiffTemplate != "" {
-		if err := requireFileAbs(prefix+".diff_template", r.DiffTemplate); err != nil {
-			return err
+		normalized, err := NormalizeDiffTemplate(r.DiffTemplate)
+		if err != nil {
+			return fmt.Errorf("%s.diff_template: %w", prefix, err)
 		}
+		r.DiffTemplate = normalized
 	}
 	if r.Base != "" {
 		if err := requireAbsIfFile(prefix+".base", r.Base); err != nil {

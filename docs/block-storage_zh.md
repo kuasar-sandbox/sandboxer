@@ -198,8 +198,36 @@ disk, err := diffstore.OpenDisk(path, base, init,
 ```
 
 使用磁盘前必须检查 `err`。`DiffInit{Existing: true}` 打开已有文件；`CreateSize` 或
-`TemplatePath` 创建新文件。v4 open 会认证并检查预期 identity/base，绝不接管旧格式文件。
+`Template` 创建新文件。v4 open 会认证并检查预期 identity/base，绝不接管旧格式文件。
 即使新 active file 必须加密，仍允许使用明文 raw provisioning template。
+
+`Template` 是惰性的 `TemplateFactory`，成功返回支持任意、重复和并发读取的
+`sparse.Source + io.Closer`。diffstore 不解释 URI、载体格式、源密钥或 Store 配置；
+制品层按[模板引用](configuration_zh.md#disk-capacity)选择 raw、tarstream、Bundle、Store
+或内建 ext4。工厂只在取得新建 claim、再次确认目标不存在后调用一次。失败前资源由工厂
+清理，成功交付后由磁盘唯一持有并关闭。已有 writer、已有空文件及竞争失败不调用工厂。
+发布使用不替换目标的 rename，竞争出现的空路径也不会被覆盖。base 和共享存储客户端始终
+由原调用方持有。
+
+可选 `TemplateVerifier.Verify(ctx)` 是完整物化的必需屏障，即使所有模板页已被前台覆盖
+也执行。物化后先完成验证，再从前台视图脱离模板，等待已经借用的读取结束，转移关闭所有权
+并只 Close 一次，随后才开放 Ready。验证或关闭失败传播为存储故障，不发布最终路径。
+`ValidateDiffTemplateExt4` 只借用 source 与 base 检查有效视图，既不关闭也不承诺完整身份。
+通用纯块盘绑定不因模板接入而增加文件系统格式要求；挂载 ext4 的启动路径继续单独预检。
+
+`sandbox.PrepareDiffWithStorage` 接收调用者的 context、实际 base、`ProcessStorage`
+及命名位置，支持所有模板类型。旧 `PrepareDiff(path, rawURI, baseSize)` 保留为仅支持
+本地 raw 的兼容入口，不获取密钥或 Store。`OpenDiskV1Source` 对 raw 文件继续返回展开的
+绝对 URI；带身份的来源保留引用限定符。`RunOptions.Storage` 保留调用者拥有的访问能力，
+同时允许 `Fetcher` 单独选择 Bundle 的 base 依赖图。
+
+嵌入调用者提供外部 Manifest Fetcher 作为模板 Store 时，须实现制品层公开的
+`VerifiedManifestFetcher` 能力，保证所选 Manifest 及每次 Chunk 读取的 ContentKey 验证。
+普通不透明 Fetcher 不能自行证明该保证，将在模板打开时报错；普通 base 读取仍沿用原接口。
+ProcessStorage 自有惰性客户端提供严格模板视图，普通 `verify_content=false` 不削弱模板
+身份检查。BorrowWithFetcher 可为捕获 base 选择 Bundle 范围，但不会改变初始化模板的
+Store 来源，也不转移共享客户端的关闭权。
+
 
 | 属性 | 单层 v3 | 版本化 v4 |
 | --- | --- | --- |
@@ -232,7 +260,7 @@ directory sync。物化使用同一 dispatcher 以及相同 stripe/presence 冲�
 | --- | --- |
 | `OpenDisk` 返回 | 已校验所有权和逻辑视图；缺失的 upper 页读取 template/base/zero，缓存写入可进行；最终路径可能尚不存在 |
 | 内部初始化完成 | truncation、固定预留及现有 header/control/redo/分批 bitmap 写入完成，或记录一个终态错误；backend I/O 与 GC 等待成功 |
-| `WaitMaterialReady` 成功 | 初始化完成，视图不再依赖 template；此边界早于 cache drain，使 checkpoint 能冻结写者 |
+| `WaitMaterialReady` 成功 | 初始化与模板完整身份验证完成，已准入的源读取结束、源释放且视图不再依赖 template；早于 cache drain，使 checkpoint 能冻结写者 |
 | `WaitMaterialized` 成功 | 初始化、可选模板导入、所需 writeback、file sync、rename、claim 释放和 directory sync 完成；不同步后续写入 |
 
 空 `Drain` 不等待初始化。物理路径交接/重开、active export 和 snapshot 发布使用

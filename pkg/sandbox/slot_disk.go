@@ -215,6 +215,10 @@ func (r *Runtime) BindDisk(ctx context.Context, req BindDiskRequest) (err error)
 			err = fmt.Errorf("%w: %w", ctl.ErrDiskPermission, err)
 		}
 	}()
+	req.Disk, err = req.Disk.NormalizeCreate()
+	if err != nil {
+		return fmt.Errorf("%w: %w", ctl.ErrDiskInvalid, err)
+	}
 	if _, err := req.MarshalBounded(); err != nil {
 		return err
 	}
@@ -335,7 +339,7 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 	if err := os.MkdirAll(filepath.Dir(plan.DiffPath), 0755); err != nil {
 		return err
 	}
-	init, err := PrepareDiff(plan.DiffPath, template, size)
+	init, err := PrepareDiffWithStorage(readCtx, plan.DiffPath, template, base, r.diskStorage, locations)
 	if err != nil {
 		return err
 	}

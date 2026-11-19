@@ -182,14 +182,14 @@ Size 是 `512MiB` 等字节大小字符串；duration 是 `30s` 等 Go duration 
 | `boot.cmdline` | String；空 | 与自动启动参数合并的额外参数；仅供冷启动 Host 输入 |
 | `boot.root.base` | Artifact ref；single-disk 模式可省略 | Overlay 模式必须的 EROFS lower；single-disk 模式可选 ext4 lower |
 | `boot.root.overlay` | Object；省略选择 single disk | 存在时选择独立只读 lower 和可写 ext4 upper |
-| `boot.root.diff`、`boot.root.diff_template`、`boot.root.base_from_refs` | Local ref、local ref、有序 ref list | 仅 single-disk 的可写绑定、provisioning template 和 lower chain；与 overlay 互斥 |
-| `boot.root.overlay.base`、`.base_from_refs`、`.diff`、`.diff_template` | Ref、ref list、local ref、local ref | 可写 upper 的不可变源链及 active binding；与 single-disk 同类字段规则相同 |
+| `boot.root.diff`、`boot.root.diff_template`、`boot.root.base_from_refs` | Local ref、模板引用、有序 ref list | 仅 single-disk 的可写绑定、provisioning template 和 lower chain；与 overlay 互斥 |
+| `boot.root.overlay.base`、`.base_from_refs`、`.diff`、`.diff_template` | Ref、ref list、local ref、模板引用 | 可写 upper 的不可变源链及 active binding；与 single-disk 同类字段规则相同 |
 | `boot.disks[].name` | 唯一非空 String | 最多八个 data disk，按稳定 array 顺序排列 |
 | `boot.disks[].base`、`.overlay`、`.diff`、`.diff_template`、`.base_from_refs` | 与 root 相同的 disk shape | 每个 data disk 遵循相同 single/overlay 源规则；每块盘在冷启动时至少有一个 `type: disk` 挂载目标 |
 | `boot.disks[].slot` | `{}` 或 `{size: 8GiB}` | 运行期绑定的单设备盘位 |
 | `boot.disks[].disk` | 完整的 DiskV1 | 从相同盘定义冷启动，使用本实例的私有可写层 |
 
-`diff` 与 `diff_template` 是本地绝对文件引用；不可变 ref 可用受支持的 local/Manifest carrier。
+`diff` 是本地绝对文件引用；`diff_template` 使用下文的五类模板引用。不可变 ref 可用受支持的 local/Manifest carrier。
 Lower chain 要求 base。冷启动的可写 ext4 设备需要可挂载 base/template/已有 diff；空白文件不是文件系统。
 普通非 checkpoint 模式下，自动 active diff 归 runtime 所有并在退出时移除；显式路径归调用者所有。
 启用 `--enable-checkpoint` 后，可写文件归于派生的 checkpoint 目录，包括自动选择的路径，正常退出后也保留。
@@ -220,7 +220,7 @@ sandbox-ctl export --source-ref "$PAUSED_E" --disk work --output "$OUT" > work.d
 sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
 ```
 
-本地输出为包含所需块层的 Bundle。跨宿主交付可用 `--upload` 发布内容，并向两端提供相应的 Manifest 配置。初始化新盘时，`--disk-spec` 也可读取含 `kind: disk`、`version: 1` 及 `diff_template` 的 JSON。绑定可以通过 `--ref-location NAME=file:///dir` 提供命名位置。
+本地输出为包含所需块层的 Bundle。跨宿主交付可用 `--upload` 发布内容，并向两端提供相应的 Manifest 配置。初始化新盘时，`--disk-spec` 也可读取含 `kind: disk`、`version: 1` 以及 `diff_template` 或 size-only 创建容量的 JSON。绑定可以通过 `--ref-location NAME=file:///dir` 提供命名位置。
 
 ### 工作负载字段
 
@@ -290,7 +290,7 @@ portable network.enabled == host provider presence
 portable interface       == explicitly supplied host interface
 ```
 
-Direct EROFS E只有 read-only image. 目标 host必须提供 pre-formatted `diff_template`,或已格式化的 explicit diff. 缺少可挂载 upper时在 controller/network/CH side effect 前失败.
+Direct EROFS E只有 read-only image. 目标 host必须提供可用 `diff_template`（含 `mkfs://ext4?size=...`），或已格式化的 explicit diff. 缺少可挂载 upper时在 controller/network/CH side effect 前失败.
 
 最终调用普通 `sandbox.Run`;`run --from` 不进入 `restore.Run`. 从来源派生的冷启动解析目标 kernel/runtime 身份，并将其写入新 C0，同时保留生效的来源工作负载与磁盘图。来源 boot 身份不要求冷启动继续使用旧 kernel/runtime，也不放宽上面的受保护字段。内存恢复则保留捕获的 C0，需要兼容的本地 runtime 绑定，但不依赖外部 kernel。
 
@@ -442,57 +442,95 @@ Go 调用者可通过 `diffstore.WithCache` 向多个 `diffstore.OpenDisk` 传�
 
 ## 可写磁盘容量与配置迁移
 
-可写磁盘的容量继承自所选文件系统来源，而不是独立的大小配置。已有且非空的活动
-`diff` 保留其逻辑容量；从 `diff_template` 初始化的新 diff 继承模板的逻辑容量；
-没有模板时，基于 COW `base` 创建的新 diff 继承该 base 的逻辑容量。已有的空 diff，
-以及没有文件系统来源的新磁盘，仍然属于无效输入。在双设备 overlay 模式下，这里的
-COW base 属于可写 ext4 upper，不是只读 EROFS 镜像。这些规则同时适用于 `boot.root`
-和 `boot.disks[]`，冷启动、`run --from` 以及内存快照恢复均保持原有行为。
+已有且有效的活动 `diff` 保留其逻辑容量和内容，不打开初始化模板：缺失模板文件、不可用的
+Store、模板密钥及未使用的生成器限制都不影响重开。已有空盘或损坏 writer 直接报错，绝不
+自动格式化。没有 writer 时由所选模板确定容量；没有模板时，新 COW 层继承 base 容量。
+恢复使用捕获的磁盘图，不会用初始化模板替代缺失或损坏的捕获内容。
 
-原来的 `diff_size` 在这些受支持的路径上从未实施容量或配额限制。该配置及其具有误导性
-的 1 GiB 默认值现已删除。在 root、数据盘或其 `overlay` 下显式配置 `diff_size`，
-或使用错误的 `size` 写法，现在都会返回附带迁移指引的错误，包括空字符串和 null 值。
-请从已有配置中删除这些键，并准备具有所需容量的文件系统来源。新生成的配置不再输出
-这些键；无关配置字段和不透明的 metadata 不受影响。
+### 模板引用
 
-对于新建的可丢弃 ext4 工作盘（overlay upper、单盘 root，以及 scratch 或数据盘测试
-文件），使用 `mkfs.ext4 -O ^has_journal` 格式化稀疏模板，避免文件系统 journal
-占用及元数据日志写入；这不影响 journald 或应用日志。COW 不能替代 journal，
-此默认约定不承诺中断后工作盘的崩溃恢复。已有带 journal 的模板、用户自带镜像和
-快照继续兼容；guest sync/quiesce 与快照/恢复语义保持不变。不要为应用此建议而
-重新格式化已有数据盘。
+现有 `diff_template` 字符串唯一选择一个逻辑来源，不增加 `diff_template_format`，不按
+扩展名猜测，也不在失败后尝试另一种格式。
 
-对于一个**新建的**、空白的 512 MiB scratch 文件系统，可以准备新模板，使用时不再指定
-大小覆盖项：
+| 引用 | 所选来源 |
+| --- | --- |
+| `file:///path/empty.ext4` | raw 稀疏磁盘，兼容现有文件写法 |
+| `file:///path/empty.tar@digest:<digest>` | 明文 canonical tarstream |
+| `file:///path/empty.tar@hmac:<digest>` | 加密 canonical tarstream |
+| `file:///path/empty.bundle@manifest:<content-key>` | Bundle 内显式选择的 Manifest |
+| `manifest://<content-key>` | Manifest Store/cache |
+| `mkfs://ext4?size=10GiB` | 内建确定性空 ext4 |
 
-```bash
-truncate -s 512M /tmp/scratch-512m.ext4
-mkfs.ext4 -F -O ^has_journal /tmp/scratch-512m.ext4
-```
+文件沿用绝对路径或命名位置规则。例如 `file://empty.ext4@location:seeds` 使用
+`--ref-location seeds=file:///templates`。身份 selector 位于 `@location` 之前。裸
+`.bundle` 路径仍选择 raw；Bundle 模板必须显式提供 `@manifest`。所选 Bundle 必须含有
+root 和所需全部 Chunk，不从其他 Store 或 Bundle 补齐缺失内容。base/snapshot 的通用
+文件检测行为不变。
+
+tarstream 身份承诺 canonical 载体及其稀疏逻辑内容，不是 raw 文件或展开磁盘的 SHA256。
+Bundle selector 是内部 Manifest ContentKey，不是包文件哈希。模板强制验证 Manifest/Chunk
+身份，即使普通读取的 `manifest.verify_content` 为 false。tarstream 随机读取和 ext4 预检
+不等于完整摘要校验；完整验证必须在 `WaitMaterialReady` 前成功。源加密沿用 local/ref/Manifest
+规则，与目标 DIFF 加密独立；明文 raw 可以初始化加密 DIFF。
+
+`mkfs://ext4?size=10GiB` 只接受一个必填 `size` 参数。`10G`、`10GB`、`10GiB` 和
+`10240MiB` 都精确表示 10,737,418,240 字节，内部规范化为字节 URI。只有实际选择新建时才
+应用生成器的 4 KiB 对齐及 1 MiB–1 TiB 范围限制。活动单层 v3 最大 1 TiB，checkpoint v4
+仍最大 32 GiB。生成器不调用宿主 mkfs，也不创建中间镜像；它计算布局，并将请求的元数据
+直接编码到调用方缓冲区。Hole 不产生 payload 读取或填充。
+
+新建一个空白的 512 MiB scratch 文件系统：
 
 ```yaml
 boot:
   # 保留完整配置中的其他必需 boot 字段。
   disks:
     - name: scratch
-      diff_template: file:///tmp/scratch-512m.ext4
+      diff_template: mkfs://ext4?size=512MiB
 mounts:
-  - target: /scratch
-    type: disk
-    source: scratch
+  - { target: /scratch, type: disk, source: scratch }
 ```
 
-模板是只读的初始化输入，与活动 DIFF 工作文件不同。既有 raw ext4 准备方式及加密
-模板读取继续受支持。运行时读取模板，另行创建 v3/v4 工作文件。可写逻辑容量必须为
-正且按 4 KiB 对齐。单层 v3 支持最大 1 TiB；启用本地 Checkpoint 时使用 v4，其容量
-上限仍为 32 GiB。需要更大的单层工作盘时，准备更大的文件系统模板即可，不引入独立
-的大小配置项。
+使用 mkfs 时，所选可写设备不能有 COW base；双设备 overlay 的独立只读 EROFS lower 可以
+存在。外部模板保留 Hole 继承 base、Zero 遮蔽为零、Data 读取模板的语义，包括子页边界；
+逻辑容量不能小于其 COW base。载体文件长度不是磁盘容量。普通 raw 模板继续支持，需要
+外部镜像时，`truncate` 加 `mkfs.ext4 -O ^has_journal` 的制作方式仍有效。
 
-必须使用新的活动 diff：已有 diff 优先，因此更换模板不会调整容量或替换已有数据。
-不要通过截断已有文件系统来实施更小的限制。Sandboxer 不会自动调整文件系统大小，
-不会限制 COW 已物化的存储占用（包括 tmpfs 文件的内存/swap；待回写缓存由 `resources.diff_cow` 单独限制），也不会在启动或恢复时改变磁盘容量。逻辑块设备容量与加密
-文件的物理长度、宿主磁盘实际分配空间、guest 文件系统可用于文件数据的空间并不是
-同一个概念。本次迁移不提供从同一个模板任意选择各实例容量的新能力。
+### DiskV1 按容量创建
+
+没有 base、父层和模板的 DiskV1，可以在必需的 kind/version 标记之外只给出字节容量：
+
+```json
+{"kind":"disk","version":1,"size":10737418240}
+```
+
+它等价于补入 `"diff_template":"mkfs://ext4?size=10GiB"`。创建归一化发生在解码校验、
+绑定和来源身份计算前，使等价单位、size-only 简写和显式 mkfs 识别为同一创建。有显式来源时，
+`size` 仍是容量断言，不能补救错误来源或孤立父层。断言也检查已有 writer；未使用的 mkfs URI
+容量则不限制已有盘。只有 slot 声明仍未绑定，即使已声明固定容量。绑定需要完整显式磁盘；
+固定 slot 容量必须匹配，动态 slot 采用所选盘容量。
+
+旧 root/overlay 的 `diff_size` 和 `size` 继续停用。删除这些键，选择所需容量的文件系统来源、
+使用 mkfs URI，或在完整 DiskV1 场景使用 `boot.disks[].disk.size`。不引入自动文件系统扩容、
+截断或物理存储配额。
+
+### 确定性空文件系统与兼容性
+
+内部 `empty-ext4/v1` profile 固定 UUID、目录 hash seed、初始及扩展时间、hash signedness、
+保留字节、元数据布局与稀疏区间分类。它使用 4 KiB block、256 字节 inode、目标 8 KiB/inode
+及 flex_bg=8；初始根目录只有 `.`、`..`，无 journal、resize_inode 和 metadata checksum。
+字节仅由容量与 profile 决定，不跟随宿主 mkfs 默认值。修改 profile 需要新的内部版本，
+不提供 UUID、feature 或 seed 调整参数。
+
+相同初始盘可在相同分块和加密代际下复用 Chunk/Manifest。文件系统 UUID 不承担实例身份。
+Guest 写入仍使用正常时间、inode generation 和 overlay UUID；活动 DIFF 密钥及 nonce
+保留既有随机性。无 journal 的 profile 不为运行中工作盘增加崩溃恢复保证。已有带 journal
+的外部文件系统与捕获盘继续支持。
+
+DIFF v1 加密 envelope 和 DIFF v3 工作文件不再作为模板载体。升级前须使用支持旧输入的版本
+导出逻辑内容，不能改名或去掉头部冒充 raw。受支持 v3/v4 writer 的活动读写和恢复不受影响。
+成功物化后，重开、导出和恢复不再依赖模板。逻辑容量与载体长度、物理占用及 Guest 文件系统
+可用空间仍是不同概念。
 
 <a id="journal-output-targets"></a>
 

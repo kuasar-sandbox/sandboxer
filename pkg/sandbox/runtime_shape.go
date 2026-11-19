@@ -279,7 +279,7 @@ func deriveBoundRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, opts
 				diffURI = DefaultDiskDiffURI(defaultBaseDir, opts.SandboxID, fmt.Sprintf("disk%d", index-1))
 			}
 		}
-		capacity, err := runtimeWritableCapacity(diffURI, template, baseSize, diffOpts)
+		capacity, err := runtimeWritableCapacity(ctx, diffURI, template, baseSize, diskStorage, launch.RefLocations, diffOpts)
 		d.WritableCapacity = capacity
 		return d, err
 	}
@@ -311,7 +311,7 @@ func deriveBoundRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, opts
 					// The opener already computed fresh template/base capacity. Read
 					// writer metadata only when this target actually exists.
 					var actual int64
-					actual, err = runtimeWritableCapacity(writer, "", size, diffOpts)
+					actual, err = runtimeWritableCapacity(ctx, writer, "", size, diskStorage, launch.RefLocations, diffOpts)
 					if err == nil && actual < size {
 						err = fmt.Errorf("existing writer capacity %d smaller than disk source %d", actual, size)
 					}
@@ -339,28 +339,33 @@ func deriveBoundRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, opts
 	return spec, nil
 }
 
-func runtimeWritableCapacity(diffURI, template string, baseSize int64, opts []diffstore.DiskOption) (int64, error) {
+func runtimeWritableCapacity(ctx context.Context, diffURI, template string, baseSize int64, storage *artifact.ProcessStorage, locations config.RefLocations, opts []diffstore.DiskOption) (int64, error) {
 	if diffURI != "" {
 		scheme, path, ok := config.SchemeAndPath(diffURI)
 		if !ok || scheme != "file" {
 			return 0, fmt.Errorf("invalid diff URI %q", diffURI)
 		}
-		// Share Launch's existing/template/base precedence, including rejection
-		// of empty targets and stat errors. PrepareDiff never creates a writer.
-		init, err := PrepareDiff(path, template, baseSize)
+		exists, err := existingDiff(path)
 		if err != nil {
 			return 0, err
 		}
-		if init.Existing {
-			return diffstore.DiffSourceCapacity(path, false, opts...)
+		if exists {
+			return diffstore.ExistingDiffCapacity(path, opts...)
 		}
 	}
 	if template != "" {
-		scheme, path, ok := config.SchemeAndPath(template)
-		if !ok || scheme != "file" {
-			return 0, fmt.Errorf("invalid diff template %q", template)
+		ref, err := config.ParseDiffTemplate(template)
+		if err != nil {
+			return 0, err
 		}
-		return diffstore.DiffSourceCapacity(path, true, opts...)
+		if ref.Kind == config.DiffTemplateMkfs && baseSize != 0 {
+			return 0, errors.New("mkfs template requires a writable device without a COW base")
+		}
+		size, err := TemplateCapacity(ctx, ref.String(), storage, locations)
+		if err == nil && size < baseSize {
+			return 0, fmt.Errorf("template capacity %d smaller than base %d", size, baseSize)
+		}
+		return size, err
 	}
 	if baseSize > 0 {
 		if err := diffstore.ValidateWritableSize(baseSize); err != nil {

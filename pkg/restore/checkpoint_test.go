@@ -139,7 +139,7 @@ func TestRestoreCheckpointSameDirectoryUsesPlanAndRealDIFF(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cache.Close()
-	db, closeDisk, err := reconstructDisk(ctx, opts, [32]byte{}, true, "", nil, "", cfg.Boot.Root.Diff, "", "overlay", func(string, ...any) {}, cache)
+	db, closeDisk, err := reconstructDisk(ctx, opts, [32]byte{}, true, "", nil, "", cfg.Boot.Root.Diff, "overlay", func(string, ...any) {}, cache)
 	if err != nil {
 		t.Fatal(err)
 	}

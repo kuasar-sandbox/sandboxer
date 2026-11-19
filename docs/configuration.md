@@ -200,14 +200,15 @@ reservation protocol and failure behavior are defined in [resources](resources.m
 | `boot.cmdline` | String; empty | Extra arguments merged with automatic boot arguments; cold-only host input |
 | `boot.root.base` | Artifact reference; optional in single-disk mode | Required EROFS lower in overlay mode; optional ext4 lower in single-disk mode |
 | `boot.root.overlay` | Object; omitted selects single disk | Presence selects separate read-only lower and writable ext4 upper |
-| `boot.root.diff`, `boot.root.diff_template`, `boot.root.base_from_refs` | Local reference, local reference, ordered ref list | Single-disk-only writable binding, provisioning template and lower chain; mutually exclusive with overlay |
-| `boot.root.overlay.base`, `.base_from_refs`, `.diff`, `.diff_template` | Ref, ref list, local ref, local ref | Writable upper's immutable source chain and active binding; same rules as the single-disk fields |
+| `boot.root.diff`, `boot.root.diff_template`, `boot.root.base_from_refs` | Local reference, template reference, ordered ref list | Single-disk-only writable binding, provisioning template and lower chain; mutually exclusive with overlay |
+| `boot.root.overlay.base`, `.base_from_refs`, `.diff`, `.diff_template` | Ref, ref list, local ref, template ref | Writable upper's immutable source chain and active binding; same rules as the single-disk fields |
 | `boot.disks[].name` | Unique nonempty string | At most eight data disks, in stable array order |
 | `boot.disks[].base`, `.overlay`, `.diff`, `.diff_template`, `.base_from_refs` | Same disk shape as root | Each data disk uses the same single/overlay source rules and has one or more `type: disk` mount projections on cold start |
 | `boot.disks[].slot` | `{}` or `{size: 8GiB}` | Single-device slot bound at runtime |
 | `boot.disks[].disk` | Complete DiskV1 | Cold launch from the same disk definition with an instance-private writer |
 
-`diff` and `diff_template` are absolute local file references. Immutable refs may
+`diff` is an absolute local file reference; `diff_template` selects one of the five
+source types below. Immutable refs may
 use the supported local or Manifest carriers. A lower chain requires its base.
 Cold writable ext4 devices need a mountable base/template/existing diff; a blank
 file is not a filesystem. In ordinary non-checkpoint mode, automatic active diffs
@@ -242,7 +243,7 @@ sandbox-ctl export --source-ref "$PAUSED_E" --disk work --output "$OUT" > work.d
 sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
 ```
 
-Local delivery creates a Bundle containing the required block layers. For delivery across hosts, use `--upload` with the appropriate Manifest configuration on both ends. To initialize a new disk, supply a JSON object with `kind: disk`, `version: 1`, and a `diff_template` reference. Bind can register named locations with `--ref-location NAME=file:///dir`.
+Local delivery creates a Bundle containing the required block layers. For delivery across hosts, use `--upload` with the appropriate Manifest configuration on both ends. To initialize a new disk, supply a JSON object with `kind: disk`, `version: 1`, and either a `diff_template` reference or a size-only creation capacity. Bind can register named locations with `--ref-location NAME=file:///dir`.
 
 ### Workload fields
 
@@ -315,7 +316,7 @@ portable network.enabled == host provider presence
 portable interface       == explicitly supplied host interface
 ```
 
-A direct EROFS E contains only a read-only image. The destination host must supply a preformatted `diff_template` or an explicitly bound, already formatted diff. A missing mountable upper fails before controller/network/CH side effects.
+A direct EROFS E contains only a read-only image. The destination host must supply a `diff_template` (including `mkfs://ext4?size=...`) or an explicitly bound, already formatted diff. A missing mountable upper fails before controller/network/CH side effects.
 
 The final call is ordinary `sandbox.Run`; `run --from` does not enter `restore.Run`. The source-derived cold path resolves the target kernel/runtime identities and records them in a new C0 while preserving the effective source workload and disk graph. Source boot identities do not require an old kernel/runtime for cold startup; this does not relax the protected fields above. Memory restore instead preserves the captured C0 and requires a compatible local runtime binding, without an external kernel.
 
@@ -488,69 +489,119 @@ COW owns a finite default cache and closes it itself.
 
 ## Writable disk capacity and migration
 
-Writable disk capacity is inherited from the selected filesystem source, not
-from a separate size setting. An existing non-empty active `diff` keeps its
-logical capacity. A fresh diff initialized from `diff_template` inherits the
-template's logical capacity; without a template, a fresh diff over a COW `base`
-inherits that base's logical capacity. An empty existing diff or a fresh disk
-without a filesystem source remains invalid. In two-device overlay mode, this
-COW base belongs to the writable ext4 upper, not the read-only EROFS image.
-These rules apply to both `boot.root` and `boot.disks[]` and remain unchanged
-for cold starts, `run --from`, and memory restores.
+An existing valid active `diff` keeps its logical capacity and contents. Its
+initializer is not opened: missing template files, unavailable Stores, template
+keys and unused generator limits do not affect reopening it. An empty or damaged
+existing writer is an error; it is never reformatted automatically. Without a
+writer, the selected template determines capacity; without a template, a fresh
+COW layer inherits its base. Restores use the captured disk graph and never
+substitute an initializer for missing or corrupt captured content.
 
-The former `diff_size` setting never enforced capacity or a quota in these
-supported paths. It has been removed, together with its misleading 1 GiB
-default. Configurations that explicitly supply `diff_size` or the mistaken
-`size` spelling directly under a root/data disk or its `overlay` now fail with
-an actionable error, including empty and null values. Remove these keys from
-existing configuration and provision a filesystem source with the required
-capacity. New configuration output does not emit them. Unrelated fields and
-opaque metadata are unaffected.
+### Template references
 
-For new disposable ext4 work disks (overlay uppers, single roots and scratch
-or data-disk fixtures), format the sparse template with `mkfs.ext4 -O ^has_journal`.
-This avoids filesystem journal allocation and metadata journal writes; it does
-not disable journald or application logs. COW is not a replacement for a journal,
-and this default does not promise crash recovery of an interrupted work disk.
-Existing journaled templates, user-supplied images and snapshots remain compatible;
-guest sync/quiesce and snapshot/restore semantics are unchanged. Do not reformat
-an existing data disk to apply this recommendation.
+The existing `diff_template` string selects one logical source. There is no
+`diff_template_format` setting, extension sniffing, or fallback to another format.
 
-For a **new**, empty 512 MiB scratch filesystem, prepare a new template and
-select it without a size override:
+| Reference | Selected source |
+| --- | --- |
+| `file:///path/empty.ext4` | Raw sparse disk; preserves existing file syntax |
+| `file:///path/empty.tar@digest:<digest>` | Plaintext canonical tarstream |
+| `file:///path/empty.tar@hmac:<digest>` | Encrypted canonical tarstream |
+| `file:///path/empty.bundle@manifest:<content-key>` | The explicitly selected Manifest in that Bundle |
+| `manifest://<content-key>` | Manifest Store/cache |
+| `mkfs://ext4?size=10GiB` | Built-in deterministic empty ext4 |
 
-```bash
-truncate -s 512M /tmp/scratch-512m.ext4
-mkfs.ext4 -F -O ^has_journal /tmp/scratch-512m.ext4
-```
+Files retain the ordinary absolute-path or named-location contract. For example,
+`file://empty.ext4@location:seeds` uses `--ref-location seeds=file:///templates`.
+Identity selectors precede `@location`. A bare `.bundle` path still selects raw;
+Bundle templates require an explicit `@manifest` selector. A selected Bundle
+must contain the root and all of its required Chunks; missing content is not
+filled from another Store or Bundle. Base/snapshot file detection is unchanged.
+
+The tarstream identity commits to its canonical carrier, including the sparse
+logical content; it is not a raw-file or expanded-disk SHA256. A Bundle selector
+is the inner Manifest ContentKey, not the Bundle file hash. Template reads force
+Manifest/Chunk identity verification even when ordinary `manifest.verify_content`
+is false. Tarstream random reads and ext4 preflight are not full commitment
+verification: complete verification must succeed before `WaitMaterialReady`.
+Source crypto follows the existing local/ref/Manifest policies independently of
+the target DIFF's encryption. Plaintext raw can initialize an encrypted DIFF.
+
+`mkfs://ext4?size=10GiB` accepts exactly one `size` query parameter. `10G`, `10GB`,
+`10GiB` and `10240MiB` denote the same exact 10,737,418,240 bytes and normalize to
+a byte-valued URI. Only a selected creation applies the generator's 4 KiB
+alignment and 1 MiB–1 TiB range. Active single-layer v3 supports up to 1 TiB;
+checkpoint v4 retains its 32 GiB limit. The generator never calls host mkfs or
+creates an intermediate image. It calculates layout and encodes requested
+metadata directly into caller buffers; holes incur no payload reads or fills.
+
+For a new empty 512 MiB scratch filesystem:
 
 ```yaml
 boot:
   # Keep the other required boot fields from the complete configuration.
   disks:
     - name: scratch
-      diff_template: file:///tmp/scratch-512m.ext4
+      diff_template: mkfs://ext4?size=512MiB
 mounts:
-  - target: /scratch
-    type: disk
-    source: scratch
+  - { target: /scratch, type: disk, source: scratch }
 ```
 
-Provisioning templates remain immutable inputs, distinct from active DIFF work
-files. Existing raw ext4 preparation and encrypted-template reading remain
-supported. The runtime reads the template and creates a separate v3/v4 working
-file. Writable logical capacity must be positive and 4 KiB aligned. Single-layer
-v3 supports up to 1 TiB; enabling local checkpoints selects v4, which remains
-limited to 32 GiB. A larger single-layer work disk is selected by provisioning
-a larger filesystem template; no separate size setting is introduced.
+The selected writable device must have no COW base when using mkfs. A separate
+read-only EROFS lower in two-device overlay mode is allowed. External templates
+retain Hole → base, Zero → zero, and Data → template semantics, including partial
+pages; their logical size must not be smaller than their COW base. Carrier file
+length is never the disk capacity. Ordinary raw templates remain supported;
+`truncate` plus `mkfs.ext4 -O ^has_journal` is still valid when an external image
+is desired.
 
-Use a new active diff: an existing diff takes precedence, so changing a template
-does not resize or replace existing data. Do not truncate an existing filesystem
-to impose a smaller limit. Sandboxer does not automatically resize filesystems,
-cap materialized COW storage (including tmpfs file memory/swap; pending cache writeback is bounded separately by `resources.diff_cow`), or change disk capacity at startup or restore. Logical block
-device capacity is distinct from an encrypted file's physical length, host disk
-allocation, and the guest filesystem's available file-data space. This migration
-does not introduce arbitrary per-instance capacity selection from one template.
+### DiskV1 creation by size
+
+A DiskV1 with no base, parent layers or template can specify only its creation
+size, in bytes, alongside the required kind/version markers:
+
+```json
+{"kind":"disk","version":1,"size":10737418240}
+```
+
+It is equivalent to adding `"diff_template":"mkfs://ext4?size=10GiB"`.
+Normalization occurs before decoding validation, binding and source identity,
+so equivalent units and the size-only shorthand identify the same creation.
+With an explicit source, `size` remains a capacity assertion; it never rescues
+an invalid source or orphan parent list. The assertion also checks an existing
+writer, whereas an unused mkfs URI's size does not. A slot alone remains unbound,
+even if it declares fixed capacity. A complete explicit disk is required to bind
+it; fixed slot capacity must match and dynamic slots adopt the selected capacity.
+
+The former root/overlay `diff_size` and `size` fields remain retired. Remove them
+and select a filesystem source of the desired capacity, use a mkfs URI, or use
+`boot.disks[].disk.size` where a complete DiskV1 is appropriate. No automatic
+filesystem resize, truncation or physical-storage quota is introduced.
+
+### Deterministic empty filesystem and compatibility
+
+The internal `empty-ext4/v1` profile fixes UUID, directory hash seed, initial and
+extended timestamps, hash signedness, reserved bytes, metadata placement and
+sparse run classification. It uses 4 KiB blocks, 256-byte inodes, a target of
+8 KiB per inode and flex_bg=8. The initial root contains only `.` and `..`; the
+profile has no journal, resize_inode or metadata checksum. Its bytes depend only
+on capacity and profile, and do not follow host mkfs defaults. Profile changes
+require a new internal version; there are no UUID/feature/seed tuning options.
+
+Identical initial disks can reuse storage Chunks/Manifests under the same
+chunking and encryption generation. Filesystem UUID is not an instance identity.
+Guest writes retain normal timestamps, inode generation and overlay UUID;
+active DIFF keys and nonces retain their existing randomness. The journal-free
+profile does not add crash-recovery guarantees to a live work disk. Existing
+journaled external filesystems and captured disks remain supported.
+
+DIFF v1 encrypted envelopes and DIFF v3 work files are no longer template
+carriers. Export their logical content with a version that supports the old
+input before upgrading; do not rename or strip headers to pretend they are raw.
+Activity and restore of supported v3/v4 writers are unaffected. Successful
+materialization removes the template dependency from reopen, export and restore.
+Logical capacity remains distinct from carrier length, physical allocation and
+Guest filesystem free space.
 
 <a id="journal-output-targets"></a>
 

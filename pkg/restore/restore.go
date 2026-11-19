@@ -795,10 +795,10 @@ func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cf
 		}
 		single := root.Single()
 		top, chain := root.Base, append([]string(nil), root.BaseFromRefs...)
-		diffURI, diffTemplate := root.Diff, root.DiffTemplate
+		diffURI := root.Diff
 		if !single {
 			top, chain = root.Overlay.Base, append([]string(nil), root.Overlay.BaseFromRefs...)
-			diffURI, diffTemplate = root.Overlay.Diff, root.Overlay.DiffTemplate
+			diffURI = root.Overlay.Diff
 		}
 		diskKey := "overlay"
 		if i != 0 {
@@ -809,7 +809,7 @@ func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cf
 			continue
 		}
 		pure := i > 0 && cfg.Boot.Disks[i-1].PureBlock
-		disk, closeDisk, err := reconstructDisk(ctx, opts, key, single, top, chain, root.Base, diffURI, diffTemplate, diskKey, logf, cache, pure)
+		disk, closeDisk, err := reconstructDisk(ctx, opts, key, single, top, chain, root.Base, diffURI, diskKey, logf, cache, pure)
 		disk.Slot = i > 0 && cfg.Boot.Disks[i-1].Slot != nil
 		if err != nil {
 			return nil, cleanup, err
@@ -833,10 +833,10 @@ func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cf
 // built on top (single mode: this IS the disk; overlay mode: the ext4 upper).
 // In overlay mode the erofs base (erofsBaseURI) is opened as the ro device.
 // capturedTop/chain come from Sandbox E's portable disk graph;
-// diffURI/diffTemplate come from the restore host binding (or the auto-default
+// diffURI comes from the restore host binding (or the auto-default
 // <sid>.<diskKey>.diff).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate, diskKey string, logf func(string, ...any), cowCache *diffstore.Cache, pure ...bool) (sandbox.DiskBackend, func() error, error) {
+func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diskKey string, logf func(string, ...any), cowCache *diffstore.Cache, pure ...bool) (sandbox.DiskBackend, func() error, error) {
 	var db sandbox.DiskBackend
 	var closers []func() error
 	cleanup := func() error {
@@ -889,11 +889,9 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	if !ok {
 		return fail(fmt.Errorf("%s: bad diff uri: %s", diskKey, diffURI))
 	}
-	var baseSize int64
-	if baseReader != nil {
-		baseSize = baseReader.Size()
-	}
-	diffInit, err := sandbox.PrepareDiff(diffPath, diffTemplate, baseSize)
+	// Captured layers are authoritative. A host initializer must never replace
+	// their contents, including when its URI names an empty filesystem.
+	diffInit, err := sandbox.PrepareDiffWithStorage(ctx, diffPath, "", baseReader, opts.storage, opts.RefLocations)
 	if err != nil {
 		return fail(fmt.Errorf("%s: prepare diff: %w", diskKey, err))
 	}
@@ -1381,10 +1379,10 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 	}
 	validateWritable := func(field string, root *config.RootConfig, diskKey string, pure bool) (retErr error) {
 		top, lowers := root.Base, root.BaseFromRefs
-		diffURI, templateURI := root.Diff, root.DiffTemplate
+		diffURI := root.Diff
 		if root.Overlay != nil {
 			top, lowers = root.Overlay.Base, root.Overlay.BaseFromRefs
-			diffURI, templateURI = root.Overlay.Diff, root.Overlay.DiffTemplate
+			diffURI = root.Overlay.Diff
 		}
 		var base diffstore.BlockReader
 		var err error
@@ -1436,14 +1434,6 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			}
 		case !os.IsNotExist(statErr):
 			return fmt.Errorf("%s writable diff stat: %w", field, statErr)
-		case templateURI != "":
-			templateScheme, templatePath, templateOK := config.SchemeAndPath(templateURI)
-			if !templateOK || templateScheme != "file" {
-				return fmt.Errorf("%s diff_template invalid URI: %s", field, templateURI)
-			}
-			if err := diffstore.ValidateDiffTemplateExt4(ctx, templatePath, base, cowOptions...); err != nil {
-				return fmt.Errorf("%s diff_template: %w", field, err)
-			}
 		default:
 			if err := validateRestoreExt4Reader(ctx, base); err != nil {
 				return fmt.Errorf("%s immutable ext4 layers: %w", field, err)

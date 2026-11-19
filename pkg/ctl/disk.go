@@ -42,9 +42,11 @@ func (req BindDiskRequest) MarshalBounded() ([]byte, error) {
 	if req.SlotName == "" {
 		return nil, fmt.Errorf("%w: bind requires slot_name", ErrDiskInvalid)
 	}
-	if err := req.Disk.Validate(); err != nil {
+	normalized, err := req.Disk.NormalizeCreate()
+	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrDiskInvalid, err)
 	}
+	req.Disk = normalized
 	b, err := json.Marshal(req)
 	if err == nil && len(b) > config.MaxPortableConfigBytes {
 		err = fmt.Errorf("%w: disk bind request exceeds message limit", ErrDiskInvalid)

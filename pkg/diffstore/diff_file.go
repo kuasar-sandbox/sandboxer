@@ -49,14 +49,15 @@ type diffScratch struct {
 	buffer []byte
 }
 
-// DiffInit describes how OpenDisk obtains its active diff. Existing
-// non-empty targets always win and ignore the other fields. A fresh target is
-// either seeded from TemplatePath's logical sparse plaintext view or created
-// at CreateSize when no template is present.
+// DiffInit describes how OpenDisk obtains its active diff. Existing opens the
+// active target without calling Template. Otherwise a fresh target is seeded
+// from the lazily opened Template (whose Size determines capacity), or created
+// at CreateSize when no template is present. The caller selects Existing before
+// constructing an initializer; fresh creation never replaces an existing path.
 type DiffInit struct {
-	Existing     bool
-	TemplatePath string
-	CreateSize   int64
+	Existing   bool
+	Template   TemplateFactory
+	CreateSize int64
 }
 
 // DiskOption configures active-diff storage without changing the COW
@@ -95,7 +96,7 @@ func (o diffEncryptionDiskOption) applyDisk(options *diskOptions) error {
 }
 
 // WithDiffEncryption makes active-diff reads policy-aware and encrypts every
-// fresh diff using customerKey: v1 by default, or v2 with WithCheckpoint.
+// fresh diff using customerKey: v3 by default, or v4 with WithCheckpoint.
 // required rejects existing
 // plaintext active diffs; it does not reject a plaintext template used only as
 // a provisioning input.
@@ -157,7 +158,7 @@ func openSingleDiff(path string, init DiffInit, options diskOptions) (*diffFile,
 	if init.Existing {
 		return openExistingDiffFile(path, options.encryption, options.required, false)
 	}
-	if init.TemplatePath != "" {
+	if init.Template != nil {
 		return nil, fmt.Errorf("diffstore: templated fresh diff must be opened through OpenDisk")
 	}
 	fresh, err := createFreshDiffFile(path, init, options.encryption)
@@ -217,34 +218,6 @@ func createFreshDiffFile(path string, init DiffInit, encryption *diffEncryption)
 	return createFreshDiff(path, init, diskOptions{encryption: encryption})
 }
 
-// initializeFreshDiffFile preserves the historical synchronous helper used by
-// focused diff tests. OpenDisk uses the asynchronous fresh path instead.
-func initializeFreshDiffFile(path string, logicalSize int64, encryption *diffEncryption, template diffTemplateSource) (*diffFile, error) {
-	init := DiffInit{CreateSize: logicalSize}
-	fresh, err := createFreshDiffFile(path, init, encryption)
-	if err != nil {
-		return nil, err
-	}
-	defer fresh.abort()
-	if template != nil {
-		if err := seedDiffTemplate(context.Background(), fresh.diff, template); err != nil {
-			return nil, fmt.Errorf("diffstore: seed diff template: %w", err)
-		}
-	}
-	if err := fresh.diff.Sync(); err != nil {
-		return nil, fmt.Errorf("diffstore: sync fresh diff: %w", err)
-	}
-	if err := fresh.diff.Close(); err != nil {
-		fresh.diff = nil
-		return nil, fmt.Errorf("diffstore: close fresh diff: %w", err)
-	}
-	fresh.diff = nil
-	if err := fresh.commit(); err != nil {
-		return nil, err
-	}
-	return openExistingDiffFile(path, encryption, encryption != nil, false)
-}
-
 func diffHeaderAAD(prefix []byte) []byte {
 	aad := make([]byte, 0, len(diffHeaderAADDomain)+len(prefix))
 	aad = append(aad, diffHeaderAADDomain...)
@@ -253,8 +226,7 @@ func diffHeaderAAD(prefix []byte) []byte {
 }
 
 type diffEncryption struct {
-	header         cipher.AEAD
-	templateHeader cipher.AEAD
+	header cipher.AEAD
 }
 
 func newDiffEncryption(customerKey [32]byte) (*diffEncryption, error) {
@@ -262,11 +234,7 @@ func newDiffEncryption(customerKey [32]byte) (*diffEncryption, error) {
 	if err != nil {
 		return nil, err
 	}
-	templateHeader, err := newDiffHeaderCipher(customerKey, []byte("kuasar/diff/header-key/aes-gcm/v1\x00"))
-	if err != nil {
-		return nil, err
-	}
-	return &diffEncryption{header: header, templateHeader: templateHeader}, nil
+	return &diffEncryption{header: header}, nil
 }
 
 func newDiffHeaderCipher(customerKey [32]byte, domain []byte) (cipher.AEAD, error) {
@@ -404,14 +372,9 @@ func (d *diffFile) Close() error {
 	return errors.Join(d.direct.read.Close(), d.direct.write.Close(), d.f.Close())
 }
 
-type diffTemplateSource interface {
-	sparse.Source
-	io.Closer
-}
-
 type freshDiffInit struct {
 	diff          diffBackend
-	template      diffTemplateSource
+	template      TemplateSource
 	tmpPath       string
 	finalPath     string
 	claim         *os.File
@@ -463,8 +426,9 @@ func (f *freshDiffInit) abort() error {
 	}
 	var err error
 	if f.template != nil {
-		err = errors.Join(err, f.template.Close())
+		template := f.template
 		f.template = nil
+		err = errors.Join(err, template.Close())
 	}
 	if f.diff != nil {
 		err = errors.Join(err, f.diff.Close())
@@ -483,8 +447,9 @@ func (f *freshDiffInit) failMaterialization() error {
 	}
 	var err error
 	if f.template != nil {
-		err = errors.Join(err, f.template.Close())
+		template := f.template
 		f.template = nil
+		err = errors.Join(err, template.Close())
 	}
 	if !f.committed && f.tmpPath != "" {
 		err = errors.Join(err, os.Remove(f.tmpPath))
@@ -493,21 +458,13 @@ func (f *freshDiffInit) failMaterialization() error {
 	return err
 }
 
-type fileDiffTemplate struct {
+type singleDiffSource struct {
 	diff *diffFile
 }
 
-func openLazyDiffTemplate(path string, encryption *diffEncryption) (diffTemplateSource, error) {
-	return openProvisioningTemplate(path, encryption)
-}
+func (s *singleDiffSource) Size() uint64 { return uint64(s.diff.logicalSize) }
 
-func openDiffTemplate(path string, encryption *diffEncryption) (diffTemplateSource, error) {
-	return openProvisioningTemplate(path, encryption)
-}
-
-func (s *fileDiffTemplate) Size() uint64 { return uint64(s.diff.logicalSize) }
-
-func (s *fileDiffTemplate) RunAt(offset, limit uint64) (sparse.Run, error) {
+func (s *singleDiffSource) RunAt(offset, limit uint64) (sparse.Run, error) {
 	if offset >= s.Size() {
 		return nil, io.EOF
 	}
@@ -515,21 +472,21 @@ func (s *fileDiffTemplate) RunAt(offset, limit uint64) (sparse.Run, error) {
 		return nil, fmt.Errorf("diffstore: diff template RunAt limit is zero")
 	}
 	kind, end := s.diff.classify(offset, limit)
-	return fileDiffTemplateRun{source: s, offset: offset, end: end, kind: kind}, nil
+	return singleDiffSourceRun{source: s, offset: offset, end: end, kind: kind}, nil
 }
 
-type fileDiffTemplateRun struct {
-	source *fileDiffTemplate
+type singleDiffSourceRun struct {
+	source *singleDiffSource
 	offset uint64
 	end    uint64
 	kind   sparse.RunKind
 }
 
-func (r fileDiffTemplateRun) Offset() uint64       { return r.offset }
-func (r fileDiffTemplateRun) End() uint64          { return r.end }
-func (r fileDiffTemplateRun) Kind() sparse.RunKind { return r.kind }
+func (r singleDiffSourceRun) Offset() uint64       { return r.offset }
+func (r singleDiffSourceRun) End() uint64          { return r.end }
+func (r singleDiffSourceRun) Kind() sparse.RunKind { return r.kind }
 
-func (r fileDiffTemplateRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+func (r singleDiffSourceRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
 	length := r.end - r.offset
 	if innerOffset > length || uint64(len(buf)) > length-innerOffset {
 		return 0, fmt.Errorf("diffstore: diff template Run read outside [0,%d)", length)
@@ -554,116 +511,18 @@ func (r fileDiffTemplateRun) ReadAt(ctx context.Context, buf []byte, innerOffset
 	return n, io.ErrUnexpectedEOF
 }
 
-func (s *fileDiffTemplate) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
+func (s *singleDiffSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 	return s.diff.ReadAt(buf, int64(offset))
 }
 
-func (s *fileDiffTemplate) Close() error { return s.diff.Close() }
-
-func seedDiffTemplate(ctx context.Context, target diffBackend, source diffTemplateSource) error {
-	block := make([]byte, cowBlockSize)
-	defer clear(block)
-	var nextSeed uint64
-	for offset := uint64(0); offset < source.Size(); {
-		run, err := source.RunAt(offset, source.Size()-offset)
-		if err != nil {
-			return err
-		}
-		kind, end := run.Kind(), run.End()
-		if end <= offset || end > source.Size() {
-			return fmt.Errorf("invalid diff template sparse run")
-		}
-		if kind != sparse.Hole {
-			start := uint64(int64(offset) / cowBlockSize * cowBlockSize)
-			if start < nextSeed {
-				start = nextSeed
-			}
-			seedEnd := uint64(alignUp(int64(end), cowBlockSize))
-			for position := start; position < seedEnd; {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-				if kind == sparse.Zero && position >= offset && position+cowBlockSize <= end {
-					zeroEnd := min(end/cowBlockSize*cowBlockSize, position+64*cowBlockSize)
-					if err := target.discard(ctx, int64(position), int64(zeroEnd-position)); err != nil {
-						return err
-					}
-					position = zeroEnd
-					continue
-				}
-				read, err := source.ReadAt(ctx, block, position)
-				if err != nil && !(errors.Is(err, io.EOF) && read == len(block)) {
-					return err
-				}
-				if read != len(block) {
-					return io.ErrUnexpectedEOF
-				}
-				written, err := target.WriteAt(block, int64(position))
-				if err != nil {
-					return err
-				}
-				if written != len(block) {
-					return io.ErrShortWrite
-				}
-				position += cowBlockSize
-			}
-			nextSeed = seedEnd
-		}
-		offset = end
-	}
-	return nil
-}
+func (s *singleDiffSource) Close() error { return s.diff.Close() }
 
 func commitFreshDiff(source, destination string) error {
-	err := unix.Renameat2(unix.AT_FDCWD, source, unix.AT_FDCWD, destination, unix.RENAME_NOREPLACE)
-	if !errors.Is(err, unix.EEXIST) {
-		if err != nil {
-			return fmt.Errorf("diffstore: commit fresh diff without replacement: %w", err)
-		}
-		return nil
-	}
-
-	// The historical contract treats an existing empty regular file as a
-	// provisioned placeholder. Serialize cooperating creators on its inode,
-	// revalidate the path while holding that lock, then atomically exchange the
-	// seeded temporary file with the placeholder. The post-exchange inode and
-	// size checks catch a non-cooperating path replacement or writer before the
-	// old empty inode is removed.
-	placeholder, openErr := os.OpenFile(destination, os.O_RDWR|unix.O_NOFOLLOW, 0)
-	if openErr != nil {
+	if err := unix.Renameat2(unix.AT_FDCWD, source, unix.AT_FDCWD, destination, unix.RENAME_NOREPLACE); err != nil {
 		return fmt.Errorf("diffstore: commit fresh diff without replacement: %w", err)
-	}
-	defer placeholder.Close()
-	if lockErr := unix.Flock(int(placeholder.Fd()), unix.LOCK_EX); lockErr != nil {
-		return fmt.Errorf("diffstore: lock empty diff placeholder: %w", lockErr)
-	}
-	defer unix.Flock(int(placeholder.Fd()), unix.LOCK_UN)
-	placeholderInfo, statErr := placeholder.Stat()
-	pathInfo, pathErr := os.Lstat(destination)
-	if statErr != nil || pathErr != nil || !placeholderInfo.Mode().IsRegular() ||
-		placeholderInfo.Size() != 0 || !os.SameFile(placeholderInfo, pathInfo) {
-		return fmt.Errorf("diffstore: commit fresh diff without replacement: %w", err)
-	}
-	if exchangeErr := unix.Renameat2(unix.AT_FDCWD, source, unix.AT_FDCWD, destination, unix.RENAME_EXCHANGE); exchangeErr != nil {
-		return fmt.Errorf("diffstore: exchange empty diff placeholder: %w", exchangeErr)
-	}
-	rollback := func(cause error) error {
-		rollbackErr := unix.Renameat2(unix.AT_FDCWD, source, unix.AT_FDCWD, destination, unix.RENAME_EXCHANGE)
-		if rollbackErr != nil {
-			return errors.Join(cause, fmt.Errorf("diffstore: roll back empty diff placeholder exchange: %w", rollbackErr))
-		}
-		return cause
-	}
-	swappedInfo, swappedErr := os.Lstat(source)
-	placeholderInfo, statErr = placeholder.Stat()
-	if swappedErr != nil || statErr != nil || !os.SameFile(placeholderInfo, swappedInfo) || placeholderInfo.Size() != 0 {
-		return rollback(fmt.Errorf("diffstore: empty diff placeholder changed during atomic exchange"))
-	}
-	if removeErr := os.Remove(source); removeErr != nil {
-		return rollback(fmt.Errorf("diffstore: remove exchanged empty diff placeholder: %w", removeErr))
 	}
 	return nil
 }
@@ -744,15 +603,15 @@ func releaseDiffScratch(scratch *diffScratch) {
 	}
 }
 
-// DiffSourceCapacity authenticates and reads logical capacity without opening
-// a writable backend or provisioning any files. Templates retain the existing plaintext-allowed provisioning policy.
-func DiffSourceCapacity(path string, template bool, rawOptions ...DiskOption) (int64, error) {
+// ExistingDiffCapacity authenticates and reads an active DIFF logical capacity
+// without opening a writable backend or provisioning files.
+func ExistingDiffCapacity(path string, rawOptions ...DiskOption) (int64, error) {
 	options, err := parseDiskOptions(rawOptions)
 	if err != nil {
 		return 0, err
 	}
 	if info, err := versioned.Probe(path); err == nil {
-		if options.required && !template && !info.Encrypted {
+		if options.required && !info.Encrypted {
 			return 0, ErrDiffPlaintextForbidden
 		}
 		source, err := versioned.OpenExport(context.Background(), path, "", options.checkpointKey)
@@ -762,14 +621,6 @@ func DiffSourceCapacity(path string, template bool, rawOptions ...DiskOption) (i
 		return int64(source.Size()), source.Close()
 	} else if !errors.Is(err, versioned.ErrFormat) {
 		return 0, err
-	}
-	if template {
-		source, err := openDiffTemplate(path, options.encryption)
-		if err != nil {
-			return 0, err
-		}
-		size := source.Size()
-		return int64(size), source.Close()
 	}
 	file, err := openExistingDiffFile(path, options.encryption, options.required, true)
 	if err != nil {

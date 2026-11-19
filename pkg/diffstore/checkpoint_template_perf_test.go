@@ -45,8 +45,9 @@ func TestCheckpointInitializationPhases(t *testing.T) {
 	}
 	var init = DiffInit{CreateSize: size}
 	if templated {
-		init.TemplatePath = filepath.Join(dir, "template.raw")
-		f, err := os.Create(init.TemplatePath)
+		templatePath := filepath.Join(dir, "template.raw")
+		init.Template = rawTemplateFactory(templatePath)
+		f, err := os.Create(templatePath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -290,7 +291,7 @@ func TestCheckpointTemplatePhases(t *testing.T) {
 	}
 	totalStart := time.Now()
 	start := time.Now()
-	cow, err := OpenDisk(path, nil, DiffInit{CreateSize: size, TemplatePath: templatePath}, options...)
+	cow, err := OpenDisk(path, nil, DiffInit{CreateSize: size, Template: rawTemplateFactory(templatePath)}, options...)
 	openNS := time.Since(start).Nanoseconds()
 	if err != nil {
 		t.Fatal(err)

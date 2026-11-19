@@ -176,7 +176,7 @@ func TestColdPreflightReadsReopenedV2ThroughTheSharedDiskPlan(t *testing.T) {
 	}
 	root := &config.RootConfig{Diff: "file://" + path}
 	check := func(b *CheckpointDiskBinding) error {
-		return preflightWritableExt4(context.Background(), root, "root", "", nil, nil, nil, [32]byte{}, false, nil, b)
+		return preflightWritableExt4(context.Background(), root, "root", "", nil, nil, nil, [32]byte{}, false, nil, nil, b)
 	}
 	if err := check(&binding); err != nil {
 		t.Fatalf("valid v2 plan rejected: %v", err)

@@ -361,7 +361,7 @@ func TestZeroTemplateSeedKeepsPayloadSparse(t *testing.T) {
 			if err := source.Close(); err != nil {
 				t.Fatal(err)
 			}
-			template, err := openDiffTemplate(filepath.Join(dir, "source"), enc)
+			template, err := openTestActiveTemplate(filepath.Join(dir, "source"), enc)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -382,7 +382,7 @@ func TestZeroTemplateSeedKeepsPayloadSparse(t *testing.T) {
 }
 
 type gatedTemplateSource struct {
-	diffTemplateSource
+	TemplateSource
 	beforeRun func()
 	afterRead func()
 }
@@ -391,11 +391,11 @@ func (s *gatedTemplateSource) RunAt(off, limit uint64) (sparse.Run, error) {
 	if off == cowBlockSize && s.beforeRun != nil {
 		s.beforeRun()
 	}
-	return s.diffTemplateSource.RunAt(off, limit)
+	return s.TemplateSource.RunAt(off, limit)
 }
 
 func (s *gatedTemplateSource) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) {
-	n, err := s.diffTemplateSource.ReadAt(ctx, p, off)
+	n, err := s.TemplateSource.ReadAt(ctx, p, off)
 	if off == cowBlockSize && s.afterRead != nil {
 		s.afterRead()
 	}
@@ -458,7 +458,7 @@ func TestTemplatePresenceAloneCoordinatesDiscardAndWrites(t *testing.T) {
 							if err := source.Close(); err != nil {
 								t.Fatal(err)
 							}
-							template, err := openDiffTemplate(sourcePath, opts.encryption)
+							template, err := openTestActiveTemplate(sourcePath, opts.encryption)
 							if err != nil {
 								t.Fatal(err)
 							}
@@ -466,7 +466,7 @@ func TestTemplatePresenceAloneCoordinatesDiscardAndWrites(t *testing.T) {
 							defer gate.open()
 							var once sync.Once
 							pause := func() { once.Do(gate.wait) }
-							wrapped := &gatedTemplateSource{diffTemplateSource: template}
+							wrapped := &gatedTemplateSource{TemplateSource: template}
 							if phase == "before" {
 								wrapped.beforeRun = pause
 							} else if phase == "read-before-publish" {
