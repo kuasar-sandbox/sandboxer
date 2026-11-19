@@ -56,6 +56,9 @@ func (l Lease) Validate() error {
 	if _, err := CacheMaximumFromFeatures(l.ClientFeatures); err != nil {
 		return err
 	}
+	if _, err := CacheReclaimRunFromFeatures(l.ClientFeatures); err != nil {
+		return err
+	}
 	if l.StartupMemory == 0 || l.StartupMemory > l.CapacityMemory {
 		return fmt.Errorf("lease startup memory is outside (0, capacity]")
 	}

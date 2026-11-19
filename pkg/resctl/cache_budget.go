@@ -88,6 +88,9 @@ func (h *ControllerHooks) requestCacheBudget(current, requested, doneSeq uint64)
 	if state.released || !state.admitted || !state.cacheSupported {
 		return 0, state.cacheReservation, state.cacheTarget, 0, errors.New("cache budget session unavailable")
 	}
+	if requested > 0 && state.cacheCoordinated && (state.cacheReclaim.Task != nil || state.cacheReclaim.Done != nil) {
+		return 0, state.cacheReservation, state.cacheTarget, 0, errors.New("cache reclaim task or completion is unresolved")
+	}
 	if current > state.cacheReservation || current > state.cacheMaximum ||
 		requested > state.cacheMaximum-current {
 		return 0, state.cacheReservation, state.cacheTarget, 0, fmt.Errorf("invalid cache request baseline")
@@ -99,6 +102,10 @@ func (h *ControllerHooks) requestCacheBudget(current, requested, doneSeq uint64)
 	if current < state.cacheReservation {
 		h.mu.Lock()
 		h.cacheReservation = current
+		// A release may return a failed construction's initial grant, while a
+		// partial growth rollback may still exceed the prior physical baseline.
+		// Neither case turns unconfirmed grant bytes into confirmed payloads.
+		h.cacheReclaim.Current = min(h.cacheReclaim.Current, current)
 		h.mu.Unlock()
 	}
 	if !state.connected {

@@ -93,17 +93,24 @@ func NewCacheWithBudget(ctx context.Context, hooks *ControllerHooks, maximum, ma
 }
 
 type elasticCacheController struct {
-	cache           *diffstore.Cache
-	hooks           *ControllerHooks
-	ctx             context.Context
-	wake            chan struct{}
-	growth          uint64
-	growAfter       time.Time
-	lastDemand      uint64
-	pendingGrowth   bool
-	moreIdleReclaim bool
-	pendingAck      uint64
-	idleAfter       time.Duration
+	cache              *diffstore.Cache
+	hooks              *ControllerHooks
+	ctx                context.Context
+	wake               chan struct{}
+	growth             uint64
+	growAfter          time.Time
+	lastDemand         uint64
+	pendingGrowth      bool
+	moreIdleReclaim    bool
+	pendingAck         uint64
+	idleAfter          time.Duration
+	reclaimObserved    diffstore.BudgetSnapshot
+	reclaimObservedSet bool
+	reclaimObservation uint64
+	reclaimIntentSeq   uint64
+	reclaimProbeIntent uint64
+	reclaimZero        bool
+	reclaimProbeAfter  time.Time
 }
 
 // Start preparing the next grant while existing slots can still serve a burst.
@@ -148,39 +155,45 @@ func (c *elasticCacheController) adjust(tick bool) {
 		s = c.cache.BudgetSnapshot()
 	}
 	minimum := min(s.Maximum, cacheBudgetUnit)
-	target, seq := c.hooks.CacheRequest()
-	if target > 0 {
-		var released uint64
-		if (seq == 0 || seq != c.pendingAck) && s.Capacity > max(minimum, target) {
-			released = c.reclaimBudget(s.Capacity - max(minimum, target))
+	if c.hooks.CacheCoordinated() {
+		if c.adjustCoordinatedReclaim(s, tick) {
+			return
 		}
-		// A lost acknowledgement may be retried without evicting more pages.
-		// StateSync can cancel this request or replace it with a new sequence.
-		if released > 0 || seq != 0 {
-			c.pendingAck = seq
-			if c.reportReclaim(seq) == nil {
-				c.pendingAck = 0
+	} else {
+		target, seq := c.hooks.CacheRequest()
+		if target > 0 {
+			var released uint64
+			if (seq == 0 || seq != c.pendingAck) && s.Capacity > max(minimum, target) {
+				released = c.reclaimBudget(s.Capacity - max(minimum, target))
 			}
-		}
-		return
-	}
-	c.pendingAck = 0
-
-	// Observe unused grant headroom on maintenance ticks. A queued I/O wake
-	// from before a grant must not immediately return the newly granted pages.
-	if tick || c.moreIdleReclaim {
-		c.moreIdleReclaim = false
-		free := s.Capacity - s.Used
-		idle := free + s.Expired
-		if s.Capacity > minimum && idle >= cacheBudgetUnit {
-			wanted := min(s.Capacity-minimum, idle/cacheBudgetUnit*cacheBudgetUnit)
-			if released := c.reclaimBudget(wanted); released > 0 {
-				_ = c.reportReclaim(0)
-				if released == cacheMaxBatch && wanted > released {
-					c.moreIdleReclaim = true
-					c.notify()
+			// A lost acknowledgement may be retried without evicting more pages.
+			// StateSync can cancel this request or replace it with a new sequence.
+			if released > 0 || seq != 0 {
+				c.pendingAck = seq
+				if c.reportReclaim(seq) == nil {
+					c.pendingAck = 0
 				}
-				return
+			}
+			return
+		}
+		c.pendingAck = 0
+
+		// Observe unused grant headroom on maintenance ticks. A queued I/O wake
+		// from before a grant must not immediately return the newly granted pages.
+		if tick || c.moreIdleReclaim {
+			c.moreIdleReclaim = false
+			free := s.Capacity - s.Used
+			idle := free + s.Expired
+			if s.Capacity > minimum && idle >= cacheBudgetUnit {
+				wanted := min(s.Capacity-minimum, idle/cacheBudgetUnit*cacheBudgetUnit)
+				if released := c.reclaimBudget(wanted); released > 0 {
+					_ = c.reportReclaim(0)
+					if released == cacheMaxBatch && wanted > released {
+						c.moreIdleReclaim = true
+						c.notify()
+					}
+					return
+				}
 			}
 		}
 	}
@@ -227,12 +240,14 @@ func (c *elasticCacheController) adjust(tick bool) {
 	if applied < newBudget {
 		if c.cache.Err() == nil && c.cache.BudgetSnapshot().Resident <= applied {
 			_, _, _, _, _ = c.hooks.RequestCacheBudget(applied, 0)
+			c.hooks.confirmCacheReclaimCurrent(applied)
 		}
 		c.growth = max(cachePhysicalBatch, applied-s.Capacity)
 		c.setWatermark(c.growth)
 		c.growAfter = time.Now().Add(cacheRetryWait)
 		return
 	}
+	c.hooks.confirmCacheReclaimCurrent(applied)
 	c.lastDemand = s.Demand
 	c.pendingGrowth = false
 	c.growth = delta

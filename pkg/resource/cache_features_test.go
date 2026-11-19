@@ -13,8 +13,9 @@ func TestCacheBudgetLeaseRetainsStrictLegacySchema(t *testing.T) {
 		ControllerSocket: "/run/sandbox-resource.sock", CgroupPath: "/sandbox/test",
 		CapacityMemory: 1 << 30, CapacityCPUMilli: 1000,
 		FloorMemory: 256 << 20, FloorCPUMilli: 1000,
-		StartupMemory:  512 << 20,
-		ClientFeatures: []string{FeatureStateSyncV1, FeatureCacheBudgetV1, CacheMaximumFeature(maximum)},
+		StartupMemory: 512 << 20,
+		ClientFeatures: []string{FeatureStateSyncV1, FeatureCacheBudgetV1, CacheMaximumFeature(maximum),
+			FeatureCacheReclaimV1, CacheReclaimRunFeature(testCacheReclaimRun)},
 	}
 	if err := l.Validate(); err != nil {
 		t.Fatal(err)

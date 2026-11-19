@@ -34,6 +34,7 @@ const (
 	TypeBudgetResponse      = "budget_response"
 	TypeRequestCacheBudget  = "request_cache_budget"
 	TypeCacheBudgetResponse = "cache_budget_response"
+	TypeCacheReclaimUpdate  = "cache_reclaim_update"
 	TypeOOMReport           = "oom_report"
 	TypeHeartbeat           = "heartbeat"
 	TypeRelease             = "release"
@@ -136,8 +137,8 @@ type Message struct {
 	NewAllocatable uint64 `json:"new_allocatable,omitempty"` // resulting/echoed reservation
 	CooldownMs     int64  `json:"cooldown_ms,omitempty"`
 
-	// Cache is a separate host-memory reservation sharing the node memory
-	// pool with Guest Budget. CacheCurrent is a safe, physically completed
+	// Cache is a separate host-memory reservation, independent of Guest Budget.
+	// CacheCurrent is a safe, physically completed
 	// baseline; returning it to the node never assumes reclaim from RSS alone.
 	CacheCurrent       uint64 `json:"cache_current,omitempty"`
 	CacheRequested     uint64 `json:"cache_requested,omitempty"`
@@ -147,6 +148,12 @@ type Message struct {
 	CacheReclaimTarget uint64 `json:"cache_reclaim_target,omitempty"`
 	CacheReclaimSeq    uint64 `json:"cache_reclaim_seq,omitempty"`
 	CacheReclaimDone   uint64 `json:"cache_reclaim_done,omitempty"`
+	// Coordinated reclaim has finite execution authority. A present state is
+	// a complete intent update: a nil Intent explicitly withdraws the intent.
+	CacheReclaim       *CacheReclaimState  `json:"cache_reclaim,omitempty"`
+	CacheReclaimTask   *CacheReclaimTask   `json:"cache_reclaim_task,omitempty"`
+	CacheReclaimAck    uint64              `json:"cache_reclaim_ack,omitempty"`
+	CacheReclaimStatus *CacheReclaimStatus `json:"cache_reclaim_status,omitempty"`
 
 	// OOMReport.
 	OOMCount  uint64 `json:"oom_count,omitempty"`
@@ -158,22 +165,25 @@ type Message struct {
 
 	// AdminStatus response. NodeBudget is the existing name for the configured
 	// physical total; HostReserved and OperationalMargin are reported separately.
-	// NodeAllocated and Allocated.MemoryBytes are the aggregate live node
-	// reservation, not guest demand or host VMM charge.
-	Zone              string            `json:"zone,omitempty"`
-	NodeAllocated     uint64            `json:"node_allocated_memory,omitempty"`
-	AllocatablePool   uint64            `json:"allocatable_pool_memory,omitempty"`
-	ReservationCount  int               `json:"reservation_count,omitempty"`
-	ProvisionalCount  int               `json:"provisional_count,omitempty"`
-	UnknownCount      int               `json:"unknown_count,omitempty"`
-	Drained           bool              `json:"drained,omitempty"`
-	NodeBudget        ResourcesView     `json:"node_budget,omitempty"`
-	HostReserved      ResourcesView     `json:"host_reserved,omitempty"`
-	OperationalMargin ResourcesView     `json:"operational_margin,omitempty"`
-	Allocated         ResourcesView     `json:"allocated,omitempty"`
-	Pool              ResourcesView     `json:"pool,omitempty"`
-	StartupInFlight   uint64            `json:"startup_in_flight,omitempty"`
-	Reservations      []ReservationView `json:"reservations,omitempty"`
+	// NodeAllocated and Allocated.MemoryBytes are the aggregate live Guest
+	// reservation, excluding the independent cache quota. They are not Guest
+	// demand or host VMM charge.
+	Zone                      string            `json:"zone,omitempty"`
+	NodeAllocated             uint64            `json:"node_allocated_memory,omitempty"`
+	AllocatablePool           uint64            `json:"allocatable_pool_memory,omitempty"`
+	ReservationCount          int               `json:"reservation_count,omitempty"`
+	ProvisionalCount          int               `json:"provisional_count,omitempty"`
+	UnknownCount              int               `json:"unknown_count,omitempty"`
+	Drained                   bool              `json:"drained,omitempty"`
+	NodeBudget                ResourcesView     `json:"node_budget,omitempty"`
+	HostReserved              ResourcesView     `json:"host_reserved,omitempty"`
+	OperationalMargin         ResourcesView     `json:"operational_margin,omitempty"`
+	Allocated                 ResourcesView     `json:"allocated,omitempty"`
+	Pool                      ResourcesView     `json:"pool,omitempty"`
+	StartupInFlight           uint64            `json:"startup_in_flight,omitempty"`
+	CacheAllocated            uint64            `json:"cache_allocated"`
+	CacheRecoveryUnknownCount int               `json:"cache_recovery_unknown_count"`
+	Reservations              []ReservationView `json:"reservations,omitempty"`
 
 	// AdminList pagination. ListLimit=0 is a legacy unpaginated request;
 	// current clients always send a positive limit. ListAfter and ListNext are

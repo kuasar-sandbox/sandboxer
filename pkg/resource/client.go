@@ -218,6 +218,7 @@ type AdmitParams struct {
 	ClientFeatures        []string
 	CacheMaximum          uint64
 	CacheInitial          uint64
+	CacheReclaim          *CacheReclaimState
 }
 
 // AdmitResult captures the response from an Admit call.
@@ -241,6 +242,8 @@ type AdmitResult struct {
 	// QueuedETAMs is retained for wire-format BC; never populated by the
 	// modern controller (which never returns StatusQueued).
 	CacheSupported      bool
+	CacheCoordinated    bool
+	ClientFeatures      []string
 	GrantedInitialCache uint64
 	QueuedETAMs         int64
 }
@@ -268,6 +271,7 @@ func (c *Client) AdmitContext(ctx context.Context, p AdmitParams) (*AdmitResult,
 		ClientFeatures:        append([]string(nil), p.ClientFeatures...),
 		CacheMaximum:          p.CacheMaximum,
 		CacheInitial:          p.CacheInitial,
+		CacheReclaim:          CloneCacheReclaimState(p.CacheReclaim),
 	}, DeadlineAdmit)
 	if err != nil {
 		return nil, err
@@ -285,6 +289,8 @@ func (c *Client) AdmitContext(ctx context.Context, p AdmitParams) (*AdmitResult,
 		Reason:              resp.Reason,
 		Msg:                 resp.Msg,
 		CacheSupported:      HasFeature(resp.ClientFeatures, FeatureCacheBudgetV1),
+		CacheCoordinated:    HasFeature(resp.ClientFeatures, FeatureCacheReclaimV1),
+		ClientFeatures:      append([]string(nil), resp.ClientFeatures...),
 		GrantedInitialCache: resp.GrantedInitialCache,
 		QueuedForMs:         resp.QueuedForMs,
 		QueuePosAtIn:        resp.QueuePosAtIn,
@@ -304,6 +310,7 @@ type StateSyncParams struct {
 	Settled                  bool
 	CurrentRSS               uint64
 	PreviousToken            string
+	CacheReclaim             *CacheReclaimState
 }
 
 type StateSyncResult struct {
@@ -312,6 +319,9 @@ type StateSyncResult struct {
 	CacheReclaimTarget uint64
 	CacheReclaimSeq    uint64
 	NewAllocatable     uint64 // echoed/reconciled node reservation
+	CacheReclaimTask   *CacheReclaimTask
+	CacheReclaimAck    uint64
+	ClientFeatures     []string
 }
 
 func (c *Client) StateSync(p StateSyncParams) (*StateSyncResult, error) {
@@ -337,6 +347,7 @@ func (c *Client) StateSyncContextOnWrite(ctx context.Context, p StateSyncParams,
 		Settled:                  p.Settled,
 		CurrentRSS:               p.CurrentRSS,
 		PreviousToken:            p.PreviousToken,
+		CacheReclaim:             CloneCacheReclaimState(p.CacheReclaim),
 	}, DeadlineAdmit, onWrite, guard)
 	if err != nil {
 		return nil, err
@@ -347,7 +358,8 @@ func (c *Client) StateSyncContextOnWrite(ctx context.Context, p StateSyncParams,
 	c.mu.Lock()
 	c.token = resp.Token
 	c.mu.Unlock()
-	return &StateSyncResult{Token: resp.Token, NewAllocatable: resp.NewAllocatable, CacheReservation: resp.CacheReservation, CacheReclaimTarget: resp.CacheReclaimTarget, CacheReclaimSeq: resp.CacheReclaimSeq}, nil
+	return &StateSyncResult{Token: resp.Token, NewAllocatable: resp.NewAllocatable, CacheReservation: resp.CacheReservation, CacheReclaimTarget: resp.CacheReclaimTarget, CacheReclaimSeq: resp.CacheReclaimSeq,
+		CacheReclaimTask: resp.CacheReclaimTask, CacheReclaimAck: resp.CacheReclaimAck, ClientFeatures: append([]string(nil), resp.ClientFeatures...)}, nil
 }
 
 // Settled marks the per-sandbox state machine's startup → settled
@@ -419,6 +431,8 @@ type HeartbeatResult struct {
 	CacheReservation   uint64
 	CacheReclaimTarget uint64
 	CacheReclaimSeq    uint64
+	CacheReclaimTask   *CacheReclaimTask
+	CacheReclaimAck    uint64
 }
 
 // Heartbeat sends host-charge diagnostics and returns the node's current
@@ -448,7 +462,8 @@ func (c *Client) HeartbeatContext(ctx context.Context, rss, cpuUsec, recentHigh,
 	if resp.Type != TypeAck {
 		return nil, fmt.Errorf("client: heartbeat reply %q", resp.Type)
 	}
-	return &HeartbeatResult{NewAllocatable: resp.NewAllocatable, CacheReservation: resp.CacheReservation, CacheReclaimTarget: resp.CacheReclaimTarget, CacheReclaimSeq: resp.CacheReclaimSeq}, nil
+	return &HeartbeatResult{NewAllocatable: resp.NewAllocatable, CacheReservation: resp.CacheReservation, CacheReclaimTarget: resp.CacheReclaimTarget, CacheReclaimSeq: resp.CacheReclaimSeq,
+		CacheReclaimTask: resp.CacheReclaimTask, CacheReclaimAck: resp.CacheReclaimAck}, nil
 }
 
 // AdminDrain toggles drain mode on the controller.
@@ -465,19 +480,22 @@ func (c *Client) AdminDrain(enable bool) error {
 
 // AdminStatusResult is the response to AdminStatus.
 type AdminStatusResult struct {
-	Zone              string
-	NodeAllocated     uint64
-	AllocatablePool   uint64
-	ReservationCount  int
-	ProvisionalCount  int
-	UnknownCount      int
-	Drained           bool
-	NodeBudget        ResourcesView
-	HostReserved      ResourcesView
-	OperationalMargin ResourcesView
-	Allocated         ResourcesView
-	Pool              ResourcesView
-	StartupInFlight   uint64
+	Zone                      string
+	NodeAllocated             uint64
+	AllocatablePool           uint64
+	ReservationCount          int
+	ProvisionalCount          int
+	UnknownCount              int
+	Drained                   bool
+	NodeBudget                ResourcesView
+	HostReserved              ResourcesView
+	OperationalMargin         ResourcesView
+	Allocated                 ResourcesView
+	Pool                      ResourcesView
+	StartupInFlight           uint64
+	CacheReclaimStatus        *CacheReclaimStatus
+	CacheAllocated            uint64
+	CacheRecoveryUnknownCount int
 }
 
 // AdminStatus queries the controller's live state via RPC. Useful when
@@ -491,19 +509,22 @@ func (c *Client) AdminStatus() (*AdminStatusResult, error) {
 		return nil, fmt.Errorf("client: admin_status reply %q msg=%q", resp.Type, resp.Msg)
 	}
 	return &AdminStatusResult{
-		Zone:              resp.Zone,
-		NodeAllocated:     resp.NodeAllocated,
-		AllocatablePool:   resp.AllocatablePool,
-		ReservationCount:  resp.ReservationCount,
-		ProvisionalCount:  resp.ProvisionalCount,
-		UnknownCount:      resp.UnknownCount,
-		Drained:           resp.Drained,
-		NodeBudget:        resp.NodeBudget,
-		HostReserved:      resp.HostReserved,
-		OperationalMargin: resp.OperationalMargin,
-		Allocated:         resp.Allocated,
-		Pool:              resp.Pool,
-		StartupInFlight:   resp.StartupInFlight,
+		Zone:                      resp.Zone,
+		NodeAllocated:             resp.NodeAllocated,
+		AllocatablePool:           resp.AllocatablePool,
+		ReservationCount:          resp.ReservationCount,
+		ProvisionalCount:          resp.ProvisionalCount,
+		UnknownCount:              resp.UnknownCount,
+		Drained:                   resp.Drained,
+		NodeBudget:                resp.NodeBudget,
+		HostReserved:              resp.HostReserved,
+		OperationalMargin:         resp.OperationalMargin,
+		Allocated:                 resp.Allocated,
+		Pool:                      resp.Pool,
+		StartupInFlight:           resp.StartupInFlight,
+		CacheReclaimStatus:        resp.CacheReclaimStatus,
+		CacheAllocated:            resp.CacheAllocated,
+		CacheRecoveryUnknownCount: resp.CacheRecoveryUnknownCount,
 	}, nil
 }
 

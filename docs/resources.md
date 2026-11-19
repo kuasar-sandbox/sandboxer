@@ -129,13 +129,45 @@ When both sides advertise `cache_budget_v1`, Admit atomically grants
 `cache_initial` together with the Guest initial reservation and records
 `cache_maximum` as an immutable per-run limit. Subsequent
 `request_cache_budget` exchanges carry a safe absolute `cache_current`,
-`cache_requested` delta and controller `cache_reservation` result. Heartbeat
-may return `cache_reclaim_target`; it is a request to release clean cache,
-not an already completed release. `state_sync` reports the safely owned
-cache reservation after a lost reply or controller restart. Cache growth
-allocates physical pages only after an accepted grant; shrink returns quota
-only after physical pages have been reclaimed. Guest Budget, balloon and
-`memory.high` remain independent.
+`cache_requested` delta and controller `cache_reservation` result. Pool cache
+capacity is independent of the Guest memory budget: an omitted pool
+`cache_capacity` imposes no pool cache quota, while the per-sandbox maximum
+still applies. Cache growth allocates physical pages only after an accepted
+grant; shrink returns quota only after physical pages have been reclaimed.
+Guest Budget, balloon and `memory.high` remain independent.
+
+When Admit also confirms `cache_reclaim_v1`, idle cache produces a finite
+background intent through `cache_reclaim_update`. It never releases pages
+without a node-issued task. The node coordinates autonomous reclaim and
+shortage-triggered yield through the same bounded executor. Active autonomous
+supply has priority over yield; an outstanding task cannot be canceled just
+by clearing a target or timing out. The optional pool `cache_low_watermark`
+pauses new autonomous permits at low allocated cache levels unless that pool
+has a real cache quota shortage. Omitting the threshold disables this pause;
+it does not inherit Guest memory watermarks.
+
+Each task carries a stable per-run identity, sequence, source and immutable
+maximum bytes. Partial and zero returns finish a finite attempt. Completion
+reports the physically completed absolute capacity together with the next
+autonomous opportunity (or explicitly none), and remains in an outbox until
+the node echoes `cache_reclaim_ack`. A repeated response never executes the
+same task twice. Growth waits until the outstanding task and its completion
+are resolved. A zero result requires a meaningful new reclaimable observation
+or a separately permitted, low-frequency probe before trying again.
+
+`state_sync` carries the accepted task or unacknowledged completion in
+addition to the latest cache reservation. Its reclaim `current` observation
+confirms physical capacity separately from an accepted growth grant; the node
+does not issue new reclaim tasks against growth still being allocated locally.
+The run identity is encoded in the
+existing immutable lease feature list; no dynamic reclaim state is written
+into that lease. A coordinated run requires explicit capability confirmation
+again after reconnect and does not silently resume local autonomous reclaim
+when the node lacks support. Node recovery retains unknown execution authority
+until participants synchronize or their exit is confirmed. Older nodes and
+legacy runs retain the previous local idle and advisory-target behavior; full
+node rate and source-exclusion guarantees require all participating runs to
+support and negotiate the new coordination mode.
 
 <a id="resource-states"></a>
 
