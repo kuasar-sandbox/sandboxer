@@ -55,13 +55,14 @@ type Config struct {
 	// Underlying memfd fd (for pread on the rare Loaded fault path).
 	MemfdFD int
 
-	// Sandbox-ctl-side mmap of the memfd. Single-uffd model: backendVA
-	// is NOT registered with uffd; the handler only references it as
+	// Sandbox-ctl-side mmap of the memfd. BackendMemoryGuard registers it
+	// with a separate SIGBUS UFFD that never joins this handler. We use it as
 	// the target of process-level madvise(DONTNEED) on EVENT_REMOVE,
 	// to clear sandbox-ctl's own PTE/RSS share of pages CH reclaimed
 	// at the inode via fallocate(PUNCH_HOLE) in its balloon path.
-	// Backend first-touch (vhost-blk DMA, snapshot copy) goes through
-	// EnsureLoaded before plain shmem access.
+	// Vhost-blk DMA goes through EnsureLoaded before accessing the protected
+	// mapping. Snapshot payload reads use the memfd FD and separate buffers;
+	// that FD path does not access this guarded VMA.
 	BackendVA uintptr
 	Size      int
 
@@ -83,13 +84,13 @@ type Config struct {
 // Handler manages CH-side userfaultfd descriptors for one shared memfd:
 //   - uffdC: each is created in CH's process, registered MISSING on a chVA region,
 //     handed to sandbox-ctl via SCM_RIGHTS in the va_report handshake.
-//     Catches first-touch from vCPU. The backendVA mmap that
-//     sandbox-ctl holds for the same memfd is left WITHOUT any uffd
-//     registration; kernel handles backend-mm faults via plain shmem
-//     fileops.
+//     Catches first-touch from vCPU. BackendMemoryGuard protects sandbox-ctl's
+//     alias with an independent SIGBUS UFFD and no reader, preventing an
+//     unprepared backend access or remote GUP from creating a zero folio.
 //
 // Multiple CH regions (for example around the x86 PCI hole) join the same
-// handler through AddUffd. There is no second UFFD on the backend mapping.
+// handler through AddUffd. Only CH-side registrations are population targets;
+// the backend guard remains separate for the entire backend VMA lifetime.
 // Vhost must call EnsureLoaded before exposing any backend slice. COPY/EEXIST
 // preserves the winning folio; it cannot recover snapshot bytes after an
 // unguarded backend first-touch has instantiated a zero shmem folio.

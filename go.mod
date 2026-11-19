@@ -3,7 +3,6 @@ module github.com/kuasar-sandbox/sandboxer
 go 1.26.1
 
 require (
-	github.com/cilium/ebpf v0.20.0
 	google.golang.org/grpc v1.83.2
 	gopkg.in/yaml.v3 v3.0.1
 )

@@ -1,9 +1,11 @@
 // Package uffd is the host-side userfaultfd handler for sandbox memory.
 //
-// One instance per sandbox (per memfd). The handler owns: a uffd fd
-// (registered MISSING on the sandbox-ctl-side mmap of the memfd), a
-// reader goroutine that drains uffd events, and a worker pool that
+// One instance per sandbox (per memfd). The handler owns the CH-side uffd fds
+// registered MISSING on CH's aliases, a reader goroutine that drains events,
+// and a worker pool that
 // services per-page faults via UFFDIO_COPY / UFFDIO_ZEROPAGE.
+// An independent BackendMemoryGuard protects sandbox-ctl's alias with SIGBUS;
+// it has no reader and is never used as a population target.
 //
 // The same handler runs in cold-start mode (snapshotReader = ZeroSource,
 // every Absent fault becomes ZEROPAGE) and restore mode (snapshotReader
@@ -17,6 +19,9 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+// UFFD_USER_MODE_ONLY was introduced after the supported Linux 5.10 floor.
+const uffdUserModeOnly = 1
 
 // userfaultfd ioctl request numbers, computed from the kernel header.
 // _IOWR(0xAA, n, struct sz)  →  0xc0_<sz<<16>>_aa_n

@@ -53,9 +53,15 @@ Memory restore uses one shared memfd and a host handler that adopts CH-side user
 
 <a id="uffd-registration"></a>
 
-### Single UFFD contract
+### Population and backend protection
 
-The single-UFFD design means faults are handled on CH's mapping rather than registering a second UFFD on sandbox-ctl's backend mapping. It does not require exactly one CH descriptor for every layout. CH registers missing-page events for its restored memory regions; the host receives the descriptors through the restore handshake and validates region bounds and nonoverlap against the shared memfd address map. The first report starts the handler; later valid regions use `AddUffd`. Out-of-range faults, duplicate/invalid region registration, and truncated sources fail closed. See [serveandwait.go](../pkg/sandbox/serveandwait.go), [handler.go](../pkg/uffd/handler.go), and [addrmap.go](../pkg/uffd/addrmap.go).
+Only CH-side registrations are used to populate memory. CH registers missing-page events for its memory regions; the host receives the descriptors through the handshake and validates region bounds and nonoverlap against the shared memfd address map. The first report starts the handler; later valid regions use `AddUffd`. Out-of-range faults, duplicate/invalid region registration, and truncated sources fail closed. See [serveandwait.go](../pkg/sandbox/serveandwait.go), [handler.go](../pkg/uffd/handler.go), and [addrmap.go](../pkg/uffd/addrmap.go).
+
+Both cold start and restore protect sandbox-ctl's entire backend mapping with an independent `MISSING_SHMEM` + `SIGBUS` UFFD before exposing memory to consumers. [BackendMemoryGuard](../pkg/uffd/backend_memory_guard_linux.go) has no reader, asynchronous event subscriptions, or timeout. An unprepared user access raises SIGBUS; kernel uaccess or remote GUP can fail with EFAULT instead of creating a shared zero folio that would defeat a later CH-side COPY. A successful CH-side COPY still makes the shared bytes accessible through the backend alias. Vhost must continue calling `EnsureLoaded` before accessing descriptor, ring, data and status slices.
+
+Guard creation, feature negotiation and registration are mandatory. After registration, startup rejects a fresh memfd containing any data extent, detecting pages instantiated before protection without changing general CH seed handling. The guard tries `UFFD_USER_MODE_ONLY` first; only EINVAL from that fixed creation flag combination retries the legacy flags for Linux 5.10. On 5.10, sandbox-ctl must retain the existing permission to create an ordinary userfaultfd; the fallback grants no additional access. Permission and subsequent API/registration errors remain startup failures; there is no host-setting change or new kernel floor. See the [Linux 5.10](https://github.com/torvalds/linux/blob/v5.10/fs/userfaultfd.c) and [5.11](https://github.com/torvalds/linux/blob/v5.11/fs/userfaultfd.c) creation paths. All consumers and the CH handler stop before the backend mapping is unmapped and its guard is closed.
+
+This is protection for the backend VMA, not every alias or FD access to the inode. It does not pin pages against arbitrary balloon/discard after `EnsureLoaded` returns; normal guest ownership of in-flight descriptors remains required. Snapshot payload reads continue through the memfd FD into separate buffers.
 
 <a id="fault-path"></a>
 
