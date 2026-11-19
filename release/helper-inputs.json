@@ -58,7 +58,8 @@
       "env": "MEMORY_COMPARE_BIN",
       "cases": [
         "snapshot.dirty-memory.sh",
-        "snapshot.ch-compat.sh"
+        "snapshot.ch-compat.sh",
+        "orchestrator.proxy-wake.sh"
       ]
     },
     {
