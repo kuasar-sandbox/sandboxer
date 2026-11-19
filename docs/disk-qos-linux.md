@@ -18,9 +18,10 @@ on a FIFO, RR, or DEADLINE CPU thread.
 Temporary priority changes run on a goroutine whose entire lifetime belongs to
 the helper. After I/O, the helper restores the execution thread's exact original
 priority. If restoration fails, that goroutine retains its thread lock and
-returns, causing Go to terminate that OS thread. An arbitrary caller, including
-an export command or an already pinned vhost worker, need not exit to prevent
-thread-pool contamination.
+returns, causing Go to retire the thread from scheduling. Ordinary OS threads
+terminate; Go's initial OS thread remains permanently parked. Neither is reused
+for other goroutines. An arbitrary caller, including an export command or an
+already pinned vhost worker, need not exit to prevent thread-pool contamination.
 
 Priority query, setup, and restoration failures produce a bounded warning once
 per failure stage. They do not replace the actual I/O byte count or error,
@@ -200,6 +201,11 @@ failure caused that thread to disappear from `/proc/self/task`. Setup failures
 preserved the actual I/O result, and RT-preservation branches were checked with
 injected states without changing a host thread to RT.
 
+Separate Go 1.26.4 retirement regressions force the helper onto both an ordinary
+thread and the initial thread. They check disappearance of the ordinary thread,
+retention without reuse of the parked initial thread, unchanged priority on 32
+simultaneously pinned probe threads, and a subsequent successful positional read.
+
 A private 64 MiB loop device, an ext4 filesystem, and a 16 MiB test file were
 created for short read-only device tests. BFQ was selected only on that loop;
 the shared backing device retained its original `none` scheduler. The loop's
@@ -242,6 +248,7 @@ Real-device contention and latency must be qualified for the target deployment.
 
 ## References
 
+* [Go runtime thread retirement (`mexit`)](https://go.dev/src/runtime/proc.go)
 * [Linux I/O priorities](https://docs.kernel.org/block/ioprio.html)
 * [BFQ scheduling and group support](https://docs.kernel.org/block/bfq-iosched.html)
 * [Linux mq-deadline implementation, v6.18](https://github.com/torvalds/linux/blob/v6.18/block/mq-deadline.c)

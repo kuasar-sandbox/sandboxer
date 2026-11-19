@@ -1,10 +1,13 @@
 package directio
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,8 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func callerAtDefault(t testing.TB) func() {
-	t.Helper()
+func probeThreadPriority() error {
 	// Probe on a disposable goroutine so even a policy that allows promotion
 	// but denies restoration cannot contaminate the testing goroutine.
 	probe := make(chan error)
@@ -47,7 +49,12 @@ func callerAtDefault(t testing.TB) func() {
 		}
 		probe <- err
 	}()
-	if err := <-probe; err != nil {
+	return <-probe
+}
+
+func callerAtDefault(t testing.TB) func() {
+	t.Helper()
+	if err := probeThreadPriority(); err != nil {
 		t.Skipf("native ioprio save/set/restore unavailable: %v", err)
 	}
 	runtime.LockOSThread()
@@ -164,8 +171,139 @@ func TestIOPrioritySetupFailuresPreserveResult(t *testing.T) {
 }
 
 func TestIOPriorityRestoreFailureRetiresWorker(t *testing.T) {
-	defer callerAtDefault(t)()
-	callerTID := unix.Gettid()
+	if retirementMode == "" {
+		for _, mode := range []string{"initial", "ordinary"} {
+			t.Run(mode, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestIOPriorityRestoreFailureRetiresWorker$", "-test.v", "-test.timeout=15s")
+				cmd.Env = append(os.Environ(), retirementEnv+"="+mode, "GOMAXPROCS=1")
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("%s retirement child: %v\n%s", mode, err, out)
+				}
+				if strings.Contains(string(out), "--- SKIP: TestIOPriorityRestoreFailureRetiresWorker") {
+					t.Skipf("%s retirement child:\n%s", mode, out)
+				}
+				if !strings.Contains(string(out), "--- PASS: TestIOPriorityRestoreFailureRetiresWorker") {
+					t.Fatalf("%s retirement child did not execute its assertions:\n%s", mode, out)
+				}
+				t.Logf("%s", out)
+			})
+		}
+		return
+	}
+	r := retirementObservation
+	if r.probeErr != nil {
+		t.Skipf("native default-priority fixture unavailable: %v", r.probeErr)
+	}
+	if r.n != 4096 || r.err != nil || r.calls != 1 {
+		t.Fatalf("n=%d err=%v calls=%d", r.n, r.err, r.calls)
+	}
+	requireDiag(t, r.diagnostics, priorityRestore)
+	if r.callerTID != os.Getpid() || (r.workerTID == os.Getpid()) != (retirementMode == "initial") {
+		t.Fatalf("wrong fixture identity: mode=%s pid=%d caller=%d worker=%d", retirementMode, os.Getpid(), r.callerTID, r.workerTID)
+	}
+	if retirementMode == "ordinary" && r.callerAfterTID != r.callerTID {
+		t.Fatal("caller moved despite outer LockOSThread")
+	}
+	if r.callerAfterTID == r.workerTID || r.callerPriority != 0 || r.callerPriorityErr != nil {
+		t.Fatalf("caller polluted: tid=%d priority=%d err=%v", r.callerAfterTID, r.callerPriority, r.callerPriorityErr)
+	}
+	if r.workerPriority != ioPriorityBE0 || r.workerPriorityErr != nil {
+		t.Fatalf("worker priority=%d err=%v", r.workerPriority, r.workerPriorityErr)
+	}
+	path := fmt.Sprintf("/proc/self/task/%d", r.workerTID)
+	if retirementMode == "ordinary" {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			_, err := os.Stat(path)
+			if os.IsNotExist(err) {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("poisoned worker thread %d still alive", r.workerTID)
+			}
+			runtime.Gosched()
+		}
+	} else if _, err := os.Stat(path); err != nil {
+		t.Fatalf("Go's retired initial thread should remain parked: %v", err)
+	}
+	assertCleanPriorityThreads(t, r.workerTID)
+	fd, err := unix.Open("/dev/zero", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	p := make([]byte, 4096)
+	for i := range p {
+		p[i] = 1
+	}
+	n, err := RetryInterruptedIO(unix.Pread, fd, p, 0)
+	if n != len(p) || err != nil {
+		t.Fatalf("following read: %d,%v", n, err)
+	}
+	for _, b := range p {
+		if b != 0 {
+			t.Fatal("following read did not deliver the actual data")
+		}
+	}
+	t.Logf("mode=%s pid=%d worker=%d caller-after=%d; 32 distinct locked threads remained at priority 0; following read=%d", retirementMode, os.Getpid(), r.workerTID, r.callerAfterTID, n)
+}
+
+const retirementEnv = "SANDBOXER_IOPRIO_RETIREMENT_HELPER"
+
+var retirementMode = os.Getenv(retirementEnv)
+var retirementObservation priorityRetirementObservation
+
+func init() {
+	if retirementMode != "" {
+		// Only the isolated fixture pins the startup thread. Single-P execution
+		// then selects either that thread or an ordinary thread for the helper.
+		runtime.LockOSThread()
+	}
+}
+
+func TestMain(m *testing.M) {
+	if retirementMode != "" {
+		retirementObservation = observePriorityRetirement(retirementMode)
+	}
+	os.Exit(m.Run())
+}
+
+type priorityRetirementObservation struct {
+	n, calls, workerTID, workerPriority                 int
+	callerTID, callerAfterTID, callerPriority           int
+	err, probeErr, workerPriorityErr, callerPriorityErr error
+	diagnostics                                         []priorityDiagnostic
+}
+
+func observePriorityRetirement(mode string) priorityRetirementObservation {
+	r := priorityRetirementObservation{callerTID: unix.Gettid()}
+	unlock := true
+	defer func() {
+		if unlock {
+			runtime.UnlockOSThread()
+		}
+	}()
+	if mode != "initial" && mode != "ordinary" || runtime.GOMAXPROCS(0) != 1 {
+		panic("invalid priority retirement fixture")
+	}
+	if r.probeErr = probeThreadPriority(); r.probeErr != nil {
+		return r
+	}
+	priority, err := getThreadPriority()
+	if err != nil || priority != 0 {
+		r.probeErr = fmt.Errorf("startup priority=%d, err=%v; require an unchanged default-priority thread", priority, err)
+		return r
+	}
+	if mode == "initial" {
+		runtime.UnlockOSThread()
+		unlock = false
+	}
 	api := nativePrioritySyscalls()
 	var sets atomic.Int32
 	api.set = func(v int) error {
@@ -174,48 +312,49 @@ func TestIOPriorityRestoreFailureRetiresWorker(t *testing.T) {
 		}
 		return setThreadPriority(v)
 	}
-	workerTID := 0
-	var ds []priorityDiagnostic
-	calls := 0
-	n, err := withPrioritySyscalls(func() (int, error) {
-		calls++
-		workerTID = unix.Gettid()
-		v, _ := getThreadPriority()
-		if v != ioPriorityBE0 {
-			panic(fmt.Sprintf("priority=%d", v))
-		}
+	r.n, r.err = withPrioritySyscalls(func() (int, error) {
+		r.calls++
+		r.workerTID = unix.Gettid()
+		r.workerPriority, r.workerPriorityErr = getThreadPriority()
 		return 4096, nil
-	}, api, collect(&ds))
-	if n != 4096 || err != nil || calls != 1 {
-		t.Fatalf("n=%d err=%v calls=%d", n, err, calls)
+	}, api, collect(&r.diagnostics))
+	r.callerAfterTID = unix.Gettid()
+	r.callerPriority, r.callerPriorityErr = getThreadPriority()
+	return r
+}
+
+func assertCleanPriorityThreads(t *testing.T, retiredTID int) {
+	t.Helper()
+	type observation struct {
+		tid, priority int
+		err           error
 	}
-	requireDiag(t, ds, priorityRestore)
-	if unix.Gettid() != callerTID {
-		t.Fatal("caller moved despite outer LockOSThread")
+	const count = 32
+	ready := make(chan observation, count)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for range count {
+		wg.Go(func() {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			priority, err := getThreadPriority()
+			ready <- observation{unix.Gettid(), priority, err}
+			<-release
+		})
 	}
-	if v, _ := getThreadPriority(); v != 0 {
-		t.Fatalf("caller polluted: %d", v)
+	observations := make([]observation, count)
+	for i := range observations {
+		observations[i] = <-ready
 	}
-	path := fmt.Sprintf("/proc/self/task/%d", workerTID)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		_, err := os.Stat(path)
-		if os.IsNotExist(err) {
-			break
+	close(release)
+	wg.Wait()
+	seen := make(map[int]bool, count)
+	for _, o := range observations {
+		if o.tid == retiredTID || o.priority != 0 || o.err != nil || seen[o.tid] {
+			t.Fatalf("retired thread reused or priority propagated: retired=%d observation=%+v duplicate=%t", retiredTID, o, seen[o.tid])
 		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("poisoned worker thread %d still alive", workerTID)
-		}
-		runtime.Gosched()
+		seen[o.tid] = true
 	}
-	n, err = withPrioritySyscalls(func() (int, error) { return 2, nil }, nativePrioritySyscalls(), nil)
-	if n != 2 || err != nil {
-		t.Fatalf("following call: %d,%v", n, err)
-	}
-	t.Logf("worker %d was observed absent from /proc/self/task; caller %d remained priority 0", workerTID, callerTID)
 }
 
 func TestIOPriorityRestoreFailurePreservesError(t *testing.T) {

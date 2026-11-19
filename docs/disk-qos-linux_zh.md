@@ -15,8 +15,9 @@ diffstore 的公共定位读写 helper 会在实际同步 I/O 期间尝试使用
 
 需要临时提升时，由 helper 独占生命周期的 goroutine 执行 I/O。结束后恢复执行
 线程的完整原始优先级值。恢复失败时，该 goroutine 保留自己的线程锁并返回，
-由 Go runtime 终止该 OS 线程。安全性不依赖 export/main 等任意调用方退出，也
-不依赖已经固定线程的 vhost worker 如何执行自己的解锁 defer。
+由 Go runtime 将该线程移出调度池：普通 OS 线程终止，初始 OS 线程则永久停用，
+两者都不会再运行其他 goroutine。安全性不依赖 export/main 等任意调用方退出，
+也不依赖已经固定线程的 vhost worker 如何执行自己的解锁 defer。
 
 查询、设置、恢复优先级失败，只按有限的失败阶段各记录一次降级告警。它们不
 替换真实 I/O 的字节数或错误，不使成功写变成失败，不引起重放，也不引入新的
@@ -178,6 +179,10 @@ cgroup 同时写同一 inode 时，归属不一定准确。仅确认进程位于
 `/proc/self/task` 消失；设置失败保留真实 I/O 结果。RT 保留分支采用状态注入
 验证，没有把宿主线程实际提升为 RT。
 
+另外的 Go 1.26.4 线程停用回归分别强制 helper 在普通线程和初始线程执行，检查普通
+线程消失、初始线程保留但不被复用、32 个同时固定的探测线程保持原优先级，
+以及后续定位读取成功并交付完整数据。
+
 短时只读设备测试使用本任务创建的 64 MiB loop 设备、ext4 和 16 MiB 数据文件。
 只给该 loop 选择 BFQ，共享 backing device 保持原来的 `none`。loop 的 backing
 file 已缓存在内存中，因此以下数据属于快速虚拟设备测试，不是物理盘性能，也
@@ -216,6 +221,7 @@ SANDBOXER_DIO_BENCH_FILE=/absolute/path/to/an/isolated/data-file \
 
 ## 参考
 
+- [Go runtime 线程停用实现（`mexit`）](https://go.dev/src/runtime/proc.go)
 - [Linux I/O priorities](https://docs.kernel.org/block/ioprio.html)
 - [BFQ 调度与 group support](https://docs.kernel.org/block/bfq-iosched.html)
 - [Linux v6.18 mq-deadline 实现](https://github.com/torvalds/linux/blob/v6.18/block/mq-deadline.c)

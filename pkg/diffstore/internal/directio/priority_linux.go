@@ -177,8 +177,10 @@ func withPrioritySyscalls(op func() (int, error), calls prioritySyscalls, report
 			if !retire {
 				runtime.UnlockOSThread()
 			}
-			// With the lock retained, returning terminates this OS thread.
-			// The caller's own defers run on its goroutine and cannot unlock it.
+			// With the lock retained, returning retires this thread from Go's
+			// scheduler. Go exits ordinary threads but permanently parks its
+			// initial thread. Neither can run another goroutine. The caller's
+			// own defers run on its goroutine and cannot unlock this thread.
 			done <- result
 		}()
 
