@@ -382,6 +382,10 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		return -1, fmt.Errorf("memfd create: %w", err)
 	}
 	defer memfd.Close()
+	backendGuard := uffd.ArmBackendPageGuardFromEnv(memfd.FD(), memfd.Addr(), memfd.Size(), logf)
+	// Later defers drain every backend consumer before the guard is removed;
+	// the earlier memfd defer then unmaps the guarded address last.
+	defer backendGuard.Close()
 	dirty, err := memory.NewDirty(uint64(memfd.Size()))
 	if err != nil {
 		return -1, err
