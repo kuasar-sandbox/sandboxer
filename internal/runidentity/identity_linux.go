@@ -185,7 +185,7 @@ func (g *Guard) removeRunDir(afterUnlink func()) error {
 	for {
 		entries, readErr := directory.ReadDir(128)
 		for _, entry := range entries {
-			if entry.Name() == filepath.Base(g.path) {
+			if entry.Name() == filepath.Base(g.path) || entry.Name() == "memory-holders" {
 				continue
 			}
 			if err := os.RemoveAll(filepath.Join(g.dir, entry.Name())); err != nil {

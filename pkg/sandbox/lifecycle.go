@@ -36,7 +36,6 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
-	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
@@ -45,6 +44,8 @@ import (
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
+	runtime                  *Runtime
+	memoryAsyncDisabled      bool
 	memoryLayout             snapshot.MemoryLayout
 	memoryLogf               func(string, ...any)
 	captureMemory            func(context.Context) (*memory.CaptureView, error)
@@ -365,7 +366,7 @@ func WaitRun(ctx context.Context, r *Runtime) (int, error) {
 	for {
 		select {
 		case <-r.exitDone:
-			return r.exit.Code, r.exit.Err
+			return r.exit.Code, errors.Join(r.exit.Err, r.WaitMemorySave(context.Background()))
 		case sig := <-signals:
 			r.signals <- sig
 		case <-done:
@@ -990,6 +991,9 @@ func (q *allQuiescer) Resume() {
 // that owns the bundle holds references; the snapshot path consumes
 // them when a request arrives.
 type SnapshotHandler struct {
+	runtime               *Runtime
+	CurrentRun            *artifact.CurrentRun
+	previousMemory        *previousMemorySave
 	MemoryLayout          snapshot.MemoryLayout
 	CaptureMemory         func(context.Context) (*memory.CaptureView, error)
 	checkpointMaintenance *diffstore.DirectoryMaintenance
@@ -1026,10 +1030,9 @@ type SnapshotHandler struct {
 	capture    captureGate
 }
 
-// captureGate serializes export and snapshot for one live VM. A successful
-// non-resume capture is terminal because the VMM shutdown is deliberately
-// scheduled after the ctl response can be flushed; no second request may enter
-// that interval.
+// captureGate serializes export and snapshot for one live VM. A committed
+// non-resume capture is terminal through retirement and response delivery;
+// no second capture may enter while its continuation is still running.
 type captureGate struct {
 	mu       sync.Mutex
 	active   bool
@@ -1066,9 +1069,11 @@ func (g *captureGate) finish(terminal bool) {
 	g.mu.Unlock()
 }
 
-// Handle dispatches one ctl snapshot_request. A successful destroy-mode
-// response owns an AfterWrite continuation; ctl.Server invokes it after writing
-// the response, and direct callers must honor the same ordering.
+// Handle dispatches one ctl snapshot_request. A destroy-mode response owns its
+// lifecycle continuation: ordinary captures use AfterWrite, while committed
+// frozen-memory captures use BeforeWrite to finish normal resource retirement
+// before reporting success. ctl.Server and Runtime.Snapshot honor both hooks;
+// direct handler adapters must do the same, including response-write failures.
 func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
 	return h.handle(req, "", nil)
 }
@@ -1077,13 +1082,27 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 	return h.handleContext(h.Context, req, cgroupPath, chExited)
 }
 func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer func() {
+		if req.HostRetirement != nil && err != nil && resp.AfterWrite == nil && resp.BeforeWrite == nil && !isTerminalCaptureError(err) && !errors.Is(err, ctl.ErrCheckpointUnsupported) {
+			err = errors.Join(ctl.ErrCaptureRejected, err)
+		}
+	}()
+	if h.EnableCheckpoint && req.CheckpointID != "" && !req.ResumeAfter {
+		if _, err = h.previousMemory.wait(ctx, req.NoWaitForPreviousMemorySave); err != nil {
+			return ctl.Response{}, err
+		}
+	}
 	if err := h.capture.begin(); err != nil {
 		return ctl.Response{}, err
 	}
 	defer func() {
-		h.capture.finish(resp.AfterWrite != nil || (err == nil && !req.ResumeAfter) || isTerminalCaptureError(err))
+		h.capture.finish(resp.AfterWrite != nil || resp.BeforeWrite != nil || (err == nil && !req.ResumeAfter) || isTerminalCaptureError(err))
 	}()
 	opts := RunOptions{
+		runtime: h.runtime, CurrentRun: h.CurrentRun,
 		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir, EnableCheckpoint: h.EnableCheckpoint,
 		memoryLayout:  h.MemoryLayout,
 		captureMemory: h.CaptureMemory,
@@ -1099,7 +1118,12 @@ func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cg
 			return ctl.Response{}, errors.New("snapshot: Cloud Hypervisor process is not started")
 		}
 	}
-	return handleSnapshotRequest(ctx, req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, chProcess, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
+	resp, err = handleSnapshotRequest(ctx, req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, chProcess, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
+	if errors.Is(err, snapshot.ErrFrozenMemoryGeometry) && !errors.Is(err, errMemorySaveAbortPending) && !isTerminalCaptureError(err) {
+		opts.memoryAsyncDisabled = true
+		return handleSnapshotRequest(ctx, req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, cgroupPath, chExited, chProcess, h.Pinger, h.Forwarder, h.Reattach, h.Memory, h.Logf)
+	}
+	return resp, err
 }
 
 // HandleExport follows the same response-ownership contract as Handle.
@@ -1115,7 +1139,7 @@ func (h *SnapshotHandler) handleExportContext(ctx context.Context, req ctl.Reque
 		return ctl.Response{}, err
 	}
 	defer func() {
-		h.capture.finish(resp.AfterWrite != nil || (err == nil && !req.ResumeAfter) || isTerminalCaptureError(err))
+		h.capture.finish(resp.AfterWrite != nil || resp.BeforeWrite != nil || (err == nil && !req.ResumeAfter) || isTerminalCaptureError(err))
 	}()
 	opts := RunOptions{
 		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir, EnableCheckpoint: h.EnableCheckpoint,
@@ -1583,7 +1607,24 @@ func handleSnapshotRequest(
 	}
 
 	opts.memoryLogf = logf
-	history, err := prepareMemoryHistory(ctx, opts, mergeRef, uint64(mfd.Size()))
+	save, err := prepareCheckpointMemorySave(ctx, req, opts, mfd, runDir)
+	if err != nil {
+		return ctl.Response{}, err
+	}
+	defer func() {
+		if save != nil && !save.holder.Record().Read().Committed {
+			err = errors.Join(err, save.abort())
+		}
+	}()
+	var history *memoryHistory
+	var memoryParents []string
+	if save != nil {
+		var external []string
+		memoryParents, external, err = checkpointMemoryParents(ctx, opts)
+		history = &memoryHistory{refs: external}
+	} else {
+		history, err = prepareMemoryHistory(ctx, opts, mergeRef, uint64(mfd.Size()))
+	}
 	if err != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: memory history: %w", err)
 	}
@@ -1728,7 +1769,7 @@ func handleSnapshotRequest(
 	defer func() {
 		// Successful destroy mode transfers the barrier to
 		// destroyAfterSnapshot, which retains it until CH exits.
-		if err == nil && !req.ResumeAfter {
+		if (err == nil || save != nil && save.holder.Record().Read().Committed) && !req.ResumeAfter {
 			return
 		}
 		releaseMemoryBarrier()
@@ -1774,7 +1815,7 @@ func handleSnapshotRequest(
 		// Successful destroy mode leaves CH paused and keeps memory.high lifted
 		// until destroyAfterSnapshot completes its ordered VMM shutdown. Every
 		// running/error path restores enforcement before returning.
-		if err == nil && !req.ResumeAfter {
+		if (err == nil || save != nil && save.holder.Record().Read().Committed) && !req.ResumeAfter {
 			return
 		}
 		restored, restoreErr := restoreVMMMemoryHigh(cgroupPath, previousMemoryHigh)
@@ -1830,7 +1871,7 @@ func handleSnapshotRequest(
 			if recoveryTerminated {
 				return
 			}
-			if err == nil && !req.ResumeAfter {
+			if (err == nil || save != nil && save.holder.Record().Read().Committed) && !req.ResumeAfter {
 				return
 			}
 			forwarder.Resume()
@@ -1851,7 +1892,7 @@ func handleSnapshotRequest(
 			if recoveryTerminated {
 				return
 			}
-			if err == nil && !req.ResumeAfter {
+			if (err == nil || save != nil && save.holder.Record().Read().Committed) && !req.ResumeAfter {
 				return
 			}
 			pinger.Resume()
@@ -1936,8 +1977,14 @@ func handleSnapshotRequest(
 	if mergeMemory {
 		src.MergeBaseSnapshot = memoryMergeBase
 	}
+	if save != nil {
+		src.FrozenMemory = save.capture(opts, memoryParents, !mergeRef)
+	}
 	sinkOpen = false // snapshot.Take owns and closes the sink on every path.
 	out, err := snapshot.Take(src, sink, req.ResumeAfter)
+	if err != nil && errors.Is(err, snapshot.ErrFrozenMemoryCommitted) {
+		return ctl.Response{BeforeWrite: frozenRetirement(opts.runtime, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, logf)}, &terminalCaptureError{err: err}
+	}
 	if err != nil {
 		// SendQuiesce closes the old MUX and freezes the application. Take
 		// restores the VM/backend state on failure; reattach completes the
@@ -1970,12 +2017,16 @@ func handleSnapshotRequest(
 		SandboxPath:      out.SandboxPath,
 	}
 	if !req.ResumeAfter {
-		resp.AfterWrite = sync.OnceFunc(func() {
-			go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
-		})
+		if save != nil {
+			resp.BeforeWrite = frozenRetirement(opts.runtime, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, logf)
+		} else {
+			resp.AfterWrite = sync.OnceFunc(func() {
+				go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
+			})
+		}
 	}
-	if err := context.Cause(ctx); err != nil {
-		return ctl.Response{}, err
+	if cause := context.Cause(ctx); cause != nil {
+		return resp, cause
 	}
 	// Keep the established overlay_* response fields populated for current
 	// callers. Their value is now the committed Sandbox E; the disk graph is
@@ -2445,7 +2496,7 @@ func prepareSnapshotDependencyPlan(
 		if err != nil {
 			return nil, err
 		}
-		prepared, transformed, err := prepareSnapshotDependencyStream(ctx, stream, dependency.role)
+		prepared, transformed, err := prepareSnapshotDependencyStream(ctx, stream, dependency.role, opts)
 		if err != nil {
 			return nil, fmt.Errorf("prepare %s %q: %w", dependency.role, raw, err)
 		}
@@ -2470,6 +2521,11 @@ func prepareSnapshotDependencyPlan(
 		}
 		if err != nil {
 			return nil, errors.Join(fmt.Errorf("retain %s %q: %w", dependency.role, raw, err), prepared.Close())
+		}
+		if dependency.role == dependencyMemorySnapshot && transformed {
+			// A named location does not make a node-local descriptor portable.
+			// Its selected source has already proved that it needs materialization.
+			retain = false
 		}
 		if retain {
 			if err := prepared.Close(); err != nil {
@@ -2592,13 +2648,13 @@ func openSnapshotDependency(ctx context.Context, dependency artifactDependency, 
 	return opened, opened.BundleReader(), key, dependency.role.String() + " " + filepath.Base(path), nil
 }
 
-func prepareSnapshotDependencyStream(ctx context.Context, stream fetch.Stream, role artifactDependencyRole) (fetch.Stream, bool, error) {
+func prepareSnapshotDependencyStream(ctx context.Context, stream fetch.Stream, role artifactDependencyRole, opts RunOptions) (fetch.Stream, bool, error) {
 	if stream == nil {
 		return nil, false, errors.New("nil dependency stream")
 	}
 	switch role {
 	case dependencyMemorySnapshot:
-		root, err := snapshotfile.Open(ctx, stream)
+		root, err := openMemoryCheckpointSnapshot(ctx, opts, stream, "")
 		if err != nil {
 			return nil, false, err
 		}
@@ -2613,7 +2669,9 @@ func prepareSnapshotDependencyStream(ctx context.Context, stream fetch.Stream, r
 			}
 			return nil, false, errors.Join(err, root.Close())
 		}
-		return root.FullStream, false, nil
+		transformed := root.LocalCheckpoint != nil
+		portable, err := artifact.PortableMemoryLayer(ctx, root)
+		return portable, transformed, err
 	case dependencyPureBlock:
 		// Every byte, including a ZIP-shaped tail, belongs to the filesystem.
 		return stream, false, nil
@@ -3115,7 +3173,7 @@ func newMemoryMergeBaseOpener(opts RunOptions) snapshot.MergeBaseOpener {
 		if err != nil {
 			return nil, err
 		}
-		root, err := snapshotfile.Open(ctx, opened)
+		root, err := openMemoryCheckpointSnapshot(ctx, opts, opened, filepath.Dir(path))
 		if err != nil {
 			return nil, err
 		}

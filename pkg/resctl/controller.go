@@ -30,6 +30,9 @@ type ControllerHookOptions struct {
 	SandboxID  string
 	Context    context.Context
 	Logf       func(string, ...any)
+	// Retained is the SID's previous capture obligation, independently of
+	// which checkpoint is selected as this runtime's restore base.
+	Retained *resource.CaptureRetention
 }
 
 // ControllerHooks is a reservation adapter. It deliberately knows nothing
@@ -65,6 +68,12 @@ type ControllerHooks struct {
 	cacheWake          chan struct{}
 	previousToken      string
 	released           bool
+	retainedSupported  bool
+	retention          *resource.CaptureRetention
+	retentionPrepared  bool
+	retentionHolder    bool
+	leaseCandidate     string
+	handoffID          string
 
 	lifetimeCtx    context.Context
 	cancelLifetime context.CancelFunc
@@ -148,7 +157,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		return nil, err
 	}
 	h.cacheMaximum = cacheMax
-	cacheFeatures := []string{resource.FeatureStateSyncV1}
+	cacheFeatures := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1}
 	if !diffstore.ElasticCacheSupported() {
 		// Keep the fixed cache if payload pages cannot be charged and returned individually.
 		h.cacheMaximum = 0
@@ -162,7 +171,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		cacheFeatures = append(cacheFeatures, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(cacheMax),
 			resource.FeatureCacheReclaimV1, resource.CacheReclaimRunFeature(h.cacheReclaim.RunID))
 	}
-	lease, err := resource.CreateLease(resource.Lease{
+	leaseSpec := resource.Lease{
 		Version: resource.LeaseVersion, SandboxID: opts.SandboxID, PID: os.Getpid(),
 		ControllerSocket: controllerSocketIdentity, CgroupPath: h.controllerCgroupPath,
 		CapacityMemory: capacity, CapacityCPUMilli: uint64(cfg.Resources.Capacity.CPU) * 1000,
@@ -170,7 +179,28 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		// The immutable lease mirrors configured startup headroom. Only the
 		// existing Admit field carries its aligned InitialBudget representation.
 		StartupMemory: startupHeadroom, ClientFeatures: cacheFeatures,
-	})
+	}
+	var lease *resource.LeaseHandle
+	if opts.Retained != nil {
+		if err := opts.Retained.Validate(); err != nil {
+			cancel()
+			return nil, err
+		}
+		var operation [16]byte
+		if _, err := cryptorand.Read(operation[:]); err != nil {
+			cancel()
+			return nil, err
+		}
+		h.handoffID = hex.EncodeToString(operation[:])
+		copy := *opts.Retained
+		h.retention = &copy
+		lease, err = resource.CreateLeaseCandidate(leaseSpec)
+		if err == nil {
+			h.leaseCandidate = lease.Path()
+		}
+	} else {
+		lease, err = resource.CreateLease(leaseSpec)
+	}
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("controller lease: %w", err)
@@ -305,7 +335,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 				continue
 			}
 		}
-		cacheFeatures := []string{resource.FeatureStateSyncV1}
+		cacheFeatures := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1}
 		if h.cacheMaximum > 0 {
 			cacheFeatures = append(cacheFeatures, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(h.cacheMaximum))
 			if h.cacheReclaim.RunID != "" {
@@ -317,14 +347,25 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 			reclaim = resource.CloneCacheReclaimState(&h.cacheReclaim)
 			reclaim.Current = min(h.cacheMaximum, cacheBudgetUnit)
 		}
-		res, err := h.client.AdmitContext(h.lifetimeCtx, resource.AdmitParams{
+		params := resource.AdmitParams{
 			SandboxID: sid, CapacityMemoryBytes: capacity,
 			CapacityCPU:      h.cfg.Resources.Capacity.CPU,
 			FloorMemoryBytes: headroom, FloorCPU: h.cfg.Resources.Allocatable.CPU,
 			StartupBudgetMemory: startupBudget, AllocatableAtSnapshot: budgetAtSnapshot,
 			CgroupPath: h.controllerCgroupPath, ClientFeatures: cacheFeatures, CacheMaximum: h.cacheMaximum, CacheInitial: min(h.cacheMaximum, cacheBudgetUnit),
 			CacheReclaim: reclaim,
-		})
+		}
+		var res *resource.AdmitResult
+		if h.opts.Retained != nil {
+			// Before any owner-side lookup following an ACK loss, register the
+			// already-held inode if the controller published it.
+			if _, err := h.lease.ConfirmPublished(); err != nil {
+				return 0, err
+			}
+			res, err = h.client.AdoptRetainedContext(h.lifetimeCtx, params, *h.opts.Retained, h.leaseCandidate, h.handoffID)
+		} else {
+			res, err = h.client.AdmitContext(h.lifetimeCtx, params)
+		}
 		if resource.IsTransportError(err) {
 			h.setConnected(false)
 			if err := h.waitRetry(backoff); err != nil {
@@ -337,6 +378,28 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 			return 0, fmt.Errorf("admit: %w", err)
 		}
 		if res.Status == resource.StatusRejected {
+			if h.opts.Retained != nil && res.Reason == resource.ReasonRetentionSettledMissing &&
+				resource.HasFeature(res.ClientFeatures, resource.FeatureRetainedMemoryV1) {
+				// The node positively verified RAMReleased for this exact
+				// capture and has no prior ledger (e.g. static -> dynamic).
+				// Close the unpublished candidate before ordinary publication.
+				leaseSpec, err := resource.ReadLease(h.lease.Path())
+				if err != nil {
+					return 0, err
+				}
+				if err := h.lease.Close(); err != nil {
+					return 0, err
+				}
+				h.lease, err = resource.CreateLease(leaseSpec)
+				if err != nil {
+					return 0, err
+				}
+				h.opts.Retained = nil
+				h.mu.Lock()
+				h.retention = nil
+				h.mu.Unlock()
+				continue
+			}
 			if res.Reason != "" {
 				return 0, fmt.Errorf("admit rejected (%s): %s", res.Reason, res.Msg)
 			}
@@ -344,6 +407,12 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 		}
 		if res.Status != resource.StatusAdmitted {
 			return 0, fmt.Errorf("admit returned unexpected status %q", res.Status)
+		}
+		if h.opts.Retained != nil {
+			published, err := h.lease.ConfirmPublished()
+			if err != nil || !published {
+				return 0, fmt.Errorf("admitted handoff lease was not published: %v", err)
+			}
 		}
 		if res.GrantedInitialAlloc != initialBudget {
 			return 0, fmt.Errorf("admit granted partial/incorrect initial reservation %d, require exactly %d", res.GrantedInitialAlloc, initialBudget)
@@ -359,6 +428,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 		}
 		h.mu.Lock()
 		h.admitted, h.connected = true, true
+		h.retainedSupported = resource.HasFeature(res.ClientFeatures, resource.FeatureRetainedMemoryV1)
 		h.reservationBytes = initialBudget
 		h.cacheSupported = res.CacheSupported
 		h.cacheCoordinated = res.CacheCoordinated
@@ -644,6 +714,7 @@ func (h *ControllerHooks) reconnectLoop() {
 				if syncErr == nil {
 					h.mu.Lock()
 					h.connected, h.previousToken = true, result.Token
+					h.retainedSupported = resource.HasFeature(result.ClientFeatures, resource.FeatureRetainedMemoryV1)
 					if !state.cacheCoordinated {
 						h.cacheReclaimTarget = result.CacheReclaimTarget
 						h.cacheReclaimSeq = result.CacheReclaimSeq
@@ -709,6 +780,7 @@ func (h *ControllerHooks) Release(reason string) {
 	}
 	h.released = true
 	cancelBg := h.cancelBg
+	preserveRetained := h.retentionPrepared || h.retentionHolder
 	h.mu.Unlock()
 	if cancelBg != nil {
 		cancelBg()
@@ -723,13 +795,15 @@ func (h *ControllerHooks) Release(reason string) {
 		// Release uses the original token on a bounded cleanup connection; do
 		// not skip it merely because normal controller work has stopped. Keep
 		// the lease until this attempt ends, and retain node recovery on error.
-		if err := h.client.Release(reason); err != nil {
-			h.opts.Logf("controller.Release: %v; retaining node recovery", err)
+		if !preserveRetained {
+			if err := h.client.Release(reason); err != nil {
+				h.opts.Logf("controller.Release: %v; retaining node recovery", err)
+			}
 		}
 		_ = h.client.Close()
 		h.sessionMu.Unlock()
 	}
-	if h.lease != nil {
+	if h.lease != nil && !preserveRetained {
 		if err := h.lease.Close(); err != nil {
 			h.opts.Logf("controller lease cleanup: %v", err)
 		}

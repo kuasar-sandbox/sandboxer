@@ -512,6 +512,42 @@ PathID 只选择 `RunRoot/PathID/ctl.sock`，不做身份一致性校验。`--ou
 BaseRoot 文件系统（例如 `BuildBaseDir/checkpoint`）；运行进程只清理自己的
 RunDir/owned diff，不会把 output 当作运行目录删除。
 
+<a id="checkpoint-memory-save"></a>
+
+### 命名 checkpoint 的内存保存
+
+已启用 checkpoint 的 Runtime，在本地输出、不带 `--resume` 的
+`snapshot --checkpoint ID` 中采用冻结内存 holder，内存与磁盘共用该 ID。
+操作固定小型内存描述、停止 CH 并释放普通运行资源后返回；原进程继续保存本轮选中的
+内存页面。冻结内存释放前保留对应资源额度，Runtime 退出不等于内存额度已归还。
+
+转储期间，恢复和发布通过只读 memfd 读取冻结数据；文件发布后，读者主动切换并关闭
+RAM FD，再确认释放。新 VM 始终使用自己的可写 memfd。临时 socket 位于
+`RunDir/memory-holders/<memoryID>/<epoch>/m.sock`，checkpoint 中的可变记录定位
+准确的生产者。正常运行目录清理保留这一独立命名空间。
+
+恢复后的 Runtime 按 SandboxID 继承上一轮保存义务，包括从较早 checkpoint 恢复的
+情况。再次命名 pause 默认在入口等待，等待期间不冻结、不离开 running。CLI 可用
+`--no-wait-for-previous-memory-save`，SDK 可设 `NoWaitForPreviousMemorySave`，
+在未完成时立即拒绝。取消等待不取消后台保存，也不改变当前 Runtime 状态。
+完整 pause 耗时包括这一入口等待。
+
+`Runtime.Wait` 和 `Close` 仍结束普通运行资源及借用 storage 的使用期。
+嵌入 SDK 的进程在生成本地 checkpoint 后还需保持存活，直至
+`Runtime.WaitMemorySave` 完成；CLI 适配器自动等待。holder 单独拥有只读 FD 和
+本地写出能力，不借用已经关闭的 Runtime fetch client。
+
+普通 capture、未启用 checkpoint 的 Runtime、同 VM `--resume`、纯磁盘 export
+和显式可移植 Bundle 输出维持既有行为。托管运行还要求 host 明确支持运行退役，
+旧 host 或旧资源控制器继续同步保存。若冻结顶层无法满足既有稀疏载体预算，先完整
+恢复原运行，并确认回滚及资源确认已完成，再回退到既有同步捕获流程。
+
+该行为缩短 pause 返回前的工作，不定义时延验收阈值，也不把返回视为内存已持久落盘。
+后台写失败保留 RAM 并重试；已提交捕获不会因调用者断连而回滚。退役记录或资源确认
+失败时，控制操作在清理预算内返回错误，已提交 holder 继续后台完成。未提交捕获的
+回滚立即关闭临时内存 FD，即使元数据发布仍需重试。降级前须完成上一轮
+保存，将本地描述发布为普通可移植快照；旧 reader 不识别这一节点本地描述格式。
+
 <a id="export"></a>
 
 ## `sandbox-ctl export`

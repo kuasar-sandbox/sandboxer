@@ -750,6 +750,23 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		Context:          backendCtx,
 		Logf:             logf,
 	}
+	if p.owner != nil {
+		snapHandler.runtime = p.owner
+		snapHandler.CurrentRun = p.owner.spec.CurrentRun
+		if p.DiskCurrentRun != nil {
+			snapHandler.CurrentRun = p.DiskCurrentRun
+		}
+		if p.owner.hooks == nil {
+			p.owner.hooks = p.Hooks
+		}
+	}
+	if enabled {
+		previous, err := newPreviousMemorySave(snapHandler.CheckpointDir, p.SandboxID)
+		if err != nil {
+			return -1, err
+		}
+		snapHandler.previousMemory = previous
+	}
 	// Runtime cleanup covers Launch and initialization failures. Restore closes
 	// this borrower before its outer disk and directory-owner closers.
 	if p.owner == nil || p.EnableCheckpoint {
@@ -776,6 +793,18 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	}()
 
 	ctlSrv := &ctl.Server{
+		CaptureStateHandler: snapHandler.captureState,
+		SnapshotAdmissionHandler: func(ctx context.Context, req ctl.Request) error {
+			if req.CheckpointID == "" || req.ResumeAfter {
+				return nil
+			}
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			stop := context.AfterFunc(backendCtx, cancel)
+			defer stop()
+			_, err := snapHandler.previousMemory.wait(ctx, req.NoWaitForPreviousMemorySave)
+			return err
+		},
 		CheckpointListHandler: func(req ctl.Request) ([]ctl.DiffCheckpointRef, error) {
 			if p.owner != nil {
 				if err := p.owner.requireRunning(); err != nil {

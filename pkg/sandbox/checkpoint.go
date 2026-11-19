@@ -224,7 +224,7 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 		if err != nil {
 			return nil, err
 		}
-		root, err := snapshotfile.Open(ctx, opened)
+		root, err := openMemoryCheckpointSnapshot(ctx, opts, opened, filepath.Dir(ref.Path))
 		if err != nil {
 			return nil, err
 		}
@@ -233,13 +233,13 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 		if err != nil {
 			return nil, err
 		}
-		hinted, err := snapshot.DirtyMemory(root.Memory, root.MemoryDirty)
+		hinted, err := artifact.SnapshotDirtyMemory(root)
 		if err != nil {
 			return nil, err
 		}
 		diagnostic = append(diagnostic, &checkpointSourceStream{Source: hinted, close: func() error { return nil }})
 		candidate := hinted
-		if root.MemoryDirty != nil && !memoryParentViewEqual(cfg.FromRefs, all[i+1:]) {
+		if (root.MemoryDirty != nil || root.LocalCheckpoint != nil) && !memoryParentViewEqual(cfg.FromRefs, all[i+1:]) {
 			candidate = root.Memory
 			unproved = true
 			if opts.memoryLogf != nil {
@@ -247,7 +247,7 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 			}
 		}
 		candidates = append(candidates, &checkpointSourceStream{Source: candidate, close: func() error { return nil }})
-		if !merge && len(prefix) == 1 && root.MemoryDirty == nil {
+		if !merge && len(prefix) == 1 && root.MemoryDirty == nil && root.LocalCheckpoint == nil {
 			// Legacy/all-dirty single parent is already the desired H.
 			if err := root.Close(); err != nil {
 				return nil, err

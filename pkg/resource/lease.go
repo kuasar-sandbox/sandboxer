@@ -87,10 +87,11 @@ func LeasePath(controllerSocket, sandboxID string) string {
 
 // LeaseHandle owns the POSIX record lock for one sandbox lifetime.
 type LeaseHandle struct {
-	path string
-	file *os.File
-	once sync.Once
-	err  error
+	path      string
+	file      *os.File
+	canonical string // nonempty only for an unpublished handoff candidate
+	once      sync.Once
+	err       error
 }
 
 // POSIX process-associated record locks are released when the owning process
@@ -203,6 +204,8 @@ func (h *LeaseHandle) Path() string {
 	if h == nil {
 		return ""
 	}
+	localLeaseHandles.Lock()
+	defer localLeaseHandles.Unlock()
 	return h.path
 }
 
@@ -212,6 +215,9 @@ func (h *LeaseHandle) Close() error {
 	if h == nil {
 		return nil
 	}
+	// A lost handoff ACK may have published our inode. Use the held FD,
+	// never an open/close of our canonical inode, to detect that case.
+	_, _ = h.ConfirmPublished()
 	localLeaseHandles.Lock()
 	defer localLeaseHandles.Unlock()
 	h.once.Do(func() {

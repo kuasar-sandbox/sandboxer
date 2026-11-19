@@ -572,6 +572,58 @@ when artifacts are unavailable; it never reads S to discover E.
 
 A local `snapshot` needs either `--sandbox-id` or `--path-id`. When both are supplied, PathID only selects `RunRoot/PathID/ctl.sock`; no identity consistency check is performed. `--output` may reside on the BaseRoot filesystem, for example `BuildBaseDir/checkpoint`. The running process cleans its own RunDir/owned diffs and does not treat output as a runtime directory to delete.
 
+<a id="checkpoint-memory-save"></a>
+
+### Named checkpoint memory saving
+
+A runtime started with checkpoint support uses a frozen memory holder for
+`(snapshot --checkpoint ID)` with local output and without `--resume`. The ID
+is shared with the disk checkpoint. The operation commits a small local memory
+descriptor, retires CH and the ordinary runtime resources, and then returns.
+The original process remains alive to save the selected memory pages. It retains
+the corresponding memory reservation until the backing is released; runtime
+retirement is not memory-resource release.
+
+Restore and publication can read the frozen read-only memfd while the file is
+being written. Each reader switches to the published local carrier and closes
+its RAM descriptor before acknowledging release. The new VM always has its own
+writable memfd. The socket lives under
+`RunDir/memory-holders/<memoryID>/<epoch>/m.sock`; a mutable checkpoint record
+locates that exact producer. Normal runtime cleanup preserves this namespace.
+
+A resumed runtime inherits the previous save obligation by SandboxID, even when
+restoring an older checkpoint. Another named pause waits for that obligation by
+default, before freezing or changing its running state. The CLI option
+`--no-wait-for-previous-memory-save` and SDK request field
+`NoWaitForPreviousMemorySave` reject the request while it is pending. Cancelling
+this wait leaves the runtime running and does not cancel the previous save.
+The full pause duration includes this admission wait.
+
+`Runtime.Wait` and `Close` still end ordinary runtime ownership, including
+borrowed storage. A process embedding the SDK must remain alive until
+`Runtime.WaitMemorySave` completes when it has produced a local checkpoint;
+executable adapters do this automatically. The holder owns its read-only FD and
+local writer independently of the runtime's fetch clients.
+
+Ordinary captures, runtimes without checkpoint support, same-VM `--resume`,
+disk-only export, and explicit portable Bundle output retain their existing
+capture behavior. A managed runtime requires its host's explicit retirement
+capability; old hosts or resource controllers continue synchronously. If a
+frozen top cannot fit the existing sparse carrier budget, capture restores the
+running VM and uses the existing synchronous path after rollback and resource
+confirmation have completed.
+
+This changes the work performed before pause returns; it does not define a
+latency threshold or claim durable storage at the return boundary. Background
+write failures retain RAM and retry. A committed capture is never rolled back
+because its caller disconnected. A retirement publication or resource-confirmation
+failure returns an error within the control operation's cleanup budget while
+the committed holder continues in the background. An uncommitted abort closes
+its provisional memory FD even if its metadata publication needs a retry.
+Before downgrading, finish pending saves and
+publish local descriptors as ordinary portable snapshots. Old readers do not
+understand the local descriptor profile.
+
 <a id="export"></a>
 
 ## `sandbox-ctl export`

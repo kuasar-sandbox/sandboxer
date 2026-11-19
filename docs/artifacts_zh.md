@@ -601,7 +601,7 @@ DIFF 从真实本地 carrier（包括所选 Bundle 成员）所在目录解析�
 
 ## `.snapshot` logical format
 
-Snapshot S layout:
+普通可移植 Snapshot S 的布局：
 
 ```text
 [memory sparse payload]
@@ -626,11 +626,31 @@ from_refs:
 
 Snapshot ZIP 与 config 同样 strict、bounded、canonical。`config.json` 和 `state.json` 各限 16 MiB，`snapshot.cfg` 限 1 MiB，`from_refs` 最多 64 项。源码见 [snapshotfile.go](../pkg/snapshotfile/snapshotfile.go) 和 [snapshot/config.go](../pkg/snapshot/config.go)。旧 disk-schema input 返回 `unsupported snapshot format/version`,不 dual-read、不 migration、不 cold fallback.
 
+<a id="memory-checkpoint-descriptor"></a>
+
+### 节点本地 checkpoint 内存描述
+
+命名本地快速捕获使用独立的严格格式：零长度内存前缀，随后依次为 `config.json`、
+`state.json`、`snapshot.cfg`、`memory.checkpoint.json`。固定描述保存版本、
+memory ID、checkpoint ID、逻辑 RAM 容量、内容标识的位图引用、有序内部父引用以及
+本轮工作集选择；外部 `from_refs` 后缀仍只在 `snapshot.cfg` 中。
+
+固定 M/D/R 位图采用独立的既有 image carrier，不挤入有界 ZIP。
+`memory/<sha256(checkpointID)>.json` 是准确 holder 与已发布 payload 的可变记录，
+`current-memory.json` 定位该 SID 最新的保存义务。socket 身份、转储进度不改变固定 S
+身份。必要记录缺失或不一致必须报错，不能视为一个空内存层。
+
+公共制品 reader 将内部图解析为单层内存视图。历史在可移植发布时物化，不把内部父图
+扩展为对外 `from_refs`。脏页捕获导出本轮变化与本地历史脏页；工作集捕获导出本轮
+工作集及独立的历史脏页层。普通 S 缺少 `memory.dirty` 时全显式内容为脏的兼容规则不变。
+发布、rewrite 和 Bundle 路径均物化为普通 S，不能把描述载体当成完整内存快照复制。
+旧 reader 拒绝本地格式，新 reader 继续兼容普通快照。
+
 <a id="memory-dirty"></a>
 
 ### 可选的 `memory.dirty` 元数据
 
-规范 Snapshot S 包含三个条目，或在 `config.json`、`state.json`、`snapshot.cfg`
+普通规范 Snapshot S 包含三个条目，或在 `config.json`、`state.json`、`snapshot.cfg`
 之后追加第四个条目 `memory.dirty`。`snapshot.cfg.version` 仍为 `1`，该元数据
 不引入另一套 snapshot 配置 schema。
 
@@ -719,13 +739,12 @@ root carrier物化为`.image`;只有需要作为独立dependency保存的root/da
 不可变 EROFS base 与 ext4 upper 保持分离。Data 和不透明 Zero 覆盖下层，Hole 向下穿透。
 历史读取走宿主制品 stream，不读 guest memfd，因此不会扩大本轮工作集。
 
-历史组合在 guest freeze 前准备并直接流入最终 sink，复用 `fetch.NewLayered` 和 sparse run，
+普通捕获在 guest freeze 前准备历史组合并直接流入最终 sink；命名本地快速捕获只记录内部父图，将历史物化延后至可移植导出。两者均复用 `fetch.NewLayered` 和 sparse run，
 不缓存整镜像，也不生成多余整镜像中间副本。local 输出对 checkpoint 已拥有的复用依赖保留物理
 selector；Bundle 输出继续使用既有成员复制发布路径。历史合并生成新内容身份；sink commit/close 和数据库提交之前，
 旧来源始终有效。捕获或数据库提交失败都不能授权删除旧文件。
 
-托管 Pause 提交精确 S/E 对（或 E-only 根）后，生命周期 owner 先 fence 旧 runner 及全部
-读写使用者，再执行选择性清理。通用 FileSink、任意 `--output`、独立 `snapshot --resume`
+托管 Pause 提交精确 S/E 对（或 E-only 根）后，生命周期 owner 先结束普通运行，只有读写 fence 允许删除后才执行选择性清理。后台内存 holder 的 unit、资源、位图和内部依赖图持续保留，普通 paused 清理不能杀掉该进程。通用 FileSink、任意 `--output`、独立 `snapshot --resume`
 和共享 build 阶段输入都不因此取得清理权。sandboxer 制品库解释保留集合；conductor 只通过
 短生命周期 `node-ctl checkpoint-cleanup` 工具提供目录归属、路径、已提交的来源对及既有
 lifecycle fence。portable Export 继续只使用已存储的来源对，不读取制品。token、公开结果、

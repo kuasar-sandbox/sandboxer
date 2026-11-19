@@ -9,6 +9,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/tailzip"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 )
 
 // ReadConfig reads only snapshot.cfg and the bounded ZIP headers required to
@@ -18,6 +19,10 @@ import (
 // The caller retains stream ownership. Carrier authentication/retries remain
 // those of the same Stream and tailReaderAt used by Open.
 func ReadConfig(ctx context.Context, stream fetch.Stream) ([]byte, error) {
+	return readConfig(ctx, stream, nil)
+}
+
+func readConfig(ctx context.Context, stream fetch.Stream, descriptor **memorycheckpoint.Descriptor) ([]byte, error) {
 	if stream == nil {
 		return nil, errors.New("snapshot config: nil stream")
 	}
@@ -25,7 +30,7 @@ func ReadConfig(ctx context.Context, stream fetch.Stream) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	names, err := archiveNames(footer.Count)
+	names, err := archiveNamesAt(footer.Count, footer.Base)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +41,7 @@ func ReadConfig(ctx context.Context, stream fetch.Stream) ([]byte, error) {
 	for _, name := range names {
 		centralSize += centralHeaderSize + uint64(len(name))
 	}
-	if footer.Base == 0 || footer.Count != len(names) || footer.CentralSize != centralSize {
+	if (footer.Base == 0 && footer.Count != 4) || footer.Count != len(names) || footer.CentralSize != centralSize {
 		return nil, errors.New("snapshot config: invalid ZIP geometry")
 	}
 	central, err := readAt(ctx, stream, footer.CentralStart, footer.CentralSize)
@@ -79,13 +84,24 @@ func ReadConfig(ctx context.Context, stream fetch.Stream) ([]byte, error) {
 				return nil, err
 			}
 		}
-		if name == SnapshotCfgName {
-			cfg, err = readAt(ctx, stream, local+headerSize, size)
+		if name == SnapshotCfgName || name == MemoryCheckpointName {
+			body, err := readAt(ctx, stream, local+headerSize, size)
 			if err != nil {
 				return nil, err
 			}
-			if crc32.ChecksumIEEE(cfg) != u32(16) {
+			if crc32.ChecksumIEEE(body) != u32(16) {
 				return nil, errors.New("snapshot config: CRC mismatch")
+			}
+			if name == SnapshotCfgName {
+				cfg = body
+			} else {
+				local, err := decodeLocalDescriptor(body)
+				if err != nil {
+					return nil, err
+				}
+				if descriptor != nil {
+					*descriptor = local
+				}
 			}
 		}
 		local += headerSize + size

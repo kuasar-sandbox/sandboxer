@@ -169,7 +169,7 @@ func TestSnapshotPureBlockDependenciesKeepEveryByte(t *testing.T) {
 	// A pure block stream may end in arbitrary bytes. Publication must never
 	// probe, strip, or even read its tail while classifying its declared type.
 	in := &checkpointSourceStream{}
-	out, transformed, err := prepareSnapshotDependencyStream(context.Background(), in, dependencyPureBlock)
+	out, transformed, err := prepareSnapshotDependencyStream(context.Background(), in, dependencyPureBlock, RunOptions{})
 	if err != nil || transformed || out != in {
 		t.Fatalf("pure block dependency was interpreted: %v", err)
 	}

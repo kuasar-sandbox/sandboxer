@@ -36,6 +36,7 @@ type Quiescer interface {
 
 // Sources gathers the inputs Take needs.
 type Sources struct {
+	FrozenMemory *FrozenMemoryCapture
 	MemoryLayout MemoryLayout // standalone callers with an existing stable layout
 	// CaptureMemory collects CH logs then freezes M/D/R after snapshot writes.
 	CaptureMemory    func(context.Context) (*memory.CaptureView, error)
@@ -139,6 +140,15 @@ type Outputs struct {
 // sink (FileSink for --output, IngestSink for --upload, or BundleSink). Take
 // closes it on every return path.
 func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr error) {
+	frozenCommitted := false
+	defer func() {
+		if frozenCommitted && retErr != nil {
+			retErr = errors.Join(ErrFrozenMemoryCommitted, retErr)
+		}
+	}()
+	if s.FrozenMemory != nil && (resumeAfter || s.CaptureMemory == nil || s.FrozenMemory.Build == nil || s.FrozenMemory.Commit == nil) {
+		return nil, errors.New("snapshot: incomplete frozen memory capability")
+	}
 	checkpointState := &checkpointCapture{id: s.CheckpointID}
 	defer func() { retErr = errors.Join(retErr, checkpointState.close()) }()
 	sinkOpen := sink != nil
@@ -228,13 +238,13 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		// A failed snapshot always leaves the sandbox running, so undo the CH
 		// pause even on the destroy-on-success path. Successful destroy mode is
 		// handled by the caller via /vmm.shutdown and deliberately stays paused.
-		if !resumed && (!succeeded || resumeAfter) {
+		if !resumed && !frozenCommitted && (!succeeded || resumeAfter) {
 			_ = ch.Resume()
 		}
 	}()
 	backendsResumed := false
 	defer func() {
-		if !backendsResumed {
+		if !backendsResumed && !frozenCommitted {
 			s.Quiescer.Resume()
 		}
 	}()
@@ -286,90 +296,119 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	}
 	// T6: [memory][ZIP] bundle → sink, streamed from the memfd (CH paused, so
 	// the mapping is stable); only resident pages are read/transferred.
-	var memorySource sparse.Source
-	var dirty []byte
-	var workingMemory sparse.Source
-	if s.CaptureMemory != nil {
-		view, err := s.CaptureMemory(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("capture memory view: %w", err)
+	if s.FrozenMemory != nil {
+		view, captureErr := s.CaptureMemory(ctx)
+		if captureErr != nil {
+			return nil, captureErr
 		}
-		if view.WorkingSetOnly {
-			logf("snapshot memory compatibility: CH dirty API unavailable; preserving complete working set")
+		if view == nil || view.Size != uint64(s.MemfdSize) {
+			return nil, errors.New("snapshot: frozen memory geometry mismatch")
 		}
-		if view.Size != uint64(s.MemfdSize) {
-			return nil, fmt.Errorf("capture memory size mismatch")
+		source, resident, buildErr := s.FrozenMemory.Build(ctx, sink, configJSON, stateJSON, snapshotCfg, view)
+		if buildErr != nil {
+			return nil, buildErr
 		}
-		memorySource, dirty, err = CaptureMemory(fdReaderAt(s.MemfdFD), view, s.MemoryWorkingSet)
-		if err != nil {
-			return nil, err
-		}
-		workingMemory, _, err = CaptureMemory(fdReaderAt(s.MemfdFD), view, true)
+		out.MemoryResident = resident
+		out.SnapshotRef, out.SnapshotPath, err = sink.AbsorbSnapshot(ctx, source)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		var holes, zeros []sparse.Extent
-		if s.MemoryLayout != nil {
-			holes, zeros, err = s.MemoryLayout()
+		var memorySource sparse.Source
+		var dirty []byte
+		var workingMemory sparse.Source
+		if s.CaptureMemory != nil {
+			view, err := s.CaptureMemory(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("capture memory view: %w", err)
+			}
+			if view.WorkingSetOnly {
+				logf("snapshot memory compatibility: CH dirty API unavailable; preserving complete working set")
+			}
+			if view.Size != uint64(s.MemfdSize) {
+				return nil, fmt.Errorf("capture memory size mismatch")
+			}
+			memorySource, dirty, err = CaptureMemory(fdReaderAt(s.MemfdFD), view, s.MemoryWorkingSet)
+			if err != nil {
+				return nil, err
+			}
+			workingMemory, _, err = CaptureMemory(fdReaderAt(s.MemfdFD), view, true)
+			if err != nil {
+				return nil, err
+			}
 		} else {
-			holes, err = WalkHoles(s.MemfdFD, s.MemfdSize)
+			var holes, zeros []sparse.Extent
+			if s.MemoryLayout != nil {
+				holes, zeros, err = s.MemoryLayout()
+			} else {
+				holes, err = WalkHoles(s.MemfdFD, s.MemfdSize)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("memory layout: %w", err)
+			}
+			memorySource = &releasedMemorySource{fd: s.MemfdFD, size: uint64(s.MemfdSize), holes: holes, zeros: zeros}
 		}
+		if workingMemory == nil {
+			workingMemory = memorySource
+		}
+		fallbackCoverage := DataCoverage(workingMemory)
+		fallbackValues := workingMemory
+		if s.MemoryFallbackBase != nil {
+			fallbackCoverage = fetch.NewLayered(memoryBorrow{fallbackCoverage}, memoryBorrow{s.MemoryFallbackBase})
+			fallbackValues = fetch.NewLayered(memoryBorrow{workingMemory}, memoryBorrow{s.MemoryFallbackBase})
+		}
+		memoryBaseOpen := false
+		var closeMemoryBase func() error
+		defer func() {
+			if memoryBaseOpen {
+				retErr = errors.Join(retErr, closeMemoryBase())
+			}
+		}()
+		var proofCandidates sparse.Source
+		if s.MergeBaseSnapshot != "" {
+			if s.MemoryProofCandidates != nil {
+				proofCandidates = fetch.NewLayered(memoryBorrow{memorySource}, memoryBorrow{s.MemoryProofCandidates})
+			}
+			base, _, berr := openMergeBaseWithOpener(ctx, s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MemoryMergeBaseOpener)
+			if berr != nil {
+				return nil, fmt.Errorf("merge memory base: %w", berr)
+			}
+			// Reuse the bounded/retrying parent view used for disk exports. Only
+			// Hole inherits; explicit Zero must mask old parent contents.
+			merged := fetch.NewLayered(memoryBorrow{memorySource}, &payloadMergeBase{Stream: base.stream, size: uint64(s.MemfdSize), ctx: ctx})
+			memorySource = merged
+			closeMemoryBase = merged.Close
+			memoryBaseOpen = true
+			// C and H are dirty relative to the retained external suffix.
+			dirty = nil
+		}
+		snapshotSource, storage, err := BuildCaptureSource(ctx, sink, memorySource, dirty, configJSON, stateJSON, snapshotCfg, fallbackCoverage, fallbackValues, proofCandidates, logf)
 		if err != nil {
-			return nil, fmt.Errorf("memory layout: %w", err)
+			return nil, fmt.Errorf("build Snapshot S: %w", err)
 		}
-		memorySource = &releasedMemorySource{fd: s.MemfdFD, size: uint64(s.MemfdSize), holes: holes, zeros: zeros}
-	}
-	if workingMemory == nil {
-		workingMemory = memorySource
-	}
-	fallbackCoverage := DataCoverage(workingMemory)
-	fallbackValues := workingMemory
-	if s.MemoryFallbackBase != nil {
-		fallbackCoverage = fetch.NewLayered(memoryBorrow{fallbackCoverage}, memoryBorrow{s.MemoryFallbackBase})
-		fallbackValues = fetch.NewLayered(memoryBorrow{workingMemory}, memoryBorrow{s.MemoryFallbackBase})
-	}
-	memoryBaseOpen := false
-	var closeMemoryBase func() error
-	defer func() {
+		out.MemoryResident = storage.DataBytes + storage.ZeroBytes
+		out.SnapshotRef, out.SnapshotPath, err = sink.AbsorbSnapshot(ctx, snapshotSource)
+		var memoryBaseCloseErr error
 		if memoryBaseOpen {
-			retErr = errors.Join(retErr, closeMemoryBase())
+			memoryBaseCloseErr = closeMemoryBase()
+			memoryBaseOpen = false
 		}
-	}()
-	var proofCandidates sparse.Source
-	if s.MergeBaseSnapshot != "" {
-		if s.MemoryProofCandidates != nil {
-			proofCandidates = fetch.NewLayered(memoryBorrow{memorySource}, memoryBorrow{s.MemoryProofCandidates})
+		if err != nil || memoryBaseCloseErr != nil {
+			return nil, fmt.Errorf("absorb Snapshot S: %w", errors.Join(err, memoryBaseCloseErr))
 		}
-		base, _, berr := openMergeBaseWithOpener(ctx, s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MemoryMergeBaseOpener)
-		if berr != nil {
-			return nil, fmt.Errorf("merge memory base: %w", berr)
-		}
-		// Reuse the bounded/retrying parent view used for disk exports. Only
-		// Hole inherits; explicit Zero must mask old parent contents.
-		merged := fetch.NewLayered(memoryBorrow{memorySource}, &payloadMergeBase{Stream: base.stream, size: uint64(s.MemfdSize), ctx: ctx})
-		memorySource = merged
-		closeMemoryBase = merged.Close
-		memoryBaseOpen = true
-		// C and H are dirty relative to the retained external suffix.
-		dirty = nil
-	}
-	snapshotSource, storage, err := BuildCaptureSource(ctx, sink, memorySource, dirty, configJSON, stateJSON, snapshotCfg, fallbackCoverage, fallbackValues, proofCandidates, logf)
-	if err != nil {
-		return nil, fmt.Errorf("build Snapshot S: %w", err)
-	}
-	out.MemoryResident = storage.DataBytes + storage.ZeroBytes
-	out.SnapshotRef, out.SnapshotPath, err = sink.AbsorbSnapshot(ctx, snapshotSource)
-	var memoryBaseCloseErr error
-	if memoryBaseOpen {
-		memoryBaseCloseErr = closeMemoryBase()
-		memoryBaseOpen = false
-	}
-	if err != nil || memoryBaseCloseErr != nil {
-		return nil, fmt.Errorf("absorb Snapshot S: %w", errors.Join(err, memoryBaseCloseErr))
 	}
 	if err := checkDiskCapture(ctx, s.Diffs); err != nil {
 		return nil, err
+	}
+	if s.FrozenMemory != nil {
+		if err := s.FrozenMemory.Commit(out); err != nil {
+			if errors.Is(err, ErrFrozenMemoryCommitted) {
+				frozenCommitted = true
+				checkpointState.retain = true
+			}
+			return nil, err
+		}
+		frozenCommitted = true
 	}
 	checkpointState.retain = true
 	if err := sink.CommitSnapshot(ctx, out.SnapshotRef, out.SnapshotPath); err != nil {

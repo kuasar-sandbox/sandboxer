@@ -414,7 +414,7 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 	if err != nil {
 		return PublishResult{}, errors.Join(sandboxErr, err)
 	}
-	snapshotRoot, snapshotErr := snapshotfile.Open(ctx, stream)
+	snapshotRoot, snapshotErr := p.openSnapshot(ctx, stream, childScope)
 	if snapshotErr != nil {
 		return PublishResult{}, fmt.Errorf("publish: logical root is neither a strict .sandbox nor .snapshot: %w", errors.Join(sandboxErr, snapshotErr))
 	}
@@ -490,6 +490,14 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 			ref, e = "", ""
 		}
 	}()
+	if root.LocalCheckpoint != nil {
+		materialized, cleanup, err := p.materializeMemoryCheckpointRoot(ctx, root)
+		if err != nil {
+			return "", "", err
+		}
+		defer func() { retErr = errors.Join(retErr, cleanup()) }()
+		return p.publishSnapshotRoot(ctx, identity, scope, materialized)
+	}
 	if err := p.enter("snapshot:" + identity); err != nil {
 		return "", "", err
 	}
@@ -509,12 +517,17 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 	for _, raw := range cfg.FromRefs {
 		p.original(raw, scope)
 	}
+	publishedMemory := make([][]string, len(cfg.FromRefs))
 	for i := len(cfg.FromRefs) - 1; i >= 0; i-- {
 		published, err := p.publishMemoryLayer(ctx, cfg.FromRefs[i], scope)
 		if err != nil {
 			return "", "", fmt.Errorf("publish Snapshot from_refs[%d]: %w", i, err)
 		}
-		cfg.FromRefs[i] = published
+		publishedMemory[i] = published
+	}
+	cfg.FromRefs = nil
+	for _, refs := range publishedMemory {
+		cfg.FromRefs = append(cfg.FromRefs, refs...)
 	}
 	sandboxStream, sandboxScope, err := p.open(ctx, cfg.SandboxRef, scope)
 	if err != nil {
@@ -611,57 +624,108 @@ func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishSc
 	return p.target.Put(ctx, role, payload)
 }
 
-func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope publishScope) (ref string, retErr error) {
+func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope publishScope) (refs []string, retErr error) {
 	p.original(raw, scope)
 	defer func() {
 		if retErr == nil {
-			if ref == raw {
-				p.retained(ref, scope)
-			} else {
-				p.retained(ref, publishScope{})
+			for _, ref := range refs {
+				if ref == raw {
+					p.retained(ref, scope)
+				} else {
+					p.retained(ref, publishScope{})
+				}
 			}
 		}
 	}()
+	var stream fetch.Stream
+	var child publishScope
 	if portable, ok, err := p.keepPortable(ctx, raw, scope); err != nil {
-		return "", err
+		return nil, err
 	} else if ok {
-		return portable, nil
+		// A selected local descriptor still requires materialization even if
+		// its file was reached through a named location. Opaque external refs
+		// keep their existing availability and access semantics.
+		stream, child, err = p.selectedLocalMemoryCheckpoint(ctx, raw, scope)
+		if err != nil {
+			return nil, err
+		}
+		if stream == nil {
+			return []string{portable}, nil
+		}
 	}
 	key := scopeKey(scope, raw)
 	p.memoMu.Lock()
 	cached := p.memoryMemo[key]
 	p.memoMu.Unlock()
 	if cached != "" {
-		return cached, nil
+		if stream != nil {
+			if err := stream.Close(); err != nil {
+				return nil, err
+			}
+		}
+		return []string{cached}, nil
 	}
-	stream, _, err := p.open(ctx, raw, scope)
-	if err != nil {
-		return "", err
+	if stream == nil {
+		var err error
+		stream, child, err = p.open(ctx, raw, scope)
+		if err != nil {
+			return nil, err
+		}
 	}
-	root, err := snapshotfile.Open(ctx, stream)
+	root, err := p.openSnapshot(ctx, stream, child)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer func() {
 		retErr = errors.Join(retErr, root.Close())
-		if retErr == nil {
+		if retErr == nil && len(refs) == 1 {
 			p.memoMu.Lock()
-			p.memoryMemo[key] = ref
+			p.memoryMemo[key] = refs[0]
 			p.memoMu.Unlock()
 		}
 	}()
 	cfg, err := snapshot.ParseConfig(root.SnapshotConfig)
 	if err != nil {
-		return "", fmt.Errorf("unsupported snapshot format/version: %w", err)
+		return nil, fmt.Errorf("unsupported snapshot format/version: %w", err)
 	}
 	canonical, err := snapshot.MarshalConfig(cfg)
 	if err != nil || string(canonical) != string(root.SnapshotConfig) {
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return "", errors.New("memory Snapshot snapshot.cfg is not canonical")
+		return nil, errors.New("memory Snapshot snapshot.cfg is not canonical")
 	}
-	return p.target.Put(ctx, RoleSnapshot, root.FullStream)
+	if root.LocalCheckpoint != nil {
+		materialized, cleanup, err := p.materializeMemoryCheckpointRoot(ctx, root)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { retErr = errors.Join(retErr, materialized.Close(), cleanup()) }()
+		converted, err := snapshot.ParseConfig(materialized.SnapshotConfig)
+		if err != nil {
+			return nil, err
+		}
+		var historyRefs []string
+		if len(converted.FromRefs) > len(cfg.FromRefs) {
+			historyRefs, err = p.publishMemoryLayer(ctx, converted.FromRefs[0], child)
+			if err != nil {
+				return nil, err
+			}
+			converted.FromRefs = append(append([]string(nil), historyRefs...), cfg.FromRefs...)
+		}
+		encoded, err := snapshot.MarshalConfig(converted)
+		if err != nil {
+			return nil, err
+		}
+		source, err := snapshotfile.BuildSourceWithDirty(materialized.Memory, materialized.ConfigJSON, materialized.StateJSON, encoded, materialized.MemoryDirty)
+		if err != nil {
+			return nil, err
+		}
+		ref, err := p.target.Put(ctx, RoleSnapshot, source)
+		return append([]string{ref}, historyRefs...), err
+	}
+	ref, err := p.target.Put(ctx, RoleSnapshot, root.FullStream)
+	return []string{ref}, err
 }
 
 func (p *Publisher) open(ctx context.Context, raw string, scope publishScope) (fetch.Stream, publishScope, error) {

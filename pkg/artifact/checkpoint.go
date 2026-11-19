@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
@@ -50,6 +51,9 @@ type checkpointKeep struct {
 	files           map[string]bool
 	aliases         map[string]string // semantic alias -> current role's physical carrier basename
 	diffVersions    map[string]map[string]bool
+	memoryVisited   map[string]bool
+	memoryActive    map[string]bool
+	memoryRecords   map[string]bool
 }
 
 // retain resolves the physical source BEFORE comparing basenames. Memory and
@@ -175,6 +179,9 @@ func (k *checkpointKeep) plan(ctx context.Context, c Checkpoint) (retErr error) 
 			if _, err := k.retain(ctx, raw, child); err != nil {
 				return err
 			}
+		}
+		if err := k.retainMemory(ctx, c.SnapshotRef, scope); err != nil {
+			return err
 		}
 		eRef, eScope = cfg.SandboxRef, child
 	}
@@ -347,6 +354,15 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	}
 	f := os.NewFile(uintptr(fd), dir)
 	defer func() { retErr = errors.Join(retErr, f.Close()) }()
+	memoryLockFD, err := unix.Openat(fd, ".memory-readers.lock", unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	if err != nil {
+		return err
+	}
+	memoryLock := os.NewFile(uintptr(memoryLockFD), "checkpoint memory readers")
+	defer func() { retErr = errors.Join(retErr, memoryLock.Close()) }()
+	if err := unix.Flock(memoryLockFD, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return fmt.Errorf("checkpoint has active memory readers: %w", err)
+	}
 	pinned, err := f.Stat()
 	if err != nil {
 		return err
@@ -374,6 +390,26 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	k.aliases = map[string]string{}
 	if err := k.plan(ctx, c); err != nil {
 		return fmt.Errorf("checkpoint keep plan: %w", err)
+	}
+	if current, err := memorycheckpoint.ReadCurrent(dir); err == nil {
+		if current.Producer.SandboxID != c.SandboxID {
+			return errors.New("current memory capture differs from cleanup owner")
+		}
+		if !current.Committed && !current.Aborted && !current.Discarded {
+			return errors.New("current memory capture has no committed source")
+		}
+		if current.Committed && !current.Discarded {
+			if err := k.retainMemory(ctx, current.SnapshotRef, publishScope{relativeDir: dir, fetcher: s.Fetcher()}); err != nil {
+				return fmt.Errorf("current memory keep plan: %w", err)
+			}
+		} else {
+			if k.memoryRecords == nil {
+				k.memoryRecords = make(map[string]bool)
+			}
+			k.memoryRecords[current.CheckpointID] = true
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	// Current disks are a separate parent-owned root, even when the last
 	// ResumeSource describes an older checkpoint. Retain their local lowers
@@ -468,7 +504,7 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 			}
 		}
 		if len(entries) == 0 {
-			return nil
+			return k.cleanupMemoryRecords(ctx, fd)
 		}
 	}
 }

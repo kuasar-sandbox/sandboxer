@@ -56,6 +56,9 @@ type Root struct {
 	// MemoryDirty is the original encoded entry; nil means absent (all explicit dirty).
 	MemoryDirty []byte
 	ArchiveBase uint64
+	// LocalCheckpoint is non-nil for a resolved node-local memory checkpoint.
+	// FullStream is then the descriptor carrier, never a portable Snapshot.
+	LocalCheckpoint *LocalCheckpointView
 
 	owner *streamOwner
 }
@@ -167,11 +170,11 @@ func parseArchive(ctx context.Context, stream fetch.Stream) (uint64, map[string]
 	if err != nil {
 		return 0, nil, err
 	}
-	names, err := archiveNames(footer.Count)
+	names, err := archiveNamesAt(footer.Count, footer.Base)
 	if err != nil {
 		return 0, nil, err
 	}
-	limits := map[string]int{ConfigJSONName: MaxConfigJSONBytes, StateJSONName: MaxStateJSONBytes, SnapshotCfgName: MaxSnapshotCfgBytes, MemoryDirtyName: MaxDirtyBytes}
+	limits := map[string]int{ConfigJSONName: MaxConfigJSONBytes, StateJSONName: MaxStateJSONBytes, SnapshotCfgName: MaxSnapshotCfgBytes, MemoryDirtyName: MaxDirtyBytes, MemoryCheckpointName: MaxSnapshotCfgBytes}
 	base, bodies, err := tailzip.ReadCanonical(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size(), names, limits)
 	if err != nil {
 		return 0, nil, fmt.Errorf("snapshot ZIP: %w", err)
@@ -239,6 +242,7 @@ func readAt(ctx context.Context, stream fetch.Stream, offset, length uint64) ([]
 
 type streamOwner struct {
 	stream fetch.Stream
+	closes []io.Closer
 	once   sync.Once
 	err    error
 }
@@ -248,8 +252,11 @@ func (o *streamOwner) Close() error {
 		return nil
 	}
 	o.once.Do(func() {
+		for i := len(o.closes) - 1; i >= 0; i-- {
+			o.err = errors.Join(o.err, o.closes[i].Close())
+		}
 		if o.stream != nil {
-			o.err = o.stream.Close()
+			o.err = errors.Join(o.err, o.stream.Close())
 		}
 	})
 	return o.err
@@ -304,4 +311,11 @@ func archiveNames(count int) ([]string, error) {
 	default:
 		return nil, errors.New("snapshot ZIP: expected three or four entries")
 	}
+}
+
+func archiveNamesAt(count int, base uint64) ([]string, error) {
+	if base == 0 && count == 4 {
+		return []string{ConfigJSONName, StateJSONName, SnapshotCfgName, MemoryCheckpointName}, nil
+	}
+	return archiveNames(count)
 }
