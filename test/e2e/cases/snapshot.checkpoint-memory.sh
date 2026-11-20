@@ -47,6 +47,18 @@ REQUEST_PIDS=()
 cleanup() {
     local status=$?
     set +e
+    if [ "$status" -ne 0 ]; then
+        printf 'checkpoint-memory failed (%s -> %s), exit=%s\n' "$FIRST_FORMAT" "$SECOND_FORMAT" "$status" >&2
+        df -PB1 "$CP_DIR" "$WORK" >&2
+        # Native CI retains the case log, so include redirected command errors
+        # before its private OUT directory is collected and removed.
+        local diagnostic
+        for diagnostic in "$OUT"/*.stderr "$OUT"/*.log "$OUT"/*.timing.json; do
+            [ -s "$diagnostic" ] || continue
+            printf 'checkpoint-memory diagnostic: %s\n' "${diagnostic##*/}" >&2
+            tail -80 "$diagnostic" >&2
+        done
+    fi
     for pid in "${REQUEST_PIDS[@]}" "${RUN_PIDS[@]}"; do kill -TERM "$pid" 2>/dev/null; done
     # A failed assertion must not leave an intentionally ENOSPC-blocked holder.
     # Fence only records in this case's private directory and exact generation.
