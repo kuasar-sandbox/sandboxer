@@ -1078,6 +1078,31 @@ func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
 	return h.handle(req, "", nil)
 }
 
+func (h *SnapshotHandler) snapshotAdmission(backendCtx context.Context) func(context.Context, ctl.Request) error {
+	return func(ctx context.Context, req ctl.Request) error {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		stop := context.AfterFunc(backendCtx, cancel)
+		defer stop()
+		return h.waitPreviousMemoryForCapture(ctx, req)
+	}
+}
+
+// Both socket admission and direct capture wait only when this request can
+// create another frozen-memory obligation. The handler rechecks after socket
+// admission so admission does not grant a stale retention capability.
+func (h *SnapshotHandler) waitPreviousMemoryForCapture(ctx context.Context, req ctl.Request) error {
+	retain, err := checkpointMemoryRetention(req, RunOptions{EnableCheckpoint: h.EnableCheckpoint, runtime: h.runtime, CurrentRun: h.CurrentRun})
+	if err != nil {
+		return err
+	}
+	if retain {
+		_, err := h.previousMemory.wait(ctx, req.NoWaitForPreviousMemorySave)
+		return err
+	}
+	return nil
+}
+
 func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (ctl.Response, error) {
 	return h.handleContext(h.Context, req, cgroupPath, chExited)
 }
@@ -1090,14 +1115,8 @@ func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cg
 			err = errors.Join(ctl.ErrCaptureRejected, err)
 		}
 	}()
-	retain, err := checkpointMemoryRetention(req, RunOptions{EnableCheckpoint: h.EnableCheckpoint, runtime: h.runtime, CurrentRun: h.CurrentRun})
-	if err != nil {
+	if err := h.waitPreviousMemoryForCapture(ctx, req); err != nil {
 		return ctl.Response{}, err
-	}
-	if retain {
-		if _, err = h.previousMemory.wait(ctx, req.NoWaitForPreviousMemorySave); err != nil {
-			return ctl.Response{}, err
-		}
 	}
 	if err := h.capture.begin(); err != nil {
 		return ctl.Response{}, err

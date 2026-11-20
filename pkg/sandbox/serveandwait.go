@@ -809,18 +809,8 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	}()
 
 	ctlSrv := &ctl.Server{
-		CaptureStateHandler: snapHandler.captureState,
-		SnapshotAdmissionHandler: func(ctx context.Context, req ctl.Request) error {
-			if req.CheckpointID == "" || req.ResumeAfter {
-				return nil
-			}
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-			stop := context.AfterFunc(backendCtx, cancel)
-			defer stop()
-			_, err := snapHandler.previousMemory.wait(ctx, req.NoWaitForPreviousMemorySave)
-			return err
-		},
+		CaptureStateHandler:      snapHandler.captureState,
+		SnapshotAdmissionHandler: snapHandler.snapshotAdmission(backendCtx),
 		CheckpointListHandler: func(req ctl.Request) ([]ctl.DiffCheckpointRef, error) {
 			if p.owner != nil {
 				if err := p.owner.requireRunning(); err != nil {
