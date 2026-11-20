@@ -842,6 +842,12 @@ only bounded current metadata and Bundle indexes, not old candidate payloads or
 full-image digests; Snapshot CPU/state bodies are not needed by this operation.
 Any keep-plan or reader-close error prevents all deletions. Kernel/runtime basename
 identities bind host-supplied boot files and are not checkpoint payload edges.
+If a `from_refs` memory lower is a recorded node-local memory object, its exact
+carrier digest and inode identify the map, payload, capture record and internal
+parent graph to retain, including through a named location. Ordinary lowers stay
+opaque. A lower's historical execution, disk and external memory configuration
+does not add recursive dependencies. The independent current-memory root retains
+its own memory lowers even when the selected source is older or E-only.
 
 Bundle candidate locations are resolved only when the existing selector visits
 that source: current Bundle first, then ordered refs, then remote. A current hit

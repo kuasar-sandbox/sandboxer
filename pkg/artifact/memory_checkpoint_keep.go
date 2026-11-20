@@ -9,10 +9,55 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 	"golang.org/x/sys/unix"
 )
+
+// A flat memory lower is ordinarily an opaque payload. Only an exact local
+// capture record's digest and inode prove that it instead owns an internal
+// memory graph. Resolving first also covers named locations without treating
+// an unrelated external basename as a local dependency.
+func (k *checkpointKeep) retainMemoryLower(ctx context.Context, raw string, scope publishScope) error {
+	resolved, err := k.retain(ctx, raw, scope)
+	if err != nil {
+		return err
+	}
+	ref, err := manifest.ParseRef(resolved)
+	if err != nil {
+		return err
+	}
+	if ref.Scheme != manifest.RefSchemeFile || k.memoryVisited[resolved] || !knownLocalMemoryCarrier(ref.Path, ref) {
+		return nil
+	}
+	return k.retainMemory(ctx, raw, scope)
+}
+
+// The current SID capture is an independent root even when the selected source
+// is older or E-only. Its own external suffix is part of that root's keep set;
+// historical lowers' external configurations are not recursive memory edges.
+func (k *checkpointKeep) retainMemoryRoot(ctx context.Context, raw string, scope publishScope) (retErr error) {
+	stream, child, err := k.open(ctx, raw, scope)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, stream.Close()) }()
+	rawConfig, err := snapshotfile.ReadConfig(ctx, stream)
+	if err != nil {
+		return err
+	}
+	cfg, err := canonicalMemoryConfig(rawConfig)
+	if err != nil {
+		return err
+	}
+	for _, lower := range cfg.FromRefs {
+		if err := k.retainMemoryLower(ctx, lower, child); err != nil {
+			return err
+		}
+	}
+	return k.retainMemory(ctx, raw, scope)
+}
 
 // retainMemory follows only the local descriptor's internal edges. Historical
 // S execution and disk configs remain irrelevant to a memory lower. It reads

@@ -765,6 +765,10 @@ source/location 绑定。选择只读取有界的当前小型元数据与 Bundle
 不计算整镜像摘要；此操作无需 Snapshot 的 CPU/state body。kernel/runtime 的
 basename identity 绑定宿主提供的启动文件，不是 checkpoint payload 依赖。keep plan 或 reader Close 出错时
 不删除任何文件。
+若 `from_refs` 内存 lower 是有记录的节点本地内存对象，通过准确的载体 digest 与 inode
+识别并保留其位图、payload、capture record 和内部父图，包括经命名 location 访问的情况。
+普通 lower 仍保持不透明，不递归引入 lower 历史的执行、磁盘或外部内存配置依赖。
+独立的 current-memory 根保留自己的内存 lower，即使所选来源较旧或仅含 E。
 
 Bundle 候选来源的 location 仅在既有选择器访问该来源时解析：先当前 Bundle，再按顺序
 查询 refs，最后查询远端。当前 Bundle 命中时不要求无用 location 可解析；不可用候选可继续

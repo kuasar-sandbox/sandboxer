@@ -186,7 +186,7 @@ func (k *checkpointKeep) plan(ctx context.Context, c Checkpoint) (retErr error) 
 			return errors.New("checkpoint S/E source binding mismatch")
 		}
 		for _, raw := range cfg.FromRefs {
-			if _, err := k.retain(ctx, raw, child); err != nil {
+			if err := k.retainMemoryLower(ctx, raw, child); err != nil {
 				return err
 			}
 		}
@@ -413,7 +413,7 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 			return errors.New("current memory capture has no committed source")
 		}
 		if current.Committed && !current.Discarded {
-			if err := k.retainMemory(ctx, current.SnapshotRef, publishScope{relativeDir: dir, fetcher: s.Fetcher()}); err != nil {
+			if err := k.retainMemoryRoot(ctx, current.SnapshotRef, publishScope{relativeDir: dir, fetcher: s.Fetcher()}); err != nil {
 				return fmt.Errorf("current memory keep plan: %w", err)
 			}
 		} else {

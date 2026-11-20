@@ -605,7 +605,9 @@ The full pause duration includes this admission wait.
 `Runtime.Wait` and `Close` still end ordinary runtime ownership, including
 borrowed storage. A process embedding the SDK must remain alive until
 `Runtime.WaitMemorySave` completes when it has produced a local checkpoint;
-executable adapters do this automatically. The holder owns its read-only FD and
+this also joins any final capture response before process exit, even if the
+memory save finishes immediately. Executable adapters do this automatically.
+The holder owns its read-only FD and
 local writer independently of the runtime's fetch clients.
 
 Ordinary captures, runtimes without checkpoint support, same-VM `--resume`,

@@ -1074,6 +1074,11 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	}
 	go func() { defer backendWG.Done(); _ = launch.Serve(backendCtx) }()
 	go func() { defer backendWG.Done(); _ = vaReportSrv.Serve(backendCtx) }()
+	if p.owner != nil {
+		p.owner.mu.Lock()
+		p.owner.captureResponsesDone = ctlSrv.ResponsesDone()
+		p.owner.mu.Unlock()
+	}
 	go func() { defer backendWG.Done(); _ = ctlSrv.Serve(backendCtx) }()
 
 	// Optional periodic lazy-load stats logger (observe a slow remote/cache or

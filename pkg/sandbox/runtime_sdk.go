@@ -205,6 +205,7 @@ type Runtime struct {
 	storage                            *artifact.ProcessStorage
 	ownStorage                         bool
 	exitDone                           chan struct{}
+	captureResponsesDone               <-chan struct{}
 	exit                               ExitResult
 	closeOnce                          sync.Once
 	cleanupOnce                        sync.Once

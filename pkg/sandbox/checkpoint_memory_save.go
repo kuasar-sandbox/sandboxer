@@ -267,16 +267,26 @@ func (s *checkpointMemorySave) finishRetirement(first chan<- error) {
 	report(err)
 }
 
-// WaitMemorySave keeps executable adapters alive for their detached holder.
-// Runtime.Wait/Close retain their existing resource-ownership boundary.
+// WaitMemorySave keeps executable adapters alive for their detached holder and
+// final capture responses. Runtime.Wait/Close retain their existing resource-
+// ownership boundary; response completion must not join that earlier barrier.
 func (r *Runtime) WaitMemorySave(ctx context.Context) error {
 	r.mu.Lock()
 	save := r.memorySave
+	responsesDone := r.captureResponsesDone
 	r.mu.Unlock()
 	if save == nil {
 		return nil
 	}
-	return save.holder.Wait(ctx)
+	err := save.holder.Wait(ctx)
+	if responsesDone != nil {
+		select {
+		case <-responsesDone:
+		case <-ctx.Done():
+			return errors.Join(err, ctx.Err())
+		}
+	}
+	return err
 }
 
 // HasRuntimeOwner lets a legacy executable adapter join the same lifecycle

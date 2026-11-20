@@ -45,9 +45,13 @@ type Server struct {
 	conns    map[net.Conn]struct{}
 	connDone map[net.Conn]func()
 	connsWG  sync.WaitGroup
-	listener *net.UnixListener
-	stopOnce sync.Once
-	stopped  chan struct{}
+	// Detached capture replies no longer own runtime resources, but an
+	// executable must still join their complete framed writes before exiting.
+	responsesWG   sync.WaitGroup
+	responsesDone chan struct{}
+	listener      *net.UnixListener
+	stopOnce      sync.Once
+	stopped       chan struct{}
 }
 
 // Listen binds the UDS.
@@ -61,6 +65,7 @@ func (s *Server) Listen() error {
 	s.stopped = make(chan struct{})
 	s.conns = make(map[net.Conn]struct{})
 	s.connDone = make(map[net.Conn]func())
+	s.responsesDone = make(chan struct{})
 	_ = os.Remove(s.Path)
 	addr, err := net.ResolveUnixAddr("unix", s.Path)
 	if err != nil {
@@ -79,6 +84,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	if s.listener == nil {
 		return errors.New("ctl: Listen not called")
 	}
+	// No new handler can be registered after the accept loop returns. Joining
+	// here synchronously would deadlock a BeforeWrite awaiting runtime exit.
+	defer func() {
+		go func() {
+			s.responsesWG.Wait()
+			close(s.responsesDone)
+		}()
+	}()
 	go func() {
 		<-ctx.Done()
 		s.Stop()
@@ -104,6 +117,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		s.conns[conn] = struct{}{}
 		s.connsWG.Add(1)
+		s.responsesWG.Add(1)
 		done := sync.OnceFunc(func() {
 			s.connsMu.Lock()
 			delete(s.conns, conn)
@@ -114,11 +128,18 @@ func (s *Server) Serve(ctx context.Context) error {
 		s.connDone[conn] = done
 		s.connsMu.Unlock()
 		go func() {
+			defer s.responsesWG.Done()
 			defer done()
 			s.handle(conn)
 		}()
 	}
 }
+
+// ResponsesDone closes after Serve has stopped accepting and every accepted
+// handler has finished, including detached capture responses. It is available
+// after Listen. Runtime cleanup must not wait for it: a capture response can be
+// waiting for that cleanup. Executable shutdown joins it after retirement.
+func (s *Server) ResponsesDone() <-chan struct{} { return s.responsesDone }
 
 // Stop closes the listener and removes the socket file.
 func (s *Server) Stop() {

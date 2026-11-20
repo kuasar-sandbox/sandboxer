@@ -536,7 +536,8 @@ RAM FD，再确认释放。新 VM 始终使用自己的可写 memfd。临时 soc
 
 `Runtime.Wait` 和 `Close` 仍结束普通运行资源及借用 storage 的使用期。
 嵌入 SDK 的进程在生成本地 checkpoint 后还需保持存活，直至
-`Runtime.WaitMemorySave` 完成；CLI 适配器自动等待。holder 单独拥有只读 FD 和
+`Runtime.WaitMemorySave` 完成；它也等待最后的捕获响应写完，避免内存立即保存完成时进程抢先退出。
+CLI 适配器自动等待。holder 单独拥有只读 FD 和
 本地写出能力，不借用已经关闭的 Runtime fetch client。
 
 普通 capture、未启用 checkpoint 的 Runtime、同 VM `--resume`、纯磁盘 export
