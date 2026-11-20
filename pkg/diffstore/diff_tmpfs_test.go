@@ -170,6 +170,7 @@ func TestDiffTmpfsMixedCacheSnapshotBackpressure(t *testing.T) {
 			t.Run(fmt.Sprintf("encrypted=%t/writeback=%t", encrypted, writeback), func(t *testing.T) {
 				gate := newWorkerGate()
 				defer gate.open()
+				writebacks := make(chan struct{}, 2)
 				waiting := make(chan struct{}, 16)
 				hooks := cacheHooks{waiting: func() {
 					select {
@@ -178,7 +179,11 @@ func TestDiffTmpfsMixedCacheSnapshotBackpressure(t *testing.T) {
 					}
 				}}
 				if writeback {
-					hooks.beforeWrite = func([]*cachePage) error { gate.wait(); return nil }
+					hooks.beforeWrite = func([]*cachePage) error {
+						writebacks <- struct{}{}
+						gate.wait()
+						return nil
+					}
 				} else {
 					hooks.beforeSelect = gate.wait
 				}
@@ -203,7 +208,11 @@ func TestDiffTmpfsMixedCacheSnapshotBackpressure(t *testing.T) {
 				writePage(t, data, 0, 0x62)
 				wb := 0
 				if writeback {
-					wb = 1
+					// Each disk has its own worker. Hold both frozen batches
+					// before checking shared accounting and snapshot reads.
+					awaitSignal(t, writebacks)
+					awaitSignal(t, writebacks)
+					wb = 2
 				}
 				checkBudget(t, cache, 2, 2, wb)
 				for _, c := range []*Disk{root, data} {

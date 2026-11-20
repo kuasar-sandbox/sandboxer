@@ -34,6 +34,9 @@ TAP_NAME="sb$((BASHPID % 1000000))"
 BLK0_IMAGE="$WORK/blk0.img"
 DIFF_FILE="$WORK/blk1.diff"
 LOG="$OUT/lifecycle.log"
+# App stdout and console/stderr are independent byte streams. Keep marker
+# assertions on the app stream so console fragments cannot split its lines.
+APP_LOG="$OUT/lifecycle.app.log"
 STATS_JSON="$OUT/lifecycle-stats.json"
 SBPID=""
 POST_PID=""
@@ -137,6 +140,7 @@ readiness_assert_wire "$WORK/post-control.ready" "$POST_READER_PID" $'control_re
     e2e_fail "post-control failure emitted an invalid readiness wire"
 
 # Real prepared-product cold lifecycle.
+: >"$APP_LOG"
 readiness_begin_capture "$WORK/lifecycle.ready"
 LIFECYCLE_READER_PID=$READY_READER_PID
 readiness_exec_in_new_session "$BIN/sandbox-ctl" run \
@@ -146,6 +150,7 @@ readiness_exec_in_new_session "$BIN/sandbox-ctl" run \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
     --stats-json "$STATS_JSON" \
+    --stdout-to "$APP_LOG" \
     >"$LOG" 2>&1 &
 SBPID=$!
 readiness_close_parent_writer
@@ -166,13 +171,26 @@ readiness_assert_wire "$WORK/lifecycle.ready" "$LIFECYCLE_READER_PID" $'control_
     e2e_fail "cold readiness wire was not exact"
 
 for _ in $(seq 1 1200); do
-    grep -qE '^LIFECYCLE-OK [0-9]+$' "$LOG" 2>/dev/null && break
+    grep -qE '^LIFECYCLE-OK [0-9]+$' "$APP_LOG" 2>/dev/null && break
     kill -0 "$SBPID" 2>/dev/null || break
     sleep 0.05
 done
-grep -qE '^LIFECYCLE-OK [0-9]+$' "$LOG" || {
+grep -qE '^LIFECYCLE-OK [0-9]+$' "$APP_LOG" || {
+    python3 - "$APP_LOG" <<'PY' >&2 || true
+import os, re, sys
+try:
+    with open(sys.argv[1], "rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        data = stream.read(4096)
+except OSError:
+    print("lifecycle app stdout: unreadable")
+else:
+    print("lifecycle app stdout: bytes=%d scanned=%d marker_count=%d exact_line_count=%d" % (
+        size, len(data), data.count(b"LIFECYCLE-OK"),
+        len(re.findall(rb"(?m)^LIFECYCLE-OK [0-9]+$", data))))
+PY
     tail -60 "$LOG" >&2 || true
-    e2e_fail "prepared image application did not execute"
+    e2e_fail "prepared image application marker was not observed"
 }
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" \
     -- /bin/sh -c 'touch /tmp/e2e-lifecycle-exit' || e2e_fail "could not release lifecycle application"

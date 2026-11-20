@@ -332,6 +332,10 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 	}
 	spec.Resources = cfg.Resources
 	spec.Network.TapFD = cfg.Network.TapFD
+	diskLimits, err := cfg.Resources.DiffCOW.Limits()
+	if err != nil {
+		return nil, err
+	}
 	prepared, err = resolvePreparedHostIdentity(cfg, prepared)
 	if err != nil {
 		return nil, err
@@ -485,6 +489,7 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 	netMAC, _ := cfg.Network.Effective(metaMAC, "")
 	baseReady := make(chan struct{})
 	params := VMParams{Ctx: engineCtx, SandboxID: sid, BaseDir: r.baseDir, RunDir: runDir,
+		DiskIO:  NewDiskIOController(diskLimits),
 		Balloon: r.balloon, Hooks: hooks, Memory: mc, Cgroup: cg, CapBytes: int64(capBytes), UffdSource: uffd.ZeroSource{},
 		StdioMode: stdio.Mode{Console: spec.Console}, TapFile: r.tapFile, NetnsFile: r.netnsFile, NetMAC: netMAC,
 		Logf: r.logf, StartUnixNs: r.startUnixNs, StatsJSONPath: spec.StatsJSONPath, StatsInterval: spec.StatsInterval,
@@ -878,11 +883,15 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if err != nil {
 		return fail(err)
 	}
+	diskLimits, err := cfg.Resources.DiffCOW.Limits()
+	if err != nil {
+		return fail(err)
+	}
 	idleAfter, err := cfg.Resources.DiffCOW.CacheIdleDuration()
 	if err != nil {
 		return fail(err)
 	}
-	cache, stopCache, err := resctl.NewCacheWithBudget(r.lifeCtx, r.hooks, cacheSize, dirtySize, idleAfter)
+	cache, stopCache, err := resctl.NewCacheWithBudget(r.lifeCtx, r.hooks, cacheSize, dirtySize, diskLimits.PerDisk.MaxDirtySize, idleAfter)
 	if err != nil {
 		return fail(err)
 	}

@@ -201,3 +201,32 @@ func TestServeAndWaitEmitsControlReadyOnlyAfterCtlListen(t *testing.T) {
 		t.Fatalf("events = %v, want [control_ready]", got)
 	}
 }
+
+func TestServeAndWaitBackendGuardFailureCannotPublishReadiness(t *testing.T) {
+	runDir := t.TempDir()
+	var got []ReadinessEvent
+	spawned := false
+	_, err := ServeAndWait(VMParams{
+		Ctx: context.Background(), SandboxID: "guard-startup-failure", RunDir: runDir,
+		Logf: func(string, ...any) {},
+		// memory.Create accepts this mapping size, but the required 4 KiB
+		// guard cannot register it. Failure must precede every consumer.
+		CapBytes:        4097,
+		NotifyReadiness: func(event ReadinessEvent) { got = append(got, event) },
+		BuildCmd: func(CmdEnv) (*exec.Cmd, func(), error) {
+			spawned = true
+			return nil, func() {}, errors.New("unexpected command construction")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "protect backend memory") {
+		t.Fatalf("expected mandatory guard failure, got %v", err)
+	}
+	if spawned || len(got) != 0 {
+		t.Fatalf("guard failure exposed consumers/readiness: spawned=%t events=%v", spawned, got)
+	}
+	for _, name := range []string{"ctl.sock", "uffd.sock"} {
+		if _, err := os.Stat(filepath.Join(runDir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("guard failure left %s: %v", name, err)
+		}
+	}
+}

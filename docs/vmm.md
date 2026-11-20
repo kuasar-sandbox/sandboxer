@@ -386,10 +386,11 @@ file descriptor with `SCM_RIGHTS` so sandbox-ctl can consume its events. Descrip
 tables are process-local, but the context still routes events using the creator's
 virtual addresses; the event addresses received by sandbox-ctl are CH's chVA.
 
-**Backend first-touch during lazy restore.** The backend mmap is deliberately
-not UFFD-registered. Ordinary shmem access can create a zero folio without
-fetching snapshot bytes, so even a read or a one-byte status write must prepare
-memory first. Every vhost GPA/UVA translation calls the context-aware
+**Backend first-touch during lazy restore.** An unregistered backend mmap lets
+ordinary shmem access or remote GUP create a zero folio without fetching
+snapshot bytes. The complete backend mapping is protected by an independent
+`MISSING_SHMEM` + `SIGBUS` UFFD. Population still uses CH's registration, and even
+a read or a one-byte status write must prepare memory first. Every vhost GPA/UVA translation calls the context-aware
 `EnsureLoaded(ctx, memfdOffset, length)` barrier before returning a slice. This
 includes descriptors and indirect tables, avail/used rings, headers, both data
 directions and status. Missing callback wiring, invalid ranges and population
@@ -433,12 +434,17 @@ balloon/discard after the barrier returns is outside this guarantee.
 Close synchronizes admission with cancellation, drains callers and all workers,
 and stops the reader through its bounded epoll poll before closing UFFD fds.
 The source and backend mapping outlive that drain. Readiness/handshake waits also
-unwind on early startup errors. No second UFFD, MINOR/CONTINUE, eager whole-RAM
-population, kernel-floor increase or resource-policy change is involved.
+unwind on early startup errors. A separate, mandatory `MISSING_SHMEM` + `SIGBUS`
+UFFD protects the complete backend VMA from unprepared first-touch and remote
+GUP. It has no reader or event subscriptions, remains active for the mapping's
+lifetime, and closes only after the backend VMA has been unmapped. CH remains
+the only population target. No MINOR/CONTINUE, eager whole-RAM population,
+kernel-floor increase or resource-policy change is involved. See
+[backend protection](memory.md#uffd-registration).
 
 Repeatable validation uses `TestRealMissingShmemRestoredUsedRingPreservesUntouchedBytes`
-in `pkg/vhost`: two shared memfd aliases, a real CH-only MISSING_SHMEM
-registration, and the actual `publishUsed` path must preserve all surrounding
+in `pkg/vhost`: two shared memfd aliases, a real CH MISSING_SHMEM population
+registration, the full backend guard, and the actual `publishUsed` path must preserve all surrounding
 bytes and advance saved index 7 to 8 for both CPU-first and backend-first orders.
 UFFD/translation tests cover range, cancellation, registration, release and
 concurrency failures. The existing `snapshot.restore.sh` E2E additionally retains

@@ -40,7 +40,7 @@ func TestElasticCacheInitialGrantIsPartOfAdmit(t *testing.T) {
 		t.Fatalf("cache not atomically granted at Admit: supported=%v reserved=%d",
 			h.CacheSupported(), h.CacheReservation())
 	}
-	cache, stop, err := NewCacheWithBudget(context.Background(), h, 64*miB, 32*miB)
+	cache, stop, err := NewCacheWithBudget(context.Background(), h, 64*miB, 32*miB, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

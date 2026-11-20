@@ -99,6 +99,7 @@ type PostSpawnCtx struct {
 type VMParams struct {
 	DiskStorage        *artifact.ProcessStorage
 	DiskCache          *diffstore.Cache
+	DiskIO             *vhost.IOController // runtime-wide rate policy; nil means unrestricted
 	DiskCurrentRun     *artifact.CurrentRun
 	DiskPlan           *CheckpointDiskPlan
 	EnableCheckpoint   bool
@@ -380,7 +381,17 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	if err != nil {
 		return -1, fmt.Errorf("memfd create: %w", err)
 	}
-	defer memfd.Close()
+	var backendGuard *uffd.BackendMemoryGuard
+	defer func() {
+		// Later defers drain all consumers and the CH UFFD handler. Keep the
+		// backend protected until its VMA is gone, including on startup errors.
+		retErr = errors.Join(retErr, memfd.Close())
+		retErr = errors.Join(retErr, backendGuard.Close())
+	}()
+	backendGuard, err = uffd.NewBackendMemoryGuard(memfd.FD(), memfd.Addr(), memfd.Size())
+	if err != nil {
+		return -1, fmt.Errorf("protect backend memory: %w", err)
+	}
 	dirty, err := memory.NewDirty(uint64(memfd.Size()))
 	if err != nil {
 		return -1, err
@@ -408,7 +419,8 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		}
 	}()
 
-	vaReportSrv := &uffd.VAReportServer{
+	var vaReportSrv *uffd.VAReportServer
+	vaReportSrv = &uffd.VAReportServer{
 		Path:              uffdSockPath,
 		AddrMap:           addrMap,
 		Logf:              logf,
@@ -433,6 +445,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 				return err
 			}
 			h.Start()
+			vaReportSrv.OnAdopted = h.PageTraceAdoptionObserver()
 			uffdHandlerMu.Lock()
 			uffdHandler = h
 			close(uffdReady)
@@ -468,8 +481,9 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	var servers []*vhost.Server // all vhost servers, in device order
 	var devs []servedDevice     // CH --disk args, in device order
 	var snapDisks []SnapDiskRef // per logical disk: writable diff for snapshot
-	addServer := func(sock string, backend vhost.Backend, label, path string, ro bool) error {
+	addServer := func(sock string, backend vhost.Backend, label, path string, ro bool, budget *vhost.DiskIOBudget) error {
 		s := vhost.NewServer(sock, backend, logf)
+		s.SetIOBudget(budget)
 		if vhost.DynamicSlot(backend) {
 			s.EnableCapacityChange()
 		}
@@ -506,8 +520,9 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	// and drain all backends before deferred handler/memfd destruction.
 	defer func() { cancelBackends(); stopServers() }()
 	if p.owner != nil && p.owner.deviceSet != nil {
+		budgets := deviceIOBudgets(p.DiskIO, p.owner.spec.Disks)
 		for i, b := range p.owner.deviceSet.DeviceBackends() {
-			if err := addServer(filepath.Join(runDir, fmt.Sprintf("blk%d.sock", i)), b, fmt.Sprintf("blk%d", i), "unbound", b.ReadOnly()); err != nil {
+			if err := addServer(filepath.Join(runDir, fmt.Sprintf("blk%d.sock", i)), b, fmt.Sprintf("blk%d", i), "unbound", b.ReadOnly(), budgets[i]); err != nil {
 				stopServers()
 				return -1, err
 			}
@@ -521,14 +536,15 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	if restoreSet != nil {
 		devIndex := 0
 		backends := restoreSet.DeviceBackends()
+		budgets := deviceIOBudgets(p.DiskIO, restoredShapes)
 		for _, d := range p.Disks {
 			if d.Overlay {
-				if err := addServer(filepath.Join(runDir, fmt.Sprintf("blk%d.sock", devIndex)), backends[devIndex], fmt.Sprintf("blk%d", devIndex), d.BasePath, true); err != nil {
+				if err := addServer(filepath.Join(runDir, fmt.Sprintf("blk%d.sock", devIndex)), backends[devIndex], fmt.Sprintf("blk%d", devIndex), d.BasePath, true, budgets[devIndex]); err != nil {
 					return -1, err
 				}
 				devIndex++
 			}
-			if err := addServer(filepath.Join(runDir, fmt.Sprintf("blk%d.sock", devIndex)), backends[devIndex], fmt.Sprintf("blk%d", devIndex), d.DiffPath, false); err != nil {
+			if err := addServer(filepath.Join(runDir, fmt.Sprintf("blk%d.sock", devIndex)), backends[devIndex], fmt.Sprintf("blk%d", devIndex), d.DiffPath, false, budgets[devIndex]); err != nil {
 				return -1, err
 			}
 			devIndex++

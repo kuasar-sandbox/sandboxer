@@ -87,6 +87,8 @@ type Server struct {
 	// Quiesce/Resume gate for snapshot pause window (docs/block-storage.md#quiesce-and-close).
 	pauseMu  pauseGate
 	inflight sync.WaitGroup
+	ioBudget *DiskIOBudget
+	ioPause  ioAdmissionSwitch
 
 	// negotiated state (modified by master)
 	mu               sync.Mutex
@@ -111,23 +113,25 @@ type Server struct {
 
 // virtq holds per-virtq state set up by SET_VRING_*.
 type virtq struct {
-	num         uint32
-	descAddr    uint64 // GPA
-	availAddr   uint64 // GPA
-	usedAddr    uint64 // GPA
-	baseIdx     uint16
-	kickFd      int
-	callFd      int
-	enabled     bool
-	kickArmed   bool   // GET_VRING_BASE disarms implicit start until the next KICK
-	readScratch []byte // private to the queue worker
+	num           uint32
+	descAddr      uint64 // GPA
+	availAddr     uint64 // GPA
+	usedAddr      uint64 // GPA
+	baseIdx       uint16
+	kickFd        int
+	callFd        int
+	enabled       bool
+	kickArmed     bool   // GET_VRING_BASE disarms implicit start until the next KICK
+	readScratch   []byte // private to the queue worker
+	notifyPending bool   // used entries published since the last successful call notification
 
-	stop     chan struct{}
-	done     chan struct{}
-	ctx      context.Context
-	cancel   context.CancelFunc
-	stopOnce sync.Once
-	drainMu  sync.Mutex
+	stop       chan struct{}
+	done       chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
+	stopOnce   sync.Once
+	drainMu    sync.Mutex
+	ioDisabled ioAdmissionSwitch
 }
 
 // NumQueues is the fixed number of request queues per device. The minimal
@@ -244,11 +248,13 @@ func (s *Server) SetMemfd(inode uint64, slab []byte) {
 // process them in the next iteration of the worker loop.
 func (s *Server) Quiesce() {
 	s.pauseMu.Lock()
+	s.ioPause.set(true)
 	s.inflight.Wait()
 }
 
 // Resume releases a Quiesce(); workers blocked on pauseMu are unblocked.
 func (s *Server) Resume() {
+	s.ioPause.set(false)
 	s.pauseMu.Unlock()
 }
 
@@ -961,6 +967,7 @@ func (s *Server) handleSetVringEnable(m *Message) error {
 	q := s.ensureQueue(idx)
 	q.enabled = enabled
 	s.mu.Unlock()
+	q.ioDisabled.set(!enabled)
 	if enabled {
 		s.maybeStartWorker(idx)
 	}

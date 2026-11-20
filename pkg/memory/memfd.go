@@ -5,8 +5,9 @@
 // an inherited fd via cmd.ExtraFiles.
 //
 // Lifecycle: Create on sandbox start, Close on sandbox shutdown.
-// Between those, sandbox-ctl uses backendVA for direct reads (snapshot
-// path) and CH uses chVA after its own mmap of the same fd.
+// Between those, sandbox-ctl uses backendVA for vhost access after
+// EnsureLoaded; snapshots read the fd into separate buffers. CH uses chVA
+// after its own mmap of the same fd.
 package memory
 
 import (

@@ -10,15 +10,24 @@ import (
 )
 
 // DiffCOWConfig is host-selected policy for the sandbox's writable disks.
-// MaxDirtySize is a subset of the shared CacheSize, not an extra pool, and an
-// empty MaxDirtySize is derived from the final effective CacheSize. Discard
+// MaxDirtySize is a subset of the shared CacheSize, not an extra pool. Empty or
+// zero limits impose no additional restriction. Discard
 // selects the cold-launch ext4 mount policy; it cannot reconfigure restored
 // mounts. None of these fields is included in portable Sandbox configuration.
 type DiffCOWConfig struct {
-	CacheSize      string `yaml:"cache_size,omitempty"`
-	CacheIdleAfter string `yaml:"cache_idle_after,omitempty"`
-	MaxDirtySize   string `yaml:"max_dirty_size,omitempty"`
-	Discard        string `yaml:"discard,omitempty"`
+	CacheSize             string  `yaml:"cache_size,omitempty"`
+	CacheIdleAfter        string  `yaml:"cache_idle_after,omitempty"`
+	MaxDirtySize          string  `yaml:"max_dirty_size,omitempty"`
+	Discard               string  `yaml:"discard,omitempty"`
+	ReadBandwidth         string  `yaml:"read_bandwidth,omitempty"`
+	WriteBandwidth        string  `yaml:"write_bandwidth,omitempty"`
+	ReadIOPS              *uint64 `yaml:"read_iops,omitempty"`
+	WriteIOPS             *uint64 `yaml:"write_iops,omitempty"`
+	MaxDirtySizePerDisk   string  `yaml:"max_dirty_size_per_disk,omitempty"`
+	ReadBandwidthPerDisk  string  `yaml:"read_bandwidth_per_disk,omitempty"`
+	WriteBandwidthPerDisk string  `yaml:"write_bandwidth_per_disk,omitempty"`
+	ReadIOPSPerDisk       *uint64 `yaml:"read_iops_per_disk,omitempty"`
+	WriteIOPSPerDisk      *uint64 `yaml:"write_iops_per_disk,omitempty"`
 }
 
 // CacheIdleDuration is a Clean-page inactivity observation interval. It does not expire data.
@@ -37,7 +46,7 @@ func (c *DiffCOWConfig) defaults() {
 	if c.CacheSize == "" {
 		c.CacheSize = "32MiB"
 	}
-	// Keep an omitted dirty limit unset so later cache overrides can change it.
+	// Keep omitted limits unset until final resource-layer merging completes.
 	// Preserve omitted Discard too: restore must distinguish no mount-policy
 	// request from an explicit cold-only setting. DiscardMode resolves it.
 }
@@ -73,14 +82,14 @@ func (c DiffCOWConfig) ValidateExplicit() error {
 
 // Resolve validates the complete policy and resolves its cache limits without
 // changing c. Explicit field strings are preserved; an omitted dirty limit
-// becomes a decimal byte count equal to half the final cache size, rounded down
-// to a 4 KiB multiple with a 4 KiB minimum. Discard keeps its explicit/omitted
+// becomes zero (no extra dirty limit). Discard keeps its explicit/omitted
 // representation; use DiscardMode when preparing a cold launch.
 func (c DiffCOWConfig) Resolve() (DiffCOWConfig, error) {
 	_, dirty, err := c.sizes(true)
 	if err != nil {
 		return DiffCOWConfig{}, err
 	}
+	c = c.Clone()
 	c.defaults()
 	if c.MaxDirtySize == "" {
 		c.MaxDirtySize = fmt.Sprintf("%d", dirty)
@@ -96,6 +105,9 @@ func (c DiffCOWConfig) Bytes() (uint64, uint64, error) {
 // sizes shares validation and default calculation between partial validation
 // and final resolution. YAML decoding deliberately validates only each leaf.
 func (c DiffCOWConfig) sizes(resolve bool) (uint64, uint64, error) {
+	if err := c.validateQOS(); err != nil {
+		return 0, 0, err
+	}
 	if _, err := c.CacheIdleDuration(); err != nil {
 		return 0, 0, err
 	}
@@ -114,12 +126,10 @@ func (c DiffCOWConfig) sizes(resolve bool) (uint64, uint64, error) {
 		}
 	}
 	if c.MaxDirtySize != "" {
-		dirty, err = diffCOWSize("max_dirty_size", c.MaxDirtySize)
+		dirty, err = diffCOWDirtySize("max_dirty_size", c.MaxDirtySize)
 		if err != nil {
 			return 0, 0, err
 		}
-	} else if resolve {
-		dirty = max(uint64(4096), total/2/4096*4096)
 	}
 	if total != 0 && dirty > total {
 		return 0, 0, fmt.Errorf("resources.diff_cow.max_dirty_size must be <= cache_size")
@@ -127,7 +137,7 @@ func (c DiffCOWConfig) sizes(resolve bool) (uint64, uint64, error) {
 	return total, dirty, nil
 }
 
-// Validate explicit empty/zero values and unknown fields even when nested YAML
+// Validate explicit empty/null values and unknown fields even when nested YAML
 // custom decoding would otherwise bypass KnownFields. Preserve merge semantics.
 func (c *DiffCOWConfig) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
@@ -136,13 +146,19 @@ func (c *DiffCOWConfig) UnmarshalYAML(node *yaml.Node) error {
 	seen := make(map[string]bool)
 	for i := 0; i < len(node.Content); i += 2 {
 		key, val := node.Content[i].Value, node.Content[i+1]
-		if key != "cache_size" && key != "max_dirty_size" && key != "discard" && key != "cache_idle_after" {
-			return fmt.Errorf("field %s not found in type config.DiffCOWConfig", key)
-		}
 		if seen[key] {
 			return fmt.Errorf("resources.diff_cow.%s duplicated", key)
 		}
 		seen[key] = true
+		if handled, err := c.decodeQOSLeaf(key, val); handled {
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		if key != "cache_size" && key != "max_dirty_size" && key != "discard" && key != "cache_idle_after" {
+			return fmt.Errorf("field %s not found in type config.DiffCOWConfig", key)
+		}
 		if key == "cache_idle_after" {
 			if val.Kind != yaml.ScalarNode || val.Tag != "!!str" || val.Value == "" {
 				return fmt.Errorf("resources.diff_cow.cache_idle_after must be a positive duration string")
@@ -166,7 +182,11 @@ func (c *DiffCOWConfig) UnmarshalYAML(node *yaml.Node) error {
 		if val.Kind != yaml.ScalarNode || val.Tag == "!!null" {
 			return fmt.Errorf("resources.diff_cow.%s must be a size", key)
 		}
-		if _, err := diffCOWSize(key, val.Value); err != nil {
+		parse := diffCOWSize
+		if key == "max_dirty_size" {
+			parse = diffCOWDirtySize
+		}
+		if _, err := parse(key, val.Value); err != nil {
 			return err
 		}
 		if key == "cache_size" {

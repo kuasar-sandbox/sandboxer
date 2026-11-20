@@ -459,6 +459,13 @@ local exec 可只给 `--path-id`；若同时给
 
 `exec` 通过当前 ctl/MUX 创建 sibling process. Export/snapshot 的 quiesce gate 原子阻止新 exec/forward 进入不稳定窗口,并关闭、join 已放行的 exec/forward session;在飞 exec 被终止且不会在 `--resume` 后自动重跑. Restore/attach 先 thaw 应用 cgroup 并重新开放 exec、forward、plugin 和 app restart,再发送 ACK. Host 在 ACK 与本端 MUX 建立后发布 ready,不会暴露仍处于 quiesce 的 exec gate. Guest mem_report 仅在 ACK 与 guest MUX 建立后恢复. Thaw 失败不发 ACK;ACK 失败不撤销已经完成的 thaw,仍由现有 host recovery/terminal-cleanup 路径负责. Guest `attach` 是幂等恢复操作;host 在 request/ACK 边界不明确时立即重试一次,且整个 dial/ACK 过程受 lifecycle context cancellation 控制.
 
+Guest 等 exec 输出到达真实 EOF 后才发送 `EXIT_STATUS`，不设置固定的退出后排空
+超时。若后代进程仍持有 stdout/stderr，直接子进程退出后 exec 仍会等待 EOF 或
+客户端取消。Host 等待 MUX 完成，并排空已缓冲的输出后才返回。输出复制失败、
+自有输出文件的 Close 失败或 MUX 传输/协议错误都会报告，并阻止返回 exit 0；
+命令已经返回的非零退出码保持不变。清理时正常取消或 reset stdin 不属于输出失败。
+该完成契约适用于 exec；主应用的 run/attach 生命周期保留现有清理策略。
+
 远程授权 exec 使用 `pkg/ctl.ServeExecTunnel(ctx, options)`,固定以下顺序:
 
 ```text

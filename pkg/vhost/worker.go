@@ -63,29 +63,7 @@ func (s *Server) runWorker(idx int, q *virtq) {
 			return
 		}
 
-		// Quiesce gate (docs/block-storage.md#quiesce-and-close): pauseMu is held by Quiesce(), so workers
-		// block here while a snapshot is in progress. Once Resume()
-		// releases it, this iteration runs and processQueue will scan
-		// the avail ring including any KICKs that piled up during pause.
-		if err := s.pauseMu.lock(q.readContext()); err != nil {
-			return
-		}
-		if q.stopped() != nil {
-			s.pauseMu.Unlock()
-			return
-		}
-		s.inflight.Add(1)
-		s.pauseMu.Unlock()
-
-		err = s.processQueue(q)
-		// Publish the runtime cause before Quiesce can pass this request.
-		// The owner callback must never synchronously join this worker.
-		// Classify the returned terminal, not a later queue-stop race.
-		// Explicit permanent causes can themselves wrap cancellation.
-		if readretry.IsTerminal(err) && (readerr.IsPermanent(err) || !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) && s.onReadFatal != nil {
-			s.onReadFatal(err)
-		}
-		s.inflight.Done()
+		err = s.runPending(q)
 		if err != nil {
 			if readretry.IsTerminal(err) {
 				return
@@ -102,6 +80,41 @@ func (s *Server) runWorker(idx int, q *virtq) {
 	}
 }
 
+// Re-enter the same avail head after a pause/disable without consuming another
+// KICK. An unstarted request must not be ACKed or turned into a terminal error.
+func (s *Server) runPending(q *virtq) error {
+	for {
+		if s.ioBudget != nil {
+			if err := s.ioPause.waitOpen(q.readContext()); err != nil {
+				return readretry.Terminal(err)
+			}
+			if err := q.ioDisabled.waitOpen(q.readContext()); err != nil {
+				return readretry.Terminal(err)
+			}
+		}
+		if err := s.pauseMu.lock(q.readContext()); err != nil {
+			return readretry.Terminal(err)
+		}
+		if err := q.stopped(); err != nil {
+			s.pauseMu.Unlock()
+			return err
+		}
+		s.inflight.Add(1)
+		s.pauseMu.Unlock()
+		err := s.processQueue(q)
+		// Publish the terminal runtime cause before Quiesce can pass this
+		// batch. The owner callback must not synchronously join this worker.
+		if readretry.IsTerminal(err) && (readerr.IsPermanent(err) || !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) && s.onReadFatal != nil {
+			s.onReadFatal(err)
+		}
+		s.inflight.Done()
+		if errors.Is(err, errIOAdmissionYield) {
+			continue
+		}
+		return err
+	}
+}
+
 // processQueue scans the avail ring from baseIdx forward and processes
 // every new descriptor chain.
 func (s *Server) processQueue(q *virtq) error {
@@ -115,8 +128,29 @@ func (s *Server) processQueue(q *virtq) error {
 		if err := q.stopped(); err != nil {
 			return err
 		}
+		if s.ioBudget != nil {
+			paused, _ := s.ioPause.snapshot()
+			disabled, _ := q.ioDisabled.snapshot()
+			if paused || disabled {
+				if err := s.notifyCall(q); err != nil {
+					return err
+				}
+				return errIOAdmissionYield
+			}
+		}
 		descIdx := availRing.ring[q.baseIdx%uint16(q.num)]
 		written, err := s.processChain(q, descIdx)
+		if errors.Is(err, errIOAdmissionYield) {
+			// Earlier chains in this scan may already have completed.
+			if notifyErr := s.notifyCall(q); notifyErr != nil {
+				return notifyErr
+			}
+			return err
+		}
+		var notifyErr *ioAdmissionNotifyError
+		if errors.As(err, &notifyErr) {
+			return notifyErr.err
+		}
 		if readretry.IsTerminal(err) {
 			return err
 		}
@@ -129,6 +163,7 @@ func (s *Server) processQueue(q *virtq) error {
 		if err := s.publishUsed(q, descIdx, uint32(written)); err != nil {
 			return err
 		}
+		q.notifyPending = true
 		q.baseIdx++
 	}
 
@@ -201,6 +236,9 @@ func (s *Server) publishUsed(q *virtq, descIdx uint16, length uint32) error {
 func (s *Server) notifyCall(q *virtq) error {
 	val := uint64(1)
 	_, err := syscall.Write(q.callFd, (*[8]byte)(unsafe.Pointer(&val))[:])
+	if err == nil {
+		q.notifyPending = false
+	}
 	return err
 }
 
@@ -344,6 +382,26 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 
 	// Pin the storage view once for all segments of this request.
 	backend := backendForRequest(s.backend)
+	if _, unbound := backend.(interface{ suppressRequestStats() bool }); !unbound && (hdr.Type == BlkTypeIn || hdr.Type == BlkTypeOut) {
+		var size uint64
+		if hdr.Type == BlkTypeIn {
+			for _, seg := range c.writeSegs {
+				size += uint64(len(seg))
+			}
+			size-- // final status byte
+		} else {
+			for _, seg := range c.readSegs[1:] {
+				size += uint64(len(seg))
+			}
+		}
+		if err := s.admitIO(q, hdr.Type == BlkTypeOut, size); err != nil {
+			var notifyErr *ioAdmissionNotifyError
+			if errors.Is(err, errIOAdmissionYield) || errors.As(err, &notifyErr) {
+				return 0, err
+			}
+			return 0, readretry.Terminal(err)
+		}
+	}
 	bytesIO := 0
 	switch hdr.Type {
 	case BlkTypeIn:

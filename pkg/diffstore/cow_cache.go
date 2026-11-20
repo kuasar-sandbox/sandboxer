@@ -13,7 +13,7 @@ import (
 
 const (
 	DefaultCacheSize      = 32 << 20
-	DefaultMaxDirtySize   = 16 << 20
+	DefaultMaxDirtySize   = 0 // no independent dirty ceiling; capacity still bounds admission
 	cleanAgeBatchPages    = 8192
 	maxWritebackPages     = (1 << 20) / cowBlockSize
 	maxWritebackMutations = (4 << 20) / cowBlockSize
@@ -71,15 +71,26 @@ func (q *pageList) remove(p *cachePage) {
 	p.prev, p.next = nil, nil
 }
 
-// Cache owns one sandbox's plaintext pages and one writeback worker. All
-// active root/data diffs must share this handle. Close the Disks before it.
+// Queue links and flags are protected by Cache.mu. The worker owns its bounded
+// batch workspace; its done channel closes only after that workspace is idle.
+type cacheWorker struct {
+	cow          *Disk
+	dirty        pageList
+	kick         chan struct{}
+	done         chan struct{}
+	urgent, stop bool // protected by Cache.mu
+}
+
+// Cache owns one sandbox's plaintext pages and one writeback worker per disk.
+// All active root/data diffs must share this handle. Close the Disks before it.
 // Page payload and metadata are bounded by capacity. Writeback stages frozen
-// pages directly in each diff's existing bounded, owned DIO workspace.
+// pages directly in the backend's bounded DIO workspace.
 type Cache struct {
 	mu                            sync.Mutex
 	resizeMu                      sync.Mutex
 	capacity, maxDirty, dirtyUsed int
 	maxCapacity, maxDirtyLimit    int
+	maxDirtyPerDisk               int // zero means no independent owner ceiling
 	pages                         map[cacheKey]*cachePage
 	free                          []*cachePage          // metadata only; all data pointers are nil
 	freeData                      []*[cowBlockSize]byte // cleared, exclusively owned payloads
@@ -88,15 +99,16 @@ type Cache struct {
 	budgetThreshold               int
 	clients                       map[*Disk]int // dirty reservations, including construction and I/O
 	chargedZeros                  map[*Disk]int // charged Zero pages, including frozen I/O
-	clean, expired, dirty         pageList
+	clean, expired                pageList
 	started                       time.Time
 	expiredPages                  int
 	changed                       chan struct{}
-	kick                          chan struct{}
+	workers                       map[*Disk]*cacheWorker
+	workersRunning                int
 	done                          chan struct{}
+	doneOnce                      sync.Once
 	closed                        bool
-	urgent                        bool
-	active                        *Disk
+	active                        map[*Disk]bool
 	err                           error
 	onFatal                       func(error)
 	hooks                         cacheHooks
@@ -152,7 +164,7 @@ func (c *Cache) SetBudgetNotifier(wake chan<- struct{}, threshold uint64) {
 	}
 }
 
-// Hooks are installed before starting the worker, only by deterministic tests.
+// Hooks are installed before starting workers, only by deterministic tests.
 type cacheHooks struct {
 	idle          func() // observes the worker entering its event wait, under mu
 	afterReadCopy func()
@@ -164,29 +176,105 @@ type cacheHooks struct {
 	beforeCleanup func() error // deterministic failure-path I/O gate for tests
 }
 
-func NewCache(cacheSize, maxDirtySize uint64) (*Cache, error) {
-	return newCache(cacheSize, maxDirtySize, cacheHooks{})
+// CacheOption configures an optional shared-cache policy at construction time.
+type CacheOption interface {
+	applyCache(*cacheOptions) error
 }
-func newCache(size, dirty uint64, hooks cacheHooks) (*Cache, error) {
-	if size == 0 || dirty == 0 || dirty > size || size%cowBlockSize != 0 || dirty%cowBlockSize != 0 || size > uint64(int(^uint(0)>>1)) {
-		return nil, fmt.Errorf("diffstore: COW cache sizes must be positive 4 KiB multiples with max_dirty_size <= cache_size")
+
+type cacheOptions struct {
+	maxDirtyPerDisk uint64
+	perDiskSet      bool
+}
+
+type perDiskDirtyLimitOption struct{ size uint64 }
+
+// WithPerDiskDirtyLimit bounds each writable Disk's dirty reservations,
+// including pages being constructed, explicit Zero pages and in-flight
+// writeback. Zero adds no independent per-disk limit. A positive value must be
+// a 4 KiB multiple; the shared dirty budget and current cache capacity still
+// apply, so this limit may exceed either without increasing their bounds.
+func WithPerDiskDirtyLimit(size uint64) CacheOption {
+	return perDiskDirtyLimitOption{size: size}
+}
+
+func (o perDiskDirtyLimitOption) applyCache(options *cacheOptions) error {
+	if options.perDiskSet {
+		return fmt.Errorf("diffstore: duplicate WithPerDiskDirtyLimit")
 	}
-	c := &Cache{capacity: int(size / cowBlockSize), maxCapacity: int(size / cowBlockSize), maxDirty: int(dirty / cowBlockSize), maxDirtyLimit: int(dirty / cowBlockSize), pages: make(map[cacheKey]*cachePage), clients: make(map[*Disk]int), chargedZeros: make(map[*Disk]int), kick: make(chan struct{}, 1), done: make(chan struct{}), started: time.Now(), hooks: hooks}
-	go c.run()
+	options.maxDirtyPerDisk, options.perDiskSet = o.size, true
+	return nil
+}
+
+// NewCache creates a fixed-capacity cache. A zero maxDirtySize adds no
+// independent dirty limit; the cache capacity always bounds dirty admission.
+func NewCache(cacheSize, maxDirtySize uint64, options ...CacheOption) (*Cache, error) {
+	return newCache(cacheSize, maxDirtySize, cacheHooks{}, options...)
+}
+
+func newCache(size, dirty uint64, hooks cacheHooks, options ...CacheOption) (*Cache, error) {
+	var config cacheOptions
+	for _, option := range options {
+		if option == nil {
+			return nil, fmt.Errorf("diffstore: nil CacheOption")
+		}
+		if err := option.applyCache(&config); err != nil {
+			return nil, err
+		}
+	}
+	return newCacheWithLimits(size, dirty, config.maxDirtyPerDisk, hooks)
+}
+
+func newCacheWithLimits(size, dirty, perDisk uint64, hooks cacheHooks) (*Cache, error) {
+	if size == 0 || dirty > size || size%cowBlockSize != 0 || dirty%cowBlockSize != 0 || perDisk%cowBlockSize != 0 || size > uint64(int(^uint(0)>>1)) || perDisk > uint64(int(^uint(0)>>1)) {
+		return nil, fmt.Errorf("diffstore: invalid COW cache or dirty limit")
+	}
+	c := &Cache{
+		capacity:        int(size / cowBlockSize),
+		maxCapacity:     int(size / cowBlockSize),
+		maxDirtyLimit:   int(dirty / cowBlockSize),
+		maxDirtyPerDisk: int(perDisk / cowBlockSize),
+		pages:           make(map[cacheKey]*cachePage),
+		clients:         make(map[*Disk]int),
+		chargedZeros:    make(map[*Disk]int),
+		workers:         make(map[*Disk]*cacheWorker),
+		active:          make(map[*Disk]bool),
+		done:            make(chan struct{}),
+		started:         time.Now(),
+		hooks:           hooks,
+	}
+	c.maxDirty = c.dirtyLimitAtCapacity(c.capacity)
 	return c, nil
+}
+
+func (c *Cache) dirtyLimitAtCapacity(capacity int) int {
+	if c.maxDirtyLimit == 0 {
+		return capacity
+	}
+	return min(c.maxDirtyLimit, capacity)
+}
+
+func (c *Cache) dirtyFullLocked(cow *Disk) bool {
+	return c.dirtyUsed >= c.maxDirty || c.maxDirtyPerDisk > 0 && c.clients[cow] >= c.maxDirtyPerDisk
+}
+
+func (c *Cache) markDoneLocked() {
+	if c.workersRunning == 0 && (c.closed || c.err != nil) {
+		c.doneOnce.Do(func() { close(c.done) })
+	}
 }
 
 // NewElasticCache keeps the configured cache size as an absolute maximum while
 // starting with a smaller effective capacity. The current capacity can then be
-// adjusted without replacing the shared cache or its writeback worker.
-func NewElasticCache(maxCacheSize, maxDirtySize, initialSize uint64) (*Cache, error) {
+// adjusted without replacing the shared cache or its writeback workers. A zero
+// maxDirtySize follows the current capacity without adding another limit.
+func NewElasticCache(maxCacheSize, maxDirtySize, initialSize uint64, options ...CacheOption) (*Cache, error) {
 	if err := safeElasticHostPageSize(os.Getpagesize()); err != nil {
 		return nil, err
 	}
 	if initialSize == 0 || initialSize > maxCacheSize || initialSize%cowBlockSize != 0 {
 		return nil, fmt.Errorf("diffstore: initial cache size must be a positive 4 KiB multiple <= maximum")
 	}
-	c, err := NewCache(maxCacheSize, maxDirtySize)
+	c, err := NewCache(maxCacheSize, maxDirtySize, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +283,7 @@ func NewElasticCache(maxCacheSize, maxDirtySize, initialSize uint64) (*Cache, er
 	err = c.backing.prepare(int(initialSize / cowBlockSize))
 	if err == nil {
 		c.capacity = int(initialSize / cowBlockSize)
-		c.maxDirty = min(c.maxDirtyLimit, c.capacity)
+		c.maxDirty = c.dirtyLimitAtCapacity(c.capacity)
 	}
 	c.mu.Unlock()
 	if err != nil {
@@ -259,7 +347,7 @@ func (c *Cache) TryResizeCapacity(size uint64) (bool, error) {
 		}
 		backing.installPrepared(prepared)
 		c.capacity = target
-		c.maxDirty = min(c.maxDirtyLimit, target)
+		c.maxDirty = c.dirtyLimitAtCapacity(target)
 		c.signalLocked()
 		c.mu.Unlock()
 		return true, nil
@@ -316,7 +404,7 @@ func (c *Cache) TryResizeCapacity(size uint64) (bool, error) {
 		c.free = c.free[:target]
 	}
 	c.capacity = target
-	c.maxDirty = min(c.maxDirtyLimit, target)
+	c.maxDirty = c.dirtyLimitAtCapacity(target)
 	c.signalLocked()
 	return true, nil
 }
@@ -341,6 +429,10 @@ func (c *Cache) attach(cow *Disk) error {
 		return os.ErrClosed
 	}
 	c.clients[cow] = 0
+	w := &cacheWorker{cow: cow, kick: make(chan struct{}, 1), done: make(chan struct{})}
+	c.workers[cow] = w
+	c.workersRunning++
+	go c.run(w)
 	return nil
 }
 
@@ -412,10 +504,32 @@ func (c *Cache) signalLocked() {
 	}
 }
 func (c *Cache) kickLocked(urgent bool) {
-	c.urgent = c.urgent || urgent
+	for _, w := range c.workers {
+		w.wakeLocked(urgent)
+	}
+}
+
+func (w *cacheWorker) wakeLocked(urgent bool) {
+	w.urgent = w.urgent || urgent
 	select {
-	case c.kick <- struct{}{}:
+	case w.kick <- struct{}{}:
 	default:
+	}
+}
+
+func (c *Cache) kickOwnerLocked(cow *Disk, urgent bool) {
+	if w := c.workers[cow]; w != nil {
+		w.wakeLocked(urgent)
+	}
+}
+
+// Shared pressure needs progress from every owner. Otherwise only this disk
+// can release the reservation or in-flight page that its frontend awaits.
+func (c *Cache) kickPressureLocked(cow *Disk) {
+	if c.dirtyUsed >= c.maxDirty || len(c.pages) == c.capacity && c.oldestCleanLocked() == nil {
+		c.kickLocked(true)
+	} else {
+		c.kickOwnerLocked(cow, true)
 	}
 }
 func (c *Cache) checkLocked(ctx context.Context) error {
@@ -517,7 +631,7 @@ func (c *Cache) releaseLocked(p *cachePage) {
 	case cacheClean:
 		c.removeCleanLocked(p)
 	case cacheDirty:
-		c.dirty.remove(p)
+		c.workers[p.key.cow].dirty.remove(p)
 	}
 	delete(c.pages, p.key)
 	if p.chargedDirty {
@@ -683,7 +797,7 @@ func (c *Cache) readColdRunLocked(ctx context.Context, cow *Disk, buf []byte, of
 
 // A foreground writer drops its block stripe before sleeping. The wake channel
 // is captured under mu to avoid lost wakeups; every retry reacquires the stripe
-// and reevaluates upper presence, cache state and both quotas.
+// and reevaluates upper presence, cache state and all applicable quotas.
 type cacheRetry struct{ wake <-chan struct{} }
 
 func (*cacheRetry) Error() string { return "diffstore: retry cache admission" }
@@ -696,7 +810,7 @@ func (c *Cache) retryLocked() error {
 	return retry
 }
 
-// write reserves both resources atomically. Initialization fills the reserved
+// write reserves capacity and both dirty budgets atomically. Initialization fills the reserved
 // page directly, so a waiting guest never owns an extra queued payload copy.
 func (c *Cache) write(ctx context.Context, cow *Disk, buf []byte, offset, block int64, upper bool, init func([]byte) error) (int, error) {
 	key := cacheKey{cow, block}
@@ -707,7 +821,7 @@ func (c *Cache) write(ctx context.Context, cow *Disk, buf []byte, offset, block 
 	}
 	p := c.pages[key]
 	if p != nil && p.state != cacheClean && p.state != cacheDirty {
-		c.kickLocked(true)
+		c.kickOwnerLocked(cow, true)
 		return 0, c.retryLocked()
 	}
 	if p != nil && p.state == cacheDirty {
@@ -722,8 +836,8 @@ func (c *Cache) write(ctx context.Context, cow *Disk, buf []byte, offset, block 
 		c.mu.Unlock()
 		return len(buf), nil
 	}
-	if c.dirtyUsed == c.maxDirty {
-		c.kickLocked(true)
+	if c.dirtyFullLocked(cow) {
+		c.kickPressureLocked(cow)
 		return 0, c.retryLocked()
 	}
 	if p != nil {
@@ -735,14 +849,14 @@ func (c *Cache) write(ctx context.Context, cow *Disk, buf []byte, offset, block 
 		c.peakDirty = max(c.peakDirty, c.dirtyUsed)
 		p.zero = false
 		copy(p.data[offset%cowBlockSize:], buf)
-		c.dirty.push(p)
-		c.kickLocked(false)
+		c.workers[cow].dirty.push(p)
+		c.kickOwnerLocked(cow, false)
 		c.mu.Unlock()
 		return len(buf), nil
 	}
 	p = c.reserveLocked(key, true)
 	if p == nil {
-		c.kickLocked(true)
+		c.kickPressureLocked(cow)
 		return 0, c.retryLocked()
 	}
 	c.acquireDataLocked(p)
@@ -762,12 +876,12 @@ func (c *Cache) write(ctx context.Context, cow *Disk, buf []byte, offset, block 
 	copy(p.data[offset%cowBlockSize:], buf)
 	p.zero = false
 	p.state = cacheDirty
-	c.dirty.push(p)
+	c.workers[cow].dirty.push(p)
 	// Cache content and upper presence become visible before worker selection
 	// and before the frontend drops the same-block stripe.
 	cow.markDirty(block)
 	c.signalLocked()
-	c.kickLocked(false)
+	c.kickOwnerLocked(cow, false)
 	c.mu.Unlock()
 	return len(buf), nil
 }
@@ -789,13 +903,13 @@ func (c *Cache) stageZero(ctx context.Context, cow *Disk, block int64) error {
 	}
 	p := c.pages[cacheKey{cow, block}]
 	if p != nil && p.state != cacheClean && p.state != cacheDirty {
-		c.kickLocked(true)
+		c.kickOwnerLocked(cow, true)
 		return c.retryLocked()
 	}
 	alreadyDirty := p != nil && p.state == cacheDirty
 	if !alreadyDirty {
 		blockedTotal := p == nil && len(c.pages) == c.capacity && c.oldestCleanLocked() == nil
-		if c.dirtyUsed == c.maxDirty || blockedTotal {
+		if c.dirtyFullLocked(cow) || blockedTotal {
 			if c.chargedZeros[cow] == 0 {
 				// Still holding the foreground stripe. Do not kick a queued
 				// Data allocation before this space-releasing mutation; the
@@ -803,13 +917,13 @@ func (c *Cache) stageZero(ctx context.Context, cow *Disk, block int64) error {
 				c.mu.Unlock()
 				return c.discard(ctx, cow, block, block)
 			}
-			c.kickLocked(true)
+			c.kickPressureLocked(cow)
 			return c.retryLocked()
 		}
 		if p == nil {
 			p = c.reserveLocked(cacheKey{cow, block}, true)
 			if p == nil {
-				c.kickLocked(true)
+				c.kickPressureLocked(cow)
 				return c.retryLocked()
 			}
 		} else {
@@ -826,40 +940,47 @@ func (c *Cache) stageZero(ctx context.Context, cow *Disk, block int64) error {
 	}
 	p.zero, p.fresh, p.state = true, false, cacheDirty
 	if !alreadyDirty {
-		c.dirty.push(p)
+		c.workers[cow].dirty.push(p)
 	}
 	// Logical ownership and readable Zero precede both worker selection and ACK.
 	cow.markDirty(block)
 	c.signalLocked()
-	c.kickLocked(false)
+	c.kickOwnerLocked(cow, false)
 	c.mu.Unlock()
 	return nil
 }
 
-func (c *Cache) run() {
-	defer close(c.done)
+func (c *Cache) run(w *cacheWorker) {
+	defer func() {
+		c.mu.Lock()
+		c.workersRunning--
+		close(w.done)
+		c.markDoneLocked()
+		c.signalLocked()
+		c.mu.Unlock()
+	}()
 	batch := make([]*cachePage, 0, maxWritebackMutations)
 	var records [maxWritebackMutations]pageWrite
 	aggregated := false
 	for {
 		c.mu.Lock()
-		if c.err != nil || c.closed {
+		if c.err != nil || c.closed || w.stop {
 			c.mu.Unlock()
 			return
 		}
-		if c.oldestEligibleLocked() == nil {
+		if c.oldestEligibleLocked(w) == nil {
 			aggregated = false
 			if c.hooks.idle != nil {
 				c.hooks.idle()
 			}
 			c.mu.Unlock()
-			<-c.kick
+			<-w.kick
 			continue
 		}
-		wait := !aggregated && !c.urgent
+		wait := !aggregated && !w.urgent
 		c.mu.Unlock()
 		if wait {
-			c.aggregate()
+			c.aggregate(w)
 		}
 		// A burst gets one fixed window. Drain an existing backlog immediately,
 		// including noncontiguous singletons, instead of sleeping per batch.
@@ -868,13 +989,13 @@ func (c *Cache) run() {
 			c.hooks.beforeSelect()
 		}
 		c.mu.Lock()
-		if c.err != nil || c.closed {
+		if c.err != nil || c.closed || w.stop {
 			c.mu.Unlock()
 			return
 		}
-		c.urgent = false
+		w.urgent = false
 		batch = batch[:0]
-		if anchor := c.oldestEligibleLocked(); anchor != nil {
+		if anchor := c.oldestEligibleLocked(w); anchor != nil {
 			// Keep the oldest anchor, then fill its same-DIFF, same-kind batch
 			// with neighboring runs before unrelated logical pages. The
 			// bounded candidate list preserves batching for dispersed
@@ -886,7 +1007,7 @@ func (c *Cache) run() {
 				limit = maxWritebackMutations
 			}
 			for p := anchor; p != nil && count < limit; p = p.next {
-				if p.key.cow == anchor.key.cow && p.zero == anchor.zero {
+				if p.zero == anchor.zero {
 					candidates[count] = p
 					count++
 				}
@@ -913,7 +1034,7 @@ func (c *Cache) run() {
 					if p == nil || p.state != cacheDirty || p.zero != anchor.zero {
 						break
 					}
-					c.dirty.remove(p)
+					w.dirty.remove(p)
 					p.state = cacheWriteback
 					batch = append(batch, p)
 				}
@@ -925,7 +1046,7 @@ func (c *Cache) run() {
 		}
 		cow := batch[0].key.cow
 		off := batch[0].key.block * cowBlockSize
-		c.active = cow
+		c.active[cow] = true
 		c.signalLocked()
 		c.mu.Unlock()
 		// Frozen pages remain readable; no writer may change or release them.
@@ -970,7 +1091,7 @@ func (c *Cache) run() {
 			}
 		}
 		c.mu.Lock()
-		c.active = nil
+		delete(c.active, cow)
 		c.writeBatches++
 		if err == nil && c.err == nil {
 			c.completeWritebackLocked(batch)
@@ -1031,16 +1152,17 @@ func (c *Cache) repairSpacePressure(cow *Disk) error {
 		return err
 	}
 	count := 0
-	for p := c.dirty.first; p != nil; p = p.next {
-		if p.key.cow == cow && p.zero {
+	dirty := &c.workers[cow].dirty
+	for p := dirty.first; p != nil; p = p.next {
+		if p.zero {
 			count++
 		}
 	}
 	cohort := make([]*cachePage, 0, count)
-	for p := c.dirty.first; p != nil; {
+	for p := dirty.first; p != nil; {
 		next := p.next
-		if p.key.cow == cow && p.zero {
-			c.dirty.remove(p)
+		if p.zero {
+			dirty.remove(p)
 			p.state = cacheWriteback
 			cohort = append(cohort, p)
 		}
@@ -1076,21 +1198,18 @@ func (c *Cache) repairSpacePressure(cow *Disk) error {
 	return nil
 }
 
-// Pending owners remain dirty (and rewritable). Search the existing bounded
-// queue without a batch-size search limit: a long pending prefix must not
-// conceal another disk's runnable pages. Completion kicks this same worker.
-func (c *Cache) oldestEligibleLocked() *cachePage {
-	for p := c.dirty.first; p != nil; p = p.next {
-		if backendWritable(p.key.cow.diff) {
-			return p
-		}
+// Pending owners remain dirty and rewritable. Their own queue is dormant until
+// initialization completes; another disk never scans or waits on that prefix.
+func (c *Cache) oldestEligibleLocked(w *cacheWorker) *cachePage {
+	if w.dirty.first != nil && backendWritable(w.cow.diff) {
+		return w.dirty.first
 	}
 	return nil
 }
 
 // Ordinary kicks do not shorten or restart the aggregation deadline. Pressure,
 // Drain, failure and Close interrupt it. Tests supply a manually fired timer.
-func (c *Cache) aggregate() {
+func (c *Cache) aggregate(w *cacheWorker) {
 	var deadline <-chan time.Time
 	var stop func()
 	if c.hooks.newTimer != nil {
@@ -1102,7 +1221,7 @@ func (c *Cache) aggregate() {
 	defer stop()
 	for {
 		c.mu.Lock()
-		urgent := c.urgent || c.err != nil || c.closed
+		urgent := w.urgent || w.stop || c.err != nil || c.closed
 		c.mu.Unlock()
 		if urgent {
 			return
@@ -1113,7 +1232,7 @@ func (c *Cache) aggregate() {
 		select {
 		case <-deadline:
 			return
-		case <-c.kick:
+		case <-w.kick:
 		}
 	}
 }
@@ -1125,6 +1244,7 @@ func (c *Cache) failLocked(err error) func(error) {
 	c.err = err
 	c.signalLocked()
 	c.kickLocked(true)
+	c.markDoneLocked()
 	return c.onFatal
 }
 
@@ -1163,7 +1283,11 @@ func (c *Cache) drain(ctx context.Context, cow *Disk) error {
 			c.mu.Unlock()
 			return nil
 		}
-		c.kickLocked(true)
+		if cow == nil {
+			c.kickLocked(true)
+		} else {
+			c.kickOwnerLocked(cow, true)
+		}
 		if err := c.waitLocked(ctx); err != nil {
 			return err
 		}
@@ -1171,16 +1295,27 @@ func (c *Cache) drain(ctx context.Context, cow *Disk) error {
 }
 func (c *Cache) detach(cow *Disk) {
 	c.mu.Lock()
-	// Even after fatal, a real syscall owns its buffers until it returns.
-	for c.active == cow {
+	w := c.workers[cow]
+	if w != nil {
+		w.stop = true
+		w.wakeLocked(true)
+	}
+	// Even after fatal, only this disk's worker may still own its buffers.
+	for c.active[cow] {
 		_ = c.waitLocked(context.Background())
 		c.mu.Lock()
 	}
+	c.mu.Unlock()
+	if w != nil {
+		<-w.done
+	}
+	c.mu.Lock()
 	for key, p := range c.pages {
 		if key.cow == cow {
 			c.releaseLocked(p)
 		}
 	}
+	delete(c.workers, cow)
 	delete(c.clients, cow)
 	delete(c.chargedZeros, cow)
 	c.signalLocked()
@@ -1197,6 +1332,7 @@ func (c *Cache) Close() error {
 	c.closed = true
 	c.signalLocked()
 	c.kickLocked(true)
+	c.markDoneLocked()
 	c.mu.Unlock()
 	<-c.done
 	c.mu.Lock()
@@ -1248,7 +1384,7 @@ func (c *Cache) discard(ctx context.Context, cow *Disk, first, last int64) error
 			if p.state == cacheClean {
 				c.removeCleanLocked(p)
 			} else {
-				c.dirty.remove(p)
+				c.workers[cow].dirty.remove(p)
 			}
 			p.state = cacheDiscarding
 		}

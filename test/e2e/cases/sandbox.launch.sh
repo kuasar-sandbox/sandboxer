@@ -32,6 +32,9 @@ TAP_NAME="sl$((BASHPID % 1000000))"
 BLK0_IMAGE="$WORK/blk0.img"
 DIFF_FILE="$WORK/runtime/blk1.diff"
 LOG="$OUT/launch.log"
+# App stdout and console/stderr are independent byte streams. Keep marker
+# assertions on the app stream so console fragments cannot split its lines.
+APP_LOG="$OUT/launch.app.log"
 TAP_CREATED=0
 
 cleanup() {
@@ -111,7 +114,7 @@ EOF
 
 launch_fail() {
     # Only fixed markers, numeric identities and byte positions leave the log.
-    python3 - "$LOG" "$rc" <<'PY' >&2 || true
+    python3 - "$APP_LOG" "$rc" <<'PY' >&2 || true
 import json, os, re, sys
 
 path, status = sys.argv[1:]
@@ -151,12 +154,14 @@ PY
 }
 
 echo "==> launch prepared sandbox"
+: >"$APP_LOG"
 set +e
 timeout -k 10s 70s "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --sandbox-id "launch-$((BASHPID % 1000000))" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
+    --stdout-to "$APP_LOG" \
     >"$LOG" 2>&1
 rc=$?
 set -e
@@ -164,11 +169,11 @@ if [ "$rc" -ne 0 ]; then
     launch_fail "launch-spec sandbox failed with status $rc"
 fi
 
-grep -qE '^LS-DONE$' "$LOG" || launch_fail "launch log missing LS-DONE"
-grep -qE '^LS-WHOAMI 65534:65534$' "$LOG" || launch_fail "launch log missing LS-WHOAMI"
-grep -qE '^LS-RESOLV nameserver 169\.254\.169\.253$' "$LOG" || launch_fail "launch log missing LS-RESOLV"
-grep -qE '^LS-TMPFS-OK$' "$LOG" || launch_fail "launch log missing LS-TMPFS-OK"
-grep -qE '^LS-VOLUME-OK$' "$LOG" || launch_fail "launch log missing LS-VOLUME-OK"
-grep -qE '^LS-INIT-OK provisioned$' "$LOG" || launch_fail "launch log missing LS-INIT-OK"
+grep -qE '^LS-DONE$' "$APP_LOG" || launch_fail "launch log missing LS-DONE"
+grep -qE '^LS-WHOAMI 65534:65534$' "$APP_LOG" || launch_fail "launch log missing LS-WHOAMI"
+grep -qE '^LS-RESOLV nameserver 169\.254\.169\.253$' "$APP_LOG" || launch_fail "launch log missing LS-RESOLV"
+grep -qE '^LS-TMPFS-OK$' "$APP_LOG" || launch_fail "launch log missing LS-TMPFS-OK"
+grep -qE '^LS-VOLUME-OK$' "$APP_LOG" || launch_fail "launch log missing LS-VOLUME-OK"
+grep -qE '^LS-INIT-OK provisioned$' "$APP_LOG" || launch_fail "launch log missing LS-INIT-OK"
 
 echo "PASS sandbox.launch.sh"

@@ -40,9 +40,15 @@ Memory restore 使用一个共享 memfd，以及接收 CH-side userfaultfd 的 h
 
 <a id="uffd-registration"></a>
 
-### Single UFFD contract
+### 内存填充与 backend 映射保护
 
-这里的 single-UFFD 设计表示只在 CH mapping 上处理 fault，而不在 sandbox-ctl 的 backend mapping 上注册第二套 UFFD；不表示所有布局都只有一个 CH fd。CH 为 restored memory region 注册 missing-page events；host 通过 restore handshake 接收 fd，并按共享 memfd address map 验证 region 范围与不重叠。首个 report 启动 handler，后续合法 region 用 `AddUffd` 加入。超界 fault、重复/无效 region registration 或截断 source 均 fail closed。源码见 [serveandwait.go](../pkg/sandbox/serveandwait.go)、[handler.go](../pkg/uffd/handler.go)、[addrmap.go](../pkg/uffd/addrmap.go)。
+内存填充只使用 CH 侧的注册。CH 为自己的 memory region 注册 missing-page events；host 通过握手接收 fd，并按共享 memfd address map 验证 region 范围与不重叠。首个 report 启动 handler，后续合法 region 用 `AddUffd` 加入。超界 fault、重复或无效的 region registration，以及截断 source 均会失败并停止继续处理。源码见 [serveandwait.go](../pkg/sandbox/serveandwait.go)、[handler.go](../pkg/uffd/handler.go) 和 [addrmap.go](../pkg/uffd/addrmap.go)。
+
+冷启动和恢复都在向消费者交出内存前，为 sandbox-ctl 的整个 backend 映射注册独立的 `MISSING_SHMEM` + `SIGBUS` UFFD。该守卫没有 reader、异步事件订阅或超时。用户态访问尚未准备的页会触发 SIGBUS；kernel uaccess 或 remote GUP 则可能返回 EFAULT，阻止这类访问提前创建共享零页、使后续 CH COPY 无法安装快照内容。CH 侧成功 COPY 后，backend 别名仍可正常读取共享字节。Vhost 访问 descriptor、ring、data 和 status slice 前仍须调用 `EnsureLoaded`。实现见 [backend_memory_guard_linux.go](../pkg/uffd/backend_memory_guard_linux.go)。
+
+创建守卫、协商特征和注册完整范围都是启动的必要步骤。注册后还会检查新 memfd 是否仍完全为空洞；发现已有 data extent 即拒绝启动，以识别建立保护之前已被创建的页，不改变一般的 CH seed 处理。创建时优先使用 `UFFD_USER_MODE_ONLY`；仅固定创建 flags 返回 EINVAL 时，才尝试 Linux 5.10 支持的 legacy flags。5.10 上 sandbox-ctl 需要已有的普通 UFFD 创建权限；权限、API 或注册错误均作为启动错误返回，不修改主机设置，也不提高内核最低版本。参见 [Linux 5.10](https://github.com/torvalds/linux/blob/v5.10/fs/userfaultfd.c) 与 [5.11](https://github.com/torvalds/linux/blob/v5.11/fs/userfaultfd.c) 的创建路径。所有消费者和 CH handler 退出后，先解除 backend 映射，再关闭守卫。
+
+保护范围是这个 backend VMA，不包括同一 inode 的所有其他别名或 FD 操作。它也不 pin 页面，不能阻止 `EnsureLoaded` 返回后任意并发的 balloon/discard；guest 仍须正常持有在途描述符所引用的页面。Snapshot payload 继续通过 memfd FD 读到独立缓冲区。
 
 <a id="fault-path"></a>
 

@@ -212,8 +212,21 @@ func mapDelete(m *yaml.Node, key string) {
 const skeletonCold = `# sandbox.yaml — sandbox-ctl run --config <this>
 # Fill the placeholder paths/values. Schema reference: docs/configuration.md#sandbox-yaml.
 resources:
-  # One sandbox-wide plaintext COW budget; dirty is a subset of total.
-  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB, discard: auto }
+  # Shared cache; omitted/zero QoS limits add no constraint. No per-disk partition.
+  diff_cow:
+    discard: auto
+    cache_size: 32MiB
+    cache_idle_after: 10s
+    max_dirty_size: 0
+    read_bandwidth: 0
+    write_bandwidth: 0
+    read_iops: 0
+    write_iops: 0
+    max_dirty_size_per_disk: 0
+    read_bandwidth_per_disk: 0
+    write_bandwidth_per_disk: 0
+    read_iops_per_disk: 0
+    write_iops_per_disk: 0
   # discard: auto (default) mounts writable ext4 with discard; manual uses nodiscard.
   capacity:    { cpu: 2, memory: 8GiB }   # vCPU / memory the guest sees
   allocatable: { cpu: 2, memory: 8GiB }   # <= capacity (no cgroup ⇒ cpu == capacity.cpu)
@@ -275,7 +288,19 @@ restore:
   prefetch: off                            # off (default) | memory (current memory self)
 resources:
   # One sandbox-wide plaintext COW budget; dirty is a subset of total.
-  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB }
+  diff_cow:
+    cache_size: 32MiB
+    cache_idle_after: 10s
+    max_dirty_size: 0
+    read_bandwidth: 0
+    write_bandwidth: 0
+    read_iops: 0
+    write_iops: 0
+    max_dirty_size_per_disk: 0
+    read_bandwidth_per_disk: 0
+    write_bandwidth_per_disk: 0
+    read_iops_per_disk: 0
+    write_iops_per_disk: 0
   capacity: { cpu: 2, memory: 8GiB }       # if present, must equal referenced Sandbox E
 network:
   # Provider presence must match E's portable network topology. Identity is fresh.
