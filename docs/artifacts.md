@@ -948,6 +948,9 @@ needed by descendants cannot be revoked. Durable parent publication and deletion
 share `.checkpoint-sources.lock` in every source directory, acquired in canonical
 path order. An existing reader permits continued reads, not new durable edges
 after revocation.
+Ordinary captures need not create an unused checkpoint destination; actual local
+parent directories still participate in this fence even when that destination
+does not yet exist.
 
 A running instance adds its current disk E and its memory dependencies separately.
 Restoring an older disk version can materialize a new E while RAM still comes

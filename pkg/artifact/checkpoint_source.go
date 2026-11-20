@@ -109,7 +109,7 @@ func (s *ProcessStorage) ProtectCheckpointParents(ctx context.Context, c Checkpo
 	if s == nil {
 		return nil, errors.New("checkpoint requires storage")
 	}
-	c, dir, err := normalizeCheckpoint(c)
+	c, dir, err := normalizeCheckpointSource(c, false)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +144,14 @@ func (s *ProcessStorage) ProtectCheckpointParents(ctx context.Context, c Checkpo
 	if err != nil {
 		return nil, err
 	}
-	dirs := []string{dir}
+	var dirs []string
+	if _, err := os.Stat(dir); err == nil {
+		dirs = append(dirs, dir)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	// Actual local parent directories are always included, even when this
+	// ordinary capture has no checkpoint destination of its own.
 	for source := range k.sourceDirectories {
 		dirs = append(dirs, source)
 	}

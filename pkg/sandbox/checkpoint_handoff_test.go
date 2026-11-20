@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -481,7 +482,7 @@ func TestRestoredDiskSourceFenceDoesNotRequireColdLayoutMarker(t *testing.T) {
 	// The memory restore entry supplies resolved E provenance without the
 	// cold-launch layout marker. Its actual immutable graph still owns DIFFs.
 	binding.Checkpoint = nil
-	opts := RunOptions{checkpointDir: t.TempDir(), SandboxID: shape.SandboxID, SourceBinding: &binding}
+	opts := RunOptions{checkpointDir: filepath.Join(t.TempDir(), "unused", "checkpoint"), SandboxID: shape.SandboxID, SourceBinding: &binding}
 	guard, err := protectCaptureParents(ctx, opts, false)
 	if err != nil {
 		t.Fatal(err)
@@ -529,5 +530,26 @@ func TestRestoredDiskSourceFenceDoesNotRequireColdLayoutMarker(t *testing.T) {
 	if guard, err = protectCaptureParents(ctx, opts, false); err == nil {
 		guard.Close()
 		t.Fatal("existing restored reader authorized new edge after revocation")
+	}
+}
+
+func TestCaptureParentProtectionWithoutCheckpointDirectory(t *testing.T) {
+	for _, memory := range []bool{false, true} {
+		opts := RunOptions{SandboxID: "ordinary", checkpointDir: filepath.Join(t.TempDir(), "checkpoint")}
+		if memory {
+			opts.SourceBinding = &RunSourceBinding{SandboxRef: "manifest://" + strings.Repeat("0", 64)}
+		}
+		guard, err := protectCaptureParents(context.Background(), opts, memory)
+		if err != nil {
+			t.Fatalf("ordinary capture memory=%t: %v", memory, err)
+		}
+		if guard != nil {
+			if err := guard.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := os.Stat(opts.checkpointDir); !os.IsNotExist(err) {
+			t.Fatalf("ordinary capture created unused checkpoint directory: %v", err)
+		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,14 +17,18 @@ import (
 )
 
 const (
-	TypeCheckpointSnapshotRequest = "checkpoint_snapshot_request"
-	TypeCheckpointExportRequest   = "checkpoint_export_request"
-	TypeCheckpointListRequest     = "checkpoint_list_request_v2"
-	TypeCheckpointListChunk       = "checkpoint_list_chunk_v2"
-	TypeCheckpointListDone        = "checkpoint_list_done_v2"
-	TypeCheckpointDeleteRequest   = "checkpoint_delete_request_v2"
-	TypeCheckpointDeleteDone      = "checkpoint_delete_done_v2"
-	CheckpointUnsupportedCode     = "checkpoint_unsupported"
+	TypeCheckpointSnapshotRequest     = "checkpoint_snapshot_request"
+	TypeCheckpointExportRequest       = "checkpoint_export_request"
+	TypeCheckpointListRequest         = "checkpoint_list_request_v2"
+	TypeCheckpointListChunk           = "checkpoint_list_chunk_v2"
+	TypeCheckpointListDone            = "checkpoint_list_done_v2"
+	TypeCheckpointDeleteRequest       = "checkpoint_delete_request_v2"
+	TypeCheckpointDeleteDone          = "checkpoint_delete_done_v2"
+	TypeCheckpointDeleteStreamRequest = "checkpoint_delete_stream_request_v2"
+	TypeCheckpointDeleteReady         = "checkpoint_delete_ready_v2"
+	typeCheckpointDeleteChunk         = "checkpoint_delete_chunk_v2"
+	typeCheckpointDeleteCommit        = "checkpoint_delete_commit_v2"
+	CheckpointUnsupportedCode         = "checkpoint_unsupported"
 )
 
 var ErrCheckpointUnsupported = errors.New(CheckpointUnsupportedCode)
@@ -120,6 +125,8 @@ func DeleteCheckpoints(ctx context.Context, socketPath, ownerID string, refs []C
 	// Freeze the caller's exact set before making any progress. Each batch is
 	// idempotent, so a failed connection can safely be retried with the same set.
 	refs = append([]DiffCheckpointRef(nil), refs...)
+	sources.Retain = append([]CheckpointSource{}, sources.Retain...)
+	sources.RefLocations = maps.Clone(sources.RefLocations)
 	for start := 0; start < len(refs); start += 128 {
 		err := func() error {
 			c, close, err := dialContext(ctx, socketPath)
@@ -128,7 +135,7 @@ func DeleteCheckpoints(ctx context.Context, socketPath, ownerID string, refs []C
 			}
 			defer close()
 			req := Request{Type: TypeCheckpointDeleteRequest, CheckpointOwner: ownerID, CheckpointRefs: refs[start:min(start+128, len(refs))], CheckpointSources: &sources}
-			if err := WriteMessage(c, req); err != nil {
+			if err := writeCheckpointDeleteRequest(c, req); err != nil {
 				return err
 			}
 			var resp Response
@@ -148,6 +155,79 @@ func DeleteCheckpoints(ctx context.Context, socketPath, ownerID string, refs []C
 		}
 	}
 	return nil
+}
+
+// Large management inputs use the same bounded frames on one connection.
+// No graph subset reaches the deletion handler: the complete request and an
+// explicit commit frame are required. Disconnects discard an unfinished input.
+type checkpointDeleteFrame struct {
+	Type string `json:"type"`
+	Data []byte `json:"data,omitempty"`
+}
+
+func writeCheckpointDeleteRequest(c io.ReadWriter, req Request) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	if len(body) <= MaxMessageBytes {
+		return WriteMessage(c, req)
+	}
+	if err := WriteMessage(c, Request{Type: TypeCheckpointDeleteStreamRequest, BodyBytes: len(body)}); err != nil {
+		return err
+	}
+	var ready Response
+	if err := ReadMessage(c, &ready); err != nil {
+		return err
+	}
+	if ready.Type == TypeError {
+		return CaptureError(ready)
+	}
+	if ready.Type != TypeCheckpointDeleteReady {
+		return fmt.Errorf("unexpected checkpoint delete readiness %q", ready.Type)
+	}
+	// JSON base64 expansion of 32 KiB remains below the 64 KiB frame limit.
+	for start := 0; start < len(body); start += 32 * 1024 {
+		if err := WriteMessage(c, checkpointDeleteFrame{Type: typeCheckpointDeleteChunk, Data: body[start:min(start+32*1024, len(body))]}); err != nil {
+			return err
+		}
+	}
+	return WriteMessage(c, checkpointDeleteFrame{Type: typeCheckpointDeleteCommit})
+}
+
+func readCheckpointDeleteRequest(r io.Reader, size int) (Request, error) {
+	if size <= 0 {
+		return Request{}, errors.New("checkpoint delete: invalid input size")
+	}
+	// Do not allocate the sender's claimed size before receiving its bytes.
+	var body []byte
+	for {
+		var frame checkpointDeleteFrame
+		if err := ReadMessage(r, &frame); err != nil {
+			return Request{}, fmt.Errorf("checkpoint delete incomplete: %w", err)
+		}
+		switch frame.Type {
+		case typeCheckpointDeleteChunk:
+			if len(frame.Data) == 0 || len(frame.Data) > size-len(body) {
+				return Request{}, errors.New("checkpoint delete: invalid data frame")
+			}
+			body = append(body, frame.Data...)
+		case typeCheckpointDeleteCommit:
+			if len(frame.Data) != 0 || len(body) != size {
+				return Request{}, errors.New("checkpoint delete: invalid completion size")
+			}
+			var req Request
+			if err := json.Unmarshal(body, &req); err != nil {
+				return Request{}, err
+			}
+			if req.Type != TypeCheckpointDeleteRequest || req.BodyBytes != 0 {
+				return Request{}, errors.New("checkpoint delete: invalid complete request")
+			}
+			return req, nil
+		default:
+			return Request{}, fmt.Errorf("checkpoint delete: unexpected frame %q", frame.Type)
+		}
+	}
 }
 
 type CheckpointOwner struct {

@@ -283,6 +283,12 @@ func (k *checkpointKeep) plan(ctx context.Context, c Checkpoint) (retErr error) 
 }
 
 func normalizeCheckpoint(c Checkpoint) (Checkpoint, string, error) {
+	return normalizeCheckpointSource(c, true)
+}
+
+// Parent validation may precede creation of an unused destination directory.
+// Management of existing versions still requires the directory to exist.
+func normalizeCheckpointSource(c Checkpoint, requireDirectory bool) (Checkpoint, string, error) {
 	if (c.SandboxID == "" || c.SandboxID == "." || c.SandboxID == "..") || filepath.Base(c.SandboxID) != c.SandboxID || strings.ContainsAny(c.SandboxID, `/\\`) {
 		return c, "", errors.New("checkpoint cleanup requires producer identity")
 	}
@@ -294,6 +300,28 @@ func normalizeCheckpoint(c Checkpoint) (Checkpoint, string, error) {
 		return c, "", errors.New("checkpoint directory is required")
 	}
 	physical, err := filepath.EvalSymlinks(dir)
+	// Validate the existing ancestors even when the final components are
+	// absent. A missing leaf must not hide an aliased source directory.
+	for ancestor := dir; !requireDirectory && os.IsNotExist(err); {
+		if _, linkErr := os.Lstat(ancestor); linkErr == nil {
+			return c, "", errors.New("checkpoint directory must be canonical without symlinks")
+		} else if !os.IsNotExist(linkErr) {
+			return c, "", linkErr
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			break
+		}
+		physical, err = filepath.EvalSymlinks(parent)
+		if err == nil {
+			suffix, relErr := filepath.Rel(parent, dir)
+			if relErr != nil {
+				return c, "", relErr
+			}
+			physical = filepath.Join(physical, suffix)
+		}
+		ancestor = parent
+	}
 	if err != nil {
 		return c, "", err
 	}

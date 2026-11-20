@@ -817,6 +817,14 @@ checkpoint_list_request_v2     -> checkpoint_list_chunk_v2* -> checkpoint_list_d
 checkpoint_delete_request_v2   -> checkpoint_delete_done_v2 | error
 ```
 
+Large delete requests use `checkpoint_delete_stream_request_v2` with the exact
+JSON byte count, followed by `checkpoint_delete_ready_v2`, bounded
+`checkpoint_delete_chunk_v2` frames and `checkpoint_delete_commit_v2`. The owner
+invokes deletion only after receiving the complete original request and explicit
+commit. Every frame retains the 64 KiB limit; the complete `retain` graph is never
+split into independently deletable subsets. Incomplete input has no deletion
+effect. Both the selected references and source inputs stay fixed across batches.
+
 Named captures use the dedicated checkpoint request types and a nonempty
 `checkpoint_id`. They reuse the existing capture responses and output fields;
 they do not negotiate support by adding a field to an ordinary capture request.

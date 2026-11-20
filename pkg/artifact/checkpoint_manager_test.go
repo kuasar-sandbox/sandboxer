@@ -151,7 +151,7 @@ func TestCheckpointCurrentRootOptionalAndDoesNotPromoteRetainedAliases(t *testin
 func TestCheckpointLocatedParentFencesItsOwnDirectory(t *testing.T) {
 	f := newMemoryCheckpointFixture(t)
 	ctx := context.Background()
-	childDirectory := t.TempDir()
+	childDirectory := filepath.Join(t.TempDir(), "unused", "checkpoint")
 	ref, err := manifest.ParseRef(f.ref)
 	if err != nil {
 		t.Fatal(err)
@@ -233,4 +233,24 @@ func TestCheckpointListThenOpenRelativeDirectory(t *testing.T) {
 		return
 	}
 	t.Fatal("committed memory checkpoint absent from unified listing")
+}
+
+func TestCheckpointParentDestinationRejectsAliasedMissingPath(t *testing.T) {
+	f := newMemoryCheckpointFixture(t)
+	for _, dangling := range []bool{false, true} {
+		parent := t.TempDir()
+		target := t.TempDir()
+		if dangling {
+			target = filepath.Join(target, "missing")
+		}
+		alias := filepath.Join(parent, "alias")
+		if err := os.Symlink(target, alias); err != nil {
+			t.Fatal(err)
+		}
+		c := Checkpoint{Directory: filepath.Join(alias, "checkpoint"), SandboxID: "sid"}
+		if guard, err := f.storage.ProtectCheckpointParents(context.Background(), c, nil); err == nil {
+			guard.Close()
+			t.Fatal("missing destination hid an aliased ancestor")
+		}
+	}
 }

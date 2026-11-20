@@ -714,6 +714,12 @@ checkpoint_list_request_v2     -> checkpoint_list_chunk_v2* -> checkpoint_list_d
 checkpoint_delete_request_v2   -> checkpoint_delete_done_v2 | error
 ```
 
+较大的删除请求使用 `checkpoint_delete_stream_request_v2` 声明完整 JSON 字节数，
+在收到 `checkpoint_delete_ready_v2` 后发送有界 `checkpoint_delete_chunk_v2` 帧及
+`checkpoint_delete_commit_v2`。owner 收齐原始请求并收到显式提交帧后才执行删除。
+每帧仍受 64 KiB 限制；完整 `retain` 图不会被拆成各自执行删除的子集。不完整输入
+不产生删除效果，精确引用和来源输入在各批次之间保持固定。
+
 命名捕获使用专用 checkpoint request type 和非空 `checkpoint_id`，复用既有捕获
 response 及输出字段；不能仅给普通捕获请求添加字段来判断能力。不支持的 owner 返回
 `code: "checkpoint_unsupported"`；客户端也识别旧服务端针对这两个捕获类型返回的
