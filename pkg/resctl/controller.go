@@ -324,6 +324,8 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 	h.sessionMu.Lock()
 	defer h.sessionMu.Unlock()
 	backoff := 100 * time.Millisecond
+	var account *resource.RetainedAccount
+	accountKnown := false
 	for {
 		select {
 		case <-h.opts.Context.Done():
@@ -368,7 +370,13 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 			if _, err := h.lease.ConfirmPublished(); err != nil {
 				return 0, err
 			}
-			account, lookupErr := h.client.RetainedAccountContext(h.lifetimeCtx, sid)
+			// A transport failure may follow acceptance. Keep the exact
+			// reference until the node definitively rejects it as stale.
+			var lookupErr error
+			if !accountKnown {
+				account, lookupErr = h.client.RetainedAccountContext(h.lifetimeCtx, sid)
+				accountKnown = lookupErr == nil
+			}
 			if lookupErr != nil {
 				err = lookupErr
 			} else if account == nil && h.opts.Retained == nil {
@@ -395,6 +403,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 		}
 		if res.Status == resource.StatusRejected {
 			if h.leaseCandidate != "" && res.Reason == resource.ReasonRetentionAccountChanged && resource.HasFeature(res.ClientFeatures, resource.FeatureRetainedMemoryV2) {
+				accountKnown = false
 				continue
 			}
 			if h.opts.Retained != nil && res.Reason == resource.ReasonRetentionSettledMissing &&
