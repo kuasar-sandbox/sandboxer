@@ -547,6 +547,18 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 		}
 		return fmt.Errorf("lock checkpoint memory readers: %w", err)
 	}
+	// A retained holder may publish FileReady and release its shared pin after
+	// the first plan read its empty PayloadRef. Refresh under the exclusive pin
+	// before unlinking; preserve the separately retained current-disk files.
+	// Logical deletion stays before this lock so unrelated live readers cannot
+	// prevent cancellation of unreachable holders.
+	refreshed, err := s.checkpointKeepPlan(ctx, c)
+	if err != nil {
+		return err
+	}
+	for name := range refreshed.files {
+		k.files[name] = true
+	}
 	for {
 		entries, err := f.ReadDir(128)
 		if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, io.EOF) {
