@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,12 +17,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Holder owns only the frozen read-only fd, local encoding job and its record.
+// Holder owns the frozen read-only FD, pins, service guard, writer and local job.
 // It must outlive Runtime.Wait and cannot borrow that Runtime's storage graph.
 type Holder struct {
 	mu         sync.Mutex
 	record     *RecordWriter
 	file       *os.File
+	ramPin     *os.File
+	gcPin      *os.File
+	directory  *holderDirectory
 	size       uint64
 	listener   *net.UnixListener
 	readers    map[string]*readerLease
@@ -56,68 +58,28 @@ type holderMessage struct {
 }
 
 func ProcessStartTime(pid int) (uint64, error) {
+	start, _, err := processIdentityState(pid)
+	return start, err
+}
+
+func processIdentityState(pid int) (uint64, byte, error) {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	i := strings.LastIndexByte(string(b), ')')
 	if i < 0 {
-		return 0, errors.New("invalid process stat")
+		return 0, 0, errors.New("invalid process stat")
 	}
 	f := strings.Fields(string(b[i+1:]))
-	if len(f) < 20 {
-		return 0, errors.New("short process stat")
+	if len(f) < 20 || len(f[0]) != 1 {
+		return 0, 0, errors.New("short process stat")
 	}
-	return strconv.ParseUint(f[19], 10, 64)
+	start, err := strconv.ParseUint(f[19], 10, 64)
+	return start, f[0][0], err
 }
 
 func ReadOnlyMemfd(fd int) (*os.File, error) { return os.Open(fmt.Sprintf("/proc/self/fd/%d", fd)) }
-
-func NewHolder(record *RecordWriter, file *os.File, size uint64, logf func(string, ...any)) (*Holder, error) {
-	if record == nil || file == nil || size == 0 {
-		return nil, errors.New("memory checkpoint: incomplete holder")
-	}
-	flags, err := unix.FcntlInt(file.Fd(), unix.F_GETFL, 0)
-	if err != nil || flags&unix.O_ACCMODE != unix.O_RDONLY {
-		return nil, errors.New("memory checkpoint: holder requires read-only memory fd")
-	}
-	st, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if uint64(st.Size()) != size {
-		return nil, errors.New("memory checkpoint: memfd size mismatch")
-	}
-	r := record.Read()
-	if err := os.MkdirAll(filepath.Dir(r.Holder.SocketPath), 0700); err != nil {
-		return nil, err
-	}
-	// Resolve the named RunDir socket through a pinned directory descriptor.
-	// Its physical path can be longer than sockaddr_un.sun_path without
-	// moving the socket out of the generation-owned RunDir namespace.
-	dir, err := os.Open(filepath.Dir(r.Holder.SocketPath))
-	if err != nil {
-		return nil, err
-	}
-	bindPath := fmt.Sprintf("/proc/self/fd/%d/%s", dir.Fd(), filepath.Base(r.Holder.SocketPath))
-	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: bindPath, Net: "unix"})
-	_ = dir.Close()
-	if err != nil {
-		return nil, err
-	}
-	l.SetUnlinkOnClose(false)
-	if err = os.Chmod(r.Holder.SocketPath, 0600); err != nil {
-		l.Close()
-		removeHolderSocket(r.Holder.SocketPath)
-		return nil, err
-	}
-	if logf == nil {
-		logf = func(string, ...any) {}
-	}
-	h := &Holder{record: record, file: file, size: size, listener: l, readers: make(map[string]*readerLease), ready: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{}, 1), logf: logf}
-	go h.serve()
-	return h, nil
-}
 
 func (h *Holder) Record() *RecordWriter { return h.record }
 func (h *Holder) Done() <-chan struct{} { return h.done }
@@ -163,33 +125,32 @@ func (h *Holder) Start(dump func(context.Context, io.ReaderAt) (string, error), 
 		h.mu.Lock()
 		close(h.ready)
 		h.mu.Unlock()
-		// Existing readers actively switch and ACK. A disconnected but live
-		// process is not proof that its fd closed; only exact process death is.
-		t := time.NewTicker(100 * time.Millisecond)
+		// File publication closes RAM admission. Drop our own backing before
+		// testing an independent OFD; queued SCM_RIGHTS and accepted readers
+		// keep the shared pin alive even if an ACK was lost or a peer exited.
+		h.mu.Lock()
+		closeErr := h.closeRAMLocked()
+		h.mu.Unlock()
+		if closeErr != nil {
+			h.logf("checkpoint RAM descriptor close: %v", closeErr)
+		}
+		var proof *os.File
 		for {
-			h.mu.Lock()
-			for token, l := range h.readers {
-				start, err := ProcessStartTime(l.pid)
-				if errors.Is(err, os.ErrNotExist) || err == nil && start != l.start {
-					_ = l.conn.Close()
-					delete(h.readers, token)
-				}
-			}
-			empty := len(h.readers) == 0
-			h.mu.Unlock()
-			if empty {
+			r := h.record.Read()
+			var err error
+			proof, err = openRAMPin(h.record.Path(), r.Holder.RAMLock, unix.LOCK_EX)
+			if err == nil {
 				break
+			}
+			if !errors.Is(err, unix.EWOULDBLOCK) {
+				h.logf("checkpoint RAM release proof retained for retry: %v", err)
 			}
 			select {
 			case <-h.changed:
-			case <-t.C:
+			case <-time.After(100 * time.Millisecond):
 			}
 		}
-		t.Stop()
-		h.mu.Lock()
-		_ = h.file.Close()
-		h.file = nil
-		h.mu.Unlock()
+		defer proof.Close()
 		// The record is the physical release fact. Resource ACK may be replayed
 		// separately; a failed ACK cannot charge or free another generation.
 		for {
@@ -220,7 +181,7 @@ func (h *Holder) Abort() error {
 }
 
 // AbortWithCleanup releases the provisional backing immediately. Metadata
-// failure can retain only its record lock and caller's directory pin; it can
+// failure can retain only its record lock, GC pin and completion cleanup; it can
 // never strand a duplicate RAM fd after a later capture has released its RAM.
 func (h *Holder) AbortWithCleanup(complete func() error) error {
 	h.abortOnce.Do(func() {
@@ -232,14 +193,16 @@ func (h *Holder) AbortWithCleanup(complete func() error) error {
 		}
 		closeErr := h.closeBackingLocked()
 		h.mu.Unlock()
-		removeHolderSocket(h.record.Read().Holder.SocketPath)
+		closeErr = errors.Join(closeErr, h.directory.close())
 		h.abortErr = errors.Join(closeErr, AbortRecord(h.record, func() error {
 			var err error
 			if complete != nil {
 				err = complete()
 			}
 			h.finish(errors.Join(closeErr, err))
-			return err
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.err
 		}, h.logf))
 	})
 	return h.abortErr
@@ -263,17 +226,22 @@ func (h *Holder) closeBackingLocked() error {
 		_ = l.conn.Close()
 	}
 	clear(h.readers)
-	if h.file != nil {
-		err = errors.Join(err, h.file.Close())
-		h.file = nil
-	}
-	return err
+	return errors.Join(err, h.closeRAMLocked())
 }
 
-func removeHolderSocket(path string) {
-	_ = os.Remove(path)
-	_ = os.Remove(filepath.Dir(path))
-	_ = os.Remove(filepath.Dir(filepath.Dir(path)))
+// Only Close releases a reference to the shared RAM-pin OFD. LOCK_UN would
+// incorrectly unlock it for every queued/received copy of this descriptor.
+func (h *Holder) closeRAMLocked() error {
+	var err error
+	if h.file != nil {
+		err = h.file.Close()
+		h.file = nil
+	}
+	if h.ramPin != nil {
+		err = errors.Join(err, h.ramPin.Close())
+		h.ramPin = nil
+	}
+	return err
 }
 
 func (h *Holder) finish(err error) {
@@ -281,9 +249,14 @@ func (h *Holder) finish(err error) {
 		h.mu.Lock()
 		err = errors.Join(err, h.closeBackingLocked())
 		h.mu.Unlock()
-		r := h.record.Read()
-		removeHolderSocket(r.Holder.SocketPath)
-		err = errors.Join(err, h.record.Close())
+		err = errors.Join(err, h.directory.close())
+		if h.record != nil {
+			err = errors.Join(err, h.record.Close())
+		}
+		if h.gcPin != nil {
+			err = errors.Join(err, h.gcPin.Close())
+			h.gcPin = nil
+		}
 		h.mu.Lock()
 		h.err = err
 		h.mu.Unlock()
@@ -354,7 +327,7 @@ func (h *Holder) serveConn(c *net.UnixConn) {
 		h.mu.Unlock()
 		return
 	} // No fd transfer was attempted.
-	_, _, err = c.WriteMsgUnix([]byte{1}, unix.UnixRights(int(h.file.Fd())), nil)
+	_, _, err = c.WriteMsgUnix([]byte{1}, unix.UnixRights(int(h.file.Fd()), int(h.ramPin.Fd())), nil)
 	h.mu.Unlock()
 	if err != nil {
 		return

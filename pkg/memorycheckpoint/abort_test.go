@@ -104,7 +104,6 @@ func TestHolderAbortClosesRAMBeforeMetadataRecovery(t *testing.T) {
 	for _, postRename := range []bool{false, true} {
 		t.Run(map[bool]string{false: "directory-unavailable", true: "rename-published-sync-failed"}[postRename], func(t *testing.T) {
 			directory := t.TempDir()
-			record := testRecord(t, directory)
 			m, err := memory.Create("abort-holder", 4096)
 			if err != nil {
 				t.Fatal(err)
@@ -115,12 +114,8 @@ func TestHolderAbortClosesRAMBeforeMetadataRecovery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			holder, err := NewHolder(record, fd, 4096, t.Logf)
-			if err != nil {
-				fd.Close()
-				record.Close()
-				t.Fatal(err)
-			}
+			holder := testPrepareHolder(t, directory, fd, 4096)
+			record := holder.Record()
 			pin, err := PinDirectory(directory)
 			if err != nil {
 				t.Fatal(err)

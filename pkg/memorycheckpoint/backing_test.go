@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
@@ -38,13 +40,50 @@ func TestMapCodecGeometryAndOverlap(t *testing.T) {
 	}
 }
 
+func testHolderIdentity(t *testing.T, dir, checkpointID string, start uint64) HolderIdentity {
+	t.Helper()
+	p, err := RecordPath(dir, checkpointID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+		t.Fatal(err)
+	}
+	pin, id, err := createRAMPin(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dirPath := t.TempDir()
+	var st unix.Stat_t
+	if err := unix.Stat(dirPath, &st); err != nil {
+		t.Fatal(err)
+	}
+	return HolderIdentity{PID: os.Getpid(), StartTime: start, SocketPath: filepath.Join(dirPath, holderSocketName), Directory: HolderDirectoryIdentity{Path: dirPath, Device: uint64(st.Dev), Inode: st.Ino}, RAMLock: id}
+}
+
+func testPrepareHolder(t *testing.T, dir string, fd *os.File, size uint64) *Holder {
+	t.Helper()
+	run := filepath.Join(dir, "run")
+	if err := os.MkdirAll(run, 0700); err != nil {
+		t.Fatal(err)
+	}
+	h, err := PrepareHolder(dir, run, CaptureRecord{Version: 1, Producer: RunIdentity{SandboxID: "sid", InstanceID: "instance", RunID: "run"}, CheckpointID: "cp", MemoryID: "mem", Epoch: 1}, fd, size, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
 func testRecord(t *testing.T, dir string) *RecordWriter {
 	t.Helper()
 	start, err := ProcessStartTime(os.Getpid())
 	if err != nil {
 		t.Fatal(err)
 	}
-	w, err := CreateRecord(dir, CaptureRecord{Version: 1, Producer: RunIdentity{SandboxID: "sid", InstanceID: "instance", RunID: "run"}, CheckpointID: "cp", MemoryID: "mem", Epoch: 1, Holder: HolderIdentity{PID: os.Getpid(), StartTime: start, SocketPath: filepath.Join(dir, "m.sock")}})
+	w, err := CreateRecord(dir, CaptureRecord{Version: 1, Producer: RunIdentity{SandboxID: "sid", InstanceID: "instance", RunID: "run"}, CheckpointID: "cp", MemoryID: "mem", Epoch: 1, Holder: testHolderIdentity(t, dir, "cp", start)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +201,6 @@ func TestHolderReadOnlyHandoffAndActiveSwitch(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			w := testRecord(t, dir)
 			m, err := memory.Create("holder-test", 8192)
 			if err != nil {
 				t.Fatal(err)
@@ -172,13 +210,8 @@ func TestHolderReadOnlyHandoffAndActiveSwitch(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			h, err := NewHolder(w, fd, 8192, t.Logf)
-			if err != nil {
-				m.Close()
-				fd.Close()
-				w.Close()
-				t.Fatal(err)
-			}
+			h := testPrepareHolder(t, dir, fd, 8192)
+			w := h.Record()
 			if err = w.Update(func(r *CaptureRecord) { r.Committed = true; r.SnapshotRef = "snapshot"; r.SandboxRef = "sandbox" }); err != nil {
 				t.Fatal(err)
 			}
@@ -282,7 +315,6 @@ func TestHolderInterruptedFDHandshakeReleasesKnownToken(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer os.RemoveAll(dir)
-			w := testRecord(t, dir)
 			m, err := memory.Create("handshake", 4096)
 			if err != nil {
 				t.Fatal(err)
@@ -291,13 +323,8 @@ func TestHolderInterruptedFDHandshakeReleasesKnownToken(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			h, err := NewHolder(w, fd, 4096, t.Logf)
-			if err != nil {
-				m.Close()
-				fd.Close()
-				w.Close()
-				t.Fatal(err)
-			}
+			h := testPrepareHolder(t, dir, fd, 4096)
+			w := h.Record()
 			if err = w.Update(func(r *CaptureRecord) { r.Committed = true; r.SnapshotRef = "snapshot"; r.SandboxRef = "sandbox" }); err != nil {
 				t.Fatal(err)
 			}

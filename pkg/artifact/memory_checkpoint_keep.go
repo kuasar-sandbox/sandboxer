@@ -4,15 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
-	"golang.org/x/sys/unix"
 )
 
 // A flat memory lower is ordinarily an opaque payload. Only an exact local
@@ -69,9 +64,6 @@ func (k *checkpointKeep) retainMemory(ctx context.Context, raw string, scope pub
 	if k.memoryActive == nil {
 		k.memoryActive = make(map[string]bool)
 	}
-	if k.memoryRecords == nil {
-		k.memoryRecords = make(map[string]bool)
-	}
 	defer func() {
 		if retErr != nil {
 			clear(k.memoryActive)
@@ -126,9 +118,6 @@ func (k *checkpointKeep) retainMemory(ctx context.Context, raw string, scope pub
 		if record.MemoryID != descriptor.MemoryID || !record.Committed || record.Discarded {
 			return errors.New("checkpoint memory capture identity mismatch")
 		}
-		if sameCheckpointDirectory(child.relativeDir, k.directory) {
-			k.memoryRecords[descriptor.CheckpointID] = true
-		}
 		if _, err := k.retain(ctx, descriptor.MapRef, child); err != nil {
 			return fmt.Errorf("checkpoint memory map: %w", err)
 		}
@@ -144,62 +133,4 @@ func (k *checkpointKeep) retainMemory(ctx context.Context, raw string, scope pub
 		}
 	}
 	return nil
-}
-
-// The caller holds the directory-wide exclusive reader pin. Per-capture lock
-// inodes stay stable even after obsolete JSON is removed; they are tiny and
-// must not be replaced while a later capture could be checking the same ID.
-func (k *checkpointKeep) cleanupMemoryRecords(ctx context.Context, checkpointFD int) (retErr error) {
-	fd, err := unix.Openat(checkpointFD, "memory", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if errors.Is(err, unix.ENOENT) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	directory := os.NewFile(uintptr(fd), "checkpoint memory records")
-	defer func() { retErr = errors.Join(retErr, directory.Close()) }()
-	for {
-		entries, err := directory.ReadDir(128)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return err
-		}
-		for _, entry := range entries {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			name := entry.Name()
-			if !strings.HasSuffix(name, ".json") || entry.Type()&os.ModeSymlink != 0 || entry.IsDir() {
-				continue
-			}
-			record, err := memorycheckpoint.ReadCaptureRecord(filepath.Join(k.directory, "memory", name))
-			if err != nil || k.memoryRecords[record.CheckpointID] || (!record.Aborted && !record.RAMReleased) {
-				continue
-			}
-			// Checkpoint IDs retain their existing UTF-8 spelling (including
-			// separators); only RecordPath determines their safe file identity.
-			path, err := memorycheckpoint.RecordPath(k.directory, record.CheckpointID)
-			if err != nil || filepath.Base(path) != name {
-				continue
-			}
-			lockFD, err := unix.Openat(fd, name+".lock", unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-			if err != nil {
-				continue
-			}
-			locked := unix.Flock(lockFD, unix.LOCK_EX|unix.LOCK_NB) == nil
-			if locked {
-				err = unix.Unlinkat(fd, name, 0)
-			}
-			closeErr := unix.Close(lockFD)
-			if locked && err != nil && !errors.Is(err, unix.ENOENT) {
-				return err
-			}
-			if closeErr != nil {
-				return closeErr
-			}
-		}
-		if len(entries) == 0 {
-			return nil
-		}
-	}
 }

@@ -22,9 +22,22 @@ type RunIdentity struct {
 }
 
 type HolderIdentity struct {
-	PID        int    `json:"pid"`
-	StartTime  uint64 `json:"start_time"`
-	SocketPath string `json:"socket_path"`
+	PID        int                     `json:"pid"`
+	StartTime  uint64                  `json:"start_time"`
+	SocketPath string                  `json:"socket_path"`
+	Directory  HolderDirectoryIdentity `json:"directory"`
+	RAMLock    FileIdentity            `json:"ram_lock"`
+}
+
+type FileIdentity struct {
+	Device uint64 `json:"device"`
+	Inode  uint64 `json:"inode"`
+}
+
+type HolderDirectoryIdentity struct {
+	Path   string `json:"path"`
+	Device uint64 `json:"device"`
+	Inode  uint64 `json:"inode"`
 }
 
 type CaptureRecord struct {
@@ -57,13 +70,23 @@ func (r CaptureRecord) Validate() error {
 	if r.Committed && (r.SnapshotRef == "" || r.SandboxRef == "") {
 		return errors.New("memory checkpoint: committed capture lacks source refs")
 	}
-	if r.Discarded && !r.RAMReleased || r.RuntimeRetired && !r.Committed && !r.Discarded || r.FileReady && (!r.Committed || r.PayloadRef == "") || r.RAMReleased && (!r.FileReady && !r.Discarded || !r.RuntimeRetired) {
+	if r.Discarded && !r.RAMReleased || r.RuntimeRetired && !r.Committed && !r.Discarded || r.FileReady && (!r.Committed || r.PayloadRef == "") || r.RAMReleased && !r.RuntimeRetired {
 		return errors.New("memory checkpoint: inconsistent capture facts")
 	}
-	if r.Holder.PID <= 0 || r.Holder.StartTime == 0 || !filepath.IsAbs(r.Holder.SocketPath) {
+	if r.Holder.PID <= 0 || r.Holder.StartTime == 0 || !filepath.IsAbs(r.Holder.Directory.Path) || filepath.Clean(r.Holder.Directory.Path) != r.Holder.Directory.Path || r.Holder.Directory.Inode == 0 || r.Holder.RAMLock.Inode == 0 || r.Holder.SocketPath != filepath.Join(r.Holder.Directory.Path, holderSocketName) {
 		return errors.New("memory checkpoint: invalid holder identity")
 	}
 	return nil
+}
+
+// Lost separates source availability from the completed physical RAM obligation.
+// A later runtime based on an intact source may proceed once RAMReleased is true.
+func (r CaptureRecord) Lost() bool {
+	return r.Committed && r.RuntimeRetired && r.RAMReleased && !r.FileReady && !r.Aborted && !r.Discarded
+}
+
+func sameCaptureIdentity(a, b CaptureRecord) bool {
+	return a.Version == b.Version && a.Producer == b.Producer && a.CheckpointID == b.CheckpointID && a.HostOperationID == b.HostOperationID && a.MemoryID == b.MemoryID && a.Epoch == b.Epoch && a.Holder == b.Holder
 }
 
 func RecordPath(directory, checkpointID string) (string, error) {
@@ -141,10 +164,11 @@ func ReadCurrent(directory string) (*CaptureRecord, error) {
 // RecordWriter serializes monotonic updates. A stable flock excludes another
 // producer across an atomic rename; the JSON file itself is never the lock.
 type RecordWriter struct {
-	mu     sync.Mutex
-	path   string
-	lock   *os.File
-	record CaptureRecord
+	mu        sync.Mutex
+	path      string
+	lock      *os.File
+	record    CaptureRecord
+	published bool
 	// Per-writer fault injection keeps atomic-publication failure tests local;
 	// production uses writeJSON. Updates invoke it while holding mu.
 	writeJSON func(string, any) error
@@ -156,6 +180,24 @@ func CreateRecord(directory string, record CaptureRecord) (*RecordWriter, error)
 	if err := record.Validate(); err != nil {
 		return nil, err
 	}
+	w, err := reserveRecord(directory, record)
+	if err != nil {
+		return nil, err
+	}
+	if err := publishRecord(directory, w); err != nil {
+		if w.published && !record.Committed {
+			_ = AbortRecord(w, nil, nil)
+		} else {
+			_ = w.Close()
+		}
+		return nil, err
+	}
+	return w, nil
+}
+
+// reserveRecord precedes RAM-pin creation. Holding this stable writer lock
+// prevents another producer/recoverer from replacing a capture's proof inode.
+func reserveRecord(directory string, record CaptureRecord) (*RecordWriter, error) {
 	p, err := RecordPath(directory, record.CheckpointID)
 	if err != nil {
 		return nil, err
@@ -163,7 +205,7 @@ func CreateRecord(directory string, record CaptureRecord) (*RecordWriter, error)
 	if err = os.MkdirAll(filepath.Dir(p), 0700); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(p+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	f, err := os.OpenFile(p+".lock", os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -186,26 +228,21 @@ func CreateRecord(directory string, record CaptureRecord) (*RecordWriter, error)
 		w.Close()
 		return nil, err
 	}
-	if err = writeJSON(p, record); err != nil {
-		var published *recordPublishedError
-		if !record.Committed && errors.As(err, &published) {
-			_ = AbortRecord(w, nil, nil)
-		} else {
-			w.Close()
-		}
-		return nil, err
-	}
-	if err = writeJSON(filepath.Join(directory, "current-memory.json"), currentLocator{record.CheckpointID, record.MemoryID, record.Epoch}); err != nil {
-		// Rename may already have published the locator. Keep its target and
-		// record the known precommit abort, rather than creating a dangling link.
-		if !record.Committed {
-			_ = AbortRecord(w, nil, nil)
-		} else {
-			w.Close()
-		}
-		return nil, err
-	}
 	return w, nil
+}
+
+func publishRecord(directory string, w *RecordWriter) error {
+	if err := w.record.Validate(); err != nil {
+		return err
+	}
+	err := writeJSON(w.path, w.record)
+	var published *recordPublishedError
+	w.published = err == nil || errors.As(err, &published)
+	if err != nil {
+		return err
+	}
+	r := w.record
+	return writeJSON(filepath.Join(directory, "current-memory.json"), currentLocator{r.CheckpointID, r.MemoryID, r.Epoch})
 }
 
 func (w *RecordWriter) Path() string        { return w.path }
@@ -215,7 +252,7 @@ func (w *RecordWriter) Update(update func(*CaptureRecord)) error {
 	defer w.mu.Unlock()
 	r := w.record
 	update(&r)
-	if r.Version != w.record.Version || r.Producer != w.record.Producer || r.CheckpointID != w.record.CheckpointID || r.HostOperationID != w.record.HostOperationID || r.MemoryID != w.record.MemoryID || r.Epoch != w.record.Epoch || r.Holder != w.record.Holder || w.record.Aborted && !r.Aborted || w.record.Discarded && !r.Discarded || w.record.Committed && !r.Committed || w.record.RuntimeRetired && !r.RuntimeRetired || w.record.FileReady && !r.FileReady || w.record.RAMReleased && !r.RAMReleased || w.record.SnapshotRef != "" && w.record.SnapshotRef != r.SnapshotRef || w.record.SandboxRef != "" && w.record.SandboxRef != r.SandboxRef || w.record.PayloadRef != "" && w.record.PayloadRef != r.PayloadRef {
+	if !sameCaptureIdentity(r, w.record) || w.record.RAMReleased && !w.record.FileReady && r.FileReady || w.record.Aborted && !r.Aborted || w.record.Discarded && !r.Discarded || w.record.Committed && !r.Committed || w.record.RuntimeRetired && !r.RuntimeRetired || w.record.FileReady && !r.FileReady || w.record.RAMReleased && !r.RAMReleased || w.record.SnapshotRef != "" && w.record.SnapshotRef != r.SnapshotRef || w.record.SandboxRef != "" && w.record.SandboxRef != r.SandboxRef || w.record.PayloadRef != "" && w.record.PayloadRef != r.PayloadRef {
 		return errors.New("memory checkpoint: nonmonotonic record update")
 	}
 	if err := r.Validate(); err != nil {
@@ -304,6 +341,14 @@ func WaitCurrent(ctx context.Context, directory, sandboxID string, noWait bool) 
 		}
 		if r.RAMReleased || r.Aborted {
 			return r, nil
+		}
+		result, err := ObservePreviousSave(ctx, directory, *r)
+		r = &result.Record
+		if err != nil || r.RAMReleased || r.Aborted {
+			if noWait && errors.Is(err, ErrMemoryUnavailable) {
+				return r, ErrSavePending
+			}
+			return r, err
 		}
 		if noWait {
 			return r, ErrSavePending

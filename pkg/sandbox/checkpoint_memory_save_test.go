@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
+	"golang.org/x/sys/unix"
 )
 
 func memorySaveRecord(t *testing.T, directory string) *memorycheckpoint.RecordWriter {
@@ -24,13 +26,86 @@ func memorySaveRecord(t *testing.T, directory string) *memorycheckpoint.RecordWr
 		Version: 1, Producer: memorycheckpoint.RunIdentity{SandboxID: "sid"},
 		CheckpointID: "previous", MemoryID: "memory", Epoch: 1,
 		Committed: true, SnapshotRef: "snapshot", SandboxRef: "sandbox",
-		Holder: memorycheckpoint.HolderIdentity{PID: os.Getpid(), StartTime: start, SocketPath: filepath.Join(directory, "run", "memory-holders", "m.sock")},
+		Holder: fixtureMemoryHolder(t, directory, "previous", start),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = r.Close() })
 	return r
+}
+
+func TestPreviousMemoryUnavailableDoesNotPoisonLaterPause(t *testing.T) {
+	directory := t.TempDir()
+	w := memorySaveRecord(t, directory)
+	if err := w.Update(func(r *memorycheckpoint.CaptureRecord) { r.RuntimeRetired = true; r.SaveError = "writer exited" }); err != nil {
+		t.Fatal(err)
+	}
+	r := w.Read()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate exact PID reuse while a real, separately opened reader pin
+	// remains. Physical proof is covered by the subprocess recovery suite.
+	r.Holder.StartTime++
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(w.Path(), b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	pin, err := os.OpenFile(w.Path()+".ram.lock", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pin.Close()
+	if err := unix.Flock(int(pin.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	p, err := newPreviousMemorySave(directory, "sid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.wait(context.Background(), false); !errors.Is(err, memorycheckpoint.ErrMemoryUnavailable) {
+		t.Fatalf("default wait did not report impossible save: %v", err)
+	}
+	if p.ready {
+		t.Fatal("unavailable source fabricated released RAM")
+	}
+	if _, err := p.wait(context.Background(), true); !errors.Is(err, ctl.ErrMemorySavePending) {
+		t.Fatalf("no-wait lost retryable conflict: %v", err)
+	}
+	if err := pin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.wait(context.Background(), false)
+	if err != nil || !p.ready || !got.Lost() || got.SaveError == "" {
+		t.Fatalf("historical loss poisoned next pause: ready=%v record=%+v err=%v", p.ready, got, err)
+	}
+	if _, err := p.wait(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func prepareMemorySaveHolder(t *testing.T, directory string, fd *os.File) *memorycheckpoint.Holder {
+	t.Helper()
+	run := filepath.Join(directory, "run")
+	if err := os.MkdirAll(run, 0700); err != nil {
+		t.Fatal(err)
+	}
+	h, err := memorycheckpoint.PrepareHolder(directory, run, memorycheckpoint.CaptureRecord{Version: 1, Producer: memorycheckpoint.RunIdentity{SandboxID: "sid"}, CheckpointID: "previous", MemoryID: "memory", Epoch: 1}, fd, 4096, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Record().Update(func(r *memorycheckpoint.CaptureRecord) {
+		r.Committed = true
+		r.SnapshotRef = "snapshot"
+		r.SandboxRef = "sandbox"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return h
 }
 
 func TestPreviousMemoryWaitDoesNotEnterCapture(t *testing.T) {
@@ -107,7 +182,6 @@ func TestRuntimeFrozenCaptureLeavesOperationBeforeRetirement(t *testing.T) {
 
 func TestRetirementPublicationFailureReturnsAndRetries(t *testing.T) {
 	directory := t.TempDir()
-	record := memorySaveRecord(t, directory)
 	m, err := memory.Create("retirement-failure", 4096)
 	if err != nil {
 		t.Fatal(err)
@@ -117,20 +191,12 @@ func TestRetirementPublicationFailureReturnsAndRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	holder, err := memorycheckpoint.NewHolder(record, fd, 4096, t.Logf)
-	if err != nil {
-		fd.Close()
-		m.Close()
-		t.Fatal(err)
-	}
+	holder := prepareMemorySaveHolder(t, directory, fd)
+	record := holder.Record()
 	if err := m.Close(); err != nil {
 		t.Fatal(err)
 	}
-	pin, err := memorycheckpoint.PinDirectory(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	save := &checkpointMemorySave{holder: holder, pin: pin, logf: t.Logf,
+	save := &checkpointMemorySave{holder: holder, logf: t.Logf,
 		dump: func(_ context.Context, reader io.ReaderAt) (string, error) {
 			var b [1]byte
 			if _, err := reader.ReadAt(b[:], 0); err != nil || b[0] != 0x73 {

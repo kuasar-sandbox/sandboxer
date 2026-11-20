@@ -41,6 +41,7 @@ type TopBacking struct {
 type switchReader struct {
 	mu     sync.RWMutex
 	ram    *os.File
+	ramPin *os.File
 	file   fetch.Stream
 	closed bool
 }
@@ -71,28 +72,35 @@ func (s *switchReader) replace(file fetch.Stream) error {
 		s.mu.Unlock()
 		return file.Close()
 	}
-	ram := s.ram
+	ram, pin := s.ram, s.ramPin
 	s.ram = nil
+	s.ramPin = nil
 	s.file = file
 	s.mu.Unlock()
-	if ram != nil {
-		return ram.Close()
-	}
-	return nil
+	return closeRAMPair(ram, pin)
 }
 func (s *switchReader) close() error {
 	s.mu.Lock()
 	s.closed = true
-	ram, file := s.ram, s.file
+	ram, pin, file := s.ram, s.ramPin, s.file
 	s.ram = nil
+	s.ramPin = nil
 	s.file = nil
 	s.mu.Unlock()
+	err := closeRAMPair(ram, pin)
+	if file != nil {
+		err = errors.Join(err, file.Close())
+	}
+	return err
+}
+
+func closeRAMPair(ram, pin *os.File) error {
 	var err error
 	if ram != nil {
 		err = ram.Close()
 	}
-	if file != nil {
-		err = errors.Join(err, file.Close())
+	if pin != nil {
+		err = errors.Join(err, pin.Close())
 	}
 	return err
 }
@@ -175,6 +183,9 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 		return nil, errors.New("memory checkpoint: uncommitted or mismatched backing")
 	}
 	t.record = *r
+	if r.Lost() {
+		return nil, fmt.Errorf("%w: checkpoint %q", ErrMemoryLost, r.CheckpointID)
+	}
 	openPayload := func(ref string) error {
 		file, err := opts.OpenFile(ctx, ref)
 		if err != nil {
@@ -194,9 +205,22 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 	c, err := dialHolder(ctx, r.Holder)
 	if err != nil {
 		// Publication and socket deletion can race the initial record read.
-		latest, re := ReadRecord(opts.Directory, d.CheckpointID)
-		if re == nil && latest.MemoryID == d.MemoryID && latest.Epoch == r.Epoch && latest.FileReady {
-			return t, openPayload(latest.PayloadRef)
+		path, pe := RecordPath(opts.Directory, r.CheckpointID)
+		if pe != nil {
+			return nil, pe
+		}
+		latest, re := RecoverMemoryRelease(ctx, path, *r)
+		if re != nil {
+			return nil, errors.Join(err, re)
+		}
+		if latest.Record.FileReady {
+			return t, openPayload(latest.Record.PayloadRef)
+		}
+		if latest.Record.Lost() {
+			return nil, fmt.Errorf("%w: checkpoint %q", ErrMemoryLost, r.CheckpointID)
+		}
+		if latest.ProducerExited {
+			return nil, fmt.Errorf("%w: checkpoint %q", ErrMemoryUnavailable, r.CheckpointID)
 		}
 		return nil, err
 	}
@@ -229,39 +253,14 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 	if reply.Type != "ram" || reply.Token != t.lease.Token {
 		return nil, fmt.Errorf("memory checkpoint: holder refused: %s", reply.Error)
 	}
-	var one [1]byte
-	oob := make([]byte, unix.CmsgSpace(4*4))
-	_, oobn, flags, _, err := c.ReadMsgUnix(one[:], oob)
+	t.reader.ram, t.reader.ramPin, err = receiveRAMPair(c)
 	if err != nil {
 		return nil, err
 	}
-	msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
-	if err != nil {
+	if err := validateRAMPin(t.reader.ramPin, r.Holder.RAMLock); err != nil {
 		return nil, err
 	}
-	var fds []int
-	for _, msg := range msgs {
-		rights, e := unix.ParseUnixRights(&msg)
-		if e != nil {
-			for _, fd := range fds {
-				_ = unix.Close(fd)
-			}
-			return nil, e
-		}
-		fds = append(fds, rights...)
-	}
-	if flags&unix.MSG_CTRUNC != 0 || len(fds) != 1 {
-		for _, fd := range fds {
-			_ = unix.Close(fd)
-		}
-		if flags&unix.MSG_CTRUNC != 0 {
-			return nil, errors.New("memory checkpoint: truncated descriptor transfer")
-		}
-		return nil, errors.New("memory checkpoint: expected one memory fd")
-	}
-	unix.CloseOnExec(fds[0])
-	t.reader.ram = os.NewFile(uintptr(fds[0]), "checkpoint-memory")
-	fdFlags, err := unix.FcntlInt(uintptr(fds[0]), unix.F_GETFL, 0)
+	fdFlags, err := unix.FcntlInt(t.reader.ram.Fd(), unix.F_GETFL, 0)
 	if err != nil || fdFlags&unix.O_ACCMODE != unix.O_RDONLY {
 		return nil, errors.New("memory checkpoint: writable transferred fd")
 	}
@@ -276,6 +275,38 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 	return t, nil
 }
 
+func receiveRAMPair(c *net.UnixConn) (*os.File, *os.File, error) {
+	var one [1]byte
+	oob := make([]byte, unix.CmsgSpace(4*4))
+	_, oobn, flags, _, recvErr := c.ReadMsgUnix(one[:], oob)
+	msgs, parseErr := unix.ParseSocketControlMessage(oob[:oobn])
+	var fds []int
+	for _, msg := range msgs {
+		rights, err := unix.ParseUnixRights(&msg)
+		parseErr = errors.Join(parseErr, err)
+		fds = append(fds, rights...)
+	}
+	err := errors.Join(recvErr, parseErr)
+	if flags&unix.MSG_CTRUNC != 0 {
+		err = errors.Join(err, errors.New("memory checkpoint: truncated descriptor transfer"))
+	}
+	if len(fds) != 2 {
+		err = errors.Join(err, errors.New("memory checkpoint: expected memory and RAM-pin descriptors"))
+	}
+	if err != nil {
+		for _, fd := range fds {
+			_ = unix.Close(fd)
+		}
+		return nil, nil, err
+	}
+	// Go's Linux ReadMsgUnix uses MSG_CMSG_CLOEXEC. Keep the contract explicit
+	// for both descriptors and never accept the former single-fd protocol.
+	for _, fd := range fds {
+		unix.CloseOnExec(fd)
+	}
+	return os.NewFile(uintptr(fds[0]), "checkpoint-memory"), os.NewFile(uintptr(fds[1]), "checkpoint-ram-pin"), nil
+}
+
 func (t *TopBacking) watch(ctx context.Context, size uint64) {
 	defer close(t.done)
 	ticker := time.NewTicker(20 * time.Millisecond)
@@ -287,7 +318,7 @@ func (t *TopBacking) watch(ctx context.Context, size uint64) {
 		case <-ticker.C:
 		}
 		r, err := ReadRecord(t.options.Directory, t.record.CheckpointID)
-		if err != nil || r.MemoryID != t.record.MemoryID || r.Epoch != t.record.Epoch || !r.FileReady {
+		if err != nil || !sameCaptureIdentity(*r, t.record) || !r.FileReady {
 			continue
 		}
 		file, err := t.options.OpenFile(ctx, r.PayloadRef)
@@ -312,8 +343,9 @@ func (t *TopBacking) watch(ctx context.Context, size uint64) {
 	}
 }
 
-// releaseLease requires a positive ACK or the exact durable physical-release
-// fact. Neither EOF nor a successful write is acknowledgement.
+// releaseLease follows RAM/pin closure. A positive ACK or exact producer death
+// ends this connection obligation; only the independent RAM proof can publish
+// physical release. EOF and a successful write prove neither fact.
 func (t *TopBacking) releaseLease() bool {
 	if t.lease.Token == "" {
 		return true
@@ -325,6 +357,18 @@ func (t *TopBacking) releaseLease() bool {
 		}
 		t.lease.Token = ""
 		return true
+	}
+	path, err := RecordPath(t.options.Directory, t.record.CheckpointID)
+	if err == nil {
+		recovery, re := RecoverMemoryRelease(context.Background(), path, t.record)
+		if re == nil && (recovery.Record.RAMReleased || recovery.ProducerExited) {
+			if t.conn != nil {
+				_ = t.conn.Close()
+				t.conn = nil
+			}
+			t.lease.Token = ""
+			return true
+		}
 	}
 	if t.conn != nil {
 		c := t.conn
@@ -372,8 +416,7 @@ func releaseOnConnection(c *net.UnixConn, lease holderMessage) bool {
 
 func leaseReleaseRecorded(directory string, record CaptureRecord) bool {
 	r, err := ReadRecord(directory, record.CheckpointID)
-	return err == nil && r.MemoryID == record.MemoryID && r.Epoch == record.Epoch &&
-		r.Producer == record.Producer && r.Holder == record.Holder && r.RAMReleased
+	return err == nil && sameCaptureIdentity(*r, record) && r.RAMReleased
 }
 
 // A source Close must not retain borrowed storage while retrying an ACK. This
@@ -393,9 +436,12 @@ func retryRelease(directory string, record CaptureRecord, lease holderMessage) {
 			if leaseReleaseRecorded(directory, record) {
 				return
 			}
-			start, err := ProcessStartTime(record.Holder.PID)
-			if errors.Is(err, os.ErrNotExist) || err == nil && start != record.Holder.StartTime {
-				return
+			path, err := RecordPath(directory, record.CheckpointID)
+			if err == nil {
+				recovery, re := RecoverMemoryRelease(context.Background(), path, record)
+				if re == nil && (recovery.Record.RAMReleased || recovery.ProducerExited) {
+					return
+				}
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			c, err := dialHolder(ctx, record.Holder)
@@ -437,11 +483,18 @@ func (t *TopBacking) Close() error {
 }
 
 func dialHolder(ctx context.Context, id HolderIdentity) (*net.UnixConn, error) {
-	dir, err := os.Open(filepath.Dir(id.SocketPath))
+	dir, err := openDirectory(id.Directory.Path)
 	if err != nil {
 		return nil, err
 	}
 	defer dir.Close()
+	if err := verifyDirectory(dir, id.Directory); err != nil {
+		return nil, err
+	}
+	marker, err := readHolderMarker(dir)
+	if err != nil || marker.Holder != id {
+		return nil, errors.Join(errors.New("memory checkpoint: holder marker identity mismatch"), err)
+	}
 	address := fmt.Sprintf("/proc/self/fd/%d/%s", dir.Fd(), filepath.Base(id.SocketPath))
 	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", address)
 	if err != nil {

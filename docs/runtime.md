@@ -585,11 +585,20 @@ the corresponding memory reservation until the backing is released; runtime
 retirement is not memory-resource release.
 
 Restore and publication can read the frozen read-only memfd while the file is
-being written. Each reader switches to the published local carrier and closes
-its RAM descriptor before acknowledging release. The new VM always has its own
-writable memfd. The socket lives under
-`RunDir/memory-holders/<memoryID>/<epoch>/m.sock`; a mutable checkpoint record
-locates that exact producer. Normal runtime cleanup preserves this namespace.
+being written. Each transfer carries the memfd and its RAM lifetime pin together
+in one SCM_RIGHTS message. A reader switches to the published local carrier,
+finishes in-flight reads, closes its RAM FD/mappings, and then closes the pin.
+It never explicitly unlocks the shared pin. The new VM always has its own writable
+memfd. File readers and acknowledgement retries retain only ordinary GC protection.
+
+The socket lives in an exclusively created sibling of the canonical RunDir,
+`RunRoot/.km-<identity-hash>-<random>/m.sock`. The short prefix does not append
+PathID. The durable capture record binds its absolute directory path, device/inode,
+immutable identity marker and directory lock. Normal runtime cleanup completely
+removes RunDir. Holder cleanup removes only its verified generation directory;
+it never visits a successor RunDir or a parent directory. Creating the sibling
+requires write permission on the RunDir parent; preparation fails before commit
+if that permission is absent. It does not fall back to the runtime directory.
 If memory readers still pin the checkpoint, managed cleanup defers its garbage
 collection and completes ordinary runtime cleanup. This does not wait for the
 save or weaken reader protection; see [selective cleanup](artifacts.md#checkpoint-history).
@@ -600,15 +609,22 @@ default, before freezing or changing its running state. The CLI option
 `--no-wait-for-previous-memory-save` and SDK request field
 `NoWaitForPreviousMemorySave` reject the request while it is pending. Cancelling
 this wait leaves the runtime running and does not cancel the previous save.
-The full pause duration includes this admission wait.
+The full pause duration includes this admission wait. If the exact producer has
+exited without publishing a file while RAM readers remain, a default wait reports
+that the previous save is unavailable without entering pausing. It keeps observing
+the physical obligation. Once RAMReleased is confirmed, an older lost source or
+SaveError does not block a runtime restored from another intact checkpoint.
 
 `Runtime.Wait` and `Close` still end ordinary runtime ownership, including
 borrowed storage. A process embedding the SDK must remain alive until
 `Runtime.WaitMemorySave` completes when it has produced a local checkpoint;
 this also joins any final capture response before process exit, even if the
 memory save finishes immediately. Executable adapters do this automatically.
-The holder owns its read-only FD and
-local writer independently of the runtime's fetch clients.
+`PrepareHolder` owns the read-only FD, record writer, checkpoint GC pin, RAM pin,
+directory guard and local encoding job independently of the runtime's fetch
+clients. Preparation consumes the FD on success or failure. A failed precommit
+abort closes RAM and the service immediately; only the record writer and GC pin
+may remain until the abort metadata is durable.
 
 Ordinary captures, runtimes without checkpoint support, same-VM `--resume`,
 disk-only export, and explicit portable Bundle output retain their existing
@@ -625,6 +641,23 @@ because its caller disconnected. A retirement publication or resource-confirmati
 failure returns an error within the control operation's cleanup budget while
 the committed holder continues in the background. An uncommitted abort closes
 its provisional memory FD even if its metadata publication needs a retry.
+Normal completion and `RecoverMemoryRelease` both require an exclusive lock on
+the original record-bound RAM-pin inode after all producer, reader and queued
+SCM_RIGHTS references close. The recovery helper additionally requires exact
+producer exit, the existing stable record-writer lock, and a committed, retired
+runtime. Missing/replaced proof inodes, unknown process identity and corrupt
+records cannot authorize release; neither recovery nor explicit discard creates
+a replacement proof. Resource settlement consumes the published RAMReleased fact. Capture records and
+stable proof locks remain until terminal BaseDir deletion, including aborted
+preparations, so graph GC cannot remove an outstanding resource-acknowledgement
+proof. Only these small metadata files accumulate with capture count; unreferenced
+payloads and map/carrier files are still collected.
+
+RAMReleased is independent of FileReady. A committed, retired capture with
+RAMReleased and no FileReady is a lost snapshot, never an automatically invented
+payload or Discarded operation. Restore/publication of that source reports an
+explicit error. A published file remains usable after producer death, and active
+readers can switch without receiving an acknowledgement from the old process.
 Before downgrading, finish pending saves and
 publish local descriptors as ordinary portable snapshots. Old readers do not
 understand the local descriptor profile.

@@ -1619,9 +1619,8 @@ func handleSnapshotRequest(
 	var history *memoryHistory
 	var memoryParents []string
 	if save != nil {
-		var external []string
-		memoryParents, external, err = checkpointMemoryParents(ctx, opts)
-		history = &memoryHistory{refs: external}
+		memoryParents = save.parents
+		history = &memoryHistory{refs: save.external}
 	} else {
 		history, err = prepareMemoryHistory(ctx, opts, mergeRef, uint64(mfd.Size()))
 	}

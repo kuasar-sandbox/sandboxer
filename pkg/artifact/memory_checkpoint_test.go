@@ -81,7 +81,7 @@ func writeLocalMemory(t *testing.T, directory, id, eRef string, parents, suffix 
 		Producer: memorycheckpoint.RunIdentity{SandboxID: "sid", InstanceID: "instance", RunID: "run-" + id}, CheckpointID: id,
 		MemoryID: descriptor.MemoryID, Epoch: 1, SnapshotRef: ref, SandboxRef: eRef, PayloadRef: payloadRef,
 		Committed: true, RuntimeRetired: true, FileReady: true, RAMReleased: true,
-		Holder: memorycheckpoint.HolderIdentity{PID: os.Getpid(), StartTime: start, SocketPath: filepath.Join(directory, "unused.socket")}}
+		Holder: fixtureMemoryHolder(t, directory, id, start)}
 	writer, err := memorycheckpoint.CreateRecord(directory, record)
 	if err != nil {
 		t.Fatal(err)
@@ -312,7 +312,7 @@ func TestMemoryCheckpointKeepGraphAndReaderPin(t *testing.T) {
 	}
 }
 
-func TestMemoryCheckpointKeepRecordsUsesOriginalCheckpointID(t *testing.T) {
+func TestMemoryCheckpointKeepsRecoveryRecordsWithOriginalCheckpointID(t *testing.T) {
 	fixture := newMemoryCheckpointFixture(t)
 	start, err := memorycheckpoint.ProcessStartTime(os.Getpid())
 	if err != nil {
@@ -323,7 +323,7 @@ func TestMemoryCheckpointKeepRecordsUsesOriginalCheckpointID(t *testing.T) {
 		writer, err := memorycheckpoint.CreateRecord(fixture.directory, memorycheckpoint.CaptureRecord{
 			Version: memorycheckpoint.Version, Producer: memorycheckpoint.RunIdentity{SandboxID: "sid"},
 			CheckpointID: id, MemoryID: memoryID, Epoch: 1, Aborted: true,
-			Holder: memorycheckpoint.HolderIdentity{PID: os.Getpid(), StartTime: start, SocketPath: filepath.Join(fixture.directory, "unused.socket")},
+			Holder: fixtureMemoryHolder(t, fixture.directory, id, start),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -353,10 +353,7 @@ func TestMemoryCheckpointKeepRecordsUsesOriginalCheckpointID(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(obsolete); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("obsolete UTF-8 checkpoint record survived: %v", err)
-	}
-	for _, kept := range []string{current, unknown, obsolete + ".lock"} {
+	for _, kept := range []string{obsolete, current, unknown, obsolete + ".lock", obsolete + ".ram.lock"} {
 		if _, err := os.Stat(kept); err != nil {
 			t.Fatalf("retained/unknown/stable-lock file was deleted: %s: %v", kept, err)
 		}
@@ -367,7 +364,69 @@ func TestMemoryCheckpointKeepRecordsUsesOriginalCheckpointID(t *testing.T) {
 	}
 }
 
-func TestMemoryCheckpointAsMemoryLowerExpandsPortableHistory(t *testing.T) {
+func TestMemoryCheckpointGCKeepsReleasedProofOutsideSourceGraph(t *testing.T) {
+	fixture := newMemoryCheckpointFixture(t)
+	_, orphanPath, orphan := writeLocalMemory(t, fixture.directory, "released-awaiting-resource-ack", fixture.eRef, nil, nil, "zzzzzz", 0x3f, 0x3f, 0, false)
+	old, err := memorycheckpoint.ReadRecord(fixture.directory, orphan.CheckpointID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPath, err := memorycheckpoint.RecordPath(fixture.directory, old.CheckpointID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(oldPath + ".ram.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The prior RAMReleased fact may still await receipt settlement. A new
+	// preparation replaces current-memory.json but then aborts, and the chosen
+	// intact source does not reference the prior capture at all.
+	next, err := memorycheckpoint.CreateRecord(fixture.directory, memorycheckpoint.CaptureRecord{
+		Version: memorycheckpoint.Version, Producer: old.Producer,
+		CheckpointID: "new-aborted", MemoryID: "new-memory", Epoch: 1, Aborted: true,
+		Holder: fixtureMemoryHolder(t, fixture.directory, "new-aborted", old.Holder.StartTime),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{Directory: fixture.directory, SandboxID: "sid", SnapshotRef: fixture.ref, SandboxRef: fixture.eRef}); err != nil {
+		t.Fatal(err)
+	}
+	proof, err := memorycheckpoint.ReadCaptureRecord(oldPath)
+	if err != nil || *proof != *old || !proof.RAMReleased {
+		t.Fatalf("GC erased exact unsettled release evidence: %+v %v", proof, err)
+	}
+	if current, err := memorycheckpoint.ReadCurrent(fixture.directory); err != nil || !current.Aborted || current.MemoryID != "new-memory" {
+		t.Fatalf("new abort evidence=%+v %v", current, err)
+	}
+	after, err := os.Stat(oldPath + ".ram.lock")
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("GC replaced the original RAM proof inode: %v", err)
+	}
+	if _, err := os.Stat(oldPath + ".lock"); err != nil {
+		t.Fatalf("writer proof removed: %v", err)
+	}
+	if _, err := os.Stat(orphanPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unreferenced descriptor carrier was kept by metadata retention: %v", err)
+	}
+	payload, err := manifest.ParseRef(old.PayloadRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadPath := payload.Path
+	if !filepath.IsAbs(payloadPath) {
+		payloadPath = filepath.Join(fixture.directory, payloadPath)
+	}
+	if _, err := os.Stat(payloadPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unreferenced payload was kept by metadata retention: %v", err)
+	}
+}
+
+func TestMemoryCheckpointAsMemoryLowerKeepsOnePortableSlot(t *testing.T) {
 	for _, method := range []string{"publish", "rewrite", "located-publish", "located-rewrite", "located-historical-publish"} {
 		t.Run(method, func(t *testing.T) {
 			rewrite := strings.Contains(method, "rewrite")
@@ -438,16 +497,19 @@ func TestMemoryCheckpointAsMemoryLowerExpandsPortableHistory(t *testing.T) {
 			}
 			defer root.Close()
 			cfg, err := snapshot.ParseConfig(root.SnapshotConfig)
-			if err != nil || len(cfg.FromRefs) != 3 {
-				t.Fatalf("portable lower graph did not expand W/H: %+v, %v", cfg, err)
+			if err != nil || len(cfg.FromRefs) != 2 {
+				t.Fatalf("portable lower graph changed the outer reference budget: %+v, %v", cfg, err)
 			}
 			var sources = []sparse.Source{root.Memory}
-			for _, ref := range cfg.FromRefs {
+			for i, ref := range cfg.FromRefs {
 				parent, err := snapshotfile.Open(ctx, rewriteOpen(t, publisher, ref))
 				if err != nil {
 					t.Fatal(err)
 				}
 				defer parent.Close()
+				if i == 0 && (len(parent.MemoryDirty) != snapshotfile.DirtyHeaderSize+1 || parent.MemoryDirty[snapshotfile.DirtyHeaderSize] != 0x17) {
+					t.Fatalf("portable lower lost the top/history dirty union: %x", parent.MemoryDirty)
+				}
 				sources = append(sources, parent.Memory)
 			}
 			assertMemoryPages(t, layerMemorySources(sources...), "DDZDZD", "bc\x00x\x00q")

@@ -46,11 +46,6 @@ type rewriteValue struct {
 	imageConfig []byte
 	forceWrite  bool
 	published   string
-	// A node-local memory layer expands into W and H when used as a lower.
-	// payload remains their complete view for replacement/reduction proofs.
-	split         []*rewriteValue
-	memoryRoot    *snapshotfile.Root
-	memoryHistory []*rewriteValue
 }
 type rewriteChain struct {
 	values    []*rewriteValue
@@ -165,17 +160,29 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 		return result, errors.Join(eerr, err)
 	}
 	plan.closes = append(plan.closes, sroot.FullStream.Close)
-	if sroot.LocalCheckpoint != nil {
-		materialized, cleanup, err := plan.p.materializeMemoryCheckpointRoot(ctx, sroot)
-		if err != nil {
-			return result, err
-		}
-		plan.closes = append(plan.closes, cleanup, materialized.Close)
-		sroot = materialized
-	}
 	scfg, err := readRewriteSnapshot(sroot)
 	if err != nil {
 		return result, err
+	}
+	if sroot.LocalCheckpoint != nil {
+		// An explicit root reduction consumes the complete local view plus
+		// its original external suffix. Do not first split W/H: that would
+		// require a 65th slot before reduction can repair a 64-parent root.
+		// Ordinary publication/rewrite retains the top working set's own
+		// coverage and the separate all-dirty historical layer.
+		_, reducing := plan.rules.reduction(raw, len(scfg.FromRefs) != 0)
+		if !reducing {
+			materialized, cleanup, err := plan.p.materializeMemoryCheckpointRoot(ctx, sroot)
+			if err != nil {
+				return result, err
+			}
+			plan.closes = append(plan.closes, cleanup, materialized.Close)
+			sroot = materialized
+			scfg, err = readRewriteSnapshot(sroot)
+			if err != nil {
+				return result, err
+			}
+		}
 	}
 	oldE := scfg.SandboxRef
 	plan.p.original(oldE, child)
@@ -361,37 +368,14 @@ func (p *publicationRewrite) openValue(ctx context.Context, raw string, scope pu
 		}
 		out.payload, out.source, out.role = root.Memory, root.FullStream, RoleSnapshot
 		if root.LocalCheckpoint != nil {
-			// An explicit reduction target is one complete view and, like an
-			// ordinary reduction, conservatively labels all explicit bytes dirty.
-			out.source, err = snapshotfile.BuildSource(root.Memory, root.ConfigJSON, root.StateJSON, root.SnapshotConfig)
+			// A lower/import occupies one external slot even when its local
+			// representation has internal history. Keep the exact visible
+			// values and dirty union, as on ordinary publication/import.
+			out.source, err = PortableMemoryLayer(ctx, root)
 			if err != nil {
 				return nil, err
 			}
 			out.forceWrite = true
-			materialized, cleanup, err := p.p.materializeMemoryCheckpointRoot(ctx, root)
-			if err != nil {
-				return nil, err
-			}
-			p.closes = append(p.closes, cleanup, materialized.Close)
-			top := &rewriteValue{raw: raw, scope: child, use: use, forceWrite: true,
-				payload: materialized.Memory, source: materialized.FullStream, role: RoleSnapshot, memoryRoot: materialized}
-			out.split = []*rewriteValue{top}
-			original, err := snapshot.ParseConfig(root.SnapshotConfig)
-			if err != nil {
-				return nil, err
-			}
-			converted, err := snapshot.ParseConfig(materialized.SnapshotConfig)
-			if err != nil {
-				return nil, err
-			}
-			if len(converted.FromRefs) > len(original.FromRefs) {
-				history, err := p.openValue(ctx, converted.FromRefs[0], child, rewriteMemory)
-				if err != nil {
-					return nil, err
-				}
-				top.memoryHistory = []*rewriteValue{history}
-				out.split = append(out.split, history)
-			}
 		}
 		return out, nil
 	}
@@ -504,7 +488,6 @@ func (p *publicationRewrite) chain(ctx context.Context, selector string, base *s
 		}
 	}
 	chain.values = append(chain.values, top)
-	expandedRefs := make([]string, 0, len(*lowers))
 	for _, raw := range *lowers {
 		value, err := p.changedValue(ctx, raw, scope, use, apply)
 		if err != nil {
@@ -513,16 +496,7 @@ func (p *publicationRewrite) chain(ctx context.Context, selector string, base *s
 		if value.payload.Size() > top.payload.Size() || use != rewritePureDisk && value.payload.Size() != top.payload.Size() {
 			return nil, fmt.Errorf("layer capacity differs for %s: %d != %d", raw, value.payload.Size(), top.payload.Size())
 		}
-		if len(value.split) != 0 {
-			chain.values = append(chain.values, value.split...)
-			expandedRefs = append(expandedRefs, raw)
-			for _, extra := range value.split[1:] {
-				expandedRefs = append(expandedRefs, extra.raw)
-			}
-		} else {
-			chain.values = append(chain.values, value)
-			expandedRefs = append(expandedRefs, raw)
-		}
+		chain.values = append(chain.values, value)
 	}
 	chain.source = layeredRewriteValues(chain.values)
 	if chain.reduced && target != "" {
@@ -556,10 +530,6 @@ func (p *publicationRewrite) chain(ctx context.Context, selector string, base *s
 		*lowers = nil
 	} else if err := chain.validateReferencePositions(); err != nil {
 		return nil, err
-	} else {
-		// Local internal memory history becomes explicit portable positions.
-		// Existing positions keep their original valid spelling until emission.
-		*lowers = expandedRefs
 	}
 
 	return chain, nil
@@ -613,27 +583,6 @@ func (p *publicationRewrite) emitValue(ctx context.Context, value *rewriteValue)
 		return value.raw, nil
 	}
 	var err error
-	if value.memoryRoot != nil && len(value.memoryHistory) != 0 {
-		cfg, err := snapshot.ParseConfig(value.memoryRoot.SnapshotConfig)
-		if err != nil {
-			return "", err
-		}
-		for i, history := range value.memoryHistory {
-			if history.published == "" {
-				return "", errors.New("memory history was not published before working set")
-			}
-			cfg.FromRefs[i] = history.published
-		}
-		encoded, err := snapshot.MarshalConfig(cfg)
-		if err != nil {
-			return "", err
-		}
-		value.source, err = snapshotfile.BuildSourceWithDirty(value.memoryRoot.Memory, value.memoryRoot.ConfigJSON,
-			value.memoryRoot.StateJSON, encoded, value.memoryRoot.MemoryDirty)
-		if err != nil {
-			return "", err
-		}
-	}
 	ref, err = p.p.target.Put(ctx, value.role, value.source)
 	if err == nil {
 		value.published = ref

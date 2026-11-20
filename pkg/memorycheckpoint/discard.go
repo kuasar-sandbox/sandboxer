@@ -32,12 +32,12 @@ func DiscardCapture(ctx context.Context, directory string, producer RunIdentity,
 	if r.RAMReleased {
 		return r, nil
 	}
-	start, err := ProcessStartTime(r.Holder.PID)
-	if err == nil && start == r.Holder.StartTime {
-		return nil, errors.New("memory checkpoint: discard requires producer fencing")
+	exited, err := producerExited(r.Holder)
+	if err != nil {
+		return nil, err
 	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("memory checkpoint: producer death unknown: %w", err)
+	if !exited {
+		return nil, errors.New("memory checkpoint: discard requires producer fencing")
 	}
 	pin, err := os.OpenFile(filepath.Join(directory, ".memory-readers.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
@@ -47,7 +47,7 @@ func DiscardCapture(ctx context.Context, directory string, producer RunIdentity,
 	if err := unix.Flock(int(pin.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("memory checkpoint: readers remain: %w", err)
 	}
-	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	lock, err := os.OpenFile(path+".lock", os.O_RDWR|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -59,8 +59,16 @@ func DiscardCapture(ctx context.Context, directory string, producer RunIdentity,
 	if err != nil {
 		return nil, err
 	}
-	if latest.Producer != r.Producer || latest.MemoryID != r.MemoryID || latest.Epoch != r.Epoch {
+	if !sameCaptureIdentity(*latest, *r) {
 		return nil, errors.New("memory checkpoint: discard generation changed")
+	}
+	ram, err := openRAMPin(path, latest.Holder.RAMLock, unix.LOCK_EX)
+	if err != nil {
+		return nil, fmt.Errorf("memory checkpoint: discard RAM proof: %w", err)
+	}
+	defer ram.Close()
+	if exited, err := producerExited(latest.Holder); err != nil || !exited {
+		return nil, errors.Join(errors.New("memory checkpoint: discard producer state changed"), err)
 	}
 	w := &RecordWriter{path: path, lock: lock, record: *latest}
 	if err := w.Update(func(r *CaptureRecord) { r.Discarded = true; r.RuntimeRetired = true; r.RAMReleased = true }); err != nil {

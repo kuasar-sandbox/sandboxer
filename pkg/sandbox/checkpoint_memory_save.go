@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -28,8 +27,9 @@ type checkpointMemorySave struct {
 	holder    *memorycheckpoint.Holder
 	hooks     *resctl.ControllerHooks
 	retention resource.CaptureRetention
+	parents   []string
+	external  []string
 	dump      func(context.Context, io.ReaderAt) (string, error)
-	pin       *os.File
 	logf      func(string, ...any)
 }
 
@@ -59,16 +59,16 @@ func prepareCheckpointMemorySave(ctx context.Context, req ctl.Request, opts RunO
 	if hooks != nil && hooks.Enabled() && !hooks.SupportsRetainedMemory() {
 		return nil, nil
 	}
+	parents, external, err := checkpointMemoryParents(ctx, opts, !req.MergeRefEnabled())
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: memory history: %w", err)
+	}
 	var id [8]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return nil, err
 	}
 	memoryID := hex.EncodeToString(id[:])
-	start, err := memorycheckpoint.ProcessStartTime(os.Getpid())
-	if err != nil {
-		return nil, err
-	}
-	r := memorycheckpoint.CaptureRecord{Version: memorycheckpoint.Version, Producer: memorycheckpoint.RunIdentity{SandboxID: opts.SandboxID}, CheckpointID: req.CheckpointID, MemoryID: memoryID, Epoch: 1, Holder: memorycheckpoint.HolderIdentity{PID: os.Getpid(), StartTime: start, SocketPath: filepath.Join(runDir, "memory-holders", memoryID, "1", "m.sock")}}
+	r := memorycheckpoint.CaptureRecord{Version: memorycheckpoint.Version, Producer: memorycheckpoint.RunIdentity{SandboxID: opts.SandboxID}, CheckpointID: req.CheckpointID, MemoryID: memoryID, Epoch: 1}
 	if opts.CurrentRun != nil {
 		r.Producer.InstanceID = opts.CurrentRun.InstanceID
 		r.Producer.RunID = opts.CurrentRun.RunID
@@ -76,29 +76,20 @@ func prepareCheckpointMemorySave(ctx context.Context, req ctl.Request, opts RunO
 	if req.HostRetirement != nil {
 		r.HostOperationID = req.HostRetirement.OperationID
 	}
-	pin, err := memorycheckpoint.PinDirectory(opts.checkpointDir)
-	if err != nil {
-		return nil, err
-	}
-	record, err := memorycheckpoint.CreateRecord(opts.checkpointDir, r)
-	if err != nil {
-		pin.Close()
-		return nil, err
-	}
 	fd, err := memorycheckpoint.ReadOnlyMemfd(mfd.FD())
 	if err != nil {
-		return nil, errors.Join(err, memorycheckpoint.AbortRecord(record, pin.Close, opts.memoryLogf))
+		return nil, err
 	}
-	holder, err := memorycheckpoint.NewHolder(record, fd, uint64(mfd.Size()), opts.memoryLogf)
+	holder, err := memorycheckpoint.PrepareHolder(opts.checkpointDir, runDir, r, fd, uint64(mfd.Size()), opts.memoryLogf)
 	if err != nil {
-		closeErr := fd.Close()
-		return nil, errors.Join(err, closeErr, memorycheckpoint.AbortRecord(record, pin.Close, opts.memoryLogf))
+		return nil, err
 	}
+	record := holder.Record()
 	op := r.HostOperationID
 	if op == "" {
 		op = r.CheckpointID
 	}
-	save := &checkpointMemorySave{holder: holder, hooks: hooks, pin: pin, logf: opts.memoryLogf, retention: resource.CaptureRetention{CapturePath: record.Path(), MemoryID: r.MemoryID, Epoch: r.Epoch, OperationID: op}}
+	save := &checkpointMemorySave{holder: holder, hooks: hooks, parents: parents, external: external, logf: opts.memoryLogf, retention: resource.CaptureRetention{CapturePath: record.Path(), MemoryID: r.MemoryID, Epoch: r.Epoch, OperationID: op}}
 	if hooks != nil && hooks.Enabled() {
 		if _, err := hooks.PrepareRetained(ctx, save.retention); err != nil {
 			return nil, errors.Join(err, save.abort())
@@ -111,7 +102,7 @@ func (s *checkpointMemorySave) abort() error {
 	if s == nil || s.holder.Record().Read().Committed {
 		return nil
 	}
-	err := s.holder.AbortWithCleanup(s.pin.Close)
+	err := s.holder.Abort()
 	if s.hooks != nil && s.hooks.Enabled() {
 		err = errors.Join(err, s.hooks.AbortRetained(context.Background(), s.retention))
 	}
@@ -262,7 +253,7 @@ func (s *checkpointMemorySave) finishRetirement(first chan<- error) {
 				return err
 			}
 		}
-		return s.pin.Close()
+		return nil
 	})
 	report(err)
 }
@@ -397,12 +388,13 @@ func (p *previousMemorySave) wait(ctx context.Context, noWait bool) (*memorychec
 		}
 		id := *p.record
 		p.mu.Unlock()
-		r, err := memorycheckpoint.ReadRecord(p.directory, id.CheckpointID)
+		result, err := memorycheckpoint.ObservePreviousSave(ctx, p.directory, id)
+		r := &result.Record
 		if err != nil {
-			return nil, err
-		}
-		if r.MemoryID != id.MemoryID || r.Epoch != id.Epoch {
-			return nil, errors.New("checkpoint memory: previous save identity changed")
+			if noWait && errors.Is(err, memorycheckpoint.ErrMemoryUnavailable) {
+				return r, ctl.ErrMemorySavePending
+			}
+			return r, err
 		}
 		if r.RAMReleased || r.Aborted {
 			p.mu.Lock()
@@ -451,7 +443,7 @@ func (h *SnapshotHandler) captureState(ctx context.Context, q ctl.CaptureStateQu
 	return state, err
 }
 
-func checkpointMemoryParents(ctx context.Context, opts RunOptions) (parents, external []string, err error) {
+func checkpointMemoryParents(ctx context.Context, opts RunOptions, working bool) (parents, external []string, err error) {
 	if opts.MemoryBinding == nil {
 		return nil, nil, nil
 	}
@@ -466,5 +458,17 @@ func checkpointMemoryParents(ctx context.Context, opts RunOptions) (parents, ext
 	} else {
 		external = append([]string(nil), all[len(parents):]...)
 	}
-	return parents, external, err
+	if err != nil {
+		return nil, nil, err
+	}
+	// A portable working-set root preserves this round's W above one dirty H.
+	// Reserve that H slot before preparing a holder or retaining resources;
+	// internal local parents must not hide an eventual from_refs overflow.
+	if working && len(parents) != 0 && len(external) >= snapshot.MaxMemoryFromRefs {
+		return nil, nil, fmt.Errorf("snapshot from_refs exceeds %d entries: working-set history requires one entry", snapshot.MaxMemoryFromRefs)
+	}
+	if err := validateProspectiveMemoryConfig(external); err != nil {
+		return nil, nil, err
+	}
+	return parents, external, nil
 }

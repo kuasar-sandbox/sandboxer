@@ -700,11 +700,37 @@ payload. `current-memory.json` locates the SID's latest obligation. Neither
 socket identity nor write progress changes the fixed S identity. Missing or
 inconsistent required records are errors, never an empty memory layer.
 
-The common artifact reader resolves this graph into one memory layer. Internal
-history is materialized at portable publication, never exposed as additional
-external `from_refs`. Dirty capture emits current changes plus eligible dirty
-history; working-set capture emits the current working set over compacted dirty
-history. Ordinary missing-`memory.dirty` compatibility remains unchanged.
+The record also binds the independent holder directory and the stable RAM-proof
+inode by device/inode. `<record path>.ram.lock` is distinct from the checkpoint
+GC lock. Capture JSON records (including aborted preparations) and their stable writer
+and RAM-proof locks remain until terminal BaseDir deletion. A newer current
+locator or an unreferenced source does not prove that a resource receipt has
+consumed the old release/abort fact. These small metadata files therefore grow
+with the number of captures; payloads, maps and carriers still follow graph GC. FileReady records can be read without a live holder. A committed, retired
+record with RAMReleased but no FileReady is a lost source: the common reader
+reports an explicit error while the SID's physical RAM obligation is complete.
+It never adopts an unpublished payload based on file existence alone.
+
+The common artifact reader exposes the node-local graph as one memory layer.
+Portable publication of an execution root preserves the capture semantics:
+dirty capture combines current changes with eligible dirty history; working-set
+capture retains only the current working set in top W and emits compacted dirty
+history as one H before the unchanged external `from_refs` suffix. This H uses
+one of the existing 64 parent slots. Fast capture validates that prospective
+configuration before holder preparation or guest freeze, as synchronous capture
+already does; W plus H plus 64 external parents is rejected without committing
+the capture or opening those external parents.
+
+When a node-local object is used as a memory lower/import, ordinary publication
+and rewrite instead emit one portable S with its complete visible values and
+dirty candidate union. That lower occupies exactly one external reference
+position, regardless of its internal history. It does not change the current
+execution root's working-set coverage. An explicit root reduction, including
+`--reduce-ref=any`, may read and merge the original external chain with the local
+view directly. This provides a repair path for an existing W/H object whose
+portable expansion would exceed 64 entries; ordinary publication continues to
+report the capacity error. Ordinary missing-`memory.dirty` compatibility remains
+unchanged.
 Portable publication, rewrite and Bundle paths materialize a standard S and do
 not copy the descriptor as if it contained memory. Older readers reject the
 local profile; the new reader continues to accept ordinary snapshots.

@@ -115,7 +115,6 @@ func TestFrozenCaptureResponseProcess(t *testing.T) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	record := memorySaveRecord(t, directory)
 	m, err := memory.Create("capture-response", 4096)
 	if err != nil {
 		fail(err)
@@ -124,10 +123,8 @@ func TestFrozenCaptureResponseProcess(t *testing.T) {
 	if err != nil {
 		fail(err)
 	}
-	holder, err := memorycheckpoint.NewHolder(record, fd, 4096, nil)
-	if err != nil {
-		fail(err)
-	}
+	holder := prepareMemorySaveHolder(t, directory, fd)
+	record := holder.Record()
 	if err := m.Close(); err != nil {
 		fail(err)
 	}

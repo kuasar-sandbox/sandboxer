@@ -63,7 +63,6 @@ type checkpointKeep struct {
 	diffVersions    map[string]map[string]bool
 	memoryVisited   map[string]bool
 	memoryActive    map[string]bool
-	memoryRecords   map[string]bool
 }
 
 // retain resolves the physical source BEFORE comparing basenames. Memory and
@@ -416,11 +415,6 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 			if err := k.retainMemoryRoot(ctx, current.SnapshotRef, publishScope{relativeDir: dir, fetcher: s.Fetcher()}); err != nil {
 				return fmt.Errorf("current memory keep plan: %w", err)
 			}
-		} else {
-			if k.memoryRecords == nil {
-				k.memoryRecords = make(map[string]bool)
-			}
-			k.memoryRecords[current.CheckpointID] = true
 		}
 	} else if !os.IsNotExist(err) {
 		return err
@@ -518,7 +512,11 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 			}
 		}
 		if len(entries) == 0 {
-			return k.cleanupMemoryRecords(ctx, fd)
+			// Capture records and their stable proof locks outlive graph GC.
+			// A released or aborted record may still settle an unacknowledged
+			// resource receipt after a newer capture replaced the SID locator.
+			// Only terminal BaseDir destruction collects that recovery evidence.
+			return nil
 		}
 	}
 }

@@ -696,33 +696,15 @@ func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope pu
 		return nil, errors.New("memory Snapshot snapshot.cfg is not canonical")
 	}
 	if root.LocalCheckpoint != nil {
-		materialized, cleanup, err := p.materializeMemoryCheckpointRoot(ctx, root)
+		// A memory lower is one logical reference position. Preserve its
+		// visible values and dirty union without exposing internal W/H as
+		// extra entries in the caller's bounded external parent list.
+		portable, err := PortableMemoryLayer(ctx, root)
 		if err != nil {
 			return nil, err
 		}
-		defer func() { retErr = errors.Join(retErr, materialized.Close(), cleanup()) }()
-		converted, err := snapshot.ParseConfig(materialized.SnapshotConfig)
-		if err != nil {
-			return nil, err
-		}
-		var historyRefs []string
-		if len(converted.FromRefs) > len(cfg.FromRefs) {
-			historyRefs, err = p.publishMemoryLayer(ctx, converted.FromRefs[0], child)
-			if err != nil {
-				return nil, err
-			}
-			converted.FromRefs = append(append([]string(nil), historyRefs...), cfg.FromRefs...)
-		}
-		encoded, err := snapshot.MarshalConfig(converted)
-		if err != nil {
-			return nil, err
-		}
-		source, err := snapshotfile.BuildSourceWithDirty(materialized.Memory, materialized.ConfigJSON, materialized.StateJSON, encoded, materialized.MemoryDirty)
-		if err != nil {
-			return nil, err
-		}
-		ref, err := p.target.Put(ctx, RoleSnapshot, source)
-		return append([]string{ref}, historyRefs...), err
+		ref, err := p.target.Put(ctx, RoleSnapshot, portable)
+		return []string{ref}, err
 	}
 	ref, err := p.target.Put(ctx, RoleSnapshot, root.FullStream)
 	return []string{ref}, err

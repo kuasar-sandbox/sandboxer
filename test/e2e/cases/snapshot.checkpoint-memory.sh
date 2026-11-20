@@ -152,12 +152,19 @@ FIRST_RUN=$RUN_PID
 capture first
 S_FIRST="$(snapshot_path first)"
 # Success must precede this round's payload publication, but follow retirement.
-python3 - "$CP_DIR" "$S_FIRST" "$OUT/first-record.json" <<'PY'
-import hashlib,json,pathlib,sys,tarfile,zipfile
+python3 - "$CP_DIR" "$S_FIRST" "$OUT/first-record.json" "$RUN_ROOT/$PATH_ID" <<'PY'
+import hashlib,json,os,pathlib,stat,sys,tarfile,zipfile
 root=pathlib.Path(sys.argv[1]); loc=json.loads((root/'current-memory.json').read_text())
 r=json.loads((root/'memory'/(hashlib.sha256(loc['checkpoint_id'].encode()).hexdigest()+'.json')).read_text())
 assert r['committed'] and r['runtime_retired'] and not r['file_ready'] and not r['ram_released'], r
-assert pathlib.Path(r['holder']['socket_path']).is_socket(), r
+run=pathlib.Path(sys.argv[4])
+assert not os.path.lexists(run), ('ordinary RunDir survived pause', run)
+holder=r['holder']; service=pathlib.Path(holder['directory']['path'])
+assert service.parent.resolve()==run.parent.resolve() and service!=run, (service,run)
+st=service.lstat()
+assert stat.S_ISDIR(st.st_mode) and (st.st_dev,st.st_ino)==(holder['directory']['device'],holder['directory']['inode']), holder
+assert pathlib.Path(holder['socket_path'])==service/'m.sock' and pathlib.Path(holder['socket_path']).is_socket(), holder
+assert json.loads((service/'identity.json').read_text())['holder']==holder, holder
 json.dump(r,open(sys.argv[3],'w'))
 with tarfile.open(sys.argv[2]) as tar:
     members=[m for m in tar if m.isfile() and not m.name.startswith('.kuasar.')]
@@ -170,6 +177,12 @@ PY
 start resumed "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_FIRST" --enable-checkpoint
 SECOND_RUN=$RUN_PID
 check_memory resumed
+python3 - "$RUN_ROOT/$PATH_ID" "$SID" "$OUT/resumed-run-identity.json" <<'PY'
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1]); pid=run/(sys.argv[2]+'.pid')
+a,b=run.lstat(),pid.lstat()
+json.dump({'run':[a.st_dev,a.st_ino], 'pid_file':[b.st_dev,b.st_ino], 'pid':pid.read_text()},open(sys.argv[3],'w'))
+PY
 # A portable publisher must consume the frozen view while the disk is blocked.
 "$BIN/sandbox-ctl" publish --json --manifest-config "$WORK/publish.yaml" \
     --ref-location "fixture=file://$WORK" \
@@ -177,14 +190,11 @@ check_memory resumed
 if capture rejected --no-wait-for-previous-memory-save; then e2e_fail "no-wait captured a second pending generation"; fi
 assert_contains "$OUT/rejected.stderr" "previous checkpoint memory save is pending"
 guest /bin/true
-# Cancellation ends only the waiting request; it cannot capture later.
-set +e
+# The default request waits while the successor remains executable. Its
+# cancellation must finish before unblocking the dump, so the live successor
+# cannot be retired by a competing second capture during our directory check.
 timeout -k 2s 1 "$BIN/sandbox-ctl" snapshot --path-id "$PATH_ID" --run-root "$RUN_ROOT" \
-    --checkpoint cancelled --json >"$OUT/cancelled.json" 2>"$OUT/cancelled.stderr"
-CANCELLED_STATUS=$?
-set -e
-[ "$CANCELLED_STATUS" -eq 124 ] || e2e_fail "waiting capture was not cancellable: $CANCELLED_STATUS"
-capture second &
+    --checkpoint cancelled --json >"$OUT/cancelled.json" 2>"$OUT/cancelled.stderr" &
 WAIT_PID=$!
 REQUEST_PIDS+=("$WAIT_PID")
 sleep .2
@@ -197,12 +207,32 @@ loc=json.loads((root/'current-memory.json').read_text())
 assert loc['memory_id']==first['memory_id'], (loc,first)
 assert len(list((root/'memory').glob('*.json')))==1, 'waiting request created another holder'
 PY
+set +e
+wait "$WAIT_PID"
+CANCELLED_STATUS=$?
+set -e
+REQUEST_PIDS=()
+[ "$CANCELLED_STATUS" -eq 124 ] || e2e_fail "waiting capture was not cancellable: $CANCELLED_STATUS"
+guest /bin/true
 # The normal writer retries and publishes; the live restored reader switches
 # to that file even without another explicit restore or export request.
 mount -o remount,size=512m "$BASE_ROOT"
-wait "$WAIT_PID"
-REQUEST_PIDS=()
 wait "$FIRST_RUN"
+kill -0 "$SECOND_RUN" || e2e_fail "old holder completion stopped the live successor"
+python3 - "$RUN_ROOT/$PATH_ID" "$SID" "$OUT/resumed-run-identity.json" "$OUT/first-record.json" "$CP_DIR" <<'PY'
+import hashlib,json,os,pathlib,sys
+run=pathlib.Path(sys.argv[1]); pid=run/(sys.argv[2]+'.pid'); expected=json.load(open(sys.argv[3]))
+a,b=run.lstat(),pid.lstat()
+assert [a.st_dev,a.st_ino]==expected['run'] and [b.st_dev,b.st_ino]==expected['pid_file'], expected
+assert pid.read_text()==expected['pid'] and (run/'ctl.sock').is_socket(), expected
+original=json.load(open(sys.argv[4])); root=pathlib.Path(sys.argv[5])
+r=json.loads((root/'memory'/(hashlib.sha256(original['checkpoint_id'].encode()).hexdigest()+'.json')).read_text())
+assert r['file_ready'] and r['ram_released'], r
+assert not os.path.lexists(r['holder']['directory']['path']), r
+PY
+guest /bin/true
+check_memory resumed
+capture second
 wait "$SECOND_RUN"
 python3 - "$CP_DIR" "$OUT/first-record.json" <<'PY'
 import hashlib,json,pathlib,sys
