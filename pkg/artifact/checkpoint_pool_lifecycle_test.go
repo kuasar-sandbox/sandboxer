@@ -37,6 +37,13 @@ func TestCheckpointPoolAliasRetargetAfterSelection(t *testing.T) {
 		return ref, path
 	}
 	firstDir, secondDir := t.TempDir(), t.TempDir()
+	pin, err := memorycheckpoint.PinDirectory(firstDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pin.Close(); err != nil {
+		t.Fatal(err)
+	}
 	raw, first := save(firstDir, "original")
 	_, second := save(secondDir, "replaced")
 	alias := filepath.Join(t.TempDir(), "alias.image")
@@ -55,7 +62,7 @@ func TestCheckpointPoolAliasRetargetAfterSelection(t *testing.T) {
 		if physical != first {
 			return nil, fmt.Errorf("pool selected %q, want %q", physical, first)
 		}
-		if _, err := owner.pin(filepath.Dir(physical), false); err != nil {
+		if _, err := owner.pin(filepath.Dir(physical)); err != nil {
 			return nil, err
 		}
 		if err := os.Remove(alias); err != nil {
@@ -104,7 +111,7 @@ func TestCheckpointPoolHolderSwitchDuringGraphConstruction(t *testing.T) {
 	fixture := newMemoryCheckpointFixture(t)
 	owner := &memoryGraphOwner{pool: newCheckpointFilePool()}
 	defer owner.Close()
-	if _, err := owner.pin(fixture.directory, false); err != nil {
+	if _, err := owner.pin(fixture.directory); err != nil {
 		t.Fatal(err)
 	}
 	const directories = 48
@@ -120,6 +127,13 @@ func TestCheckpointPoolHolderSwitchDuringGraphConstruction(t *testing.T) {
 			nil, nil, "abcdef", 0x3f, 0x3f, 0, false)
 		parents[i] = parentCarrier{directory, path, ref, descriptor}
 		switched[i] = t.TempDir()
+		pin, err := memorycheckpoint.PinDirectory(switched[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pin.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	mem, err := memory.Create("pool-switch", localMemorySize)
 	if err != nil {
@@ -158,7 +172,7 @@ func TestCheckpointPoolHolderSwitchDuringGraphConstruction(t *testing.T) {
 	begin := make(chan struct{})
 	descriptor := fixture.descriptor
 	descriptor.CheckpointID, descriptor.MemoryID, descriptor.Parents = "live", "live-memory", nil
-	top, err := memorycheckpoint.OpenTop(ctx, descriptor, memorycheckpoint.OpenOptions{Directory: fixture.directory, DirectoryPinned: true,
+	top, err := memorycheckpoint.OpenTop(ctx, descriptor, memorycheckpoint.OpenOptions{Directory: fixture.directory, SkipDirectoryPin: true,
 		OpenFile: func(callCtx context.Context, raw string) (fetch.Stream, error) {
 			if raw == saved.PayloadRef {
 				close(entered)
@@ -170,7 +184,7 @@ func TestCheckpointPoolHolderSwitchDuringGraphConstruction(t *testing.T) {
 				// A real watcher callback registers source directories while
 				// the construction side below opens independent parent frames.
 				for _, directory := range switched {
-					if _, err := owner.pin(directory, false); err != nil {
+					if _, err := owner.pin(directory); err != nil {
 						return nil, err
 					}
 				}
@@ -181,7 +195,7 @@ func TestCheckpointPoolHolderSwitchDuringGraphConstruction(t *testing.T) {
 			}
 			return fixture.storage.openFile(callCtx, filepath.Join(fixture.directory, ref.Path), ref, nil, false,
 				func(physical string) (*checkpointFilePool, error) {
-					ok, err := owner.pin(filepath.Dir(physical), true)
+					ok, err := owner.pin(filepath.Dir(physical))
 					if err != nil || !ok {
 						return nil, err
 					}

@@ -19,11 +19,12 @@ import (
 )
 
 type OpenOptions struct {
-	// DirectoryPinned borrows a shared root-view GC pin. The caller keeps it
-	// until this backing and all its in-flight reads and switching have closed.
-	DirectoryPinned bool
-	Directory       string
-	OpenFile        func(context.Context, string) (fetch.Stream, error)
+	// SkipDirectoryPin leaves file lifetime protection to the caller. It must
+	// hold an existing directory GC pin or retain the original file FDs until
+	// this backing and all its in-flight reads and switching have closed.
+	SkipDirectoryPin bool
+	Directory        string
+	OpenFile         func(context.Context, string) (fetch.Stream, error)
 }
 
 type TopBacking struct {
@@ -161,7 +162,7 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 	}
 	var pin *os.File
 	var err error
-	if !opts.DirectoryPinned {
+	if !opts.SkipDirectoryPin {
 		pin, err = PinDirectory(opts.Directory)
 		if err != nil {
 			return nil, err

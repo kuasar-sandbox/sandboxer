@@ -49,32 +49,27 @@ func (g *memoryGraphOwner) Close() error {
 }
 
 // pin serializes registration with asynchronous RAM-to-file switch callbacks.
-// An ordinary external source without a GC lock retains its original open FD.
-func (g *memoryGraphOwner) pin(directory string, existingOnly bool) (bool, error) {
+// An external source without a pre-existing GC lock retains its original open
+// FD. Remember that decision even if another opener later creates a GC lock.
+func (g *memoryGraphOwner) pin(directory string) (bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.directories[directory] {
-		return true, nil
+	if pinned, seen := g.directories[directory]; seen {
+		return pinned, nil
 	}
-	var pin *os.File
-	var err error
-	if existingOnly {
-		pin, err = memorycheckpoint.PinExistingDirectory(directory)
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-	} else {
-		pin, err = memorycheckpoint.PinDirectory(directory)
-	}
-	if err != nil {
+	pin, err := memorycheckpoint.PinExistingDirectory(directory)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
 	if g.directories == nil {
 		g.directories = make(map[string]bool)
 	}
-	g.directories[directory] = true
-	g.pins = append(g.pins, pin)
-	return true, nil
+	pinned := err == nil
+	g.directories[directory] = pinned
+	if pinned {
+		g.pins = append(g.pins, pin)
+	}
+	return pinned, nil
 }
 
 type memoryOpenNode struct {
@@ -197,7 +192,7 @@ func (s *ProcessStorage) newMemoryOpenFrame(ctx context.Context, stream fetch.St
 		return nil, err
 	}
 	opts.LocalDirectory = directory
-	if _, err := owners.pin(directory, false); err != nil {
+	if _, err := owners.pin(directory); err != nil {
 		return nil, err
 	}
 	var metadata *snapshotfile.Metadata
@@ -227,14 +222,14 @@ func (s *ProcessStorage) newMemoryOpenFrame(ctx context.Context, stream fetch.St
 			return nil, err
 		}
 		return s.openFile(ctx, path, ref, opts.RefLocations, false, func(physical string) (*checkpointFilePool, error) {
-			pinned, err := owners.pin(filepath.Dir(physical), true)
+			pinned, err := owners.pin(filepath.Dir(physical))
 			if err != nil || !pinned {
 				return nil, err
 			}
 			return owners.pool, nil
 		})
 	}
-	backing, err := memorycheckpoint.OpenTop(ctx, *descriptor, memorycheckpoint.OpenOptions{Directory: directory, OpenFile: openFile, DirectoryPinned: true})
+	backing, err := memorycheckpoint.OpenTop(ctx, *descriptor, memorycheckpoint.OpenOptions{Directory: directory, OpenFile: openFile, SkipDirectoryPin: true})
 	if err != nil {
 		return nil, err
 	}

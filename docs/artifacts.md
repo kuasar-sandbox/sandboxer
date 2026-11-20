@@ -726,9 +726,11 @@ are preserved. No checkpoint-specific interval index is constructed.
 Each opened graph keeps at most eight physical carrier FDs in its checkpoint
 file pool, separate from existing tarstream/Bundle parser metadata. Reopening
 checks the original file identity. Pooling requires an existing directory GC
-pin; ordinary external sources keep their original FD/mmap ownership and remain
-readable after unlink. Closing joins file-switch readers, closes the pool, and
-then releases the directory pins.
+pin. Pool registration never creates that protection protocol: external sources,
+including LocalDescriptors without an existing lock, keep their original
+FD/mmap ownership and remain readable after unlink. A later-created lock does
+not change that graph's decision. Closing joins file-switch readers, closes the
+pool, and then releases the directory pins.
 Portable publication of an execution root preserves the capture semantics:
 dirty capture combines current changes with eligible dirty history; working-set
 capture retains only the current working set in top W and emits compacted dirty

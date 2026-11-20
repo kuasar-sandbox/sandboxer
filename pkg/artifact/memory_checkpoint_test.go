@@ -39,6 +39,12 @@ func checkpointPageBytes(values string) []byte {
 
 func writeLocalMemory(t *testing.T, directory, id, eRef string, parents, suffix []string, values string, materialized, dirty, released byte, workingSet bool) (string, string, memorycheckpoint.Descriptor) {
 	t.Helper()
+	// The real producer establishes GC protection before publishing a record.
+	pin, err := memorycheckpoint.PinDirectory(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pin.Close()
 	ctx := context.Background()
 	sink := snapshot.NewFileSink(directory, "sid", nil, false, nil)
 	defer sink.Close()
