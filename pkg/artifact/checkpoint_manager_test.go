@@ -208,3 +208,29 @@ func TestRuntimeMemoryRetentionDoesNotInventSandboxPair(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCheckpointListThenOpenRelativeDirectory(t *testing.T) {
+	f := newMemoryCheckpointFixture(t)
+	t.Chdir(filepath.Dir(f.directory))
+	directory := "./" + filepath.Base(f.directory)
+	refs, err := f.storage.ListCheckpoints(context.Background(), directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range refs {
+		if ref.MemoryID != f.descriptor.MemoryID {
+			continue
+		}
+		view, err := f.storage.OpenCheckpoint(context.Background(), directory, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer view.Close()
+		if view.Memory == nil || view.Disk != nil {
+			t.Fatal("wrong view type")
+		}
+		assertMemoryPages(t, view.Memory.Memory, "DDZDZD", "bc\x00x\x00x")
+		return
+	}
+	t.Fatal("committed memory checkpoint absent from unified listing")
+}

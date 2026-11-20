@@ -60,6 +60,10 @@ func (s *ProcessStorage) OpenCheckpoint(ctx context.Context, directory string, r
 	if err := validateCheckpointRef(ref); err != nil {
 		return nil, err
 	}
+	directory, err := filepath.Abs(directory)
+	if err != nil {
+		return nil, err
+	}
 	if ref.DiffID != "" {
 		view, err := s.openCheckpointVersion(ctx, directory, ref.ID, ref.DiffID)
 		if err != nil {
