@@ -8,6 +8,7 @@ import (
 	"net"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -22,6 +23,10 @@ func TestDeleteDiffCheckpointsKeepsExactBatches(t *testing.T) {
 	refs := make([]DiffCheckpointRef, 129)
 	for i := range refs {
 		refs[i] = DiffCheckpointRef{DiffID: "disk", ID: fmt.Sprintf("v%d", i)}
+		if i%2 == 1 {
+			refs[i].DiffID = ""
+			refs[i].MemoryID = "memory"
+		}
 	}
 	want := append([]DiffCheckpointRef(nil), refs...)
 	done := make(chan error, 1)
@@ -34,7 +39,7 @@ func TestDeleteDiffCheckpointsKeepsExactBatches(t *testing.T) {
 			}
 			var req Request
 			err = ReadMessage(conn, &req)
-			if err == nil && (req.Type != TypeCheckpointDeleteRequest || req.CheckpointOwner != "owner" ||
+			if err == nil && (req.Type != TypeCheckpointDeleteRequest || req.CheckpointOwner != "owner" || req.CheckpointSources == nil || req.CheckpointSources.Retain == nil ||
 				!reflect.DeepEqual(req.CheckpointRefs, want[batch*128:min((batch+1)*128, len(want))])) {
 				err = fmt.Errorf("unexpected batch %d: %+v", batch, req)
 			}
@@ -54,7 +59,7 @@ func TestDeleteDiffCheckpointsKeepsExactBatches(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := DeleteDiffCheckpoints(ctx, path, "owner", refs); err != nil {
+	if err := DeleteDiffCheckpoints(ctx, path, "owner", refs, CheckpointSources{Retain: []CheckpointSource{}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-done; err != nil {
@@ -149,5 +154,25 @@ func TestCheckpointOldOwnerCannotRemoveNewRoute(t *testing.T) {
 	}
 	if err := RemoveCheckpointOwner(dir, current); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCheckpointManagementV2PreservesBothBackendsAndSources(t *testing.T) {
+	refs := []CheckpointRef{{ID: "same", DiffID: "disk"}, {ID: "same", MemoryID: "memory"}}
+	var wire bytes.Buffer
+	if err := WriteCheckpointList(&wire, refs); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadCheckpointList(&wire)
+	if err != nil || !reflect.DeepEqual(got, refs) {
+		t.Fatalf("mixed list: %v %v", got, err)
+	}
+	if err := DeleteCheckpoints(context.Background(), "missing.sock", "", refs, CheckpointSources{}); err == nil || !strings.Contains(err.Error(), "complete retention") {
+		t.Fatal("omitted roots reached transport", err)
+	}
+	for _, kind := range []string{TypeCheckpointListRequest, TypeCheckpointDeleteRequest} {
+		if err := CaptureError(Response{Type: TypeError, Msg: "unknown type: " + kind}); err == nil || errors.Is(err, ErrCheckpointUnsupported) {
+			t.Fatalf("old peer silently downgraded %s: %v", kind, err)
+		}
 	}
 }

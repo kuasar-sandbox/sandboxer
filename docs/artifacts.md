@@ -891,14 +891,14 @@ If a `from_refs` memory lower is a recorded node-local memory object, its exact
 carrier digest and inode identify the map, payload, capture record and internal
 parent graph to retain, including through a named location. Ordinary lowers stay
 opaque. A lower's historical execution, disk and external memory configuration
-does not add recursive dependencies. The independent current-memory root retains
-its own memory lowers even when the selected source is older or E-only.
+does not add recursive dependencies. `current-memory.json` is a latest-location
+hint, not a durable root. Recovery, accounting and GC enumerate every capture.
 
 Bundle candidate locations are resolved only when the existing selector visits
 that source: current Bundle first, then ordered refs, then remote. A current hit
 does not require unused locations. Unavailable candidates may fall through;
-malformed candidates and failures in a selected source remain errors. Explicit
-current S/E bindings and a complete keep plan are still required before deletion.
+malformed candidates and failures in a selected source remain errors. A complete keep plan is required; the current root may be empty or portable.
+Retained historical roots never become the current aliases.
 
 The checkpoint directory must resolve to itself without symbolic links in any
 path component, including its ancestors. Configure the sandbox base directory
@@ -923,8 +923,8 @@ unlink confined if paths race.
 
 A committed Pause remains successful if cleanup fails. If a memory reader pin
 prevents the exclusive collection lock, `CleanupCheckpoint` returns
-`artifact.ErrCheckpointMemoryReadersBusy` before changing aliases or deleting
-anything. The managed owner may defer this collection and finish ordinary paused
+`artifact.ErrCheckpointMemoryReadersBusy` after logical backend revocation;
+pinned physical files remain unchanged. The managed owner may defer this collection and finish ordinary paused
 runtime cleanup without waiting for the memory save. The holder-retirement worker
 retries collection after memory release and runner fencing while the sandbox is
 paused, including when its RunDir ownership has already been cleared.
@@ -940,6 +940,32 @@ retry ownership. The deferred-collection result does not authorize hard deletion
 or release of a memory holder. Ordinary Kill and terminal BuildBaseDir deletion
 retain their existing finalizers. Shared/external artifacts are never reclaimed
 by this step.
+
+`artifact.Checkpoint.Retain` must be an explicit complete set; nil means unknown
+and is rejected. Callers retain their external registry fence throughout the
+operation; DirectoryOwner alone cannot protect external registrations. Backends
+needed by descendants cannot be revoked. Durable parent publication and deletion
+share `.checkpoint-sources.lock` in every source directory, acquired in canonical
+path order. An existing reader permits continued reads, not new durable edges
+after revocation.
+
+A running instance adds its current disk E and its memory dependencies separately.
+Restoring an older disk version can materialize a new E while RAM still comes
+from the selected S; these are not a new S/E pair. Trusted `MemoryRefs` retain
+only the memory graph and never promote historical execution/disk configurations.
+
+CaptureRecord writes version 2 and reads/upgrades version 1; the fixed Descriptor
+remains version 1. Monotonic `Deleted` rejects new Open; existing typed views
+continue and may switch to completed files. Business lists omit uncommitted,
+Aborted and Deleted records; full inventory still serves settlement. Deleted is
+not RAMReleased; saved Deleted + FileReady + RAMReleased need not become Discarded.
+The live holder serializes Delete, Open/dual-FD sends, FileReady and cancellation.
+After RuntimeRetired it keeps the directory pin and memfd, drops only its RAM pin
+and attempts independent EX proof of the original inode/nonce. External references
+restore protection and saving; otherwise it cancels and joins the entire writer,
+closes RAM, then atomically publishes RAMReleased + Discarded. Late FileReady is
+forbidden. Cancellation needs no directory EX, so other holders cannot block it;
+ordinary GC later reclaims physical files.
 
 <a id="artifact-publication"></a>
 

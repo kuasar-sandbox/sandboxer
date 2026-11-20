@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -552,4 +553,64 @@ func memoryParentViewEqual(declared, actual []string) bool {
 		}
 	}
 	return true
+}
+
+func protectCaptureParents(ctx context.Context, opts RunOptions, memory bool) (io.Closer, error) {
+	if opts.checkpointDir == "" {
+		return nil, nil
+	}
+	storage, err := borrowRunStorage(opts)
+	if err != nil {
+		return nil, err
+	}
+	defer storage.Close()
+	source := artifact.Checkpoint{Directory: opts.checkpointDir, SandboxID: opts.SandboxID}
+	// A restored runtime also owns its immutable E graph. Checkpoint is a
+	// cold-layout hint, not evidence that the source has durable DIFF parents.
+	if opts.SourceBinding != nil {
+		source.SandboxRef = opts.SourceBinding.RuntimeRef
+		if source.SandboxRef == "" {
+			source.SandboxRef = opts.SourceBinding.SandboxRef
+		}
+	}
+	source.RefLocations = opts.RefLocations
+	var parents []string
+	if memory {
+		parents, err = memorySourceRefs(opts.MemoryBinding, opts.RefLocations)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return storage.ProtectCheckpointParents(ctx, source, parents)
+}
+
+// Memory provenance remains tied to the selected S even when restoring an
+// older disk version replaces the runtime E with materialized artifacts.
+func memorySourceRefs(b *MemorySourceBinding, locations config.RefLocations) ([]string, error) {
+	if b == nil {
+		return nil, nil
+	}
+	parents := prependRef(b.SnapshotRef, b.FromRefs)
+	if len(parents) != 0 && b.RuntimeRef != "" {
+		parents[0] = b.RuntimeRef
+	}
+	for i, raw := range parents {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return nil, err
+		}
+		if ref.Scheme == manifest.RefSchemeFile {
+			path, err := locations.ResolveFile(ref, b.RelativeDir)
+			if err != nil {
+				return nil, err
+			}
+			path, err = filepath.Abs(path)
+			if err != nil {
+				return nil, err
+			}
+			ref.Path, ref.Location = path, ""
+			parents[i] = ref.String()
+		}
+	}
+	return parents, nil
 }

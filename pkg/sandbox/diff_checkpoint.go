@@ -206,7 +206,7 @@ func (h *SnapshotHandler) startCheckpointMaintenance(ctx context.Context, owner 
 	return nil
 }
 
-func (h *SnapshotHandler) listDiffCheckpoints(ctx context.Context) ([]artifact.DiffCheckpointRef, error) {
+func (h *SnapshotHandler) listCheckpoints(ctx context.Context) ([]artifact.DiffCheckpointRef, error) {
 	if !h.EnableCheckpoint {
 		return nil, ctl.ErrCheckpointUnsupported
 	}
@@ -239,17 +239,17 @@ func (h *SnapshotHandler) listDiffCheckpoints(ctx context.Context) ([]artifact.D
 	if err := h.checkpointMaintenance.ListCheckpoints(ctx, appendRefs); err != nil {
 		return nil, err
 	}
-	return refs, nil
+	memory, err := artifact.MemoryCheckpointRefs(h.CheckpointDir)
+	if err != nil {
+		return nil, err
+	}
+	return append(refs, memory...), nil
 }
 
-func (h *SnapshotHandler) deleteDiffCheckpoints(ctx context.Context, refs []ctl.DiffCheckpointRef) error {
+func (h *SnapshotHandler) deleteDiskCheckpointVersions(ctx context.Context, refs []ctl.DiffCheckpointRef) error {
 	if !h.EnableCheckpoint {
 		return ctl.ErrCheckpointUnsupported
 	}
-	if err := h.capture.begin(); err != nil {
-		return err
-	}
-	defer h.capture.finish(false)
 	groups := map[string][]string{}
 	for _, r := range refs {
 		if r.DiffID == "" || strings.ContainsAny(r.DiffID, "/\\.") {
@@ -300,7 +300,10 @@ func (r *Runtime) ListCheckpoints(ctx context.Context) ([]artifact.DiffCheckpoin
 	}
 	return fn(ctx)
 }
-func (r *Runtime) DeleteCheckpoint(ctx context.Context, ref artifact.DiffCheckpointRef) error {
+func (r *Runtime) DeleteCheckpoint(ctx context.Context, ref artifact.CheckpointRef, sources ...ctl.CheckpointSources) error {
+	if len(sources) != 1 || sources[0].Retain == nil {
+		return errors.New("checkpoint deletion requires an explicit complete retention set")
+	}
 	if err := r.beginOperation(); err != nil {
 		return err
 	}
@@ -311,7 +314,7 @@ func (r *Runtime) DeleteCheckpoint(ctx context.Context, ref artifact.DiffCheckpo
 	if fn == nil {
 		return ctl.ErrCheckpointUnsupported
 	}
-	return fn(ctx, ref)
+	return fn(ctx, ref, sources[0])
 }
 
 func validateNamedCaptureGraph(id string, p *config.PortableSandboxConfig, parent string, merged []bool) error {
@@ -319,4 +322,47 @@ func validateNamedCaptureGraph(id string, p *config.PortableSandboxConfig, paren
 		return p.Validate()
 	}
 	return snapshot.ValidateExportGraph(p, parent, merged)
+}
+
+func (h *SnapshotHandler) deleteCheckpoints(ctx context.Context, refs []ctl.CheckpointRef, sources *ctl.CheckpointSources) (retErr error) {
+	if !h.EnableCheckpoint {
+		return ctl.ErrCheckpointUnsupported
+	}
+	if sources == nil || sources.Retain == nil {
+		return errors.New("checkpoint deletion requires an explicit complete retention set")
+	}
+	if err := h.capture.begin(); err != nil {
+		return err
+	}
+	defer h.capture.finish(false)
+	storage, err := borrowRunStorage(RunOptions{ManifestCfg: h.ManifestCfg, CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired, Fetcher: h.Fetcher})
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, storage.Close()) }()
+	c := artifact.Checkpoint{Directory: h.CheckpointDir, SandboxID: h.SandboxID, SnapshotRef: sources.SnapshotRef, SandboxRef: sources.SandboxRef, Retain: append([]artifact.CheckpointSource{}, sources.Retain...), RefLocations: config.RefLocations{}}
+	for name, path := range h.RefLocations {
+		c.RefLocations[name] = path
+	}
+	for name, path := range sources.RefLocations {
+		if old, ok := c.RefLocations[name]; ok && old != path {
+			return errors.New("checkpoint location differs from runtime binding")
+		}
+		c.RefLocations[name] = path
+	}
+	// The active runtime is itself a durable source root, independently of
+	// external user names. An untrusted maintenance request cannot omit it.
+	if h.SourceBinding != nil {
+		source := artifact.CheckpointSource{SandboxRef: h.SourceBinding.RuntimeRef}
+		if source.SandboxRef == "" {
+			source.SandboxRef = h.SourceBinding.SandboxRef
+		}
+
+		c.Retain = append(c.Retain, source)
+	}
+	c.MemoryRefs, err = memorySourceRefs(h.MemoryBinding, c.RefLocations)
+	if err != nil {
+		return err
+	}
+	return storage.DeleteCheckpoints(ctx, c, refs, h.deleteDiskCheckpointVersions)
 }

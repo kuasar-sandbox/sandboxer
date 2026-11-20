@@ -354,35 +354,41 @@ func HasRuntimeOwner(ctx context.Context) bool {
 	return ok
 }
 
-// PreviousCaptureRetention is selected by SID directory rather than the
-// chosen restore root. A completed record is also supplied: its resource ACK
-// or a previously prepared owner handoff may still need idempotent replay.
+// PreviousCaptureRetention scans every capture for a local inventory hint.
+// The node independently resolves all account entries; this does not select a
+// billing subset or depend on the requested restore root/current-memory hint.
 func PreviousCaptureRetention(directory, sid string) (*resource.CaptureRetention, error) {
-	r, err := memorycheckpoint.ReadCurrent(directory)
+	records, err := memorycheckpoint.ListRecords(directory)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if r.Producer.SandboxID != sid {
-		return nil, errors.New("checkpoint memory: retained sandbox identity mismatch")
+	var hint *resource.CaptureRetention
+	for _, r := range records {
+		if r.Producer.SandboxID != sid {
+			return nil, errors.New("checkpoint memory: retained sandbox identity mismatch")
+		}
+		if r.Aborted {
+			continue
+		}
+		if !r.Committed || !r.RuntimeRetired {
+			return nil, errors.New("checkpoint memory: previous runtime has not retired")
+		}
+		path, err := memorycheckpoint.RecordPath(directory, r.CheckpointID, r.MemoryID)
+		if err != nil {
+			return nil, err
+		}
+		op := r.HostOperationID
+		if op == "" {
+			op = r.CheckpointID
+		}
+		if hint == nil {
+			hint = &resource.CaptureRetention{CapturePath: path, MemoryID: r.MemoryID, Epoch: r.Epoch, OperationID: op}
+		}
 	}
-	if r.Aborted {
-		return nil, nil
-	}
-	if !r.Committed || !r.RuntimeRetired {
-		return nil, errors.New("checkpoint memory: previous runtime has not retired")
-	}
-	path, err := memorycheckpoint.RecordPath(directory, r.CheckpointID, r.MemoryID)
-	if err != nil {
-		return nil, err
-	}
-	op := r.HostOperationID
-	if op == "" {
-		op = r.CheckpointID
-	}
-	return &resource.CaptureRetention{CapturePath: path, MemoryID: r.MemoryID, Epoch: r.Epoch, OperationID: op}, nil
+	return hint, nil
 }
 
 func destroyFrozenMemory(process processSignaler, lock *os.File, release func(), exited <-chan struct{}, logf func(string, ...any)) {
@@ -412,109 +418,42 @@ func frozenRetirement(r *Runtime, process processSignaler, lock *os.File, releas
 	})
 }
 
-// previousMemorySave belongs to the new Runtime, including when it restores an
-// older checkpoint. Its only transition is pending -> ready.
-type previousMemorySave struct {
-	mu        sync.Mutex
-	record    *memorycheckpoint.CaptureRecord
-	directory string
-	ready     bool
-}
-
-func newPreviousMemorySave(directory, sid string) (*previousMemorySave, error) {
-	p := &previousMemorySave{directory: directory, ready: true}
-	r, err := memorycheckpoint.ReadCurrent(directory)
-	if errors.Is(err, os.ErrNotExist) {
-		return p, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if r.Producer.SandboxID != sid {
-		return nil, errors.New("checkpoint memory: previous sandbox identity mismatch")
-	}
-	if !r.RAMReleased && !r.Aborted {
-		p.record = r
-		p.ready = false
-	}
-	return p, nil
-}
-
-func (p *previousMemorySave) wait(ctx context.Context, noWait bool) (*memorycheckpoint.CaptureRecord, error) {
-	if p == nil {
-		return nil, nil
-	}
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		p.mu.Lock()
-		if p.ready {
-			r := p.record
-			p.mu.Unlock()
-			return r, nil
-		}
-		id := *p.record
-		p.mu.Unlock()
-		result, err := memorycheckpoint.ObservePreviousSave(ctx, p.directory, id)
-		r := &result.Record
-		if err != nil {
-			if noWait && errors.Is(err, memorycheckpoint.ErrMemoryUnavailable) {
-				return r, ctl.ErrMemorySavePending
-			}
-			return r, err
-		}
-		if r.RAMReleased || r.Aborted {
-			p.mu.Lock()
-			p.ready = true
-			p.record = r
-			p.mu.Unlock()
-			return r, nil
-		}
-		if noWait {
-			return r, ctl.ErrMemorySavePending
-		}
-		select {
-		case <-ctx.Done():
-			return r, ctx.Err()
-		case <-ticker.C:
-		}
-	}
-}
-
+// Capture admission depends on this run's capability, never on an older
+// holder's save progress. The diagnostic query still reports all generations.
 func (h *SnapshotHandler) captureState(ctx context.Context, q ctl.CaptureStateQuery) (ctl.CaptureState, error) {
-	state := ctl.CaptureState{SandboxID: h.SandboxID}
+	state := ctl.CaptureState{LifecycleVersion: ctl.CheckpointLifecycleVersion, SandboxID: h.SandboxID}
 	if h.CurrentRun != nil {
-		state.InstanceID = h.CurrentRun.InstanceID
-		state.RunID = h.CurrentRun.RunID
+		state.InstanceID, state.RunID = h.CurrentRun.InstanceID, h.CurrentRun.RunID
 	}
 	if q.SandboxID != state.SandboxID || q.InstanceID != state.InstanceID || q.RunID != state.RunID {
 		return state, errors.New("capture state requested for another runtime")
 	}
+	if err := ctx.Err(); err != nil {
+		return state, err
+	}
 	if q.ForCapture {
 		supported := checkpointMemoryRetentionSupported(RunOptions{EnableCheckpoint: h.EnableCheckpoint, runtime: h.runtime})
 		state.RetentionSupported = &supported
-		if !supported {
-			return state, nil
-		}
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	life := h.Context
-	if life == nil {
-		life = context.Background()
-	}
-	stop := context.AfterFunc(life, cancel)
-	defer stop()
-	r, err := h.previousMemory.wait(ctx, q.NoWaitForPreviousMemorySave)
-	if r != nil {
-		state.MemoryID = r.MemoryID
-		state.Epoch = r.Epoch
-	}
-	if errors.Is(err, ctl.ErrMemorySavePending) {
-		state.Pending = true
 		return state, nil
 	}
-	return state, err
+	if h.CheckpointDir == "" {
+		return state, nil
+	}
+	records, err := memorycheckpoint.ListRecords(h.CheckpointDir)
+	if err != nil {
+		return state, err
+	}
+	for _, record := range records {
+		if record.Producer.SandboxID != h.SandboxID {
+			return state, errors.New("capture state producer mismatch")
+		}
+		if !record.Aborted && !record.RAMReleased {
+			state.Pending = true
+			state.MemoryID, state.Epoch = record.MemoryID, record.Epoch
+			break
+		}
+	}
+	return state, nil
 }
 
 func checkpointMemoryParents(ctx context.Context, opts RunOptions, working bool) (parents, external []string, err error) {

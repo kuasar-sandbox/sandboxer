@@ -801,11 +801,11 @@ basename identity 绑定宿主提供的启动文件，不是 checkpoint payload 
 若 `from_refs` 内存 lower 是有记录的节点本地内存对象，通过准确的载体 digest 与 inode
 识别并保留其位图、payload、capture record 和内部父图，包括经命名 location 访问的情况。
 普通 lower 仍保持不透明，不递归引入 lower 历史的执行、磁盘或外部内存配置依赖。
-独立的 current-memory 根保留自己的内存 lower，即使所选来源较旧或仅含 E。
+`current-memory.json` 仅作最新定位提示，不是持久根。恢复、计账与 GC 枚举完整捕获集合。
 
 Bundle 候选来源的 location 仅在既有选择器访问该来源时解析：先当前 Bundle，再按顺序
 查询 refs，最后查询远端。当前 Bundle 命中时不要求无用 location 可解析；不可用候选可继续
-查找，损坏候选和已选定来源的错误仍然失败。删除前仍必须确认显式当前 S/E 绑定及完整保留集合。
+查找，损坏候选和已选定来源的错误仍然失败。删除前必须验证完整保留集合；当前来源可为空或 portable，历史保留项不能成为当前别名。
 
 checkpoint 目录及其祖先路径都必须不含符号链接，解析后的物理路径应与配置路径相同。
 沙箱 base 目录应配置为实际规范路径；拒绝目录内部的异常链接是另一项保护，不代表支持
@@ -823,8 +823,8 @@ E-only 也会删除旧 S 别名。Snapshot 捕获只提交 S 别名，E 身份�
 unlink 仍被限制在原目录内。
 
 新来源已提交后，即使清理失败，Pause 仍成功。内存读者持有 pin、无法取得回收独占锁时，
-`CleanupCheckpoint` 在修改别名或删除任何内容之前返回
-`artifact.ErrCheckpointMemoryReadersBusy`。管理端可延期这次回收，继续完成普通 paused
+`CleanupCheckpoint` 可先撤销不可达的后端版本，再返回
+`artifact.ErrCheckpointMemoryReadersBusy`；被 pin 的物理文件不变。管理端可延期这次回收，继续完成普通 paused
 运行资源清理，无需等待内存保存。holder 退役 worker 在内存释放、runner fence 完成且
 沙箱仍为 paused 时重试回收，包括 RunDir ownership 已清空的情况。
 
@@ -835,6 +835,25 @@ paused 收尾均成功。既有 worker 在 SID lifecycle lock 下重新读取当
 合同。候选已不存在视为完成；权限、I/O 和身份错误继续保留重试责任。延期回收不授权
 硬删除或释放内存 holder。普通 Kill 和 BuildBaseDir 终态删除仍由原 finalizer 负责；
 此步骤不回收任何共享或外部制品。
+
+`artifact.Checkpoint.Retain` 必须是显式完整集合，nil 表示未知并拒绝。调用方在操作
+期间保持外部注册表保护；DirectoryOwner 本身不足以保护外部登记。后代仍需要的后端
+不能撤销。持久父边提交与后端删除共用各来源目录的 `.checkpoint-sources.lock`，
+多目录按规范路径顺序取锁。已打开的 reader 保证续读，不授权撤销之后再发布新父边。
+
+运行实例分别补入当前磁盘 E 和内存依赖。恢复旧磁盘版本可能物化新的 E，而内存仍
+来自所选 S；二者不能拼成新的 S/E 对。可信运行时的 `MemoryRefs` 只保留内存图，
+不把历史执行/磁盘配置提升为当前依赖。
+
+CaptureRecord 写版本 2，并读取/升级版本 1；固定 Descriptor 仍为版本 1。单调
+`Deleted` 拒绝新 Open，已有强类型视图继续读取并可切到完成文件。业务列表过滤
+未提交、Aborted、Deleted，全量库存仍服务于结算。Deleted 不等于 RAMReleased；
+已保存的 Deleted + FileReady + RAMReleased 不必转成 Discarded。
+活 holder 串行处理 Delete、Open/双 FD 发送、FileReady 和取消。RuntimeRetired 后，
+它保留目录 pin 与 memfd，只放下自身 RAM pin，独立验证原 inode/nonce 的 EX 证明。
+存在外部引用就恢复保护继续保存；否则取消并等待整个写入任务结束，关闭 RAM 后
+原子发布 RAMReleased + Discarded，禁止迟到的 FileReady。取消不需要目录 EX，
+其他 holder 不会阻挡它；物理文件随后按普通 GC 回收。
 
 <a id="artifact-publication"></a>
 

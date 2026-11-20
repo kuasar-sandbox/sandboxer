@@ -199,7 +199,7 @@ assert_list() {
     "$BIN/sandbox-ctl" checkpoint list --path-id "$path" --run-root "$RUN_ROOT" --json >"$OUT/list.json"
     python3 - "$OUT/list.json" "$expected" <<'PY'
 import collections, json, sys
-refs = json.load(open(sys.argv[1]))
+refs = [r for r in json.load(open(sys.argv[1])) if r.get('diff_id')]
 expected = {x: 3 for x in sys.argv[2].split(',') if x}
 assert dict(collections.Counter(r['id'] for r in refs)) == expected, refs
 assert len({(r['diff_id'], r['id']) for r in refs}) == len(refs)
@@ -378,7 +378,13 @@ fi
 
 # Reverse order: owner is live before publication pins; guest overwrites proceed.
 # Successful publish routes exact deletion back through the live owner's gate.
-"$BIN/sandbox-ctl" publish --json --delete-checkpoint --manifest-config "$WORK/ref-required.yaml" \
+python3 - "$CP_DIR" "$SID" "$OUT/publish-sources.json" <<'PY'
+import json,sys
+# This serial case owns the full registry. The live runtime adds snapshot-b;
+# export-a has no remaining durable registration after successful publication.
+json.dump([{'Directory':sys.argv[1],'SandboxID':sys.argv[2],'Retain':[]}],open(sys.argv[3],'w'))
+PY
+"$BIN/sandbox-ctl" publish --json --delete-checkpoint --checkpoint-sources "$(cat "$OUT/publish-sources.json")" --manifest-config "$WORK/ref-required.yaml" \
     --to-ref-location "portable=file://$WORK/published-a" "$E_A" >"$OUT/published-a.json" 2>"$OUT/published-a.log" &
 PUB_A=$!
 PUBLISH_PIDS+=("$PUB_A")
@@ -422,7 +428,7 @@ for r in json.load(open(sys.argv[1])):
 PY
 )
 [ "${#DELETE_ARGS[@]}" -eq 6 ] || e2e_fail "expected exact references for three deleted disks"
-"$BIN/sandbox-ctl" checkpoint delete --path-id "$PATH_ID" --run-root "$RUN_ROOT"     --checkpoint export-a "${DELETE_ARGS[@]}" --json >"$OUT/delete-retry.json"
+"$BIN/sandbox-ctl" checkpoint delete --path-id "$PATH_ID" --run-root "$RUN_ROOT"     --checkpoint export-a "${DELETE_ARGS[@]}" --sources '{"retain":[]}' --json >"$OUT/delete-retry.json"
 assert_list "$PATH_ID" snapshot-b
 sha256sum -c "$OUT/source-artifacts.hashes"
 stop_run
@@ -551,7 +557,7 @@ PY
 start gc-history "$PATH_ID" --config "$WORK/cold.yaml" --enable-checkpoint
 for version in snapshot-b historical-c; do
     "$BIN/sandbox-ctl" checkpoint delete --path-id "$PATH_ID" --run-root "$RUN_ROOT" \
-        --checkpoint "$version" --json >"$OUT/gc-delete-$version.json"
+        --checkpoint "$version" --sources '{"retain":[]}' --json >"$OUT/gc-delete-$version.json"
 done
 assert_list "$PATH_ID" ""
 python3 - "$CP_DIR" "$OUT/history-before-gc.json" "$OUT/history-after-gc.json" <<'PY'
@@ -609,11 +615,16 @@ PY
     PIN_E="$(capture_path "pins-cold-source-$policy" sandbox "$CP_DIR")"
     start "pins-from-$policy" "$PIN_PATH" --config "$WORK/restore.yaml" --from "$PIN_E" --enable-checkpoint "${CRYPTO_ARGS[@]}"
     assert_no_restore_pins "$CP_DIR"
-    for version in "pins-source-$policy" "pins-cold-source-$policy"; do
-        "$BIN/sandbox-ctl" checkpoint delete --path-id "$PIN_PATH" --run-root "$RUN_ROOT" \
-            --checkpoint "$version" --json >"$OUT/delete-$version.json"
-    done
-    assert_list "$PIN_PATH" ""
+    "$BIN/sandbox-ctl" checkpoint delete --path-id "$PIN_PATH" --run-root "$RUN_ROOT" \
+        --checkpoint "pins-source-$policy" --sources '{"retain":[]}' --json >"$OUT/delete-pins-source-$policy.json"
+    # An active source is a durable root. A pinned reader cannot authorize its
+    # revocation followed by a new parent edge in the next capture.
+    if "$BIN/sandbox-ctl" checkpoint delete --path-id "$PIN_PATH" --run-root "$RUN_ROOT" \
+        --checkpoint "pins-cold-source-$policy" --sources '{"retain":[]}' --json >"$OUT/delete-pins-cold-$policy.log" 2>&1; then
+        e2e_fail "revoked the active durable source"
+    fi
+    assert_contains "$OUT/delete-pins-cold-$policy.log" "durable source"
+    assert_list "$PIN_PATH" "pins-cold-source-$policy"
     guest /bin/sh -c 'for f in /handoff /scratch/handoff /data/handoff; do grep -qx before-delete "$f" || exit 1; echo after-delete > "$f"; done; sync'
     capture snapshot "pins-after-delete-$policy"
     finish_capture

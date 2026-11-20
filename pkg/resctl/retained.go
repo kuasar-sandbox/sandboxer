@@ -58,8 +58,8 @@ func (h *ControllerHooks) PrepareRetained(ctx context.Context, capture resource.
 	previous := h.retention
 	h.mu.Unlock()
 	if previous != nil && *previous != capture {
-		// Data ready may precede its node ACK. Settle the one previous R
-		// before creating another capture; never accumulate generations.
+		// Only a prior preparation owned by this execution can be here.
+		// Inherited R entries belong to the node account, not h.retention.
 		if _, err := h.retentionCallLocked(ctx, resource.TypeReleaseRetained, *previous); err != nil {
 			// A prior preflight may have durably aborted while its resource
 			// ACK was lost. The exact Abort is legal only for that still

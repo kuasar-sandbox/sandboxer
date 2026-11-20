@@ -47,6 +47,7 @@ type Request struct {
 	Type                        string                `json:"type"`
 	CheckpointID                string                `json:"checkpoint_id,omitempty"`
 	CheckpointOwner             string                `json:"checkpoint_owner,omitempty"`
+	CheckpointSources           *CheckpointSources    `json:"checkpoint_sources,omitempty"`
 	CheckpointRefs              []DiffCheckpointRef   `json:"checkpoint_refs,omitempty"`
 
 	// snapshot_request: OutDir and Upload are mutually exclusive (the

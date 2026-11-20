@@ -18,20 +18,37 @@ import (
 const (
 	TypeCheckpointSnapshotRequest = "checkpoint_snapshot_request"
 	TypeCheckpointExportRequest   = "checkpoint_export_request"
-	TypeCheckpointListRequest     = "checkpoint_list_request"
-	TypeCheckpointListChunk       = "checkpoint_list_chunk"
-	TypeCheckpointListDone        = "checkpoint_list_done"
-	TypeCheckpointDeleteRequest   = "checkpoint_delete_request"
-	TypeCheckpointDeleteDone      = "checkpoint_delete_done"
+	TypeCheckpointListRequest     = "checkpoint_list_request_v2"
+	TypeCheckpointListChunk       = "checkpoint_list_chunk_v2"
+	TypeCheckpointListDone        = "checkpoint_list_done_v2"
+	TypeCheckpointDeleteRequest   = "checkpoint_delete_request_v2"
+	TypeCheckpointDeleteDone      = "checkpoint_delete_done_v2"
 	CheckpointUnsupportedCode     = "checkpoint_unsupported"
 )
 
 var ErrCheckpointUnsupported = errors.New(CheckpointUnsupportedCode)
 
-// DiffCheckpointRef identifies one immutable version, never an input alias.
-type DiffCheckpointRef struct {
-	DiffID string `json:"diff_id"`
-	ID     string `json:"id"`
+// CheckpointRef identifies one exact disk or memory version. Exactly one of
+// DiffID/MemoryID must be supplied; ID alone never selects a retry target.
+type CheckpointRef struct {
+	DiffID   string `json:"diff_id,omitempty"`
+	MemoryID string `json:"memory_id,omitempty"`
+	ID       string `json:"id"`
+}
+type DiffCheckpointRef = CheckpointRef
+
+type CheckpointSource struct {
+	SnapshotRef string `json:"snapshot_ref,omitempty"`
+	SandboxRef  string `json:"sandbox_ref,omitempty"`
+}
+
+// Sources is required for deletion. Retain must be explicit even when empty;
+// the caller keeps its registry fence until this operation returns.
+type CheckpointSources struct {
+	SnapshotRef  string             `json:"snapshot_ref,omitempty"`
+	SandboxRef   string             `json:"sandbox_ref,omitempty"`
+	Retain       []CheckpointSource `json:"retain"`
+	RefLocations map[string]string  `json:"ref_locations,omitempty"`
 }
 
 // WriteCheckpointList always terminates a complete list with an explicit count.
@@ -81,7 +98,7 @@ func CaptureError(resp Response) error {
 	return errors.New(resp.Msg)
 }
 
-func ListDiffCheckpoints(ctx context.Context, socketPath string) ([]DiffCheckpointRef, error) {
+func ListCheckpoints(ctx context.Context, socketPath string) ([]DiffCheckpointRef, error) {
 	c, close, err := dialContext(ctx, socketPath)
 	if err != nil {
 		return nil, err
@@ -93,7 +110,13 @@ func ListDiffCheckpoints(ctx context.Context, socketPath string) ([]DiffCheckpoi
 	return ReadCheckpointList(c)
 }
 
-func DeleteDiffCheckpoints(ctx context.Context, socketPath, ownerID string, refs []DiffCheckpointRef) error {
+func DeleteCheckpoints(ctx context.Context, socketPath, ownerID string, refs []CheckpointRef, sources CheckpointSources) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	if sources.Retain == nil {
+		return errors.New("checkpoint deletion requires an explicit complete retention set")
+	}
 	// Freeze the caller's exact set before making any progress. Each batch is
 	// idempotent, so a failed connection can safely be retried with the same set.
 	refs = append([]DiffCheckpointRef(nil), refs...)
@@ -104,7 +127,7 @@ func DeleteDiffCheckpoints(ctx context.Context, socketPath, ownerID string, refs
 				return err
 			}
 			defer close()
-			req := Request{Type: TypeCheckpointDeleteRequest, CheckpointOwner: ownerID, CheckpointRefs: refs[start:min(start+128, len(refs))]}
+			req := Request{Type: TypeCheckpointDeleteRequest, CheckpointOwner: ownerID, CheckpointRefs: refs[start:min(start+128, len(refs))], CheckpointSources: &sources}
 			if err := WriteMessage(c, req); err != nil {
 				return err
 			}
@@ -191,12 +214,12 @@ func RemoveCheckpointOwner(directory string, owner CheckpointOwner) error {
 
 // DeleteOwnedDiffCheckpoints is for cleanup forwarding after a failed ownership
 // acquisition. Explicit offline directory management must not call it.
-func DeleteOwnedDiffCheckpoints(ctx context.Context, directory string, refs []DiffCheckpointRef) error {
+func DeleteOwnedDiffCheckpoints(ctx context.Context, directory string, refs []DiffCheckpointRef, sources ...CheckpointSources) error {
 	var last error
 	for attempt := 0; attempt < 20; attempt++ {
 		owner, err := ReadCheckpointOwner(directory)
 		if err == nil {
-			err = DeleteDiffCheckpoints(ctx, owner.Socket, owner.ID, refs)
+			err = DeleteDiffCheckpoints(ctx, owner.Socket, owner.ID, refs, sources...)
 		}
 		if err == nil {
 			return nil
@@ -217,4 +240,19 @@ func DeleteOwnedDiffCheckpoints(ctx context.Context, directory string, refs []Di
 		}
 	}
 	return fmt.Errorf("checkpoint owner routing: %w", last)
+}
+
+// Compatibility names preserve source signatures, but cannot imply that an
+// omitted retention set is empty. All management uses the v2 protocol.
+func ListDiffCheckpoints(ctx context.Context, socket string) ([]DiffCheckpointRef, error) {
+	return ListCheckpoints(ctx, socket)
+}
+func DeleteDiffCheckpoints(ctx context.Context, socket, owner string, refs []DiffCheckpointRef, sources ...CheckpointSources) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	if len(sources) != 1 {
+		return errors.New("checkpoint deletion requires an explicit complete retention set")
+	}
+	return DeleteCheckpoints(ctx, socket, owner, refs, sources[0])
 }

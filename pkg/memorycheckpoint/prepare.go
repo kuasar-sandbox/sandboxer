@@ -39,9 +39,10 @@ func prepareHolder(directory, runDir string, initial CaptureRecord, memory *os.F
 			retErr = errors.Join(retErr, h.err)
 		}
 	}()
-	if memory == nil || size == 0 || initial.Version != Version || !validID(initial.MemoryID) || !validCheckpointID(initial.CheckpointID) || initial.Epoch == 0 || initial.Producer.SandboxID == "" || initial.Committed || initial.Aborted || initial.Discarded || initial.RuntimeRetired || initial.FileReady || initial.RAMReleased || initial.SnapshotRef != "" || initial.SandboxRef != "" || initial.PayloadRef != "" {
+	if memory == nil || size == 0 || (initial.Version != Version && initial.Version != RecordVersion) || !validID(initial.MemoryID) || !validCheckpointID(initial.CheckpointID) || initial.Epoch == 0 || initial.Producer.SandboxID == "" || initial.Committed || initial.Aborted || initial.Discarded || initial.Deleted || initial.RuntimeRetired || initial.FileReady || initial.RAMReleased || initial.SnapshotRef != "" || initial.SandboxRef != "" || initial.PayloadRef != "" {
 		return nil, errors.New("memory checkpoint: invalid holder preparation")
 	}
+	initial.Version = RecordVersion
 	flags, err := unix.FcntlInt(memory.Fd(), unix.F_GETFL, 0)
 	if err != nil || flags&unix.O_ACCMODE != unix.O_RDONLY {
 		return nil, errors.New("memory checkpoint: holder requires read-only memory fd")

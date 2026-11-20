@@ -542,15 +542,24 @@ FD/映射，再关闭 pin；不对共享 pin 显式解锁。新 VM 始终使用�
 不回退到运行目录。内存读者仍持有 checkpoint pin 时，管理端延期垃圾回收并完成普通
 运行资源清理，不等待保存，也不放宽读者保护；详见[选择性清理](artifacts_zh.md#checkpoint-history)。
 
-恢复后的 Runtime 按 SandboxID 继承上一轮保存义务，包括从较早 checkpoint 恢复的
-情况。只有本次捕获可能新增冻结 RAM 义务时，才默认在入口等待实际 `RAMReleased`；
-`FileReady` 不能替代释放证明。两种格式及等待后台完成后才返回的调用均遵守这一条件。
-纯磁盘捕获、明确只能同步保存的 runtime 不新增该义务。等待期间不冻结、不离开 running。CLI 可用
-`--no-wait-for-previous-memory-save`，SDK 可设 `NoWaitForPreviousMemorySave`，
-在未完成时立即拒绝。取消等待不取消后台保存，也不改变当前 Runtime 状态。
-完整 pause 耗时包括这一入口等待。若准确 producer 已退出、文件尚未发布且 RAM 读者
-仍存在，默认等待明确报告前轮保存不可用，不进入 pausing，并继续观察实际内存义务。
-确认 RAMReleased 后，历史 lost 或 SaveError 不阻断从其他完整 checkpoint 恢复的运行。
+同一 SID 可以同时存在多个 holder，新的暂停不等待旧 RAM 释放，Bundle 与 tarstream
+行为一致。`noWaitForPreviousMemorySave` 与 `NoWaitForPreviousMemorySave` 保留为
+兼容输入，不再触发前轮等待或 pending 冲突。恢复从权威节点库存接管该 SID 所有未
+结清额度，与所选 checkpoint 或分支无关：Q = B + ΣRi。每份 Ri 按准确 capture 只计
+一次并留在原 SourcePool，新 B/cache 由目标池准入。ReservationMemory、balloon、
+StateSync、Guest Capacity 和 startup 仍只表示本代 B，下一轮也只把 B 转为新 Ri。
+名称删除或 FileReady 不直接减账，准确 RAMReleased 证明持久结算后才扣除对应 Ri。
+旧捕获丢失不阻止从完整来源恢复的后继再次暂停，但剩余 RAM 仍须凭释放证明结算。
+
+receipt v2 将 SID 账户头的 holding/adopting/active 与各捕获的
+prepared/held/settled 分开。`checkpoint_memory_handoff_v2` 使用定长 account ID/
+revision 和 handoff 身份，不把全集塞进 64 KiB 帧。首次受理先准入并计入 B/cache，
+再持久化候选 intent；重放固定原合同，不因 Ri 乱序结清或 revision 推进而变化。
+准入失败保留旧 R，恢复失败仅释放本次 B，最后一份 R 结清不能清空待完成候选。
+重启库存覆盖所有 holder 的来源 lease、进程和 cgroup；已 settled 身份仍可被发现时
+保留零额度防重认记录，空账户头随 SID 终态清理。每代 Abort/Release 按准确 capture/
+operation 判断，只有终端删除检查全部 R。CaptureState lifecycle version 2 与资源
+能力须配套，旧端不能部分接管集合。
 
 `Runtime.Wait` 和 `Close` 仍结束普通运行资源及借用 storage 的使用期。
 嵌入 SDK 的进程在生成本地 checkpoint 后还需保持存活，直至
@@ -701,8 +710,8 @@ usage_request    -> usage_response | error
 resource_stats_request -> resource_stats_response | error
 checkpoint_snapshot_request -> snapshot_done | error
 checkpoint_export_request   -> export_done | error
-checkpoint_list_request     -> checkpoint_list_chunk* -> checkpoint_list_done | error
-checkpoint_delete_request   -> checkpoint_delete_done | error
+checkpoint_list_request_v2     -> checkpoint_list_chunk_v2* -> checkpoint_list_done_v2 | error
+checkpoint_delete_request_v2   -> checkpoint_delete_done_v2 | error
 ```
 
 命名捕获使用专用 checkpoint request type 和非空 `checkpoint_id`，复用既有捕获
@@ -710,11 +719,15 @@ response 及输出字段；不能仅给普通捕获请求添加字段来判断�
 `code: "checkpoint_unsupported"`；客户端也识别旧服务端针对这两个捕获类型返回的
 unknown-type 错误。两种情况都不会静默退回磁盘复制捕获。
 
-List chunk 的 `checkpoints` 最多携带 128 个精确 `{diff_id,id}` 引用；最终帧包含
+List chunk 的 `checkpoints` 最多携带 128 个精确 `{diff_id,id}` 或 `{memory_id,id}` 引用；最终帧包含
 `checkpoint_count`，空列表的计数为零。未收到最终匹配计数就 EOF，属于列表不完整，
 不能把已收前缀当成功结果。Delete request 的 `checkpoint_refs` 使用已固定的引用集合，
 每批最多 128 项。清理转发另带 `checkpoint_owner` 并核对运行 owner token；此路由
 不向显式离线管理授予所有权。部分进展后的重试仍使用同一组精确引用。
+
+V2 Delete 必须携带 `checkpoint_sources` 与完整的额外 `retain` 来源集合，显式 `[]`
+表示已知为空，省略/null 均拒绝。调用方保持外部来源登记保护，runtime 加入自身来源。
+旧管理端的 unknown-type 是明确错误，不降级为部分成功。
 
 唯一 reaper 在 `waitid(WEXITED|WNOWAIT)` 确认 VMM 退出后立即撤销 resource 的 live 观测,然后按既有顺序执行 usage 最后采样与 `cmd.Wait`. usage 关闭时也使用同一退出通知;不增加采样或改变停止/保存语义. 退出期间仅保留有效规格字段,不为已退出 VMM 返回新的宿主观测时间.
 

@@ -57,8 +57,8 @@ func TestCheckpointMemorySocketAdmission(t *testing.T) {
 			captures      int64
 			wait          bool
 		}{
-			{name: "standalone-retained", code: ctl.MemorySavePendingCode, message: ctl.ErrMemorySavePending.Error()},
-			{name: "managed-retained", current: current, permit: permit, code: ctl.MemorySavePendingCode, message: ctl.ErrMemorySavePending.Error()},
+			{name: "standalone-retained", message: "process is not started", captures: 1},
+			{name: "managed-retained", current: current, permit: permit, code: ctl.CaptureRejectedCode, message: "process is not started", captures: 1},
 			{name: "managed-without-permit", current: current, message: "process is not started", captures: 1},
 			{name: "managed-without-permit-default-wait", current: current, message: "process is not started", captures: 1, wait: true},
 			{name: "unsupported-controller", current: current, permit: permit, hooks: hooks, code: ctl.CaptureRejectedCode, message: "process is not started", captures: 1},
@@ -66,13 +66,9 @@ func TestCheckpointMemorySocketAdmission(t *testing.T) {
 			{name: "wrong-permit", current: current, permit: &wrongPermit, code: ctl.CaptureRejectedCode, message: "identity mismatch"},
 		} {
 			t.Run(mode+"/"+tc.name, func(t *testing.T) {
-				prior, err := newPreviousMemorySave(directory, "sid")
-				if err != nil {
-					t.Fatal(err)
-				}
 				var captures atomic.Int64
 				h := &SnapshotHandler{EnableCheckpoint: true, CurrentRun: tc.current,
-					previousMemory: prior, runtime: &Runtime{hooks: tc.hooks},
+					CheckpointDir: directory, runtime: &Runtime{hooks: tc.hooks},
 					CHProcess: func() processSignaler { captures.Add(1); return nil },
 				}
 				req := ctl.Request{Type: ctl.TypeCheckpointSnapshotRequest, CheckpointID: "next", Mode: mode,

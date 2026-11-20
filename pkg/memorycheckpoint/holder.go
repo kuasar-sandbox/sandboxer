@@ -108,72 +108,149 @@ func (h *Holder) Start(dump func(context.Context, io.ReaderAt) (string, error), 
 	}
 	h.started = true
 	h.mu.Unlock()
-	go func() {
-		ctx := context.Background()
-		for {
-			ref, err := dump(ctx, h.file)
-			if err == nil {
-				err = h.record.Update(func(r *CaptureRecord) { r.PayloadRef = ref; r.FileReady = true; r.SaveError = "" })
-			}
-			if err == nil {
-				break
-			}
-			h.logf("checkpoint memory save retained for retry: %v", err)
-			_ = h.record.Update(func(r *CaptureRecord) { r.SaveError = err.Error() })
-			time.Sleep(time.Second)
-		}
-		h.mu.Lock()
-		close(h.ready)
-		h.mu.Unlock()
-		// File publication closes RAM admission. Drop our own backing before
-		// testing an independent OFD; queued SCM_RIGHTS and accepted readers
-		// keep the shared pin alive even if an ACK was lost or a peer exited.
-		h.mu.Lock()
-		closeErr := h.closeRAMLocked()
-		h.mu.Unlock()
-		if closeErr != nil {
-			h.logf("checkpoint RAM descriptor close: %v", closeErr)
-		}
-		var proof *os.File
-		for {
-			r := h.record.Read()
-			var err error
-			proof, err = openRAMPin(h.record.Path(), r.Holder.RAMLock, unix.LOCK_EX)
-			if err == nil {
-				break
-			}
-			if !errors.Is(err, unix.EWOULDBLOCK) {
-				h.logf("checkpoint RAM release proof retained for retry: %v", err)
-			}
-			select {
-			case <-h.changed:
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
-		defer proof.Close()
-		// The record is the physical release fact. Resource ACK may be replayed
-		// separately; a failed ACK cannot charge or free another generation.
-		for {
-			err := h.record.Update(func(r *CaptureRecord) { r.RAMReleased = true })
-			if err == nil {
-				break
-			}
-			h.logf("checkpoint release record: %v", err)
-			time.Sleep(time.Second)
-		}
-		if release != nil {
-			for {
-				if err := release(ctx); err == nil {
-					break
-				} else {
-					h.logf("checkpoint resource release retained for retry: %v", err)
-				}
-				time.Sleep(time.Second)
-			}
-		}
-		h.finish(nil)
-	}()
+	go h.save(dump, release)
 	return nil
+}
+
+type dumpResult struct {
+	ref string
+	err error
+}
+
+// cancellationProofLocked drops only our pin reference. The writer and shared
+// directory pin continue to protect the local memfd and its parent graph. An
+// independent exclusive OFD proves that no accepted/queued RAM reader remains.
+// On a conflict we restore our own protection without unlocking anyone else's
+// shared OFD. Other holders' directory pins do not prevent this operation.
+func (h *Holder) cancellationProofLocked() *os.File {
+	r := h.record.Read()
+	if !r.Deleted || !r.RuntimeRetired || r.FileReady || r.RAMReleased {
+		return nil
+	}
+	if h.ramPin != nil {
+		if err := h.ramPin.Close(); err != nil {
+			h.logf("checkpoint delete pin close: %v", err)
+		}
+		h.ramPin = nil
+	}
+	proof, err := openRAMPin(h.record.Path(), r.Holder.RAMLock, unix.LOCK_EX)
+	if err == nil {
+		return proof
+	}
+	if !errors.Is(err, unix.EWOULDBLOCK) {
+		h.logf("checkpoint delete RAM proof retained: %v", err)
+	}
+	h.ramPin, err = openRAMPin(h.record.Path(), r.Holder.RAMLock, unix.LOCK_SH)
+	if err != nil {
+		// Do not invent release on a missing/replaced proof. The unique writer
+		// retains responsibility and retries, including after a finished dump.
+		h.logf("checkpoint delete pin protection retry: %v", err)
+	}
+	return nil
+}
+
+func (h *Holder) save(dump func(context.Context, io.ReaderAt) (string, error), release func(context.Context) error) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var result <-chan dumpResult
+	var cancel context.CancelFunc
+	var retryAt time.Time
+	var proof *os.File
+	discarded := false
+	for {
+		h.mu.Lock()
+		proof = h.cancellationProofLocked()
+		h.mu.Unlock()
+		if proof != nil {
+			// Publication happens only in this coordinator. Holding the proof
+			// until the entire callback exits fences a late successful result.
+			if cancel != nil {
+				cancel()
+				<-result
+			}
+			discarded = true
+			break
+		}
+		if result == nil && !time.Now().Before(retryAt) {
+			ctx, stop := context.WithCancel(context.Background())
+			cancel = stop
+			ch := make(chan dumpResult, 1)
+			result = ch
+			file := h.file // not closed until this complete task has exited
+			go func() { ref, err := dump(ctx, file); ch <- dumpResult{ref, err} }()
+		}
+		select {
+		case out := <-result:
+			cancel()
+			cancel, result = nil, nil
+			h.mu.Lock()
+			// Delete and FileReady share this lock. With surviving RAM readers,
+			// a deleted version may still publish and switch those readers.
+			if out.err == nil {
+				out.err = h.record.Update(func(r *CaptureRecord) { r.PayloadRef = out.ref; r.FileReady = true; r.SaveError = "" })
+			}
+			if out.err == nil {
+				close(h.ready)
+			}
+			h.mu.Unlock()
+			if out.err == nil {
+				goto published
+			}
+			h.logf("checkpoint memory save retained for retry: %v", out.err)
+			_ = h.record.Update(func(r *CaptureRecord) { r.SaveError = out.err.Error() })
+			retryAt = time.Now().Add(time.Second)
+		case <-h.changed:
+		case <-ticker.C:
+		}
+	}
+published:
+	h.mu.Lock()
+	closeErr := h.closeRAMLocked()
+	h.mu.Unlock()
+	if closeErr != nil {
+		h.logf("checkpoint RAM descriptor close: %v", closeErr)
+	}
+	for proof == nil {
+		r := h.record.Read()
+		var err error
+		proof, err = openRAMPin(h.record.Path(), r.Holder.RAMLock, unix.LOCK_EX)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) {
+			h.logf("checkpoint RAM release proof retained for retry: %v", err)
+		}
+		select {
+		case <-h.changed:
+		case <-ticker.C:
+		}
+	}
+	defer proof.Close()
+	for {
+		err := h.record.Update(func(r *CaptureRecord) {
+			r.RAMReleased = true
+			if discarded {
+				r.Discarded = true
+				r.SaveError = ""
+			}
+		})
+		if err == nil {
+			break
+		}
+		h.logf("checkpoint release record: %v", err)
+		time.Sleep(time.Second)
+	}
+	if release != nil {
+		for {
+			if err := release(context.Background()); err == nil {
+				break
+			} else {
+				h.logf("checkpoint resource release retained for retry: %v", err)
+			}
+			time.Sleep(time.Second)
+		}
+	}
+	h.finish(nil)
 }
 
 func (h *Holder) Abort() error {
@@ -298,6 +375,14 @@ func (h *Holder) serveConn(c *net.UnixConn) {
 		_ = writeHolderMessage(c, holderMessage{Type: "released"})
 		return
 	}
+	if req.Type == "delete" {
+		if err := h.markDeleted(); err != nil {
+			_ = writeHolderMessage(c, holderMessage{Type: "error", Error: err.Error()})
+		} else {
+			_ = writeHolderMessage(c, holderMessage{Type: "deleted"})
+		}
+		return
+	}
 	if req.Type != "open" || !r.Committed {
 		_ = writeHolderMessage(c, holderMessage{Type: "error", Error: "capture is not committed"})
 		return
@@ -308,6 +393,11 @@ func (h *Holder) serveConn(c *net.UnixConn) {
 		return
 	}
 	r = h.record.Read()
+	if r.Deleted {
+		h.mu.Unlock()
+		_ = writeHolderMessage(c, holderMessage{Type: "deleted"})
+		return
+	}
 	if r.FileReady {
 		h.mu.Unlock()
 		_ = writeHolderMessage(c, holderMessage{Type: "file", PayloadRef: r.PayloadRef, Size: h.size})

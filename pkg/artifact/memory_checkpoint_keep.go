@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
@@ -29,8 +30,8 @@ func (k *checkpointKeep) retainMemoryLower(ctx context.Context, raw string, scop
 	return k.retainMemory(ctx, raw, scope)
 }
 
-// The current SID capture is an independent root even when the selected source
-// is older or E-only. Its own external suffix is part of that root's keep set;
+// An explicitly supplied memory root includes its external suffix. The latest
+// current-memory locator is not a durable root. For a selected root,
 // historical lowers' external configurations are not recursive memory edges.
 func (k *checkpointKeep) retainMemoryRoot(ctx context.Context, raw string, scope publishScope) (retErr error) {
 	stream, child, err := k.open(ctx, raw, scope)
@@ -111,12 +112,29 @@ func (k *checkpointKeep) retainMemory(ctx context.Context, raw string, scope pub
 		if child.relativeDir == "" {
 			return errors.New("checkpoint memory keep graph has no local directory")
 		}
+		if k.sourceDirectories == nil {
+			k.sourceDirectories = map[string]bool{}
+		}
+		physical, err := filepath.EvalSymlinks(child.relativeDir)
+		if err != nil {
+			return err
+		}
+		k.sourceDirectories[physical] = true
 		record, err := memorycheckpoint.ReadRecord(child.relativeDir, descriptor.CheckpointID, descriptor.MemoryID)
 		if err != nil {
 			return err
 		}
-		if record.MemoryID != descriptor.MemoryID || !record.Committed || record.Discarded {
+		if record.Deleted {
+			return memorycheckpoint.ErrDeleted
+		}
+		if record.MemoryID != descriptor.MemoryID || !record.Committed || record.Discarded || record.Aborted {
 			return errors.New("checkpoint memory capture identity mismatch")
+		}
+		if sameCheckpointDirectory(child.relativeDir, k.directory) {
+			if k.memoryVersions == nil {
+				k.memoryVersions = make(map[memorycheckpoint.Reference]bool)
+			}
+			k.memoryVersions[memorycheckpoint.Reference{CheckpointID: record.CheckpointID, MemoryID: record.MemoryID}] = true
 		}
 		if _, err := k.retain(ctx, descriptor.MapRef, child); err != nil {
 			return fmt.Errorf("checkpoint memory map: %w", err)

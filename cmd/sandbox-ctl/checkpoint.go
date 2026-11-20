@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
@@ -19,7 +21,7 @@ func checkpointCmd(args []string) int {
 		return checkpointGCCmd(args[1:])
 	}
 	if len(args) == 0 || (args[0] != "list" && args[0] != "delete") {
-		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl checkpoint list|delete (--sandbox-id ID | --checkpoint-dir DIR) [--checkpoint ID] [--diff-id ID ...] [--json]\n       sandbox-ctl checkpoint gc --checkpoint-dir DIR [--json]")
+		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl checkpoint list|delete (--sandbox-id ID | --checkpoint-dir DIR) [--checkpoint ID] [--diff-id ID ...] [--memory-id ID ...] [--sources JSON --producer-id SID] [--json]\n       sandbox-ctl checkpoint gc --checkpoint-dir DIR [--json]")
 		return 2
 	}
 	action := args[0]
@@ -30,7 +32,11 @@ func checkpointCmd(args []string) int {
 	directory := fs.String("checkpoint-dir", "", "offline directory management target")
 	id := fs.String("checkpoint", "", "checkpoint ID to delete")
 	jsonOutput := fs.Bool("json", false, "emit exact disk/version references")
-	var diffIDs repeatedFlag
+	producer := fs.String("producer-id", "", "offline checkpoint producer SID")
+	sourcesJSON := fs.String("sources", "", "complete current/retained source graph JSON; retain is required, including []")
+	manifestPath := fs.String("manifest-config", "", "artifact storage and crypto config")
+	var diffIDs, memoryIDs repeatedFlag
+	fs.Var(&memoryIDs, "memory-id", "exact memory identity for retryable deletion (repeatable)")
 	fs.Var(&diffIDs, "diff-id", "exact disk identity for retryable deletion (repeatable)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
@@ -39,13 +45,32 @@ func checkpointCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "checkpoint: select exactly one running sandbox or offline directory")
 		return 2
 	}
-	if (action == "delete" && *id == "") || (action == "list" && (*id != "" || len(diffIDs) != 0)) {
+	if (action == "delete" && *id == "") || (action == "list" && (*id != "" || len(diffIDs) != 0 || len(memoryIDs) != 0)) {
 		fmt.Fprintln(os.Stderr, "checkpoint: delete requires --checkpoint; list accepts no deletion filter")
 		return 2
 	}
+	var sources ctl.CheckpointSources
+	if action == "delete" {
+		if err := json.Unmarshal([]byte(*sourcesJSON), &sources); err != nil || sources.Retain == nil {
+			fmt.Fprintln(os.Stderr, "checkpoint deletion requires --sources JSON with an explicit complete retain set")
+			return 2
+		}
+		if *directory != "" && *producer == "" {
+			fmt.Fprintln(os.Stderr, "offline deletion requires --producer-id")
+			return 2
+		}
+	}
 	ctx, stop := commandContext()
 	defer stop()
-	storage, err := artifact.NewProcessStorage(nil)
+	cfg, err := config.LoadManifestConfig(*manifestPath)
+	if errors.Is(err, manifest.ErrConfigNotProvided) {
+		cfg, err = nil, nil
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	storage, err := newCLIStorage(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -70,18 +95,21 @@ func checkpointCmd(args []string) int {
 	var refs []artifact.DiffCheckpointRef
 	// Explicit DiffIDs bypass rediscovery and retry precisely the original set,
 	// including versions already tombstoned by a partially completed deletion.
-	if len(diffIDs) > 0 {
+	if len(diffIDs) > 0 || len(memoryIDs) > 0 {
 		for _, d := range diffIDs {
 			refs = append(refs, artifact.DiffCheckpointRef{DiffID: d, ID: *id})
 		}
+		for _, m := range memoryIDs {
+			refs = append(refs, artifact.CheckpointRef{MemoryID: m, ID: *id})
+		}
 	} else if socket != "" {
 		var wire []ctl.DiffCheckpointRef
-		wire, err = ctl.ListDiffCheckpoints(ctx, socket)
+		wire, err = ctl.ListCheckpoints(ctx, socket)
 		for _, r := range wire {
-			refs = append(refs, artifact.DiffCheckpointRef{DiffID: r.DiffID, ID: r.ID})
+			refs = append(refs, artifact.CheckpointRef{DiffID: r.DiffID, MemoryID: r.MemoryID, ID: r.ID})
 		}
 	} else {
-		refs, err = storage.ListDiffCheckpoints(ctx, *directory)
+		refs, err = storage.ListCheckpoints(ctx, *directory)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -100,20 +128,13 @@ func checkpointCmd(args []string) int {
 			return 1
 		}
 		if socket != "" {
-			wire := make([]ctl.DiffCheckpointRef, len(refs))
-			for i, r := range refs {
-				wire[i] = ctl.DiffCheckpointRef{DiffID: r.DiffID, ID: r.ID}
-			}
-			err = ctl.DeleteDiffCheckpoints(ctx, socket, "", wire)
+			err = ctl.DeleteCheckpoints(ctx, socket, "", refs, sources)
 		} else {
-			for _, r := range refs {
-				if e := storage.DeleteDiffCheckpoint(ctx, *directory, r); e != nil {
-					err = errors.Join(err, e)
-				}
-			}
+			c := artifact.Checkpoint{Directory: *directory, SandboxID: *producer, SnapshotRef: sources.SnapshotRef, SandboxRef: sources.SandboxRef, Retain: sources.Retain, RefLocations: sources.RefLocations}
+			err = storage.DeleteCheckpoints(ctx, c, refs, nil)
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "checkpoint deletion incomplete: %v; retry the following exact references using --diff-id\n", err)
+			fmt.Fprintf(os.Stderr, "checkpoint deletion incomplete: %v; retry the following exact references using --diff-id/--memory-id\n", err)
 			_ = json.NewEncoder(os.Stderr).Encode(refs)
 			return 1
 		}
@@ -128,7 +149,7 @@ func checkpointCmd(args []string) int {
 		}
 	} else {
 		for _, r := range refs {
-			fmt.Printf("%s\t%s\n", r.DiffID, r.ID)
+			fmt.Printf("%s\t%s\t%s\n", r.DiffID, r.MemoryID, r.ID)
 		}
 	}
 	return 0

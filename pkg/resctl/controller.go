@@ -30,9 +30,12 @@ type ControllerHookOptions struct {
 	SandboxID  string
 	Context    context.Context
 	Logf       func(string, ...any)
-	// Retained is the SID's previous capture obligation, independently of
-	// which checkpoint is selected as this runtime's restore base.
+	// Retained is a local inventory hint. The controller resolves the entire
+	// SID account independently of this runtime's selected restore graph.
 	Retained *resource.CaptureRetention
+	// CheckpointAccount queries the node inventory even if the local capture
+	// set is empty, since an account header can outlive its last R.
+	CheckpointAccount bool
 }
 
 // ControllerHooks is a reservation adapter. It deliberately knows nothing
@@ -160,7 +163,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		return nil, err
 	}
 	h.cacheMaximum = cacheMax
-	cacheFeatures := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1}
+	cacheFeatures := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2}
 	if !diffstore.ElasticCacheSupported() {
 		// Keep the fixed cache if payload pages cannot be charged and returned individually.
 		h.cacheMaximum = 0
@@ -184,10 +187,12 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		StartupMemory: startupHeadroom, ClientFeatures: cacheFeatures,
 	}
 	var lease *resource.LeaseHandle
-	if opts.Retained != nil {
-		if err := opts.Retained.Validate(); err != nil {
-			cancel()
-			return nil, err
+	if opts.Retained != nil || opts.CheckpointAccount {
+		if opts.Retained != nil {
+			if err := opts.Retained.Validate(); err != nil {
+				cancel()
+				return nil, err
+			}
 		}
 		var operation [16]byte
 		if _, err := cryptorand.Read(operation[:]); err != nil {
@@ -195,8 +200,6 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 			return nil, err
 		}
 		h.handoffID = hex.EncodeToString(operation[:])
-		copy := *opts.Retained
-		h.retention = &copy
 		lease, err = resource.CreateLeaseCandidate(leaseSpec)
 		if err == nil {
 			h.leaseCandidate = lease.Path()
@@ -338,7 +341,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 				continue
 			}
 		}
-		cacheFeatures := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1}
+		cacheFeatures := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2}
 		if h.cacheMaximum > 0 {
 			cacheFeatures = append(cacheFeatures, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(h.cacheMaximum))
 			if h.cacheReclaim.RunID != "" {
@@ -359,13 +362,23 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 			CacheReclaim: reclaim,
 		}
 		var res *resource.AdmitResult
-		if h.opts.Retained != nil {
+		if h.leaseCandidate != "" {
 			// Before any owner-side lookup following an ACK loss, register the
 			// already-held inode if the controller published it.
 			if _, err := h.lease.ConfirmPublished(); err != nil {
 				return 0, err
 			}
-			res, err = h.client.AdoptRetainedContext(h.lifetimeCtx, params, *h.opts.Retained, h.leaseCandidate, h.handoffID)
+			account, lookupErr := h.client.RetainedAccountContext(h.lifetimeCtx, sid)
+			if lookupErr != nil {
+				err = lookupErr
+			} else if account == nil && h.opts.Retained == nil {
+				err = h.publishOrdinaryLease()
+				if err == nil {
+					res, err = h.client.AdmitContext(h.lifetimeCtx, params)
+				}
+			} else {
+				res, err = h.client.AdoptRetainedAccountContext(h.lifetimeCtx, params, account, h.opts.Retained, h.leaseCandidate, h.handoffID)
+			}
 		} else {
 			res, err = h.client.AdmitContext(h.lifetimeCtx, params)
 		}
@@ -381,26 +394,18 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 			return 0, fmt.Errorf("admit: %w", err)
 		}
 		if res.Status == resource.StatusRejected {
+			if h.leaseCandidate != "" && res.Reason == resource.ReasonRetentionAccountChanged && resource.HasFeature(res.ClientFeatures, resource.FeatureRetainedMemoryV2) {
+				continue
+			}
 			if h.opts.Retained != nil && res.Reason == resource.ReasonRetentionSettledMissing &&
-				resource.HasFeature(res.ClientFeatures, resource.FeatureRetainedMemoryV1) {
+				resource.HasFeature(res.ClientFeatures, resource.FeatureRetainedMemoryV2) {
 				// The node positively verified RAMReleased for this exact
 				// capture and has no prior ledger (e.g. static -> dynamic).
 				// Close the unpublished candidate before ordinary publication.
-				leaseSpec, err := resource.ReadLease(h.lease.Path())
-				if err != nil {
+				if err := h.publishOrdinaryLease(); err != nil {
 					return 0, err
 				}
-				if err := h.lease.Close(); err != nil {
-					return 0, err
-				}
-				h.lease, err = resource.CreateLease(leaseSpec)
-				if err != nil {
-					return 0, err
-				}
-				h.opts.Retained = nil
-				h.mu.Lock()
-				h.retention = nil
-				h.mu.Unlock()
+
 				continue
 			}
 			if res.Reason != "" {
@@ -411,7 +416,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 		if res.Status != resource.StatusAdmitted {
 			return 0, fmt.Errorf("admit returned unexpected status %q", res.Status)
 		}
-		if h.opts.Retained != nil {
+		if h.leaseCandidate != "" {
 			published, err := h.lease.ConfirmPublished()
 			if err != nil || !published {
 				return 0, fmt.Errorf("admitted handoff lease was not published: %v", err)
@@ -431,7 +436,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 		}
 		h.mu.Lock()
 		h.admitted, h.connected = true, true
-		h.retainedSupported = resource.HasFeature(res.ClientFeatures, resource.FeatureRetainedMemoryV1)
+		h.retainedSupported = resource.HasFeature(res.ClientFeatures, resource.FeatureRetainedMemoryV2)
 		h.reservationBytes = initialBudget
 		h.cacheSupported = res.CacheSupported
 		h.cacheCoordinated = res.CacheCoordinated
@@ -717,7 +722,7 @@ func (h *ControllerHooks) reconnectLoop() {
 				if syncErr == nil {
 					h.mu.Lock()
 					h.connected, h.previousToken = true, result.Token
-					h.retainedSupported = resource.HasFeature(result.ClientFeatures, resource.FeatureRetainedMemoryV1)
+					h.retainedSupported = resource.HasFeature(result.ClientFeatures, resource.FeatureRetainedMemoryV2)
 					if !state.cacheCoordinated {
 						h.cacheReclaimTarget = result.CacheReclaimTarget
 						h.cacheReclaimSeq = result.CacheReclaimSeq
@@ -847,4 +852,22 @@ func readHostMemoryChargeBestEffort(cgroupPath string) uint64 {
 		return 0
 	}
 	return charge
+}
+
+// Used only after the v2 controller positively reports no account (and, for
+// local capture hints, verifies the full inventory is physically released).
+func (h *ControllerHooks) publishOrdinaryLease() error {
+	spec, err := resource.ReadLease(h.lease.Path())
+	if err != nil {
+		return err
+	}
+	if err := h.lease.Close(); err != nil {
+		return err
+	}
+	h.lease, err = resource.CreateLease(spec)
+	if err != nil {
+		return err
+	}
+	h.opts.Retained, h.leaseCandidate, h.handoffID = nil, "", ""
+	return nil
 }

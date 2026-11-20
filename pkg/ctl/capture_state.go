@@ -11,6 +11,7 @@ import (
 )
 
 const HostRetirementVersion = 1
+const CheckpointLifecycleVersion = 2
 const HostRetirementEnvironment = "SANDBOX_CHECKPOINT_RETIREMENT"
 const TypeCaptureStateRequest = "capture_state_request"
 const TypeCaptureStateResponse = "capture_state_response"
@@ -56,8 +57,8 @@ func ParseHostRetirement(raw string) (*HostRetirementPermit, error) {
 }
 
 type CaptureStateQuery struct {
-	// ForCapture asks whether the previous RAM obligation blocks a new
-	// retiring memory capture. False preserves the direct save-state query.
+	// ForCapture asks for current-run capture capability. Historical holders
+	// never block capture. False reports whether any capture still retains RAM.
 	ForCapture                  bool   `json:"for_capture,omitempty"`
 	SandboxID                   string `json:"sandbox_id"`
 	InstanceID                  string `json:"instance_id"`
@@ -66,6 +67,7 @@ type CaptureStateQuery struct {
 }
 
 type CaptureState struct {
+	LifecycleVersion int `json:"lifecycle_version"`
 	// RetentionSupported is populated for capture-admission queries. Nil is
 	// an older peer with no capability answer, not evidence of a sync path.
 	RetentionSupported *bool  `json:"retention_supported,omitempty"`

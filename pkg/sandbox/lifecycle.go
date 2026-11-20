@@ -993,7 +993,6 @@ func (q *allQuiescer) Resume() {
 type SnapshotHandler struct {
 	runtime               *Runtime
 	CurrentRun            *artifact.CurrentRun
-	previousMemory        *previousMemorySave
 	MemoryLayout          snapshot.MemoryLayout
 	CaptureMemory         func(context.Context) (*memory.CaptureView, error)
 	checkpointMaintenance *diffstore.DirectoryMaintenance
@@ -1084,23 +1083,18 @@ func (h *SnapshotHandler) snapshotAdmission(backendCtx context.Context) func(con
 		defer cancel()
 		stop := context.AfterFunc(backendCtx, cancel)
 		defer stop()
-		return h.waitPreviousMemoryForCapture(ctx, req)
+		return h.validateCaptureRetention(ctx, req)
 	}
 }
 
-// Both socket admission and direct capture wait only when this request can
-// create another frozen-memory obligation. The handler rechecks after socket
-// admission so admission does not grant a stale retention capability.
-func (h *SnapshotHandler) waitPreviousMemoryForCapture(ctx context.Context, req ctl.Request) error {
-	retain, err := checkpointMemoryRetention(req, RunOptions{EnableCheckpoint: h.EnableCheckpoint, runtime: h.runtime, CurrentRun: h.CurrentRun})
-	if err != nil {
+// Validate the capability and exact host permit before capture admission.
+// Older holders remain independently charged and do not gate this generation.
+func (h *SnapshotHandler) validateCaptureRetention(ctx context.Context, req ctl.Request) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if retain {
-		_, err := h.previousMemory.wait(ctx, req.NoWaitForPreviousMemorySave)
-		return err
-	}
-	return nil
+	_, err := checkpointMemoryRetention(req, RunOptions{EnableCheckpoint: h.EnableCheckpoint, runtime: h.runtime, CurrentRun: h.CurrentRun})
+	return err
 }
 
 func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-chan struct{}) (ctl.Response, error) {
@@ -1115,7 +1109,7 @@ func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cg
 			err = errors.Join(ctl.ErrCaptureRejected, err)
 		}
 	}()
-	if err := h.waitPreviousMemoryForCapture(ctx, req); err != nil {
+	if err := h.validateCaptureRetention(ctx, req); err != nil {
 		return ctl.Response{}, err
 	}
 	if err := h.capture.begin(); err != nil {
@@ -1269,6 +1263,13 @@ func handleExportRequest(
 		}
 	}
 
+	sourceGuard, err := protectCaptureParents(ctx, opts, false)
+	if err != nil {
+		return ctl.Response{}, err
+	}
+	if sourceGuard != nil {
+		defer func() { err = errors.Join(err, sourceGuard.Close()) }()
+	}
 	opts, diffs, diskMerged, mergeBaseOpener, err := prepareCheckpointDisks(ctx, opts, disks)
 	if err != nil {
 		return ctl.Response{}, fmt.Errorf("export: checkpoint disks: %w", err)
@@ -1609,6 +1610,13 @@ func handleSnapshotRequest(
 		if err := ensureSnapshotDir(req.OutDir); err != nil {
 			return ctl.Response{}, fmt.Errorf("snapshot output directory: %w", err)
 		}
+	}
+	sourceGuard, err := protectCaptureParents(ctx, opts, true)
+	if err != nil {
+		return ctl.Response{}, err
+	}
+	if sourceGuard != nil {
+		defer func() { err = errors.Join(err, sourceGuard.Close()) }()
 	}
 	opts, diffs, diskMerged, mergeBaseOpener, err := prepareCheckpointDisks(ctx, opts, disks)
 	if err != nil {

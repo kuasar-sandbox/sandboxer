@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,29 +64,23 @@ func TestPreviousMemoryUnavailableDoesNotPoisonLaterPause(t *testing.T) {
 	if err := unix.Flock(int(pin.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
 		t.Fatal(err)
 	}
-	p, err := newPreviousMemorySave(directory, "sid")
-	if err != nil {
-		t.Fatal(err)
+	observed, err := memorycheckpoint.ObservePreviousSave(context.Background(), directory, r)
+	if !errors.Is(err, memorycheckpoint.ErrMemoryUnavailable) || observed.Record.RAMReleased {
+		t.Fatalf("live pin lost its charge: %+v %v", observed, err)
 	}
-	if _, err := p.wait(context.Background(), false); !errors.Is(err, memorycheckpoint.ErrMemoryUnavailable) {
-		t.Fatalf("default wait did not report impossible save: %v", err)
-	}
-	if p.ready {
-		t.Fatal("unavailable source fabricated released RAM")
-	}
-	if _, err := p.wait(context.Background(), true); !errors.Is(err, ctl.ErrMemorySavePending) {
-		t.Fatalf("no-wait lost retryable conflict: %v", err)
+	h := &SnapshotHandler{SandboxID: "sid", CheckpointDir: directory, EnableCheckpoint: true, runtime: &Runtime{}}
+	state, err := h.captureState(context.Background(), ctl.CaptureStateQuery{SandboxID: "sid", ForCapture: true})
+	if err != nil || state.Pending || state.RetentionSupported == nil || !*state.RetentionSupported {
+		t.Fatalf("old loss poisoned new admission: %+v %v", state, err)
 	}
 	if err := pin.Close(); err != nil {
 		t.Fatal(err)
 	}
-	got, err := p.wait(context.Background(), false)
-	if err != nil || !p.ready || !got.Lost() || got.SaveError == "" {
-		t.Fatalf("historical loss poisoned next pause: ready=%v record=%+v err=%v", p.ready, got, err)
+	observed, err = memorycheckpoint.ObservePreviousSave(context.Background(), directory, r)
+	if err != nil || !observed.Record.RAMReleased || !observed.Record.Lost() {
+		t.Fatalf("exact release recovery: %+v %v", observed, err)
 	}
-	if _, err := p.wait(context.Background(), true); err != nil {
-		t.Fatal(err)
-	}
+
 }
 
 func prepareMemorySaveHolder(t *testing.T, directory string, fd *os.File) *memorycheckpoint.Holder {
@@ -108,44 +103,23 @@ func prepareMemorySaveHolder(t *testing.T, directory string, fd *os.File) *memor
 	return h
 }
 
-func TestPreviousMemoryWaitDoesNotEnterCapture(t *testing.T) {
+func TestPreviousMemoryDoesNotBlockNewCaptureAdmission(t *testing.T) {
 	directory := t.TempDir()
 	record := memorySaveRecord(t, directory)
-	p, err := newPreviousMemorySave(directory, "sid")
-	if err != nil {
+	if err := record.Update(func(r *memorycheckpoint.CaptureRecord) { r.RuntimeRetired = true }); err != nil {
 		t.Fatal(err)
 	}
-	h := &SnapshotHandler{EnableCheckpoint: true, previousMemory: p, runtime: &Runtime{}}
-	if _, err := h.handleContext(context.Background(), ctl.Request{CheckpointID: "next", NoWaitForPreviousMemorySave: true}, "", nil); !errors.Is(err, ctl.ErrMemorySavePending) {
-		t.Fatalf("no-wait=%v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		_, err := h.handleContext(ctx, ctl.Request{CheckpointID: "next"}, "", nil)
-		done <- err
-	}()
-	// The source record itself proves pending; cancellation must not allow
-	// the handler to reach its deliberately absent VMM/capture dependencies.
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("wait=%v", err)
+	h := &SnapshotHandler{SandboxID: "sid", CheckpointDir: directory, EnableCheckpoint: true, runtime: &Runtime{}, CHProcess: func() processSignaler { return nil }}
+	for _, noWait := range []bool{false, true} {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := h.handleContext(ctx, ctl.Request{CheckpointID: "next", NoWaitForPreviousMemorySave: noWait}, "", nil)
+		cancel()
+		if err == nil || !strings.Contains(err.Error(), "process is not started") {
+			t.Fatalf("prior holder gated preflight: %v", err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("cancelled pause wait retained request")
-	}
-	if h.capture.active || h.capture.terminal {
-		t.Fatal("waiting changed the capture state")
-	}
-	if err := record.Update(func(r *memorycheckpoint.CaptureRecord) {
-		r.RuntimeRetired, r.FileReady, r.RAMReleased, r.PayloadRef = true, true, true, "payload"
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := p.wait(context.Background(), true); err != nil {
-		t.Fatal(err)
+		if record.Read().RAMReleased {
+			t.Fatal("admission fabricated RAM release")
+		}
 	}
 }
 

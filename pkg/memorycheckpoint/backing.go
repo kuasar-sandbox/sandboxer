@@ -211,6 +211,9 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 	if err != nil {
 		return nil, err
 	}
+	if r.Deleted {
+		return nil, ErrDeleted
+	}
 	if r.MemoryID != d.MemoryID || !r.Committed || r.Aborted || r.Discarded {
 		return nil, errors.New("memory checkpoint: uncommitted or mismatched backing")
 	}
@@ -226,6 +229,15 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 		if file.Size() != d.Size {
 			file.Close()
 			return errors.New("memory checkpoint: payload geometry mismatch")
+		}
+		// A deleted version rejects a newly opened file view too. The directory
+		// pin already protects this view if deletion linearizes after this read.
+		latest, err := ReadRecord(opts.Directory, d.CheckpointID, d.MemoryID)
+		if err != nil {
+			return errors.Join(err, file.Close())
+		}
+		if latest.Deleted {
+			return errors.Join(ErrDeleted, file.Close())
 		}
 		t.reader.file = file
 		close(t.done)
@@ -244,6 +256,9 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 		latest, re := RecoverMemoryRelease(ctx, path, *r)
 		if re != nil {
 			return nil, errors.Join(err, re)
+		}
+		if latest.Record.Deleted {
+			return nil, ErrDeleted
 		}
 		if latest.Record.FileReady {
 			return t, openPayload(latest.Record.PayloadRef)
@@ -272,6 +287,9 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 	var reply holderMessage
 	if err = readHolderMessage(c, &reply); err != nil {
 		return nil, err
+	}
+	if reply.Type == "deleted" {
+		return nil, ErrDeleted
 	}
 	if reply.Size != d.Size {
 		return nil, errors.New("memory checkpoint: holder geometry mismatch")

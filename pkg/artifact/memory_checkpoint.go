@@ -120,10 +120,6 @@ func (p *Publisher) selectedLocalMemoryCheckpoint(ctx context.Context, raw strin
 
 func knownLocalMemoryCarrier(path string, ref manifest.Ref) bool {
 	directory := filepath.Dir(path)
-	current, err := memorycheckpoint.ReadCurrent(directory)
-	if err != nil {
-		return false
-	}
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() {
 		return false
@@ -143,9 +139,6 @@ func knownLocalMemoryCarrier(path string, ref manifest.Ref) bool {
 		}
 		selectedInfo, err := os.Stat(selected)
 		return err == nil && os.SameFile(info, selectedInfo)
-	}
-	if matches(current) {
-		return true
 	}
 	// A named historical capture may differ from the current SID obligation.
 	// These tiny node-local records are evidence; the parent payload is unopened.
