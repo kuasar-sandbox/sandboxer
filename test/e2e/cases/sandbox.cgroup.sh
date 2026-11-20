@@ -60,6 +60,10 @@ PROBE_B64="$(base64 <"$CGROUP_FORK_PROBE_BIN" | tr -d '\n')"
 wait_marker() {
     local marker=$1 log=$2 pid=$3
     for _ in $(seq 1 1200); do
+        if grep -qF 'CG-FAIL' "$log" 2>/dev/null; then
+            grep -nF 'CG-FAIL' "$log" >&2 || true
+            return 1
+        fi
         grep -qF "$marker" "$log" 2>/dev/null && return 0
         if ! kill -0 "$pid" 2>/dev/null; then
             tail -100 "$log" >&2 || true
@@ -227,6 +231,10 @@ EOF
     wait_marker "CG-plugin-GEN-2-SELF $expected" "$log" "$run_pid" || e2e_fail "$name plugin did not restart in expected cgroup"
     wait_marker "CG-plugin-GEN-2-FORK-OK 128" "$log" "$run_pid" || e2e_fail "$name plugin immediate-fork placement failed"
     wait_marker "CG-primary-GEN-2-PID-$pid_mode-OK" "$log" "$run_pid" || e2e_fail "$name PID namespace contract failed"
+    # PID is printed before the controller and membership assertions. Ready,
+    # pong and Exec do not join the primary/plugin console streams.
+    wait_marker 'CG-primary-GEN-2-MEMBERSHIP-OK' "$log" "$run_pid" || e2e_fail "$name primary scoped membership missing"
+    wait_marker 'CG-plugin-GEN-2-MEMBERSHIP-OK' "$log" "$run_pid" || e2e_fail "$name plugin scoped membership missing"
     # Init must share its visible PID 1's cgroup. The runtime may place both
     # at / or, with delegation, /init; this consumer need not know its topology.
     # A failed assertion aborts launch, independently of interleaved console I/O.
