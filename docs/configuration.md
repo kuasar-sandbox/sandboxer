@@ -29,7 +29,7 @@ resources:
   overhead: { memory: 128MiB }
   watermark_high: { ratio: 0.875 }
   startup: { memory: 512MiB }
-  diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB, discard: auto }
+  diff_cow: { cache_size: 32MiB, max_dirty_size: 0, discard: auto }
 
 network:
   # Host provider and current identity:
@@ -173,7 +173,12 @@ objects stay absent unless a consumer resolves a documented default.
 | `resources.watermark_high.ratio` | Number; `0.875` | Strictly between zero and one; explicit object requires a cgroup |
 | `resources.startup.memory` | Size; capacity memory | Positive, at most capacity; independent of allocatable headroom |
 | `resources.diff_cow.cache_size` | Size; `32MiB` | Sandbox-wide cache, positive 4 KiB multiple |
-| `resources.diff_cow.max_dirty_size` | Size; derived from final cache | Positive 4 KiB multiple no larger than total; [derivation and overlays](#diff-cow-policy) |
+| `resources.diff_cow.max_dirty_size` | Size; `0` | Aggregate dirty bytes; zero disables this extra limit, positive values must be 4 KiB multiples no larger than `cache_size` |
+| `resources.diff_cow.max_dirty_size_per_disk` | Size; `0` | Uniform dirty limit for each writable disk; positive values must be 4 KiB multiples |
+| `resources.diff_cow.read_bandwidth`, `write_bandwidth` | Size per second; `0` | Aggregate admitted read/write payload bytes per second |
+| `resources.diff_cow.read_iops`, `write_iops` | Nonnegative integer; `0` | Aggregate complete read/write requests per second |
+| `resources.diff_cow.read_bandwidth_per_disk`, `write_bandwidth_per_disk` | Size per second; `0` | Uniform independent bandwidth limit for each logical disk |
+| `resources.diff_cow.read_iops_per_disk`, `write_iops_per_disk` | Nonnegative integer; `0` | Uniform independent request rate for each logical disk |
 | `resources.diff_cow.cache_idle_after` | Positive duration; `10s` | Time since the last Clean-page access before it counts as idle; does not invalidate or immediately reclaim pages |
 | `resources.diff_cow.discard` | `auto` or `manual`; `auto` | Cold-start policy for all managed writable ext4 mounts; explicit input is rejected on memory restore; [policy](#diff-cow-policy) |
 
@@ -395,15 +400,24 @@ not schedule reads.
 
 <a id="diff-cow-policy"></a>
 
-## `resources.diff_cow`: cache ownership and mount policy
+## `resources.diff_cow`: cache, disk QoS and mount policy
 
 ```yaml
 resources:
   diff_cow:
     cache_size: 32MiB
-    max_dirty_size: 16MiB
     cache_idle_after: 10s
     discard: auto
+    max_dirty_size: 0
+    read_bandwidth: 0
+    write_bandwidth: 0
+    read_iops: 0
+    write_iops: 0
+    max_dirty_size_per_disk: 0
+    read_bandwidth_per_disk: 0
+    write_bandwidth_per_disk: 0
+    read_iops_per_disk: 0
+    write_iops_per_disk: 0
 ```
 
 `discard` accepts `auto` or `manual`; omission resolves to `auto` after the host
@@ -423,40 +437,68 @@ exported Sandbox E therefore uses the destination host's selection. Snapshot S
 still captures Guest mount state. Memory restore retains
 the captured mounts and does not remount: explicitly supplying either `auto` or
 `manual` to `run --restore` is rejected; omit the field. `config --mode restore`
-removes this leaf while preserving `cache_size` and `max_dirty_size`.
+removes this leaf while preserving all cache and QoS settings.
 
 Go SDK callers select the policy through `RuntimeSpec.Resources.DiffCOW.Discard`
 before `StartRuntime`; the runtime uses that selection when the workload is
 launched, including after a live `runtime_ready` prewarm.
 
-The two cache budget fields are positive multiples of 4 KiB, with
-`0 < max_dirty_size <= cache_size`. An omitted `cache_size` defaults to 32 MiB.
-An omitted `max_dirty_size` is derived from the final effective cache size: half
-the cache, rounded down to a 4 KiB multiple, with a minimum of 4 KiB
-(`max(4096, floor(cacheBytes / 2 / 4096) * 4096)`). With both omitted, including
-old configs without `diff_cow`, the effective defaults remain 32 MiB / 16 MiB.
-Setting only `cache_size: 64MiB` gives a 32 MiB dirty limit; cache sizes of 4 KiB
-and 12 KiB both give a 4 KiB dirty limit.
+`cache_size` is a positive multiple of 4 KiB and defaults to 32 MiB. All ten
+limit fields default to `0`: no additional limit for that dimension. Layered
+configuration preserves an earlier value when a leaf is omitted; an explicit
+zero clears that leaf's inherited limit. Resolve defaults only after all
+host overlays have been merged. IOPS values must be nonnegative integers;
+bandwidth values use the existing size syntax with an implicit `/s`. Thus
+`50M`, `50MB` and `50MiB` all mean 50 × 1024² bytes/s. Bandwidth does not require
+4 KiB alignment. All size values must represent whole bytes.
 
-Explicitly setting `max_dirty_size: 16MiB` keeps that value even after a later
-cache override. Omitted dirty limits are derived after all overrides; applying
-defaults or loading a config does not write the derived value into the source
-configuration. Explicit dirty limits are never clamped or recomputed, and the
-final pair must satisfy the relationship above (so a dirty-only 64 MiB config
-fails against the default 32 MiB cache). These are finite engineering
-defaults, not a production SLA or a claim of optimal performance. There is no
-zero/unlimited cache value, cache disable switch, failed-data-I/O buffered retry or
-configurable alternate write mode.
+A positive `max_dirty_size` must be a 4 KiB multiple no larger than `cache_size`.
+A positive `max_dirty_size_per_disk` must be a 4 KiB multiple fitting host address
+space. It may exceed the aggregate dirty limit or cache size: the smaller
+applicable capacity still constrains actual consumption. Neither dirty limit
+creates a separate pool or reserves capacity. Clean pages share the same cache;
+with negotiated node cache grants, actual use remains bounded by the current
+grant as well as `cache_size`. Adding a disk does not multiply the aggregate
+budget. Dirty reservations include pages being constructed and frozen pages
+under writeback; submission alone does not release the quota. Overwrites and
+Data/Zero transitions of an already dirty page do not charge it again. Each
+active writable disk has its own asynchronous writeback worker. The shared
+cache and fatal-error contract remain in effect.
 
-`max_dirty_size` is a subset of `cache_size`, never an additional pool or a
-reserved partition. Clean pages may use the entire cache when there are no dirty
-pages. Adding a disk does not multiply either limit. With a node controller that
-negotiates cache grants, `cache_size` is the sandbox maximum: admission grants
-only a small initial cache budget, and the current budget grows with I/O demand.
-The effective dirty limit is `min(current budget, max_dirty_size)`. Idle clean
-cache is evicted and its physical pages returned before the node regrants it.
+Read and write requests must jointly satisfy their aggregate and logical-disk
+bandwidth/IOPS limits before entering storage. A request is charged once for
+its entire payload, including cache hits and reads from the remote base. An
+overlay root's lower and upper devices share one logical-disk budget. Internal
+writeback, remote fetch retries, FLUSH and DISCARD do not consume another
+read/write request quota. This limits admitted demand; it is not a measurement
+or guarantee of physical device throughput. Limits do not provide a minimum
+share or reserve cache for other disks.
+
+Admission permits one complete request initially, then paces subsequent
+requests by the admitted request's full cost. Idle time does not accumulate
+burst credit. A request larger than a second's bandwidth quota can complete;
+its complete cost delays the next request. Waiting quota is interruptible by
+queue stop, disable and snapshot quiesce. Resume retries the unstarted request
+without requiring another guest kick. Actual started I/O still drains before
+quiesce completes. Policies are fixed when the runtime is created; launching a
+prewarmed runtime or binding a disk slot does not reset its budget. Memory
+restore uses the destination host's merged QoS policy, not artifact policy.
+
+**Upgrade:** the previous omitted dirty limit was half the final cache size.
+It now means no extra dirty limit; physical dirty memory is still bounded by
+the cache grant. Previously normalized configs containing an explicit positive
+value retain it. Regenerate them or use `max_dirty_size: 0` to opt into the new
+default. Upgrade `sandbox-ctl`/the Sandboxer SDK before using the new
+Orchestrator defaults: old versions reject both the new keys and an explicit
+zero dirty limit, and the new default Host YAML includes that zero. There is
+no unlimited cache size, cache disable switch, or buffered retry after a failed
+DIO data operation. These controls are host policy, excluded from portable
+Sandbox E and Snapshot S identities.
+
 The payload remains charged to `sandbox-ctl` in the existing `ctl/` cgroup;
-Guest balloon, Guest reservation and `vmm/` controls are unchanged.
+Guest balloon, Guest reservation and `vmm/` controls are unchanged. For shared
+physical disk control on runner/builder units and the conditional DIO priority
+behavior, see [disk QoS deployment](disk-qos-linux.md).
 
 
 `cache_idle_after` controls only the Clean-page idle statistic. Clean

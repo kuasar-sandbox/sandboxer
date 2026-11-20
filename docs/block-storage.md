@@ -346,11 +346,12 @@ An empty `Drain` does not wait for initialization. Physical path handoff/reopen,
 active export and snapshot publication use `WaitMaterialized`. Immutable device
 identity, size, health checks and fresh checkpoint invalidation do not wait for
 format I/O. Discard and template backfill wait before taking frontend stripes.
-The one cache worker selects the oldest eligible dirty page across its bounded
-queue, skipping pending backends before freezing pages; a pending prefix longer
-than a batch cannot hide ready work. Pending pages remain readable and rewritable,
-but still consume the shared quota. If all work is pending, the worker sleeps
-until completion, new eligible work, failure or shutdown wakes it.
+Each writable disk has its own cache worker and bounded dirty queue. A pending
+backend keeps its own queue dormant until initialization completes, without
+making another worker scan or wait on that prefix. Pending pages remain readable
+and rewritable, and consume the shared quota plus any per-disk dirty quota. An
+idle or pending worker sleeps until publication, initialization completion,
+failure or shutdown wakes it.
 
 Initialization is admitted once before fallible frontend attachment and is joined
 directly on construction failure. Request cancellation affects only the waiter;
@@ -386,7 +387,8 @@ open, first useful I/O, Ready, publication and Close timings.
   stream, not separately owned fetcher/cache clients.
 - Without `WithCache`, `Disk` creates and closes a private cache. With `WithCache`,
   the caller owns the shared cache: close all attached disks before the cache.
-  A sandbox's writable devices continue sharing one budget and one worker.
+  A sandbox's writable devices share one capacity and dirty budget, with an
+  optional dirty ceiling and an independent writeback worker for each disk.
 - `ReadAtContext`/`WriteAtContext` carry queue cancellation across the package
   boundary. `ReadAt`/`WriteAt` remain conventional context-free entry points.
 - Guest `Flush` checks health; it does not promise media persistence. `Drain`
@@ -509,16 +511,16 @@ admission nor backend batching makes the whole range atomic; cancellation or a
 later failure can leave an accepted or committed prefix. Ordinary writes of zero
 bytes remain Data; this adds neither WRITE_ZEROES nor content-based compression.
 
-Each pending v4 Zero consumes one logical page of the existing shared total and
-dirty quotas. Replacing an unselected dirty page reuses its reservation and FIFO
-position. Same-page loading, construction or frozen writeback must finish first;
+Each pending v4 Zero consumes one logical page of total capacity and both the
+shared and per-disk dirty budgets. Replacing an unselected dirty page reuses its
+reservation and FIFO position. Same-page loading, construction or frozen writeback must finish first;
 quota waits release the frontend stripe. The cache publishes Zero and frontend
 presence before ACK, so older Data writeback cannot resurrect a discarded page.
 Zero has no 4 KiB payload. Data-to-Zero clears and returns the old buffer to the
 bounded Data pool; a later partial write acquires a zeroed buffer and preserves
 zero outside the written span without reading the old backend, template or base.
 
-The existing single worker batches one disk and one kind at a time: at most 256
+Each disk's worker batches one kind at a time: at most 256
 Data pages in the 1 MiB workspace, or 1024 Zero pages without a payload workspace.
 Normal selection retains the oldest eligible FIFO anchor. `Store.DiscardPages`
 validates a bounded set of distinct blocks, combines adjacent ranges and removes
@@ -540,16 +542,16 @@ Zero failure, retry failure or an independently fatal cache stops progress throu
 the existing sticky-failure path. Ordinary `Store.WritePages` retains its original
 validation, duplicate-block behavior and sticky reservation-failure contract.
 
-When either quota blocks admission of a cold/clean Zero and no already charged
+When any quota blocks admission of a cold/clean Zero and no already charged
 Zero on that disk can release quota, DISCARD uses the synchronous single-page
 path without a new reservation or first kicking queued Data. It still waits for
 same-page loading/construction/writeback. This avoids a quota deadlock; it does
 not guarantee recovery from arbitrary host-space exhaustion or supersede I/O
-already in progress. No extra worker, unbounded request queue or tuning option is
-introduced.
+already in progress. The recovery uses that disk's existing writeback worker;
+it introduces no extra worker, unbounded request queue or recovery tuning option.
 
-Successful Zero writeback removes the cache entry and releases both quotas; it
-does not enter the clean LRU. Data retains its normal clean-cache behavior.
+Successful Zero writeback removes the cache entry and releases all its
+reservations; it does not enter the clean LRU. Data retains its normal clean-cache behavior.
 `Drain`, named Checkpoint and normal Close wait for accepted Zero writeback. Pages
 that remain Zero at that boundary have no active Data mapping and report
 PayloadPresence=false. Retained Checkpoints/readers can still protect old records,
@@ -733,7 +735,7 @@ their existing behavior.
 The stack is `Disk -> plaintext cache -> diffBackend -> single-layer or versioned storage`. Pages are 4096 bytes. Base reads do not populate or
 materialize the upper cache. Each cached page is indexed by active file and block number.
 
-| State or transition | Total used | Dirty used |
+| State or transition | Total used | Shared and per-disk dirty used |
 | --- | --- | --- |
 | Clean, dirty, writeback, read loading | One page each | Dirty/writeback only |
 | New write construction/reservation | One page | One page |
@@ -744,20 +746,39 @@ materialize the upper cache. Each cached page is indexed by active file and bloc
 | Successful explicit Zero writeback | Remove one page | Remove one page |
 | Evict clean | Remove one page | Unchanged |
 
-At all times `dirty_used <= used <= cache_size` and
-`dirty_used <= max_dirty_size`. Submitting I/O does not release reservations.
-The metadata pool, Data-buffer pool, index, clean LRU and dirty FIFO are bounded
-by capacity. Explicit Zero stores metadata with no payload, but is charged as a
-full logical page. Data owns a separate 4 KiB buffer, cleared before pooling.
+At all times `dirty_used <= used <= current cache capacity`. Both
+`max_dirty_size` and `max_dirty_size_per_disk` default to `0`, meaning no
+independent ceiling; capacity still bounds all reservations. A positive shared
+limit additionally requires `dirty_used <= max_dirty_size`; a positive per-disk
+limit requires each disk's charged dirty bytes to stay at or below that limit.
+Every dirty reservation is charged once to both counters, including construction,
+Zero and frozen writeback. Submitting I/O does not release it. Overwriting an
+already dirty page adds no charge.
+
+`NewCache` and `NewElasticCache` accept `WithPerDiskDirtyLimit(bytes)`. The
+per-disk setting may exceed the shared limit or capacity; admission must satisfy
+all applicable bounds. With an elastic cache, the effective shared dirty limit
+is the current capacity when configured as zero, or the smaller of the positive
+shared limit and current capacity. A private fallback cache uses the same zero
+defaults. The current runtime keeps one active writable `Disk` per logical disk;
+checkpoint versions and read-only export views do not acquire another dirty
+budget.
+
+The metadata pool, Data-buffer pool, index, clean LRU and all per-disk dirty queues
+together are bounded by capacity. Explicit Zero stores metadata with no payload,
+but is charged as a full logical page. Data owns a separate 4 KiB buffer, cleared before pooling.
 The strong Data pool retains its previous high-water allocation until cache
 close; Data-to-Zero does not promise heap/RSS reclamation. A cold Zero-only
 workload avoids those payload allocations, but Zero-to-Data needs a buffer and
 may allocate if the pool is empty. Reading a committed Zero after its cache entry
 was released uses the normal clean-Data read cache and can allocate a buffer too.
 
-Selection and operation arrays are each bounded by 1024 entries. Space-pressure
-recovery additionally captures at most `max_dirty_size / 4096` existing Zero-page
-pointers, without copying payload. Other overhead depends on the backend:
+Each disk's worker has selection and operation arrays bounded by 1024 entries.
+Space-pressure recovery captures only that disk's currently charged Zero-page
+pointers, without copying payload. The cohort is bounded by current cache
+capacity and any positive shared/per-disk dirty ceilings; zero configuration
+values do not imply a zero-sized cohort. Concurrent cohorts remain part of the
+same charged shared budget. Other overhead depends on the backend:
 
 - v3 owns two independent 1 MiB MAP_SHARED I/O workspaces per active file,
   each with less than 1 MiB alignment padding.
@@ -810,9 +831,9 @@ Contiguous base blocks within the requested bounded range are passed together
 to `BlockReader`, which retains its own lower read boundaries. No request-sized
 payload allocation or base prefetch is added.
 
-Writes acquire total and dirty capacity together before constructing a new page.
-Clean promotion needs only dirty quota; rewriting an unselected dirty page needs
-no extra quota or queue node. Full-page overwrites need no old-data read. First
+Writes acquire total capacity and both dirty budgets together before constructing
+a new page. Clean promotion needs only the two dirty budgets; rewriting an
+unselected dirty page needs no extra quota or queue node. Full-page overwrites need no old-data read. First
 partial writes build the full page from base (or zeros), preserving the existing
 short-base/error behavior. Later partial writes preserve every untouched byte.
 The cache copies guest bytes before completion and never retains descriptor
@@ -822,26 +843,31 @@ When full, evict least-recently-used clean pages; otherwise wait for writeback.
 Quota waits are cancellable and recheck state after waking. Waiters hold no page
 reservation needed by the worker. One-page capacity and all-pages-in-flight must
 make progress. No request creates a background goroutine or an unbounded payload
-queue. Block stripes serialize foreground same-block operations; the worker does
+queue. Block stripes serialize foreground same-block operations; workers do
 not acquire these locks.
 
 <a id="writeback"></a>
 
 ### Writeback and FLUSH
 
-One sandbox worker normally anchors each batch on the oldest eligible dirty page.
-Hot overwrites do not move a page to the tail. It batches one file and one kind:
+Each writable disk has one worker with its own dirty FIFO, kick and aggregation
+window. It normally anchors each batch on that disk's oldest eligible dirty page.
+Hot overwrites do not move a page to the tail. Each worker batches one kind:
 up to 256 Data pages (1 MiB) or 1024 Zero pages, without filling holes or
 preallocating gaps. A fixed 1 ms
-aggregation window allows low-rate traffic to progress; quota pressure and
-internal Drain wake it immediately. Selected pages become frozen writeback:
-reads remain possible and same-page writes wait. v3 copies frozen Data pages
+aggregation window allows low-rate traffic to progress. Normal writes and a
+single-disk Drain wake only that disk; shared capacity/dirty pressure, a shared
+Drain and fatal shutdown wake all affected workers. Selected pages become frozen
+writeback: reads remain possible and same-page writes wait. v3 copies frozen Data pages
 directly into its per-file aligned MAP_SHARED write workspace and encrypts that
 copy. v4 first copies/encrypts each contiguous physical run in a bounded heap
 transaction buffer, then copies it into a shared direct-I/O pool buffer for the
 syscall. Both perform I/O without cache or global locks. Cache page payloads stay
 plaintext and never become syscall buffers. Foreground read staging is separate
 from write staging; v4 reads and writes borrow from the same process-wide I/O pool.
+Independent workers remove the single cache worker's cross-disk serialization,
+but do not isolate shared cache capacity, the four-buffer v4 pool or the physical
+device. Four stalled pool borrowers can still hold up another caller.
 
 The bounded page index supplies contiguous dirty neighbours from the same file,
 regardless of arrival order; unselected FIFO age is unchanged. Ordinary write
@@ -850,8 +876,8 @@ and Drain interrupt it. An already aggregated backlog proceeds without a new
 1 ms wait per batch, including batches that contain only one page.
 
 Zero batches write metadata without copying or encrypting payload, and successful
-Zero entries release both quotas rather than occupying the clean LRU. Pending
-Zero still consumes quota, can evict unrelated clean Data and can increase
+Zero entries release total and both dirty reservations rather than occupying the
+clean LRU. Pending Zero still consumes quota, can evict unrelated clean Data and can increase
 same-page write waits. `WrittenBytes` counts completed logical Data only, excluding
 Zero and replayed prefixes during the bounded [space-pressure recovery](#discard-and-reclamation).
 Backend metadata work remains serialized inside the Store, so unrelated cache
@@ -1061,20 +1087,24 @@ waiting for all GC. Retained versions and unfinished GC can still occupy disk
 space after mapping removal; named Checkpoint and normal Close also wait for
 accepted Zero. Normal Close
 stops new frontend work, cancels quota waits, drains accepted healthy writes,
-joins I/O, clears plaintext and closes the file. Frontend cancellation does not
-cancel healthy writeback. Close is idempotent and drain/close errors propagate
+joins that disk's worker and I/O, clears plaintext and closes the file. The worker
+entry remains attached until its cached pages are released. Frontend cancellation
+does not cancel healthy writeback. Close is idempotent and drain/close errors propagate
 through run/restore. Destruction must also wait for actual in-flight syscalls
 before freeing their buffers.
 
 Apart from the pre-write reservation recovery described under
 [Discard](#discard-and-reclamation), writeback and short-write failures are sticky:
-failed pages remain dirty-accounted,
+failed pages remain charged to both dirty budgets,
 new writes fail, all waiters wake, and the runtime receives a non-blocking fatal
 notification without self-joining. A partial physical write may already have changed
 the file. Cleanup of newly materialized blocks cannot punch previously existing
 upper pages in the same batch. Frontend request acceptance is not a durable whole-request transaction. The v4 backend retains its [committed-transaction recovery contract](#versioned-format); there is no silent buffered retry.
 
 Fatal errors are latched and the owner notified before cache-layer cleanup I/O. While rollback runs, active-I/O ownership, frozen pages and their quotas remain held so Close cannot release the file or buffers early. Cleanup errors are joined afterward without masking the original failure.
+Fatal state remains shared by the sandbox cache; separate workers do not provide
+per-disk failure isolation. Each disk still joins its own outstanding I/O before
+its buffers can be released.
 
 <a id="segmented-vhost-reads"></a>
 
@@ -1104,9 +1134,10 @@ discontiguous 256 KiB descriptors can use four direct calls. The last writable
 byte belongs to status.
 Each queue that first needs aggregation retains 1 MiB outside
 `diff_cow.cache_size`. Count each disk separately. Copying and clearing add
-CPU and memory traffic on fragmented reads, including cache hits. Cache and
-dirty limits keep their existing defaults. Increasing either budget does not
-change how the Guest forms requests on a cache miss.
+CPU and memory traffic on fragmented reads, including cache hits. The configured
+cache capacity defaults to 32 MiB; independent shared and per-disk dirty ceilings
+default to zero. Increasing a budget does not change how the Guest forms requests
+on a cache miss.
 
 Full reads, including a full count with ordinary EOF/EAGAIN, complete normally.
 A short read now delivers the valid prefix and reports IOERR. The old loop

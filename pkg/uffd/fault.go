@@ -82,7 +82,11 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 	pageOffset := memfdOffset &^ (PageSize - 1)
 	pageIdx := pageOffset / PageSize
 
-	switch state := h.state.Get(pageIdx); state {
+	state := h.state.Get(pageIdx)
+	if h.pageTrace != nil {
+		h.pageTrace.record("fault", pageOffset, PageSize, state, nil)
+	}
+	switch state {
 	case StateAbsent:
 		h.stats.faultsAbsent.Add(1)
 		h.handleAbsentFault(ev.uffdFD, pageVA, pageOffset, pageIdx, pageBuf)
@@ -153,6 +157,9 @@ func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint
 	if run.End()-pageOffset < PageSize {
 		h.failRead(fmt.Errorf("uffd: source Run [%d,%d) does not cover fault page", run.Offset(), run.End()))
 		return
+	}
+	if h.pageTrace != nil && pageOffset == h.pageTrace.page {
+		h.traceSource(run)
 	}
 
 	switch run.Kind() {

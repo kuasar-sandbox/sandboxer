@@ -24,9 +24,10 @@ const (
 // absent or predates cache grants. On negotiated nodes it acquires the initial
 // host memory grant before touching a single payload page, and returns a
 // lifetime-bound stop function for the autonomous cache budget loop.
-func NewCacheWithBudget(ctx context.Context, hooks *ControllerHooks, maximum, maxDirty uint64, idleAfter ...time.Duration) (*diffstore.Cache, func(), error) {
+func NewCacheWithBudget(ctx context.Context, hooks *ControllerHooks, maximum, maxDirty, maxDirtyPerDisk uint64, idleAfter ...time.Duration) (*diffstore.Cache, func(), error) {
+	cacheOptions := []diffstore.CacheOption{diffstore.WithPerDiskDirtyLimit(maxDirtyPerDisk)}
 	if hooks == nil || !hooks.CacheSupported() {
-		cache, err := diffstore.NewCache(maximum, maxDirty)
+		cache, err := diffstore.NewCache(maximum, maxDirty, cacheOptions...)
 		return cache, func() {}, err
 	}
 	cleanIdleAfter := defaultCacheIdleAfter
@@ -69,7 +70,7 @@ func NewCacheWithBudget(ctx context.Context, hooks *ControllerHooks, maximum, ma
 		case <-t.C:
 		}
 	}
-	cache, err := diffstore.NewElasticCache(maximum, maxDirty, first)
+	cache, err := diffstore.NewElasticCache(maximum, maxDirty, first, cacheOptions...)
 	if err != nil {
 		// Construction has already closed its transient backing on failure;
 		// therefore even after a lost release reply this lower baseline is safe.

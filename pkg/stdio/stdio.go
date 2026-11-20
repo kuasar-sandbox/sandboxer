@@ -332,33 +332,71 @@ func (m Mode) SetupCHStdio(cmd *exec.Cmd) (consoleArg string, cleanup func(), er
 // session's streams. streams is the negotiated set echoed in the *_ack
 // (use StreamSetFor). It returns a cleanup that, in tty mode, restores
 // the terminal and stops consuming caller-supplied resize events; in all modes it closes
-// any files it opened and waits for the guest→host pumps to drain
-// (which they do once the app exits / the session ends). ctx cancel or
-// session death also ends the pumps.
+// any files it opened, cancels and joins input, and waits for guest→host pumps
+// to drain. Output reads end on stream EOF or session death; cancelling ctx
+// alone does not interrupt a MUX read or a blocked destination write.
+// Callers that require successful output delivery must use BridgeWithResult.
 func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamSet) (cleanup func(), err error) {
+	finish, err := m.BridgeWithResult(ctx, sess, streams)
+	if err != nil {
+		return nil, err
+	}
+	return func() { _ = finish() }, nil
+}
+
+// BridgeWithResult is Bridge with an idempotent completion function that also
+// reports output-copy and owned-output Close errors. A failed output pump closes
+// the session so a peer waiting for stream credit cannot keep the caller stuck.
+// Input cancellation/reset is normal cleanup and is not an output failure.
+// The caller must also inspect sess.Err after the session has ended.
+func (m Mode) BridgeWithResult(ctx context.Context, sess *mux.Session, streams mux.StreamSet) (cleanup func() error, err error) {
 	ctx, cancel := context.WithCancel(ctx)
+	type output struct {
+		name  string
+		src   io.Reader
+		dst   io.Writer
+		owned io.Closer
+	}
 	var (
 		closers []io.Closer
-		waits   []func()
+		waits   []func() error
+		outputs []output
 		restore func()
+		once    sync.Once
+		result  error
 	)
-	cleanupAll := func() {
-		cancel()
-		for _, w := range waits {
-			w()
-		}
-		// Join input before restoring canonical terminal mode: a pending
-		// raw read must not become an uninterruptible canonical read.
-		if restore != nil {
-			restore()
-		}
-		for _, c := range closers {
-			_ = c.Close()
-		}
+	cleanupAll := func() error {
+		once.Do(func() {
+			cancel()
+			for _, w := range waits {
+				result = errors.Join(result, w())
+			}
+			// Join input before restoring canonical terminal mode: a pending
+			// raw read must not become an uninterruptible canonical read.
+			if restore != nil {
+				restore()
+			}
+			for _, c := range closers {
+				_ = c.Close() // owned input; it does not determine output delivery
+			}
+		})
+		return result
 	}
 	defer func() {
 		if err != nil {
-			cleanupAll()
+			// Output pumps have not started during fallible setup. Closing an
+			// owned destination here cannot race a blocked destination write.
+			for _, out := range outputs {
+				if out.owned != nil {
+					if closeErr := out.owned.Close(); closeErr != nil {
+						err = errors.Join(err, fmt.Errorf("stdio: close %s: %w", out.name, closeErr))
+					}
+				}
+			}
+			// Input may already be waiting for peer credit. Context cancellation
+			// alone cannot release a blocked MUX write.
+			_ = sess.Close()
+			err = errors.Join(err, cleanupAll())
 		}
 	}()
 
@@ -416,13 +454,12 @@ func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamS
 		inputDone := make(chan struct{})
 		go func() { defer close(inputDone); _ = copyInput(ctx, pty, os.Stdin) }()
 		// guest pty output → terminal, verbatim
-		outDone := make(chan struct{})
-		go func() { defer close(outDone); _, _ = io.Copy(os.Stdout, pty) }()
+		waitOutput := copyOutput(sess, pty, os.Stdout, nil, "pty")
 
-		waits = append(waits, func() {
+		waits = append(waits, func() error {
 			<-inputDone
 			<-winchDone
-			<-outDone
+			return waitOutput()
 		})
 		return cleanupAll, nil
 	}
@@ -447,14 +484,14 @@ func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamS
 		st := sess.Stream(mux.StreamStdin)
 		// A blocked MUX write waits for peer credit and cannot observe ctx.
 		// Reset first during cleanup so joining the input pump is bounded.
-		waits = append(waits, func() { _ = st.Reset() })
+		waits = append(waits, func() error { _ = st.Reset(); return nil })
 		inputDone := make(chan struct{})
 		go func() {
 			defer close(inputDone)
 			_ = copyInput(ctx, st, src)
 			_ = st.CloseWrite() // host stdin EOF → guest closes app's stdin
 		}()
-		waits = append(waits, func() { <-inputDone })
+		waits = append(waits, func() error { <-inputDone; return nil })
 	}
 	// stdout / stderr: guest → host
 	pipeOut := func(streamID uint8, s Stream, inherit *os.File) error {
@@ -462,6 +499,7 @@ func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamS
 			return nil
 		}
 		var dst io.Writer
+		var owned io.Closer
 		switch s.Kind {
 		case StreamInherit:
 			dst = inherit
@@ -471,21 +509,23 @@ func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamS
 				return fmt.Errorf("stdio: open output %s: %w", s.Path, ferr)
 			}
 			dst = f
-			closers = append(closers, f)
+			owned = f
 		case StreamJournald:
 			jw, err := openJournal(s.Journal)
 			if err != nil {
 				return err
 			}
 			dst = jw
-			closers = append(closers, jw) // Close (flush) runs after the copy goroutine is waited
+			owned = jw
 		default: // StreamNone — should not happen if streams[streamID]
 			dst = io.Discard
 		}
 		st := sess.Stream(streamID)
-		done := make(chan struct{})
-		go func() { defer close(done); _, _ = io.Copy(dst, st) }()
-		waits = append(waits, func() { <-done })
+		name := "stdout"
+		if streamID == mux.StreamStderr {
+			name = "stderr"
+		}
+		outputs = append(outputs, output{name: name, src: st, dst: dst, owned: owned})
 		return nil
 	}
 	if err = pipeOut(mux.StreamStdout, m.Stdout, os.Stdout); err != nil {
@@ -494,7 +534,40 @@ func (m Mode) Bridge(ctx context.Context, sess *mux.Session, streams mux.StreamS
 	if err = pipeOut(mux.StreamStderr, m.Stderr, os.Stderr); err != nil {
 		return nil, err
 	}
+	// Prepare every destination before starting any output pump: a later open
+	// failure must not strand an earlier pump in a borrowed or owned sink Write.
+	for _, out := range outputs {
+		waits = append(waits, copyOutput(sess, out.src, out.dst, out.owned, out.name))
+	}
 	return cleanupAll, nil
+}
+
+// copyOutput owns one output pump and, optionally, its destination. Join the
+// pump before closing the destination so buffered writers can flush their tail.
+func copyOutput(sess *mux.Session, src io.Reader, dst io.Writer, owned io.Closer, name string) func() error {
+	done := make(chan struct{})
+	var copyErr error
+	go func() {
+		defer close(done)
+		if _, err := io.Copy(dst, src); err != nil {
+			copyErr = fmt.Errorf("stdio: copy %s: %w", name, err)
+			_ = sess.Close()
+		}
+	}()
+	var once sync.Once
+	var result error
+	return func() error {
+		<-done
+		once.Do(func() {
+			result = copyErr
+			if owned != nil {
+				if err := owned.Close(); err != nil {
+					result = errors.Join(result, fmt.Errorf("stdio: close %s: %w", name, err))
+				}
+			}
+		})
+		return result
+	}
 }
 
 // --- terminal helpers (Linux) ---------------------------------------

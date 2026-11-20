@@ -45,16 +45,19 @@ func TestCOWCacheChargedZeroAccounting(t *testing.T) {
 		pages:        make(map[cacheKey]*cachePage),
 		clients:      make(map[*Disk]int),
 		chargedZeros: make(map[*Disk]int),
-		kick:         make(chan struct{}, 1),
+		workers:      make(map[*Disk]*cacheWorker),
 		started:      time.Now(),
+		done:         make(chan struct{}),
 	}
 	ctx := context.Background()
 	a := &Disk{bitmap: make([]uint64, 1)}
 	b := &Disk{bitmap: make([]uint64, 1)}
 	for _, cow := range []*Disk{a, b} {
-		if err := c.attach(cow); err != nil {
-			t.Fatal(err)
-		}
+		c.clients[cow] = 0
+		done := make(chan struct{})
+		close(done)
+		// Queue metadata without a running worker makes transitions observable.
+		c.workers[cow] = &cacheWorker{cow: cow, kick: make(chan struct{}, 1), done: done}
 	}
 
 	if err := c.stageZero(ctx, a, 0); err != nil {
@@ -84,7 +87,7 @@ func TestCOWCacheChargedZeroAccounting(t *testing.T) {
 	checkBudget(t, c, 1, 1, 0)
 
 	c.mu.Lock()
-	c.dirty.remove(p)
+	c.workers[p.key.cow].dirty.remove(p)
 	p.state = cacheWriteback
 	c.mu.Unlock()
 	checkBudget(t, c, 1, 1, 1)
@@ -103,7 +106,7 @@ func TestCOWCacheChargedZeroAccounting(t *testing.T) {
 	}
 	c.mu.Lock()
 	p = c.pages[cacheKey{a, 1}]
-	c.dirty.remove(p)
+	c.workers[p.key.cow].dirty.remove(p)
 	p.state = cacheWriteback
 	c.completeWritebackLocked([]*cachePage{p})
 	c.mu.Unlock()
@@ -113,7 +116,7 @@ func TestCOWCacheChargedZeroAccounting(t *testing.T) {
 	}
 	checkBudget(t, c, 1, 1, 0)
 	c.mu.Lock()
-	c.dirty.remove(p)
+	c.workers[p.key.cow].dirty.remove(p)
 	p.state = cacheDiscarding
 	c.mu.Unlock()
 	checkBudget(t, c, 1, 1, 0)
@@ -132,7 +135,7 @@ func TestCOWCacheChargedZeroAccounting(t *testing.T) {
 	fatalErr := errors.New("writeback failed")
 	c.mu.Lock()
 	p = c.pages[cacheKey{a, 2}]
-	c.dirty.remove(p)
+	c.workers[p.key.cow].dirty.remove(p)
 	p.state = cacheWriteback
 	c.failLocked(fatalErr)
 	c.mu.Unlock()

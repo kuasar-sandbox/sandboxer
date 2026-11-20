@@ -87,7 +87,7 @@ func TestElasticCacheBurst768(t *testing.T) {
 		lifetimeCtx: ctx, admitted: true, connected: true, cacheSupported: true, cacheMaximum: maximum,
 		cacheWake: make(chan struct{}, 1), reconnectWake: make(chan struct{}, 1),
 	}
-	cache, stop, err := NewCacheWithBudget(ctx, h, maximum, maximum/2)
+	cache, stop, err := NewCacheWithBudget(ctx, h, maximum, maximum/2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

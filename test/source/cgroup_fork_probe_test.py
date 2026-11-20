@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import platform
+import select
 import struct
 import subprocess
 import tempfile
@@ -51,6 +52,127 @@ class InitCgroupAssertionTests(unittest.TestCase):
                              'TEST_READ_STATUS': str(status), 'TEST_PID1_CGROUP': owner,
                              'TEST_PID1_READ_STATUS': str(owner_status)}, timeout=5)
                     self.assertEqual(result.returncode == 0, valid, result.stderr)
+
+
+class ProbeCompletionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source = (ROOT / 'test/e2e/cases/sandbox.cgroup.sh').read_text()
+        # Execute the shipped helper and GEN-2 wait calls, without requiring a
+        # VM. Removing either completion wait must break the handshake below.
+        cls.wait_marker = 'wait_marker() {' + source.split('wait_marker() {', 1)[1].split('\n}', 1)[0] + '\n}'
+        cls.restart_waits = '\n'.join(line for line in source.splitlines()
+                                     if line.strip().startswith('wait_marker ') and '-GEN-2-' in line)
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='cgroup-completion-')
+        self.addCleanup(temporary.cleanup)
+        self.log = Path(temporary.name, 'probe.log')
+        self.producer = self.start_process(['bash', '-c', r'''
+set -euo pipefail
+log=$1
+printf '%s\n' 'CG-primary-GEN-2-SELF /init' 'CG-primary-GEN-2-FORK-OK 128' \
+    'CG-primary-GEN-2-PID-private-OK' 'CG-plugin-GEN-2-SELF /init' \
+    'CG-plugin-GEN-2-FORK-OK 128' >"$log"
+printf 'written\n'
+while IFS= read -r marker; do
+    printf '%s\n' "$marker" >>"$log"
+    printf 'written\n'
+done
+''', 'producer', str(self.log)])
+        self.expect_line(self.producer, 'written\n')
+
+    def start_process(self, command):
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, bufsize=1)
+        self.addCleanup(self.stop_process, process)
+        return process
+
+    @staticmethod
+    def stop_process(process):
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=5)
+
+    def expect_line(self, process, expected):
+        self.assertTrue(select.select([process.stdout], [], [], 5)[0],
+                        'shell did not reach the expected handshake')
+        self.assertEqual(process.stdout.readline(), expected)
+
+    def write_markers(self, *markers):
+        for marker in markers:
+            self.producer.stdin.write(marker + '\n')
+            self.producer.stdin.flush()
+            self.expect_line(self.producer, 'written\n')
+
+    def start_waiter(self):
+        # Gate each retry before its real 50ms sleep, so the test controls log
+        # arrival without racing arbitrary delays against the polling loop.
+        script = r'''
+set -euo pipefail
+log=$1 run_pid=$2 expected=/init pid_mode=private name=test
+e2e_fail() { printf '%s\n' "$*" >&2; exit 1; }
+sleep() { printf 'poll\n'; IFS= read -r advance; command sleep "$@"; }
+'''
+        return self.start_process(['bash', '-c', script + self.wait_marker + '\n' + self.restart_waits,
+                                   'waiter', str(self.log), str(self.producer.pid)])
+
+    @staticmethod
+    def advance(waiter):
+        waiter.stdin.write('\n')
+        waiter.stdin.flush()
+
+    def finish(self, waiter, expected):
+        # Keep stdin open until exit: a missing marker must not appear to fail
+        # merely because the test closed the retry handshake's input.
+        waiter.wait(timeout=5)
+        stdout, stderr = waiter.communicate(timeout=5)
+        self.assertEqual(waiter.returncode, expected, stdout + stderr)
+        return stderr
+
+    def assert_completion_wait(self, pending_role, completed_role):
+        self.write_markers(f'CG-{completed_role}-GEN-2-CONTROLLERS-OK',
+                           f'CG-{completed_role}-GEN-2-MEMBERSHIP-OK')
+        waiter = self.start_waiter()
+        self.expect_line(waiter, 'poll\n')
+        self.write_markers(f'CG-{pending_role}-GEN-2-CONTROLLERS-OK',
+                           f'CG-{pending_role}-GEN-2-MEMBERSHIP-OK')
+        self.advance(waiter)
+        self.finish(waiter, 0)
+
+    def test_waits_for_primary_generation_two_completion_after_pid(self):
+        self.assert_completion_wait('primary', 'plugin')
+
+    def test_waits_for_plugin_generation_two_completion_after_pid(self):
+        self.assert_completion_wait('plugin', 'primary')
+
+    def test_failure_wins_over_later_completion_markers(self):
+        waiter = self.start_waiter()
+        self.expect_line(waiter, 'poll\n')
+        self.write_markers('CG-FAIL primary root-members', 'CG-primary-GEN-2-MEMBERSHIP-OK',
+                           'CG-plugin-GEN-2-MEMBERSHIP-OK')
+        self.advance(waiter)
+        self.assertIn('CG-FAIL primary root-members', self.finish(waiter, 1))
+
+    def test_producer_exit_before_completion_fails(self):
+        waiter = self.start_waiter()
+        self.expect_line(waiter, 'poll\n')
+        self.stop_process(self.producer)
+        self.advance(waiter)
+        self.finish(waiter, 1)
+
+    def test_other_generations_do_not_satisfy_completion(self):
+        self.write_markers('CG-primary-GEN-1-MEMBERSHIP-OK', 'CG-plugin-GEN-1-MEMBERSHIP-OK',
+                           'CG-primary-GEN-3-MEMBERSHIP-OK', 'CG-plugin-GEN-3-MEMBERSHIP-OK')
+        waiter = self.start_waiter()
+        self.expect_line(waiter, 'poll\n')
+        self.stop_process(self.producer)
+        self.advance(waiter)
+        self.finish(waiter, 1)
 
 
 class NativeForkProbeTests(unittest.TestCase):

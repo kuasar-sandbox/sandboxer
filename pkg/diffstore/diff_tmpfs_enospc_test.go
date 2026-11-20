@@ -130,9 +130,9 @@ func TestDiffTmpfsENOSPC(t *testing.T) {
 				t.Fatalf("failure quota %+v", s)
 			}
 			cache.mu.Lock()
-			active := cache.active
+			active := cache.active[cow]
 			cache.mu.Unlock()
-			if active != cow {
+			if !active {
 				t.Fatal("I/O owner released before failed-write cleanup")
 			}
 			// Drain's earlier quota notifications are irrelevant to Close.

@@ -345,9 +345,10 @@ sandbox-ctl mm 的 VMA,不能 register CH mm 的 chVA。所以 uffd 必须在 CH
 事件。fd 表是进程级的,但 uffd ctx 的事件路由按创建者 mm 的 VA 解析,
 sandbox-ctl 收到 fd 后读出来的事件 va 就是 CH 视角的 chVA。
 
-**惰性恢复中的后端首次访问。** 后端 mmap 有意不注册 UFFD。普通 shmem
-访问可能直接创建零页，而未读取快照字节，因此读取或只写一个状态字节也必须先准备
-内存。所有 vhost GPA/UVA 地址转换都在返回切片前调用带上下文的
+**惰性恢复中的后端首次访问。** 后端 mmap 由独立的 `MISSING_SHMEM` + `SIGBUS`
+守卫保护，正常填充仍由 CH 侧的注册完成。未受保护的普通 shmem 访问可能直接创建
+零页而没有读取快照字节；合法的读取或单个状态字节写入仍必须先准备内存。
+所有 vhost GPA/UVA 地址转换都在返回切片前调用带上下文的
 `EnsureLoaded(ctx, memfdOffset, length)` 屏障，覆盖描述符、间接描述符表、
 avail/used ring、请求头、两个方向的数据和状态。缺少回调、范围无效或填充失败都
 使队列终止，不能发布 used-ring 完成记录。所有磁盘通过统一的服务器创建路径绑定
@@ -379,12 +380,15 @@ REMOVE 在等待用户态前释放 mmap 读锁，映射变化期间 COPY 可以�
 
 Close 同步关闭准入和取消操作，等待调用者及所有 worker 退出，并通过有界 epoll
 轮询停止 reader，之后才关闭 UFFD fd。来源和后端映射必须存活至上述等待完成。
-启动早期失败也会取消就绪与握手等待。此方案不增加第二套 UFFD，不使用
-MINOR/CONTINUE，不预先填充整块 RAM，不提高内核最低版本，也不改变资源策略。
+启动早期失败也会取消就绪与握手等待。独立且必须成功建立的 `MISSING_SHMEM` + `SIGBUS`
+UFFD 保护整个 backend VMA，阻止尚未准备页面的首次访问和 remote GUP 提前创建零页。
+该守卫没有 reader 或事件订阅，在整个映射生命周期中有效，并在 backend VMA 解除映射后才关闭。
+内存填充仍只以 CH 注册为目标，不使用 MINOR/CONTINUE，不预先填充整块 RAM，不提高内核
+最低版本，也不改变资源策略。详见[backend 映射保护](memory_zh.md#uffd-registration)。
 
 可重复验证包括 `pkg/vhost` 中的
 `TestRealMissingShmemRestoredUsedRingPreservesUntouchedBytes`：两个共享 memfd
-别名、真实的 CH 侧 MISSING_SHMEM 注册及实际 `publishUsed` 路径，在 CPU-first
+别名、真实的 CH 侧 MISSING_SHMEM 填充注册、完整 backend 守卫及实际 `publishUsed` 路径，在 CPU-first
 和 backend-first 两种顺序下都必须保留周围字节，并把保存的索引从 7 推进至 8。
 UFFD 和地址转换测试覆盖范围、取消、注册、释放及并发失败。现有
 `snapshot.restore.sh` E2E 还在快照/恢复之间保留 O_DIRECT 文件描述符和 32 个

@@ -15,11 +15,11 @@ func TestDiffCOWDefaultsAndYAMLValidation(t *testing.T) {
 		total, dirty uint64
 		invalid      bool
 	}{
-		{"{}", 32 << 20, 16 << 20, false},
-		{"resources: {diff_cow: {cache_size: 64MiB}}", 64 << 20, 32 << 20, false},
-		{"resources: {diff_cow: {cache_size: 128MiB}}", 128 << 20, 64 << 20, false},
-		{"resources: {diff_cow: {cache_size: 4KiB}}", 4096, 4096, false},
-		{"resources: {diff_cow: {cache_size: 12KiB}}", 12 << 10, 4096, false},
+		{"{}", 32 << 20, 0, false},
+		{"resources: {diff_cow: {cache_size: 64MiB}}", 64 << 20, 0, false},
+		{"resources: {diff_cow: {cache_size: 128MiB}}", 128 << 20, 0, false},
+		{"resources: {diff_cow: {cache_size: 4KiB}}", 4096, 0, false},
+		{"resources: {diff_cow: {cache_size: 12KiB}}", 12 << 10, 0, false},
 		{"resources: {diff_cow: {max_dirty_size: 4KiB}}", 32 << 20, 4096, false},
 		{"resources: {diff_cow: {cache_size: 64MiB, max_dirty_size: 16MiB}}", 64 << 20, 16 << 20, false},
 		{"resources: {diff_cow: {cache_size: 64MiB, max_dirty_size: 48MiB}}", 64 << 20, 48 << 20, false},
@@ -112,6 +112,9 @@ func TestDiffCOWValidateExplicitAndResolve(t *testing.T) {
 	}
 	for _, value := range []string{"0", "-4096", "1KiB", "4.001KiB", " ", "18446744073709551616", fmt.Sprint(uint64(^uint(0)>>1) + 1)} {
 		for _, cfg := range []DiffCOWConfig{{CacheSize: value}, {MaxDirtySize: value}} {
+			if cfg.MaxDirtySize == "0" {
+				continue
+			} // zero now clears the dirty ceiling
 			t.Run(fmt.Sprintf("invalid/%+v", cfg), func(t *testing.T) {
 				before := cfg
 				if err := cfg.ValidateExplicit(); err == nil {
@@ -157,7 +160,7 @@ func TestDiffCOWApplyDefaultsBeforeCacheOverride(t *testing.T) {
 						t.Fatal("cache override silently clamped explicit dirty size")
 					}
 				} else {
-					wantDirty := cacheMiB << 19
+					wantDirty := uint64(0)
 					if explicit {
 						wantDirty = 16 << 20
 					}
@@ -181,8 +184,8 @@ func TestDiffCOWMergedFinalPolicy(t *testing.T) {
 		sourceDirty  string
 		invalid      bool
 	}{
-		{"cache override", []string{"cache_size: 32MiB", "cache_size: 64MiB"}, 64 << 20, 32 << 20, "", false},
-		{"larger cache override", []string{"cache_size: 64MiB", "cache_size: 128MiB"}, 128 << 20, 64 << 20, "", false},
+		{"cache override", []string{"cache_size: 32MiB", "cache_size: 64MiB"}, 64 << 20, 0, "", false},
+		{"larger cache override", []string{"cache_size: 64MiB", "cache_size: 128MiB"}, 128 << 20, 0, "", false},
 		{"explicit dirty retained", []string{"cache_size: 32MiB, max_dirty_size: 16MiB", "cache_size: 64MiB"}, 64 << 20, 16 << 20, "16MiB", false},
 		{"explicit dirty override", []string{"cache_size: 8MiB, max_dirty_size: 4MiB", "max_dirty_size: 2MiB"}, 8 << 20, 2 << 20, "2MiB", false},
 		{"dirty before cache", []string{"max_dirty_size: 64MiB", "cache_size: 128MiB"}, 128 << 20, 64 << 20, "64MiB", false},

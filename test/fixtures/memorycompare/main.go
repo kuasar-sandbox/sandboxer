@@ -36,8 +36,11 @@ type layerStat struct {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "page" {
+		return runPage(os.Args[2:], os.Stdout)
+	}
 	if len(os.Args) != 3 {
-		return fmt.Errorf("usage: memorycompare SNAPSHOT RAM.bin")
+		return fmt.Errorf("usage: memorycompare SNAPSHOT RAM.bin | memorycompare page --source-ref REF --source-dir DIR --manifest-config FILE --gpa N --start N --length N")
 	}
 	ctx := context.Background()
 	topPath, err := filepath.Abs(os.Args[1])

@@ -540,11 +540,15 @@ func run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
+	diskLimits, err := snapCfg.Resources.DiffCOW.Limits()
+	if err != nil {
+		return -1, err
+	}
 	idleAfter, err := snapCfg.Resources.DiffCOW.CacheIdleDuration()
 	if err != nil {
 		return -1, err
 	}
-	cowCache, stopCache, err := resctl.NewCacheWithBudget(ctx, hooks, cacheSize, maxDirtySize, idleAfter)
+	cowCache, stopCache, err := resctl.NewCacheWithBudget(ctx, hooks, cacheSize, maxDirtySize, diskLimits.PerDisk.MaxDirtySize, idleAfter)
 	if err != nil {
 		return -1, err
 	}
@@ -630,6 +634,7 @@ func run(ctx context.Context, opts Options) (code int, retErr error) {
 	return sandbox.ServeAndWait(sandbox.VMParams{
 		BaseDir:     sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID),
 		DiskStorage: opts.storage, DiskCache: cowCache, DiskCurrentRun: opts.CurrentRun, DiskPlan: opts.checkpointPlan,
+		DiskIO:             sandbox.NewDiskIOController(diskLimits),
 		EnableCheckpoint:   opts.EnableCheckpoint,
 		CheckpointOwner:    opts.checkpointOwner,
 		Balloon:            balloonCtl,

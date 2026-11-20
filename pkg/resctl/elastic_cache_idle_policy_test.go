@@ -59,7 +59,7 @@ func TestElasticCacheIdleAfterTriggersOrdinaryReclaim(t *testing.T) {
 			const mib = uint64(1 << 20)
 			h := newIdlePolicyHooks(t, nil)
 			ctx := context.Background()
-			cache, stop, err := NewCacheWithBudget(ctx, h, 64*mib, 32*mib, tc.idleAfter)
+			cache, stop, err := NewCacheWithBudget(ctx, h, 64*mib, 32*mib, 0, tc.idleAfter)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -121,7 +121,7 @@ func TestElasticCacheReclaimCompletesWithZeroRelease(t *testing.T) {
 			done <- req
 		}
 	})
-	cache, stop, err := NewCacheWithBudget(context.Background(), h, 64*miB, 32*miB, 30*time.Second)
+	cache, stop, err := NewCacheWithBudget(context.Background(), h, 64*miB, 32*miB, 0, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

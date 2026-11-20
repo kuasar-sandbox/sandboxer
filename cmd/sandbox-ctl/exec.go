@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -280,7 +281,7 @@ func runExecOverConnWithRemoteRedaction(c net.Conn, spec proto.ExecSpec, stdioMo
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cleanup, err := stdioMode.Bridge(ctx, sess, ss)
+	cleanup, err := stdioMode.BridgeWithResult(ctx, sess, ss)
 	if err != nil {
 		_ = sess.Close()
 		fmt.Fprintf(os.Stderr, "exec: bridge stdio: %v\n", err)
@@ -315,10 +316,18 @@ func runExecOverConnWithRemoteRedaction(c net.Conn, spec proto.ExecSpec, stdioMo
 	}
 	signal.Stop(sigCh)
 	cancel()
-	cleanup()        // drains stdout/stderr/pty pumps + restores the terminal
-	_ = sess.Close() // tear our side down; don't wait for CH to surface the guest close
+	outputErr := cleanup() // drains stdout/stderr/pty pumps + restores the terminal
+	_ = sess.Close()       // tear our side down; don't wait for CH to surface the guest close
 
 	code, ok := sess.ExitStatus()
+	if err := errors.Join(outputErr, sess.Err()); err != nil {
+		fmt.Fprintf(os.Stderr, "exec: stdio delivery failed: %v\n", err)
+		// Preserve an actual command failure, but never report success for
+		// incomplete output merely because EXIT_STATUS arrived before the error.
+		if !ok || code == 0 {
+			return 1
+		}
+	}
 	if !ok {
 		fmt.Fprintln(os.Stderr, "exec: connection lost before the command reported an exit status")
 		return 1

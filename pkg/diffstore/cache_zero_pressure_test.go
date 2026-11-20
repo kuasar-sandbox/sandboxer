@@ -295,7 +295,7 @@ func TestCheckpointCachedZeroPressureRepairIsFiniteAndOwnerScoped(t *testing.T) 
 		for _, target := range []struct {
 			d     diffBackend
 			block uint64
-		}{{base, 2}, {other.diff, 0}} {
+		}{{base, 2}} {
 			have, err := backendHasPayload(ctx, target.d, target.block)
 			if err != nil {
 				return err
@@ -321,9 +321,8 @@ func TestCheckpointCachedZeroPressureRepairIsFiniteAndOwnerScoped(t *testing.T) 
 		t.Fatal(err)
 	}
 	cache.mu.Lock()
-	bounded := cache.active == cow && cache.pages[cacheKey{cow, 0}].state == cacheWriteback &&
-		cache.pages[cacheKey{cow, 1}].state == cacheWriteback && cache.pages[cacheKey{cow, 2}].state == cacheDirty &&
-		cache.pages[cacheKey{other, 0}].state == cacheDirty
+	bounded := cache.active[cow] && cache.pages[cacheKey{cow, 0}].state == cacheWriteback &&
+		cache.pages[cacheKey{cow, 1}].state == cacheWriteback && cache.pages[cacheKey{cow, 2}].state == cacheDirty
 	cache.mu.Unlock()
 	if !bounded {
 		t.Fatal("repair did not freeze exactly the accepted same-owner cohort")
@@ -407,7 +406,7 @@ func TestCheckpointCachedZeroPressureRepairCloseAndFatal(t *testing.T) {
 			}
 			checkBudget(t, cache, 3, 3, 3)
 			cache.mu.Lock()
-			active := cache.active == cow
+			active := cache.active[cow]
 			cache.mu.Unlock()
 			if !active {
 				t.Fatal("repair dropped active owner before Data retry joined")

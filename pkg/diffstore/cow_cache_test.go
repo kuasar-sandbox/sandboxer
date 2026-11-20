@@ -74,6 +74,7 @@ func checkBudget(t *testing.T, c *Cache, used, dirty, wb int) {
 		t.Fatalf("budget=%+v, want used/dirty/wb=%d/%d/%d pages", s, used, dirty, wb)
 	}
 	checkChargedZeros(t, c)
+	checkDirtyCharges(t, c)
 }
 func checkRead(t *testing.T, c *Disk, block int, want []byte) {
 	t.Helper()
@@ -113,9 +114,11 @@ func TestCOWCacheSharedQuotaAdmissionSnapshotFlush(t *testing.T) {
 	clear(payload) // backend must own guest bytes
 	checkBudget(t, cache, 2, 2, 0)
 	cache.mu.Lock()
-	first, last := cache.dirty.first, cache.dirty.last
+	rootQueue, dataQueue := cache.workers[root].dirty, cache.workers[data].dirty
 	cache.mu.Unlock()
-	if first.key.cow != root || last.key.cow != data || first.next != last || last.next != nil {
+	if rootQueue.first != rootQueue.last || dataQueue.first != dataQueue.last ||
+		rootQueue.first.key.cow != root || dataQueue.first.key.cow != data ||
+		rootQueue.first.next != nil || dataQueue.first.next != nil {
 		t.Fatal("hot overwrites duplicated/reordered FIFO")
 	}
 	want := bytes.Repeat([]byte{0x11}, cowBlockSize)
@@ -415,7 +418,10 @@ func TestCOWCacheFIFOContiguousBatchBoundAndHoles(t *testing.T) {
 		pages int
 	}
 	var records []record
+	var recordMu sync.Mutex
 	cache := testCache(t, 520, 520, cacheHooks{beforeSelect: gate.wait, beforeWrite: func(p []*cachePage) error {
+		recordMu.Lock()
+		defer recordMu.Unlock()
 		records = append(records, record{p[0].key.cow, p[0].key.block, len(p)})
 		return nil
 	}})
@@ -434,8 +440,17 @@ func TestCOWCacheFIFOContiguousBatchBoundAndHoles(t *testing.T) {
 	if err := cache.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 4 || records[0].pages != 256 || records[1].start != 256 || records[1].pages != 256 || records[2].cow != b || records[3].start != 513 || records[3].pages != 3 {
-		t.Fatalf("FIFO batches: %+v", records)
+	var ownerRecords []record
+	otherRecords := 0
+	for _, r := range records {
+		if r.cow == a {
+			ownerRecords = append(ownerRecords, r)
+		} else if r.cow == b && r.pages == 1 {
+			otherRecords++
+		}
+	}
+	if len(ownerRecords) != 3 || otherRecords != 1 || ownerRecords[0].pages != 256 || ownerRecords[1].start != 256 || ownerRecords[1].pages != 256 || ownerRecords[2].start != 513 || ownerRecords[2].pages != 3 {
+		t.Fatalf("per-owner FIFO batches: %+v", records)
 	}
 	bitmap, err := a.diff.scanDirtyBlocks()
 	if err != nil {
@@ -719,7 +734,7 @@ func TestCOWDiscardWaitsWholeBatchBeforeFreezingAndCancels(t *testing.T) {
 			cow.diff = observer
 			cache.mu.Lock()
 			p := cache.pages[cacheKey{cow, 1}]
-			cache.dirty.remove(p)
+			cache.workers[cow].dirty.remove(p)
 			p.state = state
 			cache.mu.Unlock()
 			ctx, cancel := context.WithCancel(context.Background())
@@ -742,7 +757,7 @@ func TestCOWDiscardWaitsWholeBatchBeforeFreezingAndCancels(t *testing.T) {
 			}
 			cache.mu.Lock()
 			p.state = cacheDirty
-			cache.dirty.push(p)
+			cache.workers[cow].dirty.push(p)
 			cache.signalLocked()
 			cache.mu.Unlock()
 			gate.open()
@@ -808,7 +823,7 @@ func TestCOWDiscardFrozenBatchPublishesDespiteCancelOrFailsAndWakes(t *testing.T
 }
 
 func TestCOWCacheRejectsInvalidOwnershipAndSizes(t *testing.T) {
-	for _, sizes := range [][2]uint64{{0, 4096}, {4096, 0}, {4096, 8192}, {4097, 4096}, {8192, 1}} {
+	for _, sizes := range [][2]uint64{{0, 4096}, {4096, 8192}, {4097, 4096}, {8192, 1}} {
 		if c, err := NewCache(sizes[0], sizes[1]); err == nil {
 			_ = c.Close()
 			t.Fatalf("accepted %v", sizes)

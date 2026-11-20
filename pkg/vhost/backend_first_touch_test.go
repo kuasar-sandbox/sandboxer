@@ -1,8 +1,8 @@
 package vhost
 
-// Real kernel regression: two MAP_SHARED aliases with only the CH alias
-// MISSING_SHMEM registered, exactly as in ServeAndWait. Both access orders
-// must preserve the snapshot and advance the saved used index from 7 to 8.
+// Real kernel regression: two MAP_SHARED aliases, a CH MISSING_SHMEM population
+// registration, and both the old unguarded control and full backend guard.
+// Both access orders must preserve the snapshot and advance used index 7 to 8.
 import (
 	"bytes"
 	"context"
@@ -57,14 +57,18 @@ func firstTouchIOCTL(fd int, request uintptr, arg unsafe.Pointer) error {
 	return nil
 }
 func TestRealMissingShmemRestoredUsedRingPreservesUntouchedBytes(t *testing.T) {
-	for _, cpuFirst := range []bool{true, false} {
-		t.Run(fmt.Sprintf("cpu_first_%t", cpuFirst), func(t *testing.T) {
+	for _, order := range []struct{ cpuFirst, guarded bool }{{true, false}, {false, false}, {true, true}, {false, true}} {
+		cpuFirst, guarded := order.cpuFirst, order.guarded
+		t.Run(fmt.Sprintf("cpu_first_%t_guarded_%t", cpuFirst, guarded), func(t *testing.T) {
 			const size = 4096
 			memfd, err := unix.MemfdCreate("issue304-first-touch", unix.MFD_CLOEXEC)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer unix.Close(memfd)
+			var backendGuard *uffd.BackendMemoryGuard
+			// Later defers drain the handler and unmap both aliases first.
+			defer func() { _ = backendGuard.Close() }()
 			if err = unix.Ftruncate(memfd, size); err != nil {
 				t.Fatal(err)
 			}
@@ -78,6 +82,12 @@ func TestRealMissingShmemRestoredUsedRingPreservesUntouchedBytes(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer unix.Munmap(cpu)
+			if guarded {
+				backendGuard, err = uffd.NewBackendMemoryGuard(memfd, uintptr(unsafe.Pointer(&backend[0])), size)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
 			raw, _, errno := unix.Syscall(unix.SYS_USERFAULTFD, uintptr(unix.O_CLOEXEC|unix.O_NONBLOCK|1), 0, 0)
 			// USER_MODE_ONLY was added after the supported 5.10 floor. Fall back
 			// only for an unsupported flag; permission/capability failures remain fatal.

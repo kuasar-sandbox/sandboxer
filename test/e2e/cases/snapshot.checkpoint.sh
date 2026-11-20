@@ -510,6 +510,8 @@ PY
     done' sh "portable-$kind"
     stop_run
     # Each writable backend reports the same shared sandbox cache.
+    # The omitted dirty limit adds no separate ceiling; effective MaxDirty
+    # remains bounded by that cache's capacity.
     python3 - "$OUT/portable-$kind.stats.json" "$MODE" "$BASE_ROOT/portable-$kind/checkpoint/diffs" <<'PY'
 import json, pathlib, struct, sys
 disks = list(pathlib.Path(sys.argv[3]).glob('*.diff'))
@@ -525,7 +527,7 @@ writable = [b for b in backends if 'diff_cow_cache' in b.get('extra', {})]
 assert len(writable) == len({b['name'] for b in writable}) == 3, backends
 for b in writable:
     cache = b['extra']['diff_cow_cache']
-    assert (cache['Capacity'], cache['MaxDirty']) == (67108864, 33554432), (b['name'], cache)
+    assert (cache['Capacity'], cache['MaxDirty']) == (67108864, 67108864), (b['name'], cache)
     assert b['write']['count'] > 0, b
     print(sys.argv[2], b['name'], 'Capacity', cache['Capacity'], 'MaxDirty', cache['MaxDirty'],
           'writes', b['write']['count'])
