@@ -214,6 +214,9 @@ func LockPreparation(directory, checkpointID string) (io.Closer, error) {
 
 // ListRecords includes every attempt: old resource receipts continue to name
 // their original JSON and proof inode even after a later attempt is prepared.
+// On error it still returns individually validated records. Inventory callers
+// must treat the error as incomplete inventory; positive identity lookups may
+// use those records without allowing an unrelated corrupt file to hide proof.
 func ListRecords(directory string) ([]CaptureRecord, error) {
 	entries, err := os.ReadDir(filepath.Join(directory, "memory"))
 	if errors.Is(err, os.ErrNotExist) {
@@ -223,13 +226,15 @@ func ListRecords(directory string) ([]CaptureRecord, error) {
 		return nil, err
 	}
 	var records []CaptureRecord
+	var scanErrors []error
 	for _, entry := range entries {
 		p := filepath.Join(directory, "memory", entry.Name())
 		paths := []string{p}
 		if entry.IsDir() {
 			children, err := os.ReadDir(p)
 			if err != nil {
-				return nil, err
+				scanErrors = append(scanErrors, err)
+				continue
 			}
 			paths = nil
 			for _, child := range children {
@@ -244,17 +249,19 @@ func ListRecords(directory string) ([]CaptureRecord, error) {
 			}
 			r, err := ReadCaptureRecord(path)
 			if err != nil {
-				return nil, err
+				scanErrors = append(scanErrors, err)
+				continue
 			}
 			canonical, _ := RecordPath(directory, r.CheckpointID, r.MemoryID)
 			legacy, _ := legacyRecordPath(directory, r.CheckpointID)
 			if path != canonical && path != legacy {
-				return nil, errors.New("memory checkpoint: record location identity mismatch")
+				scanErrors = append(scanErrors, errors.New("memory checkpoint: record location identity mismatch"))
+				continue
 			}
 			records = append(records, *r)
 		}
 	}
-	return records, nil
+	return records, errors.Join(scanErrors...)
 }
 
 func ReadCaptureRecord(path string) (*CaptureRecord, error) {

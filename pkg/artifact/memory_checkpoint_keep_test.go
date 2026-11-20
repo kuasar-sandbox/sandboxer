@@ -64,6 +64,13 @@ func TestCleanupCheckpointRetainsLocalMemoryLowers(t *testing.T) {
 				} else if rootKind == "current-only" {
 					rootRef = "" // Current SID memory remains an independent keep root.
 				}
+				// An unrelated malformed record cannot invalidate another exact
+				// historical proof and make GC discard its still-referenced data.
+				for _, name := range []string{"000-corrupt.json", "unknown.json"} {
+					if err := os.WriteFile(filepath.Join(fixture.directory, "memory", name), []byte("unrelated malformed record"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
 				garbage := filepath.Join(fixture.directory, strings.Repeat("e", 64)+".image")
 				if err := os.WriteFile(garbage, []byte("unreferenced"), 0600); err != nil {
 					t.Fatal(err)

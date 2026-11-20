@@ -149,10 +149,10 @@ func knownLocalMemoryCarrier(path string, ref manifest.Ref) bool {
 	}
 	// A named historical capture may differ from the current SID obligation.
 	// These tiny node-local records are evidence; the parent payload is unopened.
-	records, err := memorycheckpoint.ListRecords(directory)
-	if err != nil {
-		return false
-	}
+	// This is a positive proof lookup, not an inventory completeness check.
+	// Unrelated corrupt records must not hide a valid exact carrier identity
+	// and cause its still-referenced backing graph to be collected.
+	records, _ := memorycheckpoint.ListRecords(directory)
 	for _, record := range records {
 		if matches(&record) {
 			return true
