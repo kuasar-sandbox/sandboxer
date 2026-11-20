@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # e2e-requires: ["docker","kvm","userfaultfd"]
-# Exercise the production holder while ENOSPC prevents its payload publication.
-# Growing the private filesystem releases the fault without a product test hook.
+# Exercise real ENOSPC, then bound each retired holder's output file size so
+# failed payload retries cannot also starve new capture metadata. Both faults
+# are external process/filesystem controls; no product test hook is used.
 set -euo pipefail
 umask 077
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
@@ -282,6 +283,53 @@ PY
     e2e_fail "$label did not resume the memory-checking workload"
 }
 
+
+# A whole-filesystem fault also affects the next snapshot's metadata. Once a
+# holder has actually encountered ENOSPC, retain a payload-only failure using
+# its soft RLIMIT_FSIZE. Small CaptureRecord/identity writes remain possible.
+# Limit only the exact retired holder; never its live successor or hard limit.
+hold_payload_failure() {
+    local id=$1 log=$2
+    python3 - "$CP_DIR" "$OUT/$id-record.json" "$log" "$OUT/$id-file-limit.json" <<'PY_PAYLOAD_LIMIT'
+import json,pathlib,resource,sys,time
+root,record,log,proof=map(pathlib.Path,sys.argv[1:])
+r=json.loads(record.read_text());holder=r['holder']
+assert r['committed'] and r['runtime_retired'] and not r['file_ready'] and not r['ram_released'],r
+def identity():
+    parts=pathlib.Path(f"/proc/{holder['pid']}/stat").read_text().rsplit(')',1)[1].split()
+    assert parts[0]!='Z' and int(parts[19])==holder['start_time'],holder
+deadline=time.monotonic()+30
+while not any('checkpoint memory save retained for retry:' in line and 'no space left on device' in line for line in log.read_text().splitlines()):
+    identity()
+    assert time.monotonic()<deadline,'holder did not encounter the injected ENOSPC'
+    time.sleep(.02)
+identity()
+old=resource.prlimit(holder['pid'],resource.RLIMIT_FSIZE)
+limit=1024*1024
+assert old[0]==resource.RLIM_INFINITY or old[0]>limit,old
+resource.prlimit(holder['pid'],resource.RLIMIT_FSIZE,(limit,old[1]))
+proof.write_text(json.dumps({'holder':holder,'previous':old,'soft_limit':limit}))
+# An already open large partial file is discarded after the failed write.
+# Observe reclaimed capacity before the next producer can publish metadata.
+import os
+while os.statvfs(root).f_bavail*os.statvfs(root).f_frsize<32*1024*1024:
+    identity()
+    assert time.monotonic()<deadline,'holder did not free the failed partial payload'
+    time.sleep(.02)
+print('retired holder payload bounded after real ENOSPC:',r['checkpoint_id'],flush=True)
+PY_PAYLOAD_LIMIT
+}
+release_payload_failure() {
+    python3 - "$OUT/$1-file-limit.json" <<'PY_PAYLOAD_RELEASE'
+import json,pathlib,resource,sys
+p=json.load(open(sys.argv[1]));h=p['holder']
+parts=pathlib.Path(f"/proc/{h['pid']}/stat").read_text().rsplit(')',1)[1].split()
+assert parts[0]!='Z' and int(parts[19])==h['start_time'],h
+assert resource.prlimit(h['pid'],resource.RLIMIT_FSIZE)==(p['soft_limit'],p['previous'][1]),p
+resource.prlimit(h['pid'],resource.RLIMIT_FSIZE,tuple(p['previous']))
+PY_PAYLOAD_RELEASE
+}
+
 start cold "$PATH_ID" --config "$WORK/cold.yaml" --enable-checkpoint
 FIRST_RUN=$RUN_PID
 capture first "$FIRST_FORMAT"
@@ -290,6 +338,7 @@ S_FIRST="$(snapshot_path first)"
 "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/publish.yaml" \
     --ref-location "fixture=file://$FIXTURE_DIRECTORY" "$S_FIRST" >"$OUT/first-info.json"
 check_pending_memory initial
+hold_payload_failure first "$OUT/cold.log"
 
 start resumed "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_FIRST" --enable-checkpoint
 SECOND_RUN=$RUN_PID
@@ -318,6 +367,7 @@ json.dump(r,open(sys.argv[3],'w'))
 result=json.load(open(sys.argv[4]))
 json.dump({'retain':[{'snapshot_ref':result['snapshotRef'],'sandbox_ref':result['sandboxRef']}], 'ref_locations':{'fixture':sys.argv[6]}},open(sys.argv[5],'w'))
 PY
+hold_payload_failure second "$OUT/resumed.log"
 FIRST_MEMORY="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["memory_id"])' "$OUT/first-record.json")"
 SECOND_MEMORY="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["memory_id"])' "$OUT/second-record.json")"
 # Removing a parent backend is forbidden while the child is a durable root.
@@ -364,6 +414,7 @@ check_memory branched
 # Release the fault before capturing the materialized branch: preserving its
 # disk lower artifacts is unrelated to the frozen-memory obligation test.
 mount -o remount,size=512m "$CP_DIR"
+release_payload_failure first
 wait "$FIRST_RUN"
 capture third "$SECOND_FORMAT"
 S_THIRD="$(snapshot_path third)"
