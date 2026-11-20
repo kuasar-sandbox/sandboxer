@@ -179,7 +179,7 @@ func TestPrepareSnapshotDependencyRejectsLiveSandboxAsRootImage(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, err = prepareSnapshotDependencyStream(
-		context.Background(), &lifecycleArtifactStream{Source: logical}, dependencyRootImage,
+		context.Background(), &lifecycleArtifactStream{Source: logical}, dependencyRootImage, RunOptions{},
 	)
 	if err == nil || !strings.Contains(err.Error(), "EROFS") {
 		t.Fatalf("root-image dependency error = %v", err)
@@ -208,6 +208,7 @@ func TestPrepareSnapshotDependencyPreservesRootImageConfig(t *testing.T) {
 		context.Background(),
 		&lifecycleArtifactStream{Source: source},
 		dependencyRootImage,
+		RunOptions{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -245,7 +246,7 @@ func TestPrepareSnapshotDependencyPreservesSandboxRootImageConfig(t *testing.T) 
 		t.Fatal(err)
 	}
 	prepared, transformed, err := prepareSnapshotDependencyStream(
-		context.Background(), &lifecycleArtifactStream{Source: logical}, dependencyRootImage,
+		context.Background(), &lifecycleArtifactStream{Source: logical}, dependencyRootImage, RunOptions{},
 	)
 	if err != nil {
 		t.Fatal(err)

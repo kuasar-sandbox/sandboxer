@@ -81,6 +81,13 @@ type Message struct {
 	Type  string `json:"type"`
 	Token string `json:"token,omitempty"`
 
+	// Checkpoint memory retention uses the existing resource session. The
+	// capture record, not a connection's lifetime, proves physical release.
+	Retention      *CaptureRetention `json:"retention,omitempty"`
+	Retained       *RetainedMemory   `json:"retained,omitempty"`
+	LeaseCandidate string            `json:"lease_candidate,omitempty"`
+	HandoffID      string            `json:"handoff_id,omitempty"`
+
 	// Admit (sandbox-ctl → controller). Wire names are retained at this
 	// reservation boundary: FloorMemoryBytes is settled headroom,
 	// StartupBudgetMemory is aligned cold InitialBudget, and

@@ -16,6 +16,7 @@ import (
 // handlers. Each accepted connection is serviced in its own goroutine,
 // so concurrent snapshot/exec requests don't block each other.
 type Server struct {
+	CaptureStateHandler     func(context.Context, CaptureStateQuery) (CaptureState, error)
 	DiskBindHandler         func(BindDiskRequest) error
 	DiskListHandler         func() (DiskStateReport, error)
 	Path                    string
@@ -24,10 +25,13 @@ type Server struct {
 
 	// SnapshotHandler services a snapshot_request: it returns the
 	// response and the server writes it back, then closes the conn.
-	SnapshotHandler      func(req Request) (Response, error)
-	ExportHandler        func(req Request) (Response, error)
-	UsageHandler         func(req Request) (Response, error)
-	ResourceStatsHandler func(req Request) (Response, error)
+	// SnapshotAdmissionHandler performs cancellable waiting before capture
+	// starts. Once admitted, SnapshotHandler still finishes on disconnect.
+	SnapshotAdmissionHandler func(context.Context, Request) error
+	SnapshotHandler          func(req Request) (Response, error)
+	ExportHandler            func(req Request) (Response, error)
+	UsageHandler             func(req Request) (Response, error)
+	ResourceStatsHandler     func(req Request) (Response, error)
 
 	// ExecHandler services an exec_request. It takes ownership of conn
 	// (including its lifetime): it writes the ctl exec_ack / error
@@ -39,15 +43,20 @@ type Server struct {
 
 	connsMu  sync.Mutex
 	conns    map[net.Conn]struct{}
+	connDone map[net.Conn]func()
 	connsWG  sync.WaitGroup
-	listener *net.UnixListener
-	stopOnce sync.Once
-	stopped  chan struct{}
+	// Detached capture replies no longer own runtime resources, but an
+	// executable must still join their complete framed writes before exiting.
+	responsesWG   sync.WaitGroup
+	responsesDone chan struct{}
+	listener      *net.UnixListener
+	stopOnce      sync.Once
+	stopped       chan struct{}
 }
 
 // Listen binds the UDS.
 func (s *Server) Listen() error {
-	if s.SnapshotHandler == nil && s.ExportHandler == nil && s.UsageHandler == nil && s.ResourceStatsHandler == nil && s.ExecHandler == nil && s.DiskBindHandler == nil && s.DiskListHandler == nil && s.CheckpointListHandler == nil && s.CheckpointDeleteHandler == nil {
+	if s.CaptureStateHandler == nil && s.SnapshotHandler == nil && s.ExportHandler == nil && s.UsageHandler == nil && s.ResourceStatsHandler == nil && s.ExecHandler == nil && s.DiskBindHandler == nil && s.DiskListHandler == nil && s.CheckpointListHandler == nil && s.CheckpointDeleteHandler == nil {
 		return errors.New("ctl: Server has no handlers")
 	}
 	if s.Logf == nil {
@@ -55,6 +64,8 @@ func (s *Server) Listen() error {
 	}
 	s.stopped = make(chan struct{})
 	s.conns = make(map[net.Conn]struct{})
+	s.connDone = make(map[net.Conn]func())
+	s.responsesDone = make(chan struct{})
 	_ = os.Remove(s.Path)
 	addr, err := net.ResolveUnixAddr("unix", s.Path)
 	if err != nil {
@@ -73,6 +84,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	if s.listener == nil {
 		return errors.New("ctl: Listen not called")
 	}
+	// No new handler can be registered after the accept loop returns. Joining
+	// here synchronously would deadlock a BeforeWrite awaiting runtime exit.
+	defer func() {
+		go func() {
+			s.responsesWG.Wait()
+			close(s.responsesDone)
+		}()
+	}()
 	go func() {
 		<-ctx.Done()
 		s.Stop()
@@ -98,14 +117,29 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		s.conns[conn] = struct{}{}
 		s.connsWG.Add(1)
+		s.responsesWG.Add(1)
+		done := sync.OnceFunc(func() {
+			s.connsMu.Lock()
+			delete(s.conns, conn)
+			delete(s.connDone, conn)
+			s.connsMu.Unlock()
+			s.connsWG.Done()
+		})
+		s.connDone[conn] = done
 		s.connsMu.Unlock()
 		go func() {
-			defer s.connsWG.Done()
-			defer func() { s.connsMu.Lock(); delete(s.conns, conn); s.connsMu.Unlock() }()
+			defer s.responsesWG.Done()
+			defer done()
 			s.handle(conn)
 		}()
 	}
 }
+
+// ResponsesDone closes after Serve has stopped accepting and every accepted
+// handler has finished, including detached capture responses. It is available
+// after Listen. Runtime cleanup must not wait for it: a capture response can be
+// waiting for that cleanup. Executable shutdown joins it after retirement.
+func (s *Server) ResponsesDone() <-chan struct{} { return s.responsesDone }
 
 // Stop closes the listener and removes the socket file.
 func (s *Server) Stop() {
@@ -138,6 +172,9 @@ func (s *Server) handle(conn *net.UnixConn) {
 		return
 	}
 	switch req.Type {
+	case TypeCaptureStateRequest:
+		s.serveCaptureState(conn, req)
+		return
 	case TypeDiskBind, TypeDiskList:
 		defer conn.Close()
 		if err := s.serveDisk(conn, req); err != nil {
@@ -232,16 +269,22 @@ func (s *Server) handle(conn *net.UnixConn) {
 			_ = WriteMessage(conn, Response{Type: TypeError, Code: code, Msg: "snapshot not supported"})
 			return
 		}
+		if err := s.admitSnapshot(conn, req); err != nil {
+			if req.HostRetirement != nil {
+				err = errors.Join(ErrCaptureRejected, err)
+			}
+			_ = WriteMessage(conn, Response{Type: TypeError, Code: captureErrorCode(err), Msg: err.Error()})
+			return
+		}
 		resp, err := s.SnapshotHandler(req)
 		if err != nil {
 			// A post-commit cleanup error still owns terminal teardown.
-			code := ""
-			if errors.Is(err, ErrCheckpointUnsupported) {
-				code = CheckpointUnsupportedCode
-			}
-			resp = Response{Type: TypeError, Code: code, Msg: err.Error(), AfterWrite: resp.AfterWrite}
+			resp = Response{Type: TypeError, Code: captureErrorCode(err), Msg: err.Error(), AfterWrite: resp.AfterWrite, BeforeWrite: resp.BeforeWrite}
 		} else {
 			resp.Type = TypeSnapshotDone
+		}
+		if resp.BeforeWrite != nil {
+			s.detachCapture(conn)
 		}
 		if writeErr := writeCaptureResponse(conn, resp); writeErr != nil {
 			s.Logf("ctl.sock: write resp: %v", writeErr)
@@ -261,11 +304,7 @@ func (s *Server) handle(conn *net.UnixConn) {
 		resp, err := s.ExportHandler(req)
 		if err != nil {
 			// A post-commit cleanup error still owns terminal teardown.
-			code := ""
-			if errors.Is(err, ErrCheckpointUnsupported) {
-				code = CheckpointUnsupportedCode
-			}
-			resp = Response{Type: TypeError, Code: code, Msg: err.Error(), AfterWrite: resp.AfterWrite}
+			resp = Response{Type: TypeError, Code: captureErrorCode(err), Msg: err.Error(), AfterWrite: resp.AfterWrite}
 		} else {
 			resp.Type = TypeExportDone
 		}
@@ -286,6 +325,16 @@ func (s *Server) handle(conn *net.UnixConn) {
 const captureResponseWriteTimeout = 5 * time.Second
 
 func writeCaptureResponse(conn net.Conn, resp Response) error {
+	if resp.BeforeWrite != nil {
+		if err := resp.BeforeWrite(); err != nil {
+			resp.Type = TypeError
+			resp.Code = ""
+			resp.Msg = err.Error()
+		}
+		if err := conn.SetWriteDeadline(time.Now().Add(captureResponseWriteTimeout)); err != nil {
+			return err
+		}
+	}
 	if resp.AfterWrite != nil {
 		defer resp.AfterWrite()
 		if err := conn.SetWriteDeadline(time.Now().Add(captureResponseWriteTimeout)); err != nil {
@@ -293,4 +342,13 @@ func writeCaptureResponse(conn net.Conn, resp Response) error {
 		}
 	}
 	return WriteMessage(conn, resp)
+}
+
+func (s *Server) detachCapture(conn net.Conn) {
+	s.connsMu.Lock()
+	done := s.connDone[conn]
+	s.connsMu.Unlock()
+	if done != nil {
+		done()
+	}
 }

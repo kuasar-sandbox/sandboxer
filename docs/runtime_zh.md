@@ -519,6 +519,74 @@ PathID 只选择 `RunRoot/PathID/ctl.sock`，不做身份一致性校验。`--ou
 BaseRoot 文件系统（例如 `BuildBaseDir/checkpoint`）；运行进程只清理自己的
 RunDir/owned diff，不会把 output 当作运行目录删除。
 
+<a id="checkpoint-memory-save"></a>
+
+### 命名 checkpoint 的内存保存
+
+已启用 checkpoint 的 Runtime，在本地输出、不带 `--resume` 的
+`snapshot --checkpoint ID` 中采用冻结内存 holder，内存与磁盘共用该 ID。
+`--mode local`（tarstream）与 `--mode bundle` 都支持该生命周期，mode 只选择保存格式。
+操作固定小型内存描述、停止 CH 并释放普通运行资源后返回；原进程继续保存本轮选中的
+内存页面。冻结内存释放前保留对应资源额度，Runtime 退出不等于内存额度已归还。
+
+转储期间，恢复和发布通过只读 memfd 读取冻结数据；同一条 SCM_RIGHTS 消息同时传递
+memfd 与 RAM lifetime pin。文件发布后，读者主动切换，等待在途读取结束，关闭旧 RAM
+FD/映射，再关闭 pin；不对共享 pin 显式解锁。新 VM 始终使用自己的可写 memfd。
+文件读者和确认重试只保留普通 GC 保护，不继续持有 RAM pin。
+
+临时 socket 位于规范化 RunDir 旁独占创建的平级目录
+`RunRoot/.km-<identity-hash>-<random>/m.sock`，固定短前缀不追加 PathID。
+持久捕获记录绑定准确绝对路径、目录 dev/inode、不可变身份 marker 及目录锁。
+正常运行收尾完整删除 RunDir；holder 只清理经过验证的本代目录，不访问后继 RunDir
+或父目录。创建平级目录要求 RunDir 父目录可写；权限不满足时在提交前明确失败，
+不回退到运行目录。内存读者仍持有 checkpoint pin 时，管理端延期垃圾回收并完成普通
+运行资源清理，不等待保存，也不放宽读者保护；详见[选择性清理](artifacts_zh.md#checkpoint-history)。
+
+恢复后的 Runtime 按 SandboxID 继承上一轮保存义务，包括从较早 checkpoint 恢复的
+情况。只有本次捕获可能新增冻结 RAM 义务时，才默认在入口等待实际 `RAMReleased`；
+`FileReady` 不能替代释放证明。两种格式及等待后台完成后才返回的调用均遵守这一条件。
+纯磁盘捕获、明确只能同步保存的 runtime 不新增该义务。等待期间不冻结、不离开 running。CLI 可用
+`--no-wait-for-previous-memory-save`，SDK 可设 `NoWaitForPreviousMemorySave`，
+在未完成时立即拒绝。取消等待不取消后台保存，也不改变当前 Runtime 状态。
+完整 pause 耗时包括这一入口等待。若准确 producer 已退出、文件尚未发布且 RAM 读者
+仍存在，默认等待明确报告前轮保存不可用，不进入 pausing，并继续观察实际内存义务。
+确认 RAMReleased 后，历史 lost 或 SaveError 不阻断从其他完整 checkpoint 恢复的运行。
+
+`Runtime.Wait` 和 `Close` 仍结束普通运行资源及借用 storage 的使用期。
+嵌入 SDK 的进程在生成本地 checkpoint 后还需保持存活，直至
+`Runtime.WaitMemorySave` 完成；它也等待最后的捕获响应写完，避免内存立即保存完成时进程抢先退出。
+CLI 适配器自动等待。`PrepareHolder` 完整拥有只读 FD、记录 writer、checkpoint GC pin、
+RAM pin、目录 guard 和本地编码任务，不借用已关闭的 Runtime fetch client。
+准备函数在成功或失败时均接管传入 FD；提交前回滚立即关闭 RAM 和服务，只有记录
+writer 与 GC pin 可继续保留，直至 Abort 元数据持久化。
+
+普通 capture、未启用 checkpoint 的 Runtime、同 VM `--resume`、纯磁盘 export
+和未指定本地 checkpoint ID 的可移植输出维持既有行为。托管运行还要求 host 明确支持运行退役，
+旧 host 或旧资源控制器继续同步保存。若冻结顶层无法满足既有稀疏载体预算，先完整
+恢复原运行，并确认回滚及资源确认已完成，再回退到既有同步捕获流程。
+
+该行为缩短 pause 返回前的工作，不定义时延验收阈值，也不把返回视为内存已持久落盘。
+后台写失败保留 RAM 并重试；已提交捕获不会因调用者断连而回滚。退役记录或资源确认
+失败时，控制操作在清理预算内返回错误，已提交 holder 继续后台完成。未提交捕获的
+回滚立即关闭临时内存 FD，即使元数据发布仍需重试。
+
+正常收尾与 `RecoverMemoryRelease` 均须在 producer、读者及排队 SCM_RIGHTS 引用关闭后，
+核对记录绑定的原 RAM pin inode 与 nonce，并取得排他锁。自动恢复还要求准确 producer 已退出、已有
+稳定 writer 锁可独占。未提交的准备记录此时可以发布 Aborted，但不宣称运行已退役或
+RAMReleased；普通执行所有权仍按既有流程清理。发布 RAMReleased 还须确认捕获已提交
+且原运行已退役。已提交但运行退役尚未确认的捕获，仍由既有准确 fence 后的删除/Reset
+流程处理。proof inode 缺失或被替换、
+进程身份未知、记录损坏都不能放行；恢复及显式 discard 均不能新建替代 proof。
+资源结算只消费已发布的 RAMReleased 事实。捕获记录（包括 Aborted 准备记录）和稳定
+proof 锁保留到 BaseDir 终态删除，避免引用图 GC 删除尚待资源确认的证明。只有这些
+小型元数据随捕获次数积累，不再引用的 payload、位图和载体文件仍正常回收。
+
+RAMReleased 与 FileReady 是独立事实。已提交、已退役且 RAMReleased 但未 FileReady
+表示内存快照丢失，不能制造 payload，也不借用主动 Discarded；恢复或发布该来源须
+明确报错。完整文件发布后，producer 退出不改变其可用性，存量读者也可在未收到旧进程
+确认时主动切换。降级前须完成上一轮保存，将本地描述发布为普通可移植快照；
+旧 reader 不识别这一节点本地描述格式。
+
 <a id="export"></a>
 
 ## `sandbox-ctl export`

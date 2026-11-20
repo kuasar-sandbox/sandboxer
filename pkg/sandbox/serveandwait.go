@@ -766,6 +766,23 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		Context:          backendCtx,
 		Logf:             logf,
 	}
+	if p.owner != nil {
+		snapHandler.runtime = p.owner
+		snapHandler.CurrentRun = p.owner.spec.CurrentRun
+		if p.DiskCurrentRun != nil {
+			snapHandler.CurrentRun = p.DiskCurrentRun
+		}
+		if p.owner.hooks == nil {
+			p.owner.hooks = p.Hooks
+		}
+	}
+	if enabled {
+		previous, err := newPreviousMemorySave(snapHandler.CheckpointDir, p.SandboxID)
+		if err != nil {
+			return -1, err
+		}
+		snapHandler.previousMemory = previous
+	}
 	// Runtime cleanup covers Launch and initialization failures. Restore closes
 	// this borrower before its outer disk and directory-owner closers.
 	if p.owner == nil || p.EnableCheckpoint {
@@ -792,6 +809,8 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	}()
 
 	ctlSrv := &ctl.Server{
+		CaptureStateHandler:      snapHandler.captureState,
+		SnapshotAdmissionHandler: snapHandler.snapshotAdmission(backendCtx),
 		CheckpointListHandler: func(req ctl.Request) ([]ctl.DiffCheckpointRef, error) {
 			if p.owner != nil {
 				if err := p.owner.requireRunning(); err != nil {
@@ -1061,6 +1080,11 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	}
 	go func() { defer backendWG.Done(); _ = launch.Serve(backendCtx) }()
 	go func() { defer backendWG.Done(); _ = vaReportSrv.Serve(backendCtx) }()
+	if p.owner != nil {
+		p.owner.mu.Lock()
+		p.owner.captureResponsesDone = ctlSrv.ResponsesDone()
+		p.owner.mu.Unlock()
+	}
 	go func() { defer backendWG.Done(); _ = ctlSrv.Serve(backendCtx) }()
 
 	// Optional periodic lazy-load stats logger (observe a slow remote/cache or

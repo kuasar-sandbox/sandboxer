@@ -16,15 +16,26 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 	"golang.org/x/sys/unix"
 )
 
-// Checkpoint identifies a committed managed source. The caller must exclusively
-// own Directory and fence every runner, restore and publisher using it until
-// CleanupCheckpoint returns. Arbitrary FileSink outputs grant no such right.
+// ErrCheckpointMemoryReadersBusy reports that memory readers prevented cleanup
+// from taking its exclusive directory pin. No keep-plan or deletion has run.
+// A managed caller may defer this collection while completing runtime cleanup;
+// this does not authorize deleting the directory or retiring its memory holder.
+// Other errors, including errors closing cleanup's own files, do not match it.
+var ErrCheckpointMemoryReadersBusy = errors.New("checkpoint has active memory readers")
+
+// Checkpoint identifies a committed managed source. The caller must own
+// Directory and hold its source mutation fence until CleanupCheckpoint returns.
+// Successful collection also requires the runner, restore and publisher fences
+// that permit deletion. Active memory readers instead return
+// ErrCheckpointMemoryReadersBusy without mutation; that result does not permit
+// removing Directory. Arbitrary FileSink outputs grant no cleanup rights.
 type Checkpoint struct {
 	Directory       string
 	SandboxID       string // producer identity, not PathID or a migration stable identity
@@ -50,6 +61,8 @@ type checkpointKeep struct {
 	files           map[string]bool
 	aliases         map[string]string // semantic alias -> current role's physical carrier basename
 	diffVersions    map[string]map[string]bool
+	memoryVisited   map[string]bool
+	memoryActive    map[string]bool
 }
 
 // retain resolves the physical source BEFORE comparing basenames. Memory and
@@ -172,9 +185,12 @@ func (k *checkpointKeep) plan(ctx context.Context, c Checkpoint) (retErr error) 
 			return errors.New("checkpoint S/E source binding mismatch")
 		}
 		for _, raw := range cfg.FromRefs {
-			if _, err := k.retain(ctx, raw, child); err != nil {
+			if err := k.retainMemoryLower(ctx, raw, child); err != nil {
 				return err
 			}
+		}
+		if err := k.retainMemory(ctx, c.SnapshotRef, scope); err != nil {
+			return err
 		}
 		eRef, eScope = cfg.SandboxRef, child
 	}
@@ -323,6 +339,7 @@ func (s *ProcessStorage) CheckpointVersions(ctx context.Context, c Checkpoint) (
 // complete metadata-only keep plan succeeds (including reader Close). It never
 // opens a candidate payload. A pinned directory fd confines enumeration and
 // unlink even if an ancestor or the pathname is concurrently replaced.
+// ErrCheckpointMemoryReadersBusy permits deferring only this collection.
 func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (retErr error) {
 	if s == nil {
 		return errors.New("checkpoint cleanup requires storage")
@@ -346,7 +363,19 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 		return err
 	}
 	f := os.NewFile(uintptr(fd), dir)
-	defer func() { retErr = errors.Join(retErr, f.Close()) }()
+	defer func() { retErr = checkpointCleanupCloseResult(retErr, f.Close()) }()
+	memoryLockFD, err := unix.Openat(fd, ".memory-readers.lock", unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	if err != nil {
+		return err
+	}
+	memoryLock := os.NewFile(uintptr(memoryLockFD), "checkpoint memory readers")
+	defer func() { retErr = checkpointCleanupCloseResult(retErr, memoryLock.Close()) }()
+	if err := unix.Flock(memoryLockFD, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+			return fmt.Errorf("%w: %w", ErrCheckpointMemoryReadersBusy, err)
+		}
+		return fmt.Errorf("lock checkpoint memory readers: %w", err)
+	}
 	pinned, err := f.Stat()
 	if err != nil {
 		return err
@@ -374,6 +403,21 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	k.aliases = map[string]string{}
 	if err := k.plan(ctx, c); err != nil {
 		return fmt.Errorf("checkpoint keep plan: %w", err)
+	}
+	if current, err := memorycheckpoint.ReadCurrent(dir); err == nil {
+		if current.Producer.SandboxID != c.SandboxID {
+			return errors.New("current memory capture differs from cleanup owner")
+		}
+		if !current.Committed && !current.Aborted && !current.Discarded {
+			return errors.New("current memory capture has no committed source")
+		}
+		if current.Committed && !current.Discarded {
+			if err := k.retainMemoryRoot(ctx, current.SnapshotRef, publishScope{relativeDir: dir, fetcher: s.Fetcher()}); err != nil {
+				return fmt.Errorf("current memory keep plan: %w", err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	// Current disks are a separate parent-owned root, even when the last
 	// ResumeSource describes an older checkpoint. Retain their local lowers
@@ -468,9 +512,22 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 			}
 		}
 		if len(entries) == 0 {
+			// Capture records and their stable proof locks outlive graph GC.
+			// A released or aborted record may still settle an unacknowledged
+			// resource receipt after a newer capture replaced the SID locator.
+			// Only terminal BaseDir destruction collects that recovery evidence.
 			return nil
 		}
 	}
+}
+
+func checkpointCleanupCloseResult(result, closeErr error) error {
+	if closeErr != nil && errors.Is(result, ErrCheckpointMemoryReadersBusy) {
+		// A caller may defer only the lock conflict, not a failed close. Keep
+		// the lock context in the message without preserving its busy marker.
+		return fmt.Errorf("%v; checkpoint cleanup close: %w", result, closeErr)
+	}
+	return errors.Join(result, closeErr)
 }
 
 func (k *checkpointKeep) addLocation(ref manifest.Ref) error {

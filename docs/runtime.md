@@ -582,6 +582,105 @@ when artifacts are unavailable; it never reads S to discover E.
 
 A local `snapshot` needs either `--sandbox-id` or `--path-id`. When both are supplied, PathID only selects `RunRoot/PathID/ctl.sock`; no identity consistency check is performed. `--output` may reside on the BaseRoot filesystem, for example `BuildBaseDir/checkpoint`. The running process cleans its own RunDir/owned diffs and does not treat output as a runtime directory to delete.
 
+<a id="checkpoint-memory-save"></a>
+
+### Named checkpoint memory saving
+
+A runtime started with checkpoint support uses a frozen memory holder for
+`(snapshot --checkpoint ID)` with local output and without `--resume`. The ID
+is shared with the disk checkpoint. Both `--mode local` (tarstream) and
+`--mode bundle` support this lifecycle; the mode selects the saving format.
+The operation commits a small local memory
+descriptor, retires CH and the ordinary runtime resources, and then returns.
+The original process remains alive to save the selected memory pages. It retains
+the corresponding memory reservation until the backing is released; runtime
+retirement is not memory-resource release.
+
+Restore and publication can read the frozen read-only memfd while the file is
+being written. Each transfer carries the memfd and its RAM lifetime pin together
+in one SCM_RIGHTS message. A reader switches to the published local carrier,
+finishes in-flight reads, closes its RAM FD/mappings, and then closes the pin.
+It never explicitly unlocks the shared pin. The new VM always has its own writable
+memfd. File readers and acknowledgement retries retain only ordinary GC protection.
+
+The socket lives in an exclusively created sibling of the canonical RunDir,
+`RunRoot/.km-<identity-hash>-<random>/m.sock`. The short prefix does not append
+PathID. The durable capture record binds its absolute directory path, device/inode,
+immutable identity marker and directory lock. Normal runtime cleanup completely
+removes RunDir. Holder cleanup removes only its verified generation directory;
+it never visits a successor RunDir or a parent directory. Creating the sibling
+requires write permission on the RunDir parent; preparation fails before commit
+if that permission is absent. It does not fall back to the runtime directory.
+If memory readers still pin the checkpoint, managed cleanup defers its garbage
+collection and completes ordinary runtime cleanup. This does not wait for the
+save or weaken reader protection; see [selective cleanup](artifacts.md#checkpoint-history).
+
+A resumed runtime inherits the previous save obligation by SandboxID, even when
+restoring an older checkpoint. A capture that can add another frozen-RAM
+obligation waits for actual `RAMReleased` by default, before freezing or changing
+its running state; `FileReady` alone does not end the wait. This applies to both
+formats regardless of whether the caller waits for background completion.
+Disk-only captures and known synchronous-only runtimes add no such obligation. The CLI option
+`--no-wait-for-previous-memory-save` and SDK request field
+`NoWaitForPreviousMemorySave` reject the request while it is pending. Cancelling
+this wait leaves the runtime running and does not cancel the previous save.
+The full pause duration includes this admission wait. If the exact producer has
+exited without publishing a file while RAM readers remain, a default wait reports
+that the previous save is unavailable without entering pausing. It keeps observing
+the physical obligation. Once RAMReleased is confirmed, an older lost source or
+SaveError does not block a runtime restored from another intact checkpoint.
+
+`Runtime.Wait` and `Close` still end ordinary runtime ownership, including
+borrowed storage. A process embedding the SDK must remain alive until
+`Runtime.WaitMemorySave` completes when it has produced a local checkpoint;
+this also joins any final capture response before process exit, even if the
+memory save finishes immediately. Executable adapters do this automatically.
+`PrepareHolder` owns the read-only FD, record writer, checkpoint GC pin, RAM pin,
+directory guard and local encoding job independently of the runtime's fetch
+clients. Preparation consumes the FD on success or failure. A failed precommit
+abort closes RAM and the service immediately; only the record writer and GC pin
+may remain until the abort metadata is durable.
+
+Ordinary captures, runtimes without checkpoint support, same-VM `--resume`,
+disk-only export, and portable output without a local checkpoint ID retain their existing
+capture behavior. A managed runtime requires its host's explicit retirement
+capability; old hosts or resource controllers continue synchronously. If a
+frozen top cannot fit the existing sparse carrier budget, capture restores the
+running VM and uses the existing synchronous path after rollback and resource
+confirmation have completed.
+
+This changes the work performed before pause returns; it does not define a
+latency threshold or claim durable storage at the return boundary. Background
+write failures retain RAM and retry. A committed capture is never rolled back
+because its caller disconnected. A retirement publication or resource-confirmation
+failure returns an error within the control operation's cleanup budget while
+the committed holder continues in the background. An uncommitted abort closes
+its provisional memory FD even if its metadata publication needs a retry.
+Normal completion and `RecoverMemoryRelease` both require an exclusive lock on
+the original record-bound RAM-pin inode and nonce after all producer, reader and queued
+SCM_RIGHTS references close. The recovery helper additionally requires exact
+producer exit and the existing stable record-writer lock. An uncommitted
+preparation can then become Aborted, without claiming runtime retirement or
+RAMReleased; ordinary execution ownership still follows its existing cleanup.
+Publishing RAMReleased additionally requires a committed, retired runtime.
+Committed captures whose runtime retirement is unconfirmed retain their existing
+fenced deletion/reset boundary. Missing/replaced proof inodes, unknown process identity and corrupt
+records cannot authorize release; neither recovery nor explicit discard creates
+a replacement proof. Resource settlement consumes the published RAMReleased fact. Capture records and
+stable proof locks remain until terminal BaseDir deletion, including aborted
+preparations, so graph GC cannot remove an outstanding resource-acknowledgement
+proof. Only these small metadata files accumulate with capture count; unreferenced
+payloads and map/carrier files are still collected.
+
+RAMReleased is independent of FileReady. A committed, retired capture with
+RAMReleased and no FileReady is a lost snapshot, never an automatically invented
+payload or Discarded operation. Restore/publication of that source reports an
+explicit error. A published file remains usable after producer death, and active
+readers can switch without receiving an acknowledgement from the old process.
+Before downgrading, finish pending saves and
+publish local descriptors as ordinary portable snapshots. Old readers do not
+understand the local descriptor profile.
+
 <a id="export"></a>
 
 ## `sandbox-ctl export`

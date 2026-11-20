@@ -601,7 +601,7 @@ DIFF 从真实本地 carrier（包括所选 Bundle 成员）所在目录解析�
 
 ## `.snapshot` logical format
 
-Snapshot S layout:
+普通可移植 Snapshot S 的布局：
 
 ```text
 [memory sparse payload]
@@ -626,11 +626,64 @@ from_refs:
 
 Snapshot ZIP 与 config 同样 strict、bounded、canonical。`config.json` 和 `state.json` 各限 16 MiB，`snapshot.cfg` 限 1 MiB，`from_refs` 最多 64 项。源码见 [snapshotfile.go](../pkg/snapshotfile/snapshotfile.go) 和 [snapshot/config.go](../pkg/snapshot/config.go)。旧 disk-schema input 返回 `unsupported snapshot format/version`,不 dual-read、不 migration、不 cold fallback.
 
+<a id="memory-checkpoint-descriptor"></a>
+
+### 节点本地 checkpoint 内存描述
+
+命名本地快速捕获使用独立的严格格式：零长度内存前缀，随后依次为 `config.json`、
+`state.json`、`snapshot.cfg`、`memory.checkpoint.json`。固定描述保存版本、
+memory ID、checkpoint ID、逻辑 RAM 容量、内容标识的位图引用、有序内部父引用以及
+本轮工作集选择；外部 `from_refs` 后缀仍只在 `snapshot.cfg` 中。
+
+固定 M/D/R 位图采用独立的既有 image carrier，不挤入有界 ZIP。
+`memory/<sha256(checkpointID)>/<memoryID>.json` 是单次准确尝试及其已发布 payload 的记录。
+Aborted 后重试使用新 memoryID 与递增 epoch，不覆盖旧 receipt 的 JSON 或 RAM pin；
+跨尝试的稳定准备 writer 锁仍为 `memory/<sha256(checkpointID)>.json.lock`。
+`current-memory.json` 定位该 SID 最新的保存义务。socket 身份、转储进度不改变固定 S
+身份。必要记录缺失或不一致必须报错，不能视为一个空内存层。
+
+记录通过 dev/inode 绑定独立 holder 目录；RAM proof 还校验随机 nonce，防止 inode 复用冒充原证明。
+`<record path>.ram.lock` 与 checkpoint GC 锁不同。捕获 JSON（包括 Aborted 准备记录）、
+稳定 writer 锁及 RAM proof 锁保留到 BaseDir 终态删除；当前指针已更换或来源已不在
+引用图中，不代表资源 receipt 已消费旧释放/回滚事实。这些小型元数据文件随捕获次数
+积累；payload、位图和载体仍按引用图回收。FileReady 来源读取不要求
+holder 存活；已提交、已退役且 RAMReleased 但未 FileReady 表示来源丢失，公共 reader
+明确报错，而该 SID 的实际 RAM 义务已结束。不能仅凭文件存在接纳未发布的 payload。
+
+本地 tarstream 和 Bundle 捕获都能承载该描述。Bundle 薄适配器先提交小型描述和位图，
+后台再提交 payload，各自使用普通不可变 Bundle 与既有 `file://...bundle@manifest:<key>`
+引用；可移植导出继续使用既有 planned Bundle 行为。
+
+公共制品 reader 将 holder 适配为 `sparse.Source`，复用 `CaptureMemory`、`DirtyMemory`、
+`SelectMemory` 和 `fetch.NewLayered`，把内部图暴露为单层内存视图。候选地址与选中值
+分离，保留历史选集边界和有序父层后缀，不建立 checkpoint 专用区间索引。
+每个打开的图最多保留八个池内载体 FD，与现有 tarstream/Bundle 解析元数据分开管理；
+重开校验原文件身份。仅有既存目录 GC pin 保护的载体进入池，为池化注册目录时不会创建
+该保护协议；外部来源（包括没有既存锁的 LocalDescriptor）保持原 FD/mmap 生命周期及
+open 后 unlink 仍可读的行为。后来创建的锁不改变该图的既有判断。关闭时先等待文件
+切换读者结束，再关池，最后释放目录 pin。
+
+发布执行根时仍保持捕获语义：
+脏页捕获合并本轮变化与可归并的历史脏页；工作集捕获的顶层 W 仅保留本轮工作集，
+历史脏页合并为一个 H，排在原样保留的外部 `from_refs` 后缀之前。H 占用既有 64 个
+父引用额度中的一个。快速捕获与原同步流程一样，在准备 holder 和冻结 guest 之前
+校验完整预期配置；W 加 H 再加 64 个外部父层会提前拒绝，不提交该捕获，也不打开
+这些外部父层。
+
+节点本地对象作为内存 lower/import 时，普通发布和 rewrite 将其完整可见值与脏页
+候选并集物化为一个普通 S；无论内部历史多少，均只占一个外部引用位置，不改变本轮
+执行根的工作集覆盖范围。显式归并根，包括 `--reduce-ref=any`，可以直接读取并归并
+本地完整视图及原外部引用链，因此能修复已有 W/H 对象在可移植展开后超过 64 项的
+情况；普通发布仍明确报告容量错误。普通 S 缺少 `memory.dirty` 时全显式内容为脏的
+兼容规则不变。
+可移植发布和 rewrite（包括可移植 Bundle 输出）均物化为普通 S，不能把描述载体当成完整内存快照复制。
+旧 reader 拒绝本地格式，新 reader 继续兼容普通快照。
+
 <a id="memory-dirty"></a>
 
 ### 可选的 `memory.dirty` 元数据
 
-规范 Snapshot S 包含三个条目，或在 `config.json`、`state.json`、`snapshot.cfg`
+普通规范 Snapshot S 包含三个条目，或在 `config.json`、`state.json`、`snapshot.cfg`
 之后追加第四个条目 `memory.dirty`。`snapshot.cfg.version` 仍为 `1`，该元数据
 不引入另一套 snapshot 配置 schema。
 
@@ -719,13 +772,12 @@ root carrier物化为`.image`;只有需要作为独立dependency保存的root/da
 不可变 EROFS base 与 ext4 upper 保持分离。Data 和不透明 Zero 覆盖下层，Hole 向下穿透。
 历史读取走宿主制品 stream，不读 guest memfd，因此不会扩大本轮工作集。
 
-历史组合在 guest freeze 前准备并直接流入最终 sink，复用 `fetch.NewLayered` 和 sparse run，
+普通捕获在 guest freeze 前准备历史组合并直接流入最终 sink；命名本地快速捕获只记录内部父图，将历史物化延后至可移植导出。两者均复用 `fetch.NewLayered` 和 sparse run，
 不缓存整镜像，也不生成多余整镜像中间副本。local 输出对 checkpoint 已拥有的复用依赖保留物理
 selector；Bundle 输出继续使用既有成员复制发布路径。历史合并生成新内容身份；sink commit/close 和数据库提交之前，
 旧来源始终有效。捕获或数据库提交失败都不能授权删除旧文件。
 
-托管 Pause 提交精确 S/E 对（或 E-only 根）后，生命周期 owner 先 fence 旧 runner 及全部
-读写使用者，再执行选择性清理。通用 FileSink、任意 `--output`、独立 `snapshot --resume`
+托管 Pause 提交精确 S/E 对（或 E-only 根）后，生命周期 owner 先结束普通运行，只有读写 fence 允许删除后才执行选择性清理。后台内存 holder 的 unit、资源、位图和内部依赖图持续保留，普通 paused 清理不能杀掉该进程。通用 FileSink、任意 `--output`、独立 `snapshot --resume`
 和共享 build 阶段输入都不因此取得清理权。sandboxer 制品库解释保留集合；conductor 只通过
 短生命周期 `node-ctl checkpoint-cleanup` 工具提供目录归属、路径、已提交的来源对及既有
 lifecycle fence。portable Export 继续只使用已存储的来源对，不读取制品。token、公开结果、
@@ -746,6 +798,10 @@ source/location 绑定。选择只读取有界的当前小型元数据与 Bundle
 不计算整镜像摘要；此操作无需 Snapshot 的 CPU/state body。kernel/runtime 的
 basename identity 绑定宿主提供的启动文件，不是 checkpoint payload 依赖。keep plan 或 reader Close 出错时
 不删除任何文件。
+若 `from_refs` 内存 lower 是有记录的节点本地内存对象，通过准确的载体 digest 与 inode
+识别并保留其位图、payload、capture record 和内部父图，包括经命名 location 访问的情况。
+普通 lower 仍保持不透明，不递归引入 lower 历史的执行、磁盘或外部内存配置依赖。
+独立的 current-memory 根保留自己的内存 lower，即使所选来源较旧或仅含 E。
 
 Bundle 候选来源的 location 仅在既有选择器访问该来源时解析：先当前 Bundle，再按顺序
 查询 refs，最后查询远端。当前 Bundle 命中时不要求无用 location 可解析；不可用候选可继续
@@ -766,12 +822,19 @@ E-only 也会删除旧 S 别名。Snapshot 捕获只提交 S 别名，E 身份�
 存在 E 别名。清理只 unlink 可识别别名本身，不跟随链接，不递归删除目录；dirfd 操作保证路径发生竞态时
 unlink 仍被限制在原目录内。
 
-新来源已提交后，即使清理失败，Pause 仍成功。最后一个持久 RunDir ownership 标记保留到
-checkpoint 清理和既有 paused 收尾均成功。既有 worker 在 SID lifecycle lock 下重新读取当前
-来源重试，重启后也如此。active 或 detached export 的读取 fence 在其完成前持续有效；清理
+新来源已提交后，即使清理失败，Pause 仍成功。内存读者持有 pin、无法取得回收独占锁时，
+`CleanupCheckpoint` 在修改别名或删除任何内容之前返回
+`artifact.ErrCheckpointMemoryReadersBusy`。管理端可延期这次回收，继续完成普通 paused
+运行资源清理，无需等待内存保存。holder 退役 worker 在内存释放、runner fence 完成且
+沙箱仍为 paused 时重试回收，包括 RunDir ownership 已清空的情况。
+
+其他清理失败仍保留最后一个持久 RunDir ownership 标记，直到 checkpoint 清理和既有
+paused 收尾均成功。既有 worker 在 SID lifecycle lock 下重新读取当前来源重试，重启后
+也如此。active 或 detached export 的读取 fence 在其完成前持续有效；清理
 不会持锁等待需要同一锁完成的 export。Resume/Wake/Exec 遵守既有 pending-cleanup admission
-合同。候选已不存在视为完成；权限、I/O 和身份错误继续保留重试责任。普通 Kill 和 BuildBaseDir
-终态删除仍由原 finalizer 负责；此步骤不回收任何共享或外部制品。
+合同。候选已不存在视为完成；权限、I/O 和身份错误继续保留重试责任。延期回收不授权
+硬删除或释放内存 holder。普通 Kill 和 BuildBaseDir 终态删除仍由原 finalizer 负责；
+此步骤不回收任何共享或外部制品。
 
 <a id="artifact-publication"></a>
 

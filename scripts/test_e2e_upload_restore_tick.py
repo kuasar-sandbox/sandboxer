@@ -4,6 +4,7 @@ import os
 import json
 from pathlib import Path
 import re
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -337,6 +338,143 @@ set +e
             self.assertEqual(summary['probe_status'], 124)
             self.assertEqual(summary['last_ticks'], [23])
             self.assertTrue(summary['guest_state_unavailable'])
+
+
+
+
+class PendingMemoryRestoreTests(unittest.TestCase):
+    source = (CASES / 'snapshot.checkpoint-memory.sh').read_text()
+    helpers = '\n'.join(function((CASES / 'snapshot.checkpoint-memory.sh').read_text(), name) for name in
+                        ('owner_enospc', 'check_pending_memory', 'start'))
+
+    def test_owner_enospc_classification_is_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); log = root / 'attempt.log'; checkpoint = root / 'checkpoint'
+            valid = ('2026/11/20 06:07:13.112621 [sandbox-ctl run --restore] '
+                     'restore BudgetAtSnapshot reserved=536870912 (balloon target/current=0/0)\n'
+                     'restore exited before readiness\n'
+                     f'write {checkpoint}/.owner-1753911645: no space left on device\n')
+            samples = [(valid, True),
+                       (valid.replace(str(checkpoint), str(root / 'other')), False),
+                       (valid.replace('write ', 'read '), False),
+                       (valid.replace('.owner-', '.memory-record-'), False),
+                       (valid.replace('no space left on device', 'permission denied'), False),
+                       (valid + 'additional failure\n', False),
+                       ('permission denied\n' + valid, False),
+                       (valid.replace('restore BudgetAtSnapshot', 'failed BudgetAtSnapshot'), False),
+                       (valid.replace('restore exited before readiness\n', ''), False)]
+            for content, accepted in samples:
+                with self.subTest(content=content):
+                    log.write_text(content)
+                    result = subprocess.run(['bash', '-euo', 'pipefail', '-c',
+                        function(self.source, 'owner_enospc') + '\nowner_enospc "$LOG"'],
+                        env={**ENV, 'CP_DIR': str(checkpoint), 'LOG': str(log)},
+                        capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def run_control(self, mode, label='resumed', clock_jump=False):
+        import hashlib
+        with tempfile.TemporaryDirectory(prefix='ram-e2e-') as directory:
+            root = Path(directory); checkpoint = root / 'cp'; runroot = root / 'run'
+            checkpoint.mkdir(); runroot.mkdir(); service = runroot / '.km-test'; service.mkdir()
+            record_path = checkpoint / 'memory' / hashlib.sha256(b'first').hexdigest() / ('a' * 32 + '.json')
+            record_path.parent.mkdir(parents=True)
+            pin = Path(str(record_path) + '.ram.lock'); pin.write_bytes(bytes(range(32)))
+            st = service.stat(); ram = pin.stat()
+            start = int(Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')', 1)[1].split()[19])
+            holder = {'pid': os.getpid(), 'start_time': start, 'socket_path': str(service / 'm.sock'),
+                      'directory': {'path': str(service), 'device': st.st_dev, 'inode': st.st_ino},
+                      'ram_lock': {'device': ram.st_dev, 'inode': ram.st_ino, 'nonce': pin.read_bytes().hex()}}
+            record = {'version': 1, 'producer': {'sandbox_id': 'fixture', 'instance_id': 'instance', 'run_id': 'old'},
+                      'checkpoint_id': 'first', 'memory_id': 'a' * 32, 'epoch': 1,
+                      'snapshot_ref': 'file://first.snapshot', 'committed': True, 'runtime_retired': True,
+                      'file_ready': False, 'ram_released': False, 'holder': holder}
+            record_path.write_text(json.dumps(record))
+            (service / 'identity.json').write_text(json.dumps({'holder': holder}))
+            (checkpoint / 'current-memory.json').write_text(json.dumps({key: record[key] for key in ('checkpoint_id', 'memory_id', 'epoch')}))
+            (root / 'first.json').write_text(json.dumps({'snapshotRef': record['snapshot_ref']}))
+            binary = root / 'sandbox-ctl'
+            binary.write_text(r"""#!/usr/bin/env python3
+import json,os,pathlib,signal,sys
+root=pathlib.Path(os.environ['OUT']); mode=os.environ['CONTROL']; record=pathlib.Path(os.environ['RECORD'])
+if sys.argv[1]=='exec':
+    if not (root/'ready').exists(): sys.exit(1)
+    print('{"counter": 1, "hash": "fixture"}'); sys.exit(0)
+count=root/'attempts'; n=int(count.read_text())+1 if count.exists() else 1; count.write_text(str(n))
+if n==1 or mode=='always-full':
+    if mode=='dirty-run': (pathlib.Path(os.environ['RUN_ROOT'])/'path').symlink_to('/nonexistent')
+    data=json.loads(record.read_text())
+    if mode=='settled': data['file_ready']=True
+    if mode=='changed-producer': data['producer']['run_id']='replacement'
+    if mode=='changed-start': data['holder']['start_time']+=1
+    if mode=='bad-nonce': pathlib.Path(str(record)+'.ram.lock').write_bytes(b'x'*32)
+    record.write_text(json.dumps(data))
+    print('restore exited before readiness')
+    message='permission denied' if mode=='other-error' else 'no space left on device'
+    print('write '+os.environ['CP_DIR']+'/.owner-123: '+message)
+    if mode=='extra-error': print('unexpected failure')
+    sys.exit(1)
+if mode=='ready-settled':
+    data=json.loads(record.read_text()); data['ram_released']=True; record.write_text(json.dumps(data))
+(pathlib.Path(os.environ['RUN_ROOT'])/'path').mkdir()
+(root/'ready').touch()
+signal.pause()
+""")
+            binary.chmod(0o755)
+            setup = r"""
+set -euo pipefail
+RUN_PIDS=(); SID=fixture; PATH_ID=path
+WORK=$OUT; BIN=$OUT; BASE_ROOT=$OUT; FIXTURE_DIRECTORY=$OUT
+e2e_fail() { echo "$*" >&2; exit 1; }
+trap 'status=$?; for pid in "${RUN_PIDS[@]}"; do kill -TERM "$pid" 2>/dev/null || :; done; for pid in "${RUN_PIDS[@]}"; do wait "$pid" 2>/dev/null || :; done; exit "$status"' EXIT
+"""
+            # Advance only this shell's clock after classification, without a
+            # 30-second test sleep or a product clock hook.
+            helpers = self.helpers
+            if clock_jump:
+                helpers = helpers.replace('owner_enospc() {', 'real_owner_enospc() {', 1)
+                helpers += '\nowner_enospc() { real_owner_enospc "$@"; SECONDS=$((SECONDS + 31)); }\n'
+            with socket.socket(socket.AF_UNIX) as sock:
+                sock.bind(str(service / 'm.sock'))
+                result = subprocess.run(['bash', '-c', setup + helpers + '\ncheck_pending_memory initial\nstart "$LABEL" path\n'],
+                    env={**ENV, 'OUT': str(root), 'RUN_ROOT': str(runroot), 'CP_DIR': str(checkpoint),
+                         'RECORD': str(record_path), 'CONTROL': mode, 'LABEL': label},
+                    text=True, capture_output=True, timeout=15)
+            attempts = int((root / 'attempts').read_text()) if (root / 'attempts').exists() else 0
+            logs = sorted(path.name for path in root.glob('resumed*.log'))
+            return result, attempts, logs
+
+    def test_exact_enospc_retries_then_restores_while_pending(self):
+        result, attempts, logs = self.run_control('once-full')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(logs, ['resumed-attempt-1.log', 'resumed-attempt-2.log', 'resumed.log'])
+
+    def test_other_errors_or_changed_proofs_do_not_retry(self):
+        for mode in ('other-error', 'extra-error', 'dirty-run', 'settled', 'changed-producer', 'changed-start', 'bad-nonce'):
+            with self.subTest(mode=mode):
+                result, attempts, _ = self.run_control(mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(attempts, 1, result.stderr)
+
+    def test_normal_starts_never_retry_enospc(self):
+        for label in ('cold', 'next-resume', 'portable'):
+            result, attempts, _ = self.run_control('once-full', label)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(attempts, 1, result.stderr)
+
+    def test_attempts_and_total_deadline_are_bounded(self):
+        result, attempts, _ = self.run_control('always-full')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(attempts, 8, result.stderr)
+        result, attempts, _ = self.run_control('always-full', clock_jump=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(attempts, 1, result.stderr)
+
+    def test_readiness_cannot_succeed_after_ram_settlement(self):
+        result, attempts, _ = self.run_control('ready-settled')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(attempts, 2, result.stderr)
 
 
 if __name__ == "__main__":

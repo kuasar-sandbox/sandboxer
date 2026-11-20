@@ -154,6 +154,7 @@ type runtimeOwnedDisk struct {
 // Runtime owns one VM and its service goroutines. Wait observes cleanup;
 // Close requests graceful shutdown and waits for the same retained result.
 type Runtime struct {
+	memorySave    *checkpointMemorySave
 	diskSnapshot  *SnapshotHandler
 	diskLaunch    LaunchSpec
 	diskInventory []diskEntry
@@ -204,6 +205,7 @@ type Runtime struct {
 	storage                            *artifact.ProcessStorage
 	ownStorage                         bool
 	exitDone                           chan struct{}
+	captureResponsesDone               <-chan struct{}
 	exit                               ExitResult
 	closeOnce                          sync.Once
 	cleanupOnce                        sync.Once
@@ -442,7 +444,14 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 	if allocBytes < capBytes || initial < capBytes {
 		r.balloon = resctl.NewBalloonController(chSock, capBytes, cfg.CHApiDeadline(), r.logf)
 	}
-	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{SocketPath: cfg.Resources.Control.Controller, SandboxID: sid, Context: engineCtx, Logf: r.logf}, cfg)
+	hookOptions := resctl.ControllerHookOptions{SocketPath: cfg.Resources.Control.Controller, SandboxID: sid, Context: engineCtx, Logf: r.logf}
+	if spec.EnableCheckpoint {
+		hookOptions.Retained, err = PreviousCaptureRetention(filepath.Join(r.baseDir, "checkpoint"), sid)
+		if err != nil {
+			return nil, err
+		}
+	}
+	hooks, err := resctl.NewControllerHooks(hookOptions, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -1301,6 +1310,15 @@ func (r *Runtime) finishExit(x ExitResult) {
 		r.opsWG.Wait()
 		err := r.cleanupResources()
 		r.mu.Lock()
+		save := r.memorySave
+		r.mu.Unlock()
+		if save != nil {
+			err = errors.Join(err, save.retire())
+			if err == nil {
+				x.Code = 0
+			}
+		}
+		r.mu.Lock()
 		x.Err = errors.Join(x.Err, r.launchFailure, err)
 		if x.Err != nil {
 			x.Code = -1
@@ -1508,7 +1526,9 @@ func (r *Runtime) Stats(ctx context.Context) (*ctl.ResourceStats, error) {
 }
 
 // Snapshot captures memory and disks using the same operation as ctl.sock.
-// A destroy-mode result schedules teardown after the capture is committed.
+// A destroy-mode result completes its required retirement continuation. A
+// frozen checkpoint can still own a background save; executable adapters keep
+// the process alive with WaitMemorySave after observing Runtime.Wait.
 func (r *Runtime) Snapshot(ctx context.Context, req ctl.Request) (ctl.Response, error) {
 	return r.capture(ctx, req, false)
 }
@@ -1524,7 +1544,8 @@ func (r *Runtime) capture(ctx context.Context, req ctl.Request, export bool) (ct
 	if err := r.beginOperation(); err != nil {
 		return ctl.Response{}, err
 	}
-	defer r.opsWG.Done()
+	done := sync.OnceFunc(r.opsWG.Done)
+	defer done()
 	r.mu.Lock()
 	fn := r.snapshot
 	if export {
@@ -1535,6 +1556,12 @@ func (r *Runtime) capture(ctx context.Context, req ctl.Request, export bool) (ct
 		return ctl.Response{}, errors.New("capture unavailable")
 	}
 	resp, err := fn(ctx, req)
+	if resp.BeforeWrite != nil {
+		before := resp.BeforeWrite
+		resp.BeforeWrite = nil
+		done()
+		err = errors.Join(err, before())
+	}
 	if resp.AfterWrite != nil {
 		after := resp.AfterWrite
 		resp.AfterWrite = nil

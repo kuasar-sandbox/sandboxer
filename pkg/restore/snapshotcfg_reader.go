@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
@@ -177,7 +178,14 @@ func (r *SnapshotCfgReader) ReadRaw(ctx context.Context, rootRef string, opts Sn
 	return raw, nil
 }
 
-func (r *SnapshotCfgReader) openSnapshot(ctx context.Context, rootRef string, readOpts SnapshotCfgReadOptions) (*openedRootSnapshot, *snapshotfile.Root, *snapshot.Config, error) {
+type openedSnapshotMetadata struct {
+	*snapshotfile.Metadata
+	stream fetch.Stream
+}
+
+func (m *openedSnapshotMetadata) Close() error { return m.stream.Close() }
+
+func (r *SnapshotCfgReader) openSnapshot(ctx context.Context, rootRef string, readOpts SnapshotCfgReadOptions) (*openedRootSnapshot, *openedSnapshotMetadata, *snapshot.Config, error) {
 	if r == nil || r.storage == nil {
 		return nil, nil, nil, errors.New("snapshot.cfg reader is not initialized")
 	}
@@ -195,10 +203,11 @@ func (r *SnapshotCfgReader) openSnapshot(ctx context.Context, rootRef string, re
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	root, err := snapshotfile.Open(ctx, opened.stream)
+	metadata, err := snapshotfile.ReadMetadata(ctx, opened.stream)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, errors.Join(err, opened.stream.Close())
 	}
+	root := &openedSnapshotMetadata{Metadata: metadata, stream: opened.stream}
 	memoryCfg, err := snapshot.ParseConfig(root.SnapshotConfig)
 	if err != nil {
 		return nil, nil, nil, errors.Join(fmt.Errorf("unsupported snapshot format/version: %w", err), root.Close())

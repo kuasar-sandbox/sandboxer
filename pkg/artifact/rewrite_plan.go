@@ -155,7 +155,7 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 	if err != nil {
 		return result, errors.Join(eerr, err)
 	}
-	sroot, err := snapshotfile.Open(ctx, stream)
+	sroot, err := plan.p.openSnapshot(ctx, stream, child)
 	if err != nil {
 		return result, errors.Join(eerr, err)
 	}
@@ -163,6 +163,26 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 	scfg, err := readRewriteSnapshot(sroot)
 	if err != nil {
 		return result, err
+	}
+	if sroot.LocalCheckpoint != nil {
+		// An explicit root reduction consumes the complete local view plus
+		// its original external suffix. Do not first split W/H: that would
+		// require a 65th slot before reduction can repair a 64-parent root.
+		// Ordinary publication/rewrite retains the top working set's own
+		// coverage and the separate all-dirty historical layer.
+		_, reducing := plan.rules.reduction(raw, len(scfg.FromRefs) != 0)
+		if !reducing {
+			materialized, cleanup, err := plan.p.materializeMemoryCheckpointRoot(ctx, sroot)
+			if err != nil {
+				return result, err
+			}
+			plan.closes = append(plan.closes, cleanup, materialized.Close)
+			sroot = materialized
+			scfg, err = readRewriteSnapshot(sroot)
+			if err != nil {
+				return result, err
+			}
+		}
 	}
 	oldE := scfg.SandboxRef
 	plan.p.original(oldE, child)
@@ -332,13 +352,13 @@ func (p *publicationRewrite) openValue(ctx context.Context, raw string, scope pu
 			force = selected.Reader != nil
 		}
 	}
-	stream, _, err := p.open(ctx, raw, scope)
+	stream, child, err := p.open(ctx, raw, scope)
 	if err != nil {
 		return nil, err
 	}
-	out := &rewriteValue{raw: raw, scope: scope, use: use, forceWrite: force}
+	out := &rewriteValue{raw: raw, scope: child, use: use, forceWrite: force}
 	if use == rewriteMemory {
-		root, err := snapshotfile.Open(ctx, stream)
+		root, err := p.p.openSnapshot(ctx, stream, child)
 		if err != nil {
 			return nil, err
 		}
@@ -347,6 +367,16 @@ func (p *publicationRewrite) openValue(ctx context.Context, raw string, scope pu
 			return nil, err
 		}
 		out.payload, out.source, out.role = root.Memory, root.FullStream, RoleSnapshot
+		if root.LocalCheckpoint != nil {
+			// A lower/import occupies one external slot even when its local
+			// representation has internal history. Keep the exact visible
+			// values and dirty union, as on ordinary publication/import.
+			out.source, err = PortableMemoryLayer(ctx, root)
+			if err != nil {
+				return nil, err
+			}
+			out.forceWrite = true
+		}
 		return out, nil
 	}
 	if use == rewritePureDisk {

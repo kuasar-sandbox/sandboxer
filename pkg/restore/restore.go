@@ -121,8 +121,29 @@ func (opts Options) openFile(ctx context.Context, path string, ref manifest.Ref)
 	return artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn, opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
 }
 
+func (opts Options) openSnapshot(ctx context.Context, stream fetch.Stream, directory string) (*snapshotfile.Root, error) {
+	storage, err := opts.borrowStorage()
+	if err != nil {
+		return nil, errors.Join(err, stream.Close())
+	}
+	return artifact.OpenOwnedSnapshot(ctx, storage, stream, artifact.SnapshotOpenOptions{
+		LocalDirectory: directory, RefLocations: opts.RefLocations,
+	})
+}
+
 // Run executes restore. Returns the CH exit code.
 func Run(ctx context.Context, opts Options) (code int, retErr error) {
+	if !sandbox.HasRuntimeOwner(ctx) {
+		r, err := sandbox.RunLifecycle(ctx, func(life context.Context) (int, error) { return run(life, opts) })
+		if err != nil {
+			return -1, err
+		}
+		return sandbox.WaitRun(ctx, r)
+	}
+	return run(ctx, opts)
+}
+
+func run(ctx context.Context, opts Options) (code int, retErr error) {
 	if opts.SnapshotPath == "" && opts.SnapshotManifestKey == "" {
 		return -1, errors.New("restore: SnapshotPath or SnapshotManifestKey required")
 	}
@@ -188,7 +209,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		return -1, fmt.Errorf("open snapshot: %w", err)
 	}
 	opts = root.opts
-	snapshotRoot, err := snapshotfile.Open(ctx, root.stream)
+	snapshotRoot, err := opts.openSnapshot(ctx, root.stream, "")
 	if err != nil {
 		return -1, fmt.Errorf("open Snapshot S: %w", err)
 	}
@@ -353,8 +374,8 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if declaredCap != snapCap {
 		return -1, fmt.Errorf("snapshot Capacity mismatch: CH memory zones=%d Sandbox=%d", snapCap, declaredCap)
 	}
-	if snapshotRoot.ArchiveBase != snapCap {
-		return -1, fmt.Errorf("snapshot memory payload size=%d does not match CH capacity=%d", snapshotRoot.ArchiveBase, snapCap)
+	if snapshotRoot.Memory.Size() != snapCap {
+		return -1, fmt.Errorf("snapshot memory payload size=%d does not match CH capacity=%d", snapshotRoot.Memory.Size(), snapCap)
 	}
 	if snapCap > uint64(^uint(0)>>1) {
 		return -1, fmt.Errorf("restore Capacity %d exceeds host addressable memory size", snapCap)
@@ -462,13 +483,20 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// needed by Admit is available. A stalled manifest fetch must not appear
 	// to restart inventory as a live, full-capacity sandbox that cannot yet
 	// StateSync because it has never been admitted.
-	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
+	hookOptions := resctl.ControllerHookOptions{
 		SocketPath: opts.HostCfg.Resources.Control.Controller,
 		CgroupPath: cg.LocalPath(),
 		SandboxID:  opts.SandboxID,
 		Context:    sandbox.ControllerWorkContext(ctx),
 		Logf:       logf,
-	}, &snapCfg)
+	}
+	if opts.EnableCheckpoint {
+		hookOptions.Retained, err = sandbox.PreviousCaptureRetention(filepath.Join(sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID), "checkpoint"), opts.SandboxID)
+		if err != nil {
+			return -1, err
+		}
+	}
+	hooks, err := resctl.NewControllerHooks(hookOptions, &snapCfg)
 	if err != nil {
 		return -1, fmt.Errorf("controller dial: %w", err)
 	}
@@ -1029,6 +1057,7 @@ func openMemorySnapshotRef(ctx context.Context, raw string, opts Options) (fetch
 		return nil, protectArtifactReadError(opts.LocalCodec, "parse snapshot memory ref", err)
 	}
 	var stream fetch.Stream
+	var directory string
 	switch ref.Scheme {
 	case manifest.RefSchemeFile:
 		relativeDir := ""
@@ -1044,6 +1073,7 @@ func openMemorySnapshotRef(ctx context.Context, raw string, opts Options) (fetch
 			return nil, err
 		}
 		stream = opened
+		directory = filepath.Dir(opened.ResolvedPath())
 	case manifest.RefSchemeManifest:
 		stream, _, err = sandbox.OpenManifestStream(ctx, ref.Path, opts.Fetcher)
 		if err != nil {
@@ -1052,7 +1082,7 @@ func openMemorySnapshotRef(ctx context.Context, raw string, opts Options) (fetch
 	default:
 		return nil, fmt.Errorf("unsupported snapshot memory ref scheme %q", ref.Scheme)
 	}
-	root, err := snapshotfile.Open(ctx, stream)
+	root, err := opts.openSnapshot(ctx, stream, directory)
 	if err != nil {
 		return nil, err
 	}

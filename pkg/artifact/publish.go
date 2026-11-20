@@ -414,7 +414,7 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 	if err != nil {
 		return PublishResult{}, errors.Join(sandboxErr, err)
 	}
-	snapshotRoot, snapshotErr := snapshotfile.Open(ctx, stream)
+	snapshotRoot, snapshotErr := p.openSnapshot(ctx, stream, childScope)
 	if snapshotErr != nil {
 		return PublishResult{}, fmt.Errorf("publish: logical root is neither a strict .sandbox nor .snapshot: %w", errors.Join(sandboxErr, snapshotErr))
 	}
@@ -490,6 +490,14 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 			ref, e = "", ""
 		}
 	}()
+	if root.LocalCheckpoint != nil {
+		materialized, cleanup, err := p.materializeMemoryCheckpointRoot(ctx, root)
+		if err != nil {
+			return "", "", err
+		}
+		defer func() { retErr = errors.Join(retErr, cleanup()) }()
+		return p.publishSnapshotRoot(ctx, identity, scope, materialized)
+	}
 	if err := p.enter("snapshot:" + identity); err != nil {
 		return "", "", err
 	}
@@ -509,13 +517,15 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 	for _, raw := range cfg.FromRefs {
 		p.original(raw, scope)
 	}
+	publishedMemory := make([]string, len(cfg.FromRefs))
 	for i := len(cfg.FromRefs) - 1; i >= 0; i-- {
 		published, err := p.publishMemoryLayer(ctx, cfg.FromRefs[i], scope)
 		if err != nil {
 			return "", "", fmt.Errorf("publish Snapshot from_refs[%d]: %w", i, err)
 		}
-		cfg.FromRefs[i] = published
+		publishedMemory[i] = published
 	}
+	cfg.FromRefs = publishedMemory
 	sandboxStream, sandboxScope, err := p.open(ctx, cfg.SandboxRef, scope)
 	if err != nil {
 		return "", "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
@@ -622,23 +632,42 @@ func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope pu
 			}
 		}
 	}()
+	var stream fetch.Stream
+	var child publishScope
 	if portable, ok, err := p.keepPortable(ctx, raw, scope); err != nil {
 		return "", err
 	} else if ok {
-		return portable, nil
+		// A selected local descriptor still requires materialization even if
+		// its file was reached through a named location. Opaque external refs
+		// keep their existing availability and access semantics.
+		stream, child, err = p.selectedLocalMemoryCheckpoint(ctx, raw, scope)
+		if err != nil {
+			return "", err
+		}
+		if stream == nil {
+			return portable, nil
+		}
 	}
 	key := scopeKey(scope, raw)
 	p.memoMu.Lock()
 	cached := p.memoryMemo[key]
 	p.memoMu.Unlock()
 	if cached != "" {
+		if stream != nil {
+			if err := stream.Close(); err != nil {
+				return "", err
+			}
+		}
 		return cached, nil
 	}
-	stream, _, err := p.open(ctx, raw, scope)
-	if err != nil {
-		return "", err
+	if stream == nil {
+		var err error
+		stream, child, err = p.open(ctx, raw, scope)
+		if err != nil {
+			return "", err
+		}
 	}
-	root, err := snapshotfile.Open(ctx, stream)
+	root, err := p.openSnapshot(ctx, stream, child)
 	if err != nil {
 		return "", err
 	}
@@ -661,7 +690,19 @@ func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope pu
 		}
 		return "", errors.New("memory Snapshot snapshot.cfg is not canonical")
 	}
-	return p.target.Put(ctx, RoleSnapshot, root.FullStream)
+	if root.LocalCheckpoint != nil {
+		// A memory lower is one logical reference position. Preserve its
+		// visible values and dirty union without exposing internal W/H as
+		// extra entries in the caller's bounded external parent list.
+		portable, err := PortableMemoryLayer(ctx, root)
+		if err != nil {
+			return "", err
+		}
+		ref, err := p.target.Put(ctx, RoleSnapshot, portable)
+		return ref, err
+	}
+	ref, err = p.target.Put(ctx, RoleSnapshot, root.FullStream)
+	return ref, err
 }
 
 func (p *Publisher) open(ctx context.Context, raw string, scope publishScope) (fetch.Stream, publishScope, error) {

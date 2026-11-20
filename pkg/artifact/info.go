@@ -79,11 +79,11 @@ func (s *ProcessStorage) Inspect(ctx context.Context, input string, locations co
 	if err != nil {
 		return nil, errors.Join(sandboxErr, err)
 	}
-	snapshotRoot, snapshotErr := snapshotfile.Open(ctx, stream)
+	snapshotRoot, snapshotErr := snapshotfile.ReadMetadata(ctx, stream)
 	if snapshotErr != nil {
-		return nil, fmt.Errorf("artifact info: logical root is neither a strict .sandbox nor .snapshot: %w", errors.Join(sandboxErr, snapshotErr))
+		return nil, fmt.Errorf("artifact info: logical root is neither a strict .sandbox nor .snapshot: %w", errors.Join(sandboxErr, snapshotErr, stream.Close()))
 	}
-	defer snapshotRoot.Close()
+	defer stream.Close()
 	cfg, err := snapshot.ParseConfig(snapshotRoot.SnapshotConfig)
 	if err != nil {
 		return nil, fmt.Errorf("unsupported snapshot format/version: %w", err)

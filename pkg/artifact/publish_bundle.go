@@ -19,7 +19,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
 
-var errBundleCheckpoint = errors.New("bundle contains local disk Checkpoint")
+var errBundleCheckpoint = errors.New("bundle contains local Checkpoint")
 
 func (p *Publisher) publishBundle(
 	ctx context.Context,
@@ -200,11 +200,14 @@ func (p *Publisher) inspectBundleRoot(
 	if err != nil {
 		return "", nil, "", err
 	}
-	snapshotRoot, err := snapshotfile.Open(ctx, stream)
+	snapshotRoot, err := snapshotfile.ReadMetadata(ctx, stream)
 	if err != nil {
-		return "", nil, "", fmt.Errorf("publish Bundle: root is neither a strict Sandbox nor Snapshot: %w", err)
+		return "", nil, "", fmt.Errorf("publish Bundle: root is neither a strict Sandbox nor Snapshot: %w", errors.Join(err, stream.Close()))
 	}
-	defer func() { retErr = errors.Join(retErr, snapshotRoot.Close()) }()
+	defer func() { retErr = errors.Join(retErr, stream.Close()) }()
+	if snapshotRoot.LocalCheckpoint != nil {
+		return "", nil, "", errBundleCheckpoint
+	}
 	cfg, err := snapshot.ParseConfig(snapshotRoot.SnapshotConfig)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("publish Bundle: snapshot.cfg: %w", err)
@@ -387,7 +390,7 @@ func (p *Publisher) publishCheckpointBundle(ctx context.Context, raw string, sco
 	if err != nil {
 		return PublishResult{}, err
 	}
-	snap, err := snapshotfile.Open(ctx, stream)
+	snap, err := p.openSnapshot(ctx, stream, child)
 	if err != nil {
 		return PublishResult{}, err
 	}

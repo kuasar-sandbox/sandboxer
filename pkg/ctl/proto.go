@@ -37,14 +37,17 @@ import (
 // Request is a control request on ctl.sock. Type selects which fields
 // are populated.
 type Request struct {
-	BodyBytes       int                 `json:"body_bytes,omitempty"`
-	UsageHistory    bool                `json:"usage_history,omitempty"`
-	UsageCursor     int64               `json:"usage_cursor,omitempty,string"`
-	UsageLimit      int                 `json:"usage_limit,omitempty"`
-	Type            string              `json:"type"`
-	CheckpointID    string              `json:"checkpoint_id,omitempty"`
-	CheckpointOwner string              `json:"checkpoint_owner,omitempty"`
-	CheckpointRefs  []DiffCheckpointRef `json:"checkpoint_refs,omitempty"`
+	HostRetirement              *HostRetirementPermit `json:"host_retirement,omitempty"`
+	NoWaitForPreviousMemorySave bool                  `json:"no_wait_for_previous_memory_save,omitempty"`
+	CaptureStateQuery           *CaptureStateQuery    `json:"capture_state_query,omitempty"`
+	BodyBytes                   int                   `json:"body_bytes,omitempty"`
+	UsageHistory                bool                  `json:"usage_history,omitempty"`
+	UsageCursor                 int64                 `json:"usage_cursor,omitempty,string"`
+	UsageLimit                  int                   `json:"usage_limit,omitempty"`
+	Type                        string                `json:"type"`
+	CheckpointID                string                `json:"checkpoint_id,omitempty"`
+	CheckpointOwner             string                `json:"checkpoint_owner,omitempty"`
+	CheckpointRefs              []DiffCheckpointRef   `json:"checkpoint_refs,omitempty"`
 
 	// snapshot_request: OutDir and Upload are mutually exclusive (the
 	// receiving run process enforces); ResumeAfter defaults to false
@@ -68,7 +71,13 @@ type Request struct {
 
 // Response is the run-process reply.
 type Response struct {
-	DiskState *DiskStateReport `json:"disk_state,omitempty"`
+	// BeforeWrite is used only by committed frozen-memory captures. The server
+	// detaches this connection from Runtime shutdown before invoking it; SDK
+	// callers first leave their operation wait group. It waits for retirement,
+	// never for the detached memory write.
+	BeforeWrite  func() error     `json:"-"`
+	CaptureState *CaptureState    `json:"capture_state,omitempty"`
+	DiskState    *DiskStateReport `json:"disk_state,omitempty"`
 	// SandboxID identifies the usage owner even when live/saved/history is empty.
 	SandboxID     string          `json:"sandbox_id,omitempty"`
 	ResourceStats *ResourceStats  `json:"resource_stats,omitempty"`

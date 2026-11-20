@@ -657,7 +657,7 @@ A live Disk SnapshotView is an upper-only sparse delta. Its ext4-superblock offs
 
 ## `.snapshot` logical format
 
-Snapshot S layout:
+Ordinary portable Snapshot S layout:
 
 ```text
 [memory sparse payload]
@@ -682,11 +682,83 @@ from_refs:
 
 Snapshot ZIP and configuration are also strict, bounded, and canonical. `config.json` and `state.json` are each limited to 16 MiB, `snapshot.cfg` to 1 MiB, and `from_refs` to 64 entries. See [snapshotfile.go](../pkg/snapshotfile/snapshotfile.go) and [snapshot/config.go](../pkg/snapshot/config.go). Old disk-schema inputs return `unsupported snapshot format/version`; there is no dual-read, migration, or cold fallback.
 
+<a id="memory-checkpoint-descriptor"></a>
+
+### Node-local checkpoint memory descriptor
+
+Named local fast capture uses a separate strict profile: a zero-length memory
+prefix followed by `config.json`, `state.json`, `snapshot.cfg`, and
+`memory.checkpoint.json`. The fixed descriptor contains version, memory ID,
+checkpoint ID, logical RAM size, a content-identified map reference, ordered
+internal parent refs, and the current working-set selection. The external
+`from_refs` suffix stays in `snapshot.cfg`.
+
+The map is an independent existing image carrier containing fixed M/D/R
+bitmaps; it is not placed inside the bounded ZIP. A mutable record under
+`memory/<sha256(checkpointID)>/<memoryID>.json` identifies one exact attempt
+and its published payload. An aborted retry uses a new memoryID and increasing
+epoch; it never replaces an older receipt's JSON or RAM pin. The stable preparation
+writer lock remains `memory/<sha256(checkpointID)>.json.lock` across attempts. `current-memory.json` locates the SID's latest obligation. Neither
+socket identity nor write progress changes the fixed S identity. Missing or
+inconsistent required records are errors, never an empty memory layer.
+
+The record also binds the independent holder directory and the stable RAM-proof
+inode by device/inode and a random nonce. `<record path>.ram.lock` is distinct from the checkpoint
+GC lock. Capture JSON records (including aborted preparations) and their stable writer
+and RAM-proof locks remain until terminal BaseDir deletion. A newer current
+locator or an unreferenced source does not prove that a resource receipt has
+consumed the old release/abort fact. These small metadata files therefore grow
+with the number of captures; payloads, maps and carriers still follow graph GC. FileReady records can be read without a live holder. A committed, retired
+record with RAMReleased but no FileReady is a lost source: the common reader
+reports an explicit error while the SID's physical RAM obligation is complete.
+It never adopts an unpublished payload based on file existence alone.
+
+Both local tarstream and Bundle capture can carry this profile. The local Bundle
+adapter commits each small descriptor/map and later payload as an ordinary
+immutable Bundle with an existing `file://...bundle@manifest:<key>` selector;
+portable export retains its existing planned Bundle behavior.
+
+The common artifact reader exposes the node-local graph as one memory layer.
+It adapts the holder to `sparse.Source` and reuses `CaptureMemory`, `DirtyMemory`,
+`SelectMemory` and `fetch.NewLayered`. Candidate addresses remain separate from
+selected values; historical selection boundaries and the ordered parent suffix
+are preserved. No checkpoint-specific interval index is constructed.
+Each opened graph keeps at most eight physical carrier FDs in its checkpoint
+file pool, separate from existing tarstream/Bundle parser metadata. Reopening
+checks the original file identity. Pooling requires an existing directory GC
+pin. Pool registration never creates that protection protocol: external sources,
+including LocalDescriptors without an existing lock, keep their original
+FD/mmap ownership and remain readable after unlink. A later-created lock does
+not change that graph's decision. Closing joins file-switch readers, closes the
+pool, and then releases the directory pins.
+Portable publication of an execution root preserves the capture semantics:
+dirty capture combines current changes with eligible dirty history; working-set
+capture retains only the current working set in top W and emits compacted dirty
+history as one H before the unchanged external `from_refs` suffix. This H uses
+one of the existing 64 parent slots. Fast capture validates that prospective
+configuration before holder preparation or guest freeze, as synchronous capture
+already does; W plus H plus 64 external parents is rejected without committing
+the capture or opening those external parents.
+
+When a node-local object is used as a memory lower/import, ordinary publication
+and rewrite instead emit one portable S with its complete visible values and
+dirty candidate union. That lower occupies exactly one external reference
+position, regardless of its internal history. It does not change the current
+execution root's working-set coverage. An explicit root reduction, including
+`--reduce-ref=any`, may read and merge the original external chain with the local
+view directly. This provides a repair path for an existing W/H object whose
+portable expansion would exceed 64 entries; ordinary publication continues to
+report the capacity error. Ordinary missing-`memory.dirty` compatibility remains
+unchanged.
+Portable publication and rewrite, including portable Bundle output, materialize a standard S and do
+not copy the descriptor as if it contained memory. Older readers reject the
+local profile; the new reader continues to accept ordinary snapshots.
+
 <a id="memory-dirty"></a>
 
 ### Optional `memory.dirty` metadata
 
-A canonical Snapshot S has three entries, or appends `memory.dirty` as the fourth
+A canonical ordinary Snapshot S has three entries, or appends `memory.dirty` as the fourth
 entry after `config.json`, `state.json` and `snapshot.cfg`. `snapshot.cfg.version`
 remains `1`; this metadata does not create another snapshot configuration schema.
 
@@ -779,7 +851,7 @@ remain separate from ext4 uppers. Data and opaque Zero override lower layers;
 Hole falls through. Historical reads use host artifact streams, never the guest
 memfd, and therefore do not enlarge the captured working set.
 
-History is composed before guest freeze and streamed into the final sink. It
+Ordinary capture composes history before guest freeze and streams it into the final sink. Named local fast capture records the internal parent graph and defers this materialization to portable export. It
 uses `fetch.NewLayered` and sparse runs without a full-image buffer or intermediate
 image copy. Local output reuses dependencies already owned by that checkpoint through their
 physical selectors. Bundle output keeps its existing member-copy publication path. New history has a new content
@@ -787,8 +859,7 @@ identity; the old source remains valid through sink commit/close and database
 commit. Failed capture or database commit cannot authorize old-file deletion.
 
 After a managed Pause commits its exact S/E pair (or E-only root), the lifecycle
-owner fences the old runner and all readers/writers, then invokes selective
-cleanup. Generic FileSink output, arbitrary `--output`, independent
+owner retires normal execution and invokes selective cleanup only after its reader fences permit deletion. A pending memory holder retains its unit, resources, map and internal dependency graph; it is not killed by normal paused-run cleanup. Generic FileSink output, arbitrary `--output`, independent
 `snapshot --resume`, and shared build inputs confer no cleanup rights. The
 sandboxer artifact library interprets the keep set; conductor supplies ownership,
 paths, the committed pair, and the existing lifecycle fences through the
@@ -816,6 +887,12 @@ only bounded current metadata and Bundle indexes, not old candidate payloads or
 full-image digests; Snapshot CPU/state bodies are not needed by this operation.
 Any keep-plan or reader-close error prevents all deletions. Kernel/runtime basename
 identities bind host-supplied boot files and are not checkpoint payload edges.
+If a `from_refs` memory lower is a recorded node-local memory object, its exact
+carrier digest and inode identify the map, payload, capture record and internal
+parent graph to retain, including through a named location. Ordinary lowers stay
+opaque. A lower's historical execution, disk and external memory configuration
+does not add recursive dependencies. The independent current-memory root retains
+its own memory lowers even when the selected source is older or E-only.
 
 Bundle candidate locations are resolved only when the existing selector visits
 that source: current Bundle first, then ordered refs, then remote. A current hit
@@ -844,15 +921,25 @@ the stored pair, without requiring an E alias. Cleanup unlinks recognized aliase
 symlinks or recursively removes the directory; directory-fd operations keep
 unlink confined if paths race.
 
-A committed Pause remains successful if cleanup fails. The last durable RunDir
-ownership marker remains until checkpoint cleanup and ordinary paused cleanup
-succeed. The existing worker retries with a freshly loaded current source under
-the SID lifecycle lock, including after restart. Active or detached exports keep
+A committed Pause remains successful if cleanup fails. If a memory reader pin
+prevents the exclusive collection lock, `CleanupCheckpoint` returns
+`artifact.ErrCheckpointMemoryReadersBusy` before changing aliases or deleting
+anything. The managed owner may defer this collection and finish ordinary paused
+runtime cleanup without waiting for the memory save. The holder-retirement worker
+retries collection after memory release and runner fencing while the sandbox is
+paused, including when its RunDir ownership has already been cleared.
+
+For other cleanup failures, the last durable RunDir ownership marker remains until
+checkpoint cleanup and ordinary paused cleanup succeed. The existing worker
+retries with a freshly loaded current source under the SID lifecycle lock,
+including after restart. Active or detached exports keep
 their read fence; cleanup never waits for an export while holding the lock it
 needs. Resume/Wake/Exec obey the existing pending-cleanup admission contract.
 Missing candidates count as finished; permission, I/O, and identity errors retain
-retry ownership. Ordinary Kill and terminal BuildBaseDir deletion retain their
-existing finalizers. Shared/external artifacts are never reclaimed by this step.
+retry ownership. The deferred-collection result does not authorize hard deletion
+or release of a memory holder. Ordinary Kill and terminal BuildBaseDir deletion
+retain their existing finalizers. Shared/external artifacts are never reclaimed
+by this step.
 
 <a id="artifact-publication"></a>
 

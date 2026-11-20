@@ -31,6 +31,7 @@ func snapshotCmd(args []string) int {
 	resume := fs.Bool("resume", false, "keep sandbox running after snapshot (default: destroy via /vm.shutdown)")
 	dropCaches := fs.Bool("drop-caches", false, "drop guest page, inode, and dentry caches before snapshot (default: preserve guest caches)")
 	mergeRef := fs.Bool("merge-ref", true, "merge a local parent memory ref into the new memory self layer")
+	noWait := fs.Bool("no-wait-for-previous-memory-save", false, "reject capture while the previous checkpoint memory save is pending")
 	runRoot := fs.String("run-root", "", "tmpfs run root (overrides SANDBOX_RUN_ROOT env; default /run/sandbox)")
 	timeoutS := fs.Int("timeout", 0, "seconds to wait for snapshot_done (0 = wait indefinitely; upload can take minutes)")
 
@@ -117,12 +118,18 @@ func snapshotCmd(args []string) int {
 	}
 
 	req := ctl.Request{
-		Type:        ctl.TypeSnapshotRequest,
-		OutDir:      *outDir,
-		Upload:      *upload,
-		ResumeAfter: *resume,
-		DropCaches:  dropCaches,
-		MergeRef:    mergeRef,
+		NoWaitForPreviousMemorySave: *noWait,
+		Type:                        ctl.TypeSnapshotRequest,
+		OutDir:                      *outDir,
+		Upload:                      *upload,
+		ResumeAfter:                 *resume,
+		DropCaches:                  dropCaches,
+		MergeRef:                    mergeRef,
+	}
+	req.HostRetirement, err = ctl.ParseHostRetirement(os.Getenv(ctl.HostRetirementEnvironment))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "snapshot: retirement permit: %v\n", err)
+		return 79
 	}
 	if *checkpoint != "" {
 		req.Type = ctl.TypeCheckpointSnapshotRequest
@@ -144,6 +151,9 @@ func snapshotCmd(args []string) int {
 		fmt.Fprintf(os.Stderr, "snapshot: error from sandbox: %s\n", resp.Msg)
 		if errors.Is(ctl.CaptureError(resp), ctl.ErrCheckpointUnsupported) {
 			return 78
+		}
+		if resp.Code == ctl.CaptureRejectedCode {
+			return 79
 		}
 		return 1
 	}
