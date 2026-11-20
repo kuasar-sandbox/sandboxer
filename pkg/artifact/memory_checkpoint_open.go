@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -19,7 +20,10 @@ import (
 // memoryGraphOwner owns every opened backing exactly once, in a flat list.
 // Closing a long history cannot recurse through a chain of child Root owners.
 type memoryGraphOwner struct {
+	mu          sync.Mutex // file-switch callbacks can register directories during traversal
 	closers     []io.Closer
+	pins        []io.Closer
+	pool        *checkpointFilePool
 	directories map[string]bool
 	once        sync.Once
 	err         error
@@ -33,30 +37,50 @@ func (g *memoryGraphOwner) Close() error {
 			}
 		}
 		g.closers = nil
+		if g.pool != nil {
+			g.err = errors.Join(g.err, g.pool.Close())
+		}
+		for i := len(g.pins) - 1; i >= 0; i-- {
+			g.err = errors.Join(g.err, g.pins[i].Close())
+		}
+		g.pins = nil
 	})
 	return g.err
 }
 
-func (g *memoryGraphOwner) pin(directory string) error {
+// pin serializes registration with asynchronous RAM-to-file switch callbacks.
+// An ordinary external source without a GC lock retains its original open FD.
+func (g *memoryGraphOwner) pin(directory string, existingOnly bool) (bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.directories[directory] {
-		return nil
+		return true, nil
 	}
-	pin, err := memorycheckpoint.PinDirectory(directory)
+	var pin *os.File
+	var err error
+	if existingOnly {
+		pin, err = memorycheckpoint.PinExistingDirectory(directory)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+	} else {
+		pin, err = memorycheckpoint.PinDirectory(directory)
+	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if g.directories == nil {
 		g.directories = make(map[string]bool)
 	}
 	g.directories[directory] = true
-	g.closers = append(g.closers, pin)
-	return nil
+	g.pins = append(g.pins, pin)
+	return true, nil
 }
 
 type memoryOpenNode struct {
-	config        *snapshot.Config
-	values, dirty *memoryIndex
-	local         bool
+	config                    *snapshot.Config
+	values, candidates, dirty sparse.Source
+	local                     bool
 }
 
 type memoryOpenFrame struct {
@@ -66,15 +90,17 @@ type memoryOpenFrame struct {
 	identity        string
 	options         SnapshotOpenOptions
 	openFile        func(context.Context, string) (fetch.Stream, error)
-	top, candidates *memoryIndex
+	top, candidates sparse.Source
 	topDirty        []byte
+	topEmpty        bool
 	parents         []*memoryOpenNode
 }
 
 // OpenSnapshot is the common execution/artifact reader. It takes ownership of
 // stream on every path. Ordinary Snapshot parsing and memory semantics remain
 // those of snapshotfile.Open. Local history is resolved in postorder without a
-// checkpoint-count limit, payload copies or recursive read/close operations.
+// checkpoint-count limit or payload copies. Data selection uses the existing
+// fetch/snapshot operators; ownership closes iteratively.
 func (s *ProcessStorage) OpenSnapshot(ctx context.Context, stream fetch.Stream, opts SnapshotOpenOptions) (_ *snapshotfile.Root, retErr error) {
 	if stream == nil {
 		return nil, errors.New("snapshot: nil stream")
@@ -86,7 +112,8 @@ func (s *ProcessStorage) OpenSnapshot(ctx context.Context, stream fetch.Stream, 
 	if descriptor == nil {
 		return snapshotfile.Open(ctx, stream)
 	}
-	owners := &memoryGraphOwner{}
+	pool := newCheckpointFilePool()
+	owners := &memoryGraphOwner{pool: pool}
 	transferred := false
 	defer func() {
 		if !transferred {
@@ -170,7 +197,7 @@ func (s *ProcessStorage) newMemoryOpenFrame(ctx context.Context, stream fetch.St
 		return nil, err
 	}
 	opts.LocalDirectory = directory
-	if err := owners.pin(directory); err != nil {
+	if _, err := owners.pin(directory, false); err != nil {
 		return nil, err
 	}
 	var metadata *snapshotfile.Metadata
@@ -199,9 +226,15 @@ func (s *ProcessStorage) newMemoryOpenFrame(ctx context.Context, stream fetch.St
 		if err != nil {
 			return nil, err
 		}
-		return s.OpenFileWithLocations(ctx, path, ref, opts.RefLocations)
+		return s.openFile(ctx, path, ref, opts.RefLocations, false, func(physical string) (*checkpointFilePool, error) {
+			pinned, err := owners.pin(filepath.Dir(physical), true)
+			if err != nil || !pinned {
+				return nil, err
+			}
+			return owners.pool, nil
+		})
 	}
-	backing, err := memorycheckpoint.OpenTop(ctx, *descriptor, memorycheckpoint.OpenOptions{Directory: directory, OpenFile: openFile})
+	backing, err := memorycheckpoint.OpenTop(ctx, *descriptor, memorycheckpoint.OpenOptions{Directory: directory, OpenFile: openFile, DirectoryPinned: true})
 	if err != nil {
 		return nil, err
 	}
@@ -211,28 +244,28 @@ func (s *ProcessStorage) newMemoryOpenFrame(ctx context.Context, stream fetch.St
 	if err != nil {
 		return nil, err
 	}
-	top, err := indexMemoryLeaf(ctx, topSource)
+	candidates, err := snapshot.DirtyMemory(topSource, dirty)
 	if err != nil {
 		return nil, err
 	}
-	candidates, err := snapshot.DirtyMemory(memoryIndexBranch{top}, dirty)
-	if err != nil {
-		return nil, err
-	}
-	indexedCandidates, err := indexMemoryComposite(ctx, candidates)
-	if err != nil {
-		return nil, err
-	}
-	// The index retains leaf ReaderAt/Run values, not CaptureView's page maps.
-	// Historical dense maps can be reclaimed immediately after compilation.
-	backing.Map = nil
-	hasData := false
-	for _, run := range top.runs {
-		hasData = hasData || run.kind == sparse.Data
+	// CaptureMemory owns the fixed maps; only actual data needs the backing.
+	hasData, allHole := false, true
+	for off := uint64(0); off < topSource.Size(); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		run, err := topSource.RunAt(off, topSource.Size()-off)
+		if err != nil {
+			return nil, err
+		}
+		allHole = allHole && run.Kind() == sparse.Hole
+		if run.Kind() == sparse.Data {
+			hasData = true
+			break
+		}
+		off = run.End()
 	}
 	if !hasData {
-		// Holes and explicit zeros need no RAM or payload fd. Directory pins
-		// protect the still-being-opened graph independently of data readers.
 		if err := backing.Close(); err != nil {
 			return nil, err
 		}
@@ -243,7 +276,7 @@ func (s *ProcessStorage) newMemoryOpenFrame(ctx context.Context, stream fetch.St
 	}
 	return &memoryOpenFrame{descriptor: descriptor, metadata: metadata, config: cfg,
 		identity: filepath.Join(directory, descriptor.MemoryID), options: opts, openFile: openFile,
-		top: top, candidates: indexedCandidates, topDirty: dirty}, nil
+		top: topSource, candidates: candidates, topDirty: dirty, topEmpty: allHole}, nil
 }
 
 func canonicalMemoryConfig(raw []byte) (*snapshot.Config, error) {
@@ -270,23 +303,16 @@ func openOrdinaryMemoryNode(ctx context.Context, stream fetch.Stream, owners *me
 	if err != nil {
 		return nil, err
 	}
-	values, err := indexMemoryLeaf(ctx, root.Memory)
+	candidates, err := snapshot.DirtyMemory(root.Memory, root.MemoryDirty)
 	if err != nil {
 		return nil, err
 	}
-	dirty, err := snapshot.DirtyMemory(memoryIndexBranch{values}, root.MemoryDirty)
-	if err != nil {
-		return nil, err
-	}
-	candidates, err := indexMemoryComposite(ctx, dirty)
-	if err != nil {
-		return nil, err
-	}
-	return &memoryOpenNode{config: cfg, values: values, dirty: candidates}, nil
+	return &memoryOpenNode{config: cfg, values: root.Memory, candidates: candidates, dirty: candidates}, nil
 }
 
 func (f *memoryOpenFrame) compose(ctx context.Context) (*memoryOpenNode, *snapshotfile.LocalCheckpointView, error) {
-	var parentValues, parentCandidates []*memoryIndex
+	var parentValues, parentCandidates []sparse.Source
+	var singleHistory sparse.Source
 	for i, parent := range f.parents {
 		if parent.values.Size() != f.descriptor.Size {
 			return nil, nil, errors.New("memory checkpoint parent size mismatch")
@@ -295,52 +321,52 @@ func (f *memoryOpenFrame) compose(ctx context.Context) (*memoryOpenNode, *snapsh
 		if !parent.local {
 			expected = append(append([]string(nil), f.descriptor.Parents[i+1:]...), expected...)
 		}
-		candidate := parent.dirty
+		candidate := parent.candidates
+		singleHistory = parent.dirty
 		if !SnapshotParentViewEqual(parent.config.FromRefs, expected) {
 			// Dirty is a hint relative to the complete ordered suffix. Preserve
 			// every explicit value if that suffix cannot be proved.
 			candidate = parent.values
+			singleHistory = parent.values
 		}
 		parentValues = append(parentValues, parent.values)
 		parentCandidates = append(parentCandidates, candidate)
 	}
-	var history, historyFull *memoryIndex
+	var history, historyFull, historyCandidates sparse.Source
 	var err error
 	if len(parentValues) != 0 {
-		historyFull, err = indexMemoryComposite(ctx, layerMemoryIndexes(parentValues))
-		if err != nil {
-			return nil, nil, err
+		historyFull = layerMemorySources(parentValues...)
+		historyCandidates = layerMemorySources(parentCandidates...)
+		if len(parentValues) == 1 && singleHistory != nil {
+			history = singleHistory
+		} else {
+			history, err = snapshot.SelectMemory(historyFull, historyCandidates)
 		}
-		selected, err := snapshot.SelectMemory(memoryIndexBranch{historyFull}, layerMemoryIndexes(parentCandidates))
-		if err != nil {
-			return nil, nil, err
-		}
-		history, err = indexMemoryComposite(ctx, selected)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
-	values := f.top
-	candidates := sparse.Source(memoryIndexBranch{f.candidates})
+	values, candidates := f.top, f.candidates
 	if history != nil {
-		values, err = indexMemoryComposite(ctx, layerMemoryIndexes([]*memoryIndex{f.top, history}))
-		if err != nil {
-			return nil, nil, err
-		}
-		candidates = layerMemoryIndexes([]*memoryIndex{f.candidates, history})
+		values = layerMemorySources(f.top, history)
+		// Candidates carry addresses only. Reusing the selected value expression
+		// here doubles traversal at each generation. Every candidate already
+		// has a value in its parent's view, so this preserves exact coverage.
+		candidates = layerMemorySources(f.candidates, historyCandidates)
 	}
-	selected, err := snapshot.SelectMemory(memoryIndexBranch{values}, candidates)
-	if err != nil {
-		return nil, nil, err
+	var dirty sparse.Source
+	if f.topEmpty && history != nil {
+		// An all-Hole capture leaves the already-selected history unchanged.
+		// Reuse that expression instead of wrapping it in another identity selection.
+		values, dirty, candidates = history, history, historyCandidates
+	} else {
+		dirty, err = snapshot.SelectMemory(values, candidates)
 	}
-	dirty, err := indexMemoryComposite(ctx, selected)
 	if err != nil {
 		return nil, nil, err
 	}
 	view := &snapshotfile.LocalCheckpointView{Descriptor: *f.descriptor,
-		Top: f.top, TopDirty: f.topDirty, Dirty: dirty}
-	if history != nil {
-		view.History, view.HistoryFull = history, historyFull
-	}
-	return &memoryOpenNode{config: f.config, values: values, dirty: dirty, local: true}, view, nil
+		Top: f.top, TopDirty: f.topDirty, Dirty: dirty,
+		History: history, HistoryFull: historyFull}
+	return &memoryOpenNode{config: f.config, values: values, candidates: candidates, dirty: dirty, local: true}, view, nil
 }

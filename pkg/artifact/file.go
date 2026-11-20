@@ -144,7 +144,7 @@ func OpenFileWithLocations(
 	return s.openFile(ctx, path, ref, locations, false)
 }
 
-func (s *ProcessStorage) openFile(ctx context.Context, path string, ref manifest.Ref, locations config.RefLocations, transient bool) (*OpenedFile, error) {
+func (s *ProcessStorage) openFile(ctx context.Context, path string, ref manifest.Ref, locations config.RefLocations, transient bool, poolForPath ...checkpointPoolForPath) (*OpenedFile, error) {
 	if s == nil {
 		return nil, readerr.Mark(fmt.Errorf("artifact: process storage is required"), false)
 	}
@@ -153,7 +153,7 @@ func (s *ProcessStorage) openFile(ctx context.Context, path string, ref manifest
 		return nil, readerr.Mark(err, false)
 	}
 	opened, err := readretry.Open(ctx, func() (*OpenedFile, error) {
-		opened, err := openFileWithLocations(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), locations, codec, required)
+		opened, err := openFileWithLocations(ctx, path, ref, s.cfg, s.keyFn, s.Fetcher(), locations, codec, required, poolForPath...)
 		if errors.Is(err, os.ErrNotExist) {
 			err = readerr.Mark(err, false)
 		}
@@ -172,6 +172,7 @@ func openFileWithLocations(
 	locations config.RefLocations,
 	localCodec tarstream.Codec,
 	localRequired bool,
+	poolForPath ...checkpointPoolForPath,
 ) (*OpenedFile, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -190,15 +191,41 @@ func openFileWithLocations(
 		return nil, err
 	}
 
-	format, err := DetectFileFormat(path)
+	var pool *checkpointFilePool
+	if len(poolForPath) != 0 && poolForPath[0] != nil {
+		// Register the directory pin for the actual physical path that this
+		// open will use; resolving the caller's alias twice could pin another file.
+		pool, err = poolForPath[0](path)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var format FileFormat
+	var source *checkpointFileReader
+	if pool != nil {
+		source, err = pool.source(path)
+		if err == nil {
+			var magic [4]byte
+			var n int
+			n, err = source.ReadAt(magic[:], 0)
+			if err == io.EOF {
+				err = nil
+			}
+			if n == len(magic) && magic == manifestBundleMagic {
+				format = FileFormatManifestBundle
+			}
+		}
+	} else {
+		format, err = DetectFileFormat(path)
+	}
 	if err != nil {
 		return nil, err
 	}
 	var opened *OpenedFile
 	if format == FileFormatManifestBundle {
-		opened, err = openManifestBundle(ctx, path, ref, manifestCfg, keyFn, remote, locations)
+		opened, err = openManifestBundle(ctx, path, ref, manifestCfg, keyFn, remote, locations, source)
 	} else {
-		opened, err = openTarstream(path, ref, localCodec, localRequired)
+		opened, err = openTarstream(path, ref, localCodec, localRequired, source)
 	}
 	if ref.Location != "" {
 		err = protectProcessLocalReadError(localCodec, "open ref artifact", err)
@@ -308,7 +335,7 @@ func DetectFileFormat(path string) (FileFormat, error) {
 	return FileFormatTarstream, nil
 }
 
-func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc, remote fetch.Fetcher, locations config.RefLocations) (*OpenedFile, error) {
+func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg *config.ManifestConfig, keyFn ingest.CustomerKeyFunc, remote fetch.Fetcher, locations config.RefLocations, sources ...*checkpointFileReader) (*OpenedFile, error) {
 	if ref.DigestScheme != "" && ref.DigestScheme != "manifest" {
 		return nil, readerr.Mark(fmt.Errorf("manifest Bundle rejects @%s identity", ref.DigestScheme), false)
 	}
@@ -317,7 +344,13 @@ func openManifestBundle(ctx context.Context, path string, ref manifest.Ref, cfg 
 	}
 	// path was resolved and location-checked before format detection. Use that
 	// same path for the reader, identity, dependent refs, and returned provenance.
-	reader, err := bundle.Open(path)
+	var reader *bundle.Reader
+	var err error
+	if len(sources) != 0 && sources[0] != nil {
+		reader, err = bundle.NewReader(sources[0], sources[0].identity.Size())
+	} else {
+		reader, err = bundle.Open(path)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -393,7 +426,7 @@ func bundleRootKeyFromResolvedPath(path string, ref manifest.Ref) (store.Content
 	return key, nil
 }
 
-func openTarstream(path string, ref manifest.Ref, codec tarstream.Codec, required bool) (*OpenedFile, error) {
+func openTarstream(path string, ref manifest.Ref, codec tarstream.Codec, required bool, sources ...*checkpointFileReader) (*OpenedFile, error) {
 	if ref.DigestScheme == "manifest" {
 		return nil, readerr.Mark(fmt.Errorf("tarstream rejects @manifest selector"), false)
 	}
@@ -401,7 +434,12 @@ func openTarstream(path string, ref manifest.Ref, codec tarstream.Codec, require
 	if err != nil {
 		return nil, err
 	}
-	stream, err := fetch.OpenTarStream(path, options...)
+	var stream fetch.Stream
+	if len(sources) != 0 && sources[0] != nil {
+		stream, err = checkpointTarSource(sources[0], options...)
+	} else {
+		stream, err = fetch.OpenTarStream(path, options...)
+	}
 	if err != nil {
 		return nil, err
 	}

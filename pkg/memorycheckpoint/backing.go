@@ -19,8 +19,11 @@ import (
 )
 
 type OpenOptions struct {
-	Directory string
-	OpenFile  func(context.Context, string) (fetch.Stream, error)
+	// DirectoryPinned borrows a shared root-view GC pin. The caller keeps it
+	// until this backing and all its in-flight reads and switching have closed.
+	DirectoryPinned bool
+	Directory       string
+	OpenFile        func(context.Context, string) (fetch.Stream, error)
 }
 
 type TopBacking struct {
@@ -108,21 +111,43 @@ func closeRAMPair(ram, pin *os.File) error {
 // PinDirectory protects live readers from checkpoint cleanup. The stable lock
 // inode is never replaced; an exclusive cleanup must fail while a reader lives.
 func PinDirectory(directory string) (*os.File, error) {
-	return lockDirectory(directory, unix.LOCK_SH)
+	return lockDirectory(directory, unix.LOCK_SH, true)
 }
 
 func ExclusiveDirectory(directory string) (*os.File, error) {
-	return lockDirectory(directory, unix.LOCK_EX)
+	return lockDirectory(directory, unix.LOCK_EX, true)
 }
 
-func lockDirectory(directory string, mode int) (*os.File, error) {
-	f, err := os.OpenFile(filepath.Join(directory, ".memory-readers.lock"), os.O_CREATE|os.O_RDWR, 0600)
+// PinExistingDirectory never creates a protection protocol for an external
+// artifact. Only directories that already use the stable GC lock can be pooled.
+func PinExistingDirectory(directory string) (*os.File, error) {
+	return lockDirectory(directory, unix.LOCK_SH, false)
+}
+
+func lockDirectory(directory string, mode int, create bool) (*os.File, error) {
+	flags := os.O_RDWR | unix.O_NOFOLLOW
+	if create {
+		flags |= os.O_CREATE
+	}
+	path := filepath.Join(directory, ".memory-readers.lock")
+	f, err := os.OpenFile(path, flags, 0600)
 	if err != nil {
 		return nil, err
 	}
 	if err = unix.Flock(int(f.Fd()), mode|unix.LOCK_NB); err != nil {
 		f.Close()
 		return nil, err
+	}
+	id, err := fileIdentity(f)
+	var named unix.Stat_t
+	if err == nil {
+		err = unix.Lstat(path, &named)
+	}
+	if err == nil && (id.Device != uint64(named.Dev) || id.Inode != named.Ino || named.Mode&unix.S_IFMT != unix.S_IFREG) {
+		err = errors.New("memory checkpoint: directory pin identity changed")
+	}
+	if err != nil {
+		return nil, errors.Join(err, f.Close())
 	}
 	return f, nil
 }
@@ -134,9 +159,13 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 	if opts.OpenFile == nil {
 		return nil, errors.New("memory checkpoint: missing local carrier opener")
 	}
-	pin, err := PinDirectory(opts.Directory)
-	if err != nil {
-		return nil, err
+	var pin *os.File
+	var err error
+	if !opts.DirectoryPinned {
+		pin, err = PinDirectory(opts.Directory)
+		if err != nil {
+			return nil, err
+		}
 	}
 	t := &TopBacking{reader: &switchReader{}, options: opts, done: make(chan struct{}), pin: pin}
 	t.Reader = t.reader
@@ -149,7 +178,9 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 			if t.conn != nil {
 				_ = t.conn.Close()
 			}
-			_ = pin.Close()
+			if pin != nil {
+				_ = pin.Close()
+			}
 		}
 	}()
 	m, err := opts.OpenFile(ctx, d.MapRef)
@@ -175,7 +206,7 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 	if err != nil {
 		return nil, err
 	}
-	r, err := ReadRecord(opts.Directory, d.CheckpointID)
+	r, err := ReadRecord(opts.Directory, d.CheckpointID, d.MemoryID)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +236,7 @@ func OpenTop(ctx context.Context, d Descriptor, opts OpenOptions) (top *TopBacki
 	c, err := dialHolder(ctx, r.Holder)
 	if err != nil {
 		// Publication and socket deletion can race the initial record read.
-		path, pe := RecordPath(opts.Directory, r.CheckpointID)
+		path, pe := RecordPath(opts.Directory, r.CheckpointID, r.MemoryID)
 		if pe != nil {
 			return nil, pe
 		}
@@ -317,7 +348,7 @@ func (t *TopBacking) watch(ctx context.Context, size uint64) {
 			return
 		case <-ticker.C:
 		}
-		r, err := ReadRecord(t.options.Directory, t.record.CheckpointID)
+		r, err := ReadRecord(t.options.Directory, t.record.CheckpointID, t.record.MemoryID)
 		if err != nil || !sameCaptureIdentity(*r, t.record) || !r.FileReady {
 			continue
 		}
@@ -358,7 +389,7 @@ func (t *TopBacking) releaseLease() bool {
 		t.lease.Token = ""
 		return true
 	}
-	path, err := RecordPath(t.options.Directory, t.record.CheckpointID)
+	path, err := RecordPath(t.options.Directory, t.record.CheckpointID, t.record.MemoryID)
 	if err == nil {
 		recovery, re := RecoverMemoryRelease(context.Background(), path, t.record)
 		if re == nil && (recovery.Record.RAMReleased || recovery.ProducerExited) {
@@ -415,7 +446,7 @@ func releaseOnConnection(c *net.UnixConn, lease holderMessage) bool {
 }
 
 func leaseReleaseRecorded(directory string, record CaptureRecord) bool {
-	r, err := ReadRecord(directory, record.CheckpointID)
+	r, err := ReadRecord(directory, record.CheckpointID, record.MemoryID)
 	return err == nil && sameCaptureIdentity(*r, record) && r.RAMReleased
 }
 
@@ -436,7 +467,7 @@ func retryRelease(directory string, record CaptureRecord, lease holderMessage) {
 			if leaseReleaseRecorded(directory, record) {
 				return
 			}
-			path, err := RecordPath(directory, record.CheckpointID)
+			path, err := RecordPath(directory, record.CheckpointID, record.MemoryID)
 			if err == nil {
 				recovery, re := RecoverMemoryRelease(context.Background(), path, record)
 				if re == nil && (recovery.Record.RAMReleased || recovery.ProducerExited) {

@@ -438,9 +438,20 @@ func TestRecoverKilledProducerBeforeParentReaps(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	got, err := RecoverMemoryRelease(context.Background(), p.path, p.record)
-	if err != nil || !got.ProducerExited || !got.Record.RAMReleased || !got.Record.FileReady {
-		t.Fatalf("unreaped producer retained released RAM: %+v %v", got, err)
+	// The leader can become a zombie just before the final task releases
+	// shared files. Nonblocking recovery is retried without reaping the child.
+	for {
+		got, err := RecoverMemoryRelease(context.Background(), p.path, p.record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ProducerExited && got.Record.RAMReleased && got.Record.FileReady {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("unreaped producer retained released RAM: %+v", got)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -465,7 +476,10 @@ func TestRecoveryProofFailuresNeverPublishRelease(t *testing.T) {
 				expected.MemoryID = "wrong"
 			case "writer-busy":
 				var err error
-				lock, err = os.OpenFile(p.path+".lock", os.O_RDWR, 0)
+				lock, err = os.OpenFile(func() string {
+					path, _ := preparationLockPath(filepath.Dir(filepath.Dir(filepath.Dir(p.path))), p.record.CheckpointID)
+					return path
+				}(), os.O_RDWR, 0)
 				if err != nil {
 					t.Fatal(err)
 				}

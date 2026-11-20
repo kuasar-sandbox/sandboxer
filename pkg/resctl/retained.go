@@ -3,6 +3,7 @@ package resctl
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
@@ -106,16 +107,87 @@ func (h *ControllerHooks) AbortRetained(ctx context.Context, capture resource.Ca
 		return nil
 	}
 	h.sessionMu.Lock()
-	defer h.sessionMu.Unlock()
 	if _, err := h.retentionCallLocked(ctx, resource.TypeAbortRetained, capture); err != nil {
+		h.mu.Lock()
+		released := h.released
+		h.mu.Unlock()
+		if released && h.client != nil {
+			_ = h.client.Close()
+		}
+		h.sessionMu.Unlock()
+		h.retryAbortRetained(capture)
 		return err
 	}
 	h.mu.Lock()
+	matched := false
 	if h.retention != nil && *h.retention == capture {
 		h.retention, h.retentionPrepared = nil, false
+		matched = true
 	}
+	released, releaseDone := h.released, h.releaseDone
 	h.mu.Unlock()
+	if released && h.client != nil {
+		// A late idempotent replay may reconnect after ordinary Release. It
+		// must not leave a new idle control connection owned by a closed run.
+		_ = h.client.Close()
+	}
+	h.sessionMu.Unlock()
+	if matched && released {
+		// Release may still be draining StateSync. Never release its B/lease
+		// before that barrier, and never wait while holding sessionMu.
+		<-releaseDone
+		h.sessionMu.Lock()
+		h.mu.Lock()
+		ordinary := h.retention == nil && !h.retentionPrepared && !h.retentionHolder
+		h.mu.Unlock()
+		if ordinary {
+			h.releaseOrdinaryLocked("checkpoint preparation aborted after runtime release")
+		}
+		h.sessionMu.Unlock()
+	}
 	return nil
+}
+
+// A failed Abort is an owned metadata/accounting responsibility even after
+// Runtime.Close. This continuation retains no memfd, RAM pin or runtime owner.
+func (h *ControllerHooks) retryAbortRetained(capture resource.CaptureRetention) {
+	h.mu.Lock()
+	if h.retention == nil || *h.retention != capture || !h.retentionPrepared {
+		h.mu.Unlock()
+		return
+	}
+	if h.abortRetries == nil {
+		h.abortRetries = make(map[resource.CaptureRetention]bool)
+	}
+	if h.abortRetries[capture] {
+		h.mu.Unlock()
+		return
+	}
+	h.abortRetries[capture] = true
+	h.mu.Unlock()
+	go func() {
+		defer func() {
+			h.mu.Lock()
+			delete(h.abortRetries, capture)
+			h.mu.Unlock()
+		}()
+		for {
+			time.Sleep(time.Second)
+			h.mu.Lock()
+			pending := h.retention != nil && *h.retention == capture && h.retentionPrepared
+			h.mu.Unlock()
+			if !pending {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := h.AbortRetained(ctx, capture)
+			cancel()
+			if err == nil {
+				return
+			}
+			h.opts.Logf("checkpoint resource rollback retained for retry: %v", err)
+		}
+	}()
 }
 
 func (h *ControllerHooks) ReleaseRetained(ctx context.Context, capture resource.CaptureRetention) error {

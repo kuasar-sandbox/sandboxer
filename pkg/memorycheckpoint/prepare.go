@@ -1,8 +1,12 @@
 package memorycheckpoint
 
 import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -68,6 +72,7 @@ func prepareHolder(directory, runDir string, initial CaptureRecord, memory *os.F
 	if err != nil {
 		return nil, err
 	}
+	initial = h.record.Read()
 	h.ramPin, initial.Holder.RAMLock, err = createRAMPin(h.record.Path())
 	if err != nil {
 		return nil, err
@@ -115,6 +120,24 @@ func createRAMPin(recordPath string) (*os.File, FileIdentity, error) {
 	if err != nil {
 		return failed(err)
 	}
+	st, err := f.Stat()
+	if err != nil {
+		return failed(err)
+	}
+	nonce := make([]byte, 32)
+	if st.Size() == 0 {
+		if _, err := rand.Read(nonce); err != nil {
+			return failed(err)
+		}
+		if _, err := f.WriteAt(nonce, 0); err != nil {
+			return failed(err)
+		}
+	} else if st.Size() != int64(len(nonce)) {
+		return failed(errors.New("memory checkpoint: invalid RAM pin nonce"))
+	} else if _, err := f.ReadAt(nonce, 0); err != nil {
+		return failed(err)
+	}
+	id.Nonce = hex.EncodeToString(nonce)
 	if err := f.Sync(); err != nil {
 		return failed(err)
 	}
@@ -151,6 +174,9 @@ func openRAMPin(recordPath string, expected FileIdentity, mode int) (*os.File, e
 }
 
 func validateRAMPin(f *os.File, expected FileIdentity) error {
+	if expected.Nonce == "" {
+		return errors.New("memory checkpoint: missing RAM proof nonce")
+	}
 	id, err := fileIdentity(f)
 	if err != nil {
 		return err
@@ -159,8 +185,21 @@ func validateRAMPin(f *os.File, expected FileIdentity) error {
 	if err != nil {
 		return err
 	}
-	if id != expected || !st.Mode().IsRegular() {
+	if id.Device != expected.Device || id.Inode != expected.Inode || !st.Mode().IsRegular() {
 		return errors.New("memory checkpoint: RAM proof inode mismatch")
+	}
+	if expected.Nonce != "" {
+		want, err := hex.DecodeString(expected.Nonce)
+		if err != nil || len(want) != 32 || st.Size() != 32 {
+			return errors.New("memory checkpoint: RAM proof nonce mismatch")
+		}
+		got := make([]byte, 32)
+		if _, err := io.ReadFull(io.NewSectionReader(f, 0, 32), got); err != nil {
+			return err
+		}
+		if !bytes.Equal(got, want) {
+			return errors.New("memory checkpoint: RAM proof nonce mismatch")
+		}
 	}
 	return nil
 }

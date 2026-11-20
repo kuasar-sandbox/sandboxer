@@ -97,7 +97,6 @@ func TestCheckpointMemoryRefPreflightOnlyForFastCapture(t *testing.T) {
 		{name: "resume-after", adjust: func(_ *RunOptions, r *ctl.Request) { r.ResumeAfter = true }},
 		{name: "async-disabled", adjust: func(o *RunOptions, _ *ctl.Request) { o.memoryAsyncDisabled = true }},
 		{name: "no-runtime-owner", adjust: func(o *RunOptions, _ *ctl.Request) { o.runtime = nil }},
-		{name: "portable-bundle", adjust: func(_ *RunOptions, r *ctl.Request) { r.Mode = ctl.SnapshotModeBundle }},
 		{name: "older-managed-host", adjust: func(o *RunOptions, _ *ctl.Request) {
 			o.CurrentRun = &artifact.CurrentRun{SandboxID: "sid", InstanceID: "instance", RunID: "run"}
 		}},

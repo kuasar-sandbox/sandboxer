@@ -578,7 +578,9 @@ A local `snapshot` needs either `--sandbox-id` or `--path-id`. When both are sup
 
 A runtime started with checkpoint support uses a frozen memory holder for
 `(snapshot --checkpoint ID)` with local output and without `--resume`. The ID
-is shared with the disk checkpoint. The operation commits a small local memory
+is shared with the disk checkpoint. Both `--mode local` (tarstream) and
+`--mode bundle` support this lifecycle; the mode selects the saving format.
+The operation commits a small local memory
 descriptor, retires CH and the ordinary runtime resources, and then returns.
 The original process remains alive to save the selected memory pages. It retains
 the corresponding memory reservation until the backing is released; runtime
@@ -604,8 +606,11 @@ collection and completes ordinary runtime cleanup. This does not wait for the
 save or weaken reader protection; see [selective cleanup](artifacts.md#checkpoint-history).
 
 A resumed runtime inherits the previous save obligation by SandboxID, even when
-restoring an older checkpoint. Another named pause waits for that obligation by
-default, before freezing or changing its running state. The CLI option
+restoring an older checkpoint. A capture that can add another frozen-RAM
+obligation waits for actual `RAMReleased` by default, before freezing or changing
+its running state; `FileReady` alone does not end the wait. This applies to both
+formats regardless of whether the caller waits for background completion.
+Disk-only captures and known synchronous-only runtimes add no such obligation. The CLI option
 `--no-wait-for-previous-memory-save` and SDK request field
 `NoWaitForPreviousMemorySave` reject the request while it is pending. Cancelling
 this wait leaves the runtime running and does not cancel the previous save.
@@ -627,7 +632,7 @@ abort closes RAM and the service immediately; only the record writer and GC pin
 may remain until the abort metadata is durable.
 
 Ordinary captures, runtimes without checkpoint support, same-VM `--resume`,
-disk-only export, and explicit portable Bundle output retain their existing
+disk-only export, and portable output without a local checkpoint ID retain their existing
 capture behavior. A managed runtime requires its host's explicit retirement
 capability; old hosts or resource controllers continue synchronously. If a
 frozen top cannot fit the existing sparse carrier budget, capture restores the
@@ -642,7 +647,7 @@ failure returns an error within the control operation's cleanup budget while
 the committed holder continues in the background. An uncommitted abort closes
 its provisional memory FD even if its metadata publication needs a retry.
 Normal completion and `RecoverMemoryRelease` both require an exclusive lock on
-the original record-bound RAM-pin inode after all producer, reader and queued
+the original record-bound RAM-pin inode and nonce after all producer, reader and queued
 SCM_RIGHTS references close. The recovery helper additionally requires exact
 producer exit, the existing stable record-writer lock, and a committed, retired
 runtime. Missing/replaced proof inodes, unknown process identity and corrupt

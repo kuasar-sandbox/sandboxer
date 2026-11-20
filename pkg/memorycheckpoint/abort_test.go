@@ -61,6 +61,7 @@ func TestAbortRecordRetainsMetadataOwnershipUntilPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	lockPath, _ := preparationLockPath(directory, record.Read().CheckpointID)
 	hidden, restore := blockAbortMetadata(t, directory)
 	var completions atomic.Int32
 	done := make(chan struct{})
@@ -78,7 +79,7 @@ func TestAbortRecordRetainsMetadataOwnershipUntilPublication(t *testing.T) {
 	if record.Read().Aborted || completions.Load() != 0 {
 		t.Fatal("failed abort fabricated completion")
 	}
-	assertAbortLocksHeld(t, directory, filepath.Join(hidden, filepath.Base(record.Path())+".lock"))
+	assertAbortLocksHeld(t, directory, filepath.Join(hidden, filepath.Base(lockPath)))
 	restore()
 	select {
 	case <-done:
@@ -120,7 +121,7 @@ func TestHolderAbortClosesRAMBeforeMetadataRecovery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			lockPath := record.Path() + ".lock"
+			lockPath, _ := preparationLockPath(directory, record.Read().CheckpointID)
 			var restore func()
 			if postRename {
 				// The first real atomic write succeeds, then its post-rename
@@ -147,7 +148,7 @@ func TestHolderAbortClosesRAMBeforeMetadataRecovery(t *testing.T) {
 			} else {
 				var hidden string
 				hidden, restore = blockAbortMetadata(t, directory)
-				lockPath = filepath.Join(hidden, filepath.Base(record.Path())+".lock")
+				lockPath = filepath.Join(hidden, filepath.Base(lockPath))
 			}
 			var completions atomic.Int32
 			complete := func() error { completions.Add(1); return pin.Close() }

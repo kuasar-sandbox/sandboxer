@@ -68,6 +68,9 @@ type ControllerHooks struct {
 	cacheWake          chan struct{}
 	previousToken      string
 	released           bool
+	releaseDone        chan struct{}
+	ordinaryReleased   bool
+	abortRetries       map[resource.CaptureRetention]bool
 	retainedSupported  bool
 	retention          *resource.CaptureRetention
 	retentionPrepared  bool
@@ -779,8 +782,9 @@ func (h *ControllerHooks) Release(reason string) {
 		return
 	}
 	h.released = true
+	h.releaseDone = make(chan struct{})
+	releaseDone := h.releaseDone
 	cancelBg := h.cancelBg
-	preserveRetained := h.retentionPrepared || h.retentionHolder
 	h.mu.Unlock()
 	if cancelBg != nil {
 		cancelBg()
@@ -789,21 +793,41 @@ func (h *ControllerHooks) Release(reason string) {
 	h.syncStartMu.Unlock()
 	h.bgWG.Wait()
 	h.reconnectWG.Wait()
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	defer close(releaseDone)
+	h.mu.Lock()
+	preserveRetained := h.retentionPrepared || h.retentionHolder
+	h.mu.Unlock()
+	if !preserveRetained {
+		h.releaseOrdinaryLocked(reason)
+		return
+	}
 	if h.Enabled() {
-		h.sessionMu.Lock()
-		// Cancellation may have closed an in-flight control RPC's transport.
-		// Release uses the original token on a bounded cleanup connection; do
-		// not skip it merely because normal controller work has stopped. Keep
-		// the lease until this attempt ends, and retain node recovery on error.
-		if !preserveRetained {
-			if err := h.client.Release(reason); err != nil {
-				h.opts.Logf("controller.Release: %v; retaining node recovery", err)
-			}
+		_ = h.client.Close()
+	}
+}
+
+// releaseOrdinaryLocked runs after normal controller work has stopped and the
+// prepared retention has either committed or explicitly aborted. sessionMu
+// serializes it with retention replay and protects the original client/token.
+func (h *ControllerHooks) releaseOrdinaryLocked(reason string) {
+	h.mu.Lock()
+	if h.ordinaryReleased {
+		h.mu.Unlock()
+		return
+	}
+	h.ordinaryReleased = true
+	h.mu.Unlock()
+	if h.Enabled() {
+		// Release reconnects on its bounded cleanup connection even after the
+		// active lifetime and its control transport have already ended.
+		if err := h.client.Release(reason); err != nil {
+			h.opts.Logf("controller.Release: %v; retaining node recovery", err)
 		}
 		_ = h.client.Close()
-		h.sessionMu.Unlock()
 	}
-	if h.lease != nil && !preserveRetained {
+	if h.lease != nil {
 		if err := h.lease.Close(); err != nil {
 			h.opts.Logf("controller lease cleanup: %v", err)
 		}

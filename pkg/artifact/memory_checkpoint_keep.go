@@ -111,7 +111,7 @@ func (k *checkpointKeep) retainMemory(ctx context.Context, raw string, scope pub
 		if child.relativeDir == "" {
 			return errors.New("checkpoint memory keep graph has no local directory")
 		}
-		record, err := memorycheckpoint.ReadRecord(child.relativeDir, descriptor.CheckpointID)
+		record, err := memorycheckpoint.ReadRecord(child.relativeDir, descriptor.CheckpointID, descriptor.MemoryID)
 		if err != nil {
 			return err
 		}

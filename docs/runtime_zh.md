@@ -518,6 +518,7 @@ RunDir/owned diff，不会把 output 当作运行目录删除。
 
 已启用 checkpoint 的 Runtime，在本地输出、不带 `--resume` 的
 `snapshot --checkpoint ID` 中采用冻结内存 holder，内存与磁盘共用该 ID。
+`--mode local`（tarstream）与 `--mode bundle` 都支持该生命周期，mode 只选择保存格式。
 操作固定小型内存描述、停止 CH 并释放普通运行资源后返回；原进程继续保存本轮选中的
 内存页面。冻结内存释放前保留对应资源额度，Runtime 退出不等于内存额度已归还。
 
@@ -535,7 +536,9 @@ FD/映射，再关闭 pin；不对共享 pin 显式解锁。新 VM 始终使用�
 运行资源清理，不等待保存，也不放宽读者保护；详见[选择性清理](artifacts_zh.md#checkpoint-history)。
 
 恢复后的 Runtime 按 SandboxID 继承上一轮保存义务，包括从较早 checkpoint 恢复的
-情况。再次命名 pause 默认在入口等待，等待期间不冻结、不离开 running。CLI 可用
+情况。只有本次捕获可能新增冻结 RAM 义务时，才默认在入口等待实际 `RAMReleased`；
+`FileReady` 不能替代释放证明。两种格式及等待后台完成后才返回的调用均遵守这一条件。
+纯磁盘捕获、明确只能同步保存的 runtime 不新增该义务。等待期间不冻结、不离开 running。CLI 可用
 `--no-wait-for-previous-memory-save`，SDK 可设 `NoWaitForPreviousMemorySave`，
 在未完成时立即拒绝。取消等待不取消后台保存，也不改变当前 Runtime 状态。
 完整 pause 耗时包括这一入口等待。若准确 producer 已退出、文件尚未发布且 RAM 读者
@@ -551,7 +554,7 @@ RAM pin、目录 guard 和本地编码任务，不借用已关闭的 Runtime fet
 writer 与 GC pin 可继续保留，直至 Abort 元数据持久化。
 
 普通 capture、未启用 checkpoint 的 Runtime、同 VM `--resume`、纯磁盘 export
-和显式可移植 Bundle 输出维持既有行为。托管运行还要求 host 明确支持运行退役，
+和未指定本地 checkpoint ID 的可移植输出维持既有行为。托管运行还要求 host 明确支持运行退役，
 旧 host 或旧资源控制器继续同步保存。若冻结顶层无法满足既有稀疏载体预算，先完整
 恢复原运行，并确认回滚及资源确认已完成，再回退到既有同步捕获流程。
 
@@ -561,7 +564,7 @@ writer 与 GC pin 可继续保留，直至 Abort 元数据持久化。
 回滚立即关闭临时内存 FD，即使元数据发布仍需重试。
 
 正常收尾与 `RecoverMemoryRelease` 均须在 producer、读者及排队 SCM_RIGHTS 引用关闭后，
-取得记录绑定的原 RAM pin inode 的排他锁。自动恢复还要求准确 producer 已退出、已有
+核对记录绑定的原 RAM pin inode 与 nonce，并取得排他锁。自动恢复还要求准确 producer 已退出、已有
 稳定 writer 锁可独占，并确认捕获已提交且原运行已退役。proof inode 缺失或被替换、
 进程身份未知、记录损坏都不能放行；恢复及显式 discard 均不能新建替代 proof。
 资源结算只消费已发布的 RAMReleased 事实。捕获记录（包括 Aborted 准备记录）和稳定

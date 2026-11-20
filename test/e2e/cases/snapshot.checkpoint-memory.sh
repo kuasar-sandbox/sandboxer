@@ -3,6 +3,7 @@
 # Exercise the production holder while ENOSPC prevents its payload publication.
 # Growing the private filesystem releases the fault without a product test hook.
 set -euo pipefail
+umask 077
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
 source "$E2E_LIB/sandboxer/tarstream.sh"
 : "${WORK:?WORK is required}"
@@ -13,6 +14,28 @@ require_kvm
 unset MANIFEST_KEY MANIFEST_CONFIG
 for command in docker mount umount mountpoint python3 timeout truncate mkfs.ext4; do require_command "$command"; done
 for binary in sandbox-ctl flatten-ctl cloud-hypervisor; do require_binary "$binary"; done
+# Each pair runs in an isolated filesystem and sandbox instance. Flatten the
+# immutable guest root once; every case references it outside the ENOSPC mount.
+if [ -z "${CHECKPOINT_MEMORY_FIRST_FORMAT:-}" ]; then
+    mkdir -p "$WORK/fixture" "$OUT"
+    docker image inspect "$E2E_IMAGE" >/dev/null
+    docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$WORK/fixture/root.img" --no-progress
+    FIXTURE_DIRECTORY="$WORK/fixture"
+    for pair in local:local local:bundle bundle:local bundle:bundle; do
+        first=${pair%%:*}
+        second=${pair##*:}
+        WORK="$WORK/$first-$second" OUT="$OUT/$first-$second" \
+            CHECKPOINT_MEMORY_FIXTURE_DIRECTORY="$FIXTURE_DIRECTORY" \
+            CHECKPOINT_MEMORY_FIRST_FORMAT="$first" CHECKPOINT_MEMORY_SECOND_FORMAT="$second" \
+            bash "$0"
+    done
+    echo "PASS snapshot.checkpoint-memory.sh (four format pairs)"
+    exit 0
+fi
+FIRST_FORMAT=$CHECKPOINT_MEMORY_FIRST_FORMAT
+SECOND_FORMAT=${CHECKPOINT_MEMORY_SECOND_FORMAT:?second capture format is required}
+case "$FIRST_FORMAT:$SECOND_FORMAT" in local:local|local:bundle|bundle:local|bundle:bundle) ;; *) e2e_fail "invalid capture format pair" ;; esac
+FIXTURE_DIRECTORY=${CHECKPOINT_MEMORY_FIXTURE_DIRECTORY:-$WORK}
 mkdir -p "$WORK/base" "$WORK/run" "$OUT"
 BASE_ROOT="$WORK/base"
 RUN_ROOT="$WORK/run"
@@ -29,7 +52,7 @@ cleanup() {
     # Fence only records in this case's private directory and exact generation.
     python3 - "$BASE_ROOT" "$SID" <<'PY'
 import json, os, pathlib, signal, sys
-for path in pathlib.Path(sys.argv[1]).glob('*/checkpoint/memory/*.json'):
+for path in pathlib.Path(sys.argv[1]).glob('*/checkpoint/memory/*/*.json'):
     try:
         r = json.loads(path.read_text())
         if r['producer']['sandbox_id'] != sys.argv[2]:
@@ -47,9 +70,11 @@ PY
 }
 trap cleanup EXIT
 mount -t tmpfs -o size=64m,mode=700 fastpause-e2e "$BASE_ROOT"
-docker image inspect "$E2E_IMAGE" >/dev/null
-docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$WORK/root.img" --no-progress
-ROOT_REF="$(plaintext_tarstream_ref "$WORK/root.img")"
+if [ ! -f "$FIXTURE_DIRECTORY/root.img" ]; then
+    docker image inspect "$E2E_IMAGE" >/dev/null
+    docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$FIXTURE_DIRECTORY/root.img" --no-progress
+fi
+ROOT_REF="$(plaintext_tarstream_ref "$FIXTURE_DIRECTORY/root.img")"
 # Keep the immutable root in its named external location. Otherwise ordinary
 # local dependency preservation could fill the test filesystem before freeze.
 ROOT_REF="file://root.img@digest:${ROOT_REF##*@digest:}@location:fixture"
@@ -90,7 +115,8 @@ start() {
     CURRENT_PATH=$path
     timeout -k 10s 240 "$BIN/sandbox-ctl" run --sandbox-id "$SID" --path-id "$path" \
         --ch-binary "$BIN/cloud-hypervisor" --run-root "$RUN_ROOT" --base-root "$BASE_ROOT" \
-        --ref-location "fixture=file://$WORK" \
+        --manifest-config "$WORK/publish.yaml" \
+        --ref-location "fixture=file://$FIXTURE_DIRECTORY" \
         "$@" >"$OUT/$label.log" 2>&1 &
     RUN_PID=$!
     RUN_PIDS+=("$RUN_PID")
@@ -106,11 +132,11 @@ start() {
     e2e_fail "$label did not become executable"
 }
 capture() {
-    local id=$1
-    shift
+    local id=$1 mode=$2
+    shift 2
     python3 - "$OUT/$id.json" "$OUT/$id.timing.json" "$OUT/$id.stderr" \
         "$BIN/sandbox-ctl" snapshot --path-id "$PATH_ID" --run-root "$RUN_ROOT" \
-        --checkpoint "$id" --json "$@" <<'PY'
+        --checkpoint "$id" --mode "$mode" --json "$@" <<'PY'
 import json, subprocess, sys, time
 start = time.monotonic()
 with open(sys.argv[1], 'w') as out, open(sys.argv[3], 'w') as err:
@@ -149,13 +175,17 @@ PY
 
 start cold "$PATH_ID" --config "$WORK/cold.yaml" --enable-checkpoint
 FIRST_RUN=$RUN_PID
-capture first
+capture first "$FIRST_FORMAT"
 S_FIRST="$(snapshot_path first)"
 # Success must precede this round's payload publication, but follow retirement.
-python3 - "$CP_DIR" "$S_FIRST" "$OUT/first-record.json" "$RUN_ROOT/$PATH_ID" <<'PY'
-import hashlib,json,os,pathlib,stat,sys,tarfile,zipfile
+"$BIN/sandbox-ctl" info --json --manifest-config "$WORK/publish.yaml" \
+    --ref-location "fixture=file://$FIXTURE_DIRECTORY" "$S_FIRST" >"$OUT/first-info.json"
+python3 - "$CP_DIR" "$OUT/first.json" "$OUT/first-record.json" "$RUN_ROOT/$PATH_ID" <<'PY'
+import hashlib,json,os,pathlib,stat,sys
 root=pathlib.Path(sys.argv[1]); loc=json.loads((root/'current-memory.json').read_text())
-r=json.loads((root/'memory'/(hashlib.sha256(loc['checkpoint_id'].encode()).hexdigest()+'.json')).read_text())
+r=json.loads((root/'memory'/hashlib.sha256(loc['checkpoint_id'].encode()).hexdigest()/(loc['memory_id']+'.json')).read_text())
+assert (r['checkpoint_id'],r['memory_id'],r['epoch'])==(loc['checkpoint_id'],loc['memory_id'],loc['epoch']), (r,loc)
+assert r['snapshot_ref']==json.load(open(sys.argv[2]))['snapshotRef'], r
 assert r['committed'] and r['runtime_retired'] and not r['file_ready'] and not r['ram_released'], r
 run=pathlib.Path(sys.argv[4])
 assert not os.path.lexists(run), ('ordinary RunDir survived pause', run)
@@ -166,13 +196,6 @@ assert stat.S_ISDIR(st.st_mode) and (st.st_dev,st.st_ino)==(holder['directory'][
 assert pathlib.Path(holder['socket_path'])==service/'m.sock' and pathlib.Path(holder['socket_path']).is_socket(), holder
 assert json.loads((service/'identity.json').read_text())['holder']==holder, holder
 json.dump(r,open(sys.argv[3],'w'))
-with tarfile.open(sys.argv[2]) as tar:
-    members=[m for m in tar if m.isfile() and not m.name.startswith('.kuasar.')]
-    assert len(members)==1, members
-    m=members[0]; m.size=int(m.pax_headers.get('GNU.sparse.realsize',m.size))
-    with zipfile.ZipFile(tar.extractfile(m)) as z:
-        d=json.loads(z.read('memory.checkpoint.json'))
-        assert d['checkpoint_id']=='first' and d['memory_id']==r['memory_id'], d
 PY
 start resumed "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_FIRST" --enable-checkpoint
 SECOND_RUN=$RUN_PID
@@ -185,16 +208,16 @@ json.dump({'run':[a.st_dev,a.st_ino], 'pid_file':[b.st_dev,b.st_ino], 'pid':pid.
 PY
 # A portable publisher must consume the frozen view while the disk is blocked.
 "$BIN/sandbox-ctl" publish --json --manifest-config "$WORK/publish.yaml" \
-    --ref-location "fixture=file://$WORK" \
+    --ref-location "fixture=file://$FIXTURE_DIRECTORY" \
     --to-ref-location "portable=file://$WORK/published" "$S_FIRST" >"$OUT/published.json" 2>"$OUT/published.stderr"
-if capture rejected --no-wait-for-previous-memory-save; then e2e_fail "no-wait captured a second pending generation"; fi
+if capture rejected "$SECOND_FORMAT" --no-wait-for-previous-memory-save; then e2e_fail "no-wait captured a second pending generation"; fi
 assert_contains "$OUT/rejected.stderr" "previous checkpoint memory save is pending"
 guest /bin/true
 # The default request waits while the successor remains executable. Its
 # cancellation must finish before unblocking the dump, so the live successor
 # cannot be retired by a competing second capture during our directory check.
 timeout -k 2s 1 "$BIN/sandbox-ctl" snapshot --path-id "$PATH_ID" --run-root "$RUN_ROOT" \
-    --checkpoint cancelled --json >"$OUT/cancelled.json" 2>"$OUT/cancelled.stderr" &
+    --checkpoint cancelled --mode "$SECOND_FORMAT" --json >"$OUT/cancelled.json" 2>"$OUT/cancelled.stderr" &
 WAIT_PID=$!
 REQUEST_PIDS+=("$WAIT_PID")
 sleep .2
@@ -205,7 +228,7 @@ import json,pathlib,sys
 root=pathlib.Path(sys.argv[1]); first=json.load(open(sys.argv[2]))
 loc=json.loads((root/'current-memory.json').read_text())
 assert loc['memory_id']==first['memory_id'], (loc,first)
-assert len(list((root/'memory').glob('*.json')))==1, 'waiting request created another holder'
+assert len(list((root/'memory').glob('*/*.json')))==1, 'waiting request created another holder'
 PY
 set +e
 wait "$WAIT_PID"
@@ -226,23 +249,35 @@ a,b=run.lstat(),pid.lstat()
 assert [a.st_dev,a.st_ino]==expected['run'] and [b.st_dev,b.st_ino]==expected['pid_file'], expected
 assert pid.read_text()==expected['pid'] and (run/'ctl.sock').is_socket(), expected
 original=json.load(open(sys.argv[4])); root=pathlib.Path(sys.argv[5])
-r=json.loads((root/'memory'/(hashlib.sha256(original['checkpoint_id'].encode()).hexdigest()+'.json')).read_text())
+r=json.loads((root/'memory'/hashlib.sha256(original['checkpoint_id'].encode()).hexdigest()/(original['memory_id']+'.json')).read_text())
+assert (r['memory_id'],r['epoch'])==(original['memory_id'],original['epoch']), r
 assert r['file_ready'] and r['ram_released'], r
 assert not os.path.lexists(r['holder']['directory']['path']), r
 PY
 guest /bin/true
 check_memory resumed
-capture second
+capture second "$SECOND_FORMAT"
 wait "$SECOND_RUN"
-python3 - "$CP_DIR" "$OUT/first-record.json" <<'PY'
-import hashlib,json,pathlib,sys
+python3 - "$CP_DIR" "$OUT/first-record.json" "$FIRST_FORMAT" "$SECOND_FORMAT" <<'PY'
+import hashlib,json,pathlib,sys,tarfile,zipfile
 root=pathlib.Path(sys.argv[1]); original=json.load(open(sys.argv[2]))
-records={r['checkpoint_id']:r for r in (json.loads(p.read_text()) for p in (root/'memory').glob('*.json'))}
+records={r['checkpoint_id']:r for r in (json.loads(p.read_text()) for p in (root/'memory').glob('*/*.json'))}
 assert set(records)=={'first','second'}, records.keys()
 for r in records.values():
     assert r['runtime_retired'] and r['file_ready'] and r['ram_released'], r
     assert not pathlib.Path(r['holder']['socket_path']).exists(), r
 assert records['second']['memory_id']!=original['memory_id']
+for checkpoint,mode in zip(('first','second'),sys.argv[3:5]):
+    r=records[checkpoint]
+    ref=r['payload_ref']
+    assert ref.startswith('file://'),ref
+    name=ref[7:].split('@',1)[0]
+    assert pathlib.Path(name).name==name,ref
+    carrier=root/name
+    if mode=='bundle':
+        assert '@manifest:' in ref and zipfile.is_zipfile(carrier), ('Bundle capture fell back to tarstream',ref)
+    else:
+        assert '@digest:' in ref and tarfile.is_tarfile(carrier), ('tarstream capture used unexpected format',ref)
 PY
 S_SECOND="$(snapshot_path second)"
 start next-resume "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_SECOND" --enable-checkpoint
@@ -257,4 +292,4 @@ check_memory portable
 kill -TERM "$RUN_PID"
 wait "$RUN_PID" || true
 mv "$CP_DIR.hidden" "$CP_DIR"
-echo "PASS snapshot.checkpoint-memory.sh"
+echo "PASS snapshot.checkpoint-memory.sh ($FIRST_FORMAT -> $SECOND_FORMAT)"

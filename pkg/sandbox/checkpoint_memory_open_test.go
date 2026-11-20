@@ -69,7 +69,7 @@ func TestPrepareSnapshotDependencyPlanMaterializesLocatedMemoryCheckpoint(t *tes
 		Version: 1, Producer: memorycheckpoint.RunIdentity{SandboxID: "sid"}, CheckpointID: descriptor.CheckpointID,
 		MemoryID: descriptor.MemoryID, Epoch: 1, SnapshotRef: raw, SandboxRef: eRef, PayloadRef: payloadRef,
 		Committed: true, RuntimeRetired: true, FileReady: true, RAMReleased: true,
-		Holder: fixtureMemoryHolder(t, directory, descriptor.CheckpointID, start),
+		Holder: fixtureMemoryHolder(t, directory, descriptor.CheckpointID, descriptor.MemoryID, start),
 	})
 	if err != nil {
 		t.Fatal(err)

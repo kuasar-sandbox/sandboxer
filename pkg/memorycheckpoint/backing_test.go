@@ -40,16 +40,20 @@ func TestMapCodecGeometryAndOverlap(t *testing.T) {
 	}
 }
 
-func testHolderIdentity(t *testing.T, dir, checkpointID string, start uint64) HolderIdentity {
+func testHolderIdentity(t *testing.T, dir, checkpointID string, start uint64, memoryID ...string) HolderIdentity {
 	t.Helper()
-	p, err := RecordPath(dir, checkpointID)
+	id := "mem"
+	if len(memoryID) != 0 {
+		id = memoryID[0]
+	}
+	p, err := RecordPath(dir, checkpointID, id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
 		t.Fatal(err)
 	}
-	pin, id, err := createRAMPin(p)
+	pin, ramID, err := createRAMPin(p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +65,7 @@ func testHolderIdentity(t *testing.T, dir, checkpointID string, start uint64) Ho
 	if err := unix.Stat(dirPath, &st); err != nil {
 		t.Fatal(err)
 	}
-	return HolderIdentity{PID: os.Getpid(), StartTime: start, SocketPath: filepath.Join(dirPath, holderSocketName), Directory: HolderDirectoryIdentity{Path: dirPath, Device: uint64(st.Dev), Inode: st.Ino}, RAMLock: id}
+	return HolderIdentity{PID: os.Getpid(), StartTime: start, SocketPath: filepath.Join(dirPath, holderSocketName), Directory: HolderDirectoryIdentity{Path: dirPath, Device: uint64(st.Dev), Inode: st.Ino}, RAMLock: ramID}
 }
 
 func testPrepareHolder(t *testing.T, dir string, fd *os.File, size uint64) *Holder {
@@ -132,11 +136,11 @@ func TestCurrentLocatorCannotHideMissingRecord(t *testing.T) {
 func TestCheckpointLogicalIDIsNotAPath(t *testing.T) {
 	dir := t.TempDir()
 	for _, id := range []string{"检查点/第一轮", "../outside", ".", "name with spaces"} {
-		path, err := RecordPath(dir, id)
+		path, err := RecordPath(dir, id, "mem")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if filepath.Dir(path) != filepath.Join(dir, "memory") || len(filepath.Base(path)) != 69 {
+		if filepath.Dir(filepath.Dir(path)) != filepath.Join(dir, "memory") || filepath.Base(path) != "mem.json" {
 			t.Fatalf("unsafe record path %q", path)
 		}
 	}

@@ -695,13 +695,15 @@ internal parent refs, and the current working-set selection. The external
 
 The map is an independent existing image carrier containing fixed M/D/R
 bitmaps; it is not placed inside the bounded ZIP. A mutable record under
-`memory/<sha256(checkpointID)>.json` identifies the exact holder and published
-payload. `current-memory.json` locates the SID's latest obligation. Neither
+`memory/<sha256(checkpointID)>/<memoryID>.json` identifies one exact attempt
+and its published payload. An aborted retry uses a new memoryID and increasing
+epoch; it never replaces an older receipt's JSON or RAM pin. The stable preparation
+writer lock remains `memory/<sha256(checkpointID)>.json.lock` across attempts. `current-memory.json` locates the SID's latest obligation. Neither
 socket identity nor write progress changes the fixed S identity. Missing or
 inconsistent required records are errors, never an empty memory layer.
 
 The record also binds the independent holder directory and the stable RAM-proof
-inode by device/inode. `<record path>.ram.lock` is distinct from the checkpoint
+inode by device/inode and a random nonce. `<record path>.ram.lock` is distinct from the checkpoint
 GC lock. Capture JSON records (including aborted preparations) and their stable writer
 and RAM-proof locks remain until terminal BaseDir deletion. A newer current
 locator or an unreferenced source does not prove that a resource receipt has
@@ -711,7 +713,22 @@ record with RAMReleased but no FileReady is a lost source: the common reader
 reports an explicit error while the SID's physical RAM obligation is complete.
 It never adopts an unpublished payload based on file existence alone.
 
+Both local tarstream and Bundle capture can carry this profile. The local Bundle
+adapter commits each small descriptor/map and later payload as an ordinary
+immutable Bundle with an existing `file://...bundle@manifest:<key>` selector;
+portable export retains its existing planned Bundle behavior.
+
 The common artifact reader exposes the node-local graph as one memory layer.
+It adapts the holder to `sparse.Source` and reuses `CaptureMemory`, `DirtyMemory`,
+`SelectMemory` and `fetch.NewLayered`. Candidate addresses remain separate from
+selected values; historical selection boundaries and the ordered parent suffix
+are preserved. No checkpoint-specific interval index is constructed.
+Each opened graph keeps at most eight physical carrier FDs in its checkpoint
+file pool, separate from existing tarstream/Bundle parser metadata. Reopening
+checks the original file identity. Pooling requires an existing directory GC
+pin; ordinary external sources keep their original FD/mmap ownership and remain
+readable after unlink. Closing joins file-switch readers, closes the pool, and
+then releases the directory pins.
 Portable publication of an execution root preserves the capture semantics:
 dirty capture combines current changes with eligible dirty history; working-set
 capture retains only the current working set in top W and emits compacted dirty
@@ -731,7 +748,7 @@ view directly. This provides a repair path for an existing W/H object whose
 portable expansion would exceed 64 entries; ordinary publication continues to
 report the capacity error. Ordinary missing-`memory.dirty` compatibility remains
 unchanged.
-Portable publication, rewrite and Bundle paths materialize a standard S and do
+Portable publication and rewrite, including portable Bundle output, materialize a standard S and do
 not copy the descriptor as if it contained memory. Older readers reject the
 local profile; the new reader continues to accept ordinary snapshots.
 

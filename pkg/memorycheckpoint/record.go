@@ -3,12 +3,14 @@ package memorycheckpoint
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +34,7 @@ type HolderIdentity struct {
 type FileIdentity struct {
 	Device uint64 `json:"device"`
 	Inode  uint64 `json:"inode"`
+	Nonce  string `json:"nonce,omitempty"`
 }
 
 type HolderDirectoryIdentity struct {
@@ -61,6 +64,13 @@ type CaptureRecord struct {
 }
 
 func (r CaptureRecord) Validate() error {
+	if r.Holder.RAMLock.Nonce != "" {
+		b, err := hex.DecodeString(r.Holder.RAMLock.Nonce)
+		if err != nil || len(b) != 32 {
+			return errors.New("memory checkpoint: invalid RAM proof nonce")
+		}
+	}
+
 	if r.Version != Version || !validCheckpointID(r.CheckpointID) || !validID(r.MemoryID) || r.Epoch == 0 || r.Producer.SandboxID == "" {
 		return errors.New("memory checkpoint: invalid capture identity")
 	}
@@ -89,15 +99,166 @@ func sameCaptureIdentity(a, b CaptureRecord) bool {
 	return a.Version == b.Version && a.Producer == b.Producer && a.CheckpointID == b.CheckpointID && a.HostOperationID == b.HostOperationID && a.MemoryID == b.MemoryID && a.Epoch == b.Epoch && a.Holder == b.Holder
 }
 
-func RecordPath(directory, checkpointID string) (string, error) {
+// RecordPath with a memoryID names one immutable attempt. Without one it
+// resolves the newest attempt, for callers that have no capture identity yet.
+func RecordPath(directory, checkpointID string, memoryID ...string) (string, error) {
+	legacy, err := legacyRecordPath(directory, checkpointID)
+	if err != nil {
+		return "", err
+	}
+	if len(memoryID) == 0 {
+		r, err := ReadRecord(directory, checkpointID)
+		if err != nil {
+			return "", err
+		}
+		p, _ := RecordPath(directory, checkpointID, r.MemoryID)
+		if _, err := os.Lstat(p); errors.Is(err, os.ErrNotExist) {
+			return legacy, nil
+		}
+		return p, nil
+	}
+	if len(memoryID) != 1 || !validID(memoryID[0]) {
+		return "", errors.New("memory checkpoint: invalid attempt identity")
+	}
+	p := filepath.Join(strings.TrimSuffix(legacy, ".json"), memoryID[0]+".json")
+	if _, err := os.Lstat(p); errors.Is(err, os.ErrNotExist) {
+		// Existing pre-attempt-layout receipts and descriptors keep their paths.
+		if old, err := ReadCaptureRecord(legacy); err == nil && old.CheckpointID == checkpointID && old.MemoryID == memoryID[0] {
+			return legacy, nil
+		}
+	}
+	return p, nil
+}
+
+func legacyRecordPath(directory, checkpointID string) (string, error) {
 	if !filepath.IsAbs(directory) || !validCheckpointID(checkpointID) {
 		return "", errors.New("memory checkpoint: invalid record location")
 	}
 	return filepath.Join(directory, "memory", fmt.Sprintf("%x.json", sha256.Sum256([]byte(checkpointID)))), nil
 }
 
+func preparationLockPath(directory, checkpointID string) (string, error) {
+	p, err := legacyRecordPath(directory, checkpointID)
+	return p + ".lock", err
+}
+
+func openPreparationLock(directory, checkpointID string, create bool) (*os.File, error) {
+	return openPreparationLockWithSync(directory, checkpointID, create, syncRecordDirectory)
+}
+
+func syncRecordDirectory(path string) error {
+	d, err := openDirectory(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(d.Sync(), d.Close())
+}
+
+// The sync callback is local to one preparation so publication-failure tests
+// cannot affect a concurrent producer.
+func openPreparationLockWithSync(directory, checkpointID string, create bool, syncDirectory func(string) error) (*os.File, error) {
+	p, err := preparationLockPath(directory, checkpointID)
+	if err != nil {
+		return nil, err
+	}
+	flags := os.O_RDWR | unix.O_NOFOLLOW
+	if create {
+		if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+			return nil, err
+		}
+		flags |= os.O_CREATE
+	}
+	f, err := os.OpenFile(p, flags, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if create {
+		// A durable receipt must retain the same preparation lock after reboot.
+		// Sync both the new lock entry and a possibly new memory directory.
+		if err := f.Sync(); err != nil {
+			return nil, errors.Join(err, f.Close())
+		}
+		for _, path := range []string{filepath.Dir(p), directory} {
+			if err := syncDirectory(path); err != nil {
+				return nil, errors.Join(err, f.Close())
+			}
+		}
+	}
+	return f, nil
+}
+
+type preparationGuard struct{ writer, pin *os.File }
+
+func (g *preparationGuard) Close() error { return errors.Join(g.writer.Close(), g.pin.Close()) }
+
+// LockPreparation fences both existing and late preparations of one logical
+// checkpoint. It does not establish any RAM release fact.
+func LockPreparation(directory, checkpointID string) (io.Closer, error) {
+	if _, err := legacyRecordPath(directory, checkpointID); err != nil {
+		return nil, err
+	}
+	pin, err := PinDirectory(directory)
+	if err != nil {
+		return nil, err
+	}
+	writer, err := openPreparationLock(directory, checkpointID, true)
+	if err != nil {
+		return nil, errors.Join(err, pin.Close())
+	}
+	return &preparationGuard{writer: writer, pin: pin}, nil
+}
+
+// ListRecords includes every attempt: old resource receipts continue to name
+// their original JSON and proof inode even after a later attempt is prepared.
+func ListRecords(directory string) ([]CaptureRecord, error) {
+	entries, err := os.ReadDir(filepath.Join(directory, "memory"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var records []CaptureRecord
+	for _, entry := range entries {
+		p := filepath.Join(directory, "memory", entry.Name())
+		paths := []string{p}
+		if entry.IsDir() {
+			children, err := os.ReadDir(p)
+			if err != nil {
+				return nil, err
+			}
+			paths = nil
+			for _, child := range children {
+				if strings.HasSuffix(child.Name(), ".json") {
+					paths = append(paths, filepath.Join(p, child.Name()))
+				}
+			}
+		}
+		for _, path := range paths {
+			if !strings.HasSuffix(path, ".json") {
+				continue
+			}
+			r, err := ReadCaptureRecord(path)
+			if err != nil {
+				return nil, err
+			}
+			canonical, _ := RecordPath(directory, r.CheckpointID, r.MemoryID)
+			legacy, _ := legacyRecordPath(directory, r.CheckpointID)
+			if path != canonical && path != legacy {
+				return nil, errors.New("memory checkpoint: record location identity mismatch")
+			}
+			records = append(records, *r)
+		}
+	}
+	return records, nil
+}
+
 func ReadCaptureRecord(path string) (*CaptureRecord, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -119,16 +280,94 @@ func ReadCaptureRecord(path string) (*CaptureRecord, error) {
 	return &r, nil
 }
 
-func ReadRecord(directory, checkpointID string) (*CaptureRecord, error) {
-	p, err := RecordPath(directory, checkpointID)
+// checkpointRecords inspects only one logical checkpoint. Preparing N distinct
+// checkpoints must not repeatedly parse every older capture in the directory.
+func checkpointRecords(directory, checkpointID string) ([]CaptureRecord, error) {
+	legacy, err := legacyRecordPath(directory, checkpointID)
 	if err != nil {
 		return nil, err
 	}
-	r, err := ReadCaptureRecord(p)
-	if err == nil && r.CheckpointID != checkpointID {
-		return nil, errors.New("memory checkpoint: record checkpoint identity mismatch")
+	var records []CaptureRecord
+	appendRecord := func(path string) error {
+		r, err := ReadCaptureRecord(path)
+		if err != nil {
+			return err
+		}
+		if r.CheckpointID != checkpointID {
+			return errors.New("memory checkpoint: record checkpoint identity mismatch")
+		}
+		canonical, err := RecordPath(directory, checkpointID, r.MemoryID)
+		if err != nil {
+			return err
+		}
+		if path != canonical && path != legacy {
+			return errors.New("memory checkpoint: record attempt location mismatch")
+		}
+		records = append(records, *r)
+		return nil
 	}
-	return r, err
+	if err := appendRecord(legacy); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	dir := strings.TrimSuffix(legacy, ".json")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return records, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		if err := appendRecord(filepath.Join(dir, entry.Name())); err != nil {
+			return nil, err
+		}
+	}
+	return records, nil
+}
+
+func ReadRecord(directory, checkpointID string, memoryID ...string) (*CaptureRecord, error) {
+	if _, err := legacyRecordPath(directory, checkpointID); err != nil {
+		return nil, err
+	}
+	if len(memoryID) != 0 {
+		p, err := RecordPath(directory, checkpointID, memoryID...)
+		if err != nil {
+			return nil, err
+		}
+		r, err := ReadCaptureRecord(p)
+		if errors.Is(err, os.ErrNotExist) {
+			p, _ = legacyRecordPath(directory, checkpointID)
+			r, err = ReadCaptureRecord(p)
+		}
+		if err == nil && (r.CheckpointID != checkpointID || r.MemoryID != memoryID[0]) {
+			return nil, errors.New("memory checkpoint: record attempt identity mismatch")
+		}
+		return r, err
+	}
+	records, err := checkpointRecords(directory, checkpointID)
+	if err != nil {
+		return nil, err
+	}
+	var latest *CaptureRecord
+	for _, r := range records {
+		if r.CheckpointID != checkpointID {
+			continue
+		}
+		if latest != nil && latest.Epoch == r.Epoch && latest.MemoryID != r.MemoryID {
+			return nil, errors.New("memory checkpoint: duplicate attempt epoch")
+		}
+		if latest == nil || r.Epoch > latest.Epoch {
+			copy := r
+			latest = &copy
+		}
+	}
+	if latest == nil {
+		return nil, os.ErrNotExist
+	}
+	return latest, nil
 }
 
 type currentLocator struct {
@@ -149,7 +388,7 @@ func ReadCurrent(directory string) (*CaptureRecord, error) {
 	if err := json.Unmarshal(b, &loc); err != nil {
 		return nil, err
 	}
-	r, err := ReadRecord(directory, loc.CheckpointID)
+	r, err := ReadRecord(directory, loc.CheckpointID, loc.MemoryID)
 	if err != nil {
 		// Only absence of the locator means no prior obligation. Losing a
 		// record named by a present locator is an unknown state, not readiness.
@@ -198,35 +437,60 @@ func CreateRecord(directory string, record CaptureRecord) (*RecordWriter, error)
 // reserveRecord precedes RAM-pin creation. Holding this stable writer lock
 // prevents another producer/recoverer from replacing a capture's proof inode.
 func reserveRecord(directory string, record CaptureRecord) (*RecordWriter, error) {
-	p, err := RecordPath(directory, record.CheckpointID)
+	return reserveRecordWithSync(directory, record, syncRecordDirectory)
+}
+
+func reserveRecordWithSync(directory string, record CaptureRecord, syncDirectory func(string) error) (*RecordWriter, error) {
+	p, err := RecordPath(directory, record.CheckpointID, record.MemoryID)
 	if err != nil {
 		return nil, err
 	}
-	if err = os.MkdirAll(filepath.Dir(p), 0700); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(p+".lock", os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0600)
+	lock, err := openPreparationLockWithSync(directory, record.CheckpointID, true, syncDirectory)
 	if err != nil {
 		return nil, err
 	}
-	if err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		f.Close()
-		return nil, err
+	w := &RecordWriter{path: p, lock: lock, record: record}
+	fail := func(err error) (*RecordWriter, error) { return nil, errors.Join(err, w.Close()) }
+	records, err := checkpointRecords(directory, record.CheckpointID)
+	if err != nil {
+		return fail(err)
 	}
-	w := &RecordWriter{path: p, lock: f, record: record}
+	var epoch uint64
+	for _, old := range records {
+		if old.CheckpointID != record.CheckpointID {
+			continue
+		}
+		if old.Producer.SandboxID != record.Producer.SandboxID || !old.Aborted || old.MemoryID == record.MemoryID {
+			return fail(errors.New("memory checkpoint: capture already exists"))
+		}
+		if old.Epoch > epoch {
+			epoch = old.Epoch
+		}
+	}
+	if epoch == ^uint64(0) {
+		return fail(errors.New("memory checkpoint: attempt epoch exhausted"))
+	}
+	if w.record.Epoch <= epoch {
+		w.record.Epoch = epoch + 1
+	}
 	if _, err = os.Lstat(p); err == nil {
-		w.Close()
-		return nil, errors.New("memory checkpoint: capture already exists")
+		return fail(errors.New("memory checkpoint: attempt already exists"))
 	} else if !errors.Is(err, os.ErrNotExist) {
-		w.Close()
-		return nil, err
+		return fail(err)
 	}
 	if old, err := ReadCurrent(directory); err == nil && !old.RAMReleased && !old.Aborted {
-		w.Close()
-		return nil, ErrSavePending
+		return fail(ErrSavePending)
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		w.Close()
-		return nil, err
+		return fail(err)
+	}
+	if err = os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+		return fail(err)
+	}
+	// Syncing files inside the attempt directory does not persist this new
+	// directory's entry in memory. This must precede record/locator publication,
+	// including retries after a previous failed parent-directory sync.
+	if err = syncDirectory(filepath.Join(directory, "memory")); err != nil {
+		return fail(err)
 	}
 	return w, nil
 }

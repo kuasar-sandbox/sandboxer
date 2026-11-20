@@ -8,9 +8,9 @@ import (
 	"testing"
 )
 
-func fixtureMemoryHolder(t *testing.T, directory, checkpointID string, start uint64) memorycheckpoint.HolderIdentity {
+func fixtureMemoryHolder(t *testing.T, directory, checkpointID, memoryID string, start uint64) memorycheckpoint.HolderIdentity {
 	t.Helper()
-	path, err := memorycheckpoint.RecordPath(directory, checkpointID)
+	path, err := memorycheckpoint.RecordPath(directory, checkpointID, memoryID)
 	if err != nil {
 		t.Fatal(err)
 	}

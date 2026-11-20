@@ -56,6 +56,9 @@ func ParseHostRetirement(raw string) (*HostRetirementPermit, error) {
 }
 
 type CaptureStateQuery struct {
+	// ForCapture asks whether the previous RAM obligation blocks a new
+	// retiring memory capture. False preserves the direct save-state query.
+	ForCapture                  bool   `json:"for_capture,omitempty"`
 	SandboxID                   string `json:"sandbox_id"`
 	InstanceID                  string `json:"instance_id"`
 	RunID                       string `json:"run_id"`
@@ -63,12 +66,15 @@ type CaptureStateQuery struct {
 }
 
 type CaptureState struct {
-	SandboxID  string `json:"sandbox_id"`
-	InstanceID string `json:"instance_id"`
-	RunID      string `json:"run_id"`
-	MemoryID   string `json:"memory_id,omitempty"`
-	Epoch      uint64 `json:"epoch,omitempty"`
-	Pending    bool   `json:"pending"`
+	// RetentionSupported is populated for capture-admission queries. Nil is
+	// an older peer with no capability answer, not evidence of a sync path.
+	RetentionSupported *bool  `json:"retention_supported,omitempty"`
+	SandboxID          string `json:"sandbox_id"`
+	InstanceID         string `json:"instance_id"`
+	RunID              string `json:"run_id"`
+	MemoryID           string `json:"memory_id,omitempty"`
+	Epoch              uint64 `json:"epoch,omitempty"`
+	Pending            bool   `json:"pending"`
 }
 
 func ReadCaptureState(ctx context.Context, socket string, q CaptureStateQuery) (CaptureState, error) {

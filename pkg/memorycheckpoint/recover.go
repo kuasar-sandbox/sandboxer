@@ -41,8 +41,12 @@ func RecoverMemoryRelease(ctx context.Context, capturePath string, expected Capt
 	if err := expected.Validate(); err != nil {
 		return out, err
 	}
-	directory := filepath.Dir(filepath.Dir(capturePath))
-	canonical, err := RecordPath(directory, expected.CheckpointID)
+	directory := filepath.Dir(filepath.Dir(filepath.Dir(capturePath)))
+	canonical, err := RecordPath(directory, expected.CheckpointID, expected.MemoryID)
+	if err != nil || canonical != capturePath {
+		directory = filepath.Dir(filepath.Dir(capturePath))
+		canonical, err = legacyRecordPath(directory, expected.CheckpointID)
+	}
 	if err != nil || canonical != capturePath {
 		return out, errors.Join(errors.New("memory checkpoint: recovery record location mismatch"), err)
 	}
@@ -66,7 +70,10 @@ func RecoverMemoryRelease(ctx context.Context, capturePath string, expected Capt
 	if err != nil || r.RAMReleased || r.Aborted {
 		return out, err
 	}
-	lock, err := os.OpenFile(capturePath+".lock", os.O_RDWR|unix.O_NOFOLLOW, 0)
+	lock, err := openPreparationLock(directory, expected.CheckpointID, false)
+	if errors.Is(err, unix.EWOULDBLOCK) {
+		return out, nil
+	}
 	if err != nil {
 		return out, err
 	}
@@ -116,7 +123,7 @@ func RecoverMemoryRelease(ctx context.Context, capturePath string, expected Capt
 // ObservePreviousSave checks physical completion before reporting source loss.
 // A historical lost capture never poisons a new runtime based on an intact one.
 func ObservePreviousSave(ctx context.Context, directory string, expected CaptureRecord) (CaptureRecovery, error) {
-	path, err := RecordPath(directory, expected.CheckpointID)
+	path, err := RecordPath(directory, expected.CheckpointID, expected.MemoryID)
 	if err != nil {
 		return CaptureRecovery{}, err
 	}

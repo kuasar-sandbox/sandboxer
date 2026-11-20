@@ -81,7 +81,7 @@ func writeLocalMemory(t *testing.T, directory, id, eRef string, parents, suffix 
 		Producer: memorycheckpoint.RunIdentity{SandboxID: "sid", InstanceID: "instance", RunID: "run-" + id}, CheckpointID: id,
 		MemoryID: descriptor.MemoryID, Epoch: 1, SnapshotRef: ref, SandboxRef: eRef, PayloadRef: payloadRef,
 		Committed: true, RuntimeRetired: true, FileReady: true, RAMReleased: true,
-		Holder: fixtureMemoryHolder(t, directory, id, start)}
+		Holder: fixtureMemoryHolder(t, directory, id, descriptor.MemoryID, start)}
 	writer, err := memorycheckpoint.CreateRecord(directory, record)
 	if err != nil {
 		t.Fatal(err)
@@ -323,7 +323,7 @@ func TestMemoryCheckpointKeepsRecoveryRecordsWithOriginalCheckpointID(t *testing
 		writer, err := memorycheckpoint.CreateRecord(fixture.directory, memorycheckpoint.CaptureRecord{
 			Version: memorycheckpoint.Version, Producer: memorycheckpoint.RunIdentity{SandboxID: "sid"},
 			CheckpointID: id, MemoryID: memoryID, Epoch: 1, Aborted: true,
-			Holder: fixtureMemoryHolder(t, fixture.directory, id, start),
+			Holder: fixtureMemoryHolder(t, fixture.directory, id, memoryID, start),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -353,7 +353,7 @@ func TestMemoryCheckpointKeepsRecoveryRecordsWithOriginalCheckpointID(t *testing
 	}); err != nil {
 		t.Fatal(err)
 	}
-	for _, kept := range []string{obsolete, current, unknown, obsolete + ".lock", obsolete + ".ram.lock"} {
+	for _, kept := range []string{obsolete, current, unknown, filepath.Dir(obsolete) + ".json.lock", obsolete + ".ram.lock"} {
 		if _, err := os.Stat(kept); err != nil {
 			t.Fatalf("retained/unknown/stable-lock file was deleted: %s: %v", kept, err)
 		}
@@ -371,7 +371,7 @@ func TestMemoryCheckpointGCKeepsReleasedProofOutsideSourceGraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldPath, err := memorycheckpoint.RecordPath(fixture.directory, old.CheckpointID)
+	oldPath, err := memorycheckpoint.RecordPath(fixture.directory, old.CheckpointID, old.MemoryID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestMemoryCheckpointGCKeepsReleasedProofOutsideSourceGraph(t *testing.T) {
 	next, err := memorycheckpoint.CreateRecord(fixture.directory, memorycheckpoint.CaptureRecord{
 		Version: memorycheckpoint.Version, Producer: old.Producer,
 		CheckpointID: "new-aborted", MemoryID: "new-memory", Epoch: 1, Aborted: true,
-		Holder: fixtureMemoryHolder(t, fixture.directory, "new-aborted", old.Holder.StartTime),
+		Holder: fixtureMemoryHolder(t, fixture.directory, "new-aborted", "new-memory", old.Holder.StartTime),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -407,7 +407,7 @@ func TestMemoryCheckpointGCKeepsReleasedProofOutsideSourceGraph(t *testing.T) {
 	if err != nil || !os.SameFile(before, after) {
 		t.Fatalf("GC replaced the original RAM proof inode: %v", err)
 	}
-	if _, err := os.Stat(oldPath + ".lock"); err != nil {
+	if _, err := os.Stat(filepath.Dir(oldPath) + ".json.lock"); err != nil {
 		t.Fatalf("writer proof removed: %v", err)
 	}
 	if _, err := os.Stat(orphanPath); !errors.Is(err, os.ErrNotExist) {

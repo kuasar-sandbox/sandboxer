@@ -26,7 +26,7 @@ func memorySaveRecord(t *testing.T, directory string) *memorycheckpoint.RecordWr
 		Version: 1, Producer: memorycheckpoint.RunIdentity{SandboxID: "sid"},
 		CheckpointID: "previous", MemoryID: "memory", Epoch: 1,
 		Committed: true, SnapshotRef: "snapshot", SandboxRef: "sandbox",
-		Holder: fixtureMemoryHolder(t, directory, "previous", start),
+		Holder: fixtureMemoryHolder(t, directory, "previous", "memory", start),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +115,7 @@ func TestPreviousMemoryWaitDoesNotEnterCapture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &SnapshotHandler{EnableCheckpoint: true, previousMemory: p}
+	h := &SnapshotHandler{EnableCheckpoint: true, previousMemory: p, runtime: &Runtime{}}
 	if _, err := h.handleContext(context.Background(), ctl.Request{CheckpointID: "next", NoWaitForPreviousMemorySave: true}, "", nil); !errors.Is(err, ctl.ErrMemorySavePending) {
 		t.Fatalf("no-wait=%v", err)
 	}

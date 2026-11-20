@@ -47,7 +47,7 @@ func DiscardCapture(ctx context.Context, directory string, producer RunIdentity,
 	if err := unix.Flock(int(pin.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("memory checkpoint: readers remain: %w", err)
 	}
-	lock, err := os.OpenFile(path+".lock", os.O_RDWR|unix.O_NOFOLLOW, 0)
+	lock, err := openPreparationLock(directory, checkpointID, false)
 	if err != nil {
 		return nil, err
 	}

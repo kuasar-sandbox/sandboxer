@@ -30,6 +30,7 @@ type checkpointMemorySave struct {
 	parents   []string
 	external  []string
 	dump      func(context.Context, io.ReaderAt) (string, error)
+	newSink   func() (snapshot.ArtifactSink, error)
 	logf      func(string, ...any)
 }
 
@@ -37,31 +38,54 @@ var errMemorySaveAbortPending = errors.New("checkpoint memory: rollback acknowle
 
 const memoryRetirementResponseTimeout = 5 * time.Second
 
-func prepareCheckpointMemorySave(ctx context.Context, req ctl.Request, opts RunOptions, mfd *memory.Memfd, runDir string) (*checkpointMemorySave, error) {
-	if !opts.EnableCheckpoint || req.CheckpointID == "" || req.ResumeAfter || opts.memoryAsyncDisabled || opts.runtime == nil || req.Mode == ctl.SnapshotModeBundle {
-		return nil, nil
+// checkpointMemoryRetention describes whether this attempt can create a new
+// frozen-RAM obligation. Admission and preparation share it; file encoding does
+// not select a different lifecycle.
+func checkpointMemoryRetention(req ctl.Request, opts RunOptions) (bool, error) {
+	if !checkpointMemoryRetentionSupported(opts) || req.CheckpointID == "" || req.ResumeAfter {
+		return false, nil
+	}
+	if _, err := req.SnapshotMode(); err != nil {
+		return false, err
 	}
 	if opts.CurrentRun != nil {
 		if req.HostRetirement == nil {
-			return nil, nil
+			return false, nil
 		} // older host: preserve synchronous capture
 		p := req.HostRetirement
 		if err := p.Validate(); err != nil {
-			return nil, err
+			return false, err
 		}
 		if p.SandboxID != opts.CurrentRun.SandboxID || p.InstanceID != opts.CurrentRun.InstanceID || p.RunID != opts.CurrentRun.RunID || p.CheckpointID != req.CheckpointID {
-			return nil, errors.New("snapshot: host retirement permit identity mismatch")
+			return false, errors.New("snapshot: host retirement permit identity mismatch")
 		}
 	} else if req.HostRetirement != nil {
-		return nil, errors.New("snapshot: managed permit on standalone runtime")
+		return false, errors.New("snapshot: managed permit on standalone runtime")
+	}
+	return true, nil
+}
+
+func checkpointMemoryRetentionSupported(opts RunOptions) bool {
+	if !opts.EnableCheckpoint || opts.memoryAsyncDisabled || opts.runtime == nil {
+		return false
 	}
 	hooks := opts.runtime.hooks
-	if hooks != nil && hooks.Enabled() && !hooks.SupportsRetainedMemory() {
-		return nil, nil
+	return hooks == nil || !hooks.Enabled() || hooks.SupportsRetainedMemory()
+}
+
+func prepareCheckpointMemorySave(ctx context.Context, req ctl.Request, opts RunOptions, mfd *memory.Memfd, runDir string) (*checkpointMemorySave, error) {
+	retain, err := checkpointMemoryRetention(req, opts)
+	if err != nil || !retain {
+		return nil, err
 	}
+	hooks := opts.runtime.hooks
 	parents, external, err := checkpointMemoryParents(ctx, opts, !req.MergeRefEnabled())
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: memory history: %w", err)
+	}
+	newSink, err := checkpointMemorySink(ctx, req, opts)
+	if err != nil {
+		return nil, err
 	}
 	var id [8]byte
 	if _, err := rand.Read(id[:]); err != nil {
@@ -85,17 +109,53 @@ func prepareCheckpointMemorySave(ctx context.Context, req ctl.Request, opts RunO
 		return nil, err
 	}
 	record := holder.Record()
+	r = record.Read()
 	op := r.HostOperationID
 	if op == "" {
 		op = r.CheckpointID
 	}
-	save := &checkpointMemorySave{holder: holder, hooks: hooks, parents: parents, external: external, logf: opts.memoryLogf, retention: resource.CaptureRetention{CapturePath: record.Path(), MemoryID: r.MemoryID, Epoch: r.Epoch, OperationID: op}}
+	save := &checkpointMemorySave{holder: holder, hooks: hooks, parents: parents, external: external, newSink: newSink, logf: opts.memoryLogf, retention: resource.CaptureRetention{CapturePath: record.Path(), MemoryID: r.MemoryID, Epoch: r.Epoch, OperationID: op}}
 	if hooks != nil && hooks.Enabled() {
 		if _, err := hooks.PrepareRetained(ctx, save.retention); err != nil {
 			return nil, errors.Join(err, save.abort())
 		}
 	}
 	return save, nil
+}
+
+// checkpointMemorySink fixes the encoding inputs before capture. The detached
+// writer retains only immutable configuration and the resolved customer key,
+// never the Runtime, ProcessStorage or a borrowed key-resolver closure.
+func checkpointMemorySink(ctx context.Context, req ctl.Request, opts RunOptions) (func() (snapshot.ArtifactSink, error), error) {
+	directory, sid, codec, required, logf := opts.checkpointDir, opts.SandboxID, opts.LocalCodec, opts.LocalRequired, opts.memoryLogf
+	if req.Mode != ctl.SnapshotModeBundle {
+		return func() (snapshot.ArtifactSink, error) {
+			return snapshot.NewFileSink(directory, sid, codec, required, logf), nil
+		}, nil
+	}
+	if opts.ManifestCfg == nil || opts.CustomerKeyFn == nil {
+		return nil, errors.New("checkpoint Bundle requires manifest configuration and customer key resolver")
+	}
+	cfg := *opts.ManifestCfg
+	key, err := opts.CustomerKeyFn()
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint Bundle customer key: %w", err)
+	}
+	admission, err := cfg.WriteAdmission(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint Bundle admission: %w", err)
+	}
+	newSink := func() (snapshot.ArtifactSink, error) {
+		return snapshot.NewCheckpointBundleSink(directory, sid, &cfg, func() ([32]byte, error) { return key, nil }, admission, logf)
+	}
+	probe, err := newSink()
+	if err != nil {
+		return nil, err
+	}
+	if err := probe.Close(); err != nil {
+		return nil, err
+	}
+	return newSink, nil
 }
 
 func (s *checkpointMemorySave) abort() error {
@@ -121,8 +181,13 @@ func (s *checkpointMemorySave) capture(opts RunOptions, parents []string, workin
 			if err != nil {
 				return nil, 0, err
 			}
-			if err = snapshot.ValidateMemoryPayload(ctx, top); err != nil {
-				return nil, 0, err
+			// CaptureMemory has validated the fixed page geometry. The extra
+			// GNU sparse extent/index limits apply only to the tarstream writer,
+			// just as in the existing synchronous BuildCaptureSource path.
+			if _, file := sink.(*snapshot.FileSink); file {
+				if err = snapshot.ValidateMemoryPayload(ctx, top); err != nil {
+					return nil, 0, err
+				}
 			}
 			encoded, err := memorycheckpoint.EncodeMap(view)
 			if err != nil {
@@ -142,14 +207,16 @@ func (s *checkpointMemorySave) capture(opts RunOptions, parents []string, workin
 			if err != nil {
 				return nil, 0, err
 			}
-			// Do not retain opts, Runtime, ProcessStorage or its borrowed fetcher.
-			directory, sid, codec, required, logf := opts.checkpointDir, opts.SandboxID, opts.LocalCodec, opts.LocalRequired, opts.memoryLogf
+			newSink := s.newSink
 			s.dump = func(ctx context.Context, reader io.ReaderAt) (string, error) {
 				payload, _, err := snapshot.CaptureMemory(reader, view, working)
 				if err != nil {
 					return "", err
 				}
-				sink := snapshot.NewFileSink(directory, sid, codec, required, logf)
+				sink, err := newSink()
+				if err != nil {
+					return "", err
+				}
 				ref, _, err := sink.AbsorbImageSource(ctx, payload)
 				return ref, errors.Join(err, sink.Close())
 			}
@@ -307,7 +374,7 @@ func PreviousCaptureRetention(directory, sid string) (*resource.CaptureRetention
 	if !r.Committed || !r.RuntimeRetired {
 		return nil, errors.New("checkpoint memory: previous runtime has not retired")
 	}
-	path, err := memorycheckpoint.RecordPath(directory, r.CheckpointID)
+	path, err := memorycheckpoint.RecordPath(directory, r.CheckpointID, r.MemoryID)
 	if err != nil {
 		return nil, err
 	}
@@ -422,6 +489,13 @@ func (h *SnapshotHandler) captureState(ctx context.Context, q ctl.CaptureStateQu
 	}
 	if q.SandboxID != state.SandboxID || q.InstanceID != state.InstanceID || q.RunID != state.RunID {
 		return state, errors.New("capture state requested for another runtime")
+	}
+	if q.ForCapture {
+		supported := checkpointMemoryRetentionSupported(RunOptions{EnableCheckpoint: h.EnableCheckpoint, runtime: h.runtime})
+		state.RetentionSupported = &supported
+		if !supported {
+			return state, nil
+		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

@@ -1090,7 +1090,11 @@ func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cg
 			err = errors.Join(ctl.ErrCaptureRejected, err)
 		}
 	}()
-	if h.EnableCheckpoint && req.CheckpointID != "" && !req.ResumeAfter {
+	retain, err := checkpointMemoryRetention(req, RunOptions{EnableCheckpoint: h.EnableCheckpoint, runtime: h.runtime, CurrentRun: h.CurrentRun})
+	if err != nil {
+		return ctl.Response{}, err
+	}
+	if retain {
 		if _, err = h.previousMemory.wait(ctx, req.NoWaitForPreviousMemorySave); err != nil {
 			return ctl.Response{}, err
 		}
@@ -1587,13 +1591,6 @@ func handleSnapshotRequest(
 			return ctl.Response{}, fmt.Errorf("snapshot output directory: %w", err)
 		}
 	}
-	if snapshotMode == ctl.SnapshotModeBundle {
-		bundleAdmission, err = opts.ManifestCfg.WriteAdmission(ctx)
-		if err != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot Bundle admission: %w", err)
-		}
-	}
-
 	opts, diffs, diskMerged, mergeBaseOpener, err := prepareCheckpointDisks(ctx, opts, disks)
 	if err != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: checkpoint disks: %w", err)
@@ -1644,7 +1641,11 @@ func handleSnapshotRequest(
 			err = errors.Join(err, dependencyPlan.Close())
 		}
 	}()
-	if snapshotMode == ctl.SnapshotModeBundle {
+	if snapshotMode == ctl.SnapshotModeBundle && save == nil {
+		bundleAdmission, err = opts.ManifestCfg.WriteAdmission(ctx)
+		if err != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot Bundle admission: %w", err)
+		}
 		plan, planErr := prepareSnapshotBundlePlan(ctx, opts, resultMemoryRefs,
 			diskMerged, req.OutDir, bundleAdmission)
 		if planErr != nil {
@@ -1683,6 +1684,11 @@ func handleSnapshotRequest(
 		}
 		ingestSink = snapshot.NewIngestSink(ing, logf)
 		sink = ingestSink
+	} else if save != nil && snapshotMode == ctl.SnapshotModeBundle {
+		sink, err = save.newSink()
+		if err != nil {
+			return ctl.Response{}, err
+		}
 	} else if snapshotMode == ctl.SnapshotModeBundle {
 		sink = bundleSink
 	} else {

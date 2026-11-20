@@ -9,11 +9,11 @@ import (
 
 type CaptureRecord = memorycheckpoint.CaptureRecord
 
-func ReadCheckpointCapture(ctx context.Context, directory string, producer CurrentRun, checkpointID string) (*CaptureRecord, error) {
+func ReadCheckpointCapture(ctx context.Context, directory string, producer CurrentRun, checkpointID string, memoryID ...string) (*CaptureRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	r, err := memorycheckpoint.ReadRecord(directory, checkpointID)
+	r, err := memorycheckpoint.ReadRecord(directory, checkpointID, memoryID...)
 	if err != nil {
 		return nil, err
 	}

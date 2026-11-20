@@ -636,11 +636,13 @@ memory ID、checkpoint ID、逻辑 RAM 容量、内容标识的位图引用、�
 本轮工作集选择；外部 `from_refs` 后缀仍只在 `snapshot.cfg` 中。
 
 固定 M/D/R 位图采用独立的既有 image carrier，不挤入有界 ZIP。
-`memory/<sha256(checkpointID)>.json` 是准确 holder 与已发布 payload 的可变记录，
+`memory/<sha256(checkpointID)>/<memoryID>.json` 是单次准确尝试及其已发布 payload 的记录。
+Aborted 后重试使用新 memoryID 与递增 epoch，不覆盖旧 receipt 的 JSON 或 RAM pin；
+跨尝试的稳定准备 writer 锁仍为 `memory/<sha256(checkpointID)>.json.lock`。
 `current-memory.json` 定位该 SID 最新的保存义务。socket 身份、转储进度不改变固定 S
 身份。必要记录缺失或不一致必须报错，不能视为一个空内存层。
 
-记录还通过 dev/inode 绑定独立 holder 目录与稳定 RAM proof inode。
+记录通过 dev/inode 绑定独立 holder 目录；RAM proof 还校验随机 nonce，防止 inode 复用冒充原证明。
 `<record path>.ram.lock` 与 checkpoint GC 锁不同。捕获 JSON（包括 Aborted 准备记录）、
 稳定 writer 锁及 RAM proof 锁保留到 BaseDir 终态删除；当前指针已更换或来源已不在
 引用图中，不代表资源 receipt 已消费旧释放/回滚事实。这些小型元数据文件随捕获次数
@@ -648,7 +650,18 @@ memory ID、checkpoint ID、逻辑 RAM 容量、内容标识的位图引用、�
 holder 存活；已提交、已退役且 RAMReleased 但未 FileReady 表示来源丢失，公共 reader
 明确报错，而该 SID 的实际 RAM 义务已结束。不能仅凭文件存在接纳未发布的 payload。
 
-公共制品 reader 将节点本地内部图解析为单层内存视图。发布执行根时仍保持捕获语义：
+本地 tarstream 和 Bundle 捕获都能承载该描述。Bundle 薄适配器先提交小型描述和位图，
+后台再提交 payload，各自使用普通不可变 Bundle 与既有 `file://...bundle@manifest:<key>`
+引用；可移植导出继续使用既有 planned Bundle 行为。
+
+公共制品 reader 将 holder 适配为 `sparse.Source`，复用 `CaptureMemory`、`DirtyMemory`、
+`SelectMemory` 和 `fetch.NewLayered`，把内部图暴露为单层内存视图。候选地址与选中值
+分离，保留历史选集边界和有序父层后缀，不建立 checkpoint 专用区间索引。
+每个打开的图最多保留八个池内载体 FD，与现有 tarstream/Bundle 解析元数据分开管理；
+重开校验原文件身份。仅有目录 GC pin 保护的载体进入池，普通外部来源保持原 FD/mmap
+生命周期及 open 后 unlink 仍可读的行为。关闭时先等待文件切换读者结束，再关池，最后释放目录 pin。
+
+发布执行根时仍保持捕获语义：
 脏页捕获合并本轮变化与可归并的历史脏页；工作集捕获的顶层 W 仅保留本轮工作集，
 历史脏页合并为一个 H，排在原样保留的外部 `from_refs` 后缀之前。H 占用既有 64 个
 父引用额度中的一个。快速捕获与原同步流程一样，在准备 holder 和冻结 guest 之前
@@ -661,7 +674,7 @@ holder 存活；已提交、已退役且 RAMReleased 但未 FileReady 表示来�
 本地完整视图及原外部引用链，因此能修复已有 W/H 对象在可移植展开后超过 64 项的
 情况；普通发布仍明确报告容量错误。普通 S 缺少 `memory.dirty` 时全显式内容为脏的
 兼容规则不变。
-发布、rewrite 和 Bundle 路径均物化为普通 S，不能把描述载体当成完整内存快照复制。
+可移植发布和 rewrite（包括可移植 Bundle 输出）均物化为普通 S，不能把描述载体当成完整内存快照复制。
 旧 reader 拒绝本地格式，新 reader 继续兼容普通快照。
 
 <a id="memory-dirty"></a>

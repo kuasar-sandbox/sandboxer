@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
@@ -150,23 +149,16 @@ func knownLocalMemoryCarrier(path string, ref manifest.Ref) bool {
 	}
 	// A named historical capture may differ from the current SID obligation.
 	// These tiny node-local records are evidence; the parent payload is unopened.
-	entries, err := os.ReadDir(filepath.Join(directory, "memory"))
+	records, err := memorycheckpoint.ListRecords(directory)
 	if err != nil {
 		return false
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		record, err := memorycheckpoint.ReadCaptureRecord(filepath.Join(directory, "memory", entry.Name()))
-		if err != nil {
-			continue
-		}
-		canonical, err := memorycheckpoint.RecordPath(directory, record.CheckpointID)
-		if err == nil && filepath.Base(canonical) == entry.Name() && matches(record) {
+	for _, record := range records {
+		if matches(&record) {
 			return true
 		}
 	}
+
 	return false
 }
 
