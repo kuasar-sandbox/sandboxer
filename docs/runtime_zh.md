@@ -565,7 +565,10 @@ writer 与 GC pin 可继续保留，直至 Abort 元数据持久化。
 
 正常收尾与 `RecoverMemoryRelease` 均须在 producer、读者及排队 SCM_RIGHTS 引用关闭后，
 核对记录绑定的原 RAM pin inode 与 nonce，并取得排他锁。自动恢复还要求准确 producer 已退出、已有
-稳定 writer 锁可独占，并确认捕获已提交且原运行已退役。proof inode 缺失或被替换、
+稳定 writer 锁可独占。未提交的准备记录此时可以发布 Aborted，但不宣称运行已退役或
+RAMReleased；普通执行所有权仍按既有流程清理。发布 RAMReleased 还须确认捕获已提交
+且原运行已退役。已提交但运行退役尚未确认的捕获，仍由既有准确 fence 后的删除/Reset
+流程处理。proof inode 缺失或被替换、
 进程身份未知、记录损坏都不能放行；恢复及显式 discard 均不能新建替代 proof。
 资源结算只消费已发布的 RAMReleased 事实。捕获记录（包括 Aborted 准备记录）和稳定
 proof 锁保留到 BaseDir 终态删除，避免引用图 GC 删除尚待资源确认的证明。只有这些

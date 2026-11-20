@@ -649,8 +649,12 @@ its provisional memory FD even if its metadata publication needs a retry.
 Normal completion and `RecoverMemoryRelease` both require an exclusive lock on
 the original record-bound RAM-pin inode and nonce after all producer, reader and queued
 SCM_RIGHTS references close. The recovery helper additionally requires exact
-producer exit, the existing stable record-writer lock, and a committed, retired
-runtime. Missing/replaced proof inodes, unknown process identity and corrupt
+producer exit and the existing stable record-writer lock. An uncommitted
+preparation can then become Aborted, without claiming runtime retirement or
+RAMReleased; ordinary execution ownership still follows its existing cleanup.
+Publishing RAMReleased additionally requires a committed, retired runtime.
+Committed captures whose runtime retirement is unconfirmed retain their existing
+fenced deletion/reset boundary. Missing/replaced proof inodes, unknown process identity and corrupt
 records cannot authorize release; neither recovery nor explicit discard creates
 a replacement proof. Resource settlement consumes the published RAMReleased fact. Capture records and
 stable proof locks remain until terminal BaseDir deletion, including aborted

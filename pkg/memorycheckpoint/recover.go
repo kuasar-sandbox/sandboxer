@@ -32,7 +32,9 @@ func producerExited(id HolderIdentity) (bool, error) {
 // RecoverMemoryRelease is metadata-only and never waits for a live reader. The
 // expected identity must first be checked against the caller's durable owner or
 // resource receipt. No socket, PID disappearance or file existence proves RAM
-// release without the original RAM-pin inode's exclusive lock.
+// release without the original RAM-pin inode's exclusive lock. A dead,
+// uncommitted preparation may only become Aborted; it does not prove that the
+// ordinary VM retired. Committed but unretired captures remain unconfirmed.
 func RecoverMemoryRelease(ctx context.Context, capturePath string, expected CaptureRecord) (out CaptureRecovery, retErr error) {
 	out.Record = expected
 	if err := ctx.Err(); err != nil {
@@ -89,7 +91,7 @@ func RecoverMemoryRelease(ctx context.Context, capturePath string, expected Capt
 		return out, err
 	}
 	out.ProducerExited, err = producerExited(r.Holder)
-	if err != nil || !out.ProducerExited || !r.Committed || !r.RuntimeRetired {
+	if err != nil || !out.ProducerExited || r.Committed && !r.RuntimeRetired {
 		return out, err
 	}
 	ram, err := openRAMPin(capturePath, r.Holder.RAMLock, unix.LOCK_EX)
@@ -108,14 +110,20 @@ func RecoverMemoryRelease(ctx context.Context, capturePath string, expected Capt
 	if err != nil || !exited {
 		return out, errors.Join(errors.New("memory checkpoint: producer state changed during recovery"), err)
 	}
-	if !r.Committed || !r.RuntimeRetired || r.Aborted || r.Discarded {
+	if r.Committed && !r.RuntimeRetired || r.Aborted || r.Discarded {
 		return out, errors.New("memory checkpoint: capture is not retired")
 	}
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
 	w := &RecordWriter{path: capturePath, lock: lock, record: *r, published: true}
-	err = w.Update(func(r *CaptureRecord) { r.RAMReleased = true })
+	err = w.Update(func(r *CaptureRecord) {
+		if r.Committed {
+			r.RAMReleased = true
+		} else {
+			r.Aborted = true
+		}
+	})
 	out.Record = w.Read()
 	return out, err
 }

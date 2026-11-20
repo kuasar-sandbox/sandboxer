@@ -33,7 +33,7 @@ type recoveryProcess struct {
 	killed  bool
 }
 
-func startRecoveryProcess(t *testing.T) *recoveryProcess {
+func startRecoveryProcess(t *testing.T, stage ...string) *recoveryProcess {
 	t.Helper()
 	dir := t.TempDir()
 	checkpoint := filepath.Join(dir, "checkpoint")
@@ -51,6 +51,9 @@ func startRecoveryProcess(t *testing.T) *recoveryProcess {
 	t.Cleanup(cancel)
 	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestRecoveryHolderProcess$", "-test.timeout=20s")
 	cmd.Env = append(os.Environ(), "KUASAR_MEMORY_RECOVERY_ROOT="+dir)
+	if len(stage) != 0 {
+		cmd.Env = append(cmd.Env, "KUASAR_MEMORY_RECOVERY_STAGE="+stage[0])
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -129,13 +132,16 @@ func TestRecoveryHolderProcess(t *testing.T) {
 	if err := m.Close(); err != nil {
 		fail(err)
 	}
-	if err := h.Record().Update(func(r *CaptureRecord) {
-		r.Committed = true
-		r.RuntimeRetired = true
-		r.SnapshotRef = "snapshot"
-		r.SandboxRef = "sandbox"
-	}); err != nil {
-		fail(err)
+	stage := os.Getenv("KUASAR_MEMORY_RECOVERY_STAGE")
+	if stage != "uncommitted" {
+		if err := h.Record().Update(func(r *CaptureRecord) {
+			r.Committed = true
+			r.RuntimeRetired = stage != "committed"
+			r.SnapshotRef = "snapshot"
+			r.SandboxRef = "sandbox"
+		}); err != nil {
+			fail(err)
+		}
 	}
 	enc := json.NewEncoder(os.Stdout)
 	if err := enc.Encode(h.Record().Read()); err != nil {
@@ -153,6 +159,10 @@ func TestRecoveryHolderProcess(t *testing.T) {
 			err := h.closeRAMLocked()
 			h.mu.Unlock()
 			if err != nil {
+				fail(err)
+			}
+		case "unlock":
+			if err := h.Record().Close(); err != nil {
 				fail(err)
 			}
 		case "barrier":
