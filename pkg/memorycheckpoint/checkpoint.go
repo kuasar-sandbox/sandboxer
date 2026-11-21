@@ -79,6 +79,17 @@ func DeleteCheckpoint(ctx context.Context, directory string, ref Reference) (ret
 	if errors.Is(err, unix.EWOULDBLOCK) {
 		// The live holder is the only record writer. Old holders reject this
 		// operation; never claim success by updating their record behind them.
+		// A holder may exit after recording deletion but before delivering its
+		// reply. The durable exact receipt decides logical deletion even when
+		// transport fails; it says nothing about physical RAM release.
+		defer func() {
+			latest, err := ReadRecord(directory, ref.CheckpointID, ref.MemoryID)
+			if err == nil && sameCaptureIdentity(*r, *latest) && latest.Deleted {
+				retErr = nil
+				return
+			}
+			retErr = errors.Join(retErr, err, errors.New("memory checkpoint: deletion not recorded"))
+		}()
 		c, err := dialHolder(ctx, r.Holder)
 		if err != nil {
 			return err
@@ -95,10 +106,6 @@ func DeleteCheckpoint(ctx context.Context, directory string, ref Reference) (ret
 		}
 		if reply.Type != "deleted" {
 			return fmt.Errorf("memory checkpoint: delete refused: %s", reply.Error)
-		}
-		latest, err := ReadRecord(directory, ref.CheckpointID, ref.MemoryID)
-		if err != nil || !sameCaptureIdentity(*r, *latest) || !latest.Deleted {
-			return errors.Join(err, errors.New("memory checkpoint: deletion not recorded"))
 		}
 		return nil
 	}

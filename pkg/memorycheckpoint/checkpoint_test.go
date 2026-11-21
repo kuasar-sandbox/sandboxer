@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -334,5 +336,80 @@ func TestDeletePublishedAndLegacyRecord(t *testing.T) {
 	}
 	if _, err := os.Stat(w.Path()); err != nil {
 		t.Fatal("proof record removed")
+	}
+}
+
+// A holder can exit after recording deletion but before its reply is delivered.
+// Reconcile the exact receipt; a disconnected or rejected request alone is not
+// evidence of deletion, and deletion is not evidence of physical RAM release.
+func TestDeleteReconcilesLostReply(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		recorded   bool
+		wrongEpoch bool
+		reply      bool
+	}{
+		{name: "unrecorded"},
+		{name: "recorded", recorded: true},
+		{name: "different-generation", recorded: true, wrongEpoch: true},
+		{name: "ack-without-receipt", reply: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newNamedFixture(t, t.TempDir(), "lost-reply", true)
+			if err := f.h.listener.Close(); err != nil {
+				t.Fatal(err)
+			}
+			r := f.h.Record().Read()
+			if err := os.Remove(r.Holder.SocketPath); err != nil {
+				t.Fatal(err)
+			}
+			address := fmt.Sprintf("/proc/self/fd/%d/%s", f.h.directory.file.Fd(), holderSocketName)
+			listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: address, Net: "unix"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			listener.SetUnlinkOnClose(false)
+			t.Cleanup(func() { _ = listener.Close() })
+			served := make(chan error, 1)
+			go func() {
+				c, err := listener.AcceptUnix()
+				if err != nil {
+					served <- err
+					return
+				}
+				defer c.Close()
+				var req holderMessage
+				if err = readHolderMessage(c, &req); err == nil {
+					if req.Type != "delete" || req.CheckpointID != r.CheckpointID || req.MemoryID != r.MemoryID || req.Epoch != r.Epoch {
+						err = errors.New("unexpected delete request")
+					} else if tc.recorded {
+						err = f.h.markDeleted()
+					}
+				}
+				if err == nil && tc.wrongEpoch {
+					changed := f.h.Record().Read()
+					changed.Epoch++
+					err = writeJSON(f.h.Record().Path(), changed)
+				}
+				if err == nil && tc.reply {
+					err = writeHolderMessage(c, holderMessage{Type: "deleted"})
+				}
+				// Close without an ACK after the receipt update, as process exit can.
+				served <- err
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			err = DeleteCheckpoint(ctx, f.directory, Reference{r.CheckpointID, r.MemoryID})
+			if serveErr := <-served; serveErr != nil {
+				t.Fatal(serveErr)
+			}
+			if (err == nil) != (tc.recorded && !tc.wrongEpoch) {
+				t.Fatalf("delete outcome: %+v, returned %v", tc, err)
+			}
+			latest := f.h.Record().Read()
+			if latest.Deleted != tc.recorded || latest.RAMReleased || latest.Discarded || latest.FileReady {
+				t.Fatalf("invented deletion or release facts: %+v", latest)
+			}
+		})
 	}
 }
