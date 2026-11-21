@@ -81,7 +81,7 @@ func TestCleanupCheckpointRetainsIndependentDiskCaptures(t *testing.T) {
 			t.Fatalf("old capture changed on %s: %v", id, err)
 		}
 	}
-	cleanup.Retain = nil
+	cleanup.Retain = []CheckpointSource{}
 	if err := storage.CleanupCheckpoint(ctx, cleanup); err != nil {
 		t.Fatal(err)
 	}

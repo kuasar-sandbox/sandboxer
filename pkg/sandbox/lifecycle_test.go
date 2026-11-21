@@ -1927,7 +1927,7 @@ func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) 
 			},
 		}}, nil, filepath.Join(dir, "must-not-call-ch.sock"), filepath.Join(dir, "run"),
 		"", nil, nil, pinger, nil, func() error { return nil }, nil, discardLogf)
-	if err == nil || !strings.Contains(err.Error(), "checkpoint disks") {
+	if !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), "base.overlay") {
 		t.Fatalf("disk merge preflight error = %v", err)
 	}
 	if viewCalled {

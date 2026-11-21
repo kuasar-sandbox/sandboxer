@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -56,8 +57,9 @@ func TestPublishCheckpointCleanupFailureReturns79WithUsableJSONArtifact(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	sources, _ := json.Marshal([]artifact.Checkpoint{{Directory: directory, SandboxID: "cli", Retain: []artifact.CheckpointSource{}}})
 	rc, stdout, stderr := captureInfoOutput(t, func() int {
-		return publishCmd([]string{"--delete-checkpoint", "--json", "--to-ref-location", "result=file://" + output, path})
+		return publishCmd([]string{"--delete-checkpoint", "--checkpoint-sources", string(sources), "--json", "--to-ref-location", "result=file://" + output, path})
 	})
 	if rc != 79 || !strings.Contains(stderr, "publication succeeded; checkpoint cleanup failed") {
 		t.Fatalf("rc=%d stdout=%q stderr=%q", rc, stdout, stderr)

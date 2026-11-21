@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -465,5 +466,90 @@ func TestColdCheckpointHandoffPreservesIndependentExporters(t *testing.T) {
 	}
 	if err := after.Close(); err != nil || checkpointHasReaders(t, paths[0]) {
 		t.Fatal("restore reader retained deleted version after last exporter closed", err)
+	}
+}
+
+func TestRestoredDiskSourceFenceDoesNotRequireColdLayoutMarker(t *testing.T) {
+	shape, launch, paths, _ := coldCheckpointHandoffFixture(t)
+	ctx := context.Background()
+	binding := *launch.SourceBinding
+	ref, err := manifest.ParseRef(binding.SandboxRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Path = filepath.Join(binding.RelativeDir, ref.Path)
+	binding.RuntimeRef = ref.String()
+	// The memory restore entry supplies resolved E provenance without the
+	// cold-launch layout marker. Its actual immutable graph still owns DIFFs.
+	binding.Checkpoint = nil
+	opts := RunOptions{checkpointDir: filepath.Join(t.TempDir(), "unused", "checkpoint"), SandboxID: shape.SandboxID, SourceBinding: &binding}
+	guard, err := protectCaptureParents(ctx, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.Close()
+	storage, err := artifact.NewProcessStorage(&config.ManifestConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	parent := artifact.Checkpoint{Directory: binding.RelativeDir, SandboxID: shape.SandboxID, Retain: []artifact.CheckpointSource{}}
+	version := artifact.CheckpointRef{ID: "source", DiffID: "root"}
+	short, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer cancel()
+	if err = storage.DeleteCheckpoints(short, parent, []artifact.CheckpointRef{version}, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("restored source was not fenced: %v", err)
+	}
+	if err = guard.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Restoring the latest E can keep its DIFF open as the active writer.
+	live, err := diffstore.Open(paths[0], diffstore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	liveGuard, err := protectCaptureParents(ctx, opts, false)
+	if err != nil {
+		t.Fatal("parent validation conflicted with the restored writer", err)
+	}
+	if err := liveGuard.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.Close(); err != nil {
+		t.Fatal(err)
+	}
+	view, err := diffstore.OpenExport(ctx, paths[0], "source", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+	if err = storage.DeleteCheckpoints(ctx, parent, []artifact.CheckpointRef{version}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if guard, err = protectCaptureParents(ctx, opts, false); err == nil {
+		guard.Close()
+		t.Fatal("existing restored reader authorized new edge after revocation")
+	}
+}
+
+func TestCaptureParentProtectionWithoutCheckpointDirectory(t *testing.T) {
+	for _, memory := range []bool{false, true} {
+		opts := RunOptions{SandboxID: "ordinary", checkpointDir: filepath.Join(t.TempDir(), "checkpoint")}
+		if memory {
+			opts.SourceBinding = &RunSourceBinding{SandboxRef: "manifest://" + strings.Repeat("0", 64)}
+		}
+		guard, err := protectCaptureParents(context.Background(), opts, memory)
+		if err != nil {
+			t.Fatalf("ordinary capture memory=%t: %v", memory, err)
+		}
+		if guard != nil {
+			if err := guard.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := os.Stat(opts.checkpointDir); !os.IsNotExist(err) {
+			t.Fatalf("ordinary capture created unused checkpoint directory: %v", err)
+		}
 	}
 }

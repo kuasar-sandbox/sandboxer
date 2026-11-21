@@ -18,10 +18,8 @@ import (
 
 // DiffCheckpointRef is a stable, exact disk/version identity. Deletion never
 // re-resolves a capture name after the set has been selected.
-type DiffCheckpointRef struct {
-	DiffID string `json:"diff_id"`
-	ID     string `json:"id"`
-}
+type CheckpointRef = ctl.CheckpointRef
+type DiffCheckpointRef = CheckpointRef
 
 type checkpointPublication struct {
 	directory string
@@ -214,13 +212,13 @@ func listDirectoryDiffCheckpoints(ctx context.Context, directory string) ([]Diff
 	return refs, nil
 }
 
-func (s *ProcessStorage) DeleteDiffCheckpoint(ctx context.Context, directory string, ref DiffCheckpointRef) (retErr error) {
-	owner, err := diffstore.LockDirectory(directory)
-	if err != nil {
-		return err
+func (s *ProcessStorage) DeleteDiffCheckpoint(ctx context.Context, directory string, ref DiffCheckpointRef, roots ...Checkpoint) error {
+	if len(roots) != 1 {
+		return errors.New("checkpoint deletion requires an explicit complete retention set")
 	}
-	defer func() { retErr = errors.Join(retErr, owner.Close()) }()
-	return deleteDirectoryDiffCheckpoints(ctx, owner.Directory, []DiffCheckpointRef{ref})
+	c := roots[0]
+	c.Directory = directory
+	return s.DeleteCheckpoints(ctx, c, []CheckpointRef{ref}, nil)
 }
 
 func deleteDirectoryDiffCheckpoints(ctx context.Context, directory string, refs []DiffCheckpointRef) error {
@@ -265,7 +263,7 @@ func deleteDirectoryDiffCheckpoints(ctx context.Context, directory string, refs 
 // DeletePublishedDiffCheckpoints is opt-in cleanup of the exact pinned sources.
 // It requires both successful publication and a successful Publisher.Close.
 // A busy directory is routed to its live owner and is never mutated directly.
-func (s *ProcessStorage) DeletePublishedDiffCheckpoints(ctx context.Context, result PublishResult) error {
+func (s *ProcessStorage) DeletePublishedDiffCheckpoints(ctx context.Context, result PublishResult, roots ...Checkpoint) error {
 	if len(result.checkpointSources) == 0 {
 		return nil
 	}
@@ -278,9 +276,29 @@ func (s *ProcessStorage) DeletePublishedDiffCheckpoints(ctx context.Context, res
 	if !closed {
 		return errors.New("checkpoint cleanup requires successful Publisher.Close")
 	}
+	plans := make(map[string]Checkpoint, len(roots))
+	for _, c := range roots {
+		if c.Retain == nil {
+			return errors.New("publication cleanup requires an explicit complete retention set")
+		}
+		dir, err := filepath.Abs(c.Directory)
+		if err != nil {
+			return err
+		}
+		if _, exists := plans[dir]; exists {
+			return errors.New("duplicate publication cleanup directory")
+		}
+		plans[dir] = c
+	}
+	// Validate completeness before the first selected directory is mutated.
+	for _, source := range result.checkpointSources {
+		if _, ok := plans[source.directory]; !ok {
+			return errors.New("publication cleanup requires sources for every selected directory")
+		}
+	}
 	var errs error
 	for _, source := range result.checkpointSources {
-		err := deletePublishedDiffSource(ctx, source)
+		err := s.deletePublishedDiffSource(ctx, source, plans[source.directory])
 		if err != nil {
 			errs = errors.Join(errs, fmt.Errorf("checkpoint cleanup directory %s references %+v: %w", source.directory, source.refs, err))
 		}
@@ -290,7 +308,7 @@ func (s *ProcessStorage) DeletePublishedDiffCheckpoints(ctx context.Context, res
 
 // Retain the actual directory across ownership acquisition and routing retries.
 // Resolving the original name again could select a replacement after rename.
-func deletePublishedDiffSource(ctx context.Context, source checkpointPublication) (retErr error) {
+func (s *ProcessStorage) deletePublishedDiffSource(ctx context.Context, source checkpointPublication, c Checkpoint) (retErr error) {
 	directory, err := os.Open(source.directory)
 	if err != nil {
 		return err
@@ -301,13 +319,16 @@ func deletePublishedDiffSource(ctx context.Context, source checkpointPublication
 		return errors.Join(errors.New("checkpoint source directory identity changed"), err)
 	}
 	pinnedPath := fmt.Sprintf("/proc/self/fd/%d", directory.Fd())
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	owner, err := diffstore.LockDirectory(pinnedPath)
 	if errors.Is(err, diffstore.ErrBusy) {
 		refs := make([]ctl.DiffCheckpointRef, len(source.refs))
 		for i, ref := range source.refs {
 			refs[i] = ctl.DiffCheckpointRef{DiffID: ref.DiffID, ID: ref.ID}
 		}
-		return ctl.DeleteOwnedDiffCheckpoints(ctx, pinnedPath, refs)
+		return ctl.DeleteOwnedDiffCheckpoints(ctx, pinnedPath, refs, ctl.CheckpointSources{SnapshotRef: c.SnapshotRef, SandboxRef: c.SandboxRef, Retain: c.Retain, RefLocations: c.RefLocations})
 	}
 	if err != nil {
 		return err
@@ -317,7 +338,16 @@ func deletePublishedDiffSource(ctx context.Context, source checkpointPublication
 	if err != nil || !os.SameFile(source.identity, current) {
 		return errors.Join(errors.New("checkpoint source directory identity changed"), err)
 	}
-	return deleteDirectoryDiffCheckpoints(ctx, pinnedPath, source.refs)
+	c.Directory = owner.Directory
+	// Use the same source graph as maintenance deletion. The already acquired
+	// owner is passed as the disk adapter; exact refs never get rediscovered.
+	return s.DeleteCheckpoints(ctx, c, source.refs, func(ctx context.Context, refs []DiffCheckpointRef) error {
+		current, err := os.Stat(c.Directory)
+		if err != nil || !os.SameFile(source.identity, current) {
+			return errors.Join(errors.New("checkpoint source directory identity changed"), err)
+		}
+		return deleteDirectoryDiffCheckpoints(ctx, pinnedPath, refs)
+	})
 }
 
 // ReopenIDs checks which pinned source writers still match the live epoch.

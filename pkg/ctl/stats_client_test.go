@@ -35,7 +35,7 @@ func TestClientCancellationClosesConnectedSocket(t *testing.T) {
 			return err
 		}},
 		{"checkpoint-delete", func(ctx context.Context, socket string) error {
-			return DeleteDiffCheckpoints(ctx, socket, "owner", []DiffCheckpointRef{{DiffID: "disk", ID: "version"}})
+			return DeleteDiffCheckpoints(ctx, socket, "owner", []DiffCheckpointRef{{DiffID: "disk", ID: "version"}}, CheckpointSources{Retain: []CheckpointSource{}})
 		}},
 	} {
 		for _, deadline := range []bool{false, true} {

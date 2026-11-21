@@ -82,7 +82,7 @@ func TestCleanupCheckpointEncryptedBatchedSweep(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			checkpoint := Checkpoint{Directory: dir, SandboxID: "owned", SnapshotRef: s, SandboxRef: e}
+			checkpoint := Checkpoint{Retain: []CheckpointSource{}, Directory: dir, SandboxID: "owned", SnapshotRef: s, SandboxRef: e}
 			if err = storage.CleanupCheckpoint(ctx, checkpoint); err != nil {
 				t.Fatal(err)
 			}

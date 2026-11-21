@@ -182,7 +182,7 @@ func TestCheckpointMemorySaveFormats(t *testing.T) {
 	}
 }
 
-func TestCheckpointMemoryWaitFormats(t *testing.T) {
+func TestCheckpointMemoryFormatsAllowMultipleHolders(t *testing.T) {
 	for _, previous := range []string{ctl.SnapshotModeLocal, ctl.SnapshotModeBundle} {
 		for _, next := range []string{ctl.SnapshotModeLocal, ctl.SnapshotModeBundle} {
 			t.Run(previous+"-to-"+next, func(t *testing.T) {
@@ -195,29 +195,17 @@ func TestCheckpointMemoryWaitFormats(t *testing.T) {
 				}); err != nil {
 					t.Fatal(err)
 				}
-				prior, err := newPreviousMemorySave(directory, "sid")
-				if err != nil {
-					t.Fatal(err)
-				}
-				h := &SnapshotHandler{EnableCheckpoint: true, previousMemory: prior, runtime: &Runtime{}, CHProcess: func() processSignaler { return nil }}
-				req := ctl.Request{CheckpointID: "next", Mode: next, NoWaitForPreviousMemorySave: true}
-				if _, err := h.handleContext(context.Background(), req, "", nil); !errors.Is(err, ctl.ErrMemorySavePending) {
-					t.Fatalf("FileReady bypassed RAM obligation: %v", err)
-				}
-				ctx, cancel := context.WithCancel(context.Background())
-				cancel()
-				req.NoWaitForPreviousMemorySave = false
-				if _, err := h.handleContext(ctx, req, "", nil); !errors.Is(err, context.Canceled) {
-					t.Fatalf("cancelled wait: %v", err)
-				}
-				if h.capture.active || h.capture.terminal {
-					t.Fatal("wait entered capture")
-				}
-				if err := record.Update(func(r *memorycheckpoint.CaptureRecord) { r.RAMReleased = true }); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := h.handleContext(context.Background(), req, "", nil); err == nil || !strings.Contains(err.Error(), "process is not started") {
-					t.Fatalf("released RAM did not admit capture: %v", err)
+				h := &SnapshotHandler{SandboxID: "sid", CheckpointDir: directory, EnableCheckpoint: true, runtime: &Runtime{}, CHProcess: func() processSignaler { return nil }}
+				for _, noWait := range []bool{false, true} {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					_, err := h.handleContext(ctx, ctl.Request{CheckpointID: "next", Mode: next, NoWaitForPreviousMemorySave: noWait}, "", nil)
+					cancel()
+					if err == nil || !strings.Contains(err.Error(), "process is not started") {
+						t.Fatalf("format gated new capture: %v", err)
+					}
+					if record.Read().RAMReleased {
+						t.Fatal("old RAM was forgotten")
+					}
 				}
 			})
 		}
@@ -240,11 +228,7 @@ func TestCheckpointMemoryWaitOnlyForNewRetention(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			directory := t.TempDir()
 			_ = memorySaveRecord(t, directory)
-			prior, err := newPreviousMemorySave(directory, "sid")
-			if err != nil {
-				t.Fatal(err)
-			}
-			h := &SnapshotHandler{EnableCheckpoint: true, previousMemory: prior, runtime: &Runtime{}, CHProcess: func() processSignaler { return nil }}
+			h := &SnapshotHandler{EnableCheckpoint: true, CheckpointDir: directory, runtime: &Runtime{}, CHProcess: func() processSignaler { return nil }}
 			req := ctl.Request{CheckpointID: "next", Mode: ctl.SnapshotModeBundle, NoWaitForPreviousMemorySave: true}
 			tc.adjust(h, &req)
 			if _, err := h.handleContext(context.Background(), req, "", nil); err == nil || !strings.Contains(err.Error(), "process is not started") {
@@ -266,17 +250,13 @@ func TestCheckpointMemoryCaptureStateCapability(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			directory := t.TempDir()
 			_ = memorySaveRecord(t, directory)
-			prior, err := newPreviousMemorySave(directory, "sid")
-			if err != nil {
-				t.Fatal(err)
-			}
-			h := &SnapshotHandler{SandboxID: "sid", EnableCheckpoint: tc.enabled, previousMemory: prior}
+			h := &SnapshotHandler{SandboxID: "sid", EnableCheckpoint: tc.enabled, CheckpointDir: directory}
 			if tc.owner {
 				h.runtime = &Runtime{}
 			}
 			q := ctl.CaptureStateQuery{SandboxID: "sid", NoWaitForPreviousMemorySave: true, ForCapture: true}
 			state, err := h.captureState(context.Background(), q)
-			if err != nil || state.Pending != tc.wantPending || state.RetentionSupported == nil || *state.RetentionSupported != tc.wantPending {
+			if err != nil || state.Pending || state.LifecycleVersion != ctl.CheckpointLifecycleVersion || state.RetentionSupported == nil || *state.RetentionSupported != tc.wantPending {
 				t.Fatalf("capture admission: %+v %v", state, err)
 			}
 			q.ForCapture = false

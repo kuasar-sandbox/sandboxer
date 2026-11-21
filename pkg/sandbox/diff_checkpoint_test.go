@@ -234,13 +234,13 @@ func TestOnlineCheckpointManagementSkipsRetiredAndMissingDiffs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer maintenance.Close()
-	handler := &SnapshotHandler{EnableCheckpoint: true, CheckpointDir: dir, checkpointMaintenance: maintenance}
-	refs, err := handler.listDiffCheckpoints(ctx)
+	handler := &SnapshotHandler{EnableCheckpoint: true, SandboxID: "sid", CheckpointDir: dir, checkpointMaintenance: maintenance}
+	refs, err := handler.listCheckpoints(ctx)
 	if err != nil || len(refs) != 1 || refs[0].DiffID != "available" || refs[0].ID != "cp" {
 		t.Fatalf("retired file poisoned live list: %+v %v", refs, err)
 	}
 	for range 2 {
-		err := handler.deleteDiffCheckpoints(ctx, []ctl.DiffCheckpointRef{{DiffID: "retired", ID: "cp"}, {DiffID: "removed", ID: "cp"}})
+		err := handler.deleteCheckpoints(ctx, []ctl.DiffCheckpointRef{{DiffID: "retired", ID: "cp"}, {DiffID: "removed", ID: "cp"}}, &ctl.CheckpointSources{Retain: []ctl.CheckpointSource{}})
 		if err != nil {
 			t.Fatalf("exact cleanup was not idempotent: %v", err)
 		}
@@ -249,10 +249,10 @@ func TestOnlineCheckpointManagementSkipsRetiredAndMissingDiffs(t *testing.T) {
 		t.Fatalf("existing retired pin lost: %v", err)
 	}
 	create("wrong", "different", true)
-	if _, err := handler.listDiffCheckpoints(ctx); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+	if _, err := handler.listCheckpoints(ctx); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
 		t.Fatalf("retired identity mismatch hidden by list: %v", err)
 	}
-	if err := handler.deleteDiffCheckpoints(ctx, []ctl.DiffCheckpointRef{{DiffID: "wrong", ID: "cp"}}); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+	if err := handler.deleteCheckpoints(ctx, []ctl.DiffCheckpointRef{{DiffID: "wrong", ID: "cp"}}, &ctl.CheckpointSources{Retain: []ctl.CheckpointSource{}}); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
 		t.Fatalf("retired identity mismatch hidden by delete: %v", err)
 	}
 }

@@ -101,7 +101,7 @@ func TestMemoryCheckpointLongFileHistoryHasNoCheckpointCountLimit(t *testing.T) 
 	if err := root.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{
+	if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{Retain: []CheckpointSource{},
 		Directory: fixture.directory, SandboxID: "sid", SnapshotRef: fixture.ref, SandboxRef: fixture.eRef,
 	}); err != nil {
 		t.Fatal(err)
