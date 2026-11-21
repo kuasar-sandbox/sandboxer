@@ -682,71 +682,10 @@ func (h *ControllerHooks) reconnectLoop() {
 				h.sessionMu.Unlock()
 				break
 			}
-			err := h.client.ConnectContext(h.lifetimeCtx)
+			err := h.restoreSessionLocked(h.lifetimeCtx)
 			if err == nil {
-				hostCharge := readHostMemoryChargeBestEffort(h.opts.CgroupPath)
-				h.syncStartMu.Lock()
-				// Observe an already-canceled parent even if its AfterFunc has not
-				// run yet. A cancellation racing after this point is ordered after
-				// the write: its callback cannot cancel lifetimeCtx until onWrite
-				// releases this gate. Thus the check-to-write window is protected.
-				if h.opts.Context.Err() != nil {
-					h.cancelLifetime()
-				}
-				// Do not begin a new StateSync after shutdown has started.
-				// Only an already-started RPC may drain without cancellation.
-				if err = h.lifetimeCtx.Err(); err != nil {
-					h.syncStartMu.Unlock()
-					h.sessionMu.Unlock()
-					return
-				}
-				var startOnce sync.Once
-				unlockStart := func() { startOnce.Do(h.syncStartMu.Unlock) }
-				// StateSync can rotate the reservation token before its ACK arrives.
-				// Once sent, let the existing bounded RPC finish so Release can
-				// use the new token. Release joins this worker before cleanup;
-				// canceling here could lose the only token for the live charge.
-				result, syncErr := h.client.StateSyncContextOnWrite(context.WithoutCancel(h.lifetimeCtx), resource.StateSyncParams{
-					SandboxID:                h.opts.SandboxID,
-					AppliedAllocatableMemory: state.reservation,
-					AppliedCacheReservation:  state.cacheReservation, AppliedCacheMaximum: state.cacheMaximum,
-					Settled: state.settled, CurrentRSS: hostCharge, PreviousToken: state.token,
-					CacheReclaim: state.cacheReclaim,
-				}, unlockStart, h.lifetimeCtx)
-				unlockStart()
-				if syncErr == nil && state.cacheSupported && result.CacheReservation != state.cacheReservation {
-					syncErr = fmt.Errorf("cache state_sync mismatch node=%d local=%d", result.CacheReservation, state.cacheReservation)
-				}
-				if syncErr == nil && result.NewAllocatable != state.reservation {
-					syncErr = fmt.Errorf("state_sync reservation mismatch: node=%d local=%d", result.NewAllocatable, state.reservation)
-				}
-				if syncErr == nil && state.cacheCoordinated {
-					if !resource.HasFeature(result.ClientFeatures, resource.FeatureCacheReclaimV1) ||
-						!resource.HasFeature(result.ClientFeatures, resource.FeatureCacheBudgetV1) {
-						syncErr = fmt.Errorf("state_sync did not confirm cache coordination")
-					} else {
-						syncErr = h.acceptCacheReclaimResponse(result.CacheReclaimTask, result.CacheReclaimAck)
-					}
-				}
-				if syncErr == nil {
-					h.mu.Lock()
-					h.connected, h.previousToken = true, result.Token
-					h.retainedSupported = resource.HasFeature(result.ClientFeatures, resource.FeatureRetainedMemoryV2)
-					if !state.cacheCoordinated {
-						h.cacheReclaimTarget = result.CacheReclaimTarget
-						h.cacheReclaimSeq = result.CacheReclaimSeq
-					}
-					select {
-					case h.cacheWake <- struct{}{}:
-					default:
-					}
-					h.mu.Unlock()
-					h.sessionMu.Unlock()
-					h.opts.Logf("controller state sync restored token=%s reservation=%d settled=%v",
-						shortToken(result.Token), state.reservation, state.settled)
-					break
-				}
-				err = syncErr
+				h.sessionMu.Unlock()
+				break
 			}
 			_ = h.client.Close()
 			h.setConnected(false)
@@ -760,6 +699,79 @@ func (h *ControllerHooks) reconnectLoop() {
 			backoff = nextBackoff(backoff)
 		}
 	}
+}
+
+// restoreSessionLocked restores the active B/cache contract on a fresh stream.
+// sessionMu must be held; retired holders must use their capture replay instead.
+func (h *ControllerHooks) restoreSessionLocked(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	state := h.localState()
+	if state.released || !state.admitted {
+		return fmt.Errorf("controller has no active session to restore")
+	}
+	if err := h.client.ConnectContext(ctx); err != nil {
+		return err
+	}
+	hostCharge := readHostMemoryChargeBestEffort(h.opts.CgroupPath)
+	h.syncStartMu.Lock()
+	// Order the StateSync write with lifetime cancellation, including a parent
+	// whose cancellation callback has not yet acquired this gate.
+	if h.opts.Context.Err() != nil {
+		h.cancelLifetime()
+	}
+	if err := h.lifetimeCtx.Err(); err != nil {
+		h.syncStartMu.Unlock()
+		return err
+	}
+	var startOnce sync.Once
+	unlockStart := func() { startOnce.Do(h.syncStartMu.Unlock) }
+	// Once written, drain the bounded RPC: its ACK may carry the only new token.
+	// Release waits for sessionMu after joining the background reconnect worker.
+	result, syncErr := h.client.StateSyncContextOnWrite(context.WithoutCancel(h.lifetimeCtx), resource.StateSyncParams{
+		SandboxID:                h.opts.SandboxID,
+		AppliedAllocatableMemory: state.reservation,
+		AppliedCacheReservation:  state.cacheReservation, AppliedCacheMaximum: state.cacheMaximum,
+		Settled: state.settled, CurrentRSS: hostCharge, PreviousToken: state.token,
+		CacheReclaim: state.cacheReclaim,
+	}, unlockStart, ctx)
+	unlockStart()
+	if syncErr == nil && state.cacheSupported && result.CacheReservation != state.cacheReservation {
+		syncErr = fmt.Errorf("cache state_sync mismatch node=%d local=%d", result.CacheReservation, state.cacheReservation)
+	}
+	if syncErr == nil && result.NewAllocatable != state.reservation {
+		syncErr = fmt.Errorf("state_sync reservation mismatch: node=%d local=%d", result.NewAllocatable, state.reservation)
+	}
+	if syncErr == nil && state.cacheCoordinated {
+		if !resource.HasFeature(result.ClientFeatures, resource.FeatureCacheReclaimV1) ||
+			!resource.HasFeature(result.ClientFeatures, resource.FeatureCacheBudgetV1) {
+			syncErr = fmt.Errorf("state_sync did not confirm cache coordination")
+		} else {
+			syncErr = h.acceptCacheReclaimResponse(result.CacheReclaimTask, result.CacheReclaimAck)
+		}
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	h.mu.Lock()
+	h.connected, h.previousToken = true, result.Token
+	h.retainedSupported = resource.HasFeature(result.ClientFeatures, resource.FeatureRetainedMemoryV2)
+	if !state.cacheCoordinated {
+		h.cacheReclaimTarget = result.CacheReclaimTarget
+		h.cacheReclaimSeq = result.CacheReclaimSeq
+	}
+	select {
+	case h.cacheWake <- struct{}{}:
+	default:
+	}
+	h.mu.Unlock()
+	h.opts.Logf("controller state sync restored token=%s reservation=%d settled=%v",
+		shortToken(result.Token), state.reservation, state.settled)
+	return nil
 }
 
 func nextBackoff(current time.Duration) time.Duration {

@@ -23,17 +23,52 @@ func (h *ControllerHooks) retentionCallLocked(ctx context.Context, typ string, c
 	if !h.Enabled() {
 		return &resource.RetainedMemory{MemoryID: capture.MemoryID, Epoch: capture.Epoch}, nil
 	}
-	if !h.client.Connected() {
-		if err := h.client.ConnectContext(ctx); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	prepare := typ == resource.TypePrepareRetained
+	reconnect := func() error {
+		if !prepare {
+			return h.client.ConnectContext(ctx)
+		}
+		if err := h.restoreSessionLocked(ctx); err != nil {
+			h.markDisconnectedLocked(err)
+			return err
+		}
+		// Recovery may have drained a StateSync ACK after capture or runtime
+		// cancellation. Keep its new token for Abort/Release, but do not start
+		// a new preparation after that boundary.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := h.lifetimeCtx.Err(); err != nil {
+			return err
+		}
+		if !h.SupportsRetainedMemory() {
+			return fmt.Errorf("controller does not support checkpoint memory handoff")
+		}
+		return nil
+	}
+	if !h.client.Connected() || prepare && !h.localState().connected {
+		if err := reconnect(); err != nil {
 			return nil, err
 		}
 	}
 	r, err := h.client.RetainedMemoryContext(ctx, typ, h.opts.SandboxID, capture)
 	if resource.IsTransportError(err) {
-		// Retention operations are exactly replayable and do not reconstruct
-		// a retired active Budget through the ordinary StateSync path.
-		if reconnectErr := h.client.ConnectContext(ctx); reconnectErr == nil {
+		if prepare {
+			h.markDisconnectedLocked(err)
+		}
+		// An active Prepare needs StateSync before replay, even if its first
+		// ACK was lost. Terminal holder operations replay only their capture;
+		// they must never recreate an active B through ordinary StateSync.
+		if reconnectErr := reconnect(); reconnectErr == nil {
 			r, err = h.client.RetainedMemoryContext(ctx, typ, h.opts.SandboxID, capture)
+		} else if prepare {
+			return nil, reconnectErr
+		}
+		if prepare && resource.IsTransportError(err) {
+			h.markDisconnectedLocked(err)
 		}
 	}
 	return r, err
