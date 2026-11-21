@@ -290,12 +290,20 @@ assert r['mismatches'] == [0] * 16 and r['warm_mismatches'] == [0] * 16 and r['c
 PY_DIO
 
 WANT_TICK=$((PRE_SNAP_TICK + 3))
+# The resumed guest may already have passed this value before console delivery.
+# Require forward progress, not the presence of one exact historical log line.
+restored_counter_progressed() {
+    awk -v minimum="$WANT_TICK" '
+        /^TICK [0-9]+[[:space:]]*$/ && $2 >= minimum { progressed=1; exit }
+        END { exit !progressed }
+    ' "$LOG2"
+}
 for _ in $(seq 1 600); do
-    grep -qE "^TICK $WANT_TICK[[:space:]]*$" "$LOG2" 2>/dev/null && break
+    restored_counter_progressed 2>/dev/null && break
     kill -0 "$SBPID2" 2>/dev/null || e2e_fail "restored run exited before counter resumed"
     sleep 0.05
 done
-grep -qE "^TICK $WANT_TICK[[:space:]]*$" "$LOG2" || e2e_fail "restored counter did not continue past captured state"
+restored_counter_progressed || e2e_fail "restored counter did not continue past captured state"
 
 kill -TERM "$SBPID2"
 wait "$SBPID2" || true
