@@ -391,7 +391,7 @@ func TestResetCurrentDisksPreservesMiddleUnboundSlot(t *testing.T) {
 	if e.Checkpoint.Version != 2 || len(d) != 3 || d[0].DiffID != "data-1" || d[1].Name != "unused" || d[1].DiffID != "" || d[2].DiffID != "data-2" {
 		t.Fatalf("reset topology: %+v", d)
 	}
-	versions, err := s.CheckpointVersions(ctx, Checkpoint{Directory: f.dir, SandboxID: run.SandboxID, SandboxRef: ref})
+	versions, err := s.CheckpointVersions(ctx, Checkpoint{Retain: []CheckpointSource{}, Directory: f.dir, SandboxID: run.SandboxID, SandboxRef: ref})
 	if err != nil || len(versions) != 3 {
 		t.Fatalf("pinned versions: %v %v", versions, err)
 	}

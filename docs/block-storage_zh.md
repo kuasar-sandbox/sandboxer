@@ -47,19 +47,24 @@ sandbox-ctl snapshot --path-id worker --checkpoint cp-001 --json
 
 ```bash
 sandbox-ctl checkpoint list --path-id worker --json
-sandbox-ctl checkpoint delete --path-id worker --checkpoint cp-001
+sandbox-ctl checkpoint delete --path-id worker --checkpoint cp-001 \
+  --sources "$(cat complete-sources.json)"
 # 离线管理需要目录独占所有权；存在运行 owner 时明确报 busy。
 sandbox-ctl checkpoint list --checkpoint-dir /var/lib/sandbox/worker/checkpoint
 sandbox-ctl checkpoint delete --checkpoint-dir /var/lib/sandbox/worker/checkpoint \
-  --checkpoint cp-001 --diff-id ROOT_DIFF_ID --diff-id DATA_DIFF_ID
+  --producer-id worker --checkpoint cp-001 --diff-id ROOT_DIFF_ID --diff-id DATA_DIFF_ID \
+  --sources "$(cat complete-sources.json)"
 ```
 
 在线管理通过 `RunRoot/PathID/ctl.sock` 定位（也接受 `--sandbox-id` 和 `--run-root`）。
-List 一次返回当前及历史 DIFF 的全部可见版本，也包括捕获中断留下的版本；`--json` 输出
-精确的 `{diff_id,id}`。删除在修改前固定这组引用。部分失败后，使用重复的 `--diff-id`
-重试已报告的精确集合，不要重新查找可能变化的捕获名。逻辑删除后禁止新打开；已 pin
-的导出仍可完成，并延后分批空间回收。因此删除会使依赖版本的本地 E/S 失效，但不保证
-立即归还全部空间。
+List 返回可见磁盘版本和已提交、非 Aborted/Deleted 的内存版本。JSON 为精确
+`{diff_id,id}` 或 `{memory_id,id}`。部分删除失败后以重复 `--diff-id` 或 `--memory-id`
+重试固定集合。`complete-sources.json` 为
+`{"snapshot_ref":"...","sandbox_ref":"...","retain":[...]}`，retain 项同为 S/E 对；
+`ref_locations` 可提供 location 到宿主目录的映射。只有确认无额外来源时才使用
+`{"retain":[]}`；省略/null 拒绝。runtime 加入活动来源，调用方还须保护外部完整登记。
+后代仍需要的后端不能撤销。成功撤销拒绝新 Open，已有视图续读，物理释放可以延后。
+
 
 ```bash
 sandbox-ctl checkpoint gc --checkpoint-dir /var/lib/sandbox/worker/checkpoint --json
@@ -84,7 +89,7 @@ GC 不截短文件，也不复用已使用的 Checkpoint ID。
 ```bash
 cd /var/lib/sandbox/worker/checkpoint
 sandbox-ctl publish --to-ref-location archive=file:///var/lib/sandbox/published \
-  --delete-checkpoint --json '<snapshotRef>'
+  --delete-checkpoint --checkpoint-sources "$(cat source-directories.json)" --json '<snapshotRef>'
 ```
 
 全部 publish 分支（包括引用替换/归并及 Bundle 输入）都会物化所选磁盘版本；普通输出
@@ -94,12 +99,17 @@ sandbox-ctl publish --to-ref-location archive=file:///var/lib/sandbox/published 
 解析输入别名，也不从 `removedRefs` 推断权限。发布成功但清理失败时，CLI 返回 **79**，
 同时保留有效的普通结果或 JSON；应重试清理，不应丢弃发布结果。
 
+`source-directories.json` 是 `artifact.Checkpoint` 对象数组，每个所选目录提供
+`Directory`、`SandboxID`、当前 S/E 与完整 `Retain`。发布成功不等于源已无引用，
+缺少集合或依赖仍存在时后续删除失败。`OpenCheckpoint` 返回强类型磁盘 View 或内存
+Root，保留 Top/History/HistoryFull/Dirty 语义。
+
 SDK 使用同一契约：`RuntimeSpec.EnableCheckpoint`、`RunOptions.EnableCheckpoint`、
 `restore.Options.EnableCheckpoint`、`ctl.Request.CheckpointID`、
 `Runtime.ListCheckpoints/DeleteCheckpoint` 和
-`ProcessStorage.ListDiffCheckpoints/DeleteDiffCheckpoint`。在
+`ProcessStorage.ListCheckpoints/OpenCheckpoint/DeleteCheckpoints`。在
 `Publisher.PublishWithOptions` 与 `Publisher.Close` 均成功后，可调用
-`ProcessStorage.DeletePublishedDiffCheckpoints(ctx, result)`，独立处理其错误，最后
+`ProcessStorage.DeletePublishedDiffCheckpoints(ctx, result, sources...)`，独立处理其错误，最后
 关闭 storage。离线元数据管理及固定版本发布都无需打开 Disk。
 
 嵌入调用方可在 `LaunchSpec` 中提供不透明的 `ProcessStorage`；Checkpoint 物化会

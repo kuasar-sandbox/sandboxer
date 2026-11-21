@@ -280,7 +280,7 @@ func TestMemoryCheckpointNextDirtyCaptureDropsPreviousCleanWorkingSetCopies(t *t
 func TestMemoryCheckpointKeepGraphAndReaderPin(t *testing.T) {
 	fixture := newMemoryCheckpointFixture(t)
 	root := openLocalFixture(t, fixture)
-	c := Checkpoint{Directory: fixture.directory, SandboxID: "sid", SnapshotRef: fixture.ref, SandboxRef: fixture.eRef}
+	c := Checkpoint{Retain: []CheckpointSource{}, Directory: fixture.directory, SandboxID: "sid", SnapshotRef: fixture.ref, SandboxRef: fixture.eRef}
 	garbage := filepath.Join(fixture.directory, strings.Repeat("f", 64)+".image")
 	if err := os.WriteFile(garbage, []byte("obsolete"), 0600); err != nil {
 		t.Fatal(err)
@@ -306,8 +306,8 @@ func TestMemoryCheckpointKeepGraphAndReaderPin(t *testing.T) {
 	if err := root.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// A selected older/E-only source must still retain the latest pending/current
-	// sandbox obligation's graph. No memory socket exists in this fixture.
+	// An older/E-only current root retains history only via explicit roots.
+	c.Retain = []CheckpointSource{{SnapshotRef: fixture.ref, SandboxRef: fixture.eRef}}
 	c.SnapshotRef = ""
 	if err := fixture.storage.CleanupCheckpoint(context.Background(), c); err != nil {
 		t.Fatal(err)
@@ -351,10 +351,19 @@ func TestMemoryCheckpointKeepsRecoveryRecordsWithOriginalCheckpointID(t *testing
 	if err := os.WriteFile(unknown, b, 0600); err != nil {
 		t.Fatal(err)
 	}
+	// Unknown identity evidence makes full inventory fail closed. Keep an
+	// unrecognized non-record file instead for the physical-GC preservation check.
+	if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{Directory: fixture.directory, SandboxID: "sid", Retain: []CheckpointSource{}, SnapshotRef: fixture.ref, SandboxRef: fixture.eRef}); err == nil {
+		t.Fatal("misplaced capture record was ignored")
+	}
+	if err := os.Rename(unknown, unknown+".unrecognized"); err != nil {
+		t.Fatal(err)
+	}
+	unknown += ".unrecognized"
 	if err := os.WriteFile(unknown+".lock", nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{
+	if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{Retain: []CheckpointSource{},
 		Directory: fixture.directory, SandboxID: "sid", SnapshotRef: fixture.ref, SandboxRef: fixture.eRef,
 	}); err != nil {
 		t.Fatal(err)
@@ -399,9 +408,10 @@ func TestMemoryCheckpointGCKeepsReleasedProofOutsideSourceGraph(t *testing.T) {
 	if err := next.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{Directory: fixture.directory, SandboxID: "sid", SnapshotRef: fixture.ref, SandboxRef: fixture.eRef}); err != nil {
+	if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{Retain: []CheckpointSource{}, Directory: fixture.directory, SandboxID: "sid", SnapshotRef: fixture.ref, SandboxRef: fixture.eRef}); err != nil {
 		t.Fatal(err)
 	}
+	old.Version, old.Deleted = memorycheckpoint.RecordVersion, true
 	proof, err := memorycheckpoint.ReadCaptureRecord(oldPath)
 	if err != nil || *proof != *old || !proof.RAMReleased {
 		t.Fatalf("GC erased exact unsettled release evidence: %+v %v", proof, err)
@@ -582,7 +592,7 @@ func TestMemoryCheckpointPortableSingleLayerKeepsDirtyUnion(t *testing.T) {
 	if err := portable.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{
+	if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{Retain: []CheckpointSource{},
 		Directory: fixture.directory, SandboxID: "sid", SnapshotRef: fixture.ref, SandboxRef: fixture.eRef,
 	}); err != nil {
 		t.Fatal(err)

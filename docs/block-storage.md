@@ -60,21 +60,26 @@ target's BaseRoot/PathID are independent.
 
 ```bash
 sandbox-ctl checkpoint list --path-id worker --json
-sandbox-ctl checkpoint delete --path-id worker --checkpoint cp-001
+sandbox-ctl checkpoint delete --path-id worker --checkpoint cp-001 \
+  --sources "$(cat complete-sources.json)"
 # Offline management takes exclusive directory ownership; a live owner means busy.
 sandbox-ctl checkpoint list --checkpoint-dir /var/lib/sandbox/worker/checkpoint
 sandbox-ctl checkpoint delete --checkpoint-dir /var/lib/sandbox/worker/checkpoint \
-  --checkpoint cp-001 --diff-id ROOT_DIFF_ID --diff-id DATA_DIFF_ID
+  --producer-id worker --checkpoint cp-001 --diff-id ROOT_DIFF_ID --diff-id DATA_DIFF_ID \
+  --sources "$(cat complete-sources.json)"
 ```
 
 Online management selects `RunRoot/PathID/ctl.sock` (also accepts `--sandbox-id`
-and `--run-root`). List returns all visible versions across current and historical DIFFs,
-including versions left by interrupted captures; `--json` emits exact
-`{diff_id,id}` pairs. Deletion selects that fixed set before making changes.
-For a partial deletion, retry the reported identities with repeatable `--diff-id`;
-do not rediscover a changed capture name. New opens fail after logical deletion,
-while already pinned exports finish and delay bounded reclamation. Deletion can
-therefore invalidate a local E/S without immediately returning all space.
+and `--run-root`). List includes visible disk and committed non-Aborted/Deleted
+memory versions as exact `{diff_id,id}` or `{memory_id,id}`. Retry partial deletion
+with the same repeatable `--diff-id`/`--memory-id` set. `complete-sources.json` is
+`{"snapshot_ref":"...","sandbox_ref":"...","retain":[...]}`; each retain item is
+an S/E pair. Optional `ref_locations` maps locations to host directories. Only use
+`{"retain":[]}` for known-empty extra roots; omission/null is rejected. The runtime
+adds its active roots; callers also fence the complete external registry. Backends
+required by descendants cannot be revoked. Revocation rejects new Open; existing
+views continue and physical release may be deferred.
+
 
 ```bash
 sandbox-ctl checkpoint gc --checkpoint-dir /var/lib/sandbox/worker/checkpoint --json
@@ -105,7 +110,7 @@ fixed areas and active roots remain; GC does not truncate files or recycle IDs.
 ```bash
 cd /var/lib/sandbox/worker/checkpoint
 sandbox-ctl publish --to-ref-location archive=file:///var/lib/sandbox/published \
-  --delete-checkpoint --json '<snapshotRef>'
+  --delete-checkpoint --checkpoint-sources "$(cat source-directories.json)" --json '<snapshotRef>'
 ```
 
 Every publish path, including reference replacement/reduction and Bundle inputs,
@@ -119,12 +124,18 @@ aliases and is independent of `removedRefs`. If publication succeeds but cleanup
 fails, CLI status **79** accompanies the still-valid ordinary result/JSON; retry
 cleanup without discarding that result.
 
+`source-directories.json` is an array of `artifact.Checkpoint` objects, each with
+`Directory`, `SandboxID`, current S/E and complete `Retain`. Publication does not
+prove the source unreferenced: missing roots or remaining dependencies fail the
+later deletion. `OpenCheckpoint` returns a typed disk View or memory Root,
+preserving Top/History/HistoryFull/Dirty semantics.
+
 SDK entry points use the same rules: `RuntimeSpec.EnableCheckpoint`,
 `RunOptions.EnableCheckpoint`, `restore.Options.EnableCheckpoint`,
 `ctl.Request.CheckpointID`, `Runtime.ListCheckpoints/DeleteCheckpoint`, and
-`ProcessStorage.ListDiffCheckpoints/DeleteDiffCheckpoint`. After both
+`ProcessStorage.ListCheckpoints/OpenCheckpoint/DeleteCheckpoints`. After both
 `Publisher.PublishWithOptions` and `Publisher.Close` succeed, callers may invoke
-`ProcessStorage.DeletePublishedDiffCheckpoints(ctx, result)` and report that error
+`ProcessStorage.DeletePublishedDiffCheckpoints(ctx, result, sources...)` and report that error
 separately before closing storage. No caller needs to open a Disk to manage
 offline metadata or publish a fixed version.
 

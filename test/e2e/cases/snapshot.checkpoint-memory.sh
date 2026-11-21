@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # e2e-requires: ["docker","kvm","userfaultfd"]
-# Exercise the production holder while ENOSPC prevents its payload publication.
-# Growing the private filesystem releases the fault without a product test hook.
+# Exercise real ENOSPC, then bound each retired holder's output file size so
+# failed payload retries cannot also starve new capture metadata. Both faults
+# are external process/filesystem controls; no product test hook is used.
 set -euo pipefail
 umask 077
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
@@ -47,6 +48,18 @@ REQUEST_PIDS=()
 cleanup() {
     local status=$?
     set +e
+    if [ "$status" -ne 0 ]; then
+        printf 'checkpoint-memory failed (%s -> %s), exit=%s\n' "$FIRST_FORMAT" "$SECOND_FORMAT" "$status" >&2
+        df -PB1 "$CP_DIR" "$WORK" >&2
+        # Native CI retains the case log, so include redirected command errors
+        # before its private OUT directory is collected and removed.
+        local diagnostic
+        for diagnostic in "$OUT"/*.stderr "$OUT"/*.log "$OUT"/*.timing.json; do
+            [ -s "$diagnostic" ] || continue
+            printf 'checkpoint-memory diagnostic: %s\n' "${diagnostic##*/}" >&2
+            tail -80 "$diagnostic" >&2
+        done
+    fi
     for pid in "${REQUEST_PIDS[@]}" "${RUN_PIDS[@]}"; do kill -TERM "$pid" 2>/dev/null; done
     # A failed assertion must not leave an intentionally ENOSPC-blocked holder.
     # Fence only records in this case's private directory and exact generation.
@@ -65,11 +78,18 @@ for path in pathlib.Path(sys.argv[1]).glob('*/checkpoint/memory/*/*.json'):
         pass
 PY
     for pid in "${REQUEST_PIDS[@]}" "${RUN_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
-    if mountpoint -q "$BASE_ROOT"; then umount "$BASE_ROOT"; fi
+    if mountpoint -q "$CP_DIR/diffs"; then umount "$CP_DIR/diffs"; fi
+    if mountpoint -q "$CP_DIR"; then umount "$CP_DIR"; fi
     exit "$status"
 }
 trap cleanup EXIT
-mount -t tmpfs -o size=64m,mode=700 fastpause-e2e "$BASE_ROOT"
+# Limit only publication storage. Restoring an older disk version must be
+# able to materialize its ordinary lower artifacts beside this mount.
+mkdir -p "$CP_DIR"
+mount -t tmpfs -o size=64m,mode=700 fastpause-e2e "$CP_DIR"
+# Live writable DIFFs also need independent capacity while saves fail.
+mkdir -p "$WORK/diffs" "$CP_DIR/diffs"
+mount --bind "$WORK/diffs" "$CP_DIR/diffs"
 if [ ! -f "$FIXTURE_DIRECTORY/root.img" ]; then
     docker image inspect "$E2E_IMAGE" >/dev/null
     docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$FIXTURE_DIRECTORY/root.img" --no-progress
@@ -87,6 +107,11 @@ memory = bytearray(os.urandom(128 * 1024 * 1024))
 expected = hashlib.sha256(memory).hexdigest()
 counter = 0
 while True:
+    # Dirty every page while preserving the expected bytes. Every generation
+    # must have a payload larger than the deliberately small filesystem.
+    for offset in range(0,len(memory),4096):
+        memory[offset] ^= 1
+        memory[offset] ^= 1
     actual = hashlib.sha256(memory).hexdigest()
     if actual != expected: raise RuntimeError('frozen memory corrupted')
     counter += 1
@@ -126,7 +151,11 @@ PY_OWNER_ENOSPC
 check_pending_memory() {
     python3 - "$CP_DIR" "$OUT/first.json" "$OUT/first-record.json" "$RUN_ROOT/$PATH_ID" "$SID" "$1" <<'PY_PENDING_MEMORY'
 import hashlib,json,os,pathlib,stat,sys
-root=pathlib.Path(sys.argv[1]); loc=json.loads((root/'current-memory.json').read_text())
+root=pathlib.Path(sys.argv[1])
+if sys.argv[6]=='initial':
+    loc=json.loads((root/'current-memory.json').read_text())
+else:
+    loc=json.load(open(sys.argv[3]))
 record=root/'memory'/hashlib.sha256(loc['checkpoint_id'].encode()).hexdigest()/(loc['memory_id']+'.json')
 r=json.loads(record.read_text())
 assert (r['checkpoint_id'],r['memory_id'],r['epoch'])==(loc['checkpoint_id'],loc['memory_id'],loc['epoch']), (r,loc)
@@ -161,10 +190,10 @@ start() {
     shift 2
     CURRENT_PATH=$path
     local attempt attempts=1 deadline=$((SECONDS + 30)) log_label status
-    if [ "$label" = resumed ]; then attempts=8; fi
+    if [[ "$label" = resumed || "$label" = branched ]]; then attempts=8; fi
     for attempt in $(seq 1 "$attempts"); do
         log_label=$label
-        if [ "$label" = resumed ]; then
+        if [[ "$label" = resumed || "$label" = branched ]]; then
             [ "$SECONDS" -lt "$deadline" ] || e2e_fail "first RAM restore exceeded its injected-ENOSPC deadline"
             check_pending_memory retry
             log_label="$label-attempt-$attempt"
@@ -179,7 +208,7 @@ start() {
         for _ in $(seq 1 90); do
             if timeout -k 2s 5 "$BIN/sandbox-ctl" exec --path-id "$path" --run-root "$RUN_ROOT" \
                 -- /bin/cat /memory-status >"$OUT/$log_label.status.json" 2>/dev/null; then
-                if [ "$label" = resumed ]; then
+                if [[ "$label" = resumed || "$label" = branched ]]; then
                     [ "$SECONDS" -lt "$deadline" ] || e2e_fail "first RAM restore exceeded its injected-ENOSPC deadline"
                     check_pending_memory ready
                     ln "$OUT/$log_label.log" "$OUT/$label.log"
@@ -192,7 +221,7 @@ start() {
                 unset 'RUN_PIDS[-1]'
                 printf '%s\n' "$status" >"$OUT/$log_label.exit"
                 tail -100 "$OUT/$log_label.log" >&2
-                if [ "$label" = resumed ] && [ "$status" -eq 1 ] && \
+                if [[ "$label" = resumed || "$label" = branched ]] && [ "$status" -eq 1 ] && \
                     owner_enospc "$OUT/$log_label.log"; then
                     check_pending_memory retry
                     if [ "$attempt" -lt "$attempts" ] && [ "$SECONDS" -lt "$deadline" ]; then
@@ -203,7 +232,7 @@ start() {
                 fi
                 e2e_fail "$label exited before readiness (attempt $attempt, status $status)"
             fi
-            if [ "$label" = resumed ] && [ "$SECONDS" -ge "$deadline" ]; then
+            if [[ "$label" = resumed || "$label" = branched ]] && [ "$SECONDS" -ge "$deadline" ]; then
                 e2e_fail "first RAM restore exceeded its injected-ENOSPC deadline"
             fi
             sleep .2
@@ -221,7 +250,7 @@ capture() {
 import json, subprocess, sys, time
 start = time.monotonic()
 with open(sys.argv[1], 'w') as out, open(sys.argv[3], 'w') as err:
-    result = subprocess.run(sys.argv[4:], stdout=out, stderr=err)
+    result = subprocess.run(sys.argv[4:], stdout=out, stderr=err, timeout=30)
 json.dump({'elapsed_seconds': time.monotonic() - start, 'exit': result.returncode}, open(sys.argv[2], 'w'))
 raise SystemExit(result.returncode)
 PY
@@ -254,6 +283,53 @@ PY
     e2e_fail "$label did not resume the memory-checking workload"
 }
 
+
+# A whole-filesystem fault also affects the next snapshot's metadata. Once a
+# holder has actually encountered ENOSPC, retain a payload-only failure using
+# its soft RLIMIT_FSIZE. Small CaptureRecord/identity writes remain possible.
+# Limit only the exact retired holder; never its live successor or hard limit.
+hold_payload_failure() {
+    local id=$1 log=$2
+    python3 - "$CP_DIR" "$OUT/$id-record.json" "$log" "$OUT/$id-file-limit.json" <<'PY_PAYLOAD_LIMIT'
+import json,pathlib,resource,sys,time
+root,record,log,proof=map(pathlib.Path,sys.argv[1:])
+r=json.loads(record.read_text());holder=r['holder']
+assert r['committed'] and r['runtime_retired'] and not r['file_ready'] and not r['ram_released'],r
+def identity():
+    parts=pathlib.Path(f"/proc/{holder['pid']}/stat").read_text().rsplit(')',1)[1].split()
+    assert parts[0]!='Z' and int(parts[19])==holder['start_time'],holder
+deadline=time.monotonic()+30
+while not any('checkpoint memory save retained for retry:' in line and 'no space left on device' in line for line in log.read_text().splitlines()):
+    identity()
+    assert time.monotonic()<deadline,'holder did not encounter the injected ENOSPC'
+    time.sleep(.02)
+identity()
+old=resource.prlimit(holder['pid'],resource.RLIMIT_FSIZE)
+limit=1024*1024
+assert old[0]==resource.RLIM_INFINITY or old[0]>limit,old
+resource.prlimit(holder['pid'],resource.RLIMIT_FSIZE,(limit,old[1]))
+proof.write_text(json.dumps({'holder':holder,'previous':old,'soft_limit':limit}))
+# An already open large partial file is discarded after the failed write.
+# Observe reclaimed capacity before the next producer can publish metadata.
+import os
+while os.statvfs(root).f_bavail*os.statvfs(root).f_frsize<32*1024*1024:
+    identity()
+    assert time.monotonic()<deadline,'holder did not free the failed partial payload'
+    time.sleep(.02)
+print('retired holder payload bounded after real ENOSPC:',r['checkpoint_id'],flush=True)
+PY_PAYLOAD_LIMIT
+}
+release_payload_failure() {
+    python3 - "$OUT/$1-file-limit.json" <<'PY_PAYLOAD_RELEASE'
+import json,pathlib,resource,sys
+p=json.load(open(sys.argv[1]));h=p['holder']
+parts=pathlib.Path(f"/proc/{h['pid']}/stat").read_text().rsplit(')',1)[1].split()
+assert parts[0]!='Z' and int(parts[19])==h['start_time'],h
+assert resource.prlimit(h['pid'],resource.RLIMIT_FSIZE)==(p['soft_limit'],p['previous'][1]),p
+resource.prlimit(h['pid'],resource.RLIMIT_FSIZE,tuple(p['previous']))
+PY_PAYLOAD_RELEASE
+}
+
 start cold "$PATH_ID" --config "$WORK/cold.yaml" --enable-checkpoint
 FIRST_RUN=$RUN_PID
 capture first "$FIRST_FORMAT"
@@ -262,6 +338,7 @@ S_FIRST="$(snapshot_path first)"
 "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/publish.yaml" \
     --ref-location "fixture=file://$FIXTURE_DIRECTORY" "$S_FIRST" >"$OUT/first-info.json"
 check_pending_memory initial
+hold_payload_failure first "$OUT/cold.log"
 
 start resumed "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_FIRST" --enable-checkpoint
 SECOND_RUN=$RUN_PID
@@ -276,86 +353,103 @@ PY
 "$BIN/sandbox-ctl" publish --json --manifest-config "$WORK/publish.yaml" \
     --ref-location "fixture=file://$FIXTURE_DIRECTORY" \
     --to-ref-location "portable=file://$WORK/published" "$S_FIRST" >"$OUT/published.json" 2>"$OUT/published.stderr"
-if capture rejected "$SECOND_FORMAT" --no-wait-for-previous-memory-save; then e2e_fail "no-wait captured a second pending generation"; fi
-assert_contains "$OUT/rejected.stderr" "previous checkpoint memory save is pending"
-guest /bin/true
-# The default request waits while the successor remains executable. Its
-# cancellation must finish before unblocking the dump, so the live successor
-# cannot be retired by a competing second capture during our directory check.
-timeout -k 2s 1 "$BIN/sandbox-ctl" snapshot --path-id "$PATH_ID" --run-root "$RUN_ROOT" \
-    --checkpoint cancelled --mode "$SECOND_FORMAT" --json >"$OUT/cancelled.json" 2>"$OUT/cancelled.stderr" &
-WAIT_PID=$!
-REQUEST_PIDS+=("$WAIT_PID")
-sleep .2
-kill -0 "$WAIT_PID" || e2e_fail "default pause did not wait for previous memory"
-guest /bin/true
-python3 - "$CP_DIR" "$OUT/first-record.json" <<'PY'
-import json,pathlib,sys
-root=pathlib.Path(sys.argv[1]); first=json.load(open(sys.argv[2]))
-loc=json.loads((root/'current-memory.json').read_text())
-assert loc['memory_id']==first['memory_id'], (loc,first)
-assert len(list((root/'memory').glob('*/*.json')))==1, 'waiting request created another holder'
-PY
-set +e
-wait "$WAIT_PID"
-CANCELLED_STATUS=$?
-set -e
-REQUEST_PIDS=()
-[ "$CANCELLED_STATUS" -eq 124 ] || e2e_fail "waiting capture was not cancellable: $CANCELLED_STATUS"
-guest /bin/true
-# The normal writer retries and publishes; the live restored reader switches
-# to that file even without another explicit restore or export request.
-mount -o remount,size=512m "$BASE_ROOT"
-wait "$FIRST_RUN"
-kill -0 "$SECOND_RUN" || e2e_fail "old holder completion stopped the live successor"
-python3 - "$RUN_ROOT/$PATH_ID" "$SID" "$OUT/resumed-run-identity.json" "$OUT/first-record.json" "$CP_DIR" <<'PY'
-import hashlib,json,os,pathlib,sys
-run=pathlib.Path(sys.argv[1]); pid=run/(sys.argv[2]+'.pid'); expected=json.load(open(sys.argv[3]))
-a,b=run.lstat(),pid.lstat()
-assert [a.st_dev,a.st_ino]==expected['run'] and [b.st_dev,b.st_ino]==expected['pid_file'], expected
-assert pid.read_text()==expected['pid'] and (run/'ctl.sock').is_socket(), expected
-original=json.load(open(sys.argv[4])); root=pathlib.Path(sys.argv[5])
-r=json.loads((root/'memory'/hashlib.sha256(original['checkpoint_id'].encode()).hexdigest()/(original['memory_id']+'.json')).read_text())
-assert (r['memory_id'],r['epoch'])==(original['memory_id'],original['epoch']), r
-assert r['file_ready'] and r['ram_released'], r
-assert not os.path.lexists(r['holder']['directory']['path']), r
-PY
-guest /bin/true
-check_memory resumed
-capture second "$SECOND_FORMAT"
-wait "$SECOND_RUN"
-python3 - "$CP_DIR" "$OUT/first-record.json" "$FIRST_FORMAT" "$SECOND_FORMAT" <<'PY'
-import hashlib,json,pathlib,sys,tarfile,zipfile
-root=pathlib.Path(sys.argv[1]); original=json.load(open(sys.argv[2]))
-records={r['checkpoint_id']:r for r in (json.loads(p.read_text()) for p in (root/'memory').glob('*/*.json'))}
-assert set(records)=={'first','second'}, records.keys()
-for r in records.values():
-    assert r['runtime_retired'] and r['file_ready'] and r['ram_released'], r
-    assert not pathlib.Path(r['holder']['socket_path']).exists(), r
-assert records['second']['memory_id']!=original['memory_id']
-for checkpoint,mode in zip(('first','second'),sys.argv[3:5]):
-    r=records[checkpoint]
-    ref=r['payload_ref']
-    assert ref.startswith('file://'),ref
-    name=ref[7:].split('@',1)[0]
-    assert pathlib.Path(name).name==name,ref
-    carrier=root/name
-    if mode=='bundle':
-        assert '@manifest:' in ref and zipfile.is_zipfile(carrier), ('Bundle capture fell back to tarstream',ref)
-    else:
-        assert '@digest:' in ref and tarfile.is_tarfile(carrier), ('tarstream capture used unexpected format',ref)
-PY
+# The second pause creates a second holder while the first still cannot save.
+capture second "$SECOND_FORMAT" --no-wait-for-previous-memory-save
 S_SECOND="$(snapshot_path second)"
-start next-resume "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_SECOND" --enable-checkpoint
+python3 - "$CP_DIR" "$OUT/first-record.json" "$OUT/second-record.json" "$OUT/second.json" "$OUT/keep-second.json" "$FIXTURE_DIRECTORY" <<'PY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); loc=json.loads((root/'current-memory.json').read_text())
+r=json.loads((root/'memory'/hashlib.sha256(loc['checkpoint_id'].encode()).hexdigest()/(loc['memory_id']+'.json')).read_text())
+first=json.load(open(sys.argv[2]));assert r['checkpoint_id']=='second' and r['memory_id']!=first['memory_id'],r
+for record in (r,json.loads((root/'memory'/hashlib.sha256(first['checkpoint_id'].encode()).hexdigest()/(first['memory_id']+'.json')).read_text())):
+    assert record['committed'] and record['runtime_retired'] and not record['file_ready'] and not record['ram_released'],record
+json.dump(r,open(sys.argv[3],'w'))
+result=json.load(open(sys.argv[4]))
+json.dump({'retain':[{'snapshot_ref':result['snapshotRef'],'sandbox_ref':result['sandboxRef']}], 'ref_locations':{'fixture':sys.argv[6]}},open(sys.argv[5],'w'))
+PY
+hold_payload_failure second "$OUT/resumed.log"
+FIRST_MEMORY="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["memory_id"])' "$OUT/first-record.json")"
+SECOND_MEMORY="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["memory_id"])' "$OUT/second-record.json")"
+# Removing a parent backend is forbidden while the child is a durable root.
+if "$BIN/sandbox-ctl" checkpoint delete --checkpoint-dir "$CP_DIR" --producer-id "$SID" \
+    --checkpoint first --memory-id "$FIRST_MEMORY" --manifest-config "$WORK/publish.yaml" \
+    --sources "$(cat "$OUT/keep-second.json")" >"$OUT/referenced-delete.json" 2>"$OUT/referenced-delete.stderr"; then
+    e2e_fail "referenced parent was revoked"
+fi
+assert_contains "$OUT/referenced-delete.stderr" "durable source"
+
+# Restore an older branch while both obligations exist. The current locator
+# names second, but the selected source is first; neither selects the RAM ledger.
+start branched "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_FIRST" --enable-checkpoint
+THIRD_RUN=$RUN_PID
+check_memory branched
+python3 - "$RUN_ROOT/$PATH_ID" "$SID" "$OUT/branched-run-identity.json" <<'PY'
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1]);pid=run/(sys.argv[2]+'.pid');a,b=run.lstat(),pid.lstat()
+json.dump({'run':[a.st_dev,a.st_ino],'pid_file':[b.st_dev,b.st_ino],'pid':pid.read_text()},open(sys.argv[3],'w'))
+PY
+"$BIN/sandbox-ctl" checkpoint list --path-id "$PATH_ID" --run-root "$RUN_ROOT" --json >"$OUT/versions-before-delete.json"
+python3 - "$OUT/versions-before-delete.json" <<'PY'
+import json,sys
+assert {r['id'] for r in json.load(open(sys.argv[1])) if r.get('memory_id')}=={'first','second'}
+PY
+# Second has no remaining root on this branch. Its cancellation does not need
+# directory EX, so first's holder and the running third instance cannot block it.
+"$BIN/sandbox-ctl" checkpoint delete --path-id "$PATH_ID" --run-root "$RUN_ROOT" \
+    --checkpoint second --memory-id "$SECOND_MEMORY" --sources '{"retain":[]}' --json >"$OUT/deleted-second.json"
+wait "$SECOND_RUN"
+check_pending_memory ready
+python3 - "$CP_DIR" "$OUT/second-record.json" "$RUN_ROOT/$PATH_ID" "$SID" "$OUT/branched-run-identity.json" <<'PY'
+import hashlib,json,os,pathlib,sys
+root=pathlib.Path(sys.argv[1]);old=json.load(open(sys.argv[2]))
+r=json.loads((root/'memory'/hashlib.sha256(old['checkpoint_id'].encode()).hexdigest()/(old['memory_id']+'.json')).read_text())
+assert r['deleted'] and r['ram_released'] and r['discarded'] and not r['file_ready'],r
+assert not os.path.lexists(r['holder']['directory']['path']),r
+run=pathlib.Path(sys.argv[3]);pid=run/(sys.argv[4]+'.pid');expected=json.load(open(sys.argv[5]));a,b=run.lstat(),pid.lstat()
+assert [a.st_dev,a.st_ino]==expected['run'] and [b.st_dev,b.st_ino]==expected['pid_file'] and pid.read_text()==expected['pid'],expected
+assert (run/'ctl.sock').is_socket()
+PY
+check_memory branched
+# The two pending holders and independent cancellation were observed above.
+# Release the fault before capturing the materialized branch: preserving its
+# disk lower artifacts is unrelated to the frozen-memory obligation test.
+mount -o remount,size=512m "$CP_DIR"
+release_payload_failure first
+wait "$FIRST_RUN"
+capture third "$SECOND_FORMAT"
+S_THIRD="$(snapshot_path third)"
+wait "$THIRD_RUN"
+python3 - "$CP_DIR" <<'PY'
+import json,pathlib,sys
+records={r['checkpoint_id']:r for r in (json.loads(p.read_text()) for p in (pathlib.Path(sys.argv[1])/'memory').glob('*/*.json'))}
+assert set(records)=={'first','second','third'},records
+assert len({r['memory_id'] for r in records.values()})==3,records
+assert records['second']['deleted'] and records['second']['ram_released'],records['second']
+PY
+python3 - "$CP_DIR" "$FIRST_FORMAT" "$SECOND_FORMAT" <<'PY'
+import json,pathlib,sys,tarfile,zipfile
+root=pathlib.Path(sys.argv[1]);records={r['checkpoint_id']:r for r in (json.loads(p.read_text()) for p in (root/'memory').glob('*/*.json'))}
+for checkpoint,mode in zip(('first','third'),sys.argv[2:4]):
+    r=records[checkpoint]
+    assert r['runtime_retired'] and r['file_ready'] and r['ram_released'] and not r.get('deleted'),r
+    assert not pathlib.Path(r['holder']['socket_path']).exists(),r
+    ref=r['payload_ref'];assert ref.startswith('file://'),ref
+    name=ref[7:].split('@',1)[0];assert pathlib.Path(name).name==name,ref
+    if mode=='bundle':assert '@manifest:' in ref and zipfile.is_zipfile(root/name),ref
+    else:assert '@digest:' in ref and tarfile.is_tarfile(root/name),ref
+PY
+start next-resume "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_THIRD" --enable-checkpoint
 check_memory next-resume
 kill -TERM "$RUN_PID"
 wait "$RUN_PID" || true
 PORTABLE_REF="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshotRef"])' "$OUT/published.json")"
-mv "$CP_DIR" "$CP_DIR.hidden"
+# Removing the dedicated publication mount makes every local capture
+# unavailable, so the published snapshot must restore independently.
+umount "$CP_DIR/diffs"
+umount "$CP_DIR"
 start portable "portable-$PATH_ID" --config "$WORK/restore.yaml" --restore "$PORTABLE_REF" \
     --manifest-config "$WORK/publish.yaml" --ref-location "portable=file://$WORK/published"
 check_memory portable
 kill -TERM "$RUN_PID"
 wait "$RUN_PID" || true
-mv "$CP_DIR.hidden" "$CP_DIR"
 echo "PASS snapshot.checkpoint-memory.sh ($FIRST_FORMAT -> $SECOND_FORMAT)"

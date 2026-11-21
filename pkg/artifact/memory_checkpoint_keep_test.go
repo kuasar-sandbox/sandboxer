@@ -16,7 +16,7 @@ import (
 )
 
 func TestCleanupCheckpointRetainsLocalMemoryLowers(t *testing.T) {
-	for _, rootKind := range []string{"ordinary", "local", "current-only"} {
+	for _, rootKind := range []string{"ordinary", "local", "retained-only"} {
 		for _, located := range []bool{false, true} {
 			name := rootKind + "/direct"
 			if located {
@@ -61,8 +61,8 @@ func TestCleanupCheckpointRetainsLocalMemoryLowers(t *testing.T) {
 					if err := sink.Close(); err != nil {
 						t.Fatal(err)
 					}
-				} else if rootKind == "current-only" {
-					rootRef = "" // Current SID memory remains an independent keep root.
+				} else if rootKind == "retained-only" {
+					rootRef = "" // Only the explicit named source retains this history.
 				}
 				// An unrelated malformed record cannot invalidate another exact
 				// historical proof and make GC discard its still-referenced data.
@@ -75,8 +75,25 @@ func TestCleanupCheckpointRetainsLocalMemoryLowers(t *testing.T) {
 				if err := os.WriteFile(garbage, []byte("unreferenced"), 0600); err != nil {
 					t.Fatal(err)
 				}
-				if err := fixture.storage.CleanupCheckpoint(ctx, Checkpoint{Directory: fixture.directory,
-					SandboxID: "sid", SnapshotRef: rootRef, SandboxRef: fixture.eRef, RefLocations: locations}); err != nil {
+				checkpoint := Checkpoint{Retain: []CheckpointSource{}, Directory: fixture.directory, SandboxID: "sid", SnapshotRef: rootRef, SandboxRef: fixture.eRef, RefLocations: locations}
+				if rootKind == "retained-only" {
+					checkpoint.Retain = append(checkpoint.Retain, CheckpointSource{SnapshotRef: currentRef, SandboxRef: fixture.eRef})
+				}
+				if err := fixture.storage.CleanupCheckpoint(ctx, checkpoint); err == nil {
+					t.Fatal("incomplete capture inventory permitted deletion")
+				}
+				if _, err := os.Stat(garbage); err != nil {
+					t.Fatal("failed inventory deleted a file", err)
+				}
+				for _, name := range []string{"000-corrupt.json", "unknown.json"} {
+					if err := os.Remove(filepath.Join(fixture.directory, "memory", name)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.Remove(filepath.Join(fixture.directory, "current-memory.json")); err != nil {
+					t.Fatal(err)
+				}
+				if err := fixture.storage.CleanupCheckpoint(ctx, checkpoint); err != nil {
 					t.Fatal(err)
 				}
 				for _, id := range []string{"one", "lower"} {
@@ -140,7 +157,7 @@ func TestCleanupCheckpointOrdinaryMemoryLowersRemainOpaque(t *testing.T) {
 			if err := sink.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{Directory: fixture.directory,
+			if err := fixture.storage.CleanupCheckpoint(context.Background(), Checkpoint{Retain: []CheckpointSource{}, Directory: fixture.directory,
 				SandboxID: "sid", SnapshotRef: root, SandboxRef: fixture.eRef, RefLocations: locations}); err != nil {
 				t.Fatalf("cleanup opened an ordinary memory lower: %v", err)
 			}

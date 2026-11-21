@@ -120,6 +120,9 @@ func RecoverMemoryRelease(ctx context.Context, capturePath string, expected Capt
 	err = w.Update(func(r *CaptureRecord) {
 		if r.Committed {
 			r.RAMReleased = true
+			if r.Deleted && !r.FileReady {
+				r.Discarded = true
+			}
 		} else {
 			r.Aborted = true
 		}

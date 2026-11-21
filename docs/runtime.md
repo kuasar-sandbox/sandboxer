@@ -615,20 +615,30 @@ If memory readers still pin the checkpoint, managed cleanup defers its garbage
 collection and completes ordinary runtime cleanup. This does not wait for the
 save or weaken reader protection; see [selective cleanup](artifacts.md#checkpoint-history).
 
-A resumed runtime inherits the previous save obligation by SandboxID, even when
-restoring an older checkpoint. A capture that can add another frozen-RAM
-obligation waits for actual `RAMReleased` by default, before freezing or changing
-its running state; `FileReady` alone does not end the wait. This applies to both
-formats regardless of whether the caller waits for background completion.
-Disk-only captures and known synchronous-only runtimes add no such obligation. The CLI option
-`--no-wait-for-previous-memory-save` and SDK request field
-`NoWaitForPreviousMemorySave` reject the request while it is pending. Cancelling
-this wait leaves the runtime running and does not cancel the previous save.
-The full pause duration includes this admission wait. If the exact producer has
-exited without publishing a file while RAM readers remain, a default wait reports
-that the previous save is unavailable without entering pausing. It keeps observing
-the physical obligation. Once RAMReleased is confirmed, an older lost source or
-SaveError does not block a runtime restored from another intact checkpoint.
+Multiple holders may coexist for one SID. A new Pause never waits for an older
+RAM release, for either Bundle or tarstream. `noWaitForPreviousMemorySave` and
+`NoWaitForPreviousMemorySave` remain accepted compatibility inputs without a
+previous-save gate. Restore adopts every unsettled SID obligation from the
+authoritative node inventory, independent of the chosen checkpoint or branch:
+Q = B + ΣRi. Each exact capture Ri is charged once in its original SourcePool;
+the target pool admits new B/cache. ReservationMemory, balloon, StateSync, Guest
+Capacity and startup still describe B only. The next freeze converts only B to
+another Ri. Name deletion or FileReady never reduces the ledger; exact durable
+RAMReleased settlement does. Historical loss does not block a successor restored
+from an intact source, but any remaining RAM still requires release proof.
+
+Receipt v2 separates the holding/adopting/active SID account header from its
+prepared/held/settled capture entries. `checkpoint_memory_handoff_v2` sends a
+fixed-size account ID/revision and handoff identity, not the collection in a
+64 KiB frame. First acceptance charges candidate B/cache before persisting its
+intent. Replay keeps that exact contract despite Ri settlement and revision
+changes. Admission failure preserves old R; failed restore releases only its B.
+Final Ri settlement cannot erase a pending candidate. Restart inventories every
+holder's source lease/process/cgroup; settled entries retain zero-charge identity
+while discovery could mistake them for active B. Empty headers retire at the SID
+terminal boundary. Per-generation Abort/Release matches the exact capture and
+operation; only terminal deletion checks all R. CaptureState lifecycle version 2
+and the resource capability must match; old peers cannot partially adopt a set.
 
 `Runtime.Wait` and `Close` still end ordinary runtime ownership, including
 borrowed storage. A process embedding the SDK must remain alive until
@@ -803,9 +813,17 @@ usage_request    -> usage_response | error
 resource_stats_request -> resource_stats_response | error
 checkpoint_snapshot_request -> snapshot_done | error
 checkpoint_export_request   -> export_done | error
-checkpoint_list_request     -> checkpoint_list_chunk* -> checkpoint_list_done | error
-checkpoint_delete_request   -> checkpoint_delete_done | error
+checkpoint_list_request_v2     -> checkpoint_list_chunk_v2* -> checkpoint_list_done_v2 | error
+checkpoint_delete_request_v2   -> checkpoint_delete_done_v2 | error
 ```
+
+Large delete requests use `checkpoint_delete_stream_request_v2` with the exact
+JSON byte count, followed by `checkpoint_delete_ready_v2`, bounded
+`checkpoint_delete_chunk_v2` frames and `checkpoint_delete_commit_v2`. The owner
+invokes deletion only after receiving the complete original request and explicit
+commit. Every frame retains the 64 KiB limit; the complete `retain` graph is never
+split into independently deletable subsets. Incomplete input has no deletion
+effect. Both the selected references and source inputs stay fixed across batches.
 
 Named captures use the dedicated checkpoint request types and a nonempty
 `checkpoint_id`. They reuse the existing capture responses and output fields;
@@ -814,7 +832,7 @@ An unsupported owner reports `code: "checkpoint_unsupported"`; the client also
 recognizes an older server's unknown-type reply for these two capture types.
 Neither case silently falls back to a disk-copy capture.
 
-A list chunk contains at most 128 exact `{diff_id,id}` references in
+A list chunk contains at most 128 exact `{diff_id,id}` or `{memory_id,id}` references in
 `checkpoints`; the final frame carries `checkpoint_count`, including zero for an
 empty list. EOF without the final matching count is an incomplete list, not a
 successful prefix. Delete requests contain the already selected
@@ -822,6 +840,11 @@ successful prefix. Delete requests contain the already selected
 `checkpoint_owner`, checked against the live owner's token; this route does not
 grant ownership to explicit offline management. Retries retain the same exact
 reference set after partial progress.
+
+V2 Delete requires `checkpoint_sources` with the complete additional `retain`
+set. Explicit `[]` is known empty; omitted/null is rejected. The caller keeps its
+external registry fence and the runtime adds its roots. An old management peer's
+unknown-type reply fails explicitly, never as partial success.
 
 The sole reaper ends live resource observations as soon as `waitid(WEXITED|WNOWAIT)` confirms VMM exit, before the existing final usage sample and `cmd.Wait`. The same exit notification applies when usage is disabled, without adding samples or changing stop/save behavior. During exit, only effective specification fields remain; an exited VMM receives no fresh host observation timestamp.
 

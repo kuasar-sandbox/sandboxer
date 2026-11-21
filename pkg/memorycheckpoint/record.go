@@ -56,6 +56,7 @@ type CaptureRecord struct {
 	Committed       bool           `json:"committed"`
 	Aborted         bool           `json:"aborted,omitempty"`
 	Discarded       bool           `json:"discarded,omitempty"`
+	Deleted         bool           `json:"deleted,omitempty"`
 	RuntimeRetired  bool           `json:"runtime_retired"`
 	FileReady       bool           `json:"file_ready"`
 	RAMReleased     bool           `json:"ram_released"`
@@ -71,8 +72,11 @@ func (r CaptureRecord) Validate() error {
 		}
 	}
 
-	if r.Version != Version || !validCheckpointID(r.CheckpointID) || !validID(r.MemoryID) || r.Epoch == 0 || r.Producer.SandboxID == "" {
+	if (r.Version != Version && r.Version != RecordVersion) || !validCheckpointID(r.CheckpointID) || !validID(r.MemoryID) || r.Epoch == 0 || r.Producer.SandboxID == "" {
 		return errors.New("memory checkpoint: invalid capture identity")
+	}
+	if r.Deleted && (r.Version != RecordVersion || !r.Committed) {
+		return errors.New("memory checkpoint: invalid deleted capture")
 	}
 	if r.Aborted && (r.Committed || r.FileReady || (r.RuntimeRetired || r.RAMReleased) && !r.Discarded) {
 		return errors.New("memory checkpoint: aborted committed capture")
@@ -92,11 +96,13 @@ func (r CaptureRecord) Validate() error {
 // Lost separates source availability from the completed physical RAM obligation.
 // A later runtime based on an intact source may proceed once RAMReleased is true.
 func (r CaptureRecord) Lost() bool {
-	return r.Committed && r.RuntimeRetired && r.RAMReleased && !r.FileReady && !r.Aborted && !r.Discarded
+	return r.Committed && r.RuntimeRetired && r.RAMReleased && !r.FileReady && !r.Aborted && !r.Discarded && !r.Deleted
 }
 
 func sameCaptureIdentity(a, b CaptureRecord) bool {
-	return a.Version == b.Version && a.Producer == b.Producer && a.CheckpointID == b.CheckpointID && a.HostOperationID == b.HostOperationID && a.MemoryID == b.MemoryID && a.Epoch == b.Epoch && a.Holder == b.Holder
+	// A legacy record may be upgraded when its name is revoked. The schema
+	// version is not a capture identity; all physical and operation IDs are.
+	return a.Producer == b.Producer && a.CheckpointID == b.CheckpointID && a.HostOperationID == b.HostOperationID && a.MemoryID == b.MemoryID && a.Epoch == b.Epoch && a.Holder == b.Holder
 }
 
 // RecordPath with a memoryID names one immutable attempt. Without one it
@@ -485,11 +491,8 @@ func reserveRecordWithSync(directory string, record CaptureRecord, syncDirectory
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fail(err)
 	}
-	if old, err := ReadCurrent(directory); err == nil && !old.RAMReleased && !old.Aborted {
-		return fail(ErrSavePending)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fail(err)
-	}
+	// The latest locator is only a hint. Different checkpoint IDs may retain
+	// independent holders; runtime admission accounts for their complete set.
 	if err = os.MkdirAll(filepath.Dir(p), 0700); err != nil {
 		return fail(err)
 	}
@@ -523,6 +526,12 @@ func (w *RecordWriter) Update(update func(*CaptureRecord)) error {
 	defer w.mu.Unlock()
 	r := w.record
 	update(&r)
+	if r.Deleted {
+		r.Version = RecordVersion
+	}
+	if r.Version < w.record.Version || w.record.Deleted && !r.Deleted {
+		return errors.New("memory checkpoint: nonmonotonic record lifecycle")
+	}
 	if !sameCaptureIdentity(r, w.record) || w.record.RAMReleased && !w.record.FileReady && r.FileReady || w.record.Aborted && !r.Aborted || w.record.Discarded && !r.Discarded || w.record.Committed && !r.Committed || w.record.RuntimeRetired && !r.RuntimeRetired || w.record.FileReady && !r.FileReady || w.record.RAMReleased && !r.RAMReleased || w.record.SnapshotRef != "" && w.record.SnapshotRef != r.SnapshotRef || w.record.SandboxRef != "" && w.record.SandboxRef != r.SandboxRef || w.record.PayloadRef != "" && w.record.PayloadRef != r.PayloadRef {
 		return errors.New("memory checkpoint: nonmonotonic record update")
 	}

@@ -169,7 +169,7 @@ type Runtime struct {
 	checkpointOwner                    *diffstore.DirectoryOwner
 	checkpointMaintenance              *diffstore.DirectoryMaintenance
 	listCheckpoints                    func(context.Context) ([]artifact.DiffCheckpointRef, error)
-	deleteCheckpoint                   func(context.Context, artifact.DiffCheckpointRef) error
+	deleteCheckpoint                   func(context.Context, artifact.CheckpointRef, ctl.CheckpointSources) error
 	consoleTTY                         atomic.Bool
 	mu                                 sync.Mutex
 	opsWG                              sync.WaitGroup
@@ -444,13 +444,14 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 	if allocBytes < capBytes || initial < capBytes {
 		r.balloon = resctl.NewBalloonController(chSock, capBytes, cfg.CHApiDeadline(), r.logf)
 	}
-	hookOptions := resctl.ControllerHookOptions{SocketPath: cfg.Resources.Control.Controller, SandboxID: sid, Context: engineCtx, Logf: r.logf}
-	if spec.EnableCheckpoint {
-		hookOptions.Retained, err = PreviousCaptureRetention(filepath.Join(r.baseDir, "checkpoint"), sid)
-		if err != nil {
-			return nil, err
-		}
+	// Account responsibility follows SID even when this run disables future
+	// checkpoints or restores a portable source unrelated to existing holders.
+	hookOptions := resctl.ControllerHookOptions{SocketPath: cfg.Resources.Control.Controller, SandboxID: sid, Context: engineCtx, Logf: r.logf, CheckpointAccount: true}
+	hookOptions.Retained, err = PreviousCaptureRetention(filepath.Join(r.baseDir, "checkpoint"), sid)
+	if err != nil {
+		return nil, err
 	}
+
 	hooks, err := resctl.NewControllerHooks(hookOptions, cfg)
 	if err != nil {
 		return nil, err

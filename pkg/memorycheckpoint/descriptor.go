@@ -18,6 +18,11 @@ import (
 )
 
 const Version = 1
+
+// RecordVersion changes only the local lifecycle protocol. The immutable
+// descriptor and data encodings keep Version. Old readers reject these records
+// rather than silently ignoring a revoked checkpoint.
+const RecordVersion = 2
 const pageSize = 4096
 
 type Descriptor struct {

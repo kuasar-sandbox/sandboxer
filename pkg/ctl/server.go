@@ -200,11 +200,26 @@ func (s *Server) handle(conn *net.UnixConn) {
 			s.Logf("checkpoint list: %v", err)
 		}
 		return
-	case TypeCheckpointDeleteRequest:
+	case TypeCheckpointDeleteRequest, TypeCheckpointDeleteStreamRequest:
 		defer conn.Close()
 		if s.CheckpointDeleteHandler == nil {
 			_ = WriteMessage(conn, Response{Type: TypeError, Code: CheckpointUnsupportedCode, Msg: CheckpointUnsupportedCode})
 			return
+		}
+		if req.Type == TypeCheckpointDeleteStreamRequest {
+			if req.BodyBytes <= 0 {
+				_ = WriteMessage(conn, Response{Type: TypeError, Msg: "checkpoint delete: invalid input size"})
+				return
+			}
+			if err := WriteMessage(conn, Response{Type: TypeCheckpointDeleteReady}); err != nil {
+				return
+			}
+			complete, err := readCheckpointDeleteRequest(conn, req.BodyBytes)
+			if err != nil {
+				_ = WriteMessage(conn, Response{Type: TypeError, Msg: err.Error()})
+				return
+			}
+			req = complete
 		}
 		if err := s.CheckpointDeleteHandler(req); err != nil {
 			code := ""

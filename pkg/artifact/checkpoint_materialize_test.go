@@ -248,7 +248,7 @@ func TestCleanupCheckpointKeepsOnlyCurrentDiskVersions(t *testing.T) {
 	if err := f.owner.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.CleanupCheckpoint(ctx, Checkpoint{Directory: f.dir, SandboxID: "fixture", SandboxRef: f.ref}); err != nil {
+	if err := storage.CleanupCheckpoint(ctx, Checkpoint{Retain: []CheckpointSource{}, Directory: f.dir, SandboxID: "fixture", SandboxRef: f.ref}); err != nil {
 		t.Fatal(err)
 	}
 	refs, err := storage.ListDiffCheckpoints(ctx, f.dir)
@@ -309,7 +309,7 @@ func TestCleanupCheckpointValidatesEveryDIFFIdentityBeforeMutation(t *testing.T)
 	}
 	storage, _ := NewProcessStorage(nil)
 	defer storage.Close()
-	if err := storage.CleanupCheckpoint(ctx, Checkpoint{Directory: f.dir, SandboxID: "fixture", SandboxRef: f.ref}); err == nil {
+	if err := storage.CleanupCheckpoint(ctx, Checkpoint{Retain: []CheckpointSource{}, Directory: f.dir, SandboxID: "fixture", SandboxRef: f.ref}); err == nil {
 		t.Fatal("cleanup accepted a mismatched DIFF")
 	}
 	for _, id := range []string{"root-1", "data-1", "data-2"} {
@@ -362,7 +362,7 @@ func TestCleanupRetiredDIFFKeepsRetryUntilExistingReaderCloses(t *testing.T) {
 	defer view.Close()
 	storage, _ := NewProcessStorage(nil)
 	defer storage.Close()
-	current := Checkpoint{Directory: f.dir, SandboxID: "fixture", SandboxRef: f.ref}
+	current := Checkpoint{Retain: []CheckpointSource{}, Directory: f.dir, SandboxID: "fixture", SandboxRef: f.ref}
 	if err := storage.CleanupCheckpoint(ctx, current); !errors.Is(err, diffstore.ErrBusy) || errors.Is(err, ErrCheckpointMemoryReadersBusy) {
 		t.Fatalf("retire lost retry ownership: %v", err)
 	}

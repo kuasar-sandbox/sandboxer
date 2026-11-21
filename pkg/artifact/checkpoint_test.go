@@ -106,7 +106,7 @@ func checkpointFixture(t *testing.T, dir string) (Checkpoint, string, []string) 
 		}
 		return r.Path
 	}
-	return Checkpoint{Directory: dir, SandboxID: "sid", SandboxRef: e, SnapshotRef: s}, name(oldE), []string{name(e), name(s), name(history), leaf, "sid.sandbox", "sid.snapshot"}
+	return Checkpoint{Retain: []CheckpointSource{}, Directory: dir, SandboxID: "sid", SandboxRef: e, SnapshotRef: s}, name(oldE), []string{name(e), name(s), name(history), leaf, "sid.sandbox", "sid.snapshot"}
 }
 
 func TestCleanupCheckpointRolesNamesAndNoPayloadScans(t *testing.T) {
@@ -211,7 +211,7 @@ func TestCleanupCheckpointRetainedRootsAndPrimaryAliases(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(dir, "sid.snapshot")); !os.IsNotExist(err) {
 		t.Fatalf("retained source replaced current E-only alias: %v", err)
 	}
-	c.Retain = nil
+	c.Retain = []CheckpointSource{}
 	if err := storage.CleanupCheckpoint(context.Background(), c); err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +307,7 @@ func TestCleanupCheckpointBundleMembersAndMixedCarriers(t *testing.T) {
 	}
 	eKey, _ := manifest.ParseRef(info.Snapshot.SandboxRef)
 	eRef := (manifest.Ref{Scheme: manifest.RefSchemeFile, Path: filepath.Base(bundlePath), DigestScheme: "manifest", Digest: eKey.Path}).String()
-	c := Checkpoint{Directory: dir, SandboxID: "exact", SnapshotRef: sRef, SandboxRef: eRef}
+	c := Checkpoint{Retain: []CheckpointSource{}, Directory: dir, SandboxID: "exact", SnapshotRef: sRef, SandboxRef: eRef}
 	junk := filepath.Join(dir, strings.Repeat("9", 64)+".bundle")
 	if err := os.WriteFile(junk, []byte("interrupted final"), 0600); err != nil {
 		t.Fatal(err)

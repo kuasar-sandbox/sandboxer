@@ -19,7 +19,7 @@ func TestAbortRetainedRetryCompletesReleasedRuntime(t *testing.T) {
 	server := startReservationServer(t, func(req resource.Message) (*resource.Message, bool) {
 		switch req.Type {
 		case resource.TypeAdmit:
-			return &resource.Message{Type: resource.TypeAdmitResponse, Status: resource.StatusAdmitted, Token: "original-token", GrantedInitialAlloc: 128 << 20, ClientFeatures: []string{resource.FeatureRetainedMemoryV1}}, false
+			return &resource.Message{Type: resource.TypeAdmitResponse, Status: resource.StatusAdmitted, Token: "original-token", GrantedInitialAlloc: 128 << 20, ClientFeatures: []string{resource.FeatureRetainedMemoryV2}}, false
 		case resource.TypePrepareRetained:
 			return &resource.Message{Type: resource.TypeAck, Retained: &resource.RetainedMemory{MemoryID: capture.MemoryID, Epoch: capture.Epoch}}, false
 		case resource.TypeAbortRetained:
@@ -92,7 +92,7 @@ func TestLateAbortDoesNotReleaseSuccessorRetention(t *testing.T) {
 	server := startReservationServer(t, func(req resource.Message) (*resource.Message, bool) {
 		switch req.Type {
 		case resource.TypeAdmit:
-			return &resource.Message{Type: resource.TypeAdmitResponse, Status: resource.StatusAdmitted, Token: "token", GrantedInitialAlloc: 128 << 20, ClientFeatures: []string{resource.FeatureRetainedMemoryV1}}, false
+			return &resource.Message{Type: resource.TypeAdmitResponse, Status: resource.StatusAdmitted, Token: "token", GrantedInitialAlloc: 128 << 20, ClientFeatures: []string{resource.FeatureRetainedMemoryV2}}, false
 		case resource.TypePrepareRetained:
 			return &resource.Message{Type: resource.TypeAck, Retained: &resource.RetainedMemory{MemoryID: req.Retention.MemoryID, Epoch: req.Retention.Epoch}}, false
 		case resource.TypeRelease:

@@ -776,13 +776,6 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			p.owner.hooks = p.Hooks
 		}
 	}
-	if enabled {
-		previous, err := newPreviousMemorySave(snapHandler.CheckpointDir, p.SandboxID)
-		if err != nil {
-			return -1, err
-		}
-		snapHandler.previousMemory = previous
-	}
 	// Runtime cleanup covers Launch and initialization failures. Restore closes
 	// this borrower before its outer disk and directory-owner closers.
 	if p.owner == nil || p.EnableCheckpoint {
@@ -817,10 +810,10 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 					return nil, err
 				}
 			}
-			refs, err := snapHandler.listDiffCheckpoints(backendCtx)
+			refs, err := snapHandler.listCheckpoints(backendCtx)
 			out := make([]ctl.DiffCheckpointRef, len(refs))
 			for i, r := range refs {
-				out[i] = ctl.DiffCheckpointRef{DiffID: r.DiffID, ID: r.ID}
+				out[i] = ctl.CheckpointRef{DiffID: r.DiffID, MemoryID: r.MemoryID, ID: r.ID}
 			}
 			return out, err
 		},
@@ -836,7 +829,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			if req.CheckpointOwner != "" && req.CheckpointOwner != ownerID {
 				return errors.New("checkpoint owner changed")
 			}
-			return snapHandler.deleteDiffCheckpoints(backendCtx, req.CheckpointRefs)
+			return snapHandler.deleteCheckpoints(backendCtx, req.CheckpointRefs, req.CheckpointSources)
 		},
 		Path: ctlSockPath,
 		Logf: logf,
@@ -940,9 +933,9 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		r.mu.Lock()
 		r.launch = launch
 		r.runDir = runDir
-		r.listCheckpoints = snapHandler.listDiffCheckpoints
-		r.deleteCheckpoint = func(ctx context.Context, ref artifact.DiffCheckpointRef) error {
-			return snapHandler.deleteDiffCheckpoints(ctx, []ctl.DiffCheckpointRef{{DiffID: ref.DiffID, ID: ref.ID}})
+		r.listCheckpoints = snapHandler.listCheckpoints
+		r.deleteCheckpoint = func(ctx context.Context, ref artifact.CheckpointRef, sources ctl.CheckpointSources) error {
+			return snapHandler.deleteCheckpoints(ctx, []ctl.CheckpointRef{ref}, &sources)
 		}
 		r.stats = func() (ctl.Response, error) { return ctlSrv.ResourceStatsHandler(ctl.Request{}) }
 		r.snapshot = func(ctx context.Context, req ctl.Request) (ctl.Response, error) {

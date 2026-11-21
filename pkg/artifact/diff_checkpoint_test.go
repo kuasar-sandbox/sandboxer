@@ -125,7 +125,7 @@ func TestPublishCheckpointPreservesVersionsAndCleansExactSources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.DeletePublishedDiffCheckpoints(ctx, result); err == nil {
+	if err := storage.DeletePublishedDiffCheckpoints(ctx, result, Checkpoint{Directory: f.dir, SandboxID: "fixture", Retain: []CheckpointSource{}}); err == nil {
 		t.Fatal("cleanup before target Close succeeded")
 	}
 	if err := publisher.Close(); err != nil {
@@ -181,10 +181,10 @@ func TestPublishCheckpointPreservesVersionsAndCleansExactSources(t *testing.T) {
 	if err := f.owner.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.DeletePublishedDiffCheckpoints(ctx, result); err != nil {
+	if err := storage.DeletePublishedDiffCheckpoints(ctx, result, Checkpoint{Directory: f.dir, SandboxID: "fixture", Retain: []CheckpointSource{}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.DeletePublishedDiffCheckpoints(ctx, result); err != nil {
+	if err := storage.DeletePublishedDiffCheckpoints(ctx, result, Checkpoint{Directory: f.dir, SandboxID: "fixture", Retain: []CheckpointSource{}}); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
 	refs, err := storage.ListDiffCheckpoints(ctx, f.dir)
@@ -438,7 +438,7 @@ func TestPublishedCheckpointCleanupPinsDirectoryAcrossRename(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer storage.Close()
-	if err := storage.DeletePublishedDiffCheckpoints(ctx, result); err != nil {
+	if err := storage.DeletePublishedDiffCheckpoints(ctx, result, Checkpoint{Directory: sourcePath, SandboxID: "fixture", Retain: []CheckpointSource{}}); err != nil {
 		t.Fatal(err)
 	}
 	for _, directory := range []string{sourcePath, renamed} {
@@ -535,7 +535,7 @@ func TestPublishedCheckpointRouteRetriesPinnedDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer storage.Close()
-	if err := storage.DeletePublishedDiffCheckpoints(ctx, result); err != nil {
+	if err := storage.DeletePublishedDiffCheckpoints(ctx, result, Checkpoint{Directory: sourcePath, SandboxID: "fixture", Retain: []CheckpointSource{}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-served; err != nil {

@@ -75,7 +75,7 @@ func checkpointRefsSnapshot(t *testing.T, cfg *manifest.Config, storage *Process
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, ref.Path+".bundle")
-	return Checkpoint{Directory: dir, SandboxID: "refs", SnapshotRef: checkpointBundleSelector(t, path, s), SandboxRef: e}, path
+	return Checkpoint{Retain: []CheckpointSource{}, Directory: dir, SandboxID: "refs", SnapshotRef: checkpointBundleSelector(t, path, s), SandboxRef: e}, path
 }
 
 func TestCleanupCheckpointUnusedBundleLocations(t *testing.T) {
@@ -100,7 +100,7 @@ func TestCleanupCheckpointUnusedBundleLocations(t *testing.T) {
 				if err != nil {
 					t.Fatalf("ordinary read must not require unused location: %v", err)
 				}
-				c := Checkpoint{Directory: filepath.Dir(path), SandboxID: "exact", SandboxRef: checkpointBundleSelector(t, path, info.Snapshot.SandboxRef)}
+				c := Checkpoint{Retain: []CheckpointSource{}, Directory: filepath.Dir(path), SandboxID: "exact", SandboxRef: checkpointBundleSelector(t, path, info.Snapshot.SandboxRef)}
 				if snapshotRoot {
 					c.SnapshotRef = checkpointBundleSelector(t, path, root)
 				}

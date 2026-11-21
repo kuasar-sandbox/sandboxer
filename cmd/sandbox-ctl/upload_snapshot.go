@@ -38,6 +38,7 @@ func publishArtifactCmd(command string, args []string) int {
 	skipVerifyRef := fs.Bool("skip-verify-ref", false, "skip replacement equivalence proof (identity and I/O checks remain enabled)")
 	jsonOutput := fs.Bool("json", false, "print final root references and removedRefs as JSON")
 	deleteCheckpoint := fs.Bool("delete-checkpoint", false, "delete the exact local versions after successful publication")
+	checkpointSources := fs.String("checkpoint-sources", "", "complete source graphs by directory (JSON array) for --delete-checkpoint")
 	quiet := fs.Bool("quiet", false, "suppress progress logs on stderr")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -46,6 +47,19 @@ func publishArtifactCmd(command string, args []string) int {
 	if input == "" || fs.NArg() != 1 {
 		fmt.Fprintf(os.Stderr, "usage: sandbox-ctl %s [--manifest-config <file>] [--to-ref-location name=file:///path] [--ref-location name=file:///path ...] [--replace-ref OLD=NEW ...] [--reduce-ref A[=X] ...|--reduce-ref=any] [--skip-verify-ref] [--quiet] [--json] <artifact>\n", command)
 		return 2
+	}
+	var cleanupSources []artifact.Checkpoint
+	if *deleteCheckpoint {
+		if err := json.Unmarshal([]byte(*checkpointSources), &cleanupSources); err != nil || cleanupSources == nil {
+			fmt.Fprintln(os.Stderr, "--delete-checkpoint requires --checkpoint-sources with complete retention sets")
+			return 2
+		}
+		for _, source := range cleanupSources {
+			if source.Retain == nil {
+				fmt.Fprintln(os.Stderr, "checkpoint sources require explicit retain, including []")
+				return 2
+			}
+		}
 	}
 	rewrite, err := artifact.ParseRewriteOptions(replaceRefs, reduceRefs, *skipVerifyRef)
 	if err != nil {
@@ -106,7 +120,7 @@ func publishArtifactCmd(command string, args []string) int {
 	}
 	cleanupErr := error(nil)
 	if *deleteCheckpoint {
-		cleanupErr = storage.DeletePublishedDiffCheckpoints(ctx, result)
+		cleanupErr = storage.DeletePublishedDiffCheckpoints(ctx, result, cleanupSources...)
 	}
 	storageCloseErr := storage.Close()
 	exitCode := 0
