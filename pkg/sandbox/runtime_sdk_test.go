@@ -171,6 +171,22 @@ func TestSDKChild(t *testing.T) {
 					if os.Getenv("SDK_TEST_SHUTDOWN") != "lost-ack" {
 						_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeAck})
 					}
+					if state := os.Getenv("SDK_TEST_ENVIRONMENT_RESULT"); state != "" && state != "missing" {
+						report, err := net.Dial("unix", sock+"_5000")
+						if err != nil {
+							os.Exit(35)
+						}
+						_ = report.SetDeadline(time.Now().Add(time.Second))
+						fact := &proto.EnvironmentExit{State: state, Reason: "sdk-test-manager-result"}
+						if err := proto.WriteMessage(report, &proto.Message{Type: proto.TypeEnvironmentExited, EnvironmentExit: fact}); err != nil {
+							os.Exit(36)
+						}
+						ack, err := proto.ReadMessage(report)
+						_ = report.Close()
+						if err != nil || ack.Type != proto.TypeAck {
+							os.Exit(37)
+						}
+					}
 					os.Exit(0)
 				}
 			}()
@@ -841,5 +857,102 @@ func TestSDKShutdownManagementAndFinalResponse(t *testing.T) {
 				t.Fatalf("run resources retained: %v", err)
 			}
 		})
+	}
+}
+
+func TestSDKShutdownEnvironmentReportResults(t *testing.T) {
+	for _, state := range []string{"stopped", "failed", "missing"} {
+		t.Run(state, func(t *testing.T) {
+			t.Setenv("SDK_TEST_SHUTDOWN", "ack")
+			t.Setenv("SDK_TEST_SYSTEMD_V1", "1")
+			t.Setenv("SDK_TEST_ENVIRONMENT_RESULT", state)
+			shape, launch := sdkFixture(t)
+			launch.Process.Systemd = "auto"
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			r, err := StartRuntime(ctx, shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			if err := r.Launch(ctx, launch); err != nil {
+				t.Fatal(err)
+			}
+			r.mu.Lock()
+			reaped := r.reaped
+			r.mu.Unlock()
+			if reaped == nil {
+				t.Fatal("cold owner has no actual VMM reaper notification")
+			}
+			target := ctl.ShutdownTarget{SandboxID: shape.SandboxID, RunID: r.RunID()}
+			err = ctl.Shutdown(ctx, filepath.Join(r.runDir, "ctl.sock"), target)
+			if state == "stopped" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil {
+				t.Fatalf("%s environment with CH=0 reported success", state)
+			}
+			if r.State() != "closed" {
+				t.Fatal("normal shutdown response preceded real retirement")
+			}
+			result, waitErr := r.Wait(context.Background())
+			if waitErr != nil {
+				t.Fatal(waitErr)
+			}
+			if state == "failed" && (result.Err == nil || !strings.Contains(result.Err.Error(), "sdk-test-manager-result")) {
+				t.Fatalf("fault lost: %+v", result)
+			}
+			if state == "missing" && (result.Err == nil || !strings.Contains(result.Err.Error(), "without a terminal environment report")) {
+				t.Fatalf("missing observation accepted: %+v", result)
+			}
+		})
+	}
+}
+
+func TestSDKShutdownReapedEnvironmentKeepsResultDuringSlowCleanup(t *testing.T) {
+	t.Setenv("SDK_TEST_SHUTDOWN", "ack")
+	t.Setenv("SDK_TEST_SYSTEMD_V1", "1")
+	t.Setenv("SDK_TEST_ENVIRONMENT_RESULT", "stopped")
+	shape, launch := sdkFixture(t)
+	launch.Process.Systemd = "auto"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r, err := StartRuntime(ctx, shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.Launch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	// Retain an already-admitted operation while the real child reports and
+	// exits. This blocks owner retirement without blocking the sole reaper.
+	r.opsWG.Add(1)
+	var release sync.Once
+	defer release.Do(r.opsWG.Done)
+	// The race-instrumented helper retains Go's one-second exit flush.
+	stopCtx, stopCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer stopCancel()
+	if err := r.Shutdown(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("slow cleanup wait = %v", err)
+	}
+	select {
+	case <-r.reaped:
+	default:
+		t.Fatal("child was not actually reaped")
+	}
+	if r.shutdown.escalated.Load() {
+		t.Fatal("slow cleanup forced an already-reaped environment")
+	}
+	select {
+	case <-r.exitDone:
+		t.Fatal("unfinished cleanup reported retirement")
+	default:
+	}
+	release.Do(r.opsWG.Done)
+	result, err := r.Wait(ctx)
+	if err != nil || result.Err != nil || result.Code != 0 {
+		t.Fatalf("observed clean environment lost after caller deadline: %+v / %v", result, err)
 	}
 }

@@ -602,6 +602,9 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			return true
 		},
 	}
+	if r := p.owner; r != nil {
+		launch.OnEnvironmentExited = r.recordEnvironmentExit
+	}
 	if r := p.owner; r != nil && r.deviceSet != nil {
 		r.notifyInitialReady = notifyReady
 		launch.OnInitialLaunchState = r.observeInitialLaunch
@@ -913,7 +916,6 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			r.checkpointOwner = p.CheckpointOwner
 			defer func() { r.checkpointOwner = nil }()
 			r.sandboxID = p.SandboxID
-			r.reaped = chExited
 			r.baseDir = p.BaseDir
 			r.diskStorage = p.DiskStorage
 			r.diskCache = p.DiskCache
@@ -933,6 +935,8 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	}
 	if r := p.owner; r != nil {
 		r.mu.Lock()
+		r.reaped = chExited
+		r.environmentActive = p.SnapCfg.Launch.EffectiveSystemd() != "off"
 		if r.spec.RunID == "" {
 			var err error
 			r.spec.RunID, err = resolveRuntimeRunID(p.RunID, p.DiskCurrentRun)
@@ -1010,6 +1014,8 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			return client, est, nil
 		}
 		r.installLaunch = func(cfg *config.SandboxConfig, c0 *config.PortableSandboxConfig, spec LaunchSpec, disks []DiskBackend, ls *proto.LaunchSpec) error {
+			// Launch invokes this closure while holding the owner lock.
+			r.environmentActive = cfg.Launch.EffectiveSystemd() != "off"
 			r.shutdownGrace = time.Duration(cfg.StopGraceSeconds()) * time.Second
 			var backends []vhost.Backend
 			var refs []SnapDiskRef
@@ -1245,12 +1251,14 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			logf("CH exit waitid: %v", waitIDErr)
 		}
 		waitErr := cmd.Wait()
+		// Publish actual reaping before owner locks or cancellation callbacks:
+		// cleanup latency must not keep the Guest shutdown escalation alive.
+		markCHExited()
 		if p.owner != nil {
 			p.owner.stopForExit()
 		}
 		cancelPostSpawn()
 		cancelBackends()
-		markCHExited()
 		doneCh <- waitErr
 	}()
 

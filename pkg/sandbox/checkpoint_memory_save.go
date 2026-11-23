@@ -412,6 +412,7 @@ func destroyFrozenMemory(process processSignaler, lock *os.File, release func(),
 
 func frozenRetirement(r *Runtime, process processSignaler, lock *os.File, release func(), exited <-chan struct{}, logf func(string, ...any)) func() error {
 	return sync.OnceValue(func() error {
+		r.markPhysicalRetirement()
 		go destroyFrozenMemory(process, lock, release, exited, logf)
 		<-r.exitDone
 		return r.exit.Err

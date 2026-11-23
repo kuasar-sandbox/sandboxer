@@ -312,6 +312,18 @@ undoing the owner operation. ACK/EOF never substitutes for actual VMM reaping.
 A freezing or committed frozen capture is rejected, so cleanup can destroy it
 without implicitly thawing it.
 
+For an active systemd environment, the Guest reports the completed environment
+PID 1 Wait separately from the primary process. The owner records that terminal
+fact before acknowledging it, including after S restore. An environment failure
+remains a failed `ExitResult` even if CH subsequently exits with code zero. A
+missing terminal fact is an observation error for natural exit and normal
+`Shutdown`; the shutdown request alone cannot prove the manager's result.
+Physical `Close` and committed capture-source retirement do not require Guest
+execution or a final report, and do not erase an already reported failure. A
+normal PID-namespace reboot may retain a real signal in the diagnostic fact;
+the observed environment outcome determines success, not a fabricated primary
+exit code.
+
 The owner uses the existing effective Guest stop grace G (positive wire seconds,
 otherwise 10 seconds) and internal F = 5 seconds: Guest stop gets G + F, then the
 VMM fence completes by G + 2F. A shorter caller deadline narrows both stages.

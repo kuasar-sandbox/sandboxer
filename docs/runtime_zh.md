@@ -255,6 +255,13 @@ SIGTERM/SIGINT，并保留第二次 signal 立即升级的行为。CLI 也通过
 动作。ACK、EOF 均不代替实际 VMM Wait。冻结中或已提交的冻结捕获源拒绝正常关机，
 已有清理路径可直接销毁它，不隐式 thaw。
 
+systemd 环境的 Guest 会单独报告环境 PID 1 的实际 Wait 结果，与主进程退出事实分开。
+owner 在 ACK 前保存该终态，S 恢复也走同一路径。即使 CH 随后以 0 退出，环境故障仍
+保留为失败的 `ExitResult`。自然退出或正常 `Shutdown` 缺少终态报告时返回观测错误；
+发起关机本身不足以证明 manager 的结果。物理 `Close` 与已提交捕获源退役不要求
+Guest 继续执行或补发报告，也不能清除已经报告的故障。正常 PID namespace reboot
+可能在诊断事实中保留真实信号；成功与否依据已观察的环境终态，不伪造主进程退出码。
+
 G 采用 Guest 实际使用的宽限（正整数 wire 秒，否则 10 秒），F 为内部 5 秒：Guest
 阶段最多 G + F，随后 VMM 收敛至总计 G + 2F；调用方较短期限同时收紧两阶段。独立
 VMM timer 早于 memory.high 准备和 API 请求，第二次 signal 仍立即升级。强制退役

@@ -156,19 +156,23 @@ type runtimeOwnedDisk struct {
 // Shutdown requests normal Guest stop. Close reclaims resources and waits for
 // the same retained result, including after a committed frozen capture.
 type Runtime struct {
-	shutdown      *runtimeShutdown
-	shutdownGuest func(context.Context) error
-	shutdownGrace time.Duration
-	memorySave    *checkpointMemorySave
-	diskSnapshot  *SnapshotHandler
-	diskLaunch    LaunchSpec
-	diskInventory []diskEntry
-	diskStateMu   sync.RWMutex
-	diskBackends  *vhost.BackendSet // includes restored devices
-	diskCache     *diffstore.Cache  // may be borrowed on restore
-	diskStorage   *artifact.ProcessStorage
-	diskFatal     func(error)
-	diskOwned     []runtimeOwnedDisk // writers created by BindDisk
+	environmentActive        bool
+	environmentExit          *proto.EnvironmentExit
+	environmentProtocolError error
+	physicalRetirement       bool
+	shutdown                 *runtimeShutdown
+	shutdownGuest            func(context.Context) error
+	shutdownGrace            time.Duration
+	memorySave               *checkpointMemorySave
+	diskSnapshot             *SnapshotHandler
+	diskLaunch               LaunchSpec
+	diskInventory            []diskEntry
+	diskStateMu              sync.RWMutex
+	diskBackends             *vhost.BackendSet // includes restored devices
+	diskCache                *diffstore.Cache  // may be borrowed on restore
+	diskStorage              *artifact.ProcessStorage
+	diskFatal                func(error)
+	diskOwned                []runtimeOwnedDisk // writers created by BindDisk
 
 	checkpointCleanup                  func() error
 	checkpointOwner                    *diffstore.DirectoryOwner
@@ -1336,7 +1340,7 @@ func (r *Runtime) finishExit(x ExitResult) {
 			}
 		}
 		r.mu.Lock()
-		x.Err = errors.Join(x.Err, r.launchFailure, err)
+		x.Err = errors.Join(x.Err, r.launchFailure, r.environmentExitErrorLocked(), err)
 		if x.Err != nil {
 			x.Code = -1
 		}
@@ -1364,7 +1368,12 @@ func (r *Runtime) requestClose() {
 		}
 	})
 }
-func (r *Runtime) Close() error { r.requestClose(); <-r.exitDone; return r.exit.Err }
+func (r *Runtime) Close() error {
+	r.markPhysicalRetirement()
+	r.requestClose()
+	<-r.exitDone
+	return r.exit.Err
+}
 func (r *Runtime) cleanup() {
 	if r.cancelLife != nil {
 		r.cancelLife(context.Canceled)
@@ -1495,6 +1504,7 @@ func closeRuntimeDuringStartup(ctx context.Context, r *Runtime) {
 	if r == nil {
 		return
 	}
+	r.markPhysicalRetirement()
 	r.requestClose() // first shutdown request to the runtime's private stream
 	outer := runSignalsFromContext(ctx)
 	if outer == nil {

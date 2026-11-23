@@ -370,12 +370,14 @@ func WaitRun(ctx context.Context, r *Runtime) (int, error) {
 		case <-r.exitDone:
 			return r.exit.Code, errors.Join(r.exit.Err, r.WaitMemorySave(context.Background()))
 		case sig := <-signals:
+			r.markPhysicalRetirement()
 			r.signals <- sig
 		case <-done:
 			done = nil
 			// A retained OS signal is forwarded through signals. Plain parent
 			// cancellation has no such signal and must still request shutdown.
 			if signals == nil || !runShutdownRequested(ctx) {
+				r.markPhysicalRetirement()
 				r.signals <- syscall.SIGTERM
 			}
 		}
@@ -1555,6 +1557,7 @@ func handleExportRequest(
 	}
 	if !req.ResumeAfter {
 		resp.AfterWrite = sync.OnceFunc(func() {
+			opts.runtime.markPhysicalRetirement()
 			go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
 		})
 	}
@@ -2097,6 +2100,7 @@ func handleSnapshotRequest(
 			resp.BeforeWrite = frozenRetirement(opts.runtime, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, logf)
 		} else {
 			resp.AfterWrite = sync.OnceFunc(func() {
+				opts.runtime.markPhysicalRetirement()
 				go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
 			})
 		}
