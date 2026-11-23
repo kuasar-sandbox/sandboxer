@@ -130,6 +130,18 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 	if err != nil {
 		return result, err
 	}
+	root, err := manifest.ParseRef(raw)
+	if err != nil {
+		return result, err
+	}
+	// Rewriting equivalent dependencies preserves this Snapshot's captured
+	// runtime. Plan with base identities, then annotate only its public result.
+	raw = root.Base().String()
+	defer func() {
+		if retErr == nil && result.Role == RoleSnapshot && !root.Runtime.IsZero() {
+			result, retErr = result.withSnapshotRuntime(root.Runtime, scopedRef(raw, scope))
+		}
+	}()
 	plan.p.original(raw, scope)
 	stream, child, err := plan.open(ctx, raw, scope)
 	if err != nil {
@@ -138,6 +150,9 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 	eroot, eerr := sandboxfile.Open(ctx, stream)
 	if eerr == nil {
 		plan.closes = append(plan.closes, eroot.FullStream.Close)
+		if !root.Runtime.IsZero() {
+			return result, errors.New("runtime declaration requires a Snapshot root")
+		}
 		e, err := plan.sandbox(ctx, raw, child, eroot, true)
 		if err != nil {
 			return result, err

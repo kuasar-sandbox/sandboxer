@@ -60,6 +60,18 @@ Block backend、restore 和 publisher 先打开 carrier,再按逻辑角色解析
 
 通用 carrier 字节格式由 [Accelerator 文件工件](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/artifacts_zh.md) 定义。本文的 Host 生命周期负责 E/S 逻辑 schema 和发布规则；[Guest ABI](guest-abi_zh.md) 负责 Host/Guest 协调。
 
+### Snapshot runtime 声明
+
+读取器通过 Accelerator 公共 parser 接受 Snapshot S 引用末尾的可选
+`@runtime:<basename>:digest:<64 位小写十六进制摘要>`。没有声明的旧引用仍然合法；
+存在但格式错误的声明必须报错。Bundle 和 tarstream 只是保存格式，遵守相同规则。
+
+发布或移动同一 S 时，返回的 `snapshotRef` 保留声明。选择其 E 或其他磁盘成员时不
+继承声明。`snapshot.cfg` 中的父层引用及 Bundle 物理依赖使用不带声明的基础引用，
+因此从带声明的 S 再次捕获不会改变父层内容 key、引入额外层或新增读取链路。
+实际恢复仍使用被捕获的 portable config 校验 runtime。先交付消费者，再启用新
+捕获输出；本次消费者兼容改动本身不启用带声明的新输出。
+
 <a id="platform-boundary"></a>
 
 ## 责任边界

@@ -63,6 +63,9 @@ func validateSnapshotRef(field, raw string) error {
 	if err != nil {
 		return fmt.Errorf("snapshot %s: %w", field, err)
 	}
+	if !ref.Runtime.IsZero() {
+		return fmt.Errorf("snapshot %s must use a base content reference without runtime metadata", field)
+	}
 	if ref.Scheme == manifest.RefSchemeFile {
 		if filepath.IsAbs(ref.Path) || filepath.Base(ref.Path) != ref.Path || strings.ContainsAny(ref.Path, `/\\`) {
 			return fmt.Errorf("snapshot %s local ref must use a basename", field)

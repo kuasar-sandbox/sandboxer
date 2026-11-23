@@ -9,6 +9,18 @@ func rewriteTestRef(digit byte) string {
 	return "manifest://" + strings.Repeat(string(digit), 64)
 }
 
+func TestRewriteRulesUseBaseContentIdentities(t *testing.T) {
+	a, b, c, d := rewriteTestRef('a'), rewriteTestRef('b'), rewriteTestRef('c'), rewriteTestRef('d')
+	annotation := "@runtime:runtime.bundle:digest:" + strings.Repeat("c", 64)
+	options, err := ParseRewriteOptions([]string{a + annotation + "=" + b + annotation}, []string{c + annotation + "=" + d}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(options.Replacements) != 1 || options.Replacements[0].Old != a || options.Replacements[0].New != b || options.Reductions[0].Top != c {
+		t.Fatalf("rewrite rules retained scheduling metadata: %+v", options)
+	}
+}
+
 func TestParseRewriteOptionsPreservesIndependentRules(t *testing.T) {
 	a, b, c, d := rewriteTestRef('a'), rewriteTestRef('b'), rewriteTestRef('c'), rewriteTestRef('d')
 	e, f := rewriteTestRef('e'), rewriteTestRef('f')

@@ -185,7 +185,9 @@ func canonicalRewriteRef(raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return ref.String(), nil
+	// Rules address graph content, including an explicitly selected Snapshot
+	// root. Scheduling metadata must not become a carrier or dependency ref.
+	return ref.Base().String(), nil
 }
 
 func (o RewriteOptions) empty() bool {

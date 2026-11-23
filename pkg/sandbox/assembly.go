@@ -75,6 +75,9 @@ func resolveFlattenedImageRef(raw string, locations config.RefLocations) (manife
 	if err != nil {
 		return manifest.Ref{}, "", err
 	}
+	if !ref.Runtime.IsZero() {
+		return manifest.Ref{}, "", errors.New("image source cannot carry a snapshot runtime declaration")
+	}
 	if ref.Scheme != manifest.RefSchemeFile {
 		return ref, "", nil
 	}
