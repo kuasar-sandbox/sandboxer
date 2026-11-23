@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -309,7 +310,8 @@ func TestTakeBuildsSandboxAndMemorySnapshotAtOneFreezePoint(t *testing.T) {
 	if got := events.snapshot(); !reflect.DeepEqual(got, wantOrder) {
 		t.Fatalf("snapshot E/S order = %v, want %v", got, wantOrder)
 	}
-	if out.SandboxRef != sink.sandboxRef || out.SnapshotRef != sink.snapshotRef {
+	parsedSnapshot, err := manifest.ParseRef(out.SnapshotRef)
+	if err != nil || out.SandboxRef != sink.sandboxRef || parsedSnapshot.Base().String() != sink.snapshotRef || parsedSnapshot.Runtime != (manifest.RuntimeIdentity{Basename: "runtime.bundle", Digest: strings.Repeat("a", 64)}) {
 		t.Fatalf("Take refs = E:%q S:%q", out.SandboxRef, out.SnapshotRef)
 	}
 	if sink.closes != 1 {

@@ -97,6 +97,7 @@ func TestNativeCaptureReturnsCommittedPairForEverySink(t *testing.T) {
 						t.Fatal(err)
 					}
 					portable := exportTestPortable(t)
+					portable.Boot.Runtime = "file://captured-v1.bundle@digest:" + strings.Repeat("c", 64)
 					portable.Boot.Root = config.PortableRootConfig{Base: "self"}
 					portable.Boot.Disks = nil
 					portable.Mounts = nil
@@ -127,13 +128,24 @@ func TestNativeCaptureReturnsCommittedPairForEverySink(t *testing.T) {
 					if eref == "" || (snapshotCapture && sref == "") {
 						t.Fatalf("torn output S=%q E=%q", sref, eref)
 					}
+					eIdentity, err := manifest.ParseRef(eref)
+					if err != nil || !eIdentity.Runtime.IsZero() {
+						t.Fatalf("runtime leaked onto Sandbox E: %s: %v", eref, err)
+					}
+					var sIdentity manifest.Ref
+					if snapshotCapture {
+						sIdentity, err = manifest.ParseRef(sref)
+						if err != nil || sIdentity.Runtime != (manifest.RuntimeIdentity{Basename: "captured-v1.bundle", Digest: strings.Repeat("c", 64)}) {
+							t.Fatalf("capture runtime lost: %s: %v", sref, err)
+						}
+					}
 					if mode == "upload" {
 						if eref != "manifest://"+HexKey(upload.SandboxResult().ManifestKey) {
 							t.Fatal("E differs from actual upload key")
 						}
 						if snapshotCapture {
 							_, s := upload.Results()
-							if sref != "manifest://"+HexKey(s.ManifestKey) {
+							if sIdentity.Base().String() != "manifest://"+HexKey(s.ManifestKey) {
 								t.Fatal("S differs from actual upload key")
 							}
 						}

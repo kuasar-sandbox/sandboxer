@@ -69,8 +69,14 @@ Block backend、restore 和 publisher 先打开 carrier,再按逻辑角色解析
 发布或移动同一 S 时，返回的 `snapshotRef` 保留声明。选择其 E 或其他磁盘成员时不
 继承声明。`snapshot.cfg` 中的父层引用及 Bundle 物理依赖使用不带声明的基础引用，
 因此从带声明的 S 再次捕获不会改变父层内容 key、引入额外层或新增读取链路。
-实际恢复仍使用被捕获的 portable config 校验 runtime。先交付消费者，再启用新
-捕获输出；本次消费者兼容改动本身不启用带声明的新输出。
+实际恢复仍使用被捕获的 portable config 校验 runtime。
+
+新的内存捕获从本次不可变 `PortableConfig.Boot.Runtime` 提取 basename 和内容摘要，
+在 holder 提交既有 CaptureRecord 前写入声明，因此回复丢失或后续后台保存都不会
+把它换成宿主当前默认 runtime。直接再导出没有声明的旧 source 不推测补齐声明。
+不新增 runtime 存储列、数据读取链路或声明与制品内容的重复校验器。部署生产端前，
+必须先交付支持新引用的 Accelerator、Sandboxer 和 Orchestrator 读取器；旧读取器
+不属于新标注输出的支持组合。
 
 <a id="platform-boundary"></a>
 
