@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -187,7 +188,15 @@ func TestSDKChild(t *testing.T) {
 							os.Exit(37)
 						}
 					}
-					os.Exit(0)
+					code := 0
+					if raw := os.Getenv("SDK_TEST_VMM_EXIT_CODE"); raw != "" {
+						var err error
+						code, err = strconv.Atoi(raw)
+						if err != nil || code < 0 || code > 255 {
+							os.Exit(38)
+						}
+					}
+					os.Exit(code)
 				}
 			}()
 		}
@@ -954,5 +963,69 @@ func TestSDKShutdownReapedEnvironmentKeepsResultDuringSlowCleanup(t *testing.T) 
 	result, err := r.Wait(ctx)
 	if err != nil || result.Err != nil || result.Code != 0 {
 		t.Fatalf("observed clean environment lost after caller deadline: %+v / %v", result, err)
+	}
+}
+
+func TestSDKShutdownRejectsNonzeroVMMExit(t *testing.T) {
+	for _, mode := range []string{"off", "runtime"} {
+		for _, api := range []string{"sdk", "localctl"} {
+			t.Run(mode+"/"+api, func(t *testing.T) {
+				t.Setenv("SDK_TEST_SHUTDOWN", "ack")
+				t.Setenv("SDK_TEST_VMM_EXIT_CODE", "23")
+				t.Setenv("SDK_TEST_SYSTEMD_V1", "1")
+				state := ""
+				if mode != "off" {
+					state = proto.EnvironmentStopped
+				}
+				t.Setenv("SDK_TEST_ENVIRONMENT_RESULT", state)
+				shape, launch := sdkFixture(t)
+				launch.Process.Systemd = mode
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				r, err := StartRuntime(ctx, shape)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				if err := r.Launch(ctx, launch); err != nil {
+					t.Fatal(err)
+				}
+				if api == "sdk" {
+					err = r.Shutdown(ctx)
+				} else {
+					target := ctl.ShutdownTarget{SandboxID: shape.SandboxID, RunID: r.RunID()}
+					err = ctl.Shutdown(ctx, filepath.Join(r.runDir, "ctl.sock"), target)
+				}
+				if err == nil || !strings.Contains(err.Error(), "runtime exited with code 23") {
+					t.Fatalf("nonzero real VMM exit was not rejected: %v", err)
+				}
+				select {
+				case <-r.reaped:
+				default:
+					t.Fatal("shutdown reported the code before actual child Wait")
+				}
+				result, waitErr := r.Wait(context.Background())
+				if waitErr != nil || result.Code != 23 || result.Err != nil {
+					t.Fatalf("Shutdown changed the retained Wait fact: %+v / %v", result, waitErr)
+				}
+				if r.State() != "closed" || r.shutdown.escalated.Load() {
+					t.Fatal("nonzero exit was confused with pending or forced retirement")
+				}
+				if state != "" {
+					r.mu.Lock()
+					fact := r.environmentExit
+					r.mu.Unlock()
+					if fact == nil || fact.State != proto.EnvironmentStopped {
+						t.Fatalf("normal manager result was not recorded: %+v", fact)
+					}
+				}
+				if err := r.Close(); err != nil {
+					t.Fatalf("physical Close semantics changed: %v", err)
+				}
+				if err := r.Shutdown(context.Background()); err == nil || !strings.Contains(err.Error(), "code 23") {
+					t.Fatalf("retained shutdown result was lost: %v", err)
+				}
+			})
+		}
 	}
 }

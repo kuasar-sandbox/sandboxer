@@ -79,10 +79,14 @@ func (r *Runtime) waitShutdown(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if stop != nil && stop.escalated.Load() {
-		return errors.Join(exit.Err, fmt.Errorf("Guest shutdown required forced retirement: %w", context.DeadlineExceeded))
+	resultErr := exit.Err
+	if exit.Code != 0 {
+		resultErr = errors.Join(resultErr, fmt.Errorf("runtime exited with code %d during shutdown", exit.Code))
 	}
-	return exit.Err
+	if stop != nil && stop.escalated.Load() {
+		resultErr = errors.Join(resultErr, fmt.Errorf("Guest shutdown required forced retirement: %w", context.DeadlineExceeded))
+	}
+	return resultErr
 }
 
 // beginShutdown never holds an opsWG slot or a connection cleanup obligation.
