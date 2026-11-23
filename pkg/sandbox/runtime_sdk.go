@@ -50,6 +50,7 @@ type RuntimeDiskSpec struct {
 
 // RuntimeSpec fixes the base VM shape. It contains no workload or credentials.
 type RuntimeSpec struct {
+	RunID                           string // exact execution generation; empty generates a fresh identity
 	EnableCheckpoint                bool
 	CurrentRun                      *artifact.CurrentRun
 	preparedHost                    *preparedHostIdentity
@@ -152,8 +153,12 @@ type runtimeOwnedDisk struct {
 }
 
 // Runtime owns one VM and its service goroutines. Wait observes cleanup;
-// Close requests graceful shutdown and waits for the same retained result.
+// Shutdown requests normal Guest stop. Close reclaims resources and waits for
+// the same retained result, including after a committed frozen capture.
 type Runtime struct {
+	shutdown      *runtimeShutdown
+	shutdownGuest func(context.Context) error
+	shutdownGrace time.Duration
 	memorySave    *checkpointMemorySave
 	diskSnapshot  *SnapshotHandler
 	diskLaunch    LaunchSpec
@@ -204,6 +209,7 @@ type Runtime struct {
 	cacheStop                          func()
 	storage                            *artifact.ProcessStorage
 	ownStorage                         bool
+	reaped                             <-chan struct{} // actual VMM Wait, before resource cleanup
 	exitDone                           chan struct{}
 	captureResponsesDone               <-chan struct{}
 	exit                               ExitResult
@@ -366,6 +372,10 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 	if err := validateSandboxID(sid); err != nil {
 		return nil, err
 	}
+	spec.RunID, err = resolveRuntimeRunID(spec.RunID, spec.CurrentRun)
+	if err != nil {
+		return nil, err
+	}
 	pathID, err := ResolvePathID(sid, spec.PathID)
 	if err != nil {
 		return nil, err
@@ -400,6 +410,7 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 	r.spec.CHBinary = chBinary
 	r.spec.RuntimeRoot = runtimeRoot
 	r.spec.BaseRoot = baseRoot
+	r.logf("runtime identity sandbox=%s run=%s", sid, spec.RunID)
 	defer func() {
 		if retErr != nil {
 			if r.engineStarted {
@@ -585,6 +596,7 @@ func cloneSDKConfig(c *config.SandboxConfig) (*config.SandboxConfig, error) {
 		return nil, err
 	}
 	out.Resources.Control.CgroupFD = c.Resources.Control.CgroupFD
+	out.Launch.SetSystemdPathDefault(c.Launch.PersistentSystemdPathDefault())
 	return &out, nil
 }
 func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
@@ -638,6 +650,10 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if discardMode == proto.DiscardManual && !r.launch.Ext4DiscardSupported() {
 		r.mu.Unlock()
 		return errors.New("guest incompatible: ext4_discard_v1 is required for resources.diff_cow.discard=manual; update boot.runtime")
+	}
+	if cfg.Launch.EffectiveSystemd() != "off" && !r.launch.SystemdSupported() {
+		r.mu.Unlock()
+		return errors.New("guest incompatible: systemd_v1 is required for launch.systemd; update boot.runtime")
 	}
 	r.initialLaunchToken = rand.Text()
 	r.initialLaunchState = proto.InitialLaunchState{Token: r.initialLaunchToken, State: proto.InitialLaunchPending}

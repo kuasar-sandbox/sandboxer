@@ -389,6 +389,12 @@ Portable 内容包括:
 - root/data immutable graph,以及 data disk name/order/mount topology;
 - persistent launch/plugin/mounts/files/init/metadata.
 
+`launch.systemd` 保存冷启动策略；旧 E 缺少此字段按 `off` 解释。
+`launch.systemd_path_default` 是产物内部元数据，记录已保存的 PATH 来自镜像或 Runtime
+默认值，不属于普通 Launch 配置，用户 Launch 文档不能设置。E 投影和 clone 保留具体
+PATH 与标记；显式持久 PATH 清除标记，临时 PATH 只影响本次 wire，不修改产物。
+旧产物保存了 PATH 但没有标记时，继续把该 PATH 当作权威显式值。
+
 Portable 内容排除:
 
 - cgroup path/fd/controller、overhead/watermark/startup、`resources.diff_cow` 缓存策略;

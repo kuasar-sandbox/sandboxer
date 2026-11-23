@@ -167,6 +167,12 @@ func TestSDKChild(t *testing.T) {
 				if err == nil && req.Type == proto.TypePing {
 					_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypePong, ID: req.ID, InitialLaunchState: initial.Load()})
 				}
+				if err == nil && req.Type == proto.TypeShutdown && os.Getenv("SDK_TEST_SHUTDOWN") != "" {
+					if os.Getenv("SDK_TEST_SHUTDOWN") != "lost-ack" {
+						_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeAck})
+					}
+					os.Exit(0)
+				}
 			}()
 		}
 	}()
@@ -174,7 +180,7 @@ func TestSDKChild(t *testing.T) {
 	if err != nil {
 		os.Exit(21)
 	}
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: os.Getenv("SDK_TEST_OLD_GUEST") != "1", Ext4DiscardV1: os.Getenv("SDK_TEST_EXT4_DISCARD_V1") == "1"}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: os.Getenv("SDK_TEST_OLD_GUEST") != "1", Ext4DiscardV1: os.Getenv("SDK_TEST_EXT4_DISCARD_V1") == "1", SystemdV1: os.Getenv("SDK_TEST_SYSTEMD_V1") == "1"}); err != nil {
 		os.Exit(22)
 	}
 	msg, err := proto.ReadMessage(conn)
@@ -762,4 +768,78 @@ func completedLaunchServer(t *testing.T) *guestlink.LaunchServer {
 		t.Fatal("MUX gate did not open")
 	}
 	return s
+}
+
+func TestSDKSystemdCapabilityBeforeLaunchAdmission(t *testing.T) {
+	for _, mode := range []string{"off", "auto", "runtime", "provided"} {
+		for _, supported := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/supported=%v", mode, supported), func(t *testing.T) {
+				if supported {
+					t.Setenv("SDK_TEST_SYSTEMD_V1", "1")
+				} else {
+					t.Setenv("SDK_TEST_SYSTEMD_V1", "0")
+				}
+				shape, launch := sdkFixture(t)
+				launch.Process.Systemd = mode
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				r, err := StartRuntime(ctx, shape)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				err = r.Launch(ctx, launch)
+				if mode != "off" && !supported {
+					if err == nil || !strings.Contains(err.Error(), "systemd_v1") {
+						t.Fatalf("missing capability accepted: %v", err)
+					}
+					if r.State() != "runtime_ready" || r.initialLaunchToken != "" || len(r.disks) != 0 || r.cache != nil {
+						t.Fatal("rejection consumed or prepared Launch")
+					}
+					launch.Process.Systemd = "off"
+					if err := r.Launch(ctx, launch); err != nil {
+						t.Fatalf("corrected Launch was not reusable: %v", err)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				if r.State() != "running" {
+					t.Fatalf("state=%s", r.State())
+				}
+			})
+		}
+	}
+}
+
+func TestSDKShutdownManagementAndFinalResponse(t *testing.T) {
+	for _, mode := range []string{"ack", "lost-ack"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("SDK_TEST_SHUTDOWN", mode)
+			shape, launch := sdkFixture(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			r, err := StartRuntime(ctx, shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			if err := r.Launch(ctx, launch); err != nil {
+				t.Fatal(err)
+			}
+			target := ctl.ShutdownTarget{SandboxID: shape.SandboxID, RunID: r.RunID()}
+			if err := ctl.Shutdown(ctx, filepath.Join(r.runDir, "ctl.sock"), target); err != nil {
+				t.Fatalf("normal stop: %v", err)
+			}
+			if r.State() != "closed" {
+				t.Fatalf("final response preceded cleanup: %s", r.State())
+			}
+			result, err := r.Wait(context.Background())
+			if err != nil || result.Err != nil || result.Code != 0 {
+				t.Fatalf("Wait=%+v/%v", result, err)
+			}
+			if _, err := os.Stat(r.runDir); !os.IsNotExist(err) {
+				t.Fatalf("run resources retained: %v", err)
+			}
+		})
+	}
 }

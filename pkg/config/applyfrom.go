@@ -48,6 +48,9 @@ func ApplyFromRules(artifact *PortableSandboxConfig, host *SandboxConfig, presen
 		return nil, nil, err
 	}
 	applyPersistentFromOverrides(c0, host, presence)
+	// This is now a complete cold definition, not an overlay. Preserve an
+	// explicit off even when the source predates the field.
+	c0.Launch.Systemd = c0.Launch.EffectiveSystemd()
 
 	runtime := sandboxConfigFromPortable(c0)
 	if options.ReplaceBoot {
@@ -148,6 +151,9 @@ func applyPersistentFromOverrides(c0 *PortableSandboxConfig, host *SandboxConfig
 	}
 
 	launch := &c0.Launch
+	if host.Launch.Systemd != "" {
+		launch.Systemd = host.Launch.Systemd
+	}
 	if presence.Has("launch.exec") {
 		launch.Exec = host.Launch.Exec
 	}
@@ -155,7 +161,17 @@ func applyPersistentFromOverrides(c0 *PortableSandboxConfig, host *SandboxConfig
 		launch.Args = append([]string(nil), host.Launch.Args...)
 	}
 	if presence.Has("launch.env") {
+		defaultPath, hadPath := launch.Env["PATH"]
+		keepDefaultPath := hadPath && launch.SystemdPathDefault
 		launch.Env = cloneMap(host.Launch.Env)
+		launch.SystemdPathDefault = host.Launch.PersistentSystemdPathDefault()
+		if _, explicit := host.Launch.Env["PATH"]; !explicit && keepDefaultPath {
+			if launch.Env == nil {
+				launch.Env = make(map[string]string)
+			}
+			launch.Env["PATH"] = defaultPath
+			launch.SystemdPathDefault = true
+		}
 	}
 	if presence.Has("launch.workdir") {
 		launch.Workdir = host.Launch.Workdir
@@ -307,7 +323,8 @@ func sandboxConfigFromPortable(portable *PortableSandboxConfig) *SandboxConfig {
 			Root:    rootConfigFromPortable(&portable.Boot.Root),
 		},
 		Launch: LaunchConfig{
-			Exec: portable.Launch.Exec, Args: append([]string(nil), portable.Launch.Args...),
+			Systemd: portable.Launch.Systemd,
+			Exec:    portable.Launch.Exec, Args: append([]string(nil), portable.Launch.Args...),
 			Env: cloneMap(portable.Launch.Env), Workdir: portable.Launch.Workdir,
 			Restart: portable.Launch.Restart, CgroupControl: portable.Launch.CgroupControl,
 			Placeholder: portable.Launch.Placeholder, PIDNamespace: portable.Launch.PIDNamespace,
@@ -319,6 +336,7 @@ func sandboxConfigFromPortable(portable *PortableSandboxConfig) *SandboxConfig {
 		Init:     cloneInit(portable.Init),
 		Metadata: cloneMap(portable.Metadata),
 	}
+	cfg.Launch.SetSystemdPathDefault(portable.Launch.SystemdPathDefault)
 	cfg.Boot.Disks = make([]DiskConfig, len(portable.Boot.Disks))
 	for i := range portable.Boot.Disks {
 		cfg.Boot.Disks[i] = DiskConfig{

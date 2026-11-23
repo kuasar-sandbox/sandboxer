@@ -69,6 +69,12 @@ func (c Client) Snapshot(destURL string) error {
 // reaper path. The 2xx is the ACK; the actual exit is awaited by the caller.
 func (c Client) ShutdownVMM() error { return c.do("PUT", "/api/v1/vmm.shutdown", "") }
 
+// ShutdownVMMContext bounds both CONNECT and response with the owner's remaining
+// shutdown budget. An API ACK does not replace waiting for the VMM process.
+func (c Client) ShutdownVMMContext(ctx context.Context) error {
+	return c.doContext(ctx, "PUT", "/api/v1/vmm.shutdown", "")
+}
+
 func (c Client) do(method, path, body string) error {
 	return c.doContext(context.Background(), method, path, body)
 }
@@ -89,8 +95,18 @@ func (c Client) doContext(ctx context.Context, method, path, body string) error 
 	defer conn.Close()
 	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 	defer stopCancel()
+	var deadline time.Time
 	if c.RespDeadline > 0 {
-		_ = conn.SetDeadline(time.Now().Add(c.RespDeadline))
+		deadline = time.Now().Add(c.RespDeadline)
+	}
+	if d, ok := ctx.Deadline(); ok && (deadline.IsZero() || d.Before(deadline)) {
+		deadline = d
+	}
+	if !deadline.IsZero() {
+		_ = conn.SetDeadline(deadline)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	req := fmt.Sprintf("%s %s HTTP/1.1\r\nHost: ch\r\n", method, path)

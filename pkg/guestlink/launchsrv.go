@@ -107,6 +107,7 @@ type LaunchServer struct {
 
 	initialStateV1 atomic.Bool
 	ext4DiscardV1  atomic.Bool
+	systemdV1      atomic.Bool
 	muxReady       chan struct{}
 	runtimeReady   chan struct{}
 	runtimeOnce    sync.Once
@@ -221,6 +222,9 @@ func (s *LaunchServer) InitialLaunchStateSupported() bool { return s.initialStat
 // Ext4DiscardSupported is fixed by the accepted runtime-ready hello.
 func (s *LaunchServer) Ext4DiscardSupported() bool { return s.ext4DiscardV1.Load() }
 
+// SystemdSupported is fixed by the accepted runtime-ready Hello.
+func (s *LaunchServer) SystemdSupported() bool { return s.systemdV1.Load() }
+
 // DiskCapabilities reports the accepted runtime-ready Guest Hello.
 func (s *LaunchServer) DiskCapabilities() (slot, projection bool) {
 	return s.diskSlotV1.Load(), s.diskProjectionV1.Load()
@@ -325,6 +329,7 @@ func (s *LaunchServer) handleConnAfter(conn net.Conn, afterClose *func()) (hande
 		}()
 		s.initialStateV1.Store(msg.InitialLaunchStateV1)
 		s.runtimeOnce.Do(func() {
+			s.systemdV1.Store(msg.SystemdV1)
 			s.ext4DiscardV1.Store(msg.Ext4DiscardV1)
 			s.diskSlotV1.Store(msg.DiskSlotV1)
 			s.diskProjectionV1.Store(msg.DiskMountProjectionV1)
@@ -361,6 +366,14 @@ func (s *LaunchServer) handleConnAfter(conn net.Conn, afterClose *func()) (hande
 		}
 		if spec.Ext4Discard == proto.DiscardManual && !msg.Ext4DiscardV1 {
 			err := errors.New("guest incompatible: ext4_discard_v1 is required for resources.diff_cow.discard=manual; update boot.runtime")
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+			if s.OnLaunchFailure != nil {
+				s.OnLaunchFailure(err)
+			}
+			return false
+		}
+		if spec.Systemd != "" && spec.Systemd != "off" && !msg.SystemdV1 {
+			err := errors.New("guest incompatible: systemd_v1 is required for launch.systemd; update boot.runtime")
 			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
 			if s.OnLaunchFailure != nil {
 				s.OnLaunchFailure(err)

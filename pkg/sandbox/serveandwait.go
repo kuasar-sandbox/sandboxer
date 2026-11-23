@@ -97,6 +97,7 @@ type PostSpawnCtx struct {
 // callers (sandbox.Run / restore.Run) keep their own thin front-half
 // (config resolution, cgroup, controller admit) and converge here.
 type VMParams struct {
+	RunID              string // new Host execution identity, never restored from Guest memory
 	DiskStorage        *artifact.ProcessStorage
 	DiskCache          *diffstore.Cache
 	DiskIO             *vhost.IOController // runtime-wide rate policy; nil means unrestricted
@@ -912,6 +913,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			r.checkpointOwner = p.CheckpointOwner
 			defer func() { r.checkpointOwner = nil }()
 			r.sandboxID = p.SandboxID
+			r.reaped = chExited
 			r.baseDir = p.BaseDir
 			r.diskStorage = p.DiskStorage
 			r.diskCache = p.DiskCache
@@ -931,6 +933,41 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	}
 	if r := p.owner; r != nil {
 		r.mu.Lock()
+		if r.spec.RunID == "" {
+			var err error
+			r.spec.RunID, err = resolveRuntimeRunID(p.RunID, p.DiskCurrentRun)
+			if err != nil {
+				r.mu.Unlock()
+				return -1, err
+			}
+			logf("runtime identity sandbox=%s run=%s", p.SandboxID, r.spec.RunID)
+		}
+		r.sandboxID = p.SandboxID
+		ctlSrv.ShutdownHandler = r.prepareShutdown
+		r.shutdownGrace = time.Duration(p.SnapCfg.StopGraceSeconds()) * time.Second
+		r.shutdownGuest = func(ctx context.Context) error {
+			pauseCtx, cancelPause := context.WithTimeout(ctx, chShutdownGrace)
+			pauseErr := pinger.PauseContext(pauseCtx)
+			cancelPause()
+			if pauseErr != nil {
+				logf("shutdown ping drain: %v; attempting shutdown within the original deadline", pauseErr)
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			remaining, ok := ctx.Deadline()
+			if !ok {
+				return errors.New("shutdown requires an owner deadline")
+			}
+			resp, err := pinger.Client.RoundTripContext(ctx, &proto.Message{Type: proto.TypeShutdown}, time.Until(remaining))
+			if err != nil {
+				return err
+			}
+			if resp.Type != proto.TypeAck {
+				return fmt.Errorf("Guest shutdown: %s: %s", resp.Type, resp.Msg)
+			}
+			return nil
+		}
 		r.launch = launch
 		r.runDir = runDir
 		r.listCheckpoints = snapHandler.listCheckpoints
@@ -973,6 +1010,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			return client, est, nil
 		}
 		r.installLaunch = func(cfg *config.SandboxConfig, c0 *config.PortableSandboxConfig, spec LaunchSpec, disks []DiskBackend, ls *proto.LaunchSpec) error {
+			r.shutdownGrace = time.Duration(cfg.StopGraceSeconds()) * time.Second
 			var backends []vhost.Backend
 			var refs []SnapDiskRef
 			for _, d := range disks {
@@ -1257,7 +1295,11 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		logf("post-spawn interrupted by shutdown: %v", err)
 	}
 
-	waitErr := waitForCHWithSignalEscalation(doneCh, sigCh, cmd.Process, chPid, chSock, cgroupPath, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf)
+	var shutdownDeadline func() time.Time
+	if p.owner != nil {
+		shutdownDeadline = p.owner.shutdownFinalDeadline
+	}
+	waitErr := waitForCHWithSignalEscalation(doneCh, sigCh, cmd.Process, chPid, chSock, cgroupPath, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf, shutdownDeadline)
 	cancelBackends()
 	backendWG.Wait()
 	exit := 0

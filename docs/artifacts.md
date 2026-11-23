@@ -433,6 +433,14 @@ Portable content includes:
 - The immutable root/data graph, plus data-disk names, order, and mount topology.
 - Persistent launch/plugin/mounts/files/init/metadata.
 
+`launch.systemd` persists the cold-start policy. A missing field in an older E
+means `off`. `launch.systemd_path_default` is internal artifact metadata recording
+that the stored PATH came from image/Runtime defaults; it is not an ordinary
+Launch option and cannot be set in a user Launch document. The marker and the
+actual PATH survive E projection and cloning. An explicit persistent PATH clears
+it; invocation-only PATH overrides affect the wire without changing the artifact.
+Older artifacts with a stored PATH and no marker retain authoritative PATH values.
+
 Portable content excludes:
 
 - Cgroup paths/fds/controllers, overhead, watermark, startup, and `resources.diff_cow` cache policy.

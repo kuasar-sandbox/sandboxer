@@ -44,6 +44,7 @@ import (
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
+	RunID                    string // exact execution identity, independent of retained disks
 	runtime                  *Runtime
 	memoryAsyncDisabled      bool
 	memoryLayout             snapshot.MemoryLayout
@@ -325,6 +326,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.BaseRoot = opts.BaseRoot
 	shape.EnableCheckpoint = opts.EnableCheckpoint
 	shape.CurrentRun = opts.CurrentRun
+	shape.RunID = opts.RunID
 	shape.checkpointPlan = opts.checkpointPlan
 	shape.checkpointOwner = opts.checkpointOwner
 	shape.checkpointReleaseSources = opts.checkpointReleaseSources
@@ -719,7 +721,8 @@ type processSignaler interface {
 //     teardown spent ~31 s in kernel mm-lock contention after SIGKILL).
 //  2. If lifting memory.high or the API call fails (CH dead, socket closed,
 //     etc.) fall back to forwarding SIGTERM to the CH process.
-//  3. Arm a grace timer; if CH still hasn't exited, escalate to SIGKILL.
+//  3. The grace timer spans both preparation and API calls; at its deadline,
+//     escalate to SIGKILL if the sole CH reaper has not completed.
 //  4. A second SIGTERM/INT from the user escalates immediately.
 //
 // chSock is empty for tests that exercise only the signal path; in that
@@ -735,6 +738,7 @@ func waitForCHWithSignalEscalation(
 	chRespDeadline time.Duration,
 	grace time.Duration,
 	logf func(format string, args ...any),
+	deadlineSources ...func() time.Time,
 ) error {
 	var killTimer *time.Timer
 	var killCh <-chan time.Time
@@ -746,22 +750,36 @@ func waitForCHWithSignalEscalation(
 	var memoryHighLock *os.File
 	var pendingShutdownSignal os.Signal
 	shutdownInitiated := false
-	finishShutdownRequest := func(sig os.Signal, useAPI bool) {
-		usedAPI := false
-		if useAPI {
-			if err := (chapi.Client{Sock: chSock, RespDeadline: chRespDeadline}).ShutdownVMM(); err == nil {
-				logf("received %v, requested vmm.shutdown via API (will SIGKILL after %s if CH still alive)", sig, grace)
-				usedAPI = true
-			} else {
-				logf("received %v, vmm.shutdown API failed (%v) — falling back to SIGTERM", sig, err)
+	var shutdownCtx context.Context
+	var cancelShutdown context.CancelFunc
+	var apiResult <-chan error
+	startDeadline := func() {
+		deadline := time.Now().Add(grace)
+		for _, source := range deadlineSources {
+			if source == nil {
+				continue
+			}
+			if ownerDeadline := source(); !ownerDeadline.IsZero() && ownerDeadline.Before(deadline) {
+				deadline = ownerDeadline
 			}
 		}
-		if !usedAPI {
-			logf("received %v, forwarding SIGTERM to CH (will SIGKILL after %s)", sig, grace)
-			_ = proc.Signal(syscall.SIGTERM)
-		}
-		killTimer = time.NewTimer(grace)
+		shutdownCtx, cancelShutdown = context.WithDeadline(context.Background(), deadline)
+		// This timer starts before memory.high draining or any API round trip.
+		killTimer = time.NewTimer(time.Until(deadline))
 		killCh = killTimer.C
+	}
+	finishShutdownRequest := func(sig os.Signal, useAPI bool) {
+		if useAPI {
+			result := make(chan error, 1)
+			apiResult = result
+			go func() {
+				result <- (chapi.Client{Sock: chSock, RespDeadline: chRespDeadline}).ShutdownVMMContext(shutdownCtx)
+			}()
+			logf("received %v, requesting vmm.shutdown within the original shutdown deadline", sig)
+			return
+		}
+		logf("received %v, forwarding SIGTERM to CH within the original shutdown deadline", sig)
+		_ = proc.Signal(syscall.SIGTERM)
 	}
 	attemptShutdownRequest := func(sig os.Signal) {
 		useAPI := false
@@ -814,9 +832,14 @@ func waitForCHWithSignalEscalation(
 		case sig := <-sigCh:
 			if !shutdownInitiated {
 				shutdownInitiated = true
+				startDeadline()
 				attemptShutdownRequest(sig)
 			} else {
 				logf("received %v while shutdown in progress, sending SIGKILL now", sig)
+				if cancelShutdown != nil {
+					cancelShutdown()
+				}
+				apiResult = nil
 				_ = proc.Signal(syscall.SIGKILL)
 				if memoryHighLockRetryTimer != nil {
 					memoryHighLockRetryTimer.Stop()
@@ -841,11 +864,32 @@ func waitForCHWithSignalEscalation(
 			drainCh = nil
 			drainTimer = nil
 			finishShutdownRequest(pendingShutdownSignal, true)
+		case err := <-apiResult:
+			apiResult = nil
+			if err != nil {
+				logf("vmm.shutdown API failed (%v), forwarding SIGTERM within the original deadline", err)
+				_ = proc.Signal(syscall.SIGTERM)
+			}
 		case <-killCh:
-			logf("CH didn't exit within %s of shutdown request, sending SIGKILL pid=%d", grace, chPid)
+			logf("CH reached the shutdown deadline, sending SIGKILL pid=%d", chPid)
+			if cancelShutdown != nil {
+				cancelShutdown()
+			}
+			apiResult = nil
+			if drainTimer != nil {
+				drainTimer.Stop()
+			}
+			drainCh = nil
+			if memoryHighLockRetryTimer != nil {
+				memoryHighLockRetryTimer.Stop()
+			}
+			memoryHighLockRetryCh = nil
 			_ = proc.Signal(syscall.SIGKILL)
 			killCh = nil
 		case waitErr := <-doneCh:
+			if cancelShutdown != nil {
+				cancelShutdown()
+			}
 			if memoryHighLockRetryTimer != nil {
 				memoryHighLockRetryTimer.Stop()
 			}

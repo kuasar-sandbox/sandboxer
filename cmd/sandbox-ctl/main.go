@@ -2,6 +2,7 @@
 // Subcommands:
 //
 //	run       — explicit cold start, Sandbox E cold start, or Snapshot S restore
+//	shutdown  — normally stop an exact sandbox run and await retirement
 //	export    — create a runnable Sandbox E without memory state
 //	snapshot  — create Sandbox E and memory Snapshot S at one freeze point
 //	exec      — run an ad-hoc command inside a running sandbox
@@ -50,6 +51,8 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		os.Exit(runCmd(os.Args[2:]))
+	case "shutdown":
+		os.Exit(shutdownCmd(os.Args[2:]))
 	case "disk":
 		os.Exit(diskCmd(os.Args[2:]))
 	case "checkpoint":
@@ -105,6 +108,8 @@ func printUsage(w *os.File) {
 	fmt.Fprintf(w, `sandbox-ctl — sandbox runtime control
 
 Usage:
+  sandbox-ctl shutdown --sandbox-id <sid> --run-id <run-id>
+                        [--path-id <leaf>] [--run-root <dir>] [--timeout <duration>]
   sandbox-ctl run       [--config host.yaml[:instance.yaml]] [--manifest-config <path>]
                         [--sandbox-id <sid>] [--path-id <leaf>] [--ch-binary <path>]
                         [--run-root <dir>] [--base-root <dir>] [--enable-checkpoint]

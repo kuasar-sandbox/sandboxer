@@ -56,6 +56,7 @@ import (
 // Disk refs in the referenced Sandbox E likewise support manifest:// when
 // Fetcher is set. Parent .sandbox refs are always narrowed to their Payload.
 type Options struct {
+	RunID               string // identity of this new execution, independent of retained disks
 	storage             *artifact.ProcessStorage
 	EnableCheckpoint    bool // persistent multi-version writable disks
 	CurrentRun          *artifact.CurrentRun
@@ -633,6 +634,7 @@ func run(ctx context.Context, opts Options) (code int, retErr error) {
 	// waitAPI → /vm.resume → restore{epoch} → local restore normalization.
 	return sandbox.ServeAndWait(sandbox.VMParams{
 		BaseDir:     sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID),
+		RunID:       opts.RunID,
 		DiskStorage: opts.storage, DiskCache: cowCache, DiskCurrentRun: opts.CurrentRun, DiskPlan: opts.checkpointPlan,
 		DiskIO:             sandbox.NewDiskIOController(diskLimits),
 		EnableCheckpoint:   opts.EnableCheckpoint,

@@ -103,7 +103,7 @@ func rejectRestoreColdOnly(host *SandboxConfig, presence FieldPresence) error {
 	if host.Resources.DiffCOW.Discard != "" {
 		return errors.New("run --restore: resources.diff_cow.discard is cold-start-only; restored filesystems retain their captured mount options")
 	}
-	if host.Launch.Exec != "" || len(host.Launch.Args) != 0 || len(host.Launch.Env) != 0 ||
+	if host.Launch.Systemd != "" || host.Launch.Exec != "" || len(host.Launch.Args) != 0 || len(host.Launch.Env) != 0 ||
 		len(host.Launch.EphemeralEnv) != 0 || host.Launch.Placeholder || len(host.Launch.Plugin) != 0 ||
 		host.Launch.CgroupControl || host.Launch.PIDNamespace != "" || host.Launch.User != "" ||
 		host.Launch.StopSignal != "" || host.Launch.StopGracePeriod != "" || host.Launch.StartTimeout != "" ||

@@ -60,6 +60,7 @@ func MaterializeImageDefaults(cfg *config.SandboxConfig, image *ImageConfig) err
 	cfg.Launch.Exec = spec.Exec
 	cfg.Launch.Args = append([]string(nil), spec.Args...)
 	cfg.Launch.Env = cloneLaunchEnv(spec.Env)
+	cfg.Launch.SetSystemdPathDefault(spec.SystemdPathDefault)
 	cfg.Launch.Workdir = spec.Workdir
 	cfg.Launch.Restart = spec.Restart
 	cfg.Launch.CgroupControl = spec.CgroupControl
@@ -218,9 +219,11 @@ func imageConfigFromRuntime(rc *image.RuntimeConfig) *ImageConfig {
 // Workdir / Restart: override else image else default.
 func MergeLaunch(image *ImageConfig, override config.LaunchConfig) (*proto.LaunchSpec, error) {
 	spec := &proto.LaunchSpec{
-		Workdir:       "/",
-		Restart:       "never",
-		CgroupControl: override.CgroupControl,
+		Systemd:            override.EffectiveSystemd(),
+		SystemdPathDefault: override.SystemdPathDefault(),
+		Workdir:            "/",
+		Restart:            "never",
+		CgroupControl:      override.CgroupControl,
 	}
 
 	// Placeholder: no external program. Skip exec resolution (and any image

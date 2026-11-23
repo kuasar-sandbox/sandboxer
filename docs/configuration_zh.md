@@ -231,11 +231,12 @@ sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
 
 | 字段 | 类型 / 默认值 | 校验与效果 |
 | --- | --- | --- |
+| `launch.systemd` | `off`、`auto`、`runtime`、`provided`；省略继承 E，否则 `off` | 选择环境 PID 1；active 模式要求实际 Guest 宣告 `systemd_v1`。拒绝 null、Boolean、空字符串及其他值。 |
 | `launch.exec`、`launch.args` | String、string list | 覆盖镜像 entrypoint/参数；single-disk root 要求显式 exec，除非使用 placeholder |
 | `launch.env`、`launch.ephemeral_env` | String map | 持久环境与当前调用覆盖；见[合并规则](#files-and-environment) |
 | `launch.workdir` | String；普通加载后 `/` | 应用工作目录；image/source projection 服从相应 launch merge 规则 |
 | `launch.restart` | `never`、`on-failure`、`always`；`never` | 主进程监督 |
-| `launch.cgroup_control` | Boolean；`false` | true 在用户可见 cgroup 根下放 controllers，将直接管理的进程放入 `/init` 叶组；false 直接使用 scoped 根。全局层级由 Guest Runtime 决定。见 [Guest 拓扑](guest-abi_zh.md#application-cgroups)。 |
+| `launch.cgroup_control` | Boolean；`false` | true 在用户可见 cgroup 根下放 controllers，将直接管理的进程放入 `/init` 叶组；false 直接使用 scoped 根。systemd 模式固定开启委托，同时保留此原始值供后续 direct 冷启动使用。全局层级由 Guest Runtime 决定。见 [Guest 拓扑](guest-abi_zh.md#application-cgroups)。 |
 | `launch.placeholder` | Boolean；`false` | 无 exec anchor；与 exec 互斥并始终 restart |
 | `launch.pid_namespace` | `private`、`shared`；`private` | Private 使应用成为 namespace PID 1；shared 暴露负责回收孤儿的 Runtime PID 1 |
 | `launch.user` | 身份 String；镜像 user，否则 root | `uid:gid` 或 `name:group` |
@@ -250,6 +251,24 @@ sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
 | `init[].exec`、`.args`、`.env`、`.workdir`、`.user` | String/list/map/string/string | 应用启动前按顺序执行的一次性命令 |
 | `init[].timeout` | Duration；空/零无限制 | 非零退出或 timeout 中止初始化 |
 | `metadata` | String map；空 | Opaque portable 值，runtime 不解释 |
+
+### Systemd 启动策略
+
+```yaml
+launch:
+  systemd: auto
+```
+
+`off` 使用直接监督；`runtime` 要求 Runtime 自带的 systemd；`provided` 要求工作负载
+rootfs 提供 systemd。`auto` 在 rootfs 存在安装时选择它，否则选择 Runtime 安装；
+选中安装校验失败则启动失败。active 模式共享 systemd 环境 PID namespace，并开启
+cgroup 委托，但不重写 E 中的原始 `pid_namespace` 或 `cgroup_control` 值。
+
+E 冷启动中，省略继承来源策略，显式 `off` 关闭继承策略；新的完整定义保存有效值。
+S 恢复保持捕获时 manager 和进程状态，拒绝包括 `off` 在内的模式覆盖。
+只有实际选中 Runtime 安装时，默认 PATH 才添加 `/run/sandbox-runtime/systemd/bin`。
+显式 `launch.env.PATH`、`launch.ephemeral_env.PATH`（包括空值）始终保留覆盖权。
+旧 E 保存了 PATH 但没有来源标记时，继续保持该 PATH。
 
 ### Restore、Usage 与 deadline
 

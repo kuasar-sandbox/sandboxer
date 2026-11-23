@@ -117,6 +117,7 @@ func TestDiffCOWDiscardMergedPolicy(t *testing.T) {
 
 func TestDiffCOWDiscardRunFromHostOwnership(t *testing.T) {
 	artifact := portableFromFixture()
+	artifact.Launch.Systemd = "off" // a complete definition's materialized default
 	before, err := MarshalPortableSandboxConfig(artifact)
 	if err != nil {
 		t.Fatal(err)

@@ -85,14 +85,14 @@ stateDiagram-v2
     starting --> closing: 失败或取消
     runtime_ready --> closing: Close 或 VM 退出
     launching --> closing: 失败或取消
-    running --> closing: Close、终态失败或 VM 退出
+    running --> closing: Shutdown、Close、终态失败或 VM 退出
     closing --> closed: owned work 与 cleanup 已 join
     closed --> [*]
 ```
 
 纯 Launch 校验失败可以保留 `runtime_ready`，让调用者修正输入；一旦进入 launching，失败即为终态。
 `Stats` 可观测 ready base；`Exec`、`Snapshot`、`Export` 要求工作负载 running。`Restore` 直接重建已有
-应用并返回相同公开 owner 类型，不执行新冷 Launch。`Wait(ctx)` 只等待；`Close` 请求停机并 join 保留的
+应用并返回相同公开 owner 类型，不执行新冷 Launch。`Wait(ctx)` 只等待；`Close` 退役资源并 join 保留的
 退出结果。后文给出源、context、descriptor 和 callback 的详细所有权契约。
 
 <a id="operations"></a>
@@ -244,11 +244,35 @@ running 前拒绝 Snapshot/Export；尚无工作负载的 Guest 拒绝 restore/a
 Operation context 限定 startup、launch、restore、live operation 和单次 wait。
 成功返回后取消 startup/launch context，不会杀死 Runtime 或使后续 lazy read 失效。
 取消 `Wait(ctx)` 只取消该次等待；清理后重复 Wait 观察同一份保留的 `ExitResult`。
-并发、幂等的 `Close` 由唯一 owner 请求优雅 VMM shutdown，在 CH exit 前保持 backend
+并发、幂等的 `Close` 由唯一 owner 退役 VMM，在 CH exit 前保持 backend
 存活，等待自有工作退出后释放 storage。SDK 不安装 OS signal handler。CLI 注册
 SIGTERM/SIGINT，并保留第二次 signal 立即升级的行为。CLI 也通过
 `stdio.Mode.WindowChanges` 提供 SIGWINCH；SDK 只消费该 channel，不注册 signal。
 清理会取消并等待空闲 input pump，不关闭继承的 stdin。桥接期间每个输入 FD 只有一个消费者。
+
+`Runtime.Shutdown(ctx)` 请求 Guest 正常关机并等待真实退出结果。受理后关闭新的工作负载
+操作准入，重复请求共享首次锁定的期限。调用方取消只结束自己的等待，不撤销已受理
+动作。ACK、EOF 均不代替实际 VMM Wait。冻结中或已提交的冻结捕获源拒绝正常关机，
+已有清理路径可直接销毁它，不隐式 thaw。
+
+G 采用 Guest 实际使用的宽限（正整数 wire 秒，否则 10 秒），F 为内部 5 秒：Guest
+阶段最多 G + F，随后 VMM 收敛至总计 G + 2F；调用方较短期限同时收紧两阶段。独立
+VMM timer 早于 memory.high 准备和 API 请求，第二次 signal 仍立即升级。强制退役
+返回错误；未被实际回收的进程不会报告为已释放。
+
+本机 API `ctl.Shutdown(ctx, socket, ctl.ShutdownTarget{SandboxID, RunID})` 绑定精确
+执行代次。`Runtime.RunID()` 返回该值；CLI run 会记录它，省略 `--run-id` 时自动产生
+新值。单独设置此身份不会开启磁盘保留。例如：
+
+```bash
+sandbox-ctl shutdown --sandbox-id demo --run-id RUN_ID --path-id demo
+```
+
+`--timeout` 可进一步收紧预算。连接、写请求和读取 `shutdown_accepted` 合计共享
+5 秒；受理帧携带首次 owner 的本机单调时钟绝对截止时间，此后客户端仅等至它与
+调用方期限中较早者读取 `shutdown_done`。无响应或旧 owner 会有界返回 transport/
+unsupported 错误。受理帧丢失、连接断开不会撤销停止。owner 开始前已脱离最终回复
+连接的清理义务，所以快速退出不会提前关掉回复，也不会与关机等待互锁。
 
 Live `Exec`、`Snapshot`、`Export`、`Stats` 直接调用 owner。Exec 返回调用方负责关闭的
 Guest MUX connection 及协商后的 stdio spec。Capture 复用既有 `ctl.Request` 选项和

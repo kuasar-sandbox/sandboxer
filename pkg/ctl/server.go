@@ -16,6 +16,8 @@ import (
 // handlers. Each accepted connection is serviced in its own goroutine,
 // so concurrent snapshot/exec requests don't block each other.
 type Server struct {
+	// ShutdownHandler validates only. Begin/Wait run after response detachment.
+	ShutdownHandler         func(ShutdownRequest) (ShutdownOperation, error)
 	CaptureStateHandler     func(context.Context, CaptureStateQuery) (CaptureState, error)
 	DiskBindHandler         func(BindDiskRequest) error
 	DiskListHandler         func() (DiskStateReport, error)
@@ -45,7 +47,7 @@ type Server struct {
 	conns    map[net.Conn]struct{}
 	connDone map[net.Conn]func()
 	connsWG  sync.WaitGroup
-	// Detached capture replies no longer own runtime resources, but an
+	// Detached capture/shutdown replies no longer own runtime resources, but an
 	// executable must still join their complete framed writes before exiting.
 	responsesWG   sync.WaitGroup
 	responsesDone chan struct{}
@@ -56,7 +58,7 @@ type Server struct {
 
 // Listen binds the UDS.
 func (s *Server) Listen() error {
-	if s.CaptureStateHandler == nil && s.SnapshotHandler == nil && s.ExportHandler == nil && s.UsageHandler == nil && s.ResourceStatsHandler == nil && s.ExecHandler == nil && s.DiskBindHandler == nil && s.DiskListHandler == nil && s.CheckpointListHandler == nil && s.CheckpointDeleteHandler == nil {
+	if s.ShutdownHandler == nil && s.CaptureStateHandler == nil && s.SnapshotHandler == nil && s.ExportHandler == nil && s.UsageHandler == nil && s.ResourceStatsHandler == nil && s.ExecHandler == nil && s.DiskBindHandler == nil && s.DiskListHandler == nil && s.CheckpointListHandler == nil && s.CheckpointDeleteHandler == nil {
 		return errors.New("ctl: Server has no handlers")
 	}
 	if s.Logf == nil {
@@ -136,7 +138,7 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 // ResponsesDone closes after Serve has stopped accepting and every accepted
-// handler has finished, including detached capture responses. It is available
+// handler has finished, including detached capture/shutdown responses. It is available
 // after Listen. Runtime cleanup must not wait for it: a capture response can be
 // waiting for that cleanup. Executable shutdown joins it after retirement.
 func (s *Server) ResponsesDone() <-chan struct{} { return s.responsesDone }
@@ -172,6 +174,9 @@ func (s *Server) handle(conn *net.UnixConn) {
 		return
 	}
 	switch req.Type {
+	case TypeShutdownRequest:
+		s.serveShutdown(conn, req)
+		return
 	case TypeCaptureStateRequest:
 		s.serveCaptureState(conn, req)
 		return
@@ -299,7 +304,7 @@ func (s *Server) handle(conn *net.UnixConn) {
 			resp.Type = TypeSnapshotDone
 		}
 		if resp.BeforeWrite != nil {
-			s.detachCapture(conn)
+			s.detachResponse(conn)
 		}
 		if writeErr := writeCaptureResponse(conn, resp); writeErr != nil {
 			s.Logf("ctl.sock: write resp: %v", writeErr)
@@ -359,7 +364,7 @@ func writeCaptureResponse(conn net.Conn, resp Response) error {
 	return WriteMessage(conn, resp)
 }
 
-func (s *Server) detachCapture(conn net.Conn) {
+func (s *Server) detachResponse(conn net.Conn) {
 	s.connsMu.Lock()
 	done := s.connDone[conn]
 	s.connsMu.Unlock()

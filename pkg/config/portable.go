@@ -100,18 +100,22 @@ type PortableOverlayConfig struct {
 // PortableLaunchConfig mirrors the guest-visible/persistent LaunchConfig
 // fields. StartTimeout and EphemeralEnv are intentionally absent.
 type PortableLaunchConfig struct {
-	Exec            string            `yaml:"exec,omitempty"`
-	Args            []string          `yaml:"args,omitempty"`
-	Env             map[string]string `yaml:"env,omitempty"`
-	Workdir         string            `yaml:"workdir,omitempty"`
-	Restart         string            `yaml:"restart,omitempty"`
-	CgroupControl   bool              `yaml:"cgroup_control,omitempty"`
-	Placeholder     bool              `yaml:"placeholder,omitempty"`
-	PIDNamespace    string            `yaml:"pid_namespace,omitempty"`
-	Plugin          []PluginConfig    `yaml:"plugin,omitempty"`
-	User            string            `yaml:"user,omitempty"`
-	StopSignal      string            `yaml:"stop_signal,omitempty"`
-	StopGracePeriod string            `yaml:"stop_grace_period,omitempty"`
+	// SystemdPathDefault records PATH origin after image defaults are folded.
+	// It is internal artifact metadata, not a user-facing Launch option.
+	SystemdPathDefault bool              `yaml:"systemd_path_default,omitempty"`
+	Systemd            string            `yaml:"systemd,omitempty"`
+	Exec               string            `yaml:"exec,omitempty"`
+	Args               []string          `yaml:"args,omitempty"`
+	Env                map[string]string `yaml:"env,omitempty"`
+	Workdir            string            `yaml:"workdir,omitempty"`
+	Restart            string            `yaml:"restart,omitempty"`
+	CgroupControl      bool              `yaml:"cgroup_control,omitempty"`
+	Placeholder        bool              `yaml:"placeholder,omitempty"`
+	PIDNamespace       string            `yaml:"pid_namespace,omitempty"`
+	Plugin             []PluginConfig    `yaml:"plugin,omitempty"`
+	User               string            `yaml:"user,omitempty"`
+	StopSignal         string            `yaml:"stop_signal,omitempty"`
+	StopGracePeriod    string            `yaml:"stop_grace_period,omitempty"`
 }
 
 // PortableProjection supplies identities whose source paths are host-only.
@@ -385,7 +389,9 @@ func withoutPortableRef(refs []string, excluded string) []string {
 
 func portableLaunch(in LaunchConfig) PortableLaunchConfig {
 	return PortableLaunchConfig{
-		Exec: in.Exec, Args: append([]string(nil), in.Args...), Env: cloneMap(in.Env),
+		Systemd:            in.EffectiveSystemd(),
+		SystemdPathDefault: in.PersistentSystemdPathDefault(),
+		Exec:               in.Exec, Args: append([]string(nil), in.Args...), Env: cloneMap(in.Env),
 		Workdir: in.Workdir, Restart: in.Restart, CgroupControl: in.CgroupControl,
 		Placeholder: in.Placeholder, PIDNamespace: in.PIDNamespace,
 		Plugin: clonePlugins(in.Plugin), User: in.User, StopSignal: in.StopSignal,
@@ -527,6 +533,11 @@ func parsePortableSandboxConfig(raw []byte, checkpoint bool) (*PortableSandboxCo
 }
 
 func validateStrictYAMLNode(node *yaml.Node, path string) error {
+	if path == "launch.systemd" {
+		if err := validateSystemdNode(node); err != nil {
+			return err
+		}
+	}
 	if node == nil {
 		return errors.New("nil YAML node")
 	}
@@ -929,6 +940,9 @@ func validatePortableMounts(mounts []MountConfig, names map[string]int, slots ma
 
 func validatePortableLaunch(p *PortableSandboxConfig) error {
 	launch := &p.Launch
+	if !validSystemdMode(launch.Systemd) {
+		return fmt.Errorf("invalid portable launch.systemd %q", launch.Systemd)
+	}
 	if launch.Placeholder && launch.Exec != "" {
 		return errors.New("portable launch.placeholder and launch.exec are mutually exclusive")
 	}

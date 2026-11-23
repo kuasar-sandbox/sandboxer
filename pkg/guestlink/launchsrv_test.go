@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -570,5 +573,64 @@ func TestBoundSlotRequiresGuestSupportBeforeColdLaunch(t *testing.T) {
 	spec.Mounts[0].DiskSlotDeclared = false
 	if err := checkDiskMountSupport(&proto.Message{}, spec); err != nil {
 		t.Fatalf("ordinary whole disk: %v", err)
+	}
+}
+
+func TestSystemdModeRequiresCapabilityBeforeSendingLaunch(t *testing.T) {
+	for _, mode := range []string{"off", "auto", "runtime", "provided"} {
+		for _, supported := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/%v", mode, supported), func(t *testing.T) {
+				dir, err := os.MkdirTemp("/tmp", "systemd-launch-")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer os.RemoveAll(dir)
+				path := filepath.Join(dir, "launch.sock")
+				srv := &LaunchServer{Path: path, Spec: &proto.LaunchSpec{Exec: "/bin/true", Systemd: mode}, StartTimeout: time.Second}
+				if err := srv.Listen(); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				defer srv.Stop()
+				done := make(chan error, 1)
+				go func() { done <- srv.Serve(ctx) }()
+				conn, err := net.Dial("unix", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(time.Second))
+				if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: true, SystemdV1: supported}); err != nil {
+					t.Fatal(err)
+				}
+				response, err := proto.ReadMessage(conn)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode != "off" && !supported {
+					if response.Type != proto.TypeError || !strings.Contains(response.Msg, "systemd_v1") {
+						t.Fatalf("incompatible Launch was sent: %+v", response)
+					}
+				} else {
+					if response.Type != proto.TypeLaunch || response.Launch.Systemd != mode {
+						t.Fatalf("response=%+v", response)
+					}
+					if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeLaunchAck}); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := proto.ReadMessage(conn); err != nil {
+						t.Fatal(err)
+					}
+				}
+				srv.Stop()
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("launch server did not stop")
+				}
+			})
+		}
 	}
 }
