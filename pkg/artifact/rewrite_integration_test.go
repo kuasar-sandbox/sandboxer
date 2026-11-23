@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -83,6 +85,14 @@ func rewriteTarget(t *testing.T, storage *ProcessStorage, dir string) *Publisher
 }
 
 func TestRewriteReduceAnyMaterializesMemoryAndAllDisks(t *testing.T) {
+	for _, annotated := range []bool{false, true} {
+		t.Run(fmt.Sprint(annotated), func(t *testing.T) {
+			testRewriteReduceAnyMaterializesMemoryAndAllDisks(t, annotated)
+		})
+	}
+}
+
+func testRewriteReduceAnyMaterializesMemoryAndAllDisks(t *testing.T, annotated bool) {
 	ctx := context.Background()
 	input, output := t.TempDir(), t.TempDir()
 	sink := snapshot.NewFileSink(input, "fixture", nil, false, nil)
@@ -120,11 +130,24 @@ func TestRewriteReduceAnyMaterializesMemoryAndAllDisks(t *testing.T) {
 	sRef := rewriteSaveS(t, sink, &snapshot.Config{Version: 1, SandboxRef: eRef, FromRefs: []string{pRef}}, rewriteSparse(t, currentMemory, sparse.Extent{Offset: 4096, Size: 8192}))
 	parsed, _ := manifest.ParseRef(sRef)
 	sourcePath := filepath.Join(input, parsed.Path)
-	result, err := publisher.PublishWithOptions(ctx, sourcePath, RewriteOptions{ReduceAny: true})
+	sourceRef := "file://" + sourcePath
+	if annotated {
+		parsed.Path = sourcePath
+		parsed.Runtime = manifest.RuntimeIdentity{Basename: "runtime.bundle", Digest: strings.Repeat("a", 64)}
+		sourceRef = parsed.String()
+	}
+	result, err := publisher.PublishWithOptions(ctx, sourceRef, RewriteOptions{ReduceAny: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertRemoved(t, result, "file://"+sourcePath, eRef, lowerRef, dTop, dLower, pRef)
+	assertRemoved(t, result, sourceRef, eRef, lowerRef, dTop, dLower, pRef)
+	published, err := manifest.ParseRef(result.Ref)
+	if err != nil || published.Runtime.IsZero() == annotated || (annotated && published.Runtime != parsed.Runtime) {
+		t.Fatalf("rewrite changed captured runtime: %v %v", published.Runtime, err)
+	}
+	if strings.Contains(result.SandboxRef, "@runtime:") {
+		t.Fatal("rewrite annotated the sibling Sandbox")
+	}
 	// All source increment files may now leave the retained graph.
 	if err = os.RemoveAll(input); err != nil {
 		t.Fatal(err)
@@ -507,11 +530,16 @@ func TestRewriteExplicitMemoryReductionPreservesExecutionState(t *testing.T) {
 	}
 	inputRef, _ := manifest.ParseRef(source)
 	inputRef.Path = filepath.Join(input, inputRef.Path)
+	inputRef.Runtime = manifest.RuntimeIdentity{Basename: "runtime.bundle", Digest: strings.Repeat("b", 64)}
 	target, _ := manifest.ParseRef(merged)
 	target.Path = filepath.Join(input, target.Path)
 	result, err := publisher.PublishWithOptions(ctx, inputRef.String(), RewriteOptions{Reductions: []RefReduction{{Top: inputRef.String(), Target: target.String()}}})
 	if err != nil {
 		t.Fatal(err)
+	}
+	published, err := manifest.ParseRef(result.Ref)
+	if err != nil || published.Runtime != inputRef.Runtime {
+		t.Fatalf("explicit root reduction lost runtime: %+v %v", published.Runtime, err)
 	}
 	root, err := snapshotfile.Open(ctx, rewriteOpen(t, publisher, result.Ref))
 	if err != nil {
@@ -532,6 +560,14 @@ func TestRewriteExplicitMemoryReductionPreservesExecutionState(t *testing.T) {
 }
 
 func TestRewriteBundleDependenciesSurviveRemovedSource(t *testing.T) {
+	for _, annotation := range []string{"", "@runtime:runtime.bundle:digest:" + strings.Repeat("a", 64)} {
+		t.Run(fmt.Sprint(annotation != ""), func(t *testing.T) {
+			testRewriteBundleDependenciesSurviveRemovedSource(t, annotation)
+		})
+	}
+}
+
+func testRewriteBundleDependenciesSurviveRemovedSource(t *testing.T, annotation string) {
 	ctx := context.Background()
 	cfg, storage := manifestPublisherFixture(t)
 	admission, err := cfg.WriteAdmission(ctx)
@@ -587,13 +623,19 @@ func TestRewriteBundleDependenciesSurviveRemovedSource(t *testing.T) {
 	}
 	path := filepath.Join(input, manifest.HexKey(key)+".bundle")
 	publisher := rewriteTarget(t, storage, output)
-	result, err := publisher.PublishWithOptions(ctx, path, RewriteOptions{ReduceAny: true})
+	result, err := publisher.PublishWithOptions(ctx, "file://"+path+annotation, RewriteOptions{ReduceAny: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	eKey, _ := manifest.ParseKeyRef(eref)
 	diskKey, _ := manifest.ParseKeyRef(disk)
-	assertRemoved(t, result, "file://"+path, bundleMemberRef("file://"+path, eKey), bundleMemberRef("file://"+path, diskKey))
+	assertRemoved(t, result, "file://"+path+annotation, bundleMemberRef("file://"+path, eKey), bundleMemberRef("file://"+path, diskKey))
+	if annotation != "" && !strings.HasSuffix(result.Ref, annotation) {
+		t.Fatalf("Bundle rewrite lost runtime declaration: %s", result.Ref)
+	}
+	if strings.Contains(result.SandboxRef, "@runtime:") {
+		t.Fatal("Bundle rewrite annotated the sibling Sandbox")
+	}
 	if err = os.RemoveAll(input); err != nil {
 		t.Fatal(err)
 	}

@@ -54,19 +54,25 @@ func TestAnnotatedSandboxRejectsBeforePublication(t *testing.T) {
 		if _, err := storage.Inspect(ctx, annotated, locations); err == nil {
 			t.Fatalf("inspection accepted non-Snapshot declaration: %s", annotated)
 		}
-		output := t.TempDir()
-		target, err := NewLocationPublisher(storage, "output", output, locations, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = target.Publish(ctx, annotated)
-		closeErr := target.Close()
-		if err == nil || closeErr != nil {
-			t.Fatalf("non-Snapshot publication = %v, close = %v", err, closeErr)
-		}
-		files, err := os.ReadDir(output)
-		if err != nil || len(files) != 0 {
-			t.Fatalf("rejected publication changed destination: %v, %v", files, err)
+		for _, rewrite := range []bool{false, true} {
+			output := t.TempDir()
+			target, err := NewLocationPublisher(storage, "output", output, locations, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rewrite {
+				_, err = target.PublishWithOptions(ctx, annotated, RewriteOptions{ReduceAny: true})
+			} else {
+				_, err = target.Publish(ctx, annotated)
+			}
+			closeErr := target.Close()
+			if err == nil || closeErr != nil {
+				t.Fatalf("non-Snapshot publication = %v, close = %v", err, closeErr)
+			}
+			files, err := os.ReadDir(output)
+			if err != nil || len(files) != 0 {
+				t.Fatalf("rejected publication changed destination: %v, %v", files, err)
+			}
 		}
 	}
 }
