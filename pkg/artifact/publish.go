@@ -367,7 +367,7 @@ func (p *Publisher) PublishSource(ctx context.Context, role LogicalRole, source 
 			return PublishResult{}, errors.New("publish Snapshot source: known sandbox ref is required")
 		}
 		parsed, err := manifest.ParseRef(sandboxRef[0])
-		if err != nil || !parsed.Portable() {
+		if err != nil || !parsed.Portable() || !parsed.Runtime.IsZero() {
 			return PublishResult{}, errors.New("publish Snapshot source: portable sandbox ref is required")
 		}
 		knownE = parsed.String()
@@ -385,7 +385,7 @@ func (p *Publisher) PublishSource(ctx context.Context, role LogicalRole, source 
 }
 
 // Publish auto-detects exactly one strict logical root and publishes its graph.
-func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, error) {
+func (p *Publisher) Publish(ctx context.Context, input string) (result PublishResult, retErr error) {
 	if p == nil || p.storage == nil || p.target == nil {
 		return PublishResult{}, errors.New("publish: publisher is not initialized")
 	}
@@ -394,16 +394,33 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 	if err != nil {
 		return PublishResult{}, err
 	}
+	root, err := manifest.ParseRef(rootRef)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	// Publication rewrites the content graph using base identities. Only the
+	// public reference to this same snapshot keeps its runtime declaration;
+	// sibling Sandbox/disk members and physical carriers never inherit it.
+	rootRef = root.Base().String()
+	defer func() {
+		if retErr != nil || result.Role != RoleSnapshot || root.Runtime.IsZero() {
+			return
+		}
+		result, retErr = result.withSnapshotRuntime(root.Runtime, scopedRef(rootRef, scope))
+	}()
 	p.original(rootRef, scope)
 	stream, childScope, err := p.open(ctx, rootRef, scope)
 	if err != nil {
 		return PublishResult{}, err
 	}
 	if opened, ok := stream.(*OpenedFile); ok && opened.Format() == FileFormatManifestBundle {
-		return p.publishBundle(ctx, rootRef, scope, childScope, opened)
+		return p.publishBundle(ctx, rootRef, scope, childScope, opened, !root.Runtime.IsZero())
 	}
 	sandboxRoot, sandboxErr := sandboxfile.Open(ctx, stream)
 	if sandboxErr == nil {
+		if !root.Runtime.IsZero() {
+			return PublishResult{}, errors.Join(errors.New("runtime declaration requires a Snapshot root"), sandboxRoot.Close())
+		}
 		ref, err := p.publishSandboxRoot(ctx, rootRef, childScope, sandboxRoot)
 		return p.result(RoleSandbox, ref, ref), err
 	}

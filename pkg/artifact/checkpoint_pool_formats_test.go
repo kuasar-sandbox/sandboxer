@@ -55,6 +55,11 @@ func TestCheckpointPooledBundleKeepsChunkRun(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			annotation := "@runtime:runtime.bundle:digest:" + strings.Repeat("a", 64)
+			annotated, _, err := snapshot.CommittedArtifactRef(sink, raw+annotation, "")
+			if err != nil || annotated != ref+annotation {
+				t.Fatalf("Bundle commit lost runtime declaration: %q, %v", annotated, err)
+			}
 			f.ref, f.path, f.descriptor = writeLocalMemory(t, f.directory, "bundle-child", f.eRef, []string{ref}, nil, "xxxxxx", 0, 0, 0, false)
 			root := openLocalFixture(t, f)
 			defer root.Close()

@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -48,7 +49,9 @@ func TestPublishManifestRootsToLocatedTarstream(t *testing.T) {
 	}
 	directory := t.TempDir()
 	locations := config.RefLocations{"output": directory}
-	for _, want := range []PublishResult{remoteE, remoteS} {
+	annotated := remoteS
+	annotated.Ref += "@runtime:runtime.bundle:digest:" + strings.Repeat("a", 64)
+	for _, want := range []PublishResult{remoteE, remoteS, annotated} {
 		target, err := NewLocationPublisher(storage, "output", directory, locations, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -68,6 +71,10 @@ func TestPublishManifestRootsToLocatedTarstream(t *testing.T) {
 		ref, err := manifest.ParseRef(got.Ref)
 		if err != nil || ref.Location != "output" {
 			t.Fatalf("ref=%s err=%v", got.Ref, err)
+		}
+		inputRef, _ := manifest.ParseRef(want.Ref)
+		if ref.Runtime != inputRef.Runtime {
+			t.Fatalf("publication changed snapshot runtime: %#v -> %#v", inputRef.Runtime, ref.Runtime)
 		}
 		info, err := storage.Inspect(ctx, got.Ref, locations)
 		if err != nil || info.Role != want.Role {
@@ -151,7 +158,38 @@ func TestPublishSnapshotSourceToSingleRootBundle(t *testing.T) {
 		t.Fatalf("remote E binding: result=%+v want=%s", result, e.Ref)
 	}
 	assertRemoved(t, result)
-
+	// Relocate and upload this same logical S through the Bundle path. Its E
+	// member remains unannotated, and runtime metadata changes no content key.
+	for _, annotation := range []string{"", "@runtime:runtime.bundle:digest:" + strings.Repeat("b", 64)} {
+		output := t.TempDir()
+		located, err := NewLocationPublisher(storage, "output", output, locations, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := located.Publish(ctx, result.Ref+annotation)
+		closeErr := located.Close()
+		if err != nil || closeErr != nil {
+			t.Fatalf("relocate Bundle: %v %v", err, closeErr)
+		}
+		gotRef, err := manifest.ParseRef(got.Ref)
+		original, _ := manifest.ParseRef(result.Ref + annotation)
+		if err != nil || gotRef.Runtime != original.Runtime || gotRef.Digest != original.Digest || got.SandboxRef != e.Ref {
+			t.Fatalf("relocation lost runtime or changed identity: %+v, %v", got, err)
+		}
+		upload, err := NewManifestPublisher(storage, cfg, config.RefLocations{"output": output}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		published, err := upload.Publish(ctx, got.Ref)
+		closeErr = upload.Close()
+		if err != nil || closeErr != nil {
+			t.Fatalf("upload Bundle: %v %v", err, closeErr)
+		}
+		want := "manifest://" + original.Digest + annotation
+		if published.Ref != want || published.SandboxRef != e.Ref {
+			t.Fatalf("uploaded identity/runtime changed: %+v, want %s", published, want)
+		}
+	}
 }
 
 func TestNewSourceLocatedIdentityCreatesOnlyFinal(t *testing.T) {

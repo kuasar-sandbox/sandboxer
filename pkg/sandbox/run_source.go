@@ -244,6 +244,9 @@ func resolveRunSourceRef(raw string, locations config.RefLocations) (manifest.Re
 	if err != nil {
 		return manifest.Ref{}, "", err
 	}
+	if !ref.Runtime.IsZero() {
+		return manifest.Ref{}, "", errors.New("Sandbox source cannot carry a snapshot runtime declaration")
+	}
 	if ref.Scheme != manifest.RefSchemeFile {
 		return ref, "", nil
 	}

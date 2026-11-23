@@ -625,7 +625,7 @@ func CommittedArtifactRef(sink ArtifactSink, ref, path string) (string, string, 
 		return "", "", fmt.Errorf("artifact is not a member of the committed Bundle")
 	}
 	return (manifest.Ref{Scheme: manifest.RefSchemeFile, Path: filepath.Base(bundle.finalPath),
-		DigestScheme: "manifest", Digest: parsed.Path}).String(), bundle.finalPath, nil
+		DigestScheme: "manifest", Digest: parsed.Path, Runtime: parsed.Runtime}).String(), bundle.finalPath, nil
 }
 
 func (s *BundleSink) validateExisting(ctx context.Context, path string, root store.ContentKey) error {

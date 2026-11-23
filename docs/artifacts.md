@@ -64,6 +64,23 @@ The block backend, restore code, and publisher first open the carrier, then pars
 
 Generic carrier bytes are defined by [Accelerator file artifacts](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/artifacts.md). The host lifecycle here owns the E/S logical schemas and publication rules; [Guest ABI](guest-abi.md) owns host/Guest coordination.
 
+### Snapshot runtime declarations
+
+Readers accept an optional terminal
+`@runtime:<basename>:digest:<64-lowercase-hex>` on a Snapshot S reference, using
+the shared Accelerator parser. Legacy references without a declaration remain
+valid; a present malformed declaration fails. Bundle and tarstream are carrier
+choices and obey the same declaration rules.
+
+Publishing or relocating that same S preserves its declaration in `snapshotRef`.
+Selecting its E or a disk member does not inherit it. The declaration is outside
+the content graph: `snapshot.cfg` parent references and physical Bundle dependency
+refs use the base reference. Re-snapshotting an annotated input therefore does not
+change parent keys, introduce extra layers, or add another data-reading path.
+Actual runtime compatibility is still checked from the captured portable config
+at restore time. Reader support must be deployed before annotated captures are
+enabled; this consumer change alone does not enable new capture output.
+
 <a id="platform-boundary"></a>
 
 ## Responsibility boundaries
