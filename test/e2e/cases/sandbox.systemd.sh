@@ -15,7 +15,7 @@ source "$SANDBOXER_LIB/systemd_helpers.sh"
 
 require_root
 require_kvm
-for command in docker mkfs.ext4 pkill python3 sed sha256sum timeout truncate; do
+for command in docker mkfs.ext4 pkill python3 sed sha256sum tail timeout truncate; do
     require_command "$command"
 done
 for binary in sandbox-ctl flatten-ctl cloud-hypervisor; do require_binary "$binary"; done
@@ -38,6 +38,10 @@ cleanup() {
         done
         readiness_kill_session KILL "$RUNPID"
         wait "$RUNPID" 2>/dev/null
+    fi
+    if [ "$status" -ne 0 ] && [ -n "${SCENARIO_OUT:-}" ] && [ -f "$SCENARIO_OUT/run.log" ]; then
+        echo "systemd scenario ${scenario:-setup}: sandbox run log" >&2
+        tail -n 80 "$SCENARIO_OUT/run.log" >&2
     fi
     systemd_cleanup_root_fixture
     exit "$status"
@@ -94,13 +98,17 @@ ctl_exec() {
         --run-root "$SCENARIO_WORK/run" -- "$@"
 }
 
+scenario_index=0
 for scenario in runtime auto guest-poweroff executor-fault; do
+    scenario_index=$((scenario_index + 1))
     mode=runtime
     [ "$scenario" != auto ] || mode=auto
-    SCENARIO_WORK="$WORK/$scenario"
+    # Launch adds a port suffix to its Unix socket. Keep fixture paths short
+    # under the runner's per-case directory; use the full label for reports.
+    SCENARIO_WORK="$WORK/s$scenario_index"
     SCENARIO_OUT="$OUT/$scenario"
     mkdir -p "$SCENARIO_WORK/run" "$SCENARIO_WORK/base" "$SCENARIO_OUT"
-    SID="systemd-$scenario-$BASHPID"
+    SID="sd-$scenario_index-$BASHPID"
     RUN_ID="$SID-run"
     python3 - "$SCENARIO_WORK" "$BIN" "$SYSTEMD_BASE_REF" "$SYSTEMD_DIFF_TEMPLATE" "$mode" "$WORK/probe.sh" <<'PY'
 import json, pathlib, sys
