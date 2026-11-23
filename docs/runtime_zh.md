@@ -281,6 +281,11 @@ sandbox-ctl shutdown --sandbox-id demo --run-id RUN_ID --path-id demo
 unsupported 错误。受理帧丢失、连接断开不会撤销停止。owner 开始前已脱离最终回复
 连接的清理义务，所以快速退出不会提前关掉回复，也不会与关机等待互锁。
 
+可信产品 runner 可通过内部继承 FD，在普通配置文件边界携带已物化 PATH 的默认来源。
+有界 envelope 以 SHA-256 绑定精确文件内容，并在恢复来源前核对每个插件的索引和 PATH。
+CLI 只读一次配置，读取并关闭该 FD 后恢复来源，再执行 E 继承；S 恢复拒绝该交接。
+它是显式可信调用方 API，不是身份认证机制，也不增加用户 Launch 配置项。
+
 Live `Exec`、`Snapshot`、`Export`、`Stats` 直接调用 owner。Exec 返回调用方负责关闭的
 Guest MUX connection 及协商后的 stdio spec。Capture 复用既有 `ctl.Request` 选项和
 E/S 输出 schema，不序列化为 CLI 命令。Exec 与 capture 要求工作负载已运行；资源统计

@@ -395,6 +395,11 @@ Portable 内容包括:
 PATH 与标记；显式持久 PATH 清除标记，临时 PATH 只影响本次 wire，不修改产物。
 旧产物保存了 PATH 但没有标记时，继续把该 PATH 当作权威显式值。
 
+Portable `launch.plugin` 的每个条目也以内部 `systemd_path_default` 记录其自身 PATH
+来源。普通插件 YAML/JSON 拒绝该字段，可信产品投影和 SDK clone 显式携带它，普通插件
+独立 Env 的含义不变。显式插件 PATH（即使与默认值相同或为空）仍然权威。旧插件定义
+已有 PATH 而无来源标记时保留原值；路径前缀或字符串相等不能证明平台默认来源。
+
 Portable 内容排除:
 
 - cgroup path/fd/controller、overhead/watermark/startup、`resources.diff_cow` 缓存策略;

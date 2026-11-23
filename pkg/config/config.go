@@ -733,12 +733,15 @@ type InitConfig struct {
 // PluginConfig declares a companion ("plugin") process supervised alongside
 // the app. Restart is its policy (never|on-failure|always; empty → always).
 type PluginConfig struct {
-	Exec    string            `yaml:"exec"`
-	Args    []string          `yaml:"args,omitempty"`
-	Env     map[string]string `yaml:"env,omitempty"`
-	Workdir string            `yaml:"workdir,omitempty"`
-	User    string            `yaml:"user,omitempty"`
-	Restart string            `yaml:"restart,omitempty"` // never|on-failure|always; empty → always
+	// Internal default provenance cannot be supplied by ordinary documents.
+	systemdPathDefault bool
+	systemdDefaultPath string
+	Exec               string            `yaml:"exec"`
+	Args               []string          `yaml:"args,omitempty"`
+	Env                map[string]string `yaml:"env,omitempty"`
+	Workdir            string            `yaml:"workdir,omitempty"`
+	User               string            `yaml:"user,omitempty"`
+	Restart            string            `yaml:"restart,omitempty"` // never|on-failure|always; empty → always
 }
 
 // Load reads one sandbox.yaml and applies defaults.

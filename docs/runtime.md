@@ -349,6 +349,14 @@ or caller disconnect does not cancel an accepted stop. Final response writers
 are detached before the owner begins, so fast cleanup neither closes their
 connection early nor waits on a shutdown waiter.
 
+Trusted product runners can carry materialized PATH provenance across the
+ordinary config-file boundary with an internal inherited descriptor. Its bounded
+envelope binds the exact file bytes by SHA-256 and validates each marked plugin's
+index and PATH before any origin is restored. The CLI reads that config once,
+consumes and closes the descriptor, then applies E inheritance. S restore rejects
+the handoff. The descriptor is an explicit trusted-caller API, not an
+authentication mechanism or an additional user Launch option.
+
 Live `Exec`, `Snapshot`, `Export` and `Stats` call the owner directly. Exec returns
 a caller-owned guest MUX connection and its negotiated stdio spec. Capture uses
 the existing `ctl.Request` options and E/S output schema without CLI serialization.

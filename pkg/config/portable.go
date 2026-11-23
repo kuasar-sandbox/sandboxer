@@ -102,20 +102,32 @@ type PortableOverlayConfig struct {
 type PortableLaunchConfig struct {
 	// SystemdPathDefault records PATH origin after image defaults are folded.
 	// It is internal artifact metadata, not a user-facing Launch option.
+	SystemdPathDefault bool                   `yaml:"systemd_path_default,omitempty"`
+	Systemd            string                 `yaml:"systemd,omitempty"`
+	Exec               string                 `yaml:"exec,omitempty"`
+	Args               []string               `yaml:"args,omitempty"`
+	Env                map[string]string      `yaml:"env,omitempty"`
+	Workdir            string                 `yaml:"workdir,omitempty"`
+	Restart            string                 `yaml:"restart,omitempty"`
+	CgroupControl      bool                   `yaml:"cgroup_control,omitempty"`
+	Placeholder        bool                   `yaml:"placeholder,omitempty"`
+	PIDNamespace       string                 `yaml:"pid_namespace,omitempty"`
+	Plugin             []PortablePluginConfig `yaml:"plugin,omitempty"`
+	User               string                 `yaml:"user,omitempty"`
+	StopSignal         string                 `yaml:"stop_signal,omitempty"`
+	StopGracePeriod    string                 `yaml:"stop_grace_period,omitempty"`
+}
+
+// PortablePluginConfig retains trusted PATH provenance with a persistent
+// companion definition. Ordinary PluginConfig documents cannot set the marker.
+type PortablePluginConfig struct {
 	SystemdPathDefault bool              `yaml:"systemd_path_default,omitempty"`
-	Systemd            string            `yaml:"systemd,omitempty"`
-	Exec               string            `yaml:"exec,omitempty"`
+	Exec               string            `yaml:"exec"`
 	Args               []string          `yaml:"args,omitempty"`
 	Env                map[string]string `yaml:"env,omitempty"`
 	Workdir            string            `yaml:"workdir,omitempty"`
-	Restart            string            `yaml:"restart,omitempty"`
-	CgroupControl      bool              `yaml:"cgroup_control,omitempty"`
-	Placeholder        bool              `yaml:"placeholder,omitempty"`
-	PIDNamespace       string            `yaml:"pid_namespace,omitempty"`
-	Plugin             []PluginConfig    `yaml:"plugin,omitempty"`
 	User               string            `yaml:"user,omitempty"`
-	StopSignal         string            `yaml:"stop_signal,omitempty"`
-	StopGracePeriod    string            `yaml:"stop_grace_period,omitempty"`
+	Restart            string            `yaml:"restart,omitempty"`
 }
 
 // PortableProjection supplies identities whose source paths are host-only.
@@ -394,7 +406,7 @@ func portableLaunch(in LaunchConfig) PortableLaunchConfig {
 		Exec:               in.Exec, Args: append([]string(nil), in.Args...), Env: cloneMap(in.Env),
 		Workdir: in.Workdir, Restart: in.Restart, CgroupControl: in.CgroupControl,
 		Placeholder: in.Placeholder, PIDNamespace: in.PIDNamespace,
-		Plugin: clonePlugins(in.Plugin), User: in.User, StopSignal: in.StopSignal,
+		Plugin: portablePlugins(in.Plugin), User: in.User, StopSignal: in.StopSignal,
 		StopGracePeriod: in.StopGracePeriod,
 	}
 }
@@ -421,12 +433,22 @@ func cloneInit(in []InitConfig) []InitConfig {
 	return out
 }
 
-func clonePlugins(in []PluginConfig) []PluginConfig {
+func portablePlugins(in []PluginConfig) []PortablePluginConfig {
+	out := make([]PortablePluginConfig, len(in))
+	for i := range in {
+		out[i] = PortablePluginConfig{SystemdPathDefault: in[i].PersistentSystemdPathDefault(),
+			Exec: in[i].Exec, Args: append([]string(nil), in[i].Args...), Env: cloneMap(in[i].Env),
+			Workdir: in[i].Workdir, User: in[i].User, Restart: in[i].Restart}
+	}
+	return out
+}
+
+func pluginsFromPortable(in []PortablePluginConfig) []PluginConfig {
 	out := make([]PluginConfig, len(in))
 	for i := range in {
-		out[i] = in[i]
-		out[i].Args = append([]string(nil), in[i].Args...)
-		out[i].Env = cloneMap(in[i].Env)
+		out[i] = PluginConfig{Exec: in[i].Exec, Args: append([]string(nil), in[i].Args...),
+			Env: cloneMap(in[i].Env), Workdir: in[i].Workdir, User: in[i].User, Restart: in[i].Restart}
+		out[i].SetSystemdPathDefault(in[i].SystemdPathDefault)
 	}
 	return out
 }

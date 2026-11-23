@@ -441,6 +441,14 @@ actual PATH survive E projection and cloning. An explicit persistent PATH clears
 it; invocation-only PATH overrides affect the wire without changing the artifact.
 Older artifacts with a stored PATH and no marker retain authoritative PATH values.
 
+Each portable `launch.plugin` entry has the same internal `systemd_path_default`
+origin for its own stored PATH. Ordinary plugin YAML/JSON rejects that field;
+trusted product projection and SDK cloning carry it without changing independent
+plugin environment semantics. An explicit plugin PATH, including an equal or
+empty value, is authoritative. Old plugin definitions without provenance remain
+authoritative when they contain PATH; neither a prefix nor string equality proves
+that a value came from the platform.
+
 Portable content excludes:
 
 - Cgroup paths/fds/controllers, overhead, watermark, startup, and `resources.diff_cow` cache policy.

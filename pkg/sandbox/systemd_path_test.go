@@ -65,3 +65,30 @@ func TestSystemdWireKeepsRawPolicyAndExplicitPath(t *testing.T) {
 		}
 	}
 }
+
+func TestPluginSystemdPathSurvivesSDKCloneAndWire(t *testing.T) {
+	cfg := &config.SandboxConfig{Launch: config.LaunchConfig{Plugin: []config.PluginConfig{
+		{Exec: "/default", Env: map[string]string{"PATH": "/image/custom:/usr/bin"}},
+		{Exec: "/explicit", Env: map[string]string{"PATH": "/image/custom:/usr/bin"}},
+		{Exec: "/empty", Env: map[string]string{"PATH": ""}},
+		{Exec: "/implicit"},
+	}}}
+	cfg.Launch.Plugin[0].SetSystemdPathDefault(true)
+	clone, err := cloneSDKConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plugins := toProtoPlugins(clone.Launch.Plugin)
+	for index, want := range []bool{true, false, false, true} {
+		if plugins[index].SystemdPathDefault != want {
+			t.Fatalf("plugin %d origin=%t want=%t", index, plugins[index].SystemdPathDefault, want)
+		}
+	}
+	clone.Launch.Plugin[0].Env["PATH"] = "/sdk-override"
+	if toProtoPlugins(clone.Launch.Plugin)[0].SystemdPathDefault {
+		t.Fatal("SDK mutation retained stale wire origin")
+	}
+	if cfg.Launch.Plugin[0].Env["PATH"] != "/image/custom:/usr/bin" || !cfg.Launch.Plugin[0].SystemdPathDefault() {
+		t.Fatal("SDK clone aliased its input")
+	}
+}

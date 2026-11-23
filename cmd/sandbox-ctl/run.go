@@ -134,6 +134,15 @@ func runCmd(args []string) int {
 	if *configPath == "" {
 		*configPath = os.Getenv("SANDBOX_CONFIG")
 	}
+	provenance, err := consumeConfigProvenance()
+	if err != nil {
+		fmt.Fprintln(diagnostics, err)
+		return 2
+	}
+	if len(provenance) != 0 && *restoreRef != "" {
+		fmt.Fprintln(diagnostics, "sandbox-ctl run: config provenance is not permitted with --restore")
+		return 2
+	}
 	if *replaceBoot && *configPath == "" {
 		fmt.Fprintln(diagnostics, "sandbox-ctl run: --replace-boot requires --config or SANDBOX_CONFIG")
 		return 2
@@ -282,26 +291,10 @@ func runCmd(args []string) int {
 		fmt.Fprintln(diagnostics, "sandbox-ctl run: --config or SANDBOX_CONFIG required")
 		return 2
 	}
-	var (
-		cfg      *config.SandboxConfig
-		presence config.FieldPresence
-	)
-	if *configPath == "" {
-		cfg = &config.SandboxConfig{}
-		cfg.ApplyDefaults()
-	} else if *fromRef != "" || *restoreRef != "" {
-		cfg, presence, err = config.LoadMergedWithPresence(strings.Split(*configPath, ":"))
-		if err != nil {
-			fmt.Fprintln(diagnostics, err)
-			return 1
-		}
-	} else {
-		// --config accepts ':'-separated paths, deep-merged front-to-back.
-		cfg, err = config.LoadMerged(strings.Split(*configPath, ":"))
-		if err != nil {
-			fmt.Fprintln(diagnostics, err)
-			return 1
-		}
+	cfg, presence, err := loadRunConfig(*configPath, *fromRef != "" || *restoreRef != "", provenance)
+	if err != nil {
+		fmt.Fprintln(diagnostics, err)
+		return 1
 	}
 	manifestCfg, err := config.LoadManifestConfig(*manifestPath)
 	if err != nil {

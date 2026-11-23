@@ -392,12 +392,13 @@ func toProtoPlugins(plugins []config.PluginConfig) []proto.PluginSpec {
 	out := make([]proto.PluginSpec, len(plugins))
 	for i, p := range plugins {
 		out[i] = proto.PluginSpec{
-			Exec:    p.Exec,
-			Args:    p.Args,
-			Env:     p.Env,
-			Workdir: p.Workdir,
-			User:    p.User,
-			Restart: p.Restart,
+			SystemdPathDefault: p.SystemdPathDefault(),
+			Exec:               p.Exec,
+			Args:               p.Args,
+			Env:                p.Env,
+			Workdir:            p.Workdir,
+			User:               p.User,
+			Restart:            p.Restart,
 		}
 	}
 	return out
