@@ -63,6 +63,9 @@ func (c Client) Snapshot(destURL string) error {
 	return c.do("PUT", "/api/v1/vm.snapshot", fmt.Sprintf(`{"destination_url":"%s"}`, destURL))
 }
 
+// ResetTap irreversibly releases a paused VMM's TAP queues. Always terminate the VMM after this call.
+func (c Client) ResetTap() error { return c.do("PUT", "/api/v1/vm.reset-tap", "") }
+
 // ShutdownVMM issues PUT /api/v1/vmm.shutdown — an ordered VMM teardown (stop
 // vCPU → destroy devices → release memory zones → exit), preferred over a host
 // SIGTERM whose unordered exit leaves Linux to unmap large zones via the slow

@@ -30,6 +30,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
@@ -383,8 +384,35 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	}
 	var backendGuard *uffd.BackendMemoryGuard
 	defer func() {
-		// Later defers drain all consumers and the CH UFFD handler. Keep the
-		// backend protected until its VMA is gone, including on startup errors.
+		// Later defers have drained all consumers and the CH UFFD handler.
+		// A committed checkpoint has an independently pinned backing. The old
+		// backend VMA is now inaccessible to runtime workers, but unmapping it
+		// can be expensive. Transfer only this private cleanup to that holder;
+		// keep the guard and the RAM charge until the unmap actually completes.
+		if r := p.owner; r != nil {
+			r.mu.Lock()
+			save := r.memorySave
+			if save != nil && save.holder.Record().Read().Committed {
+				save.retiredMappingCleanup = func() error {
+					if save.chExited != nil {
+						<-save.chExited
+					}
+					started := time.Now()
+					if err := memfd.Close(); err != nil {
+						return err
+					}
+					if err := backendGuard.Close(); err != nil {
+						logf("checkpoint: retired backend guard close: %v", err)
+					}
+					logf("checkpoint: retired backend mapping cleanup duration=%s", time.Since(started))
+					return nil
+				}
+				r.mu.Unlock()
+				return
+			}
+			r.mu.Unlock()
+		}
+		// Ordinary exit, aborted capture and startup failure stay synchronous.
 		retErr = errors.Join(retErr, memfd.Close())
 		retErr = errors.Join(retErr, backendGuard.Close())
 	}()
@@ -697,7 +725,12 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		chExitObserved.Store(true)
 		chExitedOnce.Do(func() { close(chExited) })
 	}
-	defer markCHExited()
+	spawned := false
+	defer func() {
+		if !spawned {
+			markCHExited()
+		}
+	}()
 	currentCHProcess := func() processSignaler {
 		chProcessMu.RLock()
 		defer chProcessMu.RUnlock()
@@ -1076,6 +1109,23 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	if p.owner != nil {
 		p.owner.mu.Lock()
 		p.owner.captureResponsesDone = ctlSrv.ResponsesDone()
+		p.owner.stopFrozenBackends = func() {
+			cancelPostSpawn()
+			cancelBackends()
+		}
+		if p.TapFile != nil || p.SnapCfg != nil && p.SnapCfg.Network.TAP != "" {
+			p.owner.resetFrozenTaps = func() bool {
+				started := time.Now()
+				err := (chapi.Client{Sock: chSock, RespDeadline: 2 * time.Second}).ResetTap()
+				if err == nil && p.TapFile != nil {
+					err = p.TapFile.Close()
+				}
+				// All failures, including old CH returning 404, retain the existing
+				// synchronous SIGKILL + wait path. Never resume a committed VM.
+				logf("checkpoint: reset TAP duration=%s err=%v", time.Since(started), err)
+				return err == nil
+			}
+		}
 		p.owner.mu.Unlock()
 	}
 	go func() { defer backendWG.Done(); _ = ctlSrv.Serve(backendCtx) }()
@@ -1138,7 +1188,11 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		backendWG.Wait()
 		return -1, fmt.Errorf("build CH cmd: %w", err)
 	}
-	defer chStdioCleanup()
+	defer func() {
+		if !spawned {
+			chStdioCleanup()
+		}
+	}()
 	// fd=3 ← memfd in CH (after stdin/out/err). New process group keeps
 	// CH out of sandbox-ctl's controlling-terminal foreground group, so
 	// terminal-generated ^C/^\/^Z don't hit CH directly — sandbox-ctl
@@ -1172,6 +1226,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		backendWG.Wait()
 		return -1, fmt.Errorf("spawn CH: %w", err)
 	}
+	spawned = true
 	chProcessMu.Lock()
 	chProcess = cmd.Process
 	chProcessMu.Unlock()
@@ -1186,6 +1241,52 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	// This goroutine is the sole reaper on every post-spawn path, including
 	// failed restore setup. WNOWAIT keeps native process counters readable.
 	doneCh := make(chan error, 1)
+	var doneOnce, finalOnce sync.Once
+	reportDone := func(e error) { doneOnce.Do(func() { doneCh <- e }) }
+	finalCH := func(ctx context.Context) {
+		finalOnce.Do(func() {
+			if usageSampler != nil {
+				usageSampler.FinalCH(ctx)
+			}
+		})
+	}
+	if p.owner != nil {
+		// LocalPath is a process-local /proc/self/fd reference. Persist only
+		// the controller's canonical pathname, proven to name that same
+		// already opened cgroup, so recovery in a new process can use it.
+		var identity *memorycheckpoint.VMMIdentity
+		if p.Cgroup != nil && p.Cgroup.Active() {
+			local, localErr := os.Stat(cgroupPath)
+			named, namedErr := os.Stat(p.Cgroup.Path)
+			if localErr == nil && namedErr == nil && os.SameFile(local, named) {
+				vmm, err := memorycheckpoint.IdentifyVMM(chPid, p.Cgroup.Path)
+				if err == nil {
+					identity = &vmm
+				} else {
+					logf("checkpoint: deferred VMM exit unavailable: %v", err)
+				}
+			} else {
+				logf("checkpoint: deferred VMM exit unavailable: source cgroup identity differs")
+			}
+		}
+		p.owner.mu.Lock()
+		p.owner.vmmIdentity = identity
+		p.owner.retireFrozenRuntime = func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			defer cancel()
+			// Seal shared usage before retirement. A late reaper must not
+			// publish after the new execution owns the shared path.
+			finalOnce.Do(func() {
+				if usageSampler != nil {
+					usageSampler.RetireCH(ctx)
+				}
+			})
+			p.owner.stopForExit()
+			logf("checkpoint: VMM execution retired; physical exit pending")
+			reportDone(nil)
+		}
+		p.owner.mu.Unlock()
+	}
 	go func() {
 		var info unix.Siginfo
 		waitIDErr := observeCHExit(func() error {
@@ -1198,22 +1299,20 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 				// context.Canceled. Mark the owner closing; stopForExit runs after Wait.
 				p.owner.markExiting()
 			}
-		}, func(ctx context.Context) {
-			if usageSampler != nil {
-				usageSampler.FinalCH(ctx)
-			}
-		})
+		}, finalCH)
 		if waitIDErr != nil {
 			logf("CH exit waitid: %v", waitIDErr)
 		}
 		waitErr := cmd.Wait()
+		chStdioCleanup()
+		logf("CH process reaped: %v", waitErr)
 		if p.owner != nil {
 			p.owner.stopForExit()
 		}
 		cancelPostSpawn()
 		cancelBackends()
 		markCHExited()
-		doneCh <- waitErr
+		reportDone(waitErr)
 	}()
 
 	if r := p.owner; r != nil {
@@ -1226,6 +1325,15 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	pinger.SetOnFatal(func(err error) {
 		logf("pinger fatal threshold (%d) hit: %v — SIGTERMing CH pid=%d",
 			pinger.Cfg.FatalThreshold, err, chPid)
+		if p.owner != nil {
+			p.owner.mu.Lock()
+			frozen := p.owner.memorySave != nil
+			p.owner.mu.Unlock()
+			if frozen {
+				_ = cmd.Process.Kill()
+				return
+			}
+		}
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 	})
 
@@ -1257,7 +1365,20 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		logf("post-spawn interrupted by shutdown: %v", err)
 	}
 
-	waitErr := waitForCHWithSignalEscalation(doneCh, sigCh, cmd.Process, chPid, chSock, cgroupPath, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf)
+	waitErr := waitForCHWithSignalEscalation(doneCh, sigCh, cmd.Process, chPid, chSock, cgroupPath, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf, func() bool {
+		snapHandler.capture.mu.Lock()
+		capturing := snapHandler.capture.active || snapHandler.capture.terminal
+		snapHandler.capture.mu.Unlock()
+		if capturing {
+			return true
+		}
+		if p.owner == nil {
+			return false
+		}
+		p.owner.mu.Lock()
+		defer p.owner.mu.Unlock()
+		return p.owner.memorySave != nil
+	})
 	cancelBackends()
 	backendWG.Wait()
 	exit := 0

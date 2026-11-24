@@ -2,6 +2,7 @@ package uffd
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -129,7 +130,8 @@ type Handler struct {
 	state     *PageStateMap
 	pageTrace *pageTrace
 
-	epfd int
+	epfd       int
+	readerWake *os.File
 
 	// removeQ holds in-flight EVENT_REMOVE / EVENT_UNMAP requests.
 	// dispatch() pushes onto this channel non-blocking, and a single
@@ -295,6 +297,17 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		_ = unix.Close(epfd)
 		return nil, fmt.Errorf("uffd: dirty RAM size mismatch")
 	}
+	wakeFD, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		_ = unix.Close(epfd)
+		return nil, fmt.Errorf("uffd: reader eventfd: %w", err)
+	}
+	wakeEvent := unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(wakeFD)}
+	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, wakeFD, &wakeEvent); err != nil {
+		_ = unix.Close(wakeFD)
+		_ = unix.Close(epfd)
+		return nil, fmt.Errorf("uffd: epoll reader wake: %w", err)
+	}
 	released, _ := memory.NewDirty(uint64(cfg.Size))
 	numPages := cfg.Size / PageSize
 	state := NewPageStateMap(numPages)
@@ -330,6 +343,7 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		state:               state,
 		pageTrace:           newPageTrace(os.Getenv(pageTraceEnv), uint64(cfg.Size)),
 		epfd:                epfd,
+		readerWake:          os.NewFile(uintptr(wakeFD), "uffd-reader-wake"),
 		removeQ:             make(chan removeReq, 4096),
 		logf:                logf,
 		stop:                make(chan struct{}),
@@ -344,6 +358,7 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 	}
 	if err := h.seedRegion(uffdCFromCH); err != nil {
 		cancel()
+		_ = h.readerWake.Close()
 		_ = unix.Close(epfd)
 		return nil, err
 	}
@@ -451,6 +466,22 @@ func (h *Handler) Close() error {
 		started := h.started
 		h.uffdsMu.Unlock()
 		h.readerStop.Store(true)
+		if started && h.readerWake != nil {
+			// Wake a blocked epoll immediately; the old timeout is a fallback
+			// for an unexpected write failure. No fd is closed under the reader.
+			var wake [8]byte
+			binary.NativeEndian.PutUint64(wake[:], 1)
+			for {
+				_, err := unix.Write(int(h.readerWake.Fd()), wake[:])
+				if errors.Is(err, unix.EINTR) {
+					continue
+				}
+				if err != nil && !errors.Is(err, unix.EAGAIN) {
+					h.logf("uffd: reader wake: %v", err)
+				}
+				break
+			}
+		}
 		if started {
 			<-h.readerDone
 		}
@@ -471,6 +502,10 @@ func (h *Handler) Close() error {
 			_ = f.Close()
 		}
 		h.uffds = nil
+		if h.readerWake != nil {
+			_ = h.readerWake.Close()
+			h.readerWake = nil
+		}
 		if h.epfd >= 0 {
 			_ = unix.Close(h.epfd)
 			h.epfd = -1
@@ -489,6 +524,10 @@ func (h *Handler) runReader() {
 	buf := make([]byte, msgSize*16)
 	events := make([]unix.EpollEvent, 4)
 	epfd := h.epfd
+	wakeFD := -1
+	if h.readerWake != nil {
+		wakeFD = int(h.readerWake.Fd())
+	}
 	for {
 		if h.readerStop.Load() {
 			return
@@ -519,6 +558,9 @@ func (h *Handler) runReader() {
 		}
 		for i := 0; i < n; i++ {
 			fd := int(events[i].Fd)
+			if fd == wakeFD {
+				continue
+			}
 			h.drain(fd, buf, msgSize)
 		}
 	}

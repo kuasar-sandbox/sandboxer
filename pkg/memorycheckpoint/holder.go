@@ -94,10 +94,17 @@ func (h *Holder) Wait(ctx context.Context) error {
 	}
 }
 
-// Start is called only after the normal runtime has released its mappings and
-// all writers. The callback writes this top alone using an independently owned
-// local sink. Failed writes retain RAM and retry; they never manufacture Ready.
+// Start is called only after the normal runtime has stopped all writers.
+// The callback writes this top alone using an independently owned local sink.
 func (h *Holder) Start(dump func(context.Context, io.ReaderAt) (string, error), release func(context.Context) error) error {
+	return h.StartWithCleanup(dump, nil, release)
+}
+
+// StartWithCleanup additionally owns a retired, inaccessible backend mapping.
+// Its cleanup runs off the retirement critical path, after save or discard and
+// before the RAM pin is dropped and RAMReleased can be published. It may retry;
+// neither a failed cleanup nor a failed dump can manufacture a release.
+func (h *Holder) StartWithCleanup(dump func(context.Context, io.ReaderAt) (string, error), cleanup func() error, release func(context.Context) error) error {
 	if !h.record.Read().RuntimeRetired || dump == nil {
 		return errors.New("memory checkpoint: start without retired runtime and dump")
 	}
@@ -108,7 +115,7 @@ func (h *Holder) Start(dump func(context.Context, io.ReaderAt) (string, error), 
 	}
 	h.started = true
 	h.mu.Unlock()
-	go h.save(dump, release)
+	go h.save(dump, cleanup, release)
 	return nil
 }
 
@@ -149,7 +156,7 @@ func (h *Holder) cancellationProofLocked() *os.File {
 	return nil
 }
 
-func (h *Holder) save(dump func(context.Context, io.ReaderAt) (string, error), release func(context.Context) error) {
+func (h *Holder) save(dump func(context.Context, io.ReaderAt) (string, error), cleanup func() error, release func(context.Context) error) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	var result <-chan dumpResult
@@ -204,6 +211,34 @@ func (h *Holder) save(dump func(context.Context, io.ReaderAt) (string, error), r
 		}
 	}
 published:
+	// On delete the exclusive proof is already held; on publication our shared
+	// RAM pin remains held. In both cases the producer's retained charge must
+	// survive until even its inaccessible old mapping has gone away.
+	for {
+		r := h.record.Read()
+		if r.VMM == nil {
+			break
+		}
+		gone, err := r.VMM.Exited()
+		if err == nil && gone {
+			break
+		}
+		if err != nil {
+			h.logf("checkpoint VMM exit proof retained for retry: %v", err)
+		}
+		select {
+		case <-h.changed:
+		case <-ticker.C:
+		}
+	}
+	for cleanup != nil {
+		if err := cleanup(); err == nil {
+			break
+		} else {
+			h.logf("checkpoint retired mapping cleanup retained for retry: %v", err)
+		}
+		time.Sleep(time.Second)
+	}
 	h.mu.Lock()
 	closeErr := h.closeRAMLocked()
 	h.mu.Unlock()

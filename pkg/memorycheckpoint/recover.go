@@ -94,6 +94,12 @@ func RecoverMemoryRelease(ctx context.Context, capturePath string, expected Capt
 	if err != nil || !out.ProducerExited || r.Committed && !r.RuntimeRetired {
 		return out, err
 	}
+	if r.Committed && r.VMM != nil {
+		gone, err := r.VMM.Exited()
+		if err != nil || !gone {
+			return out, err
+		}
+	}
 	ram, err := openRAMPin(capturePath, r.Holder.RAMLock, unix.LOCK_EX)
 	if err != nil {
 		if errors.Is(err, unix.EWOULDBLOCK) {
@@ -109,6 +115,12 @@ func RecoverMemoryRelease(ctx context.Context, capturePath string, expected Capt
 	exited, err := producerExited(r.Holder)
 	if err != nil || !exited {
 		return out, errors.Join(errors.New("memory checkpoint: producer state changed during recovery"), err)
+	}
+	if r.Committed && r.VMM != nil {
+		gone, err := r.VMM.Exited()
+		if err != nil || !gone {
+			return out, err
+		}
 	}
 	if r.Committed && !r.RuntimeRetired || r.Aborted || r.Discarded {
 		return out, errors.New("memory checkpoint: capture is not retired")

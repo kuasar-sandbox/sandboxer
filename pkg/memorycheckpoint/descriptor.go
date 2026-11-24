@@ -23,6 +23,9 @@ const Version = 1
 // descriptor and data encodings keep Version. Old readers reject these records
 // rather than silently ignoring a revoked checkpoint.
 const RecordVersion = 2
+
+// DeferredVMMRecordVersion requires a second physical exit proof. Old readers reject it.
+const DeferredVMMRecordVersion = 3
 const pageSize = 4096
 
 type Descriptor struct {

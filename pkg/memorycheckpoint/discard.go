@@ -62,6 +62,12 @@ func DiscardCapture(ctx context.Context, directory string, producer RunIdentity,
 	if !sameCaptureIdentity(*latest, *r) {
 		return nil, errors.New("memory checkpoint: discard generation changed")
 	}
+	if latest.VMM != nil && latest.Committed {
+		gone, err := latest.VMM.Exited()
+		if err != nil || !gone {
+			return nil, errors.Join(errors.New("memory checkpoint: discard VMM remains"), err)
+		}
+	}
 	ram, err := openRAMPin(path, latest.Holder.RAMLock, unix.LOCK_EX)
 	if err != nil {
 		return nil, fmt.Errorf("memory checkpoint: discard RAM proof: %w", err)

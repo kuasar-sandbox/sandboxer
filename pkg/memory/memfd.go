@@ -121,8 +121,9 @@ func (m *Memfd) Close() error {
 	if m.data != nil {
 		if err := unix.Munmap(m.data); err != nil {
 			errs = append(errs, fmt.Errorf("munmap: %w", err))
+		} else {
+			m.data = nil
 		}
-		m.data = nil
 	}
 	if m.file != nil {
 		if err := m.file.Close(); err != nil {

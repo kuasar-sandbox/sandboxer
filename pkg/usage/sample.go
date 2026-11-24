@@ -548,6 +548,13 @@ func (s *Sampler) FinalCH(ctx context.Context) {
 	}
 }
 
+// RetireCH seals the old execution's usage before physical process exit.
+// The native CH CPU tail after the sample is unknown, not a final endpoint.
+func (s *Sampler) RetireCH(ctx context.Context) {
+	s.FinalCH(ctx)
+	s.m.CounterMissing("ch.cpu", true)
+}
+
 func (s *Sampler) Stop(ctx context.Context) {
 	s.fence(false)
 	s.mu.Lock()
