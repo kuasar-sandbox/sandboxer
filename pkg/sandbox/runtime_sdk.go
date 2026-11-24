@@ -55,6 +55,7 @@ type RuntimeSpec struct {
 	EnableCheckpoint                bool
 	CurrentRun                      *artifact.CurrentRun
 	preparedHost                    *preparedHostIdentity
+	acceptCompletedRun              bool // standalone Run only; never a running SDK Launch
 	checkpointPlan                  *CheckpointDiskPlan
 	checkpointOwner                 *diffstore.DirectoryOwner
 	checkpointReleaseSources        func() error
@@ -189,6 +190,7 @@ type Runtime struct {
 	opsWG                              sync.WaitGroup
 	launchContext                      context.Context
 	launchSucceeded                    bool
+	completedRun                       bool // exact-token successful terminal outcome, without readiness
 	initialLaunchToken                 string
 	initialLaunchState                 proto.InitialLaunchState
 	initialLaunchChanged               chan struct{}
@@ -1156,7 +1158,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 wait:
 	for {
 		r.mu.Lock()
-		succeeded, failure := r.launchSucceeded, r.launchFailure
+		succeeded, failure := r.launchSucceeded || r.completedRun, r.launchFailure
 		started := r.initialLaunchState.State == proto.InitialLaunchStarted
 		r.mu.Unlock()
 		if succeeded {
@@ -1196,7 +1198,7 @@ wait:
 		}
 	}
 	r.mu.Lock()
-	succeeded := r.launchSucceeded
+	succeeded := r.launchSucceeded || r.completedRun
 	if !succeeded && r.launchFailure == nil {
 		// Timer/cancel/exit and success share one linearization lock. Freeze
 		// failure before Close so a queued readiness worker cannot commit.
@@ -1652,8 +1654,9 @@ func (r *Runtime) beginOperation() error {
 	return nil
 }
 
-// commitLaunch is the successful launch linearization point, after the guest's
-// app_started ACK. Close/exit and operation cancellation are checked together.
+// commitLaunch is the running-state linearization point, after the Guest's
+// launch ACK/MUX and confirmed started fact. Close/exit and operation
+// cancellation are checked together.
 func (r *Runtime) commitLaunch() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1703,6 +1706,18 @@ func (r *Runtime) observeInitialLaunch(fact proto.InitialLaunchState) {
 	case proto.InitialLaunchFailed:
 		r.launchFailure = fmt.Errorf("guest initial launch failed: %s", fact.Error)
 	case proto.InitialLaunchExited:
+		// The public SDK Launch promises a running Runtime and must still
+		// reject terminal facts before its commit. Standalone Run, however,
+		// owns the entire command lifetime. A short command may complete
+		// before the best-effort app_started exchange/Pong confirms it.
+		// The Guest retains its actual started PID in the terminal fact.
+		if r.acceptSuccessfulRunExitLocked(fact) {
+			r.initialLaunchState = fact
+			r.completedRun = true
+			r.state = runtimeClosing // never publish a transient ready/running state
+			close(r.launchDone)
+			return
+		}
 		r.launchFailure = fmt.Errorf("guest terminated during initial launch: code %d", fact.Code)
 	default:
 		r.launchFailure = fmt.Errorf("guest initial launch has invalid state %q", fact.State)
@@ -1711,6 +1726,32 @@ func (r *Runtime) observeInitialLaunch(fact proto.InitialLaunchState) {
 	case r.initialLaunchChanged <- struct{}{}:
 	default:
 	}
+}
+
+// acceptSuccessfulRunExitLocked admits only a proven, already completed
+// standalone command. It does not alter exit status or waive any error from
+// the real VMM reaper, backend I/O, or cleanup. Run will wait for that result.
+// The caller has already checked the exact token, launching state and absence
+// of a prior launch failure under mu.
+func (r *Runtime) acceptSuccessfulRunExitLocked(fact proto.InitialLaunchState) bool {
+	if !r.spec.acceptCompletedRun || r.environmentActive || fact.PID <= 0 ||
+		fact.Code != 0 || fact.Error != "" ||
+		(r.initialLaunchState.PID != 0 && r.initialLaunchState.PID != fact.PID) ||
+		r.launchContext == nil || r.launchContext.Err() != nil || r.lifeCtx.Err() != nil ||
+		r.launch == nil {
+		return false
+	}
+	select {
+	case <-r.launch.LaunchAckDone():
+	default:
+		return false
+	}
+	select {
+	case <-r.launch.MUXReady():
+	default:
+		return false
+	}
+	return true
 }
 
 type runtimeConsoleWriter struct {

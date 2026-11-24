@@ -220,6 +220,11 @@ failed 或 exited。快速 app_started 和既有 Pinger 的已校验 Pong 将同
 成功要求 ACK 和 MUX；failed/terminal 也可结束 ACK 前等待。旧 token 被忽略，
 非法状态失败，迟到 started 不能覆盖确定终止错误。
 
+不带托管 readiness 或 checkpoint 所有权的独立 `sandbox-ctl run` 可能在运行态确认
+前完成短任务。相同 Launch token、实际已启动的 PID 及成功退出终态允许该命令直接
+等待正常 VMM 退出和清理，不发布 ready。公共 SDK Launch/Start 和托管 readiness
+仍要求确认运行态；取消、缺失启动证明、失败及清理错误不转换为成功。
+
 Commit 按既有 readiness/Runtime 锁顺序检查 owner/operation 取消、Runtime 状态、
 永久读取错误与当前事实；在用户回调前发布内部完成信号。回调阻塞不影响 Launch、
 Pinger Pause/Stop 或管理连接 join。Pinger 仅发布有界事实，回调在 tick 外、通知
