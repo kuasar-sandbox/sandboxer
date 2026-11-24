@@ -1205,6 +1205,7 @@ func (h *SnapshotHandler) handleExportContext(ctx context.Context, req ctl.Reque
 		h.capture.finish(resp.AfterWrite != nil || resp.BeforeWrite != nil || (err == nil && !req.ResumeAfter) || isTerminalCaptureError(err))
 	}()
 	opts := RunOptions{
+		runtime:      h.runtime,
 		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir, EnableCheckpoint: h.EnableCheckpoint,
 		memoryLayout: h.MemoryLayout,
 		Cfg:          h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,

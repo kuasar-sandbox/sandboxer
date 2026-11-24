@@ -3116,3 +3116,54 @@ func TestHandleSnapshotRequestValidatesMemoryHistoryBeforeQuiesce(t *testing.T) 
 		})
 	}
 }
+
+func TestSnapshotHandlerExportRetiresSystemdOwner(t *testing.T) {
+	dir := t.TempDir()
+	guestSock := filepath.Join(dir, "guest.sock")
+	guestDone := serveOneQuiesce(t, guestSock, nil)
+	shutdown := make(chan struct{})
+	chSock, _ := serveLifecycleCH(t, dir, func(path string) int {
+		if path == "/api/v1/vmm.shutdown" {
+			close(shutdown)
+		}
+		return http.StatusNoContent
+	})
+	owner := &Runtime{state: runtimeRunning, environmentActive: true}
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	handler := &SnapshotHandler{
+		runtime: owner, Context: context.Background(),
+		Cfg: &config.SandboxConfig{}, PortableConfig: portable, SandboxID: "test",
+		CHSock: chSock, RunDir: filepath.Join(dir, "run"),
+		Pinger:    &guestlink.Pinger{Client: &guestlink.HostClient{BasePath: guestSock}},
+		Forwarder: NewForwarder("", discardLogf), Reattach: func() error { return nil }, Logf: discardLogf,
+		Disks: []SnapDiskRef{{Size: 4096, SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			return bytes.NewReader(bytes.Repeat([]byte{0x51}, 4096)), nil, nil
+		}}},
+	}
+	resp, err := handler.HandleExport(ctl.Request{OutDir: filepath.Join(dir, "out")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := waitLifecycleResult(t, guestDone); err != nil {
+		t.Fatal(err)
+	}
+	if resp.SandboxRef == "" || resp.AfterWrite == nil {
+		t.Fatalf("incomplete export: %+v", resp)
+	}
+	if owner.physicalRetirement {
+		t.Fatal("owner retired before export response")
+	}
+	resp.AfterWrite()
+	owner.mu.Lock()
+	exitErr := owner.environmentExitErrorLocked()
+	owner.mu.Unlock()
+	select {
+	case <-shutdown:
+	case <-time.After(time.Second):
+		t.Fatal("export did not retire VMM")
+	}
+	if exitErr != nil {
+		t.Fatalf("successful frozen export reported failure: %v", exitErr)
+	}
+}

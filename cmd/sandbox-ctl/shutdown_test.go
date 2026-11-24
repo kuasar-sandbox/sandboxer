@@ -38,6 +38,14 @@ func TestShutdownCommandTargetsExactRun(t *testing.T) {
 	if err := runShutdown(context.Background(), args); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("SANDBOX_RUN_ROOT", dir)
+	if err := runShutdown(context.Background(), args[:6]); err != nil {
+		t.Fatalf("inherited run root: %v", err)
+	}
+	t.Setenv("SANDBOX_RUN_ROOT", filepath.Join(dir, "unused"))
+	if err := runShutdown(context.Background(), args); err != nil {
+		t.Fatalf("explicit run root must override environment: %v", err)
+	}
 	args[3] = "stale"
 	if err := runShutdown(context.Background(), args); !errors.Is(err, ctl.ErrShutdownTargetMismatch) {
 		t.Fatalf("stale generation err=%v", err)

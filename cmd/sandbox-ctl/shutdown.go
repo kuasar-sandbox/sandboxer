@@ -26,7 +26,7 @@ func runShutdown(ctx context.Context, args []string) error {
 	sid := fs.String("sandbox-id", "", "logical sandbox ID")
 	runID := fs.String("run-id", "", "exact running generation")
 	pathID := fs.String("path-id", "", "run directory leaf (defaults to sandbox ID)")
-	runRoot := fs.String("run-root", "/run/sandbox", "host control-socket root")
+	runRoot := fs.String("run-root", "", "host control-socket root (overrides SANDBOX_RUN_ROOT env; default /run/sandbox)")
 	timeout := fs.Duration("timeout", 0, "optional shorter operation budget (for example 30s); 0 uses the owner's bound")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -47,5 +47,12 @@ func runShutdown(ctx context.Context, args []string) error {
 		ctx, cancel = context.WithTimeout(ctx, *timeout)
 		defer cancel()
 	}
-	return ctl.Shutdown(ctx, filepath.Join(*runRoot, leaf, "ctl.sock"), target)
+	rd := *runRoot
+	if rd == "" {
+		rd = os.Getenv("SANDBOX_RUN_ROOT")
+	}
+	if rd == "" {
+		rd = "/run/sandbox"
+	}
+	return ctl.Shutdown(ctx, filepath.Join(rd, leaf, "ctl.sock"), target)
 }
