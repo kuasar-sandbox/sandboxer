@@ -266,9 +266,8 @@ cgroup 委托，但不重写 E 中的原始 `pid_namespace` 或 `cgroup_control`
 
 E 冷启动中，省略继承来源策略，显式 `off` 关闭继承策略；新的完整定义保存有效值。
 S 恢复保持捕获时 manager 和进程状态，拒绝包括 `off` 在内的模式覆盖。
-只有实际选中 Runtime 安装时，默认 PATH 才添加 `/run/sandbox-runtime/systemd/bin`。
-显式 `launch.env.PATH`、`launch.ephemeral_env.PATH`（包括空值）始终保留覆盖权。
-旧 E 保存了 PATH 但没有来源标记时，继续保持该 PATH。
+只有实际选中 Runtime 安装时，native exec 的默认 PATH 才包含私有工具目录；
+调用者显式 PATH（包括空值）始终保留覆盖权。原有 Launch/OCI 环境无需新增来源标记。
 
 ### Restore、Usage 与 deadline
 

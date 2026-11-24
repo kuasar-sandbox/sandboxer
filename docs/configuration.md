@@ -292,10 +292,9 @@ not rewrite the raw `pid_namespace` or `cgroup_control` values saved in E.
 An E cold start inherits an omitted mode; explicit `off` overrides an inherited
 active mode. A complete new definition persists the effective mode. An S restore
 continues its captured manager and process state and rejects any mode override,
-including `off`. Only an actually selected Runtime installation adds
-`/run/sandbox-runtime/systemd/bin` to a default PATH. Explicit `launch.env.PATH`
-or `launch.ephemeral_env.PATH`, including an empty value, remains authoritative.
-An older E with a stored PATH and no origin marker keeps that PATH unchanged.
+including `off`. Runtime systemd adds its tool directory to the native
+exec default PATH; explicit caller PATH values are never rewritten. Existing
+Launch/OCI environment values remain authoritative without new provenance metadata.
 
 ### Restore, usage and deadlines
 

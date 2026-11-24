@@ -331,7 +331,11 @@ The VMM timer starts before memory.high preparation or API calls, and a second
 signal still escalates immediately. A forced retirement returns an error; an
 unreaped process is never reported as released.
 
-The host-local API `ctl.Shutdown(ctx, socket, ctl.ShutdownTarget{SandboxID, RunID})`
+Normal Guest `Shutdown` is used only for an active systemd environment.
+Direct mode preserves its existing StopUnit/physical fence; attempting the
+normal Guest shutdown API on direct returns unsupported without changing the
+running environment. The host-local API
+`ctl.Shutdown(ctx, socket, ctl.ShutdownTarget{SandboxID, RunID})`
 requires the exact execution generation. `Runtime.RunID()` exposes it; a CLI run
 logs it and generates a fresh value if `--run-id` is omitted. This identity alone
 does not enable disk retention. For example:
@@ -348,14 +352,6 @@ owner returns a bounded transport/unsupported error. Loss of the accepted frame
 or caller disconnect does not cancel an accepted stop. Final response writers
 are detached before the owner begins, so fast cleanup neither closes their
 connection early nor waits on a shutdown waiter.
-
-Trusted product runners can carry materialized PATH provenance across the
-ordinary config-file boundary with an internal inherited descriptor. Its bounded
-envelope binds the exact file bytes by SHA-256 and validates each marked plugin's
-index and PATH before any origin is restored. The CLI reads that config once,
-consumes and closes the descriptor, then applies E inheritance. S restore rejects
-the handoff. The descriptor is an explicit trusted-caller API, not an
-authentication mechanism or an additional user Launch option.
 
 Live `Exec`, `Snapshot`, `Export` and `Stats` call the owner directly. Exec returns
 a caller-owned guest MUX connection and its negotiated stdio spec. Capture uses

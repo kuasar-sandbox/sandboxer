@@ -161,17 +161,7 @@ func applyPersistentFromOverrides(c0 *PortableSandboxConfig, host *SandboxConfig
 		launch.Args = append([]string(nil), host.Launch.Args...)
 	}
 	if presence.Has("launch.env") {
-		defaultPath, hadPath := launch.Env["PATH"]
-		keepDefaultPath := hadPath && launch.SystemdPathDefault
 		launch.Env = cloneMap(host.Launch.Env)
-		launch.SystemdPathDefault = host.Launch.PersistentSystemdPathDefault()
-		if _, explicit := host.Launch.Env["PATH"]; !explicit && keepDefaultPath {
-			if launch.Env == nil {
-				launch.Env = make(map[string]string)
-			}
-			launch.Env["PATH"] = defaultPath
-			launch.SystemdPathDefault = true
-		}
 	}
 	if presence.Has("launch.workdir") {
 		launch.Workdir = host.Launch.Workdir
@@ -336,7 +326,6 @@ func sandboxConfigFromPortable(portable *PortableSandboxConfig) *SandboxConfig {
 		Init:     cloneInit(portable.Init),
 		Metadata: cloneMap(portable.Metadata),
 	}
-	cfg.Launch.SetSystemdPathDefault(portable.Launch.SystemdPathDefault)
 	cfg.Boot.Disks = make([]DiskConfig, len(portable.Boot.Disks))
 	for i := range portable.Boot.Disks {
 		cfg.Boot.Disks[i] = DiskConfig{

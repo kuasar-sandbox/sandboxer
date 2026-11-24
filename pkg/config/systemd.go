@@ -61,42 +61,6 @@ func (l *LaunchConfig) UnmarshalYAML(n *yaml.Node) error {
 		return err
 	}
 	*l = LaunchConfig(out)
-	if env, ok := fields["env"]; ok {
-		var entries map[string]yaml.Node
-		if err := env.Decode(&entries); err != nil {
-			return err
-		}
-		if _, explicit := entries["PATH"]; explicit {
-			l.SetSystemdPathDefault(false)
-		}
-	}
+
 	return nil
-}
-
-// PersistentSystemdPathDefault reports whether PATH still comes from defaults.
-// A missing PATH uses the Guest default; an explicit empty PATH is an override.
-// Remembering the materialized value also detects programmatic map replacement.
-func (l LaunchConfig) PersistentSystemdPathDefault() bool {
-	value, present := l.Env["PATH"]
-	return !present || (l.systemdPathDefault && value == l.systemdDefaultPath)
-}
-
-// SystemdPathDefault applies the invocation-only PATH override without changing
-// the persistent provenance written to an E artifact.
-func (l LaunchConfig) SystemdPathDefault() bool {
-	if _, explicit := l.EphemeralEnv["PATH"]; explicit {
-		return false
-	}
-	return l.PersistentSystemdPathDefault()
-}
-
-// SetSystemdPathDefault carries provenance across trusted artifact projection
-// and image-default materialization. Ordinary Launch documents cannot set it.
-func (l *LaunchConfig) SetSystemdPathDefault(value bool) {
-	path, present := l.Env["PATH"]
-	l.systemdPathDefault = value && present
-	l.systemdDefaultPath = ""
-	if l.systemdPathDefault {
-		l.systemdDefaultPath = path
-	}
 }

@@ -600,10 +600,6 @@ func cloneSDKConfig(c *config.SandboxConfig) (*config.SandboxConfig, error) {
 		return nil, err
 	}
 	out.Resources.Control.CgroupFD = c.Resources.Control.CgroupFD
-	out.Launch.SetSystemdPathDefault(c.Launch.PersistentSystemdPathDefault())
-	for i := range c.Launch.Plugin {
-		out.Launch.Plugin[i].SetSystemdPathDefault(c.Launch.Plugin[i].PersistentSystemdPathDefault())
-	}
 	return &out, nil
 }
 func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {

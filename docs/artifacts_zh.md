@@ -407,16 +407,8 @@ Portable 内容包括:
 - root/data immutable graph,以及 data disk name/order/mount topology;
 - persistent launch/plugin/mounts/files/init/metadata.
 
-`launch.systemd` 保存冷启动策略；旧 E 缺少此字段按 `off` 解释。
-`launch.systemd_path_default` 是产物内部元数据，记录已保存的 PATH 来自镜像或 Runtime
-默认值，不属于普通 Launch 配置，用户 Launch 文档不能设置。E 投影和 clone 保留具体
-PATH 与标记；显式持久 PATH 清除标记，临时 PATH 只影响本次 wire，不修改产物。
-旧产物保存了 PATH 但没有标记时，继续把该 PATH 当作权威显式值。
-
-Portable `launch.plugin` 的每个条目也以内部 `systemd_path_default` 记录其自身 PATH
-来源。普通插件 YAML/JSON 拒绝该字段，可信产品投影和 SDK clone 显式携带它，普通插件
-独立 Env 的含义不变。显式插件 PATH（即使与默认值相同或为空）仍然权威。旧插件定义
-已有 PATH 而无来源标记时保留原值；路径前缀或字符串相等不能证明平台默认来源。
+`launch.systemd` 保存冷启动策略；旧 E 缺少此字段按 `off` 解释。Launch/plugin
+环境保持原有普通持久配置，不引入 PATH 默认来源标记或第二套来源协议。
 
 Portable 内容排除:
 

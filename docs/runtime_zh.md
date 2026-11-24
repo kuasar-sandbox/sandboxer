@@ -267,7 +267,9 @@ G 采用 Guest 实际使用的宽限（正整数 wire 秒，否则 10 秒），F
 VMM timer 早于 memory.high 准备和 API 请求，第二次 signal 仍立即升级。强制退役
 返回错误；未被实际回收的进程不会报告为已释放。
 
-本机 API `ctl.Shutdown(ctx, socket, ctl.ShutdownTarget{SandboxID, RunID})` 绑定精确
+Guest 正常 `Shutdown` 仅针对运行中的 systemd 环境；direct 仍遵循原有
+StopUnit/物理回收路径。direct 对正常 Guest shutdown API 返回 unsupported，
+不会改变运行状态。本机 API `ctl.Shutdown(ctx, socket, ctl.ShutdownTarget{SandboxID, RunID})` 绑定精确
 执行代次。`Runtime.RunID()` 返回该值；CLI run 会记录它，省略 `--run-id` 时自动产生
 新值。单独设置此身份不会开启磁盘保留。例如：
 
@@ -280,11 +282,6 @@ sandbox-ctl shutdown --sandbox-id demo --run-id RUN_ID --path-id demo
 调用方期限中较早者读取 `shutdown_done`。无响应或旧 owner 会有界返回 transport/
 unsupported 错误。受理帧丢失、连接断开不会撤销停止。owner 开始前已脱离最终回复
 连接的清理义务，所以快速退出不会提前关掉回复，也不会与关机等待互锁。
-
-可信产品 runner 可通过内部继承 FD，在普通配置文件边界携带已物化 PATH 的默认来源。
-有界 envelope 以 SHA-256 绑定精确文件内容，并在恢复来源前核对每个插件的索引和 PATH。
-CLI 只读一次配置，读取并关闭该 FD 后恢复来源，再执行 E 继承；S 恢复拒绝该交接。
-它是显式可信调用方 API，不是身份认证机制，也不增加用户 Launch 配置项。
 
 Live `Exec`、`Snapshot`、`Export`、`Stats` 直接调用 owner。Exec 返回调用方负责关闭的
 Guest MUX connection 及协商后的 stdio spec。Capture 复用既有 `ctl.Request` 选项和

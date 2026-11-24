@@ -840,7 +840,10 @@ func TestSDKShutdownManagementAndFinalResponse(t *testing.T) {
 	for _, mode := range []string{"ack", "lost-ack"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("SDK_TEST_SHUTDOWN", mode)
+			t.Setenv("SDK_TEST_SYSTEMD_V1", "1")
+			t.Setenv("SDK_TEST_ENVIRONMENT_RESULT", "stopped")
 			shape, launch := sdkFixture(t)
+			launch.Process.Systemd = "runtime"
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			r, err := StartRuntime(ctx, shape)
@@ -995,6 +998,15 @@ func TestSDKShutdownRejectsNonzeroVMMExit(t *testing.T) {
 				} else {
 					target := ctl.ShutdownTarget{SandboxID: shape.SandboxID, RunID: r.RunID()}
 					err = ctl.Shutdown(ctx, filepath.Join(r.runDir, "ctl.sock"), target)
+				}
+				if mode == "off" {
+					if !errors.Is(err, ctl.ErrShutdownUnsupported) {
+						t.Fatalf("direct Shutdown must retain the old unsupported behavior: %v", err)
+					}
+					if r.shutdown != nil || r.State() != "running" {
+						t.Fatal("direct Shutdown changed running state")
+					}
+					return
 				}
 				if err == nil || !strings.Contains(err.Error(), "runtime exited with code 23") {
 					t.Fatalf("nonzero real VMM exit was not rejected: %v", err)

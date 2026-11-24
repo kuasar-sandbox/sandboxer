@@ -10,11 +10,12 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 func shutdownRuntimeFixture(send func(context.Context) error) *Runtime {
 	life, cancel := context.WithCancelCause(context.Background())
-	return &Runtime{state: runtimeRunning, sandboxID: "sandbox", spec: RuntimeSpec{RunID: "run"}, lifeCtx: life, cancelLife: cancel, exitDone: make(chan struct{}), shutdownGuest: send, shutdownGrace: time.Second}
+	return &Runtime{state: runtimeRunning, environmentActive: true, sandboxID: "sandbox", spec: RuntimeSpec{RunID: "run"}, lifeCtx: life, cancelLife: cancel, exitDone: make(chan struct{}), shutdownGuest: send, shutdownGrace: time.Second}
 }
 
 func TestRuntimeShutdownACKDoesNotCompleteAndCallerCancelDoesNotUndo(t *testing.T) {
@@ -50,6 +51,9 @@ func TestRuntimeShutdownACKDoesNotCompleteAndCallerCancelDoesNotUndo(t *testing.
 	if r.State() != "closing" {
 		t.Fatal("caller cancellation changed owner state")
 	}
+	r.mu.Lock()
+	r.environmentExit = &proto.EnvironmentExit{State: proto.EnvironmentStopped}
+	r.mu.Unlock()
 	r.finishExit(ExitResult{})
 	if err := r.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
@@ -96,7 +100,13 @@ func TestRuntimeShutdownDoesNotHoldOperationOrWorkLocksWhileWaiting(t *testing.T
 		t.Fatal("shutdown needed workMu")
 	}
 	retiring := make(chan struct{})
-	go func() { r.finishExit(ExitResult{}); close(retiring) }()
+	go func() {
+		r.mu.Lock()
+		r.environmentExit = &proto.EnvironmentExit{State: proto.EnvironmentStopped}
+		r.mu.Unlock()
+		r.finishExit(ExitResult{})
+		close(retiring)
+	}()
 	r.opsWG.Done()
 	r.workMu.Unlock()
 	select {
@@ -240,6 +250,23 @@ func TestRuntimeShutdownReapedGuestDoesNotEscalateDuringCleanup(t *testing.T) {
 	case sig := <-r.signals:
 		t.Fatalf("signaled already-reaped VMM: %v", sig)
 	default:
+	}
+	r.finishExit(ExitResult{})
+}
+
+// Direct mode preserves the preexisting StopUnit/Close path rather than
+// beginning a normal Guest/systemd shutdown transaction.
+func TestDirectRuntimeShutdownDoesNotChangeLifecycle(t *testing.T) {
+	r := shutdownRuntimeFixture(func(context.Context) error {
+		t.Fatal("direct run incorrectly received Guest shutdown")
+		return nil
+	})
+	r.environmentActive = false
+	if err := r.Shutdown(context.Background()); !errors.Is(err, ctl.ErrShutdownUnsupported) {
+		t.Fatalf("direct Shutdown = %v, want unsupported", err)
+	}
+	if r.shutdown != nil || r.State() != "running" {
+		t.Fatalf("direct shutdown changed lifecycle: state=%s shutdown=%+v", r.State(), r.shutdown)
 	}
 	r.finishExit(ExitResult{})
 }

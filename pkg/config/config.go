@@ -643,13 +643,10 @@ type OverlayConfig struct {
 type LaunchConfig struct {
 	// Systemd selects off|auto|runtime|provided. Empty input inherits from E;
 	// otherwise its effective cold-start value is off.
-	Systemd string `yaml:"systemd,omitempty"`
-	// Internal PATH provenance is deliberately absent from public YAML/JSON.
-	systemdPathDefault bool
-	systemdDefaultPath string
-	Exec               string            `yaml:"exec"`
-	Args               []string          `yaml:"args"`
-	Env                map[string]string `yaml:"env"`
+	Systemd string            `yaml:"systemd,omitempty"`
+	Exec    string            `yaml:"exec"`
+	Args    []string          `yaml:"args"`
+	Env     map[string]string `yaml:"env"`
 	// EphemeralEnv overrides Env by key for the current cold-start process. It
 	// is host/instance input and is never serialized into a Sandbox artifact.
 	EphemeralEnv map[string]string `yaml:"ephemeral_env,omitempty"`
@@ -733,15 +730,12 @@ type InitConfig struct {
 // PluginConfig declares a companion ("plugin") process supervised alongside
 // the app. Restart is its policy (never|on-failure|always; empty → always).
 type PluginConfig struct {
-	// Internal default provenance cannot be supplied by ordinary documents.
-	systemdPathDefault bool
-	systemdDefaultPath string
-	Exec               string            `yaml:"exec"`
-	Args               []string          `yaml:"args,omitempty"`
-	Env                map[string]string `yaml:"env,omitempty"`
-	Workdir            string            `yaml:"workdir,omitempty"`
-	User               string            `yaml:"user,omitempty"`
-	Restart            string            `yaml:"restart,omitempty"` // never|on-failure|always; empty → always
+	Exec    string            `yaml:"exec"`
+	Args    []string          `yaml:"args,omitempty"`
+	Env     map[string]string `yaml:"env,omitempty"`
+	Workdir string            `yaml:"workdir,omitempty"`
+	User    string            `yaml:"user,omitempty"`
+	Restart string            `yaml:"restart,omitempty"` // never|on-failure|always; empty → always
 }
 
 // Load reads one sandbox.yaml and applies defaults.

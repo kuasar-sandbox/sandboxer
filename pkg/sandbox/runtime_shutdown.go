@@ -104,6 +104,11 @@ func (r *Runtime) beginShutdown(deadline time.Time) error {
 	if r.state != runtimeRunning {
 		return fmt.Errorf("%w: state %s", ctl.ErrShutdownUnavailable, r.state)
 	}
+	// Direct environments retain their existing StopUnit/fence shutdown
+	// behavior. The new normal Guest shutdown applies only to systemd runs.
+	if !r.environmentActive {
+		return ctl.ErrShutdownUnsupported
+	}
 	if r.shutdownGuest == nil {
 		return ctl.ErrShutdownUnsupported
 	}

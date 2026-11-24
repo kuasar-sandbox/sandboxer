@@ -134,15 +134,6 @@ func runCmd(args []string) int {
 	if *configPath == "" {
 		*configPath = os.Getenv("SANDBOX_CONFIG")
 	}
-	provenance, err := consumeConfigProvenance()
-	if err != nil {
-		fmt.Fprintln(diagnostics, err)
-		return 2
-	}
-	if len(provenance) != 0 && *restoreRef != "" {
-		fmt.Fprintln(diagnostics, "sandbox-ctl run: config provenance is not permitted with --restore")
-		return 2
-	}
 	if *replaceBoot && *configPath == "" {
 		fmt.Fprintln(diagnostics, "sandbox-ctl run: --replace-boot requires --config or SANDBOX_CONFIG")
 		return 2
@@ -291,7 +282,7 @@ func runCmd(args []string) int {
 		fmt.Fprintln(diagnostics, "sandbox-ctl run: --config or SANDBOX_CONFIG required")
 		return 2
 	}
-	cfg, presence, err := loadRunConfig(*configPath, *fromRef != "" || *restoreRef != "", provenance)
+	cfg, presence, err := loadRunConfig(*configPath, *fromRef != "" || *restoreRef != "")
 	if err != nil {
 		fmt.Fprintln(diagnostics, err)
 		return 1
@@ -547,4 +538,19 @@ func locateCH() (string, error) {
 		return "", fmt.Errorf("%w; or set $SANDBOX_CH_PATH", err)
 	}
 	return p, nil
+}
+
+// loadRunConfig loads the ordinary CLI config with key presence retained for
+// Sandbox E inheritance. No task-specific provenance protocol is required.
+func loadRunConfig(paths string, withPresence bool) (*config.SandboxConfig, config.FieldPresence, error) {
+	if paths == "" {
+		cfg := &config.SandboxConfig{}
+		cfg.ApplyDefaults()
+		return cfg, config.FieldPresence{}, nil
+	}
+	if withPresence {
+		return config.LoadMergedWithPresence(strings.Split(paths, ":"))
+	}
+	cfg, err := config.LoadMerged(strings.Split(paths, ":"))
+	return cfg, config.FieldPresence{}, err
 }
