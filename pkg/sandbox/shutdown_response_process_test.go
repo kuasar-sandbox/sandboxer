@@ -72,11 +72,20 @@ func TestWaitRunJoinsShutdownResponseWithoutCapture(t *testing.T) {
 			}
 			if mode == "disconnected" {
 				cancelRequest()
+				// Cancellation schedules socket closure asynchronously. Observe the
+				// disconnect before allowing a complete reply to win that race.
+				select {
+				case err = <-replied:
+				case <-ctx.Done():
+					t.Fatal("shutdown client did not observe cancellation")
+				}
 			}
 			if _, err := stdin.Write([]byte{1}); err != nil {
 				t.Fatal(err)
 			}
-			err = <-replied
+			if mode != "disconnected" {
+				err = <-replied
+			}
 			switch mode {
 			case "success":
 				if err != nil {
@@ -87,8 +96,8 @@ func TestWaitRunJoinsShutdownResponseWithoutCapture(t *testing.T) {
 					t.Fatalf("lost shutdown error: %v", err)
 				}
 			case "disconnected":
-				if err == nil {
-					t.Fatal("disconnected shutdown client reported success")
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("disconnected shutdown client: got %v, want context cancellation", err)
 				}
 			}
 			select {
