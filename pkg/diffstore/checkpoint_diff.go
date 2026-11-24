@@ -247,6 +247,16 @@ func (c *Disk) CanResumeCheckpoint(id CheckpointID) bool {
 // Ready, so ongoing guest writes cannot starve entry to this boundary. The
 // worker and materializer never take opMu, and can finish Drain/publication.
 func (c *Disk) Checkpoint(ctx context.Context, id CheckpointID) error {
+	return c.checkpoint(ctx, id, false)
+}
+
+// TemporaryCheckpoint uses ordinary checkpoint durability but is withdrawn on
+// reopening the disk, even if the creating transaction returned an I/O error.
+func (c *Disk) TemporaryCheckpoint(ctx context.Context, id CheckpointID) error {
+	return c.checkpoint(ctx, id, true)
+}
+
+func (c *Disk) checkpoint(ctx context.Context, id CheckpointID, temporary bool) error {
 	d, err := c.checkpointBackend()
 	if err != nil {
 		return err
@@ -270,6 +280,9 @@ func (c *Disk) Checkpoint(ctx context.Context, id CheckpointID) error {
 	}
 	if err := c.WaitMaterialized(ctx); err != nil {
 		return err
+	}
+	if temporary {
+		return d.store.TemporaryCheckpoint(ctx, string(id))
 	}
 	return d.store.Checkpoint(ctx, string(id))
 }

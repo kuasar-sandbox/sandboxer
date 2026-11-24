@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 // See docs/runtime.md#snapshot.
 func snapshotCmd(args []string) int {
 	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
+	resumeEarly := fs.Bool("resume-early", false, "resume after freezing independent inputs, before persistence completes (implies --resume)")
 	checkpoint := fs.String("checkpoint", "", "create a named local disk checkpoint")
 	jsonOutput := fs.Bool("json", false, "emit the completed Snapshot S and Sandbox E references as JSON")
 	sandboxID := fs.String("sandbox-id", "", "target sandbox id (path fallback when --path-id is omitted)")
@@ -37,6 +39,13 @@ func snapshotCmd(args []string) int {
 
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if *resumeEarly {
+		if *checkpoint != "" {
+			fmt.Fprintln(os.Stderr, "snapshot: named local checkpoints are not used by early-resume snapshots")
+			return 2
+		}
+		*resume = true
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "snapshot: unexpected positional arguments")
@@ -126,6 +135,9 @@ func snapshotCmd(args []string) int {
 		DropCaches:                  dropCaches,
 		MergeRef:                    mergeRef,
 	}
+	if *resumeEarly {
+		req.ResumeEarly = true
+	}
 	req.HostRetirement, err = ctl.ParseHostRetirement(os.Getenv(ctl.HostRetirementEnvironment))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "snapshot: retirement permit: %v\n", err)
@@ -160,8 +172,36 @@ func snapshotCmd(args []string) int {
 	if warning := snapshotDropCachesWarning(*dropCaches, resp.DropCachesResult); warning != "" {
 		fmt.Fprintf(os.Stderr, "snapshot: warning: %s\n", warning)
 	}
+	if *resumeEarly {
+		if _, err := captureReport(resp, artifact.RoleSnapshot); err != nil {
+			fmt.Fprintf(os.Stderr, "snapshot: invalid runtime result: %v\n", err)
+			return 1
+		}
+		if resp.CleanupWarning != "" {
+			fmt.Fprintf(os.Stderr, "snapshot: snapshot saved; cleanup warning: %s\n", resp.CleanupWarning)
+		}
+	}
 	if *jsonOutput {
+		if *resumeEarly {
+			// These legacy fields measure the pause RPC and sink work, not the
+			// application pause. Early resume exposes its explicitly defined timings.
+			resp.WallclockPauseMs, resp.WallclockDumpMs = 0, 0
+			if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			return 0
+		}
 		return printCaptureJSON(resp, artifact.RoleSnapshot)
+	}
+	if *resumeEarly {
+		fmt.Fprintf(os.Stderr, "snapshot saved: application_pause_ms=%.3f save_complete_ms=%.3f\n", resp.ApplicationPauseMs, resp.SaveCompleteMs)
+		if *upload {
+			fmt.Println(resp.SnapshotManifestKey)
+		} else {
+			fmt.Println(resp.SnapshotRef)
+		}
+		return 0
 	}
 	if *upload {
 		// Match `manifest-ctl store --put-manifest`: stdout = manifest key,

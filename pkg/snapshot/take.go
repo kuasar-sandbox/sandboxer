@@ -36,6 +36,10 @@ type Quiescer interface {
 
 // Sources gathers the inputs Take needs.
 type Sources struct {
+	// ResumeEarly fixes independent inputs and resumes before using the ordinary sink.
+	ResumeEarly bool
+	ResumeGuest func() error
+
 	FrozenMemory *FrozenMemoryCapture
 	MemoryLayout MemoryLayout // standalone callers with an existing stable layout
 	// CaptureMemory collects CH logs then freezes M/D/R after snapshot writes.
@@ -98,15 +102,17 @@ type Sources struct {
 // re-export), is the parent's already-resolved, scheme-qualified local overlay
 // ref this disk's delta is flattened onto (replace, not stack).
 type DiskDiff struct {
-	DiffID           string
-	Checkpoint       func(context.Context, string) error
-	DeleteCheckpoint func(context.Context, string) error
-	WaitMaterialized func(context.Context) error
-	Export           func(context.Context) (ExportView, error)
-	Path             string
-	Owned            bool
-	MergeBase        string
-	SnapshotView     func() (io.ReadSeeker, []sparse.Extent, error)
+	DiffID              string
+	TemporaryCheckpoint func(context.Context, string) error
+	Checkpoint          func(context.Context, string) error
+	OpenCheckpoint      func(context.Context, string) (ExportView, error)
+	DeleteCheckpoint    func(context.Context, string) error
+	WaitMaterialized    func(context.Context) error
+	Export              func(context.Context) (ExportView, error)
+	Path                string
+	Owned               bool
+	MergeBase           string
+	SnapshotView        func() (io.ReadSeeker, []sparse.Extent, error)
 	// WaitReady resolves transient writable-diff initialization before the VM is paused.
 	WaitReady func(context.Context) error
 	// CheckError rechecks asynchronous COW failures, including after the last read.
@@ -117,10 +123,11 @@ type DiskDiff struct {
 // (scheme-qualified file ref | manifest://<key>); Path is the local file (file mode
 // only, "" for upload). The handler maps these into the ctl.Response.
 type Outputs struct {
-	SnapshotRef  string
-	SnapshotPath string
-	SandboxRef   string
-	SandboxPath  string
+	CleanupWarning string // committed snapshot remains valid if temporary cleanup fails
+	SnapshotRef    string
+	SnapshotPath   string
+	SandboxRef     string
+	SandboxPath    string
 
 	MemorySize uint64
 	// MemoryResident is explicit logical memory coverage (Data plus Zero),
@@ -139,7 +146,7 @@ type Outputs struct {
 // Caller responsibility: create/remove StagingDir and transfer ownership of a
 // sink (FileSink for --output, IngestSink for --upload, or BundleSink). Take
 // closes it on every return path.
-func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr error) {
+func Take(s Sources, sink ArtifactSink, resumeAfter bool) (result *Outputs, retErr error) {
 	frozenCommitted := false
 	defer func() {
 		if frozenCommitted && retErr != nil {
@@ -160,6 +167,9 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	logf := s.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
+	}
+	if s.ResumeEarly && (!resumeAfter || s.CheckpointID != "" || s.FrozenMemory != nil || s.ResumeGuest == nil) {
+		return nil, errors.New("resume-early requires resume, guest thaw, and ordinary portable capture")
 	}
 	if s.SandboxID == "" {
 		return nil, fmt.Errorf("snapshot: empty SandboxID")
@@ -255,8 +265,41 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		return nil, err
 	}
 
-	// T3: capture all disks once and emit Sandbox E while the same CH/backend
-	// freeze remains held. E is a dependency, not yet the operation root.
+	// A resumeEarly first owns independent immutable inputs. The sink work below
+	// can then proceed after the original guest continues running.
+	if s.ResumeEarly {
+		if err := ch.Snapshot("file://" + s.StagingDir); err != nil {
+			return nil, err
+		}
+		release, err := freezeResumeEarlyInputs(ctx, &s)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			cleanupErr := release()
+			if cleanupErr == nil {
+				return
+			}
+			if retErr == nil && result != nil {
+				result.CleanupWarning = cleanupErr.Error()
+				logf("resume-early: snapshot committed; temporary cleanup failed: %v", cleanupErr)
+			} else {
+				retErr = errors.Join(retErr, cleanupErr)
+			}
+		}()
+		s.Quiescer.Resume()
+		backendsResumed = true
+		if err := ch.Resume(); err != nil {
+			return nil, fmt.Errorf("resume-early CH resume: %w", err)
+		}
+		resumed = true
+		if err := s.ResumeGuest(); err != nil {
+			return nil, err
+		}
+	}
+
+	// T3: emit Sandbox E from live frozen disks or the detached resumeEarly inputs.
+	// E is a dependency, not yet the operation root.
 	dumpStart := time.Now()
 	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{
 		CheckpointID: s.CheckpointID, checkpointState: checkpointState,
@@ -273,8 +316,10 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	// T4: CH /vm.snapshot → staging dir. CH writes only config.json + state.json
 	// there (small); the multi-GiB memory + disk never touch the staging tmpfs —
 	// they stream straight to the sink.
-	if err := ch.Snapshot("file://" + s.StagingDir); err != nil {
-		return nil, fmt.Errorf("CH snapshot: %w", err)
+	if !s.ResumeEarly {
+		if err := ch.Snapshot("file://" + s.StagingDir); err != nil {
+			return nil, fmt.Errorf("CH snapshot: %w", err)
+		}
 	}
 	configJSON, err := os.ReadFile(filepath.Join(s.StagingDir, "config.json"))
 	if err != nil {
@@ -430,7 +475,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	dumpEnd := time.Now()
 
 	// T8: resume (destroy path handled by caller).
-	if resumeAfter {
+	if resumeAfter && !resumed {
 		s.Quiescer.Resume()
 		backendsResumed = true
 		if err := ch.Resume(); err != nil {

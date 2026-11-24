@@ -2,6 +2,7 @@ package versioned
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -68,6 +69,7 @@ type checkpoint struct {
 	Garbage    uint64
 	Visible    bool
 	Retained   bool
+	Temporary  bool `json:",omitempty"` // owned only by a live early-resume capture; recover after owner exit
 	Pending    bool
 	Bitmap     uint64 // head of the exclusive presence-copy chain
 	BitmapDone uint64 // durable GC cursor; live checkpoints always have zero
@@ -479,7 +481,10 @@ func openStore(path string, o Options, metadata bool) (*Store, error) {
 			return fail(err)
 		}
 	}
-	s.currentFlag.Store(ctrl.Current)
+	if err = s.recoverTemporaryCheckpoints(context.Background()); err != nil {
+		return fail(err)
+	}
+	s.currentFlag.Store(s.ctrl.Current)
 	s.retiredFlag.Store(ctrl.Retired)
 	if !metadata {
 		s.startGC()

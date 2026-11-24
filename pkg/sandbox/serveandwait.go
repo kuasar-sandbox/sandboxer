@@ -225,20 +225,22 @@ type DiskArg struct {
 // upper-only logical view; Size supports predictable preflight checks without
 // constructing that view, and DiffPath remains for diagnostics and cleanup.
 type SnapDiskRef struct {
-	Slot              bool
-	DiffID            string
-	Checkpoint        func(context.Context, string) error
-	DeleteCheckpoint  func(context.Context, string) error
-	DeleteCheckpoints func(context.Context, []string) error
-	ListCheckpoints   func(context.Context) ([]string, error)
-	WaitMaterialized  func(context.Context) error
-	Export            func(context.Context) (snapshot.ExportView, error)
-	DiffPath          string
-	OwnedDiff         bool
-	Size              int64
-	SnapshotView      func() (io.ReadSeeker, []sparse.Extent, error)
-	WaitReady         func(context.Context) error
-	CheckError        func() error
+	Slot                bool
+	DiffID              string
+	TemporaryCheckpoint func(context.Context, string) error
+	Checkpoint          func(context.Context, string) error
+	OpenCheckpoint      func(context.Context, string) (snapshot.ExportView, error)
+	DeleteCheckpoint    func(context.Context, string) error
+	DeleteCheckpoints   func(context.Context, []string) error
+	ListCheckpoints     func(context.Context) ([]string, error)
+	WaitMaterialized    func(context.Context) error
+	Export              func(context.Context) (snapshot.ExportView, error)
+	DiffPath            string
+	OwnedDiff           bool
+	Size                int64
+	SnapshotView        func() (io.ReadSeeker, []sparse.Extent, error)
+	WaitReady           func(context.Context) error
+	CheckError          func() error
 }
 
 // ServeAndWait owns the half of the sandbox lifecycle that is identical

@@ -58,6 +58,7 @@ type Request struct {
 	// Mode is optional for wire compatibility. Empty means local tarstream;
 	// bundle selects one multi-Manifest ZIP Bundle.
 	Mode        string `json:"mode,omitempty"`
+	ResumeEarly bool   `json:"resume_early,omitempty"` // snapshot only; implies ResumeAfter
 	ResumeAfter bool   `json:"resume_after,omitempty"`
 	StagingDir  string `json:"staging_dir,omitempty"`
 	// nil means that guest caches are preserved; callers can explicitly opt in
@@ -89,6 +90,13 @@ type Response struct {
 	Checkpoints     []DiffCheckpointRef `json:"checkpoints,omitempty"`
 	CheckpointCount int                 `json:"checkpoint_count,omitempty"`
 
+	// CleanupWarning does not invalidate the successfully committed snapshot.
+	CleanupWarning string `json:"cleanup_warning,omitempty"`
+	// Early-resume timing includes guest quiesce through successful application thaw.
+	ApplicationPauseMs float64 `json:"application_pause_ms,omitempty"`
+	// SaveCompleteMs measures server-side capture handling through persistence,
+	// commit and cleanup completion, including the application pause but excluding client round-trip overhead.
+	SaveCompleteMs float64 `json:"save_complete_ms,omitempty"`
 	// snapshot_done fields.
 	MemorySize          uint64                 `json:"memory_size,omitempty"`
 	MemoryResident      uint64                 `json:"memory_resident,omitempty"`

@@ -11,20 +11,24 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
-func printCaptureJSON(resp ctl.Response, role artifact.LogicalRole) int {
+func captureReport(resp ctl.Response, role artifact.LogicalRole) (artifact.PublishReport, error) {
 	want := ctl.TypeExportDone
 	root := resp.SandboxRef
 	if role == artifact.RoleSnapshot {
 		want, root = ctl.TypeSnapshotDone, resp.SnapshotRef
 	}
 	if resp.Type != want {
-		fmt.Fprintln(os.Stderr, "capture: unexpected runtime response")
-		return 1
+		return artifact.PublishReport{}, fmt.Errorf("unexpected runtime response")
 	}
 	report, err := (artifact.PublishResult{Role: role, Ref: root, SandboxRef: resp.SandboxRef}).Report()
 	if err == nil {
 		err = report.ValidateCapture(role)
 	}
+	return report, err
+}
+
+func printCaptureJSON(resp ctl.Response, role artifact.LogicalRole) int {
+	report, err := captureReport(resp, role)
 	if err == nil {
 		err = json.NewEncoder(os.Stdout).Encode(report)
 	}

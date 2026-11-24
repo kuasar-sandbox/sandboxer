@@ -32,6 +32,14 @@ func (s *Store) findCheckpoint(id string, t *transaction) (uint64, checkpoint, e
 	return 0, checkpoint{}, ErrNotExist
 }
 func (s *Store) Checkpoint(ctx context.Context, id string) error {
+	return s.checkpoint(ctx, id, false)
+}
+
+func (s *Store) TemporaryCheckpoint(ctx context.Context, id string) error {
+	return s.checkpoint(ctx, id, true)
+}
+
+func (s *Store) checkpoint(ctx context.Context, id string, temporary bool) error {
 	if err := WaitInitialized(s, ctx); err != nil {
 		return err
 	}
@@ -57,7 +65,7 @@ func (s *Store) Checkpoint(ctx context.Context, id string) error {
 		if err != nil {
 			return err
 		}
-		cp := checkpoint{Bitmap: bitmap, ID: id, Epoch: t.ctrl.Epoch, Root: t.ctrl.Root, Previous: t.ctrl.Tail, Visible: true, Retained: true}
+		cp := checkpoint{Temporary: temporary, Bitmap: bitmap, ID: id, Epoch: t.ctrl.Epoch, Root: t.ctrl.Root, Previous: t.ctrl.Tail, Visible: true, Retained: true}
 		if t.ctrl.Tail != 0 {
 			last, err := s.readCheckpoint(t.ctrl.Tail, t)
 			if err != nil {
@@ -236,4 +244,27 @@ func (s *Store) Retire(ctx context.Context) error {
 		return fmt.Errorf("diffstore: retired path no longer identifies the owned inode")
 	}
 	return os.Remove(path)
+}
+
+// The exclusive owner lock is held by openStore. Reader pins from another
+// process still protect deleted versions through the ordinary GC mechanism.
+func (s *Store) recoverTemporaryCheckpoints(ctx context.Context) error {
+	var ids []string
+	for slot, count := s.ctrl.Head, uint64(0); slot != 0; count++ {
+		if count >= s.ctrl.Next || slot >= s.ctrl.Next {
+			return fmt.Errorf("diffstore: checkpoint chain cycle")
+		}
+		cp, err := s.readCheckpoint(slot, nil)
+		if err != nil {
+			return err
+		}
+		if cp.Temporary && cp.Visible {
+			ids = append(ids, cp.ID)
+		}
+		slot = cp.Next
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return s.DeleteCheckpoints(ctx, ids)
 }

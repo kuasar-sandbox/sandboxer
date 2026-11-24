@@ -15,7 +15,8 @@
 
 - 从已展平 image 冷创建 Sandbox;
 - 从 snapshot template 创建相互独立的实例;
-- 捕获 snapshot、在线 export 和发布，并可选择恢复原 runtime 继续运行;
+- 捕获 snapshot、在线 export 和发布，并可选择恢复原 runtime 继续运行；
+  `snapshot --resume-early` 可在保存完成前提前恢复原沙箱，详见[接口、计时和限制](docs/resume_early_zh.md);
 - 通过外部 memfd/userfaultfd 路径按需加载 guest memory;
 - 为本地文件或 Manifest-backed 数据提供 vhost-user block backend,并维护实例独立的 copy-on-write diff;
 - 通过 vsock 和多路复用 stdio/port-forwarding 路径受控通信;

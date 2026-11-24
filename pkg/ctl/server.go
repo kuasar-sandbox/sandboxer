@@ -275,6 +275,9 @@ func (s *Server) handle(conn *net.UnixConn) {
 		return
 
 	case TypeSnapshotRequest, TypeCheckpointSnapshotRequest:
+		if req.ResumeEarly {
+			req.ResumeAfter = true
+		}
 		defer conn.Close()
 		if s.SnapshotHandler == nil {
 			code := ""

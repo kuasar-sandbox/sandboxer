@@ -344,7 +344,7 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 		if d.SnapshotView == nil || d.Size <= 0 {
 			return opts, nil, nil, nil, fmt.Errorf("disk %d has invalid SnapshotView/size", i)
 		}
-		diffs[i] = snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff, SnapshotView: d.SnapshotView, WaitReady: d.WaitReady, CheckError: d.CheckError, DiffID: d.DiffID, Checkpoint: d.Checkpoint, DeleteCheckpoint: d.DeleteCheckpoint, WaitMaterialized: d.WaitMaterialized, Export: d.Export}
+		diffs[i] = snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff, SnapshotView: d.SnapshotView, WaitReady: d.WaitReady, CheckError: d.CheckError, DiffID: d.DiffID, Checkpoint: d.Checkpoint, TemporaryCheckpoint: d.TemporaryCheckpoint, OpenCheckpoint: d.OpenCheckpoint, DeleteCheckpoint: d.DeleteCheckpoint, WaitMaterialized: d.WaitMaterialized, Export: d.Export}
 		if opts.namedCheckpoint || c0.IsCheckpoint() && (i == 0 || !c0.Boot.Disks[i-1].PureBlock) {
 			continue
 		}
