@@ -339,17 +339,18 @@ func (s *checkpointMemorySave) finishRetirement(first chan<- error) {
 }
 
 // WaitMemorySave keeps executable adapters alive for their detached holder and
-// final capture responses. Runtime.Wait/Close retain their existing resource-
+// final capture/shutdown responses, including runs without a holder.
+// Runtime.Wait/Close retain their existing resource-
 // ownership boundary; response completion must not join that earlier barrier.
 func (r *Runtime) WaitMemorySave(ctx context.Context) error {
 	r.mu.Lock()
 	save := r.memorySave
 	responsesDone := r.captureResponsesDone
 	r.mu.Unlock()
-	if save == nil {
-		return nil
+	var err error
+	if save != nil {
+		err = save.holder.Wait(ctx)
 	}
-	err := save.holder.Wait(ctx)
 	if responsesDone != nil {
 		select {
 		case <-responsesDone:
@@ -433,6 +434,7 @@ func destroyFrozenMemory(process processSignaler, lock *os.File, release func(),
 
 func frozenRetirement(r *Runtime, process processSignaler, lock *os.File, release func(), exited <-chan struct{}, logf func(string, ...any)) func() error {
 	return sync.OnceValue(func() error {
+		r.markPhysicalRetirement()
 		r.markExiting()
 		r.mu.Lock()
 		stopBackends := r.stopFrozenBackends

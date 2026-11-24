@@ -48,7 +48,7 @@ func runCmd(args []string) int {
 
 	enableCheckpoint := fs.Bool("enable-checkpoint", false, "retain versioned writable disks in BaseRoot/PathID/checkpoint")
 	retainInstance := fs.String("retain-instance", "", "parent object instance owning the current disks (requires --run-id and --enable-checkpoint)")
-	currentRunID := fs.String("run-id", "", "exact run identity for retained current disks")
+	currentRunID := fs.String("run-id", "", "exact execution identity (generated when omitted)")
 	configPath := fs.String("config", "", "sandbox.yaml path(s), ':'-separated, merged front-to-back (or SANDBOX_CONFIG env)")
 	manifestPath := fs.String("manifest-config", "", "path to storage config YAML (overrides MANIFEST_CONFIG env; controls Manifest access and local/ref encryption policies)")
 	sandboxID := fs.String("sandbox-id", "", "sandbox id (overrides sandbox.yaml)")
@@ -282,26 +282,10 @@ func runCmd(args []string) int {
 		fmt.Fprintln(diagnostics, "sandbox-ctl run: --config or SANDBOX_CONFIG required")
 		return 2
 	}
-	var (
-		cfg      *config.SandboxConfig
-		presence config.FieldPresence
-	)
-	if *configPath == "" {
-		cfg = &config.SandboxConfig{}
-		cfg.ApplyDefaults()
-	} else if *fromRef != "" || *restoreRef != "" {
-		cfg, presence, err = config.LoadMergedWithPresence(strings.Split(*configPath, ":"))
-		if err != nil {
-			fmt.Fprintln(diagnostics, err)
-			return 1
-		}
-	} else {
-		// --config accepts ':'-separated paths, deep-merged front-to-back.
-		cfg, err = config.LoadMerged(strings.Split(*configPath, ":"))
-		if err != nil {
-			fmt.Fprintln(diagnostics, err)
-			return 1
-		}
+	cfg, presence, err := loadRunConfig(*configPath, *fromRef != "" || *restoreRef != "")
+	if err != nil {
+		fmt.Fprintln(diagnostics, err)
+		return 1
 	}
 	manifestCfg, err := config.LoadManifestConfig(*manifestPath)
 	if err != nil {
@@ -349,7 +333,7 @@ func runCmd(args []string) int {
 
 	// Restore mode dispatch.
 	var currentRun *artifact.CurrentRun
-	if *retainInstance != "" || *currentRunID != "" {
+	if *retainInstance != "" {
 		currentRun = &artifact.CurrentRun{SandboxID: *sandboxID, InstanceID: *retainInstance, RunID: *currentRunID}
 		if err := currentRun.Validate(); err != nil || !*enableCheckpoint {
 			fmt.Fprintln(diagnostics, "current disk retention requires --sandbox-id, --retain-instance, --run-id and --enable-checkpoint")
@@ -359,7 +343,7 @@ func runCmd(args []string) int {
 	if restoreR != "" {
 		return runRestore(ctx, cfg, presence, manifestCfg, restoreR,
 			*sandboxID, *pathID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
-			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics, runRetentionOptions{Checkpoint: *enableCheckpoint, CurrentRun: currentRun})
+			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics, runRetentionOptions{Checkpoint: *enableCheckpoint, CurrentRun: currentRun, RunID: *currentRunID})
 	}
 
 	var sourceLaunch sandbox.LaunchSpec
@@ -390,6 +374,7 @@ func runCmd(args []string) int {
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
 		EnableCheckpoint:   *enableCheckpoint,
 		CurrentRun:         currentRun,
+		RunID:              *currentRunID,
 		Cfg:                cfg,
 		PortableConfig:     sourceLaunch.PortableConfig,
 		SourceBinding:      sourceLaunch.SourceBinding,
@@ -422,6 +407,7 @@ func runCmd(args []string) int {
 }
 
 type runRetentionOptions struct {
+	RunID      string
 	Checkpoint bool
 	CurrentRun *artifact.CurrentRun
 }
@@ -481,6 +467,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 	runtime, err := runtimesdk.Restore(ctx, runtimesdk.RestoreSpec{
 		EnableCheckpoint:    retention.Checkpoint,
 		CurrentRun:          retention.CurrentRun,
+		RunID:               retention.RunID,
 		SnapshotPath:        snapshotPath,
 		SnapshotManifestKey: snapshotKey,
 		SnapshotRef:         snapshotRef,
@@ -551,4 +538,19 @@ func locateCH() (string, error) {
 		return "", fmt.Errorf("%w; or set $SANDBOX_CH_PATH", err)
 	}
 	return p, nil
+}
+
+// loadRunConfig loads the ordinary CLI config with key presence retained for
+// Sandbox E inheritance. No task-specific provenance protocol is required.
+func loadRunConfig(paths string, withPresence bool) (*config.SandboxConfig, config.FieldPresence, error) {
+	if paths == "" {
+		cfg := &config.SandboxConfig{}
+		cfg.ApplyDefaults()
+		return cfg, config.FieldPresence{}, nil
+	}
+	if withPresence {
+		return config.LoadMergedWithPresence(strings.Split(paths, ":"))
+	}
+	cfg, err := config.LoadMerged(strings.Split(paths, ":"))
+	return cfg, config.FieldPresence{}, err
 }

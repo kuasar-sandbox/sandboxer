@@ -23,6 +23,7 @@ import (
 //   - launch_ack  → server acks; OnLaunchAck callback fires (Settled trigger)
 //   - app_started → server acks; then OnAppStarted callback fires
 //   - app_exited  → server acks; OnAppExited callback fires
+//   - environment_exited → record actual environment PID 1 Wait, then ACK
 //
 // Each connection carries exactly one request + one response, then both
 // sides close. Multiple goroutines serve concurrent connections — the
@@ -77,6 +78,10 @@ type LaunchServer struct {
 	// exited. Optional; nil → just ack.
 	OnAppExited func(code int)
 
+	// OnEnvironmentExited records a real environment PID 1 Wait before ACK.
+	// It is independent of the primary and is also installed on S restore.
+	OnEnvironmentExited func(proto.EnvironmentExit) error
+
 	// OnMemReport validates the local cold/restore observation barrier and
 	// consumes one periodic mem_report. It returns true when the report may be
 	// acknowledged. A false result returns an error response so sandbox-init
@@ -107,6 +112,7 @@ type LaunchServer struct {
 
 	initialStateV1 atomic.Bool
 	ext4DiscardV1  atomic.Bool
+	systemdV1      atomic.Bool
 	muxReady       chan struct{}
 	runtimeReady   chan struct{}
 	runtimeOnce    sync.Once
@@ -221,6 +227,9 @@ func (s *LaunchServer) InitialLaunchStateSupported() bool { return s.initialStat
 // Ext4DiscardSupported is fixed by the accepted runtime-ready hello.
 func (s *LaunchServer) Ext4DiscardSupported() bool { return s.ext4DiscardV1.Load() }
 
+// SystemdSupported is fixed by the accepted runtime-ready Hello.
+func (s *LaunchServer) SystemdSupported() bool { return s.systemdV1.Load() }
+
 // DiskCapabilities reports the accepted runtime-ready Guest Hello.
 func (s *LaunchServer) DiskCapabilities() (slot, projection bool) {
 	return s.diskSlotV1.Load(), s.diskProjectionV1.Load()
@@ -325,6 +334,7 @@ func (s *LaunchServer) handleConnAfter(conn net.Conn, afterClose *func()) (hande
 		}()
 		s.initialStateV1.Store(msg.InitialLaunchStateV1)
 		s.runtimeOnce.Do(func() {
+			s.systemdV1.Store(msg.SystemdV1)
 			s.ext4DiscardV1.Store(msg.Ext4DiscardV1)
 			s.diskSlotV1.Store(msg.DiskSlotV1)
 			s.diskProjectionV1.Store(msg.DiskMountProjectionV1)
@@ -361,6 +371,14 @@ func (s *LaunchServer) handleConnAfter(conn net.Conn, afterClose *func()) (hande
 		}
 		if spec.Ext4Discard == proto.DiscardManual && !msg.Ext4DiscardV1 {
 			err := errors.New("guest incompatible: ext4_discard_v1 is required for resources.diff_cow.discard=manual; update boot.runtime")
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+			if s.OnLaunchFailure != nil {
+				s.OnLaunchFailure(err)
+			}
+			return false
+		}
+		if spec.Systemd != "" && spec.Systemd != "off" && !msg.SystemdV1 {
+			err := errors.New("guest incompatible: systemd_v1 is required for launch.systemd; update boot.runtime")
 			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
 			if s.OnLaunchFailure != nil {
 				s.OnLaunchFailure(err)
@@ -498,6 +516,25 @@ func (s *LaunchServer) handleConnAfter(conn net.Conn, afterClose *func()) (hande
 			if s.appStartedDone != nil {
 				s.appStartedOnce.Do(func() { close(s.appStartedDone) })
 			}
+		}
+		return false
+
+	case proto.TypeEnvironmentExited:
+		fact := msg.EnvironmentExit
+		var err error
+		if fact == nil {
+			err = errors.New("environment exit report is missing")
+		} else if (fact.State != proto.EnvironmentStopped && fact.State != proto.EnvironmentFailed) || fact.Reason == "" || fact.Code < -1 || fact.Code > 255 || fact.TermSignal < 0 || fact.TermSignal > 64 {
+			err = errors.New("invalid environment exit report")
+		} else if s.OnEnvironmentExited == nil {
+			err = errors.New("environment exit reports are not supported by this owner")
+		} else {
+			err = s.OnEnvironmentExited(*fact)
+		}
+		if err != nil {
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+		} else {
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck})
 		}
 		return false
 

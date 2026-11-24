@@ -10,6 +10,9 @@ import (
 )
 
 const (
+	EnvironmentStopped = abi.EnvironmentStopped
+	EnvironmentFailed  = abi.EnvironmentFailed
+
 	VsockHostCID          = abi.VsockHostCID
 	VsockGuestCID         = abi.VsockGuestCID
 	LaunchPort            = abi.LaunchPort
@@ -31,6 +34,7 @@ const (
 	TypeLaunchAck         = abi.TypeLaunchAck
 	TypeAppStarted        = abi.TypeAppStarted
 	TypeAppExited         = abi.TypeAppExited
+	TypeEnvironmentExited = abi.TypeEnvironmentExited
 	TypeShutdown          = abi.TypeShutdown
 	TypePing              = abi.TypePing
 	TypePong              = abi.TypePong
@@ -78,6 +82,7 @@ type (
 	ExecSpec           = abi.ExecSpec
 	ConnectSpec        = abi.ConnectSpec
 	InitialLaunchState = abi.InitialLaunchState
+	EnvironmentExit    = abi.EnvironmentExit
 	Message            = abi.Message
 	MemReport          = abi.MemReport
 	DropCachesResult   = abi.DropCachesResult

@@ -407,6 +407,9 @@ Portable 内容包括:
 - root/data immutable graph,以及 data disk name/order/mount topology;
 - persistent launch/plugin/mounts/files/init/metadata.
 
+`launch.systemd` 保存冷启动策略；旧 E 缺少此字段按 `off` 解释。Launch/plugin
+环境保持原有普通持久配置，不引入 PATH 默认来源标记或第二套来源协议。
+
 Portable 内容排除:
 
 - cgroup path/fd/controller、overhead/watermark/startup、`resources.diff_cow` 缓存策略;

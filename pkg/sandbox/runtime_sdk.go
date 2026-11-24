@@ -51,6 +51,7 @@ type RuntimeDiskSpec struct {
 
 // RuntimeSpec fixes the base VM shape. It contains no workload or credentials.
 type RuntimeSpec struct {
+	RunID                           string // exact execution generation; empty generates a fresh identity
 	EnableCheckpoint                bool
 	CurrentRun                      *artifact.CurrentRun
 	preparedHost                    *preparedHostIdentity
@@ -153,22 +154,30 @@ type runtimeOwnedDisk struct {
 }
 
 // Runtime owns one VM and its service goroutines. Wait observes cleanup;
-// Close requests graceful shutdown and waits for the same retained result.
+// Shutdown requests normal Guest stop. Close reclaims resources and waits for
+// the same retained result, including after a committed frozen capture.
 type Runtime struct {
-	memorySave          *checkpointMemorySave
-	stopFrozenBackends  func()
-	resetFrozenTaps     func() bool
-	retireFrozenRuntime func()
-	vmmIdentity         *memorycheckpoint.VMMIdentity
-	diskSnapshot        *SnapshotHandler
-	diskLaunch          LaunchSpec
-	diskInventory       []diskEntry
-	diskStateMu         sync.RWMutex
-	diskBackends        *vhost.BackendSet // includes restored devices
-	diskCache           *diffstore.Cache  // may be borrowed on restore
-	diskStorage         *artifact.ProcessStorage
-	diskFatal           func(error)
-	diskOwned           []runtimeOwnedDisk // writers created by BindDisk
+	environmentActive        bool
+	environmentExit          *proto.EnvironmentExit
+	environmentProtocolError error
+	physicalRetirement       bool
+	shutdown                 *runtimeShutdown
+	shutdownGuest            func(context.Context) error
+	shutdownGrace            time.Duration
+	memorySave               *checkpointMemorySave
+	stopFrozenBackends       func()
+	resetFrozenTaps          func() bool
+	retireFrozenRuntime      func()
+	vmmIdentity              *memorycheckpoint.VMMIdentity
+	diskSnapshot             *SnapshotHandler
+	diskLaunch               LaunchSpec
+	diskInventory            []diskEntry
+	diskStateMu              sync.RWMutex
+	diskBackends             *vhost.BackendSet // includes restored devices
+	diskCache                *diffstore.Cache  // may be borrowed on restore
+	diskStorage              *artifact.ProcessStorage
+	diskFatal                func(error)
+	diskOwned                []runtimeOwnedDisk // writers created by BindDisk
 
 	checkpointCleanup                  func() error
 	checkpointOwner                    *diffstore.DirectoryOwner
@@ -209,6 +218,7 @@ type Runtime struct {
 	cacheStop                          func()
 	storage                            *artifact.ProcessStorage
 	ownStorage                         bool
+	reaped                             <-chan struct{} // actual VMM Wait, before resource cleanup
 	exitDone                           chan struct{}
 	captureResponsesDone               <-chan struct{}
 	exit                               ExitResult
@@ -371,6 +381,10 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 	if err := validateSandboxID(sid); err != nil {
 		return nil, err
 	}
+	spec.RunID, err = resolveRuntimeRunID(spec.RunID, spec.CurrentRun)
+	if err != nil {
+		return nil, err
+	}
 	pathID, err := ResolvePathID(sid, spec.PathID)
 	if err != nil {
 		return nil, err
@@ -405,6 +419,7 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 	r.spec.CHBinary = chBinary
 	r.spec.RuntimeRoot = runtimeRoot
 	r.spec.BaseRoot = baseRoot
+	r.logf("runtime identity sandbox=%s run=%s", sid, spec.RunID)
 	defer func() {
 		if retErr != nil {
 			if r.engineStarted {
@@ -643,6 +658,10 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if discardMode == proto.DiscardManual && !r.launch.Ext4DiscardSupported() {
 		r.mu.Unlock()
 		return errors.New("guest incompatible: ext4_discard_v1 is required for resources.diff_cow.discard=manual; update boot.runtime")
+	}
+	if cfg.Launch.EffectiveSystemd() != "off" && !r.launch.SystemdSupported() {
+		r.mu.Unlock()
+		return errors.New("guest incompatible: systemd_v1 is required for launch.systemd; update boot.runtime")
 	}
 	r.initialLaunchToken = rand.Text()
 	r.initialLaunchState = proto.InitialLaunchState{Token: r.initialLaunchToken, State: proto.InitialLaunchPending}
@@ -1325,7 +1344,7 @@ func (r *Runtime) finishExit(x ExitResult) {
 			}
 		}
 		r.mu.Lock()
-		x.Err = errors.Join(x.Err, r.launchFailure, err)
+		x.Err = errors.Join(x.Err, r.launchFailure, r.environmentExitErrorLocked(), err)
 		if x.Err != nil {
 			x.Code = -1
 		}
@@ -1353,7 +1372,12 @@ func (r *Runtime) requestClose() {
 		}
 	})
 }
-func (r *Runtime) Close() error { r.requestClose(); <-r.exitDone; return r.exit.Err }
+func (r *Runtime) Close() error {
+	r.markPhysicalRetirement()
+	r.requestClose()
+	<-r.exitDone
+	return r.exit.Err
+}
 func (r *Runtime) cleanup() {
 	if r.cancelLife != nil {
 		r.cancelLife(context.Canceled)
@@ -1484,6 +1508,7 @@ func closeRuntimeDuringStartup(ctx context.Context, r *Runtime) {
 	if r == nil {
 		return
 	}
+	r.markPhysicalRetirement()
 	r.requestClose() // first shutdown request to the runtime's private stream
 	outer := runSignalsFromContext(ctx)
 	if outer == nil {

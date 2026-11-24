@@ -18,6 +18,8 @@
 //     the SAME connection switches to the stdio MUX (pkg/mux)
 //     end-to-end between `sandbox-ctl exec` and the guest. The run
 //     process pipes bytes through transparently after the ack.
+//   - shutdown_request — exact-run normal stop, shutdown_accepted fixes the
+//     owner deadline, then shutdown_done follows actual retirement.
 //   - usage_request — read existing live/saved/history state, one response;
 //     never triggers observations or persistence.
 //   - resource_stats_request — read the effective resource specification and
@@ -37,6 +39,7 @@ import (
 // Request is a control request on ctl.sock. Type selects which fields
 // are populated.
 type Request struct {
+	Shutdown                    *ShutdownRequest      `json:"shutdown,omitempty"`
 	HostRetirement              *HostRetirementPermit `json:"host_retirement,omitempty"`
 	NoWaitForPreviousMemorySave bool                  `json:"no_wait_for_previous_memory_save,omitempty"`
 	CaptureStateQuery           *CaptureStateQuery    `json:"capture_state_query,omitempty"`
@@ -72,6 +75,8 @@ type Request struct {
 
 // Response is the run-process reply.
 type Response struct {
+	Shutdown                    *ShutdownTarget `json:"shutdown,omitempty"`
+	ShutdownDeadlineMonotonicNS int64           `json:"shutdown_deadline_monotonic_ns,omitempty,string"`
 	// BeforeWrite is used only by committed frozen-memory captures. The server
 	// detaches this connection from Runtime shutdown before invoking it; SDK
 	// callers first leave their operation wait group. It waits for retirement,
@@ -162,6 +167,9 @@ const (
 	TypeUsageResponse         = "usage_response"
 	TypeResourceStatsRequest  = "resource_stats_request"
 	TypeResourceStatsResponse = "resource_stats_response"
+	TypeShutdownRequest       = "shutdown_request"
+	TypeShutdownAccepted      = "shutdown_accepted"
+	TypeShutdownDone          = "shutdown_done"
 )
 
 // MaxMessageBytes caps any single message on ctl.sock.

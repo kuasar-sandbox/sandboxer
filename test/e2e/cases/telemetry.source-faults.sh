@@ -706,6 +706,9 @@ def restore_case(work, ref):
         assert resumed["live"]["run_epoch"] == before["live"]["run_epoch"]
         validate_preserved_slot(baseline, resumed)
         phase = "source-stop"
+        # Guest readers may close once the source workload exits. End source
+        # injection at that ownership boundary; keep every earlier relay error.
+        source_relay.release_source()
         sb.stop()
         # The source observer belongs to this VM, not to the later restore.
         # Join its handlers and retain all prior errors before checking the

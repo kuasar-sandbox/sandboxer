@@ -641,9 +641,12 @@ type OverlayConfig struct {
 // in the flattened image's appended config.json). For v1 the override
 // is mandatory — auto-extraction of image config is future work.
 type LaunchConfig struct {
-	Exec string            `yaml:"exec"`
-	Args []string          `yaml:"args"`
-	Env  map[string]string `yaml:"env"`
+	// Systemd selects off|auto|runtime|provided. Empty input inherits from E;
+	// otherwise its effective cold-start value is off.
+	Systemd string            `yaml:"systemd,omitempty"`
+	Exec    string            `yaml:"exec"`
+	Args    []string          `yaml:"args"`
+	Env     map[string]string `yaml:"env"`
 	// EphemeralEnv overrides Env by key for the current cold-start process. It
 	// is host/instance input and is never serialized into a Sandbox artifact.
 	EphemeralEnv map[string]string `yaml:"ephemeral_env,omitempty"`
@@ -1280,6 +1283,9 @@ func (c *SandboxConfig) validateCold(requireCgroupCapability bool) error {
 				return fmt.Errorf("init[%d].timeout: %w", i, err)
 			}
 		}
+	}
+	if !validSystemdMode(c.Launch.Systemd) {
+		return fmt.Errorf("invalid launch.systemd %q", c.Launch.Systemd)
 	}
 	// launch.pid_namespace ∈ {private, shared}.
 	switch c.Launch.PIDNamespace {

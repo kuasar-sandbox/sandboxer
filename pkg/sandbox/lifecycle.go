@@ -44,6 +44,7 @@ import (
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
+	RunID                    string // exact execution identity, independent of retained disks
 	runtime                  *Runtime
 	memoryAsyncDisabled      bool
 	memoryLayout             snapshot.MemoryLayout
@@ -325,6 +326,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.BaseRoot = opts.BaseRoot
 	shape.EnableCheckpoint = opts.EnableCheckpoint
 	shape.CurrentRun = opts.CurrentRun
+	shape.RunID = opts.RunID
 	shape.checkpointPlan = opts.checkpointPlan
 	shape.checkpointOwner = opts.checkpointOwner
 	shape.checkpointReleaseSources = opts.checkpointReleaseSources
@@ -368,12 +370,14 @@ func WaitRun(ctx context.Context, r *Runtime) (int, error) {
 		case <-r.exitDone:
 			return r.exit.Code, errors.Join(r.exit.Err, r.WaitMemorySave(context.Background()))
 		case sig := <-signals:
+			r.markPhysicalRetirement()
 			r.signals <- sig
 		case <-done:
 			done = nil
 			// A retained OS signal is forwarded through signals. Plain parent
 			// cancellation has no such signal and must still request shutdown.
 			if signals == nil || !runShutdownRequested(ctx) {
+				r.markPhysicalRetirement()
 				r.signals <- syscall.SIGTERM
 			}
 		}
@@ -708,6 +712,11 @@ type processSignaler interface {
 	Signal(sig os.Signal) error
 }
 
+type chShutdownOptions struct {
+	deadline func() time.Time
+	frozen   func() bool
+}
+
 // waitForCHWithSignalEscalation blocks until doneCh fires, driving CH
 // shutdown when host SIGTERM/SIGINT arrives. Shutdown path (in order):
 //
@@ -719,7 +728,8 @@ type processSignaler interface {
 //     teardown spent ~31 s in kernel mm-lock contention after SIGKILL).
 //  2. If lifting memory.high or the API call fails (CH dead, socket closed,
 //     etc.) fall back to forwarding SIGTERM to the CH process.
-//  3. Arm a grace timer; if CH still hasn't exited, escalate to SIGKILL.
+//  3. The grace timer spans both preparation and API calls; at its deadline,
+//     escalate to SIGKILL if the sole CH reaper has not completed.
 //  4. A second SIGTERM/INT from the user escalates immediately.
 //
 // chSock is empty for tests that exercise only the signal path; in that
@@ -735,9 +745,13 @@ func waitForCHWithSignalEscalation(
 	chRespDeadline time.Duration,
 	grace time.Duration,
 	logf func(format string, args ...any),
-	frozen ...func() bool,
+	options ...chShutdownOptions,
 ) error {
-	isFrozen := func() bool { return len(frozen) > 0 && frozen[0] != nil && frozen[0]() }
+	var control chShutdownOptions
+	if len(options) > 0 {
+		control = options[0]
+	}
+	isFrozen := func() bool { return control.frozen != nil && control.frozen() }
 	var killTimer *time.Timer
 	var killCh <-chan time.Time
 	var drainTimer *time.Timer
@@ -748,26 +762,37 @@ func waitForCHWithSignalEscalation(
 	var memoryHighLock *os.File
 	var pendingShutdownSignal os.Signal
 	shutdownInitiated := false
+	var shutdownCtx context.Context
+	var cancelShutdown context.CancelFunc
+	var apiResult <-chan error
+	startDeadline := func() {
+		deadline := time.Now().Add(grace)
+		if control.deadline != nil {
+			if ownerDeadline := control.deadline(); !ownerDeadline.IsZero() && ownerDeadline.Before(deadline) {
+				deadline = ownerDeadline
+			}
+		}
+		shutdownCtx, cancelShutdown = context.WithDeadline(context.Background(), deadline)
+		// This timer starts before memory.high draining or any API round trip.
+		killTimer = time.NewTimer(time.Until(deadline))
+		killCh = killTimer.C
+	}
 	finishShutdownRequest := func(sig os.Signal, useAPI bool) {
 		if isFrozen() {
 			_ = proc.Signal(syscall.SIGKILL)
 			return
 		}
-		usedAPI := false
 		if useAPI {
-			if err := (chapi.Client{Sock: chSock, RespDeadline: chRespDeadline}).ShutdownVMM(); err == nil {
-				logf("received %v, requested vmm.shutdown via API (will SIGKILL after %s if CH still alive)", sig, grace)
-				usedAPI = true
-			} else {
-				logf("received %v, vmm.shutdown API failed (%v) — falling back to SIGTERM", sig, err)
-			}
+			result := make(chan error, 1)
+			apiResult = result
+			go func() {
+				result <- (chapi.Client{Sock: chSock, RespDeadline: chRespDeadline}).ShutdownVMMContext(shutdownCtx)
+			}()
+			logf("received %v, requesting vmm.shutdown within the original shutdown deadline", sig)
+			return
 		}
-		if !usedAPI {
-			logf("received %v, forwarding SIGTERM to CH (will SIGKILL after %s)", sig, grace)
-			_ = proc.Signal(syscall.SIGTERM)
-		}
-		killTimer = time.NewTimer(grace)
-		killCh = killTimer.C
+		logf("received %v, forwarding SIGTERM to CH within the original shutdown deadline", sig)
+		_ = proc.Signal(syscall.SIGTERM)
 	}
 	attemptShutdownRequest := func(sig os.Signal) {
 		useAPI := false
@@ -825,9 +850,14 @@ func waitForCHWithSignalEscalation(
 		case sig := <-sigCh:
 			if !shutdownInitiated {
 				shutdownInitiated = true
+				startDeadline()
 				attemptShutdownRequest(sig)
 			} else {
 				logf("received %v while shutdown in progress, sending SIGKILL now", sig)
+				if cancelShutdown != nil {
+					cancelShutdown()
+				}
+				apiResult = nil
 				_ = proc.Signal(syscall.SIGKILL)
 				if memoryHighLockRetryTimer != nil {
 					memoryHighLockRetryTimer.Stop()
@@ -852,11 +882,36 @@ func waitForCHWithSignalEscalation(
 			drainCh = nil
 			drainTimer = nil
 			finishShutdownRequest(pendingShutdownSignal, true)
+		case err := <-apiResult:
+			apiResult = nil
+			if err != nil {
+				if isFrozen() {
+					_ = proc.Signal(syscall.SIGKILL)
+				} else {
+					logf("vmm.shutdown API failed (%v), forwarding SIGTERM within the original deadline", err)
+					_ = proc.Signal(syscall.SIGTERM)
+				}
+			}
 		case <-killCh:
-			logf("CH didn't exit within %s of shutdown request, sending SIGKILL pid=%d", grace, chPid)
+			logf("CH reached the shutdown deadline, sending SIGKILL pid=%d", chPid)
+			if cancelShutdown != nil {
+				cancelShutdown()
+			}
+			apiResult = nil
+			if drainTimer != nil {
+				drainTimer.Stop()
+			}
+			drainCh = nil
+			if memoryHighLockRetryTimer != nil {
+				memoryHighLockRetryTimer.Stop()
+			}
+			memoryHighLockRetryCh = nil
 			_ = proc.Signal(syscall.SIGKILL)
 			killCh = nil
 		case waitErr := <-doneCh:
+			if cancelShutdown != nil {
+				cancelShutdown()
+			}
 			if memoryHighLockRetryTimer != nil {
 				memoryHighLockRetryTimer.Stop()
 			}
@@ -1170,6 +1225,7 @@ func (h *SnapshotHandler) handleExportContext(ctx context.Context, req ctl.Reque
 		h.capture.finish(resp.AfterWrite != nil || resp.BeforeWrite != nil || (err == nil && !req.ResumeAfter) || isTerminalCaptureError(err))
 	}()
 	opts := RunOptions{
+		runtime:      h.runtime,
 		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir, EnableCheckpoint: h.EnableCheckpoint,
 		memoryLayout: h.MemoryLayout,
 		Cfg:          h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
@@ -1522,6 +1578,7 @@ func handleExportRequest(
 	}
 	if !req.ResumeAfter {
 		resp.AfterWrite = sync.OnceFunc(func() {
+			opts.runtime.markPhysicalRetirement()
 			go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
 		})
 	}
@@ -2064,6 +2121,7 @@ func handleSnapshotRequest(
 			resp.BeforeWrite = frozenRetirement(opts.runtime, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, logf)
 		} else {
 			resp.AfterWrite = sync.OnceFunc(func() {
+				opts.runtime.markPhysicalRetirement()
 				go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
 			})
 		}

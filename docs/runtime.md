@@ -98,7 +98,7 @@ stateDiagram-v2
     starting --> closing: failure or cancellation
     runtime_ready --> closing: Close or VM exit
     launching --> closing: failure or cancellation
-    running --> closing: Close, terminal failure or VM exit
+    running --> closing: Shutdown, Close, terminal failure or VM exit
     closing --> closed: owned work and cleanup joined
     closed --> [*]
 ```
@@ -108,7 +108,7 @@ corrected input. Once launching starts, failure is terminal. `Stats` can observe
 the ready base; `Exec`, `Snapshot` and `Export` need a running workload. `Restore`
 reconstructs an existing application directly and returns the same public owner
 type; it does not invoke a new cold Launch. `Wait(ctx)` only waits, while `Close`
-requests shutdown and joins the retained exit result. The detailed source,
+reclaims resources and joins the retained exit result. The detailed source,
 context, descriptor and callback ownership contract follows below.
 
 <a id="operations"></a>
@@ -297,13 +297,61 @@ Operation contexts bound startup, launch, restore, live operations and individua
 waits. Canceling a successfully completed startup/launch context cannot kill the
 returned runtime or invalidate later lazy reads. `Wait(ctx)` cancellation only
 cancels that wait. Repeated waits observe one retained `ExitResult` after cleanup;
-concurrent, idempotent `Close` requests graceful VMM shutdown through one owner,
+concurrent, idempotent `Close` reclaims the VMM through one owner,
 keeping backends alive until CH exits and joining owned work before releasing
 storage. The SDK installs no OS signal handlers. The CLI registers SIGTERM and
 SIGINT and retains second-signal escalation. It also supplies SIGWINCH through
 `stdio.Mode.WindowChanges`; the SDK consumes that channel without registering
 signals. Cleanup cancels and joins idle input pumps without closing inherited
 stdin. An input descriptor has one consumer while bridged.
+
+`Runtime.Shutdown(ctx)` requests normal Guest shutdown and waits for the retained
+exit result. Acceptance closes new workload-operation admission. Duplicate calls
+share the first accepted deadline; caller cancellation stops that wait without
+undoing the owner operation. ACK/EOF never substitutes for actual VMM reaping.
+A freezing or committed frozen capture is rejected, so cleanup can destroy it
+without implicitly thawing it.
+
+For an active systemd environment, the Guest reports the completed environment
+PID 1 Wait separately from the primary process. The owner records that terminal
+fact before acknowledging it, including after S restore. An environment failure
+remains a failed `ExitResult` even if CH subsequently exits with code zero. A
+missing terminal fact is an observation error for natural exit and normal
+`Shutdown`; the shutdown request alone cannot prove the manager's result.
+Physical `Close` and committed capture-source retirement do not require Guest
+execution or a final report, and do not erase an already reported failure. A
+normal PID-namespace reboot may retain a real signal in the diagnostic fact;
+the observed environment outcome determines success, not a fabricated primary
+exit code.
+
+The owner uses the existing effective Guest stop grace G (positive wire seconds,
+otherwise 10 seconds) and internal F = 5 seconds: Guest stop gets G + F, then the
+VMM fence completes by G + 2F. A shorter caller deadline narrows both stages.
+The VMM timer starts before memory.high preparation or API calls, and a second
+signal still escalates immediately. A forced retirement returns an error; an
+unreaped process is never reported as released.
+
+Normal Guest `Shutdown` is used only for an active systemd environment.
+Direct mode preserves its existing StopUnit/physical fence; attempting the
+normal Guest shutdown API on direct returns unsupported without changing the
+running environment. The host-local API
+`ctl.Shutdown(ctx, socket, ctl.ShutdownTarget{SandboxID, RunID})`
+requires the exact execution generation. `Runtime.RunID()` exposes it; a CLI run
+logs it and generates a fresh value if `--run-id` is omitted. This identity alone
+does not enable disk retention. For example:
+
+```bash
+sandbox-ctl shutdown --sandbox-id demo --run-id RUN_ID --path-id demo
+```
+
+`--timeout` optionally narrows the owner's budget. Connect, request write and
+`shutdown_accepted` share a five-second bound. The accepted frame carries the
+first owner's absolute same-host monotonic deadline; the client waits only until
+that deadline or its own earlier deadline for `shutdown_done`. A silent or older
+owner returns a bounded transport/unsupported error. Loss of the accepted frame
+or caller disconnect does not cancel an accepted stop. Final response writers
+are detached before the owner begins, so fast cleanup neither closes their
+connection early nor waits on a shutdown waiter.
 
 Live `Exec`, `Snapshot`, `Export` and `Stats` call the owner directly. Exec returns
 a caller-owned guest MUX connection and its negotiated stdio spec. Capture uses

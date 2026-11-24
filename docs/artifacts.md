@@ -458,6 +458,10 @@ Portable content includes:
 - The immutable root/data graph, plus data-disk names, order, and mount topology.
 - Persistent launch/plugin/mounts/files/init/metadata.
 
+`launch.systemd` persists the cold-start policy. A missing field in an older E
+means `off`. Launch/plugin environment values remain ordinary persistent
+content; there is no private PATH-origin metadata or second provenance protocol.
+
 Portable content excludes:
 
 - Cgroup paths/fds/controllers, overhead, watermark, startup, and `resources.diff_cow` cache policy.

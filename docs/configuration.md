@@ -254,11 +254,12 @@ Local delivery creates a Bundle containing the required block layers. For delive
 
 | Field | Type / default | Validation and effect |
 | --- | --- | --- |
+| `launch.systemd` | `off`, `auto`, `runtime`, `provided`; omitted inherits E, otherwise `off` | Choose environment PID 1; active modes require the live Guest `systemd_v1` capability. Null, booleans, empty strings and other values are rejected. |
 | `launch.exec`, `launch.args` | String and string list | Override image entrypoint/arguments; single-disk roots need explicit exec unless placeholder is selected |
 | `launch.env`, `launch.ephemeral_env` | String maps | Persistent environment and current-invocation override; [merge rules](#files-and-environment) |
 | `launch.workdir` | String; `/` after ordinary loading | Application working directory; image/source projection follows the corresponding launch merge rules |
 | `launch.restart` | `never`, `on-failure`, `always`; `never` | Primary process supervision |
-| `launch.cgroup_control` | Boolean; `false` | When true, delegate controllers at the user-visible cgroup root and place directly managed processes in its `/init` leaf; false uses the scoped root directly. The Guest Runtime owns the global hierarchy. See [Guest topology](guest-abi.md#application-cgroups). |
+| `launch.cgroup_control` | Boolean; `false` | When true, delegate controllers at the user-visible cgroup root and place directly managed processes in its `/init` leaf; false uses the scoped root directly. Systemd modes always enable delegation while preserving this raw policy for a later direct boot. The Guest Runtime owns the global hierarchy. See [Guest topology](guest-abi.md#application-cgroups). |
 | `launch.placeholder` | Boolean; `false` | No-exec anchor; excludes exec and always restarts |
 | `launch.pid_namespace` | `private`, `shared`; `private` | Private makes the application namespace PID 1; shared exposes a Runtime PID 1 that reaps orphaned processes |
 | `launch.user` | Identity string; image user, otherwise root | `uid:gid` or `name:group` |
@@ -273,6 +274,27 @@ Local delivery creates a Bundle containing the required block layers. For delive
 | `init[].exec`, `.args`, `.env`, `.workdir`, `.user` | String/list/map/string/string | Ordered one-shot commands before application startup |
 | `init[].timeout` | Duration; empty/zero means no timeout | Nonzero exit or timeout aborts initialization |
 | `metadata` | String map; empty | Opaque portable values; runtime does not interpret them |
+
+### Systemd launch policy
+
+```yaml
+launch:
+  systemd: auto
+```
+
+`off` uses direct supervision. `runtime` requires the packaged Runtime systemd;
+`provided` requires the workload rootfs installation. `auto` selects the workload
+installation when present and otherwise the Runtime installation; an invalid
+selected installation fails instead of falling back. Active modes share the
+systemd environment PID namespace and enable delegated cgroup control. They do
+not rewrite the raw `pid_namespace` or `cgroup_control` values saved in E.
+
+An E cold start inherits an omitted mode; explicit `off` overrides an inherited
+active mode. A complete new definition persists the effective mode. An S restore
+continues its captured manager and process state and rejects any mode override,
+including `off`. Runtime systemd adds its tool directory to the native
+exec default PATH; explicit caller PATH values are never rewritten. Existing
+Launch/OCI environment values remain authoritative without new provenance metadata.
 
 ### Restore, usage and deadlines
 

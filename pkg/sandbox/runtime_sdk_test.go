@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -167,6 +168,36 @@ func TestSDKChild(t *testing.T) {
 				if err == nil && req.Type == proto.TypePing {
 					_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypePong, ID: req.ID, InitialLaunchState: initial.Load()})
 				}
+				if err == nil && req.Type == proto.TypeShutdown && os.Getenv("SDK_TEST_SHUTDOWN") != "" {
+					if os.Getenv("SDK_TEST_SHUTDOWN") != "lost-ack" {
+						_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeAck})
+					}
+					if state := os.Getenv("SDK_TEST_ENVIRONMENT_RESULT"); state != "" && state != "missing" {
+						report, err := net.Dial("unix", sock+"_5000")
+						if err != nil {
+							os.Exit(35)
+						}
+						_ = report.SetDeadline(time.Now().Add(time.Second))
+						fact := &proto.EnvironmentExit{State: state, Reason: "sdk-test-manager-result"}
+						if err := proto.WriteMessage(report, &proto.Message{Type: proto.TypeEnvironmentExited, EnvironmentExit: fact}); err != nil {
+							os.Exit(36)
+						}
+						ack, err := proto.ReadMessage(report)
+						_ = report.Close()
+						if err != nil || ack.Type != proto.TypeAck {
+							os.Exit(37)
+						}
+					}
+					code := 0
+					if raw := os.Getenv("SDK_TEST_VMM_EXIT_CODE"); raw != "" {
+						var err error
+						code, err = strconv.Atoi(raw)
+						if err != nil || code < 0 || code > 255 {
+							os.Exit(38)
+						}
+					}
+					os.Exit(code)
+				}
 			}()
 		}
 	}()
@@ -174,7 +205,7 @@ func TestSDKChild(t *testing.T) {
 	if err != nil {
 		os.Exit(21)
 	}
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: os.Getenv("SDK_TEST_OLD_GUEST") != "1", Ext4DiscardV1: os.Getenv("SDK_TEST_EXT4_DISCARD_V1") == "1"}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: os.Getenv("SDK_TEST_OLD_GUEST") != "1", Ext4DiscardV1: os.Getenv("SDK_TEST_EXT4_DISCARD_V1") == "1", SystemdV1: os.Getenv("SDK_TEST_SYSTEMD_V1") == "1"}); err != nil {
 		os.Exit(22)
 	}
 	msg, err := proto.ReadMessage(conn)
@@ -762,4 +793,251 @@ func completedLaunchServer(t *testing.T) *guestlink.LaunchServer {
 		t.Fatal("MUX gate did not open")
 	}
 	return s
+}
+
+func TestSDKSystemdCapabilityBeforeLaunchAdmission(t *testing.T) {
+	for _, mode := range []string{"off", "auto", "runtime", "provided"} {
+		for _, supported := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/supported=%v", mode, supported), func(t *testing.T) {
+				if supported {
+					t.Setenv("SDK_TEST_SYSTEMD_V1", "1")
+				} else {
+					t.Setenv("SDK_TEST_SYSTEMD_V1", "0")
+				}
+				shape, launch := sdkFixture(t)
+				launch.Process.Systemd = mode
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				r, err := StartRuntime(ctx, shape)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				err = r.Launch(ctx, launch)
+				if mode != "off" && !supported {
+					if err == nil || !strings.Contains(err.Error(), "systemd_v1") {
+						t.Fatalf("missing capability accepted: %v", err)
+					}
+					if r.State() != "runtime_ready" || r.initialLaunchToken != "" || len(r.disks) != 0 || r.cache != nil {
+						t.Fatal("rejection consumed or prepared Launch")
+					}
+					launch.Process.Systemd = "off"
+					if err := r.Launch(ctx, launch); err != nil {
+						t.Fatalf("corrected Launch was not reusable: %v", err)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				if r.State() != "running" {
+					t.Fatalf("state=%s", r.State())
+				}
+			})
+		}
+	}
+}
+
+func TestSDKShutdownManagementAndFinalResponse(t *testing.T) {
+	for _, mode := range []string{"ack", "lost-ack"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("SDK_TEST_SHUTDOWN", mode)
+			t.Setenv("SDK_TEST_SYSTEMD_V1", "1")
+			t.Setenv("SDK_TEST_ENVIRONMENT_RESULT", "stopped")
+			shape, launch := sdkFixture(t)
+			launch.Process.Systemd = "runtime"
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			r, err := StartRuntime(ctx, shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			if err := r.Launch(ctx, launch); err != nil {
+				t.Fatal(err)
+			}
+			target := ctl.ShutdownTarget{SandboxID: shape.SandboxID, RunID: r.RunID()}
+			if err := ctl.Shutdown(ctx, filepath.Join(r.runDir, "ctl.sock"), target); err != nil {
+				t.Fatalf("normal stop: %v", err)
+			}
+			if r.State() != "closed" {
+				t.Fatalf("final response preceded cleanup: %s", r.State())
+			}
+			result, err := r.Wait(context.Background())
+			if err != nil || result.Err != nil || result.Code != 0 {
+				t.Fatalf("Wait=%+v/%v", result, err)
+			}
+			if _, err := os.Stat(r.runDir); !os.IsNotExist(err) {
+				t.Fatalf("run resources retained: %v", err)
+			}
+		})
+	}
+}
+
+func TestSDKShutdownEnvironmentReportResults(t *testing.T) {
+	for _, state := range []string{"stopped", "failed", "missing"} {
+		t.Run(state, func(t *testing.T) {
+			t.Setenv("SDK_TEST_SHUTDOWN", "ack")
+			t.Setenv("SDK_TEST_SYSTEMD_V1", "1")
+			t.Setenv("SDK_TEST_ENVIRONMENT_RESULT", state)
+			shape, launch := sdkFixture(t)
+			launch.Process.Systemd = "auto"
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			r, err := StartRuntime(ctx, shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			if err := r.Launch(ctx, launch); err != nil {
+				t.Fatal(err)
+			}
+			r.mu.Lock()
+			reaped := r.reaped
+			r.mu.Unlock()
+			if reaped == nil {
+				t.Fatal("cold owner has no actual VMM reaper notification")
+			}
+			target := ctl.ShutdownTarget{SandboxID: shape.SandboxID, RunID: r.RunID()}
+			err = ctl.Shutdown(ctx, filepath.Join(r.runDir, "ctl.sock"), target)
+			if state == "stopped" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil {
+				t.Fatalf("%s environment with CH=0 reported success", state)
+			}
+			if r.State() != "closed" {
+				t.Fatal("normal shutdown response preceded real retirement")
+			}
+			result, waitErr := r.Wait(context.Background())
+			if waitErr != nil {
+				t.Fatal(waitErr)
+			}
+			if state == "failed" && (result.Err == nil || !strings.Contains(result.Err.Error(), "sdk-test-manager-result")) {
+				t.Fatalf("fault lost: %+v", result)
+			}
+			if state == "missing" && (result.Err == nil || !strings.Contains(result.Err.Error(), "without a terminal environment report")) {
+				t.Fatalf("missing observation accepted: %+v", result)
+			}
+		})
+	}
+}
+
+func TestSDKShutdownReapedEnvironmentKeepsResultDuringSlowCleanup(t *testing.T) {
+	t.Setenv("SDK_TEST_SHUTDOWN", "ack")
+	t.Setenv("SDK_TEST_SYSTEMD_V1", "1")
+	t.Setenv("SDK_TEST_ENVIRONMENT_RESULT", "stopped")
+	shape, launch := sdkFixture(t)
+	launch.Process.Systemd = "auto"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r, err := StartRuntime(ctx, shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.Launch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	// Retain an already-admitted operation while the real child reports and
+	// exits. This blocks owner retirement without blocking the sole reaper.
+	r.opsWG.Add(1)
+	var release sync.Once
+	defer release.Do(r.opsWG.Done)
+	// The race-instrumented helper retains Go's one-second exit flush.
+	stopCtx, stopCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer stopCancel()
+	if err := r.Shutdown(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("slow cleanup wait = %v", err)
+	}
+	select {
+	case <-r.reaped:
+	default:
+		t.Fatal("child was not actually reaped")
+	}
+	if r.shutdown.escalated.Load() {
+		t.Fatal("slow cleanup forced an already-reaped environment")
+	}
+	select {
+	case <-r.exitDone:
+		t.Fatal("unfinished cleanup reported retirement")
+	default:
+	}
+	release.Do(r.opsWG.Done)
+	result, err := r.Wait(ctx)
+	if err != nil || result.Err != nil || result.Code != 0 {
+		t.Fatalf("observed clean environment lost after caller deadline: %+v / %v", result, err)
+	}
+}
+
+func TestSDKShutdownRejectsNonzeroVMMExit(t *testing.T) {
+	for _, mode := range []string{"off", "runtime"} {
+		for _, api := range []string{"sdk", "localctl"} {
+			t.Run(mode+"/"+api, func(t *testing.T) {
+				t.Setenv("SDK_TEST_SHUTDOWN", "ack")
+				t.Setenv("SDK_TEST_VMM_EXIT_CODE", "23")
+				t.Setenv("SDK_TEST_SYSTEMD_V1", "1")
+				state := ""
+				if mode != "off" {
+					state = proto.EnvironmentStopped
+				}
+				t.Setenv("SDK_TEST_ENVIRONMENT_RESULT", state)
+				shape, launch := sdkFixture(t)
+				launch.Process.Systemd = mode
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				r, err := StartRuntime(ctx, shape)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				if err := r.Launch(ctx, launch); err != nil {
+					t.Fatal(err)
+				}
+				if api == "sdk" {
+					err = r.Shutdown(ctx)
+				} else {
+					target := ctl.ShutdownTarget{SandboxID: shape.SandboxID, RunID: r.RunID()}
+					err = ctl.Shutdown(ctx, filepath.Join(r.runDir, "ctl.sock"), target)
+				}
+				if mode == "off" {
+					if !errors.Is(err, ctl.ErrShutdownUnsupported) {
+						t.Fatalf("direct Shutdown must retain the old unsupported behavior: %v", err)
+					}
+					if r.shutdown != nil || r.State() != "running" {
+						t.Fatal("direct Shutdown changed running state")
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), "runtime exited with code 23") {
+					t.Fatalf("nonzero real VMM exit was not rejected: %v", err)
+				}
+				select {
+				case <-r.reaped:
+				default:
+					t.Fatal("shutdown reported the code before actual child Wait")
+				}
+				result, waitErr := r.Wait(context.Background())
+				if waitErr != nil || result.Code != 23 || result.Err != nil {
+					t.Fatalf("Shutdown changed the retained Wait fact: %+v / %v", result, waitErr)
+				}
+				if r.State() != "closed" || r.shutdown.escalated.Load() {
+					t.Fatal("nonzero exit was confused with pending or forced retirement")
+				}
+				if state != "" {
+					r.mu.Lock()
+					fact := r.environmentExit
+					r.mu.Unlock()
+					if fact == nil || fact.State != proto.EnvironmentStopped {
+						t.Fatalf("normal manager result was not recorded: %+v", fact)
+					}
+				}
+				if err := r.Close(); err != nil {
+					t.Fatalf("physical Close semantics changed: %v", err)
+				}
+				if err := r.Shutdown(context.Background()); err == nil || !strings.Contains(err.Error(), "code 23") {
+					t.Fatalf("retained shutdown result was lost: %v", err)
+				}
+			})
+		}
+	}
 }

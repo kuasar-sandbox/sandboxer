@@ -242,3 +242,34 @@ func TestFrozenRetirementStopsBackendsBeforeCHExit(t *testing.T) {
 		t.Fatal("retirement did not finish")
 	}
 }
+
+func TestFrozenRetirementPreservesSystemdPhysicalExit(t *testing.T) {
+	r := &Runtime{state: runtimeRunning, environmentActive: true, exitDone: make(chan struct{})}
+	exited := make(chan struct{})
+	released := make(chan struct{})
+	process := &channelSignaler{sent: make(chan os.Signal, 1)}
+	result := make(chan error, 1)
+	go func() {
+		result <- frozenRetirement(r, process, nil, func() { close(released) }, exited, discardLogf)()
+	}()
+	select {
+	case sig := <-process.sent:
+		if sig != syscall.SIGKILL {
+			t.Errorf("unexpected frozen retirement signal: %v", sig)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("frozen retirement did not start")
+	}
+	r.mu.Lock()
+	exitErr := r.environmentExitErrorLocked()
+	r.mu.Unlock()
+	close(exited)
+	close(r.exitDone)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	<-released
+	if exitErr != nil {
+		t.Fatalf("frozen retirement lost systemd physical-exit classification: %v", exitErr)
+	}
+}

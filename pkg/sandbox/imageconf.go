@@ -218,6 +218,7 @@ func imageConfigFromRuntime(rc *image.RuntimeConfig) *ImageConfig {
 // Workdir / Restart: override else image else default.
 func MergeLaunch(image *ImageConfig, override config.LaunchConfig) (*proto.LaunchSpec, error) {
 	spec := &proto.LaunchSpec{
+		Systemd:       override.EffectiveSystemd(),
 		Workdir:       "/",
 		Restart:       "never",
 		CgroupControl: override.CgroupControl,
