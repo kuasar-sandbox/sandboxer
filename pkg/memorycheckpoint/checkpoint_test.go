@@ -413,3 +413,90 @@ func TestDeleteReconcilesLostReply(t *testing.T) {
 		})
 	}
 }
+
+// Retired runtime cleanup is not part of Start, but is part of the retained
+// RAM obligation even after FileReady or an exact deletion.
+func TestRetiredMappingCleanupBeforeRAMRelease(t *testing.T) {
+	for _, discard := range []bool{false, true} {
+		t.Run(fmt.Sprintf("discard=%t", discard), func(t *testing.T) {
+			f := newNamedFixture(t, t.TempDir(), "retired-map", true)
+			dumpEntered, cleanupEntered, cleanupGate := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			released := make(chan struct{})
+			var allow sync.Once
+			t.Cleanup(func() { allow.Do(func() { close(cleanupGate) }) })
+			err := f.h.StartWithCleanup(func(ctx context.Context, _ io.ReaderAt) (string, error) {
+				close(dumpEntered)
+				if discard {
+					<-ctx.Done()
+					return "", ctx.Err()
+				}
+				return "payload", nil
+			}, func() error {
+				close(cleanupEntered)
+				<-cleanupGate
+				return nil
+			}, func(context.Context) error {
+				close(released)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			awaitSignal(t, dumpEntered)
+			if discard {
+				f.delete(t)
+			}
+			awaitSignal(t, cleanupEntered)
+			r := f.h.Record().Read()
+			if r.RAMReleased || r.FileReady == discard || !r.RuntimeRetired {
+				t.Fatalf("invalid facts while old mapping remains: %+v", r)
+			}
+			select {
+			case <-released:
+				t.Fatal("retained budget released before mapping cleanup")
+			default:
+			}
+			select {
+			case <-f.h.Done():
+				t.Fatal("holder completed before mapping cleanup")
+			default:
+			}
+			allow.Do(func() { close(cleanupGate) })
+			awaitSignal(t, released)
+			f.wait(t)
+			r = f.h.Record().Read()
+			if !r.RAMReleased || r.Discarded != discard {
+				t.Fatalf("unexpected final facts: %+v", r)
+			}
+		})
+	}
+}
+
+func TestRetiredMappingCleanupRetryRetainsRAM(t *testing.T) {
+	f := newNamedFixture(t, t.TempDir(), "retry-map", true)
+	failed, released := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	if err := f.h.StartWithCleanup(func(context.Context, io.ReaderAt) (string, error) {
+		return "payload", nil
+	}, func() error {
+		if calls.Add(1) == 1 {
+			close(failed)
+			return errors.New("transient unmap failure")
+		}
+		return nil
+	}, func(context.Context) error {
+		close(released)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	awaitSignal(t, failed)
+	if r := f.h.Record().Read(); r.RAMReleased || !r.FileReady {
+		t.Fatalf("cleanup failure changed retained facts: %+v", r)
+	}
+	awaitSignal(t, released)
+	f.wait(t)
+	if calls.Load() != 2 || !f.h.Record().Read().RAMReleased {
+		t.Fatal("retired mapping cleanup did not retry")
+	}
+}

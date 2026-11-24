@@ -3,6 +3,7 @@ package tapfd
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -264,4 +265,86 @@ func serveOneTapFDSocket(t *testing.T, sock string, respond func(conn *net.UnixC
 		errCh <- respond(conn, line)
 	}()
 	return reqCh, errCh
+}
+
+func TestRetryBusyBoundAndScope(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		failures    int
+		err         error
+		wantCalls   int
+		wantTimeout bool
+	}{
+		{"transient", 2, unix.EBUSY, 3, false},
+		{"not-attached", 100, unix.ENOENT, 1, false},
+		{"busy-deadline", 100, unix.EBUSY, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			f, _, _, err := retryBusy(context.Background(), 65*time.Millisecond, func(_ context.Context, remaining time.Duration) (*os.File, *os.File, Metadata, error) {
+				calls++
+				if remaining <= 0 {
+					t.Fatal("attempt after deadline")
+				}
+				if calls <= tc.failures {
+					return nil, nil, Metadata{}, tc.err
+				}
+				f, e := os.Open(os.DevNull)
+				return f, nil, Metadata{}, e
+			})
+			if f != nil {
+				defer f.Close()
+			}
+			if tc.wantTimeout {
+				if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, unix.EBUSY) || calls < 2 {
+					t.Fatalf("calls=%d err=%v", calls, err)
+				}
+			} else {
+				if calls != tc.wantCalls {
+					t.Fatalf("calls=%d", calls)
+				}
+				if tc.failures < tc.wantCalls && err != nil {
+					t.Fatal(err)
+				}
+				if tc.name == "not-attached" && !errors.Is(err, unix.ENOENT) {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestBusyProviderErrorClassification(t *testing.T) {
+	for _, tc := range []struct {
+		message string
+		want    bool
+	}{
+		{"tapfd provider error PROVIDER_INTERNAL: open_tap_sw0-t1:_ioctl_TUNSETIFF_sw0-t1:_device_or_resource_busy", true},
+		{"tapfd provider error PORT_UNAVAILABLE: device_or_resource_busy", false},
+		{"tapfd provider error PROVIDER_INTERNAL: open_tap_sw0-t1:_ioctl_TUNSETIFF_sw0-t2:_device_or_resource_busy", false},
+		{"tapfd provider error PROVIDER_INTERNAL: open_tap_sw0-t1:_ioctl_TUNSETIFF_sw0-t1:_operation_not_permitted", false},
+	} {
+		if got := socketTapBusy(errors.New(tc.message)); got != tc.want {
+			t.Fatalf("%s: %t", tc.message, got)
+		}
+	}
+	if !helperTapBusy("open tap sw0-t1: ioctl TUNSETIFF sw0-t1: device or resource busy\n") {
+		t.Fatal("expected exact exec helper busy")
+	}
+	if helperTapBusy("unrelated device or resource busy") {
+		t.Fatal("unrelated error classified as TAP busy")
+	}
+}
+
+func TestRetryBusyCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	_, _, _, err := retryBusy(ctx, time.Second, func(context.Context, time.Duration) (*os.File, *os.File, Metadata, error) {
+		calls++
+		cancel()
+		return nil, nil, Metadata{}, unix.EBUSY
+	})
+	if calls != 1 || !errors.Is(err, context.Canceled) {
+		t.Fatalf("calls=%d err=%v", calls, err)
+	}
 }

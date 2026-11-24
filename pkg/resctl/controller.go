@@ -56,30 +56,31 @@ type ControllerHooks struct {
 	controllerCgroupPath     string
 	controllerSocketIdentity string
 
-	admitted           bool
-	settled            bool
-	connected          bool
-	reservationBytes   uint64
-	cacheMaximum       uint64
-	cacheReservation   uint64
-	cacheSupported     bool
-	cacheCoordinated   bool
-	cacheReclaim       resource.CacheReclaimState
-	cacheReclaimAck    uint64
-	cacheReclaimTarget uint64
-	cacheReclaimSeq    uint64
-	cacheWake          chan struct{}
-	previousToken      string
-	released           bool
-	releaseDone        chan struct{}
-	ordinaryReleased   bool
-	abortRetries       map[resource.CaptureRetention]bool
-	retainedSupported  bool
-	retention          *resource.CaptureRetention
-	retentionPrepared  bool
-	retentionHolder    bool
-	leaseCandidate     string
-	handoffID          string
+	admitted             bool
+	settled              bool
+	connected            bool
+	reservationBytes     uint64
+	cacheMaximum         uint64
+	cacheReservation     uint64
+	cacheSupported       bool
+	cacheCoordinated     bool
+	cacheReclaim         resource.CacheReclaimState
+	cacheReclaimAck      uint64
+	cacheReclaimTarget   uint64
+	cacheReclaimSeq      uint64
+	cacheWake            chan struct{}
+	previousToken        string
+	released             bool
+	releaseDone          chan struct{}
+	ordinaryReleased     bool
+	abortRetries         map[resource.CaptureRetention]bool
+	retainedSupported    bool
+	deferredVMMSupported bool
+	retention            *resource.CaptureRetention
+	retentionPrepared    bool
+	retentionHolder      bool
+	leaseCandidate       string
+	handoffID            string
 
 	lifetimeCtx    context.Context
 	cancelLifetime context.CancelFunc
@@ -163,7 +164,7 @@ func NewControllerHooks(opts ControllerHookOptions, cfg *config.SandboxConfig) (
 		return nil, err
 	}
 	h.cacheMaximum = cacheMax
-	cacheFeatures := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2}
+	cacheFeatures := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2, resource.FeatureDeferredVMMExit}
 	if !diffstore.ElasticCacheSupported() {
 		// Keep the fixed cache if payload pages cannot be charged and returned individually.
 		h.cacheMaximum = 0
@@ -343,7 +344,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 				continue
 			}
 		}
-		cacheFeatures := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2}
+		cacheFeatures := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2, resource.FeatureDeferredVMMExit}
 		if h.cacheMaximum > 0 {
 			cacheFeatures = append(cacheFeatures, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(h.cacheMaximum))
 			if h.cacheReclaim.RunID != "" {
@@ -446,6 +447,7 @@ func (h *ControllerHooks) Admit(sid string, budgetAtSnapshot uint64) (uint64, er
 		h.mu.Lock()
 		h.admitted, h.connected = true, true
 		h.retainedSupported = resource.HasFeature(res.ClientFeatures, resource.FeatureRetainedMemoryV2)
+		h.deferredVMMSupported = resource.HasFeature(res.ClientFeatures, resource.FeatureDeferredVMMExit)
 		h.reservationBytes = initialBudget
 		h.cacheSupported = res.CacheSupported
 		h.cacheCoordinated = res.CacheCoordinated
@@ -760,6 +762,7 @@ func (h *ControllerHooks) restoreSessionLocked(ctx context.Context) error {
 	h.mu.Lock()
 	h.connected, h.previousToken = true, result.Token
 	h.retainedSupported = resource.HasFeature(result.ClientFeatures, resource.FeatureRetainedMemoryV2)
+	h.deferredVMMSupported = resource.HasFeature(result.ClientFeatures, resource.FeatureDeferredVMMExit)
 	if !state.cacheCoordinated {
 		h.cacheReclaimTarget = result.CacheReclaimTarget
 		h.cacheReclaimSeq = result.CacheReclaimSeq

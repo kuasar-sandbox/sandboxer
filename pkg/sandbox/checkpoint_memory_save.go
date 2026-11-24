@@ -30,8 +30,12 @@ type checkpointMemorySave struct {
 	parents   []string
 	external  []string
 	dump      func(context.Context, io.ReaderAt) (string, error)
-	newSink   func() (snapshot.ArtifactSink, error)
-	logf      func(string, ...any)
+	// Assigned by ServeAndWait after CH and every backend consumer have stopped.
+	// The holder must join this before publishing RAMReleased.
+	retiredMappingCleanup func() error
+	chExited              <-chan struct{}
+	newSink               func() (snapshot.ArtifactSink, error)
+	logf                  func(string, ...any)
 }
 
 var errMemorySaveAbortPending = errors.New("checkpoint memory: rollback acknowledgement is pending")
@@ -99,6 +103,15 @@ func prepareCheckpointMemorySave(ctx context.Context, req ctl.Request, opts RunO
 	}
 	if req.HostRetirement != nil {
 		r.HostOperationID = req.HostRetirement.OperationID
+		if req.HostRetirement.DeferVMMExit && hooks.SupportsDeferredVMMExit() {
+			opts.runtime.mu.Lock()
+			vmm := opts.runtime.vmmIdentity
+			opts.runtime.mu.Unlock()
+			if vmm != nil {
+				r.Version = memorycheckpoint.DeferredVMMRecordVersion
+				r.VMM = vmm
+			}
+		}
 	}
 	fd, err := memorycheckpoint.ReadOnlyMemfd(mfd.FD())
 	if err != nil {
@@ -311,7 +324,7 @@ func (s *checkpointMemorySave) finishRetirement(first chan<- error) {
 			time.Sleep(time.Second)
 		}
 	}
-	err := s.holder.Start(s.dump, func(ctx context.Context) error {
+	err := s.holder.StartWithCleanup(s.dump, s.retiredMappingCleanup, func(ctx context.Context) error {
 		if s.hooks != nil && s.hooks.Enabled() {
 			if err := s.hooks.ReleaseRetained(ctx, s.retention); err != nil {
 				return err
@@ -391,7 +404,7 @@ func PreviousCaptureRetention(directory, sid string) (*resource.CaptureRetention
 	return hint, nil
 }
 
-func destroyFrozenMemory(process processSignaler, lock *os.File, release func(), exited <-chan struct{}, logf func(string, ...any)) {
+func destroyFrozenMemory(process processSignaler, lock *os.File, release func(), exited <-chan struct{}, stopBackends func(), logf func(string, ...any), afterKill ...func()) {
 	// CH shutdown can run device work. A committed frozen backing permits no
 	// further writer, so retire the already-paused VMM without resuming it.
 	defer func() {
@@ -406,13 +419,46 @@ func destroyFrozenMemory(process processSignaler, lock *os.File, release func(),
 	}
 	if err := process.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		logf("checkpoint memory: retire VMM: %v", err)
+	} else if stopBackends != nil {
+		// The capture is committed and backend writes are already frozen.
+		// Close services while the kernel destroys the old CH address space.
+		// The UFFD reader itself remains until the normal joined cleanup.
+		stopBackends()
+		if len(afterKill) > 0 && afterKill[0] != nil {
+			afterKill[0]()
+		}
 	}
 	<-exited
 }
 
 func frozenRetirement(r *Runtime, process processSignaler, lock *os.File, release func(), exited <-chan struct{}, logf func(string, ...any)) func() error {
 	return sync.OnceValue(func() error {
-		go destroyFrozenMemory(process, lock, release, exited, logf)
+		r.markExiting()
+		r.mu.Lock()
+		stopBackends := r.stopFrozenBackends
+		resetTaps := r.resetFrozenTaps
+		retire := r.retireFrozenRuntime
+		save := r.memorySave
+		r.mu.Unlock()
+		ok := resetTaps == nil || resetTaps()
+		// A successful reset is only an execution fence, not RAM release.
+		// New proof and both negotiated capabilities are prerequisites.
+		if !ok || save == nil || save.holder.Record().Read().VMM == nil || exited == nil ||
+			!save.hooks.SupportsDeferredVMMExit() {
+			retire = nil
+		}
+		// Join the complete asynchronous continuation, including the
+		// lifecycle lock and mutation-gate release. Publish before signaling.
+		done := make(chan struct{})
+		if retire != nil {
+			r.mu.Lock()
+			save.chExited = done
+			r.mu.Unlock()
+		}
+		go func() {
+			defer close(done)
+			destroyFrozenMemory(process, lock, release, exited, stopBackends, logf, retire)
+		}()
 		<-r.exitDone
 		return r.exit.Err
 	})

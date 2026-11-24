@@ -10,6 +10,7 @@ const FeatureRetainedMemoryV1 = "checkpoint_memory_handoff_v1"
 
 // V2 transfers a node-owned account, never a caller-selected subset of R.
 const FeatureRetainedMemoryV2 = "checkpoint_memory_handoff_v2"
+const FeatureDeferredVMMExit = "checkpoint_deferred_vmm_exit_v1"
 const TypeGetRetainedAccount = "get_retained_account_v2"
 
 type RetainedAccount struct {

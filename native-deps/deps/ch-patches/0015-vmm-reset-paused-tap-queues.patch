@@ -1,0 +1,399 @@
+From 504d78b1d95e3c7615bb67b824645e8feef8cf13 Mon Sep 17 00:00:00 2001
+From: local-validation <local-validation@localhost>
+Date: Tue, 24 Nov 2026 13:52:08 +0800
+Subject: [PATCH] vmm: release paused TAP queues before terminal process exit
+
+---
+ virtio-devices/src/device.rs              |  5 ++
+ virtio-devices/src/epoll_helper.rs        | 56 +++++++++++++++++++++--
+ virtio-devices/src/net.rs                 | 22 +++++++++
+ vmm/src/api/http/http_endpoint.rs         |  1 +
+ vmm/src/api/http/mod.rs                   |  4 ++
+ vmm/src/api/mod.rs                        | 37 +++++++++++++++
+ vmm/src/api/openapi/cloud-hypervisor.yaml |  9 ++++
+ vmm/src/device_manager.rs                 | 28 ++++++++++++
+ vmm/src/lib.rs                            | 21 ++++++++-
+ vmm/src/vm.rs                             | 11 +++++
+ 10 files changed, 189 insertions(+), 5 deletions(-)
+
+diff --git a/virtio-devices/src/device.rs b/virtio-devices/src/device.rs
+index 07b485b..526b79b 100644
+--- a/virtio-devices/src/device.rs
++++ b/virtio-devices/src/device.rs
+@@ -132,6 +132,11 @@ pub trait VirtioDevice: Send {
+     /// after a shutdown() can lead to unpredictable results.
+     fn shutdown(&mut self) {}
+ 
++    // Release host TAP resources from a paused, terminal VM.
++    fn reset_paused_taps(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++
+     fn add_memory_region(
+         &mut self,
+         _region: &Arc<GuestRegionMmap>,
+diff --git a/virtio-devices/src/epoll_helper.rs b/virtio-devices/src/epoll_helper.rs
+index 4a0f53c..7724175 100644
+--- a/virtio-devices/src/epoll_helper.rs
++++ b/virtio-devices/src/epoll_helper.rs
+@@ -152,7 +152,7 @@ impl EpollHelper {
+         .map_err(EpollHelperError::Ctl)
+     }
+ 
+-    fn pause_event_pending(&self) -> std::result::Result<bool, EpollHelperError> {
++    fn event_pending(&self, id: u16) -> std::result::Result<bool, EpollHelperError> {
+         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
+ 
+         loop {
+@@ -160,7 +160,7 @@ impl EpollHelper {
+                 Ok(count) => {
+                     return Ok(events[..count]
+                         .iter()
+-                        .any(|event| event.data as u16 == EPOLL_HELPER_EVENT_PAUSE));
++                        .any(|event| event.data as u16 == id));
+                 }
+                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                 Err(e) => return Err(EpollHelperError::Wait(e)),
+@@ -194,15 +194,21 @@ impl EpollHelper {
+         // device has been resumed.
+         let mut pause_request_pending = false;
+         while paused.load(Ordering::SeqCst) {
+-            if self.pause_event_pending()? {
++            if self.event_pending(EPOLL_HELPER_EVENT_PAUSE)? {
+                 pause_request_pending = true;
+                 break;
+             }
++            if self.event_pending(EPOLL_HELPER_EVENT_KILL)? {
++                return Ok(());
++            }
+             thread::park();
+         }
+         if pause_request_pending {
+             paused_sync.wait();
+             while paused.load(Ordering::SeqCst) {
++                if self.event_pending(EPOLL_HELPER_EVENT_KILL)? {
++                    return Ok(());
++                }
+                 thread::park();
+             }
+             paused_sync.wait();
+@@ -257,6 +263,9 @@ impl EpollHelper {
+                         // Until we have not resumed, the paused boolean will
+                         // be true.
+                         while paused.load(Ordering::SeqCst) {
++                            if self.event_pending(EPOLL_HELPER_EVENT_KILL)? {
++                                return Ok(());
++                            }
+                             thread::park();
+                         }
+ 
+@@ -329,6 +338,9 @@ impl EpollHelper {
+                         // Until we have not resumed, the paused boolean will
+                         // be true.
+                         while paused.load(Ordering::SeqCst) {
++                            if self.event_pending(EPOLL_HELPER_EVENT_KILL)? {
++                                return Ok(());
++                            }
+                             thread::park();
+                         }
+ 
+@@ -369,6 +381,42 @@ mod tests {
+         queue_evt.write(1).unwrap();
+         pause_evt.write(1).unwrap();
+ 
+-        assert!(helper.pause_event_pending().unwrap());
++        assert!(helper.event_pending(EPOLL_HELPER_EVENT_PAUSE).unwrap());
+     }
++
++    #[test]
++    fn kill_paused_worker_without_resume_or_queue_processing() {
++        use std::sync::{Arc, mpsc};
++        use std::time::Duration;
++
++        struct NoQueue;
++        impl EpollHelperHandler for NoQueue {
++            fn handle_event(&mut self, _: &mut EpollHelper, _: &epoll::Event)
++                -> Result<(), EpollHelperError> {
++                panic!("terminal pause processed a queued event");
++            }
++        }
++        let kill = EventFd::new(libc::EFD_NONBLOCK).unwrap();
++        let pause = EventFd::new(libc::EFD_NONBLOCK).unwrap();
++        let queue = EventFd::new(libc::EFD_NONBLOCK).unwrap();
++        let mut helper = EpollHelper::new(&kill, &pause).unwrap();
++        helper.add_event(queue.as_raw_fd(), EPOLL_HELPER_EVENT_LAST + 1).unwrap();
++        let paused = Arc::new(AtomicBool::new(true));
++        let sync = Arc::new(Barrier::new(2));
++        pause.write(1).unwrap();
++        queue.write(1).unwrap();
++        let worker_paused = paused.clone();
++        let worker_sync = sync.clone();
++        let (tx, rx) = mpsc::channel();
++        let worker = thread::spawn(move || {
++            tx.send(helper.run(&worker_paused, &worker_sync, &mut NoQueue)).unwrap();
++        });
++        sync.wait(); // the same pause ACK used by the device manager
++        kill.write(1).unwrap();
++        worker.thread().unpark();
++        rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
++        worker.join().unwrap();
++        assert!(paused.load(Ordering::SeqCst));
++    }
++
+ }
+diff --git a/virtio-devices/src/net.rs b/virtio-devices/src/net.rs
+index c55a927..b4dee9d 100644
+--- a/virtio-devices/src/net.rs
++++ b/virtio-devices/src/net.rs
+@@ -824,6 +824,28 @@ impl VirtioDevice for Net {
+         Ok(())
+     }
+ 
++    fn reset_paused_taps(&mut self) -> std::io::Result<()> {
++        if !self.common.paused.load(Ordering::SeqCst) {
++            return Err(std::io::Error::other("TAP release requires Pause"));
++        }
++        if let Some(kill_evt) = self.common.kill_evt.take() {
++            kill_evt.write(1)?;
++        }
++        if let Some(threads) = self.common.epoll_threads.as_ref() {
++            for t in threads { t.thread().unpark(); }
++        }
++        if let Some(t) = self.ctrl_queue_epoll_thread.as_ref() {
++            t.thread().unpark();
++        }
++        self.common.wait_for_epoll_threads();
++        if let Some(t) = self.ctrl_queue_epoll_thread.take() {
++            t.join().map_err(|_| std::io::Error::other("TAP control worker join failed"))?;
++        }
++        // Drop the device's own reference only after every worker joined.
++        self.taps.clear();
++        Ok(())
++    }
++
+     fn reset(&mut self) -> Option<Arc<dyn VirtioInterrupt>> {
+         let result = self.common.reset();
+         event!("virtio-device", "reset", "id", &self.id);
+diff --git a/vmm/src/api/http/http_endpoint.rs b/vmm/src/api/http/http_endpoint.rs
+index a5a2ad0..3c66663 100644
+--- a/vmm/src/api/http/http_endpoint.rs
++++ b/vmm/src/api/http/http_endpoint.rs
+@@ -413,6 +413,7 @@ vm_action_put_handler!(VmDelete);
+ vm_action_put_handler!(VmShutdown);
+ vm_action_put_handler!(VmReboot);
+ vm_action_put_handler!(VmPause);
++vm_action_put_handler!(crate::api::VmResetTap);
+ vm_action_put_handler!(VmResume);
+ vm_action_put_handler!(VmPowerButton);
+ vm_action_put_handler!(VmNmi);
+diff --git a/vmm/src/api/http/mod.rs b/vmm/src/api/http/mod.rs
+index 27823a4..4ca4f11 100644
+--- a/vmm/src/api/http/mod.rs
++++ b/vmm/src/api/http/mod.rs
+@@ -231,6 +231,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
+         endpoint!("/vm.dirty-memory"),
+         Box::new(VmActionHandler::new(&VmDirtyMemory)),
+     );
++    r.routes.insert(
++        endpoint!("/vm.reset-tap"),
++        Box::new(VmActionHandler::new(&crate::api::VmResetTap)),
++    );
+     r.routes.insert(
+         endpoint!("/vm.pause"),
+         Box::new(VmActionHandler::new(&VmPause)),
+diff --git a/vmm/src/api/mod.rs b/vmm/src/api/mod.rs
+index 4e966fb..b9a9410 100644
+--- a/vmm/src/api/mod.rs
++++ b/vmm/src/api/mod.rs
+@@ -295,6 +295,10 @@ pub trait RequestHandler {
+ 
+     fn vm_pause(&mut self) -> Result<(), VmError>;
+ 
++    fn vm_reset_tap(&mut self) -> Result<(), VmError> {
++        Err(VmError::VmNotRunning)
++    }
++
+     fn vm_resume(&mut self) -> Result<(), VmError>;
+ 
+     fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
+@@ -1006,6 +1010,39 @@ impl ApiAction for VmPause {
+     }
+ }
+ 
++pub struct VmResetTap;
++
++impl ApiAction for VmResetTap {
++    type RequestBody = ();
++    type ResponseBody = Option<Body>;
++
++    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
++        Box::new(move |vmm| {
++            info!("API request event: VmResetTap");
++
++            let response = vmm
++                .vm_reset_tap()
++                .map_err(ApiError::VmShutdown)
++                .map(|_| ApiResponsePayload::Empty);
++
++            response_sender
++                .send(response)
++                .map_err(VmmError::ApiResponseSend)?;
++
++            Ok(false)
++        })
++    }
++
++    fn send(
++        &self,
++        api_evt: EventFd,
++        api_sender: Sender<ApiRequest>,
++        data: Self::RequestBody,
++    ) -> ApiResult<Self::ResponseBody> {
++        get_response_body(self, api_evt, api_sender, data)
++    }
++}
++
+ pub struct VmPowerButton;
+ 
+ impl ApiAction for VmPowerButton {
+diff --git a/vmm/src/api/openapi/cloud-hypervisor.yaml b/vmm/src/api/openapi/cloud-hypervisor.yaml
+index 629a680..de5c65a 100644
+--- a/vmm/src/api/openapi/cloud-hypervisor.yaml
++++ b/vmm/src/api/openapi/cloud-hypervisor.yaml
+@@ -97,6 +97,15 @@ paths:
+         405:
+           description: The VM instance could not pause because it is not booted.
+ 
++  /vm.reset-tap:
++    put:
++      summary: Release TAP queues of an already paused terminal VM.
++      description: The caller must terminate the VMM after this irreversible operation. It is not a resumable pause or a guest hot-unplug.
++      responses:
++        204:
++          description: Host TAP resources released.
++        500:
++          description: Reset failed.
+   /vm.resume:
+     put:
+       summary: Resume a previously paused VM instance.
+diff --git a/vmm/src/device_manager.rs b/vmm/src/device_manager.rs
+index 0f8513e..da5e6d5 100644
+--- a/vmm/src/device_manager.rs
++++ b/vmm/src/device_manager.rs
+@@ -5401,6 +5401,34 @@ impl Aml for DeviceManager {
+     }
+ }
+ 
++impl DeviceManager {
++    pub fn reset_paused_taps(&mut self) -> std::io::Result<()> {
++        for handle in &self.virtio_devices {
++            handle.virtio_device.lock().unwrap().reset_paused_taps()?;
++        }
++        let mut config = self.config.lock().unwrap();
++        let mut tap_fds = std::collections::BTreeSet::new();
++        if let Some(nets) = config.net.as_mut() {
++            for net in nets {
++                if !net.vhost_user {
++                    tap_fds.extend(net.fds.take().unwrap_or_default());
++                }
++            }
++        }
++        if let Some(fds) = config.preserved_fds.as_mut() {
++            fds.retain(|fd| !tap_fds.contains(fd));
++        }
++        for fd in tap_fds {
++            // All Net and worker duplicates have been joined/dropped.
++            // The original inherited fd is owned by this config.
++            if unsafe { libc::close(fd) } != 0 {
++                return Err(std::io::Error::last_os_error());
++            }
++        }
++        Ok(())
++    }
++}
++
+ impl Pausable for DeviceManager {
+     fn pause(&mut self) -> result::Result<(), MigratableError> {
+         for (_, device_node) in self.device_tree.lock().unwrap().iter() {
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index 95b3a86..9c5604c 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -679,6 +679,7 @@ pub struct Vmm {
+     version: VmmVersionInfo,
+     vm: Option<Vm>,
+     vm_config: Option<Arc<Mutex<VmConfig>>>,
++    tap_reset_terminal: bool,
+     seccomp_action: SeccompAction,
+     hypervisor: Arc<dyn hypervisor::Hypervisor>,
+     activate_evt: EventFd,
+@@ -863,6 +864,7 @@ impl Vmm {
+             version: vmm_version,
+             vm: None,
+             vm_config: None,
++            tap_reset_terminal: false,
+             seccomp_action,
+             hypervisor,
+             activate_evt,
+@@ -1564,7 +1566,14 @@ impl Vmm {
+                             // Read from the API receiver channel
+                             let api_request = api_receiver.recv().map_err(Error::ApiRequestRecv)?;
+ 
+-                            if api_request(self)? {
++                            let result = api_request(self);
++                            if self.tap_reset_terminal {
++                                // ResetTap has replied (or the reply receiver disappeared).
++                                // No ordinary destructor or VM request may run now.
++                                // The management process must kill this terminal VMM.
++                                loop { std::thread::park(); }
++                            }
++                            if result? {
+                                 break 'outer;
+                             }
+                         }
+@@ -1712,6 +1721,16 @@ impl RequestHandler for Vmm {
+         }
+     }
+ 
++    fn vm_reset_tap(&mut self) -> result::Result<(), VmError> {
++        let vm = self.vm.as_mut().ok_or(VmError::VmNotRunning)?;
++        if vm.get_state() != VmState::Paused {
++            return Err(VmError::InvalidStateTransition(vm.get_state(), VmState::Paused));
++        }
++        // Also fence partial failures: a released device cannot be resumed.
++        self.tap_reset_terminal = true;
++        vm.reset_paused_taps()
++    }
++
+     fn vm_resume(&mut self) -> result::Result<(), VmError> {
+         if let Some(ref mut vm) = self.vm {
+             vm.resume().map_err(VmError::Resume)
+diff --git a/vmm/src/vm.rs b/vmm/src/vm.rs
+index fff0d40..e86921b 100644
+--- a/vmm/src/vm.rs
++++ b/vmm/src/vm.rs
+@@ -189,6 +189,9 @@ pub enum Error {
+     #[error("Cannot pause devices")]
+     PauseDevices(#[source] MigratableError),
+ 
++    #[error("Paused TAP reset failed")]
++    ResetTap(#[source] std::io::Error),
++
+     #[error("Cannot resume devices")]
+     ResumeDevices(#[source] MigratableError),
+ 
+@@ -1864,6 +1867,14 @@ impl Vm {
+         self.device_manager.lock().unwrap().console_resize_pipe()
+     }
+ 
++    pub fn reset_paused_taps(&mut self) -> Result<()> {
++        if self.state != VmState::Paused {
++            return Err(Error::InvalidStateTransition(self.state, VmState::Paused));
++        }
++        self.device_manager.lock().unwrap().reset_paused_taps().map_err(Error::ResetTap)?;
++        Ok(())
++    }
++
+     pub fn shutdown(&mut self) -> Result<()> {
+         let new_state = VmState::Shutdown;
+ 

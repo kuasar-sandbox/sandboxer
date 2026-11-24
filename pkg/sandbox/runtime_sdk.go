@@ -30,6 +30,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
@@ -154,16 +155,20 @@ type runtimeOwnedDisk struct {
 // Runtime owns one VM and its service goroutines. Wait observes cleanup;
 // Close requests graceful shutdown and waits for the same retained result.
 type Runtime struct {
-	memorySave    *checkpointMemorySave
-	diskSnapshot  *SnapshotHandler
-	diskLaunch    LaunchSpec
-	diskInventory []diskEntry
-	diskStateMu   sync.RWMutex
-	diskBackends  *vhost.BackendSet // includes restored devices
-	diskCache     *diffstore.Cache  // may be borrowed on restore
-	diskStorage   *artifact.ProcessStorage
-	diskFatal     func(error)
-	diskOwned     []runtimeOwnedDisk // writers created by BindDisk
+	memorySave          *checkpointMemorySave
+	stopFrozenBackends  func()
+	resetFrozenTaps     func() bool
+	retireFrozenRuntime func()
+	vmmIdentity         *memorycheckpoint.VMMIdentity
+	diskSnapshot        *SnapshotHandler
+	diskLaunch          LaunchSpec
+	diskInventory       []diskEntry
+	diskStateMu         sync.RWMutex
+	diskBackends        *vhost.BackendSet // includes restored devices
+	diskCache           *diffstore.Cache  // may be borrowed on restore
+	diskStorage         *artifact.ProcessStorage
+	diskFatal           func(error)
+	diskOwned           []runtimeOwnedDisk // writers created by BindDisk
 
 	checkpointCleanup                  func() error
 	checkpointOwner                    *diffstore.DirectoryOwner

@@ -14,9 +14,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -42,14 +44,90 @@ func AcquireConfig(ctx context.Context, cfg *config.TapFDConfig) (tap *os.File, 
 	if cfg == nil {
 		return nil, nil, Metadata{}, errors.New("tapfd: nil config")
 	}
+	timeout := cfg.TimeoutDuration()
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
 	if cfg.Socket != "" {
-		return AcquireSocket(ctx, cfg.Socket, cfg.Request, cfg.TimeoutDuration())
+		return retryBusy(ctx, timeout, func(ctx context.Context, remaining time.Duration) (*os.File, *os.File, Metadata, error) {
+			return AcquireSocket(ctx, cfg.Socket, cfg.Request, remaining)
+		})
 	}
 	argv, err := cfg.ResolvedExec()
 	if err != nil {
 		return nil, nil, Metadata{}, err
 	}
-	return Acquire(ctx, argv, cfg.TimeoutDuration())
+	if len(argv) < 3 || filepath.Base(argv[0]) != "connector-ctl" || argv[1] != "vswitch" || argv[2] != "open-port" {
+		return Acquire(ctx, argv, timeout)
+	}
+	return retryBusy(ctx, timeout, func(ctx context.Context, remaining time.Duration) (*os.File, *os.File, Metadata, error) {
+		return Acquire(ctx, argv, remaining)
+	})
+}
+
+// Retry only the provider's specific TUNSETIFF EBUSY. The provider continues
+// to own the selected port; OPEN is not a new attach. Keep one overall
+// acquisition deadline, including every attempt and wait.
+func retryBusy(ctx context.Context, timeout time.Duration, acquire func(context.Context, time.Duration) (*os.File, *os.File, Metadata, error)) (*os.File, *os.File, Metadata, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	var last error
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, Metadata{}, errors.Join(last, err)
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, nil, Metadata{}, errors.Join(last, context.DeadlineExceeded)
+		}
+		f, ns, meta, err := acquire(ctx, remaining)
+		if err == nil {
+			if ctx.Err() != nil {
+				closeFile(f)
+				closeFile(ns)
+				return nil, nil, Metadata{}, ctx.Err()
+			}
+			return f, ns, meta, nil
+		}
+		if !errors.Is(err, unix.EBUSY) {
+			return f, ns, meta, err
+		}
+		last = err
+		t := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil, nil, Metadata{}, errors.Join(last, ctx.Err())
+		case <-t.C:
+		}
+	}
+}
+
+func tapOpenBusy(message, prefix, separator, suffix string) bool {
+	rest, ok := strings.CutPrefix(message, prefix)
+	if !ok {
+		return false
+	}
+	name, rest, ok := strings.Cut(rest, separator)
+	return ok && name != "" && rest == name+suffix
+}
+
+func socketTapBusy(err error) bool {
+	if errors.Is(err, unix.EBUSY) {
+		return true
+	}
+	return tapOpenBusy(err.Error(), "tapfd provider error PROVIDER_INTERNAL: open_tap_", ":_ioctl_TUNSETIFF_", ":_device_or_resource_busy")
+}
+
+func helperTapBusy(stderr string) bool {
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "Error: "))
+		if tapOpenBusy(line, "open tap ", ": ioctl TUNSETIFF ", ": device or resource busy") {
+			return true
+		}
+	}
+	return false
 }
 
 // Acquire runs the https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#dynamic-acquisition-contract-normative exec-helper handoff: it creates a connected socketpair,
@@ -109,15 +187,24 @@ func Acquire(ctx context.Context, argv []string, timeout time.Duration) (tap *os
 	}
 	_ = helperFile.Close() // the child holds its own copy now
 
-	_ = uconn.SetDeadline(time.Now().Add(timeout))
+	deadline, _ := cctx.Deadline()
+	_ = uconn.SetDeadline(deadline)
+	stopCancel := context.AfterFunc(cctx, func() { _ = uconn.SetDeadline(time.Now()) })
+	defer stopCancel()
 	tapFiles, netnsFile, meta, rerr := RecvFd(uconn)
 	werr := cmd.Wait() // helper sends one message then exits (https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#helper-responsibilities-provider-side)
 
 	if rerr != nil {
 		closeAll(tapFiles)
 		closeFile(netnsFile)
-		return nil, nil, Metadata{}, fmt.Errorf("tapfd: recv from helper %s: %w (helper exit: %v, stderr=%q)",
+		err := fmt.Errorf("tapfd: recv from helper %s: %w (helper exit: %v, stderr=%q)",
 			argv[0], rerr, werr, strings.TrimSpace(stderr.String()))
+		// A successful handoff followed by a failing helper is never retried.
+		// Only an explicit failed open, without any delivered tap fd, is safe.
+		if werr != nil && (errors.Is(rerr, io.EOF) || rerr.Error() == "recvmsg: empty payload (sender must include metadata)") && helperTapBusy(stderr.String()) {
+			err = errors.Join(err, unix.EBUSY)
+		}
+		return nil, nil, Metadata{}, err
 	}
 	if werr != nil { // https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#runtime-responsibilities-consumer-side: non-zero exit or timeout ⇒ failure, do not use the nic
 		closeAll(tapFiles)
@@ -162,7 +249,10 @@ func AcquireSocket(ctx context.Context, socketPath, requestFields string, timeou
 	}
 	defer uconn.Close()
 
-	_ = uconn.SetDeadline(time.Now().Add(timeout))
+	deadline, _ := cctx.Deadline()
+	_ = uconn.SetDeadline(deadline)
+	stopCancel := context.AfterFunc(cctx, func() { _ = uconn.SetDeadline(time.Now()) })
+	defer stopCancel()
 	if _, err := uconn.Write(req); err != nil {
 		return nil, nil, Metadata{}, fmt.Errorf("tapfd: write request to %s: %w", socketPath, err)
 	}
@@ -170,6 +260,9 @@ func AcquireSocket(ctx context.Context, socketPath, requestFields string, timeou
 	if rerr != nil {
 		closeAll(tapFiles)
 		closeFile(netnsFile)
+		if socketTapBusy(rerr) {
+			rerr = errors.Join(rerr, unix.EBUSY)
+		}
 		return nil, nil, Metadata{}, fmt.Errorf("tapfd: recv from %s: %w", socketPath, rerr)
 	}
 	if len(tapFiles) != 1 {

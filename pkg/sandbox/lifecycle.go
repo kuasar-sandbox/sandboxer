@@ -735,7 +735,9 @@ func waitForCHWithSignalEscalation(
 	chRespDeadline time.Duration,
 	grace time.Duration,
 	logf func(format string, args ...any),
+	frozen ...func() bool,
 ) error {
+	isFrozen := func() bool { return len(frozen) > 0 && frozen[0] != nil && frozen[0]() }
 	var killTimer *time.Timer
 	var killCh <-chan time.Time
 	var drainTimer *time.Timer
@@ -747,6 +749,10 @@ func waitForCHWithSignalEscalation(
 	var pendingShutdownSignal os.Signal
 	shutdownInitiated := false
 	finishShutdownRequest := func(sig os.Signal, useAPI bool) {
+		if isFrozen() {
+			_ = proc.Signal(syscall.SIGKILL)
+			return
+		}
 		usedAPI := false
 		if useAPI {
 			if err := (chapi.Client{Sock: chSock, RespDeadline: chRespDeadline}).ShutdownVMM(); err == nil {
@@ -786,6 +792,11 @@ func waitForCHWithSignalEscalation(
 						return
 					}
 					memoryHighLockRetryDeadline = time.Time{}
+					if isFrozen() {
+						logf("received %v, memory.high lifecycle lock remained busy; sending SIGKILL to fence potential capture", sig)
+						_ = proc.Signal(syscall.SIGKILL)
+						return
+					}
 					logf("received %v, memory.high lifecycle lock remained busy for %s; falling back to SIGTERM", sig, memoryHighLockRetryWindow)
 				} else {
 					memoryHighLockRetryDeadline = time.Time{}
