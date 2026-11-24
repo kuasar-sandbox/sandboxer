@@ -252,6 +252,33 @@ func TestSDKChild(t *testing.T) {
 			os.Exit(31)
 		}
 	}
+	if outcome := os.Getenv("SDK_TEST_SHORT_EXIT"); outcome != "" {
+		fact := &proto.InitialLaunchState{Token: msg.Launch.InitialLaunchToken, State: proto.InitialLaunchExited, PID: 42}
+		if outcome == "nonzero" {
+			fact.Code = 7
+		}
+		if outcome == "not-started" {
+			fact.PID = 0
+		}
+		initial.Store(fact)
+		terminal, err := net.Dial("unix", sock+"_5000")
+		if err != nil {
+			os.Exit(39)
+		}
+		_ = terminal.SetDeadline(time.Now().Add(time.Second))
+		if err = proto.WriteMessage(terminal, &proto.Message{Type: proto.TypeAppExited, Code: fact.Code, InitialLaunchState: fact}); err != nil {
+			os.Exit(40)
+		}
+		resp, err := proto.ReadMessage(terminal)
+		_ = terminal.Close()
+		if err != nil || resp.Type != proto.TypeAck {
+			os.Exit(41)
+		}
+		if outcome == "vmm-error" {
+			os.Exit(19)
+		}
+		os.Exit(0)
+	}
 	initial.Store(&proto.InitialLaunchState{Token: msg.Launch.InitialLaunchToken, State: proto.InitialLaunchStarted, PID: 42})
 	if os.Getenv("SDK_TEST_DROP_APP_STARTED") == "1" {
 		_, _ = io.Copy(io.Discard, conn)

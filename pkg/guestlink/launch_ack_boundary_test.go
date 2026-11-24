@@ -135,3 +135,97 @@ func TestLaunchServerExitFactPrecedesACKAndRejectsContradiction(t *testing.T) {
 		})
 	}
 }
+
+// The ACK may be readable by the Guest before the host's Write returns.
+// A matching standalone terminal report must not ACK or commit through
+// that publication boundary, including when the original write fails.
+func TestLaunchServerCompletedExitAtACKPublication(t *testing.T) {
+	for _, failWrite := range []bool{false, true} {
+		name := "successful-write"
+		if failWrite {
+			name = "failed-write"
+		}
+		t.Run(name, func(t *testing.T) {
+			spec := &proto.LaunchSpec{Exec: "/bin/true", InitialLaunchToken: "same-token"}
+			facts := make(chan proto.InitialLaunchState, 2)
+			srv := &LaunchServer{Spec: spec, DeferLaunch: true, GateCompletedExit: true, Logf: t.Logf,
+				stopped: make(chan struct{}), runtimeReady: make(chan struct{}),
+				helloDone: make(chan struct{}), launchReady: make(chan struct{}),
+				launchAckDone: make(chan struct{}), appStartedDone: make(chan struct{}), muxReady: make(chan struct{}),
+				OnInitialLaunchState: func(f proto.InitialLaunchState) { facts <- f },
+			}
+			close(srv.launchReady)
+			request := append(encodeLaunchMessage(t, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: true}), encodeLaunchMessage(t, &proto.Message{Type: proto.TypeLaunchAck})...)
+			expected := append(encodeLaunchMessage(t, &proto.Message{Type: proto.TypeLaunch, Launch: spec}), encodeLaunchMessage(t, &proto.Message{Type: proto.TypeAck})...)
+			wireACK, releaseWrite, helloDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			release := func() { once.Do(func() { close(releaseWrite) }) }
+			defer release()
+			hello := &scriptedLaunchConn{read: bytes.NewReader(request)}
+			hello.write = func(p []byte) (int, error) {
+				n, err := hello.written.Write(p)
+				if bytes.Equal(hello.written.Bytes(), expected) {
+					close(wireACK)
+					<-releaseWrite
+					if failWrite {
+						return n, io.ErrClosedPipe
+					}
+				}
+				return n, err
+			}
+			go func() { srv.handleConn(hello); close(helloDone) }()
+			select {
+			case <-wireACK:
+			case <-time.After(time.Second):
+				t.Fatal("host did not write ACK")
+			}
+			fact := proto.InitialLaunchState{Token: "same-token", State: proto.InitialLaunchExited, PID: 42}
+			exit := &scriptedLaunchConn{read: bytes.NewReader(encodeLaunchMessage(t, &proto.Message{Type: proto.TypeAppExited, InitialLaunchState: &fact}))}
+			exitDone := make(chan struct{})
+			go func() { srv.handleConn(exit); close(exitDone) }()
+			select {
+			case got := <-facts:
+				if got != fact {
+					t.Fatalf("first fact=%+v", got)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("terminal fact not published")
+			}
+			select {
+			case <-exitDone:
+				t.Fatal("terminal reply escaped ACK barrier")
+			case <-time.After(20 * time.Millisecond):
+			}
+			release()
+			select {
+			case <-helloDone:
+			case <-time.After(time.Second):
+				t.Fatal("hello did not finish")
+			}
+			select {
+			case <-exitDone:
+			case <-time.After(time.Second):
+				t.Fatal("terminal request did not finish")
+			}
+			response, err := proto.ReadMessage(bytes.NewReader(exit.written.Bytes()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, state := proto.TypeAck, proto.InitialLaunchExited
+			if failWrite {
+				want, state = proto.TypeError, "invalid_app_exited"
+			}
+			if response.Type != want {
+				t.Fatalf("terminal reply=%s, want %s", response.Type, want)
+			}
+			select {
+			case got := <-facts:
+				if got.Token != fact.Token || got.State != state {
+					t.Fatalf("second fact=%+v, want state=%s", got, state)
+				}
+			default:
+				t.Fatal("terminal observation did not resolve")
+			}
+		})
+	}
+}

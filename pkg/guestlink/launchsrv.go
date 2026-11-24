@@ -74,6 +74,12 @@ type LaunchServer struct {
 	// not perform user callbacks or wait on capture/transport work.
 	OnInitialLaunchState func(proto.InitialLaunchState)
 
+	// GateCompletedExit is used only by the standalone Run owner. A
+	// successful initial terminal fact is published immediately, but its ACK
+	// waits for the actual launch ACK/MUX publication so the Guest cannot
+	// exit merely because the host's two concurrent handlers were reordered.
+	GateCompletedExit bool
+
 	// OnAppExited fires when the guest reports its user app has
 	// exited. Optional; nil → just ack.
 	OnAppExited func(code int)
@@ -548,6 +554,40 @@ func (s *LaunchServer) handleConnAfter(conn net.Conn, afterClose *func()) (hande
 				fact.State = "invalid_app_exited"
 			}
 			s.OnInitialLaunchState(fact)
+			if s.GateCompletedExit && s.DeferLaunch &&
+				fact.State == proto.InitialLaunchExited && fact.PID > 0 && fact.Code == 0 && fact.Error == "" {
+				spec := s.launchSpec()
+				if spec != nil && fact.Token != "" && fact.Token == spec.InitialLaunchToken &&
+					(spec.Systemd == "" || spec.Systemd == "off") {
+					// The peer may already have received the ACK while the
+					// host writer is still inside WriteMessage. Never turn
+					// that publication race into a rejected terminal fact.
+					s.launchAckMu.Lock()
+					acked := false
+					select {
+					case <-s.launchAckDone:
+						acked = true
+					default:
+					}
+					s.launchAckMu.Unlock()
+					if !acked {
+						// A report with no successful ACK is not sufficient.
+						fact.State = "invalid_app_exited"
+						s.OnInitialLaunchState(fact)
+						_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "workload has not launched"})
+						return false
+					}
+					select {
+					case <-s.muxReady:
+						// Revisit the exact terminal fact synchronously
+						// before ACK lets the Guest power off. Duplicate
+						// observations are idempotent under the owner lock.
+						s.OnInitialLaunchState(fact)
+					case <-s.stopped:
+						return false
+					}
+				}
+			}
 		}
 		*afterClose = func() {
 			if s.OnAppExited != nil {

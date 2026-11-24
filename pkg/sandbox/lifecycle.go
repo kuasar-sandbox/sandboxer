@@ -335,6 +335,10 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.StatsJSONPath = opts.StatsJSONPath
 	shape.StatsInterval = opts.StatsInterval
 	shape.NotifyReadiness = opts.NotifyReadiness
+	// A standalone command without a managed readiness consumer can finish
+	// successfully before the app_started notification has been confirmed.
+	// Keep the public Start/Launch contract and managed runs unchanged.
+	shape.acceptCompletedRun = opts.NotifyReadiness == nil && !opts.EnableCheckpoint && opts.CurrentRun == nil
 	shape.logf = func(f string, a ...any) { log.Printf("[sandbox-ctl] "+f, a...) }
 	shape.preparedHost = &hostIdentity
 	if err := preparation.seal(shape, &launch); err != nil {

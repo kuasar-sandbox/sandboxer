@@ -264,6 +264,16 @@ are insufficient. Success requires ACK and MUX; failed/terminal facts also end
 pre-ACK waiting. Old tokens are ignored, invalid states fail, and late started
 cannot overwrite a terminal error.
 
+A standalone `sandbox-ctl run` with systemd disabled, without managed readiness or checkpoint ownership
+may finish a short command before initial running-state confirmation. A matching
+terminal fact with the actual started PID and a successful exit is retained
+even if it arrives before host-side ACK/MUX publication. Only after both
+barriers open can the executable join normal VMM exit and cleanup without
+emitting a ready event; a late started fact cannot overwrite that terminal
+proof. Public SDK Launch/Start and managed readiness retain the running
+state requirement; cancellation, missing start proof, failure, and cleanup
+errors are not converted into success.
+
 Commit checks owner/operation cancellation, Runtime state, permanent read errors
 and the current fact under the existing readiness/Runtime lock order. It signals
 internal completion before the user callback. Blocked callbacks cannot strand

@@ -636,6 +636,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	if r := p.owner; r != nil && r.deviceSet != nil {
 		r.notifyInitialReady = notifyReady
 		launch.OnInitialLaunchState = r.observeInitialLaunch
+		launch.GateCompletedExit = r.spec.acceptCompletedRun
 		launch.OnLaunchFailure = func(err error) {
 			r.mu.Lock()
 			if r.launchFailure == nil {
