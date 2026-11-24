@@ -81,7 +81,7 @@ func TestReleaseCaptureRestoreWithoutRefault(t *testing.T) {
 	portable := &config.PortableSandboxConfig{
 		Version:   1,
 		Resources: config.PortableResourcesConfig{Capacity: config.CapacityConfig{CPU: 1, Memory: "1GiB"}, Allocatable: config.AllocatableConfig{CPU: 1, Memory: "1GiB"}},
-		Boot:      config.PortableBootConfig{Kernel: "file://kernel@digest:" + key, Runtime: "file://runtime@digest:" + key, Root: config.PortableRootConfig{Base: "self"}},
+		Boot:      config.PortableBootConfig{Kernel: "file://kernel@digest:" + key, Runtime: "file://runtime.bundle@digest:" + key, Root: config.PortableRootConfig{Base: "self"}},
 		Launch:    config.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},
 	}
 	if err := portable.Validate(); err != nil {
